@@ -373,7 +373,7 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
   // Cache Performance
   const l1dRefill = getCounter(counters, '0x0003');
   const l1dCache = getCounter(counters, '0x0004');
-  const l2dRefill = getCounter(counters, '0x0017');
+  const l2dRefillRaw = getCounter(counters, '0x0017'); // L2D_CACHE_REFILL (raw)
   const l2dCache = getCounter(counters, '0x0016');
   const l1MissWait = getCounter(counters, '0x0208');
   const l2MissWait = getCounter(counters, '0x0308');
@@ -427,14 +427,40 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
     });
   }
 
-  // L2 Miss Rate breakdown (using BUS_READ_TOTAL_MEM as L2 miss count)
-  const l2MissCount = getCounter(counters, '0x0316');   // BUS_READ_TOTAL_MEM as L2 miss proxy
-  const l2dRefillDm = getCounter(counters, '0x0300');   // L2D_CACHE_REFILL_DM
-  const l2dSwapDm = getCounter(counters, '0x0325');     // L2D_SWAP_DM (demand hits prefetch buffer)
-  const l2dRefillPrf = getCounter(counters, '0x0059');  // L2D_CACHE_REFILL_PRF (SW + HW)
-  const l2dRefillHwprf = getCounter(counters, '0x0302'); // L2D_CACHE_REFILL_HWPRF
+  // L2 Miss Rate breakdown with A64FX PMU Errata corrections
+  // Raw counters
+  const l2dRefillDmRaw = getCounter(counters, '0x0300');   // L2D_CACHE_REFILL_DM
+  const l2dSwapDm = getCounter(counters, '0x0325');        // L2D_SWAP_DM (demand hits prefetch buffer)
+  const l2dRefillPrfRaw = getCounter(counters, '0x0059'); // L2D_CACHE_REFILL_PRF (SW + HW)
+  const l2dRefillHwprf = getCounter(counters, '0x0302');   // L2D_CACHE_REFILL_HWPRF
+  const l2dCacheMibmchPrf = getCounter(counters, '0x0326'); // L2D_CACHE_MIBMCH_PRF
+  const l2MissCountRaw = getCounter(counters, '0x0309');   // L2_MISS_COUNT
+  const l2dCacheSwapLocal = getCounter(counters, '0x0396'); // L2D_CACHE_SWAP_LOCAL
+  const l2PipeCompPfL2mibMch = getCounter(counters, '0x0370'); // L2_PIPE_COMP_PF_L2MIB_MCH
 
-  // L2 miss rate = BUS_READ_TOTAL_MEM / (LD_SPEC + ST_SPEC)
+  // A64FX PMU Errata Corrections:
+  // L2D_CACHE_REFILL (corrected) = L2D_CACHE_REFILL - L2D_SWAP_DM - L2D_CACHE_MIBMCH_PRF
+  // L2D_CACHE_REFILL_DM (corrected) = L2D_CACHE_REFILL_DM - L2D_SWAP_DM
+  // L2D_CACHE_REFILL_PRF (corrected) = L2D_CACHE_REFILL_PRF - L2D_CACHE_MIBMCH_PRF
+  // L2_MISS_COUNT (corrected) = L2_MISS_COUNT - L2D_CACHE_SWAP_LOCAL - L2_PIPE_COMP_PF_L2MIB_MCH
+
+  // Calculate corrected L2 values
+  let l2dRefillDm = null;
+  if (l2dRefillDmRaw !== null && l2dSwapDm !== null) {
+    l2dRefillDm = l2dRefillDmRaw - l2dSwapDm;
+  }
+
+  let l2dRefillPrf = null;
+  if (l2dRefillPrfRaw !== null && l2dCacheMibmchPrf !== null) {
+    l2dRefillPrf = l2dRefillPrfRaw - l2dCacheMibmchPrf;
+  }
+
+  let l2MissCount = null;
+  if (l2MissCountRaw !== null && l2dCacheSwapLocal !== null && l2PipeCompPfL2mibMch !== null) {
+    l2MissCount = l2MissCountRaw - l2dCacheSwapLocal - l2PipeCompPfL2mibMch;
+  }
+
+  // L2 miss rate = corrected L2_MISS_COUNT / (LD_SPEC + ST_SPEC)
   if (l2MissCount !== null && ldSpec !== null && stSpec !== null) {
     const ldstSpec = ldSpec + stSpec;
     if (ldstSpec > 0) {
@@ -447,14 +473,11 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
     }
   }
 
-  // L2 miss demand rate = (L2D_CACHE_REFILL_DM - L2D_SWAP_DM) / BUS_READ_TOTAL_MEM
-  // L2D_SWAP_DM counts demand requests that hit the prefetch buffer, so we subtract it
-  // to get the true demand misses that went to memory
-  if (l2MissCount !== null && l2MissCount > 0 && l2dRefillDm !== null && l2dSwapDm !== null) {
-    const trueDemandMiss = l2dRefillDm - l2dSwapDm;
+  // L2 miss demand rate = corrected L2D_CACHE_REFILL_DM / corrected L2_MISS_COUNT
+  if (l2MissCount !== null && l2MissCount > 0 && l2dRefillDm !== null) {
     metrics.push({
       name: 'L2 Miss Demand Rate',
-      value: (trueDemandMiss / l2MissCount) * 100,
+      value: (l2dRefillDm / l2MissCount) * 100,
       unit: '%',
       category: 'Cache Performance'
     });
@@ -469,6 +492,8 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
     });
   }
 
+  // L2 miss SW prefetch rate = corrected L2D_CACHE_REFILL_PRF / corrected L2_MISS_COUNT
+  // Note: L2D_CACHE_REFILL_PRF includes both SW and HW prefetch, subtract HW to get SW only
   if (l2MissCount !== null && l2MissCount > 0 && l2dRefillPrf !== null && l2dRefillHwprf !== null) {
     const swPrefetchRefill = l2dRefillPrf - l2dRefillHwprf;
     metrics.push({
@@ -488,10 +513,16 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
     });
   }
 
-  if (l2MissWait !== null && l2dRefill !== null && l2dRefill > 0) {
+  // L2D_CACHE_REFILL (corrected) = L2D_CACHE_REFILL - L2D_SWAP_DM - L2D_CACHE_MIBMCH_PRF
+  let l2dRefillCorrected = null;
+  if (l2dRefillRaw !== null && l2dSwapDm !== null && l2dCacheMibmchPrf !== null) {
+    l2dRefillCorrected = l2dRefillRaw - l2dSwapDm - l2dCacheMibmchPrf;
+  }
+
+  if (l2MissWait !== null && l2dRefillCorrected !== null && l2dRefillCorrected > 0) {
     metrics.push({
       name: 'L2 Miss Latency',
-      value: l2MissWait / l2dRefill,
+      value: l2MissWait / l2dRefillCorrected,
       unit: 'cycles',
       category: 'Cache Performance'
     });
