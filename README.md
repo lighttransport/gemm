@@ -130,6 +130,7 @@ Structured JSON format for programmatic access:
 |----------|---------|
 | **Core Performance** | IPC, CPI |
 | **Cache Performance** | L1D/L2 miss rates, miss latency |
+| **L1 Load-Store Instructions** | Total, single vector loads, broadcast loads, non-SIMD loads/stores |
 | **Floating-Point Performance** | GFLOPS (SVE/SIMD/Total), FP operations count |
 | **Memory Bandwidth** | Memory read/write bandwidth (GB/s) |
 | **Pipeline Utilization** | Stall rates, FLA/FLB/EXA/EXB/EAGA/EAGB utilization |
