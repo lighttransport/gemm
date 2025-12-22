@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Tiled FP16 Matmul without Cooperative Matrix
+// For comparison/fallback on devices without VK_KHR_cooperative_matrix
+//
+// C = A * B where:
+//   A is M x K (row-major)
+//   B is K x N (row-major)
+//   C is M x N (row-major)
+//
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Tile dimensions
+#define TILE_M 32
+#define TILE_N 32
+#define TILE_K 16
+
+// Register blocking: each thread computes REG_M x REG_N output elements
+#define REG_M 4
+#define REG_N 4
+
+// Workgroup: 8x8 threads, each computing 4x4 outputs = 32x32 output tile
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Storage buffers using FP16
+layout(std430, binding = 0) readonly buffer MatrixA {
+    float16_t A[];
+};
+
+layout(std430, binding = 1) readonly buffer MatrixB {
+    float16_t B[];
+};
+
+layout(std430, binding = 2) writeonly buffer MatrixC {
+    float16_t C[];
+};
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+// Shared memory tiles
+// Use vec4 of f16 (f16vec4) for coalesced loads where possible
+shared float16_t tileA[TILE_M][TILE_K + 1];  // +1 to avoid bank conflicts
+shared float16_t tileB[TILE_K][TILE_N + 1];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;  // 0-7
+    const uint ty = gl_LocalInvocationID.y;  // 0-7
+    const uint tid = ty * 8 + tx;            // 0-63
+
+    // Block position in output matrix
+    const uint block_row = gl_WorkGroupID.y * TILE_M;
+    const uint block_col = gl_WorkGroupID.x * TILE_N;
+
+    // Thread's output position within the tile
+    const uint thread_row = ty * REG_M;  // 0, 4, 8, 12, 16, 20, 24, 28
+    const uint thread_col = tx * REG_N;  // 0, 4, 8, 12, 16, 20, 24, 28
+
+    // Accumulators (use FP32 for precision, convert at end)
+    float acc[REG_M][REG_N];
+    [[unroll]] for (uint i = 0; i < REG_M; i++) {
+        [[unroll]] for (uint j = 0; j < REG_N; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    // Main loop over K dimension
+    for (uint k_base = 0; k_base < pc.K; k_base += TILE_K) {
+        // Collaborative loading into shared memory
+        // 64 threads loading TILE_M * TILE_K = 32 * 16 = 512 elements = 8 per thread
+        // Load tile A
+        [[unroll]] for (uint i = 0; i < 8; i++) {
+            uint idx = tid * 8 + i;
+            uint row = idx / TILE_K;
+            uint col = idx % TILE_K;
+            uint global_row = block_row + row;
+            uint global_col = k_base + col;
+
+            if (global_row < pc.M && global_col < pc.K) {
+                tileA[row][col] = A[global_row * pc.K + global_col];
+            } else {
+                tileA[row][col] = float16_t(0.0);
+            }
+        }
+
+        // Load tile B: TILE_K * TILE_N = 16 * 32 = 512 elements = 8 per thread
+        [[unroll]] for (uint i = 0; i < 8; i++) {
+            uint idx = tid * 8 + i;
+            uint row = idx / TILE_N;
+            uint col = idx % TILE_N;
+            uint global_row = k_base + row;
+            uint global_col = block_col + col;
+
+            if (global_row < pc.K && global_col < pc.N) {
+                tileB[row][col] = B[global_row * pc.N + global_col];
+            } else {
+                tileB[row][col] = float16_t(0.0);
+            }
+        }
+
+        barrier();
+
+        // Compute partial products
+        [[unroll]] for (uint k = 0; k < TILE_K; k++) {
+            // Load A values for this thread's rows
+            float a_reg[REG_M];
+            [[unroll]] for (uint i = 0; i < REG_M; i++) {
+                a_reg[i] = float(tileA[thread_row + i][k]);
+            }
+
+            // Load B values for this thread's columns
+            float b_reg[REG_N];
+            [[unroll]] for (uint j = 0; j < REG_N; j++) {
+                b_reg[j] = float(tileB[k][thread_col + j]);
+            }
+
+            // Outer product accumulation
+            [[unroll]] for (uint i = 0; i < REG_M; i++) {
+                [[unroll]] for (uint j = 0; j < REG_N; j++) {
+                    acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Store results to global memory
+    [[unroll]] for (uint i = 0; i < REG_M; i++) {
+        uint global_row = block_row + thread_row + i;
+        if (global_row < pc.M) {
+            [[unroll]] for (uint j = 0; j < REG_N; j++) {
+                uint global_col = block_col + thread_col + j;
+                if (global_col < pc.N) {
+                    C[global_row * pc.N + global_col] = float16_t(acc[i][j]);
+                }
+            }
+        }
+    }
+}

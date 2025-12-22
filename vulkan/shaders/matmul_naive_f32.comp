@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Naive FP32 Matmul - Baseline for comparison
+//
+// C = A * B where:
+//   A is M x K (row-major)
+//   B is K x N (row-major)
+//   C is M x N (row-major)
+//
+#version 450
+
+// 16x16 workgroup, each thread computes one output element
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer MatrixA {
+    float A[];
+};
+
+layout(std430, binding = 1) readonly buffer MatrixB {
+    float B[];
+};
+
+layout(std430, binding = 2) writeonly buffer MatrixC {
+    float C[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    if (row >= pc.M || col >= pc.N) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint k = 0; k < pc.K; k++) {
+        sum += A[row * pc.K + k] * B[k * pc.N + col];
+    }
+
+    C[row * pc.N + col] = sum;
+}
