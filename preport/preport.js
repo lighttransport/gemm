@@ -778,7 +778,1580 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
     });
   }
 
+  // Branch Prediction
+  const brMisPred = getCounter(counters, '0x0010');
+  const brPred = getCounter(counters, '0x0012');
+
+  if (brMisPred !== null && brPred !== null && brPred > 0) {
+    metrics.push({
+      name: 'Branch Mispredict Rate',
+      value: (brMisPred / brPred) * 100,
+      unit: '%',
+      category: 'Branch Prediction'
+    });
+  }
+
+  if (brMisPred !== null) {
+    metrics.push({
+      name: 'Branch Mispredictions',
+      value: brMisPred,
+      unit: '',
+      category: 'Branch Prediction',
+      format: 'count'
+    });
+  }
+
+  if (brPred !== null) {
+    metrics.push({
+      name: 'Branch Predictions',
+      value: brPred,
+      unit: '',
+      category: 'Branch Prediction',
+      format: 'count'
+    });
+  }
+
+  // TLB Performance
+  const l1dTlbRefill = getCounter(counters, '0x0005');
+  const l2dTlbRefill = getCounter(counters, '0x002d');
+  const l1iTlbRefill = getCounter(counters, '0x0002');
+
+  if (l1dTlbRefill !== null && ldSpec !== null && stSpec !== null) {
+    const ldstSpec = ldSpec + stSpec;
+    if (ldstSpec > 0) {
+      metrics.push({
+        name: 'L1D TLB Miss Rate',
+        value: (l1dTlbRefill / ldstSpec) * 100,
+        unit: '%',
+        category: 'TLB Performance'
+      });
+    }
+  }
+
+  if (l2dTlbRefill !== null && l1dTlbRefill !== null && l1dTlbRefill > 0) {
+    metrics.push({
+      name: 'L2D TLB Miss Rate',
+      value: (l2dTlbRefill / l1dTlbRefill) * 100,
+      unit: '%',
+      category: 'TLB Performance'
+    });
+  }
+
+  if (l1dTlbRefill !== null) {
+    metrics.push({
+      name: 'L1D TLB Misses',
+      value: l1dTlbRefill,
+      unit: '',
+      category: 'TLB Performance',
+      format: 'count'
+    });
+  }
+
+  if (l2dTlbRefill !== null) {
+    metrics.push({
+      name: 'L2D TLB Misses',
+      value: l2dTlbRefill,
+      unit: '',
+      category: 'TLB Performance',
+      format: 'count'
+    });
+  }
+
+  // Detailed Memory Stall Breakdown
+  const ldCompWaitL2Miss = getCounter(counters, '0x0180');
+  const ldCompWaitL1Miss = getCounter(counters, '0x0182');
+  const ldCompWaitPfpBusy = getCounter(counters, '0x0186');
+
+  if (ldCompWaitL2Miss !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'L2 Miss Stall',
+      value: (ldCompWaitL2Miss / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  if (ldCompWaitL1Miss !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'L1 Miss Stall',
+      value: (ldCompWaitL1Miss / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  if (ldCompWaitPfpBusy !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'Prefetch Port Stall',
+      value: (ldCompWaitPfpBusy / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  // Instruction Commit Distribution
+  const oneInstCommit = getCounter(counters, '0x0191');
+  const twoInstCommit = getCounter(counters, '0x0192');
+  const threeInstCommit = getCounter(counters, '0x0193');
+  const fourInstCommit = getCounter(counters, '0x0194');
+
+  if (cycles !== null && cycles > 0) {
+    if (oneInstCommit !== null) {
+      metrics.push({
+        name: '1-Inst Commit Rate',
+        value: (oneInstCommit / cycles) * 100,
+        unit: '%',
+        category: 'Commit Distribution'
+      });
+    }
+    if (twoInstCommit !== null) {
+      metrics.push({
+        name: '2-Inst Commit Rate',
+        value: (twoInstCommit / cycles) * 100,
+        unit: '%',
+        category: 'Commit Distribution'
+      });
+    }
+    if (threeInstCommit !== null) {
+      metrics.push({
+        name: '3-Inst Commit Rate',
+        value: (threeInstCommit / cycles) * 100,
+        unit: '%',
+        category: 'Commit Distribution'
+      });
+    }
+    if (fourInstCommit !== null) {
+      metrics.push({
+        name: '4-Inst Commit Rate',
+        value: (fourInstCommit / cycles) * 100,
+        unit: '%',
+        category: 'Commit Distribution'
+      });
+    }
+  }
+
+  // Address Generation Pipeline Utilization
+  const eagaVal = getCounter(counters, '0x01a0');
+  const eagbVal = getCounter(counters, '0x01a1');
+  const prxVal = getCounter(counters, '0x01a6');
+
+  if (eagaVal !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'EAGA Utilization',
+      value: (eagaVal / cycles) * 100,
+      unit: '%',
+      category: 'Pipeline Utilization'
+    });
+  }
+
+  if (eagbVal !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'EAGB Utilization',
+      value: (eagbVal / cycles) * 100,
+      unit: '%',
+      category: 'Pipeline Utilization'
+    });
+  }
+
+  if (prxVal !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'PRX Utilization',
+      value: (prxVal / cycles) * 100,
+      unit: '%',
+      category: 'Pipeline Utilization'
+    });
+  }
+
+  // FP Precision Breakdown
+  const fpSpScaleOps = getCounter(counters, '0x80c4');
+  const fpSpFixedOps = getCounter(counters, '0x80c5');
+  const fpDpScaleOps = getCounter(counters, '0x80c6');
+  const fpDpFixedOps = getCounter(counters, '0x80c7');
+
+  if (fpSpScaleOps !== null && elapsed > 0) {
+    const gflops = (fpSpScaleOps * sveScaleFactor) / (elapsed * 1e9);
+    metrics.push({
+      name: 'GFLOPS SP (SVE)',
+      value: gflops,
+      unit: '',
+      category: 'FP Precision Breakdown'
+    });
+  }
+
+  if (fpSpFixedOps !== null && elapsed > 0) {
+    metrics.push({
+      name: 'GFLOPS SP (SIMD)',
+      value: fpSpFixedOps / (elapsed * 1e9),
+      unit: '',
+      category: 'FP Precision Breakdown'
+    });
+  }
+
+  if (fpDpScaleOps !== null && elapsed > 0) {
+    const gflops = (fpDpScaleOps * sveScaleFactor) / (elapsed * 1e9);
+    metrics.push({
+      name: 'GFLOPS DP (SVE)',
+      value: gflops,
+      unit: '',
+      category: 'FP Precision Breakdown'
+    });
+  }
+
+  if (fpDpFixedOps !== null && elapsed > 0) {
+    metrics.push({
+      name: 'GFLOPS DP (SIMD)',
+      value: fpDpFixedOps / (elapsed * 1e9),
+      unit: '',
+      category: 'FP Precision Breakdown'
+    });
+  }
+
+  // FP Instruction Breakdown
+  const fpFmaSpec = getCounter(counters, '0x8028');
+  const fpSpec = getCounter(counters, '0x8010');
+
+  if (fpFmaSpec !== null && fpSpec !== null && fpSpec > 0) {
+    metrics.push({
+      name: 'FMA Ratio',
+      value: (fpFmaSpec / fpSpec) * 100,
+      unit: '%',
+      category: 'FP Instruction Breakdown'
+    });
+  }
+
+  if (fpFmaSpec !== null) {
+    metrics.push({
+      name: 'FMA Operations',
+      value: fpFmaSpec,
+      unit: '',
+      category: 'FP Instruction Breakdown',
+      format: 'count'
+    });
+  }
+
+  // SVE/SIMD Detailed Metrics
+  const aseSveLdSpec = getCounter(counters, '0x8085');
+  const aseSveStSpec = getCounter(counters, '0x8086');
+  const sveGatherSpec = getCounter(counters, '0x80ad');
+  const sveScatterSpec = getCounter(counters, '0x80ae');
+  const sveLdMultiSpec = getCounter(counters, '0x80a5');
+  const sveStMultiSpec = getCounter(counters, '0x80a6');
+  const prfSpec = getCounter(counters, '0x8087');
+
+  if (aseSveLdSpec !== null) {
+    metrics.push({
+      name: 'SIMD/SVE Loads',
+      value: aseSveLdSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  if (aseSveStSpec !== null) {
+    metrics.push({
+      name: 'SIMD/SVE Stores',
+      value: aseSveStSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  if (sveGatherSpec !== null) {
+    metrics.push({
+      name: 'SVE Gather Ops',
+      value: sveGatherSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  if (sveScatterSpec !== null) {
+    metrics.push({
+      name: 'SVE Scatter Ops',
+      value: sveScatterSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  if (sveLdMultiSpec !== null) {
+    metrics.push({
+      name: 'SVE Multi-Vec Loads',
+      value: sveLdMultiSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  if (sveStMultiSpec !== null) {
+    metrics.push({
+      name: 'SVE Multi-Vec Stores',
+      value: sveStMultiSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  if (prfSpec !== null) {
+    metrics.push({
+      name: 'Prefetch Ops',
+      value: prfSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  // Gather/Scatter Efficiency
+  if (sveGatherSpec !== null && aseSveLdSpec !== null && aseSveLdSpec > 0) {
+    metrics.push({
+      name: 'Gather Ratio',
+      value: (sveGatherSpec / aseSveLdSpec) * 100,
+      unit: '%',
+      category: 'SVE/SIMD Operations'
+    });
+  }
+
+  if (sveScatterSpec !== null && aseSveStSpec !== null && aseSveStSpec > 0) {
+    metrics.push({
+      name: 'Scatter Ratio',
+      value: (sveScatterSpec / aseSveStSpec) * 100,
+      unit: '%',
+      category: 'SVE/SIMD Operations'
+    });
+  }
+
+  // HW Prefetch Activity
+  const l1HwpfStreamPf = getCounter(counters, '0x0230');
+  const l1HwpfInjAllocPf = getCounter(counters, '0x0231');
+  const l1HwpfInjNoallocPf = getCounter(counters, '0x0232');
+  const l2HwpfStreamPf = getCounter(counters, '0x0233');
+  const l2HwpfInjAllocPf = getCounter(counters, '0x0234');
+  const l2HwpfInjNoallocPf = getCounter(counters, '0x0235');
+
+  if (l1HwpfStreamPf !== null) {
+    metrics.push({
+      name: 'L1 HW Stream Prefetch',
+      value: l1HwpfStreamPf,
+      unit: '',
+      category: 'HW Prefetch',
+      format: 'count'
+    });
+  }
+
+  if (l2HwpfStreamPf !== null) {
+    metrics.push({
+      name: 'L2 HW Stream Prefetch',
+      value: l2HwpfStreamPf,
+      unit: '',
+      category: 'HW Prefetch',
+      format: 'count'
+    });
+  }
+
+  const l1HwpfTotal = (l1HwpfStreamPf || 0) + (l1HwpfInjAllocPf || 0) + (l1HwpfInjNoallocPf || 0);
+  const l2HwpfTotal = (l2HwpfStreamPf || 0) + (l2HwpfInjAllocPf || 0) + (l2HwpfInjNoallocPf || 0);
+
+  if (l1HwpfTotal > 0) {
+    metrics.push({
+      name: 'L1 HW Prefetch Total',
+      value: l1HwpfTotal,
+      unit: '',
+      category: 'HW Prefetch',
+      format: 'count'
+    });
+  }
+
+  if (l2HwpfTotal > 0) {
+    metrics.push({
+      name: 'L2 HW Prefetch Total',
+      value: l2HwpfTotal,
+      unit: '',
+      category: 'HW Prefetch',
+      format: 'count'
+    });
+  }
+
+  // Bus Traffic Breakdown
+  const busWriteCmg0 = getCounter(counters, '0x0318');
+  const busWriteCmg1 = getCounter(counters, '0x0319');
+  const busWriteCmg2 = getCounter(counters, '0x031a');
+  const busWriteCmg3 = getCounter(counters, '0x031b');
+  const busReadTofu = getCounter(counters, '0x0314');
+  const busWriteTofu = getCounter(counters, '0x031c');
+  const busReadPci = getCounter(counters, '0x0315');
+  const busWritePci = getCounter(counters, '0x031d');
+
+  const cmgWriteTotal = (busWriteCmg0 || 0) + (busWriteCmg1 || 0) + (busWriteCmg2 || 0) + (busWriteCmg3 || 0);
+
+  if (cmgWriteTotal > 0 && elapsed > 0) {
+    const bw = (cmgWriteTotal * 256) / (elapsed * 1e9);
+    metrics.push({
+      name: 'CMG Write BW',
+      value: bw,
+      unit: 'GB/s',
+      category: 'Bus Traffic'
+    });
+  }
+
+  if (busReadTofu !== null && elapsed > 0) {
+    const bw = (busReadTofu * 256) / (elapsed * 1e9);
+    metrics.push({
+      name: 'Tofu Read BW',
+      value: bw,
+      unit: 'GB/s',
+      category: 'Bus Traffic'
+    });
+  }
+
+  if (busWriteTofu !== null && elapsed > 0) {
+    const bw = (busWriteTofu * 256) / (elapsed * 1e9);
+    metrics.push({
+      name: 'Tofu Write BW',
+      value: bw,
+      unit: 'GB/s',
+      category: 'Bus Traffic'
+    });
+  }
+
+  // L1 Cache Details
+  const l1Pipe0Comp = getCounter(counters, '0x0260');
+  const l1Pipe1Comp = getCounter(counters, '0x0261');
+  const l1PipeAbort = getCounter(counters, '0x0274');
+
+  if (l1Pipe0Comp !== null && l1Pipe1Comp !== null) {
+    metrics.push({
+      name: 'L1D Requests',
+      value: l1Pipe0Comp + l1Pipe1Comp,
+      unit: '',
+      category: 'L1 Cache Details',
+      format: 'count'
+    });
+  }
+
+  if (l1PipeAbort !== null && l1Pipe0Comp !== null && l1Pipe1Comp !== null) {
+    const totalReq = l1Pipe0Comp + l1Pipe1Comp;
+    if (totalReq > 0) {
+      metrics.push({
+        name: 'L1D Abort Rate',
+        value: (l1PipeAbort / totalReq) * 100,
+        unit: '%',
+        category: 'L1 Cache Details'
+      });
+    }
+  }
+
+  // Micro-op Statistics
+  const uopSpec = getCounter(counters, '0x8008');
+  const uopSplit = getCounter(counters, '0x0139');
+
+  if (uopSpec !== null && effectiveInst !== null && effectiveInst > 0) {
+    metrics.push({
+      name: 'Micro-ops per Inst',
+      value: uopSpec / effectiveInst,
+      unit: '',
+      category: 'Micro-op Statistics'
+    });
+  }
+
+  if (uopSplit !== null) {
+    metrics.push({
+      name: 'Micro-op Splits',
+      value: uopSplit,
+      unit: '',
+      category: 'Micro-op Statistics',
+      format: 'count'
+    });
+  }
+
+  // ROB/CSE Statistics
+  const robEmpty = getCounter(counters, '0x018c');
+  const robEmptyStqBusy = getCounter(counters, '0x018d');
+
+  if (robEmpty !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'ROB Empty Rate',
+      value: (robEmpty / cycles) * 100,
+      unit: '%',
+      category: 'ROB Statistics'
+    });
+  }
+
+  if (robEmptyStqBusy !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'ROB Empty (STQ Busy)',
+      value: (robEmptyStqBusy / cycles) * 100,
+      unit: '%',
+      category: 'ROB Statistics'
+    });
+  }
+
+  // Integer Stall
+  if (euCompWait !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'Integer Stall',
+      value: (euCompWait / cycles) * 100,
+      unit: '%',
+      category: 'Pipeline Utilization'
+    });
+  }
+
+  // Branch Stall
+  const brCompWait = getCounter(counters, '0x018b');
+  if (brCompWait !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'Branch Stall',
+      value: (brCompWait / cycles) * 100,
+      unit: '%',
+      category: 'Pipeline Utilization'
+    });
+  }
+
+  // L1I Cache
+  const l1iCacheRefill = getCounter(counters, '0x0001');
+  if (l1iCacheRefill !== null) {
+    metrics.push({
+      name: 'L1I Cache Refills',
+      value: l1iCacheRefill,
+      unit: '',
+      category: 'L1I Cache',
+      format: 'count'
+    });
+  }
+
+  // L2 Cache Write-back
+  const l2dCacheWb = getCounter(counters, '0x0018');
+  if (l2dCacheWb !== null) {
+    metrics.push({
+      name: 'L2D Cache Write-backs',
+      value: l2dCacheWb,
+      unit: '',
+      category: 'L2 Cache Details',
+      format: 'count'
+    });
+  }
+
+  // Crypto/DCZVA Instructions
+  const cryptoSpec = getCounter(counters, '0x0077');
+  const dczvaSpec = getCounter(counters, '0x009f');
+
+  if (cryptoSpec !== null) {
+    metrics.push({
+      name: 'Crypto Instructions',
+      value: cryptoSpec,
+      unit: '',
+      category: 'Special Instructions',
+      format: 'count'
+    });
+  }
+
+  if (dczvaSpec !== null) {
+    metrics.push({
+      name: 'DC ZVA Instructions',
+      value: dczvaSpec,
+      unit: '',
+      category: 'Special Instructions',
+      format: 'count'
+    });
+  }
+
+  // FP Move/Load/Store Operations
+  const fpMvSpec = getCounter(counters, '0x0105');
+  const fpLdSpec = getCounter(counters, '0x0112');
+  const fpStSpec = getCounter(counters, '0x0113');
+
+  if (fpMvSpec !== null) {
+    metrics.push({
+      name: 'FP Move Ops',
+      value: fpMvSpec,
+      unit: '',
+      category: 'FP Operations Detail',
+      format: 'count'
+    });
+  }
+
+  if (fpLdSpec !== null) {
+    metrics.push({
+      name: 'FP Load Ops',
+      value: fpLdSpec,
+      unit: '',
+      category: 'FP Operations Detail',
+      format: 'count'
+    });
+  }
+
+  if (fpStSpec !== null) {
+    metrics.push({
+      name: 'FP Store Ops',
+      value: fpStSpec,
+      unit: '',
+      category: 'FP Operations Detail',
+      format: 'count'
+    });
+  }
+
+  // Predicate/Inter-element/Inter-register Operations
+  const prdSpec = getCounter(counters, '0x0108');
+  const ielSpec = getCounter(counters, '0x0109');
+  const iregSpec = getCounter(counters, '0x010a');
+
+  if (prdSpec !== null) {
+    metrics.push({
+      name: 'Predicate Ops',
+      value: prdSpec,
+      unit: '',
+      category: 'SVE Register Ops',
+      format: 'count'
+    });
+  }
+
+  if (ielSpec !== null) {
+    metrics.push({
+      name: 'Inter-element Ops',
+      value: ielSpec,
+      unit: '',
+      category: 'SVE Register Ops',
+      format: 'count'
+    });
+  }
+
+  if (iregSpec !== null) {
+    metrics.push({
+      name: 'Inter-register Ops',
+      value: iregSpec,
+      unit: '',
+      category: 'SVE Register Ops',
+      format: 'count'
+    });
+  }
+
+  // Broadcast Load
+  const bcLdSpec = getCounter(counters, '0x011a');
+  if (bcLdSpec !== null) {
+    metrics.push({
+      name: 'Broadcast Loads',
+      value: bcLdSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  // Extended Memory Stall Breakdown (integer load specific)
+  const ldCompWaitL2MissEx = getCounter(counters, '0x0181');
+  const ldCompWaitL1MissEx = getCounter(counters, '0x0183');
+  const ldCompWaitEx = getCounter(counters, '0x0185');
+  const ldCompWaitPfpBusyEx = getCounter(counters, '0x0187');
+  const ldCompWaitPfpBusySwpf = getCounter(counters, '0x0188');
+
+  if (ldCompWaitL2MissEx !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'L2 Miss Stall (Int)',
+      value: (ldCompWaitL2MissEx / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  if (ldCompWaitL1MissEx !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'L1 Miss Stall (Int)',
+      value: (ldCompWaitL1MissEx / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  if (ldCompWaitEx !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'Memory Stall (Int)',
+      value: (ldCompWaitEx / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  if (ldCompWaitPfpBusyEx !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'Prefetch Port Stall (Int)',
+      value: (ldCompWaitPfpBusyEx / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  if (ldCompWaitPfpBusySwpf !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'Prefetch Port Stall (SW PF)',
+      value: (ldCompWaitPfpBusySwpf / cycles) * 100,
+      unit: '%',
+      category: 'Memory Stall Breakdown'
+    });
+  }
+
+  // WFE/WFI Cycles
+  const wfeWfiCycle = getCounter(counters, '0x018e');
+  if (wfeWfiCycle !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'WFE/WFI Rate',
+      value: (wfeWfiCycle / cycles) * 100,
+      unit: '%',
+      category: 'Idle Statistics'
+    });
+  }
+
+  // UOP/MOVPRFX Commit
+  const uopOnlyCommit = getCounter(counters, '0x0198');
+  const singleMovprfxCommit = getCounter(counters, '0x0199');
+
+  if (uopOnlyCommit !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'UOP Only Commit Rate',
+      value: (uopOnlyCommit / cycles) * 100,
+      unit: '%',
+      category: 'Commit Distribution'
+    });
+  }
+
+  if (singleMovprfxCommit !== null && cycles !== null && cycles > 0) {
+    metrics.push({
+      name: 'MOVPRFX Only Commit Rate',
+      value: (singleMovprfxCommit / cycles) * 100,
+      unit: '%',
+      category: 'Commit Distribution'
+    });
+  }
+
+  // FLA/FLB Predicate Counts
+  const flaValPrdCnt = getCounter(counters, '0x01b4');
+  const flbValPrdCnt = getCounter(counters, '0x01b5');
+
+  if (flaValPrdCnt !== null) {
+    metrics.push({
+      name: 'FLA Predicate Count',
+      value: flaValPrdCnt,
+      unit: '',
+      category: 'SVE Predication',
+      format: 'count'
+    });
+  }
+
+  if (flbValPrdCnt !== null) {
+    metrics.push({
+      name: 'FLB Predicate Count',
+      value: flbValPrdCnt,
+      unit: '',
+      category: 'SVE Predication',
+      format: 'count'
+    });
+  }
+
+  // Calculate predication efficiency
+  if (flaValPrdCnt !== null && flaVal !== null && flaVal > 0) {
+    // Each SVE operation can process up to 8 DP or 16 SP elements
+    // PRD_CNT counts total active predicate elements
+    const avgActiveElements = flaValPrdCnt / flaVal;
+    metrics.push({
+      name: 'FLA Avg Active Elements',
+      value: avgActiveElements,
+      unit: '',
+      category: 'SVE Predication'
+    });
+  }
+
+  if (flbValPrdCnt !== null && flbVal !== null && flbVal > 0) {
+    const avgActiveElements = flbValPrdCnt / flbVal;
+    metrics.push({
+      name: 'FLB Avg Active Elements',
+      value: avgActiveElements,
+      unit: '',
+      category: 'SVE Predication'
+    });
+  }
+
+  // L2 HW Prefetch Other
+  const l2HwpfOther = getCounter(counters, '0x0236');
+  if (l2HwpfOther !== null) {
+    metrics.push({
+      name: 'L2 HW Prefetch Other',
+      value: l2HwpfOther,
+      unit: '',
+      category: 'HW Prefetch',
+      format: 'count'
+    });
+  }
+
+  // Gather Flow Statistics
+  const gatherFlow2 = getCounter(counters, '0x02b0');
+  const gatherFlow1 = getCounter(counters, '0x02b1');
+  const gatherFlow0 = getCounter(counters, '0x02b2');
+
+  if (gatherFlow2 !== null) {
+    metrics.push({
+      name: 'Gather 2-Flow',
+      value: gatherFlow2,
+      unit: '',
+      category: 'Gather Statistics',
+      format: 'count'
+    });
+  }
+
+  if (gatherFlow1 !== null) {
+    metrics.push({
+      name: 'Gather 1-Flow',
+      value: gatherFlow1,
+      unit: '',
+      category: 'Gather Statistics',
+      format: 'count'
+    });
+  }
+
+  if (gatherFlow0 !== null) {
+    metrics.push({
+      name: 'Gather 0-Flow',
+      value: gatherFlow0,
+      unit: '',
+      category: 'Gather Statistics',
+      format: 'count'
+    });
+  }
+
+  // Gather efficiency (more flows = better)
+  const totalGatherFlows = (gatherFlow2 || 0) + (gatherFlow1 || 0) + (gatherFlow0 || 0);
+  if (totalGatherFlows > 0) {
+    const avgFlows = ((gatherFlow2 || 0) * 2 + (gatherFlow1 || 0) * 1) / totalGatherFlows;
+    metrics.push({
+      name: 'Gather Avg Flows',
+      value: avgFlows,
+      unit: '',
+      category: 'Gather Statistics'
+    });
+  }
+
+  // L1 Pipe Predicate Counts
+  const l1Pipe0PrdCnt = getCounter(counters, '0x02b8');
+  const l1Pipe1PrdCnt = getCounter(counters, '0x02b9');
+
+  if (l1Pipe0PrdCnt !== null) {
+    metrics.push({
+      name: 'L1 Pipe0 Predicate Count',
+      value: l1Pipe0PrdCnt,
+      unit: '',
+      category: 'L1 Cache Details',
+      format: 'count'
+    });
+  }
+
+  if (l1Pipe1PrdCnt !== null) {
+    metrics.push({
+      name: 'L1 Pipe1 Predicate Count',
+      value: l1Pipe1PrdCnt,
+      unit: '',
+      category: 'L1 Cache Details',
+      format: 'count'
+    });
+  }
+
+  // PCI Bus Traffic
+  if (busReadPci !== null && elapsed > 0) {
+    const bw = (busReadPci * 256) / (elapsed * 1e9);
+    metrics.push({
+      name: 'PCI Read BW',
+      value: bw,
+      unit: 'GB/s',
+      category: 'Bus Traffic'
+    });
+  }
+
+  if (busWritePci !== null && elapsed > 0) {
+    const bw = (busWritePci * 256) / (elapsed * 1e9);
+    metrics.push({
+      name: 'PCI Write BW',
+      value: bw,
+      unit: 'GB/s',
+      category: 'Bus Traffic'
+    });
+  }
+
+  // L2 OC MIB Hit
+  const l2OcRdMibHit = getCounter(counters, '0x0391');
+  const l2OcWrMibHit = getCounter(counters, '0x03ae');
+
+  if (l2OcRdMibHit !== null) {
+    metrics.push({
+      name: 'L2 OC Read MIB Hits',
+      value: l2OcRdMibHit,
+      unit: '',
+      category: 'L2 Cache Details',
+      format: 'count'
+    });
+  }
+
+  if (l2OcWrMibHit !== null) {
+    metrics.push({
+      name: 'L2 OC Write MIB Hits',
+      value: l2OcWrMibHit,
+      unit: '',
+      category: 'L2 Cache Details',
+      format: 'count'
+    });
+  }
+
+  // SVE Math Operations
+  const sveMathSpec = getCounter(counters, '0x800e');
+  if (sveMathSpec !== null) {
+    metrics.push({
+      name: 'SVE Math Ops',
+      value: sveMathSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  // FP Reciprocal/Convert Operations
+  const fpRecpeSpec = getCounter(counters, '0x8034');
+  const fpCvtSpec = getCounter(counters, '0x8038');
+
+  if (fpRecpeSpec !== null) {
+    metrics.push({
+      name: 'FP Reciprocal Estimate Ops',
+      value: fpRecpeSpec,
+      unit: '',
+      category: 'FP Operations Detail',
+      format: 'count'
+    });
+  }
+
+  if (fpCvtSpec !== null) {
+    metrics.push({
+      name: 'FP Convert Ops',
+      value: fpCvtSpec,
+      unit: '',
+      category: 'FP Operations Detail',
+      format: 'count'
+    });
+  }
+
+  // SIMD/SVE Integer Operations
+  const aseSveIntSpec = getCounter(counters, '0x8043');
+  if (aseSveIntSpec !== null) {
+    metrics.push({
+      name: 'SIMD/SVE Integer Ops',
+      value: aseSveIntSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  // SVE MOVPRFX Operations
+  const sveMovprfxSpec = getCounter(counters, '0x807c');
+  if (sveMovprfxSpec !== null) {
+    metrics.push({
+      name: 'SVE MOVPRFX Ops',
+      value: sveMovprfxSpec,
+      unit: '',
+      category: 'SVE/SIMD Operations',
+      format: 'count'
+    });
+  }
+
+  // SVE LDR/STR Register Operations
+  const sveLdrRegSpec = getCounter(counters, '0x8091');
+  const sveStrRegSpec = getCounter(counters, '0x8092');
+  const sveLdrPregSpec = getCounter(counters, '0x8095');
+  const sveStrPregSpec = getCounter(counters, '0x8096');
+
+  if (sveLdrRegSpec !== null) {
+    metrics.push({
+      name: 'SVE LDR Ops',
+      value: sveLdrRegSpec,
+      unit: '',
+      category: 'SVE Load/Store',
+      format: 'count'
+    });
+  }
+
+  if (sveStrRegSpec !== null) {
+    metrics.push({
+      name: 'SVE STR Ops',
+      value: sveStrRegSpec,
+      unit: '',
+      category: 'SVE Load/Store',
+      format: 'count'
+    });
+  }
+
+  if (sveLdrPregSpec !== null) {
+    metrics.push({
+      name: 'SVE LDR Predicate Ops',
+      value: sveLdrPregSpec,
+      unit: '',
+      category: 'SVE Load/Store',
+      format: 'count'
+    });
+  }
+
+  if (sveStrPregSpec !== null) {
+    metrics.push({
+      name: 'SVE STR Predicate Ops',
+      value: sveStrPregSpec,
+      unit: '',
+      category: 'SVE Load/Store',
+      format: 'count'
+    });
+  }
+
+  // SVE Prefetch Operations
+  const svePrfContigSpec = getCounter(counters, '0x809f');
+  const svePrfGatherSpec = getCounter(counters, '0x80af');
+
+  if (svePrfContigSpec !== null) {
+    metrics.push({
+      name: 'SVE Contiguous Prefetch',
+      value: svePrfContigSpec,
+      unit: '',
+      category: 'SVE Prefetch',
+      format: 'count'
+    });
+  }
+
+  if (svePrfGatherSpec !== null) {
+    metrics.push({
+      name: 'SVE Gather Prefetch',
+      value: svePrfGatherSpec,
+      unit: '',
+      category: 'SVE Prefetch',
+      format: 'count'
+    });
+  }
+
+  // SVE First-Fault Load
+  const sveLdffSpec = getCounter(counters, '0x80bc');
+  if (sveLdffSpec !== null) {
+    metrics.push({
+      name: 'SVE First-Fault Loads',
+      value: sveLdffSpec,
+      unit: '',
+      category: 'SVE Load/Store',
+      format: 'count'
+    });
+  }
+
+  // Load/Store Counts
+  if (ldSpec !== null) {
+    metrics.push({
+      name: 'Load Instructions',
+      value: ldSpec,
+      unit: '',
+      category: 'Instruction Mix',
+      format: 'count'
+    });
+  }
+
+  if (stSpec !== null) {
+    metrics.push({
+      name: 'Store Instructions',
+      value: stSpec,
+      unit: '',
+      category: 'Instruction Mix',
+      format: 'count'
+    });
+  }
+
+  if (effectiveInst !== null) {
+    metrics.push({
+      name: 'Effective Instructions',
+      value: effectiveInst,
+      unit: '',
+      category: 'Instruction Mix',
+      format: 'count'
+    });
+  }
+
+  // Total Energy
+  if (eaCore !== null || eaL2 !== null || eaMemory !== null) {
+    const totalEnergy = (eaCore ? eaCore * 8 : 0) + (eaL2 ? eaL2 * 32 : 0) + (eaMemory ? eaMemory * 256 : 0);
+    metrics.push({
+      name: 'Total Energy',
+      value: totalEnergy / 1e9,
+      unit: 'J',
+      category: 'Energy'
+    });
+    if (elapsed > 0) {
+      metrics.push({
+        name: 'Average Power',
+        value: (totalEnergy / 1e9) / elapsed,
+        unit: 'W',
+        category: 'Energy'
+      });
+    }
+  }
+
   return metrics;
+}
+
+// =============================================================================
+// Section 3.5: Bottleneck Analysis Functions
+// =============================================================================
+
+function analyzeBottlenecks(counters, elapsed, cpuFreq) {
+  const findings = [];
+  const cycles = counters['PMCCNTR'];
+
+  // Helper to get metric value
+  const get = (code) => counters[code] !== undefined ? counters[code] : null;
+
+  // Thresholds for bottleneck detection
+  const THRESHOLDS = {
+    MEMORY_STALL_HIGH: 20,      // % of cycles
+    MEMORY_STALL_MODERATE: 10,
+    L2_MISS_STALL_HIGH: 15,
+    L1_MISS_RATE_HIGH: 20,      // %
+    L2_MISS_RATE_HIGH: 5,
+    TLB_MISS_RATE_HIGH: 1,
+    BRANCH_MISPREDICT_HIGH: 5,  // %
+    BRANCH_MISPREDICT_MODERATE: 1,
+    FP_STALL_HIGH: 10,
+    STALL_RATE_HIGH: 30,
+    STALL_RATE_MODERATE: 15,
+    IPC_LOW: 1.0,
+    IPC_MODERATE: 2.0,
+    VECTORIZATION_LOW: 50,      // % SVE utilization
+    PREDICATION_LOW: 6,         // avg active elements (out of 8 for DP)
+    ROB_EMPTY_HIGH: 10,
+    GATHER_RATIO_HIGH: 20,      // % of loads being gathers
+    MEMORY_BW_HIGH: 800,        // GB/s (A64FX peak ~1TB/s)
+  };
+
+  // === IPC Analysis ===
+  const effectiveInst = get('0x0121');
+  if (effectiveInst !== null && cycles !== null && cycles > 0) {
+    const ipc = effectiveInst / cycles;
+    if (ipc < THRESHOLDS.IPC_LOW) {
+      findings.push({
+        severity: 'high',
+        category: 'Core Performance',
+        issue: `Very low IPC (${ipc.toFixed(2)})`,
+        detail: 'Instructions per cycle is below 1.0, indicating significant stalls or inefficiencies.',
+        suggestions: [
+          'Check memory access patterns for cache misses',
+          'Look for data dependencies causing pipeline stalls',
+          'Consider loop unrolling or software pipelining'
+        ]
+      });
+    } else if (ipc < THRESHOLDS.IPC_MODERATE) {
+      findings.push({
+        severity: 'medium',
+        category: 'Core Performance',
+        issue: `Moderate IPC (${ipc.toFixed(2)})`,
+        detail: 'IPC is below 2.0. A64FX can retire up to 4 instructions/cycle.',
+        suggestions: [
+          'Analyze stall breakdown to identify limiting factors',
+          'Check for instruction-level parallelism opportunities'
+        ]
+      });
+    }
+  }
+
+  // === Memory Stall Analysis ===
+  const ldCompWait = get('0x0184');
+  const ldCompWaitL2Miss = get('0x0180');
+  const ldCompWaitL1Miss = get('0x0182');
+
+  if (ldCompWait !== null && cycles !== null && cycles > 0) {
+    const memStallPct = (ldCompWait / cycles) * 100;
+    if (memStallPct > THRESHOLDS.MEMORY_STALL_HIGH) {
+      findings.push({
+        severity: 'high',
+        category: 'Memory',
+        issue: `High memory stall rate (${memStallPct.toFixed(1)}%)`,
+        detail: 'Significant time spent waiting for memory operations.',
+        suggestions: [
+          'Use software prefetching (PRFM instructions)',
+          'Improve data locality and cache blocking',
+          'Consider data layout changes for better cache utilization',
+          'Check for false sharing in multi-threaded code'
+        ]
+      });
+    } else if (memStallPct > THRESHOLDS.MEMORY_STALL_MODERATE) {
+      findings.push({
+        severity: 'medium',
+        category: 'Memory',
+        issue: `Moderate memory stall rate (${memStallPct.toFixed(1)}%)`,
+        detail: 'Noticeable time spent waiting for memory.',
+        suggestions: [
+          'Review memory access patterns',
+          'Consider prefetching for predictable access patterns'
+        ]
+      });
+    }
+  }
+
+  // === L2 Miss Stall ===
+  if (ldCompWaitL2Miss !== null && cycles !== null && cycles > 0) {
+    const l2StallPct = (ldCompWaitL2Miss / cycles) * 100;
+    if (l2StallPct > THRESHOLDS.L2_MISS_STALL_HIGH) {
+      findings.push({
+        severity: 'high',
+        category: 'Memory',
+        issue: `High L2 miss stall (${l2StallPct.toFixed(1)}%)`,
+        detail: 'Significant time waiting for data from main memory.',
+        suggestions: [
+          'Working set may exceed L2 cache (8MB per CMG)',
+          'Use cache blocking/tiling to fit in L2',
+          'Increase prefetch distance for L2 prefetches',
+          'Consider NUMA-aware memory allocation'
+        ]
+      });
+    }
+  }
+
+  // === Cache Miss Rate Analysis ===
+  const l1dRefill = get('0x0003');
+  const ldSpec = get('0x0070');
+  const stSpec = get('0x0071');
+
+  if (l1dRefill !== null && ldSpec !== null && stSpec !== null) {
+    const ldstSpec = ldSpec + stSpec;
+    if (ldstSpec > 0) {
+      const l1MissRate = (l1dRefill / ldstSpec) * 100;
+      if (l1MissRate > THRESHOLDS.L1_MISS_RATE_HIGH) {
+        findings.push({
+          severity: 'high',
+          category: 'Cache',
+          issue: `High L1D miss rate (${l1MissRate.toFixed(1)}%)`,
+          detail: 'Many memory accesses miss the L1 data cache.',
+          suggestions: [
+            'Improve spatial locality (sequential access patterns)',
+            'Use smaller data types if precision allows',
+            'Consider Structure of Arrays (SoA) layout',
+            'Check for cache line splitting in unaligned accesses'
+          ]
+        });
+      }
+    }
+  }
+
+  // === L2 Miss Rate ===
+  const l2MissCountRaw = get('0x0309');
+  const l2dCacheSwapLocal = get('0x0396');
+  const l2PipeCompPfL2mibMch = get('0x0370');
+
+  if (l2MissCountRaw !== null && l2dCacheSwapLocal !== null && l2PipeCompPfL2mibMch !== null) {
+    const l2MissCount = l2MissCountRaw - l2dCacheSwapLocal - l2PipeCompPfL2mibMch;
+    if (ldSpec !== null && stSpec !== null) {
+      const ldstSpec = ldSpec + stSpec;
+      if (ldstSpec > 0) {
+        const l2MissRate = (l2MissCount / ldstSpec) * 100;
+        if (l2MissRate > THRESHOLDS.L2_MISS_RATE_HIGH) {
+          findings.push({
+            severity: 'high',
+            category: 'Cache',
+            issue: `High L2 miss rate (${l2MissRate.toFixed(1)}%)`,
+            detail: 'Significant traffic going to main memory.',
+            suggestions: [
+              'Apply cache blocking to fit working set in L2 (8MB)',
+              'Use L2 prefetching (PRFM PLDL2KEEP/STRM)',
+              'Consider data compression to reduce memory footprint'
+            ]
+          });
+        }
+      }
+    }
+  }
+
+  // === TLB Analysis ===
+  const l1dTlbRefill = get('0x0005');
+  const l2dTlbRefill = get('0x002d');
+
+  if (l1dTlbRefill !== null && ldSpec !== null && stSpec !== null) {
+    const ldstSpec = ldSpec + stSpec;
+    if (ldstSpec > 0) {
+      const tlbMissRate = (l1dTlbRefill / ldstSpec) * 100;
+      if (tlbMissRate > THRESHOLDS.TLB_MISS_RATE_HIGH) {
+        findings.push({
+          severity: 'medium',
+          category: 'TLB',
+          issue: `High TLB miss rate (${tlbMissRate.toFixed(2)}%)`,
+          detail: 'Address translation overhead is significant.',
+          suggestions: [
+            'Use huge pages (2MB or 1GB) to reduce TLB pressure',
+            'Improve memory access locality',
+            'Consider reducing working set size'
+          ]
+        });
+      }
+    }
+  }
+
+  // === Branch Prediction ===
+  const brMisPred = get('0x0010');
+  const brPred = get('0x0012');
+
+  if (brMisPred !== null && brPred !== null && brPred > 0) {
+    const misPredRate = (brMisPred / brPred) * 100;
+    if (misPredRate > THRESHOLDS.BRANCH_MISPREDICT_HIGH) {
+      findings.push({
+        severity: 'high',
+        category: 'Branch',
+        issue: `High branch misprediction rate (${misPredRate.toFixed(2)}%)`,
+        detail: 'Branch mispredictions cause pipeline flushes.',
+        suggestions: [
+          'Use branchless code where possible (CSEL, conditional moves)',
+          'Sort data to make branches more predictable',
+          'Use SVE predication instead of branches',
+          'Consider loop unswitching'
+        ]
+      });
+    } else if (misPredRate > THRESHOLDS.BRANCH_MISPREDICT_MODERATE) {
+      findings.push({
+        severity: 'low',
+        category: 'Branch',
+        issue: `Moderate branch misprediction rate (${misPredRate.toFixed(2)}%)`,
+        detail: 'Some branch mispredictions detected.',
+        suggestions: [
+          'Review branch-heavy code sections',
+          'Consider predicated instructions'
+        ]
+      });
+    }
+  }
+
+  // === FP/SIMD Stall ===
+  const flCompWait = get('0x018a');
+  if (flCompWait !== null && cycles !== null && cycles > 0) {
+    const fpStallPct = (flCompWait / cycles) * 100;
+    if (fpStallPct > THRESHOLDS.FP_STALL_HIGH) {
+      findings.push({
+        severity: 'medium',
+        category: 'Compute',
+        issue: `High FP/SIMD stall (${fpStallPct.toFixed(1)}%)`,
+        detail: 'Waiting for floating-point or SIMD operations.',
+        suggestions: [
+          'Check for long-latency FP operations (divisions, sqrt)',
+          'Increase instruction-level parallelism',
+          'Use FMA instructions to combine multiply-add',
+          'Consider reciprocal approximations instead of divisions'
+        ]
+      });
+    }
+  }
+
+  // === Overall Stall Rate ===
+  const zeroInstCommit = get('0x0190');
+  if (zeroInstCommit !== null && cycles !== null && cycles > 0) {
+    const stallRate = (zeroInstCommit / cycles) * 100;
+    if (stallRate > THRESHOLDS.STALL_RATE_HIGH) {
+      findings.push({
+        severity: 'high',
+        category: 'Core Performance',
+        issue: `Very high stall rate (${stallRate.toFixed(1)}%)`,
+        detail: 'CPU spends significant time without committing instructions.',
+        suggestions: [
+          'Analyze memory stall breakdown for root cause',
+          'Check for resource conflicts (registers, execution units)'
+        ]
+      });
+    }
+  }
+
+  // === SVE Vectorization Efficiency ===
+  const flaValPrdCnt = get('0x01b4');
+  const flaVal = get('0x01a4');
+  const flbValPrdCnt = get('0x01b5');
+  const flbVal = get('0x01a5');
+
+  if (flaValPrdCnt !== null && flaVal !== null && flaVal > 0) {
+    const avgActiveElements = flaValPrdCnt / flaVal;
+    // For DP, max is 8 elements; for SP, max is 16
+    if (avgActiveElements < THRESHOLDS.PREDICATION_LOW) {
+      findings.push({
+        severity: 'medium',
+        category: 'Vectorization',
+        issue: `Low vector utilization (${avgActiveElements.toFixed(1)} avg elements)`,
+        detail: 'SVE vectors are not fully utilized (max 8 for DP, 16 for SP).',
+        suggestions: [
+          'Check for loop remainder handling',
+          'Ensure data is aligned to vector boundaries',
+          'Consider padding arrays to vector length multiples',
+          'Review predication patterns for partial vector operations'
+        ]
+      });
+    }
+  }
+
+  // === Gather/Scatter Analysis ===
+  const sveGatherSpec = get('0x80ad');
+  const aseSveLdSpec = get('0x8085');
+
+  if (sveGatherSpec !== null && aseSveLdSpec !== null && aseSveLdSpec > 0) {
+    const gatherRatio = (sveGatherSpec / aseSveLdSpec) * 100;
+    if (gatherRatio > THRESHOLDS.GATHER_RATIO_HIGH) {
+      findings.push({
+        severity: 'medium',
+        category: 'Vectorization',
+        issue: `High gather load ratio (${gatherRatio.toFixed(1)}%)`,
+        detail: 'Many loads use gather operations which are slower than contiguous loads.',
+        suggestions: [
+          'Restructure data for contiguous access',
+          'Consider data layout transformations (AoS to SoA)',
+          'Pre-gather data into temporary contiguous buffers'
+        ]
+      });
+    }
+  }
+
+  // === ROB Empty Analysis ===
+  const robEmpty = get('0x018c');
+  if (robEmpty !== null && cycles !== null && cycles > 0) {
+    const robEmptyRate = (robEmpty / cycles) * 100;
+    if (robEmptyRate > THRESHOLDS.ROB_EMPTY_HIGH) {
+      findings.push({
+        severity: 'medium',
+        category: 'Frontend',
+        issue: `High ROB empty rate (${robEmptyRate.toFixed(1)}%)`,
+        detail: 'Instruction supply is not keeping up with execution.',
+        suggestions: [
+          'Check for L1I cache misses',
+          'Look for instruction fetch bottlenecks',
+          'Consider code layout optimization'
+        ]
+      });
+    }
+  }
+
+  // === Memory Bandwidth Analysis ===
+  const busReadMem = get('0x0316');
+  const busWriteMem = get('0x031e');
+
+  if (busReadMem !== null && busWriteMem !== null && elapsed > 0) {
+    const readBw = (busReadMem * 256) / (elapsed * 1e9);
+    const writeBw = (busWriteMem * 256) / (elapsed * 1e9);
+    const totalBw = readBw + writeBw;
+
+    // A64FX theoretical peak: ~1TB/s (all channels)
+    // Practical sustained: ~800 GB/s
+    if (totalBw > THRESHOLDS.MEMORY_BW_HIGH) {
+      findings.push({
+        severity: 'info',
+        category: 'Memory',
+        issue: `High memory bandwidth utilization (${totalBw.toFixed(1)} GB/s)`,
+        detail: 'Application is memory bandwidth intensive.',
+        suggestions: [
+          'Workload is memory-bound; optimize for memory efficiency',
+          'Consider cache blocking to reduce memory traffic',
+          'Use non-temporal stores for write-only data'
+        ]
+      });
+    }
+  }
+
+  // === FMA Utilization ===
+  const fpFmaSpec = get('0x8028');
+  const fpSpec = get('0x8010');
+
+  if (fpFmaSpec !== null && fpSpec !== null && fpSpec > 0) {
+    const fmaRatio = (fpFmaSpec / fpSpec) * 100;
+    if (fmaRatio < 50) {
+      findings.push({
+        severity: 'low',
+        category: 'Compute',
+        issue: `Low FMA utilization (${fmaRatio.toFixed(1)}%)`,
+        detail: 'Not all FP operations use fused multiply-add.',
+        suggestions: [
+          'Use -ffp-contract=fast compiler flag',
+          'Restructure computations to enable FMA fusion',
+          'Consider using FMA intrinsics explicitly'
+        ]
+      });
+    }
+  }
+
+  // === Commit Distribution Analysis ===
+  const fourInstCommit = get('0x0194');
+  if (fourInstCommit !== null && cycles !== null && cycles > 0) {
+    const fourCommitRate = (fourInstCommit / cycles) * 100;
+    if (fourCommitRate < 30) {
+      findings.push({
+        severity: 'low',
+        category: 'Core Performance',
+        issue: `Low 4-instruction commit rate (${fourCommitRate.toFixed(1)}%)`,
+        detail: 'CPU rarely commits maximum 4 instructions per cycle.',
+        suggestions: [
+          'Increase instruction-level parallelism',
+          'Reduce data dependencies between instructions',
+          'Consider loop unrolling'
+        ]
+      });
+    }
+  }
+
+  // Sort findings by severity
+  const severityOrder = { high: 0, medium: 1, low: 2, info: 3 };
+  findings.sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
+
+  return findings;
+}
+
+function formatBottleneckAnalysis(findings) {
+  if (findings.length === 0) {
+    return {
+      ascii: ['No significant bottlenecks detected. Performance appears well-optimized.'],
+      html: '<p class="no-issues">No significant bottlenecks detected. Performance appears well-optimized.</p>'
+    };
+  }
+
+  const ascii = [];
+  let html = '';
+
+  const severityColors = {
+    high: '#dc3545',
+    medium: '#ffc107',
+    low: '#17a2b8',
+    info: '#6c757d'
+  };
+
+  const severityIcons = {
+    high: '[!]',
+    medium: '[*]',
+    low: '[-]',
+    info: '[i]'
+  };
+
+  for (const finding of findings) {
+    // ASCII format
+    ascii.push(`${severityIcons[finding.severity]} ${finding.category}: ${finding.issue}`);
+    ascii.push(`    ${finding.detail}`);
+    ascii.push('    Suggestions:');
+    for (const suggestion of finding.suggestions) {
+      ascii.push(`      - ${suggestion}`);
+    }
+    ascii.push('');
+
+    // HTML format
+    html += `
+    <div class="finding finding-${finding.severity}">
+      <div class="finding-header">
+        <span class="severity" style="background: ${severityColors[finding.severity]}">${finding.severity.toUpperCase()}</span>
+        <span class="category">${finding.category}</span>
+        <span class="issue">${finding.issue}</span>
+      </div>
+      <p class="detail">${finding.detail}</p>
+      <ul class="suggestions">
+        ${finding.suggestions.map(s => `<li>${s}</li>`).join('\n        ')}
+      </ul>
+    </div>`;
+  }
+
+  return { ascii, html };
 }
 
 // =============================================================================
@@ -835,6 +2408,18 @@ function formatASCII(data, selectedRegions) {
         lines.push(line);
       }
       lines.push('');
+    }
+
+    // Bottleneck Analysis
+    const findings = analyzeBottlenecks(region.counters, region.elapsed, data.cpuFrequency);
+    const analysis = formatBottleneckAnalysis(findings);
+
+    lines.push(sepThin);
+    lines.push('BOTTLENECK ANALYSIS');
+    lines.push(sepThin);
+    lines.push('');
+    for (const line of analysis.ascii) {
+      lines.push(line);
     }
   }
 
@@ -923,6 +2508,70 @@ function formatHTML(data, selectedRegions) {
     .good { color: #28a745; }
     .warn { color: #ffc107; }
     .bad { color: #dc3545; }
+    .analysis-section {
+      margin-top: 30px;
+      padding-top: 20px;
+      border-top: 2px solid #007acc;
+    }
+    .analysis-section h3 {
+      color: #007acc;
+      margin-bottom: 15px;
+    }
+    .finding {
+      background: #fff;
+      border-left: 4px solid #ccc;
+      padding: 15px;
+      margin-bottom: 15px;
+      border-radius: 0 8px 8px 0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .finding-high { border-left-color: #dc3545; background: #fff5f5; }
+    .finding-medium { border-left-color: #ffc107; background: #fffdf5; }
+    .finding-low { border-left-color: #17a2b8; background: #f5fbff; }
+    .finding-info { border-left-color: #6c757d; background: #f8f9fa; }
+    .finding-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .severity {
+      color: white;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75em;
+      font-weight: bold;
+      text-transform: uppercase;
+    }
+    .category {
+      font-weight: 600;
+      color: #555;
+    }
+    .issue {
+      color: #333;
+    }
+    .detail {
+      color: #666;
+      margin: 10px 0;
+      font-size: 0.95em;
+    }
+    .suggestions {
+      margin: 10px 0 0 0;
+      padding-left: 20px;
+    }
+    .suggestions li {
+      color: #555;
+      margin: 5px 0;
+      font-size: 0.9em;
+    }
+    .no-issues {
+      color: #28a745;
+      font-style: italic;
+      padding: 20px;
+      text-align: center;
+      background: #f0fff4;
+      border-radius: 8px;
+    }
   </style>
 </head>
 <body>
@@ -970,6 +2619,17 @@ function formatHTML(data, selectedRegions) {
       }
       html += `    </table>\n`;
     }
+
+    // Bottleneck Analysis
+    const findings = analyzeBottlenecks(region.counters, region.elapsed, data.cpuFrequency);
+    const analysis = formatBottleneckAnalysis(findings);
+
+    html += `
+    <div class="analysis-section">
+      <h3>Bottleneck Analysis</h3>
+      ${analysis.html}
+    </div>
+`;
 
     html += `  </div>\n`;
   }
