@@ -2663,6 +2663,26 @@ function formatHTML(data, selectedRegions) {
       background: #f0fff4;
       border-radius: 8px;
     }
+    .tooltip {
+      position: relative;
+      cursor: help;
+      border-bottom: 1px dotted #666;
+    }
+    .tooltip:hover::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      left: 0;
+      top: 100%;
+      margin-top: 5px;
+      padding: 8px 12px;
+      background: #333;
+      color: #fff;
+      font-size: 0.85em;
+      border-radius: 4px;
+      white-space: nowrap;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
   </style>
 </head>
 <body>
@@ -2670,7 +2690,7 @@ function formatHTML(data, selectedRegions) {
 
   <div class="info-box">
     <p><strong>Profile Time:</strong> ${data.info.measuredTime || 'N/A'}</p>
-    <p><strong>CPU Frequency:</strong> ${data.cpuFrequency} MHz</p>
+    <p><strong>CPU Frequency:</strong> <span class="tooltip" data-tooltip="Note: FAPP profiler reports 2200 MHz regardless of actual operating frequency (e.g., 2000 MHz mode)">${data.cpuFrequency} MHz</span></p>
     <p><strong>Vector Length:</strong> ${data.info.vectorLength || 512} bits</p>
   </div>
 `;
