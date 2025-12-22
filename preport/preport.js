@@ -507,18 +507,24 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
 
   // L1 Load-Store Instructions breakdown
   // Reference breakdown:
-  // - Total = LD_SPEC + ST_SPEC
+  // - Total = LD_SPEC + ST_SPEC + FP_LD_SPEC + FP_ST_SPEC
   // - Single Vector Loads = ASE_SVE_LD_SPEC - BC_LD_SPEC
   // - Broadcast Loads = BC_LD_SPEC
-  // - Non-SIMD Loads = LD_SPEC - ASE_SVE_LD_SPEC (scalar loads)
+  // - Non-SIMD Loads = LD_SPEC + FP_LD_SPEC - ASE_SVE_LD_SPEC (scalar int + FP loads)
   // - Single Vector Stores = ASE_SVE_ST_SPEC
-  // - Non-SIMD Stores = ST_SPEC - ASE_SVE_ST_SPEC (scalar stores)
+  // - Non-SIMD Stores = ST_SPEC + FP_ST_SPEC - ASE_SVE_ST_SPEC (scalar int + FP stores)
+  // Note: LD_SPEC/ST_SPEC count integer loads/stores, FP_LD_SPEC/FP_ST_SPEC count FP scalar loads/stores
   const aseSveLdSpecForL1 = getCounter(counters, '0x8085');  // ASE_SVE_LD_SPEC
   const aseSveStSpecForL1 = getCounter(counters, '0x8086');  // ASE_SVE_ST_SPEC
   const bcLdSpecForL1 = getCounter(counters, '0x011a');      // BC_LD_SPEC (broadcast loads)
+  const fpLdSpecForL1 = getCounter(counters, '0x0112');       // FP_LD_SPEC (FP scalar loads)
+  const fpStSpecForL1 = getCounter(counters, '0x0113');       // FP_ST_SPEC (FP scalar stores)
 
   if (ldSpec !== null && stSpec !== null) {
-    const totalLdSt = ldSpec + stSpec;
+    // Total includes integer and FP scalar loads/stores
+    const fpLd = fpLdSpecForL1 !== null ? fpLdSpecForL1 : 0;
+    const fpSt = fpStSpecForL1 !== null ? fpStSpecForL1 : 0;
+    const totalLdSt = ldSpec + stSpec + fpLd + fpSt;
     metrics.push({
       name: 'Total L1 Load-Store',
       value: totalLdSt,
@@ -550,7 +556,9 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
   }
 
   if (ldSpec !== null && aseSveLdSpecForL1 !== null) {
-    const nonSimdLoads = ldSpec - aseSveLdSpecForL1;
+    // Non-SIMD loads = integer scalar loads + FP scalar loads
+    const fpLd = fpLdSpecForL1 !== null ? fpLdSpecForL1 : 0;
+    const nonSimdLoads = ldSpec + fpLd - aseSveLdSpecForL1;
     metrics.push({
       name: 'Non-SIMD Loads',
       value: nonSimdLoads,
@@ -571,7 +579,9 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
   }
 
   if (stSpec !== null && aseSveStSpecForL1 !== null) {
-    const nonSimdStores = stSpec - aseSveStSpecForL1;
+    // Non-SIMD stores = integer scalar stores + FP scalar stores
+    const fpSt = fpStSpecForL1 !== null ? fpStSpecForL1 : 0;
+    const nonSimdStores = stSpec + fpSt - aseSveStSpecForL1;
     metrics.push({
       name: 'Non-SIMD Stores',
       value: nonSimdStores,
