@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A64FX Performance Report</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 {
+      color: #333;
+      border-bottom: 3px solid #007acc;
+      padding-bottom: 10px;
+    }
+    h2 {
+      color: #007acc;
+      margin-top: 30px;
+    }
+    h3 {
+      color: #555;
+      margin-top: 20px;
+    }
+    .info-box {
+      background: #fff;
+      padding: 15px 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      margin-bottom: 20px;
+    }
+    .info-box p {
+      margin: 5px 0;
+    }
+    .region {
+      background: #fff;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      margin-bottom: 20px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0;
+    }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid #ddd;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: 600;
+    }
+    tr:hover {
+      background: #f9f9f9;
+    }
+    .value {
+      text-align: right;
+      font-family: 'Consolas', 'Monaco', monospace;
+    }
+    .unit {
+      color: #666;
+      font-size: 0.9em;
+    }
+    .good { color: #28a745; }
+    .warn { color: #ffc107; }
+    .bad { color: #dc3545; }
+    .analysis-section {
+      margin-top: 30px;
+      padding-top: 20px;
+      border-top: 2px solid #007acc;
+    }
+    .analysis-section h3 {
+      color: #007acc;
+      margin-bottom: 15px;
+    }
+    .finding {
+      background: #fff;
+      border-left: 4px solid #ccc;
+      padding: 15px;
+      margin-bottom: 15px;
+      border-radius: 0 8px 8px 0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .finding-high { border-left-color: #dc3545; background: #fff5f5; }
+    .finding-medium { border-left-color: #ffc107; background: #fffdf5; }
+    .finding-low { border-left-color: #17a2b8; background: #f5fbff; }
+    .finding-info { border-left-color: #6c757d; background: #f8f9fa; }
+    .finding-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .severity {
+      color: white;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75em;
+      font-weight: bold;
+      text-transform: uppercase;
+    }
+    .category {
+      font-weight: 600;
+      color: #555;
+    }
+    .issue {
+      color: #333;
+    }
+    .detail {
+      color: #666;
+      margin: 10px 0;
+      font-size: 0.95em;
+    }
+    .suggestions {
+      margin: 10px 0 0 0;
+      padding-left: 20px;
+    }
+    .suggestions li {
+      color: #555;
+      margin: 5px 0;
+      font-size: 0.9em;
+    }
+    .no-issues {
+      color: #28a745;
+      font-style: italic;
+      padding: 20px;
+      text-align: center;
+      background: #f0fff4;
+      border-radius: 8px;
+    }
+    .tooltip {
+      position: relative;
+      cursor: help;
+      border-bottom: 1px dotted #666;
+    }
+    .tooltip:hover::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      left: 0;
+      top: 100%;
+      margin-top: 5px;
+      padding: 8px 12px;
+      background: #333;
+      color: #fff;
+      font-size: 0.85em;
+      border-radius: 4px;
+      white-space: nowrap;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+  </style>
+</head>
+<body>
+  <h1>A64FX Performance Report</h1>
+
+  <div class="info-box">
+    <p><strong>Profile Time:</strong> Sat Dec 20 02:45:04 2025</p>
+    <p><strong>CPU Frequency:</strong> <span class="tooltip" data-tooltip="Note: FAPP profiler reports 2200 MHz regardless of actual operating frequency (e.g., 2000 MHz mode)">2200 MHz</span></p>
+    <p><strong>Vector Length:</strong> 512 bits</p>
+  </div>
+
+  <div class="region">
+    <h2>Region: dgemm_kernel</h2>
+    <p><strong>Elapsed Time:</strong> 4.277784 s</p>
+
+    <h3>Core Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>IPC</td><td class="value">3.15</td><td class="unit"></td></tr>
+      <tr><td>CPI</td><td class="value">0.32</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Cache Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1D Miss Rate</td><td class="value">11.37</td><td class="unit">%</td></tr>
+      <tr><td>L1D Miss Demand Rate</td><td class="value">0.91</td><td class="unit">%</td></tr>
+      <tr><td>L1D Miss HW Prefetch Rate</td><td class="value">0.52</td><td class="unit">%</td></tr>
+      <tr><td>L1D Miss SW Prefetch Rate</td><td class="value">98.56</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss Rate</td><td class="value">0.70</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss Demand Rate</td><td class="value">58.88</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss HW Prefetch Rate</td><td class="value">45.38</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss SW Prefetch Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>L1 Load-Store Instructions</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Total L1 Load-Store</td><td class="value">7.78 G</td><td class="unit"></td></tr>
+      <tr><td>Single Vector Loads</td><td class="value">3.48 G</td><td class="unit"></td></tr>
+      <tr><td>Broadcast Loads</td><td class="value">4.10 G</td><td class="unit"></td></tr>
+      <tr><td>Non-SIMD Loads</td><td class="value">541.90 K</td><td class="unit"></td></tr>
+      <tr><td>Single Vector Stores</td><td class="value">204.80 M</td><td class="unit"></td></tr>
+      <tr><td>Non-SIMD Stores</td><td class="value">23.09 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Floating-Point Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>GFLOPS (SVE)</td><td class="value">61.28</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS (SIMD)</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS (Total)</td><td class="value">61.28</td><td class="unit"></td></tr>
+      <tr><td>FP Operations</td><td class="value">262.14 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Memory Bandwidth</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Memory Read BW</td><td class="value">3.26</td><td class="unit">GB/s</td></tr>
+      <tr><td>Memory Write BW</td><td class="value">3.07</td><td class="unit">GB/s</td></tr>
+    </table>
+
+    <h3>Busy Rate</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Memory Busy</td><td class="value">2.46</td><td class="unit">%</td></tr>
+      <tr><td>L1 Busy</td><td class="value">77.90</td><td class="unit">%</td></tr>
+      <tr><td>L2 Busy</td><td class="value">5.96</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>Pipeline Utilization</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Stall Rate (0-commit)</td><td class="value">8.83</td><td class="unit">%</td></tr>
+      <tr><td>Memory Stall</td><td class="value">8.52</td><td class="unit">%</td></tr>
+      <tr><td>FP/SIMD Stall</td><td class="value">0.33</td><td class="unit">%</td></tr>
+      <tr><td>FLA Utilization</td><td class="value">89.97</td><td class="unit">%</td></tr>
+      <tr><td>FLB Utilization</td><td class="value">87.81</td><td class="unit">%</td></tr>
+      <tr><td>Integer A Utilization</td><td class="value">7.51</td><td class="unit">%</td></tr>
+      <tr><td>Integer B Utilization</td><td class="value">4.89</td><td class="unit">%</td></tr>
+      <tr><td>EAGA Utilization</td><td class="value">60.18</td><td class="unit">%</td></tr>
+      <tr><td>EAGB Utilization</td><td class="value">58.27</td><td class="unit">%</td></tr>
+      <tr><td>PRX Utilization</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Integer Stall</td><td class="value">0.31</td><td class="unit">%</td></tr>
+      <tr><td>Branch Stall</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>SVE Utilization</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SIMD Instructions</td><td class="value">24.17 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Energy</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Core Energy</td><td class="value">10.50</td><td class="unit">J</td></tr>
+      <tr><td>L2 Energy</td><td class="value">7.25</td><td class="unit">J</td></tr>
+      <tr><td>Memory Energy</td><td class="value">9.25</td><td class="unit">J</td></tr>
+      <tr><td>Total Energy</td><td class="value">27.00</td><td class="unit">J</td></tr>
+      <tr><td>Average Power</td><td class="value">6.31</td><td class="unit">W</td></tr>
+    </table>
+
+    <h3>Branch Prediction</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Branch Mispredict Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Branch Mispredictions</td><td class="value">2.45 K</td><td class="unit"></td></tr>
+      <tr><td>Branch Predictions</td><td class="value">420.63 M</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>TLB Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1D TLB Miss Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>L2D TLB Miss Rate</td><td class="value">0.68</td><td class="unit">%</td></tr>
+      <tr><td>L1D TLB Misses</td><td class="value">438.00</td><td class="unit"></td></tr>
+      <tr><td>L2D TLB Misses</td><td class="value">3.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Memory Stall Breakdown</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L2 Miss Stall</td><td class="value">2.72</td><td class="unit">%</td></tr>
+      <tr><td>L1 Miss Stall</td><td class="value">6.00</td><td class="unit">%</td></tr>
+      <tr><td>Prefetch Port Stall</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss Stall (Int)</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>L1 Miss Stall (Int)</td><td class="value">0.13</td><td class="unit">%</td></tr>
+      <tr><td>Memory Stall (Int)</td><td class="value">0.13</td><td class="unit">%</td></tr>
+      <tr><td>Prefetch Port Stall (Int)</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Prefetch Port Stall (SW PF)</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>Commit Distribution</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>1-Inst Commit Rate</td><td class="value">6.94</td><td class="unit">%</td></tr>
+      <tr><td>2-Inst Commit Rate</td><td class="value">12.82</td><td class="unit">%</td></tr>
+      <tr><td>3-Inst Commit Rate</td><td class="value">4.32</td><td class="unit">%</td></tr>
+      <tr><td>4-Inst Commit Rate</td><td class="value">67.40</td><td class="unit">%</td></tr>
+      <tr><td>UOP Only Commit Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>MOVPRFX Only Commit Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>FP Precision Breakdown</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>GFLOPS SP (SVE)</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS SP (SIMD)</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS DP (SVE)</td><td class="value">61.28</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS DP (SIMD)</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>FP Instruction Breakdown</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>FMA Ratio</td><td class="value">100.00</td><td class="unit">%</td></tr>
+      <tr><td>FMA Operations</td><td class="value">16.38 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE/SIMD Operations</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SIMD/SVE Loads</td><td class="value">7.58 G</td><td class="unit"></td></tr>
+      <tr><td>SIMD/SVE Stores</td><td class="value">204.80 M</td><td class="unit"></td></tr>
+      <tr><td>SVE Gather Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Scatter Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Multi-Vec Loads</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Multi-Vec Stores</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>Prefetch Ops</td><td class="value">942.08 M</td><td class="unit"></td></tr>
+      <tr><td>Gather Ratio</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Scatter Ratio</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Broadcast Loads</td><td class="value">4.10 G</td><td class="unit"></td></tr>
+      <tr><td>SVE Math Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SIMD/SVE Integer Ops</td><td class="value">32.00</td><td class="unit"></td></tr>
+      <tr><td>SVE MOVPRFX Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>HW Prefetch</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1 HW Stream Prefetch</td><td class="value">4.87 M</td><td class="unit"></td></tr>
+      <tr><td>L2 HW Stream Prefetch</td><td class="value">8.08 M</td><td class="unit"></td></tr>
+      <tr><td>L1 HW Prefetch Total</td><td class="value">4.87 M</td><td class="unit"></td></tr>
+      <tr><td>L2 HW Prefetch Total</td><td class="value">8.08 M</td><td class="unit"></td></tr>
+      <tr><td>L2 HW Prefetch Other</td><td class="value">40.91 M</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Bus Traffic</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>CMG Write BW</td><td class="value">3.07</td><td class="unit">GB/s</td></tr>
+      <tr><td>Tofu Read BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+      <tr><td>Tofu Write BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+      <tr><td>PCI Read BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+      <tr><td>PCI Write BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+    </table>
+
+    <h3>L1 Cache Details</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1D Requests</td><td class="value">8.73 G</td><td class="unit"></td></tr>
+      <tr><td>L1D Abort Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>L1 Pipe0 Predicate Count</td><td class="value">74.18 G</td><td class="unit"></td></tr>
+      <tr><td>L1 Pipe1 Predicate Count</td><td class="value">65.42 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Micro-op Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Micro-ops per Inst</td><td class="value">1.00</td><td class="unit"></td></tr>
+      <tr><td>Micro-op Splits</td><td class="value">29.41 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>ROB Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>ROB Empty Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>ROB Empty (STQ Busy)</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>L1I Cache</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1I Cache Refills</td><td class="value">394.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>L2 Cache Details</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L2D Cache Write-backs</td><td class="value">51.15 M</td><td class="unit"></td></tr>
+      <tr><td>L2 OC Read MIB Hits</td><td class="value">54.43 M</td><td class="unit"></td></tr>
+      <tr><td>L2 OC Write MIB Hits</td><td class="value">9.67 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Special Instructions</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Crypto Instructions</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>DC ZVA Instructions</td><td class="value">8.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>FP Operations Detail</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>FP Move Ops</td><td class="value">9.00</td><td class="unit"></td></tr>
+      <tr><td>FP Load Ops</td><td class="value">4.02 K</td><td class="unit"></td></tr>
+      <tr><td>FP Store Ops</td><td class="value">4.02 K</td><td class="unit"></td></tr>
+      <tr><td>FP Reciprocal Estimate Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>FP Convert Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE Register Ops</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Predicate Ops</td><td class="value">1.02 K</td><td class="unit"></td></tr>
+      <tr><td>Inter-element Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>Inter-register Ops</td><td class="value">9.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Idle Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>WFE/WFI Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>SVE Predication</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>FLA Predicate Count</td><td class="value">131.05 G</td><td class="unit"></td></tr>
+      <tr><td>FLB Predicate Count</td><td class="value">131.10 G</td><td class="unit"></td></tr>
+      <tr><td>FLA Avg Active Elements</td><td class="value">15.61</td><td class="unit"></td></tr>
+      <tr><td>FLB Avg Active Elements</td><td class="value">16.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Gather Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Gather 2-Flow</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>Gather 1-Flow</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>Gather 0-Flow</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE Load/Store</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SVE LDR Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE STR Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE LDR Predicate Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE STR Predicate Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE First-Fault Loads</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE Prefetch</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SVE Contiguous Prefetch</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Gather Prefetch</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Instruction Mix</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Load Instructions</td><td class="value">7.58 G</td><td class="unit"></td></tr>
+      <tr><td>Store Instructions</td><td class="value">204.82 M</td><td class="unit"></td></tr>
+      <tr><td>Effective Instructions</td><td class="value">29.41 G</td><td class="unit"></td></tr>
+    </table>
+
+    <div class="analysis-section">
+      <h3>Bottleneck Analysis</h3>
+      <p class="no-issues">No significant bottlenecks detected. Performance appears well-optimized.</p>
+    </div>
+  </div>
+
+  <div class="region">
+    <h2>Region: all</h2>
+    <p><strong>Elapsed Time:</strong> 4.344680 s</p>
+
+    <h3>Core Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>IPC</td><td class="value">3.11</td><td class="unit"></td></tr>
+      <tr><td>CPI</td><td class="value">0.32</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Cache Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1D Miss Rate</td><td class="value">11.35</td><td class="unit">%</td></tr>
+      <tr><td>L1D Miss Demand Rate</td><td class="value">0.95</td><td class="unit">%</td></tr>
+      <tr><td>L1D Miss HW Prefetch Rate</td><td class="value">0.53</td><td class="unit">%</td></tr>
+      <tr><td>L1D Miss SW Prefetch Rate</td><td class="value">98.52</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss Rate</td><td class="value">0.70</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss Demand Rate</td><td class="value">58.86</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss HW Prefetch Rate</td><td class="value">45.39</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss SW Prefetch Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>L1 Load-Store Instructions</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Total L1 Load-Store</td><td class="value">7.81 G</td><td class="unit"></td></tr>
+      <tr><td>Single Vector Loads</td><td class="value">3.49 G</td><td class="unit"></td></tr>
+      <tr><td>Broadcast Loads</td><td class="value">4.10 G</td><td class="unit"></td></tr>
+      <tr><td>Non-SIMD Loads</td><td class="value">9.35 M</td><td class="unit"></td></tr>
+      <tr><td>Single Vector Stores</td><td class="value">205.25 M</td><td class="unit"></td></tr>
+      <tr><td>Non-SIMD Stores</td><td class="value">5.65 M</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Floating-Point Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>GFLOPS (SVE)</td><td class="value">60.40</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS (SIMD)</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS (Total)</td><td class="value">60.40</td><td class="unit"></td></tr>
+      <tr><td>FP Operations</td><td class="value">262.41 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Memory Bandwidth</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Memory Read BW</td><td class="value">3.21</td><td class="unit">GB/s</td></tr>
+      <tr><td>Memory Write BW</td><td class="value">3.04</td><td class="unit">GB/s</td></tr>
+    </table>
+
+    <h3>Busy Rate</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Memory Busy</td><td class="value">2.43</td><td class="unit">%</td></tr>
+      <tr><td>L1 Busy</td><td class="value">77.15</td><td class="unit">%</td></tr>
+      <tr><td>L2 Busy</td><td class="value">5.90</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>Pipeline Utilization</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Stall Rate (0-commit)</td><td class="value">9.82</td><td class="unit">%</td></tr>
+      <tr><td>Memory Stall</td><td class="value">9.19</td><td class="unit">%</td></tr>
+      <tr><td>FP/SIMD Stall</td><td class="value">0.33</td><td class="unit">%</td></tr>
+      <tr><td>FLA Utilization</td><td class="value">88.75</td><td class="unit">%</td></tr>
+      <tr><td>FLB Utilization</td><td class="value">86.61</td><td class="unit">%</td></tr>
+      <tr><td>Integer A Utilization</td><td class="value">7.63</td><td class="unit">%</td></tr>
+      <tr><td>Integer B Utilization</td><td class="value">4.99</td><td class="unit">%</td></tr>
+      <tr><td>EAGA Utilization</td><td class="value">59.50</td><td class="unit">%</td></tr>
+      <tr><td>EAGB Utilization</td><td class="value">57.63</td><td class="unit">%</td></tr>
+      <tr><td>PRX Utilization</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Integer Stall</td><td class="value">0.36</td><td class="unit">%</td></tr>
+      <tr><td>Branch Stall</td><td class="value">0.04</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>SVE Utilization</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SIMD Instructions</td><td class="value">24.19 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Energy</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Core Energy</td><td class="value">10.64</td><td class="unit">J</td></tr>
+      <tr><td>L2 Energy</td><td class="value">7.35</td><td class="unit">J</td></tr>
+      <tr><td>Memory Energy</td><td class="value">9.37</td><td class="unit">J</td></tr>
+      <tr><td>Total Energy</td><td class="value">27.36</td><td class="unit">J</td></tr>
+      <tr><td>Average Power</td><td class="value">6.30</td><td class="unit">W</td></tr>
+    </table>
+
+    <h3>Branch Prediction</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Branch Mispredict Rate</td><td class="value">0.07</td><td class="unit">%</td></tr>
+      <tr><td>Branch Mispredictions</td><td class="value">315.15 K</td><td class="unit"></td></tr>
+      <tr><td>Branch Predictions</td><td class="value">430.25 M</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>TLB Performance</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1D TLB Miss Rate</td><td class="value">0.01</td><td class="unit">%</td></tr>
+      <tr><td>L2D TLB Miss Rate</td><td class="value">0.29</td><td class="unit">%</td></tr>
+      <tr><td>L1D TLB Misses</td><td class="value">691.95 K</td><td class="unit"></td></tr>
+      <tr><td>L2D TLB Misses</td><td class="value">1.97 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Memory Stall Breakdown</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L2 Miss Stall</td><td class="value">2.71</td><td class="unit">%</td></tr>
+      <tr><td>L1 Miss Stall</td><td class="value">6.04</td><td class="unit">%</td></tr>
+      <tr><td>Prefetch Port Stall</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>L2 Miss Stall (Int)</td><td class="value">0.04</td><td class="unit">%</td></tr>
+      <tr><td>L1 Miss Stall (Int)</td><td class="value">0.25</td><td class="unit">%</td></tr>
+      <tr><td>Memory Stall (Int)</td><td class="value">0.64</td><td class="unit">%</td></tr>
+      <tr><td>Prefetch Port Stall (Int)</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Prefetch Port Stall (SW PF)</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>Commit Distribution</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>1-Inst Commit Rate</td><td class="value">6.98</td><td class="unit">%</td></tr>
+      <tr><td>2-Inst Commit Rate</td><td class="value">12.72</td><td class="unit">%</td></tr>
+      <tr><td>3-Inst Commit Rate</td><td class="value">4.29</td><td class="unit">%</td></tr>
+      <tr><td>4-Inst Commit Rate</td><td class="value">66.51</td><td class="unit">%</td></tr>
+      <tr><td>UOP Only Commit Rate</td><td class="value">0.03</td><td class="unit">%</td></tr>
+      <tr><td>MOVPRFX Only Commit Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>FP Precision Breakdown</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>GFLOPS SP (SVE)</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS SP (SIMD)</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS DP (SVE)</td><td class="value">60.40</td><td class="unit"></td></tr>
+      <tr><td>GFLOPS DP (SIMD)</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>FP Instruction Breakdown</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>FMA Ratio</td><td class="value">100.00</td><td class="unit">%</td></tr>
+      <tr><td>FMA Operations</td><td class="value">16.40 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE/SIMD Operations</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SIMD/SVE Loads</td><td class="value">7.59 G</td><td class="unit"></td></tr>
+      <tr><td>SIMD/SVE Stores</td><td class="value">205.25 M</td><td class="unit"></td></tr>
+      <tr><td>SVE Gather Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Scatter Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Multi-Vec Loads</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Multi-Vec Stores</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>Prefetch Ops</td><td class="value">943.04 M</td><td class="unit"></td></tr>
+      <tr><td>Gather Ratio</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Scatter Ratio</td><td class="value">0.00</td><td class="unit">%</td></tr>
+      <tr><td>Broadcast Loads</td><td class="value">4.10 G</td><td class="unit"></td></tr>
+      <tr><td>SVE Math Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SIMD/SVE Integer Ops</td><td class="value">146.22 K</td><td class="unit"></td></tr>
+      <tr><td>SVE MOVPRFX Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>HW Prefetch</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1 HW Stream Prefetch</td><td class="value">4.90 M</td><td class="unit"></td></tr>
+      <tr><td>L2 HW Stream Prefetch</td><td class="value">8.12 M</td><td class="unit"></td></tr>
+      <tr><td>L1 HW Prefetch Total</td><td class="value">4.90 M</td><td class="unit"></td></tr>
+      <tr><td>L2 HW Prefetch Total</td><td class="value">8.12 M</td><td class="unit"></td></tr>
+      <tr><td>L2 HW Prefetch Other</td><td class="value">41.04 M</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Bus Traffic</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>CMG Write BW</td><td class="value">3.04</td><td class="unit">GB/s</td></tr>
+      <tr><td>Tofu Read BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+      <tr><td>Tofu Write BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+      <tr><td>PCI Read BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+      <tr><td>PCI Write BW</td><td class="value">0.00</td><td class="unit">GB/s</td></tr>
+    </table>
+
+    <h3>L1 Cache Details</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1D Requests</td><td class="value">8.75 G</td><td class="unit"></td></tr>
+      <tr><td>L1D Abort Rate</td><td class="value">0.01</td><td class="unit">%</td></tr>
+      <tr><td>L1 Pipe0 Predicate Count</td><td class="value">74.44 G</td><td class="unit"></td></tr>
+      <tr><td>L1 Pipe1 Predicate Count</td><td class="value">65.64 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Micro-op Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Micro-ops per Inst</td><td class="value">1.00</td><td class="unit"></td></tr>
+      <tr><td>Micro-op Splits</td><td class="value">29.50 G</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>ROB Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>ROB Empty Rate</td><td class="value">0.20</td><td class="unit">%</td></tr>
+      <tr><td>ROB Empty (STQ Busy)</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>L1I Cache</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L1I Cache Refills</td><td class="value">607.61 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>L2 Cache Details</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>L2D Cache Write-backs</td><td class="value">51.43 M</td><td class="unit"></td></tr>
+      <tr><td>L2 OC Read MIB Hits</td><td class="value">54.51 M</td><td class="unit"></td></tr>
+      <tr><td>L2 OC Write MIB Hits</td><td class="value">10.04 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Special Instructions</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Crypto Instructions</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>DC ZVA Instructions</td><td class="value">684.40 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>FP Operations Detail</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>FP Move Ops</td><td class="value">45.98 K</td><td class="unit"></td></tr>
+      <tr><td>FP Load Ops</td><td class="value">7.06 K</td><td class="unit"></td></tr>
+      <tr><td>FP Store Ops</td><td class="value">228.66 K</td><td class="unit"></td></tr>
+      <tr><td>FP Reciprocal Estimate Ops</td><td class="value">2.00</td><td class="unit"></td></tr>
+      <tr><td>FP Convert Ops</td><td class="value">204.83 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE Register Ops</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Predicate Ops</td><td class="value">6.15 K</td><td class="unit"></td></tr>
+      <tr><td>Inter-element Ops</td><td class="value">69.09 K</td><td class="unit"></td></tr>
+      <tr><td>Inter-register Ops</td><td class="value">252.24 K</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Idle Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>WFE/WFI Rate</td><td class="value">0.00</td><td class="unit">%</td></tr>
+    </table>
+
+    <h3>SVE Predication</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>FLA Predicate Count</td><td class="value">131.19 G</td><td class="unit"></td></tr>
+      <tr><td>FLB Predicate Count</td><td class="value">131.23 G</td><td class="unit"></td></tr>
+      <tr><td>FLA Avg Active Elements</td><td class="value">15.61</td><td class="unit"></td></tr>
+      <tr><td>FLB Avg Active Elements</td><td class="value">16.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Gather Statistics</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Gather 2-Flow</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>Gather 1-Flow</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>Gather 0-Flow</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE Load/Store</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SVE LDR Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE STR Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE LDR Predicate Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE STR Predicate Ops</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE First-Fault Loads</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>SVE Prefetch</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>SVE Contiguous Prefetch</td><td class="value">0.00</td><td class="unit"></td></tr>
+      <tr><td>SVE Gather Prefetch</td><td class="value">0.00</td><td class="unit"></td></tr>
+    </table>
+
+    <h3>Instruction Mix</h3>
+    <table>
+      <tr><th>Metric</th><th class="value">Value</th><th>Unit</th></tr>
+      <tr><td>Load Instructions</td><td class="value">7.59 G</td><td class="unit"></td></tr>
+      <tr><td>Store Instructions</td><td class="value">210.67 M</td><td class="unit"></td></tr>
+      <tr><td>Effective Instructions</td><td class="value">29.49 G</td><td class="unit"></td></tr>
+    </table>
+
+    <div class="analysis-section">
+      <h3>Bottleneck Analysis</h3>
+      <p class="no-issues">No significant bottlenecks detected. Performance appears well-optimized.</p>
+    </div>
+  </div>
+
+</body>
+</html>
