@@ -2642,6 +2642,67 @@ function formatHTML(data, selectedRegions) {
 }
 
 // =============================================================================
+// Section 5.5: JSON Reporter Functions
+// =============================================================================
+
+function formatJSON(data, selectedRegions) {
+  const regions = selectedRegions.length > 0
+    ? selectedRegions.filter(r => data.regions[r])
+    : Object.keys(data.regions);
+
+  const result = {
+    info: {
+      profilerVersion: data.info.profilerVersion,
+      measuredTime: data.info.measuredTime,
+      cpuFrequency: data.cpuFrequency,
+      vectorLength: data.info.vectorLength || 512
+    },
+    regions: {}
+  };
+
+  for (const regionName of regions) {
+    const region = data.regions[regionName];
+    if (!region) continue;
+
+    const metrics = calculateMetrics(region.counters, region.elapsed, data.cpuFrequency);
+    const findings = analyzeBottlenecks(region.counters, region.elapsed, data.cpuFrequency);
+
+    // Group metrics by category
+    const metricsByCategory = {};
+    for (const m of metrics) {
+      if (!metricsByCategory[m.category]) {
+        metricsByCategory[m.category] = {};
+      }
+      metricsByCategory[m.category][m.name] = {
+        value: m.value,
+        unit: m.unit,
+        format: m.format || 'number'
+      };
+    }
+
+    result.regions[regionName] = {
+      elapsed: region.elapsed,
+      metrics: metricsByCategory,
+      counters: region.counters,
+      bottleneckAnalysis: {
+        summary: findings.length === 0
+          ? 'No significant bottlenecks detected'
+          : `${findings.length} issue(s) found`,
+        findings: findings.map(f => ({
+          severity: f.severity,
+          category: f.category,
+          issue: f.issue,
+          detail: f.detail,
+          suggestions: f.suggestions
+        }))
+      }
+    };
+  }
+
+  return JSON.stringify(result, null, 2);
+}
+
+// =============================================================================
 // Section 6: CLI Main
 // =============================================================================
 
@@ -2649,7 +2710,7 @@ function parseArgs(args) {
   const options = {
     files: 17,
     regions: [],
-    html: false,
+    format: 'ascii',  // 'ascii', 'html', 'json'
     output: null,
     help: false
   };
@@ -2661,7 +2722,9 @@ function parseArgs(args) {
     } else if (arg === '-r' || arg === '--region') {
       options.regions.push(args[++i]);
     } else if (arg === '--html') {
-      options.html = true;
+      options.format = 'html';
+    } else if (arg === '--json') {
+      options.format = 'json';
     } else if (arg === '-o' || arg === '--output') {
       options.output = args[++i];
     } else if (arg === '-h' || arg === '--help') {
@@ -2681,15 +2744,22 @@ Usage: node preport.js [options]
 Options:
   -n, --files <num>     Number of pa*.csv files to read (1-17, default: 17)
   -r, --region <name>   Region to report (can be used multiple times)
-  --html                Output HTML format (default: ASCII)
+  --html                Output HTML format
+  --json                Output JSON format
   -o, --output <file>   Output file (default: stdout)
   -h, --help            Show this help message
+
+Output Formats:
+  (default)             ASCII text format for terminal
+  --html                HTML format with styled tables
+  --json                JSON format for programmatic access
 
 Examples:
   node preport.js                    # ASCII output, all regions, pa1-pa17
   node preport.js -n 5               # Read pa1.csv to pa5.csv
   node preport.js -r dgemm_kernel    # Report only dgemm_kernel region
   node preport.js --html -o out.html # HTML output to file
+  node preport.js --json -o out.json # JSON output to file
 `);
 }
 
@@ -2715,10 +2785,15 @@ function main() {
   console.error(`Found regions: ${Object.keys(data.regions).join(', ')}`);
 
   let output;
-  if (options.html) {
-    output = formatHTML(data, options.regions);
-  } else {
-    output = formatASCII(data, options.regions);
+  switch (options.format) {
+    case 'html':
+      output = formatHTML(data, options.regions);
+      break;
+    case 'json':
+      output = formatJSON(data, options.regions);
+      break;
+    default:
+      output = formatASCII(data, options.regions);
   }
 
   if (options.output) {
