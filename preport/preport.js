@@ -381,20 +381,28 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
   // L1D Miss Rate breakdown
   const l1dRefillPrf = getCounter(counters, '0x0049');  // L1D_CACHE_REFILL_PRF (SW + HW prefetch)
   const l1dRefillHwprf = getCounter(counters, '0x0202'); // L1D_CACHE_REFILL_HWPRF
-  const ldSpec = getCounter(counters, '0x0070');        // LD_SPEC
-  const stSpec = getCounter(counters, '0x0071');        // ST_SPEC
+  const ldSpec = getCounter(counters, '0x0070');        // LD_SPEC (integer loads)
+  const stSpec = getCounter(counters, '0x0071');        // ST_SPEC (integer stores)
+  const fpLdSpecForMiss = getCounter(counters, '0x0112'); // FP_LD_SPEC (FP scalar loads)
+  const fpStSpecForMiss = getCounter(counters, '0x0113'); // FP_ST_SPEC (FP scalar stores)
 
-  // L1D miss rate = L1D_CACHE_REFILL / (LD_SPEC + ST_SPEC)
-  if (l1dRefill !== null && ldSpec !== null && stSpec !== null) {
-    const ldstSpec = ldSpec + stSpec;
-    if (ldstSpec > 0) {
-      metrics.push({
-        name: 'L1D Miss Rate',
-        value: (l1dRefill / ldstSpec) * 100,
-        unit: '%',
-        category: 'Cache Performance'
-      });
-    }
+  // Total load-store = LD_SPEC + ST_SPEC + FP_LD_SPEC + FP_ST_SPEC
+  const getTotalLdSt = () => {
+    if (ldSpec === null || stSpec === null) return null;
+    const fpLd = fpLdSpecForMiss !== null ? fpLdSpecForMiss : 0;
+    const fpSt = fpStSpecForMiss !== null ? fpStSpecForMiss : 0;
+    return ldSpec + stSpec + fpLd + fpSt;
+  };
+  const totalLdStSpec = getTotalLdSt();
+
+  // L1D miss rate = L1D_CACHE_REFILL / Total Load-Store
+  if (l1dRefill !== null && totalLdStSpec !== null && totalLdStSpec > 0) {
+    metrics.push({
+      name: 'L1D Miss Rate',
+      value: (l1dRefill / totalLdStSpec) * 100,
+      unit: '%',
+      category: 'Cache Performance'
+    });
   }
 
   // L1D miss demand/HW/SW rates = respective_refill / L1D_CACHE_REFILL
@@ -460,17 +468,14 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
     l2MissCount = l2MissCountRaw - l2dCacheSwapLocal - l2PipeCompPfL2mibMch;
   }
 
-  // L2 miss rate = corrected L2_MISS_COUNT / (LD_SPEC + ST_SPEC)
-  if (l2MissCount !== null && ldSpec !== null && stSpec !== null) {
-    const ldstSpec = ldSpec + stSpec;
-    if (ldstSpec > 0) {
-      metrics.push({
-        name: 'L2 Miss Rate',
-        value: (l2MissCount / ldstSpec) * 100,
-        unit: '%',
-        category: 'Cache Performance'
-      });
-    }
+  // L2 miss rate = corrected L2_MISS_COUNT / Total Load-Store
+  if (l2MissCount !== null && totalLdStSpec !== null && totalLdStSpec > 0) {
+    metrics.push({
+      name: 'L2 Miss Rate',
+      value: (l2MissCount / totalLdStSpec) * 100,
+      unit: '%',
+      category: 'Cache Performance'
+    });
   }
 
   // L2 miss demand rate = corrected L2D_CACHE_REFILL_DM / corrected L2_MISS_COUNT
@@ -903,16 +908,13 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
   const l2dTlbRefill = getCounter(counters, '0x002d');
   const l1iTlbRefill = getCounter(counters, '0x0002');
 
-  if (l1dTlbRefill !== null && ldSpec !== null && stSpec !== null) {
-    const ldstSpec = ldSpec + stSpec;
-    if (ldstSpec > 0) {
-      metrics.push({
-        name: 'L1D TLB Miss Rate',
-        value: (l1dTlbRefill / ldstSpec) * 100,
-        unit: '%',
-        category: 'TLB Performance'
-      });
-    }
+  if (l1dTlbRefill !== null && totalLdStSpec !== null && totalLdStSpec > 0) {
+    metrics.push({
+      name: 'L1D TLB Miss Rate',
+      value: (l1dTlbRefill / totalLdStSpec) * 100,
+      unit: '%',
+      category: 'TLB Performance'
+    });
   }
 
   if (l2dTlbRefill !== null && l1dTlbRefill !== null && l1dTlbRefill > 0) {
@@ -2105,25 +2107,33 @@ function analyzeBottlenecks(counters, elapsed, cpuFreq) {
   const l1dRefill = get('0x0003');
   const ldSpec = get('0x0070');
   const stSpec = get('0x0071');
+  const fpLdSpecBA = get('0x0112');  // FP_LD_SPEC
+  const fpStSpecBA = get('0x0113');  // FP_ST_SPEC
 
-  if (l1dRefill !== null && ldSpec !== null && stSpec !== null) {
-    const ldstSpec = ldSpec + stSpec;
-    if (ldstSpec > 0) {
-      const l1MissRate = (l1dRefill / ldstSpec) * 100;
-      if (l1MissRate > THRESHOLDS.L1_MISS_RATE_HIGH) {
-        findings.push({
-          severity: 'high',
-          category: 'Cache',
-          issue: `High L1D miss rate (${l1MissRate.toFixed(1)}%)`,
-          detail: 'Many memory accesses miss the L1 data cache.',
-          suggestions: [
-            'Improve spatial locality (sequential access patterns)',
-            'Use smaller data types if precision allows',
-            'Consider Structure of Arrays (SoA) layout',
-            'Check for cache line splitting in unaligned accesses'
-          ]
-        });
-      }
+  // Total load-store = LD_SPEC + ST_SPEC + FP_LD_SPEC + FP_ST_SPEC
+  const getTotalLdStBA = () => {
+    if (ldSpec === null || stSpec === null) return null;
+    const fpLd = fpLdSpecBA !== null ? fpLdSpecBA : 0;
+    const fpSt = fpStSpecBA !== null ? fpStSpecBA : 0;
+    return ldSpec + stSpec + fpLd + fpSt;
+  };
+  const totalLdStBA = getTotalLdStBA();
+
+  if (l1dRefill !== null && totalLdStBA !== null && totalLdStBA > 0) {
+    const l1MissRate = (l1dRefill / totalLdStBA) * 100;
+    if (l1MissRate > THRESHOLDS.L1_MISS_RATE_HIGH) {
+      findings.push({
+        severity: 'high',
+        category: 'Cache',
+        issue: `High L1D miss rate (${l1MissRate.toFixed(1)}%)`,
+        detail: 'Many memory accesses miss the L1 data cache.',
+        suggestions: [
+          'Improve spatial locality (sequential access patterns)',
+          'Use smaller data types if precision allows',
+          'Consider Structure of Arrays (SoA) layout',
+          'Check for cache line splitting in unaligned accesses'
+        ]
+      });
     }
   }
 
@@ -2134,23 +2144,20 @@ function analyzeBottlenecks(counters, elapsed, cpuFreq) {
 
   if (l2MissCountRaw !== null && l2dCacheSwapLocal !== null && l2PipeCompPfL2mibMch !== null) {
     const l2MissCount = l2MissCountRaw - l2dCacheSwapLocal - l2PipeCompPfL2mibMch;
-    if (ldSpec !== null && stSpec !== null) {
-      const ldstSpec = ldSpec + stSpec;
-      if (ldstSpec > 0) {
-        const l2MissRate = (l2MissCount / ldstSpec) * 100;
-        if (l2MissRate > THRESHOLDS.L2_MISS_RATE_HIGH) {
-          findings.push({
-            severity: 'high',
-            category: 'Cache',
-            issue: `High L2 miss rate (${l2MissRate.toFixed(1)}%)`,
-            detail: 'Significant traffic going to main memory.',
-            suggestions: [
-              'Apply cache blocking to fit working set in L2 (8MB)',
-              'Use L2 prefetching (PRFM PLDL2KEEP/STRM)',
-              'Consider data compression to reduce memory footprint'
-            ]
-          });
-        }
+    if (totalLdStBA !== null && totalLdStBA > 0) {
+      const l2MissRate = (l2MissCount / totalLdStBA) * 100;
+      if (l2MissRate > THRESHOLDS.L2_MISS_RATE_HIGH) {
+        findings.push({
+          severity: 'high',
+          category: 'Cache',
+          issue: `High L2 miss rate (${l2MissRate.toFixed(1)}%)`,
+          detail: 'Significant traffic going to main memory.',
+          suggestions: [
+            'Apply cache blocking to fit working set in L2 (8MB)',
+            'Use L2 prefetching (PRFM PLDL2KEEP/STRM)',
+            'Consider data compression to reduce memory footprint'
+          ]
+        });
       }
     }
   }
@@ -2159,23 +2166,20 @@ function analyzeBottlenecks(counters, elapsed, cpuFreq) {
   const l1dTlbRefill = get('0x0005');
   const l2dTlbRefill = get('0x002d');
 
-  if (l1dTlbRefill !== null && ldSpec !== null && stSpec !== null) {
-    const ldstSpec = ldSpec + stSpec;
-    if (ldstSpec > 0) {
-      const tlbMissRate = (l1dTlbRefill / ldstSpec) * 100;
-      if (tlbMissRate > THRESHOLDS.TLB_MISS_RATE_HIGH) {
-        findings.push({
-          severity: 'medium',
-          category: 'TLB',
-          issue: `High TLB miss rate (${tlbMissRate.toFixed(2)}%)`,
-          detail: 'Address translation overhead is significant.',
-          suggestions: [
-            'Use huge pages (2MB or 1GB) to reduce TLB pressure',
-            'Improve memory access locality',
-            'Consider reducing working set size'
-          ]
-        });
-      }
+  if (l1dTlbRefill !== null && totalLdStBA !== null && totalLdStBA > 0) {
+    const tlbMissRate = (l1dTlbRefill / totalLdStBA) * 100;
+    if (tlbMissRate > THRESHOLDS.TLB_MISS_RATE_HIGH) {
+      findings.push({
+        severity: 'medium',
+        category: 'TLB',
+        issue: `High TLB miss rate (${tlbMissRate.toFixed(2)}%)`,
+        detail: 'Address translation overhead is significant.',
+        suggestions: [
+          'Use huge pages (2MB or 1GB) to reduce TLB pressure',
+          'Improve memory access locality',
+          'Consider reducing working set size'
+        ]
+      });
     }
   }
 
