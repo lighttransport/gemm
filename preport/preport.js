@@ -494,13 +494,90 @@ function calculateMetrics(counters, elapsed, cpuFreq) {
 
   // L2 miss SW prefetch rate = corrected L2D_CACHE_REFILL_PRF / corrected L2_MISS_COUNT
   // Note: L2D_CACHE_REFILL_PRF includes both SW and HW prefetch, subtract HW to get SW only
+  // Clip to 0 if negative (can happen due to errata corrections)
   if (l2MissCount !== null && l2MissCount > 0 && l2dRefillPrf !== null && l2dRefillHwprf !== null) {
-    const swPrefetchRefill = l2dRefillPrf - l2dRefillHwprf;
+    const swPrefetchRefill = Math.max(0, l2dRefillPrf - l2dRefillHwprf);
     metrics.push({
       name: 'L2 Miss SW Prefetch Rate',
       value: (swPrefetchRefill / l2MissCount) * 100,
       unit: '%',
       category: 'Cache Performance'
+    });
+  }
+
+  // L1 Load-Store Instructions breakdown
+  // Reference breakdown:
+  // - Total = LD_SPEC + ST_SPEC
+  // - Single Vector Loads = ASE_SVE_LD_SPEC - BC_LD_SPEC
+  // - Broadcast Loads = BC_LD_SPEC
+  // - Non-SIMD Loads = LD_SPEC - ASE_SVE_LD_SPEC (scalar loads)
+  // - Single Vector Stores = ASE_SVE_ST_SPEC
+  // - Non-SIMD Stores = ST_SPEC - ASE_SVE_ST_SPEC (scalar stores)
+  const aseSveLdSpecForL1 = getCounter(counters, '0x8085');  // ASE_SVE_LD_SPEC
+  const aseSveStSpecForL1 = getCounter(counters, '0x8086');  // ASE_SVE_ST_SPEC
+  const bcLdSpecForL1 = getCounter(counters, '0x011a');      // BC_LD_SPEC (broadcast loads)
+
+  if (ldSpec !== null && stSpec !== null) {
+    const totalLdSt = ldSpec + stSpec;
+    metrics.push({
+      name: 'Total L1 Load-Store',
+      value: totalLdSt,
+      unit: '',
+      category: 'L1 Load-Store Instructions',
+      format: 'count'
+    });
+  }
+
+  if (aseSveLdSpecForL1 !== null && bcLdSpecForL1 !== null) {
+    const singleVectorLoads = aseSveLdSpecForL1 - bcLdSpecForL1;
+    metrics.push({
+      name: 'Single Vector Loads',
+      value: singleVectorLoads,
+      unit: '',
+      category: 'L1 Load-Store Instructions',
+      format: 'count'
+    });
+  }
+
+  if (bcLdSpecForL1 !== null) {
+    metrics.push({
+      name: 'Broadcast Loads',
+      value: bcLdSpecForL1,
+      unit: '',
+      category: 'L1 Load-Store Instructions',
+      format: 'count'
+    });
+  }
+
+  if (ldSpec !== null && aseSveLdSpecForL1 !== null) {
+    const nonSimdLoads = ldSpec - aseSveLdSpecForL1;
+    metrics.push({
+      name: 'Non-SIMD Loads',
+      value: nonSimdLoads,
+      unit: '',
+      category: 'L1 Load-Store Instructions',
+      format: 'count'
+    });
+  }
+
+  if (aseSveStSpecForL1 !== null) {
+    metrics.push({
+      name: 'Single Vector Stores',
+      value: aseSveStSpecForL1,
+      unit: '',
+      category: 'L1 Load-Store Instructions',
+      format: 'count'
+    });
+  }
+
+  if (stSpec !== null && aseSveStSpecForL1 !== null) {
+    const nonSimdStores = stSpec - aseSveStSpecForL1;
+    metrics.push({
+      name: 'Non-SIMD Stores',
+      value: nonSimdStores,
+      unit: '',
+      category: 'L1 Load-Store Instructions',
+      format: 'count'
     });
   }
 
