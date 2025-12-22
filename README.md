@@ -408,6 +408,10 @@ The tool applies corrections from the A64FX PMU Events Errata document for accur
 
 These corrections account for overcounting that occurs when demand and prefetch requests are temporally close.
 
+## References
+
+- [Fujitsu A64FX GitHub Repository](https://github.com/fujitsu/A64FX) - Official documentation including PMU event specifications and microarchitecture manuals
+
 ## License
 
 See [LICENSE](LICENSE) file.
