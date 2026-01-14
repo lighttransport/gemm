@@ -33,6 +33,8 @@ KERNEL_STAGE2_K64_OBJ = kernel_stage2_k64.o
 PACK_OPT_OBJ = gemm_pack_opt.o
 PREPACKED_OBJ = gemm_prepacked.o
 FUSED_OBJ = fused_gemm.o
+SOFTMAX_OBJ = softmax_exp2.o
+ATTENTION_OBJ = fused_attention.o
 
 # Benchmark executables
 BENCH_5X4 = bench_5x4
@@ -47,8 +49,9 @@ BENCH_PREPACKED2 = bench_prepacked2
 BENCH_PIPE2 = bench_pipe2
 BENCH_FULL = bench_full
 BENCH_FUSED = bench_fused
+BENCH_ATTENTION = bench_attention
 
-.PHONY: all clean help 5x4 6x4 compare test debug ultra unroll tight prepacked2 pipe2 full fused
+.PHONY: all clean help 5x4 6x4 compare test debug ultra unroll tight prepacked2 pipe2 full fused attention
 
 all: help
 
@@ -93,6 +96,8 @@ pipe2: $(BENCH_PIPE2)
 full: $(BENCH_FULL)
 
 fused: $(BENCH_FUSED)
+
+attention: $(BENCH_ATTENTION)
 
 # Build 5x4 benchmark (link both kernels to support potential comparison)
 $(BENCH_5X4): bench_gemm.c $(PACK_OBJ) $(DRIVER_OBJ) $(KERNEL_5X4_OBJ) $(KERNEL_6X4_OBJ)
@@ -142,6 +147,10 @@ $(BENCH_FULL): bench_full.c $(PREPACKED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_6
 $(BENCH_FUSED): bench_fused.c $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ)
 	$(CC) $(CFLAGS) -o $@ bench_fused.c $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
 
+# Build fused attention benchmark: O = softmax(Q @ K^T / sqrt(d)) @ V
+$(BENCH_ATTENTION): bench_attention.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_attention.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
+
 # Compile C source files
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -170,3 +179,5 @@ $(KERNEL_STAGE2_K64_OBJ): kernel_stage2_k64.S
 $(PACK_OPT_OBJ): gemm_pack_opt.c gemm_pack_opt.h
 $(PREPACKED_OBJ): gemm_prepacked.c gemm_prepacked.h
 $(FUSED_OBJ): fused_gemm.c fused_gemm.h
+$(SOFTMAX_OBJ): softmax_exp2.c softmax_exp2.h
+$(ATTENTION_OBJ): fused_attention.c fused_attention.h fused_gemm.h softmax_exp2.h
