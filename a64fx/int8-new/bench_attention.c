@@ -128,25 +128,61 @@ int main(int argc, char** argv) {
         t1 = rdtimer();
         printf("Reference time: %.3f ms\n", (double)(t1 - t0) / (double)freq * 1000.0);
 
-        // Test INT8 variant
-        printf("\n--- INT8 Softmax Variant ---\n");
+        // Test Online Softmax variant (correct FlashAttention-style)
+        printf("\n--- Online Softmax Variant (FlashAttention-style) ---\n");
         printf("Warming up...\n");
         memset(O_fused, 0, (size_t)L * d * sizeof(int32_t));
-        fused_attention_int8(Qpack, Kpack, Vpack, O_fused, d, scale);
+        fused_attention_online(Qpack, Kpack, V, O_fused, d, scale);
 
-        // Verify correctness
-        // INT8 softmax scales P to [0, 127], so output is scaled by ~127
-        float int8_scale = 127.0f;
+        // Verify correctness - no scaling needed, should match reference directly
         float max_rel_err;
-        int errors = compare_outputs_scaled(O_fused, O_ref, L, d, int8_scale, &max_rel_err);
+        int errors = compare_outputs_scaled(O_fused, O_ref, L, d, 1.0f, &max_rel_err);
         if (errors > 0) {
             printf("WARNING: %d mismatches, max_rel_err=%.2f\n", errors, max_rel_err);
         } else {
             printf("Correctness: PASS (max_rel_err=%.2f)\n", max_rel_err);
         }
 
-        // Benchmark INT8
+        // Benchmark Online Softmax
         int iterations = (L <= 512) ? 10 : 3;
+        printf("Benchmarking (%d iterations)...\n", iterations);
+
+        memset(O_fused, 0, (size_t)L * d * sizeof(int32_t));
+        t0 = rdtimer();
+        for (int i = 0; i < iterations; i++) {
+            fused_attention_online(Qpack, Kpack, V, O_fused, d, scale);
+        }
+        t1 = rdtimer();
+
+        double time_s = (double)(t1 - t0) / (double)freq;
+        double time_per_call = time_s / iterations * 1000.0;
+
+        // Calculate FLOPS
+        double ops_gemm = 2.0 * L * L * d;  // Q @ K^T
+        double ops_softmax = 5.0 * L * L;    // exp, max, sum, div
+        double ops_pv = 2.0 * L * L * d;     // P @ V (in float)
+        double total_ops = ops_gemm + ops_softmax + ops_pv;
+        double gops = total_ops * iterations / time_s / 1e9;
+
+        printf("Online Softmax Results:\n");
+        printf("  Time per call: %.3f ms\n", time_per_call);
+        printf("  GOPS: %.2f\n", gops);
+
+        // Test INT8 variant (per-tile softmax - for comparison)
+        printf("\n--- INT8 Per-Tile Softmax (for comparison) ---\n");
+        printf("Warming up...\n");
+        memset(O_fused, 0, (size_t)L * d * sizeof(int32_t));
+        fused_attention_int8(Qpack, Kpack, Vpack, O_fused, d, scale);
+
+        // Verify - INT8 scales by 127
+        float int8_scale = 127.0f;
+        errors = compare_outputs_scaled(O_fused, O_ref, L, d, int8_scale, &max_rel_err);
+        if (errors > 0) {
+            printf("WARNING: %d mismatches (expected - uses per-tile softmax)\n", errors);
+        } else {
+            printf("Correctness: PASS (max_rel_err=%.2f)\n", max_rel_err);
+        }
+
         printf("Benchmarking (%d iterations)...\n", iterations);
 
         memset(O_fused, 0, (size_t)L * d * sizeof(int32_t));
@@ -156,21 +192,13 @@ int main(int argc, char** argv) {
         }
         t1 = rdtimer();
 
-        double time_s = (double)(t1 - t0) / (double)freq;
-        double time_per_call = time_s / iterations * 1000.0;
+        time_s = (double)(t1 - t0) / (double)freq;
+        time_per_call = time_s / iterations * 1000.0;
+        gops = total_ops * iterations / time_s / 1e9;
 
-        // Calculate FLOPS (approximate)
-        // Stage 1: 2*L*L*d ops (Q @ K^T)
-        // Softmax: ~5*L*L ops (exp, sum, div)
-        // Stage 2: 2*L*L*d ops (P @ V)
-        double ops_gemm = 4.0 * L * L * d;  // Both GEMMs
-        double ops_softmax = 5.0 * L * L;
-        double total_ops = ops_gemm + ops_softmax;
-        double gops = total_ops * iterations / time_s / 1e9;
-
-        printf("INT8 Results:\n");
+        printf("INT8 Per-Tile Results:\n");
         printf("  Time per call: %.3f ms\n", time_per_call);
-        printf("  GOPS: %.2f (GEMM: %.2e, softmax: %.2e)\n", gops, ops_gemm, ops_softmax);
+        printf("  GOPS: %.2f\n", gops);
 
         // Test UINT8 variant
         printf("\n--- UINT8 Softmax Variant (with bias correction) ---\n");
