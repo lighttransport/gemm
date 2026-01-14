@@ -1,7 +1,9 @@
 // fused_attention.c
 // Fused Attention: O = softmax(Q @ K^T / sqrt(d)) @ V
 
+#include <stdio.h>
 #include "fused_attention.h"
+#include "online_softmax.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -56,8 +58,8 @@ void fused_attention_int8(const fused_matrix_t* Qpack,
     int8_t P_tile_i8[FUSED_MR * FUSED_LB] __attribute__((aligned(256)));
     int8_t P_pack[FUSED_MR * FUSED_LB] __attribute__((aligned(256)));
 
-    // Per-output-tile accumulator
-    int32_t O_tile[FUSED_MR * d] __attribute__((aligned(256)));
+    // Per-output-tile accumulator - use compile-time constant
+    int32_t O_tile[FUSED_MR * FUSED_D] __attribute__((aligned(256)));
 
     int Q_tile_stride = FUSED_MR * d;  // Bytes per Q tile
     int K_tile_stride = FUSED_LB * d;  // Bytes per K tile
@@ -161,8 +163,8 @@ void fused_attention_uint8(const fused_matrix_t* Qpack,
     uint8_t P_pack[FUSED_MR * FUSED_LB] __attribute__((aligned(256)));
     uint32_t row_sums[FUSED_MR];
 
-    // Per-output-tile accumulator
-    int32_t O_tile[FUSED_MR * d] __attribute__((aligned(256)));
+    // Per-output-tile accumulator - use compile-time constant
+    int32_t O_tile[FUSED_MR * FUSED_D] __attribute__((aligned(256)));
     int32_t bias_acc[FUSED_MR];  // Accumulated bias correction per row
 
     int Q_tile_stride = FUSED_MR * d;
@@ -299,4 +301,85 @@ void ref_attention(const int8_t* Q, const int8_t* K, const int8_t* V,
 
     free(S);
     free(P);
+}
+
+// ============================================================================
+// Online Softmax Attention (Correct FlashAttention-style)
+// ============================================================================
+// Uses online softmax normalization to correctly compute global softmax
+// while processing in tiles.
+//
+// Algorithm:
+// For each Q tile (m0 to m0+MR rows):
+//   Initialize: row_max = -inf, row_sum = 0, O_acc = 0
+//   For each K,V tile (l0 to l0+LB cols):
+//     1. Compute S_tile = Q_tile @ K_tile^T
+//     2. Update running max: m_new = max(m_old, max(S_tile))
+//     3. Rescale old values: alpha = exp2(m_old - m_new)
+//     4. O_acc *= alpha, row_sum *= alpha
+//     5. Compute P_tile = exp2(S_tile - m_new)
+//     6. row_sum += sum(P_tile)
+//     7. O_acc += P_tile @ V_tile
+//   Finalize: O = O_acc / row_sum
+
+void fused_attention_online(const fused_matrix_t* Qpack,
+                             const fused_matrix_t* Kpack,
+                             const int8_t* V,           // Unpacked V [L, d]
+                             int32_t* O,
+                             int ldo,
+                             float scale) {
+    // CRITICAL: Copy scale to local variable immediately to prevent stack corruption
+    // from aligned stack arrays overwriting the parameter register/slot
+    volatile float local_scale = scale;
+
+    int L = Qpack->L;
+    int d = Qpack->d;
+
+    // Temporary buffers - use compile-time constants to avoid VLA issues
+    int32_t S_tile_i32[FUSED_MR * FUSED_LB] __attribute__((aligned(256)));
+
+    // Online softmax state per M-tile
+    float row_max[FUSED_MR];
+    float row_sum[FUSED_MR];
+    float O_acc[FUSED_MR * FUSED_D] __attribute__((aligned(256)));
+
+    int Q_tile_stride = FUSED_MR * d;
+    int K_tile_stride = FUSED_LB * d;
+
+    // Outer loop over M dimension (output rows)
+    for (int m0 = 0; m0 < L; m0 += FUSED_MR) {
+        int mr = (m0 + FUSED_MR <= L) ? FUSED_MR : (L - m0);
+        const int8_t* Qptr = Qpack->data + (m0 / FUSED_MR) * Q_tile_stride;
+
+        // Initialize online softmax state
+        online_softmax_state_t state;
+        online_softmax_init(&state, row_max, row_sum, O_acc, mr, d);
+
+        // Loop over L dimension (K tiles)
+        for (int l0 = 0; l0 < L; l0 += FUSED_LB) {
+            int lb = (l0 + FUSED_LB <= L) ? FUSED_LB : (L - l0);
+
+            const int8_t* Kptr = Kpack->data + (l0 / FUSED_LB) * K_tile_stride;
+            const int8_t* Vptr = V + l0 * d;  // V[l0:l0+lb, :]
+
+            // Stage 1: S_tile = Q_tile @ K_tile^T
+            memset(S_tile_i32, 0, sizeof(S_tile_i32));
+            kernel_6x4_unroll(Qptr, Kptr, S_tile_i32, FUSED_LB * sizeof(int32_t));
+
+            // Update online softmax with this tile
+            // This handles: max update, rescaling, exp2, accumulation
+            online_softmax_update_sve(&state, S_tile_i32, Vptr, lb, local_scale);
+        }
+
+        // Finalize: O = O_acc / row_sum
+        // Store to output
+        for (int m = 0; m < mr; m++) {
+            // Use double precision division directly to avoid compiler optimization issues
+            double row_sum_val = (double)row_sum[m];
+            for (int n = 0; n < d; n++) {
+                double val = (double)O_acc[m * d + n] / row_sum_val;
+                O[(m0 + m) * ldo + n] = (int32_t)(val + (val >= 0 ? 0.5 : -0.5));
+            }
+        }
+    }
 }

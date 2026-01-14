@@ -46,6 +46,19 @@ void fused_attention_uint8(const fused_matrix_t* Qpack,
                             int ldo,
                             float scale);
 
+// ============================================================================
+// Online Softmax Attention (Correct FlashAttention-style)
+// ============================================================================
+// Uses online softmax normalization to correctly compute global softmax
+// while processing in tiles. Maintains running max and sum per row.
+
+void fused_attention_online(const fused_matrix_t* Qpack,
+                             const fused_matrix_t* Kpack,
+                             const int8_t* V,           // Unpacked V [L, d]
+                             int32_t* O,
+                             int ldo,
+                             float scale);
+
 // Reference implementation for correctness testing
 void ref_attention(const int8_t* Q, const int8_t* K, const int8_t* V,
                     int32_t* O, int L, int d, float scale);
