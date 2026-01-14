@@ -29,8 +29,10 @@ KERNEL_6X4_ULTRA_OBJ = kernel_6x4_ultra.o
 KERNEL_6X4_PIPE_OBJ = kernel_6x4_pipe.o
 KERNEL_6X4_UNROLL_OBJ = kernel_6x4_unroll.o
 KERNEL_6X4_PIPE2_OBJ = kernel_6x4_pipe2.o
+KERNEL_STAGE2_K64_OBJ = kernel_stage2_k64.o
 PACK_OPT_OBJ = gemm_pack_opt.o
 PREPACKED_OBJ = gemm_prepacked.o
+FUSED_OBJ = fused_gemm.o
 
 # Benchmark executables
 BENCH_5X4 = bench_5x4
@@ -44,8 +46,9 @@ BENCH_TIGHT = bench_tight
 BENCH_PREPACKED2 = bench_prepacked2
 BENCH_PIPE2 = bench_pipe2
 BENCH_FULL = bench_full
+BENCH_FUSED = bench_fused
 
-.PHONY: all clean help 5x4 6x4 compare test debug ultra unroll tight prepacked2 pipe2 full
+.PHONY: all clean help 5x4 6x4 compare test debug ultra unroll tight prepacked2 pipe2 full fused
 
 all: help
 
@@ -88,6 +91,8 @@ prepacked2: $(BENCH_PREPACKED2)
 pipe2: $(BENCH_PIPE2)
 
 full: $(BENCH_FULL)
+
+fused: $(BENCH_FUSED)
 
 # Build 5x4 benchmark (link both kernels to support potential comparison)
 $(BENCH_5X4): bench_gemm.c $(PACK_OBJ) $(DRIVER_OBJ) $(KERNEL_5X4_OBJ) $(KERNEL_6X4_OBJ)
@@ -133,6 +138,10 @@ $(BENCH_PIPE2): bench_pipe2.c $(PREPACKED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL
 $(BENCH_FULL): bench_full.c $(PREPACKED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_6X4_ULTRA_OBJ)
 	$(CC) $(CFLAGS) -o $@ bench_full.c $(PREPACKED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_6X4_ULTRA_OBJ) $(LDFLAGS) -lm
 
+# Build fused GEMM benchmark: O = (A @ B^T) @ C
+$(BENCH_FUSED): bench_fused.c $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fused.c $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
+
 # Compile C source files
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -157,5 +166,7 @@ $(KERNEL_6X4_ULTRA_OBJ): kernel_6x4_ultra.S
 $(KERNEL_6X4_PIPE_OBJ): kernel_6x4_pipe.S
 $(KERNEL_6X4_UNROLL_OBJ): kernel_6x4_unroll.S
 $(KERNEL_6X4_PIPE2_OBJ): kernel_6x4_pipe2.S
+$(KERNEL_STAGE2_K64_OBJ): kernel_stage2_k64.S
 $(PACK_OPT_OBJ): gemm_pack_opt.c gemm_pack_opt.h
 $(PREPACKED_OBJ): gemm_prepacked.c gemm_prepacked.h
+$(FUSED_OBJ): fused_gemm.c fused_gemm.h
