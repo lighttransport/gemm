@@ -34,6 +34,7 @@ PACK_OPT_OBJ = gemm_pack_opt.o
 PREPACKED_OBJ = gemm_prepacked.o
 FUSED_OBJ = fused_gemm.o
 SOFTMAX_OBJ = softmax_exp2.o
+ONLINE_SOFTMAX_OBJ = online_softmax.o
 ATTENTION_OBJ = fused_attention.o
 
 # Benchmark executables
@@ -148,8 +149,12 @@ $(BENCH_FUSED): bench_fused.c $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STA
 	$(CC) $(CFLAGS) -o $@ bench_fused.c $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
 
 # Build fused attention benchmark: O = softmax(Q @ K^T / sqrt(d)) @ V
-$(BENCH_ATTENTION): bench_attention.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ)
-	$(CC) $(CFLAGS) -o $@ bench_attention.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
+$(BENCH_ATTENTION): bench_attention.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(ONLINE_SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_attention.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(ONLINE_SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
+
+# Build debug attention benchmark (L=512 only)
+bench_attention_debug: bench_attention_debug.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(ONLINE_SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_attention_debug.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(ONLINE_SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
 
 # Compile C source files
 %.o: %.c
@@ -180,4 +185,5 @@ $(PACK_OPT_OBJ): gemm_pack_opt.c gemm_pack_opt.h
 $(PREPACKED_OBJ): gemm_prepacked.c gemm_prepacked.h
 $(FUSED_OBJ): fused_gemm.c fused_gemm.h
 $(SOFTMAX_OBJ): softmax_exp2.c softmax_exp2.h
-$(ATTENTION_OBJ): fused_attention.c fused_attention.h fused_gemm.h softmax_exp2.h
+$(ONLINE_SOFTMAX_OBJ): online_softmax.c online_softmax.h softmax_exp2.h
+$(ATTENTION_OBJ): fused_attention.c fused_attention.h fused_gemm.h softmax_exp2.h online_softmax.h
