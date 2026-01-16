@@ -36,6 +36,9 @@ FUSED_OBJ = fused_gemm.o
 SOFTMAX_OBJ = softmax_exp2.o
 ONLINE_SOFTMAX_OBJ = online_softmax.o
 ATTENTION_OBJ = fused_attention.o
+FFN_OBJ = ffn_int8.o
+KERNEL_6X4_KLOOP_OBJ = kernel_6x4_kloop.o
+KERNEL_6X4_KLOOP_OPT_OBJ = kernel_6x4_kloop_opt.o
 
 # Benchmark executables
 BENCH_5X4 = bench_5x4
@@ -51,8 +54,14 @@ BENCH_PIPE2 = bench_pipe2
 BENCH_FULL = bench_full
 BENCH_FUSED = bench_fused
 BENCH_ATTENTION = bench_attention
+BENCH_FFN = bench_ffn
+BENCH_FFN_OPT = bench_ffn_opt
+BENCH_KLOOP = bench_kloop
+BENCH_FFN_V2 = bench_ffn_v2
+BENCH_FFN_V3 = bench_ffn_v3
+FFN_V3_OBJ = ffn_int8_v3.o
 
-.PHONY: all clean help 5x4 6x4 compare test debug ultra unroll tight prepacked2 pipe2 full fused attention
+.PHONY: all clean help 5x4 6x4 compare test debug ultra unroll tight prepacked2 pipe2 full fused attention ffn ffn_opt kloop ffn_v2 ffn_v3
 
 all: help
 
@@ -99,6 +108,18 @@ full: $(BENCH_FULL)
 fused: $(BENCH_FUSED)
 
 attention: $(BENCH_ATTENTION)
+
+ffn: $(BENCH_FFN)
+
+ffn_opt: $(BENCH_FFN_OPT)
+
+kloop: $(BENCH_KLOOP)
+
+ffn_v2: $(BENCH_FFN_V2)
+
+ffn_v3: $(BENCH_FFN_V3)
+
+silu: bench_silu
 
 # Build 5x4 benchmark (link both kernels to support potential comparison)
 $(BENCH_5X4): bench_gemm.c $(PACK_OBJ) $(DRIVER_OBJ) $(KERNEL_5X4_OBJ) $(KERNEL_6X4_OBJ)
@@ -156,6 +177,39 @@ $(BENCH_ATTENTION): bench_attention.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(ONLINE_S
 bench_attention_debug: bench_attention_debug.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(ONLINE_SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ)
 	$(CC) $(CFLAGS) -o $@ bench_attention_debug.c $(ATTENTION_OBJ) $(SOFTMAX_OBJ) $(ONLINE_SOFTMAX_OBJ) $(FUSED_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_STAGE2_K64_OBJ) $(LDFLAGS) -lm
 
+# Build INT8 FFN benchmark (Qwen3-style SwiGLU)
+$(BENCH_FFN): bench_ffn.c $(FFN_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_6X4_ULTRA_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_ffn.c $(FFN_OBJ) $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_6X4_ULTRA_OBJ) $(LDFLAGS) -lm
+
+# Build optimized INT8 FFN benchmark (kernel_6x4_kloop - target: 90%+)
+$(BENCH_FFN_OPT): bench_ffn_opt.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_KLOOP_OPT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_ffn_opt.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_KLOOP_OPT_OBJ) $(LDFLAGS) -lm
+
+# Build K-loop kernel benchmark for various K values
+$(BENCH_KLOOP): bench_kloop.c $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_KLOOP_OPT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_kloop.c $(KERNEL_6X4_UNROLL_OBJ) $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_KLOOP_OPT_OBJ) $(LDFLAGS) -lm
+
+# Build FFN V2 benchmark (kernel_6x4_kloop, no K-tiling overhead)
+$(BENCH_FFN_V2): bench_ffn_v2.c ffn_int8_v2.c $(KERNEL_6X4_KLOOP_OBJ) $(FFN_OBJ) $(KERNEL_6X4_ULTRA_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_ffn_v2.c $(KERNEL_6X4_KLOOP_OBJ) $(FFN_OBJ) $(KERNEL_6X4_ULTRA_OBJ) $(LDFLAGS) -lm
+
+# Build FFN V3 benchmark (fast SiLU with SVE polynomial approximation)
+$(BENCH_FFN_V3): bench_ffn_v3.c $(FFN_V3_OBJ) $(KERNEL_6X4_KLOOP_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_ffn_v3.c $(FFN_V3_OBJ) $(KERNEL_6X4_KLOOP_OBJ) $(LDFLAGS) -lm
+
+# Build standalone SiLU benchmark
+bench_silu: bench_silu.c silu_fast.h
+	$(CC) $(CFLAGS) -o $@ bench_silu.c $(LDFLAGS) -lm
+
+# Build FFN GEMM-only benchmark
+bench_ffn_gemm: bench_ffn_gemm.c $(KERNEL_6X4_KLOOP_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_ffn_gemm.c $(KERNEL_6X4_KLOOP_OBJ) $(LDFLAGS)
+
+# Build N-tile batched kernel benchmark
+KERNEL_6X4_NTILE_OBJ = kernel_6x4_ntile.o
+bench_ntile: bench_ntile.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_NTILE_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_ntile.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_NTILE_OBJ) $(LDFLAGS)
+
 # Compile C source files
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -187,3 +241,34 @@ $(FUSED_OBJ): fused_gemm.c fused_gemm.h
 $(SOFTMAX_OBJ): softmax_exp2.c softmax_exp2.h
 $(ONLINE_SOFTMAX_OBJ): online_softmax.c online_softmax.h softmax_exp2.h
 $(ATTENTION_OBJ): fused_attention.c fused_attention.h fused_gemm.h softmax_exp2.h online_softmax.h
+$(FFN_OBJ): ffn_int8.c ffn_int8.h
+$(FFN_V3_OBJ): ffn_int8_v3.c ffn_int8_v3.h silu_fast.h
+$(KERNEL_6X4_KLOOP_OBJ): kernel_6x4_kloop.S
+$(KERNEL_6X4_KLOOP_OPT_OBJ): kernel_6x4_kloop_opt.S
+
+# Build 5x4 pipelined kernel benchmark
+KERNEL_5X4_PIPE_OBJ = kernel_5x4_pipe.o
+KERNEL_5X4_PIPE2_OBJ = kernel_5x4_pipe2.o
+bench_5x4_pipe: bench_5x4_pipe.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_PIPE_OBJ) $(KERNEL_5X4_PIPE2_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_5x4_pipe.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_PIPE_OBJ) $(KERNEL_5X4_PIPE2_OBJ) $(LDFLAGS)
+
+$(KERNEL_5X4_PIPE_OBJ): kernel_5x4_pipe.S
+$(KERNEL_5X4_PIPE2_OBJ): kernel_5x4_pipe2.S
+
+# Build all-N optimized kernel benchmark
+KERNEL_6X4_ALLN_OBJ = kernel_6x4_allN.o
+bench_allN: bench_allN.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_ALLN_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_allN.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_ALLN_OBJ) $(LDFLAGS)
+
+$(KERNEL_6X4_ALLN_OBJ): kernel_6x4_allN.S
+
+# Build pipelined kernel comparison benchmark
+KERNEL_6X4_PIPEV2_OBJ = kernel_6x4_pipeV2.o
+KERNEL_6X4_DEEP_OBJ = kernel_6x4_deep.o
+KERNEL_6X4_PRFM_OBJ = kernel_6x4_prfm.o
+bench_pipe_cmp: bench_pipe_cmp.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_PIPEV2_OBJ) $(KERNEL_6X4_DEEP_OBJ) $(KERNEL_6X4_PRFM_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pipe_cmp.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_PIPEV2_OBJ) $(KERNEL_6X4_DEEP_OBJ) $(KERNEL_6X4_PRFM_OBJ) $(LDFLAGS)
+
+$(KERNEL_6X4_PIPEV2_OBJ): kernel_6x4_pipeV2.S
+$(KERNEL_6X4_DEEP_OBJ): kernel_6x4_deep.S
+$(KERNEL_6X4_PRFM_OBJ): kernel_6x4_prfm.S
