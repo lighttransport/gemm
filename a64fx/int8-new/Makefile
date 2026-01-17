@@ -370,3 +370,7 @@ bench_latency: bench_latency.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_INTERLEAVE
 
 $(KERNEL_5X4_DBLBUF_OBJ): kernel_5x4_dblbuf.S
 $(KERNEL_6X4_OOO_OBJ): kernel_6x4_ooo.S
+
+# Build activation benchmark (FP32 vs INT32 comparison)
+bench_activation: bench_activation.c activation_int32.h silu_fast.h
+	$(CC) $(CFLAGS) -o $@ bench_activation.c $(LDFLAGS) -lm
