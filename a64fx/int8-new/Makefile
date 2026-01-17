@@ -374,3 +374,8 @@ $(KERNEL_6X4_OOO_OBJ): kernel_6x4_ooo.S
 # Build activation benchmark (FP32 vs INT32 comparison)
 bench_activation: bench_activation.c activation_int32.h silu_fast.h
 	$(CC) $(CFLAGS) -o $@ bench_activation.c $(LDFLAGS) -lm
+
+# Build Flash Attention INT16 benchmark
+# Pipeline: INT8 SDOT -> FP32 softmax -> INT16 -> INT16 SDOT
+bench_flash_int16: bench_flash_int16.c flash_attention_int16.c flash_attention_int16.h
+	$(CC) $(CFLAGS) -o $@ bench_flash_int16.c flash_attention_int16.c $(LDFLAGS) -lm
