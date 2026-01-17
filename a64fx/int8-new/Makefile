@@ -272,3 +272,101 @@ bench_pipe_cmp: bench_pipe_cmp.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_PIPEV2_OBJ
 $(KERNEL_6X4_PIPEV2_OBJ): kernel_6x4_pipeV2.S
 $(KERNEL_6X4_DEEP_OBJ): kernel_6x4_deep.S
 $(KERNEL_6X4_PRFM_OBJ): kernel_6x4_prfm.S
+
+# Build sector cache benchmark
+KERNEL_6X4_SECTOR_OBJ = kernel_6x4_sector.o
+bench_sector: bench_sector.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_SECTOR_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_sector.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_SECTOR_OBJ) $(LDFLAGS) -lm
+
+$(KERNEL_6X4_SECTOR_OBJ): kernel_6x4_sector.S
+
+# Build tagged pointer sector cache benchmark
+KERNEL_6X4_TAGGED_OBJ = kernel_6x4_tagged.o
+bench_tagged: bench_tagged.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_TAGGED_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_tagged.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_TAGGED_OBJ) $(LDFLAGS) -lm
+
+$(KERNEL_6X4_TAGGED_OBJ): kernel_6x4_tagged.S
+
+# Build fapp profiling benchmark
+bench_fapp: bench_fapp.c $(KERNEL_6X4_KLOOP_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fapp.c $(KERNEL_6X4_KLOOP_OBJ) $(LDFLAGS) -lm
+
+# Build optimized kernel benchmark (based on reference DGEMM analysis)
+KERNEL_6X4_OPTIMIZED_OBJ = kernel_6x4_optimized.o
+bench_optimized: bench_optimized.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_OPTIMIZED_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_optimized.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_OPTIMIZED_OBJ) $(LDFLAGS) -lm
+
+$(KERNEL_6X4_OPTIMIZED_OBJ): kernel_6x4_optimized.S
+
+# Build isolation test benchmark
+KERNEL_6X4_DEBUG_OBJ = kernel_6x4_debug.o
+bench_isolate: bench_isolate.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_OPTIMIZED_OBJ) $(KERNEL_6X4_DEBUG_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_isolate.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_OPTIMIZED_OBJ) $(KERNEL_6X4_DEBUG_OBJ) $(LDFLAGS) -lm
+
+$(KERNEL_6X4_DEBUG_OBJ): kernel_6x4_debug.S
+
+# Build tile variant benchmark
+KERNEL_TILE_VARIANTS_OBJ = kernel_tile_variants.o
+bench_tiles: bench_tiles.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_TILE_VARIANTS_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_tiles.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_TILE_VARIANTS_OBJ) $(LDFLAGS) -lm
+
+$(KERNEL_TILE_VARIANTS_OBJ): kernel_tile_variants.S
+
+# Build 5x4 vs 6x4 comparison
+KERNEL_5X4_SIMPLE_OBJ = kernel_5x4_simple.o
+bench_5x4_vs_6x4: bench_5x4_vs_6x4.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_5x4_vs_6x4.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ) $(LDFLAGS)
+
+$(KERNEL_5X4_SIMPLE_OBJ): kernel_5x4_simple.S
+
+test_kernels: test_kernels.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ)
+	$(CC) $(CFLAGS) -o $@ test_kernels.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ) $(LDFLAGS)
+
+bench_5x4_simple: bench_5x4_simple.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_5x4_simple.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ) $(LDFLAGS)
+
+# Build 8x3 comparison benchmark
+bench_8x3: bench_8x3.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_8x3.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_5X4_SIMPLE_OBJ) $(LDFLAGS)
+
+# Build memory layout optimization benchmark
+KERNEL_6X4_UNROLL2_OBJ = kernel_6x4_unroll2.o
+KERNEL_6X4_UNROLL4_OBJ = kernel_6x4_unroll4.o
+KERNEL_6X4_KBLOCK_OBJ = kernel_6x4_kblock.o
+bench_layout: bench_layout.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_UNROLL2_OBJ) $(KERNEL_6X4_UNROLL4_OBJ) $(KERNEL_6X4_KBLOCK_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_layout.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_UNROLL2_OBJ) $(KERNEL_6X4_UNROLL4_OBJ) $(KERNEL_6X4_KBLOCK_OBJ) $(LDFLAGS)
+
+$(KERNEL_6X4_UNROLL2_OBJ): kernel_6x4_unroll2.S
+$(KERNEL_6X4_UNROLL4_OBJ): kernel_6x4_unroll4.S
+$(KERNEL_6X4_KBLOCK_OBJ): kernel_6x4_kblock.S
+
+# Build pure compute benchmark (L1D resident data)
+bench_compute_only: bench_compute_only.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_UNROLL2_OBJ) $(KERNEL_6X4_UNROLL4_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_compute_only.c $(KERNEL_6X4_KLOOP_OBJ) $(KERNEL_6X4_UNROLL2_OBJ) $(KERNEL_6X4_UNROLL4_OBJ) $(LDFLAGS)
+
+# Build pure compute benchmark (same address loads - no memory streaming)
+KERNEL_6X4_L1_TEST_OBJ = kernel_6x4_l1_test.o
+bench_pure_compute: bench_pure_compute.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_KLOOP_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pure_compute.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_KLOOP_OBJ) $(LDFLAGS)
+
+$(KERNEL_6X4_L1_TEST_OBJ): kernel_6x4_l1_test.S
+
+# Build pure compute benchmark v2 (fixed calculations)
+bench_pure_v2: bench_pure_v2.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_KLOOP_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pure_v2.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_KLOOP_OBJ) $(LDFLAGS)
+
+# Build interleave test benchmark (compare baseline vs interleaved instruction scheduling)
+KERNEL_6X4_INTERLEAVE_OBJ = kernel_6x4_interleave.o
+bench_interleave: bench_interleave.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_INTERLEAVE_OBJ) $(KERNEL_6X4_KLOOP_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_interleave.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_INTERLEAVE_OBJ) $(KERNEL_6X4_KLOOP_OBJ) $(LDFLAGS)
+
+$(KERNEL_6X4_INTERLEAVE_OBJ): kernel_6x4_interleave.S
+
+# Build latency-optimized kernel benchmark (5x4 dblbuf vs 6x4 OoO)
+KERNEL_5X4_DBLBUF_OBJ = kernel_5x4_dblbuf.o
+KERNEL_6X4_OOO_OBJ = kernel_6x4_ooo.o
+bench_latency: bench_latency.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_INTERLEAVE_OBJ) $(KERNEL_6X4_OOO_OBJ) $(KERNEL_5X4_DBLBUF_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_latency.c $(KERNEL_6X4_L1_TEST_OBJ) $(KERNEL_6X4_INTERLEAVE_OBJ) $(KERNEL_6X4_OOO_OBJ) $(KERNEL_5X4_DBLBUF_OBJ) $(LDFLAGS)
+
+$(KERNEL_5X4_DBLBUF_OBJ): kernel_5x4_dblbuf.S
+$(KERNEL_6X4_OOO_OBJ): kernel_6x4_ooo.S
