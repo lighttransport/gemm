@@ -1,12 +1,16 @@
 # Makefile for INT8 GEMM with SVE SDOT on A64FX
 # Supports both 5x4 and 6x4 microkernel variants
 
-COMPILER ?= fccpx
+COMPILER ?= fcc
 CC = $(COMPILER)
 
 # FCC/FCCPX flags
-ifeq ($(COMPILER),fccpx)
-    CFLAGS = -Nclang -O2 -march=armv8.2-a+sve -fopenmp
+ifeq ($(COMPILER),fcc)
+    CFLAGS = -Nclang -O3 -march=armv8.2-a+sve -fopenmp
+    ASFLAGS = -Nclang -c
+    LDFLAGS = -Nclang -fopenmp
+else ifeq ($(COMPILER),fccpx)
+    CFLAGS = -Nclang -O3 -march=armv8.2-a+sve -fopenmp
     ASFLAGS = -Nclang -c
     LDFLAGS = -Nclang -fopenmp
 else ifeq ($(COMPILER),gcc)
@@ -379,3 +383,125 @@ bench_activation: bench_activation.c activation_int32.h silu_fast.h
 # Pipeline: INT8 SDOT -> FP32 softmax -> INT16 -> INT16 SDOT
 bench_flash_int16: bench_flash_int16.c flash_attention_int16.c flash_attention_int16.h
 	$(CC) $(CFLAGS) -o $@ bench_flash_int16.c flash_attention_int16.c $(LDFLAGS) -lm
+
+# GEMM-only benchmark for efficiency measurement
+bench_gemm_only: bench_gemm_only.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# GEMM efficiency benchmark with optimized kernels
+bench_gemm_efficient: bench_gemm_efficient.c gemm_driver.o gemm_pack.o kernel_5x4.o kernel_6x4.o kernel_6x4_opt.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Fused attention GEMM benchmark (no softmax)
+bench_fused_gemm: bench_fused_gemm.c fused_attention_gemm.c fused_attention_gemm_opt.c fused_attention_gemm.h
+	$(CC) $(CFLAGS) -o $@ bench_fused_gemm.c fused_attention_gemm.c fused_attention_gemm_opt.c $(LDFLAGS)
+
+# Compute-bound fused GEMM kernel benchmark (L1D resident)
+FUSED_KERNEL_COMPUTE_OBJ = fused_kernel_compute.o
+bench_fused_compute: bench_fused_compute.c $(FUSED_KERNEL_COMPUTE_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fused_compute.c $(FUSED_KERNEL_COMPUTE_OBJ) $(LDFLAGS)
+
+$(FUSED_KERNEL_COMPUTE_OBJ): fused_kernel_compute.S
+
+# Optimized fused INT8/INT16 GEMM with ld1rw broadcast (LOAD pipe, not FPU)
+# Key optimization: ld1rw uses LOAD pipe, freeing FPU for more SDOT
+FUSED_GEMM_OPT_OBJ = fused_gemm_opt.o
+FUSED_KERNEL_LDBROADCAST_OBJ = fused_kernel_6x4_ldbroadcast.o
+
+bench_fused_opt: bench_fused_opt.c $(FUSED_GEMM_OPT_OBJ) $(FUSED_KERNEL_LDBROADCAST_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fused_opt.c $(FUSED_GEMM_OPT_OBJ) $(FUSED_KERNEL_LDBROADCAST_OBJ) $(LDFLAGS) -lm
+
+$(FUSED_GEMM_OPT_OBJ): fused_gemm_opt.c fused_gemm_opt.h
+$(FUSED_KERNEL_LDBROADCAST_OBJ): fused_kernel_6x4_ldbroadcast.S
+
+# Q@K^T 6x4 kernel benchmarks (optimized for Stage1)
+KERNEL_QKT_6X4_OBJ = kernel_qkt_6x4.o
+KERNEL_QKT_6X4_2X_OBJ = kernel_qkt_6x4_2x.o
+KERNEL_QKT_6X4_4X_OBJ = kernel_qkt_6x4_4x.o
+KERNEL_QKT_6X4_PIPE_OBJ = kernel_qkt_6x4_pipe.o
+
+bench_qkt_6x4: bench_qkt_6x4.c $(KERNEL_QKT_6X4_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_qkt_6x4.c $(KERNEL_QKT_6X4_OBJ) $(LDFLAGS)
+
+bench_qkt_6x4_cmp: bench_qkt_6x4_cmp.c $(KERNEL_QKT_6X4_OBJ) $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_QKT_6X4_4X_OBJ) $(KERNEL_QKT_6X4_PIPE_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_qkt_6x4_cmp.c $(KERNEL_QKT_6X4_OBJ) $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_QKT_6X4_4X_OBJ) $(KERNEL_QKT_6X4_PIPE_OBJ) $(LDFLAGS)
+
+$(KERNEL_QKT_6X4_OBJ): kernel_qkt_6x4.S
+$(KERNEL_QKT_6X4_2X_OBJ): kernel_qkt_6x4_2x.S
+$(KERNEL_QKT_6X4_4X_OBJ): kernel_qkt_6x4_4x.S
+$(KERNEL_QKT_6X4_PIPE_OBJ): kernel_qkt_6x4_pipe.S
+
+# P@V INT32 MLA benchmark (Stage 2 baseline without conversion overhead)
+KERNEL_PV_INT32_OBJ = kernel_pv_int32.o
+bench_pv_int32: bench_pv_int32.c $(KERNEL_PV_INT32_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pv_int32.c $(KERNEL_PV_INT32_OBJ) $(LDFLAGS)
+
+$(KERNEL_PV_INT32_OBJ): kernel_pv_int32.S
+
+# P@V comparison: INT8 SDOT vs INT16 MLA vs INT32 MLA
+KERNEL_PV_INT8_OBJ = kernel_pv_int8.o
+KERNEL_PV_INT8_2X_OBJ = kernel_pv_int8_2x.o
+KERNEL_PV_INT16_OBJ = kernel_pv_int16.o
+bench_pv_cmp: bench_pv_cmp.c $(KERNEL_PV_INT8_OBJ) $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT16_OBJ) $(KERNEL_PV_INT32_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pv_cmp.c $(KERNEL_PV_INT8_OBJ) $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT16_OBJ) $(KERNEL_PV_INT32_OBJ) $(LDFLAGS)
+
+$(KERNEL_PV_INT8_OBJ): kernel_pv_int8.S
+$(KERNEL_PV_INT8_2X_OBJ): kernel_pv_int8_2x.S
+$(KERNEL_PV_INT16_OBJ): kernel_pv_int16.S
+
+# P@V exploration: diagnose bottlenecks
+KERNEL_PV_INT8_COMPUTE_ONLY_OBJ = kernel_pv_int8_compute_only.o
+KERNEL_PV_INT8_KBLOCK_OBJ = kernel_pv_int8_kblock.o
+KERNEL_PV_INT8_4X_OBJ = kernel_pv_int8_4x.o
+KERNEL_PV_INT8_OPT_OBJ = kernel_pv_int8_opt.o
+bench_pv_explore: bench_pv_explore.c $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT8_COMPUTE_ONLY_OBJ) $(KERNEL_PV_INT8_KBLOCK_OBJ) $(KERNEL_PV_INT8_4X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pv_explore.c $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT8_COMPUTE_ONLY_OBJ) $(KERNEL_PV_INT8_KBLOCK_OBJ) $(KERNEL_PV_INT8_4X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(LDFLAGS)
+
+$(KERNEL_PV_INT8_COMPUTE_ONLY_OBJ): kernel_pv_int8_compute_only.S
+$(KERNEL_PV_INT8_KBLOCK_OBJ): kernel_pv_int8_kblock.S
+$(KERNEL_PV_INT8_4X_OBJ): kernel_pv_int8_4x.S
+$(KERNEL_PV_INT8_OPT_OBJ): kernel_pv_int8_opt.S
+
+# P@V exploration part 2: prefetch, 4-row, and 6x2 double-buffering
+KERNEL_PV_INT8_PREFETCH_OBJ = kernel_pv_int8_prefetch.o
+KERNEL_PV_INT8_4ROW_OBJ = kernel_pv_int8_4row.o
+KERNEL_PV_INT8_6X2_OBJ = kernel_pv_int8_6x2.o
+bench_pv_explore2: bench_pv_explore2.c $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(KERNEL_PV_INT8_PREFETCH_OBJ) $(KERNEL_PV_INT8_4ROW_OBJ) $(KERNEL_PV_INT8_6X2_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pv_explore2.c $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(KERNEL_PV_INT8_PREFETCH_OBJ) $(KERNEL_PV_INT8_4ROW_OBJ) $(KERNEL_PV_INT8_6X2_OBJ) $(LDFLAGS)
+
+$(KERNEL_PV_INT8_PREFETCH_OBJ): kernel_pv_int8_prefetch.S
+$(KERNEL_PV_INT8_4ROW_OBJ): kernel_pv_int8_4row.S
+$(KERNEL_PV_INT8_6X2_OBJ): kernel_pv_int8_6x2.S
+
+# P@V tile size comparison: 4x4, 5x4, 6x4, 7x4
+KERNEL_PV_INT8_5X4_OBJ = kernel_pv_int8_5x4.o
+KERNEL_PV_INT8_7X4_OBJ = kernel_pv_int8_7x4.o
+bench_pv_tiles: bench_pv_tiles.c $(KERNEL_PV_INT8_4ROW_OBJ) $(KERNEL_PV_INT8_5X4_OBJ) $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(KERNEL_PV_INT8_7X4_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_pv_tiles.c $(KERNEL_PV_INT8_4ROW_OBJ) $(KERNEL_PV_INT8_5X4_OBJ) $(KERNEL_PV_INT8_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(KERNEL_PV_INT8_7X4_OBJ) $(LDFLAGS)
+
+$(KERNEL_PV_INT8_5X4_OBJ): kernel_pv_int8_5x4.S
+$(KERNEL_PV_INT8_7X4_OBJ): kernel_pv_int8_7x4.S
+
+# Fused INT8 Attention: O = softmax(Q @ K^T) @ V
+FUSED_ATTN_INT8_OBJ = fused_attention_int8.o
+bench_fused_attn: bench_fused_attn.c $(FUSED_ATTN_INT8_OBJ) $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fused_attn.c $(FUSED_ATTN_INT8_OBJ) $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(LDFLAGS) -lm
+
+$(FUSED_ATTN_INT8_OBJ): fused_attention_int8.c fused_attention_int8.h
+
+# Debug fused attention kernels
+bench_fused_debug: bench_fused_debug.c $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fused_debug.c $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(LDFLAGS)
+
+# Optimized fused attention: INT8 SDOT for both stages, exp computed once
+EXP2_INT_OBJ = exp2_int.o
+FUSED_ATTN_OPT_OBJ = fused_attention_opt.o
+bench_fused_attn_opt: bench_fused_opt.c $(FUSED_ATTN_OPT_OBJ) $(EXP2_INT_OBJ) $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fused_opt.c $(FUSED_ATTN_OPT_OBJ) $(EXP2_INT_OBJ) $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(LDFLAGS) -lm
+
+$(EXP2_INT_OBJ): exp2_int.c exp2_int.h
+$(FUSED_ATTN_OPT_OBJ): fused_attention_opt.c fused_attention_int8.h exp2_int.h
+
+# Kernel-only benchmark (measures Q@K^T + P@V efficiency without softmax overhead)
+bench_fused_kernel_only: bench_fused_kernel_only.c $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_fused_kernel_only.c $(KERNEL_QKT_6X4_2X_OBJ) $(KERNEL_PV_INT8_OPT_OBJ) $(LDFLAGS) -lm
