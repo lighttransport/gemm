@@ -1,0 +1,39 @@
+# Example: Sequential Memory Access Pattern
+# Simulates simple sequential vector processing
+# Load 64 bytes, compute (SDOT), repeat
+
+# Process 16 SVE vectors (64 bytes each = 1024 bytes total)
+ld1 0x10000 64
+sdot
+ld1 0x10040 64
+sdot
+ld1 0x10080 64
+sdot
+ld1 0x100c0 64
+sdot
+ld1 0x10100 64
+sdot
+ld1 0x10140 64
+sdot
+ld1 0x10180 64
+sdot
+ld1 0x101c0 64
+sdot
+ld1 0x10200 64
+sdot
+ld1 0x10240 64
+sdot
+ld1 0x10280 64
+sdot
+ld1 0x102c0 64
+sdot
+ld1 0x10300 64
+sdot
+ld1 0x10340 64
+sdot
+ld1 0x10380 64
+sdot
+ld1 0x103c0 64
+sdot
+
+# Expected: 100% L1 hit rate (sequential, well within L1 capacity)
