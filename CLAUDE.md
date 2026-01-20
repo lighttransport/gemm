@@ -1,4 +1,11 @@
 
+# compiler for a64fx fugaku
+
+- fccpx: C cross(Intel host) compiler
+- FCCpx: C++ cross(Intel host) compiler
+- fcc: C native(a64fx) compiler
+- FCC: C++ native(a64fx) compiler
+
 # submit job for a64fx fugaku
 
 // freq=2000 : normal mode
