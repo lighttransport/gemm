@@ -1,59 +1,66 @@
-// test_timer.c - Timer diagnostic
+// Simple test to verify timer and kernels work
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
-#include <time.h>
+#include <string.h>
 
-static inline uint64_t read_timer_cntpct(void) {
+extern void kernel_ffn_6row_gemm_d256(
+    const int8_t* A, const int8_t* B, int32_t* C,
+    int M, int K, int N);
+
+// Get cycle counter
+static inline uint64_t get_cycles(void) {
     uint64_t val;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
     return val;
 }
 
-static inline uint64_t get_timer_freq_cntfrq(void) {
-    uint64_t freq;
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
-    return freq;
-}
+int main(void) {
+    printf("Testing timer and kernel...\n\n");
 
-int main() {
-    printf("=== Timer Diagnostic ===\n\n");
+    // Test timer
+    uint64_t t1 = get_cycles();
+    printf("Timer read 1: %llu\n", (unsigned long long)t1);
 
-    // Test cntvct and cntfrq
-    uint64_t freq = get_timer_freq_cntfrq();
-    uint64_t t0 = read_timer_cntpct();
+    for (volatile int i = 0; i < 1000000; i++);  // Busy loop
 
-    // Busy wait
-    volatile int sum = 0;
-    for (int i = 0; i < 100000000; i++) {
-        sum += i;
+    uint64_t t2 = get_cycles();
+    printf("Timer read 2: %llu\n", (unsigned long long)t2);
+    printf("Elapsed: %llu cycles\n", (unsigned long long)(t2 - t1));
+
+    if (t2 <= t1) {
+        printf("ERROR: Timer not working!\n");
+        return 1;
     }
 
-    uint64_t t1 = read_timer_cntpct();
+    // Allocate matrices
+    const int M = 6, K = 256, N = 1024;
+    int8_t* A = (int8_t*)calloc(M * K, sizeof(int8_t));
+    int8_t* B = (int8_t*)calloc(K * N, sizeof(int8_t));
+    int32_t* C = (int32_t*)calloc(M * N, sizeof(int32_t));
 
-    printf("cntvct_el0 method:\n");
-    printf("  freq = %lu\n", freq);
-    printf("  t0 = %lu\n", t0);
-    printf("  t1 = %lu\n", t1);
-    printf("  t1-t0 = %lu\n", t1 - t0);
-    printf("  time = %.6f seconds\n", (double)(t1 - t0) / (double)freq);
+    // Initialize with small values
+    for (int i = 0; i < M * K; i++) A[i] = 1;
+    for (int i = 0; i < K * N; i++) B[i] = 1;
 
-    // Test clock_gettime
-    struct timespec ts0, ts1;
-    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    printf("\nTesting D=256 kernel...\n");
+    uint64_t start = get_cycles();
+    kernel_ffn_6row_gemm_d256(A, B, C, M, K, N);
+    uint64_t end = get_cycles();
 
-    sum = 0;
-    for (int i = 0; i < 100000000; i++) {
-        sum += i;
+    printf("Kernel elapsed: %llu timer cycles\n", (unsigned long long)(end - start));
+    printf("Kernel elapsed: %llu CPU cycles (×20)\n", (unsigned long long)((end - start) * 20));
+
+    // Check results
+    int nonzero = 0;
+    for (int i = 0; i < M * N && i < 10; i++) {
+        if (C[i] != 0) nonzero++;
+        printf("C[%d] = %d\n", i, C[i]);
     }
+    printf("Nonzero results: %d / %d\n", nonzero, 10);
 
-    clock_gettime(CLOCK_MONOTONIC, &ts1);
-
-    double time_clock = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) / 1e9;
-
-    printf("\nclock_gettime method:\n");
-    printf("  time = %.6f seconds\n", time_clock);
-
-    printf("\nsum = %d (to prevent optimization)\n", sum);
-
+    free(A);
+    free(B);
+    free(C);
     return 0;
 }
