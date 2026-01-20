@@ -1,0 +1,173 @@
+# Example: INT8 GEMM Access Pattern (D=256)
+# Simulates 6-row kernel with D=256 hidden dimension
+# Working set: ~4 KB (fits well in L1 cache)
+#
+# Memory layout:
+# - A matrix (6 rows): 6 * 256 = 1536 bytes
+# - B matrix (1 K-group): 4 * 256 = 1024 bytes
+# Total per K-group: ~2.5 KB
+
+# Base addresses:
+# A matrix: 0x10000
+# B matrix: 0x20000
+
+# Outer loop: Process 32 K-groups (D=256 / 8 = 32)
+# Inner kernel: 6-row micro-kernel
+
+# K-group 0
+# Load A rows (6 rows, 32 bytes each = 192 bytes)
+ld1 0x10000 32
+ld1 0x10020 32
+ld1 0x10040 32
+ld1 0x10060 32
+ld1 0x10080 32
+ld1 0x100a0 32
+
+# Load B columns (4 cols, 32 bytes each = 128 bytes)
+ld1 0x20000 32
+ld1 0x20020 32
+ld1 0x20040 32
+ld1 0x20060 32
+
+# Compute: 6 rows * 4 cols * 4 SDOTs = 96 SDOT operations
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 1 (advance pointers by 32 bytes)
+ld1 0x100c0 32
+ld1 0x100e0 32
+ld1 0x10100 32
+ld1 0x10120 32
+ld1 0x10140 32
+ld1 0x10160 32
+
+ld1 0x20080 32
+ld1 0x200a0 32
+ld1 0x200c0 32
+ld1 0x200e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 2
+ld1 0x10180 32
+ld1 0x101a0 32
+ld1 0x101c0 32
+ld1 0x101e0 32
+ld1 0x10200 32
+ld1 0x10220 32
+
+ld1 0x20100 32
+ld1 0x20120 32
+ld1 0x20140 32
+ld1 0x20160 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 3
+ld1 0x10240 32
+ld1 0x10260 32
+ld1 0x10280 32
+ld1 0x102a0 32
+ld1 0x102c0 32
+ld1 0x102e0 32
+
+ld1 0x20180 32
+ld1 0x201a0 32
+ld1 0x201c0 32
+ld1 0x201e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Expected: ~90% L1 hit rate
+# Working set: 1536 + 1024 = 2560 bytes (fits in L1)

@@ -1,0 +1,41 @@
+# Example: Zero-fill optimization
+# Demonstrates using zfill to avoid memory fetches when initializing data
+
+# Scenario: Initialize output buffer with zeros before computation
+# Without zfill: Must load line from memory, write zeros, write back
+# With zfill: Allocate L1 line directly, mark as zero
+
+# Traditional approach (load + store)
+ld1 0x20000 64    # Load existing data (slow!)
+st1 0x20000 64    # Write zeros
+st1 0x20040 64
+st1 0x20080 64
+st1 0x200c0 64
+
+# Better approach (zfill)
+zfill 0x30000     # Allocate L1 line, no memory fetch!
+st1 0x30000 64    # Write data (hits in L1)
+zfill 0x30100
+st1 0x30100 64
+zfill 0x30200
+st1 0x30200 64
+zfill 0x30300
+st1 0x30300 64
+
+# Compute on the initialized data
+ld1 0x10000 64    # Load input
+sdot
+ld1 0x30000 64    # Load zfilled output (L1 hit)
+sdot
+st1 0x30000 64    # Store result
+
+ld1 0x10040 64
+sdot
+ld1 0x30100 64
+sdot
+st1 0x30100 64
+
+# Expected: zfill approach is much faster
+# - No DRAM fetch (260 cycles saved per line)
+# - Direct L1 allocation (11 cycles)
+# - Subsequent stores hit in L1

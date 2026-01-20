@@ -1,0 +1,268 @@
+# Example: INT8 GEMM with Software Prefetching (D=512)
+# Demonstrates prefetching 2 K-groups ahead (~16 KB distance)
+# This should reduce L2 miss latency
+
+# Base addresses:
+# A matrix: 0x10000
+# B matrix: 0x20000
+
+# Prefetch distance: 2 K-groups ahead
+# Each K-group processes: 6*32 + 4*32 = 320 bytes
+# Distance: ~640 bytes ahead
+
+# K-group 0
+# PREFETCH 2 K-groups ahead (K-group 2)
+prfm 0x10180
+prfm 0x101a0
+prfm 0x101c0
+prfm 0x101e0
+prfm 0x10200
+prfm 0x10220
+prfm 0x20100
+prfm 0x20120
+prfm 0x20140
+prfm 0x20160
+
+# Load A rows
+ld1 0x10000 32
+ld1 0x10020 32
+ld1 0x10040 32
+ld1 0x10060 32
+ld1 0x10080 32
+ld1 0x100a0 32
+
+# Load B columns
+ld1 0x20000 32
+ld1 0x20020 32
+ld1 0x20040 32
+ld1 0x20060 32
+
+# Compute
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 1
+# PREFETCH K-group 3
+prfm 0x10240
+prfm 0x10260
+prfm 0x10280
+prfm 0x102a0
+prfm 0x102c0
+prfm 0x102e0
+prfm 0x20180
+prfm 0x201a0
+prfm 0x201c0
+prfm 0x201e0
+
+ld1 0x100c0 32
+ld1 0x100e0 32
+ld1 0x10100 32
+ld1 0x10120 32
+ld1 0x10140 32
+ld1 0x10160 32
+
+ld1 0x20080 32
+ld1 0x200a0 32
+ld1 0x200c0 32
+ld1 0x200e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 2
+# PREFETCH K-group 4
+prfm 0x10300
+prfm 0x10320
+prfm 0x10340
+prfm 0x10360
+prfm 0x10380
+prfm 0x103a0
+prfm 0x20200
+prfm 0x20220
+prfm 0x20240
+prfm 0x20260
+
+ld1 0x10180 32
+ld1 0x101a0 32
+ld1 0x101c0 32
+ld1 0x101e0 32
+ld1 0x10200 32
+ld1 0x10220 32
+
+ld1 0x20100 32
+ld1 0x20120 32
+ld1 0x20140 32
+ld1 0x20160 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 3
+# PREFETCH K-group 5
+prfm 0x103c0
+prfm 0x103e0
+prfm 0x10400
+prfm 0x10420
+prfm 0x10440
+prfm 0x10460
+prfm 0x20280
+prfm 0x202a0
+prfm 0x202c0
+prfm 0x202e0
+
+ld1 0x10240 32
+ld1 0x10260 32
+ld1 0x10280 32
+ld1 0x102a0 32
+ld1 0x102c0 32
+ld1 0x102e0 32
+
+ld1 0x20180 32
+ld1 0x201a0 32
+ld1 0x201c0 32
+ld1 0x201e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 4
+# PREFETCH K-group 6
+prfm 0x10480
+prfm 0x104a0
+prfm 0x104c0
+prfm 0x104e0
+prfm 0x10500
+prfm 0x10520
+prfm 0x20300
+prfm 0x20320
+prfm 0x20340
+prfm 0x20360
+
+ld1 0x10300 32
+ld1 0x10320 32
+ld1 0x10340 32
+ld1 0x10360 32
+ld1 0x10380 32
+ld1 0x103a0 32
+
+ld1 0x20200 32
+ld1 0x20220 32
+ld1 0x20240 32
+ld1 0x20260 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Expected: Better performance than non-prefetch version
+# Prefetching should hide L2 latency by bringing data into L1 early
+# Should see reduced memory stall cycles

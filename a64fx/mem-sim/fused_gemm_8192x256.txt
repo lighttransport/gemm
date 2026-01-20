@@ -1,0 +1,417 @@
+# Fused GEMM Kernel: (A @ B) @ C
+# Dimensions: A[6, 8192], B[256, 8192]^T, C[256, 256]^T
+# Result: [6, 256]
+#
+# Memory Layout (INT8):
+#   A: 0x100000 - 6 rows × 8192 cols = 49,152 bytes
+#   B: 0x200000 - 256 rows × 8192 cols = 2,097,152 bytes (transposed)
+#   C: 0x400000 - 256 rows × 256 cols = 65,536 bytes (transposed)
+#   AB_temp: registers (6×256 = 1536 elements, kept in SVE regs)
+#   Output: 0x500000 - 6 × 256 = 1,536 bytes
+#
+# Strategy: Tile over K dimension of first GEMM
+#   K_tile = 256 (process 256 columns of A and rows of B at a time)
+#   This produces 6×256 partial sums that fit in registers
+#   After each K_tile, we can fuse with C multiplication
+#
+# Cache line = 256 bytes
+# SVE vector = 64 bytes (64 INT8 elements)
+
+# ============================================================
+# PHASE 1: First GEMM A[6,8192] @ B[256,8192]^T = AB[6,256]
+# Process K in tiles of 256 (fits in L1)
+# ============================================================
+
+# K_tile 0: k=0..255
+# Load A rows (6 rows × 256 bytes = 1536 bytes = 6 cache lines)
+ld1 0x100000 256
+ld1 0x102000 256
+ld1 0x104000 256
+ld1 0x106000 256
+ld1 0x108000 256
+ld1 0x10a000 256
+
+# Load B columns (256 rows × 256 bytes each, but we process 4 at a time)
+# Each B row = 8192 bytes, we need first 256 bytes of each
+# B[0]: 0x200000, B[1]: 0x202000, etc.
+ld1 0x200000 256
+ld1 0x202000 256
+ld1 0x204000 256
+ld1 0x206000 256
+# Compute 6×4 SDOT operations
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Continue with more B rows
+ld1 0x208000 256
+ld1 0x20a000 256
+ld1 0x20c000 256
+ld1 0x20e000 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# ... (continue for all 256 B rows, showing representative pattern)
+ld1 0x210000 256
+ld1 0x212000 256
+ld1 0x214000 256
+ld1 0x216000 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K_tile 1: k=256..511
+# A rows offset by 256 bytes
+ld1 0x100100 256
+ld1 0x102100 256
+ld1 0x104100 256
+ld1 0x106100 256
+ld1 0x108100 256
+ld1 0x10a100 256
+
+# B rows, offset by 256 bytes (second 256 of each row)
+ld1 0x200100 256
+ld1 0x202100 256
+ld1 0x204100 256
+ld1 0x206100 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x208100 256
+ld1 0x20a100 256
+ld1 0x20c100 256
+ld1 0x20e100 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K_tile 2: k=512..767
+ld1 0x100200 256
+ld1 0x102200 256
+ld1 0x104200 256
+ld1 0x106200 256
+ld1 0x108200 256
+ld1 0x10a200 256
+
+ld1 0x200200 256
+ld1 0x202200 256
+ld1 0x204200 256
+ld1 0x206200 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# ... (representative tiles, full kernel would have 32 K_tiles)
+
+# ============================================================
+# PHASE 2: Second GEMM AB[6,256] @ C[256,256]^T = Result[6,256]
+# AB is in registers from Phase 1
+# Stream through C matrix
+# ============================================================
+
+# Load C columns (256 rows × 256 bytes each)
+# C[0]: 0x400000, C[1]: 0x400100, etc.
+ld1 0x400000 256
+ld1 0x400100 256
+ld1 0x400200 256
+ld1 0x400300 256
+# Compute 6×4 SDOT operations for second GEMM
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x400400 256
+ld1 0x400500 256
+ld1 0x400600 256
+ld1 0x400700 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x400800 256
+ld1 0x400900 256
+ld1 0x400a00 256
+ld1 0x400b00 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x400c00 256
+ld1 0x400d00 256
+ld1 0x400e00 256
+ld1 0x400f00 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Continue C rows...
+ld1 0x401000 256
+ld1 0x401100 256
+ld1 0x401200 256
+ld1 0x401300 256
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# ============================================================
+# PHASE 3: Store output
+# Use zfill to efficiently allocate output buffer
+# ============================================================
+
+zfill 0x500000
+st1 0x500000 256
+zfill 0x500100
+st1 0x500100 256
+zfill 0x500200
+st1 0x500200 256
+zfill 0x500300
+st1 0x500300 256
+zfill 0x500400
+st1 0x500400 256
+zfill 0x500500
+st1 0x500500 256
+
+# Expected behavior:
+# - Phase 1: A tiles should hit in L1 (reused across B rows)
+# - Phase 1: B rows stream through, mostly L2/DRAM misses
+# - Phase 2: C matrix smaller, better L1/L2 utilization
+# - Phase 3: zfill avoids DRAM fetch for output
+#
+# Total data movement estimate:
+# - A: 6 × 8192 = 49 KB (reused many times)
+# - B: 256 × 8192 = 2 MB (streamed once per K_tile)
+# - C: 256 × 256 = 64 KB (streamed once)
+# - Output: 6 × 256 = 1.5 KB
