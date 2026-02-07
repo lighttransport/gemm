@@ -864,3 +864,786 @@ embedding_bwd_sorted_f32_asm:
     ldp     x29, x30, [sp], #80
     ret
     .size embedding_bwd_sorted_f32_asm, .-embedding_bwd_sorted_f32_asm
+
+
+//=============================================================================
+// Embedding Forward FP32 - SVE Gather/Scatter (16 tokens column-wise)
+// void embedding_fwd_f32_gather_asm(const int32_t* indices,
+//                                    const float* emb_table,
+//                                    float* output,
+//                                    size_t seq_len, size_t hidden_dim)
+// x0 = indices, x1 = emb_table, x2 = output, x3 = seq_len, x4 = hidden_dim
+//
+// Processes 16 tokens simultaneously using SVE gather loads and scatter stores.
+// Iterates column-wise over the hidden dimension.
+// Constraint: vocab_size * hidden_dim < 2^32 (32-bit word offsets)
+//
+// Register plan:
+//   z0-z3:   gathered data (4x column unroll)
+//   z16-z19: gather offsets for columns j+0..j+3
+//   z20-z23: scatter offsets for columns j+0..j+3
+//   z28:     loaded indices
+//   z31:     dup(hidden_dim) for multiply
+//   p0:      all-true (.s)
+//   p1:      tail mask for remainder tokens
+//=============================================================================
+    .align 6
+    .global embedding_fwd_f32_gather_asm
+    .type embedding_fwd_f32_gather_asm, %function
+embedding_fwd_f32_gather_asm:
+    stp     x29, x30, [sp, #-80]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    mov     x29, sp
+
+    cbz     x3, .Lgather_done
+
+    mov     x19, x0             // indices
+    mov     x20, x1             // emb_table
+    mov     x21, x2             // output
+    mov     x22, x3             // seq_len
+    mov     x23, x4             // hidden_dim
+    lsl     x24, x4, #2         // row_stride_bytes = dim * 4
+
+    ptrue   p0.s
+
+    // z31 = dup(hidden_dim) for index multiplication
+    mov     w5, w4
+    mov     z31.s, w5
+
+    mov     x25, #0             // batch_start = 0
+
+.Lgather_batch16:
+    sub     x6, x22, x25        // remaining = seq_len - batch_start
+    cmp     x6, #16
+    b.lt    .Lgather_tail
+
+    // Load 16 indices
+    add     x7, x19, x25, lsl #2
+    ld1w    {z28.s}, p0/z, [x7]
+
+    // Gather word offsets: z16[i] = indices[i] * hidden_dim
+    movprfx z16, z28
+    mul     z16.s, p0/m, z16.s, z31.s
+
+    // Scatter word offsets: z20[i] = (batch_start + i) * hidden_dim
+    mul     w7, w25, w4          // w7 = batch_start * dim
+    mov     w8, w4               // w8 = dim (step)
+    index   z20.s, w7, w8
+
+    // 4x column unroll: offset+1, +2, +3 (ADD imm is destructive, need movprfx)
+    movprfx z17, z16
+    add     z17.s, z17.s, #1
+    movprfx z18, z16
+    add     z18.s, z18.s, #2
+    movprfx z19, z16
+    add     z19.s, z19.s, #3
+    movprfx z21, z20
+    add     z21.s, z21.s, #1
+    movprfx z22, z20
+    add     z22.s, z22.s, #2
+    movprfx z23, z20
+    add     z23.s, z23.s, #3
+
+    // Inner loop: iterate over columns, 4 at a time
+    mov     x6, x23              // remaining columns
+
+.Lgather_col4:
+    cmp     x6, #4
+    b.lt    .Lgather_col_tail
+
+    // Gather 4 columns from 16 rows
+    ld1w    {z0.s}, p0/z, [x20, z16.s, UXTW #2]
+    ld1w    {z1.s}, p0/z, [x20, z17.s, UXTW #2]
+    ld1w    {z2.s}, p0/z, [x20, z18.s, UXTW #2]
+    ld1w    {z3.s}, p0/z, [x20, z19.s, UXTW #2]
+
+    // Scatter 4 columns to 16 output positions
+    st1w    {z0.s}, p0, [x21, z20.s, UXTW #2]
+    st1w    {z1.s}, p0, [x21, z21.s, UXTW #2]
+    st1w    {z2.s}, p0, [x21, z22.s, UXTW #2]
+    st1w    {z3.s}, p0, [x21, z23.s, UXTW #2]
+
+    // Advance all offset vectors by 4 columns
+    add     z16.s, z16.s, #4
+    add     z17.s, z17.s, #4
+    add     z18.s, z18.s, #4
+    add     z19.s, z19.s, #4
+    add     z20.s, z20.s, #4
+    add     z21.s, z21.s, #4
+    add     z22.s, z22.s, #4
+    add     z23.s, z23.s, #4
+
+    sub     x6, x6, #4
+    b       .Lgather_col4
+
+.Lgather_col_tail:
+    cbz     x6, .Lgather_next_batch
+
+.Lgather_col1:
+    ld1w    {z0.s}, p0/z, [x20, z16.s, UXTW #2]
+    st1w    {z0.s}, p0, [x21, z20.s, UXTW #2]
+    add     z16.s, z16.s, #1
+    add     z20.s, z20.s, #1
+    subs    x6, x6, #1
+    b.gt    .Lgather_col1
+
+.Lgather_next_batch:
+    add     x25, x25, #16
+    b       .Lgather_batch16
+
+.Lgather_tail:
+    // Handle remaining < 16 tokens
+    sub     x6, x22, x25
+    cbz     x6, .Lgather_done
+
+    // Predicate for remaining tokens
+    whilelt p1.s, xzr, x6
+
+    // Load remaining indices
+    add     x7, x19, x25, lsl #2
+    ld1w    {z28.s}, p1/z, [x7]
+
+    // Compute offsets (all lanes via p0; inactive lanes don't matter for gather/scatter with p1)
+    movprfx z16, z28
+    mul     z16.s, p0/m, z16.s, z31.s
+
+    mul     w7, w25, w4
+    mov     w8, w4
+    index   z20.s, w7, w8
+
+    movprfx z17, z16
+    add     z17.s, z17.s, #1
+    movprfx z18, z16
+    add     z18.s, z18.s, #2
+    movprfx z19, z16
+    add     z19.s, z19.s, #3
+    movprfx z21, z20
+    add     z21.s, z21.s, #1
+    movprfx z22, z20
+    add     z22.s, z22.s, #2
+    movprfx z23, z20
+    add     z23.s, z23.s, #3
+
+    mov     x6, x23
+
+.Lgather_tail_col4:
+    cmp     x6, #4
+    b.lt    .Lgather_tail_col1
+
+    ld1w    {z0.s}, p1/z, [x20, z16.s, UXTW #2]
+    ld1w    {z1.s}, p1/z, [x20, z17.s, UXTW #2]
+    ld1w    {z2.s}, p1/z, [x20, z18.s, UXTW #2]
+    ld1w    {z3.s}, p1/z, [x20, z19.s, UXTW #2]
+
+    st1w    {z0.s}, p1, [x21, z20.s, UXTW #2]
+    st1w    {z1.s}, p1, [x21, z21.s, UXTW #2]
+    st1w    {z2.s}, p1, [x21, z22.s, UXTW #2]
+    st1w    {z3.s}, p1, [x21, z23.s, UXTW #2]
+
+    add     z16.s, z16.s, #4
+    add     z17.s, z17.s, #4
+    add     z18.s, z18.s, #4
+    add     z19.s, z19.s, #4
+    add     z20.s, z20.s, #4
+    add     z21.s, z21.s, #4
+    add     z22.s, z22.s, #4
+    add     z23.s, z23.s, #4
+
+    sub     x6, x6, #4
+    b       .Lgather_tail_col4
+
+.Lgather_tail_col1:
+    cbz     x6, .Lgather_done
+
+.Lgather_tail_col1_loop:
+    ld1w    {z0.s}, p1/z, [x20, z16.s, UXTW #2]
+    st1w    {z0.s}, p1, [x21, z20.s, UXTW #2]
+    add     z16.s, z16.s, #1
+    add     z20.s, z20.s, #1
+    subs    x6, x6, #1
+    b.gt    .Lgather_tail_col1_loop
+
+.Lgather_done:
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #80
+    ret
+    .size embedding_fwd_f32_gather_asm, .-embedding_fwd_f32_gather_asm
+
+
+//=============================================================================
+// Embedding Forward FP32 - Deep-Prefetch Stream
+// void embedding_fwd_f32_stream_asm(const int32_t* indices,
+//                                    const float* emb_table,
+//                                    float* output,
+//                                    size_t seq_len, size_t hidden_dim)
+// x0 = indices, x1 = emb_table, x2 = output, x3 = seq_len, x4 = hidden_dim
+//
+// Processes tokens sequentially with 8x vector unroll (128 FP32 = 512B per iter)
+// and deep prefetching of rows 8 tokens ahead to hide HBM2 latency (~260 cycles).
+//
+// Register plan:
+//   z0-z7:   data (8x unroll)
+//   x19-x26: saved parameters
+//   p0:      all-true (.s)
+//=============================================================================
+    .align 6
+    .global embedding_fwd_f32_stream_asm
+    .type embedding_fwd_f32_stream_asm, %function
+embedding_fwd_f32_stream_asm:
+    stp     x29, x30, [sp, #-80]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    mov     x29, sp
+
+    cbz     x3, .Lstream_done
+
+    mov     x19, x0             // indices
+    mov     x20, x1             // emb_table
+    mov     x21, x2             // output
+    mov     x22, x3             // seq_len
+    mov     x23, x4             // hidden_dim
+    lsl     x24, x4, #2         // row_stride_bytes = dim * 4
+
+    cntw    x5                   // VL words = 16
+    ptrue   p0.s
+    lsl     x25, x5, #5         // 8 * VL * 4 bytes = 512 (8x unroll stride)
+    lsl     x26, x5, #3         // 8 * VL = 128 elements per 8x iter
+
+    // Issue initial prefetches for first 8 rows
+    mov     x6, #0
+    mov     x7, #8
+    cmp     x7, x22
+    csel    x7, x7, x22, lo     // min(8, seq_len)
+.Lstream_init_pf:
+    cmp     x6, x7
+    b.ge    .Lstream_init_pf_done
+    ldr     w8, [x19, x6, lsl #2]
+    mul     x9, x8, x24
+    add     x9, x20, x9
+    prfm    pldl1strm, [x9]
+    prfm    pldl1strm, [x9, #256]
+    prfm    pldl1strm, [x9, #512]
+    prfm    pldl1strm, [x9, #768]
+    add     x6, x6, #1
+    b       .Lstream_init_pf
+.Lstream_init_pf_done:
+
+    mov     x8, #0              // current token index
+
+.Lstream_outer:
+    cmp     x8, x22
+    b.ge    .Lstream_done
+
+    // Load current index
+    ldr     w9, [x19, x8, lsl #2]
+
+    // Source address: emb_table + idx * stride
+    mul     x10, x9, x24
+    add     x10, x20, x10
+
+    // Destination address: output + i * stride
+    mul     x11, x8, x24
+    add     x11, x21, x11
+
+    // Prefetch row for token i+8
+    add     x12, x8, #8
+    cmp     x12, x22
+    b.ge    .Lstream_no_pf
+
+    ldr     w13, [x19, x12, lsl #2]
+    mul     x14, x13, x24
+    add     x14, x20, x14
+    prfm    pldl1strm, [x14]
+    prfm    pldl1strm, [x14, #256]
+    prfm    pldl1strm, [x14, #512]
+    prfm    pldl1strm, [x14, #768]
+
+.Lstream_no_pf:
+
+    // Copy row: 8x unrolled inner loop
+    mov     x15, x23             // remaining elements
+
+.Lstream_inner8:
+    cmp     x15, x26
+    b.lt    .Lstream_inner_rem
+
+    ld1w    {z0.s}, p0/z, [x10]
+    ld1w    {z1.s}, p0/z, [x10, #1, mul vl]
+    ld1w    {z2.s}, p0/z, [x10, #2, mul vl]
+    ld1w    {z3.s}, p0/z, [x10, #3, mul vl]
+    ld1w    {z4.s}, p0/z, [x10, #4, mul vl]
+    ld1w    {z5.s}, p0/z, [x10, #5, mul vl]
+    ld1w    {z6.s}, p0/z, [x10, #6, mul vl]
+    ld1w    {z7.s}, p0/z, [x10, #7, mul vl]
+
+    st1w    {z0.s}, p0, [x11]
+    st1w    {z1.s}, p0, [x11, #1, mul vl]
+    st1w    {z2.s}, p0, [x11, #2, mul vl]
+    st1w    {z3.s}, p0, [x11, #3, mul vl]
+    st1w    {z4.s}, p0, [x11, #4, mul vl]
+    st1w    {z5.s}, p0, [x11, #5, mul vl]
+    st1w    {z6.s}, p0, [x11, #6, mul vl]
+    st1w    {z7.s}, p0, [x11, #7, mul vl]
+
+    add     x10, x10, x25       // src += 8*VL*4
+    add     x11, x11, x25       // dst += 8*VL*4
+    sub     x15, x15, x26
+    b       .Lstream_inner8
+
+.Lstream_inner_rem:
+    cbz     x15, .Lstream_next
+
+.Lstream_inner1:
+    whilelt p1.s, xzr, x15
+    ld1w    {z0.s}, p1/z, [x10]
+    st1w    {z0.s}, p1, [x11]
+    add     x10, x10, x5, lsl #2
+    add     x11, x11, x5, lsl #2
+    subs    x15, x15, x5
+    b.gt    .Lstream_inner1
+
+.Lstream_next:
+    add     x8, x8, #1
+    b       .Lstream_outer
+
+.Lstream_done:
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #80
+    ret
+    .size embedding_fwd_f32_stream_asm, .-embedding_fwd_f32_stream_asm
+
+
+//=============================================================================
+// Embedding Forward FP32 - Sorted Core (contiguous read, indirect write)
+// void embedding_fwd_f32_sorted_core_asm(const int32_t* sorted_indices,
+//                                         const int32_t* sorted_order,
+//                                         const float* emb_table,
+//                                         float* output,
+//                                         size_t count, size_t hidden_dim)
+// x0 = sorted_indices, x1 = sorted_order, x2 = emb_table
+// x3 = output, x4 = count, x5 = hidden_dim
+//
+// For each i in [0, count):
+//   src = emb_table + sorted_indices[i] * hidden_dim
+//   dst = output + sorted_order[i] * hidden_dim
+//   copy hidden_dim floats from src to dst
+//
+// Since indices are sorted, consecutive reads access nearby/identical rows
+// in the embedding table, exploiting HBM2 page locality and HW prefetch.
+// Writes are scattered to original token positions.
+//
+// Register plan:
+//   z0-z7: data (8x unroll)
+//   x19-x26: saved parameters
+//   p0: all-true (.s)
+//=============================================================================
+    .align 6
+    .global embedding_fwd_f32_sorted_core_asm
+    .type embedding_fwd_f32_sorted_core_asm, %function
+embedding_fwd_f32_sorted_core_asm:
+    stp     x29, x30, [sp, #-80]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    mov     x29, sp
+
+    cbz     x4, .Lsorted_done
+
+    mov     x19, x0             // sorted_indices
+    mov     x20, x1             // sorted_order
+    mov     x21, x2             // emb_table
+    mov     x22, x3             // output
+    mov     x23, x4             // count
+    mov     x24, x5             // hidden_dim
+    lsl     x25, x5, #2         // row_stride_bytes = dim * 4
+
+    cntw    x5                   // VL words = 16 (overwrites x5, saved in x24)
+    ptrue   p0.s
+    lsl     x26, x5, #5         // 8 * VL * 4 bytes = 512 (8x unroll stride)
+    lsl     x6, x5, #3          // 8 * VL = 128 elements per 8x iter
+
+    mov     x8, #0              // current index
+
+.Lsorted_outer:
+    cmp     x8, x23
+    b.ge    .Lsorted_done
+
+    // Load sorted_indices[i] and sorted_order[i]
+    ldr     w9, [x19, x8, lsl #2]   // embedding index (sorted)
+    ldr     w10, [x20, x8, lsl #2]  // original output position
+
+    // Source: emb_table + sorted_indices[i] * stride
+    mul     x11, x9, x25
+    add     x11, x21, x11
+
+    // Destination: output + sorted_order[i] * stride
+    mul     x12, x10, x25
+    add     x12, x22, x12
+
+    // Prefetch: row for sorted token i+8 (sequential read = HW prefetch helps,
+    // but SW prefetch for the initial cache line of future rows still beneficial)
+    add     x13, x8, #8
+    cmp     x13, x23
+    b.ge    .Lsorted_no_pf
+
+    ldr     w14, [x19, x13, lsl #2]
+    mul     x15, x14, x25
+    add     x15, x21, x15
+    prfm    pldl1keep, [x15]
+    prfm    pldl1keep, [x15, #256]
+
+.Lsorted_no_pf:
+
+    // Copy row: 8x unrolled
+    mov     x15, x24             // remaining elements
+
+.Lsorted_inner8:
+    cmp     x15, x6
+    b.lt    .Lsorted_inner_rem
+
+    ld1w    {z0.s}, p0/z, [x11]
+    ld1w    {z1.s}, p0/z, [x11, #1, mul vl]
+    ld1w    {z2.s}, p0/z, [x11, #2, mul vl]
+    ld1w    {z3.s}, p0/z, [x11, #3, mul vl]
+    ld1w    {z4.s}, p0/z, [x11, #4, mul vl]
+    ld1w    {z5.s}, p0/z, [x11, #5, mul vl]
+    ld1w    {z6.s}, p0/z, [x11, #6, mul vl]
+    ld1w    {z7.s}, p0/z, [x11, #7, mul vl]
+
+    st1w    {z0.s}, p0, [x12]
+    st1w    {z1.s}, p0, [x12, #1, mul vl]
+    st1w    {z2.s}, p0, [x12, #2, mul vl]
+    st1w    {z3.s}, p0, [x12, #3, mul vl]
+    st1w    {z4.s}, p0, [x12, #4, mul vl]
+    st1w    {z5.s}, p0, [x12, #5, mul vl]
+    st1w    {z6.s}, p0, [x12, #6, mul vl]
+    st1w    {z7.s}, p0, [x12, #7, mul vl]
+
+    add     x11, x11, x26       // src += 8*VL*4
+    add     x12, x12, x26       // dst += 8*VL*4
+    sub     x15, x15, x6
+    b       .Lsorted_inner8
+
+.Lsorted_inner_rem:
+    cbz     x15, .Lsorted_next
+
+.Lsorted_inner1:
+    whilelt p1.s, xzr, x15
+    ld1w    {z0.s}, p1/z, [x11]
+    st1w    {z0.s}, p1, [x12]
+    add     x11, x11, x5, lsl #2
+    add     x12, x12, x5, lsl #2
+    subs    x15, x15, x5
+    b.gt    .Lsorted_inner1
+
+.Lsorted_next:
+    add     x8, x8, #1
+    b       .Lsorted_outer
+
+.Lsorted_done:
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #80
+    ret
+    .size embedding_fwd_f32_sorted_core_asm, .-embedding_fwd_f32_sorted_core_asm
+
+
+//=============================================================================
+// Embedding Forward FP32 - Stream with Index Prefetch + Deeper Row Prefetch
+// void embedding_fwd_f32_stream_ipf_asm(const int32_t* indices,
+//                                        const float* emb_table,
+//                                        float* output,
+//                                        size_t seq_len, size_t hidden_dim)
+//
+// Same as stream_asm but:
+// 1. Prefetches 16 embedding rows ahead (vs 8)
+// 2. Prefetches index array 64 entries ahead (1 cache line of indices)
+// 3. Initial prefetch primes first 16 rows
+//=============================================================================
+    .align 6
+    .global embedding_fwd_f32_stream_ipf_asm
+    .type embedding_fwd_f32_stream_ipf_asm, %function
+embedding_fwd_f32_stream_ipf_asm:
+    stp     x29, x30, [sp, #-80]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    mov     x29, sp
+
+    cbz     x3, .Lsipf_done
+
+    mov     x19, x0             // indices
+    mov     x20, x1             // emb_table
+    mov     x21, x2             // output
+    mov     x22, x3             // seq_len
+    mov     x23, x4             // hidden_dim
+    lsl     x24, x4, #2         // row_stride_bytes = dim * 4
+
+    cntw    x5                   // VL words = 16
+    ptrue   p0.s
+    lsl     x25, x5, #5         // 8 * VL * 4 bytes = 512 (8x unroll stride)
+    lsl     x26, x5, #3         // 8 * VL = 128 elements per 8x iter
+
+    // Issue initial prefetches for first 16 rows
+    mov     x6, #0
+    mov     x7, #16
+    cmp     x7, x22
+    csel    x7, x7, x22, lo     // min(16, seq_len)
+.Lsipf_init_pf:
+    cmp     x6, x7
+    b.ge    .Lsipf_init_pf_done
+    ldr     w8, [x19, x6, lsl #2]
+    mul     x9, x8, x24
+    add     x9, x20, x9
+    prfm    pldl1strm, [x9]
+    prfm    pldl1strm, [x9, #256]
+    prfm    pldl1strm, [x9, #512]
+    prfm    pldl1strm, [x9, #768]
+    add     x6, x6, #1
+    b       .Lsipf_init_pf
+.Lsipf_init_pf_done:
+
+    // Prefetch first index cache line
+    prfm    pldl1keep, [x19]
+
+    mov     x8, #0              // current token index
+
+.Lsipf_outer:
+    cmp     x8, x22
+    b.ge    .Lsipf_done
+
+    // Load current index
+    ldr     w9, [x19, x8, lsl #2]
+
+    // Source address: emb_table + idx * stride
+    mul     x10, x9, x24
+    add     x10, x20, x10
+
+    // Destination address: output + i * stride
+    mul     x11, x8, x24
+    add     x11, x21, x11
+
+    // Prefetch embedding row for token i+16
+    add     x12, x8, #16
+    cmp     x12, x22
+    b.ge    .Lsipf_no_row_pf
+
+    ldr     w13, [x19, x12, lsl #2]
+    mul     x14, x13, x24
+    add     x14, x20, x14
+    prfm    pldl1strm, [x14]
+    prfm    pldl1strm, [x14, #256]
+    prfm    pldl1strm, [x14, #512]
+    prfm    pldl1strm, [x14, #768]
+
+.Lsipf_no_row_pf:
+
+    // Prefetch index array 64 entries ahead (1 cache line = 256B = 64 int32)
+    add     x12, x8, #64
+    cmp     x12, x22
+    b.ge    .Lsipf_no_idx_pf
+    add     x14, x19, x12, lsl #2
+    prfm    pldl1keep, [x14]
+.Lsipf_no_idx_pf:
+
+    // Copy row: 8x unrolled inner loop
+    mov     x15, x23             // remaining elements
+
+.Lsipf_inner8:
+    cmp     x15, x26
+    b.lt    .Lsipf_inner_rem
+
+    ld1w    {z0.s}, p0/z, [x10]
+    ld1w    {z1.s}, p0/z, [x10, #1, mul vl]
+    ld1w    {z2.s}, p0/z, [x10, #2, mul vl]
+    ld1w    {z3.s}, p0/z, [x10, #3, mul vl]
+    ld1w    {z4.s}, p0/z, [x10, #4, mul vl]
+    ld1w    {z5.s}, p0/z, [x10, #5, mul vl]
+    ld1w    {z6.s}, p0/z, [x10, #6, mul vl]
+    ld1w    {z7.s}, p0/z, [x10, #7, mul vl]
+
+    st1w    {z0.s}, p0, [x11]
+    st1w    {z1.s}, p0, [x11, #1, mul vl]
+    st1w    {z2.s}, p0, [x11, #2, mul vl]
+    st1w    {z3.s}, p0, [x11, #3, mul vl]
+    st1w    {z4.s}, p0, [x11, #4, mul vl]
+    st1w    {z5.s}, p0, [x11, #5, mul vl]
+    st1w    {z6.s}, p0, [x11, #6, mul vl]
+    st1w    {z7.s}, p0, [x11, #7, mul vl]
+
+    add     x10, x10, x25       // src += 8*VL*4
+    add     x11, x11, x25       // dst += 8*VL*4
+    sub     x15, x15, x26
+    b       .Lsipf_inner8
+
+.Lsipf_inner_rem:
+    cbz     x15, .Lsipf_next
+
+.Lsipf_inner1:
+    whilelt p1.s, xzr, x15
+    ld1w    {z0.s}, p1/z, [x10]
+    st1w    {z0.s}, p1, [x11]
+    add     x10, x10, x5, lsl #2
+    add     x11, x11, x5, lsl #2
+    subs    x15, x15, x5
+    b.gt    .Lsipf_inner1
+
+.Lsipf_next:
+    add     x8, x8, #1
+    b       .Lsipf_outer
+
+.Lsipf_done:
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #80
+    ret
+    .size embedding_fwd_f32_stream_ipf_asm, .-embedding_fwd_f32_stream_ipf_asm
+
+
+//=============================================================================
+// Scatter one embedding row to multiple output positions (for dedup)
+// void embedding_fwd_f32_scatter_row_asm(const float* src_row,
+//                                         float* output_base,
+//                                         const int32_t* positions,
+//                                         size_t n_positions,
+//                                         size_t hidden_dim)
+// x0 = src_row, x1 = output_base, x2 = positions array
+// x3 = n_positions, x4 = hidden_dim
+//
+// For each position k in [0, n_positions):
+//   dst = output_base + positions[k] * hidden_dim
+//   copy hidden_dim floats from src_row to dst
+//
+// Optimization: loads src_row in 8x-unrolled chunks (z0-z7),
+// then stores to all positions per chunk. Source data stays in
+// z registers; only stores are repeated. For duplicate indices,
+// this avoids re-loading the row from cache per duplicate.
+//=============================================================================
+    .align 6
+    .global embedding_fwd_f32_scatter_row_asm
+    .type embedding_fwd_f32_scatter_row_asm, %function
+embedding_fwd_f32_scatter_row_asm:
+    stp     x29, x30, [sp, #-80]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    mov     x29, sp
+
+    cbz     x3, .Lscrow_done
+
+    mov     x19, x0             // src_row
+    mov     x20, x1             // output_base
+    mov     x21, x2             // positions
+    mov     x22, x3             // n_positions
+    mov     x23, x4             // hidden_dim
+    lsl     x24, x4, #2         // row_stride_bytes = dim * 4
+
+    cntw    x5                   // VL words = 16
+    ptrue   p0.s
+    lsl     x25, x5, #5         // 8 * VL * 4 bytes = 512
+    lsl     x26, x5, #3         // 8 * VL = 128 elements per 8x
+
+    // Prefetch source row into L1
+    prfm    pldl1keep, [x19]
+    prfm    pldl1keep, [x19, #256]
+    prfm    pldl1keep, [x19, #512]
+    prfm    pldl1keep, [x19, #768]
+
+    // Outer: iterate over dim in chunks of 8*VL elements
+    mov     x6, x19             // src chunk ptr
+    mov     x7, #0              // element offset
+    mov     x8, x23             // remaining elements
+
+.Lscrow_chunk8:
+    cmp     x8, x26             // remaining >= 8*VL?
+    b.lt    .Lscrow_chunk_rem
+
+    // Load 8 vectors from source (hot in L1 or z regs)
+    ld1w    {z0.s}, p0/z, [x6]
+    ld1w    {z1.s}, p0/z, [x6, #1, mul vl]
+    ld1w    {z2.s}, p0/z, [x6, #2, mul vl]
+    ld1w    {z3.s}, p0/z, [x6, #3, mul vl]
+    ld1w    {z4.s}, p0/z, [x6, #4, mul vl]
+    ld1w    {z5.s}, p0/z, [x6, #5, mul vl]
+    ld1w    {z6.s}, p0/z, [x6, #6, mul vl]
+    ld1w    {z7.s}, p0/z, [x6, #7, mul vl]
+
+    // Store this chunk to all output positions
+    mov     x9, #0              // position index
+.Lscrow_store8:
+    ldr     w10, [x21, x9, lsl #2]   // positions[k]
+    mul     x11, x10, x24            // byte offset = pos * stride_bytes
+    add     x11, x20, x11            // dst row base
+    add     x11, x11, x7, lsl #2    // dst + element_offset * 4
+
+    st1w    {z0.s}, p0, [x11]
+    st1w    {z1.s}, p0, [x11, #1, mul vl]
+    st1w    {z2.s}, p0, [x11, #2, mul vl]
+    st1w    {z3.s}, p0, [x11, #3, mul vl]
+    st1w    {z4.s}, p0, [x11, #4, mul vl]
+    st1w    {z5.s}, p0, [x11, #5, mul vl]
+    st1w    {z6.s}, p0, [x11, #6, mul vl]
+    st1w    {z7.s}, p0, [x11, #7, mul vl]
+
+    add     x9, x9, #1
+    cmp     x9, x22
+    b.lt    .Lscrow_store8
+
+    // Next chunk
+    add     x6, x6, x25         // src += 8*VL*4
+    add     x7, x7, x26         // element offset += 8*VL
+    sub     x8, x8, x26         // remaining -= 8*VL
+    b       .Lscrow_chunk8
+
+.Lscrow_chunk_rem:
+    // Handle remaining < 8*VL elements (1 vector at a time)
+    cbz     x8, .Lscrow_done
+
+.Lscrow_rem1:
+    whilelt p1.s, xzr, x8
+    ld1w    {z0.s}, p1/z, [x6]
+
+    mov     x9, #0
+.Lscrow_store_rem1:
+    ldr     w10, [x21, x9, lsl #2]
+    mul     x11, x10, x24
+    add     x11, x20, x11
+    add     x11, x11, x7, lsl #2
+
+    st1w    {z0.s}, p1, [x11]
+
+    add     x9, x9, #1
+    cmp     x9, x22
+    b.lt    .Lscrow_store_rem1
+
+    add     x6, x6, x5, lsl #2  // src += VL*4
+    add     x7, x7, x5          // element offset += VL
+    subs    x8, x8, x5          // remaining -= VL
+    b.gt    .Lscrow_rem1
+
+.Lscrow_done:
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #80
+    ret
+    .size embedding_fwd_f32_scatter_row_asm, .-embedding_fwd_f32_scatter_row_asm
