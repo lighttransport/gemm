@@ -1,7 +1,12 @@
 // bench_embedding.c
-// Benchmark and test for SVE-optimized Embedding kernels
+// Long-context embedding forward benchmark for A64FX
 //
-// Usage: ./bench_embedding [iterations] [batch_size] [hidden_dim] [vocab_size]
+// Tests kernel variants across seqlen/dim/thread sweeps.
+// Includes Zipfian distribution benchmarks to reveal L2 cache amplification.
+//
+// Build: make          (single-core)
+//        make omp      (multi-core with OpenMP)
+// Run:   OMP_NUM_THREADS=48 OMP_PROC_BIND=close ./bench_embedding_omp
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,10 +15,20 @@
 #include <time.h>
 #include <stdint.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "embedding.h"
 
 //=============================================================================
-// Timing utilities
+// Constants
+//=============================================================================
+#define HBM2_PEAK_GBS  1024.0   // Total HBM2 peak bandwidth (GB/s)
+#define VOCAB_SIZE     151936    // Qwen2.5 vocabulary
+
+//=============================================================================
+// Timing
 //=============================================================================
 static inline double get_time_sec(void)
 {
@@ -23,10 +38,10 @@ static inline double get_time_sec(void)
 }
 
 //=============================================================================
-// Random number generation (PCG32)
+// RNG (PCG32)
 //=============================================================================
 static uint64_t pcg_state = 0x853c49e6748fea9bULL;
-static uint64_t pcg_inc = 0xda3e39cb94b95bdbULL;
+static uint64_t pcg_inc   = 0xda3e39cb94b95bdbULL;
 
 static uint32_t pcg32(void)
 {
@@ -43,18 +58,85 @@ static void pcg_seed(uint64_t seed)
     pcg32();
 }
 
-static float rand_float(void)
-{
-    return (float)pcg32() / (float)UINT32_MAX;
-}
-
 static int32_t rand_int(int32_t max)
 {
     return (int32_t)(pcg32() % (uint32_t)max);
 }
 
 //=============================================================================
-// Comparison utilities
+// Zipfian Distribution
+//=============================================================================
+static double* zipf_cdf = NULL;
+static size_t  zipf_n = 0;
+
+static void zipf_init(double alpha, size_t n)
+{
+    zipf_cdf = (double*)malloc((n + 1) * sizeof(double));
+    zipf_n = n;
+    double sum = 0.0;
+    for (size_t k = 1; k <= n; k++) {
+        sum += 1.0 / pow((double)k, alpha);
+        zipf_cdf[k] = sum;
+    }
+    // Normalize
+    for (size_t k = 1; k <= n; k++)
+        zipf_cdf[k] /= sum;
+    zipf_cdf[0] = 0.0;
+}
+
+static int32_t zipf_sample(void)
+{
+    double u = (double)(pcg32() & 0xFFFFFFFF) / 4294967296.0;
+    // Binary search for rank
+    size_t lo = 1, hi = zipf_n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (zipf_cdf[mid] < u)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return (int32_t)(lo - 1);  // 0-indexed
+}
+
+static void zipf_free(void)
+{
+    free(zipf_cdf);
+    zipf_cdf = NULL;
+    zipf_n = 0;
+}
+
+// Fill indices with Zipfian distribution; return number of unique indices
+static size_t fill_zipfian(int32_t* indices, size_t n, double alpha, size_t vocab)
+{
+    if (alpha <= 0.0) {
+        // Uniform
+        for (size_t i = 0; i < n; i++)
+            indices[i] = rand_int((int32_t)vocab);
+    } else {
+        zipf_init(alpha, vocab);
+        for (size_t i = 0; i < n; i++)
+            indices[i] = zipf_sample();
+        zipf_free();
+    }
+
+    // Count unique
+    char* seen = (char*)calloc(vocab, 1);
+    size_t unique = 0;
+    if (seen) {
+        for (size_t i = 0; i < n; i++) {
+            if (!seen[indices[i]]) {
+                seen[indices[i]] = 1;
+                unique++;
+            }
+        }
+        free(seen);
+    }
+    return unique;
+}
+
+//=============================================================================
+// Comparison
 //=============================================================================
 static float max_abs_diff_f32(const float* a, const float* b, size_t n)
 {
@@ -66,492 +148,587 @@ static float max_abs_diff_f32(const float* a, const float* b, size_t n)
     return max_diff;
 }
 
-static double max_abs_diff_f64(const double* a, const double* b, size_t n)
+//=============================================================================
+// OMP wrappers
+//=============================================================================
+typedef void (*emb_kernel_fn)(const int32_t*, const float*, float*, size_t, size_t);
+
+static void embedding_fwd_f32_omp(const int32_t* indices, const float* emb_table,
+                                   float* output, size_t seq_len, size_t hidden_dim,
+                                   emb_kernel_fn kernel)
 {
-    double max_diff = 0.0;
-    for (size_t i = 0; i < n; i++) {
-        double diff = fabs(a[i] - b[i]);
-        if (diff > max_diff) max_diff = diff;
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+        size_t chunk = (seq_len + (size_t)nthreads - 1) / (size_t)nthreads;
+        size_t start = (size_t)tid * chunk;
+        size_t end = start + chunk;
+        if (end > seq_len) end = seq_len;
+        if (start < seq_len)
+            kernel(indices + start, emb_table, output + start * hidden_dim,
+                   end - start, hidden_dim);
     }
-    return max_diff;
+#else
+    kernel(indices, emb_table, output, seq_len, hidden_dim);
+#endif
 }
 
-//=============================================================================
-// Test functions
-//=============================================================================
-static int test_embedding_fwd_f32(size_t batch_size, size_t hidden_dim,
-                                  size_t vocab_size)
+static void embedding_fwd_f32_sorted_omp(const int32_t* indices, const float* emb_table,
+                                           float* output, size_t seq_len, size_t hidden_dim,
+                                           size_t vocab_size)
 {
-    printf("  Testing embedding_fwd_f32 (batch=%zu, dim=%zu, vocab=%zu)...\n",
-           batch_size, hidden_dim, vocab_size);
-
-    // Allocate
-    int32_t* indices = aligned_alloc(64, batch_size * sizeof(int32_t));
-    float* emb_table = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-    float* output_ref = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
-    float* output_asm = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
-
-    if (!indices || !emb_table || !output_ref || !output_asm) {
-        printf("    FAILED: Memory allocation\n");
-        return 1;
+    int32_t* sorted_indices = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    int32_t* sorted_order   = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    if (!sorted_indices || !sorted_order) {
+        free(sorted_indices);
+        free(sorted_order);
+        return;
     }
 
-    // Initialize
-    for (size_t i = 0; i < batch_size; i++) {
-        indices[i] = rand_int((int32_t)vocab_size);
+    counting_sort_indices(indices, seq_len, sorted_indices, sorted_order, vocab_size);
+
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+        size_t chunk = (seq_len + (size_t)nthreads - 1) / (size_t)nthreads;
+        size_t start = (size_t)tid * chunk;
+        size_t end = start + chunk;
+        if (end > seq_len) end = seq_len;
+        if (start < seq_len)
+            embedding_fwd_f32_sorted_core_asm(sorted_indices + start,
+                                               sorted_order + start,
+                                               emb_table, output,
+                                               end - start, hidden_dim);
     }
-    for (size_t i = 0; i < vocab_size * hidden_dim; i++) {
-        emb_table[i] = rand_float() * 2.0f - 1.0f;
-    }
+#else
+    embedding_fwd_f32_sorted_core_asm(sorted_indices, sorted_order,
+                                       emb_table, output, seq_len, hidden_dim);
+#endif
 
-    // Reference
-    embedding_fwd_f32_ref(indices, emb_table, output_ref, batch_size, hidden_dim);
-
-    // Assembly
-    embedding_fwd_f32_asm(indices, emb_table, output_asm, batch_size, hidden_dim);
-
-    // Compare
-    float max_diff = max_abs_diff_f32(output_ref, output_asm, batch_size * hidden_dim);
-    int passed = (max_diff < 1e-6f);
-
-    printf("    max_diff = %e, %s\n", max_diff, passed ? "PASSED" : "FAILED");
-
-    free(indices);
-    free(emb_table);
-    free(output_ref);
-    free(output_asm);
-
-    return passed ? 0 : 1;
+    free(sorted_indices);
+    free(sorted_order);
 }
 
-static int test_embedding_fwd_f32_batched(size_t batch_size, size_t hidden_dim,
+// Dedup OMP: sort globally, then each thread does dedup scatter on its chunk
+static void embedding_fwd_f32_dedup_omp(const int32_t* indices, const float* emb_table,
+                                          float* output, size_t seq_len, size_t hidden_dim,
                                           size_t vocab_size)
 {
-    printf("  Testing embedding_fwd_f32_batched (batch=%zu, dim=%zu, vocab=%zu)...\n",
-           batch_size, hidden_dim, vocab_size);
+    int32_t* si = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    int32_t* so = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    if (!si || !so) { free(si); free(so); return; }
 
-    int32_t* indices = aligned_alloc(64, batch_size * sizeof(int32_t));
-    float* emb_table = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-    float* output_ref = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
-    float* output_asm = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
+    counting_sort_indices(indices, seq_len, si, so, vocab_size);
 
-    if (!indices || !emb_table || !output_ref || !output_asm) {
-        printf("    FAILED: Memory allocation\n");
-        return 1;
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+        size_t chunk = (seq_len + (size_t)nthreads - 1) / (size_t)nthreads;
+        size_t start = (size_t)tid * chunk;
+        size_t end = start + chunk;
+        if (end > seq_len) end = seq_len;
+
+        // Process groups within [start, end) using dedup scatter
+        size_t i = start;
+        while (i < end) {
+            int32_t idx = si[i];
+            const float* src = emb_table + (size_t)idx * hidden_dim;
+            size_t j = i + 1;
+            while (j < end && si[j] == idx) j++;
+            embedding_fwd_f32_scatter_row_asm(src, output, so + i, j - i, hidden_dim);
+            i = j;
+        }
     }
+#else
+    embedding_fwd_f32_dedup(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+#endif
 
-    for (size_t i = 0; i < batch_size; i++) {
-        indices[i] = rand_int((int32_t)vocab_size);
-    }
-    for (size_t i = 0; i < vocab_size * hidden_dim; i++) {
-        emb_table[i] = rand_float() * 2.0f - 1.0f;
-    }
-
-    embedding_fwd_f32_ref(indices, emb_table, output_ref, batch_size, hidden_dim);
-    embedding_fwd_f32_batched_asm(indices, emb_table, output_asm, batch_size, hidden_dim);
-
-    float max_diff = max_abs_diff_f32(output_ref, output_asm, batch_size * hidden_dim);
-    int passed = (max_diff < 1e-6f);
-
-    printf("    max_diff = %e, %s\n", max_diff, passed ? "PASSED" : "FAILED");
-
-    free(indices);
-    free(emb_table);
-    free(output_ref);
-    free(output_asm);
-
-    return passed ? 0 : 1;
-}
-
-static int test_embedding_bwd_f32(size_t batch_size, size_t hidden_dim,
-                                  size_t vocab_size)
-{
-    printf("  Testing embedding_bwd_f32 (batch=%zu, dim=%zu, vocab=%zu)...\n",
-           batch_size, hidden_dim, vocab_size);
-
-    int32_t* indices = aligned_alloc(64, batch_size * sizeof(int32_t));
-    float* grad_output = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
-    float* grad_emb_ref = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-    float* grad_emb_asm = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-
-    if (!indices || !grad_output || !grad_emb_ref || !grad_emb_asm) {
-        printf("    FAILED: Memory allocation\n");
-        return 1;
-    }
-
-    // Use unique indices to avoid accumulation order issues
-    for (size_t i = 0; i < batch_size; i++) {
-        indices[i] = (int32_t)(i % vocab_size);
-    }
-    for (size_t i = 0; i < batch_size * hidden_dim; i++) {
-        grad_output[i] = rand_float() * 2.0f - 1.0f;
-    }
-
-    // Zero initialize gradients
-    memset(grad_emb_ref, 0, vocab_size * hidden_dim * sizeof(float));
-    memset(grad_emb_asm, 0, vocab_size * hidden_dim * sizeof(float));
-
-    // Reference
-    embedding_bwd_f32_ref(indices, grad_output, grad_emb_ref,
-                          batch_size, hidden_dim, vocab_size);
-
-    // Assembly
-    embedding_bwd_f32_asm(indices, grad_output, grad_emb_asm,
-                          batch_size, hidden_dim, vocab_size);
-
-    // Compare
-    float max_diff = max_abs_diff_f32(grad_emb_ref, grad_emb_asm,
-                                      vocab_size * hidden_dim);
-    int passed = (max_diff < 1e-5f);
-
-    printf("    max_diff = %e, %s\n", max_diff, passed ? "PASSED" : "FAILED");
-
-    free(indices);
-    free(grad_output);
-    free(grad_emb_ref);
-    free(grad_emb_asm);
-
-    return passed ? 0 : 1;
-}
-
-static int test_embedding_fwd_f64(size_t batch_size, size_t hidden_dim,
-                                  size_t vocab_size)
-{
-    printf("  Testing embedding_fwd_f64 (batch=%zu, dim=%zu, vocab=%zu)...\n",
-           batch_size, hidden_dim, vocab_size);
-
-    int32_t* indices = aligned_alloc(64, batch_size * sizeof(int32_t));
-    double* emb_table = aligned_alloc(64, vocab_size * hidden_dim * sizeof(double));
-    double* output_ref = aligned_alloc(64, batch_size * hidden_dim * sizeof(double));
-    double* output_asm = aligned_alloc(64, batch_size * hidden_dim * sizeof(double));
-
-    if (!indices || !emb_table || !output_ref || !output_asm) {
-        printf("    FAILED: Memory allocation\n");
-        return 1;
-    }
-
-    for (size_t i = 0; i < batch_size; i++) {
-        indices[i] = rand_int((int32_t)vocab_size);
-    }
-    for (size_t i = 0; i < vocab_size * hidden_dim; i++) {
-        emb_table[i] = (double)rand_float() * 2.0 - 1.0;
-    }
-
-    embedding_fwd_f64_ref(indices, emb_table, output_ref, batch_size, hidden_dim);
-    embedding_fwd_f64_asm(indices, emb_table, output_asm, batch_size, hidden_dim);
-
-    double max_diff = max_abs_diff_f64(output_ref, output_asm, batch_size * hidden_dim);
-    int passed = (max_diff < 1e-14);
-
-    printf("    max_diff = %e, %s\n", max_diff, passed ? "PASSED" : "FAILED");
-
-    free(indices);
-    free(emb_table);
-    free(output_ref);
-    free(output_asm);
-
-    return passed ? 0 : 1;
-}
-
-static int test_embedding_fwd_with_pos_f32(size_t batch_size, size_t hidden_dim,
-                                           size_t vocab_size, size_t max_pos)
-{
-    printf("  Testing embedding_fwd_with_pos_f32 (batch=%zu, dim=%zu)...\n",
-           batch_size, hidden_dim);
-
-    int32_t* token_ids = aligned_alloc(64, batch_size * sizeof(int32_t));
-    int32_t* position_ids = aligned_alloc(64, batch_size * sizeof(int32_t));
-    float* token_emb = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-    float* pos_emb = aligned_alloc(64, max_pos * hidden_dim * sizeof(float));
-    float* output_ref = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
-    float* output_asm = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
-
-    if (!token_ids || !position_ids || !token_emb || !pos_emb ||
-        !output_ref || !output_asm) {
-        printf("    FAILED: Memory allocation\n");
-        return 1;
-    }
-
-    for (size_t i = 0; i < batch_size; i++) {
-        token_ids[i] = rand_int((int32_t)vocab_size);
-        position_ids[i] = (int32_t)(i % max_pos);
-    }
-    for (size_t i = 0; i < vocab_size * hidden_dim; i++) {
-        token_emb[i] = rand_float() * 2.0f - 1.0f;
-    }
-    for (size_t i = 0; i < max_pos * hidden_dim; i++) {
-        pos_emb[i] = rand_float() * 0.1f - 0.05f;
-    }
-
-    embedding_fwd_with_pos_f32_ref(token_ids, position_ids, token_emb, pos_emb,
-                                   output_ref, batch_size, hidden_dim);
-    embedding_fwd_with_pos_f32_asm(token_ids, position_ids, token_emb, pos_emb,
-                                   output_asm, batch_size, hidden_dim);
-
-    float max_diff = max_abs_diff_f32(output_ref, output_asm, batch_size * hidden_dim);
-    int passed = (max_diff < 1e-6f);
-
-    printf("    max_diff = %e, %s\n", max_diff, passed ? "PASSED" : "FAILED");
-
-    free(token_ids);
-    free(position_ids);
-    free(token_emb);
-    free(pos_emb);
-    free(output_ref);
-    free(output_asm);
-
-    return passed ? 0 : 1;
+    free(si);
+    free(so);
 }
 
 //=============================================================================
-// Benchmark functions
+// Correctness tests
 //=============================================================================
-static void bench_embedding_fwd_f32(size_t iterations, size_t batch_size,
-                                    size_t hidden_dim, size_t vocab_size)
+static int test_kernel(const char* name, emb_kernel_fn kernel,
+                       size_t seq_len, size_t hidden_dim, size_t vocab_size)
 {
-    printf("\nBenchmark: embedding_fwd_f32\n");
-    printf("  batch_size=%zu, hidden_dim=%zu, vocab_size=%zu, iterations=%zu\n",
-           batch_size, hidden_dim, vocab_size, iterations);
+    int32_t* indices   = (int32_t*)aligned_alloc(256, seq_len * sizeof(int32_t));
+    float* emb_table   = (float*)aligned_alloc(256, vocab_size * hidden_dim * sizeof(float));
+    float* output_ref  = (float*)aligned_alloc(256, seq_len * hidden_dim * sizeof(float));
+    float* output_test = (float*)aligned_alloc(256, seq_len * hidden_dim * sizeof(float));
 
-    int32_t* indices = aligned_alloc(64, batch_size * sizeof(int32_t));
-    float* emb_table = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-    float* output = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
+    if (!indices || !emb_table || !output_ref || !output_test) {
+        printf("  %-20s seq=%6zu dim=%4zu  SKIP (alloc fail)\n", name, seq_len, hidden_dim);
+        free(indices); free(emb_table); free(output_ref); free(output_test);
+        return 0;
+    }
 
-    for (size_t i = 0; i < batch_size; i++) {
+    for (size_t i = 0; i < seq_len; i++)
         indices[i] = rand_int((int32_t)vocab_size);
-    }
-    for (size_t i = 0; i < vocab_size * hidden_dim; i++) {
-        emb_table[i] = rand_float();
-    }
+    for (size_t i = 0; i < vocab_size * hidden_dim; i++)
+        emb_table[i] = (float)(i % 1000) * 0.001f - 0.5f;
 
-    // Warmup
-    for (size_t i = 0; i < 10; i++) {
-        embedding_fwd_f32_asm(indices, emb_table, output, batch_size, hidden_dim);
-    }
+    embedding_fwd_f32_ref(indices, emb_table, output_ref, seq_len, hidden_dim);
 
-    // Benchmark reference
-    double t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_fwd_f32_ref(indices, emb_table, output, batch_size, hidden_dim);
-    }
-    double t1 = get_time_sec();
-    double ref_time = (t1 - t0) / iterations;
+    memset(output_test, 0, seq_len * hidden_dim * sizeof(float));
+    kernel(indices, emb_table, output_test, seq_len, hidden_dim);
 
-    // Benchmark assembly
-    t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_fwd_f32_asm(indices, emb_table, output, batch_size, hidden_dim);
-    }
-    t1 = get_time_sec();
-    double asm_time = (t1 - t0) / iterations;
+    float diff = max_abs_diff_f32(output_ref, output_test, seq_len * hidden_dim);
+    int passed = (diff < 1e-6f);
+    printf("  %-20s seq=%6zu dim=%4zu  diff=%e  %s\n",
+           name, seq_len, hidden_dim, diff, passed ? "PASS" : "FAIL");
 
-    // Benchmark batched assembly
-    t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_fwd_f32_batched_asm(indices, emb_table, output, batch_size, hidden_dim);
-    }
-    t1 = get_time_sec();
-    double batched_time = (t1 - t0) / iterations;
-
-    // Memory bandwidth calculation
-    // Reads: batch_size * hidden_dim * 4 bytes (embedding rows)
-    // Writes: batch_size * hidden_dim * 4 bytes (output)
-    // Plus index reads: batch_size * 4 bytes
-    size_t bytes_moved = batch_size * hidden_dim * sizeof(float) * 2 +
-                         batch_size * sizeof(int32_t);
-    double bw_ref = bytes_moved / ref_time / 1e9;
-    double bw_asm = bytes_moved / asm_time / 1e9;
-    double bw_batched = bytes_moved / batched_time / 1e9;
-
-    printf("  Reference:    %.3f us, %.2f GB/s\n", ref_time * 1e6, bw_ref);
-    printf("  ASM:          %.3f us, %.2f GB/s (%.2fx speedup)\n",
-           asm_time * 1e6, bw_asm, ref_time / asm_time);
-    printf("  ASM (batched): %.3f us, %.2f GB/s (%.2fx speedup)\n",
-           batched_time * 1e6, bw_batched, ref_time / batched_time);
-
-    free(indices);
-    free(emb_table);
-    free(output);
+    free(indices); free(emb_table); free(output_ref); free(output_test);
+    return passed ? 0 : 1;
 }
 
-static void bench_embedding_bwd_f32(size_t iterations, size_t batch_size,
-                                    size_t hidden_dim, size_t vocab_size)
+static int test_sorted_kernel(const char* name,
+                               size_t seq_len, size_t hidden_dim, size_t vocab_size,
+                               int use_dedup)
 {
-    printf("\nBenchmark: embedding_bwd_f32\n");
-    printf("  batch_size=%zu, hidden_dim=%zu, vocab_size=%zu, iterations=%zu\n",
-           batch_size, hidden_dim, vocab_size, iterations);
+    int32_t* indices   = (int32_t*)aligned_alloc(256, seq_len * sizeof(int32_t));
+    float* emb_table   = (float*)aligned_alloc(256, vocab_size * hidden_dim * sizeof(float));
+    float* output_ref  = (float*)aligned_alloc(256, seq_len * hidden_dim * sizeof(float));
+    float* output_test = (float*)aligned_alloc(256, seq_len * hidden_dim * sizeof(float));
 
-    int32_t* indices = aligned_alloc(64, batch_size * sizeof(int32_t));
-    float* grad_output = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
-    float* grad_emb = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-
-    // Unique indices to avoid race conditions in timing
-    for (size_t i = 0; i < batch_size; i++) {
-        indices[i] = (int32_t)(i % vocab_size);
-    }
-    for (size_t i = 0; i < batch_size * hidden_dim; i++) {
-        grad_output[i] = rand_float();
+    if (!indices || !emb_table || !output_ref || !output_test) {
+        printf("  %-20s seq=%6zu dim=%4zu  SKIP (alloc fail)\n", name, seq_len, hidden_dim);
+        free(indices); free(emb_table); free(output_ref); free(output_test);
+        return 0;
     }
 
-    // Warmup
-    memset(grad_emb, 0, vocab_size * hidden_dim * sizeof(float));
-    for (size_t i = 0; i < 10; i++) {
-        embedding_bwd_f32_asm(indices, grad_output, grad_emb,
-                              batch_size, hidden_dim, vocab_size);
-    }
-
-    // Benchmark reference
-    memset(grad_emb, 0, vocab_size * hidden_dim * sizeof(float));
-    double t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_bwd_f32_ref(indices, grad_output, grad_emb,
-                              batch_size, hidden_dim, vocab_size);
-    }
-    double t1 = get_time_sec();
-    double ref_time = (t1 - t0) / iterations;
-
-    // Benchmark assembly
-    memset(grad_emb, 0, vocab_size * hidden_dim * sizeof(float));
-    t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_bwd_f32_asm(indices, grad_output, grad_emb,
-                              batch_size, hidden_dim, vocab_size);
-    }
-    t1 = get_time_sec();
-    double asm_time = (t1 - t0) / iterations;
-
-    // Bandwidth: read grad_output + read/write grad_embedding rows
-    size_t bytes_moved = batch_size * hidden_dim * sizeof(float) * 3 +
-                         batch_size * sizeof(int32_t);
-    double bw_ref = bytes_moved / ref_time / 1e9;
-    double bw_asm = bytes_moved / asm_time / 1e9;
-
-    printf("  Reference: %.3f us, %.2f GB/s\n", ref_time * 1e6, bw_ref);
-    printf("  ASM:       %.3f us, %.2f GB/s (%.2fx speedup)\n",
-           asm_time * 1e6, bw_asm, ref_time / asm_time);
-
-    free(indices);
-    free(grad_output);
-    free(grad_emb);
-}
-
-static void bench_embedding_fwd_f64(size_t iterations, size_t batch_size,
-                                    size_t hidden_dim, size_t vocab_size)
-{
-    printf("\nBenchmark: embedding_fwd_f64\n");
-    printf("  batch_size=%zu, hidden_dim=%zu, vocab_size=%zu, iterations=%zu\n",
-           batch_size, hidden_dim, vocab_size, iterations);
-
-    int32_t* indices = aligned_alloc(64, batch_size * sizeof(int32_t));
-    double* emb_table = aligned_alloc(64, vocab_size * hidden_dim * sizeof(double));
-    double* output = aligned_alloc(64, batch_size * hidden_dim * sizeof(double));
-
-    for (size_t i = 0; i < batch_size; i++) {
+    for (size_t i = 0; i < seq_len; i++)
         indices[i] = rand_int((int32_t)vocab_size);
-    }
-    for (size_t i = 0; i < vocab_size * hidden_dim; i++) {
-        emb_table[i] = rand_float();
-    }
+    for (size_t i = 0; i < vocab_size * hidden_dim; i++)
+        emb_table[i] = (float)(i % 1000) * 0.001f - 0.5f;
 
-    // Warmup
-    for (size_t i = 0; i < 10; i++) {
-        embedding_fwd_f64_asm(indices, emb_table, output, batch_size, hidden_dim);
-    }
+    embedding_fwd_f32_ref(indices, emb_table, output_ref, seq_len, hidden_dim);
 
-    // Benchmark reference
-    double t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_fwd_f64_ref(indices, emb_table, output, batch_size, hidden_dim);
-    }
-    double t1 = get_time_sec();
-    double ref_time = (t1 - t0) / iterations;
+    memset(output_test, 0, seq_len * hidden_dim * sizeof(float));
+    if (use_dedup)
+        embedding_fwd_f32_dedup(indices, emb_table, output_test, seq_len, hidden_dim, vocab_size);
+    else
+        embedding_fwd_f32_sorted(indices, emb_table, output_test, seq_len, hidden_dim, vocab_size);
 
-    // Benchmark assembly
-    t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_fwd_f64_asm(indices, emb_table, output, batch_size, hidden_dim);
-    }
-    t1 = get_time_sec();
-    double asm_time = (t1 - t0) / iterations;
+    float diff = max_abs_diff_f32(output_ref, output_test, seq_len * hidden_dim);
+    int passed = (diff < 1e-6f);
+    printf("  %-20s seq=%6zu dim=%4zu  diff=%e  %s\n",
+           name, seq_len, hidden_dim, diff, passed ? "PASS" : "FAIL");
 
-    size_t bytes_moved = batch_size * hidden_dim * sizeof(double) * 2 +
-                         batch_size * sizeof(int32_t);
-    double bw_ref = bytes_moved / ref_time / 1e9;
-    double bw_asm = bytes_moved / asm_time / 1e9;
-
-    printf("  Reference: %.3f us, %.2f GB/s\n", ref_time * 1e6, bw_ref);
-    printf("  ASM:       %.3f us, %.2f GB/s (%.2fx speedup)\n",
-           asm_time * 1e6, bw_asm, ref_time / asm_time);
-
-    free(indices);
-    free(emb_table);
-    free(output);
+    free(indices); free(emb_table); free(output_ref); free(output_test);
+    return passed ? 0 : 1;
 }
 
-static void bench_embedding_with_pos_f32(size_t iterations, size_t batch_size,
-                                         size_t hidden_dim, size_t vocab_size,
-                                         size_t max_pos)
+static int run_correctness_tests(void)
 {
-    printf("\nBenchmark: embedding_fwd_with_pos_f32\n");
-    printf("  batch_size=%zu, hidden_dim=%zu, vocab_size=%zu, max_pos=%zu\n",
-           batch_size, hidden_dim, vocab_size, max_pos);
+    printf("=== Correctness Tests ===\n");
+    int failures = 0;
 
-    int32_t* token_ids = aligned_alloc(64, batch_size * sizeof(int32_t));
-    int32_t* position_ids = aligned_alloc(64, batch_size * sizeof(int32_t));
-    float* token_emb = aligned_alloc(64, vocab_size * hidden_dim * sizeof(float));
-    float* pos_emb = aligned_alloc(64, max_pos * hidden_dim * sizeof(float));
-    float* output = aligned_alloc(64, batch_size * hidden_dim * sizeof(float));
+    size_t dims[]    = {1024, 2048, 4096};
+    size_t seqlens[] = {1, 15, 16, 17, 64, 256, 1024};
+    size_t vocab     = 32000;
 
-    for (size_t i = 0; i < batch_size; i++) {
-        token_ids[i] = rand_int((int32_t)vocab_size);
-        position_ids[i] = (int32_t)(i % max_pos);
-    }
-    for (size_t i = 0; i < vocab_size * hidden_dim; i++) {
-        token_emb[i] = rand_float();
-    }
-    for (size_t i = 0; i < max_pos * hidden_dim; i++) {
-        pos_emb[i] = rand_float();
-    }
-
-    // Warmup
-    for (size_t i = 0; i < 10; i++) {
-        embedding_fwd_with_pos_f32_asm(token_ids, position_ids, token_emb,
-                                       pos_emb, output, batch_size, hidden_dim);
+    for (size_t di = 0; di < sizeof(dims)/sizeof(dims[0]); di++) {
+        for (size_t si = 0; si < sizeof(seqlens)/sizeof(seqlens[0]); si++) {
+            pcg_seed(42 + di * 100 + si);
+            failures += test_kernel("baseline",    embedding_fwd_f32_asm,            seqlens[si], dims[di], vocab);
+            failures += test_kernel("batched",     embedding_fwd_f32_batched_asm,    seqlens[si], dims[di], vocab);
+            failures += test_kernel("stream",      embedding_fwd_f32_stream_asm,     seqlens[si], dims[di], vocab);
+            failures += test_kernel("stream_ipf",  embedding_fwd_f32_stream_ipf_asm, seqlens[si], dims[di], vocab);
+            failures += test_kernel("gather",      embedding_fwd_f32_gather_asm,     seqlens[si], dims[di], vocab);
+            failures += test_sorted_kernel("sorted", seqlens[si], dims[di], vocab, 0);
+            failures += test_sorted_kernel("dedup",  seqlens[si], dims[di], vocab, 1);
+        }
     }
 
-    // Benchmark reference
+    // Non-VL-aligned dim
+    pcg_seed(99);
+    failures += test_kernel("stream_ipf(1000)", embedding_fwd_f32_stream_ipf_asm, 64, 1000, vocab);
+    failures += test_sorted_kernel("dedup(dim=1000)", 64, 1000, vocab, 1);
+
+    if (failures)
+        printf("\n!!! %d correctness tests FAILED !!!\n\n", failures);
+    else
+        printf("\nAll correctness tests PASSED.\n\n");
+    return failures;
+}
+
+//=============================================================================
+// Benchmark infrastructure
+//=============================================================================
+typedef struct {
+    const char* name;
+    double time_ms;
+    double gb_s;
+    double pct_peak;
+} bench_result_t;
+
+static double compute_bytes_moved(size_t seq_len, size_t hidden_dim)
+{
+    return (double)seq_len * (double)hidden_dim * 4.0 * 2.0
+           + (double)seq_len * 4.0;
+}
+
+static bench_result_t bench_single(const char* name, emb_kernel_fn kernel,
+                                    const int32_t* indices, const float* emb_table,
+                                    float* output, size_t seq_len, size_t hidden_dim,
+                                    int use_omp, int iterations)
+{
+    bench_result_t r;
+    r.name = name;
+
+    for (int i = 0; i < 3; i++) {
+        if (use_omp)
+            embedding_fwd_f32_omp(indices, emb_table, output, seq_len, hidden_dim, kernel);
+        else
+            kernel(indices, emb_table, output, seq_len, hidden_dim);
+    }
+
     double t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_fwd_with_pos_f32_ref(token_ids, position_ids, token_emb,
-                                       pos_emb, output, batch_size, hidden_dim);
+    for (int i = 0; i < iterations; i++) {
+        if (use_omp)
+            embedding_fwd_f32_omp(indices, emb_table, output, seq_len, hidden_dim, kernel);
+        else
+            kernel(indices, emb_table, output, seq_len, hidden_dim);
     }
     double t1 = get_time_sec();
-    double ref_time = (t1 - t0) / iterations;
 
-    // Benchmark assembly
-    t0 = get_time_sec();
-    for (size_t i = 0; i < iterations; i++) {
-        embedding_fwd_with_pos_f32_asm(token_ids, position_ids, token_emb,
-                                       pos_emb, output, batch_size, hidden_dim);
+    double avg_sec = (t1 - t0) / iterations;
+    double bytes = compute_bytes_moved(seq_len, hidden_dim);
+    r.time_ms  = avg_sec * 1e3;
+    r.gb_s     = bytes / avg_sec / 1e9;
+    r.pct_peak = r.gb_s / HBM2_PEAK_GBS * 100.0;
+    return r;
+}
+
+// Bench function for sorted/dedup variants (takes vocab_size, mode)
+typedef enum { MODE_SORTED, MODE_DEDUP } sort_mode_t;
+
+static bench_result_t bench_sort_variant(const char* name,
+                                          const int32_t* indices, const float* emb_table,
+                                          float* output, size_t seq_len, size_t hidden_dim,
+                                          size_t vocab_size, sort_mode_t mode,
+                                          int use_omp, int iterations)
+{
+    bench_result_t r;
+    r.name = name;
+
+    for (int i = 0; i < 3; i++) {
+        if (mode == MODE_DEDUP) {
+            if (use_omp)
+                embedding_fwd_f32_dedup_omp(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+            else
+                embedding_fwd_f32_dedup(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+        } else {
+            if (use_omp)
+                embedding_fwd_f32_sorted_omp(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+            else
+                embedding_fwd_f32_sorted(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+        }
     }
-    t1 = get_time_sec();
-    double asm_time = (t1 - t0) / iterations;
 
-    // Bandwidth: read 2 embedding rows + write 1 output row per token
-    size_t bytes_moved = batch_size * hidden_dim * sizeof(float) * 3 +
-                         batch_size * sizeof(int32_t) * 2;
-    double bw_ref = bytes_moved / ref_time / 1e9;
-    double bw_asm = bytes_moved / asm_time / 1e9;
+    double t0 = get_time_sec();
+    for (int i = 0; i < iterations; i++) {
+        if (mode == MODE_DEDUP) {
+            if (use_omp)
+                embedding_fwd_f32_dedup_omp(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+            else
+                embedding_fwd_f32_dedup(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+        } else {
+            if (use_omp)
+                embedding_fwd_f32_sorted_omp(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+            else
+                embedding_fwd_f32_sorted(indices, emb_table, output, seq_len, hidden_dim, vocab_size);
+        }
+    }
+    double t1 = get_time_sec();
 
-    printf("  Reference: %.3f us, %.2f GB/s\n", ref_time * 1e6, bw_ref);
-    printf("  ASM:       %.3f us, %.2f GB/s (%.2fx speedup)\n",
-           asm_time * 1e6, bw_asm, ref_time / asm_time);
+    double avg_sec = (t1 - t0) / iterations;
+    double bytes = compute_bytes_moved(seq_len, hidden_dim);
+    r.time_ms  = avg_sec * 1e3;
+    r.gb_s     = bytes / avg_sec / 1e9;
+    r.pct_peak = r.gb_s / HBM2_PEAK_GBS * 100.0;
+    return r;
+}
 
-    free(token_ids);
-    free(position_ids);
-    free(token_emb);
-    free(pos_emb);
+static void print_result_row(bench_result_t r, size_t seq_len, size_t hidden_dim, int nthreads)
+{
+    char seq_buf[16];
+    if (seq_len >= 1024)
+        snprintf(seq_buf, sizeof(seq_buf), "%zuK", seq_len / 1024);
+    else
+        snprintf(seq_buf, sizeof(seq_buf), "%zu", seq_len);
+    printf("  %-14s | %6s | %4zu | %3d thr | %8.2f ms | %7.1f GB/s | %5.1f%%\n",
+           r.name, seq_buf, hidden_dim, nthreads, r.time_ms, r.gb_s, r.pct_peak);
+}
+
+//=============================================================================
+// Main benchmark sweep (uniform random indices)
+//=============================================================================
+static void run_benchmarks(void)
+{
+    printf("====================================================================\n");
+    printf("Embedding Forward Benchmark — A64FX (HBM2 peak: %.0f GB/s)\n", HBM2_PEAK_GBS);
+    printf("Vocab: %d, FP32, uniform random indices\n", VOCAB_SIZE);
+    printf("====================================================================\n\n");
+
+    size_t seqlens[] = {1024, 4096, 16384, 65536, 262144};
+    size_t dims[]    = {1024, 2048, 4096};
+    int n_seqlens = sizeof(seqlens) / sizeof(seqlens[0]);
+    int n_dims    = sizeof(dims) / sizeof(dims[0]);
+
+    int nthreads = 1;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+#endif
+    int use_omp = (nthreads > 1);
+
+    printf("Threads: %d, OMP: %s\n\n", nthreads, use_omp ? "yes" : "no");
+
+    size_t max_dim = 4096;
+    size_t emb_bytes = (size_t)VOCAB_SIZE * max_dim * sizeof(float);
+    float* emb_table = (float*)aligned_alloc(256, emb_bytes);
+    if (!emb_table) {
+        printf("ERROR: cannot allocate embedding table (%.2f GB)\n", emb_bytes / 1e9);
+        return;
+    }
+    memset(emb_table, 0, emb_bytes);
+    pcg_seed(123);
+    for (size_t i = 0; i < (size_t)VOCAB_SIZE * max_dim; i += 64)
+        emb_table[i] = (float)(pcg32() & 0xFFFF) * 1e-4f;
+
+    printf("  %-14s | %6s | %4s | %7s | %11s | %11s | %6s\n",
+           "Kernel", "SeqLen", "Dim", "Threads", "Time", "BW", "Peak%");
+    printf("  %-14s-+-%6s-+-%4s-+-%7s-+-%11s-+-%11s-+-%6s\n",
+           "--------------", "------", "----", "-------", "-----------", "-----------", "------");
+
+    for (int di = 0; di < n_dims; di++) {
+        size_t dim = dims[di];
+
+        for (int si = 0; si < n_seqlens; si++) {
+            size_t seq = seqlens[si];
+
+            size_t out_bytes = seq * dim * sizeof(float);
+            if (out_bytes > 8UL * 1024 * 1024 * 1024) {
+                printf("  (skipping seq=%zu dim=%zu — output %.1f GB)\n",
+                       seq, dim, out_bytes / 1e9);
+                continue;
+            }
+
+            int32_t* indices = (int32_t*)aligned_alloc(256, seq * sizeof(int32_t));
+            float* output    = (float*)aligned_alloc(256, out_bytes);
+            if (!indices || !output) {
+                printf("  (skipping seq=%zu dim=%zu — alloc fail)\n", seq, dim);
+                free(indices); free(output);
+                continue;
+            }
+
+            pcg_seed(42 + seq + dim);
+            for (size_t i = 0; i < seq; i++)
+                indices[i] = rand_int(VOCAB_SIZE);
+            memset(output, 0, out_bytes);
+
+            int iters = 1;
+            if (seq <= 4096)       iters = 20;
+            else if (seq <= 16384) iters = 5;
+            else if (seq <= 65536) iters = 3;
+
+            bench_result_t r;
+
+            r = bench_single("stream", embedding_fwd_f32_stream_asm,
+                              indices, emb_table, output, seq, dim, use_omp, iters);
+            print_result_row(r, seq, dim, nthreads);
+
+            r = bench_single("stream_ipf", embedding_fwd_f32_stream_ipf_asm,
+                              indices, emb_table, output, seq, dim, use_omp, iters);
+            print_result_row(r, seq, dim, nthreads);
+
+            r = bench_sort_variant("sorted", indices, emb_table, output,
+                                    seq, dim, VOCAB_SIZE, MODE_SORTED, use_omp, iters);
+            print_result_row(r, seq, dim, nthreads);
+
+            r = bench_sort_variant("dedup", indices, emb_table, output,
+                                    seq, dim, VOCAB_SIZE, MODE_DEDUP, use_omp, iters);
+            print_result_row(r, seq, dim, nthreads);
+
+            printf("  ---\n");
+
+            free(indices);
+            free(output);
+        }
+    }
+
+    free(emb_table);
+}
+
+//=============================================================================
+// Zipfian Distribution Benchmark
+// Shows L2 cache amplification effect for realistic token distributions
+//=============================================================================
+static void run_zipfian_benchmark(void)
+{
+    printf("\n====================================================================\n");
+    printf("Zipfian Distribution Benchmark (seq=64K, vocab=%d)\n", VOCAB_SIZE);
+    printf("Reveals L2 cache amplification for realistic distributions\n");
+    printf("====================================================================\n\n");
+
+    size_t seq = 65536;
+    size_t dims[] = {1024, 4096};
+    double alphas[] = {0.0, 0.8, 1.0, 1.2};
+    int n_dims = sizeof(dims) / sizeof(dims[0]);
+    int n_alphas = sizeof(alphas) / sizeof(alphas[0]);
+
+    int nthreads = 1;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+#endif
+    int use_omp = (nthreads > 1);
+    int iters = 3;
+
+    size_t max_dim = 4096;
+    size_t emb_bytes = (size_t)VOCAB_SIZE * max_dim * sizeof(float);
+    float* emb_table = (float*)aligned_alloc(256, emb_bytes);
+    if (!emb_table) { printf("ERROR: alloc fail\n"); return; }
+    memset(emb_table, 0, emb_bytes);
+    pcg_seed(200);
+    for (size_t i = 0; i < (size_t)VOCAB_SIZE * max_dim; i += 64)
+        emb_table[i] = (float)(pcg32() & 0xFFFF) * 1e-4f;
+
+    printf("  %-14s | %4s | %5s | %6s | %3s | %8s | %11s | %6s\n",
+           "Kernel", "Dim", "alpha", "Unique", "Thr", "Time", "BW", "Peak%");
+    printf("  %-14s-+-%4s-+-%5s-+-%6s-+-%3s-+-%8s-+-%11s-+-%6s\n",
+           "--------------", "----", "-----", "------", "---", "--------", "-----------", "------");
+
+    for (int di = 0; di < n_dims; di++) {
+        size_t dim = dims[di];
+        size_t out_bytes = seq * dim * sizeof(float);
+
+        int32_t* indices = (int32_t*)aligned_alloc(256, seq * sizeof(int32_t));
+        float* output    = (float*)aligned_alloc(256, out_bytes);
+        if (!indices || !output) {
+            printf("  (alloc fail for dim=%zu)\n", dim);
+            free(indices); free(output);
+            continue;
+        }
+
+        for (int ai = 0; ai < n_alphas; ai++) {
+            double alpha = alphas[ai];
+            pcg_seed(300 + ai * 17 + di * 7);
+            size_t unique = fill_zipfian(indices, seq, alpha, VOCAB_SIZE);
+            memset(output, 0, out_bytes);
+
+            bench_result_t r;
+
+            r = bench_single("stream", embedding_fwd_f32_stream_asm,
+                              indices, emb_table, output, seq, dim, use_omp, iters);
+            printf("  %-14s | %4zu | %5.1f | %5zuK | %3d | %5.2f ms | %7.1f GB/s | %5.1f%%\n",
+                   r.name, dim, alpha, unique/1024, nthreads, r.time_ms, r.gb_s, r.pct_peak);
+
+            r = bench_single("stream_ipf", embedding_fwd_f32_stream_ipf_asm,
+                              indices, emb_table, output, seq, dim, use_omp, iters);
+            printf("  %-14s | %4zu | %5.1f | %5zuK | %3d | %5.2f ms | %7.1f GB/s | %5.1f%%\n",
+                   r.name, dim, alpha, unique/1024, nthreads, r.time_ms, r.gb_s, r.pct_peak);
+
+            r = bench_sort_variant("sorted", indices, emb_table, output,
+                                    seq, dim, VOCAB_SIZE, MODE_SORTED, use_omp, iters);
+            printf("  %-14s | %4zu | %5.1f | %5zuK | %3d | %5.2f ms | %7.1f GB/s | %5.1f%%\n",
+                   r.name, dim, alpha, unique/1024, nthreads, r.time_ms, r.gb_s, r.pct_peak);
+
+            r = bench_sort_variant("dedup", indices, emb_table, output,
+                                    seq, dim, VOCAB_SIZE, MODE_DEDUP, use_omp, iters);
+            printf("  %-14s | %4zu | %5.1f | %5zuK | %3d | %5.2f ms | %7.1f GB/s | %5.1f%%\n",
+                   r.name, dim, alpha, unique/1024, nthreads, r.time_ms, r.gb_s, r.pct_peak);
+
+            printf("  ---\n");
+        }
+
+        free(indices);
+        free(output);
+    }
+
+    free(emb_table);
+}
+
+//=============================================================================
+// Multi-core scaling test
+//=============================================================================
+static void run_scaling_test(void)
+{
+#ifdef _OPENMP
+    printf("\n====================================================================\n");
+    printf("Multi-Core Scaling Test (seq=64K, dim=4096, vocab=%d)\n", VOCAB_SIZE);
+    printf("====================================================================\n\n");
+
+    size_t seq = 65536;
+    size_t dim = 4096;
+    int iters = 3;
+
+    float* emb_table = (float*)aligned_alloc(256, (size_t)VOCAB_SIZE * dim * sizeof(float));
+    int32_t* indices = (int32_t*)aligned_alloc(256, seq * sizeof(int32_t));
+    float* output    = (float*)aligned_alloc(256, seq * dim * sizeof(float));
+    if (!emb_table || !indices || !output) {
+        printf("  Allocation failed\n");
+        free(emb_table); free(indices); free(output);
+        return;
+    }
+
+    memset(emb_table, 0, (size_t)VOCAB_SIZE * dim * sizeof(float));
+    pcg_seed(77);
+    for (size_t i = 0; i < seq; i++)
+        indices[i] = rand_int(VOCAB_SIZE);
+    memset(output, 0, seq * dim * sizeof(float));
+
+    int thread_counts[] = {1, 12, 24, 48};
+    int n_tc = sizeof(thread_counts) / sizeof(thread_counts[0]);
+
+    printf("  %-14s | %3s | %11s | %11s | %6s\n",
+           "Kernel", "Thr", "Time", "BW", "Peak%");
+    printf("  %-14s-+-%3s-+-%11s-+-%11s-+-%6s\n",
+           "--------------", "---", "-----------", "-----------", "------");
+
+    for (int ti = 0; ti < n_tc; ti++) {
+        int nt = thread_counts[ti];
+        omp_set_num_threads(nt);
+
+        bench_result_t r;
+        int use = (nt > 1);
+
+        r = bench_single("stream", embedding_fwd_f32_stream_asm,
+                          indices, emb_table, output, seq, dim, use, iters);
+        printf("  %-14s | %3d | %8.2f ms | %7.1f GB/s | %5.1f%%\n",
+               r.name, nt, r.time_ms, r.gb_s, r.pct_peak);
+
+        r = bench_single("stream_ipf", embedding_fwd_f32_stream_ipf_asm,
+                          indices, emb_table, output, seq, dim, use, iters);
+        printf("  %-14s | %3d | %8.2f ms | %7.1f GB/s | %5.1f%%\n",
+               r.name, nt, r.time_ms, r.gb_s, r.pct_peak);
+
+        r = bench_sort_variant("sorted", indices, emb_table, output,
+                                seq, dim, VOCAB_SIZE, MODE_SORTED, use, iters);
+        printf("  %-14s | %3d | %8.2f ms | %7.1f GB/s | %5.1f%%\n",
+               r.name, nt, r.time_ms, r.gb_s, r.pct_peak);
+
+        r = bench_sort_variant("dedup", indices, emb_table, output,
+                                seq, dim, VOCAB_SIZE, MODE_DEDUP, use, iters);
+        printf("  %-14s | %3d | %8.2f ms | %7.1f GB/s | %5.1f%%\n",
+               r.name, nt, r.time_ms, r.gb_s, r.pct_peak);
+
+        printf("  ---\n");
+    }
+
+    free(emb_table);
+    free(indices);
     free(output);
+#else
+    printf("\n(Scaling test requires OpenMP — skipped)\n");
+#endif
 }
 
 //=============================================================================
@@ -559,70 +736,45 @@ static void bench_embedding_with_pos_f32(size_t iterations, size_t batch_size,
 //=============================================================================
 int main(int argc, char** argv)
 {
-    size_t iterations = 1000;
-    size_t batch_size = 512;
-    size_t hidden_dim = 4096;
-    size_t vocab_size = 32000;
-    size_t max_pos = 2048;
+    int skip_correctness = 0;
+    int bench_only_zipf = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--bench-only") == 0)
+            skip_correctness = 1;
+        if (strcmp(argv[i], "--zipf-only") == 0) {
+            skip_correctness = 1;
+            bench_only_zipf = 1;
+        }
+    }
 
-    if (argc > 1) iterations = (size_t)atol(argv[1]);
-    if (argc > 2) batch_size = (size_t)atol(argv[2]);
-    if (argc > 3) hidden_dim = (size_t)atol(argv[3]);
-    if (argc > 4) vocab_size = (size_t)atol(argv[4]);
-
-    printf("==============================================\n");
-    printf("SVE Embedding Benchmark for A64FX\n");
-    printf("==============================================\n");
-    printf("Parameters:\n");
-    printf("  iterations  = %zu\n", iterations);
-    printf("  batch_size  = %zu\n", batch_size);
-    printf("  hidden_dim  = %zu\n", hidden_dim);
-    printf("  vocab_size  = %zu\n", vocab_size);
-    printf("  max_pos     = %zu\n", max_pos);
+    printf("======================================================\n");
+    printf("SVE Embedding Forward Benchmark — A64FX\n");
+    printf("======================================================\n");
+    printf("Vocab=%d, FP32, HBM2 peak=%.0f GB/s\n", VOCAB_SIZE, HBM2_PEAK_GBS);
+#ifdef _OPENMP
+    printf("OpenMP: max_threads=%d\n", omp_get_max_threads());
+#else
+    printf("OpenMP: disabled (single-core)\n");
+#endif
     printf("\n");
 
-    pcg_seed(42);
-
-    // Run tests
-    printf("=== Correctness Tests ===\n");
     int failures = 0;
+    if (!skip_correctness)
+        failures = run_correctness_tests();
 
-    // Test with various sizes
-    failures += test_embedding_fwd_f32(batch_size, hidden_dim, vocab_size);
-    failures += test_embedding_fwd_f32_batched(batch_size, hidden_dim, vocab_size);
-    failures += test_embedding_bwd_f32(batch_size, hidden_dim, vocab_size);
-    failures += test_embedding_fwd_f64(batch_size, hidden_dim, vocab_size);
-    failures += test_embedding_fwd_with_pos_f32(batch_size, hidden_dim, vocab_size, max_pos);
+    if (failures) {
+        printf("Aborting benchmarks due to correctness failures.\n");
+        return 1;
+    }
 
-    // Test edge cases
-    printf("\n  Edge cases:\n");
-    failures += test_embedding_fwd_f32(1, hidden_dim, vocab_size);     // single token
-    failures += test_embedding_fwd_f32(batch_size, 64, vocab_size);    // small dim
-    failures += test_embedding_fwd_f32(batch_size, 63, vocab_size);    // non-VL aligned
-    failures += test_embedding_fwd_f32(3, hidden_dim, vocab_size);     // non-batch-4 aligned
-
-    if (failures > 0) {
-        printf("\n!!! %d tests FAILED !!!\n", failures);
+    if (bench_only_zipf) {
+        run_zipfian_benchmark();
     } else {
-        printf("\nAll tests PASSED!\n");
+        run_benchmarks();
+        run_zipfian_benchmark();
+        run_scaling_test();
     }
 
-    // Run benchmarks
-    printf("\n=== Performance Benchmarks ===\n");
-    bench_embedding_fwd_f32(iterations, batch_size, hidden_dim, vocab_size);
-    bench_embedding_bwd_f32(iterations, batch_size, hidden_dim, vocab_size);
-    bench_embedding_fwd_f64(iterations, batch_size, hidden_dim, vocab_size);
-    bench_embedding_with_pos_f32(iterations, batch_size, hidden_dim, vocab_size, max_pos);
-
-    // Test different hidden dimensions
-    printf("\n=== Hidden Dimension Scaling ===\n");
-    size_t dims[] = {256, 512, 1024, 2048, 4096, 8192};
-    for (size_t i = 0; i < sizeof(dims)/sizeof(dims[0]); i++) {
-        bench_embedding_fwd_f32(iterations/2, batch_size, dims[i], vocab_size);
-    }
-
-    printf("\n==============================================\n");
-    printf("Benchmark complete.\n");
-
-    return failures;
+    printf("\nDone.\n");
+    return 0;
 }
