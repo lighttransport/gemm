@@ -43,6 +43,36 @@ float cross_entropy_fwd_bwd_f32(const float *logits, int target, int V,
 float cross_entropy_fwd_bwd_blocked_f32(const float *logits, int target, int V,
                                          float *grad);
 
+/* Blocked forward with FP16 input (1 L2 pass via blocking, fp16→fp32) */
+float cross_entropy_fwd_blocked_f16(const uint16_t *logits_f16, int target, int V);
+
+/* Backward with FP16 input: grad[i] = softmax_i - 1{i==target}
+ * Reads fp16 logits, computes in fp32, writes fp32 grad.
+ */
+void cross_entropy_bwd_f16(const uint16_t *logits_f16, int target, int V,
+                           float max_val, float sum_exp, float *grad);
+
+/* Combined forward + backward with FP16 input (3-pass)
+ * Returns loss, writes fp32 grad[0..V-1].
+ */
+float cross_entropy_fwd_bwd_f16(const uint16_t *logits_f16, int target, int V,
+                                float *grad);
+
+/* Blocked forward + backward with FP16 input:
+ * Phase 1: blocked max+exp+sum (1 L2 pass, fp16→fp32)
+ * Phase 2: streaming grad (fp16 read + fp32 write)
+ */
+float cross_entropy_fwd_bwd_blocked_f16(const uint16_t *logits_f16, int target,
+                                         int V, float *grad);
+
+/* Batch forward (blocked) with OpenMP */
+void cross_entropy_batch_blocked_f32(const float *logits, const int *targets,
+                                      float *losses, int batch_tokens, int V);
+
+/* Batch forward (FP16) with OpenMP */
+void cross_entropy_batch_f16(const uint16_t *logits_f16, const int *targets,
+                              float *losses, int batch_tokens, int V);
+
 /* Scalar baseline for accuracy comparison */
 float cross_entropy_scalar_f32(const float *logits, int target, int V);
 double cross_entropy_ref_f64(const float *logits, int target, int V);
