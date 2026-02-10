@@ -94,7 +94,8 @@ profile: clean $(TARGET)
                   micro_kernel_fp16_6x4.o micro_kernel_fp16_6x4_accum.o \
                   micro_kernel_fp16_12x2_bpre.o micro_kernel_fp16_12x2_bpre_accum.o \
                   micro_kernel_fp16_12x2_noepi.o micro_kernel_fp16_12x2_noepi_accum.o \
-                  micro_kernel_fp16_12x2_noepi4.o micro_kernel_fp16_12x2_noepi4_accum.o
+                  micro_kernel_fp16_12x2_noepi4.o micro_kernel_fp16_12x2_noepi4_accum.o \
+                  micro_kernel_fp16_12x2_noepi4_prfm.o micro_kernel_fp16_12x2_noepi4_prfm_accum.o
 
 bench_2pass: bench_2pass.o $(2PASS_KERN_OBJS)
 	$(2PASS_CC) $(2PASS_CFLAGS) -o $@ $^ $(2PASS_LDFLAGS)

@@ -107,6 +107,10 @@ extern void micro_kernel_fp16_12x2_noepi4(
     const _Float16*, const _Float16*, _Float16*, int64_t, int64_t, int64_t);
 extern void micro_kernel_fp16_12x2_noepi4_accum(
     const _Float16*, const _Float16*, _Float16*, int64_t, int64_t, int64_t);
+extern void micro_kernel_fp16_12x2_noepi4_prfm(
+    const _Float16*, const _Float16*, _Float16*, int64_t, int64_t, int64_t);
+extern void micro_kernel_fp16_12x2_noepi4_prfm_accum(
+    const _Float16*, const _Float16*, _Float16*, int64_t, int64_t, int64_t);
 
 /* ─── FEXPA exp2 ─── */
 #define FEXPA_SHIFT_U32  0x48481fc0u
@@ -371,14 +375,35 @@ static void normalize(float *O, int ld_o, const float *rs, int M, int d)
     }
 }
 
-/* ─── Normalize fp16 O /= sum (scalar, not perf-critical) ─── */
+/* Forward declaration (defined after prepack_v_fp16) */
+static inline void store_f32_as_f16(svbool_t pg, _Float16 *dst, svfloat32_t src);
+
+/* ─── Normalize fp16 O /= sum (SVE vectorized via fp32 widening) ─── */
+/* Uses ld1h{z.s} widening load + fcvt+st1h narrowing store (16 elems/iter).
+ * Avoids fp16 intrinsic type ambiguity with _Float16* on Fujitsu/Clang. */
 static void normalize_fp16(_Float16 *O, int ld_o, const float *rs, int M, int d)
 {
+    const int vl = svcntw();  /* 16 for fp32 on 512-bit SVE */
+    svbool_t pg_all = svptrue_b32();
     for (int m = 0; m < M; m++) {
-        float inv = 1.0f / rs[m];
+        svfloat32_t vinv = svdup_f32(1.0f / rs[m]);
         _Float16 *row = O + m * ld_o;
-        for (int j = 0; j < d; j++)
-            row[j] = (_Float16)((float)row[j] * inv);
+        int j;
+        for (j = 0; j + vl <= d; j += vl) {
+            svfloat32_t v;
+            __asm__("ld1h {%0.s}, %1/z, [%2]"
+                    : "=w"(v) : "Upl"(pg_all), "r"(row + j));
+            v = svmul_m(pg_all, v, vinv);
+            store_f32_as_f16(pg_all, row + j, v);
+        }
+        if (j < d) {
+            svbool_t pgt = svwhilelt_b32(j, d);
+            svfloat32_t v;
+            __asm__("ld1h {%0.s}, %1/z, [%2]"
+                    : "=w"(v) : "Upl"(pgt), "r"(row + j));
+            v = svmul_m(pgt, v, vinv);
+            store_f32_as_f16(pgt, row + j, v);
+        }
     }
 }
 
@@ -1274,6 +1299,228 @@ static void run_online(
     free(Pp);
 }
 
+/* ─── 3-pass separated: max → full pass1 → GEMM-only (no L1 pollution) ─── */
+/*
+ * At large L the 2-pass pipeline's interleaved pass1 thrashes L1 during GEMM
+ * (S reads + Pp writes compete with B streaming).  Separating pass1 gives GEMM
+ * a clean L1 working set, matching the GEMM-only ceiling.
+ *
+ * Pp_all lives in L2 (~L*MR*2 bytes, e.g. 786 KB for L=32768 MR=12).
+ * Phase 2 streams Pp sequentially from L2—hardware prefetcher handles it.
+ */
+static void run_3pass_fp16_noepi(
+    const float *S, int ld_s,
+    const _Float16 *Vp_all,
+    _Float16 *O, int ld_o,
+    int MR, int L, int d_out, int NR, int Kc,
+    int n_tiles,
+    gemm_fp16_noepi_fn kern_init, gemm_fp16_noepi_fn kern_accum,
+    timing_t *tm)
+{
+    int64_t ldo_bytes = (int64_t)ld_o * sizeof(_Float16);
+    int n_kblocks = (L + Kc - 1) / Kc;
+
+    /* Full Pp buffer in L2: L × MR fp16 values */
+    size_t pp_bytes = ((size_t)L * MR * sizeof(_Float16) + 255) & ~(size_t)255;
+    _Float16 *Pp_all_h = (_Float16 *)aligned_alloc(256, pp_bytes);
+
+    float rmax[16], rsum[16];
+    memset(rsum, 0, sizeof(rsum));
+
+    /* Phase 0: Find global row maxima */
+    uint64_t t0 = rdtick();
+    {
+        svbool_t pg_mr = svwhilelt_b32(0, MR);
+        svfloat32_t vmax = svdup_f32(-1e30f);
+        for (int j = 0; j < L; j++)
+            vmax = svmax_m(pg_mr, vmax, svld1(pg_mr, S + (int64_t)j * ld_s));
+        float mbuf[16] __attribute__((aligned(256)));
+        svst1(svptrue_b32(), mbuf, vmax);
+        for (int m = 0; m < MR; m++) rmax[m] = mbuf[m];
+    }
+
+    /* Phase 1: Compute ALL Pp blocks (exp2 → fp16, sequential write to L2) */
+    for (int kb = 0; kb < n_kblocks; kb++) {
+        int kc = kb * Kc;
+        int klen = (kc + Kc <= L) ? Kc : (L - kc);
+        pass1_block_exp_fp16(S, ld_s, kc, klen, MR, rmax,
+                              Pp_all_h + kc * MR, rsum);
+    }
+    uint64_t t1 = rdtick();
+    tm->pass1 = (double)(t1 - t0) * tick2sec;
+
+    /* Phase 2: Pure GEMM — clean L1 working set, no pass1 interference */
+    for (int kb = 0; kb < n_kblocks; kb++) {
+        int kc = kb * Kc;
+        int klen = (kc + Kc <= L) ? Kc : (L - kc);
+        klen &= ~1;
+        if (klen < 2) continue;
+        const _Float16 *Pp_blk = Pp_all_h + kc * MR;
+
+        for (int t = 0; t < n_tiles; t++) {
+            /* A re-touch: after 2 B tiles (64KB), A (6KB) likely evicted from L1 */
+            if (t == 2) {
+                const char *a = (const char *)Pp_blk;
+                for (int ln = 0; ln < klen * MR * 2; ln += 256)
+                    __builtin_prefetch(a + ln, 0, 3);
+            }
+            const _Float16 *Vp = Vp_all + ((size_t)kb * n_tiles + t) * Kc * NR;
+            if (kb == 0)
+                kern_init(Pp_blk, Vp, O + t * NR,
+                          (int64_t)klen, 0, ldo_bytes);
+            else
+                kern_accum(Pp_blk, Vp, O + t * NR,
+                           (int64_t)klen, 0, ldo_bytes);
+        }
+    }
+    uint64_t t2 = rdtick();
+    tm->pass2 = (double)(t2 - t1) * tick2sec;
+
+    /* Phase 3: Normalize */
+    normalize_fp16(O, ld_o, rsum, MR, d_out);
+    uint64_t t3 = rdtick();
+    tm->norm = (double)(t3 - t2) * tick2sec;
+
+    free(Pp_all_h);
+}
+
+/* ─── Online softmax for FP16 NOEPI (no separate max-find pass) ─── */
+/*
+ * FlashAttention-style online rescaling with fp16 NOEPI kernels:
+ *   - Process k-blocks sequentially
+ *   - Find local max per block, update running global max
+ *   - When max changes: rescale O (fp16) and rsum by exp2(old_max - new_max)
+ *   - No pipeline needed: Pp written then immediately consumed by GEMM (L1 warm)
+ *   - O rescaling uses SVE fp16 vectorized multiply (32 elements per vector)
+ */
+static void run_online_fp16_noepi(
+    const float *S, int ld_s,
+    const _Float16 *Vp_all,
+    _Float16 *O, int ld_o,
+    int MR, int L, int d_out, int NR, int Kc,
+    int n_tiles,
+    gemm_fp16_noepi_fn kern_init, gemm_fp16_noepi_fn kern_accum,
+    timing_t *tm)
+{
+    int64_t ldo_bytes = (int64_t)ld_o * sizeof(_Float16);
+    int n_kblocks = (L + Kc - 1) / Kc;
+
+    /* Single Pp buffer: Kc * MR fp16 elements, fits L1 */
+    size_t pp_elems = (size_t)Kc * MR;
+    size_t pp_bytes = (pp_elems * sizeof(_Float16) + 255) & ~(size_t)255;
+    _Float16 *Pp = (_Float16 *)aligned_alloc(256, pp_bytes);
+
+    float rmax[16], rsum[16];
+    float rmax_buf[16] __attribute__((aligned(256)));
+    for (int m = 0; m < MR; m++) rmax[m] = -1e30f;
+    memset(rsum, 0, sizeof(rsum));
+
+    svbool_t pg_mr = svwhilelt_b32(0, MR);
+    const int vl_h = svcnth();  /* 32 for fp16 on 512-bit SVE */
+
+    uint64_t t0 = rdtick();
+
+    for (int kb = 0; kb < n_kblocks; kb++) {
+        int kc = kb * Kc;
+        int klen = (kc + Kc <= L) ? Kc : (L - kc);
+
+        /* Step 1: Find local max within this block's columns */
+        const float *S_blk = S + (int64_t)kc * ld_s;
+        svfloat32_t vlmax = svdup_f32(-1e30f);
+        for (int j = 0; j < klen; j++)
+            vlmax = svmax_m(pg_mr, vlmax, svld1(pg_mr, S_blk + j * ld_s));
+        svst1(svptrue_b32(), rmax_buf, vlmax);
+
+        /* Step 2: Check if max changed, rescale if needed */
+        int max_changed = 0;
+        for (int m = 0; m < MR; m++)
+            if (rmax_buf[m] > rmax[m]) { max_changed = 1; break; }
+
+        if (max_changed) {
+            /* Compute per-row correction: corr = exp2(old_max - new_max) */
+            union { uint32_t u; float f; } su = { .u = FEXPA_SHIFT_U32 };
+            float shift = su.f;
+            float cbuf[16] __attribute__((aligned(256)));
+            for (int m = 0; m < MR; m++) {
+                float new_max = (rmax_buf[m] > rmax[m]) ? rmax_buf[m] : rmax[m];
+                cbuf[m] = rmax[m] - new_max + shift;
+                rmax[m] = new_max;
+            }
+            svfloat32_t vcorr = sve_fexpa(svld1(pg_mr, cbuf));
+
+            /* Rescale running sums (fp32) */
+            float sbuf[16] __attribute__((aligned(256)));
+            for (int m = 0; m < MR; m++) sbuf[m] = rsum[m];
+            svfloat32_t vs = svmul_m(pg_mr, svld1(pg_mr, sbuf), vcorr);
+            svst1(svptrue_b32(), sbuf, vs);
+            for (int m = 0; m < MR; m++) rsum[m] = sbuf[m];
+
+            /* Rescale O: O[m][j] *= corr[m] (SVE via fp32 widening) */
+            if (kb > 0) {  /* O is non-zero only after first GEMM */
+                float corr_arr[16] __attribute__((aligned(256)));
+                svst1(svptrue_b32(), corr_arr, vcorr);
+                svbool_t pg_all = svptrue_b32();
+                const int vl_w = svcntw();  /* 16 for fp32 */
+                for (int m = 0; m < MR; m++) {
+                    svfloat32_t vc = svdup_f32(corr_arr[m]);
+                    _Float16 *row = O + m * ld_o;
+                    int j;
+                    for (j = 0; j + vl_w <= d_out; j += vl_w) {
+                        svfloat32_t v;
+                        __asm__("ld1h {%0.s}, %1/z, [%2]"
+                                : "=w"(v) : "Upl"(pg_all), "r"(row + j));
+                        v = svmul_m(pg_all, v, vc);
+                        store_f32_as_f16(pg_all, row + j, v);
+                    }
+                    if (j < d_out) {
+                        svbool_t pg_tail = svwhilelt_b32(j, d_out);
+                        svfloat32_t v;
+                        __asm__("ld1h {%0.s}, %1/z, [%2]"
+                                : "=w"(v) : "Upl"(pg_tail), "r"(row + j));
+                        v = svmul_m(pg_tail, v, vc);
+                        store_f32_as_f16(pg_tail, row + j, v);
+                    }
+                }
+            }
+        }
+
+        /* Step 3: pass1_block_exp_fp16 (compute P = exp2(S - max), fp16 output) */
+        pass1_block_exp_fp16(S, ld_s, kc, klen, MR, rmax, Pp, rsum);
+
+        /* Prefetch S data for NEXT block into L1 */
+        if (kb + 1 < n_kblocks) {
+            const float *base = S + (int64_t)((kb + 1) * Kc) * ld_s;
+            int nlines = (Kc * ld_s * (int)sizeof(float) + 255) / 256;
+            for (int line = 0; line < nlines; line++)
+                __builtin_prefetch(base + line * 64, 0, 3);
+        }
+
+        /* Step 4: GEMM for this block (noepi4 needs K multiple of 4) */
+        int klen_gemm = klen & ~3;
+        if (klen_gemm < 4) continue;
+        for (int t = 0; t < n_tiles; t++) {
+            const _Float16 *Vp = Vp_all + ((size_t)kb * n_tiles + t) * Kc * NR;
+            if (kb == 0)
+                kern_init(Pp, Vp, O + t * NR,
+                          (int64_t)klen_gemm, 0, ldo_bytes);
+            else
+                kern_accum(Pp, Vp, O + t * NR,
+                           (int64_t)klen_gemm, 0, ldo_bytes);
+        }
+    }
+
+    uint64_t t1 = rdtick();
+    tm->pass1 = 0;  /* No separate max-find pass */
+    tm->pass2 = (double)(t1 - t0) * tick2sec;  /* everything fused */
+
+    /* Normalize */
+    normalize_fp16(O, ld_o, rsum, MR, d_out);
+    uint64_t t2 = rdtick();
+    tm->norm = (double)(t2 - t1) * tick2sec;
+
+    free(Pp);
+}
+
 /* ─── Reference (double precision) ─── */
 /* S is column-major: S[j * ld_s + m] */
 static void reference(const float *S, int ld_s, const float *V, double *Or,
@@ -1366,6 +1613,8 @@ int main(void)
                            micro_kernel_fp16_12x2_noepi_accum, 12, 64);
     test_kernel_fp16_noepi("h12n4", micro_kernel_fp16_12x2_noepi4,
                            micro_kernel_fp16_12x2_noepi4_accum, 12, 64);
+    test_kernel_fp16_noepi("h12np", micro_kernel_fp16_12x2_noepi4_prfm,
+                           micro_kernel_fp16_12x2_noepi4_prfm_accum, 12, 64);
     printf("\n");
 
     /* Skip fp32 benchmarks if FP16_ONLY env is set */
@@ -1733,6 +1982,10 @@ fp16_section:
         } noepi_kerns[] = {
             {"h12ne", micro_kernel_fp16_12x2_noepi,  micro_kernel_fp16_12x2_noepi_accum,
                       micro_kernel_fp16_12x2_swp,    micro_kernel_fp16_12x2_swp_accum, 12, 64},
+            {"h12n4", micro_kernel_fp16_12x2_noepi4, micro_kernel_fp16_12x2_noepi4_accum,
+                      micro_kernel_fp16_12x2_swp,    micro_kernel_fp16_12x2_swp_accum, 12, 64},
+            {"h12np", micro_kernel_fp16_12x2_noepi4_prfm, micro_kernel_fp16_12x2_noepi4_prfm_accum,
+                      micro_kernel_fp16_12x2_swp,    micro_kernel_fp16_12x2_swp_accum, 12, 64},
         };
         int n_noepi = sizeof(noepi_kerns)/sizeof(noepi_kerns[0]);
 
@@ -1823,6 +2076,58 @@ fp16_section:
                            best_ne.pass1*1e6, best_ne.pass2*1e6, best_ne.norm*1e6,
                            total_ne*1e6, gf_ne, gf_ne/PEAK_GFLOPS_FP16*100,
                            gf_gmm_ne, gf_gmm_ne/PEAK_GFLOPS_FP16*100, me_ne);
+
+                    /* ── 3-pass separated: max+pass1 → GEMM (no L1 pollution) ── */
+                    {
+                        timing_t best_3p = {1e30, 1e30, 1e30};
+                        for (int r = 0; r < nrep; r++) {
+                            timing_t cur;
+                            memset(O16, 0, sz_O16);
+                            run_3pass_fp16_noepi(S, M_max, Vp16, O16, d_outk, MRk, L, d_outk,
+                                                  NRk, Kc16, nt,
+                                                  fk->init, fk->accum, &cur);
+                            if (r >= warmup) {
+                                double tot = cur.pass1 + cur.pass2 + cur.norm;
+                                double btot = best_3p.pass1 + best_3p.pass2 + best_3p.norm;
+                                if (tot < btot) best_3p = cur;
+                            }
+                        }
+                        double me_3p = max_error_fp16(O16, d_outk, Or, MRk, d);
+                        double total_3p = best_3p.pass1 + best_3p.pass2 + best_3p.norm;
+                        double gf_3p = flops / total_3p / 1e9;
+
+                        printf("3p_%-3s %3d %6d | %8.1f %8.1f %8.1f %8.1f | %7.1f %5.1f%% | %7.1f %5.1f%% | %.2e  (3-pass)\n",
+                               fk->name + 3, Kc16, L,
+                               best_3p.pass1*1e6, best_3p.pass2*1e6, best_3p.norm*1e6,
+                               total_3p*1e6, gf_3p, gf_3p/PEAK_GFLOPS_FP16*100,
+                               gf_gmm_ne, gf_gmm_ne/PEAK_GFLOPS_FP16*100, me_3p);
+                    }
+
+                    /* ── Online softmax NOEPI (no max-find pass) ── */
+                    {
+                        timing_t best_onl = {1e30, 1e30, 1e30};
+                        for (int r = 0; r < nrep; r++) {
+                            timing_t cur;
+                            memset(O16, 0, sz_O16);
+                            run_online_fp16_noepi(S, M_max, Vp16, O16, d_outk, MRk, L, d_outk,
+                                                   NRk, Kc16, nt,
+                                                   fk->init, fk->accum, &cur);
+                            if (r >= warmup) {
+                                double tot = cur.pass1 + cur.pass2 + cur.norm;
+                                double btot = best_onl.pass1 + best_onl.pass2 + best_onl.norm;
+                                if (tot < btot) best_onl = cur;
+                            }
+                        }
+                        double me_onl = max_error_fp16(O16, d_outk, Or, MRk, d);
+                        double total_onl = best_onl.pass1 + best_onl.pass2 + best_onl.norm;
+                        double gf_onl = flops / total_onl / 1e9;
+
+                        printf("onl_%-2s %3d %6d | %8.1f %8.1f %8.1f %8.1f | %7.1f %5.1f%% | %7.1f %5.1f%% | %.2e  (online)\n",
+                               fk->name + 3, Kc16, L,
+                               best_onl.pass1*1e6, best_onl.pass2*1e6, best_onl.norm*1e6,
+                               total_onl*1e6, gf_onl, gf_onl/PEAK_GFLOPS_FP16*100,
+                               gf_gmm_ne, gf_gmm_ne/PEAK_GFLOPS_FP16*100, me_onl);
+                    }
 
                     /* ── fp32-C SWP reference for comparison ── */
                     {
