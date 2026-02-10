@@ -908,6 +908,1152 @@ void layernorm_bwd_f32(const float *dy, const float *x, float *dx,
 
 
 /* ════════════════════════════════════════════════════════════════
+ * INT8 quantization helper
+ *
+ * Quantize FP32 vector to INT8 and store bottom byte:
+ *   scaled = round(v * vscale)
+ *   clamped = clamp(scaled, -127, 127)
+ *   store bottom byte
+ * ════════════════════════════════════════════════════════════════ */
+
+static inline void svst1_quant_f32_s8(svbool_t pg, int8_t *ptr,
+                                       svfloat32_t v, svfloat32_t vscale) {
+    svfloat32_t scaled = svmul_f32_x(pg, v, vscale);
+    scaled = svrintn_f32_x(pg, scaled);
+    svint32_t si = svcvt_s32_f32_x(pg, scaled);
+    si = svmax_s32_x(pg, si, svdup_s32(-127));
+    si = svmin_s32_x(pg, si, svdup_s32(127));
+    svst1b_s32(pg, ptr, si);
+}
+
+/* ── FP32 → FP16 store (already defined above as svst1_cvt_f32_f16) ── */
+
+
+/* ════════════════════════════════════════════════════════════════
+ * RMSNorm FP32 → INT8 (3-pass)
+ *
+ * Pass 1: sum_sq = sum(x[i]^2), compute inv_rms
+ * Pass 2: norm[i] = gamma[i] * x[i] * inv_rms, track absmax
+ * Pass 3: quantize norm[i] to INT8 and store
+ * Returns: scale = absmax / 127.0f
+ * ════════════════════════════════════════════════════════════════ */
+
+float rmsnorm_fwd_f32_int8(const float *x, int8_t *y, const float *gamma,
+                           float eps, int N) {
+    const int VL = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    const int N8 = N & ~(8 * VL - 1);
+    const int N1 = N & ~(VL - 1);
+
+    /* ── Pass 1: sum(x^2), 8x unrolled ── */
+    svfloat32_t sq0 = svdup_f32(0.0f), sq1 = sq0, sq2 = sq0, sq3 = sq0;
+    svfloat32_t sq4 = sq0, sq5 = sq0, sq6 = sq0, sq7 = sq0;
+
+    int i = 0;
+    for (; i < N8; i += 8 * VL) {
+        prefetch_l1(x + i, PF_DIST_BYTES);
+        prefetch_l1(x + i, PF_DIST_BYTES + 256);
+        svfloat32_t v0 = svld1_f32(pg, x + i + 0 * VL);
+        svfloat32_t v1 = svld1_f32(pg, x + i + 1 * VL);
+        svfloat32_t v2 = svld1_f32(pg, x + i + 2 * VL);
+        svfloat32_t v3 = svld1_f32(pg, x + i + 3 * VL);
+        svfloat32_t v4 = svld1_f32(pg, x + i + 4 * VL);
+        svfloat32_t v5 = svld1_f32(pg, x + i + 5 * VL);
+        svfloat32_t v6 = svld1_f32(pg, x + i + 6 * VL);
+        svfloat32_t v7 = svld1_f32(pg, x + i + 7 * VL);
+        sq0 = svmla_f32_x(pg, sq0, v0, v0);
+        sq1 = svmla_f32_x(pg, sq1, v1, v1);
+        sq2 = svmla_f32_x(pg, sq2, v2, v2);
+        sq3 = svmla_f32_x(pg, sq3, v3, v3);
+        sq4 = svmla_f32_x(pg, sq4, v4, v4);
+        sq5 = svmla_f32_x(pg, sq5, v5, v5);
+        sq6 = svmla_f32_x(pg, sq6, v6, v6);
+        sq7 = svmla_f32_x(pg, sq7, v7, v7);
+    }
+    for (; i < N1; i += VL) {
+        svfloat32_t v = svld1_f32(pg, x + i);
+        sq0 = svmla_f32_x(pg, sq0, v, v);
+    }
+    if (N1 < N) {
+        svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+        svfloat32_t v = svld1_f32(ptail, x + N1);
+        sq0 = svmla_f32_m(ptail, sq0, v, v);
+    }
+
+    sq0 = svadd_f32_x(pg, sq0, sq1); sq2 = svadd_f32_x(pg, sq2, sq3);
+    sq4 = svadd_f32_x(pg, sq4, sq5); sq6 = svadd_f32_x(pg, sq6, sq7);
+    sq0 = svadd_f32_x(pg, sq0, sq2); sq4 = svadd_f32_x(pg, sq4, sq6);
+    float sum_sq = hsum_f32(pg, svadd_f32_x(pg, sq0, sq4));
+
+    float var = sum_sq / (float)N + eps;
+    svfloat32_t vinv_rms = sve_rsqrt_f32(pg, svdup_f32(var));
+    float ibuf[16] __attribute__((aligned(256)));
+    svst1_f32(pg, ibuf, vinv_rms);
+    float inv_rms = ibuf[0];
+    svfloat32_t vinv = svdup_f32(inv_rms);
+
+    /* ── Pass 2: norm[i] = gamma[i]*x[i]*inv_rms, track absmax ── */
+    svfloat32_t am0 = svdup_f32(0.0f), am1 = am0, am2 = am0, am3 = am0;
+    svfloat32_t am4 = am0, am5 = am0, am6 = am0, am7 = am0;
+
+    i = 0;
+    if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            svfloat32_t n0 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 0*VL), vinv), svld1_f32(pg, gamma + i + 0*VL));
+            svfloat32_t n1 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 1*VL), vinv), svld1_f32(pg, gamma + i + 1*VL));
+            svfloat32_t n2 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 2*VL), vinv), svld1_f32(pg, gamma + i + 2*VL));
+            svfloat32_t n3 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 3*VL), vinv), svld1_f32(pg, gamma + i + 3*VL));
+            svfloat32_t n4 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 4*VL), vinv), svld1_f32(pg, gamma + i + 4*VL));
+            svfloat32_t n5 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 5*VL), vinv), svld1_f32(pg, gamma + i + 5*VL));
+            svfloat32_t n6 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 6*VL), vinv), svld1_f32(pg, gamma + i + 6*VL));
+            svfloat32_t n7 = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + 7*VL), vinv), svld1_f32(pg, gamma + i + 7*VL));
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n0));
+            am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n1));
+            am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n2));
+            am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n3));
+            am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n4));
+            am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n5));
+            am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n6));
+            am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n7));
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i), vinv), svld1_f32(pg, gamma + i));
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(ptail, x + N1), vinv), svld1_f32(ptail, gamma + N1));
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            svfloat32_t n0 = svmul_f32_x(pg, svld1_f32(pg, x + i + 0*VL), vinv);
+            svfloat32_t n1 = svmul_f32_x(pg, svld1_f32(pg, x + i + 1*VL), vinv);
+            svfloat32_t n2 = svmul_f32_x(pg, svld1_f32(pg, x + i + 2*VL), vinv);
+            svfloat32_t n3 = svmul_f32_x(pg, svld1_f32(pg, x + i + 3*VL), vinv);
+            svfloat32_t n4 = svmul_f32_x(pg, svld1_f32(pg, x + i + 4*VL), vinv);
+            svfloat32_t n5 = svmul_f32_x(pg, svld1_f32(pg, x + i + 5*VL), vinv);
+            svfloat32_t n6 = svmul_f32_x(pg, svld1_f32(pg, x + i + 6*VL), vinv);
+            svfloat32_t n7 = svmul_f32_x(pg, svld1_f32(pg, x + i + 7*VL), vinv);
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n0));
+            am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n1));
+            am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n2));
+            am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n3));
+            am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n4));
+            am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n5));
+            am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n6));
+            am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n7));
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svld1_f32(pg, x + i), vinv);
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svld1_f32(ptail, x + N1), vinv);
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    }
+
+    /* Tree reduce absmax 8→1 */
+    am0 = svmax_f32_x(pg, am0, am1); am2 = svmax_f32_x(pg, am2, am3);
+    am4 = svmax_f32_x(pg, am4, am5); am6 = svmax_f32_x(pg, am6, am7);
+    am0 = svmax_f32_x(pg, am0, am2); am4 = svmax_f32_x(pg, am4, am6);
+    am0 = svmax_f32_x(pg, am0, am4);
+    float absmax = svmaxv_f32(pg, am0);
+
+    /* Handle absmax==0 (all-zero input) */
+    if (absmax == 0.0f) {
+        memset(y, 0, (size_t)N);
+        return 1.0f;
+    }
+
+    float qscale = 127.0f / absmax;
+    svfloat32_t vqscale = svdup_f32(qscale);
+
+    /* ── Pass 3: quantize and store INT8 ── */
+    i = 0;
+    if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i + u*VL), vinv), svld1_f32(pg, gamma + i + u*VL));
+                svst1_quant_f32_s8(pg, y + i + u*VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(pg, x + i), vinv), svld1_f32(pg, gamma + i));
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_f32(ptail, x + N1), vinv), svld1_f32(ptail, gamma + N1));
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t n = svmul_f32_x(pg, svld1_f32(pg, x + i + u*VL), vinv);
+                svst1_quant_f32_s8(pg, y + i + u*VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svld1_f32(pg, x + i), vinv);
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svld1_f32(ptail, x + N1), vinv);
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    }
+
+    return absmax / 127.0f;
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+ * LayerNorm FP32 → INT8 (3-pass)
+ *
+ * Pass 1: sum(x) + sum(x^2), compute mean, inv_std
+ * Pass 2: norm[i] = gamma[i]*(x[i]-mean)*inv_std + beta[i], track absmax
+ * Pass 3: quantize to INT8
+ * ════════════════════════════════════════════════════════════════ */
+
+float layernorm_fwd_f32_int8(const float *x, int8_t *y, const float *gamma,
+                             const float *beta, float eps, int N) {
+    const int VL = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    const int N8 = N & ~(8 * VL - 1);
+    const int N1 = N & ~(VL - 1);
+
+    /* ── Pass 1: sum(x) and sum(x^2), 8x unrolled ── */
+    svfloat32_t s0 = svdup_f32(0.0f), s1 = s0, s2 = s0, s3 = s0;
+    svfloat32_t s4 = s0, s5 = s0, s6 = s0, s7 = s0;
+    svfloat32_t q0 = svdup_f32(0.0f), q1 = q0, q2 = q0, q3 = q0;
+    svfloat32_t q4 = q0, q5 = q0, q6 = q0, q7 = q0;
+
+    int i = 0;
+    for (; i < N8; i += 8 * VL) {
+        prefetch_l1(x + i, PF_DIST_BYTES);
+        prefetch_l1(x + i, PF_DIST_BYTES + 256);
+        svfloat32_t v0 = svld1_f32(pg, x + i + 0 * VL);
+        svfloat32_t v1 = svld1_f32(pg, x + i + 1 * VL);
+        svfloat32_t v2 = svld1_f32(pg, x + i + 2 * VL);
+        svfloat32_t v3 = svld1_f32(pg, x + i + 3 * VL);
+        svfloat32_t v4 = svld1_f32(pg, x + i + 4 * VL);
+        svfloat32_t v5 = svld1_f32(pg, x + i + 5 * VL);
+        svfloat32_t v6 = svld1_f32(pg, x + i + 6 * VL);
+        svfloat32_t v7 = svld1_f32(pg, x + i + 7 * VL);
+        s0 = svadd_f32_x(pg, s0, v0); q0 = svmla_f32_x(pg, q0, v0, v0);
+        s1 = svadd_f32_x(pg, s1, v1); q1 = svmla_f32_x(pg, q1, v1, v1);
+        s2 = svadd_f32_x(pg, s2, v2); q2 = svmla_f32_x(pg, q2, v2, v2);
+        s3 = svadd_f32_x(pg, s3, v3); q3 = svmla_f32_x(pg, q3, v3, v3);
+        s4 = svadd_f32_x(pg, s4, v4); q4 = svmla_f32_x(pg, q4, v4, v4);
+        s5 = svadd_f32_x(pg, s5, v5); q5 = svmla_f32_x(pg, q5, v5, v5);
+        s6 = svadd_f32_x(pg, s6, v6); q6 = svmla_f32_x(pg, q6, v6, v6);
+        s7 = svadd_f32_x(pg, s7, v7); q7 = svmla_f32_x(pg, q7, v7, v7);
+    }
+    for (; i < N1; i += VL) {
+        svfloat32_t v = svld1_f32(pg, x + i);
+        s0 = svadd_f32_x(pg, s0, v);
+        q0 = svmla_f32_x(pg, q0, v, v);
+    }
+    if (N1 < N) {
+        svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+        svfloat32_t v = svld1_f32(ptail, x + N1);
+        s0 = svadd_f32_m(ptail, s0, v);
+        q0 = svmla_f32_m(ptail, q0, v, v);
+    }
+
+    s0 = svadd_f32_x(pg, s0, s1); s2 = svadd_f32_x(pg, s2, s3);
+    s4 = svadd_f32_x(pg, s4, s5); s6 = svadd_f32_x(pg, s6, s7);
+    s0 = svadd_f32_x(pg, s0, s2); s4 = svadd_f32_x(pg, s4, s6);
+    float sum = hsum_f32(pg, svadd_f32_x(pg, s0, s4));
+
+    q0 = svadd_f32_x(pg, q0, q1); q2 = svadd_f32_x(pg, q2, q3);
+    q4 = svadd_f32_x(pg, q4, q5); q6 = svadd_f32_x(pg, q6, q7);
+    q0 = svadd_f32_x(pg, q0, q2); q4 = svadd_f32_x(pg, q4, q6);
+    float sum_sq = hsum_f32(pg, svadd_f32_x(pg, q0, q4));
+
+    float mean = sum / (float)N;
+    float var = sum_sq / (float)N - mean * mean;
+    float inv_std_val;
+    {
+        svfloat32_t vv = svdup_f32(var + eps);
+        svfloat32_t vr = sve_rsqrt_f32(pg, vv);
+        float rbuf[16] __attribute__((aligned(256)));
+        svst1_f32(pg, rbuf, vr);
+        inv_std_val = rbuf[0];
+    }
+    svfloat32_t vmean = svdup_f32(mean);
+    svfloat32_t vinv_std = svdup_f32(inv_std_val);
+
+    /* ── Pass 2: norm + absmax tracking ── */
+    svfloat32_t am0 = svdup_f32(0.0f), am1 = am0, am2 = am0, am3 = am0;
+    svfloat32_t am4 = am0, am5 = am0, am6 = am0, am7 = am0;
+
+    i = 0;
+    if (gamma && beta) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u * VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t g = svld1_f32(pg, gamma + i + u * VL);
+                svfloat32_t b = svld1_f32(pg, beta + i + u * VL);
+                svfloat32_t n = svmla_f32_x(pg, b, xhat, g);
+                svfloat32_t *am;
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i), xhat, svld1_f32(pg, gamma + i));
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(ptail, beta + N1), xhat, svld1_f32(ptail, gamma + N1));
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    } else if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u * VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i + u * VL));
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i));
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(ptail, gamma + N1));
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u * VL);
+                svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    }
+
+    am0 = svmax_f32_x(pg, am0, am1); am2 = svmax_f32_x(pg, am2, am3);
+    am4 = svmax_f32_x(pg, am4, am5); am6 = svmax_f32_x(pg, am6, am7);
+    am0 = svmax_f32_x(pg, am0, am2); am4 = svmax_f32_x(pg, am4, am6);
+    am0 = svmax_f32_x(pg, am0, am4);
+    float absmax = svmaxv_f32(pg, am0);
+
+    if (absmax == 0.0f) {
+        memset(y, 0, (size_t)N);
+        return 1.0f;
+    }
+
+    float qscale = 127.0f / absmax;
+    svfloat32_t vqscale = svdup_f32(qscale);
+
+    /* ── Pass 3: re-compute norm and quantize ── */
+    i = 0;
+    if (gamma && beta) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u * VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i + u * VL), xhat, svld1_f32(pg, gamma + i + u * VL));
+                svst1_quant_f32_s8(pg, y + i + u * VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i), xhat, svld1_f32(pg, gamma + i));
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(ptail, beta + N1), xhat, svld1_f32(ptail, gamma + N1));
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    } else if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u * VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i + u * VL));
+                svst1_quant_f32_s8(pg, y + i + u * VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i));
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(ptail, gamma + N1));
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u * VL);
+                svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svst1_quant_f32_s8(pg, y + i + u * VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    }
+
+    return absmax / 127.0f;
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+ * RMSNorm FP16 → INT8 (3-pass)
+ * ════════════════════════════════════════════════════════════════ */
+
+float rmsnorm_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                           const float *gamma, float eps, int N) {
+    set_fpcr_fz16();
+
+    const int VL = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    const int N8 = N & ~(8 * VL - 1);
+    const int N1 = N & ~(VL - 1);
+
+    /* ── Pass 1: sum(x^2) ── */
+    svfloat32_t sq0 = svdup_f32(0.0f), sq1 = sq0, sq2 = sq0, sq3 = sq0;
+    svfloat32_t sq4 = sq0, sq5 = sq0, sq6 = sq0, sq7 = sq0;
+
+    int i = 0;
+    for (; i < N8; i += 8 * VL) {
+        prefetch_l1(x_f16 + i, PF_DIST_BYTES);
+        svfloat32_t v0 = svld1_cvt_f16_f32(pg, x_f16 + i + 0*VL);
+        svfloat32_t v1 = svld1_cvt_f16_f32(pg, x_f16 + i + 1*VL);
+        svfloat32_t v2 = svld1_cvt_f16_f32(pg, x_f16 + i + 2*VL);
+        svfloat32_t v3 = svld1_cvt_f16_f32(pg, x_f16 + i + 3*VL);
+        svfloat32_t v4 = svld1_cvt_f16_f32(pg, x_f16 + i + 4*VL);
+        svfloat32_t v5 = svld1_cvt_f16_f32(pg, x_f16 + i + 5*VL);
+        svfloat32_t v6 = svld1_cvt_f16_f32(pg, x_f16 + i + 6*VL);
+        svfloat32_t v7 = svld1_cvt_f16_f32(pg, x_f16 + i + 7*VL);
+        sq0 = svmla_f32_x(pg, sq0, v0, v0); sq1 = svmla_f32_x(pg, sq1, v1, v1);
+        sq2 = svmla_f32_x(pg, sq2, v2, v2); sq3 = svmla_f32_x(pg, sq3, v3, v3);
+        sq4 = svmla_f32_x(pg, sq4, v4, v4); sq5 = svmla_f32_x(pg, sq5, v5, v5);
+        sq6 = svmla_f32_x(pg, sq6, v6, v6); sq7 = svmla_f32_x(pg, sq7, v7, v7);
+    }
+    for (; i < N1; i += VL) {
+        svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+        sq0 = svmla_f32_x(pg, sq0, v, v);
+    }
+    if (N1 < N) {
+        svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+        svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+        sq0 = svmla_f32_m(ptail, sq0, v, v);
+    }
+
+    sq0 = svadd_f32_x(pg, sq0, sq1); sq2 = svadd_f32_x(pg, sq2, sq3);
+    sq4 = svadd_f32_x(pg, sq4, sq5); sq6 = svadd_f32_x(pg, sq6, sq7);
+    sq0 = svadd_f32_x(pg, sq0, sq2); sq4 = svadd_f32_x(pg, sq4, sq6);
+    float sum_sq = hsum_f32(pg, svadd_f32_x(pg, sq0, sq4));
+
+    float var = sum_sq / (float)N + eps;
+    svfloat32_t vinv_rms = sve_rsqrt_f32(pg, svdup_f32(var));
+    float ibuf[16] __attribute__((aligned(256)));
+    svst1_f32(pg, ibuf, vinv_rms);
+    svfloat32_t vinv = svdup_f32(ibuf[0]);
+
+    /* ── Pass 2: norm + absmax ── */
+    svfloat32_t am0 = svdup_f32(0.0f), am1 = am0, am2 = am0, am3 = am0;
+    svfloat32_t am4 = am0, am5 = am0, am6 = am0, am7 = am0;
+
+    i = 0;
+    if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x_f16 + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i + u*VL), vinv), svld1_f32(pg, gamma + i + u*VL));
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i), vinv), svld1_f32(pg, gamma + i));
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_cvt_f16_f32(ptail, x_f16 + N1), vinv), svld1_f32(ptail, gamma + N1));
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x_f16 + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t n = svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i + u*VL), vinv);
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i), vinv);
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svld1_cvt_f16_f32(ptail, x_f16 + N1), vinv);
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    }
+
+    am0 = svmax_f32_x(pg, am0, am1); am2 = svmax_f32_x(pg, am2, am3);
+    am4 = svmax_f32_x(pg, am4, am5); am6 = svmax_f32_x(pg, am6, am7);
+    am0 = svmax_f32_x(pg, am0, am2); am4 = svmax_f32_x(pg, am4, am6);
+    float absmax = svmaxv_f32(pg, svmax_f32_x(pg, am0, am4));
+
+    if (absmax == 0.0f) { memset(y, 0, (size_t)N); return 1.0f; }
+
+    float qscale = 127.0f / absmax;
+    svfloat32_t vqscale = svdup_f32(qscale);
+
+    /* ── Pass 3: quantize ── */
+    i = 0;
+    if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i + u*VL), vinv), svld1_f32(pg, gamma + i + u*VL));
+                svst1_quant_f32_s8(pg, y + i + u*VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i), vinv), svld1_f32(pg, gamma + i));
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svmul_f32_x(pg, svld1_cvt_f16_f32(ptail, x_f16 + N1), vinv), svld1_f32(ptail, gamma + N1));
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t n = svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i + u*VL), vinv);
+                svst1_quant_f32_s8(pg, y + i + u*VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t n = svmul_f32_x(pg, svld1_cvt_f16_f32(pg, x_f16 + i), vinv);
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t n = svmul_f32_x(pg, svld1_cvt_f16_f32(ptail, x_f16 + N1), vinv);
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    }
+
+    return absmax / 127.0f;
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+ * LayerNorm FP16 → INT8 (3-pass)
+ * ════════════════════════════════════════════════════════════════ */
+
+float layernorm_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                             const float *gamma, const float *beta,
+                             float eps, int N) {
+    set_fpcr_fz16();
+
+    const int VL = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    const int N8 = N & ~(8 * VL - 1);
+    const int N1 = N & ~(VL - 1);
+
+    /* ── Pass 1: sum(x) + sum(x^2) ── */
+    svfloat32_t s0 = svdup_f32(0.0f), s1 = s0, s2 = s0, s3 = s0;
+    svfloat32_t s4 = s0, s5 = s0, s6 = s0, s7 = s0;
+    svfloat32_t q0 = svdup_f32(0.0f), q1 = q0, q2 = q0, q3 = q0;
+    svfloat32_t q4 = q0, q5 = q0, q6 = q0, q7 = q0;
+
+    int i = 0;
+    for (; i < N8; i += 8 * VL) {
+        prefetch_l1(x_f16 + i, PF_DIST_BYTES);
+        svfloat32_t v0 = svld1_cvt_f16_f32(pg, x_f16 + i + 0*VL);
+        svfloat32_t v1 = svld1_cvt_f16_f32(pg, x_f16 + i + 1*VL);
+        svfloat32_t v2 = svld1_cvt_f16_f32(pg, x_f16 + i + 2*VL);
+        svfloat32_t v3 = svld1_cvt_f16_f32(pg, x_f16 + i + 3*VL);
+        svfloat32_t v4 = svld1_cvt_f16_f32(pg, x_f16 + i + 4*VL);
+        svfloat32_t v5 = svld1_cvt_f16_f32(pg, x_f16 + i + 5*VL);
+        svfloat32_t v6 = svld1_cvt_f16_f32(pg, x_f16 + i + 6*VL);
+        svfloat32_t v7 = svld1_cvt_f16_f32(pg, x_f16 + i + 7*VL);
+        s0 = svadd_f32_x(pg, s0, v0); q0 = svmla_f32_x(pg, q0, v0, v0);
+        s1 = svadd_f32_x(pg, s1, v1); q1 = svmla_f32_x(pg, q1, v1, v1);
+        s2 = svadd_f32_x(pg, s2, v2); q2 = svmla_f32_x(pg, q2, v2, v2);
+        s3 = svadd_f32_x(pg, s3, v3); q3 = svmla_f32_x(pg, q3, v3, v3);
+        s4 = svadd_f32_x(pg, s4, v4); q4 = svmla_f32_x(pg, q4, v4, v4);
+        s5 = svadd_f32_x(pg, s5, v5); q5 = svmla_f32_x(pg, q5, v5, v5);
+        s6 = svadd_f32_x(pg, s6, v6); q6 = svmla_f32_x(pg, q6, v6, v6);
+        s7 = svadd_f32_x(pg, s7, v7); q7 = svmla_f32_x(pg, q7, v7, v7);
+    }
+    for (; i < N1; i += VL) {
+        svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+        s0 = svadd_f32_x(pg, s0, v);
+        q0 = svmla_f32_x(pg, q0, v, v);
+    }
+    if (N1 < N) {
+        svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+        svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+        s0 = svadd_f32_m(ptail, s0, v);
+        q0 = svmla_f32_m(ptail, q0, v, v);
+    }
+
+    s0 = svadd_f32_x(pg, s0, s1); s2 = svadd_f32_x(pg, s2, s3);
+    s4 = svadd_f32_x(pg, s4, s5); s6 = svadd_f32_x(pg, s6, s7);
+    s0 = svadd_f32_x(pg, s0, s2); s4 = svadd_f32_x(pg, s4, s6);
+    float sum = hsum_f32(pg, svadd_f32_x(pg, s0, s4));
+
+    q0 = svadd_f32_x(pg, q0, q1); q2 = svadd_f32_x(pg, q2, q3);
+    q4 = svadd_f32_x(pg, q4, q5); q6 = svadd_f32_x(pg, q6, q7);
+    q0 = svadd_f32_x(pg, q0, q2); q4 = svadd_f32_x(pg, q4, q6);
+    float sum_sq = hsum_f32(pg, svadd_f32_x(pg, q0, q4));
+
+    float mean = sum / (float)N;
+    float var = sum_sq / (float)N - mean * mean;
+    float inv_std_val;
+    {
+        svfloat32_t vv = svdup_f32(var + eps);
+        svfloat32_t vr = sve_rsqrt_f32(pg, vv);
+        float rbuf[16] __attribute__((aligned(256)));
+        svst1_f32(pg, rbuf, vr);
+        inv_std_val = rbuf[0];
+    }
+    svfloat32_t vmean = svdup_f32(mean);
+    svfloat32_t vinv_std = svdup_f32(inv_std_val);
+
+    /* ── Pass 2: norm + absmax ── */
+    svfloat32_t am0 = svdup_f32(0.0f), am1 = am0, am2 = am0, am3 = am0;
+    svfloat32_t am4 = am0, am5 = am0, am6 = am0, am7 = am0;
+
+    i = 0;
+    if (gamma && beta) {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i + u*VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i + u*VL), xhat, svld1_f32(pg, gamma + i + u*VL));
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i), xhat, svld1_f32(pg, gamma + i));
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(ptail, beta + N1), xhat, svld1_f32(ptail, gamma + N1));
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    } else if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i + u*VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i + u*VL));
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i));
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(ptail, gamma + N1));
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i + u*VL);
+                svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                switch (u) {
+                    case 0: am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n)); break;
+                    case 1: am1 = svmax_f32_x(pg, am1, svabs_f32_x(pg, n)); break;
+                    case 2: am2 = svmax_f32_x(pg, am2, svabs_f32_x(pg, n)); break;
+                    case 3: am3 = svmax_f32_x(pg, am3, svabs_f32_x(pg, n)); break;
+                    case 4: am4 = svmax_f32_x(pg, am4, svabs_f32_x(pg, n)); break;
+                    case 5: am5 = svmax_f32_x(pg, am5, svabs_f32_x(pg, n)); break;
+                    case 6: am6 = svmax_f32_x(pg, am6, svabs_f32_x(pg, n)); break;
+                    case 7: am7 = svmax_f32_x(pg, am7, svabs_f32_x(pg, n)); break;
+                }
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            am0 = svmax_f32_x(pg, am0, svabs_f32_x(pg, n));
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            am0 = svmax_f32_m(ptail, am0, svabs_f32_x(pg, n));
+        }
+    }
+
+    am0 = svmax_f32_x(pg, am0, am1); am2 = svmax_f32_x(pg, am2, am3);
+    am4 = svmax_f32_x(pg, am4, am5); am6 = svmax_f32_x(pg, am6, am7);
+    am0 = svmax_f32_x(pg, am0, am2); am4 = svmax_f32_x(pg, am4, am6);
+    float absmax = svmaxv_f32(pg, svmax_f32_x(pg, am0, am4));
+
+    if (absmax == 0.0f) { memset(y, 0, (size_t)N); return 1.0f; }
+
+    float qscale = 127.0f / absmax;
+    svfloat32_t vqscale = svdup_f32(qscale);
+
+    /* ── Pass 3: quantize ── */
+    i = 0;
+    if (gamma && beta) {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i + u*VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i + u*VL), xhat, svld1_f32(pg, gamma + i + u*VL));
+                svst1_quant_f32_s8(pg, y + i + u*VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i), xhat, svld1_f32(pg, gamma + i));
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(ptail, beta + N1), xhat, svld1_f32(ptail, gamma + N1));
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    } else if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i + u*VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i + u*VL));
+                svst1_quant_f32_s8(pg, y + i + u*VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i));
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(ptail, gamma + N1));
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i + u*VL);
+                svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svst1_quant_f32_s8(pg, y + i + u*VL, n, vqscale);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_cvt_f16_f32(pg, x_f16 + i);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svst1_quant_f32_s8(pg, y + i, n, vqscale);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_cvt_f16_f32(ptail, x_f16 + N1);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svst1_quant_f32_s8(ptail, y + N1, n, vqscale);
+        }
+    }
+
+    return absmax / 127.0f;
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+ * RMSNorm FP32 → FP16 (2-pass)
+ *
+ * Same as rmsnorm_fwd_f32 but output stored as FP16.
+ * ════════════════════════════════════════════════════════════════ */
+
+void rmsnorm_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                         const float *gamma, float eps, int N) {
+    const int VL = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    const int N8 = N & ~(8 * VL - 1);
+    const int N1 = N & ~(VL - 1);
+
+    /* ── Pass 1: sum(x^2) ── */
+    svfloat32_t sq0 = svdup_f32(0.0f), sq1 = sq0, sq2 = sq0, sq3 = sq0;
+    svfloat32_t sq4 = sq0, sq5 = sq0, sq6 = sq0, sq7 = sq0;
+
+    int i = 0;
+    for (; i < N8; i += 8 * VL) {
+        prefetch_l1(x + i, PF_DIST_BYTES);
+        prefetch_l1(x + i, PF_DIST_BYTES + 256);
+        svfloat32_t v0 = svld1_f32(pg, x + i + 0*VL);
+        svfloat32_t v1 = svld1_f32(pg, x + i + 1*VL);
+        svfloat32_t v2 = svld1_f32(pg, x + i + 2*VL);
+        svfloat32_t v3 = svld1_f32(pg, x + i + 3*VL);
+        svfloat32_t v4 = svld1_f32(pg, x + i + 4*VL);
+        svfloat32_t v5 = svld1_f32(pg, x + i + 5*VL);
+        svfloat32_t v6 = svld1_f32(pg, x + i + 6*VL);
+        svfloat32_t v7 = svld1_f32(pg, x + i + 7*VL);
+        sq0 = svmla_f32_x(pg, sq0, v0, v0); sq1 = svmla_f32_x(pg, sq1, v1, v1);
+        sq2 = svmla_f32_x(pg, sq2, v2, v2); sq3 = svmla_f32_x(pg, sq3, v3, v3);
+        sq4 = svmla_f32_x(pg, sq4, v4, v4); sq5 = svmla_f32_x(pg, sq5, v5, v5);
+        sq6 = svmla_f32_x(pg, sq6, v6, v6); sq7 = svmla_f32_x(pg, sq7, v7, v7);
+    }
+    for (; i < N1; i += VL) {
+        svfloat32_t v = svld1_f32(pg, x + i);
+        sq0 = svmla_f32_x(pg, sq0, v, v);
+    }
+    if (N1 < N) {
+        svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+        svfloat32_t v = svld1_f32(ptail, x + N1);
+        sq0 = svmla_f32_m(ptail, sq0, v, v);
+    }
+
+    sq0 = svadd_f32_x(pg, sq0, sq1); sq2 = svadd_f32_x(pg, sq2, sq3);
+    sq4 = svadd_f32_x(pg, sq4, sq5); sq6 = svadd_f32_x(pg, sq6, sq7);
+    sq0 = svadd_f32_x(pg, sq0, sq2); sq4 = svadd_f32_x(pg, sq4, sq6);
+    float sum_sq = hsum_f32(pg, svadd_f32_x(pg, sq0, sq4));
+
+    float var = sum_sq / (float)N + eps;
+    svfloat32_t vinv_rms = sve_rsqrt_f32(pg, svdup_f32(var));
+    float ibuf[16] __attribute__((aligned(256)));
+    svst1_f32(pg, ibuf, vinv_rms);
+    svfloat32_t vinv = svdup_f32(ibuf[0]);
+
+    /* ── Pass 2: y = gamma * x * inv_rms, store as FP16 ── */
+    i = 0;
+    if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svmul_f32_x(pg, svld1_f32(pg, x + i + u*VL), vinv);
+                v = svmul_f32_x(pg, v, svld1_f32(pg, gamma + i + u*VL));
+                svst1_cvt_f32_f16(pg, y_f16 + i + u*VL, v);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svmul_f32_x(pg, svld1_f32(pg, x + i), vinv);
+            v = svmul_f32_x(pg, v, svld1_f32(pg, gamma + i));
+            svst1_cvt_f32_f16(pg, y_f16 + i, v);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svmul_f32_x(pg, svld1_f32(ptail, x + N1), vinv);
+            v = svmul_f32_x(pg, v, svld1_f32(ptail, gamma + N1));
+            svst1_cvt_f32_f16(ptail, y_f16 + N1, v);
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svmul_f32_x(pg, svld1_f32(pg, x + i + u*VL), vinv);
+                svst1_cvt_f32_f16(pg, y_f16 + i + u*VL, v);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svmul_f32_x(pg, svld1_f32(pg, x + i), vinv);
+            svst1_cvt_f32_f16(pg, y_f16 + i, v);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svmul_f32_x(pg, svld1_f32(ptail, x + N1), vinv);
+            svst1_cvt_f32_f16(ptail, y_f16 + N1, v);
+        }
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+ * LayerNorm FP32 → FP16 (2-pass)
+ * ════════════════════════════════════════════════════════════════ */
+
+void layernorm_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                           const float *gamma, const float *beta,
+                           float eps, int N) {
+    const int VL = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    const int N8 = N & ~(8 * VL - 1);
+    const int N1 = N & ~(VL - 1);
+
+    /* ── Pass 1: sum(x) + sum(x^2) ── */
+    svfloat32_t s0 = svdup_f32(0.0f), s1 = s0, s2 = s0, s3 = s0;
+    svfloat32_t s4 = s0, s5 = s0, s6 = s0, s7 = s0;
+    svfloat32_t q0 = svdup_f32(0.0f), q1 = q0, q2 = q0, q3 = q0;
+    svfloat32_t q4 = q0, q5 = q0, q6 = q0, q7 = q0;
+
+    int i = 0;
+    for (; i < N8; i += 8 * VL) {
+        prefetch_l1(x + i, PF_DIST_BYTES);
+        prefetch_l1(x + i, PF_DIST_BYTES + 256);
+        svfloat32_t v0 = svld1_f32(pg, x + i + 0*VL);
+        svfloat32_t v1 = svld1_f32(pg, x + i + 1*VL);
+        svfloat32_t v2 = svld1_f32(pg, x + i + 2*VL);
+        svfloat32_t v3 = svld1_f32(pg, x + i + 3*VL);
+        svfloat32_t v4 = svld1_f32(pg, x + i + 4*VL);
+        svfloat32_t v5 = svld1_f32(pg, x + i + 5*VL);
+        svfloat32_t v6 = svld1_f32(pg, x + i + 6*VL);
+        svfloat32_t v7 = svld1_f32(pg, x + i + 7*VL);
+        s0 = svadd_f32_x(pg, s0, v0); q0 = svmla_f32_x(pg, q0, v0, v0);
+        s1 = svadd_f32_x(pg, s1, v1); q1 = svmla_f32_x(pg, q1, v1, v1);
+        s2 = svadd_f32_x(pg, s2, v2); q2 = svmla_f32_x(pg, q2, v2, v2);
+        s3 = svadd_f32_x(pg, s3, v3); q3 = svmla_f32_x(pg, q3, v3, v3);
+        s4 = svadd_f32_x(pg, s4, v4); q4 = svmla_f32_x(pg, q4, v4, v4);
+        s5 = svadd_f32_x(pg, s5, v5); q5 = svmla_f32_x(pg, q5, v5, v5);
+        s6 = svadd_f32_x(pg, s6, v6); q6 = svmla_f32_x(pg, q6, v6, v6);
+        s7 = svadd_f32_x(pg, s7, v7); q7 = svmla_f32_x(pg, q7, v7, v7);
+    }
+    for (; i < N1; i += VL) {
+        svfloat32_t v = svld1_f32(pg, x + i);
+        s0 = svadd_f32_x(pg, s0, v);
+        q0 = svmla_f32_x(pg, q0, v, v);
+    }
+    if (N1 < N) {
+        svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+        svfloat32_t v = svld1_f32(ptail, x + N1);
+        s0 = svadd_f32_m(ptail, s0, v);
+        q0 = svmla_f32_m(ptail, q0, v, v);
+    }
+
+    s0 = svadd_f32_x(pg, s0, s1); s2 = svadd_f32_x(pg, s2, s3);
+    s4 = svadd_f32_x(pg, s4, s5); s6 = svadd_f32_x(pg, s6, s7);
+    s0 = svadd_f32_x(pg, s0, s2); s4 = svadd_f32_x(pg, s4, s6);
+    float sum = hsum_f32(pg, svadd_f32_x(pg, s0, s4));
+
+    q0 = svadd_f32_x(pg, q0, q1); q2 = svadd_f32_x(pg, q2, q3);
+    q4 = svadd_f32_x(pg, q4, q5); q6 = svadd_f32_x(pg, q6, q7);
+    q0 = svadd_f32_x(pg, q0, q2); q4 = svadd_f32_x(pg, q4, q6);
+    float sum_sq = hsum_f32(pg, svadd_f32_x(pg, q0, q4));
+
+    float mean = sum / (float)N;
+    float var = sum_sq / (float)N - mean * mean;
+    float inv_std_val;
+    {
+        svfloat32_t vv = svdup_f32(var + eps);
+        svfloat32_t vr = sve_rsqrt_f32(pg, vv);
+        float rbuf[16] __attribute__((aligned(256)));
+        svst1_f32(pg, rbuf, vr);
+        inv_std_val = rbuf[0];
+    }
+    svfloat32_t vmean = svdup_f32(mean);
+    svfloat32_t vinv_std = svdup_f32(inv_std_val);
+
+    /* ── Pass 2: y = gamma*(x-mean)*inv_std + beta, store as FP16 ── */
+    i = 0;
+    if (gamma && beta) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u*VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i + u*VL), xhat, svld1_f32(pg, gamma + i + u*VL));
+                svst1_cvt_f32_f16(pg, y_f16 + i + u*VL, n);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(pg, beta + i), xhat, svld1_f32(pg, gamma + i));
+            svst1_cvt_f32_f16(pg, y_f16 + i, n);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmla_f32_x(pg, svld1_f32(ptail, beta + N1), xhat, svld1_f32(ptail, gamma + N1));
+            svst1_cvt_f32_f16(ptail, y_f16 + N1, n);
+        }
+    } else if (gamma) {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            prefetch_l1(gamma + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u*VL);
+                svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i + u*VL));
+                svst1_cvt_f32_f16(pg, y_f16 + i + u*VL, n);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(pg, gamma + i));
+            svst1_cvt_f32_f16(pg, y_f16 + i, n);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t xhat = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svfloat32_t n = svmul_f32_x(pg, xhat, svld1_f32(ptail, gamma + N1));
+            svst1_cvt_f32_f16(ptail, y_f16 + N1, n);
+        }
+    } else {
+        for (; i < N8; i += 8 * VL) {
+            prefetch_l1(x + i, PF_DIST_BYTES);
+            for (int u = 0; u < 8; u++) {
+                svfloat32_t v = svld1_f32(pg, x + i + u*VL);
+                svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+                svst1_cvt_f32_f16(pg, y_f16 + i + u*VL, n);
+            }
+        }
+        for (; i < N1; i += VL) {
+            svfloat32_t v = svld1_f32(pg, x + i);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svst1_cvt_f32_f16(pg, y_f16 + i, n);
+        }
+        if (N1 < N) {
+            svbool_t ptail = svwhilelt_b32((uint32_t)N1, (uint32_t)N);
+            svfloat32_t v = svld1_f32(ptail, x + N1);
+            svfloat32_t n = svmul_f32_x(pg, svsub_f32_x(pg, v, vmean), vinv_std);
+            svst1_cvt_f32_f16(ptail, y_f16 + N1, n);
+        }
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════
  * Batch Forward with OpenMP
  * ════════════════════════════════════════════════════════════════ */
 
@@ -950,6 +2096,83 @@ void layernorm_batch_fwd_f16(const uint16_t *x_f16, uint16_t *y_f16,
     for (int m = 0; m < M; m++)
         layernorm_fwd_f16(x_f16 + (int64_t)m * N, y_f16 + (int64_t)m * N,
                           gamma, beta, eps, N);
+}
+
+
+/* ── Batch INT8 wrappers ── */
+
+void rmsnorm_batch_fwd_f32_int8(const float *x, int8_t *y,
+                                const float *gamma, float *scales,
+                                float eps, int M, int N) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++)
+        scales[m] = rmsnorm_fwd_f32_int8(x + (int64_t)m * N,
+                                         y + (int64_t)m * N,
+                                         gamma, eps, N);
+}
+
+void rmsnorm_batch_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                                const float *gamma, float *scales,
+                                float eps, int M, int N) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++)
+        scales[m] = rmsnorm_fwd_f16_int8(x_f16 + (int64_t)m * N,
+                                         y + (int64_t)m * N,
+                                         gamma, eps, N);
+}
+
+void layernorm_batch_fwd_f32_int8(const float *x, int8_t *y,
+                                  const float *gamma, const float *beta,
+                                  float *scales, float eps, int M, int N) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++)
+        scales[m] = layernorm_fwd_f32_int8(x + (int64_t)m * N,
+                                           y + (int64_t)m * N,
+                                           gamma, beta, eps, N);
+}
+
+void layernorm_batch_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                                  const float *gamma, const float *beta,
+                                  float *scales, float eps, int M, int N) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++)
+        scales[m] = layernorm_fwd_f16_int8(x_f16 + (int64_t)m * N,
+                                           y + (int64_t)m * N,
+                                           gamma, beta, eps, N);
+}
+
+
+/* ── Batch FP32→FP16 wrappers ── */
+
+void rmsnorm_batch_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                               const float *gamma, float eps, int M, int N) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++)
+        rmsnorm_fwd_f32_f16(x + (int64_t)m * N,
+                            y_f16 + (int64_t)m * N,
+                            gamma, eps, N);
+}
+
+void layernorm_batch_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                                 const float *gamma, const float *beta,
+                                 float eps, int M, int N) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++)
+        layernorm_fwd_f32_f16(x + (int64_t)m * N,
+                              y_f16 + (int64_t)m * N,
+                              gamma, beta, eps, N);
 }
 
 

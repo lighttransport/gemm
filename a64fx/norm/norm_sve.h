@@ -79,6 +79,70 @@ void layernorm_batch_bwd_f32(const float *dy, const float *x, float *dx,
                              const float *mean, const float *inv_std,
                              int M, int N);
 
+/* ════════════════════════════════════════════════════════════════
+ * Fused Norm → Quantize Kernels
+ *
+ * INT8 output: symmetric per-row quantization
+ *   y_int8[i] = clamp(round(normalized[i] * 127/absmax), -127, 127)
+ *   returned scale = absmax / 127.0f  (so dequantized = y_int8 * scale)
+ *
+ * FP16 output: norm in FP32, output directly as FP16 (saves L2 bandwidth)
+ * ════════════════════════════════════════════════════════════════ */
+
+/* ── RMSNorm → INT8 ── */
+
+float rmsnorm_fwd_f32_int8(const float *x, int8_t *y, const float *gamma,
+                           float eps, int N);
+
+float rmsnorm_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                           const float *gamma, float eps, int N);
+
+/* ── LayerNorm → INT8 ── */
+
+float layernorm_fwd_f32_int8(const float *x, int8_t *y, const float *gamma,
+                             const float *beta, float eps, int N);
+
+float layernorm_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                             const float *gamma, const float *beta,
+                             float eps, int N);
+
+/* ── Batch → INT8 (caller provides float scales[M]) ── */
+
+void rmsnorm_batch_fwd_f32_int8(const float *x, int8_t *y,
+                                const float *gamma, float *scales,
+                                float eps, int M, int N);
+
+void rmsnorm_batch_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                                const float *gamma, float *scales,
+                                float eps, int M, int N);
+
+void layernorm_batch_fwd_f32_int8(const float *x, int8_t *y,
+                                  const float *gamma, const float *beta,
+                                  float *scales, float eps, int M, int N);
+
+void layernorm_batch_fwd_f16_int8(const uint16_t *x_f16, int8_t *y,
+                                  const float *gamma, const float *beta,
+                                  float *scales, float eps, int M, int N);
+
+/* ── RMSNorm FP32 → FP16 ── */
+
+void rmsnorm_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                         const float *gamma, float eps, int N);
+
+void layernorm_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                           const float *gamma, const float *beta,
+                           float eps, int N);
+
+/* ── Batch FP32 → FP16 ── */
+
+void rmsnorm_batch_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                               const float *gamma, float eps, int M, int N);
+
+void layernorm_batch_fwd_f32_f16(const float *x, uint16_t *y_f16,
+                                 const float *gamma, const float *beta,
+                                 float eps, int M, int N);
+
+
 /* ── Reference / Scalar ── */
 
 /* Double-precision reference (for accuracy comparison) */

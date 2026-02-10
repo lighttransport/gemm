@@ -558,6 +558,241 @@ static void test_layernorm_gradient(int N) {
 
 
 /* ════════════════════════════════════════════════════════════════
+ * Quantized output accuracy tests
+ * ════════════════════════════════════════════════════════════════ */
+
+static void test_rmsnorm_f32_int8_accuracy(int N) {
+    printf("\n=== RMSNorm FP32→INT8 Accuracy: N=%d ===\n", N);
+
+    float *x     = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *y_ref = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    int8_t *y_i8 = (int8_t *)aligned_alloc(256, (size_t)N);
+
+    fill_random(x, N, -3.0f, 3.0f, 42);
+    fill_random(gamma, N, 0.5f, 2.0f, 123);
+    float eps = 1e-5f;
+
+    /* Reference: double-precision norm */
+    rmsnorm_ref_f64(x, y_ref, gamma, eps, N);
+
+    /* Quantized kernel */
+    float scale = rmsnorm_fwd_f32_int8(x, y_i8, gamma, eps, N);
+
+    /* Dequantize and compare.
+     * For INT8: max abs error should be <= 0.5 * quantization step = 0.5 * scale.
+     * We also check that the normalized RMSE is small. */
+    float max_abs_err = 0.0f;
+    float sum_sq_err = 0.0f, sum_sq_ref = 0.0f;
+    int max_abs_val = 0;
+    for (int i = 0; i < N; i++) {
+        float dequant = (float)y_i8[i] * scale;
+        float ref = y_ref[i];
+        float ae = fabsf(dequant - ref);
+        if (ae > max_abs_err) max_abs_err = ae;
+        sum_sq_err += ae * ae;
+        sum_sq_ref += ref * ref;
+        int av = abs(y_i8[i]);
+        if (av > max_abs_val) max_abs_val = av;
+    }
+    float nrmse = sqrtf(sum_sq_err / (sum_sq_ref + 1e-20f));
+    float step = scale;  /* quantization step = absmax/127 */
+    int abs_ok = max_abs_err <= step * 1.01f;  /* allow tiny fp rounding */
+
+    printf("  scale=%.6f  max|y_i8|=%d  max_abs_err=%.6f (step=%.6f)  NRMSE=%.4f  %s\n",
+           scale, max_abs_val, max_abs_err, step, nrmse,
+           (abs_ok && nrmse < 0.01f) ? "OK" : "FAIL");
+
+    free(x); free(gamma); free(y_ref); free(y_i8);
+}
+
+static void test_layernorm_f32_int8_accuracy(int N) {
+    printf("\n=== LayerNorm FP32→INT8 Accuracy: N=%d ===\n", N);
+
+    float *x     = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *beta  = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *y_ref = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    int8_t *y_i8 = (int8_t *)aligned_alloc(256, (size_t)N);
+
+    fill_random(x, N, -3.0f, 3.0f, 42);
+    fill_random(gamma, N, 0.5f, 2.0f, 123);
+    fill_random(beta, N, -0.5f, 0.5f, 456);
+    float eps = 1e-5f;
+
+    layernorm_ref_f64(x, y_ref, gamma, beta, eps, N);
+    float scale = layernorm_fwd_f32_int8(x, y_i8, gamma, beta, eps, N);
+
+    float max_abs_err = 0.0f;
+    float sum_sq_err = 0.0f, sum_sq_ref = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float dequant = (float)y_i8[i] * scale;
+        float ref = y_ref[i];
+        float ae = fabsf(dequant - ref);
+        if (ae > max_abs_err) max_abs_err = ae;
+        sum_sq_err += ae * ae;
+        sum_sq_ref += ref * ref;
+    }
+    float nrmse = sqrtf(sum_sq_err / (sum_sq_ref + 1e-20f));
+    float step = scale;
+    int abs_ok = max_abs_err <= step * 1.01f;
+
+    printf("  scale=%.6f  max_abs_err=%.6f (step=%.6f)  NRMSE=%.4f  %s\n",
+           scale, max_abs_err, step, nrmse,
+           (abs_ok && nrmse < 0.01f) ? "OK" : "FAIL");
+
+    free(x); free(gamma); free(beta); free(y_ref); free(y_i8);
+}
+
+static void test_rmsnorm_f16_int8_accuracy(int N) {
+    printf("\n=== RMSNorm FP16→INT8 Accuracy: N=%d ===\n", N);
+
+    float *x_f32    = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    uint16_t *x_f16 = (uint16_t *)aligned_alloc(256, (size_t)N * sizeof(uint16_t));
+    float *gamma    = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *y_ref    = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    int8_t *y_i8    = (int8_t *)aligned_alloc(256, (size_t)N);
+
+    fill_random(x_f32, N, -2.0f, 2.0f, 42);
+    fill_random(gamma, N, 0.5f, 2.0f, 123);
+    fp32_to_fp16(x_f32, x_f16, N);
+    float eps = 1e-5f;
+
+    /* Reconstruct fp32 from fp16 for reference */
+    float *x_recon = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    for (int i = 0; i < N; i++)
+        x_recon[i] = fp16_to_fp32(x_f16[i]);
+
+    rmsnorm_ref_f64(x_recon, y_ref, gamma, eps, N);
+    float scale = rmsnorm_fwd_f16_int8(x_f16, y_i8, gamma, eps, N);
+
+    float max_abs_err = 0.0f;
+    float sum_sq_err = 0.0f, sum_sq_ref = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float dequant = (float)y_i8[i] * scale;
+        float ref = y_ref[i];
+        float ae = fabsf(dequant - ref);
+        if (ae > max_abs_err) max_abs_err = ae;
+        sum_sq_err += ae * ae;
+        sum_sq_ref += ref * ref;
+    }
+    float nrmse = sqrtf(sum_sq_err / (sum_sq_ref + 1e-20f));
+    float step = scale;
+    int abs_ok = max_abs_err <= step * 1.01f;
+
+    printf("  scale=%.6f  max_abs_err=%.6f (step=%.6f)  NRMSE=%.4f  %s\n",
+           scale, max_abs_err, step, nrmse,
+           (abs_ok && nrmse < 0.01f) ? "OK" : "FAIL");
+
+    free(x_f32); free(x_f16); free(gamma); free(y_ref); free(y_i8); free(x_recon);
+}
+
+static void test_rmsnorm_f32_f16_accuracy(int N) {
+    printf("\n=== RMSNorm FP32→FP16 Accuracy: N=%d ===\n", N);
+
+    float *x     = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *y_ref = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    uint16_t *y_f16 = (uint16_t *)aligned_alloc(256, (size_t)N * sizeof(uint16_t));
+
+    fill_random(x, N, -3.0f, 3.0f, 42);
+    fill_random(gamma, N, 0.5f, 2.0f, 123);
+    float eps = 1e-5f;
+
+    rmsnorm_ref_f64(x, y_ref, gamma, eps, N);
+    rmsnorm_fwd_f32_f16(x, y_f16, gamma, eps, N);
+
+    float max_rel_err = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float yf = fp16_to_fp32(y_f16[i]);
+        float e = fabsf(yf - y_ref[i]) / (fabsf(y_ref[i]) + 1e-10f);
+        if (e > max_rel_err) max_rel_err = e;
+    }
+
+    printf("  max_rel_err=%.2e %s\n", max_rel_err,
+           max_rel_err < 5e-4 ? "OK" : "FAIL");
+
+    free(x); free(gamma); free(y_ref); free(y_f16);
+}
+
+static void test_layernorm_f32_f16_accuracy(int N) {
+    printf("\n=== LayerNorm FP32→FP16 Accuracy: N=%d ===\n", N);
+
+    float *x     = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *beta  = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *y_ref = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    uint16_t *y_f16 = (uint16_t *)aligned_alloc(256, (size_t)N * sizeof(uint16_t));
+
+    fill_random(x, N, -3.0f, 3.0f, 42);
+    fill_random(gamma, N, 0.5f, 2.0f, 123);
+    fill_random(beta, N, -0.5f, 0.5f, 456);
+    float eps = 1e-5f;
+
+    layernorm_ref_f64(x, y_ref, gamma, beta, eps, N);
+    layernorm_fwd_f32_f16(x, y_f16, gamma, beta, eps, N);
+
+    float max_rel_err = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float yf = fp16_to_fp32(y_f16[i]);
+        float e = fabsf(yf - y_ref[i]) / (fabsf(y_ref[i]) + 1e-10f);
+        if (e > max_rel_err) max_rel_err = e;
+    }
+
+    printf("  max_rel_err=%.2e %s\n", max_rel_err,
+           max_rel_err < 5e-4 ? "OK" : "FAIL");
+
+    free(x); free(gamma); free(beta); free(y_ref); free(y_f16);
+}
+
+static void test_int8_edge_cases(void) {
+    printf("\n=== INT8 Edge Cases ===\n");
+    float eps = 1e-5f;
+
+    /* All-zero input: absmax=0 → scale=1, y=0 */
+    {
+        int N = 128;
+        float *x = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+        float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+        int8_t *y = (int8_t *)aligned_alloc(256, (size_t)N);
+        memset(x, 0, (size_t)N * sizeof(float));
+        for (int i = 0; i < N; i++) gamma[i] = 1.0f;
+
+        float scale = rmsnorm_fwd_f32_int8(x, y, gamma, eps, N);
+        int all_zero = 1;
+        for (int i = 0; i < N; i++)
+            if (y[i] != 0) all_zero = 0;
+        printf("  all-zero: scale=%.2f all_y_zero=%s %s\n",
+               scale, all_zero ? "yes" : "no",
+               (all_zero && scale == 1.0f) ? "OK" : "FAIL");
+
+        free(x); free(gamma); free(y);
+    }
+
+    /* Verify symmetry: max y_i8 should be +127 or -127 */
+    {
+        int N = 256;
+        float *x = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+        float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+        int8_t *y = (int8_t *)aligned_alloc(256, (size_t)N);
+        fill_random(x, N, -3.0f, 3.0f, 42);
+        for (int i = 0; i < N; i++) gamma[i] = 1.0f;
+
+        rmsnorm_fwd_f32_int8(x, y, gamma, eps, N);
+        int max_abs = 0;
+        for (int i = 0; i < N; i++) {
+            int av = abs(y[i]);
+            if (av > max_abs) max_abs = av;
+        }
+        printf("  symmetry: max|y_i8|=%d %s\n", max_abs,
+               max_abs == 127 ? "OK" : "FAIL");
+
+        free(x); free(gamma); free(y);
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════
  * Performance benchmark helpers
  * ════════════════════════════════════════════════════════════════ */
 
@@ -658,6 +893,109 @@ static void rmsnorm_fwd_f16_wrap(const uint16_t *x, uint16_t *y,
     rmsnorm_fwd_f16(x, y, gamma, eps, N);
 }
 
+/* ── INT8 output benchmark ── */
+static void bench_norm_int8(const char *label, int N, int reps,
+                            float (*fn)(const float *, int8_t *, const float *,
+                                        const float *, float, int),
+                            int has_beta) {
+    float *x     = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    int8_t *y    = (int8_t *)aligned_alloc(256, (size_t)N);
+    float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *beta  = has_beta ? (float *)aligned_alloc(256, (size_t)N * sizeof(float)) : NULL;
+
+    fill_random(x, N, -3.0f, 3.0f, 42);
+    fill_random(gamma, N, 0.5f, 2.0f, 123);
+    if (beta) fill_random(beta, N, -0.5f, 0.5f, 456);
+    float eps = 1e-5f;
+    uint64_t freq = rdfreq();
+
+    for (int r = 0; r < 3; r++)
+        fn(x, y, gamma, beta, eps, N);
+
+    uint64_t t0 = rdtsc();
+    for (int r = 0; r < reps; r++)
+        fn(x, y, gamma, beta, eps, N);
+    uint64_t t1 = rdtsc();
+
+    double cy = (double)(t1 - t0) / reps;
+    double us = cy / ((double)freq / 1e6);
+    /* 3 passes over x(4N) + gamma(4N on passes 2,3) + write(N) */
+    double bytes_read = (double)N * 4.0 * 3.0 + (double)N * 4.0 * 2.0;
+    double bytes_write = (double)N * 1.0;
+    double bw_b_cy = (bytes_read + bytes_write) / cy;
+
+    printf("  %-28s N=%5d: %8.1f cy  %6.2f us  %5.1f B/cy\n",
+           label, N, cy, us, bw_b_cy);
+
+    free(x); free(y); free(gamma); free(beta);
+}
+
+/* Wrappers to match the fn pointer for INT8 benchmarks */
+static float rmsnorm_fwd_f32_int8_wrap(const float *x, int8_t *y,
+                                        const float *gamma, const float *beta,
+                                        float eps, int N) {
+    (void)beta;
+    return rmsnorm_fwd_f32_int8(x, y, gamma, eps, N);
+}
+
+static float layernorm_fwd_f32_int8_wrap(const float *x, int8_t *y,
+                                          const float *gamma, const float *beta,
+                                          float eps, int N) {
+    return layernorm_fwd_f32_int8(x, y, gamma, beta, eps, N);
+}
+
+/* ── FP32→FP16 output benchmark ── */
+static void bench_norm_f32_f16(const char *label, int N, int reps,
+                               void (*fn)(const float *, uint16_t *,
+                                          const float *, const float *,
+                                          float, int),
+                               int has_beta) {
+    float *x     = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    uint16_t *y  = (uint16_t *)aligned_alloc(256, (size_t)N * sizeof(uint16_t));
+    float *gamma = (float *)aligned_alloc(256, (size_t)N * sizeof(float));
+    float *beta  = has_beta ? (float *)aligned_alloc(256, (size_t)N * sizeof(float)) : NULL;
+
+    fill_random(x, N, -3.0f, 3.0f, 42);
+    fill_random(gamma, N, 0.5f, 2.0f, 123);
+    if (beta) fill_random(beta, N, -0.5f, 0.5f, 456);
+    float eps = 1e-5f;
+    uint64_t freq = rdfreq();
+
+    for (int r = 0; r < 3; r++)
+        fn(x, y, gamma, beta, eps, N);
+
+    uint64_t t0 = rdtsc();
+    for (int r = 0; r < reps; r++)
+        fn(x, y, gamma, beta, eps, N);
+    uint64_t t1 = rdtsc();
+
+    double cy = (double)(t1 - t0) / reps;
+    double us = cy / ((double)freq / 1e6);
+    /* 2 passes: read x(4N)+gamma(4N), write y_f16(2N) */
+    double bytes = (double)N * 4.0 * 2.0 + (double)N * 4.0 + (double)N * 2.0;
+    double bw_b_cy = bytes / cy;
+
+    printf("  %-28s N=%5d: %8.1f cy  %6.2f us  %5.1f B/cy\n",
+           label, N, cy, us, bw_b_cy);
+
+    free(x); free(y); free(gamma); free(beta);
+}
+
+/* Wrappers for FP32→FP16 benchmarks */
+static void rmsnorm_fwd_f32_f16_wrap(const float *x, uint16_t *y,
+                                      const float *gamma, const float *beta,
+                                      float eps, int N) {
+    (void)beta;
+    rmsnorm_fwd_f32_f16(x, y, gamma, eps, N);
+}
+
+static void layernorm_fwd_f32_f16_wrap(const float *x, uint16_t *y,
+                                        const float *gamma, const float *beta,
+                                        float eps, int N) {
+    layernorm_fwd_f32_f16(x, y, gamma, beta, eps, N);
+}
+
+
 #ifdef _OPENMP
 
 /* Wrapper so layernorm_batch_fwd_f32 matches rmsnorm signature */
@@ -737,6 +1075,32 @@ int main(int argc, char **argv) {
     /* Edge cases */
     test_edge_cases();
 
+    /* ── Quantized output accuracy ── */
+    printf("\n\n════ QUANTIZED OUTPUT TESTS ════\n");
+
+    int quant_sizes[] = { 128, 256, 768, 1024, 4096, 8192 };
+    int nquant = sizeof(quant_sizes) / sizeof(quant_sizes[0]);
+
+    for (int t = 0; t < nquant; t++)
+        test_rmsnorm_f32_int8_accuracy(quant_sizes[t]);
+    for (int t = 0; t < nquant; t++)
+        test_layernorm_f32_int8_accuracy(quant_sizes[t]);
+
+    /* FP16→INT8 */
+    int f16i8_sizes[] = { 128, 256, 1024, 4096 };
+    int nf16i8 = sizeof(f16i8_sizes) / sizeof(f16i8_sizes[0]);
+    for (int t = 0; t < nf16i8; t++)
+        test_rmsnorm_f16_int8_accuracy(f16i8_sizes[t]);
+
+    /* FP32→FP16 */
+    for (int t = 0; t < nquant; t++)
+        test_rmsnorm_f32_f16_accuracy(quant_sizes[t]);
+    for (int t = 0; t < nquant; t++)
+        test_layernorm_f32_f16_accuracy(quant_sizes[t]);
+
+    /* INT8 edge cases */
+    test_int8_edge_cases();
+
     /* ── Gradient checks ── */
     test_rmsnorm_gradient(256);
     test_rmsnorm_gradient(1024);
@@ -766,6 +1130,26 @@ int main(int argc, char **argv) {
         bench_norm("scalar", N, reps, layernorm_scalar_f32, 1, 4);
         bench_norm("SVE f32", N, reps, layernorm_fwd_f32, 1, 4);
         bench_norm_f16("SVE f16", N, reps, layernorm_fwd_f16, 1, 4);
+        printf("\n");
+    }
+
+    printf("\n--- RMSNorm Fused Output Variants ---\n");
+    for (int b = 0; b < nbench; b++) {
+        int N = bench_sizes[b];
+        int reps = (N >= 4096) ? 5000 : 10000;
+        bench_norm("SVE f32→f32", N, reps, rmsnorm_fwd_f32_wrap, 0, 3);
+        bench_norm_f32_f16("SVE f32→f16", N, reps, rmsnorm_fwd_f32_f16_wrap, 0);
+        bench_norm_int8("SVE f32→int8", N, reps, rmsnorm_fwd_f32_int8_wrap, 0);
+        printf("\n");
+    }
+
+    printf("\n--- LayerNorm Fused Output Variants ---\n");
+    for (int b = 0; b < nbench; b++) {
+        int N = bench_sizes[b];
+        int reps = (N >= 4096) ? 5000 : 10000;
+        bench_norm("SVE f32→f32", N, reps, layernorm_fwd_f32, 1, 4);
+        bench_norm_f32_f16("SVE f32→f16", N, reps, layernorm_fwd_f32_f16_wrap, 1);
+        bench_norm_int8("SVE f32→int8", N, reps, layernorm_fwd_f32_int8_wrap, 1);
         printf("\n");
     }
 
