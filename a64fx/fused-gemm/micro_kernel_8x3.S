@@ -25,7 +25,11 @@
 
 micro_kernel_fp32_8x3_unroll4:
     // Save callee-saved registers
-    stp x19, x20, [sp, #-16]!
+    stp x19, x20, [sp, #-80]!
+    stp d8, d9, [sp, #16]
+    stp d10, d11, [sp, #32]
+    stp d12, d13, [sp, #48]
+    stp d14, d15, [sp, #64]
 
     ptrue p0.s
 
@@ -302,7 +306,11 @@ micro_kernel_fp32_8x3_unroll4:
     st1w {z23.s}, p0, [x2, #2, mul vl]
 
     // Restore callee-saved registers
-    ldp x19, x20, [sp], #16
+    ldp d14, d15, [sp, #64]
+    ldp d12, d13, [sp, #48]
+    ldp d10, d11, [sp, #32]
+    ldp d8, d9, [sp, #16]
+    ldp x19, x20, [sp], #80
     ret
     .size micro_kernel_fp32_8x3_unroll4, .-micro_kernel_fp32_8x3_unroll4
 
@@ -313,7 +321,11 @@ micro_kernel_fp32_8x3_unroll4:
     .type micro_kernel_fp32_8x3_unroll4_acc, %function
 
 micro_kernel_fp32_8x3_unroll4_acc:
-    stp x19, x20, [sp, #-16]!
+    stp x19, x20, [sp, #-80]!
+    stp d8, d9, [sp, #16]
+    stp d10, d11, [sp, #32]
+    stp d12, d13, [sp, #48]
+    stp d14, d15, [sp, #64]
 
     ptrue p0.s
 
@@ -565,6 +577,10 @@ micro_kernel_fp32_8x3_unroll4_acc:
     st1w {z22.s}, p0, [x2, #1, mul vl]
     st1w {z23.s}, p0, [x2, #2, mul vl]
 
-    ldp x19, x20, [sp], #16
+    ldp d14, d15, [sp, #64]
+    ldp d12, d13, [sp, #48]
+    ldp d10, d11, [sp, #32]
+    ldp d8, d9, [sp, #16]
+    ldp x19, x20, [sp], #80
     ret
     .size micro_kernel_fp32_8x3_unroll4_acc, .-micro_kernel_fp32_8x3_unroll4_acc

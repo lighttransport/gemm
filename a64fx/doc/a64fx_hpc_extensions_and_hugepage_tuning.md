@@ -61,6 +61,58 @@ ARMv8.1 virtualization host extension (HCR_EL2.E2H=1, SCR_EL3.NS=1) adds PFE1/SC
 
 The upper 8 bits of the virtual address (bits [63:56]) are divided among HPC features when the override is active. Specific bit assignments control sector ID selection and prefetch hints per load/store/prefetch instruction.
 
+#### 2.4.1 Sector Cache Relevant Bits (Experimentally Verified)
+
+Only bits [57:56] of the virtual address control sector cache behavior:
+
+```
+63                58 57 56 55                                 0
+┌──────────────────┬─────┬────────────────────────────────────┐
+│ other HPC / ign. │secID│          physical address           │
+└──────────────────┴─────┴────────────────────────────────────┘
+```
+
+| Bits | Function | Verified |
+|------|----------|:--------:|
+| [57:56] | `sector_id[1:0]` — selects L1D sector (0–3). L2 uses only bit [56]. | Yes |
+| [63:58] | Other HPC features (prefetch hints) or unused. **No effect on sector cache.** | Yes |
+
+**Common misconception:** Documentation and some references describe bits [59:56] as `{SCE, PFE, sec_id[1:0]}`, implying SCE and PFE are per-address bits. This is **incorrect** — SCE and PFE are **system register controls** in `IMP_FJ_TAG_ADDRESS_CTRL_EL1`, not per-address fields. See §2.4.2 below.
+
+#### 2.4.2 SCE Bit Investigation (Fugaku PMU Measurements, Feb 2025)
+
+**Question:** Does bit 59 of the virtual address act as a per-access SCE (Sector Cache Enable)?
+
+**Experiment:** Gather-stream benchmark (`result += values[i] * table[indices[i]]`) with fapp PMU profiling. Compared address tag `0xA` (bit 59=1, sector_id=2) against `0x2` (bit 59=0, sector_id=2) — identical except for bit 59.
+
+**PMU Events (SC3 group, single-thread, FLIB env vars enabled):**
+
+| PMU Counter | tag 0xA (bit59=1) | tag 0x2 (bit59=0) | Difference |
+|-------------|------------------:|-----------------:|:----------:|
+| CPU_CYCLES (0x0011) | 6,560,972,693 | 6,563,190,723 | -0.03% |
+| L1_TAG_SCE (0x0250+0x0252) | 2,263,047,023 | 2,263,224,226 | -0.01% |
+| L1_NOT_SEC0 (0x02a0+0x02a1) | 1,231,006,377 | 1,231,109,507 | -0.01% |
+| L2_SC_MISS (0x0260) | 706,700,108 | 706,675,684 | +0.003% |
+
+All counters match within noise (<0.03%). Bit 59 has **zero observable effect**.
+
+**Additional evidence — PMU event 0x0250 (L1_PIPEx_VAL_IU_TAG_ADRS_SCE):**
+
+| Region | SCE_active / TAG_SCE |
+|--------|:--------------------:|
+| nohint (no tags at all) | 44.9% |
+| tag 0x2 (bit 59=0) | 44.1% |
+| tag 0xA (bit 59=1) | 44.1% |
+| manual SCCR | 44.2% |
+
+The "SCE_active" ratio is ~44% for **all variants including nohint** (which uses no tagged pointers). This confirms the PMU event counts the system-level SCE state from `IMP_FJ_TAG_ADDRESS_CTRL_EL1`, not a per-address bit.
+
+**Conclusion:**
+- **SCE** is a system register control (`IMP_FJ_TAG_ADDRESS_CTRL_EL1`), always ON on Fugaku (HPC tag override enabled by default via `fhetbo enable`)
+- **Bit 59** of the virtual address is **not** SCE — it is either unused or assigned to a different HPC feature (possibly prefetch-related)
+- **Only bits [57:56]** (sector_id) control sector cache behavior at the per-access level
+- The FCC compiler correctly uses only `orr Xn, Xbase, #(1<<56)` (bit 56) for sector 1 assignment
+
 ### 2.5 fhetbo Command
 
 The `fhetbo` command controls HPC tag address override at the job level:
