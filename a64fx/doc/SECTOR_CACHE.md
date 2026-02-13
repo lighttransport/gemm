@@ -24,7 +24,8 @@ sector cache from C source code. These pragmas are **only available in FCC tradi
 - 2 groups of 2 sectors: {sector0, sector1} and {sector2, sector3}
 - Sector IDs 0,1 and 2,3 cannot be active simultaneously in the same CMG
 - Register changes on one PE affect all PEs in the same CMG
-- Registers: `IMP_SCCR_SET0_L2_EL1` (sys_reg(3, 0, 15, 8, 2))
+- Not programmble from app: Registers: `IMP_SCCR_SET0_L2_EL1` (sys_reg(3, 0, 15, 8, 2))
+- IMP_SCCR_VSCCR_L2_EL0
 
 ### Sector Mechanism
 
