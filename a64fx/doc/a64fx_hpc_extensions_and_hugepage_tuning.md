@@ -392,12 +392,14 @@ fcc -Nnoclang -O2 -Kocl,hpctag -o program program.c
 
 **Run (environment variables required):**
 ```bash
-export FLIB_SCCR_CNTL=TRUE        # Enable sector cache runtime init
-export FLIB_L1_SCCR_CNTL=TRUE     # Enable L1 sector cache specifically
+export FLIB_SCCR_CNTL=TRUE           # Enable sector cache runtime init
+export FLIB_L1_SCCR_CNTL=TRUE        # Enable L1 sector cache specifically
+export FLIB_L2_SCCR_CNTL_EX=TRUE     # Enable L2 sector cache (required for L2=N pragma!)
 ./program
 ```
 
 Without these env vars, `__jwe_xset_sccr` short-circuits (no init, no MSR, no effect).
+**⚠ Without `FLIB_L2_SCCR_CNTL_EX=TRUE`, L2 SCCR stays at sec0=14,sec1=0 even with `L2=N` pragma.**
 
 **Additional FLIB environment variables:**
 | Variable | Description |
@@ -529,6 +531,69 @@ The SCCR L1 register accepts values 0–7 per sector, but the hardware has 4 phy
 - **Effective range is 0–3** on 4-way L1D (0=sector disabled, 1–3=partition active)
 - **Best strategy:** give the keep sector exactly the ways it needs, minimize the evict sector (sec1=1 is optimal for streaming)
 - **Oversubscription (sum > 4)** works but weakens isolation — sectors compete for physical ways
+
+#### 3.6.7 L2 Way Partition Verification (Fugaku Measurements)
+
+**Critical: `FLIB_L2_SCCR_CNTL_EX=TRUE` is required for L2 sector cache.**
+
+Without this variable, the runtime sets L2 SCCR to `0x0e` (sec0=14, sec1=0) — no L2 partition regardless of `L2=N` pragma value. With it, the pragma correctly programs the L2 SCCR (e.g., `L2=5` → `0x509` = sec0=9, sec1=5).
+
+Required environment:
+```bash
+export FLIB_SCCR_CNTL=TRUE
+export FLIB_L1_SCCR_CNTL=TRUE
+export FLIB_L2_SCCR_CNTL_EX=TRUE    # ← Required for L2 partition!
+```
+
+**L2 specs:** 8MB, 16-way set-associative, 256B line. 1 way = 512KB. 14 ways available to application (2 reserved).
+
+**Test: L2 way-conflict with pointer-chase latency measurement**
+
+Setup: same 3-step pattern as L1 test (prime → evict → reload) but with MB-scale data to stress L2 instead of L1.
+
+**1MB keep (2 ways), 7MB evict (14 ways):**
+
+| Config | sec0 | sec1 | Reload cyc/load | Speedup |
+|--------|:----:|:----:|:---:|:---:|
+| nohint | — | — | 165 (Memory) | 1.00x |
+| sector L2=5 | 9 | 5 | 51 (L2) | **3.25x** |
+| manual | 14 | 1 | 51 (L2) | **3.25x** |
+| manual | 7 | 7 | 51 (L2) | **3.25x** |
+| manual | 4 | 10 | 53 (L2) | **3.11x** |
+| manual | 14 | 14 | 108 (Memory) | 1.53x (oversubscribed) |
+| manual | 0 | 0 | 117 (Memory) | 1.41x |
+
+**2MB keep (4 ways), 6MB evict (12 ways):**
+
+| Config | sec0 | sec1 | Reload cyc/load | Speedup |
+|--------|:----:|:----:|:---:|:---:|
+| nohint | — | — | 138 (Memory) | 1.00x |
+| sector L2=5 | 9 | 5 | 53 (L2) | **2.61x** |
+| sector L2=3 | 11 | 3 | 51 (L2) | **2.73x** |
+| manual | 14 | 1 | 51 (L2) | **2.73x** |
+| manual | 7 | 7 | 51 (L2) | **2.72x** |
+| manual | 14 | 14 | 71 (Memory) | 1.96x (oversubscribed) |
+
+**3.5MB keep (7 ways), 5MB evict (10 ways):**
+
+| Config | sec0 | sec1 | Reload cyc/load | Speedup |
+|--------|:----:|:----:|:---:|:---:|
+| nohint | — | — | 166 (Memory) | 1.00x |
+| sector L2=5 | 9 | 5 | 51 (L2) | **3.23x** |
+| manual | 14 | 1 | 51 (L2) | **3.25x** |
+| manual | 10 | 4 | 51 (L2) | **3.26x** |
+| manual | 7 | 7 | 101 (Memory) | 1.64x (7 ways < 7 ways needed) |
+| manual | **4** | **10** | **280 (Memory)** | **0.59x (catastrophic!)** |
+
+**Conclusions:**
+- **L2 sector cache is fully functional** on Fugaku when `FLIB_L2_SCCR_CNTL_EX=TRUE` is set
+- **Effective range:** sec0 and sec1 values 0–14 (14 ways available). Values ≥14 or ≥16 mean "all ways"
+- **sec0 must be ≥ keep_ways** to fully protect keep data in L2
+- **sec1=1 is sufficient** for streaming — same finding as L1
+- **Oversubscription (sec0+sec1 > 14)** weakens isolation
+- **Undersized sec0** is catastrophic: sec0=4 with 3.5MB keep (needs 7 ways) = 0.59x (thrashing, worse than no partition)
+- **~51 cyc/load = L2 hit** (37-40 cycle L2 latency + pointer-chase overhead)
+- **~165 cyc/load = Memory** (~100-200 cycle memory latency)
 
 ---
 

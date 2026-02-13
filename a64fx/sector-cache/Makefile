@@ -11,7 +11,7 @@ TARGET = bench_sector_cache
 
 SRCS = bench_sector_cache.c
 
-.PHONY: all clean pmu pmu_fapp l1_reuse l1_reuse_fapp l1_pragma l1_pragma_fapp
+.PHONY: all clean pmu pmu_fapp l1_reuse l1_reuse_fapp l1_pragma l1_pragma_fapp l2_conflict l2_conflict_fapp
 
 all: $(TARGET)
 
@@ -41,6 +41,14 @@ l1_pragma: test_sector_l1_pragma.c
 # L1 reuse test with FCC pragmas (with fapp)
 l1_pragma_fapp: test_sector_l1_pragma.c
 	$(CC) $(CFLAGS_PRAGMA) -DUSE_FAPP -o test_sector_l1_pragma_fapp $< $(LDFLAGS)
+
+# L2 way-conflict test (no fapp)
+l2_conflict: test_sector_l2_conflict.c
+	$(CC) $(CFLAGS_PRAGMA) -o test_sector_l2_conflict $< $(LDFLAGS)
+
+# L2 way-conflict test (with fapp)
+l2_conflict_fapp: test_sector_l2_conflict.c
+	$(CC) $(CFLAGS_PRAGMA) -DUSE_FAPP -o test_sector_l2_conflict_fapp $< $(LDFLAGS)
 
 # Assembly output for pragma version (inspect __jwe_xset_sccr calls)
 l1_pragma_asm: test_sector_l1_pragma.c
