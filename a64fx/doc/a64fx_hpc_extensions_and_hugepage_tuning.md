@@ -96,29 +96,649 @@ mpiexec -n $NR_PROCS /opt/FJSVxos/fhehpc/bin/fhetbo enable   # Re-enable
 
 ### 3.1 Overview
 
-Sector cache is a **cache partitioning** function that divides L1D and L2 caches into sectors. Each sector can be assigned a different capacity weight, allowing data with different temporal locality characteristics to be placed in appropriately sized cache partitions.
+Sector cache is a **cache partitioning** function that splits L1D and L2 caches into multiple sectors and controls them separately. A maximum capacity is specified for each sector, and the cache controller ensures that data in a given sector is not evicted as long as that sector's consumed capacity is below its configured maximum. Because multiple sectors can coexist in cache with independently configured capacities, applications have a high degree of freedom to separate data with different temporal locality characteristics.
 
 This prevents streaming data from evicting frequently reused data, and vice versa.
 
-### 3.2 Control via HPC Tag Override
+### 3.2 Architecture
 
-When HPC tag address override is enabled, each memory access instruction can specify which sector to place its data in through the tag bits. This is controlled at the instruction level, giving fine-grained control over cache utilization.
+The sector cache mechanism is implemented on **both L1D cache and L2 cache**, controlled independently:
 
-### 3.3 Software Control Methods
+- **L1D cache:** 4 sectors (sector ID 0–3), per-PE control
+- **L2 cache:** 4 sectors (sector ID 0–3), per-CMG control. The 4 L2 sectors are divided into 2 sets of 2 sectors each. Each PE selects one set via `IMP_SCCR_ASSIGN_EL1.assign`.
 
-**Fujitsu compiler OCL (Optimization Control Lines):**
-```fortran
-!OCL CACHE_SECTOR_SIZE(sector_sizes)
-!OCL CACHE_SUBSECTOR_ASSIGN(assignments)
+**Sector assignment behavior:**
+
+- When data is **not** in cache (cache miss): data is fetched from memory and stored with the sector number attached. The eviction candidate is selected considering sector capacity limits.
+- When data **is** in cache (cache hit): data on **all sectors** can be accessed regardless of the access's sector number. The `mode` bit in `IMP_SCCR_ASSIGN_EL1` controls whether the cache line's sector ID is updated to match the access sector ID (`mode=0`) or kept as-is (`mode=1`).
+
+**Note:** Instruction fetch (L1I) does not use sector cache directly. However, L1I-to-L2 requests use `assign` and `default_sector<0>` to determine their L2 sector.
+
+**Recommendations:**
+- When all 48 computing cores are used by one process, set all CMGs to the same sector cache configuration.
+- When cores within a CMG are shared by multiple processes, use consistent sector cache settings across processes within the same CMG.
+
+### 3.3 Sector ID Determination
+
+Sector IDs are determined by the combination of HPC tag address override state and register settings:
+
+| Cache | HPC Tag Override Disabled | HPC Tag Override Enabled |
+|-------|---------------------------|--------------------------|
+| **L1D** | `default_sector<1:0>` | `TagAddress.sector_id<1:0>` (bits [57:56] of address) |
+| **L2** | `assign::default_sector<0>` | `assign::sector_id<0>` (bit [56] of address, mapped via `assign`) |
+
+Where `default_sector` and `assign` are fields from `IMP_SCCR_ASSIGN_EL1`.
+
+The tag address bits [57:56] (`sector_id`) are only used when both `TBI=1`, `TBO=1`, and `SCE=1`. Otherwise sector cache operates with the default sector.
+
+### 3.4 System Registers
+
+| op0 | op1 | CRn | CRm | op2 | Register | Shared | App Access |
+|:---:|:---:|:---:|:---:|:---:|----------|:------:|:----------:|
+| 11 | 000 | 1011 | 1000 | 000 | `IMP_SCCR_CTRL_EL1` | PE | Read-only (EL0) |
+| 11 | 000 | 1011 | 1000 | 001 | `IMP_SCCR_ASSIGN_EL1` | PE | EL1+ only |
+| 11 | 011 | 1011 | 1000 | 010 | **`IMP_SCCR_L1_EL0`** | PE | **EL0 accessible** |
+| 11 | 000 | 1111 | 1000 | 010 | `IMP_SCCR_SET0_L2_EL1` | CMG | EL1+ only |
+| 11 | 000 | 1111 | 1000 | 011 | `IMP_SCCR_SET1_L2_EL1` | CMG | EL1+ only |
+| 11 | 011 | 1111 | 1000 | 010 | **`IMP_SCCR_VSCCR_L2_EL0`** | PE(→CMG) | **EL0 accessible** |
+
+Access control: EL0/EL1 access is gated by `IMP_SCCR_CTRL_EL1.el1ae` and `el0ae` bits. When `el1ae=1` and `el0ae=1`, user-space (EL0) can directly read/write `IMP_SCCR_L1_EL0` and `IMP_SCCR_VSCCR_L2_EL0`. Otherwise, access traps to EL1 (EC=0x18).
+
+#### 3.4.1 IMP_SCCR_CTRL_EL1 — Access Control
+
+64-bit register, per-PE. Controls whether lower ELs can access sector cache registers.
+
+```
+63    62    61                                           0
+┌──────┬──────┬─────────────────────────────────────────────┐
+│el1ae │el0ae │                   RES0                      │
+└──────┴──────┴─────────────────────────────────────────────┘
 ```
 
-**Environment variables:**
+| Bit | Name | Description |
+|:---:|------|-------------|
+| [63] | `el1ae` | 1: NS-EL1 R/W to all sector cache registers. 0: NS-EL1 access traps to EL2. Writable only from Secure EL1 / EL2 / EL3. |
+| [62] | `el0ae` | 1: EL0 R/W to `IMP_SCCR_L1_EL0` and `IMP_SCCR_VSCCR_L2_EL0` (when `el1ae=1`). 0: EL0 access traps to EL1. |
+
+Access: `MRS/MSR S3_0_C11_C8_0`
+
+#### 3.4.2 IMP_SCCR_ASSIGN_EL1 — Sector Assignment & Mode Control
+
+64-bit register, per-PE. Controls sector assignment behavior and L2 set selection.
+
+```
+31                           4    3      2       1      0
+┌────────────────────────────┬──────┬────────┬────────────┐
+│            RES0            │ mode │ assign │default_sect│
+└────────────────────────────┴──────┴────────┴────────────┘
+```
+
+| Bit | Name | Description |
+|:---:|------|-------------|
+| [3] | `mode` | 0: Cache line's sector ID is updated when accessed with a different sector ID. 1: Cache line keeps its original sector ID regardless of access sector ID. |
+| [2] | `assign` | Selects which L2 set register `IMP_SCCR_VSCCR_L2_EL0` aliases to. 0: → `IMP_SCCR_SET0_L2_EL1`. 1: → `IMP_SCCR_SET1_L2_EL1`. |
+| [1:0] | `default_sector` | Default sector ID used when sector is not specified by instruction (e.g., HPC tag override disabled, or instruction fetch). L1D uses both bits [1:0]. L2 uses only bit [0]. |
+
+Access: `MRS/MSR S3_0_C11_C8_1`
+
+#### 3.4.3 IMP_SCCR_L1_EL0 — L1D Sector Cache Capacity (App-Accessible)
+
+64-bit register, **per-PE**. Sets the maximum capacity for each of the 4 L1D cache sectors. This register is directly accessible from user space (EL0) when `el1ae=1` and `el0ae=1`.
+
+```
+31          15  14  12  11  10   8   7   6   4   3   2   0
+┌────────────┬───────┬─────┬───────┬─────┬───────┬─────┬───────┐
+│    RES0    │sec3_mx│RES0 │sec2_mx│RES0 │sec1_mx│RES0 │sec0_mx│
+└────────────┴───────┴─────┴───────┴─────┴───────┴─────┴───────┘
+```
+
+| Bits | Name | Description |
+|:----:|------|-------------|
+| [14:12] | `l1_sec3_max` | Maximum sector count for L1D Sector 3 (3-bit value) |
+| [11] | — | Reserved (RES0) |
+| [10:8] | `l1_sec2_max` | Maximum sector count for L1D Sector 2 (3-bit value) |
+| [7] | — | Reserved (RES0) |
+| [6:4] | `l1_sec1_max` | Maximum sector count for L1D Sector 1 (3-bit value) |
+| [3] | — | Reserved (RES0) |
+| [2:0] | `l1_sec0_max` | Maximum sector count for L1D Sector 0 (3-bit value) |
+
+Each 3-bit field specifies the maximum number of ways that the corresponding sector ID can occupy in L1D cache. The A64FX L1D cache is 64 KiB, 4-way set-associative (1 way = 16KB).
+
+**Effective value range:** 0–4. Values 0–3 partition the cache; value 4 (or higher) means "use all 4 ways" — equivalent to no partition for that sector. The register accepts 0–7 but values ≥4 have no additional effect since L1D has exactly 4 ways.
+
+**Oversubscription:** The sum of sector max values can exceed 4 (e.g., sec0=3, sec1=3). In this case sectors compete for the physical 4 ways and the partitioning guarantee weakens — the controller treats each value as a *soft maximum* rather than a hard reservation.
+
+**Access encoding:**
+```
+MRS <Xt>, S3_3_C11_C8_2    // Read L1 sector cache settings
+MSR S3_3_C11_C8_2, <Xt>    // Write L1 sector cache settings
+```
+(op0=11, op1=011, CRn=1011, CRm=1000, op2=010)
+
+**Inline assembly example (C/C++):**
+```c
+#include <stdint.h>
+
+// Read current L1 sector cache configuration
+static inline uint64_t read_sccr_l1(void) {
+    uint64_t val;
+    asm volatile("mrs %0, S3_3_C11_C8_2" : "=r"(val));
+    return val;
+}
+
+// Write L1 sector cache configuration
+// sec0..sec3: 3-bit max sector values (0–7)
+static inline void write_sccr_l1(unsigned sec0, unsigned sec1,
+                                  unsigned sec2, unsigned sec3) {
+    uint64_t val = ((uint64_t)(sec3 & 0x7) << 12)
+                 | ((uint64_t)(sec2 & 0x7) << 8)
+                 | ((uint64_t)(sec1 & 0x7) << 4)
+                 | ((uint64_t)(sec0 & 0x7));
+    asm volatile("msr S3_3_C11_C8_2, %0" :: "r"(val));
+}
+```
+
+#### 3.4.4 IMP_SCCR_SET0_L2_EL1 / IMP_SCCR_SET1_L2_EL1 — L2 Sector Cache Capacity (Privileged)
+
+64-bit registers, **per-CMG** (shared across all PEs in the CMG). Changing from one PE affects all PEs in the same CMG. Two sets exist (SET0 and SET1), each controlling 2 of the 4 L2 sectors.
+
+```
+31          13  12       8   7   5   4       0
+┌────────────┬───────────┬─────┬───────────┐
+│    RES0    │l2_sec1_max│RES0 │l2_sec0_max│
+└────────────┴───────────┴─────┴───────────┘
+```
+
+**SET0** (op0=11, op1=000, CRn=1111, CRm=1000, op2=010):
+
+| Bits | Name | Description |
+|:----:|------|-------------|
+| [12:8] | `l2_sec1_max` | Maximum sector count for L2 Sector ID=1 (5-bit) |
+| [4:0] | `l2_sec0_max` | Maximum sector count for L2 Sector ID=0 (5-bit) |
+
+**SET1** (op0=11, op1=000, CRn=1111, CRm=1000, op2=011):
+
+| Bits | Name | Description |
+|:----:|------|-------------|
+| [12:8] | `l2_sec1_max` | Maximum sector count for L2 Sector ID=3 (5-bit) |
+| [4:0] | `l2_sec0_max` | Maximum sector count for L2 Sector ID=2 (5-bit) |
+
+Access:
+```
+MRS/MSR S3_0_C15_C8_2    // SET0 (sectors 0,1)
+MRS/MSR S3_0_C15_C8_3    // SET1 (sectors 2,3)
+```
+
+These registers are EL1+ only. User-space accesses them indirectly through the window register below.
+
+#### 3.4.5 IMP_SCCR_VSCCR_L2_EL0 — L2 Sector Cache Capacity Window (App-Accessible)
+
+64-bit **window register**, per-PE but updates the underlying CMG-shared SET register. This register is directly accessible from user space (EL0) when `el1ae=1` and `el0ae=1`.
+
+The register acts as an **alias** to either `IMP_SCCR_SET0_L2_EL1` or `IMP_SCCR_SET1_L2_EL1`, selected by `IMP_SCCR_ASSIGN_EL1.assign`:
+
+- `assign=0` → reads/writes go to `IMP_SCCR_SET0_L2_EL1` (controls L2 sectors 0 and 1)
+- `assign=1` → reads/writes go to `IMP_SCCR_SET1_L2_EL1` (controls L2 sectors 2 and 3)
+
+```
+31          13  12       8   7   5   4       0
+┌────────────┬───────────┬─────┬───────────┐
+│    RES0    │l2_sec1_max│RES0 │l2_sec0_max│
+└────────────┴───────────┴─────┴───────────┘
+```
+
+| Bits | Name | Description |
+|:----:|------|-------------|
+| [12:8] | `l2_sec1_max` | Maximum sector count for L2 Sector ID=1 or 3 (5-bit, depending on `assign`) |
+| [4:0] | `l2_sec0_max` | Maximum sector count for L2 Sector ID=0 or 2 (5-bit, depending on `assign`) |
+
+**⚠ Important:** Because the underlying SET registers are CMG-shared resources, writing to `IMP_SCCR_VSCCR_L2_EL0` from any PE **affects all PEs in the same CMG**.
+
+**Access encoding:**
+```
+MRS <Xt>, S3_3_C15_C8_2    // Read L2 sector cache settings (via window)
+MSR S3_3_C15_C8_2, <Xt>    // Write L2 sector cache settings (via window)
+```
+(op0=11, op1=011, CRn=1111, CRm=1000, op2=010)
+
+**Inline assembly example (C/C++):**
+```c
+#include <stdint.h>
+
+// Read L2 sector cache capacity via window register
+static inline uint64_t read_vsccr_l2(void) {
+    uint64_t val;
+    asm volatile("mrs %0, S3_3_C15_C8_2" : "=r"(val));
+    return val;
+}
+
+// Write L2 sector cache capacity via window register
+// sec_lo, sec_hi: 5-bit max sector values (0–31)
+// Which L2 sectors these map to depends on IMP_SCCR_ASSIGN_EL1.assign
+static inline void write_vsccr_l2(unsigned sec_lo, unsigned sec_hi) {
+    uint64_t val = ((uint64_t)(sec_hi & 0x1F) << 8)
+                 | ((uint64_t)(sec_lo & 0x1F));
+    asm volatile("msr S3_3_C15_C8_2, %0" :: "r"(val));
+}
+```
+
+### 3.5 Typical Usage Pattern from User Space
+
+To configure sector cache from an application (requires OS/runtime to have set `el1ae=1, el0ae=1`):
+
+1. **L1D sectors** — Write `IMP_SCCR_L1_EL0` directly with desired capacity for each of 4 sectors.
+2. **L2 sectors** — The `assign` bit and `default_sector` are set by the OS/runtime via `IMP_SCCR_ASSIGN_EL1`. The application writes `IMP_SCCR_VSCCR_L2_EL0` to configure the selected pair of L2 sectors.
+3. **Per-instruction sector selection** — With HPC tag address override enabled (`TBI=1, TBO=1, SCE=1`), embed `sector_id` in bits [57:56] of the address for each load/store/prefetch instruction.
+
+### 3.6 Enabling Sector Cache on Fugaku
+
+SCCR registers (`S3_3_C11_C8_2`, `S3_3_C15_C8_2`) are **not directly accessible** from EL0 by default on Fugaku — the kernel ships with `IMP_SCCR_CTRL_EL1.el0ae=0`, so direct MSR/MRS traps with SIGILL.
+
+Access is enabled at runtime through a kernel driver and OS library. The full software stack:
+
+```
+Application (EL0)
+  │
+  ├── FCC pragma:  #pragma procedure scache_isolate_way L1=2
+  │     generates:  bl __jwe_xset_sccr      (libfj90i.so.1)
+  │
+  ├── __jwe_xset_sccr (Fujitsu runtime, libfj90i.so.1)
+  │     ├── first call → __jwe_xsccr_init → __jwe_xsccr_init_com
+  │     │     ├── dlopen("libsec.so")       → /lib64/libsec.so
+  │     │     └── xos_sclib_init()
+  │     ├── subsequent calls → direct MSR S3_3_C11_C8_2
+  │     └── on return → MSR S3_3_C11_C8_2, 0  (reset to default)
+  │
+  ├── libsec.so (OS sector cache library, /lib64/libsec.so)
+  │     xos_sclib_init():
+  │       ├── open("/dev/xos_sec_normal", O_RDONLY)
+  │       ├── read /proc/<pid>/cgroup  (cgroup info for multi-job isolation)
+  │       ├── ioctl(fd, 0xee08, ...)   → query driver capabilities
+  │       ├── ioctl(fd, 0xee06, ...)   → set cgroup/config (24 bytes)
+  │       ├── ioctl(fd, 0xee05, ...)   → *** enable EL0 SCCR access ***
+  │       ├── ioctl(fd, 0xee01, ...)   → read current L1 SCCR value
+  │       ├── ioctl(fd, 0xee04, ...)   → read current L2 SCCR info
+  │       └── close(fd)
+  │
+  └── Kernel driver (/dev/xos_sec_normal, char 240:0)
+        ioctl 0xee05 → sets IMP_SCCR_CTRL_EL1.el0ae=1 for this PE
+```
+
+After `xos_sclib_init` completes, the process can directly read/write SCCR registers via MSR/MRS for the remainder of its lifetime.
+
+#### 3.6.1 Using FCC Pragmas (Recommended)
+
+**Pragmas:**
+```c
+/* Inside a function body: */
+#pragma procedure scache_isolate_way L2=5 L1=2
+#pragma procedure scache_isolate_assign stream_array
+```
+
+- `scache_isolate_way L1=N`: assign N ways (of 4) to sector 1 for L1D. Sector 0 gets 4−N ways.
+- `scache_isolate_way L2=N`: assign N ways (of 16) to sector 1 for L2.
+- `scache_isolate_assign var`: loads/stores to `var` use tag bit 56 → routed to sector 1.
+
+**Compiler emits:**
+1. `bl __jwe_xset_sccr` at function entry with packed config: `{L1_line_size=256, L1_config=0x20002, L2_config=0x50009}`
+2. `orr Xn, Xbase, #(1<<56)` on assigned pointer — sets tag bit 56 for sector 1
+3. `bl __jwe_xset_sccr` at function exit with reset config `{512}`
+
+**Build:**
 ```bash
-export FLIB_SCCR_CNTL=TRUE        # Enable sector cache
-export FLIB_SCCR_ASSIGN="..."     # Sector assignment
+fcc -Nnoclang -O2 -Kocl,hpctag -o program program.c
+```
+`-Kocl` enables OCL pragma recognition, `-Khpctag` enables HPC tag address override codegen.
+
+**Run (environment variables required):**
+```bash
+export FLIB_SCCR_CNTL=TRUE        # Enable sector cache runtime init
+export FLIB_L1_SCCR_CNTL=TRUE     # Enable L1 sector cache specifically
+./program
 ```
 
-**Compiler options** can also control sector cache behavior for specific loops and data arrays.
+Without these env vars, `__jwe_xset_sccr` short-circuits (no init, no MSR, no effect).
+
+**Additional FLIB environment variables:**
+| Variable | Description |
+|----------|-------------|
+| `FLIB_SCCR_CNTL` | Master enable for sector cache runtime (`TRUE`/`FALSE`) |
+| `FLIB_L1_SCCR_CNTL` | Enable L1 sector cache (`TRUE`/`FALSE`) |
+| `FLIB_L2_SCCR_CNTL_EX` | Extended L2 sector cache control |
+| `FLIB_SCCR_CNTL_OSCALL` | Use OS-call path for SCCR access |
+| `FLIB_SCCR_USE_MAXWAY` | Use maximum way count for sectors |
+| `FLIB_L1_SECTOR_NWAYS_INIT_NP` | Initial L1 sector way count (non-parallel) |
+| `FLIB_L2_SECTOR_NWAYS_INIT` | Initial L2 sector way count |
+
+#### 3.6.2 Using libsec.so Directly (Low-Level)
+
+The sector cache library exports these functions:
+
+```c
+/* Link with -lsec or dlopen("libsec.so") */
+int  xos_sclib_init(void);                           /* Enable EL0 SCCR access */
+int  xos_sclib_set_l1_way(int s0, int s1, int s2, int s3); /* Set L1 sectors (0-4 each) */
+int  xos_sclib_set_l2_way(int s0, int s1);           /* Set L2 sectors */
+int  xos_sclib_get_cache_size(int level, int *size);  /* Query cache size */
+void xos_sclib_finalize(void);                        /* Cleanup */
+```
+
+`xos_sclib_set_l1_way` validates each sector value ≤ 4, packs as `sec0 | (sec1<<4) | (sec2<<8) | (sec3<<12)`, and does `msr S3_3_C11_C8_2, Xn`.
+
+**Note:** Calling `xos_sclib_init` directly from user code may fail with `EBUSY` if the device is already held by another process. The fjomplib path (`FLIB_SCCR_CNTL=TRUE`) handles this internally.
+
+#### 3.6.3 Verified Register Values (Fugaku Measurements)
+
+With `FLIB_SCCR_CNTL=TRUE FLIB_L1_SCCR_CNTL=TRUE` and `#pragma procedure scache_isolate_way L1=2`:
+
+| Point | L1 SCCR (`S3_3_C11_C8_2`) | L2 SCCR (`S3_3_C15_C8_2`) | Meaning |
+|-------|:--:|:--:|---|
+| Inside pragma fn | `0x0000000000000022` | `0x000000000000000e` | L1: sec0=2ways(32KB), sec1=2ways(32KB). L2: sec0=14ways |
+| After pragma fn | `0x0000000000000000` | `0x000000000000000e` | L1: reset to default (all 4 ways shared) |
+| Manual write `0x22` | `0x0000000000000022` | — | Readback matches — full R/W confirmed |
+| Manual reset `0x00` | `0x0000000000000000` | — | Reset confirmed |
+
+#### 3.6.4 Performance Verification (Fugaku Measurements)
+
+**Test: L1 way-conflict with pointer-chase latency measurement**
+
+Setup:
+- Keep array: 32KB (2 ways worth), accessed via pointer-chase (128 dependent loads per rep)
+- Evict array: 96KB (6 ways worth), streamed sequentially to create eviction pressure
+- Both arrays 2MB-aligned and aliasing to the same 64 L1 cache sets
+- Sector config: sec0=2ways(32KB) for keep, sec1=2ways(32KB) for evict
+- 500 iterations, 4 chase reps per step
+
+Pattern: prime keep → stream evict (pressure) → reload keep (measure latency)
+
+| Metric | No sector cache | With sector cache | Speedup |
+|--------|:-:|:-:|:-:|
+| Step 3 reload latency | **17.2 cyc/load** (L2) | **5.9 cyc/load** (L1) | **2.91x** |
+| Total time | 7.55 ms | 6.27 ms | **1.20x** |
+
+**Interpretation:** Without sector cache, the 96KB evict stream overflows the 4-way L1 (64KB) and evicts the keep data — reload hits L2 at ~17 cycles/load. With sector cache, keep data is pinned in sector 0 (2 ways) while evict data cycles within sector 1 (2 ways) — reload hits L1 at ~6 cycles/load.
+
+This confirms L1 sector cache partitioning is **fully functional** on Fugaku when enabled via `FLIB_SCCR_CNTL=TRUE`.
+
+#### 3.6.5 PMU Event Verification (fapp)
+
+fapp profiling with raw PMU events confirms the sector cache effect at the hardware counter level.
+
+**L1/L2 Cache Events** (`-Hevent_raw=0x0011,0x0003,0x0004,0x0016,0x0017,0x0015,0x0008,0x0049`):
+
+| PMU Event | nohint | sector | Delta |
+|-----------|-------:|-------:|-------|
+| CPU_CYCLES (0x0011) | 29,827,760 | 25,233,463 | **-15.4%** |
+| L1D_CACHE_REFILL (0x0003) | 520,135 | 417,821 | **-19.7%** (102K fewer misses) |
+| L1D_CACHE (0x0004) | 13,691,372 | 13,604,279 | ~same |
+| L1D miss rate | 3.80% | 3.07% | **-0.73 pp** |
+| L2D_CACHE (0x0016) | 553,350 | 458,984 | -17.1% |
+| L1D_CACHE_WB (0x0015) | 2,292 | 11,413 | +4.98x (sector eviction WBs) |
+
+**Sector Cache Tag Events** (`-Hevent_raw=0x0011,0x0240,0x0241,0x02a0,0x02a1,0x0250,0x0252,0x0260`):
+
+| PMU Event | nohint | sector | Interpretation |
+|-----------|-------:|-------:|----------------|
+| TAG_ADRS (0x0240+0x0241) | 17,411,207 | 16,576,198 | All tagged load ops |
+| **NOT_SEC0 (0x02a0+0x02a1)** | **0** | **12,427,729** | **Evict loads → sector 1** |
+| NOT_SEC0 ratio | 0% | **75%** | Tag bit 56 discriminating correctly |
+| SCE (0x0250+0x0252) | 13,811,809 | 13,592,195 | Always enabled (background) |
+
+**Key PMU insights:**
+- `NOT_SEC0 = 0` in nohint confirms no sector tags applied at baseline
+- `NOT_SEC0 = 12.4M` in sector confirms `orr Xn, Xbase, #(1<<56)` correctly routes evict loads to sector 1
+- 102K fewer L1D refills × ~40 cycle L2 latency ≈ 4M cycles saved, matching the observed 4.6M cycle reduction
+- L1D_CACHE_WB increases with sector cache because sector 1 (2 ways) evicts more frequently as 6 ways of data cycles through it
+
+#### 3.6.6 L1 Way Partition Sizes (Fugaku Measurements)
+
+The SCCR L1 register accepts values 0–7 per sector, but the hardware has 4 physical ways. Testing all combinations reveals the effective behavior:
+
+**16KB keep data (1 way worth), 96KB evict stream:**
+
+| Config | sec0 | sec1 | Reload cyc/load | Speedup vs nohint |
+|--------|:----:|:----:|:---:|:---:|
+| nohint | — | — | 14.5 (L2) | 1.00x |
+| sector | 1 | 1 | 4.1 (L1) | **3.54x** |
+| sector | 2 | 2 | 4.0 (L1) | **3.58x** |
+| sector | 3 | 1 | 4.1 (L1) | **3.58x** |
+| sector | **4** | **4** | **14.5 (L2)** | **1.00x** (no partition!) |
+| sector | **4** | **0** | **14.6 (L2)** | **1.00x** (no partition!) |
+
+**32KB keep data (2 ways worth):**
+
+| Config | sec0 | sec1 | Reload cyc/load | Speedup |
+|--------|:----:|:----:|:---:|:---:|
+| nohint | — | — | 15.6 (L2) | 1.00x |
+| sector | 2 | 2 | 5.8 (L1) | **2.68x** |
+| sector | **3** | **1** | **5.1 (L1)** | **3.08x** (best) |
+| sector | 3 | 3 | 10.5 (mix) | 1.49x (oversubscribed) |
+| sector | 4 | 4 | 15.6 (L2) | 1.00x |
+
+**48KB keep data (3 ways worth):**
+
+| Config | sec0 | sec1 | Reload cyc/load | Speedup |
+|--------|:----:|:----:|:---:|:---:|
+| nohint | — | — | 15.8 (L2) | 1.00x |
+| sector | **3** | **1** | **5.7 (L1)** | **2.80x** (best) |
+| sector | 3 | 3 | 13.0 (mix) | 1.22x (oversubscribed) |
+| sector | 4 | 4 | 15.9 (L2) | 1.00x |
+
+**Conclusions:**
+- **sec_max ≥ 4 disables partitioning** for that sector (value means "all ways available")
+- **Effective range is 0–3** on 4-way L1D (0=sector disabled, 1–3=partition active)
+- **Best strategy:** give the keep sector exactly the ways it needs, minimize the evict sector (sec1=1 is optimal for streaming)
+- **Oversubscription (sum > 4)** works but weakens isolation — sectors compete for physical ways
+
+---
+
+## Part III-B: Hardware Barrier
+
+### 3B.1 Overview
+
+The A64FX hardware barrier provides low-latency inter-thread synchronization via a dedicated system register, replacing software spin-wait barriers. The Fujitsu OpenMP runtime (`-Nfjomplib`) uses this by default for `#pragma omp barrier`.
+
+### 3B.2 Register Architecture
+
+The hardware barrier has **two layers**: EL1 control-plane registers for configuration, and an EL0 data-plane register for the actual barrier trigger.
+
+**EL1 Control Plane** (kernel-only, configure barrier groups at boot):
+
+| Register | Encoding | Purpose |
+|----------|----------|---------|
+| `IMP_BARRIER_CTRL_EL1` | `S3_0_C11_C12_0` | Master enable, access control |
+| `IMP_BARRIER_BST_BIT_EL1` | `S3_0_C11_C12_4` | BST base/mask configuration |
+| `IMP_BARRIER_INIT_SYNC_BB0` | `S3_0_C11_C12_5` | Init sync for barrier group 0 |
+| `IMP_BARRIER_INIT_SYNC_BB1` | `S3_0_C11_C12_6` | Init sync for barrier group 1 |
+| `IMP_BARRIER_INIT_SYNC_BB2` | `S3_0_C11_C12_7` | Init sync for barrier group 2 |
+| `IMP_BARRIER_ASSIGN_EL1` | `S3_0_C11_C15_0` | Barrier group assignment |
+
+All EL1 registers use op1=0 and are inaccessible from EL0 (trap with SIGILL).
+
+**EL0 Data Plane** (user-space, actual barrier synchronization):
+
+| Register | Encoding | Purpose |
+|----------|----------|---------|
+| **IMP_BARRIER_BST_EL0** | **`S3_3_C15_C15_0`** | Barrier Sync Trigger (toggle-and-wait) |
+
+This register is in the ARMv8 **implementation-defined** space (CRn=15, CRm=15) with op1=3, making it directly accessible from EL0 without kernel mediation. On Fugaku, it is **always accessible** — the kernel configures the barrier hardware at boot via the EL1 registers, and user-space applications simply use the EL0 trigger.
+
+**Note:** The EL0 BST encoding (`S3_3_C15_C15_0`) is completely different from the EL1 BST configuration register (`S3_0_C11_C12_4`). They are separate registers serving different roles — the EL1 register sets up barrier parameters, the EL0 register triggers synchronization.
+
+### 3B.3 Mechanism
+
+The hardware barrier uses a **toggle-and-poll** protocol on bit 0 of `IMP_BARRIER_BST_EL0`:
+
+```asm
+; Each participating thread executes:
+mrs  x0, S3_3_C15_C15_0     ; 1. Read current BST value
+mvn  x0, x0                  ; 2. Toggle
+and  x0, x0, #1              ; 3. Keep only bit 0
+msr  S3_3_C15_C15_0, x0     ; 4. Write toggled value (trigger)
+dsb  sy                      ; 5. Full data synchronization barrier
+sevl                         ; 6. Send event local (wake WFE loops)
+.poll:
+mrs  x1, S3_3_C15_C15_0     ; 7. Read BST again
+and  x1, x1, #1
+cmp  x0, x1                 ; 8. All threads synced?
+b.eq .done                  ;    Yes → barrier complete
+wfe                          ; 9. Wait for event (low-power)
+b    .poll                   ; 10. Poll again
+```
+
+The hardware coalesces toggles from all participating threads. When all threads have toggled, the BST value matches what each thread wrote, and the poll loop exits. The `wfe`/`sevl` mechanism avoids busy-spinning.
+
+### 3B.4 Inline Assembly Example
+
+```c
+#include <stdint.h>
+
+static inline uint64_t read_bst(void) {
+    uint64_t v;
+    asm volatile("mrs %0, S3_3_C15_C15_0" : "=r"(v));
+    return v;
+}
+
+static inline void write_bst(uint64_t v) {
+    asm volatile("msr S3_3_C15_C15_0, %0" :: "r"(v));
+}
+
+// Single hardware barrier (all threads must call)
+static inline void hw_barrier(void) {
+    uint64_t val = (~read_bst()) & 1;
+    write_bst(val);
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("sevl");
+    uint64_t cur;
+    do {
+        asm volatile("wfe");
+        cur = read_bst() & 1;
+    } while (cur != val);
+}
+```
+
+### 3B.5 Fujitsu OpenMP Integration
+
+The Fujitsu OpenMP runtime (`libfj90i.so.1`, linked via `-Nfjomplib`) uses the hardware barrier through `__mpc_obar`:
+
+**Call chain:**
+```
+#pragma omp barrier
+  → __mpc_obar (compiler-generated call)
+    → libfj90i.so.1:__mpc_obar (runtime)
+      → checks FLIB_BARRIER flag at config struct offset [5]
+        → if HARD: inline BST toggle + WFE poll (S3_3_C15_C15_0)
+        → if SOFT: __jwe_pbar_tree2 / tree3 / cascade / nrnw (memory-based tree)
+```
+
+**Environment variable:**
+```bash
+export FLIB_BARRIER=HARD   # Use hardware barrier (default with -Nfjomplib)
+export FLIB_BARRIER=SOFT   # Use software tree-based barrier
+```
+
+**Build:**
+```bash
+fcc -Nnoclang -O2 -Kopenmp -Nfjomplib -o program program.c
+```
+
+**Verification:** The BST register (`S3_3_C15_C15_0`) is accessed 55 times within `libfj90i.so.1`, in functions:
+- `__mpc_obar` (inline HW barrier path)
+- `__jwe_thrbar_sync` (thread barrier sync)
+- `__jwe_thrbar_sync_release` (barrier release)
+
+The library also accesses sector cache registers (`S3_3_C11_C8_2`, `S3_3_C15_C8_2`) but guards those with a runtime accessibility flag to handle SIGILL gracefully on systems where `el0ae=0`.
+
+### 3B.6 Performance (Fugaku Measurements)
+
+**12 threads (1 CMG, intra-CMG):**
+
+| Mode | ns/barrier | Speedup |
+|------|-----------|---------|
+| HARD (HW barrier) | 120.1 | 1.00x |
+| SOFT (SW tree) | 120.5 | 1.00x |
+
+**48 threads (4 CMGs, cross-CMG):**
+
+| Mode | ns/barrier | Speedup |
+|------|-----------|---------|
+| HARD (HW barrier) | 1,372 | **1.28x** |
+| SOFT (SW tree) | 1,761 | 1.00x |
+
+Within a single CMG, hardware and software barriers are equally fast (~120 ns). The hardware barrier advantage appears at cross-CMG synchronization (48 threads), where the dedicated synchronization hardware avoids cache coherence traffic between CMGs.
+
+For comparison, `#pragma omp critical` costs 15,983–272,480 ns (133–210x slower than barrier).
+
+### 3B.7 Fugaku EL0 Access Summary
+
+All register probing results on Fugaku (Fugaku kernel, EL0):
+
+| Register | Encoding | Accessible | Notes |
+|----------|----------|:----------:|-------|
+| IMP_BARRIER_CTRL_EL1 | `S3_0_C11_C12_0` | SIGILL | EL1 only |
+| IMP_BARRIER_BST_BIT_EL1 | `S3_0_C11_C12_4` | SIGILL | EL1 only |
+| IMP_BARRIER_ASSIGN_EL1 | `S3_0_C11_C15_0` | SIGILL | EL1 only |
+| **IMP_BARRIER_BST_EL0** | **`S3_3_C15_C15_0`** | **R/W** | **Always accessible** |
+| IMP_SCCR_CTRL_EL1 | `S3_0_C11_C8_0` | SIGILL | EL1 only |
+| IMP_SCCR_L1_EL0 | `S3_3_C11_C8_2` | SIGILL → **R/W** | Requires `xos_sclib_init` (via `FLIB_SCCR_CNTL=TRUE` or `libsec.so`) |
+| IMP_SCCR_VSCCR_L2_EL0 | `S3_3_C15_C8_2` | SIGILL → **R/W** | Requires `xos_sclib_init` (same as L1) |
+| IMP_PF_CTRL_EL1 | `S3_0_C11_C4_0` | SIGILL | EL1 only |
+| **IMP_PF_STREAM_DETECT_CTRL_EL0** | **`S3_3_C11_C4_0`** | **R/W** | **Always accessible** |
+| IMP_FJ_TAG_ADDRESS_CTRL_EL1 | `S3_0_C11_C2_0` | SIGILL | EL1 only |
+
+2 registers are always accessible from EL0: the HW barrier BST trigger and the HW prefetch stream detect control. 2 more (SCCR L1 and L2) become accessible after `xos_sclib_init` enables `el0ae=1` via the `/dev/xos_sec_normal` kernel driver.
+
+---
+
+## Part III-C: Hardware Prefetch Stream Detect
+
+### 3C.1 IMP_PF_STREAM_DETECT_CTRL_EL0
+
+The hardware prefetch stream detect control register is one of only two EL0-accessible HPC extension registers on Fugaku. It controls the hardware prefetch engine's stream detection behavior.
+
+**Encoding:** `S3_3_C11_C4_0` (op0=3, op1=3, CRn=11, CRm=4, op2=0)
+
+**Default value:** `0x0000000000000000` (all fields zero on Fugaku)
+
+### 3C.2 Bit Field Layout (Empirically Determined)
+
+Valid bit mask: `0x8CC000000F0F0000` (13 writable bits across 5 fields)
+
+```
+63       59 58    55 54                    27  24    19  16
+┌──┬──────┬────┬────┬────────────────────┬──────┬────┬──────┬────────────────┐
+│EN│ RES0 │CfgA│RES0│CfgB│     RES0     │ThA   │RES0│ThB   │     RES0      │
+└──┴──────┴────┴────┴────┴──────────────┘└──────┘────└──────┘────────────────┘
+```
+
+| Field | Bits | Width | Values | Description (inferred) |
+|-------|------|-------|--------|------------------------|
+| EN | [63] | 1 bit | 0–1 | Global enable/disable |
+| CfgA | [59:58] | 2 bits | 0–3 | Stream detect configuration A |
+| CfgB | [55:54] | 2 bits | 0–3 | Stream detect configuration B |
+| ThA | [27:24] | 4 bits | 0–15 | Stream detect threshold/count A |
+| ThB | [19:16] | 4 bits | 0–15 | Stream detect threshold/count B |
+
+All fields accept all possible values (readback matches write for every valid value).
+
+### 3C.3 Inline Assembly Example
+
+```c
+static inline uint64_t read_pf_stream_detect(void) {
+    uint64_t v;
+    asm volatile("mrs %0, S3_3_C11_C4_0" : "=r"(v));
+    return v;
+}
+
+static inline void write_pf_stream_detect(uint64_t v) {
+    asm volatile("msr S3_3_C11_C4_0, %0" :: "r"(v));
+    asm volatile("isb" ::: "memory");
+}
+```
+
+### 3C.4 Performance Impact
+
+Streaming benchmark (4 MB SVE ld1w sum × 50 iterations) showed **no measurable bandwidth difference** across any field value. The register likely controls stream detection thresholds that don't affect simple sequential scan patterns (which are already perfectly detected by default). Impact may be visible on irregular or multi-stream access patterns.
 
 ---
 
@@ -519,89 +1139,27 @@ export MALLOC_PERTURB_=0xAA
 ```bash
 # In job script:
 export FLIB_SCCR_CNTL=TRUE
-# In source (OCL directives):
-# !OCL CACHE_SECTOR_SIZE(...)
-# Compiler: -Ksector_cache
+export FLIB_L1_SCCR_CNTL=TRUE
+```
+```c
+// In source (FCC pragmas, requires -Nnoclang -Kocl,hpctag):
+#pragma procedure scache_isolate_way L2=5 L1=2
+#pragma procedure scache_isolate_assign stream_ptr
 ```
 
----
+### Sector cache tuning (manual, after libsec init)
+```c
+// After xos_sclib_init() or FLIB_SCCR_CNTL=TRUE enables el0ae:
+// Configure L1D: sector0=2ways(32KB), sector1=2ways(32KB)
+uint64_t l1_val = 2ULL | (2ULL << 4);
+asm volatile("msr S3_3_C11_C8_2, %0" :: "r"(l1_val));
+asm volatile("isb" ::: "memory");
 
-## Part XIV: Embedding Lookup — Hugepage Tuning Results
+// Configure L2 via window (depends on assign bit set by runtime):
+uint64_t l2_val = (5ULL << 8) | 11ULL;  // sec0=11ways, sec1=5ways
+asm volatile("msr S3_3_C15_C8_2, %0" :: "r"(l2_val));
+asm volatile("isb" ::: "memory");
 
-### 14.1 Workload Characteristics
-
-Embedding forward pass: `output[i,:] = emb_table[indices[i],:]`
-- **Embedding table**: random-access read-only (vocab=151936 × dim × 4B FP32)
-  - dim=1024: 0.58 GB, dim=2048: 1.16 GB, dim=4096: 2.37 GB
-- **Output**: sequential write (each thread writes its contiguous chunk)
-- **TLB pressure**: Each random table access hits a different page → high TLB miss rate
-
-### 14.2 Page Size Impact
-
-Measured with `stream` kernel, seq=64K, dim=4096, vocab=151936:
-
-| Page Size | 1 thread | 12 threads (1 CMG) | 48 threads (4 CMG) |
-|:---------:|:--------:|:------------------:|:------------------:|
-| **2 MiB (hugepage)** | **42.3 GB/s** | 123.3 GB/s | 77.7 GB/s |
-| **64 KiB (normal)** | **33.0 GB/s** | 125.0 GB/s | 71.7 GB/s |
-| **Hugepage uplift** | **+28%** | ~0% | ~8% |
-
-### 14.3 Analysis
-
-**Why hugepages help single-core (+28%):**
-- Table = 2.37 GB → 37K entries with 64KB pages, only ~1200 with 2MB pages
-- A64FX L2 TLB: 1024 entries, 4-way associative
-- 64KB pages: TLB covers 64MB → constant misses into 2.37GB table
-- 2MB pages: TLB covers 2GB → near-complete coverage
-
-**Why hugepages don't help at 12+ threads:**
-- 12 threads × OoO execution window = enough concurrency to hide TLB miss latency (~260 cycles)
-- HBM2 bandwidth becomes the bottleneck, not address translation
-- Multi-threaded memory-level parallelism masks TLB penalties
-
-### 14.4 Paging Policy Impact
-
-| Paging Policy | 12 threads | 48 threads |
-|:---:|:---:|:---:|
-| prepage (default for malloc) | 123.3 GB/s | 77.7 GB/s |
-| demand (NUMA-local) | 123.3 GB/s | 69.8 GB/s |
-
-Demand paging does **not** help embedding lookups because:
-- The embedding table is **shared read-only** — all CMGs need access to the full table
-- Demand paging distributes pages across CMGs, but random lookups cross all NUMA domains regardless
-- Output is already NUMA-local (sequential writes, each thread owns its chunk)
-- The Stream Triad benchmark (section 7.2) benefits from demand paging because each thread reads/writes its own region; embedding is the opposite pattern.
-
-### 14.5 Zipfian Distribution + L2 Cache Effect
-
-With realistic Zipfian index distributions (popular tokens accessed more frequently), L2 cache amplification dominates over TLB effects:
-
-| Distribution | Unique/64K | 12 threads, dim=4096 | vs uniform |
-|:---:|:---:|:---:|:---:|
-| Uniform (α=0.0) | 51K | 123 GB/s | baseline |
-| Zipfian α=0.8 | 32K | 128 GB/s | +4% |
-| Zipfian α=1.0 | 19K | 144 GB/s | +17% |
-| Zipfian α=1.2 | 8K | **169 GB/s** | **+37%** |
-
-At α=1.2, only 8K unique rows are accessed. Hot rows stay in the 8MB L2 cache, reducing HBM2 traffic. The "effective bandwidth" of 169 GB/s exceeds the per-CMG HBM2 share (~256 GB/s) because many lookups are served from L2.
-
-### 14.6 Recommended Settings for Embedding Workloads
-
-```bash
-# Use default hugepage settings (already optimal)
-# fcc links -Klargepage by default — no changes needed
-
-# For single-core or low-thread-count work:
-# Hugepages give +28% — ensure libmpg is linked and binary is ET_EXEC (not PIE)
-
-# For 12+ threads:
-# Hugepages have negligible effect — TLB latency hidden by thread-level parallelism
-# Default paging policy (prepage for malloc) is fine
-
-# Verify settings:
-export XOS_MMM_L_PRINT_ENV=on
-./bench_embedding  # check stderr for libmpg parameters
-
-# Verify binary type (must be ET_EXEC, not ET_DYN):
-readelf -h bench_embedding | grep Type
+// Tag pointer for sector 1 loads:
+float *tagged_ptr = (float*)((uintptr_t)ptr | (1ULL << 56));
 ```
