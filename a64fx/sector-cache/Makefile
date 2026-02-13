@@ -11,7 +11,7 @@ TARGET = bench_sector_cache
 
 SRCS = bench_sector_cache.c
 
-.PHONY: all clean pmu pmu_fapp l1_reuse l1_reuse_fapp l1_pragma l1_pragma_fapp l2_conflict l2_conflict_fapp
+.PHONY: all clean pmu pmu_fapp l1_reuse l1_reuse_fapp l1_pragma l1_pragma_fapp l2_conflict l2_conflict_fapp gemm
 
 all: $(TARGET)
 
@@ -50,6 +50,10 @@ l2_conflict: test_sector_l2_conflict.c
 l2_conflict_fapp: test_sector_l2_conflict.c
 	$(CC) $(CFLAGS_PRAGMA) -DUSE_FAPP -o test_sector_l2_conflict_fapp $< $(LDFLAGS)
 
+# GEMM sector cache benchmark (uses actual SVE microkernel)
+gemm: bench_gemm_sector.c ../fused-gemm/micro_kernel_8x3.S
+	$(CC) $(CFLAGS_PRAGMA) -o bench_gemm_sector $^ $(LDFLAGS)
+
 # Assembly output for pragma version (inspect __jwe_xset_sccr calls)
 l1_pragma_asm: test_sector_l1_pragma.c
 	$(CC) $(CFLAGS_PRAGMA) -S -o test_sector_l1_pragma.s $<
@@ -57,4 +61,5 @@ l1_pragma_asm: test_sector_l1_pragma.c
 clean:
 	rm -f $(TARGET) test_sector_tag_pmu test_sector_tag_pmu_fapp test_sector_l1_reuse test_sector_l1_reuse_fapp
 	rm -f test_sector_l1_pragma test_sector_l1_pragma_fapp test_sector_l1_pragma.s
+	rm -f bench_gemm_sector
 	rm -rf fapp_output fapp_pa1 fapp_pa2 prof_sc1 prof_sc3 prof_l1 prof_l1_sc1
