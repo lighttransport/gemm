@@ -605,3 +605,131 @@ export XOS_MMM_L_PRINT_ENV=on
 # Verify binary type (must be ET_EXEC, not ET_DYN):
 readelf -h bench_embedding | grep Type
 ```
+
+---
+
+## Part XV: NUMA-Replicated Multi-CMG Scaling
+
+### 15.1 Problem: Inter-CMG Ring Bottleneck
+
+When all 48 cores access a single embedding table, the inter-CMG ring bus becomes the bottleneck:
+
+```
+                 ┌───────────┐
+                 │   CMG 0   │ ← table lives here (first-touch by main thread)
+                 │ 12 cores  │
+                 │ ~256 GB/s │
+                 └─────┬─────┘
+        ring ←─────────┼──────────→ ring
+        ~100 GB/s      │           ~100 GB/s
+  ┌─────┴─────┐        │        ┌─────┴─────┐
+  │   CMG 3   │        │        │   CMG 1   │
+  │ 12 cores  │        │        │ 12 cores  │
+  └─────┬─────┘        │        └─────┬─────┘
+        ring ←─────────┼──────────→ ring
+                 ┌─────┴─────┐
+                 │   CMG 2   │
+                 │ 12 cores  │
+                 └───────────┘
+```
+
+With a shared table, 48-thread embedding achieves only **78 GB/s** — the ring's ~100 GB/s shared bandwidth is the ceiling. Each CMG has ~256 GB/s local read bandwidth, but remote access is bottlenecked at ~25 GB/s per CMG (100/4).
+
+### 15.2 Solution: Full NUMA Replication
+
+Replicate **all** data structures to each CMG's local HBM2:
+
+1. **Embedding table** — N copies in FP16 (1.24 GB/replica × 4 = 4.96 GB, fits in 32 GB HBM2)
+2. **Output buffer** — separate per-CMG allocation (each CMG writes only to its own)
+3. **Index array** — per-CMG copy of that CMG's index chunk
+
+Each CMG operates on purely local data with zero inter-CMG traffic:
+
+```
+CMG c:
+  read:  cmg_indices[c][0..seq/N-1]           → LOCAL HBM2  (256 KB)
+  read:  cmg_tables[c][idx * dim .. +dim-1]   → LOCAL HBM2  (1.24 GB)
+  write: cmg_outputs[c][tok * dim .. +dim-1]   → LOCAL HBM2  (537 MB)
+```
+
+### 15.3 Implementation Details
+
+**First-touch NUMA placement** with demand paging (`XOS_MMM_L_PAGING_POLICY=demand:demand:demand`):
+
+```c
+// Thread-to-CMG mapping: OMP_PROC_BIND=close OMP_PLACES=cores
+//   threads 0-11  → CMG0
+//   threads 12-23 → CMG1
+//   threads 24-35 → CMG2
+//   threads 36-47 → CMG3
+
+// Each CMG's 12 threads first-touch their own allocations:
+#pragma omp parallel
+{
+    int cmg = omp_get_thread_num() / 12;
+    int local_tid = omp_get_thread_num() % 12;
+
+    // 12-way parallel memcpy → pages placed on this CMG's HBM2
+    memcpy(cmg_tables[cmg] + my_chunk, master_table + my_chunk, ...);
+    memcpy(cmg_indices[cmg] + my_chunk, indices + global_offset + my_chunk, ...);
+    memset(cmg_outputs[cmg] + my_chunk, 0, ...);
+}
+```
+
+**FP16 precision** halves memory per replica (2 bytes vs 4 bytes per element), enabling 4 table copies in ~5 GB vs ~10 GB for FP32. The FP16 stream ASM kernel uses SVE `ld1h`/`st1h` with `.h` predicates and 8-row deep-prefetch pipelining.
+
+**Sequence partitioning**: `seq/N_CMG` tokens per CMG, each CMG's 12 threads further divide their chunk. No overlap, no communication.
+
+### 15.4 Results: Linear Scaling Achieved
+
+Test: vocab=151936, dim=4096, seq=256K, FP16, best-of-5 timing.
+
+| Config | Threads | Time (ms) | BW (GB/s) | Scaling | Target |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| FP16 1 CMG | 12 | 39.2 | 109.5 | 1.00x | 1x |
+| FP16 2 CMG | 24 | 19.6 | 218.6 | **2.00x** | 2x |
+| FP16 3 CMG | 36 | 13.1 | 326.9 | **2.98x** | 3x |
+| FP16 4 CMG | 48 | 9.9 | **434.6** | **3.97x** | 4x |
+| FP32 1 CMG (ref) | 12 | 59.0 | 145.4 | — | — |
+
+All targets achieved within 1% of ideal linear scaling.
+
+### 15.5 Without NUMA Replication (Before Fix)
+
+For comparison, a single shared output buffer with thread-distributed first-touch:
+
+| Config | BW (GB/s) | Scaling | Issue |
+|:---|:---:|:---:|:---|
+| 1 CMG | 109.5 | 1.00x | OK — all local |
+| 2 CMG | 141.8 | 1.30x | Output pages on wrong CMG |
+| 3 CMG | 160.5 | 1.47x | Ring-limited output writes |
+| 4 CMG | 138.2 | 1.26x | Severe ring contention |
+
+**Root cause**: The shared output buffer's first-touch init distributed pages evenly by thread index, but the timed run partitioned by CMG. CMG1's output pages were physically on CMG0's HBM2, causing all writes to cross the ring.
+
+### 15.6 Key Findings
+
+1. **All three data streams must be NUMA-local**: table (read), output (write), *and* indices (read). Even small cross-CMG traffic (1 MB indices) destabilizes 4-CMG timing due to ring contention under full load.
+
+2. **Per-CMG output buffers are critical**: A single contiguous output array with "distributed first-touch" does NOT work. The first-touch pattern must exactly match the timed-run access pattern. Separate `malloc()` per CMG is the cleanest solution.
+
+3. **Best-of-N timing filters OS noise**: With all 48 cores active, OS tasks occasionally preempt compute threads. Taking the minimum of 5 iterations (vs averaging) gives stable, reproducible results.
+
+4. **FP16 enables 4-way replication**: At dim=4096, FP16 table = 1.24 GB × 4 = 4.96 GB. FP32 would require 9.92 GB for 4 replicas. Both fit in 32 GB HBM2, but FP16 leaves more room for other data.
+
+5. **Per-CMG BW is constant**: Each CMG independently achieves ~109 GB/s regardless of how many CMGs are active, confirming zero inter-CMG interference with full replication.
+
+### 15.7 Recommended Environment
+
+```bash
+# NUMA-local page placement (essential for multi-CMG)
+export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
+
+# Pin threads to cores, close-packed within CMGs
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+export OMP_NUM_THREADS=48  # 4 CMG × 12 cores
+
+# Run
+./bench_embedding_omp --cmg-only
+```
