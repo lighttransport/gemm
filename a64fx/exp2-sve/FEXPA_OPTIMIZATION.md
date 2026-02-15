@@ -2,20 +2,21 @@
 
 ## Summary
 
-Achieved **5.64 Gelem/s** (53% of theoretical peak) using FEXPA with 8x unrolling.
+Achieved **13.72 Gelem/s** using FEXPA-only (v1) for maximum speed, or **6.11 Gelem/s** with full polynomial correction for high accuracy.
 
-| Method | cyc/elem | Gelem/s | ULP | Notes |
-|--------|----------|---------|-----|-------|
-| **FEXPA 8x unroll** | **0.360** | **5.56** | 246 | Best balance, degree-1 |
-| FEXPA 16x unroll | 0.355 | 5.64 | 246 | Marginal gain over 8x |
-| FEXPA 4x unroll | 0.448 | 4.46 | 246 | Original version |
-| FEXPA accurate | 0.543 | 3.69 | 1 | Degree-2 Taylor, ULP=1 |
-| Estrin Pipe8 | 0.716 | 2.79 | 13007 | Previous best |
+| Method | Chain | cyc/elem | Gelem/s (L1) | Error | Notes |
+|--------|-------|----------|--------------|-------|-------|
+| **v1 (fexpa only)** | **1** | **0.073** | **13.72** | 0.5% | **Fastest**, for neural nets |
+| v1 8x unroll | 1 | 0.077 | 13.06 | 0.5% | Simpler version |
+| FEXPA 8x (u8) | 5 | 0.164 | 6.11 | 0.001% | **Recommended** for precision |
+| FEXPA 16x | 5 | 0.156 | 6.42 | 0.001% | Marginal gain over 8x |
+| FEXPA accurate | 5 | 0.271 | 3.69 | ULP=1 | Perfect accuracy |
+| Estrin Pipe8 | - | 0.716 | 2.79 | - | Previous best |
 
-### Speedup vs Estrin
-- **FEXPA 8x**: 50% faster (0.360 vs 0.716 cyc/elem)
-- **FEXPA 4x**: 37% faster (0.448 vs 0.716 cyc/elem)
-- **FEXPA accurate**: 24% faster with perfect ULP=1
+### Speedup Summary
+- **v1 vs u8**: **2.26x faster** (13.72 vs 6.11 Gelem/s) with 0.5% error tradeoff
+- **v1 vs Estrin**: **4.9x faster** (13.72 vs 2.79 Gelem/s)
+- **u8 vs Estrin**: **2.2x faster** (6.11 vs 2.79 Gelem/s)
 
 ## The Problem: FL* Pipe Bottleneck
 
@@ -88,6 +89,101 @@ exp2(x) using FEXPA:
 ```
 
 No FL* pipe operations required!
+
+## Ultra-Fast v1: FEXPA Only (No Polynomial)
+
+For applications where 0.5% error is acceptable (neural networks, softmax), we can skip the polynomial correction entirely:
+
+### v1 Algorithm
+
+```
+exp2(x) ≈ fexpa(x + shift)
+```
+
+Just **2 instructions** per vector:
+1. `fadd z, x, shift` - add magic constant (9 cycles)
+2. `fexpa z, z` - table lookup (4 cycles)
+
+### Chain Length Comparison
+
+| Version | FLA Ops | Throughput | Peak Gelem/s | Actual | Efficiency |
+|---------|---------|------------|--------------|--------|------------|
+| **v1** | **2** | 1 cyc/vec | 32 | **13.72** | 43% |
+| v3 | 5 | 2.5 cyc/vec | 12.8 | 7.36 | 58% |
+| u8 | 6 | 3 cyc/vec | 10.67 | 6.11 | 57% |
+
+Throughput = FLA_ops / 2 pipes
+
+### v1 Performance Analysis
+
+```
+Operations per vector: 1 fadd + 1 fexpa = 2 FLA ops
+Throughput: 2 ops / 2 FLA pipes = 1 cycle/vector
+Theoretical peak: 16 elem / 1 cyc × 2 GHz = 32 Gelem/s
+
+Memory: 1 load + 1 store = 2 ops / 2 LD/ST pipes = 1 cycle/vector
+Memory peak: also 32 Gelem/s
+
+Actual: 13.72 Gelem/s = 42.9% of peak
+```
+
+**Why 43% of theoretical peak? A64FX Store Bandwidth Limitation**
+
+Investigation isolated each component to find the bottleneck:
+
+| Test | Measured | Peak | Efficiency |
+|------|----------|------|------------|
+| Load only (8x unroll) | 58 Gelem/s | 64 | **90%** |
+| **Store only (8x unroll)** | **22 Gelem/s** | **64** | **34%** |
+| Load+Store | 17 Gelem/s | 32 | 53% |
+| v1 (ld+fadd+fexpa+st) | 13 Gelem/s | 32 | 40% |
+
+**Root cause: A64FX L1 cache is write-through**
+
+- Every store immediately writes to L2 (not just L1)
+- Store bandwidth limited by L2 write port (~22 Gelem/s)
+- Load bandwidth benefits from L1 (near peak)
+- This is a **hardware limitation**, not a software optimization issue
+
+**Conclusion**: v1 is **store-bound**, not compute-bound. The 43% efficiency is near-optimal for streaming workloads on A64FX. Even pure load+store (no compute) only achieves 53%
+
+### v1 Accuracy
+
+FEXPA uses a 64-entry lookup table (6 bits of fraction):
+
+```
+Table entries: 2^(i/64) for i = 0..63
+
+Error analysis:
+- Values ON table boundaries (0, 0.5, 0.25, etc.): 0% error
+- Values BETWEEN entries: ~0.4-0.5% max error
+- ULP error: ~30,000-65,000 (vs ~250 for full algorithm)
+```
+
+| Input | exp2f (ref) | v1 | Error |
+|-------|-------------|-----|-------|
+| 0.0 | 1.000000 | 1.000000 | 0% |
+| 0.5 | 1.414214 | 1.414214 | 0% |
+| 0.01 | 1.006956 | 1.010889 | 0.39% |
+| 0.99 | 1.986185 | 1.978456 | 0.39% |
+
+### When to Use v1
+
+**Recommended for:**
+- Softmax in neural networks (relative accuracy matters)
+- Real-time inference requiring maximum throughput
+- Cases where exp2 is fused with subsequent operations
+- 2.26x speedup justifies 0.5% error
+
+**Not recommended for:**
+- Scientific computing requiring high precision
+- Accumulating many exp2 results (errors compound)
+- Applications where ULP accuracy is required
+
+### v1 Files
+
+- `exp2_fexpa_v1.S` - 8x unroll, 13.06 Gelem/s
+- `exp2_fexpa_v1_u16.S` - 16x unroll, **13.72 Gelem/s** (best)
 
 ## Implementation Notes
 
@@ -164,12 +260,17 @@ fcc -Nclang -O3 -march=armv8.2-a+sve -c exp2_fexpa_opt.S
 
 ### Recommended Versions
 
-1. **For maximum speed** (softmax in neural networks): Use `exp2_fexpa_u8.S`
-   - 8x unroll, 5.56 Gelem/s, 52% of peak
-   - ULP=246 ≈ 0.003% relative error
-   - Best balance of performance vs code size
+1. **For maximum speed** (softmax, neural networks): Use `exp2_fexpa_v1_u16.S`
+   - 16x unroll, **13.72 Gelem/s**, 2.26x faster than u8
+   - 0.5% max error (acceptable for ML applications)
+   - Only 2 instructions: fadd + fexpa
 
-2. **For accuracy + speed**: Use `exp2_fexpa_accurate.S`
+2. **For balanced speed/accuracy**: Use `exp2_fexpa_u8.S`
+   - 8x unroll, 6.11 Gelem/s, 52% of peak
+   - ULP=246 ≈ 0.003% relative error
+   - Best balance of performance vs accuracy
+
+3. **For high accuracy**: Use `exp2_fexpa_accurate.S`
    - ULP=1 (perfect single-precision accuracy)
    - 3.69 Gelem/s, 24% faster than Estrin
 
@@ -203,6 +304,141 @@ properly complement FEXPA's approximation to achieve ULP=1.
 # 8x unroll           0.001 ms   6.22 Gelem/s  0.322 cyc/elem   58.3%
 # 16x unroll          0.001 ms   6.42 Gelem/s  0.312 cyc/elem   60.2%
 ```
+
+## Exploration: Alternative Formulations
+
+### FCADD/FCMLA Instructions
+
+Explored using FCADD to run fadd/fsub in a single instruction by treating pairs as complex numbers:
+
+```
+FCADD rot=270: (a + c, b - d) from (a, b) and (c, d)
+FCADD rot=90:  (a - c, b + d) from (a, b) and (c, d)
+```
+
+**Finding**: Not beneficial for exp2 because:
+1. FCADD operates on adjacent element pairs, not all elements uniformly
+2. We need `z` for FEXPA before computing `n`, creating a chicken-and-egg dependency
+3. The operations we need (`z = x + shift`, `n = z - shift`) aren't suitable for complex pairing
+
+### Alternative Polynomial Formulation
+
+Explored computing `poly = x*c0 - n*c0` instead of `poly = (x-n)*c0`:
+
+**Original** (5 FLA ops):
+```
+1. z = x + shift    (fadd)
+2. n = z - shift    (fsub) ← depends on 1
+3. r = x - n        (fsub) ← depends on 2
+4. poly = r * c0    (fmul) ← depends on 3
+5. result = scale + scale*poly (fmla) ← depends on 4
+```
+
+**Alternative** (6 FLA ops):
+```
+1. z = x + shift    (fadd)
+2. xc0 = x * c0     (fmul) ← PARALLEL with 1!
+3. n = z - shift    (fsub) ← depends on 1
+4. nc0 = n * c0     (fmul) ← depends on 3
+5. poly = xc0 - nc0 (fsub) ← depends on 2, 4
+6. result = scale + scale*poly (fmla) ← depends on 5
+```
+
+**Benchmark Results** (n=4096, L1 resident):
+| Version | Gelem/s | Peak% |
+|---------|---------|-------|
+| Original (u8) | 6.11 | 57.2% |
+| Alternative | 4.60 | 43.1% |
+
+**Finding**: Alternative is **25% slower** despite parallel start at cycle 0.
+The extra `fmul` operation (6 vs 5 FLA ops) outweighs the parallelism benefit.
+
+### Fundamental Limitation
+
+The 45-cycle dependency chain (5 × 9 cycles) is the fundamental bottleneck.
+To fully hide this latency, we'd need:
+- 45 cycles / 3 cycles per vector = **15 vectors in flight**
+- Requires 15 × ~6 registers = 90 registers (we only have 32)
+
+The **~57% peak efficiency** achieved with 8x unroll is a good result given:
+1. Limited register file (32 SVE registers, 8 callee-saved)
+2. The algorithm inherently requires `x` for both `z = x + shift` and `r = x - n`
+3. SVE offset addressing limited to [-8, 7] mul vl
+
+### Polynomial vs FEXPA (frintm + fcvtzs approach)
+
+Explored replacing FEXPA with traditional polynomial approximation:
+
+**Polynomial approach**:
+```
+1. n = floor(x)         // frintm (FL* pipe, 9 cyc)
+2. f = x - n            // fsub (FLA pipe)
+3. n_int = (int)n       // fcvtzs (FL* pipe, 9 cyc)
+4. scale = 2^n          // add + lsl (INT pipe)
+5. t = c1 + c2*f        // fmla (FLA pipe)
+6. exp_f = 1 + t*f      // fmla (FLA pipe)
+7. result = scale*exp_f // fmul (FLA pipe)
+```
+
+**Throughput Analysis**:
+- FL* ops: 2 (frintm, fcvtzs) / 1 pipe = 2 cycles/vector
+- FLA ops: 4 (fsub, fmla, fmla, fmul) / 2 pipes = 2 cycles/vector
+- Theoretical: 16 Gelem/s (better than FEXPA's 10.67!)
+
+**Benchmark Results** (n=4096, L1 resident):
+| Method | Gelem/s | Peak% |
+|--------|---------|-------|
+| FEXPA | 6.06 | 57% of 10.67 |
+| Polynomial | 4.06 | 25% of 16 |
+
+**Finding**: FEXPA is **50% faster** despite lower theoretical throughput!
+
+**Why Polynomial is Slower**:
+1. FL* pipe serialization: frintm must complete before fcvtzs can use its result
+2. Sequential dependencies: FLA ops can't start until FL* completes
+3. With 8 vectors: 16 FL* ops = 16 cycles (since only 1 FL* pipe)
+4. No overlap: fmla chain waits for fsub, which waits for frintm
+
+FEXPA avoids FL* pipe entirely by clever use of the shift constant trick.
+
+### Chain Length Analysis
+
+Tested effect of dependency chain length on performance:
+
+| Version | FLA Ops | Peak Gelem/s | Actual | Efficiency | Error |
+|---------|---------|--------------|--------|------------|-------|
+| v1 | 2 (fadd+fexpa) | 32 | 13.72 | 43% | 0.5% |
+| v3 | 5 (fadd+fsub+fexpa+fmul+fmla) | 16 | 7.36 | 46% | 2.7% |
+| u8 | 6 (fadd+fsub+fsub+fexpa+fmul+fmla) | 10.67 | 6.11 | 57% | 0.001% |
+
+Peak calculation: `16 elem / (FLA_ops / 2 pipes) × 2 GHz`
+
+**Key insight**: Fewer ops = higher throughput:
+- v1 (2 ops) is **2.26x faster** than u8 (6 ops)
+- All versions achieve 43-57% of their respective peaks
+- v1 is equally bound by compute and memory (both 32 Gelem/s theoretical)
+
+For compute-bound scenarios, reducing chain length is more effective than deeper unrolling.
+
+### Conclusion
+
+1. **For maximum speed**: Use `exp2_fexpa_v1_u16.S` (13.72 Gelem/s, 0.5% error)
+2. **For accuracy**: Use `exp2_fexpa_u8.S` (6.11 Gelem/s, 0.001% error)
+3. Alternative formulations (polynomial, FCADD) don't improve performance
+4. FEXPA instruction is crucial - avoids FL* pipe bottleneck entirely
+
+## Files
+
+| File | Description | L1 Gelem/s | Error | Notes |
+|------|-------------|------------|-------|-------|
+| `exp2_fexpa_v1_u16.S` | **Fastest** v1 16x | **13.72** | 0.5% | For neural nets |
+| `exp2_fexpa_v1.S` | v1 8x unroll | 13.06 | 0.5% | Simpler v1 |
+| `exp2_fexpa_u8.S` | **Recommended** 5-chain 8x | 6.11 | 0.001% | Best accuracy/speed |
+| `exp2_fexpa_u16.S` | 5-chain 16x | 6.42 | 0.001% | Marginal gain |
+| `exp2_fexpa_pipe.S` | 5-chain interleaved | 5.64 | 0.001% | |
+| `exp2_fexpa_accurate.S` | Degree-2 Taylor | 3.69 | ULP=1 | Perfect accuracy |
+| `exp2_fexpa_v3.S` | 4-chain test | 7.36 | 2.7% | Experimental |
+| `exp2_poly_u8.S` | Polynomial (no FEXPA) | 4.06 | 3% | FL* bottleneck |
 
 ## References
 

@@ -1,99 +1,133 @@
 /*
- * Benchmark comparing software-pipelined exp2 kernels
+ * Benchmark: FEXPA chain length comparison
+ * 
+ * v1: 1-chain (fadd only + fexpa) - no polynomial
+ * v2: 3-chain (fadd + fmul + fmla) - wrong poly but fast  
+ * v3: 4-chain (fadd + fsub + fmul + fmla) - skip r computation
+ * u8: 5-chain (full algorithm) - baseline
  */
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <math.h>
 #include <stdint.h>
-#include <omp.h>
+#include <math.h>
 
-extern void exp2_estrin_simple(const float* in, float* out, int n);
-extern void exp2_estrin_u8(const float* in, float* out, int n);
-extern void exp2_estrin_pipe(const float* in, float* out, int n);
-extern void exp2_estrin_pipe8(const float* in, float* out, int n);
+extern void exp2_fexpa_v1(const float* in, float* out, int n);
+extern void exp2_fexpa_v2(const float* in, float* out, int n);
+extern void exp2_fexpa_v3(const float* in, float* out, int n);
+extern void exp2_fexpa_u8(const float* in, float* out, int n);
 
-static int ulp_error(float a, float b) {
-    if (a == b) return 0;
-    if (isnan(a) || isnan(b)) return 0;
-    if (isinf(a) || isinf(b)) return 0;
-    union { float f; int32_t i; } ua, ub;
-    ua.f = a; ub.f = b;
-    return abs(ua.i - ub.i);
+static inline uint64_t get_cycles(void) {
+    uint64_t val;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
 }
 
-static void* aligned_alloc_safe(size_t align, size_t size) {
-    void* ptr = NULL;
-    posix_memalign(&ptr, align, size);
-    if (ptr) memset(ptr, 0, size);
-    return ptr;
+static inline uint64_t get_freq(void) {
+    uint64_t val;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
+    return val;
 }
 
 typedef void (*exp2_func)(const float*, float*, int);
 
-static void benchmark(const char* name, exp2_func fn, const float* in, float* out,
-                      const float* ref, int n, int iters) {
-    // Correctness check
-    fn(in, out, n);
-    int max_ulp = 0;
-    for (int i = 0; i < n; i++) {
-        int u = ulp_error(ref[i], out[i]);
-        if (u > max_ulp) max_ulp = u;
-    }
+void benchmark(const char* name, exp2_func func, const float* input, float* output, 
+               int n, int chain_len, float* ref) {
+    uint64_t freq = get_freq();
 
     // Warmup
-    for (int i = 0; i < 5; i++) {
-        fn(in, out, n);
-    }
+    for (int i = 0; i < 100; i++) func(input, output, n);
 
     // Benchmark
-    double t0 = omp_get_wtime();
-    for (int i = 0; i < iters; i++) {
-        fn(in, out, n);
+    uint64_t start = get_cycles();
+    for (int i = 0; i < 1000; i++) func(input, output, n);
+    uint64_t end = get_cycles();
+
+    uint64_t total = end - start;
+    double cyc_per_elem = (double)total / 1000.0 / n;
+    double gelem = (double)n * 1000 / ((double)total / freq) / 1e9;
+
+    // Peak calculation based on chain length
+    // chain_len FLA ops / 2 pipes = chain_len/2 cyc/vec
+    // Peak = 16 elem / (chain_len/2) cyc * 2 GHz = 64/chain_len Gelem/s
+    double peak = 64.0 / chain_len;
+    double eff = gelem / peak * 100.0;
+
+    // Accuracy check
+    double max_err = 0;
+    for (int i = 0; i < n; i++) {
+        double err = fabs((double)output[i] - (double)ref[i]) / (fabs((double)ref[i]) + 1e-30);
+        if (err > max_err) max_err = err;
     }
-    double t1 = omp_get_wtime();
 
-    double time_ms = (t1 - t0) / iters * 1000;
-    double gelem_s = n / (t1 - t0) * iters / 1e9;
-    double cycles_elem = 2.0 / gelem_s;  // 2 GHz
-
-    printf("%-20s %8.3f ms  %6.2f Gelem/s  %5.3f cyc/elem  ULP=%d\n",
-           name, time_ms, gelem_s, cycles_elem, max_ulp);
+    printf("  %-12s: %5.2f cyc/el, %6.2f Gelem/s (%5.1f%% of %.1f peak), err=%.1e\n",
+           name, cyc_per_elem, gelem, eff, peak, max_err);
 }
 
-int main(int argc, char** argv) {
-    int n = 4 * 1024 * 1024;  // 4M elements
-    int iters = 100;
+int main() {
+    printf("=== FEXPA Chain Length Comparison ===\n");
+    printf("Testing effect of dependency chain on throughput\n\n");
 
-    if (argc > 1) n = atoi(argv[1]);
-    if (argc > 2) iters = atoi(argv[2]);
+    int n = 4096;  // L1 resident
+    float* input = aligned_alloc(64, n * sizeof(float));
+    float* output = aligned_alloc(64, n * sizeof(float));
+    float* ref = aligned_alloc(64, n * sizeof(float));
 
-    printf("=== Software Pipelining Comparison ===\n");
-    printf("Elements: %d (%.1f MB), Iterations: %d\n", n, n*4.0/1e6, iters);
-    printf("A64FX @ 2 GHz, SVE 512-bit (16 floats/vector)\n\n");
-
-    float* in = aligned_alloc_safe(256, n * sizeof(float));
-    float* out = aligned_alloc_safe(256, n * sizeof(float));
-    float* ref = aligned_alloc_safe(256, n * sizeof(float));
-
+    // Initialize
     srand(42);
     for (int i = 0; i < n; i++) {
-        in[i] = ((float)rand() / RAND_MAX * 100.0f) - 50.0f;
+        input[i] = ((float)rand() / RAND_MAX) * 4.0f - 2.0f;  // [-2, 2] for accuracy test
     }
 
-    // Reference
-    for (int i = 0; i < n; i++) ref[i] = exp2f(in[i]);
+    // Reference using exp2f
+    for (int i = 0; i < n; i++) ref[i] = exp2f(input[i]);
 
-    printf("%-20s %8s      %6s        %5s        %s\n",
-           "Method", "Time", "Thput", "Cyc/el", "Max");
+    printf("n = %d (%.1f KB, L1 resident)\n", n, n * sizeof(float) / 1024.0);
+    printf("Chain: FLA ops in dependency chain\n");
+    printf("Peak: theoretical max for that chain length\n\n");
 
-    benchmark("Estrin 4x", exp2_estrin_simple, in, out, ref, n, iters);
-    benchmark("Estrin 8x", exp2_estrin_u8, in, out, ref, n, iters);
-    benchmark("Pipe 4x", exp2_estrin_pipe, in, out, ref, n, iters);
-    benchmark("Pipe 8x", exp2_estrin_pipe8, in, out, ref, n, iters);
+    // Test each version
+    // v1: 1 FLA op (fadd) + fexpa
+    printf("v1 (1-chain: fadd + fexpa only):\n");
+    benchmark("fadd+fexpa", exp2_fexpa_v1, input, output, n, 1, ref);
 
-    printf("\n");
+    // v2: 3 FLA ops (fadd parallel with fmul, then fmla)
+    // Actually chain is: max(fadd→fexpa, fmul) → fmla
+    // If fmul doesn't depend on fadd: chain = 2 (fmul→fmla or fexpa→fmla)
+    printf("\nv2 (3-chain: fadd||fmul → fmla):\n");
+    benchmark("3-chain", exp2_fexpa_v2, input, output, n, 3, ref);
 
-    free(in); free(out); free(ref);
+    // v3: 4 FLA ops (fadd → fsub → fmul → fmla)
+    printf("\nv3 (4-chain: fadd → fsub → fmul → fmla):\n");
+    benchmark("4-chain", exp2_fexpa_v3, input, output, n, 4, ref);
+
+    // u8: 5 FLA ops (fadd → fsub → fsub → fmul → fmla)
+    printf("\nu8 (5-chain: fadd → fsub → fsub → fmul → fmla):\n");
+    benchmark("5-chain", exp2_fexpa_u8, input, output, n, 5, ref);
+
+    // Also test larger sizes
+    printf("\n=== Larger sizes ===\n");
+    int sizes[] = {8192, 65536, 262144};
+    for (int s = 0; s < 3; s++) {
+        n = sizes[s];
+        input = realloc(input, n * sizeof(float));
+        output = realloc(output, n * sizeof(float));
+        ref = realloc(ref, n * sizeof(float));
+        
+        for (int i = 0; i < n; i++) {
+            input[i] = ((float)rand() / RAND_MAX) * 4.0f - 2.0f;
+            ref[i] = exp2f(input[i]);
+        }
+        
+        printf("\nn = %d (%.1f KB):\n", n, n * sizeof(float) / 1024.0);
+        benchmark("v1 (1-ch)", exp2_fexpa_v1, input, output, n, 1, ref);
+        benchmark("v2 (3-ch)", exp2_fexpa_v2, input, output, n, 3, ref);
+        benchmark("v3 (4-ch)", exp2_fexpa_v3, input, output, n, 4, ref);
+        benchmark("u8 (5-ch)", exp2_fexpa_u8, input, output, n, 5, ref);
+    }
+
+    free(input);
+    free(output);
+    free(ref);
     return 0;
 }

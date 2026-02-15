@@ -114,3 +114,58 @@ clean_2pass:
 
 submit_2pass: bench_2pass
 	pjsub -g hp250467 -L "freq=2000,eco_state=0,rscgrp=small,node=1,elapse=00:10:00" --no-check-directory ./run_2pass.sh
+
+# ─── L1-Resident Ceiling Benchmark ─────────────────────
+L1_CEIL_KERN_OBJS = micro_kernel_fp32_12x2_swp.o micro_kernel_fp32_12x2_swp_accum.o \
+                    micro_kernel_fp32_8x3.o micro_kernel_fp32_8x3_accum.o \
+                    micro_kernel_fp32_6x4_bcast.o micro_kernel_fp32_6x4_bcast_accum.o \
+                    micro_kernel_fp32_6x4_swp.o micro_kernel_fp32_6x4_swp_accum.o
+
+bench_l1_ceiling: bench_l1_ceiling.o $(L1_CEIL_KERN_OBJS)
+	$(2PASS_CC) $(2PASS_CFLAGS) -o $@ $^ $(2PASS_LDFLAGS)
+
+bench_l1_ceiling.o: bench_l1_ceiling.c
+	$(2PASS_CC) $(2PASS_CFLAGS) -c -o $@ $<
+
+# ─── FP32 90% Target Fused Pipeline Benchmark ──────────
+FP32_90_KERN_OBJS = micro_kernel_fp32_12x2_swp.o micro_kernel_fp32_12x2_swp_accum.o \
+                    micro_kernel_fp32_8x3.o micro_kernel_fp32_8x3_accum.o \
+                    micro_kernel_fp32_6x4_bcast.o micro_kernel_fp32_6x4_bcast_accum.o \
+                    micro_kernel_fp32_6x4_swp.o micro_kernel_fp32_6x4_swp_accum.o
+
+bench_fp32_90: bench_fp32_90.o $(FP32_90_KERN_OBJS)
+	$(2PASS_CC) $(2PASS_CFLAGS) -o $@ $^ $(2PASS_LDFLAGS)
+
+bench_fp32_90.o: bench_fp32_90.c
+	$(2PASS_CC) $(2PASS_CFLAGS) -c -o $@ $<
+
+clean_fp32_90:
+	rm -f bench_fp32_90 bench_fp32_90.o bench_l1_ceiling bench_l1_ceiling.o \
+	      $(L1_CEIL_KERN_OBJS) $(FP32_90_KERN_OBJS)
+
+# ─── Multi-Core FP32 Fused Pipeline Benchmark ────────────
+MC_KERN_OBJS = micro_kernel_fp32_12x2_swp.o micro_kernel_fp32_12x2_swp_accum.o
+
+bench_fp32_90_mc: bench_fp32_90_mc.o $(MC_KERN_OBJS)
+	$(2PASS_CC) $(2PASS_CFLAGS) -fopenmp -o $@ $^ $(2PASS_LDFLAGS)
+
+bench_fp32_90_mc.o: bench_fp32_90_mc.c
+	$(2PASS_CC) $(2PASS_CFLAGS) -fopenmp -c -o $@ $<
+
+clean_mc:
+	rm -f bench_fp32_90_mc bench_fp32_90_mc.o $(MC_KERN_OBJS)
+
+# ─── Optimized FP32 PA=0 + Kc Sweep Benchmark ────────────
+OPT_KERN_OBJS = micro_kernel_fp32_12x2_swp.o micro_kernel_fp32_12x2_swp_accum.o \
+                micro_kernel_fp32_8x3.o micro_kernel_fp32_8x3_accum.o \
+                micro_kernel_fp32_6x4_bcast.o micro_kernel_fp32_6x4_bcast_accum.o \
+                micro_kernel_fp32_6x4_swp.o micro_kernel_fp32_6x4_swp_accum.o
+
+bench_fp32_opt: bench_fp32_opt.o $(OPT_KERN_OBJS)
+	$(2PASS_CC) $(2PASS_CFLAGS) -fopenmp -o $@ $^ $(2PASS_LDFLAGS)
+
+bench_fp32_opt.o: bench_fp32_opt.c
+	$(2PASS_CC) $(2PASS_CFLAGS) -fopenmp -c -o $@ $<
+
+clean_opt:
+	rm -f bench_fp32_opt bench_fp32_opt.o $(OPT_KERN_OBJS)

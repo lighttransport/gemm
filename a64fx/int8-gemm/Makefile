@@ -28,7 +28,7 @@ else ifeq ($(COMPILER),clang)
 endif
 
 # Targets
-TARGETS = bench_int8_sdot bench_int8_sdot_asm bench_int8_l2stream bench_unroll gemm_tiled bench_igemm_simple bench_peak bench_llm_gemm bench_fp_gemm gemm_parallel bench_batch_gemm bench_profile bench_overlap bench_vec bench_tile bench_fused bench_pipeline gemm_sector bench_compare bench_sector_simple bench_flash_int8 bench_softmax_int8 bench_qkt_gemm bench_tiled_l2 bench_exp2 bench_fused_attn bench_exp2_sve bench_attention bench_flash_fused bench_flash_gemm bench_flash_gemm_opt bench_flash_fused_v2
+TARGETS = bench_int8_sdot bench_int8_sdot_asm bench_int8_l2stream bench_unroll gemm_tiled bench_igemm_simple bench_peak bench_llm_gemm bench_fp_gemm gemm_parallel bench_batch_gemm bench_profile bench_overlap bench_vec bench_tile bench_fused bench_pipeline gemm_sector bench_compare bench_sector_simple bench_flash_int8 bench_softmax_int8 bench_qkt_gemm bench_tiled_l2 bench_exp2 bench_fused_attn bench_exp2_sve bench_attention bench_flash_fused bench_flash_gemm bench_flash_gemm_opt bench_flash_fused_v2 fused_attention_opt fused_attention_v2 bench_3pass_attention
 
 # Source files
 BENCH_SRC = bench_int8_sdot.c
@@ -235,8 +235,34 @@ FLASH_FUSED_V2_OBJ = flash_attention_fused_v2.o
 $(FLASH_FUSED_V2_OBJ): flash_attention_fused_v2.c flash_attention_fused_v2.h gqa_pack.h exp2_int.h
 	$(CC_FCC) -O3 -mcpu=a64fx -c -o $@ $<
 
-bench_flash_fused_v2: bench_flash_fused_v2.c $(FLASH_FUSED_V2_OBJ) $(GQA_PACK_OBJ) $(GQA_KERNEL_OBJ) $(EXP2_OBJ) flash_attention_fused_v2.h
-	$(CC_FCC) -O3 -mcpu=a64fx -fopenmp -o $@ bench_flash_fused_v2.c $(FLASH_FUSED_V2_OBJ) $(GQA_PACK_OBJ) $(GQA_KERNEL_OBJ) $(EXP2_OBJ) -lpthread -lm
+bench_flash_fused_v2: bench_flash_fused_v2.c $(FLASH_FUSED_V2_OBJ) $(GQA_PACK_OBJ) $(GQA_KERNEL_OBJ) $(EXP2_OBJ) $(EXP2_SVE_KERNEL_OBJ) flash_attention_fused_v2.h
+	$(CC_FCC) -O3 -mcpu=a64fx -fopenmp -o $@ bench_flash_fused_v2.c $(FLASH_FUSED_V2_OBJ) $(GQA_PACK_OBJ) $(GQA_KERNEL_OBJ) $(EXP2_OBJ) $(EXP2_SVE_KERNEL_OBJ) -lpthread -lm
+
+# Fused Attention Optimized (12-core, using CMG kernel)
+CMG_KERNEL_OBJ = ../int8-cmg/micro_kernel_6x4_ooo.o
+
+$(CMG_KERNEL_OBJ): ../int8-cmg/micro_kernel_6x4_ooo.S
+	$(CC_FCC) -c -o $@ $<
+
+fused_attention_opt: fused_attention_opt.c $(CMG_KERNEL_OBJ)
+	$(CC_FCC) -O3 -mcpu=a64fx -fopenmp -o $@ $< $(CMG_KERNEL_OBJ) -lm
+
+# Fused Attention V2 (K-outer P@V for better V reuse)
+fused_attention_v2: fused_attention_v2.c $(CMG_KERNEL_OBJ)
+	$(CC_FCC) -O3 -mcpu=a64fx -fopenmp -o $@ $< $(CMG_KERNEL_OBJ) -lm
+
+# 3-Pass Fused Attention (INT8 Q@K^T, Softmax, FP32 P@V with streaming)
+SDOT_6X4_OBJ = micro_kernel_sdot_6x4.o
+PV_6X4_OBJ = micro_kernel_pv_6x4_stream.o
+
+$(SDOT_6X4_OBJ): micro_kernel_sdot_6x4.S
+	$(CC_FCC) -c -o $@ $<
+
+$(PV_6X4_OBJ): micro_kernel_pv_6x4_stream.S
+	$(CC_FCC) -c -o $@ $<
+
+bench_3pass_attention: bench_3pass_attention.c $(SDOT_6X4_OBJ) $(PV_6X4_OBJ)
+	$(CC_FCC) -O3 -mcpu=a64fx -fopenmp -o $@ $< $(SDOT_6X4_OBJ) $(PV_6X4_OBJ) -lm
 
 clean:
 	rm -f $(TARGETS) $(KERNEL_OBJ) $(KERNEL_L2_OBJ) $(GQA_KERNEL_OBJ) $(GQA_PACK_OBJ) $(GQA_TILED_OBJ) $(EXP2_OBJ) $(FUSED_ATTN_OBJ) $(FUSED_ATTN_OPT_OBJ) $(EXP2_SVE_KERNEL_OBJ) $(ATTENTION_FULL_OBJ) $(FLASH_ATTN_FUSED_OBJ) $(GEMM_OPT_OBJ) $(FLASH_FUSED_V2_OBJ) softmax_int8.o
