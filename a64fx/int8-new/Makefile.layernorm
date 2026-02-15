@@ -1,0 +1,31 @@
+# Makefile for INT8/INT16 LayerNorm and RMSNorm
+
+CC = fcc
+CFLAGS = -Nclang -O3 -march=armv8.2-a+sve -ffast-math
+LIBS = -lm
+
+# Source files
+SRCS = layernorm_int8.c layernorm_int16.c
+OBJS = $(SRCS:.c=.o)
+
+# Test program
+TEST = test_layernorm
+TEST_SRC = test_layernorm.c
+TEST_OBJ = $(TEST_SRC:.c=.o)
+
+# Build targets
+all: $(TEST)
+
+$(TEST): $(OBJS) $(TEST_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+%.o: %.c layernorm.h
+	$(CC) $(CFLAGS) -c $<
+
+clean:
+	rm -f $(OBJS) $(TEST_OBJ) $(TEST)
+
+run: $(TEST)
+	./$(TEST)
+
+.PHONY: all clean run

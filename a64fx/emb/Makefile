@@ -1,10 +1,10 @@
 # Makefile for A64FX SVE Embedding Kernels
 #
 # Usage:
-#   make                    - Build with fcc (native on compute node)
+#   make                    - Build single-core benchmark
+#   make omp                - Build multi-core (OpenMP) benchmark
 #   make COMPILER=fcc       - Build with fcc (native)
 #   make COMPILER=fccpx     - Build with fccpx (cross-compile from login node)
-#   make COMPILER=clang     - Build with clang (cross-compile)
 
 #=============================================================================
 # Compiler Selection (default: fcc)
@@ -17,12 +17,14 @@ ifeq ($(COMPILER),fcc)
     CFLAGS = -O3 -Nclang -march=armv8.2-a+sve -mcpu=a64fx -ffast-math -Wall
     ASFLAGS = -Nclang -march=armv8.2-a+sve -mcpu=a64fx
     LDFLAGS = -lm
+    OMP_FLAG = -fopenmp
 else ifeq ($(COMPILER),fccpx)
     CC = fccpx
     AS = fccpx
     CFLAGS = -O3 -Nclang -march=armv8.2-a+sve -mcpu=a64fx -ffast-math -Wall
     ASFLAGS = -Nclang -march=armv8.2-a+sve -mcpu=a64fx
     LDFLAGS = -lm
+    OMP_FLAG = -fopenmp
 else ifeq ($(COMPILER),clang)
     CC = clang
     AS = clang
@@ -30,6 +32,7 @@ else ifeq ($(COMPILER),clang)
              -ffast-math -Wall
     ASFLAGS = --target=aarch64-linux-gnu -march=armv8.2-a+sve -mcpu=a64fx
     LDFLAGS = -lm --target=aarch64-linux-gnu
+    OMP_FLAG = -fopenmp
 else
     $(error Unknown COMPILER=$(COMPILER). Use fcc, fccpx, or clang)
 endif
@@ -37,63 +40,78 @@ endif
 #=============================================================================
 # Targets
 #=============================================================================
-BENCH_TARGET = bench_embedding
-BENCH_OBJS = bench_embedding.o embedding_asm.o
+BENCH_TARGET     = bench_embedding
+BENCH_OMP_TARGET = bench_embedding_omp
+ASM_OBJ          = embedding_asm.o
 
 #=============================================================================
 # Phony targets
 #=============================================================================
-.PHONY: all clean run bench help test
+.PHONY: all omp clean run run-omp test help
 
 #=============================================================================
-# Default target
+# Default: single-core
 #=============================================================================
 all: $(BENCH_TARGET)
 
 #=============================================================================
-# Benchmark executable
+# OpenMP: multi-core
 #=============================================================================
-$(BENCH_TARGET): $(BENCH_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+omp: $(BENCH_OMP_TARGET)
 
 #=============================================================================
-# Run benchmark
+# Single-core benchmark
+#=============================================================================
+$(BENCH_TARGET): bench_embedding.c embedding.h $(ASM_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_embedding.c $(ASM_OBJ) $(LDFLAGS)
+
+#=============================================================================
+# OpenMP benchmark
+#=============================================================================
+bench_embedding_omp.o: bench_embedding.c embedding.h
+	$(CC) $(CFLAGS) $(OMP_FLAG) -c -o $@ bench_embedding.c
+
+$(BENCH_OMP_TARGET): bench_embedding_omp.o $(ASM_OBJ)
+	$(CC) $(CFLAGS) $(OMP_FLAG) -o $@ $^ $(LDFLAGS)
+
+#=============================================================================
+# Assembly object
+#=============================================================================
+$(ASM_OBJ): embedding_asm.S
+	$(CC) $(ASFLAGS) -c -o $@ $<
+
+#=============================================================================
+# Run targets
 #=============================================================================
 run: $(BENCH_TARGET)
-	./$(BENCH_TARGET) 1000 512 4096 32000
+	./$(BENCH_TARGET)
 
-bench: $(BENCH_TARGET)
-	./$(BENCH_TARGET) 10000 512 4096 32000
+run-omp: $(BENCH_OMP_TARGET)
+	OMP_NUM_THREADS=48 ./$(BENCH_OMP_TARGET)
 
-# Quick test with smaller parameters
+# Quick correctness test (single-core)
 test: $(BENCH_TARGET)
-	./$(BENCH_TARGET) 100 64 512 1000
+	./$(BENCH_TARGET)
 
-# Large batch test
-large: $(BENCH_TARGET)
-	./$(BENCH_TARGET) 1000 2048 4096 32000
+# Bench-only (skip correctness)
+bench: $(BENCH_TARGET)
+	./$(BENCH_TARGET) --bench-only
 
-#=============================================================================
-# Generic compilation rules
-#=============================================================================
-%.o: %.c embedding.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-%.o: %.S
-	$(CC) $(ASFLAGS) -c -o $@ $<
+bench-omp: $(BENCH_OMP_TARGET)
+	OMP_NUM_THREADS=48 ./$(BENCH_OMP_TARGET) --bench-only
 
 #=============================================================================
 # Disassembly
 #=============================================================================
-disasm: embedding_asm.o
-	objdump -d embedding_asm.o > embedding_asm.dis
+disasm: $(ASM_OBJ)
+	objdump -d $(ASM_OBJ) > embedding_asm.dis
 	@echo "Disassembly: embedding_asm.dis"
 
 #=============================================================================
 # Clean
 #=============================================================================
 clean:
-	rm -f *.o *.dis $(BENCH_TARGET)
+	rm -f *.o *.dis $(BENCH_TARGET) $(BENCH_OMP_TARGET)
 
 #=============================================================================
 # Help
@@ -102,37 +120,21 @@ help:
 	@echo "A64FX SVE Embedding Kernels"
 	@echo "============================"
 	@echo ""
-	@echo "Compiler selection (COMPILER=fcc|fccpx|clang):"
-	@echo "  make                     - Build with fcc (native on compute node)"
-	@echo "  make COMPILER=fcc        - Build with fcc (native)"
-	@echo "  make COMPILER=fccpx      - Build with fccpx (cross-compile from login)"
-	@echo "  make COMPILER=clang      - Build with clang (cross-compile)"
+	@echo "Build targets:"
+	@echo "  make           - Build single-core benchmark"
+	@echo "  make omp       - Build OpenMP multi-core benchmark"
 	@echo ""
-	@echo "Current compiler: $(COMPILER)"
-	@echo "  CC=$(CC)"
-	@echo "  CFLAGS=$(CFLAGS)"
-	@echo ""
-	@echo "Targets:"
-	@echo "  make all      - Build benchmark executable"
-	@echo "  make run      - Build and run with default parameters"
-	@echo "  make bench    - Build and run extended benchmark"
-	@echo "  make test     - Build and run quick test"
-	@echo "  make large    - Build and run large batch benchmark"
-	@echo "  make disasm   - Generate disassembly of embedding_asm.o"
-	@echo "  make clean    - Remove all build artifacts"
-	@echo "  make help     - Show this help"
+	@echo "Run targets:"
+	@echo "  make run       - Run single-core benchmark"
+	@echo "  make run-omp   - Run 48-thread OpenMP benchmark"
+	@echo "  make test      - Quick correctness test"
+	@echo "  make bench     - Performance only (skip correctness)"
 	@echo ""
 	@echo "Kernels:"
-	@echo "  - embedding_fwd_f32_asm:          Forward pass FP32"
-	@echo "  - embedding_fwd_f32_batched_asm:  Forward pass FP32 (4-token batched)"
-	@echo "  - embedding_bwd_f32_asm:          Backward pass FP32"
-	@echo "  - embedding_fwd_f64_asm:          Forward pass FP64"
-	@echo "  - embedding_bwd_f64_asm:          Backward pass FP64"
-	@echo "  - embedding_fwd_with_pos_f32_asm: Token + position embedding FP32"
-	@echo "  - embedding_grad_zero_f32_asm:    Zero gradient table"
-	@echo "  - embedding_bwd_sorted_f32_asm:   Backward with sorted indices"
+	@echo "  baseline  - Sequential row copy with next-row prefetch"
+	@echo "  batched   - 4-token batched row copy"
+	@echo "  stream    - 8x unroll + deep prefetch (8 rows ahead)"
+	@echo "  gather    - SVE gather/scatter (16 tokens column-wise)"
+	@echo "  sorted    - Counting sort + contiguous read + indirect write"
 	@echo ""
-	@echo "Architecture: A64FX (Fugaku)"
-	@echo "  SVE vector length: 512 bits"
-	@echo "  FP64: 8 elements/vector"
-	@echo "  FP32: 16 elements/vector"
+	@echo "Compiler: $(COMPILER) (override with COMPILER=fcc|fccpx|clang)"
