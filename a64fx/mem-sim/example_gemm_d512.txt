@@ -1,0 +1,326 @@
+# Example: INT8 GEMM Access Pattern (D=512)
+# Simulates 6-row kernel with D=512 hidden dimension
+# Working set: ~8 KB (larger, more L1 misses)
+#
+# Memory layout:
+# - A matrix (6 rows): 6 * 512 = 3072 bytes
+# - B matrix (1 K-group): 4 * 512 = 2048 bytes
+# Total per K-group: ~5 KB
+
+# Base addresses:
+# A matrix: 0x10000
+# B matrix: 0x20000
+
+# Outer loop: Process 64 K-groups (D=512 / 8 = 64)
+# Show first 8 K-groups to demonstrate pattern
+
+# K-group 0
+# Load A rows (6 rows, 32 bytes each)
+ld1 0x10000 32
+ld1 0x10020 32
+ld1 0x10040 32
+ld1 0x10060 32
+ld1 0x10080 32
+ld1 0x100a0 32
+
+# Load B columns (4 cols, 32 bytes each)
+ld1 0x20000 32
+ld1 0x20020 32
+ld1 0x20040 32
+ld1 0x20060 32
+
+# Compute
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 1
+ld1 0x100c0 32
+ld1 0x100e0 32
+ld1 0x10100 32
+ld1 0x10120 32
+ld1 0x10140 32
+ld1 0x10160 32
+
+ld1 0x20080 32
+ld1 0x200a0 32
+ld1 0x200c0 32
+ld1 0x200e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 2
+ld1 0x10180 32
+ld1 0x101a0 32
+ld1 0x101c0 32
+ld1 0x101e0 32
+ld1 0x10200 32
+ld1 0x10220 32
+
+ld1 0x20100 32
+ld1 0x20120 32
+ld1 0x20140 32
+ld1 0x20160 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 3
+ld1 0x10240 32
+ld1 0x10260 32
+ld1 0x10280 32
+ld1 0x102a0 32
+ld1 0x102c0 32
+ld1 0x102e0 32
+
+ld1 0x20180 32
+ld1 0x201a0 32
+ld1 0x201c0 32
+ld1 0x201e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 4
+ld1 0x10300 32
+ld1 0x10320 32
+ld1 0x10340 32
+ld1 0x10360 32
+ld1 0x10380 32
+ld1 0x103a0 32
+
+ld1 0x20200 32
+ld1 0x20220 32
+ld1 0x20240 32
+ld1 0x20260 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 5
+ld1 0x103c0 32
+ld1 0x103e0 32
+ld1 0x10400 32
+ld1 0x10420 32
+ld1 0x10440 32
+ld1 0x10460 32
+
+ld1 0x20280 32
+ld1 0x202a0 32
+ld1 0x202c0 32
+ld1 0x202e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 6
+ld1 0x10480 32
+ld1 0x104a0 32
+ld1 0x104c0 32
+ld1 0x104e0 32
+ld1 0x10500 32
+ld1 0x10520 32
+
+ld1 0x20300 32
+ld1 0x20320 32
+ld1 0x20340 32
+ld1 0x20360 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# K-group 7
+ld1 0x10540 32
+ld1 0x10560 32
+ld1 0x10580 32
+ld1 0x105a0 32
+ld1 0x105c0 32
+ld1 0x105e0 32
+
+ld1 0x20380 32
+ld1 0x203a0 32
+ld1 0x203c0 32
+ld1 0x203e0 32
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Expected: ~75% L1 hit rate (worse than D=256)
+# Working set: 3072 + 2048 = 5120 bytes
+# Some cache pressure, more L2 accesses

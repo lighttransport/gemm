@@ -1,0 +1,525 @@
+# Heavily Tiled Fused GEMM: (A @ B) @ C
+# Demonstrates maximum L1 reuse with proper blocking
+#
+# Strategy: Process entire computation in L1-sized tiles
+# - A_tile: 6 × 64 = 384 bytes (2 cache lines)
+# - B_tile: 16 × 64 = 1024 bytes (4 cache lines)
+# - C_tile: 16 × 64 = 1024 bytes (4 cache lines)
+# - Total working set: ~2.4 KB << 64 KB L1
+#
+# This shows steady-state behavior with good temporal locality
+
+# ============================================================
+# WARMUP: Prefetch initial working set into L1
+# ============================================================
+
+prfm 0x100000
+prfm 0x100100
+prfm 0x200000
+prfm 0x200100
+prfm 0x200200
+prfm 0x200300
+prfm 0x400000
+prfm 0x400100
+
+# ============================================================
+# TILE 0: First A-tile × First B-tile block
+# A[6,64] × B[16,64]^T = partial AB[6,16]
+# ============================================================
+
+# Load A tile (6 rows × 64 bytes = 384 bytes)
+ld1 0x100000 64
+ld1 0x100040 64
+ld1 0x100080 64
+ld1 0x1000c0 64
+ld1 0x100100 64
+ld1 0x100140 64
+
+# Load B tile (4 rows × 64 bytes)
+ld1 0x200000 64
+ld1 0x200040 64
+ld1 0x200080 64
+ld1 0x2000c0 64
+
+# Compute 6×4 partial products
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Load next 4 B rows (A tile still in L1 - REUSE!)
+ld1 0x200100 64
+ld1 0x200140 64
+ld1 0x200180 64
+ld1 0x2001c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Load next 4 B rows (A still in L1!)
+ld1 0x200200 64
+ld1 0x200240 64
+ld1 0x200280 64
+ld1 0x2002c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# Load last 4 B rows of this tile (A still in L1!)
+ld1 0x200300 64
+ld1 0x200340 64
+ld1 0x200380 64
+ld1 0x2003c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# ============================================================
+# TILE 1: Same A-tile × Next B-tile block (K dimension)
+# A[6,64] × B[16,64]^T (next K slice)
+# A is STILL in L1 from previous tile!
+# ============================================================
+
+# A tile is already in L1, just reload (should hit)
+ld1 0x100000 64
+ld1 0x100040 64
+ld1 0x100080 64
+ld1 0x1000c0 64
+ld1 0x100100 64
+ld1 0x100140 64
+
+# Load new B tile (K offset)
+ld1 0x200400 64
+ld1 0x200440 64
+ld1 0x200480 64
+ld1 0x2004c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x200500 64
+ld1 0x200540 64
+ld1 0x200580 64
+ld1 0x2005c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x200600 64
+ld1 0x200640 64
+ld1 0x200680 64
+ld1 0x2006c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x200700 64
+ld1 0x200740 64
+ld1 0x200780 64
+ld1 0x2007c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# ============================================================
+# TILE 2: Continue K accumulation (A still in L1)
+# ============================================================
+
+# A tile reload (should hit in L1)
+ld1 0x100000 64
+ld1 0x100040 64
+ld1 0x100080 64
+ld1 0x1000c0 64
+ld1 0x100100 64
+ld1 0x100140 64
+
+ld1 0x200800 64
+ld1 0x200840 64
+ld1 0x200880 64
+ld1 0x2008c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x200900 64
+ld1 0x200940 64
+ld1 0x200980 64
+ld1 0x2009c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# ============================================================
+# PHASE 2: Second GEMM with C (AB in registers)
+# C tiles also show good L1 reuse
+# ============================================================
+
+# Load C tile
+ld1 0x400000 64
+ld1 0x400040 64
+ld1 0x400080 64
+ld1 0x4000c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x400100 64
+ld1 0x400140 64
+ld1 0x400180 64
+ld1 0x4001c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x400200 64
+ld1 0x400240 64
+ld1 0x400280 64
+ld1 0x4002c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+ld1 0x400300 64
+ld1 0x400340 64
+ld1 0x400380 64
+ld1 0x4003c0 64
+
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+sdot
+
+# ============================================================
+# STORE OUTPUT with zfill
+# ============================================================
+
+zfill 0x500000
+st1 0x500000 64
+zfill 0x500040
+st1 0x500040 64
+zfill 0x500080
+st1 0x500080 64
+zfill 0x5000c0
+st1 0x5000c0 64
+zfill 0x500100
+st1 0x500100 64
+zfill 0x500140
+st1 0x500140 64
+
+# ============================================================
+# KEY INSIGHT: A tile is loaded 3 times but should hit in L1
+# after the first load. B and C stream through once each.
+#
+# Expected L1 hit pattern:
+# - First A load: MISS (cold)
+# - Second A load: HIT (in L1)
+# - Third A load: HIT (in L1)
+# - B loads: Sequential, some spatial hits within 256-byte lines
+# - C loads: Sequential, some spatial hits within 256-byte lines
+#
+# This demonstrates proper tiled GEMM cache behavior
+# ============================================================
