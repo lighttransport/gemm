@@ -732,18 +732,347 @@ static void run_scaling_test(void)
 }
 
 //=============================================================================
+// FP16 helpers
+//=============================================================================
+// Use uint16_t as storage type; fcc __fp16 for conversion
+#ifdef __ARM_FP16_FORMAT_IEEE
+typedef __fp16 fp16_t;
+#else
+typedef uint16_t fp16_t;
+#endif
+
+static float fp16_to_f32(fp16_t v) {
+#ifdef __ARM_FP16_FORMAT_IEEE
+    return (float)v;
+#else
+    // Minimal software decode (for correctness test only)
+    uint16_t bits = v;
+    uint32_t sign = (bits >> 15) & 1;
+    uint32_t exp  = (bits >> 10) & 0x1f;
+    uint32_t frac = bits & 0x3ff;
+    uint32_t f32;
+    if (exp == 0) {
+        if (frac == 0) f32 = sign << 31;
+        else { exp = 1; while (!(frac & 0x400)) { frac <<= 1; exp--; }
+               frac &= 0x3ff; f32 = (sign<<31) | ((exp+127-15)<<23) | (frac<<13); }
+    } else if (exp == 31) { f32 = (sign<<31) | 0x7f800000 | (frac<<13); }
+    else { f32 = (sign<<31) | ((exp+127-15)<<23) | (frac<<13); }
+    float result; memcpy(&result, &f32, 4); return result;
+#endif
+}
+
+static fp16_t f32_to_fp16(float v) {
+#ifdef __ARM_FP16_FORMAT_IEEE
+    return (fp16_t)v;
+#else
+    uint32_t f32; memcpy(&f32, &v, 4);
+    uint32_t sign = (f32 >> 31) & 1;
+    int32_t exp = ((f32 >> 23) & 0xff) - 127 + 15;
+    uint32_t frac = (f32 >> 13) & 0x3ff;
+    if (exp <= 0) return (fp16_t)(sign << 15);
+    if (exp >= 31) return (fp16_t)((sign << 15) | 0x7c00);
+    return (fp16_t)((sign << 15) | (exp << 10) | frac);
+#endif
+}
+
+//=============================================================================
+// NUMA-Replicated FP16 CMG Scaling Test
+//
+// Architecture:
+//   A64FX has 4 CMGs (Core Memory Groups), each with 12 cores + local HBM2.
+//   Per-CMG HBM2 bandwidth: ~256 GB/s read, ~128 GB/s write.
+//   Inter-CMG ring bandwidth: ~100 GB/s total (shared).
+//
+// Problem: With a single embedding table, remote CMGs bottleneck on the ring.
+//   4 CMGs reading one table → ~78 GB/s total (ring-limited).
+//
+// Solution: Replicate FP16 table to each CMG's local HBM2.
+//   - FP16 halves memory: 151936 × 4096 × 2B = 1.17 GB per replica
+//   - 4 replicas = 4.69 GB (fits easily in 32 GB HBM2)
+//   - Each CMG reads LOCAL table, writes LOCAL output → zero inter-CMG traffic
+//   - Sequence split into N equal chunks, one per CMG
+//
+// Expected: linear scaling — 2 CMG = 2×, 3 CMG = 3×, 4 CMG = 4× of 1 CMG.
+//=============================================================================
+#ifdef _OPENMP
+#define MAX_CMGS 4
+#define CORES_PER_CMG 12
+
+static void run_cmg_scaling_test(void)
+{
+    printf("\n====================================================================\n");
+    printf("NUMA-Replicated FP16 CMG Scaling (vocab=%d)\n", VOCAB_SIZE);
+    printf("Each CMG gets local FP16 table + local output + sequence/N partition\n");
+    printf("====================================================================\n\n");
+
+    printf("  How it works:\n");
+    printf("  1. Allocate N_CMG copies of FP16 embedding table\n");
+    printf("  2. Allocate N_CMG separate output buffers\n");
+    printf("  3. First-touch init each table+output from that CMG's 12 threads\n");
+    printf("     (demand paging → pages placed on touching CMG's local HBM2)\n");
+    printf("  4. Split sequence into N_CMG equal chunks\n");
+    printf("  5. Each CMG's 12 threads process their chunk:\n");
+    printf("     LOCAL table read + LOCAL output write → zero inter-CMG traffic\n");
+    printf("  6. FP16 halves memory: 151936 × 4096 × 2B = 1.17 GB per replica\n\n");
+
+    size_t dim = 4096;
+    size_t seq = 262144;  // 256K tokens
+    size_t table_elems = (size_t)VOCAB_SIZE * dim;
+    size_t table_bytes = table_elems * sizeof(fp16_t);
+    int iters = 5;
+
+    printf("  Config: seq=%zuK, dim=%zu, vocab=%d\n", seq/1024, dim, VOCAB_SIZE);
+    printf("  FP16 table: %.2f GB per replica\n", table_bytes / 1e9);
+    printf("  FP16 output: %.2f GB total\n", seq * dim * sizeof(fp16_t) / 1e9);
+    printf("\n");
+
+    // Allocate index array (shared, small — 1MB, fits in L2 after warmup)
+    int32_t* indices = (int32_t*)aligned_alloc(256, seq * sizeof(int32_t));
+    if (!indices) { printf("  ERROR: index alloc\n"); return; }
+    pcg_seed(555);
+    for (size_t i = 0; i < seq; i++)
+        indices[i] = rand_int(VOCAB_SIZE);
+
+    // Master FP16 table (initialized sequentially, then copied per-CMG)
+    fp16_t* master_table = (fp16_t*)aligned_alloc(256, table_bytes);
+    if (!master_table) { printf("  ERROR: master table alloc\n"); free(indices); return; }
+    pcg_seed(777);
+    for (size_t i = 0; i < table_elems; i++)
+        master_table[i] = f32_to_fp16((float)(pcg32() & 0xFFFF) * 1e-4f - 3.0f);
+
+    // Per-CMG table replicas, output buffers, and index replicas
+    fp16_t* cmg_tables[MAX_CMGS] = {NULL};
+    fp16_t* cmg_outputs[MAX_CMGS] = {NULL};
+    int32_t* cmg_indices[MAX_CMGS] = {NULL};
+
+    printf("  %-18s | %3s | %11s | %11s | %6s | %7s\n",
+           "Config", "Thr", "Time", "BW", "Peak%", "Scaling");
+    printf("  %-18s-+-%3s-+-%11s-+-%11s-+-%6s-+-%7s\n",
+           "------------------", "---", "-----------", "-----------", "------", "-------");
+
+    double bw_1cmg = 0.0;
+
+    int cmg_counts[] = {1, 2, 3, 4};
+    int n_configs = sizeof(cmg_counts) / sizeof(cmg_counts[0]);
+
+    for (int ci = 0; ci < n_configs; ci++) {
+        int n_cmg = cmg_counts[ci];
+        int total_threads = n_cmg * CORES_PER_CMG;
+        size_t base_cmg_seq = seq / (size_t)n_cmg;
+
+        // Allocate per-CMG: table replicas + output buffers + index replicas
+        int alloc_ok = 1;
+        for (int c = 0; c < n_cmg; c++) {
+            cmg_tables[c] = (fp16_t*)aligned_alloc(256, table_bytes);
+            size_t this_seq = (c == n_cmg - 1) ? (seq - (size_t)c * base_cmg_seq) : base_cmg_seq;
+            cmg_outputs[c] = (fp16_t*)aligned_alloc(256, this_seq * dim * sizeof(fp16_t));
+            cmg_indices[c] = (int32_t*)aligned_alloc(256, this_seq * sizeof(int32_t));
+            if (!cmg_tables[c] || !cmg_outputs[c] || !cmg_indices[c]) {
+                printf("  ERROR: CMG%d alloc failed\n", c);
+                alloc_ok = 0;
+                break;
+            }
+        }
+        if (!alloc_ok) goto cleanup;
+
+        // First-touch each table/output/indices from its CMG's threads
+        // OMP_PROC_BIND=close ensures threads 0-11 → CMG0, 12-23 → CMG1, etc.
+        omp_set_num_threads(total_threads);
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            int cmg = tid / CORES_PER_CMG;
+            int local_tid = tid % CORES_PER_CMG;
+
+            if (cmg < n_cmg) {
+                // First-touch table replica (12 threads per table)
+                size_t tbl_chunk = (table_elems + CORES_PER_CMG - 1) / CORES_PER_CMG;
+                size_t tbl_start = (size_t)local_tid * tbl_chunk;
+                size_t tbl_end = tbl_start + tbl_chunk;
+                if (tbl_end > table_elems) tbl_end = table_elems;
+                if (tbl_start < tbl_end)
+                    memcpy(cmg_tables[cmg] + tbl_start, master_table + tbl_start,
+                           (tbl_end - tbl_start) * sizeof(fp16_t));
+
+                // This CMG's sequence parameters
+                size_t cmg_start_idx = (size_t)cmg * base_cmg_seq;
+                size_t this_seq = (cmg == n_cmg - 1)
+                    ? (seq - cmg_start_idx) : base_cmg_seq;
+
+                // First-touch index replica (copy this CMG's index chunk locally)
+                size_t idx_chunk = (this_seq + CORES_PER_CMG - 1) / CORES_PER_CMG;
+                size_t idx_start = (size_t)local_tid * idx_chunk;
+                size_t idx_end = idx_start + idx_chunk;
+                if (idx_end > this_seq) idx_end = this_seq;
+                if (idx_start < idx_end)
+                    memcpy(cmg_indices[cmg] + idx_start,
+                           indices + cmg_start_idx + idx_start,
+                           (idx_end - idx_start) * sizeof(int32_t));
+
+                // First-touch output buffer
+                size_t out_elems = this_seq * dim;
+                size_t out_chunk = (out_elems + CORES_PER_CMG - 1) / CORES_PER_CMG;
+                size_t out_start = (size_t)local_tid * out_chunk;
+                size_t out_end = out_start + out_chunk;
+                if (out_end > out_elems) out_end = out_elems;
+                if (out_start < out_end)
+                    memset(cmg_outputs[cmg] + out_start, 0,
+                           (out_end - out_start) * sizeof(fp16_t));
+            }
+        }
+
+        // Warmup (3 iterations)
+        for (int w = 0; w < 3; w++) {
+            #pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
+                int cmg = tid / CORES_PER_CMG;
+                int local_tid = tid % CORES_PER_CMG;
+
+                if (cmg < n_cmg) {
+                    size_t cmg_start_idx = (size_t)cmg * base_cmg_seq;
+                    size_t this_seq = (cmg == n_cmg - 1)
+                        ? (seq - cmg_start_idx) : base_cmg_seq;
+                    size_t thr_chunk = (this_seq + CORES_PER_CMG - 1) / CORES_PER_CMG;
+                    size_t thr_start = (size_t)local_tid * thr_chunk;
+                    size_t thr_end = thr_start + thr_chunk;
+                    if (thr_end > this_seq) thr_end = this_seq;
+
+                    if (thr_start < thr_end) {
+                        embedding_fwd_f16_stream_asm(
+                            cmg_indices[cmg] + thr_start,  // LOCAL indices
+                            cmg_tables[cmg],
+                            cmg_outputs[cmg] + thr_start * dim,
+                            thr_end - thr_start,
+                            dim);
+                    }
+                }
+            }
+        }
+
+        // Timed runs — take best of N to filter OS noise
+        double best_sec = 1e30;
+        for (int it = 0; it < iters; it++) {
+            double t0 = get_time_sec();
+            #pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
+                int cmg = tid / CORES_PER_CMG;
+                int local_tid = tid % CORES_PER_CMG;
+
+                if (cmg < n_cmg) {
+                    size_t cmg_start_idx = (size_t)cmg * base_cmg_seq;
+                    size_t this_seq = (cmg == n_cmg - 1)
+                        ? (seq - cmg_start_idx) : base_cmg_seq;
+                    size_t thr_chunk = (this_seq + CORES_PER_CMG - 1) / CORES_PER_CMG;
+                    size_t thr_start = (size_t)local_tid * thr_chunk;
+                    size_t thr_end = thr_start + thr_chunk;
+                    if (thr_end > this_seq) thr_end = this_seq;
+
+                    if (thr_start < thr_end) {
+                        // ALL data LOCAL: indices, table, output
+                        embedding_fwd_f16_stream_asm(
+                            cmg_indices[cmg] + thr_start,  // LOCAL indices
+                            cmg_tables[cmg],               // LOCAL table
+                            cmg_outputs[cmg] + thr_start * dim,  // LOCAL output
+                            thr_end - thr_start,
+                            dim);
+                    }
+                }
+            }
+            double t1 = get_time_sec();
+            double elapsed = t1 - t0;
+            if (elapsed < best_sec) best_sec = elapsed;
+        }
+
+        // Bytes moved: read table rows + write output (FP16 = 2 bytes/elem)
+        // + read indices (4 bytes/token)
+        double bytes = (double)seq * (double)dim * 2.0 * 2.0 + (double)seq * 4.0;
+        double bw = bytes / best_sec / 1e9;
+        double pct = bw / HBM2_PEAK_GBS * 100.0;
+
+        if (ci == 0) bw_1cmg = bw;
+        double scaling = (bw_1cmg > 0.0) ? bw / bw_1cmg : 0.0;
+
+        char label[64];
+        snprintf(label, sizeof(label), "FP16 %dCMG replicated", n_cmg);
+        printf("  %-18s | %3d | %8.2f ms | %7.1f GB/s | %5.1f%% | %5.2fx\n",
+               label, total_threads, best_sec * 1e3, bw, pct, scaling);
+
+        // Free per-CMG allocations
+        for (int c = 0; c < n_cmg; c++) {
+            free(cmg_tables[c]);  cmg_tables[c] = NULL;
+            free(cmg_outputs[c]); cmg_outputs[c] = NULL;
+            free(cmg_indices[c]); cmg_indices[c] = NULL;
+        }
+    }
+
+    // Also run single-CMG FP32 for comparison
+    {
+        float* f32_table = (float*)aligned_alloc(256, (size_t)VOCAB_SIZE * dim * sizeof(float));
+        float* f32_output = (float*)aligned_alloc(256, seq * dim * sizeof(float));
+        if (f32_table && f32_output) {
+            for (size_t i = 0; i < table_elems; i++)
+                f32_table[i] = fp16_to_f32(master_table[i]);
+            memset(f32_output, 0, seq * dim * sizeof(float));
+
+            omp_set_num_threads(CORES_PER_CMG);
+            embedding_fwd_f32_omp(indices, f32_table, f32_output, seq, dim,
+                                   embedding_fwd_f32_stream_asm);
+            double t0 = get_time_sec();
+            for (int it = 0; it < iters; it++)
+                embedding_fwd_f32_omp(indices, f32_table, f32_output, seq, dim,
+                                       embedding_fwd_f32_stream_asm);
+            double t1 = get_time_sec();
+            double avg = (t1 - t0) / iters;
+            double bw_bytes = (double)seq * (double)dim * 4.0 * 2.0 + (double)seq * 4.0;
+            double bw = bw_bytes / avg / 1e9;
+            printf("  ---\n");
+            printf("  %-18s | %3d | %8.2f ms | %7.1f GB/s | %5.1f%% | (ref)\n",
+                   "FP32 1CMG baseline", CORES_PER_CMG, avg * 1e3, bw,
+                   bw / HBM2_PEAK_GBS * 100.0);
+        }
+        free(f32_table);
+        free(f32_output);
+    }
+
+    printf("\n");
+    printf("  Note: Linear scaling expected when each CMG accesses only LOCAL HBM2.\n");
+    printf("  Inter-CMG ring (~100 GB/s) is the bottleneck with shared tables.\n");
+
+    goto done;
+
+cleanup:
+    for (int c = 0; c < MAX_CMGS; c++) {
+        free(cmg_tables[c]);  cmg_tables[c] = NULL;
+        free(cmg_outputs[c]); cmg_outputs[c] = NULL;
+        free(cmg_indices[c]); cmg_indices[c] = NULL;
+    }
+
+done:
+    free(indices);
+    free(master_table);
+}
+#endif // _OPENMP
+
+//=============================================================================
 // Main
 //=============================================================================
 int main(int argc, char** argv)
 {
     int skip_correctness = 0;
     int bench_only_zipf = 0;
+    int cmg_only = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--bench-only") == 0)
             skip_correctness = 1;
         if (strcmp(argv[i], "--zipf-only") == 0) {
             skip_correctness = 1;
             bench_only_zipf = 1;
+        }
+        if (strcmp(argv[i], "--cmg-only") == 0) {
+            skip_correctness = 1;
+            cmg_only = 1;
         }
     }
 
@@ -767,12 +1096,21 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    if (bench_only_zipf) {
+    if (cmg_only) {
+#ifdef _OPENMP
+        run_cmg_scaling_test();
+#else
+        printf("CMG scaling requires OpenMP.\n");
+#endif
+    } else if (bench_only_zipf) {
         run_zipfian_benchmark();
     } else {
         run_benchmarks();
         run_zipfian_benchmark();
         run_scaling_test();
+#ifdef _OPENMP
+        run_cmg_scaling_test();
+#endif
     }
 
     printf("\nDone.\n");
