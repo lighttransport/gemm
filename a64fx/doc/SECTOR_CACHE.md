@@ -24,7 +24,8 @@ sector cache from C source code. These pragmas are **only available in FCC tradi
 - 2 groups of 2 sectors: {sector0, sector1} and {sector2, sector3}
 - Sector IDs 0,1 and 2,3 cannot be active simultaneously in the same CMG
 - Register changes on one PE affect all PEs in the same CMG
-- Registers: `IMP_SCCR_SET0_L2_EL1` (sys_reg(3, 0, 15, 8, 2))
+- Not programmble from app: Registers: `IMP_SCCR_SET0_L2_EL1` (sys_reg(3, 0, 15, 8, 2))
+- IMP_SCCR_VSCCR_L2_EL0
 
 ### Sector Mechanism
 
@@ -52,9 +53,12 @@ override function interprets this bit to route the access to the correct sector.
 ### Prerequisites
 
 - **`-Khpctag`** compiler flag must be active (enabled by default with `-KA64FX`)
-- **`IMP_SCTLR_EL1.L1SECTORE`** must be enabled in the kernel for actual partitioning
-- **Fugaku status**: Sector cache is NOT enabled in the Fugaku kernel. The compiler
-  correctly emits all instructions, but the hardware ignores the sector hints.
+- **Fugaku status**: Sector cache **IS functional** on Fugaku. The HPC tag address override is enabled by default. SCCR register access requires the Fujitsu runtime initialization path:
+  - Set env vars: `FLIB_SCCR_CNTL=TRUE FLIB_L1_SCCR_CNTL=TRUE FLIB_L2_SCCR_CNTL_EX=TRUE`
+  - This triggers `xos_sclib_init()` → ioctl to `/dev/xos_sec_normal` → sets `el0ae=1`
+  - After init, user-space can directly read/write SCCR registers via MSR/MRS
+  - Verified: pointer-chase tests show 2.9x (L1) and 3.25x (L2) speedup with sector partitioning
+  - See `a64fx/doc/a64fx_hpc_extensions_and_hugepage_tuning.md` §3.6 for full enable path
 
 ## Compiler Flags
 
