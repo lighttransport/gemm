@@ -52,13 +52,40 @@ override function interprets this bit to route the access to the correct sector.
 
 ### Prerequisites
 
+**Compile-time:**
 - **`-Khpctag`** compiler flag must be active (enabled by default with `-KA64FX`)
-- **Fugaku status**: Sector cache **IS functional** on Fugaku. The HPC tag address override is enabled by default. SCCR register access requires the Fujitsu runtime initialization path:
-  - Set env vars: `FLIB_SCCR_CNTL=TRUE FLIB_L1_SCCR_CNTL=TRUE FLIB_L2_SCCR_CNTL_EX=TRUE`
+- **`-Kocl`** enables OCL pragmas (required for sector cache syntax)
+
+**Runtime (CRITICAL):**
+- **`export FLIB_HPCFUNC=TRUE`** — enables HPC function features (tag addressing)
+  - The Fujitsu runtime library writes '1' to `/sys/kernel/xos_hpc/hwpf_uaccess`
+  - Without this, `__jwe_check_hpctag` (CRT init) finds '0' → SCCR calls become no-ops
+- **`export FLIB_SCCR_CNTL=TRUE`** — enables SCCR register management
+- **`export FLIB_L1_SCCR_CNTL=TRUE`** — enable L1 SCCR
+- **`export FLIB_L2_SCCR_CNTL_EX=TRUE`** — enable L2 SCCR (required for way partitioning)
   - This triggers `xos_sclib_init()` → ioctl to `/dev/xos_sec_normal` → sets `el0ae=1`
   - After init, user-space can directly read/write SCCR registers via MSR/MRS
-  - Verified: pointer-chase tests show 2.9x (L1) and 3.25x (L2) speedup with sector partitioning
-  - See `a64fx/doc/a64fx_hpc_extensions_and_hugepage_tuning.md` §3.6 for full enable path
+
+**Kernel:**
+- **`IMP_SCTLR_EL1.L1SECTORE`** must be enabled for L1 sector partitioning
+
+**Fugaku status**: Sector cache **IS functional** on Fugaku. The HPC tag address override is enabled by default.
+- Verified: pointer-chase tests show 2.9x (L1) and 3.25x (L2) speedup with sector partitioning
+- See `a64fx/doc/a64fx_hpc_extensions_and_hugepage_tuning.md` §3.6 for full enable path
+
+### CRT Mechanism (`__jwe_check_hpctag`)
+
+The FCC compiler inserts an `.init_array` constructor that runs before `main()`:
+
+1. **CPU check**: Reads `midr_el1`, verifies implementer=0x46 (Fujitsu) and part=A64FX. **Aborts** if not running on A64FX.
+2. **HPC tag check**: Opens `/sys/kernel/xos_hpc/hwpf_uaccess` and reads one byte with `fgetc()`:
+   - If file contains `'1'` (0x31) → sets `hpctag_enabled = 1`
+   - If file doesn't exist → sets `hpctag_enabled = 1` (assumes enabled)
+   - If file contains anything else → `hpctag_enabled = 0` (disabled)
+3. Later calls to `__jwe_xset_sccr()` check this flag. If disabled, they are no-ops.
+
+The `FLIB_HPCFUNC=TRUE` environment variable causes the Fujitsu runtime library to
+write `'1'` to the sysfs file before `__jwe_check_hpctag` runs, enabling the feature.
 
 ## Compiler Flags
 
@@ -121,18 +148,30 @@ void gemm_sector(double *A, double *B, double *C, int M, int N, int K) {
 }
 ```
 
-### Method 2: L1+L2 Partitioning (`#pragma procedure`)
+### Method 2: L1+L2 Partitioning (`scache_isolate_way`)
 
-Scoped to an entire function. Must be placed at the start of the function body,
-before variable declarations.
+Three pragma levels are available:
 
+**Region-based way partitioning** (`#pragma statement`):
 ```c
-void my_function(double *stream_data, double *reuse_data, int n) {
-#pragma procedure scache_isolate_way L2=N2 [L1=N1]
-#pragma procedure scache_isolate_assign stream_data
-    int i;
-    // ... entire function body: loads from stream_data are tagged ...
+#pragma statement scache_isolate_way L2=N2 [L1=N1]
+    // ... code with sector cache active ...
+#pragma statement end_scache_isolate_way
+```
+
+**Function-level array assignment** (`#pragma procedure`):
+```c
+void func(double *stream, double *reuse) {
+#pragma procedure scache_isolate_assign stream
+    // ... entire function body: loads from stream are tagged ...
 }
+```
+
+**Statement-level array assignment** (`#pragma statement`):
+```c
+#pragma statement scache_isolate_assign ptr
+    load = ptr[i];  // this load tagged for sector 1
+#pragma statement end_scache_isolate_assign
 ```
 
 **Parameters:**
@@ -142,10 +181,18 @@ void my_function(double *stream_data, double *reuse_data, int n) {
 - Multiple arrays can be assigned: `scache_isolate_assign A, B`
 
 **Example: SpMV with streaming values/indices, reusing vector**
+(Based on `a64fx/ref/ellspmv/ellspmv.c`)
 
 ```c
+// Global region: set up way partitioning around compute loop
+#pragma statement scache_isolate_way L2=4
+    for (iter = 0; iter < niter; iter++) {
+        spmv(val, col, rowptr, x, y, nrows);
+    }
+#pragma statement end_scache_isolate_way
+
+// Kernel function: assign streaming arrays to sector 1
 void spmv(double *val, int *col, int *rowptr, double *x, double *y, int nrows) {
-#pragma procedure scache_isolate_way L2=5 L1=1
 #pragma procedure scache_isolate_assign val, col
     int i, j;
     for (i = 0; i < nrows; i++) {
@@ -156,6 +203,19 @@ void spmv(double *val, int *col, int *rowptr, double *x, double *y, int nrows) {
         y[i] = sum;
     }
 }
+```
+
+**Build flags** (from reference implementation):
+```bash
+CC=fcc CFLAGS="-Kfast -Kocl -DUSE_A64FX_SECTOR_CACHE -DA64FX_SECTOR_CACHE_L2_WAYS=4" make
+```
+
+**Runtime environment** (from reference `run_a64fx.sh`):
+```bash
+export FLIB_HPCFUNC=TRUE
+export FLIB_SCCR_CNTL=TRUE
+export FLIB_L1_SCCR_CNTL=FALSE
+export XOS_MMM_L_HPAGE_TYPE=hugetlbfs
 ```
 
 ## Generated Assembly
@@ -276,11 +336,22 @@ See `a64fx/hw-prefetch/test_sector_cache.c` for a complete standalone test.
 
 Build and run:
 ```bash
+# Compile
 fcc -Nnoclang -O2 -Kocl,hpctag -o test_sector_cache test_sector_cache.c
+
+# Run (CRITICAL: set env vars first!)
+export FLIB_HPCFUNC=TRUE
+export FLIB_SCCR_CNTL=TRUE
+export FLIB_L1_SCCR_CNTL=FALSE
 ./test_sector_cache
 ```
 
-### Results
+Or submit via `pjsub run_sector_test.sh`.
+
+### Results (without FLIB_HPCFUNC)
+
+Previous results were measured **without** `FLIB_HPCFUNC=TRUE`, so SCCR was not
+actually programmed. The `__jwe_xset_sccr` calls were no-ops:
 
 | Test | Description | No Sector | With Sector | Speedup |
 |------|-------------|-----------|-------------|---------|
@@ -291,20 +362,45 @@ fcc -Nnoclang -O2 -Kocl,hpctag -o test_sector_cache test_sector_cache.c
 | 3c | L1 config (3,1) | 3.16M cy | - | - |
 | 4 | L2: Stream A(4MB) + Resident B(512KB) | 87.5M cy | 94.4M cy | 0.93x |
 
+### Results (with FLIB_HPCFUNC=TRUE)
+
+Re-run with `FLIB_HPCFUNC=TRUE`, `FLIB_SCCR_CNTL=TRUE`, `FLIB_L1_SCCR_CNTL=TRUE`:
+
+| Test | Description | No Sector | With Sector | Speedup |
+|------|-------------|-----------|-------------|---------|
+| 1 | L1: Stream A(128KB) + Resident B(32KB) | 6.07M cy | 6.07M cy | 1.00x |
+| 2 | GEMM 64x64x64 (L1 sector) | 2.41M cy | 2.42M cy | 1.00x |
+| 3a | L1 config (1,3) | 3.07M cy | - | - |
+| 3b | L1 config (2,2) | 2.84M cy | - | - |
+| 3c | L1 config (3,1) | 3.10M cy | - | - |
+| 4 | L2: Stream A(4MB) + Resident B(512KB) | 87.5M cy | 87.5M cy | 1.00x |
+
+Still no sector partitioning effect (unchanged from previous run).
+
 ### Analysis
 
-1. **No measurable sector partitioning effect on Fugaku.**
-   The `IMP_SCTLR_EL1.L1SECTORE` register is not enabled in the Fugaku kernel.
-   The compiler correctly emits all sector cache instructions (`__jwe_xset_sccr`,
-   tagged addresses), but the hardware does not enforce way partitioning.
+1. **`/sys/kernel/xos_hpc/hwpf_uaccess` does not exist** on the tested node.
+   - `__jwe_check_hpctag` CRT code treats missing file as "enabled" (hpctag=1)
+   - But the absence of the XOS HPC sysfs module suggests the kernel lacks full
+     HPC function support (IMP_SCTLR_EL1.L1SECTORE not enabled)
 
-2. **L2 sector shows 7% overhead** from the `__jwe_xset_sccr()` runtime calls
-   without actual partitioning benefit.
+2. **SCCR library path confirmed**: `__jwe_xset_sccr` lives in `libfj90i.so.1`.
+   - `__jwe_xsccr_init` reads `FLIB_SCCR_CNTL` via `getenv()` → enables/disables
+   - When enabled, it reads/writes `IMP_SCCR_L1_EL0` (s3_3_c11_c8_2) directly
+   - But SCCR writes are silently ignored if kernel hasn't enabled sector cache
 
-3. **Test 3 variation (~5-10%) is measurement noise**, not real sector partitioning.
-   The (2,2) config appearing fastest is inconsistent with any sector model.
+3. **CRT mechanism fully decoded** (see Prerequisites section above):
+   - `__jwe_check_hpctag` → CPU check + sysfs check
+   - `__jwe_xsccr_init` → env var check (FLIB_SCCR_CNTL, FLIB_L1_SCCR_CNTL, etc.)
+   - `__jwe_xset_sccr` → actual SCCR register programming
 
-4. **Correctness verified**: GEMM with sector cache produces identical results
+4. **Test 3 variation (~8%) is measurement noise**, not real partitioning. The
+   (2,2) config appearing fastest is inconsistent with any sector model.
+
+5. **To test on Fugaku proper**: Submit via `pjsub` to the `small` resource group
+   which may have XOS HPC fully enabled (check for `/sys/kernel/xos_hpc/`).
+
+6. **Correctness verified**: GEMM with sector cache produces identical results
    to the non-sector version (max difference = 0).
 
 ## Comparison: Sector Cache vs PRFM Hints
@@ -329,5 +425,7 @@ pre-loading for B/C tiles rather than sector cache pragmas.
 - Alappat et al., "ECM modeling and performance tuning of SpMV and Lattice QCD on A64FX" (Wiley, 2022)
 - Alappat et al., "Modelling Data Locality of SpMV on the A64FX" (SC'23 Workshop)
   https://epub.ub.uni-muenchen.de/126883/1/3624062.3624198.pdf
+  https://dl.acm.org/doi/fullHtml/10.1145/3624062.3624198
 - Linux kernel RFC: A64FX cache driver (LKML, 2021)
 - Fujitsu Software Compiler Package Manual J2UL-2583
+- Reference implementation: `a64fx/ref/ellspmv/` (ELLPACK SpMV with sector cache)
