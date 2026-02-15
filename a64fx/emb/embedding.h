@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +65,33 @@ void embedding_bwd_sorted_f32_asm(const int32_t* sorted_indices,
                                   const float* grad_output,
                                   float* grad_embedding,
                                   size_t batch_size, size_t hidden_dim);
+
+// Forward pass: SVE gather/scatter (16 tokens column-wise)
+// Constraint: vocab_size * hidden_dim < 2^32
+void embedding_fwd_f32_gather_asm(const int32_t* indices, const float* emb_table,
+                                   float* output, size_t seq_len, size_t hidden_dim);
+
+// Forward pass: deep-prefetch stream (8x unroll, prefetch 8 rows ahead)
+void embedding_fwd_f32_stream_asm(const int32_t* indices, const float* emb_table,
+                                   float* output, size_t seq_len, size_t hidden_dim);
+
+// Forward pass: sorted core (contiguous read, indirect write)
+// Called after counting sort; sorted_indices[i] = emb index, sorted_order[i] = output pos
+void embedding_fwd_f32_sorted_core_asm(const int32_t* sorted_indices,
+                                        const int32_t* sorted_order,
+                                        const float* emb_table,
+                                        float* output,
+                                        size_t count, size_t hidden_dim);
+
+// Forward pass: stream with index prefetch + deeper row prefetch (16 ahead)
+void embedding_fwd_f32_stream_ipf_asm(const int32_t* indices, const float* emb_table,
+                                       float* output, size_t seq_len, size_t hidden_dim);
+
+// Scatter one embedding row to multiple output positions (for dedup)
+// Loads row in register-cached chunks, stores to all positions per chunk.
+void embedding_fwd_f32_scatter_row_asm(const float* src_row, float* output_base,
+                                        const int32_t* positions,
+                                        size_t n_positions, size_t hidden_dim);
 
 //=============================================================================
 // C Reference Implementations
@@ -165,6 +193,108 @@ static inline void embedding_grad_zero_f32_ref(float* grad_embedding,
     for (size_t i = 0; i < total; i++) {
         grad_embedding[i] = 0.0f;
     }
+}
+
+//=============================================================================
+// Counting sort helper for sorted embedding lookup
+//=============================================================================
+static inline void counting_sort_indices(const int32_t* indices, size_t n,
+                                          int32_t* sorted_indices,
+                                          int32_t* sorted_order,
+                                          size_t vocab_size)
+{
+    int32_t* counts = (int32_t*)calloc(vocab_size, sizeof(int32_t));
+    if (!counts) return;
+
+    // Count occurrences
+    for (size_t i = 0; i < n; i++)
+        counts[indices[i]]++;
+
+    // Prefix sum
+    int32_t total = 0;
+    for (size_t i = 0; i < vocab_size; i++) {
+        int32_t c = counts[i];
+        counts[i] = total;
+        total += c;
+    }
+
+    // Build sorted arrays
+    for (size_t i = 0; i < n; i++) {
+        int32_t idx = indices[i];
+        int32_t pos = counts[idx]++;
+        sorted_order[pos] = (int32_t)i;   // original position
+        sorted_indices[pos] = idx;          // embedding index
+    }
+
+    free(counts);
+}
+
+//=============================================================================
+// Sorted embedding forward: counting sort + contiguous-read ASM copy
+//=============================================================================
+static inline void embedding_fwd_f32_sorted(const int32_t* indices,
+                                             const float* emb_table,
+                                             float* output,
+                                             size_t seq_len, size_t hidden_dim,
+                                             size_t vocab_size)
+{
+    int32_t* sorted_indices = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    int32_t* sorted_order = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    if (!sorted_indices || !sorted_order) {
+        free(sorted_indices);
+        free(sorted_order);
+        return;
+    }
+
+    counting_sort_indices(indices, seq_len, sorted_indices, sorted_order, vocab_size);
+
+    embedding_fwd_f32_sorted_core_asm(sorted_indices, sorted_order,
+                                       emb_table, output, seq_len, hidden_dim);
+
+    free(sorted_indices);
+    free(sorted_order);
+}
+
+//=============================================================================
+// Deduplicated embedding forward: sort, then load each unique row once
+// and scatter to all output positions via register-cached scatter kernel.
+// Saves (N-1) row loads per group of N duplicate indices.
+//=============================================================================
+static inline void embedding_fwd_f32_dedup(const int32_t* indices,
+                                            const float* emb_table,
+                                            float* output,
+                                            size_t seq_len, size_t hidden_dim,
+                                            size_t vocab_size)
+{
+    int32_t* sorted_indices = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    int32_t* sorted_order   = (int32_t*)malloc(seq_len * sizeof(int32_t));
+    if (!sorted_indices || !sorted_order) {
+        free(sorted_indices);
+        free(sorted_order);
+        return;
+    }
+
+    counting_sort_indices(indices, seq_len, sorted_indices, sorted_order, vocab_size);
+
+    // Process groups of identical indices
+    size_t i = 0;
+    while (i < seq_len) {
+        int32_t idx = sorted_indices[i];
+        const float* src = emb_table + (size_t)idx * hidden_dim;
+
+        // Find group end
+        size_t j = i + 1;
+        while (j < seq_len && sorted_indices[j] == idx) j++;
+
+        // Scatter this row to all positions in the group
+        embedding_fwd_f32_scatter_row_asm(src, output,
+                                           sorted_order + i,
+                                           j - i, hidden_dim);
+        i = j;
+    }
+
+    free(sorted_indices);
+    free(sorted_order);
 }
 
 #ifdef __cplusplus
