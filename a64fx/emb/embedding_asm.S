@@ -1647,3 +1647,149 @@ embedding_fwd_f32_scatter_row_asm:
     ldp     x29, x30, [sp], #80
     ret
     .size embedding_fwd_f32_scatter_row_asm, .-embedding_fwd_f32_scatter_row_asm
+
+
+//=============================================================================
+// Embedding Forward FP16 - Deep-Prefetch Stream
+// void embedding_fwd_f16_stream_asm(const int32_t* indices,
+//                                    const __fp16* emb_table,
+//                                    __fp16* output,
+//                                    size_t seq_len, size_t hidden_dim)
+// x0 = indices, x1 = emb_table, x2 = output, x3 = seq_len, x4 = hidden_dim
+//
+// Same strategy as FP32 stream but for FP16 (2 bytes per element):
+// - SVE ld1h/st1h: 32 FP16 elements per vector (64 bytes)
+// - 8x unroll: 256 FP16 elements = 512 bytes per inner iteration
+// - Deep prefetch: 8 rows ahead, 4 cache lines per row
+// - Row stride: hidden_dim * 2 bytes
+//=============================================================================
+    .align 6
+    .global embedding_fwd_f16_stream_asm
+    .type embedding_fwd_f16_stream_asm, %function
+embedding_fwd_f16_stream_asm:
+    stp     x29, x30, [sp, #-80]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    mov     x29, sp
+
+    cbz     x3, .Lf16s_done
+
+    mov     x19, x0             // indices
+    mov     x20, x1             // emb_table (FP16)
+    mov     x21, x2             // output (FP16)
+    mov     x22, x3             // seq_len
+    mov     x23, x4             // hidden_dim (in elements)
+    lsl     x24, x4, #1         // row_stride_bytes = dim * 2
+
+    cnth    x5                   // VL in halfwords = 32 for A64FX
+    ptrue   p0.h                 // all-true predicate for halfwords
+    lsl     x25, x5, #4         // 8 * VL_h * 2 bytes = 8 * 32 * 2 = 512
+    lsl     x26, x5, #3         // 8 * VL_h = 256 elements per 8x iter
+
+    // Issue initial prefetches for first 8 rows
+    mov     x6, #0
+    mov     x7, #8
+    cmp     x7, x22
+    csel    x7, x7, x22, lo     // min(8, seq_len)
+.Lf16s_init_pf:
+    cmp     x6, x7
+    b.ge    .Lf16s_init_pf_done
+    ldr     w8, [x19, x6, lsl #2]
+    mul     x9, x8, x24
+    add     x9, x20, x9
+    prfm    pldl1strm, [x9]
+    prfm    pldl1strm, [x9, #256]
+    prfm    pldl1strm, [x9, #512]
+    prfm    pldl1strm, [x9, #768]
+    add     x6, x6, #1
+    b       .Lf16s_init_pf
+.Lf16s_init_pf_done:
+
+    mov     x8, #0              // current token index
+
+.Lf16s_outer:
+    cmp     x8, x22
+    b.ge    .Lf16s_done
+
+    // Load current index
+    ldr     w9, [x19, x8, lsl #2]
+
+    // Source: emb_table + idx * row_stride
+    mul     x10, x9, x24
+    add     x10, x20, x10
+
+    // Destination: output + i * row_stride
+    mul     x11, x8, x24
+    add     x11, x21, x11
+
+    // Prefetch row for token i+8
+    add     x12, x8, #8
+    cmp     x12, x22
+    b.ge    .Lf16s_no_pf
+
+    ldr     w13, [x19, x12, lsl #2]
+    mul     x14, x13, x24
+    add     x14, x20, x14
+    prfm    pldl1strm, [x14]
+    prfm    pldl1strm, [x14, #256]
+    prfm    pldl1strm, [x14, #512]
+    prfm    pldl1strm, [x14, #768]
+
+.Lf16s_no_pf:
+
+    // Copy row: 8x unrolled inner loop (FP16)
+    mov     x15, x23             // remaining elements (halfwords)
+
+.Lf16s_inner8:
+    cmp     x15, x26
+    b.lt    .Lf16s_inner_rem
+
+    ld1h    {z0.h}, p0/z, [x10]
+    ld1h    {z1.h}, p0/z, [x10, #1, mul vl]
+    ld1h    {z2.h}, p0/z, [x10, #2, mul vl]
+    ld1h    {z3.h}, p0/z, [x10, #3, mul vl]
+    ld1h    {z4.h}, p0/z, [x10, #4, mul vl]
+    ld1h    {z5.h}, p0/z, [x10, #5, mul vl]
+    ld1h    {z6.h}, p0/z, [x10, #6, mul vl]
+    ld1h    {z7.h}, p0/z, [x10, #7, mul vl]
+
+    st1h    {z0.h}, p0, [x11]
+    st1h    {z1.h}, p0, [x11, #1, mul vl]
+    st1h    {z2.h}, p0, [x11, #2, mul vl]
+    st1h    {z3.h}, p0, [x11, #3, mul vl]
+    st1h    {z4.h}, p0, [x11, #4, mul vl]
+    st1h    {z5.h}, p0, [x11, #5, mul vl]
+    st1h    {z6.h}, p0, [x11, #6, mul vl]
+    st1h    {z7.h}, p0, [x11, #7, mul vl]
+
+    add     x10, x10, x25       // src += 8*VL_h*2
+    add     x11, x11, x25       // dst += 8*VL_h*2
+    sub     x15, x15, x26
+    b       .Lf16s_inner8
+
+.Lf16s_inner_rem:
+    cbz     x15, .Lf16s_next
+
+.Lf16s_inner1:
+    whilelt p1.h, xzr, x15
+    ld1h    {z0.h}, p1/z, [x10]
+    st1h    {z0.h}, p1, [x11]
+    add     x10, x10, x5, lsl #1   // src += VL_h * 2
+    add     x11, x11, x5, lsl #1   // dst += VL_h * 2
+    subs    x15, x15, x5
+    b.gt    .Lf16s_inner1
+
+.Lf16s_next:
+    add     x8, x8, #1
+    b       .Lf16s_outer
+
+.Lf16s_done:
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #80
+    ret
+    .size embedding_fwd_f16_stream_asm, .-embedding_fwd_f16_stream_asm

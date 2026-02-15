@@ -57,13 +57,9 @@ int main(int argc, char** argv) {
     // Print results
     printf("\n");
     printf("Simulation Complete\n");
-    printf("===================\n\n");
+    printf("===================\n");
 
-    memsim_print_stats(sim);
-    printf("\n");
     memsim_print_detailed_stats(sim);
-    printf("\n");
-    memsim_analyze_bottlenecks(sim);
 
     // Cleanup
     memsim_destroy(sim);

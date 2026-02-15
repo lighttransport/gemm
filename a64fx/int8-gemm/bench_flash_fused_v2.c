@@ -1,4 +1,5 @@
 #include "flash_attention_fused_v2.h"
+#include "gqa_pack.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -16,89 +17,6 @@ static double get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
-}
-
-// =============================================================================
-// Reference implementation (parallel scalar, for correctness checking)
-// =============================================================================
-
-static void reference_attention_parallel(
-    const int8_t* Q,
-    const int8_t* K,
-    const int8_t* V,
-    float* O_ref,
-    int64_t L,
-    int64_t head_dim,
-    int num_threads)
-{
-    float scale = 1.0f / sqrtf((float)head_dim);
-
-    // Allocate S matrix (shared across threads)
-    float* S = (float*)malloc(L * L * sizeof(float));
-    if (!S) {
-        fprintf(stderr, "Failed to allocate S matrix\n");
-        return;
-    }
-
-    // Parallel computation over rows
-    #ifdef _OPENMP
-    omp_set_num_threads(num_threads);
-    #pragma omp parallel
-    {
-        #pragma omp for schedule(dynamic, 8)
-    #endif
-        for (int64_t i = 0; i < L; i++) {
-            // Compute scores: S[i,:] = Q[i,:] @ K^T * scale
-            for (int64_t j = 0; j < L; j++) {
-                int32_t dot = 0;
-                for (int64_t k = 0; k < head_dim; k++) {
-                    dot += (int32_t)Q[i * head_dim + k] * (int32_t)K[j * head_dim + k];
-                }
-                S[i * L + j] = (float)dot * scale;
-            }
-
-            // Softmax (per-row, no synchronization needed)
-            float max_val = S[i * L];
-            for (int64_t j = 1; j < L; j++) {
-                if (S[i * L + j] > max_val) max_val = S[i * L + j];
-            }
-
-            float sum = 0.0f;
-            for (int64_t j = 0; j < L; j++) {
-                S[i * L + j] = expf(S[i * L + j] - max_val);
-                sum += S[i * L + j];
-            }
-
-            for (int64_t j = 0; j < L; j++) {
-                S[i * L + j] /= sum;
-            }
-
-            // Output: O[i,:] = S[i,:] @ V
-            for (int64_t d = 0; d < head_dim; d++) {
-                float acc = 0.0f;
-                for (int64_t j = 0; j < L; j++) {
-                    acc += S[i * L + j] * (float)V[j * head_dim + d];
-                }
-                O_ref[i * head_dim + d] = acc;
-            }
-        }
-    #ifdef _OPENMP
-    }
-    #endif
-
-    free(S);
-}
-
-// Single-threaded wrapper (for backward compatibility)
-static void reference_attention(
-    const int8_t* Q,
-    const int8_t* K,
-    const int8_t* V,
-    float* O_ref,
-    int64_t L,
-    int64_t head_dim)
-{
-    reference_attention_parallel(Q, K, V, O_ref, L, head_dim, 1);
 }
 
 // =============================================================================
@@ -139,9 +57,9 @@ static void check_correctness(
            mismatch_count, L * head_dim);
 
     if (max_abs_diff < 5.0) {
-        printf("  ✓ PASS (max diff < 5.0)\n");
+        printf("  PASS (max diff < 5.0)\n");
     } else {
-        printf("  ✗ FAIL (max diff >= 5.0)\n");
+        printf("  FAIL (max diff >= 5.0)\n");
     }
 }
 
@@ -149,17 +67,16 @@ static void check_correctness(
 // Performance benchmark
 // =============================================================================
 
-static void benchmark(
+static void benchmark_original(
     const int8_t* Q,
     const int8_t* K,
     const int8_t* V,
     float* O,
     int64_t L,
     int64_t head_dim,
-    int num_iters)
+    int num_iters,
+    double* avg_time_out)
 {
-    printf("\nBenchmarking L=%ld, head_dim=%ld, iters=%d\n", L, head_dim, num_iters);
-
     // Warmup
     flash_attention_fused_forward(Q, K, V, O, NULL, L, head_dim);
 
@@ -177,8 +94,42 @@ static void benchmark(
         if (elapsed < min_time) min_time = elapsed;
     }
 
-    double avg_time = total_time / num_iters;
+    *avg_time_out = total_time / num_iters;
+    printf("  Original (packed V):   avg %.3f ms, min %.3f ms\n", *avg_time_out, min_time);
+}
 
+static void benchmark_optimized(
+    const int8_t* Q,
+    const int8_t* Kp,
+    const int8_t* V,
+    float* O,
+    int64_t L,
+    int64_t head_dim,
+    int num_iters,
+    double* avg_time_out)
+{
+    // Warmup
+    flash_attention_fused_forward_opt(Q, Kp, V, O, NULL, L, head_dim);
+
+    // Timed runs
+    double total_time = 0.0;
+    double min_time = 1e9;
+
+    for (int iter = 0; iter < num_iters; iter++) {
+        double t_start = get_time_ms();
+        flash_attention_fused_forward_opt(Q, Kp, V, O, NULL, L, head_dim);
+        double t_end = get_time_ms();
+
+        double elapsed = t_end - t_start;
+        total_time += elapsed;
+        if (elapsed < min_time) min_time = elapsed;
+    }
+
+    *avg_time_out = total_time / num_iters;
+    printf("  Optimized (L2-block):  avg %.3f ms, min %.3f ms\n", *avg_time_out, min_time);
+}
+
+static void compute_metrics(double avg_time, int64_t L, int64_t head_dim) {
     // Compute FLOPS
     // Q@K^T: 2*L*L*head_dim ops (INT8)
     // P@V: 2*L*L*head_dim ops (FP32)
@@ -189,39 +140,21 @@ static void benchmark(
     double total_ops = gemm_ops + softmax_ops + pv_ops;
 
     double gops = total_ops / (avg_time * 1e6);
-    double gemm_gops = gemm_ops / (avg_time * 1e6);
-    double pv_gflops = pv_ops / (avg_time * 1e6);
 
     // Expected peaks:
     // INT8 GEMM: 3072 GOPS (SDOT)
-    // FP32 GEMM: 2048 GFLOPS (FMLA)
+    // FP32 GEMM: 1536 GFLOPS (FMLA)
     double int8_peak = 3072.0;
-    double fp32_peak = 2048.0;
+    double fp32_peak = 1536.0;
 
-    // Approximate time breakdown (assuming 50/50 split)
-    double gemm_efficiency = (gemm_gops / int8_peak) * 100.0;
-    double pv_efficiency = (pv_gflops / fp32_peak) * 100.0;
-    double softmax_time_pct = (softmax_ops / total_ops) * 100.0;
+    // Rough estimation: assume equal time split
+    // Combined peak = harmonic mean weighted by ops
+    double combined_peak = (gemm_ops + pv_ops) / (gemm_ops/int8_peak + pv_ops/fp32_peak);
+    double efficiency = gops / combined_peak * 100.0;
 
-    printf("\nPerformance Results:\n");
-    printf("  Average time:       %.3f ms\n", avg_time);
-    printf("  Min time:           %.3f ms\n", min_time);
-    printf("  Total throughput:   %.1f GOPS\n", gops);
-    printf("\nComponent Breakdown:\n");
-    printf("  Q@K^T (INT8 GEMM):  %.1f GOPS (%.1f%% of %d GOPS peak)\n",
-           gemm_gops, gemm_efficiency, (int)int8_peak);
-    printf("  P@V (FP32 GEMM):    %.1f GFLOPS (%.1f%% of %d GFLOPS peak)\n",
-           pv_gflops, pv_efficiency, (int)fp32_peak);
-    printf("  Softmax overhead:   ~%.1f%% of total ops\n", softmax_time_pct);
-
-    // Memory bandwidth estimate
-    size_t qkv_bytes = 3 * L * head_dim;  // Q, K, V (INT8)
-    size_t o_bytes = L * head_dim * 4;    // O (FP32)
-    double total_bytes = qkv_bytes + o_bytes;
-    double bandwidth_gb_s = total_bytes / (avg_time * 1e6);
-    printf("  Memory bandwidth:   %.1f GB/s (min data movement)\n", bandwidth_gb_s);
-
-    printf("\n");
+    printf("  Total throughput: %.1f GOPS\n", gops);
+    printf("  Combined efficiency: %.1f%% (weighted peak: %.0f GOPS)\n",
+           efficiency, combined_peak);
 }
 
 // =============================================================================
@@ -233,35 +166,20 @@ int main(int argc, char** argv) {
     int64_t L = 1024;
     int64_t head_dim = 128;
     int num_iters = 5;
-    int num_threads = 1;
 
     if (argc >= 2) L = atol(argv[1]);
     if (argc >= 3) head_dim = atol(argv[2]);
     if (argc >= 4) num_iters = atoi(argv[3]);
-    if (argc >= 5) num_threads = atoi(argv[4]);
-
-    // Default to 12 threads if OpenMP available and not specified
-    #ifdef _OPENMP
-    if (argc < 5) {
-        num_threads = omp_get_max_threads();
-        if (num_threads > 12) num_threads = 12;  // A64FX has 12 cores
-    }
-    #endif
 
     printf("=================================================================\n");
-    printf("Fused FlashAttention V2 Benchmark\n");
+    printf("Fused FlashAttention V2 Benchmark (with L2-blocked P@V)\n");
     printf("=================================================================\n");
     printf("Configuration:\n");
     printf("  L (sequence length):  %ld\n", L);
     printf("  head_dim:             %ld\n", head_dim);
     printf("  Tile sizes:           TILE_BR=%d, TILE_BC=%d\n", FA_TILE_BR, FA_TILE_BC);
+    printf("  P@V kernel:           10x2 microkernel, K-block=256\n");
     printf("  L1D cache:            64 KB\n");
-    printf("  Expected working set: ~46 KB\n");
-    #ifdef _OPENMP
-    printf("  Reference threads:    %d\n", num_threads);
-    #else
-    printf("  Reference threads:    1 (OpenMP not available)\n");
-    #endif
     printf("\n");
 
     // Allocate matrices
@@ -269,9 +187,14 @@ int main(int argc, char** argv) {
     int8_t* K = (int8_t*)flash_aligned_alloc(L * head_dim);
     int8_t* V = (int8_t*)flash_aligned_alloc(L * head_dim);
     float* O = (float*)flash_aligned_alloc(L * head_dim * sizeof(float));
+    float* O_opt = (float*)flash_aligned_alloc(L * head_dim * sizeof(float));
     float* O_ref = (float*)flash_aligned_alloc(L * head_dim * sizeof(float));
 
-    if (!Q || !K || !V || !O || !O_ref) {
+    // Pre-pack K for optimized version
+    size_t Kp_size = flash_kp_size(L, head_dim);
+    int8_t* Kp = (int8_t*)flash_aligned_alloc(Kp_size);
+
+    if (!Q || !K || !V || !O || !O_opt || !O_ref || !Kp) {
         fprintf(stderr, "Memory allocation failed\n");
         return 1;
     }
@@ -284,58 +207,90 @@ int main(int argc, char** argv) {
         V[i] = (int8_t)(rand() % 32 - 16);
     }
 
-    // Correctness check with timing
+    // Pack K
+    pack_k_for_flash_attention(K, Kp, L, head_dim);
+
+    // Correctness check
     if (L <= 512) {
         printf("Running correctness check (L=%ld)...\n", L);
 
-        // Time reference implementation
+        // Reference
         double ref_start = get_time_ms();
-        reference_attention_parallel(Q, K, V, O_ref, L, head_dim, num_threads);
+        flash_attention_fused_reference(Q, K, V, O_ref, NULL, L, head_dim);
         double ref_end = get_time_ms();
-        double ref_time = ref_end - ref_start;
+        printf("  Reference: %.3f ms\n", ref_end - ref_start);
 
-        // Time fused implementation
-        double fused_start = get_time_ms();
+        // Original
+        double orig_start = get_time_ms();
         flash_attention_fused_forward(Q, K, V, O, NULL, L, head_dim);
-        double fused_end = get_time_ms();
-        double fused_time = fused_end - fused_start;
+        double orig_end = get_time_ms();
+        printf("  Original:  %.3f ms\n", orig_end - orig_start);
 
-        // Check correctness
-        check_correctness(O_ref, O, L, head_dim, "Fused FlashAttention V2");
+        // Optimized
+        double opt_start = get_time_ms();
+        flash_attention_fused_forward_opt(Q, Kp, V, O_opt, NULL, L, head_dim);
+        double opt_end = get_time_ms();
+        printf("  Optimized: %.3f ms\n", opt_end - opt_start);
 
-        // Report timing
-        printf("\nTiming Comparison:\n");
-        printf("  Reference (FP32, %d threads): %.3f ms\n", num_threads, ref_time);
-        printf("  Fused V2 (INT8, 1 thread):    %.3f ms\n", fused_time);
-        printf("  Speedup vs reference:         %.2fx\n", ref_time / fused_time);
+        // Check original vs reference
+        check_correctness(O_ref, O, L, head_dim, "Original vs Reference");
 
-        // Estimate single-threaded reference time
-        double ref_single_thread_est = ref_time * num_threads;
-        printf("  Est. speedup vs 1-thread ref: %.2fx\n", ref_single_thread_est / fused_time);
+        // Check optimized vs reference
+        check_correctness(O_ref, O_opt, L, head_dim, "Optimized vs Reference");
     } else {
         printf("Skipping correctness check (L=%ld too large, use L<=512)\n", L);
-        printf("Running reference benchmark for comparison...\n");
-
-        // Just time reference for large inputs
-        double ref_start = get_time_ms();
-        reference_attention_parallel(Q, K, V, O_ref, L, head_dim, num_threads);
-        double ref_end = get_time_ms();
-        double ref_time = ref_end - ref_start;
-
-        printf("  Reference (FP32, %d threads): %.3f ms\n", num_threads, ref_time);
     }
 
     // Performance benchmark
-    benchmark(Q, K, V, O, L, head_dim, num_iters);
+    printf("\n=================================================================\n");
+    printf("Performance Benchmark (L=%ld, head_dim=%ld, iters=%d)\n", L, head_dim, num_iters);
+    printf("=================================================================\n");
+
+    double orig_time, opt_time;
+
+    benchmark_original(Q, K, V, O, L, head_dim, num_iters, &orig_time);
+    benchmark_optimized(Q, Kp, V, O_opt, L, head_dim, num_iters, &opt_time);
+
+    printf("\nSpeedup: %.2fx\n", orig_time / opt_time);
+
+    printf("\nOriginal metrics:\n");
+    compute_metrics(orig_time, L, head_dim);
+
+    printf("\nOptimized metrics:\n");
+    compute_metrics(opt_time, L, head_dim);
+
+    // Breakdown of P@V portion estimate
+    printf("\n=================================================================\n");
+    printf("P@V Kernel Analysis\n");
+    printf("=================================================================\n");
+    double pv_ops = 2.0 * L * L * head_dim;
+    double pv_gflops_orig = pv_ops / (orig_time * 1e6);
+    double pv_gflops_opt = pv_ops / (opt_time * 1e6);
+    double fp32_peak = 1536.0;
+
+    // Assuming P@V takes ~50% of total time (rough estimate)
+    double pv_time_orig_est = orig_time * 0.5;
+    double pv_time_opt_est = opt_time * 0.5;
+    double pv_gflops_orig_est = pv_ops / (pv_time_orig_est * 1e6);
+    double pv_gflops_opt_est = pv_ops / (pv_time_opt_est * 1e6);
+
+    printf("Assuming P@V takes ~50%% of total time:\n");
+    printf("  Original P@V:  ~%.1f GFLOPS (%.1f%% of %.0f GFLOPS peak)\n",
+           pv_gflops_orig_est, pv_gflops_orig_est / fp32_peak * 100.0, fp32_peak);
+    printf("  Optimized P@V: ~%.1f GFLOPS (%.1f%% of %.0f GFLOPS peak)\n",
+           pv_gflops_opt_est, pv_gflops_opt_est / fp32_peak * 100.0, fp32_peak);
+    printf("  Target:        ~720 GFLOPS (47%% efficiency from standalone test)\n");
 
     // Cleanup
     flash_aligned_free(Q);
     flash_aligned_free(K);
     flash_aligned_free(V);
     flash_aligned_free(O);
+    flash_aligned_free(O_opt);
     flash_aligned_free(O_ref);
+    flash_aligned_free(Kp);
 
-    printf("=================================================================\n");
+    printf("\n=================================================================\n");
     printf("Benchmark complete\n");
     printf("=================================================================\n");
 

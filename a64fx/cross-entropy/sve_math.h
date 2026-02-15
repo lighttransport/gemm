@@ -112,4 +112,25 @@ static inline svfloat32_t sve_log_f32(svbool_t pg, svfloat32_t x) {
     return svmul_n_f32_x(pg, l2, LN2);
 }
 
+/* ── FPCR.FZ16: Flush fp16 denormals to zero ──
+ * Without this, fp16 denormal values trigger microcode traps (~100+ cy/op).
+ * Must be called before any fp16 computation.
+ */
+static inline void set_fpcr_fz16(void) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1UL << 19);
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+}
+
+/* ── Load fp16 → fp32 without unpack ──
+ * LD1H {Z.S} loads 16 halfwords into 32-bit containers (zero-extend).
+ * FCVT Z.S, Pg/M, Z.H reads the low 16 bits as fp16 and converts to fp32.
+ * 2 instructions per 16 elements (vs 5 for ld1h+unpack×2+fcvt×2 per 32).
+ */
+static inline svfloat32_t svld1_cvt_f16_f32(svbool_t pg, const uint16_t *ptr) {
+    svuint32_t raw = svld1uh_u32(pg, ptr);              /* LD1H {Z.S} */
+    return svcvt_f32_f16_x(pg, svreinterpret_f16(raw)); /* FCVT Z.S, Z.H */
+}
+
 #endif /* SVE_MATH_H */

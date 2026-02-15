@@ -1,7 +1,6 @@
 #!/bin/bash
 #PJM -L "freq=2000,eco_state=0,rscgrp=small,node=1,elapse=00:30:00"
 #PJM -g hp250467
-#PJM --no-check-directory
 #PJM -j
 #PJM -S
 
