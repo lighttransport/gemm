@@ -5,7 +5,7 @@ ASFLAGS = -Nclang -O3 -march=armv8.2-a+sve
 LDFLAGS = -lm
 
 OBJS = sincos_poly.o sincos_ftmad.o rope.o
-FUSED_OBJS = micro_fused_proj_rope.o fused_rope_qk.o
+FUSED_OBJS = micro_fused_proj_rope.o micro_fused_proj_rope_f16.o micro_fused_proj_rope_f16_6x2.o fused_rope_qk.o
 
 all: bench bench_fused
 
@@ -25,6 +25,12 @@ rope.o: rope.S
 	$(AS) $(ASFLAGS) -c -o $@ $<
 
 micro_fused_proj_rope.o: micro_fused_proj_rope.S
+	$(AS) $(ASFLAGS) -c -o $@ $<
+
+micro_fused_proj_rope_f16.o: micro_fused_proj_rope_f16.S
+	$(AS) $(ASFLAGS) -c -o $@ $<
+
+micro_fused_proj_rope_f16_6x2.o: micro_fused_proj_rope_f16_6x2.S
 	$(AS) $(ASFLAGS) -c -o $@ $<
 
 fused_rope_qk.o: fused_rope_qk.c fused_rope_qk.h
