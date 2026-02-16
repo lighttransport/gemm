@@ -62,12 +62,33 @@ static inline size_t flash_kp_size(int64_t L, int64_t head_dim) {
 
 static inline size_t flash_vp_size(int64_t L, int64_t head_dim) {
     int64_t head_tiles = (head_dim + 63) / 64;
+    int64_t L_tiles = (L + 63) / 64;
     int64_t L_groups = (L + 3) / 4;
-    return (size_t)(head_tiles * L_groups * 256);
+    return (size_t)(head_tiles * L_tiles * L_groups * 256);
 }
 
 // Aligned memory allocation (64-byte alignment for A64FX cache lines)
 void* flash_aligned_alloc(size_t size);
 void flash_aligned_free(void* ptr);
+
+// Scalar reference implementation using the same fixed-point algorithm.
+void flash_attention_fused_reference(
+    const int8_t* Q,
+    const int8_t* K,
+    const int8_t* V,
+    float* O,
+    float* logsumexp,
+    int64_t L,
+    int64_t head_dim);
+
+// Optimized version with L2-blocked P@V kernel (unpacked V)
+void flash_attention_fused_forward_opt(
+    const int8_t* Q,        // [L, head_dim] INT8
+    const int8_t* Kp,       // Packed K
+    const int8_t* V,        // [L, head_dim] INT8 - NOT packed (row-major)
+    float* O,               // [L, head_dim] FP32
+    float* logsumexp,       // [L] FP32 (optional)
+    int64_t L,
+    int64_t head_dim);
 
 #endif // FLASH_ATTENTION_FUSED_V2_H
