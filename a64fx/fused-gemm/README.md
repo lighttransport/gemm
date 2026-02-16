@@ -1,17 +1,35 @@
-# Fused Attention (Softmax + P@V) on A64FX
+# Fused GEMM and Fused Attention on A64FX
 
-Hand-tuned fused attention pipeline for Fujitsu A64FX (Fugaku),
-targeting single-core fp16 performance on 512-bit SVE.
+Hand-tuned GEMM micro-kernels and fused attention pipeline for
+Fujitsu A64FX (Fugaku), targeting single-core fp16 performance on
+512-bit SVE.
 
 ## Hardware
 
 - **A64FX** @ 2.0 GHz, 512-bit SVE (VL=64 bytes)
 - 2 FP pipes: fp32 peak = 128 GFLOPS, fp16 peak = 256 GFLOPS
 - L1D 64 KB (4-way, 256-byte lines, 64 sets), L2 8 MB
+- In-order pipeline, 4-wide decode
 
 ## What It Computes
 
-Single-head attention output for one M-row tile:
+### Fused GEMM: (Q @ K^T) @ V
+
+Pure double matrix multiplication without softmax. The intermediate
+S = Q @ K^T is never fully materialized — instead, tiles of S are
+computed and immediately consumed by the second GEMM.
+
+```
+E[M,N] = (A[M,K1] @ B[K1,K2]) @ C[K2,N]
+```
+
+Implementation: `fused_gemm.c`, `bench_fused.c`. Uses L2-resident
+intermediate tiles. Target: **90%+ of peak** GEMM efficiency for
+large problem sizes.
+
+### Fused Attention: softmax(S) @ V
+
+Adds softmax between the two GEMMs for full attention:
 
 ```
 O[M,d] = softmax(S[M,L]) @ V[L,d]
@@ -19,14 +37,17 @@ O[M,d] = softmax(S[M,L]) @ V[L,d]
 
 where `softmax(S)_ij = exp2(S_ij - max_i(S)) / sum_j exp2(S_ij - max_i(S))`.
 
-- S: pre-computed attention scores (fp32, column-major, M x L)
+Implementation: `bench_2pass.c`. Takes pre-computed S (attention scores)
+and V (value matrix), applies fused softmax + GEMM.
+
+- S: attention scores (fp32, column-major, M x L)
 - V: value matrix (fp32, row-major, L x d), pre-packed into fp16 panel format
 - O: output (fp16 or fp32, row-major, M x d)
 - `exp2` via A64FX FEXPA instruction (~7-bit accuracy, single-cycle)
 
 Typical parameters: M=12 (MR), L=4096..32768, d=256, NR=64 (2 SVE vectors).
 
-## Pipeline Strategies
+## Fused Attention Pipeline Strategies
 
 ### 2-Pass (Interleaved)
 
@@ -81,7 +102,10 @@ All kernels are hand-written SVE assembly (.S files). Naming convention:
 | `fp32_12x2` | 12 x 2vec (12x32) | Baseline |
 | `fp32_12x2_swp` | 12 x 2vec (12x32) | Software-pipelined loads |
 
-### FP16 Mixed-Precision Kernels (A,B in fp16, C in fp32)
+### FP16 Mixed-Precision Kernels (A,B in fp16, C accumulated in fp32)
+
+These kernels compute FMLA in fp16 but accumulate C in fp32 registers.
+An epilogue converts fp32 C back to fp16 after the K-loop.
 
 | Name | Shape | Notes |
 |------|-------|-------|
@@ -93,7 +117,12 @@ All kernels are hand-written SVE assembly (.S files). Naming convention:
 | `fp16_8x3` | 8 x 3vec (8x96) | |
 | `fp16_6x4` | 6 x 4vec (6x128) | |
 
-### FP16 NOEPI Kernels (A,B,C all in fp16, no fp32 epilogue)
+### FP16 NOEPI Kernels (No Epilogue — A,B,C all in fp16)
+
+NOEPI = No Epilogue. These kernels accumulate C directly in fp16
+registers, eliminating the fp32→fp16 conversion epilogue. Fewer
+instructions per kernel call, but lower numerical precision than
+the mixed-precision variant.
 
 | Name | Shape | Notes |
 |------|-------|-------|
@@ -110,6 +139,26 @@ void micro_kernel(const T *A, const T *B, T *C,
 ```
 
 A is column-major (K x MR), B is panel-major (K x NR), C is row-major (MR x ld_o).
+
+### Kernel Efficiency Analysis (noepi4, 12x2)
+
+Per 4K unrolled iteration:
+- 96 FMLA instructions (24 per K step, each 32-wide fp16 = 64 FLOPS)
+- 48 `ld1rh` (A broadcast loads) + 8 `ld1h` (B vector loads) = 56 loads
+- FMA-limited: 96 FMLA / 2 pipes = 48 cycles
+- Theoretical: 6144 FLOPS / 48 cycles = 128 FLOPS/cycle = 256 GF (100%)
+
+Measured GEMM-only: **85% of peak** (218 GF). The gap comes from:
+- **Load-use stalls:** Each K step starts with 6 consecutive `ld1rh` loads.
+  On A64FX's in-order pipeline (~8-cycle load latency), the first FMLA
+  stalls waiting for the first loaded register. The SWP kernel variant
+  pre-loads next-K's A data during current-K's FMAs to hide this latency.
+- **Tile overhead:** Function call, epilogue (accum: 24 ld+fadd+st), and
+  k-block/n-tile loop overhead amortized over only M=12 rows.
+- **A re-touch:** At n-tile boundaries where B tiles evict A from L1.
+
+A software-pipelined NOEPI kernel (loading next-K A during batch-2
+FMAs) would close the gap toward 90%+.
 
 ## L1 Working Set (fp16 NOEPI, Kc=256)
 
@@ -135,7 +184,21 @@ A re-touch (B tiles 0-1 = 64 KB likely evicted A's 6 KB).
 
 Single-core, A64FX @ 2.0 GHz, d=256, fp16 peak = 256 GFLOPS, FZ16=1.
 
-### Best FP16 NOEPI Pipeline Performance (Kc=256)
+### GEMM-only (P@V, no softmax)
+
+Best micro-kernel GEMM-only performance for the P@V multiply (M=12
+skinny case, pre-packed fp16). This is the ceiling for the fused
+attention pipeline — softmax overhead comes on top.
+
+| Kernel | Kc | L | GEMM-only (GF) | Peak % |
+|--------|-----|-------|----------------|--------|
+| h12n4 (noepi4) | 256 | 4096 | 218.0 | 85.2% |
+| h12n4 (noepi4) | 256 | 32768 | 216.9 | 84.7% |
+
+Current ceiling is ~85%. A software-pipelined NOEPI kernel should
+reach 90%+ by hiding load-use stalls.
+
+### Best Fused Attention Pipeline (Kc=256)
 
 | Pipeline | L | Total (GF) | Peak % | GEMM-only (GF) | GEMM % |
 |----------|-------|-----------|--------|----------------|--------|
@@ -170,17 +233,26 @@ the un-overlapped softmax cost.
 
 ### Remaining Gap
 
-GEMM-only ceiling: 217 GF (84.7%). Best pipeline: 181 GF (70.7%).
-Overhead: 177 us (softmax 166 us + normalize 11 us) = 19% of GEMM time.
+```
+GEMM-only ceiling:  218 GF (85%)   <- needs SWP NOEPI kernel for 90%+
+3-pass pipeline:    181 GF (70.7%) <- softmax overhead = 19% of GEMM time
+softmax overhead:   166 us (max-find + exp2 + fp16 convert)
+normalize:          11 us
+```
 
-The softmax computation is now the dominant bottleneck.
+Two paths to improve:
+1. **SWP NOEPI kernel:** Software-pipeline A loads to hide latency, targeting 90%+ GEMM-only (currently 85%)
+2. **Fuse Q@K^T with softmax:** Compute S tiles on-the-fly from Q,K instead of reading pre-computed S from L2, eliminating the S bandwidth bottleneck
 
 ## Build
 
 Requires Fujitsu compiler on A64FX (native).
 
 ```sh
-# Build the fused attention benchmark
+# Build the original fused (Q@K^T)@V benchmark
+make bench_fused
+
+# Build the fused attention (softmax) benchmark
 make bench_2pass
 
 # Run (native on A64FX)
@@ -193,23 +265,24 @@ FP16_ONLY=1 ./bench_2pass
 make submit_2pass
 ```
 
-Cross-compilation from Intel host: change `2PASS_CC = fcc` to `fccpx` in Makefile.
+Cross-compilation from Intel host: change `CC = fcc` / `2PASS_CC = fcc` to `fccpx` in Makefile.
 
-The benchmark uses `-Nclang` mode for `arm_sve.h` intrinsics and FEXPA inline assembly.
+The bench_2pass benchmark uses `-Nclang` mode for `arm_sve.h` intrinsics and FEXPA inline assembly.
 
 ## Files
 
 ```
-bench_2pass.c                          Main benchmark (all pipeline strategies)
-bench_fused.c                          Original fused (A@B)@C benchmark
-fused_gemm.{c,h}                       Fused GEMM library (fp32)
-pack_matrices.c                        Matrix packing routines
+fused_gemm.{c,h}                       Fused GEMM (Q@K^T)@V library (fp32)
+bench_fused.c                           Fused double-GEMM benchmark
+pack_matrices.c                         Matrix packing routines
 
-micro_kernel_fp32_*.S                  FP32 SVE micro-kernels
-micro_kernel_fp16_*_swp.S             FP16 mixed (fp32 C) kernels
-micro_kernel_fp16_*_noepi*.S          FP16 NOEPI (fp16 C) kernels
-micro_kernel_fp16_*_noepi4*.S         4K-unrolled NOEPI variants
-micro_kernel_fp16_*_noepi4_prfm*.S    NOEPI4 + PRFM (experimental)
+bench_2pass.c                           Fused attention benchmark (all softmax strategies)
 
-Makefile                               Build rules (fcc native / fccpx cross)
+micro_kernel_fp32_*.S                   FP32 SVE micro-kernels
+micro_kernel_fp16_*_swp.S              FP16 mixed (fp32 C) kernels
+micro_kernel_fp16_*_noepi*.S           FP16 NOEPI (fp16 C) kernels
+micro_kernel_fp16_*_noepi4*.S          4K-unrolled NOEPI variants
+micro_kernel_fp16_*_noepi4_prfm*.S     NOEPI4 + PRFM (experimental)
+
+Makefile                                Build rules (fcc native / fccpx cross)
 ```

@@ -15,7 +15,9 @@
  */
 
 #define FUSED_MR 4
-#define FUSED_NR 32   /* 2 × 16 (SVE VL=512 → 16 fp32/vector) */
+#define FUSED_NR 32      /* 2 × 16 (SVE VL=512 → 16 fp32/vector) */
+#define FUSED_MR_F16 4   /* 4 tokens per micro-tile (fp16 path) */
+#define FUSED_NR_F16 64  /* 2 × 32 (SVE VL=512 → 32 fp16/vector) */
 
 /* Assembly micro-kernel */
 void micro_fused_proj_rope_4x2(
@@ -76,6 +78,73 @@ void fused_proj_rope_asm_f32(
     const float *Wq_packed,
     const float *Wk_packed,
     float *Q, float *K,
+    const float *theta_scaled,
+    int n_tokens, int d_model, int d_head);
+
+/* ---- FP16 path ---- */
+
+/* Assembly micro-kernel: MR=6 x NR=64, pre-computed sin/cos */
+void micro_fused_proj_rope_f16_6x2(
+    const _Float16 *X_packed,   /* [d_model × 6] packed */
+    const _Float16 *Wq,         /* [d_model × 64] packed */
+    const _Float16 *Wk,         /* [d_model × 64] packed */
+    _Float16 *Q_out,            /* output row pointer */
+    _Float16 *K_out,            /* output row pointer */
+    int64_t d_model,            /* inner dimension */
+    const _Float16 *sin_cos,    /* [32 sin | 32 cos] as fp16 */
+    int64_t ldc_bytes           /* output row stride in bytes */
+);
+
+/* Legacy MR=4 x NR=64 kernel (kept for comparison) */
+void micro_fused_proj_rope_f16_4x2(
+    const _Float16 *X_packed,   /* [d_model × MR] packed */
+    const _Float16 *Wq,         /* [d_model × 64] packed */
+    const _Float16 *Wk,         /* [d_model × 64] packed */
+    _Float16 *Q_out,            /* output row pointer */
+    _Float16 *K_out,            /* output row pointer */
+    int64_t d_model,            /* inner dimension */
+    const _Float16 *sin_cos,    /* [32 sin | 32 cos] as fp16 */
+    int64_t ldc_bytes           /* output row stride in bytes */
+);
+
+/* Returns allocation size (bytes) for fp16 packed weight with padding */
+size_t packed_weight_size_f16(int d_model, int d_head);
+
+/* Pack fp16 weight: row-major [d_model × d_head] → blocked [d_head/64 × (d_model+1) × 64] */
+void pack_weight_f16(const _Float16 *W_rm, _Float16 *W_packed,
+                     int d_model, int d_head);
+
+/* Reference C implementation: fp32 compute, fp16 I/O */
+void fused_proj_rope_f16(
+    const float *X,
+    const float *Wq,
+    const float *Wk,
+    float *Q, float *K,
+    const float *theta,
+    const int *pos,
+    int n_tokens, int d_model, int d_head);
+
+/* Pre-compute sin/cos table for fp16 RoPE */
+void compute_sin_cos_f16(const float *theta_scaled, _Float16 *sin_cos_all,
+                         int d_head);
+
+/* Core tiling loop: pre-allocated workspace, pre-computed sin/cos */
+void fused_proj_rope_core_f16(
+    const _Float16 *X,
+    const _Float16 *Wq_packed,
+    const _Float16 *Wk_packed,
+    _Float16 *Q, _Float16 *K,
+    const _Float16 *sin_cos_all,
+    _Float16 *X_packed,
+    _Float16 *Q_tmp, _Float16 *K_tmp,
+    int n_tokens, int d_model, int d_head);
+
+/* Convenience wrapper (allocates workspace internally) */
+void fused_proj_rope_asm_f16(
+    const _Float16 *X,
+    const _Float16 *Wq_packed,
+    const _Float16 *Wk_packed,
+    _Float16 *Q, _Float16 *K,
     const float *theta_scaled,
     int n_tokens, int d_model, int d_head);
 

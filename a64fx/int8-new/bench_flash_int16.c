@@ -158,62 +158,94 @@ static int test_correctness(int64_t L, int64_t head_dim) {
     return passed;
 }
 
-// Benchmark performance
-static void bench_performance(int64_t L, int64_t head_dim, int iters) {
+// Benchmark comparing INT16 vs FP32 reference
+static void bench_comparison(int64_t L, int64_t head_dim, int iters) {
     printf("Benchmarking: L=%ld, head_dim=%ld, iters=%d\n", L, head_dim, iters);
 
-    // Allocate
-    int8_t* Q = (int8_t*)flash16_aligned_alloc(L * head_dim);
-    int8_t* K = (int8_t*)flash16_aligned_alloc(L * head_dim);
-    int8_t* V = (int8_t*)flash16_aligned_alloc(L * head_dim);
-    float* O = (float*)flash16_aligned_alloc(L * head_dim * sizeof(float));
+    // Allocate INT8 inputs
+    int8_t* Q_i8 = (int8_t*)flash16_aligned_alloc(L * head_dim);
+    int8_t* K_i8 = (int8_t*)flash16_aligned_alloc(L * head_dim);
+    int8_t* V_i8 = (int8_t*)flash16_aligned_alloc(L * head_dim);
+    float* O_int16 = (float*)flash16_aligned_alloc(L * head_dim * sizeof(float));
+
+    // Allocate FP32 inputs
+    float* Q_fp32 = (float*)malloc(L * head_dim * sizeof(float));
+    float* K_fp32 = (float*)malloc(L * head_dim * sizeof(float));
+    float* V_fp32 = (float*)malloc(L * head_dim * sizeof(float));
+    float* O_fp32 = (float*)malloc(L * head_dim * sizeof(float));
 
     // Initialize
     srand(42);
     for (int64_t i = 0; i < L * head_dim; i++) {
-        Q[i] = (rand() % 21) - 10;
-        K[i] = (rand() % 21) - 10;
-        V[i] = (rand() % 21) - 10;
+        Q_i8[i] = (rand() % 21) - 10;
+        K_i8[i] = (rand() % 21) - 10;
+        V_i8[i] = (rand() % 21) - 10;
+        Q_fp32[i] = (float)Q_i8[i];
+        K_fp32[i] = (float)K_i8[i];
+        V_fp32[i] = (float)V_i8[i];
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
-
-    // Warmup
-    flash_attention_int16_forward(Q, K, V, O, NULL, L, head_dim, scale);
-
-    // Benchmark
-    uint64_t t0 = rdtsc();
-    for (int iter = 0; iter < iters; iter++) {
-        flash_attention_int16_forward(Q, K, V, O, NULL, L, head_dim, scale);
-        __asm__ volatile("" ::: "memory");
-    }
-    uint64_t t1 = rdtsc();
-
-    double time_s = (double)(t1 - t0) / 100000000.0;  // 100 MHz timer
-    double time_per_iter_ms = time_s * 1000.0 / iters;
 
     // Compute FLOPs
     // Q@K^T: 2 * L * L * head_dim
     // Softmax: ~5 * L * L (exp, sub, div, sum)
     // P@V: 2 * L * L * head_dim
     double flops = (double)L * L * head_dim * 4 + (double)L * L * 5;
-    double gflops = flops / (time_per_iter_ms / 1000.0) / 1e9;
 
-    printf("  Time: %.2f ms/iter\n", time_per_iter_ms);
-    printf("  Throughput: %.2f GFLOPS\n", gflops);
-    printf("\n");
+    // ============ Benchmark INT16 ============
+    // Warmup
+    flash_attention_int16_forward(Q_i8, K_i8, V_i8, O_int16, NULL, L, head_dim, scale);
+
+    uint64_t t0 = rdtsc();
+    for (int iter = 0; iter < iters; iter++) {
+        flash_attention_int16_forward(Q_i8, K_i8, V_i8, O_int16, NULL, L, head_dim, scale);
+        __asm__ volatile("" ::: "memory");
+    }
+    uint64_t t1 = rdtsc();
+
+    double time_int16_s = (double)(t1 - t0) / 100000000.0;  // 100 MHz timer
+    double time_int16_ms = time_int16_s * 1000.0 / iters;
+    double gflops_int16 = flops / (time_int16_ms / 1000.0) / 1e9;
+
+    // ============ Benchmark FP32 Reference ============
+    // Warmup
+    attention_reference(Q_fp32, K_fp32, V_fp32, O_fp32, L, head_dim, scale);
+
+    t0 = rdtsc();
+    for (int iter = 0; iter < iters; iter++) {
+        attention_reference(Q_fp32, K_fp32, V_fp32, O_fp32, L, head_dim, scale);
+        __asm__ volatile("" ::: "memory");
+    }
+    t1 = rdtsc();
+
+    double time_fp32_s = (double)(t1 - t0) / 100000000.0;
+    double time_fp32_ms = time_fp32_s * 1000.0 / iters;
+    double gflops_fp32 = flops / (time_fp32_ms / 1000.0) / 1e9;
+
+    // ============ Results ============
+    double speedup = time_fp32_ms / time_int16_ms;
+
+    printf("  INT16 pipeline: %7.2f ms, %5.2f GFLOPS\n", time_int16_ms, gflops_int16);
+    printf("  FP32 reference: %7.2f ms, %5.2f GFLOPS\n", time_fp32_ms, gflops_fp32);
+    printf("  Speedup:        %.2fx\n\n", speedup);
 
     // Cleanup
-    flash16_aligned_free(Q);
-    flash16_aligned_free(K);
-    flash16_aligned_free(V);
-    flash16_aligned_free(O);
+    flash16_aligned_free(Q_i8);
+    flash16_aligned_free(K_i8);
+    flash16_aligned_free(V_i8);
+    flash16_aligned_free(O_int16);
+    free(Q_fp32);
+    free(K_fp32);
+    free(V_fp32);
+    free(O_fp32);
 }
 
 int main(void) {
     printf("============================================\n");
-    printf("Flash Attention INT16 Benchmark\n");
-    printf("Pipeline: INT8 SDOT -> FP32 softmax -> INT16 -> INT16 SDOT\n");
+    printf("Flash Attention INT16 vs FP32 Comparison\n");
+    printf("INT16 Pipeline: INT8 SDOT -> FP32 softmax -> INT16 -> INT16 SDOT\n");
+    printf("FP32 Reference: Naive triple-loop attention\n");
     printf("Platform: A64FX SVE (512-bit)\n");
     printf("============================================\n\n");
 
@@ -222,24 +254,23 @@ int main(void) {
     test_correctness(128, 128);
     test_correctness(256, 128);
 
-    printf("=== Performance Benchmarks ===\n");
+    printf("=== INT16 vs FP32 Performance Comparison ===\n");
 
-    // Small sizes for quick testing
-    bench_performance(128, 128, 100);
-    bench_performance(256, 128, 50);
-    bench_performance(512, 128, 20);
+    // Small sizes
+    bench_comparison(128, 128, 100);
+    bench_comparison(256, 128, 50);
+    bench_comparison(512, 128, 20);
 
     // Larger sizes
     printf("=== Larger Sequence Lengths ===\n");
-    bench_performance(1024, 128, 10);
-    bench_performance(2048, 128, 5);
+    bench_comparison(1024, 128, 10);
+    bench_comparison(2048, 128, 5);
 
     printf("============================================\n");
     printf("Summary:\n");
-    printf("- INT8 Q@K^T SDOT provides fast score computation\n");
-    printf("- FP32 softmax with fast exp approximation\n");
-    printf("- INT16 attention weights preserve precision\n");
-    printf("- INT16 x INT8(widen) for P@V accumulation\n");
+    printf("- INT16 pipeline uses tiled flash attention (O(n) memory)\n");
+    printf("- FP32 reference materializes full attention matrix (O(n^2) memory)\n");
+    printf("- INT8/INT16 quantization enables faster compute\n");
     printf("============================================\n");
 
     return 0;

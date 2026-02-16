@@ -18,10 +18,18 @@
  *   #pragma statement end_cache_subsector
  *   #pragma statement end_cache_sector_size
  *
- * Method 2: L1+L2 partitioning (#pragma procedure)
- *   #pragma procedure scache_isolate_way L2=N2 [L1=N1]
+ * Method 2: L1+L2 partitioning (#pragma statement scache_isolate_way)
+ *   #pragma statement scache_isolate_way L2=N2 [L1=N1]
+ *   ...code region with sector cache active...
+ *   #pragma statement end_scache_isolate_way
+ *
+ *   Per-function array assignment:
  *   #pragma procedure scache_isolate_assign ptr1 [,ptr2,...]
- *   ...function body...
+ *
+ *   Per-statement array assignment:
+ *   #pragma statement scache_isolate_assign ptr
+ *   ...loads from ptr tagged with sector 1...
+ *   #pragma statement end_scache_isolate_assign
  *
  * How it works:
  *   1. cache_sector_size(S0, S1) partitions L1D 4 ways into S0+S1=4
@@ -47,7 +55,19 @@
  *   - FCC pragmas control 2 sectors (sector 0 = default, sector 1 = tagged)
  *   - Requires IMP_SCTLR_EL1.L1SECTORE to be enabled in kernel
  *
+ * Runtime requirements:
+ *   export FLIB_HPCFUNC=TRUE       # enable HPC tag addressing
+ *   export FLIB_SCCR_CNTL=TRUE     # enable SCCR register management
+ *   export FLIB_L1_SCCR_CNTL=FALSE # disable L1 SCCR fallback
+ *
+ * CRT mechanism (__jwe_check_hpctag in .init_array):
+ *   1. Verifies CPU is A64FX via mrs midr_el1 (aborts if not)
+ *   2. Reads /sys/kernel/xos_hpc/hwpf_uaccess
+ *   3. If file contains '1' → hpctag enabled → __jwe_xset_sccr programs SCCR
+ *      FLIB_HPCFUNC=TRUE causes runtime to write '1' to this sysfs file
+ *
  * Reference: https://epub.ub.uni-muenchen.de/126883/1/3624062.3624198.pdf
+ * Reference: a64fx/ref/ellspmv/ (ELLPACK SpMV with sector cache)
  */
 
 #include <stdio.h>
@@ -238,14 +258,18 @@ void test_sector_config_3_1(double *A, double *B, double *C, int n) {
 /* ================================================================
  * Test 4: L2 sector cache using scache_isolate_way
  *
- * #pragma procedure scache_isolate_way L2=N [L1=M]
- * #pragma procedure scache_isolate_assign ptr
+ * Uses #pragma statement scache_isolate_way (region-based, matching
+ * the pattern from reference code a64fx/ref/ellspmv/)
+ *
+ * #pragma statement scache_isolate_way L2=N [L1=M]
+ * #pragma procedure scache_isolate_assign ptr  (function-level)
+ * ...code...
+ * #pragma statement end_scache_isolate_way
  *
  * L2: 8MB, 16-way. Split: sector1=N ways (streaming), sector0=rest (reuse)
  * L1: 64KB, 4-way.  Split: sector1=M ways (streaming), sector0=rest (reuse)
  * ================================================================ */
 void test_l2_sector(double *A, double *B, double *C, int nA, int nB) {
-#pragma procedure scache_isolate_way L2=5 L1=1
 #pragma procedure scache_isolate_assign A
     int i, iter;
     volatile double sum = 0.0;
@@ -255,6 +279,7 @@ void test_l2_sector(double *A, double *B, double *C, int nA, int nB) {
         sum += B[i];
     }
 
+#pragma statement scache_isolate_way L2=5 L1=1
     /* Stream through A (large) while accessing B (resident) */
     /* With L2 sector: A confined to 5 L2 ways, B gets 11 ways */
     for (iter = 0; iter < 5; iter++) {
@@ -265,6 +290,7 @@ void test_l2_sector(double *A, double *B, double *C, int nA, int nB) {
             sum += B[i];
         }
     }
+#pragma statement end_scache_isolate_way
 
     C[0] = sum;
 }
@@ -523,7 +549,8 @@ static void run_l2_sector_test(void) {
     fill_random(B, nB);
 
     printf("\n=== Test 4: L2 Sector Cache (scache_isolate_way) ===\n");
-    printf("Pragma: #pragma procedure scache_isolate_way L2=5 L1=1\n");
+    printf("Pragma: #pragma statement scache_isolate_way L2=5 L1=1\n");
+    printf("        #pragma procedure scache_isolate_assign A\n");
     printf("A=%dMB(sector1,stream), B=%dKB(sector0,reuse)\n",
            (int)(nA * sizeof(double) / (1024*1024)),
            (int)(nB * sizeof(double) / 1024));
@@ -564,26 +591,48 @@ static void run_l2_sector_test(void) {
 }
 
 int main(void) {
+    const char *flib_hpc  = getenv("FLIB_HPCFUNC");
+    const char *flib_sccr = getenv("FLIB_SCCR_CNTL");
+    const char *flib_l1   = getenv("FLIB_L1_SCCR_CNTL");
+
     printf("========================================\n");
     printf("A64FX Sector Cache Test (FCC OCL Pragmas)\n");
     printf("========================================\n");
     printf("\n");
-    printf("Compiler: FCC traditional mode (-Nnoclang)\n");
-    printf("OCL pragma format:\n");
-    printf("  #pragma statement cache_sector_size(sector0_ways, sector1_ways)\n");
+    printf("Runtime environment:\n");
+    printf("  FLIB_HPCFUNC      = %s %s\n",
+           flib_hpc  ? flib_hpc  : "(not set)",
+           (flib_hpc && strcmp(flib_hpc, "TRUE") == 0) ? "(OK)" : "(REQUIRED!)");
+    printf("  FLIB_SCCR_CNTL    = %s %s\n",
+           flib_sccr ? flib_sccr : "(not set)",
+           (flib_sccr && strcmp(flib_sccr, "TRUE") == 0) ? "(OK)" : "(REQUIRED!)");
+    printf("  FLIB_L1_SCCR_CNTL = %s\n",
+           flib_l1   ? flib_l1   : "(not set)");
+    printf("\n");
+    if (!flib_hpc || strcmp(flib_hpc, "TRUE") != 0) {
+        printf("WARNING: FLIB_HPCFUNC=TRUE is required for sector cache!\n");
+        printf("  Without it, __jwe_check_hpctag reads /sys/kernel/xos_hpc/hwpf_uaccess\n");
+        printf("  and finds '0' -> SCCR programming is skipped (no-op).\n");
+        printf("  Set: export FLIB_HPCFUNC=TRUE\n\n");
+    }
+    printf("Compiler: FCC traditional mode (-Nnoclang -Kocl,hpctag)\n");
+    printf("\n");
+    printf("Method 1 (L1 only):\n");
+    printf("  #pragma statement cache_sector_size(S0, S1)  // S0+S1=4\n");
     printf("  #pragma statement cache_subsector_assign(ptr)\n");
-    printf("  ...loop body with ptr accesses tagged...\n");
+    printf("  ...loop body with ptr tagged to sector 1...\n");
     printf("  #pragma statement end_cache_subsector\n");
     printf("  #pragma statement end_cache_sector_size\n");
     printf("\n");
-    printf("HPC tag: loads from ptr use ORR x, x, #0x0100000000000000\n");
-    printf("         (bit 56 = sector 1 tag in top byte)\n");
-    printf("\n");
-    printf("Runtime: __jwe_xset_sccr() programs sector cache control register\n");
-    printf("         SCCR config = sector0_ways | (sector1_ways << 16)\n");
+    printf("Method 2 (L1+L2):\n");
+    printf("  #pragma statement scache_isolate_way L2=N [L1=M]\n");
+    printf("  #pragma procedure scache_isolate_assign ptr1, ptr2\n");
+    printf("  ...code with ptr1,ptr2 tagged to isolated sector...\n");
+    printf("  #pragma statement end_scache_isolate_way\n");
     printf("\n");
     printf("L1D: 64KB, 4-way, 256B line, 64 sets\n");
     printf("  1 way = 16KB, 2 ways = 32KB, 3 ways = 48KB\n");
+    printf("L2: 8MB, 16-way per CMG\n");
 
     run_streaming_test();
     run_gemm_test();

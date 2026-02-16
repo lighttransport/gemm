@@ -93,6 +93,11 @@ void embedding_fwd_f32_scatter_row_asm(const float* src_row, float* output_base,
                                         const int32_t* positions,
                                         size_t n_positions, size_t hidden_dim);
 
+// Forward pass FP16: deep-prefetch stream (8x unroll, prefetch 8 rows ahead)
+// Same strategy as FP32 stream but for __fp16 (2 bytes per element)
+void embedding_fwd_f16_stream_asm(const int32_t* indices, const void* emb_table,
+                                   void* output, size_t seq_len, size_t hidden_dim);
+
 //=============================================================================
 // C Reference Implementations
 //=============================================================================
