@@ -43,6 +43,17 @@ void softmax_tile_sve(
     float* max_exp_out      // [6] for dequantization
 );
 
+// Process 4 rows (for 4-row kernels)
+void softmax_tile_4row_sve(
+    const int32_t* scores,  // Input scores [4][64]
+    float scale,
+    softmax_state_t* state, // [4]
+    float* O_accum,         // [4][D]
+    int D,
+    int8_t* P_out,          // [4][64]
+    float* max_exp_out      // [4] for dequantization
+);
+
 // Final normalization after all chunks
 void softmax_finalize_sve(
     float* O,               // Output [6][D]

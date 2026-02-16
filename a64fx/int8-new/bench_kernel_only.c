@@ -1,107 +1,148 @@
-// bench_kernel_only.c - Benchmark just the microkernel with pre-packed data
+// bench_kernel_only.c
+// Benchmark Q@K^T kernels only (no softmax)
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include "gemm_pack_opt.h"
+#include "attention_d256_interleaved.h"
+
+static inline uint64_t rdtsc(void) {
+    uint64_t t;
+    __asm__ volatile("mrs %0, CNTVCT_EL0" : "=r"(t));
+    return t;
+}
+
+static inline uint64_t get_timer_freq(void) {
+    uint64_t f;
+    __asm__ volatile("mrs %0, CNTFRQ_EL0" : "=r"(f));
+    return f;
+}
+
+// Kernel declarations
+extern void kernel_qkt_d256_interleaved(const int8_t*, const int8_t*, int32_t*, int64_t, int64_t);
+extern void kernel_qkt_d256_4x4(const int8_t*, const int8_t*, int32_t*, int64_t, int64_t);
+extern void kernel_qkt_d256_2n(const int8_t*, const int8_t*, int32_t*, int64_t, int64_t);
+
+void interleave_K_chunk(const int8_t* K, int8_t* K_int, int N) {
+    for (int d_group = 0; d_group < D_GROUPS; d_group++) {
+        for (int n = 0; n < N; n++) {
+            for (int i = 0; i < 4; i++) {
+                K_int[d_group * N * 4 + n * 4 + i] = K[n * D256 + d_group * 4 + i];
+            }
+        }
+    }
+}
 
 int main() {
-    printf("=== Microkernel-Only Benchmark ===\n");
-    printf("Testing raw kernel performance without packing overhead\n\n");
+    printf("================================================================\n");
+    printf("Q@K^T Kernel Only Benchmark (D=256)\n");
+    printf("================================================================\n\n");
 
-    // Single tile: 6x64 output from 6x256 A and 64x256 B
-    size_t A_pack_size = 6 * 256;    // 1536 bytes
-    size_t B_pack_size = 64 * 256;   // 16384 bytes
+    uint64_t timer_freq = get_timer_freq();
 
-    // Allocate aligned buffers
-    int8_t* Apack = NULL;
-    int8_t* Bpack = NULL;
-    int32_t* C = NULL;
+    int M = 1536, N = 64, D = D256;  // Single N-chunk
 
-    posix_memalign((void**)&Apack, 256, A_pack_size);
-    posix_memalign((void**)&Bpack, 256, B_pack_size);
-    posix_memalign((void**)&C, 256, 6 * 64 * sizeof(int32_t));
+    // Allocate
+    int8_t* Q = aligned_alloc(64, M * D);
+    int8_t* K = aligned_alloc(64, N * D);
+    int8_t* K_int = aligned_alloc(64, D_GROUPS * N * 4);
+    int32_t* S_6row = aligned_alloc(64, 6 * N * sizeof(int32_t));
+    int32_t* S_4x4 = aligned_alloc(64, 4 * N * sizeof(int32_t));
+    int32_t* S_ref = aligned_alloc(64, 6 * N * sizeof(int32_t));
 
-    // Initialize with test pattern
-    for (size_t i = 0; i < A_pack_size; i++) Apack[i] = 1;
-    for (size_t i = 0; i < B_pack_size; i++) Bpack[i] = 1;
-    memset(C, 0, 6 * 64 * sizeof(int32_t));
+    // Initialize
+    for (int i = 0; i < M * D; i++) Q[i] = (i % 7) - 3;
+    for (int i = 0; i < N * D; i++) K[i] = (i % 11) - 5;
+    interleave_K_chunk(K, K_int, N);
 
-    // Get frequency
-    uint64_t freq;
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
-    printf("Timer frequency: %lu Hz\n", (unsigned long)freq);
-
-    // Warmup
-    kernel_6x4_ultra(Apack, Bpack, C, 64 * sizeof(int32_t));
-
-    // Verify result (should be 256 for all ones)
-    printf("Warmup result C[0]=%d (expected 256)\n", C[0]);
-
-    // Benchmark with many iterations
-    int iterations = 1000000;  // 1M iterations
-    printf("Running %d kernel iterations...\n", iterations);
-
-    uint64_t t0, t1;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t0));
-
-    for (int i = 0; i < iterations; i++) {
-        kernel_6x4_ultra(Apack, Bpack, C, 64 * sizeof(int32_t));
+    // Compute reference for first 6 rows using scalar
+    for (int m = 0; m < 6; m++) {
+        for (int n = 0; n < N; n++) {
+            int32_t sum = 0;
+            for (int d = 0; d < D; d++) {
+                sum += (int32_t)Q[m * D + d] * (int32_t)K[n * D + d];
+            }
+            S_ref[m * N + n] = sum;
+        }
     }
 
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t1));
+    // Test 6-row interleaved kernel
+    memset(S_6row, 0, 6 * N * sizeof(int32_t));
+    kernel_qkt_d256_interleaved(Q, K_int, S_6row, D, N);
 
-    // Compute stats
-    uint64_t cycles = t1 - t0;
-    double time_s = (double)cycles / (double)freq;
-    double cycles_per_call = (double)cycles / iterations;
-
-    // Each kernel call: 6 rows × 64 cols × 256 K × 2 ops = 196,608 ops
-    double ops_per_call = 2.0 * 6 * 64 * 256;
-    double total_ops = ops_per_call * iterations;
-    double gops = total_ops / time_s / 1e9;
-
-    printf("\nResults:\n");
-    printf("  Total cycles: %lu\n", (unsigned long)cycles);
-    printf("  Time: %.3f seconds\n", time_s);
-    printf("  Cycles per kernel call: %.1f\n", cycles_per_call);
-    printf("  Ops per kernel call: %.0f\n", ops_per_call);
-    printf("  GOPS: %.2f\n", gops);
-    printf("  Efficiency: %.1f%% of 512 GOPS peak\n", 100.0 * gops / 512.0);
-
-    // Theoretical analysis
-    printf("\nTheoretical analysis (A64FX at 2 GHz):\n");
-    printf("  Minimum cycles (24 SDOT / 2 pipes): 12 cycles\n");
-    printf("  Your cycles per call: %.1f cycles\n", cycles_per_call);
-    printf("  Efficiency vs theoretical: %.1f%%\n", 100.0 * 12.0 / cycles_per_call);
-
-    // Test pipe kernel too
-    printf("\n--- Testing Pipe Kernel ---\n");
-    memset(C, 0, 6 * 64 * sizeof(int32_t));
-    kernel_6x4_pipe(Apack, Bpack, C, 64 * sizeof(int32_t));
-    printf("Pipe result C[0]=%d (expected 256)\n", C[0]);
-
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t0));
-
-    for (int i = 0; i < iterations; i++) {
-        kernel_6x4_pipe(Apack, Bpack, C, 64 * sizeof(int32_t));
+    printf("6-row interleaved kernel verification:\n");
+    int32_t max_diff_6row = 0;
+    for (int i = 0; i < 6 * N; i++) {
+        int32_t diff = S_6row[i] - S_ref[i];
+        if (diff < 0) diff = -diff;
+        if (diff > max_diff_6row) max_diff_6row = diff;
     }
+    printf("  Max diff from scalar ref: %d\n", max_diff_6row);
 
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t1));
+    // Test 4x4 kernel
+    memset(S_4x4, 0, 4 * N * sizeof(int32_t));
+    kernel_qkt_d256_4x4(Q, K_int, S_4x4, D, N);
 
-    cycles = t1 - t0;
-    time_s = (double)cycles / (double)freq;
-    cycles_per_call = (double)cycles / iterations;
-    gops = total_ops / time_s / 1e9;
+    printf("\n4x4 kernel verification:\n");
+    int32_t max_diff_4x4 = 0;
+    for (int m = 0; m < 4; m++) {
+        for (int n = 0; n < N; n++) {
+            int32_t diff = S_4x4[m * N + n] - S_ref[m * N + n];
+            if (diff < 0) diff = -diff;
+            if (diff > max_diff_4x4) max_diff_4x4 = diff;
+        }
+    }
+    printf("  Max diff from scalar ref: %d\n", max_diff_4x4);
 
-    printf("\nPipe kernel results:\n");
-    printf("  Cycles per kernel call: %.1f\n", cycles_per_call);
-    printf("  GOPS: %.2f\n", gops);
-    printf("  Efficiency: %.1f%% of 512 GOPS peak\n", 100.0 * gops / 512.0);
+    // Debug: print first few values
+    printf("\n  Sample values (first 4 elements of row 0):\n");
+    printf("    Scalar: %d %d %d %d\n", S_ref[0], S_ref[1], S_ref[2], S_ref[3]);
+    printf("    6-row:  %d %d %d %d\n", S_6row[0], S_6row[1], S_6row[2], S_6row[3]);
+    printf("    4x4:    %d %d %d %d\n", S_4x4[0], S_4x4[1], S_4x4[2], S_4x4[3]);
 
-    free(Apack);
-    free(Bpack);
-    free(C);
+    // Benchmark kernels
+    printf("\n--- Kernel Performance ---\n");
+    int M_tiles_6 = M / 6;
+    int M_tiles_4 = M / 4;
+    int iters = 100;
 
+    // 6-row kernel
+    uint64_t t0 = rdtsc();
+    for (int iter = 0; iter < iters; iter++) {
+        for (int mt = 0; mt < M_tiles_6; mt++) {
+            kernel_qkt_d256_interleaved(Q + mt * 6 * D, K_int, S_6row, D, N);
+        }
+    }
+    uint64_t t1 = rdtsc();
+    double cycles_6row = (double)(t1 - t0) / iters / timer_freq * 2.0e9;
+
+    // 4x4 kernel
+    uint64_t t2 = rdtsc();
+    for (int iter = 0; iter < iters; iter++) {
+        for (int mt = 0; mt < M_tiles_4; mt++) {
+            kernel_qkt_d256_4x4(Q + mt * 4 * D, K_int, S_4x4, D, N);
+        }
+    }
+    uint64_t t3 = rdtsc();
+    double cycles_4x4 = (double)(t3 - t2) / iters / timer_freq * 2.0e9;
+
+    // Compute GFLOPS
+    double ops_6row = 2.0 * M_tiles_6 * 6 * N * D;  // 2 ops per MAC (mul + add)
+    double ops_4x4 = 2.0 * M_tiles_4 * 4 * N * D;
+
+    printf("\n%-15s %12s %12s %10s\n", "Kernel", "Cycles", "GFLOPS", "Eff%");
+    printf("%-15s %12s %12s %10s\n", "---------------", "------------", "------------", "----------");
+    printf("%-15s %12.0f %12.1f %9.1f%%\n", "6-row interleave",
+           cycles_6row, ops_6row / (cycles_6row / 2e9) / 1e9,
+           100.0 * ops_6row / (cycles_6row / 2e9) / 1e9 / 512.0);
+    printf("%-15s %12.0f %12.1f %9.1f%%\n", "4x4 tile",
+           cycles_4x4, ops_4x4 / (cycles_4x4 / 2e9) / 1e9,
+           100.0 * ops_4x4 / (cycles_4x4 / 2e9) / 1e9 / 512.0);
+
+    free(Q); free(K); free(K_int);
+    free(S_6row); free(S_4x4); free(S_ref);
+
+    printf("\n================================================================\n");
     return 0;
 }
