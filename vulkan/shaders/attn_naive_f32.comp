@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+// Naive multi-head self-attention on fused QKV buffer.
+//
+// QKV layout: [n_patches, 3*dim]
+//   Q for token t, head h: qkv[t * 3*dim + h*head_dim .. + head_dim]
+//   K for token t, head h: qkv[t * 3*dim + dim + h*head_dim .. + head_dim]
+//   V for token t, head h: qkv[t * 3*dim + 2*dim + h*head_dim .. + head_dim]
+//
+// Output: [n_patches, dim] - all heads concatenated.
+//
+// Dispatch: one workgroup per (query_token, head) pair.
+//   gl_WorkGroupID.x = query index, gl_WorkGroupID.y = head index.
+//
+// Algorithm per WG:
+//   1. Compute scores[ki] = dot(Q_h[qi], K_h[ki]) * scale for all ki
+//   2. Softmax over scores (shared memory reduction)
+//   3. Compute output[d] = sum_ki scores[ki] * V_h[ki,d] for d in [0, head_dim)
+//
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QKVBuffer { float qkv[]; };
+layout(std430, binding = 1) writeonly buffer OutBuffer { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_patches;
+    uint dim;
+    uint n_heads;
+    uint head_dim;
+    float scale;  // 1/sqrt(head_dim)
+} pc;
+
+// Shared memory for scores (max n_patches we support in shared mem)
+// We'll use a two-pass approach if n_patches > 256
+shared float s_scores[2048]; // support up to 2048 patches
+shared float s_val[256];     // for reductions
+
+void main() {
+    uint qi = gl_WorkGroupID.x;   // query token
+    uint hi = gl_WorkGroupID.y;   // head index
+    uint tid = gl_LocalInvocationID.x;
+
+    if (qi >= pc.n_patches || hi >= pc.n_heads) return;
+
+    uint stride = 3 * pc.dim;
+    uint q_base = qi * stride + hi * pc.head_dim;         // Q offset
+    uint k_offset = pc.dim;                                // K starts at dim within each token's QKV
+
+    // Phase 1: Compute attention scores
+    for (uint ki = tid; ki < pc.n_patches; ki += 256) {
+        uint k_base = ki * stride + k_offset + hi * pc.head_dim;
+        float dot = 0.0;
+        for (uint d = 0; d < pc.head_dim; d++) {
+            dot += qkv[q_base + d] * qkv[k_base + d];
+        }
+        s_scores[ki] = dot * pc.scale;
+    }
+    barrier();
+
+    // Phase 2: Softmax - find max
+    float local_max = -1e30;
+    for (uint ki = tid; ki < pc.n_patches; ki += 256) {
+        local_max = max(local_max, s_scores[ki]);
+    }
+    s_val[tid] = local_max;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_val[tid] = max(s_val[tid], s_val[tid + s]);
+        barrier();
+    }
+    float row_max = s_val[0];
+    barrier();
+
+    // Exp and partial sum
+    float local_sum = 0.0;
+    for (uint ki = tid; ki < pc.n_patches; ki += 256) {
+        float e = exp(s_scores[ki] - row_max);
+        s_scores[ki] = e;
+        local_sum += e;
+    }
+    s_val[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_val[tid] += s_val[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / s_val[0];
+    barrier();
+
+    // Normalize scores
+    for (uint ki = tid; ki < pc.n_patches; ki += 256) {
+        s_scores[ki] *= inv_sum;
+    }
+    barrier();
+
+    // Phase 3: Weighted sum of V -> output
+    // Each thread handles a subset of head_dim dimensions
+    uint v_offset = 2 * pc.dim;
+    uint out_base = qi * pc.dim + hi * pc.head_dim;
+
+    for (uint d = tid; d < pc.head_dim; d += 256) {
+        float acc = 0.0;
+        for (uint ki = 0; ki < pc.n_patches; ki++) {
+            uint v_base = ki * stride + v_offset + hi * pc.head_dim;
+            acc += s_scores[ki] * qkv[v_base + d];
+        }
+        out_buf[out_base + d] = acc;
+    }
+}
