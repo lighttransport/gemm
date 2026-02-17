@@ -1,15 +1,14 @@
 /*
- * Zen2 AVX2 FP32 6×16 GEMM microkernel (BLIS-style)
+ * Zen2 AVX2 FP32 6×16 GEMM microkernel — v2 optimized scheduling
  *
- * Optimized for AMD Zen2 with HW prefetch OFF:
- * - 2-broadcast + 4-FMA grouping per row pair
- * - B loads cleanly after all 12 FMAs per K step
- * - B pointer pre-biased by +128 for compact encoding
- * - C prefetch (prefetchw for overwrite, prefetcht0 for accum) before K-loop
- * - A prefetch at 256, 304 bytes ahead
- * - Full B prefetch coverage: 4 prefetches per 4-CL unrolled block
+ * Changes from v1:
+ * - Removed B software prefetches (Zen2 HW prefetch handles sequential B)
+ * - Broadcasts issued BEFORE prefetches to enter scheduler earlier
+ * - Pre-broadcast A[row0,row1] for next K-step at end of current K-step
+ * - Interleaved broadcast for rows 2-3 into rows 0-1 FMA latency shadow
+ * - Prefetches placed in broadcast→FMA latency gap (dead cycles)
  *
- * Register allocation (BLIS convention):
+ * Register allocation:
  *   ymm0, ymm1:   B vectors (NR=16 = 2 × 8-wide YMM)
  *   ymm2, ymm3:   A broadcast temps
  *   ymm4–ymm15:   12 accumulators
@@ -76,8 +75,6 @@ gemm_kernel_6x16_accum:
     vmovups ymm14, [rax]
     vmovups ymm15, [rax + 32]
 
-    /* Prefetch C rows to L1 for accumulate (data already loaded above,
-       but prefetch the +32 half-CL if not same line) */
     jmp .L_k_loop_setup
 
 /* ------------------------------------------------------------------ */
@@ -128,7 +125,7 @@ gemm_kernel_6x16_accum:
 /*  Main K-loop (shared)                                              */
 /* ------------------------------------------------------------------ */
 .L_k_loop_common:
-    /* Pre-bias B pointer */
+    /* Pre-bias B pointer for compact displacement encoding */
     add    r10, 128
 
     mov    rbx, rcx
@@ -139,118 +136,130 @@ gemm_kernel_6x16_accum:
     test   rbx, rbx
     jz     .L_k_remainder
 
-    /* Preload B for K=0 */
+    /* Preload B for K=0 and pre-broadcast A[0,1] */
     vmovaps ymm0, [r10 - 4*32]
     vmovaps ymm1, [r10 - 3*32]
+    vbroadcastss ymm2, dword ptr [rax + 0*4]
+    vbroadcastss ymm3, dword ptr [rax + 1*4]
 
     .align 32
 .L_k_unrolled:
 
     /* ============ K step 0 ============ */
-    prefetcht0 [rax + 256]
-    prefetcht0 [r10 + 384]
+    /* ymm2=A[0], ymm3=A[1] already pre-broadcast */
 
-    vbroadcastss ymm2, dword ptr [rax + 0*4]
-    vbroadcastss ymm3, dword ptr [rax + 1*4]
+    /* Rows 0-1 FMAs (ymm2, ymm3 ready from pre-broadcast) */
     vfmadd231ps  ymm4,  ymm2, ymm0
     vfmadd231ps  ymm5,  ymm2, ymm1
+    /* Interleave: start rows 2-3 broadcasts in latency shadow */
+    vbroadcastss ymm2, dword ptr [rax + 2*4]
     vfmadd231ps  ymm6,  ymm3, ymm0
     vfmadd231ps  ymm7,  ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 2*4]
     vbroadcastss ymm3, dword ptr [rax + 3*4]
+
+    /* A prefetch in dead time (broadcasts in flight) */
+    prefetcht0 [rax + 256]
+
+    /* Rows 2-3 FMAs */
     vfmadd231ps  ymm8,  ymm2, ymm0
     vfmadd231ps  ymm9,  ymm2, ymm1
+    /* Interleave: start rows 4-5 broadcasts */
+    vbroadcastss ymm2, dword ptr [rax + 4*4]
     vfmadd231ps  ymm10, ymm3, ymm0
     vfmadd231ps  ymm11, ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 4*4]
     vbroadcastss ymm3, dword ptr [rax + 5*4]
+
+    /* Rows 4-5 FMAs */
     vfmadd231ps  ymm12, ymm2, ymm0
     vfmadd231ps  ymm13, ymm2, ymm1
     vfmadd231ps  ymm14, ymm3, ymm0
     vfmadd231ps  ymm15, ymm3, ymm1
 
+    /* Load B for K1 + pre-broadcast K1 A[0,1] */
     vmovaps ymm0, [r10 - 2*32]
     vmovaps ymm1, [r10 - 1*32]
+    vbroadcastss ymm2, dword ptr [rax + 6*4]
+    vbroadcastss ymm3, dword ptr [rax + 7*4]
 
 
     /* ============ K step 1 ============ */
-    prefetcht0 [r10 + 448]
+    /* ymm2=A[6], ymm3=A[7] already pre-broadcast */
 
-    vbroadcastss ymm2, dword ptr [rax + 6*4]
-    vbroadcastss ymm3, dword ptr [rax + 7*4]
     vfmadd231ps  ymm4,  ymm2, ymm0
     vfmadd231ps  ymm5,  ymm2, ymm1
+    vbroadcastss ymm2, dword ptr [rax + 8*4]
     vfmadd231ps  ymm6,  ymm3, ymm0
     vfmadd231ps  ymm7,  ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 8*4]
     vbroadcastss ymm3, dword ptr [rax + 9*4]
+
     vfmadd231ps  ymm8,  ymm2, ymm0
     vfmadd231ps  ymm9,  ymm2, ymm1
+    vbroadcastss ymm2, dword ptr [rax + 10*4]
     vfmadd231ps  ymm10, ymm3, ymm0
     vfmadd231ps  ymm11, ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 10*4]
     vbroadcastss ymm3, dword ptr [rax + 11*4]
+
     vfmadd231ps  ymm12, ymm2, ymm0
     vfmadd231ps  ymm13, ymm2, ymm1
     vfmadd231ps  ymm14, ymm3, ymm0
     vfmadd231ps  ymm15, ymm3, ymm1
 
+    /* Load B for K2 + pre-broadcast K2 A[0,1] */
     vmovaps ymm0, [r10 + 0*32]
     vmovaps ymm1, [r10 + 1*32]
+    vbroadcastss ymm2, dword ptr [rax + 12*4]
+    vbroadcastss ymm3, dword ptr [rax + 13*4]
 
 
     /* ============ K step 2 ============ */
-    prefetcht0 [rax + 304]
-    prefetcht0 [r10 + 512]
+    /* ymm2=A[12], ymm3=A[13] already pre-broadcast */
 
-    vbroadcastss ymm2, dword ptr [rax + 12*4]
-    vbroadcastss ymm3, dword ptr [rax + 13*4]
     vfmadd231ps  ymm4,  ymm2, ymm0
     vfmadd231ps  ymm5,  ymm2, ymm1
+    vbroadcastss ymm2, dword ptr [rax + 14*4]
     vfmadd231ps  ymm6,  ymm3, ymm0
     vfmadd231ps  ymm7,  ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 14*4]
     vbroadcastss ymm3, dword ptr [rax + 15*4]
+
+    /* A prefetch (second cache line) */
+    prefetcht0 [rax + 304]
+
     vfmadd231ps  ymm8,  ymm2, ymm0
     vfmadd231ps  ymm9,  ymm2, ymm1
+    vbroadcastss ymm2, dword ptr [rax + 16*4]
     vfmadd231ps  ymm10, ymm3, ymm0
     vfmadd231ps  ymm11, ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 16*4]
     vbroadcastss ymm3, dword ptr [rax + 17*4]
+
     vfmadd231ps  ymm12, ymm2, ymm0
     vfmadd231ps  ymm13, ymm2, ymm1
     vfmadd231ps  ymm14, ymm3, ymm0
     vfmadd231ps  ymm15, ymm3, ymm1
 
+    /* Load B for K3 + pre-broadcast K3 A[0,1] */
     vmovaps ymm0, [r10 + 2*32]
     vmovaps ymm1, [r10 + 3*32]
+    vbroadcastss ymm2, dword ptr [rax + 18*4]
+    vbroadcastss ymm3, dword ptr [rax + 19*4]
 
 
     /* ============ K step 3 ============ */
-    prefetcht0 [r10 + 576]
+    /* ymm2=A[18], ymm3=A[19] already pre-broadcast */
 
-    vbroadcastss ymm2, dword ptr [rax + 18*4]
-    vbroadcastss ymm3, dword ptr [rax + 19*4]
     vfmadd231ps  ymm4,  ymm2, ymm0
     vfmadd231ps  ymm5,  ymm2, ymm1
+    vbroadcastss ymm2, dword ptr [rax + 20*4]
     vfmadd231ps  ymm6,  ymm3, ymm0
     vfmadd231ps  ymm7,  ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 20*4]
     vbroadcastss ymm3, dword ptr [rax + 21*4]
+
     vfmadd231ps  ymm8,  ymm2, ymm0
     vfmadd231ps  ymm9,  ymm2, ymm1
+    vbroadcastss ymm2, dword ptr [rax + 22*4]
     vfmadd231ps  ymm10, ymm3, ymm0
     vfmadd231ps  ymm11, ymm3, ymm1
-
-    vbroadcastss ymm2, dword ptr [rax + 22*4]
     vbroadcastss ymm3, dword ptr [rax + 23*4]
+
     vfmadd231ps  ymm12, ymm2, ymm0
     vfmadd231ps  ymm13, ymm2, ymm1
     vfmadd231ps  ymm14, ymm3, ymm0
@@ -260,9 +269,11 @@ gemm_kernel_6x16_accum:
     add    rax, 4*6*4
     add    r10, 4*16*4
 
-    /* Preload B for next iteration K=0 */
+    /* Pre-load B for next K0 + pre-broadcast next K0 A[0,1] */
     vmovaps ymm0, [r10 - 4*32]
     vmovaps ymm1, [r10 - 3*32]
+    vbroadcastss ymm2, dword ptr [rax + 0*4]
+    vbroadcastss ymm3, dword ptr [rax + 1*4]
 
     dec    rbx
     jnz    .L_k_unrolled

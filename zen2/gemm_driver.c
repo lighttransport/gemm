@@ -33,7 +33,15 @@ void gemm_fp32(const float *A, int lda,
                float *C, int ldc,
                int M, int N, int K)
 {
-    int Mc = MC_DEFAULT;
+    /* Adaptive MC: use ~75% of L2 (512 KB) for A panel.
+     * A panel = Mc * K * 4 bytes.  Mc = 384*1024/(K*4), rounded to MR. */
+    int Mc;
+    {
+        int mc_max = (384 * 1024) / (K * (int)sizeof(float));
+        mc_max = (mc_max / MR) * MR;
+        if (mc_max < MR) mc_max = MR;
+        Mc = mc_max;
+    }
     int Nc = NC_DEFAULT;
 
     if (Mc > M) Mc = ((M + MR - 1) / MR) * MR;
