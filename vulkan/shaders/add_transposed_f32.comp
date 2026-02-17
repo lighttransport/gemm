@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT
+// Add position embeddings (transposed access)
+// pos_emb is [dim, orig_n] row-major: pos_emb[d * orig_n + orig_p]
+// hidden[p * dim + d] += pos_emb[d * orig_n + orig_p]
+// where orig_p = py * orig_gw + px, and (py, px) = patch coords
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer HiddenBuffer { float hidden[]; };
+layout(std430, binding = 1) readonly buffer PosEmbBuffer { float pos_emb[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_patches;
+    uint dim;
+    uint gw;       // current grid width
+    uint orig_gw;  // original grid width
+    uint orig_n;   // original total patches
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.n_patches * pc.dim;
+    if (idx >= total) return;
+
+    uint p = idx / pc.dim;
+    uint d = idx % pc.dim;
+
+    uint py = p / pc.gw;
+    uint px = p % pc.gw;
+    uint orig_p = py * pc.orig_gw + px;
+
+    hidden[p * pc.dim + d] += pos_emb[d * pc.orig_n + orig_p];
+}

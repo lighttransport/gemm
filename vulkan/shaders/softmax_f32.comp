@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: MIT
+// Per-row softmax: x[row,i] = exp(x[row,i] - max) / sum(exp(x[row,:] - max))
+// One workgroup per row. Shared memory reduction for max and sum.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DataBuffer { float data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_rows;
+    uint n_cols;
+} pc;
+
+shared float s_val[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.n_cols;
+
+    // Find max
+    float pmax = -1e30;
+    for (uint i = tid; i < pc.n_cols; i += 256) {
+        pmax = max(pmax, data[base + i]);
+    }
+    s_val[tid] = pmax;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_val[tid] = max(s_val[tid], s_val[tid + s]);
+        barrier();
+    }
+    float row_max = s_val[0];
+    barrier();
+
+    // Exp and partial sum
+    float psum = 0.0;
+    for (uint i = tid; i < pc.n_cols; i += 256) {
+        float e = exp(data[base + i] - row_max);
+        data[base + i] = e;
+        psum += e;
+    }
+    s_val[tid] = psum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_val[tid] += s_val[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / s_val[0];
+    barrier();
+
+    // Normalize
+    for (uint i = tid; i < pc.n_cols; i += 256) {
+        data[base + i] *= inv_sum;
+    }
+}

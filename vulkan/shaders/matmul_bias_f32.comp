@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: MIT
+// C[M,N] = A[M,K] * W[N,K]^T + bias[N]
+// W is stored as [N,K] row-major (GGUF layout), so C[m,n] = sum_k A[m*K+k]*W[n*K+k] + bias[n]
+// bias buffer is optional; controlled by has_bias push constant.
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer MatrixA { float A[]; };
+layout(std430, binding = 1) readonly buffer MatrixW { float W[]; };
+layout(std430, binding = 2) writeonly buffer MatrixC { float C[]; };
+layout(std430, binding = 3) readonly buffer BiasBuffer { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y; // m
+    uint col = gl_GlobalInvocationID.x; // n
+
+    if (row >= pc.M || col >= pc.N) return;
+
+    float sum = 0.0;
+    for (uint k = 0; k < pc.K; k++) {
+        sum += A[row * pc.K + k] * W[col * pc.K + k];
+    }
+
+    if (pc.has_bias != 0) {
+        sum += bias[col];
+    }
+
+    C[row * pc.N + col] = sum;
+}

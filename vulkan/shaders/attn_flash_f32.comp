@@ -1,0 +1,134 @@
+// SPDX-License-Identifier: MIT
+// Flash Attention (online softmax) on fused QKV buffer.
+//
+// QKV layout: [n_patches, 3*dim]
+//   Q for token t, head h: qkv[t * 3*dim + h*head_dim .. + head_dim]
+//   K for token t, head h: qkv[t * 3*dim + dim + h*head_dim .. + head_dim]
+//   V for token t, head h: qkv[t * 3*dim + 2*dim + h*head_dim .. + head_dim]
+//
+// Output: [n_patches, dim]
+//
+// Dispatch: one workgroup per (query_token, head) pair.
+//
+// Algorithm (FlashAttention-1 style, single pass):
+//   Process K/V in tiles of TILE_KV tokens.
+//   Maintain running max (m), running exp-sum (l), and running output accumulator (o).
+//   For each tile:
+//     1. Compute scores for tile: s[j] = dot(Q, K[j]) * scale
+//     2. Find tile max: m_tile
+//     3. Update global max: m_new = max(m_old, m_tile)
+//     4. Rescale: correction = exp(m_old - m_new)
+//     5. o = o * correction; l = l * correction
+//     6. For each j in tile: w = exp(s[j] - m_new); o += w * V[j]; l += w
+//     7. m_old = m_new
+//   Finally: o = o / l
+//
+#version 450
+
+// TILE_KV: number of K/V tokens processed per tile
+// Stored in shared memory, so keep moderate. 64 is a good balance.
+#define TILE_KV 64
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QKVBuffer { float qkv[]; };
+layout(std430, binding = 1) writeonly buffer OutBuffer { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_patches;
+    uint dim;
+    uint n_heads;
+    uint head_dim;
+    float scale;
+} pc;
+
+// Shared memory for tile scores and reductions
+shared float s_scores[TILE_KV];   // attention scores for current tile
+shared float s_reduce[256];       // reduction scratch
+shared float s_m_new;             // broadcast max
+shared float s_l;                 // broadcast exp-sum
+
+void main() {
+    uint qi = gl_WorkGroupID.x;
+    uint hi = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (qi >= pc.n_patches || hi >= pc.n_heads) return;
+
+    uint stride = 3 * pc.dim;
+    uint q_base = qi * stride + hi * pc.head_dim;
+    uint k_off = pc.dim;
+    uint v_off = 2 * pc.dim;
+
+    // Each thread handles one output dimension (head_dim <= 256)
+    float o_acc = 0.0;
+    float m_prev = -1e30;
+    float l_prev = 0.0;
+
+    // Process K/V in tiles
+    uint n_tiles = (pc.n_patches + TILE_KV - 1) / TILE_KV;
+
+    for (uint tile = 0; tile < n_tiles; tile++) {
+        uint tile_start = tile * TILE_KV;
+        uint tile_end = min(tile_start + TILE_KV, pc.n_patches);
+        uint tile_len = tile_end - tile_start;
+
+        // Step 1: Compute scores for this tile (collaborative)
+        for (uint j = tid; j < tile_len; j += 256) {
+            uint ki = tile_start + j;
+            uint k_base = ki * stride + k_off + hi * pc.head_dim;
+            float dot = 0.0;
+            for (uint d = 0; d < pc.head_dim; d++) {
+                dot += qkv[q_base + d] * qkv[k_base + d];
+            }
+            s_scores[j] = dot * pc.scale;
+        }
+        barrier();
+
+        // Step 2: Find tile max (reduction)
+        float local_max = -1e30;
+        for (uint j = tid; j < tile_len; j += 256) {
+            local_max = max(local_max, s_scores[j]);
+        }
+        s_reduce[tid] = local_max;
+        barrier();
+
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s) s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + s]);
+            barrier();
+        }
+        float m_tile = s_reduce[0];
+
+        // Step 3: New global max
+        float m_new = max(m_prev, m_tile);
+
+        // Step 4-5: Rescale running state
+        float correction = exp(m_prev - m_new);
+        o_acc *= correction;
+        l_prev *= correction;
+
+        // Step 6: Accumulate this tile's contribution
+        // Thread 0 accumulates l; all threads compute weighted V
+        float tile_l = 0.0;
+        for (uint j = 0; j < tile_len; j++) {
+            float w = exp(s_scores[j] - m_new);
+            if (tid < pc.head_dim) {
+                uint ki = tile_start + j;
+                uint v_base = ki * stride + v_off + hi * pc.head_dim;
+                o_acc += w * qkv[v_base + tid];
+            }
+            tile_l += w;
+        }
+
+        // Each thread computed the same tile_l (same scores, same loop)
+        l_prev += tile_l;
+        m_prev = m_new;
+        barrier();
+    }
+
+    // Final normalization
+    if (tid < pc.head_dim && l_prev > 0.0) {
+        uint out_base = qi * pc.dim + hi * pc.head_dim;
+        out_buf[out_base + tid] = o_acc / l_prev;
+    }
+}
