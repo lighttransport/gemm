@@ -20,6 +20,17 @@ void gemm_kernel_6x16(const float *A_packed, const float *B_packed,
 void gemm_kernel_6x16_accum(const float *A_packed, const float *B_packed,
                              float *C, int64_t K, int64_t ldc_bytes);
 
+/* Assembly microkernel with next-tile A prefetch: C = A * B (overwrite) */
+void gemm_kernel_6x16_pf(const float *A_packed, const float *B_packed,
+                          float *C, int64_t K, int64_t ldc_bytes,
+                          const float *A_next);
+
+/* AVX2 edge kernels for mr < MR: C = A * B (overwrite) */
+void gemm_kernel_4x16(const float *A_packed, const float *B_packed,
+                       float *C, int64_t K, int64_t ldc_bytes);
+void gemm_kernel_2x16(const float *A_packed, const float *B_packed,
+                       float *C, int64_t K, int64_t ldc_bytes);
+
 /* Full GEMM driver:
  *   C[M×N] = A[M×K] × B[N×K]^T   (B stored row-major as N×K)
  *   All matrices row-major.
@@ -28,5 +39,8 @@ void gemm_fp32(const float *A, int lda,
                const float *B, int ldb,
                float *C, int ldc,
                int M, int N, int K);
+
+/* Free persistent internal pack buffers (optional cleanup). */
+void gemm_cleanup(void);
 
 #endif /* GEMM_H */

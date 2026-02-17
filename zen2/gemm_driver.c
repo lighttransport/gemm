@@ -4,6 +4,29 @@
 #include <string.h>
 #include <sys/mman.h>   /* madvise */
 
+/* Persistent pack buffers — lazily allocated, reused across calls */
+static float *g_A_pack = NULL;
+static float *g_B_pack = NULL;
+static size_t g_A_pack_cap = 0;  /* current capacity in bytes */
+static size_t g_B_pack_cap = 0;
+
+static float *ensure_pack_buf(float **buf, size_t *cap, size_t need)
+{
+    if (need <= *cap)
+        return *buf;
+    free(*buf);
+    posix_memalign((void **)buf, 64, need);
+    madvise(*buf, need, MADV_HUGEPAGE);
+    *cap = need;
+    return *buf;
+}
+
+void gemm_cleanup(void)
+{
+    free(g_A_pack); g_A_pack = NULL; g_A_pack_cap = 0;
+    free(g_B_pack); g_B_pack = NULL; g_B_pack_cap = 0;
+}
+
 /*
  * Scalar microkernel for edge tiles where mr < MR or nr < NR.
  * C[mr×nr] = A_pack[K×MR] × B_pack[K×NR] (overwrite mode).
@@ -47,16 +70,10 @@ void gemm_fp32(const float *A, int lda,
     if (Mc > M) Mc = ((M + MR - 1) / MR) * MR;
     if (Nc > N) Nc = ((N + NR - 1) / NR) * NR;
 
-    float *A_pack = NULL;
-    float *B_pack = NULL;
     size_t a_pack_sz = (size_t)Mc * K * sizeof(float);
     size_t b_pack_sz = (size_t)Nc * K * sizeof(float);
-    posix_memalign((void **)&A_pack, 64, a_pack_sz);
-    posix_memalign((void **)&B_pack, 64, b_pack_sz);
-
-    /* Request transparent huge pages for packed buffers */
-    madvise(A_pack, a_pack_sz, MADV_HUGEPAGE);
-    madvise(B_pack, b_pack_sz, MADV_HUGEPAGE);
+    float *A_pack = ensure_pack_buf(&g_A_pack, &g_A_pack_cap, a_pack_sz);
+    float *B_pack = ensure_pack_buf(&g_B_pack, &g_B_pack_cap, b_pack_sz);
 
     int64_t ldc_bytes = (int64_t)ldc * sizeof(float);
 
@@ -85,6 +102,15 @@ void gemm_fp32(const float *A, int lda,
                 int nr = (jr + NR <= nc) ? NR : (nc - jr);
                 const float *B_tile = B_pack + (size_t)jr * K;
 
+                /* Prefetch first 1 KB of B_tile into L1 */
+                {
+                    size_t b_tile_bytes = (size_t)NR * K * sizeof(float);
+                    size_t pf_limit = 1024;
+                    if (pf_limit > b_tile_bytes) pf_limit = b_tile_bytes;
+                    for (size_t p = 0; p < pf_limit; p += 64)
+                        __builtin_prefetch((const char *)B_tile + p, 0, 3);
+                }
+
                 for (int ir = 0; ir < mc; ir += MR) {
                     int mr = (ir + MR <= mc) ? MR : (mc - ir);
 
@@ -92,7 +118,20 @@ void gemm_fp32(const float *A, int lda,
                     const float *A_tile = A_pack + (size_t)ir * K;
 
                     if (mr == MR && nr == NR) {
-                        gemm_kernel_6x16(A_tile, B_tile,
+                        /* A_next: prefetch next ir tile's A_pack into L1 */
+                        const float *A_next;
+                        if (ir + MR < mc)
+                            A_next = A_pack + (size_t)(ir + MR) * K;
+                        else
+                            A_next = A_tile; /* last tile: self */
+                        gemm_kernel_6x16_pf(A_tile, B_tile,
+                                            C_tile, (int64_t)K, ldc_bytes,
+                                            A_next);
+                    } else if (nr == NR && mr == 4) {
+                        gemm_kernel_4x16(A_tile, B_tile,
+                                         C_tile, (int64_t)K, ldc_bytes);
+                    } else if (nr == NR && mr == 2) {
+                        gemm_kernel_2x16(A_tile, B_tile,
                                          C_tile, (int64_t)K, ldc_bytes);
                     } else {
                         gemm_kernel_edge(A_tile, B_tile,
@@ -103,6 +142,5 @@ void gemm_fp32(const float *A, int lda,
         }
     }
 
-    free(A_pack);
-    free(B_pack);
+    /* Buffers kept for reuse; call gemm_cleanup() to free */
 }
