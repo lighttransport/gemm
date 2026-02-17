@@ -59,9 +59,12 @@ typedef struct {
     float rope_freq_base;
     float rms_norm_eps;
 
+    int has_lm_head;     /* 1 if output.weight exists (generative model) */
+
     /* Global tensors */
     qtensor token_embd;  /* [n_vocab, n_embd] */
     qtensor output_norm; /* [n_embd] */
+    qtensor output;      /* [n_vocab, n_embd] LM head (may be absent for embedding models) */
 
     /* Per-layer weights */
     transformer_layer *layers;
@@ -81,6 +84,7 @@ typedef struct {
     float *ffn_buf1; /* [n_ff] */
     float *ffn_buf2; /* [n_ff] */
     float *ffn_buf3; /* [n_ff] */
+    float *logits;     /* [n_vocab] output logits (only if has_lm_head) */
     float *matvec_tmp; /* max(n_embd, n_ff) for row dequant */
 } transformer_model;
 
@@ -90,6 +94,13 @@ void transformer_free(transformer_model *model);
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
  * For embedding models (no output projection), this is the final hidden state. */
 float *transformer_forward(transformer_model *model, int32_t token_id, int position);
+
+/* Run forward pass and compute logits [n_vocab]. Returns NULL if no LM head.
+ * The returned pointer is valid until the next call. */
+float *transformer_forward_logits(transformer_model *model, int32_t token_id, int position);
+
+/* Sample next token from logits using temperature and top-k. */
+int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperature, int top_k);
 
 #ifdef __cplusplus
 }
@@ -154,6 +165,7 @@ static void tf_dequant_row(const qtensor *t, int row, float *dst) {
 
     /* Get block/type size from ggml_type_info (defined in gguf_loader.h impl) */
     switch (t->type) {
+        case GGML_TYPE_Q8_0: block_size = 32;  type_size = 34;  break;
         case GGML_TYPE_Q4_K: block_size = 256; type_size = 144; break;
         case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
         case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
@@ -237,15 +249,24 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     transformer_model *m = (transformer_model *)calloc(1, sizeof(transformer_model));
     if (!m) return NULL;
 
+    /* Detect architecture prefix: try qwen3 first, fall back to qwen2 */
+    const char *arch = "qwen2";
+    if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
+
+    char kbuf[128];
+    #define ARCH_KEY(suffix) (snprintf(kbuf, sizeof(kbuf), "%s." suffix, arch), kbuf)
+
     /* Read hyperparameters from GGUF metadata */
-    m->n_embd      = tf_get_int(gguf, "qwen2.embedding_length", 4096);
-    m->n_heads     = tf_get_int(gguf, "qwen2.attention.head_count", 32);
-    m->n_kv_heads  = tf_get_int(gguf, "qwen2.attention.head_count_kv", 8);
-    m->n_layers    = tf_get_int(gguf, "qwen2.block_count", 36);
-    m->n_ff        = tf_get_int(gguf, "qwen2.feed_forward_length", 12288);
-    m->n_vocab     = tf_get_int(gguf, "qwen2.vocab_size", 0);
-    m->rms_norm_eps = tf_get_float(gguf, "qwen2.attention.layer_norm_rms_epsilon", 1e-6f);
-    m->rope_freq_base = tf_get_float(gguf, "qwen2.rope.freq_base", 5000000.0f);
+    m->n_embd      = tf_get_int(gguf, ARCH_KEY("embedding_length"), 4096);
+    m->n_heads     = tf_get_int(gguf, ARCH_KEY("attention.head_count"), 32);
+    m->n_kv_heads  = tf_get_int(gguf, ARCH_KEY("attention.head_count_kv"), 8);
+    m->n_layers    = tf_get_int(gguf, ARCH_KEY("block_count"), 36);
+    m->n_ff        = tf_get_int(gguf, ARCH_KEY("feed_forward_length"), 12288);
+    m->n_vocab     = tf_get_int(gguf, ARCH_KEY("vocab_size"), 0);
+    m->rms_norm_eps = tf_get_float(gguf, ARCH_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
+    m->rope_freq_base = tf_get_float(gguf, ARCH_KEY("rope.freq_base"), 5000000.0f);
+    #undef ARCH_KEY
+    fprintf(stderr, "transformer: architecture=%s\n", arch);
     m->head_dim    = m->n_embd / m->n_heads;
     m->max_seq_len = max_seq_len;
 
@@ -257,11 +278,13 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     /* Global tensors */
     m->token_embd = tf_load_tensor(gguf, "token_embd.weight", 1);
     m->output_norm = tf_load_tensor(gguf, "output_norm.weight", 1);
+    m->output = tf_load_tensor(gguf, "output.weight", 0);
+    m->has_lm_head = (m->output.data != NULL) ? 1 : 0;
 
     if (m->n_vocab == 0 && m->token_embd.data) {
         m->n_vocab = m->token_embd.n_rows;
     }
-    fprintf(stderr, "transformer: n_vocab=%d\n", m->n_vocab);
+    fprintf(stderr, "transformer: n_vocab=%d has_lm_head=%d\n", m->n_vocab, m->has_lm_head);
 
     /* Per-layer tensors */
     m->layers = (transformer_layer *)calloc(m->n_layers, sizeof(transformer_layer));
@@ -306,6 +329,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->ffn_buf1  = (float *)calloc(m->n_ff, sizeof(float));
     m->ffn_buf2  = (float *)calloc(m->n_ff, sizeof(float));
     m->ffn_buf3  = (float *)calloc(m->n_ff, sizeof(float));
+    m->logits     = m->has_lm_head ? (float *)calloc(m->n_vocab, sizeof(float)) : NULL;
     m->matvec_tmp = (float *)calloc(max_dim, sizeof(float));
 
     return m;
@@ -332,6 +356,7 @@ void transformer_free(transformer_model *model) {
     free(model->ffn_buf1);
     free(model->ffn_buf2);
     free(model->ffn_buf3);
+    free(model->logits);
     free(model->matvec_tmp);
     free(model);
 }
@@ -452,6 +477,76 @@ float *transformer_forward(transformer_model *model, int32_t token_id, int posit
     tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
 
     return m->x;
+}
+
+float *transformer_forward_logits(transformer_model *model, int32_t token_id, int position) {
+    float *hidden = transformer_forward(model, token_id, position);
+    if (!model->has_lm_head || !hidden) return NULL;
+
+    /* Project hidden state to vocab: logits[i] = output_weight[i] . hidden */
+    tf_qmatvec(model->logits, &model->output, hidden, model->n_vocab, model->matvec_tmp);
+    return model->logits;
+}
+
+/* Top-k sampling with temperature */
+int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperature, int top_k) {
+    if (top_k <= 0 || top_k > n_vocab) top_k = n_vocab;
+
+    /* Find top-k indices by partial sort */
+    int32_t *indices = (int32_t *)malloc(top_k * sizeof(int32_t));
+    float *vals = (float *)malloc(top_k * sizeof(float));
+    int k = 0;
+
+    for (int i = 0; i < n_vocab; i++) {
+        float v = logits[i] / temperature;
+        if (k < top_k) {
+            indices[k] = i;
+            vals[k] = v;
+            k++;
+            /* Bubble up to maintain min-heap property at vals[0] */
+            for (int j = k - 1; j > 0; j--) {
+                int p = (j - 1) / 2;
+                if (vals[j] < vals[p]) {
+                    float tv = vals[j]; vals[j] = vals[p]; vals[p] = tv;
+                    int32_t ti = indices[j]; indices[j] = indices[p]; indices[p] = ti;
+                }
+            }
+        } else if (v > vals[0]) {
+            vals[0] = v;
+            indices[0] = i;
+            /* Sift down */
+            int j = 0;
+            for (;;) {
+                int s = j, l = 2*j+1, r = 2*j+2;
+                if (l < top_k && vals[l] < vals[s]) s = l;
+                if (r < top_k && vals[r] < vals[s]) s = r;
+                if (s == j) break;
+                float tv = vals[j]; vals[j] = vals[s]; vals[s] = tv;
+                int32_t ti = indices[j]; indices[j] = indices[s]; indices[s] = ti;
+                j = s;
+            }
+        }
+    }
+
+    /* Softmax over top-k */
+    float max_v = vals[0];
+    for (int i = 1; i < top_k; i++) if (vals[i] > max_v) max_v = vals[i];
+    float sum = 0.0f;
+    for (int i = 0; i < top_k; i++) { vals[i] = expf(vals[i] - max_v); sum += vals[i]; }
+    for (int i = 0; i < top_k; i++) vals[i] /= sum;
+
+    /* Sample */
+    float r = (float)rand() / (float)RAND_MAX;
+    float cum = 0.0f;
+    int32_t result = (top_k > 0) ? indices[0] : 0;
+    for (int i = 0; i < top_k; i++) {
+        cum += vals[i];
+        if (r <= cum) { result = indices[i]; break; }
+    }
+
+    free(indices);
+    free(vals);
+    return result;
 }
 
 #endif /* TRANSFORMER_IMPLEMENTATION */
