@@ -180,6 +180,45 @@ if(SPIRV_OUTPUTS)
     )
 endif()
 
+# Multimodal inference executable (GPU vision + CPU LLM)
+set(MULTIMODAL_TARGET test_vision_multimodal)
+
+add_executable(${MULTIMODAL_TARGET}
+    test_vision_multimodal.cc
+    vulkan_vision_encoder.cc
+    vision_cpu_impl.c
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${MULTIMODAL_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+)
+
+target_link_libraries(${MULTIMODAL_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+)
+
+target_compile_definitions(${MULTIMODAL_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET coopmat_shaders)
+    add_dependencies(${MULTIMODAL_TARGET} coopmat_shaders)
+endif()
+
+if(SPIRV_OUTPUTS)
+    add_custom_command(TARGET ${MULTIMODAL_TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${SPIRV_OUTPUTS}
+                ${CMAKE_BINARY_DIR}/shaders/
+        COMMENT "Copying compiled shaders to build directory (multimodal)"
+    )
+endif()
+
 message(STATUS "")
 message(STATUS "Vulkan Cooperative Matrix Matmul Benchmark")
 message(STATUS "  Shader source: ${SHADER_SOURCE_DIR}")
