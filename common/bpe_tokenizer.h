@@ -38,6 +38,14 @@ int bpe_tokenize(const bpe_vocab *vocab, const char *text, int text_len,
 /* Get the string for a token ID. Returns NULL if invalid. */
 const char *bpe_token_to_str(const bpe_vocab *vocab, int32_t token_id);
 
+/* Get special token IDs. Returns -1 if not set. */
+int32_t bpe_eos_id(const bpe_vocab *vocab);
+int32_t bpe_eot_id(const bpe_vocab *vocab);
+
+/* Decode byte-encoded token string (e.g. <0x41> -> 'A').
+ * Returns malloc'd buffer. Caller must free. */
+char *bpe_byte_decode(const char *data, int data_len, int *out_len);
+
 #ifdef __cplusplus
 }
 #endif
@@ -154,7 +162,7 @@ static char *bpe_byte_encode(const char *data, int data_len, int *out_len) {
 
 /* Decode GPT-2 byte-level UTF-8 string back to raw bytes.
  * Returns malloc'd string and sets *out_len. */
-static char *bpe_byte_decode(const char *data, int data_len, int *out_len) {
+char *bpe_byte_decode(const char *data, int data_len, int *out_len) {
     bpe_init_byte_encoding();
     char *out = (char *)malloc(data_len + 1);
     int opos = 0;
@@ -440,6 +448,9 @@ bpe_vocab *bpe_vocab_load(gguf_context *gguf) {
 
     return vocab;
 }
+
+int32_t bpe_eos_id(const bpe_vocab *vocab) { return vocab ? vocab->eos_id : -1; }
+int32_t bpe_eot_id(const bpe_vocab *vocab) { return vocab ? vocab->eot_id : -1; }
 
 void bpe_vocab_free(bpe_vocab *vocab) {
     if (!vocab) return;

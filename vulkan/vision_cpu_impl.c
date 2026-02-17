@@ -1,4 +1,4 @@
-// C translation unit for vision encoder CPU reference implementation
+// C translation unit for CPU reference implementations
 // (C headers with IMPLEMENTATION don't compile cleanly as C++)
 
 #define GGUF_LOADER_IMPLEMENTATION
@@ -7,6 +7,10 @@
 #define GGML_DEQUANT_IMPLEMENTATION
 #include "../common/ggml_dequant.h"
 
+#define BPE_TOKENIZER_IMPLEMENTATION
+#include "../common/bpe_tokenizer.h"
+
+#define TRANSFORMER_IMPLEMENTATION
 #include "../common/transformer.h"
 
 #define VISION_ENCODER_IMPLEMENTATION
