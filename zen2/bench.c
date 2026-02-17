@@ -198,16 +198,23 @@ static void bench_gemm(int M, int N, int K, double peak_gflops)
     gemm_fp32(A, K, B, K, C, N, M, N, K);
 
     double t0 = get_time();
+    uint64_t c0 = rdtsc();
     for (int t = 0; t < iters; t++) {
         gemm_fp32(A, K, B, K, C, N, M, N, K);
     }
+    uint64_t c1 = rdtsc();
     double elapsed = get_time() - t0;
 
-    double gflops = flops * iters / elapsed / 1e9;
+    uint64_t cycles = c1 - c0;
+    double total_flops = flops * iters;
+    double gflops = total_flops / elapsed / 1e9;
+    double flops_per_cycle = total_flops / (double)cycles;
     double pct = gflops / peak_gflops * 100.0;
+    double actual_ghz = (double)cycles / elapsed / 1e9;
 
-    printf("M=%6d, N=%6d, K=%4d:  %7.2f GFLOPS  (%5.1f%% peak)  [%.3f s / %d iters]\n",
-           M, N, K, gflops, pct, elapsed, iters);
+    printf("M=%6d, N=%6d, K=%4d:  %7.2f GFLOPS  (%5.1f%% peak)  "
+           "%.1f FLOPS/cyc  [%.2f GHz, %.3f s, %d iters]\n",
+           M, N, K, gflops, pct, flops_per_cycle, actual_ghz, elapsed, iters);
 
     free(A);
     free(B);
@@ -291,6 +298,7 @@ int main(int argc, char **argv)
         bench_gemm(sizes[i].M, sizes[i].N, sizes[i].K, peak_gflops);
     }
 
+    gemm_cleanup();
     printf("\nDone.\n");
     return 0;
 }
