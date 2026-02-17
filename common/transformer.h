@@ -99,6 +99,11 @@ float *transformer_forward(transformer_model *model, int32_t token_id, int posit
  * The returned pointer is valid until the next call. */
 float *transformer_forward_logits(transformer_model *model, int32_t token_id, int position);
 
+/* Run forward pass with a pre-computed embedding vector instead of token lookup.
+ * Used to inject vision embeddings into the sequence. */
+float *transformer_forward_embd(transformer_model *model, const float *embd, int position);
+float *transformer_forward_embd_logits(transformer_model *model, const float *embd, int position);
+
 /* Sample next token from logits using temperature and top-k. */
 int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperature, int top_k);
 
@@ -249,9 +254,10 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     transformer_model *m = (transformer_model *)calloc(1, sizeof(transformer_model));
     if (!m) return NULL;
 
-    /* Detect architecture prefix: try qwen3 first, fall back to qwen2 */
+    /* Detect architecture prefix: try qwen3vl, qwen3, fall back to qwen2 */
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
+    if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
+    else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
 
     char kbuf[128];
     #define ARCH_KEY(suffix) (snprintf(kbuf, sizeof(kbuf), "%s." suffix, arch), kbuf)
@@ -279,6 +285,11 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->token_embd = tf_load_tensor(gguf, "token_embd.weight", 1);
     m->output_norm = tf_load_tensor(gguf, "output_norm.weight", 1);
     m->output = tf_load_tensor(gguf, "output.weight", 0);
+    if (!m->output.data && m->token_embd.data) {
+        /* Weight tying: use token_embd as output projection */
+        m->output = m->token_embd;
+        fprintf(stderr, "transformer: using weight-tied output (token_embd)\n");
+    }
     m->has_lm_head = (m->output.data != NULL) ? 1 : 0;
 
     if (m->n_vocab == 0 && m->token_embd.data) {
@@ -484,6 +495,85 @@ float *transformer_forward_logits(transformer_model *model, int32_t token_id, in
     if (!model->has_lm_head || !hidden) return NULL;
 
     /* Project hidden state to vocab: logits[i] = output_weight[i] . hidden */
+    tf_qmatvec(model->logits, &model->output, hidden, model->n_vocab, model->matvec_tmp);
+    return model->logits;
+}
+
+float *transformer_forward_embd(transformer_model *model, const float *embd, int position) {
+    /* Same as transformer_forward but inject pre-computed embedding instead of token lookup */
+    memcpy(model->x, embd, model->n_embd * sizeof(float));
+
+    /* Reuse the block loop from transformer_forward */
+    transformer_model *m = model;
+    int n_embd = m->n_embd;
+    int n_heads = m->n_heads;
+    int n_kv_heads = m->n_kv_heads;
+    int head_dim = m->head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int gqa_ratio = n_heads / n_kv_heads;
+
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+        tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        tf_qmatvec(m->q, &layer->attn_q, m->xb, n_embd, m->matvec_tmp);
+        tf_qmatvec(m->k, &layer->attn_k, m->xb, kv_dim, m->matvec_tmp);
+        tf_qmatvec(m->v, &layer->attn_v, m->xb, kv_dim, m->matvec_tmp);
+        if (layer->attn_q_norm.data)
+            tf_qk_norm(m->q, n_heads, head_dim, &layer->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
+        if (layer->attn_k_norm.data)
+            tf_qk_norm(m->k, n_kv_heads, head_dim, &layer->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
+        tf_rope(m->q, n_heads, head_dim, position, m->rope_freq_base);
+        tf_rope(m->k, n_kv_heads, head_dim, position, m->rope_freq_base);
+        float *kc = m->key_cache[l]   + position * kv_dim;
+        float *vc = m->value_cache[l] + position * kv_dim;
+        memcpy(kc, m->k, kv_dim * sizeof(float));
+        memcpy(vc, m->v, kv_dim * sizeof(float));
+        int seq_len = position + 1;
+        memset(m->xb2, 0, n_embd * sizeof(float));
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / gqa_ratio;
+            float *q_h = m->q + h * head_dim;
+            float *att_h = m->att + h * m->max_seq_len;
+            float scale = 1.0f / sqrtf((float)head_dim);
+            for (int t = 0; t < seq_len; t++) {
+                float *k_t = m->key_cache[l] + t * kv_dim + kv_h * head_dim;
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; d++) score += q_h[d] * k_t[d];
+                att_h[t] = score * scale;
+            }
+            tf_softmax(att_h, seq_len);
+            float *out_h = m->xb2 + h * head_dim;
+            for (int t = 0; t < seq_len; t++) {
+                float *v_t = m->value_cache[l] + t * kv_dim + kv_h * head_dim;
+                float a = att_h[t];
+                for (int d = 0; d < head_dim; d++) out_h[d] += a * v_t[d];
+            }
+        }
+        tf_qmatvec(m->xb, &layer->attn_output, m->xb2, n_embd, m->matvec_tmp);
+        for (int i = 0; i < n_embd; i++) m->x[i] += m->xb[i];
+        tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        tf_qmatvec(m->ffn_buf1, &layer->ffn_gate, m->xb, m->n_ff, m->matvec_tmp);
+        tf_qmatvec(m->ffn_buf2, &layer->ffn_up,   m->xb, m->n_ff, m->matvec_tmp);
+        for (int i = 0; i < m->n_ff; i++) {
+            float gate = m->ffn_buf1[i];
+            gate = gate / (1.0f + expf(-gate));
+            m->ffn_buf3[i] = gate * m->ffn_buf2[i];
+        }
+        tf_qmatvec(m->xb, &layer->ffn_down, m->ffn_buf3, n_embd, m->matvec_tmp);
+        for (int i = 0; i < n_embd; i++) m->x[i] += m->xb[i];
+        if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
+            float norm = 0.0f;
+            for (int i = 0; i < n_embd; i++) norm += m->x[i] * m->x[i];
+            fprintf(stderr, "  layer %2d: hidden norm = %.4f\n", l, sqrtf(norm));
+        }
+    }
+    tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+    return m->x;
+}
+
+float *transformer_forward_embd_logits(transformer_model *model, const float *embd, int position) {
+    float *hidden = transformer_forward_embd(model, embd, position);
+    if (!model->has_lm_head || !hidden) return NULL;
     tf_qmatvec(model->logits, &model->output, hidden, model->n_vocab, model->matvec_tmp);
     return model->logits;
 }
