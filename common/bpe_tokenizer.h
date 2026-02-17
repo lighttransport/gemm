@@ -310,6 +310,12 @@ struct bpe_vocab {
     bpe_hashmap token_to_id;  /* token_str -> token_id */
     bpe_hashmap merge_ranks;  /* "left\0right" -> rank */
     int32_t eos_id, bos_id, eot_id, pad_id, unk_id;
+
+    /* Special tokens (type=3 control tokens like <|im_start|>) */
+    int n_special;
+    int32_t *special_ids;
+    char **special_strs;
+    int *special_lens;
 };
 
 /* ---- GGUF vocab loading ---- */
@@ -397,6 +403,41 @@ bpe_vocab *bpe_vocab_load(gguf_context *gguf) {
     idx = gguf_find_key(gguf, "tokenizer.ggml.unknown_token_id");
     if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_UINT32) vocab->unk_id = (int32_t)gguf->kv[idx].value.u32;
 
+    /* Load special/control tokens (type 3 or 4) for literal matching */
+    int type_idx = gguf_find_key(gguf, "tokenizer.ggml.token_type");
+    if (type_idx >= 0 && gguf->kv[type_idx].type == GGUF_TYPE_ARRAY) {
+        int32_t *types = (int32_t *)gguf->kv[type_idx].value.arr.data;
+        /* Count special tokens */
+        int ns = 0;
+        for (int i = 0; i < n_tokens; i++) {
+            if (types[i] == 3 || types[i] == 4) ns++;
+        }
+        vocab->n_special = ns;
+        vocab->special_ids = (int32_t *)malloc(ns * sizeof(int32_t));
+        vocab->special_strs = (char **)malloc(ns * sizeof(char *));
+        vocab->special_lens = (int *)malloc(ns * sizeof(int));
+        int si = 0;
+        for (int i = 0; i < n_tokens; i++) {
+            if (types[i] == 3 || types[i] == 4) {
+                vocab->special_ids[si] = i;
+                vocab->special_strs[si] = vocab->token_strs[i];
+                vocab->special_lens[si] = vocab->token_str_lens[i];
+                si++;
+            }
+        }
+        /* Sort by length descending for greedy matching */
+        for (int i = 0; i < ns - 1; i++) {
+            for (int j = i + 1; j < ns; j++) {
+                if (vocab->special_lens[j] > vocab->special_lens[i]) {
+                    int32_t ti = vocab->special_ids[i]; vocab->special_ids[i] = vocab->special_ids[j]; vocab->special_ids[j] = ti;
+                    char *ts = vocab->special_strs[i]; vocab->special_strs[i] = vocab->special_strs[j]; vocab->special_strs[j] = ts;
+                    int tl = vocab->special_lens[i]; vocab->special_lens[i] = vocab->special_lens[j]; vocab->special_lens[j] = tl;
+                }
+            }
+        }
+        fprintf(stderr, "bpe: loaded %d special tokens\n", ns);
+    }
+
     return vocab;
 }
 
@@ -407,6 +448,9 @@ void bpe_vocab_free(bpe_vocab *vocab) {
     free(vocab->token_str_lens);
     bpe_hm_free(&vocab->token_to_id);
     bpe_hm_free(&vocab->merge_ranks);
+    free(vocab->special_ids);
+    free(vocab->special_strs);  /* strings owned by token_strs, don't free contents */
+    free(vocab->special_lens);
     free(vocab);
 }
 
@@ -819,14 +863,11 @@ static int bpe_tokenize_word(const bpe_vocab *vocab, const char *word, int word_
 
 /* ---- Public API ---- */
 
-int bpe_tokenize(const bpe_vocab *vocab, const char *text, int text_len,
-                 int32_t *tokens, int max_tokens) {
-    if (!vocab || !text) return -1;
-    if (text_len < 0) text_len = (int)strlen(text);
-
-    /* Pre-tokenize */
+/* Tokenize a segment (between special tokens) using BPE */
+static int bpe_tokenize_segment(const bpe_vocab *vocab, const char *text, int text_len,
+                                int32_t *tokens, int max_tokens) {
+    if (text_len <= 0) return 0;
     bpe_word_list wl = bpe_pretokenize_qwen2(text, text_len);
-
     int total = 0;
     for (int w = 0; w < wl.n; w++) {
         int32_t *dst = tokens ? tokens + total : NULL;
@@ -834,8 +875,60 @@ int bpe_tokenize(const bpe_vocab *vocab, const char *text, int text_len,
         int n = bpe_tokenize_word(vocab, text + wl.starts[w], wl.lens[w], dst, remaining);
         total += n;
     }
-
     bpe_wl_free(&wl);
+    return total;
+}
+
+int bpe_tokenize(const bpe_vocab *vocab, const char *text, int text_len,
+                 int32_t *tokens, int max_tokens) {
+    if (!vocab || !text) return -1;
+    if (text_len < 0) text_len = (int)strlen(text);
+
+    int total = 0;
+    int pos = 0;
+
+    while (pos < text_len) {
+        /* Try to match a special token at current position */
+        int matched = 0;
+        for (int s = 0; s < vocab->n_special; s++) {
+            int slen = vocab->special_lens[s];
+            if (pos + slen <= text_len &&
+                memcmp(text + pos, vocab->special_strs[s], slen) == 0) {
+                /* Tokenize any text before the special token */
+                if (pos > 0) {
+                    /* Find start of unprocessed text */
+                }
+                /* Emit the special token */
+                if (tokens && total < max_tokens) tokens[total] = vocab->special_ids[s];
+                total++;
+                pos += slen;
+                matched = 1;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        /* Find the next special token occurrence */
+        int next_special = text_len;
+        for (int s = 0; s < vocab->n_special; s++) {
+            int slen = vocab->special_lens[s];
+            for (int p = pos + 1; p + slen <= text_len; p++) {
+                if (memcmp(text + p, vocab->special_strs[s], slen) == 0) {
+                    if (p < next_special) next_special = p;
+                    break;
+                }
+            }
+        }
+
+        /* Tokenize the segment [pos, next_special) with BPE */
+        int seg_len = next_special - pos;
+        int32_t *dst = tokens ? tokens + total : NULL;
+        int remaining = tokens ? max_tokens - total : 0;
+        int n = bpe_tokenize_segment(vocab, text + pos, seg_len, dst, remaining);
+        total += n;
+        pos = next_special;
+    }
+
     return total;
 }
 
