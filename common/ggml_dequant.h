@@ -1,5 +1,5 @@
 /*
- * ggml_dequant.h - Dequantization routines for GGML Q4_K and Q6_K formats
+ * ggml_dequant.h - Dequantization routines for GGML Q8_0, Q4_K, and Q6_K formats
  *
  * Usage:
  *   #define GGML_DEQUANT_IMPLEMENTATION
@@ -8,6 +8,7 @@
  * Dependencies: gguf_loader.h (for ggml_dtype enum)
  *
  * API:
+ *   void dequantize_row_q8_0(const void *src, float *dst, int n);
  *   void dequantize_row_q4_K(const void *src, float *dst, int n);
  *   void dequantize_row_q6_K(const void *src, float *dst, int n);
  *   int  dequant_row(uint32_t ggml_type, const void *src, float *dst, int n);
@@ -22,6 +23,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Q8_0 block: 32 elements, 34 bytes */
+typedef struct {
+    uint16_t d;       /* block scale (fp16) */
+    int8_t   qs[32];  /* quantized values */
+} block_q8_0;
 
 /* Q4_K block: 256 elements, 144 bytes */
 typedef struct {
@@ -64,6 +71,7 @@ static inline float ggml_fp16_to_fp32(uint16_t h) {
     return result;
 }
 
+void dequantize_row_q8_0(const void *src, float *dst, int n);
 void dequantize_row_q4_K(const void *src, float *dst, int n);
 void dequantize_row_q6_K(const void *src, float *dst, int n);
 
@@ -79,6 +87,18 @@ int dequant_row(uint32_t ggml_type, const void *src, float *dst, int n);
 
 #include <string.h>
 #include <math.h>
+
+void dequantize_row_q8_0(const void *src, float *dst, int n) {
+    const int nb = n / 32;
+    const block_q8_0 *blocks = (const block_q8_0 *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(blocks[i].d);
+        for (int j = 0; j < 32; j++) {
+            dst[i * 32 + j] = d * blocks[i].qs[j];
+        }
+    }
+}
 
 void dequantize_row_q4_K(const void *src, float *dst, int n) {
     const int nb = n / 256;
@@ -202,6 +222,9 @@ void dequantize_row_q6_K(const void *src, float *dst, int n) {
 
 int dequant_row(uint32_t type, const void *src, float *dst, int n) {
     switch (type) {
+        case GGML_TYPE_Q8_0:
+            dequantize_row_q8_0(src, dst, n);
+            return 0;
         case GGML_TYPE_Q4_K:
             dequantize_row_q4_K(src, dst, n);
             return 0;
