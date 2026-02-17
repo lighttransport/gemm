@@ -6,7 +6,7 @@
 # Uses bundled vkew for runtime Vulkan loading (no link-time dependency).
 #
 cmake_minimum_required(VERSION 3.16)
-project(vulkan_coopmat_matmul CXX)
+project(vulkan_coopmat_matmul C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,16 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/matmul_coopmat_f16.comp
     ${SHADER_SOURCE_DIR}/matmul_tiled_f16.comp
     ${SHADER_SOURCE_DIR}/matmul_naive_f32.comp
+    ${SHADER_SOURCE_DIR}/add_f32.comp
+    ${SHADER_SOURCE_DIR}/gelu_f32.comp
+    ${SHADER_SOURCE_DIR}/matmul_bias_f32.comp
+    ${SHADER_SOURCE_DIR}/layernorm_f32.comp
+    ${SHADER_SOURCE_DIR}/softmax_f32.comp
+    ${SHADER_SOURCE_DIR}/patch_embed_f32.comp
+    ${SHADER_SOURCE_DIR}/add_transposed_f32.comp
+    ${SHADER_SOURCE_DIR}/spatial_merge_f32.comp
+    ${SHADER_SOURCE_DIR}/attn_naive_f32.comp
+    ${SHADER_SOURCE_DIR}/attn_flash_f32.comp
 )
 
 # Custom function to compile GLSL to SPIR-V
@@ -128,6 +138,45 @@ if(SPIRV_OUTPUTS)
                 ${SPIRV_OUTPUTS}
                 ${CMAKE_BINARY_DIR}/shaders/
         COMMENT "Copying compiled shaders to build directory"
+    )
+endif()
+
+# Vision encoder test executable
+set(VISION_TARGET test_vision_encoder)
+
+add_executable(${VISION_TARGET}
+    test_vision_encoder.cc
+    vulkan_vision_encoder.cc
+    vision_cpu_impl.c
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${VISION_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+)
+
+target_link_libraries(${VISION_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+)
+
+target_compile_definitions(${VISION_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET coopmat_shaders)
+    add_dependencies(${VISION_TARGET} coopmat_shaders)
+endif()
+
+if(SPIRV_OUTPUTS)
+    add_custom_command(TARGET ${VISION_TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${SPIRV_OUTPUTS}
+                ${CMAKE_BINARY_DIR}/shaders/
+        COMMENT "Copying compiled shaders to build directory (vision)"
     )
 endif()
 

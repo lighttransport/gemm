@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// Patch embedding: Conv2D with stride=patch_size
+// kernel[dim, kernel_size] where kernel_size = patch_size*patch_size*3
+// image[height, width, 3] (HWC interleaved)
+// output[n_patches, dim]
+//
+// One thread per output element (patch_idx * dim + d).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ImageBuffer { float image[]; };
+layout(std430, binding = 1) readonly buffer KernelBuffer { float kernel_w[]; };
+layout(std430, binding = 2) readonly buffer BiasBuffer { float bias[]; };
+layout(std430, binding = 3) writeonly buffer OutputBuffer { float output_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_patches;   // total patches
+    uint dim;         // embedding dim
+    uint kernel_size; // patch_size * patch_size * 3
+    uint gw;          // grid width (patches per row)
+    uint width;       // image width in pixels
+    uint patch_size;  // patch dimension (e.g. 16)
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.n_patches * pc.dim;
+    if (idx >= total) return;
+
+    uint pid = idx / pc.dim;
+    uint d = idx % pc.dim;
+
+    uint py = pid / pc.gw;
+    uint px = pid % pc.gw;
+
+    float sum = 0.0;
+    uint ki = 0;
+    for (uint dy = 0; dy < pc.patch_size; dy++) {
+        for (uint dx = 0; dx < pc.patch_size; dx++) {
+            uint img_y = py * pc.patch_size + dy;
+            uint img_x = px * pc.patch_size + dx;
+            uint pix_base = (img_y * pc.width + img_x) * 3;
+            for (uint c = 0; c < 3; c++) {
+                sum += image[pix_base + c] * kernel_w[d * pc.kernel_size + ki];
+                ki++;
+            }
+        }
+    }
+
+    sum += bias[d];
+    output_buf[pid * pc.dim + d] = sum;
+}

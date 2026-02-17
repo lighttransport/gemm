@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: MIT
+// LayerNorm: dst[t,i] = (src[t,i] - mean) / sqrt(var + eps) * weight[i] + bias[i]
+// One workgroup per token. Shared memory reduction for mean/var.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuffer { float src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuffer { float dst[]; };
+layout(std430, binding = 2) readonly buffer WeightBuffer { float weight[]; };
+layout(std430, binding = 3) readonly buffer BiasBuffer { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;
+    uint dim;
+    float eps;
+} pc;
+
+shared float s_sum[256];
+shared float s_sum2[256];
+
+void main() {
+    uint token = gl_WorkGroupID.x;
+    if (token >= pc.n_tokens) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = token * pc.dim;
+
+    // Accumulate partial sums for mean
+    float psum = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256) {
+        psum += src[base + i];
+    }
+    s_sum[tid] = psum;
+    barrier();
+
+    // Reduce
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        barrier();
+    }
+    float mean = s_sum[0] / float(pc.dim);
+    barrier();
+
+    // Accumulate partial sums for variance
+    float pvar = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256) {
+        float d = src[base + i] - mean;
+        pvar += d * d;
+    }
+    s_sum2[tid] = pvar;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_sum2[tid] += s_sum2[tid + s];
+        barrier();
+    }
+    float inv_std = 1.0 / sqrt(s_sum2[0] / float(pc.dim) + pc.eps);
+
+    // Normalize
+    for (uint i = tid; i < pc.dim; i += 256) {
+        dst[base + i] = (src[base + i] - mean) * inv_std * weight[i] + bias[i];
+    }
+}

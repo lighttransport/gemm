@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: MIT
+// Spatial merge: rearrange [gh, gw, dim] -> [gh/sm, gw/sm, dim*sm*sm]
+// For sm=2: each 2x2 block of patches gets concatenated into one merged token.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuffer { float src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuffer { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint gw;   // grid width
+    uint gh;   // grid height
+    uint dim;  // embedding dim per patch
+    uint sm;   // spatial merge size (2)
+} pc;
+
+void main() {
+    uint mgw = pc.gw / pc.sm;
+    uint mgh = pc.gh / pc.sm;
+    uint merged_dim = pc.dim * pc.sm * pc.sm;
+    uint n_merged = mgw * mgh;
+    uint total = n_merged * merged_dim;
+
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    // Determine which merged token and which element within it
+    uint merged_idx = idx / merged_dim;
+    uint elem = idx % merged_dim;
+
+    uint my = merged_idx / mgw;
+    uint mx = merged_idx % mgw;
+
+    // Which sub-patch and which dim within that sub-patch
+    uint sub_patch = elem / pc.dim;
+    uint d = elem % pc.dim;
+
+    uint sy = sub_patch / pc.sm;
+    uint sx = sub_patch % pc.sm;
+
+    uint py = my * pc.sm + sy;
+    uint px = mx * pc.sm + sx;
+
+    dst[idx] = src[(py * pc.gw + px) * pc.dim + d];
+}
