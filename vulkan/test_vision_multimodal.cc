@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2025 - Present, Light Transport Entertainment Inc.
 //
-// Multimodal inference: Vulkan GPU vision encoder + CPU LLM
-// Loads an image, encodes with GPU, generates text description.
+// Multimodal inference: Full GPU pipeline (Vulkan vision encoder + Vulkan LLM)
+// Loads an image, encodes with GPU, generates text description with GPU.
 //
 
 #include <cstdio>
@@ -13,7 +13,9 @@
 #include <vector>
 #include <string>
 
+#define PROFILER_IMPLEMENTATION
 extern "C" {
+#include "../common/profiler.h"
 #include "../common/gguf_loader.h"
 #include "../common/ggml_dequant.h"
 #include "../common/bpe_tokenizer.h"
@@ -22,38 +24,9 @@ extern "C" {
 }
 
 #include "vulkan_vision_encoder.hh"
-
-// Simple PPM image loader (P6 binary format)
-static uint8_t *load_ppm(const char *path, int *w, int *h) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-
-    char magic[3];
-    if (fscanf(f, "%2s", magic) != 1 || strcmp(magic, "P6") != 0) {
-        fclose(f); return NULL;
-    }
-
-    // Skip comments
-    int ch;
-    while ((ch = fgetc(f)) == '#' || ch == ' ' || ch == '\n') {
-        if (ch == '#') while (fgetc(f) != '\n');
-    }
-    ungetc(ch, f);
-
-    int maxval;
-    if (fscanf(f, "%d %d %d", w, h, &maxval) != 3) {
-        fclose(f); return NULL;
-    }
-    fgetc(f); // consume newline
-
-    size_t size = (size_t)(*w) * (*h) * 3;
-    uint8_t *data = (uint8_t *)malloc(size);
-    if (fread(data, 1, size, f) != size) {
-        free(data); fclose(f); return NULL;
-    }
-    fclose(f);
-    return data;
-}
+#include "vulkan_llm_runner.hh"
+#include "deps/stb_image.h"
+#include "deps/stb_image_resize2.h"
 
 // Generate a simple test pattern
 static uint8_t *generate_test_image(int width, int height, const char *pattern) {
@@ -109,19 +82,22 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --model <path>      LLM model GGUF\n");
     fprintf(stderr, "  --mmproj <path>     Vision mmproj GGUF\n");
-    fprintf(stderr, "  --image <path.ppm>  Input image (PPM P6 format)\n");
+    fprintf(stderr, "  --image <path>      Input image (JPG, PNG, BMP, TGA, etc.)\n");
     fprintf(stderr, "  --pattern <name>    Test pattern: checkerboard, gradient, red, circles (default: gradient)\n");
     fprintf(stderr, "  --prompt <text>     User prompt (default: 'Describe what you see in this image in detail.')\n");
     fprintf(stderr, "  --image-size <N>    Image size (default: 192)\n");
     fprintf(stderr, "  --max-gen <N>       Max tokens to generate (default: 100)\n");
     fprintf(stderr, "  --attn <mode>       Attention: cpu, naive, flash (default: flash)\n");
     fprintf(stderr, "  --device <id>       Vulkan device (default: 0)\n");
+    fprintf(stderr, "  --gpu-llm           Use Vulkan GPU for LLM (default: CPU)\n");
+    fprintf(stderr, "  -t, --threads <N>   CPU threads for LLM (default: 1)\n");
 }
 
 int main(int argc, char **argv) {
     std::string model_path, mmproj_path, image_path, pattern = "gradient";
     std::string prompt = "Describe what you see in this image in detail.";
-    int image_size = 192, max_gen = 100, device_id = 0;
+    int image_size = 192, max_gen = 100, device_id = 0, n_threads = 1;
+    bool gpu_llm = false;
     VulkanVisionEncoder::AttentionMode attn_mode = VulkanVisionEncoder::ATTN_FLASH_GPU;
 
     for (int i = 1; i < argc; i++) {
@@ -133,6 +109,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--image-size") == 0 && i+1 < argc) image_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--max-gen") == 0 && i+1 < argc) max_gen = atoi(argv[++i]);
         else if (strcmp(argv[i], "--device") == 0 && i+1 < argc) device_id = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gpu-llm") == 0) gpu_llm = true;
+        else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) n_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-t") == 0 && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--attn") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "cpu") == 0) attn_mode = VulkanVisionEncoder::ATTN_CPU;
@@ -159,9 +138,26 @@ int main(int argc, char **argv) {
     if (!vocab) { fprintf(stderr, "Failed to load vocab\n"); return 1; }
     fprintf(stderr, "Vocab loaded\n");
 
+    // CPU LLM (always loaded for fallback and n_vocab)
     int max_seq_len = 1024;
     transformer_model *model = transformer_load(gguf_main, max_seq_len);
     if (!model) { fprintf(stderr, "Failed to load model\n"); return 1; }
+    if (n_threads > 1) transformer_set_threads(model, n_threads);
+
+    // GPU LLM (optional)
+    VulkanLLMRunner *gpu_llm_runner = nullptr;
+    if (gpu_llm) {
+        fprintf(stderr, "\n=== GPU LLM Setup ===\n");
+        gpu_llm_runner = new VulkanLLMRunner();
+        if (!gpu_llm_runner->initialize(device_id, true)) {
+            fprintf(stderr, "GPU LLM init failed: %s\n", gpu_llm_runner->getLastError().c_str());
+            return 1;
+        }
+        if (!gpu_llm_runner->loadWeights(gguf_main)) {
+            fprintf(stderr, "GPU LLM weight load failed: %s\n", gpu_llm_runner->getLastError().c_str());
+            return 1;
+        }
+    }
 
     // Load vision encoder (for normalization params)
     fprintf(stderr, "Loading mmproj: %s\n", mmproj_path.c_str());
@@ -176,27 +172,23 @@ int main(int argc, char **argv) {
     int img_w = image_size, img_h = image_size;
 
     if (!image_path.empty()) {
-        img_rgb = load_ppm(image_path.c_str(), &img_w, &img_h);
+        int channels;
+        img_rgb = stbi_load(image_path.c_str(), &img_w, &img_h, &channels, 3);
         if (!img_rgb) {
-            fprintf(stderr, "Failed to load image: %s\n", image_path.c_str());
+            fprintf(stderr, "Failed to load image: %s (%s)\n",
+                    image_path.c_str(), stbi_failure_reason());
             return 1;
         }
-        // Resize to image_size if needed (simple nearest-neighbor)
+        fprintf(stderr, "Loaded image: %dx%d (%d channels)\n", img_w, img_h, channels);
+
+        // Resize if needed using high-quality filter
         if (img_w != image_size || img_h != image_size) {
-            fprintf(stderr, "Warning: image is %dx%d, need %dx%d. Using nearest-neighbor resize.\n",
-                    img_w, img_h, image_size, image_size);
+            fprintf(stderr, "Resizing %dx%d -> %dx%d...\n", img_w, img_h, image_size, image_size);
             uint8_t *resized = (uint8_t *)malloc(image_size * image_size * 3);
-            for (int y = 0; y < image_size; y++)
-                for (int x = 0; x < image_size; x++) {
-                    int sx = x * img_w / image_size;
-                    int sy = y * img_h / image_size;
-                    int si = (sy * img_w + sx) * 3;
-                    int di = (y * image_size + x) * 3;
-                    resized[di] = img_rgb[si];
-                    resized[di+1] = img_rgb[si+1];
-                    resized[di+2] = img_rgb[si+2];
-                }
-            free(img_rgb);
+            stbir_resize_uint8_linear(img_rgb, img_w, img_h, 0,
+                                      resized, image_size, image_size, 0,
+                                      (stbir_pixel_layout)3 /*STBIR_RGB*/);
+            stbi_image_free(img_rgb);
             img_rgb = resized;
             img_w = img_h = image_size;
         }
@@ -238,8 +230,58 @@ int main(int argc, char **argv) {
     int patches_h = img_h / vm->patch_size;
     int n_vision_tokens = (patches_w / vm->spatial_merge) * (patches_h / vm->spatial_merge);
     int proj_dim = vm->proj_dim;
-    fprintf(stderr, "Vision encoding: %d tokens x %d dim (%.3f s)\n",
-            n_vision_tokens, proj_dim, (double)(t1 - t0) / CLOCKS_PER_SEC);
+    int n_ds = vm->n_deepstack;
+    int embd_stride = proj_dim * (1 + n_ds);  // total dim per token (main + deepstack)
+    fprintf(stderr, "Vision encoding: %d tokens x %d dim (%d main + %d deepstack) (%.3f s)\n",
+            n_vision_tokens, embd_stride, proj_dim, n_ds, (double)(t1 - t0) / CLOCKS_PER_SEC);
+
+    // Debug: dump first vision token embedding values
+    fprintf(stderr, "  GPU vision embd[0][0..7]:");
+    for (int j = 0; j < 8 && j < proj_dim; j++)
+        fprintf(stderr, " %.4f", vision_embd[j]);
+    fprintf(stderr, "\n");
+    // Compute norm of first token
+    {
+        float norm = 0;
+        for (int j = 0; j < proj_dim; j++) norm += vision_embd[j] * vision_embd[j];
+        fprintf(stderr, "  GPU vision embd[0] norm=%.4f\n", sqrtf(norm));
+    }
+
+    // CPU vision encode for comparison
+    {
+        float *img_norm2 = vision_normalize_image(vm, NULL, 0, 0); // dummy - need actual image
+        // Re-load image for CPU test
+        int channels;
+        uint8_t *img2 = stbi_load(image_path.c_str(), &img_w, &img_h, &channels, 3);
+        if (img2 && (img_w != image_size || img_h != image_size)) {
+            uint8_t *resized = (uint8_t *)malloc(image_size * image_size * 3);
+            stbir_resize_uint8_linear(img2, img_w, img_h, 0, resized, image_size, image_size, 0, (stbir_pixel_layout)3);
+            stbi_image_free(img2); img2 = resized;
+            img_w = img_h = image_size;
+        }
+        if (img2) {
+            float *cpu_norm = vision_normalize_image(vm, img2, img_w, img_h);
+            free(img2);
+            float *cpu_embd = vision_encode(vm, cpu_norm, img_w, img_h);
+            free(cpu_norm);
+            if (cpu_embd) {
+                fprintf(stderr, "  CPU vision embd[0][0..7]:");
+                for (int j = 0; j < 8; j++) fprintf(stderr, " %.4f", cpu_embd[j]);
+                fprintf(stderr, "\n");
+                float norm = 0;
+                for (int j = 0; j < proj_dim; j++) norm += cpu_embd[j] * cpu_embd[j];
+                fprintf(stderr, "  CPU vision embd[0] norm=%.4f\n", sqrtf(norm));
+                // Compare (full embedding including deepstack features)
+                float max_diff = 0;
+                for (int j = 0; j < n_vision_tokens * embd_stride; j++) {
+                    float d = fabsf(cpu_embd[j] - vision_embd[j]);
+                    if (d > max_diff) max_diff = d;
+                }
+                fprintf(stderr, "  GPU vs CPU max diff: %.6f\n", max_diff);
+                free(cpu_embd);
+            }
+        }
+    }
 
     // Build token sequence
     // <|im_start|>user\n<|vision_start|>[vision]<|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n
@@ -255,23 +297,43 @@ int main(int argc, char **argv) {
             total_prompt_len, n_before, n_vision_tokens, n_after);
     fprintf(stderr, "User prompt: \"%s\"\n", prompt.c_str());
 
-    // Prefill
-    fprintf(stderr, "\n=== Prefill ===\n");
-    int pos = 0;
+    // Compute merged grid dimensions for M-RoPE vision positions
+    int merged_w = patches_w / vm->spatial_merge;
+    int merged_h = patches_h / vm->spatial_merge;
 
-    // Text before vision
+    // Prefill
+    fprintf(stderr, "\n=== Prefill (%s LLM) ===\n", gpu_llm ? "GPU" : "CPU");
+    int pos = 0;
+    int n_vocab_actual = gpu_llm ? gpu_llm_runner->n_vocab() : model->n_vocab;
+
+    // Text before vision: all 3 RoPE dims use the same position
     for (int i = 0; i < n_before; i++) {
-        transformer_forward(model, tokens_before[i], pos);
+        if (gpu_llm) {
+            gpu_llm_runner->forward(tokens_before[i], pos, pos, pos, pos, false);
+        } else {
+            transformer_forward_pos(model, tokens_before[i], pos, pos, pos, pos);
+        }
         pos++;
     }
     fprintf(stderr, "  Text prefix: %d tokens done\n", n_before);
 
-    // Vision tokens
-    fprintf(stderr, "  Vision: %d tokens...\n", n_vision_tokens);
+    // Vision tokens with M-RoPE 3D positions
+    // Set deepstack embedding stride so LLM injects deepstack slices at early layers
+    if (model) {
+        model->ds_embd_stride = embd_stride;
+    }
+    fprintf(stderr, "  Vision: %d tokens (merged grid %dx%d, M-RoPE, deepstack=%d)...\n",
+            n_vision_tokens, merged_w, merged_h, n_ds);
     t0 = clock();
     for (int i = 0; i < n_vision_tokens; i++) {
-        float *embd_i = vision_embd + i * proj_dim;
-        transformer_forward_embd(model, embd_i, pos);
+        float *embd_i = vision_embd + i * embd_stride;
+        int mrope_h = i / merged_w;
+        int mrope_w = i % merged_w;
+        if (gpu_llm) {
+            gpu_llm_runner->forwardEmbd(embd_i, pos, 0, mrope_h, mrope_w, false);
+        } else {
+            transformer_forward_embd_pos(model, embd_i, pos, 0, mrope_h, mrope_w);
+        }
         pos++;
     }
     t1 = clock();
@@ -281,32 +343,49 @@ int main(int argc, char **argv) {
 
     // Text after vision
     for (int i = 0; i < n_after; i++) {
-        if (i == n_after - 1) {
-            transformer_forward_logits(model, tokens_after[i], pos);
+        bool last = (i == n_after - 1);
+        if (gpu_llm) {
+            gpu_llm_runner->forward(tokens_after[i], pos, pos, pos, pos, last);
         } else {
-            transformer_forward(model, tokens_after[i], pos);
+            if (last) {
+                transformer_forward_logits_pos(model, tokens_after[i], pos, pos, pos, pos);
+            } else {
+                transformer_forward_pos(model, tokens_after[i], pos, pos, pos, pos);
+            }
         }
         pos++;
     }
     fprintf(stderr, "  Text suffix: %d tokens done\n", n_after);
 
     // Generation
-    fprintf(stderr, "\n=== Generation ===\n\n");
+    fprintf(stderr, "\n=== Generation (%s LLM) ===\n\n", gpu_llm ? "GPU" : "CPU");
 
     int32_t next_token = -1;
     for (int g = 0; g < max_gen; g++) {
         float *logits;
         if (g == 0) {
-            logits = model->logits;
+            if (gpu_llm) {
+                // Logits already computed in last prefill step
+                logits = gpu_llm_runner->forward(tokens_after[n_after - 1], pos - 1, pos - 1, pos - 1, pos - 1, true);
+                // Actually we already called forward for the last token above with compute_logits=true,
+                // so the logits are from that call. But we re-ran with same cache_pos which overwrites.
+                // This is fine since it's the same token at the same position.
+            } else {
+                logits = model->logits;
+            }
         } else {
-            logits = transformer_forward_logits(model, next_token, pos);
+            if (gpu_llm) {
+                logits = gpu_llm_runner->forward(next_token, pos, true);
+            } else {
+                logits = transformer_forward_logits(model, next_token, pos);
+            }
             pos++;
         }
         if (!logits) break;
 
         // Greedy argmax
         next_token = 0;
-        for (int j = 1; j < model->n_vocab; j++) {
+        for (int j = 1; j < n_vocab_actual; j++) {
             if (logits[j] > logits[next_token]) next_token = j;
         }
 
@@ -328,7 +407,11 @@ int main(int argc, char **argv) {
     }
     printf("\n");
 
+    // Print profiling summary
+    prof_summary();
+
     // Cleanup
+    delete gpu_llm_runner;
     vision_free(vm);
     transformer_free(model);
     bpe_vocab_free(vocab);

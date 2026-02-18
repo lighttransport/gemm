@@ -1,6 +1,8 @@
 // C translation unit for CPU reference implementations
 // (C headers with IMPLEMENTATION don't compile cleanly as C++)
 
+#include "../common/profiler.h"
+
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../common/gguf_loader.h"
 
