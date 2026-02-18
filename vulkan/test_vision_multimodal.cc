@@ -77,6 +77,61 @@ static uint8_t *generate_test_image(int width, int height, const char *pattern) 
     return img;
 }
 
+// Smart resize matching llama.cpp's Qwen-VL preprocessing:
+// - Preserves aspect ratio
+// - Aligns dimensions to multiples of align_size (patch_size * spatial_merge)
+// - Constrains total pixels between min_pixels and max_pixels
+static void calc_size_preserved_ratio(int in_w, int in_h, int align_size,
+                                       int min_pixels, int max_pixels,
+                                       int *out_w, int *out_h) {
+    auto round_by = [align_size](float x) { return (int)roundf(x / align_size) * align_size; };
+    auto ceil_by  = [align_size](float x) { return (int)ceilf(x / align_size) * align_size; };
+    auto floor_by = [align_size](float x) { return (int)floorf(x / align_size) * align_size; };
+
+    int h_bar = std::max(align_size, round_by((float)in_h));
+    int w_bar = std::max(align_size, round_by((float)in_w));
+
+    if (h_bar * w_bar > max_pixels) {
+        float beta = sqrtf((float)(in_h * in_w) / max_pixels);
+        h_bar = std::max(align_size, floor_by(in_h / beta));
+        w_bar = std::max(align_size, floor_by(in_w / beta));
+    } else if (h_bar * w_bar < min_pixels) {
+        float beta = sqrtf((float)min_pixels / (in_h * in_w));
+        h_bar = ceil_by(in_h * beta);
+        w_bar = ceil_by(in_w * beta);
+    }
+    *out_w = w_bar;
+    *out_h = h_bar;
+}
+
+// Bilinear resize matching llama.cpp's implementation exactly
+static uint8_t *resize_bilinear(const uint8_t *src, int src_w, int src_h,
+                                 int dst_w, int dst_h) {
+    uint8_t *dst = (uint8_t *)malloc(dst_w * dst_h * 3);
+    float x_ratio = (float)(src_w - 1) / dst_w;
+    float y_ratio = (float)(src_h - 1) / dst_h;
+
+    for (int y = 0; y < dst_h; y++) {
+        for (int x = 0; x < dst_w; x++) {
+            float px = x_ratio * x;
+            float py = y_ratio * y;
+            int x_floor = (int)px;
+            int y_floor = (int)py;
+            float x_lerp = px - x_floor;
+            float y_lerp = py - y_floor;
+
+            for (int c = 0; c < 3; c++) {
+                float top = (1.0f - x_lerp) * src[3 * (y_floor * src_w + x_floor) + c]
+                          +         x_lerp  * src[3 * (y_floor * src_w + (x_floor + 1)) + c];
+                float bot = (1.0f - x_lerp) * src[3 * ((y_floor + 1) * src_w + x_floor) + c]
+                          +         x_lerp  * src[3 * ((y_floor + 1) * src_w + (x_floor + 1)) + c];
+                dst[3 * (y * dst_w + x) + c] = (uint8_t)((1.0f - y_lerp) * top + y_lerp * bot);
+            }
+        }
+    }
+    return dst;
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s --model <model.gguf> --mmproj <mmproj.gguf> [options]\n\n", prog);
     fprintf(stderr, "Options:\n");
@@ -85,7 +140,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --image <path>      Input image (JPG, PNG, BMP, TGA, etc.)\n");
     fprintf(stderr, "  --pattern <name>    Test pattern: checkerboard, gradient, red, circles (default: gradient)\n");
     fprintf(stderr, "  --prompt <text>     User prompt (default: 'Describe what you see in this image in detail.')\n");
-    fprintf(stderr, "  --image-size <N>    Image size (default: 192)\n");
+    fprintf(stderr, "  --image-size <N>    Max image size (0=auto, default: 0). Caps smart resize.\n");
     fprintf(stderr, "  --max-gen <N>       Max tokens to generate (default: 100)\n");
     fprintf(stderr, "  --attn <mode>       Attention: cpu, naive, flash (default: flash)\n");
     fprintf(stderr, "  --device <id>       Vulkan device (default: 0)\n");
@@ -96,7 +151,7 @@ static void print_usage(const char *prog) {
 int main(int argc, char **argv) {
     std::string model_path, mmproj_path, image_path, pattern = "gradient";
     std::string prompt = "Describe what you see in this image in detail.";
-    int image_size = 192, max_gen = 100, device_id = 0, n_threads = 1;
+    int image_size = 0, max_gen = 100, device_id = 0, n_threads = 1;  // 0 = auto (smart resize)
     bool gpu_llm = false;
     VulkanVisionEncoder::AttentionMode attn_mode = VulkanVisionEncoder::ATTN_FLASH_GPU;
 
@@ -181,18 +236,35 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "Loaded image: %dx%d (%d channels)\n", img_w, img_h, channels);
 
-        // Resize if needed using high-quality filter
-        if (img_w != image_size || img_h != image_size) {
-            fprintf(stderr, "Resizing %dx%d -> %dx%d...\n", img_w, img_h, image_size, image_size);
-            uint8_t *resized = (uint8_t *)malloc(image_size * image_size * 3);
-            stbir_resize_uint8_linear(img_rgb, img_w, img_h, 0,
-                                      resized, image_size, image_size, 0,
-                                      (stbir_pixel_layout)3 /*STBIR_RGB*/);
-            stbi_image_free(img_rgb);
-            img_rgb = resized;
-            img_w = img_h = image_size;
+        // Smart resize: preserve aspect ratio, align to patch_size * spatial_merge
+        // Matches llama.cpp Qwen-VL preprocessing exactly
+        {
+            int align_size = 32; // patch_size(16) * spatial_merge(2)
+            // min/max tokens: 8..4096, each token covers align_size^2 pixels
+            int min_pixels = 8 * align_size * align_size;     // 8192
+            int max_pixels = 4096 * align_size * align_size;  // 4194304
+            // If user specified --image-size, cap max_pixels accordingly
+            if (image_size > 0) {
+                int user_max_pixels = image_size * image_size;
+                if (user_max_pixels < max_pixels) max_pixels = user_max_pixels;
+            }
+
+            int target_w, target_h;
+            calc_size_preserved_ratio(img_w, img_h, align_size, min_pixels, max_pixels, &target_w, &target_h);
+
+            if (img_w != target_w || img_h != target_h) {
+                fprintf(stderr, "Smart resize %dx%d -> %dx%d (aspect-preserving, align=%d)\n",
+                        img_w, img_h, target_w, target_h, align_size);
+                uint8_t *resized = resize_bilinear(img_rgb, img_w, img_h, target_w, target_h);
+                stbi_image_free(img_rgb);
+                img_rgb = resized;
+                img_w = target_w;
+                img_h = target_h;
+            }
         }
     } else {
+        if (image_size <= 0) image_size = 192;  // default for test patterns
+        img_w = img_h = image_size;
         fprintf(stderr, "Generating '%s' test image (%dx%d)...\n", pattern.c_str(), img_w, img_h);
         img_rgb = generate_test_image(img_w, img_h, pattern.c_str());
     }
@@ -249,15 +321,13 @@ int main(int argc, char **argv) {
 
     // CPU vision encode for comparison
     {
-        float *img_norm2 = vision_normalize_image(vm, NULL, 0, 0); // dummy - need actual image
-        // Re-load image for CPU test
+        // Re-load image for CPU test (use same smart resize)
         int channels;
-        uint8_t *img2 = stbi_load(image_path.c_str(), &img_w, &img_h, &channels, 3);
-        if (img2 && (img_w != image_size || img_h != image_size)) {
-            uint8_t *resized = (uint8_t *)malloc(image_size * image_size * 3);
-            stbir_resize_uint8_linear(img2, img_w, img_h, 0, resized, image_size, image_size, 0, (stbir_pixel_layout)3);
+        int cpu_w, cpu_h;
+        uint8_t *img2 = stbi_load(image_path.c_str(), &cpu_w, &cpu_h, &channels, 3);
+        if (img2 && (cpu_w != img_w || cpu_h != img_h)) {
+            uint8_t *resized = resize_bilinear(img2, cpu_w, cpu_h, img_w, img_h);
             stbi_image_free(img2); img2 = resized;
-            img_w = img_h = image_size;
         }
         if (img2) {
             float *cpu_norm = vision_normalize_image(vm, img2, img_w, img_h);
@@ -321,6 +391,9 @@ int main(int argc, char **argv) {
     // Set deepstack embedding stride so LLM injects deepstack slices at early layers
     if (model) {
         model->ds_embd_stride = embd_stride;
+    }
+    if (gpu_llm_runner) {
+        gpu_llm_runner->setDeepstackStride(embd_stride);
     }
     fprintf(stderr, "  Vision: %d tokens (merged grid %dx%d, M-RoPE, deepstack=%d)...\n",
             n_vision_tokens, merged_w, merged_h, n_ds);
