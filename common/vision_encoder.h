@@ -60,9 +60,10 @@ typedef struct {
     float image_mean[3];
     float image_std[3];
 
-    /* Patch embedding */
-    qtensor patch_embd_w;  /* [16, 16, 3, dim] */
-    qtensor patch_embd_b;  /* [dim] */
+    /* Patch embedding (dual conv2d: two kernels added together) */
+    qtensor patch_embd_w;   /* [16, 16, 3, dim] - patch_embeddings_0 */
+    qtensor patch_embd_w1;  /* [16, 16, 3, dim] - patch_embeddings_1 */
+    qtensor patch_embd_b;   /* [dim] */
 
     /* Position embedding */
     qtensor position_embd; /* [dim, n_patches] */
@@ -105,6 +106,15 @@ float *vision_normalize_image(const vision_model *vm, const uint8_t *rgb, int wi
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* Profiling macros: active only if profiler.h was included before this file */
+#ifdef PROFILER_H
+#define VIT_PROF_BEGIN(name, layer, op, prec) prof_begin(name, "vision", layer, op, prec)
+#define VIT_PROF_END(name, flops, iops) prof_end(name, flops, iops)
+#else
+#define VIT_PROF_BEGIN(name, layer, op, prec) ((void)0)
+#define VIT_PROF_END(name, flops, iops) ((void)0)
+#endif
 
 /* ---- Tensor loading ---- */
 
@@ -202,6 +212,17 @@ static void vit_matvec_bias(float *dst, const qtensor *mat, const qtensor *bias,
         bias_buf = (float *)malloc(n_rows * sizeof(float));
         vit_dequant_row(bias, 0, bias_buf);
     }
+    /* F16 fast path: fused dequant + dot product */
+    if (mat->type == GGML_TYPE_F16) {
+        const uint8_t *base = (const uint8_t *)mat->data;
+        size_t row_bytes = (size_t)n_cols * 2;
+        for (int i = 0; i < n_rows; i++) {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+            dst[i] = vec_dot_f16_f32(row, x, n_cols) + (bias_buf ? bias_buf[i] : 0.0f);
+        }
+        free(bias_buf);
+        return;
+    }
     for (int i = 0; i < n_rows; i++) {
         vit_dequant_row(mat, i, tmp);
         float sum = 0.0f;
@@ -219,6 +240,21 @@ static void vit_batch_matvec(float *dst, const qtensor *mat, const qtensor *bias
     if (bias && bias->data) {
         bias_buf = (float *)malloc(n_out * sizeof(float));
         vit_dequant_row(bias, 0, bias_buf);
+    }
+    /* F16 fast path: fused dequant + dot product */
+    if (mat->type == GGML_TYPE_F16) {
+        const uint8_t *base = (const uint8_t *)mat->data;
+        size_t row_bytes = (size_t)n_in * 2;
+        for (int b = 0; b < n_tokens; b++) {
+            const float *x = src + b * n_in;
+            float *y = dst + b * n_out;
+            for (int i = 0; i < n_out; i++) {
+                const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+                y[i] = vec_dot_f16_f32(row, x, n_in) + (bias_buf ? bias_buf[i] : 0.0f);
+            }
+        }
+        free(bias_buf);
+        return;
     }
     for (int b = 0; b < n_tokens; b++) {
         const float *x = src + b * n_in;
@@ -283,8 +319,11 @@ vision_model *vision_load(gguf_context *g) {
 
     /* Patch + position embeddings */
     vm->patch_embd_w = vit_load(g, "v.patch_embd.weight", 1);
+    vm->patch_embd_w1 = vit_load(g, "v.patch_embd.weight.1", 0);  /* second conv kernel */
     vm->patch_embd_b = vit_load(g, "v.patch_embd.bias", 0);
     vm->position_embd = vit_load(g, "v.position_embd.weight", 1);
+    if (vm->patch_embd_w1.data)
+        fprintf(stderr, "vision: loaded dual conv2d patch embeddings\n");
 
     /* Blocks */
     vm->blocks = (vision_block *)calloc(vm->n_blocks, sizeof(vision_block));
@@ -406,23 +445,30 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
     float *tmp = (float *)calloc(ffn_dim > 3 * dim ? ffn_dim : 3 * dim, sizeof(float));
     float *w_buf = (float *)calloc(dim > ffn_dim ? dim : ffn_dim, sizeof(float));
     float *b_buf = (float *)calloc(dim > ffn_dim ? dim : ffn_dim, sizeof(float));
-    float *deepstack_accum = (float *)calloc(n_merged * vm->proj_dim, sizeof(float));
+    int n_ds = vm->n_deepstack;
+    int total_embd = vm->proj_dim * (1 + n_ds);  /* main + deepstack features */
+    float *deepstack_feats = (float *)calloc(n_merged * n_ds * vm->proj_dim, sizeof(float));
+    int ds_count = 0;  /* how many deepstack features computed so far */
     float *merge_buf = (float *)calloc(n_merged * merged_dim, sizeof(float));
 
-    /* 1. Patch embedding: Conv2D with stride=patch_size */
-    /* patch_embd_w is [16, 16, 3, dim] stored as [dim] rows of [16*16*3=768] */
-    /* Actually dims are [16, 16, 3, 1024] which in GGUF means n_cols=16, but the
-     * actual layout is a 4D tensor. For a conv2d kernel, we treat it as [dim, 3*16*16]. */
-    fprintf(stderr, "  patch embedding...\n");
+    /* 1. Patch embedding: Dual Conv2D with stride=patch_size
+     * Qwen3-VL uses two conv kernels (temporal_patch_size=2): both applied to the
+     * same image and outputs added together, then bias added. */
+    fprintf(stderr, "  patch embedding (dual conv2d)...\n");
+    VIT_PROF_BEGIN("patch_embed", -1, "conv2d", "FP32");
     {
-        /* Dequant the full patch embedding weight: [dim, patch_size*patch_size*3] */
         int kernel_size = ps * ps * 3;
-        float *kernel = (float *)malloc(dim * kernel_size * sizeof(float));
-        /* The weight is stored as 4D [16,16,3,1024]. In row-major GGUF, this means
-         * dims[0]=16 (innermost), dims[1]=16, dims[2]=3, dims[3]=1024
-         * Total elements = 16*16*3*1024. We need it as [1024, 768] matrix. */
-        dequant_row(vm->patch_embd_w.type, vm->patch_embd_w.data, kernel,
+        float *kernel0 = (float *)malloc(dim * kernel_size * sizeof(float));
+        dequant_row(vm->patch_embd_w.type, vm->patch_embd_w.data, kernel0,
                     ps * ps * 3 * dim);
+
+        /* Second conv kernel (if available) */
+        float *kernel1 = NULL;
+        if (vm->patch_embd_w1.data) {
+            kernel1 = (float *)malloc(dim * kernel_size * sizeof(float));
+            dequant_row(vm->patch_embd_w1.type, vm->patch_embd_w1.data, kernel1,
+                        ps * ps * 3 * dim);
+        }
 
         float *bias_buf2 = NULL;
         if (vm->patch_embd_b.data) {
@@ -430,38 +476,43 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
             vit_dequant_row(&vm->patch_embd_b, 0, bias_buf2);
         }
 
-        /* For each patch, extract the 16x16x3 region, dot with each kernel row */
         for (int py = 0; py < gh; py++) {
             for (int px = 0; px < gw; px++) {
                 int patch_idx = py * gw + px;
                 float *out = hidden + patch_idx * dim;
 
-                /* Extract patch pixels into flat vector [768] */
-                float patch[768]; /* 16*16*3 */
-                for (int dy = 0; dy < ps; dy++) {
-                    for (int dx = 0; dx < ps; dx++) {
-                        int img_y = py * ps + dy;
-                        int img_x = px * ps + dx;
-                        int pix_idx = (img_y * width + img_x) * 3;
-                        int patch_pix = (dy * ps + dx) * 3;
-                        patch[patch_pix + 0] = rgb_norm[pix_idx + 0];
-                        patch[patch_pix + 1] = rgb_norm[pix_idx + 1];
-                        patch[patch_pix + 2] = rgb_norm[pix_idx + 2];
+                /* Extract patch pixels in CHW order */
+                float patch[768]; /* 3*16*16 */
+                for (int c = 0; c < 3; c++) {
+                    for (int dy = 0; dy < ps; dy++) {
+                        for (int dx = 0; dx < ps; dx++) {
+                            int img_y = py * ps + dy;
+                            int img_x = px * ps + dx;
+                            int pix_idx = (img_y * width + img_x) * 3;
+                            patch[c * ps * ps + dy * ps + dx] = rgb_norm[pix_idx + c];
+                        }
                     }
                 }
 
-                /* Dot with each output channel */
+                /* Dot with each output channel: conv0 + conv1 + bias */
                 for (int d = 0; d < dim; d++) {
                     float sum = 0.0f;
-                    const float *kd = kernel + d * kernel_size;
-                    for (int j = 0; j < kernel_size; j++) sum += kd[j] * patch[j];
+                    const float *kd0 = kernel0 + d * kernel_size;
+                    for (int j = 0; j < kernel_size; j++) sum += kd0[j] * patch[j];
+                    if (kernel1) {
+                        const float *kd1 = kernel1 + d * kernel_size;
+                        for (int j = 0; j < kernel_size; j++) sum += kd1[j] * patch[j];
+                    }
                     out[d] = sum + (bias_buf2 ? bias_buf2[d] : 0.0f);
                 }
             }
         }
-        free(kernel);
+        free(kernel0);
+        free(kernel1);
         free(bias_buf2);
     }
+    /* FLOPs: each patch does dim dot products of kernel_size, times 2 kernels */
+    VIT_PROF_END("patch_embed", 2.0 * n_patches * dim * ps * ps * 3 * (vm->patch_embd_w1.data ? 2 : 1), 0);
 
     /* 2. Add position embeddings: position_embd is [dim, orig_n_patches] */
     fprintf(stderr, "  position embeddings...\n");
@@ -471,19 +522,81 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
         float *pos_emb = (float *)malloc(dim * orig_n * sizeof(float));
         dequant_row(vm->position_embd.type, vm->position_embd.data, pos_emb,
                     dim * orig_n);
-        /* pos_emb is stored as [dim, orig_n] in row-major:
-         * pos_emb[d * orig_n + p] is the d-th dim of patch p.
+        /* pos_emb GGUF dims=[dim, n_patches], with dims[0]=dim contiguous.
+         * So layout is [n_patches, dim] in row-major: pos_emb[p * dim + d].
          * For smaller images, select positions from the top-left subgrid. */
         for (int py = 0; py < gh; py++) {
             for (int px = 0; px < gw; px++) {
                 int p = py * gw + px;
                 int orig_p = py * orig_gw + px;  /* position in original grid */
                 for (int d = 0; d < dim; d++) {
-                    hidden[p * dim + d] += pos_emb[d * orig_n + orig_p];
+                    hidden[p * dim + d] += pos_emb[orig_p * dim + d];
                 }
             }
         }
         free(pos_emb);
+    }
+
+    /* 2b. Compute M-RoPE position IDs for each patch (raster order).
+     * Layout: pos_ids[4][n_patches] — (t, h, w, e) per patch.
+     * Our patches are in raster order (py*gw+px), so position is simply (py, px).
+     * llama.cpp uses pixel-unshuffle reordering but we skip that, so assign
+     * positions directly from the raster grid coordinates. */
+    int *pos_ids = (int *)calloc(4 * n_patches, sizeof(int));
+    for (int py = 0; py < gh; py++) {
+        for (int px = 0; px < gw; px++) {
+            int p = py * gw + px;
+            pos_ids[0 * n_patches + p] = py;  /* p_t */
+            pos_ids[1 * n_patches + p] = px;  /* p_h */
+            pos_ids[2 * n_patches + p] = py;  /* p_w */
+            pos_ids[3 * n_patches + p] = px;  /* p_e */
+        }
+    }
+
+    /* 2c. Precompute M-RoPE cos/sin cache for all patches.
+     * Vision RoPE: theta_base=10000, independent sections, pairs [i, i+half].
+     * Sections [s0, s1, s2, s3] = [hd/4, hd/4, hd/4, hd/4].
+     * For d_head=64: 32 pairs, section 0 (pairs 0-15) uses p_t,
+     * section 1 (pairs 16-31) uses p_h. */
+    int half = head_dim / 2;  /* n_dims = d_head/2 */
+    int sect_size = head_dim / 4;
+    float freq_base = 10000.0f;
+    /* theta_scale = base^(-2/n_dims) where n_dims = d_head/2 (RoPE dimension count) */
+    float theta_scale = powf(freq_base, -2.0f / (float)half);
+    float *rope_cos = (float *)malloc(n_patches * head_dim * sizeof(float));
+    float *rope_sin = (float *)malloc(n_patches * head_dim * sizeof(float));
+    for (int p = 0; p < n_patches; p++) {
+        float p_t = (float)pos_ids[0 * n_patches + p];
+        float p_h = (float)pos_ids[1 * n_patches + p];
+        float p_w = (float)pos_ids[2 * n_patches + p];
+        float p_e = (float)pos_ids[3 * n_patches + p];
+        /* Four running thetas, one per section. All advance each iteration
+         * (matching llama.cpp), but reset at section boundaries (indep_sects). */
+        float cur_t = p_t, cur_h = p_h, cur_w = p_w, cur_e = p_e;
+        for (int i0 = 0; i0 < head_dim; i0 += 2) {
+            int sector = (i0 / 2);  /* 0..half-1 for d_head elements */
+            /* Independent sections: reset theta at section boundaries */
+            if (sector == 0) cur_t = p_t;
+            if (sector == sect_size) cur_h = p_h;
+            if (sector == 2 * sect_size) cur_w = p_w;
+            if (sector == 3 * sect_size) cur_e = p_e;
+
+            float theta;
+            if (sector < sect_size) theta = cur_t;
+            else if (sector < 2 * sect_size) theta = cur_h;
+            else if (sector < 3 * sect_size) theta = cur_w;
+            else theta = cur_e;
+
+            rope_cos[p * head_dim + i0] = cosf(theta);
+            rope_sin[p * head_dim + i0] = sinf(theta);
+            rope_cos[p * head_dim + i0 + 1] = cosf(theta);
+            rope_sin[p * head_dim + i0 + 1] = sinf(theta);
+
+            cur_t *= theta_scale;
+            cur_h *= theta_scale;
+            cur_w *= theta_scale;
+            cur_e *= theta_scale;
+        }
     }
 
     /* 3. ViT blocks */
@@ -495,16 +608,48 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
 
         /* --- Self-attention --- */
         /* LayerNorm1 */
+        VIT_PROF_BEGIN("ln1", l, "layernorm", "FP32");
         for (int p = 0; p < n_patches; p++) {
             vit_layernorm(ln_buf + p * dim, hidden + p * dim,
                           &blk->ln1_w, &blk->ln1_b, dim, vm->ln_eps, w_buf, b_buf);
         }
+        VIT_PROF_END("ln1", 5.0 * n_patches * dim, 0);
 
         /* QKV projection: [n_patches, dim] -> [n_patches, 3*dim] */
+        VIT_PROF_BEGIN("qkv_matmul", l, "matmul", "FP32");
         vit_batch_matvec(qkv, &blk->attn_qkv_w, &blk->attn_qkv_b,
                          ln_buf, n_patches, 3 * dim, dim, tmp);
+        VIT_PROF_END("qkv_matmul", 2.0 * n_patches * 3 * dim * dim, 0);
+
+        /* Apply M-RoPE to Q and K (not V).
+         * Vision rotation: pairs [i, i+half] for i in 0..half-1.
+         * cos/sin indexed by pair i0/2 from precomputed cache. */
+        VIT_PROF_BEGIN("mrope", l, "rope", "FP32");
+        for (int p = 0; p < n_patches; p++) {
+            float *q = qkv + p * 3 * dim;      /* Q starts at offset 0 */
+            float *k = qkv + p * 3 * dim + dim; /* K starts at offset dim */
+            for (int h = 0; h < n_heads; h++) {
+                float *qh = q + h * head_dim;
+                float *kh = k + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float cos_t = rope_cos[p * head_dim + 2 * i];
+                    float sin_t = rope_sin[p * head_dim + 2 * i];
+                    /* Rotate Q */
+                    float q0 = qh[i], q1 = qh[i + half];
+                    qh[i]        = q0 * cos_t - q1 * sin_t;
+                    qh[i + half] = q0 * sin_t + q1 * cos_t;
+                    /* Rotate K */
+                    float k0 = kh[i], k1 = kh[i + half];
+                    kh[i]        = k0 * cos_t - k1 * sin_t;
+                    kh[i + half] = k0 * sin_t + k1 * cos_t;
+                }
+            }
+        }
+
+        VIT_PROF_END("mrope", (double)n_patches * n_heads * half * 8.0 * 2, 0);
 
         /* Multi-head attention (head by head to save memory) */
+        VIT_PROF_BEGIN("attention", l, "attention", "FP32");
         memset(attn_out, 0, n_patches * dim * sizeof(float));
         float scale = 1.0f / sqrtf((float)head_dim);
 
@@ -536,31 +681,44 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
             }
         }
 
+        /* QK: heads*seq^2*hd, AV: same */
+        VIT_PROF_END("attention", 2.0 * n_heads * (double)n_patches * n_patches * head_dim * 2, 0);
+
         /* Attention output projection */
+        VIT_PROF_BEGIN("attn_out", l, "matmul", "FP32");
         vit_batch_matvec(hidden2, &blk->attn_out_w, &blk->attn_out_b,
                          attn_out, n_patches, dim, dim, tmp);
+        VIT_PROF_END("attn_out", 2.0 * n_patches * dim * dim, 0);
 
         /* Residual */
         for (int i = 0; i < n_patches * dim; i++) hidden[i] += hidden2[i];
 
         /* --- FFN --- */
         /* LayerNorm2 */
+        VIT_PROF_BEGIN("ln2", l, "layernorm", "FP32");
         for (int p = 0; p < n_patches; p++) {
             vit_layernorm(ln_buf + p * dim, hidden + p * dim,
                           &blk->ln2_w, &blk->ln2_b, dim, vm->ln_eps, w_buf, b_buf);
         }
+        VIT_PROF_END("ln2", 5.0 * n_patches * dim, 0);
 
         /* FFN: up -> GELU -> down */
+        VIT_PROF_BEGIN("ffn_up", l, "matmul", "FP32");
         vit_batch_matvec(ffn_buf, &blk->ffn_up_w, &blk->ffn_up_b,
                          ln_buf, n_patches, ffn_dim, dim, tmp);
+        VIT_PROF_END("ffn_up", 2.0 * n_patches * ffn_dim * dim, 0);
 
+        VIT_PROF_BEGIN("gelu", l, "gelu", "FP32");
         for (int i = 0; i < n_patches * ffn_dim; i++) {
             float v = ffn_buf[i];
             ffn_buf[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
         }
+        VIT_PROF_END("gelu", 8.0 * n_patches * ffn_dim, 0);
 
+        VIT_PROF_BEGIN("ffn_down", l, "matmul", "FP32");
         vit_batch_matvec(hidden2, &blk->ffn_down_w, &blk->ffn_down_b,
                          ffn_buf, n_patches, dim, ffn_dim, tmp);
+        VIT_PROF_END("ffn_down", 2.0 * n_patches * dim * ffn_dim, 0);
 
         /* Residual */
         for (int i = 0; i < n_patches * dim; i++) hidden[i] += hidden2[i];
@@ -590,31 +748,38 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
                 }
             }
 
-            /* fc1: [merged_dim -> merged_dim] with bias */
-            float *ds_tmp = (float *)malloc(merged_dim * sizeof(float));
-            float *ds_buf = (float *)malloc(n_merged * merged_dim * sizeof(float));
-            vit_batch_matvec(ds_buf, &dsl->fc1_w, &dsl->fc1_b,
-                             merge_buf, n_merged, merged_dim, merged_dim, ds_tmp);
-
-            /* LayerNorm on merged_dim */
+            /* LayerNorm on merge_buf (before fc1) */
             float *ds_w = (float *)malloc(merged_dim * sizeof(float));
             float *ds_b = (float *)malloc(merged_dim * sizeof(float));
             for (int p = 0; p < n_merged; p++) {
-                vit_layernorm(ds_buf + p * merged_dim, ds_buf + p * merged_dim,
+                vit_layernorm(merge_buf + p * merged_dim, merge_buf + p * merged_dim,
                               &dsl->norm_w, &dsl->norm_b, merged_dim, vm->ln_eps, ds_w, ds_b);
             }
 
+            /* fc1: [merged_dim -> merged_dim] with bias */
+            float *ds_tmp = (float *)malloc(merged_dim * sizeof(float));
+            float *ds_buf = (float *)malloc(n_merged * merged_dim * sizeof(float));
+            VIT_PROF_BEGIN("ds_fc1", l, "matmul", "FP32");
+            vit_batch_matvec(ds_buf, &dsl->fc1_w, &dsl->fc1_b,
+                             merge_buf, n_merged, merged_dim, merged_dim, ds_tmp);
+            VIT_PROF_END("ds_fc1", 2.0 * n_merged * merged_dim * merged_dim, 0);
+
             /* GELU */
+            VIT_PROF_BEGIN("ds_gelu", l, "gelu", "FP32");
             vit_gelu(ds_buf, n_merged * merged_dim);
+            VIT_PROF_END("ds_gelu", 8.0 * n_merged * merged_dim, 0);
 
             /* fc2: [merged_dim -> proj_dim] */
             float *ds_out = (float *)malloc(n_merged * vm->proj_dim * sizeof(float));
+            VIT_PROF_BEGIN("ds_fc2", l, "matmul", "FP32");
             vit_batch_matvec(ds_out, &dsl->fc2_w, &dsl->fc2_b,
                              ds_buf, n_merged, vm->proj_dim, merged_dim, ds_tmp);
+            VIT_PROF_END("ds_fc2", 2.0 * n_merged * vm->proj_dim * merged_dim, 0);
 
-            /* Accumulate */
-            for (int i = 0; i < n_merged * vm->proj_dim; i++)
-                deepstack_accum[i] += ds_out[i];
+            /* Store as separate feature slice (for concat) */
+            memcpy(deepstack_feats + ds_count * n_merged * vm->proj_dim,
+                   ds_out, n_merged * vm->proj_dim * sizeof(float));
+            ds_count++;
 
             free(ds_tmp);
             free(ds_buf);
@@ -626,10 +791,12 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
 
     /* 4. Post LayerNorm */
     fprintf(stderr, "  post layernorm...\n");
+    VIT_PROF_BEGIN("post_ln", -1, "layernorm", "FP32");
     for (int p = 0; p < n_patches; p++) {
         vit_layernorm(hidden + p * dim, hidden + p * dim,
                       &vm->post_ln_w, &vm->post_ln_b, dim, vm->ln_eps, w_buf, b_buf);
     }
+    VIT_PROF_END("post_ln", 5.0 * n_patches * dim, 0);
 
     /* 5. Spatial merge: [gh, gw, dim] -> [gh/sm, gw/sm, dim*sm*sm] */
     fprintf(stderr, "  spatial merge...\n");
@@ -656,25 +823,47 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
     fprintf(stderr, "  mm projection...\n");
     float *mm_tmp = (float *)malloc(merged_dim * sizeof(float));
     float *mm_buf = (float *)malloc(n_merged * merged_dim * sizeof(float));
-    float *result = (float *)malloc(n_merged * vm->proj_dim * sizeof(float));
+    /* Result: [n_merged, proj_dim * (1 + n_deepstack)] - main concat deepstack features */
+    float *result = (float *)calloc(n_merged * total_embd, sizeof(float));
+    float *mm_out = (float *)malloc(n_merged * vm->proj_dim * sizeof(float));
 
+    VIT_PROF_BEGIN("mm0", -1, "matmul", "FP32");
     vit_batch_matvec(mm_buf, &vm->mm0_w, &vm->mm0_b,
                      merge_buf, n_merged, merged_dim, merged_dim, mm_tmp);
+    VIT_PROF_END("mm0", 2.0 * n_merged * merged_dim * merged_dim, 0);
+
+    VIT_PROF_BEGIN("mm_gelu", -1, "gelu", "FP32");
     vit_gelu(mm_buf, n_merged * merged_dim);
-    vit_batch_matvec(result, &vm->mm2_w, &vm->mm2_b,
+    VIT_PROF_END("mm_gelu", 8.0 * n_merged * merged_dim, 0);
+
+    VIT_PROF_BEGIN("mm2", -1, "matmul", "FP32");
+    vit_batch_matvec(mm_out, &vm->mm2_w, &vm->mm2_b,
                      mm_buf, n_merged, vm->proj_dim, merged_dim, mm_tmp);
+    VIT_PROF_END("mm2", 2.0 * n_merged * vm->proj_dim * merged_dim, 0);
 
-    /* 7. Add deepstack accumulation */
-    for (int i = 0; i < n_merged * vm->proj_dim; i++)
-        result[i] += deepstack_accum[i];
+    /* 7. Concat main embeddings + deepstack features per token
+     * Layout: [main_proj_dim, ds0_proj_dim, ds1_proj_dim, ...] for each token
+     * This matches llama.cpp Qwen3-VL: LLM layers 0..n_ds-1 each add the
+     * corresponding deepstack slice to their output. */
+    for (int t = 0; t < n_merged; t++) {
+        float *dst = result + t * total_embd;
+        memcpy(dst, mm_out + t * vm->proj_dim, vm->proj_dim * sizeof(float));
+        for (int d = 0; d < ds_count; d++) {
+            memcpy(dst + (1 + d) * vm->proj_dim,
+                   deepstack_feats + d * n_merged * vm->proj_dim + t * vm->proj_dim,
+                   vm->proj_dim * sizeof(float));
+        }
+    }
 
-    fprintf(stderr, "  vision encoding done: %d tokens of dim %d\n", n_merged, vm->proj_dim);
+    fprintf(stderr, "  vision encoding done: %d tokens of dim %d (main %d + %d deepstack)\n",
+            n_merged, total_embd, vm->proj_dim, ds_count);
 
     /* Cleanup */
     free(hidden); free(hidden2); free(qkv); free(attn_out);
     free(ffn_buf); free(ln_buf); free(att); free(tmp);
-    free(w_buf); free(b_buf); free(deepstack_accum); free(merge_buf);
-    free(mm_tmp); free(mm_buf);
+    free(w_buf); free(b_buf); free(deepstack_feats); free(merge_buf);
+    free(pos_ids); free(rope_cos); free(rope_sin);
+    free(mm_tmp); free(mm_buf); free(mm_out);
 
     return result;
 }

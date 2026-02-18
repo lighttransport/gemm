@@ -12,6 +12,19 @@
 #include <iostream>
 #include <algorithm>
 
+extern "C" {
+#include "../common/profiler.h"
+}
+
+/* GPU vision profiling macros */
+#ifdef PROFILER_H
+#define GVIT_PROF_BEGIN(name, layer, op, prec) prof_begin(name, "gpu_vision", layer, op, prec)
+#define GVIT_PROF_END(name, flops, iops) prof_end(name, flops, iops)
+#else
+#define GVIT_PROF_BEGIN(name, layer, op, prec) ((void)0)
+#define GVIT_PROF_END(name, flops, iops) ((void)0)
+#endif
+
 // Load SPIR-V binary
 static std::vector<uint32_t> load_spirv(const std::string &path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -56,6 +69,7 @@ VulkanVisionEncoder::~VulkanVisionEncoder() {
         runner_.destroyComputePipeline(pipe_spatial_merge_);
         runner_.destroyComputePipeline(pipe_attn_naive_);
         runner_.destroyComputePipeline(pipe_attn_flash_);
+        runner_.destroyComputePipeline(pipe_rope_vision_);
     }
 
     if (initialized_) {
@@ -295,6 +309,17 @@ bool VulkanVisionEncoder::createPipelines() {
         }
     }
 
+    // rope_vision_f32: 2 buffers (qkv, pos_ids), push_constant {n_patches, dim, head_dim, n_heads, sect_size, freq_base}
+    {
+        auto spirv = load("rope_vision_f32");
+        if (spirv.empty()) return false;
+        // 5 uints + 1 float = 24 bytes
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(2), 24, pipe_rope_vision_)) {
+            last_error_ = "Failed to create rope_vision pipeline: " + runner_.getLastError();
+            return false;
+        }
+    }
+
     pipelines_created_ = true;
     return true;
 }
@@ -480,6 +505,27 @@ bool VulkanVisionEncoder::dispatchAttnFlash(const BufInfo &qkv, BufInfo &out,
     return runner_.waitForCompletion();
 }
 
+bool VulkanVisionEncoder::dispatchRopeVision(BufInfo &qkv, const BufInfo &pos_ids,
+                                              uint32_t n_patches, uint32_t dim,
+                                              uint32_t n_heads, uint32_t head_dim,
+                                              uint32_t sect_size, float freq_base) {
+    std::vector<BufInfo> bufs = {qkv, pos_ids};
+    runner_.updateDescriptorSet(pipe_rope_vision_, bufs);
+
+    struct { uint32_t n_patches, dim, head_dim, n_heads, sect_size; float freq_base; } pc = {
+        n_patches, dim, head_dim, n_heads, sect_size, freq_base
+    };
+
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_rope_vision_);
+    runner_.bindDescriptorSets(pipe_rope_vision_);
+    runner_.pushConstants(pipe_rope_vision_, &pc, sizeof(pc));
+    // Dispatch: one WG per (patch, head), local_size_x = 32 covers all pairs
+    runner_.dispatch(n_patches, n_heads);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
 // ---- Weight loading ----
 
 static int vit_get_int(const gguf_context *g, const char *key, int def) {
@@ -546,14 +592,20 @@ bool VulkanVisionEncoder::loadWeights(gguf_context *g) {
     shader_dir_ = ".";
     if (!createPipelines()) return false;
 
-    // Upload patch embedding
+    // Upload patch embedding (dual conv2d: add both kernels together on CPU)
     {
-        // patch_embd_w is 4D [16,16,3,dim], dequant as flat
-        qtensor pw = vit_load_qt(g, "v.patch_embd.weight");
-        if (pw.data) {
+        qtensor pw0 = vit_load_qt(g, "v.patch_embd.weight");
+        qtensor pw1 = vit_load_qt(g, "v.patch_embd.weight.1");
+        if (pw0.data) {
             int total = patch_size_ * patch_size_ * 3 * dim_;
             std::vector<float> kernel(total);
-            dequant_row(pw.type, pw.data, kernel.data(), total);
+            dequant_row(pw0.type, pw0.data, kernel.data(), total);
+            if (pw1.data) {
+                std::vector<float> kernel1(total);
+                dequant_row(pw1.type, pw1.data, kernel1.data(), total);
+                for (int i = 0; i < total; i++) kernel[i] += kernel1[i];
+                std::cerr << "vulkan vision: loaded dual conv2d patch embeddings\n";
+            }
             size_t bytes = total * sizeof(float);
             auto buf = createGpuBuffer(bytes);
             uploadToBuffer(buf, kernel.data(), bytes);
@@ -696,7 +748,9 @@ float *VulkanVisionEncoder::encode(const float *rgb_norm, int width, int height)
     auto buf_ln      = createGpuBuffer(n_patches * dim * sizeof(float));
     auto buf_att     = createGpuBuffer(n_patches * n_patches * sizeof(float));
     auto buf_merge   = createGpuBuffer(n_merged * merged_dim * sizeof(float));
-    auto buf_ds_accum = createGpuBuffer(n_merged * proj_dim_ * sizeof(float));
+    // Deepstack feature buffers (one per deepstack layer, for concat)
+    std::vector<BufInfo> buf_ds_feats;
+    buf_ds_feats.reserve(n_deepstack_);
     auto buf_image   = createGpuBuffer(width * height * 3 * sizeof(float));
 
     // For attention: Q, K, V head buffers
@@ -708,28 +762,42 @@ float *VulkanVisionEncoder::encode(const float *rgb_norm, int width, int height)
     // Dummy bias buffer for matmul without bias
     auto buf_dummy_bias = createGpuBuffer(std::max(merged_dim, std::max(3 * dim, ffn_dim)) * sizeof(float));
 
-    // Zero-init deepstack accumulator
-    {
-        std::vector<float> zeros(n_merged * proj_dim_, 0.0f);
-        uploadToBuffer(buf_ds_accum, zeros.data(), zeros.size() * sizeof(float));
-    }
+    // (deepstack features are stored per-layer, no accumulator needed)
 
     // Upload image
     uploadToBuffer(buf_image, rgb_norm, width * height * 3 * sizeof(float));
 
+    // Create M-RoPE position IDs: [4][n_patches] = {p_t, p_h, p_w, p_e}
+    std::vector<int32_t> pos_ids(4 * n_patches, 0);
+    for (int py = 0; py < gh; py++) {
+        for (int px = 0; px < gw; px++) {
+            int p = py * gw + px;
+            pos_ids[0 * n_patches + p] = py;  // p_t
+            pos_ids[1 * n_patches + p] = px;  // p_h
+            pos_ids[2 * n_patches + p] = py;  // p_w
+            pos_ids[3 * n_patches + p] = px;  // p_e
+        }
+    }
+    auto buf_pos_ids = createGpuBuffer(4 * n_patches * sizeof(int32_t));
+    uploadToBuffer(buf_pos_ids, pos_ids.data(), 4 * n_patches * sizeof(int32_t));
+
     // 1. Patch embedding
     std::cerr << "  patch embedding...\n";
+    GVIT_PROF_BEGIN("patch_embed", -1, "conv2d", "FP32");
     {
         uint32_t kernel_size = ps * ps * 3;
         dispatchPatchEmbed(buf_image, weight_bufs_["patch_embd_w"],
                            weight_bufs_["patch_embd_b"], buf_hidden,
                            n_patches, dim, kernel_size, gw, width, ps);
     }
+    GVIT_PROF_END("patch_embed", 2.0 * n_patches * dim * ps * ps * 3, 0);
 
     // 2. Position embeddings
     std::cerr << "  position embeddings...\n";
+    GVIT_PROF_BEGIN("pos_embd", -1, "add", "FP32");
     dispatchAddTransposed(buf_hidden, weight_bufs_["position_embd"],
                           n_patches, dim, gw, orig_gw, n_patches_max_);
+    GVIT_PROF_END("pos_embd", (double)n_patches * dim, 0);
 
     // 3. ViT blocks
     for (int l = 0; l < n_blocks_; l++) {
@@ -739,16 +807,28 @@ float *VulkanVisionEncoder::encode(const float *rgb_norm, int width, int height)
         auto &bn = block_names_[l];
 
         // LayerNorm1
+        GVIT_PROF_BEGIN("ln1", l, "layernorm", "FP32");
         dispatchLayernorm(buf_hidden, buf_ln,
                           weight_bufs_[bn.ln1_w], weight_bufs_[bn.ln1_b],
                           n_patches, dim, ln_eps_);
+        GVIT_PROF_END("ln1", 5.0 * n_patches * dim, 0);
 
         // QKV projection: [n_patches, dim] -> [n_patches, 3*dim]
+        GVIT_PROF_BEGIN("qkv_matmul", l, "matmul", "FP32");
         dispatchMatmulBias(buf_ln, weight_bufs_[bn.qkv_w], buf_qkv,
                            weight_bufs_[bn.qkv_b],
                            n_patches, 3 * dim, dim, true);
+        GVIT_PROF_END("qkv_matmul", 2.0 * n_patches * 3 * dim * dim, 0);
+
+        // M-RoPE on Q and K
+        GVIT_PROF_BEGIN("mrope", l, "rope", "FP32");
+        dispatchRopeVision(buf_qkv, buf_pos_ids,
+                           n_patches, dim, n_heads, head_dim,
+                           head_dim / 4, 10000.0f);
+        GVIT_PROF_END("mrope", (double)n_patches * n_heads * (head_dim / 2) * 8.0 * 2, 0);
 
         // Multi-head attention
+        GVIT_PROF_BEGIN("attention", l, "attention", "FP32");
         {
             float scale = 1.0f / sqrtf((float)head_dim);
             if (attn_mode_ == ATTN_FLASH_GPU) {
@@ -796,31 +876,43 @@ float *VulkanVisionEncoder::encode(const float *rgb_norm, int width, int height)
             }
         }
 
+        GVIT_PROF_END("attention", 2.0 * n_heads * (double)n_patches * n_patches * head_dim * 2, 0);
+
         // Attention output projection
+        GVIT_PROF_BEGIN("attn_out", l, "matmul", "FP32");
         dispatchMatmulBias(buf_attn_out, weight_bufs_[bn.out_w], buf_hidden2,
                            weight_bufs_[bn.out_b],
                            n_patches, dim, dim, true);
+        GVIT_PROF_END("attn_out", 2.0 * n_patches * dim * dim, 0);
 
         // Residual: hidden += hidden2
         dispatchAdd(buf_hidden, buf_hidden2, n_patches * dim);
 
         // LayerNorm2
+        GVIT_PROF_BEGIN("ln2", l, "layernorm", "FP32");
         dispatchLayernorm(buf_hidden, buf_ln,
                           weight_bufs_[bn.ln2_w], weight_bufs_[bn.ln2_b],
                           n_patches, dim, ln_eps_);
+        GVIT_PROF_END("ln2", 5.0 * n_patches * dim, 0);
 
         // FFN up
+        GVIT_PROF_BEGIN("ffn_up", l, "matmul", "FP32");
         dispatchMatmulBias(buf_ln, weight_bufs_[bn.ffn_up_w], buf_ffn,
                            weight_bufs_[bn.ffn_up_b],
                            n_patches, ffn_dim, dim, true);
+        GVIT_PROF_END("ffn_up", 2.0 * n_patches * ffn_dim * dim, 0);
 
         // GELU
+        GVIT_PROF_BEGIN("gelu", l, "gelu", "FP32");
         dispatchGelu(buf_ffn, n_patches * ffn_dim);
+        GVIT_PROF_END("gelu", 8.0 * n_patches * ffn_dim, 0);
 
         // FFN down
+        GVIT_PROF_BEGIN("ffn_down", l, "matmul", "FP32");
         dispatchMatmulBias(buf_ffn, weight_bufs_[bn.ffn_down_w], buf_hidden2,
                            weight_bufs_[bn.ffn_down_b],
                            n_patches, dim, ffn_dim, true);
+        GVIT_PROF_END("ffn_down", 2.0 * n_patches * dim * ffn_dim, 0);
 
         // Residual
         dispatchAdd(buf_hidden, buf_hidden2, n_patches * dim);
@@ -835,42 +927,50 @@ float *VulkanVisionEncoder::encode(const float *rgb_norm, int width, int height)
             // Spatial merge hidden -> merge_buf
             dispatchSpatialMerge(buf_hidden, buf_merge, gw, gh, dim, sm);
 
-            // fc1
-            auto buf_ds_tmp = createGpuBuffer(n_merged * merged_dim * sizeof(float));
-            dispatchMatmulBias(buf_merge, weight_bufs_[dn.fc1_w], buf_ds_tmp,
-                               weight_bufs_[dn.fc1_b],
-                               n_merged, merged_dim, merged_dim, true);
-
-            // LayerNorm on merged_dim
-            // Need to use buf_merge as temp, do LN in-place via src==dst different buffers
+            // LayerNorm on merge_buf (before fc1)
             auto buf_ds_ln = createGpuBuffer(n_merged * merged_dim * sizeof(float));
-            dispatchLayernorm(buf_ds_tmp, buf_ds_ln,
+            GVIT_PROF_BEGIN("ds_ln", l, "layernorm", "FP32");
+            dispatchLayernorm(buf_merge, buf_ds_ln,
                               weight_bufs_[dn.norm_w], weight_bufs_[dn.norm_b],
                               n_merged, merged_dim, ln_eps_);
+            GVIT_PROF_END("ds_ln", 5.0 * n_merged * merged_dim, 0);
+
+            // fc1
+            auto buf_ds_tmp = createGpuBuffer(n_merged * merged_dim * sizeof(float));
+            GVIT_PROF_BEGIN("ds_fc1", l, "matmul", "FP32");
+            dispatchMatmulBias(buf_ds_ln, weight_bufs_[dn.fc1_w], buf_ds_tmp,
+                               weight_bufs_[dn.fc1_b],
+                               n_merged, merged_dim, merged_dim, true);
+            GVIT_PROF_END("ds_fc1", 2.0 * n_merged * merged_dim * merged_dim, 0);
 
             // GELU
-            dispatchGelu(buf_ds_ln, n_merged * merged_dim);
+            GVIT_PROF_BEGIN("ds_gelu", l, "gelu", "FP32");
+            dispatchGelu(buf_ds_tmp, n_merged * merged_dim);
+            GVIT_PROF_END("ds_gelu", 8.0 * n_merged * merged_dim, 0);
 
             // fc2: [merged_dim -> proj_dim]
             auto buf_ds_out = createGpuBuffer(n_merged * proj_dim_ * sizeof(float));
-            dispatchMatmulBias(buf_ds_ln, weight_bufs_[dn.fc2_w], buf_ds_out,
+            GVIT_PROF_BEGIN("ds_fc2", l, "matmul", "FP32");
+            dispatchMatmulBias(buf_ds_tmp, weight_bufs_[dn.fc2_w], buf_ds_out,
                                weight_bufs_[dn.fc2_b],
                                n_merged, proj_dim_, merged_dim, true);
+            GVIT_PROF_END("ds_fc2", 2.0 * n_merged * proj_dim_ * merged_dim, 0);
 
-            // Accumulate
-            dispatchAdd(buf_ds_accum, buf_ds_out, n_merged * proj_dim_);
+            // Store deepstack feature (keep buffer alive for final concat)
+            buf_ds_feats.push_back(buf_ds_out);
 
             destroyGpuBuffer(buf_ds_tmp);
             destroyGpuBuffer(buf_ds_ln);
-            destroyGpuBuffer(buf_ds_out);
         }
     }
 
     // 4. Post LayerNorm
     std::cerr << "  post layernorm...\n";
+    GVIT_PROF_BEGIN("post_ln", -1, "layernorm", "FP32");
     dispatchLayernorm(buf_hidden, buf_hidden,
                       weight_bufs_["post_ln_w"], weight_bufs_["post_ln_b"],
                       n_patches, dim, ln_eps_);
+    GVIT_PROF_END("post_ln", 5.0 * n_patches * dim, 0);
 
     // 5. Spatial merge
     std::cerr << "  spatial merge...\n";
@@ -879,25 +979,52 @@ float *VulkanVisionEncoder::encode(const float *rgb_norm, int width, int height)
     // 6. MM projection
     std::cerr << "  mm projection...\n";
     auto buf_mm = createGpuBuffer(n_merged * merged_dim * sizeof(float));
+    GVIT_PROF_BEGIN("mm0", -1, "matmul", "FP32");
     dispatchMatmulBias(buf_merge, weight_bufs_["mm0_w"], buf_mm,
                        weight_bufs_["mm0_b"],
                        n_merged, merged_dim, merged_dim, true);
+    GVIT_PROF_END("mm0", 2.0 * n_merged * merged_dim * merged_dim, 0);
 
+    GVIT_PROF_BEGIN("mm_gelu", -1, "gelu", "FP32");
     dispatchGelu(buf_mm, n_merged * merged_dim);
+    GVIT_PROF_END("mm_gelu", 8.0 * n_merged * merged_dim, 0);
 
     auto buf_result = createGpuBuffer(n_merged * proj_dim_ * sizeof(float));
+    GVIT_PROF_BEGIN("mm2", -1, "matmul", "FP32");
     dispatchMatmulBias(buf_mm, weight_bufs_["mm2_w"], buf_result,
                        weight_bufs_["mm2_b"],
                        n_merged, proj_dim_, merged_dim, true);
+    GVIT_PROF_END("mm2", 2.0 * n_merged * proj_dim_ * merged_dim, 0);
 
-    // 7. Add deepstack accumulation
-    dispatchAdd(buf_result, buf_ds_accum, n_merged * proj_dim_);
+    // 7. Concat main embeddings + deepstack features per token
+    // Layout: [main_proj_dim, ds0_proj_dim, ds1_proj_dim, ...] for each token
+    int total_embd = proj_dim_ * (1 + (int)buf_ds_feats.size());
+    float *result = new float[n_merged * total_embd];
 
-    // Read back result
-    float *result = new float[n_merged * proj_dim_];
-    downloadFromBuffer(buf_result, result, n_merged * proj_dim_ * sizeof(float));
+    // Download main result
+    std::vector<float> main_result(n_merged * proj_dim_);
+    downloadFromBuffer(buf_result, main_result.data(), n_merged * proj_dim_ * sizeof(float));
 
-    std::cerr << "  vulkan vision encoding done: " << n_merged << " tokens of dim " << proj_dim_ << "\n";
+    // Download each deepstack feature
+    std::vector<std::vector<float>> ds_results(buf_ds_feats.size());
+    for (size_t d = 0; d < buf_ds_feats.size(); d++) {
+        ds_results[d].resize(n_merged * proj_dim_);
+        downloadFromBuffer(buf_ds_feats[d], ds_results[d].data(), n_merged * proj_dim_ * sizeof(float));
+    }
+
+    // Interleave: for each token, [main, ds0, ds1, ...]
+    for (int t = 0; t < n_merged; t++) {
+        float *dst = result + t * total_embd;
+        memcpy(dst, main_result.data() + t * proj_dim_, proj_dim_ * sizeof(float));
+        for (size_t d = 0; d < buf_ds_feats.size(); d++) {
+            memcpy(dst + (1 + d) * proj_dim_,
+                   ds_results[d].data() + t * proj_dim_,
+                   proj_dim_ * sizeof(float));
+        }
+    }
+
+    std::cerr << "  vulkan vision encoding done: " << n_merged << " tokens of dim " << total_embd
+              << " (main " << proj_dim_ << " + " << buf_ds_feats.size() << " deepstack)\n";
 
     // Cleanup temp buffers
     destroyGpuBuffer(buf_hidden);
@@ -908,13 +1035,14 @@ float *VulkanVisionEncoder::encode(const float *rgb_norm, int width, int height)
     destroyGpuBuffer(buf_ln);
     destroyGpuBuffer(buf_att);
     destroyGpuBuffer(buf_merge);
-    destroyGpuBuffer(buf_ds_accum);
+    for (auto &b : buf_ds_feats) destroyGpuBuffer(b);
     destroyGpuBuffer(buf_image);
     destroyGpuBuffer(buf_q_head);
     destroyGpuBuffer(buf_k_head);
     destroyGpuBuffer(buf_v_head);
     destroyGpuBuffer(buf_att_head_out);
     destroyGpuBuffer(buf_dummy_bias);
+    destroyGpuBuffer(buf_pos_ids);
     destroyGpuBuffer(buf_mm);
     destroyGpuBuffer(buf_result);
 
