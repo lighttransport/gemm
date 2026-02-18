@@ -68,6 +68,10 @@ VulkanLLMRunner::~VulkanLLMRunner() {
         runner_.destroyBuffer(buf_ffn_gate_);
         runner_.destroyBuffer(buf_ffn_up_);
         runner_.destroyBuffer(buf_logits_);
+        for (int d = 0; d < 3; d++) {
+            if (buf_ds_slices_[d].buffer != VK_NULL_HANDLE)
+                runner_.destroyBuffer(buf_ds_slices_[d]);
+        }
     }
 
     // Destroy KV cache
@@ -497,6 +501,12 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
             }
         }
     }
+    n_deepstack_ = llm_get_int(g, ARCH_KEY("n_deepstack_layers"), 0);
+    if (n_deepstack_ > 3) n_deepstack_ = 3;
+    if (n_deepstack_ > 0) {
+        std::cerr << "vulkan llm: n_deepstack=" << n_deepstack_ << "\n";
+    }
+
     #undef ARCH_KEY
 
     int kv_dim = n_kv_heads_ * head_dim_;
@@ -576,6 +586,9 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
     buf_ffn_gate_ = createGpuBuffer(n_ff_ * sizeof(float));
     buf_ffn_up_   = createGpuBuffer(n_ff_ * sizeof(float));
     buf_logits_   = createGpuBuffer(n_vocab_ * sizeof(float));
+    for (int d = 0; d < n_deepstack_; d++) {
+        buf_ds_slices_[d] = createGpuBuffer(n_embd_ * sizeof(float));
+    }
     scratch_created_ = true;
 
     // Create KV cache
@@ -621,7 +634,18 @@ float *VulkanLLMRunner::forward(int32_t token_id, int cache_pos, int pos_t, int 
 float *VulkanLLMRunner::forwardEmbd(const float *embd, int cache_pos, int pos_t, int pos_h, int pos_w,
                                      bool compute_logits) {
     uploadToBuffer(buf_x_, embd, n_embd_ * sizeof(float));
-    return forwardInternal(cache_pos, pos_t, pos_h, pos_w, compute_logits);
+    // Upload deepstack slices if stride indicates they're present
+    ds_active_ = false;
+    if (n_deepstack_ > 0 && ds_embd_stride_ > n_embd_) {
+        for (int d = 0; d < n_deepstack_; d++) {
+            const float *slice = embd + (1 + d) * n_embd_;
+            uploadToBuffer(buf_ds_slices_[d], slice, n_embd_ * sizeof(float));
+        }
+        ds_active_ = true;
+    }
+    float *result = forwardInternal(cache_pos, pos_t, pos_h, pos_w, compute_logits);
+    ds_active_ = false;
+    return result;
 }
 
 float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int pos_w,
@@ -719,6 +743,11 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
 
         // Residual: x += xb
         dispatchAdd(buf_x_, buf_xb_, n_embd_);
+
+        // DeepStack injection (Qwen3-VL): add deepstack slice after early layers
+        if (ds_active_ && l < n_deepstack_) {
+            dispatchAdd(buf_x_, buf_ds_slices_[l], n_embd_);
+        }
 
         if (l == 0 || l == n_layers_ - 1 || (l + 1) % 10 == 0) {
             // Download hidden state for debug norm
