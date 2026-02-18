@@ -1,0 +1,5 @@
+# Build artifacts (executables)
+bench
+bench_blis
+bench_ffn
+bench_flash
