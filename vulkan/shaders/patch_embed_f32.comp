@@ -35,15 +35,16 @@ void main() {
     uint px = pid % pc.gw;
 
     float sum = 0.0;
-    uint ki = 0;
-    for (uint dy = 0; dy < pc.patch_size; dy++) {
-        for (uint dx = 0; dx < pc.patch_size; dx++) {
-            uint img_y = py * pc.patch_size + dy;
-            uint img_x = px * pc.patch_size + dx;
-            uint pix_base = (img_y * pc.width + img_x) * 3;
-            for (uint c = 0; c < 3; c++) {
-                sum += image[pix_base + c] * kernel_w[d * pc.kernel_size + ki];
-                ki++;
+    // Kernel is stored in CHW order: [IC=3, KH=patch_size, KW=patch_size]
+    // so iterate c, dy, dx to match kernel indexing
+    for (uint c = 0; c < 3; c++) {
+        for (uint dy = 0; dy < pc.patch_size; dy++) {
+            for (uint dx = 0; dx < pc.patch_size; dx++) {
+                uint img_y = py * pc.patch_size + dy;
+                uint img_x = px * pc.patch_size + dx;
+                uint pix_idx = (img_y * pc.width + img_x) * 3 + c;
+                uint ki = c * pc.patch_size * pc.patch_size + dy * pc.patch_size + dx;
+                sum += image[pix_idx] * kernel_w[d * pc.kernel_size + ki];
             }
         }
     }

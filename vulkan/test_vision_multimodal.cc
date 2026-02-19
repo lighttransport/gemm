@@ -12,6 +12,7 @@
 #include <ctime>
 #include <vector>
 #include <string>
+#include <algorithm>
 
 #define PROFILER_IMPLEMENTATION
 extern "C" {
@@ -27,6 +28,41 @@ extern "C" {
 #include "vulkan_llm_runner.hh"
 #include "deps/stb_image.h"
 #include "deps/stb_image_resize2.h"
+
+static const char *gguf_get_kv_string(const gguf_context *g, const char *key) {
+    int idx = gguf_find_key(g, key);
+    if (idx < 0) return nullptr;
+    if (g->kv[idx].type != GGUF_TYPE_STRING) return nullptr;
+    return g->kv[idx].value.str.str;
+}
+
+static void build_multimodal_chat_prompt(const gguf_context *gguf_main,
+                                          const std::string &user_prompt,
+                                          std::string &text_before,
+                                          std::string &text_after) {
+    const char *tmpl = gguf_get_kv_string(gguf_main, "tokenizer.chat_template");
+    const bool has_chatml = tmpl &&
+                            strstr(tmpl, "<|im_start|>") &&
+                            strstr(tmpl, "<|im_end|>");
+    const bool has_vision = tmpl &&
+                            strstr(tmpl, "<|vision_start|>") &&
+                            strstr(tmpl, "<|vision_end|>");
+
+    if (has_chatml && has_vision) {
+        text_before = "<|im_start|>user\n<|vision_start|>";
+        text_after = "<|vision_end|>" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        fprintf(stderr, "Chat template: tokenizer.chat_template detected (chatml+vision)\n");
+        return;
+    }
+
+    text_before = "<|im_start|>user\n<|vision_start|>";
+    text_after = "<|vision_end|>" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    if (tmpl) {
+        fprintf(stderr, "Chat template: unsupported template format, using chatml fallback\n");
+    } else {
+        fprintf(stderr, "Chat template: missing tokenizer.chat_template, using chatml fallback\n");
+    }
+}
 
 // Generate a simple test pattern
 static uint8_t *generate_test_image(int width, int height, const char *pattern) {
@@ -319,9 +355,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  GPU vision embd[0] norm=%.4f\n", sqrtf(norm));
     }
 
-    // CPU vision encode for comparison
-    {
-        // Re-load image for CPU test (use same smart resize)
+    // CPU vision encode for comparison (disabled for performance — enable with --cpu-vision)
+    if (std::find(argv, argv + argc, std::string("--cpu-vision")) != argv + argc) {
         int channels;
         int cpu_w, cpu_h;
         uint8_t *img2 = stbi_load(image_path.c_str(), &cpu_w, &cpu_h, &channels, 3);
@@ -341,7 +376,6 @@ int main(int argc, char **argv) {
                 float norm = 0;
                 for (int j = 0; j < proj_dim; j++) norm += cpu_embd[j] * cpu_embd[j];
                 fprintf(stderr, "  CPU vision embd[0] norm=%.4f\n", sqrtf(norm));
-                // Compare (full embedding including deepstack features)
                 float max_diff = 0;
                 for (int j = 0; j < n_vision_tokens * embd_stride; j++) {
                     float d = fabsf(cpu_embd[j] - vision_embd[j]);
@@ -353,10 +387,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Build token sequence
-    // <|im_start|>user\n<|vision_start|>[vision]<|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n
-    std::string text_before = "<|im_start|>user\n<|vision_start|>";
-    std::string text_after = "<|vision_end|>" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    // Build token sequence from GGUF chat template when supported.
+    std::string text_before, text_after;
+    build_multimodal_chat_prompt(gguf_main, prompt, text_before, text_after);
 
     int32_t tokens_before[64], tokens_after[128];
     int n_before = bpe_tokenize(vocab, text_before.c_str(), -1, tokens_before, 64);
@@ -373,62 +406,172 @@ int main(int argc, char **argv) {
 
     // Prefill
     fprintf(stderr, "\n=== Prefill (%s LLM) ===\n", gpu_llm ? "GPU" : "CPU");
-    int pos = 0;
+    // Keep KV cache index separate from M-RoPE logical position progression.
+    int cache_pos = 0;
+    int rope_pos = 0;
     int n_vocab_actual = gpu_llm ? gpu_llm_runner->n_vocab() : model->n_vocab;
+    float *last_prefill_logits = nullptr;
 
-    // Text before vision: all 3 RoPE dims use the same position
-    for (int i = 0; i < n_before; i++) {
-        if (gpu_llm) {
-            gpu_llm_runner->forward(tokens_before[i], pos, pos, pos, pos, false);
-        } else {
-            transformer_forward_pos(model, tokens_before[i], pos, pos, pos, pos);
-        }
-        pos++;
-    }
-    fprintf(stderr, "  Text prefix: %d tokens done\n", n_before);
+    // Compute merged grid dimensions for M-RoPE vision positions
+    // (already computed above but needed for batch building)
 
-    // Vision tokens with M-RoPE 3D positions
-    // Set deepstack embedding stride so LLM injects deepstack slices at early layers
-    if (model) {
-        model->ds_embd_stride = embd_stride;
-    }
-    if (gpu_llm_runner) {
-        gpu_llm_runner->setDeepstackStride(embd_stride);
-    }
-    fprintf(stderr, "  Vision: %d tokens (merged grid %dx%d, M-RoPE, deepstack=%d)...\n",
-            n_vision_tokens, merged_w, merged_h, n_ds);
-    t0 = clock();
-    for (int i = 0; i < n_vision_tokens; i++) {
-        float *embd_i = vision_embd + i * embd_stride;
-        int mrope_h = i / merged_w;
-        int mrope_w = i % merged_w;
-        if (gpu_llm) {
-            gpu_llm_runner->forwardEmbd(embd_i, pos, 0, mrope_h, mrope_w, false);
-        } else {
-            transformer_forward_embd_pos(model, embd_i, pos, 0, mrope_h, mrope_w);
-        }
-        pos++;
-    }
-    t1 = clock();
-    fprintf(stderr, "  Vision prefill: %.1f s\n", (double)(t1 - t0) / CLOCKS_PER_SEC);
+    if (!gpu_llm && model) {
+        // === BATCHED CPU PREFILL ===
+        struct timespec wall_t0, wall_t1;
+        clock_gettime(CLOCK_MONOTONIC, &wall_t0);
+        t0 = clock();
+        int total_N = n_before + n_vision_tokens + n_after;
+        fprintf(stderr, "  Batched prefill: %d tokens total\n", total_N);
 
-    delete[] vision_embd;
+        // Allocate embedding buffer [total_N, embd_stride_or_n_embd]
+        int batch_embd_stride = (embd_stride > model->n_embd) ? embd_stride : model->n_embd;
+        float *all_embds = new float[(size_t)total_N * batch_embd_stride]();
+        int *all_cache_pos = new int[total_N];
+        int *all_pos_t = new int[total_N];
+        int *all_pos_h = new int[total_N];
+        int *all_pos_w = new int[total_N];
+        const float **all_ds_embds = new const float*[total_N]();
 
-    // Text after vision
-    for (int i = 0; i < n_after; i++) {
-        bool last = (i == n_after - 1);
-        if (gpu_llm) {
-            gpu_llm_runner->forward(tokens_after[i], pos, pos, pos, pos, last);
-        } else {
-            if (last) {
-                transformer_forward_logits_pos(model, tokens_after[i], pos, pos, pos, pos);
-            } else {
-                transformer_forward_pos(model, tokens_after[i], pos, pos, pos, pos);
+        int idx = 0;
+
+        // Text before: dequant token embeddings
+        for (int i = 0; i < n_before; i++) {
+            // Dequant token embedding: F16 = 2 bytes/elem
+            {
+                size_t rb = (size_t)model->n_embd * 2; // F16
+                const void *rd = (const uint8_t*)model->token_embd.data + (size_t)tokens_before[i] * rb;
+                dequant_row(model->token_embd.type, rd, all_embds + (size_t)idx * batch_embd_stride, model->n_embd);
             }
+            all_cache_pos[idx] = cache_pos;
+            all_pos_t[idx] = rope_pos;
+            all_pos_h[idx] = rope_pos;
+            all_pos_w[idx] = rope_pos;
+            all_ds_embds[idx] = nullptr;
+            cache_pos++; rope_pos++; idx++;
         }
-        pos++;
+
+        // Vision tokens with M-RoPE 3D positions
+        model->ds_embd_stride = embd_stride;
+        const int image_pos0 = rope_pos;
+        for (int i = 0; i < n_vision_tokens; i++) {
+            float *embd_i = vision_embd + (size_t)i * embd_stride;
+            // Copy full embedding (including deepstack) to batch buffer
+            memcpy(all_embds + (size_t)idx * batch_embd_stride, embd_i, model->n_embd * sizeof(float));
+            all_cache_pos[idx] = cache_pos;
+            int y = i / merged_w;
+            int x = i % merged_w;
+            all_pos_t[idx] = image_pos0;
+            all_pos_h[idx] = image_pos0 + y;
+            all_pos_w[idx] = image_pos0 + x;
+            // Point deepstack to the vision embedding (which has stride embd_stride)
+            all_ds_embds[idx] = (embd_stride > model->n_embd) ? embd_i : nullptr;
+            cache_pos++; idx++;
+        }
+        rope_pos += std::max(merged_w, merged_h);
+
+        // Text after
+        for (int i = 0; i < n_after; i++) {
+            // Dequant token embedding: F16 = 2 bytes/elem
+            {
+                size_t rb = (size_t)model->n_embd * 2; // F16
+                const void *rd = (const uint8_t*)model->token_embd.data + (size_t)tokens_after[i] * rb;
+                dequant_row(model->token_embd.type, rd, all_embds + (size_t)idx * batch_embd_stride, model->n_embd);
+            }
+            all_cache_pos[idx] = cache_pos;
+            all_pos_t[idx] = rope_pos;
+            all_pos_h[idx] = rope_pos;
+            all_pos_w[idx] = rope_pos;
+            all_ds_embds[idx] = nullptr;
+            cache_pos++; rope_pos++; idx++;
+        }
+
+        transformer_batch batch;
+        batch.embds = all_embds;
+        batch.N = total_N;
+        batch.embd_stride = batch_embd_stride;
+        batch.cache_pos = all_cache_pos;
+        batch.pos_t = all_pos_t;
+        batch.pos_h = all_pos_h;
+        batch.pos_w = all_pos_w;
+        batch.ds_embds = all_ds_embds;
+        batch.ds_embd_stride = embd_stride;
+
+        last_prefill_logits = transformer_forward_batch_logits(model, &batch);
+
+        delete[] all_embds;
+        delete[] all_cache_pos;
+        delete[] all_pos_t;
+        delete[] all_pos_h;
+        delete[] all_pos_w;
+        delete[] all_ds_embds;
+        delete[] vision_embd;
+
+        t1 = clock();
+        clock_gettime(CLOCK_MONOTONIC, &wall_t1);
+        double wall_s = (wall_t1.tv_sec - wall_t0.tv_sec) + (wall_t1.tv_nsec - wall_t0.tv_nsec) / 1e9;
+        fprintf(stderr, "  Batched prefill done: %.1f s wall (%.1f s CPU)\n", wall_s, (double)(t1 - t0) / CLOCKS_PER_SEC);
+    } else {
+        // === GPU or single-token CPU path (unchanged) ===
+        // Text before vision: all 3 RoPE dims use the same position
+        for (int i = 0; i < n_before; i++) {
+            if (gpu_llm) {
+                gpu_llm_runner->forward(tokens_before[i], cache_pos, rope_pos, rope_pos, rope_pos, false);
+            } else {
+                transformer_forward_pos(model, tokens_before[i], cache_pos, rope_pos, rope_pos, rope_pos);
+            }
+            cache_pos++;
+            rope_pos++;
+        }
+        fprintf(stderr, "  Text prefix: %d tokens done\n", n_before);
+
+        // Vision tokens with M-RoPE 3D positions
+        if (model) {
+            model->ds_embd_stride = embd_stride;
+        }
+        if (gpu_llm_runner) {
+            gpu_llm_runner->setDeepstackStride(embd_stride);
+        }
+        fprintf(stderr, "  Vision: %d tokens (merged grid %dx%d, M-RoPE, deepstack=%d)...\n",
+                n_vision_tokens, merged_w, merged_h, n_ds);
+        t0 = clock();
+        const int image_pos0 = rope_pos;
+        for (int i = 0; i < n_vision_tokens; i++) {
+            float *embd_i = vision_embd + i * embd_stride;
+            int y = i / merged_w;
+            int x = i % merged_w;
+            int mrope_t = image_pos0;
+            int mrope_h = image_pos0 + y;
+            int mrope_w = image_pos0 + x;
+            if (gpu_llm) {
+                gpu_llm_runner->forwardEmbd(embd_i, cache_pos, mrope_t, mrope_h, mrope_w, false);
+            } else {
+                transformer_forward_embd_pos(model, embd_i, cache_pos, mrope_t, mrope_h, mrope_w);
+            }
+            cache_pos++;
+        }
+        rope_pos += std::max(merged_w, merged_h);
+        t1 = clock();
+        fprintf(stderr, "  Vision prefill: %.1f s\n", (double)(t1 - t0) / CLOCKS_PER_SEC);
+
+        delete[] vision_embd;
+
+        // Text after vision
+        for (int i = 0; i < n_after; i++) {
+            bool last = (i == n_after - 1);
+            if (gpu_llm) {
+                last_prefill_logits = gpu_llm_runner->forward(tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos, last);
+            } else {
+                if (last) {
+                    last_prefill_logits = transformer_forward_logits_pos(model, tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos);
+                } else {
+                    transformer_forward_pos(model, tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos);
+                }
+            }
+            cache_pos++;
+            rope_pos++;
+        }
+        fprintf(stderr, "  Text suffix: %d tokens done\n", n_after);
     }
-    fprintf(stderr, "  Text suffix: %d tokens done\n", n_after);
 
     // Generation
     fprintf(stderr, "\n=== Generation (%s LLM) ===\n\n", gpu_llm ? "GPU" : "CPU");
@@ -437,22 +580,15 @@ int main(int argc, char **argv) {
     for (int g = 0; g < max_gen; g++) {
         float *logits;
         if (g == 0) {
-            if (gpu_llm) {
-                // Logits already computed in last prefill step
-                logits = gpu_llm_runner->forward(tokens_after[n_after - 1], pos - 1, pos - 1, pos - 1, pos - 1, true);
-                // Actually we already called forward for the last token above with compute_logits=true,
-                // so the logits are from that call. But we re-ran with same cache_pos which overwrites.
-                // This is fine since it's the same token at the same position.
-            } else {
-                logits = model->logits;
-            }
+            logits = last_prefill_logits;
         } else {
             if (gpu_llm) {
-                logits = gpu_llm_runner->forward(next_token, pos, true);
+                logits = gpu_llm_runner->forward(next_token, cache_pos, rope_pos, rope_pos, rope_pos, true);
             } else {
-                logits = transformer_forward_logits(model, next_token, pos);
+                logits = transformer_forward_logits_pos(model, next_token, cache_pos, rope_pos, rope_pos, rope_pos);
             }
-            pos++;
+            cache_pos++;
+            rope_pos++;
         }
         if (!logits) break;
 
@@ -476,7 +612,10 @@ int main(int argc, char **argv) {
             free(decoded);
         }
 
-        if (g == 0) pos++;
+        if (g == 0) {
+            cache_pos++;
+            rope_pos++;
+        }
     }
     printf("\n");
 

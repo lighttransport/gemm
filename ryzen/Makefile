@@ -1,11 +1,11 @@
 #
-# Makefile for AMD Zen2 GEMM Benchmark
+# Makefile for AMD Zen2 GEMM, Flash Attention & NN Ops Benchmark
 #
 # Usage:
-#   make              - Build with GCC (default)
-#   make COMPILER=gcc - Build with GCC
-#   make COMPILER=clang - Build with Clang
-#   make run          - Build and run benchmark
+#   make              - Build all benchmarks
+#   make gemm         - Build and run GEMM benchmark
+#   make flash        - Build and run Flash Attention benchmark
+#   make nn           - Build and run NN Ops benchmark (RMSNorm, LayerNorm, FFN)
 #   make clean        - Clean build artifacts
 #
 
@@ -42,59 +42,105 @@ ifdef PROFILE
     LDFLAGS += -pg
 endif
 
-# Source files
-GEMM_SRCS = gemm_avx2.c
-BENCH_SRCS = bench_gemm.c
-HEADERS = gemm_avx2.h
-
-# Object files
-GEMM_OBJS = $(GEMM_SRCS:.c=.o)
-BENCH_OBJS = $(BENCH_SRCS:.c=.o)
+# Headers
+GEMM_HEADERS = gemm_avx2.h
+FLASH_HEADERS = flash_attn_avx2.h
+NN_HEADERS = nn_ops_avx2.h
 
 # Targets
-BENCH_TARGET = bench_gemm
+BENCH_GEMM = bench_gemm
+BENCH_FLASH = bench_flash_attn
+BENCH_NN = bench_nn_ops
 
-.PHONY: all clean run disasm help
+.PHONY: all clean gemm flash nn run help disasm
 
-all: $(BENCH_TARGET)
+all: $(BENCH_GEMM) $(BENCH_FLASH) $(BENCH_NN)
 
-$(BENCH_TARGET): $(BENCH_OBJS) $(GEMM_OBJS)
+# GEMM benchmark
+$(BENCH_GEMM): bench_gemm.o gemm_avx2.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c $(HEADERS)
+bench_gemm.o: bench_gemm.c $(GEMM_HEADERS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-run: $(BENCH_TARGET)
-	./$(BENCH_TARGET)
+gemm_avx2.o: gemm_avx2.c $(GEMM_HEADERS)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Run with specific matrix size
-run-%: $(BENCH_TARGET)
-	./$(BENCH_TARGET) $*
+# Flash Attention benchmark
+$(BENCH_FLASH): bench_flash_attn.o flash_attn_avx2.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bench_flash_attn.o: bench_flash_attn.c $(FLASH_HEADERS)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+flash_attn_avx2.o: flash_attn_avx2.c $(FLASH_HEADERS)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# NN Ops benchmark (RMSNorm, LayerNorm, FFN, Activations)
+$(BENCH_NN): bench_nn_ops.o nn_ops_avx2.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bench_nn_ops.o: bench_nn_ops.c $(NN_HEADERS)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+nn_ops_avx2.o: nn_ops_avx2.c $(NN_HEADERS)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Run targets
+gemm: $(BENCH_GEMM)
+	./$(BENCH_GEMM)
+
+flash: $(BENCH_FLASH)
+	./$(BENCH_FLASH)
+
+nn: $(BENCH_NN)
+	./$(BENCH_NN)
+
+run: gemm
+
+# Run GEMM with specific matrix size
+run-%: $(BENCH_GEMM)
+	./$(BENCH_GEMM) $*
 
 # Generate disassembly for analysis
-disasm: $(BENCH_TARGET)
-	objdump -d -M intel $(BENCH_TARGET) > $(BENCH_TARGET).asm
-	@echo "Disassembly saved to $(BENCH_TARGET).asm"
-	@echo "Look for sgemm_kernel_6x16 function"
+disasm: $(BENCH_GEMM) $(BENCH_FLASH) $(BENCH_NN)
+	objdump -d -M intel $(BENCH_GEMM) > $(BENCH_GEMM).asm
+	objdump -d -M intel $(BENCH_FLASH) > $(BENCH_FLASH).asm
+	objdump -d -M intel $(BENCH_NN) > $(BENCH_NN).asm
+	@echo "Disassembly saved to *.asm files"
 
-# Show just the kernel disassembly
-kernel-asm: $(BENCH_TARGET)
-	objdump -d -M intel $(BENCH_TARGET) | \
+# Show GEMM kernel disassembly
+gemm-asm: $(BENCH_GEMM)
+	objdump -d -M intel $(BENCH_GEMM) | \
 		sed -n '/^[0-9a-f]* <sgemm_kernel_6x16>:/,/^[0-9a-f]* </p' | head -300
 
+# Show Flash Attention kernel disassembly
+flash-asm: $(BENCH_FLASH)
+	objdump -d -M intel $(BENCH_FLASH) | \
+		sed -n '/^[0-9a-f]* <exp256_ps>:/,/^[0-9a-f]* </p' | head -100
+
+# Show RMSNorm disassembly
+nn-asm: $(BENCH_NN)
+	objdump -d -M intel $(BENCH_NN) | \
+		sed -n '/^[0-9a-f]* <rmsnorm_f32_avx2>:/,/^[0-9a-f]* </p' | head -200
+
 clean:
-	rm -f $(GEMM_OBJS) $(BENCH_OBJS) $(BENCH_TARGET) $(BENCH_TARGET).asm
-	rm -f *.o *.asm
+	rm -f *.o $(BENCH_GEMM) $(BENCH_FLASH) $(BENCH_NN) *.asm
 
 help:
-	@echo "AMD Zen2 GEMM Benchmark Makefile"
+	@echo "AMD Zen2 Benchmark Makefile"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all (default)  - Build benchmark executable"
-	@echo "  run            - Build and run with default sizes"
-	@echo "  run-<N>        - Run with NxNxN matrix (e.g., make run-1024)"
-	@echo "  disasm         - Generate full disassembly"
-	@echo "  kernel-asm     - Show micro-kernel disassembly"
+	@echo "  all (default)  - Build all benchmarks"
+	@echo "  gemm           - Build and run GEMM benchmark"
+	@echo "  flash          - Build and run Flash Attention benchmark"
+	@echo "  nn             - Build and run NN Ops (RMSNorm, LayerNorm, FFN)"
+	@echo "  run            - Same as 'gemm'"
+	@echo "  run-<N>        - GEMM with NxNxN matrix (e.g., make run-1024)"
+	@echo "  disasm         - Generate disassembly for all"
+	@echo "  gemm-asm       - Show GEMM micro-kernel assembly"
+	@echo "  flash-asm      - Show exp256 kernel assembly"
+	@echo "  nn-asm         - Show RMSNorm assembly"
 	@echo "  clean          - Remove build artifacts"
 	@echo "  help           - Show this help"
 	@echo ""
@@ -105,8 +151,8 @@ help:
 	@echo "  PROFILE=1      - Build with profiling support"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make                      # Build with GCC"
-	@echo "  make COMPILER=clang       # Build with Clang"
-	@echo "  make run                  # Run benchmark"
-	@echo "  make run-2048             # Benchmark 2048x2048x2048"
-	@echo "  make DEBUG=1              # Debug build"
+	@echo "  make                      # Build all"
+	@echo "  make gemm                 # Run GEMM benchmark"
+	@echo "  make flash                # Run Flash Attention benchmark"
+	@echo "  make nn                   # Run NN Ops benchmark"
+	@echo "  make COMPILER=clang nn    # NN Ops with Clang"

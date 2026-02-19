@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Add position embeddings (transposed access)
-// pos_emb is [dim, orig_n] row-major: pos_emb[d * orig_n + orig_p]
-// hidden[p * dim + d] += pos_emb[d * orig_n + orig_p]
+// Add position embeddings
+// pos_emb GGUF dims=[dim, n_patches] means dim is contiguous:
+// layout is [n_patches, dim] row-major: pos_emb[orig_p * dim + d]
 // where orig_p = py * orig_gw + px, and (py, px) = patch coords
 #version 450
 
@@ -30,5 +30,5 @@ void main() {
     uint px = p % pc.gw;
     uint orig_p = py * pc.orig_gw + px;
 
-    hidden[p * pc.dim + d] += pos_emb[d * pc.orig_n + orig_p];
+    hidden[p * pc.dim + d] += pos_emb[orig_p * pc.dim + d];
 }
