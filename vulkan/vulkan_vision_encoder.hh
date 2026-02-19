@@ -91,6 +91,7 @@ private:
     Pipeline pipe_spatial_merge_;
     Pipeline pipe_attn_naive_;
     Pipeline pipe_attn_flash_;
+    Pipeline pipe_rope_vision_;
     bool pipelines_created_ = false;
 
     // Weight buffers on GPU (name -> buffer)
@@ -143,6 +144,10 @@ private:
     bool dispatchAttnFlash(const BufInfo &qkv, BufInfo &out,
                            uint32_t n_patches, uint32_t dim,
                            uint32_t n_heads, uint32_t head_dim, float scale);
+    bool dispatchRopeVision(BufInfo &qkv, const BufInfo &pos_ids,
+                            uint32_t n_patches, uint32_t dim,
+                            uint32_t n_heads, uint32_t head_dim,
+                            uint32_t sect_size, float freq_base);
 
     // Buffer creation helper
     BufInfo createGpuBuffer(size_t size);

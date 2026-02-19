@@ -16,16 +16,8 @@
 extern "C" {
 #include "../common/gguf_loader.h"
 #include "../common/ggml_dequant.h"
+#include "../common/transformer.h"
 }
-
-#ifndef TRANSFORMER_H
-typedef struct {
-    void    *data;
-    uint32_t type;
-    int      n_rows;
-    int      n_cols;
-} qtensor;
-#endif
 
 class VulkanLLMRunner {
 public:
@@ -54,7 +46,10 @@ public:
     }
 
     // Set deepstack embedding stride (call before vision token forwardEmbd calls)
-    void setDeepstackStride(int stride) { ds_embd_stride_ = stride; }
+    void setDeepstackStride(int stride) {
+        ds_embd_stride_ = stride;
+        if (cpu_model_) cpu_model_->ds_embd_stride = stride;
+    }
 
     std::string getLastError() const { return last_error_; }
     std::string getDeviceName() const;
@@ -75,6 +70,8 @@ private:
     Runner runner_;
     bool initialized_ = false;
     bool weights_loaded_ = false;
+    bool cpu_fallback_moe_ = false;
+    transformer_model *cpu_model_ = nullptr;
     std::string last_error_;
     std::string shader_dir_;
 
@@ -85,6 +82,10 @@ private:
     int n_kv_heads_ = 0;
     int head_dim_ = 0;
     int n_ff_ = 0;
+    int n_ff_expert_ = 0;
+    int n_expert_ = 0;
+    int n_expert_used_ = 0;
+    bool use_moe_ = false;
     int n_vocab_ = 0;
     int max_seq_len_ = 0;
     float rope_freq_base_ = 5000000.0f;
@@ -117,6 +118,7 @@ private:
         std::string attn_q_norm, attn_k_norm;
         std::string attn_output;
         std::string ffn_norm, ffn_gate, ffn_up, ffn_down;
+        std::string ffn_gate_inp, ffn_up_exps, ffn_gate_exps, ffn_down_exps;
     };
     std::vector<LayerWeightNames> layer_names_;
 
@@ -129,6 +131,7 @@ private:
     BufInfo buf_v_;        // [kv_dim]
     BufInfo buf_ffn_gate_; // [n_ff]
     BufInfo buf_ffn_up_;   // [n_ff]
+    BufInfo buf_moe_router_; // [n_expert]
     BufInfo buf_logits_;   // [n_vocab]
     bool scratch_created_ = false;
 
@@ -139,6 +142,9 @@ private:
     // CPU-side logits for download
     std::vector<float> logits_cpu_;
     std::vector<float> hidden_cpu_;
+    std::vector<float> moe_router_cpu_;
+    std::vector<float> moe_accum_cpu_;
+    std::vector<float> moe_tmp_cpu_;
 
     // Helper: dequantize and upload tensor
     bool uploadTensor(const std::string &name, const qtensor &t);
@@ -157,7 +163,7 @@ private:
     bool dispatchRmsNorm(const BufInfo &src, BufInfo &dst, const BufInfo &weight,
                          uint32_t n_tokens, uint32_t dim, float eps);
     bool dispatchMatvec(const BufInfo &x, const BufInfo &W, BufInfo &dst,
-                        uint32_t N, uint32_t K);
+                        uint32_t N, uint32_t K, uint32_t row_offset = 0);
     bool dispatchSiluMul(BufInfo &gate, const BufInfo &up, uint32_t n);
     bool dispatchRopeNeox(BufInfo &vec, uint32_t n_heads, uint32_t head_dim,
                           int position, float freq_base);
