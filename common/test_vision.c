@@ -29,6 +29,41 @@
 #include <math.h>
 #include <time.h>
 
+static const char *gguf_get_kv_string(const gguf_context *g, const char *key) {
+    int idx = gguf_find_key(g, key);
+    if (idx < 0) return NULL;
+    if (g->kv[idx].type != GGUF_TYPE_STRING) return NULL;
+    return g->kv[idx].value.str.str;
+}
+
+static void build_multimodal_chat_prompt(const gguf_context *gguf_main,
+                                         const char *user_prompt,
+                                         char *text_before, size_t text_before_cap,
+                                         char *text_after, size_t text_after_cap) {
+    const char *tmpl = gguf_get_kv_string(gguf_main, "tokenizer.chat_template");
+    int has_chatml = tmpl &&
+                     strstr(tmpl, "<|im_start|>") &&
+                     strstr(tmpl, "<|im_end|>");
+    int has_vision = tmpl &&
+                     strstr(tmpl, "<|vision_start|>") &&
+                     strstr(tmpl, "<|vision_end|>");
+
+    if (has_chatml && has_vision) {
+        snprintf(text_before, text_before_cap, "<|im_start|>user\n<|vision_start|>");
+        snprintf(text_after, text_after_cap, "<|vision_end|>%s<|im_end|>\n<|im_start|>assistant\n", user_prompt);
+        fprintf(stderr, "Chat template: tokenizer.chat_template detected (chatml+vision)\n");
+        return;
+    }
+
+    snprintf(text_before, text_before_cap, "<|im_start|>user\n<|vision_start|>");
+    snprintf(text_after, text_after_cap, "<|vision_end|>%s<|im_end|>\n<|im_start|>assistant\n", user_prompt);
+    if (tmpl) {
+        fprintf(stderr, "Chat template: unsupported template format, using chatml fallback\n");
+    } else {
+        fprintf(stderr, "Chat template: missing tokenizer.chat_template, using chatml fallback\n");
+    }
+}
+
 /* Generate a checkerboard pattern as uint8 RGB [h][w][3] */
 static uint8_t *generate_checkerboard(int width, int height, int cell_size) {
     uint8_t *img = (uint8_t *)malloc(width * height * 3);
@@ -121,10 +156,11 @@ int main(int argc, char **argv) {
     }
 
     /* ---- Build token sequence ---- */
-    /* Format: <|im_start|>user\n<|vision_start|>[576 vision tokens]<|vision_end|>Explain the image<|im_end|>\n<|im_start|>assistant\n */
-
-    const char *text_before = "<|im_start|>user\n<|vision_start|>";
-    const char *text_after  = "<|vision_end|>Explain the image<|im_end|>\n<|im_start|>assistant\n";
+    char text_before[256];
+    char text_after[512];
+    build_multimodal_chat_prompt(gguf_main, "Explain the image",
+                                 text_before, sizeof(text_before),
+                                 text_after, sizeof(text_after));
 
     int32_t tokens_before[64], tokens_after[64];
     int n_before = bpe_tokenize(vocab, text_before, -1, tokens_before, 64);

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <cstdlib>
 
 extern "C" {
 #include "../common/profiler.h"
@@ -51,6 +52,11 @@ static std::vector<VkDescriptorSetLayoutBinding> makeBindings(int count) {
 VulkanLLMRunner::VulkanLLMRunner() {}
 
 VulkanLLMRunner::~VulkanLLMRunner() {
+    if (cpu_model_) {
+        transformer_free(cpu_model_);
+        cpu_model_ = nullptr;
+    }
+
     // Destroy weight buffers
     for (auto &kv : weight_bufs_) {
         runner_.destroyBuffer(kv.second);
@@ -67,6 +73,7 @@ VulkanLLMRunner::~VulkanLLMRunner() {
         runner_.destroyBuffer(buf_v_);
         runner_.destroyBuffer(buf_ffn_gate_);
         runner_.destroyBuffer(buf_ffn_up_);
+        runner_.destroyBuffer(buf_moe_router_);
         runner_.destroyBuffer(buf_logits_);
         for (int d = 0; d < 3; d++) {
             if (buf_ds_slices_[d].buffer != VK_NULL_HANDLE)
@@ -173,8 +180,11 @@ std::vector<float> VulkanLLMRunner::dequantFull(const qtensor &t) {
 
     int block_size = 1, type_size = 4;
     switch (t.type) {
+        case GGML_TYPE_Q2_K: block_size = 256; type_size = 84;  break;
+        case GGML_TYPE_Q3_K: block_size = 256; type_size = 110; break;
         case GGML_TYPE_Q8_0: block_size = 32;  type_size = 34;  break;
         case GGML_TYPE_Q4_K: block_size = 256; type_size = 144; break;
+        case GGML_TYPE_Q5_K: block_size = 256; type_size = 176; break;
         case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
         case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
         case GGML_TYPE_F16:  block_size = 1;   type_size = 2;   break;
@@ -223,11 +233,11 @@ bool VulkanLLMRunner::createPipelines() {
         if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 12, pipe_rmsnorm_))
             return false;
     }
-    // matvec_f32: 3 buffers, push {N, K} = 8 bytes
+    // matvec_f32: 3 buffers, push {N, K, row0} = 12 bytes
     {
         auto spirv = load("matvec_f32");
         if (spirv.empty()) return false;
-        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 8, pipe_matvec_))
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 12, pipe_matvec_))
             return false;
     }
     // silu_mul_f32: 2 buffers, push {n} = 4 bytes
@@ -301,10 +311,10 @@ bool VulkanLLMRunner::dispatchRmsNorm(const BufInfo &src, BufInfo &dst, const Bu
 }
 
 bool VulkanLLMRunner::dispatchMatvec(const BufInfo &x, const BufInfo &W, BufInfo &dst,
-                                      uint32_t N, uint32_t K) {
+                                      uint32_t N, uint32_t K, uint32_t row_offset) {
     std::vector<BufInfo> bufs = {x, W, dst};
     runner_.updateDescriptorSet(pipe_matvec_, bufs);
-    struct { uint32_t N, K; } pc = {N, K};
+    struct { uint32_t N, K, row0; } pc = {N, K, row_offset};
     runner_.beginRecording();
     runner_.bindComputePipeline(pipe_matvec_);
     runner_.bindDescriptorSets(pipe_matvec_);
@@ -452,8 +462,25 @@ static qtensor llm_load_qt(const gguf_context *g, const char *name) {
     t.data = gguf_tensor_data(g, idx);
     t.type = g->tensors[idx].type;
     t.n_cols = (int)g->tensors[idx].dims[0];
-    t.n_rows = (g->tensors[idx].n_dims >= 2) ? (int)g->tensors[idx].dims[1] : 1;
+    t.n_rows = 1;
+    for (uint32_t d = 1; d < g->tensors[idx].n_dims; d++) {
+        t.n_rows *= (int)g->tensors[idx].dims[d];
+    }
     return t;
+}
+
+static void llm_softmax(float *x, int n) {
+    if (!x || n <= 0) return;
+    float vmax = x[0];
+    for (int i = 1; i < n; i++) vmax = std::max(vmax, x[i]);
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        x[i] = expf(x[i] - vmax);
+        sum += x[i];
+    }
+    if (sum <= 0.0f) return;
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
 bool VulkanLLMRunner::loadWeights(gguf_context *g) {
@@ -461,11 +488,26 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
         last_error_ = "Not initialized";
         return false;
     }
+    if (cpu_model_) {
+        transformer_free(cpu_model_);
+        cpu_model_ = nullptr;
+    }
+    cpu_fallback_moe_ = false;
 
     // Detect architecture
     const char *arch = "qwen2";
-    if (gguf_find_key(g, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
-    else if (gguf_find_key(g, "qwen3.block_count") >= 0) arch = "qwen3";
+    bool is_moe_arch = false;
+    if (gguf_find_key(g, "qwen3vlmoe.block_count") >= 0) {
+        arch = "qwen3vlmoe";
+        is_moe_arch = true;
+    } else if (gguf_find_key(g, "qwen3moe.block_count") >= 0) {
+        arch = "qwen3moe";
+        is_moe_arch = true;
+    } else if (gguf_find_key(g, "qwen3vl.block_count") >= 0) {
+        arch = "qwen3vl";
+    } else if (gguf_find_key(g, "qwen3.block_count") >= 0) {
+        arch = "qwen3";
+    }
 
     char kbuf[128];
     #define ARCH_KEY(suffix) (snprintf(kbuf, sizeof(kbuf), "%s." suffix, arch), kbuf)
@@ -475,11 +517,39 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
     n_kv_heads_  = llm_get_int(g, ARCH_KEY("attention.head_count_kv"), 8);
     n_layers_    = llm_get_int(g, ARCH_KEY("block_count"), 36);
     n_ff_        = llm_get_int(g, ARCH_KEY("feed_forward_length"), 12288);
+    n_expert_    = llm_get_int(g, ARCH_KEY("expert_count"), 0);
+    n_expert_used_ = llm_get_int(g, ARCH_KEY("expert_used_count"), 0);
+    n_ff_expert_ = llm_get_int(g, ARCH_KEY("expert_feed_forward_length"), 0);
+    use_moe_ = (n_expert_ > 0);
     n_vocab_     = llm_get_int(g, ARCH_KEY("vocab_size"), 0);
     rms_norm_eps_ = llm_get_float(g, ARCH_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
     rope_freq_base_ = llm_get_float(g, ARCH_KEY("rope.freq_base"), 5000000.0f);
-    head_dim_    = n_embd_ / n_heads_;
-    max_seq_len_ = 1024; // default, can be made configurable
+    head_dim_    = llm_get_int(g, ARCH_KEY("attention.key_length"), n_embd_ / n_heads_);
+    int model_ctx_len = llm_get_int(g, ARCH_KEY("context_length"), 0);
+    int requested_ctx = 0;
+    if (const char *env_ctx = std::getenv("GEMM_MAX_SEQ_LEN")) {
+        requested_ctx = std::atoi(env_ctx);
+    }
+    const int default_ctx = 4096;
+    if (requested_ctx > 0) {
+        max_seq_len_ = requested_ctx;
+    } else if (model_ctx_len > 0) {
+        max_seq_len_ = std::min(model_ctx_len, default_ctx);
+    } else {
+        max_seq_len_ = default_ctx;
+    }
+    if (model_ctx_len > 0 && max_seq_len_ > model_ctx_len) {
+        max_seq_len_ = model_ctx_len;
+    }
+    if (max_seq_len_ <= 0) {
+        last_error_ = "Invalid context length resolved from GGUF/env";
+        return false;
+    }
+    if (model_ctx_len > 0 && max_seq_len_ < model_ctx_len) {
+        std::cerr << "vulkan llm: runtime context capped to " << max_seq_len_
+                  << " (model supports " << model_ctx_len
+                  << "). Set GEMM_MAX_SEQ_LEN to override.\n";
+    }
 
     // M-RoPE sections
     use_mrope_ = 0;
@@ -509,11 +579,66 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
 
     #undef ARCH_KEY
 
+    if (use_moe_) {
+        if (n_expert_used_ <= 0 || n_expert_used_ > n_expert_) {
+            last_error_ = "Invalid expert_used_count in GGUF";
+            return false;
+        }
+        if (n_ff_expert_ <= 0) {
+            last_error_ = "Invalid expert_feed_forward_length in GGUF";
+            return false;
+        }
+    } else {
+        n_expert_used_ = 0;
+        n_ff_expert_ = 0;
+    }
+
     int kv_dim = n_kv_heads_ * head_dim_;
 
     std::cerr << "vulkan llm: arch=" << arch << " n_embd=" << n_embd_ << " n_heads=" << n_heads_
               << " n_kv_heads=" << n_kv_heads_ << " n_layers=" << n_layers_ << " n_ff=" << n_ff_
-              << " head_dim=" << head_dim_ << " n_vocab=" << n_vocab_ << "\n";
+              << " head_dim=" << head_dim_ << " n_vocab=" << n_vocab_;
+    if (use_moe_) {
+        std::cerr << " n_expert=" << n_expert_ << " n_expert_used=" << n_expert_used_
+                  << " n_ff_expert=" << n_ff_expert_;
+    }
+    std::cerr << "\n";
+
+    if (is_moe_arch && !use_moe_) {
+        last_error_ = std::string("Architecture '") + arch + "' detected but MoE metadata is incomplete";
+        return false;
+    }
+
+    if (use_moe_) {
+        const char *moe_cpu_fallback = std::getenv("GEMM_MOE_CPU_FALLBACK");
+        if (!(moe_cpu_fallback && std::atoi(moe_cpu_fallback) != 0)) {
+            std::cerr << "vulkan llm: MoE GPU path enabled\n";
+        } else {
+            std::cerr << "vulkan llm: MoE architecture detected; enabling CPU fallback path\n";
+            const int fallback_ctx = std::min(max_seq_len_, 1024);
+            cpu_model_ = transformer_load(g, fallback_ctx);
+            if (!cpu_model_) {
+                last_error_ = "Failed to initialize CPU fallback model for MoE architecture";
+                return false;
+            }
+            cpu_model_->ds_embd_stride = ds_embd_stride_;
+            n_layers_ = cpu_model_->n_layers;
+            n_embd_ = cpu_model_->n_embd;
+            n_heads_ = cpu_model_->n_heads;
+            n_kv_heads_ = cpu_model_->n_kv_heads;
+            head_dim_ = cpu_model_->head_dim;
+            n_ff_ = cpu_model_->n_ff;
+            n_vocab_ = cpu_model_->n_vocab;
+            max_seq_len_ = cpu_model_->max_seq_len;
+            cpu_fallback_moe_ = true;
+            weights_loaded_ = true;
+            return true;
+        }
+    }
+    if (is_moe_arch && use_moe_ && n_ff_ <= 0) {
+        // MoE models may omit dense feed_forward_length; avoid accidental zero-sized buffers.
+        n_ff_ = n_ff_expert_;
+    }
 
     // Create pipelines
     shader_dir_ = ".";
@@ -523,27 +648,47 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
     std::cerr << "vulkan llm: uploading token_embd...\n";
     {
         qtensor t = llm_load_qt(g, "token_embd.weight");
-        if (t.data) {
-            if (n_vocab_ == 0) n_vocab_ = t.n_rows;
-            uploadTensor("token_embd", t);
+        if (!t.data) {
+            last_error_ = "Missing required tensor token_embd.weight";
+            return false;
+        }
+        if (n_vocab_ == 0) n_vocab_ = t.n_rows;
+        if (!uploadTensor("token_embd", t)) {
+            last_error_ = "Failed to upload required tensor token_embd.weight";
+            return false;
         }
     }
     {
         qtensor t = llm_load_qt(g, "output_norm.weight");
-        if (t.data) uploadTensor("output_norm", t);
+        if (!t.data) {
+            last_error_ = "Missing required tensor output_norm.weight";
+            return false;
+        }
+        if (!uploadTensor("output_norm", t)) {
+            last_error_ = "Failed to upload required tensor output_norm.weight";
+            return false;
+        }
     }
     {
         qtensor t = llm_load_qt(g, "output.weight");
         if (t.data) {
-            uploadTensor("output", t);
+            if (!uploadTensor("output", t)) {
+                last_error_ = "Failed to upload tensor output.weight";
+                return false;
+            }
         } else {
             // Weight tying: output shares token_embd
             std::cerr << "vulkan llm: weight-tied output (using token_embd)\n";
         }
     }
+    if (n_vocab_ <= 0) {
+        last_error_ = "Invalid vocabulary size";
+        return false;
+    }
 
     // Per-layer tensors
     layer_names_.resize(n_layers_);
+    bool missing_required = false;
     for (int l = 0; l < n_layers_; l++) {
         char name[128];
         auto &ln = layer_names_[l];
@@ -553,9 +698,51 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
             key = name;
             qtensor t = llm_load_qt(g, name);
             if (t.data) {
-                uploadTensor(key, t);
+                if (!uploadTensor(key, t) && required) {
+                    if (!missing_required) {
+                        last_error_ = std::string("Failed to upload required tensor ") + name;
+                    }
+                    missing_required = true;
+                }
             } else if (required) {
-                std::cerr << "vulkan llm: warning: missing " << name << "\n";
+                std::cerr << "vulkan llm: missing required " << name << "\n";
+                if (!missing_required) {
+                    last_error_ = std::string("Missing required tensor ") + name;
+                }
+                missing_required = true;
+            }
+        };
+
+        auto check_dims = [&](const char *suffix, int n_dims_min,
+                              int64_t d0, int64_t d1, int64_t d2) {
+            snprintf(name, sizeof(name), "blk.%d.%s.weight", l, suffix);
+            int tidx = llm_find_tensor(g, name);
+            if (tidx < 0) return;
+            const gguf_tensor_info &ti = g->tensors[tidx];
+            if ((int)ti.n_dims < n_dims_min) {
+                if (!missing_required) {
+                    last_error_ = std::string("Unexpected tensor rank for ") + name;
+                }
+                missing_required = true;
+                return;
+            }
+            if (d0 >= 0 && (int64_t)ti.dims[0] != d0) {
+                if (!missing_required) {
+                    last_error_ = std::string("Unexpected dim[0] for ") + name;
+                }
+                missing_required = true;
+            }
+            if (d1 >= 0 && (int64_t)ti.dims[1] != d1) {
+                if (!missing_required) {
+                    last_error_ = std::string("Unexpected dim[1] for ") + name;
+                }
+                missing_required = true;
+            }
+            if (d2 >= 0 && (int64_t)ti.dims[2] != d2) {
+                if (!missing_required) {
+                    last_error_ = std::string("Unexpected dim[2] for ") + name;
+                }
+                missing_required = true;
             }
         };
 
@@ -567,24 +754,51 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
         upload_blk("attn_k_norm", ln.attn_k_norm, false);
         upload_blk("attn_output", ln.attn_output, true);
         upload_blk("ffn_norm",    ln.ffn_norm, true);
-        upload_blk("ffn_gate",    ln.ffn_gate, true);
-        upload_blk("ffn_up",      ln.ffn_up, true);
-        upload_blk("ffn_down",    ln.ffn_down, true);
+        if (use_moe_) {
+            upload_blk("ffn_gate_inp",  ln.ffn_gate_inp, true);
+            upload_blk("ffn_up_exps",   ln.ffn_up_exps, true);
+            upload_blk("ffn_gate_exps", ln.ffn_gate_exps, true);
+            upload_blk("ffn_down_exps", ln.ffn_down_exps, true);
+            check_dims("ffn_gate_inp", 2, n_embd_, n_expert_, -1);
+            check_dims("ffn_up_exps", 3, n_embd_, n_ff_expert_, n_expert_);
+            check_dims("ffn_gate_exps", 3, n_embd_, n_ff_expert_, n_expert_);
+            check_dims("ffn_down_exps", 3, n_ff_expert_, n_embd_, n_expert_);
+
+            // Keep dense tensors optional in MoE models.
+            upload_blk("ffn_gate",    ln.ffn_gate, false);
+            upload_blk("ffn_up",      ln.ffn_up, false);
+            upload_blk("ffn_down",    ln.ffn_down, false);
+        } else {
+            upload_blk("ffn_gate",    ln.ffn_gate, true);
+            upload_blk("ffn_up",      ln.ffn_up, true);
+            upload_blk("ffn_down",    ln.ffn_down, true);
+        }
 
         if (l == 0 || (l + 1) % 7 == 0 || l == n_layers_ - 1) {
             std::cerr << "  uploaded layer " << l << "/" << n_layers_ << "\n";
         }
     }
+    if (missing_required) {
+        return false;
+    }
 
     // Create scratch buffers
+    int ffn_work = n_ff_;
+    if (use_moe_ && n_ff_expert_ > ffn_work) ffn_work = n_ff_expert_;
+    if (ffn_work <= 0) ffn_work = 1;
+    int moe_router = use_moe_ ? n_expert_ : 1;
+    if (moe_router <= 0) moe_router = 1;
+
+    int q_dim = n_heads_ * head_dim_;
     buf_x_        = createGpuBuffer(n_embd_ * sizeof(float));
     buf_xb_       = createGpuBuffer(n_embd_ * sizeof(float));
-    buf_xb2_      = createGpuBuffer(n_embd_ * sizeof(float));
-    buf_q_        = createGpuBuffer(n_embd_ * sizeof(float));
+    buf_xb2_      = createGpuBuffer(q_dim * sizeof(float));
+    buf_q_        = createGpuBuffer(q_dim * sizeof(float));
     buf_k_        = createGpuBuffer(kv_dim * sizeof(float));
     buf_v_        = createGpuBuffer(kv_dim * sizeof(float));
-    buf_ffn_gate_ = createGpuBuffer(n_ff_ * sizeof(float));
-    buf_ffn_up_   = createGpuBuffer(n_ff_ * sizeof(float));
+    buf_ffn_gate_ = createGpuBuffer((size_t)ffn_work * sizeof(float));
+    buf_ffn_up_   = createGpuBuffer((size_t)ffn_work * sizeof(float));
+    buf_moe_router_ = createGpuBuffer((size_t)moe_router * sizeof(float));
     buf_logits_   = createGpuBuffer(n_vocab_ * sizeof(float));
     for (int d = 0; d < n_deepstack_; d++) {
         buf_ds_slices_[d] = createGpuBuffer(n_embd_ * sizeof(float));
@@ -607,6 +821,9 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
 
     logits_cpu_.resize(n_vocab_);
     hidden_cpu_.resize(n_embd_);
+    moe_router_cpu_.resize((size_t)moe_router);
+    moe_accum_cpu_.resize((size_t)n_embd_);
+    moe_tmp_cpu_.resize((size_t)n_embd_);
 
     weights_loaded_ = true;
     std::cerr << "vulkan llm: all weights uploaded to GPU\n";
@@ -617,6 +834,31 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
 
 float *VulkanLLMRunner::forward(int32_t token_id, int cache_pos, int pos_t, int pos_h, int pos_w,
                                  bool compute_logits) {
+    if (cpu_fallback_moe_) {
+        if (!cpu_model_) {
+            last_error_ = "CPU fallback model is not initialized";
+            return nullptr;
+        }
+        if (compute_logits) {
+            if (!cpu_model_->use_mrope) {
+                return transformer_forward_logits(cpu_model_, token_id, cache_pos);
+            }
+            return transformer_forward_logits_pos(cpu_model_, token_id, cache_pos, pos_t, pos_h, pos_w);
+        }
+        if (!cpu_model_->use_mrope) {
+            return transformer_forward(cpu_model_, token_id, cache_pos);
+        }
+        return transformer_forward_pos(cpu_model_, token_id, cache_pos, pos_t, pos_h, pos_w);
+    }
+    if (!weights_loaded_) {
+        last_error_ = "Weights are not loaded";
+        return nullptr;
+    }
+    if (token_id < 0 || token_id >= n_vocab_) {
+        last_error_ = "token_id out of range";
+        std::cerr << "vulkan llm: token_id " << token_id << " out of range [0, " << n_vocab_ << ")\n";
+        return nullptr;
+    }
     // Token embedding: read row from GPU weight buffer via CPU
     // (mapped memory, no dispatch needed)
     {
@@ -633,6 +875,31 @@ float *VulkanLLMRunner::forward(int32_t token_id, int cache_pos, int pos_t, int 
 
 float *VulkanLLMRunner::forwardEmbd(const float *embd, int cache_pos, int pos_t, int pos_h, int pos_w,
                                      bool compute_logits) {
+    if (cpu_fallback_moe_) {
+        if (!cpu_model_) {
+            last_error_ = "CPU fallback model is not initialized";
+            return nullptr;
+        }
+        cpu_model_->ds_embd_stride = ds_embd_stride_;
+        if (compute_logits) {
+            if (!cpu_model_->use_mrope) {
+                return transformer_forward_embd_logits(cpu_model_, embd, cache_pos);
+            }
+            return transformer_forward_embd_logits_pos(cpu_model_, embd, cache_pos, pos_t, pos_h, pos_w);
+        }
+        if (!cpu_model_->use_mrope) {
+            return transformer_forward_embd(cpu_model_, embd, cache_pos);
+        }
+        return transformer_forward_embd_pos(cpu_model_, embd, cache_pos, pos_t, pos_h, pos_w);
+    }
+    if (!weights_loaded_) {
+        last_error_ = "Weights are not loaded";
+        return nullptr;
+    }
+    if (!embd) {
+        last_error_ = "Null embedding pointer";
+        return nullptr;
+    }
     uploadToBuffer(buf_x_, embd, n_embd_ * sizeof(float));
     // Upload deepstack slices if stride indicates they're present
     ds_active_ = false;
@@ -650,6 +917,12 @@ float *VulkanLLMRunner::forwardEmbd(const float *embd, int cache_pos, int pos_t,
 
 float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int pos_w,
                                          bool compute_logits) {
+    if (cache_pos < 0 || cache_pos >= max_seq_len_) {
+        last_error_ = "cache_pos out of range for allocated KV cache";
+        std::cerr << "vulkan llm: cache_pos " << cache_pos
+                  << " out of range [0, " << max_seq_len_ << ")\n";
+        return nullptr;
+    }
     int kv_dim = n_kv_heads_ * head_dim_;
     int seq_len = cache_pos + 1;
     float scale = 1.0f / sqrtf((float)head_dim_);
@@ -664,9 +937,10 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
         GLLM_PROF_END("attn_norm", 5.0 * n_embd_, 0);
 
         // Q/K/V projections
+        int q_dim = n_heads_ * head_dim_;
         GLLM_PROF_BEGIN("q_proj", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb_, weight_bufs_[ln.attn_q], buf_q_, n_embd_, n_embd_);
-        GLLM_PROF_END("q_proj", 2.0 * n_embd_ * n_embd_, 0);
+        dispatchMatvec(buf_xb_, weight_bufs_[ln.attn_q], buf_q_, q_dim, n_embd_);
+        GLLM_PROF_END("q_proj", 2.0 * q_dim * n_embd_, 0);
 
         GLLM_PROF_BEGIN("k_proj", l, "matvec", "FP32");
         dispatchMatvec(buf_xb_, weight_bufs_[ln.attn_k], buf_k_, kv_dim, n_embd_);
@@ -710,8 +984,8 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
 
         // Output projection
         GLLM_PROF_BEGIN("out_proj", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb2_, weight_bufs_[ln.attn_output], buf_xb_, n_embd_, n_embd_);
-        GLLM_PROF_END("out_proj", 2.0 * n_embd_ * n_embd_, 0);
+        dispatchMatvec(buf_xb2_, weight_bufs_[ln.attn_output], buf_xb_, n_embd_, q_dim);
+        GLLM_PROF_END("out_proj", 2.0 * n_embd_ * q_dim, 0);
 
         // Residual: x += xb
         dispatchAdd(buf_x_, buf_xb_, n_embd_);
@@ -722,27 +996,102 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
         dispatchRmsNorm(buf_x_, buf_xb_, weight_bufs_[ln.ffn_norm], 1, n_embd_, rms_norm_eps_);
         GLLM_PROF_END("ffn_norm", 5.0 * n_embd_, 0);
 
-        // Gate and Up projections
-        GLLM_PROF_BEGIN("ffn_gate", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_gate], buf_ffn_gate_, n_ff_, n_embd_);
-        GLLM_PROF_END("ffn_gate", 2.0 * n_ff_ * n_embd_, 0);
+        const bool layer_has_moe = use_moe_ &&
+                                   !ln.ffn_gate_inp.empty() &&
+                                   !ln.ffn_up_exps.empty() &&
+                                   !ln.ffn_gate_exps.empty() &&
+                                   !ln.ffn_down_exps.empty() &&
+                                   weight_bufs_.count(ln.ffn_gate_inp) &&
+                                   weight_bufs_.count(ln.ffn_up_exps) &&
+                                   weight_bufs_.count(ln.ffn_gate_exps) &&
+                                   weight_bufs_.count(ln.ffn_down_exps);
+        if (layer_has_moe) {
+            GLLM_PROF_BEGIN("ffn_gate_inp", l, "matvec", "FP32");
+            dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_gate_inp], buf_moe_router_, n_expert_, n_embd_);
+            GLLM_PROF_END("ffn_gate_inp", 2.0 * n_expert_ * n_embd_, 0);
 
-        GLLM_PROF_BEGIN("ffn_up", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_up], buf_ffn_up_, n_ff_, n_embd_);
-        GLLM_PROF_END("ffn_up", 2.0 * n_ff_ * n_embd_, 0);
+            downloadFromBuffer(buf_moe_router_, moe_router_cpu_.data(), (size_t)n_expert_ * sizeof(float));
+            llm_softmax(moe_router_cpu_.data(), n_expert_);
 
-        // SiLU-Mul
-        GLLM_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
-        dispatchSiluMul(buf_ffn_gate_, buf_ffn_up_, n_ff_);
-        GLLM_PROF_END("silu_mul", 5.0 * n_ff_, 0);
+            std::vector<int> top_idx(n_expert_used_);
+            std::vector<float> top_w(n_expert_used_);
+            float wsum = 0.0f;
+            for (int i = 0; i < n_expert_used_; i++) {
+                int best = -1;
+                float best_w = -1.0f;
+                for (int e = 0; e < n_expert_; e++) {
+                    float w = moe_router_cpu_[e];
+                    if (w > best_w) {
+                        best_w = w;
+                        best = e;
+                    }
+                }
+                top_idx[i] = best;
+                top_w[i] = best_w;
+                wsum += best_w;
+                if (best >= 0) moe_router_cpu_[best] = -1.0f;
+            }
+            if (wsum > 0.0f) {
+                for (int i = 0; i < n_expert_used_; i++) top_w[i] /= wsum;
+            }
 
-        // Down projection
-        GLLM_PROF_BEGIN("ffn_down", l, "matvec", "FP32");
-        dispatchMatvec(buf_ffn_gate_, weight_bufs_[ln.ffn_down], buf_xb_, n_embd_, n_ff_);
-        GLLM_PROF_END("ffn_down", 2.0 * n_embd_ * n_ff_, 0);
+            std::fill(moe_accum_cpu_.begin(), moe_accum_cpu_.end(), 0.0f);
+            for (int ei = 0; ei < n_expert_used_; ei++) {
+                int e = top_idx[ei];
+                if (e < 0) continue;
+                float ew = top_w[ei];
+                uint32_t up_off = (uint32_t)(e * n_ff_expert_);
+                uint32_t down_off = (uint32_t)(e * n_embd_);
 
-        // Residual: x += xb
-        dispatchAdd(buf_x_, buf_xb_, n_embd_);
+                GLLM_PROF_BEGIN("ffn_up_exp", l, "matvec", "FP32");
+                dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_up_exps], buf_ffn_up_, n_ff_expert_, n_embd_, up_off);
+                GLLM_PROF_END("ffn_up_exp", 2.0 * n_ff_expert_ * n_embd_, 0);
+
+                GLLM_PROF_BEGIN("ffn_gate_exp", l, "matvec", "FP32");
+                dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_gate_exps], buf_ffn_gate_, n_ff_expert_, n_embd_, up_off);
+                GLLM_PROF_END("ffn_gate_exp", 2.0 * n_ff_expert_ * n_embd_, 0);
+
+                GLLM_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
+                dispatchSiluMul(buf_ffn_gate_, buf_ffn_up_, n_ff_expert_);
+                GLLM_PROF_END("silu_mul", 5.0 * n_ff_expert_, 0);
+
+                GLLM_PROF_BEGIN("ffn_down_exp", l, "matvec", "FP32");
+                dispatchMatvec(buf_ffn_gate_, weight_bufs_[ln.ffn_down_exps], buf_xb_, n_embd_, n_ff_expert_, down_off);
+                GLLM_PROF_END("ffn_down_exp", 2.0 * n_embd_ * n_ff_expert_, 0);
+
+                downloadFromBuffer(buf_xb_, moe_tmp_cpu_.data(), (size_t)n_embd_ * sizeof(float));
+                for (int i = 0; i < n_embd_; i++) {
+                    moe_accum_cpu_[i] += ew * moe_tmp_cpu_[i];
+                }
+            }
+            uploadToBuffer(buf_xb_, moe_accum_cpu_.data(), (size_t)n_embd_ * sizeof(float));
+            dispatchAdd(buf_x_, buf_xb_, n_embd_);
+        } else {
+            // Dense SwiGLU fallback path
+            if (!weight_bufs_.count(ln.ffn_gate) ||
+                !weight_bufs_.count(ln.ffn_up) ||
+                !weight_bufs_.count(ln.ffn_down)) {
+                last_error_ = "Missing FFN tensors for dense fallback path";
+                return nullptr;
+            }
+            GLLM_PROF_BEGIN("ffn_gate", l, "matvec", "FP32");
+            dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_gate], buf_ffn_gate_, n_ff_, n_embd_);
+            GLLM_PROF_END("ffn_gate", 2.0 * n_ff_ * n_embd_, 0);
+
+            GLLM_PROF_BEGIN("ffn_up", l, "matvec", "FP32");
+            dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_up], buf_ffn_up_, n_ff_, n_embd_);
+            GLLM_PROF_END("ffn_up", 2.0 * n_ff_ * n_embd_, 0);
+
+            GLLM_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
+            dispatchSiluMul(buf_ffn_gate_, buf_ffn_up_, n_ff_);
+            GLLM_PROF_END("silu_mul", 5.0 * n_ff_, 0);
+
+            GLLM_PROF_BEGIN("ffn_down", l, "matvec", "FP32");
+            dispatchMatvec(buf_ffn_gate_, weight_bufs_[ln.ffn_down], buf_xb_, n_embd_, n_ff_);
+            GLLM_PROF_END("ffn_down", 2.0 * n_embd_ * n_ff_, 0);
+
+            dispatchAdd(buf_x_, buf_xb_, n_embd_);
+        }
 
         // DeepStack injection (Qwen3-VL): add deepstack slice after early layers
         if (ds_active_ && l < n_deepstack_) {
