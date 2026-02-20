@@ -155,6 +155,17 @@ static inline void gemm_f16_f32(float *Y, const uint16_t *W, const float *X,
 static inline void gemm_f16_f32_tokmajor(float *Y, const uint16_t *W, const float *X,
                                           int n_rows, int K, int N, int Y_stride, int X_stride);
 
+/* Q8_0 fused dequant+dot: sum(q8_row[i] * x[i]) for i in [0, K) */
+static inline float vec_dot_q8_0_f32(const void *q8_row, const float *x, int K);
+
+/* Q8_0 single-row matvec wrapper */
+static inline void matvec_q8_0_f32(float *dst, const void *q8_row, const float *x, int K);
+
+/* Q8_0 token-major GEMM: Y[tok * Y_stride + row] = dot(W[row,:], X[tok,:])
+ * W is Q8_0 packed: each row is K/32 blocks of 34 bytes. */
+static inline void gemm_q8_0_f32_tokmajor(float *Y, const void *W, const float *X,
+                                            int n_rows, int K, int N, int Y_stride, int X_stride);
+
 #ifdef __cplusplus
 }
 #endif
@@ -752,6 +763,170 @@ static inline void gemm_f16_f32_tokmajor_fused2(
     #undef FUSED_HSUM_STORE
 }
 
+/* ---- Q8_0 SIMD kernels ---- */
+
+/* Fused dequant+dot for one Q8_0 row × F32 vector.
+ * Processes one block (32 int8 + fp16 scale = 34 bytes) per iteration.
+ * 4 groups of 8 int8 → cvtepi8_epi32 → cvtepi32_ps → mul(scale) → FMA. */
+static inline float vec_dot_q8_0_f32(const void *q8_row, const float *x, int K) {
+    const block_q8_0 *blocks = (const block_q8_0 *)q8_row;
+    int nb = K / 32;
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; b++) {
+        float scale = ggml_fp16_to_fp32(blocks[b].d);
+        __m256 vscale = _mm256_set1_ps(scale);
+        const int8_t *qs = blocks[b].qs;
+        const float *xp = x + b * 32;
+
+        /* Group 0: qs[0..7] */
+        __m128i bytes0 = _mm_loadl_epi64((const __m128i *)(qs));
+        __m256i i32_0 = _mm256_cvtepi8_epi32(bytes0);
+        __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_0), vscale);
+        acc0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(xp), acc0);
+
+        /* Group 1: qs[8..15] */
+        __m128i bytes1 = _mm_loadl_epi64((const __m128i *)(qs + 8));
+        __m256i i32_1 = _mm256_cvtepi8_epi32(bytes1);
+        __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_1), vscale);
+        acc1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(xp + 8), acc1);
+
+        /* Group 2: qs[16..23] */
+        __m128i bytes2 = _mm_loadl_epi64((const __m128i *)(qs + 16));
+        __m256i i32_2 = _mm256_cvtepi8_epi32(bytes2);
+        __m256 f2 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_2), vscale);
+        acc0 = _mm256_fmadd_ps(f2, _mm256_loadu_ps(xp + 16), acc0);
+
+        /* Group 3: qs[24..31] */
+        __m128i bytes3 = _mm_loadl_epi64((const __m128i *)(qs + 24));
+        __m256i i32_3 = _mm256_cvtepi8_epi32(bytes3);
+        __m256 f3 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_3), vscale);
+        acc1 = _mm256_fmadd_ps(f3, _mm256_loadu_ps(xp + 24), acc1);
+    }
+
+    acc0 = _mm256_add_ps(acc0, acc1);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+/* Single-row Q8_0 matvec wrapper */
+static inline void matvec_q8_0_f32(float *dst, const void *q8_row, const float *x, int K) {
+    *dst = vec_dot_q8_0_f32(q8_row, x, K);
+}
+
+/* Q8_0 token-major GEMM: 3-row × 4-token tile, 12 accumulators.
+ * Per block per row: broadcast scale, 4 groups of 8 int8→float FMA.
+ * Weight dequant amortized across 4 tokens. */
+static inline void gemm_q8_0_f32_tokmajor(float *Y, const void *W, const float *X,
+                                            int n_rows, int K, int N, int Y_stride, int X_stride) {
+    int nb = K / 32;
+    size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+
+    #define Q8_HSUM_STORE(acc, row, tok) do { \
+        __m128 _hi = _mm256_extractf128_ps(acc, 1); \
+        __m128 _lo = _mm256_castps256_ps128(acc); \
+        __m128 _s = _mm_add_ps(_lo, _hi); \
+        _s = _mm_add_ps(_s, _mm_movehl_ps(_s, _s)); \
+        _s = _mm_add_ss(_s, _mm_movehdup_ps(_s)); \
+        Y[(tok)*Y_stride + (row)] = _mm_cvtss_f32(_s); \
+    } while(0)
+
+    int r = 0;
+    for (; r + 2 < n_rows; r += 3) {
+        const block_q8_0 *w0 = (const block_q8_0 *)((const uint8_t *)W + (size_t)(r+0) * row_bytes);
+        const block_q8_0 *w1 = (const block_q8_0 *)((const uint8_t *)W + (size_t)(r+1) * row_bytes);
+        const block_q8_0 *w2 = (const block_q8_0 *)((const uint8_t *)W + (size_t)(r+2) * row_bytes);
+
+        int t = 0;
+        for (; t + 3 < N; t += 4) {
+            const float *x0 = X + (size_t)(t+0) * X_stride;
+            const float *x1 = X + (size_t)(t+1) * X_stride;
+            const float *x2 = X + (size_t)(t+2) * X_stride;
+            const float *x3 = X + (size_t)(t+3) * X_stride;
+
+            /* 3 rows × 4 tokens = 12 accumulators */
+            __m256 a00=_mm256_setzero_ps(), a01=_mm256_setzero_ps();
+            __m256 a02=_mm256_setzero_ps(), a03=_mm256_setzero_ps();
+            __m256 a10=_mm256_setzero_ps(), a11=_mm256_setzero_ps();
+            __m256 a12=_mm256_setzero_ps(), a13=_mm256_setzero_ps();
+            __m256 a20=_mm256_setzero_ps(), a21=_mm256_setzero_ps();
+            __m256 a22=_mm256_setzero_ps(), a23=_mm256_setzero_ps();
+
+            for (int b = 0; b < nb; b++) {
+                int base_k = b * 32;
+
+                /* Dequant 3 rows × 4 groups, FMA with 4 tokens */
+                for (int g = 0; g < 4; g++) {
+                    int off = base_k + g * 8;
+                    __m256 vx0 = _mm256_loadu_ps(x0 + off);
+                    __m256 vx1 = _mm256_loadu_ps(x1 + off);
+                    __m256 vx2 = _mm256_loadu_ps(x2 + off);
+                    __m256 vx3 = _mm256_loadu_ps(x3 + off);
+
+                    /* Row 0 */
+                    {
+                        __m256 vscale = _mm256_set1_ps(ggml_fp16_to_fp32(w0[b].d));
+                        __m128i bytes = _mm_loadl_epi64((const __m128i *)(w0[b].qs + g * 8));
+                        __m256 vw = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)), vscale);
+                        a00 = _mm256_fmadd_ps(vw, vx0, a00);
+                        a01 = _mm256_fmadd_ps(vw, vx1, a01);
+                        a02 = _mm256_fmadd_ps(vw, vx2, a02);
+                        a03 = _mm256_fmadd_ps(vw, vx3, a03);
+                    }
+                    /* Row 1 */
+                    {
+                        __m256 vscale = _mm256_set1_ps(ggml_fp16_to_fp32(w1[b].d));
+                        __m128i bytes = _mm_loadl_epi64((const __m128i *)(w1[b].qs + g * 8));
+                        __m256 vw = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)), vscale);
+                        a10 = _mm256_fmadd_ps(vw, vx0, a10);
+                        a11 = _mm256_fmadd_ps(vw, vx1, a11);
+                        a12 = _mm256_fmadd_ps(vw, vx2, a12);
+                        a13 = _mm256_fmadd_ps(vw, vx3, a13);
+                    }
+                    /* Row 2 */
+                    {
+                        __m256 vscale = _mm256_set1_ps(ggml_fp16_to_fp32(w2[b].d));
+                        __m128i bytes = _mm_loadl_epi64((const __m128i *)(w2[b].qs + g * 8));
+                        __m256 vw = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)), vscale);
+                        a20 = _mm256_fmadd_ps(vw, vx0, a20);
+                        a21 = _mm256_fmadd_ps(vw, vx1, a21);
+                        a22 = _mm256_fmadd_ps(vw, vx2, a22);
+                        a23 = _mm256_fmadd_ps(vw, vx3, a23);
+                    }
+                }
+            }
+
+            Q8_HSUM_STORE(a00,r+0,t+0); Q8_HSUM_STORE(a01,r+0,t+1);
+            Q8_HSUM_STORE(a02,r+0,t+2); Q8_HSUM_STORE(a03,r+0,t+3);
+            Q8_HSUM_STORE(a10,r+1,t+0); Q8_HSUM_STORE(a11,r+1,t+1);
+            Q8_HSUM_STORE(a12,r+1,t+2); Q8_HSUM_STORE(a13,r+1,t+3);
+            Q8_HSUM_STORE(a20,r+2,t+0); Q8_HSUM_STORE(a21,r+2,t+1);
+            Q8_HSUM_STORE(a22,r+2,t+2); Q8_HSUM_STORE(a23,r+2,t+3);
+        }
+        /* Remainder tokens */
+        for (; t < N; t++) {
+            const float *xt = X + (size_t)t * X_stride;
+            Y[t*Y_stride+r+0] = vec_dot_q8_0_f32(w0, xt, K);
+            Y[t*Y_stride+r+1] = vec_dot_q8_0_f32(w1, xt, K);
+            Y[t*Y_stride+r+2] = vec_dot_q8_0_f32(w2, xt, K);
+        }
+    }
+    /* Remainder rows */
+    for (; r < n_rows; r++) {
+        const void *wr = (const uint8_t *)W + (size_t)r * row_bytes;
+        for (int t = 0; t < N; t++) {
+            Y[t * Y_stride + r] = vec_dot_q8_0_f32(wr, X + (size_t)t * X_stride, K);
+        }
+    }
+    #undef Q8_HSUM_STORE
+}
+
 #else
 /* Scalar fallback */
 static inline float vec_dot_f16_f32(const uint16_t *a, const float *b, int n) {
@@ -810,6 +985,30 @@ static inline void gemm_f16_f32_tokmajor_fused2(
             Y1[t * Y1_stride + r] = vec_dot_f16_f32(w1r, xt, K);
             Y2[t * Y2_stride + r] = vec_dot_f16_f32(w2r, xt, K);
         }
+    }
+}
+/* Scalar Q8_0 fallbacks */
+static inline float vec_dot_q8_0_f32(const void *q8_row, const float *x, int K) {
+    const block_q8_0 *blocks = (const block_q8_0 *)q8_row;
+    int nb = K / 32;
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        float scale = ggml_fp16_to_fp32(blocks[b].d);
+        for (int j = 0; j < 32; j++) sum += scale * blocks[b].qs[j] * x[b * 32 + j];
+    }
+    return sum;
+}
+static inline void matvec_q8_0_f32(float *dst, const void *q8_row, const float *x, int K) {
+    *dst = vec_dot_q8_0_f32(q8_row, x, K);
+}
+static inline void gemm_q8_0_f32_tokmajor(float *Y, const void *W, const float *X,
+                                            int n_rows, int K, int N, int Y_stride, int X_stride) {
+    int nb = K / 32;
+    size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+    for (int r = 0; r < n_rows; r++) {
+        const void *wr = (const uint8_t *)W + (size_t)r * row_bytes;
+        for (int t = 0; t < N; t++)
+            Y[t * Y_stride + r] = vec_dot_q8_0_f32(wr, X + (size_t)t * X_stride, K);
     }
 }
 #endif /* __F16C__ && __AVX2__ && __FMA__ */
