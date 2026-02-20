@@ -367,6 +367,15 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         return NULL;
     }
+    if (t->mat->type == GGML_TYPE_Q8_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+        const uint8_t *base = (const uint8_t *)t->mat->data;
+        for (int i = t->row_start; i < t->row_end; i++) {
+            t->dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, t->x, n_cols);
+        }
+        return NULL;
+    }
     for (int i = t->row_start; i < t->row_end; i++) {
         tf_dequant_row(t->mat, i, t->tmp);
         float sum = 0.0f;
@@ -390,6 +399,13 @@ typedef struct {
     const float *x;
     int row_start, row_end;
 } tf_matvec_fused2_task;
+
+static void tf_matvec_q8_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                const float *x, int n_cols, int row_start, int row_end) {
+    for (int i = row_start; i < row_end; i++) {
+        dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, x, n_cols);
+    }
+}
 
 static void tf_matvec_f16_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                  const float *x, int n_cols, int row_start, int row_end) {
@@ -419,8 +435,15 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                             t->x, n_cols, t->row_start, t->row_end);
         tf_matvec_f16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                             t->x, n_cols, t->row_start, t->row_end);
+    } else if (t->mat1->type == GGML_TYPE_Q8_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+        tf_matvec_q8_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                            t->x, n_cols, t->row_start, t->row_end);
+        tf_matvec_q8_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                            t->x, n_cols, t->row_start, t->row_end);
     } else {
-        /* Generic path for quantized weights (Q8_0, etc.) */
+        /* Generic path for other quantized weights */
         float *tmp = (float *)malloc(n_cols * sizeof(float));
         for (int i = t->row_start; i < t->row_end; i++) {
             tf_dequant_row(t->mat1, i, tmp);
@@ -480,6 +503,19 @@ static void *tf_qmatvec_fused3_worker(void *arg) {
             tf_matvec_f16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                                 t->x, n_cols, t->row_start2, t->row_end2);
             tf_matvec_f16_rows(t->dst3, (const uint8_t *)t->mat3->data, row_bytes,
+                                t->x, n_cols, t->row_start2, t->row_end2);
+        }
+    } else if (t->mat1->type == GGML_TYPE_Q8_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+        if (t->row_end1 > t->row_start1) {
+            tf_matvec_q8_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                                t->x, n_cols, t->row_start1, t->row_end1);
+        }
+        if (t->row_end2 > t->row_start2) {
+            tf_matvec_q8_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                                t->x, n_cols, t->row_start2, t->row_end2);
+            tf_matvec_q8_rows(t->dst3, (const uint8_t *)t->mat3->data, row_bytes,
                                 t->x, n_cols, t->row_start2, t->row_end2);
         }
     } else {
@@ -560,6 +596,15 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         for (; i < n_rows; i++) {
             const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
             dst[i] = vec_dot_f16_f32(row, x, n_cols);
+        }
+        return;
+    }
+    if (mat->type == GGML_TYPE_Q8_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+        const uint8_t *base = (const uint8_t *)mat->data;
+        for (int i = 0; i < n_rows; i++) {
+            dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, x, n_cols);
         }
         return;
     }
@@ -1663,13 +1708,58 @@ static void *tf_gemm_tm_worker(void *arg) {
     return NULL;
 }
 
+/* Q8_0 token-major GEMM worker (for threaded dispatch) */
+typedef struct {
+    float *Y;
+    const void *W;
+    const float *X;
+    int row_start, row_end;
+    int K, N, Y_stride, X_stride;
+} tf_gemm_q8_tm_task;
+
+static void *tf_gemm_q8_tm_worker(void *arg) {
+    tf_gemm_q8_tm_task *t = (tf_gemm_q8_tm_task *)arg;
+    int nrows = t->row_end - t->row_start;
+    int nb = t->K / 32;
+    size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+    gemm_q8_0_f32_tokmajor(t->Y + t->row_start,
+                             (const uint8_t *)t->W + (size_t)t->row_start * row_bytes,
+                             t->X, nrows, t->K, t->N, t->Y_stride, t->X_stride);
+    return NULL;
+}
+
 /* Token-major GEMM: Y[tok * out_stride + row] = dot(W[row,:], X[tok,:])
  * Direct output without transpose. */
 static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const float *X,
                                        int n_rows, int N, int out_stride, int X_stride,
                                        int n_threads) {
+    if (mat->type == GGML_TYPE_Q8_0) {
+        /* Q8_0 SIMD GEMM path */
+        int K = mat->n_cols;
+        if (n_threads <= 1 || n_rows < n_threads * 6) {
+            gemm_q8_0_f32_tokmajor(Y_out, mat->data, X, n_rows, K, N, out_stride, X_stride);
+            return;
+        }
+        int nb = K / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
+        pthread_t *threads = (pthread_t *)alloca(n_threads * sizeof(pthread_t));
+        tf_gemm_q8_tm_task *tasks = (tf_gemm_q8_tm_task *)alloca(n_threads * sizeof(tf_gemm_q8_tm_task));
+        int rows_per = n_rows / n_threads, extra = n_rows % n_threads, offset = 0;
+        for (int i = 0; i < n_threads; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_q8_tm_task){Y_out,
+                                    (const uint8_t *)mat->data,
+                                    X, offset, offset + count, K, N, out_stride, X_stride};
+            offset += count;
+        }
+        for (int i = 0; i < n_threads; i++) {
+            pthread_create(&threads[i], NULL, tf_gemm_q8_tm_worker, &tasks[i]);
+        }
+        for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
+        return;
+    }
     if (mat->type != GGML_TYPE_F16) {
-        /* Fallback for non-F16: per-token matvec */
+        /* Fallback for other non-F16: per-token matvec */
         int n_cols = mat->n_cols;
         float *row_buf = (float *)malloc(n_cols * sizeof(float));
         for (int t = 0; t < N; t++) {
