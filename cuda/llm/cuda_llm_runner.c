@@ -2,7 +2,9 @@
  * cuda_llm_runner.c - CUDA LLM inference via NVRTC-compiled kernels
  *
  * Compiles with plain gcc (no nvcc). Uses cuew for dynamic CUDA/NVRTC loading.
- * F16 weights kept on GPU, F32 compute. Single-stream sequential kernel launches.
+ * Supports F16 and Q8_0 weights on GPU, F32 compute.
+ * Q8_0 uses padded 36-byte blocks (2B scale + 2B pad + 32B INT8) for aligned access.
+ * Single-stream sequential kernel launches.
  */
 
 #include "cuda_llm_runner.h"
@@ -277,6 +279,178 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- dp4a: INT8 dot product via inline PTX (sm_61+) ---- */\n"
+"__device__ __forceinline__ int dp4a_s8(int a, int b, int c) {\n"
+"    asm(\"dp4a.s32.s32 %0, %1, %2, %0;\" : \"+r\"(c) : \"r\"(a), \"r\"(b));\n"
+"    return c;\n"
+"}\n"
+"\n"
+"/* ---- 10. quantize_f32_to_int8: F32 vector -> INT8 + scale ---- */\n"
+"/* Single block, 256 threads. Writes scale_out[0] = absmax/127. */\n"
+"__global__ void quantize_f32_to_int8(signed char *dst, float *scale_out,\n"
+"                                       const float *src, int n) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"\n"
+"    /* Find absmax via parallel reduction */\n"
+"    float local_max = 0.0f;\n"
+"    for (int i = tid; i < n; i += nthreads) {\n"
+"        float v = src[i];\n"
+"        if (v < 0.0f) v = -v;\n"
+"        if (v > local_max) local_max = v;\n"
+"    }\n"
+"    sdata[tid] = local_max;\n"
+"    __syncthreads();\n"
+"\n"
+"    for (int s = nthreads / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s && sdata[tid + s] > sdata[tid])\n"
+"            sdata[tid] = sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"\n"
+"    float absmax = sdata[0];\n"
+"    float scale = absmax / 127.0f;\n"
+"    float inv_scale = (absmax > 0.0f) ? 127.0f / absmax : 0.0f;\n"
+"    if (tid == 0) scale_out[0] = scale;\n"
+"\n"
+"    /* Quantize with rounding */\n"
+"    for (int i = tid; i < n; i += nthreads) {\n"
+"        float fv = src[i] * inv_scale;\n"
+"        int iv = __float2int_rn(fv);\n"
+"        if (iv > 127) iv = 127;\n"
+"        if (iv < -128) iv = -128;\n"
+"        dst[i] = (signed char)iv;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 11. matvec_q8_0_dp4a: Q8_0 matrix x INT8 vector -> F32 via dp4a ---- */\n"
+"/* Padded Q8_0 block: 36 bytes = [uint16 d_half][2B pad][int8 qs[32]] */\n"
+"/* 4-byte aligned: qs data at offset 4 is always int-aligned. */\n"
+"/* Each block computes one output row. 256 threads stride over Q8_0 blocks. */\n"
+"__global__ void matvec_q8_0_dp4a(float *dst, const unsigned char *mat,\n"
+"                                   const signed char *x_q, const float *x_scale_ptr,\n"
+"                                   int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"\n"
+"    int n_blocks_per_row = n_cols / 32;\n"
+"    int row_bytes = n_blocks_per_row * 36;  /* padded stride */\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float x_scale = *x_scale_ptr;\n"
+"\n"
+"    float sum = 0.0f;\n"
+"    for (int b = tid; b < n_blocks_per_row; b += nthreads) {\n"
+"        const unsigned char *bp = row_ptr + b * 36;\n"
+"\n"
+"        /* Block scale (FP16 -> F32) */\n"
+"        half_raw d_half = *(const half_raw *)bp;\n"
+"        float block_scale = half_to_float(d_half);\n"
+"\n"
+"        /* 8 dp4a calls for 32 INT8 elements (4-byte aligned reads) */\n"
+"        const int *w4 = (const int *)(bp + 4);  /* qs at offset 4 = aligned */\n"
+"        const int *x4 = (const int *)(x_q + b * 32);\n"
+"        int acc = 0;\n"
+"        acc = dp4a_s8(w4[0], x4[0], acc);\n"
+"        acc = dp4a_s8(w4[1], x4[1], acc);\n"
+"        acc = dp4a_s8(w4[2], x4[2], acc);\n"
+"        acc = dp4a_s8(w4[3], x4[3], acc);\n"
+"        acc = dp4a_s8(w4[4], x4[4], acc);\n"
+"        acc = dp4a_s8(w4[5], x4[5], acc);\n"
+"        acc = dp4a_s8(w4[6], x4[6], acc);\n"
+"        acc = dp4a_s8(w4[7], x4[7], acc);\n"
+"\n"
+"        sum += (float)acc * block_scale * x_scale;\n"
+"    }\n"
+"\n"
+"    /* Warp shuffle reduction */\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    }\n"
+"\n"
+"    __shared__ float warp_sums[8];\n"
+"    int warp_id = tid / 32;\n"
+"    int lane = tid % 32;\n"
+"    if (lane == 0) warp_sums[warp_id] = sum;\n"
+"    __syncthreads();\n"
+"\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += warp_sums[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 12b. matvec_q8_0_f32: Q8_0 matrix x F32 vector -> F32 (accurate) ---- */\n"
+"/* Dequants Q8_0 weights on-the-fly, no input quantization needed. */\n"
+"/* Padded block: 36 bytes = [uint16 d_half][2B pad][int8 qs[32]] */\n"
+"__global__ void matvec_q8_0_f32(float *dst, const unsigned char *mat,\n"
+"                                  const float *x, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"\n"
+"    int n_blocks_per_row = n_cols / 32;\n"
+"    int row_bytes = n_blocks_per_row * 36;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"\n"
+"    float sum = 0.0f;\n"
+"    for (int b = tid; b < n_blocks_per_row; b += nthreads) {\n"
+"        const unsigned char *bp = row_ptr + b * 36;\n"
+"        half_raw d_half = *(const half_raw *)bp;\n"
+"        float block_scale = half_to_float(d_half);\n"
+"        const signed char *qs = (const signed char *)(bp + 4);\n"
+"        const float *xb = x + b * 32;\n"
+"\n"
+"        float partial = 0.0f;\n"
+"        for (int k = 0; k < 32; k++) {\n"
+"            partial += (float)qs[k] * xb[k];\n"
+"        }\n"
+"        sum += partial * block_scale;\n"
+"    }\n"
+"\n"
+"    /* Warp shuffle reduction */\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    }\n"
+"    __shared__ float warp_sums[8];\n"
+"    int warp_id = tid / 32;\n"
+"    int lane = tid % 32;\n"
+"    if (lane == 0) warp_sums[warp_id] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += warp_sums[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 13. embed_q8_0: Padded Q8_0 embedding lookup -> F32 ---- */\n"
+"/* Block layout: 36 bytes = [uint16 d_half][2B pad][int8 qs[32]] */\n"
+"__global__ void embed_q8_0(float *dst, const unsigned char *embd_table,\n"
+"                             int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n_embd) return;\n"
+"\n"
+"    int n_blocks_per_row = n_embd / 32;\n"
+"    int row_bytes = n_blocks_per_row * 36;  /* padded stride */\n"
+"    const unsigned char *row = embd_table + (size_t)token_id * row_bytes;\n"
+"\n"
+"    int block_idx = i / 32;\n"
+"    int block_off = i % 32;\n"
+"    const unsigned char *bp = row + block_idx * 36;\n"
+"\n"
+"    half_raw d_half = *(const half_raw *)bp;\n"
+"    float scale = half_to_float(d_half);\n"
+"    signed char qs = *((const signed char *)(bp + 4) + block_off);  /* qs at offset 4 */\n"
+"    dst[i] = (float)qs * scale;\n"
+"}\n"
+"\n"
 "} /* extern \"C\" */\n"
 ;
 
@@ -345,6 +519,10 @@ typedef struct {
     int ffn_down_rows, ffn_down_cols;
 
     int has_qk_norm;
+
+    /* Weight types (GGML_TYPE_F16=1 or GGML_TYPE_Q8_0=8) */
+    int attn_q_type, attn_k_type, attn_v_type, attn_output_type;
+    int ffn_gate_type, ffn_up_type, ffn_down_type;
 } cuda_layer;
 
 struct cuda_llm_runner {
@@ -365,6 +543,10 @@ struct cuda_llm_runner {
     CUfunction fn_attn_decode_f32;
     CUfunction fn_silu_mul_f32;
     CUfunction fn_add_f32;
+    CUfunction fn_quantize_f32_to_int8;
+    CUfunction fn_matvec_q8_0_dp4a;
+    CUfunction fn_matvec_q8_0_f32;
+    CUfunction fn_embed_q8_0;
 
     /* Model params */
     int n_layers;
@@ -379,7 +561,8 @@ struct cuda_llm_runner {
     float rms_norm_eps;
 
     /* GPU weights */
-    CUdeviceptr d_token_embd;   /* F16 [n_vocab * n_embd] */
+    int token_embd_type;        /* GGML_TYPE_F16 or GGML_TYPE_Q8_0 */
+    CUdeviceptr d_token_embd;   /* F16 or Q8_0 [n_vocab * n_embd] */
     CUdeviceptr d_output_norm;  /* F32 [n_embd] */
     cuda_layer *layers;
 
@@ -396,6 +579,10 @@ struct cuda_llm_runner {
     CUdeviceptr d_v;     /* [n_kv_heads * head_dim] */
     CUdeviceptr d_gate;  /* [n_ff] */
     CUdeviceptr d_up;    /* [n_ff] */
+
+    /* INT8 quantization scratch (for dp4a path) */
+    CUdeviceptr d_xb_q;     /* INT8 [max_dim] */
+    CUdeviceptr d_xb_scale; /* F32 [1] */
 
     /* Host output buffer */
     float *h_output;     /* [n_embd] */
@@ -495,11 +682,15 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(attn_decode_f32);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
+    GET_FUNC(quantize_f32_to_int8);
+    GET_FUNC(matvec_q8_0_dp4a);
+    GET_FUNC(matvec_q8_0_f32);
+    GET_FUNC(embed_q8_0);
 
     #undef GET_FUNC
 
     if (r->verbose >= 1) {
-        fprintf(stderr, "cuda_llm: all 9 kernels compiled successfully\n");
+        fprintf(stderr, "cuda_llm: all 13 kernels compiled successfully\n");
     }
     return 0;
 }
@@ -583,6 +774,48 @@ static int upload_norm_f32(CUdeviceptr *d_ptr, const qtensor *t, int n) {
     free(buf);
     if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
+}
+
+/* Upload Q8_0 tensor data to GPU with padding for alignment.
+ * Each 34-byte Q8_0 block (2B scale + 32B qs) is padded to 36 bytes
+ * (2B scale + 2B pad + 32B qs) so int32 reads of qs data are 4-byte aligned. */
+static int upload_q8_0_raw(CUdeviceptr *d_ptr, const qtensor *t) {
+    if (!t->data) { *d_ptr = 0; return 0; }
+    int n_elements = t->n_rows * t->n_cols;
+    int n_blocks = n_elements / 32;
+    size_t nbytes_padded = (size_t)n_blocks * 36;  /* 36 bytes per padded block */
+
+    /* Repack on host: insert 2-byte padding after each scale */
+    uint8_t *padded = (uint8_t *)malloc(nbytes_padded);
+    if (!padded) return -1;
+    const uint8_t *src = (const uint8_t *)t->data;
+    for (int i = 0; i < n_blocks; i++) {
+        uint8_t *dst = padded + (size_t)i * 36;
+        const uint8_t *s = src + (size_t)i * 34;
+        dst[0] = s[0];  /* scale low byte */
+        dst[1] = s[1];  /* scale high byte */
+        dst[2] = 0;     /* padding */
+        dst[3] = 0;     /* padding */
+        memcpy(dst + 4, s + 2, 32);  /* 32 INT8 values */
+    }
+
+    CUresult err = cuMemAlloc(d_ptr, nbytes_padded);
+    if (err != CUDA_SUCCESS) { free(padded); return -1; }
+    err = cuMemcpyHtoD(*d_ptr, padded, nbytes_padded);
+    free(padded);
+    if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    return 0;
+}
+
+/* Upload a weight matrix - dispatches F16 or Q8_0 based on type */
+static int upload_weight_matrix(CUdeviceptr *d_ptr, const qtensor *t, int *out_type) {
+    *out_type = t->type;
+    if (t->type == GGML_TYPE_Q8_0) {
+        return upload_q8_0_raw(d_ptr, t);
+    } else {
+        /* Default: F16 (or treat as F16) */
+        return upload_f16_matrix(d_ptr, t);
+    }
 }
 
 /* ======================================================================== */
@@ -676,11 +909,20 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 r->rope_freq_base, r->rms_norm_eps, r->max_seq_len);
     }
 
-    /* Token embeddings (F16) */
+    /* Token embeddings (F16 or Q8_0) */
     qtensor embd = cllm_load_tensor(gguf, "token_embd.weight", 1);
     if (!embd.data) return -1;
     if (r->n_vocab == 0) r->n_vocab = embd.n_rows;
-    if (upload_f16_matrix(&r->d_token_embd, &embd) != 0) return -1;
+    r->token_embd_type = embd.type;
+    if (embd.type == GGML_TYPE_Q8_0) {
+        if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
+    } else {
+        if (upload_f16_matrix(&r->d_token_embd, &embd) != 0) return -1;
+    }
+    if (r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: token_embd type=%s\n",
+                embd.type == GGML_TYPE_Q8_0 ? "Q8_0" : "F16");
+    }
 
     /* Output norm (F32) */
     qtensor onorm = cllm_load_tensor(gguf, "output_norm.weight", 1);
@@ -700,26 +942,26 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         qtensor t = cllm_load_tensor(gguf, name, 1);
         if (upload_norm_f32(&cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
 
-        /* Q/K/V/Output projections (F16) */
+        /* Q/K/V/Output projections (F16 or Q8_0) */
         snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
         t = cllm_load_tensor(gguf, name, 1);
         cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
-        if (upload_f16_matrix(&cl->attn_q_w, &t) != 0) return -1;
+        if (upload_weight_matrix(&cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
 
         snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
         t = cllm_load_tensor(gguf, name, 1);
         cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
-        if (upload_f16_matrix(&cl->attn_k_w, &t) != 0) return -1;
+        if (upload_weight_matrix(&cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
 
         snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
         t = cllm_load_tensor(gguf, name, 1);
         cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
-        if (upload_f16_matrix(&cl->attn_v_w, &t) != 0) return -1;
+        if (upload_weight_matrix(&cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
 
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
         t = cllm_load_tensor(gguf, name, 1);
         cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
-        if (upload_f16_matrix(&cl->attn_output_w, &t) != 0) return -1;
+        if (upload_weight_matrix(&cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
 
         /* QK norms (F32, optional) */
         snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
@@ -740,21 +982,21 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         t = cllm_load_tensor(gguf, name, 1);
         if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
 
-        /* FFN gate/up/down (F16) */
+        /* FFN gate/up/down (F16 or Q8_0) */
         snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
         t = cllm_load_tensor(gguf, name, 1);
         cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
-        if (upload_f16_matrix(&cl->ffn_gate_w, &t) != 0) return -1;
+        if (upload_weight_matrix(&cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
 
         snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
         t = cllm_load_tensor(gguf, name, 1);
         cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
-        if (upload_f16_matrix(&cl->ffn_up_w, &t) != 0) return -1;
+        if (upload_weight_matrix(&cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
 
         snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
         t = cllm_load_tensor(gguf, name, 1);
         cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
-        if (upload_f16_matrix(&cl->ffn_down_w, &t) != 0) return -1;
+        if (upload_weight_matrix(&cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
 
         if (r->verbose >= 2) {
             fprintf(stderr, "  layer %d: Q[%d×%d] K[%d×%d] V[%d×%d] O[%d×%d] gate[%d×%d] up[%d×%d] down[%d×%d] qk_norm=%d\n",
@@ -794,6 +1036,10 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     CHECK_CU(cuMemAlloc(&r->d_gate, r->n_ff * sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_up,   r->n_ff * sizeof(float)));
 
+    /* INT8 quantization scratch (for dp4a path) */
+    CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
+
     /* Host output buffer */
     r->h_output = (float *)malloc(r->n_embd * sizeof(float));
     if (!r->h_output) return -1;
@@ -801,26 +1047,34 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->weights_loaded = 1;
 
     if (r->verbose >= 1) {
+        /* Helper: bytes per element for a weight type */
+        #define WEIGHT_BYTES(type, n_elements) \
+            ((type) == GGML_TYPE_Q8_0 ? (size_t)((n_elements) / 32) * 36 : (size_t)(n_elements) * 2)
+
         /* VRAM summary */
-        size_t weight_bytes = (size_t)r->n_vocab * r->n_embd * 2;  /* token_embd */
+        size_t weight_bytes = WEIGHT_BYTES(r->token_embd_type, (size_t)r->n_vocab * r->n_embd);
         weight_bytes += r->n_embd * 4;  /* output_norm */
         for (int l = 0; l < r->n_layers; l++) {
             cuda_layer *cl = &r->layers[l];
             weight_bytes += r->n_embd * 4;  /* attn_norm */
-            weight_bytes += (size_t)cl->attn_q_rows * cl->attn_q_cols * 2;
-            weight_bytes += (size_t)cl->attn_k_rows * cl->attn_k_cols * 2;
-            weight_bytes += (size_t)cl->attn_v_rows * cl->attn_v_cols * 2;
-            weight_bytes += (size_t)cl->attn_output_rows * cl->attn_output_cols * 2;
+            weight_bytes += WEIGHT_BYTES(cl->attn_q_type, (size_t)cl->attn_q_rows * cl->attn_q_cols);
+            weight_bytes += WEIGHT_BYTES(cl->attn_k_type, (size_t)cl->attn_k_rows * cl->attn_k_cols);
+            weight_bytes += WEIGHT_BYTES(cl->attn_v_type, (size_t)cl->attn_v_rows * cl->attn_v_cols);
+            weight_bytes += WEIGHT_BYTES(cl->attn_output_type, (size_t)cl->attn_output_rows * cl->attn_output_cols);
             if (cl->has_qk_norm) weight_bytes += r->head_dim * 4 * 2;
             weight_bytes += r->n_embd * 4;  /* ffn_norm */
-            weight_bytes += (size_t)cl->ffn_gate_rows * cl->ffn_gate_cols * 2;
-            weight_bytes += (size_t)cl->ffn_up_rows * cl->ffn_up_cols * 2;
-            weight_bytes += (size_t)cl->ffn_down_rows * cl->ffn_down_cols * 2;
+            weight_bytes += WEIGHT_BYTES(cl->ffn_gate_type, (size_t)cl->ffn_gate_rows * cl->ffn_gate_cols);
+            weight_bytes += WEIGHT_BYTES(cl->ffn_up_type, (size_t)cl->ffn_up_rows * cl->ffn_up_cols);
+            weight_bytes += WEIGHT_BYTES(cl->ffn_down_type, (size_t)cl->ffn_down_rows * cl->ffn_down_cols);
         }
+        #undef WEIGHT_BYTES
         size_t cache_bytes = (size_t)r->n_layers * 2 * kv_cache_size;
-        size_t scratch_bytes = (size_t)(max_dim * 3 + q_dim + kv_dim * 2 + r->n_ff * 2) * sizeof(float);
-        fprintf(stderr, "cuda_llm: VRAM usage: weights=%.1f MB, KV cache=%.1f MB, scratch=%.1f KB\n",
-                (double)weight_bytes / (1024.0*1024.0),
+        size_t scratch_bytes = (size_t)(max_dim * 3 + q_dim + kv_dim * 2 + r->n_ff * 2) * sizeof(float)
+                             + max_dim + sizeof(float);  /* INT8 scratch */
+        cuda_layer *cl0 = &r->layers[0];
+        const char *wtype = (cl0->attn_q_type == GGML_TYPE_Q8_0) ? "Q8_0+dp4a" : "F16";
+        fprintf(stderr, "cuda_llm: VRAM usage: weights=%.1f MB (%s), KV cache=%.1f MB, scratch=%.1f KB\n",
+                (double)weight_bytes / (1024.0*1024.0), wtype,
                 (double)cache_bytes / (1024.0*1024.0),
                 (double)scratch_bytes / 1024.0);
     }
@@ -921,6 +1175,55 @@ static inline void launch_add(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr s
                    0, r->stream, args, NULL);
 }
 
+/* ---- Q8_0 dp4a launch helpers ---- */
+
+static inline void launch_embed_q8_0(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr embd_table,
+                                      int token_id, int n_embd) {
+    void *args[] = { &dst, &embd_table, &token_id, &n_embd };
+    cuLaunchKernel(r->fn_embed_q8_0,
+                   (n_embd + 255) / 256, 1, 1,
+                   256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
+static inline void launch_quantize(cuda_llm_runner *r, CUdeviceptr dst_q, CUdeviceptr dst_scale,
+                                    CUdeviceptr src, int n) {
+    void *args[] = { &dst_q, &dst_scale, &src, &n };
+    cuLaunchKernel(r->fn_quantize_f32_to_int8,
+                   1, 1, 1,
+                   256, 1, 1,
+                   256 * sizeof(float), r->stream, args, NULL);
+}
+
+static inline void launch_matvec_q8(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                     CUdeviceptr x_q, CUdeviceptr x_scale,
+                                     int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q, &x_scale, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q8_0_dp4a,
+                   n_rows, 1, 1,
+                   256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
+static inline void launch_matvec_q8_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                         CUdeviceptr x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q8_0_f32,
+                   n_rows, 1, 1,
+                   256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
+/* Auto-dispatch matvec: Q8_0 uses dequant-to-F32 path (accurate), F16 uses direct path */
+static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                       CUdeviceptr x, int n_rows, int n_cols, int weight_type) {
+    if (weight_type == GGML_TYPE_Q8_0) {
+        launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols);
+    } else {
+        launch_matvec(r, dst, mat, x, n_rows, n_cols);
+    }
+}
+
 /* ======================================================================== */
 /* Public API: forward                                                      */
 /* ======================================================================== */
@@ -938,8 +1241,12 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
     int n_ff = r->n_ff;
     float eps = r->rms_norm_eps;
 
-    /* 1. Token embedding lookup (F16 -> F32) */
-    launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    /* 1. Token embedding lookup -> F32 */
+    if (r->token_embd_type == GGML_TYPE_Q8_0) {
+        launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else {
+        launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    }
 
     /* 2. Transformer blocks */
     for (int l = 0; l < r->n_layers; l++) {
@@ -948,10 +1255,10 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         /* Attention RMSNorm: xb = rmsnorm(x, attn_norm) */
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
 
-        /* Q/K/V projections */
-        launch_matvec(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols);
-        launch_matvec(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols);
-        launch_matvec(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols);
+        /* Q/K/V projections (auto-dispatch F16 or Q8_0+dp4a) */
+        launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+        launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+        launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
 
         /* QK-Norm (if present) */
         if (cl->has_qk_norm) {
@@ -977,8 +1284,8 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
                          n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
 
         /* Output projection: xb = attn_output @ xb2 */
-        launch_matvec(r, r->d_xb, cl->attn_output_w, r->d_xb2,
-                      cl->attn_output_rows, cl->attn_output_cols);
+        launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
+                      cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
 
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
@@ -987,17 +1294,17 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
 
         /* FFN gate and up projections */
-        launch_matvec(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
-                      cl->ffn_gate_rows, cl->ffn_gate_cols);
-        launch_matvec(r, r->d_up, cl->ffn_up_w, r->d_xb,
-                      cl->ffn_up_rows, cl->ffn_up_cols);
+        launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                      cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
+        launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                      cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
 
         /* SiLU(gate) * up */
         launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
 
         /* FFN down projection: xb = ffn_down @ gate */
-        launch_matvec(r, r->d_xb, cl->ffn_down_w, r->d_gate,
-                      cl->ffn_down_rows, cl->ffn_down_cols);
+        launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
+                      cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
 
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
@@ -1029,6 +1336,8 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_v)    cuMemFree(r->d_v);
     if (r->d_gate) cuMemFree(r->d_gate);
     if (r->d_up)   cuMemFree(r->d_up);
+    if (r->d_xb_q)    cuMemFree(r->d_xb_q);
+    if (r->d_xb_scale) cuMemFree(r->d_xb_scale);
 
     /* Free KV cache */
     if (r->d_key_cache) {
