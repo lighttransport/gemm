@@ -14,8 +14,10 @@ TARGET_GEMM = int8_gemm
 TARGET_ATTN = int8_attention
 TARGET_FFN = int8_ffn
 TARGET_CUBLAS = cublas_int8_gemm
+TARGET_TEST_TYPES = test_int8_types
+TARGET_TEST_APPROX = test_int8_approx
 
-.PHONY: all clean run help bench sr attention ffn test cublas
+.PHONY: all clean run help bench sr attention ffn test test-unit cublas
 
 all: $(TARGET_GEMM) $(TARGET_ATTN) $(TARGET_FFN)
 
@@ -38,6 +40,13 @@ $(TARGET_ATTN): int8_attention.c $(HEADERS)
 $(TARGET_FFN): int8_ffn.c $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ int8_ffn.c -lm
 
+# Unit tests (CPU-only, no GPU required)
+$(TARGET_TEST_TYPES): test_int8_types.c $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ test_int8_types.c -lm
+
+$(TARGET_TEST_APPROX): test_int8_approx.c $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ test_int8_approx.c -lm
+
 # Run targets
 run: $(TARGET_GEMM)
 	./$(TARGET_GEMM)
@@ -57,8 +66,22 @@ ffn: $(TARGET_FFN)
 ffn-bench: $(TARGET_FFN)
 	./$(TARGET_FFN) --bench
 
+# Unit tests (CPU-only, no GPU required)
+test-unit: $(TARGET_TEST_TYPES) $(TARGET_TEST_APPROX)
+	@echo "=== Testing INT8 Types ==="
+	./$(TARGET_TEST_TYPES)
+	@echo ""
+	@echo "=== Testing INT8 Approximations ==="
+	./$(TARGET_TEST_APPROX)
+
 # Test all components
-test: $(TARGET_ATTN) $(TARGET_FFN)
+test: $(TARGET_ATTN) $(TARGET_FFN) $(TARGET_TEST_TYPES) $(TARGET_TEST_APPROX)
+	@echo "=== Testing INT8 Types ==="
+	./$(TARGET_TEST_TYPES)
+	@echo ""
+	@echo "=== Testing INT8 Approximations ==="
+	./$(TARGET_TEST_APPROX)
+	@echo ""
 	@echo "=== Testing INT8 Flash Attention ==="
 	./$(TARGET_ATTN) --seq 32 --dim 32
 	@echo ""
@@ -69,7 +92,7 @@ test: $(TARGET_ATTN) $(TARGET_FFN)
 	./$(TARGET_FFN) --bench
 
 clean:
-	rm -f $(TARGET_GEMM) $(TARGET_ATTN) $(TARGET_FFN)
+	rm -f $(TARGET_GEMM) $(TARGET_ATTN) $(TARGET_FFN) $(TARGET_TEST_TYPES) $(TARGET_TEST_APPROX)
 
 help:
 	@echo "INT8 Neural Network Components"

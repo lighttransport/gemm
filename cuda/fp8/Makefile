@@ -10,8 +10,9 @@ LDFLAGS = -ldl -lm
 SRCS = fp8_gemm.c ../cuew.c
 TARGET = fp8_gemm
 TARGET_CUBLAS = cublas_fp8_gemm
+TARGET_TEST_TYPES = test_fp8_types
 
-.PHONY: all clean run help cublas
+.PHONY: all clean run help cublas test-unit
 
 all: $(TARGET)
 
@@ -39,11 +40,18 @@ cublas_fp16_gemm: cublas_fp16_gemm.c ../cuew.c ../cuew.h
 fp16: cublas_fp16_gemm
 	./cublas_fp16_gemm
 
+# Unit test (CPU-only, no GPU required)
+$(TARGET_TEST_TYPES): test_fp8_types.c fp8_types.h
+	$(CC) $(CFLAGS) -o $@ test_fp8_types.c -lm
+
+test-unit: $(TARGET_TEST_TYPES)
+	./$(TARGET_TEST_TYPES)
+
 run: $(TARGET)
 	./$(TARGET)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(TARGET_TEST_TYPES)
 
 help:
 	@echo "FP8 GEMM using cuew (no CUDA SDK required)"
