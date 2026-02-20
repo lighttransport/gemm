@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
     // CPU encode
     fprintf(stderr, "\n=== CPU Encode ===\n");
     auto cpu_start = std::chrono::high_resolution_clock::now();
-    float *cpu_result = vision_encode(vm, rgb_norm.data(), width, height);
+    float *cpu_result = vision_encode(vm, rgb_norm.data(), width, height, 1);
     auto cpu_end = std::chrono::high_resolution_clock::now();
     double cpu_ms = std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count();
 

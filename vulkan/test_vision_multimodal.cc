@@ -13,6 +13,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <thread>
 
 #define PROFILER_IMPLEMENTATION
 extern "C" {
@@ -187,8 +188,10 @@ static void print_usage(const char *prog) {
 int main(int argc, char **argv) {
     std::string model_path, mmproj_path, image_path, pattern = "gradient";
     std::string prompt = "Describe what you see in this image in detail.";
-    int image_size = 0, max_gen = 100, device_id = 0, n_threads = 1;  // 0 = auto (smart resize)
-    bool gpu_llm = false;
+    int n_phys_cores = (int)std::thread::hardware_concurrency() / 2;
+    if (n_phys_cores < 1) n_phys_cores = 1;
+    int image_size = 0, max_gen = 100, device_id = 0, n_threads = n_phys_cores;  // 0 = auto (smart resize)
+    bool gpu_llm = false, cpu_vision = false;
     VulkanVisionEncoder::AttentionMode attn_mode = VulkanVisionEncoder::ATTN_FLASH_GPU;
 
     for (int i = 1; i < argc; i++) {
@@ -201,6 +204,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--max-gen") == 0 && i+1 < argc) max_gen = atoi(argv[++i]);
         else if (strcmp(argv[i], "--device") == 0 && i+1 < argc) device_id = atoi(argv[++i]);
         else if (strcmp(argv[i], "--gpu-llm") == 0) gpu_llm = true;
+        else if (strcmp(argv[i], "--cpu-vision") == 0) cpu_vision = true;
         else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-t") == 0 && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--attn") == 0 && i+1 < argc) {
@@ -356,7 +360,7 @@ int main(int argc, char **argv) {
     }
 
     // CPU vision encode for comparison (disabled for performance — enable with --cpu-vision)
-    if (std::find(argv, argv + argc, std::string("--cpu-vision")) != argv + argc) {
+    if (cpu_vision) {
         int channels;
         int cpu_w, cpu_h;
         uint8_t *img2 = stbi_load(image_path.c_str(), &cpu_w, &cpu_h, &channels, 3);
@@ -367,7 +371,7 @@ int main(int argc, char **argv) {
         if (img2) {
             float *cpu_norm = vision_normalize_image(vm, img2, img_w, img_h);
             free(img2);
-            float *cpu_embd = vision_encode(vm, cpu_norm, img_w, img_h);
+            float *cpu_embd = vision_encode(vm, cpu_norm, img_w, img_h, n_threads);
             free(cpu_norm);
             if (cpu_embd) {
                 fprintf(stderr, "  CPU vision embd[0][0..7]:");
