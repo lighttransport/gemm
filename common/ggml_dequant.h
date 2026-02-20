@@ -109,6 +109,23 @@ void dequantize_row_q6_K(const void *src, float *dst, int n);
 /* Dequantize a row. Returns 0 on success, -1 if type unsupported. */
 int dequant_row(uint32_t ggml_type, const void *src, float *dst, int n);
 
+/* Get the byte size of one row of n elements in a given GGML type. */
+static inline size_t dequant_row_size(uint32_t type, int n) {
+    int bs = 1, ts = 4;
+    switch (type) {
+        case GGML_TYPE_Q2_K: bs = 256; ts = 84;  break;
+        case GGML_TYPE_Q3_K: bs = 256; ts = 110; break;
+        case GGML_TYPE_Q8_0: bs = 32;  ts = 34;  break;
+        case GGML_TYPE_Q4_K: bs = 256; ts = 144; break;
+        case GGML_TYPE_Q5_K: bs = 256; ts = 176; break;
+        case GGML_TYPE_Q6_K: bs = 256; ts = 210; break;
+        case GGML_TYPE_F32:  bs = 1;   ts = 4;   break;
+        case GGML_TYPE_F16:  bs = 1;   ts = 2;   break;
+        default: return 0;
+    }
+    return (size_t)((n + bs - 1) / bs) * ts;
+}
+
 /* Fused F16·F32 dot product: sum(a_f16[i] * b_f32[i]) for i in [0, n).
  * Uses AVX2+F16C+FMA when available, scalar fallback otherwise. */
 static inline float vec_dot_f16_f32(const uint16_t *a, const float *b, int n);

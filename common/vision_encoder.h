@@ -616,7 +616,7 @@ float *vision_encode(vision_model *vm, const float *rgb_norm, int width, int hei
                 float *out = hidden + patch_idx * dim;
 
                 /* Extract patch pixels in CHW order */
-                float patch[768]; /* 3*16*16 */
+                float *patch = (float *)alloca(kernel_size * sizeof(float)); /* 3*ps*ps */
                 for (int c = 0; c < 3; c++) {
                     for (int dy = 0; dy < ps; dy++) {
                         for (int dx = 0; dx < ps; dx++) {
