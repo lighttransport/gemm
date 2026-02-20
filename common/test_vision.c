@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "Encoding image through vision encoder...\n");
     clock_t t0 = clock();
-    float *vision_embd = vision_encode(vm, img_norm, img_w, img_h);
+    float *vision_embd = vision_encode(vm, img_norm, img_w, img_h, 1);
     clock_t t1 = clock();
     free(img_norm);
 
