@@ -279,7 +279,7 @@ int main(int argc, char **argv) {
         // Smart resize: preserve aspect ratio, align to patch_size * spatial_merge
         // Matches llama.cpp Qwen-VL preprocessing exactly
         {
-            int align_size = 32; // patch_size(16) * spatial_merge(2)
+            int align_size = vm->patch_size * vm->spatial_merge;
             // min/max tokens: 8..4096, each token covers align_size^2 pixels
             int min_pixels = 8 * align_size * align_size;     // 8192
             int max_pixels = 4096 * align_size * align_size;  // 4194304
@@ -440,9 +440,8 @@ int main(int argc, char **argv) {
 
         // Text before: dequant token embeddings
         for (int i = 0; i < n_before; i++) {
-            // Dequant token embedding: F16 = 2 bytes/elem
             {
-                size_t rb = (size_t)model->n_embd * 2; // F16
+                size_t rb = dequant_row_size(model->token_embd.type, model->n_embd);
                 const void *rd = (const uint8_t*)model->token_embd.data + (size_t)tokens_before[i] * rb;
                 dequant_row(model->token_embd.type, rd, all_embds + (size_t)idx * batch_embd_stride, model->n_embd);
             }
@@ -475,9 +474,8 @@ int main(int argc, char **argv) {
 
         // Text after
         for (int i = 0; i < n_after; i++) {
-            // Dequant token embedding: F16 = 2 bytes/elem
             {
-                size_t rb = (size_t)model->n_embd * 2; // F16
+                size_t rb = dequant_row_size(model->token_embd.type, model->n_embd);
                 const void *rd = (const uint8_t*)model->token_embd.data + (size_t)tokens_after[i] * rb;
                 dequant_row(model->token_embd.type, rd, all_embds + (size_t)idx * batch_embd_stride, model->n_embd);
             }
