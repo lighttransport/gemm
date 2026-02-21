@@ -116,6 +116,7 @@ private:
     Pipeline pipe_rmsnorm_;
     Pipeline pipe_matvec_;
     Pipeline pipe_matvec_q8_0_;
+    Pipeline pipe_matvec_f16_;
     Pipeline pipe_silu_mul_;
     Pipeline pipe_rope_neox_;
     Pipeline pipe_rope_mrope_;
@@ -187,6 +188,7 @@ private:
     // Helper: dequantize and upload tensor
     bool uploadTensor(const std::string &name, const qtensor &t);
     bool uploadTensorRaw(const std::string &name, const qtensor &t);
+    bool uploadTensorF16(const std::string &name, const qtensor &t);
     std::vector<float> dequantFull(const qtensor &t);
 
     // Create pipelines
@@ -223,6 +225,10 @@ private:
     // Auto-dispatch matvec: picks Q8_0 or F32 based on weight_types_
     bool dispatchMatvecAuto(const BufInfo &x, const std::string &w_name, BufInfo &dst,
                             uint32_t N, uint32_t K, uint32_t row_offset = 0);
+
+    // F16 matvec dispatch
+    bool dispatchMatvecF16(const BufInfo &x, const BufInfo &W_f16, BufInfo &dst,
+                           uint32_t N, uint32_t K, uint32_t row_offset = 0);
 
     // Q8_0 matvec dispatch
     bool dispatchMatvecQ8(const BufInfo &x, const BufInfo &W_raw, BufInfo &dst,

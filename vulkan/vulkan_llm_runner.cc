@@ -104,6 +104,7 @@ VulkanLLMRunner::~VulkanLLMRunner() {
         runner_.destroyComputePipeline(pipe_rmsnorm_);
         runner_.destroyComputePipeline(pipe_matvec_);
         runner_.destroyComputePipeline(pipe_matvec_q8_0_);
+        runner_.destroyComputePipeline(pipe_matvec_f16_);
         runner_.destroyComputePipeline(pipe_silu_mul_);
         runner_.destroyComputePipeline(pipe_rope_neox_);
         runner_.destroyComputePipeline(pipe_rope_mrope_);
@@ -239,6 +240,22 @@ bool VulkanLLMRunner::uploadTensor(const std::string &name, const qtensor &t) {
     return true;
 }
 
+bool VulkanLLMRunner::uploadTensorF16(const std::string &name, const qtensor &t) {
+    if (!t.data) return false;
+    size_t total_bytes = (size_t)t.n_rows * t.n_cols * sizeof(uint16_t);
+    auto buf = createGpuBuffer(total_bytes);
+    if (buf.buffer == VK_NULL_HANDLE) return false;
+
+    if (!uploadToBuffer(buf, t.data, total_bytes)) {
+        runner_.destroyBuffer(buf);
+        return false;
+    }
+
+    weight_bufs_[name] = buf;
+    weight_types_[name] = GGML_TYPE_F16;
+    return true;
+}
+
 bool VulkanLLMRunner::uploadTensorRaw(const std::string &name, const qtensor &t) {
     if (!t.data) return false;
     int block_size = 32, type_size = 34;  // Q8_0
@@ -289,6 +306,13 @@ bool VulkanLLMRunner::createPipelines() {
         auto spirv = load("matvec_q8_0_f32");
         if (spirv.empty()) return false;
         if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 12, pipe_matvec_q8_0_))
+            return false;
+    }
+    // matvec_f16_f32: 3 buffers, push {N, K, row0} = 12 bytes
+    {
+        auto spirv = load("matvec_f16_f32");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 12, pipe_matvec_f16_))
             return false;
     }
     // silu_mul_f32: 2 buffers, push {n} = 4 bytes
@@ -423,7 +447,24 @@ bool VulkanLLMRunner::dispatchMatvecAuto(const BufInfo &x, const std::string &w_
     if (it != weight_types_.end() && it->second == GGML_TYPE_Q8_0) {
         return dispatchMatvecQ8(x, weight_bufs_[w_name], dst, N, K, row_offset);
     }
+    if (it != weight_types_.end() && it->second == GGML_TYPE_F16) {
+        return dispatchMatvecF16(x, weight_bufs_[w_name], dst, N, K, row_offset);
+    }
     return dispatchMatvec(x, weight_bufs_[w_name], dst, N, K, row_offset);
+}
+
+bool VulkanLLMRunner::dispatchMatvecF16(const BufInfo &x, const BufInfo &W_f16, BufInfo &dst,
+                                         uint32_t N, uint32_t K, uint32_t row_offset) {
+    std::vector<BufInfo> bufs = {x, W_f16, dst};
+    runner_.updateDescriptorSet(pipe_matvec_f16_, bufs);
+    struct { uint32_t N, K, row0; } pc = {N, K, row_offset};
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_matvec_f16_);
+    runner_.bindDescriptorSets(pipe_matvec_f16_);
+    runner_.pushConstants(pipe_matvec_f16_, &pc, sizeof(pc));
+    runner_.dispatch(N);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
 }
 
 bool VulkanLLMRunner::dispatchMatvecQ8(const BufInfo &x, const BufInfo &W_raw, BufInfo &dst,
@@ -893,7 +934,10 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
     {
         qtensor t = llm_load_qt(g, "output.weight");
         if (t.data) {
-            bool ok = (t.type == GGML_TYPE_Q8_0) ? uploadTensorRaw("output", t) : uploadTensor("output", t);
+            bool ok;
+            if (t.type == GGML_TYPE_Q8_0) ok = uploadTensorRaw("output", t);
+            else if (t.type == GGML_TYPE_F16) ok = uploadTensorF16("output", t);
+            else ok = uploadTensor("output", t);
             if (!ok) {
                 last_error_ = "Failed to upload tensor output.weight";
                 return false;
@@ -923,6 +967,8 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
                 bool ok;
                 if (t.type == GGML_TYPE_Q8_0) {
                     ok = uploadTensorRaw(key, t);
+                } else if (t.type == GGML_TYPE_F16) {
+                    ok = uploadTensorF16(key, t);
                 } else {
                     ok = uploadTensor(key, t);
                 }
@@ -1510,38 +1556,47 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
         // Q[n_tok, q_dim] = xb[n_tok, n_embd] * W_q^T[q_dim, n_embd]
         auto it_q = weight_types_.find(ln.attn_q);
         bool q8_q = (it_q != weight_types_.end() && it_q->second == GGML_TYPE_Q8_0);
-        if (q8_q) {
-            dispatchDequantQ8(weight_bufs_[ln.attn_q], buf_weight_f16_, q_dim, n_embd_);
-            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfq_, n_tokens, q_dim, n_embd_);
-        } else {
-            // Fallback: per-token matvec (slow but correct for F32 weights)
-            for (int t = 0; t < n_tokens; t++) {
-                // Would need offset views. For now, unsupported.
-                last_error_ = "Batch GEMM requires Q8_0 weights";
+        {
+            uint32_t wt_q = (it_q != weight_types_.end()) ? it_q->second : GGML_TYPE_F32;
+            if (wt_q == GGML_TYPE_Q8_0) {
+                dispatchDequantQ8(weight_bufs_[ln.attn_q], buf_weight_f16_, q_dim, n_embd_);
+                dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfq_, n_tokens, q_dim, n_embd_);
+            } else if (wt_q == GGML_TYPE_F16) {
+                dispatchMatmulCoopmatNT(buf_pfxb_, weight_bufs_[ln.attn_q], buf_pfq_, n_tokens, q_dim, n_embd_);
+            } else {
+                last_error_ = "Batch GEMM requires Q8_0 or F16 weights";
                 return nullptr;
             }
         }
 
         // K projection
-        auto it_k = weight_types_.find(ln.attn_k);
-        bool q8_k = (it_k != weight_types_.end() && it_k->second == GGML_TYPE_Q8_0);
-        if (q8_k) {
-            dispatchDequantQ8(weight_bufs_[ln.attn_k], buf_weight_f16_, kv_dim, n_embd_);
-            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfk_, n_tokens, kv_dim, n_embd_);
-        } else {
-            last_error_ = "Batch GEMM requires Q8_0 weights";
-            return nullptr;
+        {
+            auto it_k = weight_types_.find(ln.attn_k);
+            uint32_t wt_k = (it_k != weight_types_.end()) ? it_k->second : GGML_TYPE_F32;
+            if (wt_k == GGML_TYPE_Q8_0) {
+                dispatchDequantQ8(weight_bufs_[ln.attn_k], buf_weight_f16_, kv_dim, n_embd_);
+                dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfk_, n_tokens, kv_dim, n_embd_);
+            } else if (wt_k == GGML_TYPE_F16) {
+                dispatchMatmulCoopmatNT(buf_pfxb_, weight_bufs_[ln.attn_k], buf_pfk_, n_tokens, kv_dim, n_embd_);
+            } else {
+                last_error_ = "Batch GEMM requires Q8_0 or F16 weights";
+                return nullptr;
+            }
         }
 
         // V projection
-        auto it_v = weight_types_.find(ln.attn_v);
-        bool q8_v = (it_v != weight_types_.end() && it_v->second == GGML_TYPE_Q8_0);
-        if (q8_v) {
-            dispatchDequantQ8(weight_bufs_[ln.attn_v], buf_weight_f16_, kv_dim, n_embd_);
-            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfv_, n_tokens, kv_dim, n_embd_);
-        } else {
-            last_error_ = "Batch GEMM requires Q8_0 weights";
-            return nullptr;
+        {
+            auto it_v = weight_types_.find(ln.attn_v);
+            uint32_t wt_v = (it_v != weight_types_.end()) ? it_v->second : GGML_TYPE_F32;
+            if (wt_v == GGML_TYPE_Q8_0) {
+                dispatchDequantQ8(weight_bufs_[ln.attn_v], buf_weight_f16_, kv_dim, n_embd_);
+                dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfv_, n_tokens, kv_dim, n_embd_);
+            } else if (wt_v == GGML_TYPE_F16) {
+                dispatchMatmulCoopmatNT(buf_pfxb_, weight_bufs_[ln.attn_v], buf_pfv_, n_tokens, kv_dim, n_embd_);
+            } else {
+                last_error_ = "Batch GEMM requires Q8_0 or F16 weights";
+                return nullptr;
+            }
         }
 
         // QK-Norm (batched: treat as n_tokens*n_heads / n_tokens*n_kv_heads heads)
@@ -1584,13 +1639,18 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
                             max_seq_len_, scale);
 
         // Output projection: out[n_tok, n_embd] = attn_out[n_tok, q_dim] * W_o^T[n_embd, q_dim]
-        auto it_o = weight_types_.find(ln.attn_output);
-        if (it_o != weight_types_.end() && it_o->second == GGML_TYPE_Q8_0) {
-            dispatchDequantQ8(weight_bufs_[ln.attn_output], buf_weight_f16_, n_embd_, q_dim);
-            dispatchMatmulCoopmatNT(buf_pf_attn_out_, buf_weight_f16_, buf_pfxb_, n_tokens, n_embd_, q_dim);
-        } else {
-            last_error_ = "Batch GEMM requires Q8_0 weights";
-            return nullptr;
+        {
+            auto it_o = weight_types_.find(ln.attn_output);
+            uint32_t wt_o = (it_o != weight_types_.end()) ? it_o->second : GGML_TYPE_F32;
+            if (wt_o == GGML_TYPE_Q8_0) {
+                dispatchDequantQ8(weight_bufs_[ln.attn_output], buf_weight_f16_, n_embd_, q_dim);
+                dispatchMatmulCoopmatNT(buf_pf_attn_out_, buf_weight_f16_, buf_pfxb_, n_tokens, n_embd_, q_dim);
+            } else if (wt_o == GGML_TYPE_F16) {
+                dispatchMatmulCoopmatNT(buf_pf_attn_out_, weight_bufs_[ln.attn_output], buf_pfxb_, n_tokens, n_embd_, q_dim);
+            } else {
+                last_error_ = "Batch GEMM requires Q8_0 or F16 weights";
+                return nullptr;
+            }
         }
 
         // Residual: x += xb
@@ -1606,36 +1666,51 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
         }
 
         // Gate
-        auto it_gate = weight_types_.find(ln.ffn_gate);
-        if (it_gate != weight_types_.end() && it_gate->second == GGML_TYPE_Q8_0) {
-            dispatchDequantQ8(weight_bufs_[ln.ffn_gate], buf_weight_f16_, n_ff_, n_embd_);
-            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pf_ffn_gate_, n_tokens, n_ff_, n_embd_);
-        } else {
-            last_error_ = "Batch GEMM requires Q8_0 weights";
-            return nullptr;
+        {
+            auto it_gate = weight_types_.find(ln.ffn_gate);
+            uint32_t wt_gate = (it_gate != weight_types_.end()) ? it_gate->second : GGML_TYPE_F32;
+            if (wt_gate == GGML_TYPE_Q8_0) {
+                dispatchDequantQ8(weight_bufs_[ln.ffn_gate], buf_weight_f16_, n_ff_, n_embd_);
+                dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pf_ffn_gate_, n_tokens, n_ff_, n_embd_);
+            } else if (wt_gate == GGML_TYPE_F16) {
+                dispatchMatmulCoopmatNT(buf_pfxb_, weight_bufs_[ln.ffn_gate], buf_pf_ffn_gate_, n_tokens, n_ff_, n_embd_);
+            } else {
+                last_error_ = "Batch GEMM requires Q8_0 or F16 weights";
+                return nullptr;
+            }
         }
 
         // Up
-        auto it_up = weight_types_.find(ln.ffn_up);
-        if (it_up != weight_types_.end() && it_up->second == GGML_TYPE_Q8_0) {
-            dispatchDequantQ8(weight_bufs_[ln.ffn_up], buf_weight_f16_, n_ff_, n_embd_);
-            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pf_ffn_up_, n_tokens, n_ff_, n_embd_);
-        } else {
-            last_error_ = "Batch GEMM requires Q8_0 weights";
-            return nullptr;
+        {
+            auto it_up = weight_types_.find(ln.ffn_up);
+            uint32_t wt_up = (it_up != weight_types_.end()) ? it_up->second : GGML_TYPE_F32;
+            if (wt_up == GGML_TYPE_Q8_0) {
+                dispatchDequantQ8(weight_bufs_[ln.ffn_up], buf_weight_f16_, n_ff_, n_embd_);
+                dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pf_ffn_up_, n_tokens, n_ff_, n_embd_);
+            } else if (wt_up == GGML_TYPE_F16) {
+                dispatchMatmulCoopmatNT(buf_pfxb_, weight_bufs_[ln.ffn_up], buf_pf_ffn_up_, n_tokens, n_ff_, n_embd_);
+            } else {
+                last_error_ = "Batch GEMM requires Q8_0 or F16 weights";
+                return nullptr;
+            }
         }
 
         // SiLU(gate) * up
         dispatchSiluMul(buf_pf_ffn_gate_, buf_pf_ffn_up_, n_tokens * n_ff_);
 
         // Down
-        auto it_down = weight_types_.find(ln.ffn_down);
-        if (it_down != weight_types_.end() && it_down->second == GGML_TYPE_Q8_0) {
-            dispatchDequantQ8(weight_bufs_[ln.ffn_down], buf_weight_f16_, n_embd_, n_ff_);
-            dispatchMatmulCoopmatNT(buf_pf_ffn_gate_, buf_weight_f16_, buf_pfxb_, n_tokens, n_embd_, n_ff_);
-        } else {
-            last_error_ = "Batch GEMM requires Q8_0 weights";
-            return nullptr;
+        {
+            auto it_down = weight_types_.find(ln.ffn_down);
+            uint32_t wt_down = (it_down != weight_types_.end()) ? it_down->second : GGML_TYPE_F32;
+            if (wt_down == GGML_TYPE_Q8_0) {
+                dispatchDequantQ8(weight_bufs_[ln.ffn_down], buf_weight_f16_, n_embd_, n_ff_);
+                dispatchMatmulCoopmatNT(buf_pf_ffn_gate_, buf_weight_f16_, buf_pfxb_, n_tokens, n_embd_, n_ff_);
+            } else if (wt_down == GGML_TYPE_F16) {
+                dispatchMatmulCoopmatNT(buf_pf_ffn_gate_, weight_bufs_[ln.ffn_down], buf_pfxb_, n_tokens, n_embd_, n_ff_);
+            } else {
+                last_error_ = "Batch GEMM requires Q8_0 or F16 weights";
+                return nullptr;
+            }
         }
 
         // Residual

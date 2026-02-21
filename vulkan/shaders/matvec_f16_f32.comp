@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: MIT
+// Matrix-vector multiply with F16 weights: dst[i] = sum_j(W_f16[i*K + j] * x[j])
+// One workgroup per output row. 256 threads reduce K elements.
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuffer { float x[]; };
+layout(std430, binding = 1) readonly buffer WBuffer { float16_t W[]; };
+layout(std430, binding = 2) writeonly buffer DstBuffer { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;    // number of output rows
+    uint K;    // number of input columns
+    uint row0; // starting row in W
+} pc;
+
+shared float s_reduce[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= pc.N) return;
+
+    uint w_base = (pc.row0 + row) * pc.K;
+
+    float sum = 0.0;
+    for (uint j = tid; j < pc.K; j += 256) {
+        sum += float(W[w_base + j]) * x[j];
+    }
+
+    s_reduce[tid] = sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        barrier();
+    }
+
+    if (tid == 0) {
+        dst[row] = s_reduce[0];
+    }
+}
