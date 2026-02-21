@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: MIT
+// Causal prefill attention: one workgroup per (token, head).
+// Each query token attends to KV[0..cache_pos[token]].
+// Uses online softmax (FlashAttention-1 style).
+//
+// Dispatch: n_tokens * n_heads workgroups.
+#version 450
+
+#define TILE_KV 64
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QBuffer { float q[]; };
+layout(std430, binding = 1) readonly buffer KCacheBuffer { float k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCacheBuffer { float v_cache[]; };
+layout(std430, binding = 3) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 4) readonly buffer PosBuffer { int cache_pos[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    float scale;
+} pc;
+
+shared float s_scores[TILE_KV];
+shared float s_reduce[256];
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint token = wg / pc.n_heads;
+    uint h = wg % pc.n_heads;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (token >= pc.n_tokens) return;
+
+    uint gqa_ratio = pc.n_heads / pc.n_kv_heads;
+    uint kv_h = h / gqa_ratio;
+    uint kv_dim = pc.n_kv_heads * pc.head_dim;
+
+    // Causal: attend to positions [0..cache_pos[token]]
+    uint seq_len = uint(cache_pos[token]) + 1u;
+
+    uint q_base = (token * pc.n_heads + h) * pc.head_dim;
+    uint out_base = (token * pc.n_heads + h) * pc.head_dim;
+
+    float o_acc = 0.0;
+    float m_prev = -1e30;
+    float l_prev = 0.0;
+
+    uint n_tiles = (seq_len + TILE_KV - 1u) / TILE_KV;
+
+    for (uint tile = 0u; tile < n_tiles; tile++) {
+        uint tile_start = tile * TILE_KV;
+        uint tile_end = min(tile_start + TILE_KV, seq_len);
+        uint tile_len = tile_end - tile_start;
+
+        // Compute dot products
+        for (uint j = tid; j < tile_len; j += 256u) {
+            uint t = tile_start + j;
+            uint k_base = t * kv_dim + kv_h * pc.head_dim;
+            float dot = 0.0;
+            for (uint d = 0u; d < pc.head_dim; d++) {
+                dot += q[q_base + d] * k_cache[k_base + d];
+            }
+            s_scores[j] = dot * pc.scale;
+        }
+        barrier();
+
+        // Tile max reduction
+        float local_max = -1e30;
+        for (uint j = tid; j < tile_len; j += 256u) {
+            local_max = max(local_max, s_scores[j]);
+        }
+        s_reduce[tid] = local_max;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + s]);
+            barrier();
+        }
+        float m_tile = s_reduce[0];
+
+        float m_new = max(m_prev, m_tile);
+        float correction = exp(m_prev - m_new);
+        o_acc *= correction;
+        l_prev *= correction;
+
+        float tile_l = 0.0;
+        for (uint j = 0u; j < tile_len; j++) {
+            float w = exp(s_scores[j] - m_new);
+            if (tid < pc.head_dim) {
+                uint t = tile_start + j;
+                uint v_base = t * kv_dim + kv_h * pc.head_dim;
+                o_acc += w * v_cache[v_base + tid];
+            }
+            tile_l += w;
+        }
+
+        l_prev += tile_l;
+        m_prev = m_new;
+        barrier();
+    }
+
+    if (tid < pc.head_dim && l_prev > 0.0) {
+        out_buf[out_base + tid] = o_acc / l_prev;
+    }
+}

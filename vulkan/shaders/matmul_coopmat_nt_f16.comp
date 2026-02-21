@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Cooperative Matrix NT GEMM for LLM prefill:
+//   C[M,N] = A[M,K] * B^T[N,K]
+//
+// A: F32 activations (cast to F16 on load)
+// B: F16 weights (row-major, treated as B^T — each row is an output neuron)
+// C: F32 output
+//
+// Tiles: BM=128, BN=64, BK=64, coopmat 16x16x16
+// 256 threads / 4 subgroups per workgroup
+//
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#define CM_M 16
+#define CM_N 16
+#define CM_K 16
+
+#define BM 128
+#define BN 64
+#define BK 64
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// A is F32 activations [M, K]
+layout(std430, binding = 0) readonly buffer MatrixA { float A_f32[]; };
+// B is F16 weights [N, K] (each row = one output neuron, i.e., B^T layout)
+layout(std430, binding = 1) readonly buffer MatrixB { float16_t B[]; };
+// C is F32 output [M, N]
+layout(std430, binding = 2) writeonly buffer MatrixC { float C[]; };
+
+// Vectorized view of B
+layout(std430, binding = 1) readonly buffer MatrixBVec4 { f16vec4 B_vec4[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+#define A_STRIDE (BK + 16)
+#define B_STRIDE (BK + 16)
+
+shared float16_t tileA[BM][A_STRIDE];
+// For NT: we load B[N,K] and need to present it as B^T[K,N] to coopmat.
+// We load B rows into shared memory transposed: tileB[BK][BN]
+shared float16_t tileB[BK][B_STRIDE];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint subgroup_id = gl_SubgroupID;
+    const uint num_subgroups = gl_NumSubgroups;
+
+    const uint block_row = gl_WorkGroupID.y * BM;
+    const uint block_col = gl_WorkGroupID.x * BN;
+
+    uint warp_row, warp_col;
+    uint tiles_m, tiles_n;
+
+    if (num_subgroups <= 4) {
+        warp_row = subgroup_id * 32;
+        warp_col = 0;
+        tiles_m = 2;
+        tiles_n = 4;
+    } else {
+        warp_row = subgroup_id * 16;
+        warp_col = 0;
+        tiles_m = 1;
+        tiles_n = 4;
+    }
+
+    coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator> acc[2][4];
+    [[unroll]] for (uint i = 0; i < 2; i++) {
+        [[unroll]] for (uint j = 0; j < 4; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    const uint a_vec4_per_thread = (BM * BK) / BLOCK_SIZE / 4;  // 8
+    const uint b_vec4_per_thread = (BN * BK) / BLOCK_SIZE / 4;  // 4
+
+    for (uint k_base = 0; k_base < pc.K; k_base += BK) {
+
+        // Load A tile [BM x BK] — cast F32 to F16
+        [[unroll]] for (uint v = 0; v < a_vec4_per_thread; v++) {
+            uint vec_idx = tid * a_vec4_per_thread + v;
+            uint elem_idx = vec_idx * 4;
+            uint row = elem_idx / BK;
+            uint col = elem_idx % BK;
+
+            uint gr = block_row + row;
+            uint gc = k_base + col;
+
+            // Load F32 and cast to F16
+            [[unroll]] for (uint e = 0; e < 4; e++) {
+                float val = (gr < pc.M && gc + e < pc.K) ? A_f32[gr * pc.K + gc + e] : 0.0;
+                tileA[row][col + e] = float16_t(val);
+            }
+        }
+
+        // Load B tile transposed: B[N,K] rows → tileB[BK][BN] columns
+        // We need tileB[k][n] = B[(block_col+n), (k_base+k)]
+        // 256 threads, BN*BK = 64*64 = 4096 elements, 16 per thread
+        [[unroll]] for (uint v = 0; v < b_vec4_per_thread; v++) {
+            uint vec_idx = tid * b_vec4_per_thread + v;
+            uint elem_idx = vec_idx * 4;
+            // Linear index in [BN, BK] space → transpose into [BK, BN]
+            uint n_local = elem_idx / BK;
+            uint k_local = elem_idx % BK;
+
+            uint gn = block_col + n_local;
+            uint gk = k_base + k_local;
+
+            if (gn < pc.N && gk + 3 < pc.K && ((gk & 3) == 0)) {
+                f16vec4 data = B_vec4[(gn * pc.K + gk) >> 2];
+                tileB[k_local + 0][n_local] = data.x;
+                tileB[k_local + 1][n_local] = data.y;
+                tileB[k_local + 2][n_local] = data.z;
+                tileB[k_local + 3][n_local] = data.w;
+            } else {
+                [[unroll]] for (uint e = 0; e < 4; e++) {
+                    float16_t val = (gn < pc.N && gk + e < pc.K)
+                                    ? B[gn * pc.K + gk + e]
+                                    : float16_t(0);
+                    tileB[k_local + e][n_local] = val;
+                }
+            }
+        }
+
+        barrier();
+
+        // Multiply-accumulate
+        [[unroll]] for (uint k = 0; k < BK; k += CM_K) {
+            coopmat<float16_t, gl_ScopeSubgroup, CM_M, CM_K, gl_MatrixUseA> fragA[2];
+            [[unroll]] for (uint mi = 0; mi < tiles_m; mi++) {
+                coopMatLoad(fragA[mi], tileA[warp_row + mi * CM_M], k, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            [[unroll]] for (uint ni = 0; ni < tiles_n; ni++) {
+                coopmat<float16_t, gl_ScopeSubgroup, CM_K, CM_N, gl_MatrixUseB> fragB;
+                coopMatLoad(fragB, tileB[k], warp_col + ni * CM_N, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+
+                [[unroll]] for (uint mi = 0; mi < tiles_m; mi++) {
+                    acc[mi][ni] = coopMatMulAdd(fragA[mi], fragB, acc[mi][ni]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Store results as F32
+    // We need a temporary shared memory tile to store coopmat results then write to global
+    // Actually, coopMatStore can write directly to global memory.
+    [[unroll]] for (uint mi = 0; mi < tiles_m; mi++) {
+        [[unroll]] for (uint ni = 0; ni < tiles_n; ni++) {
+            uint c_row = block_row + warp_row + mi * CM_M;
+            uint c_col = block_col + warp_col + ni * CM_N;
+
+            if (c_row < pc.M && c_col < pc.N) {
+                coopMatStore(acc[mi][ni], C, c_row * pc.N + c_col, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+}

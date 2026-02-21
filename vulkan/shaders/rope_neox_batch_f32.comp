@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: MIT
+// Batched NeoX-style RoPE for prefill.
+// positions[token] = position for that token.
+// Dispatch: n_tokens * n_heads workgroups.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer VecBuffer { float vec[]; };
+layout(std430, binding = 1) readonly buffer PosBuffer { int positions[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;
+    uint n_heads;
+    uint head_dim;
+    float freq_base;
+} pc;
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint token = wg / pc.n_heads;
+    uint h = wg % pc.n_heads;
+    uint j = gl_LocalInvocationID.x;
+
+    if (token >= pc.n_tokens || h >= pc.n_heads) return;
+
+    uint half_dim = pc.head_dim / 2;
+    if (j >= half_dim) return;
+
+    int position = positions[token];
+    uint base = (token * pc.n_heads + h) * pc.head_dim;
+
+    float freq = 1.0 / pow(pc.freq_base, float(2 * j) / float(pc.head_dim));
+    float theta = float(position) * freq;
+    float cos_t = cos(theta);
+    float sin_t = sin(theta);
+
+    float v0 = vec[base + j];
+    float v1 = vec[base + j + half_dim];
+    vec[base + j]            = v0 * cos_t - v1 * sin_t;
+    vec[base + j + half_dim] = v0 * sin_t + v1 * cos_t;
+}

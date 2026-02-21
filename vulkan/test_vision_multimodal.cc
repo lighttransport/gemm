@@ -512,27 +512,98 @@ int main(int argc, char **argv) {
         clock_gettime(CLOCK_MONOTONIC, &wall_t1);
         double wall_s = (wall_t1.tv_sec - wall_t0.tv_sec) + (wall_t1.tv_nsec - wall_t0.tv_nsec) / 1e9;
         fprintf(stderr, "  Batched prefill done: %.1f s wall (%.1f s CPU)\n", wall_s, (double)(t1 - t0) / CLOCKS_PER_SEC);
+    } else if (gpu_llm) {
+        // === BATCHED GPU PREFILL (coopmat GEMM) ===
+        struct timespec wall_t0, wall_t1;
+        clock_gettime(CLOCK_MONOTONIC, &wall_t0);
+        t0 = clock();
+
+        int total_N = n_before + n_vision_tokens + n_after;
+        fprintf(stderr, "  GPU batched prefill: %d tokens total\n", total_N);
+
+        // Enable prefill
+        if (!gpu_llm_runner->enablePrefill(total_N)) {
+            fprintf(stderr, "Failed to enable prefill: %s\n", gpu_llm_runner->getLastError().c_str());
+            return 1;
+        }
+
+        // Build batch arrays
+        int n_embd_for_batch = gpu_llm_runner->n_embd();
+        std::vector<float> all_embds((size_t)total_N * n_embd_for_batch, 0.0f);
+        std::vector<int> all_cache_pos(total_N);
+        std::vector<int> all_pos_t(total_N), all_pos_h(total_N), all_pos_w(total_N);
+
+        int idx = 0;
+
+        // Text before: token embeddings via mapped GPU buffer
+        {
+            // We need to look up token embeddings. Use the CPU model's token_embd.
+            for (int i = 0; i < n_before; i++) {
+                size_t rb = dequant_row_size(model->token_embd.type, model->n_embd);
+                const void *rd = (const uint8_t*)model->token_embd.data + (size_t)tokens_before[i] * rb;
+                dequant_row(model->token_embd.type, rd, all_embds.data() + (size_t)idx * n_embd_for_batch, model->n_embd);
+                all_cache_pos[idx] = cache_pos;
+                all_pos_t[idx] = rope_pos;
+                all_pos_h[idx] = rope_pos;
+                all_pos_w[idx] = rope_pos;
+                cache_pos++; rope_pos++; idx++;
+            }
+        }
+
+        // Vision tokens with M-RoPE
+        const int image_pos0 = rope_pos;
+        for (int i = 0; i < n_vision_tokens; i++) {
+            float *embd_i = vision_embd + (size_t)i * embd_stride;
+            memcpy(all_embds.data() + (size_t)idx * n_embd_for_batch, embd_i, n_embd_for_batch * sizeof(float));
+            all_cache_pos[idx] = cache_pos;
+            int y = i / merged_w;
+            int x = i % merged_w;
+            all_pos_t[idx] = image_pos0;
+            all_pos_h[idx] = image_pos0 + y;
+            all_pos_w[idx] = image_pos0 + x;
+            cache_pos++; idx++;
+        }
+        rope_pos += std::max(merged_w, merged_h);
+
+        // Text after
+        for (int i = 0; i < n_after; i++) {
+            size_t rb = dequant_row_size(model->token_embd.type, model->n_embd);
+            const void *rd = (const uint8_t*)model->token_embd.data + (size_t)tokens_after[i] * rb;
+            dequant_row(model->token_embd.type, rd, all_embds.data() + (size_t)idx * n_embd_for_batch, model->n_embd);
+            all_cache_pos[idx] = cache_pos;
+            all_pos_t[idx] = rope_pos;
+            all_pos_h[idx] = rope_pos;
+            all_pos_w[idx] = rope_pos;
+            cache_pos++; rope_pos++; idx++;
+        }
+
+        last_prefill_logits = gpu_llm_runner->prefillEmbds(
+            all_embds.data(), total_N, n_embd_for_batch,
+            all_cache_pos.data(), all_pos_t.data(), all_pos_h.data(), all_pos_w.data());
+
+        delete[] vision_embd;
+
+        t1 = clock();
+        clock_gettime(CLOCK_MONOTONIC, &wall_t1);
+        double wall_s = (wall_t1.tv_sec - wall_t0.tv_sec) + (wall_t1.tv_nsec - wall_t0.tv_nsec) / 1e9;
+        fprintf(stderr, "  GPU batched prefill done: %.1f s wall (%.1f s CPU)\n", wall_s, (double)(t1 - t0) / CLOCKS_PER_SEC);
+
+        if (!last_prefill_logits) {
+            fprintf(stderr, "GPU prefill failed: %s\n", gpu_llm_runner->getLastError().c_str());
+            return 1;
+        }
     } else {
-        // === GPU or single-token CPU path (unchanged) ===
+        // === Single-token CPU path ===
         // Text before vision: all 3 RoPE dims use the same position
         for (int i = 0; i < n_before; i++) {
-            if (gpu_llm) {
-                gpu_llm_runner->forward(tokens_before[i], cache_pos, rope_pos, rope_pos, rope_pos, false);
-            } else {
-                transformer_forward_pos(model, tokens_before[i], cache_pos, rope_pos, rope_pos, rope_pos);
-            }
+            transformer_forward_pos(model, tokens_before[i], cache_pos, rope_pos, rope_pos, rope_pos);
             cache_pos++;
             rope_pos++;
         }
         fprintf(stderr, "  Text prefix: %d tokens done\n", n_before);
 
         // Vision tokens with M-RoPE 3D positions
-        if (model) {
-            model->ds_embd_stride = embd_stride;
-        }
-        if (gpu_llm_runner) {
-            gpu_llm_runner->setDeepstackStride(embd_stride);
-        }
+        model->ds_embd_stride = embd_stride;
         fprintf(stderr, "  Vision: %d tokens (merged grid %dx%d, M-RoPE, deepstack=%d)...\n",
                 n_vision_tokens, merged_w, merged_h, n_ds);
         t0 = clock();
@@ -544,11 +615,7 @@ int main(int argc, char **argv) {
             int mrope_t = image_pos0;
             int mrope_h = image_pos0 + y;
             int mrope_w = image_pos0 + x;
-            if (gpu_llm) {
-                gpu_llm_runner->forwardEmbd(embd_i, cache_pos, mrope_t, mrope_h, mrope_w, false);
-            } else {
-                transformer_forward_embd_pos(model, embd_i, cache_pos, mrope_t, mrope_h, mrope_w);
-            }
+            transformer_forward_embd_pos(model, embd_i, cache_pos, mrope_t, mrope_h, mrope_w);
             cache_pos++;
         }
         rope_pos += std::max(merged_w, merged_h);
@@ -560,14 +627,10 @@ int main(int argc, char **argv) {
         // Text after vision
         for (int i = 0; i < n_after; i++) {
             bool last = (i == n_after - 1);
-            if (gpu_llm) {
-                last_prefill_logits = gpu_llm_runner->forward(tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos, last);
+            if (last) {
+                last_prefill_logits = transformer_forward_logits_pos(model, tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos);
             } else {
-                if (last) {
-                    last_prefill_logits = transformer_forward_logits_pos(model, tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos);
-                } else {
-                    transformer_forward_pos(model, tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos);
-                }
+                transformer_forward_pos(model, tokens_after[i], cache_pos, rope_pos, rope_pos, rope_pos);
             }
             cache_pos++;
             rope_pos++;

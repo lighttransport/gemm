@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: MIT
+// Dequantize Q8_0 weights to F16 for coopmat GEMM.
+// One workgroup per row. 256 threads dequant ceil(K/32) blocks per row.
+//
+// Q8_0: 34-byte blocks (2-byte fp16 scale + 32 int8 values)
+// Output: F16 row-major [n_rows, n_cols]
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuffer { uint src_raw[]; };
+layout(std430, binding = 1) writeonly buffer DstBuffer { float16_t dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_rows;
+    uint n_cols;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= pc.n_rows) return;
+
+    uint n_blocks = (pc.n_cols + 31u) / 32u;
+    uint row_byte_offset = row * n_blocks * 34u;
+    uint dst_row_offset = row * pc.n_cols;
+
+    for (uint b = tid; b < n_blocks; b += 256u) {
+        uint block_byte = row_byte_offset + b * 34u;
+
+        // Read fp16 scale
+        uint scale_word = src_raw[block_byte >> 2u];
+        uint byte_in_word = block_byte & 3u;
+        uint scale_bits;
+        if (byte_in_word == 0u) {
+            scale_bits = scale_word & 0xFFFFu;
+        } else if (byte_in_word == 2u) {
+            scale_bits = (scale_word >> 16u) & 0xFFFFu;
+        } else if (byte_in_word == 1u) {
+            scale_bits = (scale_word >> 8u) & 0xFFFFu;
+        } else {
+            // byte_in_word == 3: crosses word boundary
+            uint next_word = src_raw[(block_byte >> 2u) + 1u];
+            scale_bits = ((scale_word >> 24u) & 0xFFu) | ((next_word & 0xFFu) << 8u);
+        }
+        float16_t d = float16_t(unpackHalf2x16(scale_bits).x);
+
+        // Dequant 32 int8 values
+        uint qs_byte_start = block_byte + 2u;
+        uint col_start = b * 32u;
+
+        for (uint i = 0u; i < 32u; i += 4u) {
+            uint col = col_start + i;
+            if (col >= pc.n_cols) break;
+
+            uint byte_off = qs_byte_start + i;
+            uint word_idx = byte_off >> 2u;
+            uint shift = (byte_off & 3u) * 8u;
+
+            uint packed;
+            if (shift == 0u) {
+                packed = src_raw[word_idx];
+            } else {
+                packed = (src_raw[word_idx] >> shift) | (src_raw[word_idx + 1u] << (32u - shift));
+            }
+
+            int q0 = int(packed << 24u) >> 24;
+            int q1 = int(packed << 16u) >> 24;
+            int q2 = int(packed << 8u) >> 24;
+            int q3 = int(packed) >> 24;
+
+            dst[dst_row_offset + col]     = d * float16_t(q0);
+            if (col + 1u < pc.n_cols) dst[dst_row_offset + col + 1u] = d * float16_t(q1);
+            if (col + 2u < pc.n_cols) dst[dst_row_offset + col + 2u] = d * float16_t(q2);
+            if (col + 3u < pc.n_cols) dst[dst_row_offset + col + 3u] = d * float16_t(q3);
+        }
+    }
+}

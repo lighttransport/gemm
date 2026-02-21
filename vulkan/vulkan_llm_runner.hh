@@ -45,6 +45,21 @@ public:
         return forward(token_id, position, position, position, position, compute_logits);
     }
 
+    // Enable batched prefill (allocates scratch buffers)
+    bool enablePrefill(int max_batch_size);
+
+    // Batched prefill from token IDs. Returns logits of last token.
+    float *prefillTokens(const int32_t *tokens, int n_tokens,
+                         const int *cache_pos, const int *pos_t,
+                         const int *pos_h, const int *pos_w);
+
+    // Batched prefill from embeddings. Returns logits of last token.
+    // embd: [n_tokens * embd_stride], ds_embds: optional deepstack pointers per token.
+    float *prefillEmbds(const float *embd, int n_tokens, int embd_stride,
+                        const int *cache_pos, const int *pos_t,
+                        const int *pos_h, const int *pos_w,
+                        const float **ds_embds = nullptr, int ds_embd_stride = 0);
+
     // Set deepstack embedding stride (call before vision token forwardEmbd calls)
     void setDeepstackStride(int stride) {
         ds_embd_stride_ = stride;
@@ -100,17 +115,25 @@ private:
     // Pipelines
     Pipeline pipe_rmsnorm_;
     Pipeline pipe_matvec_;
+    Pipeline pipe_matvec_q8_0_;
     Pipeline pipe_silu_mul_;
     Pipeline pipe_rope_neox_;
     Pipeline pipe_rope_mrope_;
+    Pipeline pipe_rope_neox_batch_;
+    Pipeline pipe_rope_mrope_batch_;
     Pipeline pipe_qknorm_;
     Pipeline pipe_kv_store_;
+    Pipeline pipe_kv_store_batch_;
     Pipeline pipe_attn_decode_;
+    Pipeline pipe_attn_prefill_;
     Pipeline pipe_add_;
+    Pipeline pipe_dequant_q8_0_;
+    Pipeline pipe_matmul_coopmat_nt_;
     bool pipelines_created_ = false;
 
     // Weight buffers on GPU
     std::map<std::string, BufInfo> weight_bufs_;
+    std::map<std::string, uint32_t> weight_types_;  // GGML type per weight (0=F32, GGML_TYPE_Q8_0=raw)
 
     // Per-layer weight buffer names
     struct LayerWeightNames {
@@ -139,6 +162,21 @@ private:
     std::vector<BufInfo> kv_key_bufs_;
     std::vector<BufInfo> kv_val_bufs_;
 
+    // Prefill batch scratch buffers
+    int max_prefill_tokens_ = 0;
+    bool prefill_enabled_ = false;
+    BufInfo buf_pfx_;          // [max_prefill * n_embd]
+    BufInfo buf_pfxb_;         // [max_prefill * n_embd]
+    BufInfo buf_pfq_;          // [max_prefill * q_dim]
+    BufInfo buf_pfk_;          // [max_prefill * kv_dim]
+    BufInfo buf_pfv_;          // [max_prefill * kv_dim]
+    BufInfo buf_pf_attn_out_;  // [max_prefill * q_dim]
+    BufInfo buf_pf_ffn_gate_;  // [max_prefill * n_ff]
+    BufInfo buf_pf_ffn_up_;    // [max_prefill * n_ff]
+    BufInfo buf_positions_;    // [max_prefill * 3] (t,h,w)
+    BufInfo buf_cache_pos_;    // [max_prefill]
+    BufInfo buf_weight_f16_;   // 96MB scratch for dequanted weights
+
     // CPU-side logits for download
     std::vector<float> logits_cpu_;
     std::vector<float> hidden_cpu_;
@@ -148,6 +186,7 @@ private:
 
     // Helper: dequantize and upload tensor
     bool uploadTensor(const std::string &name, const qtensor &t);
+    bool uploadTensorRaw(const std::string &name, const qtensor &t);
     std::vector<float> dequantFull(const qtensor &t);
 
     // Create pipelines
@@ -181,7 +220,51 @@ private:
                             uint32_t head_dim, uint32_t seq_len, float scale);
     bool dispatchAdd(BufInfo &dst, const BufInfo &src, uint32_t n);
 
+    // Auto-dispatch matvec: picks Q8_0 or F32 based on weight_types_
+    bool dispatchMatvecAuto(const BufInfo &x, const std::string &w_name, BufInfo &dst,
+                            uint32_t N, uint32_t K, uint32_t row_offset = 0);
+
+    // Q8_0 matvec dispatch
+    bool dispatchMatvecQ8(const BufInfo &x, const BufInfo &W_raw, BufInfo &dst,
+                          uint32_t N, uint32_t K, uint32_t row_offset = 0);
+
+    // Dequant Q8_0 -> F16
+    bool dispatchDequantQ8(const BufInfo &src, BufInfo &dst,
+                           uint32_t n_rows, uint32_t n_cols);
+
+    // Coopmat NT GEMM: C[M,N] = A[M,K] * B^T[N,K]
+    bool dispatchMatmulCoopmatNT(const BufInfo &A, const BufInfo &B, BufInfo &C,
+                                  uint32_t M, uint32_t N, uint32_t K);
+
+    // Batched RoPE
+    bool dispatchRopeNeoxBatch(BufInfo &vec, const BufInfo &positions,
+                               uint32_t n_tokens, uint32_t n_heads,
+                               uint32_t head_dim, float freq_base);
+    bool dispatchRopeMropeBatch(BufInfo &vec, const BufInfo &positions,
+                                uint32_t n_tokens, uint32_t n_heads,
+                                uint32_t head_dim, float freq_base,
+                                int sect0, int sect1, int sect2);
+
+    // Batched KV store
+    bool dispatchKvStoreBatch(const BufInfo &k, const BufInfo &v,
+                              BufInfo &k_cache, BufInfo &v_cache,
+                              const BufInfo &cache_positions,
+                              uint32_t n_tokens, uint32_t kv_dim);
+
+    // Prefill attention
+    bool dispatchAttnPrefill(const BufInfo &q, const BufInfo &k_cache,
+                             const BufInfo &v_cache, BufInfo &out,
+                             const BufInfo &cache_positions,
+                             uint32_t n_tokens, uint32_t n_heads,
+                             uint32_t n_kv_heads, uint32_t head_dim,
+                             uint32_t max_seq_len, float scale);
+
     // Internal forward pass (after x_ is loaded)
     float *forwardInternal(int cache_pos, int pos_t, int pos_h, int pos_w,
                            bool compute_logits);
+
+    // Batched forward pass
+    float *forwardBatch(int n_tokens, const int *cache_positions,
+                        const int *pos_t, const int *pos_h, const int *pos_w,
+                        bool compute_logits);
 };
