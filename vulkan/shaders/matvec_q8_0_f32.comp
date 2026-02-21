@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: MIT
+// Fused Q8_0 dequant + matrix-vector multiply.
+// dst[i] = sum_j(dequant(W_q8[i,j]) * x[j])
+// One workgroup per output row. 256 threads reduce K elements.
+//
+// Q8_0 format: blocks of 32 elements, 34 bytes each:
+//   - 2 bytes: fp16 scale (d)
+//   - 32 bytes: int8 quantized values (qs[32])
+//
+// Row layout: ceil(K/32) consecutive Q8_0 blocks.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuffer { float x[]; };
+layout(std430, binding = 1) readonly buffer WBuffer { uint W_raw[]; };  // packed Q8_0 bytes
+layout(std430, binding = 2) writeonly buffer DstBuffer { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;     // number of output rows
+    uint K;     // number of input columns (elements per row)
+    uint row0;  // starting row offset in W
+} pc;
+
+shared float s_reduce[256];
+
+// Unpack fp16 to float (IEEE 754 half-precision)
+float fp16_to_f32(uint h) {
+    uint sign = (h >> 15) & 1u;
+    uint expo = (h >> 10) & 0x1Fu;
+    uint mant = h & 0x3FFu;
+
+    float val;
+    if (expo == 0u) {
+        val = ldexp(float(mant), -24);  // subnormal
+    } else if (expo == 31u) {
+        val = (mant == 0u) ? uintBitsToFloat(0x7F800000u) : uintBitsToFloat(0x7FC00000u);
+    } else {
+        val = ldexp(float(mant | 0x400u), int(expo) - 25);
+    }
+    return (sign != 0u) ? -val : val;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= pc.N) return;
+
+    uint actual_row = pc.row0 + row;
+    uint n_blocks = (pc.K + 31u) / 32u;
+    // Each block is 34 bytes. Row starts at actual_row * n_blocks * 34 bytes.
+    // We address via uint (4 bytes), so byte offset / 4.
+    uint row_byte_offset = actual_row * n_blocks * 34u;
+
+    float sum = 0.0;
+
+    // Each thread processes blocks in a strided pattern
+    for (uint b = tid; b < n_blocks; b += 256u) {
+        // Block byte offset within raw buffer
+        uint block_byte = row_byte_offset + b * 34u;
+
+        // Read 2-byte fp16 scale (first 2 bytes of block)
+        // The scale is at byte offset block_byte, packed into a uint
+        uint scale_word = W_raw[block_byte >> 2u];
+        uint byte_in_word = block_byte & 3u;
+        uint scale_bits;
+        if (byte_in_word == 0u) {
+            scale_bits = scale_word & 0xFFFFu;
+        } else if (byte_in_word == 2u) {
+            scale_bits = (scale_word >> 16u) & 0xFFFFu;
+        } else {
+            // Unaligned: need to read across word boundary
+            scale_bits = (scale_word >> (byte_in_word * 8u)) & 0xFFFFu;
+            if (byte_in_word == 3u) {
+                uint next_word = W_raw[(block_byte >> 2u) + 1u];
+                scale_bits = ((scale_word >> 24u) & 0xFFu) | ((next_word & 0xFFu) << 8u);
+            }
+        }
+        float d = fp16_to_f32(scale_bits);
+
+        // Read 32 int8 quantized values (bytes 2..33 of block)
+        uint qs_byte_start = block_byte + 2u;
+        uint col_start = b * 32u;
+
+        // Process 32 elements in groups of 4 (one uint = 4 int8 values)
+        for (uint i = 0u; i < 32u; i += 4u) {
+            uint col = col_start + i;
+            if (col >= pc.K) break;
+
+            uint byte_off = qs_byte_start + i;
+            uint word_idx = byte_off >> 2u;
+            uint shift = (byte_off & 3u) * 8u;
+
+            uint packed;
+            if (shift == 0u) {
+                packed = W_raw[word_idx];
+            } else {
+                packed = (W_raw[word_idx] >> shift) | (W_raw[word_idx + 1u] << (32u - shift));
+            }
+
+            // Extract 4 int8 values and accumulate
+            int q0 = int(packed << 24u) >> 24;
+            int q1 = int(packed << 16u) >> 24;
+            int q2 = int(packed << 8u) >> 24;
+            int q3 = int(packed) >> 24;
+
+            sum += d * float(q0) * x[col];
+            if (col + 1u < pc.K) sum += d * float(q1) * x[col + 1u];
+            if (col + 2u < pc.K) sum += d * float(q2) * x[col + 2u];
+            if (col + 3u < pc.K) sum += d * float(q3) * x[col + 3u];
+        }
+    }
+
+    s_reduce[tid] = sum;
+    barrier();
+
+    // Reduction
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        dst[row] = s_reduce[0];
+    }
+}

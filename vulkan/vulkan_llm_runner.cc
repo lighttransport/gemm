@@ -85,16 +85,38 @@ VulkanLLMRunner::~VulkanLLMRunner() {
     for (auto &b : kv_key_bufs_) runner_.destroyBuffer(b);
     for (auto &b : kv_val_bufs_) runner_.destroyBuffer(b);
 
+    // Destroy prefill buffers
+    if (prefill_enabled_) {
+        runner_.destroyBuffer(buf_pfx_);
+        runner_.destroyBuffer(buf_pfxb_);
+        runner_.destroyBuffer(buf_pfq_);
+        runner_.destroyBuffer(buf_pfk_);
+        runner_.destroyBuffer(buf_pfv_);
+        runner_.destroyBuffer(buf_pf_attn_out_);
+        runner_.destroyBuffer(buf_pf_ffn_gate_);
+        runner_.destroyBuffer(buf_pf_ffn_up_);
+        runner_.destroyBuffer(buf_positions_);
+        runner_.destroyBuffer(buf_cache_pos_);
+        runner_.destroyBuffer(buf_weight_f16_);
+    }
+
     if (pipelines_created_) {
         runner_.destroyComputePipeline(pipe_rmsnorm_);
         runner_.destroyComputePipeline(pipe_matvec_);
+        runner_.destroyComputePipeline(pipe_matvec_q8_0_);
         runner_.destroyComputePipeline(pipe_silu_mul_);
         runner_.destroyComputePipeline(pipe_rope_neox_);
         runner_.destroyComputePipeline(pipe_rope_mrope_);
+        runner_.destroyComputePipeline(pipe_rope_neox_batch_);
+        runner_.destroyComputePipeline(pipe_rope_mrope_batch_);
         runner_.destroyComputePipeline(pipe_qknorm_);
         runner_.destroyComputePipeline(pipe_kv_store_);
+        runner_.destroyComputePipeline(pipe_kv_store_batch_);
         runner_.destroyComputePipeline(pipe_attn_decode_);
+        runner_.destroyComputePipeline(pipe_attn_prefill_);
         runner_.destroyComputePipeline(pipe_add_);
+        runner_.destroyComputePipeline(pipe_dequant_q8_0_);
+        runner_.destroyComputePipeline(pipe_matmul_coopmat_nt_);
     }
 
     if (initialized_) {
@@ -213,6 +235,28 @@ bool VulkanLLMRunner::uploadTensor(const std::string &name, const qtensor &t) {
     }
 
     weight_bufs_[name] = buf;
+    weight_types_[name] = GGML_TYPE_F32;  // dequanted to F32
+    return true;
+}
+
+bool VulkanLLMRunner::uploadTensorRaw(const std::string &name, const qtensor &t) {
+    if (!t.data) return false;
+    int block_size = 32, type_size = 34;  // Q8_0
+    size_t row_bytes = (size_t)((t.n_cols + block_size - 1) / block_size) * type_size;
+    size_t total_bytes = (size_t)t.n_rows * row_bytes;
+
+    // Vulkan storage buffers need at least 4-byte alignment
+    size_t aligned_bytes = (total_bytes + 3) & ~3ULL;
+    auto buf = createGpuBuffer(aligned_bytes);
+    if (buf.buffer == VK_NULL_HANDLE) return false;
+
+    if (!uploadToBuffer(buf, t.data, total_bytes)) {
+        runner_.destroyBuffer(buf);
+        return false;
+    }
+
+    weight_bufs_[name] = buf;
+    weight_types_[name] = t.type;
     return true;
 }
 
@@ -240,6 +284,13 @@ bool VulkanLLMRunner::createPipelines() {
         if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 12, pipe_matvec_))
             return false;
     }
+    // matvec_q8_0_f32: 3 buffers, push {N, K, row0} = 12 bytes
+    {
+        auto spirv = load("matvec_q8_0_f32");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 12, pipe_matvec_q8_0_))
+            return false;
+    }
     // silu_mul_f32: 2 buffers, push {n} = 4 bytes
     {
         auto spirv = load("silu_mul_f32");
@@ -261,6 +312,20 @@ bool VulkanLLMRunner::createPipelines() {
         if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(1), 36, pipe_rope_mrope_))
             return false;
     }
+    // rope_neox_batch_f32: 2 buffers, push {n_tokens, n_heads, head_dim, freq_base} = 16 bytes
+    {
+        auto spirv = load("rope_neox_batch_f32");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(2), 16, pipe_rope_neox_batch_))
+            return false;
+    }
+    // rope_mrope_batch_f32: 2 buffers, push {n_tokens, n_heads, head_dim, freq_base, sect0, sect1, sect2} = 28 bytes
+    {
+        auto spirv = load("rope_mrope_batch_f32");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(2), 28, pipe_rope_mrope_batch_))
+            return false;
+    }
     // qknorm_f32: 2 buffers, push {n_heads, head_dim, eps} = 12 bytes
     {
         auto spirv = load("qknorm_f32");
@@ -275,11 +340,39 @@ bool VulkanLLMRunner::createPipelines() {
         if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(4), 8, pipe_kv_store_))
             return false;
     }
+    // kv_cache_store_batch_f32: 5 buffers, push {n_tokens, kv_dim} = 8 bytes
+    {
+        auto spirv = load("kv_cache_store_batch_f32");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(5), 8, pipe_kv_store_batch_))
+            return false;
+    }
     // attn_decode_f32: 4 buffers, push {n_heads, n_kv_heads, head_dim, seq_len, max_seq_len, scale} = 24 bytes
     {
         auto spirv = load("attn_decode_f32");
         if (spirv.empty()) return false;
         if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(4), 24, pipe_attn_decode_))
+            return false;
+    }
+    // attn_prefill_f32: 5 buffers, push {n_tokens, n_heads, n_kv_heads, head_dim, scale} = 20 bytes
+    {
+        auto spirv = load("attn_prefill_f32");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(5), 20, pipe_attn_prefill_))
+            return false;
+    }
+    // matmul_coopmat_nt_f16: 3 buffers, push {M, N, K} = 12 bytes
+    {
+        auto spirv = load("matmul_coopmat_nt_f16");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(3), 12, pipe_matmul_coopmat_nt_))
+            return false;
+    }
+    // dequant_q8_0_f16: 2 buffers, push {n_rows, n_cols} = 8 bytes
+    {
+        auto spirv = load("dequant_q8_0_f16");
+        if (spirv.empty()) return false;
+        if (!runner_.createComputePipelineWithPushConstants(spirv, makeBindings(2), 8, pipe_dequant_q8_0_))
             return false;
     }
     // add_f32: reuse existing
@@ -319,6 +412,29 @@ bool VulkanLLMRunner::dispatchMatvec(const BufInfo &x, const BufInfo &W, BufInfo
     runner_.bindComputePipeline(pipe_matvec_);
     runner_.bindDescriptorSets(pipe_matvec_);
     runner_.pushConstants(pipe_matvec_, &pc, sizeof(pc));
+    runner_.dispatch(N);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
+bool VulkanLLMRunner::dispatchMatvecAuto(const BufInfo &x, const std::string &w_name, BufInfo &dst,
+                                          uint32_t N, uint32_t K, uint32_t row_offset) {
+    auto it = weight_types_.find(w_name);
+    if (it != weight_types_.end() && it->second == GGML_TYPE_Q8_0) {
+        return dispatchMatvecQ8(x, weight_bufs_[w_name], dst, N, K, row_offset);
+    }
+    return dispatchMatvec(x, weight_bufs_[w_name], dst, N, K, row_offset);
+}
+
+bool VulkanLLMRunner::dispatchMatvecQ8(const BufInfo &x, const BufInfo &W_raw, BufInfo &dst,
+                                        uint32_t N, uint32_t K, uint32_t row_offset) {
+    std::vector<BufInfo> bufs = {x, W_raw, dst};
+    runner_.updateDescriptorSet(pipe_matvec_q8_0_, bufs);
+    struct { uint32_t N, K, row0; } pc = {N, K, row_offset};
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_matvec_q8_0_);
+    runner_.bindDescriptorSets(pipe_matvec_q8_0_);
+    runner_.pushConstants(pipe_matvec_q8_0_, &pc, sizeof(pc));
     runner_.dispatch(N);
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
@@ -427,6 +543,111 @@ bool VulkanLLMRunner::dispatchAdd(BufInfo &dst, const BufInfo &src, uint32_t n) 
     runner_.bindDescriptorSets(pipe_add_);
     runner_.pushConstants(pipe_add_, &n, sizeof(n));
     runner_.dispatch((n + 255) / 256);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
+bool VulkanLLMRunner::dispatchRopeNeoxBatch(BufInfo &vec, const BufInfo &positions,
+                                             uint32_t n_tokens, uint32_t n_heads,
+                                             uint32_t head_dim, float freq_base) {
+    std::vector<BufInfo> bufs = {vec, positions};
+    runner_.updateDescriptorSet(pipe_rope_neox_batch_, bufs);
+    struct { uint32_t n_tokens, n_heads, head_dim; float freq_base; } pc = {
+        n_tokens, n_heads, head_dim, freq_base
+    };
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_rope_neox_batch_);
+    runner_.bindDescriptorSets(pipe_rope_neox_batch_);
+    runner_.pushConstants(pipe_rope_neox_batch_, &pc, sizeof(pc));
+    runner_.dispatch(n_tokens * n_heads);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
+bool VulkanLLMRunner::dispatchRopeMropeBatch(BufInfo &vec, const BufInfo &positions,
+                                              uint32_t n_tokens, uint32_t n_heads,
+                                              uint32_t head_dim, float freq_base,
+                                              int sect0, int sect1, int sect2) {
+    std::vector<BufInfo> bufs = {vec, positions};
+    runner_.updateDescriptorSet(pipe_rope_mrope_batch_, bufs);
+    struct {
+        uint32_t n_tokens, n_heads, head_dim;
+        float freq_base;
+        int32_t sect0, sect1, sect2;
+    } pc = {n_tokens, n_heads, head_dim, freq_base, sect0, sect1, sect2};
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_rope_mrope_batch_);
+    runner_.bindDescriptorSets(pipe_rope_mrope_batch_);
+    runner_.pushConstants(pipe_rope_mrope_batch_, &pc, sizeof(pc));
+    runner_.dispatch(n_tokens * n_heads);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
+bool VulkanLLMRunner::dispatchKvStoreBatch(const BufInfo &k, const BufInfo &v,
+                                            BufInfo &k_cache, BufInfo &v_cache,
+                                            const BufInfo &cache_positions,
+                                            uint32_t n_tokens, uint32_t kv_dim) {
+    std::vector<BufInfo> bufs = {k, v, k_cache, v_cache, cache_positions};
+    runner_.updateDescriptorSet(pipe_kv_store_batch_, bufs);
+    struct { uint32_t n_tokens, kv_dim; } pc = {n_tokens, kv_dim};
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_kv_store_batch_);
+    runner_.bindDescriptorSets(pipe_kv_store_batch_);
+    runner_.pushConstants(pipe_kv_store_batch_, &pc, sizeof(pc));
+    runner_.dispatch(n_tokens);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
+bool VulkanLLMRunner::dispatchAttnPrefill(const BufInfo &q, const BufInfo &k_cache,
+                                           const BufInfo &v_cache, BufInfo &out,
+                                           const BufInfo &cache_positions,
+                                           uint32_t n_tokens, uint32_t n_heads,
+                                           uint32_t n_kv_heads, uint32_t head_dim,
+                                           uint32_t max_seq_len, float scale) {
+    (void)max_seq_len;
+    std::vector<BufInfo> bufs = {q, k_cache, v_cache, out, cache_positions};
+    runner_.updateDescriptorSet(pipe_attn_prefill_, bufs);
+    struct { uint32_t n_tokens, n_heads, n_kv_heads, head_dim; float scale; } pc = {
+        n_tokens, n_heads, n_kv_heads, head_dim, scale
+    };
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_attn_prefill_);
+    runner_.bindDescriptorSets(pipe_attn_prefill_);
+    runner_.pushConstants(pipe_attn_prefill_, &pc, sizeof(pc));
+    runner_.dispatch(n_tokens * n_heads);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
+bool VulkanLLMRunner::dispatchMatmulCoopmatNT(const BufInfo &A, const BufInfo &B, BufInfo &C,
+                                                uint32_t M, uint32_t N, uint32_t K) {
+    std::vector<BufInfo> bufs = {A, B, C};
+    runner_.updateDescriptorSet(pipe_matmul_coopmat_nt_, bufs);
+    struct { uint32_t M, N, K; } pc = {M, N, K};
+    // Dispatch: grid = ceil(N/64) x ceil(M/128)
+    uint32_t grid_x = (N + 63) / 64;
+    uint32_t grid_y = (M + 127) / 128;
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_matmul_coopmat_nt_);
+    runner_.bindDescriptorSets(pipe_matmul_coopmat_nt_);
+    runner_.pushConstants(pipe_matmul_coopmat_nt_, &pc, sizeof(pc));
+    runner_.dispatch(grid_x, grid_y);
+    runner_.endRecordingAndSubmit();
+    return runner_.waitForCompletion();
+}
+
+bool VulkanLLMRunner::dispatchDequantQ8(const BufInfo &src, BufInfo &dst,
+                                         uint32_t n_rows, uint32_t n_cols) {
+    std::vector<BufInfo> bufs = {src, dst};
+    runner_.updateDescriptorSet(pipe_dequant_q8_0_, bufs);
+    struct { uint32_t n_rows, n_cols; } pc = {n_rows, n_cols};
+    runner_.beginRecording();
+    runner_.bindComputePipeline(pipe_dequant_q8_0_);
+    runner_.bindDescriptorSets(pipe_dequant_q8_0_);
+    runner_.pushConstants(pipe_dequant_q8_0_, &pc, sizeof(pc));
+    runner_.dispatch(n_rows);
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -672,7 +893,8 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
     {
         qtensor t = llm_load_qt(g, "output.weight");
         if (t.data) {
-            if (!uploadTensor("output", t)) {
+            bool ok = (t.type == GGML_TYPE_Q8_0) ? uploadTensorRaw("output", t) : uploadTensor("output", t);
+            if (!ok) {
                 last_error_ = "Failed to upload tensor output.weight";
                 return false;
             }
@@ -698,7 +920,13 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
             key = name;
             qtensor t = llm_load_qt(g, name);
             if (t.data) {
-                if (!uploadTensor(key, t) && required) {
+                bool ok;
+                if (t.type == GGML_TYPE_Q8_0) {
+                    ok = uploadTensorRaw(key, t);
+                } else {
+                    ok = uploadTensor(key, t);
+                }
+                if (!ok && required) {
                     if (!missing_required) {
                         last_error_ = std::string("Failed to upload required tensor ") + name;
                     }
@@ -939,15 +1167,15 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
         // Q/K/V projections
         int q_dim = n_heads_ * head_dim_;
         GLLM_PROF_BEGIN("q_proj", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb_, weight_bufs_[ln.attn_q], buf_q_, q_dim, n_embd_);
+        dispatchMatvecAuto(buf_xb_, ln.attn_q, buf_q_, q_dim, n_embd_);
         GLLM_PROF_END("q_proj", 2.0 * q_dim * n_embd_, 0);
 
         GLLM_PROF_BEGIN("k_proj", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb_, weight_bufs_[ln.attn_k], buf_k_, kv_dim, n_embd_);
+        dispatchMatvecAuto(buf_xb_, ln.attn_k, buf_k_, kv_dim, n_embd_);
         GLLM_PROF_END("k_proj", 2.0 * kv_dim * n_embd_, 0);
 
         GLLM_PROF_BEGIN("v_proj", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb_, weight_bufs_[ln.attn_v], buf_v_, kv_dim, n_embd_);
+        dispatchMatvecAuto(buf_xb_, ln.attn_v, buf_v_, kv_dim, n_embd_);
         GLLM_PROF_END("v_proj", 2.0 * kv_dim * n_embd_, 0);
 
         // QK-Norm (if present)
@@ -984,7 +1212,7 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
 
         // Output projection
         GLLM_PROF_BEGIN("out_proj", l, "matvec", "FP32");
-        dispatchMatvec(buf_xb2_, weight_bufs_[ln.attn_output], buf_xb_, n_embd_, q_dim);
+        dispatchMatvecAuto(buf_xb2_, ln.attn_output, buf_xb_, n_embd_, q_dim);
         GLLM_PROF_END("out_proj", 2.0 * n_embd_ * q_dim, 0);
 
         // Residual: x += xb
@@ -1007,7 +1235,7 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
                                    weight_bufs_.count(ln.ffn_down_exps);
         if (layer_has_moe) {
             GLLM_PROF_BEGIN("ffn_gate_inp", l, "matvec", "FP32");
-            dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_gate_inp], buf_moe_router_, n_expert_, n_embd_);
+            dispatchMatvecAuto(buf_xb_, ln.ffn_gate_inp, buf_moe_router_, n_expert_, n_embd_);
             GLLM_PROF_END("ffn_gate_inp", 2.0 * n_expert_ * n_embd_, 0);
 
             downloadFromBuffer(buf_moe_router_, moe_router_cpu_.data(), (size_t)n_expert_ * sizeof(float));
@@ -1044,11 +1272,11 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
                 uint32_t down_off = (uint32_t)(e * n_embd_);
 
                 GLLM_PROF_BEGIN("ffn_up_exp", l, "matvec", "FP32");
-                dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_up_exps], buf_ffn_up_, n_ff_expert_, n_embd_, up_off);
+                dispatchMatvecAuto(buf_xb_, ln.ffn_up_exps, buf_ffn_up_, n_ff_expert_, n_embd_, up_off);
                 GLLM_PROF_END("ffn_up_exp", 2.0 * n_ff_expert_ * n_embd_, 0);
 
                 GLLM_PROF_BEGIN("ffn_gate_exp", l, "matvec", "FP32");
-                dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_gate_exps], buf_ffn_gate_, n_ff_expert_, n_embd_, up_off);
+                dispatchMatvecAuto(buf_xb_, ln.ffn_gate_exps, buf_ffn_gate_, n_ff_expert_, n_embd_, up_off);
                 GLLM_PROF_END("ffn_gate_exp", 2.0 * n_ff_expert_ * n_embd_, 0);
 
                 GLLM_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
@@ -1056,7 +1284,7 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
                 GLLM_PROF_END("silu_mul", 5.0 * n_ff_expert_, 0);
 
                 GLLM_PROF_BEGIN("ffn_down_exp", l, "matvec", "FP32");
-                dispatchMatvec(buf_ffn_gate_, weight_bufs_[ln.ffn_down_exps], buf_xb_, n_embd_, n_ff_expert_, down_off);
+                dispatchMatvecAuto(buf_ffn_gate_, ln.ffn_down_exps, buf_xb_, n_embd_, n_ff_expert_, down_off);
                 GLLM_PROF_END("ffn_down_exp", 2.0 * n_embd_ * n_ff_expert_, 0);
 
                 downloadFromBuffer(buf_xb_, moe_tmp_cpu_.data(), (size_t)n_embd_ * sizeof(float));
@@ -1075,11 +1303,11 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
                 return nullptr;
             }
             GLLM_PROF_BEGIN("ffn_gate", l, "matvec", "FP32");
-            dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_gate], buf_ffn_gate_, n_ff_, n_embd_);
+            dispatchMatvecAuto(buf_xb_, ln.ffn_gate, buf_ffn_gate_, n_ff_, n_embd_);
             GLLM_PROF_END("ffn_gate", 2.0 * n_ff_ * n_embd_, 0);
 
             GLLM_PROF_BEGIN("ffn_up", l, "matvec", "FP32");
-            dispatchMatvec(buf_xb_, weight_bufs_[ln.ffn_up], buf_ffn_up_, n_ff_, n_embd_);
+            dispatchMatvecAuto(buf_xb_, ln.ffn_up, buf_ffn_up_, n_ff_, n_embd_);
             GLLM_PROF_END("ffn_up", 2.0 * n_ff_ * n_embd_, 0);
 
             GLLM_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
@@ -1087,7 +1315,7 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
             GLLM_PROF_END("silu_mul", 5.0 * n_ff_, 0);
 
             GLLM_PROF_BEGIN("ffn_down", l, "matvec", "FP32");
-            dispatchMatvec(buf_ffn_gate_, weight_bufs_[ln.ffn_down], buf_xb_, n_embd_, n_ff_);
+            dispatchMatvecAuto(buf_ffn_gate_, ln.ffn_down, buf_xb_, n_embd_, n_ff_);
             GLLM_PROF_END("ffn_down", 2.0 * n_embd_ * n_ff_, 0);
 
             dispatchAdd(buf_x_, buf_xb_, n_embd_);
@@ -1115,8 +1343,8 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
     if (compute_logits) {
         // LM head: logits = output_weight @ hidden
         GLLM_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
-        const std::string &output_key = weight_bufs_.count("output") ? "output" : "token_embd";
-        dispatchMatvec(buf_xb_, weight_bufs_[output_key], buf_logits_, n_vocab_, n_embd_);
+        const std::string output_key = weight_bufs_.count("output") ? "output" : "token_embd";
+        dispatchMatvecAuto(buf_xb_, output_key, buf_logits_, n_vocab_, n_embd_);
         GLLM_PROF_END("lm_head", 2.0 * n_vocab_ * n_embd_, 0);
 
         // Download logits
@@ -1124,6 +1352,333 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
         return logits_cpu_.data();
     } else {
         // Download hidden state
+        downloadFromBuffer(buf_xb_, hidden_cpu_.data(), n_embd_ * sizeof(float));
+        return hidden_cpu_.data();
+    }
+}
+
+// ---- Batched Prefill ----
+
+bool VulkanLLMRunner::enablePrefill(int max_batch_size) {
+    if (!weights_loaded_) {
+        last_error_ = "Weights must be loaded before enabling prefill";
+        return false;
+    }
+    if (prefill_enabled_) return true;
+
+    int N = max_batch_size;
+    int q_dim = n_heads_ * head_dim_;
+    int kv_dim = n_kv_heads_ * head_dim_;
+
+    buf_pfx_         = createGpuBuffer((size_t)N * n_embd_ * sizeof(float));
+    buf_pfxb_        = createGpuBuffer((size_t)N * n_embd_ * sizeof(float));
+    buf_pfq_         = createGpuBuffer((size_t)N * q_dim * sizeof(float));
+    buf_pfk_         = createGpuBuffer((size_t)N * kv_dim * sizeof(float));
+    buf_pfv_         = createGpuBuffer((size_t)N * kv_dim * sizeof(float));
+    buf_pf_attn_out_ = createGpuBuffer((size_t)N * q_dim * sizeof(float));
+    buf_pf_ffn_gate_ = createGpuBuffer((size_t)N * n_ff_ * sizeof(float));
+    buf_pf_ffn_up_   = createGpuBuffer((size_t)N * n_ff_ * sizeof(float));
+    buf_positions_   = createGpuBuffer((size_t)N * 3 * sizeof(int));
+    buf_cache_pos_   = createGpuBuffer((size_t)N * sizeof(int));
+
+    // 96MB scratch for dequanted F16 weights (covers largest weight matrix)
+    size_t weight_f16_size = 96 * 1024 * 1024;
+    buf_weight_f16_  = createGpuBuffer(weight_f16_size);
+
+    max_prefill_tokens_ = N;
+    prefill_enabled_ = true;
+    std::cerr << "vulkan llm: prefill enabled, max_batch=" << N << "\n";
+    return true;
+}
+
+float *VulkanLLMRunner::prefillTokens(const int32_t *tokens, int n_tokens,
+                                       const int *cache_pos, const int *pos_t,
+                                       const int *pos_h, const int *pos_w) {
+    if (!prefill_enabled_) {
+        last_error_ = "Prefill not enabled";
+        return nullptr;
+    }
+    if (n_tokens > max_prefill_tokens_) {
+        last_error_ = "n_tokens exceeds max_prefill_tokens";
+        return nullptr;
+    }
+
+    // Look up token embeddings and upload batch
+    std::vector<float> embds((size_t)n_tokens * n_embd_);
+    {
+        void *ptr = nullptr;
+        runner_.mapBuffer(weight_bufs_["token_embd"], &ptr);
+        const float *embd_data = reinterpret_cast<const float *>(ptr);
+        for (int i = 0; i < n_tokens; i++) {
+            const float *row = embd_data + (size_t)tokens[i] * n_embd_;
+            std::memcpy(embds.data() + (size_t)i * n_embd_, row, n_embd_ * sizeof(float));
+        }
+        runner_.unmapBuffer(weight_bufs_["token_embd"]);
+    }
+    uploadToBuffer(buf_pfx_, embds.data(), (size_t)n_tokens * n_embd_ * sizeof(float));
+
+    // Upload positions and cache positions
+    uploadToBuffer(buf_cache_pos_, cache_pos, n_tokens * sizeof(int));
+    {
+        std::vector<int> pos3(n_tokens * 3);
+        for (int i = 0; i < n_tokens; i++) {
+            pos3[i * 3 + 0] = pos_t[i];
+            pos3[i * 3 + 1] = pos_h[i];
+            pos3[i * 3 + 2] = pos_w[i];
+        }
+        uploadToBuffer(buf_positions_, pos3.data(), pos3.size() * sizeof(int));
+    }
+
+    return forwardBatch(n_tokens, cache_pos, pos_t, pos_h, pos_w, true);
+}
+
+float *VulkanLLMRunner::prefillEmbds(const float *embd, int n_tokens, int embd_stride,
+                                      const int *cache_pos, const int *pos_t,
+                                      const int *pos_h, const int *pos_w,
+                                      const float **ds_embds, int ds_embd_stride_in) {
+    if (!prefill_enabled_) {
+        last_error_ = "Prefill not enabled";
+        return nullptr;
+    }
+    if (n_tokens > max_prefill_tokens_) {
+        last_error_ = "n_tokens exceeds max_prefill_tokens";
+        return nullptr;
+    }
+
+    // Upload embeddings (extract n_embd from potentially larger stride)
+    if (embd_stride == n_embd_) {
+        uploadToBuffer(buf_pfx_, embd, (size_t)n_tokens * n_embd_ * sizeof(float));
+    } else {
+        std::vector<float> packed((size_t)n_tokens * n_embd_);
+        for (int i = 0; i < n_tokens; i++) {
+            std::memcpy(packed.data() + (size_t)i * n_embd_,
+                        embd + (size_t)i * embd_stride,
+                        n_embd_ * sizeof(float));
+        }
+        uploadToBuffer(buf_pfx_, packed.data(), packed.size() * sizeof(float));
+    }
+
+    // Upload deepstack slices for batch
+    // For batched prefill, we need to handle deepstack differently:
+    // We'll upload per-token deepstack slices and add them in forwardBatch.
+    ds_embd_stride_ = ds_embd_stride_in > 0 ? ds_embd_stride_in : embd_stride;
+
+    // Upload positions
+    uploadToBuffer(buf_cache_pos_, cache_pos, n_tokens * sizeof(int));
+    {
+        std::vector<int> pos3(n_tokens * 3);
+        for (int i = 0; i < n_tokens; i++) {
+            pos3[i * 3 + 0] = pos_t[i];
+            pos3[i * 3 + 1] = pos_h[i];
+            pos3[i * 3 + 2] = pos_w[i];
+        }
+        uploadToBuffer(buf_positions_, pos3.data(), pos3.size() * sizeof(int));
+    }
+
+    // Store deepstack data pointers for forwardBatch to handle
+    // For now we upload deepstack slices into ds_slices buffers per-layer in forwardBatch
+    // We need to pass the raw embedding data through; store it temporarily
+    // Actually for simplicity, handle deepstack in forwardBatch by uploading per-token
+    // deepstack slices from CPU. This is small data (n_tokens * n_embd * n_ds * 4 bytes).
+    // We'll pass ds_embds and embd to forwardBatch via member vars.
+
+    // Store for forwardBatch to access
+    const float *embd_for_ds = (ds_embds || (embd_stride > n_embd_ && n_deepstack_ > 0)) ? embd : nullptr;
+
+    float *result = forwardBatch(n_tokens, cache_pos, pos_t, pos_h, pos_w, true);
+
+    return result;
+}
+
+float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
+                                       const int *pos_t, const int *pos_h, const int *pos_w,
+                                       bool compute_logits) {
+    if (!prefill_enabled_ || n_tokens <= 0) return nullptr;
+
+    int kv_dim = n_kv_heads_ * head_dim_;
+    int q_dim = n_heads_ * head_dim_;
+    float scale = 1.0f / sqrtf((float)head_dim_);
+
+    for (int l = 0; l < n_layers_; l++) {
+        auto &ln = layer_names_[l];
+
+        // --- Attention ---
+        // Batched RMSNorm: [n_tokens, n_embd] -> [n_tokens, n_embd]
+        dispatchRmsNorm(buf_pfx_, buf_pfxb_, weight_bufs_[ln.attn_norm], n_tokens, n_embd_, rms_norm_eps_);
+
+        // Q/K/V projections via GEMM
+        // Q[n_tok, q_dim] = xb[n_tok, n_embd] * W_q^T[q_dim, n_embd]
+        auto it_q = weight_types_.find(ln.attn_q);
+        bool q8_q = (it_q != weight_types_.end() && it_q->second == GGML_TYPE_Q8_0);
+        if (q8_q) {
+            dispatchDequantQ8(weight_bufs_[ln.attn_q], buf_weight_f16_, q_dim, n_embd_);
+            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfq_, n_tokens, q_dim, n_embd_);
+        } else {
+            // Fallback: per-token matvec (slow but correct for F32 weights)
+            for (int t = 0; t < n_tokens; t++) {
+                // Would need offset views. For now, unsupported.
+                last_error_ = "Batch GEMM requires Q8_0 weights";
+                return nullptr;
+            }
+        }
+
+        // K projection
+        auto it_k = weight_types_.find(ln.attn_k);
+        bool q8_k = (it_k != weight_types_.end() && it_k->second == GGML_TYPE_Q8_0);
+        if (q8_k) {
+            dispatchDequantQ8(weight_bufs_[ln.attn_k], buf_weight_f16_, kv_dim, n_embd_);
+            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfk_, n_tokens, kv_dim, n_embd_);
+        } else {
+            last_error_ = "Batch GEMM requires Q8_0 weights";
+            return nullptr;
+        }
+
+        // V projection
+        auto it_v = weight_types_.find(ln.attn_v);
+        bool q8_v = (it_v != weight_types_.end() && it_v->second == GGML_TYPE_Q8_0);
+        if (q8_v) {
+            dispatchDequantQ8(weight_bufs_[ln.attn_v], buf_weight_f16_, kv_dim, n_embd_);
+            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pfv_, n_tokens, kv_dim, n_embd_);
+        } else {
+            last_error_ = "Batch GEMM requires Q8_0 weights";
+            return nullptr;
+        }
+
+        // QK-Norm (batched: treat as n_tokens*n_heads / n_tokens*n_kv_heads heads)
+        if (weight_bufs_.count(ln.attn_q_norm) && weight_bufs_[ln.attn_q_norm].buffer != VK_NULL_HANDLE) {
+            dispatchQkNorm(buf_pfq_, weight_bufs_[ln.attn_q_norm], n_tokens * n_heads_, head_dim_, rms_norm_eps_);
+        }
+        if (weight_bufs_.count(ln.attn_k_norm) && weight_bufs_[ln.attn_k_norm].buffer != VK_NULL_HANDLE) {
+            dispatchQkNorm(buf_pfk_, weight_bufs_[ln.attn_k_norm], n_tokens * n_kv_heads_, head_dim_, rms_norm_eps_);
+        }
+
+        // Batched RoPE
+        if (use_mrope_) {
+            dispatchRopeMropeBatch(buf_pfq_, buf_positions_, n_tokens, n_heads_, head_dim_,
+                                   rope_freq_base_, mrope_sections_[0], mrope_sections_[1], mrope_sections_[2]);
+            dispatchRopeMropeBatch(buf_pfk_, buf_positions_, n_tokens, n_kv_heads_, head_dim_,
+                                   rope_freq_base_, mrope_sections_[0], mrope_sections_[1], mrope_sections_[2]);
+        } else {
+            // For neox batch, positions buffer has 1 int per token (use pos_t slot)
+            // Upload pos_t as single positions
+            uploadToBuffer(buf_positions_, pos_t, n_tokens * sizeof(int));
+            dispatchRopeNeoxBatch(buf_pfq_, buf_positions_, n_tokens, n_heads_, head_dim_, rope_freq_base_);
+            dispatchRopeNeoxBatch(buf_pfk_, buf_positions_, n_tokens, n_kv_heads_, head_dim_, rope_freq_base_);
+            // Restore 3-component positions for M-RoPE (if needed later)
+            std::vector<int> pos3(n_tokens * 3);
+            for (int i = 0; i < n_tokens; i++) {
+                pos3[i * 3 + 0] = pos_t[i];
+                pos3[i * 3 + 1] = pos_h[i];
+                pos3[i * 3 + 2] = pos_w[i];
+            }
+            uploadToBuffer(buf_positions_, pos3.data(), pos3.size() * sizeof(int));
+        }
+
+        // Batched KV store
+        dispatchKvStoreBatch(buf_pfk_, buf_pfv_, kv_key_bufs_[l], kv_val_bufs_[l],
+                             buf_cache_pos_, n_tokens, kv_dim);
+
+        // Prefill attention
+        dispatchAttnPrefill(buf_pfq_, kv_key_bufs_[l], kv_val_bufs_[l], buf_pf_attn_out_,
+                            buf_cache_pos_, n_tokens, n_heads_, n_kv_heads_, head_dim_,
+                            max_seq_len_, scale);
+
+        // Output projection: out[n_tok, n_embd] = attn_out[n_tok, q_dim] * W_o^T[n_embd, q_dim]
+        auto it_o = weight_types_.find(ln.attn_output);
+        if (it_o != weight_types_.end() && it_o->second == GGML_TYPE_Q8_0) {
+            dispatchDequantQ8(weight_bufs_[ln.attn_output], buf_weight_f16_, n_embd_, q_dim);
+            dispatchMatmulCoopmatNT(buf_pf_attn_out_, buf_weight_f16_, buf_pfxb_, n_tokens, n_embd_, q_dim);
+        } else {
+            last_error_ = "Batch GEMM requires Q8_0 weights";
+            return nullptr;
+        }
+
+        // Residual: x += xb
+        dispatchAdd(buf_pfx_, buf_pfxb_, n_tokens * n_embd_);
+
+        // --- FFN ---
+        dispatchRmsNorm(buf_pfx_, buf_pfxb_, weight_bufs_[ln.ffn_norm], n_tokens, n_embd_, rms_norm_eps_);
+
+        // Dense FFN only for batch path (MoE not supported in batch)
+        if (!weight_bufs_.count(ln.ffn_gate) || !weight_bufs_.count(ln.ffn_up) || !weight_bufs_.count(ln.ffn_down)) {
+            last_error_ = "Batch prefill requires dense FFN weights";
+            return nullptr;
+        }
+
+        // Gate
+        auto it_gate = weight_types_.find(ln.ffn_gate);
+        if (it_gate != weight_types_.end() && it_gate->second == GGML_TYPE_Q8_0) {
+            dispatchDequantQ8(weight_bufs_[ln.ffn_gate], buf_weight_f16_, n_ff_, n_embd_);
+            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pf_ffn_gate_, n_tokens, n_ff_, n_embd_);
+        } else {
+            last_error_ = "Batch GEMM requires Q8_0 weights";
+            return nullptr;
+        }
+
+        // Up
+        auto it_up = weight_types_.find(ln.ffn_up);
+        if (it_up != weight_types_.end() && it_up->second == GGML_TYPE_Q8_0) {
+            dispatchDequantQ8(weight_bufs_[ln.ffn_up], buf_weight_f16_, n_ff_, n_embd_);
+            dispatchMatmulCoopmatNT(buf_pfxb_, buf_weight_f16_, buf_pf_ffn_up_, n_tokens, n_ff_, n_embd_);
+        } else {
+            last_error_ = "Batch GEMM requires Q8_0 weights";
+            return nullptr;
+        }
+
+        // SiLU(gate) * up
+        dispatchSiluMul(buf_pf_ffn_gate_, buf_pf_ffn_up_, n_tokens * n_ff_);
+
+        // Down
+        auto it_down = weight_types_.find(ln.ffn_down);
+        if (it_down != weight_types_.end() && it_down->second == GGML_TYPE_Q8_0) {
+            dispatchDequantQ8(weight_bufs_[ln.ffn_down], buf_weight_f16_, n_embd_, n_ff_);
+            dispatchMatmulCoopmatNT(buf_pf_ffn_gate_, buf_weight_f16_, buf_pfxb_, n_tokens, n_embd_, n_ff_);
+        } else {
+            last_error_ = "Batch GEMM requires Q8_0 weights";
+            return nullptr;
+        }
+
+        // Residual
+        dispatchAdd(buf_pfx_, buf_pfxb_, n_tokens * n_embd_);
+
+        // DeepStack injection — upload and add per-token deepstack slices
+        // This is handled by the caller setting up buf_pfx_ with deepstack-aware embeddings.
+        // For now, deepstack is not supported in batch mode.
+        // TODO: implement batched deepstack injection
+
+        if (l == 0 || l == n_layers_ - 1 || (l + 1) % 10 == 0) {
+            // Download last token's hidden state for debug norm
+            std::vector<float> hid(n_embd_);
+            size_t last_tok_offset = (size_t)(n_tokens - 1) * n_embd_ * sizeof(float);
+            void *ptr = nullptr;
+            runner_.mapBuffer(buf_pfx_, &ptr);
+            std::memcpy(hid.data(), (const uint8_t *)ptr + last_tok_offset, n_embd_ * sizeof(float));
+            runner_.unmapBuffer(buf_pfx_);
+            float norm = 0.0f;
+            for (int i = 0; i < n_embd_; i++) norm += hid[i] * hid[i];
+            std::cerr << "  layer " << l << ": hidden norm = " << sqrtf(norm) << "\n";
+        }
+    }
+
+    // Final RMSNorm on last token
+    // Extract last token from batch into single-token buffer
+    {
+        void *ptr = nullptr;
+        runner_.mapBuffer(buf_pfx_, &ptr);
+        const float *last_tok = reinterpret_cast<const float *>(
+            (const uint8_t *)ptr + (size_t)(n_tokens - 1) * n_embd_ * sizeof(float));
+        uploadToBuffer(buf_x_, last_tok, n_embd_ * sizeof(float));
+        runner_.unmapBuffer(buf_pfx_);
+    }
+
+    dispatchRmsNorm(buf_x_, buf_xb_, weight_bufs_["output_norm"], 1, n_embd_, rms_norm_eps_);
+
+    if (compute_logits) {
+        const std::string output_key = weight_bufs_.count("output") ? "output" : "token_embd";
+        dispatchMatvecAuto(buf_xb_, output_key, buf_logits_, n_vocab_, n_embd_);
+        downloadFromBuffer(buf_logits_, logits_cpu_.data(), n_vocab_ * sizeof(float));
+        return logits_cpu_.data();
+    } else {
         downloadFromBuffer(buf_xb_, hidden_cpu_.data(), n_embd_ * sizeof(float));
         return hidden_cpu_.data();
     }
