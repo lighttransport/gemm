@@ -63,6 +63,13 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/qknorm_f32.comp
     ${SHADER_SOURCE_DIR}/kv_cache_store_f32.comp
     ${SHADER_SOURCE_DIR}/attn_decode_f32.comp
+    ${SHADER_SOURCE_DIR}/matvec_q8_0_f32.comp
+    ${SHADER_SOURCE_DIR}/dequant_q8_0_f16.comp
+    ${SHADER_SOURCE_DIR}/matmul_coopmat_nt_f16.comp
+    ${SHADER_SOURCE_DIR}/rope_neox_batch_f32.comp
+    ${SHADER_SOURCE_DIR}/rope_mrope_batch_f32.comp
+    ${SHADER_SOURCE_DIR}/kv_cache_store_batch_f32.comp
+    ${SHADER_SOURCE_DIR}/attn_prefill_f32.comp
 )
 
 # Custom function to compile GLSL to SPIR-V

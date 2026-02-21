@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT
+// Store N KV pairs into cache at positions given by cache_pos[] buffer.
+// k_cache[cache_pos[t] * kv_dim + i] = k[t * kv_dim + i]
+// Dispatch: n_tokens workgroups, 256 threads each.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer KBuffer { float k_in[]; };
+layout(std430, binding = 1) readonly buffer VBuffer { float v_in[]; };
+layout(std430, binding = 2) buffer KCacheBuffer { float k_cache[]; };
+layout(std430, binding = 3) buffer VCacheBuffer { float v_cache[]; };
+layout(std430, binding = 4) readonly buffer PosBuffer { int cache_pos[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;
+    uint kv_dim;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (t >= pc.n_tokens) return;
+
+    int pos = cache_pos[t];
+    uint src_offset = t * pc.kv_dim;
+    uint dst_offset = uint(pos) * pc.kv_dim;
+
+    for (uint i = tid; i < pc.kv_dim; i += 256u) {
+        k_cache[dst_offset + i] = k_in[src_offset + i];
+        v_cache[dst_offset + i] = v_in[src_offset + i];
+    }
+}
