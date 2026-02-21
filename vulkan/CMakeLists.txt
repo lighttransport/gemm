@@ -56,6 +56,7 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/attn_flash_f32.comp
     ${SHADER_SOURCE_DIR}/rmsnorm_f32.comp
     ${SHADER_SOURCE_DIR}/matvec_f32.comp
+    ${SHADER_SOURCE_DIR}/matvec_f16_f32.comp
     ${SHADER_SOURCE_DIR}/silu_mul_f32.comp
     ${SHADER_SOURCE_DIR}/rope_neox_f32.comp
     ${SHADER_SOURCE_DIR}/rope_mrope_f32.comp
