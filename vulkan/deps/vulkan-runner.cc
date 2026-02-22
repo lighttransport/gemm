@@ -421,6 +421,139 @@ bool VulkanComputeRunner::updateDescriptorSet(const ComputePipeline& pipeline,
     return true;
 }
 
+bool VulkanComputeRunner::createDynamicDescriptorPool(uint32_t maxSets) {
+    if (dynamicDescriptorPool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(device_, dynamicDescriptorPool_, nullptr);
+    }
+    // Use larger pool to be safe with driver quirks
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = maxSets * 8;
+
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = maxSets;
+
+    if (vkCreateDescriptorPool(device_, &poolInfo, nullptr, &dynamicDescriptorPool_) != VK_SUCCESS) {
+        setError("Failed to create dynamic descriptor pool");
+        return false;
+    }
+
+    // Pre-cache dynamic layouts for 1-5 bindings
+    for (uint32_t n = 1; n <= 5; n++) getDynamicLayout(n);
+
+    return true;
+}
+
+void VulkanComputeRunner::resetDynamicDescriptorPool() {
+    if (dynamicDescriptorPool_ != VK_NULL_HANDLE) {
+        vkResetDescriptorPool(device_, dynamicDescriptorPool_, 0);
+    }
+}
+
+VkDescriptorSetLayout VulkanComputeRunner::getDynamicLayout(uint32_t nBindings) {
+    if (nBindings == 0 || nBindings > 8) return VK_NULL_HANDLE;
+    if (dynamicLayouts_[nBindings] != VK_NULL_HANDLE) return dynamicLayouts_[nBindings];
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings(nBindings);
+    for (uint32_t i = 0; i < nBindings; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[i].pImmutableSamplers = nullptr;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = nBindings;
+    layoutInfo.pBindings = bindings.data();
+
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &layout) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    dynamicLayouts_[nBindings] = layout;
+    return layout;
+}
+
+void VulkanComputeRunner::destroyDynamicLayouts() {
+    for (int i = 0; i <= 8; i++) {
+        if (dynamicLayouts_[i] != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(device_, dynamicLayouts_[i], nullptr);
+            dynamicLayouts_[i] = VK_NULL_HANDLE;
+        }
+    }
+}
+
+void VulkanComputeRunner::destroyDynamicDescriptorPool() {
+    destroyDynamicLayouts();
+    if (dynamicDescriptorPool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(device_, dynamicDescriptorPool_, nullptr);
+        dynamicDescriptorPool_ = VK_NULL_HANDLE;
+    }
+}
+
+VkDescriptorSet VulkanComputeRunner::allocateAndUpdateDescriptorSet(
+    const ComputePipeline& pipeline, const std::vector<BufferInfo>& buffers) {
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+
+    // Create a fresh layout matching buffer count (pipeline layouts don't work
+    // with dynamic pool on some drivers like RADV)
+    uint32_t nBindings = static_cast<uint32_t>(buffers.size());
+    if (nBindings == 0 || nBindings > 8) {
+        setError("Invalid binding count for dynamic descriptor set");
+        return VK_NULL_HANDLE;
+    }
+
+    // Use cached layout by binding count
+    VkDescriptorSetLayout layout = getDynamicLayout(nBindings);
+    if (layout == VK_NULL_HANDLE) {
+        setError("Failed to get dynamic layout");
+        return VK_NULL_HANDLE;
+    }
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = dynamicDescriptorPool_;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &layout;
+
+    VkResult res = vkAllocateDescriptorSets(device_, &allocInfo, &ds);
+    if (res != VK_SUCCESS) {
+        setError("Failed to allocate dynamic descriptor set");
+        return VK_NULL_HANDLE;
+    }
+
+    std::vector<VkDescriptorBufferInfo> bufferInfos(buffers.size());
+    std::vector<VkWriteDescriptorSet> descriptorWrites(buffers.size());
+    for (size_t i = 0; i < buffers.size(); i++) {
+        bufferInfos[i].buffer = buffers[i].buffer;
+        bufferInfos[i].offset = 0;
+        bufferInfos[i].range = buffers[i].size;
+        descriptorWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[i].pNext = nullptr;
+        descriptorWrites[i].dstSet = ds;
+        descriptorWrites[i].dstBinding = static_cast<uint32_t>(i);
+        descriptorWrites[i].dstArrayElement = 0;
+        descriptorWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptorWrites[i].descriptorCount = 1;
+        descriptorWrites[i].pBufferInfo = &bufferInfos[i];
+        descriptorWrites[i].pImageInfo = nullptr;
+        descriptorWrites[i].pTexelBufferView = nullptr;
+    }
+    vkUpdateDescriptorSets(device_, static_cast<uint32_t>(descriptorWrites.size()),
+                          descriptorWrites.data(), 0, nullptr);
+    return ds;
+}
+
+void VulkanComputeRunner::bindDescriptorSetDynamic(const ComputePipeline& pipeline, VkDescriptorSet ds) {
+    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                           pipeline.pipelineLayout, 0, 1, &ds, 0, nullptr);
+}
+
 void VulkanComputeRunner::pushConstants(const ComputePipeline& pipeline, const void* data, uint32_t size) {
     vkCmdPushConstants(commandBuffer_, pipeline.pipelineLayout,
                       VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data);
@@ -458,6 +591,17 @@ void VulkanComputeRunner::bindDescriptorSets(const ComputePipeline& pipeline) {
 
 void VulkanComputeRunner::dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
     vkCmdDispatch(commandBuffer_, groupCountX, groupCountY, groupCountZ);
+}
+
+void VulkanComputeRunner::computeBarrier() {
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer_,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 bool VulkanComputeRunner::endRecordingAndSubmit() {

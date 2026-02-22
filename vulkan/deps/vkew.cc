@@ -172,6 +172,7 @@ PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout = nullptr;
 PFN_vkCreateDescriptorPool vkCreateDescriptorPool = nullptr;
 PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool = nullptr;
 PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets = nullptr;
+PFN_vkResetDescriptorPool vkResetDescriptorPool = nullptr;
 PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets = nullptr;
 
 // Command pool/buffer
@@ -191,6 +192,7 @@ PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets = nullptr;
 PFN_vkCmdPushConstants vkCmdPushConstants = nullptr;
 PFN_vkCmdDispatch vkCmdDispatch = nullptr;
 PFN_vkCmdCopyBuffer vkCmdCopyBuffer = nullptr;
+PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
 
 //------------------------------------------------------------------------------
 // Helper macro for loading functions
@@ -293,6 +295,7 @@ void vkewShutdown(void) {
     vkCreateDescriptorPool = nullptr;
     vkDestroyDescriptorPool = nullptr;
     vkAllocateDescriptorSets = nullptr;
+    vkResetDescriptorPool = nullptr;
     vkUpdateDescriptorSets = nullptr;
     vkCreateCommandPool = nullptr;
     vkDestroyCommandPool = nullptr;
@@ -306,6 +309,7 @@ void vkewShutdown(void) {
     vkCmdPushConstants = nullptr;
     vkCmdDispatch = nullptr;
     vkCmdCopyBuffer = nullptr;
+    vkCmdPipelineBarrier = nullptr;
 
     vkewUnloadLibrary();
     g_initialized = false;
@@ -384,6 +388,7 @@ bool vkewLoadDevice(VkDevice device) {
     VKEW_LOAD_DEVICE(vkCreateDescriptorPool);
     VKEW_LOAD_DEVICE(vkDestroyDescriptorPool);
     VKEW_LOAD_DEVICE(vkAllocateDescriptorSets);
+    VKEW_LOAD_DEVICE(vkResetDescriptorPool);
     VKEW_LOAD_DEVICE(vkUpdateDescriptorSets);
 
     // Command pool/buffer
@@ -403,6 +408,7 @@ bool vkewLoadDevice(VkDevice device) {
     VKEW_LOAD_DEVICE(vkCmdPushConstants);
     VKEW_LOAD_DEVICE(vkCmdDispatch);
     VKEW_LOAD_DEVICE(vkCmdCopyBuffer);
+    VKEW_LOAD_DEVICE(vkCmdPipelineBarrier);
 
     return true;
 }
