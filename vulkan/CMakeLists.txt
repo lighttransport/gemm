@@ -78,9 +78,10 @@ function(compile_shader SHADER_SOURCE)
     get_filename_component(SHADER_NAME ${SHADER_SOURCE} NAME_WE)
     set(SPIRV_OUTPUT ${SHADER_OUTPUT_DIR}/${SHADER_NAME}.spv)
 
-    # Check if this is a cooperative matrix shader
+    # Check if this shader needs Vulkan 1.3+ (coopmat or subgroup ops)
     string(FIND ${SHADER_NAME} "coopmat" IS_COOPMAT)
-    if(IS_COOPMAT GREATER -1)
+    string(FIND ${SHADER_NAME} "matvec" IS_MATVEC)
+    if(IS_COOPMAT GREATER -1 OR IS_MATVEC GREATER -1)
         # Cooperative matrix requires Vulkan 1.3+ and SPIR-V 1.6
         add_custom_command(
             OUTPUT ${SPIRV_OUTPUT}

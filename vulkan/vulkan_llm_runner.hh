@@ -86,6 +86,10 @@ private:
     bool initialized_ = false;
     bool weights_loaded_ = false;
     bool cpu_fallback_moe_ = false;
+    bool fused_mode_ = false;  // when true, dispatches skip begin/end/wait
+
+    // Helper: bind pipeline and descriptors (uses dynamic descriptors in fused mode)
+    void bindPipelineAndDescriptors(Pipeline &pipe, const std::vector<BufInfo> &bufs);
     transformer_model *cpu_model_ = nullptr;
     std::string last_error_;
     std::string shader_dir_;

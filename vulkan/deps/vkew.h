@@ -812,6 +812,20 @@ typedef struct VkBufferCopy {
     VkDeviceSize size;
 } VkBufferCopy;
 
+typedef struct VkMemoryBarrier {
+    VkStructureType sType;
+    const void*     pNext;
+    VkFlags         srcAccessMask;
+    VkFlags         dstAccessMask;
+} VkMemoryBarrier;
+
+// Access flags
+#define VK_ACCESS_SHADER_READ_BIT  0x00000020
+#define VK_ACCESS_SHADER_WRITE_BIT 0x00000040
+
+// Pipeline stage flags
+#define VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT 0x00000800
+
 typedef struct VkSubmitInfo {
     VkStructureType sType;
     const void* pNext;
@@ -887,6 +901,7 @@ typedef void (VKAPI_PTR *PFN_vkDestroyDescriptorSetLayout)(VkDevice, VkDescripto
 typedef VkResult (VKAPI_PTR *PFN_vkCreateDescriptorPool)(VkDevice, const VkDescriptorPoolCreateInfo*, const VkAllocationCallbacks*, VkDescriptorPool*);
 typedef void (VKAPI_PTR *PFN_vkDestroyDescriptorPool)(VkDevice, VkDescriptorPool, const VkAllocationCallbacks*);
 typedef VkResult (VKAPI_PTR *PFN_vkAllocateDescriptorSets)(VkDevice, const VkDescriptorSetAllocateInfo*, VkDescriptorSet*);
+typedef VkResult (VKAPI_PTR *PFN_vkResetDescriptorPool)(VkDevice, VkDescriptorPool, VkFlags);
 typedef void (VKAPI_PTR *PFN_vkUpdateDescriptorSets)(VkDevice, uint32_t, const VkWriteDescriptorSet*, uint32_t, const VkCopyDescriptorSet*);
 
 // Command pool/buffer functions
@@ -906,6 +921,7 @@ typedef void (VKAPI_PTR *PFN_vkCmdBindDescriptorSets)(VkCommandBuffer, VkPipelin
 typedef void (VKAPI_PTR *PFN_vkCmdPushConstants)(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t, uint32_t, const void*);
 typedef void (VKAPI_PTR *PFN_vkCmdDispatch)(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
 typedef void (VKAPI_PTR *PFN_vkCmdCopyBuffer)(VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const VkBufferCopy*);
+typedef void (VKAPI_PTR *PFN_vkCmdPipelineBarrier)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const VkMemoryBarrier*, uint32_t, const void*, uint32_t, const void*);
 
 //------------------------------------------------------------------------------
 // VKEW API - Initialization and loading
@@ -985,6 +1001,7 @@ extern PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout;
 extern PFN_vkCreateDescriptorPool vkCreateDescriptorPool;
 extern PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool;
 extern PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets;
+extern PFN_vkResetDescriptorPool vkResetDescriptorPool;
 extern PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets;
 
 // Command pool/buffer
@@ -1004,6 +1021,7 @@ extern PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets;
 extern PFN_vkCmdPushConstants vkCmdPushConstants;
 extern PFN_vkCmdDispatch vkCmdDispatch;
 extern PFN_vkCmdCopyBuffer vkCmdCopyBuffer;
+extern PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier;
 
 #ifdef __cplusplus
 }

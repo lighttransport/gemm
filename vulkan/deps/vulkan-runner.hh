@@ -242,6 +242,15 @@ public:
   bool updateDescriptorSet(const ComputePipeline& pipeline,
                            const std::vector<BufferInfo>& buffers);
 
+  // Dynamic descriptor set: allocates a new set from the dynamic pool.
+  // Returns the allocated descriptor set (valid until resetDynamicDescriptorPool).
+  VkDescriptorSet allocateAndUpdateDescriptorSet(const ComputePipeline& pipeline,
+                                                  const std::vector<BufferInfo>& buffers);
+  void bindDescriptorSetDynamic(const ComputePipeline& pipeline, VkDescriptorSet ds);
+  bool createDynamicDescriptorPool(uint32_t maxSets);
+  void resetDynamicDescriptorPool();
+  void destroyDynamicDescriptorPool();
+
   // Command buffer management
   bool beginRecording();
   void bindComputePipeline(const ComputePipeline& pipeline);
@@ -250,6 +259,9 @@ public:
   void dispatch(uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
   bool endRecordingAndSubmit();
   
+  // Insert a compute→compute pipeline barrier (SHADER_WRITE→SHADER_READ|WRITE)
+  void computeBarrier();
+
   // Synchronization
   bool waitForCompletion();
   
@@ -275,7 +287,11 @@ private:
   
   std::string lastError_;
   bool initialized_;
-  
+  VkDescriptorPool dynamicDescriptorPool_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout dynamicLayouts_[9] = {};  // cached layouts by binding count [1..8]
+  VkDescriptorSetLayout getDynamicLayout(uint32_t nBindings);
+  void destroyDynamicLayouts();
+
   bool createInstance(bool enableValidation);
   bool selectPhysicalDevice(uint32_t deviceIndex);
   bool createLogicalDevice();
