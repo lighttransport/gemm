@@ -100,6 +100,8 @@ VulkanLLMRunner::~VulkanLLMRunner() {
         runner_.destroyBuffer(buf_weight_f16_);
     }
 
+    runner_.destroyDynamicDescriptorPool();
+
     if (pipelines_created_) {
         runner_.destroyComputePipeline(pipe_rmsnorm_);
         runner_.destroyComputePipeline(pipe_matvec_);
@@ -413,16 +415,30 @@ bool VulkanLLMRunner::createPipelines() {
 
 // ---- Dispatch helpers ----
 
+void VulkanLLMRunner::bindPipelineAndDescriptors(Pipeline &pipe, const std::vector<BufInfo> &bufs) {
+    if (!fused_mode_) {
+        runner_.updateDescriptorSet(pipe, bufs);
+        runner_.beginRecording();
+        runner_.bindComputePipeline(pipe);
+        runner_.bindDescriptorSets(pipe);
+    } else {
+        auto ds = runner_.allocateAndUpdateDescriptorSet(pipe, bufs);
+        if (ds == VK_NULL_HANDLE) {
+            std::cerr << "FATAL: failed to allocate dynamic descriptor set!\n";
+        }
+        runner_.bindComputePipeline(pipe);
+        runner_.bindDescriptorSetDynamic(pipe, ds);
+    }
+}
+
 bool VulkanLLMRunner::dispatchRmsNorm(const BufInfo &src, BufInfo &dst, const BufInfo &weight,
                                        uint32_t n_tokens, uint32_t dim, float eps) {
     std::vector<BufInfo> bufs = {src, dst, weight};
-    runner_.updateDescriptorSet(pipe_rmsnorm_, bufs);
     struct { uint32_t n_tokens, dim; float eps; } pc = {n_tokens, dim, eps};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_rmsnorm_);
-    runner_.bindDescriptorSets(pipe_rmsnorm_);
+    bindPipelineAndDescriptors(pipe_rmsnorm_, bufs);
     runner_.pushConstants(pipe_rmsnorm_, &pc, sizeof(pc));
     runner_.dispatch(n_tokens);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -430,13 +446,11 @@ bool VulkanLLMRunner::dispatchRmsNorm(const BufInfo &src, BufInfo &dst, const Bu
 bool VulkanLLMRunner::dispatchMatvec(const BufInfo &x, const BufInfo &W, BufInfo &dst,
                                       uint32_t N, uint32_t K, uint32_t row_offset) {
     std::vector<BufInfo> bufs = {x, W, dst};
-    runner_.updateDescriptorSet(pipe_matvec_, bufs);
     struct { uint32_t N, K, row0; } pc = {N, K, row_offset};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_matvec_);
-    runner_.bindDescriptorSets(pipe_matvec_);
+    bindPipelineAndDescriptors(pipe_matvec_, bufs);
     runner_.pushConstants(pipe_matvec_, &pc, sizeof(pc));
     runner_.dispatch(N);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -456,13 +470,11 @@ bool VulkanLLMRunner::dispatchMatvecAuto(const BufInfo &x, const std::string &w_
 bool VulkanLLMRunner::dispatchMatvecF16(const BufInfo &x, const BufInfo &W_f16, BufInfo &dst,
                                          uint32_t N, uint32_t K, uint32_t row_offset) {
     std::vector<BufInfo> bufs = {x, W_f16, dst};
-    runner_.updateDescriptorSet(pipe_matvec_f16_, bufs);
     struct { uint32_t N, K, row0; } pc = {N, K, row_offset};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_matvec_f16_);
-    runner_.bindDescriptorSets(pipe_matvec_f16_);
+    bindPipelineAndDescriptors(pipe_matvec_f16_, bufs);
     runner_.pushConstants(pipe_matvec_f16_, &pc, sizeof(pc));
-    runner_.dispatch(N);
+    runner_.dispatch((N + 3) / 4);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -470,25 +482,21 @@ bool VulkanLLMRunner::dispatchMatvecF16(const BufInfo &x, const BufInfo &W_f16, 
 bool VulkanLLMRunner::dispatchMatvecQ8(const BufInfo &x, const BufInfo &W_raw, BufInfo &dst,
                                         uint32_t N, uint32_t K, uint32_t row_offset) {
     std::vector<BufInfo> bufs = {x, W_raw, dst};
-    runner_.updateDescriptorSet(pipe_matvec_q8_0_, bufs);
     struct { uint32_t N, K, row0; } pc = {N, K, row_offset};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_matvec_q8_0_);
-    runner_.bindDescriptorSets(pipe_matvec_q8_0_);
+    bindPipelineAndDescriptors(pipe_matvec_q8_0_, bufs);
     runner_.pushConstants(pipe_matvec_q8_0_, &pc, sizeof(pc));
-    runner_.dispatch(N);
+    runner_.dispatch((N + 3) / 4);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
 
 bool VulkanLLMRunner::dispatchSiluMul(BufInfo &gate, const BufInfo &up, uint32_t n) {
     std::vector<BufInfo> bufs = {gate, up};
-    runner_.updateDescriptorSet(pipe_silu_mul_, bufs);
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_silu_mul_);
-    runner_.bindDescriptorSets(pipe_silu_mul_);
+    bindPipelineAndDescriptors(pipe_silu_mul_, bufs);
     runner_.pushConstants(pipe_silu_mul_, &n, sizeof(n));
     runner_.dispatch((n + 255) / 256);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -496,15 +504,13 @@ bool VulkanLLMRunner::dispatchSiluMul(BufInfo &gate, const BufInfo &up, uint32_t
 bool VulkanLLMRunner::dispatchRopeNeox(BufInfo &vec, uint32_t n_heads, uint32_t head_dim,
                                         int position, float freq_base) {
     std::vector<BufInfo> bufs = {vec};
-    runner_.updateDescriptorSet(pipe_rope_neox_, bufs);
     struct { uint32_t n_heads, head_dim; int32_t position; float freq_base; } pc = {
         n_heads, head_dim, position, freq_base
     };
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_rope_neox_);
-    runner_.bindDescriptorSets(pipe_rope_neox_);
+    bindPipelineAndDescriptors(pipe_rope_neox_, bufs);
     runner_.pushConstants(pipe_rope_neox_, &pc, sizeof(pc));
     runner_.dispatch(n_heads);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -513,18 +519,16 @@ bool VulkanLLMRunner::dispatchRopeMrope(BufInfo &vec, uint32_t n_heads, uint32_t
                                          int pos_t, int pos_h, int pos_w, float freq_base,
                                          int sect0, int sect1, int sect2) {
     std::vector<BufInfo> bufs = {vec};
-    runner_.updateDescriptorSet(pipe_rope_mrope_, bufs);
     struct {
         uint32_t n_heads, head_dim;
         int32_t pos_t, pos_h, pos_w;
         float freq_base;
         int32_t sect0, sect1, sect2;
     } pc = {n_heads, head_dim, pos_t, pos_h, pos_w, freq_base, sect0, sect1, sect2};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_rope_mrope_);
-    runner_.bindDescriptorSets(pipe_rope_mrope_);
+    bindPipelineAndDescriptors(pipe_rope_mrope_, bufs);
     runner_.pushConstants(pipe_rope_mrope_, &pc, sizeof(pc));
     runner_.dispatch(n_heads);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -532,13 +536,11 @@ bool VulkanLLMRunner::dispatchRopeMrope(BufInfo &vec, uint32_t n_heads, uint32_t
 bool VulkanLLMRunner::dispatchQkNorm(BufInfo &vec, const BufInfo &weight,
                                       uint32_t n_heads, uint32_t head_dim, float eps) {
     std::vector<BufInfo> bufs = {vec, weight};
-    runner_.updateDescriptorSet(pipe_qknorm_, bufs);
     struct { uint32_t n_heads, head_dim; float eps; } pc = {n_heads, head_dim, eps};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_qknorm_);
-    runner_.bindDescriptorSets(pipe_qknorm_);
+    bindPipelineAndDescriptors(pipe_qknorm_, bufs);
     runner_.pushConstants(pipe_qknorm_, &pc, sizeof(pc));
     runner_.dispatch(n_heads);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -547,13 +549,11 @@ bool VulkanLLMRunner::dispatchKvStore(const BufInfo &k_vec, const BufInfo &v_vec
                                        BufInfo &k_cache, BufInfo &v_cache,
                                        uint32_t cache_pos, uint32_t kv_dim) {
     std::vector<BufInfo> bufs = {k_vec, v_vec, k_cache, v_cache};
-    runner_.updateDescriptorSet(pipe_kv_store_, bufs);
     struct { uint32_t cache_pos, kv_dim; } pc = {cache_pos, kv_dim};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_kv_store_);
-    runner_.bindDescriptorSets(pipe_kv_store_);
+    bindPipelineAndDescriptors(pipe_kv_store_, bufs);
     runner_.pushConstants(pipe_kv_store_, &pc, sizeof(pc));
     runner_.dispatch((kv_dim + 255) / 256);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -563,27 +563,23 @@ bool VulkanLLMRunner::dispatchAttnDecode(const BufInfo &q, const BufInfo &k_cach
                                           uint32_t n_heads, uint32_t n_kv_heads,
                                           uint32_t head_dim, uint32_t seq_len, float scale) {
     std::vector<BufInfo> bufs = {q, k_cache, v_cache, out};
-    runner_.updateDescriptorSet(pipe_attn_decode_, bufs);
     struct { uint32_t n_heads, n_kv_heads, head_dim, seq_len, max_seq_len; float scale; } pc = {
         n_heads, n_kv_heads, head_dim, seq_len, (uint32_t)max_seq_len_, scale
     };
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_attn_decode_);
-    runner_.bindDescriptorSets(pipe_attn_decode_);
+    bindPipelineAndDescriptors(pipe_attn_decode_, bufs);
     runner_.pushConstants(pipe_attn_decode_, &pc, sizeof(pc));
     runner_.dispatch(n_heads);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
 
 bool VulkanLLMRunner::dispatchAdd(BufInfo &dst, const BufInfo &src, uint32_t n) {
     std::vector<BufInfo> bufs = {dst, src};
-    runner_.updateDescriptorSet(pipe_add_, bufs);
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_add_);
-    runner_.bindDescriptorSets(pipe_add_);
+    bindPipelineAndDescriptors(pipe_add_, bufs);
     runner_.pushConstants(pipe_add_, &n, sizeof(n));
     runner_.dispatch((n + 255) / 256);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -592,15 +588,13 @@ bool VulkanLLMRunner::dispatchRopeNeoxBatch(BufInfo &vec, const BufInfo &positio
                                              uint32_t n_tokens, uint32_t n_heads,
                                              uint32_t head_dim, float freq_base) {
     std::vector<BufInfo> bufs = {vec, positions};
-    runner_.updateDescriptorSet(pipe_rope_neox_batch_, bufs);
     struct { uint32_t n_tokens, n_heads, head_dim; float freq_base; } pc = {
         n_tokens, n_heads, head_dim, freq_base
     };
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_rope_neox_batch_);
-    runner_.bindDescriptorSets(pipe_rope_neox_batch_);
+    bindPipelineAndDescriptors(pipe_rope_neox_batch_, bufs);
     runner_.pushConstants(pipe_rope_neox_batch_, &pc, sizeof(pc));
     runner_.dispatch(n_tokens * n_heads);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -610,17 +604,15 @@ bool VulkanLLMRunner::dispatchRopeMropeBatch(BufInfo &vec, const BufInfo &positi
                                               uint32_t head_dim, float freq_base,
                                               int sect0, int sect1, int sect2) {
     std::vector<BufInfo> bufs = {vec, positions};
-    runner_.updateDescriptorSet(pipe_rope_mrope_batch_, bufs);
     struct {
         uint32_t n_tokens, n_heads, head_dim;
         float freq_base;
         int32_t sect0, sect1, sect2;
     } pc = {n_tokens, n_heads, head_dim, freq_base, sect0, sect1, sect2};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_rope_mrope_batch_);
-    runner_.bindDescriptorSets(pipe_rope_mrope_batch_);
+    bindPipelineAndDescriptors(pipe_rope_mrope_batch_, bufs);
     runner_.pushConstants(pipe_rope_mrope_batch_, &pc, sizeof(pc));
     runner_.dispatch(n_tokens * n_heads);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -630,13 +622,11 @@ bool VulkanLLMRunner::dispatchKvStoreBatch(const BufInfo &k, const BufInfo &v,
                                             const BufInfo &cache_positions,
                                             uint32_t n_tokens, uint32_t kv_dim) {
     std::vector<BufInfo> bufs = {k, v, k_cache, v_cache, cache_positions};
-    runner_.updateDescriptorSet(pipe_kv_store_batch_, bufs);
     struct { uint32_t n_tokens, kv_dim; } pc = {n_tokens, kv_dim};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_kv_store_batch_);
-    runner_.bindDescriptorSets(pipe_kv_store_batch_);
+    bindPipelineAndDescriptors(pipe_kv_store_batch_, bufs);
     runner_.pushConstants(pipe_kv_store_batch_, &pc, sizeof(pc));
     runner_.dispatch(n_tokens);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -649,15 +639,13 @@ bool VulkanLLMRunner::dispatchAttnPrefill(const BufInfo &q, const BufInfo &k_cac
                                            uint32_t max_seq_len, float scale) {
     (void)max_seq_len;
     std::vector<BufInfo> bufs = {q, k_cache, v_cache, out, cache_positions};
-    runner_.updateDescriptorSet(pipe_attn_prefill_, bufs);
     struct { uint32_t n_tokens, n_heads, n_kv_heads, head_dim; float scale; } pc = {
         n_tokens, n_heads, n_kv_heads, head_dim, scale
     };
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_attn_prefill_);
-    runner_.bindDescriptorSets(pipe_attn_prefill_);
+    bindPipelineAndDescriptors(pipe_attn_prefill_, bufs);
     runner_.pushConstants(pipe_attn_prefill_, &pc, sizeof(pc));
     runner_.dispatch(n_tokens * n_heads);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -665,16 +653,13 @@ bool VulkanLLMRunner::dispatchAttnPrefill(const BufInfo &q, const BufInfo &k_cac
 bool VulkanLLMRunner::dispatchMatmulCoopmatNT(const BufInfo &A, const BufInfo &B, BufInfo &C,
                                                 uint32_t M, uint32_t N, uint32_t K) {
     std::vector<BufInfo> bufs = {A, B, C};
-    runner_.updateDescriptorSet(pipe_matmul_coopmat_nt_, bufs);
     struct { uint32_t M, N, K; } pc = {M, N, K};
-    // Dispatch: grid = ceil(N/64) x ceil(M/128)
     uint32_t grid_x = (N + 63) / 64;
     uint32_t grid_y = (M + 127) / 128;
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_matmul_coopmat_nt_);
-    runner_.bindDescriptorSets(pipe_matmul_coopmat_nt_);
+    bindPipelineAndDescriptors(pipe_matmul_coopmat_nt_, bufs);
     runner_.pushConstants(pipe_matmul_coopmat_nt_, &pc, sizeof(pc));
     runner_.dispatch(grid_x, grid_y);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -682,13 +667,11 @@ bool VulkanLLMRunner::dispatchMatmulCoopmatNT(const BufInfo &A, const BufInfo &B
 bool VulkanLLMRunner::dispatchDequantQ8(const BufInfo &src, BufInfo &dst,
                                          uint32_t n_rows, uint32_t n_cols) {
     std::vector<BufInfo> bufs = {src, dst};
-    runner_.updateDescriptorSet(pipe_dequant_q8_0_, bufs);
     struct { uint32_t n_rows, n_cols; } pc = {n_rows, n_cols};
-    runner_.beginRecording();
-    runner_.bindComputePipeline(pipe_dequant_q8_0_);
-    runner_.bindDescriptorSets(pipe_dequant_q8_0_);
+    bindPipelineAndDescriptors(pipe_dequant_q8_0_, bufs);
     runner_.pushConstants(pipe_dequant_q8_0_, &pc, sizeof(pc));
     runner_.dispatch(n_rows);
+    if (fused_mode_) { runner_.computeBarrier(); return true; }
     runner_.endRecordingAndSubmit();
     return runner_.waitForCompletion();
 }
@@ -905,6 +888,13 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
     // Create pipelines
     shader_dir_ = ".";
     if (!createPipelines()) return false;
+
+    // Create dynamic descriptor pool for fused command buffer mode
+    // Max dispatches per forward: n_layers * ~15 + extras
+    if (!runner_.createDynamicDescriptorPool(n_layers_ * 20 + 200)) {
+        last_error_ = "Failed to create dynamic descriptor pool";
+        return false;
+    }
 
     // Upload global tensors
     std::cerr << "vulkan llm: uploading token_embd...\n";
@@ -1201,6 +1191,17 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
     int seq_len = cache_pos + 1;
     float scale = 1.0f / sqrtf((float)head_dim_);
 
+    // Fused mode: batch all dispatches into one command buffer
+    bool use_fused = true;
+    if (const char *env = std::getenv("GEMM_NO_FUSE")) {
+        if (std::atoi(env)) use_fused = false;
+    }
+    if (use_fused) {
+        runner_.resetDynamicDescriptorPool();
+        runner_.beginRecording();
+        fused_mode_ = true;
+    }
+
     for (int l = 0; l < n_layers_; l++) {
         auto &ln = layer_names_[l];
 
@@ -1284,6 +1285,12 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
             dispatchMatvecAuto(buf_xb_, ln.ffn_gate_inp, buf_moe_router_, n_expert_, n_embd_);
             GLLM_PROF_END("ffn_gate_inp", 2.0 * n_expert_ * n_embd_, 0);
 
+            // MoE requires CPU-side routing: flush command buffer
+            if (fused_mode_) {
+                fused_mode_ = false;
+                runner_.endRecordingAndSubmit();
+                runner_.waitForCompletion();
+            }
             downloadFromBuffer(buf_moe_router_, moe_router_cpu_.data(), (size_t)n_expert_ * sizeof(float));
             llm_softmax(moe_router_cpu_.data(), n_expert_);
 
@@ -1339,6 +1346,10 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
                 }
             }
             uploadToBuffer(buf_xb_, moe_accum_cpu_.data(), (size_t)n_embd_ * sizeof(float));
+            // Re-enter fused mode after MoE CPU routing
+            runner_.resetDynamicDescriptorPool();
+            runner_.beginRecording();
+            fused_mode_ = true;
             dispatchAdd(buf_x_, buf_xb_, n_embd_);
         } else {
             // Dense SwiGLU fallback path
@@ -1372,8 +1383,8 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
             dispatchAdd(buf_x_, buf_ds_slices_[l], n_embd_);
         }
 
-        if (l == 0 || l == n_layers_ - 1 || (l + 1) % 10 == 0) {
-            // Download hidden state for debug norm
+        if (!fused_mode_ && (l == 0 || l == n_layers_ - 1 || (l + 1) % 10 == 0)) {
+            // Download hidden state for debug norm (skipped in fused mode)
             downloadFromBuffer(buf_x_, hidden_cpu_.data(), n_embd_ * sizeof(float));
             float norm = 0.0f;
             for (int i = 0; i < n_embd_; i++) norm += hidden_cpu_[i] * hidden_cpu_[i];
@@ -1392,7 +1403,16 @@ float *VulkanLLMRunner::forwardInternal(int cache_pos, int pos_t, int pos_h, int
         const std::string output_key = weight_bufs_.count("output") ? "output" : "token_embd";
         dispatchMatvecAuto(buf_xb_, output_key, buf_logits_, n_vocab_, n_embd_);
         GLLM_PROF_END("lm_head", 2.0 * n_vocab_ * n_embd_, 0);
+    }
 
+    // End fused command buffer and wait
+    if (fused_mode_) {
+        fused_mode_ = false;
+        runner_.endRecordingAndSubmit();
+        runner_.waitForCompletion();
+    }
+
+    if (compute_logits) {
         // Download logits
         downloadFromBuffer(buf_logits_, logits_cpu_.data(), n_vocab_ * sizeof(float));
         return logits_cpu_.data();
@@ -1545,6 +1565,11 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
     int q_dim = n_heads_ * head_dim_;
     float scale = 1.0f / sqrtf((float)head_dim_);
 
+    // Begin fused command buffer
+    runner_.resetDynamicDescriptorPool();
+    runner_.beginRecording();
+    fused_mode_ = true;
+
     for (int l = 0; l < n_layers_; l++) {
         auto &ln = layer_names_[l];
 
@@ -1615,11 +1640,23 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
                                    rope_freq_base_, mrope_sections_[0], mrope_sections_[1], mrope_sections_[2]);
         } else {
             // For neox batch, positions buffer has 1 int per token (use pos_t slot)
-            // Upload pos_t as single positions
+            // Must flush fused command buffer before overwriting buf_positions_
+            if (fused_mode_) {
+                fused_mode_ = false;
+                runner_.endRecordingAndSubmit();
+                runner_.waitForCompletion();
+            }
             uploadToBuffer(buf_positions_, pos_t, n_tokens * sizeof(int));
+            runner_.resetDynamicDescriptorPool();
+            runner_.beginRecording();
+            fused_mode_ = true;
             dispatchRopeNeoxBatch(buf_pfq_, buf_positions_, n_tokens, n_heads_, head_dim_, rope_freq_base_);
             dispatchRopeNeoxBatch(buf_pfk_, buf_positions_, n_tokens, n_kv_heads_, head_dim_, rope_freq_base_);
             // Restore 3-component positions for M-RoPE (if needed later)
+            // Must flush before overwriting buf_positions_ again
+            fused_mode_ = false;
+            runner_.endRecordingAndSubmit();
+            runner_.waitForCompletion();
             std::vector<int> pos3(n_tokens * 3);
             for (int i = 0; i < n_tokens; i++) {
                 pos3[i * 3 + 0] = pos_t[i];
@@ -1627,6 +1664,9 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
                 pos3[i * 3 + 2] = pos_w[i];
             }
             uploadToBuffer(buf_positions_, pos3.data(), pos3.size() * sizeof(int));
+            runner_.resetDynamicDescriptorPool();
+            runner_.beginRecording();
+            fused_mode_ = true;
         }
 
         // Batched KV store
@@ -1721,8 +1761,8 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
         // For now, deepstack is not supported in batch mode.
         // TODO: implement batched deepstack injection
 
-        if (l == 0 || l == n_layers_ - 1 || (l + 1) % 10 == 0) {
-            // Download last token's hidden state for debug norm
+        if (!fused_mode_ && (l == 0 || l == n_layers_ - 1 || (l + 1) % 10 == 0)) {
+            // Download last token's hidden state for debug norm (skipped in fused mode)
             std::vector<float> hid(n_embd_);
             size_t last_tok_offset = (size_t)(n_tokens - 1) * n_embd_ * sizeof(float);
             void *ptr = nullptr;
@@ -1733,6 +1773,13 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
             for (int i = 0; i < n_embd_; i++) norm += hid[i] * hid[i];
             std::cerr << "  layer " << l << ": hidden norm = " << sqrtf(norm) << "\n";
         }
+    }
+
+    // End fused command buffer before CPU-side data extraction
+    if (fused_mode_) {
+        fused_mode_ = false;
+        runner_.endRecordingAndSubmit();
+        runner_.waitForCompletion();
     }
 
     // Final RMSNorm on last token
@@ -1746,6 +1793,7 @@ float *VulkanLLMRunner::forwardBatch(int n_tokens, const int *cache_positions,
         runner_.unmapBuffer(buf_pfx_);
     }
 
+    // Final norm + LM head (not fused - just 1-2 dispatches)
     dispatchRmsNorm(buf_x_, buf_xb_, weight_bufs_["output_norm"], 1, n_embd_, rms_norm_eps_);
 
     if (compute_logits) {

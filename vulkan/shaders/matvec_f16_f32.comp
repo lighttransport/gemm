@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
-// Matrix-vector multiply with F16 weights: dst[i] = sum_j(W_f16[i*K + j] * x[j])
-// One workgroup per output row. 256 threads reduce K elements.
+// Optimized F16 matrix-vector multiply with subgroup reduction and multi-row.
+// dst[row] = sum_j(W_f16[row*K + j] * x[j])
+// 4 rows per workgroup, 256 threads, subgroup arithmetic reduction.
 #version 450
 
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -18,30 +20,75 @@ layout(push_constant) uniform PushConstants {
     uint row0; // starting row in W
 } pc;
 
-shared float s_reduce[256];
+// Shared memory for cross-subgroup reduction: one slot per subgroup per row
+// Max 4 subgroups with 256 threads / 64 subgroup size
+shared float s_partial[4][4];
 
 void main() {
-    uint row = gl_WorkGroupID.x;
+    uint base_row = gl_WorkGroupID.x * 4u;
     uint tid = gl_LocalInvocationID.x;
+    uint sg_id = gl_SubgroupID;
+    uint sg_size = gl_SubgroupSize;
 
-    if (row >= pc.N) return;
+    // Each thread accumulates for all 4 rows
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
 
-    uint w_base = (pc.row0 + row) * pc.K;
+    // Compute which rows are valid
+    uint row0 = base_row;
+    uint row1 = base_row + 1u;
+    uint row2 = base_row + 2u;
+    uint row3 = base_row + 3u;
 
-    float sum = 0.0;
-    for (uint j = tid; j < pc.K; j += 256) {
-        sum += float(W[w_base + j]) * x[j];
+    uint w0 = (pc.row0 + row0) * pc.K;
+    uint w1 = (pc.row0 + row1) * pc.K;
+    uint w2 = (pc.row0 + row2) * pc.K;
+    uint w3 = (pc.row0 + row3) * pc.K;
+
+    for (uint j = tid; j < pc.K; j += 256u) {
+        float xj = x[j];
+        if (row0 < pc.N) sum0 += float(W[w0 + j]) * xj;
+        if (row1 < pc.N) sum1 += float(W[w1 + j]) * xj;
+        if (row2 < pc.N) sum2 += float(W[w2 + j]) * xj;
+        if (row3 < pc.N) sum3 += float(W[w3 + j]) * xj;
     }
 
-    s_reduce[tid] = sum;
+    // Subgroup reduction
+    sum0 = subgroupAdd(sum0);
+    sum1 = subgroupAdd(sum1);
+    sum2 = subgroupAdd(sum2);
+    sum3 = subgroupAdd(sum3);
+
+    // First thread of each subgroup writes to shared memory
+    if (gl_SubgroupInvocationID == 0u) {
+        s_partial[sg_id][0] = sum0;
+        s_partial[sg_id][1] = sum1;
+        s_partial[sg_id][2] = sum2;
+        s_partial[sg_id][3] = sum3;
+    }
+
     barrier();
 
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
-        barrier();
-    }
+    // First subgroup reduces across subgroups
+    if (sg_id == 0u && gl_SubgroupInvocationID < 4u) {
+        uint n_sg = (256u + sg_size - 1u) / sg_size;
+        float r0 = 0.0, r1 = 0.0, r2 = 0.0, r3 = 0.0;
+        uint lane = gl_SubgroupInvocationID;
+        if (lane < n_sg) {
+            r0 = s_partial[lane][0];
+            r1 = s_partial[lane][1];
+            r2 = s_partial[lane][2];
+            r3 = s_partial[lane][3];
+        }
+        r0 = subgroupAdd(r0);
+        r1 = subgroupAdd(r1);
+        r2 = subgroupAdd(r2);
+        r3 = subgroupAdd(r3);
 
-    if (tid == 0) {
-        dst[row] = s_reduce[0];
+        if (lane == 0u) {
+            if (row0 < pc.N) dst[row0] = r0;
+            if (row1 < pc.N) dst[row1] = r1;
+            if (row2 < pc.N) dst[row2] = r2;
+            if (row3 < pc.N) dst[row3] = r3;
+        }
     }
 }
