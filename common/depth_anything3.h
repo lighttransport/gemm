@@ -250,10 +250,57 @@ static int da3_tensor_numel(const qtensor *t) {
     return n;
 }
 
+/* ---- Tensor validation helpers ---- */
+
+/* Returns 0 on success, prints error and returns -1 on failure.
+ * Pass -1 for any dimension to skip that check. */
+static int da3_validate_tensor(const char *name, const qtensor *t,
+                                int expect_ndims, int expect_dim0, int expect_dim1,
+                                int expect_dim2, int expect_dim3) {
+    if (!t->data) return 0; /* NULL = optional tensor not loaded, OK */
+    if (expect_ndims >= 0 && t->n_dims != expect_ndims) {
+        fprintf(stderr, "da3: %s: expected %dD, got %dD\n", name, expect_ndims, t->n_dims);
+        return -1;
+    }
+    int expect[4] = {expect_dim0, expect_dim1, expect_dim2, expect_dim3};
+    for (int d = 0; d < t->n_dims && d < 4; d++) {
+        if (expect[d] >= 0 && (int)t->dims[d] != expect[d]) {
+            fprintf(stderr, "da3: %s: dim[%d] expected %d, got %d\n",
+                    name, d, expect[d], (int)t->dims[d]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Validate numel matches expected total element count */
+static int da3_validate_numel(const char *name, const qtensor *t, int expected) {
+    if (!t->data) return 0;
+    int actual = da3_tensor_numel(t);
+    if (actual != expected) {
+        fprintf(stderr, "da3: %s: expected %d elements, got %d\n", name, expected, actual);
+        return -1;
+    }
+    return 0;
+}
+
+/* Check that a required tensor was actually loaded */
+static int da3_validate_required(const char *name, const qtensor *t) {
+    if (!t->data) {
+        fprintf(stderr, "da3: missing required tensor '%s'\n", name);
+        return -1;
+    }
+    return 0;
+}
+
 /* Dequantize entire tensor to F32. Caller must free. Returns NULL if no data. */
 static float *da3_dequant(const qtensor *t) {
     if (!t->data) return NULL;
     int n = da3_tensor_numel(t);
+    if (n <= 0) {
+        fprintf(stderr, "da3_dequant: tensor has %d elements\n", n);
+        return NULL;
+    }
     float *buf = (float *)malloc((size_t)n * sizeof(float));
     if (t->type == GGML_TYPE_F16) {
         const uint16_t *src = (const uint16_t *)t->data;
@@ -281,6 +328,11 @@ static float *da3_dequant(const qtensor *t) {
 /* Dequant single row (1D tensor or specific row of 2D) */
 static void da3_dequant_row(const qtensor *t, int row, float *dst) {
     int n = t->n_cols;
+    if (row < 0 || row >= t->n_rows) {
+        fprintf(stderr, "da3_dequant_row: row %d out of bounds [0, %d)\n", row, t->n_rows);
+        memset(dst, 0, (size_t)n * sizeof(float));
+        return;
+    }
     if (t->type == GGML_TYPE_F16) {
         const uint16_t *src = (const uint16_t *)t->data + (size_t)row * n;
         for (int i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(src[i]);
@@ -328,6 +380,16 @@ static void *da3_gemm_worker(void *arg) {
 static void da3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
                            const float *src, int n_tok, int n_out, int n_in,
                            int n_threads) {
+    if (!W->data) {
+        fprintf(stderr, "da3_batch_gemm: NULL weight\n");
+        memset(dst, 0, (size_t)n_tok * n_out * sizeof(float));
+        return;
+    }
+    int w_numel = da3_tensor_numel(W);
+    if (w_numel != n_out * n_in) {
+        fprintf(stderr, "da3_batch_gemm: weight has %d elements, expected %d*%d=%d\n",
+                w_numel, n_out, n_in, n_out * n_in);
+    }
     if (W->type == GGML_TYPE_F16) {
         if (n_threads > 1 && n_out >= n_threads * 3) {
             /* Row-parallel multi-threaded GEMM */
@@ -901,6 +963,56 @@ da3_model *da3_load(gguf_context *gguf) {
 
     fprintf(stderr, "da3: loaded %d blocks, dim=%d, heads=%d, patches=%dx%d=%d, swiglu=%d\n",
             m->n_blocks, m->dim, m->n_heads, m->grid_h, m->grid_w, m->n_patches, m->use_swiglu);
+
+    /* ---- Post-load validation ---- */
+    {
+        int err = 0;
+        /* Validate embeddings */
+        err |= da3_validate_required("patch_embed_w", &m->patch_embed_w);
+        err |= da3_validate_required("cls_token", &m->cls_token);
+        err |= da3_validate_required("pos_embed", &m->pos_embed);
+        err |= da3_validate_numel("cls_token", &m->cls_token, m->dim);
+        err |= da3_validate_numel("pos_embed", &m->pos_embed, m->n_tokens * m->dim);
+
+        /* Validate blocks have minimum required tensors */
+        for (int L = 0; L < m->n_blocks; L++) {
+            da3_block *blk = &m->blocks[L];
+            char name[64];
+            snprintf(name, sizeof(name), "block.%d.ln1_w", L);
+            err |= da3_validate_required(name, &blk->ln1_w);
+            snprintf(name, sizeof(name), "block.%d.attn_qkv_w", L);
+            err |= da3_validate_required(name, &blk->attn_qkv_w);
+            snprintf(name, sizeof(name), "block.%d.attn_out_w", L);
+            err |= da3_validate_required(name, &blk->attn_out_w);
+            /* Validate QKV weight shape: [3*dim, dim] */
+            snprintf(name, sizeof(name), "block.%d.attn_qkv_w", L);
+            err |= da3_validate_numel(name, &blk->attn_qkv_w, 3 * m->dim * m->dim);
+        }
+
+        /* Validate feature_layers within bounds */
+        for (int i = 0; i < 4; i++) {
+            if (m->feature_layers[i] >= m->n_blocks) {
+                fprintf(stderr, "da3: feature_layers[%d]=%d >= n_blocks=%d\n",
+                        i, m->feature_layers[i], m->n_blocks);
+                err = -1;
+            }
+        }
+
+        /* Validate DPT head projections match head_out_channels */
+        for (int i = 0; i < 4; i++) {
+            if (m->head.proj_w[i].data) {
+                int expected_co = m->head_out_channels[i];
+                if (m->head.proj_w[i].n_rows != expected_co) {
+                    fprintf(stderr, "da3: head.proj_w[%d]: n_rows=%d, expected Co=%d\n",
+                            i, m->head.proj_w[i].n_rows, expected_co);
+                    err = -1;
+                }
+            }
+        }
+
+        if (err) { fprintf(stderr, "da3: model validation failed\n"); da3_free(m); return NULL; }
+    }
+
     return m;
 }
 
@@ -1762,6 +1874,79 @@ da3_model *da3_load_safetensors(const char *st_path, const char *config_path) {
             m->feature_layers[2], m->feature_layers[3]);
     fprintf(stderr, "  has_cam_dec=%d, has_aux=%d, has_gsdpt=%d\n",
             m->has_cam_dec, m->has_aux, m->has_gsdpt);
+
+    /* ---- Post-load validation ---- */
+    {
+        int err = 0;
+        /* Validate embeddings */
+        err |= da3_validate_required("patch_embed_w", &m->patch_embed_w);
+        err |= da3_validate_required("cls_token", &m->cls_token);
+        err |= da3_validate_required("pos_embed", &m->pos_embed);
+        err |= da3_validate_numel("cls_token", &m->cls_token, m->dim);
+        err |= da3_validate_numel("pos_embed", &m->pos_embed, m->n_tokens * m->dim);
+
+        /* Validate patch_embed_w shape: [embed_dim, 3, patch_size, patch_size] */
+        err |= da3_validate_tensor("patch_embed_w", &m->patch_embed_w,
+                                    4, m->dim, 3, m->patch_size, m->patch_size);
+
+        /* Validate n_heads * head_dim == dim */
+        if (m->n_heads * m->head_dim != m->dim) {
+            fprintf(stderr, "da3: n_heads(%d) * head_dim(%d) = %d != dim(%d)\n",
+                    m->n_heads, m->head_dim, m->n_heads * m->head_dim, m->dim);
+            err = -1;
+        }
+
+        /* Validate blocks have minimum required tensors */
+        for (int L = 0; L < m->n_blocks; L++) {
+            da3_block *blk = &m->blocks[L];
+            char name[64];
+            snprintf(name, sizeof(name), "block.%d.ln1_w", L);
+            err |= da3_validate_required(name, &blk->ln1_w);
+            snprintf(name, sizeof(name), "block.%d.attn_qkv_w", L);
+            err |= da3_validate_required(name, &blk->attn_qkv_w);
+            snprintf(name, sizeof(name), "block.%d.attn_out_w", L);
+            err |= da3_validate_required(name, &blk->attn_out_w);
+            /* Validate QKV weight shape: [3*dim, dim] */
+            snprintf(name, sizeof(name), "block.%d.attn_qkv_w", L);
+            err |= da3_validate_numel(name, &blk->attn_qkv_w, 3 * m->dim * m->dim);
+        }
+
+        /* Validate feature_layers within bounds */
+        for (int i = 0; i < 4; i++) {
+            if (m->feature_layers[i] >= m->n_blocks) {
+                fprintf(stderr, "da3: feature_layers[%d]=%d >= n_blocks=%d\n",
+                        i, m->feature_layers[i], m->n_blocks);
+                err = -1;
+            }
+        }
+
+        /* Validate DPT head projections match head_out_channels */
+        for (int i = 0; i < 4; i++) {
+            if (m->head.proj_w[i].data) {
+                int expected_co = m->head_out_channels[i];
+                if (m->head.proj_w[i].n_rows != expected_co) {
+                    fprintf(stderr, "da3: head.proj_w[%d]: n_rows=%d, expected Co=%d\n",
+                            i, m->head.proj_w[i].n_rows, expected_co);
+                    err = -1;
+                }
+            }
+        }
+
+        /* Validate CameraDec shapes if present */
+        if (m->has_cam_dec) {
+            err |= da3_validate_required("cam_dec.mlp0_w", &m->cam_dec.mlp0_w);
+            err |= da3_validate_required("cam_dec.fc_t_w", &m->cam_dec.fc_t_w);
+            if (m->cam_dec.fc_t_w.data)
+                err |= da3_validate_tensor("cam_dec.fc_t_w", &m->cam_dec.fc_t_w, 2, 3, -1, -1, -1);
+            if (m->cam_dec.fc_qvec_w.data)
+                err |= da3_validate_tensor("cam_dec.fc_qvec_w", &m->cam_dec.fc_qvec_w, 2, 4, -1, -1, -1);
+            if (m->cam_dec.fc_fov_w.data)
+                err |= da3_validate_tensor("cam_dec.fc_fov_w", &m->cam_dec.fc_fov_w, 2, 2, -1, -1, -1);
+        }
+
+        if (err) { fprintf(stderr, "da3: model validation failed\n"); da3_free(m); return NULL; }
+    }
+
     return m;
 }
 
