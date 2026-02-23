@@ -404,6 +404,22 @@ st_context *safetensors_open(const char *path) {
         }
     }
 
+    /* Validate tensor data ranges fit within file */
+    size_t data_size = file_size - 8 - (size_t)header_size;
+    for (int i = 0; i < n_tensors; i++) {
+        uint64_t end = (uint64_t)tensors[i].offset + tensors[i].nbytes;
+        if (end > data_size) {
+            fprintf(stderr, "safetensors: tensor '%s' data extends past file end "
+                    "(offset=%zu, nbytes=%zu, data_size=%zu)\n",
+                    tensors[i].name, tensors[i].offset, tensors[i].nbytes, data_size);
+            for (int j = 0; j < n_tensors; j++) free(tensors[j].name);
+            free(tensors);
+            json_free(root);
+            munmap(map, file_size);
+            return NULL;
+        }
+    }
+
     json_free(root);
 
     st_context *ctx = (st_context *)malloc(sizeof(st_context));
