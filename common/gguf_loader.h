@@ -471,7 +471,9 @@ const char *gguf_tensor_name(const gguf_context *ctx, int i) {
 
 void *gguf_tensor_data(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors || !ctx->data) return NULL;
-    return ctx->data + ctx->tensors[i].offset;
+    uint64_t offset = ctx->tensors[i].offset;
+    if (offset >= ctx->data_size) return NULL;  /* bounds check */
+    return ctx->data + offset;
 }
 
 size_t gguf_tensor_size(const gguf_context *ctx, int i) {
