@@ -101,6 +101,14 @@ void        ppd_result_free(ppd_result *r);
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <float.h>
+
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
+
+#define CPU_COMPUTE_IMPLEMENTATION
+#include "cpu_compute.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -125,7 +133,7 @@ static uint16_t ppd_f32_to_f16(float f) {
     int exp = ((x >> 23) & 0xFF) - 127 + 15;
     uint32_t mant = (x >> 13) & 0x3FF;
     if (exp <= 0) return (uint16_t)sign;
-    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    if (exp >= 31) return (uint16_t)(sign | 0x7BFF); /* clamp to ±65504, avoid Inf */
     return (uint16_t)(sign | (exp << 10) | mant);
 }
 
@@ -139,61 +147,19 @@ static uint16_t *ppd_fp32_to_fp16(const float *src, int n) {
 /* LayerNorm: y = (x - mean) / sqrt(var + eps) * w + b */
 static void ppd_layernorm(float *dst, const float *src, const float *w,
                            const float *b, int n_tok, int dim, float eps) {
-    for (int t = 0; t < n_tok; t++) {
-        const float *x = src + t * dim;
-        float *y = dst + t * dim;
-        float mean = 0.0f;
-        for (int i = 0; i < dim; i++) mean += x[i];
-        mean /= dim;
-        float var = 0.0f;
-        for (int i = 0; i < dim; i++) { float d = x[i] - mean; var += d * d; }
-        var /= dim;
-        float inv = 1.0f / sqrtf(var + eps);
-        for (int i = 0; i < dim; i++)
-            y[i] = (x[i] - mean) * inv * w[i] + b[i];
-    }
+    cpu_layernorm(dst, src, w, b, n_tok, dim, eps);
 }
 
-/* GELU (tanh approximation): x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))) */
-static void ppd_gelu(float *x, int n) {
-    const float c = 0.7978845608f; /* sqrt(2/pi) */
-    for (int i = 0; i < n; i++) {
-        float v = x[i];
-        float t = tanhf(c * (v + 0.044715f * v * v * v));
-        x[i] = 0.5f * v * (1.0f + t);
-    }
-}
+/* GELU (tanh approximation) */
+static void ppd_gelu(float *x, int n) { cpu_gelu(x, n); }
 
 /* SiLU: x * sigmoid(x) */
-static void ppd_silu(float *x, int n) {
-    for (int i = 0; i < n; i++) {
-        float v = x[i];
-        x[i] = v / (1.0f + expf(-v));
-    }
-}
+static void ppd_silu(float *x, int n) { cpu_silu(x, n); }
 
 /* Bilinear resize for CHW float image */
 static void ppd_bilinear_resize(float *dst, const float *src,
                                   int C, int Hi, int Wi, int Ho, int Wo) {
-    for (int c = 0; c < C; c++) {
-        for (int oh = 0; oh < Ho; oh++) {
-            float fy = (Ho > 1) ? (float)oh * (Hi - 1) / (Ho - 1) : 0;
-            int y0 = (int)fy;
-            int y1 = (y0 + 1 < Hi) ? y0 + 1 : y0;
-            float dy = fy - y0;
-            for (int ow = 0; ow < Wo; ow++) {
-                float fx = (Wo > 1) ? (float)ow * (Wi - 1) / (Wo - 1) : 0;
-                int x0 = (int)fx;
-                int x1 = (x0 + 1 < Wi) ? x0 + 1 : x0;
-                float dx = fx - x0;
-                dst[c * Ho * Wo + oh * Wo + ow] =
-                    src[c * Hi * Wi + y0 * Wi + x0] * (1-dy) * (1-dx) +
-                    src[c * Hi * Wi + y0 * Wi + x1] * (1-dy) * dx +
-                    src[c * Hi * Wi + y1 * Wi + x0] * dy * (1-dx) +
-                    src[c * Hi * Wi + y1 * Wi + x1] * dy * dx;
-            }
-        }
-    }
+    cpu_bilinear_resize(dst, src, C, Hi, Wi, Ho, Wo);
 }
 
 /* Interpolate position embeddings from original grid to new grid */
@@ -266,176 +232,31 @@ static void ppd_generate_grid_pos(int *pos_y, int *pos_x, int gH, int gW) {
 
 /* ---- Threaded GEMM: Y[tok][row] = W[row,:] * X[tok,:] + bias[row] ---- */
 
-typedef struct {
-    float *dst;
-    const uint16_t *W;
-    const float *src;
-    int n_out, n_in, n_tok;
-    int r_start, r_end;
-} ppd_gemm_task;
-
-static void *ppd_gemm_worker(void *arg) {
-    ppd_gemm_task *t = (ppd_gemm_task *)arg;
-    int count = t->r_end - t->r_start;
-    if (count <= 0) return NULL;
-    gemm_f16_f32_tokmajor(t->dst + t->r_start,
-                           t->W + (size_t)t->r_start * t->n_in,
-                           t->src,
-                           count, t->n_in, t->n_tok,
-                           t->n_out, t->n_in);
-    return NULL;
-}
-
 static void ppd_gemm(float *dst, const uint16_t *W, const float *bias,
                       const float *src, int n_tok, int n_out, int n_in,
                       int n_threads) {
-    if (n_threads > 1 && n_out >= n_threads * 3) {
-        ppd_gemm_task *tasks = (ppd_gemm_task *)calloc((size_t)n_threads, sizeof(ppd_gemm_task));
-        pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-        int rows_per = ((n_out / n_threads) / 3) * 3;
-        if (rows_per < 3) rows_per = 3;
-        int r = 0, actual = 0;
-        for (int i = 0; i < n_threads && r < n_out; i++) {
-            int end = (i == n_threads - 1) ? n_out : r + rows_per;
-            if (end > n_out) end = n_out;
-            tasks[i] = (ppd_gemm_task){dst, W, src, n_out, n_in, n_tok, r, end};
-            pthread_create(&threads[i], NULL, ppd_gemm_worker, &tasks[i]);
-            r = end;
-            actual = i + 1;
-        }
-        for (int i = 0; i < actual; i++) pthread_join(threads[i], NULL);
-        free(tasks); free(threads);
-    } else {
-        gemm_f16_f32_tokmajor(dst, W, src, n_out, n_in, n_tok, n_out, n_in);
-    }
-    if (bias) {
-        for (int t = 0; t < n_tok; t++)
-            for (int i = 0; i < n_out; i++)
-                dst[t * n_out + i] += bias[i];
-    }
+    cpu_gemm_f16(dst, W, bias, src, n_tok, n_out, n_in, n_threads);
 }
 
-/* ---- Threaded attention: head-parallel ---- */
-
-typedef struct {
-    const float *qkv;
-    float *attn_out;
-    int n_tok, dim, head_dim, n_heads;
-    int h_start, h_end;
-    float scale;
-} ppd_attn_task;
-
-static void *ppd_attn_worker(void *arg) {
-    ppd_attn_task *t = (ppd_attn_task *)arg;
-    int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
-    float *att = (float *)malloc((size_t)N * sizeof(float));
-
-    for (int h = t->h_start; h < t->h_end; h++) {
-        for (int qi = 0; qi < N; qi++) {
-            const float *q_h = t->qkv + qi * dim3 + h * hd;
-            for (int ki = 0; ki < N; ki++) {
-                const float *k_h = t->qkv + ki * dim3 + t->dim + h * hd;
-                float dot = 0.0f;
-                for (int d = 0; d < hd; d++) dot += q_h[d] * k_h[d];
-                att[ki] = dot * t->scale;
-            }
-            /* softmax */
-            float mx = att[0];
-            for (int i = 1; i < N; i++) if (att[i] > mx) mx = att[i];
-            float sum = 0.0f;
-            for (int i = 0; i < N; i++) { att[i] = expf(att[i] - mx); sum += att[i]; }
-            float inv = 1.0f / sum;
-            for (int i = 0; i < N; i++) att[i] *= inv;
-            /* V weighted sum */
-            float *out_h = t->attn_out + qi * t->dim + h * hd;
-            memset(out_h, 0, (size_t)hd * sizeof(float));
-            for (int vi = 0; vi < N; vi++) {
-                const float *v_h = t->qkv + vi * dim3 + 2 * t->dim + h * hd;
-                float w = att[vi];
-                for (int d = 0; d < hd; d++) out_h[d] += w * v_h[d];
-            }
-        }
-    }
-    free(att);
-    return NULL;
-}
+/* ---- Threaded attention: head-parallel, flash-attention style ---- */
 
 static void ppd_attention(float *out, const float *qkv, int n_tok, int dim,
                            int n_heads, int head_dim, int n_threads) {
-    float scale = 1.0f / sqrtf((float)head_dim);
-    if (n_threads <= 1 || n_heads < n_threads) {
-        ppd_attn_task task = {qkv, out, n_tok, dim, head_dim, n_heads,
-                              0, n_heads, scale};
-        ppd_attn_worker(&task);
-        return;
-    }
-    ppd_attn_task *tasks = (ppd_attn_task *)calloc((size_t)n_threads, sizeof(ppd_attn_task));
-    pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-    int heads_per = n_heads / n_threads;
-    int extra = n_heads % n_threads;
-    int h = 0;
-    for (int i = 0; i < n_threads; i++) {
-        int count = heads_per + (i < extra ? 1 : 0);
-        tasks[i] = (ppd_attn_task){qkv, out, n_tok, dim, head_dim, n_heads,
-                                    h, h + count, scale};
-        h += count;
-        pthread_create(&threads[i], NULL, ppd_attn_worker, &tasks[i]);
-    }
-    for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
-    free(tasks); free(threads);
+    cpu_attention(out, qkv, n_tok, dim, n_heads, head_dim, n_threads);
 }
 
 /* Per-head QK LayerNorm on Q or K within interleaved QKV buffer */
 static void ppd_qk_norm(float *qkv, const float *w, const float *b,
                           int n_tok, int n_heads, int head_dim, int stride,
                           float eps) {
-    for (int t = 0; t < n_tok; t++) {
-        for (int h = 0; h < n_heads; h++) {
-            float *v = qkv + t * stride + h * head_dim;
-            float mean = 0.0f;
-            for (int i = 0; i < head_dim; i++) mean += v[i];
-            mean /= head_dim;
-            float var = 0.0f;
-            for (int i = 0; i < head_dim; i++) { float d = v[i] - mean; var += d * d; }
-            var /= head_dim;
-            float s = 1.0f / sqrtf(var + eps);
-            for (int i = 0; i < head_dim; i++)
-                v[i] = (v[i] - mean) * s * w[i] + b[i];
-        }
-    }
+    cpu_qk_norm(qkv, n_tok, n_heads, head_dim, stride, w, b, eps);
 }
 
 /* 2D RoPE: separate Y and X rotations within each head */
 static void ppd_rope_2d(float *vec, int n_tok, int n_heads, int head_dim,
                           int stride, const int *pos_y, const int *pos_x,
                           float freq_base) {
-    int half = head_dim / 2;
-    int quarter = half / 2;
-    for (int t = 0; t < n_tok; t++) {
-        float py = (float)pos_y[t];
-        float px = (float)pos_x[t];
-        for (int h = 0; h < n_heads; h++) {
-            float *v = vec + t * stride + h * head_dim;
-            /* Y rotation: first half */
-            for (int j = 0; j < quarter; j++) {
-                float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)half);
-                float theta = py * freq;
-                float c = cosf(theta), s = sinf(theta);
-                float v0 = v[j], v1 = v[j + quarter];
-                v[j]           = v0 * c - v1 * s;
-                v[j + quarter] = v0 * s + v1 * c;
-            }
-            /* X rotation: second half */
-            for (int j = 0; j < quarter; j++) {
-                float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)half);
-                float theta = px * freq;
-                float c = cosf(theta), s = sinf(theta);
-                float v0 = v[half + j], v1 = v[half + j + quarter];
-                v[half + j]           = v0 * c - v1 * s;
-                v[half + j + quarter] = v0 * s + v1 * c;
-            }
-        }
-    }
+    cpu_rope_2d(vec, n_tok, n_heads, head_dim, stride, pos_y, pos_x, freq_base);
 }
 
 /* adaLN: y = LN(x) * (1 + scale) + shift */
@@ -1208,9 +1029,6 @@ static void ppd_dit_step(ppd_model *m, float *pred, float *hidden,
         ppd_dit_block_forward(m, &m->dit_blocks[L], hidden, ln_buf, qkv,
                               attn_out, ffn_buf, proj_out, t_embed_silu,
                               pos_y_hi, pos_x_hi, dit_nt_hi, n_threads);
-        if (m->verbose >= 2)
-            fprintf(stderr, "  [cpu-hi%d] hidden[0..3]: %.4f %.4f %.4f %.4f\n",
-                    L, hidden[0], hidden[1], hidden[2], hidden[3]);
     }
     free(pos_y_hi); free(pos_x_hi);
 

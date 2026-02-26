@@ -156,10 +156,12 @@ typedef struct {
     float *depth, *confidence;     /* main DPT output */
     float *rays;                   /* [6, H, W] ray directions */
     float *ray_confidence;         /* [H, W] */
+    float *sky_seg;                /* [H, W] sky segmentation (GPU only) */
     float pose[9];                 /* [t(3), qvec(4), fov(2)] */
     float *gaussians;              /* [38, H, W] */
+    float *metric_depth;           /* [H, W] metric depth (GPU only, nested model) */
     int width, height;
-    int has_pose, has_rays, has_gaussians;
+    int has_pose, has_rays, has_gaussians, has_metric;
 } da3_full_result;
 
 da3_model      *da3_load(gguf_context *gguf);
@@ -184,6 +186,14 @@ void            da3_full_result_free(da3_full_result *r);
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <float.h>
+
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
+
+#define CPU_COMPUTE_IMPLEMENTATION
+#include "cpu_compute.h"
 
 static double da3_time_ms(void) {
     struct timespec ts;
@@ -353,30 +363,6 @@ static void da3_dequant_row(const qtensor *t, int row, float *dst) {
 
 /* ---- Batch GEMM: dst[tok][out] = W[out][in] * src[tok][in] + bias[out] ---- */
 
-/* Thread worker for row-parallel F16 GEMM */
-typedef struct {
-    float *dst;
-    const uint16_t *W;
-    const float *src;
-    int n_out, n_in, n_tok;
-    int r_start, r_end;
-} da3_gemm_task;
-
-static void *da3_gemm_worker(void *arg) {
-    da3_gemm_task *t = (da3_gemm_task *)arg;
-    int count = t->r_end - t->r_start;
-    if (count <= 0) return NULL;
-    /* Row-parallel: each thread computes a subset of output rows.
-     * dst is offset by r_start so that gemm writes to the correct positions
-     * in the token-major layout: dst[tok * n_out + r_start + local_r] */
-    gemm_f16_f32_tokmajor(t->dst + t->r_start,
-                           t->W + (size_t)t->r_start * t->n_in,
-                           t->src,
-                           count, t->n_in, t->n_tok,
-                           t->n_out, t->n_in);
-    return NULL;
-}
-
 static void da3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
                            const float *src, int n_tok, int n_out, int n_in,
                            int n_threads) {
@@ -391,30 +377,15 @@ static void da3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
                 w_numel, n_out, n_in, n_out * n_in);
     }
     if (W->type == GGML_TYPE_F16) {
-        if (n_threads > 1 && n_out >= n_threads * 3) {
-            /* Row-parallel multi-threaded GEMM */
-            da3_gemm_task *tasks = (da3_gemm_task *)calloc((size_t)n_threads, sizeof(da3_gemm_task));
-            pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-            /* Round rows per thread to multiple of 3 for the 3-row tiling kernel */
-            int rows_per = ((n_out / n_threads) / 3) * 3;
-            if (rows_per < 3) rows_per = 3;
-            int r = 0;
-            int actual_threads = 0;
-            for (int i = 0; i < n_threads && r < n_out; i++) {
-                int end = (i == n_threads - 1) ? n_out : r + rows_per;
-                if (end > n_out) end = n_out;
-                tasks[i] = (da3_gemm_task){dst, (const uint16_t *)W->data, src,
-                                            n_out, n_in, n_tok, r, end};
-                pthread_create(&threads[i], NULL, da3_gemm_worker, &tasks[i]);
-                r = end;
-                actual_threads = i + 1;
-            }
-            for (int i = 0; i < actual_threads; i++) pthread_join(threads[i], NULL);
-            free(tasks); free(threads);
-        } else {
-            gemm_f16_f32_tokmajor(dst, (const uint16_t *)W->data, src,
-                                  n_out, n_in, n_tok, n_out, n_in);
+        /* Dequant bias first, then delegate to cpu_gemm_f16 */
+        float *b = NULL;
+        if (bias && bias->data) {
+            b = (float *)malloc((size_t)n_out * sizeof(float));
+            da3_dequant_row(bias, 0, b);
         }
+        cpu_gemm_f16(dst, (const uint16_t *)W->data, b, src,
+                     n_tok, n_out, n_in, n_threads);
+        free(b);
     } else {
         float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
         for (int t = 0; t < n_tok; t++) {
@@ -426,14 +397,14 @@ static void da3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
             }
         }
         free(tmp);
-    }
-    if (bias && bias->data) {
-        float *b = (float *)malloc((size_t)n_out * sizeof(float));
-        da3_dequant_row(bias, 0, b);
-        for (int t = 0; t < n_tok; t++)
-            for (int i = 0; i < n_out; i++)
-                dst[t * n_out + i] += b[i];
-        free(b);
+        if (bias && bias->data) {
+            float *b = (float *)malloc((size_t)n_out * sizeof(float));
+            da3_dequant_row(bias, 0, b);
+            for (int t = 0; t < n_tok; t++)
+                for (int i = 0; i < n_out; i++)
+                    dst[t * n_out + i] += b[i];
+            free(b);
+        }
     }
 }
 
@@ -445,19 +416,7 @@ static void da3_layernorm_batch(float *dst, const float *src, const qtensor *w,
     float *bf = (float *)malloc((size_t)dim * sizeof(float));
     da3_dequant_row(w, 0, wf);
     da3_dequant_row(b, 0, bf);
-    for (int t = 0; t < n_tok; t++) {
-        const float *x = src + t * dim;
-        float *y = dst + t * dim;
-        float mean = 0.0f;
-        for (int i = 0; i < dim; i++) mean += x[i];
-        mean /= dim;
-        float var = 0.0f;
-        for (int i = 0; i < dim; i++) { float d = x[i] - mean; var += d * d; }
-        var /= dim;
-        float inv = 1.0f / sqrtf(var + eps);
-        for (int i = 0; i < dim; i++)
-            y[i] = (x[i] - mean) * inv * wf[i] + bf[i];
-    }
+    cpu_layernorm(dst, src, wf, bf, n_tok, dim, eps);
     free(wf); free(bf);
 }
 
@@ -470,21 +429,7 @@ static void da3_qk_norm_batch(float *vec, int n_tok, int n_heads, int head_dim,
     float *b = (float *)malloc((size_t)head_dim * sizeof(float));
     da3_dequant_row(nw, 0, w);
     da3_dequant_row(nb, 0, b);
-    int dim = n_heads * head_dim;
-    for (int t = 0; t < n_tok; t++) {
-        for (int h = 0; h < n_heads; h++) {
-            float *v = vec + t * dim + h * head_dim;
-            float mean = 0.0f;
-            for (int i = 0; i < head_dim; i++) mean += v[i];
-            mean /= head_dim;
-            float var = 0.0f;
-            for (int i = 0; i < head_dim; i++) { float d = v[i] - mean; var += d * d; }
-            var /= head_dim;
-            float s = 1.0f / sqrtf(var + eps);
-            for (int i = 0; i < head_dim; i++)
-                v[i] = (v[i] - mean) * s * w[i] + b[i];
-        }
-    }
+    cpu_qk_norm(vec, n_tok, n_heads, head_dim, n_heads * head_dim, w, b, eps);
     free(w); free(b);
 }
 
@@ -492,34 +437,7 @@ static void da3_qk_norm_batch(float *vec, int n_tok, int n_heads, int head_dim,
 
 static void da3_rope_2d_batch(float *vec, int n_tok, int n_heads, int head_dim,
                                const int *pos_y, const int *pos_x, float freq_base) {
-    int half = head_dim / 2;
-    int quarter = half / 2;
-    int dim = n_heads * head_dim;
-    for (int t = 0; t < n_tok; t++) {
-        float py = (float)pos_y[t];
-        float px = (float)pos_x[t];
-        for (int h = 0; h < n_heads; h++) {
-            float *v = vec + t * dim + h * head_dim;
-            /* Y rotation: first half */
-            for (int j = 0; j < quarter; j++) {
-                float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)half);
-                float theta = py * freq;
-                float c = cosf(theta), s = sinf(theta);
-                float v0 = v[j], v1 = v[j + quarter];
-                v[j]           = v0 * c - v1 * s;
-                v[j + quarter] = v0 * s + v1 * c;
-            }
-            /* X rotation: second half */
-            for (int j = 0; j < quarter; j++) {
-                float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)half);
-                float theta = px * freq;
-                float c = cosf(theta), s = sinf(theta);
-                float v0 = v[half + j], v1 = v[half + j + quarter];
-                v[half + j]           = v0 * c - v1 * s;
-                v[half + j + quarter] = v0 * s + v1 * c;
-            }
-        }
-    }
+    cpu_rope_2d(vec, n_tok, n_heads, head_dim, n_heads * head_dim, pos_y, pos_x, freq_base);
 }
 
 /* ---- LayerScale: out[i] = x[i] * gamma[i] ---- */
@@ -537,80 +455,13 @@ static void da3_layerscale(float *x, const qtensor *gamma, int n_tok, int dim) {
 
 /* ---- Softmax ---- */
 
-static void da3_softmax(float *x, int n) {
-    float mx = x[0];
-    for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); sum += x[i]; }
-    float inv = 1.0f / sum;
-    for (int i = 0; i < n; i++) x[i] *= inv;
-}
+static void da3_softmax(float *x, int n) { cpu_softmax(x, n); }
 
-/* ---- Multi-head attention (full sequence) ---- */
-
-typedef struct {
-    const float *qkv;
-    float *attn_out;
-    int n_tok, dim, head_dim, n_heads;
-    int h_start, h_end;
-    float scale;
-} da3_attn_task;
-
-static void *da3_attn_worker(void *arg) {
-    da3_attn_task *t = (da3_attn_task *)arg;
-    int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
-    float *att = (float *)malloc((size_t)N * sizeof(float));
-
-    for (int h = t->h_start; h < t->h_end; h++) {
-        for (int qi = 0; qi < N; qi++) {
-            const float *q_h = t->qkv + qi * dim3 + h * hd;
-            /* Compute QK^T scores */
-            for (int ki = 0; ki < N; ki++) {
-                const float *k_h = t->qkv + ki * dim3 + t->dim + h * hd;
-                float dot = 0.0f;
-                for (int d = 0; d < hd; d++) dot += q_h[d] * k_h[d];
-                att[ki] = dot * t->scale;
-            }
-            da3_softmax(att, N);
-            /* Weighted sum of V */
-            float *out_h = t->attn_out + qi * t->dim + h * hd;
-            memset(out_h, 0, (size_t)hd * sizeof(float));
-            for (int vi = 0; vi < N; vi++) {
-                const float *v_h = t->qkv + vi * dim3 + 2 * t->dim + h * hd;
-                float w = att[vi];
-                for (int d = 0; d < hd; d++) out_h[d] += w * v_h[d];
-            }
-        }
-    }
-    free(att);
-    return NULL;
-}
+/* ---- Multi-head attention: flash-attention style with K/V transpose ---- */
 
 static void da3_attention(float *out, const float *qkv, int n_tok, int dim,
                           int n_heads, int head_dim, int n_threads) {
-    float scale = 1.0f / sqrtf((float)head_dim);
-
-    if (n_threads <= 1 || n_heads < n_threads) {
-        da3_attn_task task = {qkv, out, n_tok, dim, head_dim, n_heads,
-                              0, n_heads, scale};
-        da3_attn_worker(&task);
-        return;
-    }
-
-    da3_attn_task *tasks = (da3_attn_task *)calloc((size_t)n_threads, sizeof(da3_attn_task));
-    pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-    int heads_per = n_heads / n_threads;
-    int extra = n_heads % n_threads;
-    int h = 0;
-    for (int i = 0; i < n_threads; i++) {
-        int count = heads_per + (i < extra ? 1 : 0);
-        tasks[i] = (da3_attn_task){qkv, out, n_tok, dim, head_dim, n_heads,
-                                    h, h + count, scale};
-        h += count;
-        pthread_create(&threads[i], NULL, da3_attn_worker, &tasks[i]);
-    }
-    for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
-    free(tasks); free(threads);
+    cpu_attention(out, qkv, n_tok, dim, n_heads, head_dim, n_threads);
 }
 
 /* ---- Conv2d helpers (CHW layout) ---- */
@@ -704,26 +555,7 @@ static float *da3_conv_transpose2d_qt(const float *src, const qtensor *wt, const
 
 static void da3_bilinear(float *dst, const float *src, int C,
                          int Hi, int Wi, int Ho, int Wo) {
-    for (int c = 0; c < C; c++) {
-        for (int oh = 0; oh < Ho; oh++) {
-            float fy = (Ho > 1) ? (float)oh * (Hi - 1) / (Ho - 1) : 0.0f;
-            int y0 = (int)fy;
-            int y1 = (y0 + 1 < Hi) ? y0 + 1 : y0;
-            float dy = fy - y0;
-            for (int ow = 0; ow < Wo; ow++) {
-                float fx = (Wo > 1) ? (float)ow * (Wi - 1) / (Wo - 1) : 0.0f;
-                int x0 = (int)fx;
-                int x1 = (x0 + 1 < Wi) ? x0 + 1 : x0;
-                float dx = fx - x0;
-                const float *s = src + c * Hi * Wi;
-                dst[c * Ho * Wo + oh * Wo + ow] =
-                    s[y0 * Wi + x0] * (1 - dy) * (1 - dx) +
-                    s[y0 * Wi + x1] * (1 - dy) * dx +
-                    s[y1 * Wi + x0] * dy * (1 - dx) +
-                    s[y1 * Wi + x1] * dy * dx;
-            }
-        }
-    }
+    cpu_bilinear_resize(dst, src, C, Hi, Wi, Ho, Wo);
 }
 
 /* ---- ResidualConvUnit ---- */
@@ -3165,7 +2997,8 @@ da3_full_result da3_predict_full(da3_model *m, const uint8_t *rgb, int img_w, in
 void da3_full_result_free(da3_full_result *r) {
     free(r->depth); free(r->confidence);
     free(r->rays); free(r->ray_confidence);
-    free(r->gaussians);
+    free(r->sky_seg); free(r->gaussians);
+    free(r->metric_depth);
     memset(r, 0, sizeof(*r));
 }
 

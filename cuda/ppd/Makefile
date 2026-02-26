@@ -17,6 +17,7 @@ TARGET = test_cuda_ppd
 all: $(TARGET)
 
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) cuda_ppd_runner.h ../cuew.h \
+           ../cuda_kernels_common.h ../cuda_runner_common.h \
            ../../common/pth_loader.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
 

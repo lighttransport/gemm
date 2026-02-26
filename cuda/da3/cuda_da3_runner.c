@@ -17,6 +17,9 @@
 
 #include "cuda_da3_runner.h"
 #include "../cuew.h"
+#include "../cuda_kernels_common.h"
+#define CUDA_RUNNER_COMMON_IMPLEMENTATION
+#include "../cuda_runner_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,233 +27,14 @@
 #include <math.h>
 
 /* ======================================================================== */
-/* CUDA C kernel source (compiled at runtime via NVRTC)                     */
+/* DA3-specific CUDA kernels (compiled at runtime via NVRTC)                */
+/* Shared kernels (layernorm, GEMM, attention, etc.) are in                 */
+/* cuda_kernels_common.h. This string is concatenated after them.           */
 /* ======================================================================== */
 
-static const char *cuda_da3_kernel_source =
-"typedef unsigned short half_raw;\n"
-"__device__ __forceinline__ float half_to_float(half_raw h) {\n"
-"    float f; asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h)); return f;\n"
-"}\n"
+static const char *cuda_da3_specific_kernels =
 "\n"
-"extern \"C\" {\n"
-"\n"
-"/* ---- 1. layernorm_f32 ---- */\n"
-"__global__ void layernorm_f32(float *dst, const float *src, const float *w,\n"
-"                               const float *b, int dim, float eps) {\n"
-"    extern __shared__ float sdata[];\n"
-"    int tok = blockIdx.x;\n"
-"    int tid = threadIdx.x;\n"
-"    int nt = blockDim.x;\n"
-"    const float *x = src + tok * dim;\n"
-"    float *y = dst + tok * dim;\n"
-"    float s = 0.0f;\n"
-"    for (int i = tid; i < dim; i += nt) s += x[i];\n"
-"    sdata[tid] = s;\n"
-"    __syncthreads();\n"
-"    for (int r = nt/2; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid+r]; __syncthreads(); }\n"
-"    float mean = sdata[0] / (float)dim;\n"
-"    s = 0.0f;\n"
-"    for (int i = tid; i < dim; i += nt) { float d = x[i] - mean; s += d*d; }\n"
-"    sdata[tid] = s;\n"
-"    __syncthreads();\n"
-"    for (int r = nt/2; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid+r]; __syncthreads(); }\n"
-"    float inv = rsqrtf(sdata[0] / (float)dim + eps);\n"
-"    for (int i = tid; i < dim; i += nt)\n"
-"        y[i] = (x[i] - mean) * inv * w[i] + b[i];\n"
-"}\n"
-"\n"
-"/* ---- 2. gemm_f16_f32: Y[tok][out] = W[out][in]*X[tok][in] + bias[out] ---- */\n"
-"/* Tensor core MMA m16n8k16, smem-tiled X, 4 warps in N direction. */\n"
-"/* Grid: (ceil(n_out/256), ceil(n_tok/16)). 128 threads = 4 warps. */\n"
-"/* Each warp: 16 tok × 64 out (8 MMA). All warps share X via smem. */\n"
-"#define GEMM_N_TILE 8\n"
-"__global__ void gemm_f16_f32(float *Y, const half_raw *W, const float *X,\n"
-"                              const float *bias,\n"
-"                              int n_out, int n_in, int n_tok) {\n"
-"    extern __shared__ float smem_x[];\n"
-"    int tok_base = blockIdx.y * 16;\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int out_base = blockIdx.x * 256 + warp_id * 64;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int gid = lane / 4;\n"
-"    int tid4 = lane % 4;\n"
-"    int tid = threadIdx.x;\n"
-"\n"
-"    if (tok_base >= n_tok) return;\n"
-"\n"
-"    float d0[GEMM_N_TILE], d1[GEMM_N_TILE], d2[GEMM_N_TILE], d3[GEMM_N_TILE];\n"
-"#pragma unroll\n"
-"    for (int i = 0; i < GEMM_N_TILE; i++) { d0[i]=0; d1[i]=0; d2[i]=0; d3[i]=0; }\n"
-"\n"
-"    for (int k = 0; k < n_in; k += 16) {\n"
-"        /* Cooperative load: 128 threads load X[16,16] into smem */\n"
-"        int srow = tid / 8, scol = (tid % 8) * 2;\n"
-"        int grow = tok_base + srow;\n"
-"        if (grow < n_tok) {\n"
-"            smem_x[srow * 16 + scol] = X[grow * n_in + k + scol];\n"
-"            smem_x[srow * 16 + scol + 1] = X[grow * n_in + k + scol + 1];\n"
-"        } else {\n"
-"            smem_x[srow * 16 + scol] = 0.0f;\n"
-"            smem_x[srow * 16 + scol + 1] = 0.0f;\n"
-"        }\n"
-"        __syncthreads();\n"
-"\n"
-"        /* A fragment from smem (same for all warps) */\n"
-"        unsigned int a0, a1, a2, a3;\n"
-"        { float f0 = smem_x[gid * 16 + tid4 * 2];\n"
-"          float f1 = smem_x[gid * 16 + tid4 * 2 + 1];\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\" : \"=r\"(a0) : \"f\"(f0), \"f\"(f1)); }\n"
-"        { float f0 = smem_x[gid * 16 + tid4 * 2 + 8];\n"
-"          float f1 = smem_x[gid * 16 + tid4 * 2 + 9];\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\" : \"=r\"(a1) : \"f\"(f0), \"f\"(f1)); }\n"
-"        { float f0 = smem_x[(gid + 8) * 16 + tid4 * 2];\n"
-"          float f1 = smem_x[(gid + 8) * 16 + tid4 * 2 + 1];\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\" : \"=r\"(a2) : \"f\"(f0), \"f\"(f1)); }\n"
-"        { float f0 = smem_x[(gid + 8) * 16 + tid4 * 2 + 8];\n"
-"          float f1 = smem_x[(gid + 8) * 16 + tid4 * 2 + 9];\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\" : \"=r\"(a3) : \"f\"(f0), \"f\"(f1)); }\n"
-"\n"
-"        /* 8 N-tiles, B from global W */\n"
-"#pragma unroll\n"
-"        for (int nt = 0; nt < GEMM_N_TILE; nt++) {\n"
-"            int bc = out_base + nt * 8 + gid;\n"
-"            unsigned int b0 = 0, b1 = 0;\n"
-"            if (bc < n_out) {\n"
-"                const half_raw *wp = W + (size_t)bc * n_in + k;\n"
-"                b0 = *(const unsigned int *)(wp + tid4 * 2);\n"
-"                b1 = *(const unsigned int *)(wp + tid4 * 2 + 8);\n"
-"            }\n"
-"            asm volatile(\n"
-"                \"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\\n\\t\"\n"
-"                \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
-"                : \"=f\"(d0[nt]), \"=f\"(d1[nt]), \"=f\"(d2[nt]), \"=f\"(d3[nt])\n"
-"                : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"
-"                  \"r\"(b0), \"r\"(b1),\n"
-"                  \"f\"(d0[nt]), \"f\"(d1[nt]), \"f\"(d2[nt]), \"f\"(d3[nt])\n"
-"            );\n"
-"        }\n"
-"        __syncthreads();\n"
-"    }\n"
-"\n"
-"    int yr0 = tok_base + gid;\n"
-"    int yr1 = tok_base + gid + 8;\n"
-"#pragma unroll\n"
-"    for (int nt = 0; nt < GEMM_N_TILE; nt++) {\n"
-"        int yc0 = out_base + nt * 8 + tid4 * 2;\n"
-"        int yc1 = yc0 + 1;\n"
-"        float bv0 = (bias && yc0 < n_out) ? bias[yc0] : 0.0f;\n"
-"        float bv1 = (bias && yc1 < n_out) ? bias[yc1] : 0.0f;\n"
-"        if (yr0 < n_tok && yc0 < n_out) Y[yr0 * n_out + yc0] = d0[nt] + bv0;\n"
-"        if (yr0 < n_tok && yc1 < n_out) Y[yr0 * n_out + yc1] = d1[nt] + bv1;\n"
-"        if (yr1 < n_tok && yc0 < n_out) Y[yr1 * n_out + yc0] = d2[nt] + bv0;\n"
-"        if (yr1 < n_tok && yc1 < n_out) Y[yr1 * n_out + yc1] = d3[nt] + bv1;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* ---- 2b. gemm_fp8_f32: FP8 E4M3 backbone GEMM (sm_89+) ---- */\n"
-"/* MMA m16n8k32, K-loop steps by 32. Weights are FP8 (1 byte/elem). */\n"
-"/* Same grid/warp structure as gemm_f16_f32: (ceil(n_out/256), ceil(n_tok/16)), 128 threads. */\n"
-"#if __CUDA_ARCH__ >= 890\n"
-"__global__ void gemm_fp8_f32(float *Y, const unsigned char *W, const float *X,\n"
-"                              const float *bias, int n_out, int n_in, int n_tok) {\n"
-"    extern __shared__ float smem_x[];\n"
-"    int tok_base = blockIdx.y * 16;\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int out_base = blockIdx.x * 256 + warp_id * 64;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int gid = lane / 4;\n"
-"    int tid4 = lane % 4;\n"
-"    int tid = threadIdx.x;\n"
-"\n"
-"    if (tok_base >= n_tok) return;\n"
-"\n"
-"    float d0[GEMM_N_TILE], d1[GEMM_N_TILE], d2[GEMM_N_TILE], d3[GEMM_N_TILE];\n"
-"#pragma unroll\n"
-"    for (int i = 0; i < GEMM_N_TILE; i++) { d0[i]=0; d1[i]=0; d2[i]=0; d3[i]=0; }\n"
-"\n"
-"    for (int k = 0; k < n_in; k += 32) {\n"
-"        /* Cooperative load: 128 threads load X[16,32] into smem */\n"
-"        int srow = tid / 8, scol = (tid % 8) * 4;\n"
-"        int grow = tok_base + srow;\n"
-"        if (grow < n_tok) {\n"
-"            smem_x[srow * 32 + scol]     = X[grow * n_in + k + scol];\n"
-"            smem_x[srow * 32 + scol + 1] = X[grow * n_in + k + scol + 1];\n"
-"            smem_x[srow * 32 + scol + 2] = X[grow * n_in + k + scol + 2];\n"
-"            smem_x[srow * 32 + scol + 3] = X[grow * n_in + k + scol + 3];\n"
-"        } else {\n"
-"            smem_x[srow * 32 + scol]     = 0.0f;\n"
-"            smem_x[srow * 32 + scol + 1] = 0.0f;\n"
-"            smem_x[srow * 32 + scol + 2] = 0.0f;\n"
-"            smem_x[srow * 32 + scol + 3] = 0.0f;\n"
-"        }\n"
-"        __syncthreads();\n"
-"\n"
-"        /* A fragments: convert FP32 smem -> FP8 E4M3, pack 4 bytes per uint32 */\n"
-"        /* m16n8k32 A layout: a0 = X[gid, tid4*4..tid4*4+3], etc. */\n"
-"        unsigned int a0, a1, a2, a3;\n"
-"        { unsigned short lo, hi;\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(lo) : \"f\"(smem_x[gid * 32 + tid4 * 4]), \"f\"(smem_x[gid * 32 + tid4 * 4 + 1]));\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(hi) : \"f\"(smem_x[gid * 32 + tid4 * 4 + 2]), \"f\"(smem_x[gid * 32 + tid4 * 4 + 3]));\n"
-"          a0 = (unsigned int)lo | ((unsigned int)hi << 16); }\n"
-"        { unsigned short lo, hi;\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(lo) : \"f\"(smem_x[gid * 32 + tid4 * 4 + 16]), \"f\"(smem_x[gid * 32 + tid4 * 4 + 17]));\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(hi) : \"f\"(smem_x[gid * 32 + tid4 * 4 + 18]), \"f\"(smem_x[gid * 32 + tid4 * 4 + 19]));\n"
-"          a1 = (unsigned int)lo | ((unsigned int)hi << 16); }\n"
-"        { unsigned short lo, hi;\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(lo) : \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4]), \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4 + 1]));\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(hi) : \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4 + 2]), \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4 + 3]));\n"
-"          a2 = (unsigned int)lo | ((unsigned int)hi << 16); }\n"
-"        { unsigned short lo, hi;\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(lo) : \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4 + 16]), \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4 + 17]));\n"
-"          asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(hi) : \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4 + 18]), \"f\"(smem_x[(gid + 8) * 32 + tid4 * 4 + 19]));\n"
-"          a3 = (unsigned int)lo | ((unsigned int)hi << 16); }\n"
-"\n"
-"        /* 8 N-tiles, B from global W (FP8, 4 bytes = 1 uint32) */\n"
-"#pragma unroll\n"
-"        for (int nt = 0; nt < GEMM_N_TILE; nt++) {\n"
-"            int bc = out_base + nt * 8 + gid;\n"
-"            unsigned int b0 = 0, b1 = 0;\n"
-"            if (bc < n_out) {\n"
-"                const unsigned char *wp = W + (size_t)bc * n_in + k;\n"
-"                b0 = *(const unsigned int *)(wp + tid4 * 4);\n"
-"                b1 = *(const unsigned int *)(wp + tid4 * 4 + 16);\n"
-"            }\n"
-"            asm volatile(\n"
-"                \"mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32\\n\\t\"\n"
-"                \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
-"                : \"=f\"(d0[nt]), \"=f\"(d1[nt]), \"=f\"(d2[nt]), \"=f\"(d3[nt])\n"
-"                : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"
-"                  \"r\"(b0), \"r\"(b1),\n"
-"                  \"f\"(d0[nt]), \"f\"(d1[nt]), \"f\"(d2[nt]), \"f\"(d3[nt])\n"
-"            );\n"
-"        }\n"
-"        __syncthreads();\n"
-"    }\n"
-"\n"
-"    int yr0 = tok_base + gid;\n"
-"    int yr1 = tok_base + gid + 8;\n"
-"#pragma unroll\n"
-"    for (int nt = 0; nt < GEMM_N_TILE; nt++) {\n"
-"        int yc0 = out_base + nt * 8 + tid4 * 2;\n"
-"        int yc1 = yc0 + 1;\n"
-"        float bv0 = (bias && yc0 < n_out) ? bias[yc0] : 0.0f;\n"
-"        float bv1 = (bias && yc1 < n_out) ? bias[yc1] : 0.0f;\n"
-"        if (yr0 < n_tok && yc0 < n_out) Y[yr0 * n_out + yc0] = d0[nt] + bv0;\n"
-"        if (yr0 < n_tok && yc1 < n_out) Y[yr0 * n_out + yc1] = d1[nt] + bv1;\n"
-"        if (yr1 < n_tok && yc0 < n_out) Y[yr1 * n_out + yc0] = d2[nt] + bv0;\n"
-"        if (yr1 < n_tok && yc1 < n_out) Y[yr1 * n_out + yc1] = d3[nt] + bv1;\n"
-"    }\n"
-"}\n"
-"#endif\n"
-"\n"
-"/* ---- 3. add_bias_f32 ---- */\n"
-"__global__ void add_bias_f32(float *Y, const float *bias, int n_out, int n_tok) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n_out * n_tok) Y[i] += bias[i % n_out];\n"
-"}\n"
-"\n"
-"/* ---- 4. qk_layernorm_f32: per-head LN on Q/K with stride ---- */\n"
+"/* ---- DA3: qk_layernorm_f32: per-head LN on Q/K with stride ---- */\n"
 "/* stride = distance in floats between same element in consecutive tokens */\n"
 "__global__ void qk_layernorm_f32(float *vec, const float *w, const float *b,\n"
 "                                   int n_tok, int n_heads, int head_dim,\n"
@@ -316,150 +100,6 @@ static const char *cuda_da3_kernel_source =
 "    v[half + j + quarter] = v0x * sx + v1x * cx;\n"
 "}\n"
 "\n"
-"/* ---- 6. attn_prefill_f32: Tensor Core FlashAttention ---- */\n"
-"/* Grid: (n_heads, ceil(n_tok/64)). 128 threads = 4 warps. */\n"
-"/* Each warp: 16 queries via MMA m16n8k16 for QK and SV, online softmax. */\n"
-"/* KV tiles of 16: QK = 8 MMA + softmax + SV = 8 MMA per tile. */\n"
-"__global__ void attn_prefill_f32(float *out, const float *qkv,\n"
-"                                  const float *K_t, const float *V_t,\n"
-"                                  int n_tok, int dim, int n_heads, int head_dim,\n"
-"                                  float scale) {\n"
-"    int h = blockIdx.x;\n"
-"    if (h >= n_heads) return;\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int qb = blockIdx.y * 64 + warp_id * 16;\n"
-"    if (qb >= n_tok) return;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int gid = lane / 4, tid4 = lane % 4;\n"
-"    int dim3 = 3 * dim;\n"
-"    const float *kt_h = K_t + h * n_tok * head_dim;\n"
-"    const float *vt_h = V_t + h * n_tok * head_dim;\n"
-"    int qi0 = qb + gid, qi1 = qb + gid + 8;\n"
-"\n"
-"    /* Preload Q fragments for all k-steps into registers (head_dim/16 = 4 steps) */\n"
-"    unsigned int qa0[4], qa1[4], qa2[4], qa3[4];\n"
-"#pragma unroll\n"
-"    for (int kk = 0; kk < 64; kk += 16) {\n"
-"        int ks = kk / 16;\n"
-"        int dc = kk + tid4*2;\n"
-"        { float f0=(qi0<n_tok)?qkv[qi0*dim3+h*head_dim+dc]:0, f1=(qi0<n_tok)?qkv[qi0*dim3+h*head_dim+dc+1]:0;\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa0[ks]):\"f\"(f0),\"f\"(f1)); }\n"
-"        { float f0=(qi0<n_tok)?qkv[qi0*dim3+h*head_dim+dc+8]:0, f1=(qi0<n_tok)?qkv[qi0*dim3+h*head_dim+dc+9]:0;\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa1[ks]):\"f\"(f0),\"f\"(f1)); }\n"
-"        { float f0=(qi1<n_tok)?qkv[qi1*dim3+h*head_dim+dc]:0, f1=(qi1<n_tok)?qkv[qi1*dim3+h*head_dim+dc+1]:0;\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa2[ks]):\"f\"(f0),\"f\"(f1)); }\n"
-"        { float f0=(qi1<n_tok)?qkv[qi1*dim3+h*head_dim+dc+8]:0, f1=(qi1<n_tok)?qkv[qi1*dim3+h*head_dim+dc+9]:0;\n"
-"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa3[ks]):\"f\"(f0),\"f\"(f1)); }\n"
-"    }\n"
-"\n"
-"    /* Online softmax: m,l per row (thread owns rows gid and gid+8) */\n"
-"    float m0 = -1e30f, l0 = 0.0f, m1 = -1e30f, l1 = 0.0f;\n"
-"    /* Output accum O[16,64] as 8 chunks of MMA D[16,8] */\n"
-"    float oc0[8]={0}, oc1[8]={0}, oc2[8]={0}, oc3[8]={0};\n"
-"\n"
-"    for (int kv = 0; kv < n_tok; kv += 16) {\n"
-"        /* ---- QK: S[16,16] = Q[16,hd] x K^T[hd,16] via 2 n-halves ---- */\n"
-"        float s0[2]={0,0}, s1[2]={0,0}, s2[2]={0,0}, s3[2]={0,0};\n"
-"#pragma unroll\n"
-"        for (int kk = 0; kk < 64; kk += 16) {\n"
-"            /* A = Q fragment (preloaded in registers) */\n"
-"            int ks = kk / 16;\n"
-"            unsigned int a0=qa0[ks], a1=qa1[ks], a2=qa2[ks], a3=qa3[ks];\n"
-"            /* Two n-halves: keys [0..7] and [8..15] */\n"
-"            for (int nh = 0; nh < 2; nh++) {\n"
-"                int ki = kv + nh*8 + gid;\n"
-"                unsigned int b0=0, b1=0;\n"
-"                if (ki < n_tok) {\n"
-"                    const float *kp = kt_h + ki*head_dim + kk;\n"
-"                    float kf0=kp[tid4*2], kf1=kp[tid4*2+1];\n"
-"                    asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(b0):\"f\"(kf0),\"f\"(kf1));\n"
-"                    float kf2=kp[tid4*2+8], kf3=kp[tid4*2+9];\n"
-"                    asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(b1):\"f\"(kf2),\"f\"(kf3));\n"
-"                }\n"
-"                asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\\n\\t\"\n"
-"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
-"                    :\"=f\"(s0[nh]),\"=f\"(s1[nh]),\"=f\"(s2[nh]),\"=f\"(s3[nh])\n"
-"                    :\"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1),\n"
-"                     \"f\"(s0[nh]),\"f\"(s1[nh]),\"f\"(s2[nh]),\"f\"(s3[nh]));\n"
-"            }\n"
-"        }\n"
-"        /* Scale + mask OOB */\n"
-"        s0[0]*=scale; s1[0]*=scale; s2[0]*=scale; s3[0]*=scale;\n"
-"        s0[1]*=scale; s1[1]*=scale; s2[1]*=scale; s3[1]*=scale;\n"
-"        { int c0=kv+tid4*2, c1=c0+1;\n"
-"          if(c0>=n_tok){s0[0]=-1e30f;s2[0]=-1e30f;} if(c1>=n_tok){s1[0]=-1e30f;s3[0]=-1e30f;}\n"
-"          if(c0+8>=n_tok){s0[1]=-1e30f;s2[1]=-1e30f;} if(c1+8>=n_tok){s1[1]=-1e30f;s3[1]=-1e30f;} }\n"
-"        if(qi0>=n_tok){s0[0]=-1e30f;s1[0]=-1e30f;s0[1]=-1e30f;s1[1]=-1e30f;}\n"
-"        if(qi1>=n_tok){s2[0]=-1e30f;s3[0]=-1e30f;s2[1]=-1e30f;s3[1]=-1e30f;}\n"
-"\n"
-"        /* ---- Online softmax per row ---- */\n"
-"        /* Row gid max */\n"
-"        float mx0 = fmaxf(fmaxf(s0[0],s1[0]),fmaxf(s0[1],s1[1]));\n"
-"        mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFF, mx0, 1));\n"
-"        mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFF, mx0, 2));\n"
-"        float mn0 = fmaxf(m0, mx0);\n"
-"        float al0 = expf(m0 - mn0);\n"
-"        l0 *= al0; m0 = mn0;\n"
-"        for (int c=0;c<8;c++) { oc0[c]*=al0; oc1[c]*=al0; }\n"
-"        s0[0]=expf(s0[0]-mn0); s1[0]=expf(s1[0]-mn0);\n"
-"        s0[1]=expf(s0[1]-mn0); s1[1]=expf(s1[1]-mn0);\n"
-"        float rs0=s0[0]+s1[0]+s0[1]+s1[1];\n"
-"        rs0+=__shfl_xor_sync(0xFFFFFFFF,rs0,1); rs0+=__shfl_xor_sync(0xFFFFFFFF,rs0,2);\n"
-"        l0 += rs0;\n"
-"        /* Row gid+8 max */\n"
-"        float mx1 = fmaxf(fmaxf(s2[0],s3[0]),fmaxf(s2[1],s3[1]));\n"
-"        mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFF, mx1, 1));\n"
-"        mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFF, mx1, 2));\n"
-"        float mn1 = fmaxf(m1, mx1);\n"
-"        float al1 = expf(m1 - mn1);\n"
-"        l1 *= al1; m1 = mn1;\n"
-"        for (int c=0;c<8;c++) { oc2[c]*=al1; oc3[c]*=al1; }\n"
-"        s2[0]=expf(s2[0]-mn1); s3[0]=expf(s3[0]-mn1);\n"
-"        s2[1]=expf(s2[1]-mn1); s3[1]=expf(s3[1]-mn1);\n"
-"        float rs1=s2[0]+s3[0]+s2[1]+s3[1];\n"
-"        rs1+=__shfl_xor_sync(0xFFFFFFFF,rs1,1); rs1+=__shfl_xor_sync(0xFFFFFFFF,rs1,2);\n"
-"        l1 += rs1;\n"
-"\n"
-"        /* ---- SV: O[16,64] += P[16,16] x V[16,64] via 8 chunks ---- */\n"
-"        unsigned int pa0,pa1,pa2,pa3;\n"
-"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa0):\"f\"(s0[0]),\"f\"(s1[0]));\n"
-"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa1):\"f\"(s0[1]),\"f\"(s1[1]));\n"
-"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa2):\"f\"(s2[0]),\"f\"(s3[0]));\n"
-"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa3):\"f\"(s2[1]),\"f\"(s3[1]));\n"
-"        for (int c = 0; c < 8; c++) {\n"
-"            int vki0 = kv+tid4*2, vki1 = vki0+1, vki8 = vki0+8, vki9 = vki8+1;\n"
-"            unsigned int vb0=0, vb1=0;\n"
-"            if (vki1 < n_tok) {\n"
-"                float vf0=vt_h[vki0*head_dim+c*8+gid], vf1=vt_h[vki1*head_dim+c*8+gid];\n"
-"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb0):\"f\"(vf0),\"f\"(vf1));\n"
-"            } else if (vki0 < n_tok) {\n"
-"                float vf0=vt_h[vki0*head_dim+c*8+gid];\n"
-"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb0):\"f\"(vf0),\"f\"(0.0f));\n"
-"            }\n"
-"            if (vki9 < n_tok) {\n"
-"                float vf0=vt_h[vki8*head_dim+c*8+gid], vf1=vt_h[vki9*head_dim+c*8+gid];\n"
-"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb1):\"f\"(vf0),\"f\"(vf1));\n"
-"            } else if (vki8 < n_tok) {\n"
-"                float vf0=vt_h[vki8*head_dim+c*8+gid];\n"
-"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb1):\"f\"(vf0),\"f\"(0.0f));\n"
-"            }\n"
-"            asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\\n\\t\"\n"
-"                \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
-"                :\"=f\"(oc0[c]),\"=f\"(oc1[c]),\"=f\"(oc2[c]),\"=f\"(oc3[c])\n"
-"                :\"r\"(pa0),\"r\"(pa1),\"r\"(pa2),\"r\"(pa3),\"r\"(vb0),\"r\"(vb1),\n"
-"                 \"f\"(oc0[c]),\"f\"(oc1[c]),\"f\"(oc2[c]),\"f\"(oc3[c]));\n"
-"        }\n"
-"    }\n"
-"    /* Final normalize + write */\n"
-"    float il0 = (l0>0) ? 1.0f/l0 : 0.0f;\n"
-"    float il1 = (l1>0) ? 1.0f/l1 : 0.0f;\n"
-"    for (int c = 0; c < 8; c++) {\n"
-"        int d0 = c*8+tid4*2, d1 = d0+1;\n"
-"        if (qi0<n_tok) { out[qi0*dim+h*head_dim+d0]=oc0[c]*il0; out[qi0*dim+h*head_dim+d1]=oc1[c]*il0; }\n"
-"        if (qi1<n_tok) { out[qi1*dim+h*head_dim+d0]=oc2[c]*il1; out[qi1*dim+h*head_dim+d1]=oc3[c]*il1; }\n"
-"    }\n"
-"}\n"
-"\n"
 "/* ---- 7. swiglu_f32: dst = silu(gate) * up ---- */\n"
 "__global__ void swiglu_f32(float *dst, const float *gate_up, int hidden, int n_tok) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -472,32 +112,11 @@ static const char *cuda_da3_kernel_source =
 "    dst[t * hidden + j] = g * gu[j + hidden];\n"
 "}\n"
 "\n"
-"/* ---- 8. gelu_f32 ---- */\n"
-"__global__ void gelu_f32(float *x, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) {\n"
-"        float v = x[i];\n"
-"        x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v*v*v)));\n"
-"    }\n"
-"}\n"
-"\n"
 "/* ---- 9. layerscale_add_f32: hidden[i] += proj[i] * gamma[i%dim] ---- */\n"
 "__global__ void layerscale_add_f32(float *hidden, const float *proj, const float *gamma,\n"
 "                                    int dim, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) hidden[i] += proj[i] * gamma[i % dim];\n"
-"}\n"
-"\n"
-"/* ---- 10. add_f32 ---- */\n"
-"__global__ void add_f32(float *dst, const float *src, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) dst[i] += src[i];\n"
-"}\n"
-"\n"
-"/* ---- 11. relu_f32 ---- */\n"
-"__global__ void relu_f32(float *x, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) x[i] = x[i] > 0 ? x[i] : 0;\n"
 "}\n"
 "\n"
 "/* ---- 12. depth_activation ---- */\n"
@@ -507,26 +126,6 @@ static const char *cuda_da3_kernel_source =
 "        out[i]      = expf(out[i]);\n"
 "        out[i + hw] = expf(out[i + hw]) + 1.0f;\n"  /* expp1: exp(x) + 1, per DA3 source */
 "    }\n"
-"}\n"
-"\n"
-"/* ---- 13. bilinear_upsample_f32 ---- */\n"
-"__global__ void bilinear_upsample_f32(float *dst, const float *src,\n"
-"                                       int C, int Hi, int Wi, int Ho, int Wo) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int total = C * Ho * Wo;\n"
-"    if (idx >= total) return;\n"
-"    int c = idx / (Ho * Wo);\n"
-"    int rem = idx % (Ho * Wo);\n"
-"    int oh = rem / Wo, ow = rem % Wo;\n"
-"    float fy = (Ho > 1) ? (float)oh * (Hi-1) / (Ho-1) : 0.0f;\n"
-"    float fx = (Wo > 1) ? (float)ow * (Wi-1) / (Wo-1) : 0.0f;\n"
-"    int y0 = (int)fy, x0 = (int)fx;\n"
-"    int y1 = (y0+1 < Hi) ? y0+1 : y0;\n"
-"    int x1 = (x0+1 < Wi) ? x0+1 : x0;\n"
-"    float dy = fy - y0, dx = fx - x0;\n"
-"    const float *s = src + c * Hi * Wi;\n"
-"    dst[idx] = s[y0*Wi+x0]*(1-dy)*(1-dx) + s[y0*Wi+x1]*(1-dy)*dx\n"
-"             + s[y1*Wi+x0]*dy*(1-dx) + s[y1*Wi+x1]*dy*dx;\n"
 "}\n"
 "\n"
 "/* ---- 14. conv2d_f32 ---- */\n"
@@ -575,82 +174,6 @@ static const char *cuda_da3_kernel_source =
 "    int rem = idx % (gH * gW);\n"
 "    int p = (rem / gW) * gW + (rem % gW);\n"
 "    dst[idx] = src[p * C + c];\n"
-"}\n"
-"\n"
-"/* ---- 18. kv_transpose: deinterleave K,V from QKV to contiguous per-head layout ---- */\n"
-"/* From: qkv[tok * dim3 + (dim|2*dim) + h*hd + d] (stride dim3 between tokens) */\n"
-"/* To: K_t/V_t[h * n_tok * hd + tok * hd + d] (stride hd between tokens) */\n"
-"__global__ void kv_transpose(float *K_t, float *V_t, const float *qkv,\n"
-"                              int n_tok, int dim, int n_heads, int head_dim) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int total = n_tok * dim;\n"
-"    if (idx >= total) return;\n"
-"    int tok = idx / dim;\n"
-"    int hd_idx = idx % dim;\n"
-"    int h = hd_idx / head_dim;\n"
-"    int d = hd_idx % head_dim;\n"
-"    int dim3 = 3 * dim;\n"
-"    int dst_idx = h * n_tok * head_dim + tok * head_dim + d;\n"
-"    K_t[dst_idx] = qkv[tok * dim3 + dim + hd_idx];\n"
-"    V_t[dst_idx] = qkv[tok * dim3 + 2*dim + hd_idx];\n"
-"}\n"
-"\n"
-"/* ---- 19. resize_normalize ---- */\n"
-"__global__ void resize_normalize(float *dst, const unsigned char *src,\n"
-"                                  int src_w, int src_h, int dst_w, int dst_h,\n"
-"                                  float mean0, float mean1, float mean2,\n"
-"                                  float istd0, float istd1, float istd2) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int total = dst_h * dst_w;\n"
-"    if (idx >= total) return;\n"
-"    int oh = idx / dst_w, ow = idx % dst_w;\n"
-"    float fy = (dst_h > 1) ? (float)oh * (src_h-1) / (dst_h-1) : 0.0f;\n"
-"    float fx = (dst_w > 1) ? (float)ow * (src_w-1) / (dst_w-1) : 0.0f;\n"
-"    int y0 = (int)fy, x0 = (int)fx;\n"
-"    int y1 = (y0+1 < src_h) ? y0+1 : y0;\n"
-"    int x1 = (x0+1 < src_w) ? x0+1 : x0;\n"
-"    float dy = fy - y0, dx = fx - x0;\n"
-"    float mean[3] = {mean0, mean1, mean2};\n"
-"    float istd[3] = {istd0, istd1, istd2};\n"
-"    for (int c = 0; c < 3; c++) {\n"
-"        float v = (float)src[(y0*src_w+x0)*3+c] * (1-dy)*(1-dx)\n"
-"                + (float)src[(y0*src_w+x1)*3+c] * (1-dy)*dx\n"
-"                + (float)src[(y1*src_w+x0)*3+c] * dy*(1-dx)\n"
-"                + (float)src[(y1*src_w+x1)*3+c] * dy*dx;\n"
-"        dst[c * total + idx] = (v / 255.0f - mean[c]) * istd[c];\n"
-"    }\n"
-"}\n"
-"\n"
-"/* ---- 20. patch_embed_conv2d ---- */\n"
-"__global__ void patch_embed_conv2d(float *out, const float *img, const float *w,\n"
-"                                    const float *bias, int gw, int dim, int ps,\n"
-"                                    int img_w) {\n"
-"    /* Grid: n_patches blocks. Each block: 256 threads handle output dims. */\n"
-"    int patch = blockIdx.x;\n"
-"    int tid = threadIdx.x;\n"
-"    int py = patch / gw, px = patch % gw;\n"
-"    int tok = 1 + patch;      /* skip CLS at token 0 */\n"
-"    for (int co = tid; co < dim; co += blockDim.x) {\n"
-"        float sum = bias ? bias[co] : 0.0f;\n"
-"        for (int ci = 0; ci < 3; ci++)\n"
-"            for (int kh = 0; kh < ps; kh++)\n"
-"                for (int kw = 0; kw < ps; kw++)\n"
-"                    sum += w[((co*3+ci)*ps+kh)*ps+kw]\n"
-"                         * img[ci * img_w * img_w + (py*ps+kh) * img_w + (px*ps+kw)];\n"
-"        out[tok * dim + co] = sum;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* ---- 21. cls_pos_embed ---- */\n"
-"__global__ void cls_pos_embed(float *hidden, const float *cls, const float *pos,\n"
-"                               int n_tok, int dim) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (idx >= n_tok * dim) return;\n"
-"    int t = idx / dim;\n"
-"    if (t == 0)\n"
-"        hidden[idx] = cls[idx] + pos[idx];\n"
-"    else\n"
-"        hidden[idx] += pos[idx];\n"
 "}\n"
 "\n"
 "/* ---- 22. deconv_scatter_f32: scatter GEMM output to spatial CHW for ConvTranspose2d ---- */\n"
@@ -827,39 +350,12 @@ static const char *cuda_da3_kernel_source =
 "        dst[c * HW + hw] = (src[c * HW + hw] - mean) * inv * (w ? w[c] : 1.0f) + (b ? b[c] : 0.0f);\n"
 "}\n"
 "\n"
-"/* ---- 25. silu_f32: SiLU activation (x * sigmoid(x)) ---- */\n"
-"__global__ void silu_f32(float *x, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) {\n"
-"        float v = x[i];\n"
-"        x[i] = v / (1.0f + expf(-v));\n"
-"    }\n"
-"}\n"
-"\n"
 "} /* extern C */\n"
 ;
 
-/* ======================================================================== */
-/* Error checking                                                           */
-/* ======================================================================== */
-
-#define CHECK_CU(call) do { \
-    CUresult err = (call); \
-    if (err != CUDA_SUCCESS) { \
-        const char *es = "?"; cuGetErrorString(err, &es); \
-        fprintf(stderr, "CUDA error %s:%d: %s (%d)\n", __FILE__, __LINE__, es, (int)err); \
-        return -1; \
-    } \
-} while(0)
-
-#define CHECK_CU_NULL(call) do { \
-    CUresult err = (call); \
-    if (err != CUDA_SUCCESS) { \
-        const char *es = "?"; cuGetErrorString(err, &es); \
-        fprintf(stderr, "CUDA error %s:%d: %s (%d)\n", __FILE__, __LINE__, es, (int)err); \
-        return NULL; \
-    } \
-} while(0)
+/* Error macros from shared header: CU_CHECK, CU_CHECK_NULL */
+#define CHECK_CU CU_CHECK
+#define CHECK_CU_NULL CU_CHECK_NULL
 
 /* ======================================================================== */
 /* Runner state                                                             */
@@ -1067,76 +563,52 @@ struct cuda_da3_runner {
 /* ======================================================================== */
 
 static int da3_compile_kernels(cuda_da3_runner *r) {
-    int major, minor;
-    cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, r->device);
-    cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, r->device);
-    int sm = major * 10 + minor;
+    /* Concatenate shared + DA3-specific kernel source */
+    size_t len1 = strlen(cuda_kernels_common_src);
+    size_t len2 = strlen(cuda_da3_specific_kernels);
+    char *full_src = (char *)malloc(len1 + len2 + 1);
+    memcpy(full_src, cuda_kernels_common_src, len1);
+    memcpy(full_src + len1, cuda_da3_specific_kernels, len2 + 1);
 
-    if (r->verbose >= 1)
-        fprintf(stderr, "cuda_da3: compiling kernels for sm_%d ...\n", sm);
+    int sm = cu_compile_kernels(&r->module, r->device, full_src,
+                                 "da3_kernels.cu", r->verbose, "cuda_da3");
+    free(full_src);
+    if (sm < 0) return -1;
 
-    nvrtcProgram prog;
-    if (nvrtcCreateProgram(&prog, cuda_da3_kernel_source, "da3_kernels.cu", 0, NULL, NULL) != NVRTC_SUCCESS)
-        return -1;
-
-    char arch[32];
-    snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d", sm);
-    const char *opts[] = { arch, "--use_fast_math" };
-    nvrtcResult nres = nvrtcCompileProgram(prog, 2, opts);
-
-    if (nres != NVRTC_SUCCESS) {
-        size_t log_sz;
-        nvrtcGetProgramLogSize(prog, &log_sz);
-        if (log_sz > 1) {
-            char *log = (char *)malloc(log_sz);
-            nvrtcGetProgramLog(prog, log);
-            fprintf(stderr, "cuda_da3: NVRTC log:\n%s\n", log);
-            free(log);
-        }
-        nvrtcDestroyProgram(&prog);
-        return -1;
-    }
-
-    size_t ptx_sz;
-    nvrtcGetPTXSize(prog, &ptx_sz);
-    char *ptx = (char *)malloc(ptx_sz);
-    nvrtcGetPTX(prog, ptx);
-    nvrtcDestroyProgram(&prog);
-
-    CUresult err = cuModuleLoadDataEx(&r->module, ptx, 0, NULL, NULL);
-    free(ptx);
-    if (err != CUDA_SUCCESS) return -1;
-
+    CUresult err;
 #define GET_FN(name) do { \
     err = cuModuleGetFunction(&r->fn_##name, r->module, #name); \
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_da3: kernel '%s' not found\n", #name); return -1; } \
 } while(0)
 
+    /* Shared kernels (from cuda_kernels_common.h) */
     GET_FN(layernorm_f32);
     GET_FN(gemm_f16_f32);
     GET_FN(add_bias_f32);
-    GET_FN(qk_layernorm_f32);
-    GET_FN(rope_2d_f32);
     GET_FN(attn_prefill_f32);
-    GET_FN(swiglu_f32);
     GET_FN(gelu_f32);
-    GET_FN(layerscale_add_f32);
     GET_FN(add_f32);
     GET_FN(relu_f32);
-    GET_FN(depth_activation);
     GET_FN(bilinear_upsample_f32);
-    GET_FN(conv2d_f32);
-    GET_FN(dpt_cls_concat);
-    GET_FN(dpt_tok_to_chw);
     GET_FN(kv_transpose);
     GET_FN(resize_normalize);
     GET_FN(patch_embed_conv2d);
     GET_FN(cls_pos_embed);
-    GET_FN(conv_gemm_f16_f32);
+    GET_FN(silu_f32);
+
+    /* DA3-specific kernels */
+    GET_FN(qk_layernorm_f32);
+    GET_FN(rope_2d_f32);
+    GET_FN(swiglu_f32);
+    GET_FN(layerscale_add_f32);
+    GET_FN(depth_activation);
+    GET_FN(conv2d_f32);
+    GET_FN(dpt_cls_concat);
+    GET_FN(dpt_tok_to_chw);
     GET_FN(deconv_scatter_f32);
+    GET_FN(conv_gemm_f16_f32);
     GET_FN(groupnorm_f32);
     GET_FN(channel_layernorm_f32);
-    GET_FN(silu_f32);
 
     /* FP8 E4M3 GEMM: only available on sm_89+ (Ada/Blackwell) */
     r->use_fp8 = (sm >= 89);
@@ -1148,7 +620,7 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
 
     if (r->verbose >= 1)
         fprintf(stderr, "cuda_da3: %d kernels compiled (fp8=%d)\n",
-                r->use_fp8 ? 25 : 24, r->use_fp8);
+                r->use_fp8 ? 26 : 25, r->use_fp8);
     return 0;
 }
 
@@ -1156,13 +628,7 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
 /* Upload tensor to GPU                                                     */
 /* ======================================================================== */
 
-static CUdeviceptr upload_tensor_raw(const void *data, size_t bytes) {
-    if (!data || bytes == 0) return 0;
-    CUdeviceptr d;
-    if (cuMemAlloc(&d, bytes) != CUDA_SUCCESS) return 0;
-    cuMemcpyHtoD(d, data, bytes);
-    return d;
-}
+#define upload_tensor_raw cu_upload_raw
 
 static CUdeviceptr upload_tensor_f32(const qtensor *t) {
     if (!t->data) return 0;
@@ -1191,23 +657,8 @@ static CUdeviceptr upload_tensor_f16(const qtensor *t) {
     return upload_tensor_raw(t->data, (size_t)n * 2);
 }
 
-/* FP32 -> FP16 conversion (truncation, no rounding) */
-static uint16_t fp32_to_fp16_raw(float f) {
-    union { float f; uint32_t i; } u;
-    u.f = f;
-    uint32_t x = u.i;
-    uint16_t sign = (uint16_t)((x >> 16) & 0x8000);
-    int32_t exp = ((x >> 23) & 0xFF) - 127;
-    uint32_t mant = x & 0x7FFFFF;
-    if (exp > 15) return sign | 0x7C00;
-    if (exp < -14) {
-        if (exp < -24) return sign;
-        mant |= 0x800000;
-        mant >>= (-1 - exp);
-        return sign | (uint16_t)(mant >> 13);
-    }
-    return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
-}
+/* FP32 -> FP16 conversion (from shared header) */
+#define fp32_to_fp16_raw cu_f32_to_f16
 
 /* Upload conv weight to GPU as FP16, padding K to next multiple of 16.
  * Weight layout: [Co, Ci*kH*kW] row-major. If K%16!=0, pads each row with zeros.
@@ -1233,18 +684,8 @@ static CUdeviceptr upload_tensor_f32_as_f16(const qtensor *t) {
     return d;
 }
 
-/* FP32 -> FP8 E4M3 conversion (bias=7, 4-bit exp, 3-bit mantissa, range [-448,448]) */
-static uint8_t f32_to_fp8_e4m3(float f) {
-    if (f != f) return 0x7F; /* NaN */
-    if (f == 0.0f) return 0x00;
-    uint32_t bits; memcpy(&bits, &f, sizeof(bits));
-    uint32_t sign = (bits >> 31) & 1;
-    int32_t exp = ((bits >> 23) & 0xFF) - 127 + 7; /* rebias to E4M3 */
-    uint32_t mant = (bits >> 20) & 0x7; /* top 3 mantissa bits */
-    if (exp >= 15) { exp = 15; mant = 0x6; } /* clamp to max finite */
-    if (exp <= 0) return (uint8_t)(sign << 7); /* flush subnormals to zero */
-    return (uint8_t)((sign << 7) | ((exp & 0xF) << 3) | (mant & 0x7));
-}
+/* FP32 -> FP8 E4M3 conversion (from shared header) */
+#define f32_to_fp8_e4m3 cu_f32_to_fp8_e4m3
 
 /* Upload tensor to GPU as FP8 E4M3 (1 byte/element) */
 static CUdeviceptr upload_tensor_fp8_e4m3(const qtensor *t) {
@@ -3698,6 +3139,22 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     if (r->verbose >= 2) {
         CUresult err = cuCtxSynchronize();
         fprintf(stderr, "  CUDA after backbone: %d\n", (int)err);
+        /* Dump hidden stats after backbone */
+        int _nt = r->n_tokens, _dim = r->dim;
+        float *_hbuf = (float *)malloc((size_t)_nt * _dim * sizeof(float));
+        cuMemcpyDtoH(_hbuf, r->d_hidden, (size_t)_nt * _dim * sizeof(float));
+        float _hmin = _hbuf[0], _hmax = _hbuf[0], _hsum = 0;
+        for (int _i = 0; _i < _nt * _dim; _i++) {
+            if (_hbuf[_i] < _hmin) _hmin = _hbuf[_i];
+            if (_hbuf[_i] > _hmax) _hmax = _hbuf[_i];
+            _hsum += _hbuf[_i];
+        }
+        fprintf(stderr, "  GPU hidden after backbone: min=%.4f max=%.4f mean=%.6f\n",
+                _hmin, _hmax, _hsum / (_nt * _dim));
+        fprintf(stderr, "  GPU hidden[tok1][0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                _hbuf[_dim], _hbuf[_dim+1], _hbuf[_dim+2], _hbuf[_dim+3],
+                _hbuf[_dim+4], _hbuf[_dim+5], _hbuf[_dim+6], _hbuf[_dim+7]);
+        free(_hbuf);
     }
 
     /* ─── CameraDec (Phase 1): pose estimation ─── */
