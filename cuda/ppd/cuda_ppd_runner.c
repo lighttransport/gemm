@@ -76,6 +76,69 @@ static const char *cuda_ppd_kernel_source =
 "        base[i] = (base[i] - mean) * inv * w[i] + b[i];\n"
 "}\n"
 "\n"
+"/* ---- gemm_tiled_f16_f32: shared-memory tiled GEMM (no MMA), 16x16 tiles ---- */\n"
+"/* Grid: (ceil(n_out/64), ceil(n_tok/16)), blockDim=(16,16)=256 threads           */\n"
+"/* Each block computes Y[tok_base..+15][out_base..+63]: 16 tok × 64 out           */\n"
+"/* Each thread computes one (tok, out) pair accumulating over K-tiles             */\n"
+"/* smA[16][16]: X tile (row-major load, coalesced); smB[16][16]: W tile           */\n"
+"__global__ void gemm_tiled_f16_f32(float *Y, const half_raw *W, const float *X,\n"
+"                                    const float *bias,\n"
+"                                    int n_out, int n_in, int n_tok) {\n"
+"    __shared__ float smA[16][16];   /* X[16 tok][16 k] */\n"
+"    __shared__ float smB[16][16];   /* W[16 out][16 k]^T stored as smB[k][out] */\n"
+"    int tx = threadIdx.x, ty = threadIdx.y;\n"
+"    /* Each block covers 16 tokens × 64 outputs (4 consecutive N-tiles of 16) */\n"
+"    int tok_base = blockIdx.y * 16;\n"
+"    int out_base = blockIdx.x * 64;\n"
+"    int row = tok_base + ty;          /* token index for this thread */\n"
+"    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f; /* 4 output neurons */\n"
+"    for (int k = 0; k < n_in; k += 16) {\n"
+"        /* Load smA: smA[ty][tx] = X[tok_base+ty][k+tx] — row-major, coalesced */\n"
+"        smA[ty][tx] = (tok_base+ty < n_tok && k+tx < n_in)\n"
+"                      ? X[(tok_base+ty)*n_in + k+tx] : 0.f;\n"
+"        /* Load smB for 4 output tiles (64 outputs) */\n"
+"        /* For tile ot=0..3: smB[ty][tx] = W[out_base+ot*16+tx][k+ty] */\n"
+"        /* Done in 4 sequential passes (reuse smB for each out-tile) */\n"
+"        /* Accumulate inline to avoid extra sync */\n"
+"        __syncthreads();\n"
+"        /* Tile 0: out_base+0..15 */\n"
+"        { int w_out = out_base + tx;   /* each tx loads different output neuron */\n"
+"          smB[ty][tx] = (w_out < n_out && k+ty < n_in)\n"
+"                        ? half_to_float(W[(size_t)w_out*n_in + k+ty]) : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc0 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        /* Tile 1: out_base+16..31 */\n"
+"        { int w_out = out_base+16+tx;\n"
+"          smB[ty][tx] = (w_out < n_out && k+ty < n_in)\n"
+"                        ? half_to_float(W[(size_t)w_out*n_in + k+ty]) : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc1 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        /* Tile 2: out_base+32..47 */\n"
+"        { int w_out = out_base+32+tx;\n"
+"          smB[ty][tx] = (w_out < n_out && k+ty < n_in)\n"
+"                        ? half_to_float(W[(size_t)w_out*n_in + k+ty]) : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc2 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        /* Tile 3: out_base+48..63 */\n"
+"        { int w_out = out_base+48+tx;\n"
+"          smB[ty][tx] = (w_out < n_out && k+ty < n_in)\n"
+"                        ? half_to_float(W[(size_t)w_out*n_in + k+ty]) : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc3 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    /* Write 4 outputs per thread */\n"
+"    if (row < n_tok) {\n"
+"        if (out_base+   tx < n_out) Y[row*n_out+out_base+   tx] = acc0 + (bias?bias[out_base+   tx]:0.f);\n"
+"        if (out_base+16+tx < n_out) Y[row*n_out+out_base+16+tx] = acc1 + (bias?bias[out_base+16+tx]:0.f);\n"
+"        if (out_base+32+tx < n_out) Y[row*n_out+out_base+32+tx] = acc2 + (bias?bias[out_base+32+tx]:0.f);\n"
+"        if (out_base+48+tx < n_out) Y[row*n_out+out_base+48+tx] = acc3 + (bias?bias[out_base+48+tx]:0.f);\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- gemm_f16_f32: MMA m16n8k16 ---- */\n"
 "#define GEMM_N_TILE 8\n"
 "__global__ void gemm_f16_f32(float *Y, const half_raw *W, const float *X,\n"
@@ -366,6 +429,103 @@ static const char *cuda_ppd_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- flash_attn_tiled_f32: tiled FlashAttention (no MMA, no TC) ---- */\n"
+"/* Grid: (n_heads, ceil(n_tok/FA_BQ)), blockDim=(FA_BQ=64) = 2 warps   */\n"
+"/* Each thread handles 1 query row, Q and O_accum kept in registers     */\n"
+"/* Score computation: fused outer-d/inner-kj loop (16-way ILP unrolled) */\n"
+"/* V-accumulation: outer kj / inner d (64-way ILP, 4-cycle latency OK)  */\n"
+"/* Smem: smK[FA_BKV*64] + smV[FA_BKV*64] FP16 = 4KB; FA_BKV=16, FA_BQ=64*/\n"
+"#define FA_BQ       64\n"
+"#define FA_BKV      16\n"
+"#define FA_HEAD_DIM 64  /* compile-time head_dim: q_reg/O_i stay in regs, no spill */\n"
+"__global__ void flash_attn_tiled_f32(float *out, const float *qkv,\n"
+"                                      const float *K_t, const float *V_t,\n"
+"                                      int n_tok, int dim, int n_heads,\n"
+"                                      int head_dim, float scale) {\n"
+"    int h  = blockIdx.x;\n"
+"    int qi = blockIdx.y * FA_BQ + threadIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int dim3 = 3 * dim;\n"
+"    const float *qt   = qkv + (qi < n_tok ? qi : 0) * dim3 + h * head_dim;\n"
+"    const float *kt_h = K_t + (size_t)h * n_tok * head_dim;\n"
+"    const float *vt_h = V_t + (size_t)h * n_tok * head_dim;\n"
+"    extern __shared__ float smem[];\n"
+"    float *smK = smem;\n"
+"    float *smV = smem + FA_BKV * FA_HEAD_DIM;\n"
+"    /* Load Q into registers — FA_HEAD_DIM compile-time constant keeps q_reg in regs */\n"
+"    float q_reg[FA_HEAD_DIM];\n"
+"#pragma unroll\n"
+"    for (int d = 0; d < FA_HEAD_DIM; d++)\n"
+"        q_reg[d] = (qi < n_tok) ? qt[d] : 0.0f;\n"
+"    /* Online softmax state + output accumulator */\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O_i[FA_HEAD_DIM];\n"
+"#pragma unroll\n"
+"    for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] = 0.0f;\n"
+"    int tid = threadIdx.x;\n"
+"    int kv_tiles = (n_tok + FA_BKV - 1) / FA_BKV;\n"
+"    for (int tile = 0; tile < kv_tiles; tile++) {\n"
+"        int kv = tile * FA_BKV;\n"
+"        /* Cooperatively load K and V tiles (64 threads × 16 elems = 1024 floats) */\n"
+"        for (int idx = tid; idx < FA_BKV * FA_HEAD_DIM; idx += FA_BQ) {\n"
+"            int kj = idx / FA_HEAD_DIM, d = idx % FA_HEAD_DIM;\n"
+"            int kv_tok = kv + kj;\n"
+"            smK[idx] = (kv_tok < n_tok) ? kt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0.0f;\n"
+"            smV[idx] = (kv_tok < n_tok) ? vt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        /* Score: outer d (unrolled) / inner kj (unrolled) — compile-time indices     */\n"
+"        /* → q_reg[d] and smK[kj*FA_HEAD_DIM+d] both at compile-time offsets → regs  */\n"
+"        float sc[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) sc[kj] = 0.0f;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++) {\n"
+"            float qd = q_reg[d];\n"
+"#pragma unroll\n"
+"            for (int kj = 0; kj < FA_BKV; kj++)\n"
+"                sc[kj] += qd * smK[kj * FA_HEAD_DIM + d];\n"
+"        }\n"
+"        /* Scale + mask + find max */\n"
+"        float mx_tile = -1e30f;\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            sc[kj] = (kv + kj < n_tok) ? sc[kj] * scale : -1e30f;\n"
+"            if (sc[kj] > mx_tile) mx_tile = sc[kj];\n"
+"        }\n"
+"        /* Online softmax: rescale O_i and l_i */\n"
+"        float mn_i  = fmaxf(m_i, mx_tile);\n"
+"        float alpha = expf(m_i - mn_i);\n"
+"        l_i *= alpha;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] *= alpha;\n"
+"        m_i = mn_i;\n"
+"        /* Precompute exp values (all kj) then V-accumulate                        */\n"
+"        /* V-accum: outer kj (unrolled), inner d (unrolled) → O_i[d] compile-time */\n"
+"        float ej[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            ej[kj] = (kv + kj < n_tok) ? expf(sc[kj] - m_i) : 0.0f;\n"
+"            l_i += ej[kj];\n"
+"        }\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            float e = ej[kj];\n"
+"#pragma unroll\n"
+"            for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] += e * smV[kj * FA_HEAD_DIM + d];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    /* Normalize and write output */\n"
+"    if (qi < n_tok) {\n"
+"        float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;\n"
+"        float *out_qi = out + (size_t)qi * dim + h * head_dim;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++)\n"
+"            out_qi[d] = O_i[d] * inv_l;\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- scalar_attn_f32: scalar attention (no MMA), one block per (head, query) ---- */\n"
 "__global__ void scalar_attn_f32(float *out, const float *qkv,\n"
 "                                 const float *K_t, const float *V_t,\n"
@@ -446,6 +606,360 @@ static const char *cuda_ppd_kernel_source =
 "    int dst_idx = h * n_tok * head_dim + tok * head_dim + d;\n"
 "    K_t[dst_idx] = qkv[tok * dim3 + dim + hd_idx];\n"
 "    V_t[dst_idx] = qkv[tok * dim3 + 2*dim + hd_idx];\n"
+"}\n"
+"\n"
+"/* ---- kv_transpose_f16: transpose QKV and store K,V as FP16 ---- */\n"
+"/* Halves global memory bandwidth for K/V during attention         */\n"
+"__global__ void kv_transpose_f16(unsigned short *K_t, unsigned short *V_t,\n"
+"                                   const float *qkv,\n"
+"                                   int n_tok, int dim, int n_heads, int head_dim) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_tok * dim;\n"
+"    if (idx >= total) return;\n"
+"    int tok = idx / dim;\n"
+"    int hd_idx = idx % dim;\n"
+"    int h = hd_idx / head_dim;\n"
+"    int d = hd_idx % head_dim;\n"
+"    int dim3 = 3 * dim;\n"
+"    int dst_idx = h * n_tok * head_dim + tok * head_dim + d;\n"
+"    float kv, vv;\n"
+"    unsigned short kh, vh;\n"
+"    kv = qkv[tok * dim3 + dim + hd_idx];\n"
+"    vv = qkv[tok * dim3 + 2*dim + hd_idx];\n"
+"    asm(\"cvt.rn.f16.f32 %0, %1;\\n\" : \"=h\"(kh) : \"f\"(kv));\n"
+"    asm(\"cvt.rn.f16.f32 %0, %1;\\n\" : \"=h\"(vh) : \"f\"(vv));\n"
+"    K_t[dst_idx] = kh;\n"
+"    V_t[dst_idx] = vh;\n"
+"}\n"
+"\n"
+"/* ---- kv_transpose_fp8: transpose QKV and store K,V as FP8 E4M3    ---- */\n"
+"/* Halves K/V global bandwidth vs FP16 (1 byte vs 2 bytes per element)     */\n"
+"/* FP32 → FP8 E4M3 via cvt.rn.satfinite.e4m3x2.f32 (sm_89+)               */\n"
+"#if __CUDA_ARCH__ >= 890\n"
+"__global__ void kv_transpose_fp8(unsigned char *K_t, unsigned char *V_t,\n"
+"                                   const float *qkv,\n"
+"                                   int n_tok, int dim, int n_heads, int head_dim) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_tok * dim;\n"
+"    if (idx >= total) return;\n"
+"    int tok = idx / dim;\n"
+"    int hd_idx = idx % dim;\n"
+"    int h = hd_idx / head_dim;\n"
+"    int d = hd_idx % head_dim;\n"
+"    int dim3 = 3 * dim;\n"
+"    int dst_idx = h * n_tok * head_dim + tok * head_dim + d;\n"
+"    float kv = qkv[tok * dim3 + dim + hd_idx];\n"
+"    float vv = qkv[tok * dim3 + 2*dim + hd_idx];\n"
+"    unsigned short kh, vh;\n"
+"    /* lower byte of packed output = FP8 E4M3(val) */\n"
+"    asm(\"{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}\\n\" : \"=h\"(kh) : \"f\"(kv), \"f\"(kv));\n"
+"    asm(\"{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}\\n\" : \"=h\"(vh) : \"f\"(vv), \"f\"(vv));\n"
+"    K_t[dst_idx] = (unsigned char)(kh & 0xFF);\n"
+"    V_t[dst_idx] = (unsigned char)(vh & 0xFF);\n"
+"}\n"
+"#endif\n"
+"\n"
+"/* ---- flash_attn_f16kv_f32: flash attention with FP16 global K/V    ---- */\n"
+"/* K_t and V_t are FP16 (unsigned short) in global memory.              */\n"
+"/* smem stores K/V as FP16 (4KB/block) → 25 blocks/SM smem limit.       */\n"
+"/* __launch_bounds__(FA_BQ, 8) → compiler reduces to ≤128 regs/thread,  */\n"
+"/*   enabling 8 blocks/SM (16 warps) vs default 5 blocks (10 warps).     */\n"
+"/* FP16→FP32 conversion inline in compute loops (1 cvt per FMA, fast).   */\n"
+"/* Grid: (n_heads, ceil(n_tok/FA_BQ)), blockDim=(FA_BQ=64)               */\n"
+"__global__ __launch_bounds__(FA_BQ, 6)\n"
+"void flash_attn_f16kv_f32(float *out, const float *qkv,\n"
+"                            const unsigned short *K_t,\n"
+"                            const unsigned short *V_t,\n"
+"                            int n_tok, int dim, int n_heads,\n"
+"                            int head_dim, float scale) {\n"
+"    int h  = blockIdx.x;\n"
+"    int qi = blockIdx.y * FA_BQ + threadIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int dim3 = 3 * dim;\n"
+"    const float         *qt   = qkv + (qi < n_tok ? qi : 0) * dim3 + h * head_dim;\n"
+"    const unsigned short *kt_h = K_t + (size_t)h * n_tok * head_dim;\n"
+"    const unsigned short *vt_h = V_t + (size_t)h * n_tok * head_dim;\n"
+"    /* FP16 smem: 2 × FA_BKV × FA_HEAD_DIM × 2 = 4KB/block (was 8KB FP32 smem) */\n"
+"    extern __shared__ unsigned short smem_u16[];\n"
+"    unsigned short *smK = smem_u16;\n"
+"    unsigned short *smV = smem_u16 + FA_BKV * FA_HEAD_DIM;\n"
+"    /* Load Q into FP32 registers                                          */\n"
+"    float q_reg[FA_HEAD_DIM];\n"
+"#pragma unroll\n"
+"    for (int d = 0; d < FA_HEAD_DIM; d++)\n"
+"        q_reg[d] = (qi < n_tok) ? qt[d] : 0.0f;\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O_i[FA_HEAD_DIM];\n"
+"#pragma unroll\n"
+"    for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] = 0.0f;\n"
+"    int tid = threadIdx.x;\n"
+"    int kv_tiles = (n_tok + FA_BKV - 1) / FA_BKV;\n"
+"    for (int tile = 0; tile < kv_tiles; tile++) {\n"
+"        int kv = tile * FA_BKV;\n"
+"        /* Load FP16 K/V into FP16 smem — no conversion on load */\n"
+"        for (int idx = tid; idx < FA_BKV * FA_HEAD_DIM; idx += FA_BQ) {\n"
+"            int kj = idx / FA_HEAD_DIM, d = idx % FA_HEAD_DIM;\n"
+"            int kv_tok = kv + kj;\n"
+"            smK[idx] = (kv_tok < n_tok) ? kt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0;\n"
+"            smV[idx] = (kv_tok < n_tok) ? vt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        /* Score: cvt FP16→FP32 inline per smem read (1 cycle, same as FMA)   */\n"
+"        float sc[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) sc[kj] = 0.0f;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++) {\n"
+"            float qd = q_reg[d];\n"
+"#pragma unroll\n"
+"            for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"                float kf;\n"
+"                asm(\"cvt.f32.f16 %0, %1;\\n\" : \"=f\"(kf) : \"h\"(smK[kj * FA_HEAD_DIM + d]));\n"
+"                sc[kj] += qd * kf;\n"
+"            }\n"
+"        }\n"
+"        float mx_tile = -1e30f;\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            sc[kj] = (kv + kj < n_tok) ? sc[kj] * scale : -1e30f;\n"
+"            if (sc[kj] > mx_tile) mx_tile = sc[kj];\n"
+"        }\n"
+"        float mn_i  = fmaxf(m_i, mx_tile);\n"
+"        float alpha = expf(m_i - mn_i);\n"
+"        l_i *= alpha;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] *= alpha;\n"
+"        m_i = mn_i;\n"
+"        float ej[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            ej[kj] = (kv + kj < n_tok) ? expf(sc[kj] - m_i) : 0.0f;\n"
+"            l_i += ej[kj];\n"
+"        }\n"
+"        /* V-accum: cvt FP16→FP32 inline per smem V read                       */\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            float e = ej[kj];\n"
+"#pragma unroll\n"
+"            for (int d = 0; d < FA_HEAD_DIM; d++) {\n"
+"                float vf;\n"
+"                asm(\"cvt.f32.f16 %0, %1;\\n\" : \"=f\"(vf) : \"h\"(smV[kj * FA_HEAD_DIM + d]));\n"
+"                O_i[d] += e * vf;\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (qi < n_tok) {\n"
+"        float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;\n"
+"        float *out_qi = out + (size_t)qi * dim + h * head_dim;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++)\n"
+"            out_qi[d] = O_i[d] * inv_l;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- flash_attn_fp8kv_f32: flash attention with FP8 E4M3 global K/V  ---- */\n"
+"/* K_t and V_t are FP8 E4M3 (unsigned char) in global — half FP16 bandwidth  */\n"
+"/* Strategy: load FP8 from global, convert FP8→FP16 on smem store.            */\n"
+"/* smem is FP16 (4KB/block), compute loop identical to flash_attn_f16kv_f32.  */\n"
+"/* Net gain: halved global K/V bandwidth, same compute throughput as FP16.    */\n"
+"#if __CUDA_ARCH__ >= 890\n"
+"__global__ __launch_bounds__(FA_BQ, 6)\n"
+"void flash_attn_fp8kv_f32(float *out, const float *qkv,\n"
+"                            const unsigned char *K_t,\n"
+"                            const unsigned char *V_t,\n"
+"                            int n_tok, int dim, int n_heads,\n"
+"                            int head_dim, float scale) {\n"
+"    int h  = blockIdx.x;\n"
+"    int qi = blockIdx.y * FA_BQ + threadIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int dim3 = 3 * dim;\n"
+"    const float         *qt   = qkv + (qi < n_tok ? qi : 0) * dim3 + h * head_dim;\n"
+"    const unsigned char *kt_h = K_t + (size_t)h * n_tok * head_dim;\n"
+"    const unsigned char *vt_h = V_t + (size_t)h * n_tok * head_dim;\n"
+"    /* FP16 smem (same 4KB/block as FP16 kernel) — compute loop is identical  */\n"
+"    extern __shared__ unsigned short smem_fp8kv[];\n"
+"    unsigned short *smK = smem_fp8kv;\n"
+"    unsigned short *smV = smem_fp8kv + FA_BKV * FA_HEAD_DIM;\n"
+"    float q_reg[FA_HEAD_DIM];\n"
+"#pragma unroll\n"
+"    for (int d = 0; d < FA_HEAD_DIM; d++)\n"
+"        q_reg[d] = (qi < n_tok) ? qt[d] : 0.0f;\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O_i[FA_HEAD_DIM];\n"
+"#pragma unroll\n"
+"    for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] = 0.0f;\n"
+"    int tid = threadIdx.x;\n"
+"    int kv_tiles = (n_tok + FA_BKV - 1) / FA_BKV;\n"
+"    for (int tile = 0; tile < kv_tiles; tile++) {\n"
+"        int kv = tile * FA_BKV;\n"
+"        /* Load FP8 K/V from global, convert FP8→FP16 on store to smem         */\n"
+"        /* Global reads: FA_BKV*FA_HEAD_DIM bytes (1B/elem vs 2B for FP16)      */\n"
+"        for (int idx = tid; idx < FA_BKV * FA_HEAD_DIM; idx += FA_BQ) {\n"
+"            int kj = idx / FA_HEAD_DIM, d = idx % FA_HEAD_DIM;\n"
+"            int kv_tok = kv + kj;\n"
+"            unsigned char k8 = (kv_tok < n_tok) ? kt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0;\n"
+"            unsigned char v8 = (kv_tok < n_tok) ? vt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0;\n"
+"            /* FP8 E4M3 → FP16: cvt.rn.f16x2.e4m3x2 converts lower FP8 → lower FP16 */\n"
+"            unsigned int kh16, vh16;\n"
+"            asm(\"{cvt.rn.f16x2.e4m3x2 %0, %1;}\\n\" : \"=r\"(kh16) : \"h\"((unsigned short)k8));\n"
+"            asm(\"{cvt.rn.f16x2.e4m3x2 %0, %1;}\\n\" : \"=r\"(vh16) : \"h\"((unsigned short)v8));\n"
+"            smK[idx] = (unsigned short)(kh16 & 0xFFFF);\n"
+"            smV[idx] = (unsigned short)(vh16 & 0xFFFF);\n"
+"        }\n"
+"        __syncthreads();\n"
+"        /* Score — identical to flash_attn_f16kv_f32 compute loop (1 cvt per elem) */\n"
+"        float sc[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) sc[kj] = 0.0f;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++) {\n"
+"            float qd = q_reg[d];\n"
+"#pragma unroll\n"
+"            for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"                float kf;\n"
+"                asm(\"cvt.f32.f16 %0, %1;\\n\" : \"=f\"(kf) : \"h\"(smK[kj * FA_HEAD_DIM + d]));\n"
+"                sc[kj] += qd * kf;\n"
+"            }\n"
+"        }\n"
+"        float mx_tile = -1e30f;\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            sc[kj] = (kv + kj < n_tok) ? sc[kj] * scale : -1e30f;\n"
+"            if (sc[kj] > mx_tile) mx_tile = sc[kj];\n"
+"        }\n"
+"        float mn_i  = fmaxf(m_i, mx_tile);\n"
+"        float alpha = expf(m_i - mn_i);\n"
+"        l_i *= alpha;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] *= alpha;\n"
+"        m_i = mn_i;\n"
+"        float ej[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            ej[kj] = (kv + kj < n_tok) ? expf(sc[kj] - m_i) : 0.0f;\n"
+"            l_i += ej[kj];\n"
+"        }\n"
+"        /* V-accum — identical to FP16 kernel */\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            float e = ej[kj];\n"
+"#pragma unroll\n"
+"            for (int d = 0; d < FA_HEAD_DIM; d++) {\n"
+"                float vf;\n"
+"                asm(\"cvt.f32.f16 %0, %1;\\n\" : \"=f\"(vf) : \"h\"(smV[kj * FA_HEAD_DIM + d]));\n"
+"                O_i[d] += e * vf;\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (qi < n_tok) {\n"
+"        float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;\n"
+"        float *out_qi = out + (size_t)qi * dim + h * head_dim;\n"
+"#pragma unroll\n"
+"        for (int d = 0; d < FA_HEAD_DIM; d++)\n"
+"            out_qi[d] = O_i[d] * inv_l;\n"
+"    }\n"
+"}\n"
+"#endif\n"
+"\n"
+"/* ---- flash_attn_warp_f16kv_f32: warp-cooperative flash attention     ---- */\n"
+"/* 1 warp (32 threads) handles 1 query token cooperatively.                  */\n"
+"/* Each thread holds q[lane*2], q[lane*2+1] and O[lane*2], O[lane*2+1].     */\n"
+"/* Score = warp_reduce(q0*K[kj][lane*2] + q1*K[kj][lane*2+1]) → 5 shuffles */\n"
+"/* V-accum: O0 += ej[kj]*V[kj][lane*2], O1 += ej[kj]*V[kj][lane*2+1]      */\n"
+"/* Register savings: q_reg[64]+O_i[64]→q0,q1,O0,O1 → ~46 regs vs ~180     */\n"
+"/* → 5 blocks/SM (vs ~5 before) but 8 warps/block → 40 warps/SM (83% occ) */\n"
+"/* Grid: (n_heads, ceil(n_tok/FA_WARPS)), Block: 32*FA_WARPS threads         */\n"
+"#define FA_WARPS  8   /* warps per block = query-tokens per block */\n"
+"__global__ void flash_attn_warp_f16kv_f32(\n"
+"    float *out, const float *qkv,\n"
+"    const unsigned short *K_t, const unsigned short *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int tid     = threadIdx.x;\n"
+"    int warp_id = tid / 32;\n"
+"    int lane    = tid % 32;  /* 0..31: each thread holds 2 consecutive head_dim elems */\n"
+"    int h  = blockIdx.x;\n"
+"    int qi = blockIdx.y * FA_WARPS + warp_id;\n"
+"    if (h >= n_heads) return;\n"
+"    int dim3 = 3 * dim;\n"
+"    const float         *qt   = qkv + (qi < n_tok ? qi : 0) * dim3 + h * FA_HEAD_DIM;\n"
+"    const unsigned short *kt_h = K_t + (size_t)h * n_tok * FA_HEAD_DIM;\n"
+"    const unsigned short *vt_h = V_t + (size_t)h * n_tok * FA_HEAD_DIM;\n"
+"    extern __shared__ float smw[];   /* smK + smV: FA_BKV * FA_HEAD_DIM * 2 floats = 8KB */\n"
+"    float *smK = smw;\n"
+"    float *smV = smw + FA_BKV * FA_HEAD_DIM;\n"
+"    /* Each thread holds 2 Q elems: q[lane*2] and q[lane*2+1] */\n"
+"    float q0 = (qi < n_tok) ? qt[lane * 2]     : 0.0f;\n"
+"    float q1 = (qi < n_tok) ? qt[lane * 2 + 1] : 0.0f;\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O0 = 0.0f, O1 = 0.0f;\n"
+"    int kv_tiles = (n_tok + FA_BKV - 1) / FA_BKV;\n"
+"    for (int tile = 0; tile < kv_tiles; tile++) {\n"
+"        int kv = tile * FA_BKV;\n"
+"        /* All 32*FA_WARPS threads cooperatively load K/V tile (FP16→FP32) */\n"
+"        for (int idx = tid; idx < FA_BKV * FA_HEAD_DIM; idx += 32 * FA_WARPS) {\n"
+"            int kj = idx / FA_HEAD_DIM, d = idx % FA_HEAD_DIM;\n"
+"            int kv_tok = kv + kj;\n"
+"            unsigned short kh = (kv_tok < n_tok) ? kt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0;\n"
+"            unsigned short vh = (kv_tok < n_tok) ? vt_h[(size_t)kv_tok * FA_HEAD_DIM + d] : 0;\n"
+"            float kf, vf;\n"
+"            asm(\"cvt.f32.f16 %0, %1;\\n\" : \"=f\"(kf) : \"h\"(kh));\n"
+"            asm(\"cvt.f32.f16 %0, %1;\\n\" : \"=f\"(vf) : \"h\"(vh));\n"
+"            smK[idx] = kf;\n"
+"            smV[idx] = vf;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        /* Score: warp-reduce dot product; each lane contributes 2 dims */\n"
+"        /* sc[kj] = sum_d(q[d]*K[kj][d]) via __shfl_xor_sync 5-level reduce */\n"
+"        float sc[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            float p = q0 * smK[kj * FA_HEAD_DIM + lane * 2]\n"
+"                    + q1 * smK[kj * FA_HEAD_DIM + lane * 2 + 1];\n"
+"            p += __shfl_xor_sync(0xffffffff, p, 16);\n"
+"            p += __shfl_xor_sync(0xffffffff, p,  8);\n"
+"            p += __shfl_xor_sync(0xffffffff, p,  4);\n"
+"            p += __shfl_xor_sync(0xffffffff, p,  2);\n"
+"            p += __shfl_xor_sync(0xffffffff, p,  1);\n"
+"            sc[kj] = p;  /* all lanes hold same reduced value */\n"
+"        }\n"
+"        /* Scale + mask + tile max */\n"
+"        float mx_tile = -1e30f;\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            sc[kj] = (kv + kj < n_tok) ? sc[kj] * scale : -1e30f;\n"
+"            if (sc[kj] > mx_tile) mx_tile = sc[kj];\n"
+"        }\n"
+"        /* Online softmax: rescale O and l_i */\n"
+"        float mn_i  = fmaxf(m_i, mx_tile);\n"
+"        float alpha = expf(m_i - mn_i);\n"
+"        l_i *= alpha;\n"
+"        O0  *= alpha;\n"
+"        O1  *= alpha;\n"
+"        m_i  = mn_i;\n"
+"        /* Exp weights + l_i update */\n"
+"        float ej[FA_BKV];\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            ej[kj] = (kv + kj < n_tok) ? expf(sc[kj] - m_i) : 0.0f;\n"
+"            l_i += ej[kj];\n"
+"        }\n"
+"        /* V accumulation: each thread accumulates 2 output dims */\n"
+"#pragma unroll\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            float e = ej[kj];\n"
+"            O0 += e * smV[kj * FA_HEAD_DIM + lane * 2];\n"
+"            O1 += e * smV[kj * FA_HEAD_DIM + lane * 2 + 1];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (qi < n_tok) {\n"
+"        float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;\n"
+"        float *out_qi = out + (size_t)qi * dim + h * FA_HEAD_DIM;\n"
+"        out_qi[lane * 2]     = O0 * inv_l;\n"
+"        out_qi[lane * 2 + 1] = O1 * inv_l;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- gelu_f32 (tanh approx, same as GELU used in DINOv2 & DiT) ---- */\n"
@@ -665,6 +1179,29 @@ static const char *cuda_ppd_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- dit_im2col: extract [n_ch,H,W] patches → [n_patches, n_ch*ps*ps] (coalesced) ---- */\n"
+"/* Grid: (ceil(n_patches/BLK), n_ch, 1), Block: ps*ps threads                            */\n"
+"/* kw is the fast inner dim → consecutive threads access consecutive img columns           */\n"
+"/* → fully coalesced global reads for the image data.                                     */\n"
+"#define DIT_IM2COL_BLK 8\n"
+"__global__ void dit_im2col(float *out, const float *img,\n"
+"                            int n_patches, int gw, int ps, int img_h, int img_w, int n_ch) {\n"
+"    int patch_base = blockIdx.x * DIT_IM2COL_BLK;\n"
+"    int ci  = blockIdx.y;             /* input channel 0..n_ch-1 */\n"
+"    int tid = threadIdx.x;            /* kh*ps+kw in 0..ps*ps-1 */\n"
+"    int kh = tid / ps, kw = tid % ps;\n"
+"    int ci_stride = img_h * img_w;\n"
+"    int in_ps2 = n_ch * ps * ps;      /* total elems per patch in output buffer */\n"
+"    for (int i = 0; i < DIT_IM2COL_BLK; i++) {\n"
+"        int patch = patch_base + i;\n"
+"        if (patch >= n_patches) break;\n"
+"        int py = patch / gw, px = patch % gw;\n"
+"        int src = ci * ci_stride + (py*ps+kh) * img_w + (px*ps+kw);\n"
+"        int dst = patch * in_ps2 + ci * ps*ps + tid;  /* kh*ps+kw = tid */\n"
+"        out[dst] = img[src];\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- euler_step: latent = (1-s/T)*pred_x0 + (s/T)*pred_xT ---- */\n"
 "/* pred = model output (velocity). Updates latent in-place. */\n"
 "__global__ void euler_step_f32(float *latent, const float *pred,\n"
@@ -806,11 +1343,18 @@ struct cuda_ppd_runner {
     CUmodule module;
     /* Kernel function handles */
     CUfunction fn_layernorm_f32;
+    CUfunction fn_gemm_tiled_f16_f32;
     CUfunction fn_gemm_f16_f32;
     CUfunction fn_gemm_fp8_f32;
     CUfunction fn_add_bias_f32;
     CUfunction fn_attn_prefill_f32;
+    CUfunction fn_flash_attn_tiled_f32;
+    CUfunction fn_flash_attn_f16kv_f32;   /* FP16 K/V flash attention */
+    CUfunction fn_flash_attn_warp_f16kv_f32; /* warp-coop FP16 K/V, lower reg pressure */
+    CUfunction fn_flash_attn_fp8kv_f32;   /* FP8 K/V flash attention (sm_89+) */
     CUfunction fn_kv_transpose;
+    CUfunction fn_kv_transpose_f16;       /* FP16 K/V transpose */
+    CUfunction fn_kv_transpose_fp8;       /* FP8 K/V transpose (sm_89+) */
     CUfunction fn_gelu_f32;
     CUfunction fn_add_f32;
     CUfunction fn_resize_normalize;
@@ -825,6 +1369,7 @@ struct cuda_ppd_runner {
     CUfunction fn_unpatchify_f32;
     CUfunction fn_concat_4ch_f32;
     CUfunction fn_dit_patch_embed_conv2d;
+    CUfunction fn_dit_im2col;             /* fast im2col for dit x_embed */
     CUfunction fn_euler_step_f32;
     CUfunction fn_add_scalar_f32;
     CUfunction fn_sub_scalar_chw_f32;
@@ -942,6 +1487,12 @@ static int ppd_compile_kernels(cuda_ppd_runner *r) {
     nvrtcGetPTX(prog, ptx);
     nvrtcDestroyProgram(&prog);
 
+    /* Save PTX for inspection (register spill analysis) */
+    if (r->verbose >= 3) {
+        FILE *fp = fopen("/tmp/ppd_kernels.ptx", "w");
+        if (fp) { fwrite(ptx, 1, ptx_sz, fp); fclose(fp);
+            fprintf(stderr, "cuda_ppd: PTX saved to /tmp/ppd_kernels.ptx\n"); }
+    }
     CUresult err = cuModuleLoadDataEx(&r->module, ptx, 0, NULL, NULL);
     free(ptx);
     if (err != CUDA_SUCCESS) return -1;
@@ -953,10 +1504,15 @@ static int ppd_compile_kernels(cuda_ppd_runner *r) {
 } while(0)
 
     GET_FN(layernorm_f32);
+    GET_FN(gemm_tiled_f16_f32);
     GET_FN(gemm_f16_f32);
     GET_FN(add_bias_f32);
     GET_FN(attn_prefill_f32);
+    GET_FN(flash_attn_tiled_f32);
+    GET_FN(flash_attn_f16kv_f32);
+    GET_FN(flash_attn_warp_f16kv_f32);
     GET_FN(kv_transpose);
+    GET_FN(kv_transpose_f16);
     GET_FN(gelu_f32);
     GET_FN(add_f32);
     GET_FN(resize_normalize);
@@ -971,6 +1527,7 @@ static int ppd_compile_kernels(cuda_ppd_runner *r) {
     GET_FN(unpatchify_f32);
     GET_FN(concat_4ch_f32);
     GET_FN(dit_patch_embed_conv2d);
+    GET_FN(dit_im2col);
     GET_FN(euler_step_f32);
     GET_FN(add_scalar_f32);
     GET_FN(sub_scalar_chw_f32);
@@ -980,13 +1537,11 @@ static int ppd_compile_kernels(cuda_ppd_runner *r) {
     GET_FN(scalar_gemm_f16_f32);
     GET_FN(scalar_attn_f32);
 
-    /* FP8 is optional — disabled for PPD to maintain numerical precision
-     * (diffusion models are more sensitive to quantization than single-pass models) */
+    /* FP8 disabled for PPD: FP8 quantization causes denoising trajectory divergence.
+     * F16 GEMM gives correct results matching the original F32 model. */
     r->use_fp8 = 0;
-    if (sm >= 89) {
-        err = cuModuleGetFunction(&r->fn_gemm_fp8_f32, r->module, "gemm_fp8_f32");
-        (void)err; /* loaded but not used */
-    }
+    r->fn_kv_transpose_fp8 = NULL;
+    r->fn_flash_attn_fp8kv_f32 = NULL;
 #undef GET_FN
 
     if (r->verbose >= 1)
@@ -1308,7 +1863,7 @@ static int ppd_load_sem_weights(cuda_ppd_runner *r, const char *path) {
     /* Patch embedding, CLS token, position embedding */
     char buf[256];
     snprintf(buf, sizeof(buf), "%spatch_embed.proj.weight", prefix);
-    r->sem_patch_embed_w = pth_upload_f32(pth, r->stream, buf);
+    r->sem_patch_embed_w = pth_upload_f16(pth, r->stream, buf);  /* F16 for kl_gemm */
     snprintf(buf, sizeof(buf), "%spatch_embed.proj.bias", prefix);
     r->sem_patch_embed_b = pth_upload_f32(pth, r->stream, buf);
     snprintf(buf, sizeof(buf), "%scls_token", prefix);
@@ -1392,9 +1947,9 @@ static int ppd_load_dit_weights(cuda_ppd_runner *r, const char *path) {
 
     char buf[256];
 
-    /* PatchEmbed: x_embedder.proj */
+    /* PatchEmbed: x_embedder.proj — load as FP8/F16 for backbone GEMM dispatch */
     snprintf(buf, sizeof(buf), "%sx_embedder.proj.weight", dit_pfx);
-    r->dit_x_embed_w = pth_upload_f32(pth, r->stream, buf);
+    r->dit_x_embed_w = pth_upload_backbone(pth, r->stream, buf, r->use_fp8);
     snprintf(buf, sizeof(buf), "%sx_embedder.proj.bias", dit_pfx);
     r->dit_x_embed_b = pth_upload_f32(pth, r->stream, buf);
 
@@ -1410,15 +1965,15 @@ static int ppd_load_dit_weights(cuda_ppd_runner *r, const char *path) {
 
     /* Proj fusion (3 layers) */
     snprintf(buf, sizeof(buf), "%sproj_fusion.0.weight", dit_pfx);
-    r->dit_proj_fusion_w[0] = pth_upload_f16(pth, r->stream, buf);
+    r->dit_proj_fusion_w[0] = pth_upload_backbone(pth, r->stream, buf, r->use_fp8);
     snprintf(buf, sizeof(buf), "%sproj_fusion.0.bias", dit_pfx);
     r->dit_proj_fusion_b[0] = pth_upload_f32(pth, r->stream, buf);
     snprintf(buf, sizeof(buf), "%sproj_fusion.2.weight", dit_pfx);
-    r->dit_proj_fusion_w[1] = pth_upload_f16(pth, r->stream, buf);
+    r->dit_proj_fusion_w[1] = pth_upload_backbone(pth, r->stream, buf, r->use_fp8);
     snprintf(buf, sizeof(buf), "%sproj_fusion.2.bias", dit_pfx);
     r->dit_proj_fusion_b[1] = pth_upload_f32(pth, r->stream, buf);
     snprintf(buf, sizeof(buf), "%sproj_fusion.4.weight", dit_pfx);
-    r->dit_proj_fusion_w[2] = pth_upload_f16(pth, r->stream, buf);
+    r->dit_proj_fusion_w[2] = pth_upload_backbone(pth, r->stream, buf, r->use_fp8);
     snprintf(buf, sizeof(buf), "%sproj_fusion.4.bias", dit_pfx);
     r->dit_proj_fusion_b[2] = pth_upload_f32(pth, r->stream, buf);
 
@@ -1560,10 +2115,10 @@ static void kl_layernorm(cuda_ppd_runner *r, CUdeviceptr dst, CUdeviceptr src,
 static void kl_gemm(cuda_ppd_runner *r, CUdeviceptr Y, CUdeviceptr W_f16,
                      CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
-    /* Use scalar GEMM for all sizes — MMA m16n8k16 produces wrong results
-       on sm_120 (Blackwell) for this compilation unit. */
-    unsigned gx = (unsigned)((n_out + 255) / 256);
-    cuLaunchKernel(r->fn_scalar_gemm_f16_f32, gx, (unsigned)n_tok, 1, 256, 1, 1,
+    /* Tiled shared-memory GEMM: grid=(ceil(n_out/64), ceil(n_tok/16)), blockDim=(16,16) */
+    unsigned gx = (unsigned)((n_out + 63) / 64);
+    unsigned gy = (unsigned)((n_tok + 15) / 16);
+    cuLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,
                    0, r->stream, args, NULL);
 }
 
@@ -1598,11 +2153,80 @@ static void kl_attn(cuda_ppd_runner *r, CUdeviceptr out, CUdeviceptr qkv,
                      int n_tok, int dim, int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
     void *args[] = {&out, &qkv, &K_t, &V_t, &n_tok, &dim, &n_heads, &head_dim, &scale};
-    /* Use scalar attention — MMA attn_prefill_f32 produces wrong results on sm_120 */
-    unsigned smem = (unsigned)((n_tok + 256) * sizeof(float));
-    cuLaunchKernel(r->fn_scalar_attn_f32,
-                   (unsigned)n_heads, (unsigned)n_tok, 1, 256, 1, 1,
-                   smem, r->stream, args, NULL);
+    /* flash_attn_tiled_f32: 2 warps per query-block (FA_BQ=64), FA_BKV=16 KV tile */
+    int bq = 64, bkv = 16;
+    unsigned smem_size = (unsigned)(2 * bkv * head_dim * sizeof(float));
+    unsigned gy = (unsigned)((n_tok + bq - 1) / bq);
+    cuLaunchKernel(r->fn_flash_attn_tiled_f32,
+                   (unsigned)n_heads, gy, 1, (unsigned)bq, 1, 1,
+                   smem_size, r->stream, args, NULL);
+}
+
+/* kl_kv_transpose_f16: transposes QKV K/V into FP16 K_t, V_t buffers */
+static void kl_kv_transpose_f16(cuda_ppd_runner *r, CUdeviceptr K_t_f16, CUdeviceptr V_t_f16,
+                                  CUdeviceptr qkv, int n_tok, int dim, int n_heads, int head_dim) {
+    int total = n_tok * dim;
+    int grid = (total + 255) / 256;
+    void *args[] = {&K_t_f16, &V_t_f16, &qkv, &n_tok, &dim, &n_heads, &head_dim};
+    cuLaunchKernel(r->fn_kv_transpose_f16, (unsigned)grid, 1, 1, 256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
+/* kl_attn_f16kv: flash attention reading FP16 K_t/V_t, output FP32 */
+static void kl_attn_f16kv(cuda_ppd_runner *r, CUdeviceptr out, CUdeviceptr qkv,
+                            CUdeviceptr K_t_f16, CUdeviceptr V_t_f16,
+                            int n_tok, int dim, int n_heads, int head_dim) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    void *args[] = {&out, &qkv, &K_t_f16, &V_t_f16, &n_tok, &dim, &n_heads, &head_dim, &scale};
+    int bq = 64;
+    /* smem = 2 × FA_BKV × head_dim × sizeof(uint16) = 2 × 16 × 64 × 2 = 4KB (FP16 smem, FP16 global) */
+    unsigned smem_size = (unsigned)(2 * 16 * head_dim * sizeof(unsigned short));
+    unsigned gy = (unsigned)((n_tok + bq - 1) / bq);
+    cuLaunchKernel(r->fn_flash_attn_f16kv_f32,
+                   (unsigned)n_heads, gy, 1, (unsigned)bq, 1, 1,
+                   smem_size, r->stream, args, NULL);
+}
+
+/* kl_kv_transpose_fp8: transposes QKV K/V into FP8 E4M3 K_t, V_t buffers (sm_89+) */
+static void kl_kv_transpose_fp8(cuda_ppd_runner *r, CUdeviceptr K_t_fp8, CUdeviceptr V_t_fp8,
+                                   CUdeviceptr qkv, int n_tok, int dim, int n_heads, int head_dim) {
+    int total = n_tok * dim;
+    int grid = (total + 255) / 256;
+    void *args[] = {&K_t_fp8, &V_t_fp8, &qkv, &n_tok, &dim, &n_heads, &head_dim};
+    cuLaunchKernel(r->fn_kv_transpose_fp8, (unsigned)grid, 1, 1, 256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
+/* kl_attn_fp8kv: flash attention reading FP8 K_t/V_t, output FP32 (sm_89+) */
+static void kl_attn_fp8kv(cuda_ppd_runner *r, CUdeviceptr out, CUdeviceptr qkv,
+                            CUdeviceptr K_t_fp8, CUdeviceptr V_t_fp8,
+                            int n_tok, int dim, int n_heads, int head_dim) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    void *args[] = {&out, &qkv, &K_t_fp8, &V_t_fp8, &n_tok, &dim, &n_heads, &head_dim, &scale};
+    int bq = 64;
+    /* smem = 2 × FA_BKV × head_dim × sizeof(uint16) = 2 × 16 × 64 × 2 = 4KB (FP16 smem in kernel) */
+    unsigned smem_size = (unsigned)(2 * 16 * head_dim * sizeof(unsigned short));
+    unsigned gy = (unsigned)((n_tok + bq - 1) / bq);
+    cuLaunchKernel(r->fn_flash_attn_fp8kv_f32,
+                   (unsigned)n_heads, gy, 1, (unsigned)bq, 1, 1,
+                   smem_size, r->stream, args, NULL);
+}
+
+/* kl_attn_warp_f16kv: warp-coop flash attention — lower register pressure */
+/* 1 warp (32 threads) handles 1 query token; smem same 8KB as kl_attn_f16kv */
+static void kl_attn_warp_f16kv(cuda_ppd_runner *r, CUdeviceptr out, CUdeviceptr qkv,
+                                 CUdeviceptr K_t_f16, CUdeviceptr V_t_f16,
+                                 int n_tok, int dim, int n_heads, int head_dim) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    void *args[] = {&out, &qkv, &K_t_f16, &V_t_f16, &n_tok, &dim, &n_heads, &head_dim, &scale};
+    int fa_warps = 8, bkv = 16;
+    int bx = fa_warps * 32;  /* 256 threads per block */
+    /* smem = 2 * FA_BKV * head_dim * sizeof(float) = 8KB (same as kl_attn_f16kv) */
+    unsigned smem_size = (unsigned)(2 * bkv * head_dim * sizeof(float));
+    unsigned gy = (unsigned)((n_tok + fa_warps - 1) / fa_warps);
+    cuLaunchKernel(r->fn_flash_attn_warp_f16kv_f32,
+                   (unsigned)n_heads, gy, 1, (unsigned)bx, 1, 1,
+                   smem_size, r->stream, args, NULL);
 }
 
 static void kl_gelu(cuda_ppd_runner *r, CUdeviceptr x, int n) {
@@ -1903,12 +2527,28 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
                        0, r->stream, args, NULL);
     }
 
-    /* 3b. Patch embedding → d_hidden [1+sem_np, sem_dim] */
+    /* 3b. Patch embedding via im2col + tiled GEMM → d_hidden [1+sem_np, sem_dim]        */
+    /* im2col: [3,sem_h,sem_w] → [sem_np, 3*ps*ps=588] in d_ffn_buf (safe: not yet used) */
+    /* GEMM:   [sem_np, 588] × W[1024,588]^T → d_hidden[1:] (skip CLS slot at [0])      */
+    /* Note: K=588 not MMA-aligned → use kl_gemm (tiled, handles arbitrary K via guards) */
     {
-        void *args[] = {&d_hidden, &d_img_norm, &r->sem_patch_embed_w, &r->sem_patch_embed_b,
-                        &sem_gW, &sem_dim, &sem_ps, &sem_w};
-        cuLaunchKernel(r->fn_patch_embed_conv2d, (unsigned)sem_np, 1, 1, 256, 1, 1,
-                       0, r->stream, args, NULL);
+        int in_ch = 3;
+        int in_elems = in_ch * sem_ps * sem_ps; /* 3*14*14 = 588 */
+        /* Step 1: im2col */
+        {
+            int blk = 8; /* DIT_IM2COL_BLK */
+            unsigned gx = (unsigned)((sem_np + blk - 1) / blk);
+            unsigned gy = (unsigned)in_ch;
+            void *args[] = {&d_ffn_buf, &d_img_norm, &sem_np, &sem_gW,
+                            &sem_ps, &sem_h, &sem_w, &in_ch};
+            cuLaunchKernel(r->fn_dit_im2col, gx, gy, 1,
+                           (unsigned)(sem_ps * sem_ps), 1, 1,
+                           0, r->stream, args, NULL);
+        }
+        /* Step 2: GEMM → d_hidden[1..] (patch tokens, skip CLS at [0]) */
+        CUdeviceptr d_hidden_patches = d_hidden + (size_t)sem_dim * sizeof(float);
+        kl_gemm(r, d_hidden_patches, r->sem_patch_embed_w, d_ffn_buf,
+                r->sem_patch_embed_b, sem_dim, in_elems, sem_np);
     }
 
     /* 3c. CLS token + position embedding (with interpolation if needed) */
@@ -1968,12 +2608,12 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
             kl_backbone_gemm(r, d_qkv, ly->attn_qkv_w, d_ln_buf, ly->attn_qkv_b,
                              ly->qkv_rows, ly->qkv_cols, nt);
 
-            /* KV transpose + attention */
+            /* KV transpose + attention (F16 K/V) */
             {
                 CUdeviceptr K_t = d_ffn_buf;
-                CUdeviceptr V_t = d_ffn_buf + (size_t)nt * dim * sizeof(float);
-                kl_kv_transpose(r, K_t, V_t, d_qkv, nt, dim, n_heads, head_dim);
-                kl_attn(r, d_attn_out, d_qkv, K_t, V_t, nt, dim, n_heads, head_dim);
+                CUdeviceptr V_t = d_ffn_buf + (size_t)nt * dim * sizeof(uint16_t);
+                kl_kv_transpose_f16(r, K_t, V_t, d_qkv, nt, dim, n_heads, head_dim);
+                kl_attn_f16kv(r, d_attn_out, d_qkv, K_t, V_t, nt, dim, n_heads, head_dim);
             }
 
             /* Output projection + LayerScale + residual */
@@ -2046,6 +2686,16 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
     /* ══════════════════════════════════════════════════════════ */
     /*  Step 5: DiT diffusion — 4 Euler steps                   */
     /* ══════════════════════════════════════════════════════════ */
+    /* Profile events for GEMM vs attention breakdown */
+    CUevent ev_attn_start = NULL, ev_attn_stop = NULL;
+    CUevent ev_gemm_start = NULL, ev_gemm_stop = NULL;
+    /* ms_*_total not accumulated; events used for single-block (L0/L12) timing only */
+    if (r->verbose >= 2) {
+        cuEventCreate(&ev_attn_start, 0);
+        cuEventCreate(&ev_attn_stop,  0);
+        cuEventCreate(&ev_gemm_start, 0);
+        cuEventCreate(&ev_gemm_stop,  0);
+    }
     clock_gettime(CLOCK_MONOTONIC, &ts);
     t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
 
@@ -2064,13 +2714,27 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
         /* 5a. Concat [latent, cond] → d_dit_input [4, proc_h, proc_w] */
         kl_concat_4ch(r, d_dit_input, d_latent, d_cond, HW);
 
-        /* 5b. DiT PatchEmbed: Conv2d(4, dit_dim, k=16, s=16) → [dit_nt_lo, dit_dim] */
+        /* 5b. DiT PatchEmbed: Conv2d(4, dit_dim, k=16, s=16) → [dit_nt_lo, dit_dim]   */
+        /* Fast path: dit_im2col → backbone GEMM (avoids serial inner loops)             */
+        /* im2col output [dit_nt_lo, 4*16*16=1024] stored in d_ffn_buf (4.9MB << 78MB) */
         {
-            int dit_ps = 16; /* input patch stride */
-            void *args[] = {&d_hidden, &d_dit_input, &r->dit_x_embed_w, &r->dit_x_embed_b,
-                            &dit_gW_lo, &dit_dim, &dit_ps, &proc_h, &proc_w};
-            cuLaunchKernel(r->fn_dit_patch_embed_conv2d, (unsigned)dit_nt_lo, 1, 1, 256, 1, 1,
-                           0, r->stream, args, NULL);
+            int dit_ps = 16;
+            int in_ch = 4, in_elems = in_ch * dit_ps * dit_ps; /* = 1024 */
+            /* Step 1: extract patches coalesced into d_ffn_buf as scratch */
+            {
+                int blk = 8; /* DIT_IM2COL_BLK */
+                unsigned gx = (unsigned)((dit_nt_lo + blk - 1) / blk);
+                unsigned gy = (unsigned)in_ch;  /* 4 channels */
+                int npatches = dit_nt_lo;
+                void *args[] = {&d_ffn_buf, &d_dit_input, &npatches,
+                                &dit_gW_lo, &dit_ps, &proc_h, &proc_w, &in_ch};
+                cuLaunchKernel(r->fn_dit_im2col, gx, gy, 1,
+                               (unsigned)(dit_ps * dit_ps), 1, 1,
+                               0, r->stream, args, NULL);
+            }
+            /* Step 2: GEMM [dit_nt_lo, 1024] × W[dit_dim, 1024]^T → [dit_nt_lo, dit_dim] */
+            kl_backbone_gemm(r, d_hidden, r->dit_x_embed_w, d_ffn_buf,
+                             r->dit_x_embed_b, dit_dim, in_elems, dit_nt_lo);
         }
 
         /* 5c. Timestep embedding: sinusoidal(t) → fc1 → SiLU → fc2 → [1, dit_dim] */
@@ -2087,6 +2751,7 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
             /* Pre-compute SiLU(t_embed) for adaLN conditioning */
             cuMemcpyDtoDAsync(d_t_embed, d_t_embed_silu, (size_t)dit_dim * sizeof(float), r->stream);
             kl_silu(r, d_t_embed_silu, dit_dim);
+
         }
 
         /* 5d. Upload low-res position indices for RoPE */
@@ -2106,6 +2771,14 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
             int n_heads = r->dit_n_heads;
             int head_dim = r->dit_head_dim;
             int stride_3dim = 3 * dim;
+
+            struct timespec ts_lo;
+            double t_lo0 = 0;
+            if (step == 0 && r->verbose >= 2) {
+                cuStreamSynchronize(r->stream);
+                clock_gettime(CLOCK_MONOTONIC, &ts_lo);
+                t_lo0 = ts_lo.tv_sec + ts_lo.tv_nsec * 1e-9;
+            }
 
             for (int L = 0; L < 12; L++) {
                 dit_layer *ly = &r->dit_layers[L];
@@ -2149,12 +2822,14 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
                                    nt, n_heads, head_dim, stride_3dim, r->dit_rope_freq);
                 }
 
-                /* KV transpose + attention */
+                /* KV transpose + attention (F16 K/V) */
                 {
                     CUdeviceptr K_t = d_ffn_buf;
-                    CUdeviceptr V_t = d_ffn_buf + (size_t)nt * dim * sizeof(float);
-                    kl_kv_transpose(r, K_t, V_t, d_qkv, nt, dim, n_heads, head_dim);
-                    kl_attn(r, d_attn_out, d_qkv, K_t, V_t, nt, dim, n_heads, head_dim);
+                    CUdeviceptr V_t = d_ffn_buf + (size_t)nt * dim * sizeof(uint16_t);
+                    kl_kv_transpose_f16(r, K_t, V_t, d_qkv, nt, dim, n_heads, head_dim);
+                    if (L == 0 && ev_attn_start) cuEventRecord(ev_attn_start, r->stream);
+                    kl_attn_f16kv(r, d_attn_out, d_qkv, K_t, V_t, nt, dim, n_heads, head_dim);
+                    if (L == 0 && ev_attn_stop)  cuEventRecord(ev_attn_stop,  r->stream);
                 }
 
                 /* Output projection */
@@ -2178,6 +2853,20 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
                 /* Gate + residual: hidden += gate_mlp * proj_out */
                 kl_gate_residual_add(r, d_hidden, d_proj_out, gate_mlp, dim, nt * dim);
             }
+
+            if (step == 0 && r->verbose >= 2) {
+                float ms_lo_attn = 0.0f;
+                if (ev_attn_stop) {
+                    cuEventSynchronize(ev_attn_stop);
+                    cuEventElapsedTime(&ms_lo_attn, ev_attn_start, ev_attn_stop);
+                }
+                cuStreamSynchronize(r->stream);
+                clock_gettime(CLOCK_MONOTONIC, &ts_lo);
+                double t_lo1 = ts_lo.tv_sec + ts_lo.tv_nsec * 1e-9;
+                fprintf(stderr, "cuda_ppd: [profile] lo-res blocks (12 blocks, nt=%d): %.1f ms"
+                        "  (L0 attn=%.2f ms, est. 12-blk attn=%.1f ms)\n",
+                        nt, (t_lo1 - t_lo0) * 1000.0, ms_lo_attn, ms_lo_attn * 12.0f);
+            }
         }
 
         /* 5f. Semantic fusion at midpoint */
@@ -2191,15 +2880,15 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
 
             /* proj_fusion: 3-layer MLP with SiLU
              * Layer 0: Linear(2*dim, 4*dim) */
-            kl_gemm(r, d_fusion_out, r->dit_proj_fusion_w[0], d_concat, r->dit_proj_fusion_b[0],
+            kl_backbone_gemm(r, d_fusion_out, r->dit_proj_fusion_w[0], d_concat, r->dit_proj_fusion_b[0],
                     4 * dim, 2 * dim, nt_lo);
             kl_silu(r, d_fusion_out, nt_lo * 4 * dim);
             /* Layer 2: Linear(4*dim, 4*dim) */
-            kl_gemm(r, d_concat, r->dit_proj_fusion_w[1], d_fusion_out, r->dit_proj_fusion_b[1],
+            kl_backbone_gemm(r, d_concat, r->dit_proj_fusion_w[1], d_fusion_out, r->dit_proj_fusion_b[1],
                     4 * dim, 4 * dim, nt_lo);
             kl_silu(r, d_concat, nt_lo * 4 * dim);
             /* Layer 4: Linear(4*dim, 4*dim) → output for pixel_shuffle */
-            kl_gemm(r, d_fusion_out, r->dit_proj_fusion_w[2], d_concat, r->dit_proj_fusion_b[2],
+            kl_backbone_gemm(r, d_fusion_out, r->dit_proj_fusion_w[2], d_concat, r->dit_proj_fusion_b[2],
                     4 * dim, 4 * dim, nt_lo);
             /* Pixel shuffle 2×2: [nt_lo, 4*dim] → [nt_hi, dim] */
             kl_pixel_shuffle_2x(r, d_hidden, d_fusion_out, dit_gH_lo, dit_gW_lo, dim);
@@ -2221,6 +2910,14 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
             int n_heads = r->dit_n_heads;
             int head_dim = r->dit_head_dim;
             int stride_3dim = 3 * dim;
+
+            struct timespec ts_hi;
+            double t_hi0 = 0;
+            if (step == 0 && r->verbose >= 2) {
+                cuStreamSynchronize(r->stream);
+                clock_gettime(CLOCK_MONOTONIC, &ts_hi);
+                t_hi0 = ts_hi.tv_sec + ts_hi.tv_nsec * 1e-9;
+            }
 
             for (int L = 12; L < 24; L++) {
                 dit_layer *ly = &r->dit_layers[L];
@@ -2260,11 +2957,14 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
                                    nt, n_heads, head_dim, stride_3dim, r->dit_rope_freq);
                 }
 
+                /* KV transpose + attention (F16 K/V) */
                 {
                     CUdeviceptr K_t = d_ffn_buf;
-                    CUdeviceptr V_t = d_ffn_buf + (size_t)nt * dim * sizeof(float);
-                    kl_kv_transpose(r, K_t, V_t, d_qkv, nt, dim, n_heads, head_dim);
-                    kl_attn(r, d_attn_out, d_qkv, K_t, V_t, nt, dim, n_heads, head_dim);
+                    CUdeviceptr V_t = d_ffn_buf + (size_t)nt * dim * sizeof(uint16_t);
+                    kl_kv_transpose_f16(r, K_t, V_t, d_qkv, nt, dim, n_heads, head_dim);
+                    if (L == 12 && ev_gemm_start) cuEventRecord(ev_gemm_start, r->stream);
+                    kl_attn_f16kv(r, d_attn_out, d_qkv, K_t, V_t, nt, dim, n_heads, head_dim);
+                    if (L == 12 && ev_gemm_stop)  cuEventRecord(ev_gemm_stop,  r->stream);
                 }
 
                 kl_backbone_gemm(r, d_proj_out, ly->attn_out_w, d_attn_out, ly->attn_out_b,
@@ -2281,6 +2981,20 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
                 kl_backbone_gemm(r, d_proj_out, ly->mlp_fc2_w, d_ffn_buf, ly->mlp_fc2_b,
                                  ly->fc2_rows, ly->fc2_cols, nt);
                 kl_gate_residual_add(r, d_hidden, d_proj_out, gate_mlp, dim, nt * dim);
+            }
+
+            if (step == 0 && r->verbose >= 2) {
+                float ms_hi_attn = 0.0f;
+                if (ev_gemm_stop) {
+                    cuEventSynchronize(ev_gemm_stop);
+                    cuEventElapsedTime(&ms_hi_attn, ev_gemm_start, ev_gemm_stop);
+                }
+                cuStreamSynchronize(r->stream);
+                clock_gettime(CLOCK_MONOTONIC, &ts_hi);
+                double t_hi1 = ts_hi.tv_sec + ts_hi.tv_nsec * 1e-9;
+                fprintf(stderr, "cuda_ppd: [profile] hi-res blocks (12 blocks, nt=%d): %.1f ms"
+                        "  (L12 attn=%.2f ms, est. 12-blk attn=%.1f ms)\n",
+                        nt, (t_hi1 - t_hi0) * 1000.0, ms_hi_attn, ms_hi_attn * 12.0f);
             }
         }
 
@@ -2373,6 +3087,11 @@ ppd_result cuda_ppd_predict(cuda_ppd_runner *r, const uint8_t *rgb, int w, int h
     cuMemFree(d_pos_x);
     cuMemFree(d_concat);
     if (d_fusion_out != d_ffn_buf) cuMemFree(d_fusion_out);
+
+    if (ev_attn_start) cuEventDestroy(ev_attn_start);
+    if (ev_attn_stop)  cuEventDestroy(ev_attn_stop);
+    if (ev_gemm_start) cuEventDestroy(ev_gemm_start);
+    if (ev_gemm_stop)  cuEventDestroy(ev_gemm_stop);
 
     if (r->verbose >= 1)
         fprintf(stderr, "cuda_ppd: predict done (%dx%d)\n", w, h);
