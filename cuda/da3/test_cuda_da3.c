@@ -20,6 +20,11 @@
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
 
+/* EXR output support (tinyexr implementation compiled separately as C++) */
+#include "../../common/tinyexr.h"
+#define EXR_WRITER_IMPLEMENTATION
+#include "../../common/exr_writer.h"
+
 /* CUDA DA3 runner */
 #include "cuda_da3_runner.h"
 
@@ -98,8 +103,10 @@ static void print_stats(const char *name, const float *data, int n) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <da3.gguf|model.safetensors> [-i input.ppm] [-o output.pgm]\n"
-                        "       [--full] [--pose] [--rays] [--gaussians] [-d device_id] [-v verbosity]\n",
+        fprintf(stderr, "Usage: %s <da3.gguf|model.safetensors> [-i input.ppm] [-o output.pgm|output.exr]\n"
+                        "       [--full] [--pose] [--rays] [--gaussians] [-d device_id] [-v verbosity]\n"
+                        "  .exr output: writes raw float channels (depth, confidence, rays, gaussians)\n"
+                        "  .pgm output: writes normalized 16-bit depth only\n",
                 argv[0]);
         return 1;
     }
@@ -243,15 +250,27 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "\nDepth sanity: %s\n", pass ? "PASS" : "FAIL (see warnings above)");
 
-        /* Write depth output */
+        /* Write output */
         if (output_pgm && result.depth) {
-            float range = dmax - dmin;
-            if (range < 1e-6f) range = 1.0f;
-            float *normalized = (float *)malloc((size_t)npix * sizeof(float));
-            for (int i = 0; i < npix; i++)
-                normalized[i] = (result.depth[i] - dmin) / range * 65535.0f;
-            write_pgm16(output_pgm, normalized, result.width, result.height);
-            free(normalized);
+            size_t olen = strlen(output_pgm);
+            int is_exr = (olen > 4 && strcmp(output_pgm + olen - 4, ".exr") == 0);
+            if (is_exr) {
+                if (output_flags != DA3_OUTPUT_DEPTH) {
+                    write_exr_full(output_pgm, &result, result.width, result.height);
+                } else {
+                    write_exr_depth(output_pgm, result.depth, result.confidence,
+                                    result.width, result.height);
+                }
+            } else {
+                /* PGM: normalized 16-bit depth */
+                float range = dmax - dmin;
+                if (range < 1e-6f) range = 1.0f;
+                float *normalized = (float *)malloc((size_t)npix * sizeof(float));
+                for (int i = 0; i < npix; i++)
+                    normalized[i] = (result.depth[i] - dmin) / range * 65535.0f;
+                write_pgm16(output_pgm, normalized, result.width, result.height);
+                free(normalized);
+            }
         }
     } else {
         fprintf(stderr, "No depth output produced (depth is NULL)\n");
