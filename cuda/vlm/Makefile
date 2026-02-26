@@ -12,21 +12,38 @@ CUEW_SRC = ../cuew.c
 RUNNER_SRC = cuda_vision_encoder.c
 TEST_SRC = test_cuda_vision.c
 
-# Target
+# Targets
 TARGET = test_cuda_vision
+COMPARE = compare_vs_llamacpp
 
-.PHONY: all clean run help
+.PHONY: all clean run help compare
 
-all: $(TARGET)
+all: $(TARGET) $(COMPARE)
 
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../cuew.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+
+$(COMPARE): compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../cuew.h
+	$(CC) $(CFLAGS) -o $@ compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+
+# dump_clip_embd requires llama.cpp build (link against libmtmd.so)
+# Usage: make dump_clip_embd LLAMA_DIR=/path/to/llama.cpp
+LLAMA_DIR ?= /home/syoyo/work/llama.cpp
+dump_clip_embd: dump_clip_embd.cpp
+	g++ -O2 -std=c++17 \
+		-I$(LLAMA_DIR)/vendor/stb \
+		-I$(LLAMA_DIR)/tools/mtmd \
+		-I$(LLAMA_DIR)/ggml/include \
+		-I$(LLAMA_DIR)/include \
+		-L$(LLAMA_DIR)/build/bin \
+		-Wl,-rpath,$(LLAMA_DIR)/build/bin \
+		-o $@ $< -lmtmd -lllama -lm
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <mmproj.gguf> [--f16] [--image-size N]"
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(COMPARE) dump_clip_embd
 
 help:
 	@echo "CUDA VLM Vision Encoder (NVRTC-based, no nvcc needed)"
