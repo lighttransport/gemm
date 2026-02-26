@@ -101,6 +101,11 @@ void        ppd_result_free(ppd_result *r);
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <float.h>
+
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -125,7 +130,7 @@ static uint16_t ppd_f32_to_f16(float f) {
     int exp = ((x >> 23) & 0xFF) - 127 + 15;
     uint32_t mant = (x >> 13) & 0x3FF;
     if (exp <= 0) return (uint16_t)sign;
-    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    if (exp >= 31) return (uint16_t)(sign | 0x7BFF); /* clamp to ±65504, avoid Inf */
     return (uint16_t)(sign | (exp << 10) | mant);
 }
 
@@ -315,7 +320,9 @@ static void ppd_gemm(float *dst, const uint16_t *W, const float *bias,
     }
 }
 
-/* ---- Threaded attention: head-parallel ---- */
+/* ---- Threaded attention: head-parallel, flash-attention style ---- */
+
+#define PPD_ATTN_TILE 64
 
 typedef struct {
     const float *qkv;
@@ -325,63 +332,236 @@ typedef struct {
     float scale;
 } ppd_attn_task;
 
+#if defined(__AVX2__) && defined(__FMA__)
+
+static inline float ppd_hsum_avx(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
 static void *ppd_attn_worker(void *arg) {
     ppd_attn_task *t = (ppd_attn_task *)arg;
     int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
-    float *att = (float *)malloc((size_t)N * sizeof(float));
+    float scale = t->scale;
+
+    /* Allocate contiguous K/V buffers for cache-friendly access */
+    float *K_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
+    float *V_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
+    float scores[PPD_ATTN_TILE];
 
     for (int h = t->h_start; h < t->h_end; h++) {
-        for (int qi = 0; qi < N; qi++) {
-            const float *q_h = t->qkv + qi * dim3 + h * hd;
-            for (int ki = 0; ki < N; ki++) {
-                const float *k_h = t->qkv + ki * dim3 + t->dim + h * hd;
-                float dot = 0.0f;
-                for (int d = 0; d < hd; d++) dot += q_h[d] * k_h[d];
-                att[ki] = dot * t->scale;
-            }
-            /* softmax */
-            float mx = att[0];
-            for (int i = 1; i < N; i++) if (att[i] > mx) mx = att[i];
-            float sum = 0.0f;
-            for (int i = 0; i < N; i++) { att[i] = expf(att[i] - mx); sum += att[i]; }
-            float inv = 1.0f / sum;
-            for (int i = 0; i < N; i++) att[i] *= inv;
-            /* V weighted sum */
-            float *out_h = t->attn_out + qi * t->dim + h * hd;
-            memset(out_h, 0, (size_t)hd * sizeof(float));
-            for (int vi = 0; vi < N; vi++) {
-                const float *v_h = t->qkv + vi * dim3 + 2 * t->dim + h * hd;
-                float w = att[vi];
-                for (int d = 0; d < hd; d++) out_h[d] += w * v_h[d];
+        /* Transpose K and V into contiguous per-head buffers */
+        for (int ki = 0; ki < N; ki++) {
+            const float *k_src = t->qkv + ki * dim3 + t->dim + h * hd;
+            const float *v_src = t->qkv + ki * dim3 + 2 * t->dim + h * hd;
+            float *k_dst = K_buf + ki * hd;
+            float *v_dst = V_buf + ki * hd;
+            for (int d = 0; d < hd; d += 8) {
+                _mm256_storeu_ps(k_dst + d, _mm256_loadu_ps(k_src + d));
+                _mm256_storeu_ps(v_dst + d, _mm256_loadu_ps(v_src + d));
             }
         }
+
+        /* Process each query with tiled online softmax */
+        for (int qi = 0; qi < N; qi++) {
+            const float *q_h = t->qkv + qi * dim3 + h * hd;
+
+            /* Load Q into registers (head_dim=64 → 8 __m256) */
+            __m256 q0 = _mm256_loadu_ps(q_h);
+            __m256 q1 = _mm256_loadu_ps(q_h + 8);
+            __m256 q2 = _mm256_loadu_ps(q_h + 16);
+            __m256 q3 = _mm256_loadu_ps(q_h + 24);
+            __m256 q4 = _mm256_loadu_ps(q_h + 32);
+            __m256 q5 = _mm256_loadu_ps(q_h + 40);
+            __m256 q6 = _mm256_loadu_ps(q_h + 48);
+            __m256 q7 = _mm256_loadu_ps(q_h + 56);
+
+            /* Accumulators for weighted V sum */
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+            __m256 acc4 = _mm256_setzero_ps();
+            __m256 acc5 = _mm256_setzero_ps();
+            __m256 acc6 = _mm256_setzero_ps();
+            __m256 acc7 = _mm256_setzero_ps();
+            float running_max = -FLT_MAX;
+            float running_sum = 0.0f;
+
+            for (int ki_base = 0; ki_base < N; ki_base += PPD_ATTN_TILE) {
+                int tile_end = ki_base + PPD_ATTN_TILE;
+                if (tile_end > N) tile_end = N;
+                int tile_len = tile_end - ki_base;
+
+                /* Compute Q @ K^T scores for this tile */
+                float tile_max = -FLT_MAX;
+                for (int j = 0; j < tile_len; j++) {
+                    const float *k_j = K_buf + (ki_base + j) * hd;
+                    __m256 dot = _mm256_mul_ps(q0, _mm256_loadu_ps(k_j));
+                    dot = _mm256_fmadd_ps(q1, _mm256_loadu_ps(k_j + 8), dot);
+                    dot = _mm256_fmadd_ps(q2, _mm256_loadu_ps(k_j + 16), dot);
+                    dot = _mm256_fmadd_ps(q3, _mm256_loadu_ps(k_j + 24), dot);
+                    dot = _mm256_fmadd_ps(q4, _mm256_loadu_ps(k_j + 32), dot);
+                    dot = _mm256_fmadd_ps(q5, _mm256_loadu_ps(k_j + 40), dot);
+                    dot = _mm256_fmadd_ps(q6, _mm256_loadu_ps(k_j + 48), dot);
+                    dot = _mm256_fmadd_ps(q7, _mm256_loadu_ps(k_j + 56), dot);
+                    float s = ppd_hsum_avx(dot) * scale;
+                    scores[j] = s;
+                    if (s > tile_max) tile_max = s;
+                }
+
+                /* Online softmax: rescale previous accumulator */
+                float new_max = running_max > tile_max ? running_max : tile_max;
+                float correction = expf(running_max - new_max);
+                __m256 vc = _mm256_set1_ps(correction);
+                running_sum *= correction;
+                acc0 = _mm256_mul_ps(acc0, vc);
+                acc1 = _mm256_mul_ps(acc1, vc);
+                acc2 = _mm256_mul_ps(acc2, vc);
+                acc3 = _mm256_mul_ps(acc3, vc);
+                acc4 = _mm256_mul_ps(acc4, vc);
+                acc5 = _mm256_mul_ps(acc5, vc);
+                acc6 = _mm256_mul_ps(acc6, vc);
+                acc7 = _mm256_mul_ps(acc7, vc);
+
+                /* Accumulate weighted V for this tile */
+                for (int j = 0; j < tile_len; j++) {
+                    float w = expf(scores[j] - new_max);
+                    running_sum += w;
+                    __m256 vw = _mm256_set1_ps(w);
+                    const float *v_j = V_buf + (ki_base + j) * hd;
+                    acc0 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j), acc0);
+                    acc1 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 8), acc1);
+                    acc2 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 16), acc2);
+                    acc3 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 24), acc3);
+                    acc4 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 32), acc4);
+                    acc5 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 40), acc5);
+                    acc6 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 48), acc6);
+                    acc7 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 56), acc7);
+                }
+                running_max = new_max;
+            }
+
+            /* Normalize by sum and store output */
+            float inv_sum = 1.0f / running_sum;
+            __m256 vinv = _mm256_set1_ps(inv_sum);
+            float *out_h = t->attn_out + qi * t->dim + h * hd;
+            _mm256_storeu_ps(out_h,      _mm256_mul_ps(acc0, vinv));
+            _mm256_storeu_ps(out_h + 8,  _mm256_mul_ps(acc1, vinv));
+            _mm256_storeu_ps(out_h + 16, _mm256_mul_ps(acc2, vinv));
+            _mm256_storeu_ps(out_h + 24, _mm256_mul_ps(acc3, vinv));
+            _mm256_storeu_ps(out_h + 32, _mm256_mul_ps(acc4, vinv));
+            _mm256_storeu_ps(out_h + 40, _mm256_mul_ps(acc5, vinv));
+            _mm256_storeu_ps(out_h + 48, _mm256_mul_ps(acc6, vinv));
+            _mm256_storeu_ps(out_h + 56, _mm256_mul_ps(acc7, vinv));
+        }
     }
-    free(att);
+    free(K_buf);
+    free(V_buf);
     return NULL;
 }
+
+#else /* Scalar fallback */
+
+static void *ppd_attn_worker(void *arg) {
+    ppd_attn_task *t = (ppd_attn_task *)arg;
+    int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
+    float scale = t->scale;
+
+    /* Allocate contiguous K/V buffers for cache-friendly access */
+    float *K_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
+    float *V_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
+    float scores[PPD_ATTN_TILE];
+
+    for (int h = t->h_start; h < t->h_end; h++) {
+        /* Transpose K and V into contiguous per-head buffers */
+        for (int ki = 0; ki < N; ki++) {
+            memcpy(K_buf + ki * hd, t->qkv + ki * dim3 + t->dim + h * hd,
+                   (size_t)hd * sizeof(float));
+            memcpy(V_buf + ki * hd, t->qkv + ki * dim3 + 2 * t->dim + h * hd,
+                   (size_t)hd * sizeof(float));
+        }
+
+        /* Process each query with tiled online softmax */
+        for (int qi = 0; qi < N; qi++) {
+            const float *q_h = t->qkv + qi * dim3 + h * hd;
+            float acc[64];
+            memset(acc, 0, (size_t)hd * sizeof(float));
+            float running_max = -FLT_MAX;
+            float running_sum = 0.0f;
+
+            for (int ki_base = 0; ki_base < N; ki_base += PPD_ATTN_TILE) {
+                int tile_end = ki_base + PPD_ATTN_TILE;
+                if (tile_end > N) tile_end = N;
+                int tile_len = tile_end - ki_base;
+
+                /* Compute Q @ K^T scores for this tile */
+                float tile_max = -FLT_MAX;
+                for (int j = 0; j < tile_len; j++) {
+                    const float *k_j = K_buf + (ki_base + j) * hd;
+                    float dot = 0.0f;
+                    for (int d = 0; d < hd; d++) dot += q_h[d] * k_j[d];
+                    float s = dot * scale;
+                    scores[j] = s;
+                    if (s > tile_max) tile_max = s;
+                }
+
+                /* Online softmax: rescale previous accumulator */
+                float new_max = running_max > tile_max ? running_max : tile_max;
+                float correction = expf(running_max - new_max);
+                running_sum *= correction;
+                for (int d = 0; d < hd; d++) acc[d] *= correction;
+
+                /* Accumulate weighted V for this tile */
+                for (int j = 0; j < tile_len; j++) {
+                    float w = expf(scores[j] - new_max);
+                    running_sum += w;
+                    const float *v_j = V_buf + (ki_base + j) * hd;
+                    for (int d = 0; d < hd; d++) acc[d] += w * v_j[d];
+                }
+                running_max = new_max;
+            }
+
+            /* Normalize by sum and store output */
+            float inv_sum = 1.0f / running_sum;
+            float *out_h = t->attn_out + qi * t->dim + h * hd;
+            for (int d = 0; d < hd; d++) out_h[d] = acc[d] * inv_sum;
+        }
+    }
+    free(K_buf);
+    free(V_buf);
+    return NULL;
+}
+
+#endif /* AVX2+FMA */
 
 static void ppd_attention(float *out, const float *qkv, int n_tok, int dim,
                            int n_heads, int head_dim, int n_threads) {
     float scale = 1.0f / sqrtf((float)head_dim);
-    if (n_threads <= 1 || n_heads < n_threads) {
+    if (n_threads <= 1) {
         ppd_attn_task task = {qkv, out, n_tok, dim, head_dim, n_heads,
                               0, n_heads, scale};
         ppd_attn_worker(&task);
         return;
     }
-    ppd_attn_task *tasks = (ppd_attn_task *)calloc((size_t)n_threads, sizeof(ppd_attn_task));
-    pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-    int heads_per = n_heads / n_threads;
-    int extra = n_heads % n_threads;
+    int nt = n_threads < n_heads ? n_threads : n_heads;
+    ppd_attn_task *tasks = (ppd_attn_task *)calloc((size_t)nt, sizeof(ppd_attn_task));
+    pthread_t *threads = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+    int heads_per = n_heads / nt;
+    int extra = n_heads % nt;
     int h = 0;
-    for (int i = 0; i < n_threads; i++) {
+    for (int i = 0; i < nt; i++) {
         int count = heads_per + (i < extra ? 1 : 0);
         tasks[i] = (ppd_attn_task){qkv, out, n_tok, dim, head_dim, n_heads,
                                     h, h + count, scale};
         h += count;
         pthread_create(&threads[i], NULL, ppd_attn_worker, &tasks[i]);
     }
-    for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
     free(tasks); free(threads);
 }
 
@@ -1208,9 +1388,6 @@ static void ppd_dit_step(ppd_model *m, float *pred, float *hidden,
         ppd_dit_block_forward(m, &m->dit_blocks[L], hidden, ln_buf, qkv,
                               attn_out, ffn_buf, proj_out, t_embed_silu,
                               pos_y_hi, pos_x_hi, dit_nt_hi, n_threads);
-        if (m->verbose >= 2)
-            fprintf(stderr, "  [cpu-hi%d] hidden[0..3]: %.4f %.4f %.4f %.4f\n",
-                    L, hidden[0], hidden[1], hidden[2], hidden[3]);
     }
     free(pos_y_hi); free(pos_x_hi);
 
