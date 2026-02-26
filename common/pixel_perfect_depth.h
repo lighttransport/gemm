@@ -107,6 +107,9 @@ void        ppd_result_free(ppd_result *r);
 #include <immintrin.h>
 #endif
 
+#define CPU_COMPUTE_IMPLEMENTATION
+#include "cpu_compute.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -144,61 +147,19 @@ static uint16_t *ppd_fp32_to_fp16(const float *src, int n) {
 /* LayerNorm: y = (x - mean) / sqrt(var + eps) * w + b */
 static void ppd_layernorm(float *dst, const float *src, const float *w,
                            const float *b, int n_tok, int dim, float eps) {
-    for (int t = 0; t < n_tok; t++) {
-        const float *x = src + t * dim;
-        float *y = dst + t * dim;
-        float mean = 0.0f;
-        for (int i = 0; i < dim; i++) mean += x[i];
-        mean /= dim;
-        float var = 0.0f;
-        for (int i = 0; i < dim; i++) { float d = x[i] - mean; var += d * d; }
-        var /= dim;
-        float inv = 1.0f / sqrtf(var + eps);
-        for (int i = 0; i < dim; i++)
-            y[i] = (x[i] - mean) * inv * w[i] + b[i];
-    }
+    cpu_layernorm(dst, src, w, b, n_tok, dim, eps);
 }
 
-/* GELU (tanh approximation): x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))) */
-static void ppd_gelu(float *x, int n) {
-    const float c = 0.7978845608f; /* sqrt(2/pi) */
-    for (int i = 0; i < n; i++) {
-        float v = x[i];
-        float t = tanhf(c * (v + 0.044715f * v * v * v));
-        x[i] = 0.5f * v * (1.0f + t);
-    }
-}
+/* GELU (tanh approximation) */
+static void ppd_gelu(float *x, int n) { cpu_gelu(x, n); }
 
 /* SiLU: x * sigmoid(x) */
-static void ppd_silu(float *x, int n) {
-    for (int i = 0; i < n; i++) {
-        float v = x[i];
-        x[i] = v / (1.0f + expf(-v));
-    }
-}
+static void ppd_silu(float *x, int n) { cpu_silu(x, n); }
 
 /* Bilinear resize for CHW float image */
 static void ppd_bilinear_resize(float *dst, const float *src,
                                   int C, int Hi, int Wi, int Ho, int Wo) {
-    for (int c = 0; c < C; c++) {
-        for (int oh = 0; oh < Ho; oh++) {
-            float fy = (Ho > 1) ? (float)oh * (Hi - 1) / (Ho - 1) : 0;
-            int y0 = (int)fy;
-            int y1 = (y0 + 1 < Hi) ? y0 + 1 : y0;
-            float dy = fy - y0;
-            for (int ow = 0; ow < Wo; ow++) {
-                float fx = (Wo > 1) ? (float)ow * (Wi - 1) / (Wo - 1) : 0;
-                int x0 = (int)fx;
-                int x1 = (x0 + 1 < Wi) ? x0 + 1 : x0;
-                float dx = fx - x0;
-                dst[c * Ho * Wo + oh * Wo + ow] =
-                    src[c * Hi * Wi + y0 * Wi + x0] * (1-dy) * (1-dx) +
-                    src[c * Hi * Wi + y0 * Wi + x1] * (1-dy) * dx +
-                    src[c * Hi * Wi + y1 * Wi + x0] * dy * (1-dx) +
-                    src[c * Hi * Wi + y1 * Wi + x1] * dy * dx;
-            }
-        }
-    }
+    cpu_bilinear_resize(dst, src, C, Hi, Wi, Ho, Wo);
 }
 
 /* Interpolate position embeddings from original grid to new grid */
@@ -271,351 +232,31 @@ static void ppd_generate_grid_pos(int *pos_y, int *pos_x, int gH, int gW) {
 
 /* ---- Threaded GEMM: Y[tok][row] = W[row,:] * X[tok,:] + bias[row] ---- */
 
-typedef struct {
-    float *dst;
-    const uint16_t *W;
-    const float *src;
-    int n_out, n_in, n_tok;
-    int r_start, r_end;
-} ppd_gemm_task;
-
-static void *ppd_gemm_worker(void *arg) {
-    ppd_gemm_task *t = (ppd_gemm_task *)arg;
-    int count = t->r_end - t->r_start;
-    if (count <= 0) return NULL;
-    gemm_f16_f32_tokmajor(t->dst + t->r_start,
-                           t->W + (size_t)t->r_start * t->n_in,
-                           t->src,
-                           count, t->n_in, t->n_tok,
-                           t->n_out, t->n_in);
-    return NULL;
-}
-
 static void ppd_gemm(float *dst, const uint16_t *W, const float *bias,
                       const float *src, int n_tok, int n_out, int n_in,
                       int n_threads) {
-    if (n_threads > 1 && n_out >= n_threads * 3) {
-        ppd_gemm_task *tasks = (ppd_gemm_task *)calloc((size_t)n_threads, sizeof(ppd_gemm_task));
-        pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-        int rows_per = ((n_out / n_threads) / 3) * 3;
-        if (rows_per < 3) rows_per = 3;
-        int r = 0, actual = 0;
-        for (int i = 0; i < n_threads && r < n_out; i++) {
-            int end = (i == n_threads - 1) ? n_out : r + rows_per;
-            if (end > n_out) end = n_out;
-            tasks[i] = (ppd_gemm_task){dst, W, src, n_out, n_in, n_tok, r, end};
-            pthread_create(&threads[i], NULL, ppd_gemm_worker, &tasks[i]);
-            r = end;
-            actual = i + 1;
-        }
-        for (int i = 0; i < actual; i++) pthread_join(threads[i], NULL);
-        free(tasks); free(threads);
-    } else {
-        gemm_f16_f32_tokmajor(dst, W, src, n_out, n_in, n_tok, n_out, n_in);
-    }
-    if (bias) {
-        for (int t = 0; t < n_tok; t++)
-            for (int i = 0; i < n_out; i++)
-                dst[t * n_out + i] += bias[i];
-    }
+    cpu_gemm_f16(dst, W, bias, src, n_tok, n_out, n_in, n_threads);
 }
 
 /* ---- Threaded attention: head-parallel, flash-attention style ---- */
 
-#define PPD_ATTN_TILE 64
-
-typedef struct {
-    const float *qkv;
-    float *attn_out;
-    int n_tok, dim, head_dim, n_heads;
-    int h_start, h_end;
-    float scale;
-} ppd_attn_task;
-
-#if defined(__AVX2__) && defined(__FMA__)
-
-static inline float ppd_hsum_avx(__m256 v) {
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 s = _mm_add_ps(lo, hi);
-    s = _mm_hadd_ps(s, s);
-    s = _mm_hadd_ps(s, s);
-    return _mm_cvtss_f32(s);
-}
-
-static void *ppd_attn_worker(void *arg) {
-    ppd_attn_task *t = (ppd_attn_task *)arg;
-    int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
-    float scale = t->scale;
-
-    /* Allocate contiguous K/V buffers for cache-friendly access */
-    float *K_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
-    float *V_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
-    float scores[PPD_ATTN_TILE];
-
-    for (int h = t->h_start; h < t->h_end; h++) {
-        /* Transpose K and V into contiguous per-head buffers */
-        for (int ki = 0; ki < N; ki++) {
-            const float *k_src = t->qkv + ki * dim3 + t->dim + h * hd;
-            const float *v_src = t->qkv + ki * dim3 + 2 * t->dim + h * hd;
-            float *k_dst = K_buf + ki * hd;
-            float *v_dst = V_buf + ki * hd;
-            for (int d = 0; d < hd; d += 8) {
-                _mm256_storeu_ps(k_dst + d, _mm256_loadu_ps(k_src + d));
-                _mm256_storeu_ps(v_dst + d, _mm256_loadu_ps(v_src + d));
-            }
-        }
-
-        /* Process each query with tiled online softmax */
-        for (int qi = 0; qi < N; qi++) {
-            const float *q_h = t->qkv + qi * dim3 + h * hd;
-
-            /* Load Q into registers (head_dim=64 → 8 __m256) */
-            __m256 q0 = _mm256_loadu_ps(q_h);
-            __m256 q1 = _mm256_loadu_ps(q_h + 8);
-            __m256 q2 = _mm256_loadu_ps(q_h + 16);
-            __m256 q3 = _mm256_loadu_ps(q_h + 24);
-            __m256 q4 = _mm256_loadu_ps(q_h + 32);
-            __m256 q5 = _mm256_loadu_ps(q_h + 40);
-            __m256 q6 = _mm256_loadu_ps(q_h + 48);
-            __m256 q7 = _mm256_loadu_ps(q_h + 56);
-
-            /* Accumulators for weighted V sum */
-            __m256 acc0 = _mm256_setzero_ps();
-            __m256 acc1 = _mm256_setzero_ps();
-            __m256 acc2 = _mm256_setzero_ps();
-            __m256 acc3 = _mm256_setzero_ps();
-            __m256 acc4 = _mm256_setzero_ps();
-            __m256 acc5 = _mm256_setzero_ps();
-            __m256 acc6 = _mm256_setzero_ps();
-            __m256 acc7 = _mm256_setzero_ps();
-            float running_max = -FLT_MAX;
-            float running_sum = 0.0f;
-
-            for (int ki_base = 0; ki_base < N; ki_base += PPD_ATTN_TILE) {
-                int tile_end = ki_base + PPD_ATTN_TILE;
-                if (tile_end > N) tile_end = N;
-                int tile_len = tile_end - ki_base;
-
-                /* Compute Q @ K^T scores for this tile */
-                float tile_max = -FLT_MAX;
-                for (int j = 0; j < tile_len; j++) {
-                    const float *k_j = K_buf + (ki_base + j) * hd;
-                    __m256 dot = _mm256_mul_ps(q0, _mm256_loadu_ps(k_j));
-                    dot = _mm256_fmadd_ps(q1, _mm256_loadu_ps(k_j + 8), dot);
-                    dot = _mm256_fmadd_ps(q2, _mm256_loadu_ps(k_j + 16), dot);
-                    dot = _mm256_fmadd_ps(q3, _mm256_loadu_ps(k_j + 24), dot);
-                    dot = _mm256_fmadd_ps(q4, _mm256_loadu_ps(k_j + 32), dot);
-                    dot = _mm256_fmadd_ps(q5, _mm256_loadu_ps(k_j + 40), dot);
-                    dot = _mm256_fmadd_ps(q6, _mm256_loadu_ps(k_j + 48), dot);
-                    dot = _mm256_fmadd_ps(q7, _mm256_loadu_ps(k_j + 56), dot);
-                    float s = ppd_hsum_avx(dot) * scale;
-                    scores[j] = s;
-                    if (s > tile_max) tile_max = s;
-                }
-
-                /* Online softmax: rescale previous accumulator */
-                float new_max = running_max > tile_max ? running_max : tile_max;
-                float correction = expf(running_max - new_max);
-                __m256 vc = _mm256_set1_ps(correction);
-                running_sum *= correction;
-                acc0 = _mm256_mul_ps(acc0, vc);
-                acc1 = _mm256_mul_ps(acc1, vc);
-                acc2 = _mm256_mul_ps(acc2, vc);
-                acc3 = _mm256_mul_ps(acc3, vc);
-                acc4 = _mm256_mul_ps(acc4, vc);
-                acc5 = _mm256_mul_ps(acc5, vc);
-                acc6 = _mm256_mul_ps(acc6, vc);
-                acc7 = _mm256_mul_ps(acc7, vc);
-
-                /* Accumulate weighted V for this tile */
-                for (int j = 0; j < tile_len; j++) {
-                    float w = expf(scores[j] - new_max);
-                    running_sum += w;
-                    __m256 vw = _mm256_set1_ps(w);
-                    const float *v_j = V_buf + (ki_base + j) * hd;
-                    acc0 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j), acc0);
-                    acc1 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 8), acc1);
-                    acc2 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 16), acc2);
-                    acc3 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 24), acc3);
-                    acc4 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 32), acc4);
-                    acc5 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 40), acc5);
-                    acc6 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 48), acc6);
-                    acc7 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + 56), acc7);
-                }
-                running_max = new_max;
-            }
-
-            /* Normalize by sum and store output */
-            float inv_sum = 1.0f / running_sum;
-            __m256 vinv = _mm256_set1_ps(inv_sum);
-            float *out_h = t->attn_out + qi * t->dim + h * hd;
-            _mm256_storeu_ps(out_h,      _mm256_mul_ps(acc0, vinv));
-            _mm256_storeu_ps(out_h + 8,  _mm256_mul_ps(acc1, vinv));
-            _mm256_storeu_ps(out_h + 16, _mm256_mul_ps(acc2, vinv));
-            _mm256_storeu_ps(out_h + 24, _mm256_mul_ps(acc3, vinv));
-            _mm256_storeu_ps(out_h + 32, _mm256_mul_ps(acc4, vinv));
-            _mm256_storeu_ps(out_h + 40, _mm256_mul_ps(acc5, vinv));
-            _mm256_storeu_ps(out_h + 48, _mm256_mul_ps(acc6, vinv));
-            _mm256_storeu_ps(out_h + 56, _mm256_mul_ps(acc7, vinv));
-        }
-    }
-    free(K_buf);
-    free(V_buf);
-    return NULL;
-}
-
-#else /* Scalar fallback */
-
-static void *ppd_attn_worker(void *arg) {
-    ppd_attn_task *t = (ppd_attn_task *)arg;
-    int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
-    float scale = t->scale;
-
-    /* Allocate contiguous K/V buffers for cache-friendly access */
-    float *K_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
-    float *V_buf = (float *)malloc((size_t)N * (size_t)hd * sizeof(float));
-    float scores[PPD_ATTN_TILE];
-
-    for (int h = t->h_start; h < t->h_end; h++) {
-        /* Transpose K and V into contiguous per-head buffers */
-        for (int ki = 0; ki < N; ki++) {
-            memcpy(K_buf + ki * hd, t->qkv + ki * dim3 + t->dim + h * hd,
-                   (size_t)hd * sizeof(float));
-            memcpy(V_buf + ki * hd, t->qkv + ki * dim3 + 2 * t->dim + h * hd,
-                   (size_t)hd * sizeof(float));
-        }
-
-        /* Process each query with tiled online softmax */
-        for (int qi = 0; qi < N; qi++) {
-            const float *q_h = t->qkv + qi * dim3 + h * hd;
-            float acc[64];
-            memset(acc, 0, (size_t)hd * sizeof(float));
-            float running_max = -FLT_MAX;
-            float running_sum = 0.0f;
-
-            for (int ki_base = 0; ki_base < N; ki_base += PPD_ATTN_TILE) {
-                int tile_end = ki_base + PPD_ATTN_TILE;
-                if (tile_end > N) tile_end = N;
-                int tile_len = tile_end - ki_base;
-
-                /* Compute Q @ K^T scores for this tile */
-                float tile_max = -FLT_MAX;
-                for (int j = 0; j < tile_len; j++) {
-                    const float *k_j = K_buf + (ki_base + j) * hd;
-                    float dot = 0.0f;
-                    for (int d = 0; d < hd; d++) dot += q_h[d] * k_j[d];
-                    float s = dot * scale;
-                    scores[j] = s;
-                    if (s > tile_max) tile_max = s;
-                }
-
-                /* Online softmax: rescale previous accumulator */
-                float new_max = running_max > tile_max ? running_max : tile_max;
-                float correction = expf(running_max - new_max);
-                running_sum *= correction;
-                for (int d = 0; d < hd; d++) acc[d] *= correction;
-
-                /* Accumulate weighted V for this tile */
-                for (int j = 0; j < tile_len; j++) {
-                    float w = expf(scores[j] - new_max);
-                    running_sum += w;
-                    const float *v_j = V_buf + (ki_base + j) * hd;
-                    for (int d = 0; d < hd; d++) acc[d] += w * v_j[d];
-                }
-                running_max = new_max;
-            }
-
-            /* Normalize by sum and store output */
-            float inv_sum = 1.0f / running_sum;
-            float *out_h = t->attn_out + qi * t->dim + h * hd;
-            for (int d = 0; d < hd; d++) out_h[d] = acc[d] * inv_sum;
-        }
-    }
-    free(K_buf);
-    free(V_buf);
-    return NULL;
-}
-
-#endif /* AVX2+FMA */
-
 static void ppd_attention(float *out, const float *qkv, int n_tok, int dim,
                            int n_heads, int head_dim, int n_threads) {
-    float scale = 1.0f / sqrtf((float)head_dim);
-    if (n_threads <= 1) {
-        ppd_attn_task task = {qkv, out, n_tok, dim, head_dim, n_heads,
-                              0, n_heads, scale};
-        ppd_attn_worker(&task);
-        return;
-    }
-    int nt = n_threads < n_heads ? n_threads : n_heads;
-    ppd_attn_task *tasks = (ppd_attn_task *)calloc((size_t)nt, sizeof(ppd_attn_task));
-    pthread_t *threads = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
-    int heads_per = n_heads / nt;
-    int extra = n_heads % nt;
-    int h = 0;
-    for (int i = 0; i < nt; i++) {
-        int count = heads_per + (i < extra ? 1 : 0);
-        tasks[i] = (ppd_attn_task){qkv, out, n_tok, dim, head_dim, n_heads,
-                                    h, h + count, scale};
-        h += count;
-        pthread_create(&threads[i], NULL, ppd_attn_worker, &tasks[i]);
-    }
-    for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
-    free(tasks); free(threads);
+    cpu_attention(out, qkv, n_tok, dim, n_heads, head_dim, n_threads);
 }
 
 /* Per-head QK LayerNorm on Q or K within interleaved QKV buffer */
 static void ppd_qk_norm(float *qkv, const float *w, const float *b,
                           int n_tok, int n_heads, int head_dim, int stride,
                           float eps) {
-    for (int t = 0; t < n_tok; t++) {
-        for (int h = 0; h < n_heads; h++) {
-            float *v = qkv + t * stride + h * head_dim;
-            float mean = 0.0f;
-            for (int i = 0; i < head_dim; i++) mean += v[i];
-            mean /= head_dim;
-            float var = 0.0f;
-            for (int i = 0; i < head_dim; i++) { float d = v[i] - mean; var += d * d; }
-            var /= head_dim;
-            float s = 1.0f / sqrtf(var + eps);
-            for (int i = 0; i < head_dim; i++)
-                v[i] = (v[i] - mean) * s * w[i] + b[i];
-        }
-    }
+    cpu_qk_norm(qkv, n_tok, n_heads, head_dim, stride, w, b, eps);
 }
 
 /* 2D RoPE: separate Y and X rotations within each head */
 static void ppd_rope_2d(float *vec, int n_tok, int n_heads, int head_dim,
                           int stride, const int *pos_y, const int *pos_x,
                           float freq_base) {
-    int half = head_dim / 2;
-    int quarter = half / 2;
-    for (int t = 0; t < n_tok; t++) {
-        float py = (float)pos_y[t];
-        float px = (float)pos_x[t];
-        for (int h = 0; h < n_heads; h++) {
-            float *v = vec + t * stride + h * head_dim;
-            /* Y rotation: first half */
-            for (int j = 0; j < quarter; j++) {
-                float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)half);
-                float theta = py * freq;
-                float c = cosf(theta), s = sinf(theta);
-                float v0 = v[j], v1 = v[j + quarter];
-                v[j]           = v0 * c - v1 * s;
-                v[j + quarter] = v0 * s + v1 * c;
-            }
-            /* X rotation: second half */
-            for (int j = 0; j < quarter; j++) {
-                float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)half);
-                float theta = px * freq;
-                float c = cosf(theta), s = sinf(theta);
-                float v0 = v[half + j], v1 = v[half + j + quarter];
-                v[half + j]           = v0 * c - v1 * s;
-                v[half + j + quarter] = v0 * s + v1 * c;
-            }
-        }
-    }
+    cpu_rope_2d(vec, n_tok, n_heads, head_dim, stride, pos_y, pos_x, freq_base);
 }
 
 /* adaLN: y = LN(x) * (1 + scale) + shift */
