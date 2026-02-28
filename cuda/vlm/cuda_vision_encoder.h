@@ -29,6 +29,10 @@ typedef struct cuda_vision_runner cuda_vision_runner;
  * use_f16: 0=F32 weights (exact match with CPU), 1=F16 weights (faster, ~1e-2 error) */
 cuda_vision_runner *cuda_vision_init(int device_id, int verbose, int use_f16);
 
+/* Set maximum pixel budget for dynamic resolution. Must be called BEFORE load_weights.
+ * max_pixels=0 means use model default (image_size^2). */
+void cuda_vision_set_max_pixels(cuda_vision_runner *r, int max_pixels);
+
 /* Load model weights from GGUF. Returns 0 on success, -1 on error. */
 int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *mmproj_gguf);
 
