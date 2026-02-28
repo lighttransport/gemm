@@ -97,7 +97,7 @@ static const char *cuda_vlm_specific_kernels =
 "    }\n"
 "}\n"
 "\n"
-"/* ---- add_pos_embd: add position embeddings ---- */\n"
+"/* ---- add_pos_embd: add position embeddings via indirection map ---- */\n"
 "/* Grid: (n_patches), Block: (256) */\n"
 "__global__ void add_pos_embd(float *hidden, const float *pos_emb,\n"
 "                               const int *pos_map, int dim) {\n"
@@ -106,6 +106,16 @@ static const char *cuda_vlm_specific_kernels =
 "    int tid = threadIdx.x;\n"
 "    for (int d = tid; d < dim; d += blockDim.x)\n"
 "        hidden[p * dim + d] += pos_emb[orig_p * dim + d];\n"
+"}\n"
+"\n"
+"/* ---- add_pos_embd_direct: add pre-interpolated position embeddings ---- */\n"
+"/* Grid: (n_patches), Block: (256) */\n"
+"__global__ void add_pos_embd_direct(float *hidden, const float *pos_emb,\n"
+"                                      int dim, int n) {\n"
+"    int p = blockIdx.x;\n"
+"    if (p >= n) return;\n"
+"    for (int d = threadIdx.x; d < dim; d += blockDim.x)\n"
+"        hidden[p * dim + d] += pos_emb[p * dim + d];\n"
 "}\n"
 "\n"
 "/* ---- rope_vision_f32: M-RoPE on Q and K ---- */\n"
@@ -264,6 +274,7 @@ struct cuda_vision_runner {
     CUfunction fn_gemm_f32_f32;
     CUfunction fn_patch_embed_dual_f32;
     CUfunction fn_add_pos_embd;
+    CUfunction fn_add_pos_embd_direct;
     CUfunction fn_rope_vision_f32;
     CUfunction fn_attn_full_f32;
     CUfunction fn_spatial_merge_f32;
@@ -283,6 +294,13 @@ struct cuda_vision_runner {
     float ln_eps;
     float image_mean[3];
     float image_std[3];
+
+    /* Dynamic resolution support */
+    int max_patches;           /* max patches for buffer allocation (0 = use n_patches) */
+    int max_merged;            /* max merged tokens */
+    int max_pixels;            /* max pixel count for RGB buffer */
+    float *h_pos_embd;         /* CPU copy of original pos embedding [n_patches * dim] */
+    CUdeviceptr d_pos_interp;  /* GPU buffer for interpolated pos embedding [max_patches * dim] */
 
     /* GPU weights: patch embeddings */
     CUdeviceptr d_patch_w0;     /* F32 [dim, ps*ps*3] */
@@ -413,6 +431,7 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
     GET_FN(gemm_f32_f32);
     GET_FN(patch_embed_dual_f32);
     GET_FN(add_pos_embd);
+    GET_FN(add_pos_embd_direct);
     GET_FN(rope_vision_f32);
     GET_FN(attn_full_f32);
     GET_FN(spatial_merge_f32);
@@ -420,7 +439,7 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 11, sm);
+        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 12, sm);
     return 0;
 }
 
@@ -580,6 +599,10 @@ cuda_vision_runner *cuda_vision_init(int device_id, int verbose, int use_f16) {
     return r;
 }
 
+void cuda_vision_set_max_pixels(cuda_vision_runner *r, int max_pixels) {
+    if (r) r->max_pixels = max_pixels;
+}
+
 /* ======================================================================== */
 /* Public API: load_weights                                                 */
 /* ======================================================================== */
@@ -604,6 +627,14 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
     r->n_patches = gs * gs;
     r->n_merged  = r->n_patches / (r->spatial_merge * r->spatial_merge);
 
+    /* Compute max buffer sizes for dynamic resolution */
+    {
+        int mp = r->max_pixels > 0 ? r->max_pixels / (ps * ps) : r->n_patches;
+        if (mp < r->n_patches) mp = r->n_patches;
+        r->max_patches = mp;
+        r->max_merged = mp / (r->spatial_merge * r->spatial_merge);
+    }
+
     /* Image mean/std */
     int idx = gguf_find_key(g, "clip.vision.image_mean");
     if (idx >= 0) {
@@ -616,12 +647,14 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
         r->image_std[0] = d[0]; r->image_std[1] = d[1]; r->image_std[2] = d[2];
     }
 
-    fprintf(stderr, "cuda_vlm: dim=%d heads=%d blocks=%d ffn=%d patch=%d image=%d patches=%d merged=%d proj=%d f16=%d\n",
+    fprintf(stderr, "cuda_vlm: dim=%d heads=%d blocks=%d ffn=%d patch=%d image=%d patches=%d merged=%d proj=%d f16=%d max_patches=%d\n",
             r->dim, r->n_heads, r->n_blocks, r->ffn_dim,
-            r->patch_size, r->image_size, r->n_patches, r->n_merged, r->proj_dim, r->use_f16);
+            r->patch_size, r->image_size, r->n_patches, r->n_merged, r->proj_dim, r->use_f16,
+            r->max_patches);
 
     int dim = r->dim;
-    int np = r->n_patches;
+    int mp = r->max_patches;
+    int max_merged = r->max_merged;
     int sm = r->spatial_merge;
     int merged_dim = dim * sm * sm;
 
@@ -635,9 +668,15 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
     if (t_pw1.data)
         fprintf(stderr, "cuda_vlm: loaded dual conv2d patch embeddings\n");
 
-    /* Position embedding (always F32) */
+    /* Position embedding (always F32) — keep CPU copy for interpolation */
     vlm_tensor_info t_pos = vlm_get_tensor(g, "v.position_embd.weight", 1);
     r->d_pos_embd = vlm_upload_f32(&t_pos);
+    r->h_pos_embd = (float *)malloc(t_pos.n_elem * sizeof(float));
+    if (t_pos.type == GGML_TYPE_F32) {
+        memcpy(r->h_pos_embd, t_pos.data, t_pos.n_elem * sizeof(float));
+    } else {
+        dequant_row(t_pos.type, t_pos.data, r->h_pos_embd, t_pos.n_elem);
+    }
 
     /* Blocks */
     r->blocks = (gpu_vit_block *)calloc(r->n_blocks, sizeof(gpu_vit_block));
@@ -747,29 +786,33 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
     tb = vlm_get_tensor(g, "mm.2.bias", 1);
     r->mm2 = vlm_upload_weight(&tw, &tb, r->use_f16);
 
-    /* Allocate scratch buffers */
-    CHECK_CU(cuMemAlloc(&r->d_hidden,    (size_t)np * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_hidden2,   (size_t)np * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_qkv,       (size_t)np * 3 * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_attn_out,  (size_t)np * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_ffn_buf,   (size_t)np * r->ffn_dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_ln_buf,    (size_t)np * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_merge_buf, (size_t)r->n_merged * merged_dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_mm_buf,    (size_t)r->n_merged * merged_dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_mm_out,    (size_t)r->n_merged * r->proj_dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_rgb,       (size_t)r->image_size * r->image_size * 3 * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_rope_cos,  (size_t)np * r->head_dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_rope_sin,  (size_t)np * r->head_dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_pos_map,   (size_t)np * sizeof(int)));
+    /* Allocate scratch buffers (sized for max_patches, not n_patches) */
+    {
+        size_t rgb_pixels = r->max_pixels > 0 ? (size_t)r->max_pixels : (size_t)r->image_size * r->image_size;
+        CHECK_CU(cuMemAlloc(&r->d_hidden,    (size_t)mp * dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_hidden2,   (size_t)mp * dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_qkv,       (size_t)mp * 3 * dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_attn_out,  (size_t)mp * dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ffn_buf,   (size_t)mp * r->ffn_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ln_buf,    (size_t)mp * dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_merge_buf, (size_t)max_merged * merged_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_mm_buf,    (size_t)max_merged * merged_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_mm_out,    (size_t)max_merged * r->proj_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_rgb,       rgb_pixels * 3 * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_rope_cos,  (size_t)mp * r->head_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_rope_sin,  (size_t)mp * r->head_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_pos_map,   (size_t)mp * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&r->d_pos_interp,(size_t)mp * dim * sizeof(float)));
+    }
 
     /* DeepStack feature buffer */
     if (r->n_deepstack > 0) {
         CHECK_CU(cuMemAlloc(&r->d_ds_feats,
-            (size_t)r->n_merged * r->n_deepstack * r->proj_dim * sizeof(float)));
+            (size_t)max_merged * r->n_deepstack * r->proj_dim * sizeof(float)));
     }
 
     int total_embd = r->proj_dim * (1 + r->n_deepstack);
-    r->h_output = (float *)malloc((size_t)r->n_merged * total_embd * sizeof(float));
+    r->h_output = (float *)malloc((size_t)max_merged * total_embd * sizeof(float));
 
     r->loaded = 1;
     fprintf(stderr, "cuda_vlm: weights loaded, VRAM for weights ~%.1f MB\n",
@@ -837,8 +880,8 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     int merged_dim = dim * sm * sm;
     int n_merged = n_patches / (sm * sm);
 
-    if (n_patches > r->n_patches) {
-        fprintf(stderr, "cuda_vlm: too many patches %d (max %d)\n", n_patches, r->n_patches);
+    if (n_patches > r->max_patches) {
+        fprintf(stderr, "cuda_vlm: too many patches %d (max %d)\n", n_patches, r->max_patches);
         return NULL;
     }
 
@@ -873,25 +916,65 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                 dbg[0], dbg[1], dbg[2], dbg[3]);
     }
 
-    /* 3. Position embeddings */
+    /* 3. Position embeddings (bilinear interpolation for dynamic resolution) */
     fprintf(stderr, "  position embeddings...\n");
     {
-        /* Build position map on host: for each patch in current grid,
-         * map to position in original full grid */
         int orig_gw = r->image_size / ps;
-        int *pos_map = (int *)malloc(n_patches * sizeof(int));
-        for (int py = 0; py < gh; py++)
-            for (int px = 0; px < gw; px++)
-                pos_map[py * gw + px] = py * orig_gw + px;
-        cuMemcpyHtoD(r->d_pos_map, pos_map, n_patches * sizeof(int));
-        free(pos_map);
+        int orig_gh = orig_gw;  /* original grid is square */
 
-        void *args[] = { &r->d_hidden, &r->d_pos_embd, &r->d_pos_map, &dim };
-        cuLaunchKernel(r->fn_add_pos_embd,
-                       n_patches, 1, 1,
-                       256, 1, 1,
-                       0, r->stream,
-                       args, NULL);
+        if (gw == orig_gw && gh == orig_gh) {
+            /* Exact match: use direct indirection (no interpolation needed) */
+            int *pos_map = (int *)malloc(n_patches * sizeof(int));
+            for (int py = 0; py < gh; py++)
+                for (int px = 0; px < gw; px++)
+                    pos_map[py * gw + px] = py * orig_gw + px;
+            cuMemcpyHtoD(r->d_pos_map, pos_map, n_patches * sizeof(int));
+            free(pos_map);
+
+            void *args[] = { &r->d_hidden, &r->d_pos_embd, &r->d_pos_map, &dim };
+            cuLaunchKernel(r->fn_add_pos_embd,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+        } else {
+            /* Bilinear interpolation on CPU, upload to d_pos_interp */
+            fprintf(stderr, "  interpolating pos embedding: %dx%d -> %dx%d\n",
+                    orig_gw, orig_gh, gw, gh);
+            float *interp = (float *)malloc((size_t)n_patches * dim * sizeof(float));
+            for (int py = 0; py < gh; py++) {
+                float sy = (float)py * (orig_gh - 1) / (gh > 1 ? gh - 1 : 1);
+                int y0 = (int)sy, y1 = (y0 + 1 < orig_gh) ? y0 + 1 : y0;
+                float wy = sy - y0;
+                for (int px = 0; px < gw; px++) {
+                    float sx = (float)px * (orig_gw - 1) / (gw > 1 ? gw - 1 : 1);
+                    int x0 = (int)sx, x1 = (x0 + 1 < orig_gw) ? x0 + 1 : x0;
+                    float wx = sx - x0;
+                    int dst_idx = (py * gw + px) * dim;
+                    int s00 = (y0 * orig_gw + x0) * dim;
+                    int s01 = (y0 * orig_gw + x1) * dim;
+                    int s10 = (y1 * orig_gw + x0) * dim;
+                    int s11 = (y1 * orig_gw + x1) * dim;
+                    for (int d = 0; d < dim; d++) {
+                        interp[dst_idx + d] =
+                            r->h_pos_embd[s00+d] * (1-wy)*(1-wx) +
+                            r->h_pos_embd[s01+d] * (1-wy)*wx +
+                            r->h_pos_embd[s10+d] * wy*(1-wx) +
+                            r->h_pos_embd[s11+d] * wy*wx;
+                    }
+                }
+            }
+            cuMemcpyHtoD(r->d_pos_interp, interp, (size_t)n_patches * dim * sizeof(float));
+            free(interp);
+
+            /* Add interpolated pos embedding directly (no pos_map needed) */
+            void *args[] = { &r->d_hidden, &r->d_pos_interp, &dim, &n_patches };
+            cuLaunchKernel(r->fn_add_pos_embd_direct,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+        }
     }
 
     /* 4. Precompute M-RoPE cos/sin on host, upload to GPU */
@@ -1325,8 +1408,10 @@ void cuda_vision_free(cuda_vision_runner *r) {
     if (r->d_rope_cos) cuMemFree(r->d_rope_cos);
     if (r->d_rope_sin) cuMemFree(r->d_rope_sin);
     if (r->d_pos_map) cuMemFree(r->d_pos_map);
+    if (r->d_pos_interp) cuMemFree(r->d_pos_interp);
     if (r->d_ds_feats) cuMemFree(r->d_ds_feats);
 
+    free(r->h_pos_embd);
     free(r->h_output);
 
     /* Destroy CUDA objects */
