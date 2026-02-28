@@ -105,6 +105,7 @@ void dequantize_row_q8_0(const void *src, float *dst, int n);
 void dequantize_row_q4_K(const void *src, float *dst, int n);
 void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q6_K(const void *src, float *dst, int n);
+void dequantize_row_bf16(const void *src, float *dst, int n);
 
 /* Dequantize a row. Returns 0 on success, -1 if type unsupported. */
 int dequant_row(uint32_t ggml_type, const void *src, float *dst, int n);
@@ -121,6 +122,7 @@ static inline size_t dequant_row_size(uint32_t type, int n) {
         case GGML_TYPE_Q6_K: bs = 256; ts = 210; break;
         case GGML_TYPE_F32:  bs = 1;   ts = 4;   break;
         case GGML_TYPE_F16:  bs = 1;   ts = 2;   break;
+        case GGML_TYPE_BF16: bs = 1;  ts = 2;   break;
         default: return 0;
     }
     return (size_t)((n + bs - 1) / bs) * ts;
@@ -1215,6 +1217,14 @@ void dequantize_row_q6_K(const void *src, float *dst, int n) {
     }
 }
 
+void dequantize_row_bf16(const void *src, float *dst, int n) {
+    const uint16_t *s = (const uint16_t *)src;
+    for (int i = 0; i < n; i++) {
+        uint32_t bits = (uint32_t)s[i] << 16;  /* BF16 → F32: pad mantissa with zeros */
+        memcpy(&dst[i], &bits, sizeof(float));
+    }
+}
+
 int dequant_row(uint32_t type, const void *src, float *dst, int n) {
     switch (type) {
         case GGML_TYPE_Q2_K:
@@ -1243,6 +1253,9 @@ int dequant_row(uint32_t type, const void *src, float *dst, int n) {
             for (int i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(s[i]);
             return 0;
         }
+        case GGML_TYPE_BF16:
+            dequantize_row_bf16(src, dst, n);
+            return 0;
         default:
             return -1;
     }

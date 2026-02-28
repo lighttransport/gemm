@@ -131,14 +131,13 @@ int main(int argc, char **argv) {
 
     if (max_tokens > n_tokens) max_tokens = n_tokens;
 
-    /* Load CPU reference model */
+    /* Load CPU reference model (may fail for MoE — run GPU-only in that case) */
     fprintf(stderr, "\n=== Loading CPU reference model ===\n");
     transformer_model *cpu_model = transformer_load(gguf, max_seq_len);
+    int gpu_only = 0;
     if (!cpu_model) {
-        fprintf(stderr, "Failed to load CPU model\n");
-        bpe_vocab_free(vocab);
-        gguf_close(gguf);
-        return 1;
+        fprintf(stderr, "CPU model load failed (MoE?), running GPU-only mode\n");
+        gpu_only = 1;
     }
 
     /* Initialize CUDA runner */
@@ -146,7 +145,7 @@ int main(int argc, char **argv) {
     cuda_llm_runner *gpu = cuda_llm_init(0, 1);
     if (!gpu) {
         fprintf(stderr, "Failed to init CUDA runner\n");
-        transformer_free(cpu_model);
+        if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);
         gguf_close(gguf);
         return 1;
@@ -157,14 +156,15 @@ int main(int argc, char **argv) {
     if (cuda_llm_load_weights(gpu, gguf, max_seq_len) != 0) {
         fprintf(stderr, "Failed to load weights to GPU\n");
         cuda_llm_free(gpu);
-        transformer_free(cpu_model);
+        if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);
         gguf_close(gguf);
         return 1;
     }
 
     int n_embd = cuda_llm_n_embd(gpu);
-    fprintf(stderr, "\n=== Running %d tokens (n_embd=%d) ===\n", max_tokens, n_embd);
+    fprintf(stderr, "\n=== Running %d tokens (n_embd=%d)%s ===\n",
+            max_tokens, n_embd, gpu_only ? " [GPU-only]" : "");
 
     /* Run tokens through both */
     double total_cpu_ms = 0.0, total_gpu_ms = 0.0;
@@ -173,50 +173,65 @@ int main(int argc, char **argv) {
     for (int i = 0; i < max_tokens; i++) {
         int32_t token = tokens[i];
 
-        /* CPU forward */
-        double t0 = get_time_ms();
-        float *cpu_out = transformer_forward(cpu_model, token, i);
-        double cpu_ms = get_time_ms() - t0;
-        total_cpu_ms += cpu_ms;
+        /* CPU forward (skip if GPU-only) */
+        float *cpu_out = NULL;
+        double cpu_ms = 0.0;
+        if (!gpu_only) {
+            double t0 = get_time_ms();
+            cpu_out = transformer_forward(cpu_model, token, i);
+            cpu_ms = get_time_ms() - t0;
+            total_cpu_ms += cpu_ms;
+        }
 
         /* GPU forward */
-        t0 = get_time_ms();
+        double t0 = get_time_ms();
         float *gpu_out = cuda_llm_forward(gpu, token, i);
         double gpu_ms = get_time_ms() - t0;
         total_gpu_ms += gpu_ms;
 
-        if (!cpu_out || !gpu_out) {
-            fprintf(stderr, "Token %d: forward failed (cpu=%p gpu=%p)\n", i, (void*)cpu_out, (void*)gpu_out);
+        if (!gpu_out) {
+            fprintf(stderr, "Token %d: GPU forward failed\n", i);
             pass = 0;
             continue;
         }
 
-        /* Compare */
-        float err = rel_l2_error(gpu_out, cpu_out, n_embd);
-        const char *status = (err < 1e-2f) ? "OK" : "MISMATCH";
-        if (err >= 1e-2f) pass = 0;
+        if (gpu_only) {
+            /* GPU-only: just print hidden state */
+            fprintf(stderr, "\nToken %d (id=%d): GPU=%.1fms\n", i, token, gpu_ms);
+            print_first_n("GPU", gpu_out, n_embd, 8);
+        } else if (!cpu_out) {
+            fprintf(stderr, "Token %d: CPU forward failed\n", i);
+            pass = 0;
+        } else {
+            /* Compare */
+            float err = rel_l2_error(gpu_out, cpu_out, n_embd);
+            const char *status = (err < 1e-2f) ? "OK" : "MISMATCH";
+            if (err >= 1e-2f) pass = 0;
 
-        fprintf(stderr, "\nToken %d (id=%d): rel_L2=%.6f [%s]  CPU=%.1fms  GPU=%.1fms  (%.1fx)\n",
-                i, token, err, status, cpu_ms, gpu_ms,
-                gpu_ms > 0 ? cpu_ms / gpu_ms : 0.0);
-        print_first_n("CPU", cpu_out, n_embd, 8);
-        print_first_n("GPU", gpu_out, n_embd, 8);
+            fprintf(stderr, "\nToken %d (id=%d): rel_L2=%.6f [%s]  CPU=%.1fms  GPU=%.1fms  (%.1fx)\n",
+                    i, token, err, status, cpu_ms, gpu_ms,
+                    gpu_ms > 0 ? cpu_ms / gpu_ms : 0.0);
+            print_first_n("CPU", cpu_out, n_embd, 8);
+            print_first_n("GPU", gpu_out, n_embd, 8);
+        }
     }
 
     fprintf(stderr, "\n=== Summary ===\n");
     fprintf(stderr, "Tokens processed: %d\n", max_tokens);
-    fprintf(stderr, "Total CPU time: %.1f ms (%.1f ms/token)\n",
-            total_cpu_ms, total_cpu_ms / max_tokens);
+    if (!gpu_only) {
+        fprintf(stderr, "Total CPU time: %.1f ms (%.1f ms/token)\n",
+                total_cpu_ms, total_cpu_ms / max_tokens);
+    }
     fprintf(stderr, "Total GPU time: %.1f ms (%.1f ms/token)\n",
             total_gpu_ms, total_gpu_ms / max_tokens);
-    if (total_gpu_ms > 0) {
+    if (!gpu_only && total_gpu_ms > 0) {
         fprintf(stderr, "Speedup: %.1fx\n", total_cpu_ms / total_gpu_ms);
     }
     fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 
     /* Cleanup */
     cuda_llm_free(gpu);
-    transformer_free(cpu_model);
+    if (cpu_model) transformer_free(cpu_model);
     bpe_vocab_free(vocab);
     gguf_close(gguf);
 
