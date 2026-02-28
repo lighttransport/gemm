@@ -1013,6 +1013,7 @@ struct cuda_llm_runner {
     float rms_norm_eps;
     int debug_layers;       /* if > 0, print hidden state norm after each layer */
     int max_layers;         /* if > 0, process only first N layers (debug) */
+    int n_deepstack;        /* number of deepstack layers (VLM injection, 0 = none) */
 
     /* Hybrid SSM params (Qwen3.5) */
     int is_hybrid;
@@ -1058,6 +1059,9 @@ struct cuda_llm_runner {
     CUdeviceptr d_ssm_conv_out; /* [qkv_dim] conv1d output */
     CUdeviceptr d_attn_gate;  /* [q_dim] for gated attention gate */
 
+    /* Deepstack scratch (for VLM embedding injection) */
+    CUdeviceptr d_ds_tmp;   /* [n_embd] for deepstack slice upload */
+
     /* INT8 quantization scratch (for dp4a path) */
     CUdeviceptr d_xb_q;     /* INT8 [max_dim] */
     CUdeviceptr d_xb_scale; /* F32 [1] */
@@ -1068,6 +1072,10 @@ struct cuda_llm_runner {
 
     /* Weight loading state */
     int weights_loaded;
+
+    /* Deepstack injection state (set during forward_embd, NULL otherwise) */
+    const float *_ds_embd;
+    int _ds_embd_stride;
 };
 
 /* ======================================================================== */
@@ -1436,6 +1444,12 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         }
     }
 
+    /* DeepStack layers (VLM injection) */
+    r->n_deepstack = cllm_get_int(gguf, ARCH_KEY("n_deepstack_layers"), 0);
+    if (r->verbose >= 1 && r->n_deepstack > 0) {
+        fprintf(stderr, "cuda_llm: n_deepstack=%d\n", r->n_deepstack);
+    }
+
     #undef ARCH_KEY
 
     int kv_dim = r->n_kv_heads * r->head_dim;
@@ -1690,6 +1704,11 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         CHECK_CU(cuMemAlloc(&r->d_ssm_out,       d_inner * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_ssm_conv_out,  r->ssm_qkv_dim * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_attn_gate,     q_dim * sizeof(float)));
+    }
+
+    /* DeepStack scratch buffer */
+    if (r->n_deepstack > 0) {
+        CHECK_CU(cuMemAlloc(&r->d_ds_tmp, r->n_embd * sizeof(float)));
     }
 
     /* INT8 quantization scratch (for dp4a path) */
@@ -2011,18 +2030,14 @@ static inline void launch_deinterleave_qgate(cuda_llm_runner *r, CUdeviceptr q,
 /* Public API: forward                                                      */
 /* ======================================================================== */
 
+static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position);
+
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
 
     int n_embd = r->n_embd;
-    int n_heads = r->n_heads;
-    int n_kv_heads = r->n_kv_heads;
-    int head_dim = r->head_dim;
-    int kv_dim = n_kv_heads * head_dim;
-    int n_ff = r->n_ff;
-    float eps = r->rms_norm_eps;
 
     /* 1. Token embedding lookup -> F32 */
     if (r->token_embd_type == GGML_TYPE_Q8_0) {
@@ -2075,9 +2090,22 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         free(gpu_emb); free(cpu_emb); free(row_data);
     }
 
-    /* 2. Transformer blocks */
+    /* Run transformer blocks (shared with forward_embd) */
+    return cuda_llm_forward_blocks(r, position);
+}
+
+/* Internal: run transformer blocks + final norm on d_x.
+ * Assumes d_x already contains the input embedding on GPU. */
+static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
+    int n_embd = r->n_embd;
+    int n_heads = r->n_heads;
+    int n_kv_heads = r->n_kv_heads;
+    int head_dim = r->head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int n_ff = r->n_ff;
+    float eps = r->rms_norm_eps;
+
     int n_run_layers = r->n_layers;
-    /* max_layers: 0 or negative = all layers (default), positive = limit */
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
     for (int l = 0; l < n_run_layers; l++) {
         cuda_layer *cl = &r->layers[l];
@@ -2786,6 +2814,13 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
 
+        /* DeepStack injection: add deepstack slice after each early layer */
+        if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
+            const float *ds_slice = r->_ds_embd + (1 + l) * n_embd;
+            cuMemcpyHtoDAsync(r->d_ds_tmp, (const void *)ds_slice, n_embd * sizeof(float), r->stream);
+            launch_add(r, r->d_x, r->d_ds_tmp, n_embd);
+        }
+
         /* Debug: print hidden state norm after each layer */
         if (r->debug_layers) {
             cuStreamSynchronize(r->stream);
@@ -2837,6 +2872,48 @@ float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int positio
     return r->h_output;
 }
 
+/* Forward pass with pre-computed F32 embedding (for VLM vision token injection).
+ * Uploads embd[0..n_embd-1] to d_x, then runs the same transformer blocks as
+ * cuda_llm_forward(). Deepstack injection adds embd[(1+l)*n_embd .. (2+l)*n_embd-1]
+ * after each early layer l < n_deepstack, if embd_stride > n_embd. */
+float *cuda_llm_forward_embd(cuda_llm_runner *r, const float *embd, int embd_stride, int position) {
+    if (!r || !r->weights_loaded || !embd) return NULL;
+    if (position < 0 || position >= r->max_seq_len) return NULL;
+
+    int n_embd = r->n_embd;
+
+    /* Upload F32 embedding to d_x (first n_embd floats) */
+    cuMemcpyHtoDAsync(r->d_x, (const void *)embd, n_embd * sizeof(float), r->stream);
+
+    /* Set deepstack state for the forward loop */
+    r->_ds_embd = embd;
+    r->_ds_embd_stride = embd_stride;
+
+    /* Run transformer blocks + final norm (same code path as cuda_llm_forward) */
+    float *result = cuda_llm_forward_blocks(r, position);
+
+    r->_ds_embd = NULL;
+    r->_ds_embd_stride = 0;
+
+    return result;
+}
+
+/* Forward pass with embedding returning logits */
+float *cuda_llm_forward_embd_logits(cuda_llm_runner *r, const float *embd, int embd_stride, int position) {
+    float *hidden = cuda_llm_forward_embd(r, embd, embd_stride, position);
+    if (!hidden || !r->has_lm_head) return NULL;
+
+    /* LM head: logits = output_w @ hidden (d_x still holds the normed state) */
+    launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
+                       r->n_vocab, r->n_embd, r->output_w_type);
+
+    /* Copy logits to host */
+    cuMemcpyDtoHAsync(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float), r->stream);
+    cuStreamSynchronize(r->stream);
+
+    return r->h_output;
+}
+
 /* Read last hidden state (d_x) from GPU */
 int cuda_llm_read_hidden(const cuda_llm_runner *r, float *dst, int n) {
     if (!r || !dst || n <= 0) return -1;
@@ -2877,6 +2954,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_ssm_out)      cuMemFree(r->d_ssm_out);
     if (r->d_ssm_conv_out) cuMemFree(r->d_ssm_conv_out);
     if (r->d_attn_gate)    cuMemFree(r->d_attn_gate);
+    if (r->d_ds_tmp)   cuMemFree(r->d_ds_tmp);
     if (r->d_xb_q)    cuMemFree(r->d_xb_q);
     if (r->d_xb_scale) cuMemFree(r->d_xb_scale);
 
