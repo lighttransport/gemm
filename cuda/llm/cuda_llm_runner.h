@@ -38,6 +38,12 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position);
  * The returned pointer is valid until the next call (host-side buffer). */
 float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int position);
 
+/* Run forward pass with a pre-computed F32 embedding [n_embd] instead of token lookup.
+ * Used to inject vision embeddings. embd_stride is the stride between embeddings
+ * (>= n_embd; extra data used for deepstack injection). */
+float *cuda_llm_forward_embd(cuda_llm_runner *r, const float *embd, int embd_stride, int position);
+float *cuda_llm_forward_embd_logits(cuda_llm_runner *r, const float *embd, int embd_stride, int position);
+
 /* Free all GPU resources and the runner. */
 void cuda_llm_free(cuda_llm_runner *r);
 

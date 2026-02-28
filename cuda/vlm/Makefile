@@ -10,11 +10,13 @@ LDFLAGS = -ldl -lm -lpthread
 # Sources
 CUEW_SRC = ../cuew.c
 RUNNER_SRC = cuda_vision_encoder.c
+LLM_RUNNER_SRC = ../llm/cuda_llm_runner.c
 TEST_SRC = test_cuda_vision.c
 
 # Targets
 TARGET = test_cuda_vision
 COMPARE = compare_vs_llamacpp
+VLM = test_cuda_vlm
 
 .PHONY: all clean run help compare
 
@@ -25,6 +27,9 @@ $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../cuew.h
 
 $(COMPARE): compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../cuew.h
 	$(CC) $(CFLAGS) -o $@ compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+
+$(VLM): test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../llm/cuda_llm_runner.h ../cuew.h
+	$(CC) $(CFLAGS) -o $@ test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
 
 # dump_clip_embd requires llama.cpp build (link against libmtmd.so)
 # Usage: make dump_clip_embd LLAMA_DIR=/path/to/llama.cpp
@@ -43,7 +48,7 @@ run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <mmproj.gguf> [--f16] [--image-size N]"
 
 clean:
-	rm -f $(TARGET) $(COMPARE) dump_clip_embd
+	rm -f $(TARGET) $(COMPARE) $(VLM) dump_clip_embd
 
 help:
 	@echo "CUDA VLM Vision Encoder (NVRTC-based, no nvcc needed)"
