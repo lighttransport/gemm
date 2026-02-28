@@ -34,8 +34,24 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
  * The returned pointer is valid until the next call (host-side buffer). */
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position);
 
+/* Run one token and return logits [n_vocab]. Applies lm_head after hidden state.
+ * The returned pointer is valid until the next call (host-side buffer). */
+float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int position);
+
 /* Free all GPU resources and the runner. */
 void cuda_llm_free(cuda_llm_runner *r);
+
+/* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
+void cuda_llm_reset_state(cuda_llm_runner *r);
+
+/* Read last hidden state (d_x) from GPU into dst. n = n_embd. */
+int cuda_llm_read_hidden(const cuda_llm_runner *r, float *dst, int n);
+
+/* Enable per-layer debug output (print hidden state norm after each layer). */
+void cuda_llm_set_debug(cuda_llm_runner *r, int debug_layers);
+
+/* Set max layers to process (0 = all). For debugging: run only first N layers. */
+void cuda_llm_set_max_layers(cuda_llm_runner *r, int max_layers);
 
 /* Query model dimensions (valid after load_weights). */
 int cuda_llm_n_embd(const cuda_llm_runner *r);
