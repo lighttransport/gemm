@@ -51,6 +51,19 @@ typedef struct {
     qtensor ffn_up_exps;   /* [n_embd, n_ff_expert, n_expert] */
     qtensor ffn_gate_exps; /* [n_embd, n_ff_expert, n_expert] */
     qtensor ffn_down_exps; /* [n_ff_expert, n_embd, n_expert] */
+
+    /* SSM (Delta-Net) tensors — Qwen3.5 hybrid layers */
+    qtensor ssm_qkv;       /* [n_embd, qkv_dim] combined Q/K/V input projection */
+    qtensor ssm_gate;      /* [n_embd, d_inner] gate (z) projection */
+    qtensor ssm_alpha;     /* [n_embd, n_v_heads] alpha projection */
+    qtensor ssm_beta;      /* [n_embd, n_v_heads] beta projection */
+    qtensor ssm_a;         /* [n_v_heads] fixed decay constants */
+    qtensor ssm_dt_bias;   /* [n_v_heads] alpha bias */
+    qtensor ssm_conv1d;    /* [conv_kernel, qkv_dim] 1D conv kernel */
+    qtensor ssm_norm;      /* [d_state] RMS norm for gated output */
+    qtensor ssm_out;       /* [d_inner, n_embd] output projection */
+
+    int is_ssm;            /* 1 = Delta-Net SSM layer, 0 = full attention */
 } transformer_layer;
 
 typedef struct {
@@ -73,6 +86,18 @@ typedef struct {
     int has_lm_head;     /* 1 if output.weight exists (generative model) */
     int mrope_sections[4]; /* M-RoPE dimension sections [temporal, height, width, pad] */
     int use_mrope;         /* 1 if M-RoPE is enabled (Qwen3-VL) */
+
+    /* Hybrid SSM+Attention (Qwen3.5) */
+    int is_hybrid;           /* 1 if model has SSM layers */
+    int full_attn_interval;  /* every Nth layer is full attention (e.g. 4) */
+    int ssm_conv_kernel;     /* conv1d kernel size (4) */
+    int ssm_d_state;         /* state dimension per head (128) */
+    int ssm_n_group;         /* number of K/Q heads (16) */
+    int ssm_dt_rank;         /* number of V heads (48) */
+    int ssm_d_inner;         /* inner hidden dim (6144) */
+    int ssm_qkv_dim;         /* combined QKV dim (10240) */
+    float **conv_state;      /* [n_layers] -> [conv_kernel-1, qkv_dim] per SSM layer */
+    float **recurrent_state; /* [n_layers] -> [n_v_heads, d_state, d_state] per SSM layer */
     int n_deepstack;       /* number of deepstack layers (Qwen3-VL) */
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
     int ds_embd_stride;    /* total embedding dim = proj_dim * (1 + n_deepstack) */
@@ -685,31 +710,37 @@ static void tf_rope_mrope(float *vec, int n_heads, int head_dim, int pos_t, int 
                            float freq_base, const int sections[4]) {
     int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
     if (sect_dims <= 0) sect_dims = head_dim / 2; /* fallback */
-    int half_dim = head_dim / 2;
+    /* Pair offset = sect_dims (NOT head_dim/2).
+       NeoX-style RoPE with partial rotation pairs (j, j + n_dims/2).
+       For Qwen3.5: sect_dims=32, head_dim=256, so pairs are (j, j+32). */
+    int pair_off = sect_dims;
+    /* Use rope_dim_count (= 2 * sect_dims) as freq denominator, not head_dim.
+       For models where rope_dim < head_dim (e.g. Qwen3.5: 64 vs 256). */
+    int rope_dim = 2 * sect_dims;
 
     for (int h = 0; h < n_heads; h++) {
         float *v = vec + h * head_dim;
-        for (int j = 0; j < half_dim; j++) {
-            int sector = j % sect_dims;
+        /* Only rotate first sect_dims pairs; dimensions beyond are left unchanged */
+        for (int j = 0; j < sect_dims; j++) {
             int pos;
             /* IMROPE interleaved pattern (matches llama.cpp) */
-            if (sector % 3 == 1 && sector < 3 * sections[1]) {
+            if (j % 3 == 1 && j < 3 * sections[1]) {
                 pos = pos_h;
-            } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
+            } else if (j % 3 == 2 && j < 3 * sections[2]) {
                 pos = pos_w;
-            } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
+            } else if (j % 3 == 0 && j < 3 * sections[0]) {
                 pos = pos_t;
             } else {
                 pos = pos_t; /* extra/padding: use temporal */
             }
-            float freq = 1.0f / powf(freq_base, (float)(2 * j) / head_dim);
+            float freq = 1.0f / powf(freq_base, (float)(2 * j) / rope_dim);
             float theta = pos * freq;
             float cos_t = cosf(theta);
             float sin_t = sinf(theta);
             float v0 = v[j];
-            float v1 = v[j + half_dim];
-            v[j]            = v0 * cos_t - v1 * sin_t;
-            v[j + half_dim] = v0 * sin_t + v1 * cos_t;
+            float v1 = v[j + pair_off];
+            v[j]             = v0 * cos_t - v1 * sin_t;
+            v[j + pair_off]  = v0 * sin_t + v1 * cos_t;
         }
     }
 }
@@ -935,7 +966,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     /* Detect architecture prefix. */
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "qwen3vlmoe.block_count") >= 0) {
+    if (gguf_find_key(gguf, "qwen35.block_count") >= 0) {
+        arch = "qwen35";
+    } else if (gguf_find_key(gguf, "qwen3vlmoe.block_count") >= 0) {
         arch = "qwen3vlmoe";
     } else if (gguf_find_key(gguf, "qwen3moe.block_count") >= 0) {
         arch = "qwen3moe";
@@ -1017,6 +1050,24 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
      * despite n_embd/n_heads=80), fall back to n_embd/n_heads */
     m->head_dim = tf_get_int(gguf, ARCH_KEY("attention.key_length"), m->n_embd / m->n_heads);
 
+    /* Hybrid SSM (Qwen3.5) */
+    m->is_hybrid = 0;
+    m->full_attn_interval = 0;
+    if (strcmp(arch, "qwen35") == 0) {
+        m->is_hybrid = 1;
+        m->ssm_conv_kernel = tf_get_int(gguf, ARCH_KEY("ssm.conv_kernel"), 4);
+        m->ssm_d_state     = tf_get_int(gguf, ARCH_KEY("ssm.state_size"), 128);
+        m->ssm_n_group     = tf_get_int(gguf, ARCH_KEY("ssm.group_count"), 16);
+        m->ssm_dt_rank     = tf_get_int(gguf, ARCH_KEY("ssm.time_step_rank"), 48);
+        m->ssm_d_inner     = tf_get_int(gguf, ARCH_KEY("ssm.inner_size"), 6144);
+        m->full_attn_interval = tf_get_int(gguf, ARCH_KEY("attention.full_attention_interval"), 4);
+        m->ssm_qkv_dim = m->ssm_d_state * m->ssm_n_group * 2 + m->ssm_d_inner;
+        fprintf(stderr, "transformer: hybrid SSM: conv_k=%d d_state=%d n_group=%d dt_rank=%d d_inner=%d\n",
+                m->ssm_conv_kernel, m->ssm_d_state, m->ssm_n_group, m->ssm_dt_rank, m->ssm_d_inner);
+        fprintf(stderr, "transformer: full_attn_interval=%d qkv_dim=%d\n",
+                m->full_attn_interval, m->ssm_qkv_dim);
+    }
+
     #undef ARCH_KEY
     fprintf(stderr, "transformer: architecture=%s\n", arch);
     m->max_seq_len = max_seq_len;
@@ -1084,13 +1135,46 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             } while (0)
 
         LOAD(attn_norm,    "attn_norm",   1)
-        LOAD(attn_q,       "attn_q",      1)
-        LOAD(attn_k,       "attn_k",      1)
-        LOAD(attn_v,       "attn_v",      1)
-        LOAD(attn_q_norm,  "attn_q_norm", 0)
-        LOAD(attn_k_norm,  "attn_k_norm", 0)
-        LOAD(attn_output,  "attn_output", 1)
-        LOAD(ffn_norm,     "ffn_norm",    1)
+
+        if (m->is_hybrid) {
+            int is_attn = (m->full_attn_interval > 0 && (l + 1) % m->full_attn_interval == 0);
+            m->layers[l].is_ssm = !is_attn;
+            if (is_attn) {
+                LOAD(attn_q,       "attn_q",      1)
+                LOAD(attn_k,       "attn_k",      1)
+                LOAD(attn_v,       "attn_v",      1)
+                LOAD(attn_q_norm,  "attn_q_norm", 0)
+                LOAD(attn_k_norm,  "attn_k_norm", 0)
+                LOAD(attn_output,  "attn_output", 1)
+            } else {
+                LOAD(ssm_qkv,      "attn_qkv",    1)
+                LOAD(ssm_gate,     "attn_gate",    1)
+                LOAD(ssm_alpha,    "ssm_alpha",    1)
+                LOAD(ssm_beta,     "ssm_beta",     1)
+                LOAD(ssm_out,      "ssm_out",      1)
+                LOAD(ssm_conv1d,   "ssm_conv1d",   1)
+                LOAD(ssm_norm,     "ssm_norm",     1)
+                /* ssm_a and ssm_dt.bias: no .weight suffix */
+                snprintf(name, sizeof(name), "blk.%d.ssm_a", l);
+                m->layers[l].ssm_a = tf_load_tensor(gguf, name, 1);
+                if (!m->layers[l].ssm_a.data) missing_required = 1;
+                snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", l);
+                m->layers[l].ssm_dt_bias = tf_load_tensor(gguf, name, 1);
+                if (!m->layers[l].ssm_dt_bias.data) missing_required = 1;
+            }
+            /* post_attention_norm replaces ffn_norm in qwen35 */
+            snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l);
+            m->layers[l].ffn_norm = tf_load_tensor(gguf, name, 1);
+            if (!m->layers[l].ffn_norm.data) missing_required = 1;
+        } else {
+            LOAD(attn_q,       "attn_q",      1)
+            LOAD(attn_k,       "attn_k",      1)
+            LOAD(attn_v,       "attn_v",      1)
+            LOAD(attn_q_norm,  "attn_q_norm", 0)
+            LOAD(attn_k_norm,  "attn_k_norm", 0)
+            LOAD(attn_output,  "attn_output", 1)
+            LOAD(ffn_norm,     "ffn_norm",    1)
+        }
         if (m->use_moe) {
             LOAD(ffn_gate_inp,  "ffn_gate_inp",  1)
             LOAD(ffn_up_exps,   "ffn_up_exps",   1)
@@ -1134,11 +1218,22 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             REQUIRE_SUPPORTED(ffn_down, "ffn_down");
         }
         REQUIRE_SUPPORTED(attn_norm,   "attn_norm");
-        REQUIRE_SUPPORTED(attn_q,      "attn_q");
-        REQUIRE_SUPPORTED(attn_k,      "attn_k");
-        REQUIRE_SUPPORTED(attn_v,      "attn_v");
-        REQUIRE_SUPPORTED(attn_output, "attn_output");
         REQUIRE_SUPPORTED(ffn_norm,    "ffn_norm");
+        if (!m->is_hybrid || !m->layers[l].is_ssm) {
+            REQUIRE_SUPPORTED(attn_q,      "attn_q");
+            REQUIRE_SUPPORTED(attn_k,      "attn_k");
+            REQUIRE_SUPPORTED(attn_v,      "attn_v");
+            REQUIRE_SUPPORTED(attn_output, "attn_output");
+        }
+        if (m->is_hybrid && m->layers[l].is_ssm) {
+            REQUIRE_SUPPORTED(ssm_qkv,    "attn_qkv");
+            REQUIRE_SUPPORTED(ssm_gate,   "attn_gate");
+            REQUIRE_SUPPORTED(ssm_alpha,  "ssm_alpha");
+            REQUIRE_SUPPORTED(ssm_beta,   "ssm_beta");
+            REQUIRE_SUPPORTED(ssm_out,    "ssm_out");
+            REQUIRE_SUPPORTED(ssm_conv1d, "ssm_conv1d");
+            REQUIRE_SUPPORTED(ssm_norm,   "ssm_norm");
+        }
         #undef LOAD
         #undef REQUIRE_SUPPORTED
     }
@@ -1148,13 +1243,34 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         return NULL;
     }
 
-    /* Allocate KV cache */
+    /* Allocate KV cache (skip SSM layers in hybrid mode) */
     int kv_dim = m->n_kv_heads * m->head_dim;
     m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
     m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
     for (int l = 0; l < m->n_layers; l++) {
+        if (m->is_hybrid && m->layers[l].is_ssm) continue;
         m->key_cache[l]   = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
         m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+    }
+
+    /* Allocate SSM state for hybrid models */
+    m->conv_state = NULL;
+    m->recurrent_state = NULL;
+    if (m->is_hybrid) {
+        m->conv_state = (float **)calloc(m->n_layers, sizeof(float *));
+        m->recurrent_state = (float **)calloc(m->n_layers, sizeof(float *));
+        int n_ssm = 0;
+        for (int l = 0; l < m->n_layers; l++) {
+            if (!m->layers[l].is_ssm) continue;
+            int conv_state_size = (m->ssm_conv_kernel - 1) * m->ssm_qkv_dim;
+            m->conv_state[l] = (float *)calloc(conv_state_size, sizeof(float));
+            int rec_state_size = m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state;
+            m->recurrent_state[l] = (float *)calloc(rec_state_size, sizeof(float));
+            n_ssm++;
+        }
+        fprintf(stderr, "transformer: SSM state: %d layers, conv=[%d×%d], recurrent=[%d×%d×%d]\n",
+                n_ssm, m->ssm_conv_kernel - 1, m->ssm_qkv_dim,
+                m->ssm_dt_rank, m->ssm_d_state, m->ssm_d_state);
     }
 
     /* Allocate scratch buffers */
@@ -1163,10 +1279,20 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     if (m->use_moe && m->n_expert > max_ff) max_ff = m->n_expert;
     int max_dim = m->n_embd > max_ff ? m->n_embd : max_ff;
     int q_dim = m->n_heads * m->head_dim;  /* may differ from n_embd (e.g. 4B: 4096 vs 2560) */
+    /* xb2 must hold: attention output (q_dim), SSM qkv (qkv_dim), or Q+gate (2*q_dim) */
+    int xb2_dim = q_dim;
+    if (m->is_hybrid) {
+        if (m->ssm_qkv_dim > xb2_dim) xb2_dim = m->ssm_qkv_dim;
+        if (2 * q_dim > xb2_dim) xb2_dim = 2 * q_dim; /* Q+gate for gated attention */
+    }
+    /* q buffer must hold Q or expanded Q for SSM */
+    int q_buf_dim = q_dim;
+    if (m->is_hybrid && m->ssm_dt_rank * m->ssm_d_state > q_buf_dim)
+        q_buf_dim = m->ssm_dt_rank * m->ssm_d_state;
     m->x         = (float *)calloc(m->n_embd, sizeof(float));
     m->xb        = (float *)calloc(m->n_embd, sizeof(float));
-    m->xb2       = (float *)calloc(q_dim, sizeof(float));
-    m->q         = (float *)calloc(q_dim, sizeof(float));
+    m->xb2       = (float *)calloc(xb2_dim, sizeof(float));
+    m->q         = (float *)calloc(q_buf_dim, sizeof(float));
     m->k         = (float *)calloc(kv_dim, sizeof(float));
     m->v         = (float *)calloc(kv_dim, sizeof(float));
     m->att       = (float *)calloc(m->n_heads * max_seq_len, sizeof(float));
@@ -1194,6 +1320,14 @@ void transformer_free(transformer_model *model) {
         }
         free(model->key_cache);
         free(model->value_cache);
+    }
+    if (model->conv_state) {
+        for (int l = 0; l < model->n_layers; l++) free(model->conv_state[l]);
+        free(model->conv_state);
+    }
+    if (model->recurrent_state) {
+        for (int l = 0; l < model->n_layers; l++) free(model->recurrent_state[l]);
+        free(model->recurrent_state);
     }
     free(model->x);
     free(model->xb);
@@ -1318,6 +1452,189 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
 }
 
+/* ---- SSM Delta-Net forward (single token, autoregressive) ---- */
+
+/* L2-normalize a vector in-place: v[i] /= sqrt(sum(v[i]^2) + eps) */
+static void tf_l2_norm(float *v, int n, float eps) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += v[i] * v[i];
+    float inv = 1.0f / sqrtf(ss + eps);
+    for (int i = 0; i < n; i++) v[i] *= inv;
+}
+
+/* SSM Delta-Net forward for one layer.
+ * Input:  m->xb (post-norm hidden state [n_embd])
+ * Output: m->xb (residual-ready output [n_embd])
+ * Scratch: m->xb2 (qkv), m->q (Q_expanded), m->ffn_buf1 (z/gate),
+ *          m->ffn_buf2 (K_expanded), m->ffn_buf3 (delta-net output) */
+static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
+    transformer_layer *layer = &m->layers[layer_idx];
+    int n_embd  = m->n_embd;
+    int qkv_dim = m->ssm_qkv_dim;
+    int d_inner = m->ssm_d_inner;
+    int d_state = m->ssm_d_state;
+    int n_group = m->ssm_n_group;
+    int dt_rank = m->ssm_dt_rank;
+    int conv_k  = m->ssm_conv_kernel;
+    float eps   = m->rms_norm_eps;
+
+    float *qkv_buf = m->xb2;       /* [qkv_dim] */
+    float *z_buf   = m->ffn_buf1;  /* [d_inner] */
+    float *K_exp   = m->ffn_buf2;  /* [dt_rank * d_state] */
+    float *out_buf = m->ffn_buf3;  /* [d_inner] */
+    float *Q_exp   = m->q;         /* [dt_rank * d_state] */
+
+    /* 1. Linear projections from xb */
+    tf_qmatvec(qkv_buf, &layer->ssm_qkv, m->xb, qkv_dim, m->matvec_tmp);
+    tf_qmatvec(z_buf, &layer->ssm_gate, m->xb, d_inner, m->matvec_tmp);
+
+    float alpha[64], beta_arr[64]; /* dt_rank <= 64 (48 for Qwen3.5-27B) */
+    tf_qmatvec(alpha, &layer->ssm_alpha, m->xb, dt_rank, m->matvec_tmp);
+    tf_qmatvec(beta_arr, &layer->ssm_beta, m->xb, dt_rank, m->matvec_tmp);
+
+    /* 2. alpha = softplus(alpha + dt_bias) * ssm_a */
+    {
+        float a_buf[64], dt_bias_buf[64];
+        tf_dequant_row(&layer->ssm_a, 0, a_buf);
+        tf_dequant_row(&layer->ssm_dt_bias, 0, dt_bias_buf);
+        for (int i = 0; i < dt_rank; i++) {
+            float val = alpha[i] + dt_bias_buf[i];
+            float sp = (val > 20.0f) ? val : logf(1.0f + expf(val));
+            alpha[i] = sp * a_buf[i]; /* negative since ssm_a < 0 */
+        }
+    }
+
+    /* 3. beta = sigmoid(beta) */
+    for (int i = 0; i < dt_rank; i++) {
+        beta_arr[i] = 1.0f / (1.0f + expf(-beta_arr[i]));
+    }
+
+    /* 4. Conv1d: depthwise causal conv + SiLU */
+    {
+        float *conv_st = m->conv_state[layer_idx]; /* [(conv_k-1) * qkv_dim] */
+        /* Use K_exp temporarily for conv output (17408 >= 10240) */
+        float *conv_out = K_exp;
+
+        for (int j = 0; j < qkv_dim; j++) {
+            float w_buf[8]; /* conv_k <= 8 */
+            tf_dequant_row(&layer->ssm_conv1d, j, w_buf);
+            float sum = 0.0f;
+            for (int f = 0; f < conv_k - 1; f++) {
+                sum += w_buf[f] * conv_st[f * qkv_dim + j];
+            }
+            sum += w_buf[conv_k - 1] * qkv_buf[j];
+            /* SiLU activation */
+            conv_out[j] = sum / (1.0f + expf(-sum));
+        }
+
+        /* Update conv_state: shift left, append current input (pre-conv) */
+        if (conv_k > 2) {
+            memmove(conv_st, conv_st + qkv_dim, (size_t)(conv_k - 2) * qkv_dim * sizeof(float));
+        }
+        memcpy(conv_st + (conv_k - 2) * qkv_dim, qkv_buf, qkv_dim * sizeof(float));
+
+        /* Copy conv output to qkv_buf */
+        memcpy(qkv_buf, conv_out, qkv_dim * sizeof(float));
+    }
+
+    /* 5. Split: Q[n_group*d_state], K[n_group*d_state], V[dt_rank*d_state]
+     *    Order in qkv_buf: Q, K, V (following llama.cpp convention) */
+    float *Q_raw = qkv_buf;                                  /* [n_group * d_state] */
+    float *K_raw = qkv_buf + n_group * d_state;              /* [n_group * d_state] */
+    float *V_raw = qkv_buf + 2 * n_group * d_state;          /* [dt_rank * d_state = d_inner] */
+
+    /* L2-normalize Q and K per head (n_group heads, d_state elements each) */
+    for (int g = 0; g < n_group; g++) {
+        tf_l2_norm(Q_raw + g * d_state, d_state, eps);
+        tf_l2_norm(K_raw + g * d_state, d_state, eps);
+    }
+
+    /* Repeat Q and K from n_group to dt_rank heads (tiling, matching ggml_repeat) */
+    {
+        for (int h = dt_rank - 1; h >= 0; h--) {
+            int g = h % n_group;
+            memcpy(Q_exp + h * d_state, Q_raw + g * d_state, d_state * sizeof(float));
+            memcpy(K_exp + h * d_state, K_raw + g * d_state, d_state * sizeof(float));
+        }
+    }
+
+    /* 6. Delta-Net recurrence per head */
+    float scale = 1.0f / sqrtf((float)d_state);
+    float *rec_state = m->recurrent_state[layer_idx]; /* [dt_rank * d_state * d_state] */
+
+    for (int h = 0; h < dt_rank; h++) {
+        float *state = rec_state + h * d_state * d_state; /* [d_state][d_state] */
+        float *q_h = Q_exp + h * d_state;
+        float *k_h = K_exp + h * d_state;
+        float *v_h = V_raw + h * d_state;
+        float *o_h = out_buf + h * d_state;
+
+        /* Scale Q */
+        for (int i = 0; i < d_state; i++) q_h[i] *= scale;
+
+        /* Decay: state *= exp(alpha_h) */
+        float decay = expf(alpha[h]);
+        for (int i = 0; i < d_state * d_state; i++) state[i] *= decay;
+
+        /* Read: sk = state @ k (sk[row] = sum_col(state[row][col] * k[col])) */
+        float sk[128];
+        for (int r = 0; r < d_state; r++) {
+            float sum = 0.0f;
+            for (int c = 0; c < d_state; c++) {
+                sum += state[r * d_state + c] * k_h[c];
+            }
+            sk[r] = sum;
+        }
+
+        /* Delta: d = (v - sk) * beta */
+        float delta[128];
+        for (int i = 0; i < d_state; i++) {
+            delta[i] = (v_h[i] - sk[i]) * beta_arr[h];
+        }
+
+        /* Update: state[r][c] += delta[r] * k[c] (rank-1 outer product) */
+        for (int r = 0; r < d_state; r++) {
+            float dr = delta[r];
+            for (int c = 0; c < d_state; c++) {
+                state[r * d_state + c] += dr * k_h[c];
+            }
+        }
+
+        /* Output: o = state @ q */
+        for (int r = 0; r < d_state; r++) {
+            float sum = 0.0f;
+            for (int c = 0; c < d_state; c++) {
+                sum += state[r * d_state + c] * q_h[c];
+            }
+            o_h[r] = sum;
+        }
+    }
+
+    /* 7. Fused: out = rmsnorm(out, ssm_norm) * silu(z) */
+    {
+        /* ssm_norm has [d_state] weights, applied per-head (48 groups of 128) */
+        float norm_w[128];
+        tf_dequant_row(&layer->ssm_norm, 0, norm_w);
+        for (int h = 0; h < dt_rank; h++) {
+            float *o_h = out_buf + h * d_state;
+            /* RMSNorm per head */
+            float ss = 0.0f;
+            for (int i = 0; i < d_state; i++) ss += o_h[i] * o_h[i];
+            ss = 1.0f / sqrtf(ss / d_state + eps);
+            /* Apply norm * weight * silu(z) */
+            for (int i = 0; i < d_state; i++) {
+                float normed = o_h[i] * ss * norm_w[i];
+                float z_val = z_buf[h * d_state + i];
+                float silu_z = z_val / (1.0f + expf(-z_val));
+                o_h[i] = normed * silu_z;
+            }
+        }
+    }
+
+    /* 8. Output projection: xb = ssm_out @ out_buf */
+    tf_qmatvec(m->xb, &layer->ssm_out, out_buf, n_embd, m->matvec_tmp);
+}
+
 /* Helper: apply standard or M-RoPE depending on model config */
 static void tf_apply_rope(transformer_model *m, float *q, float *k,
                            int n_heads, int n_kv_heads, int head_dim,
@@ -1387,54 +1704,48 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
         tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         TF_PROF_END("attn_norm", 5.0 * n_embd, 0);
 
-        /* Q/K/V projections (fused: one pool dispatch for all three) */
-        TF_PROF_BEGIN("qkv_proj", l, "matvec", "FP32");
-        tf_qmatvec_fused_qkv_pool(m, m->q, &layer->attn_q, q_dim,
-                                   m->k, &layer->attn_k, m->v, &layer->attn_v, kv_dim);
-        TF_PROF_END("qkv_proj", 2.0 * (q_dim + 2.0 * kv_dim) * n_embd, 0);
+        if (m->is_hybrid && layer->is_ssm) {
+            /* --- SSM (Delta-Net) layer --- */
+            tf_ssm_deltanet_forward(m, l);
+        } else if (m->is_hybrid) {
+            /* --- Gated attention layer (Qwen3.5) --- */
+            /* Q+gate combined projection: attn_q outputs [2*q_dim] interleaved */
+            int q2_dim = 2 * q_dim;
+            TF_PROF_BEGIN("qkv_proj", l, "matvec", "FP32");
+            tf_qmatvec(m->xb2, &layer->attn_q, m->xb, q2_dim, m->matvec_tmp);
+            tf_qmatvec(m->k, &layer->attn_k, m->xb, kv_dim, m->matvec_tmp);
+            tf_qmatvec(m->v, &layer->attn_v, m->xb, kv_dim, m->matvec_tmp);
+            TF_PROF_END("qkv_proj", 2.0 * (q2_dim + 2.0 * kv_dim) * n_embd, 0);
 
-        /* QK-Norm (if present) */
-        TF_PROF_BEGIN("qk_norm", l, "rmsnorm", "FP32");
-        if (layer->attn_q_norm.data) {
-            tf_qk_norm(m->q, n_heads, head_dim, &layer->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
-        }
-        if (layer->attn_k_norm.data) {
-            tf_qk_norm(m->k, n_kv_heads, head_dim, &layer->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
-        }
-        TF_PROF_END("qk_norm", 5.0 * (n_heads + n_kv_heads) * head_dim, 0);
-
-        /* RoPE on Q and K (standard or M-RoPE) */
-        TF_PROF_BEGIN("rope", l, "rope", "FP32");
-        tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
-        TF_PROF_END("rope", 8.0 * (n_heads + n_kv_heads) * head_dim / 2, 0);
-
-        /* Store K/V into cache at position */
-        float *kc = m->key_cache[l]   + position * kv_dim;
-        float *vc = m->value_cache[l] + position * kv_dim;
-        memcpy(kc, m->k, kv_dim * sizeof(float));
-        memcpy(vc, m->v, kv_dim * sizeof(float));
-
-        /* Multi-head attention with GQA */
-        TF_PROF_BEGIN("attention", l, "attention", "FP32");
-        int seq_len = position + 1;
-        float scale = 1.0f / sqrtf((float)head_dim);
-
-        if (m->n_threads > 1 && n_heads >= m->n_threads && m->pool_alive) {
-            /* Pool-based threaded attention */
-            int nt = m->n_threads;
-            tf_attn_task *atasks = (tf_attn_task *)alloca(nt * sizeof(tf_attn_task));
-            int heads_per = n_heads / nt;
-            int heads_extra = n_heads % nt;
-            int hoff = 0;
-            for (int t = 0; t < nt; t++) {
-                int hcount = heads_per + (t < heads_extra ? 1 : 0);
-                atasks[t] = (tf_attn_task){m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
-                                           hoff, hoff + hcount, head_dim, kv_dim, gqa_ratio, seq_len,
-                                           m->max_seq_len, scale};
-                hoff += hcount;
+            /* De-interleave: [Q0,gate0, Q1,gate1, ...] → Q[q_dim], gate[q_dim] */
+            for (int h = 0; h < n_heads; h++) {
+                memcpy(m->q + h * head_dim, m->xb2 + h * 2 * head_dim, head_dim * sizeof(float));
+                memcpy(m->ffn_buf1 + h * head_dim, m->xb2 + h * 2 * head_dim + head_dim, head_dim * sizeof(float));
             }
-            tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
-        } else {
+
+            /* QK-Norm */
+            TF_PROF_BEGIN("qk_norm", l, "rmsnorm", "FP32");
+            if (layer->attn_q_norm.data)
+                tf_qk_norm(m->q, n_heads, head_dim, &layer->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
+            if (layer->attn_k_norm.data)
+                tf_qk_norm(m->k, n_kv_heads, head_dim, &layer->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
+            TF_PROF_END("qk_norm", 5.0 * (n_heads + n_kv_heads) * head_dim, 0);
+
+            /* RoPE */
+            TF_PROF_BEGIN("rope", l, "rope", "FP32");
+            tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
+            TF_PROF_END("rope", 8.0 * (n_heads + n_kv_heads) * head_dim / 2, 0);
+
+            /* KV cache */
+            float *kc = m->key_cache[l] + position * kv_dim;
+            float *vc = m->value_cache[l] + position * kv_dim;
+            memcpy(kc, m->k, kv_dim * sizeof(float));
+            memcpy(vc, m->v, kv_dim * sizeof(float));
+
+            /* GQA attention */
+            TF_PROF_BEGIN("attention", l, "attention", "FP32");
+            int seq_len = position + 1;
+            float scale = 1.0f / sqrtf((float)head_dim);
             memset(m->xb2, 0, q_dim * sizeof(float));
             for (int h = 0; h < n_heads; h++) {
                 int kv_h = h / gqa_ratio;
@@ -1454,15 +1765,96 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
                     for (int d = 0; d < head_dim; d++) out_h[d] += a * v_t[d];
                 }
             }
+            TF_PROF_END("attention", 2.0 * n_heads * seq_len * head_dim * 2, 0);
+
+            /* Apply sigmoid gate: xb2[i] *= sigmoid(gate[i]) */
+            for (int i = 0; i < q_dim; i++) {
+                m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
+            }
+
+            /* Output projection */
+            TF_PROF_BEGIN("out_proj", l, "matvec", "FP32");
+            tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
+            TF_PROF_END("out_proj", 2.0 * n_embd * q_dim, 0);
+        } else {
+            /* --- Standard attention (non-hybrid) --- */
+            /* Q/K/V projections (fused: one pool dispatch for all three) */
+            TF_PROF_BEGIN("qkv_proj", l, "matvec", "FP32");
+            tf_qmatvec_fused_qkv_pool(m, m->q, &layer->attn_q, q_dim,
+                                       m->k, &layer->attn_k, m->v, &layer->attn_v, kv_dim);
+            TF_PROF_END("qkv_proj", 2.0 * (q_dim + 2.0 * kv_dim) * n_embd, 0);
+
+            /* QK-Norm (if present) */
+            TF_PROF_BEGIN("qk_norm", l, "rmsnorm", "FP32");
+            if (layer->attn_q_norm.data) {
+                tf_qk_norm(m->q, n_heads, head_dim, &layer->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
+            }
+            if (layer->attn_k_norm.data) {
+                tf_qk_norm(m->k, n_kv_heads, head_dim, &layer->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
+            }
+            TF_PROF_END("qk_norm", 5.0 * (n_heads + n_kv_heads) * head_dim, 0);
+
+            /* RoPE on Q and K (standard or M-RoPE) */
+            TF_PROF_BEGIN("rope", l, "rope", "FP32");
+            tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
+            TF_PROF_END("rope", 8.0 * (n_heads + n_kv_heads) * head_dim / 2, 0);
+
+            /* Store K/V into cache at position */
+            float *kc = m->key_cache[l]   + position * kv_dim;
+            float *vc = m->value_cache[l] + position * kv_dim;
+            memcpy(kc, m->k, kv_dim * sizeof(float));
+            memcpy(vc, m->v, kv_dim * sizeof(float));
+
+            /* Multi-head attention with GQA */
+            TF_PROF_BEGIN("attention", l, "attention", "FP32");
+            int seq_len = position + 1;
+            float scale = 1.0f / sqrtf((float)head_dim);
+
+            if (m->n_threads > 1 && n_heads >= m->n_threads && m->pool_alive) {
+                /* Pool-based threaded attention */
+                int nt = m->n_threads;
+                tf_attn_task *atasks = (tf_attn_task *)alloca(nt * sizeof(tf_attn_task));
+                int heads_per = n_heads / nt;
+                int heads_extra = n_heads % nt;
+                int hoff = 0;
+                for (int t = 0; t < nt; t++) {
+                    int hcount = heads_per + (t < heads_extra ? 1 : 0);
+                    atasks[t] = (tf_attn_task){m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
+                                               hoff, hoff + hcount, head_dim, kv_dim, gqa_ratio, seq_len,
+                                               m->max_seq_len, scale};
+                    hoff += hcount;
+                }
+                tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
+            } else {
+                memset(m->xb2, 0, q_dim * sizeof(float));
+                for (int h = 0; h < n_heads; h++) {
+                    int kv_h = h / gqa_ratio;
+                    float *q_h = m->q + h * head_dim;
+                    float *att_h = m->att + h * m->max_seq_len;
+                    for (int t = 0; t < seq_len; t++) {
+                        float *k_t = m->key_cache[l] + t * kv_dim + kv_h * head_dim;
+                        float score = 0.0f;
+                        for (int d = 0; d < head_dim; d++) score += q_h[d] * k_t[d];
+                        att_h[t] = score * scale;
+                    }
+                    tf_softmax(att_h, seq_len);
+                    float *out_h = m->xb2 + h * head_dim;
+                    for (int t = 0; t < seq_len; t++) {
+                        float *v_t = m->value_cache[l] + t * kv_dim + kv_h * head_dim;
+                        float a = att_h[t];
+                        for (int d = 0; d < head_dim; d++) out_h[d] += a * v_t[d];
+                    }
+                }
+            }
+
+            /* QK: heads*seq*hd, AV: heads*seq*hd */
+            TF_PROF_END("attention", 2.0 * n_heads * seq_len * head_dim * 2, 0);
+
+            /* Output projection */
+            TF_PROF_BEGIN("out_proj", l, "matvec", "FP32");
+            tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
+            TF_PROF_END("out_proj", 2.0 * n_embd * n_embd, 0);
         }
-
-        /* QK: heads*seq*hd, AV: heads*seq*hd */
-        TF_PROF_END("attention", 2.0 * n_heads * seq_len * head_dim * 2, 0);
-
-        /* Output projection */
-        TF_PROF_BEGIN("out_proj", l, "matvec", "FP32");
-        tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
-        TF_PROF_END("out_proj", 2.0 * n_embd * n_embd, 0);
 
         /* Residual */
         for (int i = 0; i < n_embd; i++) m->x[i] += m->xb[i];
@@ -1918,13 +2310,15 @@ static void tf_rope_mrope_batch(float *bq, float *bk, int N, int n_heads, int n_
     int half_dim = head_dim / 2;
     int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
     if (sect_dims <= 0) sect_dims = half_dim;
+    /* Use rope_dim_count (= 2 * sect_dims) as freq denominator, not head_dim */
+    int rope_dim = 2 * sect_dims;
 
     /* Precompute per-dimension: freq[j] and which position axis to use (0=t,1=h,2=w) */
     float *freq = (float *)alloca(half_dim * sizeof(float));
     int *pos_axis = (int *)alloca(half_dim * sizeof(int));
 
     for (int j = 0; j < half_dim; j++) {
-        freq[j] = 1.0f / powf(freq_base, (float)(2 * j) / head_dim);
+        freq[j] = 1.0f / powf(freq_base, (float)(2 * j) / rope_dim);
         int sector = j % sect_dims;
         if (sector % 3 == 1 && sector < 3 * sections[1]) {
             pos_axis[j] = 1; /* height */
