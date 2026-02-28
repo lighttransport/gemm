@@ -290,6 +290,47 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 9b. scale_add_f32: dst += scale * src (MoE expert accumulate) ---- */\n"
+"__global__ void scale_add_f32(float *dst, const float *src, float scale, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) {\n"
+"        dst[i] += scale * src[i];\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 9c. matvec_f32_f32: F32 matrix x F32 vector -> F32 (for MoE router) ---- */\n"
+"__global__ void matvec_f32_f32(float *dst, const float *mat, const float *x,\n"
+"                                int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"\n"
+"    const float *row_ptr = mat + (size_t)row * n_cols;\n"
+"    float sum = 0.0f;\n"
+"    for (int j = tid; j < n_cols; j += nthreads) {\n"
+"        sum += row_ptr[j] * x[j];\n"
+"    }\n"
+"\n"
+"    /* Warp shuffle reduction */\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    }\n"
+"\n"
+"    __shared__ float warp_sums[8];\n"
+"    int warp_id = tid / 32;\n"
+"    int lane = tid % 32;\n"
+"    if (lane == 0) warp_sums[warp_id] = sum;\n"
+"    __syncthreads();\n"
+"\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += warp_sums[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- dp4a: INT8 dot product via inline PTX (sm_61+) ---- */\n"
 "__device__ __forceinline__ int dp4a_s8(int a, int b, int c) {\n"
 "    asm(\"dp4a.s32.s32 %0, %1, %2, %0;\" : \"+r\"(c) : \"r\"(a), \"r\"(b));\n"
@@ -684,6 +725,65 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 17b. matvec_q5_K_f32: Q5_K matrix x F32 vector -> F32 ---- */\n"
+"/* Q5_K block: 176 bytes = d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128], 256 elements */\n"
+"__global__ void matvec_q5_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                  int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 176;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
+"        const unsigned char *bp = row_ptr + b * 176;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qh = bp + 16;\n"
+"        const unsigned char *qs = bp + 48;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        int is = 0;\n"
+"        /* Note: qhbits extracted inline below */\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0;\n"
+"            float d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int qhbit = (qh[l] >> j) & 1;\n"
+"                partial += (d1 * ((q[l] & 0xF) | (qhbit << 4)) - m1) * xb[yi++];\n"
+"            }\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int qhbit = (qh[l] >> (j + 4)) & 1;\n"
+"                partial += (d2 * ((q[l] >> 4) | (qhbit << 4)) - m2) * xb[yi++];\n"
+"            }\n"
+"            is += 2;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    __shared__ float ws5[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws5[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) total += ws5[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- 18. embed_q2_K: Q2_K embedding lookup -> F32 ---- */\n"
 "__global__ void embed_q2_K(float *dst, const unsigned char *embd_table,\n"
 "                             int token_id, int n_embd) {\n"
@@ -938,6 +1038,29 @@ typedef struct {
     int attn_q_type, attn_k_type, attn_v_type, attn_output_type;
     int ffn_gate_type, ffn_up_type, ffn_down_type;
 
+    /* MoE fields — only used when is_moe=1 */
+    int is_moe;
+    CUdeviceptr moe_gate_w;         /* F32 [n_experts, n_embd] — router */
+    int moe_gate_rows, moe_gate_cols;
+
+    CUdeviceptr moe_gate_exps_w;    /* K-quant [expert_ff, n_embd, n_experts] — 3D packed */
+    CUdeviceptr moe_up_exps_w;      /* K-quant [expert_ff, n_embd, n_experts] */
+    CUdeviceptr moe_down_exps_w;    /* K-quant [n_embd, expert_ff, n_experts] */
+    int moe_gate_exps_type, moe_up_exps_type, moe_down_exps_type;
+    int moe_exp_rows_gu, moe_exp_cols_gu;   /* per-expert dims for gate/up: [expert_ff, n_embd] */
+    int moe_exp_rows_d, moe_exp_cols_d;     /* per-expert dims for down: [n_embd, expert_ff] */
+    size_t moe_exp_stride_gu;       /* byte stride between experts in gate/up tensors */
+    size_t moe_exp_stride_d;        /* byte stride between experts in down tensor */
+
+    CUdeviceptr moe_shared_gate_w;      /* F32 [n_embd] — shared expert sigmoid gate */
+    CUdeviceptr moe_shared_ffn_gate_w;  /* F16/BF16 [shared_ff, n_embd] — shared expert */
+    CUdeviceptr moe_shared_ffn_up_w;    /* F16/BF16 [shared_ff, n_embd] */
+    CUdeviceptr moe_shared_ffn_down_w;  /* F16/BF16 [n_embd, shared_ff] */
+    int moe_shared_gate_type, moe_shared_up_type, moe_shared_down_type;
+    int moe_shared_gate_rows, moe_shared_gate_cols;
+    int moe_shared_up_rows, moe_shared_up_cols;
+    int moe_shared_down_rows, moe_shared_down_cols;
+
     /* SSM (Delta-Net) layer fields — only used when is_ssm=1 */
     int is_ssm;
     CUdeviceptr ssm_qkv_w;      /* [qkv_dim, n_embd] quantized */
@@ -986,6 +1109,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q2_K_f32;
     CUfunction fn_matvec_q3_K_f32;
     CUfunction fn_matvec_q4_K_f32;
+    CUfunction fn_matvec_q5_K_f32;
     CUfunction fn_matvec_q6_K_f32;
     CUfunction fn_embed_q2_K;
     /* SSM kernels */
@@ -998,6 +1122,9 @@ struct cuda_llm_runner {
     CUfunction fn_gated_rmsnorm_silu_f32;
     CUfunction fn_sigmoid_mul_f32;
     CUfunction fn_deinterleave_qgate_f32;
+    /* MoE kernels */
+    CUfunction fn_scale_add_f32;
+    CUfunction fn_matvec_f32_f32;
 
     /* Model params */
     int n_layers;
@@ -1024,6 +1151,18 @@ struct cuda_llm_runner {
     int ssm_dt_rank;
     int ssm_d_inner;
     int ssm_qkv_dim;
+
+    /* MoE params */
+    int is_moe;
+    int n_experts;
+    int n_experts_used;   /* top-k */
+    int expert_ff;        /* per-expert FFN dim */
+    int shared_expert_ff; /* shared expert FFN dim */
+
+    /* MoE scratch buffers */
+    CUdeviceptr d_router_logits;  /* [n_experts] F32 */
+    CUdeviceptr d_moe_accum;      /* [n_embd] F32 */
+    float *h_router_logits;       /* host copy for top-k selection */
 
     /* GPU weights */
     int token_embd_type;        /* GGML_TYPE_F16 or GGML_TYPE_Q8_0 */
@@ -1176,6 +1315,7 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q3_K_f32);
     GET_FUNC(matvec_q4_K_f32);
+    GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
     /* SSM kernels */
@@ -1188,11 +1328,14 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(gated_rmsnorm_silu_f32);
     GET_FUNC(sigmoid_mul_f32);
     GET_FUNC(deinterleave_qgate_f32);
+    /* MoE kernels */
+    GET_FUNC(scale_add_f32);
+    GET_FUNC(matvec_f32_f32);
 
     #undef GET_FUNC
 
     if (r->verbose >= 1) {
-        fprintf(stderr, "cuda_llm: all 27 kernels compiled successfully\n");
+        fprintf(stderr, "cuda_llm: all 30 kernels compiled successfully\n");
     }
     return 0;
 }
@@ -1258,9 +1401,9 @@ static int upload_f16_matrix(CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
     size_t nbytes = (size_t)t->n_rows * t->n_cols * sizeof(uint16_t);  /* F16 = 2 bytes */
     CUresult err = cuMemAlloc(d_ptr, nbytes);
-    if (err != CUDA_SUCCESS) return -1;
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_f16_matrix alloc failed (%zu bytes, err=%d)\n", nbytes, (int)err); return -1; }
     err = cuMemcpyHtoD(*d_ptr, t->data, nbytes);
-    if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_f16_matrix copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
 
@@ -1268,13 +1411,13 @@ static int upload_f16_matrix(CUdeviceptr *d_ptr, const qtensor *t) {
 static int upload_norm_f32(CUdeviceptr *d_ptr, const qtensor *t, int n) {
     if (!t->data) { *d_ptr = 0; return 0; }
     float *buf = (float *)malloc(n * sizeof(float));
-    if (!buf) return -1;
+    if (!buf) { fprintf(stderr, "cuda_llm: upload_norm_f32 malloc failed (n=%d)\n", n); return -1; }
     dequant_row(t->type, t->data, buf, n);
     CUresult err = cuMemAlloc(d_ptr, n * sizeof(float));
-    if (err != CUDA_SUCCESS) { free(buf); return -1; }
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 alloc failed (n=%d, err=%d)\n", n, (int)err); free(buf); return -1; }
     err = cuMemcpyHtoD(*d_ptr, buf, n * sizeof(float));
     free(buf);
-    if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
 
@@ -1314,10 +1457,28 @@ static int upload_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
     size_t nbytes = dequant_row_size(t->type, t->n_cols) * (size_t)t->n_rows;
     CUresult err = cuMemAlloc(d_ptr, nbytes);
-    if (err != CUDA_SUCCESS) return -1;
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_kquant_raw alloc failed (%zu bytes, type=%d, err=%d)\n", nbytes, t->type, (int)err); return -1; }
     err = cuMemcpyHtoD(*d_ptr, t->data, nbytes);
-    if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_kquant_raw copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
+}
+
+/* F32 → F16 conversion (truncation, no rounding) */
+static uint16_t cllm_f32_to_f16(float f) {
+    union { float f; uint32_t i; } u;
+    u.f = f;
+    uint32_t x = u.i;
+    uint16_t sign = (uint16_t)((x >> 16) & 0x8000);
+    int32_t exp = ((x >> 23) & 0xFF) - 127;
+    uint32_t mant = x & 0x7FFFFF;
+    if (exp > 15) return sign | 0x7C00;
+    if (exp < -14) {
+        if (exp < -24) return sign;
+        mant |= 0x800000;
+        mant >>= (-1 - exp);
+        return sign | (uint16_t)(mant >> 13);
+    }
+    return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
 }
 
 /* Upload a weight matrix - dispatches based on type */
@@ -1329,10 +1490,46 @@ static int upload_weight_matrix(CUdeviceptr *d_ptr, const qtensor *t, int *out_t
                t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K ||
                t->type == GGML_TYPE_Q6_K) {
         return upload_kquant_raw(d_ptr, t);
+    } else if (t->type == GGML_TYPE_BF16) {
+        /* BF16 → F32 → F16, then upload as F16 */
+        *out_type = GGML_TYPE_F16;
+        int n_elements = t->n_rows * t->n_cols;
+        float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
+        if (!f32_buf) return -1;
+        dequant_row(GGML_TYPE_BF16, t->data, f32_buf, n_elements);
+        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
+        if (!f16_buf) { free(f32_buf); return -1; }
+        for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_f32_to_f16(f32_buf[i]);
+        free(f32_buf);
+        size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
+        CUresult err = cuMemAlloc(d_ptr, nbytes);
+        if (err != CUDA_SUCCESS) { free(f16_buf); return -1; }
+        err = cuMemcpyHtoD(*d_ptr, f16_buf, nbytes);
+        free(f16_buf);
+        if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+        return 0;
     } else {
         /* Default: F16 (or treat as F16) */
+        fprintf(stderr, "cuda_llm: upload_weight_matrix: unhandled type %d, treating as F16 (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
         return upload_f16_matrix(d_ptr, t);
     }
+}
+
+/* Upload a 3D K-quant tensor (stacked experts) directly to GPU.
+ * Returns per-expert byte stride via out_stride. */
+static int upload_3d_kquant_raw(CUdeviceptr *d_ptr, const qtensor *t, size_t *out_stride) {
+    if (!t->data) { *d_ptr = 0; return 0; }
+    /* For 3D tensors: dims[0]=cols, dims[1]=rows_per_expert, dims[2]=n_experts
+     * Total rows = dims[1] * dims[2] (already computed in t->n_rows by cllm_load_tensor) */
+    size_t row_bytes = dequant_row_size(t->type, t->n_cols);
+    int rows_per_expert = (t->n_dims >= 3) ? (int)t->dims[1] : t->n_rows;
+    *out_stride = row_bytes * (size_t)rows_per_expert;
+    size_t total_bytes = row_bytes * (size_t)t->n_rows;
+    CUresult err = cuMemAlloc(d_ptr, total_bytes);
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_3d_kquant alloc failed (%zu bytes, type=%d, err=%d)\n", total_bytes, t->type, (int)err); return -1; }
+    err = cuMemcpyHtoD(*d_ptr, t->data, total_bytes);
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_3d_kquant copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    return 0;
 }
 
 /* ======================================================================== */
@@ -1390,7 +1587,8 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
 
     /* Detect architecture prefix */
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
+    if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
+    else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
     else if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
 
@@ -1425,10 +1623,11 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     }
     r->max_seq_len = max_seq_len;
 
-    /* Hybrid SSM (Qwen3.5) */
+    /* Hybrid SSM (Qwen3.5 / Qwen3.5-MoE) */
     r->is_hybrid = 0;
+    r->is_moe = 0;
     r->full_attn_interval = 0;
-    if (strcmp(arch, "qwen35") == 0) {
+    if (strcmp(arch, "qwen35") == 0 || strcmp(arch, "qwen35moe") == 0) {
         r->is_hybrid = 1;
         r->ssm_conv_kernel = cllm_get_int(gguf, ARCH_KEY("ssm.conv_kernel"), 4);
         r->ssm_d_state     = cllm_get_int(gguf, ARCH_KEY("ssm.state_size"), 128);
@@ -1441,6 +1640,21 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             fprintf(stderr, "cuda_llm: hybrid SSM: conv_k=%d d_state=%d n_group=%d dt_rank=%d d_inner=%d interval=%d qkv_dim=%d\n",
                     r->ssm_conv_kernel, r->ssm_d_state, r->ssm_n_group, r->ssm_dt_rank,
                     r->ssm_d_inner, r->full_attn_interval, r->ssm_qkv_dim);
+        }
+
+        /* MoE params (Qwen3.5-MoE) */
+        if (strcmp(arch, "qwen35moe") == 0) {
+            r->is_moe = 1;
+            r->n_experts       = cllm_get_int(gguf, ARCH_KEY("expert_count"), 256);
+            r->n_experts_used  = cllm_get_int(gguf, ARCH_KEY("expert_used_count"), 8);
+            r->expert_ff       = cllm_get_int(gguf, ARCH_KEY("expert_feed_forward_length"), 512);
+            r->shared_expert_ff = cllm_get_int(gguf, ARCH_KEY("expert_shared_feed_forward_length"), 512);
+            /* n_ff is not meaningful for MoE layers; set to expert_ff for scratch sizing */
+            r->n_ff = r->expert_ff;
+            if (r->verbose >= 1) {
+                fprintf(stderr, "cuda_llm: MoE: n_experts=%d n_experts_used=%d expert_ff=%d shared_expert_ff=%d\n",
+                        r->n_experts, r->n_experts_used, r->expert_ff, r->shared_expert_ff);
+            }
         }
     }
 
@@ -1472,6 +1686,27 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     } else if (embd.type == GGML_TYPE_Q2_K || embd.type == GGML_TYPE_Q3_K ||
                embd.type == GGML_TYPE_Q4_K || embd.type == GGML_TYPE_Q6_K) {
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
+    } else if (embd.type == GGML_TYPE_Q5_K) {
+        /* Q5_K → dequant to F16 at load time (no Q5_K embed kernel) */
+        int n_elements = embd.n_rows * embd.n_cols;
+        float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
+        if (!f32_buf) return -1;
+        for (int row = 0; row < embd.n_rows; row++) {
+            const void *row_data = (const uint8_t *)embd.data +
+                                    (size_t)row * dequant_row_size(embd.type, embd.n_cols);
+            dequant_row(embd.type, row_data, f32_buf + (size_t)row * embd.n_cols, embd.n_cols);
+        }
+        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
+        if (!f16_buf) { free(f32_buf); return -1; }
+        for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_f32_to_f16(f32_buf[i]);
+        free(f32_buf);
+        size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
+        CUresult err = cuMemAlloc(&r->d_token_embd, nbytes);
+        if (err != CUDA_SUCCESS) { free(f16_buf); return -1; }
+        err = cuMemcpyHtoD(r->d_token_embd, f16_buf, nbytes);
+        free(f16_buf);
+        if (err != CUDA_SUCCESS) { cuMemFree(r->d_token_embd); r->d_token_embd = 0; return -1; }
+        r->token_embd_type = GGML_TYPE_F16;  /* now stored as F16 */
     } else {
         if (upload_f16_matrix(&r->d_token_embd, &embd) != 0) return -1;
     }
@@ -1479,7 +1714,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         static const char *type_names[] = {
             [GGML_TYPE_F16] = "F16", [GGML_TYPE_Q8_0] = "Q8_0",
             [GGML_TYPE_Q2_K] = "Q2_K", [GGML_TYPE_Q3_K] = "Q3_K",
-            [GGML_TYPE_Q4_K] = "Q4_K", [GGML_TYPE_Q6_K] = "Q6_K",
+            [GGML_TYPE_Q4_K] = "Q4_K", [GGML_TYPE_Q5_K] = "Q5_K", [GGML_TYPE_Q6_K] = "Q6_K",
         };
         const char *tn = (embd.type < 15 && type_names[embd.type]) ? type_names[embd.type] : "unknown";
         fprintf(stderr, "cuda_llm: token_embd type=%s\n", tn);
@@ -1520,6 +1755,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     for (int l = 0; l < r->n_layers; l++) {
         char name[128];
         cuda_layer *cl = &r->layers[l];
+        if (r->verbose >= 2) fprintf(stderr, "cuda_llm: loading layer %d/%d\n", l, r->n_layers);
 
         /* Determine layer type for hybrid models */
         int is_ssm = (r->is_hybrid && r->full_attn_interval > 0 &&
@@ -1635,21 +1871,86 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         t = cllm_load_tensor(gguf, name, 1);
         if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
 
-        /* FFN gate/up/down — shared by all layer types */
-        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
-        t = cllm_load_tensor(gguf, name, 1);
-        cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
-        if (upload_weight_matrix(&cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
+        /* FFN weights */
+        if (r->is_moe) {
+            /* --- MoE FFN weights --- */
+            cl->is_moe = 1;
 
-        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
-        t = cllm_load_tensor(gguf, name, 1);
-        cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
-        if (upload_weight_matrix(&cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
+            /* Router: ffn_gate_inp [n_experts, n_embd] F32 */
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->moe_gate_rows = t.n_rows; cl->moe_gate_cols = t.n_cols;
+            if (upload_norm_f32(&cl->moe_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
 
-        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
-        t = cllm_load_tensor(gguf, name, 1);
-        cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
-        if (upload_weight_matrix(&cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
+            /* Expert 3D weights (K-quant packed) */
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->moe_gate_exps_type = t.type;
+            cl->moe_exp_cols_gu = t.n_cols;  /* n_embd (input dim) */
+            cl->moe_exp_rows_gu = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;  /* expert_ff */
+            if (upload_3d_kquant_raw(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+
+            snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->moe_up_exps_type = t.type;
+            if (upload_3d_kquant_raw(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu) != 0) return -1;
+
+            snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->moe_down_exps_type = t.type;
+            cl->moe_exp_cols_d = t.n_cols;   /* expert_ff (input dim) */
+            cl->moe_exp_rows_d = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;  /* n_embd */
+            if (upload_3d_kquant_raw(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d) != 0) return -1;
+
+            /* Shared expert gate: ffn_gate_inp_shexp [n_embd] F32 (1D sigmoid gate) */
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->moe_shared_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+
+            /* Shared expert FFN (BF16 → F16 via upload_weight_matrix) */
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->moe_shared_gate_rows = t.n_rows; cl->moe_shared_gate_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->moe_shared_ffn_gate_w, &t, &cl->moe_shared_gate_type) != 0) return -1;
+
+            snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->moe_shared_up_rows = t.n_rows; cl->moe_shared_up_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->moe_shared_ffn_up_w, &t, &cl->moe_shared_up_type) != 0) return -1;
+
+            snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->moe_shared_down_rows = t.n_rows; cl->moe_shared_down_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->moe_shared_ffn_down_w, &t, &cl->moe_shared_down_type) != 0) return -1;
+
+            if (r->verbose >= 2) {
+                fprintf(stderr, "  layer %d [MoE]: router[%d×%d] exp_gu[%d×%d] exp_d[%d×%d] stride_gu=%zu stride_d=%zu\n",
+                        l, cl->moe_gate_rows, cl->moe_gate_cols,
+                        cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                        cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                        cl->moe_exp_stride_gu, cl->moe_exp_stride_d);
+                fprintf(stderr, "         shared_gate[%d×%d] shared_up[%d×%d] shared_down[%d×%d]\n",
+                        cl->moe_shared_gate_rows, cl->moe_shared_gate_cols,
+                        cl->moe_shared_up_rows, cl->moe_shared_up_cols,
+                        cl->moe_shared_down_rows, cl->moe_shared_down_cols);
+            }
+        } else {
+            /* Dense FFN gate/up/down */
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
+
+            snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
+
+            snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
+            if (upload_weight_matrix(&cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
+        }
     }
 
     /* Allocate KV cache (skip SSM layers) */
@@ -1687,8 +1988,20 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     CHECK_CU(cuMemAlloc(&r->d_q,   q_dim * sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_k,   kv_dim * sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_v,   kv_dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_gate, r->n_ff * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_up,   r->n_ff * sizeof(float)));
+    {
+        int ff_dim = r->n_ff;
+        if (r->is_moe && r->shared_expert_ff > ff_dim) ff_dim = r->shared_expert_ff;
+        CHECK_CU(cuMemAlloc(&r->d_gate, ff_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_up,   ff_dim * sizeof(float)));
+    }
+
+    /* MoE scratch buffers */
+    if (r->is_moe) {
+        CHECK_CU(cuMemAlloc(&r->d_router_logits, r->n_experts * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_moe_accum, r->n_embd * sizeof(float)));
+        r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
+        if (!r->h_router_logits) return -1;
+    }
 
     /* SSM scratch buffers */
     if (r->is_hybrid) {
@@ -1746,9 +2059,20 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             weight_bytes += WEIGHT_BYTES(cl->attn_output_type, (size_t)cl->attn_output_rows * cl->attn_output_cols);
             if (cl->has_qk_norm) weight_bytes += r->head_dim * 4 * 2;
             weight_bytes += r->n_embd * 4;  /* ffn_norm */
-            weight_bytes += WEIGHT_BYTES(cl->ffn_gate_type, (size_t)cl->ffn_gate_rows * cl->ffn_gate_cols);
-            weight_bytes += WEIGHT_BYTES(cl->ffn_up_type, (size_t)cl->ffn_up_rows * cl->ffn_up_cols);
-            weight_bytes += WEIGHT_BYTES(cl->ffn_down_type, (size_t)cl->ffn_down_rows * cl->ffn_down_cols);
+            if (cl->is_moe) {
+                /* MoE: router + expert weights + shared expert */
+                weight_bytes += (size_t)cl->moe_gate_rows * cl->moe_gate_cols * 4;  /* router F32 */
+                weight_bytes += cl->moe_exp_stride_gu * r->n_experts * 2;  /* gate_exps + up_exps */
+                weight_bytes += cl->moe_exp_stride_d * r->n_experts;  /* down_exps */
+                weight_bytes += r->n_embd * 4;  /* shared gate F32 */
+                weight_bytes += WEIGHT_BYTES(cl->moe_shared_gate_type, (size_t)cl->moe_shared_gate_rows * cl->moe_shared_gate_cols);
+                weight_bytes += WEIGHT_BYTES(cl->moe_shared_up_type, (size_t)cl->moe_shared_up_rows * cl->moe_shared_up_cols);
+                weight_bytes += WEIGHT_BYTES(cl->moe_shared_down_type, (size_t)cl->moe_shared_down_rows * cl->moe_shared_down_cols);
+            } else {
+                weight_bytes += WEIGHT_BYTES(cl->ffn_gate_type, (size_t)cl->ffn_gate_rows * cl->ffn_gate_cols);
+                weight_bytes += WEIGHT_BYTES(cl->ffn_up_type, (size_t)cl->ffn_up_rows * cl->ffn_up_cols);
+                weight_bytes += WEIGHT_BYTES(cl->ffn_down_type, (size_t)cl->ffn_down_rows * cl->ffn_down_cols);
+            }
         }
         #undef WEIGHT_BYTES
         size_t cache_bytes = (size_t)r->n_layers * 2 * kv_cache_size;
@@ -1760,7 +2084,9 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         else if (cl0->attn_q_type == GGML_TYPE_Q2_K) wtype = "Q2_K";
         else if (cl0->attn_q_type == GGML_TYPE_Q3_K) wtype = "Q3_K";
         else if (cl0->attn_q_type == GGML_TYPE_Q4_K) wtype = "Q4_K";
+        else if (cl0->attn_q_type == GGML_TYPE_Q5_K) wtype = "Q5_K";
         else if (cl0->attn_q_type == GGML_TYPE_Q6_K) wtype = "Q6_K";
+        if (r->is_moe) wtype = "MoE+K-quant";
         fprintf(stderr, "cuda_llm: VRAM usage: weights=%.1f MB (%s), KV cache=%.1f MB, scratch=%.1f KB\n",
                 (double)weight_bytes / (1024.0*1024.0), wtype,
                 (double)cache_bytes / (1024.0*1024.0),
@@ -1926,6 +2252,13 @@ static inline void launch_matvec_q4_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                    n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                        CUdeviceptr x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q5_K_f32,
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_q6_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -1948,6 +2281,7 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
         case GGML_TYPE_Q2_K: launch_matvec_q2_K(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q3_K: launch_matvec_q3_K(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q4_K: launch_matvec_q4_K(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_Q5_K: launch_matvec_q5_K(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q6_K: launch_matvec_q6_K(r, dst, mat, x, n_rows, n_cols); break;
         default:             launch_matvec(r, dst, mat, x, n_rows, n_cols); break;
     }
@@ -2024,6 +2358,60 @@ static inline void launch_deinterleave_qgate(cuda_llm_runner *r, CUdeviceptr q,
     void *args[] = { &q, &gate, &qfull, &n_heads, &head_dim };
     cuLaunchKernel(r->fn_deinterleave_qgate_f32,
                    (total + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+/* ---- MoE launch helpers ---- */
+
+static inline void launch_scale_add(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr src,
+                                     float scale, int n) {
+    void *args[] = { &dst, &src, &scale, &n };
+    cuLaunchKernel(r->fn_scale_add_f32,
+                   (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+static inline void launch_matvec_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                      CUdeviceptr x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_f32_f32,
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+/* Top-K softmax for MoE routing: select top-k experts and compute softmax weights */
+static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, float *out_weights) {
+    /* Initialize with -inf */
+    for (int i = 0; i < k; i++) { out_idx[i] = -1; out_weights[i] = -1e30f; }
+
+    /* Simple selection sort for top-k (k is small, typically 8) */
+    for (int ki = 0; ki < k; ki++) {
+        float best = -1e30f;
+        int best_idx = -1;
+        for (int i = 0; i < n; i++) {
+            /* Skip already selected */
+            int skip = 0;
+            for (int j = 0; j < ki; j++) {
+                if (out_idx[j] == i) { skip = 1; break; }
+            }
+            if (skip) continue;
+            if (logits[i] > best) { best = logits[i]; best_idx = i; }
+        }
+        out_idx[ki] = best_idx;
+        out_weights[ki] = best;
+    }
+
+    /* Softmax over selected weights */
+    float max_val = out_weights[0];
+    for (int i = 1; i < k; i++) {
+        if (out_weights[i] > max_val) max_val = out_weights[i];
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) {
+        out_weights[i] = expf(out_weights[i] - max_val);
+        sum += out_weights[i];
+    }
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < k; i++) {
+        out_weights[i] *= inv_sum;
+    }
 }
 
 /* ======================================================================== */
@@ -2680,21 +3068,97 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
         /* FFN RMSNorm: xb = rmsnorm(x, ffn_norm) */
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
 
-        /* FFN gate and up projections */
-        launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
-                      cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
-        launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
-                      cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+        if (cl->is_moe) {
+            /* ---- MoE FFN ---- */
+            int n_experts = r->n_experts;
+            int n_experts_used = r->n_experts_used;
+            int expert_ff = r->expert_ff;
+            int shared_expert_ff = r->shared_expert_ff;
 
-        /* SiLU(gate) * up */
-        launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
+            /* 1. Router: logits = gate_inp @ xb → [n_experts] (F32 matvec) */
+            launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
+                             cl->moe_gate_rows, cl->moe_gate_cols);
 
-        /* FFN down projection: xb = ffn_down @ gate */
-        launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
-                      cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+            /* 2. Top-k on CPU (sync + download n_experts floats → pick top-k + softmax) */
+            cuStreamSynchronize(r->stream);
+            cuMemcpyDtoH(r->h_router_logits, r->d_router_logits, n_experts * sizeof(float));
+            int top_k_idx[64];  /* max 64 experts selected */
+            float top_k_weights[64];
+            moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_k_idx, top_k_weights);
 
-        /* CPU cross-check of FFN matvecs for layer 0 (debug_layers >= 3) */
-        if (r->debug_layers >= 3 && l == 0) {
+            /* Debug: print routing info for first layer */
+            /* 3. Zero accumulator */
+            cuMemsetD32(r->d_moe_accum, 0, n_embd);
+
+            /* 4. For each selected expert */
+            for (int e = 0; e < n_experts_used; e++) {
+                int eidx = top_k_idx[e];
+                CUdeviceptr gate_w = cl->moe_gate_exps_w + (size_t)eidx * cl->moe_exp_stride_gu;
+                CUdeviceptr up_w   = cl->moe_up_exps_w   + (size_t)eidx * cl->moe_exp_stride_gu;
+                CUdeviceptr down_w = cl->moe_down_exps_w  + (size_t)eidx * cl->moe_exp_stride_d;
+
+                /* gate = expert_gate @ xb, up = expert_up @ xb */
+                launch_matvec_auto(r, r->d_gate, gate_w, r->d_xb,
+                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_gate_exps_type);
+                launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
+                                  cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
+
+                /* SiLU(gate) * up */
+                launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
+
+                /* down = expert_down @ gate → d_xb2 */
+                launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
+                                  cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
+
+                /* Weighted accumulate: moe_accum += weight * xb2 */
+                launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_k_weights[e], n_embd);
+            }
+
+            /* 5. Shared expert */
+            {
+                /* Compute gate scalar: sigmoid(dot(xb, shared_gate_w))
+                 * shared_gate_w is [n_embd] F32, treated as [1, n_embd] matvec → [1] */
+                launch_matvec_f32(r, r->d_router_logits, cl->moe_shared_gate_w, r->d_xb,
+                                 1, n_embd);
+                cuStreamSynchronize(r->stream);
+                float gate_val;
+                cuMemcpyDtoH(&gate_val, r->d_router_logits, sizeof(float));
+                float shared_scale = 1.0f / (1.0f + expf(-gate_val));  /* sigmoid */
+
+                /* Shared expert FFN: gate, up, silu_mul, down */
+                launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                                  cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+                launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                                  cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+                launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+                launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                                  cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+
+                /* moe_accum += shared_scale * xb2 */
+                launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
+            }
+
+            /* 6. Copy accumulated result to xb for residual */
+            cuMemcpyDtoDAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float), r->stream);
+
+        } else {
+            /* ---- Dense FFN ---- */
+            /* FFN gate and up projections */
+            launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                          cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
+            launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                          cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+
+            /* SiLU(gate) * up */
+            launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
+
+            /* FFN down projection: xb = ffn_down @ gate */
+            launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
+                          cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+        }
+
+        /* CPU cross-check of FFN matvecs for layer 0 (debug_layers >= 3, dense only) */
+        if (r->debug_layers >= 3 && l == 0 && !cl->is_moe) {
             cuStreamSynchronize(r->stream);
 
             /* Download GPU input (d_xb = RMSNorm output, input to FFN gate/up) */
@@ -2955,6 +3419,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_ssm_conv_out) cuMemFree(r->d_ssm_conv_out);
     if (r->d_attn_gate)    cuMemFree(r->d_attn_gate);
     if (r->d_ds_tmp)   cuMemFree(r->d_ds_tmp);
+    if (r->d_router_logits) cuMemFree(r->d_router_logits);
+    if (r->d_moe_accum)    cuMemFree(r->d_moe_accum);
+    free(r->h_router_logits);
     if (r->d_xb_q)    cuMemFree(r->d_xb_q);
     if (r->d_xb_scale) cuMemFree(r->d_xb_scale);
 
@@ -2999,6 +3466,15 @@ void cuda_llm_free(cuda_llm_runner *r) {
             if (cl->ssm_norm_w)     cuMemFree(cl->ssm_norm_w);
             if (cl->d_conv_state)      cuMemFree(cl->d_conv_state);
             if (cl->d_recurrent_state) cuMemFree(cl->d_recurrent_state);
+            /* MoE weights */
+            if (cl->moe_gate_w)             cuMemFree(cl->moe_gate_w);
+            if (cl->moe_gate_exps_w)        cuMemFree(cl->moe_gate_exps_w);
+            if (cl->moe_up_exps_w)          cuMemFree(cl->moe_up_exps_w);
+            if (cl->moe_down_exps_w)        cuMemFree(cl->moe_down_exps_w);
+            if (cl->moe_shared_gate_w)      cuMemFree(cl->moe_shared_gate_w);
+            if (cl->moe_shared_ffn_gate_w)  cuMemFree(cl->moe_shared_ffn_gate_w);
+            if (cl->moe_shared_ffn_up_w)    cuMemFree(cl->moe_shared_ffn_up_w);
+            if (cl->moe_shared_ffn_down_w)  cuMemFree(cl->moe_shared_ffn_down_w);
         }
         free(r->layers);
     }

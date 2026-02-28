@@ -254,9 +254,16 @@ int main(int argc, char **argv) {
                 vmin, vmax, sqrtf(vnorm));
     }
 
+    /* Free vision encoder GPU weights — no longer needed after encoding */
+    fprintf(stderr, "Freeing vision encoder to reclaim VRAM...\n");
+    cuda_vision_free(cuda_vis);
+    cuda_vis = NULL;
+    gguf_close(gguf_mmproj);
+    gguf_mmproj = NULL;
+
     /* ---- 6. Load LLM model ---- */
     fprintf(stderr, "\nLoading LLM model: %s\n", model_path);
-    gguf_context *gguf_llm = gguf_open(model_path, 0);
+    gguf_context *gguf_llm = gguf_open(model_path, 1);
     if (!gguf_llm) { fprintf(stderr, "Failed to open LLM GGUF\n"); return 1; }
 
     bpe_vocab *vocab = bpe_vocab_load(gguf_llm);
@@ -265,7 +272,7 @@ int main(int argc, char **argv) {
 
     /* Need enough seq_len for prompt + vision tokens + generation */
     int max_seq_len = n_vision_tokens + 256 + max_gen;
-    if (max_seq_len < 2048) max_seq_len = 2048;
+    if (max_seq_len < 1024) max_seq_len = 1024;
 
     fprintf(stderr, "Initializing CUDA LLM runner (max_seq_len=%d)...\n", max_seq_len);
     cuda_llm_runner *llm = cuda_llm_init(0, 1);
@@ -395,11 +402,11 @@ int main(int argc, char **argv) {
     /* ---- 10. Cleanup ---- */
     fprintf(stderr, "\nCleaning up...\n");
     free(vision_embd);
-    cuda_vision_free(cuda_vis);
+    if (cuda_vis) cuda_vision_free(cuda_vis);
     vision_free(vm);
     cuda_llm_free(llm);
     bpe_vocab_free(vocab);
-    gguf_close(gguf_mmproj);
+    if (gguf_mmproj) gguf_close(gguf_mmproj);
     gguf_close(gguf_llm);
 
     fprintf(stderr, "Done.\n");
