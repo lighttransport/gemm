@@ -1,5 +1,5 @@
 /*
- * bpe_tokenizer.h - Single-file BPE tokenizer for Qwen2 models (loads from GGUF)
+ * bpe_tokenizer.h - Single-file BPE tokenizer for Qwen2/Qwen3.5 models (loads from GGUF)
  *
  * Usage:
  *   #define BPE_TOKENIZER_IMPLEMENTATION
@@ -311,6 +311,10 @@ static int32_t bpe_hm_get(const bpe_hashmap *hm, const char *key, int key_len) {
 
 /* ---- Vocab structure ---- */
 
+/* Pre-tokenizer types */
+#define BPE_PRE_TYPE_QWEN2  11
+#define BPE_PRE_TYPE_QWEN35 46
+
 struct bpe_vocab {
     int n_tokens;
     char **token_strs;   /* token_strs[id] = string */
@@ -318,6 +322,7 @@ struct bpe_vocab {
     bpe_hashmap token_to_id;  /* token_str -> token_id */
     bpe_hashmap merge_ranks;  /* "left\0right" -> rank */
     int32_t eos_id, bos_id, eot_id, pad_id, unk_id;
+    int pre_type;         /* BPE_PRE_TYPE_QWEN2 or BPE_PRE_TYPE_QWEN35 */
 
     /* Special tokens (type=3 control tokens like <|im_start|>) */
     int n_special;
@@ -355,6 +360,19 @@ bpe_vocab *bpe_vocab_load(gguf_context *gguf) {
     vocab->eot_id = -1;
     vocab->pad_id = -1;
     vocab->unk_id = -1;
+    vocab->pre_type = BPE_PRE_TYPE_QWEN2; /* default */
+
+    /* Detect pre-tokenizer type from GGUF */
+    {
+        int pre_idx = gguf_find_key(gguf, "tokenizer.ggml.pre");
+        if (pre_idx >= 0 && gguf->kv[pre_idx].type == GGUF_TYPE_STRING) {
+            const char *pre_str = gguf->kv[pre_idx].value.str.str;
+            if (strcmp(pre_str, "qwen35") == 0) {
+                vocab->pre_type = BPE_PRE_TYPE_QWEN35;
+                fprintf(stderr, "bpe: using qwen35 pre-tokenizer\n");
+            }
+        }
+    }
 
     /* Build token_to_id map */
     bpe_hm_init(&vocab->token_to_id, n_tokens * 2 + 1);
@@ -548,7 +566,13 @@ static void bpe_wl_free(bpe_word_list *wl) {
     free(wl->lens);
 }
 
-static bpe_word_list bpe_pretokenize_qwen2(const char *text, int text_len) {
+/*
+ * Pretokenizer for Qwen2/Qwen3.5 models.
+ * marks_with_letters: if 1, \p{M} (combining marks) group with \p{L} (letters).
+ *   qwen2: marks_with_letters=0  -> \p{L}+
+ *   qwen35: marks_with_letters=1 -> [\p{L}\p{M}]+
+ */
+static bpe_word_list bpe_pretokenize_qwen(const char *text, int text_len, int marks_with_letters) {
     bpe_word_list wl;
     bpe_wl_init(&wl);
 
@@ -559,7 +583,8 @@ static bpe_word_list bpe_pretokenize_qwen2(const char *text, int text_len) {
 
     #define CPT(p) ((p) >= 0 && (p) < n ? cpts[p] : 0xFFFFFFFFu)
     #define FLAGS(p) ((p) >= 0 && (p) < n ? bpe_cpt_flags(cpts[p]) : 0)
-    #define IS_LETTER(f) ((f) & BPE_FLAG_LETTER)
+    /* IS_LM: letter, or letter+mark when marks_with_letters is set */
+    #define IS_LM(f) ((f) & (BPE_FLAG_LETTER | (marks_with_letters ? BPE_FLAG_ACCENT_MARK : 0)))
     #define IS_NUMBER(f) ((f) & BPE_FLAG_NUMBER)
     #define IS_WS(f) ((f) & BPE_FLAG_WHITESPACE)
 
@@ -595,11 +620,11 @@ static bpe_word_list bpe_pretokenize_qwen2(const char *text, int text_len) {
             }
         }
 
-        /* [^\r\n\p{L}\p{N}]?\p{L}+ */
+        /* [^\r\n\p{L}\p{N}]?[\p{L}(\p{M})?]+ */
         if (!(cpt == '\r' || cpt == '\n' || IS_NUMBER(flags))) {
-            if (IS_LETTER(flags) || IS_LETTER(FLAGS(pos + 1))) {
+            if (IS_LM(flags) || IS_LM(FLAGS(pos + 1))) {
                 int p = pos + 1;
-                while (IS_LETTER(FLAGS(p))) p++;
+                while (IS_LM(FLAGS(p))) p++;
                 ADD_TOKEN(p);
                 pos = p;
                 continue;
@@ -613,14 +638,14 @@ static bpe_word_list bpe_pretokenize_qwen2(const char *text, int text_len) {
             continue;
         }
 
-        /* <space>?[^\s\p{L}\p{N}]+[\r\n]* */
+        /* <space>?[^\s\p{L}(\p{M})?\p{N}]+[\r\n]* */
         {
             uint16_t f2 = (cpt == ' ') ? FLAGS(pos + 1) : flags;
-            if (!(IS_WS(f2) | IS_LETTER(f2) | IS_NUMBER(f2)) && f2) {
+            if (!(IS_WS(f2) | IS_LM(f2) | IS_NUMBER(f2)) && f2) {
                 int p = pos + (cpt == ' ');
                 while (p < n) {
                     uint16_t ff = FLAGS(p);
-                    if (IS_WS(ff) | IS_LETTER(ff) | IS_NUMBER(ff) || !ff) break;
+                    if (IS_WS(ff) | IS_LM(ff) | IS_NUMBER(ff) || !ff) break;
                     p++;
                 }
                 /* consume trailing \r\n */
@@ -673,7 +698,7 @@ static bpe_word_list bpe_pretokenize_qwen2(const char *text, int text_len) {
 
     #undef CPT
     #undef FLAGS
-    #undef IS_LETTER
+    #undef IS_LM
     #undef IS_NUMBER
     #undef IS_WS
     #undef ADD_TOKEN
@@ -878,7 +903,8 @@ static int bpe_tokenize_word(const bpe_vocab *vocab, const char *word, int word_
 static int bpe_tokenize_segment(const bpe_vocab *vocab, const char *text, int text_len,
                                 int32_t *tokens, int max_tokens) {
     if (text_len <= 0) return 0;
-    bpe_word_list wl = bpe_pretokenize_qwen2(text, text_len);
+    int marks_with_letters = (vocab->pre_type == BPE_PRE_TYPE_QWEN35) ? 1 : 0;
+    bpe_word_list wl = bpe_pretokenize_qwen(text, text_len, marks_with_letters);
     int total = 0;
     for (int w = 0; w < wl.n; w++) {
         int32_t *dst = tokens ? tokens + total : NULL;

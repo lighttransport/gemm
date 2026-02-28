@@ -1128,14 +1128,20 @@ void dequantize_row_q4_K(const void *src, float *dst, int n) {
         const float dmin = ggml_fp16_to_fp32(b->dmin);
         float *y = dst + i * 256;
 
-        for (int j = 0; j < 8; j++) {
-            uint8_t sc, m;
-            get_scale_min_k4(j, b->scales, &sc, &m);
-            const float dl = d * sc;
-            const float ml = dmin * m;
-            const uint8_t *q = b->qs + j * 16;
-            for (int l = 0; l < 16; l++) *y++ = dl * (q[l] & 0xF) - ml;
-            for (int l = 0; l < 16; l++) *y++ = dl * (q[l] >> 4) - ml;
+        const uint8_t *q = b->qs;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m_val;
+            get_scale_min_k4(is + 0, b->scales, &sc, &m_val);
+            const float d1 = d * sc;
+            const float m1 = dmin * m_val;
+            get_scale_min_k4(is + 1, b->scales, &sc, &m_val);
+            const float d2 = d * sc;
+            const float m2 = dmin * m_val;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
         }
     }
 }
