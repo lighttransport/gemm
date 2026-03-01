@@ -43,13 +43,14 @@ static void print_hidden_stats(const float *hidden, int n_embd) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <model.gguf> [prompt] [max_gen_tokens]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> [prompt] [max_gen_tokens] [n_threads]\n", argv[0]);
         return 1;
     }
 
     const char *model_path = argv[1];
     const char *prompt = (argc >= 3) ? argv[2] : "Hello";
     int max_gen = (argc >= 4) ? atoi(argv[3]) : 32;
+    int n_threads = (argc >= 5) ? atoi(argv[4]) : 1;
 
     srand((unsigned)time(NULL));
 
@@ -81,6 +82,8 @@ int main(int argc, char **argv) {
         gguf_close(gguf);
         return 1;
     }
+
+    if (n_threads > 1) transformer_set_threads(model, n_threads);
 
     /* Tokenize prompt */
     fprintf(stderr, "Prompt: \"%s\"\n", prompt);
