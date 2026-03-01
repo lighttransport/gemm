@@ -759,11 +759,11 @@ static const char *cuda_kernel_source =
 "            float d2 = d * sv1, m2 = dmin * mv1;\n"
 "            const unsigned char *q = qs + j * 32;\n"
 "            for (int l = 0; l < 32; l++) {\n"
-"                int qhbit = (qh[l] >> j) & 1;\n"
+"                int qhbit = (qh[l] >> (2*j)) & 1;\n"
 "                partial += (d1 * ((q[l] & 0xF) | (qhbit << 4)) - m1) * xb[yi++];\n"
 "            }\n"
 "            for (int l = 0; l < 32; l++) {\n"
-"                int qhbit = (qh[l] >> (j + 4)) & 1;\n"
+"                int qhbit = (qh[l] >> (2*j + 1)) & 1;\n"
 "                partial += (d2 * ((q[l] >> 4) | (qhbit << 4)) - m2) * xb[yi++];\n"
 "            }\n"
 "            is += 2;\n"
@@ -3086,7 +3086,25 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             float top_k_weights[64];
             moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_k_idx, top_k_weights);
 
-            /* Debug: print routing info for first layer */
+            /* MoE debug helper macro */
+            #define MOE_DBG_NORM(label, dptr, sz) do { \
+                if (r->debug_layers >= 2 && l == 0) { \
+                    cuStreamSynchronize(r->stream); \
+                    float _dbg[8]; int _dn = (sz) < 8 ? (sz) : 8; \
+                    cuMemcpyDtoH(_dbg, (dptr), _dn * sizeof(float)); \
+                    float _s = 0; for (int _i = 0; _i < _dn; _i++) _s += _dbg[_i]*_dbg[_i]; \
+                    fprintf(stderr, "  [L0 MoE] %s norm~%.4f first=[%.6f,%.6f,%.6f,%.6f]\n", \
+                            (label), sqrtf(_s*(float)(sz)/(float)_dn), _dbg[0],_dbg[1],_dbg[2],_dbg[3]); \
+                } } while(0)
+
+            /* Debug: routing info */
+            if (r->debug_layers >= 2 && l == 0) {
+                fprintf(stderr, "  [L0 MoE] router top-k:");
+                for (int e = 0; e < n_experts_used; e++)
+                    fprintf(stderr, " e%d(%.4f)", top_k_idx[e], top_k_weights[e]);
+                fprintf(stderr, "\n");
+            }
+
             /* 3. Zero accumulator */
             cuMemsetD32(r->d_moe_accum, 0, n_embd);
 
@@ -3103,6 +3121,50 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 launch_matvec_auto(r, r->d_up, up_w, r->d_xb,
                                   cl->moe_exp_rows_gu, cl->moe_exp_cols_gu, cl->moe_up_exps_type);
 
+                if (r->debug_layers >= 2 && l == 0 && e == 0) {
+                    MOE_DBG_NORM("e0 gate_out", r->d_gate, expert_ff);
+                    MOE_DBG_NORM("e0 up_out", r->d_up, expert_ff);
+
+                    /* CPU cross-check: verify Q2_K expert matvec for expert 0 */
+                    {
+                        cuStreamSynchronize(r->stream);
+                        /* Download FFN input (d_xb = post-norm) */
+                        float *cpu_xb = (float *)malloc(n_embd * sizeof(float));
+                        cuMemcpyDtoH(cpu_xb, r->d_xb, n_embd * sizeof(float));
+                        /* Download GPU gate output for comparison */
+                        float *gpu_gate_out = (float *)malloc(expert_ff * sizeof(float));
+                        cuMemcpyDtoH(gpu_gate_out, r->d_gate, expert_ff * sizeof(float));
+                        /* Download expert gate weight raw bytes from GPU */
+                        size_t exp_bytes = cl->moe_exp_stride_gu;
+                        unsigned char *gate_raw = (unsigned char *)malloc(exp_bytes);
+                        cuMemcpyDtoH(gate_raw, gate_w, exp_bytes);
+                        /* CPU dequant + matvec for a few rows */
+                        int exp_cols = cl->moe_exp_cols_gu;
+                        int exp_rows = cl->moe_exp_rows_gu;
+                        int row_bytes = (int)dequant_row_size(cl->moe_gate_exps_type, exp_cols);
+                        float *dqbuf = (float *)malloc(exp_cols * sizeof(float));
+                        fprintf(stderr, "  [L0 MoE CPU cross-check] exp type=%d rows=%d cols=%d stride=%zu row_bytes=%d\n",
+                                cl->moe_gate_exps_type, exp_rows, exp_cols, exp_bytes, row_bytes);
+                        fprintf(stderr, "  [L0 MoE CPU cross-check] xb_input first=[%.6f,%.6f,%.6f,%.6f]\n",
+                                cpu_xb[0], cpu_xb[1], cpu_xb[2], cpu_xb[3]);
+                        int check_rows[] = {0, 1, 10, 100, exp_rows/2, exp_rows-1};
+                        float max_err = 0;
+                        for (int ci = 0; ci < 6; ci++) {
+                            int row = check_rows[ci];
+                            if (row >= exp_rows) continue;
+                            dequant_row(cl->moe_gate_exps_type, gate_raw + (size_t)row * row_bytes, dqbuf, exp_cols);
+                            float cpu_dot = 0;
+                            for (int j = 0; j < exp_cols; j++) cpu_dot += dqbuf[j] * cpu_xb[j];
+                            float err = fabsf(cpu_dot - gpu_gate_out[row]);
+                            if (err > max_err) max_err = err;
+                            fprintf(stderr, "    row %3d: CPU=%.6f GPU=%.6f err=%.6f\n",
+                                    row, cpu_dot, gpu_gate_out[row], err);
+                        }
+                        fprintf(stderr, "    max_err=%.6f\n", max_err);
+                        free(cpu_xb); free(gpu_gate_out); free(gate_raw); free(dqbuf);
+                    }
+                }
+
                 /* SiLU(gate) * up */
                 launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
 
@@ -3110,9 +3172,16 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 launch_matvec_auto(r, r->d_xb2, down_w, r->d_gate,
                                   cl->moe_exp_rows_d, cl->moe_exp_cols_d, cl->moe_down_exps_type);
 
+                if (r->debug_layers >= 2 && l == 0 && e == 0) {
+                    MOE_DBG_NORM("e0 silu_mul", r->d_gate, expert_ff);
+                    MOE_DBG_NORM("e0 down_out", r->d_xb2, n_embd);
+                }
+
                 /* Weighted accumulate: moe_accum += weight * xb2 */
                 launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_k_weights[e], n_embd);
             }
+
+            MOE_DBG_NORM("experts_accum", r->d_moe_accum, n_embd);
 
             /* 5. Shared expert */
             {
@@ -3125,6 +3194,9 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 cuMemcpyDtoH(&gate_val, r->d_router_logits, sizeof(float));
                 float shared_scale = 1.0f / (1.0f + expf(-gate_val));  /* sigmoid */
 
+                if (r->debug_layers >= 2 && l == 0)
+                    fprintf(stderr, "  [L0 MoE] shared_gate=%.6f sigmoid=%.6f\n", gate_val, shared_scale);
+
                 /* Shared expert FFN: gate, up, silu_mul, down */
                 launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
                                   cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
@@ -3134,9 +3206,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
                                   cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
 
+                MOE_DBG_NORM("shared_down_out", r->d_xb2, n_embd);
+
                 /* moe_accum += shared_scale * xb2 */
                 launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
             }
+
+            MOE_DBG_NORM("final_moe_out", r->d_moe_accum, n_embd);
+            #undef MOE_DBG_NORM
 
             /* 6. Copy accumulated result to xb for residual */
             cuMemcpyDtoDAsync(r->d_xb, r->d_moe_accum, n_embd * sizeof(float), r->stream);
