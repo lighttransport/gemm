@@ -965,6 +965,134 @@ static const char *cuda_kernel_source =
 "    gate_out[idx] = qfull[h * 2 * head_dim + head_dim + i];\n"
 "}\n"
 "\n"
+"/* ---- 31. matvec_iq2_xxs_f32: IQ2_XXS matrix x F32 vector -> F32 ---- */\n"
+"/* IQ2_XXS block: 66 bytes = d(f16) + qs[32](uint16), 256 elements */\n"
+"/* Lookup tables for IQ2_XXS codebook dequantization */\n"
+"__device__ static const unsigned long long iq2xxs_grid_dev[256] = {\n"
+"    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,\n"
+"    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x08080808082b0808ULL,\n"
+"    0x08080808082b082bULL, 0x08080808082b2b08ULL, 0x08080808082b2b2bULL, 0x0808080819080819ULL,\n"
+"    0x0808080819081908ULL, 0x0808080819190808ULL, 0x0808080819192b08ULL, 0x08080808192b0819ULL,\n"
+"    0x08080808192b1908ULL, 0x080808082b080808ULL, 0x080808082b08082bULL, 0x080808082b082b2bULL,\n"
+"    0x080808082b2b082bULL, 0x0808081908080819ULL, 0x0808081908081908ULL, 0x0808081908190808ULL,\n"
+"    0x0808081908191919ULL, 0x0808081919080808ULL, 0x080808192b081908ULL, 0x080808192b192b08ULL,\n"
+"    0x0808082b08080808ULL, 0x0808082b0808082bULL, 0x0808082b082b082bULL, 0x0808082b2b08082bULL,\n"
+"    0x0808190808080819ULL, 0x0808190808081908ULL, 0x0808190808190808ULL, 0x08081908082b0819ULL,\n"
+"    0x08081908082b1908ULL, 0x0808190819080808ULL, 0x080819081908082bULL, 0x0808190819082b08ULL,\n"
+"    0x08081908192b0808ULL, 0x080819082b080819ULL, 0x080819082b081908ULL, 0x080819082b190808ULL,\n"
+"    0x080819082b2b1908ULL, 0x0808191908080808ULL, 0x080819190808082bULL, 0x0808191908082b08ULL,\n"
+"    0x08081919082b0808ULL, 0x080819191908192bULL, 0x08081919192b2b19ULL, 0x080819192b080808ULL,\n"
+"    0x080819192b190819ULL, 0x0808192b08082b19ULL, 0x0808192b08190808ULL, 0x0808192b19080808ULL,\n"
+"    0x0808192b2b081908ULL, 0x0808192b2b2b1908ULL, 0x08082b0808080808ULL, 0x08082b0808081919ULL,\n"
+"    0x08082b0808082b08ULL, 0x08082b0808191908ULL, 0x08082b08082b2b08ULL, 0x08082b0819080819ULL,\n"
+"    0x08082b0819081908ULL, 0x08082b0819190808ULL, 0x08082b081919082bULL, 0x08082b082b082b08ULL,\n"
+"    0x08082b1908081908ULL, 0x08082b1919080808ULL, 0x08082b2b0808082bULL, 0x08082b2b08191908ULL,\n"
+"    0x0819080808080819ULL, 0x0819080808081908ULL, 0x0819080808190808ULL, 0x08190808082b0819ULL,\n"
+"    0x0819080819080808ULL, 0x08190808192b0808ULL, 0x081908082b081908ULL, 0x081908082b190808ULL,\n"
+"    0x081908082b191919ULL, 0x0819081908080808ULL, 0x0819081908082b08ULL, 0x08190819082b0808ULL,\n"
+"    0x0819081919190808ULL, 0x0819081919192b2bULL, 0x081908192b080808ULL, 0x0819082b082b1908ULL,\n"
+"    0x0819082b19081919ULL, 0x0819190808080808ULL, 0x0819190808082b08ULL, 0x08191908082b0808ULL,\n"
+"    0x08191908082b1919ULL, 0x0819190819082b19ULL, 0x081919082b080808ULL, 0x0819191908192b08ULL,\n"
+"    0x08191919192b082bULL, 0x0819192b08080808ULL, 0x0819192b0819192bULL, 0x08192b0808080819ULL,\n"
+"    0x08192b0808081908ULL, 0x08192b0808190808ULL, 0x08192b0819080808ULL, 0x08192b082b080819ULL,\n"
+"    0x08192b1908080808ULL, 0x08192b1908081919ULL, 0x08192b192b2b0808ULL, 0x08192b2b19190819ULL,\n"
+"    0x082b080808080808ULL, 0x082b08080808082bULL, 0x082b080808082b2bULL, 0x082b080819081908ULL,\n"
+"    0x082b0808192b0819ULL, 0x082b08082b080808ULL, 0x082b08082b08082bULL, 0x082b0819082b2b19ULL,\n"
+"    0x082b081919082b08ULL, 0x082b082b08080808ULL, 0x082b082b0808082bULL, 0x082b190808080819ULL,\n"
+"    0x082b190808081908ULL, 0x082b190808190808ULL, 0x082b190819080808ULL, 0x082b19081919192bULL,\n"
+"    0x082b191908080808ULL, 0x082b191919080819ULL, 0x082b1919192b1908ULL, 0x082b192b2b190808ULL,\n"
+"    0x082b2b0808082b08ULL, 0x082b2b08082b0808ULL, 0x082b2b082b191908ULL, 0x082b2b2b19081908ULL,\n"
+"    0x1908080808080819ULL, 0x1908080808081908ULL, 0x1908080808190808ULL, 0x1908080808192b08ULL,\n"
+"    0x19080808082b0819ULL, 0x19080808082b1908ULL, 0x1908080819080808ULL, 0x1908080819082b08ULL,\n"
+"    0x190808081919192bULL, 0x19080808192b0808ULL, 0x190808082b080819ULL, 0x190808082b081908ULL,\n"
+"    0x190808082b190808ULL, 0x1908081908080808ULL, 0x19080819082b0808ULL, 0x19080819192b0819ULL,\n"
+"    0x190808192b080808ULL, 0x190808192b081919ULL, 0x1908082b08080819ULL, 0x1908082b08190808ULL,\n"
+"    0x1908082b19082b08ULL, 0x1908082b1919192bULL, 0x1908082b192b2b08ULL, 0x1908190808080808ULL,\n"
+"    0x1908190808082b08ULL, 0x19081908082b0808ULL, 0x190819082b080808ULL, 0x190819082b192b19ULL,\n"
+"    0x190819190819082bULL, 0x19081919082b1908ULL, 0x1908192b08080808ULL, 0x19082b0808080819ULL,\n"
+"    0x19082b0808081908ULL, 0x19082b0808190808ULL, 0x19082b0819080808ULL, 0x19082b0819081919ULL,\n"
+"    0x19082b1908080808ULL, 0x19082b1919192b08ULL, 0x19082b19192b0819ULL, 0x19082b192b08082bULL,\n"
+"    0x19082b2b19081919ULL, 0x19082b2b2b190808ULL, 0x1919080808080808ULL, 0x1919080808082b08ULL,\n"
+"    0x1919080808190819ULL, 0x1919080808192b19ULL, 0x19190808082b0808ULL, 0x191908082b080808ULL,\n"
+"    0x191908082b082b08ULL, 0x1919081908081908ULL, 0x191908191908082bULL, 0x191908192b2b1908ULL,\n"
+"    0x1919082b2b190819ULL, 0x191919082b190808ULL, 0x191919082b19082bULL, 0x1919191908082b2bULL,\n"
+"    0x1919192b08080819ULL, 0x1919192b19191908ULL, 0x19192b0808080808ULL, 0x19192b0808190819ULL,\n"
+"    0x19192b0808192b19ULL, 0x19192b08192b1908ULL, 0x19192b1919080808ULL, 0x19192b2b08082b08ULL,\n"
+"    0x192b080808081908ULL, 0x192b080808190808ULL, 0x192b080819080808ULL, 0x192b0808192b2b08ULL,\n"
+"    0x192b081908080808ULL, 0x192b081919191919ULL, 0x192b082b08192b08ULL, 0x192b082b192b0808ULL,\n"
+"    0x192b190808080808ULL, 0x192b190808081919ULL, 0x192b191908190808ULL, 0x192b19190819082bULL,\n"
+"    0x192b19192b081908ULL, 0x192b2b081908082bULL, 0x2b08080808080808ULL, 0x2b0808080808082bULL,\n"
+"    0x2b08080808082b2bULL, 0x2b08080819080819ULL, 0x2b0808082b08082bULL, 0x2b08081908081908ULL,\n"
+"    0x2b08081908192b08ULL, 0x2b08081919080808ULL, 0x2b08082b08190819ULL, 0x2b08190808080819ULL,\n"
+"    0x2b08190808081908ULL, 0x2b08190808190808ULL, 0x2b08190808191919ULL, 0x2b08190819080808ULL,\n"
+"    0x2b081908192b0808ULL, 0x2b08191908080808ULL, 0x2b0819191908192bULL, 0x2b0819192b191908ULL,\n"
+"    0x2b08192b08082b19ULL, 0x2b08192b19080808ULL, 0x2b08192b192b0808ULL, 0x2b082b080808082bULL,\n"
+"    0x2b082b1908081908ULL, 0x2b082b2b08190819ULL, 0x2b19080808081908ULL, 0x2b19080808190808ULL,\n"
+"    0x2b190808082b1908ULL, 0x2b19080819080808ULL, 0x2b1908082b2b0819ULL, 0x2b1908190819192bULL,\n"
+"    0x2b1908192b080808ULL, 0x2b19082b19081919ULL, 0x2b19190808080808ULL, 0x2b191908082b082bULL,\n"
+"    0x2b19190819081908ULL, 0x2b19191919190819ULL, 0x2b192b082b080819ULL, 0x2b192b19082b0808ULL,\n"
+"    0x2b2b08080808082bULL, 0x2b2b080819190808ULL, 0x2b2b08082b081919ULL, 0x2b2b081908082b19ULL,\n"
+"    0x2b2b082b08080808ULL, 0x2b2b190808192b08ULL, 0x2b2b2b0819190808ULL, 0x2b2b2b1908081908ULL,\n"
+"};\n"
+"\n"
+"__device__ static const unsigned char ksigns_iq2xs_dev[128] = {\n"
+"      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,\n"
+"    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,\n"
+"    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,\n"
+"     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,\n"
+"    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,\n"
+"     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,\n"
+"     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,\n"
+"    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,\n"
+"};\n"
+"\n"
+"__global__ void matvec_iq2_xxs_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 66;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
+"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"            for (int l = 0; l < 4; l++) {\n"
+"                const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[aux8[l]];\n"
+"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"                for (int j = 0; j < 8; j++) {\n"
+"                    float w = db * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    partial += w * xb[yi++];\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    __shared__ float ws_iq2[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq2[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq2[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern \"C\" */\n"
 ;
 
@@ -1125,6 +1253,7 @@ struct cuda_llm_runner {
     /* MoE kernels */
     CUfunction fn_scale_add_f32;
     CUfunction fn_matvec_f32_f32;
+    CUfunction fn_matvec_iq2_xxs_f32;
 
     /* Model params */
     int n_layers;
@@ -1331,11 +1460,12 @@ static int compile_kernels(cuda_llm_runner *r) {
     /* MoE kernels */
     GET_FUNC(scale_add_f32);
     GET_FUNC(matvec_f32_f32);
+    GET_FUNC(matvec_iq2_xxs_f32);
 
     #undef GET_FUNC
 
     if (r->verbose >= 1) {
-        fprintf(stderr, "cuda_llm: all 30 kernels compiled successfully\n");
+        fprintf(stderr, "cuda_llm: all 31 kernels compiled successfully\n");
     }
     return 0;
 }
@@ -1715,8 +1845,9 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             [GGML_TYPE_F16] = "F16", [GGML_TYPE_Q8_0] = "Q8_0",
             [GGML_TYPE_Q2_K] = "Q2_K", [GGML_TYPE_Q3_K] = "Q3_K",
             [GGML_TYPE_Q4_K] = "Q4_K", [GGML_TYPE_Q5_K] = "Q5_K", [GGML_TYPE_Q6_K] = "Q6_K",
+            [GGML_TYPE_IQ2_XXS] = "IQ2_XXS",
         };
-        const char *tn = (embd.type < 15 && type_names[embd.type]) ? type_names[embd.type] : "unknown";
+        const char *tn = (embd.type < sizeof(type_names)/sizeof(type_names[0]) && type_names[embd.type]) ? type_names[embd.type] : "unknown";
         fprintf(stderr, "cuda_llm: token_embd type=%s\n", tn);
     }
 
@@ -2044,7 +2175,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             ((type) == GGML_TYPE_Q8_0 ? (size_t)((n_elements) / 32) * 36 : \
              ((type) == GGML_TYPE_Q2_K || (type) == GGML_TYPE_Q3_K || \
               (type) == GGML_TYPE_Q4_K || (type) == GGML_TYPE_Q5_K || \
-              (type) == GGML_TYPE_Q6_K) ? dequant_row_size(type, n_elements) : \
+              (type) == GGML_TYPE_Q6_K || (type) == GGML_TYPE_IQ2_XXS) ? dequant_row_size(type, n_elements) : \
              (size_t)(n_elements) * 2)
 
         /* VRAM summary */
@@ -2266,6 +2397,13 @@ static inline void launch_matvec_q6_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                    n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                        CUdeviceptr x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_iq2_xxs_f32,
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_embed_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr embd_table,
                                        int token_id, int n_embd) {
     void *args[] = { &dst, &embd_table, &token_id, &n_embd };
@@ -2283,6 +2421,7 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
         case GGML_TYPE_Q4_K: launch_matvec_q4_K(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q5_K: launch_matvec_q5_K(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q6_K: launch_matvec_q6_K(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_IQ2_XXS: launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols); break;
         default:             launch_matvec(r, dst, mat, x, n_rows, n_cols); break;
     }
 }
