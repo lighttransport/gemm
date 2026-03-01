@@ -97,6 +97,7 @@ typedef struct {
     int ssm_d_inner;         /* inner hidden dim (6144) */
     int ssm_qkv_dim;         /* combined QKV dim (10240) */
     float **conv_state;      /* [n_layers] -> [conv_kernel-1, qkv_dim] per SSM layer */
+    int *conv_state_pos;     /* [n_layers] circular buffer write position per SSM layer */
     float **recurrent_state; /* [n_layers] -> [n_v_heads, d_state, d_state] per SSM layer */
     int n_deepstack;       /* number of deepstack layers (Qwen3-VL) */
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
@@ -131,6 +132,12 @@ typedef struct {
     /* Multi-threading */
     int n_threads;           /* number of threads (default: 1) */
     float **thread_tmp;      /* per-thread dequant scratch [n_threads][max_dim] */
+
+    /* Precomputed RoPE inverse frequency tables */
+    float *rope_inv_freq;        /* [head_dim/2]: 1/powf(base, 2j/head_dim) for standard RoPE */
+    float *rope_mrope_inv_freq;  /* [sect_dims]: 1/powf(base, 2j/(2*sect_dims)) for M-RoPE */
+    int rope_inv_freq_len;       /* head_dim/2 */
+    int rope_mrope_inv_freq_len; /* sect_dims */
 
     /* Thread pool (persistent workers, no per-call pthread_create) */
     pthread_t *pool_threads;   /* [n_threads] worker threads */
@@ -349,15 +356,55 @@ static void tf_qmatvec_expert(float *dst, const qtensor *mat, int expert, const 
     }
 }
 
+/* Vectorized element-wise add: dst[i] += src[i] */
+static void tf_vadd(float *dst, const float *src, int n) {
+#if defined(__AVX2__)
+    int i = 0;
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i), _mm256_loadu_ps(src + i)));
+    for (; i < n; i++) dst[i] += src[i];
+#else
+    for (int i = 0; i < n; i++) dst[i] += src[i];
+#endif
+}
+
 /* RMSNorm: y[i] = x[i] * w[i] / sqrt(mean(x^2) + eps) */
 static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, float eps, float *w_buf) {
+    /* Dequant weight */
+    tf_dequant_row(w, 0, w_buf);
+
+#if defined(__AVX2__) && defined(__FMA__)
+    /* AVX2: sum of squares */
+    __m256 vss = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        vss = _mm256_fmadd_ps(vx, vx, vss);
+    }
+    __m128 hi = _mm256_extractf128_ps(vss, 1);
+    __m128 lo = _mm256_castps256_ps128(vss);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+    float ss = _mm_cvtss_f32(s4);
+    for (; i < n; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / n + eps);
+
+    /* Fused x * ss * w */
+    __m256 vscale = _mm256_set1_ps(ss);
+    i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vw = _mm256_loadu_ps(w_buf + i);
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_mul_ps(vx, vscale), vw));
+    }
+    for (; i < n; i++) dst[i] = x[i] * ss * w_buf[i];
+#else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     ss = 1.0f / sqrtf(ss / n + eps);
-
-    /* Dequant weight */
-    tf_dequant_row(w, 0, w_buf);
     for (int i = 0; i < n; i++) dst[i] = x[i] * ss * w_buf[i];
+#endif
 }
 
 /* Quantized matrix-vector multiply: dst[i] = sum_j(M[i][j] * x[j]) for i in [0, n_rows) */
@@ -660,6 +707,31 @@ static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat
     tf_pool_dispatch(m, tf_qmatvec_worker, tasks, sizeof(tf_matvec_task));
 }
 
+/* Pool-based multi-threaded expert matvec: splits rows across threads */
+static void tf_qmatvec_expert_pool(transformer_model *m, float *dst, const qtensor *mat,
+                                    int expert, const float *x, int rows_per_expert) {
+    int n_threads = m->n_threads;
+    if (n_threads <= 1 || rows_per_expert < n_threads * 4 || !m->pool_alive) {
+        tf_qmatvec_expert(dst, mat, expert, x, rows_per_expert, m->thread_tmp[0]);
+        return;
+    }
+    /* Create a virtual qtensor pointing to the expert's data slice */
+    size_t row_bytes = tf_row_bytes(mat->type, mat->n_cols);
+    qtensor expert_mat = *mat;
+    expert_mat.data = (void *)((const uint8_t *)mat->data + (size_t)expert * rows_per_expert * row_bytes);
+
+    tf_matvec_task *tasks = (tf_matvec_task *)alloca(n_threads * sizeof(tf_matvec_task));
+    int rows_per = rows_per_expert / n_threads;
+    int extra = rows_per_expert % n_threads;
+    int offset = 0;
+    for (int t = 0; t < n_threads; t++) {
+        int count = rows_per + (t < extra ? 1 : 0);
+        tasks[t] = (tf_matvec_task){dst, &expert_mat, x, offset, offset + count, m->thread_tmp[t]};
+        offset += count;
+    }
+    tf_pool_dispatch(m, tf_qmatvec_worker, tasks, sizeof(tf_matvec_task));
+}
+
 /* Legacy multi-threaded version (pthread_create per call) */
 static void tf_qmatvec_mt(float *dst, const qtensor *mat, const float *x, int n_rows,
                            int n_threads, float **thread_tmp) {
@@ -683,20 +755,41 @@ static void tf_qmatvec_mt(float *dst, const qtensor *mat, const float *x, int n_
 
 /* RoPE: apply rotary position encoding to a vector of shape [n_heads, head_dim] */
 /* NeoX-style RoPE: pairs (v[j], v[j + half_dim]) instead of consecutive (v[2j], v[2j+1]) */
-static void tf_rope(float *vec, int n_heads, int head_dim, int pos, float freq_base) {
+static void tf_rope(float *vec, int n_heads, int head_dim, int pos, float freq_base,
+                    const float *inv_freq) {
     int half_dim = head_dim / 2;
+    /* Precompute cos/sin table for all pair positions */
+    float cos_tab[512], sin_tab[512]; /* half_dim <= 512 */
+    for (int j = 0; j < half_dim; j++) {
+        float freq = inv_freq ? inv_freq[j] : (1.0f / powf(freq_base, (float)(2 * j) / head_dim));
+        float theta = pos * freq;
+        cos_tab[j] = cosf(theta);
+        sin_tab[j] = sinf(theta);
+    }
     for (int h = 0; h < n_heads; h++) {
         float *v = vec + h * head_dim;
-        for (int j = 0; j < half_dim; j++) {
-            float freq = 1.0f / powf(freq_base, (float)(2 * j) / head_dim);
-            float theta = pos * freq;
-            float cos_t = cosf(theta);
-            float sin_t = sinf(theta);
-            float v0 = v[j];
-            float v1 = v[j + half_dim];
-            v[j]            = v0 * cos_t - v1 * sin_t;
-            v[j + half_dim] = v0 * sin_t + v1 * cos_t;
+#if defined(__AVX2__) && defined(__FMA__)
+        int j = 0;
+        for (; j + 7 < half_dim; j += 8) {
+            __m256 vc = _mm256_loadu_ps(cos_tab + j);
+            __m256 vs = _mm256_loadu_ps(sin_tab + j);
+            __m256 v0 = _mm256_loadu_ps(v + j);
+            __m256 v1 = _mm256_loadu_ps(v + j + half_dim);
+            _mm256_storeu_ps(v + j,             _mm256_fmsub_ps(v0, vc, _mm256_mul_ps(v1, vs)));
+            _mm256_storeu_ps(v + j + half_dim,  _mm256_fmadd_ps(v0, vs, _mm256_mul_ps(v1, vc)));
         }
+        for (; j < half_dim; j++) {
+            float v0 = v[j], v1 = v[j + half_dim];
+            v[j]            = v0 * cos_tab[j] - v1 * sin_tab[j];
+            v[j + half_dim] = v0 * sin_tab[j] + v1 * cos_tab[j];
+        }
+#else
+        for (int j = 0; j < half_dim; j++) {
+            float v0 = v[j], v1 = v[j + half_dim];
+            v[j]            = v0 * cos_tab[j] - v1 * sin_tab[j];
+            v[j + half_dim] = v0 * sin_tab[j] + v1 * cos_tab[j];
+        }
+#endif
     }
 }
 
@@ -707,41 +800,55 @@ static void tf_rope(float *vec, int n_heads, int head_dim, int pos, float freq_b
  * Cache index i0 = 2*j determines the sector and frequency.
  * sector = (i0/2) % sect_dims = j % sect_dims. */
 static void tf_rope_mrope(float *vec, int n_heads, int head_dim, int pos_t, int pos_h, int pos_w,
-                           float freq_base, const int sections[4]) {
+                           float freq_base, const int sections[4], const float *inv_freq) {
     int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
     if (sect_dims <= 0) sect_dims = head_dim / 2; /* fallback */
-    /* Pair offset = sect_dims (NOT head_dim/2).
-       NeoX-style RoPE with partial rotation pairs (j, j + n_dims/2).
-       For Qwen3.5: sect_dims=32, head_dim=256, so pairs are (j, j+32). */
     int pair_off = sect_dims;
-    /* Use rope_dim_count (= 2 * sect_dims) as freq denominator, not head_dim.
-       For models where rope_dim < head_dim (e.g. Qwen3.5: 64 vs 256). */
     int rope_dim = 2 * sect_dims;
+
+    /* Precompute cos/sin table once (per-position varies by section) */
+    float cos_tab[512], sin_tab[512]; /* sect_dims <= 512 */
+    for (int j = 0; j < sect_dims; j++) {
+        int pos;
+        if (j % 3 == 1 && j < 3 * sections[1]) {
+            pos = pos_h;
+        } else if (j % 3 == 2 && j < 3 * sections[2]) {
+            pos = pos_w;
+        } else if (j % 3 == 0 && j < 3 * sections[0]) {
+            pos = pos_t;
+        } else {
+            pos = pos_t;
+        }
+        float freq = inv_freq ? inv_freq[j] : (1.0f / powf(freq_base, (float)(2 * j) / rope_dim));
+        float theta = pos * freq;
+        cos_tab[j] = cosf(theta);
+        sin_tab[j] = sinf(theta);
+    }
 
     for (int h = 0; h < n_heads; h++) {
         float *v = vec + h * head_dim;
-        /* Only rotate first sect_dims pairs; dimensions beyond are left unchanged */
-        for (int j = 0; j < sect_dims; j++) {
-            int pos;
-            /* IMROPE interleaved pattern (matches llama.cpp) */
-            if (j % 3 == 1 && j < 3 * sections[1]) {
-                pos = pos_h;
-            } else if (j % 3 == 2 && j < 3 * sections[2]) {
-                pos = pos_w;
-            } else if (j % 3 == 0 && j < 3 * sections[0]) {
-                pos = pos_t;
-            } else {
-                pos = pos_t; /* extra/padding: use temporal */
-            }
-            float freq = 1.0f / powf(freq_base, (float)(2 * j) / rope_dim);
-            float theta = pos * freq;
-            float cos_t = cosf(theta);
-            float sin_t = sinf(theta);
-            float v0 = v[j];
-            float v1 = v[j + pair_off];
-            v[j]             = v0 * cos_t - v1 * sin_t;
-            v[j + pair_off]  = v0 * sin_t + v1 * cos_t;
+#if defined(__AVX2__) && defined(__FMA__)
+        int j = 0;
+        for (; j + 7 < sect_dims; j += 8) {
+            __m256 vc = _mm256_loadu_ps(cos_tab + j);
+            __m256 vs = _mm256_loadu_ps(sin_tab + j);
+            __m256 v0 = _mm256_loadu_ps(v + j);
+            __m256 v1 = _mm256_loadu_ps(v + j + pair_off);
+            _mm256_storeu_ps(v + j,              _mm256_fmsub_ps(v0, vc, _mm256_mul_ps(v1, vs)));
+            _mm256_storeu_ps(v + j + pair_off,   _mm256_fmadd_ps(v0, vs, _mm256_mul_ps(v1, vc)));
         }
+        for (; j < sect_dims; j++) {
+            float v0 = v[j], v1 = v[j + pair_off];
+            v[j]             = v0 * cos_tab[j] - v1 * sin_tab[j];
+            v[j + pair_off]  = v0 * sin_tab[j] + v1 * cos_tab[j];
+        }
+#else
+        for (int j = 0; j < sect_dims; j++) {
+            float v0 = v[j], v1 = v[j + pair_off];
+            v[j]             = v0 * cos_tab[j] - v1 * sin_tab[j];
+            v[j + pair_off]  = v0 * sin_tab[j] + v1 * cos_tab[j];
+        }
+#endif
     }
 }
 
@@ -750,10 +857,35 @@ static void tf_qk_norm(float *vec, int n_heads, int head_dim, const qtensor *nor
     tf_dequant_row(norm_w, 0, w_buf);
     for (int h = 0; h < n_heads; h++) {
         float *v = vec + h * head_dim;
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 vss = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 7 < head_dim; i += 8) {
+            __m256 vi = _mm256_loadu_ps(v + i);
+            vss = _mm256_fmadd_ps(vi, vi, vss);
+        }
+        __m128 hi = _mm256_extractf128_ps(vss, 1);
+        __m128 lo = _mm256_castps256_ps128(vss);
+        __m128 s4 = _mm_add_ps(lo, hi);
+        s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+        float ss = _mm_cvtss_f32(s4);
+        for (; i < head_dim; i++) ss += v[i] * v[i];
+        ss = 1.0f / sqrtf(ss / head_dim + eps);
+        __m256 vscale = _mm256_set1_ps(ss);
+        i = 0;
+        for (; i + 7 < head_dim; i += 8) {
+            __m256 vi = _mm256_loadu_ps(v + i);
+            __m256 vw = _mm256_loadu_ps(w_buf + i);
+            _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_mul_ps(vi, vscale), vw));
+        }
+        for (; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#else
         float ss = 0.0f;
         for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];
         ss = 1.0f / sqrtf(ss / head_dim + eps);
         for (int i = 0; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#endif
     }
 }
 
@@ -1256,9 +1388,11 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     /* Allocate SSM state for hybrid models */
     m->conv_state = NULL;
+    m->conv_state_pos = NULL;
     m->recurrent_state = NULL;
     if (m->is_hybrid) {
         m->conv_state = (float **)calloc(m->n_layers, sizeof(float *));
+        m->conv_state_pos = (int *)calloc(m->n_layers, sizeof(int));
         m->recurrent_state = (float **)calloc(m->n_layers, sizeof(float *));
         int n_ssm = 0;
         for (int l = 0; l < m->n_layers; l++) {
@@ -1308,6 +1442,27 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->thread_tmp = (float **)calloc(1, sizeof(float *));
     m->thread_tmp[0] = m->matvec_tmp;
 
+    /* Precompute RoPE inverse frequency tables */
+    {
+        int half_dim = m->head_dim / 2;
+        m->rope_inv_freq_len = half_dim;
+        m->rope_inv_freq = (float *)calloc(half_dim, sizeof(float));
+        for (int j = 0; j < half_dim; j++)
+            m->rope_inv_freq[j] = 1.0f / powf(m->rope_freq_base, (float)(2 * j) / m->head_dim);
+
+        int sect_sum = m->mrope_sections[0] + m->mrope_sections[1] + m->mrope_sections[2] + m->mrope_sections[3];
+        if (sect_sum > 0) {
+            int rope_dim = 2 * sect_sum;
+            m->rope_mrope_inv_freq_len = sect_sum;
+            m->rope_mrope_inv_freq = (float *)calloc(sect_sum, sizeof(float));
+            for (int j = 0; j < sect_sum; j++)
+                m->rope_mrope_inv_freq[j] = 1.0f / powf(m->rope_freq_base, (float)(2 * j) / rope_dim);
+        } else {
+            m->rope_mrope_inv_freq_len = 0;
+            m->rope_mrope_inv_freq = NULL;
+        }
+    }
+
     return m;
 }
 
@@ -1326,6 +1481,7 @@ void transformer_free(transformer_model *model) {
         for (int l = 0; l < model->n_layers; l++) free(model->conv_state[l]);
         free(model->conv_state);
     }
+    free(model->conv_state_pos);
     if (model->recurrent_state) {
         for (int l = 0; l < model->n_layers; l++) free(model->recurrent_state[l]);
         free(model->recurrent_state);
@@ -1342,6 +1498,8 @@ void transformer_free(transformer_model *model) {
     free(model->ffn_buf3);
     free(model->logits);
     free(model->matvec_tmp);
+    free(model->rope_inv_freq);
+    free(model->rope_mrope_inv_freq);
     /* Free extra per-thread scratch (thread_tmp[0] == matvec_tmp, already freed) */
     tf_pool_shutdown(model);
     if (model->thread_tmp) {
@@ -1532,30 +1690,71 @@ static void *tf_ssm_recurrence_worker(void *arg) {
             for (; i < d2; i++) state[i] *= decay;
         }
 
-        /* Read: sk = state @ k */
+        /* Read: sk = state @ k (2-row to share k loads) */
         float sk[128];
-        for (int r = 0; r < ds; r++) {
-            float *row = state + r * ds;
-            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
-            __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-            int c = 0;
-            for (; c + 31 < ds; c += 32) {
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c),      _mm256_loadu_ps(k_h + c),      acc0);
-                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 8),  _mm256_loadu_ps(k_h + c + 8),  acc1);
-                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 16), _mm256_loadu_ps(k_h + c + 16), acc2);
-                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 24), _mm256_loadu_ps(k_h + c + 24), acc3);
+        {
+            int r = 0;
+            for (; r + 1 < ds; r += 2) {
+                float *row0 = state + r * ds;
+                float *row1 = state + (r + 1) * ds;
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+                __m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 31 < ds; c += 32) {
+                    __m256 k0 = _mm256_loadu_ps(k_h + c);
+                    __m256 k1 = _mm256_loadu_ps(k_h + c + 8);
+                    __m256 k2 = _mm256_loadu_ps(k_h + c + 16);
+                    __m256 k3 = _mm256_loadu_ps(k_h + c + 24);
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c),      k0, a0);
+                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c + 8),  k1, a1);
+                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c + 16), k2, a2);
+                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c + 24), k3, a3);
+                    b0 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c),      k0, b0);
+                    b1 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c + 8),  k1, b1);
+                    b2 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c + 16), k2, b2);
+                    b3 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c + 24), k3, b3);
+                }
+                for (; c + 7 < ds; c += 8) {
+                    __m256 kv = _mm256_loadu_ps(k_h + c);
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c), kv, a0);
+                    b0 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c), kv, b0);
+                }
+                a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+                b0 = _mm256_add_ps(_mm256_add_ps(b0, b1), _mm256_add_ps(b2, b3));
+                __m128 ahi = _mm256_extractf128_ps(a0, 1), alo = _mm256_castps256_ps128(a0);
+                __m128 as4 = _mm_add_ps(alo, ahi);
+                as4 = _mm_add_ps(as4, _mm_movehl_ps(as4, as4));
+                as4 = _mm_add_ss(as4, _mm_movehdup_ps(as4));
+                float sum0 = _mm_cvtss_f32(as4);
+                __m128 bhi = _mm256_extractf128_ps(b0, 1), blo = _mm256_castps256_ps128(b0);
+                __m128 bs4 = _mm_add_ps(blo, bhi);
+                bs4 = _mm_add_ps(bs4, _mm_movehl_ps(bs4, bs4));
+                bs4 = _mm_add_ss(bs4, _mm_movehdup_ps(bs4));
+                float sum1 = _mm_cvtss_f32(bs4);
+                for (; c < ds; c++) { sum0 += row0[c] * k_h[c]; sum1 += row1[c] * k_h[c]; }
+                sk[r] = sum0;
+                sk[r + 1] = sum1;
             }
-            for (; c + 7 < ds; c += 8)
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c), _mm256_loadu_ps(k_h + c), acc0);
-            acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-            __m128 hi = _mm256_extractf128_ps(acc0, 1);
-            __m128 lo = _mm256_castps256_ps128(acc0);
-            __m128 s4 = _mm_add_ps(lo, hi);
-            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
-            float sum = _mm_cvtss_f32(s4);
-            for (; c < ds; c++) sum += row[c] * k_h[c];
-            sk[r] = sum;
+            for (; r < ds; r++) {
+                float *row = state + r * ds;
+                __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 31 < ds; c += 32) {
+                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c), _mm256_loadu_ps(k_h + c), acc0);
+                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 8), _mm256_loadu_ps(k_h + c + 8), acc1);
+                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 16), _mm256_loadu_ps(k_h + c + 16), acc2);
+                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 24), _mm256_loadu_ps(k_h + c + 24), acc3);
+                }
+                acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+                __m128 hi = _mm256_extractf128_ps(acc0, 1), lo = _mm256_castps256_ps128(acc0);
+                __m128 s4 = _mm_add_ps(lo, hi);
+                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+                s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+                sk[r] = _mm_cvtss_f32(s4);
+            }
         }
 
         /* Delta: d = (v - sk) * beta */
@@ -1582,29 +1781,68 @@ static void *tf_ssm_recurrence_worker(void *arg) {
             for (; c < ds; c++) row[c] += delta[r] * k_h[c];
         }
 
-        /* Output: o = state @ q */
-        for (int r = 0; r < ds; r++) {
-            float *row = state + r * ds;
-            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
-            __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-            int c = 0;
-            for (; c + 31 < ds; c += 32) {
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c),      _mm256_loadu_ps(q_h + c),      acc0);
-                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 8),  _mm256_loadu_ps(q_h + c + 8),  acc1);
-                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 16), _mm256_loadu_ps(q_h + c + 16), acc2);
-                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 24), _mm256_loadu_ps(q_h + c + 24), acc3);
+        /* Output: o = state @ q (2-row to share q loads) */
+        {
+            int r = 0;
+            for (; r + 1 < ds; r += 2) {
+                float *row0 = state + r * ds;
+                float *row1 = state + (r + 1) * ds;
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+                __m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 31 < ds; c += 32) {
+                    __m256 q0 = _mm256_loadu_ps(q_h + c);
+                    __m256 q1 = _mm256_loadu_ps(q_h + c + 8);
+                    __m256 q2 = _mm256_loadu_ps(q_h + c + 16);
+                    __m256 q3 = _mm256_loadu_ps(q_h + c + 24);
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c),      q0, a0);
+                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c + 8),  q1, a1);
+                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c + 16), q2, a2);
+                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c + 24), q3, a3);
+                    b0 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c),      q0, b0);
+                    b1 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c + 8),  q1, b1);
+                    b2 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c + 16), q2, b2);
+                    b3 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c + 24), q3, b3);
+                }
+                for (; c + 7 < ds; c += 8) {
+                    __m256 qv = _mm256_loadu_ps(q_h + c);
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row0 + c), qv, a0);
+                    b0 = _mm256_fmadd_ps(_mm256_loadu_ps(row1 + c), qv, b0);
+                }
+                a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+                b0 = _mm256_add_ps(_mm256_add_ps(b0, b1), _mm256_add_ps(b2, b3));
+                __m128 ahi = _mm256_extractf128_ps(a0, 1), alo = _mm256_castps256_ps128(a0);
+                __m128 as4 = _mm_add_ps(alo, ahi);
+                as4 = _mm_add_ps(as4, _mm_movehl_ps(as4, as4));
+                as4 = _mm_add_ss(as4, _mm_movehdup_ps(as4));
+                o_h[r] = _mm_cvtss_f32(as4);
+                __m128 bhi = _mm256_extractf128_ps(b0, 1), blo = _mm256_castps256_ps128(b0);
+                __m128 bs4 = _mm_add_ps(blo, bhi);
+                bs4 = _mm_add_ps(bs4, _mm_movehl_ps(bs4, bs4));
+                bs4 = _mm_add_ss(bs4, _mm_movehdup_ps(bs4));
+                o_h[r + 1] = _mm_cvtss_f32(bs4);
+                for (; c < ds; c++) { o_h[r] += row0[c] * q_h[c]; o_h[r + 1] += row1[c] * q_h[c]; }
             }
-            for (; c + 7 < ds; c += 8)
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c), _mm256_loadu_ps(q_h + c), acc0);
-            acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-            __m128 hi = _mm256_extractf128_ps(acc0, 1);
-            __m128 lo = _mm256_castps256_ps128(acc0);
-            __m128 s4 = _mm_add_ps(lo, hi);
-            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
-            float sum = _mm_cvtss_f32(s4);
-            for (; c < ds; c++) sum += row[c] * q_h[c];
-            o_h[r] = sum;
+            for (; r < ds; r++) {
+                float *row = state + r * ds;
+                __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 31 < ds; c += 32) {
+                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c), _mm256_loadu_ps(q_h + c), acc0);
+                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 8), _mm256_loadu_ps(q_h + c + 8), acc1);
+                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 16), _mm256_loadu_ps(q_h + c + 16), acc2);
+                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 24), _mm256_loadu_ps(q_h + c + 24), acc3);
+                }
+                acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+                __m128 hi = _mm256_extractf128_ps(acc0, 1), lo = _mm256_castps256_ps128(acc0);
+                __m128 s4 = _mm_add_ps(lo, hi);
+                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+                s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+                o_h[r] = _mm_cvtss_f32(s4);
+            }
         }
 #else
         /* Scalar fallback */
@@ -1696,21 +1934,24 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     }
 #endif
 
-    /* 4. Conv1d: depthwise causal conv + SiLU */
+    /* 4. Conv1d: depthwise causal conv + SiLU (circular buffer) */
     {
         float *conv_st = m->conv_state[layer_idx]; /* [(conv_k-1) * qkv_dim] */
+        int wr = m->conv_state_pos[layer_idx]; /* circular buffer write position */
+        int n_hist = conv_k - 1;
         /* Use K_exp temporarily for conv output (17408 >= 10240) */
         float *conv_out = K_exp;
 
-        /* Compute conv MAC (scalar per-channel) */
+        /* Compute conv MAC with circular buffer indexing */
         for (int j = 0; j < qkv_dim; j++) {
             float w_buf[8]; /* conv_k <= 8 */
             tf_dequant_row(&layer->ssm_conv1d, j, w_buf);
             float sum = 0.0f;
-            for (int f = 0; f < conv_k - 1; f++) {
-                sum += w_buf[f] * conv_st[f * qkv_dim + j];
+            for (int f = 0; f < n_hist; f++) {
+                int row = (wr + f) % n_hist;
+                sum += w_buf[f] * conv_st[row * qkv_dim + j];
             }
-            conv_out[j] = sum + w_buf[conv_k - 1] * qkv_buf[j];
+            conv_out[j] = sum + w_buf[n_hist] * qkv_buf[j];
         }
         /* Vectorized SiLU activation */
 #if defined(__AVX2__) && defined(__FMA__)
@@ -1731,11 +1972,9 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
             conv_out[j] = conv_out[j] / (1.0f + expf(-conv_out[j]));
 #endif
 
-        /* Update conv_state: shift left, append current input (pre-conv) */
-        if (conv_k > 2) {
-            memmove(conv_st, conv_st + qkv_dim, (size_t)(conv_k - 2) * qkv_dim * sizeof(float));
-        }
-        memcpy(conv_st + (conv_k - 2) * qkv_dim, qkv_buf, qkv_dim * sizeof(float));
+        /* Update circular buffer: overwrite oldest slot, advance write position */
+        memcpy(conv_st + wr * qkv_dim, qkv_buf, qkv_dim * sizeof(float));
+        m->conv_state_pos[layer_idx] = (wr + 1) % n_hist;
 
         /* Copy conv output to qkv_buf */
         memcpy(qkv_buf, conv_out, qkv_dim * sizeof(float));
@@ -1855,11 +2094,11 @@ static void tf_apply_rope(transformer_model *m, float *q, float *k,
                            int n_heads, int n_kv_heads, int head_dim,
                            int pos_t, int pos_h, int pos_w) {
     if (m->use_mrope) {
-        tf_rope_mrope(q, n_heads,    head_dim, pos_t, pos_h, pos_w, m->rope_freq_base, m->mrope_sections);
-        tf_rope_mrope(k, n_kv_heads, head_dim, pos_t, pos_h, pos_w, m->rope_freq_base, m->mrope_sections);
+        tf_rope_mrope(q, n_heads,    head_dim, pos_t, pos_h, pos_w, m->rope_freq_base, m->mrope_sections, m->rope_mrope_inv_freq);
+        tf_rope_mrope(k, n_kv_heads, head_dim, pos_t, pos_h, pos_w, m->rope_freq_base, m->mrope_sections, m->rope_mrope_inv_freq);
     } else {
-        tf_rope(q, n_heads,    head_dim, pos_t, m->rope_freq_base);
-        tf_rope(k, n_kv_heads, head_dim, pos_t, m->rope_freq_base);
+        tf_rope(q, n_heads,    head_dim, pos_t, m->rope_freq_base, m->rope_inv_freq);
+        tf_rope(k, n_kv_heads, head_dim, pos_t, m->rope_freq_base, m->rope_inv_freq);
     }
 }
 
@@ -2103,7 +2342,7 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
         }
 
         /* Residual */
-        for (int i = 0; i < n_embd; i++) m->x[i] += m->xb[i];
+        tf_vadd(m->x, m->xb, n_embd);
 
         /* --- FFN --- */
         /* RMSNorm */
@@ -2152,11 +2391,11 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
                 float ew = top_w[ei];
 
                 TF_PROF_BEGIN("ffn_up_exp", l, "matvec", "FP32");
-                tf_qmatvec_expert(m->ffn_buf2, &layer->ffn_up_exps, e, m->xb, n_ff_exp, m->thread_tmp[0]);
+                tf_qmatvec_expert_pool(m, m->ffn_buf2, &layer->ffn_up_exps, e, m->xb, n_ff_exp);
                 TF_PROF_END("ffn_up_exp", 2.0 * n_ff_exp * n_embd, 0);
 
                 TF_PROF_BEGIN("ffn_gate_exp", l, "matvec", "FP32");
-                tf_qmatvec_expert(m->ffn_buf3, &layer->ffn_gate_exps, e, m->xb, n_ff_exp, m->thread_tmp[0]);
+                tf_qmatvec_expert_pool(m, m->ffn_buf3, &layer->ffn_gate_exps, e, m->xb, n_ff_exp);
                 TF_PROF_END("ffn_gate_exp", 2.0 * n_ff_exp * n_embd, 0);
 
                 TF_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
@@ -2164,13 +2403,25 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
                 TF_PROF_END("silu_mul", 5.0 * n_ff_exp, 0);
 
                 TF_PROF_BEGIN("ffn_down_exp", l, "matvec", "FP32");
-                tf_qmatvec_expert(m->q, &layer->ffn_down_exps, e, m->ffn_buf3, n_embd, m->thread_tmp[0]);
+                tf_qmatvec_expert_pool(m, m->q, &layer->ffn_down_exps, e, m->ffn_buf3, n_embd);
                 TF_PROF_END("ffn_down_exp", 2.0 * n_embd * n_ff_exp, 0);
 
+                /* Weighted accumulation: xb2 += ew * q */
+#if defined(__AVX2__) && defined(__FMA__)
+                {
+                    __m256 vew = _mm256_set1_ps(ew);
+                    int i = 0;
+                    for (; i + 7 < n_embd; i += 8)
+                        _mm256_storeu_ps(m->xb2 + i, _mm256_fmadd_ps(vew, _mm256_loadu_ps(m->q + i),
+                                                                       _mm256_loadu_ps(m->xb2 + i)));
+                    for (; i < n_embd; i++) m->xb2[i] += ew * m->q[i];
+                }
+#else
                 for (int i = 0; i < n_embd; i++) m->xb2[i] += ew * m->q[i];
+#endif
             }
 
-            for (int i = 0; i < n_embd; i++) m->x[i] += m->xb2[i];
+            tf_vadd(m->x, m->xb2, n_embd);
         } else {
             /* Dense SwiGLU: down @ (silu(gate @ x) * (up @ x)) */
             TF_PROF_BEGIN("ffn_gate_up", l, "matvec", "FP32");
@@ -2186,7 +2437,7 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
             tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
             TF_PROF_END("ffn_down", 2.0 * n_embd * m->n_ff, 0);
 
-            for (int i = 0; i < n_embd; i++) m->x[i] += m->xb[i];
+            tf_vadd(m->x, m->xb, n_embd);
         }
 
         /* DeepStack injection: add deepstack slice after each early layer */
