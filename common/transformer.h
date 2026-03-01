@@ -757,8 +757,9 @@ static void tf_qk_norm(float *vec, int n_heads, int head_dim, const qtensor *nor
     }
 }
 
-/* Forward declaration — defined after fast_exp_avx2 */
+/* Forward declarations — defined after fast_exp_avx2 */
 static void tf_softmax(float *x, int n);
+static void tf_silu_mul_avx2(float *out, const float *gate, const float *up, int n);
 
 /* Multi-head attention worker for threading */
 typedef struct {
@@ -1456,10 +1457,181 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
 
 /* L2-normalize a vector in-place: v[i] /= sqrt(sum(v[i]^2) + eps) */
 static void tf_l2_norm(float *v, int n, float eps) {
+#if defined(__AVX2__) && defined(__FMA__)
+    float ss = 0.0f;
+    int i = 0;
+    __m256 vss = _mm256_setzero_ps();
+    for (; i + 7 < n; i += 8) {
+        __m256 vi = _mm256_loadu_ps(v + i);
+        vss = _mm256_fmadd_ps(vi, vi, vss);
+    }
+    __m128 hi128 = _mm256_extractf128_ps(vss, 1);
+    __m128 lo128 = _mm256_castps256_ps128(vss);
+    __m128 s4 = _mm_add_ps(lo128, hi128);
+    s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+    ss = _mm_cvtss_f32(s4);
+    for (; i < n; i++) ss += v[i] * v[i];
+    float inv = 1.0f / sqrtf(ss + eps);
+    __m256 vinv = _mm256_set1_ps(inv);
+    i = 0;
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_loadu_ps(v + i), vinv));
+    for (; i < n; i++) v[i] *= inv;
+#else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += v[i] * v[i];
     float inv = 1.0f / sqrtf(ss + eps);
     for (int i = 0; i < n; i++) v[i] *= inv;
+#endif
+}
+
+/* SSM Delta-Net recurrence task for multi-threaded head dispatch */
+typedef struct {
+    float *rec_state;       /* [dt_rank * d_state * d_state] */
+    float *Q_exp;           /* [dt_rank * d_state] */
+    float *K_exp;           /* [dt_rank * d_state] */
+    float *V_raw;           /* [dt_rank * d_state] */
+    float *out_buf;         /* [dt_rank * d_state] */
+    const float *alpha;     /* [dt_rank] */
+    const float *beta_arr;  /* [dt_rank] */
+    int head_start, head_end;
+    int d_state;
+    float scale;
+} tf_ssm_recurrence_task;
+
+static void *tf_ssm_recurrence_worker(void *arg) {
+    tf_ssm_recurrence_task *t = (tf_ssm_recurrence_task *)arg;
+    int ds = t->d_state;
+    int d2 = ds * ds;
+
+    for (int h = t->head_start; h < t->head_end; h++) {
+        float *state = t->rec_state + (size_t)h * d2;
+        float *q_h = t->Q_exp + h * ds;
+        float *k_h = t->K_exp + h * ds;
+        float *v_h = t->V_raw + h * ds;
+        float *o_h = t->out_buf + h * ds;
+
+#if defined(__AVX2__) && defined(__FMA__)
+        /* Scale Q */
+        {
+            __m256 vscale = _mm256_set1_ps(t->scale);
+            int i = 0;
+            for (; i + 7 < ds; i += 8)
+                _mm256_storeu_ps(q_h + i, _mm256_mul_ps(_mm256_loadu_ps(q_h + i), vscale));
+            for (; i < ds; i++) q_h[i] *= t->scale;
+        }
+
+        /* Decay: state *= exp(alpha_h) */
+        {
+            float decay = expf(t->alpha[h]);
+            __m256 vdecay = _mm256_set1_ps(decay);
+            int i = 0;
+            for (; i + 7 < d2; i += 8)
+                _mm256_storeu_ps(state + i, _mm256_mul_ps(_mm256_loadu_ps(state + i), vdecay));
+            for (; i < d2; i++) state[i] *= decay;
+        }
+
+        /* Read: sk = state @ k */
+        float sk[128];
+        for (int r = 0; r < ds; r++) {
+            float *row = state + r * ds;
+            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+            int c = 0;
+            for (; c + 31 < ds; c += 32) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c),      _mm256_loadu_ps(k_h + c),      acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 8),  _mm256_loadu_ps(k_h + c + 8),  acc1);
+                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 16), _mm256_loadu_ps(k_h + c + 16), acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 24), _mm256_loadu_ps(k_h + c + 24), acc3);
+            }
+            for (; c + 7 < ds; c += 8)
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c), _mm256_loadu_ps(k_h + c), acc0);
+            acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+            __m128 hi = _mm256_extractf128_ps(acc0, 1);
+            __m128 lo = _mm256_castps256_ps128(acc0);
+            __m128 s4 = _mm_add_ps(lo, hi);
+            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+            float sum = _mm_cvtss_f32(s4);
+            for (; c < ds; c++) sum += row[c] * k_h[c];
+            sk[r] = sum;
+        }
+
+        /* Delta: d = (v - sk) * beta */
+        float delta[128];
+        {
+            float beta_h = t->beta_arr[h];
+            __m256 vbeta = _mm256_set1_ps(beta_h);
+            int i = 0;
+            for (; i + 7 < ds; i += 8) {
+                __m256 d = _mm256_sub_ps(_mm256_loadu_ps(v_h + i), _mm256_loadu_ps(sk + i));
+                _mm256_storeu_ps(delta + i, _mm256_mul_ps(d, vbeta));
+            }
+            for (; i < ds; i++) delta[i] = (v_h[i] - sk[i]) * beta_h;
+        }
+
+        /* Update: state[r][c] += delta[r] * k[c] */
+        for (int r = 0; r < ds; r++) {
+            float *row = state + r * ds;
+            __m256 vdr = _mm256_set1_ps(delta[r]);
+            int c = 0;
+            for (; c + 7 < ds; c += 8)
+                _mm256_storeu_ps(row + c, _mm256_fmadd_ps(vdr, _mm256_loadu_ps(k_h + c),
+                                                            _mm256_loadu_ps(row + c)));
+            for (; c < ds; c++) row[c] += delta[r] * k_h[c];
+        }
+
+        /* Output: o = state @ q */
+        for (int r = 0; r < ds; r++) {
+            float *row = state + r * ds;
+            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+            int c = 0;
+            for (; c + 31 < ds; c += 32) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c),      _mm256_loadu_ps(q_h + c),      acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 8),  _mm256_loadu_ps(q_h + c + 8),  acc1);
+                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 16), _mm256_loadu_ps(q_h + c + 16), acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c + 24), _mm256_loadu_ps(q_h + c + 24), acc3);
+            }
+            for (; c + 7 < ds; c += 8)
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + c), _mm256_loadu_ps(q_h + c), acc0);
+            acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+            __m128 hi = _mm256_extractf128_ps(acc0, 1);
+            __m128 lo = _mm256_castps256_ps128(acc0);
+            __m128 s4 = _mm_add_ps(lo, hi);
+            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+            float sum = _mm_cvtss_f32(s4);
+            for (; c < ds; c++) sum += row[c] * q_h[c];
+            o_h[r] = sum;
+        }
+#else
+        /* Scalar fallback */
+        for (int i = 0; i < ds; i++) q_h[i] *= t->scale;
+        float decay = expf(t->alpha[h]);
+        for (int i = 0; i < d2; i++) state[i] *= decay;
+
+        float sk[128];
+        for (int r = 0; r < ds; r++) {
+            float sum = 0.0f;
+            for (int c = 0; c < ds; c++) sum += state[r * ds + c] * k_h[c];
+            sk[r] = sum;
+        }
+        float delta[128];
+        for (int i = 0; i < ds; i++) delta[i] = (v_h[i] - sk[i]) * t->beta_arr[h];
+        for (int r = 0; r < ds; r++) {
+            float dr = delta[r];
+            for (int c = 0; c < ds; c++) state[r * ds + c] += dr * k_h[c];
+        }
+        for (int r = 0; r < ds; r++) {
+            float sum = 0.0f;
+            for (int c = 0; c < ds; c++) sum += state[r * ds + c] * q_h[c];
+            o_h[r] = sum;
+        }
+#endif
+    }
+    return NULL;
 }
 
 /* SSM Delta-Net forward for one layer.
@@ -1484,9 +1656,9 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     float *out_buf = m->ffn_buf3;  /* [d_inner] */
     float *Q_exp   = m->q;         /* [dt_rank * d_state] */
 
-    /* 1. Linear projections from xb */
-    tf_qmatvec(qkv_buf, &layer->ssm_qkv, m->xb, qkv_dim, m->matvec_tmp);
-    tf_qmatvec(z_buf, &layer->ssm_gate, m->xb, d_inner, m->matvec_tmp);
+    /* 1. Linear projections from xb (pool-based for large projections) */
+    tf_qmatvec_pool(m, qkv_buf, &layer->ssm_qkv, m->xb, qkv_dim);
+    tf_qmatvec_pool(m, z_buf, &layer->ssm_gate, m->xb, d_inner);
 
     float alpha[64], beta_arr[64]; /* dt_rank <= 64 (48 for Qwen3.5-27B) */
     tf_qmatvec(alpha, &layer->ssm_alpha, m->xb, dt_rank, m->matvec_tmp);
@@ -1505,9 +1677,24 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     }
 
     /* 3. beta = sigmoid(beta) */
+#if defined(__AVX2__) && defined(__FMA__)
+    {
+        const __m256 one = _mm256_set1_ps(1.0f);
+        int i = 0;
+        for (; i + 7 < dt_rank; i += 8) {
+            __m256 b = _mm256_loadu_ps(beta_arr + i);
+            __m256 neg_b = _mm256_sub_ps(_mm256_setzero_ps(), b);
+            __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, fast_exp_avx2(neg_b)));
+            _mm256_storeu_ps(beta_arr + i, sig);
+        }
+        for (; i < dt_rank; i++)
+            beta_arr[i] = 1.0f / (1.0f + expf(-beta_arr[i]));
+    }
+#else
     for (int i = 0; i < dt_rank; i++) {
         beta_arr[i] = 1.0f / (1.0f + expf(-beta_arr[i]));
     }
+#endif
 
     /* 4. Conv1d: depthwise causal conv + SiLU */
     {
@@ -1515,6 +1702,7 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         /* Use K_exp temporarily for conv output (17408 >= 10240) */
         float *conv_out = K_exp;
 
+        /* Compute conv MAC (scalar per-channel) */
         for (int j = 0; j < qkv_dim; j++) {
             float w_buf[8]; /* conv_k <= 8 */
             tf_dequant_row(&layer->ssm_conv1d, j, w_buf);
@@ -1522,10 +1710,26 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
             for (int f = 0; f < conv_k - 1; f++) {
                 sum += w_buf[f] * conv_st[f * qkv_dim + j];
             }
-            sum += w_buf[conv_k - 1] * qkv_buf[j];
-            /* SiLU activation */
-            conv_out[j] = sum / (1.0f + expf(-sum));
+            conv_out[j] = sum + w_buf[conv_k - 1] * qkv_buf[j];
         }
+        /* Vectorized SiLU activation */
+#if defined(__AVX2__) && defined(__FMA__)
+        {
+            const __m256 one = _mm256_set1_ps(1.0f);
+            int j = 0;
+            for (; j + 7 < qkv_dim; j += 8) {
+                __m256 s = _mm256_loadu_ps(conv_out + j);
+                __m256 neg_s = _mm256_sub_ps(_mm256_setzero_ps(), s);
+                __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, fast_exp_avx2(neg_s)));
+                _mm256_storeu_ps(conv_out + j, _mm256_mul_ps(s, sig));
+            }
+            for (; j < qkv_dim; j++)
+                conv_out[j] = conv_out[j] / (1.0f + expf(-conv_out[j]));
+        }
+#else
+        for (int j = 0; j < qkv_dim; j++)
+            conv_out[j] = conv_out[j] / (1.0f + expf(-conv_out[j]));
+#endif
 
         /* Update conv_state: shift left, append current input (pre-conv) */
         if (conv_k > 2) {
@@ -1558,56 +1762,30 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         }
     }
 
-    /* 6. Delta-Net recurrence per head */
+    /* 6. Delta-Net recurrence per head (AVX2 + multi-threaded) */
     float scale = 1.0f / sqrtf((float)d_state);
     float *rec_state = m->recurrent_state[layer_idx]; /* [dt_rank * d_state * d_state] */
 
-    for (int h = 0; h < dt_rank; h++) {
-        float *state = rec_state + h * d_state * d_state; /* [d_state][d_state] */
-        float *q_h = Q_exp + h * d_state;
-        float *k_h = K_exp + h * d_state;
-        float *v_h = V_raw + h * d_state;
-        float *o_h = out_buf + h * d_state;
-
-        /* Scale Q */
-        for (int i = 0; i < d_state; i++) q_h[i] *= scale;
-
-        /* Decay: state *= exp(alpha_h) */
-        float decay = expf(alpha[h]);
-        for (int i = 0; i < d_state * d_state; i++) state[i] *= decay;
-
-        /* Read: sk = state @ k (sk[row] = sum_col(state[row][col] * k[col])) */
-        float sk[128];
-        for (int r = 0; r < d_state; r++) {
-            float sum = 0.0f;
-            for (int c = 0; c < d_state; c++) {
-                sum += state[r * d_state + c] * k_h[c];
-            }
-            sk[r] = sum;
+    if (m->n_threads > 1 && dt_rank >= m->n_threads && m->pool_alive) {
+        int nt = m->n_threads;
+        tf_ssm_recurrence_task *rtasks = (tf_ssm_recurrence_task *)alloca(
+            nt * sizeof(tf_ssm_recurrence_task));
+        int heads_per = dt_rank / nt, heads_extra = dt_rank % nt, hoff = 0;
+        for (int t = 0; t < nt; t++) {
+            int hcount = heads_per + (t < heads_extra ? 1 : 0);
+            rtasks[t] = (tf_ssm_recurrence_task){
+                rec_state, Q_exp, K_exp, V_raw, out_buf,
+                alpha, beta_arr, hoff, hoff + hcount, d_state, scale
+            };
+            hoff += hcount;
         }
-
-        /* Delta: d = (v - sk) * beta */
-        float delta[128];
-        for (int i = 0; i < d_state; i++) {
-            delta[i] = (v_h[i] - sk[i]) * beta_arr[h];
-        }
-
-        /* Update: state[r][c] += delta[r] * k[c] (rank-1 outer product) */
-        for (int r = 0; r < d_state; r++) {
-            float dr = delta[r];
-            for (int c = 0; c < d_state; c++) {
-                state[r * d_state + c] += dr * k_h[c];
-            }
-        }
-
-        /* Output: o = state @ q */
-        for (int r = 0; r < d_state; r++) {
-            float sum = 0.0f;
-            for (int c = 0; c < d_state; c++) {
-                sum += state[r * d_state + c] * q_h[c];
-            }
-            o_h[r] = sum;
-        }
+        tf_pool_dispatch(m, tf_ssm_recurrence_worker, rtasks, sizeof(tf_ssm_recurrence_task));
+    } else {
+        tf_ssm_recurrence_task rtask = {
+            rec_state, Q_exp, K_exp, V_raw, out_buf,
+            alpha, beta_arr, 0, dt_rank, d_state, scale
+        };
+        tf_ssm_recurrence_worker(&rtask);
     }
 
     /* 7. Fused: out = rmsnorm(out, ssm_norm) * silu(z) */
@@ -1617,6 +1795,42 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         tf_dequant_row(&layer->ssm_norm, 0, norm_w);
         for (int h = 0; h < dt_rank; h++) {
             float *o_h = out_buf + h * d_state;
+            float *z_h = z_buf + h * d_state;
+#if defined(__AVX2__) && defined(__FMA__)
+            /* RMSNorm: sum of squares (AVX2) */
+            __m256 vss = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 7 < d_state; i += 8) {
+                __m256 oi = _mm256_loadu_ps(o_h + i);
+                vss = _mm256_fmadd_ps(oi, oi, vss);
+            }
+            __m128 hi128 = _mm256_extractf128_ps(vss, 1);
+            __m128 lo128 = _mm256_castps256_ps128(vss);
+            __m128 s4 = _mm_add_ps(lo128, hi128);
+            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+            float ss = _mm_cvtss_f32(s4);
+            for (; i < d_state; i++) ss += o_h[i] * o_h[i];
+            __m256 vscale = _mm256_set1_ps(1.0f / sqrtf(ss / d_state + eps));
+            const __m256 one = _mm256_set1_ps(1.0f);
+            /* Apply norm * weight * silu(z) */
+            i = 0;
+            for (; i + 7 < d_state; i += 8) {
+                __m256 oi = _mm256_loadu_ps(o_h + i);
+                __m256 wi = _mm256_loadu_ps(norm_w + i);
+                __m256 normed = _mm256_mul_ps(_mm256_mul_ps(oi, vscale), wi);
+                __m256 zi = _mm256_loadu_ps(z_h + i);
+                __m256 neg_z = _mm256_sub_ps(_mm256_setzero_ps(), zi);
+                __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, fast_exp_avx2(neg_z)));
+                _mm256_storeu_ps(o_h + i, _mm256_mul_ps(normed, _mm256_mul_ps(zi, sig)));
+            }
+            float ss_scalar = 1.0f / sqrtf(ss / d_state + eps);
+            for (; i < d_state; i++) {
+                float normed = o_h[i] * ss_scalar * norm_w[i];
+                float z_val = z_h[i];
+                o_h[i] = normed * (z_val / (1.0f + expf(-z_val)));
+            }
+#else
             /* RMSNorm per head */
             float ss = 0.0f;
             for (int i = 0; i < d_state; i++) ss += o_h[i] * o_h[i];
@@ -1624,15 +1838,16 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
             /* Apply norm * weight * silu(z) */
             for (int i = 0; i < d_state; i++) {
                 float normed = o_h[i] * ss * norm_w[i];
-                float z_val = z_buf[h * d_state + i];
+                float z_val = z_h[i];
                 float silu_z = z_val / (1.0f + expf(-z_val));
                 o_h[i] = normed * silu_z;
             }
+#endif
         }
     }
 
     /* 8. Output projection: xb = ssm_out @ out_buf */
-    tf_qmatvec(m->xb, &layer->ssm_out, out_buf, n_embd, m->matvec_tmp);
+    tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
 }
 
 /* Helper: apply standard or M-RoPE depending on model config */
@@ -1712,9 +1927,8 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
             /* Q+gate combined projection: attn_q outputs [2*q_dim] interleaved */
             int q2_dim = 2 * q_dim;
             TF_PROF_BEGIN("qkv_proj", l, "matvec", "FP32");
-            tf_qmatvec(m->xb2, &layer->attn_q, m->xb, q2_dim, m->matvec_tmp);
-            tf_qmatvec(m->k, &layer->attn_k, m->xb, kv_dim, m->matvec_tmp);
-            tf_qmatvec(m->v, &layer->attn_v, m->xb, kv_dim, m->matvec_tmp);
+            tf_qmatvec_fused_qkv_pool(m, m->xb2, &layer->attn_q, q2_dim,
+                                       m->k, &layer->attn_k, m->v, &layer->attn_v, kv_dim);
             TF_PROF_END("qkv_proj", 2.0 * (q2_dim + 2.0 * kv_dim) * n_embd, 0);
 
             /* De-interleave: [Q0,gate0, Q1,gate1, ...] → Q[q_dim], gate[q_dim] */
@@ -1742,35 +1956,67 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
             memcpy(kc, m->k, kv_dim * sizeof(float));
             memcpy(vc, m->v, kv_dim * sizeof(float));
 
-            /* GQA attention */
+            /* GQA attention (threaded if pool available) */
             TF_PROF_BEGIN("attention", l, "attention", "FP32");
             int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
-            memset(m->xb2, 0, q_dim * sizeof(float));
-            for (int h = 0; h < n_heads; h++) {
-                int kv_h = h / gqa_ratio;
-                float *q_h = m->q + h * head_dim;
-                float *att_h = m->att + h * m->max_seq_len;
-                for (int t = 0; t < seq_len; t++) {
-                    float *k_t = m->key_cache[l] + t * kv_dim + kv_h * head_dim;
-                    float score = 0.0f;
-                    for (int d = 0; d < head_dim; d++) score += q_h[d] * k_t[d];
-                    att_h[t] = score * scale;
+
+            if (m->n_threads > 1 && n_heads >= m->n_threads && m->pool_alive) {
+                int nt = m->n_threads;
+                tf_attn_task *atasks = (tf_attn_task *)alloca(nt * sizeof(tf_attn_task));
+                int heads_per = n_heads / nt, heads_extra = n_heads % nt, hoff = 0;
+                for (int t = 0; t < nt; t++) {
+                    int hcount = heads_per + (t < heads_extra ? 1 : 0);
+                    atasks[t] = (tf_attn_task){m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
+                                               hoff, hoff + hcount, head_dim, kv_dim, gqa_ratio, seq_len,
+                                               m->max_seq_len, scale};
+                    hoff += hcount;
                 }
-                tf_softmax(att_h, seq_len);
-                float *out_h = m->xb2 + h * head_dim;
-                for (int t = 0; t < seq_len; t++) {
-                    float *v_t = m->value_cache[l] + t * kv_dim + kv_h * head_dim;
-                    float a = att_h[t];
-                    for (int d = 0; d < head_dim; d++) out_h[d] += a * v_t[d];
+                tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
+            } else {
+                memset(m->xb2, 0, q_dim * sizeof(float));
+                for (int h = 0; h < n_heads; h++) {
+                    int kv_h = h / gqa_ratio;
+                    float *q_h = m->q + h * head_dim;
+                    float *att_h = m->att + h * m->max_seq_len;
+                    for (int t = 0; t < seq_len; t++) {
+                        float *k_t = m->key_cache[l] + t * kv_dim + kv_h * head_dim;
+                        float score = 0.0f;
+                        for (int d = 0; d < head_dim; d++) score += q_h[d] * k_t[d];
+                        att_h[t] = score * scale;
+                    }
+                    tf_softmax(att_h, seq_len);
+                    float *out_h = m->xb2 + h * head_dim;
+                    memset(out_h, 0, head_dim * sizeof(float));
+                    for (int t = 0; t < seq_len; t++) {
+                        float *v_t = m->value_cache[l] + t * kv_dim + kv_h * head_dim;
+                        float a = att_h[t];
+                        for (int d = 0; d < head_dim; d++) out_h[d] += a * v_t[d];
+                    }
                 }
             }
             TF_PROF_END("attention", 2.0 * n_heads * seq_len * head_dim * 2, 0);
 
             /* Apply sigmoid gate: xb2[i] *= sigmoid(gate[i]) */
+#if defined(__AVX2__) && defined(__FMA__)
+            {
+                const __m256 one = _mm256_set1_ps(1.0f);
+                int i = 0;
+                for (; i + 7 < q_dim; i += 8) {
+                    __m256 x2 = _mm256_loadu_ps(m->xb2 + i);
+                    __m256 g = _mm256_loadu_ps(m->ffn_buf1 + i);
+                    __m256 neg_g = _mm256_sub_ps(_mm256_setzero_ps(), g);
+                    __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, fast_exp_avx2(neg_g)));
+                    _mm256_storeu_ps(m->xb2 + i, _mm256_mul_ps(x2, sig));
+                }
+                for (; i < q_dim; i++)
+                    m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
+            }
+#else
             for (int i = 0; i < q_dim; i++) {
                 m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
             }
+#endif
 
             /* Output projection */
             TF_PROF_BEGIN("out_proj", l, "matvec", "FP32");
@@ -1914,11 +2160,7 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
                 TF_PROF_END("ffn_gate_exp", 2.0 * n_ff_exp * n_embd, 0);
 
                 TF_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
-                for (int i = 0; i < n_ff_exp; i++) {
-                    float gate = m->ffn_buf3[i];
-                    gate = gate / (1.0f + expf(-gate));
-                    m->ffn_buf3[i] = gate * m->ffn_buf2[i];
-                }
+                tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf3, m->ffn_buf2, n_ff_exp);
                 TF_PROF_END("silu_mul", 5.0 * n_ff_exp, 0);
 
                 TF_PROF_BEGIN("ffn_down_exp", l, "matvec", "FP32");
@@ -1937,11 +2179,7 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
             TF_PROF_END("ffn_gate_up", 2.0 * 2.0 * m->n_ff * n_embd, 0);
 
             TF_PROF_BEGIN("silu_mul", l, "silu_mul", "FP32");
-            for (int i = 0; i < m->n_ff; i++) {
-                float gate = m->ffn_buf1[i];
-                gate = gate / (1.0f + expf(-gate));  /* SiLU */
-                m->ffn_buf3[i] = gate * m->ffn_buf2[i];
-            }
+            tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff);
             TF_PROF_END("silu_mul", 5.0 * m->n_ff, 0);
 
             TF_PROF_BEGIN("ffn_down", l, "matvec", "FP32");
