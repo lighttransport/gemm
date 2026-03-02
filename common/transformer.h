@@ -99,6 +99,7 @@ typedef struct {
     float **conv_state;      /* [n_layers] -> [conv_kernel-1, qkv_dim] per SSM layer */
     int *conv_state_pos;     /* [n_layers] circular buffer write position per SSM layer */
     float **recurrent_state; /* [n_layers] -> [n_v_heads, d_state, d_state] per SSM layer */
+    float *conv_w_trans;     /* pre-allocated [conv_k * qkv_dim] for batch-dequant conv weights */
     int n_deepstack;       /* number of deepstack layers (Qwen3-VL) */
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
     int ds_embd_stride;    /* total embedding dim = proj_dim * (1 + n_deepstack) */
@@ -365,6 +366,30 @@ static void tf_vadd(float *dst, const float *src, int n) {
     for (; i < n; i++) dst[i] += src[i];
 #else
     for (int i = 0; i < n; i++) dst[i] += src[i];
+#endif
+}
+
+/* Sum of squares: returns sum(v[i]^2) — used for hidden norm profiling */
+static float tf_sum_squares(const float *v, int n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 x = _mm256_loadu_ps(v + i);
+        acc = _mm256_fmadd_ps(x, x, acc);
+    }
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+    float ss = _mm_cvtss_f32(s4);
+    for (; i < n; i++) ss += v[i] * v[i];
+    return ss;
+#else
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += v[i] * v[i];
+    return ss;
 #endif
 }
 
@@ -1526,6 +1551,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         fprintf(stderr, "transformer: SSM state: %d layers, conv=[%d×%d], recurrent=[%d×%d×%d]\n",
                 n_ssm, m->ssm_conv_kernel - 1, m->ssm_qkv_dim,
                 m->ssm_dt_rank, m->ssm_d_state, m->ssm_d_state);
+        m->conv_w_trans = (float *)malloc((size_t)m->ssm_conv_kernel * m->ssm_qkv_dim * sizeof(float));
+    } else {
+        m->conv_w_trans = NULL;
     }
 
     /* Allocate scratch buffers */
@@ -1602,6 +1630,7 @@ void transformer_free(transformer_model *model) {
         free(model->conv_state);
     }
     free(model->conv_state_pos);
+    free(model->conv_w_trans);
     if (model->recurrent_state) {
         for (int l = 0; l < model->n_layers; l++) free(model->recurrent_state[l]);
         free(model->recurrent_state);
@@ -2079,7 +2108,7 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         float *conv_out = K_exp;
 
         /* Batch-dequant all conv weights into transposed layout [conv_k][qkv_dim] */
-        float *w_trans = (float *)alloca((size_t)conv_k * qkv_dim * sizeof(float));
+        float *w_trans = m->conv_w_trans;
         {
             size_t crb = tf_row_bytes(layer->ssm_conv1d.type, layer->ssm_conv1d.n_cols);
             const uint8_t *cbase = (const uint8_t *)layer->ssm_conv1d.data;
@@ -2101,6 +2130,11 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         {
             int j = 0;
             for (; j + 7 < qkv_dim; j += 8) {
+                /* Prefetch conv_st rows 64 bytes ahead */
+                if (j + 16 < qkv_dim) {
+                    for (int f = 0; f < n_hist; f++)
+                        _mm_prefetch((const char *)(conv_st + row_off[f] + j + 16), _MM_HINT_T0);
+                }
                 __m256 sum = _mm256_setzero_ps();
                 for (int f = 0; f < n_hist; f++)
                     sum = _mm256_fmadd_ps(_mm256_loadu_ps(w_trans + f * qkv_dim + j),
@@ -2164,11 +2198,13 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     }
 
     /* Repeat Q and K from n_group to dt_rank heads (tiling, matching ggml_repeat) */
+    /* dt_rank=48, n_group=16: 3 bulk copies of n_group*d_state instead of 96 memcpys */
     {
-        for (int h = dt_rank - 1; h >= 0; h--) {
-            int g = h % n_group;
-            memcpy(Q_exp + h * d_state, Q_raw + g * d_state, d_state * sizeof(float));
-            memcpy(K_exp + h * d_state, K_raw + g * d_state, d_state * sizeof(float));
+        size_t tile_bytes = (size_t)n_group * d_state * sizeof(float);
+        int n_repeat = dt_rank / n_group;
+        for (int r = n_repeat - 1; r >= 0; r--) {
+            memcpy(Q_exp + r * n_group * d_state, Q_raw, tile_bytes);
+            memcpy(K_exp + r * n_group * d_state, K_raw, tile_bytes);
         }
     }
 
@@ -2591,9 +2627,7 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
         }
 
         if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
-            float norm = 0.0f;
-            for (int i = 0; i < n_embd; i++) norm += m->x[i] * m->x[i];
-            fprintf(stderr, "  layer %2d: hidden norm = %.4f\n", l, sqrtf(norm));
+            fprintf(stderr, "  layer %2d: hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(m->x, n_embd)));
         }
     }
 
@@ -3507,7 +3541,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
 
         /* 8. Residual add */
         t0p = tf_time_ms();
-        for (int i = 0; i < N * n_embd; i++) bx[i] += bxb[i];
+        for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
         t_residual += tf_time_ms() - t0p;
 
         /* 9. FFN */
@@ -3531,7 +3565,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
         t_ffn_gemm_down += tf_time_ms() - t0p;
 
         t0p = tf_time_ms();
-        for (int i = 0; i < N * n_embd; i++) bx[i] += bxb[i];
+        for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
         t_residual += tf_time_ms() - t0p;
 
         /* 10. DeepStack injection */
@@ -3550,9 +3584,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
 
         if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
             float *last = bx + (size_t)(N-1) * n_embd;
-            float norm = 0.0f;
-            for (int i = 0; i < n_embd; i++) norm += last[i] * last[i];
-            fprintf(stderr, "  [batch] layer %2d: last token hidden norm = %.4f\n", l, sqrtf(norm));
+            fprintf(stderr, "  [batch] layer %2d: last token hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(last, n_embd)));
         }
     }
 
@@ -3639,12 +3671,8 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
         }
     }
 
-    /* Softmax over top-k */
-    float max_v = vals[0];
-    for (int i = 1; i < top_k; i++) if (vals[i] > max_v) max_v = vals[i];
-    float sum = 0.0f;
-    for (int i = 0; i < top_k; i++) { vals[i] = expf(vals[i] - max_v); sum += vals[i]; }
-    for (int i = 0; i < top_k; i++) vals[i] /= sum;
+    /* Softmax over top-k (uses AVX2 fast_exp when available) */
+    tf_softmax(vals, top_k);
 
     /* Sample */
     float r = (float)rand() / (float)RAND_MAX;
