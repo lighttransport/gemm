@@ -450,8 +450,30 @@ static void *tf_qmatvec_worker(void *arg) {
     }
     for (int i = t->row_start; i < t->row_end; i++) {
         tf_dequant_row(t->mat, i, t->tmp);
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 31 < n_cols; j += 32) {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(t->tmp + j),      _mm256_loadu_ps(t->x + j),      acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(t->tmp + j + 8),  _mm256_loadu_ps(t->x + j + 8),  acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(t->tmp + j + 16), _mm256_loadu_ps(t->x + j + 16), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(t->tmp + j + 24), _mm256_loadu_ps(t->x + j + 24), acc3);
+        }
+        for (; j + 7 < n_cols; j += 8)
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(t->tmp + j), _mm256_loadu_ps(t->x + j), acc0);
+        acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        __m128 hi = _mm256_extractf128_ps(acc0, 1);
+        __m128 lo = _mm256_castps256_ps128(acc0);
+        __m128 s4 = _mm_add_ps(lo, hi);
+        s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+        float sum = _mm_cvtss_f32(s4);
+        for (; j < n_cols; j++) sum += t->tmp[j] * t->x[j];
+#else
         float sum = 0.0f;
         for (int j = 0; j < n_cols; j++) sum += t->tmp[j] * t->x[j];
+#endif
         t->dst[i] = sum;
     }
     return NULL;
@@ -515,18 +537,60 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
         tf_matvec_q8_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                             t->x, n_cols, t->row_start, t->row_end);
     } else {
-        /* Generic path for other quantized weights */
+        /* Generic path for other quantized weights — AVX2 dot product */
         float *tmp = (float *)malloc(n_cols * sizeof(float));
         for (int i = t->row_start; i < t->row_end; i++) {
             tf_dequant_row(t->mat1, i, tmp);
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+            int j = 0;
+            for (; j + 31 < n_cols; j += 32) {
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j),    _mm256_loadu_ps(t->x+j),    a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j+8),  _mm256_loadu_ps(t->x+j+8),  a1);
+                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j+16), _mm256_loadu_ps(t->x+j+16), a2);
+                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j+24), _mm256_loadu_ps(t->x+j+24), a3);
+            }
+            for (; j + 7 < n_cols; j += 8)
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j), _mm256_loadu_ps(t->x+j), a0);
+            a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+            __m128 hi = _mm256_extractf128_ps(a0, 1), lo = _mm256_castps256_ps128(a0);
+            __m128 s4 = _mm_add_ps(lo, hi);
+            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+            float sum = _mm_cvtss_f32(s4);
+            for (; j < n_cols; j++) sum += tmp[j] * t->x[j];
+#else
             float sum = 0.0f;
             for (int j = 0; j < n_cols; j++) sum += tmp[j] * t->x[j];
+#endif
             t->dst1[i] = sum;
         }
         for (int i = t->row_start; i < t->row_end; i++) {
             tf_dequant_row(t->mat2, i, tmp);
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+            int j = 0;
+            for (; j + 31 < n_cols; j += 32) {
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j),    _mm256_loadu_ps(t->x+j),    a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j+8),  _mm256_loadu_ps(t->x+j+8),  a1);
+                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j+16), _mm256_loadu_ps(t->x+j+16), a2);
+                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j+24), _mm256_loadu_ps(t->x+j+24), a3);
+            }
+            for (; j + 7 < n_cols; j += 8)
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp+j), _mm256_loadu_ps(t->x+j), a0);
+            a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+            __m128 hi = _mm256_extractf128_ps(a0, 1), lo = _mm256_castps256_ps128(a0);
+            __m128 s4 = _mm_add_ps(lo, hi);
+            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+            float sum = _mm_cvtss_f32(s4);
+            for (; j < n_cols; j++) sum += tmp[j] * t->x[j];
+#else
             float sum = 0.0f;
             for (int j = 0; j < n_cols; j++) sum += tmp[j] * t->x[j];
+#endif
             t->dst2[i] = sum;
         }
         free(tmp);
@@ -682,8 +746,30 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
     }
     for (int i = 0; i < n_rows; i++) {
         tf_dequant_row(mat, i, tmp);
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 31 < n_cols; j += 32) {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + j),      _mm256_loadu_ps(x + j),      acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + j + 8),  _mm256_loadu_ps(x + j + 8),  acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + j + 16), _mm256_loadu_ps(x + j + 16), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + j + 24), _mm256_loadu_ps(x + j + 24), acc3);
+        }
+        for (; j + 7 < n_cols; j += 8)
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + j), _mm256_loadu_ps(x + j), acc0);
+        acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        __m128 hi = _mm256_extractf128_ps(acc0, 1);
+        __m128 lo = _mm256_castps256_ps128(acc0);
+        __m128 s4 = _mm_add_ps(lo, hi);
+        s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+        float sum = _mm_cvtss_f32(s4);
+        for (; j < n_cols; j++) sum += tmp[j] * x[j];
+#else
         float sum = 0.0f;
         for (int j = 0; j < n_cols; j++) sum += tmp[j] * x[j];
+#endif
         dst[i] = sum;
     }
 }
@@ -1010,8 +1096,41 @@ static void *tf_attn_worker(void *arg) {
             _mm256_storeu_ps(out_h+16,o2); _mm256_storeu_ps(out_h+24,o3);
             _mm256_storeu_ps(out_h+32,o4); _mm256_storeu_ps(out_h+40,o5);
             _mm256_storeu_ps(out_h+48,o6); _mm256_storeu_ps(out_h+56,o7);
-        } else
-#endif
+        } else {
+            /* Generic AVX2 attention for any head_dim (with prefetch) */
+            __m256 vscale = _mm256_set1_ps(t->scale);
+            for (int p = 0; p < seq_len; p++) {
+                const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
+                if (p + 2 < seq_len)
+                    _mm_prefetch((const char *)(t->key_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd), _MM_HINT_T0);
+                __m256 acc = _mm256_setzero_ps();
+                int d = 0;
+                for (; d + 7 < hd; d += 8)
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(q_h + d), _mm256_loadu_ps(k_p + d), acc);
+                __m128 hi = _mm256_extractf128_ps(acc, 1);
+                __m128 lo = _mm256_castps256_ps128(acc);
+                __m128 s4 = _mm_add_ps(lo, hi);
+                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+                s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+                float score = _mm_cvtss_f32(s4);
+                for (; d < hd; d++) score += q_h[d] * k_p[d];
+                att_h[p] = score * t->scale;
+            }
+            tf_softmax(att_h, seq_len);
+            float *out_h = t->xb2 + h * hd;
+            /* Zero output with AVX2 */
+            for (int d = 0; d < hd; d += 8) _mm256_storeu_ps(out_h + d, _mm256_setzero_ps());
+            for (int p = 0; p < seq_len; p++) {
+                const float *v_p = t->value_cache + (size_t)p * t->kv_dim + kv_h * hd;
+                if (p + 2 < seq_len)
+                    _mm_prefetch((const char *)(t->value_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd), _MM_HINT_T0);
+                __m256 a = _mm256_set1_ps(att_h[p]);
+                for (int d = 0; d < hd; d += 8)
+                    _mm256_storeu_ps(out_h + d, _mm256_fmadd_ps(a, _mm256_loadu_ps(v_p + d),
+                                                                  _mm256_loadu_ps(out_h + d)));
+            }
+        }
+#else
         {
             for (int p = 0; p < seq_len; p++) {
                 const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
@@ -1028,6 +1147,7 @@ static void *tf_attn_worker(void *arg) {
                 for (int d = 0; d < hd; d++) out_h[d] += a * v_p[d];
             }
         }
+#endif
     }
     return NULL;
 }
@@ -1697,6 +1817,13 @@ static void *tf_ssm_recurrence_worker(void *arg) {
             for (; r + 1 < ds; r += 2) {
                 float *row0 = state + r * ds;
                 float *row1 = state + (r + 1) * ds;
+                /* Prefetch next 2 rows (512B each = 8 cache lines) */
+                if (r + 3 < ds) {
+                    for (int pf = 0; pf < ds; pf += 16) {
+                        _mm_prefetch((const char *)(state + (r+2)*ds + pf), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(state + (r+3)*ds + pf), _MM_HINT_T0);
+                    }
+                }
                 __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
                 __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
                 __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
@@ -1773,6 +1900,8 @@ static void *tf_ssm_recurrence_worker(void *arg) {
         /* Update: state[r][c] += delta[r] * k[c] */
         for (int r = 0; r < ds; r++) {
             float *row = state + r * ds;
+            if (r + 1 < ds)
+                _mm_prefetch((const char *)(state + (r+1)*ds), _MM_HINT_T0);
             __m256 vdr = _mm256_set1_ps(delta[r]);
             int c = 0;
             for (; c + 7 < ds; c += 8)
@@ -1787,6 +1916,13 @@ static void *tf_ssm_recurrence_worker(void *arg) {
             for (; r + 1 < ds; r += 2) {
                 float *row0 = state + r * ds;
                 float *row1 = state + (r + 1) * ds;
+                /* Prefetch next 2 rows for output matvec */
+                if (r + 3 < ds) {
+                    for (int pf = 0; pf < ds; pf += 16) {
+                        _mm_prefetch((const char *)(state + (r+2)*ds + pf), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(state + (r+3)*ds + pf), _MM_HINT_T0);
+                    }
+                }
                 __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
                 __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
                 __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
@@ -1942,17 +2078,52 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         /* Use K_exp temporarily for conv output (17408 >= 10240) */
         float *conv_out = K_exp;
 
-        /* Compute conv MAC with circular buffer indexing */
-        for (int j = 0; j < qkv_dim; j++) {
-            float w_buf[8]; /* conv_k <= 8 */
-            tf_dequant_row(&layer->ssm_conv1d, j, w_buf);
-            float sum = 0.0f;
-            for (int f = 0; f < n_hist; f++) {
-                int row = (wr + f) % n_hist;
-                sum += w_buf[f] * conv_st[row * qkv_dim + j];
+        /* Batch-dequant all conv weights into transposed layout [conv_k][qkv_dim] */
+        float *w_trans = (float *)alloca((size_t)conv_k * qkv_dim * sizeof(float));
+        {
+            size_t crb = tf_row_bytes(layer->ssm_conv1d.type, layer->ssm_conv1d.n_cols);
+            const uint8_t *cbase = (const uint8_t *)layer->ssm_conv1d.data;
+            for (int j = 0; j < qkv_dim; j++) {
+                float wb[8];
+                dequant_row(layer->ssm_conv1d.type, cbase + j * crb, wb, conv_k);
+                for (int f = 0; f < conv_k; f++)
+                    w_trans[f * qkv_dim + j] = wb[f];
             }
-            conv_out[j] = sum + w_buf[n_hist] * qkv_buf[j];
         }
+
+        /* Precompute circular buffer row offsets to avoid modulo in inner loop */
+        int row_off[8]; /* conv_k <= 8, n_hist = conv_k-1 */
+        for (int f = 0; f < n_hist; f++)
+            row_off[f] = ((wr + f) % n_hist) * qkv_dim;
+
+        /* Vectorized conv MAC over channels */
+#if defined(__AVX2__) && defined(__FMA__)
+        {
+            int j = 0;
+            for (; j + 7 < qkv_dim; j += 8) {
+                __m256 sum = _mm256_setzero_ps();
+                for (int f = 0; f < n_hist; f++)
+                    sum = _mm256_fmadd_ps(_mm256_loadu_ps(w_trans + f * qkv_dim + j),
+                                           _mm256_loadu_ps(conv_st + row_off[f] + j), sum);
+                sum = _mm256_fmadd_ps(_mm256_loadu_ps(w_trans + n_hist * qkv_dim + j),
+                                       _mm256_loadu_ps(qkv_buf + j), sum);
+                _mm256_storeu_ps(conv_out + j, sum);
+            }
+            for (; j < qkv_dim; j++) {
+                float s = 0.0f;
+                for (int f = 0; f < n_hist; f++)
+                    s += w_trans[f * qkv_dim + j] * conv_st[row_off[f] + j];
+                conv_out[j] = s + w_trans[n_hist * qkv_dim + j] * qkv_buf[j];
+            }
+        }
+#else
+        for (int j = 0; j < qkv_dim; j++) {
+            float sum = 0.0f;
+            for (int f = 0; f < n_hist; f++)
+                sum += w_trans[f * qkv_dim + j] * conv_st[row_off[f] + j];
+            conv_out[j] = sum + w_trans[n_hist * qkv_dim + j] * qkv_buf[j];
+        }
+#endif
         /* Vectorized SiLU activation */
 #if defined(__AVX2__) && defined(__FMA__)
         {
@@ -2213,26 +2384,12 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
                 }
                 tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
             } else {
+                /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
+                tf_attn_task st = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
+                                   0, n_heads, head_dim, kv_dim, gqa_ratio, seq_len,
+                                   m->max_seq_len, scale};
                 memset(m->xb2, 0, q_dim * sizeof(float));
-                for (int h = 0; h < n_heads; h++) {
-                    int kv_h = h / gqa_ratio;
-                    float *q_h = m->q + h * head_dim;
-                    float *att_h = m->att + h * m->max_seq_len;
-                    for (int t = 0; t < seq_len; t++) {
-                        float *k_t = m->key_cache[l] + t * kv_dim + kv_h * head_dim;
-                        float score = 0.0f;
-                        for (int d = 0; d < head_dim; d++) score += q_h[d] * k_t[d];
-                        att_h[t] = score * scale;
-                    }
-                    tf_softmax(att_h, seq_len);
-                    float *out_h = m->xb2 + h * head_dim;
-                    memset(out_h, 0, head_dim * sizeof(float));
-                    for (int t = 0; t < seq_len; t++) {
-                        float *v_t = m->value_cache[l] + t * kv_dim + kv_h * head_dim;
-                        float a = att_h[t];
-                        for (int d = 0; d < head_dim; d++) out_h[d] += a * v_t[d];
-                    }
-                }
+                tf_attn_worker(&st);
             }
             TF_PROF_END("attention", 2.0 * n_heads * seq_len * head_dim * 2, 0);
 
@@ -2311,25 +2468,12 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
                 }
                 tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
             } else {
+                /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
+                tf_attn_task st = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
+                                   0, n_heads, head_dim, kv_dim, gqa_ratio, seq_len,
+                                   m->max_seq_len, scale};
                 memset(m->xb2, 0, q_dim * sizeof(float));
-                for (int h = 0; h < n_heads; h++) {
-                    int kv_h = h / gqa_ratio;
-                    float *q_h = m->q + h * head_dim;
-                    float *att_h = m->att + h * m->max_seq_len;
-                    for (int t = 0; t < seq_len; t++) {
-                        float *k_t = m->key_cache[l] + t * kv_dim + kv_h * head_dim;
-                        float score = 0.0f;
-                        for (int d = 0; d < head_dim; d++) score += q_h[d] * k_t[d];
-                        att_h[t] = score * scale;
-                    }
-                    tf_softmax(att_h, seq_len);
-                    float *out_h = m->xb2 + h * head_dim;
-                    for (int t = 0; t < seq_len; t++) {
-                        float *v_t = m->value_cache[l] + t * kv_dim + kv_h * head_dim;
-                        float a = att_h[t];
-                        for (int d = 0; d < head_dim; d++) out_h[d] += a * v_t[d];
-                    }
-                }
+                tf_attn_worker(&st);
             }
 
             /* QK: heads*seq*hd, AV: heads*seq*hd */
@@ -2443,7 +2587,7 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
         /* DeepStack injection: add deepstack slice after each early layer */
         if (m->ds_embd && l < m->n_deepstack && m->ds_embd_stride > n_embd) {
             const float *ds_slice = m->ds_embd + (1 + l) * n_embd;
-            for (int i = 0; i < n_embd; i++) m->x[i] += ds_slice[i];
+            tf_vadd(m->x, ds_slice, n_embd);
         }
 
         if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
@@ -3397,7 +3541,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
                 if (b->ds_embds[t] && b->ds_embd_stride > n_embd) {
                     const float *ds_slice = b->ds_embds[t] + (1 + l) * n_embd;
                     float *xt = bx + (size_t)t * n_embd;
-                    for (int i = 0; i < n_embd; i++) xt[i] += ds_slice[i];
+                    tf_vadd(xt, ds_slice, n_embd);
                 }
             }
         }
