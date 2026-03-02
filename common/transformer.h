@@ -2541,25 +2541,39 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
             TF_PROF_END("ffn_gate_inp", 2.0 * n_expert * n_embd, 0);
             tf_softmax(m->ffn_buf1, n_expert);
 
-            /* Select top-k experts */
+            /* Select top-k experts using min-heap: O(n_expert) single pass */
             int *top_idx = (int *)alloca(n_top * sizeof(int));
             float *top_w = (float *)alloca(n_top * sizeof(float));
-            float wsum = 0.0f;
-            for (int i = 0; i < n_top; i++) {
-                int best = -1;
-                float best_w = -1.0f;
-                for (int e = 0; e < n_expert; e++) {
-                    float w = m->ffn_buf1[e];
-                    if (w > best_w) {
-                        best_w = w;
-                        best = e;
+            int k = 0;
+            for (int e = 0; e < n_expert; e++) {
+                float w = m->ffn_buf1[e];
+                if (k < n_top) {
+                    top_idx[k] = e; top_w[k] = w; k++;
+                    /* Sift up to maintain min-heap at top_w[0] */
+                    for (int j = k-1; j > 0;) {
+                        int p = (j-1)/2;
+                        if (top_w[j] < top_w[p]) {
+                            float tv = top_w[j]; top_w[j] = top_w[p]; top_w[p] = tv;
+                            int ti = top_idx[j]; top_idx[j] = top_idx[p]; top_idx[p] = ti;
+                            j = p;
+                        } else break;
+                    }
+                } else if (w > top_w[0]) {
+                    top_w[0] = w; top_idx[0] = e;
+                    /* Sift down from root */
+                    for (int j = 0;;) {
+                        int s = j, l2 = 2*j+1, r2 = 2*j+2;
+                        if (l2 < n_top && top_w[l2] < top_w[s]) s = l2;
+                        if (r2 < n_top && top_w[r2] < top_w[s]) s = r2;
+                        if (s == j) break;
+                        float tv = top_w[j]; top_w[j] = top_w[s]; top_w[s] = tv;
+                        int ti = top_idx[j]; top_idx[j] = top_idx[s]; top_idx[s] = ti;
+                        j = s;
                     }
                 }
-                top_idx[i] = best;
-                top_w[i] = best_w;
-                wsum += best_w;
-                m->ffn_buf1[best] = -1.0f; /* mark as used */
             }
+            float wsum = 0.0f;
+            for (int i = 0; i < n_top; i++) wsum += top_w[i];
             if (wsum > 0.0f) {
                 for (int i = 0; i < n_top; i++) top_w[i] /= wsum;
             }
@@ -2696,28 +2710,38 @@ static void tf_gemm_f16_mt(float *Y, const qtensor *mat, const float *X,
                             int n_rows, int N, int Y_stride, int X_stride,
                             int n_threads) {
     if (mat->type != GGML_TYPE_F16) {
-        /* Fallback: per-token matvec for non-F16 weights */
+        /* Fallback: per-token matvec for non-F16 weights (AVX2 dot product) */
         int n_cols = mat->n_cols;
         float *row_buf = (float *)malloc(n_cols * sizeof(float));
+        size_t rb = tf_row_bytes(mat->type, n_cols);
         for (int t = 0; t < N; t++) {
             const float *xt = X + (size_t)t * X_stride;
             for (int r = 0; r < n_rows; r++) {
-                int block_size = 1, type_size = 4;
-                switch (mat->type) {
-                    case GGML_TYPE_Q2_K: block_size = 256; type_size = 84;  break;
-                    case GGML_TYPE_Q3_K: block_size = 256; type_size = 110; break;
-                    case GGML_TYPE_Q8_0: block_size = 32;  type_size = 34;  break;
-                    case GGML_TYPE_Q4_K: block_size = 256; type_size = 144; break;
-                    case GGML_TYPE_Q5_K: block_size = 256; type_size = 176; break;
-                    case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
-                    case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
-                    default: break;
-                }
-                size_t row_bytes = (size_t)((n_cols + block_size - 1) / block_size) * type_size;
-                const void *row_data = (const uint8_t *)mat->data + (size_t)r * row_bytes;
+                const void *row_data = (const uint8_t *)mat->data + (size_t)r * rb;
                 dequant_row(mat->type, row_data, row_buf, n_cols);
+#if defined(__AVX2__) && defined(__FMA__)
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                int j = 0;
+                for (; j + 31 < n_cols; j += 32) {
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j),    _mm256_loadu_ps(xt+j),    a0);
+                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+8),  _mm256_loadu_ps(xt+j+8),  a1);
+                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+16), _mm256_loadu_ps(xt+j+16), a2);
+                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+24), _mm256_loadu_ps(xt+j+24), a3);
+                }
+                for (; j + 7 < n_cols; j += 8)
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j), _mm256_loadu_ps(xt+j), a0);
+                a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+                __m128 hi = _mm256_extractf128_ps(a0, 1), lo = _mm256_castps256_ps128(a0);
+                __m128 s4 = _mm_add_ps(lo, hi);
+                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+                s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+                float sum = _mm_cvtss_f32(s4);
+                for (; j < n_cols; j++) sum += row_buf[j] * xt[j];
+#else
                 float sum = 0.0f;
                 for (int j = 0; j < n_cols; j++) sum += row_buf[j] * xt[j];
+#endif
                 Y[r * Y_stride + t] = sum;
             }
         }
@@ -2818,17 +2842,38 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         return;
     }
     if (mat->type != GGML_TYPE_F16) {
-        /* Fallback for other non-F16: per-token matvec */
+        /* Fallback for other non-F16: per-token matvec (AVX2 dot product) */
         int n_cols = mat->n_cols;
         float *row_buf = (float *)malloc(n_cols * sizeof(float));
+        size_t rb = tf_row_bytes(mat->type, n_cols);
         for (int t = 0; t < N; t++) {
             const float *xt = X + (size_t)t * X_stride;
             for (int r = 0; r < n_rows; r++) {
-                size_t row_bytes = tf_row_bytes(mat->type, n_cols);
-                const void *row_data = (const uint8_t *)mat->data + (size_t)r * row_bytes;
+                const void *row_data = (const uint8_t *)mat->data + (size_t)r * rb;
                 dequant_row(mat->type, row_data, row_buf, n_cols);
+#if defined(__AVX2__) && defined(__FMA__)
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                int j = 0;
+                for (; j + 31 < n_cols; j += 32) {
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j),    _mm256_loadu_ps(xt+j),    a0);
+                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+8),  _mm256_loadu_ps(xt+j+8),  a1);
+                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+16), _mm256_loadu_ps(xt+j+16), a2);
+                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+24), _mm256_loadu_ps(xt+j+24), a3);
+                }
+                for (; j + 7 < n_cols; j += 8)
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j), _mm256_loadu_ps(xt+j), a0);
+                a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+                __m128 hi = _mm256_extractf128_ps(a0, 1), lo = _mm256_castps256_ps128(a0);
+                __m128 s4 = _mm_add_ps(lo, hi);
+                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+                s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+                float sum = _mm_cvtss_f32(s4);
+                for (; j < n_cols; j++) sum += row_buf[j] * xt[j];
+#else
                 float sum = 0.0f;
                 for (int j = 0; j < n_cols; j++) sum += row_buf[j] * xt[j];
+#endif
                 Y_out[(size_t)t * out_stride + r] = sum;
             }
         }
@@ -3077,10 +3122,33 @@ static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
     for (int t = 0; t < N; t++) {
         const float *xi = src + (size_t)t * n_embd;
         float *yi = dst + (size_t)t * n_embd;
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 vss = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 7 < n_embd; i += 8) {
+            __m256 vx = _mm256_loadu_ps(xi + i);
+            vss = _mm256_fmadd_ps(vx, vx, vss);
+        }
+        __m128 hi = _mm256_extractf128_ps(vss, 1);
+        __m128 lo = _mm256_castps256_ps128(vss);
+        __m128 s4 = _mm_add_ps(lo, hi);
+        s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+        float ss = _mm_cvtss_f32(s4);
+        for (; i < n_embd; i++) ss += xi[i] * xi[i];
+        ss = 1.0f / sqrtf(ss / n_embd + eps);
+        __m256 vscale = _mm256_set1_ps(ss);
+        i = 0;
+        for (; i + 7 < n_embd; i += 8)
+            _mm256_storeu_ps(yi + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xi + i), vscale),
+                                                     _mm256_loadu_ps(w_buf + i)));
+        for (; i < n_embd; i++) yi[i] = xi[i] * ss * w_buf[i];
+#else
         float ss = 0.0f;
         for (int i = 0; i < n_embd; i++) ss += xi[i] * xi[i];
         ss = 1.0f / sqrtf(ss / n_embd + eps);
         for (int i = 0; i < n_embd; i++) yi[i] = xi[i] * ss * w_buf[i];
+#endif
     }
 }
 
@@ -3092,10 +3160,33 @@ static void tf_qk_norm_batch(float *vec, int n_heads, int head_dim, int N,
     for (int t = 0; t < N; t++) {
         for (int h = 0; h < n_heads; h++) {
             float *v = vec + (size_t)t * vec_dim + h * head_dim;
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 vss = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 7 < head_dim; i += 8) {
+                __m256 vx = _mm256_loadu_ps(v + i);
+                vss = _mm256_fmadd_ps(vx, vx, vss);
+            }
+            __m128 hi = _mm256_extractf128_ps(vss, 1);
+            __m128 lo = _mm256_castps256_ps128(vss);
+            __m128 s4 = _mm_add_ps(lo, hi);
+            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+            float ss = _mm_cvtss_f32(s4);
+            for (; i < head_dim; i++) ss += v[i] * v[i];
+            ss = 1.0f / sqrtf(ss / head_dim + eps);
+            __m256 vscale = _mm256_set1_ps(ss);
+            i = 0;
+            for (; i + 7 < head_dim; i += 8)
+                _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(v + i), vscale),
+                                                       _mm256_loadu_ps(w_buf + i)));
+            for (; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#else
             float ss = 0.0f;
             for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];
             ss = 1.0f / sqrtf(ss / head_dim + eps);
             for (int i = 0; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#endif
         }
     }
 }
@@ -3635,9 +3726,9 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
 int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperature, int top_k) {
     if (top_k <= 0 || top_k > n_vocab) top_k = n_vocab;
 
-    /* Find top-k indices by partial sort */
-    int32_t *indices = (int32_t *)malloc(top_k * sizeof(int32_t));
-    float *vals = (float *)malloc(top_k * sizeof(float));
+    /* Find top-k indices by partial sort (alloca to avoid malloc in hot path) */
+    int32_t *indices = (int32_t *)alloca(top_k * sizeof(int32_t));
+    float *vals = (float *)alloca(top_k * sizeof(float));
     int k = 0;
 
     for (int i = 0; i < n_vocab; i++) {
@@ -3683,8 +3774,6 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
         if (r <= cum) { result = indices[i]; break; }
     }
 
-    free(indices);
-    free(vals);
     return result;
 }
 
