@@ -148,6 +148,12 @@ typedef struct {
     volatile int pool_phase;   /* incremented to signal work */
     volatile int pool_done;    /* number of workers done */
     int pool_alive;            /* 1 if pool is running */
+
+    /* Tensor parallelism */
+    int tp_rank;               /* this rank's position in the TP group (0 if no TP) */
+    int tp_size;               /* size of the TP group (1 if no TP) */
+    void (*tp_allreduce_fn)(float *buf, int count, void *ctx);  /* allreduce callback */
+    void *tp_allreduce_ctx;    /* opaque context passed to allreduce (e.g. parallel_config*) */
 } transformer_model;
 
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len);
@@ -175,6 +181,39 @@ float *transformer_forward_pos(transformer_model *model, int32_t token_id, int c
 float *transformer_forward_logits_pos(transformer_model *model, int32_t token_id, int cache_pos, int pos_t, int pos_h, int pos_w);
 float *transformer_forward_embd_pos(transformer_model *model, const float *embd, int cache_pos, int pos_t, int pos_h, int pos_w);
 float *transformer_forward_embd_logits_pos(transformer_model *model, const float *embd, int cache_pos, int pos_t, int pos_h, int pos_w);
+
+/* --- Pipeline-parallel API (for MPI) --- */
+
+/* Process layers [layer_start, layer_end) only.
+ * If layer_start == 0: expects model->x already set (e.g. via token embedding).
+ * If layer_end == n_layers: applies final RMSNorm.
+ * Returns pointer to model->x (hidden state [n_embd]). */
+float *transformer_forward_partial(transformer_model *model, int cache_pos,
+                                    int layer_start, int layer_end);
+
+/* Compute logits from the current hidden state in model->x.
+ * Call after transformer_forward_partial with layer_end == n_layers. */
+float *transformer_compute_logits(transformer_model *model);
+
+/* Copy hidden state into/out of model->x for MPI communication */
+float *transformer_get_hidden(transformer_model *model);
+void transformer_set_hidden(transformer_model *model, const float *hidden);
+
+/* Embed a token into model->x (no layer processing) */
+void transformer_embed_token(transformer_model *model, int32_t token_id);
+
+/* --- Tensor-parallel API --- */
+
+/* Configure tensor parallelism. Must be called before forward passes.
+ * tp_rank: this rank's index in the TP group [0, tp_size).
+ * tp_size: total ranks in the TP group.
+ * allreduce_fn: callback to allreduce(sum) a float buffer in-place.
+ * allreduce_ctx: opaque context passed to allreduce_fn (e.g. parallel_config*).
+ *
+ * Constraints: n_heads % tp_size == 0, n_kv_heads % tp_size == 0, n_ff % tp_size == 0. */
+void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
+                         void (*allreduce_fn)(float *buf, int count, void *ctx),
+                         void *allreduce_ctx);
 
 /* --- Batched prefill API --- */
 
@@ -1571,8 +1610,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->logits     = m->has_lm_head ? (float *)calloc(m->n_vocab, sizeof(float)) : NULL;
     m->matvec_tmp = (float *)calloc(max_dim, sizeof(float));
 
-    /* Default: single-threaded */
+    /* Default: single-threaded, no tensor parallelism */
     m->n_threads = 1;
+    m->tp_rank = 0;
+    m->tp_size = 1;
+    m->tp_allreduce_fn = NULL;
+    m->tp_allreduce_ctx = NULL;
     m->thread_tmp = (float **)calloc(1, sizeof(float *));
     m->thread_tmp[0] = m->matvec_tmp;
 
@@ -2295,7 +2338,10 @@ static void tf_apply_rope(transformer_model *m, float *q, float *k,
 
 /* ---- Forward pass ---- */
 
-/* Internal: forward pass block loop with separate cache position and 3D RoPE positions */
+/* Internal: forward pass block loop with separate cache position and 3D RoPE positions.
+ * Processes layers [layer_start, layer_end). If layer_end == n_layers, applies final norm. */
+static float *tf_forward_blocks_range(transformer_model *m, int cache_pos, int pos_t, int pos_h, int pos_w,
+                                       int layer_start, int layer_end);
 static float *tf_forward_blocks(transformer_model *m, int cache_pos, int pos_t, int pos_h, int pos_w);
 
 /* Forward with M-RoPE: cache_pos = KV cache slot, pos_t/h/w = RoPE temporal/height/width */
@@ -2331,6 +2377,11 @@ float *transformer_forward_logits(transformer_model *model, int32_t token_id, in
 }
 
 static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
+    return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
+}
+
+static float *tf_forward_blocks_range(transformer_model *m, int position, int pos_t, int pos_h, int pos_w,
+                                       int layer_start, int layer_end) {
     int n_embd = m->n_embd;
     int n_heads = m->n_heads;
     int n_kv_heads = m->n_kv_heads;
@@ -2339,8 +2390,11 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
     int q_dim = n_heads * head_dim;  /* may differ from n_embd */
     int gqa_ratio = n_heads / n_kv_heads;
 
+    if (layer_end > m->n_layers) layer_end = m->n_layers;
+    if (layer_start < 0) layer_start = 0;
+
     /* 2. Transformer blocks */
-    for (int l = 0; l < m->n_layers; l++) {
+    for (int l = layer_start; l < layer_end; l++) {
         transformer_layer *layer = &m->layers[l];
 
         /* --- Attention --- */
@@ -2629,12 +2683,124 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
         }
     }
 
-    /* Final RMSNorm */
-    TF_PROF_BEGIN("final_norm", -1, "rmsnorm", "FP32");
-    tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
-    TF_PROF_END("final_norm", 5.0 * n_embd, 0);
+    /* Final RMSNorm (only if we processed through the last layer) */
+    if (layer_end >= m->n_layers) {
+        TF_PROF_BEGIN("final_norm", -1, "rmsnorm", "FP32");
+        tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        TF_PROF_END("final_norm", 5.0 * n_embd, 0);
+    }
 
     return m->x;
+}
+
+/* ---- Tensor-parallel API ---- */
+
+void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
+                         void (*allreduce_fn)(float *buf, int count, void *ctx),
+                         void *allreduce_ctx) {
+    if (!model) return;
+    model->tp_rank = tp_rank;
+    model->tp_size = tp_size;
+    model->tp_allreduce_fn = allreduce_fn;
+    model->tp_allreduce_ctx = allreduce_ctx;
+}
+
+/* Column-parallel matvec: compute rows [row_start, row_end) of mat, output to dst[0..count).
+ * Used for QKV, gate, up projections where each TP rank computes a subset of output rows. */
+static void tf_qmatvec_row_slice(transformer_model *m, float *dst, const qtensor *mat,
+                                  const float *x, int row_start, int row_end) {
+    int count = row_end - row_start;
+    if (count <= 0) return;
+    /* Create a virtual qtensor pointing to the slice */
+    size_t row_bytes = tf_row_bytes(mat->type, mat->n_cols);
+    qtensor slice = *mat;
+    slice.data = (void *)((const uint8_t *)mat->data + (size_t)row_start * row_bytes);
+    slice.n_rows = count;
+    tf_qmatvec_pool(m, dst, &slice, x, count);
+}
+
+/* Row-parallel matvec: compute partial dot products using columns [col_start, col_end) of mat.
+ * Each row's result is a partial sum; caller must allreduce across TP ranks.
+ * x_local is the local slice of the input [col_end - col_start].
+ * dst has n_rows elements (partial sums). */
+static void tf_qmatvec_col_slice(float *dst, const qtensor *mat, const float *x_local,
+                                  int n_rows, int col_start, int col_end, float *tmp) {
+    int n_cols = mat->n_cols;
+    int local_cols = col_end - col_start;
+    size_t row_bytes = tf_row_bytes(mat->type, n_cols);
+    for (int i = 0; i < n_rows; i++) {
+        /* Dequant full row to tmp, then dot with local slice */
+        tf_dequant_row(mat, i, tmp);
+        float sum = 0.0f;
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 15 < local_cols; j += 16) {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + col_start + j),
+                                    _mm256_loadu_ps(x_local + j), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + col_start + j + 8),
+                                    _mm256_loadu_ps(x_local + j + 8), acc1);
+        }
+        for (; j + 7 < local_cols; j += 8)
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + col_start + j),
+                                    _mm256_loadu_ps(x_local + j), acc0);
+        acc0 = _mm256_add_ps(acc0, acc1);
+        __m128 hi = _mm256_extractf128_ps(acc0, 1);
+        __m128 lo = _mm256_castps256_ps128(acc0);
+        __m128 s4 = _mm_add_ps(lo, hi);
+        s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
+        sum = _mm_cvtss_f32(s4);
+        for (; j < local_cols; j++) sum += tmp[col_start + j] * x_local[j];
+#else
+        for (int j = 0; j < local_cols; j++)
+            sum += tmp[col_start + j] * x_local[j];
+#endif
+        dst[i] = sum;
+    }
+}
+
+/* Row-parallel matvec with pool threading: col_slice + allreduce. */
+static void tf_qmatvec_col_slice_pool(transformer_model *m, float *dst, const qtensor *mat,
+                                       const float *x_local, int n_rows,
+                                       int col_start, int col_end) {
+    /* Single-threaded col-slice (threading within rows is hard for col-slice) */
+    tf_qmatvec_col_slice(dst, mat, x_local, n_rows, col_start, col_end, m->matvec_tmp);
+    /* Allreduce partial sums across TP ranks */
+    if (m->tp_allreduce_fn)
+        m->tp_allreduce_fn(dst, n_rows, m->tp_allreduce_ctx);
+}
+
+/* ---- Pipeline-parallel API ---- */
+
+void transformer_embed_token(transformer_model *model, int32_t token_id) {
+    if (!model || !model->token_embd.data) return;
+    if (token_id < 0 || token_id >= model->n_vocab) return;
+    tf_dequant_row(&model->token_embd, token_id, model->x);
+}
+
+float *transformer_get_hidden(transformer_model *model) {
+    return model ? model->x : NULL;
+}
+
+void transformer_set_hidden(transformer_model *model, const float *hidden) {
+    if (model && hidden)
+        memcpy(model->x, hidden, model->n_embd * sizeof(float));
+}
+
+float *transformer_compute_logits(transformer_model *model) {
+    if (!model || !model->has_lm_head) return NULL;
+    TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
+    tf_qmatvec_pool(model, model->logits, &model->output, model->x, model->n_vocab);
+    TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
+    return model->logits;
+}
+
+float *transformer_forward_partial(transformer_model *m, int cache_pos,
+                                    int layer_start, int layer_end) {
+    if (!m) return NULL;
+    return tf_forward_blocks_range(m, cache_pos, cache_pos, cache_pos, cache_pos,
+                                    layer_start, layer_end);
 }
 
 float *transformer_forward_embd_pos(transformer_model *model, const float *embd, int cache_pos, int pos_t, int pos_h, int pos_w) {
