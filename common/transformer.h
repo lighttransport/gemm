@@ -664,6 +664,7 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         tf_matvec_q8_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else {
         float *tmp = (float *)malloc(n_cols * sizeof(float));
+        if (!tmp) return;
         for (int i = row_start; i < row_end; i++) {
             tf_dequant_row(mat, i, tmp);
             float sum = 0.0f;
@@ -1215,6 +1216,14 @@ static void tf_softmax(float *x, int n) {
 
 /* ---- Load ---- */
 
+static int tf_compute_max_ff(const transformer_model *m) {
+    int max_ff = m->n_ff;
+    if (m->use_moe && m->n_ff_expert > max_ff) max_ff = m->n_ff_expert;
+    if (m->use_moe && m->n_expert > max_ff) max_ff = m->n_expert;
+    if (m->is_hybrid && m->ssm_qkv_dim > max_ff) max_ff = m->ssm_qkv_dim;
+    return max_ff;
+}
+
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     if (!gguf) return NULL;
 
@@ -1536,10 +1545,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     }
 
     /* Allocate scratch buffers */
-    int max_ff = m->n_ff;
-    if (m->use_moe && m->n_ff_expert > max_ff) max_ff = m->n_ff_expert;
-    if (m->use_moe && m->n_expert > max_ff) max_ff = m->n_expert;
-    if (m->is_hybrid && m->ssm_qkv_dim > max_ff) max_ff = m->ssm_qkv_dim; /* conv_out scratch */
+    int max_ff = tf_compute_max_ff(m);
     int max_dim = m->n_embd > max_ff ? m->n_embd : max_ff;
     int q_dim = m->n_heads * m->head_dim;  /* may differ from n_embd (e.g. 4B: 4096 vs 2560) */
     /* xb2 must hold: attention output (q_dim), SSM qkv (qkv_dim), or Q+gate (2*q_dim) */
@@ -1724,10 +1730,7 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     for (int t = 1; t < model->n_threads; t++) free(model->thread_tmp[t]);
     free(model->thread_tmp);
 
-    int max_ff = model->n_ff;
-    if (model->use_moe && model->n_ff_expert > max_ff) max_ff = model->n_ff_expert;
-    if (model->use_moe && model->n_expert > max_ff) max_ff = model->n_expert;
-    if (model->is_hybrid && model->ssm_qkv_dim > max_ff) max_ff = model->ssm_qkv_dim;
+    int max_ff = tf_compute_max_ff(model);
     int max_dim = model->n_embd > max_ff ? model->n_embd : max_ff;
     model->n_threads = n_threads;
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
