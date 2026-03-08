@@ -652,58 +652,37 @@ typedef struct {
     int row_start2, row_end2; /* range for mat2 and mat3 */
 } tf_matvec_fused3_task;
 
-static void *tf_qmatvec_fused3_worker(void *arg) {
-    tf_matvec_fused3_task *t = (tf_matvec_fused3_task *)arg;
-    int n_cols = t->mat1->n_cols;
-    if (t->mat1->type == GGML_TYPE_F16) {
-        size_t row_bytes = (size_t)n_cols * 2;
-        if (t->row_end1 > t->row_start1)
-            tf_matvec_f16_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
-                                t->x, n_cols, t->row_start1, t->row_end1);
-        if (t->row_end2 > t->row_start2) {
-            tf_matvec_f16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
-                                t->x, n_cols, t->row_start2, t->row_end2);
-            tf_matvec_f16_rows(t->dst3, (const uint8_t *)t->mat3->data, row_bytes,
-                                t->x, n_cols, t->row_start2, t->row_end2);
-        }
-    } else if (t->mat1->type == GGML_TYPE_Q8_0) {
-        int nb = n_cols / 32;
-        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
-        if (t->row_end1 > t->row_start1) {
-            tf_matvec_q8_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
-                                t->x, n_cols, t->row_start1, t->row_end1);
-        }
-        if (t->row_end2 > t->row_start2) {
-            tf_matvec_q8_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
-                                t->x, n_cols, t->row_start2, t->row_end2);
-            tf_matvec_q8_rows(t->dst3, (const uint8_t *)t->mat3->data, row_bytes,
-                                t->x, n_cols, t->row_start2, t->row_end2);
-        }
+/* Process one matrix matvec with its own type (helper for fused3 worker) */
+static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *x,
+                                    int row_start, int row_end) {
+    int n_cols = mat->n_cols;
+    if (mat->type == GGML_TYPE_F16) {
+        size_t rb = (size_t)n_cols * 2;
+        tf_matvec_f16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+    } else if (mat->type == GGML_TYPE_Q8_0) {
+        size_t rb = (size_t)(n_cols / 32) * sizeof(block_q8_0);
+        tf_matvec_q8_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else {
         float *tmp = (float *)malloc(n_cols * sizeof(float));
-        if (t->row_end1 > t->row_start1) {
-            for (int i = t->row_start1; i < t->row_end1; i++) {
-                tf_dequant_row(t->mat1, i, tmp);
-                float sum = 0.0f;
-                for (int j = 0; j < n_cols; j++) sum += tmp[j] * t->x[j];
-                t->dst1[i] = sum;
-            }
-        }
-        if (t->row_end2 > t->row_start2) {
-            for (int i = t->row_start2; i < t->row_end2; i++) {
-                tf_dequant_row(t->mat2, i, tmp);
-                float sum = 0.0f;
-                for (int j = 0; j < n_cols; j++) sum += tmp[j] * t->x[j];
-                t->dst2[i] = sum;
-            }
-            for (int i = t->row_start2; i < t->row_end2; i++) {
-                tf_dequant_row(t->mat3, i, tmp);
-                float sum = 0.0f;
-                for (int j = 0; j < n_cols; j++) sum += tmp[j] * t->x[j];
-                t->dst3[i] = sum;
-            }
+        for (int i = row_start; i < row_end; i++) {
+            tf_dequant_row(mat, i, tmp);
+            float sum = 0.0f;
+            for (int j = 0; j < n_cols; j++) sum += tmp[j] * x[j];
+            dst[i] = sum;
         }
         free(tmp);
+    }
+}
+
+static void *tf_qmatvec_fused3_worker(void *arg) {
+    tf_matvec_fused3_task *t = (tf_matvec_fused3_task *)arg;
+    /* Each matrix is processed with its own type — handles mixed quantization
+     * (e.g. Unsloth UD where Q may be F16 while K/V remain Q8_0). */
+    if (t->row_end1 > t->row_start1)
+        tf_matvec_qtensor_rows(t->dst1, t->mat1, t->x, t->row_start1, t->row_end1);
+    if (t->row_end2 > t->row_start2) {
+        tf_matvec_qtensor_rows(t->dst2, t->mat2, t->x, t->row_start2, t->row_end2);
+        tf_matvec_qtensor_rows(t->dst3, t->mat3, t->x, t->row_start2, t->row_end2);
     }
     return NULL;
 }
@@ -1560,6 +1539,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     int max_ff = m->n_ff;
     if (m->use_moe && m->n_ff_expert > max_ff) max_ff = m->n_ff_expert;
     if (m->use_moe && m->n_expert > max_ff) max_ff = m->n_expert;
+    if (m->is_hybrid && m->ssm_qkv_dim > max_ff) max_ff = m->ssm_qkv_dim; /* conv_out scratch */
     int max_dim = m->n_embd > max_ff ? m->n_embd : max_ff;
     int q_dim = m->n_heads * m->head_dim;  /* may differ from n_embd (e.g. 4B: 4096 vs 2560) */
     /* xb2 must hold: attention output (q_dim), SSM qkv (qkv_dim), or Q+gate (2*q_dim) */
@@ -1747,6 +1727,7 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     int max_ff = model->n_ff;
     if (model->use_moe && model->n_ff_expert > max_ff) max_ff = model->n_ff_expert;
     if (model->use_moe && model->n_expert > max_ff) max_ff = model->n_expert;
+    if (model->is_hybrid && model->ssm_qkv_dim > max_ff) max_ff = model->ssm_qkv_dim;
     int max_dim = model->n_embd > max_ff ? model->n_embd : max_ff;
     model->n_threads = n_threads;
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
