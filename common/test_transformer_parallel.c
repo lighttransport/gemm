@@ -1,20 +1,25 @@
 /*
- * test_transformer_parallel.c - Unified MPI parallel transformer inference test
+ * test_transformer_parallel.c - Distributed parallel transformer inference test
  *
  * Supports three orthogonal parallelism modes:
  *   --tp N : Tensor Parallel (split heads/FFN across N ranks)
  *   --pp N : Pipeline Parallel (split layers across N ranks)
  *   --dp N : Data Parallel (N independent replicas)
  *
- * Total MPI ranks must equal tp * pp * dp.
+ * Total ranks must equal tp * pp * dp.
  *
- * Build:
- *   mpicc -O2 -march=native -o test_transformer_parallel test_transformer_parallel.c -lm -lpthread
+ * Build (custom comm, no MPI needed):
+ *   gcc -O2 -march=native -o test_transformer_parallel test_transformer_parallel.c -lm -lpthread
  *
- * Run:
+ * Build (MPI backend):
+ *   mpicc -O2 -march=native -DUSE_MPI -o test_transformer_parallel test_transformer_parallel.c -lm -lpthread
+ *
+ * Run (custom comm via launcher):
+ *   ./launch.sh 2 ./test_transformer_parallel <model.gguf> --pp 2 "Hello" 16
+ *   ./launch.sh 4 ./test_transformer_parallel <model.gguf> --tp 2 --pp 2 "Hello" 16
+ *
+ * Run (MPI):
  *   mpirun -np 2 ./test_transformer_parallel <model.gguf> --pp 2 "Hello" 16
- *   mpirun -np 4 ./test_transformer_parallel <model.gguf> --tp 2 --pp 2 "Hello" 16
- *   mpirun -np 4 ./test_transformer_parallel <model.gguf> --dp 4 "Hello" 16
  */
 
 #define GGUF_LOADER_IMPLEMENTATION
@@ -29,6 +34,15 @@
 #define TRANSFORMER_IMPLEMENTATION
 #include "transformer.h"
 
+#ifdef USE_MPI
+#define PARALLEL_USE_MPI
+#endif
+
+#ifndef USE_MPI
+#define COMM_IMPLEMENTATION
+#include "comm.h"
+#endif
+
 #define PARALLEL_IMPLEMENTATION
 #include "parallel.h"
 
@@ -36,16 +50,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
+#include <sys/time.h>
+
+static double wtime(void) {
+#ifdef USE_MPI
+    return MPI_Wtime();
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
+#endif
+}
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: mpirun -np N %s <model.gguf> [options] [prompt] [max_gen] [n_threads]\n", prog);
+    fprintf(stderr, "Usage: %s <model.gguf> [options] [prompt] [max_gen] [n_threads]\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --tp N    Tensor parallel size (default: 1)\n");
     fprintf(stderr, "  --pp N    Pipeline parallel size (default: 1)\n");
     fprintf(stderr, "  --dp N    Data parallel size (default: 1)\n");
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Total MPI ranks must equal tp * pp * dp.\n");
+#ifdef USE_MPI
+    fprintf(stderr, "\nLaunch: mpirun -np N %s ...\n", prog);
+#else
+    fprintf(stderr, "\nLaunch: ./launch.sh N %s ...\n", prog);
+#endif
 }
 
 /* Parse command line: extract --tp/--pp/--dp, return remaining positional args */
@@ -79,7 +106,7 @@ static void parse_args(int argc, char **argv,
     }
 }
 
-/* ---- Pipeline-parallel inference (PP only, no TP) ---- */
+/* ---- Pipeline-parallel inference ---- */
 static void run_pipeline_parallel(parallel_config *cfg, transformer_model *model,
                                    bpe_vocab *vocab, const int32_t *tokens, int n_tokens,
                                    int max_gen) {
@@ -87,11 +114,10 @@ static void run_pipeline_parallel(parallel_config *cfg, transformer_model *model
     int pp_rank = cfg->pp_rank;
     int pp_size = cfg->pp_size;
 
-    /* Prefill */
     if (pp_rank == 0)
         fprintf(stderr, "\n=== PP Prefill (%d tokens, %d stages) ===\n", n_tokens, pp_size);
 
-    double t0 = MPI_Wtime();
+    double t0 = wtime();
     int pos = 0;
     for (int i = 0; i < n_tokens; i++) {
         if (pp_rank == 0)
@@ -110,19 +136,16 @@ static void run_pipeline_parallel(parallel_config *cfg, transformer_model *model
 
         pos++;
     }
-    double t1 = MPI_Wtime();
+    double t1 = wtime();
 
-    if (pp_rank == 0) {
+    if (pp_rank == 0)
         fprintf(stderr, "Prefill: %.3f s (%.1f ms/tok)\n", t1 - t0, (t1 - t0) * 1000.0 / n_tokens);
-        printf("%s", ""); /* placeholder for prompt echo */
-        fflush(stdout);
-    }
 
     /* Generation */
     if (pp_rank == 0)
         fprintf(stderr, "\n=== PP Generation (max %d tokens) ===\n", max_gen);
 
-    double t_gen_start = MPI_Wtime();
+    double t_gen_start = wtime();
     int gen_count = 0;
     int32_t next_token = -1;
 
@@ -150,17 +173,14 @@ static void run_pipeline_parallel(parallel_config *cfg, transformer_model *model
             pos++;
         }
 
-        /* Greedy sample on last PP rank */
         if (pp_rank == pp_size - 1 && logits) {
             next_token = 0;
             for (int j = 1; j < model->n_vocab; j++)
                 if (logits[j] > logits[next_token]) next_token = j;
         }
 
-        /* Broadcast next_token to all PP ranks */
         parallel_pp_bcast_from_last(cfg, &next_token);
 
-        /* Check EOS on rank 0, broadcast stop */
         int stop = 0;
         if (pp_rank == 0 && vocab) {
             if (next_token == vocab->eos_id || next_token == vocab->eot_id) {
@@ -183,7 +203,7 @@ static void run_pipeline_parallel(parallel_config *cfg, transformer_model *model
         gen_count = g + 1;
     }
 
-    double t_gen_end = MPI_Wtime();
+    double t_gen_end = wtime();
     if (pp_rank == 0) {
         printf("\n");
         fprintf(stderr, "\nPP Generation: %.3f s (%d tokens, %.1f tok/s)\n",
@@ -192,12 +212,10 @@ static void run_pipeline_parallel(parallel_config *cfg, transformer_model *model
     }
 }
 
-/* ---- Data-parallel inference (each DP rank runs independently) ---- */
+/* ---- Data-parallel inference ---- */
 static void run_data_parallel(parallel_config *cfg, transformer_model *model,
                                bpe_vocab *vocab, const int32_t *tokens, int n_tokens,
                                int max_gen) {
-    /* Each DP rank processes the same prompt independently.
-     * In a real scenario, each would process different inputs. */
     fprintf(stderr, "[DP rank %d] Running independent inference\n", cfg->dp_rank);
 
     int pos = 0;
@@ -209,7 +227,6 @@ static void run_data_parallel(parallel_config *cfg, transformer_model *model,
         pos++;
     }
 
-    /* Generation */
     int32_t next_token = -1;
     int gen_count = 0;
 
@@ -231,7 +248,6 @@ static void run_data_parallel(parallel_config *cfg, transformer_model *model,
         if (next_token == vocab->eos_id || next_token == vocab->eot_id)
             break;
 
-        /* Only DP rank 0 prints output */
         if (cfg->dp_rank == 0) {
             const char *tok_str = bpe_token_to_str(vocab, next_token);
             if (tok_str) {
@@ -250,22 +266,21 @@ static void run_data_parallel(parallel_config *cfg, transformer_model *model,
     if (cfg->dp_rank == 0)
         printf("\n");
 
-    /* Verify all DP replicas got the same output (sanity check) */
-    int32_t all_last_token = next_token;
-    MPI_Bcast(&all_last_token, 1, MPI_INT32_T, 0, cfg->dp_comm);
-    if (all_last_token != next_token) {
-        fprintf(stderr, "[DP rank %d] WARNING: last token %d != rank 0's %d (divergence!)\n",
-                cfg->dp_rank, next_token, all_last_token);
-    } else {
+    /* Verify replicas match */
+    int32_t ref_token = next_token;
+#ifdef USE_MPI
+    MPI_Bcast(&ref_token, 1, MPI_INT32_T, 0, cfg->dp_comm);
+#else
+    comm_broadcast(cfg->dp_ctx, &ref_token, sizeof(int32_t), 0);
+#endif
+    if (ref_token != next_token)
+        fprintf(stderr, "[DP rank %d] WARNING: output diverged!\n", cfg->dp_rank);
+    else
         fprintf(stderr, "[DP rank %d] Verified: output matches rank 0 (%d tokens)\n",
                 cfg->dp_rank, gen_count);
-    }
 }
 
-/* ---- Tensor-parallel inference (TP, foundation/verification) ---- */
-/* This is a minimal TP implementation that verifies the sliced matvec primitives.
- * It runs column-parallel QKV and FFN gate/up, then row-parallel output proj and FFN down.
- * Currently works for the standard (non-hybrid) attention path. */
+/* ---- Tensor-parallel inference ---- */
 static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                                  bpe_vocab *vocab, const int32_t *tokens, int n_tokens,
                                  int max_gen) {
@@ -277,7 +292,6 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
     int head_dim = model->head_dim;
     int n_ff = model->n_ff;
 
-    /* Verify divisibility */
     if (n_heads % tp_size != 0 || n_kv_heads % tp_size != 0 || n_ff % tp_size != 0) {
         if (tp_rank == 0)
             fprintf(stderr, "TP error: n_heads=%d, n_kv_heads=%d, n_ff=%d not divisible by tp_size=%d\n",
@@ -285,16 +299,13 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
         return;
     }
 
-    /* Configure the model for TP */
-    transformer_set_tp(model, tp_rank, tp_size,
-                        parallel_tp_allreduce_cb, cfg);
+    transformer_set_tp(model, tp_rank, tp_size, parallel_tp_allreduce_cb, cfg);
 
-    /* TP dimensions */
-    int tp_nh = n_heads / tp_size;       /* heads per TP rank */
-    int tp_nkh = n_kv_heads / tp_size;   /* KV heads per TP rank */
-    int tp_qd = tp_nh * head_dim;        /* Q dim per TP rank */
-    int tp_kvd = tp_nkh * head_dim;      /* KV dim per TP rank */
-    int tp_ff = n_ff / tp_size;          /* FFN neurons per TP rank */
+    int tp_nh = n_heads / tp_size;
+    int tp_nkh = n_kv_heads / tp_size;
+    int tp_qd = tp_nh * head_dim;
+    int tp_kvd = tp_nkh * head_dim;
+    int tp_ff = n_ff / tp_size;
 
     int q_row_start = tp_rank * tp_qd;
     int kv_row_start = tp_rank * tp_kvd;
@@ -309,12 +320,12 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
     float *tp_k   = (float *)calloc(tp_kvd, sizeof(float));
     float *tp_v   = (float *)calloc(tp_kvd, sizeof(float));
     float *tp_att = (float *)calloc(tp_nh * model->max_seq_len, sizeof(float));
-    float *tp_xb2 = (float *)calloc(tp_qd, sizeof(float));  /* attention output */
-    float *tp_ff1 = (float *)calloc(tp_ff, sizeof(float));   /* gate */
-    float *tp_ff2 = (float *)calloc(tp_ff, sizeof(float));   /* up */
-    float *tp_ff3 = (float *)calloc(tp_ff, sizeof(float));   /* silu(gate)*up */
+    float *tp_xb2 = (float *)calloc(tp_qd, sizeof(float));
+    float *tp_ff1 = (float *)calloc(tp_ff, sizeof(float));
+    float *tp_ff2 = (float *)calloc(tp_ff, sizeof(float));
+    float *tp_ff3 = (float *)calloc(tp_ff, sizeof(float));
 
-    /* Local KV cache: [n_layers][max_seq_len * tp_kvd] */
+    /* Local KV cache */
     float **tp_key_cache = (float **)calloc(model->n_layers, sizeof(float *));
     float **tp_val_cache = (float **)calloc(model->n_layers, sizeof(float *));
     for (int l = 0; l < model->n_layers; l++) {
@@ -322,41 +333,25 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
         tp_val_cache[l] = (float *)calloc(model->max_seq_len * tp_kvd, sizeof(float));
     }
 
-    double t0 = MPI_Wtime();
+    double t0 = wtime();
     int pos = 0;
 
     for (int i = 0; i < n_tokens + max_gen; i++) {
-        int32_t token_id;
         int is_prefill = (i < n_tokens);
 
-        if (is_prefill) {
-            token_id = tokens[i];
-        } else if (i == n_tokens) {
-            /* First gen step: logits already computed below */
-            token_id = -1;
-        } else {
-            token_id = -1; /* set below from broadcast */
-        }
+        if (i < n_tokens)
+            transformer_embed_token(model, tokens[i]);
 
-        /* Embed token (all TP ranks need the full embedding) */
-        if (i < n_tokens) {
-            transformer_embed_token(model, token_id);
-        }
+        float *x = model->x;
 
-        float *x = model->x;  /* current hidden state [n_embd] */
-
-        /* Process each layer */
         for (int l = 0; l < model->n_layers; l++) {
             transformer_layer *layer = &model->layers[l];
 
-            /* Skip SSM layers for TP foundation (run full on each rank) */
+            /* SSM layers: no TP, run fully on each rank */
             if (model->is_hybrid && layer->is_ssm) {
-                /* RMSNorm */
                 tf_rmsnorm(model->xb, x, &layer->attn_norm, n_embd, model->rms_norm_eps, model->matvec_tmp);
-                /* Run SSM fully on each rank (no TP for SSM) */
                 tf_ssm_deltanet_forward(model, l);
                 tf_vadd(x, model->xb, n_embd);
-                /* FFN for SSM layers is also not split */
                 tf_rmsnorm(model->xb, x, &layer->ffn_norm, n_embd, model->rms_norm_eps, model->matvec_tmp);
                 if (layer->ffn_gate.data) {
                     tf_qmatvec_pool(model, model->ffn_buf1, &layer->ffn_gate, model->xb, n_ff);
@@ -369,19 +364,15 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
             }
 
             /* --- Attention (TP) --- */
-            /* RMSNorm (all ranks compute the same result) */
             tf_rmsnorm(model->xb, x, &layer->attn_norm, n_embd, model->rms_norm_eps, model->matvec_tmp);
 
-            /* Column-parallel QKV: each rank computes its head slice */
             if (model->is_hybrid && !layer->is_ssm) {
-                /* Gated attention: Q has 2*q_dim interleaved rows */
-                int q2_dim = 2 * n_heads * head_dim;
-                int tp_q2_start = tp_rank * (2 * tp_nh * head_dim);
+                /* Gated attention */
                 int tp_q2_count = 2 * tp_nh * head_dim;
+                int tp_q2_start = tp_rank * tp_q2_count;
                 float *tp_q2 = (float *)alloca(tp_q2_count * sizeof(float));
                 tf_qmatvec_row_slice(model, tp_q2, &layer->attn_q, model->xb,
                                       tp_q2_start, tp_q2_start + tp_q2_count);
-                /* De-interleave into tp_q and gate */
                 float *tp_gate = (float *)alloca(tp_qd * sizeof(float));
                 for (int h = 0; h < tp_nh; h++) {
                     memcpy(tp_q + h * head_dim, tp_q2 + h * 2 * head_dim, head_dim * sizeof(float));
@@ -392,22 +383,16 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                 tf_qmatvec_row_slice(model, tp_v, &layer->attn_v, model->xb,
                                       kv_row_start, kv_row_start + tp_kvd);
 
-                /* QK-Norm on local heads */
                 if (layer->attn_q_norm.data)
                     tf_qk_norm(tp_q, tp_nh, head_dim, &layer->attn_q_norm, model->rms_norm_eps, model->matvec_tmp);
                 if (layer->attn_k_norm.data)
                     tf_qk_norm(tp_k, tp_nkh, head_dim, &layer->attn_k_norm, model->rms_norm_eps, model->matvec_tmp);
 
-                /* RoPE on local heads */
                 tf_apply_rope(model, tp_q, tp_k, tp_nh, tp_nkh, head_dim, pos, pos, pos);
 
-                /* Store to local KV cache */
-                float *kc = tp_key_cache[l] + pos * tp_kvd;
-                float *vc = tp_val_cache[l] + pos * tp_kvd;
-                memcpy(kc, tp_k, tp_kvd * sizeof(float));
-                memcpy(vc, tp_v, tp_kvd * sizeof(float));
+                memcpy(tp_key_cache[l] + pos * tp_kvd, tp_k, tp_kvd * sizeof(float));
+                memcpy(tp_val_cache[l] + pos * tp_kvd, tp_v, tp_kvd * sizeof(float));
 
-                /* Local attention on this rank's heads */
                 int seq_len = pos + 1;
                 float scale = 1.0f / sqrtf((float)head_dim);
                 int tp_gqa = tp_nh / tp_nkh;
@@ -417,27 +402,17 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                     float *q_h = tp_q + h * head_dim;
                     int kv_h = h / tp_gqa;
                     float *att_h = tp_att + h * model->max_seq_len;
-
-                    /* QK dot products */
                     for (int t = 0; t < seq_len; t++) {
                         float *kt = tp_key_cache[l] + t * tp_kvd + kv_h * head_dim;
                         float dot = 0.0f;
                         for (int d = 0; d < head_dim; d++) dot += q_h[d] * kt[d];
                         att_h[t] = dot * scale;
                     }
-
-                    /* Softmax */
                     float max_val = att_h[0];
-                    for (int t = 1; t < seq_len; t++)
-                        if (att_h[t] > max_val) max_val = att_h[t];
+                    for (int t = 1; t < seq_len; t++) if (att_h[t] > max_val) max_val = att_h[t];
                     float sum = 0.0f;
-                    for (int t = 0; t < seq_len; t++) {
-                        att_h[t] = expf(att_h[t] - max_val);
-                        sum += att_h[t];
-                    }
+                    for (int t = 0; t < seq_len; t++) { att_h[t] = expf(att_h[t] - max_val); sum += att_h[t]; }
                     for (int t = 0; t < seq_len; t++) att_h[t] /= sum;
-
-                    /* Weighted sum of values */
                     float *out_h = tp_xb2 + h * head_dim;
                     for (int t = 0; t < seq_len; t++) {
                         float *vt = tp_val_cache[l] + t * tp_kvd + kv_h * head_dim;
@@ -446,11 +421,9 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                     }
                 }
 
-                /* Apply sigmoid gate */
                 for (int j = 0; j < tp_qd; j++)
                     tp_xb2[j] *= 1.0f / (1.0f + expf(-tp_gate[j]));
 
-                /* Row-parallel output projection: each rank has tp_qd columns */
                 tf_qmatvec_col_slice_pool(model, model->xb, &layer->attn_output,
                                            tp_xb2, n_embd, q_row_start, q_row_start + tp_qd);
             } else {
@@ -469,10 +442,8 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
 
                 tf_apply_rope(model, tp_q, tp_k, tp_nh, tp_nkh, head_dim, pos, pos, pos);
 
-                float *kc = tp_key_cache[l] + pos * tp_kvd;
-                float *vc = tp_val_cache[l] + pos * tp_kvd;
-                memcpy(kc, tp_k, tp_kvd * sizeof(float));
-                memcpy(vc, tp_v, tp_kvd * sizeof(float));
+                memcpy(tp_key_cache[l] + pos * tp_kvd, tp_k, tp_kvd * sizeof(float));
+                memcpy(tp_val_cache[l] + pos * tp_kvd, tp_v, tp_kvd * sizeof(float));
 
                 int seq_len = pos + 1;
                 float scale = 1.0f / sqrtf((float)head_dim);
@@ -483,24 +454,17 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                     float *q_h = tp_q + h * head_dim;
                     int kv_h = h / tp_gqa;
                     float *att_h = tp_att + h * model->max_seq_len;
-
                     for (int t = 0; t < seq_len; t++) {
                         float *kt = tp_key_cache[l] + t * tp_kvd + kv_h * head_dim;
                         float dot = 0.0f;
                         for (int d = 0; d < head_dim; d++) dot += q_h[d] * kt[d];
                         att_h[t] = dot * scale;
                     }
-
                     float max_val = att_h[0];
-                    for (int t = 1; t < seq_len; t++)
-                        if (att_h[t] > max_val) max_val = att_h[t];
+                    for (int t = 1; t < seq_len; t++) if (att_h[t] > max_val) max_val = att_h[t];
                     float sum = 0.0f;
-                    for (int t = 0; t < seq_len; t++) {
-                        att_h[t] = expf(att_h[t] - max_val);
-                        sum += att_h[t];
-                    }
+                    for (int t = 0; t < seq_len; t++) { att_h[t] = expf(att_h[t] - max_val); sum += att_h[t]; }
                     for (int t = 0; t < seq_len; t++) att_h[t] /= sum;
-
                     float *out_h = tp_xb2 + h * head_dim;
                     for (int t = 0; t < seq_len; t++) {
                         float *vt = tp_val_cache[l] + t * tp_kvd + kv_h * head_dim;
@@ -509,22 +473,19 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                     }
                 }
 
-                /* Row-parallel output projection */
                 tf_qmatvec_col_slice_pool(model, model->xb, &layer->attn_output,
                                            tp_xb2, n_embd, q_row_start, q_row_start + tp_qd);
             }
 
-            /* Residual (all ranks have the same allreduced result) */
             tf_vadd(x, model->xb, n_embd);
 
             /* --- FFN (TP) --- */
             tf_rmsnorm(model->xb, x, &layer->ffn_norm, n_embd, model->rms_norm_eps, model->matvec_tmp);
 
             if (model->use_moe && layer->ffn_gate_inp.data) {
-                /* MoE: no TP for foundation, run fully on each rank */
+                /* MoE: no TP, run fully on each rank */
                 tf_qmatvec_pool(model, model->ffn_buf1, &layer->ffn_gate_inp, model->xb, model->n_expert);
                 tf_softmax(model->ffn_buf1, model->n_expert);
-                /* Select top experts */
                 int n_top = model->n_expert_used;
                 int n_ff_exp = model->n_ff_expert;
                 int *top_idx = (int *)alloca(n_top * sizeof(int));
@@ -535,7 +496,6 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                     if (k < n_top) {
                         top_idx[k] = e; top_w[k] = w; k++;
                     } else if (w > top_w[0]) {
-                        /* Find min and replace (simple for small n_top) */
                         int mi = 0;
                         for (int j = 1; j < n_top; j++) if (top_w[j] < top_w[mi]) mi = j;
                         top_w[mi] = w; top_idx[mi] = e;
@@ -555,77 +515,67 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
                 }
                 tf_vadd(x, model->xb2, n_embd);
             } else if (layer->ffn_gate.data) {
-                /* Dense FFN with TP: column-parallel gate/up, row-parallel down */
                 tf_qmatvec_row_slice(model, tp_ff1, &layer->ffn_gate, model->xb,
                                       ff_row_start, ff_row_start + tp_ff);
                 tf_qmatvec_row_slice(model, tp_ff2, &layer->ffn_up, model->xb,
                                       ff_row_start, ff_row_start + tp_ff);
                 tf_silu_mul_avx2(tp_ff3, tp_ff1, tp_ff2, tp_ff);
-
-                /* Row-parallel down projection */
                 tf_qmatvec_col_slice_pool(model, model->xb, &layer->ffn_down,
                                            tp_ff3, n_embd, ff_row_start, ff_row_start + tp_ff);
                 tf_vadd(x, model->xb, n_embd);
             }
         }
 
-        /* Final norm (all ranks compute same thing) */
         tf_rmsnorm(x, x, &model->output_norm, n_embd, model->rms_norm_eps, model->matvec_tmp);
 
-        /* Compute logits (all ranks compute full logits for simplicity) */
         float *logits = NULL;
         if (model->has_lm_head) {
             tf_qmatvec_pool(model, model->logits, &model->output, x, model->n_vocab);
             logits = model->logits;
         }
 
-        /* Greedy sample */
         int32_t next = 0;
-        if (logits) {
+        if (logits)
             for (int j = 1; j < model->n_vocab; j++)
                 if (logits[j] > logits[next]) next = j;
-        }
 
-        /* Print output (only on TP rank 0) */
-        if (tp_rank == 0) {
-            if (i >= n_tokens) {
-                if (next == vocab->eos_id || next == vocab->eot_id) {
-                    fprintf(stderr, "  [EOS %d]\n", next);
-                    break;
-                }
-                const char *tok_str = bpe_token_to_str(vocab, next);
-                if (tok_str) {
-                    int dec_len;
-                    char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
-                    fwrite(decoded, 1, dec_len, stdout);
-                    fflush(stdout);
-                    free(decoded);
-                }
+        if (tp_rank == 0 && i >= n_tokens) {
+            if (next == vocab->eos_id || next == vocab->eot_id) {
+                fprintf(stderr, "  [EOS %d]\n", next);
+                break;
+            }
+            const char *tok_str = bpe_token_to_str(vocab, next);
+            if (tok_str) {
+                int dec_len;
+                char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
+                fwrite(decoded, 1, dec_len, stdout);
+                fflush(stdout);
+                free(decoded);
             }
         }
 
-        /* All TP ranks need the same next token for embedding */
+        /* All TP ranks need the same next token */
+#ifdef USE_MPI
         MPI_Bcast(&next, 1, MPI_INT32_T, 0, cfg->tp_comm);
+#else
+        comm_broadcast(cfg->tp_ctx, &next, sizeof(int32_t), 0);
+#endif
 
-        /* For next iteration, embed this token */
         if (i >= n_tokens - 1) {
             pos++;
-            /* Set next token for embedding in next iteration */
-            if (i + 1 < n_tokens + max_gen) {
+            if (i + 1 < n_tokens + max_gen)
                 transformer_embed_token(model, next);
-            }
         } else {
             pos++;
         }
     }
 
-    double t1 = MPI_Wtime();
+    double t1 = wtime();
     if (tp_rank == 0) {
         printf("\n");
         fprintf(stderr, "TP Total time: %.3f s\n", t1 - t0);
     }
 
-    /* Cleanup */
     free(tp_q); free(tp_k); free(tp_v);
     free(tp_att); free(tp_xb2);
     free(tp_ff1); free(tp_ff2); free(tp_ff3);
@@ -636,13 +586,20 @@ static void run_tensor_parallel(parallel_config *cfg, transformer_model *model,
 }
 
 int main(int argc, char **argv) {
+#ifdef USE_MPI
     MPI_Init(&argc, &argv);
-
     int world_rank, world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+#else
+    /* Parse comm args (--comm-rank, --comm-nranks, etc.) first */
+    int world_rank, world_size;
+    char master_addr[64];
+    int master_port;
+    comm_parse_args(&argc, argv, &world_rank, &world_size, master_addr, sizeof(master_addr), &master_port);
+#endif
 
-    /* Parse args */
+    /* Parse app args */
     int tp_size, pp_size, dp_size;
     const char *model_path, *prompt;
     int max_gen, n_threads;
@@ -651,55 +608,63 @@ int main(int argc, char **argv) {
 
     if (!model_path) {
         if (world_rank == 0) usage(argv[0]);
+#ifdef USE_MPI
         MPI_Finalize();
+#endif
         return 1;
     }
 
     /* Initialize parallel config */
     parallel_config cfg;
+#ifdef USE_MPI
     if (parallel_init(&cfg, tp_size, pp_size, dp_size) != 0) {
         MPI_Finalize();
         return 1;
     }
+#else
+    if (parallel_init(&cfg, tp_size, pp_size, dp_size,
+                       world_rank, world_size, master_addr, master_port) != 0) {
+        return 1;
+    }
+#endif
 
     if (world_rank == 0)
         fprintf(stderr, "Parallel config: tp=%d pp=%d dp=%d (total=%d ranks)\n",
                 tp_size, pp_size, dp_size, world_size);
 
-    /* Load model (all ranks load the full model) */
+    /* Load model */
     gguf_context *gguf = gguf_open(model_path, (world_rank == 0) ? 1 : 0);
     if (!gguf) {
         fprintf(stderr, "[rank %d] Failed to open GGUF\n", world_rank);
-        MPI_Finalize();
-        return 1;
+        goto fail;
     }
 
     bpe_vocab *vocab = bpe_vocab_load(gguf);
     if (!vocab) {
         fprintf(stderr, "[rank %d] Failed to load vocab\n", world_rank);
         gguf_close(gguf);
-        MPI_Finalize();
-        return 1;
+        goto fail;
     }
 
     int max_seq_len = 256;
     transformer_model *model = transformer_load(gguf, max_seq_len);
     if (!model) {
         fprintf(stderr, "[rank %d] Failed to load model\n", world_rank);
-        MPI_Finalize();
-        return 1;
+        goto fail;
     }
 
     if (n_threads > 1) transformer_set_threads(model, n_threads);
 
-    /* Compute PP layer partition */
+    /* Compute PP layer partition and free unused KV cache */
     parallel_compute_pp_layers(&cfg, model->n_layers);
+    if (pp_size > 1)
+        transformer_free_unused_kv(model, cfg.pp_layer_start, cfg.pp_layer_end);
 
     fprintf(stderr, "[rank %d] tp=%d/%d pp=%d/%d dp=%d/%d layers=[%d,%d) n_threads=%d\n",
             world_rank, cfg.tp_rank, tp_size, cfg.pp_rank, pp_size, cfg.dp_rank, dp_size,
             cfg.pp_layer_start, cfg.pp_layer_end, n_threads);
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    parallel_barrier(&cfg);
 
     /* Tokenize (rank 0 broadcasts) */
     int32_t tokens[256];
@@ -708,32 +673,27 @@ int main(int argc, char **argv) {
         n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, 256);
         fprintf(stderr, "Prompt: \"%s\" -> %d tokens\n", prompt, n_tokens);
     }
-    MPI_Bcast(&n_tokens, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(tokens, n_tokens, MPI_INT32_T, 0, MPI_COMM_WORLD);
+    parallel_bcast_tokens(&cfg, tokens, &n_tokens);
 
     if (!model->has_lm_head) {
         if (world_rank == 0) fprintf(stderr, "Model has no LM head\n");
         goto cleanup;
     }
 
-    /* Print prompt (rank 0 only) */
     if (world_rank == 0) {
         printf("%s", prompt);
         fflush(stdout);
     }
 
-    /* Dispatch to the appropriate parallelism mode */
+    /* Dispatch */
     if (tp_size > 1 && pp_size == 1 && dp_size == 1) {
-        /* Pure TP */
         run_tensor_parallel(&cfg, model, vocab, tokens, n_tokens, max_gen);
     } else if (pp_size > 1 && tp_size == 1 && dp_size == 1) {
-        /* Pure PP */
         run_pipeline_parallel(&cfg, model, vocab, tokens, n_tokens, max_gen);
     } else if (dp_size > 1 && tp_size == 1 && pp_size == 1) {
-        /* Pure DP */
         run_data_parallel(&cfg, model, vocab, tokens, n_tokens, max_gen);
     } else if (tp_size == 1 && pp_size == 1 && dp_size == 1) {
-        /* Single rank: normal inference */
+        /* Single rank */
         if (world_rank == 0) {
             int pos = 0;
             for (int i = 0; i < n_tokens; i++) {
@@ -743,19 +703,15 @@ int main(int argc, char **argv) {
                     transformer_forward(model, tokens[i], pos);
                 pos++;
             }
-
             for (int g = 0; g < max_gen; g++) {
                 float *logits = (g == 0) ? model->logits
                     : transformer_forward_logits(model, tokens[0], pos);
                 if (g > 0) pos++;
                 if (!logits) break;
-
                 int32_t next = 0;
                 for (int j = 1; j < model->n_vocab; j++)
                     if (logits[j] > logits[next]) next = j;
-
                 if (next == vocab->eos_id || next == vocab->eot_id) break;
-
                 const char *tok_str = bpe_token_to_str(vocab, next);
                 if (tok_str) {
                     int dec_len;
@@ -764,7 +720,6 @@ int main(int argc, char **argv) {
                     fflush(stdout);
                     free(decoded);
                 }
-
                 tokens[0] = next;
                 if (g == 0) pos++;
             }
@@ -772,8 +727,7 @@ int main(int argc, char **argv) {
         }
     } else {
         if (world_rank == 0)
-            fprintf(stderr, "Combined TP+PP or TP+DP modes not yet implemented in this test.\n"
-                            "Use pure --tp, --pp, or --dp for now.\n");
+            fprintf(stderr, "Combined TP+PP or TP+DP modes not yet implemented.\n");
     }
 
 cleanup:
@@ -781,6 +735,15 @@ cleanup:
     bpe_vocab_free(vocab);
     gguf_close(gguf);
     parallel_finalize(&cfg);
+#ifdef USE_MPI
     MPI_Finalize();
+#endif
     return 0;
+
+fail:
+    parallel_finalize(&cfg);
+#ifdef USE_MPI
+    MPI_Finalize();
+#endif
+    return 1;
 }
