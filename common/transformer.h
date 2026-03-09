@@ -215,6 +215,18 @@ void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
                          void (*allreduce_fn)(float *buf, int count, void *ctx),
                          void *allreduce_ctx);
 
+/* --- Distributed memory management --- */
+
+/* Free KV cache for layers outside [layer_start, layer_end).
+ * Call after transformer_load for PP ranks that only process a layer subset. */
+void transformer_free_unused_kv(transformer_model *model, int layer_start, int layer_end);
+
+/* Reallocate KV cache with reduced dimension for TP.
+ * Only affects attention layers within [layer_start, layer_end).
+ * tp_kv_dim = n_kv_heads / tp_size * head_dim. */
+void transformer_resize_kv_for_tp(transformer_model *model,
+                                    int layer_start, int layer_end, int tp_kv_dim);
+
 /* --- Batched prefill API --- */
 
 /* Batch descriptor for prefill: process N tokens through all layers at once. */
@@ -2703,6 +2715,39 @@ void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
     model->tp_size = tp_size;
     model->tp_allreduce_fn = allreduce_fn;
     model->tp_allreduce_ctx = allreduce_ctx;
+}
+
+/* ---- Distributed memory management ---- */
+
+void transformer_free_unused_kv(transformer_model *model, int layer_start, int layer_end) {
+    if (!model || !model->key_cache) return;
+    for (int l = 0; l < model->n_layers; l++) {
+        if (l < layer_start || l >= layer_end) {
+            free(model->key_cache[l]);   model->key_cache[l] = NULL;
+            free(model->value_cache[l]); model->value_cache[l] = NULL;
+        }
+    }
+    /* Also free SSM state for unused layers */
+    if (model->conv_state) {
+        for (int l = 0; l < model->n_layers; l++) {
+            if (l < layer_start || l >= layer_end) {
+                free(model->conv_state[l]);     model->conv_state[l] = NULL;
+                free(model->recurrent_state[l]); model->recurrent_state[l] = NULL;
+            }
+        }
+    }
+}
+
+void transformer_resize_kv_for_tp(transformer_model *model,
+                                    int layer_start, int layer_end, int tp_kv_dim) {
+    if (!model || !model->key_cache) return;
+    for (int l = layer_start; l < layer_end && l < model->n_layers; l++) {
+        if (!model->key_cache[l]) continue;  /* SSM layer, no KV cache */
+        free(model->key_cache[l]);
+        free(model->value_cache[l]);
+        model->key_cache[l]   = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
+        model->value_cache[l] = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
+    }
 }
 
 /* Column-parallel matvec: compute rows [row_start, row_end) of mat, output to dst[0..count).
