@@ -166,7 +166,7 @@ class DinoV2ViT(nn.Module):
 
     def __init__(self, dim=384, num_heads=6, depth=12, patch_size=14,
                  img_size=518, out_layers=(5, 7, 9, 11), rope_start=4,
-                 qknorm_start=4, cat_token=True):
+                 qknorm_start=4, cat_token=True, alt_start=None):
         super().__init__()
         self.dim = dim
         self.patch_size = patch_size
@@ -177,6 +177,8 @@ class DinoV2ViT(nn.Module):
         self.qknorm_start = qknorm_start
         self.cat_token = cat_token
         self.num_heads = num_heads
+        # alt_start: layer at which camera_token replaces CLS token
+        self.alt_start = alt_start if alt_start is not None else rope_start
 
         # Patch embedding
         self.patch_embed = nn.Conv2d(3, dim, kernel_size=patch_size,
@@ -184,6 +186,8 @@ class DinoV2ViT(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.pos_embed = nn.Parameter(
             torch.zeros(1, 1 + self.grid_size ** 2, dim))
+        # Learned camera token: (1, 2, dim) — ref_token[0] used for single-view
+        self.camera_token = nn.Parameter(torch.zeros(1, 2, dim))
 
         # Transformer blocks
         self.blocks = nn.ModuleList()
@@ -208,6 +212,13 @@ class DinoV2ViT(nn.Module):
 
         features = []
         for i, block in enumerate(self.blocks):
+            # At alt_start, inject camera token into CLS position
+            if i == self.alt_start and self.camera_token is not None:
+                # For single-view: use ref_token (index 0)
+                ref_token = self.camera_token[:, 0, :].expand(B, -1)
+                x = x.clone()
+                x[:, 0, :] = ref_token
+
             if i >= self.rope_start:
                 x = block(x, rope_cos_y, rope_sin_y, rope_cos_x, rope_sin_x)
             else:
@@ -374,6 +385,7 @@ class DepthAnything3(nn.Module):
             rope_start=net_cfg.get("rope_start", 4),
             qknorm_start=net_cfg.get("qknorm_start", 4),
             cat_token=net_cfg.get("cat_token", True),
+            alt_start=net_cfg.get("alt_start", net_cfg.get("rope_start", 4)),
         )
 
         self.head = DualDPTHead(
@@ -430,6 +442,8 @@ def load_weights(model, st_path):
         # Head scratch output_conv -> head.output_conv
         key = key.replace("head.scratch.output_conv1.", "head.output_conv1.")
         key = key.replace("head.scratch.output_conv2.", "head.output_conv2.")
+
+        # Map backbone.camera_token → backbone.camera_token (keep it)
 
         # Skip cam_enc, cam_dec, aux heads, gsdpt, mask_token
         if any(key.startswith(p) for p in [
@@ -500,6 +514,8 @@ def main():
                         help="Output directory")
     parser.add_argument("--device", default="cpu",
                         choices=["cpu", "cuda"], help="Device")
+    parser.add_argument("--no-cam-token", action="store_true",
+                        help="Disable camera_token injection (match C code behavior)")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -540,6 +556,11 @@ def main():
     if n_loaded < n_total:
         print(f"WARNING: Only {n_loaded}/{n_total} params loaded — "
               "results will be unreliable!")
+
+    # Optionally disable camera_token to match C code (for depth comparison)
+    if args.no_cam_token:
+        model.backbone.camera_token = None
+        print("Camera token injection DISABLED (matching C code)")
 
     model = model.to(device).eval()
 
