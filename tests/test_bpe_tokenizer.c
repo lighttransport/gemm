@@ -3,10 +3,10 @@
  * Usage: ./test_bpe_tokenizer <model.gguf>
  */
 #define GGUF_LOADER_IMPLEMENTATION
-#include "gguf_loader.h"
+#include "../common/gguf_loader.h"
 
 #define BPE_TOKENIZER_IMPLEMENTATION
-#include "bpe_tokenizer.h"
+#include "../common/bpe_tokenizer.h"
 
 #include <stdio.h>
 #include <string.h>

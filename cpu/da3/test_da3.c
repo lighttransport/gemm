@@ -13,16 +13,16 @@
  */
 
 #define GGUF_LOADER_IMPLEMENTATION
-#include "gguf_loader.h"
+#include "../../common/gguf_loader.h"
 
 #define GGML_DEQUANT_IMPLEMENTATION
-#include "ggml_dequant.h"
+#include "../../common/ggml_dequant.h"
 
 #define SAFETENSORS_IMPLEMENTATION
-#include "safetensors.h"
+#include "../../common/safetensors.h"
 
 #define DEPTH_ANYTHING3_IMPLEMENTATION
-#include "depth_anything3.h"
+#include "../../common/depth_anything3.h"
 
 #include <stdio.h>
 #include <stdlib.h>

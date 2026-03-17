@@ -9,9 +9,9 @@
 #define PTH_LOADER_IMPLEMENTATION
 #define GGML_DEQUANT_IMPLEMENTATION
 #define PIXEL_PERFECT_DEPTH_IMPLEMENTATION
-#include "pth_loader.h"
-#include "ggml_dequant.h"
-#include "pixel_perfect_depth.h"
+#include "../../common/pth_loader.h"
+#include "../../common/ggml_dequant.h"
+#include "../../common/pixel_perfect_depth.h"
 
 #include <stdio.h>
 #include <stdlib.h>
