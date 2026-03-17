@@ -2019,6 +2019,7 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
                 memcpy(features[fi], hidden, (size_t)nt * dim * sizeof(float));
             }
         }
+
     }
 
     free(hidden); free(ln_buf); free(qkv); free(attn_out);
@@ -2066,6 +2067,7 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         float *proj = (float *)malloc((size_t)np * oc * sizeof(float));
         da3_batch_gemm(proj, &m->head.proj_w[fi], &m->head.proj_b[fi],
                        cat, np, oc, head_dim_in, n_threads);
+
         free(cat);
 
         /* Reshape to spatial CHW: [oc, gh, gw] */
