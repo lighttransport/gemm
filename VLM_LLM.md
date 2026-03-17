@@ -6,18 +6,24 @@
 
 | Model | Architecture | CPU | CUDA | Vulkan | A64FX |
 |-------|-------------|-----|------|--------|-------|
-| Qwen2 | Dense transformer | x | x | x | - |
-| Qwen3 | Dense transformer | x | x | x | - |
-| Qwen3-MoE | Mixture of Experts | x | x | - | - |
+| ~~Qwen2~~ | Dense transformer | x | x | x | - |
+| ~~Qwen3~~ | Dense transformer | x | x | x | - |
+| ~~Qwen3-MoE~~ | Mixture of Experts | x | x | - | - |
 | Qwen3.5 | Hybrid SSM+Attention (Delta-Net) | x | x | - | - |
 | Qwen3.5-MoE | Hybrid SSM+Attention + MoE (256 experts, top-8) | x | x | - | - |
+
+~~Qwen2 and Qwen3 are deprecated.~~ Use Qwen3.5 family instead.
 
 ### VLM (Vision-Language)
 
 | Model | Architecture | CPU | CUDA | Vulkan |
 |-------|-------------|-----|------|--------|
-| Qwen3-VL | CLIP vision encoder + M-RoPE + DeepStack | x | x | x |
-| Qwen3-VLMoE | Vision-Language + MoE | x | x | - |
+| ~~Qwen3-VL~~ | CLIP vision encoder + M-RoPE + DeepStack | x | x | x |
+| ~~Qwen3-VLMoE~~ | Vision-Language + MoE | x | x | - |
+| Qwen3.5-VL | Hybrid SSM+Attention + CLIP vision encoder | x | x | - |
+| Qwen3.5-VLMoE | Hybrid SSM+Attention + Vision-Language + MoE | x | x | - |
+
+~~Qwen3-VL and Qwen3-VLMoE are deprecated.~~ Use Qwen3.5-VL family instead.
 
 ### Depth Estimation
 
@@ -54,7 +60,7 @@ DA3 supports multiple output modalities: depth + confidence, pose estimation (Ca
 - Conv1d with circular buffer
 - Configurable: kernel size 4, state dim 128, inner hidden 6144, combined QKV 10240
 
-### Vision Encoding (Qwen3-VL)
+### Vision Encoding (Qwen3.5-VL)
 - CLIP-style vision encoder with dynamic resolution
 - Bilinear positional embedding interpolation
 - DeepStack multi-scale vision token merging
