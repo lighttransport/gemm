@@ -9,19 +9,19 @@
  */
 
 #define GGUF_LOADER_IMPLEMENTATION
-#include "gguf_loader.h"
+#include "../../common/gguf_loader.h"
 
 #define GGML_DEQUANT_IMPLEMENTATION
-#include "ggml_dequant.h"
+#include "../../common/ggml_dequant.h"
 
 #define BPE_TOKENIZER_IMPLEMENTATION
-#include "bpe_tokenizer.h"
+#include "../../common/bpe_tokenizer.h"
 
 #define TRANSFORMER_IMPLEMENTATION
-#include "transformer.h"
+#include "../../common/transformer.h"
 
 #define VISION_ENCODER_IMPLEMENTATION
-#include "vision_encoder.h"
+#include "../../common/vision_encoder.h"
 
 #include <stdio.h>
 #include <stdlib.h>

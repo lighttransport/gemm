@@ -1,5 +1,5 @@
 #define GGUF_LOADER_IMPLEMENTATION
-#include "gguf_loader.h"
+#include "../common/gguf_loader.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
