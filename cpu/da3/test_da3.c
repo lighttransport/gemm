@@ -29,6 +29,34 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdint.h>
+
+/* Write a float32 array as NumPy .npy format (v1.0) */
+static void write_npy_f32(const char *path, const float *data, int w, int h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    /* NumPy v1.0 format: magic + version + header */
+    const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t version[2] = {1, 0};
+    fwrite(version, 1, 2, f);
+    /* Header: dict with descr, fortran_order, shape */
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", h, w);
+    /* Pad header to multiple of 64 bytes (including 10-byte preamble) */
+    int total = 10 + hlen + 1;  /* +1 for newline */
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    /* Data */
+    fwrite(data, sizeof(float), (size_t)w * h, f);
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%dx%d, float32)\n", path, w, h);
+}
 
 /* Generate a synthetic gradient image as uint8 RGB [h][w][3] */
 static uint8_t *generate_gradient(int width, int height) {
@@ -120,6 +148,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --pose          Enable pose output\n");
         fprintf(stderr, "  --rays          Enable rays output\n");
         fprintf(stderr, "  --gaussians     Enable gaussians output\n");
+        fprintf(stderr, "  --npy <path>    Save raw depth as NumPy .npy file\n");
         return 1;
     }
 
@@ -128,6 +157,7 @@ int main(int argc, char **argv) {
     const char *input_ppm = NULL;
     const char *output_path = NULL;
     const char *config_path = NULL;
+    const char *npy_path = NULL;
     int output_flags = DA3_OUTPUT_DEPTH;
 
     for (int i = 2; i < argc; i++) {
@@ -135,6 +165,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_ppm = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) output_path = argv[++i];
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) config_path = argv[++i];
+        else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
         else if (strcmp(argv[i], "--full") == 0) output_flags = DA3_OUTPUT_ALL;
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
         else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
@@ -237,6 +268,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Output format not supported (use .pgm): %s\n", output_path);
             }
         }
+        if (npy_path && full.depth)
+            write_npy_f32(npy_path, full.depth, full.width, full.height);
 
         da3_full_result_free(&full);
     } else {
@@ -275,6 +308,8 @@ int main(int argc, char **argv) {
             write_pgm16(output_path, normalized, result.width, result.height);
             free(normalized);
         }
+        if (npy_path && result.depth)
+            write_npy_f32(npy_path, result.depth, result.width, result.height);
 
         da3_result_free(&result);
     }
