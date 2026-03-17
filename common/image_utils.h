@@ -14,14 +14,33 @@
  *   #include "image_utils.h"
  *
  * Dependencies:
- *   stb_image.h (for loading JPEG/PNG/BMP/etc.)
- *   stb_image_resize2.h (optional, for general-purpose resizing)
+ *   stb_image.h        (loading JPEG/PNG/BMP/etc.)
+ *   stb_image_write.h  (writing JPEG/PNG/BMP/HDR)
+ *   stb_image_resize2.h (optional, general-purpose resizing)
+ *   tinyexr.h          (optional, for EXR output — impl must be compiled as C++)
  *
- * API:
+ * API — Loading:
  *   img_load(path, &w, &h)         → uint8 RGB, NULL on failure
+ *
+ * API — Resizing:
  *   img_resize_ac(src, sw, sh, dw, dh) → uint8 RGB, bilinear align_corners=True
- *   img_preprocess_da3(rgb, w, h, target, mean[3], std[3]) → float CHW normalized
- *   img_write_ppm(path, rgb, w, h) → write P6 PPM
+ *   img_resize_ac_f32(src, ch, sw, sh, dw, dh) → float32 CHW version
+ *
+ * API — Preprocessing:
+ *   img_preprocess_da3(rgb, w, h, target, mean, std) → float CHW normalized
+ *
+ * API — Writing (uint8 RGB):
+ *   img_write_ppm(path, rgb, w, h)           → P6 PPM
+ *   img_write_png(path, rgb, w, h)           → PNG
+ *   img_write_jpg(path, rgb, w, h, quality)  → JPEG (quality 1-100)
+ *   img_write_bmp(path, rgb, w, h)           → BMP
+ *
+ * API — Writing (float):
+ *   img_write_pgm16(path, data, w, h)            → 16-bit PGM (auto normalize)
+ *   img_write_hdr(path, rgb_f32, w, h)            → Radiance HDR (3-ch float)
+ *   img_write_exr(path, data, w, h, n_ch, names)  → OpenEXR (N-ch float32)
+ *
+ * API — Utility:
  *   img_free(ptr)                  → free loaded/resized image
  */
 #ifndef IMAGE_UTILS_H
@@ -60,11 +79,48 @@ float *img_resize_ac_f32(const float *src, int channels,
 float *img_preprocess_da3(const uint8_t *rgb, int width, int height,
                           int target_size, const float *mean, const float *std);
 
+/* ---- Writers: uint8 RGB ---- */
+
 /* Write 8-bit RGB as P6 PPM. Returns 0 on success. */
 int img_write_ppm(const char *path, const uint8_t *rgb, int width, int height);
 
-/* Write 16-bit PGM (P5) from float array (auto min/max normalize). */
+/* Write 8-bit RGB as PNG. Returns 0 on success. */
+int img_write_png(const char *path, const uint8_t *rgb, int width, int height);
+
+/* Write 8-bit RGB as JPEG. quality: 1 (worst) to 100 (best). Returns 0 on success. */
+int img_write_jpg(const char *path, const uint8_t *rgb, int width, int height,
+                  int quality);
+
+/* Write 8-bit RGB as BMP. Returns 0 on success. */
+int img_write_bmp(const char *path, const uint8_t *rgb, int width, int height);
+
+/* ---- Writers: float32 ---- */
+
+/* Write 16-bit PGM (P5) from float array (auto min/max normalize to 0-65535). */
 void img_write_pgm16(const char *path, const float *data, int width, int height);
+
+/* Write Radiance HDR from float32 RGB [h][w][3] (HWC layout). Returns 0 on success. */
+int img_write_hdr(const char *path, const float *rgb_f32, int width, int height);
+
+/* Write OpenEXR with N float32 channels. Each channel is [height * width] floats.
+ * channel_data: array of N pointers to float arrays (one per channel).
+ * channel_names: array of N null-terminated name strings.
+ * Requires tinyexr.h. Returns 0 on success.
+ * NOTE: tinyexr implementation must be compiled as C++ (tinyexr_impl.cc). */
+int img_write_exr(const char *path, const float **channel_data,
+                  int width, int height, int n_channels,
+                  const char **channel_names);
+
+/* Convenience: write single-channel float32 as EXR (e.g., depth map). */
+int img_write_exr_1ch(const char *path, const float *data,
+                      int width, int height, const char *channel_name);
+
+/* Convenience: write 3-channel float32 as EXR (e.g., RGB). */
+int img_write_exr_3ch(const char *path, const float *ch0, const float *ch1,
+                      const float *ch2, int width, int height,
+                      const char *name0, const char *name1, const char *name2);
+
+/* ---- Utility ---- */
 
 /* Free image memory allocated by img_load / img_resize_ac / img_preprocess_da3. */
 void img_free(void *ptr);
@@ -90,6 +146,11 @@ void img_free(void *ptr);
 #define STB_IMAGE_IMPLEMENTATION
 #endif
 #include "stb_image.h"
+
+#ifndef STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#endif
+#include "stb_image_write.h"
 
 uint8_t *img_load(const char *path, int *width, int *height) {
     int w, h, channels;
@@ -254,6 +315,126 @@ void img_write_pgm16(const char *path, const float *data, int width, int height)
     fclose(f);
     fprintf(stderr, "Wrote %s (%dx%d)\n", path, width, height);
 }
+
+/* ---- PNG / JPEG / BMP writers (via stb_image_write) ---- */
+
+int img_write_png(const char *path, const uint8_t *rgb, int width, int height) {
+    int ret = stbi_write_png(path, width, height, 3, rgb, width * 3);
+    if (ret) fprintf(stderr, "Wrote %s (%dx%d, PNG)\n", path, width, height);
+    else     fprintf(stderr, "img_write_png: failed to write %s\n", path);
+    return ret ? 0 : -1;
+}
+
+int img_write_jpg(const char *path, const uint8_t *rgb, int width, int height,
+                  int quality) {
+    int ret = stbi_write_jpg(path, width, height, 3, rgb, quality);
+    if (ret) fprintf(stderr, "Wrote %s (%dx%d, JPEG q=%d)\n", path, width, height, quality);
+    else     fprintf(stderr, "img_write_jpg: failed to write %s\n", path);
+    return ret ? 0 : -1;
+}
+
+int img_write_bmp(const char *path, const uint8_t *rgb, int width, int height) {
+    int ret = stbi_write_bmp(path, width, height, 3, rgb);
+    if (ret) fprintf(stderr, "Wrote %s (%dx%d, BMP)\n", path, width, height);
+    else     fprintf(stderr, "img_write_bmp: failed to write %s\n", path);
+    return ret ? 0 : -1;
+}
+
+/* ---- HDR writer (via stb_image_write) ---- */
+
+int img_write_hdr(const char *path, const float *rgb_f32, int width, int height) {
+    /* stbi_write_hdr expects float RGB [h][w][3] in HWC layout */
+    int ret = stbi_write_hdr(path, width, height, 3, rgb_f32);
+    if (ret) fprintf(stderr, "Wrote %s (%dx%d, HDR)\n", path, width, height);
+    else     fprintf(stderr, "img_write_hdr: failed to write %s\n", path);
+    return ret ? 0 : -1;
+}
+
+/* ---- EXR writer (via tinyexr) ---- */
+
+#ifdef TINYEXR_H_  /* Only compile if tinyexr.h was included before this header */
+
+int img_write_exr(const char *path, const float **channel_data,
+                  int width, int height, int n_channels,
+                  const char **channel_names) {
+    if (n_channels < 1 || n_channels > 128) return -1;
+
+    /* Sort channels alphabetically (EXR requirement) */
+    int *order = (int *)malloc((size_t)n_channels * sizeof(int));
+    for (int i = 0; i < n_channels; i++) order[i] = i;
+    /* Insertion sort by name */
+    for (int i = 1; i < n_channels; i++) {
+        int key = order[i];
+        int j = i - 1;
+        while (j >= 0 && strcmp(channel_names[order[j]], channel_names[key]) > 0) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+
+    EXRHeader header;
+    InitEXRHeader(&header);
+    EXRImage image;
+    InitEXRImage(&image);
+
+    image.num_channels = n_channels;
+    image.width = width;
+    image.height = height;
+
+    /* Build sorted channel pointer array */
+    const float **sorted_ptrs = (const float **)malloc(
+        (size_t)n_channels * sizeof(const float *));
+    for (int i = 0; i < n_channels; i++)
+        sorted_ptrs[i] = channel_data[order[i]];
+    image.images = (unsigned char **)sorted_ptrs;
+
+    header.num_channels = n_channels;
+    header.channels = (EXRChannelInfo *)malloc(
+        sizeof(EXRChannelInfo) * (size_t)n_channels);
+    header.pixel_types = (int *)malloc(sizeof(int) * (size_t)n_channels);
+    header.requested_pixel_types = (int *)malloc(sizeof(int) * (size_t)n_channels);
+
+    for (int i = 0; i < n_channels; i++) {
+        strncpy(header.channels[i].name, channel_names[order[i]], 255);
+        header.channels[i].name[255] = '\0';
+        header.pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+        header.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+    }
+
+    const char *err = NULL;
+    int ret = SaveEXRImageToFile(&image, &header, path, &err);
+    if (ret != TINYEXR_SUCCESS) {
+        fprintf(stderr, "img_write_exr: %s: %s\n", path, err ? err : "unknown error");
+        FreeEXRErrorMessage(err);
+    } else {
+        fprintf(stderr, "Wrote %s (%dx%d, %d-ch EXR)\n", path, width, height, n_channels);
+    }
+
+    free(order);
+    free(sorted_ptrs);
+    free(header.channels);
+    free(header.pixel_types);
+    free(header.requested_pixel_types);
+    return ret == TINYEXR_SUCCESS ? 0 : -1;
+}
+
+int img_write_exr_1ch(const char *path, const float *data,
+                      int width, int height, const char *channel_name) {
+    const float *ptrs[1] = {data};
+    const char *names[1] = {channel_name};
+    return img_write_exr(path, ptrs, width, height, 1, names);
+}
+
+int img_write_exr_3ch(const char *path, const float *ch0, const float *ch1,
+                      const float *ch2, int width, int height,
+                      const char *name0, const char *name1, const char *name2) {
+    const float *ptrs[3] = {ch0, ch1, ch2};
+    const char *names[3] = {name0, name1, name2};
+    return img_write_exr(path, ptrs, width, height, 3, names);
+}
+
+#endif /* TINYEXR_H_ */
 
 #endif /* IMAGE_UTILS_IMPLEMENTATION */
 #endif /* IMAGE_UTILS_H */
