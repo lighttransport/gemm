@@ -40,29 +40,36 @@
 # debug information files
 *.dwo
 
-# Build artifact binaries (legacy, in common/)
-common/test_transformer
-common/test_transformer_asan
-common/test_transformer_debug
-common/test_transformer_debug2
-common/test_transformer_debug3
-common/test_transformer_mpi
-common/test_transformer_nofm
-common/test_transformer_parallel
+# Build artifact binaries — CPU runners
+common/test_transformer*
 common/test_vision
-
-# Build artifact binaries
-cpu/llm/test_transformer
-cpu/llm/test_transformer_parallel
-cpu/llm/test_transformer_mpi
+cpu/llm/test_transformer*
 cpu/vlm/test_vision
 cpu/da3/test_da3
 cpu/ppd/test_ppd
+
+# Build artifact binaries — CUDA runners
 cuda/llm/test_cuda_llm
 cuda/vlm/test_cuda_vlm
 cuda/fp8/fp8_gemm
+
+# Build artifact binaries — unit tests
 tests/test_bpe_tokenizer
 tests/test_gguf_loader
 tests/test_safetensors
+
+# Build artifact binaries — a64fx benchmarks
+a64fx/mem-pattern/bench_*
+!a64fx/mem-pattern/bench_*.c
+
+# Build artifact binaries — zen2 benchmarks
+zen2/bench
+zen2/bench_*
+!zen2/bench_*.c
+
+# Fugaku job scheduler logs
+*.err
+
+# External / generated
 ref/
 result/
