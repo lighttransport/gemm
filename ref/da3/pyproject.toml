@@ -1,0 +1,14 @@
+[project]
+name = "da3-reference"
+version = "0.1.0"
+description = "PyTorch reference for DA3 depth estimation comparison"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "torchvision",
+    "safetensors",
+    "numpy",
+    "Pillow",
+    "scipy",
+    "scikit-image",
+]
