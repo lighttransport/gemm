@@ -17,7 +17,7 @@
 #include <time.h>
 #include <stdint.h>
 
-/* Write a float32 array as NumPy .npy format (v1.0) */
+/* Write a float32 array as NumPy .npy format (v1.0) — 2D (h, w) */
 static void write_npy_f32(const char *path, const float *data, int w, int h) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
@@ -42,6 +42,52 @@ static void write_npy_f32(const char *path, const float *data, int w, int h) {
     fwrite(data, sizeof(float), (size_t)w * h, f);
     fclose(f);
     fprintf(stderr, "Wrote %s (%dx%d, float32)\n", path, w, h);
+}
+
+/* Write a float32 array as NumPy .npy format — 3D (c, h, w) */
+static void write_npy_f32_3d(const char *path, const float *data, int c, int h, int w) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t version[2] = {1, 0};
+    fwrite(version, 1, 2, f);
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d, %d), }", c, h, w);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(data, sizeof(float), (size_t)c * h * w, f);
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%dx%dx%d, float32)\n", path, c, h, w);
+}
+
+/* Write a float32 1D array as NumPy .npy */
+static void write_npy_f32_1d(const char *path, const float *data, int n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t version[2] = {1, 0};
+    fwrite(version, 1, 2, f);
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d,), }", n);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(data, sizeof(float), (size_t)n, f);
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%d, float32)\n", path, n);
 }
 
 /* GGUF loader */
@@ -144,6 +190,7 @@ int main(int argc, char **argv) {
     const char *input_ppm = NULL;
     const char *output_pgm = NULL;
     const char *npy_path = NULL;
+    const char *npy_dir = NULL;  /* directory for all npy outputs */
     int device_id = 0;
     int verbose = 1;
     int output_flags = DA3_OUTPUT_DEPTH;  /* default: depth only */
@@ -154,6 +201,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) device_id = atoi(argv[++i]);
         else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc) verbose = atoi(argv[++i]);
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
+        else if (strcmp(argv[i], "--npy-dir") == 0 && i + 1 < argc) npy_dir = argv[++i];
         else if (strcmp(argv[i], "--full") == 0) output_flags = DA3_OUTPUT_ALL;
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
         else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
@@ -371,6 +419,28 @@ int main(int argc, char **argv) {
     if (result.has_metric && result.metric_depth) {
         fprintf(stderr, "\n--- Metric Depth ---\n");
         print_stats("metric", result.metric_depth, npix);
+    }
+
+    /* Save all outputs as npy if --npy-dir specified */
+    if (npy_dir && npix > 0) {
+        char path[512];
+        if (result.has_pose) {
+            snprintf(path, sizeof(path), "%s/pose_gpu.npy", npy_dir);
+            write_npy_f32_1d(path, result.pose, 9);
+        }
+        if (result.has_rays && result.rays) {
+            snprintf(path, sizeof(path), "%s/rays_gpu.npy", npy_dir);
+            write_npy_f32_3d(path, result.rays, 6, result.height, result.width);
+            if (result.ray_confidence) {
+                snprintf(path, sizeof(path), "%s/ray_conf_gpu.npy", npy_dir);
+                write_npy_f32(path, result.ray_confidence, result.width, result.height);
+            }
+        }
+        if (result.has_gaussians && result.gaussians) {
+            int gs_oc = 38;
+            snprintf(path, sizeof(path), "%s/gaussians_gpu.npy", npy_dir);
+            write_npy_f32_3d(path, result.gaussians, gs_oc, result.height, result.width);
+        }
     }
 
     /* Cleanup */
