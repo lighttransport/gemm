@@ -422,6 +422,8 @@ struct cuda_da3_runner {
     CUfunction fn_qk_layernorm_f32;
     CUfunction fn_rope_2d_f32;
     CUfunction fn_attn_prefill_f32;
+    CUfunction fn_gemm_tiled_f16_f32;
+    CUfunction fn_flash_attn_tiled_f32;
     CUfunction fn_swiglu_f32;
     CUfunction fn_gelu_f32;
     CUfunction fn_layerscale_add_f32;
@@ -594,6 +596,8 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
     /* Shared kernels (from cuda_kernels_common.h) */
     GET_FN(layernorm_f32);
     GET_FN(gemm_f16_f32);
+    GET_FN(gemm_tiled_f16_f32);
+    GET_FN(flash_attn_tiled_f32);
     GET_FN(add_bias_f32);
     GET_FN(attn_prefill_f32);
     GET_FN(gelu_f32);
@@ -2352,10 +2356,11 @@ static void kl_layernorm(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
 static void kl_gemm(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W_f16,
                      CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
-    unsigned gx = (unsigned)((n_out + 255) / 256); /* 4 warps × 64 outputs = 256 per block */
-    unsigned gy = (unsigned)((n_tok + 15) / 16);  /* 16 tokens per block (shared via smem) */
-    cuLaunchKernel(r->fn_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
-                   16 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+    /* Use tiled GEMM (correct) instead of MMA GEMM (has output mapping bug) */
+    unsigned gx = (unsigned)((n_out + 63) / 64);
+    unsigned gy = (unsigned)((n_tok + 15) / 16);
+    cuLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,
+                   0, r->stream, args, NULL);
 }
 
 static void kl_gemm_fp8(cuda_da3_runner *r, CUdeviceptr Y, CUdeviceptr W_fp8,
@@ -2414,11 +2419,14 @@ static void kl_attn_prefill(cuda_da3_runner *r, CUdeviceptr out, CUdeviceptr qkv
                               int n_tok, int dim, int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
     void *args[] = {&out, &qkv, &K_t, &V_t, &n_tok, &dim, &n_heads, &head_dim, &scale};
-    unsigned gy = (unsigned)((n_tok + 63) / 64);
-    cuLaunchKernel(r->fn_attn_prefill_f32,
+    /* Use tiled FlashAttention (no MMA) — MMA attn_prefill_f32 has fragment mapping bug */
+    int bq = 64, bkv = 16;
+    unsigned smem_size = (unsigned)(2 * bkv * head_dim * sizeof(float));
+    unsigned gy = (unsigned)((n_tok + bq - 1) / bq);
+    cuLaunchKernel(r->fn_flash_attn_tiled_f32,
                    (unsigned)n_heads, gy, 1,
-                   128, 1, 1,
-                   0, r->stream, args, NULL);
+                   (unsigned)bq, 1, 1,
+                   smem_size, r->stream, args, NULL);
 }
 
 static void kl_swiglu(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr gate_up,
@@ -2487,19 +2495,28 @@ static void kl_conv2d(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
                    0, r->stream, args, NULL);
 }
 
-/* Conv2d via implicit im2col MMA GEMM. Weight must be FP16, K must be multiple of 16. */
+/* Conv2d via scalar kernel (MMA conv_gemm has fragment mapping bug on sm_86).
+ * Weight w_f16 is FP16 [Co, Ci*kH*kW]. conv2d_f32 expects F32 weight,
+ * so we dequant to F32 on host, upload, and use the scalar kernel.
+ * For correctness first — can optimize later with a tiled non-MMA variant. */
 static void kl_conv_gemm(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
                            CUdeviceptr w_f16, CUdeviceptr bias, int H, int W,
                            int Ci, int Co, int kH, int kW, int stride, int pad) {
-    int Ho = (H + 2 * pad - kH) / stride + 1;
-    int Wo = (W + 2 * pad - kW) / stride + 1;
-    int M = Ho * Wo;
-    void *args[] = {&dst, &src, &w_f16, &bias, &H, &W, &Ci, &Co,
-                    &kH, &kW, &stride, &pad};
-    unsigned gx = (unsigned)((Co + 63) / 64);
-    unsigned gy = (unsigned)((M + 63) / 64);
-    cuLaunchKernel(r->fn_conv_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
-                   64 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+    /* Dequant F16 weight to F32 on device would be ideal but conv2d_f32
+     * actually reads F32 weights. Use the existing kl_conv2d which accepts F32. */
+    int K = Ci * kH * kW;
+    int n = Co * K;
+    /* Download F16 weights, convert to F32, re-upload */
+    uint16_t *h_w16 = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
+    float *h_w32 = (float *)malloc((size_t)n * sizeof(float));
+    cuMemcpyDtoH(h_w16, w_f16, (size_t)n * sizeof(uint16_t));
+    for (int i = 0; i < n; i++) h_w32[i] = ggml_fp16_to_fp32(h_w16[i]);
+    CUdeviceptr d_w32;
+    cuMemAlloc(&d_w32, (size_t)n * sizeof(float));
+    cuMemcpyHtoD(d_w32, h_w32, (size_t)n * sizeof(float));
+    free(h_w16); free(h_w32);
+    kl_conv2d(r, dst, src, d_w32, bias, H, W, Ci, Co, kH, kW, stride, pad);
+    cuMemFree(d_w32);
 }
 
 /* GEMM-based ConvTranspose2d for stride-aligned case (kH==stride, kW==stride).
@@ -3115,6 +3132,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
             }
         }
         PROF_END(prof_feat);
+
     }
 
 #undef PROF_START
@@ -3460,40 +3478,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* GSDPT token processing + refinenet (same pipeline as main DPT) */
         /* Reuses d_features from backbone as input */
 
-        /* Debug: check backbone features and GSDPT proj weights */
-        if (r->verbose >= 2) {
-            CUresult err = cuStreamSynchronize(r->stream);
-            fprintf(stderr, "  CUDA stream sync before GSDPT: %d\n", (int)err);
-            err = cuCtxSynchronize();
-            fprintf(stderr, "  CUDA ctx sync before GSDPT: %d\n", (int)err);
-            float dbg[4];
-            err = cuMemcpyDtoH(dbg, r->d_features[0], sizeof(dbg));
-            fprintf(stderr, "  d_features[0] CLS[0..3]: %.6f %.6f %.6f %.6f (err=%d, ptr=0x%llx)\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3], (int)err,
-                    (unsigned long long)r->d_features[0]);
-            /* Check patch token 0 (offset = 1 * dim) */
-            err = cuMemcpyDtoH(dbg, r->d_features[0] + (size_t)dim * sizeof(float),
-                          sizeof(dbg));
-            fprintf(stderr, "  d_features[0] patch0[0..3]: %.6f %.6f %.6f %.6f (err=%d)\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3], (int)err);
-            /* Also check d_dpt_cat after CLS concat for fi=0 */
-            /* Check GSDPT proj weight (download first 8 FP16 values as raw bytes) */
-            uint16_t wdbg[8];
-            cuMemcpyDtoH(wdbg, gdw->proj_w[0], sizeof(wdbg));
-            float wf[4];
-            for (int i = 0; i < 4; i++) {
-                uint32_t bits = wdbg[i];
-                uint32_t sign = (bits >> 15) & 1;
-                uint32_t exp  = (bits >> 10) & 0x1F;
-                uint32_t mant = bits & 0x3FF;
-                if (exp == 0) wf[i] = sign ? -0.0f : 0.0f;
-                else if (exp == 31) wf[i] = sign ? -1.0f/0.0f : 1.0f/0.0f;
-                else { uint32_t f = (sign<<31)|((exp+112)<<23)|(mant<<13); memcpy(&wf[i],&f,4); }
-            }
-            fprintf(stderr, "  gsdpt proj_w[0] fp16[0..3]: %.6f %.6f %.6f %.6f\n",
-                    wf[0], wf[1], wf[2], wf[3]);
-        }
-
         for (int fi = 0; fi < 4; fi++) {
             int oc_val = r->head_out_channels[fi];
 
@@ -3507,25 +3491,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
 
             kl_gemm(r, r->d_dpt_proj, gdw->proj_w[fi], r->d_dpt_ln, gdw->proj_b[fi],
                      oc_val, head_dim_in, np);
-
-            /* Debug: trace GSDPT fi=0 token processing */
-            if (r->verbose >= 2 && fi == 0) {
-                cuStreamSynchronize(r->stream);
-                float dbg[4];
-                cuMemcpyDtoH(dbg, r->d_dpt_cat, sizeof(dbg));
-                fprintf(stderr, "  gsdpt cat[0][0..3]: %.6f %.6f %.6f %.6f\n",
-                        dbg[0], dbg[1], dbg[2], dbg[3]);
-                cuMemcpyDtoH(dbg, r->d_dpt_ln, sizeof(dbg));
-                fprintf(stderr, "  gsdpt ln[0][0..3]: %.6f %.6f %.6f %.6f\n",
-                        dbg[0], dbg[1], dbg[2], dbg[3]);
-                cuMemcpyDtoH(dbg, r->d_dpt_proj, sizeof(dbg));
-                fprintf(stderr, "  gsdpt proj[0][0..3]: %.6e %.6e %.6e %.6e (oc=%d)\n",
-                        dbg[0], dbg[1], dbg[2], dbg[3], oc_val);
-                /* Check proj bias */
-                cuMemcpyDtoH(dbg, gdw->proj_b[0], sizeof(dbg));
-                fprintf(stderr, "  gsdpt proj_b[0][0..3]: %.6f %.6f %.6f %.6f\n",
-                        dbg[0], dbg[1], dbg[2], dbg[3]);
-            }
 
             if (fi == 0)
                 kl_deconv_gemm_scatter(r, r->d_dpt_spatial[0], r->d_dpt_proj,
@@ -3544,15 +3509,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                 kl_conv_gemm(r, r->d_dpt_spatial[3], r->d_dpt_chw,
                               gdw->downsample_w, gdw->downsample_b,
                               gh, gw, oc_val, oc_val, 3, 3, 2, 1);
-            }
-
-            /* Debug: trace spatial output */
-            if (r->verbose >= 2 && fi == 0) {
-                cuStreamSynchronize(r->stream);
-                float dbg[4];
-                cuMemcpyDtoH(dbg, r->d_dpt_spatial[0], sizeof(dbg));
-                fprintf(stderr, "  gsdpt spatial[0][0..3]: %.4f %.4f %.4f %.4f\n",
-                        dbg[0], dbg[1], dbg[2], dbg[3]);
             }
 
             CUdeviceptr null_bias = 0;
@@ -3602,18 +3558,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->has_rcu1[0], gdw->has_rcu2[0]);
         gs_fh = sp_h[0]; gs_fw = sp_w[0];
 
-        /* Debug: check GSDPT d_dpt_adapted[0] and d_dpt_fused after refinenet */
-        if (r->verbose >= 2) {
-            cuStreamSynchronize(r->stream);
-            float dbg[4];
-            cuMemcpyDtoH(dbg, r->d_dpt_adapted[0], sizeof(dbg));
-            fprintf(stderr, "  gsdpt adapted[0][0..3]: %.4f %.4f %.4f %.4f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3]);
-            cuMemcpyDtoH(dbg, r->d_dpt_fused, sizeof(dbg));
-            fprintf(stderr, "  gsdpt fused[0..3]: %.4f %.4f %.4f %.4f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3]);
-        }
-
         /* Output convolutions → gs_oc channels
          * output_conv1 (neck): Conv2d(256, 128, 3) — NO ReLU (single .0 index)
          * + inject upsampled merger features (element-wise add)
@@ -3646,17 +3590,6 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
 
         /* Download gaussians */
         cuStreamSynchronize(r->stream);
-
-        /* Debug: check output conv intermediate and final */
-        if (r->verbose >= 2) {
-            float dbg[4];
-            cuMemcpyDtoH(dbg, r->d_dpt_tmp, sizeof(dbg));
-            fprintf(stderr, "  gsdpt neck_out[0..3]: %.4f %.4f %.4f %.4f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3]);
-            cuMemcpyDtoH(dbg, r->d_gs_out, sizeof(dbg));
-            fprintf(stderr, "  gsdpt gs_out[0..3]: %.4f %.4f %.4f %.4f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3]);
-        }
 
         /* Bilinear upsample each channel to output resolution */
         int npix = img_w * img_h;
