@@ -98,8 +98,11 @@ static int cu_compile_kernels(CUmodule *module, CUdevice device,
         fprintf(stderr, "%s: compiling kernels for sm_%d ...\n", prefix, sm);
 
     nvrtcProgram prog;
-    if (nvrtcCreateProgram(&prog, source, prog_name, 0, NULL, NULL) != NVRTC_SUCCESS)
+    nvrtcResult cres = nvrtcCreateProgram(&prog, source, prog_name, 0, NULL, NULL);
+    if (cres != NVRTC_SUCCESS) {
+        fprintf(stderr, "%s: nvrtcCreateProgram failed: %d\n", prefix, (int)cres);
         return -1;
+    }
 
     char arch[32];
     snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d", sm);
@@ -107,35 +110,56 @@ static int cu_compile_kernels(CUmodule *module, CUdevice device,
     nvrtcResult nres = nvrtcCompileProgram(prog, 2, opts);
 
     if (nres != NVRTC_SUCCESS) {
+        fprintf(stderr, "%s: NVRTC compile error %d\n", prefix, (int)nres);
         size_t log_sz;
         nvrtcGetProgramLogSize(prog, &log_sz);
-        if (log_sz > 1) {
-            char *log = (char *)malloc(log_sz);
-            nvrtcGetProgramLog(prog, log);
-            fprintf(stderr, "%s: NVRTC log:\n%s\n", prefix, log);
-            free(log);
-        }
+        char *log = (char *)malloc(log_sz + 1);
+        nvrtcGetProgramLog(prog, log);
+        log[log_sz] = '\0';
+        fprintf(stderr, "%s: NVRTC log (%zu bytes):\n%s\n", prefix, log_sz, log);
+        free(log);
         nvrtcDestroyProgram(&prog);
         return -1;
     }
 
-    size_t ptx_sz;
-    nvrtcGetPTXSize(prog, &ptx_sz);
-    char *ptx = (char *)malloc(ptx_sz);
-    nvrtcGetPTX(prog, ptx);
-    nvrtcDestroyProgram(&prog);
-
-    if (verbose >= 3) {
-        char path[256];
-        snprintf(path, sizeof(path), "/tmp/%s.ptx", prog_name);
-        FILE *fp = fopen(path, "w");
-        if (fp) { fwrite(ptx, 1, ptx_sz, fp); fclose(fp);
-            fprintf(stderr, "%s: PTX saved to %s\n", prefix, path); }
+    /* Prefer CUBIN (native binary) over PTX.  CUBIN avoids the
+     * CUDA_ERROR_UNSUPPORTED_PTX_VERSION failure that occurs when the NVRTC
+     * toolkit version is newer than the installed driver (e.g. NVRTC 13.1
+     * emits PTX 9.1 which a CUDA 13.0 driver cannot JIT-compile). */
+    CUresult err;
+    size_t cubin_sz = 0;
+    if (nvrtcGetCUBINSize && nvrtcGetCUBIN &&
+        nvrtcGetCUBINSize(prog, &cubin_sz) == NVRTC_SUCCESS && cubin_sz > 0) {
+        char *cubin = (char *)malloc(cubin_sz);
+        nvrtcGetCUBIN(prog, cubin);
+        nvrtcDestroyProgram(&prog);
+        if (verbose >= 2)
+            fprintf(stderr, "%s: loading CUBIN (%zu bytes)\n", prefix, cubin_sz);
+        err = cuModuleLoadData(module, cubin);
+        free(cubin);
+    } else {
+        /* Fallback to PTX (works when toolkit <= driver) */
+        size_t ptx_sz;
+        nvrtcGetPTXSize(prog, &ptx_sz);
+        char *ptx = (char *)malloc(ptx_sz);
+        nvrtcGetPTX(prog, ptx);
+        nvrtcDestroyProgram(&prog);
+        if (verbose >= 2)
+            fprintf(stderr, "%s: loading PTX (%zu bytes)\n", prefix, ptx_sz);
+        if (verbose >= 3) {
+            char path[256];
+            snprintf(path, sizeof(path), "/tmp/%s.ptx", prog_name);
+            FILE *fp = fopen(path, "w");
+            if (fp) { fwrite(ptx, 1, ptx_sz, fp); fclose(fp);
+                fprintf(stderr, "%s: PTX saved to %s\n", prefix, path); }
+        }
+        err = cuModuleLoadDataEx(module, ptx, 0, NULL, NULL);
+        free(ptx);
     }
-
-    CUresult err = cuModuleLoadDataEx(module, ptx, 0, NULL, NULL);
-    free(ptx);
-    if (err != CUDA_SUCCESS) return -1;
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "%s: cuModuleLoad failed: %d\n", prefix, (int)err);
+        return -1;
+    }
 
     return sm;
 }
