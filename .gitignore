@@ -39,3 +39,30 @@
 
 # debug information files
 *.dwo
+
+# Build artifact binaries (legacy, in common/)
+common/test_transformer
+common/test_transformer_asan
+common/test_transformer_debug
+common/test_transformer_debug2
+common/test_transformer_debug3
+common/test_transformer_mpi
+common/test_transformer_nofm
+common/test_transformer_parallel
+common/test_vision
+
+# Build artifact binaries
+cpu/llm/test_transformer
+cpu/llm/test_transformer_parallel
+cpu/llm/test_transformer_mpi
+cpu/vlm/test_vision
+cpu/da3/test_da3
+cpu/ppd/test_ppd
+cuda/llm/test_cuda_llm
+cuda/vlm/test_cuda_vlm
+cuda/fp8/fp8_gemm
+tests/test_bpe_tokenizer
+tests/test_gguf_loader
+tests/test_safetensors
+ref/
+result/

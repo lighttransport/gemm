@@ -8,7 +8,7 @@
  *   ./test_safetensors ../models/da3-small/model.safetensors [../models/da3-small/config.json]
  */
 #define SAFETENSORS_IMPLEMENTATION
-#include "safetensors.h"
+#include "../common/safetensors.h"
 
 #include <stdio.h>
 #include <stdlib.h>
