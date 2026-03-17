@@ -88,7 +88,7 @@ class Attention(nn.Module):
             k = torch.cat([k_cls, k_sp], dim=2)
 
         attn = torch.matmul(q * self.scale, k.transpose(-2, -1))
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(v.dtype)
         x = torch.matmul(attn, v)
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
