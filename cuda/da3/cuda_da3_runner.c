@@ -1163,11 +1163,11 @@ static st_name_map *build_st_name_map(const st_context *st, int *out_count) {
     const char *bb_prefix = NULL;
     const char *hd_prefix = NULL;
     static const char *bb_candidates[] = {
-        "model.backbone.pretrained.", "backbone.pretrained.",
-        "backbone.", "pretrained.", "encoder.", NULL
+        "model.da3.backbone.pretrained.", "model.backbone.pretrained.",
+        "backbone.pretrained.", "backbone.", "pretrained.", "encoder.", NULL
     };
     static const char *hd_candidates[] = {
-        "model.head.", "head.", "depth_head.", "dpt_head.", NULL
+        "model.da3.head.", "model.head.", "head.", "depth_head.", "dpt_head.", NULL
     };
     for (int c = 0; bb_candidates[c]; c++) {
         for (int i = 0; i < st->n_tensors; i++) {
@@ -1296,9 +1296,11 @@ hd_found:
                 }
             }
         }
-        /* CameraDec: model.cam_dec.* */
-        else if (strncmp(key, "model.cam_dec.", 14) == 0) {
-            const char *s = key + 14;
+        /* CameraDec: model.cam_dec.* or model.da3.cam_dec.* */
+        else if (strncmp(key, "model.da3.cam_dec.", 18) == 0 ||
+                 strncmp(key, "model.cam_dec.", 14) == 0) {
+            const char *s = strncmp(key, "model.da3.", 10) == 0
+                          ? key + 18 : key + 14;
             for (int j = 0; cam_dec_map[j].st; j++) {
                 if (strcmp(s, cam_dec_map[j].st) == 0) {
                     snprintf(gguf_name, sizeof(gguf_name), "da3.%s", cam_dec_map[j].gg);
@@ -1306,9 +1308,11 @@ hd_found:
                 }
             }
         }
-        /* CameraEnc: model.cam_enc.* */
-        else if (strncmp(key, "model.cam_enc.", 14) == 0) {
-            const char *s = key + 14;
+        /* CameraEnc: model.cam_enc.* or model.da3.cam_enc.* */
+        else if (strncmp(key, "model.da3.cam_enc.", 18) == 0 ||
+                 strncmp(key, "model.cam_enc.", 14) == 0) {
+            const char *s = strncmp(key, "model.da3.", 10) == 0
+                          ? key + 18 : key + 14;
             /* Check fixed mappings first */
             for (int j = 0; cam_enc_pose_map[j].st; j++) {
                 if (strcmp(s, cam_enc_pose_map[j].st) == 0) {
@@ -1330,9 +1334,11 @@ hd_found:
                 }
             }
         }
-        /* GSDPT: model.gs_head.* */
-        else if (strncmp(key, "model.gs_head.", 14) == 0) {
-            const char *s = key + 14;
+        /* GSDPT: model.gs_head.* or model.da3.gs_head.* */
+        else if (strncmp(key, "model.da3.gs_head.", 18) == 0 ||
+                 strncmp(key, "model.gs_head.", 14) == 0) {
+            const char *s = strncmp(key, "model.da3.", 10) == 0
+                          ? key + 18 : key + 14;
             /* images_merger: Conv2d layers 0, 2, 4 */
             if (strncmp(s, "images_merger.", 14) == 0) {
                 const char *ms = s + 14;
@@ -1605,7 +1611,10 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
             if (root) {
                 json_val *cfg = json_obj_get(root, "config");
                 if (cfg) {
-                    json_val *head = json_obj_get(cfg, "head");
+                    /* For nested models, config is under "anyview" */
+                    json_val *anyview = json_obj_get(cfg, "anyview");
+                    json_val *cfg_src = anyview ? anyview : cfg;
+                    json_val *head = json_obj_get(cfg_src, "head");
                     if (head) {
                         json_val *v = json_obj_get(head, "features");
                         if (v && v->type == JSON_NUMBER) head_features = (int)v->num;
@@ -1614,7 +1623,7 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
                             for (int i = 0; i < 4 && i < oc->arr.count; i++)
                                 head_oc[i] = (int)oc->arr.items[i].num;
                     }
-                    json_val *net = json_obj_get(cfg, "net");
+                    json_val *net = json_obj_get(cfg_src, "net");
                     if (net) {
                         json_val *ol = json_obj_get(net, "out_layers");
                         if (ol && ol->type == JSON_ARRAY)
