@@ -902,19 +902,19 @@ static qtensor da3s_make_tensor(st_context *st, int idx) {
 static int da3s_map_name(const char *st_name, char *gg_name, int gg_size) {
     gg_name[0] = '\0';
 
-    /* Detect and strip backbone prefix */
+    /* Detect and strip backbone prefix (incl. nested model "da3." prefix) */
     const char *s = st_name;
     static const char *bb_pfx[] = {
-        "model.backbone.pretrained.", "backbone.pretrained.",
-        "backbone.", "pretrained.", "encoder.", NULL
+        "model.da3.backbone.pretrained.", "model.backbone.pretrained.",
+        "backbone.pretrained.", "backbone.", "pretrained.", "encoder.", NULL
     };
     for (int i = 0; bb_pfx[i]; i++) {
         size_t pl = strlen(bb_pfx[i]);
         if (strncmp(s, bb_pfx[i], pl) == 0) { s += pl; break; }
     }
 
-    /* Head prefix */
-    static const char *hd_pfx[] = { "model.head.", "head.", "depth_head.", NULL };
+    /* Head prefix (incl. nested model "da3." prefix) */
+    static const char *hd_pfx[] = { "model.da3.head.", "model.head.", "head.", "depth_head.", NULL };
     int is_head = 0;
     const char *orig_s = s;
     for (int i = 0; hd_pfx[i]; i++) {
@@ -922,8 +922,8 @@ static int da3s_map_name(const char *st_name, char *gg_name, int gg_size) {
         if (strncmp(s, hd_pfx[i], pl) == 0) { s += pl; is_head = 1; break; }
     }
 
-    /* CameraDec prefix */
-    static const char *cam_pfx[] = { "model.cam_dec.", "cam_dec.", NULL };
+    /* CameraDec prefix (incl. nested model "da3." prefix) */
+    static const char *cam_pfx[] = { "model.da3.cam_dec.", "model.cam_dec.", "cam_dec.", NULL };
     int is_cam = 0;
     for (int i = 0; cam_pfx[i]; i++) {
         size_t pl = strlen(cam_pfx[i]);
@@ -933,8 +933,8 @@ static int da3s_map_name(const char *st_name, char *gg_name, int gg_size) {
         }
     }
 
-    /* GSDPT prefix */
-    static const char *gs_pfx[] = { "model.gs_head.", "gs_head.", NULL };
+    /* GSDPT prefix (incl. nested model "da3." prefix) */
+    static const char *gs_pfx[] = { "model.da3.gs_head.", "model.gs_head.", "gs_head.", NULL };
     int is_gs = 0;
     for (int i = 0; gs_pfx[i]; i++) {
         size_t pl = strlen(gs_pfx[i]);
