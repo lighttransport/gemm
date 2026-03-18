@@ -29,17 +29,37 @@
 
 | Model | Architecture | CPU | CUDA |
 |-------|-------------|-----|------|
-| Depth Anything 3 (DA3) | DINOv2 ViT encoder + DPT head | x | x |
+| Depth Anything 3 (DA3) | DINOv2 ViT encoder + DualDPT head | x | x |
 | Pixel-Perfect Depth (PPD) | DINOv2 ViT-L + DiT diffusion (4-step Euler) | x | x |
 
-DA3 supports multiple output modalities: depth + confidence, pose estimation (CameraDec), ray extraction + sky segmentation, 3D Gaussians, and metric depth. Variants: NESTED, LARGE, GIANT.
+DA3 supports multiple output modalities: depth + confidence, pose estimation (CameraDec), ray extraction + sky segmentation, 3D Gaussians, and metric depth. Variants: Small, Base, Large, Giant, Nested-Giant-Large-1.1.
+
+**DA3 Output Modalities:**
+
+| Output | Small | Giant | Nested-1.1 | Verified | Notes |
+|--------|-------|-------|------------|----------|-------|
+| Depth + Confidence | x | x | x | r=0.999 (small), r=0.963 (nested) | Main DualDPT head |
+| Pose (CameraDec) | x | x | x | qcos=0.971 (giant), qcos=0.981 (nested) | backbone_norm(CLS) -> MLP -> 3 heads |
+| Rays (Aux DPT) | - | - | - | GPU=0, needs camera_token fix | Requires camera_token injection at alt_start |
+| Gaussians (GSDPT) | - | x | x | r=0.998 (giant/nested) | Separate DPT + RGB merger |
+| Metric Depth | - | - | ref only | PyTorch ref works | Needs ViT-L backbone in C/CUDA |
+| Sky Segmentation | - | - | ref only | PyTorch ref works | Needs metric DPT branch |
+
+See `doc/da3-reference-verification.md` for full verification results.
 
 ## Key Inference Features
 
 ### Model Loading
 - **GGUF format** with automatic architecture detection (model type, MoE params, SSM layers, M-RoPE sections)
-- **SafeTensors format** for DA3 models
+- **SafeTensors format** for DA3 models (incl. nested model `da3.` prefix)
 - **PyTorch PTH format** with BF16/FP16 support
+
+### Image I/O (`common/image_utils.h`)
+- **Input**: JPEG, PNG, BMP, TGA, PPM, HDR (Radiance), EXR (OpenEXR via tinyexr)
+- **Output**: PNG, JPEG, BMP, HDR, PGM (16-bit), EXR (fp16/fp32), PPM
+- **Depth visualization**: Spectral falsecolor PNG (matching DA3 PyTorch: inverse depth, 2nd/98th percentile, Spectral cmap)
+- **Resize**: `--resize WxH` (pixels), `--resize N%` (scale), `--resize Nt` (ViT token count, aspect-preserving, patch-aligned)
+- **Preprocessing**: align_corners=True bilinear resize + ImageNet normalization (matches PyTorch F.interpolate exactly)
 
 ### Quantization
 24 GGML quantization types supported on both CPU and CUDA. See README.md for full list.
@@ -99,6 +119,9 @@ DA3 supports multiple output modalities: depth + confidence, pose estimation (Ca
 ## TODOs
 
 ### CUDA DA3
+- **Camera token injection** (enables ray output): Load `backbone.camera_token` from safetensors, inject ref_token at block `alt_start` by overwriting CLS position. ~5 lines in backbone loop. Without this, aux DPT (rays) outputs zeros.
+- **Metric depth backbone** (ViT-L): Implement second backbone (dim=1024, 24 blocks, no RoPE/QKNorm, GELU MLP) + standard DPT head (output_dim=1) for metric-scale depth. Needed for Nested-Giant-Large models.
+- **Sky segmentation**: Add `sky_output_conv2` branch off metric DPT neck (shares neck output, separate Conv3x3+ReLU+Conv1x1 -> 1ch).
 - `cuda/da3/cuda_da3_runner.c:3564` - Inject merger features at level 0 (add to d_dpt_adapted[0])
 
 ### CUDA INT8

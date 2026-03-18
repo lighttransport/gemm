@@ -197,7 +197,29 @@ uv run python compare.py --reference output/depth_ref.npy \
 ### C/CUDA Test Programs
 
 ```bash
+# JPEG/PNG input (no PPM conversion needed), auto-exports falsecolor PNG + fp16 EXR
+./test_cuda_da3 model.safetensors -i photo.jpg -o depth.pgm --full
+# Output: depth.pgm + depth_falsecolor.png + depth_depth.exr + pose/rays/gs npy
+
+# With resize (token-based: ~1369 tokens matching DA3 default 37x37 grid)
+./test_cuda_da3 model.safetensors -i photo.jpg --resize 1369t -o depth.pgm
+
+# With resize (percentage)
+./test_da3 model.safetensors -i photo.jpg --resize 50% -o depth.pgm
+
 # With --npy for depth and --npy-dir for all modalities
-./test_cuda_da3 model.safetensors -i input.ppm -o depth.pgm \
+./test_cuda_da3 model.safetensors -i photo.jpg -o depth.pgm \
     --npy depth.npy --npy-dir output/ --full
 ```
+
+### Supported Input Formats
+
+JPEG, PNG, BMP, TGA, PPM, HDR (Radiance), EXR (OpenEXR) -- via stb_image + tinyexr.
+
+### Default Output (auto-exported alongside -o)
+
+| File | Format | Content |
+|------|--------|---------|
+| `{base}.pgm` | PGM 16-bit | Grayscale depth (min/max normalized) |
+| `{base}_falsecolor.png` | PNG RGB 8-bit | Spectral colormap (DA3 PyTorch-matching) |
+| `{base}_depth.exr` | EXR fp16 | Raw depth values (CUDA only) |
