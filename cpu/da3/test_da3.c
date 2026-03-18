@@ -24,6 +24,9 @@
 #define DEPTH_ANYTHING3_IMPLEMENTATION
 #include "../../common/depth_anything3.h"
 
+#define IMAGE_UTILS_IMPLEMENTATION
+#include "image_utils.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -249,23 +252,27 @@ int main(int argc, char **argv) {
             print_stats("gaussians", full.gaussians, gs_oc * npix);
         }
 
-        /* Write output */
+        /* Write output — auto-export falsecolor PNG + fp16 EXR alongside requested format */
         if (output_path && full.depth) {
             if (ends_with(output_path, ".pgm")) {
-                float mn = full.depth[0], mx = full.depth[0];
-                for (int i = 1; i < npix; i++) {
-                    if (full.depth[i] < mn) mn = full.depth[i];
-                    if (full.depth[i] > mx) mx = full.depth[i];
-                }
-                float range = mx - mn;
-                if (range < 1e-6f) range = 1.0f;
-                float *normalized = (float *)malloc((size_t)npix * sizeof(float));
-                for (int i = 0; i < npix; i++)
-                    normalized[i] = (full.depth[i] - mn) / range * 65535.0f;
-                write_pgm16(output_path, normalized, full.width, full.height);
-                free(normalized);
+                img_write_pgm16(output_path, full.depth, full.width, full.height);
+            } else if (ends_with(output_path, ".png")) {
+                img_write_depth_png(output_path, full.depth, full.width, full.height);
             } else {
-                fprintf(stderr, "Output format not supported (use .pgm): %s\n", output_path);
+                /* Default: strip extension and export both PNG + PGM */
+                img_write_pgm16(output_path, full.depth, full.width, full.height);
+            }
+            /* Always also export falsecolor PNG + fp16 depth alongside */
+            if (!ends_with(output_path, ".png")) {
+                /* Derive base path by stripping extension */
+                char base[512];
+                strncpy(base, output_path, sizeof(base) - 1);
+                base[sizeof(base) - 1] = '\0';
+                char *dot = strrchr(base, '.');
+                if (dot) *dot = '\0';
+                char fpath[512];
+                snprintf(fpath, sizeof(fpath), "%s_falsecolor.png", base);
+                img_write_depth_png(fpath, full.depth, full.width, full.height);
             }
         }
         if (npy_path && full.depth)
@@ -295,18 +302,22 @@ int main(int argc, char **argv) {
         }
 
         if (output_path && result.depth) {
-            float mn = result.depth[0], mx = result.depth[0];
-            for (int i = 1; i < npix; i++) {
-                if (result.depth[i] < mn) mn = result.depth[i];
-                if (result.depth[i] > mx) mx = result.depth[i];
+            if (ends_with(output_path, ".png")) {
+                img_write_depth_png(output_path, result.depth, result.width, result.height);
+            } else {
+                img_write_pgm16(output_path, result.depth, result.width, result.height);
             }
-            float range = mx - mn;
-            if (range < 1e-6f) range = 1.0f;
-            float *normalized = (float *)malloc((size_t)npix * sizeof(float));
-            for (int i = 0; i < npix; i++)
-                normalized[i] = (result.depth[i] - mn) / range * 65535.0f;
-            write_pgm16(output_path, normalized, result.width, result.height);
-            free(normalized);
+            /* Also export falsecolor PNG alongside */
+            if (!ends_with(output_path, ".png")) {
+                char base[512];
+                strncpy(base, output_path, sizeof(base) - 1);
+                base[sizeof(base) - 1] = '\0';
+                char *dot = strrchr(base, '.');
+                if (dot) *dot = '\0';
+                char fpath[512];
+                snprintf(fpath, sizeof(fpath), "%s_falsecolor.png", base);
+                img_write_depth_png(fpath, result.depth, result.width, result.height);
+            }
         }
         if (npy_path && result.depth)
             write_npy_f32(npy_path, result.depth, result.width, result.height);
