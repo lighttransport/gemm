@@ -191,21 +191,23 @@ int main(int argc, char **argv) {
     }
 
     const char *model_path = argv[1];
-    const char *input_ppm = NULL;
+    const char *input_path = NULL;
     const char *output_pgm = NULL;
     const char *npy_path = NULL;
-    const char *npy_dir = NULL;  /* directory for all npy outputs */
+    const char *npy_dir = NULL;
+    const char *resize_mode = NULL;
     int device_id = 0;
     int verbose = 1;
-    int output_flags = DA3_OUTPUT_DEPTH;  /* default: depth only */
+    int output_flags = DA3_OUTPUT_DEPTH;
 
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_ppm = argv[++i];
+        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) output_pgm = argv[++i];
         else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) device_id = atoi(argv[++i]);
         else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc) verbose = atoi(argv[++i]);
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
         else if (strcmp(argv[i], "--npy-dir") == 0 && i + 1 < argc) npy_dir = argv[++i];
+        else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) resize_mode = argv[++i];
         else if (strcmp(argv[i], "--full") == 0) output_flags = DA3_OUTPUT_ALL;
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
         else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
@@ -265,15 +267,15 @@ int main(int argc, char **argv) {
     /* Prepare input image */
     int img_w, img_h;
     uint8_t *img;
-    if (input_ppm) {
-        img = load_ppm(input_ppm, &img_w, &img_h);
+    if (input_path) {
+        img = img_load_resize(input_path, &img_w, &img_h, resize_mode);
         if (!img) {
-            fprintf(stderr, "Failed to load %s\n", input_ppm);
+            fprintf(stderr, "Failed to load %s\n", input_path);
             cuda_da3_free(gpu);
-            gguf_close(gguf);
+            if (gguf) gguf_close(gguf);
             return 1;
         }
-        fprintf(stderr, "\nInput: %s (%dx%d)\n", input_ppm, img_w, img_h);
+        fprintf(stderr, "\nInput: %s (%dx%d)\n", input_path, img_w, img_h);
     } else {
         img_w = 518; img_h = 518;
         img = generate_gradient(img_w, img_h);

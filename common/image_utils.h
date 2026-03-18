@@ -52,10 +52,32 @@
 extern "C" {
 #endif
 
-/* Load image from any supported format (JPEG, PNG, BMP, PPM, TGA, etc.)
+/* Load image from any supported format (JPEG, PNG, BMP, PPM, TGA, HDR, etc.)
+ * HDR/EXR are auto-tonemapped to uint8 RGB.
  * Returns RGB uint8 array (w * h * 3), or NULL on failure.
  * Caller must free with img_free(). */
 uint8_t *img_load(const char *path, int *width, int *height);
+
+/* Load image as float32 RGB [h][w][3] (HWC layout).
+ * For LDR formats (JPEG/PNG): converts uint8 to [0,1] float.
+ * For HDR/EXR: loads native float values.
+ * Caller must free with img_free(). */
+float *img_load_f32(const char *path, int *width, int *height);
+
+/* Load and optionally resize in one call. resize_mode:
+ *   NULL or "none"      — no resize
+ *   "WxH"  (e.g. "640x480") — resize to exact pixel dimensions
+ *   "N%"   (e.g. "50%")     — scale by percentage
+ *   "Nt"   (e.g. "1369t")   — resize so total patches = N (patch_size=14)
+ * Returns RGB uint8, or NULL on failure. Caller must free. */
+uint8_t *img_load_resize(const char *path, int *width, int *height,
+                         const char *resize_mode);
+
+/* Compute best resolution for a target number of ViT tokens.
+ * Preserves aspect ratio, rounds to patch_size grid.
+ * out_w, out_h: output pixel dimensions. */
+void img_calc_token_size(int src_w, int src_h, int target_tokens,
+                         int patch_size, int *out_w, int *out_h);
 
 /* Bilinear resize with align_corners=True (matches PyTorch F.interpolate).
  * Input/output: RGB uint8 [h][w][3].
@@ -172,6 +194,35 @@ void img_free(void *ptr);
 #include "stb_image_write.h"
 
 uint8_t *img_load(const char *path, int *width, int *height) {
+    /* Try EXR first if tinyexr is available */
+#ifdef TINYEXR_H_
+    {
+        size_t plen = strlen(path);
+        if (plen > 4 && strcmp(path + plen - 4, ".exr") == 0) {
+            float *fdata;
+            int w, h;
+            const char *err = NULL;
+            int ret = LoadEXR(&fdata, &w, &h, path, &err);
+            if (ret == TINYEXR_SUCCESS) {
+                /* EXR loads as RGBA float; convert to uint8 RGB with tonemap */
+                uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+                for (int i = 0; i < w * h; i++) {
+                    for (int c = 0; c < 3; c++) {
+                        float v = fdata[i * 4 + c];
+                        /* Simple Reinhard tonemap + gamma */
+                        v = v / (1.0f + v);
+                        v = powf(v > 0 ? v : 0, 1.0f / 2.2f) * 255.0f + 0.5f;
+                        rgb[i * 3 + c] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+                    }
+                }
+                free(fdata);
+                *width = w; *height = h;
+                return rgb;
+            }
+            if (err) FreeEXRErrorMessage(err);
+        }
+    }
+#endif
     int w, h, channels;
     uint8_t *data = stbi_load(path, &w, &h, &channels, 3); /* force RGB */
     if (!data) {
@@ -184,8 +235,129 @@ uint8_t *img_load(const char *path, int *width, int *height) {
     return data;
 }
 
+float *img_load_f32(const char *path, int *width, int *height) {
+    /* Try EXR first */
+#ifdef TINYEXR_H_
+    {
+        size_t plen = strlen(path);
+        if (plen > 4 && strcmp(path + plen - 4, ".exr") == 0) {
+            float *fdata;
+            int w, h;
+            const char *err = NULL;
+            int ret = LoadEXR(&fdata, &w, &h, path, &err);
+            if (ret == TINYEXR_SUCCESS) {
+                /* EXR loads as RGBA; extract RGB HWC */
+                float *rgb = (float *)malloc((size_t)w * h * 3 * sizeof(float));
+                for (int i = 0; i < w * h; i++) {
+                    rgb[i * 3 + 0] = fdata[i * 4 + 0];
+                    rgb[i * 3 + 1] = fdata[i * 4 + 1];
+                    rgb[i * 3 + 2] = fdata[i * 4 + 2];
+                }
+                free(fdata);
+                *width = w; *height = h;
+                return rgb;
+            }
+            if (err) FreeEXRErrorMessage(err);
+        }
+    }
+#endif
+    /* stbi_loadf handles HDR natively, converts LDR to float [0,1] */
+    int w, h, channels;
+    float *data = stbi_loadf(path, &w, &h, &channels, 3);
+    if (!data) {
+        fprintf(stderr, "img_load_f32: failed to load %s: %s\n",
+                path, stbi_failure_reason());
+        return NULL;
+    }
+    *width = w;
+    *height = h;
+    return data;
+}
+
 void img_free(void *ptr) {
     free(ptr);  /* stbi_load uses malloc, so free() works */
+}
+
+/* ---- Token-based resize calculation ---- */
+
+void img_calc_token_size(int src_w, int src_h, int target_tokens,
+                         int patch_size, int *out_w, int *out_h) {
+    /* Find grid dimensions that give ~target_tokens patches while preserving
+     * aspect ratio. grid_w * grid_h ≈ target_tokens. */
+    float aspect = (float)src_w / (float)src_h;
+    /* grid_h * (grid_h * aspect) = target_tokens → grid_h = sqrt(target_tokens / aspect) */
+    float gh = sqrtf((float)target_tokens / aspect);
+    float gw = gh * aspect;
+    int grid_h = (int)(gh + 0.5f);
+    int grid_w = (int)(gw + 0.5f);
+    if (grid_h < 1) grid_h = 1;
+    if (grid_w < 1) grid_w = 1;
+    /* Adjust to get closer to target */
+    while (grid_w * grid_h < target_tokens && grid_w * grid_h < target_tokens * 2) {
+        if ((float)(grid_w + 1) / grid_h < aspect * 1.1f) grid_w++;
+        else grid_h++;
+        if (grid_w * grid_h >= target_tokens) break;
+    }
+    *out_w = grid_w * patch_size;
+    *out_h = grid_h * patch_size;
+}
+
+/* ---- Load + resize ---- */
+
+uint8_t *img_load_resize(const char *path, int *width, int *height,
+                         const char *resize_mode) {
+    int w, h;
+    uint8_t *img = img_load(path, &w, &h);
+    if (!img) return NULL;
+
+    if (!resize_mode || strcmp(resize_mode, "none") == 0) {
+        *width = w; *height = h;
+        return img;
+    }
+
+    int dst_w = w, dst_h = h;
+
+    /* Parse resize mode */
+    int len = (int)strlen(resize_mode);
+    if (len > 1 && resize_mode[len - 1] == '%') {
+        /* Percentage: "50%" */
+        float pct = (float)atof(resize_mode) / 100.0f;
+        dst_w = (int)(w * pct + 0.5f);
+        dst_h = (int)(h * pct + 0.5f);
+    } else if (len > 1 && (resize_mode[len - 1] == 't' || resize_mode[len - 1] == 'T')) {
+        /* Token count: "1369t" → find best resolution for N tokens */
+        int tokens = atoi(resize_mode);
+        img_calc_token_size(w, h, tokens, 14, &dst_w, &dst_h);
+    } else if (strchr(resize_mode, 'x') || strchr(resize_mode, 'X')) {
+        /* Pixel dimensions: "640x480" */
+        if (sscanf(resize_mode, "%dx%d", &dst_w, &dst_h) != 2 &&
+            sscanf(resize_mode, "%dX%d", &dst_w, &dst_h) != 2) {
+            fprintf(stderr, "img_load_resize: invalid resize mode: %s\n", resize_mode);
+            *width = w; *height = h;
+            return img;
+        }
+    } else {
+        fprintf(stderr, "img_load_resize: invalid resize mode: %s\n"
+                "  Use: WxH (e.g. 640x480), N%% (e.g. 50%%), or Nt (e.g. 1369t)\n",
+                resize_mode);
+        *width = w; *height = h;
+        return img;
+    }
+
+    if (dst_w < 1) dst_w = 1;
+    if (dst_h < 1) dst_h = 1;
+    if (dst_w == w && dst_h == h) {
+        *width = w; *height = h;
+        return img;
+    }
+
+    fprintf(stderr, "Resizing: %dx%d → %dx%d\n", w, h, dst_w, dst_h);
+    uint8_t *resized = img_resize_ac(img, w, h, dst_w, dst_h);
+    free(img);
+    if (!resized) return NULL;
+    *width = dst_w;
+    *height = dst_h;
+    return resized;
 }
 
 /* ---- Bilinear resize with align_corners=True ----
