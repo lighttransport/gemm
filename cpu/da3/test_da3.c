@@ -152,23 +152,26 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --rays          Enable rays output\n");
         fprintf(stderr, "  --gaussians     Enable gaussians output\n");
         fprintf(stderr, "  --npy <path>    Save raw depth as NumPy .npy file\n");
+        fprintf(stderr, "  --resize <mode> Resize input: WxH, N%%, or Nt (tokens, patch=14)\n");
         return 1;
     }
 
     const char *model_path = argv[1];
     int n_threads = 4;
-    const char *input_ppm = NULL;
+    const char *input_path = NULL;
     const char *output_path = NULL;
     const char *config_path = NULL;
     const char *npy_path = NULL;
+    const char *resize_mode = NULL;
     int output_flags = DA3_OUTPUT_DEPTH;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_ppm = argv[++i];
+        else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) output_path = argv[++i];
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) config_path = argv[++i];
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
+        else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) resize_mode = argv[++i];
         else if (strcmp(argv[i], "--full") == 0) output_flags = DA3_OUTPUT_ALL;
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
         else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
@@ -207,10 +210,10 @@ int main(int argc, char **argv) {
     /* Prepare input image */
     int img_w, img_h;
     uint8_t *img;
-    if (input_ppm) {
-        img = load_ppm(input_ppm, &img_w, &img_h);
-        if (!img) { fprintf(stderr, "Failed to load %s\n", input_ppm); da3_free(model); if (gguf) gguf_close(gguf); return 1; }
-        fprintf(stderr, "Input: %s (%dx%d)\n", input_ppm, img_w, img_h);
+    if (input_path) {
+        img = img_load_resize(input_path, &img_w, &img_h, resize_mode);
+        if (!img) { fprintf(stderr, "Failed to load %s\n", input_path); da3_free(model); if (gguf) gguf_close(gguf); return 1; }
+        fprintf(stderr, "Input: %s (%dx%d)\n", input_path, img_w, img_h);
     } else {
         img_w = 518; img_h = 518;
         img = generate_gradient(img_w, img_h);
