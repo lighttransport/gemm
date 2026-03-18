@@ -13,6 +13,9 @@
 #include "../../common/ggml_dequant.h"
 #include "../../common/pixel_perfect_depth.h"
 
+#define IMAGE_UTILS_IMPLEMENTATION
+#include "image_utils.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,8 +115,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Write output */
-    write_pgm16(output, res.depth, res.width, res.height);
+    /* Write output — PGM + auto-export falsecolor PNG */
+    img_write_pgm16(output, res.depth, res.width, res.height);
+    {
+        char base[512];
+        strncpy(base, output, sizeof(base) - 1);
+        base[sizeof(base) - 1] = '\0';
+        char *dot = strrchr(base, '.');
+        if (dot) *dot = '\0';
+        char fpath[512];
+        snprintf(fpath, sizeof(fpath), "%s_falsecolor.png", base);
+        img_write_depth_png(fpath, res.depth, res.width, res.height);
+    }
 
     /* Compute stats */
     float sum = 0, mn = res.depth[0], mx = res.depth[0];
