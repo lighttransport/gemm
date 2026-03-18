@@ -99,6 +99,10 @@ static void write_npy_f32_1d(const char *path, const float *data, int n) {
 #define EXR_WRITER_IMPLEMENTATION
 #include "../../common/exr_writer.h"
 
+/* Image utilities (falsecolor depth, PNG/EXR export) */
+#define IMAGE_UTILS_IMPLEMENTATION
+#include "../../common/image_utils.h"
+
 /* CUDA DA3 runner */
 #include "cuda_da3_runner.h"
 
@@ -333,6 +337,7 @@ int main(int argc, char **argv) {
         if (output_pgm && result.depth) {
             size_t olen = strlen(output_pgm);
             int is_exr = (olen > 4 && strcmp(output_pgm + olen - 4, ".exr") == 0);
+            int is_png = (olen > 4 && strcmp(output_pgm + olen - 4, ".png") == 0);
             if (is_exr) {
                 if (output_flags != DA3_OUTPUT_DEPTH) {
                     write_exr_full(output_pgm, &result, result.width, result.height);
@@ -340,15 +345,29 @@ int main(int argc, char **argv) {
                     write_exr_depth(output_pgm, result.depth, result.confidence,
                                     result.width, result.height);
                 }
+            } else if (is_png) {
+                img_write_depth_png(output_pgm, result.depth, result.width, result.height);
             } else {
                 /* PGM: normalized 16-bit depth */
-                float range = dmax - dmin;
-                if (range < 1e-6f) range = 1.0f;
-                float *normalized = (float *)malloc((size_t)npix * sizeof(float));
-                for (int i = 0; i < npix; i++)
-                    normalized[i] = (result.depth[i] - dmin) / range * 65535.0f;
-                write_pgm16(output_pgm, normalized, result.width, result.height);
-                free(normalized);
+                img_write_pgm16(output_pgm, result.depth, result.width, result.height);
+            }
+            /* Auto-export: falsecolor PNG + fp16 depth EXR alongside */
+            {
+                char base[512];
+                strncpy(base, output_pgm, sizeof(base) - 1);
+                base[sizeof(base) - 1] = '\0';
+                char *dot = strrchr(base, '.');
+                if (dot) *dot = '\0';
+                if (!is_png) {
+                    char fpath[512];
+                    snprintf(fpath, sizeof(fpath), "%s_falsecolor.png", base);
+                    img_write_depth_png(fpath, result.depth, result.width, result.height);
+                }
+                if (!is_exr) {
+                    char fpath[512];
+                    snprintf(fpath, sizeof(fpath), "%s_depth.exr", base);
+                    img_write_depth_exr(fpath, result.depth, result.width, result.height);
+                }
             }
         }
         if (npy_path && result.depth)
