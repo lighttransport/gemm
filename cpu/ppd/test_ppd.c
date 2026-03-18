@@ -75,6 +75,7 @@ static void write_pgm16(const char *path, const float *depth, int w, int h) {
 int main(int argc, char **argv) {
     const char *ppd_path = NULL, *sem_path = NULL;
     const char *input = NULL, *output = "depth_cpu.pgm";
+    const char *resize_mode = NULL;
     int n_threads = 4, verbose = 0;
 
     /* Parse positional args: ppd.pth sem.pth */
@@ -83,6 +84,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) { input = argv[++i]; }
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { output = argv[++i]; }
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) { n_threads = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) { resize_mode = argv[++i]; }
         else if (strcmp(argv[i], "-v") == 0) { verbose++; }
         else if (argv[i][0] != '-') {
             if (pos == 0) ppd_path = argv[i];
@@ -92,14 +94,14 @@ int main(int argc, char **argv) {
     }
 
     if (!ppd_path || !sem_path || !input) {
-        fprintf(stderr, "Usage: %s <ppd.pth> <da2.pth> -i input.ppm [-o output.pgm] [-t threads] [-v]\n",
-                argv[0]);
+        fprintf(stderr, "Usage: %s <ppd.pth> <da2.pth> -i input.jpg [-o output.pgm] [-t threads]\n"
+                "       [--resize WxH|N%%|Nt] [-v]\n", argv[0]);
         return 1;
     }
 
-    /* Load image */
+    /* Load image (supports JPEG, PNG, BMP, HDR, PPM, etc.) */
     int w, h;
-    uint8_t *rgb = read_ppm(input, &w, &h);
+    uint8_t *rgb = img_load_resize(input, &w, &h, resize_mode);
     if (!rgb) return 1;
     fprintf(stderr, "input: %s (%dx%d)\n", input, w, h);
 
