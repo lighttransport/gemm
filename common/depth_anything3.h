@@ -131,6 +131,7 @@ typedef struct {
 
     qtensor patch_embed_w, patch_embed_b;
     qtensor cls_token, pos_embed;
+    qtensor camera_token;  /* [2, dim] — injected at CLS position at rope_start layer */
 
     da3_block *blocks;
     da3_dpt_head head;
@@ -581,49 +582,67 @@ static void da3_rcu(float *out, const float *x, const float *c1w, const float *c
 /* ---- RefineNet fusion block ---- */
 
 static float *da3_refinenet(const da3_dpt_head *head, int stage,
-                             const float *feat, int fH, int fW,
+                             const float *lateral, int lH, int lW,
                              const float *deeper, int dH, int dW,
-                             int features) {
-    int sz = features * fH * fW;
-    float *output = (float *)malloc((size_t)sz * sizeof(float));
-    memcpy(output, feat, (size_t)sz * sizeof(float));
+                             int features, int out_h, int out_w) {
+    int sz = features * lH * lW;
 
-    /* If deeper input exists, upsample and add (with optional RCU1) */
+    /* Default out_h/out_w: 2x lateral size (for level 0) */
+    if (out_h == 0) { out_h = lH * 2; out_w = lW * 2; }
+
+    float *output = (float *)malloc((size_t)sz * sizeof(float));
+
     if (deeper) {
-        float *up = (float *)malloc((size_t)sz * sizeof(float));
-        da3_bilinear(up, deeper, features, dH, dW, fH, fW);
+        /* Top branch = deeper, upsampled to lateral's spatial size */
+        if (dH != lH || dW != lW) {
+            da3_bilinear(output, deeper, features, dH, dW, lH, lW);
+        } else {
+            memcpy(output, deeper, (size_t)sz * sizeof(float));
+        }
+        /* Add RCU1(lateral) — official: y = y + resConfUnit1(lateral) */
         if (head->fuse_rcu1_c1_w[stage].data) {
             float *c1w = da3_dequant(&head->fuse_rcu1_c1_w[stage]);
             float *c1b = da3_dequant(&head->fuse_rcu1_c1_b[stage]);
             float *c2w = da3_dequant(&head->fuse_rcu1_c2_w[stage]);
             float *c2b = da3_dequant(&head->fuse_rcu1_c2_b[stage]);
             float *rcu_out = (float *)malloc((size_t)sz * sizeof(float));
-            da3_rcu(rcu_out, up, c1w, c1b, c2w, c2b, features, fH, fW);
+            da3_rcu(rcu_out, lateral, c1w, c1b, c2w, c2b, features, lH, lW);
             for (int i = 0; i < sz; i++) output[i] += rcu_out[i];
             free(rcu_out); free(c1w); free(c1b); free(c2w); free(c2b);
         } else {
-            for (int i = 0; i < sz; i++) output[i] += up[i];
+            for (int i = 0; i < sz; i++) output[i] += lateral[i];
         }
-        free(up);
+    } else {
+        /* Deepest level: no deeper input, just use lateral */
+        memcpy(output, lateral, (size_t)sz * sizeof(float));
     }
 
-    /* RCU2 (if weights exist) */
+    /* RCU2 */
     if (head->fuse_rcu2_c1_w[stage].data) {
         float *c1w = da3_dequant(&head->fuse_rcu2_c1_w[stage]);
         float *c1b = da3_dequant(&head->fuse_rcu2_c1_b[stage]);
         float *c2w = da3_dequant(&head->fuse_rcu2_c2_w[stage]);
         float *c2b = da3_dequant(&head->fuse_rcu2_c2_b[stage]);
         float *rcu_out = (float *)malloc((size_t)sz * sizeof(float));
-        da3_rcu(rcu_out, output, c1w, c1b, c2w, c2b, features, fH, fW);
+        da3_rcu(rcu_out, output, c1w, c1b, c2w, c2b, features, lH, lW);
         memcpy(output, rcu_out, (size_t)sz * sizeof(float));
         free(rcu_out); free(c1w); free(c1b); free(c2w); free(c2b);
     }
 
-    /* out_conv: 1x1 */
+    /* Upsample BEFORE out_conv (matching official FeatureFusionBlock) */
+    int osz = features * out_h * out_w;
+    if (out_h != lH || out_w != lW) {
+        float *up = (float *)malloc((size_t)osz * sizeof(float));
+        da3_bilinear(up, output, features, lH, lW, out_h, out_w);
+        free(output);
+        output = up;
+    }
+
+    /* out_conv: 1x1 at output resolution */
     float *ow = da3_dequant(&head->fuse_out_w[stage]);
     float *ob = da3_dequant(&head->fuse_out_b[stage]);
-    float *conv_out = (float *)calloc((size_t)sz, sizeof(float));
-    da3_conv2d(conv_out, output, ow, ob, fH, fW, features, features, 1, 1, 1, 0);
+    float *conv_out = (float *)calloc((size_t)osz, sizeof(float));
+    da3_conv2d(conv_out, output, ow, ob, out_h, out_w, features, features, 1, 1, 1, 0);
     free(output); free(ow); free(ob);
     return conv_out;
 }
@@ -1204,6 +1223,7 @@ static int da3s_map_name(const char *st_name, char *gg_name, int gg_size) {
     /* Backbone tensors */
     if (strcmp(s, "cls_token") == 0) { snprintf(gg_name, gg_size, "da3.cls_token"); return 1; }
     if (strcmp(s, "pos_embed") == 0) { snprintf(gg_name, gg_size, "da3.pos_embed"); return 1; }
+    if (strcmp(s, "camera_token") == 0) { snprintf(gg_name, gg_size, "da3.camera_token"); return 1; }
     if (strcmp(s, "patch_embed.proj.weight") == 0) { snprintf(gg_name, gg_size, "da3.patch_embed.weight"); return 1; }
     if (strcmp(s, "patch_embed.proj.bias") == 0)   { snprintf(gg_name, gg_size, "da3.patch_embed.bias"); return 1; }
     if (strcmp(s, "norm.weight") == 0) { snprintf(gg_name, gg_size, "da3.backbone_norm.weight"); return 1; }
@@ -1424,6 +1444,7 @@ da3_model *da3_load_safetensors(const char *st_path, const char *config_path) {
     /* Load embeddings */
     m->cls_token     = da3s_find(st, map, map_count, "da3.cls_token");
     m->pos_embed     = da3s_find(st, map, map_count, "da3.pos_embed");
+    m->camera_token  = da3s_find(st, map, map_count, "da3.camera_token");
     m->patch_embed_w = da3s_find(st, map, map_count, "da3.patch_embed.weight");
     m->patch_embed_b = da3s_find(st, map, map_count, "da3.patch_embed.bias");
 
@@ -1882,12 +1903,20 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         free(pe);
     }
 
-    /* Build position arrays for RoPE 2D (CLS=0, patches use grid coords) */
+    /* Build position arrays for RoPE 2D */
+    /* Local blocks: CLS=(0,0), patches at (y+1, x+1) where y,x in 0..grid-1 */
     int *pos_y = (int *)calloc((size_t)nt, sizeof(int));
     int *pos_x = (int *)calloc((size_t)nt, sizeof(int));
     for (int p = 0; p < np; p++) {
-        pos_y[1 + p] = p / gw;
-        pos_x[1 + p] = p % gw;
+        pos_y[1 + p] = p / gw + 1;
+        pos_x[1 + p] = p % gw + 1;
+    }
+    /* Global blocks: CLS=(0,0), all patches at (1,1) (pos_nodiff) */
+    int *pos_y_nd = (int *)calloc((size_t)nt, sizeof(int));
+    int *pos_x_nd = (int *)calloc((size_t)nt, sizeof(int));
+    for (int p = 0; p < np; p++) {
+        pos_y_nd[1 + p] = 1;
+        pos_x_nd[1 + p] = 1;
     }
 
     /* ─── Step 4: Transformer blocks ─── */
@@ -1902,8 +1931,20 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
     /* Saved features for DPT head (4 layers) */
     float *features[4] = {NULL, NULL, NULL, NULL};
 
+    /* cat_token: track local_hidden (output of most recent local-attention block) */
+    float *local_hidden = (float *)malloc((size_t)nt * dim * sizeof(float));
+    memcpy(local_hidden, hidden, (size_t)nt * dim * sizeof(float));
+
     for (int L = 0; L < m->n_blocks; L++) {
         da3_block *blk = &m->blocks[L];
+
+        /* Camera token injection: replace CLS (token 0) at rope_start layer */
+        if (L == m->rope_start_layer && m->camera_token.data) {
+            float *cam = da3_dequant(&m->camera_token);
+            /* camera_token shape [2, dim], use index 0 for single-view */
+            memcpy(hidden, cam, (size_t)dim * sizeof(float));
+            free(cam);
+        }
 
         /* LayerNorm 1 */
         da3_layernorm_batch(ln_buf, hidden, &blk->ln1_w, &blk->ln1_b,
@@ -1936,18 +1977,21 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
 
         /* RoPE 2D (layers >= rope_start_layer, applied to Q and K in qkv) */
         if (L >= m->rope_start_layer) {
-            /* Apply RoPE to Q (patch tokens only, skip CLS) */
+            /* Select positions: local blocks use real grid, global blocks use pos_nodiff */
+            int is_global = (L >= m->rope_start_layer && (L % 2) == 1);
+            const int *use_py = is_global ? pos_y_nd : pos_y;
+            const int *use_px = is_global ? pos_x_nd : pos_x;
+
             float *q_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             float *k_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             for (int t = 0; t < nt; t++) {
                 memcpy(q_flat + t * dim, qkv + t * 3 * dim, (size_t)dim * sizeof(float));
                 memcpy(k_flat + t * dim, qkv + t * 3 * dim + dim, (size_t)dim * sizeof(float));
             }
-            /* Only apply to patch tokens (1..nt-1), leave CLS unchanged */
-            da3_rope_2d_batch(q_flat + dim, np, m->n_heads, m->head_dim,
-                              pos_y + 1, pos_x + 1, 10000.0f);
-            da3_rope_2d_batch(k_flat + dim, np, m->n_heads, m->head_dim,
-                              pos_y + 1, pos_x + 1, 10000.0f);
+            da3_rope_2d_batch(q_flat, nt, m->n_heads, m->head_dim,
+                              use_py, use_px, 100.0f);
+            da3_rope_2d_batch(k_flat, nt, m->n_heads, m->head_dim,
+                              use_py, use_px, 100.0f);
             for (int t = 0; t < nt; t++) {
                 memcpy(qkv + t * 3 * dim, q_flat + t * dim, (size_t)dim * sizeof(float));
                 memcpy(qkv + t * 3 * dim + dim, k_flat + t * dim, (size_t)dim * sizeof(float));
@@ -2012,18 +2056,28 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         for (int i = 0; i < nt * dim; i++) hidden[i] += ffn_out[i];
         free(ffn_out);
 
-        /* Save features if this is a feature layer */
+        /* Update local_hidden after each local block */
+        {
+            int is_global = (L >= m->rope_start_layer && (L % 2) == 1);
+            if (!is_global)
+                memcpy(local_hidden, hidden, (size_t)nt * dim * sizeof(float));
+        }
+
+        /* Save features with cat_token: [local_hidden, hidden] per token */
         for (int fi = 0; fi < 4; fi++) {
             if (L == m->feature_layers[fi]) {
-                features[fi] = (float *)malloc((size_t)nt * dim * sizeof(float));
-                memcpy(features[fi], hidden, (size_t)nt * dim * sizeof(float));
+                features[fi] = (float *)malloc((size_t)nt * 2 * dim * sizeof(float));
+                for (int t = 0; t < nt; t++) {
+                    memcpy(features[fi] + t * 2 * dim, local_hidden + t * dim, (size_t)dim * sizeof(float));
+                    memcpy(features[fi] + t * 2 * dim + dim, hidden + t * dim, (size_t)dim * sizeof(float));
+                }
             }
         }
 
     }
 
-    free(hidden); free(ln_buf); free(qkv); free(attn_out);
-    free(ffn_buf); free(ffn_mid); free(pos_y); free(pos_x);
+    free(hidden); free(local_hidden); free(ln_buf); free(qkv); free(attn_out);
+    free(ffn_buf); free(ffn_mid); free(pos_y); free(pos_x); free(pos_y_nd); free(pos_x_nd);
     double t_dpt = da3_time_ms();
     fprintf(stderr, "da3: preprocess+embed %.1f ms, backbone %.1f ms (%d threads)\n",
             t_backbone - t_start, t_dpt - t_backbone, n_threads);
@@ -2045,14 +2099,29 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         if (!features[fi]) continue;
         int oc = m->head_out_channels[fi];
 
-        /* Extract patch tokens + concat CLS */
+        /* cat_token=True: features stored as [local_x, x] per token (2*dim each).
+         * Official output: [local_x_raw, backbone_norm(x)] for patches. */
         float *cat = (float *)malloc((size_t)np * head_dim_in * sizeof(float));
-        float *cls_vec = features[fi]; /* CLS at index 0 */
+        /* First half: local_x patches (as-is) */
+        float *x_patches = (float *)malloc((size_t)np * dim * sizeof(float));
         for (int p = 0; p < np; p++) {
-            float *dst = cat + p * head_dim_in;
-            memcpy(dst, features[fi] + (1 + p) * dim, (size_t)dim * sizeof(float));
-            memcpy(dst + dim, cls_vec, (size_t)dim * sizeof(float));
+            memcpy(cat + p * head_dim_in,
+                   features[fi] + (1 + p) * head_dim_in, (size_t)dim * sizeof(float));
+            memcpy(x_patches + p * dim,
+                   features[fi] + (1 + p) * head_dim_in + dim, (size_t)dim * sizeof(float));
         }
+        /* Second half: backbone_norm(x patches) */
+        {
+            float *normed_patches = (float *)malloc((size_t)np * dim * sizeof(float));
+            da3_layernorm_batch(normed_patches, x_patches,
+                                &m->backbone_norm_w, &m->backbone_norm_b,
+                                np, dim, m->ln_eps);
+            for (int p = 0; p < np; p++)
+                memcpy(cat + p * head_dim_in + dim,
+                       normed_patches + p * dim, (size_t)dim * sizeof(float));
+            free(normed_patches);
+        }
+        free(x_patches);
 
         /* Apply head norm */
         if (m->head.norm_w.data) {
@@ -2118,50 +2187,92 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         free(spatial[fi]); spatial[fi] = NULL;
     }
 
-    /* 5c: Bottom-up fusion */
-    /* Level 3 (deepest) */
+    /* 5c: Bottom-up fusion (matching official: refinenet4→3→2→1) */
     float *fused = da3_refinenet(&m->head, 3, adapted[3], ad_h[3], ad_w[3],
-                                  NULL, 0, 0, feat);
+                                  NULL, 0, 0, feat, ad_h[2], ad_w[2]);
     free(adapted[3]);
-    int fh = ad_h[3], fw = ad_w[3];
+    int fh = ad_h[2], fw = ad_w[2];
 
-    /* Level 2 */
     float *fused2 = da3_refinenet(&m->head, 2, adapted[2], ad_h[2], ad_w[2],
-                                   fused, fh, fw, feat);
+                                   fused, fh, fw, feat, ad_h[1], ad_w[1]);
     free(adapted[2]); free(fused);
-    fh = ad_h[2]; fw = ad_w[2]; fused = fused2;
-
-    /* Level 1 */
-    fused2 = da3_refinenet(&m->head, 1, adapted[1], ad_h[1], ad_w[1],
-                            fused, fh, fw, feat);
-    free(adapted[1]); free(fused);
     fh = ad_h[1]; fw = ad_w[1]; fused = fused2;
 
-    /* Level 0 */
-    fused2 = da3_refinenet(&m->head, 0, adapted[0], ad_h[0], ad_w[0],
-                            fused, fh, fw, feat);
-    free(adapted[0]); free(fused);
+    fused2 = da3_refinenet(&m->head, 1, adapted[1], ad_h[1], ad_w[1],
+                            fused, fh, fw, feat, ad_h[0], ad_w[0]);
+    free(adapted[1]); free(fused);
     fh = ad_h[0]; fw = ad_w[0]; fused = fused2;
 
-    /* 5d: Output convolutions — derive Co from weight shapes */
+    fused2 = da3_refinenet(&m->head, 0, adapted[0], ad_h[0], ad_w[0],
+                            fused, fh, fw, feat, 0, 0);
+    free(adapted[0]); free(fused);
+    fh = ad_h[0] * 2; fw = ad_w[0] * 2;  /* 296x296 */
+    fused = fused2;
+
+    /* 5d: Output convolutions — matching official DA3 DualDPT._forward_impl:
+     * 1. output_conv1 (neck): Conv2d(feat, feat/2, 3x3) — NO ReLU
+     * 2. Bilinear upsample from fused res (296) to model res (518)
+     * 3. Sinusoidal UV pos_embed (ratio=0.1)
+     * 4. output_conv2: Conv2d(feat/2, feat/2, 3x3) + ReLU + Conv2d(feat/2, 2, 1x1)
+     * 5. depth_activation: exp(depth), exp(conf)+1 */
     int neck_Co = m->head.neck_w.n_rows;   /* e.g. 32 (small) or 64 (base) */
     int nh, nw;
     float *neck_out = da3_conv2d_qt(fused, &m->head.neck_w, &m->head.neck_b,
                                      fh, fw, feat, neck_Co, 3, 3, 1, 1, &nh, &nw);
     free(fused);
-    for (int i = 0; i < neck_Co * nh * nw; i++)
-        neck_out[i] = neck_out[i] > 0 ? neck_out[i] : 0.0f;
+    /* NO ReLU on neck (official DA3) */
 
-    int out0_Co = m->head.out_0_w.n_rows;  /* e.g. 32 (both small and base) */
-    int o0h, o0w;
-    float *out0 = da3_conv2d_qt(neck_out, &m->head.out_0_w, &m->head.out_0_b,
-                                 nh, nw, neck_Co, out0_Co, 3, 3, 1, 1, &o0h, &o0w);
+    /* Bilinear upsample from fused res to model res (296→518) */
+    int full_h = m->image_size, full_w = m->image_size;
+    float *neck_up = (float *)malloc((size_t)neck_Co * full_h * full_w * sizeof(float));
+    da3_bilinear(neck_up, neck_out, neck_Co, nh, nw, full_h, full_w);
     free(neck_out);
 
-    /* ReLU */
+    /* Sinusoidal UV positional embedding (ratio=0.1, omega_0=100) */
+    {
+        float aspect = (float)full_w / (float)full_h;
+        float ratio = 0.1f;
+        float diag = sqrtf(aspect * aspect + 1.0f);
+        float span_x = aspect / diag;
+        float span_y = 1.0f / diag;
+        int quarter = neck_Co / 4;
+        for (int c = 0; c < neck_Co; c++) {
+            int band, is_cos;
+            float (*coord_fn)(int, int);  (void)coord_fn;
+            float coord_is_u;
+            if (c < quarter) {
+                band = c; coord_is_u = 1; is_cos = 0;
+            } else if (c < 2 * quarter) {
+                band = c - quarter; coord_is_u = 1; is_cos = 1;
+            } else if (c < 3 * quarter) {
+                band = c - 2 * quarter; coord_is_u = 0; is_cos = 0;
+            } else {
+                band = c - 3 * quarter; coord_is_u = 0; is_cos = 1;
+            }
+            float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);
+            for (int h = 0; h < full_h; h++) {
+                for (int w = 0; w < full_w; w++) {
+                    float u = (full_w > 1) ? span_x * (2.0f * w - (full_w - 1)) / (float)full_w : 0.0f;
+                    float v = (full_h > 1) ? span_y * (2.0f * h - (full_h - 1)) / (float)full_h : 0.0f;
+                    float coord = coord_is_u ? u : v;
+                    float angle = coord * omega;
+                    float emb = is_cos ? cosf(angle) : sinf(angle);
+                    neck_up[c * full_h * full_w + h * full_w + w] += emb * ratio;
+                }
+            }
+        }
+    }
+
+    /* output_conv2[0]: Conv2d(neck_Co, out0_Co, 3x3) + ReLU */
+    int out0_Co = m->head.out_0_w.n_rows;
+    int o0h, o0w;
+    float *out0 = da3_conv2d_qt(neck_up, &m->head.out_0_w, &m->head.out_0_b,
+                                 full_h, full_w, neck_Co, out0_Co, 3, 3, 1, 1, &o0h, &o0w);
+    free(neck_up);
     for (int i = 0; i < out0_Co * o0h * o0w; i++)
         out0[i] = out0[i] > 0 ? out0[i] : 0.0f;
 
+    /* output_conv2[1]: Conv2d(out0_Co, output_dim, 1x1) */
     int out_dim = m->head.out_2_w.n_rows;  /* 2 */
     int oh, ow;
     float *out2 = da3_conv2d_qt(out0, &m->head.out_2_w, &m->head.out_2_b,
@@ -2174,17 +2285,14 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
     result.depth = (float *)malloc((size_t)img_w * img_h * sizeof(float));
     result.confidence = (float *)malloc((size_t)img_w * img_h * sizeof(float));
 
-    /* Separate depth (channel 0) and confidence (channel 1) */
-    float *depth_small = out2;                       /* [oh, ow] */
-    float *conf_small  = out2 + oh * ow;             /* [oh, ow] */
+    float *depth_small = out2;
+    float *conf_small  = out2 + oh * ow;
 
-    /* Apply activations: exp(depth), expp1(confidence) */
     for (int i = 0; i < oh * ow; i++) {
         depth_small[i] = expf(depth_small[i]);
         conf_small[i] = expf(conf_small[i]) + 1.0f;
     }
 
-    /* Bilinear upsample to original resolution */
     da3_bilinear(result.depth, depth_small, 1, oh, ow, img_h, img_w);
     da3_bilinear(result.confidence, conf_small, 1, oh, ow, img_h, img_w);
 
@@ -2236,34 +2344,40 @@ static void da3_channel_layernorm(float *dst, const float *src, const qtensor *w
 /* RefineNet with explicit weight pointers (for aux/gsdpt branches)     */
 /* ==================================================================== */
 
-static float *da3_refinenet_w(const float *feat, int fH, int fW,
+static float *da3_refinenet_w(const float *lateral, int lH, int lW,
                                 const float *deeper, int dH, int dW,
                                 int features,
                                 const qtensor *out_w, const qtensor *out_b,
                                 const qtensor *rcu1_c1_w, const qtensor *rcu1_c1_b,
                                 const qtensor *rcu1_c2_w, const qtensor *rcu1_c2_b,
                                 const qtensor *rcu2_c1_w, const qtensor *rcu2_c1_b,
-                                const qtensor *rcu2_c2_w, const qtensor *rcu2_c2_b) {
-    int sz = features * fH * fW;
+                                const qtensor *rcu2_c2_w, const qtensor *rcu2_c2_b,
+                                int out_h, int out_w_) {
+    int sz = features * lH * lW;
+    if (out_h == 0) { out_h = lH * 2; out_w_ = lW * 2; }
+
     float *output = (float *)malloc((size_t)sz * sizeof(float));
-    memcpy(output, feat, (size_t)sz * sizeof(float));
 
     if (deeper) {
-        float *up = (float *)malloc((size_t)sz * sizeof(float));
-        da3_bilinear(up, deeper, features, dH, dW, fH, fW);
+        if (dH != lH || dW != lW)
+            da3_bilinear(output, deeper, features, dH, dW, lH, lW);
+        else
+            memcpy(output, deeper, (size_t)sz * sizeof(float));
+        /* Add RCU1(lateral) */
         if (rcu1_c1_w && rcu1_c1_w->data) {
             float *c1w = da3_dequant(rcu1_c1_w);
             float *c1b = da3_dequant(rcu1_c1_b);
             float *c2w = da3_dequant(rcu1_c2_w);
             float *c2b = da3_dequant(rcu1_c2_b);
             float *rcu_out = (float *)malloc((size_t)sz * sizeof(float));
-            da3_rcu(rcu_out, up, c1w, c1b, c2w, c2b, features, fH, fW);
+            da3_rcu(rcu_out, lateral, c1w, c1b, c2w, c2b, features, lH, lW);
             for (int i = 0; i < sz; i++) output[i] += rcu_out[i];
             free(rcu_out); free(c1w); free(c1b); free(c2w); free(c2b);
         } else {
-            for (int i = 0; i < sz; i++) output[i] += up[i];
+            for (int i = 0; i < sz; i++) output[i] += lateral[i];
         }
-        free(up);
+    } else {
+        memcpy(output, lateral, (size_t)sz * sizeof(float));
     }
 
     if (rcu2_c1_w && rcu2_c1_w->data) {
@@ -2272,15 +2386,24 @@ static float *da3_refinenet_w(const float *feat, int fH, int fW,
         float *c2w = da3_dequant(rcu2_c2_w);
         float *c2b = da3_dequant(rcu2_c2_b);
         float *rcu_out = (float *)malloc((size_t)sz * sizeof(float));
-        da3_rcu(rcu_out, output, c1w, c1b, c2w, c2b, features, fH, fW);
+        da3_rcu(rcu_out, output, c1w, c1b, c2w, c2b, features, lH, lW);
         memcpy(output, rcu_out, (size_t)sz * sizeof(float));
         free(rcu_out); free(c1w); free(c1b); free(c2w); free(c2b);
     }
 
+    /* Upsample before out_conv */
+    int osz = features * out_h * out_w_;
+    if (out_h != lH || out_w_ != lW) {
+        float *up = (float *)malloc((size_t)osz * sizeof(float));
+        da3_bilinear(up, output, features, lH, lW, out_h, out_w_);
+        free(output);
+        output = up;
+    }
+
     float *ow_f = da3_dequant(out_w);
     float *ob_f = da3_dequant(out_b);
-    float *conv_out = (float *)calloc((size_t)sz, sizeof(float));
-    da3_conv2d(conv_out, output, ow_f, ob_f, fH, fW, features, features, 1, 1, 1, 0);
+    float *conv_out = (float *)calloc((size_t)osz, sizeof(float));
+    da3_conv2d(conv_out, output, ow_f, ob_f, out_h, out_w_, features, features, 1, 1, 1, 0);
     free(output); free(ow_f); free(ob_f);
     return conv_out;
 }
@@ -2371,18 +2494,23 @@ static void da3_run_aux_dpt(da3_model *m, float **adapted, int *ad_h, int *ad_w,
                                      &ah->fuse_rcu1_c1_w[3], &ah->fuse_rcu1_c1_b[3],
                                      &ah->fuse_rcu1_c2_w[3], &ah->fuse_rcu1_c2_b[3],
                                      &ah->fuse_rcu2_c1_w[3], &ah->fuse_rcu2_c1_b[3],
-                                     &ah->fuse_rcu2_c2_w[3], &ah->fuse_rcu2_c2_b[3]);
-    int fh = ad_h[3], fw = ad_w[3];
+                                     &ah->fuse_rcu2_c2_w[3], &ah->fuse_rcu2_c2_b[3],
+                                     ad_h[2], ad_w[2]);
+    int fh = ad_h[2], fw = ad_w[2];
 
     for (int lv = 2; lv >= 0; lv--) {
+        int tgt_h = (lv > 0) ? ad_h[lv-1] : 0;
+        int tgt_w = (lv > 0) ? ad_w[lv-1] : 0;
         float *fused2 = da3_refinenet_w(adapted[lv], ad_h[lv], ad_w[lv], fused, fh, fw, feat,
                                           &ah->fuse_out_w[lv], &ah->fuse_out_b[lv],
                                           &ah->fuse_rcu1_c1_w[lv], &ah->fuse_rcu1_c1_b[lv],
                                           &ah->fuse_rcu1_c2_w[lv], &ah->fuse_rcu1_c2_b[lv],
                                           &ah->fuse_rcu2_c1_w[lv], &ah->fuse_rcu2_c1_b[lv],
-                                          &ah->fuse_rcu2_c2_w[lv], &ah->fuse_rcu2_c2_b[lv]);
+                                          &ah->fuse_rcu2_c2_w[lv], &ah->fuse_rcu2_c2_b[lv],
+                                          tgt_h, tgt_w);
         free(fused);
-        fh = ad_h[lv]; fw = ad_w[lv];
+        fh = (tgt_h > 0) ? tgt_h : ad_h[lv] * 2;
+        fw = (tgt_w > 0) ? tgt_w : ad_w[lv] * 2;
         fused = fused2;
     }
 
@@ -2507,12 +2635,26 @@ static void da3_run_gsdpt(da3_model *m, const float *img_norm, int target_h, int
         int oc = m->head_out_channels[fi];
 
         float *cat = (float *)malloc((size_t)np * head_dim_in * sizeof(float));
-        float *cls_vec = features[fi];
+        /* cat_token=True: features stored as [local_x, x] per token.
+         * Output: [local_x_raw, backbone_norm(x)] for patches. */
+        float *x_patches = (float *)malloc((size_t)np * dim * sizeof(float));
         for (int p = 0; p < np; p++) {
-            float *dst = cat + p * head_dim_in;
-            memcpy(dst, features[fi] + (1 + p) * dim, (size_t)dim * sizeof(float));
-            memcpy(dst + dim, cls_vec, (size_t)dim * sizeof(float));
+            memcpy(cat + p * head_dim_in,
+                   features[fi] + (1 + p) * head_dim_in, (size_t)dim * sizeof(float));
+            memcpy(x_patches + p * dim,
+                   features[fi] + (1 + p) * head_dim_in + dim, (size_t)dim * sizeof(float));
         }
+        {
+            float *normed_patches = (float *)malloc((size_t)np * dim * sizeof(float));
+            da3_layernorm_batch(normed_patches, x_patches,
+                                &m->backbone_norm_w, &m->backbone_norm_b,
+                                np, dim, m->ln_eps);
+            for (int p = 0; p < np; p++)
+                memcpy(cat + p * head_dim_in + dim,
+                       normed_patches + p * dim, (size_t)dim * sizeof(float));
+            free(normed_patches);
+        }
+        free(x_patches);
 
         if (gh->norm_w.data) {
             float *normed = (float *)malloc((size_t)np * head_dim_in * sizeof(float));
@@ -2565,14 +2707,18 @@ static void da3_run_gsdpt(da3_model *m, const float *img_norm, int target_h, int
 
     /* Bottom-up RefineNet fusion */
     float *fused = da3_refinenet(&gs->head, 3, adapted[3], ad_h[3], ad_w[3],
-                                   NULL, 0, 0, feat);
+                                   NULL, 0, 0, feat, ad_h[2], ad_w[2]);
     free(adapted[3]);
-    int fh = ad_h[3], fw = ad_w[3];
+    int fh = ad_h[2], fw = ad_w[2];
     for (int lv = 2; lv >= 0; lv--) {
+        int tgt_h = (lv > 0) ? ad_h[lv-1] : 0;  /* 0 means 2x for level 0 */
+        int tgt_w = (lv > 0) ? ad_w[lv-1] : 0;
         float *fused2 = da3_refinenet(&gs->head, lv, adapted[lv], ad_h[lv], ad_w[lv],
-                                        fused, fh, fw, feat);
+                                        fused, fh, fw, feat, tgt_h, tgt_w);
         free(adapted[lv]); free(fused);
-        fh = ad_h[lv]; fw = ad_w[lv]; fused = fused2;
+        fh = (tgt_h > 0) ? tgt_h : ad_h[lv] * 2;
+        fw = (tgt_w > 0) ? tgt_w : ad_w[lv] * 2;
+        fused = fused2;
     }
     int gs_fh = fh, gs_fw = fw;
 
@@ -2628,11 +2774,27 @@ static void da3_compute_adapted(da3_model *m, float **features, int np, int dim,
         if (!features[fi] || !m->head.proj_w[fi].data) continue;
         int oc = m->head_out_channels[fi];
         float *cat = (float *)malloc((size_t)np * head_dim_in * sizeof(float));
+        /* cat_token=True: features are stored as [local_x, x] per token (each dim wide).
+         * Official: output = [local_x_raw, backbone_norm(x_raw)] for patches.
+         * Skip CLS at position 0, patches start at position 1. */
+        float *x_patches = (float *)malloc((size_t)np * dim * sizeof(float));
         for (int p = 0; p < np; p++) {
-            float *dst = cat + p * head_dim_in;
-            memcpy(dst, features[fi] + (1 + p) * dim, (size_t)dim * sizeof(float));
-            memcpy(dst + dim, features[fi], (size_t)dim * sizeof(float));
+            /* First half of cat: local_x (as-is) */
+            memcpy(cat + p * head_dim_in,
+                   features[fi] + (1 + p) * head_dim_in,
+                   (size_t)dim * sizeof(float));
+            /* Collect x patches for backbone_norm */
+            memcpy(x_patches + p * dim,
+                   features[fi] + (1 + p) * head_dim_in + dim,
+                   (size_t)dim * sizeof(float));
         }
+        /* Second half: backbone_norm(x patches) */
+        float *normed = (float *)malloc((size_t)np * dim * sizeof(float));
+        da3_layernorm_batch(normed, x_patches, &m->backbone_norm_w, &m->backbone_norm_b,
+                           np, dim, m->ln_eps);
+        for (int p = 0; p < np; p++)
+            memcpy(cat + p * head_dim_in + dim, normed + p * dim, (size_t)dim * sizeof(float));
+        free(x_patches); free(normed);
         if (m->head.norm_w.data) {
             float *normed = (float *)malloc((size_t)np * head_dim_in * sizeof(float));
             da3_layernorm_batch(normed, cat, &m->head.norm_w, &m->head.norm_b, np, head_dim_in, m->ln_eps);
@@ -2671,31 +2833,70 @@ __attribute__((noinline))
 static void da3_run_dpt_output(da3_model *m, float **adapted, int *ad_h, int *ad_w,
                                  int feat, int img_w, int img_h,
                                  float **depth_out, float **conf_out) {
-    /* Bottom-up fusion */
-    float *fused = da3_refinenet(&m->head, 3, adapted[3], ad_h[3], ad_w[3], NULL, 0, 0, feat);
+    /* Bottom-up fusion (matching official: refinenet4→3→2→1 with upsample) */
+    float *fused = da3_refinenet(&m->head, 3, adapted[3], ad_h[3], ad_w[3],
+                                   NULL, 0, 0, feat, ad_h[2], ad_w[2]);
     free(adapted[3]); adapted[3] = NULL;
-    int fh = ad_h[3], fw = ad_w[3];
+    int fh = ad_h[2], fw = ad_w[2];
     for (int lv = 2; lv >= 0; lv--) {
-        float *fused2 = da3_refinenet(&m->head, lv, adapted[lv], ad_h[lv], ad_w[lv], fused, fh, fw, feat);
+        int tgt_h = (lv > 0) ? ad_h[lv-1] : 0;
+        int tgt_w = (lv > 0) ? ad_w[lv-1] : 0;
+        float *fused2 = da3_refinenet(&m->head, lv, adapted[lv], ad_h[lv], ad_w[lv],
+                                        fused, fh, fw, feat, tgt_h, tgt_w);
         free(adapted[lv]); adapted[lv] = NULL;
         free(fused);
-        fh = ad_h[lv]; fw = ad_w[lv]; fused = fused2;
+        fh = (tgt_h > 0) ? tgt_h : ad_h[lv] * 2;
+        fw = (tgt_w > 0) ? tgt_w : ad_w[lv] * 2;
+        fused = fused2;
     }
 
-    /* Output convs — derive Co from weight shapes */
+    /* Output convs — matching official DualDPT._forward_impl */
     int neck_Co = m->head.neck_w.n_rows;
     int nh, nw;
     float *neck_out = da3_conv2d_qt(fused, &m->head.neck_w, &m->head.neck_b,
                                       fh, fw, feat, neck_Co, 3, 3, 1, 1, &nh, &nw);
     free(fused);
-    for (int i = 0; i < neck_Co * nh * nw; i++)
-        neck_out[i] = neck_out[i] > 0 ? neck_out[i] : 0.0f;
+    /* NO ReLU on neck (official DA3) */
+
+    /* Bilinear upsample from fused res to model res (296→518) */
+    int full_h = m->image_size, full_w = m->image_size;
+    float *neck_up = (float *)malloc((size_t)neck_Co * full_h * full_w * sizeof(float));
+    da3_bilinear(neck_up, neck_out, neck_Co, nh, nw, full_h, full_w);
+    free(neck_out);
+
+    /* Sinusoidal UV positional embedding (ratio=0.1) */
+    {
+        float aspect = (float)full_w / (float)full_h;
+        float diag = sqrtf(aspect * aspect + 1.0f);
+        float span_x = aspect / diag;
+        float span_y = 1.0f / diag;
+        int quarter = neck_Co / 4;
+        for (int c = 0; c < neck_Co; c++) {
+            int band, is_cos;
+            float coord_is_u;
+            if (c < quarter) { band = c; coord_is_u = 1; is_cos = 0; }
+            else if (c < 2*quarter) { band = c - quarter; coord_is_u = 1; is_cos = 1; }
+            else if (c < 3*quarter) { band = c - 2*quarter; coord_is_u = 0; is_cos = 0; }
+            else { band = c - 3*quarter; coord_is_u = 0; is_cos = 1; }
+            float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);
+            for (int hh = 0; hh < full_h; hh++) {
+                for (int ww = 0; ww < full_w; ww++) {
+                    float u = (full_w > 1) ? span_x * (2.0f * ww - (full_w - 1)) / (float)full_w : 0.0f;
+                    float v = (full_h > 1) ? span_y * (2.0f * hh - (full_h - 1)) / (float)full_h : 0.0f;
+                    float coord = coord_is_u ? u : v;
+                    float angle = coord * omega;
+                    float emb = is_cos ? cosf(angle) : sinf(angle);
+                    neck_up[c * full_h * full_w + hh * full_w + ww] += emb * 0.1f;
+                }
+            }
+        }
+    }
 
     int out0_Co = m->head.out_0_w.n_rows;
     int o0h, o0w;
-    float *out0 = da3_conv2d_qt(neck_out, &m->head.out_0_w, &m->head.out_0_b,
-                                  nh, nw, neck_Co, out0_Co, 3, 3, 1, 1, &o0h, &o0w);
-    free(neck_out);
+    float *out0 = da3_conv2d_qt(neck_up, &m->head.out_0_w, &m->head.out_0_b,
+                                  full_h, full_w, neck_Co, out0_Co, 3, 3, 1, 1, &o0h, &o0w);
+    free(neck_up);
     for (int i = 0; i < out0_Co * o0h * o0w; i++)
         out0[i] = out0[i] > 0 ? out0[i] : 0.0f;
 
@@ -2798,8 +2999,14 @@ static void da3_run_backbone(da3_model *m, const uint8_t *rgb, int img_w, int im
     int *pos_y = (int *)calloc((size_t)nt, sizeof(int));
     int *pos_x = (int *)calloc((size_t)nt, sizeof(int));
     for (int p = 0; p < np; p++) {
-        pos_y[1 + p] = p / gw;
-        pos_x[1 + p] = p % gw;
+        pos_y[1 + p] = p / gw + 1;
+        pos_x[1 + p] = p % gw + 1;
+    }
+    int *pos_y_nd = (int *)calloc((size_t)nt, sizeof(int));
+    int *pos_x_nd = (int *)calloc((size_t)nt, sizeof(int));
+    for (int p = 0; p < np; p++) {
+        pos_y_nd[1 + p] = 1;
+        pos_x_nd[1 + p] = 1;
     }
 
     /* Step 4: Transformer blocks */
@@ -2810,10 +3017,23 @@ static void da3_run_backbone(da3_model *m, const uint8_t *rgb, int img_w, int im
     float *ffn_buf  = (float *)malloc((size_t)nt * ffn_out_dim * sizeof(float));
     float *ffn_mid  = (float *)malloc((size_t)nt * m->ffn_hidden * sizeof(float));
 
+    /* cat_token: track local_hidden (output of most recent local-attention block).
+     * Official DA3 saves features as [local_x, x] concatenated along dim,
+     * NOT [raw_block_output, backbone_norm(raw_block_output)]. */
+    float *local_hidden = (float *)malloc((size_t)nt * dim * sizeof(float));
+    memcpy(local_hidden, hidden, (size_t)nt * dim * sizeof(float));
+
     for (int fi = 0; fi < 4; fi++) features_out[fi] = NULL;
 
     for (int L = 0; L < m->n_blocks; L++) {
         da3_block *blk = &m->blocks[L];
+
+        /* Camera token injection: replace CLS (token 0) at rope_start layer */
+        if (L == m->rope_start_layer && m->camera_token.data) {
+            float *cam = da3_dequant(&m->camera_token);
+            memcpy(hidden, cam, (size_t)dim * sizeof(float));
+            free(cam);
+        }
 
         da3_layernorm_batch(ln_buf, hidden, &blk->ln1_w, &blk->ln1_b, nt, dim, m->ln_eps);
         da3_batch_gemm(qkv, &blk->attn_qkv_w, &blk->attn_qkv_b, ln_buf, nt, 3*dim, dim, n_threads);
@@ -2835,14 +3055,18 @@ static void da3_run_backbone(da3_model *m, const uint8_t *rgb, int img_w, int im
         }
 
         if (L >= m->rope_start_layer) {
+            int is_global = (L >= m->rope_start_layer && (L % 2) == 1);
+            const int *use_py = is_global ? pos_y_nd : pos_y;
+            const int *use_px = is_global ? pos_x_nd : pos_x;
+
             float *q_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             float *k_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             for (int t = 0; t < nt; t++) {
                 memcpy(q_flat + t*dim, qkv + t*3*dim, (size_t)dim * sizeof(float));
                 memcpy(k_flat + t*dim, qkv + t*3*dim + dim, (size_t)dim * sizeof(float));
             }
-            da3_rope_2d_batch(q_flat + dim, np, m->n_heads, m->head_dim, pos_y+1, pos_x+1, 10000.0f);
-            da3_rope_2d_batch(k_flat + dim, np, m->n_heads, m->head_dim, pos_y+1, pos_x+1, 10000.0f);
+            da3_rope_2d_batch(q_flat, nt, m->n_heads, m->head_dim, use_py, use_px, 100.0f);
+            da3_rope_2d_batch(k_flat, nt, m->n_heads, m->head_dim, use_py, use_px, 100.0f);
             for (int t = 0; t < nt; t++) {
                 memcpy(qkv + t*3*dim, q_flat + t*dim, (size_t)dim * sizeof(float));
                 memcpy(qkv + t*3*dim + dim, k_flat + t*dim, (size_t)dim * sizeof(float));
@@ -2888,16 +3112,30 @@ static void da3_run_backbone(da3_model *m, const uint8_t *rgb, int img_w, int im
         for (int i = 0; i < nt * dim; i++) hidden[i] += ffn_out[i];
         free(ffn_out);
 
+        /* Update local_hidden after each local attention block.
+         * Local blocks: L < rope_start OR L%2 == 0 */
+        {
+            int is_global = (L >= m->rope_start_layer && (L % 2) == 1);
+            if (!is_global)
+                memcpy(local_hidden, hidden, (size_t)nt * dim * sizeof(float));
+        }
+
+        /* Save features with cat_token: [local_hidden, hidden] per token.
+         * Each feature array is nt * 2*dim, first dim = local_x, second dim = x. */
         for (int fi = 0; fi < 4; fi++) {
             if (L == m->feature_layers[fi]) {
-                features_out[fi] = (float *)malloc((size_t)nt * dim * sizeof(float));
-                memcpy(features_out[fi], hidden, (size_t)nt * dim * sizeof(float));
+                features_out[fi] = (float *)malloc((size_t)nt * 2 * dim * sizeof(float));
+                for (int t = 0; t < nt; t++) {
+                    memcpy(features_out[fi] + t * 2 * dim, local_hidden + t * dim, (size_t)dim * sizeof(float));
+                    memcpy(features_out[fi] + t * 2 * dim + dim, hidden + t * dim, (size_t)dim * sizeof(float));
+                }
             }
         }
     }
 
     free(ln_buf); free(qkv); free(attn_out); free(ffn_buf); free(ffn_mid);
-    free(pos_y); free(pos_x);
+    free(local_hidden);
+    free(pos_y); free(pos_x); free(pos_y_nd); free(pos_x_nd);
     *hidden_out = hidden;
 }
 
