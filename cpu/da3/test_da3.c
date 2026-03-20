@@ -34,31 +34,45 @@
 #include <time.h>
 #include <stdint.h>
 
-/* Write a float32 array as NumPy .npy format (v1.0) */
-static void write_npy_f32(const char *path, const float *data, int w, int h) {
+/* Write a float32 array as NumPy .npy format (v1.0).
+ * ndim=1: shape=(dims[0],), ndim=2: shape=(dims[0],dims[1]), etc. */
+static void write_npy_f32_nd(const char *path, const float *data, const int *dims, int ndim) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
-    /* NumPy v1.0 format: magic + version + header */
     const char magic[] = "\x93NUMPY";
     fwrite(magic, 1, 6, f);
     uint8_t version[2] = {1, 0};
     fwrite(version, 1, 2, f);
-    /* Header: dict with descr, fortran_order, shape */
+    /* Build shape string */
+    char shape_str[128];
+    int slen = 0;
+    slen += snprintf(shape_str + slen, sizeof(shape_str) - slen, "(");
+    size_t n_elem = 1;
+    for (int i = 0; i < ndim; i++) {
+        slen += snprintf(shape_str + slen, sizeof(shape_str) - slen, "%d,", dims[i]);
+        n_elem *= (size_t)dims[i];
+    }
+    slen += snprintf(shape_str + slen, sizeof(shape_str) - slen, ")");
     char header[256];
     int hlen = snprintf(header, sizeof(header),
-        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", h, w);
-    /* Pad header to multiple of 64 bytes (including 10-byte preamble) */
-    int total = 10 + hlen + 1;  /* +1 for newline */
+        "{'descr': '<f4', 'fortran_order': False, 'shape': %s, }", shape_str);
+    int total = 10 + hlen + 1;
     int pad = ((total + 63) / 64) * 64 - total;
     uint16_t header_len = (uint16_t)(hlen + pad + 1);
     fwrite(&header_len, 2, 1, f);
     fwrite(header, 1, (size_t)hlen, f);
     for (int i = 0; i < pad; i++) fputc(' ', f);
     fputc('\n', f);
-    /* Data */
-    fwrite(data, sizeof(float), (size_t)w * h, f);
+    fwrite(data, sizeof(float), n_elem, f);
     fclose(f);
-    fprintf(stderr, "Wrote %s (%dx%d, float32)\n", path, w, h);
+    fprintf(stderr, "Wrote %s (", path);
+    for (int i = 0; i < ndim; i++) fprintf(stderr, "%s%d", i ? "x" : "", dims[i]);
+    fprintf(stderr, ", float32)\n");
+}
+
+static void write_npy_f32(const char *path, const float *data, int w, int h) {
+    int dims[2] = {h, w};
+    write_npy_f32_nd(path, data, dims, 2);
 }
 
 /* Generate a synthetic gradient image as uint8 RGB [h][w][3] */
@@ -152,6 +166,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --rays          Enable rays output\n");
         fprintf(stderr, "  --gaussians     Enable gaussians output\n");
         fprintf(stderr, "  --npy <path>    Save raw depth as NumPy .npy file\n");
+        fprintf(stderr, "  --npy-dir <dir> Export all modalities as .npy files\n");
         fprintf(stderr, "  --resize <mode> Resize input: WxH, N%%, or Nt (tokens, patch=14)\n");
         return 1;
     }
@@ -162,6 +177,7 @@ int main(int argc, char **argv) {
     const char *output_path = NULL;
     const char *config_path = NULL;
     const char *npy_path = NULL;
+    const char *npy_dir = NULL;
     const char *resize_mode = NULL;
     int output_flags = DA3_OUTPUT_DEPTH;
 
@@ -171,6 +187,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) output_path = argv[++i];
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) config_path = argv[++i];
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
+        else if (strcmp(argv[i], "--npy-dir") == 0 && i + 1 < argc) npy_dir = argv[++i];
         else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) resize_mode = argv[++i];
         else if (strcmp(argv[i], "--full") == 0) output_flags = DA3_OUTPUT_ALL;
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
@@ -280,6 +297,40 @@ int main(int argc, char **argv) {
         }
         if (npy_path && full.depth)
             write_npy_f32(npy_path, full.depth, full.width, full.height);
+
+        /* Export all modalities as .npy */
+        if (npy_dir) {
+            char p[512];
+            int W = full.width, H = full.height;
+            if (full.depth) {
+                snprintf(p, sizeof(p), "%s/depth.npy", npy_dir);
+                write_npy_f32(p, full.depth, W, H);
+            }
+            if (full.confidence) {
+                snprintf(p, sizeof(p), "%s/confidence.npy", npy_dir);
+                write_npy_f32(p, full.confidence, W, H);
+            }
+            if (full.has_pose) {
+                snprintf(p, sizeof(p), "%s/pose.npy", npy_dir);
+                int d1[1] = {9};
+                write_npy_f32_nd(p, full.pose, d1, 1);
+            }
+            if (full.has_rays && full.rays) {
+                snprintf(p, sizeof(p), "%s/rays.npy", npy_dir);
+                int d3[3] = {6, H, W};
+                write_npy_f32_nd(p, full.rays, d3, 3);
+            }
+            if (full.has_rays && full.ray_confidence) {
+                snprintf(p, sizeof(p), "%s/ray_confidence.npy", npy_dir);
+                write_npy_f32(p, full.ray_confidence, W, H);
+            }
+            if (full.has_gaussians && full.gaussians) {
+                int gs_oc = model->has_gsdpt ? model->gsdpt.gs_out_channels : 38;
+                snprintf(p, sizeof(p), "%s/gaussians.npy", npy_dir);
+                int d3[3] = {gs_oc, H, W};
+                write_npy_f32_nd(p, full.gaussians, d3, 3);
+            }
+        }
 
         da3_full_result_free(&full);
     } else {
