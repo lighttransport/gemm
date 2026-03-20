@@ -1191,7 +1191,6 @@ int cuda_da3_load_weights(cuda_da3_runner *r, gguf_context *gguf) {
         sp_h[1] = sp_w[1] = (gh - 1) * 2 + 2; /* 74 */
         sp_h[2] = sp_w[2] = gh;                /* 37 */
         sp_h[3] = sp_w[3] = (gh + 2 - 3) / 2 + 1; /* 19 */
-        int max_hw = sp_h[0] * sp_w[0]; /* 148*148 = 21904 */
         /* After refinenet level 0: output is 2x sp_h[0] = 296x296 */
         int fused_h = sp_h[0] * 2, fused_w = sp_w[0] * 2; /* 296x296 */
         int fused_hw = fused_h * fused_w; /* 87616 */
@@ -2409,7 +2408,13 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
         }
 
         CHECK_CU(cuMemAlloc(&r->d_dpt_fused, large_sz * sizeof(float)));
-        CHECK_CU(cuMemAlloc(&r->d_dpt_tmp,   large_sz * sizeof(float)));
+        /* d_dpt_tmp: must also fit aux oc1 conv chain at fused resolution (256 * fused_hw) */
+        size_t dpt_tmp_sz = large_sz;
+        {
+            size_t aux_conv_sz = (size_t)256 * fused_hw;
+            if (aux_conv_sz > dpt_tmp_sz) dpt_tmp_sz = aux_conv_sz;
+        }
+        CHECK_CU(cuMemAlloc(&r->d_dpt_tmp,   dpt_tmp_sz * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_dpt_tmp2,  large_sz * sizeof(float)));
         /* Full model-resolution buffers for output_conv2 (official DA3 upsamples BEFORE convs) */
         {
@@ -2425,15 +2430,16 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
             fprintf(stderr, "cuda_da3: DPT scratch buffers allocated (~%.1f MB)\n",
                     (float)(4 * large_sz + np * oc_max + oc_max * gh * gh + 2 * r->image_size * r->image_size) * 4 / 1e6f);
 
-        /* Aux DPT scratch: per-level 7-channel output + conv chain scratch
-         * All output conv chains operate at level 0 spatial size (sp_h[0] x sp_w[0]) */
+        /* Aux DPT scratch: per-level 7-channel output + conv chain scratch.
+         * After refinenet upsample fix, output conv chains operate at fused resolution
+         * (2x level 0 spatial size = 296×296 for 518 input). */
         if (r->dpt_aux.loaded) {
             for (int i = 0; i < 4; i++)
                 CHECK_CU(cuMemAlloc(&r->d_aux_out[i],
-                                     (size_t)7 * sp_h[0] * sp_w[0] * sizeof(float)));
-            /* Scratch for output conv chains (max 256 channels * max_hw) */
+                                     (size_t)7 * fused_hw * sizeof(float)));
+            /* Scratch for output conv chains (max 256 channels * fused_hw) */
             CHECK_CU(cuMemAlloc(&r->d_aux_scratch,
-                                 (size_t)256 * max_hw * sizeof(float)));
+                                 (size_t)256 * fused_hw * sizeof(float)));
             if (r->verbose >= 1)
                 fprintf(stderr, "cuda_da3: DPT Aux scratch allocated\n");
         }
@@ -2881,7 +2887,9 @@ static void gpu_refinenet(cuda_da3_runner *r, int stage,
 }
 
 /* Generalized RefineNet fusion that takes explicit weight pointers.
- * Used for both main DPT and aux branch. */
+ * Used for both main DPT and aux branch.
+ * out_h/out_w: target output size for upsample BEFORE fuse_out conv.
+ *   0,0 = no upsample (stay at lateral size). */
 static void gpu_refinenet_w(cuda_da3_runner *r,
                               CUdeviceptr feat, int fH, int fW,
                               CUdeviceptr deeper, int dH, int dW, int features,
@@ -2891,27 +2899,47 @@ static void gpu_refinenet_w(cuda_da3_runner *r,
                               CUdeviceptr rcu1_c2_w, CUdeviceptr rcu1_c2_b,
                               CUdeviceptr rcu2_c1_w, CUdeviceptr rcu2_c1_b,
                               CUdeviceptr rcu2_c2_w, CUdeviceptr rcu2_c2_b,
-                              int has_rcu1, int has_rcu2) {
+                              int has_rcu1, int has_rcu2,
+                              int out_h, int out_w) {
     int sz = features * fH * fW;
-    if (deeper) kl_bilinear(r, r->d_dpt_cat, deeper, features, dH, dW, fH, fW);
-    cuMemcpyDtoDAsync(result_buf, feat, (size_t)sz * sizeof(float), r->stream);
     if (deeper) {
+        /* Top branch = deeper. Upsample to lateral's spatial size if needed. */
+        if (dH != fH || dW != fW) {
+            kl_bilinear(r, r->d_dpt_cat, deeper, features, dH, dW, fH, fW);
+            cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
+        } else {
+            cuMemcpyDtoDAsync(result_buf, deeper, (size_t)sz * sizeof(float), r->stream);
+        }
+        /* Add lateral through RCU1 (official: y = y + resConfUnit1(lateral)) */
         if (has_rcu1) {
-            kl_rcu(r, r->d_dpt_ln, r->d_dpt_cat,
+            kl_rcu(r, r->d_dpt_ln, feat,
                    rcu1_c1_w, rcu1_c1_b, rcu1_c2_w, rcu1_c2_b, features, fH, fW);
             kl_add_inplace(r, result_buf, r->d_dpt_ln, sz);
         } else {
-            kl_add_inplace(r, result_buf, r->d_dpt_cat, sz);
+            kl_add_inplace(r, result_buf, feat, sz);
         }
+    } else {
+        /* Deepest level: no deeper input, just use lateral */
+        cuMemcpyDtoDAsync(result_buf, feat, (size_t)sz * sizeof(float), r->stream);
     }
     if (has_rcu2) {
         kl_rcu(r, r->d_dpt_cat, result_buf,
                rcu2_c1_w, rcu2_c1_b, rcu2_c2_w, rcu2_c2_b, features, fH, fW);
         cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
     }
+    /* Upsample BEFORE out_conv if target size differs from lateral size */
+    int conv_h = fH, conv_w = fW;
+    if (out_h > 0 && (out_h != fH || out_w != fW)) {
+        kl_bilinear(r, r->d_dpt_cat, result_buf, features, fH, fW, out_h, out_w);
+        cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat,
+                           (size_t)features * out_h * out_w * sizeof(float), r->stream);
+        conv_h = out_h;
+        conv_w = out_w;
+    }
+    int osz = features * conv_h * conv_w;
     kl_conv_gemm(r, r->d_dpt_cat, result_buf,
-                  fuse_out_w, fuse_out_b, fH, fW, features, features, 1, 1, 1, 0);
-    cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
+                  fuse_out_w, fuse_out_b, conv_h, conv_w, features, features, 1, 1, 1, 0);
+    cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)osz * sizeof(float), r->stream);
 }
 
 /* CameraDec: raw cam_token → ReLU MLP → 3 linear heads → pose[9] (CPU) */
@@ -2988,7 +3016,7 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
     /* Bottom-up aux RefineNet fusion (same structure as main but with aux weights) */
     CUdeviceptr aux_fused = r->d_dpt_fused; /* reuse after main DPT completes */
 
-    /* Level 3 (deepest) */
+    /* Level 3 (deepest) — upsample to level 2 spatial size */
     gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
                      0, 0, 0, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[3], r->dpt_aux.fuse_out_b[3],
@@ -2996,10 +3024,11 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[3], r->dpt_aux.fuse_rcu1_c2_b[3],
                      r->dpt_aux.fuse_rcu2_c1_w[3], r->dpt_aux.fuse_rcu2_c1_b[3],
                      r->dpt_aux.fuse_rcu2_c2_w[3], r->dpt_aux.fuse_rcu2_c2_b[3],
-                     r->dpt_aux.has_rcu1[3], r->dpt_aux.has_rcu2[3]);
-    int fh = sp_h[3], fw = sp_w[3];
+                     r->dpt_aux.has_rcu1[3], r->dpt_aux.has_rcu2[3],
+                     sp_h[2], sp_w[2]);
+    int fh = sp_h[2], fw = sp_w[2];
 
-    /* Level 2 */
+    /* Level 2 — upsample to level 1 spatial size */
     gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
                      aux_fused, fh, fw, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[2], r->dpt_aux.fuse_out_b[2],
@@ -3007,10 +3036,11 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[2], r->dpt_aux.fuse_rcu1_c2_b[2],
                      r->dpt_aux.fuse_rcu2_c1_w[2], r->dpt_aux.fuse_rcu2_c1_b[2],
                      r->dpt_aux.fuse_rcu2_c2_w[2], r->dpt_aux.fuse_rcu2_c2_b[2],
-                     r->dpt_aux.has_rcu1[2], r->dpt_aux.has_rcu2[2]);
-    fh = sp_h[2]; fw = sp_w[2];
+                     r->dpt_aux.has_rcu1[2], r->dpt_aux.has_rcu2[2],
+                     sp_h[1], sp_w[1]);
+    fh = sp_h[1]; fw = sp_w[1];
 
-    /* Level 1 */
+    /* Level 1 — upsample to level 0 spatial size */
     gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
                      aux_fused, fh, fw, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[1], r->dpt_aux.fuse_out_b[1],
@@ -3018,10 +3048,11 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[1], r->dpt_aux.fuse_rcu1_c2_b[1],
                      r->dpt_aux.fuse_rcu2_c1_w[1], r->dpt_aux.fuse_rcu2_c1_b[1],
                      r->dpt_aux.fuse_rcu2_c2_w[1], r->dpt_aux.fuse_rcu2_c2_b[1],
-                     r->dpt_aux.has_rcu1[1], r->dpt_aux.has_rcu2[1]);
-    fh = sp_h[1]; fw = sp_w[1];
+                     r->dpt_aux.has_rcu1[1], r->dpt_aux.has_rcu2[1],
+                     sp_h[0], sp_w[0]);
+    fh = sp_h[0]; fw = sp_w[0];
 
-    /* Level 0 */
+    /* Level 0 — upsample 2x (148→296) matching official scale_factor=2 */
     gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
                      aux_fused, fh, fw, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[0], r->dpt_aux.fuse_out_b[0],
@@ -3029,16 +3060,8 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[0], r->dpt_aux.fuse_rcu1_c2_b[0],
                      r->dpt_aux.fuse_rcu2_c1_w[0], r->dpt_aux.fuse_rcu2_c1_b[0],
                      r->dpt_aux.fuse_rcu2_c2_w[0], r->dpt_aux.fuse_rcu2_c2_b[0],
-                     r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0]);
-
-    /* Debug: check aux_fused values after refinenet */
-    if (r->verbose >= 2) {
-        cuStreamSynchronize(r->stream);
-        float dbg[8];
-        cuMemcpyDtoH(dbg, aux_fused, sizeof(dbg));
-        fprintf(stderr, "  aux_fused[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
-    }
+                     r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0],
+                     sp_h[0] * 2, sp_w[0] * 2);
 
     /* Only the LAST level (index 3, finest resolution) is used for output.
      * Python: fused_aux_pyr[-1] → output_conv2_aux[-1] → final output.
@@ -3046,7 +3069,7 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
      * output_conv2_aux[3]: Conv2d(128,32,3) → LayerNorm(32) → ReLU → Conv2d(32,7,1) */
     {
         int lv = 3;  /* last level = finest */
-        int oh = sp_h[0], ow = sp_w[0];
+        int oh = sp_h[0] * 2, ow = sp_w[0] * 2;  /* fused resolution (296×296) */
 
         /* output_conv1_aux[3]: 5 Conv2d chain (NO activations) */
         CUdeviceptr cur = r->d_aux_scratch;
@@ -3947,22 +3970,26 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* Run aux branch (reuses d_dpt_adapted from main DPT token processing) */
         run_aux_dpt(r, sp_h, sp_w, feat, r->d_aux_out);
 
-        /* Average 4 levels (all at level 0 spatial size) */
-        /* Only last level (index 3) is used — single output in d_aux_out[0] */
-        int oh = sp_h[0], ow = sp_w[0];
+        /* Only last level (index 3) is used — single output in d_aux_out[0].
+         * After refinenet upsample fix, output is at fused resolution (2x level 0). */
+        int oh = sp_h[0] * 2, ow = sp_w[0] * 2;
         int aux_hw = oh * ow;
 
-        /* Bilinear upsample 7 channels to original resolution */
+        /* Bilinear upsample 7 channels to original resolution.
+         * d_dpt_tmp is too small (feat*fused_hw ≈ 5.6M) for 7*img_h*img_w (≈20M).
+         * Allocate a temporary GPU buffer for the full-res output. */
         int npix = img_w * img_h;
         result.rays = (float *)malloc((size_t)6 * npix * sizeof(float));
         result.ray_confidence = (float *)malloc((size_t)npix * sizeof(float));
 
-        CUdeviceptr d_aux_full = r->d_dpt_tmp;
+        CUdeviceptr d_aux_full = 0;
+        cuMemAlloc(&d_aux_full, (size_t)7 * npix * sizeof(float));
         kl_bilinear(r, d_aux_full, r->d_aux_out[0], 7, oh, ow, img_h, img_w);
         cuStreamSynchronize(r->stream);
 
         float *h_aux_full = (float *)malloc((size_t)7 * npix * sizeof(float));
         cuMemcpyDtoH(h_aux_full, d_aux_full, (size_t)7 * npix * sizeof(float));
+        cuMemFree(d_aux_full);
 
         /* Split: rays = channels 0-5 (linear activation = identity),
          *        ray_confidence = channel 6 (expp1 = exp(x) + 1) */
@@ -4064,7 +4091,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* TODO: Inject merger features at level 0 (add to d_dpt_adapted[0]) */
         /* For now, skip merger injection — just run standard DPT pipeline */
 
-        /* Bottom-up RefineNet fusion with GSDPT weights */
+        /* Bottom-up RefineNet fusion with GSDPT weights (no upsample in refinenet_w) */
         gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
                         0, 0, 0, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[3], gdw->fuse_out_b[3],
@@ -4072,7 +4099,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[3], gdw->fuse_rcu1_c2_b[3],
                         gdw->fuse_rcu2_c1_w[3], gdw->fuse_rcu2_c1_b[3],
                         gdw->fuse_rcu2_c2_w[3], gdw->fuse_rcu2_c2_b[3],
-                        gdw->has_rcu1[3], gdw->has_rcu2[3]);
+                        gdw->has_rcu1[3], gdw->has_rcu2[3],
+                        0, 0);
         int gs_fh = sp_h[3], gs_fw = sp_w[3];
         gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
@@ -4081,7 +4109,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[2], gdw->fuse_rcu1_c2_b[2],
                         gdw->fuse_rcu2_c1_w[2], gdw->fuse_rcu2_c1_b[2],
                         gdw->fuse_rcu2_c2_w[2], gdw->fuse_rcu2_c2_b[2],
-                        gdw->has_rcu1[2], gdw->has_rcu2[2]);
+                        gdw->has_rcu1[2], gdw->has_rcu2[2],
+                        0, 0);
         gs_fh = sp_h[2]; gs_fw = sp_w[2];
         gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
@@ -4090,7 +4119,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[1], gdw->fuse_rcu1_c2_b[1],
                         gdw->fuse_rcu2_c1_w[1], gdw->fuse_rcu2_c1_b[1],
                         gdw->fuse_rcu2_c2_w[1], gdw->fuse_rcu2_c2_b[1],
-                        gdw->has_rcu1[1], gdw->has_rcu2[1]);
+                        gdw->has_rcu1[1], gdw->has_rcu2[1],
+                        0, 0);
         gs_fh = sp_h[1]; gs_fw = sp_w[1];
         gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
@@ -4099,7 +4129,8 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[0], gdw->fuse_rcu1_c2_b[0],
                         gdw->fuse_rcu2_c1_w[0], gdw->fuse_rcu2_c1_b[0],
                         gdw->fuse_rcu2_c2_w[0], gdw->fuse_rcu2_c2_b[0],
-                        gdw->has_rcu1[0], gdw->has_rcu2[0]);
+                        gdw->has_rcu1[0], gdw->has_rcu2[0],
+                        0, 0);
         gs_fh = sp_h[0]; gs_fw = sp_w[0];
 
         /* Output convolutions → gs_oc channels
