@@ -445,21 +445,29 @@ int main(int argc, char **argv) {
     /* Save all outputs as npy if --npy-dir specified */
     if (npy_dir && npix > 0) {
         char path[512];
+        if (result.depth) {
+            snprintf(path, sizeof(path), "%s/depth.npy", npy_dir);
+            write_npy_f32(path, result.depth, result.width, result.height);
+        }
+        if (result.confidence) {
+            snprintf(path, sizeof(path), "%s/confidence.npy", npy_dir);
+            write_npy_f32(path, result.confidence, result.width, result.height);
+        }
         if (result.has_pose) {
-            snprintf(path, sizeof(path), "%s/pose_gpu.npy", npy_dir);
+            snprintf(path, sizeof(path), "%s/pose.npy", npy_dir);
             write_npy_f32_1d(path, result.pose, 9);
         }
         if (result.has_rays && result.rays) {
-            snprintf(path, sizeof(path), "%s/rays_gpu.npy", npy_dir);
+            snprintf(path, sizeof(path), "%s/rays.npy", npy_dir);
             write_npy_f32_3d(path, result.rays, 6, result.height, result.width);
             if (result.ray_confidence) {
-                snprintf(path, sizeof(path), "%s/ray_conf_gpu.npy", npy_dir);
+                snprintf(path, sizeof(path), "%s/ray_confidence.npy", npy_dir);
                 write_npy_f32(path, result.ray_confidence, result.width, result.height);
             }
         }
         if (result.has_gaussians && result.gaussians) {
             int gs_oc = 38;
-            snprintf(path, sizeof(path), "%s/gaussians_gpu.npy", npy_dir);
+            snprintf(path, sizeof(path), "%s/gaussians.npy", npy_dir);
             write_npy_f32_3d(path, result.gaussians, gs_oc, result.height, result.width);
         }
     }
