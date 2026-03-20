@@ -2414,41 +2414,27 @@ static float *da3_refinenet_w(const float *lateral, int lH, int lW,
 
 /* noinline for code organization: keep da3_predict_full manageable */
 __attribute__((noinline))
-static void da3_run_camera_dec(da3_model *m, const float *hidden, float *pose) {
-    int dim = m->dim;
+/* cam_token: raw [local_x_CLS, x_CLS] (768-dim) from last feature level.
+ * Official: cam_dec(feats[-1][1]) where feats[-1][1] is the camera_token
+ * extracted BEFORE backbone_norm is applied. No norm on this input. */
+static void da3_run_camera_dec(da3_model *m, const float *cam_token, float *pose) {
     da3_cam_dec *cd = &m->cam_dec;
-    int dim_in = cd->mlp0_w.n_cols; /* input dim (typically 2*dim=768 for CLS concat) */
+    int dim_in = cd->mlp0_w.n_cols; /* 768 = 2*dim */
 
-    /* LayerNorm on CLS token (token 0) */
-    float *cls_normed = (float *)malloc((size_t)dim * sizeof(float));
-    da3_layernorm_batch(cls_normed, hidden, &m->backbone_norm_w, &m->backbone_norm_b,
-                        1, dim, m->ln_eps);
+    /* cam_token is already the correct 768-dim [local_x_CLS, x_CLS] */
+    const float *cam_input = cam_token;
 
-    /* If dim_in > dim, concatenate CLS with itself (same as DPT readout) */
-    float *cam_input;
-    if (dim_in > dim) {
-        cam_input = (float *)malloc((size_t)dim_in * sizeof(float));
-        memcpy(cam_input, cls_normed, (size_t)dim * sizeof(float));
-        memcpy(cam_input + dim, cls_normed, (size_t)dim * sizeof(float));
-    } else {
-        cam_input = cls_normed;
-    }
-
-    /* MLP layer 0: [mlp_dim, dim_in] × [dim_in] + bias → GELU */
+    /* MLP layer 0: Linear(dim_in, mlp_dim) + ReLU */
     float *mlp_h = (float *)calloc(cd->mlp_dim, sizeof(float));
     da3_batch_gemm(mlp_h, &cd->mlp0_w, &cd->mlp0_b, cam_input, 1, cd->mlp_dim, dim_in, 1);
-    for (int i = 0; i < cd->mlp_dim; i++) {
-        float v = mlp_h[i];
-        mlp_h[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
-    }
+    for (int i = 0; i < cd->mlp_dim; i++)
+        mlp_h[i] = mlp_h[i] > 0 ? mlp_h[i] : 0.0f;
 
-    /* MLP layer 2: [mlp_dim, mlp_dim] × [mlp_dim] + bias → GELU */
+    /* MLP layer 2: Linear(mlp_dim, mlp_dim) + ReLU */
     float *mlp_h2 = (float *)calloc(cd->mlp_dim, sizeof(float));
     da3_batch_gemm(mlp_h2, &cd->mlp2_w, &cd->mlp2_b, mlp_h, 1, cd->mlp_dim, cd->mlp_dim, 1);
-    for (int i = 0; i < cd->mlp_dim; i++) {
-        float v = mlp_h2[i];
-        mlp_h2[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
-    }
+    for (int i = 0; i < cd->mlp_dim; i++)
+        mlp_h2[i] = mlp_h2[i] > 0 ? mlp_h2[i] : 0.0f;
 
     /* 3 output heads (small matmuls on CPU) */
     float *fc_t_w = da3_dequant(&cd->fc_t_w);
@@ -2470,11 +2456,10 @@ static void da3_run_camera_dec(da3_model *m, const float *hidden, float *pose) {
     for (int o = 0; o < 2; o++) {
         float s = fc_f_b ? fc_f_b[o] : 0.0f;
         for (int k = 0; k < cd->mlp_dim; k++) s += fc_f_w[o * cd->mlp_dim + k] * mlp_h2[k];
-        pose[7 + o] = s;
+        pose[7 + o] = s > 0 ? s : 0.0f;  /* ReLU on FOV output */
     }
 
-    if (cam_input != cls_normed) free(cam_input);
-    free(cls_normed); free(mlp_h); free(mlp_h2);
+    free(mlp_h); free(mlp_h2);
     free(fc_t_w); free(fc_t_b); free(fc_q_w); free(fc_q_b); free(fc_f_w); free(fc_f_b);
 }
 
@@ -3162,9 +3147,11 @@ da3_full_result da3_predict_full(da3_model *m, const uint8_t *rgb, int img_w, in
     fprintf(stderr, "da3_full: backbone %.1f ms (%d threads)\n", t_dpt - t_backbone, n_threads);
 
     /* ─── CameraDec (pose) ─── */
+    /* Official: cam_dec takes feats[-1][1] = raw CLS token from last feature level.
+     * features[3] is stored as [local_hidden, hidden] per token, CLS is token 0. */
     if (m->has_cam_dec && (output_flags & DA3_OUTPUT_POSE)) {
         double t0 = da3_time_ms();
-        da3_run_camera_dec(m, hidden, result.pose);
+        da3_run_camera_dec(m, features[3], result.pose);  /* token 0 = CLS */
         result.has_pose = 1;
         fprintf(stderr, "da3_full: CameraDec %.1f ms\n", da3_time_ms() - t0);
     }
