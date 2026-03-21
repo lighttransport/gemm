@@ -470,6 +470,14 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof(path), "%s/gaussians.npy", npy_dir);
             write_npy_f32_3d(path, result.gaussians, gs_oc, result.height, result.width);
         }
+        if (result.has_metric && result.metric_depth) {
+            snprintf(path, sizeof(path), "%s/metric_depth.npy", npy_dir);
+            write_npy_f32(path, result.metric_depth, result.width, result.height);
+        }
+        if (result.sky_seg) {
+            snprintf(path, sizeof(path), "%s/sky_seg.npy", npy_dir);
+            write_npy_f32(path, result.sky_seg, result.width, result.height);
+        }
     }
 
     /* Cleanup */
