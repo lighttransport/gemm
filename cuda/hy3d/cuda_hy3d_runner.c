@@ -1,8 +1,17 @@
 /*
  * cuda_hy3d_runner.c - CUDA Hunyuan3D-2.1 via NVRTC-compiled kernels
  *
- * Pipeline: DINOv2 encoder → DiT diffusion (flow matching) → ShapeVAE → MC mesh
+ * Pipeline: DINOv2 encoder -> DiT diffusion (flow matching) -> ShapeVAE -> MC mesh
  * Compiles with plain gcc (no nvcc). Uses cuew for dynamic CUDA/NVRTC loading.
+ *
+ * Architecture fixes applied:
+ *   1. DiT U-Net skip connections (blocks 11-20)
+ *   2. DiT MoE in last 6 blocks (15-20): 8 experts + shared expert, top-2 gating
+ *   3. DiT prepends timestep token (seq_len 4096 -> 4097, stripped at final layer)
+ *   4. TimestepEmbedder uses GELU (not SiLU)
+ *   5. VAE include_pi=false (freqs = 2^i, not pi*2^i)
+ *   6. VAE tensor name mapping (transformer.resblocks, c_qkv, c_proj, etc.)
+ *   7. VAE geo_decoder tensor names (cross_attn_decoder prefix, c_q/c_kv, etc.)
  *
  * SPDX-License-Identifier: MIT
  * Copyright 2025 - Present, Light Transport Entertainment Inc.
@@ -19,220 +28,15 @@
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 
+/* Modular ops: kernel source strings + launch wrappers */
+#include "cuda_hy3d_kernels.h"
+#include "cuda_hy3d_ops.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
-
-/* ======================================================================== */
-/* HY3D-specific CUDA kernel source (compiled at runtime via NVRTC)         */
-/* Shared kernels are in cuda_kernels_common.h (cuda_kernels_common_src)    */
-/* ======================================================================== */
-
-static const char cuda_hy3d_specific_kernels[] =
-"\n"
-"/* ---- rms_norm_f32: per-head RMSNorm (for QK normalization) ---- */\n"
-"/* One thread per (token, head). Normalizes head_dim elements in-place. */\n"
-"__global__ void rms_norm_f32(float *data, const float *w,\n"
-"                              int n_tok, int n_heads, int head_dim,\n"
-"                              int stride, float eps) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int total = n_tok * n_heads;\n"
-"    if (idx >= total) return;\n"
-"    int tok = idx / n_heads;\n"
-"    int h = idx % n_heads;\n"
-"    float *base = data + tok * stride + h * head_dim;\n"
-"    float sum_sq = 0.0f;\n"
-"    for (int i = 0; i < head_dim; i++) sum_sq += base[i] * base[i];\n"
-"    float inv = rsqrtf(sum_sq / (float)head_dim + eps);\n"
-"    for (int i = 0; i < head_dim; i++)\n"
-"        base[i] = base[i] * inv * w[i];\n"
-"}\n"
-"\n"
-"/* ---- qk_layernorm_f32: per-head LayerNorm (for ShapeVAE QK norm) ---- */\n"
-"__global__ void qk_layernorm_f32(float *data, const float *w, const float *b,\n"
-"                                   int n_tok, int n_heads, int head_dim,\n"
-"                                   int stride, float eps) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int total = n_tok * n_heads;\n"
-"    if (idx >= total) return;\n"
-"    int tok = idx / n_heads;\n"
-"    int h = idx % n_heads;\n"
-"    float *base = data + tok * stride + h * head_dim;\n"
-"    float sum = 0.0f;\n"
-"    for (int i = 0; i < head_dim; i++) sum += base[i];\n"
-"    float mean = sum / (float)head_dim;\n"
-"    float var_sum = 0.0f;\n"
-"    for (int i = 0; i < head_dim; i++) { float d = base[i] - mean; var_sum += d*d; }\n"
-"    float inv = rsqrtf(var_sum / (float)head_dim + eps);\n"
-"    for (int i = 0; i < head_dim; i++)\n"
-"        base[i] = (base[i] - mean) * inv * w[i] + (b ? b[i] : 0.0f);\n"
-"}\n"
-"\n"
-"/* ---- layerscale_add_f32: LayerScale residual for DINOv2 ---- */\n"
-"/* dst[i] += src[i] * scale[i % dim] */\n"
-"__global__ void layerscale_add_f32(float *dst, const float *src,\n"
-"                                     const float *scale, int n, int dim) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    dst[i] += src[i] * scale[i % dim];\n"
-"}\n"
-"\n"
-"/* ---- cross_attn_f32: cross-attention with different Q/KV lengths ---- */\n"
-"/* One block per (head, query_token). Handles Q_len != KV_len.          */\n"
-"__global__ void cross_attn_f32(float *out,\n"
-"                                const float *Q, const float *K, const float *V,\n"
-"                                int q_len, int kv_len, int dim,\n"
-"                                int n_heads, int head_dim, float scale) {\n"
-"    int h = blockIdx.x;\n"
-"    int qi = blockIdx.y;\n"
-"    if (h >= n_heads || qi >= q_len) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nt = blockDim.x;\n"
-"    const float *q = Q + qi * dim + h * head_dim;\n"
-"    extern __shared__ float sdata[];\n"
-"    float *scores = sdata;\n"
-"    float *rbuf = sdata + kv_len;\n"
-"\n"
-"    /* Phase 1: Q @ K^T */\n"
-"    for (int ki = tid; ki < kv_len; ki += nt) {\n"
-"        const float *k = K + ki * dim + h * head_dim;\n"
-"        float dot = 0.0f;\n"
-"        for (int d = 0; d < head_dim; d++) dot += q[d] * k[d];\n"
-"        scores[ki] = dot * scale;\n"
-"    }\n"
-"    __syncthreads();\n"
-"\n"
-"    /* Phase 2: Softmax — find max */\n"
-"    float lmax = -1e30f;\n"
-"    for (int ki = tid; ki < kv_len; ki += nt)\n"
-"        lmax = fmaxf(lmax, scores[ki]);\n"
-"    rbuf[tid] = lmax;\n"
-"    __syncthreads();\n"
-"    for (int r = nt/2; r > 0; r >>= 1) {\n"
-"        if (tid < r) rbuf[tid] = fmaxf(rbuf[tid], rbuf[tid+r]);\n"
-"        __syncthreads();\n"
-"    }\n"
-"    float mx = rbuf[0];\n"
-"    __syncthreads();\n"
-"\n"
-"    /* Exp + sum */\n"
-"    float lsum = 0.0f;\n"
-"    for (int ki = tid; ki < kv_len; ki += nt) {\n"
-"        scores[ki] = expf(scores[ki] - mx);\n"
-"        lsum += scores[ki];\n"
-"    }\n"
-"    rbuf[tid] = lsum;\n"
-"    __syncthreads();\n"
-"    for (int r = nt/2; r > 0; r >>= 1) {\n"
-"        if (tid < r) rbuf[tid] += rbuf[tid+r];\n"
-"        __syncthreads();\n"
-"    }\n"
-"    float inv_sum = (rbuf[0] > 0) ? 1.0f / rbuf[0] : 0.0f;\n"
-"    for (int ki = tid; ki < kv_len; ki += nt)\n"
-"        scores[ki] *= inv_sum;\n"
-"    __syncthreads();\n"
-"\n"
-"    /* Phase 3: Weighted sum of V */\n"
-"    for (int d = tid; d < head_dim; d += nt) {\n"
-"        float acc = 0.0f;\n"
-"        for (int ki = 0; ki < kv_len; ki++)\n"
-"            acc += scores[ki] * V[ki * dim + h * head_dim + d];\n"
-"        out[qi * dim + h * head_dim + d] = acc;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* ---- fourier_embed_3d_f32: 3D coordinate Fourier embedding ---- */\n"
-"/* input: [N, 3], output: [N, out_dim] where out_dim = 3*(2*nf+1)  */\n"
-"/* Layout: [x,y,z, sin(f0*x),...sin(fn*x), sin(f0*y),..., cos(...)...] */\n"
-"__global__ void fourier_embed_3d_f32(float *out, const float *coords,\n"
-"                                      const float *freqs, int N,\n"
-"                                      int num_freqs, int out_dim) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (idx >= N) return;\n"
-"    const float *in = coords + idx * 3;\n"
-"    float *o = out + idx * out_dim;\n"
-"    int p = 0;\n"
-"    /* Include raw input */\n"
-"    o[p++] = in[0]; o[p++] = in[1]; o[p++] = in[2];\n"
-"    /* Sin embeddings */\n"
-"    for (int d = 0; d < 3; d++)\n"
-"        for (int f = 0; f < num_freqs; f++)\n"
-"            o[p++] = sinf(in[d] * freqs[f]);\n"
-"    /* Cos embeddings */\n"
-"    for (int d = 0; d < 3; d++)\n"
-"        for (int f = 0; f < num_freqs; f++)\n"
-"            o[p++] = cosf(in[d] * freqs[f]);\n"
-"}\n"
-"\n"
-"/* ---- timestep_embed_f32: sinusoidal timestep embedding ---- */\n"
-"/* Similar to transformer PE but for scalar timestep */\n"
-"__global__ void timestep_embed_f32(float *out, float t, int dim) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int half = dim / 2;\n"
-"    if (i >= half) return;\n"
-"    float log_ts = logf(10000.0f) / (float)(half - 1);\n"
-"    float emb = expf(-log_ts * (float)i) * t * 1000.0f;\n"
-"    out[i] = sinf(emb);\n"
-"    out[half + i] = cosf(emb);\n"
-"}\n"
-"\n"
-"/* ---- euler_step_f32: x_new = x - dt * v ---- */\n"
-"__global__ void euler_step_f32(float *x, const float *v, float dt, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    x[i] = x[i] - dt * v[i];\n"
-"}\n"
-"\n"
-"/* ---- cfg_combine_f32: out = uncond + scale * (cond - uncond) ---- */\n"
-"__global__ void cfg_combine_f32(float *out, const float *cond,\n"
-"                                  const float *uncond,\n"
-"                                  float scale, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    out[i] = uncond[i] + scale * (cond[i] - uncond[i]);\n"
-"}\n"
-"\n"
-"/* ---- split_qkv_interleaved_f32: split [N, 3*W] with interleaved heads ---- */\n"
-"/* Input:  [N, H, 3, HD] (3*W = H*3*HD) */\n"
-"/* Output: Q[N, W], K[N, W], V[N, W] (W = H*HD) */\n"
-"__global__ void split_qkv_interleaved_f32(\n"
-"    float *Q, float *K, float *V,\n"
-"    const float *qkv, int N, int H, int HD) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int W = H * HD;\n"
-"    int total = N * W;\n"
-"    if (idx >= total) return;\n"
-"    int n = idx / W;\n"
-"    int rem = idx % W;\n"
-"    int h = rem / HD;\n"
-"    int d = rem % HD;\n"
-"    int base = n * 3 * W + h * 3 * HD;\n"
-"    Q[idx] = qkv[base + d];\n"
-"    K[idx] = qkv[base + HD + d];\n"
-"    V[idx] = qkv[base + 2*HD + d];\n"
-"}\n"
-"\n"
-"/* ---- split_kv_interleaved_f32: split [M, 2*W] with interleaved heads ---- */\n"
-"/* Input:  [M, H, 2, HD] (2*W = H*2*HD) */\n"
-"/* Output: K[M, W], V[M, W] (W = H*HD) */\n"
-"__global__ void split_kv_interleaved_f32(\n"
-"    float *K, float *V,\n"
-"    const float *kv, int M, int H, int HD) {\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int W = H * HD;\n"
-"    int total = M * W;\n"
-"    if (idx >= total) return;\n"
-"    int m = idx / W;\n"
-"    int rem = idx % W;\n"
-"    int h = rem / HD;\n"
-"    int d = rem % HD;\n"
-"    int base = m * 2 * W + h * 2 * HD;\n"
-"    K[idx] = kv[base + d];\n"
-"    V[idx] = kv[base + HD + d];\n"
-"}\n"
-"\n";
 
 /* ======================================================================== */
 /* Model constants                                                          */
@@ -257,6 +61,11 @@ static const char cuda_hy3d_specific_kernels[] =
 #define DIT_DEPTH       21
 #define DIT_HEADS       16
 #define DIT_HEAD_DIM    128
+#define DIT_FFN         (DIT_HIDDEN * 4)    /* 8192 */
+#define DIT_HALF_DEPTH  (DIT_DEPTH / 2)     /* 10 */
+#define DIT_MOE_START   15
+#define DIT_N_EXPERTS   8
+#define DIT_MOE_TOP_K   2
 
 /* ShapeVAE config */
 #define VAE_NUM_LATENTS  4096
@@ -292,16 +101,30 @@ typedef struct {
     CUdeviceptr norm1_w, norm1_b;
     CUdeviceptr sa_q_w, sa_k_w, sa_v_w;
     CUdeviceptr sa_out_w, sa_out_b;
-    CUdeviceptr sa_q_norm_w, sa_k_norm_w;  /* RMSNorm for QK */
+    CUdeviceptr sa_q_norm_w, sa_k_norm_w;  /* RMSNorm weight only */
     /* Cross-attention */
     CUdeviceptr norm2_w, norm2_b;
     CUdeviceptr ca_q_w, ca_k_w, ca_v_w;
     CUdeviceptr ca_out_w, ca_out_b;
     CUdeviceptr ca_q_norm_w, ca_k_norm_w;
-    /* MLP */
+    /* Norm3 + MLP/MoE */
     CUdeviceptr norm3_w, norm3_b;
+    /* Regular MLP (blocks 0-14) */
     CUdeviceptr mlp_fc1_w, mlp_fc1_b;
     CUdeviceptr mlp_fc2_w, mlp_fc2_b;
+    /* MoE (blocks 15-20) */
+    int use_moe;
+    CUdeviceptr moe_gate_w;                                   /* [8, 2048] */
+    CUdeviceptr moe_expert_fc1_w[DIT_N_EXPERTS];              /* [8192, 2048] each */
+    CUdeviceptr moe_expert_fc1_b[DIT_N_EXPERTS];              /* [8192] each */
+    CUdeviceptr moe_expert_fc2_w[DIT_N_EXPERTS];              /* [2048, 8192] each */
+    CUdeviceptr moe_expert_fc2_b[DIT_N_EXPERTS];              /* [2048] each */
+    CUdeviceptr moe_shared_fc1_w, moe_shared_fc1_b;
+    CUdeviceptr moe_shared_fc2_w, moe_shared_fc2_b;
+    /* Skip connection (blocks 11-20) */
+    int use_skip;
+    CUdeviceptr skip_linear_w, skip_linear_b; /* [2048, 4096] */
+    CUdeviceptr skip_norm_w, skip_norm_b;
 } dit_block_gpu;
 
 /* ShapeVAE transformer block weights (on GPU, F32) */
@@ -344,31 +167,8 @@ struct cuda_hy3d_runner {
     int sm_version;
     int verbose;
 
-    /* Compiled kernel functions */
-    CUfunction fn_layernorm;
-    CUfunction fn_gemm;
-    CUfunction fn_gemm_tiled;
-    CUfunction fn_gelu;
-    CUfunction fn_add;
-    CUfunction fn_silu;
-    CUfunction fn_resize_normalize;
-    CUfunction fn_patch_embed;
-    CUfunction fn_cls_pos_embed;
-    CUfunction fn_attn_prefill;
-    CUfunction fn_flash_attn_tiled;
-    CUfunction fn_kv_transpose;
-    CUfunction fn_bilinear_upsample;
-    /* HY3D-specific */
-    CUfunction fn_rms_norm;
-    CUfunction fn_qk_layernorm;
-    CUfunction fn_layerscale_add;
-    CUfunction fn_cross_attn;
-    CUfunction fn_fourier_embed;
-    CUfunction fn_timestep_embed;
-    CUfunction fn_euler_step;
-    CUfunction fn_cfg_combine;
-    CUfunction fn_split_qkv;
-    CUfunction fn_split_kv;
+    /* Modular ops context (all compiled kernel functions) */
+    hy3d_ops ops;
 
     /* DINOv2 weights */
     CUdeviceptr dino_patch_w, dino_patch_b;
@@ -422,44 +222,12 @@ static int hy3d_compile_kernels(cuda_hy3d_runner *r) {
     free(full_src);
     if (r->sm_version < 0) return -1;
 
-    /* Get common kernel functions */
-    #define GET_FN(name, var) \
-        if (cuModuleGetFunction(&r->var, r->module, name) != CUDA_SUCCESS) { \
-            fprintf(stderr, "HY3D: failed to get kernel '%s'\n", name); return -1; }
-
-    GET_FN("layernorm_f32",          fn_layernorm);
-    GET_FN("gemm_f16_f32",           fn_gemm);
-    GET_FN("gemm_tiled_f16_f32",     fn_gemm_tiled);
-    GET_FN("gelu_f32",               fn_gelu);
-    GET_FN("add_f32",                fn_add);
-    GET_FN("silu_f32",               fn_silu);
-    GET_FN("resize_normalize",       fn_resize_normalize);
-    GET_FN("patch_embed_conv2d",     fn_patch_embed);
-    GET_FN("cls_pos_embed",          fn_cls_pos_embed);
-    GET_FN("kv_transpose",           fn_kv_transpose);
-
-    /* Use MMA attention if sm_70+ */
-    if (r->sm_version >= 70) {
-        GET_FN("attn_prefill_f32", fn_attn_prefill);
-    } else {
-        GET_FN("flash_attn_tiled_f32", fn_attn_prefill);
+    /* Load all kernel functions via the modular ops API */
+    if (hy3d_ops_load(&r->ops, r->module, r->sm_version) != 0) {
+        fprintf(stderr, "HY3D: ops_load failed\n");
+        return -1;
     }
-    GET_FN("flash_attn_tiled_f32",   fn_flash_attn_tiled);
-    GET_FN("bilinear_upsample_f32",  fn_bilinear_upsample);
 
-    /* HY3D-specific functions */
-    GET_FN("rms_norm_f32",           fn_rms_norm);
-    GET_FN("qk_layernorm_f32",       fn_qk_layernorm);
-    GET_FN("layerscale_add_f32",     fn_layerscale_add);
-    GET_FN("cross_attn_f32",         fn_cross_attn);
-    GET_FN("fourier_embed_3d_f32",   fn_fourier_embed);
-    GET_FN("timestep_embed_f32",     fn_timestep_embed);
-    GET_FN("euler_step_f32",         fn_euler_step);
-    GET_FN("cfg_combine_f32",        fn_cfg_combine);
-    GET_FN("split_qkv_interleaved_f32", fn_split_qkv);
-    GET_FN("split_kv_interleaved_f32",  fn_split_kv);
-
-    #undef GET_FN
     return 0;
 }
 
@@ -543,142 +311,6 @@ static CUdeviceptr gpu_alloc(size_t bytes) {
         return 0;
     }
     return d;
-}
-
-/* ======================================================================== */
-/* Kernel launch wrappers                                                   */
-/* ======================================================================== */
-
-static void kl_layernorm(cuda_hy3d_runner *r, CUdeviceptr dst, CUdeviceptr src,
-                          CUdeviceptr w, CUdeviceptr b, int n_tok, int dim) {
-    float eps = 1e-6f;
-    void *args[] = {&dst, &src, &w, &b, &dim, &eps};
-    cuLaunchKernel(r->fn_layernorm, (unsigned)n_tok, 1, 1, 256, 1, 1,
-                   0, r->stream, args, NULL);
-}
-
-static void kl_gemm(cuda_hy3d_runner *r, CUdeviceptr Y, CUdeviceptr W,
-                     CUdeviceptr X, CUdeviceptr bias,
-                     int n_out, int n_in, int n_tok) {
-    CUfunction fn = (r->sm_version >= 70) ? r->fn_gemm : r->fn_gemm_tiled;
-    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
-    int bx = (r->sm_version >= 70) ? 32 : 256;
-    int gy = (n_tok + 15) / 16;
-    cuLaunchKernel(fn, (unsigned)((n_out+15)/16), (unsigned)gy, 1,
-                   bx, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_gelu(cuda_hy3d_runner *r, CUdeviceptr x, int n) {
-    void *args[] = {&x, &n};
-    cuLaunchKernel(r->fn_gelu, (unsigned)((n+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_silu(cuda_hy3d_runner *r, CUdeviceptr x, int n) {
-    void *args[] = {&x, &n};
-    cuLaunchKernel(r->fn_silu, (unsigned)((n+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_add(cuda_hy3d_runner *r, CUdeviceptr dst, CUdeviceptr src, int n) {
-    void *args[] = {&dst, &src, &n};
-    cuLaunchKernel(r->fn_add, (unsigned)((n+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_layerscale_add(cuda_hy3d_runner *r, CUdeviceptr dst,
-                               CUdeviceptr src, CUdeviceptr scale,
-                               int n, int dim) {
-    void *args[] = {&dst, &src, &scale, &n, &dim};
-    cuLaunchKernel(r->fn_layerscale_add, (unsigned)((n+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_rms_norm(cuda_hy3d_runner *r, CUdeviceptr data, CUdeviceptr w,
-                         int n_tok, int n_heads, int head_dim, int stride) {
-    float eps = 1e-6f;
-    int total = n_tok * n_heads;
-    void *args[] = {&data, &w, &n_tok, &n_heads, &head_dim, &stride, &eps};
-    cuLaunchKernel(r->fn_rms_norm, (unsigned)((total+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_qk_layernorm(cuda_hy3d_runner *r, CUdeviceptr data,
-                              CUdeviceptr w, CUdeviceptr b,
-                              int n_tok, int n_heads, int head_dim, int stride) {
-    float eps = 1e-6f;
-    int total = n_tok * n_heads;
-    void *args[] = {&data, &w, &b, &n_tok, &n_heads, &head_dim, &stride, &eps};
-    cuLaunchKernel(r->fn_qk_layernorm, (unsigned)((total+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_cross_attn(cuda_hy3d_runner *r, CUdeviceptr out,
-                           CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V,
-                           int q_len, int kv_len, int dim,
-                           int n_heads, int head_dim) {
-    float scale = 1.0f / sqrtf((float)head_dim);
-    int nt = 128;  /* threads per block */
-    size_t smem = (size_t)(kv_len + nt) * sizeof(float);
-    void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim,
-                    &n_heads, &head_dim, &scale};
-    cuLaunchKernel(r->fn_cross_attn, (unsigned)n_heads, (unsigned)q_len, 1,
-                   (unsigned)nt, 1, 1, smem, r->stream, args, NULL);
-}
-
-static void kl_self_attn(cuda_hy3d_runner *r, CUdeviceptr out,
-                          CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V,
-                          int n_tok, int dim, int n_heads, int head_dim) {
-    /* Reuse cross_attn with q_len == kv_len */
-    kl_cross_attn(r, out, Q, K, V, n_tok, n_tok, dim, n_heads, head_dim);
-}
-
-static void kl_fourier_embed(cuda_hy3d_runner *r, CUdeviceptr out,
-                              CUdeviceptr coords, CUdeviceptr freqs,
-                              int N, int num_freqs, int out_dim) {
-    void *args[] = {&out, &coords, &freqs, &N, &num_freqs, &out_dim};
-    cuLaunchKernel(r->fn_fourier_embed, (unsigned)((N+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_timestep_embed(cuda_hy3d_runner *r, CUdeviceptr out,
-                               float t, int dim) {
-    int half = dim / 2;
-    void *args[] = {&out, &t, &dim};
-    cuLaunchKernel(r->fn_timestep_embed, (unsigned)((half+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_euler_step(cuda_hy3d_runner *r, CUdeviceptr x, CUdeviceptr v,
-                           float dt, int n) {
-    void *args[] = {&x, &v, &dt, &n};
-    cuLaunchKernel(r->fn_euler_step, (unsigned)((n+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_cfg_combine(cuda_hy3d_runner *r, CUdeviceptr out,
-                            CUdeviceptr cond, CUdeviceptr uncond,
-                            float scale, int n) {
-    void *args[] = {&out, &cond, &uncond, &scale, &n};
-    cuLaunchKernel(r->fn_cfg_combine, (unsigned)((n+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_split_qkv(cuda_hy3d_runner *r, CUdeviceptr Q, CUdeviceptr K,
-                           CUdeviceptr V, CUdeviceptr qkv,
-                           int N, int H, int HD) {
-    int total = N * H * HD;
-    void *args[] = {&Q, &K, &V, &qkv, &N, &H, &HD};
-    cuLaunchKernel(r->fn_split_qkv, (unsigned)((total+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static void kl_split_kv(cuda_hy3d_runner *r, CUdeviceptr K, CUdeviceptr V,
-                          CUdeviceptr kv, int M, int H, int HD) {
-    int total = M * H * HD;
-    void *args[] = {&K, &V, &kv, &M, &H, &HD};
-    cuLaunchKernel(r->fn_split_kv, (unsigned)((total+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
 }
 
 /* ======================================================================== */
@@ -802,14 +434,47 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
         DIT_T(ca_q_norm_w, "attn2.q_norm.weight");
         DIT_T(ca_k_norm_w, "attn2.k_norm.weight");
 
-        /* norm3 before MLP (may or may not exist) */
+        /* norm3 before MLP/MoE */
         DIT_T(norm3_w,     "norm3.weight");
         DIT_T(norm3_b,     "norm3.bias");
 
-        DIT_T(mlp_fc1_w,   "mlp.fc1.weight");
-        DIT_T(mlp_fc1_b,   "mlp.fc1.bias");
-        DIT_T(mlp_fc2_w,   "mlp.fc2.weight");
-        DIT_T(mlp_fc2_b,   "mlp.fc2.bias");
+        /* Skip connection weights (blocks 11-20, i.e. layer > depth//2) */
+        b->use_skip = (i > DIT_HALF_DEPTH) ? 1 : 0;
+        if (b->use_skip) {
+            DIT_T(skip_linear_w, "skip_linear.weight");
+            DIT_T(skip_linear_b, "skip_linear.bias");
+            DIT_T(skip_norm_w,   "skip_norm.weight");
+            DIT_T(skip_norm_b,   "skip_norm.bias");
+        }
+
+        /* MoE vs regular MLP */
+        b->use_moe = (i >= DIT_MOE_START) ? 1 : 0;
+        if (b->use_moe) {
+            /* MoE gate */
+            DIT_T(moe_gate_w, "moe.gate.weight");
+            /* Per-expert weights */
+            for (int e = 0; e < DIT_N_EXPERTS; e++) {
+                snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.0.proj.weight", i, e);
+                b->moe_expert_fc1_w[e] = st_upload_f16(st, name, r->verbose);
+                snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.0.proj.bias", i, e);
+                b->moe_expert_fc1_b[e] = st_upload_f16(st, name, r->verbose);
+                snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.2.weight", i, e);
+                b->moe_expert_fc2_w[e] = st_upload_f16(st, name, r->verbose);
+                snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.2.bias", i, e);
+                b->moe_expert_fc2_b[e] = st_upload_f16(st, name, r->verbose);
+            }
+            /* Shared expert */
+            DIT_T(moe_shared_fc1_w, "moe.shared_experts.net.0.proj.weight");
+            DIT_T(moe_shared_fc1_b, "moe.shared_experts.net.0.proj.bias");
+            DIT_T(moe_shared_fc2_w, "moe.shared_experts.net.2.weight");
+            DIT_T(moe_shared_fc2_b, "moe.shared_experts.net.2.bias");
+        } else {
+            /* Regular MLP */
+            DIT_T(mlp_fc1_w,   "mlp.fc1.weight");
+            DIT_T(mlp_fc1_b,   "mlp.fc1.bias");
+            DIT_T(mlp_fc2_w,   "mlp.fc2.weight");
+            DIT_T(mlp_fc2_b,   "mlp.fc2.bias");
+        }
         #undef DIT_T
     }
 
@@ -825,6 +490,7 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
     return 0;
 }
 
+/* Fix 6 & 7: VAE tensor name mapping */
 static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
     st_context *st = safetensors_open(path);
     if (!st) {
@@ -838,72 +504,71 @@ static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
     r->vae_post_kl_w = st_upload_f32(st, "post_kl.weight", r->verbose);
     r->vae_post_kl_b = st_upload_f32(st, "post_kl.bias", r->verbose);
 
-    /* Transformer decoder blocks */
+    /* Fix 6: Transformer decoder blocks use transformer.resblocks.N prefix */
     for (int i = 0; i < VAE_DEC_LAYERS; i++) {
         char name[256];
         vae_block_gpu *b = &r->vae_blocks[i];
         #define VAE_T(field, suffix) \
-            snprintf(name, sizeof(name), "decoder.layers.%d.%s", i, suffix); \
+            snprintf(name, sizeof(name), "transformer.resblocks.%d.%s", i, suffix); \
             b->field = st_upload_f32(st, name, r->verbose);
 
-        VAE_T(ln1_w,        "ln1.weight");
-        VAE_T(ln1_b,        "ln1.bias");
-        VAE_T(qkv_w,        "attn.qkv.weight");
-        VAE_T(proj_w,       "attn.proj.weight");
-        VAE_T(proj_b,       "attn.proj.bias");
-        VAE_T(q_norm_w,     "attn.q_norm.weight");
-        VAE_T(q_norm_b,     "attn.q_norm.bias");
-        VAE_T(k_norm_w,     "attn.k_norm.weight");
-        VAE_T(k_norm_b,     "attn.k_norm.bias");
-        VAE_T(ln2_w,        "ln2.weight");
-        VAE_T(ln2_b,        "ln2.bias");
-        VAE_T(mlp_fc_w,     "mlp.fc.weight");
-        VAE_T(mlp_fc_b,     "mlp.fc.bias");
-        VAE_T(mlp_proj_w,   "mlp.proj.weight");
-        VAE_T(mlp_proj_b,   "mlp.proj.bias");
+        VAE_T(ln1_w,        "ln_1.weight");
+        VAE_T(ln1_b,        "ln_1.bias");
+        VAE_T(qkv_w,        "attn.c_qkv.weight");
+        VAE_T(proj_w,       "attn.c_proj.weight");
+        VAE_T(proj_b,       "attn.c_proj.bias");
+        VAE_T(q_norm_w,     "attn.attention.q_norm.weight");
+        VAE_T(q_norm_b,     "attn.attention.q_norm.bias");
+        VAE_T(k_norm_w,     "attn.attention.k_norm.weight");
+        VAE_T(k_norm_b,     "attn.attention.k_norm.bias");
+        VAE_T(ln2_w,        "ln_2.weight");
+        VAE_T(ln2_b,        "ln_2.bias");
+        VAE_T(mlp_fc_w,     "mlp.c_fc.weight");
+        VAE_T(mlp_fc_b,     "mlp.c_fc.bias");
+        VAE_T(mlp_proj_w,   "mlp.c_proj.weight");
+        VAE_T(mlp_proj_b,   "mlp.c_proj.bias");
         #undef VAE_T
 
         b->use_qk_norm = (b->q_norm_w != 0);
     }
 
-    /* Geometry decoder */
+    /* Fix 7: Geometry decoder uses geo_decoder.cross_attn_decoder prefix */
     vae_geo_decoder_gpu *g = &r->vae_geo;
     #define GEO_T(field, suffix) \
-        g->field = st_upload_f32(st, "geo_decoder." suffix, r->verbose);
+        g->field = st_upload_f32(st, suffix, r->verbose);
 
-    GEO_T(query_proj_w, "query_proj.weight");
-    GEO_T(query_proj_b, "query_proj.bias");
-    GEO_T(ln1_w,        "cross_attn_block.ln1.weight");
-    GEO_T(ln1_b,        "cross_attn_block.ln1.bias");
-    GEO_T(ln2_w,        "cross_attn_block.ln2.weight");
-    GEO_T(ln2_b,        "cross_attn_block.ln2.bias");
-    GEO_T(c_q_w,        "cross_attn_block.attn.q.weight");
-    GEO_T(c_kv_w,       "cross_attn_block.attn.kv.weight");
-    GEO_T(c_proj_w,     "cross_attn_block.attn.proj.weight");
-    GEO_T(c_proj_b,     "cross_attn_block.attn.proj.bias");
-    GEO_T(q_norm_w,     "cross_attn_block.attn.q_norm.weight");
-    GEO_T(q_norm_b,     "cross_attn_block.attn.q_norm.bias");
-    GEO_T(k_norm_w,     "cross_attn_block.attn.k_norm.weight");
-    GEO_T(k_norm_b,     "cross_attn_block.attn.k_norm.bias");
-    GEO_T(ln3_w,        "cross_attn_block.ln3.weight");
-    GEO_T(ln3_b,        "cross_attn_block.ln3.bias");
-    GEO_T(mlp_fc_w,     "cross_attn_block.mlp.fc.weight");
-    GEO_T(mlp_fc_b,     "cross_attn_block.mlp.fc.bias");
-    GEO_T(mlp_proj_w,   "cross_attn_block.mlp.proj.weight");
-    GEO_T(mlp_proj_b,   "cross_attn_block.mlp.proj.bias");
-    GEO_T(ln_post_w,    "ln_post.weight");
-    GEO_T(ln_post_b,    "ln_post.bias");
-    GEO_T(output_w,     "output_proj.weight");
-    GEO_T(output_b,     "output_proj.bias");
+    GEO_T(query_proj_w, "geo_decoder.query_proj.weight");
+    GEO_T(query_proj_b, "geo_decoder.query_proj.bias");
+    GEO_T(ln1_w,        "geo_decoder.cross_attn_decoder.ln_1.weight");
+    GEO_T(ln1_b,        "geo_decoder.cross_attn_decoder.ln_1.bias");
+    GEO_T(ln2_w,        "geo_decoder.cross_attn_decoder.ln_2.weight");
+    GEO_T(ln2_b,        "geo_decoder.cross_attn_decoder.ln_2.bias");
+    GEO_T(c_q_w,        "geo_decoder.cross_attn_decoder.attn.c_q.weight");
+    GEO_T(c_kv_w,       "geo_decoder.cross_attn_decoder.attn.c_kv.weight");
+    GEO_T(c_proj_w,     "geo_decoder.cross_attn_decoder.attn.c_proj.weight");
+    GEO_T(c_proj_b,     "geo_decoder.cross_attn_decoder.attn.c_proj.bias");
+    GEO_T(q_norm_w,     "geo_decoder.cross_attn_decoder.attn.attention.q_norm.weight");
+    GEO_T(q_norm_b,     "geo_decoder.cross_attn_decoder.attn.attention.q_norm.bias");
+    GEO_T(k_norm_w,     "geo_decoder.cross_attn_decoder.attn.attention.k_norm.weight");
+    GEO_T(k_norm_b,     "geo_decoder.cross_attn_decoder.attn.attention.k_norm.bias");
+    GEO_T(ln3_w,        "geo_decoder.cross_attn_decoder.ln_3.weight");
+    GEO_T(ln3_b,        "geo_decoder.cross_attn_decoder.ln_3.bias");
+    GEO_T(mlp_fc_w,     "geo_decoder.cross_attn_decoder.mlp.c_fc.weight");
+    GEO_T(mlp_fc_b,     "geo_decoder.cross_attn_decoder.mlp.c_fc.bias");
+    GEO_T(mlp_proj_w,   "geo_decoder.cross_attn_decoder.mlp.c_proj.weight");
+    GEO_T(mlp_proj_b,   "geo_decoder.cross_attn_decoder.mlp.c_proj.bias");
+    GEO_T(ln_post_w,    "geo_decoder.ln_post.weight");
+    GEO_T(ln_post_b,    "geo_decoder.ln_post.bias");
+    GEO_T(output_w,     "geo_decoder.output_proj.weight");
+    GEO_T(output_b,     "geo_decoder.output_proj.bias");
     #undef GEO_T
 
     g->use_qk_norm = (g->q_norm_w != 0);
 
-    /* Pre-compute Fourier frequencies on GPU */
+    /* Fix 5: Pre-compute Fourier frequencies WITHOUT pi multiplier */
     float freqs[VAE_NUM_FREQS];
-    const float pi = 3.141592653589793f;
     for (int i = 0; i < VAE_NUM_FREQS; i++) {
-        freqs[i] = powf(2.0f, (float)i) * pi;
+        freqs[i] = powf(2.0f, (float)i);  /* 2^i, no pi factor */
     }
     r->vae_fourier_freqs = cu_upload_raw(freqs, sizeof(freqs));
 
@@ -921,6 +586,8 @@ static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
  * Input:  d_image [3, 518, 518] F32 (normalized)
  * Output: d_out [1370, 1024] F32 */
 static void run_dinov2(cuda_hy3d_runner *r, CUdeviceptr d_image, CUdeviceptr d_out) {
+    hy3d_ops *ops = &r->ops;
+    CUstream stream = r->stream;
     const int seq = DINO_SEQ_LEN;
     const int dim = DINO_HIDDEN;
     const int heads = DINO_HEADS;
@@ -930,31 +597,28 @@ static void run_dinov2(cuda_hy3d_runner *r, CUdeviceptr d_image, CUdeviceptr d_o
     const int gw = DINO_IMG_SIZE / ps;  /* 37 */
 
     /* Scratch: 0=hidden[seq*dim], 1=qkv[3*seq*dim], 2=attn_out[seq*dim],
-     *          3=mlp[seq*ffn], 4=normed[seq*dim], 5=K_t+V_t[2*heads*seq*hd] */
+     *          3=mlp[seq*ffn], 4=normed[seq*dim] */
     ensure_scratch(r, 0, (size_t)seq * dim * sizeof(float));
     ensure_scratch(r, 1, (size_t)3 * seq * dim * sizeof(float));
     ensure_scratch(r, 2, (size_t)seq * dim * sizeof(float));
     ensure_scratch(r, 3, (size_t)seq * ffn * sizeof(float));
     ensure_scratch(r, 4, (size_t)seq * dim * sizeof(float));
-    ensure_scratch(r, 5, (size_t)2 * seq * dim * sizeof(float));
 
     CUdeviceptr d_hidden = r->scratch[0];
     CUdeviceptr d_qkv    = r->scratch[1];
     CUdeviceptr d_attn   = r->scratch[2];
     CUdeviceptr d_mlp    = r->scratch[3];
     CUdeviceptr d_normed = r->scratch[4];
-    CUdeviceptr d_Kt     = r->scratch[5];
-    (void)d_Kt; /* KV transpose used by flash attention path */
 
-    /* 1. Patch embedding: conv2d → [num_patches, dim] */
+    /* 1. Patch embedding: conv2d -> [num_patches, dim] */
     {
         int gw2 = gw;
         int dim2 = dim, ps2 = ps, img_w = DINO_IMG_SIZE;
         CUdeviceptr pw = r->dino_patch_w, pb = r->dino_patch_b;
         void *args[] = {&d_hidden, &d_image, &pw, &pb, &gw2, &dim2, &ps2, &img_w};
-        cuLaunchKernel(r->fn_patch_embed,
+        cuLaunchKernel(ops->patch_embed,
                        (unsigned)((dim+15)/16), (unsigned)(gw*gw), 1,
-                       16, 1, 1, 0, r->stream, args, NULL);
+                       16, 1, 1, 0, stream, args, NULL);
     }
 
     /* 2. CLS token + position embeddings */
@@ -962,60 +626,63 @@ static void run_dinov2(cuda_hy3d_runner *r, CUdeviceptr d_image, CUdeviceptr d_o
         int n_tok = seq, d2 = dim;
         void *args[] = {(void*)&d_hidden, (void*)&r->dino_cls_token,
                         (void*)&r->dino_pos_emb, &n_tok, &d2};
-        cuLaunchKernel(r->fn_cls_pos_embed,
+        cuLaunchKernel(ops->cls_pos_embed,
                        (unsigned)((seq*dim+255)/256), 1, 1,
-                       256, 1, 1, 0, r->stream, args, NULL);
+                       256, 1, 1, 0, stream, args, NULL);
     }
 
     /* 3. Encoder layers */
     for (int li = 0; li < DINO_LAYERS; li++) {
         dino_layer_gpu *l = &r->dino_layers[li];
 
-        /* LN1 → Q,K,V → Attention → LayerScale + residual */
-        kl_layernorm(r, d_normed, d_hidden, l->ln1_w, l->ln1_b, seq, dim);
+        /* LN1 -> Q,K,V -> Attention -> LayerScale + residual */
+        op_layernorm(ops, stream, d_normed, d_hidden, l->ln1_w, l->ln1_b, seq, dim);
 
         /* Q, K, V projections */
         CUdeviceptr d_Q = d_qkv;
         CUdeviceptr d_K = d_qkv + (size_t)seq * dim * sizeof(float);
         CUdeviceptr d_V = d_qkv + (size_t)2 * seq * dim * sizeof(float);
-        kl_gemm(r, d_Q, l->q_w, d_normed, l->q_b, dim, dim, seq);
-        kl_gemm(r, d_K, l->k_w, d_normed, l->k_b, dim, dim, seq);
-        kl_gemm(r, d_V, l->v_w, d_normed, l->v_b, dim, dim, seq);
+        op_gemm(ops, stream, d_Q, l->q_w, d_normed, l->q_b, dim, dim, seq);
+        op_gemm(ops, stream, d_K, l->k_w, d_normed, l->k_b, dim, dim, seq);
+        op_gemm(ops, stream, d_V, l->v_w, d_normed, l->v_b, dim, dim, seq);
 
         /* Self-attention */
-        kl_self_attn(r, d_attn, d_Q, d_K, d_V, seq, dim, heads, hd);
+        op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, seq, dim, heads, hd);
 
         /* Output projection */
-        kl_gemm(r, d_normed, l->out_w, d_attn, l->out_b, dim, dim, seq);
+        op_gemm(ops, stream, d_normed, l->out_w, d_attn, l->out_b, dim, dim, seq);
 
         /* LayerScale 1 + residual */
         if (l->ls1)
-            kl_layerscale_add(r, d_hidden, d_normed, l->ls1, seq * dim, dim);
+            op_layerscale_add(ops, stream, d_hidden, d_normed, l->ls1, seq * dim, dim);
         else
-            kl_add(r, d_hidden, d_normed, seq * dim);
+            op_add(ops, stream, d_hidden, d_normed, seq * dim);
 
-        /* LN2 → MLP → LayerScale + residual */
-        kl_layernorm(r, d_normed, d_hidden, l->ln2_w, l->ln2_b, seq, dim);
-        kl_gemm(r, d_mlp, l->fc1_w, d_normed, l->fc1_b, ffn, dim, seq);
-        kl_gelu(r, d_mlp, seq * ffn);
-        kl_gemm(r, d_normed, l->fc2_w, d_mlp, l->fc2_b, dim, ffn, seq);
+        /* LN2 -> MLP -> LayerScale + residual */
+        op_layernorm(ops, stream, d_normed, d_hidden, l->ln2_w, l->ln2_b, seq, dim);
+        op_gemm(ops, stream, d_mlp, l->fc1_w, d_normed, l->fc1_b, ffn, dim, seq);
+        op_gelu(ops, stream, d_mlp, seq * ffn);
+        op_gemm(ops, stream, d_normed, l->fc2_w, d_mlp, l->fc2_b, dim, ffn, seq);
 
         if (l->ls2)
-            kl_layerscale_add(r, d_hidden, d_normed, l->ls2, seq * dim, dim);
+            op_layerscale_add(ops, stream, d_hidden, d_normed, l->ls2, seq * dim, dim);
         else
-            kl_add(r, d_hidden, d_normed, seq * dim);
+            op_add(ops, stream, d_hidden, d_normed, seq * dim);
     }
 
     /* 4. Final LN */
     if (r->dino_final_ln_w) {
-        kl_layernorm(r, d_out, d_hidden, r->dino_final_ln_w, r->dino_final_ln_b, seq, dim);
+        op_layernorm(ops, stream, d_out, d_hidden, r->dino_final_ln_w, r->dino_final_ln_b, seq, dim);
     } else {
-        cuMemcpyDtoDAsync(d_out, d_hidden, (size_t)seq * dim * sizeof(float), r->stream);
+        cuMemcpyDtoDAsync(d_out, d_hidden, (size_t)seq * dim * sizeof(float), stream);
     }
 }
 
 /* Pre-compute DiT cross-attention K,V for all blocks (constant across diffusion steps) */
 static void precompute_dit_ca_kv(cuda_hy3d_runner *r, CUdeviceptr d_context) {
+    hy3d_ops *ops = &r->ops;
+    CUstream stream = r->stream;
+
     for (int i = 0; i < DIT_DEPTH; i++) {
         dit_block_gpu *b = &r->dit_blocks[i];
 
@@ -1026,51 +693,236 @@ static void precompute_dit_ca_kv(cuda_hy3d_runner *r, CUdeviceptr d_context) {
         }
 
         /* K = context @ ca_k_w.T  (no bias) */
-        kl_gemm(r, r->dit_ca_K[i], b->ca_k_w, d_context, 0,
+        op_gemm(ops, stream, r->dit_ca_K[i], b->ca_k_w, d_context, 0,
                 DIT_HIDDEN, DIT_CONTEXT_DIM, DINO_SEQ_LEN);
         /* V = context @ ca_v_w.T  (no bias) */
-        kl_gemm(r, r->dit_ca_V[i], b->ca_v_w, d_context, 0,
+        op_gemm(ops, stream, r->dit_ca_V[i], b->ca_v_w, d_context, 0,
                 DIT_HIDDEN, DIT_CONTEXT_DIM, DINO_SEQ_LEN);
 
         /* Apply RMS norm to K for QK normalization */
         if (b->ca_k_norm_w) {
-            kl_rms_norm(r, r->dit_ca_K[i], b->ca_k_norm_w,
+            op_rms_norm(ops, stream, r->dit_ca_K[i], b->ca_k_norm_w,
                         DINO_SEQ_LEN, DIT_HEADS, DIT_HEAD_DIM, DIT_HIDDEN);
         }
     }
     r->ca_kv_precomputed = 1;
 }
 
+/*
+ * MoE forward: simplified "run all experts on all tokens" approach.
+ *
+ * 1. gate_logits = x @ gate_w.T             -> [N, 8]
+ * 2. Download gate_logits, compute softmax, top-2 mask on CPU
+ * 3. Shared expert: shared_out = GELU(x @ shared_fc1_w.T + b) @ shared_fc2_w.T + b
+ * 4. For each expert e (0..7):
+ *      expert_out_e = GELU(x @ fc1_w_e.T + b_e) @ fc2_w_e.T + b_e
+ *      output += expert_out_e * gate_weights[:, e]  (only top-2 are non-zero)
+ * 5. output += shared_out
+ *
+ * The gate weights (top-2 per row, rest zero) are uploaded as [N] floats per expert.
+ * We accumulate into d_output which starts as zeros.
+ */
+static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
+                         CUdeviceptr d_input, CUdeviceptr d_output,
+                         int N_tok, CUdeviceptr d_moe_scratch) {
+    hy3d_ops *ops = &r->ops;
+    CUstream stream = r->stream;
+    const int H_dim = DIT_HIDDEN;
+    const int ffn = DIT_FFN;
+
+    /* Scratch layout within d_moe_scratch:
+     * gate_logits  [N_tok * DIT_N_EXPERTS]
+     * expert_h     [N_tok * ffn]
+     * expert_out   [N_tok * H_dim]
+     * shared_h     [N_tok * ffn]
+     * shared_out   [N_tok * H_dim]
+     * scale_buf    [N_tok]           -- per-expert gate weights (re-uploaded each expert)
+     */
+    size_t off = 0;
+    CUdeviceptr d_gate   = d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
+    CUdeviceptr d_exp_h  = d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
+    CUdeviceptr d_exp_o  = d_moe_scratch + off; off += (size_t)N_tok * H_dim * sizeof(float);
+    CUdeviceptr d_shr_h  = d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
+    CUdeviceptr d_shr_o  = d_moe_scratch + off; off += (size_t)N_tok * H_dim * sizeof(float);
+    CUdeviceptr d_scale  = d_moe_scratch + off; /* [N_tok] */
+
+    /* Step 1: Compute gate logits: [N_tok, H_dim] @ [8, H_dim]^T -> [N_tok, 8] */
+    op_gemm(ops, stream, d_gate, blk->moe_gate_w, d_input, 0,
+            DIT_N_EXPERTS, H_dim, N_tok);
+
+    /* Step 2: Download gate logits, compute softmax + top-2 on CPU */
+    float *gate_cpu = (float *)malloc((size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
+    cuStreamSynchronize(stream);
+    cuMemcpyDtoH(gate_cpu, d_gate, (size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
+
+    /* Softmax over experts per token, then top-2 masking */
+    /* gate_weights[tok][expert]: non-zero only for top-2 */
+    float *gate_weights = (float *)calloc((size_t)N_tok * DIT_N_EXPERTS, sizeof(float));
+    for (int t = 0; t < N_tok; t++) {
+        float *row = gate_cpu + t * DIT_N_EXPERTS;
+        /* Softmax */
+        float mx = row[0];
+        for (int e = 1; e < DIT_N_EXPERTS; e++)
+            if (row[e] > mx) mx = row[e];
+        float sum = 0.0f;
+        float softmax_vals[DIT_N_EXPERTS];
+        for (int e = 0; e < DIT_N_EXPERTS; e++) {
+            softmax_vals[e] = expf(row[e] - mx);
+            sum += softmax_vals[e];
+        }
+        float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+        for (int e = 0; e < DIT_N_EXPERTS; e++)
+            softmax_vals[e] *= inv;
+
+        /* Top-2 selection */
+        int top_idx[DIT_MOE_TOP_K];
+        float top_val[DIT_MOE_TOP_K];
+        for (int k = 0; k < DIT_MOE_TOP_K; k++) {
+            int best = -1;
+            float best_v = -1e30f;
+            for (int e = 0; e < DIT_N_EXPERTS; e++) {
+                int used = 0;
+                for (int kk = 0; kk < k; kk++)
+                    if (top_idx[kk] == e) { used = 1; break; }
+                if (!used && softmax_vals[e] > best_v) {
+                    best_v = softmax_vals[e];
+                    best = e;
+                }
+            }
+            top_idx[k] = best;
+            top_val[k] = best_v;
+        }
+
+        /* Renormalize top-2 weights */
+        float top_sum = 0.0f;
+        for (int k = 0; k < DIT_MOE_TOP_K; k++) top_sum += top_val[k];
+        float top_inv = (top_sum > 0.0f) ? 1.0f / top_sum : 0.0f;
+        for (int k = 0; k < DIT_MOE_TOP_K; k++) {
+            gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k] * top_inv;
+        }
+    }
+    free(gate_cpu);
+
+    /* Step 3: Zero out accumulator (d_output) */
+    cuMemsetD8Async(d_output, 0, (size_t)N_tok * H_dim * sizeof(float), stream);
+
+    /* Step 4: For each expert, compute output and weighted-add */
+    float *expert_scale_cpu = (float *)malloc((size_t)N_tok * sizeof(float));
+    for (int e = 0; e < DIT_N_EXPERTS; e++) {
+        /* Check if any token uses this expert */
+        int any_nonzero = 0;
+        for (int t = 0; t < N_tok; t++) {
+            expert_scale_cpu[t] = gate_weights[t * DIT_N_EXPERTS + e];
+            if (expert_scale_cpu[t] > 0.0f) any_nonzero = 1;
+        }
+        if (!any_nonzero) continue;
+
+        /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e */
+        op_gemm(ops, stream, d_exp_h, blk->moe_expert_fc1_w[e], d_input,
+                blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
+        op_gelu(ops, stream, d_exp_h, N_tok * ffn);
+        op_gemm(ops, stream, d_exp_o, blk->moe_expert_fc2_w[e], d_exp_h,
+                blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
+
+        /* Upload per-token scale factors for this expert */
+        cuMemcpyHtoDAsync(d_scale, expert_scale_cpu,
+                          (size_t)N_tok * sizeof(float), stream);
+
+        /* Weighted add: d_output[t, :] += scale[t] * d_exp_o[t, :]
+         * We use broadcast_add style but with per-element scaling.
+         * Since we lack a fused scale-add kernel, we'll scale d_exp_o in-place
+         * using broadcast (scale per row) then add to output.
+         *
+         * Scale each row: for element [t*H_dim + j], multiply by scale[t].
+         * We can reuse broadcast_add semantics reversed: treat scale as [N_tok]
+         * and broadcast across dim. But we need multiply, not add.
+         *
+         * Simplest approach: do it row-by-row. But that's N_tok kernel launches.
+         * Better: just do it on CPU for the accumulation since we already sync'd.
+         *
+         * Actually, let's keep it on GPU. Download expert output, scale, upload
+         * accumulated result. For a first pass this is acceptable. */
+
+        /* Sync and do scale-add on CPU */
+        cuStreamSynchronize(stream);
+        float *exp_out_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
+        float *accum_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
+        cuMemcpyDtoH(exp_out_cpu, d_exp_o, (size_t)N_tok * H_dim * sizeof(float));
+        cuMemcpyDtoH(accum_cpu, d_output, (size_t)N_tok * H_dim * sizeof(float));
+
+        for (int t = 0; t < N_tok; t++) {
+            float w = expert_scale_cpu[t];
+            if (w == 0.0f) continue;
+            for (int j = 0; j < H_dim; j++)
+                accum_cpu[t * H_dim + j] += w * exp_out_cpu[t * H_dim + j];
+        }
+
+        cuMemcpyHtoDAsync(d_output, accum_cpu,
+                          (size_t)N_tok * H_dim * sizeof(float), stream);
+        free(exp_out_cpu);
+        free(accum_cpu);
+    }
+    free(expert_scale_cpu);
+    free(gate_weights);
+
+    /* Step 5: Add shared expert output */
+    op_gemm(ops, stream, d_shr_h, blk->moe_shared_fc1_w, d_input,
+            blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    op_gelu(ops, stream, d_shr_h, N_tok * ffn);
+    op_gemm(ops, stream, d_shr_o, blk->moe_shared_fc2_w, d_shr_h,
+            blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
+    op_add(ops, stream, d_output, d_shr_o, N_tok * H_dim);
+}
+
 /* Stage 2: Single DiT forward pass
+ *
+ * Fix 1: U-Net skip connections (blocks 11-20)
+ * Fix 2: MoE in blocks 15-20
+ * Fix 3: Prepend timestep token -> seq_len = N+1, strip at final layer
+ * Fix 4: TimestepEmbedder uses GELU (not SiLU)
+ *
  * Input:  d_latents [4096, 64] F32, timestep (scalar), d_context [1370, 1024] F32
  * Output: d_output [4096, 64] F32 */
 static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
                              float timestep, CUdeviceptr d_context __attribute__((unused)),
                              CUdeviceptr d_output) {
-    const int N = DIT_INPUT_SIZE;
-    const int C = DIT_IN_CHANNELS;
-    const int H_dim = DIT_HIDDEN;
-    const int heads = DIT_HEADS;
-    const int hd = DIT_HEAD_DIM;
-    const int ffn = H_dim * 4;
-    const int ctx_len = DINO_SEQ_LEN;
+    hy3d_ops *ops = &r->ops;
+    CUstream stream = r->stream;
+    const int N = DIT_INPUT_SIZE;       /* 4096 */
+    const int C = DIT_IN_CHANNELS;      /* 64 */
+    const int H_dim = DIT_HIDDEN;       /* 2048 */
+    const int heads = DIT_HEADS;        /* 16 */
+    const int hd = DIT_HEAD_DIM;        /* 128 */
+    const int ffn = DIT_FFN;            /* 8192 */
+    const int ctx_len = DINO_SEQ_LEN;   /* 1370 */
+    const int N1 = N + 1;              /* 4097 (with prepended timestep token) */
 
-    /* Scratch layout:
-     * 0: hidden [N, H_dim]
-     * 1: Q/K/V [3 * N * H_dim]
-     * 2: attn_out [N, H_dim]
-     * 3: mlp [N, ffn]
-     * 4: normed [N, H_dim]
+    /* Scratch layout (using N1 = N+1 for transformer sequence length):
+     * 0: hidden [(N1) * H_dim]         -- main hidden state
+     * 1: Q/K/V [3 * N1 * H_dim]        -- QKV workspace
+     * 2: attn_out [N1 * H_dim]
+     * 3: mlp/moe scratch [see below]
+     * 4: normed [N1 * H_dim]
      * 5: t_emb [H_dim] + t_mlp [ffn]
-     * 6: cross_Q [N, H_dim]
-     */
-    ensure_scratch(r, 0, (size_t)N * H_dim * sizeof(float));
-    ensure_scratch(r, 1, (size_t)3 * N * H_dim * sizeof(float));
-    ensure_scratch(r, 2, (size_t)N * H_dim * sizeof(float));
-    ensure_scratch(r, 3, (size_t)N * ffn * sizeof(float));
-    ensure_scratch(r, 4, (size_t)N * H_dim * sizeof(float));
+     * 6: cross_Q [N1 * H_dim] + cat_buf [N1 * 2*H_dim] + skip_values stack
+     * 7: moe scratch [N1*(8+ffn+H_dim)*2+...] */
+
+    /* For MoE scratch: gate[N1*8] + exp_h[N1*ffn] + exp_o[N1*H_dim] +
+     *                  shr_h[N1*ffn] + shr_o[N1*H_dim] + scale[N1] */
+    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim + ffn + H_dim + 1) * sizeof(float);
+    /* For skip: need [DIT_HALF_DEPTH+1] saved hidden states, each N1*H_dim */
+    size_t skip_stack_sz = (size_t)(DIT_HALF_DEPTH + 1) * N1 * H_dim * sizeof(float);
+    /* For concat: [N1 * 2*H_dim] */
+    size_t cat_buf_sz = (size_t)N1 * 2 * H_dim * sizeof(float);
+
+    ensure_scratch(r, 0, (size_t)N1 * H_dim * sizeof(float));
+    ensure_scratch(r, 1, (size_t)3 * N1 * H_dim * sizeof(float));
+    ensure_scratch(r, 2, (size_t)N1 * H_dim * sizeof(float));
+    ensure_scratch(r, 3, (size_t)N1 * ffn * sizeof(float));
+    ensure_scratch(r, 4, (size_t)N1 * H_dim * sizeof(float));
     ensure_scratch(r, 5, (size_t)(H_dim + ffn) * sizeof(float));
-    ensure_scratch(r, 6, (size_t)N * H_dim * sizeof(float));
+    ensure_scratch(r, 6, cat_buf_sz + skip_stack_sz + (size_t)N1 * H_dim * sizeof(float));
+    ensure_scratch(r, 7, moe_scratch_sz);
 
     CUdeviceptr d_hidden = r->scratch[0];
     CUdeviceptr d_qkv    = r->scratch[1];
@@ -1080,93 +932,144 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     CUdeviceptr d_temb   = r->scratch[5];
     CUdeviceptr d_tmlp   = d_temb + (size_t)H_dim * sizeof(float);
     CUdeviceptr d_cross_Q = r->scratch[6];
+    CUdeviceptr d_cat_buf = d_cross_Q + (size_t)N1 * H_dim * sizeof(float);
+    CUdeviceptr d_skip_stack = d_cat_buf + cat_buf_sz;
+    CUdeviceptr d_moe_scratch = r->scratch[7];
 
-    /* 1. Embed latents: [N, C] → [N, H_dim] */
-    kl_gemm(r, d_hidden, r->dit_x_emb_w, d_latents, r->dit_x_emb_b,
+    /* 1. Embed latents: [N, C] -> [N, H_dim] (into a temp buffer, not d_hidden yet) */
+    /* We put the embedded result into d_normed temporarily */
+    op_gemm(ops, stream, d_normed, r->dit_x_emb_w, d_latents, r->dit_x_emb_b,
             H_dim, C, N);
 
-    /* 2. Timestep embedding: sinusoidal → MLP(SiLU) → add to all tokens */
-    kl_timestep_embed(r, d_temb, timestep, H_dim);
-    kl_gemm(r, d_tmlp, r->dit_t_mlp0_w, d_temb, r->dit_t_mlp0_b,
+    /* 2. Fix 4: Timestep embedding with GELU (not SiLU)
+     * sinusoidal -> Linear(2048 -> 8192) -> GELU -> Linear(8192 -> 2048) */
+    op_timestep_embed(ops, stream, d_temb, timestep, H_dim);
+    op_gemm(ops, stream, d_tmlp, r->dit_t_mlp0_w, d_temb, r->dit_t_mlp0_b,
             ffn, H_dim, 1);
-    kl_silu(r, d_tmlp, ffn);
-    kl_gemm(r, d_temb, r->dit_t_mlp2_w, d_tmlp, r->dit_t_mlp2_b,
+    op_gelu(ops, stream, d_tmlp, ffn);  /* Fix 4: GELU, not SiLU */
+    op_gemm(ops, stream, d_temb, r->dit_t_mlp2_w, d_tmlp, r->dit_t_mlp2_b,
             H_dim, ffn, 1);
 
-    /* Broadcast-add timestep embedding to all N tokens */
-    /* We'll use a simple loop: replicate d_temb N times and add */
-    /* For efficiency, use the bilinear_upsample as a broadcast or just do N adds */
-    /* Simple approach: do it per-row via GPU kernel. Use add_f32 with tiling. */
-    /* Actually, let's just iterate on CPU side — N is fixed at 4096 */
-    for (int tok = 0; tok < N; tok++) {
-        CUdeviceptr dst = d_hidden + (size_t)tok * H_dim * sizeof(float);
-        kl_add(r, dst, d_temb, H_dim);
-    }
+    /* 3. Fix 3: Prepend timestep token to sequence
+     * c = t_emb [1, H_dim]
+     * x = d_normed [N, H_dim]   (embedded latents)
+     * d_hidden = cat([c, x], dim=0)  -> [N+1, H_dim] */
+    op_concat_first(ops, stream, d_hidden, d_temb, d_normed, N, H_dim);
 
-    /* 3. Transformer blocks */
+    /* Now d_hidden has shape [N1, H_dim] = [4097, 2048] */
+
+    /* Skip value stack pointer: blocks 0..DIT_HALF_DEPTH save hidden states */
+    int skip_sp = 0;
+
+    /* 4. Transformer blocks */
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
         dit_block_gpu *blk = &r->dit_blocks[bi];
 
+        /* Fix 1: Skip connection (blocks 11-20, layer > depth//2)
+         * Before self-attention: pop skip value, concat, linear project, norm */
+        if (blk->use_skip && skip_sp > 0) {
+            skip_sp--;
+            CUdeviceptr d_skip_val = d_skip_stack + (size_t)skip_sp * N1 * H_dim * sizeof(float);
+
+            /* cat = concat([skip_value, x], dim=-1)  -> [N1, 2*H_dim] */
+            op_concat_last_dim(ops, stream, d_cat_buf, d_skip_val, d_hidden, N1, H_dim);
+
+            /* x = skip_linear(cat)  -> [N1, H_dim] */
+            op_gemm(ops, stream, d_hidden, blk->skip_linear_w, d_cat_buf,
+                    blk->skip_linear_b, H_dim, 2 * H_dim, N1);
+
+            /* x = skip_norm(x) */
+            op_layernorm(ops, stream, d_hidden, d_hidden,
+                         blk->skip_norm_w, blk->skip_norm_b, N1, H_dim);
+        }
+
+        /* Save hidden state for skip connection (blocks 0..DIT_HALF_DEPTH) */
+        if (bi <= DIT_HALF_DEPTH) {
+            CUdeviceptr d_save = d_skip_stack + (size_t)skip_sp * N1 * H_dim * sizeof(float);
+            cuMemcpyDtoDAsync(d_save, d_hidden,
+                              (size_t)N1 * H_dim * sizeof(float), stream);
+            skip_sp++;
+        }
+
         /* === Self-attention === */
-        kl_layernorm(r, d_normed, d_hidden, blk->norm1_w, blk->norm1_b, N, H_dim);
+        op_layernorm(ops, stream, d_normed, d_hidden, blk->norm1_w, blk->norm1_b, N1, H_dim);
 
         CUdeviceptr d_Q = d_qkv;
-        CUdeviceptr d_K = d_qkv + (size_t)N * H_dim * sizeof(float);
-        CUdeviceptr d_V = d_qkv + (size_t)2 * N * H_dim * sizeof(float);
+        CUdeviceptr d_K = d_qkv + (size_t)N1 * H_dim * sizeof(float);
+        CUdeviceptr d_V = d_qkv + (size_t)2 * N1 * H_dim * sizeof(float);
 
-        kl_gemm(r, d_Q, blk->sa_q_w, d_normed, 0, H_dim, H_dim, N);
-        kl_gemm(r, d_K, blk->sa_k_w, d_normed, 0, H_dim, H_dim, N);
-        kl_gemm(r, d_V, blk->sa_v_w, d_normed, 0, H_dim, H_dim, N);
+        op_gemm(ops, stream, d_Q, blk->sa_q_w, d_normed, 0, H_dim, H_dim, N1);
+        op_gemm(ops, stream, d_K, blk->sa_k_w, d_normed, 0, H_dim, H_dim, N1);
+        op_gemm(ops, stream, d_V, blk->sa_v_w, d_normed, 0, H_dim, H_dim, N1);
 
         /* QK RMSNorm */
         if (blk->sa_q_norm_w)
-            kl_rms_norm(r, d_Q, blk->sa_q_norm_w, N, heads, hd, H_dim);
+            op_rms_norm(ops, stream, d_Q, blk->sa_q_norm_w, N1, heads, hd, H_dim);
         if (blk->sa_k_norm_w)
-            kl_rms_norm(r, d_K, blk->sa_k_norm_w, N, heads, hd, H_dim);
+            op_rms_norm(ops, stream, d_K, blk->sa_k_norm_w, N1, heads, hd, H_dim);
 
-        kl_self_attn(r, d_attn, d_Q, d_K, d_V, N, H_dim, heads, hd);
+        op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N1, H_dim, heads, hd);
 
-        kl_gemm(r, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b, H_dim, H_dim, N);
-        kl_add(r, d_hidden, d_normed, N * H_dim);
+        op_gemm(ops, stream, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b, H_dim, H_dim, N1);
+        op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
 
         /* === Cross-attention === */
-        kl_layernorm(r, d_normed, d_hidden, blk->norm2_w, blk->norm2_b, N, H_dim);
+        op_layernorm(ops, stream, d_normed, d_hidden, blk->norm2_w, blk->norm2_b, N1, H_dim);
 
         /* Q from hidden */
-        kl_gemm(r, d_cross_Q, blk->ca_q_w, d_normed, 0, H_dim, H_dim, N);
+        op_gemm(ops, stream, d_cross_Q, blk->ca_q_w, d_normed, 0, H_dim, H_dim, N1);
         if (blk->ca_q_norm_w)
-            kl_rms_norm(r, d_cross_Q, blk->ca_q_norm_w, N, heads, hd, H_dim);
+            op_rms_norm(ops, stream, d_cross_Q, blk->ca_q_norm_w, N1, heads, hd, H_dim);
 
         /* K, V pre-computed from context */
-        kl_cross_attn(r, d_attn, d_cross_Q, r->dit_ca_K[bi], r->dit_ca_V[bi],
-                      N, ctx_len, H_dim, heads, hd);
+        op_cross_attn(ops, stream, d_attn, d_cross_Q, r->dit_ca_K[bi], r->dit_ca_V[bi],
+                      N1, ctx_len, H_dim, heads, hd);
 
-        kl_gemm(r, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b, H_dim, H_dim, N);
-        kl_add(r, d_hidden, d_normed, N * H_dim);
+        op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b, H_dim, H_dim, N1);
+        op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
 
-        /* === MLP === */
+        /* === MLP or MoE === */
         if (blk->norm3_w) {
-            kl_layernorm(r, d_normed, d_hidden, blk->norm3_w, blk->norm3_b, N, H_dim);
+            op_layernorm(ops, stream, d_normed, d_hidden, blk->norm3_w, blk->norm3_b, N1, H_dim);
         } else {
-            cuMemcpyDtoDAsync(d_normed, d_hidden, (size_t)N * H_dim * sizeof(float), r->stream);
+            cuMemcpyDtoDAsync(d_normed, d_hidden, (size_t)N1 * H_dim * sizeof(float), stream);
         }
 
-        kl_gemm(r, d_mlp, blk->mlp_fc1_w, d_normed, blk->mlp_fc1_b, ffn, H_dim, N);
-        kl_gelu(r, d_mlp, N * ffn);
-        kl_gemm(r, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b, H_dim, ffn, N);
-        kl_add(r, d_hidden, d_normed, N * H_dim);
+        if (blk->use_moe) {
+            /* Fix 2: MoE with 8 experts + shared expert, top-2 gating */
+            CUdeviceptr d_moe_out = d_mlp; /* reuse mlp scratch for MoE output [N1 * H_dim] */
+            run_dit_moe(r, blk, d_normed, d_moe_out, N1, d_moe_scratch);
+            op_add(ops, stream, d_hidden, d_moe_out, N1 * H_dim);
+        } else {
+            /* Regular MLP: fc1 -> GELU -> fc2 */
+            op_gemm(ops, stream, d_mlp, blk->mlp_fc1_w, d_normed, blk->mlp_fc1_b, ffn, H_dim, N1);
+            op_gelu(ops, stream, d_mlp, N1 * ffn);
+            op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b, H_dim, ffn, N1);
+            op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
+        }
     }
 
-    /* 4. Final layer: LN → Linear → output [N, C] */
-    kl_layernorm(r, d_normed, d_hidden, r->dit_final_ln_w, r->dit_final_ln_b, N, H_dim);
-    kl_gemm(r, d_output, r->dit_final_linear_w, d_normed, r->dit_final_linear_b,
-            C, H_dim, N);
+    /* 5. Final layer: strip timestep token, LN, Linear -> output [N, C]
+     * Fix 3: Strip the first token (timestep) -> [N, H_dim] */
+    op_strip_first(ops, stream, d_normed, d_hidden, N1, H_dim);
+    /* d_normed is now [N, H_dim] */
+
+    /* Apply final LN */
+    CUdeviceptr d_ln_out = d_attn; /* reuse attn scratch, only need [N, H_dim] */
+    op_layernorm(ops, stream, d_ln_out, d_normed,
+                 r->dit_final_ln_w, r->dit_final_ln_b, N, H_dim);
+
+    /* Final linear: [N, H_dim] -> [N, C] */
+    op_gemm(ops, stream, d_output, r->dit_final_linear_w, d_ln_out,
+            r->dit_final_linear_b, C, H_dim, N);
 }
 
 /* Stage 3: ShapeVAE single transformer block */
 static void run_vae_block(cuda_hy3d_runner *r, vae_block_gpu *b,
                            CUdeviceptr d_in, CUdeviceptr d_out,
                            CUdeviceptr d_scratch) {
+    hy3d_ops *ops = &r->ops;
+    CUstream stream = r->stream;
     const int N = VAE_NUM_LATENTS;
     const int W = VAE_WIDTH;
     const int H = VAE_HEADS;
@@ -1191,39 +1094,39 @@ static void run_vae_block(cuda_hy3d_runner *r, vae_block_gpu *b,
     CUdeviceptr d_mlpo  = d_scratch + off;
 
     /* LN1 */
-    kl_layernorm(r, d_ln1, d_in, b->ln1_w, b->ln1_b, N, W);
+    op_layernorm(ops, stream, d_ln1, d_in, b->ln1_w, b->ln1_b, N, W);
 
     /* Fused QKV projection */
-    kl_gemm(r, d_qkv, b->qkv_w, d_ln1, 0, 3 * W, W, N);
+    op_gemm(ops, stream, d_qkv, b->qkv_w, d_ln1, 0, 3 * W, W, N);
 
     /* Split interleaved QKV */
-    kl_split_qkv(r, d_Q, d_K, d_V, d_qkv, N, H, HD);
+    op_split_qkv(ops, stream, d_Q, d_K, d_V, d_qkv, N, H, HD);
 
     /* QK normalization */
     if (b->use_qk_norm) {
-        kl_qk_layernorm(r, d_Q, b->q_norm_w, b->q_norm_b, N, H, HD, W);
-        kl_qk_layernorm(r, d_K, b->k_norm_w, b->k_norm_b, N, H, HD, W);
+        op_qk_layernorm(ops, stream, d_Q, b->q_norm_w, b->q_norm_b, N, H, HD, W);
+        op_qk_layernorm(ops, stream, d_K, b->k_norm_w, b->k_norm_b, N, H, HD, W);
     }
 
     /* Self-attention */
-    kl_self_attn(r, d_aout, d_Q, d_K, d_V, N, W, H, HD);
+    op_self_attn(ops, stream, d_aout, d_Q, d_K, d_V, N, W, H, HD);
 
     /* Output projection */
-    kl_gemm(r, d_proj, b->proj_w, d_aout, b->proj_b, W, W, N);
+    op_gemm(ops, stream, d_proj, b->proj_w, d_aout, b->proj_b, W, W, N);
 
     /* Residual 1: res1 = input + proj */
-    cuMemcpyDtoDAsync(d_res1, d_in, (size_t)N * W * sizeof(float), r->stream);
-    kl_add(r, d_res1, d_proj, N * W);
+    cuMemcpyDtoDAsync(d_res1, d_in, (size_t)N * W * sizeof(float), stream);
+    op_add(ops, stream, d_res1, d_proj, N * W);
 
-    /* LN2 → MLP → Residual 2 */
-    kl_layernorm(r, d_ln2, d_res1, b->ln2_w, b->ln2_b, N, W);
-    kl_gemm(r, d_mlph, b->mlp_fc_w, d_ln2, b->mlp_fc_b, MLP, W, N);
-    kl_gelu(r, d_mlph, N * MLP);
-    kl_gemm(r, d_mlpo, b->mlp_proj_w, d_mlph, b->mlp_proj_b, W, MLP, N);
+    /* LN2 -> MLP -> Residual 2 */
+    op_layernorm(ops, stream, d_ln2, d_res1, b->ln2_w, b->ln2_b, N, W);
+    op_gemm(ops, stream, d_mlph, b->mlp_fc_w, d_ln2, b->mlp_fc_b, MLP, W, N);
+    op_gelu(ops, stream, d_mlph, N * MLP);
+    op_gemm(ops, stream, d_mlpo, b->mlp_proj_w, d_mlph, b->mlp_proj_b, W, MLP, N);
 
     /* Output = res1 + mlp_out */
-    cuMemcpyDtoDAsync(d_out, d_res1, (size_t)N * W * sizeof(float), r->stream);
-    kl_add(r, d_out, d_mlpo, N * W);
+    cuMemcpyDtoDAsync(d_out, d_res1, (size_t)N * W * sizeof(float), stream);
+    op_add(ops, stream, d_out, d_mlpo, N * W);
 }
 
 /* Stage 3: ShapeVAE decode + SDF query
@@ -1231,6 +1134,8 @@ static void run_vae_block(cuda_hy3d_runner *r, vae_block_gpu *b,
  * Output: sdf_grid [grid_res^3] F32 (on CPU) */
 static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
                           int grid_res, float *sdf_out) {
+    hy3d_ops *ops = &r->ops;
+    CUstream stream = r->stream;
     const int N = VAE_NUM_LATENTS;
     const int E = VAE_EMBED_DIM;
     const int W = VAE_WIDTH;
@@ -1243,8 +1148,8 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     size_t block_scratch = (size_t)N * (W * 12 + 4 * W * 4) * sizeof(float);
     CUdeviceptr d_block_scratch = gpu_alloc(block_scratch);
 
-    /* Post-KL projection: [N, E] → [N, W] */
-    kl_gemm(r, d_dec_a, r->vae_post_kl_w, d_latents, r->vae_post_kl_b, W, E, N);
+    /* Post-KL projection: [N, E] -> [N, W] */
+    op_gemm(ops, stream, d_dec_a, r->vae_post_kl_w, d_latents, r->vae_post_kl_b, W, E, N);
 
     /* Run transformer blocks */
     CUdeviceptr d_cur = d_dec_a;
@@ -1288,15 +1193,15 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             coords[i*3+1] = bounds[1] + iy * dy;
             coords[i*3+2] = bounds[2] + iz * dz;
         }
-        cuMemcpyHtoDAsync(d_coords, coords, (size_t)count * 3 * sizeof(float), r->stream);
+        cuMemcpyHtoDAsync(d_coords, coords, (size_t)count * 3 * sizeof(float), stream);
         free(coords);
 
         /* Fourier embedding */
-        kl_fourier_embed(r, d_fourier, d_coords, r->vae_fourier_freqs,
+        op_fourier_embed(ops, stream, d_fourier, d_coords, r->vae_fourier_freqs,
                          count, VAE_NUM_FREQS, VAE_FOURIER_DIM);
 
-        /* Query projection: [count, 51] → [count, W] */
-        kl_gemm(r, d_query_proj, r->vae_geo.query_proj_w, d_fourier,
+        /* Query projection: [count, 51] -> [count, W] */
+        op_gemm(ops, stream, d_query_proj, r->vae_geo.query_proj_w, d_fourier,
                 r->vae_geo.query_proj_b, W, VAE_FOURIER_DIM, count);
 
         /* Cross-attention with decoded latents */
@@ -1318,57 +1223,57 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         CUdeviceptr d_g_mlpo = d_geo_scratch + geo_off; geo_off += (size_t)count * W * sizeof(float);
         CUdeviceptr d_g_post = d_geo_scratch + geo_off;
 
-        kl_layernorm(r, d_g_ln1, d_query_proj, g->ln1_w, g->ln1_b, count, W);
-        kl_layernorm(r, d_g_ln2, d_cur, g->ln2_w, g->ln2_b, N, W);
+        op_layernorm(ops, stream, d_g_ln1, d_query_proj, g->ln1_w, g->ln1_b, count, W);
+        op_layernorm(ops, stream, d_g_ln2, d_cur, g->ln2_w, g->ln2_b, N, W);
 
         /* Q from queries, KV from latents */
-        kl_gemm(r, d_g_Q, g->c_q_w, d_g_ln1, 0, W, W, count);
-        kl_gemm(r, d_g_KV, g->c_kv_w, d_g_ln2, 0, 2 * W, W, N);
+        op_gemm(ops, stream, d_g_Q, g->c_q_w, d_g_ln1, 0, W, W, count);
+        op_gemm(ops, stream, d_g_KV, g->c_kv_w, d_g_ln2, 0, 2 * W, W, N);
 
         /* Split KV */
-        kl_split_kv(r, d_g_K, d_g_V, d_g_KV, N, VAE_HEADS, VAE_HEAD_DIM);
+        op_split_kv(ops, stream, d_g_K, d_g_V, d_g_KV, N, VAE_HEADS, VAE_HEAD_DIM);
 
         /* QK norm */
         if (g->use_qk_norm) {
-            kl_qk_layernorm(r, d_g_Q, g->q_norm_w, g->q_norm_b,
+            op_qk_layernorm(ops, stream, d_g_Q, g->q_norm_w, g->q_norm_b,
                             count, VAE_HEADS, VAE_HEAD_DIM, W);
-            kl_qk_layernorm(r, d_g_K, g->k_norm_w, g->k_norm_b,
+            op_qk_layernorm(ops, stream, d_g_K, g->k_norm_w, g->k_norm_b,
                             N, VAE_HEADS, VAE_HEAD_DIM, W);
         }
 
         /* Cross-attention */
-        kl_cross_attn(r, d_g_aout, d_g_Q, d_g_K, d_g_V,
+        op_cross_attn(ops, stream, d_g_aout, d_g_Q, d_g_K, d_g_V,
                       count, N, W, VAE_HEADS, VAE_HEAD_DIM);
 
         /* Output projection + residual */
-        kl_gemm(r, d_g_proj, g->c_proj_w, d_g_aout, g->c_proj_b, W, W, count);
-        cuMemcpyDtoDAsync(d_g_res, d_query_proj, (size_t)count * W * sizeof(float), r->stream);
-        kl_add(r, d_g_res, d_g_proj, count * W);
+        op_gemm(ops, stream, d_g_proj, g->c_proj_w, d_g_aout, g->c_proj_b, W, W, count);
+        cuMemcpyDtoDAsync(d_g_res, d_query_proj, (size_t)count * W * sizeof(float), stream);
+        op_add(ops, stream, d_g_res, d_g_proj, count * W);
 
         /* MLP block */
-        kl_layernorm(r, d_g_ln3, d_g_res, g->ln3_w, g->ln3_b, count, W);
-        kl_gemm(r, d_g_mlph, g->mlp_fc_w, d_g_ln3, g->mlp_fc_b, 4 * W, W, count);
-        kl_gelu(r, d_g_mlph, count * 4 * W);
-        kl_gemm(r, d_g_mlpo, g->mlp_proj_w, d_g_mlph, g->mlp_proj_b, W, 4 * W, count);
-        cuMemcpyDtoDAsync(d_g_post, d_g_res, (size_t)count * W * sizeof(float), r->stream);
-        kl_add(r, d_g_post, d_g_mlpo, count * W);
+        op_layernorm(ops, stream, d_g_ln3, d_g_res, g->ln3_w, g->ln3_b, count, W);
+        op_gemm(ops, stream, d_g_mlph, g->mlp_fc_w, d_g_ln3, g->mlp_fc_b, 4 * W, W, count);
+        op_gelu(ops, stream, d_g_mlph, count * 4 * W);
+        op_gemm(ops, stream, d_g_mlpo, g->mlp_proj_w, d_g_mlph, g->mlp_proj_b, W, 4 * W, count);
+        cuMemcpyDtoDAsync(d_g_post, d_g_res, (size_t)count * W * sizeof(float), stream);
+        op_add(ops, stream, d_g_post, d_g_mlpo, count * W);
 
         /* Post LN */
         if (g->ln_post_w) {
-            kl_layernorm(r, d_g_ln1, d_g_post, g->ln_post_w, g->ln_post_b, count, W);
+            op_layernorm(ops, stream, d_g_ln1, d_g_post, g->ln_post_w, g->ln_post_b, count, W);
         } else {
-            cuMemcpyDtoDAsync(d_g_ln1, d_g_post, (size_t)count * W * sizeof(float), r->stream);
+            cuMemcpyDtoDAsync(d_g_ln1, d_g_post, (size_t)count * W * sizeof(float), stream);
         }
 
-        /* Final output projection: [count, W] → [count, 1] */
-        kl_gemm(r, d_sdf_out, g->output_w, d_g_ln1, g->output_b, 1, W, count);
+        /* Final output projection: [count, W] -> [count, 1] */
+        op_gemm(ops, stream, d_sdf_out, g->output_w, d_g_ln1, g->output_b, 1, W, count);
 
         /* Download SDF values */
         cuMemcpyDtoHAsync(sdf_out + start, d_sdf_out,
-                          (size_t)count * sizeof(float), r->stream);
+                          (size_t)count * sizeof(float), stream);
     }
 
-    cuStreamSynchronize(r->stream);
+    cuStreamSynchronize(stream);
 
     /* Cleanup */
     cuMemFree(d_dec_a);
@@ -1407,10 +1312,10 @@ static void generate_randn(float *buf, int n, uint32_t seed) {
         /* Box-Muller */
         double u1 = ((r1 >> 11) + 0.5) / 2097152.0;
         double u2 = ((r2 >> 11) + 0.5) / 2097152.0;
-        double r = sqrt(-2.0 * log(u1));
+        double rr = sqrt(-2.0 * log(u1));
         double theta = 2.0 * 3.141592653589793 * u2;
-        buf[i] = (float)(r * cos(theta));
-        if (i + 1 < n) buf[i+1] = (float)(r * sin(theta));
+        buf[i] = (float)(rr * cos(theta));
+        if (i + 1 < n) buf[i+1] = (float)(rr * sin(theta));
     }
 }
 
@@ -1470,6 +1375,8 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
                             const uint8_t *rgb, int w, int h,
                             int n_steps, float guidance_scale,
                             int grid_res, uint32_t seed) {
+    hy3d_ops *ops = &r->ops;
+    CUstream stream = r->stream;
     hy3d_mesh result = {0};
     if (!r || !r->dino_loaded || !r->dit_loaded || !r->vae_loaded) {
         fprintf(stderr, "HY3D: runner not fully initialized\n");
@@ -1488,7 +1395,7 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
 
     /* Upload and preprocess image: resize to 518x518, normalize with ImageNet stats */
     CUdeviceptr d_rgb = gpu_alloc((size_t)w * h * 3);
-    cuMemcpyHtoDAsync(d_rgb, rgb, (size_t)w * h * 3, r->stream);
+    cuMemcpyHtoDAsync(d_rgb, rgb, (size_t)w * h * 3, stream);
 
     CUdeviceptr d_image = gpu_alloc((size_t)3 * DINO_IMG_SIZE * DINO_IMG_SIZE * sizeof(float));
     {
@@ -1497,9 +1404,9 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
         float istd0 = 1.0f/0.229f, istd1 = 1.0f/0.224f, istd2 = 1.0f/0.225f;
         void *args[] = {&d_image, &d_rgb, &w, &h, &dw, &dh,
                         &mean0, &mean1, &mean2, &istd0, &istd1, &istd2};
-        cuLaunchKernel(r->fn_resize_normalize,
+        cuLaunchKernel(ops->resize_normalize,
                        (unsigned)((dw*dh+255)/256), 1, 1,
-                       256, 1, 1, 0, r->stream, args, NULL);
+                       256, 1, 1, 0, stream, args, NULL);
     }
 
     /* DINOv2 forward */
@@ -1520,7 +1427,7 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     generate_randn(noise_cpu, latent_size, seed);
 
     CUdeviceptr d_latents = gpu_alloc((size_t)latent_size * sizeof(float));
-    cuMemcpyHtoDAsync(d_latents, noise_cpu, (size_t)latent_size * sizeof(float), r->stream);
+    cuMemcpyHtoDAsync(d_latents, noise_cpu, (size_t)latent_size * sizeof(float), stream);
     free(noise_cpu);
 
     CUdeviceptr d_pred_cond = gpu_alloc((size_t)latent_size * sizeof(float));
@@ -1529,15 +1436,9 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
 
     /* Create zero context for unconditional pass */
     CUdeviceptr d_uncond_ctx = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
-    cuMemsetD8Async(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), r->stream);
+    cuMemsetD8Async(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), stream);
 
-    /* Pre-compute unconditional cross-attention K,V */
-    /* We need separate K,V arrays for unconditional pass.
-     * For now, we'll do both conditional and unconditional passes per step,
-     * recomputing K,V each time (since precompute_dit_ca_kv overwrites).
-     * TODO: optimize by storing both sets. */
-
-    /* Flow matching: timestep schedule from 1.0 → 0.0 */
+    /* Flow matching: timestep schedule from 1.0 -> 0.0 */
     for (int step = 0; step < n_steps; step++) {
         float t_current = 1.0f - (float)step / (float)n_steps;
         float t_next = 1.0f - (float)(step + 1) / (float)n_steps;
@@ -1555,11 +1456,11 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
         run_dit_forward(r, d_latents, t_current, d_uncond_ctx, d_pred_uncond);
 
         /* CFG combination */
-        kl_cfg_combine(r, d_pred_combined, d_pred_cond, d_pred_uncond,
+        op_cfg_combine(ops, stream, d_pred_combined, d_pred_cond, d_pred_uncond,
                        guidance_scale, latent_size);
 
         /* Euler step: x_{t-dt} = x_t - dt * v */
-        kl_euler_step(r, d_latents, d_pred_combined, dt, latent_size);
+        op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
     }
 
     cuMemFree(d_pred_cond);
