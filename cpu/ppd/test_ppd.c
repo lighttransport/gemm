@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 
 /* Read binary PPM (P6) */
@@ -72,10 +73,34 @@ static void write_pgm16(const char *path, const float *depth, int w, int h) {
     fprintf(stderr, "wrote %s (%dx%d, depth range [%.4f, %.4f])\n", path, w, h, mn, mx);
 }
 
+/* Write a float32 array as NumPy .npy format (v1.0) — 2D (h, w) */
+static void write_npy_f32(const char *path, const float *data, int w, int h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t version[2] = {1, 0};
+    fwrite(version, 1, 2, f);
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", h, w);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(data, sizeof(float), (size_t)w * h, f);
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%dx%d, float32)\n", path, w, h);
+}
+
 int main(int argc, char **argv) {
     const char *ppd_path = NULL, *sem_path = NULL;
     const char *input = NULL, *output = "depth_cpu.pgm";
     const char *resize_mode = NULL;
+    const char *npy_path = NULL;
     int n_threads = 4, verbose = 0;
 
     /* Parse positional args: ppd.pth sem.pth */
@@ -85,6 +110,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { output = argv[++i]; }
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) { n_threads = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) { resize_mode = argv[++i]; }
+        else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) { npy_path = argv[++i]; }
         else if (strcmp(argv[i], "-v") == 0) { verbose++; }
         else if (argv[i][0] != '-') {
             if (pos == 0) ppd_path = argv[i];
@@ -94,8 +120,8 @@ int main(int argc, char **argv) {
     }
 
     if (!ppd_path || !sem_path || !input) {
-        fprintf(stderr, "Usage: %s <ppd.pth> <da2.pth> -i input.jpg [-o output.pgm] [-t threads]\n"
-                "       [--resize WxH|N%%|Nt] [-v]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <ppd.pth> <da2.pth> -i input.jpg [-o output.pgm] [--npy depth.npy]\n"
+                "       [-t threads] [--resize WxH|N%%|Nt] [-v]\n", argv[0]);
         return 1;
     }
 
@@ -117,8 +143,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Write output — PGM + auto-export falsecolor PNG */
+    /* Write output — PGM + auto-export falsecolor PNG + optional npy */
     img_write_pgm16(output, res.depth, res.width, res.height);
+    if (npy_path)
+        write_npy_f32(npy_path, res.depth, res.width, res.height);
     {
         char base[512];
         strncpy(base, output, sizeof(base) - 1);

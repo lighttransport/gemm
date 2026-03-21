@@ -38,6 +38,20 @@ def print_result(m, threshold_r=0.999):
     return r >= threshold_r
 
 
+def find_file(directory, candidates):
+    """Find first existing file from a list of candidate names or glob patterns."""
+    for name in candidates:
+        if '*' in name:
+            matches = sorted(directory.glob(name))
+            if matches:
+                return matches[0]
+        else:
+            p = directory / name
+            if p.exists():
+                return p
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ref-dir", required=True, help="Dir with official_*.npy files")
@@ -54,32 +68,42 @@ def main():
     print("=" * 80)
 
     # --- Depth ---
-    ref_depth = ref / "official_depth_2100x1400.npy"
-    our_depth = ours / "depth.npy"
-    if ref_depth.exists() and our_depth.exists():
+    ref_depth = find_file(ref, ["official_depth_2100x1400.npy", "depth_ref.npy",
+                                 "depth_*_ref.npy", "depth.npy"])
+    our_depth = find_file(ours, ["depth.npy", "depth_ref.npy"])
+    if ref_depth and our_depth:
         rd = np.load(str(ref_depth))
         od = np.load(str(our_depth))
+        if rd.shape != od.shape:
+            print(f"  depth shape mismatch: ref={rd.shape}, ours={od.shape} — resizing ours")
+            from scipy.ndimage import zoom
+            factors = tuple(r / o for r, o in zip(rd.shape, od.shape))
+            od = zoom(od, factors, order=1)
         m = metrics_2d(rd, od, "depth")
         if not print_result(m, args.threshold):
             all_pass = False
     else:
-        print(f"  SKIP depth: ref={ref_depth.exists()}, ours={our_depth.exists()}")
+        print(f"  SKIP depth: ref={ref_depth}, ours={our_depth}")
 
     # --- Confidence ---
-    # Official confidence is from 518x518 output; ours is upsampled to 2100x1400
-    # We need to compare at same resolution. Check if 2100x1400 conf exists.
-    our_conf = ours / "confidence.npy"
-    if our_conf.exists():
+    ref_conf = find_file(ref, ["official_confidence_2100x1400.npy", "confidence_ref.npy",
+                                "confidence_*_ref.npy", "confidence.npy"])
+    our_conf = find_file(ours, ["confidence.npy", "confidence_ref.npy"])
+    if ref_conf and our_conf:
+        rc = np.load(str(ref_conf))
         oc = np.load(str(our_conf))
-        # Try to find matching reference
-        ref_conf_full = ref / "official_confidence_2100x1400.npy"
+        if rc.shape != oc.shape:
+            print(f"  confidence shape mismatch: ref={rc.shape}, ours={oc.shape} — resizing ours")
+            from scipy.ndimage import zoom
+            factors = tuple(r / o for r, o in zip(rc.shape, oc.shape))
+            oc = zoom(oc, factors, order=1)
+        m = metrics_2d(rc, oc, "confidence")
+        if not print_result(m, args.threshold):
+            all_pass = False
+    elif our_conf:
+        oc = np.load(str(our_conf))
         ref_conf_518 = ref / "official_depth_conf_518.npy"
-        if ref_conf_full.exists():
-            rc = np.load(str(ref_conf_full))
-            m = metrics_2d(rc, oc, "confidence")
-            if not print_result(m, args.threshold):
-                all_pass = False
-        elif ref_conf_518.exists():
+        if ref_conf_518.exists():
             print(f"  confidence: ref only at 518x518, ours at {oc.shape} — range comparison only")
             rc518 = np.load(str(ref_conf_518))
             print(f"    ref 518: [{rc518.min():.4f}, {rc518.max():.4f}], mean={rc518.mean():.4f}")
@@ -88,9 +112,9 @@ def main():
             print(f"  SKIP confidence: no ref file found")
 
     # --- Pose ---
-    ref_pose = ref / "official_pose.npy"
-    our_pose = ours / "pose.npy"
-    if ref_pose.exists() and our_pose.exists():
+    ref_pose = find_file(ref, ["official_pose.npy", "pose_ref.npy", "pose_*_ref.npy", "pose.npy"])
+    our_pose = find_file(ours, ["pose.npy", "pose_ref.npy"])
+    if ref_pose and our_pose:
         rp = np.load(str(ref_pose)).flatten()
         op = np.load(str(our_pose)).flatten()
         diff = np.abs(rp - op)
@@ -105,12 +129,13 @@ def main():
         if max_err >= 0.01:
             all_pass = False
     else:
-        print(f"  SKIP pose: ref={ref_pose.exists()}, ours={our_pose.exists()}")
+        print(f"  SKIP pose: ref={ref_pose}, ours={our_pose}")
 
     # --- Rays ---
-    ref_rays = ref / "official_rays_2100x1400.npy"
-    our_rays = ours / "rays.npy"
-    if ref_rays.exists() and our_rays.exists():
+    ref_rays = find_file(ref, ["official_rays_2100x1400.npy", "rays_ref.npy",
+                                "rays_*_ref.npy", "rays.npy"])
+    our_rays = find_file(ours, ["rays.npy", "rays_ref.npy"])
+    if ref_rays and our_rays:
         rr = np.load(str(ref_rays))
         orr = np.load(str(our_rays))
         print()
@@ -123,12 +148,13 @@ def main():
             m = metrics_2d(rr[ch], orr[ch], f"  rays ch{ch}")
             print_result(m, args.threshold)
     else:
-        print(f"  SKIP rays: ref={ref_rays.exists()}, ours={our_rays.exists()}")
+        print(f"  SKIP rays: ref={ref_rays}, ours={our_rays}")
 
     # --- Ray confidence ---
-    ref_rc = ref / "official_ray_confidence_2100x1400.npy"
-    our_rc = ours / "ray_confidence.npy"
-    if ref_rc.exists() and our_rc.exists():
+    ref_rc = find_file(ref, ["official_ray_confidence_2100x1400.npy", "ray_confidence_ref.npy",
+                              "ray_conf_*_ref.npy", "ray_confidence.npy"])
+    our_rc = find_file(ours, ["ray_confidence.npy", "ray_confidence_ref.npy"])
+    if ref_rc and our_rc:
         rrc = np.load(str(ref_rc))
         orc = np.load(str(our_rc))
         print()
@@ -136,7 +162,56 @@ def main():
         if not print_result(m, args.threshold):
             all_pass = False
     else:
-        print(f"  SKIP ray_confidence: ref={ref_rc.exists()}, ours={our_rc.exists()}")
+        print(f"  SKIP ray_confidence: ref={ref_rc}, ours={our_rc}")
+
+    # --- Gaussians ---
+    ref_gauss = find_file(ref, ["gaussians_ref.npy", "gaussians_*_ref.npy", "gaussians.npy"])
+    our_gauss = find_file(ours, ["gaussians.npy", "gaussians_ref.npy"])
+    if ref_gauss and our_gauss:
+        rg = np.load(str(ref_gauss))
+        og = np.load(str(our_gauss))
+        print()
+        m = metrics_2d(rg, og, "gaussians")
+        if not print_result(m, args.threshold):
+            all_pass = False
+    else:
+        print(f"  SKIP gaussians: ref={ref_gauss}, ours={our_gauss}")
+
+    # --- Metric depth (DA3-Nested) ---
+    ref_md = find_file(ref, ["metric_depth_ref.npy", "metric_depth.npy"])
+    our_md = find_file(ours, ["metric_depth.npy", "metric_depth_ref.npy"])
+    if ref_md and our_md:
+        rmd = np.load(str(ref_md))
+        omd = np.load(str(our_md))
+        if rmd.shape != omd.shape:
+            print(f"  metric_depth shape mismatch: ref={rmd.shape}, ours={omd.shape} — resizing ours")
+            from scipy.ndimage import zoom
+            factors = tuple(r / o for r, o in zip(rmd.shape, omd.shape))
+            omd = zoom(omd, factors, order=1)
+        print()
+        m = metrics_2d(rmd, omd, "metric_depth")
+        if not print_result(m, args.threshold):
+            all_pass = False
+    else:
+        print(f"  SKIP metric_depth: ref={ref_md}, ours={our_md}")
+
+    # --- Sky segmentation (DA3-Nested) ---
+    ref_sky = find_file(ref, ["sky_seg_ref.npy", "sky_seg.npy"])
+    our_sky = find_file(ours, ["sky_seg.npy", "sky_seg_ref.npy"])
+    if ref_sky and our_sky:
+        rsk = np.load(str(ref_sky))
+        osk = np.load(str(our_sky))
+        if rsk.shape != osk.shape:
+            print(f"  sky_seg shape mismatch: ref={rsk.shape}, ours={osk.shape} — resizing ours")
+            from scipy.ndimage import zoom
+            factors = tuple(r / o for r, o in zip(rsk.shape, osk.shape))
+            osk = zoom(osk, factors, order=1)
+        print()
+        m = metrics_2d(rsk, osk, "sky_seg")
+        if not print_result(m, args.threshold):
+            all_pass = False
+    else:
+        print(f"  SKIP sky_seg: ref={ref_sky}, ours={our_sky}")
 
     # --- Summary ---
     print("\n" + "=" * 80)

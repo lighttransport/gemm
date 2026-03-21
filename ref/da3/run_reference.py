@@ -210,6 +210,10 @@ class DinoV2ViT(nn.Module):
         rope_cos_y, rope_sin_y, rope_cos_x, rope_sin_x = build_rope_cache(
             self.grid_size, self.dim // self.num_heads, x.device)
 
+        # cat_token: track local_hidden (output of most recent local block)
+        # Global blocks: odd-numbered layers >= rope_start
+        local_hidden = x.clone()
+
         features = []
         for i, block in enumerate(self.blocks):
             # At alt_start, inject camera token into CLS position
@@ -223,10 +227,15 @@ class DinoV2ViT(nn.Module):
                 x = block(x, rope_cos_y, rope_sin_y, rope_cos_x, rope_sin_x)
             else:
                 x = block(x)
+
+            # Update local_hidden for non-global blocks
+            is_global = (i >= self.rope_start) and (i % 2 == 1)
+            if not is_global:
+                local_hidden = x.clone()
+
             if i in self.out_layers:
-                # Save raw hidden states (no backbone norm) — matches C code
-                # CLS token concat + norm happens in the DPT head
-                features.append(x.clone())
+                # cat_token: save [local_hidden, hidden] per token
+                features.append((local_hidden.clone(), x.clone()))
 
         return features
 
@@ -322,20 +331,23 @@ class DualDPTHead(nn.Module):
             nn.Conv2d(features // 2, output_dim, 1),
         )
 
-    def forward(self, features, grid_size, patch_size=14):
-        """features: list of 4 tensors, each (B, 1+n_patches, dim) raw hidden."""
-        B = features[0].shape[0]
+    def forward(self, features, grid_size, patch_size=14, backbone_norm=None):
+        """features: list of 4 (local_hidden, hidden) tuples from cat_token backbone."""
+        B = features[0][0].shape[0]
 
-        # Reassemble: concat [patch, CLS], norm, reshape, project
+        # Reassemble: cat_token = [local_x_patches, backbone_norm(x_patches)]
         outs = []
-        for i, (feat, proj, resize) in enumerate(zip(
+        for i, ((local_h, cur_h), proj, resize) in enumerate(zip(
                 features, self.projects, self.resize_layers)):
-            # feat is raw hidden: (B, 1+n_patches, dim) with CLS at position 0
-            # Concat: [patch_token, CLS_token] for each patch → (B, n_patches, 2*dim)
-            dim = feat.shape[-1]
-            patch_tokens = feat[:, 1:, :]  # (B, n_patches, dim)
-            cls_expanded = feat[:, :1, :].expand(-1, patch_tokens.shape[1], -1)
-            cat = torch.cat([patch_tokens, cls_expanded], dim=-1)  # (B, n_patches, 2*dim)
+            # local_h, cur_h: (B, 1+n_patches, dim)
+            # Skip CLS token (position 0), take patches only
+            local_patches = local_h[:, 1:, :]   # (B, n_patches, dim)
+            cur_patches = cur_h[:, 1:, :]        # (B, n_patches, dim)
+            # Apply backbone_norm to current hidden patches
+            if backbone_norm is not None:
+                cur_patches = backbone_norm(cur_patches)
+            # Concatenate: [local_x_raw, backbone_norm(x)]
+            cat = torch.cat([local_patches, cur_patches], dim=-1)
             # Apply head norm (dim_in = 2*dim)
             cat = self.norm(cat)
             x = cat.transpose(1, 2).reshape(B, -1, grid_size, grid_size)
@@ -398,7 +410,8 @@ class DepthAnything3(nn.Module):
     def forward(self, x):
         features = self.backbone(x)
         out = self.head(features, self.backbone.grid_size,
-                        self.backbone.patch_size)
+                        self.backbone.patch_size,
+                        backbone_norm=self.backbone.norm)
         return out
 
 

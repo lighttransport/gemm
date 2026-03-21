@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* Simple PPM reader (P6 binary) */
 static uint8_t *read_ppm(const char *path, int *w, int *h) {
@@ -54,9 +55,32 @@ static void write_pgm(const char *path, const float *depth, int w, int h) {
     fprintf(stderr, "Wrote depth to %s (range: %.4f - %.4f)\n", path, dmin, dmax);
 }
 
+/* Write a float32 array as NumPy .npy format (v1.0) — 2D (h, w) */
+static void write_npy_f32(const char *path, const float *data, int w, int h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t version[2] = {1, 0};
+    fwrite(version, 1, 2, f);
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", h, w);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(data, sizeof(float), (size_t)w * h, f);
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%dx%d, float32)\n", path, w, h);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <ppd.pth> <da2_vitl.pth> [-i image.ppm] [-o depth.pgm]\n",
+        fprintf(stderr, "Usage: %s <ppd.pth> <da2_vitl.pth> [-i image.ppm] [-o depth.pgm] [--npy depth.npy]\n",
                 argv[0]);
         return 1;
     }
@@ -65,12 +89,14 @@ int main(int argc, char **argv) {
     const char *sem_path = argv[2];
     const char *img_path = NULL;
     const char *out_path = "depth_ppd.pgm";
+    const char *npy_path = NULL;
     int verbose = 1;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) img_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc) verbose = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
     }
 
     fprintf(stderr, "Initializing CUDA PPD runner...\n");
@@ -95,6 +121,8 @@ int main(int argc, char **argv) {
 
         if (res.depth) {
             write_pgm(out_path, res.depth, res.width, res.height);
+            if (npy_path)
+                write_npy_f32(npy_path, res.depth, res.width, res.height);
             ppd_result_free(&res);
         }
     } else {
