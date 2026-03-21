@@ -1320,6 +1320,8 @@ da3_model *da3_load_safetensors(const char *st_path, const char *config_path) {
 
     for (int i = 0; i < st->n_tensors; i++) {
         const char *nm = safetensors_name(st, i);
+        /* Skip metric backbone tensors — detect from main/anyview backbone only */
+        if (strstr(nm, "da3_metric")) continue;
         if (strstr(nm, "patch_embed.proj.weight")) {
             embed_dim = (int)safetensors_shape(st, i)[0];
             patch_size = (int)safetensors_shape(st, i)[2];
@@ -1390,6 +1392,9 @@ da3_model *da3_load_safetensors(const char *st_path, const char *config_path) {
             if (root) {
                 json_val *cfg = json_obj_get(root, "config");
                 if (!cfg) cfg = root;
+                /* Nested model: config is under "anyview" sub-object */
+                json_val *av = json_obj_get(cfg, "anyview");
+                if (av) cfg = av;
                 json_val *hcfg = json_obj_get(cfg, "head");
                 if (hcfg) {
                     json_val *v = json_obj_get(hcfg, "features");
