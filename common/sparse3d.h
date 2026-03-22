@@ -122,6 +122,44 @@ int        sp3d_hash_lookup(const sp3d_hash *h, int32_t batch,
                              int32_t z, int32_t y, int32_t x);
 void       sp3d_ensure_hash(sp3d_tensor *t);
 
+/* ---- Profiling ---- */
+
+enum sp3d_op {
+    SP3D_OP_LINEAR = 0,
+    SP3D_OP_LAYERNORM,
+    SP3D_OP_GELU,
+    SP3D_OP_SILU,
+    SP3D_OP_CONV3D,
+    SP3D_OP_ATTENTION,
+    SP3D_OP_ROPE3D,
+    SP3D_OP_DOWNSAMPLE,
+    SP3D_OP_UPSAMPLE,
+    SP3D_OP_HASH_BUILD,
+    SP3D_OP_CREATE,
+    SP3D_OP_COUNT
+};
+
+typedef struct {
+    int      calls;           /* number of invocations */
+    double   total_ms;        /* cumulative wall time (ms) */
+    double   min_ms;          /* fastest call */
+    double   max_ms;          /* slowest call */
+    int64_t  mem_alloc;       /* bytes allocated by this op (estimated) */
+} sp3d_prof_entry;
+
+typedef struct {
+    int             enabled;
+    sp3d_prof_entry ops[SP3D_OP_COUNT];
+    int64_t         mem_current;  /* current live bytes (alloc - free) */
+    int64_t         mem_peak;     /* high-water mark */
+} sp3d_prof;
+
+/* Global profiler instance */
+sp3d_prof *sp3d_prof_get(void);
+void       sp3d_prof_enable(int on);
+void       sp3d_prof_reset(void);
+void       sp3d_prof_print(void);
+
 #ifdef __cplusplus
 }
 #endif
@@ -135,11 +173,112 @@ void       sp3d_ensure_hash(sp3d_tensor *t);
 #include <math.h>
 #include <pthread.h>
 #include <float.h>
+#include <time.h>
 
 #ifndef CPU_COMPUTE_H
 #define CPU_COMPUTE_IMPLEMENTATION
 #include "cpu_compute.h"
 #endif
+
+/* ==================================================================== */
+/* Profiling infrastructure                                               */
+/* ==================================================================== */
+
+static sp3d_prof sp3d_g_prof = {0};
+
+sp3d_prof *sp3d_prof_get(void) { return &sp3d_g_prof; }
+
+void sp3d_prof_enable(int on) { sp3d_g_prof.enabled = on; }
+
+void sp3d_prof_reset(void) {
+    int was_enabled = sp3d_g_prof.enabled;
+    memset(&sp3d_g_prof, 0, sizeof(sp3d_g_prof));
+    sp3d_g_prof.enabled = was_enabled;
+}
+
+static const char *sp3d_op_names[SP3D_OP_COUNT] = {
+    "linear", "layernorm", "gelu", "silu", "conv3d",
+    "attention", "rope_3d", "downsample", "upsample",
+    "hash_build", "create"
+};
+
+static inline double sp3d_clock_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static inline void sp3d_prof_begin(double *t0) {
+    if (sp3d_g_prof.enabled) *t0 = sp3d_clock_ms();
+}
+
+static inline void sp3d_prof_end(enum sp3d_op op, double t0, int64_t mem_bytes) {
+    if (!sp3d_g_prof.enabled) return;
+    double elapsed = sp3d_clock_ms() - t0;
+    sp3d_prof_entry *e = &sp3d_g_prof.ops[op];
+    e->calls++;
+    e->total_ms += elapsed;
+    if (e->calls == 1 || elapsed < e->min_ms) e->min_ms = elapsed;
+    if (elapsed > e->max_ms) e->max_ms = elapsed;
+    e->mem_alloc += mem_bytes;
+}
+
+static inline void sp3d_prof_mem_alloc(int64_t bytes) {
+    if (!sp3d_g_prof.enabled) return;
+    sp3d_g_prof.mem_current += bytes;
+    if (sp3d_g_prof.mem_current > sp3d_g_prof.mem_peak)
+        sp3d_g_prof.mem_peak = sp3d_g_prof.mem_current;
+}
+
+static inline void sp3d_prof_mem_free(int64_t bytes) {
+    if (!sp3d_g_prof.enabled) return;
+    sp3d_g_prof.mem_current -= bytes;
+}
+
+static const char *sp3d_fmt_bytes(int64_t bytes, char *buf, size_t bufsz) {
+    if (bytes < 1024)
+        snprintf(buf, bufsz, "%lld B", (long long)bytes);
+    else if (bytes < 1024 * 1024)
+        snprintf(buf, bufsz, "%.1f KB", bytes / 1024.0);
+    else
+        snprintf(buf, bufsz, "%.1f MB", bytes / (1024.0 * 1024.0));
+    return buf;
+}
+
+void sp3d_prof_print(void) {
+    char b1[32], b2[32];
+    double total_time = 0;
+    int64_t total_mem = 0;
+    for (int i = 0; i < SP3D_OP_COUNT; i++) {
+        total_time += sp3d_g_prof.ops[i].total_ms;
+        total_mem += sp3d_g_prof.ops[i].mem_alloc;
+    }
+
+    fprintf(stderr, "\n╔══════════════════════════════════════════════════════════════════════╗\n");
+    fprintf(stderr, "║  sparse3d profiling summary                                        ║\n");
+    fprintf(stderr, "╠════════════╤═══════╤══════════╤══════════╤══════════╤════════════════╣\n");
+    fprintf(stderr, "║ %-10s │ %5s │ %8s │ %8s │ %8s │ %14s ║\n",
+            "operation", "calls", "total ms", "avg ms", "max ms", "mem allocated");
+    fprintf(stderr, "╟────────────┼───────┼──────────┼──────────┼──────────┼────────────────╢\n");
+
+    for (int i = 0; i < SP3D_OP_COUNT; i++) {
+        sp3d_prof_entry *e = &sp3d_g_prof.ops[i];
+        if (e->calls == 0) continue;
+        double avg = e->total_ms / e->calls;
+        fprintf(stderr, "║ %-10s │ %5d │ %8.2f │ %8.3f │ %8.3f │ %14s ║\n",
+                sp3d_op_names[i], e->calls, e->total_ms, avg, e->max_ms,
+                sp3d_fmt_bytes(e->mem_alloc, b1, sizeof(b1)));
+    }
+
+    fprintf(stderr, "╟────────────┼───────┼──────────┼──────────┼──────────┼────────────────╢\n");
+    fprintf(stderr, "║ %-10s │       │ %8.2f │          │          │ %14s ║\n",
+            "TOTAL", total_time, sp3d_fmt_bytes(total_mem, b1, sizeof(b1)));
+    fprintf(stderr, "╟────────────┴───────┴──────────┴──────────┴──────────┴────────────────╢\n");
+    fprintf(stderr, "║  peak mem: %-14s  current mem: %-14s              ║\n",
+            sp3d_fmt_bytes(sp3d_g_prof.mem_peak, b1, sizeof(b1)),
+            sp3d_fmt_bytes(sp3d_g_prof.mem_current, b2, sizeof(b2)));
+    fprintf(stderr, "╚══════════════════════════════════════════════════════════════════════╝\n");
+}
 
 /* ==================================================================== */
 /* Spatial Hash Table                                                     */
@@ -162,10 +301,13 @@ static uint64_t sp3d_pack_coord(int32_t batch, int32_t z, int32_t y, int32_t x) 
 }
 
 sp3d_hash *sp3d_hash_build(const int32_t *coords, int N) {
+    double _t0; sp3d_prof_begin(&_t0);
+
     /* Capacity: next power of 2 >= 2*N, minimum 16 */
     int cap = 16;
     while (cap < 2 * N) cap *= 2;
 
+    int64_t mem = (int64_t)(sizeof(sp3d_hash) + (size_t)cap * (sizeof(uint64_t) + sizeof(int32_t)));
     sp3d_hash *h = (sp3d_hash *)malloc(sizeof(sp3d_hash));
     h->capacity = cap;
     h->count = N;
@@ -188,11 +330,17 @@ sp3d_hash *sp3d_hash_build(const int32_t *coords, int N) {
         h->keys[slot] = key;
         h->vals[slot] = i;
     }
+
+    sp3d_prof_mem_alloc(mem);
+    sp3d_prof_end(SP3D_OP_HASH_BUILD, _t0, mem);
     return h;
 }
 
 void sp3d_hash_free(sp3d_hash *h) {
     if (!h) return;
+    int64_t mem = (int64_t)(sizeof(sp3d_hash) +
+        (size_t)h->capacity * (sizeof(uint64_t) + sizeof(int32_t)));
+    sp3d_prof_mem_free(mem);
     free(h->keys);
     free(h->vals);
     free(h);
@@ -222,6 +370,8 @@ void sp3d_ensure_hash(sp3d_tensor *t) {
 
 sp3d_tensor *sp3d_create(const int32_t *coords, const float *feats,
                           int N, int C, int batch_size) {
+    double _t0; sp3d_prof_begin(&_t0);
+
     sp3d_tensor *t = (sp3d_tensor *)calloc(1, sizeof(sp3d_tensor));
     t->N = N;
     t->C = C;
@@ -255,11 +405,22 @@ sp3d_tensor *sp3d_create(const int32_t *coords, const float *feats,
     }
     free(counts);
 
+    int64_t mem = (int64_t)(sizeof(sp3d_tensor) +
+        (size_t)N * 4 * sizeof(int32_t) +
+        (size_t)N * C * sizeof(float) +
+        (size_t)(batch_size + 1) * sizeof(int));
+    sp3d_prof_mem_alloc(mem);
+    sp3d_prof_end(SP3D_OP_CREATE, _t0, mem);
     return t;
 }
 
 void sp3d_free(sp3d_tensor *t) {
     if (!t) return;
+    int64_t mem = (int64_t)(sizeof(sp3d_tensor) +
+        (size_t)t->N * 4 * sizeof(int32_t) +
+        (size_t)t->N * t->C * sizeof(float) +
+        (size_t)(t->batch_size + 1) * sizeof(int));
+    sp3d_prof_mem_free(mem);
     free(t->coords);
     free(t->feats);
     free(t->batch_starts);
@@ -441,8 +602,10 @@ static void *sp3d_gemm_worker(void *arg) {
 void sp3d_linear(float *dst, const float *src, int N,
                   const qtensor *W, const qtensor *bias,
                   int out_C, int in_C, int n_threads) {
+    double _t0; sp3d_prof_begin(&_t0);
     if (!W->data) {
         memset(dst, 0, (size_t)N * out_C * sizeof(float));
+        sp3d_prof_end(SP3D_OP_LINEAR, _t0, 0);
         return;
     }
     if (W->type == GGML_TYPE_F16) {
@@ -494,11 +657,13 @@ void sp3d_linear(float *dst, const float *src, int N,
             free(b);
         }
     }
+    sp3d_prof_end(SP3D_OP_LINEAR, _t0, (int64_t)N * out_C * sizeof(float));
 }
 
 void sp3d_layernorm(float *dst, const float *src,
                      const qtensor *w, const qtensor *b,
                      int N, int C, float eps) {
+    double _t0; sp3d_prof_begin(&_t0);
     float *wf = (float *)malloc((size_t)C * sizeof(float));
     float *bf = (float *)malloc((size_t)C * sizeof(float));
     sp3d_dequant_row(w, 0, wf);
@@ -546,6 +711,7 @@ void sp3d_layernorm(float *dst, const float *src,
     cpu_layernorm(dst, src, wf, bf, N, C, eps);
 #endif
     free(wf); free(bf);
+    sp3d_prof_end(SP3D_OP_LAYERNORM, _t0, (int64_t)N * C * sizeof(float));
 }
 
 #if defined(__AVX2__) && defined(__FMA__)
@@ -584,6 +750,7 @@ static inline __m256 sp3d_tanh_avx(__m256 x) {
 #endif
 
 void sp3d_gelu(float *x, int count) {
+    double _t0; sp3d_prof_begin(&_t0);
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 half = _mm256_set1_ps(0.5f);
     __m256 one = _mm256_set1_ps(1.0f);
@@ -605,9 +772,11 @@ void sp3d_gelu(float *x, int count) {
 #else
     cpu_gelu(x, count);
 #endif
+    sp3d_prof_end(SP3D_OP_GELU, _t0, 0);
 }
 
 void sp3d_silu(float *x, int count) {
+    double _t0; sp3d_prof_begin(&_t0);
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 one = _mm256_set1_ps(1.0f);
     int i = 0;
@@ -624,6 +793,7 @@ void sp3d_silu(float *x, int count) {
 #else
     cpu_silu(x, count);
 #endif
+    sp3d_prof_end(SP3D_OP_SILU, _t0, 0);
 }
 
 /* ==================================================================== */
@@ -723,6 +893,7 @@ void sp3d_conv3d_forward(float *dst, const sp3d_tensor *t,
                           const float *weight, const float *bias_f,
                           int in_C, int out_C, int kernel_size,
                           int n_threads) {
+    double _t0; sp3d_prof_begin(&_t0);
     if (kernel_size != 3) {
         fprintf(stderr, "sp3d_conv3d: only kernel_size=3 supported, got %d\n", kernel_size);
         return;
@@ -760,6 +931,8 @@ void sp3d_conv3d_forward(float *dst, const sp3d_tensor *t,
         for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
         free(tasks); free(threads);
     }
+    int64_t mem_w = (int64_t)out_C * K3 * in_C * sizeof(float);
+    sp3d_prof_end(SP3D_OP_CONV3D, _t0, (int64_t)t->N * out_C * sizeof(float) + mem_w);
 }
 
 /* ==================================================================== */
@@ -768,6 +941,7 @@ void sp3d_conv3d_forward(float *dst, const sp3d_tensor *t,
 
 void sp3d_attention(float *out, const float *qkv, const sp3d_tensor *t,
                      int n_heads, int head_dim, int n_threads) {
+    double _t0; sp3d_prof_begin(&_t0);
     int dim = n_heads * head_dim;
 
     /* Process each batch element independently.
@@ -778,12 +952,11 @@ void sp3d_attention(float *out, const float *qkv, const sp3d_tensor *t,
         int seq_len = end - start;
         if (seq_len <= 0) continue;
 
-        /* Delegate to cpu_attention for this batch's subsequence.
-         * qkv layout: [N, 3*dim], batch b spans rows [start, end). */
         const float *batch_qkv = qkv + (size_t)start * 3 * dim;
         float *batch_out = out + (size_t)start * dim;
         cpu_attention(batch_out, batch_qkv, seq_len, dim, n_heads, head_dim, n_threads);
     }
+    sp3d_prof_end(SP3D_OP_ATTENTION, _t0, (int64_t)t->N * dim * sizeof(float));
 }
 
 /* ==================================================================== */
@@ -793,6 +966,7 @@ void sp3d_attention(float *out, const float *qkv, const sp3d_tensor *t,
 void sp3d_rope_3d(float *qk, const sp3d_tensor *t,
                    int n_heads, int head_dim, int dim_stride,
                    const float *rope_freqs, int n_freqs) {
+    double _t0; sp3d_prof_begin(&_t0);
     int axis_dim = 2 * n_freqs;
     if (3 * axis_dim > head_dim) {
         axis_dim = head_dim / 3;
@@ -860,6 +1034,7 @@ void sp3d_rope_3d(float *qk, const sp3d_tensor *t,
 
     free(cs_tab);
     free(sn_tab);
+    sp3d_prof_end(SP3D_OP_ROPE3D, _t0, 0);
 }
 
 /* ==================================================================== */
@@ -867,6 +1042,7 @@ void sp3d_rope_3d(float *qk, const sp3d_tensor *t,
 /* ==================================================================== */
 
 sp3d_tensor *sp3d_downsample(const sp3d_tensor *t, int factor, int pool_mode) {
+    double _t0; sp3d_prof_begin(&_t0);
     /* Compute downsampled coords: floor(coord / factor) */
     int32_t *new_coords = (int32_t *)malloc((size_t)t->N * 4 * sizeof(int32_t));
     for (int i = 0; i < t->N; i++) {
@@ -949,11 +1125,15 @@ sp3d_tensor *sp3d_downsample(const sp3d_tensor *t, int factor, int pool_mode) {
 
     free(new_coords); free(unique_coords); free(mapping);
     free(out_feats); free(counts);
+    int64_t ds_mem = (int64_t)(result->N * 4 * sizeof(int32_t) +
+                               result->N * C * sizeof(float));
+    sp3d_prof_end(SP3D_OP_DOWNSAMPLE, _t0, ds_mem);
     return result;
 }
 
 sp3d_tensor *sp3d_upsample(const sp3d_tensor *t, int factor,
                              const int32_t *target_coords, int target_N) {
+    double _t0; sp3d_prof_begin(&_t0);
     /* Nearest-neighbor upsample: for each target coord, find source via floor(coord/factor) */
     sp3d_ensure_hash((sp3d_tensor *)t);
 
@@ -974,6 +1154,9 @@ sp3d_tensor *sp3d_upsample(const sp3d_tensor *t, int factor,
 
     sp3d_tensor *result = sp3d_create(target_coords, out_feats, target_N, C, t->batch_size);
     free(out_feats);
+    int64_t up_mem = (int64_t)(target_N * 4 * sizeof(int32_t) +
+                               target_N * C * sizeof(float));
+    sp3d_prof_end(SP3D_OP_UPSAMPLE, _t0, up_mem);
     return result;
 }
 
