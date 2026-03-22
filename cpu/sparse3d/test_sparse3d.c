@@ -994,14 +994,17 @@ static void export_all(const char *out_dir, const char *in_dir) {
 }
 
 int main(int argc, char **argv) {
-    /* Check for --export mode */
+    /* Parse args */
     const char *export_dir = NULL;
     const char *input_dir = NULL;
+    int do_profile = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) {
             export_dir = argv[++i];
         } else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
             input_dir = argv[++i];
+        } else if (strcmp(argv[i], "--profile") == 0) {
+            do_profile = 1;
         }
     }
 
@@ -1010,6 +1013,9 @@ int main(int argc, char **argv) {
         export_all(export_dir, input_dir);
         return 0;
     }
+
+    /* Enable profiling if requested */
+    if (do_profile) sp3d_prof_enable(1);
 
     /* Normal unit test mode */
     fprintf(stderr, "sparse3d unit tests\n");
@@ -1025,7 +1031,11 @@ int main(int argc, char **argv) {
     test_downsample();
     test_upsample();
     test_rope_3d();
+
+    /* Run benchmarks with fresh profiler state */
+    if (do_profile) sp3d_prof_reset();
     bench_all();
+    if (do_profile) sp3d_prof_print();
 
     fprintf(stderr, "\n========================================\n");
     fprintf(stderr, "Tests: %d total, %d passed, %d failed\n", g_tests, g_pass, g_fail);
