@@ -751,21 +751,15 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
     const int H_dim = DIT_HIDDEN;
     const int ffn = DIT_FFN;
 
-    /* Scratch layout within d_moe_scratch:
-     * gate_logits  [N_tok * DIT_N_EXPERTS]
-     * expert_h     [N_tok * ffn]
-     * expert_out   [N_tok * H_dim]
-     * shared_h     [N_tok * ffn]
-     * shared_out   [N_tok * H_dim]
-     * scale_buf    [N_tok]           -- per-expert gate weights (re-uploaded each expert)
+    /* Scratch layout within d_moe_scratch (reduced — reuse buffers):
+     * gate_logits  [N_tok * DIT_N_EXPERTS]    (~131KB)
+     * expert_h     [N_tok * ffn]              (~134MB, reused for each expert + shared)
+     * accum        [N_tok * H_dim]            (~33.5MB, output accumulator)
      */
     size_t off = 0;
     CUdeviceptr d_gate   = d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
     CUdeviceptr d_exp_h  = d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
-    CUdeviceptr d_exp_o  = d_moe_scratch + off; off += (size_t)N_tok * H_dim * sizeof(float);
-    CUdeviceptr d_shr_h  = d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
-    CUdeviceptr d_shr_o  = d_moe_scratch + off; off += (size_t)N_tok * H_dim * sizeof(float);
-    CUdeviceptr d_scale  = d_moe_scratch + off; /* [N_tok] */
+    CUdeviceptr d_exp_o  = d_moe_scratch + off; /* [N_tok * H_dim] reused */
 
     /* Step 1: Compute gate logits: [N_tok, H_dim] @ [8, H_dim]^T -> [N_tok, 8] */
     op_gemm(ops, stream, d_gate, blk->moe_gate_w, d_input, 0,
@@ -814,12 +808,9 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
             top_val[k] = best_v;
         }
 
-        /* Renormalize top-2 weights */
-        float top_sum = 0.0f;
-        for (int k = 0; k < DIT_MOE_TOP_K; k++) top_sum += top_val[k];
-        float top_inv = (top_sum > 0.0f) ? 1.0f / top_sum : 0.0f;
+        /* Store top-2 weights (no renormalization — norm_topk_prob=False in PyTorch) */
         for (int k = 0; k < DIT_MOE_TOP_K; k++) {
-            gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k] * top_inv;
+            gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k];
         }
     }
     free(gate_cpu);
@@ -845,26 +836,7 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
         op_gemm(ops, stream, d_exp_o, blk->moe_expert_fc2_w[e], d_exp_h,
                 blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
 
-        /* Upload per-token scale factors for this expert */
-        cuMemcpyHtoDAsync(d_scale, expert_scale_cpu,
-                          (size_t)N_tok * sizeof(float), stream);
-
-        /* Weighted add: d_output[t, :] += scale[t] * d_exp_o[t, :]
-         * We use broadcast_add style but with per-element scaling.
-         * Since we lack a fused scale-add kernel, we'll scale d_exp_o in-place
-         * using broadcast (scale per row) then add to output.
-         *
-         * Scale each row: for element [t*H_dim + j], multiply by scale[t].
-         * We can reuse broadcast_add semantics reversed: treat scale as [N_tok]
-         * and broadcast across dim. But we need multiply, not add.
-         *
-         * Simplest approach: do it row-by-row. But that's N_tok kernel launches.
-         * Better: just do it on CPU for the accumulation since we already sync'd.
-         *
-         * Actually, let's keep it on GPU. Download expert output, scale, upload
-         * accumulated result. For a first pass this is acceptable. */
-
-        /* Sync and do scale-add on CPU */
+        /* Scale-add: d_output[t,:] += scale[t] * d_exp_o[t,:]  (on CPU) */
         cuStreamSynchronize(stream);
         float *exp_out_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
         float *accum_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
@@ -886,13 +858,13 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
     free(expert_scale_cpu);
     free(gate_weights);
 
-    /* Step 5: Add shared expert output */
-    op_gemm(ops, stream, d_shr_h, blk->moe_shared_fc1_w, d_input,
+    /* Step 5: Add shared expert output (reuse d_exp_h/d_exp_o buffers) */
+    op_gemm(ops, stream, d_exp_h, blk->moe_shared_fc1_w, d_input,
             blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
-    op_gelu(ops, stream, d_shr_h, N_tok * ffn);
-    op_gemm(ops, stream, d_shr_o, blk->moe_shared_fc2_w, d_shr_h,
+    op_gelu(ops, stream, d_exp_h, N_tok * ffn);
+    op_gemm(ops, stream, d_exp_o, blk->moe_shared_fc2_w, d_exp_h,
             blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
-    op_add(ops, stream, d_output, d_shr_o, N_tok * H_dim);
+    op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
 }
 
 /* Stage 2: Single DiT forward pass
@@ -905,7 +877,7 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
  * Input:  d_latents [4096, 64] F32, timestep (scalar), d_context [1370, 1024] F32
  * Output: d_output [4096, 64] F32 */
 static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
-                             float timestep, CUdeviceptr d_context __attribute__((unused)),
+                             float timestep, CUdeviceptr d_context,
                              CUdeviceptr d_output) {
     hy3d_ops *ops = &r->ops;
     CUstream stream = r->stream;
@@ -928,34 +900,54 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
      * 6: cross_Q [N1 * H_dim] + cat_buf [N1 * 2*H_dim] + skip_values stack
      * 7: moe scratch [N1*(8+ffn+H_dim)*2+...] */
 
-    /* For MoE scratch: gate[N1*8] + exp_h[N1*ffn] + exp_o[N1*H_dim] +
-     *                  shr_h[N1*ffn] + shr_o[N1*H_dim] + scale[N1] */
-    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim + ffn + H_dim + 1) * sizeof(float);
-    /* For skip: need [DIT_HALF_DEPTH+1] saved hidden states, each N1*H_dim */
-    size_t skip_stack_sz = (size_t)(DIT_HALF_DEPTH + 1) * N1 * H_dim * sizeof(float);
+    /* MLP and MoE never active simultaneously — share scratch[3].
+     * MLP needs: N1 * ffn  (134MB)
+     * MoE needs: gate[N1*8] + expert_h[N1*ffn] + accum[N1*H_dim]  (168MB)
+     *   (process one expert at a time, reuse expert_h for shared expert) */
+    size_t mlp_sz = (size_t)N1 * ffn * sizeof(float);
+    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim) * sizeof(float);
+    size_t mlp_moe_sz = mlp_sz > moe_scratch_sz ? mlp_sz : moe_scratch_sz;
     /* For concat: [N1 * 2*H_dim] */
     size_t cat_buf_sz = (size_t)N1 * 2 * H_dim * sizeof(float);
+    /* For cross-attention K,V: [ctx_len * H_dim] each, reused per block */
+    size_t ca_kv_sz = (size_t)ctx_len * H_dim * sizeof(float);
 
+    /* Memory-tight scratch layout — 4 GPU buffers, ~392MB total
+     * 0: hidden [N1 * H_dim]                                = 33.5 MB
+     * 1: QKV/MLP/MoE (shared) [max(3*N1*H_dim, moe_sz)]     = 168 MB
+     * 2: attn_out/normed [2 * N1 * H_dim]                    = 67 MB
+     * 3: cross_Q + cat_buf + ca_K + ca_V + t_emb             = ~123 MB
+     *
+     * scratch[1] is shared: QKV during attention, MLP/MoE during FFN.
+     * scratch[2] holds both attn_out and normed (non-overlapping within each phase).
+     */
+    size_t qkv_sz = (size_t)3 * N1 * H_dim * sizeof(float);
+    size_t shared1_sz = qkv_sz > mlp_moe_sz ? qkv_sz : mlp_moe_sz;
+    size_t buf3_sz = (size_t)N1 * H_dim * sizeof(float) + cat_buf_sz + 2 * ca_kv_sz
+                   + (size_t)(H_dim + ffn) * sizeof(float);
     ensure_scratch(r, 0, (size_t)N1 * H_dim * sizeof(float));
-    ensure_scratch(r, 1, (size_t)3 * N1 * H_dim * sizeof(float));
-    ensure_scratch(r, 2, (size_t)N1 * H_dim * sizeof(float));
-    ensure_scratch(r, 3, (size_t)N1 * ffn * sizeof(float));
-    ensure_scratch(r, 4, (size_t)N1 * H_dim * sizeof(float));
-    ensure_scratch(r, 5, (size_t)(H_dim + ffn) * sizeof(float));
-    ensure_scratch(r, 6, cat_buf_sz + skip_stack_sz + (size_t)N1 * H_dim * sizeof(float));
-    ensure_scratch(r, 7, moe_scratch_sz);
+    ensure_scratch(r, 1, shared1_sz);
+    ensure_scratch(r, 2, (size_t)2 * N1 * H_dim * sizeof(float));
+    ensure_scratch(r, 3, buf3_sz);
 
-    CUdeviceptr d_hidden = r->scratch[0];
-    CUdeviceptr d_qkv    = r->scratch[1];
-    CUdeviceptr d_attn   = r->scratch[2];
-    CUdeviceptr d_mlp    = r->scratch[3];
-    CUdeviceptr d_normed = r->scratch[4];
-    CUdeviceptr d_temb   = r->scratch[5];
-    CUdeviceptr d_tmlp   = d_temb + (size_t)H_dim * sizeof(float);
-    CUdeviceptr d_cross_Q = r->scratch[6];
+    CUdeviceptr d_hidden  = r->scratch[0];
+    CUdeviceptr d_qkv     = r->scratch[1];  /* also used as d_mlp during MLP/MoE phase */
+    CUdeviceptr d_mlp     = r->scratch[1];  /* shares with d_qkv */
+    CUdeviceptr d_attn    = r->scratch[2];
+    CUdeviceptr d_normed  = r->scratch[2] + (size_t)N1 * H_dim * sizeof(float);
+    CUdeviceptr d_temb    = r->scratch[3];
+    CUdeviceptr d_tmlp    = d_temb + (size_t)H_dim * sizeof(float);
+    CUdeviceptr d_cross_Q = d_tmlp + (size_t)ffn * sizeof(float);
     CUdeviceptr d_cat_buf = d_cross_Q + (size_t)N1 * H_dim * sizeof(float);
-    CUdeviceptr d_skip_stack = d_cat_buf + cat_buf_sz;
-    CUdeviceptr d_moe_scratch = r->scratch[7];
+    CUdeviceptr d_ca_K    = d_cat_buf + cat_buf_sz;
+    CUdeviceptr d_ca_V    = d_ca_K + ca_kv_sz;
+    CUdeviceptr d_moe_scratch = r->scratch[1]; /* shared with d_qkv/d_mlp */
+
+    /* Skip stack: stored in CPU RAM (saves ~370MB GPU, trades bandwidth) */
+    size_t skip_entry_sz = (size_t)N1 * H_dim * sizeof(float);
+    float *skip_stack_cpu = (float *)malloc((size_t)(DIT_HALF_DEPTH + 1) * skip_entry_sz);
+    /* GPU staging buffer for skip load/store (reuses d_attn temporarily) */
+    CUdeviceptr d_skip_tmp = d_attn; /* reuse attn buffer since skip happens before attention */
 
     /* 1. Embed latents: [N, C] -> [N, H_dim] (into a temp buffer, not d_hidden yet) */
     /* We put the embedded result into d_normed temporarily */
@@ -987,13 +979,18 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         dit_block_gpu *blk = &r->dit_blocks[bi];
 
         /* Fix 1: Skip connection (blocks 11-20, layer > depth//2)
-         * Before self-attention: pop skip value, concat, linear project, norm */
+         * Before self-attention: pop skip value, concat, linear project, norm
+         * Skip values stored in CPU RAM to save GPU memory */
         if (blk->use_skip && skip_sp > 0) {
             skip_sp--;
-            CUdeviceptr d_skip_val = d_skip_stack + (size_t)skip_sp * N1 * H_dim * sizeof(float);
+            float *skip_cpu = skip_stack_cpu + (size_t)skip_sp * N1 * H_dim;
+
+            /* Upload skip value from CPU to GPU staging buffer */
+            cuMemcpyHtoDAsync(d_skip_tmp, skip_cpu, skip_entry_sz, stream);
+            cuStreamSynchronize(stream);
 
             /* cat = concat([skip_value, x], dim=-1)  -> [N1, 2*H_dim] */
-            op_concat_last_dim(ops, stream, d_cat_buf, d_skip_val, d_hidden, N1, H_dim);
+            op_concat_last_dim(ops, stream, d_cat_buf, d_skip_tmp, d_hidden, N1, H_dim);
 
             /* x = skip_linear(cat)  -> [N1, H_dim] */
             op_gemm(ops, stream, d_hidden, blk->skip_linear_w, d_cat_buf,
@@ -1006,9 +1003,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
 
         /* Save hidden state for skip connection (blocks 0..DIT_HALF_DEPTH) */
         if (bi <= DIT_HALF_DEPTH) {
-            CUdeviceptr d_save = d_skip_stack + (size_t)skip_sp * N1 * H_dim * sizeof(float);
-            cuMemcpyDtoDAsync(d_save, d_hidden,
-                              (size_t)N1 * H_dim * sizeof(float), stream);
+            float *skip_cpu = skip_stack_cpu + (size_t)skip_sp * N1 * H_dim;
+            cuStreamSynchronize(stream);
+            cuMemcpyDtoH(skip_cpu, d_hidden, skip_entry_sz);
             skip_sp++;
         }
 
@@ -1042,8 +1039,16 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         if (blk->ca_q_norm_w)
             op_rms_norm(ops, stream, d_cross_Q, blk->ca_q_norm_w, N1, heads, hd, H_dim);
 
-        /* K, V pre-computed from context */
-        op_cross_attn(ops, stream, d_attn, d_cross_Q, r->dit_ca_K[bi], r->dit_ca_V[bi],
+        /* Compute K, V from context per-block (saves GPU memory vs precomputing all 21) */
+        op_gemm(ops, stream, d_ca_K, blk->ca_k_w, d_context, 0,
+                H_dim, DIT_CONTEXT_DIM, ctx_len);
+        op_gemm(ops, stream, d_ca_V, blk->ca_v_w, d_context, 0,
+                H_dim, DIT_CONTEXT_DIM, ctx_len);
+        if (blk->ca_k_norm_w)
+            op_rms_norm(ops, stream, d_ca_K, blk->ca_k_norm_w,
+                        ctx_len, heads, hd, H_dim);
+
+        op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K, d_ca_V,
                       N1, ctx_len, H_dim, heads, hd);
 
         op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b, H_dim, H_dim, N1);
@@ -1083,6 +1088,8 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     /* Final linear: [N, H_dim] -> [N, C] */
     op_gemm(ops, stream, d_output, r->dit_final_linear_w, d_ln_out,
             r->dit_final_linear_b, C, H_dim, N);
+
+    free(skip_stack_cpu);
 }
 
 /* Stage 3: ShapeVAE single transformer block */
@@ -1439,8 +1446,7 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     /* ---- Stage 2: DiT diffusion with flow matching ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 2 - DiT diffusion (%d steps)...\n", n_steps);
 
-    /* Pre-compute cross-attention K,V */
-    precompute_dit_ca_kv(r, d_dino_out);
+    /* K,V computed per-block inside run_dit_forward (saves GPU memory) */
 
     /* Create initial noise */
     int latent_size = DIT_INPUT_SIZE * DIT_IN_CHANNELS;
@@ -1469,11 +1475,9 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
             fprintf(stderr, "  step %d/%d (t=%.3f)\n", step+1, n_steps, t_current);
 
         /* Conditional pass */
-        precompute_dit_ca_kv(r, d_dino_out);
         run_dit_forward(r, d_latents, t_current, d_dino_out, d_pred_cond);
 
         /* Unconditional pass */
-        precompute_dit_ca_kv(r, d_uncond_ctx);
         run_dit_forward(r, d_latents, t_current, d_uncond_ctx, d_pred_uncond);
 
         /* CFG combination */
@@ -1577,9 +1581,7 @@ int cuda_hy3d_run_dit(cuda_hy3d_runner *r,
     cuMemcpyHtoDAsync(d_latents, latents, lat_bytes, r->stream);
     cuMemcpyHtoDAsync(d_context, context, ctx_bytes, r->stream);
 
-    /* Pre-compute cross-attention K,V from context */
-    precompute_dit_ca_kv(r, d_context);
-
+    /* K,V computed per-block inside run_dit_forward (saves GPU memory) */
     run_dit_forward(r, d_latents, timestep, d_context, d_output);
 
     cuMemcpyDtoHAsync(output, d_output, out_bytes, r->stream);
