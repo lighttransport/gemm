@@ -128,7 +128,7 @@ static inline void op_layernorm(hy3d_ops *ops, CUstream stream,
     float eps = 1e-6f;
     void *args[] = {&dst, &src, &w, &b, &dim, &eps};
     cuLaunchKernel(ops->layernorm, (unsigned)n_tok, 1, 1,
-                   256, 1, 1, 0, stream, args, NULL);
+                   256, 1, 1, 256 * sizeof(float), stream, args, NULL);
 }
 
 /* ---- GEMM: Y = W @ X + bias  (F16 weights, F32 compute) ---- */
@@ -137,12 +137,12 @@ static inline void op_gemm(hy3d_ops *ops, CUstream stream,
                            CUdeviceptr Y, CUdeviceptr W,
                            CUdeviceptr X, CUdeviceptr bias,
                            int n_out, int n_in, int n_tok) {
-    CUfunction fn = (ops->sm_version >= 70) ? ops->gemm : ops->gemm_tiled;
+    /* Use tiled GEMM (the MMA GEMM has an output mapping bug in common kernels) */
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
-    int bx = (ops->sm_version >= 70) ? 32 : 256;
-    int gy = (n_tok + 15) / 16;
-    cuLaunchKernel(fn, (unsigned)((n_out + 15) / 16), (unsigned)gy, 1,
-                   bx, 1, 1, 0, stream, args, NULL);
+    unsigned gx = (unsigned)((n_out + 63) / 64);
+    unsigned gy = (unsigned)((n_tok + 15) / 16);
+    cuLaunchKernel(ops->gemm_tiled, gx, gy, 1,
+                   16, 16, 1, 0, stream, args, NULL);
 }
 
 /* ---- GELU activation in-place ---- */
