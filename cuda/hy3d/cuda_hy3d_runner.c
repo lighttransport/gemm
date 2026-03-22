@@ -970,6 +970,42 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     op_concat_first(ops, stream, d_hidden, d_temb, d_normed, N, H_dim);
 
     /* Now d_hidden has shape [N1, H_dim] = [4097, 2048] */
+    if (r->verbose > 1) {
+        cuStreamSynchronize(stream);
+        float *hcpu = (float *)malloc((size_t)N1 * H_dim * sizeof(float));
+        cuMemcpyDtoH(hcpu, d_hidden, (size_t)N1 * H_dim * sizeof(float));
+        float mn = hcpu[0], mx = hcpu[0], sm = 0;
+        for (int j = 0; j < N1 * H_dim; j++) {
+            if (hcpu[j] < mn) mn = hcpu[j];
+            if (hcpu[j] > mx) mx = hcpu[j];
+            sm += hcpu[j];
+        }
+        float mean = sm / (float)(N1 * H_dim);
+        float var = 0;
+        for (int j = 0; j < N1 * H_dim; j++) { float d = hcpu[j] - mean; var += d*d; }
+        fprintf(stderr, "  after_embed: mean=%.6f std=%.6f min=%.6f max=%.6f\n",
+                mean, sqrtf(var / (float)(N1 * H_dim)), mn, mx);
+        /* Token 0 (timestep) */
+        float t0_mn = hcpu[0], t0_mx = hcpu[0], t0_sm = 0;
+        for (int j = 0; j < H_dim; j++) {
+            if (hcpu[j] < t0_mn) t0_mn = hcpu[j];
+            if (hcpu[j] > t0_mx) t0_mx = hcpu[j];
+            t0_sm += hcpu[j];
+        }
+        float t0_mean = t0_sm / H_dim;
+        float t0_var = 0;
+        for (int j = 0; j < H_dim; j++) { float d = hcpu[j] - t0_mean; t0_var += d*d; }
+        fprintf(stderr, "    token[0]: mean=%.6f std=%.6f\n",
+                t0_mean, sqrtf(t0_var / H_dim));
+        float t1_sm = 0;
+        for (int j = H_dim; j < 2*H_dim; j++) t1_sm += hcpu[j];
+        float t1_mean = t1_sm / H_dim;
+        float t1_var = 0;
+        for (int j = H_dim; j < 2*H_dim; j++) { float d = hcpu[j] - t1_mean; t1_var += d*d; }
+        fprintf(stderr, "    token[1]: mean=%.6f std=%.6f\n",
+                t1_mean, sqrtf(t1_var / H_dim));
+        free(hcpu);
+    }
 
     /* Skip value stack pointer: blocks 0..DIT_HALF_DEPTH save hidden states */
     int skip_sp = 0;
@@ -1009,16 +1045,47 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             skip_sp++;
         }
 
-        /* === Self-attention === */
+        /* === Self-attention ===
+         * PyTorch Attention does: cat(to_q(x), to_k(x), to_v(x), dim=-1)
+         *   → view(1, -1, H, 3*HD) → split(HD, dim=-1) → q_norm/k_norm → sdpa
+         * The view+split interleaves Q/K/V per head. Head h's Q/K/V come from
+         * positions [h*3*HD : (h+1)*3*HD] in the concatenated [Q,K,V] vector.
+         * We replicate by:
+         *   1. GEMM: Q_raw, K_raw, V_raw each [N1, W]  (into d_mlp scratch)
+         *   2. Per-token interleave into d_qkv: [N1, 3*W] where
+         *      row n = [Q_raw[n,:], K_raw[n,:], V_raw[n,:]]
+         *   3. split_qkv_interleaved → Q, K, V each [N1, W] with PyTorch head layout
+         */
         op_layernorm(ops, stream, d_normed, d_hidden, blk->norm1_w, blk->norm1_b, N1, H_dim);
 
-        CUdeviceptr d_Q = d_qkv;
-        CUdeviceptr d_K = d_qkv + (size_t)N1 * H_dim * sizeof(float);
-        CUdeviceptr d_V = d_qkv + (size_t)2 * N1 * H_dim * sizeof(float);
+        /* Step 1: compute Q/K/V into d_mlp scratch (has room for 3*N1*H_dim) */
+        CUdeviceptr d_Q_raw = d_mlp;
+        CUdeviceptr d_K_raw = d_mlp + (size_t)N1 * H_dim * sizeof(float);
+        CUdeviceptr d_V_raw = d_mlp + (size_t)2 * N1 * H_dim * sizeof(float);
 
-        op_gemm(ops, stream, d_Q, blk->sa_q_w, d_normed, 0, H_dim, H_dim, N1);
-        op_gemm(ops, stream, d_K, blk->sa_k_w, d_normed, 0, H_dim, H_dim, N1);
-        op_gemm(ops, stream, d_V, blk->sa_v_w, d_normed, 0, H_dim, H_dim, N1);
+        op_gemm(ops, stream, d_Q_raw, blk->sa_q_w, d_normed, 0, H_dim, H_dim, N1);
+        op_gemm(ops, stream, d_K_raw, blk->sa_k_w, d_normed, 0, H_dim, H_dim, N1);
+        op_gemm(ops, stream, d_V_raw, blk->sa_v_w, d_normed, 0, H_dim, H_dim, N1);
+
+        /* Step 2: per-token interleave [Q_raw, K_raw, V_raw] → d_qkv [N1, 3*W]
+         * Each token n: d_qkv[n*3W..n*3W+W-1] = Q_raw[n], [n*3W+W..+2W-1] = K_raw[n], etc.
+         * Use cuMemcpy2D or simple per-row copies. For now, loop on CPU: */
+        for (int tok = 0; tok < N1; tok++) {
+            size_t src_off = (size_t)tok * H_dim * sizeof(float);
+            size_t dst_off = (size_t)tok * 3 * H_dim * sizeof(float);
+            cuMemcpyDtoDAsync(d_qkv + dst_off, d_Q_raw + src_off,
+                              (size_t)H_dim * sizeof(float), stream);
+            cuMemcpyDtoDAsync(d_qkv + dst_off + (size_t)H_dim * sizeof(float),
+                              d_K_raw + src_off, (size_t)H_dim * sizeof(float), stream);
+            cuMemcpyDtoDAsync(d_qkv + dst_off + (size_t)2 * H_dim * sizeof(float),
+                              d_V_raw + src_off, (size_t)H_dim * sizeof(float), stream);
+        }
+
+        /* Step 3: split interleaved QKV → de-interleaved per-head Q, K, V */
+        CUdeviceptr d_Q = d_Q_raw;  /* reuse d_mlp for output Q */
+        CUdeviceptr d_K = d_K_raw;
+        CUdeviceptr d_V = d_V_raw;
+        op_split_qkv(ops, stream, d_Q, d_K, d_V, d_qkv, N1, heads, hd);
 
         /* QK RMSNorm */
         if (blk->sa_q_norm_w)
@@ -1030,6 +1097,36 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
 
         op_gemm(ops, stream, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b, H_dim, H_dim, N1);
         op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
+
+        if (r->verbose > 1 && bi == 0) {
+            cuStreamSynchronize(stream);
+            /* Check attention output (before adding residual) */
+            float *t = (float *)malloc((size_t)N1*H_dim*4);
+            cuMemcpyDtoH(t, d_attn, (size_t)N1*H_dim*4);
+            float sm=0,mn2=t[0],mx2=t[0];
+            for (int j=0;j<N1*H_dim;j++){if(t[j]<mn2)mn2=t[j];if(t[j]>mx2)mx2=t[j];sm+=t[j];}
+            float m=sm/(N1*H_dim),v=0;
+            for(int j=0;j<N1*H_dim;j++){float d=t[j]-m;v+=d*d;}
+            fprintf(stderr, "    b0 attn_raw: mean=%.6f std=%.6f min=%.6f max=%.6f\n",
+                    m, sqrtf(v/(N1*H_dim)), mn2, mx2);
+            /* Check sa output projection (d_normed after GEMM, before residual add) */
+            cuMemcpyDtoH(t, d_normed, (size_t)N1*H_dim*4);
+            sm=0;mn2=t[0];mx2=t[0];
+            for (int j=0;j<N1*H_dim;j++){if(t[j]<mn2)mn2=t[j];if(t[j]>mx2)mx2=t[j];sm+=t[j];}
+            m=sm/(N1*H_dim);v=0;
+            for(int j=0;j<N1*H_dim;j++){float d=t[j]-m;v+=d*d;}
+            fprintf(stderr, "    b0 sa_proj:  mean=%.6f std=%.6f min=%.6f max=%.6f\n",
+                    m, sqrtf(v/(N1*H_dim)), mn2, mx2);
+            /* After residual add */
+            cuMemcpyDtoH(t, d_hidden, (size_t)N1*H_dim*4);
+            sm=0;mn2=t[0];mx2=t[0];
+            for (int j=0;j<N1*H_dim;j++){if(t[j]<mn2)mn2=t[j];if(t[j]>mx2)mx2=t[j];sm+=t[j];}
+            m=sm/(N1*H_dim);v=0;
+            for(int j=0;j<N1*H_dim;j++){float d=t[j]-m;v+=d*d;}
+            fprintf(stderr, "    b0 after_sa: mean=%.6f std=%.6f min=%.6f max=%.6f\n",
+                    m, sqrtf(v/(N1*H_dim)), mn2, mx2);
+            free(t);
+        }
 
         /* === Cross-attention === */
         op_layernorm(ops, stream, d_normed, d_hidden, blk->norm2_w, blk->norm2_b, N1, H_dim);
@@ -1054,6 +1151,19 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b, H_dim, H_dim, N1);
         op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
 
+        if (r->verbose > 1 && bi == 0) {
+            cuStreamSynchronize(stream);
+            float sm = 0; float *t2 = (float *)malloc((size_t)N1*H_dim*4);
+            cuMemcpyDtoH(t2, d_hidden, (size_t)N1*H_dim*4);
+            float mn2=t2[0], mx2=t2[0];
+            for (int j=0;j<N1*H_dim;j++){if(t2[j]<mn2)mn2=t2[j];if(t2[j]>mx2)mx2=t2[j];sm+=t2[j];}
+            float m2 = sm/(N1*H_dim); float v2=0;
+            for(int j=0;j<N1*H_dim;j++){float d=t2[j]-m2;v2+=d*d;}
+            fprintf(stderr, "    b0 after_ca: mean=%.6f std=%.6f min=%.6f max=%.6f\n",
+                    m2, sqrtf(v2/(N1*H_dim)), mn2, mx2);
+            free(t2);
+        }
+
         /* === MLP or MoE === */
         if (blk->norm3_w) {
             op_layernorm(ops, stream, d_normed, d_hidden, blk->norm3_w, blk->norm3_b, N1, H_dim);
@@ -1072,6 +1182,30 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             op_gelu(ops, stream, d_mlp, N1 * ffn);
             op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b, H_dim, ffn, N1);
             op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
+        }
+
+        /* Per-block debug stats */
+        if (r->verbose > 1) {
+            cuStreamSynchronize(stream);
+            float stats[4] = {0}; /* min, max, mean, std */
+            float *hcpu = (float *)malloc((size_t)N1 * H_dim * sizeof(float));
+            cuMemcpyDtoH(hcpu, d_hidden, (size_t)N1 * H_dim * sizeof(float));
+            float mn = hcpu[0], mx = hcpu[0], sm = 0;
+            for (int j = 0; j < N1 * H_dim; j++) {
+                if (hcpu[j] < mn) mn = hcpu[j];
+                if (hcpu[j] > mx) mx = hcpu[j];
+                sm += hcpu[j];
+            }
+            float mean = sm / (float)(N1 * H_dim);
+            float var = 0;
+            for (int j = 0; j < N1 * H_dim; j++) {
+                float d = hcpu[j] - mean; var += d * d;
+            }
+            float std = sqrtf(var / (float)(N1 * H_dim));
+            fprintf(stderr, "  block %2d: mean=%.6f std=%.6f min=%.6f max=%.6f%s%s\n",
+                    bi, mean, std, mn, mx,
+                    blk->use_moe ? " [MoE]" : "", blk->use_skip ? " [skip]" : "");
+            free(hcpu);
         }
     }
 

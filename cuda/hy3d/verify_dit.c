@@ -241,7 +241,7 @@ int main(int argc, char **argv) {
 
     /* Init CUDA */
     fprintf(stderr, "Initializing CUDA...\n");
-    cuda_hy3d_runner *r = cuda_hy3d_init(0, 1);
+    cuda_hy3d_runner *r = cuda_hy3d_init(0, 2);
     if (!r) return 1;
 
     int n_pass = 0, n_fail = 0, n_skip = 0;
