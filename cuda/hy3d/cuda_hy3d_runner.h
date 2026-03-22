@@ -66,6 +66,38 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
 /* Free runner and all GPU resources */
 void cuda_hy3d_free(cuda_hy3d_runner *r);
 
+/* ---- Per-stage verification API ---- */
+
+/* Run DINOv2 encoder only.
+ *   image_f32: [3, 518, 518] F32 pre-processed image (ImageNet-normalized, CHW)
+ *   output:    [1370, 1024] F32 buffer (must be pre-allocated)
+ *   Returns 0 on success. */
+int cuda_hy3d_run_dinov2(cuda_hy3d_runner *r,
+                          const float *image_f32,
+                          float *output);
+
+/* Run ShapeVAE decoder + SDF query.
+ *   latents:   [4096, 64] F32 input latents
+ *   grid_res:  marching cubes grid resolution (e.g. 8, 32, 256)
+ *   sdf_out:   [grid_res^3] F32 buffer (must be pre-allocated)
+ *   Returns 0 on success. */
+int cuda_hy3d_run_vae(cuda_hy3d_runner *r,
+                       const float *latents,
+                       int grid_res,
+                       float *sdf_out);
+
+/* Run DiT single forward pass.
+ *   latents:   [4096, 64] F32 noisy latents
+ *   timestep:  scalar timestep (e.g. 0.5)
+ *   context:   [1370, 1024] F32 conditioning from DINOv2
+ *   output:    [4096, 64] F32 buffer (must be pre-allocated)
+ *   Returns 0 on success. */
+int cuda_hy3d_run_dit(cuda_hy3d_runner *r,
+                       const float *latents,
+                       float timestep,
+                       const float *context,
+                       float *output);
+
 /* Free mesh data */
 static inline void cuda_hy3d_mesh_free(hy3d_mesh *m) {
     if (m) {

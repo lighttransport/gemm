@@ -344,41 +344,50 @@ static int load_dino_weights(cuda_hy3d_runner *r, const char *path) {
     r->dino_pos_emb = st_upload_f32(st, "main_image_encoder.model.embeddings.position_embeddings", r->verbose);
     r->dino_cls_token = st_upload_f32(st, "main_image_encoder.model.embeddings.cls_token", r->verbose);
 
-    /* Encoder layers */
+    /* Encoder layers
+     * GEMM weights → F16 (gemm_f16_f32 expects half_raw)
+     * LayerNorm weights, biases, LayerScale → F32 (layernorm_f32 expects float) */
     for (int i = 0; i < DINO_LAYERS; i++) {
         char name[256];
         dino_layer_gpu *l = &r->dino_layers[i];
-        #define DINO_T(field, suffix) \
+
+        /* F32 uploads: LayerNorm, LayerScale, biases used by LN or standalone */
+        #define DINO_F32(field, suffix) \
+            snprintf(name, sizeof(name), "main_image_encoder.model.encoder.layer.%d.%s", i, suffix); \
+            l->field = st_upload_f32(st, name, r->verbose);
+        /* F16 uploads: GEMM weights and biases consumed by gemm_f16_f32 */
+        #define DINO_F16(field, suffix) \
             snprintf(name, sizeof(name), "main_image_encoder.model.encoder.layer.%d.%s", i, suffix); \
             l->field = st_upload_f16(st, name, r->verbose);
 
-        DINO_T(ln1_w, "norm1.weight");
-        DINO_T(ln1_b, "norm1.bias");
-        DINO_T(q_w,   "attention.attention.query.weight");
-        DINO_T(q_b,   "attention.attention.query.bias");
-        DINO_T(k_w,   "attention.attention.key.weight");
-        DINO_T(k_b,   "attention.attention.key.bias");
-        DINO_T(v_w,   "attention.attention.value.weight");
-        DINO_T(v_b,   "attention.attention.value.bias");
-        DINO_T(out_w, "attention.output.dense.weight");
-        DINO_T(out_b, "attention.output.dense.bias");
-        DINO_T(ls1,   "layer_scale1.lambda1");
-        DINO_T(ln2_w, "norm2.weight");
-        DINO_T(ln2_b, "norm2.bias");
-        DINO_T(fc1_w, "mlp.fc1.weight");
-        DINO_T(fc1_b, "mlp.fc1.bias");
-        DINO_T(fc2_w, "mlp.fc2.weight");
-        DINO_T(fc2_b, "mlp.fc2.bias");
-        DINO_T(ls2,   "layer_scale2.lambda1");
-        #undef DINO_T
+        DINO_F32(ln1_w, "norm1.weight");
+        DINO_F32(ln1_b, "norm1.bias");
+        DINO_F16(q_w,   "attention.attention.query.weight");
+        DINO_F32(q_b,   "attention.attention.query.bias");
+        DINO_F16(k_w,   "attention.attention.key.weight");
+        DINO_F32(k_b,   "attention.attention.key.bias");
+        DINO_F16(v_w,   "attention.attention.value.weight");
+        DINO_F32(v_b,   "attention.attention.value.bias");
+        DINO_F16(out_w, "attention.output.dense.weight");
+        DINO_F32(out_b, "attention.output.dense.bias");
+        DINO_F32(ls1,   "layer_scale1.lambda1");
+        DINO_F32(ln2_w, "norm2.weight");
+        DINO_F32(ln2_b, "norm2.bias");
+        DINO_F16(fc1_w, "mlp.fc1.weight");
+        DINO_F32(fc1_b, "mlp.fc1.bias");
+        DINO_F16(fc2_w, "mlp.fc2.weight");
+        DINO_F32(fc2_b, "mlp.fc2.bias");
+        DINO_F32(ls2,   "layer_scale2.lambda1");
+        #undef DINO_F32
+        #undef DINO_F16
     }
 
-    /* Final LN */
-    r->dino_final_ln_w = st_upload_f16(st, "main_image_encoder.model.layernorm.weight", r->verbose);
-    r->dino_final_ln_b = st_upload_f16(st, "main_image_encoder.model.layernorm.bias", r->verbose);
+    /* Final LN (F32 — consumed by layernorm_f32) */
+    r->dino_final_ln_w = st_upload_f32(st, "main_image_encoder.model.layernorm.weight", r->verbose);
+    r->dino_final_ln_b = st_upload_f32(st, "main_image_encoder.model.layernorm.bias", r->verbose);
     if (!r->dino_final_ln_w) {
-        r->dino_final_ln_w = st_upload_f16(st, "main_image_encoder.model.norm.weight", r->verbose);
-        r->dino_final_ln_b = st_upload_f16(st, "main_image_encoder.model.norm.bias", r->verbose);
+        r->dino_final_ln_w = st_upload_f32(st, "main_image_encoder.model.norm.weight", r->verbose);
+        r->dino_final_ln_b = st_upload_f32(st, "main_image_encoder.model.norm.bias", r->verbose);
     }
 
     safetensors_close(st);
@@ -396,93 +405,97 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
     if (r->verbose) fprintf(stderr, "HY3D: loading DiT from %s (%d tensors)\n",
                              path, st->n_tensors);
 
-    /* x_embedder */
+    /* x_embedder (GEMM bias → F32) */
     r->dit_x_emb_w = st_upload_f16(st, "x_embedder.weight", r->verbose);
-    r->dit_x_emb_b = st_upload_f16(st, "x_embedder.bias", r->verbose);
+    r->dit_x_emb_b = st_upload_f32(st, "x_embedder.bias", r->verbose);
 
-    /* t_embedder */
+    /* t_embedder (GEMM bias → F32) */
     r->dit_t_mlp0_w = st_upload_f16(st, "t_embedder.mlp.0.weight", r->verbose);
-    r->dit_t_mlp0_b = st_upload_f16(st, "t_embedder.mlp.0.bias", r->verbose);
+    r->dit_t_mlp0_b = st_upload_f32(st, "t_embedder.mlp.0.bias", r->verbose);
     r->dit_t_mlp2_w = st_upload_f16(st, "t_embedder.mlp.2.weight", r->verbose);
-    r->dit_t_mlp2_b = st_upload_f16(st, "t_embedder.mlp.2.bias", r->verbose);
+    r->dit_t_mlp2_b = st_upload_f32(st, "t_embedder.mlp.2.bias", r->verbose);
 
-    /* Blocks */
+    /* Blocks
+     * F16: GEMM weights (gemm_f16_f32 expects half_raw)
+     * F32: LayerNorm weights/biases, RMSNorm weights (rms_norm_f32 expects float) */
     for (int i = 0; i < DIT_DEPTH; i++) {
         char name[256];
         dit_block_gpu *b = &r->dit_blocks[i];
-        #define DIT_T(field, suffix) \
+        #define DIT_F16(field, suffix) \
             snprintf(name, sizeof(name), "blocks.%d.%s", i, suffix); \
             b->field = st_upload_f16(st, name, r->verbose);
+        #define DIT_F32(field, suffix) \
+            snprintf(name, sizeof(name), "blocks.%d.%s", i, suffix); \
+            b->field = st_upload_f32(st, name, r->verbose);
 
-        DIT_T(norm1_w,     "norm1.weight");
-        DIT_T(norm1_b,     "norm1.bias");
-        DIT_T(sa_q_w,      "attn1.to_q.weight");
-        DIT_T(sa_k_w,      "attn1.to_k.weight");
-        DIT_T(sa_v_w,      "attn1.to_v.weight");
-        DIT_T(sa_out_w,    "attn1.out_proj.weight");
-        DIT_T(sa_out_b,    "attn1.out_proj.bias");
-        DIT_T(sa_q_norm_w, "attn1.q_norm.weight");
-        DIT_T(sa_k_norm_w, "attn1.k_norm.weight");
+        /* LayerNorm → F32 */
+        DIT_F32(norm1_w,     "norm1.weight");
+        DIT_F32(norm1_b,     "norm1.bias");
+        /* Self-attn GEMM weights → F16 */
+        DIT_F16(sa_q_w,      "attn1.to_q.weight");
+        DIT_F16(sa_k_w,      "attn1.to_k.weight");
+        DIT_F16(sa_v_w,      "attn1.to_v.weight");
+        DIT_F16(sa_out_w,    "attn1.out_proj.weight");
+        DIT_F32(sa_out_b,    "attn1.out_proj.bias");
+        /* RMSNorm weights → F32 */
+        DIT_F32(sa_q_norm_w, "attn1.q_norm.weight");
+        DIT_F32(sa_k_norm_w, "attn1.k_norm.weight");
 
-        DIT_T(norm2_w,     "norm2.weight");
-        DIT_T(norm2_b,     "norm2.bias");
-        DIT_T(ca_q_w,      "attn2.to_q.weight");
-        DIT_T(ca_k_w,      "attn2.to_k.weight");
-        DIT_T(ca_v_w,      "attn2.to_v.weight");
-        DIT_T(ca_out_w,    "attn2.out_proj.weight");
-        DIT_T(ca_out_b,    "attn2.out_proj.bias");
-        DIT_T(ca_q_norm_w, "attn2.q_norm.weight");
-        DIT_T(ca_k_norm_w, "attn2.k_norm.weight");
+        DIT_F32(norm2_w,     "norm2.weight");
+        DIT_F32(norm2_b,     "norm2.bias");
+        DIT_F16(ca_q_w,      "attn2.to_q.weight");
+        DIT_F16(ca_k_w,      "attn2.to_k.weight");
+        DIT_F16(ca_v_w,      "attn2.to_v.weight");
+        DIT_F16(ca_out_w,    "attn2.out_proj.weight");
+        DIT_F32(ca_out_b,    "attn2.out_proj.bias");
+        DIT_F32(ca_q_norm_w, "attn2.q_norm.weight");
+        DIT_F32(ca_k_norm_w, "attn2.k_norm.weight");
 
-        /* norm3 before MLP/MoE */
-        DIT_T(norm3_w,     "norm3.weight");
-        DIT_T(norm3_b,     "norm3.bias");
+        DIT_F32(norm3_w,     "norm3.weight");
+        DIT_F32(norm3_b,     "norm3.bias");
 
-        /* Skip connection weights (blocks 11-20, i.e. layer > depth//2) */
+        /* Skip connection (blocks 11-20) */
         b->use_skip = (i > DIT_HALF_DEPTH) ? 1 : 0;
         if (b->use_skip) {
-            DIT_T(skip_linear_w, "skip_linear.weight");
-            DIT_T(skip_linear_b, "skip_linear.bias");
-            DIT_T(skip_norm_w,   "skip_norm.weight");
-            DIT_T(skip_norm_b,   "skip_norm.bias");
+            DIT_F16(skip_linear_w, "skip_linear.weight");
+            DIT_F32(skip_linear_b, "skip_linear.bias");
+            DIT_F32(skip_norm_w,   "skip_norm.weight");
+            DIT_F32(skip_norm_b,   "skip_norm.bias");
         }
 
         /* MoE vs regular MLP */
         b->use_moe = (i >= DIT_MOE_START) ? 1 : 0;
         if (b->use_moe) {
-            /* MoE gate */
-            DIT_T(moe_gate_w, "moe.gate.weight");
-            /* Per-expert weights */
+            DIT_F16(moe_gate_w, "moe.gate.weight");
             for (int e = 0; e < DIT_N_EXPERTS; e++) {
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.0.proj.weight", i, e);
                 b->moe_expert_fc1_w[e] = st_upload_f16(st, name, r->verbose);
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.0.proj.bias", i, e);
-                b->moe_expert_fc1_b[e] = st_upload_f16(st, name, r->verbose);
+                b->moe_expert_fc1_b[e] = st_upload_f32(st, name, r->verbose);
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.2.weight", i, e);
                 b->moe_expert_fc2_w[e] = st_upload_f16(st, name, r->verbose);
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.2.bias", i, e);
-                b->moe_expert_fc2_b[e] = st_upload_f16(st, name, r->verbose);
+                b->moe_expert_fc2_b[e] = st_upload_f32(st, name, r->verbose);
             }
-            /* Shared expert */
-            DIT_T(moe_shared_fc1_w, "moe.shared_experts.net.0.proj.weight");
-            DIT_T(moe_shared_fc1_b, "moe.shared_experts.net.0.proj.bias");
-            DIT_T(moe_shared_fc2_w, "moe.shared_experts.net.2.weight");
-            DIT_T(moe_shared_fc2_b, "moe.shared_experts.net.2.bias");
+            DIT_F16(moe_shared_fc1_w, "moe.shared_experts.net.0.proj.weight");
+            DIT_F32(moe_shared_fc1_b, "moe.shared_experts.net.0.proj.bias");
+            DIT_F16(moe_shared_fc2_w, "moe.shared_experts.net.2.weight");
+            DIT_F32(moe_shared_fc2_b, "moe.shared_experts.net.2.bias");
         } else {
-            /* Regular MLP */
-            DIT_T(mlp_fc1_w,   "mlp.fc1.weight");
-            DIT_T(mlp_fc1_b,   "mlp.fc1.bias");
-            DIT_T(mlp_fc2_w,   "mlp.fc2.weight");
-            DIT_T(mlp_fc2_b,   "mlp.fc2.bias");
+            DIT_F16(mlp_fc1_w,   "mlp.fc1.weight");
+            DIT_F32(mlp_fc1_b,   "mlp.fc1.bias");
+            DIT_F16(mlp_fc2_w,   "mlp.fc2.weight");
+            DIT_F32(mlp_fc2_b,   "mlp.fc2.bias");
         }
-        #undef DIT_T
+        #undef DIT_F16
+        #undef DIT_F32
     }
 
-    /* Final layer */
-    r->dit_final_ln_w = st_upload_f16(st, "final_layer.norm_final.weight", r->verbose);
-    r->dit_final_ln_b = st_upload_f16(st, "final_layer.norm_final.bias", r->verbose);
+    /* Final layer: LN → F32, linear → F16 */
+    r->dit_final_ln_w = st_upload_f32(st, "final_layer.norm_final.weight", r->verbose);
+    r->dit_final_ln_b = st_upload_f32(st, "final_layer.norm_final.bias", r->verbose);
     r->dit_final_linear_w = st_upload_f16(st, "final_layer.linear.weight", r->verbose);
-    r->dit_final_linear_b = st_upload_f16(st, "final_layer.linear.bias", r->verbose);
+    r->dit_final_linear_b = st_upload_f32(st, "final_layer.linear.bias", r->verbose);
 
     safetensors_close(st);
     r->dit_loaded = 1;
@@ -500,68 +513,75 @@ static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
     if (r->verbose) fprintf(stderr, "HY3D: loading ShapeVAE from %s (%d tensors)\n",
                              path, st->n_tensors);
 
-    /* Post-KL projection */
-    r->vae_post_kl_w = st_upload_f32(st, "post_kl.weight", r->verbose);
+    /* Post-KL projection (GEMM: weight F16, bias F32) */
+    r->vae_post_kl_w = st_upload_f16(st, "post_kl.weight", r->verbose);
     r->vae_post_kl_b = st_upload_f32(st, "post_kl.bias", r->verbose);
 
-    /* Fix 6: Transformer decoder blocks use transformer.resblocks.N prefix */
+    /* Fix 6: Transformer decoder blocks use transformer.resblocks.N prefix
+     * GEMM weights → F16, biases → F32; LN/QKnorm weights → F32 */
     for (int i = 0; i < VAE_DEC_LAYERS; i++) {
         char name[256];
         vae_block_gpu *b = &r->vae_blocks[i];
-        #define VAE_T(field, suffix) \
+        #define VAE_F16(field, suffix) \
+            snprintf(name, sizeof(name), "transformer.resblocks.%d.%s", i, suffix); \
+            b->field = st_upload_f16(st, name, r->verbose);
+        #define VAE_F32(field, suffix) \
             snprintf(name, sizeof(name), "transformer.resblocks.%d.%s", i, suffix); \
             b->field = st_upload_f32(st, name, r->verbose);
 
-        VAE_T(ln1_w,        "ln_1.weight");
-        VAE_T(ln1_b,        "ln_1.bias");
-        VAE_T(qkv_w,        "attn.c_qkv.weight");
-        VAE_T(proj_w,       "attn.c_proj.weight");
-        VAE_T(proj_b,       "attn.c_proj.bias");
-        VAE_T(q_norm_w,     "attn.attention.q_norm.weight");
-        VAE_T(q_norm_b,     "attn.attention.q_norm.bias");
-        VAE_T(k_norm_w,     "attn.attention.k_norm.weight");
-        VAE_T(k_norm_b,     "attn.attention.k_norm.bias");
-        VAE_T(ln2_w,        "ln_2.weight");
-        VAE_T(ln2_b,        "ln_2.bias");
-        VAE_T(mlp_fc_w,     "mlp.c_fc.weight");
-        VAE_T(mlp_fc_b,     "mlp.c_fc.bias");
-        VAE_T(mlp_proj_w,   "mlp.c_proj.weight");
-        VAE_T(mlp_proj_b,   "mlp.c_proj.bias");
-        #undef VAE_T
+        VAE_F32(ln1_w,        "ln_1.weight");
+        VAE_F32(ln1_b,        "ln_1.bias");
+        VAE_F16(qkv_w,        "attn.c_qkv.weight");
+        VAE_F16(proj_w,       "attn.c_proj.weight");
+        VAE_F32(proj_b,       "attn.c_proj.bias");
+        VAE_F32(q_norm_w,     "attn.attention.q_norm.weight");
+        VAE_F32(q_norm_b,     "attn.attention.q_norm.bias");
+        VAE_F32(k_norm_w,     "attn.attention.k_norm.weight");
+        VAE_F32(k_norm_b,     "attn.attention.k_norm.bias");
+        VAE_F32(ln2_w,        "ln_2.weight");
+        VAE_F32(ln2_b,        "ln_2.bias");
+        VAE_F16(mlp_fc_w,     "mlp.c_fc.weight");
+        VAE_F32(mlp_fc_b,     "mlp.c_fc.bias");
+        VAE_F16(mlp_proj_w,   "mlp.c_proj.weight");
+        VAE_F32(mlp_proj_b,   "mlp.c_proj.bias");
+        #undef VAE_F16
+        #undef VAE_F32
 
         b->use_qk_norm = (b->q_norm_w != 0);
     }
 
-    /* Fix 7: Geometry decoder uses geo_decoder.cross_attn_decoder prefix */
+    /* Fix 7: Geometry decoder
+     * GEMM weights → F16, biases → F32; LN/QKnorm → F32 */
     vae_geo_decoder_gpu *g = &r->vae_geo;
-    #define GEO_T(field, suffix) \
-        g->field = st_upload_f32(st, suffix, r->verbose);
+    #define GEO_F16(field, suffix) g->field = st_upload_f16(st, suffix, r->verbose);
+    #define GEO_F32(field, suffix) g->field = st_upload_f32(st, suffix, r->verbose);
 
-    GEO_T(query_proj_w, "geo_decoder.query_proj.weight");
-    GEO_T(query_proj_b, "geo_decoder.query_proj.bias");
-    GEO_T(ln1_w,        "geo_decoder.cross_attn_decoder.ln_1.weight");
-    GEO_T(ln1_b,        "geo_decoder.cross_attn_decoder.ln_1.bias");
-    GEO_T(ln2_w,        "geo_decoder.cross_attn_decoder.ln_2.weight");
-    GEO_T(ln2_b,        "geo_decoder.cross_attn_decoder.ln_2.bias");
-    GEO_T(c_q_w,        "geo_decoder.cross_attn_decoder.attn.c_q.weight");
-    GEO_T(c_kv_w,       "geo_decoder.cross_attn_decoder.attn.c_kv.weight");
-    GEO_T(c_proj_w,     "geo_decoder.cross_attn_decoder.attn.c_proj.weight");
-    GEO_T(c_proj_b,     "geo_decoder.cross_attn_decoder.attn.c_proj.bias");
-    GEO_T(q_norm_w,     "geo_decoder.cross_attn_decoder.attn.attention.q_norm.weight");
-    GEO_T(q_norm_b,     "geo_decoder.cross_attn_decoder.attn.attention.q_norm.bias");
-    GEO_T(k_norm_w,     "geo_decoder.cross_attn_decoder.attn.attention.k_norm.weight");
-    GEO_T(k_norm_b,     "geo_decoder.cross_attn_decoder.attn.attention.k_norm.bias");
-    GEO_T(ln3_w,        "geo_decoder.cross_attn_decoder.ln_3.weight");
-    GEO_T(ln3_b,        "geo_decoder.cross_attn_decoder.ln_3.bias");
-    GEO_T(mlp_fc_w,     "geo_decoder.cross_attn_decoder.mlp.c_fc.weight");
-    GEO_T(mlp_fc_b,     "geo_decoder.cross_attn_decoder.mlp.c_fc.bias");
-    GEO_T(mlp_proj_w,   "geo_decoder.cross_attn_decoder.mlp.c_proj.weight");
-    GEO_T(mlp_proj_b,   "geo_decoder.cross_attn_decoder.mlp.c_proj.bias");
-    GEO_T(ln_post_w,    "geo_decoder.ln_post.weight");
-    GEO_T(ln_post_b,    "geo_decoder.ln_post.bias");
-    GEO_T(output_w,     "geo_decoder.output_proj.weight");
-    GEO_T(output_b,     "geo_decoder.output_proj.bias");
-    #undef GEO_T
+    GEO_F16(query_proj_w, "geo_decoder.query_proj.weight");
+    GEO_F32(query_proj_b, "geo_decoder.query_proj.bias");
+    GEO_F32(ln1_w,        "geo_decoder.cross_attn_decoder.ln_1.weight");
+    GEO_F32(ln1_b,        "geo_decoder.cross_attn_decoder.ln_1.bias");
+    GEO_F32(ln2_w,        "geo_decoder.cross_attn_decoder.ln_2.weight");
+    GEO_F32(ln2_b,        "geo_decoder.cross_attn_decoder.ln_2.bias");
+    GEO_F16(c_q_w,        "geo_decoder.cross_attn_decoder.attn.c_q.weight");
+    GEO_F16(c_kv_w,       "geo_decoder.cross_attn_decoder.attn.c_kv.weight");
+    GEO_F16(c_proj_w,     "geo_decoder.cross_attn_decoder.attn.c_proj.weight");
+    GEO_F32(c_proj_b,     "geo_decoder.cross_attn_decoder.attn.c_proj.bias");
+    GEO_F32(q_norm_w,     "geo_decoder.cross_attn_decoder.attn.attention.q_norm.weight");
+    GEO_F32(q_norm_b,     "geo_decoder.cross_attn_decoder.attn.attention.q_norm.bias");
+    GEO_F32(k_norm_w,     "geo_decoder.cross_attn_decoder.attn.attention.k_norm.weight");
+    GEO_F32(k_norm_b,     "geo_decoder.cross_attn_decoder.attn.attention.k_norm.bias");
+    GEO_F32(ln3_w,        "geo_decoder.cross_attn_decoder.ln_3.weight");
+    GEO_F32(ln3_b,        "geo_decoder.cross_attn_decoder.ln_3.bias");
+    GEO_F16(mlp_fc_w,     "geo_decoder.cross_attn_decoder.mlp.c_fc.weight");
+    GEO_F32(mlp_fc_b,     "geo_decoder.cross_attn_decoder.mlp.c_fc.bias");
+    GEO_F16(mlp_proj_w,   "geo_decoder.cross_attn_decoder.mlp.c_proj.weight");
+    GEO_F32(mlp_proj_b,   "geo_decoder.cross_attn_decoder.mlp.c_proj.bias");
+    GEO_F32(ln_post_w,    "geo_decoder.ln_post.weight");
+    GEO_F32(ln_post_b,    "geo_decoder.ln_post.bias");
+    GEO_F16(output_w,     "geo_decoder.output_proj.weight");
+    GEO_F32(output_b,     "geo_decoder.output_proj.bias");
+    #undef GEO_F16
+    #undef GEO_F32
 
     g->use_qk_norm = (g->q_norm_w != 0);
 
@@ -610,22 +630,23 @@ static void run_dinov2(cuda_hy3d_runner *r, CUdeviceptr d_image, CUdeviceptr d_o
     CUdeviceptr d_mlp    = r->scratch[3];
     CUdeviceptr d_normed = r->scratch[4];
 
-    /* 1. Patch embedding: conv2d -> [num_patches, dim] */
+    /* 1. Patch embedding: conv2d -> [num_patches, dim]
+     * Kernel: blockIdx.x = patch index, threadIdx.x loops over output channels */
     {
         int gw2 = gw;
         int dim2 = dim, ps2 = ps, img_w = DINO_IMG_SIZE;
         CUdeviceptr pw = r->dino_patch_w, pb = r->dino_patch_b;
         void *args[] = {&d_hidden, &d_image, &pw, &pb, &gw2, &dim2, &ps2, &img_w};
         cuLaunchKernel(ops->patch_embed,
-                       (unsigned)((dim+15)/16), (unsigned)(gw*gw), 1,
-                       16, 1, 1, 0, stream, args, NULL);
+                       (unsigned)(gw * gw), 1, 1,
+                       256, 1, 1, 0, stream, args, NULL);
     }
 
     /* 2. CLS token + position embeddings */
     {
         int n_tok = seq, d2 = dim;
-        void *args[] = {(void*)&d_hidden, (void*)&r->dino_cls_token,
-                        (void*)&r->dino_pos_emb, &n_tok, &d2};
+        CUdeviceptr cls = r->dino_cls_token, pos = r->dino_pos_emb;
+        void *args[] = {&d_hidden, &cls, &pos, &n_tok, &d2};
         cuLaunchKernel(ops->cls_pos_embed,
                        (unsigned)((seq*dim+255)/256), 1, 1,
                        256, 1, 1, 0, stream, args, NULL);
@@ -1162,7 +1183,7 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     /* d_cur now contains decoded latents [N, W] */
     /* Query SDF at grid points in batches */
     int total_points = grid_res * grid_res * grid_res;
-    int batch_size = 65536;  /* 64K points per batch */
+    int batch_size = 8192;  /* 8K points per batch (fits in 8GB GPU) */
     float bounds[6] = {-1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
 
     /* Allocate GPU buffers for SDF query */
@@ -1495,6 +1516,79 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
                 elapsed, result.n_verts, result.n_tris);
 
     return result;
+}
+
+/* ======================================================================== */
+/* Per-stage verification API                                               */
+/* ======================================================================== */
+
+int cuda_hy3d_run_dinov2(cuda_hy3d_runner *r,
+                          const float *image_f32,
+                          float *output) {
+    if (!r || !r->dino_loaded) return -1;
+
+    size_t img_bytes = (size_t)3 * DINO_IMG_SIZE * DINO_IMG_SIZE * sizeof(float);
+    size_t out_bytes = (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float);
+
+    CUdeviceptr d_image = gpu_alloc(img_bytes);
+    CUdeviceptr d_out = gpu_alloc(out_bytes);
+
+    cuMemcpyHtoDAsync(d_image, image_f32, img_bytes, r->stream);
+    run_dinov2(r, d_image, d_out);
+    cuMemcpyDtoHAsync(output, d_out, out_bytes, r->stream);
+    cuStreamSynchronize(r->stream);
+
+    cuMemFree(d_image);
+    cuMemFree(d_out);
+    return 0;
+}
+
+int cuda_hy3d_run_vae(cuda_hy3d_runner *r,
+                       const float *latents,
+                       int grid_res,
+                       float *sdf_out) {
+    if (!r || !r->vae_loaded) return -1;
+
+    size_t lat_bytes = (size_t)VAE_NUM_LATENTS * VAE_EMBED_DIM * sizeof(float);
+    CUdeviceptr d_latents = gpu_alloc(lat_bytes);
+    cuMemcpyHtoDAsync(d_latents, latents, lat_bytes, r->stream);
+
+    run_shapevae(r, d_latents, grid_res, sdf_out);
+
+    cuMemFree(d_latents);
+    return 0;
+}
+
+int cuda_hy3d_run_dit(cuda_hy3d_runner *r,
+                       const float *latents,
+                       float timestep,
+                       const float *context,
+                       float *output) {
+    if (!r || !r->dit_loaded) return -1;
+
+    size_t lat_bytes = (size_t)DIT_INPUT_SIZE * DIT_IN_CHANNELS * sizeof(float);
+    size_t ctx_bytes = (size_t)DINO_SEQ_LEN * DIT_CONTEXT_DIM * sizeof(float);
+    size_t out_bytes = lat_bytes;
+
+    CUdeviceptr d_latents = gpu_alloc(lat_bytes);
+    CUdeviceptr d_context = gpu_alloc(ctx_bytes);
+    CUdeviceptr d_output  = gpu_alloc(out_bytes);
+
+    cuMemcpyHtoDAsync(d_latents, latents, lat_bytes, r->stream);
+    cuMemcpyHtoDAsync(d_context, context, ctx_bytes, r->stream);
+
+    /* Pre-compute cross-attention K,V from context */
+    precompute_dit_ca_kv(r, d_context);
+
+    run_dit_forward(r, d_latents, timestep, d_context, d_output);
+
+    cuMemcpyDtoHAsync(output, d_output, out_bytes, r->stream);
+    cuStreamSynchronize(r->stream);
+
+    cuMemFree(d_latents);
+    cuMemFree(d_context);
+    cuMemFree(d_output);
+    return 0;
 }
 
 void cuda_hy3d_free(cuda_hy3d_runner *r) {
