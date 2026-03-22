@@ -338,8 +338,105 @@ static void sp3d_dequant_row(const qtensor *t, int row, float *dst) {
 }
 
 /* ==================================================================== */
+/* SIMD helpers                                                           */
+/* ==================================================================== */
+
+/* AVX2 dot product: sum(a[0..n-1] * b[0..n-1]) */
+static inline float sp3d_dot(const float *a, const float *b, int n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int ic = 0;
+    for (; ic + 15 < n; ic += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + ic),
+                               _mm256_loadu_ps(b + ic), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + ic + 8),
+                               _mm256_loadu_ps(b + ic + 8), acc1);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    for (; ic + 7 < n; ic += 8) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + ic),
+                               _mm256_loadu_ps(b + ic), acc0);
+    }
+    float s = cpu_hsum_avx(acc0);
+    for (; ic < n; ic++) s += a[ic] * b[ic];
+    return s;
+#else
+    float s = 0.0f;
+    for (int ic = 0; ic < n; ic++) s += a[ic] * b[ic];
+    return s;
+#endif
+}
+
+/* ==================================================================== */
 /* Elementwise operations                                                */
 /* ==================================================================== */
+
+/* F32 GEMM kernel: dst[i_start..i_end][0..out_C] = src @ Wf^T + bf */
+static void sp3d_gemm_f32_range(float *dst, const float *src,
+                                 const float *Wf, const float *bf,
+                                 int i_start, int i_end, int out_C, int in_C) {
+    for (int i = i_start; i < i_end; i++) {
+        const float *s_row = src + (size_t)i * in_C;
+        float *d_row = dst + (size_t)i * out_C;
+        int j = 0;
+        for (; j + 3 < out_C; j += 4) {
+            const float *w0 = Wf + (size_t)(j)     * in_C;
+            const float *w1 = Wf + (size_t)(j + 1) * in_C;
+            const float *w2 = Wf + (size_t)(j + 2) * in_C;
+            const float *w3 = Wf + (size_t)(j + 3) * in_C;
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+            int k = 0;
+            for (; k + 7 < in_C; k += 8) {
+                __m256 sv = _mm256_loadu_ps(s_row + k);
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + k), sv, a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + k), sv, a1);
+                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + k), sv, a2);
+                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + k), sv, a3);
+            }
+            float s0 = cpu_hsum_avx(a0), s1 = cpu_hsum_avx(a1);
+            float s2 = cpu_hsum_avx(a2), s3 = cpu_hsum_avx(a3);
+            for (; k < in_C; k++) {
+                float sv = s_row[k];
+                s0 += w0[k] * sv; s1 += w1[k] * sv;
+                s2 += w2[k] * sv; s3 += w3[k] * sv;
+            }
+#else
+            float s0=0,s1=0,s2=0,s3=0;
+            for (int k = 0; k < in_C; k++) {
+                float sv = s_row[k];
+                s0 += w0[k]*sv; s1 += w1[k]*sv;
+                s2 += w2[k]*sv; s3 += w3[k]*sv;
+            }
+#endif
+            d_row[j]   = bf ? s0 + bf[j]   : s0;
+            d_row[j+1] = bf ? s1 + bf[j+1] : s1;
+            d_row[j+2] = bf ? s2 + bf[j+2] : s2;
+            d_row[j+3] = bf ? s3 + bf[j+3] : s3;
+        }
+        for (; j < out_C; j++) {
+            float s = sp3d_dot(Wf + (size_t)j * in_C, s_row, in_C);
+            d_row[j] = bf ? s + bf[j] : s;
+        }
+    }
+}
+
+typedef struct {
+    float *dst;
+    const float *src;
+    const float *Wf;
+    const float *bf;
+    int i_start, i_end, out_C, in_C;
+} sp3d_gemm_task;
+
+static void *sp3d_gemm_worker(void *arg) {
+    sp3d_gemm_task *t = (sp3d_gemm_task *)arg;
+    sp3d_gemm_f32_range(t->dst, t->src, t->Wf, t->bf,
+                         t->i_start, t->i_end, t->out_C, t->in_C);
+    return NULL;
+}
 
 void sp3d_linear(float *dst, const float *src, int N,
                   const qtensor *W, const qtensor *bias,
@@ -360,20 +457,21 @@ void sp3d_linear(float *dst, const float *src, int N,
     } else if (W->type == GGML_TYPE_F32) {
         /* F32 GEMM: dst[i][j] = sum_k src[i][k] * W[j][k] + bias[j] */
         const float *Wf = (const float *)W->data;
-        for (int i = 0; i < N; i++) {
-            for (int j = 0; j < out_C; j++) {
-                float s = 0.0f;
-                const float *w_row = Wf + (size_t)j * in_C;
-                const float *s_row = src + (size_t)i * in_C;
-                for (int k = 0; k < in_C; k++) s += w_row[k] * s_row[k];
-                dst[i * out_C + j] = s;
+        const float *bf = (bias && bias->data) ? (const float *)bias->data : NULL;
+        if (n_threads <= 1 || N < n_threads * 4) {
+            sp3d_gemm_f32_range(dst, src, Wf, bf, 0, N, out_C, in_C);
+        } else {
+            sp3d_gemm_task *tasks = (sp3d_gemm_task *)calloc((size_t)n_threads, sizeof(sp3d_gemm_task));
+            pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
+            int per = N / n_threads, rem = N % n_threads, v = 0;
+            for (int ti = 0; ti < n_threads; ti++) {
+                int cnt = per + (ti < rem ? 1 : 0);
+                tasks[ti] = (sp3d_gemm_task){dst, src, Wf, bf, v, v + cnt, out_C, in_C};
+                v += cnt;
+                pthread_create(&threads[ti], NULL, sp3d_gemm_worker, &tasks[ti]);
             }
-        }
-        if (bias && bias->data) {
-            const float *bf = (const float *)bias->data;
-            for (int i = 0; i < N; i++)
-                for (int j = 0; j < out_C; j++)
-                    dst[i * out_C + j] += bf[j];
+            for (int ti = 0; ti < n_threads; ti++) pthread_join(threads[ti], NULL);
+            free(tasks); free(threads);
         }
     } else {
         /* Quantized: dequant row by row */
@@ -405,16 +503,127 @@ void sp3d_layernorm(float *dst, const float *src,
     float *bf = (float *)malloc((size_t)C * sizeof(float));
     sp3d_dequant_row(w, 0, wf);
     sp3d_dequant_row(b, 0, bf);
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 v_eps = _mm256_set1_ps(eps);
+    for (int t = 0; t < N; t++) {
+        const float *x = src + (size_t)t * C;
+        float *y = dst + (size_t)t * C;
+        /* Pass 1: mean */
+        __m256 sum = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 7 < C; i += 8)
+            sum = _mm256_add_ps(sum, _mm256_loadu_ps(x + i));
+        float mean = cpu_hsum_avx(sum);
+        for (; i < C; i++) mean += x[i];
+        mean /= C;
+        /* Pass 2: variance */
+        __m256 vmean = _mm256_set1_ps(mean);
+        __m256 vvar = _mm256_setzero_ps();
+        i = 0;
+        for (; i + 7 < C; i += 8) {
+            __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), vmean);
+            vvar = _mm256_fmadd_ps(d, d, vvar);
+        }
+        float var = cpu_hsum_avx(vvar);
+        for (; i < C; i++) { float d = x[i] - mean; var += d * d; }
+        var /= C;
+        /* Pass 3: normalize */
+        float inv = 1.0f / sqrtf(var + eps);
+        __m256 vinv = _mm256_set1_ps(inv);
+        i = 0;
+        for (; i + 7 < C; i += 8) {
+            __m256 xv = _mm256_loadu_ps(x + i);
+            __m256 norm = _mm256_mul_ps(_mm256_sub_ps(xv, vmean), vinv);
+            __m256 out = _mm256_fmadd_ps(norm, _mm256_loadu_ps(wf + i),
+                                          _mm256_loadu_ps(bf + i));
+            _mm256_storeu_ps(y + i, out);
+        }
+        for (; i < C; i++)
+            y[i] = (x[i] - mean) * inv * wf[i] + bf[i];
+    }
+    (void)v_eps;
+#else
     cpu_layernorm(dst, src, wf, bf, N, C, eps);
+#endif
     free(wf); free(bf);
 }
 
+#if defined(__AVX2__) && defined(__FMA__)
+/* Fast exp approximation for AVX2: max relative error ~1.5e-7 in [-88, 88]
+ * Uses Cephes-style polynomial minimax on reduced range */
+static inline __m256 sp3d_exp_avx(__m256 x) {
+    /* Clamp to avoid overflow/underflow */
+    x = _mm256_max_ps(x, _mm256_set1_ps(-88.0f));
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.0f));
+    /* exp(x) = 2^(x/ln2) = 2^n * 2^f where n=floor(x/ln2), f=frac */
+    __m256 log2e = _mm256_set1_ps(1.44269504089f);
+    __m256 t = _mm256_mul_ps(x, log2e);
+    __m256 n = _mm256_floor_ps(t);
+    __m256 f = _mm256_sub_ps(t, n);  /* fractional part in [0,1) */
+    /* 2^f approx via polynomial: p(f) ≈ 2^f for f in [0,1) */
+    __m256 p = _mm256_set1_ps(1.3534167e-2f);
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(5.2011464e-2f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(2.4114209e-1f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(6.9315836e-1f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(9.9999994e-1f));
+    /* Multiply by 2^n: add n to float exponent */
+    __m256i ni = _mm256_cvtps_epi32(n);
+    ni = _mm256_slli_epi32(ni, 23);
+    __m256 pow2n = _mm256_castsi256_ps(_mm256_add_epi32(ni,
+                    _mm256_set1_epi32(0x3f800000)));
+    return _mm256_mul_ps(p, pow2n);
+}
+
+/* Fast tanh approximation: tanh(x) = 1 - 2/(exp(2x)+1) */
+static inline __m256 sp3d_tanh_avx(__m256 x) {
+    __m256 two = _mm256_set1_ps(2.0f);
+    __m256 one = _mm256_set1_ps(1.0f);
+    __m256 e2x = sp3d_exp_avx(_mm256_mul_ps(two, x));
+    return _mm256_sub_ps(one, _mm256_div_ps(two, _mm256_add_ps(e2x, one)));
+}
+#endif
+
 void sp3d_gelu(float *x, int count) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 half = _mm256_set1_ps(0.5f);
+    __m256 one = _mm256_set1_ps(1.0f);
+    __m256 c = _mm256_set1_ps(0.7978845608f);
+    __m256 c2 = _mm256_set1_ps(0.044715f);
+    int i = 0;
+    for (; i + 7 < count; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 v3 = _mm256_mul_ps(_mm256_mul_ps(v, v), v);
+        __m256 inner = _mm256_mul_ps(c, _mm256_fmadd_ps(c2, v3, v));
+        __m256 t = sp3d_tanh_avx(inner);
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(half, _mm256_mul_ps(v, _mm256_add_ps(one, t))));
+    }
+    for (; i < count; i++) {
+        float v = x[i];
+        float t = tanhf(0.7978845608f * (v + 0.044715f * v * v * v));
+        x[i] = 0.5f * v * (1.0f + t);
+    }
+#else
     cpu_gelu(x, count);
+#endif
 }
 
 void sp3d_silu(float *x, int count) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 one = _mm256_set1_ps(1.0f);
+    int i = 0;
+    for (; i + 7 < count; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 neg_v = _mm256_sub_ps(_mm256_setzero_ps(), v);
+        __m256 sigmoid = _mm256_div_ps(one, _mm256_add_ps(one, sp3d_exp_avx(neg_v)));
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(v, sigmoid));
+    }
+    for (; i < count; i++) {
+        float v = x[i];
+        x[i] = v / (1.0f + expf(-v));
+    }
+#else
     cpu_silu(x, count);
+#endif
 }
 
 /* ==================================================================== */
@@ -443,7 +652,6 @@ static void *sp3d_conv_worker(void *arg) {
     int in_C = task->in_C, out_C = task->out_C;
     int K3 = task->n_offsets;
 
-    /* CUDA extension point: launch one thread per output voxel */
     for (int i = task->v_start; i < task->v_end; i++) {
         int32_t batch = t->coords[i*4];
         int32_t z = t->coords[i*4+1];
@@ -459,16 +667,52 @@ static void *sp3d_conv_worker(void *arg) {
             int j = sp3d_hash_lookup(t->hash, batch, nz, ny, nx);
             if (j < 0) continue;
 
-            /* Accumulate: out[oc] += sum_ic W[oc, k, ic] * feats[j, ic]
-             * W layout: [out_C, K3, in_C] */
             const float *feat_j = t->feats + (size_t)j * in_C;
-            for (int oc = 0; oc < out_C; oc++) {
-                const float *w_ock = W + ((size_t)oc * K3 + k) * in_C;
-                float s = 0.0f;
-                for (int ic = 0; ic < in_C; ic++) {
-                    s += w_ock[ic] * feat_j[ic];
+            /* W layout: [out_C, K3, in_C] */
+            const float *w_k_base = W + (size_t)k * in_C;
+            size_t w_stride = (size_t)K3 * in_C; /* stride between oc rows */
+
+            /* Process 4 output channels at a time to hide FMA latency */
+            int oc = 0;
+            for (; oc + 3 < out_C; oc += 4) {
+                const float *w0 = w_k_base + (size_t)(oc)     * w_stride;
+                const float *w1 = w_k_base + (size_t)(oc + 1) * w_stride;
+                const float *w2 = w_k_base + (size_t)(oc + 2) * w_stride;
+                const float *w3 = w_k_base + (size_t)(oc + 3) * w_stride;
+#if defined(__AVX2__) && defined(__FMA__)
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                int ic = 0;
+                for (; ic + 7 < in_C; ic += 8) {
+                    __m256 f = _mm256_loadu_ps(feat_j + ic);
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + ic), f, a0);
+                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + ic), f, a1);
+                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + ic), f, a2);
+                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + ic), f, a3);
                 }
-                out[oc] += s;
+                float s0 = cpu_hsum_avx(a0), s1 = cpu_hsum_avx(a1);
+                float s2 = cpu_hsum_avx(a2), s3 = cpu_hsum_avx(a3);
+                for (; ic < in_C; ic++) {
+                    float fv = feat_j[ic];
+                    s0 += w0[ic] * fv; s1 += w1[ic] * fv;
+                    s2 += w2[ic] * fv; s3 += w3[ic] * fv;
+                }
+                out[oc]   += s0; out[oc+1] += s1;
+                out[oc+2] += s2; out[oc+3] += s3;
+#else
+                float s0=0, s1=0, s2=0, s3=0;
+                for (int ic = 0; ic < in_C; ic++) {
+                    float fv = feat_j[ic];
+                    s0 += w0[ic] * fv; s1 += w1[ic] * fv;
+                    s2 += w2[ic] * fv; s3 += w3[ic] * fv;
+                }
+                out[oc]   += s0; out[oc+1] += s1;
+                out[oc+2] += s2; out[oc+3] += s3;
+#endif
+            }
+            for (; oc < out_C; oc++) {
+                const float *w_ock = w_k_base + (size_t)oc * w_stride;
+                out[oc] += sp3d_dot(w_ock, feat_j, in_C);
             }
         }
     }
@@ -549,53 +793,73 @@ void sp3d_attention(float *out, const float *qkv, const sp3d_tensor *t,
 void sp3d_rope_3d(float *qk, const sp3d_tensor *t,
                    int n_heads, int head_dim, int dim_stride,
                    const float *rope_freqs, int n_freqs) {
-    /* Split head_dim into 3 axes: z, y, x.
-     * TRELLIS.2 convention: head_dim is split into 3 equal groups of pairs.
-     * n_freqs = head_dim / 6 (number of rotation pairs per axis).
-     * Layout within head: [z_pairs, y_pairs, x_pairs] each of size n_freqs*2.
-     * Uses rotate_half: out = x * cos + rotate_half(x) * sin
-     *
-     * rope_freqs[j] = 1.0 / (freq_base ^ (2*j / (2*n_freqs)))
-     *   typically 3 * n_freqs * 2 = head_dim
-     */
-    int axis_dim = 2 * n_freqs;  /* dims per axis */
+    int axis_dim = 2 * n_freqs;
     if (3 * axis_dim > head_dim) {
-        /* Fallback: use as many dims as fit */
         axis_dim = head_dim / 3;
         n_freqs = axis_dim / 2;
     }
 
-    for (int i = 0; i < t->N; i++) {
-        float cz = (float)t->coords[i*4+1];
-        float cy = (float)t->coords[i*4+2];
-        float cx = (float)t->coords[i*4+3];
-        float coords[3] = {cz, cy, cx};
+    /* Precompute sin/cos tables for all 3 axes × n_freqs.
+     * These are reused across all heads for a given voxel. */
+    float *cs_tab = (float *)malloc((size_t)3 * n_freqs * sizeof(float));
+    float *sn_tab = (float *)malloc((size_t)3 * n_freqs * sizeof(float));
 
+    for (int i = 0; i < t->N; i++) {
+        float coord_vals[3] = {
+            (float)t->coords[i*4+1],
+            (float)t->coords[i*4+2],
+            (float)t->coords[i*4+3]
+        };
+
+        /* Precompute sin/cos for this voxel (3 axes × n_freqs) */
+        for (int axis = 0; axis < 3; axis++) {
+            float coord = coord_vals[axis];
+            for (int j = 0; j < n_freqs; j++) {
+                float theta = coord * rope_freqs[j];
+                cs_tab[axis * n_freqs + j] = cosf(theta);
+                sn_tab[axis * n_freqs + j] = sinf(theta);
+            }
+        }
+
+        /* Apply rotation to all heads using precomputed tables */
         for (int h = 0; h < n_heads; h++) {
             float *v = qk + (size_t)i * dim_stride + h * head_dim;
 
             for (int axis = 0; axis < 3; axis++) {
-                float coord = coords[axis];
                 int base = axis * axis_dim;
-
-                for (int j = 0; j < n_freqs; j++) {
-                    float theta = coord * rope_freqs[j];
-                    float cs = cosf(theta);
-                    float sn = sinf(theta);
-
-                    /* rotate_half: pairs are (v[j], v[j+n_freqs]) */
+                const float *cs_a = cs_tab + axis * n_freqs;
+                const float *sn_a = sn_tab + axis * n_freqs;
+                int j = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                for (; j + 7 < n_freqs; j += 8) {
+                    int idx0 = base + j;
+                    int idx1 = base + j + n_freqs;
+                    if (idx1 + 7 >= head_dim) break;
+                    __m256 v0 = _mm256_loadu_ps(v + idx0);
+                    __m256 v1 = _mm256_loadu_ps(v + idx1);
+                    __m256 c  = _mm256_loadu_ps(cs_a + j);
+                    __m256 s  = _mm256_loadu_ps(sn_a + j);
+                    /* v0' = v0*cos - v1*sin, v1' = v0*sin + v1*cos */
+                    __m256 new0 = _mm256_fmsub_ps(v0, c, _mm256_mul_ps(v1, s));
+                    __m256 new1 = _mm256_fmadd_ps(v0, s, _mm256_mul_ps(v1, c));
+                    _mm256_storeu_ps(v + idx0, new0);
+                    _mm256_storeu_ps(v + idx1, new1);
+                }
+#endif
+                for (; j < n_freqs; j++) {
                     int idx0 = base + j;
                     int idx1 = base + j + n_freqs;
                     if (idx1 >= head_dim) break;
-
-                    float v0 = v[idx0];
-                    float v1 = v[idx1];
-                    v[idx0] = v0 * cs - v1 * sn;
-                    v[idx1] = v0 * sn + v1 * cs;
+                    float v0 = v[idx0], v1 = v[idx1];
+                    v[idx0] = v0 * cs_a[j] - v1 * sn_a[j];
+                    v[idx1] = v0 * sn_a[j] + v1 * cs_a[j];
                 }
             }
         }
     }
+
+    free(cs_tab);
+    free(sn_tab);
 }
 
 /* ==================================================================== */
