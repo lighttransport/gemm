@@ -577,43 +577,164 @@ static void test_conv3d_threaded(void) {
     fprintf(stderr, "  conv3d threaded: OK\n");
 }
 
-/* ---- Benchmark: conv3d scaling ---- */
-static void bench_conv3d(void) {
-    SECTION("Benchmark: conv3d");
+/* ---- Helper: elapsed time in ms ---- */
+static double elapsed_ms(struct timespec *t0, struct timespec *t1) {
+    return (t1->tv_sec - t0->tv_sec) * 1e3 + (t1->tv_nsec - t0->tv_nsec) / 1e6;
+}
 
-    int N = 4096;
-    int in_C = 32, out_C = 32;
-    int32_t *coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
-    float *feats = (float *)malloc((size_t)N * in_C * sizeof(float));
+/* ---- Benchmark: all operations ---- */
+static void bench_all(void) {
+    SECTION("Benchmarks");
+    struct timespec t0, t1;
     srand(42);
-    for (int i = 0; i < N; i++) {
-        coords[i*4]   = 0;
-        coords[i*4+1] = rand() % 32;
-        coords[i*4+2] = rand() % 32;
-        coords[i*4+3] = rand() % 32;
-        for (int c = 0; c < in_C; c++)
-            feats[i*in_C+c] = (float)(rand() % 1000) / 1000.0f;
+
+    /* --- Conv3d (most expensive) --- */
+    {
+        int N = 4096, in_C = 32, out_C = 32, K3 = 27;
+        int32_t *coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
+        float *feats = (float *)malloc((size_t)N * in_C * sizeof(float));
+        for (int i = 0; i < N; i++) {
+            coords[i*4] = 0;
+            coords[i*4+1] = rand() % 32;
+            coords[i*4+2] = rand() % 32;
+            coords[i*4+3] = rand() % 32;
+            for (int c = 0; c < in_C; c++)
+                feats[i*in_C+c] = (float)(rand() % 1000) / 1000.0f;
+        }
+        sp3d_tensor *t = sp3d_create(coords, feats, N, in_C, 1);
+        float *weight = (float *)malloc((size_t)out_C * K3 * in_C * sizeof(float));
+        for (int i = 0; i < out_C * K3 * in_C; i++)
+            weight[i] = (float)(rand() % 1000) / 1000.0f - 0.5f;
+        float *dst = (float *)calloc((size_t)N * out_C, sizeof(float));
+
+        for (int thr = 1; thr <= 4; thr *= 2) {
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            sp3d_conv3d_forward(dst, t, weight, NULL, in_C, out_C, 3, thr);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            fprintf(stderr, "  conv3d  N=%d C=%d->%d %dt: %.1f ms\n",
+                    N, in_C, out_C, thr, elapsed_ms(&t0, &t1));
+        }
+        free(dst); free(weight); free(feats); free(coords);
+        sp3d_free(t);
     }
-    sp3d_tensor *t = sp3d_create(coords, feats, N, in_C, 1);
 
-    int K3 = 27;
-    float *weight = (float *)malloc((size_t)out_C * K3 * in_C * sizeof(float));
-    for (int i = 0; i < out_C * K3 * in_C; i++)
-        weight[i] = (float)(rand() % 1000) / 1000.0f - 0.5f;
+    /* --- Linear F32 --- */
+    {
+        int N = 4096, in_C = 128, out_C = 128;
+        float *src = (float *)malloc((size_t)N * in_C * sizeof(float));
+        float *wt = (float *)malloc((size_t)out_C * in_C * sizeof(float));
+        float *dst = (float *)malloc((size_t)N * out_C * sizeof(float));
+        for (int i = 0; i < N * in_C; i++) src[i] = (float)(rand() % 1000) / 1000.0f - 0.5f;
+        for (int i = 0; i < out_C * in_C; i++) wt[i] = (float)(rand() % 1000) / 1000.0f - 0.5f;
+        qtensor W = {0};
+        W.data = wt; W.type = GGML_TYPE_F32;
+        W.n_rows = out_C; W.n_cols = in_C; W.n_dims = 2;
+        W.dims[0] = (uint64_t)out_C; W.dims[1] = (uint64_t)in_C;
 
-    float *dst = (float *)calloc((size_t)N * out_C, sizeof(float));
-
-    for (int thr = 1; thr <= 4; thr *= 2) {
-        struct timespec ts0, ts1;
-        clock_gettime(CLOCK_MONOTONIC, &ts0);
-        sp3d_conv3d_forward(dst, t, weight, NULL, in_C, out_C, 3, thr);
-        clock_gettime(CLOCK_MONOTONIC, &ts1);
-        double ms = (ts1.tv_sec - ts0.tv_sec) * 1e3 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
-        fprintf(stderr, "  conv3d N=%d C=%d->%d, %d threads: %.1f ms\n", N, in_C, out_C, thr, ms);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        sp3d_linear(dst, src, N, &W, NULL, out_C, in_C, 1);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "  linear  N=%d C=%d->%d: %.1f ms\n",
+                N, in_C, out_C, elapsed_ms(&t0, &t1));
+        free(src); free(wt); free(dst);
     }
 
-    free(dst); free(weight); free(feats); free(coords);
-    sp3d_free(t);
+    /* --- LayerNorm --- */
+    {
+        int N = 4096, C = 128;
+        float *src = (float *)malloc((size_t)N * C * sizeof(float));
+        float *dst = (float *)malloc((size_t)N * C * sizeof(float));
+        float *w = (float *)malloc((size_t)C * sizeof(float));
+        float *b = (float *)malloc((size_t)C * sizeof(float));
+        for (int i = 0; i < N * C; i++) src[i] = (float)(rand() % 1000) / 1000.0f - 0.5f;
+        for (int i = 0; i < C; i++) { w[i] = 1.0f; b[i] = 0.0f; }
+        qtensor W = {0}; W.data = w; W.type = GGML_TYPE_F32; W.n_rows = 1; W.n_cols = C;
+        W.n_dims = 1; W.dims[0] = (uint64_t)C;
+        qtensor B = {0}; B.data = b; B.type = GGML_TYPE_F32; B.n_rows = 1; B.n_cols = C;
+        B.n_dims = 1; B.dims[0] = (uint64_t)C;
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int rep = 0; rep < 100; rep++)
+            sp3d_layernorm(dst, src, &W, &B, N, C, 1e-6f);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "  layernorm N=%d C=%d x100: %.1f ms (%.2f us/call)\n",
+                N, C, elapsed_ms(&t0, &t1), elapsed_ms(&t0, &t1) * 10.0);
+        free(src); free(dst); free(w); free(b);
+    }
+
+    /* --- GELU / SiLU --- */
+    {
+        int count = 4096 * 128;
+        float *x = (float *)malloc((size_t)count * sizeof(float));
+        for (int i = 0; i < count; i++) x[i] = (float)(rand() % 1000) / 1000.0f * 6.0f - 3.0f;
+
+        float *tmp = (float *)malloc((size_t)count * sizeof(float));
+        memcpy(tmp, x, (size_t)count * sizeof(float));
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int rep = 0; rep < 100; rep++) {
+            memcpy(tmp, x, (size_t)count * sizeof(float));
+            sp3d_gelu(tmp, count);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "  gelu    %d elems x100: %.1f ms (%.2f us/call)\n",
+                count, elapsed_ms(&t0, &t1), elapsed_ms(&t0, &t1) * 10.0);
+
+        memcpy(tmp, x, (size_t)count * sizeof(float));
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int rep = 0; rep < 100; rep++) {
+            memcpy(tmp, x, (size_t)count * sizeof(float));
+            sp3d_silu(tmp, count);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "  silu    %d elems x100: %.1f ms (%.2f us/call)\n",
+                count, elapsed_ms(&t0, &t1), elapsed_ms(&t0, &t1) * 10.0);
+        free(x); free(tmp);
+    }
+
+    /* --- Attention --- */
+    {
+        int N = 512, n_heads = 2, head_dim = 64, dim = n_heads * head_dim;
+        float *qkv = (float *)malloc((size_t)N * 3 * dim * sizeof(float));
+        for (int i = 0; i < N * 3 * dim; i++)
+            qkv[i] = ((float)(rand() % 1000) / 1000.0f - 0.5f) * 0.1f;
+        int32_t *coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
+        for (int i = 0; i < N; i++) {
+            coords[i*4] = 0; coords[i*4+1] = i/100;
+            coords[i*4+2] = (i/10)%10; coords[i*4+3] = i%10;
+        }
+        sp3d_tensor *t = sp3d_create(coords, NULL, N, dim, 1);
+        float *out = (float *)calloc((size_t)N * dim, sizeof(float));
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        sp3d_attention(out, qkv, t, n_heads, head_dim, 1);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "  attention N=%d dim=%d: %.1f ms\n",
+                N, dim, elapsed_ms(&t0, &t1));
+        free(out); free(qkv); free(coords); sp3d_free(t);
+    }
+
+    /* --- RoPE 3D --- */
+    {
+        int N = 4096, n_heads = 8, head_dim = 24, n_freqs = 4;
+        int dim = n_heads * head_dim;
+        float *qk = (float *)malloc((size_t)N * dim * sizeof(float));
+        for (int i = 0; i < N * dim; i++) qk[i] = (float)(rand() % 1000) / 1000.0f - 0.5f;
+        int32_t *coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
+        for (int i = 0; i < N; i++) {
+            coords[i*4] = 0; coords[i*4+1] = rand()%16;
+            coords[i*4+2] = rand()%16; coords[i*4+3] = rand()%16;
+        }
+        sp3d_tensor *t = sp3d_create(coords, NULL, N, 1, 1);
+        float freqs[] = {1.0f, 0.5f, 0.25f, 0.125f};
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int rep = 0; rep < 100; rep++)
+            sp3d_rope_3d(qk, t, n_heads, head_dim, dim, freqs, n_freqs);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "  rope_3d N=%d nh=%d hd=%d x100: %.1f ms (%.2f us/call)\n",
+                N, n_heads, head_dim, elapsed_ms(&t0, &t1), elapsed_ms(&t0, &t1) * 10.0);
+        free(qk); free(coords); sp3d_free(t);
+    }
 }
 
 /* ==================================================================== */
@@ -904,7 +1025,7 @@ int main(int argc, char **argv) {
     test_downsample();
     test_upsample();
     test_rope_3d();
-    bench_conv3d();
+    bench_all();
 
     fprintf(stderr, "\n========================================\n");
     fprintf(stderr, "Tests: %d total, %d passed, %d failed\n", g_tests, g_pass, g_fail);
