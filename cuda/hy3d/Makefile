@@ -18,7 +18,7 @@ HDRS = cuda_hy3d_runner.h cuda_hy3d_kernels.h cuda_hy3d_ops.h \
 
 all: test_cuda_hy3d
 
-verify: verify_dinov2 verify_vae
+verify: verify_dinov2 verify_vae verify_dit
 
 test_cuda_hy3d: test_cuda_hy3d.c $(RUNNER_SRC) $(CUEW_SRC) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ test_cuda_hy3d.c $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
@@ -29,8 +29,11 @@ verify_dinov2: verify_dinov2.c $(RUNNER_SRC) $(CUEW_SRC) $(HDRS)
 verify_vae: verify_vae.c $(RUNNER_SRC) $(CUEW_SRC) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ verify_vae.c $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
 
+verify_dit: verify_dit.c $(RUNNER_SRC) $(CUEW_SRC) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ verify_dit.c $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+
 clean:
-	rm -f test_cuda_hy3d verify_dinov2 verify_vae
+	rm -f test_cuda_hy3d verify_dinov2 verify_vae verify_dit
 
 help:
 	@echo "CUDA Hunyuan3D-2.1 Runner (NVRTC-based, no nvcc needed)"
