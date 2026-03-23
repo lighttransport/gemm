@@ -364,6 +364,76 @@ static CUdeviceptr gpu_alloc(size_t bytes) {
     return d;
 }
 
+/* Upload GEMM weight: F16 or F32 based on runner mode */
+static CUdeviceptr st_upload_gemm_w(st_context *st, const char *name,
+                                     int use_f32, int verbose) {
+    return use_f32 ? st_upload_f32(st, name, verbose)
+                   : st_upload_f16(st, name, verbose);
+}
+
+/* Fuse 3 weight tensors for GEMM: F16 or F32 based on runner mode */
+static CUdeviceptr st_fuse_3_gemm_w(st_context *st,
+                                      const char *a, const char *b, const char *c,
+                                      int use_f32, int verbose) {
+    if (use_f32) {
+        /* Concatenate as F32 */
+        int ia = safetensors_find(st, a);
+        int ib = safetensors_find(st, b);
+        int ic = safetensors_find(st, c);
+        if (ia < 0 || ib < 0 || ic < 0) return 0;
+        /* Get each as F32 on CPU */
+        CUdeviceptr da = st_upload_f32(st, a, 0);
+        CUdeviceptr db = st_upload_f32(st, b, 0);
+        CUdeviceptr dc = st_upload_f32(st, c, 0);
+        size_t na = safetensors_nbytes(st, ia);
+        const char *dt = safetensors_dtype(st, ia);
+        size_t n_elems = (strcmp(dt, "F16") == 0) ? na / 2 : na / 4;
+        size_t bytes_each = n_elems * sizeof(float);
+        /* Allocate combined GPU buffer and copy */
+        CUdeviceptr d = gpu_alloc(bytes_each * 3);
+        cuMemcpyDtoDAsync(d, da, bytes_each, 0);
+        cuMemcpyDtoDAsync(d + bytes_each, db, bytes_each, 0);
+        cuMemcpyDtoDAsync(d + 2 * bytes_each, dc, bytes_each, 0);
+        cuMemFree(da); cuMemFree(db); cuMemFree(dc);
+        return d;
+    }
+    return st_fuse_3_f16(st, a, b, c, verbose);
+}
+
+/* Fuse 2 weight tensors for GEMM: F16 or F32 */
+static CUdeviceptr st_fuse_2_gemm_w(st_context *st,
+                                      const char *a, const char *b,
+                                      int use_f32, int verbose) {
+    if (use_f32) {
+        int ia = safetensors_find(st, a);
+        int ib = safetensors_find(st, b);
+        if (ia < 0 || ib < 0) return 0;
+        CUdeviceptr da = st_upload_f32(st, a, 0);
+        CUdeviceptr db = st_upload_f32(st, b, 0);
+        size_t na = safetensors_nbytes(st, ia);
+        const char *dt = safetensors_dtype(st, ia);
+        size_t n_elems = (strcmp(dt, "F16") == 0) ? na / 2 : na / 4;
+        size_t bytes_each = n_elems * sizeof(float);
+        CUdeviceptr d = gpu_alloc(bytes_each * 2);
+        cuMemcpyDtoDAsync(d, da, bytes_each, 0);
+        cuMemcpyDtoDAsync(d + bytes_each, db, bytes_each, 0);
+        cuMemFree(da); cuMemFree(db);
+        return d;
+    }
+    /* F16 variant: concatenate raw F16 data */
+    int ia = safetensors_find(st, a);
+    int ib = safetensors_find(st, b);
+    if (ia < 0 || ib < 0) return 0;
+    size_t na = safetensors_nbytes(st, ia);
+    size_t nb = safetensors_nbytes(st, ib);
+    uint8_t *buf = (uint8_t *)malloc(na + nb);
+    memcpy(buf, safetensors_data(st, ia), na);
+    memcpy(buf + na, safetensors_data(st, ib), nb);
+    CUdeviceptr d = cu_upload_raw(buf, na + nb);
+    free(buf);
+    return d;
+}
+
 /* ======================================================================== */
 /* Scratch buffer management                                                */
 /* ======================================================================== */
@@ -406,31 +476,32 @@ static int load_dino_weights(cuda_hy3d_runner *r, const char *path) {
         #define DINO_F32(field, suffix) \
             snprintf(name, sizeof(name), "main_image_encoder.model.encoder.layer.%d.%s", i, suffix); \
             l->field = st_upload_f32(st, name, r->verbose);
-        /* F16 uploads: GEMM weights and biases consumed by gemm_f16_f32 */
-        #define DINO_F16(field, suffix) \
+        /* GEMM weight uploads: F16 or F32 depending on mode */
+        int f32g = r->ops.use_f32_gemm;
+        #define DINO_GW(field, suffix) \
             snprintf(name, sizeof(name), "main_image_encoder.model.encoder.layer.%d.%s", i, suffix); \
-            l->field = st_upload_f16(st, name, r->verbose);
+            l->field = st_upload_gemm_w(st, name, f32g, r->verbose);
 
         DINO_F32(ln1_w, "norm1.weight");
         DINO_F32(ln1_b, "norm1.bias");
-        DINO_F16(q_w,   "attention.attention.query.weight");
+        DINO_GW(q_w,   "attention.attention.query.weight");
         DINO_F32(q_b,   "attention.attention.query.bias");
-        DINO_F16(k_w,   "attention.attention.key.weight");
+        DINO_GW(k_w,   "attention.attention.key.weight");
         DINO_F32(k_b,   "attention.attention.key.bias");
-        DINO_F16(v_w,   "attention.attention.value.weight");
+        DINO_GW(v_w,   "attention.attention.value.weight");
         DINO_F32(v_b,   "attention.attention.value.bias");
-        DINO_F16(out_w, "attention.output.dense.weight");
+        DINO_GW(out_w, "attention.output.dense.weight");
         DINO_F32(out_b, "attention.output.dense.bias");
         DINO_F32(ls1,   "layer_scale1.lambda1");
         DINO_F32(ln2_w, "norm2.weight");
         DINO_F32(ln2_b, "norm2.bias");
-        DINO_F16(fc1_w, "mlp.fc1.weight");
+        DINO_GW(fc1_w, "mlp.fc1.weight");
         DINO_F32(fc1_b, "mlp.fc1.bias");
-        DINO_F16(fc2_w, "mlp.fc2.weight");
+        DINO_GW(fc2_w, "mlp.fc2.weight");
         DINO_F32(fc2_b, "mlp.fc2.bias");
         DINO_F32(ls2,   "layer_scale2.lambda1");
         #undef DINO_F32
-        #undef DINO_F16
+        #undef DINO_GW
     }
 
     /* Final LN (F32 — consumed by layernorm_f32) */
@@ -456,25 +527,25 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
     if (r->verbose) fprintf(stderr, "HY3D: loading DiT from %s (%d tensors)\n",
                              path, st->n_tensors);
 
-    /* x_embedder (GEMM bias → F32) */
-    r->dit_x_emb_w = st_upload_f16(st, "x_embedder.weight", r->verbose);
+    int f32g = r->ops.use_f32_gemm;
+
+    /* x_embedder */
+    r->dit_x_emb_w = st_upload_gemm_w(st, "x_embedder.weight", f32g, r->verbose);
     r->dit_x_emb_b = st_upload_f32(st, "x_embedder.bias", r->verbose);
 
-    /* t_embedder (GEMM bias → F32) */
-    r->dit_t_mlp0_w = st_upload_f16(st, "t_embedder.mlp.0.weight", r->verbose);
+    /* t_embedder */
+    r->dit_t_mlp0_w = st_upload_gemm_w(st, "t_embedder.mlp.0.weight", f32g, r->verbose);
     r->dit_t_mlp0_b = st_upload_f32(st, "t_embedder.mlp.0.bias", r->verbose);
-    r->dit_t_mlp2_w = st_upload_f16(st, "t_embedder.mlp.2.weight", r->verbose);
+    r->dit_t_mlp2_w = st_upload_gemm_w(st, "t_embedder.mlp.2.weight", f32g, r->verbose);
     r->dit_t_mlp2_b = st_upload_f32(st, "t_embedder.mlp.2.bias", r->verbose);
 
-    /* Blocks
-     * F16: GEMM weights (gemm_f16_f32 expects half_raw)
-     * F32: LayerNorm weights/biases, RMSNorm weights (rms_norm_f32 expects float) */
+    /* Blocks: GEMM weights F16 or F32 (switchable), LN/RMSNorm always F32 */
     for (int i = 0; i < DIT_DEPTH; i++) {
         char name[256];
         dit_block_gpu *b = &r->dit_blocks[i];
-        #define DIT_F16(field, suffix) \
+        #define DIT_GW(field, suffix) \
             snprintf(name, sizeof(name), "blocks.%d.%s", i, suffix); \
-            b->field = st_upload_f16(st, name, r->verbose);
+            b->field = st_upload_gemm_w(st, name, f32g, r->verbose);
         #define DIT_F32(field, suffix) \
             snprintf(name, sizeof(name), "blocks.%d.%s", i, suffix); \
             b->field = st_upload_f32(st, name, r->verbose);
@@ -488,9 +559,9 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
             snprintf(nq, sizeof(nq), "blocks.%d.attn1.to_q.weight", i);
             snprintf(nk, sizeof(nk), "blocks.%d.attn1.to_k.weight", i);
             snprintf(nv, sizeof(nv), "blocks.%d.attn1.to_v.weight", i);
-            b->sa_qkv_w = st_fuse_3_f16(st, nq, nk, nv, r->verbose);
+            b->sa_qkv_w = st_fuse_3_gemm_w(st, nq, nk, nv, f32g, r->verbose);
         }
-        DIT_F16(sa_out_w,    "attn1.out_proj.weight");
+        DIT_GW(sa_out_w,    "attn1.out_proj.weight");
         DIT_F32(sa_out_b,    "attn1.out_proj.bias");
         /* RMSNorm weights → F32 */
         DIT_F32(sa_q_norm_w, "attn1.q_norm.weight");
@@ -498,26 +569,15 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
 
         DIT_F32(norm2_w,     "norm2.weight");
         DIT_F32(norm2_b,     "norm2.bias");
-        DIT_F16(ca_q_w,      "attn2.to_q.weight");
+        DIT_GW(ca_q_w,      "attn2.to_q.weight");
         /* Fuse K/V weights for correct head interleaving */
         {
             char nk[256], nv[256];
             snprintf(nk, sizeof(nk), "blocks.%d.attn2.to_k.weight", i);
             snprintf(nv, sizeof(nv), "blocks.%d.attn2.to_v.weight", i);
-            /* to_k: [2048, 1024], to_v: [2048, 1024] → fused: [4096, 1024] */
-            int ik = safetensors_find(st, nk);
-            int iv = safetensors_find(st, nv);
-            if (ik >= 0 && iv >= 0) {
-                size_t nk_bytes = safetensors_nbytes(st, ik);
-                size_t nv_bytes = safetensors_nbytes(st, iv);
-                uint8_t *buf = (uint8_t *)malloc(nk_bytes + nv_bytes);
-                memcpy(buf, safetensors_data(st, ik), nk_bytes);
-                memcpy(buf + nk_bytes, safetensors_data(st, iv), nv_bytes);
-                b->ca_kv_w = cu_upload_raw(buf, nk_bytes + nv_bytes);
-                free(buf);
-            }
+            b->ca_kv_w = st_fuse_2_gemm_w(st, nk, nv, f32g, r->verbose);
         }
-        DIT_F16(ca_out_w,    "attn2.out_proj.weight");
+        DIT_GW(ca_out_w,    "attn2.out_proj.weight");
         DIT_F32(ca_out_b,    "attn2.out_proj.bias");
         DIT_F32(ca_q_norm_w, "attn2.q_norm.weight");
         DIT_F32(ca_k_norm_w, "attn2.k_norm.weight");
@@ -528,7 +588,7 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
         /* Skip connection (blocks 11-20) */
         b->use_skip = (i > DIT_HALF_DEPTH) ? 1 : 0;
         if (b->use_skip) {
-            DIT_F16(skip_linear_w, "skip_linear.weight");
+            DIT_GW(skip_linear_w, "skip_linear.weight");
             DIT_F32(skip_linear_b, "skip_linear.bias");
             DIT_F32(skip_norm_w,   "skip_norm.weight");
             DIT_F32(skip_norm_b,   "skip_norm.bias");
@@ -537,35 +597,35 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
         /* MoE vs regular MLP */
         b->use_moe = (i >= DIT_MOE_START) ? 1 : 0;
         if (b->use_moe) {
-            DIT_F16(moe_gate_w, "moe.gate.weight");
+            DIT_GW(moe_gate_w, "moe.gate.weight");
             for (int e = 0; e < DIT_N_EXPERTS; e++) {
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.0.proj.weight", i, e);
-                b->moe_expert_fc1_w[e] = st_upload_f16(st, name, r->verbose);
+                b->moe_expert_fc1_w[e] = st_upload_gemm_w(st, name, f32g, r->verbose);
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.0.proj.bias", i, e);
                 b->moe_expert_fc1_b[e] = st_upload_f32(st, name, r->verbose);
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.2.weight", i, e);
-                b->moe_expert_fc2_w[e] = st_upload_f16(st, name, r->verbose);
+                b->moe_expert_fc2_w[e] = st_upload_gemm_w(st, name, f32g, r->verbose);
                 snprintf(name, sizeof(name), "blocks.%d.moe.experts.%d.net.2.bias", i, e);
                 b->moe_expert_fc2_b[e] = st_upload_f32(st, name, r->verbose);
             }
-            DIT_F16(moe_shared_fc1_w, "moe.shared_experts.net.0.proj.weight");
+            DIT_GW(moe_shared_fc1_w, "moe.shared_experts.net.0.proj.weight");
             DIT_F32(moe_shared_fc1_b, "moe.shared_experts.net.0.proj.bias");
-            DIT_F16(moe_shared_fc2_w, "moe.shared_experts.net.2.weight");
+            DIT_GW(moe_shared_fc2_w, "moe.shared_experts.net.2.weight");
             DIT_F32(moe_shared_fc2_b, "moe.shared_experts.net.2.bias");
         } else {
-            DIT_F16(mlp_fc1_w,   "mlp.fc1.weight");
+            DIT_GW(mlp_fc1_w,   "mlp.fc1.weight");
             DIT_F32(mlp_fc1_b,   "mlp.fc1.bias");
-            DIT_F16(mlp_fc2_w,   "mlp.fc2.weight");
+            DIT_GW(mlp_fc2_w,   "mlp.fc2.weight");
             DIT_F32(mlp_fc2_b,   "mlp.fc2.bias");
         }
-        #undef DIT_F16
+        #undef DIT_GW
         #undef DIT_F32
     }
 
     /* Final layer: LN → F32, linear → F16 */
     r->dit_final_ln_w = st_upload_f32(st, "final_layer.norm_final.weight", r->verbose);
     r->dit_final_ln_b = st_upload_f32(st, "final_layer.norm_final.bias", r->verbose);
-    r->dit_final_linear_w = st_upload_f16(st, "final_layer.linear.weight", r->verbose);
+    r->dit_final_linear_w = st_upload_gemm_w(st, "final_layer.linear.weight", f32g, r->verbose);
     r->dit_final_linear_b = st_upload_f32(st, "final_layer.linear.bias", r->verbose);
 
     safetensors_close(st);
@@ -585,17 +645,18 @@ static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
                              path, st->n_tensors);
 
     /* Post-KL projection (GEMM: weight F16, bias F32) */
-    r->vae_post_kl_w = st_upload_f16(st, "post_kl.weight", r->verbose);
+    r->vae_post_kl_w = st_upload_gemm_w(st, "post_kl.weight", r->ops.use_f32_gemm, r->verbose);
     r->vae_post_kl_b = st_upload_f32(st, "post_kl.bias", r->verbose);
 
     /* Fix 6: Transformer decoder blocks use transformer.resblocks.N prefix
-     * GEMM weights → F16, biases → F32; LN/QKnorm weights → F32 */
+     * GEMM weights → F16/F32 (switchable), biases/LN/QKnorm → F32 */
+    int f32g = r->ops.use_f32_gemm;
     for (int i = 0; i < VAE_DEC_LAYERS; i++) {
         char name[256];
         vae_block_gpu *b = &r->vae_blocks[i];
         #define VAE_F16(field, suffix) \
             snprintf(name, sizeof(name), "transformer.resblocks.%d.%s", i, suffix); \
-            b->field = st_upload_f16(st, name, r->verbose);
+            b->field = st_upload_gemm_w(st, name, f32g, r->verbose);
         #define VAE_F32(field, suffix) \
             snprintf(name, sizeof(name), "transformer.resblocks.%d.%s", i, suffix); \
             b->field = st_upload_f32(st, name, r->verbose);
@@ -624,7 +685,7 @@ static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
     /* Fix 7: Geometry decoder
      * GEMM weights → F16, biases → F32; LN/QKnorm → F32 */
     vae_geo_decoder_gpu *g = &r->vae_geo;
-    #define GEO_F16(field, suffix) g->field = st_upload_f16(st, suffix, r->verbose);
+    #define GEO_F16(field, suffix) g->field = st_upload_gemm_w(st, suffix, f32g, r->verbose);
     #define GEO_F32(field, suffix) g->field = st_upload_f32(st, suffix, r->verbose);
 
     GEO_F16(query_proj_w, "geo_decoder.query_proj.weight");
@@ -1594,6 +1655,14 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
     }
 
     return r;
+}
+
+void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable) {
+    if (!r) return;
+    r->ops.use_f32_gemm = enable;
+    if (r->verbose)
+        fprintf(stderr, "HY3D: GEMM mode set to %s\n",
+                enable ? "F32 (PyTorch-compatible)" : "F16 (default)");
 }
 
 int cuda_hy3d_load_weights(cuda_hy3d_runner *r,

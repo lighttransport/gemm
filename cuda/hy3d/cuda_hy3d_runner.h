@@ -63,6 +63,11 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
                             int n_steps, float guidance_scale,
                             int grid_res, uint32_t seed);
 
+/* Set GEMM precision mode. Call BEFORE cuda_hy3d_load_weights().
+ *   0 = F16 weights, F32 compute (default, memory efficient)
+ *   1 = F32 weights, F32 compute (matches PyTorch reference exactly) */
+void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable);
+
 /* Free runner and all GPU resources */
 void cuda_hy3d_free(cuda_hy3d_runner *r);
 

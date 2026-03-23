@@ -228,10 +228,12 @@ int main(int argc, char **argv) {
     const char *model_path = argv[1];
     const char *ref_dir = "/mnt/nvme02/work/gemm/ref/hy3d/output";
     const char *out_dir = "cuda_output";
+    int use_f32 = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--ref-dir") == 0 && i+1 < argc) ref_dir = argv[++i];
         else if (strcmp(argv[i], "--out-dir") == 0 && i+1 < argc) out_dir = argv[++i];
+        else if (strcmp(argv[i], "--f32") == 0) use_f32 = 1;
     }
 
     { char cmd[512]; snprintf(cmd, sizeof(cmd), "mkdir -p %s", out_dir); (void)!system(cmd); }
@@ -239,6 +241,10 @@ int main(int argc, char **argv) {
     /* Init CUDA */
     fprintf(stderr, "Initializing CUDA...\n");
     cuda_hy3d_runner *r = cuda_hy3d_init(0, 1);
+    if (use_f32) {
+        cuda_hy3d_set_f32_gemm(r, 1);
+        fprintf(stderr, "Using F32 GEMM for exact PyTorch match\n");
+    }
     if (!r) return 1;
 
     int n_pass = 0, n_fail = 0, n_skip = 0;
