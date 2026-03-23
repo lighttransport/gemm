@@ -188,12 +188,9 @@ static int test_dit_forward(cuda_hy3d_runner *r, const char *model_path,
     }
     fprintf(stderr, "  Ref:  min=%.6f max=%.6f mean=%.6f\n", rmn, rmx, rsm / out_n);
 
-    /* Compare — expect larger error due to:
-     * - F16 weights over 21 blocks (error accumulates)
-     * - MoE top-2 gating (small precision differences in softmax change expert selection)
-     * - Reference runs F32 on CPU, CUDA uses F16 weights
-     * Tolerance: max absolute 5.0, mean 1.0 */
-    int ok = compare_f32("dit_output", ref_output, cuda_output, out_n, 5.0f, 0.5f);
+    /* Compare — F16 weights over 21 blocks + MoE gating precision.
+     * Tolerance: max absolute 2.0, relative 0.5 */
+    int ok = compare_f32("dit_output", ref_output, cuda_output, out_n, 2.0f, 0.5f);
 
     snprintf(path, sizeof(path), "%s/dit_output.npy", out_dir);
     FILE *fp = fopen(path, "wb");
@@ -241,7 +238,7 @@ int main(int argc, char **argv) {
 
     /* Init CUDA */
     fprintf(stderr, "Initializing CUDA...\n");
-    cuda_hy3d_runner *r = cuda_hy3d_init(0, 2);
+    cuda_hy3d_runner *r = cuda_hy3d_init(0, 1);
     if (!r) return 1;
 
     int n_pass = 0, n_fail = 0, n_skip = 0;
