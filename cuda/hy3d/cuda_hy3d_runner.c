@@ -97,14 +97,15 @@ typedef struct {
 
 /* DiT per-block weights (on GPU, F16) */
 typedef struct {
-    /* Self-attention */
+    /* Self-attention — fused QKV weight [3*dim, dim] for correct head interleaving */
     CUdeviceptr norm1_w, norm1_b;
-    CUdeviceptr sa_q_w, sa_k_w, sa_v_w;
+    CUdeviceptr sa_qkv_w;              /* [3*2048, 2048] = concat(to_q.w, to_k.w, to_v.w) */
     CUdeviceptr sa_out_w, sa_out_b;
     CUdeviceptr sa_q_norm_w, sa_k_norm_w;  /* RMSNorm weight only */
-    /* Cross-attention */
+    /* Cross-attention — separate Q (from hidden) and K,V (from context, different dim) */
     CUdeviceptr norm2_w, norm2_b;
-    CUdeviceptr ca_q_w, ca_k_w, ca_v_w;
+    CUdeviceptr ca_q_w;                /* [2048, 2048] */
+    CUdeviceptr ca_k_w, ca_v_w;       /* [2048, 1024] each (context_dim→hidden) */
     CUdeviceptr ca_out_w, ca_out_b;
     CUdeviceptr ca_q_norm_w, ca_k_norm_w;
     /* Norm3 + MLP/MoE */
@@ -303,6 +304,56 @@ static CUdeviceptr st_upload_f32(st_context *st, const char *name, int verbose) 
     return 0;
 }
 
+/* Fuse 3 F16 weight tensors [dim, in_dim] into one [3*dim, in_dim] on GPU */
+static CUdeviceptr st_fuse_3_f16(st_context *st,
+                                   const char *name_a, const char *name_b, const char *name_c,
+                                   int verbose) {
+    int ia = safetensors_find(st, name_a);
+    int ib = safetensors_find(st, name_b);
+    int ic = safetensors_find(st, name_c);
+    if (ia < 0 || ib < 0 || ic < 0) {
+        if (verbose) fprintf(stderr, "  [WARN] fuse: missing tensor(s)\n");
+        return 0;
+    }
+    size_t na = safetensors_nbytes(st, ia);
+    size_t nb = safetensors_nbytes(st, ib);
+    size_t nc = safetensors_nbytes(st, ic);
+    const char *da = safetensors_dtype(st, ia);
+
+    /* All must be same dtype and size */
+    if (na != nb || nb != nc) {
+        if (verbose) fprintf(stderr, "  [WARN] fuse: size mismatch\n");
+        return 0;
+    }
+
+    /* Convert to F16 if needed, then concatenate */
+    size_t total = na + nb + nc;
+    if (strcmp(da, "F16") == 0) {
+        uint8_t *buf = (uint8_t *)malloc(total);
+        memcpy(buf, safetensors_data(st, ia), na);
+        memcpy(buf + na, safetensors_data(st, ib), nb);
+        memcpy(buf + na + nb, safetensors_data(st, ic), nc);
+        CUdeviceptr d = cu_upload_raw(buf, total);
+        free(buf);
+        return d;
+    } else if (strcmp(da, "F32") == 0) {
+        /* Convert each F32 tensor to F16, then concatenate */
+        size_t n_each = na / sizeof(float);
+        size_t n_total = n_each * 3;
+        uint16_t *f16 = (uint16_t *)malloc(n_total * sizeof(uint16_t));
+        const float *fa = (const float *)safetensors_data(st, ia);
+        const float *fb = (const float *)safetensors_data(st, ib);
+        const float *fc = (const float *)safetensors_data(st, ic);
+        for (size_t i = 0; i < n_each; i++) f16[i] = cu_f32_to_f16(fa[i]);
+        for (size_t i = 0; i < n_each; i++) f16[n_each + i] = cu_f32_to_f16(fb[i]);
+        for (size_t i = 0; i < n_each; i++) f16[2 * n_each + i] = cu_f32_to_f16(fc[i]);
+        CUdeviceptr d = cu_upload_raw(f16, n_total * sizeof(uint16_t));
+        free(f16);
+        return d;
+    }
+    return 0;
+}
+
 /* Allocate GPU buffer */
 static CUdeviceptr gpu_alloc(size_t bytes) {
     CUdeviceptr d = 0;
@@ -431,10 +482,14 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
         /* LayerNorm → F32 */
         DIT_F32(norm1_w,     "norm1.weight");
         DIT_F32(norm1_b,     "norm1.bias");
-        /* Self-attn GEMM weights → F16 */
-        DIT_F16(sa_q_w,      "attn1.to_q.weight");
-        DIT_F16(sa_k_w,      "attn1.to_k.weight");
-        DIT_F16(sa_v_w,      "attn1.to_v.weight");
+        /* Self-attn: fuse Q/K/V weights into [3*dim, dim] for correct head interleaving */
+        {
+            char nq[256], nk[256], nv[256];
+            snprintf(nq, sizeof(nq), "blocks.%d.attn1.to_q.weight", i);
+            snprintf(nk, sizeof(nk), "blocks.%d.attn1.to_k.weight", i);
+            snprintf(nv, sizeof(nv), "blocks.%d.attn1.to_v.weight", i);
+            b->sa_qkv_w = st_fuse_3_f16(st, nq, nk, nv, r->verbose);
+        }
         DIT_F16(sa_out_w,    "attn1.out_proj.weight");
         DIT_F32(sa_out_b,    "attn1.out_proj.bias");
         /* RMSNorm weights → F32 */
@@ -923,8 +978,12 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
      */
     size_t qkv_sz = (size_t)3 * N1 * H_dim * sizeof(float);
     size_t shared1_sz = qkv_sz > mlp_moe_sz ? qkv_sz : mlp_moe_sz;
-    size_t buf3_sz = (size_t)N1 * H_dim * sizeof(float) + cat_buf_sz + 2 * ca_kv_sz
-                   + (size_t)(H_dim + ffn) * sizeof(float);
+    /* buf3 layout: d_temb[H_dim] + d_tmlp[ffn] + d_cross_Q[N1*H_dim] + cat_buf[N1*2*H_dim]
+     *              + ca_K[ctx*H_dim] + ca_V[ctx*H_dim] + split_V[N1*H_dim] */
+    size_t buf3_sz = (size_t)(H_dim + ffn) * sizeof(float)
+                   + (size_t)N1 * H_dim * sizeof(float)
+                   + cat_buf_sz + 2 * ca_kv_sz
+                   + (size_t)N1 * H_dim * sizeof(float); /* space for split V output */
     ensure_scratch(r, 0, (size_t)N1 * H_dim * sizeof(float));
     ensure_scratch(r, 1, shared1_sz);
     ensure_scratch(r, 2, (size_t)2 * N1 * H_dim * sizeof(float));
@@ -1048,50 +1107,71 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         /* === Self-attention ===
          * PyTorch Attention does: cat(to_q(x), to_k(x), to_v(x), dim=-1)
          *   → view(1, -1, H, 3*HD) → split(HD, dim=-1) → q_norm/k_norm → sdpa
-         * The view+split interleaves Q/K/V per head. Head h's Q/K/V come from
-         * positions [h*3*HD : (h+1)*3*HD] in the concatenated [Q,K,V] vector.
-         * We replicate by:
-         *   1. GEMM: Q_raw, K_raw, V_raw each [N1, W]  (into d_mlp scratch)
-         *   2. Per-token interleave into d_qkv: [N1, 3*W] where
-         *      row n = [Q_raw[n,:], K_raw[n,:], V_raw[n,:]]
-         *   3. split_qkv_interleaved → Q, K, V each [N1, W] with PyTorch head layout
-         */
+         * The view+split interleaves Q/K/V per head. We replicate by using a
+         * fused QKV weight [3*dim, dim] = concat(to_q.w, to_k.w, to_v.w) and
+         * computing a single GEMM → [N1, 3*dim], then split_qkv_interleaved. */
         op_layernorm(ops, stream, d_normed, d_hidden, blk->norm1_w, blk->norm1_b, N1, H_dim);
 
-        /* Step 1: compute Q/K/V into d_mlp scratch (has room for 3*N1*H_dim) */
-        CUdeviceptr d_Q_raw = d_mlp;
-        CUdeviceptr d_K_raw = d_mlp + (size_t)N1 * H_dim * sizeof(float);
-        CUdeviceptr d_V_raw = d_mlp + (size_t)2 * N1 * H_dim * sizeof(float);
+        /* Fused QKV GEMM: [N1, dim] @ [3*dim, dim]^T → [N1, 3*dim] */
+        op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, 0, 3 * H_dim, H_dim, N1);
 
-        op_gemm(ops, stream, d_Q_raw, blk->sa_q_w, d_normed, 0, H_dim, H_dim, N1);
-        op_gemm(ops, stream, d_K_raw, blk->sa_k_w, d_normed, 0, H_dim, H_dim, N1);
-        op_gemm(ops, stream, d_V_raw, blk->sa_v_w, d_normed, 0, H_dim, H_dim, N1);
-
-        /* Step 2: per-token interleave [Q_raw, K_raw, V_raw] → d_qkv [N1, 3*W]
-         * Each token n: d_qkv[n*3W..n*3W+W-1] = Q_raw[n], [n*3W+W..+2W-1] = K_raw[n], etc.
-         * Use cuMemcpy2D or simple per-row copies. For now, loop on CPU: */
-        for (int tok = 0; tok < N1; tok++) {
-            size_t src_off = (size_t)tok * H_dim * sizeof(float);
-            size_t dst_off = (size_t)tok * 3 * H_dim * sizeof(float);
-            cuMemcpyDtoDAsync(d_qkv + dst_off, d_Q_raw + src_off,
-                              (size_t)H_dim * sizeof(float), stream);
-            cuMemcpyDtoDAsync(d_qkv + dst_off + (size_t)H_dim * sizeof(float),
-                              d_K_raw + src_off, (size_t)H_dim * sizeof(float), stream);
-            cuMemcpyDtoDAsync(d_qkv + dst_off + (size_t)2 * H_dim * sizeof(float),
-                              d_V_raw + src_off, (size_t)H_dim * sizeof(float), stream);
-        }
-
-        /* Step 3: split interleaved QKV → de-interleaved per-head Q, K, V */
-        CUdeviceptr d_Q = d_Q_raw;  /* reuse d_mlp for output Q */
-        CUdeviceptr d_K = d_K_raw;
-        CUdeviceptr d_V = d_V_raw;
+        /* Split interleaved QKV → per-head Q, K, V each [N1, dim]
+         * IMPORTANT: d_qkv and d_mlp alias scratch[1], so split output must NOT
+         * overlap with d_qkv input. Use:
+         *   Q → scratch[2] (d_attn, free at this point)
+         *   K → scratch[4] (d_normed, free at this point)
+         *   V → end of scratch[3] (d_temb buffer has 123MB, V needs 33.5MB at offset ~90MB) */
+        CUdeviceptr d_Q = d_attn;    /* scratch[2] */
+        CUdeviceptr d_K = d_normed;  /* scratch[4] */
+        CUdeviceptr d_V = d_ca_V + ca_kv_sz; /* after ca_V in scratch[3], ~100MB offset */
         op_split_qkv(ops, stream, d_Q, d_K, d_V, d_qkv, N1, heads, hd);
+
+        /* Debug: compare Q/K/V after interleave */
+        if (r->verbose > 1 && bi == 0) {
+            cuStreamSynchronize(stream);
+            float qv[8], kv[8], vv2[4];
+            cuMemcpyDtoH(qv, d_Q, 8 * sizeof(float));
+            cuMemcpyDtoH(kv, d_K, 8 * sizeof(float));
+            cuMemcpyDtoH(vv2, d_V, 4 * sizeof(float));
+            fprintf(stderr, "    b0 Q_interleaved[0,0:8]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    qv[0],qv[1],qv[2],qv[3],qv[4],qv[5],qv[6],qv[7]);
+            fprintf(stderr, "    b0 K_interleaved[0,0:8]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    kv[0],kv[1],kv[2],kv[3],kv[4],kv[5],kv[6],kv[7]);
+            fprintf(stderr, "    b0 V_interleaved[0,0:4]: %.6f %.6f %.6f %.6f\n",
+                    vv2[0],vv2[1],vv2[2],vv2[3]);
+            /* Check raw QKV at position 256 (should be Q_raw head 2) */
+            float raw[4];
+            cuMemcpyDtoH(raw, d_qkv + 256*sizeof(float), 4*sizeof(float));
+            fprintf(stderr, "    b0 QKV_raw[256:260]: %.6f %.6f %.6f %.6f\n",
+                    raw[0],raw[1],raw[2],raw[3]);
+            /* Check where V actually reads from */
+            cuMemcpyDtoH(raw, d_qkv + 0*3*H_dim*sizeof(float) + 0*3*hd*sizeof(float) + 2*hd*sizeof(float), 4*sizeof(float));
+            fprintf(stderr, "    b0 QKV[tok0,h0,2HD:2HD+4]: %.6f %.6f %.6f %.6f\n",
+                    raw[0],raw[1],raw[2],raw[3]);
+        }
 
         /* QK RMSNorm */
         if (blk->sa_q_norm_w)
             op_rms_norm(ops, stream, d_Q, blk->sa_q_norm_w, N1, heads, hd, H_dim);
         if (blk->sa_k_norm_w)
             op_rms_norm(ops, stream, d_K, blk->sa_k_norm_w, N1, heads, hd, H_dim);
+
+        if (r->verbose > 1 && bi == 0) {
+            cuStreamSynchronize(stream);
+            float qn[4], kn[4], vv[4];
+            cuMemcpyDtoH(qn, d_Q, 4 * sizeof(float));
+            cuMemcpyDtoH(kn, d_K, 4 * sizeof(float));
+            cuMemcpyDtoH(vv, d_V, 4 * sizeof(float));
+            fprintf(stderr, "    b0 Q_normed[0,0:4]: %.6f %.6f %.6f %.6f\n", qn[0],qn[1],qn[2],qn[3]);
+            fprintf(stderr, "    b0 K_normed[0,0:4]: %.6f %.6f %.6f %.6f\n", kn[0],kn[1],kn[2],kn[3]);
+            fprintf(stderr, "    b0 V[0,0:4]:        %.6f %.6f %.6f %.6f\n", vv[0],vv[1],vv[2],vv[3]);
+            /* V stats */
+            float *vc = (float*)malloc((size_t)N1*H_dim*4);
+            cuMemcpyDtoH(vc, d_V, (size_t)N1*H_dim*4);
+            float vs=0; for(int j=0;j<N1*H_dim;j++) vs+=vc[j]*vc[j];
+            fprintf(stderr, "    b0 V rms: %.6f\n", sqrtf(vs/(N1*H_dim)));
+            free(vc);
+        }
 
         op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N1, H_dim, heads, hd);
 
