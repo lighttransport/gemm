@@ -87,14 +87,16 @@ int main(int argc, char **argv) {
     const char *ref_dir = "ref/output";
     const char *out_dir = "cuda_output";
     int grid_res = 8;
+    int use_f32 = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--ref-dir") == 0 && i+1 < argc) ref_dir = argv[++i];
         else if (strcmp(argv[i], "--out-dir") == 0 && i+1 < argc) out_dir = argv[++i];
         else if (strcmp(argv[i], "--grid-res") == 0 && i+1 < argc) grid_res = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--f32") == 0) use_f32 = 1;
     }
 
-    { char cmd[512]; snprintf(cmd, sizeof(cmd), "mkdir -p %s", out_dir); system(cmd); }
+    { char cmd[512]; snprintf(cmd, sizeof(cmd), "mkdir -p %s", out_dir); (void)!system(cmd); }
 
     /* Load reference latents */
     char path[512];
@@ -117,6 +119,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\nInitializing CUDA...\n");
     cuda_hy3d_runner *r = cuda_hy3d_init(0, 1);
     if (!r) { free(latents); free(ref_sdf); return 1; }
+    if (use_f32) cuda_hy3d_set_f32_gemm(r, 1);
 
     if (cuda_hy3d_load_weights(r, NULL, NULL, vae_path) != 0) {
         fprintf(stderr, "Failed to load VAE weights\n");
