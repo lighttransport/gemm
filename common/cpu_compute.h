@@ -423,6 +423,201 @@ static void *cpu_attn_worker(void *arg) {
 
 #endif /* AVX2+FMA */
 
+/* ---- Cross Attention: Q from tokens, KV from separate source ---- */
+/* Q: [n_q, dim], KV: [n_kv, 2*dim] (K and V interleaved per token) */
+
+#define CPU_XATTN_TILE 64
+
+typedef struct {
+    const float *Q;
+    const float *KV;
+    float *out;
+    int n_q, n_kv, dim, head_dim, n_heads;
+    int h_start, h_end;
+    float scale;
+} cpu_xattn_task;
+
+#if defined(__AVX2__) && defined(__FMA__)
+
+static void *cpu_xattn_worker(void *arg) {
+    cpu_xattn_task *t = (cpu_xattn_task *)arg;
+    int Nq = t->n_q, Nk = t->n_kv, hd = t->head_dim, dim = t->dim;
+    float scale = t->scale;
+
+    float *K_buf = (float *)malloc((size_t)Nk * (size_t)hd * sizeof(float));
+    float *V_buf = (float *)malloc((size_t)Nk * (size_t)hd * sizeof(float));
+    float scores[CPU_XATTN_TILE];
+
+    for (int h = t->h_start; h < t->h_end; h++) {
+        /* Transpose K and V from interleaved KV into contiguous per-head buffers */
+        for (int ki = 0; ki < Nk; ki++) {
+            const float *k_src = t->KV + ki * 2 * dim + h * hd;
+            const float *v_src = t->KV + ki * 2 * dim + dim + h * hd;
+            float *k_dst = K_buf + ki * hd;
+            float *v_dst = V_buf + ki * hd;
+            for (int d = 0; d < hd; d += 8) {
+                _mm256_storeu_ps(k_dst + d, _mm256_loadu_ps(k_src + d));
+                _mm256_storeu_ps(v_dst + d, _mm256_loadu_ps(v_src + d));
+            }
+        }
+
+        for (int qi = 0; qi < Nq; qi++) {
+            const float *q_h = t->Q + qi * dim + h * hd;
+
+            /* Load Q into registers */
+            __m256 qr[16]; /* up to head_dim=128 */
+            for (int d = 0; d < hd; d += 8)
+                qr[d/8] = _mm256_loadu_ps(q_h + d);
+
+            /* Accumulators for weighted V sum */
+            __m256 acc[16];
+            for (int d = 0; d < hd; d += 8)
+                acc[d/8] = _mm256_setzero_ps();
+            float running_max = -FLT_MAX;
+            float running_sum = 0.0f;
+
+            for (int ki_base = 0; ki_base < Nk; ki_base += CPU_XATTN_TILE) {
+                int tile_end = ki_base + CPU_XATTN_TILE;
+                if (tile_end > Nk) tile_end = Nk;
+                int tile_len = tile_end - ki_base;
+
+                float tile_max = -FLT_MAX;
+                for (int j = 0; j < tile_len; j++) {
+                    const float *k_j = K_buf + (ki_base + j) * hd;
+                    __m256 dot = _mm256_setzero_ps();
+                    for (int d = 0; d < hd; d += 8)
+                        dot = _mm256_fmadd_ps(qr[d/8], _mm256_loadu_ps(k_j + d), dot);
+                    float s = cpu_hsum_avx(dot) * scale;
+                    scores[j] = s;
+                    if (s > tile_max) tile_max = s;
+                }
+
+                float new_max = running_max > tile_max ? running_max : tile_max;
+                float correction = expf(running_max - new_max);
+                __m256 vc = _mm256_set1_ps(correction);
+                running_sum *= correction;
+                for (int d = 0; d < hd; d += 8)
+                    acc[d/8] = _mm256_mul_ps(acc[d/8], vc);
+
+                for (int j = 0; j < tile_len; j++) {
+                    float w = expf(scores[j] - new_max);
+                    running_sum += w;
+                    __m256 vw = _mm256_set1_ps(w);
+                    const float *v_j = V_buf + (ki_base + j) * hd;
+                    for (int d = 0; d < hd; d += 8)
+                        acc[d/8] = _mm256_fmadd_ps(vw, _mm256_loadu_ps(v_j + d), acc[d/8]);
+                }
+                running_max = new_max;
+            }
+
+            float inv_sum = 1.0f / running_sum;
+            __m256 vinv = _mm256_set1_ps(inv_sum);
+            float *out_h = t->out + qi * dim + h * hd;
+            for (int d = 0; d < hd; d += 8)
+                _mm256_storeu_ps(out_h + d, _mm256_mul_ps(acc[d/8], vinv));
+        }
+    }
+    free(K_buf);
+    free(V_buf);
+    return NULL;
+}
+
+#else /* Scalar fallback */
+
+static void *cpu_xattn_worker(void *arg) {
+    cpu_xattn_task *t = (cpu_xattn_task *)arg;
+    int Nq = t->n_q, Nk = t->n_kv, hd = t->head_dim, dim = t->dim;
+    float scale = t->scale;
+
+    float *K_buf = (float *)malloc((size_t)Nk * (size_t)hd * sizeof(float));
+    float *V_buf = (float *)malloc((size_t)Nk * (size_t)hd * sizeof(float));
+    float scores[CPU_XATTN_TILE];
+
+    for (int h = t->h_start; h < t->h_end; h++) {
+        for (int ki = 0; ki < Nk; ki++) {
+            memcpy(K_buf + ki * hd, t->KV + ki * 2 * dim + h * hd,
+                   (size_t)hd * sizeof(float));
+            memcpy(V_buf + ki * hd, t->KV + ki * 2 * dim + dim + h * hd,
+                   (size_t)hd * sizeof(float));
+        }
+
+        for (int qi = 0; qi < Nq; qi++) {
+            const float *q_h = t->Q + qi * dim + h * hd;
+            float *acc = (float *)calloc((size_t)hd, sizeof(float));
+            float running_max = -FLT_MAX;
+            float running_sum = 0.0f;
+
+            for (int ki_base = 0; ki_base < Nk; ki_base += CPU_XATTN_TILE) {
+                int tile_end = ki_base + CPU_XATTN_TILE;
+                if (tile_end > Nk) tile_end = Nk;
+                int tile_len = tile_end - ki_base;
+
+                float tile_max = -FLT_MAX;
+                for (int j = 0; j < tile_len; j++) {
+                    const float *k_j = K_buf + (ki_base + j) * hd;
+                    float dot = 0.0f;
+                    for (int d = 0; d < hd; d++) dot += q_h[d] * k_j[d];
+                    float s = dot * scale;
+                    scores[j] = s;
+                    if (s > tile_max) tile_max = s;
+                }
+
+                float new_max = running_max > tile_max ? running_max : tile_max;
+                float correction = expf(running_max - new_max);
+                running_sum *= correction;
+                for (int d = 0; d < hd; d++) acc[d] *= correction;
+
+                for (int j = 0; j < tile_len; j++) {
+                    float w = expf(scores[j] - new_max);
+                    running_sum += w;
+                    const float *v_j = V_buf + (ki_base + j) * hd;
+                    for (int d = 0; d < hd; d++) acc[d] += w * v_j[d];
+                }
+                running_max = new_max;
+            }
+
+            float inv_sum = 1.0f / running_sum;
+            float *out_h = t->out + qi * dim + h * hd;
+            for (int d = 0; d < hd; d++) out_h[d] = acc[d] * inv_sum;
+            free(acc);
+        }
+    }
+    free(K_buf);
+    free(V_buf);
+    return NULL;
+}
+
+#endif /* AVX2+FMA */
+
+static void cpu_cross_attention(float *out, const float *Q, const float *KV,
+                                 int n_q, int n_kv, int dim, int n_heads,
+                                 int head_dim, int n_threads) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    if (n_threads <= 1) {
+        cpu_xattn_task task = {Q, KV, out, n_q, n_kv, dim, head_dim, n_heads,
+                                0, n_heads, scale};
+        cpu_xattn_worker(&task);
+        return;
+    }
+
+    int nt = n_threads < n_heads ? n_threads : n_heads;
+    cpu_xattn_task *tasks = (cpu_xattn_task *)calloc((size_t)nt, sizeof(cpu_xattn_task));
+    pthread_t *threads = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+    int heads_per = n_heads / nt;
+    int extra = n_heads % nt;
+    int h = 0;
+    for (int i = 0; i < nt; i++) {
+        int count = heads_per + (i < extra ? 1 : 0);
+        tasks[i] = (cpu_xattn_task){Q, KV, out, n_q, n_kv, dim, head_dim, n_heads,
+                                     h, h + count, scale};
+        h += count;
+        pthread_create(&threads[i], NULL, cpu_xattn_worker, &tasks[i]);
+    }
+    for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+    free(tasks); free(threads);
+}
+
 static void cpu_attention(float *out, const float *qkv, int n_tok, int dim,
                            int n_heads, int head_dim, int n_threads) {
     float scale = 1.0f / sqrtf((float)head_dim);
