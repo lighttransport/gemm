@@ -57,8 +57,10 @@ typedef struct {
     CUfunction concat_first;     /* prepend token */
     CUfunction strip_first;      /* drop first token */
     CUfunction concat_last_dim;  /* concat along last dim */
+    CUfunction gemm_f32;         /* pure F32 GEMM (no F16 conversion) */
 
     int sm_version;
+    int use_f32_gemm;            /* 0=F16 weights (default), 1=F32 weights */
 } hy3d_ops;
 
 /* ======================================================================== */
@@ -111,6 +113,7 @@ static int hy3d_ops_load(hy3d_ops *ops, CUmodule module, int sm_version) {
     GET_FN("concat_token_f32",             concat_first);
     GET_FN("strip_first_token_f32",       strip_first);
     GET_FN("concat_f32",                  concat_last_dim);
+    GET_FN("gemm_f32_f32",               gemm_f32);
 
     #undef GET_FN
     return 0;
@@ -131,18 +134,19 @@ static inline void op_layernorm(hy3d_ops *ops, CUstream stream,
                    256, 1, 1, 256 * sizeof(float), stream, args, NULL);
 }
 
-/* ---- GEMM: Y = W @ X + bias  (F16 weights, F32 compute) ---- */
-/* W: [n_out, n_in] (F16), X: [n_tok, n_in] (F32), Y: [n_tok, n_out] (F32) */
+/* ---- GEMM: Y = W @ X + bias ---- */
+/* When use_f32_gemm=0: W is F16 (half_raw), bias/X/Y are F32.
+ * When use_f32_gemm=1: all F32.
+ * Both use same grid/block config: (ceil(n_out/64), ceil(n_tok/16)), blockDim=(16,16) */
 static inline void op_gemm(hy3d_ops *ops, CUstream stream,
                            CUdeviceptr Y, CUdeviceptr W,
                            CUdeviceptr X, CUdeviceptr bias,
                            int n_out, int n_in, int n_tok) {
-    /* Use tiled GEMM (the MMA GEMM has an output mapping bug in common kernels) */
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
-    cuLaunchKernel(ops->gemm_tiled, gx, gy, 1,
-                   16, 16, 1, 0, stream, args, NULL);
+    CUfunction fn = ops->use_f32_gemm ? ops->gemm_f32 : ops->gemm_tiled;
+    cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, stream, args, NULL);
 }
 
 /* ---- GELU activation in-place ---- */
