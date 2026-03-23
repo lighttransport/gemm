@@ -102,10 +102,10 @@ typedef struct {
     CUdeviceptr sa_qkv_w;              /* [3*2048, 2048] = concat(to_q.w, to_k.w, to_v.w) */
     CUdeviceptr sa_out_w, sa_out_b;
     CUdeviceptr sa_q_norm_w, sa_k_norm_w;  /* RMSNorm weight only */
-    /* Cross-attention — separate Q (from hidden) and K,V (from context, different dim) */
+    /* Cross-attention — Q separate (from hidden), K/V fused (from context) */
     CUdeviceptr norm2_w, norm2_b;
     CUdeviceptr ca_q_w;                /* [2048, 2048] */
-    CUdeviceptr ca_k_w, ca_v_w;       /* [2048, 1024] each (context_dim→hidden) */
+    CUdeviceptr ca_kv_w;              /* [2*2048, 1024] = concat(to_k.w, to_v.w) */
     CUdeviceptr ca_out_w, ca_out_b;
     CUdeviceptr ca_q_norm_w, ca_k_norm_w;
     /* Norm3 + MLP/MoE */
@@ -499,8 +499,24 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
         DIT_F32(norm2_w,     "norm2.weight");
         DIT_F32(norm2_b,     "norm2.bias");
         DIT_F16(ca_q_w,      "attn2.to_q.weight");
-        DIT_F16(ca_k_w,      "attn2.to_k.weight");
-        DIT_F16(ca_v_w,      "attn2.to_v.weight");
+        /* Fuse K/V weights for correct head interleaving */
+        {
+            char nk[256], nv[256];
+            snprintf(nk, sizeof(nk), "blocks.%d.attn2.to_k.weight", i);
+            snprintf(nv, sizeof(nv), "blocks.%d.attn2.to_v.weight", i);
+            /* to_k: [2048, 1024], to_v: [2048, 1024] → fused: [4096, 1024] */
+            int ik = safetensors_find(st, nk);
+            int iv = safetensors_find(st, nv);
+            if (ik >= 0 && iv >= 0) {
+                size_t nk_bytes = safetensors_nbytes(st, ik);
+                size_t nv_bytes = safetensors_nbytes(st, iv);
+                uint8_t *buf = (uint8_t *)malloc(nk_bytes + nv_bytes);
+                memcpy(buf, safetensors_data(st, ik), nk_bytes);
+                memcpy(buf + nk_bytes, safetensors_data(st, iv), nv_bytes);
+                b->ca_kv_w = cu_upload_raw(buf, nk_bytes + nv_bytes);
+                free(buf);
+            }
+        }
         DIT_F16(ca_out_w,    "attn2.out_proj.weight");
         DIT_F32(ca_out_b,    "attn2.out_proj.bias");
         DIT_F32(ca_q_norm_w, "attn2.q_norm.weight");
@@ -754,35 +770,7 @@ static void run_dinov2(cuda_hy3d_runner *r, CUdeviceptr d_image, CUdeviceptr d_o
     }
 }
 
-/* Pre-compute DiT cross-attention K,V for all blocks (constant across diffusion steps) */
-static void precompute_dit_ca_kv(cuda_hy3d_runner *r, CUdeviceptr d_context) {
-    hy3d_ops *ops = &r->ops;
-    CUstream stream = r->stream;
-
-    for (int i = 0; i < DIT_DEPTH; i++) {
-        dit_block_gpu *b = &r->dit_blocks[i];
-
-        /* Allocate K,V buffers if not already done */
-        if (!r->dit_ca_K[i]) {
-            r->dit_ca_K[i] = gpu_alloc((size_t)DINO_SEQ_LEN * DIT_HIDDEN * sizeof(float));
-            r->dit_ca_V[i] = gpu_alloc((size_t)DINO_SEQ_LEN * DIT_HIDDEN * sizeof(float));
-        }
-
-        /* K = context @ ca_k_w.T  (no bias) */
-        op_gemm(ops, stream, r->dit_ca_K[i], b->ca_k_w, d_context, 0,
-                DIT_HIDDEN, DIT_CONTEXT_DIM, DINO_SEQ_LEN);
-        /* V = context @ ca_v_w.T  (no bias) */
-        op_gemm(ops, stream, r->dit_ca_V[i], b->ca_v_w, d_context, 0,
-                DIT_HIDDEN, DIT_CONTEXT_DIM, DINO_SEQ_LEN);
-
-        /* Apply RMS norm to K for QK normalization */
-        if (b->ca_k_norm_w) {
-            op_rms_norm(ops, stream, r->dit_ca_K[i], b->ca_k_norm_w,
-                        DINO_SEQ_LEN, DIT_HEADS, DIT_HEAD_DIM, DIT_HIDDEN);
-        }
-    }
-    r->ca_kv_precomputed = 1;
-}
+/* precompute_dit_ca_kv removed — K/V computed per-block inside run_dit_forward */
 
 /*
  * MoE forward: simplified "run all experts on all tokens" approach.
@@ -1216,11 +1204,22 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         if (blk->ca_q_norm_w)
             op_rms_norm(ops, stream, d_cross_Q, blk->ca_q_norm_w, N1, heads, hd, H_dim);
 
-        /* Compute K, V from context per-block (saves GPU memory vs precomputing all 21) */
-        op_gemm(ops, stream, d_ca_K, blk->ca_k_w, d_context, 0,
-                H_dim, DIT_CONTEXT_DIM, ctx_len);
-        op_gemm(ops, stream, d_ca_V, blk->ca_v_w, d_context, 0,
-                H_dim, DIT_CONTEXT_DIM, ctx_len);
+        /* Fused KV from context: cat(to_k(ctx), to_v(ctx)) → view(H, 2*HD) → split
+         * PyTorch: kv=cat(k,v)→view(1,-1,H,2*HD)→split → k,v each [ctx_len, H, HD]
+         * Fused weight ca_kv_w = [2*dim, ctx_dim] */
+        {
+            /* Compute fused KV → d_qkv (reuse, large enough: 2*ctx*dim < 3*N1*dim) */
+            op_gemm(ops, stream, d_qkv, blk->ca_kv_w, d_context, 0,
+                    2 * H_dim, DIT_CONTEXT_DIM, ctx_len);
+            /* Split interleaved KV → K, V
+             * Output to d_ca_K, d_ca_V (non-aliased with d_qkv) */
+            op_split_kv(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, heads, hd);
+        }
+
+        /* Q: just reshape per-head (no interleaving needed for single projection) */
+        /* Actually Q in PyTorch CrossAttention is just: q.view(b,s1,H,HD)
+         * No interleaving. So separate Q GEMM is correct. */
+
         if (blk->ca_k_norm_w)
             op_rms_norm(ops, stream, d_ca_K, blk->ca_k_norm_w,
                         ctx_len, heads, hd, H_dim);
