@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: MIT
+// Prepend a token [dim] to a sequence [N, dim] -> [(N+1), dim]
+// First row is token, remaining rows are seq.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer TokenBuffer { float token[]; };
+layout(std430, binding = 2) readonly buffer SeqBuffer { float seq[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint dim;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = (pc.N + 1) * pc.dim;
+    if (i >= total) return;
+
+    if (i < pc.dim) {
+        out_buf[i] = token[i];
+    } else {
+        out_buf[i] = seq[i - pc.dim];
+    }
+}
