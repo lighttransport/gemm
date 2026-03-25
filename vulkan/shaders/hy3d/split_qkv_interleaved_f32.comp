@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT
+// Split [N, H, 3, HD] -> Q[N, H*HD], K[N, H*HD], V[N, H*HD]
+// Input is interleaved as [N, H, 3, HD] where 3*W = H*3*HD, W = H*HD
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer QBuffer { float Q[]; };
+layout(std430, binding = 1) writeonly buffer KBuffer { float K[]; };
+layout(std430, binding = 2) writeonly buffer VBuffer { float V[]; };
+layout(std430, binding = 3) readonly buffer QKVBuffer { float qkv[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint H;
+    uint HD;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint W = pc.H * pc.HD;
+    uint total = pc.N * W;
+    if (idx >= total) return;
+
+    uint n = idx / W;
+    uint rem = idx % W;
+    uint h = rem / pc.HD;
+    uint d = rem % pc.HD;
+
+    uint base = n * 3 * W + h * 3 * pc.HD;
+    Q[idx] = qkv[base + d];
+    K[idx] = qkv[base + pc.HD + d];
+    V[idx] = qkv[base + 2 * pc.HD + d];
+}
