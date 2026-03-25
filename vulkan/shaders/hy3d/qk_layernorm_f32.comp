@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: MIT
+// Per-head LayerNorm for ShapeVAE QK normalization.
+// Same layout as rms_norm but with mean subtraction and bias.
+// data[tok*stride + h*head_dim : +head_dim]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DataBuffer { float data[]; };
+layout(std430, binding = 1) readonly buffer WeightBuffer { float w[]; };
+layout(std430, binding = 2) readonly buffer BiasBuffer { float b[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    uint stride;
+    float eps;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.n_tok * pc.n_heads;
+    if (idx >= total) return;
+
+    uint tok = idx / pc.n_heads;
+    uint h = idx % pc.n_heads;
+    uint base = tok * pc.stride + h * pc.head_dim;
+
+    // Compute mean
+    float sum = 0.0;
+    for (uint i = 0; i < pc.head_dim; i++) {
+        sum += data[base + i];
+    }
+    float mean = sum / float(pc.head_dim);
+
+    // Compute variance
+    float var_sum = 0.0;
+    for (uint i = 0; i < pc.head_dim; i++) {
+        float d = data[base + i] - mean;
+        var_sum += d * d;
+    }
+
+    float inv = inversesqrt(var_sum / float(pc.head_dim) + pc.eps);
+
+    // Normalize in-place with weight and bias
+    for (uint i = 0; i < pc.head_dim; i++) {
+        data[base + i] = (data[base + i] - mean) * inv * w[i] + b[i];
+    }
+}
