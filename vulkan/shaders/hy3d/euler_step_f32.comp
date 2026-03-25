@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: MIT
+// Euler step: x[i] = x[i] - dt * v[i]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { float x[]; };
+layout(std430, binding = 1) readonly buffer VBuffer { float v[]; };
+
+layout(push_constant) uniform PushConstants {
+    float dt;
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    x[i] = x[i] - pc.dt * v[i];
+}
