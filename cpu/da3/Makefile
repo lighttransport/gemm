@@ -63,7 +63,7 @@ HEADERS = $(wildcard $(COMMON)/*.h)
 all: test_da3
 
 test_da3: test_da3.c $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
 
 clean:
 	rm -f test_da3

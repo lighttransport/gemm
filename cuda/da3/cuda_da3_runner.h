@@ -34,7 +34,8 @@ extern "C" {
 #define DA3_OUTPUT_POSE       0x02
 #define DA3_OUTPUT_RAYS       0x04
 #define DA3_OUTPUT_GAUSSIANS  0x08
-#define DA3_OUTPUT_ALL        0x0F
+#define DA3_OUTPUT_METRIC     0x10
+#define DA3_OUTPUT_ALL        0x1F
 #endif
 
 /* Legacy result (depth + confidence only) */
