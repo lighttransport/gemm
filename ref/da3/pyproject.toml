@@ -6,9 +6,12 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.3",
     "torchvision",
+    "xformers",
     "safetensors",
     "numpy",
     "Pillow",
     "scipy",
     "scikit-image",
+    "opencv-python-headless",
+    "depth-anything-3 @ git+https://github.com/ByteDance-Seed/depth-anything-3.git",
 ]

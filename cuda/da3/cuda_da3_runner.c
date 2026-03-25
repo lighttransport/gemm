@@ -155,14 +155,101 @@ static const char *cuda_da3_specific_kernels =
 "    dst[idx] = sum;\n"
 "}\n"
 "\n"
-"/* ---- 15. dpt_cls_concat: extract patches + concat CLS ---- */\n"
-"__global__ void dpt_cls_concat(float *dst, const float *src, int np, int dim) {\n"
+"/* ---- 15. dpt_patch_norm_concat: extract patches + concat [raw, backbone_norm(patch)] ---- */\n"
+"/* Official DA3: features = [patch_raw, backbone_norm(patch)] per patch token.             */\n"
+"/* src = [nt, dim] (CLS at pos 0, patches at 1..np). norm_w/b = backbone LayerNorm.       */\n"
+"/* dst = [np, 2*dim]: first dim = raw patch, second dim = normed patch.                   */\n"
+"/* Phase 1: extract raw patches. Phase 2: extract + normalize patches (separate kernel).  */\n"
+"__global__ void dpt_extract_patches(float *dst, const float *src, int np, int dim) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = np * dim;\n"
+"    if (idx >= total) return;\n"
+"    int p = idx / dim;\n"
+"    int j = idx % dim;\n"
+"    dst[idx] = src[(1 + p) * dim + j];\n"  /* skip CLS at position 0 */
+"}\n"
+"\n"
+"/* Concatenate two [np, dim] buffers into [np, 2*dim] interleaved */\n"
+"__global__ void dpt_concat_halves(float *dst, const float *a, const float *b, int np, int dim) {\n"
 "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    int total = np * 2 * dim;\n"
 "    if (idx >= total) return;\n"
 "    int p = idx / (2 * dim);\n"
 "    int j = idx % (2 * dim);\n"
-"    dst[idx] = (j < dim) ? src[(1 + p) * dim + j] : src[j - dim];\n"
+"    dst[idx] = (j < dim) ? a[p * dim + j] : b[p * dim + (j - dim)];\n"
+"}\n"
+"\n"
+"/* ---- 16b. dpt_pos_embed: sinusoidal UV positional embedding (CHW layout) ---- */\n"
+"/* Official DA3: create_uv_grid + position_grid_to_embed + ratio=0.1 */\n"
+"/* Channel layout: [sin_x, cos_x, sin_y, cos_y] in C/4 bands each */\n"
+"__global__ void dpt_pos_embed(float *x, int C, int H, int W,\n"
+"                               float aspect_ratio, float ratio) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = C * H * W;\n"
+"    if (idx >= total) return;\n"
+"    int c = idx / (H * W);\n"
+"    int rem = idx % (H * W);\n"
+"    int h = rem / W;\n"
+"    int w = rem % W;\n"
+"    /* UV coordinates (matching create_uv_grid with aspect_ratio) */\n"
+"    float diag = sqrtf(aspect_ratio * aspect_ratio + 1.0f);\n"
+"    float span_x = aspect_ratio / diag;\n"
+"    float span_y = 1.0f / diag;\n"
+"    float u = (W > 1) ? span_x * (2.0f * w - (W - 1)) / (float)W : 0.0f;\n"
+"    float v = (H > 1) ? span_y * (2.0f * h - (H - 1)) / (float)H : 0.0f;\n"
+"    /* Sinusoidal embedding for channel c */\n"
+"    int quarter = C / 4;\n"
+"    int band;\n"
+"    float coord;\n"
+"    int is_cos;\n"
+"    if (c < quarter) {\n"
+"        band = c; coord = u; is_cos = 0;\n"
+"    } else if (c < 2 * quarter) {\n"
+"        band = c - quarter; coord = u; is_cos = 1;\n"
+"    } else if (c < 3 * quarter) {\n"
+"        band = c - 2 * quarter; coord = v; is_cos = 0;\n"
+"    } else {\n"
+"        band = c - 3 * quarter; coord = v; is_cos = 1;\n"
+"    }\n"
+"    float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);\n"
+"    float angle = coord * omega;\n"
+"    float emb = is_cos ? cosf(angle) : sinf(angle);\n"
+"    x[idx] += emb * ratio;\n"
+"}\n"
+"\n"
+"/* ---- 16c. dpt_pos_embed_tok: sinusoidal UV pos embed (token-major layout) ---- */\n"
+"/* For [np, C] format where position p maps to (p/gW, p%gW) spatially */\n"
+"__global__ void dpt_pos_embed_tok(float *x, int np, int C, int gH, int gW,\n"
+"                                   float aspect_ratio, float ratio) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = np * C;\n"
+"    if (idx >= total) return;\n"
+"    int p = idx / C;\n"
+"    int c = idx % C;\n"
+"    int h = p / gW;\n"
+"    int w = p % gW;\n"
+"    float diag = sqrtf(aspect_ratio * aspect_ratio + 1.0f);\n"
+"    float span_x = aspect_ratio / diag;\n"
+"    float span_y = 1.0f / diag;\n"
+"    float u = (gW > 1) ? span_x * (2.0f * w - (gW - 1)) / (float)gW : 0.0f;\n"
+"    float v = (gH > 1) ? span_y * (2.0f * h - (gH - 1)) / (float)gH : 0.0f;\n"
+"    int quarter = C / 4;\n"
+"    int band;\n"
+"    float coord;\n"
+"    int is_cos;\n"
+"    if (c < quarter) {\n"
+"        band = c; coord = u; is_cos = 0;\n"
+"    } else if (c < 2 * quarter) {\n"
+"        band = c - quarter; coord = u; is_cos = 1;\n"
+"    } else if (c < 3 * quarter) {\n"
+"        band = c - 2 * quarter; coord = v; is_cos = 0;\n"
+"    } else {\n"
+"        band = c - 3 * quarter; coord = v; is_cos = 1;\n"
+"    }\n"
+"    float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);\n"
+"    float angle = coord * omega;\n"
+"    float emb = is_cos ? cosf(angle) : sinf(angle);\n"
+"    x[idx] += emb * ratio;\n"
 "}\n"
 "\n"
 "/* ---- 17. dpt_tok_to_chw: token-major [np,C] -> spatial CHW [C,H,W] ---- */\n"
@@ -432,7 +519,10 @@ struct cuda_da3_runner {
     CUfunction fn_depth_activation;
     CUfunction fn_bilinear_upsample_f32;
     CUfunction fn_conv2d_f32;
-    CUfunction fn_dpt_cls_concat;
+    CUfunction fn_dpt_extract_patches;
+    CUfunction fn_dpt_concat_halves;
+    CUfunction fn_dpt_pos_embed;
+    CUfunction fn_dpt_pos_embed_tok;
     CUfunction fn_dpt_tok_to_chw;
     CUfunction fn_kv_transpose;
     CUfunction fn_resize_normalize;
@@ -444,6 +534,7 @@ struct cuda_da3_runner {
     CUfunction fn_groupnorm_f32;  /* GroupNorm for aux output convs */
     CUfunction fn_channel_layernorm_f32;  /* Per-position channel LayerNorm */
     CUfunction fn_silu_f32;       /* SiLU for CameraDec MLP */
+    CUfunction fn_sigmoid_f32;    /* Sigmoid for sky segmentation */
     int use_fp8;                   /* 1 if FP8 MMA available */
 
     /* Model params */
@@ -459,6 +550,7 @@ struct cuda_da3_runner {
     /* GPU weights */
     CUdeviceptr d_patch_embed_w, d_patch_embed_b;
     CUdeviceptr d_cls_token, d_pos_embed;
+    CUdeviceptr d_camera_token;  /* [dim] F32 — injected at CLS at rope_start */
     cuda_da3_layer *layers;
 
     /* Preprocessing buffers */
@@ -471,8 +563,10 @@ struct cuda_da3_runner {
     /* Scratch buffers */
     CUdeviceptr d_hidden, d_hidden2, d_ln_buf, d_qkv, d_attn_out;
     CUdeviceptr d_ffn_buf, d_ffn_mid, d_proj_out;
-    CUdeviceptr d_pos_y, d_pos_x;
-    CUdeviceptr d_features[4]; /* saved backbone features */
+    CUdeviceptr d_pos_y, d_pos_x;         /* local blocks: actual grid positions */
+    CUdeviceptr d_pos_y_nd, d_pos_x_nd;   /* global blocks: pos_nodiff (all 1s) */
+    CUdeviceptr d_features[4]; /* saved backbone features (post-block output) */
+    CUdeviceptr d_features_local[4]; /* saved local_x (pre-block, i.e. previous local layer output) */
 
     /* DPT head GPU weights */
     dpt_gpu_weights dpt_w;
@@ -487,7 +581,9 @@ struct cuda_da3_runner {
     CUdeviceptr d_dpt_fused;     /* [feat, max_h, max_w] for fusion */
     CUdeviceptr d_dpt_tmp;       /* scratch for RCU/bilinear */
     CUdeviceptr d_dpt_tmp2;      /* scratch for RCU conv mid */
-    CUdeviceptr d_dpt_out;       /* [2, 148, 148] final output */
+    CUdeviceptr d_dpt_out;       /* [2, full_h, full_w] final output at model res */
+    CUdeviceptr d_dpt_fullres1;  /* [feat/2, full_h, full_w] upsampled neck output */
+    CUdeviceptr d_dpt_fullres2;  /* [feat/2, full_h, full_w] conv scratch at model res */
 
     /* CameraDec weights (Phase 1: pose estimation) */
     struct {
@@ -556,9 +652,15 @@ struct cuda_da3_runner {
         int use_swiglu;
         CUdeviceptr d_patch_embed_w, d_patch_embed_b;
         CUdeviceptr d_cls_token, d_pos_embed;
+        CUdeviceptr d_backbone_norm_w, d_backbone_norm_b;
         cuda_da3_layer *layers;
         dpt_gpu_weights dpt_w;
         CUdeviceptr d_features[4];
+        /* Sky segmentation branch (from output_conv1 features) */
+        CUdeviceptr sky_0_w, sky_0_b;  /* Conv2d(128→32, 3x3) */
+        CUdeviceptr sky_2_w, sky_2_b;  /* Conv2d(32→1, 1x1) */
+        int head_features;             /* 256 for standard DPT */
+        int head_out_channels[4];      /* [256, 512, 1024, 1024] */
         int loaded;
     } metric;
 
@@ -609,6 +711,7 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
     GET_FN(patch_embed_conv2d);
     GET_FN(cls_pos_embed);
     GET_FN(silu_f32);
+    GET_FN(sigmoid_f32);
 
     /* DA3-specific kernels */
     GET_FN(qk_layernorm_f32);
@@ -617,7 +720,10 @@ static int da3_compile_kernels(cuda_da3_runner *r) {
     GET_FN(layerscale_add_f32);
     GET_FN(depth_activation);
     GET_FN(conv2d_f32);
-    GET_FN(dpt_cls_concat);
+    GET_FN(dpt_extract_patches);
+    GET_FN(dpt_concat_halves);
+    GET_FN(dpt_pos_embed);
+    GET_FN(dpt_pos_embed_tok);
     GET_FN(dpt_tok_to_chw);
     GET_FN(deconv_scatter_f32);
     GET_FN(conv_gemm_f16_f32);
@@ -1074,10 +1180,14 @@ int cuda_da3_load_weights(cuda_da3_runner *r, gguf_context *gguf) {
     CHECK_CU(cuMemAlloc(&r->d_proj_out, (size_t)nt * dim * sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_pos_y,    (size_t)nt * sizeof(int)));
     CHECK_CU(cuMemAlloc(&r->d_pos_x,    (size_t)nt * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&r->d_pos_y_nd, (size_t)nt * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&r->d_pos_x_nd, (size_t)nt * sizeof(int)));
     CHECK_CU(cuMemAlloc(&r->d_img_norm, (size_t)3 * r->image_size * r->image_size * sizeof(float)));
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 4; i++) {
         CHECK_CU(cuMemAlloc(&r->d_features[i], (size_t)nt * dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_features_local[i], (size_t)nt * dim * sizeof(float)));
+    }
 
     /* Allocate DPT head scratch buffers */
     {
@@ -1089,12 +1199,14 @@ int cuda_da3_load_weights(cuda_da3_runner *r, gguf_context *gguf) {
         sp_h[1] = sp_w[1] = (gh - 1) * 2 + 2; /* 74 */
         sp_h[2] = sp_w[2] = gh;                /* 37 */
         sp_h[3] = sp_w[3] = (gh + 2 - 3) / 2 + 1; /* 19 */
-        int max_hw = sp_h[0] * sp_w[0]; /* 148*148 = 21904 */
+        /* After refinenet level 0: output is 2x sp_h[0] = 296x296 */
+        int fused_h = sp_h[0] * 2, fused_w = sp_w[0] * 2; /* 296x296 */
+        int fused_hw = fused_h * fused_w; /* 87616 */
 
-        /* Large scratch: max of token processing and fusion needs */
-        size_t large_sz = (size_t)feat * max_hw; /* 64*148*148 = 1,401,856 */
+        /* Large scratch: must fit refinenet output at 296x296 */
+        size_t large_sz = (size_t)feat * fused_hw; /* 64*296*296 = 5,607,424 */
         if (large_sz < (size_t)np * 2 * dim)
-            large_sz = (size_t)np * 2 * dim; /* 1369*768 = 1,051,392 */
+            large_sz = (size_t)np * 2 * dim;
 
         CHECK_CU(cuMemAlloc(&r->d_dpt_cat,  large_sz * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_dpt_ln,   large_sz * sizeof(float)));
@@ -1112,22 +1224,38 @@ int cuda_da3_load_weights(cuda_da3_runner *r, gguf_context *gguf) {
         CHECK_CU(cuMemAlloc(&r->d_dpt_fused, large_sz * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_dpt_tmp,   large_sz * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_dpt_tmp2,  large_sz * sizeof(float)));
-        CHECK_CU(cuMemAlloc(&r->d_dpt_out,   (size_t)2 * max_hw * sizeof(float)));
+        /* Full model-resolution buffers for output_conv2 (official DA3 upsamples BEFORE convs) */
+        {
+            int full_hw = r->image_size * r->image_size;
+            int feat_half = feat / 2; if (feat_half < 1) feat_half = 1;
+            size_t fullres_sz = (size_t)feat_half * full_hw;
+            CHECK_CU(cuMemAlloc(&r->d_dpt_out,      (size_t)2 * full_hw * sizeof(float)));
+            CHECK_CU(cuMemAlloc(&r->d_dpt_fullres1,  fullres_sz * sizeof(float)));
+            CHECK_CU(cuMemAlloc(&r->d_dpt_fullres2,  fullres_sz * sizeof(float)));
+        }
 
         if (r->verbose >= 1)
             fprintf(stderr, "cuda_da3: DPT scratch buffers allocated (~%.1f MB)\n",
-                    (float)(4 * large_sz + np * oc_max + oc_max * gh * gh + 2 * max_hw) * 4 / 1e6f);
+                    (float)(4 * large_sz + np * oc_max + oc_max * gh * gh + 2 * r->image_size * r->image_size) * 4 / 1e6f);
     }
 
-    /* Upload position arrays for RoPE */
+    /* Upload position arrays for RoPE.
+     * Official DA3: CLS at (0,0), patches at (y+1, x+1) where y,x in 0..grid-1.
+     * The +1 comes from patch_start_idx=1 in vision_transformer.py. */
     int *py = (int *)calloc((size_t)nt, sizeof(int));
     int *px = (int *)calloc((size_t)nt, sizeof(int));
     for (int p = 0; p < np; p++) {
-        py[1 + p] = p / r->grid_w;
-        px[1 + p] = p % r->grid_w;
+        py[1 + p] = p / r->grid_w + 1;
+        px[1 + p] = p % r->grid_w + 1;
     }
     cuMemcpyHtoD(r->d_pos_y, py, (size_t)nt * sizeof(int));
     cuMemcpyHtoD(r->d_pos_x, px, (size_t)nt * sizeof(int));
+    /* pos_nodiff: CLS=(0,0), all patches=(1,1) — used for global attention blocks */
+    memset(py, 0, (size_t)nt * sizeof(int));
+    memset(px, 0, (size_t)nt * sizeof(int));
+    for (int p = 0; p < np; p++) { py[1 + p] = 1; px[1 + p] = 1; }
+    cuMemcpyHtoD(r->d_pos_y_nd, py, (size_t)nt * sizeof(int));
+    cuMemcpyHtoD(r->d_pos_x_nd, px, (size_t)nt * sizeof(int));
     free(py); free(px);
 
     r->h_output = (float *)malloc((size_t)nt * dim * sizeof(float));
@@ -1275,6 +1403,8 @@ hd_found:
                 strcpy(gguf_name, "da3.cls_token");
             } else if (strcmp(s, "pos_embed") == 0) {
                 strcpy(gguf_name, "da3.pos_embed");
+            } else if (strcmp(s, "camera_token") == 0) {
+                strcpy(gguf_name, "da3.camera_token");
             } else if (strcmp(s, "patch_embed.proj.weight") == 0) {
                 strcpy(gguf_name, "da3.patch_embed.weight");
             } else if (strcmp(s, "patch_embed.proj.bias") == 0) {
@@ -1412,6 +1542,105 @@ hd_found:
                     for (int j = 0; gsout_map[j].st; j++) {
                         if (strcmp(ss, gsout_map[j].st) == 0) {
                             strcpy(gguf_name, gsout_map[j].gg);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        /* Metric backbone: model.da3_metric.backbone.pretrained.* */
+        else if (strncmp(key, "model.da3_metric.backbone.pretrained.", 37) == 0) {
+            const char *s = key + 37;
+            if (strcmp(s, "cls_token") == 0) {
+                strcpy(gguf_name, "da3.metric.cls_token");
+            } else if (strcmp(s, "pos_embed") == 0) {
+                strcpy(gguf_name, "da3.metric.pos_embed");
+            } else if (strcmp(s, "patch_embed.proj.weight") == 0) {
+                strcpy(gguf_name, "da3.metric.patch_embed.weight");
+            } else if (strcmp(s, "patch_embed.proj.bias") == 0) {
+                strcpy(gguf_name, "da3.metric.patch_embed.bias");
+            } else if (strcmp(s, "norm.weight") == 0) {
+                strcpy(gguf_name, "da3.metric.backbone_norm.weight");
+            } else if (strcmp(s, "norm.bias") == 0) {
+                strcpy(gguf_name, "da3.metric.backbone_norm.bias");
+            } else if (strncmp(s, "blocks.", 7) == 0) {
+                int L = 0;
+                const char *rest = s + 7;
+                while (*rest >= '0' && *rest <= '9') { L = L * 10 + (*rest - '0'); rest++; }
+                if (*rest == '.') rest++;
+                for (int j = 0; blk_map[j].st; j++) {
+                    if (strcmp(rest, blk_map[j].st) == 0) {
+                        snprintf(gguf_name, sizeof(gguf_name), "da3.metric.blk.%d.%s", L, blk_map[j].gg);
+                        break;
+                    }
+                }
+            }
+        }
+        /* Metric head: model.da3_metric.head.* */
+        else if (strncmp(key, "model.da3_metric.head.", 22) == 0) {
+            const char *s = key + 22;
+            if (strcmp(s, "norm.weight") == 0) {
+                strcpy(gguf_name, "da3.metric.head.norm.weight");
+            } else if (strcmp(s, "norm.bias") == 0) {
+                strcpy(gguf_name, "da3.metric.head.norm.bias");
+            } else if (strncmp(s, "projects.", 9) == 0) {
+                int idx = s[9] - '0';
+                const char *wb = s + 11;
+                snprintf(gguf_name, sizeof(gguf_name), "da3.metric.head.proj.%d.%s", idx, wb);
+            } else if (strncmp(s, "resize_layers.", 14) == 0) {
+                int idx = s[14] - '0';
+                const char *wb = s + 16;
+                if (idx == 0) snprintf(gguf_name, sizeof(gguf_name), "da3.metric.head.upsample_0.%s", wb);
+                else if (idx == 1) snprintf(gguf_name, sizeof(gguf_name), "da3.metric.head.upsample_1.%s", wb);
+                else if (idx == 3) snprintf(gguf_name, sizeof(gguf_name), "da3.metric.head.downsample.%s", wb);
+            } else if (strncmp(s, "scratch.", 8) == 0) {
+                const char *ss = s + 8;
+                /* layer{1-4}_rn */
+                for (int li = 1; li <= 4; li++) {
+                    char pfx[32];
+                    snprintf(pfx, sizeof(pfx), "layer%d_rn.weight", li);
+                    if (strcmp(ss, pfx) == 0) {
+                        snprintf(gguf_name, sizeof(gguf_name), "da3.metric.head.adapter.%d.weight", li - 1);
+                        break;
+                    }
+                }
+                /* refinenet{1-4}.* */
+                if (!gguf_name[0]) {
+                    for (int ri = 1; ri <= 4; ri++) {
+                        char pfx[32];
+                        snprintf(pfx, sizeof(pfx), "refinenet%d.", ri);
+                        size_t plen = strlen(pfx);
+                        if (strncmp(ss, pfx, plen) == 0) {
+                            const char *rn = ss + plen;
+                            for (int j = 0; rn_map[j].st; j++) {
+                                if (strcmp(rn, rn_map[j].st) == 0) {
+                                    snprintf(gguf_name, sizeof(gguf_name), "da3.metric.head.fuse.%d.%s", ri - 1, rn_map[j].gg);
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                /* Output convolutions */
+                if (!gguf_name[0]) {
+                    static const struct { const char *st; const char *gg; } mout_map[] = {
+                        {"output_conv1.weight",   "da3.metric.head.neck.weight"},
+                        {"output_conv1.bias",     "da3.metric.head.neck.bias"},
+                        {"output_conv2.0.weight", "da3.metric.head.out_0.weight"},
+                        {"output_conv2.0.bias",   "da3.metric.head.out_0.bias"},
+                        {"output_conv2.2.weight", "da3.metric.head.out_2.weight"},
+                        {"output_conv2.2.bias",   "da3.metric.head.out_2.bias"},
+                        /* Sky segmentation branch */
+                        {"sky_output_conv2.0.weight", "da3.metric.head.sky_0.weight"},
+                        {"sky_output_conv2.0.bias",   "da3.metric.head.sky_0.bias"},
+                        {"sky_output_conv2.2.weight", "da3.metric.head.sky_2.weight"},
+                        {"sky_output_conv2.2.bias",   "da3.metric.head.sky_2.bias"},
+                        {NULL, NULL}
+                    };
+                    for (int j = 0; mout_map[j].st; j++) {
+                        if (strcmp(ss, mout_map[j].st) == 0) {
+                            strcpy(gguf_name, mout_map[j].gg);
                             break;
                         }
                     }
@@ -1567,8 +1796,19 @@ static qtensor da3s_tensor(const st_context *st, const st_name_map *map, int map
          * so we reverse the shape to match GGUF convention. */
         for (int d = 0; d < t.n_dims; d++)
             t.dims[d] = shape[t.n_dims - 1 - d];
-        t.n_cols = (int)t.dims[0];
-        t.n_rows = (t.n_dims >= 2) ? (int)t.dims[1] : 1;
+        /* Set n_rows/n_cols matching GGUF convention.
+         * 4D conv: GGUF dims [kW, kH, Ci, Co] → n_rows=Co, n_cols=kW*kH*Ci
+         * 2D linear: GGUF dims [Ci, Co] → n_rows=Co, n_cols=Ci */
+        if (t.n_dims == 4) {
+            t.n_rows = (int)t.dims[3];
+            t.n_cols = (int)(t.dims[0] * t.dims[1] * t.dims[2]);
+        } else if (t.n_dims >= 2) {
+            t.n_cols = (int)t.dims[0];
+            t.n_rows = (int)t.dims[1];
+        } else {
+            t.n_cols = (int)t.dims[0];
+            t.n_rows = 1;
+        }
         break;
     }
     return t;
@@ -1724,6 +1964,13 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
         qtensor t;
         t = da3s_tensor(st, map, map_count, "da3.cls_token");     r->d_cls_token = upload_tensor_f32(&t);
         t = da3s_tensor(st, map, map_count, "da3.pos_embed");     r->d_pos_embed = upload_tensor_f32(&t);
+        t = da3s_tensor(st, map, map_count, "da3.camera_token");
+        if (t.data) {
+            /* camera_token shape [2, dim], upload first row [dim] as F32 */
+            r->d_camera_token = upload_tensor_f32(&t);  /* uploads full [2*dim] */
+        } else {
+            r->d_camera_token = 0;
+        }
         t = da3s_tensor(st, map, map_count, "da3.patch_embed.weight"); r->d_patch_embed_w = upload_tensor_f32(&t);
         t = da3s_tensor(st, map, map_count, "da3.patch_embed.bias");   r->d_patch_embed_b = upload_tensor_f32(&t);
     }
@@ -2222,42 +2469,276 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
         }
     }
 
-    /* Allocate backbone scratch buffers */
+    /* Upload Metric Backbone + Head weights (Phase 6) */
+    {
+        qtensor t = da3s_tensor(st, map, map_count, "da3.metric.cls_token");
+        if (t.data) {
+            char name[128];
+            /* Infer dim from cls_token shape.
+             * Safetensors shape [1,1,1024] → GGUF dims [1024,1,1], so dims[0] = dim */
+            int mdim = (t.n_dims >= 1) ? (int)t.dims[0] : 1024;
+            r->metric.dim = mdim;
+            r->metric.n_heads = 16;
+            r->metric.head_dim = mdim / 16;
+            r->metric.ffn_hidden = mdim * 4;
+            r->metric.n_blocks = 24;
+            r->metric.use_swiglu = 0;
+            r->metric.rope_start = 999;     /* no RoPE */
+            r->metric.qk_norm_start = 999;  /* no QKNorm */
+            /* Standard DINOv2 feature layers for 24-block model */
+            r->metric.feature_layers[0] = 5;
+            r->metric.feature_layers[1] = 11;
+            r->metric.feature_layers[2] = 17;
+            r->metric.feature_layers[3] = 23;
+
+            /* Global params */
+            r->metric.d_cls_token = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.pos_embed");
+            if (t.data) r->metric.d_pos_embed = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.patch_embed.weight");
+            if (t.data) r->metric.d_patch_embed_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.patch_embed.bias");
+            if (t.data) r->metric.d_patch_embed_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.backbone_norm.weight");
+            if (t.data) r->metric.d_backbone_norm_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.backbone_norm.bias");
+            if (t.data) r->metric.d_backbone_norm_b = upload_tensor_f32(&t);
+
+            /* Allocate and upload transformer blocks */
+            int mb = r->metric.n_blocks;
+            r->metric.layers = (cuda_da3_layer *)calloc((size_t)mb, sizeof(cuda_da3_layer));
+            for (int L = 0; L < mb; L++) {
+                cuda_da3_layer *ly = &r->metric.layers[L];
+                /* LayerNorm (F32) */
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ln1.weight", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ln1_w = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ln1.bias", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ln1_b = upload_tensor_f32(&t);
+                /* Attention QKV (F16 weight, F32 bias) */
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.attn_qkv.weight", L);
+                t = da3s_tensor(st, map, map_count, name);
+                ly->attn_qkv_w = upload_tensor_f32_as_f16(&t);
+                ly->qkv_rows = t.n_rows; ly->qkv_cols = t.n_cols;
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.attn_qkv.bias", L);
+                t = da3s_tensor(st, map, map_count, name); ly->attn_qkv_b = upload_tensor_f32(&t);
+                /* Attention output proj */
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.attn_out.weight", L);
+                t = da3s_tensor(st, map, map_count, name);
+                ly->attn_out_w = upload_tensor_f32_as_f16(&t);
+                ly->out_rows = t.n_rows; ly->out_cols = t.n_cols;
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.attn_out.bias", L);
+                t = da3s_tensor(st, map, map_count, name); ly->attn_out_b = upload_tensor_f32(&t);
+                /* LayerScale */
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ls1", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ls1 = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ls2", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ls2 = upload_tensor_f32(&t);
+                /* LN2 */
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ln2.weight", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ln2_w = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ln2.bias", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ln2_b = upload_tensor_f32(&t);
+                /* GELU MLP (not SwiGLU) */
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ffn_up.weight", L);
+                t = da3s_tensor(st, map, map_count, name);
+                ly->ffn_up_w = upload_tensor_f32_as_f16(&t);
+                ly->ffn_up_rows = t.n_rows; ly->ffn_up_cols = t.n_cols;
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ffn_up.bias", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ffn_up_b = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ffn_down.weight", L);
+                t = da3s_tensor(st, map, map_count, name);
+                ly->ffn_down_w = upload_tensor_f32_as_f16(&t);
+                ly->ffn_down_rows = t.n_rows; ly->ffn_down_cols = t.n_cols;
+                snprintf(name, sizeof(name), "da3.metric.blk.%d.ffn_down.bias", L);
+                t = da3s_tensor(st, map, map_count, name); ly->ffn_down_b = upload_tensor_f32(&t);
+                /* No QKNorm, no SwiGLU for metric backbone */
+                ly->has_qk_norm = 0;
+                ly->has_swiglu = 0;
+            }
+
+            /* Upload Metric DPT head weights */
+            dpt_gpu_weights *mdw = &r->metric.dpt_w;
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.norm.weight");
+            mdw->norm_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.norm.bias");
+            mdw->norm_b = upload_tensor_f32(&t);
+
+            /* Infer head out_channels from proj weight shapes */
+            for (int i = 0; i < 4; i++) {
+                snprintf(name, sizeof(name), "da3.metric.head.proj.%d.weight", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->proj_w[i] = upload_tensor_f32_as_f16(&t);
+                mdw->proj_rows[i] = t.n_rows;
+                r->metric.head_out_channels[i] = t.n_rows;
+                snprintf(name, sizeof(name), "da3.metric.head.proj.%d.bias", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->proj_b[i] = upload_tensor_f32(&t);
+            }
+
+            /* Resize layers: ConvTranspose2d for levels 0,1; Conv2d stride-2 for level 3 */
+            {
+                int moc0 = r->metric.head_out_channels[0];
+                t = da3s_tensor(st, map, map_count, "da3.metric.head.upsample_0.weight");
+                if (t.data) mdw->upsample_0_w = upload_deconv_weight_f16(&t, moc0, moc0, 4, 4);
+                t = da3s_tensor(st, map, map_count, "da3.metric.head.upsample_0.bias");
+                mdw->upsample_0_b = upload_tensor_f32(&t);
+                int moc1 = r->metric.head_out_channels[1];
+                t = da3s_tensor(st, map, map_count, "da3.metric.head.upsample_1.weight");
+                if (t.data) mdw->upsample_1_w = upload_deconv_weight_f16(&t, moc1, moc1, 2, 2);
+                t = da3s_tensor(st, map, map_count, "da3.metric.head.upsample_1.bias");
+                mdw->upsample_1_b = upload_tensor_f32(&t);
+            }
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.downsample.weight");
+            mdw->downsample_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.downsample.bias");
+            mdw->downsample_b = upload_tensor_f32(&t);
+
+            /* Adapters (Conv3x3, no bias) */
+            for (int i = 0; i < 4; i++) {
+                snprintf(name, sizeof(name), "da3.metric.head.adapter.%d.weight", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->adapter_w[i] = upload_tensor_f32_as_f16(&t);
+            }
+
+            /* Infer features from adapter weight shape */
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.adapter.0.weight");
+            r->metric.head_features = t.data ? t.n_rows : 256;
+
+            /* RefineNet fuse[0-3] */
+            for (int i = 0; i < 4; i++) {
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.out.weight", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_out_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.out.bias", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_out_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu1.conv1.weight", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu1_c1_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu1.conv1.bias", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu1_c1_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu1.conv2.weight", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu1_c2_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu1.conv2.bias", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu1_c2_b[i] = upload_tensor_f32(&t);
+                mdw->has_rcu1[i] = (mdw->fuse_rcu1_c1_w[i] != 0);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu2.conv1.weight", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu2_c1_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu2.conv1.bias", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu2_c1_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu2.conv2.weight", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu2_c2_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.metric.head.fuse.%d.rcu2.conv2.bias", i);
+                t = da3s_tensor(st, map, map_count, name);
+                mdw->fuse_rcu2_c2_b[i] = upload_tensor_f32(&t);
+                mdw->has_rcu2[i] = (mdw->fuse_rcu2_c1_w[i] != 0);
+            }
+
+            /* Output convolutions */
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.neck.weight");
+            mdw->neck_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.neck.bias");
+            mdw->neck_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.out_0.weight");
+            mdw->out_0_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.out_0.bias");
+            mdw->out_0_b = upload_tensor_f32(&t);
+            mdw->out_mid = t.n_cols;
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.out_2.weight");
+            mdw->out_2_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.out_2.bias");
+            mdw->out_2_b = upload_tensor_f32(&t);
+
+            /* Sky segmentation branch */
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.sky_0.weight");
+            r->metric.sky_0_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.sky_0.bias");
+            r->metric.sky_0_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.sky_2.weight");
+            r->metric.sky_2_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.metric.head.sky_2.bias");
+            r->metric.sky_2_b = upload_tensor_f32(&t);
+
+            r->metric.loaded = 1;
+            if (r->verbose >= 1)
+                fprintf(stderr, "cuda_da3: Metric backbone loaded (dim=%d, %d blocks, "
+                        "head features=%d, oc=[%d,%d,%d,%d])\n",
+                        r->metric.dim, r->metric.n_blocks, r->metric.head_features,
+                        r->metric.head_out_channels[0], r->metric.head_out_channels[1],
+                        r->metric.head_out_channels[2], r->metric.head_out_channels[3]);
+        }
+    }
+
+    /* Allocate backbone scratch buffers.
+     * If metric backbone is loaded (dim may be different), size for max(main, metric). */
     int nt = r->n_tokens;
     int dim = r->dim;
     int np = r->n_patches;
     int gh = r->grid_h;
     int max_ffn = r->use_swiglu ? 2 * r->ffn_hidden : 4 * dim;
+    int alloc_dim = dim;        /* max of main and metric dims */
+    int alloc_ffn = max_ffn;
+    if (r->metric.loaded) {
+        int mdim = r->metric.dim;
+        int mffn = r->metric.use_swiglu ? 2 * r->metric.ffn_hidden : 4 * mdim;
+        if (mdim > alloc_dim) alloc_dim = mdim;
+        if (mffn > alloc_ffn) alloc_ffn = mffn;
+        if (r->metric.ffn_hidden > r->ffn_hidden)
+            r->ffn_hidden = r->ffn_hidden; /* keep as-is; alloc_ffn handles sizing */
+    }
 
-    CHECK_CU(cuMemAlloc(&r->d_hidden,   (size_t)nt * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_hidden2,  (size_t)nt * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_ln_buf,   (size_t)nt * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_qkv,      (size_t)nt * 3 * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_attn_out, (size_t)nt * dim * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_ffn_buf,  (size_t)nt * max_ffn * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_ffn_mid,  (size_t)nt * r->ffn_hidden * sizeof(float)));
-    CHECK_CU(cuMemAlloc(&r->d_proj_out, (size_t)nt * dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_hidden,   (size_t)nt * alloc_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_hidden2,  (size_t)nt * alloc_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_ln_buf,   (size_t)nt * alloc_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_qkv,      (size_t)nt * 3 * alloc_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_attn_out, (size_t)nt * alloc_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_ffn_buf,  (size_t)nt * alloc_ffn * sizeof(float)));
+    {
+        int alloc_ffn_mid = r->ffn_hidden;
+        if (r->metric.loaded && r->metric.ffn_hidden > alloc_ffn_mid)
+            alloc_ffn_mid = r->metric.ffn_hidden;
+        CHECK_CU(cuMemAlloc(&r->d_ffn_mid,  (size_t)nt * alloc_ffn_mid * sizeof(float)));
+    }
+    CHECK_CU(cuMemAlloc(&r->d_proj_out, (size_t)nt * alloc_dim * sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_pos_y,    (size_t)nt * sizeof(int)));
     CHECK_CU(cuMemAlloc(&r->d_pos_x,    (size_t)nt * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&r->d_pos_y_nd, (size_t)nt * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&r->d_pos_x_nd, (size_t)nt * sizeof(int)));
     CHECK_CU(cuMemAlloc(&r->d_img_norm, (size_t)3 * r->image_size * r->image_size * sizeof(float)));
 
-    for (int i = 0; i < 4; i++)
-        CHECK_CU(cuMemAlloc(&r->d_features[i], (size_t)nt * dim * sizeof(float)));
+    for (int i = 0; i < 4; i++) {
+        CHECK_CU(cuMemAlloc(&r->d_features[i], (size_t)nt * alloc_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_features_local[i], (size_t)nt * alloc_dim * sizeof(float)));
+    }
 
-    /* Allocate DPT head scratch buffers */
+    /* Allocate DPT head scratch buffers (safetensors path) */
     {
         int feat = r->head_features;
         int oc_max = r->head_out_channels[3];
+        /* If metric DPT has larger features/channels, use max */
+        if (r->metric.loaded) {
+            if (r->metric.head_features > feat) feat = r->metric.head_features;
+            if (r->metric.head_out_channels[3] > oc_max)
+                oc_max = r->metric.head_out_channels[3];
+        }
         int sp_h[4], sp_w[4];
         sp_h[0] = sp_w[0] = (gh - 1) * 4 + 4;
         sp_h[1] = sp_w[1] = (gh - 1) * 2 + 2;
         sp_h[2] = sp_w[2] = gh;
         sp_h[3] = sp_w[3] = (gh + 2 - 3) / 2 + 1;
         int max_hw = sp_h[0] * sp_w[0];
+        int fused_h = sp_h[0] * 2, fused_w = sp_w[0] * 2;
+        int fused_hw = fused_h * fused_w;
 
-        size_t large_sz = (size_t)feat * max_hw;
-        if (large_sz < (size_t)np * 2 * dim)
-            large_sz = (size_t)np * 2 * dim;
+        size_t large_sz = (size_t)feat * fused_hw; /* max(64,256)*296*296 for refinenet output */
+        if (large_sz < (size_t)np * 2 * alloc_dim)
+            large_sz = (size_t)np * 2 * alloc_dim;
 
         CHECK_CU(cuMemAlloc(&r->d_dpt_cat,  large_sz * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_dpt_ln,   large_sz * sizeof(float)));
@@ -2266,6 +2747,9 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
 
         for (int i = 0; i < 4; i++) {
             int oc = r->head_out_channels[i];
+            /* Size for max(main, metric) DPT channels */
+            if (r->metric.loaded && r->metric.head_out_channels[i] > oc)
+                oc = r->metric.head_out_channels[i];
             CHECK_CU(cuMemAlloc(&r->d_dpt_spatial[i],
                                  (size_t)oc * sp_h[i] * sp_w[i] * sizeof(float)));
             CHECK_CU(cuMemAlloc(&r->d_dpt_adapted[i],
@@ -2273,23 +2757,38 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
         }
 
         CHECK_CU(cuMemAlloc(&r->d_dpt_fused, large_sz * sizeof(float)));
-        CHECK_CU(cuMemAlloc(&r->d_dpt_tmp,   large_sz * sizeof(float)));
+        /* d_dpt_tmp: must also fit aux oc1 conv chain at fused resolution (256 * fused_hw) */
+        size_t dpt_tmp_sz = large_sz;
+        {
+            size_t aux_conv_sz = (size_t)256 * fused_hw;
+            if (aux_conv_sz > dpt_tmp_sz) dpt_tmp_sz = aux_conv_sz;
+        }
+        CHECK_CU(cuMemAlloc(&r->d_dpt_tmp,   dpt_tmp_sz * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_dpt_tmp2,  large_sz * sizeof(float)));
-        CHECK_CU(cuMemAlloc(&r->d_dpt_out,   (size_t)2 * max_hw * sizeof(float)));
+        /* Full model-resolution buffers for output_conv2 (official DA3 upsamples BEFORE convs) */
+        {
+            int full_hw = r->image_size * r->image_size;
+            int feat_half = feat / 2; if (feat_half < 1) feat_half = 1;
+            size_t fullres_sz = (size_t)feat_half * full_hw;
+            CHECK_CU(cuMemAlloc(&r->d_dpt_out,      (size_t)2 * full_hw * sizeof(float)));
+            CHECK_CU(cuMemAlloc(&r->d_dpt_fullres1,  fullres_sz * sizeof(float)));
+            CHECK_CU(cuMemAlloc(&r->d_dpt_fullres2,  fullres_sz * sizeof(float)));
+        }
 
         if (r->verbose >= 1)
             fprintf(stderr, "cuda_da3: DPT scratch buffers allocated (~%.1f MB)\n",
-                    (float)(4 * large_sz + np * oc_max + oc_max * gh * gh + 2 * max_hw) * 4 / 1e6f);
+                    (float)(4 * large_sz + np * oc_max + oc_max * gh * gh + 2 * r->image_size * r->image_size) * 4 / 1e6f);
 
-        /* Aux DPT scratch: per-level 7-channel output + conv chain scratch
-         * All output conv chains operate at level 0 spatial size (sp_h[0] x sp_w[0]) */
+        /* Aux DPT scratch: per-level 7-channel output + conv chain scratch.
+         * After refinenet upsample fix, output conv chains operate at fused resolution
+         * (2x level 0 spatial size = 296×296 for 518 input). */
         if (r->dpt_aux.loaded) {
             for (int i = 0; i < 4; i++)
                 CHECK_CU(cuMemAlloc(&r->d_aux_out[i],
-                                     (size_t)7 * sp_h[0] * sp_w[0] * sizeof(float)));
-            /* Scratch for output conv chains (max 256 channels * max_hw) */
+                                     (size_t)7 * fused_hw * sizeof(float)));
+            /* Scratch for output conv chains (max 256 channels * fused_hw) */
             CHECK_CU(cuMemAlloc(&r->d_aux_scratch,
-                                 (size_t)256 * max_hw * sizeof(float)));
+                                 (size_t)256 * fused_hw * sizeof(float)));
             if (r->verbose >= 1)
                 fprintf(stderr, "cuda_da3: DPT Aux scratch allocated\n");
         }
@@ -2309,23 +2808,32 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
                                  (size_t)128 * mg_h * mg_w * sizeof(float)));
             int gs_oc = r->gsdpt.gs_out_channels;
             if (gs_oc < 2) gs_oc = 38;
+            /* After refinenet level 0 with 2x upsample, output convs operate at fused resolution */
             CHECK_CU(cuMemAlloc(&r->d_gs_out,
-                                 (size_t)gs_oc * max_hw * sizeof(float)));
+                                 (size_t)gs_oc * fused_hw * sizeof(float)));
             if (r->verbose >= 1)
                 fprintf(stderr, "cuda_da3: GSDPT scratch allocated (%d channels, merger=%dx%d)\n",
                         gs_oc, mg_h, mg_w);
         }
     }
 
-    /* Upload position arrays for RoPE */
+    /* Upload position arrays for RoPE.
+     * Official DA3: CLS at (0,0), patches at (y+1, x+1) where y,x in 0..grid-1.
+     * The +1 comes from patch_start_idx=1 in vision_transformer.py. */
     int *py = (int *)calloc((size_t)nt, sizeof(int));
     int *px = (int *)calloc((size_t)nt, sizeof(int));
     for (int p = 0; p < np; p++) {
-        py[1 + p] = p / r->grid_w;
-        px[1 + p] = p % r->grid_w;
+        py[1 + p] = p / r->grid_w + 1;
+        px[1 + p] = p % r->grid_w + 1;
     }
     cuMemcpyHtoD(r->d_pos_y, py, (size_t)nt * sizeof(int));
     cuMemcpyHtoD(r->d_pos_x, px, (size_t)nt * sizeof(int));
+    /* pos_nodiff: CLS=(0,0), all patches=(1,1) — used for global attention blocks */
+    memset(py, 0, (size_t)nt * sizeof(int));
+    memset(px, 0, (size_t)nt * sizeof(int));
+    for (int p = 0; p < np; p++) { py[1 + p] = 1; px[1 + p] = 1; }
+    cuMemcpyHtoD(r->d_pos_y_nd, py, (size_t)nt * sizeof(int));
+    cuMemcpyHtoD(r->d_pos_x_nd, px, (size_t)nt * sizeof(int));
     free(py); free(px);
 
     r->h_output = (float *)malloc((size_t)nt * dim * sizeof(float));
@@ -2335,8 +2843,9 @@ int cuda_da3_load_safetensors(cuda_da3_runner *r, const char *st_path, const cha
     if (r->verbose >= 1) {
         fprintf(stderr, "cuda_da3: loaded %d blocks, dim=%d, tokens=%d, swiglu=%d (safetensors)\n",
                 nb, dim, nt, r->use_swiglu);
-        fprintf(stderr, "cuda_da3: modules: cam_dec=%d cam_enc=%d dpt_aux=%d gsdpt=%d\n",
-                r->cam_dec.loaded, r->cam_enc.loaded, r->dpt_aux.loaded, r->gsdpt.loaded);
+        fprintf(stderr, "cuda_da3: modules: cam_dec=%d cam_enc=%d dpt_aux=%d gsdpt=%d metric=%d\n",
+                r->cam_dec.loaded, r->cam_enc.loaded, r->dpt_aux.loaded, r->gsdpt.loaded,
+                r->metric.loaded);
     }
 
     /* Free name mapping */
@@ -2408,7 +2917,7 @@ static void kl_rope_2d(cuda_da3_runner *r, CUdeviceptr vec, CUdeviceptr pos_y,
                          int stride) {
     int quarter = head_dim / 4;
     int threads = n_heads * quarter;
-    float freq_base = 10000.0f;
+    float freq_base = 100.0f;  /* DA3 uses 100, not 10000 (see RotaryPositionEmbedding2D) */
     void *args[] = {&vec, &pos_y, &pos_x, &n_tok, &n_heads, &head_dim, &stride, &freq_base};
     cuLaunchKernel(r->fn_rope_2d_f32, (unsigned)n_tok, 1, 1,
                    (unsigned)threads, 1, 1, 0, r->stream, args, NULL);
@@ -2474,13 +2983,42 @@ static void kl_layerscale_add(cuda_da3_runner *r, CUdeviceptr hidden,
 /* DPT head kernel launch helpers                                           */
 /* ======================================================================== */
 
-static void kl_cls_concat(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
-                            int np, int dim) {
-    int total = np * 2 * dim;
+/* Extract patch tokens from [nt, dim] -> [np, dim] (skip CLS at position 0) */
+static void kl_extract_patches(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
+                                 int np, int dim) {
+    int total = np * dim;
     int grid = (total + 255) / 256;
     void *args[] = {&dst, &src, &np, &dim};
-    cuLaunchKernel(r->fn_dpt_cls_concat, (unsigned)grid, 1, 1, 256, 1, 1,
+    cuLaunchKernel(r->fn_dpt_extract_patches, (unsigned)grid, 1, 1, 256, 1, 1,
                    0, r->stream, args, NULL);
+}
+
+/* Concatenate two [np, dim] buffers into interleaved [np, 2*dim] */
+static void kl_concat_halves(cuda_da3_runner *r, CUdeviceptr dst,
+                               CUdeviceptr a, CUdeviceptr b, int np, int dim) {
+    int total = np * 2 * dim;
+    int grid = (total + 255) / 256;
+    void *args[] = {&dst, &a, &b, &np, &dim};
+    cuLaunchKernel(r->fn_dpt_concat_halves, (unsigned)grid, 1, 1, 256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
+/* Build DPT input features: [local_x_raw, backbone_norm(x)] per patch token.
+ * Matches official DA3: features = [local_x, norm(x)] with cat_token=True.
+ * local_features = hidden state BEFORE the feature block (output of previous local block).
+ * features = hidden state AFTER the feature block (current layer output). */
+static void kl_patch_norm_concat(cuda_da3_runner *r, CUdeviceptr dst,
+                                   CUdeviceptr local_features, CUdeviceptr features,
+                                   CUdeviceptr bn_w, CUdeviceptr bn_b, int np, int dim) {
+    /* Step 1: Extract raw patches from local_features (first half) -> d_dpt_tmp */
+    kl_extract_patches(r, r->d_dpt_tmp, local_features, np, dim);
+
+    /* Step 2: Extract patches from features, apply backbone LayerNorm (second half) */
+    kl_extract_patches(r, r->d_dpt_ln, features, np, dim);  /* use d_dpt_ln as scratch */
+    kl_layernorm(r, r->d_dpt_tmp2, r->d_dpt_ln, bn_w, bn_b, np, dim);
+
+    /* Step 3: Concatenate [raw_local, normed] -> dst [np, 2*dim] */
+    kl_concat_halves(r, dst, r->d_dpt_tmp, r->d_dpt_tmp2, np, dim);
 }
 
 static void kl_tok_to_chw(cuda_da3_runner *r, CUdeviceptr dst, CUdeviceptr src,
@@ -2600,6 +3138,13 @@ static void kl_silu_inplace(cuda_da3_runner *r, CUdeviceptr x, int n) {
                    0, r->stream, args, NULL);
 }
 
+static void kl_sigmoid_inplace(cuda_da3_runner *r, CUdeviceptr x, int n) {
+    int grid = (n + 255) / 256;
+    void *args[] = {&x, &n};
+    cuLaunchKernel(r->fn_sigmoid_f32, (unsigned)grid, 1, 1, 256, 1, 1,
+                   0, r->stream, args, NULL);
+}
+
 /* RCU: relu -> conv3x3 -> relu -> conv3x3 + residual
  * Uses d_dpt_tmp and d_dpt_tmp2 as internal scratch.
  * Input x and output out must NOT alias d_dpt_tmp or d_dpt_tmp2.
@@ -2628,54 +3173,81 @@ static void kl_rcu(cuda_da3_runner *r, CUdeviceptr out, CUdeviceptr x,
  * IMPORTANT: deeper and result_buf may alias (both d_dpt_fused). We handle this
  * by consuming deeper (bilinear upsample) before overwriting result_buf.
  * Uses d_dpt_cat, d_dpt_ln as extra scratch (beyond d_dpt_tmp/tmp2 used by kl_rcu). */
-static void gpu_refinenet(cuda_da3_runner *r, int stage, CUdeviceptr feat, int fH, int fW,
+/* GPU RefineNet fusion matching official FeatureFusionBlock:
+ *   y = top_input (deeper)
+ *   y = y + RCU1(lateral_input)   (if has_residual)
+ *   y = RCU2(y)
+ *   y = upsample(y, out_h, out_w)
+ *   y = out_conv(y)
+ *
+ * Parameters:
+ *   lateral: lateral/skip input (adapter features at this level)
+ *   lH, lW: spatial size of lateral
+ *   deeper: top/deeper input from previous refinenet (NULL for deepest level)
+ *   dH, dW: spatial size of deeper (ignored if deeper==NULL)
+ *   out_h, out_w: target output size after upsample (if 0, use scale_factor=2 on lH)
+ */
+static void gpu_refinenet(cuda_da3_runner *r, int stage,
+                            CUdeviceptr lateral, int lH, int lW,
                             CUdeviceptr deeper, int dH, int dW, int features,
-                            CUdeviceptr result_buf) {
-    int sz = features * fH * fW;
+                            CUdeviceptr result_buf,
+                            int out_h, int out_w) {
+    int sz = features * lH * lW;
     dpt_gpu_weights *dw = &r->dpt_w;
 
-    /* If deeper exists: bilinear upsample BEFORE overwriting result_buf,
-     * since deeper and result_buf may be the same buffer (d_dpt_fused). */
-    if (deeper) {
-        /* Bilinear upsample deeper to feat's spatial size -> d_dpt_cat */
-        kl_bilinear(r, r->d_dpt_cat, deeper, features, dH, dW, fH, fW);
-    }
+    if (out_h == 0) { out_h = lH * 2; out_w = lW * 2; }
 
-    /* result_buf = copy of feat (safe now, deeper already consumed above) */
-    cuMemcpyDtoDAsync(result_buf, feat, (size_t)sz * sizeof(float), r->stream);
-
-    /* If deeper exists: optional RCU1 on upsampled + add to result */
     if (deeper) {
+        /* Top branch = deeper. Upsample to lateral's spatial size if needed. */
+        if (dH != lH || dW != lW) {
+            kl_bilinear(r, r->d_dpt_cat, deeper, features, dH, dW, lH, lW);
+            cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
+        } else {
+            cuMemcpyDtoDAsync(result_buf, deeper, (size_t)sz * sizeof(float), r->stream);
+        }
+        /* Add lateral through RCU1 (official: y = y + resConfUnit1(lateral)) */
         if (dw->has_rcu1[stage]) {
-            /* RCU1 on upsampled deeper -> d_dpt_ln (uses d_dpt_tmp/tmp2 internally) */
-            kl_rcu(r, r->d_dpt_ln, r->d_dpt_cat,
+            kl_rcu(r, r->d_dpt_ln, lateral,
                    dw->fuse_rcu1_c1_w[stage], dw->fuse_rcu1_c1_b[stage],
                    dw->fuse_rcu1_c2_w[stage], dw->fuse_rcu1_c2_b[stage],
-                   features, fH, fW);
+                   features, lH, lW);
             kl_add_inplace(r, result_buf, r->d_dpt_ln, sz);
         } else {
-            kl_add_inplace(r, result_buf, r->d_dpt_cat, sz);
+            kl_add_inplace(r, result_buf, lateral, sz);
         }
+    } else {
+        /* Deepest level: no deeper input, just use lateral */
+        cuMemcpyDtoDAsync(result_buf, lateral, (size_t)sz * sizeof(float), r->stream);
     }
 
-    /* RCU2 (if weights exist) */
+    /* RCU2 */
     if (dw->has_rcu2[stage]) {
         kl_rcu(r, r->d_dpt_cat, result_buf,
                dw->fuse_rcu2_c1_w[stage], dw->fuse_rcu2_c1_b[stage],
                dw->fuse_rcu2_c2_w[stage], dw->fuse_rcu2_c2_b[stage],
-               features, fH, fW);
+               features, lH, lW);
         cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
     }
 
-    /* out_conv: 1x1 convolution via MMA */
+    /* Upsample BEFORE out_conv (matching official FeatureFusionBlock) */
+    if (out_h != lH || out_w != lW) {
+        kl_bilinear(r, r->d_dpt_cat, result_buf, features, lH, lW, out_h, out_w);
+        cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat,
+                           (size_t)features * out_h * out_w * sizeof(float), r->stream);
+    }
+
+    /* out_conv: 1x1 convolution at output resolution */
+    int osz = features * out_h * out_w;
     kl_conv_gemm(r, r->d_dpt_cat, result_buf,
                   dw->fuse_out_w[stage], dw->fuse_out_b[stage],
-                  fH, fW, features, features, 1, 1, 1, 0);
-    cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
+                  out_h, out_w, features, features, 1, 1, 1, 0);
+    cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)osz * sizeof(float), r->stream);
 }
 
 /* Generalized RefineNet fusion that takes explicit weight pointers.
- * Used for both main DPT and aux branch. */
+ * Used for both main DPT and aux branch.
+ * out_h/out_w: target output size for upsample BEFORE fuse_out conv.
+ *   0,0 = no upsample (stay at lateral size). */
 static void gpu_refinenet_w(cuda_da3_runner *r,
                               CUdeviceptr feat, int fH, int fW,
                               CUdeviceptr deeper, int dH, int dW, int features,
@@ -2685,47 +3257,71 @@ static void gpu_refinenet_w(cuda_da3_runner *r,
                               CUdeviceptr rcu1_c2_w, CUdeviceptr rcu1_c2_b,
                               CUdeviceptr rcu2_c1_w, CUdeviceptr rcu2_c1_b,
                               CUdeviceptr rcu2_c2_w, CUdeviceptr rcu2_c2_b,
-                              int has_rcu1, int has_rcu2) {
+                              int has_rcu1, int has_rcu2,
+                              int out_h, int out_w) {
     int sz = features * fH * fW;
-    if (deeper) kl_bilinear(r, r->d_dpt_cat, deeper, features, dH, dW, fH, fW);
-    cuMemcpyDtoDAsync(result_buf, feat, (size_t)sz * sizeof(float), r->stream);
     if (deeper) {
+        /* Top branch = deeper. Upsample to lateral's spatial size if needed. */
+        if (dH != fH || dW != fW) {
+            kl_bilinear(r, r->d_dpt_cat, deeper, features, dH, dW, fH, fW);
+            cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
+        } else {
+            cuMemcpyDtoDAsync(result_buf, deeper, (size_t)sz * sizeof(float), r->stream);
+        }
+        /* Add lateral through RCU1 (official: y = y + resConfUnit1(lateral)) */
         if (has_rcu1) {
-            kl_rcu(r, r->d_dpt_ln, r->d_dpt_cat,
+            kl_rcu(r, r->d_dpt_ln, feat,
                    rcu1_c1_w, rcu1_c1_b, rcu1_c2_w, rcu1_c2_b, features, fH, fW);
             kl_add_inplace(r, result_buf, r->d_dpt_ln, sz);
         } else {
-            kl_add_inplace(r, result_buf, r->d_dpt_cat, sz);
+            kl_add_inplace(r, result_buf, feat, sz);
         }
+    } else {
+        /* Deepest level: no deeper input, just use lateral */
+        cuMemcpyDtoDAsync(result_buf, feat, (size_t)sz * sizeof(float), r->stream);
     }
     if (has_rcu2) {
         kl_rcu(r, r->d_dpt_cat, result_buf,
                rcu2_c1_w, rcu2_c1_b, rcu2_c2_w, rcu2_c2_b, features, fH, fW);
         cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
     }
+    /* Upsample BEFORE out_conv if target size differs from lateral size */
+    int conv_h = fH, conv_w = fW;
+    if (out_h > 0 && (out_h != fH || out_w != fW)) {
+        kl_bilinear(r, r->d_dpt_cat, result_buf, features, fH, fW, out_h, out_w);
+        cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat,
+                           (size_t)features * out_h * out_w * sizeof(float), r->stream);
+        conv_h = out_h;
+        conv_w = out_w;
+    }
+    int osz = features * conv_h * conv_w;
     kl_conv_gemm(r, r->d_dpt_cat, result_buf,
-                  fuse_out_w, fuse_out_b, fH, fW, features, features, 1, 1, 1, 0);
-    cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), r->stream);
+                  fuse_out_w, fuse_out_b, conv_h, conv_w, features, features, 1, 1, 1, 0);
+    cuMemcpyDtoDAsync(result_buf, r->d_dpt_cat, (size_t)osz * sizeof(float), r->stream);
 }
 
-/* CameraDec: backbone_norm(CLS) → MLP → 3 linear heads → pose[9] (CPU) */
+/* CameraDec: raw cam_token → ReLU MLP → 3 linear heads → pose[9] (CPU) */
 static void run_camera_dec(cuda_da3_runner *r, float *pose_out) {
     int dim = r->dim;
+    int dim_in = dim * 2;  /* 768: [local_hidden_CLS, hidden_CLS] */
     int mlp_dim = r->cam_dec.mlp_dim;
 
-    /* 1. LayerNorm on CLS token (token 0 of d_hidden) → d_ln_buf[0] */
-    kl_layernorm(r, r->d_ln_buf, r->d_hidden,
-                  r->cam_dec.backbone_norm_w, r->cam_dec.backbone_norm_b, 1, dim);
+    /* 1. Build 768-dim CLS input from features[3]: [local_x_CLS, x_CLS].
+     * Official: cam_dec(feats[-1][1]) = raw camera_token, no backbone_norm. */
+    cuMemcpyDtoDAsync(r->d_ln_buf, r->d_features_local[3],
+                       (size_t)dim * sizeof(float), r->stream);
+    cuMemcpyDtoDAsync(r->d_ln_buf + dim * sizeof(float), r->d_features[3],
+                       (size_t)dim * sizeof(float), r->stream);
 
-    /* 2. MLP layer 1: GEMM [mlp_dim, dim] × CLS[1, dim] + bias → d_attn_out[1, mlp_dim] */
+    /* 2. MLP layer 0: GEMM [mlp_dim, 768] × CLS[1, 768] + bias → ReLU */
     kl_gemm(r, r->d_attn_out, r->cam_dec.mlp_w[0], r->d_ln_buf,
-             r->cam_dec.mlp_b[0], mlp_dim, dim, 1);
-    kl_gelu(r, r->d_attn_out, mlp_dim);
+             r->cam_dec.mlp_b[0], mlp_dim, dim_in, 1);
+    kl_relu_inplace(r, r->d_attn_out, mlp_dim);
 
-    /* 3. MLP layer 2: GEMM [mlp_dim, mlp_dim] × hidden[1, mlp_dim] → d_proj_out[1, mlp_dim] */
+    /* 3. MLP layer 2: GEMM [mlp_dim, mlp_dim] × [1, mlp_dim] + bias → ReLU */
     kl_gemm(r, r->d_proj_out, r->cam_dec.mlp_w[1], r->d_attn_out,
              r->cam_dec.mlp_b[1], mlp_dim, mlp_dim, 1);
-    kl_gelu(r, r->d_proj_out, mlp_dim);
+    kl_relu_inplace(r, r->d_proj_out, mlp_dim);
 
     /* 4. Download MLP output to CPU for tiny matmuls */
     float *h_mlp = (float *)malloc((size_t)mlp_dim * sizeof(float));
@@ -2760,7 +3356,7 @@ static void run_camera_dec(cuda_da3_runner *r, float *pose_out) {
     for (int o = 0; o < 2; o++) {
         float s = h_fc_f_b[o];
         for (int k = 0; k < mlp_dim; k++) s += h_fc_f_w[o * mlp_dim + k] * h_mlp[k];
-        pose_out[7 + o] = s;
+        pose_out[7 + o] = s > 0 ? s : 0.0f;  /* ReLU on FOV output */
     }
 
     free(h_mlp);
@@ -2778,7 +3374,7 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
     /* Bottom-up aux RefineNet fusion (same structure as main but with aux weights) */
     CUdeviceptr aux_fused = r->d_dpt_fused; /* reuse after main DPT completes */
 
-    /* Level 3 (deepest) */
+    /* Level 3 (deepest) — upsample to level 2 spatial size */
     gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
                      0, 0, 0, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[3], r->dpt_aux.fuse_out_b[3],
@@ -2786,10 +3382,11 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[3], r->dpt_aux.fuse_rcu1_c2_b[3],
                      r->dpt_aux.fuse_rcu2_c1_w[3], r->dpt_aux.fuse_rcu2_c1_b[3],
                      r->dpt_aux.fuse_rcu2_c2_w[3], r->dpt_aux.fuse_rcu2_c2_b[3],
-                     r->dpt_aux.has_rcu1[3], r->dpt_aux.has_rcu2[3]);
-    int fh = sp_h[3], fw = sp_w[3];
+                     r->dpt_aux.has_rcu1[3], r->dpt_aux.has_rcu2[3],
+                     sp_h[2], sp_w[2]);
+    int fh = sp_h[2], fw = sp_w[2];
 
-    /* Level 2 */
+    /* Level 2 — upsample to level 1 spatial size */
     gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
                      aux_fused, fh, fw, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[2], r->dpt_aux.fuse_out_b[2],
@@ -2797,10 +3394,11 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[2], r->dpt_aux.fuse_rcu1_c2_b[2],
                      r->dpt_aux.fuse_rcu2_c1_w[2], r->dpt_aux.fuse_rcu2_c1_b[2],
                      r->dpt_aux.fuse_rcu2_c2_w[2], r->dpt_aux.fuse_rcu2_c2_b[2],
-                     r->dpt_aux.has_rcu1[2], r->dpt_aux.has_rcu2[2]);
-    fh = sp_h[2]; fw = sp_w[2];
+                     r->dpt_aux.has_rcu1[2], r->dpt_aux.has_rcu2[2],
+                     sp_h[1], sp_w[1]);
+    fh = sp_h[1]; fw = sp_w[1];
 
-    /* Level 1 */
+    /* Level 1 — upsample to level 0 spatial size */
     gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
                      aux_fused, fh, fw, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[1], r->dpt_aux.fuse_out_b[1],
@@ -2808,10 +3406,11 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[1], r->dpt_aux.fuse_rcu1_c2_b[1],
                      r->dpt_aux.fuse_rcu2_c1_w[1], r->dpt_aux.fuse_rcu2_c1_b[1],
                      r->dpt_aux.fuse_rcu2_c2_w[1], r->dpt_aux.fuse_rcu2_c2_b[1],
-                     r->dpt_aux.has_rcu1[1], r->dpt_aux.has_rcu2[1]);
-    fh = sp_h[1]; fw = sp_w[1];
+                     r->dpt_aux.has_rcu1[1], r->dpt_aux.has_rcu2[1],
+                     sp_h[0], sp_w[0]);
+    fh = sp_h[0]; fw = sp_w[0];
 
-    /* Level 0 */
+    /* Level 0 — upsample 2x (148→296) matching official scale_factor=2 */
     gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
                      aux_fused, fh, fw, feat, aux_fused,
                      r->dpt_aux.fuse_out_w[0], r->dpt_aux.fuse_out_b[0],
@@ -2819,16 +3418,8 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[0], r->dpt_aux.fuse_rcu1_c2_b[0],
                      r->dpt_aux.fuse_rcu2_c1_w[0], r->dpt_aux.fuse_rcu2_c1_b[0],
                      r->dpt_aux.fuse_rcu2_c2_w[0], r->dpt_aux.fuse_rcu2_c2_b[0],
-                     r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0]);
-
-    /* Debug: check aux_fused values after refinenet */
-    if (r->verbose >= 2) {
-        cuStreamSynchronize(r->stream);
-        float dbg[8];
-        cuMemcpyDtoH(dbg, aux_fused, sizeof(dbg));
-        fprintf(stderr, "  aux_fused[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
-    }
+                     r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0],
+                     sp_h[0] * 2, sp_w[0] * 2);
 
     /* Only the LAST level (index 3, finest resolution) is used for output.
      * Python: fused_aux_pyr[-1] → output_conv2_aux[-1] → final output.
@@ -2836,7 +3427,7 @@ static void run_aux_dpt(cuda_da3_runner *r, int *sp_h, int *sp_w, int features,
      * output_conv2_aux[3]: Conv2d(128,32,3) → LayerNorm(32) → ReLU → Conv2d(32,7,1) */
     {
         int lv = 3;  /* last level = finest */
-        int oh = sp_h[0], ow = sp_w[0];
+        int oh = sp_h[0] * 2, ow = sp_w[0] * 2;  /* fused resolution (296×296) */
 
         /* output_conv1_aux[3]: 5 Conv2d chain (NO activations) */
         CUdeviceptr cur = r->d_aux_scratch;
@@ -3009,6 +3600,58 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     if (r->verbose >= 1)
         fprintf(stderr, "cuda_da3: GPU preprocess+embed: %.1f ms\n", (t1-t0)*1000);
 
+    /* Debug: dump hidden after embed */
+    if (r->verbose >= 2) {
+        cuStreamSynchronize(r->stream);
+        /* Dump just patches (skip CLS at token 0) for comparison with official patch_embed */
+        float *_pe = (float *)malloc((size_t)np * dim * sizeof(float));
+        cuMemcpyDtoH(_pe, r->d_hidden + (size_t)dim * sizeof(float), (size_t)np * dim * sizeof(float));
+        float _pmin = _pe[0], _pmax = _pe[0], _psum = 0;
+        for (int _j = 0; _j < np * dim; _j++) {
+            if (_pe[_j] < _pmin) _pmin = _pe[_j];
+            if (_pe[_j] > _pmax) _pmax = _pe[_j];
+            _psum += _pe[_j];
+        }
+        fprintf(stderr, "  Patches after embed (no CLS/pos): range=[%.4f, %.4f], mean=%.6f\n",
+                _pmin, _pmax, _psum / (np * dim));
+        /* Dump full hidden (CLS + patches + pos_embed) */
+        float *_fh = (float *)malloc((size_t)nt * dim * sizeof(float));
+        cuMemcpyDtoH(_fh, r->d_hidden, (size_t)nt * dim * sizeof(float));
+        float _fmin = _fh[0], _fmax = _fh[0], _fsum = 0;
+        for (int _j = 0; _j < nt * dim; _j++) {
+            if (_fh[_j] < _fmin) _fmin = _fh[_j];
+            if (_fh[_j] > _fmax) _fmax = _fh[_j];
+            _fsum += _fh[_j];
+        }
+        fprintf(stderr, "  Hidden after CLS+pos: range=[%.4f, %.4f], mean=%.6f\n",
+                _fmin, _fmax, _fsum / (nt * dim));
+        /* Save as .npy */
+        {
+            char _np[256]; snprintf(_np, sizeof(_np), "results/our_hidden_after_embed.npy");
+            FILE *_fp = fopen(_np, "wb");
+            if (_fp) {
+                const char _magic[] = "\x93NUMPY";
+                unsigned char _ver[] = {1, 0};
+                char _dict[128];
+                int _dl = snprintf(_dict, sizeof(_dict),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", nt, dim);
+                int _pad = 64 - ((6+2+2+_dl) % 64);
+                if (_pad == 0) _pad = 64;
+                memset(_dict + _dl, ' ', _pad - 1);
+                _dict[_dl + _pad - 1] = '\n';
+                unsigned short _tl = (unsigned short)(_dl + _pad);
+                fwrite(_magic, 1, 6, _fp);
+                fwrite(_ver, 1, 2, _fp);
+                fwrite(&_tl, 2, 1, _fp);
+                fwrite(_dict, 1, _tl, _fp);
+                fwrite(_fh, sizeof(float), nt * dim, _fp);
+                fclose(_fp);
+            }
+        }
+        free(_pe);
+        free(_fh);
+    }
+
     /* ─── GPU: 12 Transformer Blocks ─── */
     clock_gettime(CLOCK_MONOTONIC, &ts);
     t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -3029,6 +3672,24 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     for (int L = 0; L < r->n_blocks; L++) {
         cuda_da3_layer *ly = &r->layers[L];
 
+        /* Save local_x (pre-block hidden state) for feature layers.
+         * Official DA3: features = [local_x, backbone_norm(x)] where local_x is
+         * the hidden state BEFORE the feature block (output of previous local block). */
+        for (int fi = 0; fi < 4; fi++) {
+            if (L == r->feature_layers[fi]) {
+                cuMemcpyDtoDAsync(r->d_features_local[fi], r->d_hidden,
+                                   (size_t)nt * dim * sizeof(float), r->stream);
+            }
+        }
+
+        /* 0. Camera token injection: replace CLS (token 0) at alt_start.
+         * Official DA3 uses camera_token[:, :1] (ref view) for single-view inference.
+         * camera_token weight shape is [2, dim]; first row is the ref view token. */
+        if (L == r->rope_start && r->d_camera_token) {
+            cuMemcpyDtoDAsync(r->d_hidden, r->d_camera_token,
+                               (size_t)dim * sizeof(float), r->stream);
+        }
+
         /* 1. LayerNorm 1 */
         PROF_START();
         kl_layernorm(r, r->d_ln_buf, r->d_hidden, ly->ln1_w, ly->ln1_b, nt, dim);
@@ -3042,6 +3703,39 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
 
         /* 3. QK Normalization (stride=3*dim for interleaved QKV) */
         if (L >= r->qk_norm_start && ly->has_qk_norm) {
+            /* Debug: dump QKV raw at block 4 before QK norm */
+            if (L == 4 && r->verbose >= 2) {
+                cuStreamSynchronize(r->stream);
+                float *_qkv = (float *)malloc((size_t)nt * 3 * dim * sizeof(float));
+                cuMemcpyDtoH(_qkv, r->d_qkv, (size_t)nt * 3 * dim * sizeof(float));
+                /* Q raw: check first token's first 8 values */
+                fprintf(stderr, "  B4 QKV raw Q[0][0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        _qkv[0], _qkv[1], _qkv[2], _qkv[3], _qkv[4], _qkv[5], _qkv[6], _qkv[7]);
+                /* Save Q raw as npy - extract Q from interleaved [nt, Q|K|V] */
+                {
+                    float *qraw = (float *)malloc((size_t)nt * dim * sizeof(float));
+                    for (int t = 0; t < nt; t++)
+                        memcpy(qraw + t * dim, _qkv + t * 3 * dim, dim * sizeof(float));
+                    char _np[256]; snprintf(_np, sizeof(_np), "results/our_b4_q_raw.npy");
+                    FILE *_fp = fopen(_np, "wb");
+                    if (_fp) {
+                        const char _magic[] = "\x93NUMPY";
+                        unsigned char _ver[] = {1, 0};
+                        char _dict[128];
+                        int _dl = snprintf(_dict, sizeof(_dict),
+                            "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", nt, dim);
+                        int _pad = 64 - ((6+2+2+_dl) % 64); if (_pad == 0) _pad = 64;
+                        memset(_dict + _dl, ' ', _pad - 1); _dict[_dl + _pad - 1] = '\n';
+                        unsigned short _tl = (unsigned short)(_dl + _pad);
+                        fwrite(_magic, 1, 6, _fp); fwrite(_ver, 1, 2, _fp);
+                        fwrite(&_tl, 2, 1, _fp); fwrite(_dict, 1, _tl, _fp);
+                        fwrite(qraw, sizeof(float), nt * dim, _fp); fclose(_fp);
+                    }
+                    free(qraw);
+                }
+                free(_qkv);
+            }
+
             PROF_START();
             /* Q starts at offset 0 */
             kl_qk_layernorm(r, r->d_qkv, ly->attn_q_norm_w, ly->attn_q_norm_b,
@@ -3051,19 +3745,87 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
             kl_qk_layernorm(r, k_base, ly->attn_k_norm_w, ly->attn_k_norm_b,
                              nt, r->n_heads, r->head_dim, stride_3dim);
             PROF_END(prof_qknorm);
+
+            /* Debug: dump Q normed at block 4 */
+            if (L == 4 && r->verbose >= 2) {
+                cuStreamSynchronize(r->stream);
+                float *_qkv = (float *)malloc((size_t)nt * 3 * dim * sizeof(float));
+                cuMemcpyDtoH(_qkv, r->d_qkv, (size_t)nt * 3 * dim * sizeof(float));
+                fprintf(stderr, "  B4 Q normed[0][0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        _qkv[0], _qkv[1], _qkv[2], _qkv[3], _qkv[4], _qkv[5], _qkv[6], _qkv[7]);
+                /* Save Q normed - extract from interleaved */
+                {
+                    float *qn = (float *)malloc((size_t)nt * dim * sizeof(float));
+                    for (int t = 0; t < nt; t++)
+                        memcpy(qn + t * dim, _qkv + t * 3 * dim, dim * sizeof(float));
+                    char _np[256]; snprintf(_np, sizeof(_np), "results/our_b4_q_normed.npy");
+                    FILE *_fp = fopen(_np, "wb");
+                    if (_fp) {
+                        const char _magic[] = "\x93NUMPY";
+                        unsigned char _ver[] = {1, 0};
+                        char _dict[128];
+                        int _dl = snprintf(_dict, sizeof(_dict),
+                            "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", nt, dim);
+                        int _pad = 64 - ((6+2+2+_dl) % 64); if (_pad == 0) _pad = 64;
+                        memset(_dict + _dl, ' ', _pad - 1); _dict[_dl + _pad - 1] = '\n';
+                        unsigned short _tl = (unsigned short)(_dl + _pad);
+                        fwrite(_magic, 1, 6, _fp); fwrite(_ver, 1, 2, _fp);
+                        fwrite(&_tl, 2, 1, _fp); fwrite(_dict, 1, _tl, _fp);
+                        fwrite(qn, sizeof(float), nt * dim, _fp); fclose(_fp);
+                    }
+                    free(qn);
+                }
+                free(_qkv);
+            }
         }
 
-        /* 4. RoPE 2D (CLS at pos (0,0) -> identity rotation, safe to apply) */
+        /* 4. RoPE 2D
+         * Local blocks (even >= alt_start, or < alt_start): use real positions
+         * Global blocks (odd >= alt_start): use pos_nodiff (all patches at (1,1))
+         * This matches official DA3 vision_transformer.py process_attention. */
         if (L >= r->rope_start) {
             PROF_START();
+            int is_global = (L >= r->rope_start && (L % 2) == 1);
+            CUdeviceptr use_py = is_global ? r->d_pos_y_nd : r->d_pos_y;
+            CUdeviceptr use_px = is_global ? r->d_pos_x_nd : r->d_pos_x;
             /* Q: RoPE on all tokens */
-            kl_rope_2d(r, r->d_qkv, r->d_pos_y, r->d_pos_x,
+            kl_rope_2d(r, r->d_qkv, use_py, use_px,
                         nt, r->n_heads, r->head_dim, stride_3dim);
             /* K: starts at offset dim */
             CUdeviceptr k_base = r->d_qkv + (size_t)dim * sizeof(float);
-            kl_rope_2d(r, k_base, r->d_pos_y, r->d_pos_x,
+            kl_rope_2d(r, k_base, use_py, use_px,
                         nt, r->n_heads, r->head_dim, stride_3dim);
             PROF_END(prof_rope);
+        }
+
+        /* Debug: dump Q after RoPE at block 4 */
+        if (L == 4 && r->verbose >= 2) {
+            cuStreamSynchronize(r->stream);
+            float *_qkv = (float *)malloc((size_t)nt * 3 * dim * sizeof(float));
+            cuMemcpyDtoH(_qkv, r->d_qkv, (size_t)nt * 3 * dim * sizeof(float));
+            /* Save Q after RoPE */
+            {
+                float *qr = (float *)malloc((size_t)nt * dim * sizeof(float));
+                for (int t = 0; t < nt; t++)
+                    memcpy(qr + t * dim, _qkv + t * 3 * dim, dim * sizeof(float));
+                char _np[256]; snprintf(_np, sizeof(_np), "results/our_b4_q_roped.npy");
+                FILE *_fp = fopen(_np, "wb");
+                if (_fp) {
+                    const char _magic[] = "\x93NUMPY";
+                    unsigned char _ver[] = {1, 0};
+                    char _dict[128];
+                    int _dl = snprintf(_dict, sizeof(_dict),
+                        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", nt, dim);
+                    int _pad = 64 - ((6+2+2+_dl) % 64); if (_pad == 0) _pad = 64;
+                    memset(_dict + _dl, ' ', _pad - 1); _dict[_dl + _pad - 1] = '\n';
+                    unsigned short _tl = (unsigned short)(_dl + _pad);
+                    fwrite(_magic, 1, 6, _fp); fwrite(_ver, 1, 2, _fp);
+                    fwrite(&_tl, 2, 1, _fp); fwrite(_dict, 1, _tl, _fp);
+                    fwrite(qr, sizeof(float), nt * dim, _fp); fclose(_fp);
+                }
+                free(qr);
+            }
+            free(_qkv);
         }
 
         /* 5a. Transpose K,V to contiguous per-head layout (reuse d_ffn_buf) */
@@ -3084,6 +3846,29 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         kl_backbone_gemm(r, r->d_proj_out, ly->attn_out_w, r->d_attn_out, ly->attn_out_b,
                  ly->out_rows, ly->out_cols, nt);
         PROF_END(prof_gemm);
+
+        /* Debug: dump attn proj output at block 4 */
+        if (L == 4 && r->verbose >= 2) {
+            cuStreamSynchronize(r->stream);
+            float *_po = (float *)malloc((size_t)nt * dim * sizeof(float));
+            cuMemcpyDtoH(_po, r->d_proj_out, (size_t)nt * dim * sizeof(float));
+            char _np[256]; snprintf(_np, sizeof(_np), "results/our_b4_attn_proj_out.npy");
+            FILE *_fp = fopen(_np, "wb");
+            if (_fp) {
+                const char _magic[] = "\x93NUMPY";
+                unsigned char _ver[] = {1, 0};
+                char _dict[128];
+                int _dl = snprintf(_dict, sizeof(_dict),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", nt, dim);
+                int _pad = 64 - ((6+2+2+_dl) % 64); if (_pad == 0) _pad = 64;
+                memset(_dict + _dl, ' ', _pad - 1); _dict[_dl + _pad - 1] = '\n';
+                unsigned short _tl = (unsigned short)(_dl + _pad);
+                fwrite(_magic, 1, 6, _fp); fwrite(_ver, 1, 2, _fp);
+                fwrite(&_tl, 2, 1, _fp); fwrite(_dict, 1, _tl, _fp);
+                fwrite(_po, sizeof(float), nt * dim, _fp); fclose(_fp);
+            }
+            free(_po);
+        }
 
         /* 7. LayerScale 1 + residual */
         PROF_START();
@@ -3142,6 +3927,44 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         }
         PROF_END(prof_feat);
 
+        /* Debug: dump per-block hidden state */
+        if (r->verbose >= 2) {
+            cuStreamSynchronize(r->stream);
+            float *_hb = (float *)malloc((size_t)nt * dim * sizeof(float));
+            cuMemcpyDtoH(_hb, r->d_hidden, (size_t)nt * dim * sizeof(float));
+            float _mn = _hb[0], _mx = _hb[0], _sm = 0;
+            for (int _j = 0; _j < nt * dim; _j++) {
+                if (_hb[_j] < _mn) _mn = _hb[_j];
+                if (_hb[_j] > _mx) _mx = _hb[_j];
+                _sm += _hb[_j];
+            }
+            fprintf(stderr, "  Block %2d: range=[%.6f, %.6f], mean=%.6f\n",
+                    L, _mn, _mx, _sm / (nt * dim));
+            /* Save as .npy */
+            char _np[256];
+            snprintf(_np, sizeof(_np), "results/our_hidden_block_%d.npy", L);
+            FILE *_fp = fopen(_np, "wb");
+            if (_fp) {
+                const char _magic[] = "\x93NUMPY";
+                unsigned char _ver[] = {1, 0};
+                char _dict[128];
+                int _dl = snprintf(_dict, sizeof(_dict),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", nt, dim);
+                int _pad = 64 - ((6+2+2+_dl) % 64);
+                if (_pad == 0) _pad = 64;
+                memset(_dict + _dl, ' ', _pad - 1);
+                _dict[_dl + _pad - 1] = '\n';
+                unsigned short _tl = (unsigned short)(_dl + _pad);
+                fwrite(_magic, 1, 6, _fp);
+                fwrite(_ver, 1, 2, _fp);
+                fwrite(&_tl, 2, 1, _fp);
+                fwrite(_dict, 1, _tl, _fp);
+                fwrite(_hb, sizeof(float), nt * dim, _fp);
+                fclose(_fp);
+            }
+            free(_hb);
+        }
+
     }
 
 #undef PROF_START
@@ -3192,6 +4015,56 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                 _hbuf[_dim], _hbuf[_dim+1], _hbuf[_dim+2], _hbuf[_dim+3],
                 _hbuf[_dim+4], _hbuf[_dim+5], _hbuf[_dim+6], _hbuf[_dim+7]);
         free(_hbuf);
+    }
+
+    /* Debug: dump backbone features as .npy for comparison with official */
+    if (r->verbose >= 2) {
+        int np = r->n_patches;
+        float *fbuf = (float *)malloc((size_t)np * dim * 2 * sizeof(float));
+        for (int fi = 0; fi < 4; fi++) {
+            /* Build concatenated features: [local_x_patches, norm(x_patches)] */
+            /* First, run patch_norm_concat into d_dpt_cat */
+            kl_patch_norm_concat(r, r->d_dpt_cat,
+                                  r->d_features_local[fi], r->d_features[fi],
+                                  r->cam_dec.backbone_norm_w, r->cam_dec.backbone_norm_b, np, dim);
+            cuStreamSynchronize(r->stream);
+            cuMemcpyDtoH(fbuf, r->d_dpt_cat, (size_t)np * dim * 2 * sizeof(float));
+            float fmin = fbuf[0], fmax = fbuf[0], fsum = 0;
+            for (int j = 0; j < np * dim * 2; j++) {
+                if (fbuf[j] < fmin) fmin = fbuf[j];
+                if (fbuf[j] > fmax) fmax = fbuf[j];
+                fsum += fbuf[j];
+            }
+            fprintf(stderr, "  Our feat %d: shape=(%d, %d), range=[%.4f, %.4f], mean=%.6f\n",
+                    fi, np, dim * 2, fmin, fmax, fsum / (np * dim * 2));
+
+            /* Write .npy */
+            char npy_path[256];
+            snprintf(npy_path, sizeof(npy_path), "results/our_feat_%d.npy", fi);
+            FILE *fp = fopen(npy_path, "wb");
+            if (fp) {
+                /* NumPy v1.0 .npy header */
+                const char magic[] = "\x93NUMPY";
+                unsigned char ver[] = {1, 0};
+                char dict[128];
+                int dlen = snprintf(dict, sizeof(dict),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", np, dim * 2);
+                /* Pad to multiple of 64 */
+                int hdr_len = 6 + 2 + 2 + dlen;
+                int pad = 64 - (hdr_len % 64);
+                if (pad == 0) pad = 64;
+                memset(dict + dlen, ' ', pad - 1);
+                dict[dlen + pad - 1] = '\n';
+                unsigned short total = (unsigned short)(dlen + pad);
+                fwrite(magic, 1, 6, fp);
+                fwrite(ver, 1, 2, fp);
+                fwrite(&total, 2, 1, fp);
+                fwrite(dict, 1, total, fp);
+                fwrite(fbuf, sizeof(float), np * dim * 2, fp);
+                fclose(fp);
+            }
+        }
+        free(fbuf);
     }
 
     /* ─── CameraDec (Phase 1): pose estimation ─── */
@@ -3249,8 +4122,10 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     for (int fi = 0; fi < 4; fi++) {
         int oc_val = r->head_out_channels[fi];
 
-        /* 1. Extract patch tokens + concatenate CLS -> d_dpt_cat [np, 2*dim] */
-        kl_cls_concat(r, r->d_dpt_cat, r->d_features[fi], np, dim);
+        /* 1. Extract patches + concat [local_x_raw, backbone_norm(x)] -> d_dpt_cat [np, 2*dim] */
+        kl_patch_norm_concat(r, r->d_dpt_cat,
+                              r->d_features_local[fi], r->d_features[fi],
+                              r->cam_dec.backbone_norm_w, r->cam_dec.backbone_norm_b, np, dim);
 
         /* 2. Head LayerNorm -> d_dpt_ln [np, 2*dim] */
         if (dw->norm_w) {
@@ -3264,6 +4139,17 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* 3. 1x1 projection (GEMM F16) -> d_dpt_proj [np, oc_val] */
         kl_gemm(r, r->d_dpt_proj, dw->proj_w[fi], r->d_dpt_ln, dw->proj_b[fi],
                  oc_val, head_dim_in, np);
+
+        /* 3b. DPT pos_embed (sinusoidal UV, ratio=0.1) in token-major layout */
+        {
+            float aspect = (float)r->image_size / (float)r->image_size; /* 1.0 for square */
+            float ratio = 0.1f;
+            int total = np * oc_val;
+            int grid = (total + 255) / 256;
+            void *args[] = {&r->d_dpt_proj, &np, &oc_val, &gh, &gw, &aspect, &ratio};
+            cuLaunchKernel(r->fn_dpt_pos_embed_tok, (unsigned)grid, 1, 1, 256, 1, 1,
+                           0, r->stream, args, NULL);
+        }
 
         /* 4-5. Spatial alignment + reshape */
         if (fi == 0) {
@@ -3300,55 +4186,83 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
     }
     DPT_PROF_END(dpt_tok);
 
-    /* Bottom-up RefineNet fusion (on GPU) */
+    /* Bottom-up RefineNet fusion (on GPU)
+     * Official: refinenet4→3→2→1, each upsamples its output to next level.
+     * Level 3 upsamples to level 2 adapter size, etc.
+     * Level 0 (final) uses scale_factor=2 (148→296). */
     DPT_PROF_START();
-    /* Level 3 (deepest, no deeper input) */
+    /* Level 3 (deepest, no deeper input) → upsample to level 2 adapter size */
     gpu_refinenet(r, 3, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
-                  0, 0, 0, feat, r->d_dpt_fused);
-    int fh = sp_h[3], fw = sp_w[3];
+                  0, 0, 0, feat, r->d_dpt_fused,
+                  sp_h[2], sp_w[2]);
+    int fh = sp_h[2], fw = sp_w[2];
 
-    /* Level 2 */
+    /* Level 2 → upsample to level 1 adapter size */
     gpu_refinenet(r, 2, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
-                  r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused);
-    fh = sp_h[2]; fw = sp_w[2];
-
-    /* Level 1 */
-    gpu_refinenet(r, 1, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
-                  r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused);
+                  r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
+                  sp_h[1], sp_w[1]);
     fh = sp_h[1]; fw = sp_w[1];
 
-    /* Level 0 */
-    gpu_refinenet(r, 0, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
-                  r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused);
+    /* Level 1 → upsample to level 0 adapter size */
+    gpu_refinenet(r, 1, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
+                  r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
+                  sp_h[0], sp_w[0]);
     fh = sp_h[0]; fw = sp_w[0];
+
+    /* Level 0 → scale_factor=2 (0 means use 2x) */
+    gpu_refinenet(r, 0, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
+                  r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
+                  0, 0);
+    fh = sp_h[0] * 2; fw = sp_w[0] * 2;  /* 296×296 */
     DPT_PROF_END(dpt_refine);
 
-    /* Output convolutions (on GPU) */
+    /* Output convolutions — matching official DA3 DualDPT._forward_impl:
+     * 1. output_conv1 (neck): Conv2d(64→32, 3x3) — NO ReLU (applied in _fuse)
+     * 2. Bilinear upsample from patch-grid res (148) to model res (518)
+     * 3. Sinusoidal UV pos_embed (ratio=0.1)
+     * 4. output_conv2: Conv2d(32→32, 3x3) + ReLU + Conv2d(32→2, 1x1)
+     * 5. depth_activation: exp(depth), exp(conf)+1
+     */
     DPT_PROF_START();
     int feat_half = feat / 2;
     if (feat_half < 1) feat_half = 1;
     int out_mid = dw->out_mid > 0 ? dw->out_mid : feat_half; /* typically 32 */
+    int full_h = r->image_size, full_w = r->image_size;
 
-    /* neck: Conv2d(feat, feat/2, 3, pad=1) + ReLU via MMA */
+    /* Step 1: neck (output_conv1): Conv2d(feat, feat/2, 3, pad=1) — NO ReLU */
     kl_conv_gemm(r, r->d_dpt_tmp, r->d_dpt_fused,
                   dw->neck_w, dw->neck_b,
                   fh, fw, feat, feat_half, 3, 3, 1, 1);
-    kl_relu_inplace(r, r->d_dpt_tmp, feat_half * fh * fw);
 
-    /* out_0: Conv2d(feat/2, out_mid, 3, pad=1) + ReLU via MMA */
-    kl_conv_gemm(r, r->d_dpt_tmp2, r->d_dpt_tmp,
-                  dw->out_0_w, dw->out_0_b,
-                  fh, fw, feat_half, out_mid, 3, 3, 1, 1);
-    kl_relu_inplace(r, r->d_dpt_tmp2, out_mid * fh * fw);
+    /* Step 2: Bilinear upsample from fused res to model res (296→518) */
+    kl_bilinear(r, r->d_dpt_fullres1, r->d_dpt_tmp, feat_half, fh, fw, full_h, full_w);
 
-    /* out_2: Conv2d(out_mid, 2, 1) */
-    kl_conv2d(r, r->d_dpt_out, r->d_dpt_tmp2,
-               dw->out_2_w, dw->out_2_b,
-               fh, fw, out_mid, 2, 1, 1, 1, 0);
-
-    /* depth_activation: exp(depth), sigmoid(confidence) */
+    /* Step 3: DPT positional embedding (sinusoidal UV, ratio=0.1) */
     {
-        int hw = fh * fw;
+        float aspect = (float)full_w / (float)full_h;
+        float ratio = 0.1f;
+        int total = feat_half * full_h * full_w;
+        int grid = (total + 255) / 256;
+        void *args[] = {&r->d_dpt_fullres1, &feat_half, &full_h, &full_w, &aspect, &ratio};
+        cuLaunchKernel(r->fn_dpt_pos_embed, (unsigned)grid, 1, 1, 256, 1, 1,
+                       0, r->stream, args, NULL);
+    }
+
+    /* Step 4: output_conv2 at full model resolution */
+    /* Conv2d(feat/2, out_mid, 3, pad=1) + ReLU */
+    kl_conv_gemm(r, r->d_dpt_fullres2, r->d_dpt_fullres1,
+                  dw->out_0_w, dw->out_0_b,
+                  full_h, full_w, feat_half, out_mid, 3, 3, 1, 1);
+    kl_relu_inplace(r, r->d_dpt_fullres2, out_mid * full_h * full_w);
+
+    /* Conv2d(out_mid, 2, 1) */
+    kl_conv2d(r, r->d_dpt_out, r->d_dpt_fullres2,
+               dw->out_2_w, dw->out_2_b,
+               full_h, full_w, out_mid, 2, 1, 1, 1, 0);
+
+    /* Step 5: depth_activation: exp(depth), exp(confidence)+1 */
+    {
+        int hw = full_h * full_w;
         int grid = (hw + 255) / 256;
         void *args[] = {&r->d_dpt_out, &hw};
         cuLaunchKernel(r->fn_depth_activation, (unsigned)grid, 1, 1, 256, 1, 1,
@@ -3367,7 +4281,7 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         }
         CUdeviceptr d_result = r->d_result;
 
-        kl_bilinear(r, d_result, r->d_dpt_out, 2, fh, fw, img_h, img_w);
+        kl_bilinear(r, d_result, r->d_dpt_out, 2, full_h, full_w, img_h, img_w);
 
         /* Synchronize before downloading */
         cuStreamSynchronize(r->stream);
@@ -3414,22 +4328,26 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         /* Run aux branch (reuses d_dpt_adapted from main DPT token processing) */
         run_aux_dpt(r, sp_h, sp_w, feat, r->d_aux_out);
 
-        /* Average 4 levels (all at level 0 spatial size) */
-        /* Only last level (index 3) is used — single output in d_aux_out[0] */
-        int oh = sp_h[0], ow = sp_w[0];
+        /* Only last level (index 3) is used — single output in d_aux_out[0].
+         * After refinenet upsample fix, output is at fused resolution (2x level 0). */
+        int oh = sp_h[0] * 2, ow = sp_w[0] * 2;
         int aux_hw = oh * ow;
 
-        /* Bilinear upsample 7 channels to original resolution */
+        /* Bilinear upsample 7 channels to original resolution.
+         * d_dpt_tmp is too small (feat*fused_hw ≈ 5.6M) for 7*img_h*img_w (≈20M).
+         * Allocate a temporary GPU buffer for the full-res output. */
         int npix = img_w * img_h;
         result.rays = (float *)malloc((size_t)6 * npix * sizeof(float));
         result.ray_confidence = (float *)malloc((size_t)npix * sizeof(float));
 
-        CUdeviceptr d_aux_full = r->d_dpt_tmp;
+        CUdeviceptr d_aux_full = 0;
+        cuMemAlloc(&d_aux_full, (size_t)7 * npix * sizeof(float));
         kl_bilinear(r, d_aux_full, r->d_aux_out[0], 7, oh, ow, img_h, img_w);
         cuStreamSynchronize(r->stream);
 
         float *h_aux_full = (float *)malloc((size_t)7 * npix * sizeof(float));
         cuMemcpyDtoH(h_aux_full, d_aux_full, (size_t)7 * npix * sizeof(float));
+        cuMemFree(d_aux_full);
 
         /* Split: rays = channels 0-5 (linear activation = identity),
          *        ray_confidence = channel 6 (expp1 = exp(x) + 1) */
@@ -3490,7 +4408,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         for (int fi = 0; fi < 4; fi++) {
             int oc_val = r->head_out_channels[fi];
 
-            kl_cls_concat(r, r->d_dpt_cat, r->d_features[fi], np, dim);
+            kl_patch_norm_concat(r, r->d_dpt_cat,
+                                  r->d_features_local[fi], r->d_features[fi],
+                                  r->cam_dec.backbone_norm_w, r->cam_dec.backbone_norm_b, np, dim);
             if (gdw->norm_w)
                 kl_layernorm(r, r->d_dpt_ln, r->d_dpt_cat, gdw->norm_w, gdw->norm_b,
                               np, head_dim_in);
@@ -3526,10 +4446,12 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                           sp_h[fi], sp_w[fi], oc_val, feat, 3, 3, 1, 1);
         }
 
-        /* TODO: Inject merger features at level 0 (add to d_dpt_adapted[0]) */
-        /* For now, skip merger injection — just run standard DPT pipeline */
+        /* Merger injection happens AFTER neck conv (lines below), not at adapted[0].
+         * See CPU da3_run_gsdpt lines 2719-2726: merger is added to neck output. */
 
-        /* Bottom-up RefineNet fusion with GSDPT weights */
+        /* Bottom-up RefineNet fusion with GSDPT weights.
+         * Upsample targets match CPU da3_refinenet: level N → level N-1 spatial size,
+         * level 0 → 2x (scale_factor=2). */
         gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
                         0, 0, 0, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[3], gdw->fuse_out_b[3],
@@ -3537,8 +4459,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[3], gdw->fuse_rcu1_c2_b[3],
                         gdw->fuse_rcu2_c1_w[3], gdw->fuse_rcu2_c1_b[3],
                         gdw->fuse_rcu2_c2_w[3], gdw->fuse_rcu2_c2_b[3],
-                        gdw->has_rcu1[3], gdw->has_rcu2[3]);
-        int gs_fh = sp_h[3], gs_fw = sp_w[3];
+                        gdw->has_rcu1[3], gdw->has_rcu2[3],
+                        sp_h[2], sp_w[2]);
+        int gs_fh = sp_h[2], gs_fw = sp_w[2];
         gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[2], gdw->fuse_out_b[2],
@@ -3546,8 +4469,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[2], gdw->fuse_rcu1_c2_b[2],
                         gdw->fuse_rcu2_c1_w[2], gdw->fuse_rcu2_c1_b[2],
                         gdw->fuse_rcu2_c2_w[2], gdw->fuse_rcu2_c2_b[2],
-                        gdw->has_rcu1[2], gdw->has_rcu2[2]);
-        gs_fh = sp_h[2]; gs_fw = sp_w[2];
+                        gdw->has_rcu1[2], gdw->has_rcu2[2],
+                        sp_h[1], sp_w[1]);
+        gs_fh = sp_h[1]; gs_fw = sp_w[1];
         gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[1], gdw->fuse_out_b[1],
@@ -3555,8 +4479,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[1], gdw->fuse_rcu1_c2_b[1],
                         gdw->fuse_rcu2_c1_w[1], gdw->fuse_rcu2_c1_b[1],
                         gdw->fuse_rcu2_c2_w[1], gdw->fuse_rcu2_c2_b[1],
-                        gdw->has_rcu1[1], gdw->has_rcu2[1]);
-        gs_fh = sp_h[1]; gs_fw = sp_w[1];
+                        gdw->has_rcu1[1], gdw->has_rcu2[1],
+                        sp_h[0], sp_w[0]);
+        gs_fh = sp_h[0]; gs_fw = sp_w[0];
         gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[0], gdw->fuse_out_b[0],
@@ -3564,8 +4489,9 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[0], gdw->fuse_rcu1_c2_b[0],
                         gdw->fuse_rcu2_c1_w[0], gdw->fuse_rcu2_c1_b[0],
                         gdw->fuse_rcu2_c2_w[0], gdw->fuse_rcu2_c2_b[0],
-                        gdw->has_rcu1[0], gdw->has_rcu2[0]);
-        gs_fh = sp_h[0]; gs_fw = sp_w[0];
+                        gdw->has_rcu1[0], gdw->has_rcu2[0],
+                        sp_h[0] * 2, sp_w[0] * 2);
+        gs_fh = sp_h[0] * 2; gs_fw = sp_w[0] * 2;
 
         /* Output convolutions → gs_oc channels
          * output_conv1 (neck): Conv2d(256, 128, 3) — NO ReLU (single .0 index)
@@ -3618,6 +4544,253 @@ da3_full_result cuda_da3_predict_full(cuda_da3_runner *r, const uint8_t *rgb,
         if (r->verbose >= 1)
             fprintf(stderr, "cuda_da3: GSDPT (%d channels): %.1f ms\n",
                     gs_oc, (gs1-gs0)*1000);
+    }
+
+    /* ─── Metric Backbone + DPT + Sky (Phase 6) ─── */
+    if (r->metric.loaded && (output_flags & DA3_OUTPUT_METRIC)) {
+        struct timespec mts;
+        clock_gettime(CLOCK_MONOTONIC, &mts);
+        double met0 = mts.tv_sec + mts.tv_nsec * 1e-9;
+
+        int mdim = r->metric.dim;
+        int mn_heads = r->metric.n_heads;
+        int mhead_dim = r->metric.head_dim;
+        int mstride_3dim = 3 * mdim;
+
+        /* 1. Re-run patch embed with metric weights → d_hidden */
+        {
+            int img_dim = gw * ps;
+            void *args[] = {&r->d_hidden, &r->d_img_norm, &r->metric.d_patch_embed_w,
+                            &r->metric.d_patch_embed_b, &gw, &mdim, &ps, &img_dim};
+            cuLaunchKernel(r->fn_patch_embed_conv2d, (unsigned)np, 1, 1, 256, 1, 1,
+                           0, r->stream, args, NULL);
+        }
+
+        /* 2. CLS + pos_embed with metric weights */
+        {
+            int total = nt * mdim;
+            int grid = (total + 255) / 256;
+            void *args[] = {&r->d_hidden, &r->metric.d_cls_token, &r->metric.d_pos_embed,
+                            &nt, &mdim};
+            cuLaunchKernel(r->fn_cls_pos_embed, (unsigned)grid, 1, 1, 256, 1, 1,
+                           0, r->stream, args, NULL);
+        }
+
+        /* 3. Run metric backbone blocks (24 blocks, no RoPE, no QKNorm, GELU MLP) */
+        for (int L = 0; L < r->metric.n_blocks; L++) {
+            cuda_da3_layer *ly = &r->metric.layers[L];
+
+            /* Save features at feature layers */
+            for (int fi = 0; fi < 4; fi++) {
+                if (L == r->metric.feature_layers[fi]) {
+                    cuMemcpyDtoDAsync(r->d_features[fi], r->d_hidden,
+                                       (size_t)nt * mdim * sizeof(float), r->stream);
+                }
+            }
+
+            /* No camera token injection for metric backbone */
+
+            /* LN1 */
+            kl_layernorm(r, r->d_ln_buf, r->d_hidden, ly->ln1_w, ly->ln1_b, nt, mdim);
+
+            /* QKV projection */
+            kl_backbone_gemm(r, r->d_qkv, ly->attn_qkv_w, r->d_ln_buf, ly->attn_qkv_b,
+                             ly->qkv_rows, ly->qkv_cols, nt);
+
+            /* No QKNorm, no RoPE for metric backbone */
+
+            /* Attention */
+            {
+                CUdeviceptr K_t = r->d_ffn_buf;
+                CUdeviceptr V_t = r->d_ffn_buf + (size_t)nt * mdim * sizeof(float);
+                kl_kv_transpose(r, K_t, V_t, r->d_qkv, nt, mdim, mn_heads, mhead_dim);
+                kl_attn_prefill(r, r->d_attn_out, r->d_qkv, K_t, V_t,
+                                 nt, mdim, mn_heads, mhead_dim);
+            }
+
+            /* Output projection */
+            kl_backbone_gemm(r, r->d_proj_out, ly->attn_out_w, r->d_attn_out, ly->attn_out_b,
+                             ly->out_rows, ly->out_cols, nt);
+
+            /* LayerScale + residual: hidden = hidden + ls1 * proj_out */
+            kl_layerscale_add(r, r->d_hidden, r->d_proj_out, ly->ls1, mdim, nt * mdim);
+
+            /* LN2 */
+            kl_layernorm(r, r->d_ln_buf, r->d_hidden, ly->ln2_w, ly->ln2_b, nt, mdim);
+
+            /* GELU MLP: up → gelu → down */
+            kl_backbone_gemm(r, r->d_ffn_buf, ly->ffn_up_w, r->d_ln_buf, ly->ffn_up_b,
+                             ly->ffn_up_rows, ly->ffn_up_cols, nt);
+            kl_gelu(r, r->d_ffn_buf, nt * ly->ffn_up_rows);
+            kl_backbone_gemm(r, r->d_proj_out, ly->ffn_down_w, r->d_ffn_buf, ly->ffn_down_b,
+                             ly->ffn_down_rows, ly->ffn_down_cols, nt);
+
+            /* LayerScale + residual: hidden = hidden + ls2 * mlp_out */
+            kl_layerscale_add(r, r->d_hidden, r->d_proj_out, ly->ls2, mdim, nt * mdim);
+        }
+
+        /* 4. Apply backbone norm to saved features */
+        if (r->metric.d_backbone_norm_w) {
+            for (int fi = 0; fi < 4; fi++) {
+                /* Norm on patch tokens only (skip CLS), write to d_features[fi] offset */
+                CUdeviceptr feat_patches = r->d_features[fi] + (size_t)mdim * sizeof(float);
+                kl_layernorm(r, r->d_ln_buf, feat_patches,
+                              r->metric.d_backbone_norm_w, r->metric.d_backbone_norm_b,
+                              np, mdim);
+                cuMemcpyDtoDAsync(feat_patches, r->d_ln_buf,
+                                   (size_t)np * mdim * sizeof(float), r->stream);
+            }
+        }
+
+        /* 5. Metric DPT head (standard DPT, no CLS concat) */
+        dpt_gpu_weights *mdw = &r->metric.dpt_w;
+        int mfeat = r->metric.head_features;  /* 256 */
+
+        for (int fi = 0; fi < 4; fi++) {
+            int oc_val = r->metric.head_out_channels[fi];
+
+            /* Extract patch tokens (skip CLS at token 0) → d_dpt_cat [np, mdim] */
+            CUdeviceptr feat_patches = r->d_features[fi] + (size_t)mdim * sizeof(float);
+
+            /* Head LayerNorm → d_dpt_ln [np, mdim] */
+            if (mdw->norm_w) {
+                kl_layernorm(r, r->d_dpt_ln, feat_patches, mdw->norm_w, mdw->norm_b,
+                              np, mdim);
+            } else {
+                cuMemcpyDtoDAsync(r->d_dpt_ln, feat_patches,
+                                   (size_t)np * mdim * sizeof(float), r->stream);
+            }
+
+            /* 1x1 projection → d_dpt_proj [np, oc_val] */
+            kl_gemm(r, r->d_dpt_proj, mdw->proj_w[fi], r->d_dpt_ln, mdw->proj_b[fi],
+                     oc_val, mdim, np);
+
+            /* No sinusoidal DPT pos_embed for standard DPT */
+
+            /* Spatial alignment + reshape */
+            if (fi == 0) {
+                kl_deconv_gemm_scatter(r, r->d_dpt_spatial[0],
+                                        r->d_dpt_proj, mdw->upsample_0_w,
+                                        mdw->upsample_0_b, r->d_dpt_ln,
+                                        oc_val, oc_val, gh, gw, 4, 4, 4);
+            } else if (fi == 1) {
+                kl_deconv_gemm_scatter(r, r->d_dpt_spatial[1],
+                                        r->d_dpt_proj, mdw->upsample_1_w,
+                                        mdw->upsample_1_b, r->d_dpt_ln,
+                                        oc_val, oc_val, gh, gw, 2, 2, 2);
+            } else if (fi == 2) {
+                kl_tok_to_chw(r, r->d_dpt_chw, r->d_dpt_proj, oc_val, gh, gw);
+                cuMemcpyDtoDAsync(r->d_dpt_spatial[2], r->d_dpt_chw,
+                                   (size_t)oc_val * gh * gw * sizeof(float), r->stream);
+            } else {
+                kl_tok_to_chw(r, r->d_dpt_chw, r->d_dpt_proj, oc_val, gh, gw);
+                kl_conv_gemm(r, r->d_dpt_spatial[3], r->d_dpt_chw,
+                              mdw->downsample_w, mdw->downsample_b,
+                              gh, gw, oc_val, oc_val, 3, 3, 2, 1);
+            }
+
+            /* Adapter: Conv3x3 → features channels */
+            CUdeviceptr null_bias = 0;
+            kl_conv_gemm(r, r->d_dpt_adapted[fi], r->d_dpt_spatial[fi],
+                          mdw->adapter_w[fi], null_bias,
+                          sp_h[fi], sp_w[fi], oc_val, mfeat, 3, 3, 1, 1);
+        }
+
+        /* Bottom-up RefineNet fusion using gpu_refinenet_w (explicit weight pointers).
+         * Standard DPT: no 2x upsample at level 0 — pass 0,0 for out_h,out_w. */
+        gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
+                        0, 0, 0, mfeat, r->d_dpt_fused,
+                        mdw->fuse_out_w[3], mdw->fuse_out_b[3],
+                        mdw->fuse_rcu1_c1_w[3], mdw->fuse_rcu1_c1_b[3],
+                        mdw->fuse_rcu1_c2_w[3], mdw->fuse_rcu1_c2_b[3],
+                        mdw->fuse_rcu2_c1_w[3], mdw->fuse_rcu2_c1_b[3],
+                        mdw->fuse_rcu2_c2_w[3], mdw->fuse_rcu2_c2_b[3],
+                        mdw->has_rcu1[3], mdw->has_rcu2[3],
+                        0, 0);
+        gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
+                        r->d_dpt_fused, sp_h[3], sp_w[3], mfeat, r->d_dpt_fused,
+                        mdw->fuse_out_w[2], mdw->fuse_out_b[2],
+                        mdw->fuse_rcu1_c1_w[2], mdw->fuse_rcu1_c1_b[2],
+                        mdw->fuse_rcu1_c2_w[2], mdw->fuse_rcu1_c2_b[2],
+                        mdw->fuse_rcu2_c1_w[2], mdw->fuse_rcu2_c1_b[2],
+                        mdw->fuse_rcu2_c2_w[2], mdw->fuse_rcu2_c2_b[2],
+                        mdw->has_rcu1[2], mdw->has_rcu2[2],
+                        0, 0);
+        gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
+                        r->d_dpt_fused, sp_h[2], sp_w[2], mfeat, r->d_dpt_fused,
+                        mdw->fuse_out_w[1], mdw->fuse_out_b[1],
+                        mdw->fuse_rcu1_c1_w[1], mdw->fuse_rcu1_c1_b[1],
+                        mdw->fuse_rcu1_c2_w[1], mdw->fuse_rcu1_c2_b[1],
+                        mdw->fuse_rcu2_c1_w[1], mdw->fuse_rcu2_c1_b[1],
+                        mdw->fuse_rcu2_c2_w[1], mdw->fuse_rcu2_c2_b[1],
+                        mdw->has_rcu1[1], mdw->has_rcu2[1],
+                        0, 0);
+        gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
+                        r->d_dpt_fused, sp_h[1], sp_w[1], mfeat, r->d_dpt_fused,
+                        mdw->fuse_out_w[0], mdw->fuse_out_b[0],
+                        mdw->fuse_rcu1_c1_w[0], mdw->fuse_rcu1_c1_b[0],
+                        mdw->fuse_rcu1_c2_w[0], mdw->fuse_rcu1_c2_b[0],
+                        mdw->fuse_rcu2_c1_w[0], mdw->fuse_rcu2_c1_b[0],
+                        mdw->fuse_rcu2_c2_w[0], mdw->fuse_rcu2_c2_b[0],
+                        mdw->has_rcu1[0], mdw->has_rcu2[0],
+                        0, 0);
+        int mfh = sp_h[0], mfw = sp_w[0]; /* fusion resolution = level 0 = 148x148 */
+
+        /* Output conv: Conv2d(256→128, 3) + ReLU */
+        int mfeat_half = mfeat / 2;
+        if (mfeat_half < 1) mfeat_half = 1;
+        kl_conv_gemm(r, r->d_dpt_tmp, r->d_dpt_fused,
+                      mdw->neck_w, mdw->neck_b,
+                      mfh, mfw, mfeat, mfeat_half, 3, 3, 1, 1);
+        kl_relu_inplace(r, r->d_dpt_tmp, mfeat_half * mfh * mfw);
+
+        /* Save neck output for sky branch before output_conv2 */
+        cuMemcpyDtoDAsync(r->d_dpt_tmp2, r->d_dpt_tmp,
+                           (size_t)mfeat_half * mfh * mfw * sizeof(float), r->stream);
+
+        /* Output conv2: Conv2d(128→32, 3) + ReLU + Conv2d(32→1, 1) */
+        int m_out_mid = mdw->out_mid > 0 ? mdw->out_mid : mfeat_half;
+        kl_conv_gemm(r, r->d_dpt_fused, r->d_dpt_tmp,
+                      mdw->out_0_w, mdw->out_0_b,
+                      mfh, mfw, mfeat_half, m_out_mid, 3, 3, 1, 1);
+        kl_relu_inplace(r, r->d_dpt_fused, m_out_mid * mfh * mfw);
+        kl_conv2d(r, r->d_dpt_cat, r->d_dpt_fused,
+                   mdw->out_2_w, mdw->out_2_b,
+                   mfh, mfw, m_out_mid, 1, 1, 1, 1, 0);
+
+        /* Upsample metric depth to original resolution */
+        kl_bilinear(r, r->d_dpt_fused, r->d_dpt_cat, 1, mfh, mfw, img_h, img_w);
+        cuStreamSynchronize(r->stream);
+        result.metric_depth = (float *)malloc((size_t)img_w * img_h * sizeof(float));
+        cuMemcpyDtoH(result.metric_depth, r->d_dpt_fused,
+                      (size_t)img_w * img_h * sizeof(float));
+        result.has_metric = 1;
+
+        /* Sky segmentation: Conv2d(128→32, 3) + ReLU + Conv2d(32→1, 1) + sigmoid */
+        if (r->metric.sky_0_w) {
+            kl_conv_gemm(r, r->d_dpt_fused, r->d_dpt_tmp2,
+                          r->metric.sky_0_w, r->metric.sky_0_b,
+                          mfh, mfw, mfeat_half, 32, 3, 3, 1, 1);
+            kl_relu_inplace(r, r->d_dpt_fused, 32 * mfh * mfw);
+            kl_conv2d(r, r->d_dpt_cat, r->d_dpt_fused,
+                       r->metric.sky_2_w, r->metric.sky_2_b,
+                       mfh, mfw, 32, 1, 1, 1, 1, 0);
+
+            /* Sigmoid activation */
+            kl_sigmoid_inplace(r, r->d_dpt_cat, mfh * mfw);
+
+            /* Upsample sky mask to original resolution */
+            kl_bilinear(r, r->d_dpt_fused, r->d_dpt_cat, 1, mfh, mfw, img_h, img_w);
+            cuStreamSynchronize(r->stream);
+            result.sky_seg = (float *)malloc((size_t)img_w * img_h * sizeof(float));
+            cuMemcpyDtoH(result.sky_seg, r->d_dpt_fused,
+                          (size_t)img_w * img_h * sizeof(float));
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &mts);
+        double met1 = mts.tv_sec + mts.tv_nsec * 1e-9;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_da3: Metric backbone+DPT+sky: %.1f ms\n", (met1-met0)*1000);
     }
 
     return result;
@@ -3680,8 +4853,12 @@ void cuda_da3_free(cuda_da3_runner *r) {
     if (r->d_proj_out) cuMemFree(r->d_proj_out);
     if (r->d_pos_y) cuMemFree(r->d_pos_y);
     if (r->d_pos_x) cuMemFree(r->d_pos_x);
-    for (int i = 0; i < 4; i++)
+    if (r->d_pos_y_nd) cuMemFree(r->d_pos_y_nd);
+    if (r->d_pos_x_nd) cuMemFree(r->d_pos_x_nd);
+    for (int i = 0; i < 4; i++) {
         if (r->d_features[i]) cuMemFree(r->d_features[i]);
+        if (r->d_features_local[i]) cuMemFree(r->d_features_local[i]);
+    }
 
     /* Free DPT head weights */
     {
@@ -3730,6 +4907,8 @@ void cuda_da3_free(cuda_da3_runner *r) {
     if (r->d_dpt_tmp) cuMemFree(r->d_dpt_tmp);
     if (r->d_dpt_tmp2) cuMemFree(r->d_dpt_tmp2);
     if (r->d_dpt_out) cuMemFree(r->d_dpt_out);
+    if (r->d_dpt_fullres1) cuMemFree(r->d_dpt_fullres1);
+    if (r->d_dpt_fullres2) cuMemFree(r->d_dpt_fullres2);
 
     /* Free CameraDec weights */
     if (r->cam_dec.loaded) {
@@ -3858,6 +5037,12 @@ void cuda_da3_free(cuda_da3_runner *r) {
         if (r->metric.d_patch_embed_b) cuMemFree(r->metric.d_patch_embed_b);
         if (r->metric.d_cls_token) cuMemFree(r->metric.d_cls_token);
         if (r->metric.d_pos_embed) cuMemFree(r->metric.d_pos_embed);
+        if (r->metric.d_backbone_norm_w) cuMemFree(r->metric.d_backbone_norm_w);
+        if (r->metric.d_backbone_norm_b) cuMemFree(r->metric.d_backbone_norm_b);
+        if (r->metric.sky_0_w) cuMemFree(r->metric.sky_0_w);
+        if (r->metric.sky_0_b) cuMemFree(r->metric.sky_0_b);
+        if (r->metric.sky_2_w) cuMemFree(r->metric.sky_2_w);
+        if (r->metric.sky_2_b) cuMemFree(r->metric.sky_2_b);
         if (r->metric.layers) {
             for (int L = 0; L < r->metric.n_blocks; L++) {
                 cuda_da3_layer *ly = &r->metric.layers[L];

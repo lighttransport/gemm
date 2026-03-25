@@ -55,7 +55,7 @@ HEADERS = $(wildcard $(COMMON)/*.h)
 all: test_ppd
 
 test_ppd: test_ppd.c $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
 
 clean:
 	rm -f test_ppd
