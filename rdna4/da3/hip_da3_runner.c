@@ -1422,7 +1422,224 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
         t = da3s_tensor(st, map, map_count, "da3.head.out_2.bias"); dw->out_2_b = upload_tensor_f32(&t);
     }
 
-    /* Allocate scratch buffers (same as GGUF path) */
+    /* Upload CameraDec weights */
+    {
+        qtensor t;
+        t = da3s_tensor(st, map, map_count, "da3.backbone_norm.weight");
+        if (t.data) {
+            r->cam_dec.backbone_norm_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.backbone_norm.bias");
+            r->cam_dec.backbone_norm_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.mlp.0.weight");
+            r->cam_dec.mlp_w[0] = upload_tensor_f32_as_f16(&t);
+            r->cam_dec.mlp_dim = t.n_rows;
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.mlp.0.bias");
+            r->cam_dec.mlp_b[0] = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.mlp.2.weight");
+            r->cam_dec.mlp_w[1] = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.mlp.2.bias");
+            r->cam_dec.mlp_b[1] = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.fc_t.weight");
+            r->cam_dec.fc_t_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.fc_t.bias");
+            r->cam_dec.fc_t_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.fc_qvec.weight");
+            r->cam_dec.fc_qvec_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.fc_qvec.bias");
+            r->cam_dec.fc_qvec_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.fc_fov.weight");
+            r->cam_dec.fc_fov_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_dec.fc_fov.bias");
+            r->cam_dec.fc_fov_b = upload_tensor_f32(&t);
+            r->cam_dec.loaded = 1;
+            if (r->verbose >= 1)
+                fprintf(stderr, "hip_da3: CameraDec weights loaded (mlp_dim=%d)\n", r->cam_dec.mlp_dim);
+        }
+    }
+
+    /* Upload CameraEnc weights */
+    {
+        qtensor t; char name[128];
+        t = da3s_tensor(st, map, map_count, "da3.cam_enc.fc1.weight");
+        if (t.data) {
+            r->cam_enc.fc1_w = upload_tensor_f32_as_f16(&t);
+            r->cam_enc.trunk_dim = t.n_rows;
+            t = da3s_tensor(st, map, map_count, "da3.cam_enc.fc1.bias");
+            r->cam_enc.fc1_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_enc.fc2.weight");
+            r->cam_enc.fc2_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_enc.fc2.bias");
+            r->cam_enc.fc2_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_enc.trunk_norm.weight");
+            r->cam_enc.trunk_norm_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_enc.trunk_norm.bias");
+            r->cam_enc.trunk_norm_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_enc.token_norm.weight");
+            r->cam_enc.token_norm_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.cam_enc.token_norm.bias");
+            r->cam_enc.token_norm_b = upload_tensor_f32(&t);
+            r->cam_enc.n_trunk_blocks = 0;
+            for (int L = 0; L < 8; L++) {
+                snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.ln1.weight", L);
+                t = da3s_tensor(st, map, map_count, name);
+                if (!t.data) break;
+                r->cam_enc.n_trunk_blocks = L + 1;
+            }
+            int ntb = r->cam_enc.n_trunk_blocks;
+            if (ntb > 0) {
+                r->cam_enc.trunk = (hip_da3_layer *)calloc((size_t)ntb, sizeof(hip_da3_layer));
+                for (int L = 0; L < ntb; L++) {
+                    hip_da3_layer *ly = &r->cam_enc.trunk[L];
+#define CE_F32(field, fmt, ...) snprintf(name, sizeof(name), fmt, __VA_ARGS__); t = da3s_tensor(st, map, map_count, name); ly->field = upload_tensor_f32(&t);
+#define CE_F16(field, fmt, ...) snprintf(name, sizeof(name), fmt, __VA_ARGS__); t = da3s_tensor(st, map, map_count, name); ly->field = upload_tensor_f32_as_f16(&t);
+                    CE_F32(ln1_w, "da3.cam_enc.trunk.%d.ln1.weight", L)
+                    CE_F32(ln1_b, "da3.cam_enc.trunk.%d.ln1.bias", L)
+                    CE_F16(attn_qkv_w, "da3.cam_enc.trunk.%d.attn_qkv.weight", L)
+                    snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.attn_qkv.weight", L);
+                    t = da3s_tensor(st, map, map_count, name);
+                    ly->qkv_rows = t.n_rows; ly->qkv_cols = t.n_cols;
+                    CE_F32(attn_qkv_b, "da3.cam_enc.trunk.%d.attn_qkv.bias", L)
+                    CE_F16(attn_out_w, "da3.cam_enc.trunk.%d.attn_out.weight", L)
+                    snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.attn_out.weight", L);
+                    t = da3s_tensor(st, map, map_count, name);
+                    ly->out_rows = t.n_rows; ly->out_cols = t.n_cols;
+                    CE_F32(attn_out_b, "da3.cam_enc.trunk.%d.attn_out.bias", L)
+                    CE_F32(ls1, "da3.cam_enc.trunk.%d.ls1", L)
+                    CE_F32(ls2, "da3.cam_enc.trunk.%d.ls2", L)
+                    CE_F32(ln2_w, "da3.cam_enc.trunk.%d.ln2.weight", L)
+                    CE_F32(ln2_b, "da3.cam_enc.trunk.%d.ln2.bias", L)
+                    CE_F16(ffn_up_w, "da3.cam_enc.trunk.%d.ffn_up.weight", L)
+                    if (ly->ffn_up_w) { snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.ffn_up.weight", L); t = da3s_tensor(st, map, map_count, name); ly->ffn_up_rows = t.n_rows; ly->ffn_up_cols = t.n_cols; }
+                    CE_F32(ffn_up_b, "da3.cam_enc.trunk.%d.ffn_up.bias", L)
+                    CE_F16(ffn_down_w, "da3.cam_enc.trunk.%d.ffn_down.weight", L)
+                    snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.ffn_down.weight", L); t = da3s_tensor(st, map, map_count, name); ly->ffn_down_rows = t.n_rows; ly->ffn_down_cols = t.n_cols;
+                    CE_F32(ffn_down_b, "da3.cam_enc.trunk.%d.ffn_down.bias", L)
+                    ly->has_qk_norm = 0; ly->has_swiglu = 0;
+#undef CE_F32
+#undef CE_F16
+                }
+            }
+            r->cam_enc.loaded = 1;
+            if (r->verbose >= 1)
+                fprintf(stderr, "hip_da3: CameraEnc weights loaded (%d trunk blocks, dim=%d)\n", ntb, r->cam_enc.trunk_dim);
+        }
+    }
+
+    /* Upload DPT Aux Branch weights */
+    {
+        qtensor t; char name[128];
+        t = da3s_tensor(st, map, map_count, "da3.head.aux_fuse.0.out.weight");
+        if (t.data) {
+            for (int i = 0; i < 4; i++) {
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.out.weight", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_out_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.out.bias", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_out_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu1.conv1.weight", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu1_c1_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu1.conv1.bias", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu1_c1_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu1.conv2.weight", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu1_c2_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu1.conv2.bias", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu1_c2_b[i] = upload_tensor_f32(&t);
+                r->dpt_aux.has_rcu1[i] = (r->dpt_aux.fuse_rcu1_c1_w[i] != NULL);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu2.conv1.weight", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu2_c1_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu2.conv1.bias", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu2_c1_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu2.conv2.weight", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu2_c2_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_fuse.%d.rcu2.conv2.bias", i); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.fuse_rcu2_c2_b[i] = upload_tensor_f32(&t);
+                r->dpt_aux.has_rcu2[i] = (r->dpt_aux.fuse_rcu2_c1_w[i] != NULL);
+            }
+            for (int lv = 0; lv < 4; lv++) {
+                r->dpt_aux.oc1_count[lv] = 0;
+                for (int ci = 0; ci < 5; ci++) {
+                    snprintf(name, sizeof(name), "da3.head.aux_oc1.%d.%d.weight", lv, ci);
+                    t = da3s_tensor(st, map, map_count, name);
+                    if (!t.data) break;
+                    r->dpt_aux.oc1_w[lv][ci] = upload_tensor_f32(&t);
+                    r->dpt_aux.oc1_co[lv][ci] = (t.n_dims == 4) ? (int)t.dims[3] : t.n_rows;
+                    r->dpt_aux.oc1_ci[lv][ci] = (t.n_dims == 4) ? (int)t.dims[2] : (t.n_cols / 9);
+                    snprintf(name, sizeof(name), "da3.head.aux_oc1.%d.%d.bias", lv, ci);
+                    t = da3s_tensor(st, map, map_count, name);
+                    r->dpt_aux.oc1_b[lv][ci] = upload_tensor_f32(&t);
+                    r->dpt_aux.oc1_count[lv] = ci + 1;
+                }
+            }
+            for (int lv = 0; lv < 4; lv++) {
+                snprintf(name, sizeof(name), "da3.head.aux_oc2.%d.conv.weight", lv); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.oc2_conv_w[lv] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_oc2.%d.conv.bias", lv); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.oc2_conv_b[lv] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_oc2.%d.gn.weight", lv); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.oc2_gn_w[lv] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_oc2.%d.gn.bias", lv); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.oc2_gn_b[lv] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_oc2.%d.out.weight", lv); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.oc2_out_w[lv] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.head.aux_oc2.%d.out.bias", lv); t = da3s_tensor(st, map, map_count, name); r->dpt_aux.oc2_out_b[lv] = upload_tensor_f32(&t);
+            }
+            r->dpt_aux.loaded = 1;
+            if (r->verbose >= 1)
+                fprintf(stderr, "hip_da3: DPT Aux Branch weights loaded\n");
+        }
+    }
+
+    /* Upload GSDPT weights */
+    {
+        qtensor t; char name[128];
+        t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.proj.0.weight");
+        if (t.data) {
+            dpt_gpu_weights *gdw = &r->gsdpt.dpt;
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.norm.weight"); gdw->norm_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.norm.bias"); gdw->norm_b = upload_tensor_f32(&t);
+            for (int i = 0; i < 4; i++) {
+                snprintf(name, sizeof(name), "da3.gsdpt.head.proj.%d.weight", i); t = da3s_tensor(st, map, map_count, name); gdw->proj_w[i] = upload_tensor_f32_as_f16(&t); gdw->proj_rows[i] = t.n_rows;
+                snprintf(name, sizeof(name), "da3.gsdpt.head.proj.%d.bias", i); t = da3s_tensor(st, map, map_count, name); gdw->proj_b[i] = upload_tensor_f32(&t);
+            }
+            { int oc0 = r->head_out_channels[0];
+                t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.upsample_0.weight"); if (t.data) gdw->upsample_0_w = upload_deconv_weight_f16(&t, oc0, oc0, 4, 4);
+                t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.upsample_0.bias"); gdw->upsample_0_b = upload_tensor_f32(&t);
+                int oc1 = r->head_out_channels[1];
+                t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.upsample_1.weight"); if (t.data) gdw->upsample_1_w = upload_deconv_weight_f16(&t, oc1, oc1, 2, 2);
+                t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.upsample_1.bias"); gdw->upsample_1_b = upload_tensor_f32(&t);
+            }
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.downsample.weight"); gdw->downsample_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.downsample.bias"); gdw->downsample_b = upload_tensor_f32(&t);
+            for (int i = 0; i < 4; i++) { snprintf(name, sizeof(name), "da3.gsdpt.head.adapter.%d.weight", i); t = da3s_tensor(st, map, map_count, name); gdw->adapter_w[i] = upload_tensor_f32_as_f16(&t); }
+            for (int i = 0; i < 4; i++) {
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.out.weight", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_out_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.out.bias", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_out_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu1.conv1.weight", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu1_c1_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu1.conv1.bias", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu1_c1_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu1.conv2.weight", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu1_c2_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu1.conv2.bias", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu1_c2_b[i] = upload_tensor_f32(&t);
+                gdw->has_rcu1[i] = (gdw->fuse_rcu1_c1_w[i] != NULL);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu2.conv1.weight", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu2_c1_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu2.conv1.bias", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu2_c1_b[i] = upload_tensor_f32(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu2.conv2.weight", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu2_c2_w[i] = upload_tensor_f32_as_f16(&t);
+                snprintf(name, sizeof(name), "da3.gsdpt.head.fuse.%d.rcu2.conv2.bias", i); t = da3s_tensor(st, map, map_count, name); gdw->fuse_rcu2_c2_b[i] = upload_tensor_f32(&t);
+                gdw->has_rcu2[i] = (gdw->fuse_rcu2_c1_w[i] != NULL);
+            }
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.neck.weight"); gdw->neck_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.neck.bias"); gdw->neck_b = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.out_0.weight"); gdw->out_0_w = upload_tensor_f32_as_f16(&t);
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.out_0.bias"); gdw->out_0_b = upload_tensor_f32(&t);
+            gdw->out_mid = t.n_cols;
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.out_2.weight"); gdw->out_2_w = upload_tensor_f32(&t);
+            t = da3s_tensor(st, map, map_count, "da3.gsdpt.head.out_2.bias"); gdw->out_2_b = upload_tensor_f32(&t);
+            r->gsdpt.gs_out_channels = t.n_cols;
+            r->gsdpt.merger_ci[0] = 3;  r->gsdpt.merger_co[0] = 32;
+            r->gsdpt.merger_ci[1] = 32; r->gsdpt.merger_co[1] = 64;
+            r->gsdpt.merger_ci[2] = 64; r->gsdpt.merger_co[2] = 128;
+            for (int mi = 0; mi < 3; mi++) {
+                snprintf(name, sizeof(name), "da3.gsdpt.merger.%d.weight", mi);
+                t = da3s_tensor(st, map, map_count, name);
+                if (t.data) {
+                    r->gsdpt.merger_w[mi] = upload_tensor_f32(&t);
+                    r->gsdpt.merger_co[mi] = (t.n_dims == 4) ? (int)t.dims[3] : t.n_rows;
+                    snprintf(name, sizeof(name), "da3.gsdpt.merger.%d.bias", mi);
+                    t = da3s_tensor(st, map, map_count, name);
+                    r->gsdpt.merger_b[mi] = upload_tensor_f32(&t);
+                }
+            }
+            r->gsdpt.loaded = 1;
+            if (r->verbose >= 1)
+                fprintf(stderr, "hip_da3: GSDPT weights loaded (out_ch=%d, out_mid=%d, merger=%d→%d→%d)\n",
+                        r->gsdpt.gs_out_channels, gdw->out_mid,
+                        r->gsdpt.merger_co[0], r->gsdpt.merger_co[1], r->gsdpt.merger_co[2]);
+        }
+    }
+
+    /* Allocate scratch buffers */
     int nt = r->n_tokens, dim = r->dim, np = r->n_patches, gh = r->grid_h;
     int max_ffn = r->use_swiglu ? 2 * r->ffn_hidden : 4 * dim;
     CHECK_HIP(hipMalloc(&r->d_hidden, (size_t)nt*dim*sizeof(float)));
@@ -1455,6 +1672,22 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
         CHECK_HIP(hipMalloc(&r->d_dpt_tmp, large_sz*sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_dpt_tmp2, large_sz*sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_dpt_out, (size_t)2*max_hw*sizeof(float)));
+        if (r->dpt_aux.loaded) {
+            for (int i = 0; i < 4; i++)
+                CHECK_HIP(hipMalloc(&r->d_aux_out[i], (size_t)7*sp_h[0]*sp_w[0]*sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_aux_scratch, (size_t)256*max_hw*sizeof(float)));
+            if (r->verbose >= 1) fprintf(stderr, "hip_da3: DPT Aux scratch allocated\n");
+        }
+        if (r->gsdpt.loaded) {
+            int mg_h = r->image_size, mg_w = r->image_size;
+            for (int s = 0; s < 3; s++) { mg_h = (mg_h + 2*1 - 3)/2 + 1; mg_w = (mg_w + 2*1 - 3)/2 + 1; }
+            r->gs_merger_h = mg_h; r->gs_merger_w = mg_w;
+            CHECK_HIP(hipMalloc(&r->d_gs_merged, (size_t)128*mg_h*mg_w*sizeof(float)));
+            int gs_oc = r->gsdpt.gs_out_channels; if (gs_oc < 2) gs_oc = 38;
+            CHECK_HIP(hipMalloc(&r->d_gs_out, (size_t)gs_oc*max_hw*sizeof(float)));
+            if (r->verbose >= 1)
+                fprintf(stderr, "hip_da3: GSDPT scratch allocated (%d channels, merger=%dx%d)\n", gs_oc, mg_h, mg_w);
+        }
     }
     int *py = (int *)calloc((size_t)nt, sizeof(int));
     int *px = (int *)calloc((size_t)nt, sizeof(int));
@@ -1466,9 +1699,12 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
     r->cpu_model = NULL;
     r->loaded = 1;
 
-    if (r->verbose >= 1)
+    if (r->verbose >= 1) {
         fprintf(stderr, "hip_da3: loaded %d blocks, dim=%d, tokens=%d, swiglu=%d (safetensors)\n",
                 nb, dim, nt, r->use_swiglu);
+        fprintf(stderr, "hip_da3: modules: cam_dec=%d cam_enc=%d dpt_aux=%d gsdpt=%d\n",
+                r->cam_dec.loaded, r->cam_enc.loaded, r->dpt_aux.loaded, r->gsdpt.loaded);
+    }
 
     for (int i = 0; i < map_count; i++) free((void *)map[i].gguf_name);
     free(map);
@@ -1740,6 +1976,160 @@ static void run_camera_dec(hip_da3_runner *r, float *pose_out) {
     free(h_mlp); free(h_fc_t_w); free(h_fc_t_b); free(h_fc_q_w); free(h_fc_q_b); free(h_fc_f_w); free(h_fc_f_b);
 }
 
+/* Aux DPT: rays + sky segmentation (reuses d_dpt_adapted from main DPT) */
+static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
+                          void **d_aux_out) {
+    int feat = features;
+
+    /* Bottom-up aux RefineNet fusion (same structure as main but with aux weights) */
+    void *aux_fused = r->d_dpt_fused; /* reuse after main DPT completes */
+
+    /* Level 3 (deepest) */
+    gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
+                     NULL, 0, 0, feat, aux_fused,
+                     r->dpt_aux.fuse_out_w[3], r->dpt_aux.fuse_out_b[3],
+                     r->dpt_aux.fuse_rcu1_c1_w[3], r->dpt_aux.fuse_rcu1_c1_b[3],
+                     r->dpt_aux.fuse_rcu1_c2_w[3], r->dpt_aux.fuse_rcu1_c2_b[3],
+                     r->dpt_aux.fuse_rcu2_c1_w[3], r->dpt_aux.fuse_rcu2_c1_b[3],
+                     r->dpt_aux.fuse_rcu2_c2_w[3], r->dpt_aux.fuse_rcu2_c2_b[3],
+                     r->dpt_aux.has_rcu1[3], r->dpt_aux.has_rcu2[3]);
+    int fh = sp_h[3], fw = sp_w[3];
+
+    /* Level 2 */
+    gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
+                     aux_fused, fh, fw, feat, aux_fused,
+                     r->dpt_aux.fuse_out_w[2], r->dpt_aux.fuse_out_b[2],
+                     r->dpt_aux.fuse_rcu1_c1_w[2], r->dpt_aux.fuse_rcu1_c1_b[2],
+                     r->dpt_aux.fuse_rcu1_c2_w[2], r->dpt_aux.fuse_rcu1_c2_b[2],
+                     r->dpt_aux.fuse_rcu2_c1_w[2], r->dpt_aux.fuse_rcu2_c1_b[2],
+                     r->dpt_aux.fuse_rcu2_c2_w[2], r->dpt_aux.fuse_rcu2_c2_b[2],
+                     r->dpt_aux.has_rcu1[2], r->dpt_aux.has_rcu2[2]);
+    fh = sp_h[2]; fw = sp_w[2];
+
+    /* Level 1 */
+    gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
+                     aux_fused, fh, fw, feat, aux_fused,
+                     r->dpt_aux.fuse_out_w[1], r->dpt_aux.fuse_out_b[1],
+                     r->dpt_aux.fuse_rcu1_c1_w[1], r->dpt_aux.fuse_rcu1_c1_b[1],
+                     r->dpt_aux.fuse_rcu1_c2_w[1], r->dpt_aux.fuse_rcu1_c2_b[1],
+                     r->dpt_aux.fuse_rcu2_c1_w[1], r->dpt_aux.fuse_rcu2_c1_b[1],
+                     r->dpt_aux.fuse_rcu2_c2_w[1], r->dpt_aux.fuse_rcu2_c2_b[1],
+                     r->dpt_aux.has_rcu1[1], r->dpt_aux.has_rcu2[1]);
+    fh = sp_h[1]; fw = sp_w[1];
+
+    /* Level 0 */
+    gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
+                     aux_fused, fh, fw, feat, aux_fused,
+                     r->dpt_aux.fuse_out_w[0], r->dpt_aux.fuse_out_b[0],
+                     r->dpt_aux.fuse_rcu1_c1_w[0], r->dpt_aux.fuse_rcu1_c1_b[0],
+                     r->dpt_aux.fuse_rcu1_c2_w[0], r->dpt_aux.fuse_rcu1_c2_b[0],
+                     r->dpt_aux.fuse_rcu2_c1_w[0], r->dpt_aux.fuse_rcu2_c1_b[0],
+                     r->dpt_aux.fuse_rcu2_c2_w[0], r->dpt_aux.fuse_rcu2_c2_b[0],
+                     r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0]);
+
+    /* Debug: check aux_fused values after refinenet */
+    if (r->verbose >= 2) {
+        hipDeviceSynchronize();
+        float dbg[8];
+        hipMemcpy(dbg, aux_fused, sizeof(dbg), hipMemcpyDeviceToHost);
+        fprintf(stderr, "  aux_fused[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
+    }
+
+    /* Only the LAST level (index 3, finest resolution) is used for output.
+     * Python: fused_aux_pyr[-1] -> output_conv2_aux[-1] -> final output.
+     * output_conv1_aux[3]: 5 Conv2d, no activations (dense indices .0-.4)
+     * output_conv2_aux[3]: Conv2d(128,32,3) -> LayerNorm(32) -> ReLU -> Conv2d(32,7,1) */
+    {
+        int lv = 3;  /* last level = finest */
+        int oh = sp_h[0], ow = sp_w[0];
+
+        /* output_conv1_aux[3]: 5 Conv2d chain (NO activations) */
+        void *cur = r->d_aux_scratch;
+        hipMemcpyAsync(cur, aux_fused, (size_t)feat * oh * ow * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+        int ci = feat;
+        for (int ci_idx = 0; ci_idx < r->dpt_aux.oc1_count[lv]; ci_idx++) {
+            int co = r->dpt_aux.oc1_co[lv][ci_idx];
+            void *dst_buf = (ci_idx % 2 == 0) ? r->d_dpt_tmp : r->d_aux_scratch;
+            void *src_buf = (ci_idx % 2 == 0) ? r->d_aux_scratch : r->d_dpt_tmp;
+            if (ci_idx == 0) src_buf = cur;
+            kl_conv2d(r, dst_buf, src_buf,
+                       r->dpt_aux.oc1_w[lv][ci_idx], r->dpt_aux.oc1_b[lv][ci_idx],
+                       oh, ow, ci, co, 3, 3, 1, 1);
+            if (r->verbose >= 2) {
+                hipDeviceSynchronize();
+                float dbg[4];
+                hipMemcpy(dbg, dst_buf, sizeof(dbg), hipMemcpyDeviceToHost);
+                fprintf(stderr, "    oc1[3].%d (%d->%d): %.4e %.4e %.4e %.4e\n",
+                        ci_idx, ci, co, dbg[0], dbg[1], dbg[2], dbg[3]);
+            }
+            ci = co;
+            cur = dst_buf;
+        }
+
+        /* output_conv2_aux[3]: Conv2d(128,32,3) + LayerNorm(32) + ReLU + Conv2d(32,7,1) */
+        void *ln_in = r->d_dpt_tmp2;
+        kl_conv2d(r, ln_in, cur,
+                   r->dpt_aux.oc2_conv_w[lv], r->dpt_aux.oc2_conv_b[lv],
+                   oh, ow, ci, 32, 3, 3, 1, 1);
+        if (r->verbose >= 2) {
+            hipDeviceSynchronize();
+            float dbg[8];
+            hipMemcpy(dbg, ln_in, sizeof(dbg), hipMemcpyDeviceToHost);
+            fprintf(stderr, "  aux oc2 conv[0..7]: %.4e %.4e %.4e %.4e %.4e %.4e %.4e %.4e\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
+            int mid = 32 * (oh * ow / 2);
+            hipMemcpy(dbg, (char *)ln_in + (size_t)mid * sizeof(float), sizeof(dbg), hipMemcpyDeviceToHost);
+            fprintf(stderr, "  aux oc2 conv[mid]: %.4e %.4e %.4e %.4e\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3]);
+        }
+        void *relu_src = ln_in;
+        /* Use LayerNorm weights for this level (NULL = default init w=1, b=0).
+         * Only level 0 has trained LayerNorm weights in safetensors;
+         * levels 1-3 use default init (normalize without learned scale/bias). */
+        void *ln_w = r->dpt_aux.oc2_gn_w[lv];  /* may be NULL */
+        void *ln_b = r->dpt_aux.oc2_gn_b[lv];  /* may be NULL */
+        {
+            void *ln_out = r->d_aux_scratch;
+            kl_channel_layernorm(r, ln_out, ln_in, ln_w, ln_b, 32, oh * ow);
+            relu_src = ln_out;
+            if (r->verbose >= 2) {
+                hipDeviceSynchronize();
+                float dbg[8];
+                hipMemcpy(dbg, ln_out, sizeof(dbg), hipMemcpyDeviceToHost);
+                fprintf(stderr, "  aux oc2 ln[0..7]: %.4e %.4e %.4e %.4e %.4e %.4e %.4e %.4e\n",
+                        dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
+                int mid = 32 * (oh * ow / 2);
+                hipMemcpy(dbg, (char *)ln_out + (size_t)mid * sizeof(float), sizeof(dbg), hipMemcpyDeviceToHost);
+                fprintf(stderr, "  aux oc2 ln[mid]: %.4e %.4e %.4e %.4e\n",
+                        dbg[0], dbg[1], dbg[2], dbg[3]);
+            }
+        }
+        kl_relu_inplace(r, relu_src, 32 * oh * ow);
+        if (r->verbose >= 2) {
+            hipDeviceSynchronize();
+            float dbg[8];
+            hipMemcpy(dbg, relu_src, sizeof(dbg), hipMemcpyDeviceToHost);
+            fprintf(stderr, "  aux oc2 relu[0..7]: %.4e %.4e %.4e %.4e %.4e %.4e %.4e %.4e\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
+        }
+        kl_conv2d(r, d_aux_out[0], relu_src,
+                   r->dpt_aux.oc2_out_w[lv], r->dpt_aux.oc2_out_b[lv],
+                   oh, ow, 32, 7, 1, 1, 1, 0);
+        if (r->verbose >= 2) {
+            hipDeviceSynchronize();
+            float dbg[8];
+            hipMemcpy(dbg, d_aux_out[0], sizeof(dbg), hipMemcpyDeviceToHost);
+            fprintf(stderr, "  aux final[0..7]: %.4e %.4e %.4e %.4e %.4e %.4e %.4e %.4e\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
+            int mid = 7 * (oh * ow / 2);
+            hipMemcpy(dbg, (char *)d_aux_out[0] + (size_t)mid * sizeof(float), sizeof(dbg), hipMemcpyDeviceToHost);
+            fprintf(stderr, "  aux final[mid]: %.4e %.4e %.4e %.4e\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3]);
+        }
+    }
+}
+
 /* ======================================================================== */
 /* Public API: predict                                                      */
 /* ======================================================================== */
@@ -1923,6 +2313,218 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
     if (r->verbose >= 1) fprintf(stderr, "hip_da3: GPU DPT head: %.1f ms\n", (t1-t0)*1000);
+
+    /* ─── Aux DPT (Phase 2): rays + sky segmentation ─── */
+    if (r->dpt_aux.loaded && (output_flags & DA3_OUTPUT_RAYS)) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double ax0 = ts.tv_sec + ts.tv_nsec * 1e-9;
+
+        /* Run aux branch (reuses d_dpt_adapted from main DPT token processing) */
+        run_aux_dpt(r, sp_h, sp_w, feat, r->d_aux_out);
+
+        /* Only last level (index 3) is used — single output in d_aux_out[0] */
+        int oh = sp_h[0], ow = sp_w[0];
+
+        /* Bilinear upsample 7 channels to original resolution */
+        int npix = img_w * img_h;
+        result.rays = (float *)malloc((size_t)6 * npix * sizeof(float));
+        result.ray_confidence = (float *)malloc((size_t)npix * sizeof(float));
+
+        void *d_aux_full = r->d_dpt_tmp;
+        kl_bilinear(r, d_aux_full, r->d_aux_out[0], 7, oh, ow, img_h, img_w);
+        hipDeviceSynchronize();
+
+        float *h_aux_full = (float *)malloc((size_t)7 * npix * sizeof(float));
+        hipMemcpy(h_aux_full, d_aux_full, (size_t)7 * npix * sizeof(float), hipMemcpyDeviceToHost);
+
+        /* Split: rays = channels 0-5 (linear activation = identity),
+         *        ray_confidence = channel 6 (expp1 = exp(x) + 1) */
+        memcpy(result.rays, h_aux_full, (size_t)6 * npix * sizeof(float));
+        /* Apply expp1 activation to ray confidence: exp(x) + 1 */
+        {
+            const float *src = h_aux_full + 6 * npix;
+            for (int i = 0; i < npix; i++)
+                result.ray_confidence[i] = expf(src[i]) + 1.0f;
+        }
+        /* Sky segmentation: not available from DualDPT (only from metric DPT branch) */
+        result.sky_seg = NULL;
+        free(h_aux_full);
+
+        result.has_rays = 1;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double ax1 = ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (r->verbose >= 1)
+            fprintf(stderr, "hip_da3: Aux DPT (rays+sky): %.1f ms\n", (ax1-ax0)*1000);
+    }
+
+    /* ─── GSDPT (Phase 4): 3D Gaussian estimation ─── */
+    if (r->gsdpt.loaded && (output_flags & DA3_OUTPUT_GAUSSIANS)) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double gs0 = ts.tv_sec + ts.tv_nsec * 1e-9;
+
+        dpt_gpu_weights *gdw = &r->gsdpt.dpt;
+        int gs_oc = r->gsdpt.gs_out_channels;
+        if (gs_oc < 2) gs_oc = 38;
+
+        /* Run images_merger: 3 stride-2 Conv2d on normalized image -> d_gs_merged
+         * Input: d_img_norm [3, target_h, target_w] */
+        {
+            void *cur = r->d_img_norm;
+            void *bufs[2] = {r->d_dpt_tmp, r->d_dpt_tmp2};
+            int mh = target_h, mw = target_w;
+            for (int mi = 0; mi < 3; mi++) {
+                if (!r->gsdpt.merger_w[mi]) break;
+                int mci = r->gsdpt.merger_ci[mi];
+                int mco = r->gsdpt.merger_co[mi];
+                int moh = (mh + 2 * 1 - 3) / 2 + 1;
+                int mow = (mw + 2 * 1 - 3) / 2 + 1;
+                void *dst = (mi == 2) ? r->d_gs_merged : bufs[mi % 2];
+                kl_conv2d(r, dst, cur, r->gsdpt.merger_w[mi], r->gsdpt.merger_b[mi],
+                           mh, mw, mci, mco, 3, 3, 2, 1);
+                /* Activation at indices 1,3 only (not after last conv at index 4) */
+                if (mi < 2)
+                    kl_silu_inplace(r, dst, mco * moh * mow);
+                cur = dst;
+                mh = moh; mw = mow;
+            }
+        }
+
+        /* GSDPT token processing + refinenet (same pipeline as main DPT) */
+        /* Reuses d_features from backbone as input */
+
+        for (int fi = 0; fi < 4; fi++) {
+            int oc_val = r->head_out_channels[fi];
+
+            kl_cls_concat(r, r->d_dpt_cat, r->d_features[fi], np, dim);
+            if (gdw->norm_w)
+                kl_layernorm(r, r->d_dpt_ln, r->d_dpt_cat, gdw->norm_w, gdw->norm_b,
+                              np, head_dim_in);
+            else
+                hipMemcpyAsync(r->d_dpt_ln, r->d_dpt_cat,
+                                   (size_t)np * head_dim_in * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+
+            kl_gemm(r, r->d_dpt_proj, gdw->proj_w[fi], r->d_dpt_ln, gdw->proj_b[fi],
+                     oc_val, head_dim_in, np);
+
+            if (fi == 0)
+                kl_deconv_gemm_scatter(r, r->d_dpt_spatial[0], r->d_dpt_proj,
+                                        gdw->upsample_0_w, gdw->upsample_0_b, r->d_dpt_ln,
+                                        oc_val, oc_val, gh, gw, 4, 4, 4);
+            else if (fi == 1)
+                kl_deconv_gemm_scatter(r, r->d_dpt_spatial[1], r->d_dpt_proj,
+                                        gdw->upsample_1_w, gdw->upsample_1_b, r->d_dpt_ln,
+                                        oc_val, oc_val, gh, gw, 2, 2, 2);
+            else if (fi == 2) {
+                kl_tok_to_chw(r, r->d_dpt_chw, r->d_dpt_proj, oc_val, gh, gw);
+                hipMemcpyAsync(r->d_dpt_spatial[2], r->d_dpt_chw,
+                                   (size_t)oc_val * gh * gw * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+            } else {
+                kl_tok_to_chw(r, r->d_dpt_chw, r->d_dpt_proj, oc_val, gh, gw);
+                kl_conv_gemm(r, r->d_dpt_spatial[3], r->d_dpt_chw,
+                              gdw->downsample_w, gdw->downsample_b,
+                              gh, gw, oc_val, oc_val, 3, 3, 2, 1);
+            }
+
+            void *null_bias = NULL;
+            kl_conv_gemm(r, r->d_dpt_adapted[fi], r->d_dpt_spatial[fi],
+                          gdw->adapter_w[fi], null_bias,
+                          sp_h[fi], sp_w[fi], oc_val, feat, 3, 3, 1, 1);
+        }
+
+        /* TODO: Inject merger features at level 0 (add to d_dpt_adapted[0]) */
+        /* For now, skip merger injection — just run standard DPT pipeline */
+
+        /* Bottom-up RefineNet fusion with GSDPT weights */
+        gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
+                        NULL, 0, 0, feat, r->d_dpt_fused,
+                        gdw->fuse_out_w[3], gdw->fuse_out_b[3],
+                        gdw->fuse_rcu1_c1_w[3], gdw->fuse_rcu1_c1_b[3],
+                        gdw->fuse_rcu1_c2_w[3], gdw->fuse_rcu1_c2_b[3],
+                        gdw->fuse_rcu2_c1_w[3], gdw->fuse_rcu2_c1_b[3],
+                        gdw->fuse_rcu2_c2_w[3], gdw->fuse_rcu2_c2_b[3],
+                        gdw->has_rcu1[3], gdw->has_rcu2[3]);
+        int gs_fh = sp_h[3], gs_fw = sp_w[3];
+        gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
+                        r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
+                        gdw->fuse_out_w[2], gdw->fuse_out_b[2],
+                        gdw->fuse_rcu1_c1_w[2], gdw->fuse_rcu1_c1_b[2],
+                        gdw->fuse_rcu1_c2_w[2], gdw->fuse_rcu1_c2_b[2],
+                        gdw->fuse_rcu2_c1_w[2], gdw->fuse_rcu2_c1_b[2],
+                        gdw->fuse_rcu2_c2_w[2], gdw->fuse_rcu2_c2_b[2],
+                        gdw->has_rcu1[2], gdw->has_rcu2[2]);
+        gs_fh = sp_h[2]; gs_fw = sp_w[2];
+        gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
+                        r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
+                        gdw->fuse_out_w[1], gdw->fuse_out_b[1],
+                        gdw->fuse_rcu1_c1_w[1], gdw->fuse_rcu1_c1_b[1],
+                        gdw->fuse_rcu1_c2_w[1], gdw->fuse_rcu1_c2_b[1],
+                        gdw->fuse_rcu2_c1_w[1], gdw->fuse_rcu2_c1_b[1],
+                        gdw->fuse_rcu2_c2_w[1], gdw->fuse_rcu2_c2_b[1],
+                        gdw->has_rcu1[1], gdw->has_rcu2[1]);
+        gs_fh = sp_h[1]; gs_fw = sp_w[1];
+        gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
+                        r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
+                        gdw->fuse_out_w[0], gdw->fuse_out_b[0],
+                        gdw->fuse_rcu1_c1_w[0], gdw->fuse_rcu1_c1_b[0],
+                        gdw->fuse_rcu1_c2_w[0], gdw->fuse_rcu1_c2_b[0],
+                        gdw->fuse_rcu2_c1_w[0], gdw->fuse_rcu2_c1_b[0],
+                        gdw->fuse_rcu2_c2_w[0], gdw->fuse_rcu2_c2_b[0],
+                        gdw->has_rcu1[0], gdw->has_rcu2[0]);
+        gs_fh = sp_h[0]; gs_fw = sp_w[0];
+
+        /* Output convolutions -> gs_oc channels
+         * output_conv1 (neck): Conv2d(256, 128, 3) — NO ReLU (single .0 index)
+         * + inject upsampled merger features (element-wise add)
+         * output_conv2: Conv2d(128, 32, 3) + ReLU + Conv2d(32, gs_oc, 1) */
+        int gs_feat_half = feat / 2;
+        if (gs_feat_half < 1) gs_feat_half = 1;
+        int gs_out_mid = gdw->out_mid > 0 ? gdw->out_mid : gs_feat_half;
+
+        /* output_conv1 (neck): Conv2d(256, 128, 3, pad=1), no activation */
+        kl_conv_gemm(r, r->d_dpt_tmp, r->d_dpt_fused,
+                      gdw->neck_w, gdw->neck_b,
+                      gs_fh, gs_fw, feat, gs_feat_half, 3, 3, 1, 1);
+
+        /* Inject merger features: upsample d_gs_merged [128, mg_h, mg_w] -> [128, gs_fh, gs_fw]
+         * then add to neck output */
+        if (r->d_gs_merged && r->gs_merger_h > 0) {
+            kl_bilinear(r, r->d_dpt_tmp2, r->d_gs_merged,
+                         gs_feat_half, r->gs_merger_h, r->gs_merger_w, gs_fh, gs_fw);
+            kl_add_inplace(r, r->d_dpt_tmp, r->d_dpt_tmp2, gs_feat_half * gs_fh * gs_fw);
+        }
+
+        /* output_conv2: Conv2d(128, 32, 3, pad=1) + ReLU + Conv2d(32, gs_oc, 1) */
+        kl_conv_gemm(r, r->d_dpt_tmp2, r->d_dpt_tmp,
+                      gdw->out_0_w, gdw->out_0_b,
+                      gs_fh, gs_fw, gs_feat_half, gs_out_mid, 3, 3, 1, 1);
+        kl_relu_inplace(r, r->d_dpt_tmp2, gs_out_mid * gs_fh * gs_fw);
+        kl_conv2d(r, r->d_gs_out, r->d_dpt_tmp2,
+                   gdw->out_2_w, gdw->out_2_b,
+                   gs_fh, gs_fw, gs_out_mid, gs_oc, 1, 1, 1, 0);
+
+        /* Download gaussians */
+        hipDeviceSynchronize();
+
+        /* Bilinear upsample each channel to output resolution */
+        int npix = img_w * img_h;
+        size_t gs_full_sz = (size_t)gs_oc * npix * sizeof(float);
+        void *d_gs_full = NULL;
+        hipMalloc(&d_gs_full, gs_full_sz);
+        kl_bilinear(r, d_gs_full, r->d_gs_out, gs_oc, gs_fh, gs_fw, img_h, img_w);
+        hipDeviceSynchronize();
+        result.gaussians = (float *)malloc(gs_full_sz);
+        hipMemcpy(result.gaussians, d_gs_full, gs_full_sz, hipMemcpyDeviceToHost);
+        hipFree(d_gs_full);
+
+        result.has_gaussians = 1;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double gs1 = ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (r->verbose >= 1)
+            fprintf(stderr, "hip_da3: GSDPT (%d channels): %.1f ms\n",
+                    gs_oc, (gs1-gs0)*1000);
+    }
 
     return result;
 }
