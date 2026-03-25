@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: MIT
+// Split [M, H, 2, HD] -> K[M, H*HD], V[M, H*HD]
+// Input is interleaved as [M, H, 2, HD] where 2*W = H*2*HD, W = H*HD
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer KBuffer { float K[]; };
+layout(std430, binding = 1) writeonly buffer VBuffer { float V[]; };
+layout(std430, binding = 2) readonly buffer KVBuffer { float kv[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint H;
+    uint HD;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint W = pc.H * pc.HD;
+    uint total = pc.M * W;
+    if (idx >= total) return;
+
+    uint m = idx / W;
+    uint rem = idx % W;
+    uint h = rem / pc.HD;
+    uint d = rem % pc.HD;
+
+    uint base = m * 2 * W + h * 2 * pc.HD;
+    K[idx] = kv[base + d];
+    V[idx] = kv[base + pc.HD + d];
+}
