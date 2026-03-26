@@ -85,8 +85,15 @@ static float rescale_t(float t, float rt) { return t*rt/(1.0f+(rt-1.0f)*t); }
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <stage1.st> <decoder.st> <features.npy> "
-                "[-s seed] [-n steps] [-g cfg_scale] [-o output.obj]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <stage1.st> <decoder.st> <features.npy> [options]\n\n"
+                "Options:\n"
+                "  -s <seed>        Random seed (default: 42)\n"
+                "  -n <steps>       Euler steps (default: 12)\n"
+                "  -g <cfg_scale>   CFG guidance scale (default: 7.5)\n"
+                "  -o <output.obj>  Output mesh path (default: output.obj)\n"
+                "  --grid <N>       Marching cubes grid resolution (default: 64, try 32 for lighter mesh)\n"
+                "  --threshold <t>  Occupancy threshold (default: 0.0)\n"
+                "  --npy <path>     Also save latent as .npy\n", argv[0]);
         return 1;
     }
     const char *stage1_path = argv[1];
@@ -98,6 +105,8 @@ int main(int argc, char **argv) {
     float rescale = 5.0f;
     const char *obj_path = "output.obj";
     const char *npy_path = NULL;
+    int mc_grid = 64;
+    float mc_threshold = 0.0f;
 
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
@@ -105,6 +114,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-g") && i+1 < argc) cfg_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "-o") && i+1 < argc) obj_path = argv[++i];
         else if (!strcmp(argv[i], "--npy") && i+1 < argc) npy_path = argv[++i];
+        else if (!strcmp(argv[i], "--grid") && i+1 < argc) mc_grid = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--threshold") && i+1 < argc) mc_threshold = (float)atof(argv[++i]);
     }
 
     /* Load features */
@@ -202,9 +213,48 @@ int main(int argc, char **argv) {
             occ_count, 64*64*64, 100.0f * occ_count / (64*64*64));
 
     /* Marching cubes + OBJ export */
-    fprintf(stderr, "\n=== Mesh Export ===\n");
+    fprintf(stderr, "\n=== Mesh Export (grid=%d, threshold=%.1f) ===\n", mc_grid, mc_threshold);
+
+    float *mc_input = occupancy;
+    int mc_n = 64;
+
+    /* Downsample occupancy grid if requested */
+    if (mc_grid > 0 && mc_grid < 64) {
+        mc_n = mc_grid;
+        float *ds = (float *)calloc((size_t)mc_n * mc_n * mc_n, sizeof(float));
+        float scale = 64.0f / (float)mc_n;
+        for (int z = 0; z < mc_n; z++) {
+            for (int y = 0; y < mc_n; y++) {
+                for (int x = 0; x < mc_n; x++) {
+                    /* Trilinear interpolation from 64^3 */
+                    float fz = (z + 0.5f) * scale - 0.5f;
+                    float fy = (y + 0.5f) * scale - 0.5f;
+                    float fx = (x + 0.5f) * scale - 0.5f;
+                    int iz = (int)fz, iy = (int)fy, ix = (int)fx;
+                    if (iz < 0) iz = 0; if (iz > 62) iz = 62;
+                    if (iy < 0) iy = 0; if (iy > 62) iy = 62;
+                    if (ix < 0) ix = 0; if (ix > 62) ix = 62;
+                    float dz = fz - iz, dy = fy - iy, dx = fx - ix;
+                    #define OCC(a,b,c) occupancy[(a)*64*64 + (b)*64 + (c)]
+                    float v = OCC(iz,iy,ix)*(1-dz)*(1-dy)*(1-dx)
+                            + OCC(iz,iy,ix+1)*(1-dz)*(1-dy)*dx
+                            + OCC(iz,iy+1,ix)*(1-dz)*dy*(1-dx)
+                            + OCC(iz,iy+1,ix+1)*(1-dz)*dy*dx
+                            + OCC(iz+1,iy,ix)*dz*(1-dy)*(1-dx)
+                            + OCC(iz+1,iy,ix+1)*dz*(1-dy)*dx
+                            + OCC(iz+1,iy+1,ix)*dz*dy*(1-dx)
+                            + OCC(iz+1,iy+1,ix+1)*dz*dy*dx;
+                    #undef OCC
+                    ds[z * mc_n * mc_n + y * mc_n + x] = v;
+                }
+            }
+        }
+        mc_input = ds;
+        fprintf(stderr, "Downsampled 64^3 -> %d^3\n", mc_n);
+    }
+
     float bounds[6] = {0, 0, 0, 1, 1, 1};
-    mc_mesh mesh = mc_marching_cubes(occupancy, 64, 64, 64, 0.0f, bounds);
+    mc_mesh mesh = mc_marching_cubes(mc_input, mc_n, mc_n, mc_n, mc_threshold, bounds);
     fprintf(stderr, "Marching cubes: %d vertices, %d triangles\n", mesh.n_verts, mesh.n_tris);
 
     if (mesh.n_tris > 0) {
@@ -212,6 +262,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Wrote %s\n", obj_path);
     }
     mc_mesh_free(&mesh);
+    if (mc_input != occupancy) free(mc_input);
     free(occupancy);
     cuda_trellis2_free(r);
 
