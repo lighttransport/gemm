@@ -109,6 +109,24 @@ Options:
 
 Output: `occupancy.npy` — float32 [64, 64, 64] occupancy logits
 
+### Export mesh (.obj)
+
+Convert the occupancy grid to a triangle mesh using marching cubes:
+
+```bash
+./test_trellis2 mesh occupancy.npy -o output.obj -t 0.0
+```
+
+Options:
+- `-o <path>` — output .obj file (default: output.obj)
+- `-t <threshold>` — occupancy threshold (default: 0.0, higher = less volume)
+
+The mesh is in [0,1]^3 coordinate space. Open with any 3D viewer
+(Blender, MeshLab, the macOS Preview, etc.).
+
+**Threshold guide**: start with 0.0. If the mesh has too much noise/fill,
+try higher values (10, 50, 100).
+
 ### Interpreting the output
 
 The output is a 64x64x64 grid of logits (not probabilities). Positive values indicate
