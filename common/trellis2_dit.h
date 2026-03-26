@@ -53,19 +53,21 @@ typedef struct {
 typedef struct {
     /* Self-attention */
     qtensor sa_qkv_w, sa_qkv_b;         /* [3*dim, dim] */
-    qtensor sa_q_norm_w;                  /* [head_dim] RMSNorm */
-    qtensor sa_k_norm_w;                  /* [head_dim] RMSNorm */
+    qtensor sa_q_norm_w;                  /* [n_heads, head_dim] RMSNorm gamma */
+    qtensor sa_k_norm_w;                  /* [n_heads, head_dim] RMSNorm gamma */
     qtensor sa_proj_w, sa_proj_b;        /* [dim, dim] */
     /* Cross-attention */
     qtensor norm2_w, norm2_b;             /* [dim] affine LayerNorm */
     qtensor ca_q_w, ca_q_b;             /* [dim, dim] */
     qtensor ca_kv_w, ca_kv_b;           /* [2*dim, cond_dim] */
-    qtensor ca_q_norm_w;                  /* [head_dim] RMSNorm */
-    qtensor ca_k_norm_w;                  /* [head_dim] RMSNorm */
+    qtensor ca_q_norm_w;                  /* [n_heads, head_dim] RMSNorm gamma */
+    qtensor ca_k_norm_w;                  /* [n_heads, head_dim] RMSNorm gamma */
     qtensor ca_proj_w, ca_proj_b;        /* [dim, dim] */
     /* MLP */
     qtensor mlp_fc1_w, mlp_fc1_b;       /* [ffn, dim] */
     qtensor mlp_fc2_w, mlp_fc2_b;       /* [dim, ffn] */
+    /* Per-block modulation bias: [6*dim] added to global mod */
+    qtensor mod_bias;
 } t2dit_block;
 
 typedef struct {
@@ -365,16 +367,18 @@ static void t2dit_adaln(float *dst, const float *src,
 
 /* ---- Per-head RMSNorm: x = x * w / sqrt(mean(x^2) + eps) ---- */
 
+/* w is [n_heads * head_dim] (flattened from [n_heads, head_dim]) */
 static void t2dit_rmsnorm(float *vec, int n_tok, int n_heads, int head_dim,
                             int stride, const float *w, float eps) {
     if (!w) return;
     for (int t = 0; t < n_tok; t++) {
         for (int h = 0; h < n_heads; h++) {
             float *v = vec + (size_t)t * stride + h * head_dim;
+            const float *wh = w + h * head_dim;  /* per-head weights */
             float ss = 0.0f;
             for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];
             float rms = 1.0f / sqrtf(ss / head_dim + eps);
-            for (int i = 0; i < head_dim; i++) v[i] *= rms * w[i];
+            for (int i = 0; i < head_dim; i++) v[i] *= rms * wh[i];
         }
     }
 }
@@ -527,14 +531,28 @@ static void t2dit_self_attention(float *out, const float *qkv,
 /* ---- DiT block forward ---- */
 
 static void t2dit_block_forward(float *hidden, const t2dit_block *blk,
-                                  const float *shift_sa, const float *scale_sa,
-                                  const float *gate_sa,
-                                  const float *shift_mlp, const float *scale_mlp,
-                                  const float *gate_mlp,
+                                  const float *global_mod,
                                   const float *cond_kv, int n_cond,
                                   const t2dit_model *m, int n_threads) {
     int nt = m->n_tokens;
     int dim = m->model_channels;
+
+    /* Combine global mod + per-block mod bias */
+    float *mod = (float *)malloc((size_t)6 * dim * sizeof(float));
+    memcpy(mod, global_mod, (size_t)6 * dim * sizeof(float));
+    if (blk->mod_bias.data) {
+        float *mb = t2dit_dequant_full(&blk->mod_bias);
+        if (mb) {
+            for (int i = 0; i < 6 * dim; i++) mod[i] += mb[i];
+            free(mb);
+        }
+    }
+    const float *shift_sa  = mod;
+    const float *scale_sa  = mod + dim;
+    const float *gate_sa   = mod + 2 * dim;
+    const float *shift_mlp = mod + 3 * dim;
+    const float *scale_mlp = mod + 4 * dim;
+    const float *gate_mlp  = mod + 5 * dim;
     int hd = m->head_dim;
     int nh = m->n_heads;
 
@@ -636,6 +654,7 @@ static void t2dit_block_forward(float *hidden, const t2dit_block *blk,
             hidden[(size_t)t * dim + i] += gate_mlp[i] * mlp_out[(size_t)t * dim + i];
     free(mlp_out);
 
+    free(mod);
     free(tmp);
     free(attn_out);
 }
@@ -666,13 +685,6 @@ void t2dit_forward(float *out, const float *x_t, float t_val,
     t2dit_modulation(mod, t_emb, m);
     free(t_emb);
 
-    float *shift_sa  = mod;
-    float *scale_sa  = mod + dim;
-    float *gate_sa   = mod + 2 * dim;
-    float *shift_mlp = mod + 3 * dim;
-    float *scale_mlp = mod + 4 * dim;
-    float *gate_mlp  = mod + 5 * dim;
-
     /* Input embedding: x_t [n_tokens, in_channels] -> [n_tokens, dim] */
     float *hidden = (float *)malloc((size_t)nt * dim * sizeof(float));
     t2dit_batch_gemm(hidden, &m->x_embed_w, &m->x_embed_b,
@@ -685,9 +697,7 @@ void t2dit_forward(float *out, const float *x_t, float t_val,
         if (cond_kv_cache)
             block_kv = cond_kv_cache + (size_t)L * n_cond * 2 * dim;
 
-        t2dit_block_forward(hidden, &m->blocks[L],
-                            shift_sa, scale_sa, gate_sa,
-                            shift_mlp, scale_mlp, gate_mlp,
+        t2dit_block_forward(hidden, &m->blocks[L], mod,
                             block_kv, n_cond, m, n_threads);
     }
 
@@ -894,18 +904,20 @@ prefix_found:
     m->t_embed_fc1_b = T2DIT_FIND("t_embedder.mlp.0.bias");
     m->t_embed_fc2_w = T2DIT_FIND("t_embedder.mlp.2.weight");
     m->t_embed_fc2_b = T2DIT_FIND("t_embedder.mlp.2.bias");
-    m->mod_w = T2DIT_FIND("mod.1.weight");
-    m->mod_b = T2DIT_FIND("mod.1.bias");
-    m->x_embed_w = T2DIT_FIND("x_embedder.weight");
-    m->x_embed_b = T2DIT_FIND("x_embedder.bias");
+    m->mod_w = T2DIT_FIND("adaLN_modulation.1.weight");
+    m->mod_b = T2DIT_FIND("adaLN_modulation.1.bias");
+    if (!m->mod_w.data) {
+        m->mod_w = T2DIT_FIND("mod.1.weight");
+        m->mod_b = T2DIT_FIND("mod.1.bias");
+    }
+    m->x_embed_w = T2DIT_FIND("input_layer.weight");
+    m->x_embed_b = T2DIT_FIND("input_layer.bias");
+    if (!m->x_embed_w.data) {
+        m->x_embed_w = T2DIT_FIND("x_embedder.weight");
+        m->x_embed_b = T2DIT_FIND("x_embedder.bias");
+    }
     m->out_w = T2DIT_FIND("out_layer.weight");
     m->out_b = T2DIT_FIND("out_layer.bias");
-
-    /* Try alternate names */
-    if (!m->out_w.data) {
-        m->out_w = T2DIT_FIND("final_layer.linear.weight");
-        m->out_b = T2DIT_FIND("final_layer.linear.bias");
-    }
 
     fprintf(stderr, "t2dit: t_embedder: %s\n", m->t_embed_fc1_w.data ? "loaded" : "MISSING");
     fprintf(stderr, "t2dit: mod: %s\n", m->mod_w.data ? "loaded" : "MISSING");
@@ -926,30 +938,33 @@ prefix_found:
         } while(0)
 
         /* Self-attention */
-        T2DIT_LOAD(sa_qkv_w,      "self_attn.qkv.weight");
-        T2DIT_LOAD(sa_qkv_b,      "self_attn.qkv.bias");
-        T2DIT_LOAD(sa_q_norm_w,   "self_attn.q_norm.weight");
-        T2DIT_LOAD(sa_k_norm_w,   "self_attn.k_norm.weight");
-        T2DIT_LOAD(sa_proj_w,     "self_attn.proj.weight");
-        T2DIT_LOAD(sa_proj_b,     "self_attn.proj.bias");
+        T2DIT_LOAD(sa_qkv_w,      "self_attn.to_qkv.weight");
+        T2DIT_LOAD(sa_qkv_b,      "self_attn.to_qkv.bias");
+        T2DIT_LOAD(sa_q_norm_w,   "self_attn.q_rms_norm.gamma");
+        T2DIT_LOAD(sa_k_norm_w,   "self_attn.k_rms_norm.gamma");
+        T2DIT_LOAD(sa_proj_w,     "self_attn.to_out.weight");
+        T2DIT_LOAD(sa_proj_b,     "self_attn.to_out.bias");
 
         /* Cross-attention */
         T2DIT_LOAD(norm2_w,       "norm2.weight");
         T2DIT_LOAD(norm2_b,       "norm2.bias");
-        T2DIT_LOAD(ca_q_w,        "cross_attn.q.weight");
-        T2DIT_LOAD(ca_q_b,        "cross_attn.q.bias");
-        T2DIT_LOAD(ca_kv_w,       "cross_attn.kv.weight");
-        T2DIT_LOAD(ca_kv_b,       "cross_attn.kv.bias");
-        T2DIT_LOAD(ca_q_norm_w,   "cross_attn.q_norm.weight");
-        T2DIT_LOAD(ca_k_norm_w,   "cross_attn.k_norm.weight");
-        T2DIT_LOAD(ca_proj_w,     "cross_attn.proj.weight");
-        T2DIT_LOAD(ca_proj_b,     "cross_attn.proj.bias");
+        T2DIT_LOAD(ca_q_w,        "cross_attn.to_q.weight");
+        T2DIT_LOAD(ca_q_b,        "cross_attn.to_q.bias");
+        T2DIT_LOAD(ca_kv_w,       "cross_attn.to_kv.weight");
+        T2DIT_LOAD(ca_kv_b,       "cross_attn.to_kv.bias");
+        T2DIT_LOAD(ca_q_norm_w,   "cross_attn.q_rms_norm.gamma");
+        T2DIT_LOAD(ca_k_norm_w,   "cross_attn.k_rms_norm.gamma");
+        T2DIT_LOAD(ca_proj_w,     "cross_attn.to_out.weight");
+        T2DIT_LOAD(ca_proj_b,     "cross_attn.to_out.bias");
 
         /* MLP */
-        T2DIT_LOAD(mlp_fc1_w,     "mlp.0.weight");
-        T2DIT_LOAD(mlp_fc1_b,     "mlp.0.bias");
-        T2DIT_LOAD(mlp_fc2_w,     "mlp.2.weight");
-        T2DIT_LOAD(mlp_fc2_b,     "mlp.2.bias");
+        T2DIT_LOAD(mlp_fc1_w,     "mlp.mlp.0.weight");
+        T2DIT_LOAD(mlp_fc1_b,     "mlp.mlp.0.bias");
+        T2DIT_LOAD(mlp_fc2_w,     "mlp.mlp.2.weight");
+        T2DIT_LOAD(mlp_fc2_b,     "mlp.mlp.2.bias");
+
+        /* Per-block modulation bias */
+        T2DIT_LOAD(mod_bias,      "modulation");
 
         #undef T2DIT_LOAD
 
