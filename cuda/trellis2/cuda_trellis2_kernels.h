@@ -11,7 +11,7 @@ static const char cuda_trellis2_kernel_source[] =
 /* ---- adaLN: y = LN_noaffine(x) * (1 + scale) + shift ---- */
 /* x: [N, dim], shift: [dim], scale: [dim], y: [N, dim] */
 /* Grid: N blocks, Block: 256 threads */
-"extern \"C\" __global__ void adaln_f32(\n"
+"__global__ void adaln_f32(\n"
 "    float *y, const float *x, const float *shift, const float *scale,\n"
 "    int dim, float eps) {\n"
 "    int tok = blockIdx.x;\n"
@@ -42,7 +42,7 @@ static const char cuda_trellis2_kernel_source[] =
 
 /* ---- Gated residual: dst[i] += gate[i % dim] * src[i] ---- */
 /* Grid: ceil(n/256), Block: 256 */
-"extern \"C\" __global__ void gated_add_f32(\n"
+"__global__ void gated_add_f32(\n"
 "    float *dst, const float *src, const float *gate, int n, int dim) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) dst[i] += gate[i % dim] * src[i];\n"
@@ -51,7 +51,7 @@ static const char cuda_trellis2_kernel_source[] =
 /* ---- Modulation: out = SiLU(t_emb) @ W^T + bias + per_block_bias ---- */
 /* t_emb: [dim], W: F16 [6*dim, dim], bias: [6*dim], blk_bias: [6*dim], out: [6*dim] */
 /* Single block, 256 threads — small computation (one vector) */
-"extern \"C\" __global__ void modulation_f32(\n"
+"__global__ void modulation_f32(\n"
 "    float *out, const float *t_emb, const float *mod_w, const float *mod_b,\n"
 "    const float *blk_bias, int dim, int out_dim) {\n"
 "    extern __shared__ float silu_emb[];\n"
@@ -74,7 +74,7 @@ static const char cuda_trellis2_kernel_source[] =
 /* Applied to Q and K buffers: [N, dim] where N = grid^3 */
 /* rope_cos/sin: [N, 3, n_freqs] */
 /* Grid: N, Block: 256 */
-"extern \"C\" __global__ void rope_3d_f32(\n"
+"__global__ void rope_3d_f32(\n"
 "    float *data, const float *rope_cos, const float *rope_sin,\n"
 "    int N, int dim, int n_heads, int head_dim,\n"
 "    int n_freqs, int axis_dim) {\n"
@@ -102,7 +102,7 @@ static const char cuda_trellis2_kernel_source[] =
 /* ---- Per-head RMSNorm with per-head gamma [n_heads, head_dim] ---- */
 /* data: [n_tok, stride], gamma: [n_heads * head_dim] */
 /* Grid: ceil(total_heads/256), Block: 256 — one thread per (tok, head) */
-"extern \"C\" __global__ void rms_norm_perhead_f32(\n"
+"__global__ void rms_norm_perhead_f32(\n"
 "    float *data, const float *gamma,\n"
 "    int n_tok, int n_heads, int head_dim, int stride, float eps) {\n"
 "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -121,7 +121,7 @@ static const char cuda_trellis2_kernel_source[] =
 /* ---- Dense Conv3D: k=3, pad=1, stride=1 ---- */
 /* input: [Ci, D, H, W], weight: F32 [Co, Ci, 3, 3, 3], bias: [Co], output: [Co, D, H, W] */
 /* Grid: (Co, D*H*W / 64), Block: 64 */
-"extern \"C\" __global__ void conv3d_k3_f32(\n"
+"__global__ void conv3d_k3_f32(\n"
 "    float *out, const float *inp, const float *weight, const float *bias,\n"
 "    int Ci, int Co, int D, int H, int W) {\n"
 "    int co = blockIdx.x;\n"
@@ -154,7 +154,7 @@ static const char cuda_trellis2_kernel_source[] =
 
 /* ---- GroupNorm 3D: [C, D, H, W] with G groups ---- */
 /* Grid: G, Block: 256 */
-"extern \"C\" __global__ void groupnorm_3d_f32(\n"
+"__global__ void groupnorm_3d_f32(\n"
 "    float *dst, const float *src, const float *w, const float *b,\n"
 "    int C, int spatial, int G) {\n"
 "    int g = blockIdx.x;\n"
@@ -191,14 +191,14 @@ static const char cuda_trellis2_kernel_source[] =
 "}\n\n"
 
 /* ---- SiLU in-place ---- */
-"extern \"C\" __global__ void silu_inplace_f32(float *x, int n) {\n"
+"__global__ void silu_inplace_f32(float *x, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) x[i] = x[i] / (1.0f + expf(-x[i]));\n"
 "}\n\n"
 
 /* ---- pixel_shuffle_3d: [C*8, D, H, W] -> [C, 2D, 2H, 2W] ---- */
 /* Grid: ceil(total/256), Block: 256 — total = C * 2D * 2H * 2W */
-"extern \"C\" __global__ void pixel_shuffle_3d_f32(\n"
+"__global__ void pixel_shuffle_3d_f32(\n"
 "    float *dst, const float *src,\n"
 "    int C, int D, int H, int W) {\n"
 "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -221,7 +221,7 @@ static const char cuda_trellis2_kernel_source[] =
 
 /* ---- LayerNorm (no affine): y = (x - mean) / sqrt(var + eps) ---- */
 /* Grid: N, Block: 256 */
-"extern \"C\" __global__ void layernorm_noaffine_f32(\n"
+"__global__ void layernorm_noaffine_f32(\n"
 "    float *y, const float *x, int dim, float eps) {\n"
 "    int tok = blockIdx.x;\n"
 "    const float *xi = x + tok * dim;\n"
@@ -247,6 +247,7 @@ static const char cuda_trellis2_kernel_source[] =
 "        yi[i] = (xi[i] - mean) * inv;\n"
 "}\n\n"
 
+"} /* close extern C from cuda_kernels_common */\n"
 ; /* end of kernel source string */
 
 #endif /* CUDA_TRELLIS2_KERNELS_H */

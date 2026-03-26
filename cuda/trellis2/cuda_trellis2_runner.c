@@ -16,6 +16,11 @@
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 
+/* Include HY3D kernels for cross_attn, timestep_embed, euler_step, cfg_combine,
+ * split_qkv, split_kv, broadcast_add, rms_norm — these are model-specific in HY3D
+ * but reused here. We extract only the kernel source string (no ops header). */
+#include "../hy3d/cuda_hy3d_kernels.h"
+
 #include "cuda_trellis2_kernels.h"
 #include "cuda_trellis2_ops.h"
 
@@ -239,26 +244,36 @@ cuda_trellis2_runner *cuda_trellis2_init(int device_id, int verbose) {
     cuDeviceTotalMem(&mem, r->device);
     fprintf(stderr, "T2: GPU %d: %s (%.1f GB)\n", device_id, name, (double)mem / (1<<30));
 
-    /* Compile kernels */
-    char *full_source = (char *)malloc(strlen(cuda_kernels_common_src)
-                                      + strlen(cuda_trellis2_kernel_source) + 16);
-    sprintf(full_source, "%s\n%s", cuda_kernels_common_src, cuda_trellis2_kernel_source);
+    /* Compile kernels: common + HY3D shared ops + TRELLIS2-specific.
+     * HY3D kernels end with "} extern C" so we strip the last line
+     * and let trellis2 kernels close the block. */
+    size_t hy3d_len = strlen(cuda_hy3d_specific_kernels);
+    /* Find and trim the closing "}" from HY3D source */
+    const char *hy3d_end = cuda_hy3d_specific_kernels + hy3d_len;
+    while (hy3d_end > cuda_hy3d_specific_kernels && hy3d_end[-1] != '}')
+        hy3d_end--;
+    if (hy3d_end > cuda_hy3d_specific_kernels) hy3d_end--; /* skip the '}' itself */
+    size_t hy3d_trimmed = (size_t)(hy3d_end - cuda_hy3d_specific_kernels);
 
-    if (cu_compile_kernels(&r->module, r->device, full_source, "trellis2",
-                           verbose, "T2") != 0) {
+    size_t total_len = strlen(cuda_kernels_common_src) + hy3d_trimmed
+                     + strlen(cuda_trellis2_kernel_source) + 16;
+    char *full_source = (char *)malloc(total_len);
+    sprintf(full_source, "%s\n", cuda_kernels_common_src);
+    size_t off = strlen(full_source);
+    memcpy(full_source + off, cuda_hy3d_specific_kernels, hy3d_trimmed);
+    off += hy3d_trimmed;
+    sprintf(full_source + off, "\n%s", cuda_trellis2_kernel_source);
+
+    int sm = cu_compile_kernels(&r->module, r->device, full_source, "trellis2",
+                                verbose, "T2");
+    free(full_source);
+    if (sm < 0) {
         fprintf(stderr, "T2: kernel compilation failed\n");
-        free(full_source);
         cuCtxDestroy(r->context);
         free(r);
         return NULL;
     }
-    free(full_source);
-
-    /* Load kernel function pointers */
-    int major, minor;
-    cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, r->device);
-    cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, r->device);
-    if (t2_ops_load(&r->ops, r->module, major * 10 + minor) != 0) {
+    if (t2_ops_load(&r->ops, r->module, sm) != 0) {
         fprintf(stderr, "T2: failed to load kernel functions\n");
         cuModuleUnload(r->module);
         cuCtxDestroy(r->context);
@@ -266,7 +281,7 @@ cuda_trellis2_runner *cuda_trellis2_init(int device_id, int verbose) {
         return NULL;
     }
 
-    fprintf(stderr, "T2: kernels compiled for sm_%d%d\n", major, minor);
+    fprintf(stderr, "T2: kernels compiled for sm_%d\n", sm);
     return r;
 }
 
