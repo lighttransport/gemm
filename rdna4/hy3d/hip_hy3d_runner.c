@@ -1016,6 +1016,16 @@ static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
     void *d_skip_tmp = d_attn;
 
     /* 1. Embed latents: [N, C] -> [N, H_dim] */
+    if (r->verbose > 1) {
+        fprintf(stderr, "  x_emb_w=%p x_emb_b=%p d_latents=%p d_normed=%p\n",
+                r->dit_x_emb_w, r->dit_x_emb_b, d_latents, d_normed);
+        hipDeviceSynchronize();
+        float chk[4];
+        hipMemcpy(chk, d_latents, sizeof(chk), hipMemcpyDeviceToHost);
+        fprintf(stderr, "  latents_in[0:4]: %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+        hipMemcpy(chk, r->dit_x_emb_w, sizeof(chk), hipMemcpyDeviceToHost);
+        fprintf(stderr, "  x_emb_w[0:4]: %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+    }
     op_gemm(ops, stream, d_normed, r->dit_x_emb_w, d_latents, r->dit_x_emb_b,
             H_dim, C, N);
 
@@ -1026,6 +1036,20 @@ static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
     op_gelu(ops, stream, d_tmlp, ffn);
     op_gemm(ops, stream, d_temb, r->dit_t_mlp2_w, d_tmlp, r->dit_t_mlp2_b,
             H_dim, ffn, 1);
+
+    /* Debug: check timestep embedding */
+    if (r->verbose > 1) {
+        hipDeviceSynchronize();
+        float chk[8];
+        hipMemcpy(chk, d_temb, sizeof(chk), hipMemcpyDeviceToHost);
+        int nc = 0; for (int i = 0; i < 8; i++) if (chk[i] != chk[i]) nc++;
+        fprintf(stderr, "  temb[0:8]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f nan=%d\n",
+                chk[0], chk[1], chk[2], chk[3], chk[4], chk[5], chk[6], chk[7], nc);
+        /* Check latent embedding too */
+        hipMemcpy(chk, d_normed, sizeof(chk), hipMemcpyDeviceToHost);
+        nc = 0; for (int i = 0; i < 8; i++) if (chk[i] != chk[i]) nc++;
+        fprintf(stderr, "  x_emb[0:8]: %.4f %.4f %.4f %.4f nan=%d\n", chk[0], chk[1], chk[2], chk[3], nc);
+    }
 
     /* 3. Fix 3: Prepend timestep token to sequence */
     op_concat_first(ops, stream, d_hidden, d_temb, d_normed, N, H_dim);
@@ -1083,8 +1107,21 @@ static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
         /* === Self-attention === */
         op_layernorm(ops, stream, d_normed, d_hidden, blk->norm1_w, blk->norm1_b, N1, H_dim);
 
+        /* Debug: check after LN for block 0 */
+        if (bi == 0 && r->verbose > 1) {
+            hipDeviceSynchronize(); float chk[4];
+            hipMemcpy(chk, d_normed, sizeof(chk), hipMemcpyDeviceToHost);
+            fprintf(stderr, "    b0 after_LN1: %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+        }
+
         /* Fused QKV GEMM */
         op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, NULL, 3 * H_dim, H_dim, N1);
+
+        if (bi == 0 && r->verbose > 1) {
+            hipDeviceSynchronize(); float chk[4];
+            hipMemcpy(chk, d_qkv, sizeof(chk), hipMemcpyDeviceToHost);
+            fprintf(stderr, "    b0 after_QKV: %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+        }
 
         /* Split interleaved QKV */
         void *d_Q = d_attn;    /* scratch[2] */
@@ -1092,13 +1129,33 @@ static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
         void *d_V = (char *)d_ca_V + ca_kv_sz; /* after ca_V in scratch[3] */
         op_split_qkv(ops, stream, d_Q, d_K, d_V, d_qkv, N1, heads, hd);
 
+        if (bi == 0 && r->verbose > 1) {
+            hipDeviceSynchronize(); float chk[4];
+            hipMemcpy(chk, d_Q, sizeof(chk), hipMemcpyDeviceToHost);
+            fprintf(stderr, "    b0 Q[0:4]:  %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+            hipMemcpy(chk, d_K, sizeof(chk), hipMemcpyDeviceToHost);
+            fprintf(stderr, "    b0 K[0:4]:  %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+        }
+
         /* QK RMSNorm */
         if (blk->sa_q_norm_w)
             op_rms_norm(ops, stream, d_Q, blk->sa_q_norm_w, N1, heads, hd, H_dim);
         if (blk->sa_k_norm_w)
             op_rms_norm(ops, stream, d_K, blk->sa_k_norm_w, N1, heads, hd, H_dim);
 
+        if (bi == 0 && r->verbose > 1) {
+            hipDeviceSynchronize(); float chk[4];
+            hipMemcpy(chk, d_Q, sizeof(chk), hipMemcpyDeviceToHost);
+            fprintf(stderr, "    b0 Q_norm:  %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+        }
+
         op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N1, H_dim, heads, hd);
+
+        if (bi == 0 && r->verbose > 1) {
+            hipDeviceSynchronize(); float chk[4];
+            hipMemcpy(chk, d_attn, sizeof(chk), hipMemcpyDeviceToHost);
+            fprintf(stderr, "    b0 attn_out: %.6f %.6f %.6f %.6f\n", chk[0], chk[1], chk[2], chk[3]);
+        }
 
         op_gemm(ops, stream, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b, H_dim, H_dim, N1);
         op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
@@ -1404,8 +1461,8 @@ static void generate_randn(float *buf, int n, uint32_t seed) {
         s1 = x ^ y ^ (x >> 17) ^ (y >> 26);
         uint64_t r2 = s1 + y;
 
-        double u1 = ((r1 >> 11) + 0.5) / 2097152.0;
-        double u2 = ((r2 >> 11) + 0.5) / 2097152.0;
+        double u1 = ((r1 >> 11) + 0.5) / 9007199254740992.0; /* 2^53 */
+        double u2 = ((r2 >> 11) + 0.5) / 9007199254740992.0;
         double rr = sqrt(-2.0 * log(u1));
         double theta = 2.0 * 3.141592653589793 * u2;
         buf[i] = (float)(rr * cos(theta));
@@ -1517,6 +1574,28 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
     hipFree(d_rgb);
     hipFree(d_image);
 
+    /* NaN check after DINOv2 */
+    if (r->verbose) {
+        hipDeviceSynchronize();
+        float dino_check[8];
+        hipMemcpy(dino_check, d_dino_out, sizeof(dino_check), hipMemcpyDeviceToHost);
+        int has_nan = 0;
+        for (int i = 0; i < 8; i++) if (dino_check[i] != dino_check[i]) has_nan = 1;
+        float *dino_full = (float *)malloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
+        hipMemcpy(dino_full, d_dino_out, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), hipMemcpyDeviceToHost);
+        float dmin = dino_full[0], dmax = dino_full[0], dsum = 0; int nan_cnt = 0;
+        for (int i = 0; i < DINO_SEQ_LEN * DINO_HIDDEN; i++) {
+            if (dino_full[i] != dino_full[i]) { nan_cnt++; continue; }
+            if (dino_full[i] < dmin) dmin = dino_full[i];
+            if (dino_full[i] > dmax) dmax = dino_full[i];
+            dsum += dino_full[i];
+        }
+        fprintf(stderr, "  DINOv2 output: min=%.4f max=%.4f mean=%.6f nan=%d%s\n",
+                dmin, dmax, dsum / (DINO_SEQ_LEN * DINO_HIDDEN), nan_cnt,
+                has_nan ? " *** NaN DETECTED ***" : "");
+        free(dino_full);
+    }
+
     /* ---- Stage 2: DiT diffusion with flow matching ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 2 - DiT diffusion (%d steps)...\n", n_steps);
 
@@ -1550,6 +1629,20 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
                        guidance_scale, latent_size);
 
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
+
+        /* NaN check after each step */
+        if (r->verbose && step == 0) {
+            hipDeviceSynchronize();
+            float chk[8];
+            hipMemcpy(chk, d_pred_cond, sizeof(chk), hipMemcpyDeviceToHost);
+            int nan_c = 0; for (int i = 0; i < 8; i++) if (chk[i] != chk[i]) nan_c++;
+            fprintf(stderr, "  DiT cond[0:8]: %.4f %.4f %.4f %.4f nan=%d\n",
+                    chk[0], chk[1], chk[2], chk[3], nan_c);
+            hipMemcpy(chk, d_latents, sizeof(chk), hipMemcpyDeviceToHost);
+            nan_c = 0; for (int i = 0; i < 8; i++) if (chk[i] != chk[i]) nan_c++;
+            fprintf(stderr, "  latents[0:8]:  %.4f %.4f %.4f %.4f nan=%d\n",
+                    chk[0], chk[1], chk[2], chk[3], nan_c);
+        }
     }
 
     hipFree(d_pred_cond);
