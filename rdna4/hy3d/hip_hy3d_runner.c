@@ -902,9 +902,13 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
             top_val[k] = best_v;
         }
 
-        /* Store top-2 weights (no renormalization -- norm_topk_prob=False in PyTorch) */
+        /* Renormalize top-k weights so they sum to 1 */
+        float top_sum = 0.0f;
+        for (int k = 0; k < DIT_MOE_TOP_K; k++) top_sum += top_val[k];
+        float top_inv = (top_sum > 0.0f) ? 1.0f / top_sum : 0.0f;
         for (int k = 0; k < DIT_MOE_TOP_K; k++) {
-            gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k];
+            if (top_idx[k] >= 0)
+                gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k] * top_inv;
         }
     }
     free(gate_cpu);
@@ -1561,6 +1565,21 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
     float *sdf_grid = (float *)malloc((size_t)total_pts * sizeof(float));
     run_shapevae(r, d_latents, grid_res, sdf_grid);
     hipFree(d_latents);
+
+    /* SDF grid stats */
+    if (r->verbose) {
+        float smin = sdf_grid[0], smax = sdf_grid[0], ssum = 0;
+        int n_neg = 0, n_pos = 0;
+        for (int i = 0; i < total_pts; i++) {
+            if (sdf_grid[i] < smin) smin = sdf_grid[i];
+            if (sdf_grid[i] > smax) smax = sdf_grid[i];
+            ssum += sdf_grid[i];
+            if (sdf_grid[i] < 0) n_neg++;
+            else n_pos++;
+        }
+        fprintf(stderr, "HY3D: SDF stats: min=%.4f max=%.4f mean=%.4f neg=%d pos=%d\n",
+                smin, smax, ssum / total_pts, n_neg, n_pos);
+    }
 
     /* ---- Stage 4: Marching cubes ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 4 - Marching cubes...\n");
