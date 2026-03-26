@@ -69,23 +69,30 @@ typedef struct {
 } t2_ss_dec_resblock;
 
 typedef struct {
-    /* Stage A: 16^3, 512 channels */
-    qtensor conv_in_w, conv_in_b;             /* [512, 8, 3, 3, 3] */
-    t2_ss_dec_resblock res_a[2];
-    /* After pixel_shuffle_3d(2): 32^3, 64 channels */
+    /* input_layer: Conv3d(8->512, k=3) at 16^3 */
+    qtensor conv_in_w, conv_in_b;
 
-    /* Stage B: 32^3, 128 channels */
-    qtensor conv_b_w, conv_b_b;               /* [128, 64, 3, 3, 3] */
-    t2_ss_dec_resblock res_b[2];
-    /* After pixel_shuffle_3d(2): 64^3, 16 channels */
+    /* middle_block: 2x ResBlock3d(512) at 16^3 */
+    t2_ss_dec_resblock middle[2];
 
-    /* Stage C: 64^3, 32 channels */
-    qtensor conv_c_w, conv_c_b;               /* [32, 16, 3, 3, 3] */
-    t2_ss_dec_resblock res_c[2];
+    /* blocks.0-1: 2x ResBlock3d(512) at 16^3 */
+    t2_ss_dec_resblock res_16[2];
 
-    /* Output: GN -> SiLU -> Conv3d(32->1, k=3) */
+    /* blocks.2.conv: Conv3d(512->1024, k=3) at 16^3, then pixel_shuffle -> [128, 32^3] */
+    qtensor up1_conv_w, up1_conv_b;
+
+    /* blocks.3-4: 2x ResBlock3d(128) at 32^3 */
+    t2_ss_dec_resblock res_32[2];
+
+    /* blocks.5.conv: Conv3d(128->256, k=3) at 32^3, then pixel_shuffle -> [32, 64^3] */
+    qtensor up2_conv_w, up2_conv_b;
+
+    /* blocks.6-7: 2x ResBlock3d(32) at 64^3 */
+    t2_ss_dec_resblock res_64[2];
+
+    /* out_layer: GN(32) -> SiLU -> Conv3d(32->1, k=3) */
     qtensor out_gn_w, out_gn_b;
-    qtensor out_conv_w, out_conv_b;           /* [1, 32, 3, 3, 3] */
+    qtensor out_conv_w, out_conv_b;
 
     int gn_groups;   /* 32 */
 
@@ -125,9 +132,8 @@ static double t2dec_time_ms(void) {
 
 static int t2dec_numel(const qtensor *t) {
     if (!t->data) return 0;
-    int n = 1;
-    for (int d = 0; d < t->n_dims; d++) n *= (int)t->dims[d];
-    return n;
+    /* Use n_rows * n_cols for correct total even with >4D tensors */
+    return t->n_rows * t->n_cols;
 }
 
 static float *t2dec_dequant(const qtensor *t) {
@@ -335,13 +341,12 @@ static void t2dec_resblock(float *dst, const float *src,
 /* ---- Full decoder forward ---- */
 
 float *t2_ss_dec_forward(t2_ss_dec *d, const float *latent, int n_threads) {
-    (void)n_threads;  /* Conv3d not threaded in this implementation */
+    (void)n_threads;
     double t0 = t2dec_time_ms();
-
     int G = d->gn_groups;
 
-    /* Input: latent [8, 16, 16, 16] in NCDHW */
-    /* Conv_in: [8->512, k=3] at 16^3 */
+    /* Input: latent [8, 16, 16, 16] NCDHW */
+    /* input_layer: Conv3d(8->512, k=3) at 16^3 */
     float *conv_in_w = t2dec_dequant(&d->conv_in_w);
     float *conv_in_b = t2dec_dequant(&d->conv_in_b);
     float *h = (float *)malloc((size_t)512 * 16 * 16 * 16 * sizeof(float));
@@ -349,75 +354,74 @@ float *t2_ss_dec_forward(t2_ss_dec *d, const float *latent, int n_threads) {
     free(conv_in_w); free(conv_in_b);
     fprintf(stderr, "ss_dec: conv_in done (512, 16^3)\n");
 
-    /* ResBlock A[0]: 512->512 at 16^3 */
+    /* middle_block: 2x ResBlock3d(512) at 16^3 */
     float *h2 = (float *)malloc((size_t)512 * 16 * 16 * 16 * sizeof(float));
-    t2dec_resblock(h2, h, &d->res_a[0], 512, 512, 16, 16, 16, G);
-    /* ResBlock A[1]: 512->512 at 16^3 */
-    t2dec_resblock(h, h2, &d->res_a[1], 512, 512, 16, 16, 16, G);
+    t2dec_resblock(h2, h, &d->middle[0], 512, 512, 16, 16, 16, G);
+    t2dec_resblock(h, h2, &d->middle[1], 512, 512, 16, 16, 16, G);
+    fprintf(stderr, "ss_dec: middle done (512, 16^3)\n");
+
+    /* blocks.0-1: 2x ResBlock3d(512) at 16^3 */
+    t2dec_resblock(h2, h, &d->res_16[0], 512, 512, 16, 16, 16, G);
+    t2dec_resblock(h, h2, &d->res_16[1], 512, 512, 16, 16, 16, G);
     free(h2);
-    fprintf(stderr, "ss_dec: res_a done (512, 16^3)\n");
+    fprintf(stderr, "ss_dec: res_16 done (512, 16^3)\n");
 
-    /* pixel_shuffle_3d(2): [512, 16, 16, 16] -> [64, 32, 32, 32] */
-    float *ps1 = (float *)malloc((size_t)64 * 32 * 32 * 32 * sizeof(float));
-    t2dec_pixel_shuffle_3d(ps1, h, 64, 16, 16, 16);
-    free(h);
-    fprintf(stderr, "ss_dec: pixel_shuffle -> (64, 32^3)\n");
+    /* blocks.2.conv: Conv3d(512->1024, k=3) at 16^3 */
+    float *up1_w = t2dec_dequant(&d->up1_conv_w);
+    float *up1_b = t2dec_dequant(&d->up1_conv_b);
+    float *h_up = (float *)malloc((size_t)1024 * 16 * 16 * 16 * sizeof(float));
+    t2dec_conv3d(h_up, h, up1_w, up1_b, 512, 1024, 16, 16, 16);
+    free(h); free(up1_w); free(up1_b);
 
-    /* Conv_b: [64->128, k=3] at 32^3 */
-    float *conv_b_w = t2dec_dequant(&d->conv_b_w);
-    float *conv_b_b = t2dec_dequant(&d->conv_b_b);
+    /* pixel_shuffle_3d(2): [1024, 16, 16, 16] -> [128, 32, 32, 32] */
+    float *ps1 = (float *)malloc((size_t)128 * 32 * 32 * 32 * sizeof(float));
+    t2dec_pixel_shuffle_3d(ps1, h_up, 128, 16, 16, 16);
+    free(h_up);
+    fprintf(stderr, "ss_dec: upsample -> (128, 32^3)\n");
+
+    /* blocks.3-4: 2x ResBlock3d(128) at 32^3 */
     h = (float *)malloc((size_t)128 * 32 * 32 * 32 * sizeof(float));
-    t2dec_conv3d(h, ps1, conv_b_w, conv_b_b, 64, 128, 32, 32, 32);
-    free(ps1); free(conv_b_w); free(conv_b_b);
-    fprintf(stderr, "ss_dec: conv_b done (128, 32^3)\n");
-
-    /* ResBlock B[0]: 128->128 at 32^3 */
-    h2 = (float *)malloc((size_t)128 * 32 * 32 * 32 * sizeof(float));
-    t2dec_resblock(h2, h, &d->res_b[0], 128, 128, 32, 32, 32, G);
-    /* ResBlock B[1]: 128->128 at 32^3 */
-    t2dec_resblock(h, h2, &d->res_b[1], 128, 128, 32, 32, 32, G);
-    free(h2);
-    fprintf(stderr, "ss_dec: res_b done (128, 32^3)\n");
-
-    /* pixel_shuffle_3d(2): [128, 32, 32, 32] -> [16, 64, 64, 64] */
-    float *ps2 = (float *)malloc((size_t)16 * 64 * 64 * 64 * sizeof(float));
-    t2dec_pixel_shuffle_3d(ps2, h, 16, 32, 32, 32);
+    t2dec_resblock(h, ps1, &d->res_32[0], 128, 128, 32, 32, 32, G);
+    t2dec_resblock(ps1, h, &d->res_32[1], 128, 128, 32, 32, 32, G);
     free(h);
-    fprintf(stderr, "ss_dec: pixel_shuffle -> (16, 64^3)\n");
+    fprintf(stderr, "ss_dec: res_32 done (128, 32^3)\n");
 
-    /* Conv_c: [16->32, k=3] at 64^3 */
-    float *conv_c_w = t2dec_dequant(&d->conv_c_w);
-    float *conv_c_b = t2dec_dequant(&d->conv_c_b);
+    /* blocks.5.conv: Conv3d(128->256, k=3) at 32^3 */
+    float *up2_w = t2dec_dequant(&d->up2_conv_w);
+    float *up2_b = t2dec_dequant(&d->up2_conv_b);
+    h_up = (float *)malloc((size_t)256 * 32 * 32 * 32 * sizeof(float));
+    t2dec_conv3d(h_up, ps1, up2_w, up2_b, 128, 256, 32, 32, 32);
+    free(ps1); free(up2_w); free(up2_b);
+
+    /* pixel_shuffle_3d(2): [256, 32, 32, 32] -> [32, 64, 64, 64] */
+    float *ps2 = (float *)malloc((size_t)32 * 64 * 64 * 64 * sizeof(float));
+    t2dec_pixel_shuffle_3d(ps2, h_up, 32, 32, 32, 32);
+    free(h_up);
+    fprintf(stderr, "ss_dec: upsample -> (32, 64^3)\n");
+
+    /* blocks.6-7: 2x ResBlock3d(32) at 64^3 */
     h = (float *)malloc((size_t)32 * 64 * 64 * 64 * sizeof(float));
-    t2dec_conv3d(h, ps2, conv_c_w, conv_c_b, 16, 32, 64, 64, 64);
-    free(ps2); free(conv_c_w); free(conv_c_b);
-    fprintf(stderr, "ss_dec: conv_c done (32, 64^3)\n");
+    t2dec_resblock(h, ps2, &d->res_64[0], 32, 32, 64, 64, 64, G);
+    t2dec_resblock(ps2, h, &d->res_64[1], 32, 32, 64, 64, 64, G);
+    free(h);
+    fprintf(stderr, "ss_dec: res_64 done (32, 64^3)\n");
 
-    /* ResBlock C[0]: 32->32 at 64^3 */
-    h2 = (float *)malloc((size_t)32 * 64 * 64 * 64 * sizeof(float));
-    t2dec_resblock(h2, h, &d->res_c[0], 32, 32, 64, 64, 64, G);
-    /* ResBlock C[1]: 32->32 at 64^3 */
-    t2dec_resblock(h, h2, &d->res_c[1], 32, 32, 64, 64, 64, G);
-    free(h2);
-    fprintf(stderr, "ss_dec: res_c done (32, 64^3)\n");
-
-    /* Final: GN -> SiLU -> Conv3d(32->1, k=3) */
+    /* out_layer: GN(32) -> SiLU -> Conv3d(32->1, k=3) */
     float *gn_w = t2dec_dequant(&d->out_gn_w);
     float *gn_b = t2dec_dequant(&d->out_gn_b);
-    h2 = (float *)malloc((size_t)32 * 64 * 64 * 64 * sizeof(float));
-    t2dec_groupnorm(h2, h, gn_w, gn_b, 32, 64, 64, 64, G);
-    t2dec_silu(h2, 32 * 64 * 64 * 64);
-    free(gn_w); free(gn_b); free(h);
+    h = (float *)malloc((size_t)32 * 64 * 64 * 64 * sizeof(float));
+    t2dec_groupnorm(h, ps2, gn_w, gn_b, 32, 64, 64, 64, G);
+    t2dec_silu(h, 32 * 64 * 64 * 64);
+    free(gn_w); free(gn_b); free(ps2);
 
     float *out_conv_w = t2dec_dequant(&d->out_conv_w);
     float *out_conv_b = t2dec_dequant(&d->out_conv_b);
     float *out = (float *)malloc((size_t)64 * 64 * 64 * sizeof(float));
-    t2dec_conv3d(out, h2, out_conv_w, out_conv_b, 32, 1, 64, 64, 64);
-    free(h2); free(out_conv_w); free(out_conv_b);
+    t2dec_conv3d(out, h, out_conv_w, out_conv_b, 32, 1, 64, 64, 64);
+    free(h); free(out_conv_w); free(out_conv_b);
 
     double t1 = t2dec_time_ms();
     fprintf(stderr, "ss_dec: forward done in %.1f ms, output (1, 64^3)\n", t1 - t0);
-
     return out;
 }
 
@@ -436,13 +440,14 @@ static qtensor t2dec_make_tensor(st_context *st, int idx) {
     else if (strcmp(dt, "F16") == 0)  t.type = GGML_TYPE_F16;
     else if (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_F32;
     else return (qtensor){0};
-    t.n_dims = safetensors_ndims(st, idx);
+    int nd = safetensors_ndims(st, idx);
+    t.n_dims = nd < 4 ? nd : 4;  /* qtensor.dims only has 4 slots */
     const uint64_t *shape = safetensors_shape(st, idx);
     for (int d = 0; d < t.n_dims; d++) t.dims[d] = shape[d];
-    if (t.n_dims >= 2) {
+    if (nd >= 2) {
         t.n_rows = (int)shape[0];
         t.n_cols = 1;
-        for (int d = 1; d < t.n_dims; d++) t.n_cols *= (int)shape[d];
+        for (int d = 1; d < nd; d++) t.n_cols *= (int)shape[d];
     } else {
         t.n_cols = (int)shape[0];
         t.n_rows = 1;
@@ -544,70 +549,59 @@ t2_ss_dec *t2_ss_dec_load(const char *st_path) {
     d->gn_groups = 32;
     d->st_ctx = st;
 
-    /* Conv_in */
-    d->conv_in_w = DEC_FIND("conv_in.weight");
-    d->conv_in_b = DEC_FIND("conv_in.bias");
-    if (!d->conv_in_w.data) {
-        d->conv_in_w = DEC_FIND("input_layer.weight");
-        d->conv_in_b = DEC_FIND("input_layer.bias");
-    }
+    /* input_layer: Conv3d(8->512, k=3) */
+    d->conv_in_w = DEC_FIND("input_layer.weight");
+    d->conv_in_b = DEC_FIND("input_layer.bias");
 
-    /* Stage A: ResBlocks at 16^3, 512 channels */
+    /* middle_block: 2x ResBlock3d(512) */
     char blk_prefix[512];
     for (int i = 0; i < 2; i++) {
-        snprintf(blk_prefix, sizeof(blk_prefix), "%sblocks.%d.", prefix, i);
-        t2dec_load_resblock(st, &d->res_a[i], blk_prefix, 512, 512);
+        snprintf(blk_prefix, sizeof(blk_prefix), "%smiddle_block.%d.", prefix, i);
+        t2dec_load_resblock(st, &d->middle[i], blk_prefix, 512, 512);
     }
 
-    /* Stage B conv + ResBlocks at 32^3 */
-    d->conv_b_w = DEC_FIND("blocks.2.weight");
-    d->conv_b_b = DEC_FIND("blocks.2.bias");
-    if (!d->conv_b_w.data) {
-        /* Try alternate naming: after pixel_shuffle, there might be a conv layer */
-        d->conv_b_w = DEC_FIND("up1.conv.weight");
-        d->conv_b_b = DEC_FIND("up1.conv.bias");
+    /* blocks.0-1: 2x ResBlock3d(512) at 16^3 */
+    for (int i = 0; i < 2; i++) {
+        snprintf(blk_prefix, sizeof(blk_prefix), "%sblocks.%d.", prefix, i);
+        t2dec_load_resblock(st, &d->res_16[i], blk_prefix, 512, 512);
     }
+
+    /* blocks.2.conv: Conv3d(512->1024, k=3) — upsample conv */
+    d->up1_conv_w = DEC_FIND("blocks.2.conv.weight");
+    d->up1_conv_b = DEC_FIND("blocks.2.conv.bias");
+
+    /* blocks.3-4: 2x ResBlock3d(128) at 32^3 */
     for (int i = 0; i < 2; i++) {
         snprintf(blk_prefix, sizeof(blk_prefix), "%sblocks.%d.", prefix, 3 + i);
-        t2dec_load_resblock(st, &d->res_b[i], blk_prefix, 128, 128);
+        t2dec_load_resblock(st, &d->res_32[i], blk_prefix, 128, 128);
     }
 
-    /* Stage C conv + ResBlocks at 64^3 */
-    d->conv_c_w = DEC_FIND("blocks.5.weight");
-    d->conv_c_b = DEC_FIND("blocks.5.bias");
-    if (!d->conv_c_w.data) {
-        d->conv_c_w = DEC_FIND("up2.conv.weight");
-        d->conv_c_b = DEC_FIND("up2.conv.bias");
-    }
+    /* blocks.5.conv: Conv3d(128->256, k=3) — upsample conv */
+    d->up2_conv_w = DEC_FIND("blocks.5.conv.weight");
+    d->up2_conv_b = DEC_FIND("blocks.5.conv.bias");
+
+    /* blocks.6-7: 2x ResBlock3d(32) at 64^3 */
     for (int i = 0; i < 2; i++) {
         snprintf(blk_prefix, sizeof(blk_prefix), "%sblocks.%d.", prefix, 6 + i);
-        t2dec_load_resblock(st, &d->res_c[i], blk_prefix, 32, 32);
+        t2dec_load_resblock(st, &d->res_64[i], blk_prefix, 32, 32);
     }
 
-    /* Output */
-    d->out_gn_w = DEC_FIND("out_norm.weight");
-    d->out_gn_b = DEC_FIND("out_norm.bias");
-    if (!d->out_gn_w.data) {
-        d->out_gn_w = DEC_FIND("output_layer.0.weight");
-        d->out_gn_b = DEC_FIND("output_layer.0.bias");
-    }
-    d->out_conv_w = DEC_FIND("out_conv.weight");
-    d->out_conv_b = DEC_FIND("out_conv.bias");
-    if (!d->out_conv_w.data) {
-        d->out_conv_w = DEC_FIND("output_layer.2.weight");
-        d->out_conv_b = DEC_FIND("output_layer.2.bias");
-    }
+    /* out_layer: GN(32) -> SiLU -> Conv3d(32->1, k=3) */
+    d->out_gn_w = DEC_FIND("out_layer.0.weight");
+    d->out_gn_b = DEC_FIND("out_layer.0.bias");
+    d->out_conv_w = DEC_FIND("out_layer.2.weight");
+    d->out_conv_b = DEC_FIND("out_layer.2.bias");
 
     #undef DEC_FIND
 
-    fprintf(stderr, "ss_dec: conv_in: %s\n", d->conv_in_w.data ? "loaded" : "MISSING");
-    fprintf(stderr, "ss_dec: res_a[0]: %s\n", d->res_a[0].conv1_w.data ? "loaded" : "MISSING");
-    fprintf(stderr, "ss_dec: conv_b: %s\n", d->conv_b_w.data ? "loaded" : "MISSING");
-    fprintf(stderr, "ss_dec: res_b[0]: %s\n", d->res_b[0].conv1_w.data ? "loaded" : "MISSING");
-    fprintf(stderr, "ss_dec: conv_c: %s\n", d->conv_c_w.data ? "loaded" : "MISSING");
-    fprintf(stderr, "ss_dec: res_c[0]: %s\n", d->res_c[0].conv1_w.data ? "loaded" : "MISSING");
-    fprintf(stderr, "ss_dec: out_gn: %s\n", d->out_gn_w.data ? "loaded" : "MISSING");
-    fprintf(stderr, "ss_dec: out_conv: %s\n", d->out_conv_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: input_layer: %s\n", d->conv_in_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: middle[0]: %s\n", d->middle[0].conv1_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: res_16[0]: %s\n", d->res_16[0].conv1_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: up1_conv: %s\n", d->up1_conv_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: res_32[0]: %s\n", d->res_32[0].conv1_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: up2_conv: %s\n", d->up2_conv_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: res_64[0]: %s\n", d->res_64[0].conv1_w.data ? "loaded" : "MISSING");
+    fprintf(stderr, "ss_dec: out_layer: %s\n", d->out_conv_w.data ? "loaded" : "MISSING");
 
     return d;
 }
