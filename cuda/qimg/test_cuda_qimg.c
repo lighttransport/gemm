@@ -80,7 +80,7 @@ int main(int argc, char **argv) {
     const char *prompt = "a red apple on a white table";
     const char *mode = NULL;
     int out_h = 256, out_w = 256, n_steps = 20;
-    int force_f16 = 0;
+    int force_f16 = 0, no_cfg = 0;
     uint64_t seed = 42;
 
     for (int i = 1; i < argc; i++) {
@@ -89,6 +89,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
         else if (strcmp(argv[i], "--generate") == 0) mode = "gen";
         else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
+        else if (strcmp(argv[i], "--no-cfg") == 0) no_cfg = 1;
         else if (strcmp(argv[i], "--dit") == 0 && i+1 < argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae") == 0 && i+1 < argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc") == 0 && i+1 < argc) enc_path = argv[++i];
@@ -315,39 +316,41 @@ int main(int argc, char **argv) {
             cuda_qimg_dit_step(r, img_tokens, n_img, txt_hidden, n_txt,
                                t_val, vel_cond);
 
-            /* Unconditional DiT forward (negative prompt encoding) */
-            cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt,
-                               t_val, vel_uncond);
-
-            /* CFG combine: velocity = uncond + cfg_scale * (cond - uncond) */
             int lat_n = lat_ch * lat_h * lat_w;
             float *vel_latent = (float *)malloc((size_t)lat_n * sizeof(float));
-            /* Unpatchify both */
-            float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
-            float *vu_lat = (float *)malloc((size_t)lat_n * sizeof(float));
-            qimg_dit_unpatchify(vc_lat, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
-            qimg_dit_unpatchify(vu_lat, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
-            for (int i = 0; i < lat_n; i++)
-                vel_latent[i] = vu_lat[i] + cfg_scale * (vc_lat[i] - vu_lat[i]);
-            free(vc_lat); free(vu_lat);
 
-            /* CFGNorm: normalize combined velocity by its magnitude
-             * (matches ComfyUI CFGNorm node with strength=1) */
-            {
-                float mag = 0;
-                for (int i = 0; i < lat_n; i++) mag += vel_latent[i] * vel_latent[i];
-                mag = sqrtf(mag / (float)lat_n + 1e-8f);
-                /* Compute uncond magnitude for reference scale */
-                float *vu_tmp = (float *)malloc((size_t)lat_n * sizeof(float));
-                qimg_dit_unpatchify(vu_tmp, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
-                float umag = 0;
-                for (int i = 0; i < lat_n; i++) umag += vu_tmp[i] * vu_tmp[i];
-                umag = sqrtf(umag / (float)lat_n + 1e-8f);
-                free(vu_tmp);
-                /* Rescale combined to match uncond magnitude */
-                if (mag > 1e-6f) {
-                    float scale_norm = umag / mag;
-                    for (int i = 0; i < lat_n; i++) vel_latent[i] *= scale_norm;
+            if (no_cfg) {
+                /* No CFG: just use conditional velocity directly */
+                qimg_dit_unpatchify(vel_latent, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
+            } else {
+                /* Unconditional DiT forward (negative prompt encoding) */
+                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt,
+                                   t_val, vel_uncond);
+
+                /* CFG combine: velocity = uncond + cfg_scale * (cond - uncond) */
+                float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
+                float *vu_lat = (float *)malloc((size_t)lat_n * sizeof(float));
+                qimg_dit_unpatchify(vc_lat, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
+                qimg_dit_unpatchify(vu_lat, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
+                for (int i = 0; i < lat_n; i++)
+                    vel_latent[i] = vu_lat[i] + cfg_scale * (vc_lat[i] - vu_lat[i]);
+                free(vc_lat); free(vu_lat);
+
+                /* CFGNorm: normalize combined velocity by its magnitude */
+                {
+                    float mag = 0;
+                    for (int i = 0; i < lat_n; i++) mag += vel_latent[i] * vel_latent[i];
+                    mag = sqrtf(mag / (float)lat_n + 1e-8f);
+                    float *vu_tmp = (float *)malloc((size_t)lat_n * sizeof(float));
+                    qimg_dit_unpatchify(vu_tmp, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
+                    float umag = 0;
+                    for (int i = 0; i < lat_n; i++) umag += vu_tmp[i] * vu_tmp[i];
+                    umag = sqrtf(umag / (float)lat_n + 1e-8f);
+                    free(vu_tmp);
+                    if (mag > 1e-6f) {
+                        float scale_norm = umag / mag;
+                        for (int i = 0; i < lat_n; i++) vel_latent[i] *= scale_norm;
+                    }
                 }
             }
 
@@ -377,13 +380,14 @@ int main(int argc, char **argv) {
         free(img_tokens); free(vel_cond); free(vel_uncond);
         free(txt_hidden); free(txt_neg_hidden);
 
-        /* 3. VAE decode (CUDA) */
-        fprintf(stderr, "\n[3/3] VAE decode (CUDA)...\n");
-        cuda_qimg_load_vae(r, vae_path);
+        /* 3. VAE decode (CPU — verified correct, CUDA VAE has bug) */
+        fprintf(stderr, "\n[3/3] VAE decode (CPU)...\n");
+        qimg_vae_model *vae = qimg_vae_load(vae_path);
         float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
         t0 = clock();
-        cuda_qimg_vae_decode(r, latent, lat_h, lat_w, rgb);
+        qimg_vae_decode(rgb, latent, lat_h, lat_w, vae);
         fprintf(stderr, "VAE decode: %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+        qimg_vae_free(vae);
         free(latent);
 
         /* Save */
