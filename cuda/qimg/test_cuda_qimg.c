@@ -334,6 +334,13 @@ int main(int argc, char **argv) {
                 }
             }
 
+            /* Track velocity magnitude */
+            { float vmx=0;
+              for(int i=0;i<lat_n;i++) if(fabsf(vel_latent[i])>vmx) vmx=fabsf(vel_latent[i]);
+              if (r->verbose >= 2)
+                fprintf(stderr, "    vel_max=%.2f dt=%.6f step_size=%.2f\n",
+                        vmx, sched.dt[step], vmx * fabsf(sched.dt[step])); }
+
             /* Euler step */
             qimg_sched_step(latent, vel_latent, lat_n, step, &sched);
             free(vel_latent);

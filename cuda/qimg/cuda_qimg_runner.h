@@ -84,10 +84,7 @@ static float fp8_e4m3_to_f32(uint8_t b) {
         /* Subnormal: value = (-1)^s × 2^(1-7) × (0.mant) */
         f = ldexpf((float)mant / 8.0f, -6);
     } else if (exp == 15 && mant == 7) {
-        /* NaN */
-        uint32_t bits = (sign << 31) | 0x7FC00000;
-        memcpy(&f, &bits, 4);
-        return f;
+        return 0.0f;  /* NaN → 0 (safe for GEMM) */
     } else {
         /* Normal: value = (-1)^s × 2^(exp-7) × (1 + mant/8) */
         f = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
@@ -1039,7 +1036,7 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         cuMemGetInfo(&free_mem, &total_mem);
         /* Block size: FP8=1 byte, F32=4 bytes per element */
         size_t block_bytes = r->use_fp8_gemm ? (324 * 1024 * 1024) : (1296ULL * 1024 * 1024);
-        size_t workspace = 500 * 1024 * 1024;     /* 500MB reserved for activations */
+        size_t workspace = 2ULL * 1024 * 1024 * 1024; /* 2GB reserved for activations + scratch */
         int max_preload = (int)((free_mem - workspace) / block_bytes);
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
         if (max_preload < 0) max_preload = 0;
@@ -1160,7 +1157,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
      * The txt_norm in the DiT is applied to RAW encoder output.
      * When using ComfyUI pre-encoded hidden states, skip txt_norm since
      * ComfyUI's CLIP encoder already applies it internally. */
-    if (r->d_txt_norm_w && 0) {  /* DISABLED: ComfyUI text is already normalized */
+    if (r->d_txt_norm_w) {  /* Apply txt_norm RMSNorm (required by model) */
         void *rn_args[] = {&d_txt_in, &r->d_txt_norm_w, &n_txt, &txt_dim};
         cuLaunchKernel(r->rmsnorm_weighted, (unsigned)n_txt, 1, 1,
                        256, 1, 1, 256 * sizeof(float), s, rn_args, NULL);
