@@ -533,7 +533,6 @@ static void run_dit_forward(cuda_trellis2_runner *r,
                D, D, 1);
     /* Now d_temb = [D] timestep embedding */
 
-    /* Debug: dump intermediates */
     /* 3. Transformer blocks */
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
         dit_block_gpu *blk = &r->dit_blocks[bi];
@@ -626,6 +625,19 @@ static void run_dit_forward(cuda_trellis2_runner *r,
                    D, FFN, N);
         t2_op_gated_add(ops, stream, d_hidden, d_normed, d_gate_mlp, N * D, D);
 
+        /* Per-block debug */
+        if (r->verbose >= 2) {
+            cuStreamSynchronize(stream);
+            float hs[4];
+            cuMemcpyDtoH(hs, d_hidden, 4 * sizeof(float));
+            float *hc = (float *)malloc(4096 * sizeof(float));
+            cuMemcpyDtoH(hc, d_hidden, 4096 * sizeof(float));
+            double sm = 0, sm2 = 0;
+            for (int j = 0; j < 4096; j++) { sm += hc[j]; sm2 += (double)hc[j]*hc[j]; }
+            fprintf(stderr, "  block %2d: std=%10.4f  h[:4]=%.4f %.4f %.4f %.4f\n",
+                    bi, sqrt(sm2/4096 - (sm/4096)*(sm/4096)), hs[0], hs[1], hs[2], hs[3]);
+            free(hc);
+        }
     }
 
     /* 4. Final LayerNorm (no affine) + output projection */
