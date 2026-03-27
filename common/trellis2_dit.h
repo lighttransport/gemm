@@ -676,9 +676,9 @@ void t2dit_forward(float *out, const float *x_t, float t_val,
     /* For now, store it in the model. */
     n_cond = 1029;  /* DINOv3: 1 CLS + 4 storage + 1024 patches */
 
-    /* Timestep embedding */
+    /* Timestep embedding — official TRELLIS.2 scales t by 1000 */
     float *t_emb = (float *)malloc((size_t)dim * sizeof(float));
-    t2dit_timestep_embed(t_emb, t_val, m);
+    t2dit_timestep_embed(t_emb, t_val * 1000.0f, m);
 
     /* Shared modulation -> 6 chunks of [dim] */
     float *mod = (float *)malloc((size_t)6 * dim * sizeof(float));
@@ -700,6 +700,9 @@ void t2dit_forward(float *out, const float *x_t, float t_val,
         t2dit_block_forward(hidden, &m->blocks[L], mod,
                             block_kv, n_cond, m, n_threads);
     }
+
+    /* Final LayerNorm (no affine) before output projection */
+    t2dit_layernorm_noaffine(hidden, hidden, nt, dim, m->ln_eps);
 
     /* Output projection: [n_tokens, dim] -> [n_tokens, in_channels] */
     t2dit_batch_gemm(out, &m->out_w, &m->out_b,

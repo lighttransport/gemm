@@ -42,6 +42,8 @@ typedef struct {
     CUfunction silu_inplace;
     CUfunction pixel_shuffle_3d;
     CUfunction layernorm_noaffine;
+    CUfunction split_qkv_chunk;
+    CUfunction split_kv_chunk;
 
     int sm_version;
     int use_f32_gemm;
@@ -89,6 +91,8 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("silu_inplace_f32",        silu_inplace);
     GET_FN("pixel_shuffle_3d_f32",    pixel_shuffle_3d);
     GET_FN("layernorm_noaffine_f32",  layernorm_noaffine);
+    GET_FN("split_qkv_chunk_f32",    split_qkv_chunk);
+    GET_FN("split_kv_chunk_f32",     split_kv_chunk);
 
     #undef GET_FN
     return 0;
@@ -237,6 +241,25 @@ static inline void t2_op_split_kv(t2_ops *ops, CUstream s,
     int total = M * H * HD;
     void *args[] = {&K, &V, &kv, &M, &H, &HD};
     cuLaunchKernel(ops->split_kv, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Non-interleaved chunk splits (for TRELLIS.2 standard torch.chunk(3)) */
+static inline void t2_op_split_qkv_chunk(t2_ops *ops, CUstream s,
+                                            CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V,
+                                            CUdeviceptr qkv, int N, int W) {
+    int total = N * W;
+    void *args[] = {&Q, &K, &V, &qkv, &N, &W};
+    cuLaunchKernel(ops->split_qkv_chunk, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_split_kv_chunk(t2_ops *ops, CUstream s,
+                                           CUdeviceptr K, CUdeviceptr V,
+                                           CUdeviceptr kv, int M, int W) {
+    int total = M * W;
+    void *args[] = {&K, &V, &kv, &M, &W};
+    cuLaunchKernel(ops->split_kv_chunk, (unsigned)((total+255)/256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
 }
 
