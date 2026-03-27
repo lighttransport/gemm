@@ -260,6 +260,7 @@ struct cuda_qimg_runner {
 
     /* Kernel handles */
     CUfunction gemm_f16_f32;
+    CUfunction gemm_fp8_f32;     /* native FP8 GEMM (sm_89+) */
     CUfunction layernorm_f32;
     CUfunction gelu_f32;
     CUfunction silu_f32;
@@ -267,6 +268,7 @@ struct cuda_qimg_runner {
     CUfunction add_bias_f32;
     CUfunction rmsnorm_per_head;
     CUfunction adaln_modulate;
+    int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
     CUfunction gated_add;
     CUfunction patchify;
     CUfunction unpatchify;
@@ -384,45 +386,60 @@ static CUdeviceptr qimg_st_upload_f32(st_context *st, const char *name) {
 }
 
 
+/* Upload raw FP8 bytes directly to GPU (zero-copy, no conversion) */
+static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return 0;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    void *data = safetensors_data(st, idx);
+    CUdeviceptr d;
+    cuMemAlloc(&d, nbytes);
+    cuMemcpyHtoD(d, data, nbytes);
+    return d;
+}
+
 /* ---- Load/free one DiT block ---- */
 
+/* Upload block weights as raw FP8 (for native FP8 GEMM) or dequant to F16 */
 static void qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b) {
     st_context *st = (st_context *)r->dit_st;
     char name[256];
 
-    #define BLK_F16(field, suffix) do { \
+    /* Upload weight: FP8 raw if native GEMM available, else dequant to F16 */
+    #define BLK_W(field, suffix) do { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        b->field = qimg_st_upload_f16(st, name); \
+        b->field = r->use_fp8_gemm ? qimg_st_upload_fp8_raw(st, name) \
+                                    : qimg_st_upload_f16(st, name); \
     } while(0)
     #define BLK_F32(field, suffix) do { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         b->field = qimg_st_upload_f32(st, name); \
     } while(0)
 
-    BLK_F16(attn_q_w, "attn.to_q.weight"); BLK_F32(attn_q_b, "attn.to_q.bias");
-    BLK_F16(attn_k_w, "attn.to_k.weight"); BLK_F32(attn_k_b, "attn.to_k.bias");
-    BLK_F16(attn_v_w, "attn.to_v.weight"); BLK_F32(attn_v_b, "attn.to_v.bias");
-    BLK_F16(attn_out_w, "attn.to_out.0.weight"); BLK_F32(attn_out_b, "attn.to_out.0.bias");
+    BLK_W(attn_q_w, "attn.to_q.weight"); BLK_F32(attn_q_b, "attn.to_q.bias");
+    BLK_W(attn_k_w, "attn.to_k.weight"); BLK_F32(attn_k_b, "attn.to_k.bias");
+    BLK_W(attn_v_w, "attn.to_v.weight"); BLK_F32(attn_v_b, "attn.to_v.bias");
+    BLK_W(attn_out_w, "attn.to_out.0.weight"); BLK_F32(attn_out_b, "attn.to_out.0.bias");
 
-    BLK_F16(attn_add_q_w, "attn.add_q_proj.weight"); BLK_F32(attn_add_q_b, "attn.add_q_proj.bias");
-    BLK_F16(attn_add_k_w, "attn.add_k_proj.weight"); BLK_F32(attn_add_k_b, "attn.add_k_proj.bias");
-    BLK_F16(attn_add_v_w, "attn.add_v_proj.weight"); BLK_F32(attn_add_v_b, "attn.add_v_proj.bias");
-    BLK_F16(attn_add_out_w, "attn.to_add_out.weight"); BLK_F32(attn_add_out_b, "attn.to_add_out.bias");
+    BLK_W(attn_add_q_w, "attn.add_q_proj.weight"); BLK_F32(attn_add_q_b, "attn.add_q_proj.bias");
+    BLK_W(attn_add_k_w, "attn.add_k_proj.weight"); BLK_F32(attn_add_k_b, "attn.add_k_proj.bias");
+    BLK_W(attn_add_v_w, "attn.add_v_proj.weight"); BLK_F32(attn_add_v_b, "attn.add_v_proj.bias");
+    BLK_W(attn_add_out_w, "attn.to_add_out.weight"); BLK_F32(attn_add_out_b, "attn.to_add_out.bias");
 
     BLK_F32(norm_q_w, "attn.norm_q.weight");
     BLK_F32(norm_k_w, "attn.norm_k.weight");
     BLK_F32(norm_added_q_w, "attn.norm_added_q.weight");
     BLK_F32(norm_added_k_w, "attn.norm_added_k.weight");
 
-    BLK_F16(img_mod_w, "img_mod.1.weight"); BLK_F32(img_mod_b, "img_mod.1.bias");
-    BLK_F16(img_mlp_fc1_w, "img_mlp.net.0.proj.weight"); BLK_F32(img_mlp_fc1_b, "img_mlp.net.0.proj.bias");
-    BLK_F16(img_mlp_fc2_w, "img_mlp.net.2.weight"); BLK_F32(img_mlp_fc2_b, "img_mlp.net.2.bias");
+    BLK_W(img_mod_w, "img_mod.1.weight"); BLK_F32(img_mod_b, "img_mod.1.bias");
+    BLK_W(img_mlp_fc1_w, "img_mlp.net.0.proj.weight"); BLK_F32(img_mlp_fc1_b, "img_mlp.net.0.proj.bias");
+    BLK_W(img_mlp_fc2_w, "img_mlp.net.2.weight"); BLK_F32(img_mlp_fc2_b, "img_mlp.net.2.bias");
 
-    BLK_F16(txt_mod_w, "txt_mod.1.weight"); BLK_F32(txt_mod_b, "txt_mod.1.bias");
-    BLK_F16(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight"); BLK_F32(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias");
-    BLK_F16(txt_mlp_fc2_w, "txt_mlp.net.2.weight"); BLK_F32(txt_mlp_fc2_b, "txt_mlp.net.2.bias");
+    BLK_W(txt_mod_w, "txt_mod.1.weight"); BLK_F32(txt_mod_b, "txt_mod.1.bias");
+    BLK_W(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight"); BLK_F32(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias");
+    BLK_W(txt_mlp_fc2_w, "txt_mlp.net.2.weight"); BLK_F32(txt_mlp_fc2_b, "txt_mlp.net.2.bias");
 
-    #undef BLK_F16
+    #undef BLK_W
     #undef BLK_F32
 }
 
@@ -441,13 +458,21 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
-    /* gemm_f16_f32: each block handles 256 output cols × 16 tokens,
-     * 128 threads (4 warps), shared mem = 16 rows × 16 cols of F32 */
     unsigned gx = (unsigned)((n_out + 255) / 256);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
-    unsigned smem = 16 * 16 * sizeof(float);
-    cuLaunchKernel(r->gemm_f16_f32, gx, gy, 1, 128, 1, 1,
-                   smem, r->stream, args, NULL);
+
+    if (r->use_fp8_gemm) {
+        /* gemm_fp8_f32: W is raw FP8 bytes, X is F32 (converted to FP8 in smem)
+         * shared mem = 16 rows × 32 cols of F32 (k=32 tile) */
+        unsigned smem = 16 * 32 * sizeof(float);
+        cuLaunchKernel(r->gemm_fp8_f32, gx, gy, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+    } else {
+        /* gemm_f16_f32: W is F16, shared mem = 16 × 16 F32 */
+        unsigned smem = 16 * 16 * sizeof(float);
+        cuLaunchKernel(r->gemm_f16_f32, gx, gy, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+    }
 }
 
 static void op_silu(cuda_qimg_runner *r, CUdeviceptr x, int n) {
@@ -543,6 +568,16 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
 
     #define GET(field, name) cuModuleGetFunction(&r->field, module, name)
     GET(gemm_f16_f32, "gemm_f16_f32");
+    /* Try loading native FP8 GEMM (available on sm_89+) */
+    r->use_fp8_gemm = 0;
+    if (sm >= 89) {
+        CUresult fp8_rc = cuModuleGetFunction(&r->gemm_fp8_f32, module, "gemm_fp8_f32");
+        if (fp8_rc == CUDA_SUCCESS && r->gemm_fp8_f32) {
+            r->use_fp8_gemm = 1;
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: native FP8 GEMM available (sm_%d)\n", sm);
+        }
+    }
     GET(layernorm_f32, "layernorm_f32");
     GET(gelu_f32, "gelu_f32");
     GET(silu_f32, "silu_f32");
@@ -583,20 +618,23 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         }
     }
 
-    /* Upload global weights (permanent) */
-    r->d_img_in_w = qimg_st_upload_f16(st, "img_in.weight");
+    /* Upload global weights — FP8 raw if native GEMM, else F16 */
+    #define GW(name) (r->use_fp8_gemm ? qimg_st_upload_fp8_raw(st, name) \
+                                       : qimg_st_upload_f16(st, name))
+    r->d_img_in_w = GW("img_in.weight");
     r->d_img_in_b = qimg_st_upload_f32(st, "img_in.bias");
-    r->d_txt_in_w = qimg_st_upload_f16(st, "txt_in.weight");
+    r->d_txt_in_w = GW("txt_in.weight");
     r->d_txt_in_b = qimg_st_upload_f32(st, "txt_in.bias");
     r->d_txt_norm_w = qimg_st_upload_f32(st, "txt_norm.weight");
-    r->d_t_fc1_w = qimg_st_upload_f16(st, "time_text_embed.timestep_embedder.linear_1.weight");
+    r->d_t_fc1_w = GW("time_text_embed.timestep_embedder.linear_1.weight");
     r->d_t_fc1_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_1.bias");
-    r->d_t_fc2_w = qimg_st_upload_f16(st, "time_text_embed.timestep_embedder.linear_2.weight");
+    r->d_t_fc2_w = GW("time_text_embed.timestep_embedder.linear_2.weight");
     r->d_t_fc2_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_2.bias");
-    r->d_norm_out_w = qimg_st_upload_f16(st, "norm_out.linear.weight");
+    r->d_norm_out_w = GW("norm_out.linear.weight");
     r->d_norm_out_b = qimg_st_upload_f32(st, "norm_out.linear.bias");
-    r->d_proj_out_w = qimg_st_upload_f16(st, "proj_out.weight");
+    r->d_proj_out_w = GW("proj_out.weight");
     r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
+    #undef GW
 
     fprintf(stderr, "cuda_qimg: loaded %d blocks, dim=%d, global weights on GPU\n",
             r->dit_n_blocks, r->dit_dim);
