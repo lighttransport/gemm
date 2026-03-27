@@ -34,6 +34,8 @@ typedef struct {
 } qimg_text_enc;
 
 qimg_text_enc *qimg_text_enc_load(const char *gguf_path);
+qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
+                                               const char *tokenizer_gguf_path);
 void           qimg_text_enc_free(qimg_text_enc *enc);
 
 /* Encode text prompt to hidden states.
@@ -91,6 +93,217 @@ qimg_text_enc *qimg_text_enc_load(const char *gguf_path) {
 
     fprintf(stderr, "qimg_text_enc: loaded (n_embd=%d, n_vocab=%d, n_layers=%d)\n",
             model->n_embd, model->n_vocab, model->n_layers);
+    return enc;
+}
+
+/* ---- Scaled FP8 safetensors loader ---- */
+
+/* Dequant scaled FP8: actual = fp8_to_f32(byte) * scale_weight */
+static float *st_dequant_scaled_fp8(st_context *st, const char *weight_name,
+                                     const char *scale_name,
+                                     int *out_rows, int *out_cols) {
+    int widx = safetensors_find(st, weight_name);
+    int sidx = safetensors_find(st, scale_name);
+    if (widx < 0) { *out_rows = *out_cols = 0; return NULL; }
+
+    const uint64_t *shape = safetensors_shape(st, widx);
+    int ndims = safetensors_ndims(st, widx);
+    *out_rows = (ndims >= 2) ? (int)shape[0] : 1;
+    *out_cols = (ndims >= 2) ? (int)shape[1] : (int)shape[0];
+    int n = (*out_rows) * (*out_cols);
+
+    const uint8_t *raw = (const uint8_t *)safetensors_data(st, widx);
+    float scale = 1.0f;
+    if (sidx >= 0) {
+        /* scale_weight is a scalar F32 */
+        const float *sp = (const float *)safetensors_data(st, sidx);
+        scale = *sp;
+    }
+
+    /* Use LUT for FP8→F32, then multiply by scale */
+    static float fp8_lut[256];
+    static int fp8_lut_done = 0;
+    if (!fp8_lut_done) {
+        for (int i = 0; i < 256; i++) {
+            uint8_t b = (uint8_t)i;
+            uint32_t sign = (b >> 7) & 1, exp = (b >> 3) & 0xF, mant = b & 0x7;
+            if (exp == 0 && mant == 0) fp8_lut[i] = 0.0f;
+            else if (exp == 0) fp8_lut[i] = (sign ? -1.0f : 1.0f) * ((float)mant / 8.0f) * ldexpf(1.0f, -6);
+            else if (exp == 15 && mant == 7) fp8_lut[i] = 0.0f;
+            else fp8_lut[i] = (sign ? -1.0f : 1.0f) * (1.0f + (float)mant / 8.0f) * ldexpf(1.0f, (int)exp - 7);
+        }
+        fp8_lut_done = 1;
+    }
+
+    float *f32 = (float *)malloc((size_t)n * sizeof(float));
+    const char *dtype = safetensors_dtype(st, widx);
+    if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0) {
+        for (int i = 0; i < n; i++)
+            f32[i] = fp8_lut[raw[i]] * scale;
+    } else if (strcmp(dtype, "BF16") == 0) {
+        const uint16_t *bf = (const uint16_t *)safetensors_data(st, widx);
+        for (int i = 0; i < n; i++) {
+            uint32_t bits = (uint32_t)bf[i] << 16;
+            memcpy(&f32[i], &bits, 4);
+        }
+    } else if (strcmp(dtype, "F32") == 0) {
+        memcpy(f32, safetensors_data(st, widx), (size_t)n * sizeof(float));
+    }
+    return f32;
+}
+
+/* Build a qtensor from F32 data (PyTorch shape [rows, cols]) */
+static qtensor make_qt_f32(float *data, int rows, int cols) {
+    qtensor t = {0};
+    t.data = data;
+    t.type = GGML_TYPE_F32;
+    t.n_rows = rows;
+    t.n_cols = cols;
+    t.n_dims = (rows == 1) ? 1 : 2;
+    t.dims[0] = (uint64_t)cols;
+    if (rows > 1) t.dims[1] = (uint64_t)rows;
+    return t;
+}
+
+qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
+                                               const char *tokenizer_gguf_path) {
+    fprintf(stderr, "qimg_text_enc: loading FP8 safetensors %s\n", st_path);
+    st_context *st = safetensors_open(st_path);
+    if (!st) return NULL;
+
+    /* Load tokenizer from GGUF (need vocab + merges) */
+    gguf_context *tok_gguf = gguf_open(tokenizer_gguf_path, 1);
+    if (!tok_gguf) { safetensors_close(st); return NULL; }
+    bpe_vocab *vocab = bpe_vocab_load(tok_gguf);
+    if (!vocab) { gguf_close(tok_gguf); safetensors_close(st); return NULL; }
+
+    /* Count layers */
+    int n_layers = 0;
+    for (int i = 0; i < st->n_tensors; i++) {
+        const char *nm = safetensors_name(st, i);
+        if (strstr(nm, "model.layers.")) {
+            int l = atoi(strstr(nm, "layers.") + 7);
+            if (l + 1 > n_layers) n_layers = l + 1;
+        }
+    }
+
+    int n_embd = 3584, n_heads = 28, n_kv_heads = 4, head_dim = 128;
+    int n_ff = 18944, n_vocab = 152064;
+    fprintf(stderr, "qimg_text_enc: %d layers, n_embd=%d\n", n_layers, n_embd);
+
+    /* Allocate transformer model */
+    transformer_model *m = (transformer_model *)calloc(1, sizeof(transformer_model));
+    m->n_embd = n_embd;
+    m->n_heads = n_heads;
+    m->n_kv_heads = n_kv_heads;
+    m->head_dim = head_dim;
+    m->n_ff = n_ff;
+    m->n_vocab = n_vocab;
+    m->n_layers = n_layers;
+    m->max_seq_len = 2048;
+    m->rms_norm_eps = 1e-6f;
+    m->rope_freq_base = 1000000.0f;
+    m->has_lm_head = 0;  /* no lm_head needed for hidden state extraction */
+
+    /* Allocate scratch buffers */
+    int kv_dim = n_kv_heads * head_dim;
+    m->x = (float *)calloc(n_embd, sizeof(float));
+    m->xb = (float *)calloc(n_embd, sizeof(float));
+    m->xb2 = (float *)calloc(n_embd, sizeof(float));
+    m->q = (float *)calloc(n_embd, sizeof(float));
+    m->k = (float *)calloc(kv_dim, sizeof(float));
+    m->v = (float *)calloc(kv_dim, sizeof(float));
+    m->att = (float *)calloc((size_t)n_heads * m->max_seq_len, sizeof(float));
+    m->ffn_buf1 = (float *)calloc(n_ff, sizeof(float));
+    m->ffn_buf2 = (float *)calloc(n_ff, sizeof(float));
+    m->ffn_buf3 = (float *)calloc(n_ff, sizeof(float));
+    m->matvec_tmp = (float *)calloc(n_ff > n_embd ? n_ff : n_embd, sizeof(float));
+    m->n_threads = 1;
+
+    /* KV cache */
+    m->key_cache = (float **)calloc(n_layers, sizeof(float *));
+    m->value_cache = (float **)calloc(n_layers, sizeof(float *));
+    for (int l = 0; l < n_layers; l++) {
+        m->key_cache[l] = (float *)calloc((size_t)m->max_seq_len * kv_dim, sizeof(float));
+        m->value_cache[l] = (float *)calloc((size_t)m->max_seq_len * kv_dim, sizeof(float));
+    }
+
+    /* Load global weights */
+    int er, ec;
+    float *emb_data = st_dequant_scaled_fp8(st, "model.embed_tokens.weight", "", &er, &ec);
+    m->token_embd = make_qt_f32(emb_data, er, ec);
+
+    float *norm_data = st_dequant_scaled_fp8(st, "model.norm.weight", "", &er, &ec);
+    m->output_norm = make_qt_f32(norm_data, 1, n_embd);
+
+    /* Allocate layers */
+    m->layers = (transformer_layer *)calloc(n_layers, sizeof(transformer_layer));
+
+    fprintf(stderr, "qimg_text_enc: loading %d layers...\n", n_layers);
+    for (int l = 0; l < n_layers; l++) {
+        transformer_layer *ly = &m->layers[l];
+        char wn[256], sn[256];
+        int r, c;
+
+        #define LOAD_W(field, w_suffix, s_suffix) do { \
+            snprintf(wn, sizeof(wn), "model.layers.%d." w_suffix, l); \
+            snprintf(sn, sizeof(sn), "model.layers.%d." s_suffix, l); \
+            float *d = st_dequant_scaled_fp8(st, wn, sn, &r, &c); \
+            ly->field = make_qt_f32(d, r, c); \
+        } while(0)
+
+        #define LOAD_NORM(field, suffix) do { \
+            snprintf(wn, sizeof(wn), "model.layers.%d." suffix, l); \
+            float *d = st_dequant_scaled_fp8(st, wn, "", &r, &c); \
+            ly->field = make_qt_f32(d, 1, n_embd); \
+        } while(0)
+
+        (void)0; /* LOAD_BIAS removed — transformer.h doesn't support attn biases */
+
+        LOAD_NORM(attn_norm, "input_layernorm.weight");
+        LOAD_W(attn_q, "self_attn.q_proj.weight", "self_attn.q_proj.scale_weight");
+        LOAD_W(attn_k, "self_attn.k_proj.weight", "self_attn.k_proj.scale_weight");
+        LOAD_W(attn_v, "self_attn.v_proj.weight", "self_attn.v_proj.scale_weight");
+        LOAD_W(attn_output, "self_attn.o_proj.weight", "self_attn.o_proj.scale_weight");
+        /* Note: Qwen2 has Q/K/V biases but transformer.h doesn't support them.
+         * Skip for compatibility with existing forward pass. */
+
+        LOAD_NORM(ffn_norm, "post_attention_layernorm.weight");
+        LOAD_W(ffn_gate, "mlp.gate_proj.weight", "mlp.gate_proj.scale_weight");
+        LOAD_W(ffn_up, "mlp.up_proj.weight", "mlp.up_proj.scale_weight");
+        LOAD_W(ffn_down, "mlp.down_proj.weight", "mlp.down_proj.scale_weight");
+
+        #undef LOAD_W
+        #undef LOAD_NORM
+        #undef LOAD_BIAS
+
+        if (l % 7 == 0)
+            fprintf(stderr, "\r  layer %d/%d (%.0f MB)",
+                    l+1, n_layers, (float)(l+1)*26*n_embd*n_embd*4/1024/1024);
+    }
+    fprintf(stderr, "\n");
+
+    /* RoPE */
+    m->use_mrope = 0;  /* standard RoPE for text-only */
+    int rope_len = head_dim / 2;
+    m->rope_inv_freq = (float *)malloc(rope_len * sizeof(float));
+    m->rope_inv_freq_len = rope_len;
+    for (int i = 0; i < rope_len; i++)
+        m->rope_inv_freq[i] = 1.0f / powf(m->rope_freq_base, (float)(2*i) / (float)head_dim);
+
+    safetensors_close(st);
+
+    transformer_set_threads(m, 1);
+
+    qimg_text_enc *enc = (qimg_text_enc *)calloc(1, sizeof(qimg_text_enc));
+    enc->model = m;
+    enc->vocab = vocab;
+    enc->gguf = tok_gguf;
+    enc->n_embd = n_embd;
+    enc->n_vocab = n_vocab;
+
+    fprintf(stderr, "qimg_text_enc: loaded FP8 scaled encoder (%d layers, %d vocab)\n",
+            n_layers, n_vocab);
     return enc;
 }
 
