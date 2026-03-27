@@ -419,28 +419,30 @@ static void t2dit_precompute_rope(t2dit_model *m) {
     free(freqs);
 }
 
-/* Apply 3D RoPE to Q and K in QKV buffer.
+/* Apply 3D RoPE to Q and K (complex-pair convention).
+ * Official TRELLIS.2 uses view_as_complex on consecutive pairs: (x[2k], x[2k+1]).
+ * Phase layout per head: [z_freqs(21), y_freqs(21), x_freqs(21), pad(1)] complex pairs.
  * QKV layout: [n_tok, 3*dim], Q at offset 0, K at offset dim. */
 static void t2dit_apply_rope_qkv(float *qkv, int n_tok, int dim,
                                     int n_heads, int head_dim,
                                     const float *rope_cos, const float *rope_sin,
                                     int n_freqs, int axis_dim) {
+    (void)axis_dim;
     for (int t = 0; t < n_tok; t++) {
         const float *cs = rope_cos + (size_t)t * 3 * n_freqs;
         const float *sn = rope_sin + (size_t)t * 3 * n_freqs;
-        /* Apply to Q (offset 0) and K (offset dim) */
         for (int qk = 0; qk < 2; qk++) {
             for (int h = 0; h < n_heads; h++) {
                 float *v = qkv + (size_t)t * 3 * dim + qk * dim + h * head_dim;
+                int pair = 0;
                 for (int axis = 0; axis < 3; axis++) {
-                    int base = axis * axis_dim;
                     const float *ca = cs + axis * n_freqs;
                     const float *sa = sn + axis * n_freqs;
-                    for (int j = 0; j < n_freqs; j++) {
-                        float v0 = v[base + j];
-                        float v1 = v[base + j + n_freqs];
-                        v[base + j]            = v0 * ca[j] - v1 * sa[j];
-                        v[base + j + n_freqs]  = v0 * sa[j] + v1 * ca[j];
+                    for (int j = 0; j < n_freqs; j++, pair++) {
+                        int idx = pair * 2;
+                        float re = v[idx], im = v[idx + 1];
+                        v[idx]     = re * ca[j] - im * sa[j];
+                        v[idx + 1] = re * sa[j] + im * ca[j];
                     }
                 }
             }

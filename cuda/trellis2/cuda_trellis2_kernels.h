@@ -70,10 +70,11 @@ static const char cuda_trellis2_kernel_source[] =
 "    }\n"
 "}\n\n"
 
-/* ---- 3D RoPE for dense grid ---- */
-/* Applied to Q and K buffers: [N, dim] where N = grid^3 */
-/* rope_cos/sin: [N, 3, n_freqs] */
-/* Grid: N, Block: 256 */
+/* ---- 3D RoPE for dense grid (complex-pair convention) ---- */
+/* Official TRELLIS.2: view_as_complex pairs (x[2k], x[2k+1]) then multiply by phase.
+ * Phase layout: [n_freqs_z, n_freqs_y, n_freqs_x, padding] complex values.
+ * rope_cos/sin: [N, 3, n_freqs] — per axis cos/sin of coord*freq.
+ * Grid: N, Block: 256 (one thread per head) */
 "__global__ void rope_3d_f32(\n"
 "    float *data, const float *rope_cos, const float *rope_sin,\n"
 "    int N, int dim, int n_heads, int head_dim,\n"
@@ -85,17 +86,20 @@ static const char cuda_trellis2_kernel_source[] =
 "    const float *sn = rope_sin + (size_t)tok * 3 * n_freqs;\n"
 "    for (int h = threadIdx.x; h < n_heads; h += blockDim.x) {\n"
 "        float *vh = v + h * head_dim;\n"
+"        /* Complex-pair rotation: (vh[2k], vh[2k+1]) * (cos+i*sin) */\n"
+"        int pair = 0;\n"
 "        for (int axis = 0; axis < 3; axis++) {\n"
-"            int base = axis * axis_dim;\n"
 "            const float *ca = cs + axis * n_freqs;\n"
 "            const float *sa = sn + axis * n_freqs;\n"
-"            for (int j = 0; j < n_freqs; j++) {\n"
-"                float v0 = vh[base + j];\n"
-"                float v1 = vh[base + j + n_freqs];\n"
-"                vh[base + j]            = v0 * ca[j] - v1 * sa[j];\n"
-"                vh[base + j + n_freqs]  = v0 * sa[j] + v1 * ca[j];\n"
+"            for (int j = 0; j < n_freqs; j++, pair++) {\n"
+"                int idx = pair * 2;\n"
+"                float re = vh[idx];\n"
+"                float im = vh[idx + 1];\n"
+"                vh[idx]     = re * ca[j] - im * sa[j];\n"
+"                vh[idx + 1] = re * sa[j] + im * ca[j];\n"
 "            }\n"
 "        }\n"
+"        /* remaining pairs (if head_dim/2 > 3*n_freqs): identity (no rotation) */\n"
 "    }\n"
 "}\n\n"
 
