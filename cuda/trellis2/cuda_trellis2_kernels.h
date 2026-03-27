@@ -282,6 +282,18 @@ static const char cuda_trellis2_kernel_source[] =
 "    V[idx] = kv[base + W + d];\n"
 "}\n\n"
 
+/* ---- timestep_embed_cossin_f32: sinusoidal embed with [cos, sin] order ---- */
+/* TRELLIS.2 uses [cos, sin] while HY3D uses [sin, cos]. */
+"__global__ void timestep_embed_cossin_f32(float *out, float t, int dim) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int half = dim / 2;\n"
+"    if (i >= half) return;\n"
+"    float exponent = -logf(10000.0f) * (float)i / (float)half;\n"
+"    float emb = expf(exponent) * t;\n"
+"    out[i] = cosf(emb);\n"
+"    out[half + i] = sinf(emb);\n"
+"}\n\n"
+
 "} /* close extern C from cuda_kernels_common */\n"
 ; /* end of kernel source string */
 
