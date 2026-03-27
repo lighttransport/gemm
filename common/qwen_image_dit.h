@@ -122,15 +122,27 @@ typedef struct {
     int rope_axes[3];  /* temporal, height, width dims for RoPE */
     float rope_theta;  /* 10000.0 */
 
-    void *gguf_ctx;  /* kept for mmap lifetime */
+    void *gguf_ctx;        /* kept for mmap lifetime (gguf_context* or st_context*) */
+    int   gguf_ctx_is_st;  /* 1 if gguf_ctx is st_context*, 0 if gguf_context* */
 
     /* Debug: dump intermediates for a specific block (-1 = disabled) */
     int dump_block;
     void (*dump_fn)(const char *name, const float *data, int n, void *ctx);
     void *dump_ctx;
+
+    /* Pre-dequantized F32 weight storage (from qimg_dit_predequant) */
+    float **predequant_bufs;  /* array of malloc'd F32 buffers */
+    int     n_predequant;     /* count of buffers */
+    int     is_predequanted;  /* 1 if predequant has been applied */
 } qimg_dit_model;
 
+/* Pre-dequantize all quantized weights to F32 for fast SIMD GEMM.
+ * Call once after loading. Increases memory (~2GB for 60 blocks) but
+ * eliminates repeated dequantization during inference. */
+void qimg_dit_predequant(qimg_dit_model *m);
+
 qimg_dit_model *qimg_dit_load_gguf(const char *path);
+qimg_dit_model *qimg_dit_load_safetensors(const char *path);
 void            qimg_dit_free(qimg_dit_model *m);
 
 /* Forward: single denoising step.
@@ -161,11 +173,63 @@ void qimg_dit_unpatchify(float *out, const float *tokens,
 #include <string.h>
 #include <math.h>
 #include "gguf_loader.h"
+#include "safetensors.h"
 
-/* ---- Helper: dequantize a row ---- */
+/* Custom type ID for FP8 E4M3 (not in GGML enum) */
+#define QIMG_TYPE_F8_E4M3 200
+
+/* FP8 E4M3 → F32 conversion */
+static float qimg_fp8_e4m3_to_f32(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp  = (b >> 3) & 0xF;
+    uint32_t mant = b & 0x7;
+    if (exp == 0 && mant == 0) return sign ? -0.0f : 0.0f;
+    float f;
+    if (exp == 0) {
+        f = ldexpf((float)mant / 8.0f, -6);
+    } else if (exp == 15 && mant == 7) {
+        return 0.0f;
+    } else {
+        f = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
+    }
+    return sign ? -f : f;
+}
+
+/* Dequantize one row of FP8 E4M3 data to F32 */
+static void qimg_dequant_row_fp8(const uint8_t *src, float *dst, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = qimg_fp8_e4m3_to_f32(src[i]);
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define QIMG_HAS_SSE2 1
+#ifdef __AVX2__
+#define QIMG_HAS_AVX2 1
+#endif
+#ifdef __FMA__
+#define QIMG_HAS_FMA 1
+#endif
+#endif
+
+/* ---- Helper: dequantize a row (kept for non-predequant path) ---- */
 
 static void qimg_dequant_row(const qtensor *t, int row, float *dst) {
     int n_cols = t->n_cols;
+
+    /* FP8 E4M3: 1 byte per element, simple row layout */
+    if (t->type == QIMG_TYPE_F8_E4M3) {
+        const uint8_t *src = (const uint8_t *)t->data + (size_t)row * n_cols;
+        qimg_dequant_row_fp8(src, dst, n_cols);
+        return;
+    }
+    /* F32: direct memcpy */
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(dst, (const float *)t->data + (size_t)row * n_cols,
+               (size_t)n_cols * sizeof(float));
+        return;
+    }
+
     int block_size, type_size;
     switch (t->type) {
         case GGML_TYPE_Q4_0:    block_size = 32;  type_size = 18;  break;
@@ -173,7 +237,7 @@ static void qimg_dequant_row(const qtensor *t, int row, float *dst) {
         case GGML_TYPE_Q8_0:    block_size = 32;  type_size = 34;  break;
         case GGML_TYPE_Q4_K:    block_size = 256; type_size = 144; break;
         case GGML_TYPE_Q6_K:    block_size = 256; type_size = 210; break;
-        case GGML_TYPE_F32:     block_size = 1;   type_size = 4;   break;
+        case GGML_TYPE_IQ4_XS:  block_size = 256; type_size = 136; break;
         case GGML_TYPE_F16:     block_size = 1;   type_size = 2;   break;
         case GGML_TYPE_BF16:    block_size = 1;   type_size = 2;   break;
         case GGML_TYPE_Q4_0_4_4: block_size = 32; type_size = 18;  break;
@@ -197,32 +261,129 @@ static float *qimg_dequant_full(const qtensor *t) {
     return buf;
 }
 
-/* ---- Batched GEMM: out[tok, n_out] = inp[tok, n_in] @ W^T + bias ---- */
+/* ---- Pre-dequantized weight: just F32 pointer + dims ---- */
+
+typedef struct {
+    float *data;   /* [n_rows, n_cols] F32, pre-dequantized */
+    int    n_rows;
+    int    n_cols;
+} qimg_f32w;
+
+/* Pre-dequantize a qtensor to F32. */
+static qimg_f32w qimg_predequant(const qtensor *t) {
+    qimg_f32w w = {NULL, 0, 0};
+    if (!t || !t->data) return w;
+    w.n_rows = t->n_rows;
+    w.n_cols = t->n_cols;
+    w.data = qimg_dequant_full(t);
+    return w;
+}
+
+static void qimg_f32w_free(qimg_f32w *w) {
+    if (w->data) { free(w->data); w->data = NULL; }
+}
+
+/* ---- SIMD dot product: a[n] . b[n] ---- */
+
+static float qimg_dot(const float *a, const float *b, int n) {
+#if defined(QIMG_HAS_AVX2) && defined(QIMG_HAS_FMA)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 31 < n; i += 32) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), acc3);
+    }
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    /* Horizontal sum */
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float sum = _mm_cvtss_f32(lo);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+#elif defined(QIMG_HAS_SSE2)
+    __m128 acc0 = _mm_setzero_ps();
+    __m128 acc1 = _mm_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_loadu_ps(a + i),     _mm_loadu_ps(b + i)));
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4)));
+    }
+    acc0 = _mm_add_ps(acc0, acc1);
+    /* Horizontal sum */
+    __m128 shuf = _mm_shuffle_ps(acc0, acc0, _MM_SHUFFLE(2, 3, 0, 1));
+    acc0 = _mm_add_ps(acc0, shuf);
+    shuf = _mm_movehl_ps(shuf, acc0);
+    acc0 = _mm_add_ss(acc0, shuf);
+    float sum = _mm_cvtss_f32(acc0);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+#else
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += a[i] * b[i];
+    return sum;
+#endif
+}
+
+/* ---- Batched GEMM with pre-dequantized F32 weights ---- */
+/* out[tok, n_out] = inp[tok, n_in] @ W^T + bias
+ * W is [n_out, n_in] row-major F32 (pre-dequantized)
+ * bias is [n_out] F32 or NULL */
+
+static void qimg_gemm_f32(float *out, const float *W, const float *bias,
+                          const float *inp, int n_tok, int n_out, int n_in) {
+    for (int o = 0; o < n_out; o++) {
+        const float *w_row = W + (size_t)o * n_in;
+        float b = bias ? bias[o] : 0.0f;
+        for (int t = 0; t < n_tok; t++) {
+            const float *x = inp + (size_t)t * n_in;
+            out[(size_t)t * n_out + o] = qimg_dot(w_row, x, n_in) + b;
+        }
+    }
+}
+
+/* ---- Legacy GEMM with on-the-fly dequant (for non-predequant path) ---- */
 
 static void qimg_batch_gemm(float *out, const qtensor *w, const qtensor *bias,
                             const float *inp, int n_tok, int n_out, int n_in,
                             int n_threads) {
-    (void)n_threads; /* TODO: thread parallelism */
+    (void)n_threads;
+
+    /* Get bias as F32 (zero-copy if already F32) */
+    const float *b = NULL;
+    float *b_tmp = NULL;
+    if (bias && bias->data) {
+        if (bias->type == GGML_TYPE_F32)
+            b = (const float *)bias->data;
+        else { b_tmp = qimg_dequant_full(bias); b = b_tmp; }
+    }
+
+    /* Fast path: weights already F32 (pre-dequanted) — zero-copy SIMD GEMM */
+    if (w->type == GGML_TYPE_F32) {
+        qimg_gemm_f32(out, (const float *)w->data, b, inp, n_tok, n_out, n_in);
+        if (b_tmp) free(b_tmp);
+        return;
+    }
+
+    /* Quantized path: dequant one row at a time, use SIMD dot product */
     float *row_buf = (float *)malloc((size_t)n_in * sizeof(float));
     for (int o = 0; o < n_out; o++) {
         qimg_dequant_row(w, o, row_buf);
+        float bv = b ? b[o] : 0.0f;
         for (int t = 0; t < n_tok; t++) {
-            float sum = 0.0f;
             const float *x = inp + (size_t)t * n_in;
-            for (int i = 0; i < n_in; i++)
-                sum += row_buf[i] * x[i];
-            out[(size_t)t * n_out + o] = sum;
+            out[(size_t)t * n_out + o] = qimg_dot(row_buf, x, n_in) + bv;
         }
     }
     free(row_buf);
-    /* Add bias */
-    if (bias && bias->data) {
-        float *b = qimg_dequant_full(bias);
-        for (int t = 0; t < n_tok; t++)
-            for (int o = 0; o < n_out; o++)
-                out[(size_t)t * n_out + o] += b[o];
-        free(b);
-    }
+    if (b_tmp) free(b_tmp);
 }
 
 /* ---- LayerNorm (no affine) ---- */
@@ -932,10 +1093,225 @@ qimg_dit_model *qimg_dit_load_gguf(const char *path) {
     return m;
 }
 
+/* ---- Load DiT from FP8 safetensors ---- */
+
+/* Helper: create qtensor pointing at mmap'd safetensors data (zero-copy for weights).
+ * Small tensors (1D biases/norms) are converted to F32 immediately.
+ * Large tensors (2D weights) stay as raw FP8 and are dequanted per-row during GEMM. */
+static qtensor qimg_st_make_tensor(st_context *st, const char *name,
+                                    float ***buf_list, int *buf_count) {
+    qtensor t = {0};
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return t;
+
+    const uint64_t *shape = safetensors_shape(st, idx);
+    int ndims = safetensors_ndims(st, idx);
+    size_t numel = 1;
+    for (int d = 0; d < ndims; d++) numel *= shape[d];
+
+    const char *dtype = safetensors_dtype(st, idx);
+    int is_fp8 = (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0);
+
+    if (ndims >= 2) {
+        /* 2D weight: keep as mmap'd FP8, dequant per-row during GEMM */
+        t.data = safetensors_data(st, idx);
+        t.type = is_fp8 ? QIMG_TYPE_F8_E4M3 : GGML_TYPE_F32;
+        t.n_dims = ndims;
+        for (int d = 0; d < ndims && d < 4; d++) t.dims[d] = shape[d];
+        t.n_rows = (int)shape[0];
+        t.n_cols = (int)shape[1];
+    } else {
+        /* 1D bias/norm: convert to F32 immediately (small) */
+        float *f32 = (float *)malloc(numel * sizeof(float));
+        const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
+        if (is_fp8) {
+            for (size_t i = 0; i < numel; i++)
+                f32[i] = qimg_fp8_e4m3_to_f32(src[i]);
+        } else if (strcmp(dtype, "BF16") == 0) {
+            const uint16_t *bf = (const uint16_t *)src;
+            for (size_t i = 0; i < numel; i++) {
+                uint32_t bits = (uint32_t)bf[i] << 16;
+                memcpy(&f32[i], &bits, 4);
+            }
+        } else if (strcmp(dtype, "F32") == 0) {
+            memcpy(f32, src, numel * sizeof(float));
+        }
+        *buf_list = (float **)realloc(*buf_list, (size_t)(*buf_count + 1) * sizeof(float *));
+        (*buf_list)[*buf_count] = f32;
+        (*buf_count)++;
+        t.data = f32;
+        t.type = GGML_TYPE_F32;
+        t.n_dims = 1;
+        t.dims[0] = shape[0];
+        t.n_rows = 1;
+        t.n_cols = (int)shape[0];
+    }
+    return t;
+}
+
+qimg_dit_model *qimg_dit_load_safetensors(const char *path) {
+    fprintf(stderr, "qimg_dit: loading safetensors %s\n", path);
+    st_context *st = safetensors_open(path);
+    if (!st) { fprintf(stderr, "qimg_dit: failed to open %s\n", path); return NULL; }
+
+    qimg_dit_model *m = (qimg_dit_model *)calloc(1, sizeof(qimg_dit_model));
+    m->dump_block = -1;
+
+    float **bufs = NULL;
+    int n_bufs = 0;
+
+    m->hidden_dim = 3072; m->n_heads = 24; m->head_dim = 128;
+    m->in_channels = 64; m->out_channels = 64; m->patch_size = 2;
+    m->txt_dim = 3584; m->mlp_hidden = 12288;
+    m->ln_eps = 1e-6f; m->rope_theta = 10000.0f;
+    m->rope_axes[0] = 16; m->rope_axes[1] = 56; m->rope_axes[2] = 56;
+
+    /* Count blocks */
+    m->n_blocks = 0;
+    for (int i = 0; i < st->n_tensors; i++) {
+        const char *nm = safetensors_name(st, i);
+        const char *bp = strstr(nm, "transformer_blocks.");
+        if (bp) {
+            int blk = atoi(bp + 19);
+            if (blk + 1 > m->n_blocks) m->n_blocks = blk + 1;
+        }
+    }
+    fprintf(stderr, "qimg_dit: %d blocks detected\n", m->n_blocks);
+
+    #define ST_LOAD(field, name) m->field = qimg_st_make_tensor(st, name, &bufs, &n_bufs)
+
+    ST_LOAD(txt_norm_w, "txt_norm.weight");
+    ST_LOAD(img_in_w, "img_in.weight"); ST_LOAD(img_in_b, "img_in.bias");
+    ST_LOAD(txt_in_w, "txt_in.weight"); ST_LOAD(txt_in_b, "txt_in.bias");
+    ST_LOAD(t_fc1_w, "time_text_embed.timestep_embedder.linear_1.weight");
+    ST_LOAD(t_fc1_b, "time_text_embed.timestep_embedder.linear_1.bias");
+    ST_LOAD(t_fc2_w, "time_text_embed.timestep_embedder.linear_2.weight");
+    ST_LOAD(t_fc2_b, "time_text_embed.timestep_embedder.linear_2.bias");
+    ST_LOAD(norm_out_w, "norm_out.linear.weight");
+    ST_LOAD(norm_out_b, "norm_out.linear.bias");
+    ST_LOAD(proj_out_w, "proj_out.weight");
+    ST_LOAD(proj_out_b, "proj_out.bias");
+
+    m->blocks = (qimg_dit_block *)calloc((size_t)m->n_blocks, sizeof(qimg_dit_block));
+    for (int L = 0; L < m->n_blocks; L++) {
+        qimg_dit_block *blk = &m->blocks[L];
+        char name[256];
+        #define BLK_ST(field, suffix) do { \
+            snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, L); \
+            blk->field = qimg_st_make_tensor(st, name, &bufs, &n_bufs); \
+        } while(0)
+
+        BLK_ST(attn_q_w, "attn.to_q.weight"); BLK_ST(attn_q_b, "attn.to_q.bias");
+        BLK_ST(attn_k_w, "attn.to_k.weight"); BLK_ST(attn_k_b, "attn.to_k.bias");
+        BLK_ST(attn_v_w, "attn.to_v.weight"); BLK_ST(attn_v_b, "attn.to_v.bias");
+        BLK_ST(attn_out_w, "attn.to_out.0.weight"); BLK_ST(attn_out_b, "attn.to_out.0.bias");
+        BLK_ST(attn_add_q_w, "attn.add_q_proj.weight"); BLK_ST(attn_add_q_b, "attn.add_q_proj.bias");
+        BLK_ST(attn_add_k_w, "attn.add_k_proj.weight"); BLK_ST(attn_add_k_b, "attn.add_k_proj.bias");
+        BLK_ST(attn_add_v_w, "attn.add_v_proj.weight"); BLK_ST(attn_add_v_b, "attn.add_v_proj.bias");
+        BLK_ST(attn_add_out_w, "attn.to_add_out.weight"); BLK_ST(attn_add_out_b, "attn.to_add_out.bias");
+        BLK_ST(norm_q_w, "attn.norm_q.weight"); BLK_ST(norm_k_w, "attn.norm_k.weight");
+        BLK_ST(norm_added_q_w, "attn.norm_added_q.weight"); BLK_ST(norm_added_k_w, "attn.norm_added_k.weight");
+        BLK_ST(img_mod_w, "img_mod.1.weight"); BLK_ST(img_mod_b, "img_mod.1.bias");
+        BLK_ST(img_mlp_fc1_w, "img_mlp.net.0.proj.weight"); BLK_ST(img_mlp_fc1_b, "img_mlp.net.0.proj.bias");
+        BLK_ST(img_mlp_fc2_w, "img_mlp.net.2.weight"); BLK_ST(img_mlp_fc2_b, "img_mlp.net.2.bias");
+        BLK_ST(txt_mod_w, "txt_mod.1.weight"); BLK_ST(txt_mod_b, "txt_mod.1.bias");
+        BLK_ST(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight"); BLK_ST(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias");
+        BLK_ST(txt_mlp_fc2_w, "txt_mlp.net.2.weight"); BLK_ST(txt_mlp_fc2_b, "txt_mlp.net.2.bias");
+        #undef BLK_ST
+    }
+    #undef ST_LOAD
+
+    m->predequant_bufs = bufs;
+    m->n_predequant = n_bufs;
+    /* Keep st_context alive — 2D weight data pointers reference the mmap */
+    m->gguf_ctx = st;
+    m->gguf_ctx_is_st = 1;
+
+    fprintf(stderr, "qimg_dit: loaded %d blocks (FP8 weights mmap'd, biases F32)\n",
+            m->n_blocks);
+    return m;
+}
+
+/* ---- Pre-dequantize a single qtensor in-place: convert to F32 ---- */
+
+static void qimg_predequant_tensor(qtensor *t, float ***buf_list, int *buf_count) {
+    if (!t->data || t->type == GGML_TYPE_F32) return;
+    int n = t->n_rows * t->n_cols;
+    if (n <= 0) return;
+    float *f32 = (float *)malloc((size_t)n * sizeof(float));
+    for (int r = 0; r < t->n_rows; r++)
+        qimg_dequant_row(t, r, f32 + (size_t)r * t->n_cols);
+    /* Patch qtensor to point at F32 data */
+    t->data = f32;
+    t->type = GGML_TYPE_F32;
+    /* Track allocation for later free */
+    *buf_list = (float **)realloc(*buf_list, (size_t)(*buf_count + 1) * sizeof(float *));
+    (*buf_list)[*buf_count] = f32;
+    (*buf_count)++;
+}
+
+void qimg_dit_predequant(qimg_dit_model *m) {
+    if (m->is_predequanted) return;
+    float **bufs = NULL;
+    int n_bufs = 0;
+
+    fprintf(stderr, "qimg_dit: pre-dequantizing global weights to F32...\n");
+    clock_t t0 = clock();
+
+    /* Only predequant GLOBAL weights (small, ~50MB total).
+     * Block weights (~1.3GB each × 60 = 79GB) stay quantized and are
+     * dequanted on-the-fly per GEMM call using the SIMD dot product. */
+    #define PD(ptr) qimg_predequant_tensor(ptr, &bufs, &n_bufs)
+    PD(&m->txt_norm_w);
+    PD(&m->img_in_w); PD(&m->img_in_b);
+    PD(&m->txt_in_w); PD(&m->txt_in_b);
+    PD(&m->t_fc1_w); PD(&m->t_fc1_b);
+    PD(&m->t_fc2_w); PD(&m->t_fc2_b);
+    PD(&m->norm_out_w); PD(&m->norm_out_b);
+    PD(&m->proj_out_w); PD(&m->proj_out_b);
+
+    /* Predequant small per-block tensors (norms, biases — a few KB each) */
+    for (int L = 0; L < m->n_blocks; L++) {
+        qimg_dit_block *blk = &m->blocks[L];
+        /* Biases: [3072] or [12288] or [18432] F32 — small */
+        PD(&blk->attn_q_b); PD(&blk->attn_k_b); PD(&blk->attn_v_b);
+        PD(&blk->attn_out_b);
+        PD(&blk->attn_add_q_b); PD(&blk->attn_add_k_b); PD(&blk->attn_add_v_b);
+        PD(&blk->attn_add_out_b);
+        /* Per-head norms: [128] — tiny */
+        PD(&blk->norm_q_w); PD(&blk->norm_k_w);
+        PD(&blk->norm_added_q_w); PD(&blk->norm_added_k_w);
+        /* Modulation + MLP biases */
+        PD(&blk->img_mod_b); PD(&blk->txt_mod_b);
+        PD(&blk->img_mlp_fc1_b); PD(&blk->img_mlp_fc2_b);
+        PD(&blk->txt_mlp_fc1_b); PD(&blk->txt_mlp_fc2_b);
+    }
+    #undef PD
+
+    m->predequant_bufs = bufs;
+    m->n_predequant = n_bufs;
+    m->is_predequanted = 1;
+
+    double elapsed = (double)(clock() - t0) / CLOCKS_PER_SEC;
+    fprintf(stderr, "qimg_dit: pre-dequanted %d tensors (globals+biases) in %.1fs\n",
+            n_bufs, elapsed);
+}
+
 void qimg_dit_free(qimg_dit_model *m) {
     if (!m) return;
+    /* Free pre-dequanted buffers */
+    if (m->predequant_bufs) {
+        for (int i = 0; i < m->n_predequant; i++)
+            free(m->predequant_bufs[i]);
+        free(m->predequant_bufs);
+    }
     if (m->blocks) free(m->blocks);
-    if (m->gguf_ctx) gguf_close((gguf_context *)m->gguf_ctx);
+    if (m->gguf_ctx) {
+        if (m->gguf_ctx_is_st)
+            safetensors_close((st_context *)m->gguf_ctx);
+        else
+            gguf_close((gguf_context *)m->gguf_ctx);
+    }
     free(m);
 }
 
