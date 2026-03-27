@@ -195,10 +195,30 @@ static float qimg_fp8_e4m3_to_f32(uint8_t b) {
     return sign ? -f : f;
 }
 
-/* Dequantize one row of FP8 E4M3 data to F32 */
+/* Pre-computed FP8 E4M3 → F32 lookup table (256 entries) */
+static float qimg_fp8_lut[256];
+static int qimg_fp8_lut_init = 0;
+
+static void qimg_init_fp8_lut(void) {
+    if (qimg_fp8_lut_init) return;
+    for (int i = 0; i < 256; i++)
+        qimg_fp8_lut[i] = qimg_fp8_e4m3_to_f32((uint8_t)i);
+    qimg_fp8_lut_init = 1;
+}
+
+/* Dequantize one row of FP8 E4M3 data to F32 using LUT */
 static void qimg_dequant_row_fp8(const uint8_t *src, float *dst, int n) {
-    for (int i = 0; i < n; i++)
-        dst[i] = qimg_fp8_e4m3_to_f32(src[i]);
+    qimg_init_fp8_lut();
+    int i = 0;
+#if defined(__AVX2__)
+    /* Process 32 bytes at a time: load 32 uint8, gather 32 floats from LUT */
+    for (; i + 31 < n; i += 32) {
+        for (int j = 0; j < 32; j++)
+            dst[i + j] = qimg_fp8_lut[src[i + j]];
+    }
+#endif
+    for (; i < n; i++)
+        dst[i] = qimg_fp8_lut[src[i]];
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
