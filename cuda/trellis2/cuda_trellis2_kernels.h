@@ -316,6 +316,72 @@ static const char cuda_trellis2_kernel_source[] =
 "    }\n"
 "}\n\n"
 
+/* ---- DINOv3 2D RoPE: rotate_half convention, patch tokens only ---- */
+/* cos/sin: [n_patches, head_dim], Q/K: [seq, dim] where first n_prefix tokens skipped */
+/* Grid: n_patches, Block: 256 */
+"__global__ void rope_2d_dinov3_f32(\n"
+"    float *Q, float *K,\n"
+"    const float *cos_tab, const float *sin_tab,\n"
+"    int n_patches, int n_prefix, int dim, int n_heads, int head_dim) {\n"
+"    int p = blockIdx.x;\n"
+"    if (p >= n_patches) return;\n"
+"    int tok = n_prefix + p;  /* skip CLS + register tokens */\n"
+"    int half_hd = head_dim / 2;\n"
+"    const float *c = cos_tab + p * head_dim;\n"
+"    const float *s = sin_tab + p * head_dim;\n"
+"    for (int h = threadIdx.x; h < n_heads; h += blockDim.x) {\n"
+"        /* rotate_half: [-x[d/2:], x[:d/2]] */\n"
+"        float *q = Q + (size_t)tok * dim + h * head_dim;\n"
+"        float *k = K + (size_t)tok * dim + h * head_dim;\n"
+"        for (int d = 0; d < half_hd; d++) {\n"
+"            float q0 = q[d], q1 = q[d + half_hd];\n"
+"            q[d]           = q0 * c[d]           + (-q1) * s[d];\n"
+"            q[d + half_hd] = q1 * c[d + half_hd] + q0 * s[d + half_hd];\n"
+"            float k0 = k[d], k1 = k[d + half_hd];\n"
+"            k[d]           = k0 * c[d]           + (-k1) * s[d];\n"
+"            k[d + half_hd] = k1 * c[d + half_hd] + k0 * s[d + half_hd];\n"
+"        }\n"
+"    }\n"
+"}\n\n"
+
+/* ---- DINOv3 patch embedding: conv2d [3, ps, ps] -> [dim] per patch ---- */
+/* image: [3, H, W] normalized float. Grid: n_patches, Block: 256 */
+"__global__ void dinov3_patch_embed_f32(\n"
+"    float *out, const float *image, const float *W, const float *bias,\n"
+"    int grid_w, int dim, int ps, int img_w) {\n"
+"    int pidx = blockIdx.x;\n"
+"    int py = pidx / grid_w, px = pidx % grid_w;\n"
+"    for (int co = threadIdx.x; co < dim; co += blockDim.x) {\n"
+"        float sum = bias ? bias[co] : 0.0f;\n"
+"        for (int ci = 0; ci < 3; ci++) {\n"
+"            for (int kh = 0; kh < ps; kh++) {\n"
+"                for (int kw = 0; kw < ps; kw++) {\n"
+"                    int ih = py * ps + kh, iw = px * ps + kw;\n"
+"                    sum += W[((co * 3 + ci) * ps + kh) * ps + kw]\n"
+"                         * image[ci * img_w * img_w + ih * img_w + iw];\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        out[pidx * dim + co] = sum;\n"
+"    }\n"
+"}\n\n"
+
+/* ---- DINOv3 prepend CLS + register tokens ---- */
+/* patches: [n_patches, dim] at offset n_prefix in output */
+/* cls: [1, dim], reg: [n_reg, dim] */
+"__global__ void dinov3_prepend_tokens_f32(\n"
+"    float *hidden, const float *patches, const float *cls, const float *reg,\n"
+"    int n_patches, int n_reg, int dim) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int n_prefix = 1 + n_reg;\n"
+"    int total = (n_prefix + n_patches) * dim;\n"
+"    if (i >= total) return;\n"
+"    int tok = i / dim, d = i % dim;\n"
+"    if (tok == 0) hidden[i] = cls[d];\n"
+"    else if (tok < n_prefix) hidden[i] = reg[(tok - 1) * dim + d];\n"
+"    else hidden[i] = patches[(tok - n_prefix) * dim + d];\n"
+"}\n\n"
+
 "} /* close extern C from cuda_kernels_common */\n"
 ; /* end of kernel source string */
 

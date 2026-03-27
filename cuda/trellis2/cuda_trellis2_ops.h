@@ -46,6 +46,10 @@ typedef struct {
     CUfunction split_kv_chunk;
     CUfunction timestep_embed_cossin;
     CUfunction channel_layernorm_3d;
+    CUfunction rope_2d_dinov3;
+    CUfunction dinov3_patch_embed;
+    CUfunction dinov3_prepend_tokens;
+    CUfunction layerscale_add;
 
     int sm_version;
     int use_f32_gemm;
@@ -97,6 +101,10 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("split_kv_chunk_f32",     split_kv_chunk);
     GET_FN("timestep_embed_cossin_f32", timestep_embed_cossin);
     GET_FN("channel_layernorm_3d_f32", channel_layernorm_3d);
+    GET_FN("rope_2d_dinov3_f32",      rope_2d_dinov3);
+    GET_FN("dinov3_patch_embed_f32",   dinov3_patch_embed);
+    GET_FN("dinov3_prepend_tokens_f32", dinov3_prepend_tokens);
+    GET_FN("layerscale_add_f32",       layerscale_add);
 
     #undef GET_FN
     return 0;
