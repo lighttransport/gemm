@@ -1467,7 +1467,104 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
       if (scw) cuMemFree(scw); if (scb) cuMemFree(scb); }
 
-    /* Skip middle attention for now (small contribution, complex to implement) */
+    /* Middle attention: GroupNorm → QKV → spatial self-attention → proj + residual */
+    {
+        int spatial = h * w;
+        CUdeviceptr d_gn_g = vae_upload_f32(st, "decoder.middle.1.norm.gamma", s);
+        CUdeviceptr d_qkv_w = vae_upload_f32(st, "decoder.middle.1.to_qkv.weight", s);
+        CUdeviceptr d_qkv_b = vae_upload_f32(st, "decoder.middle.1.to_qkv.bias", s);
+        CUdeviceptr d_proj_w = vae_upload_f32(st, "decoder.middle.1.proj.weight", s);
+        CUdeviceptr d_proj_b = vae_upload_f32(st, "decoder.middle.1.proj.bias", s);
+
+        /* GroupNorm */
+        CUdeviceptr d_normed; cuMemAlloc(&d_normed, (size_t)c*spatial*sizeof(float));
+        vae_op_gn(r, d_normed, d_x, d_gn_g, c, spatial);
+        cuMemFree(d_gn_g);
+
+        /* QKV: 1×1 conv = per-spatial-position linear: [3*C, C] @ [C, S] → [3*C, S]
+         * Layout: data is [C, spatial] (CHW). QKV weight is [3*C, C, 1, 1].
+         * Treat as GEMM: out[3C, S] = W[3C, C] @ inp[C, S] */
+        CUdeviceptr d_qkv; cuMemAlloc(&d_qkv, (size_t)3*c*spatial*sizeof(float));
+        /* We need a transposed GEMM since data is [C, S] not [S, C].
+         * Simple approach: use conv2d with k=1 */
+        vae_op_conv2d(r, d_qkv, d_normed, d_qkv_w, d_qkv_b, c, h, w, 3*c, 1, 1, 0);
+        cuMemFree(d_normed); cuMemFree(d_qkv_w); cuMemFree(d_qkv_b);
+
+        /* Attention: Q, K, V are each [C, spatial] in CHW layout.
+         * We need to compute attention over spatial positions with C as feature dim.
+         * Reshape to [spatial, C] (row per spatial position), then run attention with 1 head.
+         * But our data is [C, spatial] (channel-first). We need to transpose. */
+
+        /* For simplicity: download to CPU, run CPU attention, upload result */
+        float *h_qkv = (float *)malloc((size_t)3 * c * spatial * sizeof(float));
+        cuMemcpyDtoH(h_qkv, d_qkv, (size_t)3 * c * spatial * sizeof(float));
+        cuMemFree(d_qkv);
+
+        /* Transpose from [3C, spatial] to [spatial, 3C] for attention */
+        float *h_qkv_t = (float *)malloc((size_t)3 * c * spatial * sizeof(float));
+        for (int s_pos = 0; s_pos < spatial; s_pos++)
+            for (int ch = 0; ch < 3 * c; ch++)
+                h_qkv_t[s_pos * 3 * c + ch] = h_qkv[ch * spatial + s_pos];
+        free(h_qkv);
+
+        /* Split Q[spatial, C], K[spatial, C], V[spatial, C] */
+        float *h_q = h_qkv_t;
+        float *h_k = h_qkv_t + (size_t)spatial * c;
+        float *h_v = h_qkv_t + (size_t)spatial * 2 * c;
+
+        /* Run attention: 1 head with head_dim=C */
+        float *h_attn = (float *)malloc((size_t)spatial * c * sizeof(float));
+        float scale_at = 1.0f / sqrtf((float)c);
+        for (int i = 0; i < spatial; i++) {
+            float mx = -1e30f;
+            for (int j = 0; j < spatial; j++) {
+                float dot = 0;
+                for (int d = 0; d < c; d++) dot += h_q[i*c+d] * h_k[j*c+d];
+                dot *= scale_at;
+                if (dot > mx) mx = dot;
+            }
+            float esum = 0;
+            memset(h_attn + i*c, 0, (size_t)c * sizeof(float));
+            for (int j = 0; j < spatial; j++) {
+                float dot = 0;
+                for (int d = 0; d < c; d++) dot += h_q[i*c+d] * h_k[j*c+d];
+                float w_at = expf(dot * scale_at - mx);
+                esum += w_at;
+                for (int d = 0; d < c; d++) h_attn[i*c+d] += w_at * h_v[j*c+d];
+            }
+            float inv = 1.0f / esum;
+            for (int d = 0; d < c; d++) h_attn[i*c+d] *= inv;
+        }
+        free(h_qkv_t);
+
+        /* Output projection: [C, C] @ attn_out[C, spatial] + residual
+         * First transpose attn back to [C, spatial] */
+        float *h_attn_chw = (float *)malloc((size_t)c * spatial * sizeof(float));
+        for (int s_pos = 0; s_pos < spatial; s_pos++)
+            for (int ch = 0; ch < c; ch++)
+                h_attn_chw[ch * spatial + s_pos] = h_attn[s_pos * c + ch];
+        free(h_attn);
+
+        /* Upload, conv 1×1, add residual */
+        CUdeviceptr d_attn_chw; cuMemAlloc(&d_attn_chw, (size_t)c*spatial*sizeof(float));
+        cuMemcpyHtoD(d_attn_chw, h_attn_chw, (size_t)c*spatial*sizeof(float));
+        free(h_attn_chw);
+
+        CUdeviceptr d_proj_out; cuMemAlloc(&d_proj_out, (size_t)c*spatial*sizeof(float));
+        vae_op_conv2d(r, d_proj_out, d_attn_chw, d_proj_w, d_proj_b, c, h, w, c, 1, 1, 0);
+        cuMemFree(d_attn_chw); cuMemFree(d_proj_w); cuMemFree(d_proj_b);
+
+        /* Residual: d_x += d_proj_out */
+        {
+            int n = c * spatial;
+            float one = 1.0f;
+            void *add_args[] = {&d_x, &d_proj_out, &one, &n};
+            cuLaunchKernel(r->euler_step, (unsigned)((n+255)/256), 1, 1,
+                           256, 1, 1, 0, s, add_args, NULL);
+        }
+        cuMemFree(d_proj_out);
+        cuStreamSynchronize(s);
+    }
 
     /* mid.2 */
     { LOAD_RB_NAMED("decoder.middle.2", n1, c1w, c1b, n2, c2w, c2b, scw, scb);

@@ -234,6 +234,26 @@ int main(int argc, char **argv) {
                 vel_latent[i] = vu_lat[i] + cfg_scale * (vc_lat[i] - vu_lat[i]);
             free(vc_lat); free(vu_lat);
 
+            /* CFGNorm: normalize combined velocity by its magnitude
+             * (matches ComfyUI CFGNorm node with strength=1) */
+            {
+                float mag = 0;
+                for (int i = 0; i < lat_n; i++) mag += vel_latent[i] * vel_latent[i];
+                mag = sqrtf(mag / (float)lat_n + 1e-8f);
+                /* Compute uncond magnitude for reference scale */
+                float *vu_tmp = (float *)malloc((size_t)lat_n * sizeof(float));
+                qimg_dit_unpatchify(vu_tmp, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
+                float umag = 0;
+                for (int i = 0; i < lat_n; i++) umag += vu_tmp[i] * vu_tmp[i];
+                umag = sqrtf(umag / (float)lat_n + 1e-8f);
+                free(vu_tmp);
+                /* Rescale combined to match uncond magnitude */
+                if (mag > 1e-6f) {
+                    float scale_norm = umag / mag;
+                    for (int i = 0; i < lat_n; i++) vel_latent[i] *= scale_norm;
+                }
+            }
+
             /* Euler step */
             qimg_sched_step(latent, vel_latent, lat_n, step, &sched);
             free(vel_latent);
