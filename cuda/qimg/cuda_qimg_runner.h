@@ -653,6 +653,18 @@ static void qimg_init_fp8_to_f32_lut(void) {
     qimg_cuda_fp8_to_f32_lut_init = 1;
 }
 
+/* Checked cuMemAlloc — returns 0 on failure */
+static CUdeviceptr checked_cuMemAlloc(size_t nbytes) {
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, nbytes);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg: cuMemAlloc(%.1f MB) FAILED (err=%d)\n",
+                (float)nbytes / (1 << 20), (int)err);
+        return 0;
+    }
+    return d;
+}
+
 /* Upload safetensor as F32 (for biases, norms) */
 static CUdeviceptr qimg_st_upload_f32(st_context *st, const char *name) {
     int idx = safetensors_find(st, name);
@@ -694,8 +706,8 @@ static CUdeviceptr qimg_st_upload_f32(st_context *st, const char *name) {
         }
     }
 
-    CUdeviceptr d;
-    cuMemAlloc(&d, n * sizeof(float));
+    CUdeviceptr d = checked_cuMemAlloc(n * sizeof(float));
+    if (!d) { free(f32); return 0; }
     cuMemcpyHtoD(d, f32, n * sizeof(float));
     free(f32);
     return d;
@@ -708,8 +720,8 @@ static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     if (idx < 0) return 0;
     size_t nbytes = safetensors_nbytes(st, idx);
     void *data = safetensors_data(st, idx);
-    CUdeviceptr d;
-    cuMemAlloc(&d, nbytes);
+    CUdeviceptr d = checked_cuMemAlloc(nbytes);
+    if (!d) return 0;
     cuMemcpyHtoD(d, data, nbytes);
     return d;
 }
@@ -717,23 +729,29 @@ static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
 /* ---- Load/free one DiT block ---- */
 
 /* Upload block weights as raw FP8 (for native FP8 GEMM) or dequant to F16 */
-static void qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b) {
+static void qimg_free_block(qimg_block_gpu *b);  /* forward decl */
+
+/* Returns 0 on success, -1 on OOM (partial allocs are freed) */
+static int qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b) {
     st_context *st = (st_context *)r->dit_st;
     char name[256];
+    int ok = 1;
 
     /* Upload weight: FP8 raw for native GEMM, or F32 for precision */
-    #define BLK_W(field, suffix) do { \
+    #define BLK_W(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_fp8_gemm) { \
             b->field = qimg_st_upload_fp8_raw(st, name); \
         } else { \
             b->field = qimg_st_upload_f32(st, name); \
         } \
-    } while(0)
-    #define BLK_F32(field, suffix) do { \
+        if (!b->field) ok = 0; \
+    } } while(0)
+    #define BLK_F32(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         b->field = qimg_st_upload_f32(st, name); \
-    } while(0)
+        if (!b->field) ok = 0; \
+    } } while(0)
 
     BLK_W(attn_q_w, "attn.to_q.weight"); BLK_F32(attn_q_b, "attn.to_q.bias");
     BLK_W(attn_k_w, "attn.to_k.weight"); BLK_F32(attn_k_b, "attn.to_k.bias");
@@ -760,6 +778,12 @@ static void qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *
 
     #undef BLK_W
     #undef BLK_F32
+
+    if (!ok) {
+        qimg_free_block(b);
+        return -1;
+    }
+    return 0;
 }
 
 static void qimg_free_block(qimg_block_gpu *b) {
@@ -1024,7 +1048,11 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
                 (float)free_mem / (1<<30), (float)block_bytes / (1<<20));
 
         for (int i = 0; i < max_preload; i++) {
-            qimg_load_block(r, i, &r->gpu_blocks[i]);
+            if (qimg_load_block(r, i, &r->gpu_blocks[i]) != 0) {
+                fprintf(stderr, "cuda_qimg: stopped preloading at block %d (OOM)\n", i);
+                r->n_preloaded = i;
+                break;
+            }
         }
         cuStreamSynchronize(r->stream);
 
@@ -1346,7 +1374,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_gemm(r, d_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
                 in_ch, dim, n_img);
 
-        /* Download result */
+        /* Download result (sync stream first to ensure computation is complete) */
+        cuStreamSynchronize(s);
         cuMemcpyDtoH(out, d_out, (size_t)n_img * in_ch * sizeof(float));
         cuMemFree(d_out);
     }
