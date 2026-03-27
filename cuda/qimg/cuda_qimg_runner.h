@@ -275,6 +275,54 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 
+/* gemm_fp8w_f32: FP8 weights dequanted via LUT in registers, F32 inputs+accumulation.
+ * W is raw FP8 bytes [n_out, n_in], X is F32 [n_tok, n_in].
+ * Uses the constant memory LUT d_fp8_to_f16_lut but converts to F32.
+ * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
+"__device__ __constant__ float d_fp8_to_f32_lut[256];\n"
+"\n"
+"__global__ void gemm_fp8w_f32(float *Y, const unsigned char *W, const float *X,\n"
+"    const float *bias, int n_out, int n_in, int n_tok) {\n"
+"    __shared__ float smA[16][16];\n"
+"    __shared__ float smB[16][16];\n"
+"    int tx = threadIdx.x, ty = threadIdx.y;\n"
+"    int tok_base = blockIdx.y * 16;\n"
+"    int out_base = blockIdx.x * 64;\n"
+"    int row = tok_base + ty;\n"
+"    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;\n"
+"    for (int k = 0; k < n_in; k += 16) {\n"
+"        smA[ty][tx] = (tok_base+ty < n_tok && k+tx < n_in) ? X[(tok_base+ty)*n_in + k+tx] : 0.f;\n"
+"        __syncthreads();\n"
+"        { int w = out_base + tx;\n"
+"          smB[ty][tx] = (w < n_out && k+ty < n_in) ? d_fp8_to_f32_lut[W[(size_t)w*n_in+k+ty]] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc0 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        { int w = out_base+16+tx;\n"
+"          smB[ty][tx] = (w < n_out && k+ty < n_in) ? d_fp8_to_f32_lut[W[(size_t)w*n_in+k+ty]] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc1 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        { int w = out_base+32+tx;\n"
+"          smB[ty][tx] = (w < n_out && k+ty < n_in) ? d_fp8_to_f32_lut[W[(size_t)w*n_in+k+ty]] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc2 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        { int w = out_base+48+tx;\n"
+"          smB[ty][tx] = (w < n_out && k+ty < n_in) ? d_fp8_to_f32_lut[W[(size_t)w*n_in+k+ty]] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc3 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (row < n_tok) {\n"
+"        if (out_base+   tx < n_out) Y[row*n_out+out_base+   tx] = acc0 + (bias?bias[out_base+   tx]:0.f);\n"
+"        if (out_base+16+tx < n_out) Y[row*n_out+out_base+16+tx] = acc1 + (bias?bias[out_base+16+tx]:0.f);\n"
+"        if (out_base+32+tx < n_out) Y[row*n_out+out_base+32+tx] = acc2 + (bias?bias[out_base+32+tx]:0.f);\n"
+"        if (out_base+48+tx < n_out) Y[row*n_out+out_base+48+tx] = acc3 + (bias?bias[out_base+48+tx]:0.f);\n"
+"    }\n"
+"}\n"
+"\n"
+
 /* gemm_f32_f32: pure F32 tiled GEMM (from HY3D kernels) */
 "__global__ void gemm_f32_f32(float *Y, const float *W, const float *X,\n"
 "    const float *bias, int n_out, int n_in, int n_tok) {\n"
@@ -485,6 +533,7 @@ struct cuda_qimg_runner {
     CUfunction gemm_f16_f32;
     CUfunction gemm_fp8_f32;     /* native FP8 GEMM (sm_89+) */
     CUfunction gemm_f32_f32;     /* pure F32 GEMM (highest precision) */
+    CUfunction gemm_fp8w_f32;   /* FP8 weight (LUT dequant) × F32 input */
     CUfunction layernorm_f32;
     CUfunction gelu_f32;
     CUfunction silu_f32;
@@ -727,16 +776,17 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
     unsigned gy = (unsigned)((n_tok + 15) / 16);
 
     if (r->use_fp8_gemm) {
-        /* gemm_fp8_f32: W is raw FP8 bytes, X is F32 (converted to FP8 in smem)
-         * shared mem = 16 rows × 32 cols of F32 (k=32 tile) */
-        unsigned smem = 16 * 32 * sizeof(float);
-        cuLaunchKernel(r->gemm_fp8_f32, gx, gy, 1, 128, 1, 1,
-                       smem, r->stream, args, NULL);
-    } else {
-        /* gemm_f32_f32: W is F32, pure F32 compute (highest precision).
+        /* gemm_fp8w_f32: W stays as raw FP8 bytes, dequanted to F32 via LUT
+         * in shared memory. X stays F32. F32 accumulation.
          * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
-        unsigned gx32 = (unsigned)((n_out + 63) / 64);
-        cuLaunchKernel(r->gemm_f32_f32, gx32, gy, 1, 16, 16, 1,
+        unsigned gx64 = (unsigned)((n_out + 63) / 64);
+        cuLaunchKernel(r->gemm_fp8w_f32, gx64, gy, 1, 16, 16, 1,
+                       0, r->stream, args, NULL);
+    } else {
+        /* gemm_f32_f32: W is F32, pure F32 compute.
+         * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
+        unsigned gx64 = (unsigned)((n_out + 63) / 64);
+        cuLaunchKernel(r->gemm_f32_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
     }
 }
@@ -871,6 +921,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     #define GET(field, name) cuModuleGetFunction(&r->field, module, name)
     GET(gemm_f16_f32, "gemm_f16_f32");
     GET(gemm_f32_f32, "gemm_f32_f32");
+    GET(gemm_fp8w_f32, "gemm_fp8w_f32");
     /* Try loading native FP8 GEMM (available on sm_89+) */
     r->use_fp8_gemm = 0;
     if (sm >= 89) {
@@ -912,6 +963,19 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
             cuMemcpyHtoD(d_lut, qimg_fp8_to_f16_lut, 256 * sizeof(uint16_t));
             if (verbose)
                 fprintf(stderr, "cuda_qimg: FP8→F16 LUT uploaded to GPU constant memory\n");
+        }
+    }
+
+    /* Upload FP8→F32 LUT to GPU constant memory (for gemm_fp8w_f32) */
+    {
+        qimg_init_fp8_to_f32_lut();
+        CUdeviceptr d_lut32;
+        size_t lut_size32;
+        CUresult lut_rc = cuModuleGetGlobal(&d_lut32, &lut_size32, module, "d_fp8_to_f32_lut");
+        if (lut_rc == CUDA_SUCCESS && lut_size32 == 256 * sizeof(float)) {
+            cuMemcpyHtoD(d_lut32, qimg_cuda_fp8_to_f32_lut, 256 * sizeof(float));
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: FP8→F32 LUT uploaded\n");
         }
     }
 
