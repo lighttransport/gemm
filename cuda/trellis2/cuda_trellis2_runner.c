@@ -64,7 +64,7 @@
 
 typedef struct {
     CUdeviceptr ln1_w, ln1_b;
-    CUdeviceptr qkv_w, qkv_b;
+    CUdeviceptr q_w, q_b, k_w, k_b, v_w, v_b;  /* separate Q/K/V for RoPE */
     CUdeviceptr q_norm_w, k_norm_w;
     CUdeviceptr out_w, out_b;
     CUdeviceptr ls1, ls2;
@@ -115,6 +115,7 @@ struct cuda_trellis2_runner {
     CUdeviceptr dino_norm_w, dino_norm_b;
     dino_layer_gpu dino_layers[DINO_LAYERS];
     int dino_has_qk_norm, dino_has_layerscale;
+    CUdeviceptr dino_rope_cos, dino_rope_sin;  /* [1024, 64] for 32x32 patches */
 
     /* DiT weights */
     CUdeviceptr dit_t_fc1_w, dit_t_fc1_b, dit_t_fc2_w, dit_t_fc2_b;
@@ -458,6 +459,135 @@ static int load_decoder_weights(cuda_trellis2_runner *r, const char *path) {
     return 0;
 }
 
+static int load_dinov3_weights(cuda_trellis2_runner *r, const char *path) {
+    st_context *st = safetensors_open(path);
+    if (!st) return -1;
+    fprintf(stderr, "T2: loading DINOv3 from %s (%d tensors)\n", path, st->n_tensors);
+    int v = r->verbose;
+
+    /* Patch embedding + tokens (timm naming) */
+    r->dino_patch_w = t2_upload_f32(st, "patch_embed.proj.weight", v);
+    r->dino_patch_b = t2_upload_f32(st, "patch_embed.proj.bias", v);
+    r->dino_cls_token = t2_upload_f32(st, "cls_token", v);
+    r->dino_storage_tokens = t2_upload_f32(st, "reg_token", v);
+
+    r->dino_has_layerscale = 0;
+    r->dino_has_qk_norm = 0;
+
+    /* Per-layer weights (timm naming: fused QKV → split to separate Q/K/V) */
+    for (int L = 0; L < DINO_LAYERS; L++) {
+        dino_layer_gpu *l = &r->dino_layers[L];
+        char name[256];
+
+        #define DINO_LOAD(field, suffix) do { \
+            snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix); \
+            l->field = t2_upload_f32(st, name, v >= 2 ? v : 0); \
+        } while(0)
+
+        DINO_LOAD(ln1_w, "norm1.weight");
+        DINO_LOAD(ln1_b, "norm1.bias");
+
+        /* Split fused QKV [3*dim, dim] into separate Q, K, V on CPU */
+        snprintf(name, sizeof(name), "blocks.%d.attn.qkv.weight", L);
+        int idx = safetensors_find(st, name);
+        if (idx >= 0) {
+            size_t nbytes = safetensors_nbytes(st, idx);
+            const char *dtype = safetensors_dtype(st, idx);
+            void *data = safetensors_data(st, idx);
+            int n_elem = (int)(nbytes / (strcmp(dtype, "F32") == 0 ? 4 : 2));
+            int dim = DINO_HIDDEN;
+            float *f32 = (float *)malloc(n_elem * sizeof(float));
+            if (strcmp(dtype, "F32") == 0) memcpy(f32, data, n_elem * 4);
+            else if (strcmp(dtype, "F16") == 0) {
+                const uint16_t *src = (const uint16_t *)data;
+                for (int i = 0; i < n_elem; i++) {
+                    uint16_t h = src[i]; uint32_t sign = ((uint32_t)h & 0x8000) << 16;
+                    uint32_t exp = (h>>10)&0x1f; uint32_t mant = h&0x3ff; uint32_t f;
+                    if (exp==0) { if (mant==0) f=sign; else { exp=1; while(!(mant&0x400)){mant<<=1;exp--;} mant&=0x3ff; f=sign|((exp+127-15)<<23)|(mant<<13); }}
+                    else if (exp==31) f=sign|0x7f800000|(mant<<13); else f=sign|((exp+127-15)<<23)|(mant<<13);
+                    memcpy(&f32[i], &f, 4);
+                }
+            }
+            /* Split: Q=[dim, dim], K=[dim, dim], V=[dim, dim] */
+            l->q_w = cu_upload_raw(f32, (size_t)dim * dim * 4);
+            l->k_w = cu_upload_raw(f32 + dim * dim, (size_t)dim * dim * 4);
+            l->v_w = cu_upload_raw(f32 + 2 * dim * dim, (size_t)dim * dim * 4);
+            free(f32);
+            /* timm has no QKV bias — create zeros */
+            float *zeros = (float *)calloc(dim, sizeof(float));
+            l->q_b = cu_upload_raw(zeros, dim * 4);
+            l->k_b = cu_upload_raw(zeros, dim * 4);
+            l->v_b = cu_upload_raw(zeros, dim * 4);
+            free(zeros);
+        }
+
+        DINO_LOAD(out_w, "attn.proj.weight");
+        DINO_LOAD(out_b, "attn.proj.bias");
+        DINO_LOAD(ln2_w, "norm2.weight");
+        DINO_LOAD(ln2_b, "norm2.bias");
+        DINO_LOAD(fc1_w, "mlp.fc1.weight");
+        DINO_LOAD(fc1_b, "mlp.fc1.bias");
+        DINO_LOAD(fc2_w, "mlp.fc2.weight");
+        DINO_LOAD(fc2_b, "mlp.fc2.bias");
+
+        /* LayerScale (timm: gamma_1, gamma_2) */
+        snprintf(name, sizeof(name), "blocks.%d.gamma_1", L);
+        l->ls1 = t2_upload_f32(st, name, 0);
+        snprintf(name, sizeof(name), "blocks.%d.gamma_2", L);
+        l->ls2 = t2_upload_f32(st, name, 0);
+        if (l->ls1) r->dino_has_layerscale = 1;
+
+        /* QK norm (not present in timm ViT-L) */
+        l->q_norm_w = 0; l->k_norm_w = 0;
+
+        #undef DINO_LOAD
+    }
+
+    /* Precompute 2D RoPE tables for 32×32 grid */
+    {
+        int gh = DINO_IMG_SIZE / DINO_PATCH;  /* 32 */
+        int np = gh * gh;  /* 1024 */
+        int hd = DINO_HEAD_DIM;  /* 64 */
+        float rope_theta = 100.0f;
+        int n_freqs = hd / 4;  /* 16 */
+
+        float *inv_freq = (float *)malloc(n_freqs * sizeof(float));
+        for (int j = 0; j < n_freqs; j++)
+            inv_freq[j] = 1.0f / powf(rope_theta, (float)(4 * j) / (float)hd);
+
+        float *cos_tab = (float *)malloc((size_t)np * hd * sizeof(float));
+        float *sin_tab = (float *)malloc((size_t)np * hd * sizeof(float));
+
+        for (int p = 0; p < np; p++) {
+            int py = p / gh, px = p % gh;
+            float cy = ((0.5f + py) / gh) * 2.0f - 1.0f;
+            float cx = ((0.5f + px) / gh) * 2.0f - 1.0f;
+
+            /* angles: [y_freqs(16), x_freqs(16)] tiled 2× = [y16, x16, y16, x16] = 64 */
+            float angles[64];
+            for (int j = 0; j < n_freqs; j++) {
+                angles[j]              = 2.0f * 3.14159265358979f * cy * inv_freq[j];
+                angles[n_freqs + j]    = 2.0f * 3.14159265358979f * cx * inv_freq[j];
+                angles[2*n_freqs + j]  = angles[j];       /* tile */
+                angles[3*n_freqs + j]  = angles[n_freqs + j];
+            }
+            for (int d = 0; d < hd; d++) {
+                cos_tab[p * hd + d] = cosf(angles[d]);
+                sin_tab[p * hd + d] = sinf(angles[d]);
+            }
+        }
+        r->dino_rope_cos = cu_upload_raw(cos_tab, (size_t)np * hd * sizeof(float));
+        r->dino_rope_sin = cu_upload_raw(sin_tab, (size_t)np * hd * sizeof(float));
+        free(inv_freq); free(cos_tab); free(sin_tab);
+        fprintf(stderr, "T2: DINOv3 RoPE tables uploaded (16 freqs, 32x32 grid)\n");
+    }
+
+    safetensors_close(st);
+    fprintf(stderr, "T2: DINOv3 loaded (%d blocks, layerscale=%d)\n",
+            DINO_LAYERS, r->dino_has_layerscale);
+    return 0;
+}
+
 int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
                                 const char *dinov3_path,
                                 const char *stage1_path,
@@ -468,11 +598,127 @@ int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
     if (stage1_path && load_dit_weights(r, stage1_path) != 0) return -1;
     if (decoder_path && load_decoder_weights(r, decoder_path) != 0) return -1;
 
-    /* DINOv3 loading would go here — skip for now (use CPU DINOv3 features) */
-    if (dinov3_path)
-        fprintf(stderr, "T2: DINOv3 GPU encoding not yet implemented (use CPU features)\n");
+    if (dinov3_path && load_dinov3_weights(r, dinov3_path) != 0) return -1;
 
     return 0;
+}
+
+/* ======================================================================== */
+/* DINOv3 forward pass                                                      */
+/* ======================================================================== */
+
+static void run_dinov3(cuda_trellis2_runner *r, CUdeviceptr d_image, CUdeviceptr d_out) {
+    t2_ops *ops = &r->ops;
+    CUstream stream = r->stream;
+    const int dim = DINO_HIDDEN;        /* 1024 */
+    const int heads = DINO_HEADS;       /* 16 */
+    const int hd = DINO_HEAD_DIM;       /* 64 */
+    const int ffn = DINO_FFN;           /* 4096 */
+    const int ps = DINO_PATCH;          /* 16 */
+    const int gw = DINO_IMG_SIZE / ps;  /* 32 */
+    const int np = DINO_N_PATCHES;      /* 1024 */
+    const int ns = DINO_N_STORAGE;      /* 4 */
+    const int seq = DINO_SEQ_LEN;       /* 1029 */
+    const int n_prefix = 1 + ns;        /* 5 */
+
+    /* Scratch layout */
+    ensure_scratch(r, 0, (size_t)seq * dim * sizeof(float));       /* hidden */
+    ensure_scratch(r, 1, (size_t)3 * seq * dim * sizeof(float));   /* QKV */
+    ensure_scratch(r, 2, (size_t)seq * dim * sizeof(float));       /* attn_out */
+    ensure_scratch(r, 3, (size_t)seq * ffn * sizeof(float));       /* mlp */
+    ensure_scratch(r, 4, (size_t)seq * dim * sizeof(float));       /* normed */
+
+    CUdeviceptr d_hidden = r->scratch[0];
+    CUdeviceptr d_qkv    = r->scratch[1];
+    CUdeviceptr d_attn   = r->scratch[2];
+    CUdeviceptr d_mlp    = r->scratch[3];
+    CUdeviceptr d_normed = r->scratch[4];
+
+    /* 1. Patch embedding */
+    /* Write patches starting at offset n_prefix in hidden buffer */
+    CUdeviceptr d_patches = d_hidden + (size_t)n_prefix * dim * sizeof(float);
+    {
+        int gw2 = gw, dim2 = dim, ps2 = ps, iw = DINO_IMG_SIZE;
+        void *args[] = {&d_patches, &d_image, &r->dino_patch_w, &r->dino_patch_b,
+                        &gw2, &dim2, &ps2, &iw};
+        cuLaunchKernel(ops->dinov3_patch_embed, (unsigned)(gw * gw), 1, 1,
+                       256, 1, 1, 0, stream, args, NULL);
+    }
+
+    /* 2. Prepend CLS + register tokens */
+    {
+        int np2 = np, ns2 = ns, dim2 = dim;
+        void *args[] = {&d_hidden, &d_patches, &r->dino_cls_token, &r->dino_storage_tokens,
+                        &np2, &ns2, &dim2};
+        cuLaunchKernel(ops->dinov3_prepend_tokens,
+                       (unsigned)((seq * dim + 255) / 256), 1, 1,
+                       256, 1, 1, 0, stream, args, NULL);
+    }
+
+    /* 3. Transformer blocks */
+    for (int li = 0; li < DINO_LAYERS; li++) {
+        dino_layer_gpu *l = &r->dino_layers[li];
+
+        /* LN1 → Q, K, V projections */
+        t2_op_layernorm(ops, stream, d_normed, d_hidden, l->ln1_w, l->ln1_b, seq, dim);
+
+        CUdeviceptr d_Q = d_qkv;
+        CUdeviceptr d_K = d_qkv + (size_t)seq * dim * sizeof(float);
+        CUdeviceptr d_V = d_qkv + (size_t)2 * seq * dim * sizeof(float);
+        t2_op_gemm(ops, stream, d_Q, l->q_w, d_normed, l->q_b, dim, dim, seq);
+        t2_op_gemm(ops, stream, d_K, l->k_w, d_normed, l->k_b, dim, dim, seq);
+        t2_op_gemm(ops, stream, d_V, l->v_w, d_normed, l->v_b, dim, dim, seq);
+
+        /* 2D RoPE on Q and K (patch tokens only, skip prefix) */
+        {
+            int np3 = np, npx = n_prefix, dim3 = dim, nh = heads, hd3 = hd;
+            void *args[] = {&d_Q, &d_K, &r->dino_rope_cos, &r->dino_rope_sin,
+                            &np3, &npx, &dim3, &nh, &hd3};
+            cuLaunchKernel(ops->rope_2d_dinov3, (unsigned)np, 1, 1,
+                           256, 1, 1, 0, stream, args, NULL);
+        }
+
+        /* Self-attention */
+        t2_op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, seq, dim, heads, hd);
+
+        /* Output projection */
+        t2_op_gemm(ops, stream, d_normed, l->out_w, d_attn, l->out_b, dim, dim, seq);
+
+        /* LayerScale 1 + residual */
+        if (l->ls1) {
+            /* layerscale_add: dst[i] += src[i] * scale[i % dim] */
+            int n = seq * dim;
+            void *ls_args[] = {&d_hidden, &d_normed, &l->ls1, &n, &dim};
+            cuLaunchKernel(ops->layerscale_add, (unsigned)((n+255)/256), 1, 1,
+                           256, 1, 1, 0, stream, ls_args, NULL);
+        } else {
+            t2_op_add(ops, stream, d_hidden, d_normed, seq * dim);
+        }
+
+        /* LN2 → MLP → LayerScale 2 + residual */
+        t2_op_layernorm(ops, stream, d_normed, d_hidden, l->ln2_w, l->ln2_b, seq, dim);
+        t2_op_gemm(ops, stream, d_mlp, l->fc1_w, d_normed, l->fc1_b, ffn, dim, seq);
+        t2_op_gelu(ops, stream, d_mlp, seq * ffn);
+        t2_op_gemm(ops, stream, d_normed, l->fc2_w, d_mlp, l->fc2_b, dim, ffn, seq);
+
+        if (l->ls2) {
+            int n = seq * dim;
+            void *ls_args[] = {&d_hidden, &d_normed, &l->ls2, &n, &dim};
+            cuLaunchKernel(ops->layerscale_add, (unsigned)((n+255)/256), 1, 1,
+                           256, 1, 1, 0, stream, ls_args, NULL);
+        } else {
+            t2_op_add(ops, stream, d_hidden, d_normed, seq * dim);
+        }
+    }
+
+    /* 4. Final unparameterized LayerNorm (for TRELLIS.2 compatibility) */
+    {
+        float eps = 1e-6f;
+        int dim2 = dim;
+        void *args[] = {&d_out, &d_hidden, &dim2, &eps};
+        cuLaunchKernel(ops->layernorm_noaffine, (unsigned)seq, 1, 1,
+                       256, 1, 1, 512 * sizeof(float), stream, args, NULL);
+    }
 }
 
 /* ======================================================================== */
@@ -888,7 +1134,21 @@ int cuda_trellis2_run_decoder(cuda_trellis2_runner *r,
 
 int cuda_trellis2_run_dinov3(cuda_trellis2_runner *r,
                               const float *image_f32, float *output) {
-    (void)r; (void)image_f32; (void)output;
-    fprintf(stderr, "T2: DINOv3 GPU not yet implemented\n");
-    return -1;
+    CUstream s = r->stream;
+    int seq = DINO_SEQ_LEN;
+    int dim = DINO_HIDDEN;
+
+    /* Upload normalized image [3, 512, 512] */
+    CUdeviceptr d_image = cu_upload_raw(image_f32,
+        (size_t)3 * DINO_IMG_SIZE * DINO_IMG_SIZE * sizeof(float));
+    CUdeviceptr d_out;
+    cuMemAlloc(&d_out, (size_t)seq * dim * sizeof(float));
+
+    run_dinov3(r, d_image, d_out);
+
+    cuStreamSynchronize(s);
+    cuMemcpyDtoH(output, d_out, (size_t)seq * dim * sizeof(float));
+
+    cuMemFree(d_image); cuMemFree(d_out);
+    return 0;
 }
