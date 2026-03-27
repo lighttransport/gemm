@@ -1,0 +1,15 @@
+[project]
+name = "qwen-image-reference"
+version = "0.1.0"
+description = "PyTorch reference for Qwen-Image layer-by-layer verification"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "safetensors",
+    "numpy",
+    "Pillow",
+    "diffusers @ git+https://github.com/huggingface/diffusers",
+    "transformers>=4.45",
+    "accelerate",
+    "qwen-vl-utils",
+]

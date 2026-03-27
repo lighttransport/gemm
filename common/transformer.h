@@ -335,17 +335,18 @@ static void tf_dequant_row(const qtensor *t, int row, float *dst) {
         case GGML_TYPE_Q8_0: block_size = 32;  type_size = 34;  break;
         case GGML_TYPE_Q4_K: block_size = 256; type_size = 144; break;
         case GGML_TYPE_Q5_K: block_size = 256; type_size = 176; break;
-        case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
-        case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
-        case GGML_TYPE_F16:  block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_Q6_K:   block_size = 256; type_size = 210; break;
+        case GGML_TYPE_IQ4_XS: block_size = 256; type_size = 136; break;
+        case GGML_TYPE_F32:    block_size = 1;   type_size = 4;   break;
+        case GGML_TYPE_F16:    block_size = 1;   type_size = 2;   break;
         default:
             fprintf(stderr, "tf_dequant_row: unsupported type %u\n", t->type);
-            memset(dst, 0, n_cols * sizeof(float));
+            memset(dst, 0, (size_t)n_cols * sizeof(float));
             return;
     }
 
     size_t row_bytes = (size_t)((n_cols + block_size - 1) / block_size) * type_size;
-    const void *row_data = (const uint8_t *)t->data + row * row_bytes;
+    const void *row_data = (const uint8_t *)t->data + (size_t)row * row_bytes;
     dequant_row(t->type, row_data, dst, n_cols);
 }
 
@@ -357,6 +358,7 @@ static int tf_is_supported_weight_type(uint32_t type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
             return 1;
@@ -1283,7 +1285,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     /* Detect architecture prefix. */
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "qwen35.block_count") >= 0) {
+    if (gguf_find_key(gguf, "qwen2vl.block_count") >= 0) {
+        arch = "qwen2vl";
+    } else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) {
         arch = "qwen35";
     } else if (gguf_find_key(gguf, "qwen3vlmoe.block_count") >= 0) {
         arch = "qwen3vlmoe";
