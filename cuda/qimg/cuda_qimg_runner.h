@@ -364,50 +364,44 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 
-/* Simple self-attention: Q[N,dim], K[N,dim], V[N,dim] → out[N,dim]
- * One block per head, iterates over all query positions */
+/* Self-attention: Q[N,dim], K[N,dim], V[N,dim] → out[N,dim]
+ * One block per (head, query). Threads parallelize head_dim accumulation.
+ * Grid: (n_heads, N), Block: (128) — one thread per head_dim element */
 "__global__ void simple_attn_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ Q, const float *__restrict__ K,\n"
 "    const float *__restrict__ V,\n"
 "    int N, int n_heads, int head_dim) {\n"
 "    int h = blockIdx.x;\n"
+"    int qi = blockIdx.y;\n"
+"    if (h >= n_heads || qi >= N) return;\n"
 "    int dim = n_heads * head_dim;\n"
+"    int d = threadIdx.x;\n"  /* each thread handles one dimension */
+"    if (d >= head_dim) return;\n"
 "    float scale = rsqrtf((float)head_dim);\n"
-"    /* Process one query at a time per head */\n"
-"    for (int qi = 0; qi < N; qi++) {\n"
-"        const float *q = Q + qi * dim + h * head_dim;\n"
-"        /* Find max for numerical stability */\n"
-"        float mx = -1e30f;\n"
-"        for (int j = 0; j < N; j++) {\n"
-"            const float *k = K + j * dim + h * head_dim;\n"
-"            float s = 0;\n"
-"            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)\n"
-"                s += q[d] * k[d];\n"
-"            for (int m = 16; m > 0; m >>= 1)\n"
-"                s += __shfl_xor_sync(0xFFFFFFFF, s, m);\n"
-"            s *= scale;\n"
-"            if (s > mx) mx = s;\n"
-"        }\n"
-"        /* Softmax + weighted sum */\n"
-"        float exp_sum = 0;\n"
-"        float acc[128];\n"  /* max head_dim = 128 */
-"        for (int d = 0; d < head_dim; d++) acc[d] = 0;\n"
-"        for (int j = 0; j < N; j++) {\n"
-"            const float *k = K + j * dim + h * head_dim;\n"
-"            float s = 0;\n"
-"            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)\n"
-"                s += q[d] * k[d];\n"
-"            for (int m = 16; m > 0; m >>= 1)\n"
-"                s += __shfl_xor_sync(0xFFFFFFFF, s, m);\n"
-"            float w = expf(s * scale - mx);\n"
-"            exp_sum += w;\n"
-"            const float *v = V + j * dim + h * head_dim;\n"
-"            for (int d = 0; d < head_dim; d++) acc[d] += w * v[d];\n"
-"        }\n"
-"        float inv = 1.0f / exp_sum;\n"
-"        float *dst = out + qi * dim + h * head_dim;\n"
-"        for (int d = 0; d < head_dim; d++) dst[d] = acc[d] * inv;\n"
+"    const float *q = Q + qi * dim + h * head_dim;\n"
+"    extern __shared__ float smem[];\n"  /* [N] attention weights */
+"    /* Pass 1: compute attention scores + max */\n"
+"    float qd = q[d];\n"
+"    float mx = -1e30f;\n"
+"    for (int j = 0; j < N; j++) {\n"
+"        float s = qd * K[j * dim + h * head_dim + d];\n"
+"        /* Reduce across head_dim threads */\n"
+"        for (int m = 64; m > 0; m >>= 1)\n"
+"            s += __shfl_xor_sync(0xFFFFFFFF, s, m);\n"
+"        s *= scale;\n"
+"        if (d == 0) smem[j] = s;\n"  /* thread 0 stores score */
+"        if (s > mx) mx = s;\n"
 "    }\n"
+"    __syncthreads();\n"
+"    /* Pass 2: softmax + weighted sum (per-dim) */\n"
+"    float acc = 0;\n"
+"    float exp_sum_local = 0;\n"
+"    for (int j = 0; j < N; j++) {\n"
+"        float w = expf(smem[j] - mx);\n"
+"        exp_sum_local += w;\n"
+"        acc += w * V[j * dim + h * head_dim + d];\n"
+"    }\n"
+"    out[qi * dim + h * head_dim + d] = acc / exp_sum_local;\n"
 "}\n"
 
 "}\n"; /* close extern "C" from cuda_kernels_common_src */
@@ -748,12 +742,14 @@ static void op_gated_add(cuda_qimg_runner *r, CUdeviceptr x, CUdeviceptr proj,
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr q,
                     CUdeviceptr k, CUdeviceptr v,
                     int n_tok, int n_heads, int head_dim) {
-    /* simple_attn_f32: one block per head, single thread (sequential per head) */
+    /* simple_attn_f32: one block per (head, query).
+     * Block has head_dim threads (128). Shared mem stores N attention scores. */
     void *args[] = {&out, &q, &k, &v, &n_tok, &n_heads, &head_dim};
+    unsigned smem = (unsigned)n_tok * sizeof(float);
     cuLaunchKernel(r->attn_prefill_f32,
-                   (unsigned)n_heads, 1, 1,
-                   32, 1, 1,  /* 1 warp */
-                   0, r->stream, args, NULL);
+                   (unsigned)n_heads, (unsigned)n_tok, 1,
+                   (unsigned)head_dim, 1, 1,
+                   smem, r->stream, args, NULL);
 }
 
 

@@ -140,6 +140,9 @@ int main(int argc, char **argv) {
         t0 = clock();
         cuda_qimg_dit_step(r, img, n_img, txt, n_txt, 500.0f, out);
         fprintf(stderr, "DiT step: %.2fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+        { float mn=out[0],mx=out[0],sm=0; int nn=n_img*in_ch, nc=0;
+          for(int i=0;i<nn;i++){if(out[i]!=out[i])nc++;else{if(out[i]<mn)mn=out[i];if(out[i]>mx)mx=out[i];sm+=out[i];}}
+          fprintf(stderr, "Output: min=%.4f max=%.4f mean=%.4f nan=%d/%d\n",mn,mx,sm/(nn-nc),nc,nn); }
         free(img); free(txt); free(out);
         cuda_qimg_free(r); return 0;
     }
@@ -152,16 +155,92 @@ int main(int argc, char **argv) {
         int in_ch = 64, lat_ch = 16;
         int txt_dim = 3584;
 
-        /* 1. Text encoder (CPU) — encode both positive and negative prompts */
-        fprintf(stderr, "\n[1/3] Text encoder (CPU)...\n");
+        /* 1. Text encoder — try loading ComfyUI .npy first, fall back to GGUF */
+        fprintf(stderr, "\n[1/3] Text conditioning...\n");
         int n_txt = 0, n_txt_neg = 0;
         float *txt_hidden = NULL, *txt_neg_hidden = NULL;
-        qimg_text_enc *enc = qimg_text_enc_load(enc_path);
-        if (enc) {
-            txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
-            fprintf(stderr, "  Encoding negative prompt...\n");
-            txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
-            qimg_text_enc_free(enc);
+
+        /* Try ComfyUI pre-encoded hidden states */
+        {
+            /* Try loading from several locations */
+            const char *pos_paths[] = {
+                "../../ref/qwen_image/output/comfyui_text_hidden.npy",
+                "../../../diffusion/ref/qwen_image/output/comfyui_text_hidden.npy",
+                "comfyui_text_hidden.npy", NULL};
+            const char *pos_path = NULL, *neg_path = NULL;
+            for (int pi = 0; pos_paths[pi]; pi++) {
+                FILE *tf = fopen(pos_paths[pi], "rb");
+                if (tf) { fclose(tf); pos_path = pos_paths[pi]; break; }
+            }
+            if (!pos_path) pos_path = "comfyui_text_hidden.npy";
+            {
+                /* Derive neg path from pos path */
+                static char neg_buf[512];
+                const char *dot = strrchr(pos_path, '.');
+                if (dot) {
+                    size_t base_len = (size_t)(dot - pos_path);
+                    memcpy(neg_buf, pos_path, base_len);
+                    snprintf(neg_buf + base_len, sizeof(neg_buf) - base_len, "_neg.npy");
+                    neg_path = neg_buf;
+                }
+            }
+            FILE *fp = fopen(pos_path, "rb");
+            if (fp) {
+                uint8_t hdr[10]; if(fread(hdr,1,10,fp)==10) {
+                    int hl = (int)hdr[8] | ((int)hdr[9]<<8);
+                    char hbuf[512]; fseek(fp,10,SEEK_SET);
+                    if(fread(hbuf,1,(size_t)hl,fp)==(size_t)hl) {
+                        hbuf[hl]=0;
+                        /* Parse shape (1, N, 3584) */
+                        char *sp = strstr(hbuf, "shape");
+                        if (sp) { sp = strchr(sp, '(');
+                            if (sp) { sp++; /* skip batch dim */
+                                while(*sp && *sp!=',') sp++; if(*sp==',') sp++;
+                                n_txt = atoi(sp);
+                            }
+                        }
+                    }
+                    if (n_txt > 0) {
+                        fseek(fp, 10+hl, SEEK_SET);
+                        txt_hidden = (float*)malloc((size_t)n_txt*txt_dim*sizeof(float));
+                        fread(txt_hidden, sizeof(float), (size_t)n_txt*txt_dim, fp);
+                        fprintf(stderr, "  Loaded ComfyUI pos hidden [%d, %d]\n", n_txt, txt_dim);
+                    }
+                }
+                fclose(fp);
+                /* Load negative */
+                fp = fopen(neg_path, "rb");
+                if (fp) {
+                    uint8_t hdr2[10]; fread(hdr2,1,10,fp);
+                    int hl2 = (int)hdr2[8] | ((int)hdr2[9]<<8);
+                    char hb2[512]; fseek(fp,10,SEEK_SET);
+                    if(fread(hb2,1,(size_t)hl2,fp)==(size_t)hl2) {
+                        hb2[hl2]=0;
+                        char *sp2 = strstr(hb2, "shape");
+                        if (sp2) { sp2 = strchr(sp2, '(');
+                            if (sp2) { sp2++; while(*sp2&&*sp2!=',') sp2++; if(*sp2==',') sp2++;
+                                n_txt_neg = atoi(sp2); } }
+                    }
+                    if (n_txt_neg > 0) {
+                        fseek(fp, 10+hl2, SEEK_SET);
+                        txt_neg_hidden = (float*)malloc((size_t)n_txt_neg*txt_dim*sizeof(float));
+                        fread(txt_neg_hidden, sizeof(float), (size_t)n_txt_neg*txt_dim, fp);
+                        fprintf(stderr, "  Loaded ComfyUI neg hidden [%d, %d]\n", n_txt_neg, txt_dim);
+                    }
+                    fclose(fp);
+                }
+            }
+        }
+
+        /* Fallback: GGUF text encoder */
+        if (!txt_hidden) {
+            qimg_text_enc *enc = qimg_text_enc_load(enc_path);
+            if (enc) {
+                txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
+                fprintf(stderr, "  Encoding negative prompt...\n");
+                txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
+                qimg_text_enc_free(enc);
+            }
         }
         if (!txt_hidden) {
             fprintf(stderr, "Text encoder failed\n");
@@ -258,8 +337,13 @@ int main(int argc, char **argv) {
             qimg_sched_step(latent, vel_latent, lat_n, step, &sched);
             free(vel_latent);
 
-            double step_s = (double)(clock() - step_t0) / CLOCKS_PER_SEC;
-            fprintf(stderr, "  step %d/%d  t=%.3f  %.2fs\n", step+1, n_steps, t_val, step_s);
+            /* Track latent stats */
+            { float lmn=latent[0],lmx=latent[0],ls=0;
+              int ln=lat_ch*lat_h*lat_w;
+              for(int i=0;i<ln;i++){if(latent[i]<lmn)lmn=latent[i];if(latent[i]>lmx)lmx=latent[i];ls+=latent[i];}
+              double step_s = (double)(clock() - step_t0) / CLOCKS_PER_SEC;
+              fprintf(stderr, "  step %d/%d  t=%.3f  lat=[%.2f,%.2f] mean=%.3f  %.2fs\n",
+                      step+1, n_steps, t_val, lmn, lmx, ls/ln, step_s); }
         }
         double denoise_s = (double)(clock() - denoise_t0) / CLOCKS_PER_SEC;
         fprintf(stderr, "Denoising: %.1fs total (%.2fs/step)\n", denoise_s, denoise_s / n_steps);
