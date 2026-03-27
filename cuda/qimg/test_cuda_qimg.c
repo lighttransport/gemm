@@ -233,7 +233,23 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Fallback: GGUF text encoder */
+        /* Try FP8 safetensors text encoder first, then GGUF fallback */
+        if (!txt_hidden) {
+            const char *st_enc = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
+            FILE *tf = fopen(st_enc, "rb");
+            if (tf) {
+                fclose(tf);
+                fprintf(stderr, "  Loading FP8 scaled text encoder...\n");
+                qimg_text_enc *enc = qimg_text_enc_load_safetensors(st_enc, enc_path);
+                if (enc) {
+                    txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
+                    fprintf(stderr, "  Encoding negative prompt...\n");
+                    txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
+                    qimg_text_enc_free(enc);
+                }
+            }
+        }
+        /* GGUF fallback */
         if (!txt_hidden) {
             qimg_text_enc *enc = qimg_text_enc_load(enc_path);
             if (enc) {
