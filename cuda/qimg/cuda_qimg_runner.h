@@ -1194,7 +1194,12 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         CUdeviceptr txt_g2  = d_txt_mod + (size_t)5 * dim * sizeof(float);
 
         /* adaLN image → d_scratch1 */
-        if (L == 0) { DUMP_MAX("img_input", d_img, n_img*dim); }
+        if (L == 0) {
+            DUMP_MAX("img_input", d_img, n_img*dim);
+            DUMP_MAX("img_mod_shift1", img_sh1, dim);
+            DUMP_MAX("img_mod_scale1", img_sc1, dim);
+            DUMP_MAX("img_mod_gate1", img_g1, dim);
+        }
         op_adaln(r, d_scratch1, d_img, img_sh1, img_sc1, n_img, dim);
         if (L == 0) { DUMP_MAX("img_adaln", d_scratch1, n_img*dim); }
         /* adaLN text → d_scratch2 */
