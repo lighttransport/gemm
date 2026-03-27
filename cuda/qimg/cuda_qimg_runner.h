@@ -92,6 +92,18 @@ static float fp8_e4m3_to_f32(uint8_t b) {
 static const char *qimg_kernel_src =
 "\n/* ---- Qwen-Image specific kernels ---- */\n"
 
+/* GPU-side FP8 E4M3 → F16 dequant via constant memory LUT */
+"__device__ __constant__ unsigned short d_fp8_to_f16_lut[256];\n"
+"\n"
+/* Bulk dequant kernel: convert [n] FP8 bytes → [n] F16 values using LUT */
+"__global__ void dequant_fp8_to_f16(const unsigned char *__restrict__ src,\n"
+"    unsigned short *__restrict__ dst, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    dst[i] = d_fp8_to_f16_lut[src[i]];\n"
+"}\n"
+"\n"
+
 /* Per-head RMSNorm: x[N, dim], w[head_dim], n_heads, head_dim */
 "__global__ void rmsnorm_per_head_f32(float *__restrict__ x,\n"
 "    const float *__restrict__ w, int N, int n_heads, int head_dim) {\n"
@@ -268,6 +280,7 @@ struct cuda_qimg_runner {
     CUfunction add_bias_f32;
     CUfunction rmsnorm_per_head;
     CUfunction adaln_modulate;
+    CUfunction dequant_fp8_to_f16;  /* GPU-side FP8→F16 via LUT */
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
     CUfunction gated_add;
     CUfunction patchify;
@@ -431,11 +444,29 @@ static void qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *
     st_context *st = (st_context *)r->dit_st;
     char name[256];
 
-    /* Upload weight: FP8 raw if native GEMM available, else dequant to F16 */
+    /* Upload weight: always upload raw FP8, dequant on GPU if needed */
     #define BLK_W(field, suffix) do { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        b->field = r->use_fp8_gemm ? qimg_st_upload_fp8_raw(st, name) \
-                                    : qimg_st_upload_f16(st, name); \
+        if (r->use_fp8_gemm) { \
+            b->field = qimg_st_upload_fp8_raw(st, name); \
+        } else { \
+            /* Upload raw FP8 then dequant to F16 on GPU via LUT kernel */ \
+            int _idx = safetensors_find(st, name); \
+            if (_idx >= 0) { \
+                size_t _n = safetensors_nbytes(st, _idx); \
+                CUdeviceptr _d_fp8; \
+                cuMemAlloc(&_d_fp8, _n); \
+                cuMemcpyHtoD(_d_fp8, safetensors_data(st, _idx), _n); \
+                cuMemAlloc(&b->field, _n * 2); \
+                void *_args[] = {&_d_fp8, &b->field, &_n}; \
+                int _nn = (int)_n; _args[2] = &_nn; \
+                cuLaunchKernel(r->dequant_fp8_to_f16, \
+                    (unsigned)((_n + 255) / 256), 1, 1, 256, 1, 1, \
+                    0, r->stream, _args, NULL); \
+                cuStreamSynchronize(r->stream); \
+                cuMemFree(_d_fp8); \
+            } else { b->field = 0; } \
+        } \
     } while(0)
     #define BLK_F32(field, suffix) do { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
@@ -615,12 +646,62 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(patchify, "patchify_f32");
     GET(unpatchify, "unpatchify_f32");
     GET(euler_step, "euler_step_f32");
+    GET(dequant_fp8_to_f16, "dequant_fp8_to_f16");
     #undef GET
+
+    /* Upload FP8→F16 LUT to GPU constant memory */
+    {
+        qimg_init_fp8_to_f16_lut();
+        CUdeviceptr d_lut;
+        size_t lut_size;
+        CUresult lut_rc = cuModuleGetGlobal(&d_lut, &lut_size, module, "d_fp8_to_f16_lut");
+        if (lut_rc == CUDA_SUCCESS && lut_size == 256 * sizeof(uint16_t)) {
+            cuMemcpyHtoD(d_lut, qimg_fp8_to_f16_lut, 256 * sizeof(uint16_t));
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: FP8→F16 LUT uploaded to GPU constant memory\n");
+        }
+    }
 
     if (verbose) fprintf(stderr, "cuda_qimg: kernels compiled OK\n");
     return r;
 }
 
+
+/* Upload weight: raw FP8 for native GEMM, or upload FP8 + GPU dequant to F16 */
+static CUdeviceptr qimg_upload_weight_auto(cuda_qimg_runner *r,
+                                            st_context *st, const char *name) {
+    if (r->use_fp8_gemm)
+        return qimg_st_upload_fp8_raw(st, name);
+
+    /* F16 fallback: upload raw FP8, dequant on GPU via LUT kernel */
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return 0;
+    const char *dtype = safetensors_dtype(st, idx);
+    int is_fp8 = (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0);
+
+    if (!is_fp8) {
+        /* Already F16/BF16/F32 — use CPU-side upload */
+        return qimg_st_upload_f16(st, name);
+    }
+
+    size_t n = safetensors_nbytes(st, idx);  /* n bytes = n elements for FP8 */
+    /* Upload raw FP8 to GPU temp buffer */
+    CUdeviceptr d_fp8;
+    cuMemAlloc(&d_fp8, n);
+    cuMemcpyHtoD(d_fp8, safetensors_data(st, idx), n);
+    /* Allocate F16 output on GPU */
+    CUdeviceptr d_f16;
+    cuMemAlloc(&d_f16, n * 2);
+    /* Launch GPU LUT dequant */
+    int nn = (int)n;
+    void *args[] = {&d_fp8, &d_f16, &nn};
+    cuLaunchKernel(r->dequant_fp8_to_f16,
+                   (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                   0, r->stream, args, NULL);
+    cuStreamSynchronize(r->stream);
+    cuMemFree(d_fp8);
+    return d_f16;
+}
 
 /* ---- Load DiT from FP8 safetensors ---- */
 
@@ -644,9 +725,9 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         }
     }
 
-    /* Upload global weights — FP8 raw if native GEMM, else F16 */
-    #define GW(name) (r->use_fp8_gemm ? qimg_st_upload_fp8_raw(st, name) \
-                                       : qimg_st_upload_f16(st, name))
+    /* Upload global weights — FP8 raw if native GEMM, else GPU dequant to F16 */
+    #define GW(nm) qimg_upload_weight_auto(r, st, nm)
+    /* Helper: upload + GPU dequant if not using native FP8 */
     r->d_img_in_w = GW("img_in.weight");
     r->d_img_in_b = qimg_st_upload_f32(st, "img_in.bias");
     r->d_txt_in_w = GW("txt_in.weight");
