@@ -496,12 +496,13 @@ static void run_dit_forward(cuda_trellis2_runner *r,
      * 0: hidden [N * D]
      * 1: QKV / MLP shared [max(3*N*D, N*FFN)]
      * 2: attn_out + normed [2 * N * D]
-     * 3: mod[6*D] + t_emb[256] + cross_Q[N*D] + ca_K[ctx*D] + ca_V[ctx*D] */
+     * 3: mod[6*D] + t_emb[D] + cross_Q[N*D] + ca_K[ctx*D] + ca_V[ctx*D] */
     size_t qkv_sz = (size_t)3 * N * D * sizeof(float);
     size_t mlp_sz = (size_t)N * FFN * sizeof(float);
     size_t sh1 = qkv_sz > mlp_sz ? qkv_sz : mlp_sz;
     size_t ca_kv_sz = (size_t)ctx_len * D * sizeof(float);
-    size_t buf3_sz = (size_t)(6*D + 256) * sizeof(float)
+    /* t_emb MLP outputs D floats (not 256), needs D-sized buffer */
+    size_t buf3_sz = (size_t)(6*D + D) * sizeof(float)
                    + (size_t)N * D * sizeof(float) + 2 * ca_kv_sz
                    + (size_t)N * D * sizeof(float); /* split V space */
 
@@ -518,7 +519,7 @@ static void run_dit_forward(cuda_trellis2_runner *r,
 
     CUdeviceptr d_mod    = r->scratch[3];
     CUdeviceptr d_temb   = d_mod + (size_t)6 * D * sizeof(float);
-    CUdeviceptr d_cross_Q = d_temb + 256 * sizeof(float);
+    CUdeviceptr d_cross_Q = d_temb + (size_t)D * sizeof(float);  /* t_emb is D floats, not 256 */
     CUdeviceptr d_ca_K   = d_cross_Q + (size_t)N * D * sizeof(float);
     CUdeviceptr d_ca_V   = d_ca_K + ca_kv_sz;
     CUdeviceptr d_split_V = d_ca_V + ca_kv_sz;
