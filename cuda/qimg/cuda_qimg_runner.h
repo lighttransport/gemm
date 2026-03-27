@@ -293,9 +293,21 @@ struct cuda_qimg_runner {
 };
 
 
+/* ---- FP8 E4M3 → F16 LUT (256 entries, computed once) ---- */
+
+static uint16_t qimg_fp8_to_f16_lut[256];
+static int qimg_fp8_to_f16_lut_init = 0;
+
+static void qimg_init_fp8_to_f16_lut(void) {
+    if (qimg_fp8_to_f16_lut_init) return;
+    for (int i = 0; i < 256; i++)
+        qimg_fp8_to_f16_lut[i] = cu_f32_to_f16(fp8_e4m3_to_f32((uint8_t)i));
+    qimg_fp8_to_f16_lut_init = 1;
+}
+
 /* ---- Safetensor FP8→F16 upload helpers ---- */
 
-/* Upload safetensor as F16 weight (dequant FP8→F32→F16 on CPU).
+/* Upload safetensor as F16 weight using LUT for FP8→F16 conversion.
  * Safetensor shape [n_out, n_in] matches gemm_f16_f32 layout. */
 static CUdeviceptr qimg_st_upload_f16(st_context *st, const char *name) {
     int idx = safetensors_find(st, name);
@@ -310,8 +322,9 @@ static CUdeviceptr qimg_st_upload_f16(st_context *st, const char *name) {
 
     uint16_t *f16 = (uint16_t *)malloc(n * sizeof(uint16_t));
     if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0) {
+        qimg_init_fp8_to_f16_lut();
         for (size_t i = 0; i < n; i++)
-            f16[i] = cu_f32_to_f16(fp8_e4m3_to_f32(src[i]));
+            f16[i] = qimg_fp8_to_f16_lut[src[i]];
     } else if (strcmp(dtype, "F16") == 0) {
         memcpy(f16, src, n * 2);
     } else if (strcmp(dtype, "BF16") == 0) {
@@ -338,6 +351,18 @@ static CUdeviceptr qimg_st_upload_f16(st_context *st, const char *name) {
     return d;
 }
 
+/* ---- FP8 E4M3 → F32 LUT (256 entries) ---- */
+
+static float qimg_cuda_fp8_to_f32_lut[256];
+static int qimg_cuda_fp8_to_f32_lut_init = 0;
+
+static void qimg_init_fp8_to_f32_lut(void) {
+    if (qimg_cuda_fp8_to_f32_lut_init) return;
+    for (int i = 0; i < 256; i++)
+        qimg_cuda_fp8_to_f32_lut[i] = fp8_e4m3_to_f32((uint8_t)i);
+    qimg_cuda_fp8_to_f32_lut_init = 1;
+}
+
 /* Upload safetensor as F32 (for biases, norms) */
 static CUdeviceptr qimg_st_upload_f32(st_context *st, const char *name) {
     int idx = safetensors_find(st, name);
@@ -352,8 +377,9 @@ static CUdeviceptr qimg_st_upload_f32(st_context *st, const char *name) {
 
     float *f32 = (float *)malloc(n * sizeof(float));
     if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0) {
+        qimg_init_fp8_to_f32_lut();
         for (size_t i = 0; i < n; i++)
-            f32[i] = fp8_e4m3_to_f32(src[i]);
+            f32[i] = qimg_cuda_fp8_to_f32_lut[src[i]];
     } else if (strcmp(dtype, "F32") == 0) {
         memcpy(f32, src, n * 4);
     } else if (strcmp(dtype, "BF16") == 0) {

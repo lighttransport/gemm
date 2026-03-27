@@ -37,11 +37,13 @@ int main(int argc, char **argv) {
     const char *vae_path = "/mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors";
     const char *mode = NULL;
     int lat_h = 8, lat_w = 8;
+    int force_f16 = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test-init") == 0) mode = "init";
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
+        else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
         else if (strcmp(argv[i], "--dit") == 0 && i+1 < argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae") == 0 && i+1 < argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--height") == 0 && i+1 < argc) lat_h = atoi(argv[++i]) / 8;
@@ -57,6 +59,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "=== CUDA Qwen-Image Test: %s ===\n", mode);
 
     cuda_qimg_runner *r = cuda_qimg_init(0, 1);
+    if (r && force_f16) {
+        r->use_fp8_gemm = 0;
+        fprintf(stderr, "Forced F16 GEMM path (--no-fp8)\n");
+    }
     if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
 
     if (strcmp(mode, "init") == 0) { cuda_qimg_free(r); return 0; }
