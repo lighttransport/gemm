@@ -108,6 +108,7 @@ int main(int argc, char **argv) {
     int mc_grid = 64;
     float mc_threshold = 0.0f;
     const char *noise_path = NULL;
+    const char *occ_npy_path = NULL;
 
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
@@ -115,6 +116,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-g") && i+1 < argc) cfg_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "-o") && i+1 < argc) obj_path = argv[++i];
         else if (!strcmp(argv[i], "--npy") && i+1 < argc) npy_path = argv[++i];
+        else if (!strcmp(argv[i], "--occ") && i+1 < argc) occ_npy_path = argv[++i];
         else if (!strcmp(argv[i], "--grid") && i+1 < argc) mc_grid = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) mc_threshold = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--noise") && i+1 < argc) noise_path = argv[++i];
@@ -270,6 +272,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Occupancy: min=%.2f max=%.2f mean=%.4f\n", mn, mx, sum/(64*64*64));
     fprintf(stderr, "Occupied (logit>0): %d / %d (%.1f%%)\n",
             occ_count, 64*64*64, 100.0f * occ_count / (64*64*64));
+
+    if (occ_npy_path) {
+        int occ_dims[3] = {64, 64, 64};
+        write_npy_f32(occ_npy_path, occupancy, occ_dims, 3);
+    }
 
     /* Marching cubes + OBJ export */
     fprintf(stderr, "\n=== Mesh Export (grid=%d, threshold=%.1f) ===\n", mc_grid, mc_threshold);

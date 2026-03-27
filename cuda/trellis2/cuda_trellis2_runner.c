@@ -726,13 +726,13 @@ static void run_resblock(cuda_trellis2_runner *r,
     CUdeviceptr d_h1 = r->scratch[4];
     CUdeviceptr d_h2 = r->scratch[5];
 
-    /* GN1 -> SiLU -> Conv1 */
-    t2_op_groupnorm_3d(ops, s, d_h1, d_in, rb->gn1_w, rb->gn1_b, C, spatial, G);
+    /* ChannelLN1 -> SiLU -> Conv1 */
+    t2_op_channel_layernorm_3d(ops, s, d_h1, d_in, rb->gn1_w, rb->gn1_b, C, spatial);
     t2_op_silu_inplace(ops, s, d_h1, C * spatial);
     t2_op_conv3d(ops, s, d_h2, d_h1, rb->conv1_w, rb->conv1_b, C, C, D, H, W);
 
-    /* GN2 -> SiLU -> Conv2 */
-    t2_op_groupnorm_3d(ops, s, d_h1, d_h2, rb->gn2_w, rb->gn2_b, C, spatial, G);
+    /* ChannelLN2 -> SiLU -> Conv2 */
+    t2_op_channel_layernorm_3d(ops, s, d_h1, d_h2, rb->gn2_w, rb->gn2_b, C, spatial);
     t2_op_silu_inplace(ops, s, d_h1, C * spatial);
     t2_op_conv3d(ops, s, d_out, d_h1, rb->conv2_w, rb->conv2_b, C, C, D, H, W);
 
@@ -757,9 +757,13 @@ static void run_decoder(cuda_trellis2_runner *r,
     t2_op_conv3d(ops, s, d_buf_a, d_latent, r->dec_conv_in_w, r->dec_conv_in_b,
                  8, 512, 16, 16, 16);
 
+    if (r->verbose >= 2) dbg4("dec_conv_in", d_buf_a, s);
+
     /* middle + res16 blocks (512 ch, 16^3) */
     run_resblock(r, d_buf_b, d_buf_a, &r->dec_middle[0], 512, 16, 16, 16, G);
+    if (r->verbose >= 2) dbg4("dec_mid0", d_buf_b, s);
     run_resblock(r, d_buf_a, d_buf_b, &r->dec_middle[1], 512, 16, 16, 16, G);
+    if (r->verbose >= 2) dbg4("dec_mid1", d_buf_a, s);
     run_resblock(r, d_buf_b, d_buf_a, &r->dec_res16[0], 512, 16, 16, 16, G);
     run_resblock(r, d_buf_a, d_buf_b, &r->dec_res16[1], 512, 16, 16, 16, G);
 
@@ -787,8 +791,9 @@ static void run_decoder(cuda_trellis2_runner *r,
     run_resblock(r, d_buf_a, d_buf_b, &r->dec_res64[1], 32, 64, 64, 64, G);
 
     /* Output: GN -> SiLU -> Conv3d(32->1) */
-    t2_op_groupnorm_3d(ops, s, d_buf_b, d_buf_a,
-                       r->dec_out_gn_w, r->dec_out_gn_b, 32, 64*64*64, G);
+    /* Output: ChannelLayerNorm -> SiLU -> Conv3d(32->1) */
+    t2_op_channel_layernorm_3d(ops, s, d_buf_b, d_buf_a,
+                                r->dec_out_gn_w, r->dec_out_gn_b, 32, 64*64*64);
     t2_op_silu_inplace(ops, s, d_buf_b, 32 * 64 * 64 * 64);
     t2_op_conv3d(ops, s, d_output, d_buf_b, r->dec_out_conv_w, r->dec_out_conv_b,
                  32, 1, 64, 64, 64);

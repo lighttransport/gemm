@@ -45,6 +45,7 @@ typedef struct {
     CUfunction split_qkv_chunk;
     CUfunction split_kv_chunk;
     CUfunction timestep_embed_cossin;
+    CUfunction channel_layernorm_3d;
 
     int sm_version;
     int use_f32_gemm;
@@ -95,6 +96,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("split_qkv_chunk_f32",    split_qkv_chunk);
     GET_FN("split_kv_chunk_f32",     split_kv_chunk);
     GET_FN("timestep_embed_cossin_f32", timestep_embed_cossin);
+    GET_FN("channel_layernorm_3d_f32", channel_layernorm_3d);
 
     #undef GET_FN
     return 0;
@@ -288,6 +290,15 @@ static inline void t2_op_silu_inplace(t2_ops *ops, CUstream s,
                                         CUdeviceptr x, int n) {
     void *args[] = {&x, &n};
     cuLaunchKernel(ops->silu_inplace, (unsigned)((n+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+static inline void t2_op_channel_layernorm_3d(t2_ops *ops, CUstream s,
+                                                CUdeviceptr dst, CUdeviceptr src,
+                                                CUdeviceptr w, CUdeviceptr b,
+                                                int C, int spatial) {
+    void *args[] = {&dst, &src, &w, &b, &C, &spatial};
+    cuLaunchKernel(ops->channel_layernorm_3d, (unsigned)((spatial+255)/256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
 }
 

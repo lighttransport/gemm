@@ -294,6 +294,28 @@ static const char cuda_trellis2_kernel_source[] =
 "    out[half + i] = sinf(emb);\n"
 "}\n\n"
 
+/* ---- Channel LayerNorm 3D: normalize across C at each spatial position ---- */
+/* Input: [C, D, H, W] (NCDHW batch=1). Normalize over C with learnable w, b [C]. */
+/* Grid: spatial (D*H*W), Block: 256 */
+"__global__ void channel_layernorm_3d_f32(\n"
+"    float *dst, const float *src, const float *w, const float *b,\n"
+"    int C, int spatial) {\n"
+"    int s = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (s >= spatial) return;\n"
+"    float sum = 0, sum2 = 0;\n"
+"    for (int c = 0; c < C; c++) {\n"
+"        float v = src[(size_t)c * spatial + s];\n"
+"        sum += v; sum2 += v * v;\n"
+"    }\n"
+"    float mean = sum / C;\n"
+"    float var = sum2 / C - mean * mean;\n"
+"    float inv = rsqrtf(var + 1e-5f);\n"
+"    for (int c = 0; c < C; c++) {\n"
+"        float v = (src[(size_t)c * spatial + s] - mean) * inv;\n"
+"        dst[(size_t)c * spatial + s] = v * (w ? w[c] : 1.0f) + (b ? b[c] : 0.0f);\n"
+"    }\n"
+"}\n\n"
+
 "} /* close extern C from cuda_kernels_common */\n"
 ; /* end of kernel source string */
 
