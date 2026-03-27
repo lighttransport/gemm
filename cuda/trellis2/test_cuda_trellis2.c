@@ -190,20 +190,33 @@ int main(int argc, char **argv) {
             for (int i = 0; i < N * C; i++)
                 pred_v[i] = cfg_scale * v_cond[i] + (1.0f - cfg_scale) * v_uncond[i];
 
-            /* CFG rescale (std-ratio matching): x0_pos from v_cond, x0_cfg from pred_v */
+            /* CFG rescale: match official _pred_to_xstart / std / _xstart_to_pred */
             if (cfg_rescale_val > 0.0f) {
-                float tc = sigma_min + (1.0f - sigma_min) * t_cur;
-                float s2_pos = 0, s2_cfg = 0;
+                float sm = sigma_min;
+                float tc = sm + (1.0f - sm) * t_cur;  /* t_cur is already rescaled */
+                float one_m_sm = 1.0f - sm;
+                /* x0_pos = (1-sm)*x - tc * v_cond */
+                /* x0_cfg = (1-sm)*x - tc * pred_v */
+                /* Compute std (torch.std: mean-subtracted, Bessel corrected) */
+                double sum_pos = 0, sum_cfg = 0;
+                double sum2_pos = 0, sum2_cfg = 0;
                 for (int i = 0; i < N * C; i++) {
-                    float x0p = (1.0f - sigma_min) * x[i] - tc * v_cond[i];  /* from conditioned */
-                    float x0c = (1.0f - sigma_min) * x[i] - tc * pred_v[i];  /* from CFG combined */
-                    s2_pos += x0p * x0p; s2_cfg += x0c * x0c;
+                    float x0p = one_m_sm * x[i] - tc * v_cond[i];
+                    float x0c = one_m_sm * x[i] - tc * pred_v[i];
+                    sum_pos += x0p; sum2_pos += (double)x0p * x0p;
+                    sum_cfg += x0c; sum2_cfg += (double)x0c * x0c;
                 }
-                float ratio = sqrtf(s2_pos / (s2_cfg + 1e-12f));
+                double n = (double)(N * C);
+                double std_pos = sqrt((sum2_pos - sum_pos*sum_pos/n) / (n - 1.0));
+                double std_cfg = sqrt((sum2_cfg - sum_cfg*sum_cfg/n) / (n - 1.0));
+                float ratio = (std_cfg > 1e-8) ? (float)(std_pos / std_cfg) : 1.0f;
                 float sc = cfg_rescale_val * ratio + (1.0f - cfg_rescale_val);
+                /* x0_rescaled = x0_cfg * (std_pos/std_cfg) */
+                /* x0_final = cfg_rescale * x0_rescaled + (1-cfg_rescale) * x0_cfg = sc * x0_cfg */
+                /* pred_final = ((1-sm)*x - x0_final) / tc */
                 for (int i = 0; i < N * C; i++) {
-                    float x0c = (1.0f - sigma_min) * x[i] - tc * pred_v[i];
-                    pred_v[i] = ((1.0f - sigma_min) * x[i] - sc * x0c) / tc;
+                    float x0c = one_m_sm * x[i] - tc * pred_v[i];
+                    pred_v[i] = (one_m_sm * x[i] - sc * x0c) / tc;
                 }
             }
 
@@ -213,6 +226,8 @@ int main(int argc, char **argv) {
         } else {
             /* No CFG — conditioned only */
             cuda_trellis2_run_dit(r, x, t_cur, features, v_cond);
+            /* Debug: check for NaN/explosion */
+            { float mx = 0; for (int i = 0; i < N*C; i++) { float a = v_cond[i]; if (a!=a || (a>1e10f || a<-1e10f)) { fprintf(stderr, "  WARNING: v_cond[%d]=%.4g\n", i, a); break; } if (a>mx || a<-mx) mx = (a>0?a:-a); } fprintf(stderr, "  v_cond max_abs=%.4f x[:4]=%.4f %.4f %.4f %.4f\n", mx, x[0],x[1],x[2],x[3]); }
             for (int i = 0; i < N * C; i++)
                 x[i] -= (t_cur - t_next) * v_cond[i];
         }
