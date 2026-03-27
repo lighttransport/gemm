@@ -281,6 +281,26 @@ static const char *qimg_kernel_src =
 "    if (i < n) x[i] = x[i] / (1.0f + expf(-x[i]));\n"
 "}\n"
 
+/* RMSNorm with weight: x[N, dim] *= rsqrt(mean(x^2)) * w[dim]
+ * Grid: (N), Block: (256) */
+"__global__ void rmsnorm_weighted_f32(float *__restrict__ x,\n"
+"    const float *__restrict__ w, int N, int dim) {\n"
+"    int tok = blockIdx.x;\n"
+"    if (tok >= N) return;\n"
+"    extern __shared__ float sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    float s = 0;\n"
+"    for (int i = tid; i < dim; i += blockDim.x) {\n"
+"        float v = x[tok * dim + i];\n"
+"        s += v * v;\n"
+"    }\n"
+"    sdata[tid] = s; __syncthreads();\n"
+"    for (int r = blockDim.x/2; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid+r]; __syncthreads(); }\n"
+"    float inv = rsqrtf(sdata[0] / (float)dim + 1e-6f);\n"
+"    for (int i = tid; i < dim; i += blockDim.x)\n"
+"        x[tok * dim + i] *= inv * w[i];\n"
+"}\n"
+
 /* 2D RoPE for image tokens: apply height+width rotary embeddings
  * q,k: [n_tok, n_heads*head_dim], axes: t_dim, h_dim, w_dim
  * Grid: (n_tok), Block: (n_heads) */
@@ -440,6 +460,7 @@ struct cuda_qimg_runner {
     CUfunction vae_groupnorm;
     CUfunction vae_silu;
     CUfunction nn_upsample2x;
+    CUfunction rmsnorm_weighted;
 
     /* DiT config */
     int dit_dim, dit_n_heads, dit_head_dim, dit_n_blocks;
@@ -810,6 +831,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(vae_groupnorm, "vae_groupnorm_f32");
     GET(vae_silu, "vae_silu_f32");
     GET(nn_upsample2x, "nn_upsample2x_f32");
+    GET(rmsnorm_weighted, "rmsnorm_weighted_f32");
     GET(dequant_fp8_to_f16, "dequant_fp8_to_f16");
     #undef GET
 
@@ -1013,10 +1035,13 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemFree(d_t_emb); d_t_emb = d_t_emb2;
     cuMemFree(d_t_sin);
 
-    /* 2. Text input: RMSNorm → GEMM (TODO: RMSNorm on GPU, for now use layernorm) */
-    /* Simplification: upload pre-normed text from CPU for now */
-    /* Actually, let's do the RMSNorm + projection on GPU */
-    /* For now: just project (skip txt_norm — text encoder already applied RMSNorm) */
+    /* 2. Text input: RMSNorm(txt_norm_w) → Linear(txt_in) */
+    {
+        /* Apply RMSNorm with weight to text encoder output */
+        void *rn_args[] = {&d_txt_in, &r->d_txt_norm_w, &n_txt, &txt_dim};
+        cuLaunchKernel(r->rmsnorm_weighted, (unsigned)n_txt, 1, 1,
+                       256, 1, 1, 256 * sizeof(float), s, rn_args, NULL);
+    }
     op_gemm(r, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
     cuMemFree(d_txt_in);
 
