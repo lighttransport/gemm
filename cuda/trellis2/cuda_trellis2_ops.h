@@ -44,6 +44,7 @@ typedef struct {
     CUfunction layernorm_noaffine;
     CUfunction split_qkv_chunk;
     CUfunction split_kv_chunk;
+    CUfunction timestep_embed_cossin;
 
     int sm_version;
     int use_f32_gemm;
@@ -93,6 +94,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("layernorm_noaffine_f32",  layernorm_noaffine);
     GET_FN("split_qkv_chunk_f32",    split_qkv_chunk);
     GET_FN("split_kv_chunk_f32",     split_kv_chunk);
+    GET_FN("timestep_embed_cossin_f32", timestep_embed_cossin);
 
     #undef GET_FN
     return 0;
