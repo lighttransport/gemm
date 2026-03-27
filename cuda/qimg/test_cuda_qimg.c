@@ -363,12 +363,13 @@ int main(int argc, char **argv) {
             free(vel_latent);
 
             /* Track latent stats */
-            { float lmn=latent[0],lmx=latent[0],ls=0;
+            { float lmn=latent[0],lmx=latent[0],ls=0,ls2=0;
               int ln=lat_ch*lat_h*lat_w;
-              for(int i=0;i<ln;i++){if(latent[i]<lmn)lmn=latent[i];if(latent[i]>lmx)lmx=latent[i];ls+=latent[i];}
+              for(int i=0;i<ln;i++){if(latent[i]<lmn)lmn=latent[i];if(latent[i]>lmx)lmx=latent[i];ls+=latent[i];ls2+=latent[i]*latent[i];}
+              float mean=ls/ln, std=sqrtf(ls2/ln - mean*mean);
               double step_s = (double)(clock() - step_t0) / CLOCKS_PER_SEC;
-              fprintf(stderr, "  step %d/%d  t=%.3f  lat=[%.2f,%.2f] mean=%.3f  %.2fs\n",
-                      step+1, n_steps, t_val, lmn, lmx, ls/ln, step_s); }
+              fprintf(stderr, "  step %d/%d  t=%.3f  lat=[%.2f,%.2f] mean=%.3f std=%.3f  %.2fs\n",
+                      step+1, n_steps, t_val, lmn, lmx, mean, std, step_s); }
         }
         double denoise_s = (double)(clock() - denoise_t0) / CLOCKS_PER_SEC;
         fprintf(stderr, "Denoising: %.1fs total (%.2fs/step)\n", denoise_s, denoise_s / n_steps);
