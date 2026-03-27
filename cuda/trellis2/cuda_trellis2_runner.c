@@ -75,7 +75,7 @@ typedef struct {
 
 typedef struct {
     /* Self-attention */
-    CUdeviceptr sa_qkv_w;       /* [3*DIT_DIM, DIT_DIM] fused */
+    CUdeviceptr sa_qkv_w, sa_qkv_b;    /* [3*DIT_DIM, DIT_DIM], [3*DIT_DIM] */
     CUdeviceptr sa_q_norm, sa_k_norm;   /* [DIT_HEADS * DIT_HEAD_DIM] */
     CUdeviceptr sa_out_w, sa_out_b;
     /* Cross-attention */
@@ -336,6 +336,7 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
                               t2_upload_f32(st, name, v >= 2 ? v : 0))
 
         blk->sa_qkv_w    = BLK("self_attn.to_qkv.weight");
+        blk->sa_qkv_b    = BLK("self_attn.to_qkv.bias");
         blk->sa_q_norm   = BLK("self_attn.q_rms_norm.gamma");
         blk->sa_k_norm   = BLK("self_attn.k_rms_norm.gamma");
         blk->sa_out_w    = BLK("self_attn.to_out.weight");
@@ -520,7 +521,8 @@ static void run_dit_forward(cuda_trellis2_runner *r,
                D, DIT_IN_CH, N);
 
     /* 2. Timestep embedding: sinusoidal(256) -> MLP(256->D->D) */
-    t2_op_timestep_embed(ops, stream, d_temb, timestep, 256);
+    /* Official TRELLIS.2 scales timestep by 1000 */
+    t2_op_timestep_embed(ops, stream, d_temb, timestep * 1000.0f, 256);
     /* t_fc1: [D, 256] */
     t2_op_gemm(ops, stream, d_normed, r->dit_t_fc1_w, d_temb, r->dit_t_fc1_b,
                D, 256, 1);
@@ -531,6 +533,7 @@ static void run_dit_forward(cuda_trellis2_runner *r,
                D, D, 1);
     /* Now d_temb = [D] timestep embedding */
 
+    /* Debug: dump intermediates */
     /* 3. Transformer blocks */
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
         dit_block_gpu *blk = &r->dit_blocks[bi];
@@ -554,14 +557,14 @@ static void run_dit_forward(cuda_trellis2_runner *r,
                     d_shift_sa, d_scale_sa, N, D);
 
         /* QKV projection: [N, D] -> [N, 3*D] */
-        t2_op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, 0,
+        t2_op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, blk->sa_qkv_b,
                    3 * D, D, N);
 
-        /* Split QKV -> Q, K, V */
+        /* Split QKV -> Q, K, V (standard chunk, NOT interleaved) */
         CUdeviceptr d_Q = d_attn;
         CUdeviceptr d_K = d_normed;
         CUdeviceptr d_V = d_split_V;
-        t2_op_split_qkv(ops, stream, d_Q, d_K, d_V, d_qkv, N, H, HD);
+        t2_op_split_qkv_chunk(ops, stream, d_Q, d_K, d_V, d_qkv, N, D);
 
         /* QK RMSNorm (per-head, gamma [n_heads * head_dim]) */
         if (blk->sa_q_norm)
@@ -598,8 +601,8 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         /* KV GEMM: [ctx, cond_dim] -> [ctx, 2*D] */
         t2_op_gemm(ops, stream, d_qkv, blk->ca_kv_w, d_cond, blk->ca_kv_b,
                    2 * D, DIT_COND_DIM, ctx_len);
-        /* Split KV */
-        t2_op_split_kv(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, H, HD);
+        /* Split KV (standard chunk, NOT interleaved) */
+        t2_op_split_kv_chunk(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, D);
         if (blk->ca_k_norm)
             t2_op_rms_norm_perhead(ops, stream, d_ca_K, blk->ca_k_norm,
                                   ctx_len, H, HD, D);
@@ -622,9 +625,16 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         t2_op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b,
                    D, FFN, N);
         t2_op_gated_add(ops, stream, d_hidden, d_normed, d_gate_mlp, N * D, D);
+
     }
 
-    /* 4. Output projection: [N, D] -> [N, DIT_IN_CH] */
+    /* 4. Final LayerNorm (no affine) + output projection */
+    {
+        float eps = 1e-6f;
+        void *ln_args[] = {&d_hidden, &d_hidden, &D, &eps};
+        cuLaunchKernel(ops->layernorm_noaffine, (unsigned)N, 1, 1,
+                       256, 1, 1, 512 * sizeof(float), stream, ln_args, NULL);
+    }
     t2_op_gemm(ops, stream, d_output, r->dit_out_w, d_hidden, r->dit_out_b,
                DIT_IN_CH, D, N);
 }
@@ -755,18 +765,32 @@ int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
                            const float *x_t, float timestep,
                            const float *cond_features, float *output) {
     CUstream s = r->stream;
-    int N = DIT_N_TOKENS, D = DIT_DIM, in_ch = DIT_IN_CH;
+    int N = DIT_N_TOKENS, in_ch = DIT_IN_CH;
     int ctx_len = DINO_SEQ_LEN;
 
-    CUdeviceptr d_x = cu_upload_raw(x_t, (size_t)N * in_ch * sizeof(float));
+    /* Transpose input from NCDHW [C, spatial] to [spatial, C] on CPU.
+     * Official code: x.view(B, C, -1).permute(0, 2, 1) -> [B, N, C] */
+    float *x_transposed = (float *)malloc((size_t)N * in_ch * sizeof(float));
+    for (int pos = 0; pos < N; pos++)
+        for (int ch = 0; ch < in_ch; ch++)
+            x_transposed[pos * in_ch + ch] = x_t[ch * N + pos];
+
+    CUdeviceptr d_x = cu_upload_raw(x_transposed, (size_t)N * in_ch * sizeof(float));
+    free(x_transposed);
     CUdeviceptr d_cond = cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
     CUdeviceptr d_out;
     cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
 
     run_dit_forward(r, d_x, timestep, d_cond, d_out);
 
+    /* Transpose output from [spatial, C] back to [C, spatial] NCDHW */
+    float *out_flat = (float *)malloc((size_t)N * in_ch * sizeof(float));
     cuStreamSynchronize(s);
-    cuMemcpyDtoH(output, d_out, (size_t)N * in_ch * sizeof(float));
+    cuMemcpyDtoH(out_flat, d_out, (size_t)N * in_ch * sizeof(float));
+    for (int pos = 0; pos < N; pos++)
+        for (int ch = 0; ch < in_ch; ch++)
+            output[ch * N + pos] = out_flat[pos * in_ch + ch];
+    free(out_flat);
 
     cuMemFree(d_x); cuMemFree(d_cond); cuMemFree(d_out);
     return 0;

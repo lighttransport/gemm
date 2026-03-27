@@ -107,6 +107,7 @@ int main(int argc, char **argv) {
     const char *npy_path = NULL;
     int mc_grid = 64;
     float mc_threshold = 0.0f;
+    const char *noise_path = NULL;
 
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
@@ -116,6 +117,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--npy") && i+1 < argc) npy_path = argv[++i];
         else if (!strcmp(argv[i], "--grid") && i+1 < argc) mc_grid = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) mc_threshold = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--noise") && i+1 < argc) noise_path = argv[++i];
     }
 
     /* Load features */
@@ -136,13 +138,21 @@ int main(int argc, char **argv) {
         cuda_trellis2_free(r); free(features); return 1;
     }
 
-    /* Generate initial noise */
+    /* Generate or load initial noise */
     int N = 4096, C = 8;
-    float *x = (float *)malloc((size_t)N * C * sizeof(float));
-    rng_state rng = {{seed, seed ^ 0x9E3779B97F4A7C15ULL,
-                       seed ^ 0x6C62272E07BB0142ULL, seed ^ 0xBF58476D1CE4E5B9ULL}};
-    for (int i = 0; i < 8; i++) rng_next(&rng);
-    for (int i = 0; i < N * C; i++) x[i] = rng_randn(&rng);
+    float *x;
+    if (noise_path) {
+        int nd2, dd2[8];
+        x = read_npy_f32(noise_path, &nd2, dd2);
+        if (!x) { cuda_trellis2_free(r); return 1; }
+        fprintf(stderr, "Loaded noise from %s\n", noise_path);
+    } else {
+        x = (float *)malloc((size_t)N * C * sizeof(float));
+        rng_state rng = {{seed, seed ^ 0x9E3779B97F4A7C15ULL,
+                           seed ^ 0x6C62272E07BB0142ULL, seed ^ 0xBF58476D1CE4E5B9ULL}};
+        for (int i = 0; i < 8; i++) rng_next(&rng);
+        for (int i = 0; i < N * C; i++) x[i] = rng_randn(&rng);
+    }
 
     /* Upload conditioning features */
     fprintf(stderr, "\n=== Stage 1: Flow Sampling (%d steps, cfg=%.1f) ===\n",
@@ -165,19 +175,51 @@ int main(int argc, char **argv) {
         struct timespec step_ts; clock_gettime(CLOCK_MONOTONIC, &step_ts);
         double step_t0 = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
 
-        cuda_trellis2_run_dit(r, x, t_cur, features, v_cond);
-        cuda_trellis2_run_dit(r, x, t_cur, zeros_cond, v_uncond);
+        /* Guidance interval: only apply CFG when t_cur in [0.6, 1.0] */
+        int apply_cfg = (t_cur >= 0.6f && t_cur <= 1.0f && cfg_scale != 1.0f);
+        float sigma_min = 1e-5f;
+        float cfg_rescale_val = 0.7f;
 
-        /* CFG combine + Euler step */
-        for (int i = 0; i < N * C; i++) {
-            float v = v_uncond[i] + cfg_scale * (v_cond[i] - v_uncond[i]);
-            x[i] += dt * v;
+        if (apply_cfg) {
+            cuda_trellis2_run_dit(r, x, t_cur, features, v_cond);
+            cuda_trellis2_run_dit(r, x, t_cur, zeros_cond, v_uncond);
+
+            /* CFG: pred_v = cfg * v_cond + (1-cfg) * v_uncond */
+            for (int i = 0; i < N * C; i++)
+                v_cond[i] = cfg_scale * v_cond[i] + (1.0f - cfg_scale) * v_uncond[i];
+
+            /* CFG rescale (std-ratio matching) */
+            if (cfg_rescale_val > 0.0f) {
+                float tc = sigma_min + (1.0f - sigma_min) * t_cur;
+                float s2_pos = 0, s2_cfg = 0;
+                for (int i = 0; i < N * C; i++) {
+                    float x0p = (1.0f - sigma_min) * x[i] - tc * v_uncond[i];
+                    float x0c = (1.0f - sigma_min) * x[i] - tc * v_cond[i];
+                    s2_pos += x0p * x0p; s2_cfg += x0c * x0c;
+                }
+                float ratio = sqrtf(s2_pos / (s2_cfg + 1e-12f));
+                float sc = cfg_rescale_val * ratio + (1.0f - cfg_rescale_val);
+                for (int i = 0; i < N * C; i++) {
+                    float x0c = (1.0f - sigma_min) * x[i] - tc * v_cond[i];
+                    v_cond[i] = ((1.0f - sigma_min) * x[i] - sc * x0c) / tc;
+                }
+            }
+
+            /* Euler step: x -= (t_cur - t_next) * pred_v */
+            for (int i = 0; i < N * C; i++)
+                x[i] -= (t_cur - t_next) * v_cond[i];
+        } else {
+            /* No CFG — conditioned only */
+            cuda_trellis2_run_dit(r, x, t_cur, features, v_cond);
+            for (int i = 0; i < N * C; i++)
+                x[i] -= (t_cur - t_next) * v_cond[i];
         }
 
         clock_gettime(CLOCK_MONOTONIC, &step_ts);
         double step_t1 = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
-        fprintf(stderr, "  step %d/%d  t=%.4f  dt=%.4f  %.1f ms\n",
-                step+1, n_steps, t_start, dt, step_t1 - step_t0);
+        fprintf(stderr, "  step %d/%d  t=%.4f->%.4f  %s  %.1f ms\n",
+                step+1, n_steps, t_cur, t_next,
+                apply_cfg ? "CFG" : "noG", step_t1 - step_t0);
     }
 
     free(zeros_cond); free(v_cond); free(v_uncond); free(features);

@@ -247,6 +247,37 @@ static const char cuda_trellis2_kernel_source[] =
 "        yi[i] = (xi[i] - mean) * inv;\n"
 "}\n\n"
 
+/* ---- split_qkv_chunk_f32: split [N, 3*W] by chunk (NOT interleaved) ---- */
+/* Input: [N, 3*W] where first W = Q, next W = K, last W = V */
+/* Output: Q[N, W], K[N, W], V[N, W] */
+"__global__ void split_qkv_chunk_f32(\n"
+"    float *Q, float *K, float *V,\n"
+"    const float *qkv, int N, int W) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = N * W;\n"
+"    if (idx >= total) return;\n"
+"    int n = idx / W;\n"
+"    int d = idx % W;\n"
+"    int base = n * 3 * W;\n"
+"    Q[idx] = qkv[base + d];\n"
+"    K[idx] = qkv[base + W + d];\n"
+"    V[idx] = qkv[base + 2*W + d];\n"
+"}\n\n"
+
+/* ---- split_kv_chunk_f32: split [M, 2*W] by chunk ---- */
+"__global__ void split_kv_chunk_f32(\n"
+"    float *K, float *V,\n"
+"    const float *kv, int M, int W) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = M * W;\n"
+"    if (idx >= total) return;\n"
+"    int n = idx / W;\n"
+"    int d = idx % W;\n"
+"    int base = n * 2 * W;\n"
+"    K[idx] = kv[base + d];\n"
+"    V[idx] = kv[base + W + d];\n"
+"}\n\n"
+
 "} /* close extern C from cuda_kernels_common */\n"
 ; /* end of kernel source string */
 
