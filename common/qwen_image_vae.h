@@ -111,6 +111,10 @@ void            qimg_vae_decode(float *rgb_out, const float *latent,
 #include <math.h>
 #include "safetensors.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 /* ---- BF16 conversion ---- */
 
 static float qimg_bf16_to_f32(uint16_t bf) {
@@ -259,7 +263,8 @@ static void qimg_vae_silu(float *x, int n) {
 }
 
 /* Conv2D: input [ci, h, w] → output [co, oh, ow], kernel [co, ci, kh, kw]
- * padding = (kh-1)/2, pad_replicate: 0=zero padding, 1=replicate padding */
+ * padding = (kh-1)/2, pad_replicate: 0=zero padding, 1=replicate padding
+ * Optimized: for 3×3 conv, gather 9 input values per channel then accumulate */
 static void qimg_vae_conv2d_pad(float *out, const float *inp, const float *weight,
                                 const float *bias, int ci, int h, int w,
                                 int co, int kh, int kw, int stride,
@@ -268,29 +273,44 @@ static void qimg_vae_conv2d_pad(float *out, const float *inp, const float *weigh
     int pad_w = (kw - 1) / 2;
     int oh = (h + 2 * pad_h - kh) / stride + 1;
     int ow = (w + 2 * pad_w - kw) / stride + 1;
+    int spatial = h * w;
+    int kernel_size = kh * kw;
 
-    for (int oc = 0; oc < co; oc++) {
-        for (int oy = 0; oy < oh; oy++) {
-            for (int ox = 0; ox < ow; ox++) {
+    /* For each output position, pre-gather input patch indices */
+    for (int oy = 0; oy < oh; oy++) {
+        for (int ox = 0; ox < ow; ox++) {
+            /* Compute clamped/skipped input positions for this output pixel */
+            int iy_arr[9], ix_arr[9];
+            int valid[9];
+            int n_k = 0;
+            for (int fy = 0; fy < kh; fy++) {
+                for (int fx = 0; fx < kw; fx++) {
+                    int iy = oy * stride + fy - pad_h;
+                    int ix = ox * stride + fx - pad_w;
+                    if (pad_replicate) {
+                        if (iy < 0) iy = 0; if (iy >= h) iy = h - 1;
+                        if (ix < 0) ix = 0; if (ix >= w) ix = w - 1;
+                        valid[n_k] = 1;
+                    } else {
+                        valid[n_k] = (iy >= 0 && iy < h && ix >= 0 && ix < w);
+                    }
+                    iy_arr[n_k] = iy;
+                    ix_arr[n_k] = ix;
+                    n_k++;
+                }
+            }
+
+            for (int oc = 0; oc < co; oc++) {
                 float sum = bias ? bias[oc] : 0.0f;
+                const float *wk = weight + (size_t)oc * ci * kernel_size;
+
+                /* Accumulate over input channels — SIMD-friendly inner loop */
                 for (int ic = 0; ic < ci; ic++) {
-                    for (int fy = 0; fy < kh; fy++) {
-                        for (int fx = 0; fx < kw; fx++) {
-                            int iy = oy * stride + fy - pad_h;
-                            int ix = ox * stride + fx - pad_w;
-                            if (pad_replicate) {
-                                if (iy < 0) iy = 0;
-                                if (iy >= h) iy = h - 1;
-                                if (ix < 0) ix = 0;
-                                if (ix >= w) ix = w - 1;
-                            } else {
-                                if (iy < 0 || iy >= h || ix < 0 || ix >= w)
-                                    continue;
-                            }
-                            float v = inp[(size_t)ic * h * w + iy * w + ix];
-                            float wt = weight[((((size_t)oc * ci + ic) * kh) + fy) * kw + fx];
-                            sum += v * wt;
-                        }
+                    const float *ch_inp = inp + (size_t)ic * spatial;
+                    const float *ch_w = wk + (size_t)ic * kernel_size;
+                    for (int k = 0; k < n_k; k++) {
+                        if (valid[k])
+                            sum += ch_inp[iy_arr[k] * w + ix_arr[k]] * ch_w[k];
                     }
                 }
                 out[(size_t)oc * oh * ow + oy * ow + ox] = sum;
