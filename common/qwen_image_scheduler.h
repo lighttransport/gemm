@@ -37,6 +37,8 @@ typedef struct {
 
 void qimg_sched_init(qimg_scheduler *s);
 void qimg_sched_set_timesteps(qimg_scheduler *s, int n_steps, int img_seq_len);
+/* ComfyUI-compatible: fixed shift, multiplier=1.0 (timestep = sigma, not sigma×1000) */
+void qimg_sched_set_timesteps_comfyui(qimg_scheduler *s, int n_steps, float shift);
 void qimg_sched_step(float *x, const float *v, int n, int step,
                      const qimg_scheduler *s);
 
@@ -89,6 +91,28 @@ void qimg_sched_set_timesteps(qimg_scheduler *s, int n_steps, int img_seq_len) {
     /* Timesteps = sigmas * num_train_timesteps */
     for (int i = 0; i < n_steps; i++) {
         s->timesteps[i] = s->sigmas[i] * (float)s->num_train_timesteps;
+        s->dt[i] = s->sigmas[i + 1] - s->sigmas[i];
+    }
+}
+
+/* ComfyUI-compatible scheduler: simple linear sigmas with fixed shift.
+ * timestep = sigma (not sigma * 1000). Matches ComfyUI's ModelSamplingAuraFlow. */
+void qimg_sched_set_timesteps_comfyui(qimg_scheduler *s, int n_steps, float shift) {
+    if (n_steps > QIMG_SCHED_MAX_STEPS) n_steps = QIMG_SCHED_MAX_STEPS;
+    s->n_steps = n_steps;
+
+    /* Simple linear sigmas from 1.0 to 0.0 */
+    for (int i = 0; i <= n_steps; i++) {
+        float sigma = 1.0f - (float)i / (float)n_steps;
+        /* Apply AuraFlow shift: sigma_shifted = exp(shift) * sigma / (1 + (exp(shift)-1)*sigma) */
+        float es = expf(shift);
+        sigma = es * sigma / (1.0f + (es - 1.0f) * sigma);
+        s->sigmas[i] = sigma;
+    }
+
+    /* Timestep = sigma (multiplier=1.0 in ComfyUI AuraFlow mode) */
+    for (int i = 0; i < n_steps; i++) {
+        s->timesteps[i] = s->sigmas[i];
         s->dt[i] = s->sigmas[i + 1] - s->sigmas[i];
     }
 }

@@ -152,20 +152,35 @@ int main(int argc, char **argv) {
         int in_ch = 64, lat_ch = 16;
         int txt_dim = 3584;
 
-        /* 1. Text encoder (CPU) */
+        /* 1. Text encoder (CPU) — encode both positive and negative prompts */
         fprintf(stderr, "\n[1/3] Text encoder (CPU)...\n");
-        int n_txt = 0;
-        float *txt_hidden = NULL;
+        int n_txt = 0, n_txt_neg = 0;
+        float *txt_hidden = NULL, *txt_neg_hidden = NULL;
         qimg_text_enc *enc = qimg_text_enc_load(enc_path);
         if (enc) {
             txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
+            fprintf(stderr, "  Encoding negative prompt...\n");
+            txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
             qimg_text_enc_free(enc);
         }
         if (!txt_hidden) {
-            fprintf(stderr, "Text encoder failed, using random conditioning\n");
-            n_txt = 7; txt_hidden = (float *)malloc((size_t)n_txt * txt_dim * sizeof(float));
-            rng_state = seed + 1;
-            for (int i = 0; i < n_txt * txt_dim; i++) txt_hidden[i] = randn() * 0.1f;
+            fprintf(stderr, "Text encoder failed\n");
+            free(txt_neg_hidden);
+            cuda_qimg_free(r); return 1;
+        }
+        /* Pad negative to same length as positive (or vice versa) */
+        if (n_txt_neg < n_txt) {
+            float *padded = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
+            memcpy(padded, txt_neg_hidden, (size_t)n_txt_neg * txt_dim * sizeof(float));
+            free(txt_neg_hidden);
+            txt_neg_hidden = padded;
+            n_txt_neg = n_txt;
+        } else if (n_txt < n_txt_neg) {
+            float *padded = (float *)calloc((size_t)n_txt_neg * txt_dim, sizeof(float));
+            memcpy(padded, txt_hidden, (size_t)n_txt * txt_dim * sizeof(float));
+            free(txt_hidden);
+            txt_hidden = padded;
+            n_txt = n_txt_neg;
         }
 
         /* 2. DiT denoising loop (CUDA) */
@@ -181,11 +196,15 @@ int main(int argc, char **argv) {
         /* Scheduler */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
-        qimg_sched_set_timesteps(&sched, n_steps, n_img);
+        /* Use ComfyUI-compatible scheduler: shift=3.1, timestep=sigma */
+        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f);
 
-        /* Patchify + denoising loop */
+        float cfg_scale = 2.5f;  /* ComfyUI default for Qwen-Image */
+
+        /* Patchify + denoising loop with CFG */
         float *img_tokens = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
-        float *velocity = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
+        float *vel_cond = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
+        float *vel_uncond = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
 
         clock_t denoise_t0 = clock();
         for (int step = 0; step < n_steps; step++) {
@@ -195,25 +214,38 @@ int main(int argc, char **argv) {
             /* Patchify latent */
             qimg_dit_patchify(img_tokens, latent, lat_ch, lat_h, lat_w, ps);
 
-            /* DiT forward on GPU */
+            /* Conditional DiT forward (with text) */
             cuda_qimg_dit_step(r, img_tokens, n_img, txt_hidden, n_txt,
-                               t_val, velocity);
+                               t_val, vel_cond);
 
-            /* Unpatchify velocity */
-            float *vel_latent = (float *)malloc((size_t)lat_ch * lat_h * lat_w * sizeof(float));
-            qimg_dit_unpatchify(vel_latent, velocity, n_img, lat_ch, lat_h, lat_w, ps);
+            /* Unconditional DiT forward (negative prompt encoding) */
+            cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt,
+                               t_val, vel_uncond);
+
+            /* CFG combine: velocity = uncond + cfg_scale * (cond - uncond) */
+            int lat_n = lat_ch * lat_h * lat_w;
+            float *vel_latent = (float *)malloc((size_t)lat_n * sizeof(float));
+            /* Unpatchify both */
+            float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
+            float *vu_lat = (float *)malloc((size_t)lat_n * sizeof(float));
+            qimg_dit_unpatchify(vc_lat, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
+            qimg_dit_unpatchify(vu_lat, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
+            for (int i = 0; i < lat_n; i++)
+                vel_latent[i] = vu_lat[i] + cfg_scale * (vc_lat[i] - vu_lat[i]);
+            free(vc_lat); free(vu_lat);
 
             /* Euler step */
-            qimg_sched_step(latent, vel_latent, lat_ch * lat_h * lat_w, step, &sched);
+            qimg_sched_step(latent, vel_latent, lat_n, step, &sched);
             free(vel_latent);
 
             double step_s = (double)(clock() - step_t0) / CLOCKS_PER_SEC;
-            fprintf(stderr, "  step %d/%d  t=%.1f  %.2fs\n", step+1, n_steps, t_val, step_s);
+            fprintf(stderr, "  step %d/%d  t=%.3f  %.2fs\n", step+1, n_steps, t_val, step_s);
         }
         double denoise_s = (double)(clock() - denoise_t0) / CLOCKS_PER_SEC;
         fprintf(stderr, "Denoising: %.1fs total (%.2fs/step)\n", denoise_s, denoise_s / n_steps);
 
-        free(img_tokens); free(velocity); free(txt_hidden);
+        free(img_tokens); free(vel_cond); free(vel_uncond);
+        free(txt_hidden); free(txt_neg_hidden);
 
         /* 3. VAE decode (CUDA) */
         fprintf(stderr, "\n[3/3] VAE decode (CUDA)...\n");
