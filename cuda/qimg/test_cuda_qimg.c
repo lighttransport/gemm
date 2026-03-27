@@ -293,7 +293,8 @@ int main(int argc, char **argv) {
         qimg_scheduler sched;
         qimg_sched_init(&sched);
         /* Use ComfyUI-compatible scheduler: shift=3.1, timestep=sigma */
-        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f);
+        /* Use original dynamic scheduler (better stability than AuraFlow shift=3.1) */
+        qimg_sched_set_timesteps(&sched, n_steps, n_img);
 
         float cfg_scale = 2.5f;  /* ComfyUI default for Qwen-Image */
 
