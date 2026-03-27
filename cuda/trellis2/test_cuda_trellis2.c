@@ -184,30 +184,32 @@ int main(int argc, char **argv) {
             cuda_trellis2_run_dit(r, x, t_cur, features, v_cond);
             cuda_trellis2_run_dit(r, x, t_cur, zeros_cond, v_uncond);
 
+            /* Save original v_cond for CFG rescale (x0_pos uses cond prediction) */
             /* CFG: pred_v = cfg * v_cond + (1-cfg) * v_uncond */
+            float *pred_v = v_uncond;  /* reuse v_uncond buffer for combined */
             for (int i = 0; i < N * C; i++)
-                v_cond[i] = cfg_scale * v_cond[i] + (1.0f - cfg_scale) * v_uncond[i];
+                pred_v[i] = cfg_scale * v_cond[i] + (1.0f - cfg_scale) * v_uncond[i];
 
-            /* CFG rescale (std-ratio matching) */
+            /* CFG rescale (std-ratio matching): x0_pos from v_cond, x0_cfg from pred_v */
             if (cfg_rescale_val > 0.0f) {
                 float tc = sigma_min + (1.0f - sigma_min) * t_cur;
                 float s2_pos = 0, s2_cfg = 0;
                 for (int i = 0; i < N * C; i++) {
-                    float x0p = (1.0f - sigma_min) * x[i] - tc * v_uncond[i];
-                    float x0c = (1.0f - sigma_min) * x[i] - tc * v_cond[i];
+                    float x0p = (1.0f - sigma_min) * x[i] - tc * v_cond[i];  /* from conditioned */
+                    float x0c = (1.0f - sigma_min) * x[i] - tc * pred_v[i];  /* from CFG combined */
                     s2_pos += x0p * x0p; s2_cfg += x0c * x0c;
                 }
                 float ratio = sqrtf(s2_pos / (s2_cfg + 1e-12f));
                 float sc = cfg_rescale_val * ratio + (1.0f - cfg_rescale_val);
                 for (int i = 0; i < N * C; i++) {
-                    float x0c = (1.0f - sigma_min) * x[i] - tc * v_cond[i];
-                    v_cond[i] = ((1.0f - sigma_min) * x[i] - sc * x0c) / tc;
+                    float x0c = (1.0f - sigma_min) * x[i] - tc * pred_v[i];
+                    pred_v[i] = ((1.0f - sigma_min) * x[i] - sc * x0c) / tc;
                 }
             }
 
             /* Euler step: x -= (t_cur - t_next) * pred_v */
             for (int i = 0; i < N * C; i++)
-                x[i] -= (t_cur - t_next) * v_cond[i];
+                x[i] -= (t_cur - t_next) * pred_v[i];
         } else {
             /* No CFG — conditioned only */
             cuda_trellis2_run_dit(r, x, t_cur, features, v_cond);
