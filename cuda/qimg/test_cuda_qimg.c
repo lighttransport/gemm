@@ -215,15 +215,13 @@ int main(int argc, char **argv) {
 
         free(img_tokens); free(velocity); free(txt_hidden);
 
-        /* 3. VAE decode (CPU) */
-        fprintf(stderr, "\n[3/3] VAE decode (CPU)...\n");
-        qimg_vae_model *vae = qimg_vae_load(vae_path);
-        if (!vae) { free(latent); cuda_qimg_free(r); return 1; }
+        /* 3. VAE decode (CUDA) */
+        fprintf(stderr, "\n[3/3] VAE decode (CUDA)...\n");
+        cuda_qimg_load_vae(r, vae_path);
         float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
         t0 = clock();
-        qimg_vae_decode(rgb, latent, lat_h, lat_w, vae);
+        cuda_qimg_vae_decode(r, latent, lat_h, lat_w, rgb);
         fprintf(stderr, "VAE decode: %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
-        qimg_vae_free(vae);
         free(latent);
 
         /* Save */
