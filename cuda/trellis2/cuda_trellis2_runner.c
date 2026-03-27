@@ -148,6 +148,13 @@ static void ensure_scratch(cuda_trellis2_runner *r, int idx, size_t bytes) {
     r->scratch_size[idx] = bytes;
 }
 
+static void dbg4(const char *label, CUdeviceptr ptr, CUstream stream) {
+    cuStreamSynchronize(stream);
+    float d[4];
+    cuMemcpyDtoH(d, ptr, 16);
+    fprintf(stderr, "  %s: [:4]=%.6f %.6f %.6f %.6f\n", label, d[0], d[1], d[2], d[3]);
+}
+
 static double t2_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -521,8 +528,16 @@ static void run_dit_forward(cuda_trellis2_runner *r,
                D, DIT_IN_CH, N);
 
     /* 2. Timestep embedding: sinusoidal(256) -> MLP(256->D->D) */
-    /* Official TRELLIS.2 scales timestep by 1000 */
-    t2_op_timestep_embed(ops, stream, d_temb, timestep * 1000.0f, 256);
+    /* TRELLIS.2: t*1000, [cos, sin] order (NOT [sin, cos] like HY3D) */
+    {
+        float t_scaled = timestep * 1000.0f;
+        int half = 128;
+        void *te_args[] = {&d_temb, &t_scaled, &half};  /* dim/2 = 128 for the kernel */
+        int te_dim = 256;
+        void *te_args2[] = {&d_temb, &t_scaled, &te_dim};
+        cuLaunchKernel(ops->timestep_embed_cossin, (unsigned)((128+255)/256), 1, 1,
+                       256, 1, 1, 0, stream, te_args2, NULL);
+    }
     /* t_fc1: [D, 256] */
     t2_op_gemm(ops, stream, d_normed, r->dit_t_fc1_w, d_temb, r->dit_t_fc1_b,
                D, 256, 1);
@@ -555,15 +570,23 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         t2_op_adaln(ops, stream, d_normed, d_hidden,
                     d_shift_sa, d_scale_sa, N, D);
 
+        if (bi == 0 && r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_normed, 16); fprintf(stderr, "  adaln_out: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
+
         /* QKV projection: [N, D] -> [N, 3*D] */
         t2_op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, blk->sa_qkv_b,
                    3 * D, D, N);
 
-        /* Split QKV -> Q, K, V (standard chunk, NOT interleaved) */
-        CUdeviceptr d_Q = d_attn;
+        /* Split QKV -> Q, K, V (standard chunk, NOT interleaved)
+         * IMPORTANT: Q must NOT alias d_attn since the attention kernel reads Q
+         * and writes to d_attn simultaneously. Use d_cross_Q as temp for Q. */
+        CUdeviceptr d_Q = d_cross_Q;  /* use cross_Q buffer as temp for self-attn Q */
         CUdeviceptr d_K = d_normed;
         CUdeviceptr d_V = d_split_V;
         t2_op_split_qkv_chunk(ops, stream, d_Q, d_K, d_V, d_qkv, N, D);
+
+        if (bi==0 && r->verbose>=2) dbg4("Q_raw", d_Q, stream);
+        if (bi==0 && r->verbose>=2) dbg4("K_raw", d_K, stream);
+        if (bi==0 && r->verbose>=2) dbg4("V_raw", d_V, stream);
 
         /* QK RMSNorm (per-head, gamma [n_heads * head_dim]) */
         if (blk->sa_q_norm)
@@ -571,19 +594,52 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         if (blk->sa_k_norm)
             t2_op_rms_norm_perhead(ops, stream, d_K, blk->sa_k_norm, N, H, HD, D);
 
+        if (bi==0 && r->verbose>=2) dbg4("Q_rmsnorm", d_Q, stream);
+        if (bi==0 && r->verbose>=2) dbg4("K_rmsnorm", d_K, stream);
+
         /* 3D RoPE on Q and K */
         t2_op_rope_3d(ops, stream, d_Q, r->dit_rope_cos, r->dit_rope_sin,
                       N, D, H, HD, r->dit_n_freqs, r->dit_axis_dim);
         t2_op_rope_3d(ops, stream, d_K, r->dit_rope_cos, r->dit_rope_sin,
                       N, D, H, HD, r->dit_n_freqs, r->dit_axis_dim);
 
-        /* Self-attention */
+        if (bi==0 && r->verbose>=2) dbg4("Q_rope", d_Q, stream);
+        if (bi==0 && r->verbose>=2) dbg4("K_rope", d_K, stream);
+
+        /* Debug: save Q, K, V for token 0 to check attention */
+        if (bi == 0 && r->verbose >= 2) {
+            cuStreamSynchronize(stream);
+            /* Save first head's Q for token 0 (128 floats) */
+            float q0[128], k0[128], v0[128];
+            cuMemcpyDtoH(q0, d_Q, 128 * sizeof(float));
+            cuMemcpyDtoH(k0, d_K, 128 * sizeof(float));
+            cuMemcpyDtoH(v0, d_V, 128 * sizeof(float));
+            /* Compute Q[0] @ K[0]^T manually for head 0 */
+            float dot = 0;
+            for (int d = 0; d < 128; d++) dot += q0[d] * k0[d];
+            dot /= sqrtf(128.0f);
+            fprintf(stderr, "  MANUAL Q[0]@K[0]/sqrt(hd) = %.6f (should produce softmax weight for k=0)\n", dot);
+            /* Also check how many Q/K elements are nonzero */
+            int nz_q = 0, nz_k = 0;
+            for (int d = 0; d < 128; d++) { if (q0[d] != 0.0f) nz_q++; if (k0[d] != 0.0f) nz_k++; }
+            fprintf(stderr, "  Q[0] nonzero: %d/128, K[0] nonzero: %d/128\n", nz_q, nz_k);
+        }
+
+        /* Self-attention — output goes to d_attn (d_Q is separate buffer) */
         t2_op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N, D, H, HD);
+
+        if (bi==0 && r->verbose>=2) dbg4("attn_out", d_attn, stream);
 
         /* Output projection + gated residual */
         t2_op_gemm(ops, stream, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b,
                    D, D, N);
+
+        if (bi==0 && r->verbose>=2) dbg4("sa_proj", d_normed, stream);
+
         t2_op_gated_add(ops, stream, d_hidden, d_normed, d_gate_sa, N * D, D);
+
+        if (bi==0 && r->verbose>=2) dbg4("h_after_sa", d_hidden, stream);
+
 
         /* === Cross-attention === */
         /* LayerNorm (affine) */
