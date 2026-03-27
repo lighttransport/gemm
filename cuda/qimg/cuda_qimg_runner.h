@@ -447,54 +447,62 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 
-/* Self-attention: Q[N,dim], K[N,dim], V[N,dim] → out[N,dim]
- * One block per (head, query). Uses 32 threads (1 warp) for correct
- * warp-shuffle reduction. Each thread handles head_dim/32 = 4 dims.
- * Grid: (n_heads, N), Block: (32) */
-"__global__ void simple_attn_f32(float *__restrict__ out,\n"
+/* Tiled self-attention: Q[N,dim], K[N,dim], V[N,dim] → out[N,dim]
+ * Grid: (n_heads), Block: (128) — 4 warps per head.
+ * Each block processes ALL queries for one head sequentially.
+ * Uses online softmax (single pass over K/V).
+ * head_dim=128: 4 elements per thread (128 threads / 32 = 4 warps, not used for parallelism here). */
+"__global__ void tiled_attn_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ Q, const float *__restrict__ K,\n"
 "    const float *__restrict__ V,\n"
 "    int N, int n_heads, int head_dim) {\n"
 "    int h = blockIdx.x;\n"
-"    int qi = blockIdx.y;\n"
-"    if (h >= n_heads || qi >= N) return;\n"
+"    if (h >= n_heads) return;\n"
 "    int dim = n_heads * head_dim;\n"
-"    int lane = threadIdx.x;\n"  /* 0..31 */
+"    int tid = threadIdx.x;\n"  /* 0..127 */
 "    float scale = rsqrtf((float)head_dim);\n"
-"    const float *q = Q + qi * dim + h * head_dim;\n"
-"    extern __shared__ float smem[];\n"  /* [N] for scores */
-"    /* Pass 1: compute Q·K scores */\n"
-"    float mx = -1e30f;\n"
-"    for (int j = 0; j < N; j++) {\n"
-"        const float *kj = K + j * dim + h * head_dim;\n"
-"        float s = 0;\n"
-"        for (int d = lane; d < head_dim; d += 32)\n"
-"            s += q[d] * kj[d];\n"
-"        for (int m = 16; m > 0; m >>= 1)\n"
-"            s += __shfl_xor_sync(0xFFFFFFFF, s, m);\n"
-"        s *= scale;\n"
-"        if (lane == 0) smem[j] = s;\n"
-"        if (s > mx) mx = s;\n"
-"    }\n"
-"    __syncwarp();\n"
-"    __threadfence_block();\n"  /* ensure smem writes are visible to all threads */
-"    /* Pass 2: softmax + weighted V accumulation */\n"
-"    float acc[4] = {0, 0, 0, 0};\n"  /* head_dim/32 = 4 elements per thread */
-"    float exp_sum = 0;\n"
-"    for (int j = 0; j < N; j++) {\n"
-"        float w = expf(smem[j] - mx);\n"
-"        exp_sum += w;\n"
-"        const float *vj = V + j * dim + h * head_dim;\n"
-"        for (int dd = 0; dd < 4; dd++) {\n"
-"            int d = lane + dd * 32;\n"
-"            if (d < head_dim) acc[dd] += w * vj[d];\n"
+"\n"
+"    /* Process each query sequentially */\n"
+"    for (int qi = 0; qi < N; qi++) {\n"
+"        /* Each thread handles one element of head_dim (tid maps to dim index) */\n"
+"        float q_val = (tid < head_dim) ? Q[qi * dim + h * head_dim + tid] : 0.0f;\n"
+"\n"
+"        /* Online softmax: track running max + sum + weighted V accumulation */\n"
+"        float row_max = -1e30f;\n"
+"        float row_sum = 0.0f;\n"
+"        float acc = 0.0f;\n"  /* accumulator for output[tid] */
+"\n"
+"        for (int j = 0; j < N; j++) {\n"
+"            /* Compute Q·K dot product using warp shuffle */\n"
+"            float kv = (tid < head_dim) ? K[j * dim + h * head_dim + tid] : 0.0f;\n"
+"            float dot = q_val * kv;\n"
+"            /* Reduce across all 128 threads (4 warps) using shared memory */\n"
+"            __shared__ float reduce_buf[128];\n"
+"            reduce_buf[tid] = dot;\n"
+"            __syncthreads();\n"
+"            /* Tree reduction */\n"
+"            for (int s = 64; s > 0; s >>= 1) {\n"
+"                if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];\n"
+"                __syncthreads();\n"
+"            }\n"
+"            float score = reduce_buf[0] * scale;\n"
+"            __syncthreads();\n"
+"\n"
+"            /* Online softmax update */\n"
+"            float new_max = fmaxf(row_max, score);\n"
+"            float exp_old = expf(row_max - new_max);\n"
+"            float exp_new = expf(score - new_max);\n"
+"            row_sum = row_sum * exp_old + exp_new;\n"
+"            acc = acc * exp_old;\n"  /* rescale previous accumulation */
+"            float v_val = (tid < head_dim) ? V[j * dim + h * head_dim + tid] : 0.0f;\n"
+"            acc += exp_new * v_val;\n"
+"            row_max = new_max;\n"
 "        }\n"
-"    }\n"
-"    float inv = 1.0f / exp_sum;\n"
-"    float *dst = out + qi * dim + h * head_dim;\n"
-"    for (int dd = 0; dd < 4; dd++) {\n"
-"        int d = lane + dd * 32;\n"
-"        if (d < head_dim) dst[d] = acc[dd] * inv;\n"
+"\n"
+"        /* Write output */\n"
+"        if (tid < head_dim) {\n"
+"            out[qi * dim + h * head_dim + tid] = acc / row_sum;\n"
+"        }\n"
 "    }\n"
 "}\n"
 
@@ -825,48 +833,14 @@ static void op_gated_add(cuda_qimg_runner *r, CUdeviceptr x, CUdeviceptr proj,
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
                     CUdeviceptr d_k, CUdeviceptr d_v,
                     int n_tok, int n_heads, int head_dim) {
-    /* CPU fallback attention — download, compute on CPU, upload.
-     * GPU attention kernel has precision issues at large token counts.
-     * This is correct but slower (~5ms per call at 256 tokens). */
-    int dim = n_heads * head_dim;
-    size_t sz = (size_t)n_tok * dim * sizeof(float);
-    float *q = (float *)malloc(sz), *k = (float *)malloc(sz);
-    float *v = (float *)malloc(sz), *out = (float *)malloc(sz);
-    cuStreamSynchronize(r->stream);
-    cuMemcpyDtoH(q, d_q, sz);
-    cuMemcpyDtoH(k, d_k, sz);
-    cuMemcpyDtoH(v, d_v, sz);
-
-    float scale = 1.0f / sqrtf((float)head_dim);
-    for (int h = 0; h < n_heads; h++) {
-        for (int i = 0; i < n_tok; i++) {
-            const float *qi = q + (size_t)i * dim + h * head_dim;
-            float mx = -1e30f;
-            for (int j = 0; j < n_tok; j++) {
-                const float *kj = k + (size_t)j * dim + h * head_dim;
-                float s = 0;
-                for (int d = 0; d < head_dim; d++) s += qi[d] * kj[d];
-                s *= scale;
-                if (s > mx) mx = s;
-            }
-            float esum = 0;
-            float *acc = out + (size_t)i * dim + h * head_dim;
-            for (int d = 0; d < head_dim; d++) acc[d] = 0;
-            for (int j = 0; j < n_tok; j++) {
-                const float *kj = k + (size_t)j * dim + h * head_dim;
-                float s = 0;
-                for (int d = 0; d < head_dim; d++) s += qi[d] * kj[d];
-                float w = expf(s * scale - mx);
-                esum += w;
-                const float *vj = v + (size_t)j * dim + h * head_dim;
-                for (int d = 0; d < head_dim; d++) acc[d] += w * vj[d];
-            }
-            float inv = 1.0f / esum;
-            for (int d = 0; d < head_dim; d++) acc[d] *= inv;
-        }
-    }
-    cuMemcpyHtoD(d_out, out, sz);
-    free(q); free(k); free(v); free(out);
+    /* tiled_attn_f32: one block per head, 128 threads (= head_dim).
+     * Online softmax, single pass over K/V per query. All on GPU. */
+    void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+    cuLaunchKernel(r->attn_prefill_f32,
+                   (unsigned)n_heads, 1, 1,
+                   128, 1, 1,
+                   128 * sizeof(float),  /* shared mem for dot product reduction */
+                   r->stream, args, NULL);
 }
 
 
@@ -932,7 +906,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(layernorm_f32, "layernorm_f32");
     GET(gelu_f32, "gelu_f32");
     GET(silu_f32, "silu_f32");
-    GET(attn_prefill_f32, "simple_attn_f32");
+    GET(attn_prefill_f32, "tiled_attn_f32");
     GET(add_bias_f32, "add_bias_f32");
     GET(rmsnorm_per_head, "rmsnorm_per_head_f32");
     GET(adaln_modulate, "adaln_modulate_f32");
