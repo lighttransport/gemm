@@ -196,6 +196,69 @@ static const char *qimg_kernel_src =
 "    if (i < n) x[i] += dt * v[i];\n"
 "}\n"
 
+/* 2D RoPE for image tokens: apply height+width rotary embeddings
+ * q,k: [n_tok, n_heads*head_dim], axes: t_dim, h_dim, w_dim
+ * Grid: (n_tok), Block: (n_heads) */
+"__global__ void rope_2d_f32(float *__restrict__ q, float *__restrict__ k,\n"
+"    int n_tok, int n_heads, int head_dim, int w_patches,\n"
+"    int t_dim, int h_dim, int w_dim, float theta) {\n"
+"    int tok = blockIdx.x;\n"
+"    int head = threadIdx.x;\n"
+"    if (tok >= n_tok || head >= n_heads) return;\n"
+"    int dim = n_heads * head_dim;\n"
+"    int ph = tok / w_patches, pw = tok % w_patches;\n"
+"    int off = head * head_dim;\n"
+"    /* Height RoPE at offset t_dim */\n"
+"    for (int i = 0; i < h_dim / 2; i++) {\n"
+"        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)h_dim);\n"
+"        float angle = (float)ph * freq;\n"
+"        float cs = cosf(angle), sn = sinf(angle);\n"
+"        int idx = off + t_dim + 2 * i;\n"
+"        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
+"        q[tok*dim+idx]   = q0*cs - q1*sn;\n"
+"        q[tok*dim+idx+1] = q0*sn + q1*cs;\n"
+"        float k0 = k[tok*dim+idx], k1 = k[tok*dim+idx+1];\n"
+"        k[tok*dim+idx]   = k0*cs - k1*sn;\n"
+"        k[tok*dim+idx+1] = k0*sn + k1*cs;\n"
+"    }\n"
+"    /* Width RoPE at offset t_dim + h_dim */\n"
+"    for (int i = 0; i < w_dim / 2; i++) {\n"
+"        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)w_dim);\n"
+"        float angle = (float)pw * freq;\n"
+"        float cs = cosf(angle), sn = sinf(angle);\n"
+"        int idx = off + t_dim + h_dim + 2 * i;\n"
+"        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
+"        q[tok*dim+idx]   = q0*cs - q1*sn;\n"
+"        q[tok*dim+idx+1] = q0*sn + q1*cs;\n"
+"        float k0 = k[tok*dim+idx], k1 = k[tok*dim+idx+1];\n"
+"        k[tok*dim+idx]   = k0*cs - k1*sn;\n"
+"        k[tok*dim+idx+1] = k0*sn + k1*cs;\n"
+"    }\n"
+"}\n"
+
+/* 1D RoPE for text tokens
+ * Grid: (n_tok), Block: (n_heads) */
+"__global__ void rope_1d_f32(float *__restrict__ q, float *__restrict__ k,\n"
+"    int n_tok, int n_heads, int head_dim, float theta) {\n"
+"    int tok = blockIdx.x;\n"
+"    int head = threadIdx.x;\n"
+"    if (tok >= n_tok || head >= n_heads) return;\n"
+"    int dim = n_heads * head_dim;\n"
+"    int off = head * head_dim;\n"
+"    for (int i = 0; i < head_dim / 2; i++) {\n"
+"        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);\n"
+"        float angle = (float)tok * freq;\n"
+"        float cs = cosf(angle), sn = sinf(angle);\n"
+"        int idx = off + 2 * i;\n"
+"        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
+"        q[tok*dim+idx]   = q0*cs - q1*sn;\n"
+"        q[tok*dim+idx+1] = q0*sn + q1*cs;\n"
+"        float k0 = k[tok*dim+idx], k1 = k[tok*dim+idx+1];\n"
+"        k[tok*dim+idx]   = k0*cs - k1*sn;\n"
+"        k[tok*dim+idx+1] = k0*sn + k1*cs;\n"
+"    }\n"
+"}\n"
+
 /* Simple self-attention: Q[N,dim], K[N,dim], V[N,dim] → out[N,dim]
  * One block per head, iterates over all query positions */
 "__global__ void simple_attn_f32(float *__restrict__ out,\n"
@@ -286,16 +349,22 @@ struct cuda_qimg_runner {
     CUfunction patchify;
     CUfunction unpatchify;
     CUfunction euler_step;
+    CUfunction rope_2d;
+    CUfunction rope_1d;
 
     /* DiT config */
     int dit_dim, dit_n_heads, dit_head_dim, dit_n_blocks;
     int dit_in_ch, dit_txt_dim, dit_mlp_h;
 
-    /* Safetensors context (mmap'd, kept for block-by-block loading) */
+    /* Safetensors context (mmap'd) */
     void *dit_st;
     void *vae_st;
 
-    /* Persistent GPU: global weights (~50MB F16) */
+    /* Preloaded blocks on GPU (NULL if not preloaded, loaded on-demand) */
+    qimg_block_gpu *gpu_blocks;  /* [dit_n_blocks] array, some may be zero */
+    int n_preloaded;             /* how many blocks are resident on GPU */
+
+    /* Persistent GPU: global weights (~50MB) */
     CUdeviceptr d_img_in_w, d_img_in_b;
     CUdeviceptr d_txt_in_w, d_txt_in_b;
     CUdeviceptr d_txt_norm_w;
@@ -646,6 +715,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(patchify, "patchify_f32");
     GET(unpatchify, "unpatchify_f32");
     GET(euler_step, "euler_step_f32");
+    GET(rope_2d, "rope_2d_f32");
+    GET(rope_1d, "rope_1d_f32");
     GET(dequant_fp8_to_f16, "dequant_fp8_to_f16");
     #undef GET
 
@@ -743,7 +814,35 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
     #undef GW
 
-    fprintf(stderr, "cuda_qimg: loaded %d blocks, dim=%d, global weights on GPU\n",
+    /* Preload as many blocks as fit in VRAM */
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cuMemGetInfo(&free_mem, &total_mem);
+        size_t block_bytes = 324 * 1024 * 1024;  /* ~324MB per block in FP8 */
+        size_t workspace = 500 * 1024 * 1024;     /* 500MB reserved for activations */
+        int max_preload = (int)((free_mem - workspace) / block_bytes);
+        if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
+        if (max_preload < 0) max_preload = 0;
+
+        r->gpu_blocks = (qimg_block_gpu *)calloc((size_t)r->dit_n_blocks,
+                                                  sizeof(qimg_block_gpu));
+        r->n_preloaded = max_preload;
+        fprintf(stderr, "cuda_qimg: preloading %d/%d blocks to GPU "
+                "(%.1f GB free, %.0f MB/block)\n",
+                max_preload, r->dit_n_blocks,
+                (float)free_mem / (1<<30), (float)block_bytes / (1<<20));
+
+        for (int i = 0; i < max_preload; i++) {
+            qimg_load_block(r, i, &r->gpu_blocks[i]);
+        }
+        cuStreamSynchronize(r->stream);
+
+        cuMemGetInfo(&free_mem, &total_mem);
+        fprintf(stderr, "cuda_qimg: after preload: %.1f GB free\n",
+                (float)free_mem / (1<<30));
+    }
+
+    fprintf(stderr, "cuda_qimg: loaded %d blocks, dim=%d\n",
             r->dit_n_blocks, r->dit_dim);
     return 0;
 }
@@ -759,6 +858,12 @@ int cuda_qimg_load_vae(cuda_qimg_runner *r, const char *path) {
 
 void cuda_qimg_free(cuda_qimg_runner *r) {
     if (!r) return;
+    /* Free preloaded blocks */
+    if (r->gpu_blocks) {
+        for (int i = 0; i < r->n_preloaded; i++)
+            qimg_free_block(&r->gpu_blocks[i]);
+        free(r->gpu_blocks);
+    }
     CUdeviceptr *globals = &r->d_img_in_w;
     for (int i = 0; i < 13; i++) { if (globals[i]) cuMemFree(globals[i]); }
     if (r->dit_st) safetensors_close((st_context *)r->dit_st);
@@ -845,15 +950,27 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemAlloc(&d_v, (size_t)n_total * dim * sizeof(float));
     cuMemAlloc(&d_attn_out, (size_t)n_total * dim * sizeof(float));
 
-    /* 4. Process all 60 blocks */
+    /* Compute image patch grid for RoPE */
+    int hp_rope = (int)sqrtf((float)n_img);
+    int wp_rope = n_img / hp_rope;
+    float rope_theta = 10000.0f;
+    int t_dim_rope = 16, h_dim_rope = 56, w_dim_rope = 56;
+
+    /* 4. Process all blocks */
     for (int L = 0; L < r->dit_n_blocks; L++) {
         if (r->verbose && (L % 10 == 0 || L == r->dit_n_blocks - 1))
             fprintf(stderr, "\r  cuda_qimg: block %d/%d", L + 1, r->dit_n_blocks);
 
-        /* Load block weights to GPU */
+        /* Use preloaded block if available, otherwise load on-demand */
         qimg_block_gpu blk;
-        memset(&blk, 0, sizeof(blk));
-        qimg_load_block(r, L, &blk);
+        int need_free = 0;
+        if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
+            blk = r->gpu_blocks[L];
+        } else {
+            memset(&blk, 0, sizeof(blk));
+            qimg_load_block(r, L, &blk);
+            need_free = 1;
+        }
 
         /* -- Image modulation: SiLU(t_emb) → Linear → 6×dim -- */
         CUdeviceptr d_t_silu;
@@ -917,7 +1034,18 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_rmsnorm_ph(r, d_txt_q, blk.norm_added_q_w, n_txt, nh, hd);
         op_rmsnorm_ph(r, d_txt_k, blk.norm_added_k_w, n_txt, nh, hd);
 
-        /* TODO: RoPE (skip for now — will add later for accuracy) */
+        /* RoPE: 2D for image tokens, 1D for text tokens */
+        {
+            void *rope2d_args[] = {&d_img_q, &d_img_k,
+                                   &n_img, &nh, &hd, &wp_rope,
+                                   &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
+            cuLaunchKernel(r->rope_2d, (unsigned)n_img, 1, 1,
+                           (unsigned)nh, 1, 1, 0, s, rope2d_args, NULL);
+            void *rope1d_args[] = {&d_txt_q, &d_txt_k,
+                                   &n_txt, &nh, &hd, &rope_theta};
+            cuLaunchKernel(r->rope_1d, (unsigned)n_txt, 1, 1,
+                           (unsigned)nh, 1, 1, 0, s, rope1d_args, NULL);
+        }
 
         /* Joint attention: Q/K/V already concatenated as [txt, img] */
         op_attn(r, d_attn_out, d_q, d_k, d_v, n_total, nh, hd);
@@ -951,9 +1079,14 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
                 dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
 
-        /* Free block weights */
+        /* Free modulation (always per-step), block weights only if loaded on-demand */
         cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
-        qimg_free_block(&blk);
+        if (need_free) {
+            CUdeviceptr *ptrs = (CUdeviceptr *)&blk;
+            int np = sizeof(qimg_block_gpu) / sizeof(CUdeviceptr);
+            for (int pi = 0; pi < np; pi++)
+                if (ptrs[pi]) cuMemFree(ptrs[pi]);
+        }
 
         cuStreamSynchronize(s);
     }
