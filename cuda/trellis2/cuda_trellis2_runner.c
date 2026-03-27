@@ -1277,6 +1277,66 @@ int cuda_trellis2_run_decoder(cuda_trellis2_runner *r,
     return 0;
 }
 
+int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
+                                  const float *x_t, float timestep,
+                                  const float *cond_features,
+                                  const int32_t *coords, int N,
+                                  float *output) {
+    if (!r->stage2_loaded) {
+        fprintf(stderr, "T2: Stage 2 not loaded\n"); return -1;
+    }
+    CUstream s = r->stream;
+    dit_model_gpu *m = &r->stage2;
+    int in_ch = m->in_channels;  /* 32 */
+    int ctx_len = DINO_SEQ_LEN;
+
+    /* Compute 3D RoPE tables from sparse coords on CPU */
+    int n_freqs = m->n_rope_freqs;  /* 21 */
+    float rope_theta = 10000.0f;
+    float *freqs = (float *)malloc((size_t)n_freqs * sizeof(float));
+    for (int j = 0; j < n_freqs; j++)
+        freqs[j] = 1.0f / powf(rope_theta, (float)j / (float)n_freqs);
+
+    size_t table_sz = (size_t)N * 3 * n_freqs * sizeof(float);
+    float *cos_tab = (float *)malloc(table_sz);
+    float *sin_tab = (float *)malloc(table_sz);
+
+    for (int i = 0; i < N; i++) {
+        /* coords[i] = (batch, z, y, x) */
+        float cz = (float)coords[i * 4 + 1];
+        float cy = (float)coords[i * 4 + 2];
+        float cx = (float)coords[i * 4 + 3];
+        float c[3] = {cz, cy, cx};
+        for (int axis = 0; axis < 3; axis++) {
+            for (int j = 0; j < n_freqs; j++) {
+                float theta = c[axis] * freqs[j];
+                cos_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(theta);
+                sin_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(theta);
+            }
+        }
+    }
+
+    CUdeviceptr d_rope_cos = cu_upload_raw(cos_tab, table_sz);
+    CUdeviceptr d_rope_sin = cu_upload_raw(sin_tab, table_sz);
+    free(freqs); free(cos_tab); free(sin_tab);
+
+    /* Upload input and conditioning */
+    CUdeviceptr d_x = cu_upload_raw(x_t, (size_t)N * in_ch * sizeof(float));
+    CUdeviceptr d_cond = cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+    CUdeviceptr d_out;
+    cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
+
+    /* Run Stage 2 DiT forward */
+    run_stage2_forward(r, d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin);
+
+    cuStreamSynchronize(s);
+    cuMemcpyDtoH(output, d_out, (size_t)N * in_ch * sizeof(float));
+
+    cuMemFree(d_x); cuMemFree(d_cond); cuMemFree(d_out);
+    cuMemFree(d_rope_cos); cuMemFree(d_rope_sin);
+    return 0;
+}
+
 int cuda_trellis2_run_dinov3(cuda_trellis2_runner *r,
                               const float *image_f32, float *output) {
     CUstream s = r->stream;
