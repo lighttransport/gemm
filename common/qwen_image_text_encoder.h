@@ -219,6 +219,9 @@ qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
     m->ffn_buf3 = (float *)calloc(n_ff, sizeof(float));
     m->matvec_tmp = (float *)calloc(n_ff > n_embd ? n_ff : n_embd, sizeof(float));
     m->n_threads = 1;
+    /* thread_tmp: needed even for single-thread (matvec scratch per thread) */
+    m->thread_tmp = (float **)calloc(1, sizeof(float *));
+    m->thread_tmp[0] = (float *)calloc(n_ff > n_embd ? n_ff : n_embd, sizeof(float));
 
     /* KV cache */
     m->key_cache = (float **)calloc(n_layers, sizeof(float *));
