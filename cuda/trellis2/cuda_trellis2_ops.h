@@ -50,6 +50,7 @@ typedef struct {
     CUfunction dinov3_patch_embed;
     CUfunction dinov3_prepend_tokens;
     CUfunction layerscale_add;
+    CUfunction cross_attn_tiled;
 
     int sm_version;
     int use_f32_gemm;
@@ -105,6 +106,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("dinov3_patch_embed_f32",   dinov3_patch_embed);
     GET_FN("dinov3_prepend_tokens_f32", dinov3_prepend_tokens);
     GET_FN("layerscale_add_f32",       layerscale_add);
+    GET_FN("cross_attn_tiled_f32",    cross_attn_tiled);
 
     #undef GET_FN
     return 0;
@@ -201,12 +203,20 @@ static inline void t2_op_cross_attn(t2_ops *ops, CUstream s,
                                       int q_len, int kv_len, int dim,
                                       int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
-    int nt = 128;
-    size_t smem = (size_t)(kv_len + nt) * sizeof(float);
-    void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim,
-                    &n_heads, &head_dim, &scale};
-    cuLaunchKernel(ops->cross_attn, (unsigned)n_heads, (unsigned)q_len, 1,
-                   (unsigned)nt, 1, 1, smem, s, args, NULL);
+    size_t smem = (size_t)(kv_len + 128) * sizeof(float);
+    if (smem <= 48 * 1024) {
+        int nt = 128;
+        void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim,
+                        &n_heads, &head_dim, &scale};
+        cuLaunchKernel(ops->cross_attn, (unsigned)n_heads, (unsigned)q_len, 1,
+                       (unsigned)nt, 1, 1, smem, s, args, NULL);
+    } else {
+        /* Large N: tiled online-softmax (1 thread per head×query) */
+        void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim,
+                        &n_heads, &head_dim, &scale};
+        cuLaunchKernel(ops->cross_attn_tiled, (unsigned)n_heads, (unsigned)q_len, 1,
+                       1, 1, 1, 0, s, args, NULL);
+    }
 }
 
 static inline void t2_op_self_attn(t2_ops *ops, CUstream s,
