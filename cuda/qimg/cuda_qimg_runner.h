@@ -1043,6 +1043,21 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     int n_total = n_img + n_txt;
     CUstream s = r->stream;
 
+    /* Check GPU memory before allocations */
+    {
+        size_t free_mem, total_mem;
+        cuMemGetInfo(&free_mem, &total_mem);
+        size_t needed = (size_t)(n_img + n_txt + n_total*3 + n_total) * dim * sizeof(float)
+                      + (size_t)(n_img > n_txt ? n_img : n_txt) * mlp_h * sizeof(float)
+                      + (size_t)n_img * in_ch * sizeof(float) * 2
+                      + (size_t)n_txt * txt_dim * sizeof(float)
+                      + 6 * dim * sizeof(float) * 3;  /* modulation + t_emb */
+        if (free_mem < needed + 50*1024*1024) {
+            fprintf(stderr, "cuda_qimg: WARNING: low GPU memory! free=%.1fMB needed=%.1fMB\n",
+                    (float)free_mem/(1<<20), (float)needed/(1<<20));
+        }
+    }
+
     /* Allocate GPU activation buffers */
     CUdeviceptr d_img, d_txt, d_t_emb;
     cuMemAlloc(&d_img, (size_t)n_img * dim * sizeof(float));
