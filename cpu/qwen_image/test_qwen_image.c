@@ -12,6 +12,10 @@
  *   cc -O2 -o test_qwen_image test_qwen_image.c -lm -lpthread
  */
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #define SAFETENSORS_IMPLEMENTATION
 #define GGUF_LOADER_IMPLEMENTATION
 #define GGML_DEQUANT_IMPLEMENTATION
@@ -343,8 +347,16 @@ static void dit_dump_cb(const char *name, const float *data, int n, void *ctx) {
 
 static int test_dit(const char *dit_path, int lat_h, int lat_w, uint64_t seed) {
     fprintf(stderr, "\n=== DiT Layer-by-Layer Verify ===\n");
-    qimg_dit_model *dit = qimg_dit_load_gguf(dit_path);
+    /* Auto-detect GGUF vs safetensors */
+    qimg_dit_model *dit = NULL;
+    if (strstr(dit_path, ".safetensors"))
+        dit = qimg_dit_load_safetensors(dit_path);
+    else
+        dit = qimg_dit_load_gguf(dit_path);
     if (!dit) return 1;
+
+    /* Pre-dequantize all weights for fast SIMD GEMM */
+    qimg_dit_predequant(dit);
 
     int ps = dit->patch_size;
     int hp = lat_h / ps, wp = lat_w / ps;
@@ -513,7 +525,12 @@ static int test_full_pipeline(const char *dit_path, const char *vae_path,
     fprintf(stderr, "\n=== Full Pipeline ===\n");
 
     /* Load models */
-    qimg_dit_model *dit = qimg_dit_load_gguf(dit_path);
+    /* Auto-detect GGUF vs safetensors */
+    qimg_dit_model *dit = NULL;
+    if (strstr(dit_path, ".safetensors"))
+        dit = qimg_dit_load_safetensors(dit_path);
+    else
+        dit = qimg_dit_load_gguf(dit_path);
     if (!dit) return 1;
     qimg_vae_model *vae = qimg_vae_load(vae_path);
     if (!vae) return 1;

@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS = -O2 -Wall -Wno-unused-function -I../../common
+CFLAGS = -O2 -mavx2 -mfma -Wall -Wno-unused-function -I../../common
 LDFLAGS = -lm -lpthread
 
 .PHONY: all clean test-sched test-vae test-dit test-enc test-gen
