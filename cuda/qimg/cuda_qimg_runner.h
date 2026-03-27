@@ -275,6 +275,44 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 
+/* gemm_f32_f32: pure F32 tiled GEMM (from HY3D kernels) */
+"__global__ void gemm_f32_f32(float *Y, const float *W, const float *X,\n"
+"    const float *bias, int n_out, int n_in, int n_tok) {\n"
+"    __shared__ float smA[16][16];\n"
+"    __shared__ float smB[16][16];\n"
+"    int tx = threadIdx.x, ty = threadIdx.y;\n"
+"    int tok_base = blockIdx.y * 16;\n"
+"    int out_base = blockIdx.x * 64;\n"
+"    int row = tok_base + ty;\n"
+"    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;\n"
+"    for (int k = 0; k < n_in; k += 16) {\n"
+"        smA[ty][tx] = (tok_base+ty < n_tok && k+tx < n_in) ? X[(tok_base+ty)*n_in + k+tx] : 0.f;\n"
+"        __syncthreads();\n"
+"        { int w = out_base + tx; smB[ty][tx] = (w < n_out && k+ty < n_in) ? W[(size_t)w*n_in+k+ty] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc0 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        { int w = out_base+16+tx; smB[ty][tx] = (w < n_out && k+ty < n_in) ? W[(size_t)w*n_in+k+ty] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc1 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        { int w = out_base+32+tx; smB[ty][tx] = (w < n_out && k+ty < n_in) ? W[(size_t)w*n_in+k+ty] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc2 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"        { int w = out_base+48+tx; smB[ty][tx] = (w < n_out && k+ty < n_in) ? W[(size_t)w*n_in+k+ty] : 0.f; }\n"
+"        __syncthreads();\n"
+"        for (int i = 0; i < 16; i++) acc3 += smA[ty][i] * smB[i][tx];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (row < n_tok) {\n"
+"        if (out_base+   tx < n_out) Y[row*n_out+out_base+   tx] = acc0 + (bias?bias[out_base+   tx]:0.f);\n"
+"        if (out_base+16+tx < n_out) Y[row*n_out+out_base+16+tx] = acc1 + (bias?bias[out_base+16+tx]:0.f);\n"
+"        if (out_base+32+tx < n_out) Y[row*n_out+out_base+32+tx] = acc2 + (bias?bias[out_base+32+tx]:0.f);\n"
+"        if (out_base+48+tx < n_out) Y[row*n_out+out_base+48+tx] = acc3 + (bias?bias[out_base+48+tx]:0.f);\n"
+"    }\n"
+"}\n"
+
 /* SiLU for VAE: x = x / (1 + exp(-x)) */
 "__global__ void vae_silu_f32(float *__restrict__ x, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -446,6 +484,7 @@ struct cuda_qimg_runner {
     /* Kernel handles */
     CUfunction gemm_f16_f32;
     CUfunction gemm_fp8_f32;     /* native FP8 GEMM (sm_89+) */
+    CUfunction gemm_f32_f32;     /* pure F32 GEMM (highest precision) */
     CUfunction layernorm_f32;
     CUfunction gelu_f32;
     CUfunction silu_f32;
@@ -628,28 +667,13 @@ static void qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *
     st_context *st = (st_context *)r->dit_st;
     char name[256];
 
-    /* Upload weight: always upload raw FP8, dequant on GPU if needed */
+    /* Upload weight: FP8 raw for native GEMM, or F32 for precision */
     #define BLK_W(field, suffix) do { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_fp8_gemm) { \
             b->field = qimg_st_upload_fp8_raw(st, name); \
         } else { \
-            /* Upload raw FP8 then dequant to F16 on GPU via LUT kernel */ \
-            int _idx = safetensors_find(st, name); \
-            if (_idx >= 0) { \
-                size_t _n = safetensors_nbytes(st, _idx); \
-                CUdeviceptr _d_fp8; \
-                cuMemAlloc(&_d_fp8, _n); \
-                cuMemcpyHtoD(_d_fp8, safetensors_data(st, _idx), _n); \
-                cuMemAlloc(&b->field, _n * 2); \
-                void *_args[] = {&_d_fp8, &b->field, &_n}; \
-                int _nn = (int)_n; _args[2] = &_nn; \
-                cuLaunchKernel(r->dequant_fp8_to_f16, \
-                    (unsigned)((_n + 255) / 256), 1, 1, 256, 1, 1, \
-                    0, r->stream, _args, NULL); \
-                cuStreamSynchronize(r->stream); \
-                cuMemFree(_d_fp8); \
-            } else { b->field = 0; } \
+            b->field = qimg_st_upload_f32(st, name); \
         } \
     } while(0)
     #define BLK_F32(field, suffix) do { \
@@ -709,10 +733,11 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         cuLaunchKernel(r->gemm_fp8_f32, gx, gy, 1, 128, 1, 1,
                        smem, r->stream, args, NULL);
     } else {
-        /* gemm_f16_f32: W is F16, shared mem = 16 × 16 F32 */
-        unsigned smem = 16 * 16 * sizeof(float);
-        cuLaunchKernel(r->gemm_f16_f32, gx, gy, 1, 128, 1, 1,
-                       smem, r->stream, args, NULL);
+        /* gemm_f32_f32: W is F32, pure F32 compute (highest precision).
+         * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
+        unsigned gx32 = (unsigned)((n_out + 63) / 64);
+        cuLaunchKernel(r->gemm_f32_f32, gx32, gy, 1, 16, 16, 1,
+                       0, r->stream, args, NULL);
     }
 }
 
@@ -845,6 +870,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
 
     #define GET(field, name) cuModuleGetFunction(&r->field, module, name)
     GET(gemm_f16_f32, "gemm_f16_f32");
+    GET(gemm_f32_f32, "gemm_f32_f32");
     /* Try loading native FP8 GEMM (available on sm_89+) */
     r->use_fp8_gemm = 0;
     if (sm >= 89) {
@@ -899,35 +925,8 @@ static CUdeviceptr qimg_upload_weight_auto(cuda_qimg_runner *r,
                                             st_context *st, const char *name) {
     if (r->use_fp8_gemm)
         return qimg_st_upload_fp8_raw(st, name);
-
-    /* F16 fallback: upload raw FP8, dequant on GPU via LUT kernel */
-    int idx = safetensors_find(st, name);
-    if (idx < 0) return 0;
-    const char *dtype = safetensors_dtype(st, idx);
-    int is_fp8 = (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0);
-
-    if (!is_fp8) {
-        /* Already F16/BF16/F32 — use CPU-side upload */
-        return qimg_st_upload_f16(st, name);
-    }
-
-    size_t n = safetensors_nbytes(st, idx);  /* n bytes = n elements for FP8 */
-    /* Upload raw FP8 to GPU temp buffer */
-    CUdeviceptr d_fp8;
-    cuMemAlloc(&d_fp8, n);
-    cuMemcpyHtoD(d_fp8, safetensors_data(st, idx), n);
-    /* Allocate F16 output on GPU */
-    CUdeviceptr d_f16;
-    cuMemAlloc(&d_f16, n * 2);
-    /* Launch GPU LUT dequant */
-    int nn = (int)n;
-    void *args[] = {&d_fp8, &d_f16, &nn};
-    cuLaunchKernel(r->dequant_fp8_to_f16,
-                   (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
-                   0, r->stream, args, NULL);
-    cuStreamSynchronize(r->stream);
-    cuMemFree(d_fp8);
-    return d_f16;
+    /* F32 path: dequant FP8→F32 on CPU, upload F32 (highest precision) */
+    return qimg_st_upload_f32(st, name);
 }
 
 /* ---- Load DiT from FP8 safetensors ---- */
@@ -974,8 +973,8 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     {
         size_t free_mem = 0, total_mem = 0;
         cuMemGetInfo(&free_mem, &total_mem);
-        /* Block size depends on whether we use FP8 (1 byte) or F16 (2 bytes) per element */
-        size_t block_bytes = r->use_fp8_gemm ? (324 * 1024 * 1024) : (648 * 1024 * 1024);
+        /* Block size: FP8=1 byte, F32=4 bytes per element */
+        size_t block_bytes = r->use_fp8_gemm ? (324 * 1024 * 1024) : (1296ULL * 1024 * 1024);
         size_t workspace = 500 * 1024 * 1024;     /* 500MB reserved for activations */
         int max_preload = (int)((free_mem - workspace) / block_bytes);
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
@@ -1117,6 +1116,15 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     size_t ffn_scratch = (size_t)(n_img > n_txt ? n_img : n_txt) * mlp_h * sizeof(float);
     cuMemAlloc(&d_scratch3, ffn_scratch);
 
+    /* Debug: dump max value of a GPU buffer */
+    #define DUMP_MAX(name, ptr, count) do { if (r->verbose >= 2) { \
+        float *_tmp = (float*)malloc((count)*sizeof(float)); \
+        cuStreamSynchronize(s); cuMemcpyDtoH(_tmp, ptr, (count)*sizeof(float)); \
+        float _mx=0; int _nc=0; \
+        for(int _i=0;_i<(count);_i++){if(_tmp[_i]!=_tmp[_i])_nc++;else if(fabsf(_tmp[_i])>_mx)_mx=fabsf(_tmp[_i]);} \
+        fprintf(stderr, "    %s: max=%.4f nan=%d\n", name, _mx, _nc); \
+        free(_tmp); } } while(0)
+
     /* Modulation scratch */
     CUdeviceptr d_mod;
     cuMemAlloc(&d_mod, (size_t)6 * dim * sizeof(float));
@@ -1186,7 +1194,9 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         CUdeviceptr txt_g2  = d_txt_mod + (size_t)5 * dim * sizeof(float);
 
         /* adaLN image → d_scratch1 */
+        if (L == 0) { DUMP_MAX("img_input", d_img, n_img*dim); }
         op_adaln(r, d_scratch1, d_img, img_sh1, img_sc1, n_img, dim);
+        if (L == 0) { DUMP_MAX("img_adaln", d_scratch1, n_img*dim); }
         /* adaLN text → d_scratch2 */
         op_adaln(r, d_scratch2, d_txt, txt_sh1, txt_sc1, n_txt, dim);
 
@@ -1235,8 +1245,10 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_gemm(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt);
 
         /* Gated residual */
+        if (L == 0) { DUMP_MAX("img_attn_proj", d_scratch1, n_img*dim); }
         op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
         op_gated_add(r, d_txt, d_scratch2, txt_g1, n_txt, dim);
+        if (L == 0) { DUMP_MAX("img_after_attn", d_img, n_img*dim); }
 
         /* -- MLP with adaLN -- */
         /* Image MLP */
@@ -1247,6 +1259,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_gemm(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b,
                 dim, mlp_h, n_img);
         op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
+        if (L == 0) { DUMP_MAX("img_after_mlp", d_img, n_img*dim); }
 
         /* Text MLP */
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
