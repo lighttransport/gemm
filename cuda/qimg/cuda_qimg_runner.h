@@ -365,8 +365,9 @@ static const char *qimg_kernel_src =
 "}\n"
 
 /* Self-attention: Q[N,dim], K[N,dim], V[N,dim] → out[N,dim]
- * One block per (head, query). Threads parallelize head_dim accumulation.
- * Grid: (n_heads, N), Block: (128) — one thread per head_dim element */
+ * One block per (head, query). Uses 32 threads (1 warp) for correct
+ * warp-shuffle reduction. Each thread handles head_dim/32 = 4 dims.
+ * Grid: (n_heads, N), Block: (32) */
 "__global__ void simple_attn_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ Q, const float *__restrict__ K,\n"
 "    const float *__restrict__ V,\n"
@@ -375,33 +376,44 @@ static const char *qimg_kernel_src =
 "    int qi = blockIdx.y;\n"
 "    if (h >= n_heads || qi >= N) return;\n"
 "    int dim = n_heads * head_dim;\n"
-"    int d = threadIdx.x;\n"  /* each thread handles one dimension */
-"    if (d >= head_dim) return;\n"
+"    int lane = threadIdx.x;\n"  /* 0..31 */
 "    float scale = rsqrtf((float)head_dim);\n"
 "    const float *q = Q + qi * dim + h * head_dim;\n"
-"    extern __shared__ float smem[];\n"  /* [N] attention weights */
-"    /* Pass 1: compute attention scores + max */\n"
-"    float qd = q[d];\n"
+"    extern __shared__ float smem[];\n"  /* [N] for scores */
+"    /* Pass 1: compute Q·K scores */\n"
 "    float mx = -1e30f;\n"
 "    for (int j = 0; j < N; j++) {\n"
-"        float s = qd * K[j * dim + h * head_dim + d];\n"
-"        /* Reduce across head_dim threads */\n"
-"        for (int m = 64; m > 0; m >>= 1)\n"
+"        const float *kj = K + j * dim + h * head_dim;\n"
+"        float s = 0;\n"
+"        for (int d = lane; d < head_dim; d += 32)\n"
+"            s += q[d] * kj[d];\n"
+"        for (int m = 16; m > 0; m >>= 1)\n"
 "            s += __shfl_xor_sync(0xFFFFFFFF, s, m);\n"
 "        s *= scale;\n"
-"        if (d == 0) smem[j] = s;\n"  /* thread 0 stores score */
+"        if (lane == 0) smem[j] = s;\n"
 "        if (s > mx) mx = s;\n"
 "    }\n"
-"    __syncthreads();\n"
-"    /* Pass 2: softmax + weighted sum (per-dim) */\n"
-"    float acc = 0;\n"
-"    float exp_sum_local = 0;\n"
+"    __syncwarp();\n"
+"    /* Broadcast mx from lane 0 */\n"
+"    mx = __shfl_sync(0xFFFFFFFF, mx, 0);\n"
+"    /* Pass 2: softmax + weighted V accumulation */\n"
+"    float acc[4] = {0, 0, 0, 0};\n"  /* head_dim/32 = 4 elements per thread */
+"    float exp_sum = 0;\n"
 "    for (int j = 0; j < N; j++) {\n"
 "        float w = expf(smem[j] - mx);\n"
-"        exp_sum_local += w;\n"
-"        acc += w * V[j * dim + h * head_dim + d];\n"
+"        exp_sum += w;\n"
+"        const float *vj = V + j * dim + h * head_dim;\n"
+"        for (int dd = 0; dd < 4; dd++) {\n"
+"            int d = lane + dd * 32;\n"
+"            if (d < head_dim) acc[dd] += w * vj[d];\n"
+"        }\n"
 "    }\n"
-"    out[qi * dim + h * head_dim + d] = acc / exp_sum_local;\n"
+"    float inv = 1.0f / exp_sum;\n"
+"    float *dst = out + qi * dim + h * head_dim;\n"
+"    for (int dd = 0; dd < 4; dd++) {\n"
+"        int d = lane + dd * 32;\n"
+"        if (d < head_dim) dst[d] = acc[dd] * inv;\n"
+"    }\n"
 "}\n"
 
 "}\n"; /* close extern "C" from cuda_kernels_common_src */
@@ -743,12 +755,12 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr q,
                     CUdeviceptr k, CUdeviceptr v,
                     int n_tok, int n_heads, int head_dim) {
     /* simple_attn_f32: one block per (head, query).
-     * Block has head_dim threads (128). Shared mem stores N attention scores. */
+     * 32 threads (1 warp) for correct warp-shuffle reduction. */
     void *args[] = {&out, &q, &k, &v, &n_tok, &n_heads, &head_dim};
     unsigned smem = (unsigned)n_tok * sizeof(float);
     cuLaunchKernel(r->attn_prefill_f32,
                    (unsigned)n_heads, (unsigned)n_tok, 1,
-                   (unsigned)head_dim, 1, 1,
+                   32, 1, 1,
                    smem, r->stream, args, NULL);
 }
 
@@ -929,7 +941,8 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     {
         size_t free_mem = 0, total_mem = 0;
         cuMemGetInfo(&free_mem, &total_mem);
-        size_t block_bytes = 324 * 1024 * 1024;  /* ~324MB per block in FP8 */
+        /* Block size depends on whether we use FP8 (1 byte) or F16 (2 bytes) per element */
+        size_t block_bytes = r->use_fp8_gemm ? (324 * 1024 * 1024) : (648 * 1024 * 1024);
         size_t workspace = 500 * 1024 * 1024;     /* 500MB reserved for activations */
         int max_preload = (int)((free_mem - workspace) / block_bytes);
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
@@ -1032,8 +1045,11 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemFree(d_t_sin);
 
     /* 2. Text input: RMSNorm(txt_norm_w) → Linear(txt_in) */
-    {
-        /* Apply RMSNorm with weight to text encoder output */
+    /* Note: ComfyUI's text encoder already outputs normalized hidden states.
+     * The txt_norm in the DiT is applied to RAW encoder output.
+     * When using ComfyUI pre-encoded hidden states, skip txt_norm since
+     * ComfyUI's CLIP encoder already applies it internally. */
+    if (r->d_txt_norm_w && 0) {  /* DISABLED: ComfyUI text is already normalized */
         void *rn_args[] = {&d_txt_in, &r->d_txt_norm_w, &n_txt, &txt_dim};
         cuLaunchKernel(r->rmsnorm_weighted, (unsigned)n_txt, 1, 1,
                        256, 1, 1, 256 * sizeof(float), s, rn_args, NULL);
