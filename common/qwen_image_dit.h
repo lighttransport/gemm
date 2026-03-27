@@ -531,8 +531,8 @@ static void qimg_timestep_embed(float *out, float t, int dim) {
     for (int i = 0; i < half; i++) {
         float freq = expf(-(float)i / (float)half * logf(10000.0f));
         float angle = t * freq;
-        out[i]        = sinf(angle);
-        out[half + i] = cosf(angle);
+        out[i]        = cosf(angle);  /* cos first (flip_sin_to_cos=True) */
+        out[half + i] = sinf(angle);
     }
 }
 

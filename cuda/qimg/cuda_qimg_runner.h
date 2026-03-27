@@ -1020,8 +1020,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     for (int i = 0; i < half; i++) {
         float freq = expf(-(float)i / (float)half * logf(10000.0f));
         float angle = timestep * freq;
-        t_sin[i] = sinf(angle);
-        t_sin[half + i] = cosf(angle);
+        t_sin[i]        = cosf(angle);  /* cos first (flip_sin_to_cos=True) */
+        t_sin[half + i] = sinf(angle);
     }
     CUdeviceptr d_t_sin;
     cuMemAlloc(&d_t_sin, 256 * sizeof(float));
