@@ -69,6 +69,17 @@ int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
 int cuda_trellis2_run_decoder(cuda_trellis2_runner *r,
                                const float *latent, float *output);
 
+/* Run Stage 2 shape DiT single forward step.
+ * x_t: [N, 32] sparse voxel features (token-major, no transpose needed)
+ * coords: [N, 4] int32 (batch, z, y, x) — for RoPE computation
+ * cond: [1029, 1024] DINOv3 features
+ * output: [N, 32] predicted velocity */
+int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
+                                  const float *x_t, float timestep,
+                                  const float *cond_features,
+                                  const int32_t *coords, int N,
+                                  float *output);
+
 #ifdef __cplusplus
 }
 #endif
