@@ -110,9 +110,9 @@ void qimg_sched_set_timesteps_comfyui(qimg_scheduler *s, int n_steps, float shif
         s->sigmas[i] = sigma;
     }
 
-    /* Timestep = sigma (multiplier=1.0 in ComfyUI AuraFlow mode) */
+    /* Timestep = sigma * 1000 (model expects [0, 1000] range) */
     for (int i = 0; i < n_steps; i++) {
-        s->timesteps[i] = s->sigmas[i];
+        s->timesteps[i] = s->sigmas[i] * 1000.0f;
         s->dt[i] = s->sigmas[i + 1] - s->sigmas[i];
     }
 }
