@@ -112,6 +112,7 @@ int main(int argc, char **argv) {
 
     /* ---- Init CUDA ---- */
     cuda_qimg_runner *r = cuda_qimg_init(0, 1);
+    if (r) r->verbose = 2;  /* enable debug dumps */
     if (r && force_f16) { r->use_fp8_gemm = 0; fprintf(stderr, "Forced F16 path\n"); }
     if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
 
