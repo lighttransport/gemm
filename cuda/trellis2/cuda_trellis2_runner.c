@@ -91,6 +91,24 @@ typedef struct {
     CUdeviceptr mod_bias;  /* [6*DIT_DIM] */
 } dit_block_gpu;
 
+/* Generic DiT model (shared by Stage 1 and Stage 2) */
+typedef struct {
+    int n_blocks;
+    int model_channels;   /* D: 1536 */
+    int n_heads;          /* 12 */
+    int head_dim;         /* 128 */
+    int ffn_hidden;       /* 8192 */
+    int in_channels;      /* 8 for Stage 1, 32 for Stage 2 */
+    int cond_dim;         /* 1024 */
+    CUdeviceptr t_fc1_w, t_fc1_b, t_fc2_w, t_fc2_b;
+    CUdeviceptr mod_w, mod_b;
+    CUdeviceptr x_emb_w, x_emb_b;
+    CUdeviceptr out_w, out_b;
+    dit_block_gpu *blocks;
+    CUdeviceptr rope_cos, rope_sin;
+    int n_rope_freqs, rope_axis_dim;
+} dit_model_gpu;
+
 typedef struct {
     CUdeviceptr conv_w, conv_b;
     CUdeviceptr gn1_w, gn1_b, conv1_w, conv1_b;
@@ -117,14 +135,19 @@ struct cuda_trellis2_runner {
     int dino_has_qk_norm, dino_has_layerscale;
     CUdeviceptr dino_rope_cos, dino_rope_sin;  /* [1024, 64] for 32x32 patches */
 
-    /* DiT weights */
+    /* Stage 1 DiT */
     CUdeviceptr dit_t_fc1_w, dit_t_fc1_b, dit_t_fc2_w, dit_t_fc2_b;
     CUdeviceptr dit_mod_w, dit_mod_b;
     CUdeviceptr dit_x_emb_w, dit_x_emb_b;
     CUdeviceptr dit_out_w, dit_out_b;
     dit_block_gpu dit_blocks[DIT_DEPTH];
-    CUdeviceptr dit_rope_cos, dit_rope_sin;  /* [DIT_N_TOKENS, 3, n_freqs] */
+    CUdeviceptr dit_rope_cos, dit_rope_sin;
     int dit_n_freqs, dit_axis_dim;
+
+    /* Stage 2 shape flow DiT */
+    dit_model_gpu stage2;
+    dit_block_gpu stage2_blocks[DIT_DEPTH];
+    int stage2_loaded;
 
     /* Decoder weights */
     CUdeviceptr dec_conv_in_w, dec_conv_in_b;
@@ -588,6 +611,84 @@ static int load_dinov3_weights(cuda_trellis2_runner *r, const char *path) {
     return 0;
 }
 
+static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
+    /* Stage 2 uses identical weight naming as Stage 1, just in_channels=32 */
+    st_context *st = safetensors_open(path);
+    if (!st) return -1;
+    fprintf(stderr, "T2: loading Stage 2 from %s (%d tensors)\n", path, st->n_tensors);
+    int v = r->verbose;
+    dit_model_gpu *m = &r->stage2;
+
+    m->n_blocks = DIT_DEPTH;
+    m->model_channels = DIT_DIM;
+    m->n_heads = DIT_HEADS;
+    m->head_dim = DIT_HEAD_DIM;
+    m->ffn_hidden = DIT_FFN;
+    m->cond_dim = DIT_COND_DIM;
+    m->blocks = r->stage2_blocks;
+
+    /* Detect in_channels from input_layer weight */
+    {
+        int idx = safetensors_find(st, "input_layer.weight");
+        if (idx >= 0) m->in_channels = (int)safetensors_shape(st, idx)[1];
+        else m->in_channels = 32;
+    }
+
+    m->t_fc1_w = t2_upload_f32(st, "t_embedder.mlp.0.weight", v);
+    m->t_fc1_b = t2_upload_f32(st, "t_embedder.mlp.0.bias", v);
+    m->t_fc2_w = t2_upload_f32(st, "t_embedder.mlp.2.weight", v);
+    m->t_fc2_b = t2_upload_f32(st, "t_embedder.mlp.2.bias", v);
+    m->mod_w   = t2_upload_f32(st, "adaLN_modulation.1.weight", v);
+    m->mod_b   = t2_upload_f32(st, "adaLN_modulation.1.bias", v);
+    m->x_emb_w = t2_upload_f32(st, "input_layer.weight", v);
+    m->x_emb_b = t2_upload_f32(st, "input_layer.bias", v);
+    m->out_w   = t2_upload_f32(st, "out_layer.weight", v);
+    m->out_b   = t2_upload_f32(st, "out_layer.bias", v);
+
+    for (int L = 0; L < m->n_blocks; L++) {
+        dit_block_gpu *blk = &m->blocks[L];
+        char name[256]; int idx;
+        #define BLK2(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
+                               t2_upload_f32(st, name, v >= 2 ? v : 0))
+        blk->sa_qkv_w  = BLK2("self_attn.to_qkv.weight");
+        blk->sa_qkv_b  = BLK2("self_attn.to_qkv.bias");
+        blk->sa_q_norm  = BLK2("self_attn.q_rms_norm.gamma");
+        blk->sa_k_norm  = BLK2("self_attn.k_rms_norm.gamma");
+        blk->sa_out_w   = BLK2("self_attn.to_out.weight");
+        blk->sa_out_b   = BLK2("self_attn.to_out.bias");
+        blk->norm2_w    = BLK2("norm2.weight");
+        blk->norm2_b    = BLK2("norm2.bias");
+        blk->ca_q_w     = BLK2("cross_attn.to_q.weight");
+        blk->ca_q_b     = BLK2("cross_attn.to_q.bias");
+        blk->ca_kv_w    = BLK2("cross_attn.to_kv.weight");
+        blk->ca_kv_b    = BLK2("cross_attn.to_kv.bias");
+        blk->ca_q_norm  = BLK2("cross_attn.q_rms_norm.gamma");
+        blk->ca_k_norm  = BLK2("cross_attn.k_rms_norm.gamma");
+        blk->ca_out_w   = BLK2("cross_attn.to_out.weight");
+        blk->ca_out_b   = BLK2("cross_attn.to_out.bias");
+        blk->mlp_fc1_w  = BLK2("mlp.mlp.0.weight");
+        blk->mlp_fc1_b  = BLK2("mlp.mlp.0.bias");
+        blk->mlp_fc2_w  = BLK2("mlp.mlp.2.weight");
+        blk->mlp_fc2_b  = BLK2("mlp.mlp.2.bias");
+        blk->mod_bias   = BLK2("modulation");
+        #undef BLK2
+    }
+
+    /* RoPE tables computed at runtime from sparse coords — set to NULL for now */
+    m->rope_cos = 0; m->rope_sin = 0;
+    m->n_rope_freqs = DIT_HEAD_DIM / 6;  /* 21 */
+    m->rope_axis_dim = 2 * m->n_rope_freqs;
+
+    safetensors_close(st);
+    r->stage2_loaded = 1;
+    fprintf(stderr, "T2: Stage 2 loaded (%d blocks, in_ch=%d)\n", m->n_blocks, m->in_channels);
+    return 0;
+}
+
+int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path) {
+    return load_stage2_weights(r, stage2_path);
+}
+
 int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
                                 const char *dinov3_path,
                                 const char *stage1_path,
@@ -599,6 +700,9 @@ int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
     if (decoder_path && load_decoder_weights(r, decoder_path) != 0) return -1;
 
     if (dinov3_path && load_dinov3_weights(r, dinov3_path) != 0) return -1;
+
+    /* Stage 2 shape flow model loads with same code as Stage 1 — just different in_channels */
+    r->stage2_loaded = 0;
 
     return 0;
 }
@@ -725,13 +829,24 @@ static void run_dinov3(cuda_trellis2_runner *r, CUdeviceptr d_image, CUdeviceptr
 /* DiT forward pass (single denoising step)                                 */
 /* ======================================================================== */
 
-static void run_dit_forward(cuda_trellis2_runner *r,
-                             CUdeviceptr d_x, float timestep,
-                             CUdeviceptr d_cond,
-                             CUdeviceptr d_output) {
+/* Generic DiT forward: works for both Stage 1 (N=4096, in=8) and Stage 2 (N=variable, in=32) */
+static void run_dit_forward_generic(cuda_trellis2_runner *r,
+                                      CUdeviceptr d_x, float timestep,
+                                      CUdeviceptr d_cond,
+                                      CUdeviceptr d_output,
+                                      int N,                   /* token count */
+                                      int in_ch,               /* input channels */
+                                      int n_blocks,
+                                      CUdeviceptr t_fc1_w, CUdeviceptr t_fc1_b,
+                                      CUdeviceptr t_fc2_w, CUdeviceptr t_fc2_b,
+                                      CUdeviceptr mod_w, CUdeviceptr mod_b,
+                                      CUdeviceptr x_emb_w, CUdeviceptr x_emb_b,
+                                      CUdeviceptr out_w, CUdeviceptr out_b,
+                                      dit_block_gpu *blocks,
+                                      CUdeviceptr rope_cos, CUdeviceptr rope_sin,
+                                      int n_freqs, int axis_dim) {
     t2_ops *ops = &r->ops;
     CUstream stream = r->stream;
-    const int N = DIT_N_TOKENS;   /* 4096 */
     const int D = DIT_DIM;        /* 1536 */
     const int H = DIT_HEADS;      /* 12 */
     const int HD = DIT_HEAD_DIM;  /* 128 */
@@ -771,8 +886,8 @@ static void run_dit_forward(cuda_trellis2_runner *r,
     CUdeviceptr d_split_V = d_ca_V + ca_kv_sz;
 
     /* 1. Input embedding: [N, DIT_IN_CH] -> [N, D] */
-    t2_op_gemm(ops, stream, d_hidden, r->dit_x_emb_w, d_x, r->dit_x_emb_b,
-               D, DIT_IN_CH, N);
+    t2_op_gemm(ops, stream, d_hidden, x_emb_w, d_x, x_emb_b,
+               D, in_ch, N);
 
     /* 2. Timestep embedding: sinusoidal(256) -> MLP(256->D->D) */
     /* TRELLIS.2: t*1000, [cos, sin] order (NOT [sin, cos] like HY3D) */
@@ -786,22 +901,22 @@ static void run_dit_forward(cuda_trellis2_runner *r,
                        256, 1, 1, 0, stream, te_args2, NULL);
     }
     /* t_fc1: [D, 256] */
-    t2_op_gemm(ops, stream, d_normed, r->dit_t_fc1_w, d_temb, r->dit_t_fc1_b,
+    t2_op_gemm(ops, stream, d_normed, t_fc1_w, d_temb, t_fc1_b,
                D, 256, 1);
     /* SiLU */
     t2_op_silu_inplace(ops, stream, d_normed, D);
     /* t_fc2: [D, D] */
-    t2_op_gemm(ops, stream, d_temb, r->dit_t_fc2_w, d_normed, r->dit_t_fc2_b,
+    t2_op_gemm(ops, stream, d_temb, t_fc2_w, d_normed, t_fc2_b,
                D, D, 1);
     /* Now d_temb = [D] timestep embedding */
 
     /* 3. Transformer blocks */
-    for (int bi = 0; bi < DIT_DEPTH; bi++) {
-        dit_block_gpu *blk = &r->dit_blocks[bi];
+    for (int bi = 0; bi < n_blocks; bi++) {
+        dit_block_gpu *blk = &blocks[bi];
 
         /* 3a. Modulation: SiLU(t_emb) @ mod_w + mod_b + block_bias -> [6*D] */
         t2_op_modulation(ops, stream, d_mod, d_temb,
-                         r->dit_mod_w, r->dit_mod_b, blk->mod_bias,
+                         mod_w, mod_b, blk->mod_bias,
                          D, 6 * D);
 
         /* Split mod into shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp */
@@ -845,10 +960,10 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         if (bi==0 && r->verbose>=2) dbg4("K_rmsnorm", d_K, stream);
 
         /* 3D RoPE on Q and K */
-        t2_op_rope_3d(ops, stream, d_Q, r->dit_rope_cos, r->dit_rope_sin,
-                      N, D, H, HD, r->dit_n_freqs, r->dit_axis_dim);
-        t2_op_rope_3d(ops, stream, d_K, r->dit_rope_cos, r->dit_rope_sin,
-                      N, D, H, HD, r->dit_n_freqs, r->dit_axis_dim);
+        t2_op_rope_3d(ops, stream, d_Q, rope_cos, rope_sin,
+                      N, D, H, HD, n_freqs, axis_dim);
+        t2_op_rope_3d(ops, stream, d_K, rope_cos, rope_sin,
+                      N, D, H, HD, n_freqs, axis_dim);
 
         if (bi==0 && r->verbose>=2) dbg4("Q_rope", d_Q, stream);
         if (bi==0 && r->verbose>=2) dbg4("K_rope", d_K, stream);
@@ -950,8 +1065,38 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         cuLaunchKernel(ops->layernorm_noaffine, (unsigned)N, 1, 1,
                        256, 1, 1, 512 * sizeof(float), stream, ln_args, NULL);
     }
-    t2_op_gemm(ops, stream, d_output, r->dit_out_w, d_hidden, r->dit_out_b,
-               DIT_IN_CH, D, N);
+    t2_op_gemm(ops, stream, d_output, out_w, d_hidden, out_b,
+               in_ch, D, N);
+}
+
+/* Stage 1 wrapper */
+static void run_dit_forward(cuda_trellis2_runner *r,
+                             CUdeviceptr d_x, float timestep,
+                             CUdeviceptr d_cond, CUdeviceptr d_output) {
+    run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
+        DIT_N_TOKENS, DIT_IN_CH, DIT_DEPTH,
+        r->dit_t_fc1_w, r->dit_t_fc1_b, r->dit_t_fc2_w, r->dit_t_fc2_b,
+        r->dit_mod_w, r->dit_mod_b,
+        r->dit_x_emb_w, r->dit_x_emb_b,
+        r->dit_out_w, r->dit_out_b,
+        r->dit_blocks, r->dit_rope_cos, r->dit_rope_sin,
+        r->dit_n_freqs, r->dit_axis_dim);
+}
+
+/* Stage 2 wrapper (variable N from sparse coords) */
+static void run_stage2_forward(cuda_trellis2_runner *r,
+                                CUdeviceptr d_x, float timestep,
+                                CUdeviceptr d_cond, CUdeviceptr d_output,
+                                int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin) {
+    dit_model_gpu *m = &r->stage2;
+    run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
+        N, m->in_channels, m->n_blocks,
+        m->t_fc1_w, m->t_fc1_b, m->t_fc2_w, m->t_fc2_b,
+        m->mod_w, m->mod_b,
+        m->x_emb_w, m->x_emb_b,
+        m->out_w, m->out_b,
+        m->blocks, rope_cos, rope_sin,
+        m->n_rope_freqs, m->rope_axis_dim);
 }
 
 /* ======================================================================== */

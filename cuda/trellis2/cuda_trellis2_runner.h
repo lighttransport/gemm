@@ -46,6 +46,9 @@ float *cuda_trellis2_predict(cuda_trellis2_runner *r,
                               int n_steps, float cfg_scale,
                               uint32_t seed);
 
+/* Load Stage 2 shape flow model weights (separate from Stage 1) */
+int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path);
+
 /* Set GEMM mode: 0=F16 weights (default), 1=F32 weights */
 void cuda_trellis2_set_f32_gemm(cuda_trellis2_runner *r, int enable);
 
