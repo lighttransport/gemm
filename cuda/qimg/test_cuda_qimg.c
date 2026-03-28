@@ -342,9 +342,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
             latent[i] = randn();
 
-        /* Scheduler — dynamic with timestep = sigma * 1000 */
+        /* Scheduler — dynamic with shift_terminal=0 (sigma goes to 0) */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
+        sched.shift_terminal = 0.0f;  /* go to sigma=0 (fully denoise) */
         qimg_sched_set_timesteps(&sched, n_steps, n_img);
 
         float cfg_scale = 2.5f;  /* ComfyUI default for Qwen-Image */

@@ -900,8 +900,6 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         cuLaunchKernel(r->gemm_f32_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
     }
-    /* Truncate GEMM output to BF16 precision (simulate BF16 training compute) */
-    op_bf16_trunc(r, Y, n_out * n_tok);
 }
 
 /* Truncate buffer to BF16 precision (if enabled) */
@@ -1442,6 +1440,10 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_gemm(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
                 dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
+
+        /* Truncate block output to BF16 precision (matches ComfyUI's BF16 compute) */
+        op_bf16_trunc(r, d_img, n_img * dim);
+        op_bf16_trunc(r, d_txt, n_txt * dim);
 
         /* Free modulation (always per-step), block weights only if loaded on-demand */
         cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
