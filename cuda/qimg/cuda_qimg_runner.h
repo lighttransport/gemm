@@ -880,8 +880,15 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
          * Grid: (ceil(n_out/256), ceil(n_tok/16)), Block: (128) */
         cuLaunchKernel(r->gemm_f16_f32, gx, gy, 1, 128, 1, 1,
                        16 * 16 * sizeof(float), r->stream, args, NULL);
+    } else if (r->use_fp8_gemm && r->gemm_fp8_f32) {
+        /* gemm_fp8_f32: NATIVE FP8×FP8→F32 MMA (sm_89+).
+         * Both weights AND inputs quantized to E4M3 on tensor cores.
+         * Grid: (ceil(n_out/256), ceil(n_tok/16)), Block: (128)
+         * Shared mem: 16*32*sizeof(float) for input tile */
+        cuLaunchKernel(r->gemm_fp8_f32, gx, gy, 1, 128, 1, 1,
+                       16 * 32 * sizeof(float), r->stream, args, NULL);
     } else if (r->use_fp8_gemm) {
-        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 inputs.
+        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 inputs (fallback).
          * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_fp8w_f32, gx64, gy, 1, 16, 16, 1,
@@ -909,14 +916,12 @@ static void op_silu(cuda_qimg_runner *r, CUdeviceptr x, int n) {
     void *args[] = {&x, &n};
     cuLaunchKernel(r->silu_f32, (unsigned)((n+255)/256), 1, 1, 256, 1, 1,
                    0, r->stream, args, NULL);
-    op_bf16_trunc(r, x, n);
 }
 
 static void op_gelu(cuda_qimg_runner *r, CUdeviceptr x, int n) {
     void *args[] = {&x, &n};
     cuLaunchKernel(r->gelu_f32, (unsigned)((n+255)/256), 1, 1, 256, 1, 1,
                    0, r->stream, args, NULL);
-    op_bf16_trunc(r, x, n);
 }
 
 static void op_adaln(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr x,
