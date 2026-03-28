@@ -103,21 +103,18 @@ void qimg_sched_set_timesteps_comfyui(qimg_scheduler *s, int n_steps, float shif
 
     float es = expf(shift);
 
-    /* ComfyUI convention: raw linear sigmas are used for Euler step sizes (dt).
-     * The AuraFlow shift is applied ONLY to compute the timestep passed to the model.
-     * This is critical: shifted sigmas compress the schedule (tiny dt), while
-     * raw sigmas give normal-sized steps matching the training distribution. */
+    /* ComfyUI convention: shifted sigmas are used for EVERYTHING —
+     * the timestep passed to the model, the sigma in the Euler step division,
+     * and the dt computation. The "simple" scheduler in ComfyUI returns
+     * shifted sigmas from model_sampling.sigmas which are pre-shifted. */
     for (int i = 0; i <= n_steps; i++) {
         float sigma_raw = 1.0f - (float)i / (float)n_steps;
-        s->sigmas[i] = sigma_raw;  /* raw sigmas for dt */
+        float sigma_shifted = es * sigma_raw / (1.0f + (es - 1.0f) * sigma_raw);
+        s->sigmas[i] = sigma_shifted;
     }
 
     for (int i = 0; i < n_steps; i++) {
-        /* Timestep: apply shift then multiply */
-        float sigma_raw = s->sigmas[i];
-        float sigma_shifted = es * sigma_raw / (1.0f + (es - 1.0f) * sigma_raw);
-        s->timesteps[i] = sigma_shifted * multiplier;
-        /* dt from RAW sigmas (not shifted) */
+        s->timesteps[i] = s->sigmas[i] * multiplier;
         s->dt[i] = s->sigmas[i + 1] - s->sigmas[i];
     }
 }

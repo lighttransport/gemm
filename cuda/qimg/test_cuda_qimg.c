@@ -338,12 +338,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
             latent[i] = randn();
 
-        /* Scheduler — match ComfyUI's Qwen-Image defaults:
-         * shift=1.15, multiplier=1.0 (from comfy/supported_models.py QwenImage class)
-         * The generate_comfyui.py overrides shift to 3.1 for better quality */
+        /* Scheduler — use dynamic scheduler with timestep = sigma * 1000 */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
-        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f, 1.0f);
+        qimg_sched_set_timesteps(&sched, n_steps, n_img);
 
         float cfg_scale = 2.5f;  /* ComfyUI default for Qwen-Image */
 
@@ -367,15 +365,21 @@ int main(int argc, char **argv) {
             int lat_n = lat_ch * lat_h * lat_w;
             float *vel_latent = (float *)malloc((size_t)lat_n * sizeof(float));
 
+            /* Euler step: x += v * dt (model output is velocity) */
             if (no_cfg) {
-                /* No CFG: just use conditional velocity directly */
                 qimg_dit_unpatchify(vel_latent, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
+                /* Debug: save step 1 model output */
+                if (step == 0) {
+                    FILE *vf = fopen("dit_output_step1.bin", "wb");
+                    if (vf) { fwrite(vel_cond, sizeof(float), (size_t)n_img*in_ch, vf); fclose(vf);
+                        fprintf(stderr, "  Saved dit_output_step1.bin [%d, %d]\n", n_img, in_ch); }
+                    FILE *lf2 = fopen("dit_vel_latent_step1.bin", "wb");
+                    if (lf2) { fwrite(vel_latent, sizeof(float), (size_t)lat_n, lf2); fclose(lf2); }
+                }
             } else {
-                /* Unconditional DiT forward (negative prompt encoding) */
                 cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt,
                                    t_val, vel_uncond);
 
-                /* CFG combine: velocity = uncond + cfg_scale * (cond - uncond) */
                 float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
                 float *vu_lat = (float *)malloc((size_t)lat_n * sizeof(float));
                 qimg_dit_unpatchify(vc_lat, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
@@ -383,31 +387,7 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < lat_n; i++)
                     vel_latent[i] = vu_lat[i] + cfg_scale * (vc_lat[i] - vu_lat[i]);
                 free(vc_lat); free(vu_lat);
-
-                /* CFGNorm: normalize combined velocity by its magnitude */
-                {
-                    float mag = 0;
-                    for (int i = 0; i < lat_n; i++) mag += vel_latent[i] * vel_latent[i];
-                    mag = sqrtf(mag / (float)lat_n + 1e-8f);
-                    float *vu_tmp = (float *)malloc((size_t)lat_n * sizeof(float));
-                    qimg_dit_unpatchify(vu_tmp, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
-                    float umag = 0;
-                    for (int i = 0; i < lat_n; i++) umag += vu_tmp[i] * vu_tmp[i];
-                    umag = sqrtf(umag / (float)lat_n + 1e-8f);
-                    free(vu_tmp);
-                    if (mag > 1e-6f) {
-                        float scale_norm = umag / mag;
-                        for (int i = 0; i < lat_n; i++) vel_latent[i] *= scale_norm;
-                    }
-                }
             }
-
-            /* Track velocity magnitude */
-            { float vmx=0;
-              for(int i=0;i<lat_n;i++) if(fabsf(vel_latent[i])>vmx) vmx=fabsf(vel_latent[i]);
-              if (r->verbose >= 2)
-                fprintf(stderr, "    vel_max=%.2f dt=%.6f step_size=%.2f\n",
-                        vmx, sched.dt[step], vmx * fabsf(sched.dt[step])); }
 
             /* Euler step */
             qimg_sched_step(latent, vel_latent, lat_n, step, &sched);
