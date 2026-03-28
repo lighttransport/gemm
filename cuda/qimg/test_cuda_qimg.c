@@ -348,7 +348,10 @@ int main(int argc, char **argv) {
         sched.shift_terminal = 0.0f;  /* go to sigma=0 (fully denoise) */
         qimg_sched_set_timesteps(&sched, n_steps, n_img);
 
-        float cfg_scale = 2.5f;  /* ComfyUI default for Qwen-Image */
+        float cfg_scale = 2.5f;
+        for (int i = 1; i < argc; i++)
+            if (strcmp(argv[i], "--cfg-scale") == 0 && i+1 < argc)
+                cfg_scale = (float)atof(argv[++i]);
 
         /* Patchify + denoising loop with CFG */
         float *img_tokens = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
