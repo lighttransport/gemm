@@ -450,20 +450,51 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 
-/* 1D RoPE for text tokens
+/* 3-axis RoPE for text tokens: SAME structure as image RoPE but with
+ * text-specific positions. ComfyUI uses txt_pos = txt_start + tok for
+ * ALL 3 axes (temporal, height, width), with axes_dim=[16,56,56].
  * Grid: (n_tok), Block: (n_heads) */
 "__global__ void rope_1d_f32(float *__restrict__ q, float *__restrict__ k,\n"
-"    int n_tok, int n_heads, int head_dim, float theta) {\n"
+"    int n_tok, int n_heads, int head_dim, int txt_start,\n"
+"    int t_dim, int h_dim, int w_dim, float theta) {\n"
 "    int tok = blockIdx.x;\n"
 "    int head = threadIdx.x;\n"
 "    if (tok >= n_tok || head >= n_heads) return;\n"
 "    int dim = n_heads * head_dim;\n"
 "    int off = head * head_dim;\n"
-"    for (int i = 0; i < head_dim / 2; i++) {\n"
-"        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);\n"
-"        float angle = (float)tok * freq;\n"
+"    float pos = (float)(txt_start + tok);\n"
+"    /* Temporal RoPE (first t_dim/2 pairs) — same position for all text tokens */\n"
+"    for (int i = 0; i < t_dim / 2; i++) {\n"
+"        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)t_dim);\n"
+"        float angle = pos * freq;\n"
 "        float cs = cosf(angle), sn = sinf(angle);\n"
 "        int idx = off + 2 * i;\n"
+"        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
+"        q[tok*dim+idx]   = q0*cs - q1*sn;\n"
+"        q[tok*dim+idx+1] = q0*sn + q1*cs;\n"
+"        float k0 = k[tok*dim+idx], k1 = k[tok*dim+idx+1];\n"
+"        k[tok*dim+idx]   = k0*cs - k1*sn;\n"
+"        k[tok*dim+idx+1] = k0*sn + k1*cs;\n"
+"    }\n"
+"    /* Height RoPE (next h_dim/2 pairs) */\n"
+"    for (int i = 0; i < h_dim / 2; i++) {\n"
+"        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)h_dim);\n"
+"        float angle = pos * freq;\n"
+"        float cs = cosf(angle), sn = sinf(angle);\n"
+"        int idx = off + t_dim + 2 * i;\n"
+"        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
+"        q[tok*dim+idx]   = q0*cs - q1*sn;\n"
+"        q[tok*dim+idx+1] = q0*sn + q1*cs;\n"
+"        float k0 = k[tok*dim+idx], k1 = k[tok*dim+idx+1];\n"
+"        k[tok*dim+idx]   = k0*cs - k1*sn;\n"
+"        k[tok*dim+idx+1] = k0*sn + k1*cs;\n"
+"    }\n"
+"    /* Width RoPE (last w_dim/2 pairs) */\n"
+"    for (int i = 0; i < w_dim / 2; i++) {\n"
+"        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)w_dim);\n"
+"        float angle = pos * freq;\n"
+"        float cs = cosf(angle), sn = sinf(angle);\n"
+"        int idx = off + t_dim + h_dim + 2 * i;\n"
 "        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
 "        q[tok*dim+idx]   = q0*cs - q1*sn;\n"
 "        q[tok*dim+idx+1] = q0*sn + q1*cs;\n"
@@ -1416,15 +1447,21 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_rmsnorm_ph(r, d_txt_q, blk.norm_added_q_w, n_txt, nh, hd);
         op_rmsnorm_ph(r, d_txt_k, blk.norm_added_k_w, n_txt, nh, hd);
 
-        /* RoPE: 2D for image tokens, 1D for text tokens */
+        /* RoPE: 3-axis for both image and text tokens.
+         * Image: positions = centered height/width, 0 for temporal.
+         * Text: positions = txt_start + tok for ALL 3 axes.
+         * txt_start = max(hp/2, wp/2) to match ComfyUI convention. */
         {
             void *rope2d_args[] = {&d_img_q, &d_img_k,
                                    &n_img, &nh, &hd, &wp_rope,
                                    &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
             cuLaunchKernel(r->rope_2d, (unsigned)n_img, 1, 1,
                            (unsigned)nh, 1, 1, 0, s, rope2d_args, NULL);
+            /* Text RoPE: 3-axis with txt_start offset */
+            int txt_start = hp_rope > wp_rope ? hp_rope / 2 : wp_rope / 2;
             void *rope1d_args[] = {&d_txt_q, &d_txt_k,
-                                   &n_txt, &nh, &hd, &rope_theta};
+                                   &n_txt, &nh, &hd, &txt_start,
+                                   &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
             cuLaunchKernel(r->rope_1d, (unsigned)n_txt, 1, 1,
                            (unsigned)nh, 1, 1, 0, s, rope1d_args, NULL);
         }
