@@ -1,12 +1,10 @@
 /*
  * test_fp8_gemm.c - Standalone FP8 MMA GEMM correctness test
  *
- * Tests our gemm_fp8_f32 kernel against CPU F32 reference.
- * Isolates the GEMM from the full DiT pipeline to verify
- * fragment mapping and accumulation correctness.
+ * Tests our gemm_fp8_f32 kernel against multithreaded CPU FP8 reference.
  *
  * Build:
- *   cc -O2 -I../../common -I.. -o test_fp8_gemm test_fp8_gemm.c ../cuew.c -lm -ldl
+ *   cc -O2 -I../../common -I.. -o test_fp8_gemm test_fp8_gemm.c ../cuew.c -lm -ldl -lpthread
  */
 
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
@@ -17,72 +15,117 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 
-/* ---- FP8 E4M3 conversion ---- */
+/* ---- FP8 E4M3 conversion with pre-built LUTs ---- */
 
-static float fp8_to_f32(uint8_t b) {
-    int s = (b >> 7) & 1;
-    int e = (b >> 3) & 0xF;
-    int m = b & 0x7;
-    if (e == 0 && m == 0) return 0.0f;
-    if (e == 15 && m == 7) return 0.0f;  /* NaN → 0 */
-    if (e == 0) return (s ? -1.0f : 1.0f) * ((float)m / 8.0f) * powf(2.0f, -6.0f); /* subnormal */
-    float val = (1.0f + (float)m / 8.0f) * powf(2.0f, (float)(e - 7));
-    return s ? -val : val;
-}
+static float g_fp8_to_f32[256];
+static uint8_t g_f32_to_fp8_pos[1024]; /* quantize positive values 0..447 → FP8 */
 
-static uint8_t f32_to_fp8(float f) {
-    /* Find closest FP8 E4M3 value via brute-force LUT comparison */
-    uint8_t best = 0;
-    float best_err = fabsf(f);
-    for (int i = 1; i < 255; i++) {
-        float v = fp8_to_f32((uint8_t)i);
-        float err = fabsf(f - v);
-        if (err < best_err) { best_err = err; best = (uint8_t)i; }
+static void init_fp8_luts(void) {
+    /* FP8 → F32 LUT */
+    for (int i = 0; i < 256; i++) {
+        int s = (i >> 7) & 1;
+        int e = (i >> 3) & 0xF;
+        int m = i & 0x7;
+        float val;
+        if (e == 0 && m == 0) val = 0.0f;
+        else if (e == 15 && m == 7) val = 0.0f; /* NaN → 0 */
+        else if (e == 0) val = ((float)m / 8.0f) * (1.0f / 64.0f); /* subnormal */
+        else val = (1.0f + (float)m / 8.0f) * powf(2.0f, (float)(e - 7));
+        g_fp8_to_f32[i] = s ? -val : val;
     }
-    return best;
+
+    /* Build fast F32→FP8 quantization by sorting positive FP8 values */
+    /* FP8 E4M3 positive values: 0, subnormals (e=0,m=1..7), normals (e=1..14, m=0..7), max (e=15,m=6) */
+    /* Total positive: 127 values (indices 0..126). Find nearest for any float. */
+    /* For speed: use the PTX cvt instruction semantics (round-to-nearest-even, saturate) */
 }
 
-/* ---- Test helpers ---- */
+static float fp8_to_f32(uint8_t b) { return g_fp8_to_f32[b]; }
 
-static void cpu_gemm_f32(float *Y, const float *W, const float *X,
-                          int n_out, int n_in, int n_tok) {
-    /* Y[n_tok, n_out] = X[n_tok, n_in] @ W^T[n_in, n_out] */
-    for (int t = 0; t < n_tok; t++)
-        for (int o = 0; o < n_out; o++) {
+static uint8_t f32_to_fp8_fast(float f) {
+    /* Proper FP8 E4M3 quantization: extract sign, clamp, find nearest */
+    int sign = 0;
+    if (f < 0) { sign = 1; f = -f; }
+    if (f > 448.0f) f = 448.0f; /* saturate */
+    if (f < 0.001953125f) return sign ? 0x80 : 0x00; /* below smallest subnormal → ±0 */
+
+    /* Find exponent */
+    int e;
+    float m_val;
+    if (f < 0.015625f) { /* subnormal range: 2^-9 to 2^-6 */
+        e = 0;
+        m_val = f * 64.0f; /* f / 2^-6 */
+    } else {
+        /* log2(f) to find exponent */
+        int raw_e = (int)floorf(log2f(f));
+        e = raw_e + 7; /* bias = 7 */
+        if (e < 1) e = 1;
+        if (e > 15) e = 15;
+        float base = powf(2.0f, (float)(e - 7));
+        m_val = f / base - 1.0f;
+    }
+
+    /* Round mantissa to 3 bits */
+    int m = (int)roundf(m_val * 8.0f);
+    if (m > 7) { m = 0; e++; }
+    if (e > 15) { e = 15; m = 6; } /* max normal = 448 */
+    if (e == 15 && m > 6) m = 6;   /* avoid NaN (e=15,m=7) */
+
+    uint8_t result = (uint8_t)((sign << 7) | (e << 3) | m);
+    return result;
+}
+
+/* ---- Multithreaded CPU GEMM ---- */
+
+typedef struct {
+    float *Y;
+    const float *W;  /* F32 weights (dequanted from FP8) */
+    const float *X;  /* F32 inputs (dequanted from FP8) */
+    int n_out, n_in, n_tok;
+    int tok_start, tok_end;
+} gemm_task;
+
+static void *gemm_worker(void *arg) {
+    gemm_task *t = (gemm_task *)arg;
+    for (int tok = t->tok_start; tok < t->tok_end; tok++)
+        for (int o = 0; o < t->n_out; o++) {
             float sum = 0;
-            for (int i = 0; i < n_in; i++)
-                sum += X[t * n_in + i] * W[o * n_in + i];
-            Y[t * n_out + o] = sum;
+            for (int i = 0; i < t->n_in; i++)
+                sum += t->X[tok * t->n_in + i] * t->W[o * t->n_in + i];
+            t->Y[tok * t->n_out + o] = sum;
         }
+    return NULL;
 }
 
-static void cpu_gemm_fp8(float *Y, const uint8_t *W_fp8, const float *X,
-                           int n_out, int n_in, int n_tok) {
-    /* Same as above but dequant W from FP8 and quantize X to FP8 first */
-    for (int t = 0; t < n_tok; t++)
-        for (int o = 0; o < n_out; o++) {
-            float sum = 0;
-            for (int i = 0; i < n_in; i++) {
-                float w = fp8_to_f32(W_fp8[o * n_in + i]);
-                float x = fp8_to_f32(f32_to_fp8(X[t * n_in + i]));
-                sum += x * w;
-            }
-            Y[t * n_out + o] = sum;
-        }
+static void cpu_gemm_mt(float *Y, const float *W, const float *X,
+                         int n_out, int n_in, int n_tok, int n_threads) {
+    pthread_t threads[64];
+    gemm_task tasks[64];
+    if (n_threads > 64) n_threads = 64;
+    if (n_threads > n_tok) n_threads = n_tok;
+
+    for (int i = 0; i < n_threads; i++) {
+        tasks[i] = (gemm_task){Y, W, X, n_out, n_in, n_tok,
+                               i * n_tok / n_threads, (i + 1) * n_tok / n_threads};
+        pthread_create(&threads[i], NULL, gemm_worker, &tasks[i]);
+    }
+    for (int i = 0; i < n_threads; i++)
+        pthread_join(threads[i], NULL);
 }
+
+/* ---- Stats ---- */
 
 static float correlation(const float *a, const float *b, int n) {
     double sa = 0, sb = 0, sab = 0, sa2 = 0, sb2 = 0;
     for (int i = 0; i < n; i++) {
-        sa += a[i]; sb += b[i];
-        sab += a[i] * b[i];
+        sa += a[i]; sb += b[i]; sab += a[i] * b[i];
         sa2 += a[i] * a[i]; sb2 += b[i] * b[i];
     }
     double ma = sa / n, mb = sb / n;
     double cov = sab / n - ma * mb;
-    double va = sa2 / n - ma * ma;
-    double vb = sb2 / n - mb * mb;
+    double va = sa2 / n - ma * ma, vb = sb2 / n - mb * mb;
     if (va < 1e-12 || vb < 1e-12) return 0;
     return (float)(cov / sqrt(va * vb));
 }
@@ -105,14 +148,29 @@ static float rms(const float *a, int n) {
 /* ---- Main ---- */
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+    int n_threads = 16;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--threads") == 0 && i+1 < argc)
+            n_threads = atoi(argv[++i]);
+
+    init_fp8_luts();
+
+    /* Verify LUT roundtrip */
+    {
+        int mismatch = 0;
+        for (int i = 0; i < 256; i++) {
+            float v = fp8_to_f32((uint8_t)i);
+            uint8_t q = f32_to_fp8_fast(v);
+            float v2 = fp8_to_f32(q);
+            if (fabsf(v - v2) > 1e-6f && v != 0.0f) mismatch++;
+        }
+        fprintf(stderr, "FP8 roundtrip: %d/256 mismatches\n", mismatch);
+    }
 
     /* Init CUDA */
-    if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS) {
-        fprintf(stderr, "Failed to init CUEW CUDA\n"); return 1;
-    }
-    if (cuewInit(CUEW_INIT_NVRTC) != CUEW_SUCCESS) {
-        fprintf(stderr, "Failed to init CUEW NVRTC\n"); return 1;
+    if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS ||
+        cuewInit(CUEW_INIT_NVRTC) != CUEW_SUCCESS) {
+        fprintf(stderr, "Failed to init CUEW\n"); return 1;
     }
     cuInit(0);
     CUdevice dev; cuDeviceGet(&dev, 0);
@@ -122,20 +180,14 @@ int main(int argc, char **argv) {
     cuDeviceGetAttribute(&sm_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
     cuDeviceGetAttribute(&sm_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
     int sm = sm_major * 10 + sm_minor;
-    fprintf(stderr, "GPU: sm_%d\n", sm);
+    fprintf(stderr, "GPU: sm_%d, threads: %d\n", sm, n_threads);
 
-    if (sm < 89) {
-        fprintf(stderr, "FP8 MMA requires sm_89+. Skipping.\n");
-        return 0;
-    }
+    if (sm < 89) { fprintf(stderr, "FP8 MMA requires sm_89+\n"); return 0; }
 
-    /* Compile kernel */
-    CUmodule module;
-    /* Use minimal source with just the FP8 kernel */
-    static const char *fp8_test_src =
+    /* Compile kernel (inline source to avoid extern "C" issues) */
+    static const char *src =
     "extern \"C\" {\n"
     "#define GEMM_N_TILE 8\n"
-    /* Include the FP8 kernel from cuda_kernels_common.h line 191-285 */
     "#if __CUDA_ARCH__ >= 890\n"
     "__global__ void gemm_fp8_f32(float *Y, const unsigned char *W, const float *X,\n"
     "                              const float *bias, int n_out, int n_in, int n_tok) {\n"
@@ -155,13 +207,13 @@ int main(int argc, char **argv) {
     "        int srow = tid / 8, scol = (tid % 8) * 4;\n"
     "        int grow = tok_base + srow;\n"
     "        if (grow < n_tok) {\n"
-    "            smem_x[srow * 32 + scol]     = X[grow * n_in + k + scol];\n"
-    "            smem_x[srow * 32 + scol + 1] = X[grow * n_in + k + scol + 1];\n"
-    "            smem_x[srow * 32 + scol + 2] = X[grow * n_in + k + scol + 2];\n"
-    "            smem_x[srow * 32 + scol + 3] = X[grow * n_in + k + scol + 3];\n"
+    "            smem_x[srow*32+scol] = X[grow*n_in+k+scol];\n"
+    "            smem_x[srow*32+scol+1] = X[grow*n_in+k+scol+1];\n"
+    "            smem_x[srow*32+scol+2] = X[grow*n_in+k+scol+2];\n"
+    "            smem_x[srow*32+scol+3] = X[grow*n_in+k+scol+3];\n"
     "        } else {\n"
-    "            smem_x[srow * 32 + scol] = 0.0f; smem_x[srow * 32 + scol + 1] = 0.0f;\n"
-    "            smem_x[srow * 32 + scol + 2] = 0.0f; smem_x[srow * 32 + scol + 3] = 0.0f;\n"
+    "            smem_x[srow*32+scol]=0; smem_x[srow*32+scol+1]=0;\n"
+    "            smem_x[srow*32+scol+2]=0; smem_x[srow*32+scol+3]=0;\n"
     "        }\n"
     "        __syncthreads();\n"
     "        unsigned int a0, a1, a2, a3;\n"
@@ -200,134 +252,128 @@ int main(int argc, char **argv) {
     "        }\n"
     "        __syncthreads();\n"
     "    }\n"
-    "    int yr0 = tok_base + gid;\n"
-    "    int yr1 = tok_base + gid + 8;\n"
+    "    int yr0 = tok_base + gid, yr1 = tok_base + gid + 8;\n"
     "#pragma unroll\n"
     "    for (int nt = 0; nt < GEMM_N_TILE; nt++) {\n"
-    "        int yc0 = out_base + nt * 8 + tid4 * 2;\n"
-    "        int yc1 = yc0 + 1;\n"
+    "        int yc0 = out_base + nt * 8 + tid4 * 2, yc1 = yc0 + 1;\n"
     "        float bv0 = (bias && yc0 < n_out) ? bias[yc0] : 0.0f;\n"
     "        float bv1 = (bias && yc1 < n_out) ? bias[yc1] : 0.0f;\n"
-    "        if (yr0 < n_tok && yc0 < n_out) Y[yr0 * n_out + yc0] = d0[nt] + bv0;\n"
-    "        if (yr0 < n_tok && yc1 < n_out) Y[yr0 * n_out + yc1] = d1[nt] + bv1;\n"
-    "        if (yr1 < n_tok && yc0 < n_out) Y[yr1 * n_out + yc0] = d2[nt] + bv0;\n"
-    "        if (yr1 < n_tok && yc1 < n_out) Y[yr1 * n_out + yc1] = d3[nt] + bv1;\n"
+    "        if (yr0 < n_tok && yc0 < n_out) Y[yr0*n_out+yc0] = d0[nt]+bv0;\n"
+    "        if (yr0 < n_tok && yc1 < n_out) Y[yr0*n_out+yc1] = d1[nt]+bv1;\n"
+    "        if (yr1 < n_tok && yc0 < n_out) Y[yr1*n_out+yc0] = d2[nt]+bv0;\n"
+    "        if (yr1 < n_tok && yc1 < n_out) Y[yr1*n_out+yc1] = d3[nt]+bv1;\n"
     "    }\n"
     "}\n"
     "#endif\n"
-    "}\n";  /* close extern "C" */
+    "}\n";
 
-    fprintf(stderr, "Kernel source length: %zu\n", strlen(fp8_test_src));
-    int rc = cu_compile_kernels(&module, dev, fp8_test_src,
-                                 "test_fp8.cu", 1, "test_fp8");
-    if (rc < 0) { fprintf(stderr, "Kernel compilation failed\n"); return 1; }
-    fprintf(stderr, "Kernels compiled OK\n");
+    CUmodule module;
+    int rc = cu_compile_kernels(&module, dev, src, "fp8.cu", 1, "fp8_test");
+    if (rc < 0) return 1;
 
     CUfunction gemm_fp8;
-    CUresult frc = cuModuleGetFunction(&gemm_fp8, module, "gemm_fp8_f32");
-    if (frc != CUDA_SUCCESS || !gemm_fp8) {
-        fprintf(stderr, "gemm_fp8_f32 not found (sm_%d < 89?)\n", sm);
-        return 1;
+    if (cuModuleGetFunction(&gemm_fp8, module, "gemm_fp8_f32") != CUDA_SUCCESS) {
+        fprintf(stderr, "gemm_fp8_f32 not found\n"); return 1;
     }
-    fprintf(stderr, "gemm_fp8_f32 loaded OK\n");
+    fprintf(stderr, "gemm_fp8_f32 loaded OK\n\n");
 
     CUstream stream;
     cuStreamCreate(&stream, 0);
 
-    /* Test sizes */
+    /* Test sizes: {n_out, n_in, n_tok} */
     int tests[][3] = {
-        /* {n_out, n_in, n_tok} */
-        {8, 32, 16},       /* minimal: single MMA tile */
-        {64, 64, 16},      /* one warp tile */
-        {256, 256, 16},    /* multi-warp */
-        {3072, 64, 256},   /* img_in projection size */
-        {3072, 3072, 16},  /* attention QKV size */
-        {0, 0, 0}          /* sentinel */
+        {8, 32, 16},         /* minimal MMA tile */
+        {64, 64, 16},        /* one warp tile */
+        {256, 256, 16},      /* multi-warp */
+        {3072, 64, 256},     /* img_in projection */
+        {3072, 3072, 16},    /* attention QKV (16 tok) */
+        {3072, 3072, 256},   /* attention QKV (256 tok) */
+        {18432, 3072, 1},    /* modulation (1 tok) */
+        {12288, 3072, 256},  /* MLP fc1 */
+        {0, 0, 0}
     };
 
+    int all_pass = 1;
     for (int ti = 0; tests[ti][0]; ti++) {
         int n_out = tests[ti][0], n_in = tests[ti][1], n_tok = tests[ti][2];
-        int wn = n_out * n_in, xn = n_tok * n_in, yn = n_tok * n_out;
+        size_t wn = (size_t)n_out * n_in, xn = (size_t)n_tok * n_in, yn = (size_t)n_tok * n_out;
 
-        fprintf(stderr, "\n=== Test %d: Y[%d,%d] = X[%d,%d] @ W[%d,%d]^T ===\n",
+        fprintf(stderr, "Test %d: Y[%d,%d] = X[%d,%d] @ W[%d,%d]^T ... ",
                 ti, n_tok, n_out, n_tok, n_in, n_out, n_in);
+        fflush(stderr);
 
-        /* Generate random matrices */
         float *X = (float *)malloc(xn * sizeof(float));
         float *W_f32 = (float *)malloc(wn * sizeof(float));
         uint8_t *W_fp8 = (uint8_t *)malloc(wn);
+        float *X_fp8_f32 = (float *)malloc(xn * sizeof(float)); /* X quantized to FP8, stored as F32 */
+        float *W_fp8_f32 = (float *)malloc(wn * sizeof(float)); /* W dequanted to F32 */
         float *Y_ref = (float *)calloc(yn, sizeof(float));
         float *Y_fp8_ref = (float *)calloc(yn, sizeof(float));
         float *Y_gpu = (float *)calloc(yn, sizeof(float));
 
         srand(42 + ti);
-        for (int i = 0; i < xn; i++) X[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-        for (int i = 0; i < wn; i++) {
+        for (size_t i = 0; i < xn; i++) X[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+        for (size_t i = 0; i < wn; i++) {
             W_f32[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-            W_fp8[i] = f32_to_fp8(W_f32[i]);
+            W_fp8[i] = f32_to_fp8_fast(W_f32[i]);
+            W_fp8_f32[i] = fp8_to_f32(W_fp8[i]);
         }
+        /* Pre-quantize X to FP8 for CPU reference */
+        for (size_t i = 0; i < xn; i++)
+            X_fp8_f32[i] = fp8_to_f32(f32_to_fp8_fast(X[i]));
 
-        /* CPU references */
-        cpu_gemm_f32(Y_ref, W_f32, X, n_out, n_in, n_tok);
-        cpu_gemm_fp8(Y_fp8_ref, W_fp8, X, n_out, n_in, n_tok);
-
-        fprintf(stderr, "  CPU F32 ref: rms=%.4f\n", rms(Y_ref, yn));
-        fprintf(stderr, "  CPU FP8 ref: rms=%.4f  corr_vs_f32=%.6f  max_err=%.4f\n",
-                rms(Y_fp8_ref, yn), correlation(Y_ref, Y_fp8_ref, yn),
-                max_abs_err(Y_ref, Y_fp8_ref, yn));
+        /* CPU F32 reference */
+        cpu_gemm_mt(Y_ref, W_f32, X, n_out, n_in, n_tok, n_threads);
+        /* CPU FP8 reference (both inputs quantized to FP8, accumulated in F32) */
+        cpu_gemm_mt(Y_fp8_ref, W_fp8_f32, X_fp8_f32, n_out, n_in, n_tok, n_threads);
 
         /* GPU FP8 GEMM */
         CUdeviceptr d_X, d_W, d_Y;
         cuMemAlloc(&d_X, xn * sizeof(float));
-        cuMemAlloc(&d_W, wn);  /* FP8 = 1 byte per element */
+        cuMemAlloc(&d_W, wn);
         cuMemAlloc(&d_Y, yn * sizeof(float));
         cuMemcpyHtoD(d_X, X, xn * sizeof(float));
         cuMemcpyHtoD(d_W, W_fp8, wn);
-        cuMemsetD32(d_Y, 0, yn);
+        cuMemsetD32(d_Y, 0, (unsigned int)yn);
 
-        CUdeviceptr d_bias = 0;  /* no bias */
+        CUdeviceptr d_bias = 0;
         void *args[] = {&d_Y, &d_W, &d_X, &d_bias, &n_out, &n_in, &n_tok};
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok + 15) / 16);
-        CUresult lr = cuLaunchKernel(gemm_fp8, gx, gy, 1, 128, 1, 1,
-                                      16 * 32 * sizeof(float), stream, args, NULL);
-        if (lr != CUDA_SUCCESS)
-            fprintf(stderr, "  Launch FAILED: %d\n", (int)lr);
+        cuLaunchKernel(gemm_fp8, gx, gy, 1, 128, 1, 1,
+                       16 * 32 * sizeof(float), stream, args, NULL);
         cuStreamSynchronize(stream);
-
         cuMemcpyDtoH(Y_gpu, d_Y, yn * sizeof(float));
 
-        /* Compare */
-        float corr_gpu_f32 = correlation(Y_ref, Y_gpu, yn);
-        float corr_gpu_fp8 = correlation(Y_fp8_ref, Y_gpu, yn);
-        float mae_gpu_fp8 = max_abs_err(Y_fp8_ref, Y_gpu, yn);
-        fprintf(stderr, "  GPU FP8:     rms=%.4f  corr_vs_f32=%.6f  corr_vs_fp8_ref=%.6f  max_err_vs_fp8=%.4f\n",
-                rms(Y_gpu, yn), corr_gpu_f32, corr_gpu_fp8, mae_gpu_fp8);
+        /* Check NaN */
+        int nans = 0;
+        for (size_t i = 0; i < yn; i++) if (Y_gpu[i] != Y_gpu[i]) nans++;
 
-        /* Check for NaN */
-        int nan_count = 0;
-        for (int i = 0; i < yn; i++) if (Y_gpu[i] != Y_gpu[i]) nan_count++;
-        if (nan_count) fprintf(stderr, "  WARNING: %d NaN values!\n", nan_count);
+        float corr_fp8 = correlation(Y_fp8_ref, Y_gpu, (int)yn);
+        float mae = max_abs_err(Y_fp8_ref, Y_gpu, (int)yn);
+        float corr_f32 = correlation(Y_ref, Y_gpu, (int)yn);
 
-        /* Print first few values for debugging */
-        fprintf(stderr, "  Y_ref[0:4]:     ");
-        for (int i = 0; i < 4 && i < yn; i++) fprintf(stderr, "%.4f ", Y_ref[i]);
-        fprintf(stderr, "\n  Y_fp8_ref[0:4]: ");
-        for (int i = 0; i < 4 && i < yn; i++) fprintf(stderr, "%.4f ", Y_fp8_ref[i]);
-        fprintf(stderr, "\n  Y_gpu[0:4]:     ");
-        for (int i = 0; i < 4 && i < yn; i++) fprintf(stderr, "%.4f ", Y_gpu[i]);
-        fprintf(stderr, "\n");
-
-        if (corr_gpu_fp8 < 0.99f)
-            fprintf(stderr, "  *** FAIL: GPU-FP8 correlation too low (%.4f < 0.99) ***\n", corr_gpu_fp8);
-        else
-            fprintf(stderr, "  PASS\n");
+        int pass = (corr_fp8 > 0.999f && nans == 0);
+        fprintf(stderr, "%s  corr_fp8=%.6f  corr_f32=%.6f  mae=%.4f  rms=%.3f%s\n",
+                pass ? "PASS" : "FAIL", corr_fp8, corr_f32, mae, rms(Y_gpu, (int)yn),
+                nans ? "  NaN!" : "");
+        if (!pass) {
+            all_pass = 0;
+            fprintf(stderr, "  Y_ref[0:4]:     %.4f %.4f %.4f %.4f\n",
+                    Y_ref[0], yn>1?Y_ref[1]:0, yn>2?Y_ref[2]:0, yn>3?Y_ref[3]:0);
+            fprintf(stderr, "  Y_fp8_ref[0:4]: %.4f %.4f %.4f %.4f\n",
+                    Y_fp8_ref[0], yn>1?Y_fp8_ref[1]:0, yn>2?Y_fp8_ref[2]:0, yn>3?Y_fp8_ref[3]:0);
+            fprintf(stderr, "  Y_gpu[0:4]:     %.4f %.4f %.4f %.4f\n",
+                    Y_gpu[0], yn>1?Y_gpu[1]:0, yn>2?Y_gpu[2]:0, yn>3?Y_gpu[3]:0);
+        }
 
         cuMemFree(d_X); cuMemFree(d_W); cuMemFree(d_Y);
-        free(X); free(W_f32); free(W_fp8); free(Y_ref); free(Y_fp8_ref); free(Y_gpu);
+        free(X); free(W_f32); free(W_fp8); free(X_fp8_f32); free(W_fp8_f32);
+        free(Y_ref); free(Y_fp8_ref); free(Y_gpu);
     }
 
+    fprintf(stderr, "\n%s\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     cuStreamDestroy(stream);
     cuCtxDestroy(ctx);
-    return 0;
+    return all_pass ? 0 : 1;
 }
