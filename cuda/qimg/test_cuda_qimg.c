@@ -87,6 +87,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--test-init") == 0) mode = "init";
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
+        else if (strcmp(argv[i], "--test-vae") == 0) mode = "vae";
         else if (strcmp(argv[i], "--generate") == 0) mode = "gen";
         else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
         else if (strcmp(argv[i], "--no-cfg") == 0) no_cfg = 1;
@@ -126,6 +127,53 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "load") == 0) {
         cuda_qimg_load_vae(r, vae_path);
+        cuda_qimg_free(r); return 0;
+    }
+
+    /* ---- test-vae: decode a .npy latent ---- */
+    if (strcmp(mode, "vae") == 0) {
+        const char *lat_npy = "../../ref/qwen_image/output/ground_truth_comfyui_512_latent.npy";
+        for (int i = 1; i < argc; i++)
+            if (strcmp(argv[i], "--latent") == 0 && i+1 < argc) lat_npy = argv[++i];
+
+        FILE *fp = fopen(lat_npy, "rb");
+        if (!fp) { fprintf(stderr, "Cannot open %s\n", lat_npy); return 1; }
+        uint8_t hdr[10]; fread(hdr,1,10,fp);
+        int hl = (int)hdr[8] | ((int)hdr[9]<<8);
+        char hbuf[512]; fseek(fp,10,SEEK_SET); fread(hbuf,1,(size_t)hl,fp); hbuf[hl]=0;
+        fprintf(stderr, "Latent header: %s\n", hbuf);
+
+        /* Parse shape — support both (1,16,H,W) and (1,16,1,H,W) */
+        int dims[5]={0}, ndims=0;
+        char *sp = strchr(hbuf, '('); if (sp) { sp++;
+            while(*sp && *sp != ')' && ndims < 5) {
+                while(*sp == ' ') sp++;
+                if (*sp >= '0' && *sp <= '9') { dims[ndims++] = atoi(sp); while(*sp>='0'&&*sp<='9') sp++; }
+                if (*sp == ',') sp++;
+            }
+        }
+        int lc, lh, lw;
+        if (ndims == 5) { lc=dims[1]; lh=dims[3]; lw=dims[4]; }
+        else if (ndims == 4) { lc=dims[1]; lh=dims[2]; lw=dims[3]; }
+        else { fprintf(stderr, "Unexpected shape\n"); return 1; }
+        fprintf(stderr, "Latent: [%d, %d, %d]\n", lc, lh, lw);
+
+        fseek(fp, 10+hl, SEEK_SET);
+        size_t lat_n = (size_t)lc * lh * lw;
+        float *latent_raw = (float *)malloc(lat_n * sizeof(float));
+        /* For 5D [1,16,1,H,W], read all and reshape to [16,H,W] */
+        fread(latent_raw, sizeof(float), lat_n, fp);
+        fclose(fp);
+
+        cuda_qimg_load_vae(r, vae_path);
+        int oh = lh * 8, ow = lw * 8;
+        float *rgb = (float *)malloc((size_t)3 * oh * ow * sizeof(float));
+        t0 = clock();
+        cuda_qimg_vae_decode(r, latent_raw, lh, lw, rgb);
+        fprintf(stderr, "VAE decode: %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+
+        save_ppm("cuda_qimg_vae_test.ppm", rgb, oh, ow);
+        free(latent_raw); free(rgb);
         cuda_qimg_free(r); return 0;
     }
 
@@ -290,12 +338,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
             latent[i] = randn();
 
-        /* Scheduler */
+        /* Scheduler — match ComfyUI's AuraFlow shift=3.1 */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
-        /* Use ComfyUI-compatible scheduler: shift=3.1, timestep=sigma */
-        /* Use original dynamic scheduler (better stability than AuraFlow shift=3.1) */
-        qimg_sched_set_timesteps(&sched, n_steps, n_img);
+        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f);
 
         float cfg_scale = 2.5f;  /* ComfyUI default for Qwen-Image */
 
