@@ -447,61 +447,100 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 
-/* Tiled self-attention: Q[N,dim], K[N,dim], V[N,dim] → out[N,dim]
- * Grid: (n_heads), Block: (128) — 4 warps per head.
- * Each block processes ALL queries for one head sequentially.
- * Uses online softmax (single pass over K/V).
- * head_dim=128: 4 elements per thread (128 threads / 32 = 4 warps, not used for parallelism here). */
-"__global__ void tiled_attn_f32(float *__restrict__ out,\n"
+/* Warp-cooperative flash attention for head_dim=128.
+ * Q[N,dim], K[N,dim], V[N,dim] → out[N,dim], dim = n_heads * head_dim.
+ *
+ * Design: one warp (32 threads) per query. Each thread handles 4 elements
+ * of head_dim=128 (128/32=4). Dot products via warp shuffle. K/V loaded
+ * in tiles of FA2_BKV into shared memory for reuse across warps.
+ *
+ * Grid: (n_heads, ceil(N / FA2_WARPS))
+ * Block: (32 * FA2_WARPS) threads
+ * Shared mem: FA2_BKV * 128 * 2 * sizeof(float) for K+V tiles
+ *
+ * Register budget per thread: q[4] + O[4] + m + l + 8 misc ≈ 18 regs → high occupancy.
+ */
+"#define FA2_WARPS   4\n"  /* queries per block (warps per block) */
+"#define FA2_BKV    16\n"  /* KV tile size */
+"#define FA2_HD    128\n"  /* head_dim */
+"#define FA2_EPT     4\n"  /* elements per thread (128/32) */
+"\n"
+"__global__ void flash_attn_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ Q, const float *__restrict__ K,\n"
 "    const float *__restrict__ V,\n"
 "    int N, int n_heads, int head_dim) {\n"
-"    int h = blockIdx.x;\n"
+"    int h  = blockIdx.x;\n"
 "    if (h >= n_heads) return;\n"
 "    int dim = n_heads * head_dim;\n"
-"    int tid = threadIdx.x;\n"  /* 0..127 */
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane    = threadIdx.x % 32;\n"
+"    int qi = blockIdx.y * FA2_WARPS + warp_id;\n"
 "    float scale = rsqrtf((float)head_dim);\n"
 "\n"
-"    /* Process each query sequentially */\n"
-"    for (int qi = 0; qi < N; qi++) {\n"
-"        /* Each thread handles one element of head_dim (tid maps to dim index) */\n"
-"        float q_val = (tid < head_dim) ? Q[qi * dim + h * head_dim + tid] : 0.0f;\n"
+"    /* Load Q for this query into registers (4 elements per thread) */\n"
+"    float q_r[FA2_EPT];\n"
+"    for (int e = 0; e < FA2_EPT; e++) {\n"
+"        int d = lane * FA2_EPT + e;\n"
+"        q_r[e] = (qi < N && d < head_dim) ? Q[qi * dim + h * head_dim + d] : 0.0f;\n"
+"    }\n"
 "\n"
-"        /* Online softmax: track running max + sum + weighted V accumulation */\n"
-"        float row_max = -1e30f;\n"
-"        float row_sum = 0.0f;\n"
-"        float acc = 0.0f;\n"  /* accumulator for output[tid] */
+"    /* Online softmax accumulators */\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O_r[FA2_EPT];\n"
+"    for (int e = 0; e < FA2_EPT; e++) O_r[e] = 0.0f;\n"
 "\n"
-"        for (int j = 0; j < N; j++) {\n"
-"            /* Compute Q·K dot product using warp shuffle */\n"
-"            float kv = (tid < head_dim) ? K[j * dim + h * head_dim + tid] : 0.0f;\n"
-"            float dot = q_val * kv;\n"
-"            /* Reduce across all 128 threads (4 warps) using shared memory */\n"
-"            __shared__ float reduce_buf[128];\n"
-"            reduce_buf[tid] = dot;\n"
-"            __syncthreads();\n"
-"            /* Tree reduction */\n"
-"            for (int s = 64; s > 0; s >>= 1) {\n"
-"                if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];\n"
-"                __syncthreads();\n"
-"            }\n"
-"            float score = reduce_buf[0] * scale;\n"
-"            __syncthreads();\n"
+"    /* Shared memory for K/V tiles: [FA2_BKV][128] × 2 */\n"
+"    extern __shared__ float smem[];\n"
+"    float *smK = smem;\n"
+"    float *smV = smem + FA2_BKV * FA2_HD;\n"
+"\n"
+"    int n_tiles = (N + FA2_BKV - 1) / FA2_BKV;\n"
+"    int n_threads = FA2_WARPS * 32;\n"
+"\n"
+"    for (int tile = 0; tile < n_tiles; tile++) {\n"
+"        int kv_base = tile * FA2_BKV;\n"
+"\n"
+"        /* Cooperative load: all threads load K/V tile */\n"
+"        for (int idx = threadIdx.x; idx < FA2_BKV * FA2_HD; idx += n_threads) {\n"
+"            int kj = idx / FA2_HD, d = idx % FA2_HD;\n"
+"            int kv_tok = kv_base + kj;\n"
+"            smK[idx] = (kv_tok < N) ? K[kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"            smV[idx] = (kv_tok < N) ? V[kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        /* Compute attention scores for this tile (FA2_BKV keys) */\n"
+"        for (int kj = 0; kj < FA2_BKV; kj++) {\n"
+"            /* Dot product Q·K[kj] distributed across warp */\n"
+"            float dot = 0.0f;\n"
+"            for (int e = 0; e < FA2_EPT; e++)\n"
+"                dot += q_r[e] * smK[kj * FA2_HD + lane * FA2_EPT + e];\n"
+"            /* Warp shuffle reduction (5 rounds for 32 lanes) */\n"
+"            for (int off = 16; off > 0; off >>= 1)\n"
+"                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);\n"
+"            /* dot is now the full Q·K score in all lanes */\n"
+"            float score = (kv_base + kj < N) ? dot * scale : -1e30f;\n"
 "\n"
 "            /* Online softmax update */\n"
-"            float new_max = fmaxf(row_max, score);\n"
-"            float exp_old = expf(row_max - new_max);\n"
-"            float exp_new = expf(score - new_max);\n"
-"            row_sum = row_sum * exp_old + exp_new;\n"
-"            acc = acc * exp_old;\n"  /* rescale previous accumulation */
-"            float v_val = (tid < head_dim) ? V[j * dim + h * head_dim + tid] : 0.0f;\n"
-"            acc += exp_new * v_val;\n"
-"            row_max = new_max;\n"
+"            float new_max = fmaxf(m_i, score);\n"
+"            float alpha = expf(m_i - new_max);\n"
+"            float p = expf(score - new_max);\n"
+"            l_i = l_i * alpha + p;\n"
+"            for (int e = 0; e < FA2_EPT; e++) {\n"
+"                O_r[e] = O_r[e] * alpha + p * smV[kj * FA2_HD + lane * FA2_EPT + e];\n"
+"            }\n"
+"            m_i = new_max;\n"
 "        }\n"
+"        __syncthreads();\n"
+"    }\n"
 "\n"
-"        /* Write output */\n"
-"        if (tid < head_dim) {\n"
-"            out[qi * dim + h * head_dim + tid] = acc / row_sum;\n"
+"    /* Write output: O / l */\n"
+"    if (qi < N) {\n"
+"        float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;\n"
+"        for (int e = 0; e < FA2_EPT; e++) {\n"
+"            int d = lane * FA2_EPT + e;\n"
+"            if (d < head_dim)\n"
+"                out[qi * dim + h * head_dim + d] = O_r[e] * inv_l;\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -857,14 +896,20 @@ static void op_gated_add(cuda_qimg_runner *r, CUdeviceptr x, CUdeviceptr proj,
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
                     CUdeviceptr d_k, CUdeviceptr d_v,
                     int n_tok, int n_heads, int head_dim) {
-    /* tiled_attn_f32: one block per head, 128 threads (= head_dim).
-     * Online softmax, single pass over K/V per query. All on GPU. */
+    /* flash_attn_f32: warp-cooperative, FA2_WARPS queries per block.
+     * Each warp handles one query, 32 threads × 4 elems = 128 head_dim.
+     * Grid: (n_heads, ceil(n_tok/FA2_WARPS)), Block: (32*FA2_WARPS) */
+    int fa2_warps = 4;  /* must match FA2_WARPS in kernel */
+    int fa2_bkv = 16;   /* must match FA2_BKV in kernel */
+    unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
+    unsigned n_threads = (unsigned)(32 * fa2_warps);
+    /* Shared mem: 2 × BKV × 128 floats for K+V tiles */
+    size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
     void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
     cuLaunchKernel(r->attn_prefill_f32,
-                   (unsigned)n_heads, 1, 1,
-                   128, 1, 1,
-                   128 * sizeof(float),  /* shared mem for dot product reduction */
-                   r->stream, args, NULL);
+                   (unsigned)n_heads, gy, 1,
+                   n_threads, 1, 1,
+                   smem, r->stream, args, NULL);
 }
 
 
@@ -930,7 +975,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(layernorm_f32, "layernorm_f32");
     GET(gelu_f32, "gelu_f32");
     GET(silu_f32, "silu_f32");
-    GET(attn_prefill_f32, "tiled_attn_f32");
+    GET(attn_prefill_f32, "flash_attn_f32");
     GET(add_bias_f32, "add_bias_f32");
     GET(rmsnorm_per_head, "rmsnorm_per_head_f32");
     GET(adaln_modulate, "adaln_modulate_f32");
