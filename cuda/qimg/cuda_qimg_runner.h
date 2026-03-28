@@ -601,6 +601,7 @@ struct cuda_qimg_runner {
     CUfunction adaln_modulate;
     CUfunction dequant_fp8_to_f16;  /* GPU-side FP8→F16 via LUT */
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
+    int use_f16_gemm;  /* 1 to use F16 weights + gemm_f16_f32 (better precision) */
     CUfunction gated_add;
     CUfunction patchify;
     CUfunction unpatchify;
@@ -790,11 +791,13 @@ static int qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b
     char name[256];
     int ok = 1;
 
-    /* Upload weight: FP8 raw for native GEMM, or F32 for precision */
+    /* Upload weight: FP8 raw for native GEMM, F16 for MMA, or F32 fallback */
     #define BLK_W(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         if (r->use_fp8_gemm) { \
             b->field = qimg_st_upload_fp8_raw(st, name); \
+        } else if (r->use_f16_gemm) { \
+            b->field = qimg_st_upload_f16(st, name); \
         } else { \
             b->field = qimg_st_upload_f32(st, name); \
         } \
@@ -857,15 +860,19 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
     unsigned gx = (unsigned)((n_out + 255) / 256);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
 
-    if (r->use_fp8_gemm) {
-        /* gemm_fp8w_f32: W stays as raw FP8 bytes, dequanted to F32 via LUT
-         * in shared memory. X stays F32. F32 accumulation.
+    if (r->use_f16_gemm) {
+        /* gemm_f16_f32: F16 weights (MMA tensor cores), F32 inputs+accumulation.
+         * Grid: (ceil(n_out/256), ceil(n_tok/16)), Block: (128) */
+        cuLaunchKernel(r->gemm_f16_f32, gx, gy, 1, 128, 1, 1,
+                       16 * 16 * sizeof(float), r->stream, args, NULL);
+    } else if (r->use_fp8_gemm) {
+        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 accumulation.
          * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_fp8w_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
     } else {
-        /* gemm_f32_f32: W is F32, pure F32 compute.
+        /* gemm_f32_f32: pure F32 fallback.
          * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_f32_f32, gx64, gy, 1, 16, 16, 1,
@@ -1043,6 +1050,8 @@ static CUdeviceptr qimg_upload_weight_auto(cuda_qimg_runner *r,
                                             st_context *st, const char *name) {
     if (r->use_fp8_gemm)
         return qimg_st_upload_fp8_raw(st, name);
+    if (r->use_f16_gemm)
+        return qimg_st_upload_f16(st, name);
     /* F32 path: dequant FP8→F32 on CPU, upload F32 (highest precision) */
     return qimg_st_upload_f32(st, name);
 }
@@ -1092,7 +1101,11 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         size_t free_mem = 0, total_mem = 0;
         cuMemGetInfo(&free_mem, &total_mem);
         /* Block size: FP8=1 byte, F32=4 bytes per element */
-        size_t block_bytes = r->use_fp8_gemm ? (324 * 1024 * 1024) : (1296ULL * 1024 * 1024);
+        /* Block size: FP8=1B, F16=2B, F32=4B per weight element (~324M params/block) */
+        size_t block_bytes;
+        if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
+        else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
+        else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
         size_t workspace = 2ULL * 1024 * 1024 * 1024; /* 2GB reserved for activations + scratch */
         int max_preload = (int)((free_mem - workspace) / block_bytes);
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
