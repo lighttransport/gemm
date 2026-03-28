@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
 
     /* ---- Init CUDA ---- */
     cuda_qimg_runner *r = cuda_qimg_init(0, 1);
-    if (r) r->verbose = 2;  /* enable debug dumps */
+    if (r) r->verbose = 3;  /* 3 = save block 0 intermediates to .bin files */
     if (r && force_f16 == 1) { r->use_fp8_gemm = 0; fprintf(stderr, "Forced F32 GEMM path\n"); }
     if (r && force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; fprintf(stderr, "Forced F16 MMA path\n"); }
     if (r && force_f16 == 3) { r->use_bf16_trunc = 1; fprintf(stderr, "BF16 truncation enabled\n"); }
