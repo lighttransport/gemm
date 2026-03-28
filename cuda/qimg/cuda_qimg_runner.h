@@ -378,6 +378,18 @@ static const char *qimg_kernel_src =
 "    out[idx] = inp[c * H * W + iy * W + ix];\n"
 "}\n"
 
+/* Truncate F32 to BF16 precision in-place (simulate BF16 compute).
+ * This matches the training precision (BF16) by rounding F32 intermediates
+ * to 7 mantissa bits after each operation. Grid: ceil(n/256), Block: 256 */
+"__global__ void truncate_bf16_f32(float *__restrict__ x, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    unsigned int bits;\n"
+"    memcpy(&bits, &x[i], 4);\n"
+"    bits &= 0xFFFF0000u;  /* zero lower 16 bits (truncate to BF16) */\n"
+"    memcpy(&x[i], &bits, 4);\n"
+"}\n"
+
 /* RMSNorm with weight: x[N, dim] *= rsqrt(mean(x^2)) * w[dim]
  * Grid: (N), Block: (256) */
 "__global__ void rmsnorm_weighted_f32(float *__restrict__ x,\n"
@@ -602,6 +614,8 @@ struct cuda_qimg_runner {
     CUfunction dequant_fp8_to_f16;  /* GPU-side FP8→F16 via LUT */
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
     int use_f16_gemm;  /* 1 to use F16 weights + gemm_f16_f32 (better precision) */
+    CUfunction truncate_bf16;
+    int use_bf16_trunc;  /* 1 to truncate intermediates to BF16 precision */
     CUfunction gated_add;
     CUfunction patchify;
     CUfunction unpatchify;
@@ -852,6 +866,7 @@ static void qimg_free_block(qimg_block_gpu *b) {
 
 
 /* ---- Op launch helpers ---- */
+static void op_bf16_trunc(cuda_qimg_runner *r, CUdeviceptr x, int n);  /* forward decl */
 
 static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
@@ -866,7 +881,7 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         cuLaunchKernel(r->gemm_f16_f32, gx, gy, 1, 128, 1, 1,
                        16 * 16 * sizeof(float), r->stream, args, NULL);
     } else if (r->use_fp8_gemm) {
-        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 accumulation.
+        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 inputs.
          * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_fp8w_f32, gx64, gy, 1, 16, 16, 1,
@@ -878,18 +893,30 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         cuLaunchKernel(r->gemm_f32_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
     }
+    /* Truncate GEMM output to BF16 precision (simulate BF16 training compute) */
+    op_bf16_trunc(r, Y, n_out * n_tok);
+}
+
+/* Truncate buffer to BF16 precision (if enabled) */
+static void op_bf16_trunc(cuda_qimg_runner *r, CUdeviceptr x, int n) {
+    if (!r->use_bf16_trunc) return;
+    void *args[] = {&x, &n};
+    cuLaunchKernel(r->truncate_bf16, (unsigned)((n+255)/256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static void op_silu(cuda_qimg_runner *r, CUdeviceptr x, int n) {
     void *args[] = {&x, &n};
     cuLaunchKernel(r->silu_f32, (unsigned)((n+255)/256), 1, 1, 256, 1, 1,
                    0, r->stream, args, NULL);
+    op_bf16_trunc(r, x, n);
 }
 
 static void op_gelu(cuda_qimg_runner *r, CUdeviceptr x, int n) {
     void *args[] = {&x, &n};
     cuLaunchKernel(r->gelu_f32, (unsigned)((n+255)/256), 1, 1, 256, 1, 1,
                    0, r->stream, args, NULL);
+    op_bf16_trunc(r, x, n);
 }
 
 static void op_adaln(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr x,
@@ -1011,6 +1038,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(vae_silu, "vae_silu_f32");
     GET(nn_upsample2x, "nn_upsample2x_f32");
     GET(rmsnorm_weighted, "rmsnorm_weighted_f32");
+    GET(truncate_bf16, "truncate_bf16_f32");
     GET(dequant_fp8_to_f16, "dequant_fp8_to_f16");
     #undef GET
 
