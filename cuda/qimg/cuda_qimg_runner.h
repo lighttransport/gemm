@@ -1360,14 +1360,26 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         CUdeviceptr txt_g2  = d_txt_mod + (size_t)5 * dim * sizeof(float);
 
         /* adaLN image → d_scratch1 */
-        if (L == 0) {
+        if (L == 0 && r->verbose >= 2) {
             DUMP_MAX("img_input", d_img, n_img*dim);
             DUMP_MAX("img_mod_shift1", img_sh1, dim);
             DUMP_MAX("img_mod_scale1", img_sc1, dim);
             DUMP_MAX("img_mod_gate1", img_g1, dim);
         }
         op_adaln(r, d_scratch1, d_img, img_sh1, img_sc1, n_img, dim);
-        if (L == 0) { DUMP_MAX("img_adaln", d_scratch1, n_img*dim); }
+        if (L == 0 && r->verbose >= 2) { DUMP_MAX("img_adaln", d_scratch1, n_img*dim); }
+        /* Save block 0 intermediates for comparison */
+        if (L == 0 && r->verbose >= 3) {
+            #define SAVE_GPU(name, ptr, cnt) do { \
+                float *_t = (float*)malloc((cnt)*sizeof(float)); \
+                cuStreamSynchronize(s); cuMemcpyDtoH(_t, ptr, (cnt)*sizeof(float)); \
+                FILE *_f = fopen(name, "wb"); \
+                if (_f) { fwrite(_t, sizeof(float), cnt, _f); fclose(_f); \
+                    fprintf(stderr, "    Saved %s (%d floats)\n", name, (int)(cnt)); } \
+                free(_t); } while(0)
+            SAVE_GPU("cuda_img_projected.bin", d_img, n_img*dim);
+            SAVE_GPU("cuda_block0_adaln.bin", d_scratch1, n_img*dim);
+        }
         /* adaLN text → d_scratch2 */
         op_adaln(r, d_scratch2, d_txt, txt_sh1, txt_sc1, n_txt, dim);
 
@@ -1376,6 +1388,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         CUdeviceptr d_img_k = d_k + (size_t)n_txt * dim * sizeof(float);
         CUdeviceptr d_img_v = d_v + (size_t)n_txt * dim * sizeof(float);
         op_gemm(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img);
+        if (L == 0 && r->verbose >= 3) SAVE_GPU("cuda_block0_img_q.bin", d_img_q, n_img*dim);
         op_gemm(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img);
         op_gemm(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img);
 
@@ -1440,6 +1453,10 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_gemm(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
                 dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
+
+        /* Save block 0 output */
+        if (L == 0 && r->verbose >= 3)
+            SAVE_GPU("cuda_after_block0_img.bin", d_img, n_img*dim);
 
         /* Truncate block output to BF16 precision (matches ComfyUI's BF16 compute) */
         op_bf16_trunc(r, d_img, n_img * dim);
