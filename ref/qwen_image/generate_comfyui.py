@@ -144,7 +144,7 @@ def main():
     print(f"  VAE decoded in {time.time()-t0:.1f}s")
 
     # Save image (ComfyUI VAE returns [B, T, H, W, C] or [B, H, W, C] in [0,1])
-    img_np = images[0].cpu().float().numpy()
+    img_np = images[0].detach().cpu().float().numpy()
     while img_np.ndim > 3:
         img_np = img_np[0]  # remove batch/temporal dims until [H, W, C]
     img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
