@@ -101,20 +101,23 @@ void qimg_sched_set_timesteps_comfyui(qimg_scheduler *s, int n_steps, float shif
     if (n_steps > QIMG_SCHED_MAX_STEPS) n_steps = QIMG_SCHED_MAX_STEPS;
     s->n_steps = n_steps;
 
-    /* Simple linear sigmas from 1.0 to 0.0 */
+    float es = expf(shift);
+
+    /* ComfyUI convention: raw linear sigmas are used for Euler step sizes (dt).
+     * The AuraFlow shift is applied ONLY to compute the timestep passed to the model.
+     * This is critical: shifted sigmas compress the schedule (tiny dt), while
+     * raw sigmas give normal-sized steps matching the training distribution. */
     for (int i = 0; i <= n_steps; i++) {
-        float sigma = 1.0f - (float)i / (float)n_steps;
-        /* Apply AuraFlow shift: sigma_shifted = exp(shift) * sigma / (1 + (exp(shift)-1)*sigma) */
-        float es = expf(shift);
-        sigma = es * sigma / (1.0f + (es - 1.0f) * sigma);
-        s->sigmas[i] = sigma;
+        float sigma_raw = 1.0f - (float)i / (float)n_steps;
+        s->sigmas[i] = sigma_raw;  /* raw sigmas for dt */
     }
 
-    /* Timestep = sigma × multiplier.
-     * Qwen-Image default multiplier=1.0 (timestep = sigma ∈ [0,1]).
-     * The model's sinusoidal embedding handles this range directly. */
     for (int i = 0; i < n_steps; i++) {
-        s->timesteps[i] = s->sigmas[i] * multiplier;
+        /* Timestep: apply shift then multiply */
+        float sigma_raw = s->sigmas[i];
+        float sigma_shifted = es * sigma_raw / (1.0f + (es - 1.0f) * sigma_raw);
+        s->timesteps[i] = sigma_shifted * multiplier;
+        /* dt from RAW sigmas (not shifted) */
         s->dt[i] = s->sigmas[i + 1] - s->sigmas[i];
     }
 }
