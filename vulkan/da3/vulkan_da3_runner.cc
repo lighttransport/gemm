@@ -1509,8 +1509,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     /* Initialize local_hidden = hidden */
     bufferCopy(r->runner, r->local_hidden, r->hidden, (size_t)nt * dim * sizeof(float));
 
-    /* DEBUG: dump hidden before backbone */
-    if (r->verbose >= 1) {
+    /* dump hidden before backbone (verbose >= 3) */
+    if (r->verbose >= 3) {
         std::vector<float> h_dbg(nt * dim);
         downloadFromBuffer(r->runner, r->hidden, h_dbg.data(), nt * dim * sizeof(float));
         float mn = h_dbg[0], mx = h_dbg[0], sum = 0;
@@ -1704,8 +1704,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
             }
         }
 
-        /* DEBUG: per-block backbone stats */
-        if (r->verbose >= 1) {
+        /* Per-block backbone stats */
+        if (r->verbose >= 2) {
             std::vector<float> h_dbg(nt * dim);
             downloadFromBuffer(r->runner, r->hidden, h_dbg.data(), nt * dim * sizeof(float));
             float mn = h_dbg[0], mx = h_dbg[0], sum = 0;
@@ -1718,8 +1718,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
     if (r->verbose >= 1) fprintf(stderr, "DA3: GPU backbone (%d blocks): %.1f ms\n", r->n_blocks, (t1 - t0) * 1000);
 
-    /* DEBUG: dump backbone hidden stats */
-    if (r->verbose >= 1) {
+    /* dump backbone hidden stats (verbose >= 3) */
+    if (r->verbose >= 3) {
         std::vector<float> h_dbg(nt * dim);
         downloadFromBuffer(r->runner, r->hidden, h_dbg.data(), nt * dim * sizeof(float));
         float mn = h_dbg[0], mx = h_dbg[0], sum = 0;
@@ -1768,8 +1768,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         opMatmulBias(r, r->dpt_proj, dw.proj_w[fi], r->dpt_ln, dw.proj_b[fi],
                      np, oc_val, head_dim_in);
 
-        /* DEBUG: DPT projection stats */
-        if (r->verbose >= 1 && fi == 0) {
+        /* DPT projection stats */
+        if (r->verbose >= 3 && fi == 0) {
             int pn = np * oc_val;
             std::vector<float> dbg(pn);
             downloadFromBuffer(r->runner, r->dpt_proj, dbg.data(), pn * sizeof(float));
@@ -1811,8 +1811,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         }
     }
 
-    /* DEBUG: adapted stats */
-    if (r->verbose >= 1) {
+    /* adapted stats (verbose >= 3) */
+    if (r->verbose >= 3) {
         for (int fi2 = 0; fi2 < 4; fi2++) {
             int an = feat * sp_h[fi2] * sp_w[fi2];
             std::vector<float> dbg(an);
@@ -1841,8 +1841,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
                  &r->dpt_fused, fh, fw, feat, r->dpt_fused, sp_h[0] * 2, sp_w[0] * 2);
     fh = sp_h[0] * 2; fw = sp_w[0] * 2;
 
-    /* DEBUG: fused stats after RefineNet */
-    if (r->verbose >= 1) {
+    /* fused stats after RefineNet (verbose >= 3) */
+    if (r->verbose >= 3) {
         int fn = feat * fh * fw;
         std::vector<float> dbg(fn);
         downloadFromBuffer(r->runner, r->dpt_fused, dbg.data(), fn * sizeof(float));
@@ -1860,8 +1860,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     opConv2d(r, r->dpt_tmp, r->dpt_fused, dw.neck_w, dw.neck_b,
              fh, fw, feat, feat_half, 3, 3, 1, 1);
 
-    /* DEBUG: neck output */
-    if (r->verbose >= 1) {
+    /* neck output (verbose >= 3) */
+    if (r->verbose >= 3) {
         int nn = feat_half * fh * fw;
         std::vector<float> dbg(nn);
         downloadFromBuffer(r->runner, r->dpt_tmp, dbg.data(), nn * sizeof(float));
@@ -1888,8 +1888,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
              model_h, model_w, feat_half, out_mid, 3, 3, 1, 1);
     opRelu(r, r->dpt_tmp, out_mid * model_h * model_w);
 
-    /* DEBUG: out_0+relu */
-    if (r->verbose >= 1) {
+    /* out_0+relu (verbose >= 3) */
+    if (r->verbose >= 3) {
         int nn = out_mid * model_h * model_w;
         std::vector<float> dbg(nn);
         downloadFromBuffer(r->runner, r->dpt_tmp, dbg.data(), nn * sizeof(float));
@@ -1906,8 +1906,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     /* Depth activation */
     opDepthActivation(r, r->dpt_out, fh * fw);
 
-    /* DEBUG: depth activation output stats */
-    if (r->verbose >= 1) {
+    /* depth activation output stats (verbose >= 3) */
+    if (r->verbose >= 3) {
         int dn = 2 * fh * fw;
         std::vector<float> dbg(dn);
         downloadFromBuffer(r->runner, r->dpt_out, dbg.data(), dn * sizeof(float));
