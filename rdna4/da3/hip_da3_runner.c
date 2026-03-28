@@ -163,14 +163,58 @@ static const char *hip_da3_specific_kernels =
 "    dst[idx] = sum;\n"
 "}\n"
 "\n"
-"/* ---- 15. dpt_cls_concat: extract patches + concat CLS ---- */\n"
+"/* ---- 15. dpt_cls_concat: extract patch tokens from [nt, 2*dim] features (skip CLS at index 0) ---- */\n"
 "__global__ void dpt_cls_concat(float *dst, const float *src, int np, int dim) {\n"
 "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int total = np * 2 * dim;\n"
+"    int dim2 = 2 * dim;\n"
+"    int total = np * dim2;\n"
 "    if (idx >= total) return;\n"
-"    int p = idx / (2 * dim);\n"
+"    /* src is [nt, 2*dim] where nt = np+1; skip token 0 (CLS) */\n"
+"    int p = idx / dim2;\n"
+"    int j = idx % dim2;\n"
+"    dst[idx] = src[(1 + p) * dim2 + j];\n"
+"}\n"
+"\n"
+"/* ---- 16. cat_local_global: interleave [local_x, x] per token for cat_token feature saving ---- */\n"
+"/* dst[t * 2*dim + j] = local[t*dim+j] for j<dim, else global[t*dim+(j-dim)] */\n"
+"__global__ void cat_local_global(float *dst, const float *local_buf, const float *global_buf, int nt, int dim) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = nt * 2 * dim;\n"
+"    if (idx >= total) return;\n"
+"    int t = idx / (2 * dim);\n"
 "    int j = idx % (2 * dim);\n"
-"    dst[idx] = (j < dim) ? src[(1 + p) * dim + j] : src[j - dim];\n"
+"    dst[idx] = (j < dim) ? local_buf[t * dim + j] : global_buf[t * dim + (j - dim)];\n"
+"}\n"
+"\n"
+"/* ---- 16b. strided_layernorm: apply LN to second half of [np, 2*dim] in-place ---- */\n"
+"/* Each row has 2*dim elements; normalize only elements [dim..2*dim-1] per row */\n"
+"__global__ void strided_layernorm_f32(float *data, const float *w, const float *b,\n"
+"                                       int np, int dim, int stride, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int p = blockIdx.x;\n"
+"    if (p >= np) return;\n"
+"    int tid = threadIdx.x;\n"
+"    float *row = data + (size_t)p * stride + dim;\n"
+"    float val = (tid < dim) ? row[tid] : 0.0f;\n"
+"    /* Reduce for mean — only count valid elements */\n"
+"    sdata[tid] = (tid < dim) ? val : 0.0f;\n"
+"    __syncthreads();\n"
+"    for (int r2 = blockDim.x/2; r2 > 0; r2 >>= 1) {\n"
+"        if (tid < r2) sdata[tid] += sdata[tid+r2];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float mean = sdata[0] / (float)dim;\n"
+"    /* Reduce for variance — only count valid elements (FIX v2) */\n"
+"    float d = (tid < dim) ? (val - mean) : 0.0f;\n"
+"    sdata[tid] = d * d;\n"
+"    __syncthreads();\n"
+"    for (int r2 = blockDim.x/2; r2 > 0; r2 >>= 1) {\n"
+"        if (tid < r2) sdata[tid] += sdata[tid+r2];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float var = sdata[0] / (float)dim;\n"
+"    float rstd = rsqrtf(var + eps);\n"
+"    if (tid < dim) row[tid] = (val - mean) * rstd * w[tid] + b[tid];\n"
 "}\n"
 "\n"
 "/* ---- 17. dpt_tok_to_chw: token-major [np,C] -> spatial CHW [C,H,W] ---- */\n"
@@ -253,6 +297,33 @@ static const char *hip_da3_specific_kernels =
 "        dst[c * HW + hw] = (src[c * HW + hw] - mean) * inv * (w ? w[c] : 1.0f) + (b ? b[c] : 0.0f);\n"
 "}\n"
 "\n"
+"/* ---- sinusoidal_uv_posembed: add sin/cos UV positional embedding in-place ---- */\n"
+"/* data: [C, H, W] CHW layout. quarter = C/4. */\n"
+"/* Channels 0..Q-1: sin(u*omega), Q..2Q-1: cos(u*omega), */\n"
+"/* 2Q..3Q-1: sin(v*omega), 3Q..4Q-1: cos(v*omega) */\n"
+"__global__ void sinusoidal_uv_posembed(float *data, int C, int H, int W,\n"
+"                                        float span_x, float span_y, float ratio) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = C * H * W;\n"
+"    if (idx >= total) return;\n"
+"    int c = idx / (H * W);\n"
+"    int hw = idx % (H * W);\n"
+"    int h = hw / W, w = hw % W;\n"
+"    int quarter = C / 4;\n"
+"    int band, is_cos;\n"
+"    float coord;\n"
+"    float u = (W > 1) ? span_x * (2.0f * w - (W - 1)) / (float)W : 0.0f;\n"
+"    float v = (H > 1) ? span_y * (2.0f * h - (H - 1)) / (float)H : 0.0f;\n"
+"    if (c < quarter) { band = c; coord = u; is_cos = 0; }\n"
+"    else if (c < 2*quarter) { band = c - quarter; coord = u; is_cos = 1; }\n"
+"    else if (c < 3*quarter) { band = c - 2*quarter; coord = v; is_cos = 0; }\n"
+"    else { band = c - 3*quarter; coord = v; is_cos = 1; }\n"
+"    float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);\n"
+"    float angle = coord * omega;\n"
+"    float emb = is_cos ? cosf(angle) : sinf(angle);\n"
+"    data[idx] += emb * ratio;\n"
+"}\n"
+"\n"
 "} /* extern C */\n"
 ;
 
@@ -324,6 +395,8 @@ struct hip_da3_runner {
     hipFunction_t fn_bilinear_upsample_f32;
     hipFunction_t fn_conv2d_f32;
     hipFunction_t fn_dpt_cls_concat;
+    hipFunction_t fn_cat_local_global;
+    hipFunction_t fn_strided_layernorm_f32;
     hipFunction_t fn_dpt_tok_to_chw;
     hipFunction_t fn_kv_transpose;
     hipFunction_t fn_resize_normalize;
@@ -332,6 +405,7 @@ struct hip_da3_runner {
     hipFunction_t fn_deconv_scatter_f32;
     hipFunction_t fn_groupnorm_f32;
     hipFunction_t fn_channel_layernorm_f32;
+    hipFunction_t fn_sinusoidal_uv_posembed;
     hipFunction_t fn_silu_f32;
 
     /* Model params */
@@ -347,6 +421,8 @@ struct hip_da3_runner {
     /* GPU weights */
     void *d_patch_embed_w, *d_patch_embed_b;
     void *d_cls_token, *d_pos_embed;
+    float *h_pos_embed_orig; /* CPU copy of original pos_embed for interpolation */
+    void *d_camera_token; /* [dim] float32 — injected at CLS position at rope_start */
     hip_da3_layer *layers;
 
     /* Preprocessing buffers */
@@ -358,9 +434,11 @@ struct hip_da3_runner {
 
     /* Scratch buffers */
     void *d_hidden, *d_hidden2, *d_ln_buf, *d_qkv, *d_attn_out;
+    void *d_local_hidden;  /* tracks most recent local-attention block output */
     void *d_ffn_buf, *d_ffn_mid, *d_proj_out;
     void *d_pos_y, *d_pos_x;
-    void *d_features[4]; /* saved backbone features */
+    void *d_pos_y_nd, *d_pos_x_nd;  /* pos_nodiff: all patches at (1,1) for global blocks */
+    void *d_features[4]; /* saved backbone features: [nt, 2*dim] = [local_x, x] */
 
     /* DPT head GPU weights */
     dpt_gpu_weights dpt_w;
@@ -504,15 +582,18 @@ static int da3_compile_kernels(hip_da3_runner *r) {
     GET_FN(depth_activation);
     GET_FN(conv2d_f32);
     GET_FN(dpt_cls_concat);
+    GET_FN(cat_local_global);
+    GET_FN(strided_layernorm_f32);
     GET_FN(dpt_tok_to_chw);
     GET_FN(deconv_scatter_f32);
     GET_FN(groupnorm_f32);
     GET_FN(channel_layernorm_f32);
+    GET_FN(sinusoidal_uv_posembed);
 
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "hip_da3: %d kernels compiled\n", 25);
+        fprintf(stderr, "hip_da3: %d kernels compiled\n", 26);
     return 0;
 }
 
@@ -912,6 +993,7 @@ int hip_da3_load_weights(hip_da3_runner *r, gguf_context *gguf) {
 
     CHECK_HIP(hipMalloc(&r->d_hidden,   (size_t)nt * dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_hidden2,  (size_t)nt * dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&r->d_local_hidden, (size_t)nt * dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_ln_buf,   (size_t)nt * dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_qkv,      (size_t)nt * 3 * dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_attn_out, (size_t)nt * dim * sizeof(float)));
@@ -920,10 +1002,12 @@ int hip_da3_load_weights(hip_da3_runner *r, gguf_context *gguf) {
     CHECK_HIP(hipMalloc(&r->d_proj_out, (size_t)nt * dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_pos_y,    (size_t)nt * sizeof(int)));
     CHECK_HIP(hipMalloc(&r->d_pos_x,    (size_t)nt * sizeof(int)));
+    CHECK_HIP(hipMalloc(&r->d_pos_y_nd, (size_t)nt * sizeof(int)));
+    CHECK_HIP(hipMalloc(&r->d_pos_x_nd, (size_t)nt * sizeof(int)));
     CHECK_HIP(hipMalloc(&r->d_img_norm, (size_t)3 * r->image_size * r->image_size * sizeof(float)));
 
     for (int i = 0; i < 4; i++)
-        CHECK_HIP(hipMalloc(&r->d_features[i], (size_t)nt * dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_features[i], (size_t)nt * 2 * dim * sizeof(float)));
 
     /* Allocate DPT head scratch buffers */
     {
@@ -936,7 +1020,13 @@ int hip_da3_load_weights(hip_da3_runner *r, gguf_context *gguf) {
         sp_h[3] = sp_w[3] = (gh + 2 - 3) / 2 + 1;
         int max_hw = sp_h[0] * sp_w[0];
 
-        size_t large_sz = (size_t)feat * max_hw;
+        /* After RefineNet stage 0, output is 2x the largest spatial size.
+         * Output convs run at model resolution (518×518), need large buffers. */
+        int fused_hw = sp_h[0] * 2 * sp_w[0] * 2;
+        int model_hw = r->image_size * r->image_size;  /* 518*518 = 268324 */
+        size_t large_sz = (size_t)feat * fused_hw;
+        if (large_sz < (size_t)feat * model_hw) large_sz = (size_t)feat * model_hw;
+        if (large_sz < (size_t)feat * max_hw) large_sz = (size_t)feat * max_hw;
         if (large_sz < (size_t)np * 2 * dim)
             large_sz = (size_t)np * 2 * dim;
 
@@ -956,23 +1046,34 @@ int hip_da3_load_weights(hip_da3_runner *r, gguf_context *gguf) {
         CHECK_HIP(hipMalloc(&r->d_dpt_fused, large_sz * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_dpt_tmp,   large_sz * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_dpt_tmp2,  large_sz * sizeof(float)));
-        CHECK_HIP(hipMalloc(&r->d_dpt_out,   (size_t)2 * max_hw * sizeof(float)));
+        { size_t out_sz = (size_t)2 * model_hw; if (out_sz < (size_t)2*fused_hw) out_sz = (size_t)2*fused_hw;
+          CHECK_HIP(hipMalloc(&r->d_dpt_out, out_sz * sizeof(float))); }
 
         if (r->verbose >= 1)
             fprintf(stderr, "hip_da3: DPT scratch buffers allocated (~%.1f MB)\n",
                     (float)(4 * large_sz + np * oc_max + oc_max * gh * gh + 2 * max_hw) * 4 / 1e6f);
     }
 
-    /* Upload position arrays for RoPE */
+    /* Upload position arrays for RoPE: CLS at (0,0), patches at (y+1, x+1) */
     int *py = (int *)calloc((size_t)nt, sizeof(int));
     int *px = (int *)calloc((size_t)nt, sizeof(int));
     for (int p = 0; p < np; p++) {
-        py[1 + p] = p / r->grid_w;
-        px[1 + p] = p % r->grid_w;
+        py[1 + p] = p / r->grid_w + 1;
+        px[1 + p] = p % r->grid_w + 1;
     }
     hipMemcpy(r->d_pos_y, py, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
     hipMemcpy(r->d_pos_x, px, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
-    free(py); free(px);
+
+    /* pos_nodiff: CLS at (0,0), all patches at (1,1) — used for global attention blocks */
+    int *py_nd = (int *)calloc((size_t)nt, sizeof(int));
+    int *px_nd = (int *)calloc((size_t)nt, sizeof(int));
+    for (int p = 0; p < np; p++) {
+        py_nd[1 + p] = 1;
+        px_nd[1 + p] = 1;
+    }
+    hipMemcpy(r->d_pos_y_nd, py_nd, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
+    hipMemcpy(r->d_pos_x_nd, px_nd, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
+    free(py); free(px); free(py_nd); free(px_nd);
 
     r->h_output = (float *)malloc((size_t)nt * dim * sizeof(float));
 
@@ -1091,6 +1192,7 @@ hd_found:
         if (bb_prefix && strncmp(key, bb_prefix, strlen(bb_prefix)) == 0) {
             const char *s = key + strlen(bb_prefix);
             if (strcmp(s, "cls_token") == 0) strcpy(gguf_name, "da3.cls_token");
+            else if (strcmp(s, "camera_token") == 0) strcpy(gguf_name, "da3.camera_token");
             else if (strcmp(s, "pos_embed") == 0) strcpy(gguf_name, "da3.pos_embed");
             else if (strcmp(s, "patch_embed.proj.weight") == 0) strcpy(gguf_name, "da3.patch_embed.weight");
             else if (strcmp(s, "patch_embed.proj.bias") == 0) strcpy(gguf_name, "da3.patch_embed.bias");
@@ -1338,8 +1440,28 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
     { qtensor t;
         t = da3s_tensor(st, map, map_count, "da3.cls_token");     r->d_cls_token = upload_tensor_f32(&t);
         t = da3s_tensor(st, map, map_count, "da3.pos_embed");     r->d_pos_embed = upload_tensor_f32(&t);
+        /* Save CPU copy for pos_embed interpolation */
+        { size_t pe_sz = (size_t)(r->n_patches + 1) * r->dim;
+          r->h_pos_embed_orig = (float *)malloc(pe_sz * sizeof(float));
+          hipMemcpy(r->h_pos_embed_orig, r->d_pos_embed, pe_sz * sizeof(float), hipMemcpyDeviceToHost); }
         t = da3s_tensor(st, map, map_count, "da3.patch_embed.weight"); r->d_patch_embed_w = upload_tensor_f32(&t);
         t = da3s_tensor(st, map, map_count, "da3.patch_embed.bias");   r->d_patch_embed_b = upload_tensor_f32(&t);
+        /* camera_token: [2, dim] — use index 0 for single-view */
+        t = da3s_tensor(st, map, map_count, "da3.camera_token");
+        if (t.data) {
+            /* Upload only the first dim floats (index 0 for single-view ref token) */
+            float *cam_f32 = (float *)malloc((size_t)r->dim * sizeof(float));
+            if (t.type == GGML_TYPE_F16) {
+                const uint16_t *src16 = (const uint16_t *)t.data;
+                for (int ci = 0; ci < r->dim; ci++) cam_f32[ci] = ggml_fp16_to_fp32(src16[ci]);
+            } else {
+                memcpy(cam_f32, t.data, (size_t)r->dim * sizeof(float));
+            }
+            hipMalloc(&r->d_camera_token, (size_t)r->dim * sizeof(float));
+            hipMemcpy(r->d_camera_token, cam_f32, (size_t)r->dim * sizeof(float), hipMemcpyHostToDevice);
+            free(cam_f32);
+            if (r->verbose >= 1) fprintf(stderr, "hip_da3: camera_token loaded (%d floats)\n", r->dim);
+        }
     }
 
     /* Upload transformer blocks (F16 weights, no FP8 on RDNA4) */
@@ -1644,6 +1766,7 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
     int max_ffn = r->use_swiglu ? 2 * r->ffn_hidden : 4 * dim;
     CHECK_HIP(hipMalloc(&r->d_hidden, (size_t)nt*dim*sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_hidden2, (size_t)nt*dim*sizeof(float)));
+    CHECK_HIP(hipMalloc(&r->d_local_hidden, (size_t)nt*dim*sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_ln_buf, (size_t)nt*dim*sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_qkv, (size_t)nt*3*dim*sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_attn_out, (size_t)nt*dim*sizeof(float)));
@@ -1652,14 +1775,20 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
     CHECK_HIP(hipMalloc(&r->d_proj_out, (size_t)nt*dim*sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_pos_y, (size_t)nt*sizeof(int)));
     CHECK_HIP(hipMalloc(&r->d_pos_x, (size_t)nt*sizeof(int)));
+    CHECK_HIP(hipMalloc(&r->d_pos_y_nd, (size_t)nt*sizeof(int)));
+    CHECK_HIP(hipMalloc(&r->d_pos_x_nd, (size_t)nt*sizeof(int)));
     CHECK_HIP(hipMalloc(&r->d_img_norm, (size_t)3*r->image_size*r->image_size*sizeof(float)));
-    for (int i = 0; i < 4; i++) CHECK_HIP(hipMalloc(&r->d_features[i], (size_t)nt*dim*sizeof(float)));
+    for (int i = 0; i < 4; i++) CHECK_HIP(hipMalloc(&r->d_features[i], (size_t)nt*2*dim*sizeof(float)));
     { int feat = r->head_features, oc_max = r->head_out_channels[3];
         int sp_h[4], sp_w[4];
         sp_h[0] = sp_w[0] = (gh-1)*4+4; sp_h[1] = sp_w[1] = (gh-1)*2+2;
         sp_h[2] = sp_w[2] = gh; sp_h[3] = sp_w[3] = (gh+2-3)/2+1;
         int max_hw = sp_h[0]*sp_w[0];
-        size_t large_sz = (size_t)feat*max_hw;
+        int fused_hw = sp_h[0]*2*sp_w[0]*2;
+        int model_hw = r->image_size * r->image_size;
+        size_t large_sz = (size_t)feat*fused_hw;
+        if (large_sz < (size_t)feat*model_hw) large_sz = (size_t)feat*model_hw;
+        if (large_sz < (size_t)feat*max_hw) large_sz = (size_t)feat*max_hw;
         if (large_sz < (size_t)np*2*dim) large_sz = (size_t)np*2*dim;
         CHECK_HIP(hipMalloc(&r->d_dpt_cat, large_sz*sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_dpt_ln, large_sz*sizeof(float)));
@@ -1671,7 +1800,8 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
         CHECK_HIP(hipMalloc(&r->d_dpt_fused, large_sz*sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_dpt_tmp, large_sz*sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_dpt_tmp2, large_sz*sizeof(float)));
-        CHECK_HIP(hipMalloc(&r->d_dpt_out, (size_t)2*max_hw*sizeof(float)));
+        { size_t out_sz = (size_t)2*model_hw; if (out_sz < (size_t)2*fused_hw) out_sz = (size_t)2*fused_hw;
+          CHECK_HIP(hipMalloc(&r->d_dpt_out, out_sz*sizeof(float))); }
         if (r->dpt_aux.loaded) {
             for (int i = 0; i < 4; i++)
                 CHECK_HIP(hipMalloc(&r->d_aux_out[i], (size_t)7*sp_h[0]*sp_w[0]*sizeof(float)));
@@ -1689,12 +1819,19 @@ int hip_da3_load_safetensors(hip_da3_runner *r, const char *st_path, const char 
                 fprintf(stderr, "hip_da3: GSDPT scratch allocated (%d channels, merger=%dx%d)\n", gs_oc, mg_h, mg_w);
         }
     }
+    /* Upload position arrays for RoPE: CLS at (0,0), patches at (y+1, x+1) */
     int *py = (int *)calloc((size_t)nt, sizeof(int));
     int *px = (int *)calloc((size_t)nt, sizeof(int));
-    for (int p = 0; p < np; p++) { py[1+p] = p/r->grid_w; px[1+p] = p%r->grid_w; }
+    for (int p = 0; p < np; p++) { py[1+p] = p/r->grid_w + 1; px[1+p] = p%r->grid_w + 1; }
     hipMemcpy(r->d_pos_y, py, (size_t)nt*sizeof(int), hipMemcpyHostToDevice);
     hipMemcpy(r->d_pos_x, px, (size_t)nt*sizeof(int), hipMemcpyHostToDevice);
-    free(py); free(px);
+    /* pos_nodiff: CLS at (0,0), all patches at (1,1) — for global attention blocks */
+    int *py_nd = (int *)calloc((size_t)nt, sizeof(int));
+    int *px_nd = (int *)calloc((size_t)nt, sizeof(int));
+    for (int p = 0; p < np; p++) { py_nd[1+p] = 1; px_nd[1+p] = 1; }
+    hipMemcpy(r->d_pos_y_nd, py_nd, (size_t)nt*sizeof(int), hipMemcpyHostToDevice);
+    hipMemcpy(r->d_pos_x_nd, px_nd, (size_t)nt*sizeof(int), hipMemcpyHostToDevice);
+    free(py); free(px); free(py_nd); free(px_nd);
     r->h_output = (float *)malloc((size_t)nt*dim*sizeof(float));
     r->cpu_model = NULL;
     r->loaded = 1;
@@ -1750,7 +1887,7 @@ static void kl_rope_2d(hip_da3_runner *r, void *vec, void *pos_y, void *pos_x,
                          int n_tok, int n_heads, int head_dim, int stride) {
     int quarter = head_dim / 4;
     int threads = n_heads * quarter;
-    float freq_base = 10000.0f;
+    float freq_base = 100.0f;
     void *args[] = {&vec, &pos_y, &pos_x, &n_tok, &n_heads, &head_dim, &stride, &freq_base};
     KL(r->fn_rope_2d_f32, (unsigned)n_tok, 1, 1, (unsigned)threads, 1, 1, 0, r->stream, args);
 }
@@ -1913,28 +2050,39 @@ static void gpu_refinenet_w(hip_da3_runner *r,
                               void *rcu1_c2_w, void *rcu1_c2_b,
                               void *rcu2_c1_w, void *rcu2_c1_b,
                               void *rcu2_c2_w, void *rcu2_c2_b,
-                              int has_rcu1, int has_rcu2) {
+                              int has_rcu1, int has_rcu2,
+                              int out_h, int out_w) {
     int sz = features * fH * fW;
-    if (deeper) kl_bilinear(r, r->d_dpt_cat, deeper, features, dH, dW, fH, fW);
-    hipMemcpyAsync(result_buf, feat, (size_t)sz * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
     if (deeper) {
+        /* result = upsample(deeper) + RCU(lateral) — matching official FeatureFusionBlock */
+        kl_bilinear(r, result_buf, deeper, features, dH, dW, fH, fW);  /* result = upsample(deeper) */
         if (has_rcu1) {
-            kl_rcu(r, r->d_dpt_ln, r->d_dpt_cat, rcu1_c1_w, rcu1_c1_b, rcu1_c2_w, rcu1_c2_b, features, fH, fW);
-            kl_add_inplace(r, result_buf, r->d_dpt_ln, sz);
+            kl_rcu(r, r->d_dpt_ln, feat, rcu1_c1_w, rcu1_c1_b, rcu1_c2_w, rcu1_c2_b, features, fH, fW);
+            kl_add_inplace(r, result_buf, r->d_dpt_ln, sz);  /* result += RCU(lateral) */
         } else {
-            kl_add_inplace(r, result_buf, r->d_dpt_cat, sz);
+            kl_add_inplace(r, result_buf, feat, sz);  /* result += lateral */
         }
+    } else {
+        hipMemcpyAsync(result_buf, feat, (size_t)sz * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
     }
     if (has_rcu2) {
         kl_rcu(r, r->d_dpt_cat, result_buf, rcu2_c1_w, rcu2_c1_b, rcu2_c2_w, rcu2_c2_b, features, fH, fW);
         hipMemcpyAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
     }
-    kl_conv_gemm(r, r->d_dpt_cat, result_buf, fuse_out_w, fuse_out_b, fH, fW, features, features, 1, 1, 1, 0);
-    hipMemcpyAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+    /* Upsample to output resolution before out_conv (matching official FeatureFusionBlock) */
+    if (out_h > 0 && (out_h != fH || out_w != fW)) {
+        kl_bilinear(r, r->d_dpt_cat, result_buf, features, fH, fW, out_h, out_w);
+        kl_conv_gemm(r, r->d_dpt_ln, r->d_dpt_cat, fuse_out_w, fuse_out_b, out_h, out_w, features, features, 1, 1, 1, 0);
+        hipMemcpyAsync(result_buf, r->d_dpt_ln, (size_t)features * out_h * out_w * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+    } else {
+        kl_conv_gemm(r, r->d_dpt_cat, result_buf, fuse_out_w, fuse_out_b, fH, fW, features, features, 1, 1, 1, 0);
+        hipMemcpyAsync(result_buf, r->d_dpt_cat, (size_t)sz * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+    }
 }
 
 static void gpu_refinenet(hip_da3_runner *r, int stage, void *feat, int fH, int fW,
-                            void *deeper, int dH, int dW, int features, void *result_buf) {
+                            void *deeper, int dH, int dW, int features, void *result_buf,
+                            int out_h, int out_w) {
     dpt_gpu_weights *dw = &r->dpt_w;
     gpu_refinenet_w(r, feat, fH, fW, deeper, dH, dW, features, result_buf,
                      dw->fuse_out_w[stage], dw->fuse_out_b[stage],
@@ -1942,7 +2090,8 @@ static void gpu_refinenet(hip_da3_runner *r, int stage, void *feat, int fH, int 
                      dw->fuse_rcu1_c2_w[stage], dw->fuse_rcu1_c2_b[stage],
                      dw->fuse_rcu2_c1_w[stage], dw->fuse_rcu2_c1_b[stage],
                      dw->fuse_rcu2_c2_w[stage], dw->fuse_rcu2_c2_b[stage],
-                     dw->has_rcu1[stage], dw->has_rcu2[stage]);
+                     dw->has_rcu1[stage], dw->has_rcu2[stage],
+                     out_h, out_w);
 }
 
 /* CameraDec: backbone_norm(CLS) -> MLP -> 3 linear heads -> pose[9] (CPU) */
@@ -1992,8 +2141,9 @@ static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[3], r->dpt_aux.fuse_rcu1_c2_b[3],
                      r->dpt_aux.fuse_rcu2_c1_w[3], r->dpt_aux.fuse_rcu2_c1_b[3],
                      r->dpt_aux.fuse_rcu2_c2_w[3], r->dpt_aux.fuse_rcu2_c2_b[3],
-                     r->dpt_aux.has_rcu1[3], r->dpt_aux.has_rcu2[3]);
-    int fh = sp_h[3], fw = sp_w[3];
+                     r->dpt_aux.has_rcu1[3], r->dpt_aux.has_rcu2[3],
+                     sp_h[2], sp_w[2]);
+    int fh = sp_h[2], fw = sp_w[2];
 
     /* Level 2 */
     gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
@@ -2003,8 +2153,9 @@ static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[2], r->dpt_aux.fuse_rcu1_c2_b[2],
                      r->dpt_aux.fuse_rcu2_c1_w[2], r->dpt_aux.fuse_rcu2_c1_b[2],
                      r->dpt_aux.fuse_rcu2_c2_w[2], r->dpt_aux.fuse_rcu2_c2_b[2],
-                     r->dpt_aux.has_rcu1[2], r->dpt_aux.has_rcu2[2]);
-    fh = sp_h[2]; fw = sp_w[2];
+                     r->dpt_aux.has_rcu1[2], r->dpt_aux.has_rcu2[2],
+                     sp_h[1], sp_w[1]);
+    fh = sp_h[1]; fw = sp_w[1];
 
     /* Level 1 */
     gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
@@ -2014,8 +2165,9 @@ static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[1], r->dpt_aux.fuse_rcu1_c2_b[1],
                      r->dpt_aux.fuse_rcu2_c1_w[1], r->dpt_aux.fuse_rcu2_c1_b[1],
                      r->dpt_aux.fuse_rcu2_c2_w[1], r->dpt_aux.fuse_rcu2_c2_b[1],
-                     r->dpt_aux.has_rcu1[1], r->dpt_aux.has_rcu2[1]);
-    fh = sp_h[1]; fw = sp_w[1];
+                     r->dpt_aux.has_rcu1[1], r->dpt_aux.has_rcu2[1],
+                     sp_h[0], sp_w[0]);
+    fh = sp_h[0]; fw = sp_w[0];
 
     /* Level 0 */
     gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
@@ -2025,7 +2177,8 @@ static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu1_c2_w[0], r->dpt_aux.fuse_rcu1_c2_b[0],
                      r->dpt_aux.fuse_rcu2_c1_w[0], r->dpt_aux.fuse_rcu2_c1_b[0],
                      r->dpt_aux.fuse_rcu2_c2_w[0], r->dpt_aux.fuse_rcu2_c2_b[0],
-                     r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0]);
+                     r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0],
+                     sp_h[0] * 2, sp_w[0] * 2);
 
     /* Debug: check aux_fused values after refinenet */
     if (r->verbose >= 2) {
@@ -2148,17 +2301,86 @@ da3_hip_result hip_da3_predict(hip_da3_runner *r, const uint8_t *rgb, int img_w,
 /* Public API: predict_full                                                 */
 /* ======================================================================== */
 
+/* Helper: nearest multiple of p to x */
+static int nearest_multiple(int x, int p) {
+    int down = (x / p) * p;
+    int up = down + p;
+    return (up - x <= x - down) ? up : down;
+}
+
+/* Helper: bicubic interpolation weight (Keys cubic, a=-0.75 matching PyTorch) */
+static float bicubic_weight(float x) {
+    float ax = fabsf(x);
+    if (ax <= 1.0f) return ((1.25f*ax - 2.25f)*ax)*ax + 1.0f;
+    if (ax < 2.0f) return ((-0.75f*ax + 3.75f)*ax - 6.0f)*ax + 3.0f;
+    return 0.0f;
+}
+
+/* Interpolate pos_embed from [M, M, dim] to [h0, w0, dim] using bicubic */
+static float *interpolate_pos_embed_cpu(const float *pos_embed_flat,
+                                          int M, int h0, int w0, int dim) {
+    /* pos_embed_flat: [M*M, dim] (patch pos_embed, no CLS) */
+    /* output: [h0*w0, dim] */
+    /* Match PyTorch DINOv2's interpolate_offset=0.1: uses scale_factor instead of size */
+    float interp_offset = 0.1f;
+    float sx = (float)(w0 + interp_offset) / M;
+    float sy = (float)(h0 + interp_offset) / M;
+    float *out = (float *)calloc((size_t)h0 * w0 * dim, sizeof(float));
+    for (int y = 0; y < h0; y++) {
+        /* scale_factor mapping: src = (dst + 0.5) / scale - 0.5 */
+        float fy = ((float)y + 0.5f) / sy - 0.5f;
+        if (fy < 0) fy = 0; if (fy > M - 1) fy = (float)(M - 1);
+        int iy = (int)floorf(fy);
+        float dy = fy - iy;
+        for (int x = 0; x < w0; x++) {
+            float fx = ((float)x + 0.5f) / sx - 0.5f;
+            if (fx < 0) fx = 0; if (fx > M - 1) fx = (float)(M - 1);
+            int ix = (int)floorf(fx);
+            float dx = fx - ix;
+            for (int d = 0; d < dim; d++) {
+                float val = 0.0f;
+                for (int jj = -1; jj <= 2; jj++) {
+                    int sy = iy + jj; if (sy < 0) sy = 0; if (sy >= M) sy = M - 1;
+                    float wy = bicubic_weight(dy - jj);
+                    for (int ii = -1; ii <= 2; ii++) {
+                        int sx = ix + ii; if (sx < 0) sx = 0; if (sx >= M) sx = M - 1;
+                        float wx = bicubic_weight(dx - ii);
+                        val += pos_embed_flat[sy * M * dim + sx * dim + d] * wy * wx;
+                    }
+                }
+                out[y * w0 * dim + x * dim + d] = val;
+            }
+        }
+    }
+    return out;
+}
+
 da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                                         int img_w, int img_h, int output_flags,
                                         const float *pose_in) {
     da3_full_result result = {0};
     if (!r->loaded) return result;
 
-    int dim = r->dim, nt = r->n_tokens, np = r->n_patches;
-    int gh = r->grid_h, gw = r->grid_w, ps = r->patch_size;
-    int target_h = gh * ps, target_w = gw * ps;
+    int dim = r->dim, ps = r->patch_size;
     double t0, t1;
     struct timespec ts;
+
+    /* Compute aspect-ratio-preserving target size (matching official DA3 preprocessing) */
+    int process_res = 504;  /* official default: longest side = 504 */
+    int longest = (img_w > img_h) ? img_w : img_h;
+    float scale = (float)process_res / (float)longest;
+    int new_w = (int)(img_w * scale + 0.5f); if (new_w < 1) new_w = 1;
+    int new_h = (int)(img_h * scale + 0.5f); if (new_h < 1) new_h = 1;
+    /* Round to nearest multiple of patch_size */
+    int target_w = nearest_multiple(new_w, ps); if (target_w < ps) target_w = ps;
+    int target_h = nearest_multiple(new_h, ps); if (target_h < ps) target_h = ps;
+
+    int gh = target_h / ps, gw = target_w / ps;
+    int np = gh * gw, nt = np + 1;
+
+    if (r->verbose >= 1)
+        fprintf(stderr, "hip_da3: input %dx%d → target %dx%d (grid %dx%d, %d patches)\n",
+                img_w, img_h, target_w, target_h, gw, gh, np);
 
     /* GPU: Preprocess + Patch Embed + CLS + PosEmbed */
     clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -2171,19 +2393,67 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
     }
     hipMemcpy(r->d_img_raw, rgb, img_bytes, hipMemcpyHostToDevice);
 
+    /* Ensure scratch buffers are large enough for this image's grid */
+    /* (For simplicity, reallocate if new grid is larger than original 37x37) */
+    int orig_nt = r->n_tokens;
+    if (nt > orig_nt) {
+        fprintf(stderr, "hip_da3: WARNING: grid %dx%d (%d tokens) exceeds allocated %d tokens, clamping\n",
+                gw, gh, nt, orig_nt);
+        /* Fall back to square resize */
+        gh = r->grid_h; gw = r->grid_w; np = r->n_patches; nt = r->n_tokens;
+        target_h = gh * ps; target_w = gw * ps;
+    }
+
     { int total = target_h * target_w; int grid = (total + 255) / 256;
         float istd0 = 1.0f/r->image_std[0], istd1 = 1.0f/r->image_std[1], istd2 = 1.0f/r->image_std[2];
         float m0 = r->image_mean[0], m1 = r->image_mean[1], m2 = r->image_mean[2];
         void *args[] = {&r->d_img_norm, &r->d_img_raw, &img_w, &img_h, &target_w, &target_h, &m0, &m1, &m2, &istd0, &istd1, &istd2};
         KL(r->fn_resize_normalize, (unsigned)grid, 1, 1, 256, 1, 1, 0, r->stream, args); }
 
-    { int img_dim = target_w;
-        void *args[] = {&r->d_hidden, &r->d_img_norm, &r->d_patch_embed_w, &r->d_patch_embed_b, &gw, &dim, &ps, &img_dim};
+    { void *args[] = {&r->d_hidden, &r->d_img_norm, &r->d_patch_embed_w, &r->d_patch_embed_b, &gw, &dim, &ps, &target_w, &target_h};
         KL(r->fn_patch_embed_conv2d, (unsigned)np, 1, 1, 256, 1, 1, 0, r->stream, args); }
 
-    { int total = nt * dim; int grid = (total + 255) / 256;
+    /* Interpolate position embedding for non-square grid */
+    {
+        int M = r->grid_h;  /* original square grid size (37) */
+        if (gh != M || gw != M) {
+            /* Use saved CPU copy of original pos_embed for interpolation */
+            float *orig_pe = r->h_pos_embed_orig;
+            float *cls_pe = orig_pe;  /* first token = CLS */
+            float *patch_pe = orig_pe + dim;  /* [M*M, dim] in row-major [y, x, dim] */
+            /* Reshape [M*M, dim] → treat as [M, M, dim] and bicubic interpolate to [gh, gw, dim] */
+            float *interp_pe = interpolate_pos_embed_cpu(patch_pe, M, gh, gw, dim);
+            /* Build new pos_embed: [CLS, interp_patches] */
+            float *new_pe = (float *)malloc((size_t)nt * dim * sizeof(float));
+            memcpy(new_pe, cls_pe, (size_t)dim * sizeof(float));
+            /* Convert from [gh, gw, dim] (spatial) to [np, dim] (token order) */
+            for (int p = 0; p < np; p++)
+                memcpy(new_pe + (1 + p) * dim, interp_pe + p * dim, (size_t)dim * sizeof(float));
+            hipMemcpy(r->d_pos_embed, new_pe, (size_t)nt * dim * sizeof(float), hipMemcpyHostToDevice);
+            free(interp_pe); free(new_pe);
+        }
+
+        int total = nt * dim; int grid = (total + 255) / 256;
         void *args[] = {&r->d_hidden, &r->d_cls_token, &r->d_pos_embed, &nt, &dim};
-        KL(r->fn_cls_pos_embed, (unsigned)grid, 1, 1, 256, 1, 1, 0, r->stream, args); }
+        KL(r->fn_cls_pos_embed, (unsigned)grid, 1, 1, 256, 1, 1, 0, r->stream, args);
+
+        /* Rebuild position arrays for RoPE with new grid */
+        if (gh != r->grid_h || gw != r->grid_w) {
+            int *py = (int *)calloc((size_t)nt, sizeof(int));
+            int *px = (int *)calloc((size_t)nt, sizeof(int));
+            int *py_nd = (int *)calloc((size_t)nt, sizeof(int));
+            int *px_nd = (int *)calloc((size_t)nt, sizeof(int));
+            for (int p = 0; p < np; p++) {
+                py[1 + p] = p / gw + 1; px[1 + p] = p % gw + 1;
+                py_nd[1 + p] = 1; px_nd[1 + p] = 1;
+            }
+            hipMemcpy(r->d_pos_y, py, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
+            hipMemcpy(r->d_pos_x, px, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
+            hipMemcpy(r->d_pos_y_nd, py_nd, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
+            hipMemcpy(r->d_pos_x_nd, px_nd, (size_t)nt * sizeof(int), hipMemcpyHostToDevice);
+            free(py); free(px); free(py_nd); free(px_nd);
+        }
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
     if (r->verbose >= 1) fprintf(stderr, "hip_da3: GPU preprocess+embed: %.1f ms\n", (t1-t0)*1000);
@@ -2192,8 +2462,20 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
     clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
     int stride_3dim = 3 * dim;
 
+    /* Initialize local_hidden = hidden (before any block runs) */
+    hipMemcpyAsync(r->d_local_hidden, r->d_hidden, (size_t)nt*dim*sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+
     for (int L = 0; L < r->n_blocks; L++) {
         hip_da3_layer *ly = &r->layers[L];
+
+        /* Determine if this is a global block (odd-indexed from rope_start) */
+        int is_global = (L >= r->rope_start && (L % 2) == 1);
+
+        /* Camera token injection: replace CLS (token 0) at rope_start layer */
+        if (L == r->rope_start && r->d_camera_token) {
+            hipMemcpyAsync(r->d_hidden, r->d_camera_token, (size_t)dim * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+        }
+
         kl_layernorm(r, r->d_ln_buf, r->d_hidden, ly->ln1_w, ly->ln1_b, nt, dim);
         kl_gemm(r, r->d_qkv, ly->attn_qkv_w, r->d_ln_buf, ly->attn_qkv_b, ly->qkv_rows, ly->qkv_cols, nt);
 
@@ -2204,9 +2486,12 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
         }
 
         if (L >= r->rope_start) {
-            kl_rope_2d(r, r->d_qkv, r->d_pos_y, r->d_pos_x, nt, r->n_heads, r->head_dim, stride_3dim);
+            /* Use pos_nodiff for global blocks, real positions for local blocks */
+            void *use_py = is_global ? r->d_pos_y_nd : r->d_pos_y;
+            void *use_px = is_global ? r->d_pos_x_nd : r->d_pos_x;
+            kl_rope_2d(r, r->d_qkv, use_py, use_px, nt, r->n_heads, r->head_dim, stride_3dim);
             void *k_base = (char *)r->d_qkv + (size_t)dim * sizeof(float);
-            kl_rope_2d(r, k_base, r->d_pos_y, r->d_pos_x, nt, r->n_heads, r->head_dim, stride_3dim);
+            kl_rope_2d(r, k_base, use_py, use_px, nt, r->n_heads, r->head_dim, stride_3dim);
         }
 
         { void *K_t = r->d_ffn_buf;
@@ -2232,9 +2517,18 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
 
         kl_layerscale_add(r, r->d_hidden, r->d_proj_out, ly->ls2, dim, nt * dim);
 
+        /* Update local_hidden after each local (non-global) block */
+        if (!is_global)
+            hipMemcpyAsync(r->d_local_hidden, r->d_hidden, (size_t)nt*dim*sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+
+        /* Save features as [local_x, x] per token (cat_token=True) */
         for (int fi = 0; fi < 4; fi++) {
-            if (L == r->feature_layers[fi])
-                hipMemcpyAsync(r->d_features[fi], r->d_hidden, (size_t)nt*dim*sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+            if (L == r->feature_layers[fi]) {
+                int total_cat = nt * 2 * dim;
+                int grid_cat = (total_cat + 255) / 256;
+                void *cat_args[] = {&r->d_features[fi], &r->d_local_hidden, &r->d_hidden, &nt, &dim};
+                KL(r->fn_cat_local_global, (unsigned)grid_cat, 1, 1, 256, 1, 1, 0, r->stream, cat_args);
+            }
         }
     }
 
@@ -2257,13 +2551,34 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
     dpt_gpu_weights *dw = &r->dpt_w;
     int feat = r->head_features, head_dim_in = dim * 2;
     int sp_h[4], sp_w[4];
-    sp_h[0] = sp_w[0] = (gh-1)*4+4; sp_h[1] = sp_w[1] = (gh-1)*2+2;
-    sp_h[2] = sp_w[2] = gh; sp_h[3] = sp_w[3] = (gh+2-3)/2+1;
+    /* Non-square spatial dimensions: ConvTranspose/Conv with separate h/w */
+    sp_h[0] = (gh-1)*4+4; sp_w[0] = (gw-1)*4+4;
+    sp_h[1] = (gh-1)*2+2; sp_w[1] = (gw-1)*2+2;
+    sp_h[2] = gh;          sp_w[2] = gw;
+    sp_h[3] = (gh+2-3)/2+1; sp_w[3] = (gw+2-3)/2+1;
 
     /* Token processing + projection for each feature level */
     for (int fi = 0; fi < 4; fi++) {
         int oc_val = r->head_out_channels[fi];
         kl_cls_concat(r, r->d_dpt_cat, r->d_features[fi], np, dim);
+
+        /* Apply backbone_norm to second half of [local_x, x] features in-place:
+         * result is [local_x_raw, backbone_norm(x)] — matches PyTorch's
+         * get_intermediate_layers which applies self.norm only to the x part */
+        if (r->cam_dec.backbone_norm_w) { /* DISABLED: test without backbone_norm */
+            int ln_threads = dim;
+            if (ln_threads < 64) ln_threads = 64;
+            /* Round up to power of 2 for reduction */
+            int pow2 = 1; while (pow2 < ln_threads) pow2 <<= 1;
+            ln_threads = pow2;
+            unsigned ln_smem = (unsigned)(ln_threads * sizeof(float));
+            float ln_eps = r->ln_eps;
+            void *ln_args[] = {&r->d_dpt_cat, &r->cam_dec.backbone_norm_w, &r->cam_dec.backbone_norm_b,
+                               &np, &dim, &head_dim_in, &ln_eps};
+            KL(r->fn_strided_layernorm_f32, (unsigned)np, 1, 1, (unsigned)ln_threads, 1, 1,
+               ln_smem, r->stream, ln_args);
+        }
+
         if (dw->norm_w) kl_layernorm(r, r->d_dpt_ln, r->d_dpt_cat, dw->norm_w, dw->norm_b, np, head_dim_in);
         else hipMemcpyAsync(r->d_dpt_ln, r->d_dpt_cat, (size_t)np*head_dim_in*sizeof(float), hipMemcpyDeviceToDevice, r->stream);
         kl_gemm(r, r->d_dpt_proj, dw->proj_w[fi], r->d_dpt_ln, dw->proj_b[fi], oc_val, head_dim_in, np);
@@ -2277,21 +2592,57 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
         kl_conv_gemm(r, r->d_dpt_adapted[fi], r->d_dpt_spatial[fi], dw->adapter_w[fi], null_bias, sp_h[fi], sp_w[fi], oc_val, feat, 3, 3, 1, 1);
     }
 
-    /* Bottom-up RefineNet fusion */
-    gpu_refinenet(r, 3, r->d_dpt_adapted[3], sp_h[3], sp_w[3], NULL, 0, 0, feat, r->d_dpt_fused);
-    int fh = sp_h[3], fw = sp_w[3];
-    gpu_refinenet(r, 2, r->d_dpt_adapted[2], sp_h[2], sp_w[2], r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused); fh = sp_h[2]; fw = sp_w[2];
-    gpu_refinenet(r, 1, r->d_dpt_adapted[1], sp_h[1], sp_w[1], r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused); fh = sp_h[1]; fw = sp_w[1];
-    gpu_refinenet(r, 0, r->d_dpt_adapted[0], sp_h[0], sp_w[0], r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused); fh = sp_h[0]; fw = sp_w[0];
+    /* Bottom-up RefineNet fusion — each stage upsamples to next level's resolution */
+    gpu_refinenet(r, 3, r->d_dpt_adapted[3], sp_h[3], sp_w[3], NULL, 0, 0, feat, r->d_dpt_fused,
+                  sp_h[2], sp_w[2]);
+    int fh = sp_h[2], fw = sp_w[2];
+    gpu_refinenet(r, 2, r->d_dpt_adapted[2], sp_h[2], sp_w[2], r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
+                  sp_h[1], sp_w[1]);
+    fh = sp_h[1]; fw = sp_w[1];
+    gpu_refinenet(r, 1, r->d_dpt_adapted[1], sp_h[1], sp_w[1], r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
+                  sp_h[0], sp_w[0]);
+    fh = sp_h[0]; fw = sp_w[0];
+    gpu_refinenet(r, 0, r->d_dpt_adapted[0], sp_h[0], sp_w[0], r->d_dpt_fused, fh, fw, feat, r->d_dpt_fused,
+                  sp_h[0] * 2, sp_w[0] * 2);
+    fh = sp_h[0] * 2; fw = sp_w[0] * 2;
 
-    /* Output convolutions */
+    /* Output convolutions — matching official DA3 DualDPT:
+     * 1. neck (output_conv1): Conv3x3(feat→feat/2) — NO ReLU
+     * 2. Bilinear upsample fused_res → model_res (296→518)
+     * 3. TODO: sinusoidal UV pos_embed (ratio=0.1)
+     * 4. out_0 (output_conv2[0]): Conv3x3(feat/2→out_mid) + ReLU
+     * 5. out_2 (output_conv2[2]): Conv1x1(out_mid→2) */
     int feat_half = feat / 2; if (feat_half < 1) feat_half = 1;
     int out_mid = dw->out_mid > 0 ? dw->out_mid : feat_half;
+
+    /* 1. Neck conv at fused resolution — NO ReLU */
     kl_conv_gemm(r, r->d_dpt_tmp, r->d_dpt_fused, dw->neck_w, dw->neck_b, fh, fw, feat, feat_half, 3, 3, 1, 1);
-    kl_relu_inplace(r, r->d_dpt_tmp, feat_half*fh*fw);
-    kl_conv_gemm(r, r->d_dpt_tmp2, r->d_dpt_tmp, dw->out_0_w, dw->out_0_b, fh, fw, feat_half, out_mid, 3, 3, 1, 1);
-    kl_relu_inplace(r, r->d_dpt_tmp2, out_mid*fh*fw);
-    kl_conv2d(r, r->d_dpt_out, r->d_dpt_tmp2, dw->out_2_w, dw->out_2_b, fh, fw, out_mid, 2, 1, 1, 1, 0);
+    /* NO relu here — official DA3 doesn't apply ReLU after neck */
+
+    /* 2. Bilinear upsample to model resolution (518×518) */
+    int model_h = gh * ps, model_w = gw * ps;  /* 37*14 = 518 */
+    kl_bilinear(r, r->d_dpt_tmp2, r->d_dpt_tmp, feat_half, fh, fw, model_h, model_w);
+
+    /* 3. Sinusoidal UV positional embedding (ratio=0.1, omega_0=100) */
+    {
+        float aspect = (float)model_w / (float)model_h;
+        float diag = sqrtf(aspect * aspect + 1.0f);
+        float span_x = aspect / diag;
+        float span_y = 1.0f / diag;
+        float ratio = 0.1f;
+        int total_uv = feat_half * model_h * model_w;
+        int grid_uv = (total_uv + 255) / 256;
+        void *uv_args[] = {&r->d_dpt_tmp2, &feat_half, &model_h, &model_w, &span_x, &span_y, &ratio};
+        KL(r->fn_sinusoidal_uv_posembed, (unsigned)grid_uv, 1, 1, 256, 1, 1, 0, r->stream, uv_args);
+    }
+
+    /* 4. out_0: Conv3x3 + ReLU at model resolution */
+    kl_conv_gemm(r, r->d_dpt_tmp, r->d_dpt_tmp2, dw->out_0_w, dw->out_0_b, model_h, model_w, feat_half, out_mid, 3, 3, 1, 1);
+    kl_relu_inplace(r, r->d_dpt_tmp, out_mid*model_h*model_w);
+
+    /* 5. out_2: Conv1x1 → 2 channels */
+    kl_conv2d(r, r->d_dpt_out, r->d_dpt_tmp, dw->out_2_w, dw->out_2_b, model_h, model_w, out_mid, 2, 1, 1, 1, 0);
+    fh = model_h; fw = model_w;  /* update for depth activation + upsample */
 
     { int hw = fh*fw; int grid = (hw+255)/256;
         void *args[] = {&r->d_dpt_out, &hw};
@@ -2443,8 +2794,9 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[3], gdw->fuse_rcu1_c2_b[3],
                         gdw->fuse_rcu2_c1_w[3], gdw->fuse_rcu2_c1_b[3],
                         gdw->fuse_rcu2_c2_w[3], gdw->fuse_rcu2_c2_b[3],
-                        gdw->has_rcu1[3], gdw->has_rcu2[3]);
-        int gs_fh = sp_h[3], gs_fw = sp_w[3];
+                        gdw->has_rcu1[3], gdw->has_rcu2[3],
+                        sp_h[2], sp_w[2]);
+        int gs_fh = sp_h[2], gs_fw = sp_w[2];
         gpu_refinenet_w(r, r->d_dpt_adapted[2], sp_h[2], sp_w[2],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[2], gdw->fuse_out_b[2],
@@ -2452,8 +2804,9 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[2], gdw->fuse_rcu1_c2_b[2],
                         gdw->fuse_rcu2_c1_w[2], gdw->fuse_rcu2_c1_b[2],
                         gdw->fuse_rcu2_c2_w[2], gdw->fuse_rcu2_c2_b[2],
-                        gdw->has_rcu1[2], gdw->has_rcu2[2]);
-        gs_fh = sp_h[2]; gs_fw = sp_w[2];
+                        gdw->has_rcu1[2], gdw->has_rcu2[2],
+                        sp_h[1], sp_w[1]);
+        gs_fh = sp_h[1]; gs_fw = sp_w[1];
         gpu_refinenet_w(r, r->d_dpt_adapted[1], sp_h[1], sp_w[1],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[1], gdw->fuse_out_b[1],
@@ -2461,8 +2814,9 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[1], gdw->fuse_rcu1_c2_b[1],
                         gdw->fuse_rcu2_c1_w[1], gdw->fuse_rcu2_c1_b[1],
                         gdw->fuse_rcu2_c2_w[1], gdw->fuse_rcu2_c2_b[1],
-                        gdw->has_rcu1[1], gdw->has_rcu2[1]);
-        gs_fh = sp_h[1]; gs_fw = sp_w[1];
+                        gdw->has_rcu1[1], gdw->has_rcu2[1],
+                        sp_h[0], sp_w[0]);
+        gs_fh = sp_h[0]; gs_fw = sp_w[0];
         gpu_refinenet_w(r, r->d_dpt_adapted[0], sp_h[0], sp_w[0],
                         r->d_dpt_fused, gs_fh, gs_fw, feat, r->d_dpt_fused,
                         gdw->fuse_out_w[0], gdw->fuse_out_b[0],
@@ -2470,7 +2824,8 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                         gdw->fuse_rcu1_c2_w[0], gdw->fuse_rcu1_c2_b[0],
                         gdw->fuse_rcu2_c1_w[0], gdw->fuse_rcu2_c1_b[0],
                         gdw->fuse_rcu2_c2_w[0], gdw->fuse_rcu2_c2_b[0],
-                        gdw->has_rcu1[0], gdw->has_rcu2[0]);
+                        gdw->has_rcu1[0], gdw->has_rcu2[0],
+                        sp_h[0] * 2, sp_w[0] * 2);
         gs_fh = sp_h[0]; gs_fw = sp_w[0];
 
         /* Output convolutions -> gs_oc channels
@@ -2554,14 +2909,18 @@ void hip_da3_free(hip_da3_runner *r) {
     }
 
     if (r->d_cls_token) hipFree(r->d_cls_token); if (r->d_pos_embed) hipFree(r->d_pos_embed);
+    if (r->h_pos_embed_orig) free(r->h_pos_embed_orig);
+    if (r->d_camera_token) hipFree(r->d_camera_token);
     if (r->d_patch_embed_w) hipFree(r->d_patch_embed_w); if (r->d_patch_embed_b) hipFree(r->d_patch_embed_b);
     if (r->d_img_norm) hipFree(r->d_img_norm); if (r->d_img_raw) hipFree(r->d_img_raw);
     if (r->d_result) hipFree(r->d_result);
     if (r->d_hidden) hipFree(r->d_hidden); if (r->d_hidden2) hipFree(r->d_hidden2);
+    if (r->d_local_hidden) hipFree(r->d_local_hidden);
     if (r->d_ln_buf) hipFree(r->d_ln_buf); if (r->d_qkv) hipFree(r->d_qkv);
     if (r->d_attn_out) hipFree(r->d_attn_out); if (r->d_ffn_buf) hipFree(r->d_ffn_buf);
     if (r->d_ffn_mid) hipFree(r->d_ffn_mid); if (r->d_proj_out) hipFree(r->d_proj_out);
     if (r->d_pos_y) hipFree(r->d_pos_y); if (r->d_pos_x) hipFree(r->d_pos_x);
+    if (r->d_pos_y_nd) hipFree(r->d_pos_y_nd); if (r->d_pos_x_nd) hipFree(r->d_pos_x_nd);
     for (int i = 0; i < 4; i++) if (r->d_features[i]) hipFree(r->d_features[i]);
 
     { dpt_gpu_weights *dw_p = &r->dpt_w;
