@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
             latent[i] = randn();
 
-        /* Scheduler — use dynamic scheduler with timestep = sigma * 1000 */
+        /* Scheduler — dynamic with timestep = sigma * 1000 */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
         qimg_sched_set_timesteps(&sched, n_steps, n_img);
