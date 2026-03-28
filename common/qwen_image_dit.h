@@ -924,8 +924,9 @@ void qimg_dit_forward(float *out, const float *img_tokens, int n_img,
                         t_silu, 1, 2 * dim, dim, n_threads);
         free(t_silu);
 
-        float *shift = final_mod;
-        float *scale = final_mod + dim;
+        /* LastLayer: scale, shift = chunk(emb, 2) — scale is FIRST half */
+        float *scale = final_mod;
+        float *shift = final_mod + dim;
         qimg_adaln(img, img, shift, scale, n_img, dim, m->ln_eps);
         free(final_mod);
     }
