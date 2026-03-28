@@ -342,10 +342,12 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
             latent[i] = randn();
 
-        /* Scheduler — ComfyUI compatible (shift=1.15, sigma→0, multiplier=1000) */
+        /* Scheduler — match ComfyUI ground truth exactly:
+         * shift=3.1, multiplier=1000 (our embedding uses angle=t*freq,
+         * ComfyUI's Timesteps has internal scale=1000 so t=sigma*1000) */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
-        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 1.15f, 1000.0f);
+        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f, 1000.0f);
 
         float cfg_scale = 2.5f;
         for (int i = 1; i < argc; i++)
