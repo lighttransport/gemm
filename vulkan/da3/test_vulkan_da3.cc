@@ -16,6 +16,8 @@
 
 /* stb_image for JPEG/PNG loading (implementation in stb_impl.c) */
 #include "../../common/stb_image.h"
+#include "../../common/stb_image_write.h"
+#include "../../common/image_utils.h"
 
 /* Vulkan DA3 runner */
 #include "vulkan_da3_runner.h"
@@ -165,8 +167,7 @@ int main(int argc, char **argv) {
 
         /* Save outputs */
         if (output_path && result.depth) {
-            /* TODO: add falsecolor depth PNG export */
-            fprintf(stderr, "PNG output not yet implemented\n");
+            img_write_depth_png(output_path, result.depth, result.width, result.height);
         }
         if (npy_path && result.depth) {
             write_npy_f32(npy_path, result.depth, result.width, result.height);
