@@ -486,6 +486,16 @@ static const char *qimg_kernel_src =
  *
  * Register budget per thread: q[4] + O[4] + m + l + 8 misc ≈ 18 regs → high occupancy.
  */
+/* BF16 truncation helper for attention scores.
+ * Matches ComfyUI's BF16 compute precision for softmax. */
+"__device__ __forceinline__ float to_bf16(float f) {\n"
+"    unsigned int bits;\n"
+"    memcpy(&bits, &f, 4);\n"
+"    bits &= 0xFFFF0000u;\n"
+"    memcpy(&f, &bits, 4);\n"
+"    return f;\n"
+"}\n"
+"\n"
 "#define FA2_WARPS   4\n"  /* queries per block (warps per block) */
 "#define FA2_BKV    16\n"  /* KV tile size */
 "#define FA2_HD    128\n"  /* head_dim */
