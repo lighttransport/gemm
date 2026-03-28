@@ -7,6 +7,8 @@
 #include "../../common/sparse3d.h"
 #define T2_SHAPE_DEC_IMPLEMENTATION
 #include "../../common/trellis2_shape_decoder.h"
+#define T2_FDG_MESH_IMPLEMENTATION
+#include "../../common/trellis2_fdg_mesh.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,10 +68,49 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\nRunning shape decoder (%d threads)...\n", n_threads);
     t2_shape_dec_result result = t2_shape_dec_forward(dec, slat, n_threads);
 
-    fprintf(stderr, "\nResult: N=%d, feats[:4]=%.4f %.4f %.4f %.4f\n",
+    fprintf(stderr, "\nResult: N=%d, raw feats[:7]=%.2f %.2f %.2f | %.2f %.2f %.2f | %.2f\n",
             result.N,
-            result.feats[0], result.feats[1], result.feats[2], result.feats[3]);
+            result.feats[0], result.feats[1], result.feats[2],
+            result.feats[3], result.feats[4], result.feats[5], result.feats[6]);
 
+    /* Post-process: apply sigmoid to vertex offsets, threshold for intersected */
+    float voxel_margin = 0.0f;  /* from official code default */
+    for (int i = 0; i < result.N; i++) {
+        float *f = result.feats + i * 7;
+        /* vertex offsets: (1 + 2*margin) * sigmoid(x) - margin */
+        for (int j = 0; j < 3; j++)
+            f[j] = (1.0f + 2.0f * voxel_margin) / (1.0f + expf(-f[j])) - voxel_margin;
+        /* intersected: f[3..5] > 0 (already raw logits, keep as-is for mesh extraction) */
+        /* split_weight: softplus(f[6]) = log(1 + exp(x)) */
+        f[6] = logf(1.0f + expf(f[6]));
+    }
+
+    /* Extract coords without batch dim: [N, 3] from result.coords [N, 4] */
+    int32_t *coords3 = (int32_t *)malloc((size_t)result.N * 3 * sizeof(int32_t));
+    for (int i = 0; i < result.N; i++) {
+        coords3[i*3+0] = result.coords[i*4+1];  /* z */
+        coords3[i*3+1] = result.coords[i*4+2];  /* y */
+        coords3[i*3+2] = result.coords[i*4+3];  /* x */
+    }
+
+    /* Mesh extraction */
+    float aabb[6] = {-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f};
+    /* Compute voxel_size from grid resolution and aabb */
+    int max_coord = 0;
+    for (int i = 0; i < result.N * 3; i++)
+        if (coords3[i] > max_coord) max_coord = coords3[i];
+    float vs = (aabb[3] - aabb[0]) / (float)(max_coord + 1);
+
+    fprintf(stderr, "\nExtracting mesh (voxel_size=%.4f, max_coord=%d)...\n", vs, max_coord);
+    t2_fdg_mesh mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
+    free(coords3);
+
+    if (mesh.n_tris > 0) {
+        const char *obj_path = "shape_output.obj";
+        t2_fdg_write_obj(obj_path, &mesh);
+    }
+
+    t2_fdg_mesh_free(&mesh);
     t2_shape_dec_result_free(&result);
     sp3d_free(slat);
     t2_shape_dec_free(dec);
