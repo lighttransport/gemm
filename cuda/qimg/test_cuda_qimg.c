@@ -338,10 +338,12 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
             latent[i] = randn();
 
-        /* Scheduler — match ComfyUI's AuraFlow shift=3.1 */
+        /* Scheduler — match ComfyUI's Qwen-Image defaults:
+         * shift=1.15, multiplier=1.0 (from comfy/supported_models.py QwenImage class)
+         * The generate_comfyui.py overrides shift to 3.1 for better quality */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
-        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f);
+        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f, 1.0f);
 
         float cfg_scale = 2.5f;  /* ComfyUI default for Qwen-Image */
 
@@ -425,6 +427,14 @@ int main(int argc, char **argv) {
 
         free(img_tokens); free(vel_cond); free(vel_uncond);
         free(txt_hidden); free(txt_neg_hidden);
+
+        /* Save denoised latent for debugging */
+        {
+            int lat_n = lat_ch * lat_h * lat_w;
+            FILE *lf = fopen("cuda_latent.bin", "wb");
+            if (lf) { fwrite(latent, sizeof(float), (size_t)lat_n, lf); fclose(lf);
+                fprintf(stderr, "Saved latent [%d,%d,%d] to cuda_latent.bin\n", lat_ch, lat_h, lat_w); }
+        }
 
         /* 3. VAE decode (CUDA) */
         fprintf(stderr, "\n[3/3] VAE decode (CUDA)...\n");
