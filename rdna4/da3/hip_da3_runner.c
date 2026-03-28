@@ -2125,6 +2125,77 @@ static void run_camera_dec(hip_da3_runner *r, float *pose_out) {
     free(h_mlp); free(h_fc_t_w); free(h_fc_t_b); free(h_fc_q_w); free(h_fc_q_b); free(h_fc_f_w); free(h_fc_f_b);
 }
 
+/* CameraEnc: pose[9] -> MLP -> trunk(4 ViT blocks) -> camera_token[dim]
+ * Used for pose-conditioned depth estimation: given a known camera pose,
+ * encode it into a token that replaces the default camera_token in the backbone. */
+static void run_camera_enc(hip_da3_runner *r, const float *pose_in, void *d_cam_token_out) {
+    int dim = r->cam_enc.trunk_dim;
+    int ntb = r->cam_enc.n_trunk_blocks;
+
+    /* Upload pose[9] to GPU */
+    float *h_pose = (float *)malloc(9 * sizeof(float));
+    memcpy(h_pose, pose_in, 9 * sizeof(float));
+    void *d_pose = NULL;
+    hipMalloc(&d_pose, 9 * sizeof(float));
+    hipMemcpy(d_pose, h_pose, 9 * sizeof(float), hipMemcpyHostToDevice);
+    free(h_pose);
+
+    /* pose_branch MLP: [1, 9] -> fc1 -> GELU -> fc2 -> [1, dim] */
+    kl_gemm(r, r->d_attn_out, r->cam_enc.fc1_w, d_pose, r->cam_enc.fc1_b, dim, 9, 1);
+    kl_gelu(r, r->d_attn_out, dim);
+    kl_gemm(r, r->d_proj_out, r->cam_enc.fc2_w, r->d_attn_out, r->cam_enc.fc2_b, dim, dim, 1);
+
+    /* token_norm: LayerNorm on [1, dim] */
+    kl_layernorm(r, r->d_ln_buf, r->d_proj_out,
+                  r->cam_enc.token_norm_w, r->cam_enc.token_norm_b, 1, dim);
+
+    /* Copy to hidden for trunk processing (reuse d_hidden2 as scratch) */
+    hipMemcpyAsync(r->d_hidden2, r->d_ln_buf, (size_t)dim * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+
+    /* trunk: 4 standard ViT blocks (no RoPE, no QK-norm, single token) */
+    for (int L = 0; L < ntb; L++) {
+        hip_da3_layer *ly = &r->cam_enc.trunk[L];
+
+        /* LN1 + self-attention */
+        kl_layernorm(r, r->d_ln_buf, r->d_hidden2, ly->ln1_w, ly->ln1_b, 1, dim);
+        kl_gemm(r, r->d_qkv, ly->attn_qkv_w, r->d_ln_buf, ly->attn_qkv_b, ly->qkv_rows, dim, 1);
+
+        /* For single token, attention is trivial: output = V (softmax of [1x1] = 1) */
+        /* Q@K^T = [1,1] score, softmax = 1, output = V */
+        hipMemcpyAsync(r->d_attn_out, (char *)r->d_qkv + (size_t)(2 * dim) * sizeof(float),
+                        (size_t)dim * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+
+        /* Output projection */
+        kl_gemm(r, r->d_proj_out, ly->attn_out_w, r->d_attn_out, ly->attn_out_b, dim, dim, 1);
+
+        /* LayerScale 1 + residual */
+        kl_layerscale_add(r, r->d_hidden2, r->d_proj_out, ly->ls1, dim, dim);
+
+        /* LN2 + FFN (GELU MLP) */
+        kl_layernorm(r, r->d_ln_buf, r->d_hidden2, ly->ln2_w, ly->ln2_b, 1, dim);
+        kl_gemm(r, r->d_ffn_buf, ly->ffn_up_w, r->d_ln_buf, ly->ffn_up_b, ly->ffn_up_rows, dim, 1);
+        kl_gelu(r, r->d_ffn_buf, ly->ffn_up_rows);
+        kl_gemm(r, r->d_proj_out, ly->ffn_down_w, r->d_ffn_buf, ly->ffn_down_b, dim, ly->ffn_up_rows, 1);
+
+        /* LayerScale 2 + residual */
+        kl_layerscale_add(r, r->d_hidden2, r->d_proj_out, ly->ls2, dim, dim);
+    }
+
+    /* trunk_norm: LayerNorm on final output */
+    kl_layernorm(r, d_cam_token_out, r->d_hidden2,
+                  r->cam_enc.trunk_norm_w, r->cam_enc.trunk_norm_b, 1, dim);
+
+    hipFree(d_pose);
+
+    if (r->verbose >= 1) {
+        hipDeviceSynchronize();
+        float dbg[5];
+        hipMemcpy(dbg, d_cam_token_out, sizeof(dbg), hipMemcpyDeviceToHost);
+        fprintf(stderr, "hip_da3: CameraEnc output[0:5] = %.4f %.4f %.4f %.4f %.4f\n",
+                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
+    }
+}
+
 /* Aux DPT: rays + sky segmentation (reuses d_dpt_adapted from main DPT) */
 static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
                           void **d_aux_out) {
@@ -2462,6 +2533,14 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
     clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
     int stride_3dim = 3 * dim;
 
+    /* If pose_in is provided and CameraEnc is loaded, compute conditioned camera token */
+    void *d_cond_cam_token = NULL;
+    if (pose_in && r->cam_enc.loaded) {
+        hipMalloc(&d_cond_cam_token, (size_t)dim * sizeof(float));
+        run_camera_enc(r, pose_in, d_cond_cam_token);
+        if (r->verbose >= 1) fprintf(stderr, "hip_da3: CameraEnc: pose-conditioned camera token computed\n");
+    }
+
     /* Initialize local_hidden = hidden (before any block runs) */
     hipMemcpyAsync(r->d_local_hidden, r->d_hidden, (size_t)nt*dim*sizeof(float), hipMemcpyDeviceToDevice, r->stream);
 
@@ -2472,8 +2551,10 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
         int is_global = (L >= r->rope_start && (L % 2) == 1);
 
         /* Camera token injection: replace CLS (token 0) at rope_start layer */
-        if (L == r->rope_start && r->d_camera_token) {
-            hipMemcpyAsync(r->d_hidden, r->d_camera_token, (size_t)dim * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
+        if (L == r->rope_start) {
+            void *cam_src = d_cond_cam_token ? d_cond_cam_token : r->d_camera_token;
+            if (cam_src)
+                hipMemcpyAsync(r->d_hidden, cam_src, (size_t)dim * sizeof(float), hipMemcpyDeviceToDevice, r->stream);
         }
 
         kl_layernorm(r, r->d_ln_buf, r->d_hidden, ly->ln1_w, ly->ln1_b, nt, dim);
@@ -2881,6 +2962,7 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                     gs_oc, (gs1-gs0)*1000);
     }
 
+    if (d_cond_cam_token) hipFree(d_cond_cam_token);
     return result;
 }
 
