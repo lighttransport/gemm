@@ -214,9 +214,14 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk, int n_
     int C_in = blk->C_in, C_out = blk->C_out;
 
     /* 1. Predict subdivision: which sub-voxels to activate */
-    /* to_subdiv: [8, C_in] @ feats[N, C_in] -> [N, 8] */
     float *sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
-    t2sd_linear(sub_logits, t->feats, N, blk->to_subdiv_w, blk->to_subdiv_b, 8, C_in);
+    if (blk->to_subdiv_w) {
+        /* to_subdiv: [8, C_in] @ feats[N, C_in] -> [N, 8] */
+        t2sd_linear(sub_logits, t->feats, N, blk->to_subdiv_w, blk->to_subdiv_b, 8, C_in);
+    } else {
+        /* No subdivision prediction — activate all 8 sub-voxels (for texture decoder) */
+        for (int i = 0; i < N * 8; i++) sub_logits[i] = 1.0f;
+    }
 
     /* Threshold: activate sub-voxels where logit > 0 */
     int total_sub = 0;
