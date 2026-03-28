@@ -342,11 +342,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
             latent[i] = randn();
 
-        /* Scheduler — dynamic with shift_terminal=0 (sigma goes to 0) */
+        /* Scheduler — ComfyUI compatible (shift=1.15, sigma→0, multiplier=1000) */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
-        sched.shift_terminal = 0.0f;  /* go to sigma=0 (fully denoise) */
-        qimg_sched_set_timesteps(&sched, n_steps, n_img);
+        qimg_sched_set_timesteps_comfyui(&sched, n_steps, 1.15f, 1000.0f);
 
         float cfg_scale = 2.5f;
         for (int i = 1; i < argc; i++)
