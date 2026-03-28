@@ -414,18 +414,21 @@ static const char *qimg_kernel_src =
  * q,k: [n_tok, n_heads*head_dim], axes: t_dim, h_dim, w_dim
  * Grid: (n_tok), Block: (n_heads) */
 "__global__ void rope_2d_f32(float *__restrict__ q, float *__restrict__ k,\n"
-"    int n_tok, int n_heads, int head_dim, int w_patches,\n"
+"    int n_tok, int n_heads, int head_dim, int h_patches, int w_patches,\n"
 "    int t_dim, int h_dim, int w_dim, float theta) {\n"
 "    int tok = blockIdx.x;\n"
 "    int head = threadIdx.x;\n"
 "    if (tok >= n_tok || head >= n_heads) return;\n"
 "    int dim = n_heads * head_dim;\n"
 "    int ph = tok / w_patches, pw = tok % w_patches;\n"
+"    /* Center positions around 0 (matches ComfyUI: pos - h_len//2) */\n"
+"    float ph_f = (float)ph - (float)(h_patches / 2);\n"
+"    float pw_f = (float)pw - (float)(w_patches / 2);\n"
 "    int off = head * head_dim;\n"
 "    /* Height RoPE at offset t_dim */\n"
 "    for (int i = 0; i < h_dim / 2; i++) {\n"
 "        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)h_dim);\n"
-"        float angle = (float)ph * freq;\n"
+"        float angle = ph_f * freq;\n"
 "        float cs = cosf(angle), sn = sinf(angle);\n"
 "        int idx = off + t_dim + 2 * i;\n"
 "        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
@@ -438,7 +441,7 @@ static const char *qimg_kernel_src =
 "    /* Width RoPE at offset t_dim + h_dim */\n"
 "    for (int i = 0; i < w_dim / 2; i++) {\n"
 "        float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)w_dim);\n"
-"        float angle = (float)pw * freq;\n"
+"        float angle = pw_f * freq;\n"
 "        float cs = cosf(angle), sn = sinf(angle);\n"
 "        int idx = off + t_dim + h_dim + 2 * i;\n"
 "        float q0 = q[tok*dim+idx], q1 = q[tok*dim+idx+1];\n"
@@ -1453,7 +1456,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
          * txt_start = max(hp/2, wp/2) to match ComfyUI convention. */
         {
             void *rope2d_args[] = {&d_img_q, &d_img_k,
-                                   &n_img, &nh, &hd, &wp_rope,
+                                   &n_img, &nh, &hd, &hp_rope, &wp_rope,
                                    &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
             cuLaunchKernel(r->rope_2d, (unsigned)n_img, 1, 1,
                            (unsigned)nh, 1, 1, 0, s, rope2d_args, NULL);
