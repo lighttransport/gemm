@@ -34,6 +34,12 @@ make
 | 1050x700 | 36x24 | 74 ms | 76 ms | ~128 ms | Same image, half resolution |
 | 518x518 | 37x37 | 85 ms | 98 ms | ~183 ms | Square input |
 
+**DA3-Giant (dim=1536, 40 blocks):**
+
+| Image Size | Backbone | DPT | Aux DPT | GSDPT | Total |
+|-----------|----------|-----|---------|-------|-------|
+| 2100x1400 | 750 ms | 310 ms | 314 ms | 549 ms | ~2.0 s |
+
 First run includes HIPRTC kernel compilation (~30-60 min on gfx1201 with ROCm 7.x).
 
 ## Accuracy
@@ -52,17 +58,18 @@ Auto-detected from safetensors tensor shapes. No config.json required for basic 
 
 | Model | embed_dim | Blocks | Heads | Status |
 |-------|-----------|--------|-------|--------|
-| DA3-Small | 384 | 12 | 6 | Verified |
+| DA3-Small | 384 | 12 | 6 | Verified (depth, pose, rays, GS) |
 | DA3-Base | 768 | 12 | 12 | Untested (should work) |
 | DA3-Large | 1024 | 24 | 16 | Untested (should work) |
-| DA3-Giant | 1536 | 40 | 24 | Untested (should work) |
+| DA3-Giant | 1536 | 40 | 24 | Verified (all modalities, ~2s) |
 
 ## Output Modalities
 
 | Output | Flag | Status |
 |--------|------|--------|
 | Depth + Confidence | `DA3_OUTPUT_DEPTH` | Implemented, verified |
-| Pose (CameraDec) | `DA3_OUTPUT_POSE` | Implemented |
+| Pose estimation (CameraDec) | `DA3_OUTPUT_POSE` | Implemented |
+| Pose conditioning (CameraEnc) | `--pose-in` | Implemented |
 | Rays + Sky Seg | `DA3_OUTPUT_RAYS` | Implemented |
 | 3D Gaussians (GSDPT) | `DA3_OUTPUT_GAUSSIANS` | Implemented |
 | Metric Depth | - | Not implemented |
@@ -86,6 +93,8 @@ Modes:
   --pose             Enable pose estimation
   --rays             Enable ray + sky segmentation
   --gaussians        Enable 3D gaussian output
+  --pose-in "t,t,t,q,q,q,q,f,f"  Pose conditioning (CameraEnc)
+                     9 comma-separated floats: translation[3], quaternion[4], fov[2]
 
 Debug:
   -v <level>         Verbosity (0=quiet, 1=timing, 2=per-block stats)
