@@ -1422,8 +1422,9 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
                 2 * dim, dim, 1);
         cuMemFree(d_t_silu);
 
-        CUdeviceptr f_shift = d_final_mod;
-        CUdeviceptr f_scale = d_final_mod + (size_t)dim * sizeof(float);
+        /* LastLayer: scale, shift = chunk(emb, 2) — scale is FIRST half */
+        CUdeviceptr f_scale = d_final_mod;
+        CUdeviceptr f_shift = d_final_mod + (size_t)dim * sizeof(float);
         op_adaln(r, d_scratch1, d_img, f_shift, f_scale, n_img, dim);
         cuMemFree(d_final_mod);
 
