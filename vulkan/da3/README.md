@@ -84,12 +84,12 @@ Auto-detected from safetensors tensor shapes:
 
 ## Output Modalities
 
-| Output | Status |
-|--------|--------|
-| Depth + Confidence | Implemented, verified |
-| Pose (CameraDec) | API defined, not yet implemented |
-| Rays + Sky Seg | API defined, not yet implemented |
-| 3D Gaussians | API defined, not yet implemented |
+| Output | Flag | Status |
+|--------|------|--------|
+| Depth + Confidence | `DA3_OUTPUT_DEPTH` | Implemented, verified |
+| Pose estimation (CameraDec) | `DA3_OUTPUT_POSE` | Implemented, verified vs HIP |
+| Rays + Sky Seg (Aux DPT) | `DA3_OUTPUT_RAYS` | Implemented |
+| 3D Gaussians (GSDPT) | `DA3_OUTPUT_GAUSSIANS` | Implemented (needs Giant model) |
 
 ## CLI Options
 
@@ -104,6 +104,12 @@ Input:
 Output:
   -o <path>            Falsecolor depth PNG
   --npy <path>         Raw depth as NumPy .npy
+
+Debug:
+  --full               Enable all output modalities
+  --pose               Enable pose estimation
+  --rays               Enable ray + sky segmentation
+  --gaussians          Enable 3D gaussian output
 
 Debug:
   -v <level>           Verbosity:
@@ -137,6 +143,7 @@ Debug:
 | `sinusoidal_uv_posembed_f32` | UV positional embedding |
 | `relu_f32` | In-place ReLU |
 | `channel_layernorm_f32` | Per-position channel LayerNorm |
+| `silu_f32` | In-place SiLU activation (for GSDPT merger) |
 
 Plus 6 shared shaders: `layernorm_f32`, `matmul_bias_f32`, `gelu_f32`, `add_f32`, `hy3d/layerscale_add_f32`, `hy3d/qk_layernorm_f32`.
 
@@ -182,4 +189,4 @@ Input RGB
 | Kernel compilation | HIPRTC at runtime (~30 min first run) | Pre-compiled SPIR-V (instant) |
 | GPU support | RDNA4 only (gfx1200/1201) | Any Vulkan compute GPU |
 | Dispatch model | Async stream | Per-dispatch sync (optimization TODO) |
-| Output modalities | Depth, Pose, Rays, Gaussians | Depth only (others TODO) |
+| Output modalities | Depth, Pose, Rays, Gaussians | Depth, Pose, Rays, Gaussians |
