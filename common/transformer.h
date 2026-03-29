@@ -41,6 +41,9 @@ typedef struct {
     qtensor attn_v;      /* [n_kv_dim, n_embd] */
     qtensor attn_q_norm; /* [head_dim] */
     qtensor attn_k_norm; /* [head_dim] */
+    qtensor attn_q_bias; /* [n_embd] Q projection bias (Qwen2.5-VL) */
+    qtensor attn_k_bias; /* [n_kv_dim] K projection bias */
+    qtensor attn_v_bias; /* [n_kv_dim] V projection bias */
     qtensor attn_output; /* [n_embd, n_embd] */
     qtensor ffn_norm;    /* [n_embd] */
     qtensor ffn_gate;    /* [n_ff, n_embd] */
@@ -1495,6 +1498,13 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             LOAD(attn_k_norm,  "attn_k_norm", 0)
             LOAD(attn_output,  "attn_output", 1)
             LOAD(ffn_norm,     "ffn_norm",    1)
+            /* Q/K/V biases (optional, e.g. Qwen2.5-VL) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+            m->layers[l].attn_q_bias = tf_load_tensor(gguf, name, 0);
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+            m->layers[l].attn_k_bias = tf_load_tensor(gguf, name, 0);
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);
+            m->layers[l].attn_v_bias = tf_load_tensor(gguf, name, 0);
         }
         if (m->use_moe) {
             LOAD(ffn_gate_inp,  "ffn_gate_inp",  1)
@@ -2514,6 +2524,34 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             TF_PROF_BEGIN("qkv_proj", l, "matvec", "FP32");
             tf_qmatvec_fused_qkv_pool(m, m->q, &layer->attn_q, q_dim,
                                        m->k, &layer->attn_k, m->v, &layer->attn_v, kv_dim);
+            /* Add Q/K/V biases if present (Qwen2.5-VL) */
+            if (layer->attn_q_bias.data) {
+                if (layer->attn_q_bias.type == GGML_TYPE_F32) {
+                    float *qb = (float *)layer->attn_q_bias.data;
+                    for (int i = 0; i < q_dim; i++) m->q[i] += qb[i];
+                } else {
+                    tf_dequant_row(&layer->attn_q_bias, 0, m->matvec_tmp);
+                    for (int i = 0; i < q_dim; i++) m->q[i] += m->matvec_tmp[i];
+                }
+            }
+            if (layer->attn_k_bias.data) {
+                if (layer->attn_k_bias.type == GGML_TYPE_F32) {
+                    float *kb = (float *)layer->attn_k_bias.data;
+                    for (int i = 0; i < kv_dim; i++) m->k[i] += kb[i];
+                } else {
+                    tf_dequant_row(&layer->attn_k_bias, 0, m->matvec_tmp);
+                    for (int i = 0; i < kv_dim; i++) m->k[i] += m->matvec_tmp[i];
+                }
+            }
+            if (layer->attn_v_bias.data) {
+                if (layer->attn_v_bias.type == GGML_TYPE_F32) {
+                    float *vb = (float *)layer->attn_v_bias.data;
+                    for (int i = 0; i < kv_dim; i++) m->v[i] += vb[i];
+                } else {
+                    tf_dequant_row(&layer->attn_v_bias, 0, m->matvec_tmp);
+                    for (int i = 0; i < kv_dim; i++) m->v[i] += m->matvec_tmp[i];
+                }
+            }
             TF_PROF_END("qkv_proj", 2.0 * (q_dim + 2.0 * kv_dim) * n_embd, 0);
 
             /* QK-Norm (if present) */
@@ -2694,9 +2732,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             tf_vadd(m->x, ds_slice, n_embd);
         }
 
-        if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
-            fprintf(stderr, "  layer %2d: hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(m->x, n_embd)));
-        }
+        (void)0; /* hidden norm profiling available via tf_sum_squares if needed */
     }
 
     /* Final RMSNorm (only if we processed through the last layer) */
@@ -3872,10 +3908,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
 
         t_deepstack += tf_time_ms() - t0p;
 
-        if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
-            float *last = bx + (size_t)(N-1) * n_embd;
-            fprintf(stderr, "  [batch] layer %2d: last token hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(last, n_embd)));
-        }
+        (void)0; /* batch hidden norm profiling available via tf_sum_squares if needed */
     }
 
     /* Print batch profiling summary */

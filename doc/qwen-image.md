@@ -179,6 +179,9 @@ All are single-header libraries (define `*_IMPLEMENTATION` before include).
 
 | Script | Description |
 |---|---|
+| `generate_reference.py` | **Consolidated** reference data generator (text + DiT + VAE) |
+| `verify_pipeline.py` | **End-to-end** verification against ComfyUI reference |
+| `compare.py` | Single-file .npy comparison tool (corr, max diff, PASS/FAIL) |
 | `generate_comfyui.py` | ComfyUI ground truth generator (PyTorch noise) |
 | `generate_comfyui_ournoise.py` | ComfyUI ground truth with our PRNG (cos+sin pair caching) |
 | `trace_dit_blocks.py` | Block-by-block DiT comparison (saves all 60 block outputs as .npy) |
@@ -205,9 +208,14 @@ make test_cuda_qimg
 #   --no-cfg     Disable classifier-free guidance (single pass, 2× faster)
 #   --cfg-scale  CFG scale (default: 2.5)
 #   --seed <n>   Random seed (default: 42)
-#   --verbose <n> Debug level (3=save .npy intermediates)
 #   --test-vae   VAE-only decode from .npy latent
 #   --test-dit   Single DiT step test
+#
+# Verbose levels (--verbose <n>):
+#   0 = silent (errors only)
+#   1 = progress (default: step N/M, block loading, timing)
+#   2 = stats (per-layer min/max/mean/NaN)
+#   3 = dump (save .npy/.bin intermediates for verification)
 ```
 
 ### CPU
@@ -224,6 +232,24 @@ make test_qwen_image
     --height 128 --width 128 --steps 20 --prompt "a red apple on a white table"
 ```
 
+### Verification
+
+```bash
+# Step 1: Generate ComfyUI reference data (requires ComfyUI + GPU)
+cd ref/qwen_image
+python generate_reference.py --all \
+    --comfyui-dir /mnt/disk01/ComfyUI \
+    --model-dir /mnt/disk01/models/qwen-image-st
+
+# Step 2: Generate our output with debug dumps
+cd cuda/qimg
+./test_cuda_qimg --generate --height 256 --width 256 --steps 10 --verbose 3
+
+# Step 3: Run verification
+cd ref/qwen_image
+python verify_pipeline.py --cuda-dir ../../cuda/qimg/ --ref-dir output/
+```
+
 ## Implementation Status
 
 ### Verification Results
@@ -234,7 +260,7 @@ make test_qwen_image
 | **VAE (CPU)** | SSIM=1.0000 | Pixel-perfect (same 3 fixes as CUDA) |
 | **DiT (per-block)** | corr=1.000000 | All 60 blocks match (FP8 LUT = ComfyUI FP8) |
 | **DiT (per-block, 6-tok neg)** | corr=1.000000 | Separate token counts work correctly |
-| **Text encoder** | corr=1.000000 | Cached + live encoding both match |
+| **Text encoder** | corr=1.000000 | FP8 scaled safetensors with Q/K/V biases + template stripping |
 | **Scheduler sigmas** | exact match | Pre-shifted table + simple sampling |
 | **Full pipeline (10 steps)** | SSIM≈0.73 | FP8 precision compounds over 10 steps |
 
@@ -262,6 +288,9 @@ GPU memory: 41/60 DiT blocks preloaded (FP8), 2.0 GB free for activations.
 | norm_out scale/shift swap | corr=0.39 → 0.81 | `scale = chunk[0], shift = chunk[1]` |
 | Text RoPE: 1D vs 3-axis | corr=0.81 → 0.989 | 3-axis with txt_start offset |
 | PRNG: cos-only vs cos+sin | Mismatched noise sequences | Box-Muller pair caching (both cos and sin) |
+| **Text enc: missing Q/K/V biases** | Garbage hidden states, random images | Add `attn_q_bias/k_bias/v_bias` to transformer.h |
+| **Text enc: no template stripping** | 46 tokens instead of 12 | Strip chat template prefix (match ComfyUI encode_token_weights) |
+| **Text enc: wrong cached .npy** | All prompts generate apple | Skip cached .npy when `--prompt` specified |
 
 ## TODO / FIXME
 
@@ -277,7 +306,7 @@ GPU memory: 41/60 DiT blocks preloaded (FP8), 2.0 GB free for activations.
 
 ### Quality
 
-- [ ] **CFG with separate n_txt**: Currently zero-pads negative text. Should run uncond pass with actual token count (6 tokens) to match ComfyUI. Previous attempt caused velocity instability — needs investigation.
+- [x] **CFG with separate n_txt**: Uncond pass uses actual token count (6 tokens) matching ComfyUI.
 - [ ] **FP8 precision gap**: Single-step corr=1.0, but 10-step SSIM≈0.73 due to FP8 error compounding. Could be improved by:
   - Mixed precision: F32 for sensitive operations (modulation, attention softmax)
   - Kahan summation in GEMM accumulation

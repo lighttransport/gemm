@@ -261,15 +261,22 @@ qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
             ly->field = make_qt_f32(d, 1, n_embd); \
         } while(0)
 
-        (void)0; /* LOAD_BIAS removed — transformer.h doesn't support attn biases */
-
         LOAD_NORM(attn_norm, "input_layernorm.weight");
         LOAD_W(attn_q, "self_attn.q_proj.weight", "self_attn.q_proj.scale_weight");
         LOAD_W(attn_k, "self_attn.k_proj.weight", "self_attn.k_proj.scale_weight");
         LOAD_W(attn_v, "self_attn.v_proj.weight", "self_attn.v_proj.scale_weight");
         LOAD_W(attn_output, "self_attn.o_proj.weight", "self_attn.o_proj.scale_weight");
-        /* Note: Qwen2 has Q/K/V biases but transformer.h doesn't support them.
-         * Skip for compatibility with existing forward pass. */
+
+        /* Q/K/V biases (BF16 in safetensors) — critical for correct attention */
+        #define LOAD_BIAS(field, suffix) do { \
+            snprintf(wn, sizeof(wn), "model.layers.%d." suffix, l); \
+            float *d = st_dequant_scaled_fp8(st, wn, "", &r, &c); \
+            if (d) ly->field = make_qt_f32(d, 1, r * c); \
+        } while(0)
+        LOAD_BIAS(attn_q_bias, "self_attn.q_proj.bias");
+        LOAD_BIAS(attn_k_bias, "self_attn.k_proj.bias");
+        LOAD_BIAS(attn_v_bias, "self_attn.v_proj.bias");
+        #undef LOAD_BIAS
 
         LOAD_NORM(ffn_norm, "post_attention_layernorm.weight");
         LOAD_W(ffn_gate, "mlp.gate_proj.weight", "mlp.gate_proj.scale_weight");
@@ -374,11 +381,10 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
     #undef IM_START
     #undef IM_END
 
-    fprintf(stderr, "qimg_text_enc: tokenized \"%s\" -> %d tokens: [",
+    fprintf(stderr, "qimg_text_enc: tokenized \"%s\" -> %d tokens:\n  [",
             text, n_tokens);
-    for (int i = 0; i < n_tokens && i < 10; i++)
+    for (int i = 0; i < n_tokens; i++)
         fprintf(stderr, "%d%s", tokens[i], i < n_tokens - 1 ? ", " : "");
-    if (n_tokens > 10) fprintf(stderr, "...");
     fprintf(stderr, "]\n");
 
     /* Run each token through transformer and collect hidden states */
@@ -401,9 +407,40 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
     }
     fprintf(stderr, "\n");
 
+    /* Strip template prefix (matching ComfyUI's encode_token_weights).
+     * ComfyUI finds the 2nd <|im_start|> (151644), then if followed by
+     * "user" (872) + "\n" (198), skips past them.
+     * Result: only user prompt + assistant tokens remain. */
+    int template_end = 0;
+    {
+        int count_im_start = 0;
+        for (int i = 0; i < n_tokens; i++) {
+            if (tokens[i] == 151644 && count_im_start < 2) {
+                template_end = i;
+                count_im_start++;
+            }
+        }
+        /* Advance past "user\n" if present */
+        if (n_tokens > template_end + 3 &&
+            tokens[template_end + 1] == 872 &&   /* "user" */
+            tokens[template_end + 2] == 198) {    /* "\n" */
+            template_end += 3;
+        }
+    }
+
+    int out_count = n_tokens - template_end;
+    fprintf(stderr, "qimg_text_enc: stripping template prefix (%d tokens), returning %d tokens\n",
+            template_end, out_count);
+
+    /* Shift hidden states to remove template prefix */
+    float *out_hidden = (float *)malloc((size_t)out_count * n_embd * sizeof(float));
+    memcpy(out_hidden, hidden_states + (size_t)template_end * n_embd,
+           (size_t)out_count * n_embd * sizeof(float));
+    free(hidden_states);
     free(tokens);
-    *out_n_tokens = n_tokens;
-    return hidden_states;
+
+    *out_n_tokens = out_count;
+    return out_hidden;
 }
 
 #endif /* QIMG_TEXT_ENCODER_IMPLEMENTATION */
