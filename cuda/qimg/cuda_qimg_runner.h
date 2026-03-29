@@ -676,7 +676,7 @@ struct cuda_qimg_runner {
     CUstream stream;
     CUmodule module;
     int sm_version;
-    int verbose;
+    int verbose;  /* 0=silent, 1=progress(default), 2=stats, 3=dump .npy */
 
     /* Kernel handles */
     CUfunction gemm_f16_f32;
@@ -1865,8 +1865,8 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     int h = lat_h, w = lat_w, c = 16;
     fprintf(stderr, "cuda_qimg_vae: decoding [%d, %d, %d] on GPU\n", c, h, w);
 
-    /* Debug: dump GPU buffer stats */
-    #define VAE_DUMP(label, ptr, count) do { \
+    /* Debug: dump GPU buffer stats (verbose >= 2) */
+    #define VAE_DUMP(label, ptr, count) do { if (r->verbose >= 2) { \
         cuStreamSynchronize(s); \
         float *_t = (float*)malloc((count)*sizeof(float)); \
         cuMemcpyDtoH(_t, ptr, (count)*sizeof(float)); \
@@ -1876,7 +1876,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
                 if(_t[_i]<_mn)_mn=_t[_i]; if(_t[_i]>_mx)_mx=_t[_i]; _s+=_t[_i];}} \
         fprintf(stderr, "  [vae] %s: min=%.4f max=%.4f mean=%.4f nan=%d/%d\n", \
                 label, _mn, _mx, _s/((count)-_nn), _nn, (count)); \
-        free(_t); } while(0)
+        free(_t); } } while(0)
 
     /* Save GPU buffer as .npy file for comparison with ComfyUI */
     #define VAE_SAVE_NPY(fname, ptr, ndim, dims) do { \
@@ -1919,7 +1919,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     CUdeviceptr d_x;
     cuMemAlloc(&d_x, (size_t)c * h * w * sizeof(float));
     cuMemcpyHtoD(d_x, latent, (size_t)c * h * w * sizeof(float));
-    if (r->verbose >= 2) VAE_DUMP("latent_input", d_x, c*h*w);
+    VAE_DUMP("latent_input", d_x, c*h*w);
 
     /* post_quant_conv (conv2): 1×1×1 → effectively pointwise */
     CUdeviceptr d_pqc_w = vae_upload_f32(st, "conv2.weight", s);
@@ -1931,7 +1931,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         cuMemFree(d_x); d_x = d_tmp;
         cuMemFree(d_pqc_w); cuMemFree(d_pqc_b);
     }
-    if (r->verbose >= 2) VAE_DUMP("post_quant", d_x, c*h*w);
+    VAE_DUMP("post_quant", d_x, c*h*w);
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_post_quant.npy", d_x, 3, _d); }
 
     /* decoder.conv1: 16→384, 3×3 */
@@ -1947,7 +1947,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         cuMemFree(d_c1_w); cuMemFree(d_c1_b);
     }
     fprintf(stderr, "  after conv1: [%d, %d, %d]\n", c, h, w);
-    if (r->verbose >= 2) VAE_DUMP("conv1_out", d_x, c*h*w);
+    VAE_DUMP("conv1_out", d_x, c*h*w);
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_conv1.npy", d_x, 3, _d); }
 
     /* Middle: ResBlock → skip attention for now → ResBlock */
@@ -2087,7 +2087,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
       if (scw) cuMemFree(scw); if (scb) cuMemFree(scb); }
     fprintf(stderr, "  after middle: [%d, %d, %d]\n", c, h, w);
-    if (r->verbose >= 2) VAE_DUMP("middle_out", d_x, c*h*w);
+    VAE_DUMP("middle_out", d_x, c*h*w);
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_2.npy", d_x, 3, _d); }
 
     /* Upsample blocks 0-14 */
@@ -2136,11 +2136,9 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             fprintf(stderr, "  upsample %d: [%d, %d, %d]\n", i, c, h, w);
         }
 
-        /* Dump after each upsample iteration (verbose only) */
-        if (r->verbose >= 2) {
-            char _lbl[64]; snprintf(_lbl, sizeof(_lbl), "block_%d [%d,%d,%d]", i, c, h, w);
-            VAE_DUMP(_lbl, d_x, c*h*w);
-        }
+        /* Dump after each upsample iteration */
+        { char _lbl[64]; snprintf(_lbl, sizeof(_lbl), "block_%d [%d,%d,%d]", i, c, h, w);
+          VAE_DUMP(_lbl, d_x, c*h*w); }
         { char _fn[64]; snprintf(_fn, sizeof(_fn), "cuda_vae_upsample_%d.npy", i);
           int _d[] = {c, h, w}; VAE_SAVE_NPY(_fn, d_x, 3, _d); }
     }
@@ -2148,16 +2146,16 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
 
     /* Head: GroupNorm → SiLU → Conv(96→3) */
     {
-        if (r->verbose >= 2) VAE_DUMP("pre_head", d_x, c*h*w);
+        VAE_DUMP("pre_head", d_x, c*h*w);
         CUdeviceptr d_gn = vae_upload_f32(st, "decoder.head.0.gamma", s);
         int spatial = h * w;
         CUdeviceptr d_tmp; cuMemAlloc(&d_tmp, (size_t)c*spatial*sizeof(float));
         vae_op_gn(r, d_tmp, d_x, d_gn, c, spatial);
         vae_bf16(r, d_tmp, c*spatial);
-        if (r->verbose >= 2) VAE_DUMP("head_gn", d_tmp, c*spatial);
+        VAE_DUMP("head_gn", d_tmp, c*spatial);
         vae_op_silu(r, d_tmp, c * spatial);
         vae_bf16(r, d_tmp, c*spatial);
-        if (r->verbose >= 2) VAE_DUMP("head_silu", d_tmp, c*spatial);
+        VAE_DUMP("head_silu", d_tmp, c*spatial);
         cuMemFree(d_gn);
 
         int head_co, head_ci;
@@ -2165,7 +2163,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         CUdeviceptr d_hb = vae_upload_f32(st, "decoder.head.2.bias", s);
         CUdeviceptr d_rgb; cuMemAlloc(&d_rgb, (size_t)3*spatial*sizeof(float));
         vae_op_conv2d(r, d_rgb, d_tmp, d_hw, d_hb, c, h, w, 3, 3, 3, 0);  /* zero spatial pad */
-        if (r->verbose >= 2) VAE_DUMP("head_conv", d_rgb, 3*spatial);
+        VAE_DUMP("head_conv", d_rgb, 3*spatial);
         cuMemFree(d_tmp); cuMemFree(d_x); cuMemFree(d_hw); cuMemFree(d_hb);
         d_x = d_rgb;
         c = 3;
