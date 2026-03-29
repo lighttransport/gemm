@@ -326,22 +326,10 @@ int main(int argc, char **argv) {
             free(txt_neg_hidden);
             cuda_qimg_free(r); return 1;
         }
-        /* Pad shorter condition to match longer with zeros.
-         * ComfyUI processes different-length conds separately, but with repeat-padding
-         * when batching. For our separate-pass approach, zero-padding works best. */
-        if (n_txt_neg < n_txt) {
-            float *padded = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
-            memcpy(padded, txt_neg_hidden, (size_t)n_txt_neg * txt_dim * sizeof(float));
-            free(txt_neg_hidden);
-            txt_neg_hidden = padded;
-            n_txt_neg = n_txt;
-        } else if (n_txt < n_txt_neg) {
-            float *padded = (float *)calloc((size_t)n_txt_neg * txt_dim, sizeof(float));
-            memcpy(padded, txt_hidden, (size_t)n_txt * txt_dim * sizeof(float));
-            free(txt_hidden);
-            txt_hidden = padded;
-            n_txt = n_txt_neg;
-        }
+        /* ComfyUI processes cond/uncond with their ORIGINAL token counts
+         * (no padding). Zero-padding makes uncond ≈ cond, killing CFG effect.
+         * Keep separate n_txt and n_txt_neg for the two passes. */
+        fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens\n", n_txt, n_txt_neg);
 
         /* 2. DiT denoising loop (CUDA) */
         fprintf(stderr, "\n[2/3] DiT denoising (%d steps, %dx%d, %s)...\n",
@@ -397,13 +385,23 @@ int main(int argc, char **argv) {
                     if (lf2) { fwrite(vel_latent, sizeof(float), (size_t)lat_n, lf2); fclose(lf2); }
                 }
             } else {
-                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt,
+                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt_neg,
                                    t_val, vel_uncond);
 
                 float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
                 float *vu_lat = (float *)malloc((size_t)lat_n * sizeof(float));
                 qimg_dit_unpatchify(vc_lat, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
                 qimg_dit_unpatchify(vu_lat, vel_uncond, n_img, lat_ch, lat_h, lat_w, ps);
+
+                /* Debug: save separate velocities at step 0 */
+                if (step == 0 && r->verbose >= 2) {
+                    float vc_std=0,vu_std=0,diff_std=0;
+                    for(int i=0;i<lat_n;i++){vc_std+=vc_lat[i]*vc_lat[i];vu_std+=vu_lat[i]*vu_lat[i];
+                        float d=vc_lat[i]-vu_lat[i];diff_std+=d*d;}
+                    fprintf(stderr, "    step0: v_cond_std=%.4f  v_uncond_std=%.4f  diff_std=%.4f\n",
+                            sqrtf(vc_std/lat_n), sqrtf(vu_std/lat_n), sqrtf(diff_std/lat_n));
+                }
+
                 for (int i = 0; i < lat_n; i++)
                     vel_latent[i] = vu_lat[i] + cfg_scale * (vc_lat[i] - vu_lat[i]);
                 free(vc_lat); free(vu_lat);

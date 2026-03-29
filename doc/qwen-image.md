@@ -16,14 +16,14 @@ Text Prompt
          ▼
 ┌─────────────────┐
 │  MMDiT           │  60-layer dual-stream DiT
-│  [CPU or CUDA]   │  × N_steps (Euler flow matching)
+│  [CUDA]          │  × N_steps (Euler flow matching)
 │                  │  latent [16, H/8, W/8]
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
 │  VAE Decoder     │  3D causal VAE (BF16 weights)
-│  [CPU]           │  → RGB [3, H, W]
+│  [CPU or CUDA]   │  → RGB [3, H, W]
 └────────┬────────┘
          │
          ▼
@@ -70,52 +70,54 @@ Output: per-token hidden states `[N_tokens, 3584]`, no pooling.
 1. Timestep modulation (adaLN-Zero): `SiLU(t_emb) → Linear(3072→18432)` → split into 6 × [shift, scale, gate]
 2. Parallel streams: `adaLN(img)`, `adaLN(txt)`
 3. Q/K/V projection (3072→3072 each) + per-head QK RMSNorm
-4. RoPE: 2D spatial for image tokens, 1D positional for text tokens
+4. RoPE: 3-axis for both image and text tokens (matching ComfyUI convention)
 5. Joint attention: concatenate `[txt, img]` for Q/K/V, attend, split back
 6. Gated residual: `x += gate × proj(attn_out)`
 7. FFN with gated residual: `adaLN → GELU(Linear) → Linear → gated_add`
 
-**Final output:** `adaLN → Linear(3072→64) → unpatchify → velocity [16, H/8, W/8]`
+**Final output:** `LayerNorm + adaLN → Linear(3072→64) → unpatchify → velocity [16, H/8, W/8]`
 
-### VAE — 3D Causal Decoder
+### VAE — 3D Causal Decoder (Wan2.1)
 
 | Parameter | Value |
 |---|---|
 | Latent channels | 16 |
 | Base channels | 96 |
 | Channel multipliers | [1, 2, 4, 4] → [96, 192, 384, 384] |
-| GroupNorm groups | 32 |
+| Normalization | **RMS norm** (NOT GroupNorm) |
 | Activation | SiLU |
 | Weight dtype | BF16 (254 MB) |
-| 3D→2D conversion | Sum temporal kernel dimension (for image mode, T=1) |
+| Spatial padding | **Zeros** (spatial_padding_mode="zeros") |
+| 3D→2D conversion | **Last temporal slice only** (causal_zero for T=1) |
 | Upsample method | Nearest-neighbor 2× + Conv2d 3×3 |
+
+The Wan VAE uses `RMS_norm`: `F.normalize(x, dim=channels) × sqrt(C) × gamma` — L2 normalization per spatial position along the channel dimension. This is fundamentally different from GroupNorm.
+
+For CausalConv3d with T=1 input, ComfyUI's `autopad="causal_zero"` truncates the weight to the last temporal slice (`weight[:,:,-1:,:,:]`), not sum of all slices.
 
 Decoder path: `post_quant_conv(16→16) → conv1(16→384) → mid_block → 15 upsample blocks → norm → conv_out(96→3)`
 
 Blocks 3, 7, 11 are resample-only (spatial upsample, no residual block).
 
-### Scheduler — FlowMatch Euler Discrete
+### Scheduler — FlowMatch Euler (ComfyUI-compatible)
 
 | Parameter | Value |
 |---|---|
-| Training timesteps | 1000 |
-| Shift type | Exponential (dynamic) |
-| Base shift | 0.5 |
-| Max shift | 0.9 |
-| Shift terminal | 0.02 |
-| Base image seq len | 256 |
-| Max image seq len | 8192 |
+| Scheduler type | "simple" (ComfyUI) |
+| Shift function | `time_snr_shift(alpha, t) = alpha * t / (1 + (alpha-1) * t)` |
+| Shift alpha | 3.1 (NOT `exp(3.1)`) |
+| Sigma table | 1000 pre-computed shifted sigmas |
+| Step selection | Evenly-spaced indices from reversed table |
 | Solver | Euler: `x += dt × velocity` |
+| Timestep scale | `timestep = sigma × 1000` (model's Timesteps has scale=1000) |
 
-Dynamic shift: `mu = clamp((log(n_img) - log(256)) / (log(8192) - log(256)), 0, 1)`, `shift = 0.5 + 0.4 × mu`.
-
-Timestep scaling: `timestep = sigma × 1000` (model expects [0, 1000] range).
+The "simple" scheduler pre-computes 1000 shifted sigmas, then picks `n_steps` evenly-spaced samples. This differs from computing the shift at exactly `n_steps` points because the shift function is nonlinear.
 
 ### Classifier-Free Guidance (CFG)
 
 - CFG scale: 2.5 (ComfyUI default)
 - Formula: `v = v_uncond + cfg_scale × (v_cond - v_uncond)`
-- CFGNorm: rescale combined velocity magnitude to match unconditional magnitude
+- Cond and uncond processed with their **original token counts** (no padding — ComfyUI processes them separately)
 
 ## Weight Files
 
@@ -138,7 +140,7 @@ All weights stored under `/mnt/disk01/models/qwen-image-st/` (ComfyUI FP8 format
 
 8-bit float: `[S:1][E:4][M:3]`, exponent bias=7, range ±448.
 
-Dequantization: 256-entry LUT (`fp8_byte → float32`). NaN value (0x7F) mapped to 0.0.
+Dequantization: 256-entry LUT (`fp8_byte → float32`). NaN value (0x7F) mapped to 0.0. LUT verified identical to PyTorch's `torch.float8_e4m3fn` conversion.
 
 Scaled FP8 (text encoder): `actual_weight = fp8_to_f32(byte) × scale_per_tensor`.
 
@@ -149,7 +151,7 @@ Scaled FP8 (text encoder): `actual_weight = fp8_to_f32(byte) × scale_per_tensor
 | File | Description |
 |---|---|
 | `qwen_image_dit.h` | 60-layer MMDiT: patchify, joint attention, adaLN, RoPE, SIMD dot product |
-| `qwen_image_vae.h` | 3D causal VAE decoder: conv2d, groupnorm, resblocks, upsample |
+| `qwen_image_vae.h` | 3D causal VAE decoder: RMS norm, zero-padded conv2d, resblocks, upsample |
 | `qwen_image_scheduler.h` | FlowMatch scheduler: dynamic shift + ComfyUI-compatible mode |
 | `qwen_image_text_encoder.h` | Text encoder wrapper: GGUF + scaled-FP8 safetensors loaders |
 | `safetensors.h` | SafeTensors file parser (mmap) |
@@ -171,225 +173,127 @@ All are single-header libraries (define `*_IMPLEMENTATION` before include).
 |---|---|
 | `cuda_qimg_runner.h` | GPU runner: NVRTC kernel compilation, weight management, DiT/VAE forward |
 | `test_cuda_qimg.c` | CUDA test harness: init, load, dit step, full generation |
+| `test_fp8_gemm.c` | FP8 GEMM correctness test (all sizes PASS, corr=1.0) |
 
 ### PyTorch Reference (`ref/qwen_image/`)
 
 | Script | Description |
 |---|---|
-| `run_full_pipeline.py` | End-to-end PyTorch reference with block-by-block GPU processing |
-| `run_dit_reference.py` | Single DiT block reference with intermediate dumps |
-| `run_dit_block_reference.py` | Comprehensive block-level verification |
-| `run_vae_reference.py` | VAE decoder layer-by-layer with 22-stage dumps |
-| `compare.py` | Numerical comparison tool (max error, correlation) |
-| `generate_comfyui.py` | ComfyUI ground truth generator (512×512, 1024×1024) |
+| `generate_comfyui.py` | ComfyUI ground truth generator (PyTorch noise) |
+| `generate_comfyui_ournoise.py` | ComfyUI ground truth with our PRNG (cos+sin pair caching) |
+| `trace_dit_blocks.py` | Block-by-block DiT comparison (saves all 60 block outputs as .npy) |
+| `trace_perstep.py` | Per-step latent comparison with ComfyUI sampling loop |
+| `trace_block0.py` | Block 0 intermediate trace |
 | `encode_text_comfyui.py` | Extract text encoder hidden states from ComfyUI |
-| `generate_ground_truth.py` | Ground truth image generation |
 
 ## Build & Run
+
+### CUDA (recommended)
+
+```bash
+cd cuda/qimg
+make test_cuda_qimg
+
+# Full pipeline (256×256, 10 steps)
+./test_cuda_qimg --generate \
+    --height 256 --width 256 --steps 10 \
+    --prompt "a red apple on a white table"
+
+# Options:
+#   --no-fp8     Force F32 GEMM (slow but maximum precision)
+#   --f16        Force F16 tiled GEMM (correct but slower than FP8 LUT)
+#   --no-cfg     Disable classifier-free guidance (single pass, 2× faster)
+#   --cfg-scale  CFG scale (default: 2.5)
+#   --seed <n>   Random seed (default: 42)
+#   --verbose <n> Debug level (3=save .npy intermediates)
+#   --test-vae   VAE-only decode from .npy latent
+#   --test-dit   Single DiT step test
+```
 
 ### CPU
 
 ```bash
 cd cpu/qwen_image
+make test_qwen_image
 
-# Build
-cc -O2 -mavx2 -mfma -I../../common -o test_qwen_image test_qwen_image.c -lm -lpthread
-
-# Full pipeline (safetensors weights)
+# Full pipeline (128×128, 20 steps)
 ./test_qwen_image --generate \
     /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors \
     /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors \
     /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
     --height 128 --width 128 --steps 20 --prompt "a red apple on a white table"
-
-# Individual tests
-./test_qwen_image --test-sched
-./test_qwen_image --test-vae /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors
-./test_qwen_image --test-dit /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors
-./test_qwen_image --test-enc /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf
-```
-
-### CUDA
-
-```bash
-cd cuda/qimg
-
-# Build (requires cuew.c for CUDA driver API loading)
-cc -O2 -mavx2 -mfma -I../../common -I.. -o test_cuda_qimg test_cuda_qimg.c ../cuew.c -lm -ldl -lpthread
-
-# Full pipeline (uses FP8 native GEMM on sm_89+)
-./test_cuda_qimg --generate \
-    --height 256 --width 256 --steps 20 \
-    --prompt "a red apple on a white table"
-
-# Default weight paths (hardcoded, overridable):
-#   --dit /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors
-#   --vae /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors
-#   --enc /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf
-
-# Options
-#   --no-fp8     Force F32 GEMM (disable FP8 weight dequant optimization)
-#   --no-cfg     Disable classifier-free guidance (single pass, faster)
-#   --seed <n>   Random seed (default: 42)
-```
-
-**Text conditioning priority:**
-1. ComfyUI pre-encoded `.npy` files (if found at `ref/qwen_image/output/comfyui_text_hidden.npy`)
-2. FP8 scaled safetensors text encoder
-3. GGUF text encoder fallback
-
-### PyTorch Reference
-
-```bash
-cd ref/qwen_image
-uv venv && uv pip install torch safetensors numpy pillow
-
-# Generate ComfyUI ground truth
-uv run python encode_text_comfyui.py --prompt "a red apple on a white table" --output output/comfyui_text_hidden.npy
-uv run python generate_comfyui.py --prompt "a red apple on a white table" --output output/ground_truth_512.png
-
-# Layer-by-layer VAE reference
-uv run python run_vae_reference.py --vae-path /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors --output-dir output/
-
-# Compare .npy outputs
-uv run python compare.py output/vae_03_mid_res0.npy ../../cpu/qwen_image/vae_03_mid_res0.npy
 ```
 
 ## Implementation Status
 
-### Feature Matrix
+### Verification Results
 
-| Feature | CPU | CUDA | PyTorch Ref |
-|---|:---:|:---:|:---:|
-| Text encoder (GGUF) | done | done (fallback) | N/A |
-| Text encoder (FP8 safetensors) | done | done | ComfyUI |
-| MMDiT forward (60 blocks) | done | done | done |
-| FP8 weight loading (safetensors) | done | done (native FP8 + LUT) | N/A |
-| GGUF weight loading (Q4_0) | done | — | done |
-| AVX2/FMA SIMD (CPU DiT) | done | N/A | N/A |
-| FP8 native GEMM (sm_89+) | N/A | done | N/A |
-| FP8→F32 LUT dequant GEMM | N/A | done | N/A |
-| Joint attention (online softmax) | done | done | done |
-| Per-head QK RMSNorm | done | done | done |
-| 2D RoPE (image) + 1D RoPE (text) | done | done | done |
-| adaLN-Zero modulation | done | done | done |
-| Patchify / Unpatchify | done | done (CPU) | done |
-| FlowMatch scheduler (dynamic shift) | done | done | done |
-| ComfyUI-compatible scheduler | done | done | done |
-| CFG + CFGNorm | — | done | done |
-| VAE decoder | done | **broken** | done |
-| Block preloading (GPU VRAM) | N/A | done (41/60 blocks) | N/A |
-| Layer-by-layer verification | 34/34 PASS | partial | baseline |
+| Component | vs ComfyUI | Notes |
+|---|---|---|
+| **VAE (CUDA)** | SSIM=1.0000 | Pixel-perfect (max diff=2/255) |
+| **VAE (CPU)** | SSIM=1.0000 | Pixel-perfect (same 3 fixes as CUDA) |
+| **DiT (per-block)** | corr=1.000000 | All 60 blocks match (FP8 LUT = ComfyUI FP8) |
+| **DiT (per-block, 6-tok neg)** | corr=1.000000 | Separate token counts work correctly |
+| **Text encoder** | corr=1.000000 | Cached + live encoding both match |
+| **Scheduler sigmas** | exact match | Pre-shifted table + simple sampling |
+| **Full pipeline (10 steps)** | SSIM≈0.73 | FP8 precision compounds over 10 steps |
 
-### Verified Resolutions (CUDA)
+### Performance (CUDA, RTX 5060 Ti 16GB, FP8 LUT GEMM)
 
-| Resolution | Latent | Img Tokens | Status | Time/step |
-|---|---|---|---|---|
-| 64×64 | 8×8 | 16 | working | ~1.5s |
-| 128×128 | 16×16 | 64 | working | ~1.7s |
-| 256×256 | 32×32 | 256 | working | ~9.4s |
-| 512×512 | 64×64 | 1024 | working (slow) | ~62s |
+| Resolution | Latent | Tokens | Time/step (CFG) | Time/step (no-CFG) | VAE decode |
+|---|---|---|---|---|---|
+| 256×256 | 32×32 | 256 | 6.6s | 3.5s | 1.2s |
+| 512×512 | 64×64 | 1024 | 20.6s | ~10s | 14.3s |
 
-GPU: NVIDIA RTX 5060 Ti (sm_120, 16 GB VRAM). Times include CFG (2 DiT passes per step).
-
-### Known Issues
-
-1. **CUDA VAE decoder** produces flat output (R=0.251, G=0.263, B=0.086, std=0.000). CPU VAE is used as fallback. Root cause not yet identified.
-
-2. **512×512+ is slow** due to O(n²) attention kernel (single block per head, sequential query processing). Needs tiled/flash attention for production use.
-
-3. **`ulimit -v` breaks CUDA allocations.** Host virtual memory limits affect CUDA driver API's unified virtual addressing. Do not use `ulimit -v` with the CUDA binary.
+GPU memory: 41/60 DiT blocks preloaded (FP8), 2.0 GB free for activations.
 
 ### Critical Bugs Fixed
 
-| Bug | Symptom | Fix | Commit |
-|---|---|---|---|
-| Missing `cuStreamSynchronize` | Latent drift at >64×64 (min→-187, max stuck at 3.17) | Add sync before `cuMemcpyDtoH` | `3c4b4ac` |
-| FP8 MMA quantizes both inputs | 160× scale error in modulation (GPU vs CPU) | New `gemm_fp8w_f32` kernel: FP8 weights via LUT, F32 inputs | `a32452a` |
-| Timestep = sigma (not sigma×1000) | Denoising doesn't converge | `timestep = sigma * 1000` | `133847e` |
-| Sinusoidal embedding order | Wrong timestep encoding | Swap to `[cos, sin]` (flip_sin_to_cos=True) | `569fce1` |
-| FP8 NaN (0x7F) | NaN propagation through blocks | Map 0x7F → 0.0f in LUT | `70b05d0` |
-| Text encoder segfault | `thread_tmp` not allocated | Add `calloc` for scratch buffer | `dbda87d` |
-| Attention warp reduction | 128 threads, only 32 reduced | Shared memory tree reduction | `c3b13e7` |
-
-### CPU Performance (FP8 safetensors, AVX2)
-
-| Component | 64×64 | 128×128 |
+| Bug | Symptom | Fix |
 |---|---|---|
-| DiT (20 steps, no CFG) | ~35s/step | ~35s/step |
-| VAE decode | ~10s | ~42s |
-| Text encoder | ~5s | ~5s |
+| **VAE: GroupNorm instead of RMS norm** | SSIM=0.5, wrong colors/brightness | Use `F.normalize(x,dim=C) × sqrt(C) × gamma` |
+| **VAE: Conv3d temporal sum** | Accumulated error from conv1 onward | Use last temporal slice only (`d = kd - 1`) |
+| **VAE: Replicate spatial padding** | Boundary artifacts | Use zero padding (`spatial_padding_mode="zeros"`) |
+| **Scheduler: exp(shift) instead of shift** | 7× wrong dt, latent too smooth | Use `alpha = shift` directly in SNR formula |
+| **Scheduler: direct sigma sampling** | Different sigma schedule from ComfyUI | Pre-compute 1000-entry table, pick evenly |
+| **F16 MMA GEMM fragment bug** | Noisy output on Blackwell (sm_120) | Switch to `gemm_tiled_f16_f32` (correct) |
+| Missing `cuStreamSynchronize` | Latent drift at >64×64 | Add sync before `cuMemcpyDtoH` |
+| FP8 MMA quantizes both inputs | 160× scale error | Use `gemm_fp8w_f32` (FP8 weights, F32 inputs) |
+| norm_out scale/shift swap | corr=0.39 → 0.81 | `scale = chunk[0], shift = chunk[1]` |
+| Text RoPE: 1D vs 3-axis | corr=0.81 → 0.989 | 3-axis with txt_start offset |
+| PRNG: cos-only vs cos+sin | Mismatched noise sequences | Box-Muller pair caching (both cos and sin) |
 
-### CUDA GPU Memory Usage
+## TODO / FIXME
 
-- Global DiT weights: ~50 MB (F32 biases + norms)
-- Per-block weights: ~324 MB (FP8 raw)
-- Preloaded blocks: 41/60 (13.3 GB)
-- Workspace reservation: 2 GB (activations + scratch)
-- Total VRAM: ~15.3 GB used of 16 GB
+### Performance
 
-## Reproduction
+- [ ] **GEMM optimization**: FP8 LUT GEMM achieves ~7% GPU utilization. The 16×16 tiled approach with constant memory LUT is bottlenecked by syncthreads overhead. Consider:
+  - Fix the MMA m16n8k16 output fragment mapping for Blackwell (sm_120) — would enable tensor core GEMM
+  - Wider tiles with register blocking
+  - Warp-cooperative loading patterns
+- [ ] **Attention kernel**: Single-block-per-head flash attention works but doesn't scale well to 1024+ tokens. Implement multi-block flash attention or use cuDNN.
+- [ ] **VAE on GPU**: Conv2d kernel is naive (one thread per output element). Large convolutions (384 channels × 256×256) would benefit from im2col + GEMM or Winograd.
+- [ ] **Block streaming**: Only 41/60 blocks preloaded in 16GB VRAM. On-demand loading adds ~0.5s/block. Pipeline: overlap block loading with computation.
 
-### Generate a 256×256 image (CUDA, ~3 min)
+### Quality
 
-```bash
-cd cuda/qimg
-cc -O2 -mavx2 -mfma -I../../common -I.. -o test_cuda_qimg test_cuda_qimg.c ../cuew.c -lm -ldl -lpthread
-./test_cuda_qimg --generate --height 256 --width 256 --steps 20 --prompt "a red apple on a white table"
-# Output: cuda_qimg_output.ppm (256×256 PPM image)
-```
+- [ ] **CFG with separate n_txt**: Currently zero-pads negative text. Should run uncond pass with actual token count (6 tokens) to match ComfyUI. Previous attempt caused velocity instability — needs investigation.
+- [ ] **FP8 precision gap**: Single-step corr=1.0, but 10-step SSIM≈0.73 due to FP8 error compounding. Could be improved by:
+  - Mixed precision: F32 for sensitive operations (modulation, attention softmax)
+  - Kahan summation in GEMM accumulation
+  - Stochastic rounding
 
-### Generate a 128×128 image (CPU only, ~15 min)
+### Features
 
-```bash
-cd cpu/qwen_image
-cc -O2 -mavx2 -mfma -I../../common -o test_qwen_image test_qwen_image.c -lm -lpthread
-./test_qwen_image --generate \
-    /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors \
-    /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors \
-    /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
-    --height 128 --width 128 --steps 20 --prompt "a red apple on a white table"
-# Output: qwen_image_output.ppm
-```
+- [ ] **Attention masking**: No `encoder_hidden_states_mask` support. Needed for proper padding-aware attention.
+- [ ] **Video generation (T>1)**: VAE temporal convolutions (`time_conv`) not implemented. Only single-frame (T=1) supported.
+- [ ] **ControlNet / Reference latents**: `timestep_zero_index` path in `_apply_gate` not implemented.
+- [ ] **Image-to-image**: No img2img / inpainting support.
+- [ ] **Quantized text encoder on GPU**: Currently CPU-only. Could move to GPU for faster encoding.
+- [ ] **Multiple resolutions in one session**: DiT weight preloading is resolution-independent, but activation buffers are allocated per-call.
 
-### Verify against PyTorch reference (VAE layer-by-layer)
+### Code Quality
 
-```bash
-# 1. Generate PyTorch reference dumps
-cd ref/qwen_image
-uv run python run_vae_reference.py \
-    --vae-path /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors \
-    --output-dir output/ --latent-h 8 --latent-w 8 --seed 42
-
-# 2. Run CPU VAE with same input
-cd ../../cpu/qwen_image
-./test_qwen_image --test-vae /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors \
-    --height 64 --width 64
-
-# 3. Compare each layer
-cd ../../ref/qwen_image
-uv run python compare.py output/vae_03_mid_res0.npy ../../cpu/qwen_image/vae_03_mid_res0.npy
-# Expected: correlation = 1.000000, max error < 1e-4
-```
-
-### Generate ComfyUI ground truth for comparison
-
-```bash
-cd ref/qwen_image
-
-# Encode text (requires ComfyUI installed at /mnt/disk01/ComfyUI)
-uv run python encode_text_comfyui.py \
-    --prompt "a red apple on a white table" \
-    --output output/comfyui_text_hidden.npy
-
-# Generate image
-uv run python generate_comfyui.py \
-    --prompt "a red apple on a white table" \
-    --height 512 --width 512 --steps 30 \
-    --output output/ground_truth_comfyui_512.png
-```
-
-Ground truth images available at `ref/qwen_image/output/`:
-- `ground_truth_comfyui_512.png` (512×512)
-- `ground_truth_comfyui_1024.png` (1024×1024)
-- `ground_truth_comfyui_512_latent.npy` (pre-VAE latent for comparison)
+- [ ] **VAE weight cleanup**: `qimg_vae_free()` doesn't free all weight buffers (memory leak on reload).
+- [ ] **Remove debug .npy saves**: verbose=3 saves per-block .npy files (useful for debugging, but should be optional build flag).
+- [ ] **Error handling**: Some CUDA allocation failures are silently ignored (especially in on-demand block loading).
