@@ -73,6 +73,32 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/attn_prefill_f32.comp
 )
 
+# HY3D shaders
+set(HY3D_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders/hy3d)
+set(HY3D_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/hy3d)
+file(MAKE_DIRECTORY ${HY3D_SHADER_OUTPUT_DIR})
+
+# TRELLIS2 shaders
+set(T2_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders/trellis2)
+set(T2_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/trellis2)
+file(MAKE_DIRECTORY ${T2_SHADER_OUTPUT_DIR})
+
+set(T2_SHADER_SOURCES
+    ${T2_SHADER_SOURCE_DIR}/adaln_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/gated_add_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/modulation_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/rope_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/timestep_embed_cossin_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/split_qkv_chunk_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/split_kv_chunk_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/layernorm_noaffine_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/silu_inplace_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/conv3d_k3_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/channel_layernorm_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/pixel_shuffle_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/self_attn_tiled_f32.comp
+)
+
 # Custom function to compile GLSL to SPIR-V
 function(compile_shader SHADER_SOURCE)
     get_filename_component(SHADER_NAME ${SHADER_SOURCE} NAME_WE)
@@ -287,6 +313,100 @@ if(SPIRV_OUTPUTS)
                 ${SPIRV_OUTPUTS}
                 ${CMAKE_BINARY_DIR}/shaders/
         COMMENT "Copying compiled shaders to build directory (llm)"
+    )
+endif()
+
+# Compile TRELLIS2 shaders
+set(T2_SPIRV_OUTPUTS "")
+foreach(SHADER ${T2_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+        set(SPIRV_OUTPUT ${T2_SHADER_OUTPUT_DIR}/${SHADER_NAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPIRV_OUTPUT}
+            COMMAND ${GLSLC_EXECUTABLE}
+                    -fshader-stage=compute
+                    -O
+                    -o ${SPIRV_OUTPUT}
+                    ${SHADER}
+            DEPENDS ${SHADER}
+            COMMENT "Compiling trellis2/${SHADER_NAME}.comp -> ${SHADER_NAME}.spv"
+            VERBATIM
+        )
+        list(APPEND T2_SPIRV_OUTPUTS ${SPIRV_OUTPUT})
+    endif()
+endforeach()
+
+if(T2_SPIRV_OUTPUTS)
+    add_custom_target(trellis2_shaders ALL DEPENDS ${T2_SPIRV_OUTPUTS})
+endif()
+
+# Compile HY3D shaders (needed by TRELLIS2 for reused ops)
+file(GLOB HY3D_SHADER_COMPS ${HY3D_SHADER_SOURCE_DIR}/*.comp)
+set(HY3D_SPIRV_OUTPUTS "")
+foreach(SHADER ${HY3D_SHADER_COMPS})
+    if(EXISTS ${SHADER})
+        get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+        set(SPIRV_OUTPUT ${HY3D_SHADER_OUTPUT_DIR}/${SHADER_NAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPIRV_OUTPUT}
+            COMMAND ${GLSLC_EXECUTABLE}
+                    -fshader-stage=compute
+                    -O
+                    -o ${SPIRV_OUTPUT}
+                    ${SHADER}
+            DEPENDS ${SHADER}
+            COMMENT "Compiling hy3d/${SHADER_NAME}.comp -> ${SHADER_NAME}.spv"
+            VERBATIM
+        )
+        list(APPEND HY3D_SPIRV_OUTPUTS ${SPIRV_OUTPUT})
+    endif()
+endforeach()
+
+if(HY3D_SPIRV_OUTPUTS)
+    add_custom_target(hy3d_shaders ALL DEPENDS ${HY3D_SPIRV_OUTPUTS})
+endif()
+
+# TRELLIS2 Vulkan test executable
+set(TRELLIS2_VK_TARGET test_vulkan_trellis2)
+
+add_executable(${TRELLIS2_VK_TARGET}
+    trellis2/test_vulkan_trellis2.cc
+    trellis2/vulkan_trellis2_runner.cc
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${TRELLIS2_VK_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+)
+
+target_link_libraries(${TRELLIS2_VK_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+)
+
+target_compile_definitions(${TRELLIS2_VK_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET trellis2_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} trellis2_shaders)
+endif()
+if(TARGET hy3d_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} hy3d_shaders)
+endif()
+if(TARGET coopmat_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} coopmat_shaders)
+endif()
+
+# Copy all shader SPVs to build directory
+if(T2_SPIRV_OUTPUTS OR HY3D_SPIRV_OUTPUTS)
+    add_custom_command(TARGET ${TRELLIS2_VK_TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders/trellis2
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders/hy3d
+        COMMENT "Shader directories created for trellis2"
     )
 endif()
 

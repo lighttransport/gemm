@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MIT
+// Tiled self-attention with online softmax (no large shared memory score array)
+// Dispatched in batches of queries to avoid GPU timeout on long-running kernels.
+// Grid: (n_heads, batch_size, 1), workgroup: (32, 1, 1)
+// Each workgroup handles one (head, query) pair with 32 threads collaborating on dot products.
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer QBuffer { float Q[]; };
+layout(std430, binding = 2) readonly buffer KBuffer { float K[]; };
+layout(std430, binding = 3) readonly buffer VBuffer { float V[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint q_start;    // first query index in this batch
+    uint q_count;    // number of queries in this batch
+    uint kv_len;
+    uint dim;
+    uint n_heads;
+    uint head_dim;
+    float scale;
+} pc;
+
+shared float s_dot[32]; // for parallel dot product reduction
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint local_qi = gl_WorkGroupID.y;
+    if (h >= pc.n_heads || local_qi >= pc.q_count) return;
+
+    uint qi = pc.q_start + local_qi;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint q_offset = qi * pc.dim + h * pc.head_dim;
+
+    // Online softmax with tiling over KV
+    float running_max = -1.0e30;
+    float running_sum = 0.0;
+
+    // Each thread accumulates head_dim/32 output dimensions
+    // Thread tid handles dims: tid, tid+32, tid+64, tid+96 (for head_dim=128)
+    float acc[4]; // max head_dim/32 = 128/32 = 4
+    uint n_out = (pc.head_dim + 31) / 32;
+    for (uint i = 0; i < n_out; i++) acc[i] = 0.0;
+
+    for (uint ki = 0; ki < pc.kv_len; ki++) {
+        uint k_offset = ki * pc.dim + h * pc.head_dim;
+
+        // Parallel dot product: each thread sums head_dim/32 elements
+        float partial = 0.0;
+        for (uint d = tid; d < pc.head_dim; d += 32) {
+            partial += Q[q_offset + d] * K[k_offset + d];
+        }
+        s_dot[tid] = partial;
+        barrier();
+
+        // Tree reduction for dot product
+        if (tid < 16) s_dot[tid] += s_dot[tid + 16];
+        barrier();
+        if (tid < 8) s_dot[tid] += s_dot[tid + 8];
+        barrier();
+        if (tid < 4) s_dot[tid] += s_dot[tid + 4];
+        barrier();
+        if (tid < 2) s_dot[tid] += s_dot[tid + 2];
+        barrier();
+        if (tid < 1) s_dot[tid] += s_dot[tid + 1];
+        barrier();
+
+        float score = s_dot[0] * pc.scale;
+
+        // Online softmax update
+        float new_max = max(running_max, score);
+        float correction = exp(running_max - new_max);
+        running_sum = running_sum * correction + exp(score - new_max);
+
+        // Update accumulator
+        uint v_offset = ki * pc.dim + h * pc.head_dim;
+        float w = exp(score - new_max);
+        for (uint i = 0; i < n_out; i++) {
+            uint d = tid + i * 32;
+            if (d < pc.head_dim) {
+                acc[i] = acc[i] * correction + w * V[v_offset + d];
+            }
+        }
+
+        running_max = new_max;
+    }
+
+    // Normalize and write output
+    float inv = (running_sum > 0.0) ? 1.0 / running_sum : 0.0;
+    uint o_offset = qi * pc.dim + h * pc.head_dim;
+    for (uint i = 0; i < n_out; i++) {
+        uint d = tid + i * 32;
+        if (d < pc.head_dim) {
+            out_buf[o_offset + d] = acc[i] * inv;
+        }
+    }
+}

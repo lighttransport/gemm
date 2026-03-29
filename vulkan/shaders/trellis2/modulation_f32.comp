@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: MIT
+// Modulation: out = SiLU(t_emb) @ W^T + bias + per_block_bias
+// t_emb: [dim], W: [out_dim, dim], bias: [out_dim], blk_bias: [out_dim], out: [out_dim]
+// Grid: (1, 1, 1), workgroup: (256, 1, 1) -- single vector computation
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer TEmbBuffer { float t_emb[]; };
+layout(std430, binding = 2) readonly buffer WBuffer { float mod_w[]; };
+layout(std430, binding = 3) readonly buffer BiasBuffer { float mod_b[]; };
+layout(std430, binding = 4) readonly buffer BlkBiasBuffer { float blk_bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint dim;
+    uint out_dim;
+} pc;
+
+shared float silu_emb[2048]; // max dim = 1536, fits comfortably
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Load t_emb with SiLU into shared memory
+    for (uint i = tid; i < pc.dim; i += 256) {
+        float v = t_emb[i];
+        silu_emb[i] = v / (1.0 + exp(-v));
+    }
+    barrier();
+
+    // Each thread computes one or more output elements
+    for (uint r = tid; r < pc.out_dim; r += 256) {
+        float sum = 0.0;
+        uint w_offset = r * pc.dim;
+        for (uint j = 0; j < pc.dim; j++) {
+            sum += mod_w[w_offset + j] * silu_emb[j];
+        }
+        sum += mod_b[r];
+        sum += blk_bias[r];
+        out_buf[r] = sum;
+    }
+}
