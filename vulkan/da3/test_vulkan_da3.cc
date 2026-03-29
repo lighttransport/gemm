@@ -175,7 +175,7 @@ int main(int argc, char **argv) {
     /* Run inference */
     fprintf(stderr, "\n=== Running Vulkan DA3 inference (flags=0x%02x) ===\n", output_flags);
     double t0 = get_time_ms();
-    da3_full_result result = vulkan_da3_predict_full(gpu, img, img_w, img_h, output_flags);
+    da3_full_result result = vulkan_da3_predict_full(gpu, img, img_w, img_h, output_flags, NULL);
     double elapsed = get_time_ms() - t0;
     fprintf(stderr, "\nTotal inference time: %.1f ms\n", elapsed);
 
