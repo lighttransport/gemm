@@ -650,6 +650,70 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 
+/* Optimized GEMM: FP8 weights with LUT dequant, 128×128 tiles */
+"__global__ void gemm_opt_fp8(float *Y, const unsigned char *W, const float *X,\n"
+"                              const float *bias, int N, int K, int M) {\n"
+"    const int BM = GEMM_OPT_BM, BN = GEMM_OPT_BN, BK = GEMM_OPT_BK;\n"
+"    const int TM = GEMM_OPT_TM, TN = GEMM_OPT_TN;\n"
+"    __shared__ float smA[BK][BM];\n"
+"    __shared__ float smB[BK][BN];\n"
+"    int tid = threadIdx.x;\n"
+"    int bm = blockIdx.y * BM, bn = blockIdx.x * BN;\n"
+"    int tr = tid / 16, tc = tid % 16;\n"
+"    float acc[TM][TN];\n"
+"    #pragma unroll\n"
+"    for (int i = 0; i < TM; i++)\n"
+"        #pragma unroll\n"
+"        for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;\n"
+"    #define OFP8_LA(ko) do { \\\n"
+"        for (int _i = tid; _i < BM*BK; _i += 256) { \\\n"
+"            int _r = _i % BM, _c = _i / BM; \\\n"
+"            int gr = bm+_r, gk = (ko)+_c; \\\n"
+"            smA[_c][_r] = (gr<M&&gk<K) ? X[gr*K+gk] : 0.0f; \\\n"
+"        } } while(0)\n"
+"    #define OFP8_LB(ko) do { \\\n"
+"        for (int _i = tid; _i < BN*BK; _i += 256) { \\\n"
+"            int _r = _i % BN, _c = _i / BN; \\\n"
+"            int gn = bn+_r, gk = (ko)+_c; \\\n"
+"            smB[_c][_r] = (gn<N&&gk<K) ? d_fp8_to_f32_lut[W[(size_t)gn*K+gk]] : 0.0f; \\\n"
+"        } } while(0)\n"
+"    for (int k = 0; k < K; k += BK) {\n"
+"        OFP8_LA(k); OFP8_LB(k);\n"
+"        __syncthreads();\n"
+"        #pragma unroll\n"
+"        for (int kk = 0; kk < BK; kk++) {\n"
+"            float af[TM], bf[TN];\n"
+"            #pragma unroll\n"
+"            for (int i=0;i<TM;i++) af[i] = smA[kk][tr*TM+i];\n"
+"            #pragma unroll\n"
+"            for (int j=0;j<TN;j++) bf[j] = smB[kk][tc*TN+j];\n"
+"            #pragma unroll\n"
+"            for (int i=0;i<TM;i++)\n"
+"                #pragma unroll\n"
+"                for (int j=0;j<TN;j++) acc[i][j] += af[i]*bf[j];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    #undef OFP8_LA\n"
+"    #undef OFP8_LB\n"
+"    #pragma unroll\n"
+"    for (int i=0;i<TM;i++) {\n"
+"        int gr = bm+tr*TM+i; if(gr>=M) continue;\n"
+"        #pragma unroll\n"
+"        for (int j=0;j<TN;j++) {\n"
+"            int gn = bn+tc*TN+j;\n"
+"            if(gn<N) {\n"
+"                float val = acc[i][j]+(bias?bias[gn]:0.0f);\n"
+"                unsigned int bits;\n"
+"                asm(\"mov.b32 %0, %1;\" : \"=r\"(bits) : \"f\"(val));\n"
+"                bits += 0x7FFFu+((bits>>16)&1u); bits &= 0xFFFF0000u;\n"
+"                asm(\"mov.b32 %0, %1;\" : \"=f\"(val) : \"r\"(bits));\n"
+"                Y[gr*N+gn] = val;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "}\n"; /* close extern "C" from cuda_kernels_common_src */
 
 
@@ -683,6 +747,8 @@ struct cuda_qimg_runner {
     CUfunction gemm_fp8_f32;     /* native FP8 GEMM (sm_89+) */
     CUfunction gemm_f32_f32;     /* pure F32 GEMM (highest precision) */
     CUfunction gemm_fp8w_f32;   /* FP8 weight (LUT dequant) × F32 input */
+    CUfunction gemm_opt_f16;    /* optimized 128×128 tiled F16 GEMM */
+    CUfunction gemm_opt_fp8;    /* optimized 128×128 tiled FP8 LUT GEMM */
     CUfunction layernorm_f32;
     CUfunction gelu_f32;
     CUfunction silu_f32;
@@ -696,6 +762,7 @@ struct cuda_qimg_runner {
     CUfunction truncate_bf16;
     CUfunction quantize_fp8_rt;  /* FP8 roundtrip quantization */
     int use_bf16_trunc;  /* 1 to truncate intermediates to BF16 precision */
+    int use_old_gemm;    /* 1 to use old 16×16 tiled GEMM (for A/B testing) */
     CUfunction gated_add;
     CUfunction patchify;
     CUfunction unpatchify;
@@ -957,25 +1024,41 @@ static void op_bf16_trunc(cuda_qimg_runner *r, CUdeviceptr x, int n);  /* forwar
 static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
+
+    if (r->use_f16_gemm && r->gemm_opt_f16 && n_tok >= 16 && !r->use_old_gemm) {
+        /* Optimized 128×128 tiled GEMM with fused BF16 truncation.
+         * Grid: (ceil(n_out/128), ceil(n_tok/128)), Block: (256, 1, 1) */
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        cuLaunchKernel(r->gemm_opt_f16, gx, gy, 1, 256, 1, 1,
+                       0, r->stream, args, NULL);
+        return;  /* BF16 truncation fused into kernel */
+    }
+
+    if (r->use_fp8_gemm && r->gemm_opt_fp8 && n_tok >= 16 && !r->use_old_gemm) {
+        /* Optimized 128×128 tiled GEMM with FP8 LUT dequant + fused BF16 truncation. */
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        cuLaunchKernel(r->gemm_opt_fp8, gx, gy, 1, 256, 1, 1,
+                       0, r->stream, args, NULL);
+        return;  /* BF16 truncation fused into kernel */
+    }
+
+    /* Fallback: old 16×16 tiled kernels */
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
-    unsigned gx = (unsigned)((n_out + 255) / 256);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
 
     if (r->use_f16_gemm) {
-        /* gemm_tiled_f16_f32: shared-memory tiled GEMM (no MMA), F16 weights.
-         * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_f16_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
     } else if (r->use_fp8_gemm) {
-        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 inputs.
-         * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_fp8w_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
     } else {
-        /* gemm_f32_f32: pure F32 fallback.
-         * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_f32_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
@@ -1096,6 +1179,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gemm_f16_f32, "gemm_tiled_f16_f32");  /* Use tiled (correct) kernel, not MMA (has fragment mapping bug) */
     GET(gemm_f32_f32, "gemm_f32_f32");
     GET(gemm_fp8w_f32, "gemm_fp8w_f32");
+    GET(gemm_opt_f16, "gemm_opt_f16");
+    GET(gemm_opt_fp8, "gemm_opt_fp8");
     /* Try loading native FP8 GEMM (available on sm_89+) */
     r->use_fp8_gemm = 0;
     if (sm >= 89) {

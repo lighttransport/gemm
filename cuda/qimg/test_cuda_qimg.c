@@ -101,6 +101,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--f16") == 0) force_f16 = 2;  /* F16 MMA path */
         else if (strcmp(argv[i], "--bf16") == 0) force_f16 = 3;  /* BF16 truncation */
         else if (strcmp(argv[i], "--no-cfg") == 0) no_cfg = 1;
+        else if (strcmp(argv[i], "--old-gemm") == 0) force_f16 = 4;
         else if (strcmp(argv[i], "--dit") == 0 && i+1 < argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae") == 0 && i+1 < argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc") == 0 && i+1 < argc) enc_path = argv[++i];
@@ -130,6 +131,7 @@ int main(int argc, char **argv) {
     if (r && force_f16 == 1) { r->use_fp8_gemm = 0; fprintf(stderr, "Forced F32 GEMM path\n"); }
     if (r && force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; fprintf(stderr, "Forced F16 MMA path\n"); }
     if (r && force_f16 == 3) { r->use_bf16_trunc = 1; fprintf(stderr, "BF16 truncation enabled\n"); }
+    if (r && force_f16 == 4) { r->use_old_gemm = 1; fprintf(stderr, "Old 16x16 GEMM (for comparison)\n"); }
     if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
 
     if (strcmp(mode, "init") == 0) { cuda_qimg_free(r); return 0; }
