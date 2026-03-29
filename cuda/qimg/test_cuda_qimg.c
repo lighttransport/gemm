@@ -326,9 +326,28 @@ int main(int argc, char **argv) {
             free(txt_neg_hidden);
             cuda_qimg_free(r); return 1;
         }
-        /* ComfyUI processes cond/uncond with their ORIGINAL token counts
-         * (no padding). Zero-padding makes uncond ≈ cond, killing CFG effect.
-         * Keep separate n_txt and n_txt_neg for the two passes. */
+        /* ComfyUI's CONDCrossAttn.concat REPEATS shorter cond to match longer.
+         * E.g., negative 6 tokens → repeated 2× → 12 tokens (matching positive).
+         * This ensures both passes have the same n_txt for identical attention patterns. */
+        if (n_txt_neg > 0 && n_txt_neg < n_txt && (n_txt % n_txt_neg) == 0) {
+            int reps = n_txt / n_txt_neg;
+            float *repeated = (float *)malloc((size_t)n_txt * txt_dim * sizeof(float));
+            for (int rep = 0; rep < reps; rep++)
+                memcpy(repeated + (size_t)rep * n_txt_neg * txt_dim,
+                       txt_neg_hidden, (size_t)n_txt_neg * txt_dim * sizeof(float));
+            free(txt_neg_hidden);
+            txt_neg_hidden = repeated;
+            fprintf(stderr, "  Negative: %d tokens → repeated %d× → %d tokens\n", n_txt_neg, reps, n_txt);
+            n_txt_neg = n_txt;
+        } else if (n_txt_neg < n_txt) {
+            float *padded = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
+            memcpy(padded, txt_neg_hidden, (size_t)n_txt_neg * txt_dim * sizeof(float));
+            free(txt_neg_hidden);
+            txt_neg_hidden = padded;
+            n_txt_neg = n_txt;
+        } else if (n_txt < n_txt_neg) {
+            n_txt = n_txt_neg;  /* expand positive if needed */
+        }
         fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens\n", n_txt, n_txt_neg);
 
         /* 2. DiT denoising loop (CUDA) */
@@ -385,7 +404,7 @@ int main(int argc, char **argv) {
                     if (lf2) { fwrite(vel_latent, sizeof(float), (size_t)lat_n, lf2); fclose(lf2); }
                 }
             } else {
-                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt_neg,
+                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt,
                                    t_val, vel_uncond);
 
                 float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
