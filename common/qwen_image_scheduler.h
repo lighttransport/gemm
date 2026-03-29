@@ -95,23 +95,39 @@ void qimg_sched_set_timesteps(qimg_scheduler *s, int n_steps, int img_seq_len) {
     }
 }
 
-/* ComfyUI-compatible scheduler: simple linear sigmas with fixed shift.
- * timestep = sigma (not sigma * 1000). Matches ComfyUI's ModelSamplingAuraFlow. */
+/* ComfyUI-compatible scheduler: matches "simple" scheduler with AuraFlow shift.
+ *
+ * ComfyUI's approach:
+ * 1. Pre-compute 1000 shifted sigmas: sigma(i/1000) for i=1..1000
+ *    where sigma(t) is the AuraFlow shift function
+ * 2. "simple" scheduler picks n_steps evenly-spaced samples from this array
+ *
+ * This produces DIFFERENT results from directly computing sigma at n_steps
+ * equally-spaced points, because the shift function is nonlinear. */
 void qimg_sched_set_timesteps_comfyui(qimg_scheduler *s, int n_steps, float shift, float multiplier) {
     if (n_steps > QIMG_SCHED_MAX_STEPS) n_steps = QIMG_SCHED_MAX_STEPS;
     s->n_steps = n_steps;
 
-    float es = expf(shift);
-
-    /* ComfyUI convention: shifted sigmas are used for EVERYTHING —
-     * the timestep passed to the model, the sigma in the Euler step division,
-     * and the dt computation. The "simple" scheduler in ComfyUI returns
-     * shifted sigmas from model_sampling.sigmas which are pre-shifted. */
-    for (int i = 0; i <= n_steps; i++) {
-        float sigma_raw = 1.0f - (float)i / (float)n_steps;
-        float sigma_shifted = es * sigma_raw / (1.0f + (es - 1.0f) * sigma_raw);
-        s->sigmas[i] = sigma_shifted;
+    /* Step 1: Pre-compute 1000 shifted sigmas (matching ModelSamplingAdvanced) */
+    int n_table = 1000;
+    float table[1001];  /* 1-indexed: table[1..1000] */
+    /* time_snr_shift(alpha, t) = alpha * t / (1 + (alpha-1) * t)
+     * NOTE: shift parameter IS alpha directly (NOT exp(shift)) */
+    float alpha = shift;
+    for (int i = 1; i <= n_table; i++) {
+        float t = (float)i / (float)n_table;  /* t in (0, 1] */
+        table[i] = alpha * t / (1.0f + (alpha - 1.0f) * t);
     }
+
+    /* Step 2: "simple" scheduler — pick evenly-spaced from reversed table */
+    float ss = (float)n_table / (float)n_steps;
+    for (int x = 0; x < n_steps; x++) {
+        int idx = n_table - (int)(x * ss);  /* index from end */
+        if (idx < 1) idx = 1;
+        if (idx > n_table) idx = n_table;
+        s->sigmas[x] = table[idx];
+    }
+    s->sigmas[n_steps] = 0.0f;
 
     for (int i = 0; i < n_steps; i++) {
         s->timesteps[i] = s->sigmas[i] * multiplier;
