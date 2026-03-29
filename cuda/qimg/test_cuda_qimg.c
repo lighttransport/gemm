@@ -42,15 +42,22 @@
 #include <math.h>
 #include <time.h>
 
-/* Simple PRNG */
+/* PRNG with Box-Muller pair caching (uses both cos and sin outputs) */
 static uint64_t rng_state = 42;
+static int rng_has_cached = 0;
+static float rng_cached = 0.0f;
 static float randn(void) {
+    if (rng_has_cached) { rng_has_cached = 0; return rng_cached; }
     rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
     double u1 = (double)(rng_state >> 11) / (double)(1ULL << 53);
     rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
     double u2 = (double)(rng_state >> 11) / (double)(1ULL << 53);
     if (u1 < 1e-10) u1 = 1e-10;
-    return (float)(sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979323846 * u2));
+    double r = sqrt(-2.0 * log(u1));
+    double theta = 2.0 * 3.14159265358979323846 * u2;
+    rng_cached = (float)(r * sin(theta));
+    rng_has_cached = 1;
+    return (float)(r * cos(theta));
 }
 
 static void save_ppm(const char *path, const float *rgb, int h, int w) {
