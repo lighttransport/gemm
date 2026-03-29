@@ -72,6 +72,7 @@ struct vulkan_da3_runner {
     Pipeline pipe_relu;               /* 1 buf: x; push: {n} = 4B */
     Pipeline pipe_channel_layernorm;  /* 4 bufs: dst,src,w,b; push: {C,HW,eps} = 12B */
     Pipeline pipe_silu;               /* 1 buf: x; push: {n} = 4B */
+    Pipeline pipe_matmul_bias_f16;    /* 4 bufs: A(f32),W(f16),C(f32),bias(f32); push: 16B */
 
     /* Model params */
     int n_blocks, dim, n_heads, head_dim, ffn_hidden;
@@ -128,6 +129,24 @@ struct vulkan_da3_runner {
         int mlp_dim = 0;
         bool loaded = false;
     } cam_dec;
+
+    /* CameraEnc weights (pose conditioning) */
+    struct CamEnc {
+        BufInfo fc1_w, fc1_b, fc2_w, fc2_b;  /* pose MLP: 9 -> dim/2 -> dim */
+        struct TrunkBlock {
+            BufInfo ln1_w, ln1_b, attn_qkv_w, attn_qkv_b;
+            BufInfo attn_out_w, attn_out_b;
+            BufInfo ls1, ls2;
+            BufInfo ln2_w, ln2_b;
+            BufInfo ffn_up_w, ffn_up_b, ffn_down_w, ffn_down_b;
+            int qkv_rows = 0, out_rows = 0, ffn_up_rows = 0;
+        };
+        std::vector<TrunkBlock> trunk;
+        BufInfo trunk_norm_w, trunk_norm_b;
+        BufInfo token_norm_w, token_norm_b;
+        int trunk_dim = 0;
+        bool loaded = false;
+    } cam_enc;
 
     /* DPT Aux Branch weights (rays + sky segmentation) */
     struct DptAux {
@@ -348,6 +367,20 @@ static void opMatmulBias(vulkan_da3_runner *r, BufInfo &C, BufInfo &W, BufInfo &
      * Use C as a dummy for the bias binding when no bias is provided. */
     BufInfo &bias_buf = has_bias ? bias : C;
     dispatchSync(r, r->pipe_matmul_bias, {A, W, C, bias_buf}, &pc, sizeof(pc), gx, gy);
+}
+
+/* MatMul+Bias with F16 weights: C[M,N] = A[M,K](f32) * W[N,K](f16)^T + bias[N](f32)
+ * Same interface as opMatmulBias but uses the F16 weight pipeline. */
+static void opMatmulBiasF16(vulkan_da3_runner *r, BufInfo &C, BufInfo &W, BufInfo &A, BufInfo &bias,
+                               int M, int N, int K) {
+    bool has_bias = isValid(bias);
+    struct { uint32_t M, N, K_val, has_bias; } pc = {
+        (uint32_t)M, (uint32_t)N, (uint32_t)K, has_bias ? 1u : 0u
+    };
+    uint32_t gx = (uint32_t)((N + 15) / 16);
+    uint32_t gy = (uint32_t)((M + 15) / 16);
+    BufInfo &bias_buf = has_bias ? bias : C;
+    dispatchSync(r, r->pipe_matmul_bias_f16, {A, W, C, bias_buf}, &pc, sizeof(pc), gx, gy);
 }
 
 /* GELU in-place */
@@ -579,10 +612,10 @@ static void opDeconvGemmScatter(vulkan_da3_runner *r, BufInfo &dst, BufInfo &X,
                                   BufInfo &W, BufInfo &bias, BufInfo &scratch,
                                   int Ci, int Co, int Hi, int Wi,
                                   int kH, int kW, int stride) {
-    /* Step 1: GEMM: scratch[Hi*Wi, kH*kW*Co] = X[Hi*Wi, Ci] * W[kH*kW*Co, Ci]^T */
+    /* Step 1: GEMM: scratch[Hi*Wi, kH*kW*Co] = X[Hi*Wi, Ci] * W[kH*kW*Co, Ci]^T (F16 weights) */
     int N = kH * kW * Co;
     BufInfo null_bias{};
-    opMatmulBias(r, scratch, W, X, null_bias, Hi * Wi, N, Ci);
+    opMatmulBiasF16(r, scratch, W, X, null_bias, Hi * Wi, N, Ci);
 
     /* Step 2: Scatter to spatial output */
     int Ho = (Hi - 1) * stride + kH;
@@ -742,6 +775,7 @@ static bool createPipelines(vulkan_da3_runner *r) {
     if (!createPipe("shaders/da3/relu_f32",                    1, 4,  r->pipe_relu)) return false;
     if (!createPipe("shaders/da3/channel_layernorm_f32",       4, 12, r->pipe_channel_layernorm)) return false;
     if (!createPipe("shaders/da3/silu_f32",                    1, 4,  r->pipe_silu)) return false;
+    if (!createPipe("shaders/da3/matmul_bias_f16_f32",        4, 16, r->pipe_matmul_bias_f16)) return false;
 
     if (r->verbose >= 1) fprintf(stderr, "DA3: all pipelines created\n");
     return true;
@@ -817,6 +851,14 @@ hd_found:
         {nullptr, nullptr}
     };
 
+    static const struct { const char *st; const char *gg; } cam_enc_pose_map[] = {
+        {"pose_branch.fc1.weight","cam_enc.fc1.weight"},{"pose_branch.fc1.bias","cam_enc.fc1.bias"},
+        {"pose_branch.fc2.weight","cam_enc.fc2.weight"},{"pose_branch.fc2.bias","cam_enc.fc2.bias"},
+        {"trunk_norm.weight","cam_enc.trunk_norm.weight"},{"trunk_norm.bias","cam_enc.trunk_norm.bias"},
+        {"token_norm.weight","cam_enc.token_norm.weight"},{"token_norm.bias","cam_enc.token_norm.bias"},
+        {nullptr, nullptr}
+    };
+
     /* Allocate enough space (2x for safety since we add more mappings now) */
     st_name_map *map = (st_name_map *)calloc((size_t)st->n_tensors * 2, sizeof(st_name_map));
     int n = 0;
@@ -852,6 +894,22 @@ hd_found:
             const char *s = strncmp(key, "model.da3.", 10) == 0 ? key + 18 : key + 14;
             for (int j = 0; cam_dec_map[j].st; j++) {
                 if (strcmp(s, cam_dec_map[j].st) == 0) { snprintf(gguf_name, sizeof(gguf_name), "da3.%s", cam_dec_map[j].gg); break; }
+            }
+        }
+        /* CameraEnc: model.da3.cam_enc.* or model.cam_enc.* */
+        else if (strncmp(key, "model.da3.cam_enc.", 18) == 0 || strncmp(key, "model.cam_enc.", 14) == 0) {
+            const char *s = strncmp(key, "model.da3.", 10) == 0 ? key + 18 : key + 14;
+            for (int j = 0; cam_enc_pose_map[j].st; j++) {
+                if (strcmp(s, cam_enc_pose_map[j].st) == 0) { snprintf(gguf_name, sizeof(gguf_name), "da3.%s", cam_enc_pose_map[j].gg); break; }
+            }
+            if (!gguf_name[0] && strncmp(s, "trunk.", 6) == 0) {
+                int L_idx = 0;
+                const char *rest = s + 6;
+                while (*rest >= '0' && *rest <= '9') { L_idx = L_idx * 10 + (*rest - '0'); rest++; }
+                if (*rest == '.') rest++;
+                for (int j = 0; blk_map[j].st; j++) {
+                    if (strcmp(rest, blk_map[j].st) == 0) { snprintf(gguf_name, sizeof(gguf_name), "da3.cam_enc.trunk.%d.%s", L_idx, blk_map[j].gg); break; }
+                }
             }
         }
         /* GSDPT: model.da3.gs_head.* or model.gs_head.* */
@@ -1051,6 +1109,63 @@ static BufInfo stUploadF32Mapped(VulkanRunner &runner, const st_context *st,
     return buf;
 }
 
+/* Upload tensor from safetensors to GPU as F16 (uint16 storage).
+ * If source is F32, convert to F16 on CPU. If already F16, upload directly. */
+static BufInfo stUploadF16Mapped(VulkanRunner &runner, const st_context *st,
+                                   const st_name_map *map, int map_count,
+                                   const char *gguf_name, int verbose) {
+    da3_tensor_info ti = find_st_tensor(st, map, map_count, gguf_name);
+    if (!ti.valid) {
+        if (verbose >= 2) fprintf(stderr, "  [WARN] mapped tensor '%s' not found\n", gguf_name);
+        return BufInfo{};
+    }
+
+    size_t n_elements = ti.nbytes / (strcmp(ti.dtype, "F16") == 0 ? 2 : 4);
+    size_t f16_bytes = n_elements * sizeof(uint16_t);
+    BufInfo buf = createGpuBuffer(runner, f16_bytes);
+
+    if (strcmp(ti.dtype, "F16") == 0) {
+        /* Already F16, upload directly */
+        uploadToBuffer(runner, buf, ti.data, f16_bytes);
+    } else if (strcmp(ti.dtype, "F32") == 0) {
+        /* Convert F32 -> F16 on CPU (matching HIP's hip_f32_to_f16 with denormals) */
+        const float *f32 = (const float *)ti.data;
+        std::vector<uint16_t> f16(n_elements);
+        for (size_t i = 0; i < n_elements; i++) {
+            uint32_t bits; memcpy(&bits, &f32[i], 4);
+            uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
+            int32_t exp = ((bits >> 23) & 0xff) - 127;
+            uint32_t mant = bits & 0x7fffff;
+            if (exp > 15) { f16[i] = sign | 0x7c00; }
+            else if (exp < -14) {
+                if (exp < -24) { f16[i] = sign; }
+                else { mant |= 0x800000; mant >>= (-1 - exp); f16[i] = sign | (uint16_t)(mant >> 13); }
+            }
+            else { f16[i] = sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13); }
+        }
+        uploadToBuffer(runner, buf, f16.data(), f16_bytes);
+    } else if (strcmp(ti.dtype, "BF16") == 0) {
+        /* Convert BF16 -> F32 -> F16 on CPU */
+        const uint16_t *bf16 = (const uint16_t *)ti.data;
+        std::vector<uint16_t> f16(n_elements);
+        for (size_t i = 0; i < n_elements; i++) {
+            uint32_t f32_bits = (uint32_t)bf16[i] << 16;
+            float fv; memcpy(&fv, &f32_bits, 4);
+            uint32_t bits; memcpy(&bits, &fv, 4);
+            uint32_t sign = (bits >> 31) & 1;
+            int32_t exp = ((bits >> 23) & 0xff) - 127;
+            uint32_t mant = bits & 0x7fffff;
+            uint16_t h;
+            if (exp > 15) h = (sign << 15) | 0x7c00;
+            else if (exp < -14) h = (sign << 15);
+            else h = (sign << 15) | ((exp + 15) << 10) | (mant >> 13);
+            f16[i] = h;
+        }
+        uploadToBuffer(runner, buf, f16.data(), f16_bytes);
+    }
+    return buf;
+}
+
 /* F16 half-float to F32 conversion */
 static float f16_to_f32(uint16_t h) {
     uint32_t sign = (h >> 15) & 0x1;
@@ -1119,6 +1234,75 @@ static BufInfo uploadDeconvWeightF32(VulkanRunner &runner, const st_context *st,
 
     BufInfo buf = createGpuBuffer(runner, (size_t)N * K * sizeof(float));
     uploadToBuffer(runner, buf, transposed.data(), (size_t)N * K * sizeof(float));
+    return buf;
+}
+
+/* Upload ConvTranspose2d weight transposed for GEMM-based deconv (as F16).
+ * Input layout: [Ci, Co, kH, kW].
+ * Output layout: [kH*kW*Co, Ci] as F16 (GEMM W matrix). */
+static BufInfo uploadDeconvWeightF16(VulkanRunner &runner, const st_context *st,
+                                       const st_name_map *map, int map_count,
+                                       const char *gguf_name, int Ci, int Co, int kH, int kW,
+                                       int verbose) {
+    da3_tensor_info ti = find_st_tensor(st, map, map_count, gguf_name);
+    if (!ti.valid) return BufInfo{};
+
+    int N = kH * kW * Co;
+    int K = Ci;
+    size_t total = (size_t)Ci * Co * kH * kW;
+
+    /* Get F32 source */
+    std::vector<float> f32_src;
+    const float *src_f32 = nullptr;
+
+    if (strcmp(ti.dtype, "F32") == 0) {
+        src_f32 = (const float *)ti.data;
+    } else if (strcmp(ti.dtype, "F16") == 0) {
+        f32_src.resize(total);
+        const uint16_t *src16 = (const uint16_t *)ti.data;
+        for (size_t i = 0; i < total; i++) f32_src[i] = f16_to_f32(src16[i]);
+        src_f32 = f32_src.data();
+    } else if (strcmp(ti.dtype, "BF16") == 0) {
+        f32_src.resize(total);
+        const uint16_t *bf16 = (const uint16_t *)ti.data;
+        for (size_t i = 0; i < total; i++) {
+            uint32_t f = (uint32_t)bf16[i] << 16;
+            memcpy(&f32_src[i], &f, sizeof(float));
+        }
+        src_f32 = f32_src.data();
+    } else {
+        return BufInfo{};
+    }
+
+    /* Transpose [Ci, Co, kH, kW] -> [kH*kW*Co, Ci] then convert to F16 */
+    std::vector<uint16_t> transposed_f16((size_t)N * K);
+    for (int ci = 0; ci < Ci; ci++) {
+        for (int co = 0; co < Co; co++) {
+            for (int kh = 0; kh < kH; kh++) {
+                for (int kw_i = 0; kw_i < kW; kw_i++) {
+                    int src_idx = ci * (Co * kH * kW) + co * (kH * kW) + kh * kW + kw_i;
+                    int dst_row = (kh * kW + kw_i) * Co + co;
+                    int dst_idx = dst_row * Ci + ci;
+                    float fv = src_f32[src_idx];
+                    uint32_t bits; memcpy(&bits, &fv, 4);
+                    uint16_t s16 = (uint16_t)((bits >> 16) & 0x8000);
+                    int32_t exp = ((bits >> 23) & 0xff) - 127;
+                    uint32_t mant = bits & 0x7fffff;
+                    uint16_t h;
+                    if (exp > 15) h = s16 | 0x7c00;
+                    else if (exp < -14) {
+                        if (exp < -24) h = s16;
+                        else { mant |= 0x800000; mant >>= (-1 - exp); h = s16 | (uint16_t)(mant >> 13); }
+                    }
+                    else h = s16 | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
+                    transposed_f16[dst_idx] = h;
+                }
+            }
+        }
+    }
+
+    BufInfo buf = createGpuBuffer(runner, (size_t)N * K * sizeof(uint16_t));
+    uploadToBuffer(runner, buf, transposed_f16.data(), (size_t)N * K * sizeof(uint16_t));
     return buf;
 }
 
@@ -1284,10 +1468,13 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
 #define VK_F32(field, fmt, ...) \
     snprintf(name, sizeof(name), fmt, __VA_ARGS__); \
     ly.field = stUploadF32Mapped(r->runner, st, map, map_count, name, r->verbose);
+#define VK_F16(field, fmt, ...) \
+    snprintf(name, sizeof(name), fmt, __VA_ARGS__); \
+    ly.field = stUploadF16Mapped(r->runner, st, map, map_count, name, r->verbose);
 
         VK_F32(ln1_w, "da3.blk.%d.ln1.weight", L)
         VK_F32(ln1_b, "da3.blk.%d.ln1.bias", L)
-        VK_F32(attn_qkv_w, "da3.blk.%d.attn_qkv.weight", L)
+        VK_F16(attn_qkv_w, "da3.blk.%d.attn_qkv.weight", L)
         { snprintf(name, sizeof(name), "da3.blk.%d.attn_qkv.weight", L);
           da3_tensor_info ti = find_st_tensor(st, map, map_count, name);
           ly.qkv_rows = ti.valid ? ti.n_rows : (3 * dim); }
@@ -1297,7 +1484,7 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
         VK_F32(attn_k_norm_w, "da3.blk.%d.attn_k_norm.weight", L)
         VK_F32(attn_k_norm_b, "da3.blk.%d.attn_k_norm.bias", L)
         ly.has_qk_norm = isValid(ly.attn_q_norm_w);
-        VK_F32(attn_out_w, "da3.blk.%d.attn_out.weight", L)
+        VK_F16(attn_out_w, "da3.blk.%d.attn_out.weight", L)
         { snprintf(name, sizeof(name), "da3.blk.%d.attn_out.weight", L);
           da3_tensor_info ti = find_st_tensor(st, map, map_count, name);
           ly.out_rows = ti.valid ? ti.n_rows : dim; }
@@ -1307,7 +1494,7 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
         VK_F32(ln2_w, "da3.blk.%d.ln2.weight", L)
         VK_F32(ln2_b, "da3.blk.%d.ln2.bias", L)
 
-        VK_F32(ffn_gate_up_w, "da3.blk.%d.ffn_gate_up.weight", L)
+        VK_F16(ffn_gate_up_w, "da3.blk.%d.ffn_gate_up.weight", L)
         if (isValid(ly.ffn_gate_up_w)) {
             snprintf(name, sizeof(name), "da3.blk.%d.ffn_gate_up.weight", L);
             da3_tensor_info ti = find_st_tensor(st, map, map_count, name);
@@ -1315,20 +1502,21 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
             ly.has_swiglu = true;
         }
         VK_F32(ffn_gate_up_b, "da3.blk.%d.ffn_gate_up.bias", L)
-        VK_F32(ffn_up_w, "da3.blk.%d.ffn_up.weight", L)
+        VK_F16(ffn_up_w, "da3.blk.%d.ffn_up.weight", L)
         if (isValid(ly.ffn_up_w)) {
             snprintf(name, sizeof(name), "da3.blk.%d.ffn_up.weight", L);
             da3_tensor_info ti = find_st_tensor(st, map, map_count, name);
             ly.ffn_up_rows = ti.valid ? ti.n_rows : ffn_hidden;
         }
         VK_F32(ffn_up_b, "da3.blk.%d.ffn_up.bias", L)
-        VK_F32(ffn_down_w, "da3.blk.%d.ffn_down.weight", L)
+        VK_F16(ffn_down_w, "da3.blk.%d.ffn_down.weight", L)
         { snprintf(name, sizeof(name), "da3.blk.%d.ffn_down.weight", L);
           da3_tensor_info ti = find_st_tensor(st, map, map_count, name);
           ly.ffn_down_rows = ti.valid ? ti.n_rows : dim; }
         VK_F32(ffn_down_b, "da3.blk.%d.ffn_down.bias", L)
 
 #undef VK_F32
+#undef VK_F16
     }
 
     /* Upload DPT head weights */
@@ -1340,21 +1528,21 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
         for (int i = 0; i < 4; i++) {
             char name[128];
             snprintf(name, sizeof(name), "da3.head.proj.%d.weight", i);
-            dw.proj_w[i] = stUploadF32Mapped(r->runner, st, map, map_count, name, r->verbose);
+            dw.proj_w[i] = stUploadF16Mapped(r->runner, st, map, map_count, name, r->verbose);
             { da3_tensor_info ti = find_st_tensor(st, map, map_count, name);
               dw.proj_rows[i] = ti.valid ? ti.n_rows : head_oc[i]; }
             snprintf(name, sizeof(name), "da3.head.proj.%d.bias", i);
             dw.proj_b[i] = stUploadF32Mapped(r->runner, st, map, map_count, name, r->verbose);
         }
 
-        /* Spatial alignment: ConvTranspose2d weights */
+        /* Spatial alignment: ConvTranspose2d weights (F16 for GEMM) */
         {
             int oc0 = r->head_out_channels[0];
-            dw.upsample_0_w = uploadDeconvWeightF32(r->runner, st, map, map_count,
+            dw.upsample_0_w = uploadDeconvWeightF16(r->runner, st, map, map_count,
                                                       "da3.head.upsample_0.weight", oc0, oc0, 4, 4, r->verbose);
             dw.upsample_0_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.head.upsample_0.bias", r->verbose);
             int oc1 = r->head_out_channels[1];
-            dw.upsample_1_w = uploadDeconvWeightF32(r->runner, st, map, map_count,
+            dw.upsample_1_w = uploadDeconvWeightF16(r->runner, st, map, map_count,
                                                       "da3.head.upsample_1.weight", oc1, oc1, 2, 2, r->verbose);
             dw.upsample_1_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.head.upsample_1.bias", r->verbose);
         }
@@ -1416,10 +1604,10 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
             auto &cd = r->cam_dec;
             cd.backbone_norm_w = stUploadF32Mapped(r->runner, st, map, map_count, "da3.backbone_norm.weight", r->verbose);
             cd.backbone_norm_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.backbone_norm.bias", r->verbose);
-            cd.mlp_w[0] = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_dec.mlp.0.weight", r->verbose);
+            cd.mlp_w[0] = stUploadF16Mapped(r->runner, st, map, map_count, "da3.cam_dec.mlp.0.weight", r->verbose);
             cd.mlp_dim = ti.n_rows;
             cd.mlp_b[0] = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_dec.mlp.0.bias", r->verbose);
-            cd.mlp_w[1] = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_dec.mlp.2.weight", r->verbose);
+            cd.mlp_w[1] = stUploadF16Mapped(r->runner, st, map, map_count, "da3.cam_dec.mlp.2.weight", r->verbose);
             cd.mlp_b[1] = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_dec.mlp.2.bias", r->verbose);
             cd.fc_t_w = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_dec.fc_t.weight", r->verbose);
             cd.fc_t_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_dec.fc_t.bias", r->verbose);
@@ -1429,6 +1617,73 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
             cd.fc_fov_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_dec.fc_fov.bias", r->verbose);
             cd.loaded = true;
             if (r->verbose >= 1) fprintf(stderr, "DA3: CameraDec weights loaded (mlp_dim=%d)\n", cd.mlp_dim);
+        }
+    }
+
+    /* Upload CameraEnc weights */
+    {
+        da3_tensor_info ti = find_st_tensor(st, map, map_count, "da3.cam_enc.fc1.weight");
+        if (ti.valid) {
+            auto &ce = r->cam_enc;
+            ce.fc1_w = stUploadF16Mapped(r->runner, st, map, map_count, "da3.cam_enc.fc1.weight", r->verbose);
+            ce.trunk_dim = ti.n_rows;
+            ce.fc1_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_enc.fc1.bias", r->verbose);
+            ce.fc2_w = stUploadF16Mapped(r->runner, st, map, map_count, "da3.cam_enc.fc2.weight", r->verbose);
+            ce.fc2_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_enc.fc2.bias", r->verbose);
+            ce.trunk_norm_w = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_enc.trunk_norm.weight", r->verbose);
+            ce.trunk_norm_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_enc.trunk_norm.bias", r->verbose);
+            ce.token_norm_w = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_enc.token_norm.weight", r->verbose);
+            ce.token_norm_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.cam_enc.token_norm.bias", r->verbose);
+
+            /* Count trunk blocks */
+            int ntb = 0;
+            for (int L = 0; L < 8; L++) {
+                char tname[128];
+                snprintf(tname, sizeof(tname), "da3.cam_enc.trunk.%d.ln1.weight", L);
+                da3_tensor_info tti = find_st_tensor(st, map, map_count, tname);
+                if (!tti.valid) break;
+                ntb = L + 1;
+            }
+
+            if (ntb > 0) {
+                ce.trunk.resize(ntb);
+                for (int L = 0; L < ntb; L++) {
+                    auto &ly = ce.trunk[L];
+                    char name[128];
+#define CE_F32(field, fmt, ...) snprintf(name, sizeof(name), fmt, __VA_ARGS__); ly.field = stUploadF32Mapped(r->runner, st, map, map_count, name, r->verbose);
+#define CE_F16(field, fmt, ...) snprintf(name, sizeof(name), fmt, __VA_ARGS__); ly.field = stUploadF16Mapped(r->runner, st, map, map_count, name, r->verbose);
+                    CE_F32(ln1_w, "da3.cam_enc.trunk.%d.ln1.weight", L)
+                    CE_F32(ln1_b, "da3.cam_enc.trunk.%d.ln1.bias", L)
+                    CE_F16(attn_qkv_w, "da3.cam_enc.trunk.%d.attn_qkv.weight", L)
+                    { snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.attn_qkv.weight", L);
+                      da3_tensor_info qti = find_st_tensor(st, map, map_count, name);
+                      ly.qkv_rows = qti.valid ? qti.n_rows : (3 * ce.trunk_dim); }
+                    CE_F32(attn_qkv_b, "da3.cam_enc.trunk.%d.attn_qkv.bias", L)
+                    CE_F16(attn_out_w, "da3.cam_enc.trunk.%d.attn_out.weight", L)
+                    { snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.attn_out.weight", L);
+                      da3_tensor_info oti = find_st_tensor(st, map, map_count, name);
+                      ly.out_rows = oti.valid ? oti.n_rows : ce.trunk_dim; }
+                    CE_F32(attn_out_b, "da3.cam_enc.trunk.%d.attn_out.bias", L)
+                    CE_F32(ls1, "da3.cam_enc.trunk.%d.ls1", L)
+                    CE_F32(ls2, "da3.cam_enc.trunk.%d.ls2", L)
+                    CE_F32(ln2_w, "da3.cam_enc.trunk.%d.ln2.weight", L)
+                    CE_F32(ln2_b, "da3.cam_enc.trunk.%d.ln2.bias", L)
+                    CE_F16(ffn_up_w, "da3.cam_enc.trunk.%d.ffn_up.weight", L)
+                    if (isValid(ly.ffn_up_w)) {
+                        snprintf(name, sizeof(name), "da3.cam_enc.trunk.%d.ffn_up.weight", L);
+                        da3_tensor_info fti = find_st_tensor(st, map, map_count, name);
+                        ly.ffn_up_rows = fti.valid ? fti.n_rows : (4 * ce.trunk_dim);
+                    }
+                    CE_F32(ffn_up_b, "da3.cam_enc.trunk.%d.ffn_up.bias", L)
+                    CE_F16(ffn_down_w, "da3.cam_enc.trunk.%d.ffn_down.weight", L)
+                    CE_F32(ffn_down_b, "da3.cam_enc.trunk.%d.ffn_down.bias", L)
+#undef CE_F32
+#undef CE_F16
+                }
+            }
+            ce.loaded = true;
+            if (r->verbose >= 1)
+                fprintf(stderr, "DA3: CameraEnc weights loaded (%d trunk blocks, dim=%d)\n", ntb, ce.trunk_dim);
         }
     }
 
@@ -1506,17 +1761,17 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
             gdw.norm_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.gsdpt.head.norm.bias", r->verbose);
             for (int i = 0; i < 4; i++) {
                 snprintf(name, sizeof(name), "da3.gsdpt.head.proj.%d.weight", i);
-                gdw.proj_w[i] = stUploadF32Mapped(r->runner, st, map, map_count, name, r->verbose);
+                gdw.proj_w[i] = stUploadF16Mapped(r->runner, st, map, map_count, name, r->verbose);
                 { da3_tensor_info pti = find_st_tensor(st, map, map_count, name); gdw.proj_rows[i] = pti.valid ? pti.n_rows : head_oc[i]; }
                 snprintf(name, sizeof(name), "da3.gsdpt.head.proj.%d.bias", i);
                 gdw.proj_b[i] = stUploadF32Mapped(r->runner, st, map, map_count, name, r->verbose);
             }
             { int oc0 = r->head_out_channels[0];
-              gdw.upsample_0_w = uploadDeconvWeightF32(r->runner, st, map, map_count,
+              gdw.upsample_0_w = uploadDeconvWeightF16(r->runner, st, map, map_count,
                   "da3.gsdpt.head.upsample_0.weight", oc0, oc0, 4, 4, r->verbose);
               gdw.upsample_0_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.gsdpt.head.upsample_0.bias", r->verbose);
               int oc1 = r->head_out_channels[1];
-              gdw.upsample_1_w = uploadDeconvWeightF32(r->runner, st, map, map_count,
+              gdw.upsample_1_w = uploadDeconvWeightF16(r->runner, st, map, map_count,
                   "da3.gsdpt.head.upsample_1.weight", oc1, oc1, 2, 2, r->verbose);
               gdw.upsample_1_b = stUploadF32Mapped(r->runner, st, map, map_count, "da3.gsdpt.head.upsample_1.bias", r->verbose);
             }
@@ -1686,8 +1941,8 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
     if (r->verbose >= 1) {
         fprintf(stderr, "DA3: loaded %d blocks, dim=%d, tokens=%d, swiglu=%d (safetensors)\n",
                 nb, dim, nt, r->use_swiglu);
-        fprintf(stderr, "DA3: modules: cam_dec=%d dpt_aux=%d gsdpt=%d\n",
-                (int)r->cam_dec.loaded, (int)r->dpt_aux.loaded, (int)r->gsdpt.loaded);
+        fprintf(stderr, "DA3: modules: cam_dec=%d cam_enc=%d dpt_aux=%d gsdpt=%d\n",
+                (int)r->cam_dec.loaded, (int)r->cam_enc.loaded, (int)r->dpt_aux.loaded, (int)r->gsdpt.loaded);
     }
     return 0;
 }
@@ -1744,11 +1999,86 @@ static int nearest_multiple(int x, int p) {
 }
 
 /* ======================================================================== */
+/* CameraEnc: pose[9] -> MLP -> trunk(ViT blocks) -> camera_token[dim]     */
+/* ======================================================================== */
+
+/* CameraEnc: encode a camera pose into a conditioning token.
+ * The output token replaces the default camera_token in the backbone. */
+static void run_camera_enc(vulkan_da3_runner *r, const float *pose_in, BufInfo &cam_token_out) {
+    auto &ce = r->cam_enc;
+    int dim = ce.trunk_dim;
+    int ntb = (int)ce.trunk.size();
+
+    /* Upload pose[9] to a small temp buffer */
+    BufInfo d_pose = createGpuBuffer(r->runner, 9 * sizeof(float));
+    uploadToBuffer(r->runner, d_pose, pose_in, 9 * sizeof(float));
+
+    /* pose_branch MLP: [1, 9] -> fc1 -> GELU -> fc2 -> [1, dim] */
+    opMatmulBiasF16(r, r->attn_out, ce.fc1_w, d_pose, ce.fc1_b, 1, dim, 9);
+    opGelu(r, r->attn_out, dim);
+    opMatmulBiasF16(r, r->proj_out, ce.fc2_w, r->attn_out, ce.fc2_b, 1, dim, dim);
+
+    /* token_norm: LayerNorm on [1, dim] */
+    opLayerNorm(r, r->ln_buf, r->proj_out, ce.token_norm_w, ce.token_norm_b, 1, dim);
+
+    /* Copy to hidden2 for trunk processing */
+    bufferCopy(r->runner, r->hidden2, r->ln_buf, (size_t)dim * sizeof(float));
+
+    /* trunk: ViT blocks (no RoPE, no QK-norm, single token) */
+    for (int L = 0; L < ntb; L++) {
+        auto &ly = ce.trunk[L];
+
+        /* LN1 + self-attention */
+        opLayerNorm(r, r->ln_buf, r->hidden2, ly.ln1_w, ly.ln1_b, 1, dim);
+        opMatmulBiasF16(r, r->qkv, ly.attn_qkv_w, r->ln_buf, ly.attn_qkv_b, 1, ly.qkv_rows, dim);
+
+        /* For single token, attention is trivial: output = V (softmax of [1x1] = 1) */
+        /* V starts at offset 2*dim in the QKV buffer */
+        {
+            void *qkv_ptr = nullptr, *ao_ptr = nullptr;
+            r->runner.mapBuffer(r->qkv, &qkv_ptr);
+            r->runner.mapBuffer(r->attn_out, &ao_ptr);
+            memcpy(ao_ptr, (const float *)qkv_ptr + 2 * dim, (size_t)dim * sizeof(float));
+            r->runner.unmapBuffer(r->qkv);
+            r->runner.unmapBuffer(r->attn_out);
+        }
+
+        /* Output projection */
+        opMatmulBiasF16(r, r->proj_out, ly.attn_out_w, r->attn_out, ly.attn_out_b, 1, dim, dim);
+
+        /* LayerScale 1 + residual */
+        opLayerscaleAdd(r, r->hidden2, r->proj_out, ly.ls1, dim, dim);
+
+        /* LN2 + FFN (GELU MLP) */
+        opLayerNorm(r, r->ln_buf, r->hidden2, ly.ln2_w, ly.ln2_b, 1, dim);
+        opMatmulBiasF16(r, r->ffn_buf, ly.ffn_up_w, r->ln_buf, ly.ffn_up_b, 1, ly.ffn_up_rows, dim);
+        opGelu(r, r->ffn_buf, ly.ffn_up_rows);
+        opMatmulBiasF16(r, r->proj_out, ly.ffn_down_w, r->ffn_buf, ly.ffn_down_b, 1, dim, ly.ffn_up_rows);
+
+        /* LayerScale 2 + residual */
+        opLayerscaleAdd(r, r->hidden2, r->proj_out, ly.ls2, dim, dim);
+    }
+
+    /* trunk_norm: LayerNorm on final output -> cam_token_out */
+    opLayerNorm(r, cam_token_out, r->hidden2, ce.trunk_norm_w, ce.trunk_norm_b, 1, dim);
+
+    r->runner.destroyBuffer(d_pose);
+
+    if (r->verbose >= 1) {
+        float dbg[5];
+        downloadFromBuffer(r->runner, cam_token_out, dbg, sizeof(dbg));
+        fprintf(stderr, "DA3: CameraEnc output[0:5] = %.4f %.4f %.4f %.4f %.4f\n",
+                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
+    }
+}
+
+/* ======================================================================== */
 /* Public API: predict_full                                                 */
 /* ======================================================================== */
 
 da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb,
-                                          int img_w, int img_h, int output_flags) {
+                                          int img_w, int img_h, int output_flags,
+                                          const float *pose_in) {
     da3_full_result result = {};
     if (!r || !r->loaded) return result;
 
@@ -1841,6 +2171,16 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
     int stride_3dim = 3 * dim;
 
+    /* If pose_in is provided and CameraEnc is loaded, compute conditioned camera token */
+    BufInfo d_cond_cam_token{};
+    bool have_cond_cam = false;
+    if (pose_in && r->cam_enc.loaded) {
+        d_cond_cam_token = createGpuBuffer(r->runner, (size_t)dim * sizeof(float));
+        run_camera_enc(r, pose_in, d_cond_cam_token);
+        have_cond_cam = true;
+        if (r->verbose >= 1) fprintf(stderr, "DA3: CameraEnc: pose-conditioned camera token computed\n");
+    }
+
     /* Initialize local_hidden = hidden */
     bufferCopy(r->runner, r->local_hidden, r->hidden, (size_t)nt * dim * sizeof(float));
 
@@ -1860,20 +2200,24 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         auto &ly = r->layers[L];
         int is_global = (L >= r->rope_start && (L % 2) == 1);
 
-        /* Camera token injection at rope_start layer */
-        if (L == r->rope_start && r->has_camera_token) {
-            /* Copy camera_token to hidden[0:dim] (CLS position) */
-            void *h_cam = nullptr, *h_hid = nullptr;
-            r->runner.mapBuffer(r->camera_token, &h_cam);
-            r->runner.mapBuffer(r->hidden, &h_hid);
-            memcpy(h_hid, h_cam, (size_t)dim * sizeof(float));
-            r->runner.unmapBuffer(r->camera_token);
-            r->runner.unmapBuffer(r->hidden);
+        /* Camera token injection at rope_start layer:
+         * Use conditioned token (from CameraEnc) if available, else default camera_token */
+        if (L == r->rope_start) {
+            BufInfo *cam_src = have_cond_cam ? &d_cond_cam_token :
+                               (r->has_camera_token ? &r->camera_token : nullptr);
+            if (cam_src) {
+                void *h_cam = nullptr, *h_hid = nullptr;
+                r->runner.mapBuffer(*cam_src, &h_cam);
+                r->runner.mapBuffer(r->hidden, &h_hid);
+                memcpy(h_hid, h_cam, (size_t)dim * sizeof(float));
+                r->runner.unmapBuffer(*cam_src);
+                r->runner.unmapBuffer(r->hidden);
+            }
         }
 
         /* LayerNorm -> QKV projection */
         opLayerNorm(r, r->ln_buf, r->hidden, ly.ln1_w, ly.ln1_b, nt, dim);
-        opMatmulBias(r, r->qkv, ly.attn_qkv_w, r->ln_buf, ly.attn_qkv_b, nt, ly.qkv_rows, dim);
+        opMatmulBiasF16(r, r->qkv, ly.attn_qkv_w, r->ln_buf, ly.attn_qkv_b, nt, ly.qkv_rows, dim);
 
         /* QK LayerNorm */
         if (L >= r->qk_norm_start && ly.has_qk_norm) {
@@ -1991,7 +2335,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         }
 
         /* Attention output projection */
-        opMatmulBias(r, r->proj_out, ly.attn_out_w, r->attn_out, ly.attn_out_b,
+        opMatmulBiasF16(r, r->proj_out, ly.attn_out_w, r->attn_out, ly.attn_out_b,
                      nt, ly.out_rows, dim);
 
         /* Residual with layer scale */
@@ -2006,18 +2350,18 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
         if (ly.has_swiglu && isValid(ly.ffn_gate_up_w)) {
             /* SwiGLU: gate_up = W12 * x + b12, then swiglu, then down */
-            opMatmulBias(r, r->ffn_buf, ly.ffn_gate_up_w, r->ln_buf, ly.ffn_gate_up_b,
+            opMatmulBiasF16(r, r->ffn_buf, ly.ffn_gate_up_w, r->ln_buf, ly.ffn_gate_up_b,
                          nt, ly.ffn_gu_rows, dim);
             int hid = ly.ffn_gu_rows / 2;
             opSwiglu(r, r->ffn_mid, r->ffn_buf, hid, nt);
-            opMatmulBias(r, r->proj_out, ly.ffn_down_w, r->ffn_mid, ly.ffn_down_b,
+            opMatmulBiasF16(r, r->proj_out, ly.ffn_down_w, r->ffn_mid, ly.ffn_down_b,
                          nt, ly.ffn_down_rows, hid);
         } else if (isValid(ly.ffn_up_w)) {
             /* GELU FFN: up -> gelu -> down */
-            opMatmulBias(r, r->ffn_buf, ly.ffn_up_w, r->ln_buf, ly.ffn_up_b,
+            opMatmulBiasF16(r, r->ffn_buf, ly.ffn_up_w, r->ln_buf, ly.ffn_up_b,
                          nt, ly.ffn_up_rows, dim);
             opGelu(r, r->ffn_buf, nt * ly.ffn_up_rows);
-            opMatmulBias(r, r->proj_out, ly.ffn_down_w, r->ffn_buf, ly.ffn_down_b,
+            opMatmulBiasF16(r, r->proj_out, ly.ffn_down_w, r->ffn_buf, ly.ffn_down_b,
                          nt, ly.ffn_down_rows, ly.ffn_up_rows);
         }
 
@@ -2050,6 +2394,10 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         }
     }
 
+    /* Free conditioned camera token buffer if allocated */
+    if (have_cond_cam && isValid(d_cond_cam_token))
+        r->runner.destroyBuffer(d_cond_cam_token);
+
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
     if (r->verbose >= 1) fprintf(stderr, "DA3: GPU backbone (%d blocks): %.1f ms\n", r->n_blocks, (t1 - t0) * 1000);
 
@@ -2071,9 +2419,9 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
         /* backbone_norm(CLS token) -> MLP -> 3 FC heads (CPU) */
         opLayerNorm(r, r->ln_buf, r->hidden, cd.backbone_norm_w, cd.backbone_norm_b, 1, dim);
-        opMatmulBias(r, r->attn_out, cd.mlp_w[0], r->ln_buf, cd.mlp_b[0], 1, mlp_dim, dim);
+        opMatmulBiasF16(r, r->attn_out, cd.mlp_w[0], r->ln_buf, cd.mlp_b[0], 1, mlp_dim, dim);
         opGelu(r, r->attn_out, mlp_dim);
-        opMatmulBias(r, r->proj_out, cd.mlp_w[1], r->attn_out, cd.mlp_b[1], 1, mlp_dim, mlp_dim);
+        opMatmulBiasF16(r, r->proj_out, cd.mlp_w[1], r->attn_out, cd.mlp_b[1], 1, mlp_dim, mlp_dim);
         opGelu(r, r->proj_out, mlp_dim);
 
         /* Download MLP output and FC weights to CPU for tiny matmuls */
@@ -2144,7 +2492,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         }
 
         /* Project: [np, 2*dim] -> [np, oc_val] */
-        opMatmulBias(r, r->dpt_proj, dw.proj_w[fi], r->dpt_ln, dw.proj_b[fi],
+        opMatmulBiasF16(r, r->dpt_proj, dw.proj_w[fi], r->dpt_ln, dw.proj_b[fi],
                      np, oc_val, head_dim_in);
 
         /* DPT projection stats */
@@ -2496,7 +2844,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
             else
                 bufferCopy(r->runner, r->dpt_ln, r->dpt_cat, (size_t)np * head_dim_in * sizeof(float));
 
-            opMatmulBias(r, r->dpt_proj, gdw.proj_w[fi], r->dpt_ln, gdw.proj_b[fi],
+            opMatmulBiasF16(r, r->dpt_proj, gdw.proj_w[fi], r->dpt_ln, gdw.proj_b[fi],
                          np, oc_val, head_dim_in);
 
             if (fi == 0)
@@ -2618,7 +2966,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 /* ======================================================================== */
 
 da3_vk_result vulkan_da3_predict(vulkan_da3_runner *r, const uint8_t *rgb, int w, int h) {
-    da3_full_result full = vulkan_da3_predict_full(r, rgb, w, h, DA3_OUTPUT_DEPTH);
+    da3_full_result full = vulkan_da3_predict_full(r, rgb, w, h, DA3_OUTPUT_DEPTH, nullptr);
     da3_vk_result result = {};
     result.depth = full.depth;
     result.confidence = full.confidence;
