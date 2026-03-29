@@ -1,16 +1,33 @@
 /*
- * test_cuda_trellis2.c - Test CUDA TRELLIS.2 Stage 1 runner
+ * test_cuda_trellis2.c - Test CUDA TRELLIS.2 pipeline
  *
- * Usage:
- *   ./test_cuda_trellis2 <stage1.st> <decoder.st> <features.npy> [-s seed] [-o output.obj]
+ * Stage 1 only:
+ *   ./test_cuda_trellis2 <stage1.st> <decoder.st> <features.npy> [options]
  *
- * Runs Stage 1 DiT + decoder on GPU, exports mesh via marching cubes.
- * DINOv3 features must be pre-computed on CPU (pass as .npy).
+ * Stage 1 + Stage 2 (shape generation):
+ *   ./test_cuda_trellis2 <stage1.st> <decoder.st> <features.npy> --stage2 <stage2.st> \
+ *       --shape-dec <shape_dec.st> [options]
+ *
+ * Runs Stage 1 DiT + decoder on GPU. If --stage2 is given, also runs Stage 2
+ * flow sampling on GPU + shape decoder on CPU + FDG mesh extraction.
  */
 
 #include "cuda_trellis2_runner.h"
 #define MARCHING_CUBES_IMPLEMENTATION
 #include "../../common/marching_cubes.h"
+
+/* Shape decoder + FDG mesh (for Stage 2).
+ * safetensors.h is already compiled in cuda_trellis2_runner.c,
+ * so we only include headers here, not implementations. */
+#define GGML_DEQUANT_IMPLEMENTATION
+#include "../../common/ggml_dequant.h"
+#include "../../common/safetensors.h"
+#define SPARSE3D_IMPLEMENTATION
+#include "../../common/sparse3d.h"
+#define T2_SHAPE_DEC_IMPLEMENTATION
+#include "../../common/trellis2_shape_decoder.h"
+#define T2_FDG_MESH_IMPLEMENTATION
+#include "../../common/trellis2_fdg_mesh.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,7 +110,17 @@ int main(int argc, char **argv) {
                 "  -o <output.obj>  Output mesh path (default: output.obj)\n"
                 "  --grid <N>       Marching cubes grid resolution (default: 64, try 32 for lighter mesh)\n"
                 "  --threshold <t>  Occupancy threshold (default: 0.0)\n"
-                "  --npy <path>     Also save latent as .npy\n", argv[0]);
+                "  --npy <path>     Also save latent as .npy\n"
+                "  --noise <path>   Load noise from .npy instead of generating\n"
+                "  --occ <path>     Save occupancy grid as .npy\n"
+                "\nStage 2 (shape generation):\n"
+                "  --stage2 <path>      Stage 2 flow model .safetensors\n"
+                "  --shape-dec <path>   Shape decoder .safetensors\n"
+                "  --s2-steps <N>       Stage 2 Euler steps (default: 12)\n"
+                "  --s2-cfg <scale>     Stage 2 CFG scale (default: 7.5)\n"
+                "  --s2-npy <path>      Save Stage 2 latent as .npy\n"
+                "  -t <threads>         CPU threads for shape decoder (default: 4)\n"
+                , argv[0]);
         return 1;
     }
     const char *stage1_path = argv[1];
@@ -109,6 +136,12 @@ int main(int argc, char **argv) {
     float mc_threshold = 0.0f;
     const char *noise_path = NULL;
     const char *occ_npy_path = NULL;
+    const char *stage2_path = NULL;
+    const char *shape_dec_path = NULL;
+    int s2_steps = 12;
+    float s2_cfg = 7.5f;
+    const char *s2_npy_path = NULL;
+    int n_threads = 4;
 
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
@@ -120,6 +153,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--grid") && i+1 < argc) mc_grid = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) mc_threshold = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--noise") && i+1 < argc) noise_path = argv[++i];
+        else if (!strcmp(argv[i], "--stage2") && i+1 < argc) stage2_path = argv[++i];
+        else if (!strcmp(argv[i], "--shape-dec") && i+1 < argc) shape_dec_path = argv[++i];
+        else if (!strcmp(argv[i], "--s2-steps") && i+1 < argc) s2_steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--s2-cfg") && i+1 < argc) s2_cfg = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--s2-npy") && i+1 < argc) s2_npy_path = argv[++i];
+        else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
     }
 
     /* Load features */
@@ -138,6 +177,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n=== Loading weights ===\n");
     if (cuda_trellis2_load_weights(r, NULL, stage1_path, decoder_path) != 0) {
         cuda_trellis2_free(r); free(features); return 1;
+    }
+    if (stage2_path) {
+        if (cuda_trellis2_load_stage2(r, stage2_path) != 0) {
+            cuda_trellis2_free(r); free(features); return 1;
+        }
     }
 
     /* Generate or load initial noise */
@@ -241,7 +285,7 @@ int main(int argc, char **argv) {
                 apply_cfg ? "CFG" : "noG", step_t1 - step_t0);
     }
 
-    free(zeros_cond); free(v_cond); free(v_uncond); free(features);
+    free(zeros_cond); free(v_cond); free(v_uncond);
 
     /* Save latent */
     if (npy_path) {
@@ -250,26 +294,26 @@ int main(int argc, char **argv) {
     }
 
     /* Decode */
-    fprintf(stderr, "\n=== Decoder ===\n");
+    fprintf(stderr, "\n=== Structure Decoder ===\n");
     float *occupancy = (float *)malloc(64 * 64 * 64 * sizeof(float));
     cuda_trellis2_run_decoder(r, x, occupancy);
     free(x);
 
     struct timespec t1_ts; clock_gettime(CLOCK_MONOTONIC, &t1_ts);
     double t1 = t1_ts.tv_sec * 1000.0 + t1_ts.tv_nsec / 1e6;
-    fprintf(stderr, "\nTotal GPU time: %.1f s\n", (t1 - t0) / 1000.0);
+    fprintf(stderr, "\nStage 1 GPU time: %.1f s\n", (t1 - t0) / 1000.0);
 
-    /* Stats */
-    float mn = occupancy[0], mx = occupancy[0];
+    /* Occupancy stats */
+    float mn = occupancy[0], mx_occ = occupancy[0];
     double sum = 0;
     int occ_count = 0;
     for (int i = 0; i < 64*64*64; i++) {
         if (occupancy[i] < mn) mn = occupancy[i];
-        if (occupancy[i] > mx) mx = occupancy[i];
+        if (occupancy[i] > mx_occ) mx_occ = occupancy[i];
         sum += occupancy[i];
         if (occupancy[i] > 0) occ_count++;
     }
-    fprintf(stderr, "Occupancy: min=%.2f max=%.2f mean=%.4f\n", mn, mx, sum/(64*64*64));
+    fprintf(stderr, "Occupancy: min=%.2f max=%.2f mean=%.4f\n", mn, mx_occ, sum/(64*64*64));
     fprintf(stderr, "Occupied (logit>0): %d / %d (%.1f%%)\n",
             occ_count, 64*64*64, 100.0f * occ_count / (64*64*64));
 
@@ -278,58 +322,230 @@ int main(int argc, char **argv) {
         write_npy_f32(occ_npy_path, occupancy, occ_dims, 3);
     }
 
-    /* Marching cubes + OBJ export */
-    fprintf(stderr, "\n=== Mesh Export (grid=%d, threshold=%.1f) ===\n", mc_grid, mc_threshold);
+    /* ================================================================ */
+    /* Stage 2: Shape generation (if --stage2 provided)                 */
+    /* ================================================================ */
+    if (stage2_path && shape_dec_path) {
+        fprintf(stderr, "\n=== Stage 2: Shape Flow Sampling (%d steps, cfg=%.1f) ===\n",
+                s2_steps, s2_cfg);
 
-    float *mc_input = occupancy;
-    int mc_n = 64;
+        /* Extract sparse coords from occupancy */
+        int N_sparse = occ_count;
+        int32_t *sparse_coords = (int32_t *)malloc((size_t)N_sparse * 4 * sizeof(int32_t));
+        int idx = 0;
+        for (int z = 0; z < 64; z++)
+            for (int y = 0; y < 64; y++)
+                for (int xi = 0; xi < 64; xi++)
+                    if (occupancy[z * 64 * 64 + y * 64 + xi] > 0.0f) {
+                        sparse_coords[idx * 4 + 0] = 0;   /* batch */
+                        sparse_coords[idx * 4 + 1] = z;
+                        sparse_coords[idx * 4 + 2] = y;
+                        sparse_coords[idx * 4 + 3] = xi;
+                        idx++;
+                    }
+        fprintf(stderr, "Sparse voxels: %d\n", N_sparse);
 
-    /* Downsample occupancy grid if requested */
-    if (mc_grid > 0 && mc_grid < 64) {
-        mc_n = mc_grid;
-        float *ds = (float *)calloc((size_t)mc_n * mc_n * mc_n, sizeof(float));
-        float scale = 64.0f / (float)mc_n;
-        for (int z = 0; z < mc_n; z++) {
-            for (int y = 0; y < mc_n; y++) {
-                for (int x = 0; x < mc_n; x++) {
-                    /* Trilinear interpolation from 64^3 */
-                    float fz = (z + 0.5f) * scale - 0.5f;
-                    float fy = (y + 0.5f) * scale - 0.5f;
-                    float fx = (x + 0.5f) * scale - 0.5f;
-                    int iz = (int)fz, iy = (int)fy, ix = (int)fx;
-                    if (iz < 0) iz = 0; if (iz > 62) iz = 62;
-                    if (iy < 0) iy = 0; if (iy > 62) iy = 62;
-                    if (ix < 0) ix = 0; if (ix > 62) ix = 62;
-                    float dz = fz - iz, dy = fy - iy, dx = fx - ix;
-                    #define OCC(a,b,c) occupancy[(a)*64*64 + (b)*64 + (c)]
-                    float v = OCC(iz,iy,ix)*(1-dz)*(1-dy)*(1-dx)
-                            + OCC(iz,iy,ix+1)*(1-dz)*(1-dy)*dx
-                            + OCC(iz,iy+1,ix)*(1-dz)*dy*(1-dx)
-                            + OCC(iz,iy+1,ix+1)*(1-dz)*dy*dx
-                            + OCC(iz+1,iy,ix)*dz*(1-dy)*(1-dx)
-                            + OCC(iz+1,iy,ix+1)*dz*(1-dy)*dx
-                            + OCC(iz+1,iy+1,ix)*dz*dy*(1-dx)
-                            + OCC(iz+1,iy+1,ix+1)*dz*dy*dx;
-                    #undef OCC
-                    ds[z * mc_n * mc_n + y * mc_n + x] = v;
+        /* Generate noise [N, 32] for Stage 2 */
+        int s2_ch = 32;
+        float *s2_x = (float *)malloc((size_t)N_sparse * s2_ch * sizeof(float));
+        rng_state s2_rng = {{seed + 1, (seed + 1) ^ 0x9E3779B97F4A7C15ULL,
+                             (seed + 1) ^ 0x6C62272E07BB0142ULL, (seed + 1) ^ 0xBF58476D1CE4E5B9ULL}};
+        for (int i = 0; i < 8; i++) rng_next(&s2_rng);
+        for (int i = 0; i < N_sparse * s2_ch; i++) s2_x[i] = rng_randn(&s2_rng);
+
+        /* Stage 2 Euler sampling with CFG */
+        float *s2_v_cond = (float *)malloc((size_t)N_sparse * s2_ch * sizeof(float));
+        float *s2_v_uncond = (float *)malloc((size_t)N_sparse * s2_ch * sizeof(float));
+        float *s2_zeros_cond = (float *)calloc((size_t)n_cond * 1024, sizeof(float));
+        float s2_rescale_t = 3.0f;  /* Stage 2 uses rescale_t=3.0 */
+        float s2_sigma_min = 1e-5f;
+        float s2_cfg_rescale = 0.7f;
+
+        struct timespec s2_t0_ts; clock_gettime(CLOCK_MONOTONIC, &s2_t0_ts);
+        double s2_t0 = s2_t0_ts.tv_sec * 1000.0 + s2_t0_ts.tv_nsec / 1e6;
+
+        for (int step = 0; step < s2_steps; step++) {
+            float t_start = 1.0f - (float)step / (float)s2_steps;
+            float t_end = 1.0f - (float)(step + 1) / (float)s2_steps;
+            float t_cur = rescale_t(t_start, s2_rescale_t);
+            float t_next = rescale_t(t_end, s2_rescale_t);
+
+            struct timespec step_ts; clock_gettime(CLOCK_MONOTONIC, &step_ts);
+            double step_t0x = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
+
+            int apply_cfg = (t_cur >= 0.6f && t_cur <= 1.0f && s2_cfg != 1.0f);
+
+            if (apply_cfg) {
+                cuda_trellis2_run_stage2_dit(r, s2_x, t_cur, features, sparse_coords, N_sparse, s2_v_cond);
+                cuda_trellis2_run_stage2_dit(r, s2_x, t_cur, s2_zeros_cond, sparse_coords, N_sparse, s2_v_uncond);
+
+                /* CFG combine */
+                float *pred_v = s2_v_uncond;
+                for (int i = 0; i < N_sparse * s2_ch; i++)
+                    pred_v[i] = s2_cfg * s2_v_cond[i] + (1.0f - s2_cfg) * s2_v_uncond[i];
+
+                /* CFG rescale */
+                if (s2_cfg_rescale > 0.0f) {
+                    float sm = s2_sigma_min;
+                    float tc = sm + (1.0f - sm) * t_cur;
+                    float one_m_sm = 1.0f - sm;
+                    double sum_pos = 0, sum_cfg_v = 0, sum2_pos = 0, sum2_cfg_v = 0;
+                    for (int i = 0; i < N_sparse * s2_ch; i++) {
+                        float x0p = one_m_sm * s2_x[i] - tc * s2_v_cond[i];
+                        float x0c = one_m_sm * s2_x[i] - tc * pred_v[i];
+                        sum_pos += x0p; sum2_pos += (double)x0p * x0p;
+                        sum_cfg_v += x0c; sum2_cfg_v += (double)x0c * x0c;
+                    }
+                    double n_d = (double)(N_sparse * s2_ch);
+                    double std_pos = sqrt((sum2_pos - sum_pos * sum_pos / n_d) / (n_d - 1.0));
+                    double std_cfg_v = sqrt((sum2_cfg_v - sum_cfg_v * sum_cfg_v / n_d) / (n_d - 1.0));
+                    float ratio = (std_cfg_v > 1e-8) ? (float)(std_pos / std_cfg_v) : 1.0f;
+                    float sc = s2_cfg_rescale * ratio + (1.0f - s2_cfg_rescale);
+                    for (int i = 0; i < N_sparse * s2_ch; i++) {
+                        float x0c = one_m_sm * s2_x[i] - tc * pred_v[i];
+                        pred_v[i] = (one_m_sm * s2_x[i] - sc * x0c) / tc;
+                    }
+                }
+
+                for (int i = 0; i < N_sparse * s2_ch; i++)
+                    s2_x[i] -= (t_cur - t_next) * pred_v[i];
+            } else {
+                cuda_trellis2_run_stage2_dit(r, s2_x, t_cur, features, sparse_coords, N_sparse, s2_v_cond);
+                for (int i = 0; i < N_sparse * s2_ch; i++)
+                    s2_x[i] -= (t_cur - t_next) * s2_v_cond[i];
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &step_ts);
+            double step_t1x = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
+            fprintf(stderr, "  step %d/%d  t=%.4f->%.4f  %s  %.1f ms  std=%.4f\n",
+                    step + 1, s2_steps, t_cur, t_next,
+                    apply_cfg ? "CFG" : "noG", step_t1x - step_t0x,
+                    0.0f /* TODO: compute std */);
+        }
+
+        free(s2_v_cond); free(s2_v_uncond); free(s2_zeros_cond);
+
+        struct timespec s2_t1_ts; clock_gettime(CLOCK_MONOTONIC, &s2_t1_ts);
+        double s2_t1 = s2_t1_ts.tv_sec * 1000.0 + s2_t1_ts.tv_nsec / 1e6;
+        fprintf(stderr, "Stage 2 GPU time: %.1f s\n", (s2_t1 - s2_t0) / 1000.0);
+
+        /* Save Stage 2 latent (raw, before denormalization) */
+        if (s2_npy_path) {
+            int s2d[2] = {N_sparse, s2_ch};
+            write_npy_f32(s2_npy_path, s2_x, s2d, 2);
+        }
+
+        /* TODO: Denormalize using pipeline.json shape_slat_normalization mean/std.
+         * For now, skip denormalization — the shape decoder should still produce
+         * meaningful geometry from the normalized latent. */
+        fprintf(stderr, "\n=== Shape Decoder (CPU, %d threads) ===\n", n_threads);
+
+        /* Load shape decoder */
+        t2_shape_dec *dec = t2_shape_dec_load(shape_dec_path);
+        if (!dec) {
+            fprintf(stderr, "Failed to load shape decoder\n");
+            free(s2_x); free(sparse_coords); free(occupancy);
+            cuda_trellis2_free(r); free(features);
+            return 1;
+        }
+
+        /* Create sparse tensor for shape decoder */
+        sp3d_tensor *slat = sp3d_create(sparse_coords, s2_x, N_sparse, s2_ch, 1);
+        free(s2_x); free(sparse_coords);
+
+        /* Run shape decoder */
+        t2_shape_dec_result result = t2_shape_dec_forward(dec, slat, n_threads);
+        fprintf(stderr, "Shape decoder output: N=%d\n", result.N);
+
+        /* Post-process: sigmoid on vertex offsets, softplus on split_weight */
+        for (int i = 0; i < result.N; i++) {
+            float *f = result.feats + i * 7;
+            for (int j = 0; j < 3; j++)
+                f[j] = 1.0f / (1.0f + expf(-f[j]));
+            f[6] = logf(1.0f + expf(f[6]));
+        }
+
+        /* Extract coords without batch dim: [N, 3] from [N, 4] */
+        int32_t *coords3 = (int32_t *)malloc((size_t)result.N * 3 * sizeof(int32_t));
+        for (int i = 0; i < result.N; i++) {
+            coords3[i * 3 + 0] = result.coords[i * 4 + 1];  /* z */
+            coords3[i * 3 + 1] = result.coords[i * 4 + 2];  /* y */
+            coords3[i * 3 + 2] = result.coords[i * 4 + 3];  /* x */
+        }
+
+        /* FDG mesh extraction */
+        float aabb[6] = {-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f};
+        int max_coord = 0;
+        for (int i = 0; i < result.N * 3; i++)
+            if (coords3[i] > max_coord) max_coord = coords3[i];
+        float vs = (aabb[3] - aabb[0]) / (float)(max_coord + 1);
+
+        fprintf(stderr, "\n=== FDG Mesh (voxel_size=%.4f, max_coord=%d) ===\n", vs, max_coord);
+        t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
+        free(coords3);
+
+        if (fdg_mesh.n_tris > 0) {
+            t2_fdg_write_obj(obj_path, &fdg_mesh);
+        }
+
+        t2_fdg_mesh_free(&fdg_mesh);
+        t2_shape_dec_result_free(&result);
+        sp3d_free(slat);
+        t2_shape_dec_free(dec);
+    } else {
+        /* Stage 1 only: marching cubes mesh export */
+        fprintf(stderr, "\n=== Mesh Export (grid=%d, threshold=%.1f) ===\n", mc_grid, mc_threshold);
+
+        float *mc_input = occupancy;
+        int mc_n = 64;
+
+        if (mc_grid > 0 && mc_grid < 64) {
+            mc_n = mc_grid;
+            float *ds = (float *)calloc((size_t)mc_n * mc_n * mc_n, sizeof(float));
+            float scale2 = 64.0f / (float)mc_n;
+            for (int z = 0; z < mc_n; z++) {
+                for (int y = 0; y < mc_n; y++) {
+                    for (int xi = 0; xi < mc_n; xi++) {
+                        float fz = (z + 0.5f) * scale2 - 0.5f;
+                        float fy = (y + 0.5f) * scale2 - 0.5f;
+                        float fx = (xi + 0.5f) * scale2 - 0.5f;
+                        int iz = (int)fz, iy = (int)fy, ix = (int)fx;
+                        if (iz < 0) iz = 0; if (iz > 62) iz = 62;
+                        if (iy < 0) iy = 0; if (iy > 62) iy = 62;
+                        if (ix < 0) ix = 0; if (ix > 62) ix = 62;
+                        float dz = fz - iz, dy = fy - iy, dx = fx - ix;
+                        #define OCC(a,b,c) occupancy[(a)*64*64 + (b)*64 + (c)]
+                        float v = OCC(iz,iy,ix)*(1-dz)*(1-dy)*(1-dx)
+                                + OCC(iz,iy,ix+1)*(1-dz)*(1-dy)*dx
+                                + OCC(iz,iy+1,ix)*(1-dz)*dy*(1-dx)
+                                + OCC(iz,iy+1,ix+1)*(1-dz)*dy*dx
+                                + OCC(iz+1,iy,ix)*dz*(1-dy)*(1-dx)
+                                + OCC(iz+1,iy,ix+1)*dz*(1-dy)*dx
+                                + OCC(iz+1,iy+1,ix)*dz*dy*(1-dx)
+                                + OCC(iz+1,iy+1,ix+1)*dz*dy*dx;
+                        #undef OCC
+                        ds[z * mc_n * mc_n + y * mc_n + xi] = v;
+                    }
                 }
             }
+            mc_input = ds;
+            fprintf(stderr, "Downsampled 64^3 -> %d^3\n", mc_n);
         }
-        mc_input = ds;
-        fprintf(stderr, "Downsampled 64^3 -> %d^3\n", mc_n);
+
+        float bounds[6] = {0, 0, 0, 1, 1, 1};
+        mc_mesh mesh = mc_marching_cubes(mc_input, mc_n, mc_n, mc_n, mc_threshold, bounds);
+        fprintf(stderr, "Marching cubes: %d vertices, %d triangles\n", mesh.n_verts, mesh.n_tris);
+
+        if (mesh.n_tris > 0) {
+            mc_write_obj(obj_path, &mesh);
+            fprintf(stderr, "Wrote %s\n", obj_path);
+        }
+        mc_mesh_free(&mesh);
+        if (mc_input != occupancy) free(mc_input);
     }
 
-    float bounds[6] = {0, 0, 0, 1, 1, 1};
-    mc_mesh mesh = mc_marching_cubes(mc_input, mc_n, mc_n, mc_n, mc_threshold, bounds);
-    fprintf(stderr, "Marching cubes: %d vertices, %d triangles\n", mesh.n_verts, mesh.n_tris);
-
-    if (mesh.n_tris > 0) {
-        mc_write_obj(obj_path, &mesh);
-        fprintf(stderr, "Wrote %s\n", obj_path);
-    }
-    mc_mesh_free(&mesh);
-    if (mc_input != occupancy) free(mc_input);
     free(occupancy);
+    free(features);
     cuda_trellis2_free(r);
 
     fprintf(stderr, "\nDone.\n");
