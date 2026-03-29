@@ -52,8 +52,11 @@ typedef struct {
     CUfunction layerscale_add;
     CUfunction cross_attn_tiled;
 
+    CUfunction gemm_f16_mma;
+
     int sm_version;
-    int use_f32_gemm;
+    int use_f32_gemm;   /* 0=F16 weights, 1=F32 weights */
+    int use_mma_gemm;   /* 1=use MMA tensor core GEMM (sm_70+, F16 weights) */
 } t2_ops;
 
 static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
@@ -108,6 +111,10 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     GET_FN("layerscale_add_f32",       layerscale_add);
     GET_FN("cross_attn_tiled_f32",    cross_attn_tiled);
 
+    if (sm_version >= 70) {
+        GET_FN("gemm_f16_f32",        gemm_f16_mma);
+    }
+
     #undef GET_FN
     return 0;
 }
@@ -121,10 +128,37 @@ static inline void t2_op_gemm(t2_ops *ops, CUstream s,
                                 CUdeviceptr X, CUdeviceptr bias,
                                 int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+    if (ops->use_f32_gemm) {
+        /* F32 weights: use tiled F32 GEMM */
+        unsigned gx = (unsigned)((n_out + 63) / 64);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(ops->gemm_f32, gx, gy, 1, 16, 16, 1, 0, s, args, NULL);
+    } else if (ops->use_mma_gemm && ops->gemm_f16_mma) {
+        /* F16 weights + MMA tensor cores (sm_70+)
+         * Block: 256 threads (8 warps), each warp handles 64 output cols.
+         * blockIdx.x * 256 with overlapping warps — grid uses 256 stride. */
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        size_t smem = 32 * 16 * sizeof(float);  /* smem_x: 256 threads/8=32 rows × 16 cols */
+        cuLaunchKernel(ops->gemm_f16_mma, gx, gy, 1,
+                       256, 1, 1, smem, s, args, NULL);
+    } else {
+        /* F16 weights + tiled GEMM (fallback) */
+        unsigned gx = (unsigned)((n_out + 63) / 64);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(ops->gemm_tiled, gx, gy, 1, 16, 16, 1, 0, s, args, NULL);
+    }
+}
+
+/* GEMM with explicitly F32 weights (for timestep MLP, modulation) */
+static inline void t2_op_gemm_f32(t2_ops *ops, CUstream s,
+                                CUdeviceptr Y, CUdeviceptr W,
+                                CUdeviceptr X, CUdeviceptr bias,
+                                int n_out, int n_in, int n_tok) {
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
-    CUfunction fn = ops->use_f32_gemm ? ops->gemm_f32 : ops->gemm_tiled;
-    cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, s, args, NULL);
+    cuLaunchKernel(ops->gemm_f32, gx, gy, 1, 16, 16, 1, 0, s, args, NULL);
 }
 
 static inline void t2_op_layernorm(t2_ops *ops, CUstream s,
@@ -204,14 +238,24 @@ static inline void t2_op_cross_attn(t2_ops *ops, CUstream s,
                                       int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
     size_t smem = (size_t)(kv_len + 128) * sizeof(float);
-    if (smem <= 48 * 1024) {
+    /* sm_120 supports up to 228KB dynamic smem. Use smem-based kernel up to 200KB
+     * (kv_len ~50K). Beyond that, fall back to tiled kernel. */
+    size_t smem_limit = (ops->sm_version >= 120) ? 200 * 1024 :
+                        (ops->sm_version >= 80)  ? 160 * 1024 :
+                        (ops->sm_version >= 70)  ? 96 * 1024 : 48 * 1024;
+    if (smem <= smem_limit) {
+        /* Set max dynamic smem for this kernel if needed */
+        if (smem > 48 * 1024) {
+            cuFuncSetAttribute(ops->cross_attn,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)smem);
+        }
         int nt = 128;
         void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim,
                         &n_heads, &head_dim, &scale};
         cuLaunchKernel(ops->cross_attn, (unsigned)n_heads, (unsigned)q_len, 1,
                        (unsigned)nt, 1, 1, smem, s, args, NULL);
     } else {
-        /* Large N: tiled online-softmax (1 thread per head×query) */
+        /* Very large N: tiled online-softmax (1 thread per head×query) */
         void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim,
                         &n_heads, &head_dim, &scale};
         cuLaunchKernel(ops->cross_attn_tiled, (unsigned)n_heads, (unsigned)q_len, 1,
