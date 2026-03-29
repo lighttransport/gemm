@@ -10,6 +10,11 @@
 #define _GNU_SOURCE
 #define SAFETENSORS_IMPLEMENTATION
 #include "../../common/safetensors.h"
+/* sparse3d.h provides sp3d_hash_build/free for shape decoder gather map */
+#define GGML_DEQUANT_IMPLEMENTATION
+#include "../../common/ggml_dequant.h"
+#define SPARSE3D_IMPLEMENTATION
+#include "../../common/sparse3d.h"
 #include "cuda_trellis2_runner.h"
 #include "../cuew.h"
 #include "../cuda_kernels_common.h"
@@ -161,9 +166,30 @@ struct cuda_trellis2_runner {
     CUdeviceptr dec_out_gn_w, dec_out_gn_b;
     CUdeviceptr dec_out_conv_w, dec_out_conv_b;
 
-    /* Scratch buffers */
-    CUdeviceptr scratch[8];
-    size_t      scratch_size[8];
+    /* Shape decoder (SC-VAE) */
+    struct {
+        CUdeviceptr from_latent_w, from_latent_b;  /* [1024, 32] */
+        CUdeviceptr out_w, out_b;                   /* [7, 64] */
+        struct {
+            CUdeviceptr conv_w, conv_b;   /* [27, C, C] transposed for gather-GEMM */
+            CUdeviceptr norm_w, norm_b;   /* [C] */
+            CUdeviceptr mlp0_w, mlp0_b;   /* [4C, C] */
+            CUdeviceptr mlp2_w, mlp2_b;   /* [C, 4C] */
+        } convnext[4][16];  /* [stage][block] — max 16 blocks per stage */
+        struct {
+            CUdeviceptr norm1_w, norm1_b;
+            CUdeviceptr conv1_w, conv1_b;  /* [27, C_out*8, C_in] transposed */
+            CUdeviceptr conv2_w, conv2_b;  /* [27, C_out, C_out] transposed */
+            CUdeviceptr subdiv_w, subdiv_b; /* [8, C_in] */
+        } c2s[4];  /* one per stage */
+        int n_convnext[4];  /* {4, 16, 8, 4} */
+        int channels[5];    /* {1024, 512, 256, 128, 64} */
+        int loaded;
+    } shape_dec;
+
+    /* Scratch buffers (expanded to 12 for shape decoder use) */
+    CUdeviceptr scratch[12];
+    size_t      scratch_size[12];
 };
 
 static void ensure_scratch(cuda_trellis2_runner *r, int idx, size_t bytes) {
@@ -797,6 +823,160 @@ int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path) 
         r->ops.use_mma_gemm = 0;
     }
     return load_stage2_weights(r, stage2_path);
+}
+
+/* ---- Shape decoder weight loading ---- */
+
+/* Upload sparse conv weight transposed: [out_C, 27, in_C] -> [27, out_C, in_C]
+ * This layout enables gather-GEMM: for each k in 0..26, use weight[k*out_C*in_C] */
+static CUdeviceptr t2_upload_conv_transposed(st_context *st, const char *name,
+                                               int out_C, int in_C, int v,
+                                               int use_f16) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) { if (v) fprintf(stderr, "  [MISSING] %s\n", name); return 0; }
+    const char *dtype = safetensors_dtype(st, idx);
+    size_t nbytes = safetensors_nbytes(st, idx);
+    void *data = safetensors_data(st, idx);
+
+    /* First convert to F32 on CPU */
+    size_t n_elem = (size_t)out_C * 27 * in_C;
+    float *f32 = (float *)malloc(n_elem * sizeof(float));
+    const uint16_t *src16 = (const uint16_t *)data;
+
+    if (strcmp(dtype, "F32") == 0) {
+        memcpy(f32, data, n_elem * sizeof(float));
+    } else if (strcmp(dtype, "BF16") == 0) {
+        for (size_t i = 0; i < n_elem; i++) {
+            uint32_t bits = (uint32_t)src16[i] << 16;
+            memcpy(&f32[i], &bits, 4);
+        }
+    } else if (strcmp(dtype, "F16") == 0) {
+        for (size_t i = 0; i < n_elem; i++) {
+            uint16_t h = src16[i];
+            uint32_t sign = ((uint32_t)h & 0x8000) << 16;
+            uint32_t exp = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            uint32_t fb;
+            if (exp == 0) { fb = sign; }
+            else if (exp == 31) fb = sign | 0x7f800000 | (mant << 13);
+            else fb = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+            memcpy(&f32[i], &fb, 4);
+        }
+    } else {
+        free(f32); return 0;
+    }
+
+    /* Transpose: [out_C, 27, in_C] -> [27, out_C, in_C] */
+    float *trans = (float *)malloc(n_elem * sizeof(float));
+    for (int o = 0; o < out_C; o++)
+        for (int k = 0; k < 27; k++)
+            memcpy(trans + ((size_t)k * out_C + o) * in_C,
+                   f32 + ((size_t)o * 27 + k) * in_C,
+                   (size_t)in_C * sizeof(float));
+    free(f32);
+
+    CUdeviceptr d;
+    if (use_f16) {
+        /* Convert transposed F32 to F16 */
+        uint16_t *f16 = (uint16_t *)malloc(n_elem * sizeof(uint16_t));
+        for (size_t i = 0; i < n_elem; i++) {
+            uint32_t fb; memcpy(&fb, &trans[i], 4);
+            uint32_t s = (fb >> 16) & 0x8000;
+            int32_t e = ((fb >> 23) & 0xff) - 127 + 15;
+            uint32_t m = (fb >> 13) & 0x3ff;
+            if (e <= 0) f16[i] = (uint16_t)s;
+            else if (e >= 31) f16[i] = (uint16_t)(s | 0x7c00);
+            else f16[i] = (uint16_t)(s | (e << 10) | m);
+        }
+        d = cu_upload_raw(f16, n_elem * sizeof(uint16_t));
+        free(f16);
+    } else {
+        d = cu_upload_raw(trans, n_elem * sizeof(float));
+    }
+    free(trans);
+
+    if (v >= 2)
+        fprintf(stderr, "  %s: [%d,27,%d] -> [27,%d,%d] %s GPU\n",
+                name, out_C, in_C, out_C, in_C, use_f16 ? "F16" : "F32");
+    return d;
+}
+
+int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) {
+    st_context *st = safetensors_open(path);
+    if (!st) return -1;
+    fprintf(stderr, "T2: loading shape decoder from %s (%d tensors)\n", path, st->n_tensors);
+    int v = r->verbose;
+    int use_f16 = (r->ops.sm_version >= 70);
+
+    /* Weight names match: blocks.{stage}.{block}.{component} */
+    #define UPW(n) (use_f16 ? t2_upload_f16(st, n, v) : t2_upload_f32(st, n, v))
+    #define UPB(n) t2_upload_f32(st, n, v)
+
+    r->shape_dec.from_latent_w = UPW("from_latent.weight");
+    r->shape_dec.from_latent_b = UPB("from_latent.bias");
+    r->shape_dec.out_w = UPW("output_layer.weight");
+    r->shape_dec.out_b = UPB("output_layer.bias");
+
+    /* Channel progression: 1024 -> 512 -> 256 -> 128 -> 64 */
+    int ch[] = {1024, 512, 256, 128, 64};
+    int nblk[] = {4, 16, 8, 4};
+    memcpy(r->shape_dec.channels, ch, sizeof(ch));
+    memcpy(r->shape_dec.n_convnext, nblk, sizeof(nblk));
+
+    for (int s = 0; s < 4; s++) {
+        int C = ch[s];
+
+        /* ConvNeXt blocks */
+        for (int b = 0; b < nblk[s]; b++) {
+            char name[256];
+            #define CN(suf) (snprintf(name, sizeof(name), "blocks.%d.%d.%s", s, b, suf), name)
+            r->shape_dec.convnext[s][b].conv_w = t2_upload_conv_transposed(
+                st, CN("conv.weight"), C, C, v, use_f16);
+            r->shape_dec.convnext[s][b].conv_b = UPB(CN("conv.bias"));
+            r->shape_dec.convnext[s][b].norm_w = UPB(CN("norm.weight"));
+            r->shape_dec.convnext[s][b].norm_b = UPB(CN("norm.bias"));
+            r->shape_dec.convnext[s][b].mlp0_w = UPW(CN("mlp.0.weight"));
+            r->shape_dec.convnext[s][b].mlp0_b = UPB(CN("mlp.0.bias"));
+            r->shape_dec.convnext[s][b].mlp2_w = UPW(CN("mlp.2.weight"));
+            r->shape_dec.convnext[s][b].mlp2_b = UPB(CN("mlp.2.bias"));
+            #undef CN
+        }
+
+        /* C2S upsample block */
+        {
+            char name[256];
+            int C_out = ch[s + 1];
+            #define C2S(suf) (snprintf(name, sizeof(name), "blocks.%d.%d.%s", s, nblk[s], suf), name)
+            r->shape_dec.c2s[s].norm1_w = UPB(C2S("norm1.weight"));
+            r->shape_dec.c2s[s].norm1_b = UPB(C2S("norm1.bias"));
+            r->shape_dec.c2s[s].conv1_w = t2_upload_conv_transposed(
+                st, C2S("conv1.weight"), C_out * 8, C, v, use_f16);
+            r->shape_dec.c2s[s].conv1_b = UPB(C2S("conv1.bias"));
+            r->shape_dec.c2s[s].conv2_w = t2_upload_conv_transposed(
+                st, C2S("conv2.weight"), C_out, C_out, v, use_f16);
+            r->shape_dec.c2s[s].conv2_b = UPB(C2S("conv2.bias"));
+            /* to_subdiv may be missing (texture decoder) */
+            snprintf(name, sizeof(name), "blocks.%d.%d.to_subdiv.weight", s, nblk[s]);
+            int idx = safetensors_find(st, name);
+            if (idx >= 0) {
+                r->shape_dec.c2s[s].subdiv_w = UPW(name);
+                snprintf(name, sizeof(name), "blocks.%d.%d.to_subdiv.bias", s, nblk[s]);
+                r->shape_dec.c2s[s].subdiv_b = UPB(name);
+            } else {
+                r->shape_dec.c2s[s].subdiv_w = 0;
+                r->shape_dec.c2s[s].subdiv_b = 0;
+            }
+            #undef C2S
+        }
+    }
+
+    #undef UPW
+    #undef UPB
+
+    safetensors_close(st);
+    r->shape_dec.loaded = 1;
+    fprintf(stderr, "T2: shape decoder loaded (weights=%s)\n", use_f16 ? "F16" : "F32");
+    return 0;
 }
 
 int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
@@ -1439,6 +1619,169 @@ int cuda_trellis2_run_decoder(cuda_trellis2_runner *r,
     cuMemcpyDtoH(output, d_out, (size_t)64 * 64 * 64 * sizeof(float));
 
     cuMemFree(d_lat); cuMemFree(d_out);
+    return 0;
+}
+
+/* ======================================================================== */
+/* Shape decoder forward (SC-VAE, gather-GEMM sparse conv)                  */
+/* ======================================================================== */
+
+/* Run one ConvNeXt block on GPU.
+ * d_feats: [N, C] in/out features (modified in-place via residual)
+ * d_gather_map: [N, 27] precomputed neighbor indices */
+static void run_shape_convnext(cuda_trellis2_runner *r,
+                                 CUdeviceptr d_feats, int N, int C,
+                                 CUdeviceptr d_gather_map,
+                                 CUdeviceptr conv_w, CUdeviceptr conv_b,
+                                 CUdeviceptr norm_w, CUdeviceptr norm_b,
+                                 CUdeviceptr mlp0_w, CUdeviceptr mlp0_b,
+                                 CUdeviceptr mlp2_w, CUdeviceptr mlp2_b) {
+    t2_ops *ops = &r->ops;
+    CUstream s = r->stream;
+
+    /* Scratch layout:
+     * 8: [N, C] conv output / tmp
+     * 9: [N, max(C, 4C)] gathered features / MLP buffer
+     * 10: [N, max(C, out_C)] GEMM partial result */
+    ensure_scratch(r, 8, (size_t)N * C * sizeof(float));
+    ensure_scratch(r, 9, (size_t)N * 4 * C * sizeof(float));
+    ensure_scratch(r, 10, (size_t)N * C * sizeof(float));
+
+    CUdeviceptr d_tmp = r->scratch[8];
+    CUdeviceptr d_gathered = r->scratch[9];
+    CUdeviceptr d_partial = r->scratch[10];
+
+    /* 1. Sparse conv: feats -> tmp */
+    t2_op_sparse_conv3d(ops, s, d_tmp, d_feats, conv_w, conv_b,
+                         d_gather_map, d_gathered, d_partial, N, C, C);
+
+    /* 2. LayerNorm: tmp -> tmp */
+    t2_op_layernorm(ops, s, d_tmp, d_tmp, norm_w, norm_b, N, C);
+
+    /* 3. MLP: Linear(C->4C) -> GELU -> Linear(4C->C) */
+    CUdeviceptr d_mlp = r->scratch[9];  /* reuse as [N, 4C] */
+    t2_op_gemm(ops, s, d_mlp, mlp0_w, d_tmp, mlp0_b, 4 * C, C, N);
+    t2_op_gelu(ops, s, d_mlp, N * 4 * C);
+    t2_op_gemm(ops, s, d_tmp, mlp2_w, d_mlp, mlp2_b, C, 4 * C, N);
+
+    /* 4. Residual: feats += tmp */
+    t2_op_residual_add(ops, s, d_feats, d_tmp, N * C);
+}
+
+/* Run shape decoder forward pass.
+ * slat: [N, 32] structured latent on CPU
+ * coords: [N, 4] int32 on CPU
+ * out_feats: caller-allocated [N_out, 7] on CPU
+ * out_coords: caller-allocated [N_out, 4] int32 on CPU
+ * Returns N_out (number of output voxels after C2S upsampling).
+ * NOTE: Currently runs ConvNeXt blocks only (no C2S), outputs at same resolution. */
+int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
+                                      const float *slat, const int32_t *coords, int N,
+                                      float *out_feats, int32_t *out_coords,
+                                      int *out_N) {
+    if (!r->shape_dec.loaded) {
+        fprintf(stderr, "T2: shape decoder not loaded\n"); return -1;
+    }
+    t2_ops *ops = &r->ops;
+    CUstream s = r->stream;
+
+    /* Use F16 MMA GEMM for shape decoder weights */
+    int saved_f32 = ops->use_f32_gemm;
+    int saved_mma = ops->use_mma_gemm;
+    if (r->ops.sm_version >= 70) {
+        ops->use_f32_gemm = 0;
+        ops->use_mma_gemm = 1;
+    }
+
+    int C = r->shape_dec.channels[0];  /* 1024 */
+
+    /* Upload input */
+    CUdeviceptr d_slat = cu_upload_raw(slat, (size_t)N * 32 * sizeof(float));
+    CUdeviceptr d_coords = cu_upload_raw(coords, (size_t)N * 4 * sizeof(int));
+
+    /* from_latent: [N, 32] -> [N, 1024] */
+    CUdeviceptr d_feats;
+    cuMemAlloc(&d_feats, (size_t)N * C * sizeof(float));
+    t2_op_gemm(ops, s, d_feats, r->shape_dec.from_latent_w, d_slat, r->shape_dec.from_latent_b,
+               C, 32, N);
+    cuMemFree(d_slat);
+
+    fprintf(stderr, "T2: shape decoder: from_latent -> [%d, %d]\n", N, C);
+
+    /* Build hash table on CPU, upload to GPU */
+    /* We need the sp3d hash for neighbor lookup. Build on CPU, upload keys/vals. */
+    /* Using the sp3d_hash from sparse3d.h */
+    sp3d_hash *hash = sp3d_hash_build(coords, N);
+    CUdeviceptr d_hash_keys = cu_upload_raw(hash->keys, (size_t)hash->capacity * sizeof(uint64_t));
+    CUdeviceptr d_hash_vals = cu_upload_raw(hash->vals, (size_t)hash->capacity * sizeof(int32_t));
+    int hash_cap = hash->capacity;
+
+    /* Build gather map on GPU */
+    CUdeviceptr d_gather_map;
+    cuMemAlloc(&d_gather_map, (size_t)N * 27 * sizeof(int));
+    t2_op_sparse_build_gather_map(ops, s, d_gather_map, d_coords, N,
+                                   d_hash_keys, d_hash_vals, hash_cap);
+
+    fprintf(stderr, "T2: shape decoder: gather map built (N=%d, hash_cap=%d)\n", N, hash_cap);
+
+    /* Run ConvNeXt blocks for each stage (without C2S for now) */
+    for (int stage = 0; stage < 4; stage++) {
+        int nblk = r->shape_dec.n_convnext[stage];
+        C = r->shape_dec.channels[stage];
+        fprintf(stderr, "T2: shape decoder: stage %d: %d ConvNeXt(%d), N=%d\n",
+                stage, nblk, C, N);
+
+        struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+        for (int b = 0; b < nblk; b++) {
+            run_shape_convnext(r, d_feats, N, C,
+                d_gather_map,
+                r->shape_dec.convnext[stage][b].conv_w,
+                r->shape_dec.convnext[stage][b].conv_b,
+                r->shape_dec.convnext[stage][b].norm_w,
+                r->shape_dec.convnext[stage][b].norm_b,
+                r->shape_dec.convnext[stage][b].mlp0_w,
+                r->shape_dec.convnext[stage][b].mlp0_b,
+                r->shape_dec.convnext[stage][b].mlp2_w,
+                r->shape_dec.convnext[stage][b].mlp2_b);
+        }
+
+        cuStreamSynchronize(s);
+        struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
+        double dt = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+        fprintf(stderr, "T2: shape decoder: stage %d done (%.1f ms)\n", stage, dt);
+
+        /* TODO: C2S upsampling between stages.
+         * For now, skip C2S — output at input resolution with stage 0 features.
+         * This means we only run stage 0 ConvNeXt blocks and output [N, 1024].
+         * Full C2S requires: subdivision prediction, coordinate expansion,
+         * hash rebuild at new resolution, and conv at new resolution. */
+        if (stage == 0) break;  /* TEMP: only run stage 0 */
+    }
+
+    /* output_layer: [N, C] -> [N, 7] (skipped if C != 64, since no C2S) */
+    /* For now, just download features and coords */
+    cuStreamSynchronize(s);
+    float *feats_cpu = (float *)malloc((size_t)N * C * sizeof(float));
+    cuMemcpyDtoH(feats_cpu, d_feats, (size_t)N * C * sizeof(float));
+    /* Copy first 7 channels as output (placeholder) */
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < 7 && j < C; j++)
+            out_feats[i * 7 + j] = feats_cpu[i * C + j];
+    free(feats_cpu);
+    memcpy(out_coords, coords, (size_t)N * 4 * sizeof(int32_t));
+    *out_N = N;
+
+    /* Cleanup */
+    cuMemFree(d_feats);
+    cuMemFree(d_coords);
+    cuMemFree(d_gather_map);
+    cuMemFree(d_hash_keys);
+    cuMemFree(d_hash_vals);
+    sp3d_hash_free(hash);
+
+    ops->use_f32_gemm = saved_f32;
+    ops->use_mma_gemm = saved_mma;
     return 0;
 }
 
