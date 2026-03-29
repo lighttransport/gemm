@@ -1669,14 +1669,14 @@ static CUdeviceptr vae_resblock_gpu(cuda_qimg_runner *r, CUdeviceptr x,
     vae_op_gn(r, tmp, x, n1_g, ci, sp);
     vae_op_silu(r, tmp, ci*sp);
     CUdeviceptr c1_out; cuMemAlloc(&c1_out, (size_t)co*sp*sizeof(float));
-    vae_op_conv2d(r, c1_out, tmp, c1_w, c1_b, ci, h, w, co, 3, 3, 1);
+    vae_op_conv2d(r, c1_out, tmp, c1_w, c1_b, ci, h, w, co, 3, 3, 0);  /* zero spatial pad */
     cuMemFree(tmp);
 
     tmp = (CUdeviceptr)0; cuMemAlloc(&tmp, (size_t)co*sp*sizeof(float));
     vae_op_gn(r, tmp, c1_out, n2_g, co, sp);
     vae_op_silu(r, tmp, co*sp);
     CUdeviceptr c2_out; cuMemAlloc(&c2_out, (size_t)co*sp*sizeof(float));
-    vae_op_conv2d(r, c2_out, tmp, c2_w, c2_b, co, h, w, co, 3, 3, 1);
+    vae_op_conv2d(r, c2_out, tmp, c2_w, c2_b, co, h, w, co, 3, 3, 0);  /* zero spatial pad */
     cuMemFree(tmp); cuMemFree(c1_out);
 
     /* Shortcut + residual */
@@ -1766,7 +1766,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     c = co_c1;
     {
         CUdeviceptr d_tmp; cuMemAlloc(&d_tmp, (size_t)c*h*w*sizeof(float));
-        vae_op_conv2d(r, d_tmp, d_x, d_c1_w, d_c1_b, ci_c1, h, w, c, 3, 3, 1);
+        vae_op_conv2d(r, d_tmp, d_x, d_c1_w, d_c1_b, ci_c1, h, w, c, 3, 3, 0);  /* zero spatial pad */
         cuMemFree(d_x); d_x = d_tmp;
         cuMemFree(d_c1_w); cuMemFree(d_c1_b);
     }
@@ -1972,7 +1972,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         CUdeviceptr d_hw = vae_upload_conv3d(st, "decoder.head.2.weight", &head_co, &head_ci, s);
         CUdeviceptr d_hb = vae_upload_f32(st, "decoder.head.2.bias", s);
         CUdeviceptr d_rgb; cuMemAlloc(&d_rgb, (size_t)3*spatial*sizeof(float));
-        vae_op_conv2d(r, d_rgb, d_tmp, d_hw, d_hb, c, h, w, 3, 3, 3, 1);
+        vae_op_conv2d(r, d_rgb, d_tmp, d_hw, d_hb, c, h, w, 3, 3, 3, 0);  /* zero spatial pad */
         if (r->verbose >= 2) VAE_DUMP("head_conv", d_rgb, 3*spatial);
         cuMemFree(d_tmp); cuMemFree(d_x); cuMemFree(d_hw); cuMemFree(d_hb);
         d_x = d_rgb;
