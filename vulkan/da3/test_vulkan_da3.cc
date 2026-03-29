@@ -3,6 +3,7 @@
  *
  * Usage: ./test_vulkan_da3 <model.safetensors> [-i input.jpg] [-o output.png]
  *        [--npy path.npy] [-d device_id] [-v verbosity]
+ *        [--shader-dir path] [--full] [--pose] [--rays] [--gaussians]
  *
  * Matches the CLI of test_hip_da3.c for easy comparison.
  */
@@ -30,7 +31,7 @@ static double get_time_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-/* Write float32 array as NumPy .npy (2D) */
+/* Write float32 array as NumPy .npy (2D or 3D) */
 static void write_npy_f32(const char *path, const float *data, int w, int h) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
@@ -53,6 +54,29 @@ static void write_npy_f32(const char *path, const float *data, int w, int h) {
     fprintf(stderr, "Wrote %s (%dx%d, float32)\n", path, w, h);
 }
 
+/* Write 3D float array as NumPy .npy */
+static void write_npy_f32_3d(const char *path, const float *data, int c, int h, int w) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t version[2] = {1, 0};
+    fwrite(version, 1, 2, f);
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d, %d), }", c, h, w);
+    int total_hdr = 10 + hlen + 1;
+    int pad = ((total_hdr + 63) / 64) * 64 - total_hdr;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(data, sizeof(float), (size_t)c * h * w, f);
+    fclose(f);
+    fprintf(stderr, "Wrote %s (%dx%dx%d, float32)\n", path, c, h, w);
+}
+
 static void print_stats(const char *name, const float *data, int n) {
     if (!data || n == 0) return;
     float mn = data[0], mx = data[0], sum = 0;
@@ -70,7 +94,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <model.safetensors> [-i input.jpg] [-o output.png]\n"
                         "       [--npy path.npy] [-d device_id] [-v verbosity]\n"
-                        "       [--shader-dir path]\n", argv[0]);
+                        "       [--shader-dir path] [--full] [--pose] [--rays] [--gaussians]\n", argv[0]);
         return 1;
     }
 
@@ -81,6 +105,8 @@ int main(int argc, char **argv) {
     const char *shader_dir = nullptr;
     int device_id = 0;
     int verbose = 1;
+    int output_flags = DA3_OUTPUT_DEPTH;
+    bool flag_full = false;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_path = argv[++i];
@@ -89,6 +115,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc) verbose = atoi(argv[++i]);
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
         else if (strcmp(argv[i], "--shader-dir") == 0 && i + 1 < argc) shader_dir = argv[++i];
+        else if (strcmp(argv[i], "--full") == 0) { flag_full = true; output_flags = DA3_OUTPUT_ALL; }
+        else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
+        else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
+        else if (strcmp(argv[i], "--gaussians") == 0) output_flags |= DA3_OUTPUT_GAUSSIANS;
     }
 
     /* Derive config.json path */
@@ -143,9 +173,9 @@ int main(int argc, char **argv) {
     }
 
     /* Run inference */
-    fprintf(stderr, "\n=== Running Vulkan DA3 inference ===\n");
+    fprintf(stderr, "\n=== Running Vulkan DA3 inference (flags=0x%02x) ===\n", output_flags);
     double t0 = get_time_ms();
-    da3_vk_result result = vulkan_da3_predict(gpu, img, img_w, img_h);
+    da3_full_result result = vulkan_da3_predict_full(gpu, img, img_w, img_h, output_flags);
     double elapsed = get_time_ms() - t0;
     fprintf(stderr, "\nTotal inference time: %.1f ms\n", elapsed);
 
@@ -176,9 +206,40 @@ int main(int argc, char **argv) {
         fprintf(stderr, "No depth output produced\n");
     }
 
+    /* Pose output */
+    if (result.has_pose) {
+        fprintf(stderr, "\nPose estimation:\n");
+        fprintf(stderr, "  translation: [%.6f, %.6f, %.6f]\n",
+                result.pose[0], result.pose[1], result.pose[2]);
+        fprintf(stderr, "  quaternion:  [%.6f, %.6f, %.6f, %.6f]\n",
+                result.pose[3], result.pose[4], result.pose[5], result.pose[6]);
+        fprintf(stderr, "  fov:         [%.6f, %.6f]\n",
+                result.pose[7], result.pose[8]);
+    }
+
+    /* Rays output */
+    if (result.has_rays && result.rays) {
+        fprintf(stderr, "\nRays output:\n");
+        print_stats("rays", result.rays, 6 * npix);
+        print_stats("ray_conf", result.ray_confidence, npix);
+    }
+
+    /* Gaussians output */
+    if (result.has_gaussians && result.gaussians) {
+        fprintf(stderr, "\nGaussians output:\n");
+        /* Print stats for first channel as proxy (full array is gs_oc * npix) */
+        print_stats("gauss[0]", result.gaussians, npix);
+        if (npy_path) {
+            char gs_path[512];
+            snprintf(gs_path, sizeof(gs_path), "%s.gaussians.npy", npy_path);
+            /* Assume 38 output channels (standard DA3 gaussian representation) */
+            write_npy_f32_3d(gs_path, result.gaussians, 38, result.height, result.width);
+        }
+    }
+
     /* Cleanup */
     if (input_path) stbi_image_free(img); else free(img);
-    da3_vk_result_free(&result);
+    da3_full_result_free(&result);
     vulkan_da3_free(gpu);
 
     fprintf(stderr, "\nDone.\n");
