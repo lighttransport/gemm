@@ -80,6 +80,16 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
                                   const int32_t *coords, int N,
                                   float *output);
 
+/* Load shape decoder (SC-VAE) weights */
+int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path);
+
+/* Run shape decoder on GPU. Currently runs stage 0 ConvNeXt blocks only.
+ * slat: [N, 32], coords: [N, 4] int32, out_feats: [N, 7], out_coords: [N, 4] */
+int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
+                                      const float *slat, const int32_t *coords, int N,
+                                      float *out_feats, int32_t *out_coords,
+                                      int *out_N);
+
 #ifdef __cplusplus
 }
 #endif

@@ -54,6 +54,13 @@ typedef struct {
 
     CUfunction gemm_f16_mma;
 
+    /* Sparse conv kernels */
+    CUfunction sparse_build_gather_map;
+    CUfunction sparse_gather;
+    CUfunction scatter_add;
+    CUfunction broadcast_bias;
+    CUfunction residual_add;
+
     int sm_version;
     int use_f32_gemm;   /* 0=F16 weights, 1=F32 weights */
     int use_mma_gemm;   /* 1=use MMA tensor core GEMM (sm_70+, F16 weights) */
@@ -114,6 +121,13 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
     if (sm_version >= 70) {
         GET_FN("gemm_f16_f32",        gemm_f16_mma);
     }
+
+    /* Sparse conv kernels */
+    GET_FN("sparse_build_gather_map_f32", sparse_build_gather_map);
+    GET_FN("sparse_gather_f32",           sparse_gather);
+    GET_FN("scatter_add_f32",             scatter_add);
+    GET_FN("broadcast_bias_f32",          broadcast_bias);
+    GET_FN("residual_add_f32",            residual_add);
 
     #undef GET_FN
     return 0;
@@ -371,6 +385,117 @@ static inline void t2_op_pixel_shuffle_3d(t2_ops *ops, CUstream s,
     void *args[] = {&dst, &src, &C, &D, &H, &W};
     cuLaunchKernel(ops->pixel_shuffle_3d, (unsigned)((total+255)/256), 1, 1,
                    256, 1, 1, 0, s, args, NULL);
+}
+
+/* ======================================================================== */
+/* Sparse convolution ops                                                    */
+/* ======================================================================== */
+
+/* Build gather map: for each voxel, find neighbor indices via hash table.
+ * out_map: [N, 27] int32 on GPU */
+static inline void t2_op_sparse_build_gather_map(t2_ops *ops, CUstream s,
+                                                   CUdeviceptr out_map,
+                                                   CUdeviceptr coords, int N,
+                                                   CUdeviceptr hash_keys,
+                                                   CUdeviceptr hash_vals,
+                                                   int hash_cap) {
+    void *args[] = {&out_map, &coords, &N, &hash_keys, &hash_vals, &hash_cap};
+    cuLaunchKernel(ops->sparse_build_gather_map, (unsigned)((N+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Gather features for kernel position k_idx.
+ * gathered: [N, C], feats: [N, C], gather_map: [N, 27] */
+static inline void t2_op_sparse_gather(t2_ops *ops, CUstream s,
+                                         CUdeviceptr gathered,
+                                         CUdeviceptr feats,
+                                         CUdeviceptr gather_map,
+                                         int N, int C, int k_idx) {
+    int total = N * C;
+    void *args[] = {&gathered, &feats, &gather_map, &N, &C, &k_idx};
+    cuLaunchKernel(ops->sparse_gather, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Broadcast bias: dst[i*C + c] = bias[c] */
+static inline void t2_op_broadcast_bias(t2_ops *ops, CUstream s,
+                                          CUdeviceptr dst, CUdeviceptr bias,
+                                          int N, int C) {
+    int total = N * C;
+    void *args[] = {&dst, &bias, &N, &C};
+    cuLaunchKernel(ops->broadcast_bias, (unsigned)((total+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Scatter add: dst += src */
+static inline void t2_op_scatter_add(t2_ops *ops, CUstream s,
+                                       CUdeviceptr dst, CUdeviceptr src, int n) {
+    void *args[] = {&dst, &src, &n};
+    cuLaunchKernel(ops->scatter_add, (unsigned)((n+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* Residual add: dst += src */
+static inline void t2_op_residual_add(t2_ops *ops, CUstream s,
+                                        CUdeviceptr dst, CUdeviceptr src, int n) {
+    void *args[] = {&dst, &src, &n};
+    cuLaunchKernel(ops->residual_add, (unsigned)((n+255)/256), 1, 1,
+                   256, 1, 1, 0, s, args, NULL);
+}
+
+/* ---- Sparse Conv3D using gather-GEMM pattern ----
+ * For each of 27 kernel positions:
+ *   1. Gather neighbor features → dense [N, in_C]
+ *   2. GEMM: weight_k[out_C, in_C] × gathered[N, in_C]^T → partial[N, out_C]
+ *   3. Accumulate partial into output
+ *
+ * dst: [N, out_C], feats: [N, in_C], weight: [out_C, 27, in_C] (F16 or F32)
+ * gather_map: [N, 27] precomputed neighbor indices
+ * scratch: temp buffer >= N*max(in_C, out_C)*sizeof(float)
+ * scratch2: temp buffer >= N*out_C*sizeof(float)
+ */
+static inline void t2_op_sparse_conv3d(t2_ops *ops, CUstream s,
+                                         CUdeviceptr dst,
+                                         CUdeviceptr feats,
+                                         CUdeviceptr weight,
+                                         CUdeviceptr bias,
+                                         CUdeviceptr gather_map,
+                                         CUdeviceptr scratch,   /* [N, in_C] gathered features */
+                                         CUdeviceptr scratch2,  /* [N, out_C] partial GEMM result */
+                                         int N, int in_C, int out_C) {
+    /* Initialize output with bias */
+    t2_op_broadcast_bias(ops, s, dst, bias, N, out_C);
+
+    /* For each kernel position, gather + GEMM + accumulate */
+    for (int k = 0; k < 27; k++) {
+        /* Gather neighbor features for position k */
+        t2_op_sparse_gather(ops, s, scratch, feats, gather_map, N, in_C, k);
+
+        /* GEMM: scratch2[N, out_C] = weight_k[out_C, in_C] @ scratch[N, in_C]^T
+         * weight_k starts at weight + k * out_C * in_C (but layout is [out_C, 27, in_C])
+         * So for kernel position k, weight for output o is at: weight[(o*27 + k) * in_C]
+         * This is NOT contiguous in out_C — we need weight transposed to [27, out_C, in_C].
+         *
+         * Actually the CPU layout is [out_C, 27, in_C]. For GEMM we need [out_C, in_C]
+         * for each k. The stride between consecutive out_C for same k is 27*in_C.
+         * This requires a strided GEMM or weight reshuffling.
+         *
+         * Simpler: assume weight is pre-transposed to [27, out_C, in_C] at load time.
+         * Then weight_k = weight + k * out_C * in_C.
+         */
+        CUdeviceptr weight_k = weight + (size_t)k * out_C * in_C * sizeof(float);
+        /* Note: if weights are F16, the stride is half */
+        if (!ops->use_f32_gemm) {
+            weight_k = weight + (size_t)k * out_C * in_C * sizeof(unsigned short);
+        }
+
+        /* GEMM: scratch2 = weight_k @ scratch^T + 0 (no bias, added once) */
+        CUdeviceptr null_bias = 0;
+        t2_op_gemm(ops, s, scratch2, weight_k, scratch, null_bias, out_C, in_C, N);
+
+        /* Accumulate: dst += scratch2 */
+        t2_op_scatter_add(ops, s, dst, scratch2, N * out_C);
+    }
 }
 
 #endif /* CUDA_TRELLIS2_OPS_H */

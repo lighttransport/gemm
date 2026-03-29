@@ -423,6 +423,91 @@ static const char cuda_trellis2_kernel_source[] =
 "    for (int d = 0; d < head_dim; d++) o[d] = acc[d] * inv;\n"
 "}\n\n"
 
+/* ---- Sparse 3D convolution kernels ---- */
+
+/* Build neighbor gather map: for each voxel, find indices of 27 neighbors.
+ * coords: [N, 4] int32 (batch, z, y, x)
+ * hash_keys: [capacity] uint64  hash_vals: [capacity] int32
+ * out_map: [N, 27] int32 (-1 if neighbor absent)
+ * Grid: ceil(N/256), Block: 256 */
+"__global__ void sparse_build_gather_map_f32(\n"
+"    int *out_map, const int *coords, int N,\n"
+"    const unsigned long long *hash_keys, const int *hash_vals, int hash_cap) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= N) return;\n"
+"    int b  = coords[i * 4];\n"
+"    int cz = coords[i * 4 + 1];\n"
+"    int cy = coords[i * 4 + 2];\n"
+"    int cx = coords[i * 4 + 3];\n"
+"    for (int kd = 0; kd < 3; kd++) {\n"
+"        for (int kh = 0; kh < 3; kh++) {\n"
+"            for (int kw = 0; kw < 3; kw++) {\n"
+"                int nz = cz + kd - 1, ny = cy + kh - 1, nx = cx + kw - 1;\n"
+"                unsigned long long key = ((unsigned long long)(unsigned short)b << 48)\n"
+"                    | ((unsigned long long)(unsigned short)nz << 32)\n"
+"                    | ((unsigned long long)(unsigned short)ny << 16)\n"
+"                    | (unsigned long long)(unsigned short)nx;\n"
+"                unsigned int slot = (unsigned int)((key * 0x9E3779B97F4A7C15ULL) >> 32)\n"
+"                                  % (unsigned int)hash_cap;\n"
+"                int result = -1;\n"
+"                for (;;) {\n"
+"                    unsigned long long sk = hash_keys[slot];\n"
+"                    if (sk == key) { result = hash_vals[slot]; break; }\n"
+"                    if (sk == 0xFFFFFFFFFFFFFFFFULL) break;\n"
+"                    slot = (slot + 1) % (unsigned int)hash_cap;\n"
+"                }\n"
+"                out_map[i * 27 + kd * 9 + kh * 3 + kw] = result;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n\n"
+
+/* Gather neighbor features for one kernel position.
+ * gather_map: [N, 27] int32 neighbor indices
+ * feats: [N, C] float32 input features
+ * gathered: [N, C] float32 output (zero if neighbor absent)
+ * k_idx: which of the 27 kernel positions to gather for
+ * Grid: ceil(N*C/256), Block: 256 */
+"__global__ void sparse_gather_f32(\n"
+"    float *gathered, const float *feats, const int *gather_map,\n"
+"    int N, int C, int k_idx) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (idx >= N * C) return;\n"
+"    int i = idx / C;\n"
+"    int c = idx % C;\n"
+"    int ni = gather_map[i * 27 + k_idx];\n"
+"    gathered[idx] = (ni >= 0) ? feats[(size_t)ni * C + c] : 0.0f;\n"
+"}\n\n"
+
+/* Scatter-add: dst[i] += src[i] for N*C elements.
+ * Grid: ceil(N*C/256), Block: 256 */
+"__global__ void scatter_add_f32(\n"
+"    float *dst, const float *src, int count) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < count) dst[i] += src[i];\n"
+"}\n\n"
+
+/* Init buffer with broadcast bias: dst[i*C + c] = bias[c] for all i.
+ * Grid: ceil(N*C/256), Block: 256 */
+"__global__ void broadcast_bias_f32(\n"
+"    float *dst, const float *bias, int N, int C) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (idx >= N * C) return;\n"
+"    dst[idx] = bias ? bias[idx % C] : 0.0f;\n"
+"}\n\n"
+
+/* Residual add: dst[i] += src[i]. Grid: ceil(n/256), Block: 256 */
+"__global__ void residual_add_f32(float *dst, const float *src, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) dst[i] += src[i];\n"
+"}\n\n"
+
+/* GELU activation (in-place). Grid: ceil(n/256), Block: 256 */
+"/* (gelu_f32 already in common kernels) */\n"
+
+/* LayerNorm for sparse features: same as layernorm_f32 but just a reminder.
+ * Already available as layernorm_f32 in common kernels. */
+
 "} /* close extern C from cuda_kernels_common */\n"
 ; /* end of kernel source string */
 
