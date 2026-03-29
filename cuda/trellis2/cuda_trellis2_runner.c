@@ -143,6 +143,7 @@ struct cuda_trellis2_runner {
     dit_block_gpu dit_blocks[DIT_DEPTH];
     CUdeviceptr dit_rope_cos, dit_rope_sin;
     int dit_n_freqs, dit_axis_dim;
+    int dit_use_f16;  /* 1 if DiT weights stored as F16 */
 
     /* Stage 2 shape flow DiT */
     dit_model_gpu stage2;
@@ -168,7 +169,20 @@ struct cuda_trellis2_runner {
 static void ensure_scratch(cuda_trellis2_runner *r, int idx, size_t bytes) {
     if (r->scratch_size[idx] >= bytes) return;
     if (r->scratch[idx]) cuMemFree(r->scratch[idx]);
-    cuMemAlloc(&r->scratch[idx], bytes);
+    CUresult err = cuMemAlloc(&r->scratch[idx], bytes);
+    if (err != 0) {
+        const char *name = NULL;
+        cuGetErrorName(err, &name);
+        size_t free_mem = 0, total_mem = 0;
+        cuMemGetInfo(&free_mem, &total_mem);
+        fprintf(stderr, "T2: FATAL: cuMemAlloc(%zu bytes = %.1f MB) for scratch[%d] failed: %s "
+                "(GPU free=%.0f MB / %.0f MB total)\n",
+                bytes, bytes / 1048576.0, idx, name ? name : "?",
+                free_mem / 1048576.0, total_mem / 1048576.0);
+        r->scratch[idx] = 0;
+        r->scratch_size[idx] = 0;
+        return;
+    }
     r->scratch_size[idx] = bytes;
 }
 
@@ -242,6 +256,70 @@ static CUdeviceptr t2_upload_f32(st_context *st, const char *name, int verbose) 
         fprintf(stderr, "  %s: %s [", name, dtype);
         for (int d2 = 0; d2 < nd; d2++) fprintf(stderr, "%s%lu", d2?",":"", (unsigned long)sh[d2]);
         fprintf(stderr, "] -> F32 GPU (%.1f MB)\n", (float)(n_elem * 4) / (1024*1024));
+    }
+    return d;
+}
+
+/* Upload safetensors tensor as F16 on GPU (handles F16, BF16, F32 source).
+ * Halves GPU memory compared to F32, enables MMA tensor core GEMM. */
+static CUdeviceptr t2_upload_f16(st_context *st, const char *name, int verbose) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) {
+        if (verbose) fprintf(stderr, "  [MISSING] %s\n", name);
+        return 0;
+    }
+    const char *dtype = safetensors_dtype(st, idx);
+    size_t nbytes = safetensors_nbytes(st, idx);
+    void *data = safetensors_data(st, idx);
+
+    if (strcmp(dtype, "F16") == 0) {
+        /* Already F16 — upload directly */
+        return cu_upload_raw(data, nbytes);
+    }
+
+    size_t n_elem;
+    if (strcmp(dtype, "BF16") == 0)     n_elem = nbytes / 2;
+    else if (strcmp(dtype, "F32") == 0) n_elem = nbytes / 4;
+    else { fprintf(stderr, "  [SKIP] %s: unsupported dtype %s for F16\n", name, dtype); return 0; }
+
+    uint16_t *f16 = (uint16_t *)malloc(n_elem * sizeof(uint16_t));
+    if (strcmp(dtype, "BF16") == 0) {
+        /* BF16 -> F16: convert via F32 intermediate */
+        const uint16_t *src = (const uint16_t *)data;
+        for (size_t i = 0; i < n_elem; i++) {
+            uint32_t bits = (uint32_t)src[i] << 16;
+            float f; memcpy(&f, &bits, 4);
+            /* F32 -> F16 conversion */
+            uint32_t fb; memcpy(&fb, &f, 4);
+            uint32_t sign = (fb >> 16) & 0x8000;
+            int32_t exp = ((fb >> 23) & 0xff) - 127 + 15;
+            uint32_t mant = (fb >> 13) & 0x3ff;
+            if (exp <= 0) f16[i] = (uint16_t)sign;           /* underflow to zero */
+            else if (exp >= 31) f16[i] = (uint16_t)(sign | 0x7c00); /* overflow to inf */
+            else f16[i] = (uint16_t)(sign | (exp << 10) | mant);
+        }
+    } else { /* F32 -> F16 */
+        const float *src = (const float *)data;
+        for (size_t i = 0; i < n_elem; i++) {
+            uint32_t fb; memcpy(&fb, &src[i], 4);
+            uint32_t sign = (fb >> 16) & 0x8000;
+            int32_t exp = ((fb >> 23) & 0xff) - 127 + 15;
+            uint32_t mant = (fb >> 13) & 0x3ff;
+            if (exp <= 0) f16[i] = (uint16_t)sign;
+            else if (exp >= 31) f16[i] = (uint16_t)(sign | 0x7c00);
+            else f16[i] = (uint16_t)(sign | (exp << 10) | mant);
+        }
+    }
+
+    CUdeviceptr d = cu_upload_raw(f16, n_elem * sizeof(uint16_t));
+    free(f16);
+
+    if (verbose >= 2) {
+        const uint64_t *sh = safetensors_shape(st, idx);
+        int nd = safetensors_ndims(st, idx);
+        fprintf(stderr, "  %s: %s [", name, dtype);
+        for (int d2 = 0; d2 < nd; d2++) fprintf(stderr, "%s%lu", d2?",":"", (unsigned long)sh[d2]);
+        fprintf(stderr, "] -> F16 GPU (%.1f MB)\n", (float)(n_elem * 2) / (1024*1024));
     }
     return d;
 }
@@ -341,17 +419,21 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
     fprintf(stderr, "T2: loading DiT from %s (%d tensors)\n", path, st->n_tensors);
 
     int v = r->verbose;
+    int use_f16 = (r->ops.sm_version >= 70);
 
-    /* Top-level */
+    /* Timestep MLP and modulation: always F32 (n_tok=1, modulation reads directly) */
     r->dit_t_fc1_w = t2_upload_f32(st, "t_embedder.mlp.0.weight", v);
     r->dit_t_fc1_b = t2_upload_f32(st, "t_embedder.mlp.0.bias", v);
     r->dit_t_fc2_w = t2_upload_f32(st, "t_embedder.mlp.2.weight", v);
     r->dit_t_fc2_b = t2_upload_f32(st, "t_embedder.mlp.2.bias", v);
     r->dit_mod_w   = t2_upload_f32(st, "adaLN_modulation.1.weight", v);
     r->dit_mod_b   = t2_upload_f32(st, "adaLN_modulation.1.bias", v);
-    r->dit_x_emb_w = t2_upload_f32(st, "input_layer.weight", v);
+
+    /* Input/output embedding and block weights: F16 if supported */
+    #define UPW(name) (use_f16 ? t2_upload_f16(st, name, v) : t2_upload_f32(st, name, v))
+    r->dit_x_emb_w = UPW("input_layer.weight");
     r->dit_x_emb_b = t2_upload_f32(st, "input_layer.bias", v);
-    r->dit_out_w   = t2_upload_f32(st, "out_layer.weight", v);
+    r->dit_out_w   = UPW("out_layer.weight");
     r->dit_out_b   = t2_upload_f32(st, "out_layer.bias", v);
 
     if (!r->dit_t_fc1_w) fprintf(stderr, "T2: WARNING: t_embedder missing\n");
@@ -363,39 +445,43 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
         dit_block_gpu *blk = &r->dit_blocks[L];
         char name[256];
 
-        #define BLK(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
+        #define BLKW(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
+                              UPW(name))
+        #define BLKB(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
                               t2_upload_f32(st, name, v >= 2 ? v : 0))
 
-        blk->sa_qkv_w    = BLK("self_attn.to_qkv.weight");
-        blk->sa_qkv_b    = BLK("self_attn.to_qkv.bias");
-        blk->sa_q_norm   = BLK("self_attn.q_rms_norm.gamma");
-        blk->sa_k_norm   = BLK("self_attn.k_rms_norm.gamma");
-        blk->sa_out_w    = BLK("self_attn.to_out.weight");
-        blk->sa_out_b    = BLK("self_attn.to_out.bias");
+        blk->sa_qkv_w    = BLKW("self_attn.to_qkv.weight");
+        blk->sa_qkv_b    = BLKB("self_attn.to_qkv.bias");
+        blk->sa_q_norm   = BLKB("self_attn.q_rms_norm.gamma");
+        blk->sa_k_norm   = BLKB("self_attn.k_rms_norm.gamma");
+        blk->sa_out_w    = BLKW("self_attn.to_out.weight");
+        blk->sa_out_b    = BLKB("self_attn.to_out.bias");
 
-        blk->norm2_w     = BLK("norm2.weight");
-        blk->norm2_b     = BLK("norm2.bias");
-        blk->ca_q_w      = BLK("cross_attn.to_q.weight");
-        blk->ca_q_b      = BLK("cross_attn.to_q.bias");
-        blk->ca_kv_w     = BLK("cross_attn.to_kv.weight");
-        blk->ca_kv_b     = BLK("cross_attn.to_kv.bias");
-        blk->ca_q_norm   = BLK("cross_attn.q_rms_norm.gamma");
-        blk->ca_k_norm   = BLK("cross_attn.k_rms_norm.gamma");
-        blk->ca_out_w    = BLK("cross_attn.to_out.weight");
-        blk->ca_out_b    = BLK("cross_attn.to_out.bias");
+        blk->norm2_w     = BLKB("norm2.weight");
+        blk->norm2_b     = BLKB("norm2.bias");
+        blk->ca_q_w      = BLKW("cross_attn.to_q.weight");
+        blk->ca_q_b      = BLKB("cross_attn.to_q.bias");
+        blk->ca_kv_w     = BLKW("cross_attn.to_kv.weight");
+        blk->ca_kv_b     = BLKB("cross_attn.to_kv.bias");
+        blk->ca_q_norm   = BLKB("cross_attn.q_rms_norm.gamma");
+        blk->ca_k_norm   = BLKB("cross_attn.k_rms_norm.gamma");
+        blk->ca_out_w    = BLKW("cross_attn.to_out.weight");
+        blk->ca_out_b    = BLKB("cross_attn.to_out.bias");
 
-        blk->mlp_fc1_w   = BLK("mlp.mlp.0.weight");
-        blk->mlp_fc1_b   = BLK("mlp.mlp.0.bias");
-        blk->mlp_fc2_w   = BLK("mlp.mlp.2.weight");
-        blk->mlp_fc2_b   = BLK("mlp.mlp.2.bias");
+        blk->mlp_fc1_w   = BLKW("mlp.mlp.0.weight");
+        blk->mlp_fc1_b   = BLKB("mlp.mlp.0.bias");
+        blk->mlp_fc2_w   = BLKW("mlp.mlp.2.weight");
+        blk->mlp_fc2_b   = BLKB("mlp.mlp.2.bias");
 
-        blk->mod_bias    = BLK("modulation");
+        blk->mod_bias    = BLKB("modulation");
 
-        #undef BLK
+        #undef BLKW
+        #undef BLKB
 
         if (L == 0 && !blk->sa_qkv_w)
             fprintf(stderr, "T2: WARNING: block 0 self_attn missing\n");
     }
+    #undef UPW
 
     /* Precompute 3D RoPE tables on CPU, upload to GPU */
     {
@@ -431,8 +517,9 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
         fprintf(stderr, "T2: RoPE tables uploaded (%d freqs/axis)\n", n_freqs);
     }
 
+    r->dit_use_f16 = use_f16;
     safetensors_close(st);
-    fprintf(stderr, "T2: DiT loaded (%d blocks)\n", DIT_DEPTH);
+    fprintf(stderr, "T2: DiT loaded (%d blocks, weights=%s)\n", DIT_DEPTH, use_f16 ? "F16" : "F32");
     return 0;
 }
 
@@ -612,12 +699,15 @@ static int load_dinov3_weights(cuda_trellis2_runner *r, const char *path) {
 }
 
 static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
-    /* Stage 2 uses identical weight naming as Stage 1, just in_channels=32 */
+    /* Stage 2 uses identical weight naming as Stage 1, just in_channels=32.
+     * Weight matrices are stored as F16 for MMA tensor core GEMM;
+     * biases, norms, and small matrices stay F32. */
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     fprintf(stderr, "T2: loading Stage 2 from %s (%d tensors)\n", path, st->n_tensors);
     int v = r->verbose;
     dit_model_gpu *m = &r->stage2;
+    int use_f16 = (r->ops.sm_version >= 70);  /* F16 MMA needs sm_70+ */
 
     m->n_blocks = DIT_DEPTH;
     m->model_channels = DIT_DIM;
@@ -634,45 +724,54 @@ static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
         else m->in_channels = 32;
     }
 
+    /* Timestep MLP and modulation: keep F32 (n_tok=1, GEMM perf irrelevant).
+     * Modulation kernel reads weights as F32 directly. */
     m->t_fc1_w = t2_upload_f32(st, "t_embedder.mlp.0.weight", v);
     m->t_fc1_b = t2_upload_f32(st, "t_embedder.mlp.0.bias", v);
     m->t_fc2_w = t2_upload_f32(st, "t_embedder.mlp.2.weight", v);
     m->t_fc2_b = t2_upload_f32(st, "t_embedder.mlp.2.bias", v);
     m->mod_w   = t2_upload_f32(st, "adaLN_modulation.1.weight", v);
     m->mod_b   = t2_upload_f32(st, "adaLN_modulation.1.bias", v);
-    m->x_emb_w = t2_upload_f32(st, "input_layer.weight", v);
+
+    /* Input/output embedding: F16 weight, F32 bias */
+    #define UPW(name) (use_f16 ? t2_upload_f16(st, name, v) : t2_upload_f32(st, name, v))
+    m->x_emb_w = UPW("input_layer.weight");
     m->x_emb_b = t2_upload_f32(st, "input_layer.bias", v);
-    m->out_w   = t2_upload_f32(st, "out_layer.weight", v);
+    m->out_w   = UPW("out_layer.weight");
     m->out_b   = t2_upload_f32(st, "out_layer.bias", v);
 
     for (int L = 0; L < m->n_blocks; L++) {
         dit_block_gpu *blk = &m->blocks[L];
-        char name[256]; int idx;
-        #define BLK2(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
+        char name[256];
+        #define BLK2W(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
+                               UPW(name))
+        #define BLK2B(suffix) (snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix), \
                                t2_upload_f32(st, name, v >= 2 ? v : 0))
-        blk->sa_qkv_w  = BLK2("self_attn.to_qkv.weight");
-        blk->sa_qkv_b  = BLK2("self_attn.to_qkv.bias");
-        blk->sa_q_norm  = BLK2("self_attn.q_rms_norm.gamma");
-        blk->sa_k_norm  = BLK2("self_attn.k_rms_norm.gamma");
-        blk->sa_out_w   = BLK2("self_attn.to_out.weight");
-        blk->sa_out_b   = BLK2("self_attn.to_out.bias");
-        blk->norm2_w    = BLK2("norm2.weight");
-        blk->norm2_b    = BLK2("norm2.bias");
-        blk->ca_q_w     = BLK2("cross_attn.to_q.weight");
-        blk->ca_q_b     = BLK2("cross_attn.to_q.bias");
-        blk->ca_kv_w    = BLK2("cross_attn.to_kv.weight");
-        blk->ca_kv_b    = BLK2("cross_attn.to_kv.bias");
-        blk->ca_q_norm  = BLK2("cross_attn.q_rms_norm.gamma");
-        blk->ca_k_norm  = BLK2("cross_attn.k_rms_norm.gamma");
-        blk->ca_out_w   = BLK2("cross_attn.to_out.weight");
-        blk->ca_out_b   = BLK2("cross_attn.to_out.bias");
-        blk->mlp_fc1_w  = BLK2("mlp.mlp.0.weight");
-        blk->mlp_fc1_b  = BLK2("mlp.mlp.0.bias");
-        blk->mlp_fc2_w  = BLK2("mlp.mlp.2.weight");
-        blk->mlp_fc2_b  = BLK2("mlp.mlp.2.bias");
-        blk->mod_bias   = BLK2("modulation");
-        #undef BLK2
+        blk->sa_qkv_w  = BLK2W("self_attn.to_qkv.weight");
+        blk->sa_qkv_b  = BLK2B("self_attn.to_qkv.bias");
+        blk->sa_q_norm  = BLK2B("self_attn.q_rms_norm.gamma");
+        blk->sa_k_norm  = BLK2B("self_attn.k_rms_norm.gamma");
+        blk->sa_out_w   = BLK2W("self_attn.to_out.weight");
+        blk->sa_out_b   = BLK2B("self_attn.to_out.bias");
+        blk->norm2_w    = BLK2B("norm2.weight");
+        blk->norm2_b    = BLK2B("norm2.bias");
+        blk->ca_q_w     = BLK2W("cross_attn.to_q.weight");
+        blk->ca_q_b     = BLK2B("cross_attn.to_q.bias");
+        blk->ca_kv_w    = BLK2W("cross_attn.to_kv.weight");
+        blk->ca_kv_b    = BLK2B("cross_attn.to_kv.bias");
+        blk->ca_q_norm  = BLK2B("cross_attn.q_rms_norm.gamma");
+        blk->ca_k_norm  = BLK2B("cross_attn.k_rms_norm.gamma");
+        blk->ca_out_w   = BLK2W("cross_attn.to_out.weight");
+        blk->ca_out_b   = BLK2B("cross_attn.to_out.bias");
+        blk->mlp_fc1_w  = BLK2W("mlp.mlp.0.weight");
+        blk->mlp_fc1_b  = BLK2B("mlp.mlp.0.bias");
+        blk->mlp_fc2_w  = BLK2W("mlp.mlp.2.weight");
+        blk->mlp_fc2_b  = BLK2B("mlp.mlp.2.bias");
+        blk->mod_bias   = BLK2B("modulation");
+        #undef BLK2W
+        #undef BLK2B
     }
+    #undef UPW
 
     /* RoPE tables computed at runtime from sparse coords — set to NULL for now */
     m->rope_cos = 0; m->rope_sin = 0;
@@ -681,11 +780,22 @@ static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
 
     safetensors_close(st);
     r->stage2_loaded = 1;
-    fprintf(stderr, "T2: Stage 2 loaded (%d blocks, in_ch=%d)\n", m->n_blocks, m->in_channels);
+    fprintf(stderr, "T2: Stage 2 loaded (%d blocks, in_ch=%d, weights=%s)\n",
+            m->n_blocks, m->in_channels, use_f16 ? "F16" : "F32");
     return 0;
 }
 
 int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path) {
+    int use_f16 = (r->ops.sm_version >= 70);
+    if (use_f16) {
+        /* F16 weights: use MMA tensor core GEMM */
+        r->ops.use_f32_gemm = 0;
+        r->ops.use_mma_gemm = 1;
+    } else {
+        /* Fallback: F32 weights, F32 GEMM */
+        r->ops.use_f32_gemm = 1;
+        r->ops.use_mma_gemm = 0;
+    }
     return load_stage2_weights(r, stage2_path);
 }
 
@@ -693,7 +803,8 @@ int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
                                 const char *dinov3_path,
                                 const char *stage1_path,
                                 const char *decoder_path) {
-    /* Use F32 GEMM since all weights are converted to F32 */
+    /* GEMM mode is set per-model in each forward wrapper (run_dit_forward,
+     * run_stage2_forward). Default to F32 for safety. */
     r->ops.use_f32_gemm = 1;
 
     if (stage1_path && load_dit_weights(r, stage1_path) != 0) return -1;
@@ -860,7 +971,9 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
      * 3: mod[6*D] + t_emb[D] + cross_Q[N*D] + ca_K[ctx*D] + ca_V[ctx*D] */
     size_t qkv_sz = (size_t)3 * N * D * sizeof(float);
     size_t mlp_sz = (size_t)N * FFN * sizeof(float);
+    size_t ca_kv_gemm_sz = (size_t)ctx_len * 2 * D * sizeof(float);  /* cross-attn KV GEMM */
     size_t sh1 = qkv_sz > mlp_sz ? qkv_sz : mlp_sz;
+    if (ca_kv_gemm_sz > sh1) sh1 = ca_kv_gemm_sz;
     size_t ca_kv_sz = (size_t)ctx_len * D * sizeof(float);
     /* t_emb MLP outputs D floats (not 256), needs D-sized buffer */
     size_t buf3_sz = (size_t)(6*D + D) * sizeof(float)
@@ -889,26 +1002,32 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     t2_op_gemm(ops, stream, d_hidden, x_emb_w, d_x, x_emb_b,
                D, in_ch, N);
 
+    if (r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_hidden, 16); fprintf(stderr, "  input_emb: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
+
     /* 2. Timestep embedding: sinusoidal(256) -> MLP(256->D->D) */
     /* TRELLIS.2: t*1000, [cos, sin] order (NOT [sin, cos] like HY3D) */
     {
         float t_scaled = timestep * 1000.0f;
-        int half = 128;
-        void *te_args[] = {&d_temb, &t_scaled, &half};  /* dim/2 = 128 for the kernel */
         int te_dim = 256;
         void *te_args2[] = {&d_temb, &t_scaled, &te_dim};
         cuLaunchKernel(ops->timestep_embed_cossin, (unsigned)((128+255)/256), 1, 1,
                        256, 1, 1, 0, stream, te_args2, NULL);
     }
+
+    if (r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_temb, 16); fprintf(stderr, "  sinusoidal_emb: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
+
     /* t_fc1: [D, 256] */
-    t2_op_gemm(ops, stream, d_normed, t_fc1_w, d_temb, t_fc1_b,
+    /* Timestep MLP always uses F32 GEMM (weights are F32, n_tok=1) */
+    t2_op_gemm_f32(ops, stream, d_normed, t_fc1_w, d_temb, t_fc1_b,
                D, 256, 1);
     /* SiLU */
     t2_op_silu_inplace(ops, stream, d_normed, D);
     /* t_fc2: [D, D] */
-    t2_op_gemm(ops, stream, d_temb, t_fc2_w, d_normed, t_fc2_b,
+    t2_op_gemm_f32(ops, stream, d_temb, t_fc2_w, d_normed, t_fc2_b,
                D, D, 1);
     /* Now d_temb = [D] timestep embedding */
+
+    if (r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_temb, 16); fprintf(stderr, "  t_emb_mlp: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
 
     /* 3. Transformer blocks */
     for (int bi = 0; bi < n_blocks; bi++) {
@@ -918,6 +1037,9 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         t2_op_modulation(ops, stream, d_mod, d_temb,
                          mod_w, mod_b, blk->mod_bias,
                          D, 6 * D);
+
+        if (bi == 0 && r->verbose >= 2) { cuStreamSynchronize(stream); float _d[8]; cuMemcpyDtoH(_d, d_mod, 32); fprintf(stderr, "  mod_block0: [:8]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3],_d[4],_d[5],_d[6],_d[7]); }
+        if (bi == 0 && r->verbose >= 2) { float _s[4]; cuMemcpyDtoH(_s, d_mod+(size_t)D*sizeof(float), 16); fprintf(stderr, "  scale_sa: [:4]=%.6f %.6f %.6f %.6f\n", _s[0],_s[1],_s[2],_s[3]); }
 
         /* Split mod into shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp */
         CUdeviceptr d_shift_sa  = d_mod;
@@ -1028,20 +1150,35 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         t2_op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K, d_ca_V,
                          N, ctx_len, D, H, HD);
 
+        if (bi==0 && r->verbose>=2) dbg4("cross_attn_out", d_attn, stream);
+
         /* Cross-attn output + residual (no gate) */
         t2_op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b,
                    D, D, N);
+
+        if (bi==0 && r->verbose>=2) dbg4("ca_proj", d_normed, stream);
+
         t2_op_add(ops, stream, d_hidden, d_normed, N * D);
+
+        if (bi==0 && r->verbose>=2) dbg4("h_after_ca", d_hidden, stream);
 
         /* === MLP === */
         t2_op_adaln(ops, stream, d_normed, d_hidden,
                     d_shift_mlp, d_scale_mlp, N, D);
+
+        if (bi==0 && r->verbose>=2) dbg4("mlp_adaln", d_normed, stream);
+
         t2_op_gemm(ops, stream, d_mlp, blk->mlp_fc1_w, d_normed, blk->mlp_fc1_b,
                    FFN, D, N);
         t2_op_gelu(ops, stream, d_mlp, N * FFN);
         t2_op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b,
                    D, FFN, N);
+
+        if (bi==0 && r->verbose>=2) dbg4("mlp_out", d_normed, stream);
+
         t2_op_gated_add(ops, stream, d_hidden, d_normed, d_gate_mlp, N * D, D);
+
+        if (bi==0 && r->verbose>=2) dbg4("h_after_mlp", d_hidden, stream);
 
         /* Per-block debug */
         if (r->verbose >= 2) {
@@ -1069,10 +1206,21 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                in_ch, D, N);
 }
 
-/* Stage 1 wrapper */
+/* Stage 1 wrapper — uses F16 MMA if weights are F16, else F32 */
 static void run_dit_forward(cuda_trellis2_runner *r,
                              CUdeviceptr d_x, float timestep,
                              CUdeviceptr d_cond, CUdeviceptr d_output) {
+    /* Save GEMM mode and set appropriate mode for Stage 1 */
+    int saved_f32 = r->ops.use_f32_gemm;
+    int saved_mma = r->ops.use_mma_gemm;
+    if (r->dit_use_f16) {
+        r->ops.use_f32_gemm = 0;
+        r->ops.use_mma_gemm = 1;
+    } else {
+        r->ops.use_f32_gemm = 1;
+        r->ops.use_mma_gemm = 0;
+    }
+
     run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
         DIT_N_TOKENS, DIT_IN_CH, DIT_DEPTH,
         r->dit_t_fc1_w, r->dit_t_fc1_b, r->dit_t_fc2_w, r->dit_t_fc2_b,
@@ -1081,13 +1229,27 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         r->dit_out_w, r->dit_out_b,
         r->dit_blocks, r->dit_rope_cos, r->dit_rope_sin,
         r->dit_n_freqs, r->dit_axis_dim);
+
+    r->ops.use_f32_gemm = saved_f32;
+    r->ops.use_mma_gemm = saved_mma;
 }
 
-/* Stage 2 wrapper (variable N from sparse coords) */
+/* Stage 2 wrapper — uses F16 MMA GEMM if available (weights stored as F16) */
 static void run_stage2_forward(cuda_trellis2_runner *r,
                                 CUdeviceptr d_x, float timestep,
                                 CUdeviceptr d_cond, CUdeviceptr d_output,
                                 int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin) {
+    /* Save GEMM mode and set Stage 2 mode (F16 MMA or F32 fallback) */
+    int saved_f32 = r->ops.use_f32_gemm;
+    int saved_mma = r->ops.use_mma_gemm;
+    if (r->ops.sm_version >= 70) {
+        r->ops.use_f32_gemm = 0;
+        r->ops.use_mma_gemm = 1;
+    } else {
+        r->ops.use_f32_gemm = 1;
+        r->ops.use_mma_gemm = 0;
+    }
+
     dit_model_gpu *m = &r->stage2;
     run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
         N, m->in_channels, m->n_blocks,
@@ -1097,6 +1259,9 @@ static void run_stage2_forward(cuda_trellis2_runner *r,
         m->out_w, m->out_b,
         m->blocks, rope_cos, rope_sin,
         m->n_rope_freqs, m->rope_axis_dim);
+
+    r->ops.use_f32_gemm = saved_f32;
+    r->ops.use_mma_gemm = saved_mma;
 }
 
 /* ======================================================================== */
