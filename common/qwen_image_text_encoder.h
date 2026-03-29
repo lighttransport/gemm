@@ -324,17 +324,55 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
     bpe_vocab *vocab = (bpe_vocab *)enc->vocab;
     int n_embd = enc->n_embd;
 
-    /* Tokenize */
-    int text_len = (int)strlen(text);
-    int n_tokens = bpe_tokenize(vocab, text, text_len, NULL, 0);
-    if (n_tokens <= 0) {
-        fprintf(stderr, "qimg_text_enc: tokenization failed\n");
-        *out_n_tokens = 0;
-        return NULL;
-    }
+    /* Wrap prompt in Qwen-Image chat template (matching ComfyUI's QwenImageTokenizer).
+     * Template: <|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n
+     * Special tokens: <|im_start|>=151644, <|im_end|>=151645
+     * Without this template, the LLM produces wrong hidden states. */
+    #define IM_START 151644
+    #define IM_END   151645
 
-    int32_t *tokens = (int32_t *)malloc((size_t)n_tokens * sizeof(int32_t));
-    bpe_tokenize(vocab, text, text_len, tokens, n_tokens);
+    /* Tokenize the system prompt text (without special tokens) */
+    static const char sys_text[] =
+        "system\nDescribe the image by detailing the color, shape, size, texture, "
+        "quantity, text, spatial relationships of the objects and background:";
+    static const char user_text[] = "user\n";
+    static const char asst_text[] = "assistant\n";
+
+    int n_sys = bpe_tokenize(vocab, sys_text, (int)strlen(sys_text), NULL, 0);
+    int text_len = (int)strlen(text);
+    int n_user_prompt = bpe_tokenize(vocab, text, text_len, NULL, 0);
+    int n_user_prefix = bpe_tokenize(vocab, user_text, (int)strlen(user_text), NULL, 0);
+    int n_asst = bpe_tokenize(vocab, asst_text, (int)strlen(asst_text), NULL, 0);
+
+    /* Total: <im_start> sys_tokens <im_end> \n <im_start> user_prefix user_tokens <im_end> \n <im_start> asst_tokens */
+    int n_tokens = 1 + n_sys + 1 + 1 + n_user_prefix + n_user_prompt + 1 + 1 + n_asst;
+    /* Actually: [IM_START] [sys_tokens...] [IM_END] [\n] [IM_START] [user\n] [prompt...] [IM_END] [\n] [IM_START] [assistant\n] */
+    /* \n = token 198 in Qwen tokenizer */
+
+    int32_t *tokens = (int32_t *)malloc((size_t)(n_tokens + 10) * sizeof(int32_t));
+    int pos = 0;
+
+    /* <|im_start|>system\n...system_prompt...<|im_end|>\n */
+    tokens[pos++] = IM_START;
+    pos += bpe_tokenize(vocab, sys_text, (int)strlen(sys_text), tokens + pos, n_sys);
+    tokens[pos++] = IM_END;
+    tokens[pos++] = 198;  /* \n */
+
+    /* <|im_start|>user\n...prompt...<|im_end|>\n */
+    tokens[pos++] = IM_START;
+    pos += bpe_tokenize(vocab, user_text, (int)strlen(user_text), tokens + pos, n_user_prefix);
+    pos += bpe_tokenize(vocab, text, text_len, tokens + pos, n_user_prompt);
+    tokens[pos++] = IM_END;
+    tokens[pos++] = 198;  /* \n */
+
+    /* <|im_start|>assistant\n */
+    tokens[pos++] = IM_START;
+    pos += bpe_tokenize(vocab, asst_text, (int)strlen(asst_text), tokens + pos, n_asst);
+
+    n_tokens = pos;
+
+    #undef IM_START
+    #undef IM_END
 
     fprintf(stderr, "qimg_text_enc: tokenized \"%s\" -> %d tokens: [",
             text, n_tokens);
