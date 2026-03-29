@@ -326,35 +326,19 @@ int main(int argc, char **argv) {
             free(txt_neg_hidden);
             cuda_qimg_free(r); return 1;
         }
-        /* ComfyUI's CONDCrossAttn.concat REPEATS shorter cond to match longer.
-         * E.g., negative 6 tokens → repeated 2× → 12 tokens (matching positive).
-         * This ensures both passes have the same n_txt for identical attention patterns. */
-        if (n_txt_neg > 0 && n_txt_neg < n_txt && (n_txt % n_txt_neg) == 0) {
-            int reps = n_txt / n_txt_neg;
-            float *repeated = (float *)malloc((size_t)n_txt * txt_dim * sizeof(float));
-            for (int rep = 0; rep < reps; rep++)
-                memcpy(repeated + (size_t)rep * n_txt_neg * txt_dim,
-                       txt_neg_hidden, (size_t)n_txt_neg * txt_dim * sizeof(float));
-            free(txt_neg_hidden);
-            txt_neg_hidden = repeated;
-            fprintf(stderr, "  Negative: %d tokens → repeated %d× → %d tokens\n", n_txt_neg, reps, n_txt);
-            n_txt_neg = n_txt;
-        } else if (n_txt_neg < n_txt) {
-            float *padded = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
-            memcpy(padded, txt_neg_hidden, (size_t)n_txt_neg * txt_dim * sizeof(float));
-            free(txt_neg_hidden);
-            txt_neg_hidden = padded;
-            n_txt_neg = n_txt;
-        } else if (n_txt < n_txt_neg) {
-            n_txt = n_txt_neg;  /* expand positive if needed */
-        }
-        fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens\n", n_txt, n_txt_neg);
+        /* ComfyUI processes cond/uncond separately on 16GB GPUs (not enough VRAM
+         * to batch). Each pass uses its ORIGINAL token count.
+         * Cond: 12 tokens, Uncond: 6 tokens — different attention patterns. */
+        fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens (separate passes)\n", n_txt, n_txt_neg);
 
         /* 2. DiT denoising loop (CUDA) */
         fprintf(stderr, "\n[2/3] DiT denoising (%d steps, %dx%d, %s)...\n",
                 n_steps, out_w, out_h, r->use_fp8_gemm ? "FP8 native" : "F16 fallback");
 
-        /* Initialize noise latent */
+        /* Initialize noise latent with ComfyUI's noise_scaling.
+         * CONST.noise_scaling(sigma, noise, latent_image, max_denoise=True):
+         *   noise = noise * sqrt(1.0 + sigma^2) + latent_image
+         * For sigma[0]=1.0, latent_image=0: noise *= sqrt(2) */
         rng_state = seed;
         float *latent = (float *)malloc((size_t)lat_ch * lat_h * lat_w * sizeof(float));
         for (size_t i = 0; i < (size_t)lat_ch * lat_h * lat_w; i++)
@@ -366,6 +350,17 @@ int main(int argc, char **argv) {
         qimg_scheduler sched;
         qimg_sched_init(&sched);
         qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f, 1000.0f);
+
+        /* Apply noise_scaling: CONST.noise_scaling with max_denoise=True
+         * scales noise by sqrt(1 + sigma[0]^2). For sigma[0]=1.0: sqrt(2). */
+        {
+            float sigma0 = sched.sigmas[0];
+            float scale = sqrtf(1.0f + sigma0 * sigma0);
+            int lat_n = lat_ch * lat_h * lat_w;
+            for (int i = 0; i < lat_n; i++)
+                latent[i] *= scale;
+            fprintf(stderr, "  noise_scaling: sigma0=%.4f scale=%.4f\n", sigma0, scale);
+        }
 
         float cfg_scale = 2.5f;
         for (int i = 1; i < argc; i++)
@@ -404,7 +399,7 @@ int main(int argc, char **argv) {
                     if (lf2) { fwrite(vel_latent, sizeof(float), (size_t)lat_n, lf2); fclose(lf2); }
                 }
             } else {
-                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt,
+                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt_neg,
                                    t_val, vel_uncond);
 
                 float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));

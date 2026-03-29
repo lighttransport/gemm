@@ -367,6 +367,50 @@ static const char *qimg_kernel_src =
 
 /* Round F32 to BF16 precision in-place (round-to-nearest-even).
  * Matches PyTorch's BF16 rounding, NOT simple truncation. */
+/* Simulate FP8 E4M3 input quantization: F32 → FP8 → F32 (round-trip).
+ * Clamp to [-448, 448], quantize to E4M3, dequant back to F32.
+ * This matches ComfyUI's fp8_linear which casts input to FP8 before matmul. */
+"__global__ void quantize_fp8_roundtrip_f32(float *__restrict__ x, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    float v = x[i];\n"
+"    /* Clamp to FP8 E4M3 range */\n"
+"    if (v > 448.0f) v = 448.0f;\n"
+"    if (v < -448.0f) v = -448.0f;\n"
+"    /* Quantize: F32 → FP8 E4M3 → F32 */\n"
+"    unsigned int bits;\n"
+"    memcpy(&bits, &v, 4);\n"
+"    unsigned int sign = bits >> 31;\n"
+"    int exp = (int)((bits >> 23) & 0xFF) - 127;  /* unbiased F32 exponent */\n"
+"    unsigned int mant = bits & 0x7FFFFF;          /* F32 mantissa (23 bits) */\n"
+"    /* E4M3: bias=7, max_exp=14 (exp=15 reserved for NaN except mant=7) */\n"
+"    int fp8_exp = exp + 7;\n"
+"    float result;\n"
+"    if (exp < -9) { result = 0.0f; }  /* too small for subnormal */\n"
+"    else if (fp8_exp <= 0) {\n"
+"        /* Subnormal: round mantissa with implicit bit */\n"
+"        unsigned int full_mant = mant | 0x800000;\n"
+"        int shift = 1 - fp8_exp + 20;  /* shift to get 3-bit mantissa */\n"
+"        if (shift >= 24) { result = 0.0f; }\n"
+"        else {\n"
+"            unsigned int fp8_mant = (full_mant + (1u << (shift-1))) >> shift;\n"
+"            if (fp8_mant > 7) fp8_mant = 7;\n"
+"            result = ldexpf((float)fp8_mant / 8.0f, -6);\n"
+"            if (sign) result = -result;\n"
+"        }\n"
+"    } else if (fp8_exp >= 15) {\n"
+"        result = sign ? -448.0f : 448.0f;\n"
+"    } else {\n"
+"        /* Normal: round 23-bit mantissa to 3 bits */\n"
+"        unsigned int fp8_mant = (mant + (1u << 19)) >> 20;\n"
+"        if (fp8_mant > 7) { fp8_mant = 0; fp8_exp++; }\n"
+"        if (fp8_exp >= 15) { result = sign ? -448.0f : 448.0f; }\n"
+"        else { result = ldexpf(1.0f + (float)fp8_mant / 8.0f, fp8_exp - 7);\n"
+"               if (sign) result = -result; }\n"
+"    }\n"
+"    x[i] = result;\n"
+"}\n"
+"\n"
 "__global__ void truncate_bf16_f32(float *__restrict__ x, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i >= n) return;\n"
@@ -650,6 +694,7 @@ struct cuda_qimg_runner {
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
     int use_f16_gemm;  /* 1 to use F16 weights + gemm_f16_f32 (better precision) */
     CUfunction truncate_bf16;
+    CUfunction quantize_fp8_rt;  /* FP8 roundtrip quantization */
     int use_bf16_trunc;  /* 1 to truncate intermediates to BF16 precision */
     CUfunction gated_add;
     CUfunction patchify;
@@ -935,11 +980,14 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         cuLaunchKernel(r->gemm_f32_f32, gx64, gy, 1, 16, 16, 1,
                        0, r->stream, args, NULL);
     }
+    /* Truncate output to BF16: match ComfyUI's BF16 inference dtype. */
+    op_bf16_trunc(r, Y, n_out * n_tok);
 }
 
-/* Truncate buffer to BF16 precision (if enabled) */
+/* Truncate buffer to BF16 precision */
 static void op_bf16_trunc(cuda_qimg_runner *r, CUdeviceptr x, int n) {
-    if (!r->use_bf16_trunc) return;
+    /* ComfyUI runs the DiT in BF16 inference mode — all activations are BF16.
+     * We compute in F32 but truncate to BF16 precision to match. */
     void *args[] = {&x, &n};
     cuLaunchKernel(r->truncate_bf16, (unsigned)((n+255)/256), 1, 1,
                    256, 1, 1, 0, r->stream, args, NULL);
@@ -1077,6 +1125,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(nn_upsample2x, "nn_upsample2x_f32");
     GET(rmsnorm_weighted, "rmsnorm_weighted_f32");
     GET(truncate_bf16, "truncate_bf16_f32");
+    GET(quantize_fp8_rt, "quantize_fp8_roundtrip_f32");
     GET(dequant_fp8_to_f16, "dequant_fp8_to_f16");
     #undef GET
 
@@ -1290,6 +1339,18 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemAlloc(&d_txt_in, (size_t)n_txt * txt_dim * sizeof(float));
     cuMemcpyHtoD(d_txt_in, txt_tokens, (size_t)n_txt * txt_dim * sizeof(float));
 
+    /* Match ComfyUI: apply_model casts input to BF16 (inference dtype).
+     * This is critical — BF16 truncation of activations changes the model output
+     * significantly (std=0.44 vs 1.11 without it). */
+    {
+        void *bf_args[] = {&d_img_in, &(int){n_img * in_ch}};
+        cuLaunchKernel(r->truncate_bf16, (unsigned)((n_img*in_ch+255)/256), 1, 1,
+                       256, 1, 1, 0, s, bf_args, NULL);
+        void *bf_args2[] = {&d_txt_in, &(int){n_txt * txt_dim}};
+        cuLaunchKernel(r->truncate_bf16, (unsigned)((n_txt*txt_dim+255)/256), 1, 1,
+                       256, 1, 1, 0, s, bf_args2, NULL);
+    }
+
     /* 1. Timestep embedding: sinusoidal(256) → SiLU(GEMM) → GEMM */
     float t_sin[256];
     int half = 128;
@@ -1367,6 +1428,11 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             free(_buf); \
         } \
     } while(0)
+
+    /* BF16 truncation after projection (matching ComfyUI BF16 inference) */
+    op_bf16_trunc(r, d_img, n_img * dim);
+    op_bf16_trunc(r, d_txt, n_txt * dim);
+    op_bf16_trunc(r, d_t_emb, dim);
 
     DIT_SAVE_NPY("cuda_dit_img_projected.npy", d_img, n_img, dim);
     DIT_SAVE_NPY("cuda_dit_txt_projected.npy", d_txt, n_txt, dim);
