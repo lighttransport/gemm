@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
     const char *vae_path = "/mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors";
     const char *enc_path = "/mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf";
     const char *prompt = "a red apple on a white table";
+    int custom_prompt = 0;
     const char *mode = NULL;
     int out_h = 256, out_w = 256, n_steps = 20;
     int force_f16 = 0, no_cfg = 0;
@@ -103,7 +104,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dit") == 0 && i+1 < argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae") == 0 && i+1 < argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc") == 0 && i+1 < argc) enc_path = argv[++i];
-        else if (strcmp(argv[i], "--prompt") == 0 && i+1 < argc) prompt = argv[++i];
+        else if (strcmp(argv[i], "--prompt") == 0 && i+1 < argc) { prompt = argv[++i]; custom_prompt = 1; }
         else if (strcmp(argv[i], "--height") == 0 && i+1 < argc) out_h = atoi(argv[++i]);
         else if (strcmp(argv[i], "--width") == 0 && i+1 < argc) out_w = atoi(argv[++i]);
         else if (strcmp(argv[i], "--steps") == 0 && i+1 < argc) n_steps = atoi(argv[++i]);
@@ -223,8 +224,8 @@ int main(int argc, char **argv) {
         int n_txt = 0, n_txt_neg = 0;
         float *txt_hidden = NULL, *txt_neg_hidden = NULL;
 
-        /* Try ComfyUI pre-encoded hidden states */
-        {
+        /* Try ComfyUI pre-encoded hidden states (only for default prompt) */
+        if (!custom_prompt) {
             /* Try loading from several locations */
             const char *pos_paths[] = {
                 "../../ref/qwen_image/output/comfyui_text_hidden.npy",
@@ -293,7 +294,7 @@ int main(int argc, char **argv) {
                     fclose(fp);
                 }
             }
-        }
+        } /* if !custom_prompt */
 
         /* Try FP8 safetensors text encoder first, then GGUF fallback */
         if (!txt_hidden) {
@@ -382,8 +383,8 @@ int main(int argc, char **argv) {
             /* Euler step: x += v * dt (model output is velocity) */
             if (no_cfg) {
                 qimg_dit_unpatchify(vel_latent, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
-                /* Debug: save step 1 model output */
-                if (step == 0) {
+                /* Debug: save step 1 model output (verbose >= 3) */
+                if (step == 0 && r->verbose >= 3) {
                     FILE *vf = fopen("dit_output_step1.bin", "wb");
                     if (vf) { fwrite(vel_cond, sizeof(float), (size_t)n_img*in_ch, vf); fclose(vf);
                         fprintf(stderr, "  Saved dit_output_step1.bin [%d, %d]\n", n_img, in_ch); }
@@ -413,11 +414,13 @@ int main(int argc, char **argv) {
                 free(vc_lat); free(vu_lat);
             }
 
-            /* Track velocity stats before step */
-            { float vs=0,vs2=0; int vn=lat_ch*lat_h*lat_w;
-              for(int i=0;i<vn;i++){vs+=vel_latent[i];vs2+=vel_latent[i]*vel_latent[i];}
-              float vm=vs/vn, vstd=sqrtf(vs2/vn-vm*vm);
-              fprintf(stderr, "    vel: mean=%.4f std=%.4f dt=%.6f\n", vm, vstd, sched.dt[step]); }
+            /* Track velocity stats (verbose >= 2) */
+            if (r->verbose >= 2) {
+                float vs=0,vs2=0; int vn=lat_ch*lat_h*lat_w;
+                for(int i=0;i<vn;i++){vs+=vel_latent[i];vs2+=vel_latent[i]*vel_latent[i];}
+                float vm=vs/vn, vstd=sqrtf(vs2/vn-vm*vm);
+                fprintf(stderr, "    vel: mean=%.4f std=%.4f dt=%.6f\n", vm, vstd, sched.dt[step]);
+            }
 
             /* Save per-step latent (before Euler step) */
             if (r->verbose >= 3) {
@@ -431,13 +434,17 @@ int main(int argc, char **argv) {
             free(vel_latent);
 
             /* Track latent stats */
-            { float lmn=latent[0],lmx=latent[0],ls=0,ls2=0;
-              int ln=lat_ch*lat_h*lat_w;
-              for(int i=0;i<ln;i++){if(latent[i]<lmn)lmn=latent[i];if(latent[i]>lmx)lmx=latent[i];ls+=latent[i];ls2+=latent[i]*latent[i];}
-              float mean=ls/ln, std=sqrtf(ls2/ln - mean*mean);
-              double step_s = (double)(clock() - step_t0) / CLOCKS_PER_SEC;
-              fprintf(stderr, "  step %d/%d  t=%.3f  lat=[%.2f,%.2f] mean=%.3f std=%.3f  %.2fs\n",
-                      step+1, n_steps, t_val, lmn, lmx, mean, std, step_s); }
+            { double step_s = (double)(clock() - step_t0) / CLOCKS_PER_SEC;
+              if (r->verbose >= 2) {
+                  float lmn=latent[0],lmx=latent[0],ls=0,ls2=0;
+                  int ln=lat_ch*lat_h*lat_w;
+                  for(int i=0;i<ln;i++){if(latent[i]<lmn)lmn=latent[i];if(latent[i]>lmx)lmx=latent[i];ls+=latent[i];ls2+=latent[i]*latent[i];}
+                  float mean=ls/ln, std=sqrtf(ls2/ln - mean*mean);
+                  fprintf(stderr, "  step %d/%d  t=%.3f  lat=[%.2f,%.2f] mean=%.3f std=%.3f  %.2fs\n",
+                          step+1, n_steps, t_val, lmn, lmx, mean, std, step_s);
+              } else if (r->verbose >= 1) {
+                  fprintf(stderr, "  step %d/%d  %.2fs\n", step+1, n_steps, step_s);
+              } }
         }
         double denoise_s = (double)(clock() - denoise_t0) / CLOCKS_PER_SEC;
         fprintf(stderr, "Denoising: %.1fs total (%.2fs/step)\n", denoise_s, denoise_s / n_steps);
