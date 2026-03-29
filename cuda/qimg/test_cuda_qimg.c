@@ -432,13 +432,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Saved latent [%d,%d,%d] to cuda_latent.bin\n", lat_ch, lat_h, lat_w); }
         }
 
-        /* 3. VAE decode (CUDA) */
-        fprintf(stderr, "\n[3/3] VAE decode (CUDA)...\n");
+        /* 3. VAE decode (CUDA comparison, CUDA VAE has precision issues) */
+        fprintf(stderr, "\n[3/3] VAE decode (CPU)...\n");
         cuda_qimg_load_vae(r, vae_path);
         float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
         t0 = clock();
         cuda_qimg_vae_decode(r, latent, lat_h, lat_w, rgb);
         fprintf(stderr, "VAE decode: %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+        
         free(latent);
 
         /* Save */
