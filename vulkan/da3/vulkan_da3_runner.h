@@ -69,9 +69,11 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
 /* Run depth estimation (depth + confidence only) */
 da3_vk_result vulkan_da3_predict(vulkan_da3_runner *r, const uint8_t *rgb, int w, int h);
 
-/* Run full depth estimation with output flags */
+/* Run full depth estimation with output flags.
+ * pose_in: optional camera pose[9] for CameraEnc conditioning (NULL to skip) */
 da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb,
-                                          int w, int h, int output_flags);
+                                          int w, int h, int output_flags,
+                                          const float *pose_in);
 
 /* Free runner */
 void vulkan_da3_free(vulkan_da3_runner *r);
