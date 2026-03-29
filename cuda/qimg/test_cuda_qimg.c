@@ -351,16 +351,8 @@ int main(int argc, char **argv) {
         qimg_sched_init(&sched);
         qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f, 1000.0f);
 
-        /* Apply noise_scaling: CONST.noise_scaling with max_denoise=True
-         * scales noise by sqrt(1 + sigma[0]^2). For sigma[0]=1.0: sqrt(2). */
-        {
-            float sigma0 = sched.sigmas[0];
-            float scale = sqrtf(1.0f + sigma0 * sigma0);
-            int lat_n = lat_ch * lat_h * lat_w;
-            for (int i = 0; i < lat_n; i++)
-                latent[i] *= scale;
-            fprintf(stderr, "  noise_scaling: sigma0=%.4f scale=%.4f\n", sigma0, scale);
-        }
+        /* CONST.noise_scaling: sigma * noise + (1-sigma) * latent_image
+         * For sigma=1.0, latent_image=0: noise unchanged. No sqrt(2) scaling. */
 
         float cfg_scale = 2.5f;
         for (int i = 1; i < argc; i++)
@@ -453,6 +445,24 @@ int main(int argc, char **argv) {
         free(img_tokens); free(vel_cond); free(vel_uncond);
         free(txt_hidden); free(txt_neg_hidden);
 
+        /* Wan21 process_latent_out: latent = latent * latents_std + latents_mean
+         * The DiT operates in normalized space. Denormalize before VAE decode. */
+        {
+            static const float wan21_mean[16] = {
+                -0.7571f, -0.7089f, -0.9113f,  0.1075f, -0.1745f,  0.9653f, -0.1517f,  1.5508f,
+                 0.4134f, -0.0715f,  0.5517f, -0.3632f, -0.1922f, -0.9497f,  0.2503f, -0.2921f
+            };
+            static const float wan21_std[16] = {
+                2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f,
+                3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f
+            };
+            int spatial = lat_h * lat_w;
+            for (int c = 0; c < lat_ch; c++)
+                for (int s = 0; s < spatial; s++)
+                    latent[c * spatial + s] = latent[c * spatial + s] * wan21_std[c] + wan21_mean[c];
+            fprintf(stderr, "  Applied Wan21 latent denormalization\n");
+        }
+
         /* Save denoised latent for debugging */
         {
             int lat_n = lat_ch * lat_h * lat_w;
@@ -461,7 +471,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Saved latent [%d,%d,%d] to cuda_latent.bin\n", lat_ch, lat_h, lat_w); }
         }
 
-        /* 3. VAE decode (CUDA comparison, CUDA VAE has precision issues) */
+        /* 3. VAE decode */
         fprintf(stderr, "\n[3/3] VAE decode (CPU)...\n");
         cuda_qimg_load_vae(r, vae_path);
         float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
