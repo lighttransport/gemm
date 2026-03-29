@@ -52,6 +52,10 @@ int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path);
 /* Set GEMM mode: 0=F16 weights (default), 1=F32 weights */
 void cuda_trellis2_set_f32_gemm(cuda_trellis2_runner *r, int enable);
 
+/* Set max DiT layers on GPU at once (0 = all, >0 = stream N layers at a time).
+ * Call BEFORE loading weights. Reduces VRAM at the cost of CPU↔GPU transfer. */
+void cuda_trellis2_set_max_gpu_layers(cuda_trellis2_runner *r, int n);
+
 void cuda_trellis2_free(cuda_trellis2_runner *r);
 
 /* ---- Per-stage API (for testing/debugging) ---- */

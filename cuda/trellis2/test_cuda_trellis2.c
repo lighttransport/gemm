@@ -119,6 +119,8 @@ int main(int argc, char **argv) {
                 "  --s2-cfg <scale>     Stage 2 CFG scale (default: 7.5)\n"
                 "  --s2-npy <path>      Save Stage 2 latent as .npy\n"
                 "  -t <threads>         CPU threads for shape decoder (default: 4)\n"
+                "  --max-gpu-layers <N> Max DiT layers on GPU (0=all, default: 0)\n"
+                "                       Use 1-10 to reduce VRAM at cost of speed\n"
                 , argv[0]);
         return 1;
     }
@@ -141,6 +143,7 @@ int main(int argc, char **argv) {
     float s2_cfg = 7.5f;
     const char *s2_npy_path = NULL;
     int n_threads = 4;
+    int max_gpu_layers = 0;  /* 0 = all on GPU */
 
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
@@ -158,6 +161,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--s2-cfg") && i+1 < argc) s2_cfg = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--s2-npy") && i+1 < argc) s2_npy_path = argv[++i];
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-gpu-layers") && i+1 < argc)
+            max_gpu_layers = atoi(argv[++i]);
     }
 
     /* Load features */
@@ -174,6 +179,8 @@ int main(int argc, char **argv) {
 
     /* Load weights (DINOv3 skipped — we already have features) */
     fprintf(stderr, "\n=== Loading weights ===\n");
+    if (max_gpu_layers > 0)
+        cuda_trellis2_set_max_gpu_layers(r, max_gpu_layers);
     if (cuda_trellis2_load_weights(r, NULL, stage1_path, decoder_path) != 0) {
         cuda_trellis2_free(r); free(features); return 1;
     }

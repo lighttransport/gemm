@@ -96,6 +96,22 @@ typedef struct {
     CUdeviceptr mod_bias;  /* [6*DIT_DIM] */
 } dit_block_gpu;
 
+/* CPU-side weight storage for layer streaming (offloading) */
+typedef struct {
+    void *sa_qkv_w, *sa_qkv_b, *sa_q_norm, *sa_k_norm, *sa_out_w, *sa_out_b;
+    void *norm2_w, *norm2_b, *ca_q_w, *ca_q_b, *ca_kv_w, *ca_kv_b;
+    void *ca_q_norm, *ca_k_norm, *ca_out_w, *ca_out_b;
+    void *mlp_fc1_w, *mlp_fc1_b, *mlp_fc2_w, *mlp_fc2_b;
+    void *mod_bias;
+    /* Byte sizes for each weight */
+    size_t sa_qkv_w_sz, sa_qkv_b_sz, sa_q_norm_sz, sa_k_norm_sz;
+    size_t sa_out_w_sz, sa_out_b_sz, norm2_w_sz, norm2_b_sz;
+    size_t ca_q_w_sz, ca_q_b_sz, ca_kv_w_sz, ca_kv_b_sz;
+    size_t ca_q_norm_sz, ca_k_norm_sz, ca_out_w_sz, ca_out_b_sz;
+    size_t mlp_fc1_w_sz, mlp_fc1_b_sz, mlp_fc2_w_sz, mlp_fc2_b_sz;
+    size_t mod_bias_sz;
+} dit_block_cpu;
+
 /* Generic DiT model (shared by Stage 1 and Stage 2) */
 typedef struct {
     int n_blocks;
@@ -149,11 +165,16 @@ struct cuda_trellis2_runner {
     CUdeviceptr dit_rope_cos, dit_rope_sin;
     int dit_n_freqs, dit_axis_dim;
     int dit_use_f16;  /* 1 if DiT weights stored as F16 */
+    dit_block_cpu dit_blocks_cpu[DIT_DEPTH]; /* CPU copies for layer streaming */
 
     /* Stage 2 shape flow DiT */
     dit_model_gpu stage2;
     dit_block_gpu stage2_blocks[DIT_DEPTH];
+    dit_block_cpu stage2_blocks_cpu[DIT_DEPTH]; /* CPU copies for layer streaming */
     int stage2_loaded;
+
+    /* Layer streaming config (0 = all on GPU, >0 = max layers on GPU at once) */
+    int max_gpu_layers;
 
     /* Decoder weights */
     CUdeviceptr dec_conv_in_w, dec_conv_in_b;
@@ -210,6 +231,75 @@ static void ensure_scratch(cuda_trellis2_runner *r, int idx, size_t bytes) {
         return;
     }
     r->scratch_size[idx] = bytes;
+}
+
+/* ======================================================================== */
+/* Layer streaming: upload/free individual blocks                           */
+/* ======================================================================== */
+
+/* Upload a single block's weights from CPU to GPU */
+static void dit_block_upload_to_gpu(dit_block_gpu *gpu, const dit_block_cpu *cpu) {
+    #define UP(field) if (cpu->field) gpu->field = cu_upload_raw(cpu->field, cpu->field##_sz); else gpu->field = 0
+    UP(sa_qkv_w); UP(sa_qkv_b); UP(sa_q_norm); UP(sa_k_norm);
+    UP(sa_out_w); UP(sa_out_b); UP(norm2_w); UP(norm2_b);
+    UP(ca_q_w); UP(ca_q_b); UP(ca_kv_w); UP(ca_kv_b);
+    UP(ca_q_norm); UP(ca_k_norm); UP(ca_out_w); UP(ca_out_b);
+    UP(mlp_fc1_w); UP(mlp_fc1_b); UP(mlp_fc2_w); UP(mlp_fc2_b);
+    UP(mod_bias);
+    #undef UP
+}
+
+/* Free a block's GPU weights */
+static void dit_block_free_gpu(dit_block_gpu *gpu) {
+    #define FR(field) if (gpu->field) { cuMemFree(gpu->field); gpu->field = 0; }
+    FR(sa_qkv_w); FR(sa_qkv_b); FR(sa_q_norm); FR(sa_k_norm);
+    FR(sa_out_w); FR(sa_out_b); FR(norm2_w); FR(norm2_b);
+    FR(ca_q_w); FR(ca_q_b); FR(ca_kv_w); FR(ca_kv_b);
+    FR(ca_q_norm); FR(ca_k_norm); FR(ca_out_w); FR(ca_out_b);
+    FR(mlp_fc1_w); FR(mlp_fc1_b); FR(mlp_fc2_w); FR(mlp_fc2_b);
+    FR(mod_bias);
+    #undef FR
+}
+
+/* Save CPU copy of data that was uploaded to GPU.
+ * Returns malloc'd CPU copy (caller owns). */
+static void *cpu_copy_from_gpu(CUdeviceptr d, size_t bytes) {
+    if (!d || !bytes) return NULL;
+    void *cpu = malloc(bytes);
+    cuMemcpyDtoH(cpu, d, bytes);
+    return cpu;
+}
+
+/* After loading a block to GPU, save CPU copies for streaming */
+static void dit_block_save_cpu_copy(dit_block_cpu *cpu, const dit_block_gpu *gpu,
+                                      int use_f16, int D, int H, int HD, int FFN, int COND_DIM) {
+    /* Weight sizes depend on F16 vs F32 */
+    size_t ws = use_f16 ? sizeof(uint16_t) : sizeof(float); /* weight element size */
+    size_t bs = sizeof(float); /* bias always F32 */
+
+    #define SV(field, sz) cpu->field##_sz = (sz); cpu->field = cpu_copy_from_gpu(gpu->field, (sz))
+    SV(sa_qkv_w, (size_t)3*D*D*ws);  SV(sa_qkv_b, (size_t)3*D*bs);
+    SV(sa_q_norm, (size_t)H*HD*bs);  SV(sa_k_norm, (size_t)H*HD*bs);
+    SV(sa_out_w, (size_t)D*D*ws);    SV(sa_out_b, (size_t)D*bs);
+    SV(norm2_w, (size_t)D*bs);       SV(norm2_b, (size_t)D*bs);
+    SV(ca_q_w, (size_t)D*D*ws);      SV(ca_q_b, (size_t)D*bs);
+    SV(ca_kv_w, (size_t)2*D*COND_DIM*ws); SV(ca_kv_b, (size_t)2*D*bs);
+    SV(ca_q_norm, (size_t)H*HD*bs);  SV(ca_k_norm, (size_t)H*HD*bs);
+    SV(ca_out_w, (size_t)D*D*ws);    SV(ca_out_b, (size_t)D*bs);
+    SV(mlp_fc1_w, (size_t)FFN*D*ws); SV(mlp_fc1_b, (size_t)FFN*bs);
+    SV(mlp_fc2_w, (size_t)D*FFN*ws); SV(mlp_fc2_b, (size_t)D*bs);
+    SV(mod_bias, (size_t)6*D*bs);
+    #undef SV
+}
+
+static void dit_block_cpu_free(dit_block_cpu *cpu) {
+    free(cpu->sa_qkv_w); free(cpu->sa_qkv_b); free(cpu->sa_q_norm); free(cpu->sa_k_norm);
+    free(cpu->sa_out_w); free(cpu->sa_out_b); free(cpu->norm2_w); free(cpu->norm2_b);
+    free(cpu->ca_q_w); free(cpu->ca_q_b); free(cpu->ca_kv_w); free(cpu->ca_kv_b);
+    free(cpu->ca_q_norm); free(cpu->ca_k_norm); free(cpu->ca_out_w); free(cpu->ca_out_b);
+    free(cpu->mlp_fc1_w); free(cpu->mlp_fc1_b); free(cpu->mlp_fc2_w); free(cpu->mlp_fc2_b);
+    free(cpu->mod_bias);
+    memset(cpu, 0, sizeof(*cpu));
 }
 
 static void dbg4(const char *label, CUdeviceptr ptr, CUstream stream) {
@@ -424,6 +514,12 @@ void cuda_trellis2_set_f32_gemm(cuda_trellis2_runner *r, int enable) {
     r->ops.use_f32_gemm = enable;
 }
 
+void cuda_trellis2_set_max_gpu_layers(cuda_trellis2_runner *r, int n) {
+    r->max_gpu_layers = n;
+    if (n > 0)
+        fprintf(stderr, "T2: layer streaming enabled: max %d layers on GPU\n", n);
+}
+
 void cuda_trellis2_free(cuda_trellis2_runner *r) {
     if (!r) return;
     for (int i = 0; i < 8; i++)
@@ -506,6 +602,15 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
 
         if (L == 0 && !blk->sa_qkv_w)
             fprintf(stderr, "T2: WARNING: block 0 self_attn missing\n");
+
+        /* Save CPU copy for layer streaming */
+        cuStreamSynchronize(0);
+        dit_block_save_cpu_copy(&r->dit_blocks_cpu[L], blk, use_f16,
+                                 DIT_DIM, DIT_HEADS, DIT_HEAD_DIM, DIT_FFN, DIT_COND_DIM);
+
+        /* If streaming enabled, free GPU weights for blocks beyond limit */
+        if (r->max_gpu_layers > 0 && L >= r->max_gpu_layers)
+            dit_block_free_gpu(blk);
     }
     #undef UPW
 
@@ -545,7 +650,10 @@ static int load_dit_weights(cuda_trellis2_runner *r, const char *path) {
 
     r->dit_use_f16 = use_f16;
     safetensors_close(st);
-    fprintf(stderr, "T2: DiT loaded (%d blocks, weights=%s)\n", DIT_DEPTH, use_f16 ? "F16" : "F32");
+    { size_t fr = 0, to = 0; cuMemGetInfo(&fr, &to);
+      int on_gpu = r->max_gpu_layers > 0 ? (r->max_gpu_layers < DIT_DEPTH ? r->max_gpu_layers : DIT_DEPTH) : DIT_DEPTH;
+      fprintf(stderr, "T2: DiT loaded (%d blocks, %d on GPU, weights=%s, GPU %.0f/%.0f MB free)\n",
+              DIT_DEPTH, on_gpu, use_f16 ? "F16" : "F32", fr/1048576.0, to/1048576.0); }
     return 0;
 }
 
@@ -796,6 +904,14 @@ static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
         blk->mod_bias   = BLK2B("modulation");
         #undef BLK2W
         #undef BLK2B
+
+        /* Save CPU copy for layer streaming */
+        cuStreamSynchronize(0);
+        dit_block_save_cpu_copy(&r->stage2_blocks_cpu[L], blk, use_f16,
+                                 DIT_DIM, DIT_HEADS, DIT_HEAD_DIM, DIT_FFN, DIT_COND_DIM);
+
+        if (r->max_gpu_layers > 0 && L >= r->max_gpu_layers)
+            dit_block_free_gpu(blk);
     }
     #undef UPW
 
@@ -806,8 +922,11 @@ static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
 
     safetensors_close(st);
     r->stage2_loaded = 1;
-    fprintf(stderr, "T2: Stage 2 loaded (%d blocks, in_ch=%d, weights=%s)\n",
-            m->n_blocks, m->in_channels, use_f16 ? "F16" : "F32");
+    { size_t fr = 0, to = 0; cuMemGetInfo(&fr, &to);
+      int on_gpu = r->max_gpu_layers > 0 ? (r->max_gpu_layers < m->n_blocks ? r->max_gpu_layers : m->n_blocks) : m->n_blocks;
+      fprintf(stderr, "T2: Stage 2 loaded (%d blocks, %d on GPU, in_ch=%d, weights=%s, GPU %.0f/%.0f MB free)\n",
+              m->n_blocks, on_gpu, m->in_channels, use_f16 ? "F16" : "F32",
+              fr/1048576.0, to/1048576.0); }
     return 0;
 }
 
@@ -1134,6 +1253,7 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                                       CUdeviceptr x_emb_w, CUdeviceptr x_emb_b,
                                       CUdeviceptr out_w, CUdeviceptr out_b,
                                       dit_block_gpu *blocks,
+                                      dit_block_cpu *blocks_cpu, /* CPU copies for streaming (NULL = all on GPU) */
                                       CUdeviceptr rope_cos, CUdeviceptr rope_sin,
                                       int n_freqs, int axis_dim) {
     t2_ops *ops = &r->ops;
@@ -1212,6 +1332,14 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     /* 3. Transformer blocks */
     for (int bi = 0; bi < n_blocks; bi++) {
         dit_block_gpu *blk = &blocks[bi];
+        int streamed = 0;  /* 1 if we uploaded this block from CPU */
+
+        /* Layer streaming: if block not on GPU, upload from CPU */
+        if (blocks_cpu && !blk->sa_qkv_w) {
+            cuStreamSynchronize(stream);  /* wait for previous work before upload */
+            dit_block_upload_to_gpu(blk, &blocks_cpu[bi]);
+            streamed = 1;
+        }
 
         /* 3a. Modulation: SiLU(t_emb) @ mod_w + mod_b + block_bias -> [6*D] */
         t2_op_modulation(ops, stream, d_mod, d_temb,
@@ -1373,6 +1501,12 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                     bi, sqrt(sm2/4096 - (sm/4096)*(sm/4096)), hs[0], hs[1], hs[2], hs[3]);
             free(hc);
         }
+
+        /* Layer streaming: free GPU weights after processing this block */
+        if (streamed) {
+            cuStreamSynchronize(stream);
+            dit_block_free_gpu(blk);
+        }
     }
 
     /* 4. Final LayerNorm (no affine) + output projection */
@@ -1407,7 +1541,8 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         r->dit_mod_w, r->dit_mod_b,
         r->dit_x_emb_w, r->dit_x_emb_b,
         r->dit_out_w, r->dit_out_b,
-        r->dit_blocks, r->dit_rope_cos, r->dit_rope_sin,
+        r->dit_blocks, r->dit_blocks_cpu,
+        r->dit_rope_cos, r->dit_rope_sin,
         r->dit_n_freqs, r->dit_axis_dim);
 
     r->ops.use_f32_gemm = saved_f32;
@@ -1437,7 +1572,8 @@ static void run_stage2_forward(cuda_trellis2_runner *r,
         m->mod_w, m->mod_b,
         m->x_emb_w, m->x_emb_b,
         m->out_w, m->out_b,
-        m->blocks, rope_cos, rope_sin,
+        m->blocks, r->stage2_blocks_cpu,
+        rope_cos, rope_sin,
         m->n_rope_freqs, m->rope_axis_dim);
 
     r->ops.use_f32_gemm = saved_f32;
