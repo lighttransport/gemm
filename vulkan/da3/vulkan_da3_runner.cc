@@ -73,6 +73,7 @@ struct vulkan_da3_runner {
     Pipeline pipe_channel_layernorm;  /* 4 bufs: dst,src,w,b; push: {C,HW,eps} = 12B */
     Pipeline pipe_silu;               /* 1 buf: x; push: {n} = 4B */
     Pipeline pipe_matmul_bias_f16;    /* 4 bufs: A(f32),W(f16),C(f32),bias(f32); push: 16B */
+    Pipeline pipe_copy;               /* 2 bufs: dst,src; push: {n} = 4B */
 
     /* Model params */
     int n_blocks, dim, n_heads, head_dim, ffn_hidden;
@@ -198,7 +199,9 @@ struct vulkan_da3_runner {
     BufInfo gs_out;           /* [gs_oc, fh, fw] gaussian output */
     int gs_merger_h = 0, gs_merger_w = 0;
 
+    BufInfo zero_bias;  /* pre-allocated zero buffer for no-bias Conv2d */
     bool loaded = false;
+    bool batched = false; /* when true, dispatchOp uses batched mode */
 };
 
 /* ======================================================================== */
@@ -326,6 +329,31 @@ static void bufferZero(VulkanRunner &runner, BufInfo &buf, size_t bytes) {
 /* Dispatch helpers                                                         */
 /* ======================================================================== */
 
+/* Batched dispatch: record into open command buffer with barrier, no sync.
+ * Call beginBatch() before first dispatch, endBatch() after last. */
+static void dispatchBatched(vulkan_da3_runner *r, Pipeline &pipe,
+                              const std::vector<BufInfo> &bufs,
+                              const void *push_data, uint32_t push_size,
+                              uint32_t gx, uint32_t gy = 1, uint32_t gz = 1) {
+    auto ds = r->runner.allocateAndUpdateDescriptorSet(pipe, bufs);
+    r->runner.bindComputePipeline(pipe);
+    r->runner.bindDescriptorSetDynamic(pipe, ds);
+    if (push_data && push_size > 0)
+        r->runner.pushConstants(pipe, push_data, push_size);
+    r->runner.dispatch(gx, gy, gz);
+    r->runner.computeBarrier();
+}
+
+static void beginBatch(vulkan_da3_runner *r) { r->runner.beginRecording(); }
+static void endBatch(vulkan_da3_runner *r) {
+    r->runner.endRecordingAndSubmit();
+    r->runner.waitForCompletion();
+    r->runner.resetDynamicDescriptorPool();
+}
+
+/* Dispatch: record + submit per dispatch, no waitForCompletion.
+ * Vulkan guarantees submission-order execution on the same queue.
+ * Only call gpuSync() before CPU reads (downloadFromBuffer). */
 static void dispatchSync(vulkan_da3_runner *r, Pipeline &pipe,
                           const std::vector<BufInfo> &bufs,
                           const void *push_data, uint32_t push_size,
@@ -337,7 +365,12 @@ static void dispatchSync(vulkan_da3_runner *r, Pipeline &pipe,
     if (push_data && push_size > 0)
         r->runner.pushConstants(pipe, push_data, push_size);
     r->runner.dispatch(gx, gy, gz);
+    r->runner.computeBarrier();
     r->runner.endRecordingAndSubmit();
+    r->runner.waitForCompletion();
+}
+
+static void gpuSync(vulkan_da3_runner *r) {
     r->runner.waitForCompletion();
 }
 
@@ -393,6 +426,12 @@ static void opGelu(vulkan_da3_runner *r, BufInfo &x, int n) {
 static void opRelu(vulkan_da3_runner *r, BufInfo &x, int n) {
     uint32_t pc = (uint32_t)n;
     dispatchSync(r, r->pipe_relu, {x}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
+}
+
+/* GPU buffer copy (batchable, unlike bufferCopy which uses CPU memcpy) */
+static void opCopy(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src, int n_floats) {
+    uint32_t pc = (uint32_t)n_floats;
+    dispatchSync(r, r->pipe_copy, {dst, src}, &pc, sizeof(pc), (uint32_t)((n_floats + 255) / 256));
 }
 
 /* SiLU in-place: x = x * sigmoid(x) */
@@ -665,7 +704,7 @@ static void opRefineNet(vulkan_da3_runner *r,
             opAdd(r, result, feat, sz);
         }
     } else {
-        bufferCopy(r->runner, result, feat, (size_t)sz * sizeof(float));
+        opCopy(r, result, feat, sz);
     }
 
     if (has_rcu2) {
@@ -776,6 +815,7 @@ static bool createPipelines(vulkan_da3_runner *r) {
     if (!createPipe("shaders/da3/channel_layernorm_f32",       4, 12, r->pipe_channel_layernorm)) return false;
     if (!createPipe("shaders/da3/silu_f32",                    1, 4,  r->pipe_silu)) return false;
     if (!createPipe("shaders/da3/matmul_bias_f16_f32",        4, 16, r->pipe_matmul_bias_f16)) return false;
+    if (!createPipe("shaders/da3/copy_f32",                   2, 4,  r->pipe_copy)) return false;
 
     if (r->verbose >= 1) fprintf(stderr, "DA3: all pipelines created\n");
     return true;
@@ -1894,6 +1934,10 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
         if (out_sz < (size_t)2 * fused_hw) out_sz = (size_t)2 * fused_hw;
         r->dpt_out = createGpuBuffer(r->runner, out_sz * sizeof(float));
 
+        /* Pre-allocate zero buffer for no-bias Conv2d (avoids per-dispatch alloc) */
+        r->zero_bias = createGpuBuffer(r->runner, (size_t)feat * sizeof(float));
+        bufferZero(r->runner, r->zero_bias, (size_t)feat * sizeof(float));
+
         /* Aux DPT scratch buffers */
         if (r->dpt_aux.loaded) {
             int max_hw = sp_h[0] * sp_w[0];
@@ -2165,7 +2209,9 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
-    if (r->verbose >= 1) fprintf(stderr, "DA3: GPU preprocess+embed: %.1f ms\n", (t1 - t0) * 1000);
+    if (r->verbose >= 1) gpuSync(r);
+    r->runner.resetDynamicDescriptorPool();
+    fprintf(stderr, "DA3: GPU preprocess+embed: %.1f ms\n", (t1 - t0) * 1000);
 
     /* ---- GPU: Transformer Blocks ---- */
     clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -2182,7 +2228,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     }
 
     /* Initialize local_hidden = hidden */
-    bufferCopy(r->runner, r->local_hidden, r->hidden, (size_t)nt * dim * sizeof(float));
+    opCopy(r, r->local_hidden, r->hidden, nt * dim);
 
     /* dump hidden before backbone (verbose >= 3) */
     if (r->verbose >= 3) {
@@ -2206,12 +2252,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
             BufInfo *cam_src = have_cond_cam ? &d_cond_cam_token :
                                (r->has_camera_token ? &r->camera_token : nullptr);
             if (cam_src) {
-                void *h_cam = nullptr, *h_hid = nullptr;
-                r->runner.mapBuffer(*cam_src, &h_cam);
-                r->runner.mapBuffer(r->hidden, &h_hid);
-                memcpy(h_hid, h_cam, (size_t)dim * sizeof(float));
-                r->runner.unmapBuffer(*cam_src);
-                r->runner.unmapBuffer(r->hidden);
+                /* GPU-side copy of camera token to hidden[0:dim] */
+                opCopy(r, r->hidden, *cam_src, dim);
             }
         }
 
@@ -2374,7 +2416,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
         /* Update local_hidden after each local (non-global) block */
         if (!is_global)
-            bufferCopy(r->runner, r->local_hidden, r->hidden, (size_t)nt * dim * sizeof(float));
+            opCopy(r, r->local_hidden, r->hidden, nt * dim);
 
         /* Save features as [local_x, x] per token */
         for (int fi = 0; fi < 4; fi++) {
@@ -2399,7 +2441,9 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         r->runner.destroyBuffer(d_cond_cam_token);
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
-    if (r->verbose >= 1) fprintf(stderr, "DA3: GPU backbone (%d blocks): %.1f ms\n", r->n_blocks, (t1 - t0) * 1000);
+    if (r->verbose >= 1) gpuSync(r);
+    r->runner.resetDynamicDescriptorPool();
+    fprintf(stderr, "DA3: GPU backbone (%d blocks): %.1f ms\n", r->n_blocks, (t1 - t0) * 1000);
 
     /* dump backbone hidden stats (verbose >= 3) */
     if (r->verbose >= 3) {
@@ -2529,12 +2573,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         }
 
         /* Adapter: Conv2d 3x3, no bias (create zero bias buffer since shader always reads bias) */
-        {
-            BufInfo zero_bias = createGpuBuffer(r->runner, (size_t)feat * sizeof(float));
-            bufferZero(r->runner, zero_bias, (size_t)feat * sizeof(float));
-            opConv2d(r, r->dpt_adapted[fi], r->dpt_spatial[fi], dw.adapter_w[fi], zero_bias,
+        {            opConv2d(r, r->dpt_adapted[fi], r->dpt_spatial[fi], dw.adapter_w[fi], r->zero_bias,
                      sp_h[fi], sp_w[fi], oc_val, feat, 3, 3, 1, 1);
-            r->runner.destroyBuffer(zero_bias);
         }
     }
 
@@ -2666,7 +2706,9 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
-    if (r->verbose >= 1) fprintf(stderr, "DA3: GPU DPT head: %.1f ms\n", (t1 - t0) * 1000);
+    if (r->verbose >= 1) gpuSync(r);
+    r->runner.resetDynamicDescriptorPool();
+    fprintf(stderr, "DA3: GPU DPT head: %.1f ms\n", (t1 - t0) * 1000);
 
     /* ---- Aux DPT (Phase 2): Rays + Sky Segmentation ---- */
     if (r->dpt_aux.loaded && (output_flags & DA3_OUTPUT_RAYS)) {
@@ -2864,12 +2906,8 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
                          gh, gw, oc_val, oc_val, 3, 3, 2, 1);
             }
 
-            /* Adapter conv (no bias) */
-            BufInfo zero_bias = createGpuBuffer(r->runner, (size_t)feat * sizeof(float));
-            bufferZero(r->runner, zero_bias, (size_t)feat * sizeof(float));
-            opConv2d(r, r->dpt_adapted[fi], r->dpt_spatial[fi], gdw.adapter_w[fi], zero_bias,
+            /* Adapter conv (no bias) */            opConv2d(r, r->dpt_adapted[fi], r->dpt_spatial[fi], gdw.adapter_w[fi], r->zero_bias,
                      sp_h[fi], sp_w[fi], oc_val, feat, 3, 3, 1, 1);
-            r->runner.destroyBuffer(zero_bias);
         }
 
         /* Bottom-up RefineNet fusion with GSDPT weights */
