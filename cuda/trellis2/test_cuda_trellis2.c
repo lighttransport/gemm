@@ -19,10 +19,9 @@
 /* Shape decoder + FDG mesh (for Stage 2).
  * safetensors.h is already compiled in cuda_trellis2_runner.c,
  * so we only include headers here, not implementations. */
-#define GGML_DEQUANT_IMPLEMENTATION
+/* ggml_dequant, safetensors, sparse3d are compiled in cuda_trellis2_runner.c */
 #include "../../common/ggml_dequant.h"
 #include "../../common/safetensors.h"
-#define SPARSE3D_IMPLEMENTATION
 #include "../../common/sparse3d.h"
 #define T2_SHAPE_DEC_IMPLEMENTATION
 #include "../../common/trellis2_shape_decoder.h"

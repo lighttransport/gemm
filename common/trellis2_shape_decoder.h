@@ -60,6 +60,14 @@ void t2_shape_dec_result_free(t2_shape_dec_result *r);
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
+
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#define T2SD_AVX2 1
+#else
+#define T2SD_AVX2 0
+#endif
 
 /* ---- ConvNeXtBlock weights ---- */
 typedef struct {
@@ -103,12 +111,72 @@ static double t2sd_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-/* ---- Simple F32 LayerNorm ---- */
-static void t2sd_layernorm(float *dst, const float *src, const float *w, const float *b,
-                             int N, int C, float eps) {
-    for (int i = 0; i < N; i++) {
-        const float *xi = src + (size_t)i * C;
-        float *yi = dst + (size_t)i * C;
+/* ---- AVX2/FMA dot product helper ---- */
+static inline float t2sd_dot(const float *a, const float *b, int n) {
+#if T2SD_AVX2
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    int j = 0;
+    for (; j + 15 < n; j += 16) {
+        sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + j), _mm256_loadu_ps(b + j), sum0);
+        sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + j + 8), _mm256_loadu_ps(b + j + 8), sum1);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    for (; j + 7 < n; j += 8)
+        sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + j), _mm256_loadu_ps(b + j), sum0);
+    /* Horizontal sum */
+    __m128 lo = _mm256_castps256_ps128(sum0);
+    __m128 hi = _mm256_extractf128_ps(sum0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float s = _mm_cvtss_f32(lo);
+    for (; j < n; j++) s += a[j] * b[j];
+    return s;
+#else
+    float s = 0;
+    for (int j = 0; j < n; j++) s += a[j] * b[j];
+    return s;
+#endif
+}
+
+/* ---- Multithreaded LayerNorm ---- */
+typedef struct { float *dst; const float *src, *w, *b; int start, end, C; float eps; } t2sd_ln_task;
+static void *t2sd_layernorm_worker(void *arg) {
+    t2sd_ln_task *t = (t2sd_ln_task *)arg;
+    int C = t->C; float eps = t->eps;
+    for (int i = t->start; i < t->end; i++) {
+        const float *xi = t->src + (size_t)i * C;
+        float *yi = t->dst + (size_t)i * C;
+#if T2SD_AVX2
+        __m256 vsum = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 7 < C; j += 8) vsum = _mm256_add_ps(vsum, _mm256_loadu_ps(xi + j));
+        float mean = 0; float tmp[8]; _mm256_storeu_ps(tmp, vsum);
+        for (int k = 0; k < 8; k++) mean += tmp[k];
+        for (; j < C; j++) mean += xi[j];
+        mean /= C;
+        __m256 vmean = _mm256_set1_ps(mean);
+        __m256 vvar = _mm256_setzero_ps();
+        for (j = 0; j + 7 < C; j += 8) {
+            __m256 d = _mm256_sub_ps(_mm256_loadu_ps(xi + j), vmean);
+            vvar = _mm256_fmadd_ps(d, d, vvar);
+        }
+        float var = 0; _mm256_storeu_ps(tmp, vvar);
+        for (int k = 0; k < 8; k++) var += tmp[k];
+        for (; j < C; j++) { float d = xi[j] - mean; var += d * d; }
+        var /= C;
+        float inv = 1.0f / sqrtf(var + eps);
+        __m256 vinv = _mm256_set1_ps(inv);
+        for (j = 0; j + 7 < C; j += 8) {
+            __m256 val = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(xi + j), vmean), vinv);
+            if (t->w) val = _mm256_mul_ps(val, _mm256_loadu_ps(t->w + j));
+            if (t->b) val = _mm256_add_ps(val, _mm256_loadu_ps(t->b + j));
+            _mm256_storeu_ps(yi + j, val);
+        }
+        for (; j < C; j++)
+            yi[j] = (xi[j] - mean) * inv * (t->w ? t->w[j] : 1.0f) + (t->b ? t->b[j] : 0.0f);
+#else
         float mean = 0;
         for (int j = 0; j < C; j++) mean += xi[j];
         mean /= C;
@@ -117,11 +185,31 @@ static void t2sd_layernorm(float *dst, const float *src, const float *w, const f
         var /= C;
         float inv = 1.0f / sqrtf(var + eps);
         for (int j = 0; j < C; j++)
-            yi[j] = (xi[j] - mean) * inv * (w ? w[j] : 1.0f) + (b ? b[j] : 0.0f);
+            yi[j] = (xi[j] - mean) * inv * (t->w ? t->w[j] : 1.0f) + (t->b ? t->b[j] : 0.0f);
+#endif
     }
+    return NULL;
 }
 
-/* ---- Simple F32 GELU ---- */
+static void t2sd_layernorm(float *dst, const float *src, const float *w, const float *b,
+                             int N, int C, float eps) {
+    t2sd_ln_task task = {dst, src, w, b, 0, N, C, eps};
+    t2sd_layernorm_worker(&task);
+}
+
+static void t2sd_layernorm_mt(float *dst, const float *src, const float *w, const float *b,
+                                int N, int C, float eps, int n_threads) {
+    if (n_threads <= 1) { t2sd_layernorm(dst, src, w, b, N, C, eps); return; }
+    pthread_t *threads = (pthread_t *)alloca((size_t)n_threads * sizeof(pthread_t));
+    t2sd_ln_task *tasks = (t2sd_ln_task *)alloca((size_t)n_threads * sizeof(t2sd_ln_task));
+    for (int i = 0; i < n_threads; i++) {
+        tasks[i] = (t2sd_ln_task){dst, src, w, b, i * N / n_threads, (i + 1) * N / n_threads, C, eps};
+        pthread_create(&threads[i], NULL, t2sd_layernorm_worker, &tasks[i]);
+    }
+    for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
+}
+
+/* ---- GELU (AVX2 approximation) ---- */
 static void t2sd_gelu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float v = x[i];
@@ -129,40 +217,130 @@ static void t2sd_gelu(float *x, int n) {
     }
 }
 
-/* ---- Simple F32 linear: dst[N, out_C] = src[N, in_C] @ W^T[in_C, out_C] + bias ---- */
+/* ---- Multithreaded linear with AVX2 dot product ---- */
+typedef struct {
+    float *dst; const float *src, *W, *bias;
+    int start, end, in_C, out_C;
+} t2sd_linear_task;
+
+static void *t2sd_linear_worker(void *arg) {
+    t2sd_linear_task *t = (t2sd_linear_task *)arg;
+    int in_C = t->in_C, out_C = t->out_C;
+    for (int i = t->start; i < t->end; i++) {
+        const float *xi = t->src + (size_t)i * in_C;
+        float *yi = t->dst + (size_t)i * out_C;
+        for (int o = 0; o < out_C; o++) {
+            const float *wr = t->W + (size_t)o * in_C;
+            yi[o] = t2sd_dot(wr, xi, in_C) + (t->bias ? t->bias[o] : 0.0f);
+        }
+    }
+    return NULL;
+}
+
 static void t2sd_linear(float *dst, const float *src, int N,
                           const float *W, const float *bias,
                           int out_C, int in_C) {
-    for (int i = 0; i < N; i++) {
-        for (int o = 0; o < out_C; o++) {
-            float sum = bias ? bias[o] : 0.0f;
-            const float *wr = W + (size_t)o * in_C;
-            const float *xi = src + (size_t)i * in_C;
-            for (int j = 0; j < in_C; j++) sum += wr[j] * xi[j];
-            dst[(size_t)i * out_C + o] = sum;
-        }
-    }
+    t2sd_linear_task task = {dst, src, W, bias, 0, N, in_C, out_C};
+    t2sd_linear_worker(&task);
 }
 
-/* ---- Simple sparse conv3d: uses sp3d hash for neighbor lookup ---- */
-static void t2sd_sparse_conv(float *dst, const sp3d_tensor *t,
-                               const float *weight, const float *bias,
-                               int in_C, int out_C, int n_threads) {
-    /* Weight layout: [out_C, 3, 3, 3, in_C] = [out_C, 27, in_C] */
-    int N = t->N;
-    sp3d_ensure_hash((sp3d_tensor *)t);
+static void t2sd_linear_mt(float *dst, const float *src, int N,
+                             const float *W, const float *bias,
+                             int out_C, int in_C, int n_threads) {
+    if (n_threads <= 1 || N < n_threads) {
+        t2sd_linear(dst, src, N, W, bias, out_C, in_C); return;
+    }
+    pthread_t *threads = (pthread_t *)alloca((size_t)n_threads * sizeof(pthread_t));
+    t2sd_linear_task *tasks = (t2sd_linear_task *)alloca((size_t)n_threads * sizeof(t2sd_linear_task));
+    for (int i = 0; i < n_threads; i++) {
+        tasks[i] = (t2sd_linear_task){dst, src, W, bias,
+                                       i * N / n_threads, (i + 1) * N / n_threads,
+                                       in_C, out_C};
+        pthread_create(&threads[i], NULL, t2sd_linear_worker, &tasks[i]);
+    }
+    for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
+}
 
-    /* Initialize with bias */
-    for (int i = 0; i < N; i++)
-        for (int o = 0; o < out_C; o++)
-            dst[(size_t)i * out_C + o] = bias ? bias[o] : 0.0f;
+/* ---- Multithreaded sparse conv3d with AVX2 ---- */
+typedef struct {
+    float *dst; const sp3d_tensor *t; const float *weight, *bias;
+    int start, end, in_C, out_C;
+} t2sd_conv_task;
 
-    /* Accumulate 3x3x3 neighbor contributions */
-    for (int i = 0; i < N; i++) {
+/* Matrix-vector multiply: dst[out_C] += W[out_C, in_C] @ x[in_C]
+ * Process 4 output rows at once for better ILP */
+static inline void t2sd_matvec_add(float *dst, const float *W, const float *x,
+                                     int out_C, int in_C) {
+#if T2SD_AVX2
+    int o = 0;
+    for (; o + 3 < out_C; o += 4) {
+        const float *w0 = W + (size_t)(o + 0) * in_C;
+        const float *w1 = W + (size_t)(o + 1) * in_C;
+        const float *w2 = W + (size_t)(o + 2) * in_C;
+        const float *w3 = W + (size_t)(o + 3) * in_C;
+        __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+        __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 7 < in_C; j += 8) {
+            __m256 xv = _mm256_loadu_ps(x + j);
+            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + j), xv, s0);
+            s1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + j), xv, s1);
+            s2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + j), xv, s2);
+            s3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + j), xv, s3);
+        }
+        /* Horizontal reduce */
+        __m128 lo0 = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+        __m128 lo1 = _mm_add_ps(_mm256_castps256_ps128(s1), _mm256_extractf128_ps(s1, 1));
+        __m128 lo2 = _mm_add_ps(_mm256_castps256_ps128(s2), _mm256_extractf128_ps(s2, 1));
+        __m128 lo3 = _mm_add_ps(_mm256_castps256_ps128(s3), _mm256_extractf128_ps(s3, 1));
+        /* Transpose 4×4 and sum */
+        __m128 t01lo = _mm_unpacklo_ps(lo0, lo1);
+        __m128 t01hi = _mm_unpackhi_ps(lo0, lo1);
+        __m128 t23lo = _mm_unpacklo_ps(lo2, lo3);
+        __m128 t23hi = _mm_unpackhi_ps(lo2, lo3);
+        __m128 row0 = _mm_movelh_ps(t01lo, t23lo);
+        __m128 row1 = _mm_movehl_ps(t23lo, t01lo);
+        __m128 row2 = _mm_movelh_ps(t01hi, t23hi);
+        __m128 row3 = _mm_movehl_ps(t23hi, t01hi);
+        __m128 sum4 = _mm_add_ps(_mm_add_ps(row0, row1), _mm_add_ps(row2, row3));
+        /* Handle tail elements */
+        float tail[4] = {0, 0, 0, 0};
+        for (; j < in_C; j++) {
+            float xv = x[j];
+            tail[0] += w0[j] * xv; tail[1] += w1[j] * xv;
+            tail[2] += w2[j] * xv; tail[3] += w3[j] * xv;
+        }
+        sum4 = _mm_add_ps(sum4, _mm_loadu_ps(tail));
+        /* Accumulate into dst */
+        _mm_storeu_ps(dst + o, _mm_add_ps(_mm_loadu_ps(dst + o), sum4));
+    }
+    for (; o < out_C; o++) {
+        dst[o] += t2sd_dot(W + (size_t)o * in_C, x, in_C);
+    }
+#else
+    for (int o = 0; o < out_C; o++)
+        dst[o] += t2sd_dot(W + (size_t)o * in_C, x, in_C);
+#endif
+}
+
+static void *t2sd_sparse_conv_worker(void *arg) {
+    t2sd_conv_task *tk = (t2sd_conv_task *)arg;
+    const sp3d_tensor *t = tk->t;
+    int in_C = tk->in_C, out_C = tk->out_C;
+
+    for (int i = tk->start; i < tk->end; i++) {
+        float *di = tk->dst + (size_t)i * out_C;
+        /* Init with bias */
+        if (tk->bias)
+            memcpy(di, tk->bias, (size_t)out_C * sizeof(float));
+        else
+            memset(di, 0, (size_t)out_C * sizeof(float));
+
         int32_t bz = t->coords[i * 4];
-        int32_t z = t->coords[i * 4 + 1];
-        int32_t y = t->coords[i * 4 + 2];
-        int32_t x = t->coords[i * 4 + 3];
+        int32_t z  = t->coords[i * 4 + 1];
+        int32_t y  = t->coords[i * 4 + 2];
+        int32_t x  = t->coords[i * 4 + 3];
+
         for (int kd = 0; kd < 3; kd++) {
             for (int kh = 0; kh < 3; kh++) {
                 for (int kw = 0; kw < 3; kw++) {
@@ -171,16 +349,85 @@ static void t2sd_sparse_conv(float *dst, const sp3d_tensor *t,
                     if (ni < 0) continue;
                     int k_idx = kd * 9 + kh * 3 + kw;
                     const float *feat_n = t->feats + (size_t)ni * in_C;
-                    for (int o = 0; o < out_C; o++) {
-                        const float *kern = weight + ((size_t)o * 27 + k_idx) * in_C;
-                        float sum = 0;
-                        for (int j = 0; j < in_C; j++) sum += kern[j] * feat_n[j];
-                        dst[(size_t)i * out_C + o] += sum;
+                    /* Weight layout: [out_C, 27, in_C]
+                     * For kernel position k_idx, weight for output o is at:
+                     *   weight[(o * 27 + k_idx) * in_C]
+                     * Row stride between consecutive o: 27 * in_C */
+                    const float *W_k0 = tk->weight + (size_t)k_idx * in_C;
+                    int w_stride = 27 * in_C;
+#if T2SD_AVX2
+                    int o = 0;
+                    for (; o + 3 < out_C; o += 4) {
+                        const float *w0 = W_k0 + (size_t)(o + 0) * w_stride;
+                        const float *w1 = W_k0 + (size_t)(o + 1) * w_stride;
+                        const float *w2 = W_k0 + (size_t)(o + 2) * w_stride;
+                        const float *w3 = W_k0 + (size_t)(o + 3) * w_stride;
+                        __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+                        __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+                        int j = 0;
+                        for (; j + 7 < in_C; j += 8) {
+                            __m256 xv = _mm256_loadu_ps(feat_n + j);
+                            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + j), xv, s0);
+                            s1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + j), xv, s1);
+                            s2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + j), xv, s2);
+                            s3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + j), xv, s3);
+                        }
+                        __m128 lo0 = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+                        __m128 lo1 = _mm_add_ps(_mm256_castps256_ps128(s1), _mm256_extractf128_ps(s1, 1));
+                        __m128 lo2 = _mm_add_ps(_mm256_castps256_ps128(s2), _mm256_extractf128_ps(s2, 1));
+                        __m128 lo3 = _mm_add_ps(_mm256_castps256_ps128(s3), _mm256_extractf128_ps(s3, 1));
+                        __m128 t01lo = _mm_unpacklo_ps(lo0, lo1);
+                        __m128 t01hi = _mm_unpackhi_ps(lo0, lo1);
+                        __m128 t23lo = _mm_unpacklo_ps(lo2, lo3);
+                        __m128 t23hi = _mm_unpackhi_ps(lo2, lo3);
+                        __m128 row0 = _mm_movelh_ps(t01lo, t23lo);
+                        __m128 row1 = _mm_movehl_ps(t23lo, t01lo);
+                        __m128 row2 = _mm_movelh_ps(t01hi, t23hi);
+                        __m128 row3 = _mm_movehl_ps(t23hi, t01hi);
+                        __m128 sum4 = _mm_add_ps(_mm_add_ps(row0, row1), _mm_add_ps(row2, row3));
+                        float tail[4] = {0, 0, 0, 0};
+                        for (; j < in_C; j++) {
+                            float xv2 = feat_n[j];
+                            tail[0] += w0[j]*xv2; tail[1] += w1[j]*xv2;
+                            tail[2] += w2[j]*xv2; tail[3] += w3[j]*xv2;
+                        }
+                        sum4 = _mm_add_ps(sum4, _mm_loadu_ps(tail));
+                        _mm_storeu_ps(di + o, _mm_add_ps(_mm_loadu_ps(di + o), sum4));
                     }
+                    for (; o < out_C; o++)
+                        di[o] += t2sd_dot(W_k0 + (size_t)o * w_stride, feat_n, in_C);
+#else
+                    for (int o = 0; o < out_C; o++) {
+                        const float *kern = W_k0 + (size_t)o * w_stride;
+                        di[o] += t2sd_dot(kern, feat_n, in_C);
+                    }
+#endif
                 }
             }
         }
     }
+    return NULL;
+}
+
+static void t2sd_sparse_conv(float *dst, const sp3d_tensor *t,
+                               const float *weight, const float *bias,
+                               int in_C, int out_C, int n_threads) {
+    sp3d_ensure_hash((sp3d_tensor *)t);
+    int N = t->N;
+    if (n_threads <= 1 || N < n_threads) {
+        t2sd_conv_task task = {dst, t, weight, bias, 0, N, in_C, out_C};
+        t2sd_sparse_conv_worker(&task);
+        return;
+    }
+    pthread_t *threads = (pthread_t *)alloca((size_t)n_threads * sizeof(pthread_t));
+    t2sd_conv_task *tasks = (t2sd_conv_task *)alloca((size_t)n_threads * sizeof(t2sd_conv_task));
+    for (int i = 0; i < n_threads; i++) {
+        tasks[i] = (t2sd_conv_task){dst, t, weight, bias,
+                                     i * N / n_threads, (i + 1) * N / n_threads,
+                                     in_C, out_C};
+        pthread_create(&threads[i], NULL, t2sd_sparse_conv_worker, &tasks[i]);
+    }
+    for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
 }
 
 /* ---- Forward helpers ---- */
@@ -195,15 +442,25 @@ static void t2sd_convnext_forward(float *feats, int N, const t2sd_convnext *blk,
     t2sd_sparse_conv(tmp, t, blk->conv_w, blk->conv_b, C, C, n_threads);
 
     /* layernorm(tmp) */
-    t2sd_layernorm(tmp, tmp, blk->norm_w, blk->norm_b, N, C, 1e-6f);
+    t2sd_layernorm_mt(tmp, tmp, blk->norm_w, blk->norm_b, N, C, 1e-6f, n_threads);
 
     /* mlp: Linear(C, 4C) -> GELU -> Linear(4C, C) */
-    t2sd_linear(mlp_buf, tmp, N, blk->mlp0_w, blk->mlp0_b, 4 * C, C);
+    t2sd_linear_mt(mlp_buf, tmp, N, blk->mlp0_w, blk->mlp0_b, 4 * C, C, n_threads);
     t2sd_gelu(mlp_buf, N * 4 * C);
-    t2sd_linear(tmp, mlp_buf, N, blk->mlp2_w, blk->mlp2_b, C, 4 * C);
+    t2sd_linear_mt(tmp, mlp_buf, N, blk->mlp2_w, blk->mlp2_b, C, 4 * C, n_threads);
 
     /* residual: feats += tmp */
+#if T2SD_AVX2
+    int j = 0;
+    for (; j + 7 < N * C; j += 8) {
+        __m256 a = _mm256_loadu_ps(feats + j);
+        __m256 b = _mm256_loadu_ps(tmp + j);
+        _mm256_storeu_ps(feats + j, _mm256_add_ps(a, b));
+    }
+    for (; j < N * C; j++) feats[j] += tmp[j];
+#else
     for (int i = 0; i < N * C; i++) feats[i] += tmp[i];
+#endif
 
     free(tmp);
     free(mlp_buf);
@@ -216,8 +473,7 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk, int n_
     /* 1. Predict subdivision: which sub-voxels to activate */
     float *sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
     if (blk->to_subdiv_w) {
-        /* to_subdiv: [8, C_in] @ feats[N, C_in] -> [N, 8] */
-        t2sd_linear(sub_logits, t->feats, N, blk->to_subdiv_w, blk->to_subdiv_b, 8, C_in);
+        t2sd_linear_mt(sub_logits, t->feats, N, blk->to_subdiv_w, blk->to_subdiv_b, 8, C_in, n_threads);
     } else {
         /* No subdivision prediction — activate all 8 sub-voxels (for texture decoder) */
         for (int i = 0; i < N * 8; i++) sub_logits[i] = 1.0f;
@@ -233,7 +489,7 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk, int n_
 
     /* 2. LayerNorm input */
     float *normed = (float *)malloc((size_t)N * C_in * sizeof(float));
-    t2sd_layernorm(normed, t->feats, blk->norm1_w, blk->norm1_b, N, C_in, 1e-6f);
+    t2sd_layernorm_mt(normed, t->feats, blk->norm1_w, blk->norm1_b, N, C_in, 1e-6f, n_threads);
 
     /* 3. conv1: [C_out*8, 27, C_in] -> [N, C_out*8] */
     float *expanded = (float *)malloc((size_t)N * C_out * 8 * sizeof(float));
