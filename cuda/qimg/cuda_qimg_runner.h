@@ -234,41 +234,26 @@ static const char *qimg_kernel_src =
 "    out[idx] = sum;\n"
 "}\n"
 
-/* GroupNorm for VAE: scale-only (no bias), 32 groups
- * Grid: (groups), Block: (min(spatial, 256)) */
-"__global__ void vae_groupnorm_f32(float *__restrict__ out,\n"
+/* RMS norm for VAE: F.normalize(x, dim=1) * sqrt(C) * gamma
+ * = x / ||x||_2_per_spatial * sqrt(C) * gamma[c]
+ * Input: [C, spatial] (CHW layout). Normalize along C at each spatial position.
+ * Grid: (ceil(spatial/blockDim.x)), Block: (256) — one thread per spatial pos */
+"__global__ void vae_rmsnorm_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ inp, const float *__restrict__ gamma,\n"
-"    int C, int spatial, int groups) {\n"
-"    int g = blockIdx.x;\n"
-"    if (g >= groups) return;\n"
-"    int cpg = C / groups;\n"
-"    int n = cpg * spatial;\n"
-"    /* Two-pass: compute mean then variance */\n"
-"    float mean = 0;\n"
-"    for (int gc = 0; gc < cpg; gc++) {\n"
-"        int ch = g * cpg + gc;\n"
-"        for (int s = threadIdx.x; s < spatial; s += blockDim.x)\n"
-"            mean += inp[ch * spatial + s];\n"
+"    int C, int spatial) {\n"
+"    int s = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (s >= spatial) return;\n"
+"    /* Compute L2 norm across channels at this spatial position */\n"
+"    float sum_sq = 0.0f;\n"
+"    for (int c = 0; c < C; c++) {\n"
+"        float v = inp[c * spatial + s];\n"
+"        sum_sq += v * v;\n"
 "    }\n"
-"    for (int m = 16; m > 0; m >>= 1)\n"
-"        mean += __shfl_xor_sync(0xFFFFFFFF, mean, m);\n"
-"    mean /= (float)n;\n"
-"    float var = 0;\n"
-"    for (int gc = 0; gc < cpg; gc++) {\n"
-"        int ch = g * cpg + gc;\n"
-"        for (int s = threadIdx.x; s < spatial; s += blockDim.x) {\n"
-"            float d = inp[ch * spatial + s] - mean;\n"
-"            var += d * d;\n"
-"        }\n"
-"    }\n"
-"    for (int m = 16; m > 0; m >>= 1)\n"
-"        var += __shfl_xor_sync(0xFFFFFFFF, var, m);\n"
-"    float inv = rsqrtf(var / (float)n + 1e-6f);\n"
-"    for (int gc = 0; gc < cpg; gc++) {\n"
-"        int ch = g * cpg + gc;\n"
-"        float gv = gamma ? gamma[ch] : 1.0f;\n"
-"        for (int s = threadIdx.x; s < spatial; s += blockDim.x)\n"
-"            out[ch * spatial + s] = (inp[ch * spatial + s] - mean) * inv * gv;\n"
+"    float inv_norm = rsqrtf(sum_sq + 1e-12f);\n"
+"    float scale = sqrtf((float)C);\n"
+"    for (int c = 0; c < C; c++) {\n"
+"        float gv = gamma ? gamma[c] : 1.0f;\n"
+"        out[c * spatial + s] = inp[c * spatial + s] * inv_norm * scale * gv;\n"
 "    }\n"
 "}\n"
 
@@ -278,6 +263,8 @@ static const char *qimg_kernel_src =
  * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
 "__device__ __constant__ float d_fp8_to_f32_lut[256];\n"
 "\n"
+"/* FP8 LUT GEMM: dequant weights via constant memory LUT, F32 inputs+accum.\n"
+" * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */\n"
 "__global__ void gemm_fp8w_f32(float *Y, const unsigned char *W, const float *X,\n"
 "    const float *bias, int n_out, int n_in, int n_tok) {\n"
 "    __shared__ float smA[16][16];\n"
@@ -671,7 +658,7 @@ struct cuda_qimg_runner {
     CUfunction rope_2d;
     CUfunction rope_1d;
     CUfunction vae_conv2d;
-    CUfunction vae_groupnorm;
+    CUfunction vae_rmsnorm;
     CUfunction vae_silu;
     CUfunction nn_upsample2x;
     CUfunction rmsnorm_weighted;
@@ -750,8 +737,14 @@ static CUdeviceptr qimg_st_upload_f16(st_context *st, const char *name) {
         return 0;
     }
 
-    CUdeviceptr d;
-    cuMemAlloc(&d, n * sizeof(uint16_t));
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, n * sizeof(uint16_t));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_qimg: F16 upload cuMemAlloc(%.1f MB) FAILED (err=%d) for %s\n",
+                (float)(n * 2) / (1 << 20), (int)err, name);
+        free(f16);
+        return 0;
+    }
     cuMemcpyHtoD(d, f16, n * sizeof(uint16_t));
     free(f16);
     return d;
@@ -924,14 +917,13 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
     unsigned gy = (unsigned)((n_tok + 15) / 16);
 
     if (r->use_f16_gemm) {
-        /* gemm_f16_f32: F16 weights (MMA tensor cores), F32 inputs+accumulation.
-         * Grid: (ceil(n_out/256), ceil(n_tok/16)), Block: (128) */
-        cuLaunchKernel(r->gemm_f16_f32, gx, gy, 1, 128, 1, 1,
-                       16 * 16 * sizeof(float), r->stream, args, NULL);
+        /* gemm_tiled_f16_f32: shared-memory tiled GEMM (no MMA), F16 weights.
+         * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
+        unsigned gx64 = (unsigned)((n_out + 63) / 64);
+        cuLaunchKernel(r->gemm_f16_f32, gx64, gy, 1, 16, 16, 1,
+                       0, r->stream, args, NULL);
     } else if (r->use_fp8_gemm) {
-        /* NOTE: Skip native FP8×FP8 MMA — input FP8 quantization hurts image quality.
-         * Use FP8 weight LUT dequant with F32 inputs instead. */
-        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 inputs (fallback).
+        /* gemm_fp8w_f32: FP8 weights dequanted via LUT, F32 inputs.
          * Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16, 16) */
         unsigned gx64 = (unsigned)((n_out + 63) / 64);
         cuLaunchKernel(r->gemm_fp8w_f32, gx64, gy, 1, 16, 16, 1,
@@ -1053,7 +1045,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     r->module = module; r->sm_version = sm; r->verbose = verbose;
 
     #define GET(field, name) cuModuleGetFunction(&r->field, module, name)
-    GET(gemm_f16_f32, "gemm_f16_f32");
+    GET(gemm_f16_f32, "gemm_tiled_f16_f32");  /* Use tiled (correct) kernel, not MMA (has fragment mapping bug) */
     GET(gemm_f32_f32, "gemm_f32_f32");
     GET(gemm_fp8w_f32, "gemm_fp8w_f32");
     /* Try loading native FP8 GEMM (available on sm_89+) */
@@ -1080,7 +1072,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(rope_2d, "rope_2d_f32");
     GET(rope_1d, "rope_1d_f32");
     GET(vae_conv2d, "vae_conv2d_f32");
-    GET(vae_groupnorm, "vae_groupnorm_f32");
+    GET(vae_rmsnorm, "vae_rmsnorm_f32");
     GET(vae_silu, "vae_silu_f32");
     GET(nn_upsample2x, "nn_upsample2x_f32");
     GET(rmsnorm_weighted, "rmsnorm_weighted_f32");
@@ -1276,6 +1268,25 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     CUdeviceptr d_img_in, d_txt_in;
     cuMemAlloc(&d_img_in, (size_t)n_img * in_ch * sizeof(float));
     cuMemcpyHtoD(d_img_in, img_tokens, (size_t)n_img * in_ch * sizeof(float));
+    /* Save raw patchified input for comparison */
+    if (r->verbose >= 3) {
+        FILE *_pf = fopen("cuda_dit_img_input.npy", "wb");
+        if (_pf) {
+            unsigned char _mag[] = {0x93,'N','U','M','P','Y',1,0};
+            char _h[256];
+            int _hl = snprintf(_h, sizeof(_h),
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", n_img, in_ch);
+            int _pad = 64 - ((10 + _hl + 1) % 64); if (_pad == 64) _pad = 0;
+            for (int _p = 0; _p < _pad; _p++) _h[_hl++] = ' ';
+            _h[_hl++] = '\n';
+            unsigned short _hs = (unsigned short)_hl;
+            fwrite(_mag, 1, 8, _pf); fwrite(&_hs, 2, 1, _pf);
+            fwrite(_h, 1, _hl, _pf);
+            fwrite(img_tokens, sizeof(float), (size_t)n_img*in_ch, _pf);
+            fclose(_pf);
+            fprintf(stderr, "    Saved cuda_dit_img_input.npy [%d,%d]\n", n_img, in_ch);
+        }
+    }
     cuMemAlloc(&d_txt_in, (size_t)n_txt * txt_dim * sizeof(float));
     cuMemcpyHtoD(d_txt_in, txt_tokens, (size_t)n_txt * txt_dim * sizeof(float));
 
@@ -1300,6 +1311,19 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemFree(d_t_emb); d_t_emb = d_t_emb2;
     cuMemFree(d_t_sin);
 
+    /* Save temb for comparison */
+    if (r->verbose >= 3) {
+        float *_temb = (float*)malloc((size_t)dim*sizeof(float));
+        cuStreamSynchronize(s); cuMemcpyDtoH(_temb, d_t_emb, (size_t)dim*sizeof(float));
+        float _std = 0, _mean = 0;
+        for (int i = 0; i < dim; i++) _mean += _temb[i];
+        _mean /= dim;
+        for (int i = 0; i < dim; i++) _std += (_temb[i]-_mean)*(_temb[i]-_mean);
+        _std = sqrtf(_std / dim);
+        fprintf(stderr, "    temb: std=%.6f\n", _std);
+        free(_temb);
+    }
+
     /* 2. Text input: RMSNorm(txt_norm_w) → Linear(txt_in) */
     /* Note: ComfyUI's text encoder already outputs normalized hidden states.
      * The txt_norm in the DiT is applied to RAW encoder output.
@@ -1316,6 +1340,36 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     /* 3. Image input: GEMM(64→3072) */
     op_gemm(r, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
     cuMemFree(d_img_in);
+
+    /* Helper: save GPU tensor as .npy [rows, cols] */
+    #define DIT_SAVE_NPY(fname, ptr, rows, cols) do { \
+        if (r->verbose >= 3) { \
+            cuStreamSynchronize(s); \
+            size_t _n = (size_t)(rows) * (cols); \
+            float *_buf = (float*)malloc(_n * sizeof(float)); \
+            cuMemcpyDtoH(_buf, ptr, _n * sizeof(float)); \
+            FILE *_fp = fopen(fname, "wb"); \
+            if (_fp) { \
+                unsigned char _magic[] = {0x93,'N','U','M','P','Y',1,0}; \
+                char _hdr[256]; \
+                int _hl = snprintf(_hdr, sizeof(_hdr), \
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", (rows), (cols)); \
+                int _pad = 64 - ((10 + _hl + 1) % 64); \
+                if (_pad == 64) _pad = 0; \
+                for (int _p = 0; _p < _pad; _p++) _hdr[_hl++] = ' '; \
+                _hdr[_hl++] = '\n'; \
+                unsigned short _hs = (unsigned short)_hl; \
+                fwrite(_magic, 1, 8, _fp); fwrite(&_hs, 2, 1, _fp); \
+                fwrite(_hdr, 1, _hl, _fp); fwrite(_buf, sizeof(float), _n, _fp); \
+                fclose(_fp); \
+                fprintf(stderr, "    Saved %s [%d,%d]\n", fname, (rows), (cols)); \
+            } \
+            free(_buf); \
+        } \
+    } while(0)
+
+    DIT_SAVE_NPY("cuda_dit_img_projected.npy", d_img, n_img, dim);
+    DIT_SAVE_NPY("cuda_dit_txt_projected.npy", d_txt, n_txt, dim);
 
     /* Scratch buffers */
     CUdeviceptr d_scratch1, d_scratch2, d_scratch3;
@@ -1503,9 +1557,14 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
                 dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
 
-        /* Save block 0 output */
-        if (L == 0 && r->verbose >= 3)
-            SAVE_GPU("cuda_after_block0_img.bin", d_img, n_img*dim);
+        /* Save every block output for comparison */
+        if (r->verbose >= 3) {
+            char _fn[64];
+            snprintf(_fn, sizeof(_fn), "cuda_dit_block%02d_img.npy", L);
+            DIT_SAVE_NPY(_fn, d_img, n_img, dim);
+            snprintf(_fn, sizeof(_fn), "cuda_dit_block%02d_txt.npy", L);
+            DIT_SAVE_NPY(_fn, d_txt, n_txt, dim);
+        }
 
         /* Truncate block output to BF16 precision (matches ComfyUI's BF16 compute) */
         op_bf16_trunc(r, d_img, n_img * dim);
@@ -1542,11 +1601,15 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_adaln(r, d_scratch1, d_img, f_shift, f_scale, n_img, dim);
         cuMemFree(d_final_mod);
 
+        DIT_SAVE_NPY("cuda_dit_norm_out.npy", d_scratch1, n_img, dim);
+
         /* proj_out: [n_img, dim] → [n_img, in_ch] */
         CUdeviceptr d_out;
         cuMemAlloc(&d_out, (size_t)n_img * in_ch * sizeof(float));
         op_gemm(r, d_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
                 in_ch, dim, n_img);
+
+        DIT_SAVE_NPY("cuda_dit_proj_out.npy", d_out, n_img, in_ch);
 
         /* Download result (sync stream first to ensure computation is complete) */
         cuStreamSynchronize(s);
@@ -1604,19 +1667,19 @@ static CUdeviceptr vae_upload_conv3d(st_context *st, const char *name,
     if (out_ci) *out_ci = ci;
     size_t n3d = (size_t)co * ci * kd * kh * kw;
     const uint16_t *bf = (const uint16_t *)safetensors_data(st, idx);
-    /* BF16 → F32 + sum temporal dim */
+    /* BF16 → F32: take LAST temporal slice only (causal_zero for T=1 input) */
     size_t n2d = (size_t)co * ci * kh * kw;
-    float *w2d = (float *)calloc(n2d, sizeof(float));
+    float *w2d = (float *)malloc(n2d * sizeof(float));
+    int d_last = kd - 1;  /* causal: use last temporal position only */
     for (int o = 0; o < co; o++)
         for (int i = 0; i < ci; i++)
-            for (int d = 0; d < kd; d++)
-                for (int h = 0; h < kh; h++)
-                    for (int w = 0; w < kw; w++) {
-                        size_t idx3 = ((((size_t)o*ci+i)*kd+d)*kh+h)*kw+w;
-                        uint32_t bits = (uint32_t)bf[idx3] << 16;
-                        float f; memcpy(&f, &bits, 4);
-                        w2d[(((size_t)o*ci+i)*kh+h)*kw+w] += f;
-                    }
+            for (int h = 0; h < kh; h++)
+                for (int w = 0; w < kw; w++) {
+                    size_t idx3 = ((((size_t)o*ci+i)*kd+d_last)*kh+h)*kw+w;
+                    uint32_t bits = (uint32_t)bf[idx3] << 16;
+                    float f; memcpy(&f, &bits, 4);
+                    w2d[(((size_t)o*ci+i)*kh+h)*kw+w] = f;
+                }
     CUdeviceptr dp; cuMemAlloc(&dp, n2d * sizeof(float));
     cuMemcpyHtoD(dp, w2d, n2d * sizeof(float));
     free(w2d);
@@ -1634,13 +1697,12 @@ static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
                    256, 1, 1, 0, r->stream, args, NULL);
 }
 
-/* GPU VAE groupnorm launch */
+/* GPU VAE RMS norm launch: L2-normalize along channels, scale by sqrt(C) * gamma */
 static void vae_op_gn(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
                       CUdeviceptr gamma, int C, int spatial) {
-    int groups = 32;
-    void *args[] = {&out, &inp, &gamma, &C, &spatial, &groups};
-    cuLaunchKernel(r->vae_groupnorm, (unsigned)groups, 1, 1,
-                   32, 1, 1, 0, r->stream, args, NULL);
+    void *args[] = {&out, &inp, &gamma, &C, &spatial};
+    cuLaunchKernel(r->vae_rmsnorm, (unsigned)((spatial + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
 }
 
 /* GPU VAE silu launch */
@@ -1662,12 +1724,9 @@ static CUdeviceptr vae_op_upsample(cuda_qimg_runner *r, CUdeviceptr inp,
     return out;
 }
 
-/* BF16 truncation for VAE intermediates (matches ComfyUI's BF16 compute).
- * Always active for VAE — the BF16 precision matches training distribution. */
+/* BF16 truncation for VAE intermediates — DISABLED (ComfyUI F32=BF16). */
 static void vae_bf16(cuda_qimg_runner *r, CUdeviceptr x, int n) {
-    void *args[] = {&x, &n};
-    cuLaunchKernel(r->truncate_bf16, (unsigned)((n+255)/256), 1, 1,
-                   256, 1, 1, 0, r->stream, args, NULL);
+    (void)r; (void)x; (void)n;  /* no-op: F32 is correct */
 }
 
 /* GPU VAE ResBlock: GroupNorm→SiLU→Conv→GroupNorm→SiLU→Conv + shortcut */
@@ -1753,6 +1812,43 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
                 label, _mn, _mx, _s/((count)-_nn), _nn, (count)); \
         free(_t); } while(0)
 
+    /* Save GPU buffer as .npy file for comparison with ComfyUI */
+    #define VAE_SAVE_NPY(fname, ptr, ndim, dims) do { \
+        if (r->verbose >= 3) { \
+            cuStreamSynchronize(s); \
+            size_t _total = 1; \
+            const int *_dims_p = (dims); \
+            for (int _di = 0; _di < (ndim); _di++) _total *= _dims_p[_di]; \
+            float *_buf = (float*)malloc(_total * sizeof(float)); \
+            cuMemcpyDtoH(_buf, ptr, _total * sizeof(float)); \
+            FILE *_fp = fopen(fname, "wb"); \
+            if (_fp) { \
+                /* NumPy .npy format header */ \
+                unsigned char _magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0}; \
+                char _hdr[256]; \
+                int _hlen; \
+                if ((ndim) == 1) _hlen = snprintf(_hdr, sizeof(_hdr), \
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d,), }", _dims_p[0]); \
+                else if ((ndim) == 2) _hlen = snprintf(_hdr, sizeof(_hdr), \
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", _dims_p[0], _dims_p[1]); \
+                else _hlen = snprintf(_hdr, sizeof(_hdr), \
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d, %d), }", _dims_p[0], _dims_p[1], _dims_p[2]); \
+                int _pad = 64 - ((10 + _hlen + 1) % 64); \
+                if (_pad == 64) _pad = 0; \
+                for (int _p = 0; _p < _pad; _p++) _hdr[_hlen++] = ' '; \
+                _hdr[_hlen++] = '\n'; \
+                unsigned short _hl = (unsigned short)_hlen; \
+                fwrite(_magic, 1, 8, _fp); \
+                fwrite(&_hl, 2, 1, _fp); \
+                fwrite(_hdr, 1, _hlen, _fp); \
+                fwrite(_buf, sizeof(float), _total, _fp); \
+                fclose(_fp); \
+                fprintf(stderr, "  [vae] saved %s (%zu floats)\n", fname, _total); \
+            } \
+            free(_buf); \
+        } \
+    } while(0)
+
     /* Upload latent */
     CUdeviceptr d_x;
     cuMemAlloc(&d_x, (size_t)c * h * w * sizeof(float));
@@ -1770,6 +1866,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         cuMemFree(d_pqc_w); cuMemFree(d_pqc_b);
     }
     if (r->verbose >= 2) VAE_DUMP("post_quant", d_x, c*h*w);
+    { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_post_quant.npy", d_x, 3, _d); }
 
     /* decoder.conv1: 16→384, 3×3 */
     int co_c1, ci_c1;
@@ -1785,6 +1882,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     }
     fprintf(stderr, "  after conv1: [%d, %d, %d]\n", c, h, w);
     if (r->verbose >= 2) VAE_DUMP("conv1_out", d_x, c*h*w);
+    { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_conv1.npy", d_x, 3, _d); }
 
     /* Middle: ResBlock → skip attention for now → ResBlock */
     /* Load a resblock's weights given prefix string. Uses snprintf to build names. */
@@ -1807,6 +1905,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
       cuMemFree(d_x); d_x = d_tmp;
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
       if (scw) cuMemFree(scw); if (scb) cuMemFree(scb); }
+    { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_0.npy", d_x, 3, _d); }
 
     /* Middle attention: GroupNorm → QKV → spatial self-attention → proj + residual */
     {
@@ -1913,6 +2012,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         vae_bf16(r, d_x, c * spatial);
         cuStreamSynchronize(s);
     }
+    { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_1.npy", d_x, 3, _d); }
 
     /* mid.2 */
     { LOAD_RB_NAMED("decoder.middle.2", n1, c1w, c1b, n2, c2w, c2b, scw, scb);
@@ -1922,6 +2022,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
       if (scw) cuMemFree(scw); if (scb) cuMemFree(scb); }
     fprintf(stderr, "  after middle: [%d, %d, %d]\n", c, h, w);
     if (r->verbose >= 2) VAE_DUMP("middle_out", d_x, c*h*w);
+    { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_2.npy", d_x, 3, _d); }
 
     /* Upsample blocks 0-14 */
     for (int i = 0; i < 15; i++) {
@@ -1974,6 +2075,8 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             char _lbl[64]; snprintf(_lbl, sizeof(_lbl), "block_%d [%d,%d,%d]", i, c, h, w);
             VAE_DUMP(_lbl, d_x, c*h*w);
         }
+        { char _fn[64]; snprintf(_fn, sizeof(_fn), "cuda_vae_upsample_%d.npy", i);
+          int _d[] = {c, h, w}; VAE_SAVE_NPY(_fn, d_x, 3, _d); }
     }
     #undef LOAD_RB_NAMED
 
