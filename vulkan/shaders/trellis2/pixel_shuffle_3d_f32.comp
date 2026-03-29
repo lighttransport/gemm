@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MIT
+// pixel_shuffle_3d: [C*8, D, H, W] -> [C, 2*D, 2*H, 2*W]
+// Grid: (ceil(total/256), 1, 1), workgroup: (256, 1, 1)
+// total = C * 2D * 2H * 2W
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer DstBuffer { float dst[]; };
+layout(std430, binding = 1) readonly buffer SrcBuffer { float src[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint D;
+    uint H;
+    uint W;
+} pc;
+
+void main() {
+    uint idx = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    uint D2 = 2 * pc.D, H2 = 2 * pc.H, W2 = 2 * pc.W;
+    uint total = pc.C * D2 * H2 * W2;
+    if (idx >= total) return;
+
+    uint c = idx / (D2 * H2 * W2);
+    uint rem = idx % (D2 * H2 * W2);
+    uint od = rem / (H2 * W2);
+    rem = rem % (H2 * W2);
+    uint oh = rem / W2;
+    uint ow = rem % W2;
+
+    uint d = od / 2, sd = od % 2;
+    uint h = oh / 2, sh = oh % 2;
+    uint w = ow / 2, sw = ow % 2;
+
+    uint src_ch = c * 8 + (sd * 2 + sh) * 2 + sw;
+    uint spatial_in = pc.D * pc.H * pc.W;
+
+    dst[idx] = src[src_ch * spatial_in + d * pc.H * pc.W + h * pc.W + w];
+}
