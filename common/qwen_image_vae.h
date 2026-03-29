@@ -179,20 +179,19 @@ static float *qimg_vae_load_tensor(const st_context *st, const char *name,
     return NULL;
 }
 
-/* Sum 3D conv kernel [Co, Ci, kD, kH, kW] → 2D [Co, Ci, kH, kW]
- * For T=1 with replicate causal padding. */
+/* Extract last temporal slice of 3D conv kernel [Co, Ci, kD, kH, kW] → 2D [Co, Ci, kH, kW]
+ * For T=1 input, ComfyUI uses only d = kD-1 (the last temporal position). */
 static float *qimg_vae_conv3d_to_2d(const float *w3d, int co, int ci,
                                      int kd, int kh, int kw) {
     size_t n2d = (size_t)co * ci * kh * kw;
     float *w2d = (float *)calloc(n2d, sizeof(float));
+    int d = kd - 1;  /* last temporal slice only */
     for (int o = 0; o < co; o++)
         for (int i = 0; i < ci; i++)
             for (int h = 0; h < kh; h++)
                 for (int w = 0; w < kw; w++) {
-                    float sum = 0;
-                    for (int d = 0; d < kd; d++)
-                        sum += w3d[((((size_t)o * ci + i) * kd + d) * kh + h) * kw + w];
-                    w2d[(((size_t)o * ci + i) * kh + h) * kw + w] = sum;
+                    w2d[(((size_t)o * ci + i) * kh + h) * kw + w] =
+                        w3d[((((size_t)o * ci + i) * kd + d) * kh + h) * kw + w];
                 }
     return w2d;
 }
@@ -214,44 +213,29 @@ static float *qimg_vae_load_conv3d_as_2d(const st_context *st, const char *name,
 
 /* ---- Compute primitives ---- */
 
-/* GroupNorm: scale-only (no bias), 32 groups */
+/* RMS normalization along channel dimension (per spatial position):
+ * out[c,s] = x[c,s] / sqrt(sum_c(x[c,s]^2) + eps) * sqrt(C) * gamma[c]
+ * This matches F.normalize(x, dim=1) * sqrt(C) * gamma from ComfyUI. */
 static void qimg_vae_groupnorm(float *out, const float *x, const float *gamma,
                                 int c, int h, int w) {
-    int groups = 32;
-    if (c < groups) groups = c;
-    int cpg = c / groups;  /* channels per group */
     int spatial = h * w;
+    float sqrt_c = sqrtf((float)c);
+    float eps = 1e-12f;
 
-    for (int g = 0; g < groups; g++) {
-        /* Compute mean and variance over spatial + channels in group */
-        int n = cpg * spatial;
-        float mean = 0;
-        for (int gc = 0; gc < cpg; gc++) {
-            int ch = g * cpg + gc;
-            const float *src = x + (size_t)ch * spatial;
-            for (int s = 0; s < spatial; s++) mean += src[s];
+    for (int s = 0; s < spatial; s++) {
+        /* Compute L2 norm along channel dimension for this spatial position */
+        float sum_sq = 0;
+        for (int ch = 0; ch < c; ch++) {
+            float v = x[(size_t)ch * spatial + s];
+            sum_sq += v * v;
         }
-        mean /= (float)n;
+        float inv_norm = 1.0f / sqrtf(sum_sq + eps);
 
-        float var = 0;
-        for (int gc = 0; gc < cpg; gc++) {
-            int ch = g * cpg + gc;
-            const float *src = x + (size_t)ch * spatial;
-            for (int s = 0; s < spatial; s++) {
-                float d = src[s] - mean;
-                var += d * d;
-            }
-        }
-        var /= (float)n;
-        float inv = 1.0f / sqrtf(var + 1e-6f);
-
-        for (int gc = 0; gc < cpg; gc++) {
-            int ch = g * cpg + gc;
-            const float *src = x + (size_t)ch * spatial;
-            float *dst = out + (size_t)ch * spatial;
+        /* Normalize and scale */
+        for (int ch = 0; ch < c; ch++) {
+            float v = x[(size_t)ch * spatial + s];
             float g_val = gamma ? gamma[ch] : 1.0f;
-            for (int s = 0; s < spatial; s++)
-                dst[s] = (src[s] - mean) * inv * g_val;
+            out[(size_t)ch * spatial + s] = v * inv_norm * sqrt_c * g_val;
         }
     }
 }
@@ -319,11 +303,11 @@ static void qimg_vae_conv2d_pad(float *out, const float *inp, const float *weigh
     }
 }
 
-/* Convenience: replicate-padded conv2d (for 3D conv converted to 2D) */
+/* Zero-padded conv2d (Wan VAE uses spatial_padding_mode="zeros") */
 static void qimg_vae_conv2d(float *out, const float *inp, const float *weight,
                              const float *bias, int ci, int h, int w,
                              int co, int kh, int kw, int stride) {
-    qimg_vae_conv2d_pad(out, inp, weight, bias, ci, h, w, co, kh, kw, stride, 1);
+    qimg_vae_conv2d_pad(out, inp, weight, bias, ci, h, w, co, kh, kw, stride, 0);
 }
 
 /* Zero-padded conv2d (for 2D resample convolutions) */

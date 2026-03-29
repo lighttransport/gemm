@@ -123,7 +123,9 @@ int main(int argc, char **argv) {
 
     /* ---- Init CUDA ---- */
     cuda_qimg_runner *r = cuda_qimg_init(0, 1);
-    if (r) r->verbose = 1;  /* 1 = progress only */
+    r->verbose = 1;  /* 1 = progress only */
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--verbose") == 0 && i+1 < argc) r->verbose = atoi(argv[++i]);
     if (r && force_f16 == 1) { r->use_fp8_gemm = 0; fprintf(stderr, "Forced F32 GEMM path\n"); }
     if (r && force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; fprintf(stderr, "Forced F16 MMA path\n"); }
     if (r && force_f16 == 3) { r->use_bf16_trunc = 1; fprintf(stderr, "BF16 truncation enabled\n"); }
@@ -324,7 +326,9 @@ int main(int argc, char **argv) {
             free(txt_neg_hidden);
             cuda_qimg_free(r); return 1;
         }
-        /* Pad negative to same length as positive (or vice versa) */
+        /* Pad shorter condition to match longer with zeros.
+         * ComfyUI processes different-length conds separately, but with repeat-padding
+         * when batching. For our separate-pass approach, zero-padding works best. */
         if (n_txt_neg < n_txt) {
             float *padded = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
             memcpy(padded, txt_neg_hidden, (size_t)n_txt_neg * txt_dim * sizeof(float));
@@ -403,6 +407,19 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < lat_n; i++)
                     vel_latent[i] = vu_lat[i] + cfg_scale * (vc_lat[i] - vu_lat[i]);
                 free(vc_lat); free(vu_lat);
+            }
+
+            /* Track velocity stats before step */
+            { float vs=0,vs2=0; int vn=lat_ch*lat_h*lat_w;
+              for(int i=0;i<vn;i++){vs+=vel_latent[i];vs2+=vel_latent[i]*vel_latent[i];}
+              float vm=vs/vn, vstd=sqrtf(vs2/vn-vm*vm);
+              fprintf(stderr, "    vel: mean=%.4f std=%.4f dt=%.6f\n", vm, vstd, sched.dt[step]); }
+
+            /* Save per-step latent (before Euler step) */
+            if (r->verbose >= 3) {
+                char fn[64]; snprintf(fn, sizeof(fn), "cuda_perstep_%02d.bin", step);
+                FILE *sf = fopen(fn, "wb");
+                if (sf) { fwrite(latent, sizeof(float), (size_t)lat_n, sf); fclose(sf); }
             }
 
             /* Euler step */
