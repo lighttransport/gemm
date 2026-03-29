@@ -1682,18 +1682,9 @@ static CUdeviceptr vae_resblock_gpu(cuda_qimg_runner *r, CUdeviceptr x,
     /* Shortcut + residual */
     CUdeviceptr out; cuMemAlloc(&out, (size_t)co*sp*sizeof(float));
     if (sc_w) {
-        /* 1x1 conv shortcut (pointwise: treat as conv 1×1) */
+        /* 1x1 conv shortcut + residual: out = shortcut(x) + c2_out */
         vae_op_conv2d(r, out, x, sc_w, sc_b, ci, h, w, co, 1, 1, 0);
-        /* out += c2_out */
         int n = co * sp;
-        void *args[] = {&out, &c2_out, &n};
-        cuLaunchKernel(r->euler_step, (unsigned)((n+255)/256), 1, 1,
-                       256, 1, 1, 0, r->stream, args, NULL);
-        /* Hack: euler_step does x += dt*v, set dt=1 → x += v. Actually that kernel is
-           euler_step_f32(x, v, dt, n) → x[i] += dt*v[i]. We need add. Let me just
-           do a device-side add */
-        /* Actually just do: for(i) out[i] += c2_out[i] via a generic kernel.
-           euler_step with dt=1.0 works! */
         float one = 1.0f;
         void *add_args[] = {&out, &c2_out, &one, &n};
         cuLaunchKernel(r->euler_step, (unsigned)((n+255)/256), 1, 1,
@@ -1835,10 +1826,15 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
                 h_qkv_t[s_pos * 3 * c + ch] = h_qkv[ch * spatial + s_pos];
         free(h_qkv);
 
-        /* Split Q[spatial, C], K[spatial, C], V[spatial, C] */
-        float *h_q = h_qkv_t;
-        float *h_k = h_qkv_t + (size_t)spatial * c;
-        float *h_v = h_qkv_t + (size_t)spatial * 2 * c;
+        /* Split Q[spatial, C], K[spatial, C], V[spatial, C] from interleaved [spatial, 3C] */
+        float *h_q = (float *)malloc((size_t)spatial * c * sizeof(float));
+        float *h_k = (float *)malloc((size_t)spatial * c * sizeof(float));
+        float *h_v = (float *)malloc((size_t)spatial * c * sizeof(float));
+        for (int s_pos = 0; s_pos < spatial; s_pos++) {
+            memcpy(h_q + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c,           (size_t)c * sizeof(float));
+            memcpy(h_k + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c + c,       (size_t)c * sizeof(float));
+            memcpy(h_v + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c + 2 * c,   (size_t)c * sizeof(float));
+        }
 
         /* Run attention: 1 head with head_dim=C */
         float *h_attn = (float *)malloc((size_t)spatial * c * sizeof(float));
@@ -1864,6 +1860,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             for (int d = 0; d < c; d++) h_attn[i*c+d] *= inv;
         }
         free(h_qkv_t);
+        free(h_q); free(h_k); free(h_v);
 
         /* Output projection: [C, C] @ attn_out[C, spatial] + residual
          * First transpose attn back to [C, spatial] */
