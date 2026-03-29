@@ -77,10 +77,10 @@ Auto-detected from safetensors tensor shapes:
 
 | Model | embed_dim | Blocks | Heads | Status |
 |-------|-----------|--------|-------|--------|
-| DA3-Small | 384 | 12 | 6 | Verified |
+| DA3-Small | 384 | 12 | 6 | Verified (all modalities) |
 | DA3-Base | 768 | 12 | 12 | Untested (should work) |
 | DA3-Large | 1024 | 24 | 16 | Untested (should work) |
-| DA3-Giant | 1536 | 40 | 24 | Untested (should work) |
+| DA3-Giant | 1536 | 40 | 24 | Verified (all modalities, ~39s unoptimized) |
 
 ## Output Modalities
 
