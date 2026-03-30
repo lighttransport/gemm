@@ -3353,7 +3353,8 @@ static int upload_weight_matrix(CUdeviceptr *d_ptr, const qtensor *t, int *out_t
         return upload_q8_0_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_Q2_K || t->type == GGML_TYPE_Q3_K ||
                t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K ||
-               t->type == GGML_TYPE_Q6_K) {
+               t->type == GGML_TYPE_Q6_K ||
+               t->type == GGML_TYPE_IQ4_XS || t->type == GGML_TYPE_IQ4_NL) {
         return upload_kquant_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_BF16) {
         /* BF16 → F32 → F16, then upload as F16 */
@@ -3549,11 +3550,13 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->token_embd_type = embd.type;
     if (embd.type == GGML_TYPE_Q8_0) {
         if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q2_K || embd.type == GGML_TYPE_Q3_K ||
-               embd.type == GGML_TYPE_Q4_K || embd.type == GGML_TYPE_Q6_K) {
+    } else if (embd.type == GGML_TYPE_Q2_K) {
+        /* Q2_K has a dedicated GPU embed kernel */
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q5_K) {
-        /* Q5_K → dequant to F16 at load time (no Q5_K embed kernel) */
+    } else if (embd.type == GGML_TYPE_Q3_K || embd.type == GGML_TYPE_Q4_K ||
+               embd.type == GGML_TYPE_Q5_K || embd.type == GGML_TYPE_Q6_K ||
+               embd.type == GGML_TYPE_IQ4_XS || embd.type == GGML_TYPE_IQ4_NL) {
+        /* K-quants without GPU embed kernels → dequant to F16 at load time */
         int n_elements = embd.n_rows * embd.n_cols;
         float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
         if (!f32_buf) return -1;

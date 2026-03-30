@@ -124,23 +124,31 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "=== CUDA Qwen-Image: %s ===\n", mode);
 
-    /* ---- Init CUDA ---- */
-    cuda_qimg_runner *r = cuda_qimg_init(0, 1);
-    r->verbose = 1;  /* 1 = progress only */
+    /* ---- Init CUDA (deferred for gen mode — GPU text encoder needs VRAM first) ---- */
+    cuda_qimg_runner *r = NULL;
+    int verbose_level = 1;
     for (int i = 1; i < argc; i++)
-        if (strcmp(argv[i], "--verbose") == 0 && i+1 < argc) r->verbose = atoi(argv[++i]);
-    if (r && force_f16 == 1) { r->use_fp8_gemm = 0; fprintf(stderr, "Forced F32 GEMM path\n"); }
-    if (r && force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; fprintf(stderr, "Forced F16 MMA path\n"); }
-    if (r && force_f16 == 3) { r->use_bf16_trunc = 1; fprintf(stderr, "BF16 truncation enabled\n"); }
-    if (r && force_f16 == 4) { r->use_old_gemm = 1; fprintf(stderr, "Old 16x16 GEMM (for comparison)\n"); }
-    if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
+        if (strcmp(argv[i], "--verbose") == 0 && i+1 < argc) verbose_level = atoi(argv[++i]);
+
+    if (strcmp(mode, "gen") != 0) {
+        r = cuda_qimg_init(0, 1);
+        r->verbose = verbose_level;
+        if (r && force_f16 == 1) { r->use_fp8_gemm = 0; }
+        if (r && force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; }
+        if (r && force_f16 == 3) { r->use_bf16_trunc = 1; }
+        if (r && force_f16 == 4) { r->use_old_gemm = 1; }
+        if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
+    }
 
     if (strcmp(mode, "init") == 0) { cuda_qimg_free(r); return 0; }
 
-    /* ---- Load DiT ---- */
-    clock_t t0 = clock();
-    if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
-    fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+    /* ---- Load DiT (skip for gen mode — deferred after GPU text encoding) ---- */
+    clock_t t0;
+    if (r) {
+        t0 = clock();
+        if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
+        fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+    }
 
     if (strcmp(mode, "load") == 0) {
         cuda_qimg_load_vae(r, vae_path);
@@ -301,13 +309,8 @@ int main(int argc, char **argv) {
         } /* if !custom_prompt */
 
         /* Try GPU text encoder (GGUF + biases, ~500× faster than CPU).
-         * NOTE: Currently causes CUDA error 700 (sticky) that prevents DiT from
-         * running afterward. Disabled until the LLM runner kernel bug is fixed.
-         * Use --gpu-enc to enable for text-encoding-only benchmarks. */
-        int use_gpu_enc = 0;
-        for (int i = 1; i < argc; i++)
-            if (strcmp(argv[i], "--gpu-enc") == 0) use_gpu_enc = 1;
-        if (!txt_hidden && use_gpu_enc) {
+         * Uses primary CUDA context shared with DiT runner. */
+        if (!txt_hidden) {
             const char *bias_st = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
             qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, bias_st, 0);
             if (enc) {
@@ -355,7 +358,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens (separate passes)\n", n_txt, n_txt_neg);
         fprintf(stderr, "  Text encoding: %.1fs\n", (double)(clock() - enc_t0) / CLOCKS_PER_SEC);
 
-        /* (DiT already loaded during init) */
+        /* Init qimg + load DiT AFTER text encoding frees GPU memory */
+        r = cuda_qimg_init(0, verbose_level);
+        if (!r) { fprintf(stderr, "CUDA qimg init failed\n"); return 1; }
+        r->verbose = verbose_level;
+        if (force_f16 == 1) { r->use_fp8_gemm = 0; }
+        if (force_f16 == 2) { r->use_fp8_gemm = 0; r->use_f16_gemm = 1; }
+        if (force_f16 == 4) { r->use_old_gemm = 1; }
+        t0 = clock();
+        if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
+        fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
         /* 2. DiT denoising loop (CUDA) */
         fprintf(stderr, "\n[2/3] DiT denoising (%d steps, %dx%d, %s)...\n",
