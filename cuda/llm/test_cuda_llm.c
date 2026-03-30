@@ -18,6 +18,8 @@
 /* GGUF loader */
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
+#define SAFETENSORS_IMPLEMENTATION
+#include "../../common/safetensors.h"
 
 /* Dequant (needed by transformer.h) */
 #define GGML_DEQUANT_IMPLEMENTATION
