@@ -119,7 +119,8 @@ typedef struct {
     int n_heads;          /* 12 */
     int head_dim;         /* 128 */
     int ffn_hidden;       /* 8192 */
-    int in_channels;      /* 8 for Stage 1, 32 for Stage 2 */
+    int in_channels;      /* 8 for Stage 1, 32 for Stage 2, 64 for Stage 3 */
+    int out_channels;     /* same as in_channels for Stage 1/2, 32 for Stage 3 */
     int cond_dim;         /* 1024 */
     CUdeviceptr t_fc1_w, t_fc1_b, t_fc2_w, t_fc2_b;
     CUdeviceptr mod_w, mod_b;
@@ -170,8 +171,14 @@ struct cuda_trellis2_runner {
     /* Stage 2 shape flow DiT */
     dit_model_gpu stage2;
     dit_block_gpu stage2_blocks[DIT_DEPTH];
-    dit_block_cpu stage2_blocks_cpu[DIT_DEPTH]; /* CPU copies for layer streaming */
+    dit_block_cpu stage2_blocks_cpu[DIT_DEPTH];
     int stage2_loaded;
+
+    /* Stage 3 texture flow DiT (same architecture, in_channels=64) */
+    dit_model_gpu stage3;
+    dit_block_gpu stage3_blocks[DIT_DEPTH];
+    dit_block_cpu stage3_blocks_cpu[DIT_DEPTH];
+    int stage3_loaded;
 
     /* Layer streaming config (0 = all on GPU, >0 = max layers on GPU at once) */
     int max_gpu_layers;
@@ -832,16 +839,17 @@ static int load_dinov3_weights(cuda_trellis2_runner *r, const char *path) {
     return 0;
 }
 
-static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
-    /* Stage 2 uses identical weight naming as Stage 1, just in_channels=32.
-     * Weight matrices are stored as F16 for MMA tensor core GEMM;
-     * biases, norms, and small matrices stay F32. */
+/* Generic DiT weight loader (used for Stage 2 and Stage 3).
+ * Both use identical architecture with different in_channels. */
+static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
+                                    dit_model_gpu *m, dit_block_gpu *blocks_arr,
+                                    dit_block_cpu *blocks_cpu_arr,
+                                    const char *label) {
     st_context *st = safetensors_open(path);
     if (!st) return -1;
-    fprintf(stderr, "T2: loading Stage 2 from %s (%d tensors)\n", path, st->n_tensors);
+    fprintf(stderr, "T2: loading %s from %s (%d tensors)\n", label, path, st->n_tensors);
     int v = r->verbose;
-    dit_model_gpu *m = &r->stage2;
-    int use_f16 = (r->ops.sm_version >= 70);  /* F16 MMA needs sm_70+ */
+    int use_f16 = (r->ops.sm_version >= 70);
 
     m->n_blocks = DIT_DEPTH;
     m->model_channels = DIT_DIM;
@@ -849,13 +857,16 @@ static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
     m->head_dim = DIT_HEAD_DIM;
     m->ffn_hidden = DIT_FFN;
     m->cond_dim = DIT_COND_DIM;
-    m->blocks = r->stage2_blocks;
+    m->blocks = blocks_arr;
 
-    /* Detect in_channels from input_layer weight */
+    /* Detect in_channels and out_channels from weight shapes */
     {
         int idx = safetensors_find(st, "input_layer.weight");
         if (idx >= 0) m->in_channels = (int)safetensors_shape(st, idx)[1];
         else m->in_channels = 32;
+        idx = safetensors_find(st, "out_layer.weight");
+        if (idx >= 0) m->out_channels = (int)safetensors_shape(st, idx)[0];
+        else m->out_channels = m->in_channels;
     }
 
     /* Timestep MLP and modulation: keep F32 (n_tok=1, GEMM perf irrelevant).
@@ -907,7 +918,7 @@ static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
 
         /* Save CPU copy for layer streaming */
         cuStreamSynchronize(0);
-        dit_block_save_cpu_copy(&r->stage2_blocks_cpu[L], blk, use_f16,
+        dit_block_save_cpu_copy(&blocks_cpu_arr[L], blk, use_f16,
                                  DIT_DIM, DIT_HEADS, DIT_HEAD_DIM, DIT_FFN, DIT_COND_DIM);
 
         if (r->max_gpu_layers > 0 && L >= r->max_gpu_layers)
@@ -915,33 +926,31 @@ static int load_stage2_weights(cuda_trellis2_runner *r, const char *path) {
     }
     #undef UPW
 
-    /* RoPE tables computed at runtime from sparse coords — set to NULL for now */
     m->rope_cos = 0; m->rope_sin = 0;
-    m->n_rope_freqs = DIT_HEAD_DIM / 6;  /* 21 */
+    m->n_rope_freqs = DIT_HEAD_DIM / 6;
     m->rope_axis_dim = 2 * m->n_rope_freqs;
 
     safetensors_close(st);
-    r->stage2_loaded = 1;
     { size_t fr = 0, to = 0; cuMemGetInfo(&fr, &to);
       int on_gpu = r->max_gpu_layers > 0 ? (r->max_gpu_layers < m->n_blocks ? r->max_gpu_layers : m->n_blocks) : m->n_blocks;
-      fprintf(stderr, "T2: Stage 2 loaded (%d blocks, %d on GPU, in_ch=%d, weights=%s, GPU %.0f/%.0f MB free)\n",
-              m->n_blocks, on_gpu, m->in_channels, use_f16 ? "F16" : "F32",
+      fprintf(stderr, "T2: %s loaded (%d blocks, %d on GPU, in_ch=%d, weights=%s, GPU %.0f/%.0f MB free)\n",
+              label, m->n_blocks, on_gpu, m->in_channels, use_f16 ? "F16" : "F32",
               fr/1048576.0, to/1048576.0); }
     return 0;
 }
 
 int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path) {
-    int use_f16 = (r->ops.sm_version >= 70);
-    if (use_f16) {
-        /* F16 weights: use MMA tensor core GEMM */
-        r->ops.use_f32_gemm = 0;
-        r->ops.use_mma_gemm = 1;
-    } else {
-        /* Fallback: F32 weights, F32 GEMM */
-        r->ops.use_f32_gemm = 1;
-        r->ops.use_mma_gemm = 0;
-    }
-    return load_stage2_weights(r, stage2_path);
+    int ret = load_dit_model_weights(r, stage2_path, &r->stage2, r->stage2_blocks,
+                                      r->stage2_blocks_cpu, "Stage 2");
+    if (ret == 0) r->stage2_loaded = 1;
+    return ret;
+}
+
+int cuda_trellis2_load_stage3(cuda_trellis2_runner *r, const char *stage3_path) {
+    int ret = load_dit_model_weights(r, stage3_path, &r->stage3, r->stage3_blocks,
+                                      r->stage3_blocks_cpu, "Stage 3");
+    if (ret == 0) r->stage3_loaded = 1;
+    return ret;
 }
 
 /* ---- Shape decoder weight loading ---- */
@@ -1246,6 +1255,7 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                                       CUdeviceptr d_output,
                                       int N,                   /* token count */
                                       int in_ch,               /* input channels */
+                                      int out_ch,              /* output channels (may differ from in_ch) */
                                       int n_blocks,
                                       CUdeviceptr t_fc1_w, CUdeviceptr t_fc1_b,
                                       CUdeviceptr t_fc2_w, CUdeviceptr t_fc2_b,
@@ -1517,7 +1527,7 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                        256, 1, 1, 512 * sizeof(float), stream, ln_args, NULL);
     }
     t2_op_gemm(ops, stream, d_output, out_w, d_hidden, out_b,
-               in_ch, D, N);
+               out_ch, D, N);
 }
 
 /* Stage 1 wrapper — uses F16 MMA if weights are F16, else F32 */
@@ -1536,7 +1546,7 @@ static void run_dit_forward(cuda_trellis2_runner *r,
     }
 
     run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
-        DIT_N_TOKENS, DIT_IN_CH, DIT_DEPTH,
+        DIT_N_TOKENS, DIT_IN_CH, DIT_IN_CH, DIT_DEPTH,
         r->dit_t_fc1_w, r->dit_t_fc1_b, r->dit_t_fc2_w, r->dit_t_fc2_b,
         r->dit_mod_w, r->dit_mod_b,
         r->dit_x_emb_w, r->dit_x_emb_b,
@@ -1550,11 +1560,13 @@ static void run_dit_forward(cuda_trellis2_runner *r,
 }
 
 /* Stage 2 wrapper — uses F16 MMA GEMM if available (weights stored as F16) */
-static void run_stage2_forward(cuda_trellis2_runner *r,
-                                CUdeviceptr d_x, float timestep,
-                                CUdeviceptr d_cond, CUdeviceptr d_output,
-                                int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin) {
-    /* Save GEMM mode and set Stage 2 mode (F16 MMA or F32 fallback) */
+/* Generic sparse DiT forward (used for Stage 2 and Stage 3) */
+static void run_sparse_dit_forward(cuda_trellis2_runner *r,
+                                     dit_model_gpu *m, dit_block_cpu *blocks_cpu,
+                                     CUdeviceptr d_x, float timestep,
+                                     CUdeviceptr d_cond, CUdeviceptr d_output,
+                                     int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin) {
+    /* Save GEMM mode and set F16 MMA if available */
     int saved_f32 = r->ops.use_f32_gemm;
     int saved_mma = r->ops.use_mma_gemm;
     if (r->ops.sm_version >= 70) {
@@ -1565,14 +1577,13 @@ static void run_stage2_forward(cuda_trellis2_runner *r,
         r->ops.use_mma_gemm = 0;
     }
 
-    dit_model_gpu *m = &r->stage2;
     run_dit_forward_generic(r, d_x, timestep, d_cond, d_output,
-        N, m->in_channels, m->n_blocks,
+        N, m->in_channels, m->out_channels, m->n_blocks,
         m->t_fc1_w, m->t_fc1_b, m->t_fc2_w, m->t_fc2_b,
         m->mod_w, m->mod_b,
         m->x_emb_w, m->x_emb_b,
         m->out_w, m->out_b,
-        m->blocks, r->stage2_blocks_cpu,
+        m->blocks, blocks_cpu,
         rope_cos, rope_sin,
         m->n_rope_freqs, m->rope_axis_dim);
 
@@ -1971,10 +1982,68 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
     cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
 
     /* Run Stage 2 DiT forward */
-    run_stage2_forward(r, d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin);
+    run_sparse_dit_forward(r, m, r->stage2_blocks_cpu,
+                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin);
 
     cuStreamSynchronize(s);
     cuMemcpyDtoH(output, d_out, (size_t)N * in_ch * sizeof(float));
+
+    cuMemFree(d_x); cuMemFree(d_cond); cuMemFree(d_out);
+    cuMemFree(d_rope_cos); cuMemFree(d_rope_sin);
+    return 0;
+}
+
+int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
+                                  const float *x_t, float timestep,
+                                  const float *cond_features,
+                                  const int32_t *coords, int N,
+                                  float *output) {
+    if (!r->stage3_loaded) {
+        fprintf(stderr, "T2: Stage 3 not loaded\n"); return -1;
+    }
+    CUstream s = r->stream;
+    dit_model_gpu *m = &r->stage3;
+    int in_ch = m->in_channels;  /* 64 (noise_32 + shape_slat_32) */
+    int ctx_len = DINO_SEQ_LEN;
+
+    /* Compute 3D RoPE tables from sparse coords (same as Stage 2) */
+    int n_freqs = m->n_rope_freqs;
+    float rope_theta = 10000.0f;
+    float *freqs = (float *)malloc((size_t)n_freqs * sizeof(float));
+    for (int j = 0; j < n_freqs; j++)
+        freqs[j] = 1.0f / powf(rope_theta, (float)j / (float)n_freqs);
+
+    size_t table_sz = (size_t)N * 3 * n_freqs * sizeof(float);
+    float *cos_tab = (float *)malloc(table_sz);
+    float *sin_tab = (float *)malloc(table_sz);
+    for (int i = 0; i < N; i++) {
+        float cz = (float)coords[i * 4 + 1];
+        float cy = (float)coords[i * 4 + 2];
+        float cx = (float)coords[i * 4 + 3];
+        float c[3] = {cz, cy, cx};
+        for (int axis = 0; axis < 3; axis++)
+            for (int j = 0; j < n_freqs; j++) {
+                float theta = c[axis] * freqs[j];
+                cos_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(theta);
+                sin_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(theta);
+            }
+    }
+    CUdeviceptr d_rope_cos = cu_upload_raw(cos_tab, table_sz);
+    CUdeviceptr d_rope_sin = cu_upload_raw(sin_tab, table_sz);
+    free(freqs); free(cos_tab); free(sin_tab);
+
+    /* Upload input [N, 64] and conditioning */
+    CUdeviceptr d_x = cu_upload_raw(x_t, (size_t)N * in_ch * sizeof(float));
+    CUdeviceptr d_cond = cu_upload_raw(cond_features, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+    int out_ch = m->out_channels;  /* 32 for Stage 3 */
+    CUdeviceptr d_out;
+    cuMemAlloc(&d_out, (size_t)N * out_ch * sizeof(float));
+
+    run_sparse_dit_forward(r, m, r->stage3_blocks_cpu,
+                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin);
+
+    cuStreamSynchronize(s);
+    cuMemcpyDtoH(output, d_out, (size_t)N * out_ch * sizeof(float));
 
     cuMemFree(d_x); cuMemFree(d_cond); cuMemFree(d_out);
     cuMemFree(d_rope_cos); cuMemFree(d_rope_sin);
