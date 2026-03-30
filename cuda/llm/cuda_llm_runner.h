@@ -59,6 +59,10 @@ void cuda_llm_set_debug(cuda_llm_runner *r, int debug_layers);
 /* Set max layers to process (0 = all). For debugging: run only first N layers. */
 void cuda_llm_set_max_layers(cuda_llm_runner *r, int max_layers);
 
+/* Inject Q/K/V biases from a safetensors file (for models like Qwen2.5-VL
+ * where GGUF doesn't include biases). Returns number of biases loaded. */
+int cuda_llm_inject_biases(cuda_llm_runner *r, const char *safetensors_path);
+
 /* Query model dimensions (valid after load_weights). */
 int cuda_llm_n_embd(const cuda_llm_runner *r);
 int cuda_llm_n_layers(const cuda_llm_runner *r);

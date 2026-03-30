@@ -26,11 +26,12 @@ extern "C" {
 #endif
 
 typedef struct {
-    void *model;     /* transformer_model* */
+    void *model;     /* transformer_model* (CPU) or cuda_llm_runner* (GPU) */
     void *vocab;     /* bpe_vocab* */
     void *gguf;      /* gguf_context* (kept for mmap lifetime) */
     int   n_embd;    /* 3584 for Qwen2.5-VL-7B */
     int   n_vocab;
+    int   use_gpu;   /* 1 = model is cuda_llm_runner*, 0 = transformer_model* */
 } qimg_text_enc;
 
 qimg_text_enc *qimg_text_enc_load(const char *gguf_path);
@@ -39,6 +40,11 @@ qimg_text_enc *qimg_text_enc_load_gguf_with_biases(const char *gguf_path,
                                                      const char *bias_st_path);
 qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
                                                const char *tokenizer_gguf_path);
+/* Load text encoder on GPU via CUDA LLM runner (much faster than CPU).
+ * Requires cuda_llm_runner.h. bias_st_path provides Q/K/V biases. */
+qimg_text_enc *qimg_text_enc_load_gpu(const char *gguf_path,
+                                       const char *bias_st_path,
+                                       int gpu_device);
 void           qimg_text_enc_free(qimg_text_enc *enc);
 
 /* Encode text prompt to hidden states.
@@ -369,7 +375,13 @@ qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
 
 void qimg_text_enc_free(qimg_text_enc *enc) {
     if (!enc) return;
-    if (enc->model) transformer_free((transformer_model *)enc->model);
+#ifdef CUDA_LLM_RUNNER_H
+    if (enc->use_gpu && enc->model) {
+        cuda_llm_free((cuda_llm_runner *)enc->model);
+        enc->model = NULL;
+    }
+#endif
+    if (!enc->use_gpu && enc->model) transformer_free((transformer_model *)enc->model);
     if (enc->vocab) bpe_vocab_free((bpe_vocab *)enc->vocab);
     if (enc->gguf) gguf_close((gguf_context *)enc->gguf);
     free(enc);
@@ -377,7 +389,6 @@ void qimg_text_enc_free(qimg_text_enc *enc) {
 
 float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
                             int *out_n_tokens) {
-    transformer_model *model = (transformer_model *)enc->model;
     bpe_vocab *vocab = (bpe_vocab *)enc->vocab;
     int n_embd = enc->n_embd;
 
@@ -440,22 +451,38 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
     /* Run each token through transformer and collect hidden states */
     float *hidden_states = (float *)malloc((size_t)n_tokens * n_embd * sizeof(float));
 
-    for (int i = 0; i < n_tokens; i++) {
-        /* Forward pass: returns hidden state after final RMSNorm, before lm_head */
-        float *h = transformer_forward(model, tokens[i], i);
-        if (!h) {
-            fprintf(stderr, "qimg_text_enc: forward failed at token %d\n", i);
-            free(tokens);
-            free(hidden_states);
-            *out_n_tokens = 0;
-            return NULL;
+#ifdef CUDA_LLM_RUNNER_H
+    if (enc->use_gpu) {
+        cuda_llm_runner *gpu = (cuda_llm_runner *)enc->model;
+        for (int i = 0; i < n_tokens; i++) {
+            float *h = cuda_llm_forward(gpu, tokens[i], i);
+            if (!h) {
+                fprintf(stderr, "qimg_text_enc: GPU forward failed at token %d\n", i);
+                free(tokens); free(hidden_states);
+                *out_n_tokens = 0; return NULL;
+            }
+            memcpy(hidden_states + (size_t)i * n_embd, h, (size_t)n_embd * sizeof(float));
+            if (i == 0 || (i + 1) % 10 == 0 || i == n_tokens - 1)
+                fprintf(stderr, "\r  qimg_text_enc: token %d/%d (GPU)", i + 1, n_tokens);
         }
-        memcpy(hidden_states + (size_t)i * n_embd, h, (size_t)n_embd * sizeof(float));
-
-        if (i == 0 || (i + 1) % 10 == 0 || i == n_tokens - 1)
-            fprintf(stderr, "\r  qimg_text_enc: token %d/%d", i + 1, n_tokens);
+        fprintf(stderr, "\n");
+    } else
+#endif
+    {
+        transformer_model *model = (transformer_model *)enc->model;
+        for (int i = 0; i < n_tokens; i++) {
+            float *h = transformer_forward(model, tokens[i], i);
+            if (!h) {
+                fprintf(stderr, "qimg_text_enc: forward failed at token %d\n", i);
+                free(tokens); free(hidden_states);
+                *out_n_tokens = 0; return NULL;
+            }
+            memcpy(hidden_states + (size_t)i * n_embd, h, (size_t)n_embd * sizeof(float));
+            if (i == 0 || (i + 1) % 10 == 0 || i == n_tokens - 1)
+                fprintf(stderr, "\r  qimg_text_enc: token %d/%d", i + 1, n_tokens);
+        }
+        fprintf(stderr, "\n");
     }
-    fprintf(stderr, "\n");
 
     /* Strip template prefix (matching ComfyUI's encode_token_weights).
      * ComfyUI finds the 2nd <|im_start|> (151644), then if followed by
@@ -492,6 +519,57 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
     *out_n_tokens = out_count;
     return out_hidden;
 }
+
+/* ---- GPU text encoder (requires CUDA LLM runner) ---- */
+#ifdef CUDA_LLM_RUNNER_H
+
+qimg_text_enc *qimg_text_enc_load_gpu(const char *gguf_path,
+                                       const char *bias_st_path,
+                                       int gpu_device) {
+    fprintf(stderr, "qimg_text_enc: loading GPU encoder from %s\n", gguf_path);
+
+    /* Load tokenizer from GGUF */
+    gguf_context *gguf = gguf_open(gguf_path, 1);
+    if (!gguf) { fprintf(stderr, "qimg_text_enc: failed to open GGUF\n"); return NULL; }
+    bpe_vocab *vocab = bpe_vocab_load(gguf);
+    if (!vocab) { gguf_close(gguf); return NULL; }
+
+    /* Initialize CUDA LLM runner */
+    cuda_llm_runner *gpu = cuda_llm_init(gpu_device, 1);
+    if (!gpu) {
+        fprintf(stderr, "qimg_text_enc: CUDA init failed\n");
+        bpe_vocab_free(vocab); gguf_close(gguf);
+        return NULL;
+    }
+
+    /* Load weights to GPU */
+    if (cuda_llm_load_weights(gpu, gguf, 2048) != 0) {
+        fprintf(stderr, "qimg_text_enc: GPU weight loading failed\n");
+        cuda_llm_free(gpu); bpe_vocab_free(vocab); gguf_close(gguf);
+        return NULL;
+    }
+
+    /* Inject Q/K/V biases from safetensors */
+    if (bias_st_path) {
+        int nb = cuda_llm_inject_biases(gpu, bias_st_path);
+        if (nb == 0)
+            fprintf(stderr, "qimg_text_enc: WARNING: no biases injected (image quality may suffer)\n");
+    }
+
+    qimg_text_enc *enc = (qimg_text_enc *)calloc(1, sizeof(qimg_text_enc));
+    enc->model = gpu;
+    enc->vocab = vocab;
+    enc->gguf = gguf;
+    enc->n_embd = cuda_llm_n_embd(gpu);
+    enc->n_vocab = cuda_llm_n_vocab(gpu);
+    enc->use_gpu = 1;
+
+    fprintf(stderr, "qimg_text_enc: GPU encoder ready (n_embd=%d, n_layers=%d)\n",
+            enc->n_embd, cuda_llm_n_layers(gpu));
+    return enc;
+}
+
+#endif /* CUDA_LLM_RUNNER_H */
 
 #endif /* QIMG_TEXT_ENCODER_IMPLEMENTATION */
 #endif /* QIMG_TEXT_ENCODER_H */
