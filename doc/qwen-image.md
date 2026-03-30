@@ -10,20 +10,22 @@ Text Prompt
     ▼
 ┌─────────────────┐
 │  Text Encoder    │  Qwen2.5-VL-7B (28 layers, GQA)
-│  [CPU]           │  → hidden states [N_txt, 3584]
+│  [CUDA or CPU]   │  GGUF Q4_K weights + injected biases
+│                  │  → hidden states [N_txt, 3584]
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
 │  MMDiT           │  60-layer dual-stream DiT
-│  [CUDA]          │  × N_steps (Euler flow matching)
+│  [CUDA]          │  FP8 E4M3 weights, 128×128 tiled GEMM
+│                  │  × N_steps (Euler flow matching)
 │                  │  latent [16, H/8, W/8]
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
 │  VAE Decoder     │  3D causal VAE (BF16 weights)
-│  [CPU or CUDA]   │  → RGB [3, H, W]
+│  [CUDA + CPU]    │  → RGB [3, H, W]
 └────────┬────────┘
          │
          ▼
@@ -153,7 +155,7 @@ Scaled FP8 (text encoder): `actual_weight = fp8_to_f32(byte) × scale_per_tensor
 | `qwen_image_dit.h` | 60-layer MMDiT: patchify, joint attention, adaLN, RoPE, SIMD dot product |
 | `qwen_image_vae.h` | 3D causal VAE decoder: RMS norm, zero-padded conv2d, resblocks, upsample |
 | `qwen_image_scheduler.h` | FlowMatch scheduler: dynamic shift + ComfyUI-compatible mode |
-| `qwen_image_text_encoder.h` | Text encoder wrapper: GGUF + scaled-FP8 safetensors loaders |
+| `qwen_image_text_encoder.h` | Text encoder: GPU (CUDA LLM runner) or CPU (transformer.h), GGUF + FP8 safetensors |
 | `safetensors.h` | SafeTensors file parser (mmap) |
 | `gguf_loader.h` | GGUF v3 file loader |
 | `transformer.h` | Transformer inference engine (Qwen2.5-VL architecture) |
@@ -174,6 +176,13 @@ All are single-header libraries (define `*_IMPLEMENTATION` before include).
 | `cuda_qimg_runner.h` | GPU runner: NVRTC kernel compilation, weight management, DiT/VAE forward |
 | `test_cuda_qimg.c` | CUDA test harness: init, load, dit step, full generation |
 | `test_fp8_gemm.c` | FP8 GEMM correctness test (all sizes PASS, corr=1.0) |
+
+### CUDA LLM Runner (`cuda/llm/`)
+
+| File | Description |
+|---|---|
+| `cuda_llm_runner.{h,c}` | GPU LLM inference: Qwen2/2.5-VL/3/3.5, GGUF weights, Q/K/V biases |
+| `test_cuda_llm.c` | LLM test: CPU vs GPU hidden state comparison |
 
 ### PyTorch Reference (`ref/qwen_image/`)
 
@@ -264,14 +273,26 @@ python verify_pipeline.py --cuda-dir ../../cuda/qimg/ --ref-dir output/
 | **Scheduler sigmas** | exact match | Pre-shifted table + simple sampling |
 | **Full pipeline (10 steps)** | SSIM≈0.73 | FP8 precision compounds over 10 steps |
 
-### Performance (CUDA, RTX 5060 Ti 16GB, FP8 LUT GEMM)
+### Performance (CUDA, RTX 5060 Ti 16GB)
 
-| Resolution | Latent | Tokens | Time/step (CFG) | Time/step (no-CFG) | VAE decode |
-|---|---|---|---|---|---|
-| 256×256 | 32×32 | 256 | 6.6s | 3.5s | 1.2s |
-| 512×512 | 64×64 | 1024 | 20.6s | ~10s | 14.3s |
+**End-to-end pipeline (256×256, 10 steps, CFG):**
 
-GPU memory: 41/60 DiT blocks preloaded (FP8), 2.0 GB free for activations.
+| Stage | Time | Notes |
+|---|---|---|
+| Text encoder (GPU) | 12.8s | GGUF Q4_K via CUDA LLM runner (CPU fallback: ~710s) |
+| DiT load | 1.7s | 41/60 blocks preloaded to VRAM |
+| DiT denoising (10 steps) | 36.7s | 3.67s/step, 128×128 tiled GEMM |
+| VAE decode | 1.2s | GPU conv2d + CPU middle attention |
+| **Total** | **52.4s** | **14.3× faster than initial 748s** |
+
+**DiT per-step performance:**
+
+| Resolution | Latent | Tokens | Time/step (CFG) | Time/step (no-CFG) |
+|---|---|---|---|---|
+| 256×256 | 32×32 | 256 | 3.67s | ~1.8s |
+| 512×512 | 64×64 | 1024 | ~12s | ~6s |
+
+**GPU memory strategy:** Text encoder (4.1 GB) runs first, then releases VRAM. DiT weights (13.3 GB) loaded after. Both share the primary CUDA context via `cuDevicePrimaryCtxRetain`.
 
 ### Critical Bugs Fixed
 
@@ -291,18 +312,30 @@ GPU memory: 41/60 DiT blocks preloaded (FP8), 2.0 GB free for activations.
 | **Text enc: missing Q/K/V biases** | Garbage hidden states, random images | Add `attn_q_bias/k_bias/v_bias` to transformer.h |
 | **Text enc: no template stripping** | 46 tokens instead of 12 | Strip chat template prefix (match ComfyUI encode_token_weights) |
 | **Text enc: wrong cached .npy** | All prompts generate apple | Skip cached .npy when `--prompt` specified |
+| **CUDA LLM: IQ4_XS not handled** | NaN from GPU encoder (CUDA error 700) | Add IQ4_XS/IQ4_NL to K-quant upload path |
+| **CUDA LLM: Q4_K embed as F16** | NaN embedding → NaN all layers | Dequant Q3_K/Q4_K/Q5_K/Q6_K/IQ4 embeds to F16 at load |
+
+### Optimization History
+
+| Change | Pipeline Time | Speedup |
+|---|---|---|
+| Baseline (16×16 GEMM, CPU text encoder) | 748s | 1× |
+| 128×128 tiled GEMM with register blocking | 714s | 1.05× |
+| Multi-threaded CPU text encoder (16 threads) | 710s | 1.05× |
+| GGUF Q4_K encoder + injected biases | 710s | 1.05× |
+| **GPU text encoder via CUDA LLM runner** | **52s** | **14.3×** |
 
 ## TODO / FIXME
 
 ### Performance
 
-- [ ] **GEMM optimization**: FP8 LUT GEMM achieves ~7% GPU utilization. The 16×16 tiled approach with constant memory LUT is bottlenecked by syncthreads overhead. Consider:
-  - Fix the MMA m16n8k16 output fragment mapping for Blackwell (sm_120) — would enable tensor core GEMM
-  - Wider tiles with register blocking
-  - Warp-cooperative loading patterns
+- [x] **GEMM optimization**: 128×128 tiled GEMM with 8×8 register blocking + fused BF16 truncation. 6.67s → 3.67s/step (1.82×).
+- [x] **GPU text encoder**: CUDA LLM runner with GGUF Q4_K weights + injected Q/K/V biases. 710s → 12.8s (56×).
 - [ ] **Attention kernel**: Single-block-per-head flash attention works but doesn't scale well to 1024+ tokens. Implement multi-block flash attention or use cuDNN.
 - [ ] **VAE on GPU**: Conv2d kernel is naive (one thread per output element). Large convolutions (384 channels × 256×256) would benefit from im2col + GEMM or Winograd.
 - [ ] **Block streaming**: Only 41/60 blocks preloaded in 16GB VRAM. On-demand loading adds ~0.5s/block. Pipeline: overlap block loading with computation.
+- [ ] **AdaLN + GEMM fusion**: 4 standalone adaln kernels per block → fuse into GEMM input load. ~5-10% DiT speedup.
+- [ ] **CFG batching**: Process cond/uncond in single DiT pass (batch_size=2). ~30% DiT speedup.
 
 ### Quality
 
@@ -318,11 +351,11 @@ GPU memory: 41/60 DiT blocks preloaded (FP8), 2.0 GB free for activations.
 - [ ] **Video generation (T>1)**: VAE temporal convolutions (`time_conv`) not implemented. Only single-frame (T=1) supported.
 - [ ] **ControlNet / Reference latents**: `timestep_zero_index` path in `_apply_gate` not implemented.
 - [ ] **Image-to-image**: No img2img / inpainting support.
-- [ ] **Quantized text encoder on GPU**: Currently CPU-only. Could move to GPU for faster encoding.
+- [x] **Quantized text encoder on GPU**: CUDA LLM runner with GGUF Q4_K weights (12.8s vs 710s CPU).
 - [ ] **Multiple resolutions in one session**: DiT weight preloading is resolution-independent, but activation buffers are allocated per-call.
 
 ### Code Quality
 
 - [ ] **VAE weight cleanup**: `qimg_vae_free()` doesn't free all weight buffers (memory leak on reload).
-- [ ] **Remove debug .npy saves**: verbose=3 saves per-block .npy files (useful for debugging, but should be optional build flag).
+- [x] **Debug output gated by verbose levels**: 0=silent, 1=progress, 2=stats, 3=dump .npy.
 - [ ] **Error handling**: Some CUDA allocation failures are silently ignored (especially in on-demand block loading).
