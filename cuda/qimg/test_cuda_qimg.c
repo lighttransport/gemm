@@ -163,9 +163,9 @@ int main(int argc, char **argv) {
 
         FILE *fp = fopen(lat_npy, "rb");
         if (!fp) { fprintf(stderr, "Cannot open %s\n", lat_npy); return 1; }
-        uint8_t hdr[10]; fread(hdr,1,10,fp);
+        uint8_t hdr[10]; if(fread(hdr,1,10,fp)!=10){fclose(fp);return 1;}
         int hl = (int)hdr[8] | ((int)hdr[9]<<8);
-        char hbuf[512]; fseek(fp,10,SEEK_SET); fread(hbuf,1,(size_t)hl,fp); hbuf[hl]=0;
+        char hbuf[512]; fseek(fp,10,SEEK_SET); if(fread(hbuf,1,(size_t)hl,fp)!=(size_t)hl){fclose(fp);return 1;} hbuf[hl]=0;
         fprintf(stderr, "Latent header: %s\n", hbuf);
 
         /* Parse shape — support both (1,16,H,W) and (1,16,1,H,W) */
@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
         size_t lat_n = (size_t)lc * lh * lw;
         float *latent_raw = (float *)malloc(lat_n * sizeof(float));
         /* For 5D [1,16,1,H,W], read all and reshape to [16,H,W] */
-        fread(latent_raw, sizeof(float), lat_n, fp);
+        if(fread(latent_raw, sizeof(float), lat_n, fp)!=lat_n){fclose(fp);free(latent_raw);return 1;}
         fclose(fp);
 
         cuda_qimg_load_vae(r, vae_path);
@@ -271,7 +271,8 @@ int main(int argc, char **argv) {
                         char *sp = strstr(hbuf, "shape");
                         if (sp) { sp = strchr(sp, '(');
                             if (sp) { sp++; /* skip batch dim */
-                                while(*sp && *sp!=',') sp++; if(*sp==',') sp++;
+                                while(*sp && *sp!=',') sp++;
+                                if(*sp==',') { sp++; }
                                 n_txt = atoi(sp);
                             }
                         }
@@ -279,7 +280,7 @@ int main(int argc, char **argv) {
                     if (n_txt > 0) {
                         fseek(fp, 10+hl, SEEK_SET);
                         txt_hidden = (float*)malloc((size_t)n_txt*txt_dim*sizeof(float));
-                        fread(txt_hidden, sizeof(float), (size_t)n_txt*txt_dim, fp);
+                        if(fread(txt_hidden, sizeof(float), (size_t)n_txt*txt_dim, fp)!=(size_t)n_txt*txt_dim) { free(txt_hidden); txt_hidden=NULL; n_txt=0; }
                         fprintf(stderr, "  Loaded ComfyUI pos hidden [%d, %d]\n", n_txt, txt_dim);
                     }
                 }
@@ -287,21 +288,23 @@ int main(int argc, char **argv) {
                 /* Load negative */
                 fp = fopen(neg_path, "rb");
                 if (fp) {
-                    uint8_t hdr2[10]; fread(hdr2,1,10,fp);
-                    int hl2 = (int)hdr2[8] | ((int)hdr2[9]<<8);
-                    char hb2[512]; fseek(fp,10,SEEK_SET);
-                    if(fread(hb2,1,(size_t)hl2,fp)==(size_t)hl2) {
-                        hb2[hl2]=0;
-                        char *sp2 = strstr(hb2, "shape");
-                        if (sp2) { sp2 = strchr(sp2, '(');
-                            if (sp2) { sp2++; while(*sp2&&*sp2!=',') sp2++; if(*sp2==',') sp2++;
-                                n_txt_neg = atoi(sp2); } }
-                    }
-                    if (n_txt_neg > 0) {
-                        fseek(fp, 10+hl2, SEEK_SET);
-                        txt_neg_hidden = (float*)malloc((size_t)n_txt_neg*txt_dim*sizeof(float));
-                        fread(txt_neg_hidden, sizeof(float), (size_t)n_txt_neg*txt_dim, fp);
-                        fprintf(stderr, "  Loaded ComfyUI neg hidden [%d, %d]\n", n_txt_neg, txt_dim);
+                    uint8_t hdr2[10];
+                    if(fread(hdr2,1,10,fp)==10) {
+                        int hl2 = (int)hdr2[8] | ((int)hdr2[9]<<8);
+                        char hb2[512]; fseek(fp,10,SEEK_SET);
+                        if(fread(hb2,1,(size_t)hl2,fp)==(size_t)hl2) {
+                            hb2[hl2]=0;
+                            char *sp2 = strstr(hb2, "shape");
+                            if (sp2) { sp2 = strchr(sp2, '(');
+                                if (sp2) { sp2++; while(*sp2&&*sp2!=',') sp2++; if(*sp2==',') sp2++;
+                                    n_txt_neg = atoi(sp2); } }
+                        }
+                        if (n_txt_neg > 0) {
+                            fseek(fp, 10+hl2, SEEK_SET);
+                            txt_neg_hidden = (float*)malloc((size_t)n_txt_neg*txt_dim*sizeof(float));
+                            if(fread(txt_neg_hidden, sizeof(float), (size_t)n_txt_neg*txt_dim, fp)!=(size_t)n_txt_neg*txt_dim) { free(txt_neg_hidden); txt_neg_hidden=NULL; n_txt_neg=0; }
+                            else fprintf(stderr, "  Loaded ComfyUI neg hidden [%d, %d]\n", n_txt_neg, txt_dim);
+                        }
                     }
                     fclose(fp);
                 }

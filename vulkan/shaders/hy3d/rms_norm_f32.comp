@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: MIT
+// Per-head RMSNorm for DiT QK normalization.
+// One invocation per (token, head). Normalizes head_dim elements in-place.
+// data[tok*stride + h*head_dim : +head_dim]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DataBuffer { float data[]; };
+layout(std430, binding = 1) readonly buffer WeightBuffer { float w[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    uint stride;
+    float eps;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.n_tok * pc.n_heads;
+    if (idx >= total) return;
+
+    uint tok = idx / pc.n_heads;
+    uint h = idx % pc.n_heads;
+    uint base = tok * pc.stride + h * pc.head_dim;
+
+    // Compute sum of squares
+    float sum_sq = 0.0;
+    for (uint i = 0; i < pc.head_dim; i++) {
+        float v = data[base + i];
+        sum_sq += v * v;
+    }
+
+    float inv = inversesqrt(sum_sq / float(pc.head_dim) + pc.eps);
+
+    // Normalize in-place with weight
+    for (uint i = 0; i < pc.head_dim; i++) {
+        data[base + i] = data[base + i] * inv * w[i];
+    }
+}
