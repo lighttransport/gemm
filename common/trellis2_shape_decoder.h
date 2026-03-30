@@ -35,9 +35,10 @@ extern "C" {
 #endif
 
 typedef struct {
-    float *feats;       /* [N, 7]: vertex_xyz(3), intersected(3), quad_lerp(1) */
+    float *feats;       /* [N, C]: shape=[N,7] or texture=[N,6] */
     int32_t *coords;    /* [N, 4]: batch, z, y, x */
     int N;
+    int C;              /* output channels: 7 for shape, 6 for texture */
 } t2_shape_dec_result;
 
 typedef struct t2_shape_dec t2_shape_dec;
@@ -93,7 +94,8 @@ typedef struct {
 
 struct t2_shape_dec {
     float *from_latent_w, *from_latent_b;  /* [1024, 32] */
-    float *output_w, *output_b;             /* [7, 64] */
+    float *output_w, *output_b;             /* [out_channels, 64] */
+    int out_channels;                       /* 7 for shape, 6 for texture */
 
     /* Stages: each has N convnext blocks + 1 C2S block */
     int n_stages;
@@ -588,14 +590,16 @@ t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
         }
     }
 
-    /* output_layer: Linear(64 -> 7) */
-    float *out_feats = (float *)malloc((size_t)t->N * 7 * sizeof(float));
-    t2sd_linear(out_feats, t->feats, t->N, d->output_w, d->output_b, 7, t->C);
+    /* output_layer: Linear(64 -> out_channels) */
+    int out_ch = d->out_channels;
+    float *out_feats = (float *)malloc((size_t)t->N * out_ch * sizeof(float));
+    t2sd_linear_mt(out_feats, t->feats, t->N, d->output_w, d->output_b, out_ch, t->C, n_threads);
 
     result.feats = out_feats;
     result.coords = (int32_t *)malloc((size_t)t->N * 4 * sizeof(int32_t));
     memcpy(result.coords, t->coords, (size_t)t->N * 4 * sizeof(int32_t));
     result.N = t->N;
+    result.C = out_ch;
 
     sp3d_free(t);
 
@@ -652,6 +656,12 @@ t2_shape_dec *t2_shape_dec_load(const char *st_path) {
     d->from_latent_b = t2sd_load_f32(st, "from_latent.bias");
     d->output_w = t2sd_load_f32(st, "output_layer.weight");
     d->output_b = t2sd_load_f32(st, "output_layer.bias");
+    /* Detect output channels from weight shape */
+    {
+        int idx = safetensors_find(st, "output_layer.weight");
+        if (idx >= 0) d->out_channels = (int)safetensors_shape(st, idx)[0];
+        else d->out_channels = 7;
+    }
 
     /* Detect stages and blocks from weight names */
     int channels[] = {1024, 512, 256, 128, 64};
