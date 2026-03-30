@@ -3227,7 +3227,8 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
     r->verbose = verbose;
 
     CHECK_CU_NULL(cuDeviceGet(&r->device, device_id));
-    CHECK_CU_NULL(cuCtxCreate(&r->context, 0, r->device));
+    CHECK_CU_NULL(cuDevicePrimaryCtxRetain(&r->context, r->device));
+    CHECK_CU_NULL(cuCtxSetCurrent(r->context));
     CHECK_CU_NULL(cuStreamCreate(&r->stream, CU_STREAM_NON_BLOCKING));
 
     if (verbose >= 1) {
@@ -3245,7 +3246,6 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
     /* Compile kernels */
     if (compile_kernels(r) != 0) {
         cuStreamDestroy(r->stream);
-        cuCtxDestroy(r->context);
         free(r);
         return NULL;
     }
@@ -5534,9 +5534,8 @@ void cuda_llm_free(cuda_llm_runner *r) {
     /* Free host buffer */
     free(r->h_output);
 
-    /* Destroy CUDA objects */
+    /* Destroy CUDA objects (keep primary context alive for other runners) */
     if (r->stream) cuStreamDestroy(r->stream);
-    if (r->context) cuCtxDestroy(r->context);
 
     free(r);
 }

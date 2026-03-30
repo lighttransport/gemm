@@ -137,13 +137,10 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "init") == 0) { cuda_qimg_free(r); return 0; }
 
-    /* ---- Load DiT (deferred for gen mode to allow GPU text encoding first) ---- */
-    clock_t t0;
-    if (strcmp(mode, "gen") != 0) {
-        t0 = clock();
-        if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
-        fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
-    }
+    /* ---- Load DiT ---- */
+    clock_t t0 = clock();
+    if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
+    fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
     if (strcmp(mode, "load") == 0) {
         cuda_qimg_load_vae(r, vae_path);
@@ -304,9 +301,9 @@ int main(int argc, char **argv) {
         } /* if !custom_prompt */
 
         /* Try GPU text encoder (GGUF + biases, ~500× faster than CPU).
-         * NOTE: GPU text encoder creates its own CUDA context which conflicts
-         * with the DiT runner's context on 16GB cards. Disabled by default
-         * until shared-context support is added. Use --gpu-enc to enable. */
+         * NOTE: Currently causes CUDA error 700 (sticky) that prevents DiT from
+         * running afterward. Disabled until the LLM runner kernel bug is fixed.
+         * Use --gpu-enc to enable for text-encoding-only benchmarks. */
         int use_gpu_enc = 0;
         for (int i = 1; i < argc; i++)
             if (strcmp(argv[i], "--gpu-enc") == 0) use_gpu_enc = 1;
@@ -358,13 +355,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens (separate passes)\n", n_txt, n_txt_neg);
         fprintf(stderr, "  Text encoding: %.1fs\n", (double)(clock() - enc_t0) / CLOCKS_PER_SEC);
 
-        /* Restore qimg CUDA context after GPU text encoder may have used a different one */
-        cuCtxSetCurrent(r->ctx);
-
-        /* Load DiT weights (deferred from init to allow GPU text encoding to use VRAM first) */
-        t0 = clock();
-        if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
-        fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+        /* (DiT already loaded during init) */
 
         /* 2. DiT denoising loop (CUDA) */
         fprintf(stderr, "\n[2/3] DiT denoising (%d steps, %dx%d, %s)...\n",

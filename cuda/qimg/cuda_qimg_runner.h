@@ -1157,7 +1157,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     int sm = sm_major * 10 + sm_minor;
 
     CUcontext ctx;
-    CU_CHECK_NULL(cuCtxCreate(&ctx, 0, dev));
+    CU_CHECK_NULL(cuDevicePrimaryCtxRetain(&ctx, dev));
+    CU_CHECK_NULL(cuCtxSetCurrent(ctx));
     CUstream stream;
     CU_CHECK_NULL(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
 
@@ -1370,7 +1371,7 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->dit_st) safetensors_close((st_context *)r->dit_st);
     if (r->vae_st) safetensors_close((st_context *)r->vae_st);
     if (r->stream) cuStreamDestroy(r->stream);
-    if (r->ctx) cuCtxDestroy(r->ctx);
+    if (r->ctx) cuDevicePrimaryCtxRelease(r->device);
     free(r);
 }
 
