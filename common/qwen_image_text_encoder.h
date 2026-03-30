@@ -54,6 +54,7 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "transformer.h"
 #include "bpe_tokenizer.h"
 
@@ -82,7 +83,14 @@ qimg_text_enc *qimg_text_enc_load(const char *gguf_path) {
         return NULL;
     }
 
-    transformer_set_threads(model, 1);
+    { /* Use half of available cores for text encoder (matvec is memory-bound) */
+        int n_cpu = 4;
+#ifdef _SC_NPROCESSORS_ONLN
+        int hw = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (hw > 0) n_cpu = hw > 8 ? hw / 2 : hw;
+#endif
+        transformer_set_threads(model, n_cpu);
+    }
 
     qimg_text_enc *enc = (qimg_text_enc *)calloc(1, sizeof(qimg_text_enc));
     enc->model = model;
@@ -303,7 +311,13 @@ qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
 
     safetensors_close(st);
 
-    transformer_set_threads(m, 1);
+    { int n_cpu = 4;
+#ifdef _SC_NPROCESSORS_ONLN
+        int hw = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (hw > 0) n_cpu = hw > 8 ? hw / 2 : hw;
+#endif
+        transformer_set_threads(m, n_cpu);
+    }
 
     qimg_text_enc *enc = (qimg_text_enc *)calloc(1, sizeof(qimg_text_enc));
     enc->model = m;
