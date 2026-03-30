@@ -25,6 +25,8 @@
 #include "../../common/sparse3d.h"
 #define T2_SHAPE_DEC_IMPLEMENTATION
 #include "../../common/trellis2_shape_decoder.h"
+#define T2_PBR_IMPLEMENTATION
+#include "../../common/trellis2_pbr.h"
 #define T2_FDG_MESH_IMPLEMENTATION
 #include "../../common/trellis2_fdg_mesh.h"
 
@@ -581,12 +583,35 @@ int main(int argc, char **argv) {
 
         fprintf(stderr, "\n=== FDG Mesh (voxel_size=%.4f, max_coord=%d) ===\n", vs, max_coord);
         t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
-        free(coords3);
 
         if (fdg_mesh.n_tris > 0) {
-            t2_fdg_write_obj(obj_path, &fdg_mesh);
+            if (tex_slat) {
+                /* Run texture decoder on CPU to get PBR voxel field,
+                 * then sample vertex colors from the field.
+                 * For now, use the raw texture latent directly as a placeholder
+                 * (full texture decoder would produce 6-channel output).
+                 * TODO: Run actual texture decoder SC-VAE for 6-channel output.
+                 *
+                 * Compute voxel grid resolution from shape decoder output coords */
+                int max_c = 0;
+                for (int i = 0; i < result.N * 3; i++)
+                    if (coords3[i] > max_c) max_c = coords3[i];
+                int tex_res = max_c + 1;
+
+                fprintf(stderr, "\n=== PBR Vertex Color Sampling (tex_res=%d) ===\n", tex_res);
+
+                /* Since we don't have the full texture decoder on GPU yet,
+                 * we'll just use the shape decoder coords for now.
+                 * A full pipeline would run tex_dec on tex_slat + coords. */
+                fprintf(stderr, "Note: texture decoder not yet integrated, "
+                        "writing shape mesh without colors\n");
+                t2_fdg_write_obj(obj_path, &fdg_mesh);
+            } else {
+                t2_fdg_write_obj(obj_path, &fdg_mesh);
+            }
         }
 
+        free(coords3);
         t2_fdg_mesh_free(&fdg_mesh);
         t2_shape_dec_result_free(&result);
         sp3d_free(slat);
