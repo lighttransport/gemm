@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MIT
+// Pure F32 tiled GEMM. Y = X @ W^T + bias
+// Grid: (ceil(n_out/64), ceil(n_tok/16)), workgroup: (16, 16)
+// Each workgroup computes a 16x64 output tile using 16x16 shared memory tiles.
+// W is stored row-major: W[n_out, n_in], X is [n_tok, n_in], Y is [n_tok, n_out]
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer YBuffer { float Y[]; };
+layout(std430, binding = 1) readonly buffer WBuffer { float W[]; };
+layout(std430, binding = 2) readonly buffer XBuffer { float X[]; };
+layout(std430, binding = 3) readonly buffer BiasBuffer { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_out;
+    uint n_in;
+    uint n_tok;
+    uint has_bias;  // 1 if bias is valid, 0 otherwise
+} pc;
+
+shared float smA[16][16]; // X tile
+shared float smB[16][16]; // W tile
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint tok_base = gl_WorkGroupID.y * 16;
+    uint out_base = gl_WorkGroupID.x * 64;
+    uint row = tok_base + ty;
+
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+
+    for (uint k = 0; k < pc.n_in; k += 16) {
+        // Load X tile: smA[ty][tx] = X[(tok_base+ty), (k+tx)]
+        smA[ty][tx] = (tok_base + ty < pc.n_tok && k + tx < pc.n_in)
+                      ? X[(tok_base + ty) * pc.n_in + k + tx] : 0.0;
+        barrier();
+
+        // Sub-tile 0: columns [out_base .. out_base+15]
+        {
+            uint w_out = out_base + tx;
+            smB[ty][tx] = (w_out < pc.n_out && k + ty < pc.n_in)
+                          ? W[w_out * pc.n_in + k + ty] : 0.0;
+        }
+        barrier();
+        for (uint i = 0; i < 16; i++) acc0 += smA[ty][i] * smB[i][tx];
+        barrier();
+
+        // Sub-tile 1: columns [out_base+16 .. out_base+31]
+        {
+            uint w_out = out_base + 16 + tx;
+            smB[ty][tx] = (w_out < pc.n_out && k + ty < pc.n_in)
+                          ? W[w_out * pc.n_in + k + ty] : 0.0;
+        }
+        barrier();
+        for (uint i = 0; i < 16; i++) acc1 += smA[ty][i] * smB[i][tx];
+        barrier();
+
+        // Sub-tile 2: columns [out_base+32 .. out_base+47]
+        {
+            uint w_out = out_base + 32 + tx;
+            smB[ty][tx] = (w_out < pc.n_out && k + ty < pc.n_in)
+                          ? W[w_out * pc.n_in + k + ty] : 0.0;
+        }
+        barrier();
+        for (uint i = 0; i < 16; i++) acc2 += smA[ty][i] * smB[i][tx];
+        barrier();
+
+        // Sub-tile 3: columns [out_base+48 .. out_base+63]
+        {
+            uint w_out = out_base + 48 + tx;
+            smB[ty][tx] = (w_out < pc.n_out && k + ty < pc.n_in)
+                          ? W[w_out * pc.n_in + k + ty] : 0.0;
+        }
+        barrier();
+        for (uint i = 0; i < 16; i++) acc3 += smA[ty][i] * smB[i][tx];
+        barrier();
+    }
+
+    // Write results
+    if (row < pc.n_tok) {
+        float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+        if (pc.has_bias != 0) {
+            if (out_base + tx < pc.n_out) b0 = bias[out_base + tx];
+            if (out_base + 16 + tx < pc.n_out) b1 = bias[out_base + 16 + tx];
+            if (out_base + 32 + tx < pc.n_out) b2 = bias[out_base + 32 + tx];
+            if (out_base + 48 + tx < pc.n_out) b3 = bias[out_base + 48 + tx];
+        }
+        if (out_base + tx < pc.n_out)
+            Y[row * pc.n_out + out_base + tx] = acc0 + b0;
+        if (out_base + 16 + tx < pc.n_out)
+            Y[row * pc.n_out + out_base + 16 + tx] = acc1 + b1;
+        if (out_base + 32 + tx < pc.n_out)
+            Y[row * pc.n_out + out_base + 32 + tx] = acc2 + b2;
+        if (out_base + 48 + tx < pc.n_out)
+            Y[row * pc.n_out + out_base + 48 + tx] = acc3 + b3;
+    }
+}

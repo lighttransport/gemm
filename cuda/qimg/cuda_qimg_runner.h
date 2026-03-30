@@ -1968,7 +1968,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         float _mn=_t[0],_mx=_t[0],_s=0; int _nn=0; \
         for(int _i=0;_i<(count);_i++){ \
             if(_t[_i]!=_t[_i]){_nn++;}else{ \
-                if(_t[_i]<_mn)_mn=_t[_i]; if(_t[_i]>_mx)_mx=_t[_i]; _s+=_t[_i];}} \
+                if(_t[_i]<_mn){_mn=_t[_i];} if(_t[_i]>_mx){_mx=_t[_i];} _s+=_t[_i];}} \
         fprintf(stderr, "  [vae] %s: min=%.4f max=%.4f mean=%.4f nan=%d/%d\n", \
                 label, _mn, _mx, _s/((count)-_nn), _nn, (count)); \
         free(_t); } } while(0)
@@ -2065,7 +2065,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
       CUdeviceptr d_tmp = vae_resblock_gpu(r, d_x, n1, c1w, c1b, n2, c2w, c2b, scw, scb, c, c, h, w);
       cuMemFree(d_x); d_x = d_tmp;
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
-      if (scw) cuMemFree(scw); if (scb) cuMemFree(scb); }
+      if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); } }
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_0.npy", d_x, 3, _d); }
 
     /* Middle attention: GroupNorm → QKV → spatial self-attention → proj + residual */
@@ -2180,7 +2180,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
       CUdeviceptr d_tmp = vae_resblock_gpu(r, d_x, n1, c1w, c1b, n2, c2w, c2b, scw, scb, c, c, h, w);
       cuMemFree(d_x); d_x = d_tmp;
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
-      if (scw) cuMemFree(scw); if (scb) cuMemFree(scb); }
+      if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); } }
     fprintf(stderr, "  after middle: [%d, %d, %d]\n", c, h, w);
     VAE_DUMP("middle_out", d_x, c*h*w);
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_2.npy", d_x, 3, _d); }
@@ -2205,7 +2205,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             c = new_co;
             cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b);
             cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
-            if (scw) cuMemFree(scw); if (scb) cuMemFree(scb);
+            if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); }
         }
 
         /* Check for resample (spatial upsample) */
