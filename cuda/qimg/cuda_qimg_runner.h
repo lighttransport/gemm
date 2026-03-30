@@ -1724,13 +1724,12 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         /* Free modulation (always per-step), block weights only if loaded on-demand */
         cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
         if (need_free) {
+            cuStreamSynchronize(s);  /* must sync before freeing on-demand weights */
             CUdeviceptr *ptrs = (CUdeviceptr *)&blk;
             int np = sizeof(qimg_block_gpu) / sizeof(CUdeviceptr);
             for (int pi = 0; pi < np; pi++)
                 if (ptrs[pi]) cuMemFree(ptrs[pi]);
         }
-
-        cuStreamSynchronize(s);
     }
     if (r->verbose) fprintf(stderr, "\n");
 
