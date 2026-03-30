@@ -8,6 +8,7 @@ layout(push_constant) uniform PushConstants {
     uint head_dim;
     uint stride;
     float freq_base;
+    uint base_offset;  // offset within each token's stride (0 for Q, dim for K)
 } pc;
 
 layout(std430, binding = 0) buffer VecBuf { float vec[]; };
@@ -30,7 +31,7 @@ void main() {
     float py = float(pos_y[t]);
     float px = float(pos_x[t]);
 
-    uint base = t * pc.stride + h * pc.head_dim;
+    uint base = t * pc.stride + pc.base_offset + h * pc.head_dim;
 
     float freq = 1.0 / pow(pc.freq_base, float(2u * j) / float(half_dim));
 

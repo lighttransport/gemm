@@ -92,6 +92,7 @@ set(DA3_SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/da3/sinusoidal_uv_posembed_f32.comp
     ${SHADER_SOURCE_DIR}/da3/relu_f32.comp
     ${SHADER_SOURCE_DIR}/da3/channel_layernorm_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/qk_layernorm_offset_f32.comp
 )
 
 # HY3D shaders (reused by DA3 for layerscale_add and qk_layernorm)
