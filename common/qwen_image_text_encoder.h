@@ -34,6 +34,9 @@ typedef struct {
 } qimg_text_enc;
 
 qimg_text_enc *qimg_text_enc_load(const char *gguf_path);
+/* Load GGUF model + inject Q/K/V biases from FP8 safetensors (for Qwen2.5-VL) */
+qimg_text_enc *qimg_text_enc_load_gguf_with_biases(const char *gguf_path,
+                                                     const char *bias_st_path);
 qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
                                                const char *tokenizer_gguf_path);
 void           qimg_text_enc_free(qimg_text_enc *enc);
@@ -171,6 +174,39 @@ static qtensor make_qt_f32(float *data, int rows, int cols) {
     t.dims[0] = (uint64_t)cols;
     if (rows > 1) t.dims[1] = (uint64_t)rows;
     return t;
+}
+
+/* Load GGUF model + inject Q/K/V biases from FP8 safetensors.
+ * GGUF has quantized weights (fast CPU inference) but no biases.
+ * The safetensors file has BF16 biases (~200KB total, loads in <0.1s). */
+qimg_text_enc *qimg_text_enc_load_gguf_with_biases(const char *gguf_path,
+                                                     const char *bias_st_path) {
+    qimg_text_enc *enc = qimg_text_enc_load(gguf_path);
+    if (!enc || !bias_st_path) return enc;
+
+    st_context *st = safetensors_open(bias_st_path);
+    if (!st) {
+        fprintf(stderr, "qimg_text_enc: no bias file, continuing without biases\n");
+        return enc;
+    }
+
+    transformer_model *m = (transformer_model *)enc->model;
+    int n_loaded = 0;
+    for (int l = 0; l < m->n_layers; l++) {
+        char wn[256]; int r, c;
+        snprintf(wn, sizeof(wn), "model.layers.%d.self_attn.q_proj.bias", l);
+        float *qb = st_dequant_scaled_fp8(st, wn, "", &r, &c);
+        if (qb) { m->layers[l].attn_q_bias = make_qt_f32(qb, 1, r*c); n_loaded++; }
+        snprintf(wn, sizeof(wn), "model.layers.%d.self_attn.k_proj.bias", l);
+        float *kb = st_dequant_scaled_fp8(st, wn, "", &r, &c);
+        if (kb) { m->layers[l].attn_k_bias = make_qt_f32(kb, 1, r*c); n_loaded++; }
+        snprintf(wn, sizeof(wn), "model.layers.%d.self_attn.v_proj.bias", l);
+        float *vb = st_dequant_scaled_fp8(st, wn, "", &r, &c);
+        if (vb) { m->layers[l].attn_v_bias = make_qt_f32(vb, 1, r*c); n_loaded++; }
+    }
+    safetensors_close(st);
+    fprintf(stderr, "qimg_text_enc: injected %d biases from %s\n", n_loaded, bias_st_path);
+    return enc;
 }
 
 qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,

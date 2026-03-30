@@ -201,6 +201,14 @@ static const char *qimg_kernel_src =
 "    if (i < n) x[i] += dt * v[i];\n"
 "}\n"
 
+/* CFG combine: out = v_uncond + cfg_scale * (v_cond - v_uncond) */
+"__global__ void cfg_combine_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ v_cond, const float *__restrict__ v_uncond,\n"
+"    float cfg_scale, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) out[i] = v_uncond[i] + cfg_scale * (v_cond[i] - v_uncond[i]);\n"
+"}\n"
+
 /* Conv2D for VAE: replicate or zero padding, handles any spatial size.
  * Grid: (ceil(co*oh*ow / 256)), Block: (256) */
 "__global__ void vae_conv2d_f32(float *__restrict__ out,\n"
@@ -767,6 +775,7 @@ struct cuda_qimg_runner {
     CUfunction patchify;
     CUfunction unpatchify;
     CUfunction euler_step;
+    CUfunction cfg_combine;
     CUfunction rope_2d;
     CUfunction rope_1d;
     CUfunction vae_conv2d;
@@ -1202,6 +1211,7 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(patchify, "patchify_f32");
     GET(unpatchify, "unpatchify_f32");
     GET(euler_step, "euler_step_f32");
+    GET(cfg_combine, "cfg_combine_f32");
     GET(rope_2d, "rope_2d_f32");
     GET(rope_1d, "rope_1d_f32");
     GET(vae_conv2d, "vae_conv2d_f32");

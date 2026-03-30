@@ -222,6 +222,7 @@ int main(int argc, char **argv) {
         int txt_dim = 3584;
 
         /* 1. Text encoder — try loading ComfyUI .npy first, fall back to GGUF */
+        clock_t enc_t0 = clock();
         fprintf(stderr, "\n[1/3] Text conditioning...\n");
         int n_txt = 0, n_txt_neg = 0;
         float *txt_hidden = NULL, *txt_neg_hidden = NULL;
@@ -298,13 +299,25 @@ int main(int argc, char **argv) {
             }
         } /* if !custom_prompt */
 
-        /* Try FP8 safetensors text encoder first, then GGUF fallback */
+        /* Try GGUF text encoder + biases from safetensors (fast quantized inference
+         * with correct attention biases from the FP8 file). */
+        if (!txt_hidden) {
+            const char *bias_st = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
+            qimg_text_enc *enc = qimg_text_enc_load_gguf_with_biases(enc_path, bias_st);
+            if (enc) {
+                txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
+                fprintf(stderr, "  Encoding negative prompt...\n");
+                txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
+                qimg_text_enc_free(enc);
+            }
+        }
+        /* FP8 safetensors fallback (dequants to F32 — 30GB, slow on CPU) */
         if (!txt_hidden) {
             const char *st_enc = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
             FILE *tf = fopen(st_enc, "rb");
             if (tf) {
                 fclose(tf);
-                fprintf(stderr, "  Loading FP8 scaled text encoder...\n");
+                fprintf(stderr, "  Loading FP8 scaled text encoder (slow fallback)...\n");
                 qimg_text_enc *enc = qimg_text_enc_load_safetensors(st_enc, enc_path);
                 if (enc) {
                     txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
@@ -312,16 +325,6 @@ int main(int argc, char **argv) {
                     txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
                     qimg_text_enc_free(enc);
                 }
-            }
-        }
-        /* GGUF fallback */
-        if (!txt_hidden) {
-            qimg_text_enc *enc = qimg_text_enc_load(enc_path);
-            if (enc) {
-                txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
-                fprintf(stderr, "  Encoding negative prompt...\n");
-                txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
-                qimg_text_enc_free(enc);
             }
         }
         if (!txt_hidden) {
@@ -333,6 +336,7 @@ int main(int argc, char **argv) {
          * to batch). Each pass uses its ORIGINAL token count.
          * Cond: 12 tokens, Uncond: 6 tokens — different attention patterns. */
         fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens (separate passes)\n", n_txt, n_txt_neg);
+        fprintf(stderr, "  Text encoding: %.1fs\n", (double)(clock() - enc_t0) / CLOCKS_PER_SEC);
 
         /* 2. DiT denoising loop (CUDA) */
         fprintf(stderr, "\n[2/3] DiT denoising (%d steps, %dx%d, %s)...\n",
