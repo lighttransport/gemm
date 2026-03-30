@@ -864,12 +864,20 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
             t_backbone - t_start, t_norm - t_backbone, n_threads);
 
     /* ─── Step 5: Final LayerNorm ─── */
+    /* TRELLIS.2 uses unparameterized LN (no weight/bias) for feature extraction,
+     * NOT the model's learned norm. Apply plain (x-mean)/std normalization. */
     float *output = (float *)malloc((size_t)nt * dim * sizeof(float));
-    if (m->norm_w.data) {
-        dinov3_layernorm_batch(output, hidden, &m->norm_w, &m->norm_b,
-                               nt, dim, m->ln_eps);
-    } else {
-        memcpy(output, hidden, (size_t)nt * dim * sizeof(float));
+    for (int t = 0; t < nt; t++) {
+        const float *xi = hidden + t * dim;
+        float *yi = output + t * dim;
+        float mean = 0.0f;
+        for (int i = 0; i < dim; i++) mean += xi[i];
+        mean /= dim;
+        float var = 0.0f;
+        for (int i = 0; i < dim; i++) { float d = xi[i] - mean; var += d * d; }
+        var /= dim;
+        float inv = 1.0f / sqrtf(var + m->ln_eps);
+        for (int i = 0; i < dim; i++) yi[i] = (xi[i] - mean) * inv;
     }
     free(hidden);
 

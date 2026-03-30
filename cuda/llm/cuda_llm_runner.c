@@ -4416,7 +4416,6 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         /* Download Q2_K embedding weights from GPU */
         int nb_per_row = n_embd / 256;
         int row_bytes = nb_per_row * 84;
-        size_t total_embd_bytes = (size_t)r->n_vocab * row_bytes;
         /* Only download the one row we need */
         unsigned char *row_data = (unsigned char *)malloc(row_bytes);
         cuMemcpyDtoH(row_data, r->d_token_embd + (size_t)token_id * row_bytes, row_bytes);

@@ -272,8 +272,8 @@ static void qimg_vae_conv2d_pad(float *out, const float *inp, const float *weigh
                     int iy = oy * stride + fy - pad_h;
                     int ix = ox * stride + fx - pad_w;
                     if (pad_replicate) {
-                        if (iy < 0) iy = 0; if (iy >= h) iy = h - 1;
-                        if (ix < 0) ix = 0; if (ix >= w) ix = w - 1;
+                        if (iy < 0) { iy = 0; } if (iy >= h) { iy = h - 1; }
+                        if (ix < 0) { ix = 0; } if (ix >= w) { ix = w - 1; }
                         valid[n_k] = 1;
                     } else {
                         valid[n_k] = (iy >= 0 && iy < h && ix >= 0 && ix < w);

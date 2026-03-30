@@ -34,6 +34,10 @@ typedef struct {
     int n_steps;         /* 12 Euler steps */
     float cfg_scale;     /* 7.5 */
     float rescale_t;     /* 5.0 */
+    float cfg_rescale;   /* 0.7 — std-ratio rescaling of CFG output */
+    float guidance_min;  /* 0.6 — lower bound of guidance interval */
+    float guidance_max;  /* 1.0 — upper bound of guidance interval */
+    float sigma_min;     /* 1e-5 */
 } t2_stage1;
 
 t2_stage1 *t2_stage1_load(const char *st_path);
@@ -113,6 +117,10 @@ t2_stage1 *t2_stage1_load(const char *st_path) {
     s->n_steps = 12;
     s->cfg_scale = 7.5f;
     s->rescale_t = 5.0f;
+    s->cfg_rescale = 0.7f;
+    s->guidance_min = 0.6f;
+    s->guidance_max = 1.0f;
+    s->sigma_min = 1e-5f;
     return s;
 }
 
@@ -172,21 +180,59 @@ float *t2_stage1_sample(t2_stage1 *s, const float *cond, int n_cond,
 
         double step_t0 = t2s1_time_ms();
 
-        /* Conditioned forward pass */
-        t2dit_forward(v_cond, x, t_cur, cond_kv, m, n_threads);
+        /* Check guidance interval: only apply CFG when t is in [guidance_min, guidance_max] */
+        int apply_cfg = (t_cur >= s->guidance_min && t_cur <= s->guidance_max
+                         && s->cfg_scale != 1.0f);
 
-        /* Unconditioned forward pass */
-        t2dit_forward(v_uncond, x, t_cur, uncond_kv, m, n_threads);
+        if (apply_cfg) {
+            /* Conditioned + unconditioned forward passes */
+            t2dit_forward(v_cond, x, t_cur, cond_kv, m, n_threads);
+            t2dit_forward(v_uncond, x, t_cur, uncond_kv, m, n_threads);
 
-        /* CFG: v = v_uncond + cfg_scale * (v_cond - v_uncond) */
-        for (int i = 0; i < n_elem; i++) {
-            float v = v_uncond[i] + s->cfg_scale * (v_cond[i] - v_uncond[i]);
-            x[i] += dt * v;
+            /* CFG: pred_v = cfg_scale * v_cond + (1 - cfg_scale) * v_uncond */
+            float *pred_v = v_cond; /* reuse buffer */
+            for (int i = 0; i < n_elem; i++)
+                pred_v[i] = s->cfg_scale * v_cond[i] + (1.0f - s->cfg_scale) * v_uncond[i];
+
+            /* CFG rescale: blend x0_cfg toward x0_uncond by matching std.
+             * x0_uncond = (1-sm)*x - t_coeff*v_uncond (reference)
+             * x0_cfg    = (1-sm)*x - t_coeff*pred_v   (CFG-boosted)
+             * scale = cfg_rescale*(std_uncond/std_cfg) + (1-cfg_rescale) */
+            if (s->cfg_rescale > 0.0f) {
+                float sm = s->sigma_min;
+                float t_coeff = sm + (1.0f - sm) * t_cur;
+                float sum_pos2 = 0, sum_cfg2 = 0;
+                for (int i = 0; i < n_elem; i++) {
+                    float x0_pos = (1.0f - sm) * x[i] - t_coeff * v_uncond[i];
+                    float x0_cfg = (1.0f - sm) * x[i] - t_coeff * pred_v[i];
+                    sum_pos2 += x0_pos * x0_pos;
+                    sum_cfg2 += x0_cfg * x0_cfg;
+                }
+                float std_pos = sqrtf(sum_pos2 / n_elem);
+                float std_cfg = sqrtf(sum_cfg2 / n_elem);
+                if (std_cfg > 1e-8f) {
+                    float scale = s->cfg_rescale * (std_pos / std_cfg) + (1.0f - s->cfg_rescale);
+                    for (int i = 0; i < n_elem; i++) {
+                        float x0_cfg = (1.0f - sm) * x[i] - t_coeff * pred_v[i];
+                        pred_v[i] = ((1.0f - sm) * x[i] - scale * x0_cfg) / t_coeff;
+                    }
+                }
+            }
+
+            /* Euler step: x_{t_prev} = x_t - (t_cur - t_next) * pred_v */
+            for (int i = 0; i < n_elem; i++)
+                x[i] -= (t_cur - t_next) * pred_v[i];
+        } else {
+            /* No CFG — only conditioned pass */
+            t2dit_forward(v_cond, x, t_cur, cond_kv, m, n_threads);
+            for (int i = 0; i < n_elem; i++)
+                x[i] -= (t_cur - t_next) * v_cond[i];
         }
 
         double step_t1 = t2s1_time_ms();
-        fprintf(stderr, "stage1: step %d/%d  t=%.4f->%.4f  dt=%.4f  %.1f ms\n",
-                step + 1, s->n_steps, t_start, t_end, dt, step_t1 - step_t0);
+        fprintf(stderr, "stage1: step %d/%d  t=%.4f->%.4f  %s  %.1f ms\n",
+                step + 1, s->n_steps, t_cur, t_next,
+                apply_cfg ? "CFG" : "noG", step_t1 - step_t0);
     }
 
     free(v_cond);

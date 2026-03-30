@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint Co;
+    uint Hi;
+    uint Wi;
+    uint Ho;
+    uint Wo;
+    uint kH;
+    uint kW;
+    uint stride_h;
+    uint stride_w;
+} pc;
+
+layout(std430, binding = 0) writeonly buffer DstBuf { float dst[]; };
+layout(std430, binding = 1) readonly buffer YBuf { float Y[]; };
+layout(std430, binding = 2) readonly buffer BiasBuf { float bias[]; };
+
+void main() {
+    uint idx = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint total = pc.Co * pc.Ho * pc.Wo;
+    if (idx >= total) return;
+
+    uint co = idx / (pc.Ho * pc.Wo);
+    uint rem = idx % (pc.Ho * pc.Wo);
+    uint oh = rem / pc.Wo;
+    uint ow = rem % pc.Wo;
+
+    uint kh = oh % pc.stride_h;
+    uint kw = ow % pc.stride_w;
+    uint ih = oh / pc.stride_h;
+    uint iw = ow / pc.stride_w;
+    uint group = kh * pc.kW + kw;
+    uint pos = ih * pc.Wi + iw;
+    uint n_groups = pc.kH * pc.kW;
+
+    float v = Y[pos * (n_groups * pc.Co) + group * pc.Co + co];
+    dst[idx] = v + bias[co];
+}

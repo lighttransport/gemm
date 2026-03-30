@@ -755,9 +755,7 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
         tf_qmatvec(v, mat_v, m->xb, n_kv, m->thread_tmp[0]);
         return;
     }
-    /* Distribute total_rows = n_q + 2*n_kv across threads.
-     * Each thread gets a proportional slice of Q rows and KV rows. */
-    int total = n_q + 2 * n_kv;
+    /* Distribute rows across threads: n_q Q rows and n_kv K+V rows each. */
     tf_matvec_fused3_task *tasks = (tf_matvec_fused3_task *)alloca(nt * sizeof(tf_matvec_fused3_task));
     int q_per = n_q / nt, q_extra = n_q % nt, q_off = 0;
     int kv_per = n_kv / nt, kv_extra = n_kv % nt, kv_off = 0;
@@ -1159,7 +1157,6 @@ static void *tf_attn_worker(void *arg) {
             _mm256_storeu_ps(out_h+48,o6); _mm256_storeu_ps(out_h+56,o7);
         } else {
             /* Generic AVX2 attention for any head_dim (with prefetch) */
-            __m256 vscale = _mm256_set1_ps(t->scale);
             for (int p = 0; p < seq_len; p++) {
                 const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
                 if (p + 2 < seq_len)
@@ -1588,10 +1585,11 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->conv_state = NULL;
     m->conv_state_pos = NULL;
     m->recurrent_state = NULL;
-    if (m->is_hybrid) {
-        m->conv_state = (float **)calloc(m->n_layers, sizeof(float *));
-        m->conv_state_pos = (int *)calloc(m->n_layers, sizeof(int));
-        m->recurrent_state = (float **)calloc(m->n_layers, sizeof(float *));
+    if (m->is_hybrid && m->n_layers > 0) {
+        size_t nl = (size_t)m->n_layers;
+        m->conv_state = (float **)calloc(nl, sizeof(float *));
+        m->conv_state_pos = (int *)calloc(nl, sizeof(int));
+        m->recurrent_state = (float **)calloc(nl, sizeof(float *));
         int n_ssm = 0;
         for (int l = 0; l < m->n_layers; l++) {
             if (!m->layers[l].is_ssm) continue;
@@ -2810,9 +2808,7 @@ static void tf_qmatvec_row_slice(transformer_model *m, float *dst, const qtensor
  * dst has n_rows elements (partial sums). */
 static void tf_qmatvec_col_slice(float *dst, const qtensor *mat, const float *x_local,
                                   int n_rows, int col_start, int col_end, float *tmp) {
-    int n_cols = mat->n_cols;
     int local_cols = col_end - col_start;
-    size_t row_bytes = tf_row_bytes(mat->type, n_cols);
     for (int i = 0; i < n_rows; i++) {
         /* Dequant full row to tmp, then dot with local slice */
         tf_dequant_row(mat, i, tmp);
@@ -3058,8 +3054,6 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
             gemm_q8_0_f32_tokmajor(Y_out, mat->data, X, n_rows, K, N, out_stride, X_stride);
             return;
         }
-        int nb = K / 32;
-        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
         pthread_t *threads = (pthread_t *)alloca(n_threads * sizeof(pthread_t));
         tf_gemm_q8_tm_task *tasks = (tf_gemm_q8_tm_task *)alloca(n_threads * sizeof(tf_gemm_q8_tm_task));
         int rows_per = n_rows / n_threads, extra = n_rows % n_threads, offset = 0;
@@ -3195,8 +3189,6 @@ static void tf_gemm_f16_mt_fused2(float *Y1, const qtensor *mat1,
 static inline __m256 fast_exp_avx2(__m256 x) {
     const __m256 log2e  = _mm256_set1_ps(1.442695040f);
     const __m256 c0     = _mm256_set1_ps(12582912.0f); /* 1.5 * 2^23 (magic bias) */
-    const __m256 c1     = _mm256_set1_ps(1065353216.0f); /* 127 * 2^23 */
-    const __m256 c2     = _mm256_set1_ps(8388608.0f);  /* 2^23 */
     /* Polynomial coefficients for fractional part */
     const __m256 p0     = _mm256_set1_ps(0.9999999f);
     const __m256 p1     = _mm256_set1_ps(0.6931472f);

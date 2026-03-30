@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: MIT
+// Mixed-precision GEMM: C[M,N] = A[M,K] * W[N,K]^T + bias[N]
+// A (input): F32, W (weights): F16, C (output): F32, bias: F32
+// W is stored as [N,K] row-major, so C[m,n] = sum_k A[m*K+k]*W[n*K+k] + bias[n]
+// Matches HIP's gemm_tiled_f16_f32 precision: F16 weights, F32 accumulation.
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer MatrixA { float A[]; };
+layout(std430, binding = 1) readonly buffer MatrixW { float16_t W[]; };
+layout(std430, binding = 2) writeonly buffer MatrixC { float C[]; };
+layout(std430, binding = 3) readonly buffer BiasBuffer { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y; // m (token)
+    uint col = gl_GlobalInvocationID.x; // n (output dim)
+
+    if (row >= pc.M || col >= pc.N) return;
+
+    float sum = 0.0;
+    for (uint k = 0; k < pc.K; k++) {
+        sum += A[row * pc.K + k] * float(W[col * pc.K + k]);
+    }
+
+    if (pc.has_bias != 0) {
+        sum += bias[col];
+    }
+
+    C[row * pc.N + col] = sum;
+}
