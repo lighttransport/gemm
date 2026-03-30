@@ -84,6 +84,20 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
                                   const int32_t *coords, int N,
                                   float *output);
 
+/* Load Stage 3 texture flow model weights */
+int cuda_trellis2_load_stage3(cuda_trellis2_runner *r, const char *stage3_path);
+
+/* Run Stage 3 texture DiT single forward step.
+ * x_t: [N, 64] = [noise_32, shape_slat_norm_32] concatenated
+ * coords: [N, 4] int32 — same sparse coords as Stage 2
+ * cond: [1029, 1024] DINOv3 features
+ * output: [N, 32] predicted velocity (texture channels only) */
+int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
+                                  const float *x_t, float timestep,
+                                  const float *cond_features,
+                                  const int32_t *coords, int N,
+                                  float *output);
+
 /* Load shape decoder (SC-VAE) weights */
 int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path);
 
