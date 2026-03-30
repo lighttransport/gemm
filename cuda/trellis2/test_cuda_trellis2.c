@@ -99,6 +99,12 @@ static float rng_randn(rng_state *r) {
 }
 static float rescale_t(float t, float rt) { return t*rt/(1.0f+(rt-1.0f)*t); }
 
+/* Normalization constants from pipeline.json */
+static const float shape_slat_mean[32] = {0.781296f, 0.018091f, -0.495192f, -0.558457f, 1.060530f, 0.093252f, 1.518149f, -0.933218f, -0.732996f, 2.604095f, -0.118341f, -2.143904f, 0.495076f, -2.179512f, -2.130751f, -0.996944f, 0.261421f, -2.217463f, 1.260067f, -0.150213f, 3.790713f, 1.481266f, -1.046058f, -1.523667f, -0.059621f, 2.220780f, 1.621212f, 0.877230f, 0.567247f, -3.175944f, -3.186688f, 1.578665f};
+static const float shape_slat_std[32]  = {5.972266f, 4.706852f, 5.445010f, 5.209927f, 5.320220f, 4.547237f, 5.020802f, 5.444004f, 5.226681f, 5.683095f, 4.831436f, 5.286469f, 5.652043f, 5.367606f, 5.525084f, 4.730578f, 4.805265f, 5.124013f, 5.530808f, 5.619001f, 5.103930f, 5.417670f, 5.269677f, 5.547194f, 5.634698f, 5.235274f, 6.110351f, 5.511298f, 6.237273f, 4.879207f, 5.347008f, 5.405691f};
+static const float tex_slat_mean[32] = {3.501659f, 2.212398f, 2.226094f, 0.251093f, -0.026248f, -0.687364f, 0.439898f, -0.928075f, 0.029398f, -0.339596f, -0.869527f, 1.038479f, -0.972385f, 0.126042f, -1.129303f, 0.455149f, -1.209521f, 2.069067f, 0.544735f, 2.569128f, -0.323407f, 2.293000f, -1.925608f, -1.217717f, 1.213905f, 0.971588f, -0.023631f, 0.106750f, 2.021786f, 0.250524f, -0.662387f, -0.768862f};
+static const float tex_slat_std[32]  = {2.665652f, 2.743913f, 2.765121f, 2.595319f, 3.037293f, 2.291316f, 2.144656f, 2.911822f, 2.969419f, 2.501689f, 2.154811f, 3.163343f, 2.621215f, 2.381943f, 3.186697f, 3.021588f, 2.295916f, 3.234985f, 3.233086f, 2.260140f, 2.874801f, 2.810596f, 3.292720f, 2.674999f, 2.680878f, 2.372054f, 2.451546f, 2.353556f, 2.995195f, 2.379849f, 2.786195f, 2.775190f};
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <stage1.st> <decoder.st> <features.npy> [options]\n\n"
@@ -121,6 +127,9 @@ int main(int argc, char **argv) {
                 "  -t <threads>         CPU threads for shape decoder (default: 4)\n"
                 "  --max-gpu-layers <N> Max DiT layers on GPU (0=all, default: 0)\n"
                 "                       Use 1-10 to reduce VRAM at cost of speed\n"
+                "\nStage 3 (texture generation):\n"
+                "  --stage3 <path>      Stage 3 texture flow model .safetensors\n"
+                "  --s3-steps <N>       Stage 3 Euler steps (default: 12)\n"
                 , argv[0]);
         return 1;
     }
@@ -143,7 +152,9 @@ int main(int argc, char **argv) {
     float s2_cfg = 7.5f;
     const char *s2_npy_path = NULL;
     int n_threads = 4;
-    int max_gpu_layers = 0;  /* 0 = all on GPU */
+    int max_gpu_layers = 0;
+    const char *stage3_path = NULL;
+    int s3_steps = 12;
 
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
@@ -163,6 +174,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-gpu-layers") && i+1 < argc)
             max_gpu_layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--stage3") && i+1 < argc) stage3_path = argv[++i];
+        else if (!strcmp(argv[i], "--s3-steps") && i+1 < argc) s3_steps = atoi(argv[++i]);
     }
 
     /* Load features */
@@ -186,6 +199,11 @@ int main(int argc, char **argv) {
     }
     if (stage2_path) {
         if (cuda_trellis2_load_stage2(r, stage2_path) != 0) {
+            cuda_trellis2_free(r); free(features); return 1;
+        }
+    }
+    if (stage3_path) {
+        if (cuda_trellis2_load_stage3(r, stage3_path) != 0) {
             cuda_trellis2_free(r); free(features); return 1;
         }
     }
@@ -441,9 +459,84 @@ int main(int argc, char **argv) {
             write_npy_f32(s2_npy_path, s2_x, s2d, 2);
         }
 
-        /* TODO: Denormalize using pipeline.json shape_slat_normalization mean/std.
-         * For now, skip denormalization — the shape decoder should still produce
-         * meaningful geometry from the normalized latent. */
+        /* Denormalize shape latent: slat = x_feats * std + mean */
+        for (int i = 0; i < N_sparse; i++)
+            for (int c = 0; c < s2_ch; c++)
+                s2_x[i * s2_ch + c] = s2_x[i * s2_ch + c] * shape_slat_std[c] + shape_slat_mean[c];
+        fprintf(stderr, "Shape latent denormalized\n");
+
+        /* ============================================================ */
+        /* Stage 3: Texture generation (if --stage3 provided)           */
+        /* ============================================================ */
+        float *tex_slat = NULL;
+        if (stage3_path) {
+            fprintf(stderr, "\n=== Stage 3: Texture Flow Sampling (%d steps, no CFG) ===\n", s3_steps);
+
+            /* Normalize shape_slat for concat_cond */
+            float *shape_norm = (float *)malloc((size_t)N_sparse * 32 * sizeof(float));
+            for (int i = 0; i < N_sparse; i++)
+                for (int c = 0; c < 32; c++)
+                    shape_norm[i * 32 + c] = (s2_x[i * 32 + c] - shape_slat_mean[c]) / shape_slat_std[c];
+
+            /* Generate noise [N, 32] */
+            float *s3_noise = (float *)malloc((size_t)N_sparse * 32 * sizeof(float));
+            rng_state s3_rng = {{seed + 2, (seed + 2) ^ 0x9E3779B97F4A7C15ULL,
+                                 (seed + 2) ^ 0x6C62272E07BB0142ULL, (seed + 2) ^ 0xBF58476D1CE4E5B9ULL}};
+            for (int i = 0; i < 8; i++) rng_next(&s3_rng);
+            for (int i = 0; i < N_sparse * 32; i++) s3_noise[i] = rng_randn(&s3_rng);
+
+            /* Concatenate [noise, shape_norm] -> [N, 64] */
+            float *s3_xt = (float *)malloc((size_t)N_sparse * 64 * sizeof(float));
+            float *s3_v = (float *)malloc((size_t)N_sparse * 32 * sizeof(float));
+            float s3_rescale_t = 3.0f;
+
+            struct timespec s3_t0_ts; clock_gettime(CLOCK_MONOTONIC, &s3_t0_ts);
+            double s3_t0 = s3_t0_ts.tv_sec * 1000.0 + s3_t0_ts.tv_nsec / 1e6;
+
+            for (int step = 0; step < s3_steps; step++) {
+                float t_start = 1.0f - (float)step / (float)s3_steps;
+                float t_end = 1.0f - (float)(step + 1) / (float)s3_steps;
+                float t_cur = rescale_t(t_start, s3_rescale_t);
+                float t_next = rescale_t(t_end, s3_rescale_t);
+
+                /* Build x_t = [noise, shape_norm] */
+                for (int i = 0; i < N_sparse; i++) {
+                    memcpy(s3_xt + i * 64, s3_noise + i * 32, 32 * sizeof(float));
+                    memcpy(s3_xt + i * 64 + 32, shape_norm + i * 32, 32 * sizeof(float));
+                }
+
+                struct timespec step_ts; clock_gettime(CLOCK_MONOTONIC, &step_ts);
+                double step_t0x = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
+
+                /* No CFG for Stage 3 (guidance_strength=1.0) */
+                cuda_trellis2_run_stage3_dit(r, s3_xt, t_cur, features,
+                                              sparse_coords, N_sparse, s3_v);
+
+                /* Euler step: noise -= (t_cur - t_next) * v */
+                for (int i = 0; i < N_sparse * 32; i++)
+                    s3_noise[i] -= (t_cur - t_next) * s3_v[i];
+
+                clock_gettime(CLOCK_MONOTONIC, &step_ts);
+                double step_t1x = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
+                fprintf(stderr, "  step %d/%d  t=%.4f->%.4f  %.1f ms\n",
+                        step + 1, s3_steps, t_cur, t_next, step_t1x - step_t0x);
+            }
+
+            struct timespec s3_t1_ts; clock_gettime(CLOCK_MONOTONIC, &s3_t1_ts);
+            double s3_t1 = s3_t1_ts.tv_sec * 1000.0 + s3_t1_ts.tv_nsec / 1e6;
+            fprintf(stderr, "Stage 3 GPU time: %.1f s\n", (s3_t1 - s3_t0) / 1000.0);
+
+            /* Denormalize texture latent */
+            tex_slat = s3_noise;  /* reuse buffer */
+            for (int i = 0; i < N_sparse; i++)
+                for (int c = 0; c < 32; c++)
+                    tex_slat[i * 32 + c] = tex_slat[i * 32 + c] * tex_slat_std[c] + tex_slat_mean[c];
+            fprintf(stderr, "Texture latent denormalized\n");
+
+            free(shape_norm); free(s3_xt); free(s3_v);
+            /* tex_slat (= s3_noise) kept alive for texture decoder */
+        }
+
         fprintf(stderr, "\n=== Shape Decoder (CPU, %d threads) ===\n", n_threads);
 
         /* Load shape decoder */
@@ -498,6 +591,7 @@ int main(int argc, char **argv) {
         t2_shape_dec_result_free(&result);
         sp3d_free(slat);
         t2_shape_dec_free(dec);
+        if (tex_slat) free(tex_slat);
     } else {
         /* Stage 1 only: marching cubes mesh export */
         fprintf(stderr, "\n=== Mesh Export (grid=%d, threshold=%.1f) ===\n", mc_grid, mc_threshold);
