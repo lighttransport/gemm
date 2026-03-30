@@ -54,6 +54,9 @@ typedef struct {
 
     CUfunction gemm_f16_mma;
 
+    /* MMA attention for head_dim=128 */
+    CUfunction attn_mma_hd128;
+
     /* Sparse conv kernels */
     CUfunction sparse_build_gather_map;
     CUfunction sparse_gather;
@@ -120,6 +123,7 @@ static int t2_ops_load(t2_ops *ops, CUmodule module, int sm_version) {
 
     if (sm_version >= 70) {
         GET_FN("gemm_f16_f32",        gemm_f16_mma);
+        GET_FN("attn_mma_hd128_f32",  attn_mma_hd128);
     }
 
     /* Sparse conv kernels */
@@ -251,6 +255,18 @@ static inline void t2_op_cross_attn(t2_ops *ops, CUstream s,
                                       int q_len, int kv_len, int dim,
                                       int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* Use MMA attention for head_dim=128 on sm_70+ */
+    if (head_dim == 128 && ops->attn_mma_hd128) {
+        void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim,
+                        &n_heads, &head_dim, &scale};
+        unsigned gy = (unsigned)((q_len + 63) / 64);
+        cuLaunchKernel(ops->attn_mma_hd128, (unsigned)n_heads, gy, 1,
+                       128, 1, 1, 0, s, args, NULL);
+        return;
+    }
+
+    /* Fallback: scalar attention kernels */
     size_t smem = (size_t)(kv_len + 128) * sizeof(float);
     /* sm_120 supports up to 228KB dynamic smem. Use smem-based kernel up to 200KB
      * (kv_len ~50K). Beyond that, fall back to tiled kernel. */
