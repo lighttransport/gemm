@@ -4,7 +4,7 @@
 // Vulkan DA3 Depth Estimation Runner
 //
 // Pipeline: Preprocessing -> ViT backbone (12 transformer blocks) -> DPT head -> depth output
-// Uses pre-compiled SPIR-V shaders and HOST_VISIBLE SSBOs for simplicity.
+// Uses pre-compiled SPIR-V shaders and DEVICE_LOCAL SSBOs with batched dispatch.
 // F32 weights (converted from F16/BF16 at load time).
 //
 // Port of hip_da3_runner.c for cross-platform Vulkan compute.
@@ -74,6 +74,7 @@ struct vulkan_da3_runner {
     Pipeline pipe_silu;               /* 1 buf: x; push: {n} = 4B */
     Pipeline pipe_matmul_bias_f16;    /* 4 bufs: A(f32),W(f16),C(f32),bias(f32); push: 16B */
     Pipeline pipe_copy;               /* 2 bufs: dst,src; push: {n} = 4B */
+    Pipeline pipe_qk_layernorm_offset; /* 3 bufs: data,w,b; push: {n_tok,n_heads,head_dim,stride,eps,base_offset} = 24B */
 
     /* Model params */
     int n_blocks, dim, n_heads, head_dim, ffn_hidden;
@@ -200,6 +201,16 @@ struct vulkan_da3_runner {
     int gs_merger_h = 0, gs_merger_w = 0;
 
     BufInfo zero_bias;  /* pre-allocated zero buffer for no-bias Conv2d */
+
+    /* Staging buffers for device-local transfers */
+    BufInfo upload_staging;   /* persistent HOST_VISIBLE for image upload */
+    BufInfo download_staging; /* persistent HOST_VISIBLE for result download */
+    size_t upload_staging_cap = 0;
+    size_t download_staging_cap = 0;
+
+    /* Batch fence for fenced submit */
+    VkFence batch_fence = VK_NULL_HANDLE;
+
     bool loaded = false;
     bool batched = false; /* when true, dispatchOp uses batched mode */
 };
@@ -233,12 +244,7 @@ static std::vector<VkDescriptorSetLayoutBinding> makeBindings(int count) {
 static BufInfo createGpuBuffer(VulkanRunner &runner, size_t size) {
     BufInfo buf{};
     if (size == 0) return buf;
-    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VkMemoryPropertyFlags props = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    runner.createBuffer(size, usage, props, buf);
+    runner.createDeviceLocalBuffer(size, buf);
     return buf;
 }
 
@@ -276,7 +282,7 @@ static BufInfo stUploadF32(VulkanRunner &runner, st_context *st, const char *nam
 
     if (strcmp(dtype, "F32") == 0) {
         buf = createGpuBuffer(runner, nbytes);
-        uploadToBuffer(runner, buf, data, nbytes);
+        runner.uploadToDeviceLocal(buf, data, nbytes);
     } else if (strcmp(dtype, "F16") == 0) {
         size_t n = nbytes / sizeof(uint16_t);
         std::vector<float> f32(n);
@@ -292,7 +298,7 @@ static BufInfo stUploadF32(VulkanRunner &runner, st_context *st, const char *nam
             memcpy(&f32[i], &f, sizeof(float));
         }
         buf = createGpuBuffer(runner, n * sizeof(float));
-        uploadToBuffer(runner, buf, f32.data(), n * sizeof(float));
+        runner.uploadToDeviceLocal(buf, f32.data(), n * sizeof(float));
     } else if (strcmp(dtype, "BF16") == 0) {
         size_t n = nbytes / sizeof(uint16_t);
         std::vector<float> f32(n);
@@ -302,7 +308,7 @@ static BufInfo stUploadF32(VulkanRunner &runner, st_context *st, const char *nam
             memcpy(&f32[i], &f, sizeof(float));
         }
         buf = createGpuBuffer(runner, n * sizeof(float));
-        uploadToBuffer(runner, buf, f32.data(), n * sizeof(float));
+        runner.uploadToDeviceLocal(buf, f32.data(), n * sizeof(float));
     }
     return buf;
 }
@@ -374,6 +380,18 @@ static void gpuSync(vulkan_da3_runner *r) {
     r->runner.waitForCompletion();
 }
 
+/* Dispatch that routes to batched or sync mode based on r->batched flag */
+static void dispatchOp(vulkan_da3_runner *r, Pipeline &pipe,
+                        const std::vector<BufInfo> &bufs,
+                        const void *push_data, uint32_t push_size,
+                        uint32_t gx, uint32_t gy = 1, uint32_t gz = 1) {
+    if (r->batched) {
+        dispatchBatched(r, pipe, bufs, push_data, push_size, gx, gy, gz);
+    } else {
+        dispatchSync(r, pipe, bufs, push_data, push_size, gx, gy, gz);
+    }
+}
+
 /* ---- Op wrappers ---- */
 
 /* LayerNorm: dst = LN(src, weight, bias) */
@@ -382,7 +400,7 @@ static void opLayerNorm(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src,
     struct { uint32_t n_tokens, dim; float eps; } pc = {
         (uint32_t)n_tok, (uint32_t)dim, r->ln_eps
     };
-    dispatchSync(r, r->pipe_layernorm, {src, dst, w, b}, &pc, sizeof(pc), (uint32_t)n_tok);
+    dispatchOp(r, r->pipe_layernorm, {src, dst, w, b}, &pc, sizeof(pc), (uint32_t)n_tok);
 }
 
 /* MatMul+Bias: C[M,N] = A[M,K] * W[N,K]^T + bias[N]
@@ -399,7 +417,7 @@ static void opMatmulBias(vulkan_da3_runner *r, BufInfo &C, BufInfo &W, BufInfo &
     /* Vulkan requires valid buffers for all bindings even when has_bias=0.
      * Use C as a dummy for the bias binding when no bias is provided. */
     BufInfo &bias_buf = has_bias ? bias : C;
-    dispatchSync(r, r->pipe_matmul_bias, {A, W, C, bias_buf}, &pc, sizeof(pc), gx, gy);
+    dispatchOp(r, r->pipe_matmul_bias, {A, W, C, bias_buf}, &pc, sizeof(pc), gx, gy);
 }
 
 /* MatMul+Bias with F16 weights: C[M,N] = A[M,K](f32) * W[N,K](f16)^T + bias[N](f32)
@@ -413,44 +431,44 @@ static void opMatmulBiasF16(vulkan_da3_runner *r, BufInfo &C, BufInfo &W, BufInf
     uint32_t gx = (uint32_t)((N + 15) / 16);
     uint32_t gy = (uint32_t)((M + 15) / 16);
     BufInfo &bias_buf = has_bias ? bias : C;
-    dispatchSync(r, r->pipe_matmul_bias_f16, {A, W, C, bias_buf}, &pc, sizeof(pc), gx, gy);
+    dispatchOp(r, r->pipe_matmul_bias_f16, {A, W, C, bias_buf}, &pc, sizeof(pc), gx, gy);
 }
 
 /* GELU in-place */
 static void opGelu(vulkan_da3_runner *r, BufInfo &x, int n) {
     uint32_t pc = (uint32_t)n;
-    dispatchSync(r, r->pipe_gelu, {x}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
+    dispatchOp(r, r->pipe_gelu, {x}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
 }
 
 /* ReLU in-place */
 static void opRelu(vulkan_da3_runner *r, BufInfo &x, int n) {
     uint32_t pc = (uint32_t)n;
-    dispatchSync(r, r->pipe_relu, {x}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
+    dispatchOp(r, r->pipe_relu, {x}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
 }
 
 /* GPU buffer copy (batchable, unlike bufferCopy which uses CPU memcpy) */
 static void opCopy(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src, int n_floats) {
     uint32_t pc = (uint32_t)n_floats;
-    dispatchSync(r, r->pipe_copy, {dst, src}, &pc, sizeof(pc), (uint32_t)((n_floats + 255) / 256));
+    dispatchOp(r, r->pipe_copy, {dst, src}, &pc, sizeof(pc), (uint32_t)((n_floats + 255) / 256));
 }
 
 /* SiLU in-place: x = x * sigmoid(x) */
 static void opSilu(vulkan_da3_runner *r, BufInfo &x, int n) {
     uint32_t pc = (uint32_t)n;
-    dispatchSync(r, r->pipe_silu, {x}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
+    dispatchOp(r, r->pipe_silu, {x}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
 }
 
 /* Element-wise add: dst += src */
 static void opAdd(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src, int n) {
     uint32_t pc = (uint32_t)n;
-    dispatchSync(r, r->pipe_add, {dst, src}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
+    dispatchOp(r, r->pipe_add, {dst, src}, &pc, sizeof(pc), (uint32_t)((n + 255) / 256));
 }
 
 /* LayerScale add: dst[i] += src[i] * scale[i % dim] */
 static void opLayerscaleAdd(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src,
                               BufInfo &scale, int n, int dim) {
     struct { uint32_t n, dim; } pc = {(uint32_t)n, (uint32_t)dim};
-    dispatchSync(r, r->pipe_layerscale_add, {dst, src, scale}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_layerscale_add, {dst, src, scale}, &pc, sizeof(pc),
                  (uint32_t)((n + 255) / 256));
 }
 
@@ -461,18 +479,29 @@ static void opQkLayerNorm(vulkan_da3_runner *r, BufInfo &data, BufInfo &w, BufIn
         (uint32_t)n_tok, (uint32_t)n_heads, (uint32_t)head_dim, (uint32_t)stride, r->ln_eps
     };
     int total = n_tok * n_heads;
-    dispatchSync(r, r->pipe_qk_layernorm, {data, w, b}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_qk_layernorm, {data, w, b}, &pc, sizeof(pc),
+                 (uint32_t)((total + 255) / 256));
+}
+
+/* Per-head QK LayerNorm with base_offset (for K portion of interleaved QKV) */
+static void opQkLayerNormOffset(vulkan_da3_runner *r, BufInfo &data, BufInfo &w, BufInfo &b,
+                                  int n_tok, int n_heads, int head_dim, int stride, float eps, int base_offset = 0) {
+    struct { uint32_t n_tok, n_heads, head_dim, stride; float eps; uint32_t base_offset; } pc = {
+        (uint32_t)n_tok, (uint32_t)n_heads, (uint32_t)head_dim, (uint32_t)stride, eps, (uint32_t)base_offset
+    };
+    int total = n_tok * n_heads;
+    dispatchOp(r, r->pipe_qk_layernorm_offset, {data, w, b}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
 /* 2D RoPE */
 static void opRope2d(vulkan_da3_runner *r, BufInfo &vec, BufInfo &pos_y_buf, BufInfo &pos_x_buf,
-                       int n_tok, int n_heads, int head_dim, int stride) {
-    struct { uint32_t n_tok, n_heads, head_dim, stride; float freq_base; } pc = {
-        (uint32_t)n_tok, (uint32_t)n_heads, (uint32_t)head_dim, (uint32_t)stride, 100.0f
+                       int n_tok, int n_heads, int head_dim, int stride, float freq_base = 100.0f, int base_offset = 0) {
+    struct { uint32_t n_tok, n_heads, head_dim, stride; float freq_base; uint32_t base_offset; } pc = {
+        (uint32_t)n_tok, (uint32_t)n_heads, (uint32_t)head_dim, (uint32_t)stride, freq_base, (uint32_t)base_offset
     };
     /* One workgroup per token; threads = n_heads * (head_dim/4) */
-    dispatchSync(r, r->pipe_rope_2d, {vec, pos_y_buf, pos_x_buf}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_rope_2d, {vec, pos_y_buf, pos_x_buf}, &pc, sizeof(pc),
                  (uint32_t)n_tok);
 }
 
@@ -480,7 +509,7 @@ static void opRope2d(vulkan_da3_runner *r, BufInfo &vec, BufInfo &pos_y_buf, Buf
 static void opSwiglu(vulkan_da3_runner *r, BufInfo &dst, BufInfo &gate_up, int hidden, int n_tok) {
     struct { uint32_t hidden, n_tok; } pc = {(uint32_t)hidden, (uint32_t)n_tok};
     int total = hidden * n_tok;
-    dispatchSync(r, r->pipe_swiglu, {dst, gate_up}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_swiglu, {dst, gate_up}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -491,7 +520,7 @@ static void opKvTranspose(vulkan_da3_runner *r, BufInfo &K_t, BufInfo &V_t,
         (uint32_t)n_tok, (uint32_t)dim, (uint32_t)n_heads, (uint32_t)head_dim
     };
     int total = n_tok * dim;
-    dispatchSync(r, r->pipe_kv_transpose, {K_t, V_t, qkv_buf}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_kv_transpose, {K_t, V_t, qkv_buf}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -505,7 +534,7 @@ static void opFlashAttn(vulkan_da3_runner *r, BufInfo &out, BufInfo &qkv_buf,
     };
     int bq = 64;
     uint32_t gy = (uint32_t)((n_tok + bq - 1) / bq);
-    dispatchSync(r, r->pipe_flash_attn, {out, qkv_buf, K_t, V_t}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_flash_attn, {out, qkv_buf, K_t, V_t}, &pc, sizeof(pc),
                  (uint32_t)n_heads, gy);
 }
 
@@ -514,7 +543,7 @@ static void opClsPosEmbed(vulkan_da3_runner *r, BufInfo &hidden_buf, BufInfo &cl
                             BufInfo &pos_buf, int nt, int dim) {
     struct { uint32_t nt, dim; } pc = {(uint32_t)nt, (uint32_t)dim};
     int total = nt * dim;
-    dispatchSync(r, r->pipe_cls_pos_embed, {hidden_buf, cls_buf, pos_buf}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_cls_pos_embed, {hidden_buf, cls_buf, pos_buf}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -523,7 +552,7 @@ static void opCatLocalGlobal(vulkan_da3_runner *r, BufInfo &dst, BufInfo &local_
                                BufInfo &global_buf, int nt, int dim) {
     struct { uint32_t nt, dim; } pc = {(uint32_t)nt, (uint32_t)dim};
     int total = nt * 2 * dim;
-    dispatchSync(r, r->pipe_cat_local_global, {dst, local_buf, global_buf}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_cat_local_global, {dst, local_buf, global_buf}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -531,7 +560,7 @@ static void opCatLocalGlobal(vulkan_da3_runner *r, BufInfo &dst, BufInfo &local_
 static void opDptClsConcat(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src, int np, int dim) {
     struct { uint32_t np, dim; } pc = {(uint32_t)np, (uint32_t)dim};
     int total = np * 2 * dim;
-    dispatchSync(r, r->pipe_dpt_cls_concat, {dst, src}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_dpt_cls_concat, {dst, src}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -541,14 +570,14 @@ static void opStridedLayerNorm(vulkan_da3_runner *r, BufInfo &data, BufInfo &w, 
     struct { uint32_t np, dim, stride; float eps; } pc = {
         (uint32_t)np, (uint32_t)dim, (uint32_t)stride, r->ln_eps
     };
-    dispatchSync(r, r->pipe_strided_layernorm, {data, w, b}, &pc, sizeof(pc), (uint32_t)np);
+    dispatchOp(r, r->pipe_strided_layernorm, {data, w, b}, &pc, sizeof(pc), (uint32_t)np);
 }
 
 /* Token-major [np, C] -> spatial CHW [C, H, W] */
 static void opTokToChw(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src, int C, int gH, int gW) {
     struct { uint32_t C, gH, gW; } pc = {(uint32_t)C, (uint32_t)gH, (uint32_t)gW};
     int total = C * gH * gW;
-    dispatchSync(r, r->pipe_tok_to_chw, {dst, src}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_tok_to_chw, {dst, src}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -563,7 +592,7 @@ static void opConv2d(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src,
     int Ho = (H + 2 * pad - kH) / stride + 1;
     int Wo = (W + 2 * pad - kW) / stride + 1;
     int total = Co * Ho * Wo;
-    dispatchSync(r, r->pipe_conv2d, {dst, src, w, bias}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_conv2d, {dst, src, w, bias}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -576,7 +605,7 @@ static void opDeconvScatter(vulkan_da3_runner *r, BufInfo &dst, BufInfo &Y, BufI
         (uint32_t)kH, (uint32_t)kW, (uint32_t)stride_h, (uint32_t)stride_w
     };
     int total = Co * Ho * Wo;
-    dispatchSync(r, r->pipe_deconv_scatter, {dst, Y, bias}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_deconv_scatter, {dst, Y, bias}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -587,14 +616,14 @@ static void opBilinear(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src,
         (uint32_t)C, (uint32_t)Hi, (uint32_t)Wi, (uint32_t)Ho, (uint32_t)Wo
     };
     int total = C * Ho * Wo;
-    dispatchSync(r, r->pipe_bilinear, {dst, src}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_bilinear, {dst, src}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
 /* Depth activation: out[i] = exp(out[i]), out[i+hw] = exp(out[i+hw]) + 1 */
 static void opDepthActivation(vulkan_da3_runner *r, BufInfo &out, int hw) {
     uint32_t pc = (uint32_t)hw;
-    dispatchSync(r, r->pipe_depth_activation, {out}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_depth_activation, {out}, &pc, sizeof(pc),
                  (uint32_t)((hw + 255) / 256));
 }
 
@@ -605,7 +634,7 @@ static void opSinusoidalUv(vulkan_da3_runner *r, BufInfo &data,
         (uint32_t)C, (uint32_t)H, (uint32_t)W, span_x, span_y, ratio
     };
     int total = C * H * W;
-    dispatchSync(r, r->pipe_sinusoidal_uv, {data}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_sinusoidal_uv, {data}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -613,7 +642,7 @@ static void opSinusoidalUv(vulkan_da3_runner *r, BufInfo &data,
 static void opChannelLayerNorm(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src,
                                  BufInfo &w, BufInfo &b, int C, int HW) {
     struct { uint32_t C, HW; float eps; } pc = {(uint32_t)C, (uint32_t)HW, 1e-5f};
-    dispatchSync(r, r->pipe_channel_layernorm, {dst, src, w, b}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_channel_layernorm, {dst, src, w, b}, &pc, sizeof(pc),
                  (uint32_t)((HW + 255) / 256));
 }
 
@@ -629,7 +658,7 @@ static void opResizeNormalize(vulkan_da3_runner *r, BufInfo &dst, BufInfo &src,
         1.0f / r->image_std[0], 1.0f / r->image_std[1], 1.0f / r->image_std[2]
     };
     int total = dst_h * dst_w;
-    dispatchSync(r, r->pipe_resize_normalize, {dst, src}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_resize_normalize, {dst, src}, &pc, sizeof(pc),
                  (uint32_t)((total + 255) / 256));
 }
 
@@ -642,7 +671,7 @@ static void opPatchEmbed(vulkan_da3_runner *r, BufInfo &hidden, BufInfo &image,
         (uint32_t)gw, (uint32_t)dim, (uint32_t)ps, (uint32_t)img_w, (uint32_t)img_h
     };
     /* One workgroup per patch, 256 threads iterate over output channels */
-    dispatchSync(r, r->pipe_patch_embed, {hidden, image, kernel_w, bias}, &pc, sizeof(pc),
+    dispatchOp(r, r->pipe_patch_embed, {hidden, image, kernel_w, bias}, &pc, sizeof(pc),
                  (uint32_t)np);
 }
 
@@ -668,7 +697,7 @@ static void opRcu(vulkan_da3_runner *r, BufInfo &out, BufInfo &x,
                     int C, int H, int W) {
     int sz = C * H * W;
     /* tmp2 = relu(x) */
-    bufferCopy(r->runner, r->dpt_tmp2, x, (size_t)sz * sizeof(float));
+    opCopy(r, r->dpt_tmp2, x, sz);
     opRelu(r, r->dpt_tmp2, sz);
     /* tmp = conv3x3(tmp2) */
     opConv2d(r, r->dpt_tmp, r->dpt_tmp2, c1w, c1b, H, W, C, C, 3, 3, 1, 1);
@@ -709,7 +738,7 @@ static void opRefineNet(vulkan_da3_runner *r,
 
     if (has_rcu2) {
         opRcu(r, r->dpt_cat, result, rcu2_c1_w, rcu2_c1_b, rcu2_c2_w, rcu2_c2_b, features, fH, fW);
-        bufferCopy(r->runner, result, r->dpt_cat, (size_t)sz * sizeof(float));
+        opCopy(r, result, r->dpt_cat, sz);
     }
 
     /* Upsample + out_conv */
@@ -717,10 +746,10 @@ static void opRefineNet(vulkan_da3_runner *r,
         opBilinear(r, r->dpt_cat, result, features, fH, fW, out_h, out_w);
         opConv2d(r, r->dpt_ln, r->dpt_cat, fuse_out_w, fuse_out_b,
                  out_h, out_w, features, features, 1, 1, 1, 0);
-        bufferCopy(r->runner, result, r->dpt_ln, (size_t)features * out_h * out_w * sizeof(float));
+        opCopy(r, result, r->dpt_ln, features * out_h * out_w);
     } else {
         opConv2d(r, r->dpt_cat, result, fuse_out_w, fuse_out_b, fH, fW, features, features, 1, 1, 1, 0);
-        bufferCopy(r->runner, result, r->dpt_cat, (size_t)sz * sizeof(float));
+        opCopy(r, result, r->dpt_cat, sz);
     }
 }
 
@@ -793,12 +822,13 @@ static bool createPipelines(vulkan_da3_runner *r) {
     if (!createPipe("shaders/add_f32",                 2, 4,  r->pipe_add)) return false;
     if (!createPipe("shaders/hy3d/layerscale_add_f32", 3, 8,  r->pipe_layerscale_add)) return false;
     if (!createPipe("shaders/hy3d/qk_layernorm_f32",   3, 20, r->pipe_qk_layernorm)) return false;
+    if (!createPipe("shaders/da3/qk_layernorm_offset_f32", 3, 24, r->pipe_qk_layernorm_offset)) return false;
     if (!createPipe("shaders/da3/patch_embed_conv2d_f32", 4, 20, r->pipe_patch_embed)) return false;
 
     /* DA3-specific shaders */
     if (!createPipe("shaders/da3/resize_normalize_f32",       2, 40, r->pipe_resize_normalize)) return false;
     if (!createPipe("shaders/da3/cls_pos_embed_f32",          3, 8,  r->pipe_cls_pos_embed)) return false;
-    if (!createPipe("shaders/da3/rope_2d_f32",                3, 20, r->pipe_rope_2d)) return false;
+    if (!createPipe("shaders/da3/rope_2d_f32",                3, 24, r->pipe_rope_2d)) return false;
     if (!createPipe("shaders/da3/swiglu_f32",                 2, 8,  r->pipe_swiglu)) return false;
     if (!createPipe("shaders/da3/kv_transpose_f32",           3, 16, r->pipe_kv_transpose)) return false;
     if (!createPipe("shaders/da3/flash_attn_tiled_f32",       4, 20, r->pipe_flash_attn)) return false;
@@ -1118,7 +1148,7 @@ static BufInfo stUploadF32Mapped(VulkanRunner &runner, const st_context *st,
 
     if (strcmp(ti.dtype, "F32") == 0) {
         buf = createGpuBuffer(runner, nbytes);
-        uploadToBuffer(runner, buf, ti.data, nbytes);
+        runner.uploadToDeviceLocal(buf, ti.data, nbytes);
     } else if (strcmp(ti.dtype, "F16") == 0) {
         size_t n = nbytes / sizeof(uint16_t);
         std::vector<float> f32(n);
@@ -1134,7 +1164,7 @@ static BufInfo stUploadF32Mapped(VulkanRunner &runner, const st_context *st,
             memcpy(&f32[i], &f, sizeof(float));
         }
         buf = createGpuBuffer(runner, n * sizeof(float));
-        uploadToBuffer(runner, buf, f32.data(), n * sizeof(float));
+        runner.uploadToDeviceLocal(buf, f32.data(), n * sizeof(float));
     } else if (strcmp(ti.dtype, "BF16") == 0) {
         size_t n = nbytes / sizeof(uint16_t);
         std::vector<float> f32(n);
@@ -1144,7 +1174,7 @@ static BufInfo stUploadF32Mapped(VulkanRunner &runner, const st_context *st,
             memcpy(&f32[i], &f, sizeof(float));
         }
         buf = createGpuBuffer(runner, n * sizeof(float));
-        uploadToBuffer(runner, buf, f32.data(), n * sizeof(float));
+        runner.uploadToDeviceLocal(buf, f32.data(), n * sizeof(float));
     }
     return buf;
 }
@@ -1166,7 +1196,7 @@ static BufInfo stUploadF16Mapped(VulkanRunner &runner, const st_context *st,
 
     if (strcmp(ti.dtype, "F16") == 0) {
         /* Already F16, upload directly */
-        uploadToBuffer(runner, buf, ti.data, f16_bytes);
+        runner.uploadToDeviceLocal(buf, ti.data, f16_bytes);
     } else if (strcmp(ti.dtype, "F32") == 0) {
         /* Convert F32 -> F16 on CPU (matching HIP's hip_f32_to_f16 with denormals) */
         const float *f32 = (const float *)ti.data;
@@ -1183,7 +1213,7 @@ static BufInfo stUploadF16Mapped(VulkanRunner &runner, const st_context *st,
             }
             else { f16[i] = sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13); }
         }
-        uploadToBuffer(runner, buf, f16.data(), f16_bytes);
+        runner.uploadToDeviceLocal(buf, f16.data(), f16_bytes);
     } else if (strcmp(ti.dtype, "BF16") == 0) {
         /* Convert BF16 -> F32 -> F16 on CPU */
         const uint16_t *bf16 = (const uint16_t *)ti.data;
@@ -1201,7 +1231,7 @@ static BufInfo stUploadF16Mapped(VulkanRunner &runner, const st_context *st,
             else h = (sign << 15) | ((exp + 15) << 10) | (mant >> 13);
             f16[i] = h;
         }
-        uploadToBuffer(runner, buf, f16.data(), f16_bytes);
+        runner.uploadToDeviceLocal(buf, f16.data(), f16_bytes);
     }
     return buf;
 }
@@ -1273,7 +1303,7 @@ static BufInfo uploadDeconvWeightF32(VulkanRunner &runner, const st_context *st,
     }
 
     BufInfo buf = createGpuBuffer(runner, (size_t)N * K * sizeof(float));
-    uploadToBuffer(runner, buf, transposed.data(), (size_t)N * K * sizeof(float));
+    runner.uploadToDeviceLocal(buf, transposed.data(), (size_t)N * K * sizeof(float));
     return buf;
 }
 
@@ -1342,7 +1372,7 @@ static BufInfo uploadDeconvWeightF16(VulkanRunner &runner, const st_context *st,
     }
 
     BufInfo buf = createGpuBuffer(runner, (size_t)N * K * sizeof(uint16_t));
-    uploadToBuffer(runner, buf, transposed_f16.data(), (size_t)N * K * sizeof(uint16_t));
+    runner.uploadToDeviceLocal(buf, transposed_f16.data(), (size_t)N * K * sizeof(uint16_t));
     return buf;
 }
 
@@ -1464,7 +1494,7 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
     if (isValid(r->pos_embed)) {
         size_t pe_sz = (size_t)(r->n_patches + 1) * dim;
         r->h_pos_embed_orig = (float *)malloc(pe_sz * sizeof(float));
-        downloadFromBuffer(r->runner, r->pos_embed, r->h_pos_embed_orig, pe_sz * sizeof(float));
+        r->runner.downloadFromDeviceLocal(r->pos_embed, r->h_pos_embed_orig, pe_sz * sizeof(float));
     }
 
     r->patch_embed_w = stUploadF32Mapped(r->runner, st, map, map_count, "da3.patch_embed.weight", r->verbose);
@@ -1488,7 +1518,7 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
                 memcpy(cam_f32.data(), ti.data, (size_t)dim * sizeof(float));
             }
             r->camera_token = createGpuBuffer(r->runner, (size_t)dim * sizeof(float));
-            uploadToBuffer(r->runner, r->camera_token, cam_f32.data(), (size_t)dim * sizeof(float));
+            r->runner.uploadToDeviceLocal(r->camera_token, cam_f32.data(), (size_t)dim * sizeof(float));
             r->has_camera_token = true;
             if (r->verbose >= 1) fprintf(stderr, "DA3: camera_token loaded (%d floats)\n", dim);
         }
@@ -1935,8 +1965,12 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
         r->dpt_out = createGpuBuffer(r->runner, out_sz * sizeof(float));
 
         /* Pre-allocate zero buffer for no-bias Conv2d (avoids per-dispatch alloc) */
-        r->zero_bias = createGpuBuffer(r->runner, (size_t)feat * sizeof(float));
-        bufferZero(r->runner, r->zero_bias, (size_t)feat * sizeof(float));
+        {
+            size_t zb_size = (size_t)feat * sizeof(float);
+            r->zero_bias = createGpuBuffer(r->runner, zb_size);
+            std::vector<float> zeros(feat, 0.0f);
+            r->runner.uploadToDeviceLocal(r->zero_bias, zeros.data(), zb_size);
+        }
 
         /* Aux DPT scratch buffers */
         if (r->dpt_aux.loaded) {
@@ -1969,10 +2003,10 @@ int vulkan_da3_load_safetensors(vulkan_da3_runner *r, const char *st_path, const
             py_nd[1 + p] = 1;
             px_nd[1 + p] = 1;
         }
-        uploadToBuffer(r->runner, r->pos_y, py.data(), (size_t)nt * sizeof(int));
-        uploadToBuffer(r->runner, r->pos_x, px.data(), (size_t)nt * sizeof(int));
-        uploadToBuffer(r->runner, r->pos_y_nd, py_nd.data(), (size_t)nt * sizeof(int));
-        uploadToBuffer(r->runner, r->pos_x_nd, px_nd.data(), (size_t)nt * sizeof(int));
+        r->runner.uploadToDeviceLocal(r->pos_y, py.data(), (size_t)nt * sizeof(int));
+        r->runner.uploadToDeviceLocal(r->pos_x, px.data(), (size_t)nt * sizeof(int));
+        r->runner.uploadToDeviceLocal(r->pos_y_nd, py_nd.data(), (size_t)nt * sizeof(int));
+        r->runner.uploadToDeviceLocal(r->pos_x_nd, px_nd.data(), (size_t)nt * sizeof(int));
     }
 
     /* Clean up name map */
@@ -2055,7 +2089,7 @@ static void run_camera_enc(vulkan_da3_runner *r, const float *pose_in, BufInfo &
 
     /* Upload pose[9] to a small temp buffer */
     BufInfo d_pose = createGpuBuffer(r->runner, 9 * sizeof(float));
-    uploadToBuffer(r->runner, d_pose, pose_in, 9 * sizeof(float));
+    r->runner.uploadToDeviceLocal(d_pose, pose_in, 9 * sizeof(float));
 
     /* pose_branch MLP: [1, 9] -> fc1 -> GELU -> fc2 -> [1, dim] */
     opMatmulBiasF16(r, r->attn_out, ce.fc1_w, d_pose, ce.fc1_b, 1, dim, 9);
@@ -2066,7 +2100,7 @@ static void run_camera_enc(vulkan_da3_runner *r, const float *pose_in, BufInfo &
     opLayerNorm(r, r->ln_buf, r->proj_out, ce.token_norm_w, ce.token_norm_b, 1, dim);
 
     /* Copy to hidden2 for trunk processing */
-    bufferCopy(r->runner, r->hidden2, r->ln_buf, (size_t)dim * sizeof(float));
+    opCopy(r, r->hidden2, r->ln_buf, dim);
 
     /* trunk: ViT blocks (no RoPE, no QK-norm, single token) */
     for (int L = 0; L < ntb; L++) {
@@ -2077,14 +2111,11 @@ static void run_camera_enc(vulkan_da3_runner *r, const float *pose_in, BufInfo &
         opMatmulBiasF16(r, r->qkv, ly.attn_qkv_w, r->ln_buf, ly.attn_qkv_b, 1, ly.qkv_rows, dim);
 
         /* For single token, attention is trivial: output = V (softmax of [1x1] = 1) */
-        /* V starts at offset 2*dim in the QKV buffer */
+        /* V starts at offset 2*dim in the QKV buffer. Use GPU copy with offset. */
         {
-            void *qkv_ptr = nullptr, *ao_ptr = nullptr;
-            r->runner.mapBuffer(r->qkv, &qkv_ptr);
-            r->runner.mapBuffer(r->attn_out, &ao_ptr);
-            memcpy(ao_ptr, (const float *)qkv_ptr + 2 * dim, (size_t)dim * sizeof(float));
-            r->runner.unmapBuffer(r->qkv);
-            r->runner.unmapBuffer(r->attn_out);
+            std::vector<float> qkv_tmp(3 * dim);
+            r->runner.downloadFromDeviceLocal(r->qkv, qkv_tmp.data(), 3 * dim * sizeof(float));
+            r->runner.uploadToDeviceLocal(r->attn_out, qkv_tmp.data() + 2 * dim, (size_t)dim * sizeof(float));
         }
 
         /* Output projection */
@@ -2110,7 +2141,7 @@ static void run_camera_enc(vulkan_da3_runner *r, const float *pose_in, BufInfo &
 
     if (r->verbose >= 1) {
         float dbg[5];
-        downloadFromBuffer(r->runner, cam_token_out, dbg, sizeof(dbg));
+        r->runner.downloadFromDeviceLocal(cam_token_out, dbg, sizeof(dbg));
         fprintf(stderr, "DA3: CameraEnc output[0:5] = %.4f %.4f %.4f %.4f %.4f\n",
                 dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
     }
@@ -2158,14 +2189,32 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     /* ---- GPU: Preprocess + Patch Embed + CLS + PosEmbed ---- */
     clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
 
-    /* Upload raw image */
+    /* Upload raw image via staging buffer */
     size_t img_bytes = (size_t)img_w * img_h * 3;
     if (img_bytes > r->img_raw_cap) {
         if (isValid(r->img_raw)) r->runner.destroyBuffer(r->img_raw);
         r->img_raw = createGpuBuffer(r->runner, img_bytes);
         r->img_raw_cap = img_bytes;
     }
-    uploadToBuffer(r->runner, r->img_raw, rgb, img_bytes);
+    /* Ensure staging buffer is large enough */
+    if (img_bytes > r->upload_staging_cap) {
+        if (isValid(r->upload_staging)) r->runner.destroyBuffer(r->upload_staging);
+        r->runner.createStagingBuffer(img_bytes, r->upload_staging);
+        r->upload_staging_cap = img_bytes;
+    }
+    /* Upload image to staging */
+    {
+        void *ptr = nullptr;
+        r->runner.mapBuffer(r->upload_staging, &ptr);
+        memcpy(ptr, rgb, img_bytes);
+        r->runner.unmapBuffer(r->upload_staging);
+    }
+
+    /* GPU copy: staging -> img_raw, then preprocessing dispatches */
+    r->batched = true;
+    r->runner.beginRecording();
+    r->runner.recordCopyBuffer(r->upload_staging, r->img_raw, img_bytes);
+    r->runner.computeBarrier();
 
     /* Resize + normalize */
     opResizeNormalize(r, r->img_norm, r->img_raw, img_w, img_h, target_w, target_h);
@@ -2175,7 +2224,14 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
     opPatchEmbed(r, r->hidden, r->img_norm, r->patch_embed_w, r->patch_embed_b,
                  np, dim, ps, gw, target_w, target_h);
 
-    /* Interpolate pos_embed for non-square grid */
+    /* End preprocessing batch (resize+normalize, patch_embed are batched) */
+    r->runner.endRecordingAndSubmitFenced(r->batch_fence);
+    r->runner.waitForFence(r->batch_fence);
+    r->runner.resetFence(r->batch_fence);
+    r->runner.resetDynamicDescriptorPool();
+    r->batched = false;
+
+    /* Interpolate pos_embed for non-square grid (CPU work + device-local uploads) */
     {
         int M = r->grid_h;
         if (gh != M || gw != M) {
@@ -2187,12 +2243,9 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
             memcpy(new_pe.data(), cls_pe, (size_t)dim * sizeof(float));
             for (int p = 0; p < np; p++)
                 memcpy(new_pe.data() + (1 + p) * dim, interp_pe + p * dim, (size_t)dim * sizeof(float));
-            uploadToBuffer(r->runner, r->pos_embed, new_pe.data(), (size_t)nt * dim * sizeof(float));
+            r->runner.uploadToDeviceLocal(r->pos_embed, new_pe.data(), (size_t)nt * dim * sizeof(float));
             free(interp_pe);
         }
-
-        /* CLS prepend + pos_embed add */
-        opClsPosEmbed(r, r->hidden, r->cls_token, r->pos_embed, nt, dim);
 
         /* Rebuild position arrays for RoPE with new grid */
         if (gh != r->grid_h || gw != r->grid_w) {
@@ -2201,16 +2254,17 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
                 py[1 + p] = p / gw + 1; px[1 + p] = p % gw + 1;
                 py_nd[1 + p] = 1; px_nd[1 + p] = 1;
             }
-            uploadToBuffer(r->runner, r->pos_y, py.data(), (size_t)nt * sizeof(int));
-            uploadToBuffer(r->runner, r->pos_x, px.data(), (size_t)nt * sizeof(int));
-            uploadToBuffer(r->runner, r->pos_y_nd, py_nd.data(), (size_t)nt * sizeof(int));
-            uploadToBuffer(r->runner, r->pos_x_nd, px_nd.data(), (size_t)nt * sizeof(int));
+            r->runner.uploadToDeviceLocal(r->pos_y, py.data(), (size_t)nt * sizeof(int));
+            r->runner.uploadToDeviceLocal(r->pos_x, px.data(), (size_t)nt * sizeof(int));
+            r->runner.uploadToDeviceLocal(r->pos_y_nd, py_nd.data(), (size_t)nt * sizeof(int));
+            r->runner.uploadToDeviceLocal(r->pos_x_nd, px_nd.data(), (size_t)nt * sizeof(int));
         }
+
+        /* CLS prepend + pos_embed add (not batched, runs sync) */
+        opClsPosEmbed(r, r->hidden, r->cls_token, r->pos_embed, nt, dim);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
-    if (r->verbose >= 1) gpuSync(r);
-    r->runner.resetDynamicDescriptorPool();
     fprintf(stderr, "DA3: GPU preprocess+embed: %.1f ms\n", (t1 - t0) * 1000);
 
     /* ---- GPU: Transformer Blocks ---- */
@@ -2227,13 +2281,10 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         if (r->verbose >= 1) fprintf(stderr, "DA3: CameraEnc: pose-conditioned camera token computed\n");
     }
 
-    /* Initialize local_hidden = hidden */
-    opCopy(r, r->local_hidden, r->hidden, nt * dim);
-
     /* dump hidden before backbone (verbose >= 3) */
     if (r->verbose >= 3) {
         std::vector<float> h_dbg(nt * dim);
-        downloadFromBuffer(r->runner, r->hidden, h_dbg.data(), nt * dim * sizeof(float));
+        r->runner.downloadFromDeviceLocal(r->hidden, h_dbg.data(), nt * dim * sizeof(float));
         float mn = h_dbg[0], mx = h_dbg[0], sum = 0;
         for (int i = 0; i < nt * dim; i++) { if (h_dbg[i]<mn) mn=h_dbg[i]; if (h_dbg[i]>mx) mx=h_dbg[i]; sum+=h_dbg[i]; }
         fprintf(stderr, "DA3: after embed: min=%.4f max=%.4f mean=%.6f\n", mn, mx, sum/(nt*dim));
@@ -2241,6 +2292,13 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         fprintf(stderr, "DA3: hidden[dim:dim+5] = %.4f %.4f %.4f %.4f %.4f\n", h_dbg[dim], h_dbg[dim+1], h_dbg[dim+2], h_dbg[dim+3], h_dbg[dim+4]);
         fflush(stderr);
     }
+
+    /* Begin batched backbone dispatch */
+    r->batched = true;
+    r->runner.beginRecording();
+
+    /* Initialize local_hidden = hidden */
+    opCopy(r, r->local_hidden, r->hidden, nt * dim);
 
     for (int L = 0; L < r->n_blocks; L++) {
         auto &ly = r->layers[L];
@@ -2263,107 +2321,22 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
         /* QK LayerNorm */
         if (L >= r->qk_norm_start && ly.has_qk_norm) {
-            opQkLayerNorm(r, r->qkv, ly.attn_q_norm_w, ly.attn_q_norm_b,
-                          nt, r->n_heads, r->head_dim, stride_3dim);
-            /* K starts at offset dim in the interleaved QKV buffer.
-             * We need a separate buffer pointing at the K portion.
-             * Since we use HOST_VISIBLE buffers, we handle this via a second dispatch
-             * on the same buffer with an adjusted base. For simplicity, use a push constant
-             * approach: the qk_layernorm shader operates on the buffer with a stride.
-             * The K portion is at offset dim from Q. Since QKV is [nt, 3*dim],
-             * Q is at [t*3*dim], K at [t*3*dim + dim].
-             * We need to apply LN to K. The shader handles stride, so we pass a different
-             * buffer view. Since Vulkan doesn't support offsets easily in SSBO bindings
-             * with our simple framework, we use a workaround: copy Q to separate buf,
-             * apply, copy back. OR: Use the shader's stride parameter.
-             * Actually the qk_layernorm shader uses: v = vec + t * stride + h * head_dim
-             * So for K, we need to add dim to the base pointer. Since our VulkanRunner
-             * doesn't support buffer offsets, we do this on the CPU side. */
-
-            /* For K normalization, we need to offset into the qkv buffer.
-             * Since HOST_VISIBLE, we can create a temporary buffer, copy K portion,
-             * normalize, copy back. But this is expensive. Instead, we rely on
-             * the shader accepting stride = 3*dim and doing the offset internally.
-             * The shader processes vec[t*stride + h*head_dim], which for Q starts at qkv[0].
-             * For K, we need to start at qkv[dim]. But we bind the full qkv buffer.
-             *
-             * Workaround: Create a second BufInfo that wraps the same VkBuffer but with an offset.
-             * Our framework doesn't support this, so we'll do a CPU copy approach for correctness.
-             */
-
-            /* CPU-side offset approach: map qkv, create a view buffer for K, apply LN */
-            /* Actually, let's create a small wrapper that handles the K offset.
-             * For now, we'll create a temporary buffer, copy K data, normalize, copy back. */
-            {
-                /* Create temp buffer for K normalization */
-                BufInfo k_tmp = createGpuBuffer(r->runner, (size_t)nt * dim * sizeof(float));
-                /* Copy K portion from QKV: K[t,h,d] = qkv[t*3*dim + dim + h*head_dim + d] */
-                {
-                    void *qkv_ptr = nullptr, *k_ptr = nullptr;
-                    r->runner.mapBuffer(r->qkv, &qkv_ptr);
-                    r->runner.mapBuffer(k_tmp, &k_ptr);
-                    const float *qkv_f = (const float *)qkv_ptr;
-                    float *k_f = (float *)k_ptr;
-                    for (int t = 0; t < nt; t++) {
-                        memcpy(k_f + t * dim, qkv_f + t * stride_3dim + dim, (size_t)dim * sizeof(float));
-                    }
-                    r->runner.unmapBuffer(r->qkv);
-                    r->runner.unmapBuffer(k_tmp);
-                }
-                /* Apply QK LayerNorm to K (using dim as stride since it's contiguous now) */
-                opQkLayerNorm(r, k_tmp, ly.attn_k_norm_w, ly.attn_k_norm_b,
-                              nt, r->n_heads, r->head_dim, dim);
-                /* Copy back */
-                {
-                    void *qkv_ptr = nullptr, *k_ptr = nullptr;
-                    r->runner.mapBuffer(r->qkv, &qkv_ptr);
-                    r->runner.mapBuffer(k_tmp, &k_ptr);
-                    float *qkv_f = (float *)qkv_ptr;
-                    const float *k_f = (const float *)k_ptr;
-                    for (int t = 0; t < nt; t++) {
-                        memcpy(qkv_f + t * stride_3dim + dim, k_f + t * dim, (size_t)dim * sizeof(float));
-                    }
-                    r->runner.unmapBuffer(r->qkv);
-                    r->runner.unmapBuffer(k_tmp);
-                }
-                r->runner.destroyBuffer(k_tmp);
-            }
+            /* Q norm: base_offset=0 (Q starts at beginning of each token's QKV) */
+            opQkLayerNormOffset(r, r->qkv, ly.attn_q_norm_w, ly.attn_q_norm_b,
+                                nt, r->n_heads, r->head_dim, stride_3dim, r->ln_eps, 0);
+            /* K norm: base_offset=dim (K starts at offset dim in each token's QKV) */
+            opQkLayerNormOffset(r, r->qkv, ly.attn_k_norm_w, ly.attn_k_norm_b,
+                                nt, r->n_heads, r->head_dim, stride_3dim, r->ln_eps, dim);
         }
 
         /* RoPE 2D */
         if (L >= r->rope_start) {
             BufInfo &use_py = is_global ? r->pos_y_nd : r->pos_y;
             BufInfo &use_px = is_global ? r->pos_x_nd : r->pos_x;
-            opRope2d(r, r->qkv, use_py, use_px, nt, r->n_heads, r->head_dim, stride_3dim);
-            /* Apply RoPE to K as well - same offset issue.
-             * Again, copy K out, apply RoPE, copy back. */
-            {
-                BufInfo k_tmp = createGpuBuffer(r->runner, (size_t)nt * dim * sizeof(float));
-                {
-                    void *qkv_ptr = nullptr, *k_ptr = nullptr;
-                    r->runner.mapBuffer(r->qkv, &qkv_ptr);
-                    r->runner.mapBuffer(k_tmp, &k_ptr);
-                    const float *qkv_f = (const float *)qkv_ptr;
-                    float *k_f = (float *)k_ptr;
-                    for (int t = 0; t < nt; t++)
-                        memcpy(k_f + t * dim, qkv_f + t * stride_3dim + dim, (size_t)dim * sizeof(float));
-                    r->runner.unmapBuffer(r->qkv);
-                    r->runner.unmapBuffer(k_tmp);
-                }
-                opRope2d(r, k_tmp, use_py, use_px, nt, r->n_heads, r->head_dim, dim);
-                {
-                    void *qkv_ptr = nullptr, *k_ptr = nullptr;
-                    r->runner.mapBuffer(r->qkv, &qkv_ptr);
-                    r->runner.mapBuffer(k_tmp, &k_ptr);
-                    float *qkv_f = (float *)qkv_ptr;
-                    const float *k_f = (const float *)k_ptr;
-                    for (int t = 0; t < nt; t++)
-                        memcpy(qkv_f + t * stride_3dim + dim, k_f + t * dim, (size_t)dim * sizeof(float));
-                    r->runner.unmapBuffer(r->qkv);
-                    r->runner.unmapBuffer(k_tmp);
-                }
-                r->runner.destroyBuffer(k_tmp);
-            }
+            /* Q RoPE: base_offset=0 */
+            opRope2d(r, r->qkv, use_py, use_px, nt, r->n_heads, r->head_dim, stride_3dim, 100.0f, 0);
+            /* K RoPE: base_offset=dim */
+            opRope2d(r, r->qkv, use_py, use_px, nt, r->n_heads, r->head_dim, stride_3dim, 100.0f, dim);
         }
 
         /* KV transpose + Flash Attention */
@@ -2427,28 +2400,42 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
         /* Per-block backbone stats */
         if (r->verbose >= 2) {
+            if (r->batched) {
+                r->runner.endRecordingAndSubmitFenced(r->batch_fence);
+                r->runner.waitForFence(r->batch_fence);
+                r->runner.resetFence(r->batch_fence);
+            }
             std::vector<float> h_dbg(nt * dim);
-            downloadFromBuffer(r->runner, r->hidden, h_dbg.data(), nt * dim * sizeof(float));
+            r->runner.downloadFromDeviceLocal(r->hidden, h_dbg.data(), nt * dim * sizeof(float));
             float mn = h_dbg[0], mx = h_dbg[0], sum = 0;
             for (int i = 0; i < nt * dim; i++) { if (h_dbg[i]<mn) mn=h_dbg[i]; if (h_dbg[i]>mx) mx=h_dbg[i]; sum+=h_dbg[i]; }
             fprintf(stderr, "DA3: block %2d (%s): min=%8.4f max=%8.4f mean=%10.6f\n", L, is_global?"global":"local ", mn, mx, sum/(nt*dim));
             fflush(stderr);
+            if (r->batched) {
+                r->runner.resetDynamicDescriptorPool();
+                r->runner.beginRecording();
+            }
         }
     }
+
+    /* End batched backbone dispatch */
+    r->runner.endRecordingAndSubmitFenced(r->batch_fence);
+    r->runner.waitForFence(r->batch_fence);
+    r->runner.resetFence(r->batch_fence);
+    r->runner.resetDynamicDescriptorPool();
+    r->batched = false;
 
     /* Free conditioned camera token buffer if allocated */
     if (have_cond_cam && isValid(d_cond_cam_token))
         r->runner.destroyBuffer(d_cond_cam_token);
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
-    if (r->verbose >= 1) gpuSync(r);
-    r->runner.resetDynamicDescriptorPool();
     fprintf(stderr, "DA3: GPU backbone (%d blocks): %.1f ms\n", r->n_blocks, (t1 - t0) * 1000);
 
     /* dump backbone hidden stats (verbose >= 3) */
     if (r->verbose >= 3) {
         std::vector<float> h_dbg(nt * dim);
-        downloadFromBuffer(r->runner, r->hidden, h_dbg.data(), nt * dim * sizeof(float));
+        r->runner.downloadFromDeviceLocal(r->hidden, h_dbg.data(), nt * dim * sizeof(float));
         float mn = h_dbg[0], mx = h_dbg[0], sum = 0;
         for (int i = 0; i < nt * dim; i++) { if (h_dbg[i]<mn) mn=h_dbg[i]; if (h_dbg[i]>mx) mx=h_dbg[i]; sum+=h_dbg[i]; }
         fprintf(stderr, "DA3: backbone hidden: min=%.4f max=%.4f mean=%.6f\n", mn, mx, sum/(nt*dim));
@@ -2470,17 +2457,17 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
         /* Download MLP output and FC weights to CPU for tiny matmuls */
         std::vector<float> h_mlp(mlp_dim);
-        downloadFromBuffer(r->runner, r->proj_out, h_mlp.data(), (size_t)mlp_dim * sizeof(float));
+        r->runner.downloadFromDeviceLocal(r->proj_out, h_mlp.data(), (size_t)mlp_dim * sizeof(float));
 
         std::vector<float> h_fc_t_w(3*mlp_dim), h_fc_t_b(3);
         std::vector<float> h_fc_q_w(4*mlp_dim), h_fc_q_b(4);
         std::vector<float> h_fc_f_w(2*mlp_dim), h_fc_f_b(2);
-        downloadFromBuffer(r->runner, cd.fc_t_w, h_fc_t_w.data(), 3*mlp_dim*sizeof(float));
-        downloadFromBuffer(r->runner, cd.fc_t_b, h_fc_t_b.data(), 3*sizeof(float));
-        downloadFromBuffer(r->runner, cd.fc_qvec_w, h_fc_q_w.data(), 4*mlp_dim*sizeof(float));
-        downloadFromBuffer(r->runner, cd.fc_qvec_b, h_fc_q_b.data(), 4*sizeof(float));
-        downloadFromBuffer(r->runner, cd.fc_fov_w, h_fc_f_w.data(), 2*mlp_dim*sizeof(float));
-        downloadFromBuffer(r->runner, cd.fc_fov_b, h_fc_f_b.data(), 2*sizeof(float));
+        r->runner.downloadFromDeviceLocal( cd.fc_t_w, h_fc_t_w.data(), 3*mlp_dim*sizeof(float));
+        r->runner.downloadFromDeviceLocal( cd.fc_t_b, h_fc_t_b.data(), 3*sizeof(float));
+        r->runner.downloadFromDeviceLocal( cd.fc_qvec_w, h_fc_q_w.data(), 4*mlp_dim*sizeof(float));
+        r->runner.downloadFromDeviceLocal( cd.fc_qvec_b, h_fc_q_b.data(), 4*sizeof(float));
+        r->runner.downloadFromDeviceLocal( cd.fc_fov_w, h_fc_f_w.data(), 2*mlp_dim*sizeof(float));
+        r->runner.downloadFromDeviceLocal( cd.fc_fov_b, h_fc_f_b.data(), 2*sizeof(float));
 
         for (int o = 0; o < 3; o++) { float s = h_fc_t_b[o]; for (int k = 0; k < mlp_dim; k++) s += h_fc_t_w[o*mlp_dim+k]*h_mlp[k]; result.pose[o] = s; }
         for (int o = 0; o < 4; o++) { float s = h_fc_q_b[o]; for (int k = 0; k < mlp_dim; k++) s += h_fc_q_w[o*mlp_dim+k]*h_mlp[k]; result.pose[3+o] = s; }
@@ -2505,6 +2492,10 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         fprintf(stderr, "DA3: no DPT head weights\n");
         return result;
     }
+
+    /* Begin batched DPT head dispatch */
+    r->batched = true;
+    r->runner.beginRecording();
 
     auto &dw = r->dpt;
     int feat = r->head_features;
@@ -2532,7 +2523,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         if (isValid(dw.norm_w)) {
             opLayerNorm(r, r->dpt_ln, r->dpt_cat, dw.norm_w, dw.norm_b, np, head_dim_in);
         } else {
-            bufferCopy(r->runner, r->dpt_ln, r->dpt_cat, (size_t)np * head_dim_in * sizeof(float));
+            opCopy(r, r->dpt_ln, r->dpt_cat, np * head_dim_in);
         }
 
         /* Project: [np, 2*dim] -> [np, oc_val] */
@@ -2541,13 +2532,15 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
         /* DPT projection stats */
         if (r->verbose >= 3 && fi == 0) {
+            if (r->batched) { r->runner.endRecordingAndSubmitFenced(r->batch_fence); r->runner.waitForFence(r->batch_fence); r->runner.resetFence(r->batch_fence); }
             int pn = np * oc_val;
             std::vector<float> dbg(pn);
-            downloadFromBuffer(r->runner, r->dpt_proj, dbg.data(), pn * sizeof(float));
+            r->runner.downloadFromDeviceLocal( r->dpt_proj, dbg.data(), pn * sizeof(float));
             float mn=dbg[0], mx=dbg[0], sm=0;
             for (int i=0;i<pn;i++){if(dbg[i]<mn)mn=dbg[i];if(dbg[i]>mx)mx=dbg[i];sm+=dbg[i];}
             fprintf(stderr, "DA3: DPT fi=0 proj[%d]: min=%.4f max=%.4f mean=%.6f\n", pn, mn, mx, sm/pn);
             fflush(stderr);
+            if (r->batched) { r->runner.resetDynamicDescriptorPool(); r->runner.beginRecording(); }
         }
 
         /* Spatial alignment */
@@ -2564,7 +2557,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         } else if (fi == 2) {
             /* Identity: tok_to_chw */
             opTokToChw(r, r->dpt_chw, r->dpt_proj, oc_val, gh, gw);
-            bufferCopy(r->runner, r->dpt_spatial[2], r->dpt_chw, (size_t)oc_val * gh * gw * sizeof(float));
+            opCopy(r, r->dpt_spatial[2], r->dpt_chw, oc_val * gh * gw);
         } else {
             /* Conv2d 3x3 stride 2 (downsample) */
             opTokToChw(r, r->dpt_chw, r->dpt_proj, oc_val, gh, gw);
@@ -2580,15 +2573,17 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
     /* adapted stats (verbose >= 3) */
     if (r->verbose >= 3) {
+        if (r->batched) { r->runner.endRecordingAndSubmitFenced(r->batch_fence); r->runner.waitForFence(r->batch_fence); r->runner.resetFence(r->batch_fence); }
         for (int fi2 = 0; fi2 < 4; fi2++) {
             int an = feat * sp_h[fi2] * sp_w[fi2];
             std::vector<float> dbg(an);
-            downloadFromBuffer(r->runner, r->dpt_adapted[fi2], dbg.data(), an * sizeof(float));
+            r->runner.downloadFromDeviceLocal( r->dpt_adapted[fi2], dbg.data(), an * sizeof(float));
             float mn=dbg[0], mx=dbg[0], sm=0;
             for (int i=0;i<an;i++){if(dbg[i]<mn)mn=dbg[i];if(dbg[i]>mx)mx=dbg[i];sm+=dbg[i];}
             fprintf(stderr, "DA3: adapted[%d][%d]: min=%.4f max=%.4f mean=%.6f\n", fi2, an, mn, mx, sm/an);
         }
         fflush(stderr);
+        if (r->batched) { r->runner.resetDynamicDescriptorPool(); r->runner.beginRecording(); }
     }
 
     /* Bottom-up RefineNet fusion */
@@ -2610,13 +2605,15 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
     /* fused stats after RefineNet (verbose >= 3) */
     if (r->verbose >= 3) {
+        if (r->batched) { r->runner.endRecordingAndSubmitFenced(r->batch_fence); r->runner.waitForFence(r->batch_fence); r->runner.resetFence(r->batch_fence); }
         int fn = feat * fh * fw;
         std::vector<float> dbg(fn);
-        downloadFromBuffer(r->runner, r->dpt_fused, dbg.data(), fn * sizeof(float));
+        r->runner.downloadFromDeviceLocal( r->dpt_fused, dbg.data(), fn * sizeof(float));
         float mn=dbg[0], mx=dbg[0], sm=0;
         for (int i=0;i<fn;i++){if(dbg[i]<mn)mn=dbg[i];if(dbg[i]>mx)mx=dbg[i];sm+=dbg[i];}
         fprintf(stderr, "DA3: fused[%d] (%dx%d): min=%.4f max=%.4f mean=%.6f\n", fn, fh, fw, mn, mx, sm/fn);
         fflush(stderr);
+        if (r->batched) { r->runner.resetDynamicDescriptorPool(); r->runner.beginRecording(); }
     }
 
     /* Output convolutions */
@@ -2629,13 +2626,15 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
     /* neck output (verbose >= 3) */
     if (r->verbose >= 3) {
+        if (r->batched) { r->runner.endRecordingAndSubmitFenced(r->batch_fence); r->runner.waitForFence(r->batch_fence); r->runner.resetFence(r->batch_fence); }
         int nn = feat_half * fh * fw;
         std::vector<float> dbg(nn);
-        downloadFromBuffer(r->runner, r->dpt_tmp, dbg.data(), nn * sizeof(float));
+        r->runner.downloadFromDeviceLocal( r->dpt_tmp, dbg.data(), nn * sizeof(float));
         float mn=dbg[0], mx=dbg[0], sm=0;
         for (int i=0;i<nn;i++){if(dbg[i]<mn)mn=dbg[i];if(dbg[i]>mx)mx=dbg[i];sm+=dbg[i];}
         fprintf(stderr, "DA3: neck[%d] (%dx%d): min=%.4f max=%.4f mean=%.6f\n", nn, fh, fw, mn, mx, sm/nn);
         fflush(stderr);
+        if (r->batched) { r->runner.resetDynamicDescriptorPool(); r->runner.beginRecording(); }
     }
     /* 2. Bilinear upsample to model resolution */
     int model_h = gh * ps, model_w = gw * ps;
@@ -2657,13 +2656,15 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
     /* out_0+relu (verbose >= 3) */
     if (r->verbose >= 3) {
+        if (r->batched) { r->runner.endRecordingAndSubmitFenced(r->batch_fence); r->runner.waitForFence(r->batch_fence); r->runner.resetFence(r->batch_fence); }
         int nn = out_mid * model_h * model_w;
         std::vector<float> dbg(nn);
-        downloadFromBuffer(r->runner, r->dpt_tmp, dbg.data(), nn * sizeof(float));
+        r->runner.downloadFromDeviceLocal( r->dpt_tmp, dbg.data(), nn * sizeof(float));
         float mn=dbg[0], mx=dbg[0], sm=0;
         for (int i=0;i<nn;i++){if(dbg[i]<mn)mn=dbg[i];if(dbg[i]>mx)mx=dbg[i];sm+=dbg[i];}
         fprintf(stderr, "DA3: out_0+relu[%d] (%dx%d, out_mid=%d): min=%.4f max=%.4f mean=%.6f\n", nn, model_h, model_w, out_mid, mn, mx, sm/nn);
         fflush(stderr);
+        if (r->batched) { r->runner.resetDynamicDescriptorPool(); r->runner.beginRecording(); }
     }
     /* 5. out_2: Conv1x1 -> 2 channels */
     opConv2d(r, r->dpt_out, r->dpt_tmp, dw.out_2_w, dw.out_2_b,
@@ -2675,18 +2676,21 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
     /* depth activation output stats (verbose >= 3) */
     if (r->verbose >= 3) {
+        if (r->batched) { r->runner.endRecordingAndSubmitFenced(r->batch_fence); r->runner.waitForFence(r->batch_fence); r->runner.resetFence(r->batch_fence); }
         int dn = 2 * fh * fw;
         std::vector<float> dbg(dn);
-        downloadFromBuffer(r->runner, r->dpt_out, dbg.data(), dn * sizeof(float));
+        r->runner.downloadFromDeviceLocal( r->dpt_out, dbg.data(), dn * sizeof(float));
         float mn=dbg[0], mx=dbg[0], sm=0;
         for (int i=0;i<fh*fw;i++){if(dbg[i]<mn)mn=dbg[i];if(dbg[i]>mx)mx=dbg[i];sm+=dbg[i];}
         fprintf(stderr, "DA3: depth logits: min=%.4f max=%.4f mean=%.6f\n", mn, mx, sm/(fh*fw));
         fflush(stderr);
+        if (r->batched) { r->runner.resetDynamicDescriptorPool(); r->runner.beginRecording(); }
     }
 
     /* Bilinear upsample to original resolution */
     {
         size_t result_sz = (size_t)2 * img_h * img_w * sizeof(float);
+        int npix = img_w * img_h;
         if (result_sz > r->result_cap) {
             if (isValid(r->result_buf)) r->runner.destroyBuffer(r->result_buf);
             r->result_buf = createGpuBuffer(r->runner, result_sz);
@@ -2694,20 +2698,38 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
         }
         opBilinear(r, r->result_buf, r->dpt_out, 2, fh, fw, img_h, img_w);
 
-        std::vector<float> h_result((size_t)2 * img_h * img_w);
-        downloadFromBuffer(r->runner, r->result_buf, h_result.data(), result_sz);
+        /* Ensure download staging buffer is large enough */
+        if (result_sz > r->download_staging_cap) {
+            if (isValid(r->download_staging)) r->runner.destroyBuffer(r->download_staging);
+            r->runner.createStagingBuffer(result_sz, r->download_staging);
+            r->download_staging_cap = result_sz;
+        }
 
+        /* Record copy from device-local result_buf to staging */
+        r->runner.recordCopyBuffer(r->result_buf, r->download_staging, result_sz);
+
+        /* End DPT batch */
+        r->runner.endRecordingAndSubmitFenced(r->batch_fence);
+        r->runner.waitForFence(r->batch_fence);
+        r->runner.resetFence(r->batch_fence);
+        r->runner.resetDynamicDescriptorPool();
+        r->batched = false;
+
+        /* Read from staging */
         result.width = img_w;
         result.height = img_h;
-        result.depth = (float *)malloc((size_t)img_w * img_h * sizeof(float));
-        result.confidence = (float *)malloc((size_t)img_w * img_h * sizeof(float));
-        memcpy(result.depth, h_result.data(), (size_t)img_w * img_h * sizeof(float));
-        memcpy(result.confidence, h_result.data() + img_h * img_w, (size_t)img_w * img_h * sizeof(float));
+        result.depth = (float *)malloc((size_t)npix * sizeof(float));
+        result.confidence = (float *)malloc((size_t)npix * sizeof(float));
+        {
+            void *ptr = nullptr;
+            r->runner.mapBuffer(r->download_staging, &ptr);
+            memcpy(result.depth, ptr, (size_t)npix * sizeof(float));
+            memcpy(result.confidence, (float *)ptr + npix, (size_t)npix * sizeof(float));
+            r->runner.unmapBuffer(r->download_staging);
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
-    if (r->verbose >= 1) gpuSync(r);
-    r->runner.resetDynamicDescriptorPool();
     fprintf(stderr, "DA3: GPU DPT head: %.1f ms\n", (t1 - t0) * 1000);
 
     /* ---- Aux DPT (Phase 2): Rays + Sky Segmentation ---- */
@@ -2771,7 +2793,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
 
             /* output_conv1_aux: chain of Conv2d (no activation) */
             BufInfo *cur = &r->aux_scratch;
-            bufferCopy(r->runner, r->aux_scratch, r->dpt_fused, (size_t)feat * oh * ow * sizeof(float));
+            opCopy(r, r->aux_scratch, r->dpt_fused, feat * oh * ow);
             int ci = feat;
             for (int ci_idx = 0; ci_idx < aux.oc1_count[lv]; ci_idx++) {
                 int co = aux.oc1_co[lv][ci_idx];
@@ -2796,12 +2818,13 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
                 if (!isValid(ln_w)) {
                     ln_w = createGpuBuffer(r->runner, 32 * sizeof(float));
                     std::vector<float> ones(32, 1.0f);
-                    uploadToBuffer(r->runner, ln_w, ones.data(), 32 * sizeof(float));
+                    r->runner.uploadToDeviceLocal(ln_w, ones.data(), 32 * sizeof(float));
                     created_w = true;
                 }
                 if (!isValid(ln_b)) {
                     ln_b = createGpuBuffer(r->runner, 32 * sizeof(float));
-                    bufferZero(r->runner, ln_b, 32 * sizeof(float));
+                    std::vector<float> zeros_b(32, 0.0f);
+                    r->runner.uploadToDeviceLocal(ln_b, zeros_b.data(), 32 * sizeof(float));
                     created_b = true;
                 }
                 opChannelLayerNorm(r, r->aux_scratch, r->dpt_tmp2, ln_w, ln_b, 32, oh * ow);
@@ -2829,7 +2852,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
             opBilinear(r, r->result_buf, r->aux_out, 7, oh, ow, img_h, img_w);
 
             std::vector<float> h_aux_full((size_t)7 * npix);
-            downloadFromBuffer(r->runner, r->result_buf, h_aux_full.data(), aux_full_sz);
+            r->runner.downloadFromDeviceLocal( r->result_buf, h_aux_full.data(), aux_full_sz);
 
             /* Split: rays = channels 0-5 (linear), ray_confidence = channel 6 (expp1) */
             result.rays = (float *)malloc((size_t)6 * npix * sizeof(float));
@@ -2884,7 +2907,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
             if (isValid(gdw.norm_w))
                 opLayerNorm(r, r->dpt_ln, r->dpt_cat, gdw.norm_w, gdw.norm_b, np, head_dim_in);
             else
-                bufferCopy(r->runner, r->dpt_ln, r->dpt_cat, (size_t)np * head_dim_in * sizeof(float));
+                opCopy(r, r->dpt_ln, r->dpt_cat, np * head_dim_in);
 
             opMatmulBiasF16(r, r->dpt_proj, gdw.proj_w[fi], r->dpt_ln, gdw.proj_b[fi],
                          np, oc_val, head_dim_in);
@@ -2899,7 +2922,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
                                     oc_val, oc_val, gh, gw, 2, 2, 2);
             else if (fi == 2) {
                 opTokToChw(r, r->dpt_chw, r->dpt_proj, oc_val, gh, gw);
-                bufferCopy(r->runner, r->dpt_spatial[2], r->dpt_chw, (size_t)oc_val * gh * gw * sizeof(float));
+                opCopy(r, r->dpt_spatial[2], r->dpt_chw, oc_val * gh * gw);
             } else {
                 opTokToChw(r, r->dpt_chw, r->dpt_proj, oc_val, gh, gw);
                 opConv2d(r, r->dpt_spatial[3], r->dpt_chw, gdw.downsample_w, gdw.downsample_b,
@@ -2987,7 +3010,7 @@ da3_full_result vulkan_da3_predict_full(vulkan_da3_runner *r, const uint8_t *rgb
             }
             opBilinear(r, r->result_buf, r->gs_out, gs_oc, gs_fh, gs_fw, img_h, img_w);
             result.gaussians = (float *)malloc(gs_full_sz);
-            downloadFromBuffer(r->runner, r->result_buf, result.gaussians, gs_full_sz);
+            r->runner.downloadFromDeviceLocal( r->result_buf, result.gaussians, gs_full_sz);
             result.has_gaussians = 1;
         }
 
@@ -3056,6 +3079,8 @@ vulkan_da3_runner *vulkan_da3_init(int device_id, int verbose, const char *shade
         return nullptr;
     }
 
+    r->runner.createFence(r->batch_fence);
+
     if (verbose >= 1) fprintf(stderr, "DA3: Vulkan runner initialized (device %d)\n", device_id);
     return r;
 }
@@ -3069,6 +3094,13 @@ void vulkan_da3_free(vulkan_da3_runner *r) {
 
     /* Free CPU pos_embed copy */
     free(r->h_pos_embed_orig);
+
+    /* Destroy staging buffers */
+    if (isValid(r->upload_staging)) r->runner.destroyBuffer(r->upload_staging);
+    if (isValid(r->download_staging)) r->runner.destroyBuffer(r->download_staging);
+
+    /* Destroy batch fence */
+    if (r->batch_fence != VK_NULL_HANDLE) r->runner.destroyFence(r->batch_fence);
 
     /* The VulkanRunner destructor handles Vulkan cleanup */
     delete r;
