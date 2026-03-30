@@ -18,6 +18,9 @@
 /* transformer.h header-only: gives us qtensor type + dequant declarations */
 #include "../../common/ggml_dequant.h"
 #include "../../common/transformer.h"
+/* safetensors.h for cuda_llm_inject_biases — IMPLEMENTATION must be defined
+ * by the translation unit that includes this .c file (e.g. test_cuda_qimg.c) */
+#include "../../common/safetensors.h"
 
 /* ======================================================================== */
 /* CUDA C kernel source (compiled at runtime via NVRTC)                     */
@@ -2846,6 +2849,9 @@ typedef struct {
     CUdeviceptr attn_v_w;
     CUdeviceptr attn_q_norm_w; /* F32 [head_dim] */
     CUdeviceptr attn_k_norm_w; /* F32 [head_dim] */
+    CUdeviceptr attn_q_bias;   /* F32 [q_dim], 0 if absent (Qwen2.5-VL) */
+    CUdeviceptr attn_k_bias;   /* F32 [kv_dim] */
+    CUdeviceptr attn_v_bias;   /* F32 [kv_dim] */
     CUdeviceptr attn_output_w; /* F16 */
     CUdeviceptr ffn_norm_w;    /* F32 [n_embd] */
     CUdeviceptr ffn_gate_w;    /* F16 */
@@ -3450,6 +3456,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
     else if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
+    else if (gguf_find_key(gguf, "qwen2vl.block_count") >= 0) arch = "qwen2vl";
 
     char kbuf[128];
     #define ARCH_KEY(suffix) (snprintf(kbuf, sizeof(kbuf), "%s." suffix, arch), kbuf)
@@ -3719,13 +3726,46 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 if (upload_norm_f32(&cl->attn_k_norm_w, &t, r->head_dim) != 0) return -1;
             }
 
+            /* Q/K/V biases (F32, optional — Qwen2.5-VL has these) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+            t = cllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                size_t sz = (size_t)t.n_cols * sizeof(float);
+                cuMemAlloc(&cl->attn_q_bias, sz);
+                /* Dequant to F32 and upload */
+                float *tmp = (float *)malloc(sz);
+                dequant_row(t.type, t.data, tmp, t.n_cols);
+                cuMemcpyHtoD(cl->attn_q_bias, tmp, sz);
+                free(tmp);
+            }
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+            t = cllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                size_t sz = (size_t)t.n_cols * sizeof(float);
+                cuMemAlloc(&cl->attn_k_bias, sz);
+                float *tmp = (float *)malloc(sz);
+                dequant_row(t.type, t.data, tmp, t.n_cols);
+                cuMemcpyHtoD(cl->attn_k_bias, tmp, sz);
+                free(tmp);
+            }
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);
+            t = cllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                size_t sz = (size_t)t.n_cols * sizeof(float);
+                cuMemAlloc(&cl->attn_v_bias, sz);
+                float *tmp = (float *)malloc(sz);
+                dequant_row(t.type, t.data, tmp, t.n_cols);
+                cuMemcpyHtoD(cl->attn_v_bias, tmp, sz);
+                free(tmp);
+            }
+
             if (r->verbose >= 2) {
-                fprintf(stderr, "  layer %d [ATT]: Q[%d×%d] K[%d×%d] V[%d×%d] O[%d×%d] qk_norm=%d\n",
+                fprintf(stderr, "  layer %d [ATT]: Q[%d×%d] K[%d×%d] V[%d×%d] O[%d×%d] qk_norm=%d bias=%d\n",
                         l, cl->attn_q_rows, cl->attn_q_cols,
                         cl->attn_k_rows, cl->attn_k_cols,
                         cl->attn_v_rows, cl->attn_v_cols,
                         cl->attn_output_rows, cl->attn_output_cols,
-                        cl->has_qk_norm);
+                        cl->has_qk_norm, cl->attn_q_bias ? 1 : 0);
             }
         }
 
@@ -4938,8 +4978,11 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             /* === Standard attention (non-hybrid) === */
             /* Q/K/V projections (auto-dispatch) */
             launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+            if (cl->attn_q_bias) launch_add(r, r->d_q, cl->attn_q_bias, cl->attn_q_rows);
             launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+            if (cl->attn_k_bias) launch_add(r, r->d_k, cl->attn_k_bias, cl->attn_k_rows);
             launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            if (cl->attn_v_bias) launch_add(r, r->d_v, cl->attn_v_bias, cl->attn_v_rows);
 
             /* QK-Norm (if present) */
             if (cl->has_qk_norm) {
@@ -5446,6 +5489,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
             if (cl->attn_v_w)      cuMemFree(cl->attn_v_w);
             if (cl->attn_q_norm_w) cuMemFree(cl->attn_q_norm_w);
             if (cl->attn_k_norm_w) cuMemFree(cl->attn_k_norm_w);
+            if (cl->attn_q_bias)   cuMemFree(cl->attn_q_bias);
+            if (cl->attn_k_bias)   cuMemFree(cl->attn_k_bias);
+            if (cl->attn_v_bias)   cuMemFree(cl->attn_v_bias);
             if (cl->attn_output_w) cuMemFree(cl->attn_output_w);
             if (cl->ffn_norm_w)    cuMemFree(cl->ffn_norm_w);
             if (cl->ffn_gate_w)    cuMemFree(cl->ffn_gate_w);
@@ -5513,6 +5559,75 @@ void cuda_llm_reset_state(cuda_llm_runner *r) {
             cuMemsetD8(cl->d_recurrent_state, 0, rec_bytes);
         }
     }
+}
+
+int cuda_llm_inject_biases(cuda_llm_runner *r, const char *safetensors_path) {
+    if (!r || !safetensors_path) return 0;
+
+    st_context *st = safetensors_open(safetensors_path);
+    if (!st) {
+        fprintf(stderr, "cuda_llm: cannot open safetensors for biases: %s\n", safetensors_path);
+        return 0;
+    }
+
+    int n_loaded = 0;
+    for (int l = 0; l < r->n_layers; l++) {
+        cuda_layer *cl = &r->layers[l];
+        if (cl->is_ssm) continue;  /* SSM layers don't have attention biases */
+
+        char wn[256];
+        for (int qi = 0; qi < 3; qi++) {
+            const char *proj = (qi == 0) ? "q" : (qi == 1) ? "k" : "v";
+            snprintf(wn, sizeof(wn), "model.layers.%d.self_attn.%s_proj.bias", l, proj);
+            int idx = safetensors_find(st, wn);
+            if (idx < 0) continue;
+
+            const uint64_t *shape = safetensors_shape(st, idx);
+            int n = (int)shape[0];
+            const char *dtype = safetensors_dtype(st, idx);
+            const void *raw = safetensors_data(st, idx);
+
+            /* Dequant to F32 */
+            float *f32 = (float *)malloc((size_t)n * sizeof(float));
+            if (strcmp(dtype, "BF16") == 0) {
+                const uint16_t *bf = (const uint16_t *)raw;
+                for (int i = 0; i < n; i++) {
+                    uint32_t bits = (uint32_t)bf[i] << 16;
+                    memcpy(&f32[i], &bits, 4);
+                }
+            } else if (strcmp(dtype, "F32") == 0) {
+                memcpy(f32, raw, (size_t)n * sizeof(float));
+            } else if (strcmp(dtype, "F16") == 0) {
+                /* F16 to F32 — simple conversion */
+                const uint16_t *fp16 = (const uint16_t *)raw;
+                for (int i = 0; i < n; i++) {
+                    uint32_t h = fp16[i];
+                    uint32_t sign = (h >> 15) & 1;
+                    uint32_t exp = (h >> 10) & 0x1F;
+                    uint32_t mant = h & 0x3FF;
+                    uint32_t f;
+                    if (exp == 0) f = sign << 31;
+                    else if (exp == 31) f = (sign << 31) | 0x7F800000 | (mant << 13);
+                    else f = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+                    memcpy(&f32[i], &f, 4);
+                }
+            }
+
+            CUdeviceptr *dst = (qi == 0) ? &cl->attn_q_bias :
+                               (qi == 1) ? &cl->attn_k_bias : &cl->attn_v_bias;
+            size_t sz = (size_t)n * sizeof(float);
+            if (*dst) cuMemFree(*dst);  /* free existing if any */
+            cuMemAlloc(dst, sz);
+            cuMemcpyHtoD(*dst, f32, sz);
+            free(f32);
+            n_loaded++;
+        }
+    }
+
+    safetensors_close(st);
+    if (r->verbose >= 1)
+        fprintf(stderr, "cuda_llm: injected %d Q/K/V biases from %s\n", n_loaded, safetensors_path);
+    return n_loaded;
 }
 
 int cuda_llm_n_embd(const cuda_llm_runner *r) { return r ? r->n_embd : 0; }

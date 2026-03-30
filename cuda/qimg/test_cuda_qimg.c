@@ -33,6 +33,7 @@
 #include "../../common/qwen_image_scheduler.h"
 #include "../../common/qwen_image_dit.h"
 #include "../../common/qwen_image_vae.h"
+#include "../llm/cuda_llm_runner.h"  /* must be before text_encoder.h for GPU path */
 #include "../../common/qwen_image_text_encoder.h"
 #include "cuda_qimg_runner.h"
 
@@ -136,10 +137,13 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "init") == 0) { cuda_qimg_free(r); return 0; }
 
-    /* ---- Load DiT ---- */
-    clock_t t0 = clock();
-    if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
-    fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+    /* ---- Load DiT (deferred for gen mode to allow GPU text encoding first) ---- */
+    clock_t t0;
+    if (strcmp(mode, "gen") != 0) {
+        t0 = clock();
+        if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
+        fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+    }
 
     if (strcmp(mode, "load") == 0) {
         cuda_qimg_load_vae(r, vae_path);
@@ -299,8 +303,24 @@ int main(int argc, char **argv) {
             }
         } /* if !custom_prompt */
 
-        /* Try GGUF text encoder + biases from safetensors (fast quantized inference
-         * with correct attention biases from the FP8 file). */
+        /* Try GPU text encoder (GGUF + biases, ~500× faster than CPU).
+         * NOTE: GPU text encoder creates its own CUDA context which conflicts
+         * with the DiT runner's context on 16GB cards. Disabled by default
+         * until shared-context support is added. Use --gpu-enc to enable. */
+        int use_gpu_enc = 0;
+        for (int i = 1; i < argc; i++)
+            if (strcmp(argv[i], "--gpu-enc") == 0) use_gpu_enc = 1;
+        if (!txt_hidden && use_gpu_enc) {
+            const char *bias_st = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
+            qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, bias_st, 0);
+            if (enc) {
+                txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
+                fprintf(stderr, "  Encoding negative prompt...\n");
+                txt_neg_hidden = qimg_text_enc_encode(enc, " ", &n_txt_neg);
+                qimg_text_enc_free(enc);
+            }
+        }
+        /* CPU GGUF fallback (slow but works without GPU LLM runner) */
         if (!txt_hidden) {
             const char *bias_st = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
             qimg_text_enc *enc = qimg_text_enc_load_gguf_with_biases(enc_path, bias_st);
@@ -337,6 +357,14 @@ int main(int argc, char **argv) {
          * Cond: 12 tokens, Uncond: 6 tokens — different attention patterns. */
         fprintf(stderr, "  Positive: %d tokens, Negative: %d tokens (separate passes)\n", n_txt, n_txt_neg);
         fprintf(stderr, "  Text encoding: %.1fs\n", (double)(clock() - enc_t0) / CLOCKS_PER_SEC);
+
+        /* Restore qimg CUDA context after GPU text encoder may have used a different one */
+        cuCtxSetCurrent(r->ctx);
+
+        /* Load DiT weights (deferred from init to allow GPU text encoding to use VRAM first) */
+        t0 = clock();
+        if (cuda_qimg_load_dit(r, dit_path) != 0) { cuda_qimg_free(r); return 1; }
+        fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
         /* 2. DiT denoising loop (CUDA) */
         fprintf(stderr, "\n[2/3] DiT denoising (%d steps, %dx%d, %s)...\n",
