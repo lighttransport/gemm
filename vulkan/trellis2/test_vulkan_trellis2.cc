@@ -115,6 +115,7 @@ int main(int argc, char **argv) {
             "  --npy <path>     Save latent/occupancy as .npy\n"
             "  --dit-only       Only run DiT (no decoder)\n"
             "  --decode-only <latent.npy>  Only run decoder\n"
+            "  --encode <dinov3.st> <image.npy>  Run DINOv3 encoder only\n"
             "  -v               Verbose\n",
             argv[0]);
         return 1;
@@ -127,6 +128,8 @@ int main(int argc, char **argv) {
     const char *noise_path = nullptr;
     const char *npy_path = nullptr;
     const char *decode_only_path = nullptr;
+    const char *encode_dinov3_path = nullptr;
+    const char *encode_image_path = nullptr;
     uint32_t seed = 42;
     int n_steps = 12;
     float cfg_scale = 7.5f;
@@ -144,12 +147,39 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
         else if (strcmp(argv[i], "--dit-only") == 0) dit_only = true;
         else if (strcmp(argv[i], "--decode-only") == 0 && i + 1 < argc) decode_only_path = argv[++i];
+        else if (strcmp(argv[i], "--encode") == 0 && i + 2 < argc) { encode_dinov3_path = argv[++i]; encode_image_path = argv[++i]; }
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
     }
 
     /* Initialize */
     vulkan_trellis2_runner *r = vulkan_trellis2_init(0, verbose);
     if (!r) { fprintf(stderr, "Failed to init Vulkan runner\n"); return 1; }
+
+    /* Encode-only mode */
+    if (encode_dinov3_path) {
+        if (vulkan_trellis2_load_weights(r, encode_dinov3_path, nullptr, nullptr) != 0) {
+            fprintf(stderr, "Failed to load DINOv3 weights\n");
+            vulkan_trellis2_free(r);
+            return 1;
+        }
+        int ndim, dims[8];
+        float *image = read_npy_f32(encode_image_path, &ndim, dims);
+        if (!image) { vulkan_trellis2_free(r); return 1; }
+
+        std::vector<float> features(1029 * 1024);
+        vulkan_trellis2_run_dinov3(r, image, features.data());
+
+        fprintf(stderr, "DINOv3 features: [%.6f, %.6f, %.6f, %.6f]\n",
+                features[0], features[1], features[2], features[3]);
+
+        if (npy_path) {
+            int od[] = {1029, 1024};
+            write_npy_f32(npy_path, features.data(), od, 2);
+        }
+        free(image);
+        vulkan_trellis2_free(r);
+        return 0;
+    }
 
     /* Load weights */
     if (vulkan_trellis2_load_weights(r, nullptr, stage1_path, decoder_path) != 0) {
