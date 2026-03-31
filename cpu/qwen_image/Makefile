@@ -23,22 +23,22 @@ test-sched: test_qwen_image
 	./test_qwen_image --test-sched
 
 test-vae: test_qwen_image
-	./test_qwen_image --test-vae /mnt/disk01/models/qwen-image/vae/qwen_image_vae.safetensors \
+	./test_qwen_image --test-vae /mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors \
 		--height 64 --width 64
 
 test-dit: test_qwen_image
-	./test_qwen_image --test-dit /mnt/disk01/models/qwen-image/diffusion-models/qwen-image-Q4_0.gguf \
+	./test_qwen_image --test-dit /mnt/nvme02/models/qwen-image/diffusion-models/qwen-image-Q4_0.gguf \
 		--height 64 --width 64
 
 test-enc: test_qwen_image
-	./test_qwen_image --test-enc /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
+	./test_qwen_image --test-enc /mnt/nvme02/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
 		--prompt "a red apple on a white table"
 
 test-gen: test_qwen_image
 	./test_qwen_image --generate \
-		/mnt/disk01/models/qwen-image/diffusion-models/qwen-image-Q4_0.gguf \
-		/mnt/disk01/models/qwen-image/vae/qwen_image_vae.safetensors \
-		/mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
+		/mnt/nvme02/models/qwen-image/diffusion-models/qwen-image-Q4_0.gguf \
+		/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors \
+		/mnt/nvme02/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
 		--height 256 --width 256 --steps 20 --seed 42 \
 		--prompt "a red apple on a white table"
 
