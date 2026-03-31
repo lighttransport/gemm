@@ -585,27 +585,56 @@ int main(int argc, char **argv) {
         t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
 
         if (fdg_mesh.n_tris > 0) {
-            if (tex_slat) {
-                /* Run texture decoder on CPU to get PBR voxel field,
-                 * then sample vertex colors from the field.
-                 * For now, use the raw texture latent directly as a placeholder
-                 * (full texture decoder would produce 6-channel output).
-                 * TODO: Run actual texture decoder SC-VAE for 6-channel output.
-                 *
-                 * Compute voxel grid resolution from shape decoder output coords */
-                int max_c = 0;
-                for (int i = 0; i < result.N * 3; i++)
-                    if (coords3[i] > max_c) max_c = coords3[i];
-                int tex_res = max_c + 1;
+            if (tex_slat && shape_dec_path) {
+                /* Run texture decoder on CPU to get 6-channel PBR voxel field */
+                fprintf(stderr, "\n=== Texture Decoder (CPU, %d threads) ===\n", n_threads);
+                t2_shape_dec *tex_dec = t2_shape_dec_load(
+                    "/mnt/disk01/models/trellis2-4b/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors");
+                if (tex_dec) {
+                    /* Create sparse tensor from texture latent + shape coords */
+                    sp3d_tensor *tex_tensor = sp3d_create(sparse_coords, tex_slat,
+                                                           N_sparse, 32, 1);
+                    t2_shape_dec_result tex_result = t2_shape_dec_forward(tex_dec, tex_tensor, n_threads);
+                    fprintf(stderr, "Texture decoder output: N=%d, C=%d\n",
+                            tex_result.N, tex_result.C);
 
-                fprintf(stderr, "\n=== PBR Vertex Color Sampling (tex_res=%d) ===\n", tex_res);
+                    /* Scale decoder output: * 0.5 + 0.5 -> [0,1] */
+                    /* Build PBR field from texture decoder output */
+                    int max_c = 0;
+                    for (int i = 0; i < tex_result.N; i++) {
+                        for (int j = 1; j <= 3; j++)
+                            if (tex_result.coords[i*4+j] > max_c)
+                                max_c = tex_result.coords[i*4+j];
+                    }
+                    int tex_res = max_c + 1;
+                    fprintf(stderr, "\n=== PBR Texture Baking (res=%d) ===\n", tex_res);
 
-                /* Since we don't have the full texture decoder on GPU yet,
-                 * we'll just use the shape decoder coords for now.
-                 * A full pipeline would run tex_dec on tex_slat + coords. */
-                fprintf(stderr, "Note: texture decoder not yet integrated, "
-                        "writing shape mesh without colors\n");
-                t2_fdg_write_obj(obj_path, &fdg_mesh);
+                    t2_pbr_field pbr = t2_pbr_from_decoder(
+                        tex_result.feats, tex_result.coords, tex_result.N, tex_res);
+
+                    /* Sample PBR at mesh vertices */
+                    t2_pbr_attr *colors = (t2_pbr_attr *)malloc(
+                        (size_t)fdg_mesh.n_verts * sizeof(t2_pbr_attr));
+                    t2_pbr_sample_vertices(&pbr, fdg_mesh.vertices, fdg_mesh.n_verts, colors);
+
+                    /* Write textured OBJ + MTL + texture maps */
+                    /* Strip .obj extension for base path */
+                    char base[512];
+                    snprintf(base, sizeof(base), "%s", obj_path);
+                    char *dot = strrchr(base, '.');
+                    if (dot) *dot = '\0';
+                    t2_pbr_write_textured_obj(base, fdg_mesh.vertices, fdg_mesh.triangles,
+                                               fdg_mesh.n_verts, fdg_mesh.n_tris, colors, 1024);
+
+                    free(colors);
+                    t2_pbr_free(&pbr);
+                    t2_shape_dec_result_free(&tex_result);
+                    sp3d_free(tex_tensor);
+                    t2_shape_dec_free(tex_dec);
+                } else {
+                    fprintf(stderr, "Failed to load texture decoder, writing shape-only mesh\n");
+                    t2_fdg_write_obj(obj_path, &fdg_mesh);
+                }
             } else {
                 t2_fdg_write_obj(obj_path, &fdg_mesh);
             }
