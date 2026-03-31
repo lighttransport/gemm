@@ -654,7 +654,14 @@ int main(int argc, char **argv) {
         t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
 
         if (fdg_mesh.n_tris > 0) {
-            if (tex_slat && stage3_path) {
+            /* Always write shape-only mesh first */
+            {
+                char shape_path[512];
+                snprintf(shape_path, sizeof(shape_path), "%s_shape.obj", obj_path);
+                t2_fdg_write_obj(shape_path, &fdg_mesh);
+            }
+
+            if (tex_slat && stage3_path && tex_dec_path) {
                 /* Run texture decoder to get 6-channel PBR voxel field */
                 fprintf(stderr, "\n=== Texture Decoder (CPU, %d threads) ===\n", n_threads);
                 t2_shape_dec *tex_dec = t2_shape_dec_load(tex_dec_path);
