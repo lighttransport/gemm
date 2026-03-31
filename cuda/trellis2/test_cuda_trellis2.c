@@ -23,7 +23,7 @@
 #include "../../common/ggml_dequant.h"
 #include "../../common/safetensors.h"
 #include "../../common/sparse3d.h"
-#define T2_SHAPE_DEC_IMPLEMENTATION
+/* trellis2_shape_decoder.h compiled in cuda_trellis2_runner.c */
 #include "../../common/trellis2_shape_decoder.h"
 #define T2_PBR_IMPLEMENTATION
 #include "../../common/trellis2_pbr.h"
