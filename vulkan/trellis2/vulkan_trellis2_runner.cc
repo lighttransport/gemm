@@ -80,6 +80,16 @@ struct t2_dit_block_vk {
     BufInfo mod_bias;  /* [6*DIT_DIM] = [9216] */
 };
 
+/* DINOv3 per-layer weights */
+struct t2_dino_layer_vk {
+    BufInfo ln1_w, ln1_b;
+    BufInfo q_w, q_b, k_w, k_b, v_w, v_b;  /* separate Q/K/V for RoPE */
+    BufInfo out_w, out_b;
+    BufInfo ls1, ls2;                        /* LayerScale gamma */
+    BufInfo ln2_w, ln2_b;
+    BufInfo fc1_w, fc1_b, fc2_w, fc2_b;
+};
+
 /* Decoder ResBlock weights */
 struct t2_dec_resblock_vk {
     BufInfo gn1_w, gn1_b, conv1_w, conv1_b;
@@ -115,8 +125,21 @@ struct vulkan_trellis2_runner {
     Pipeline pipe_conv3d;            /* 4 bufs: out, inp, w, bias; push: 24B */
     Pipeline pipe_channel_layernorm; /* 4 bufs: dst, src, w, b; push: 12B */
     Pipeline pipe_pixel_shuffle;     /* 2 bufs: dst, src; push: 16B */
-    Pipeline pipe_self_attn_tiled;   /* 4 bufs: out, Q, K, V; push: 24B */
+    Pipeline pipe_self_attn_tiled;   /* 4 bufs: out, Q, K, V; push: 28B */
+
+    /* DINOv3-specific */
+    Pipeline pipe_rope_2d_dinov3;    /* 4 bufs: Q, K, cos, sin; push: 20B */
+    Pipeline pipe_dinov3_prepend;    /* 4 bufs: hidden, patches, cls, reg; push: 12B */
+    Pipeline pipe_layerscale_add;    /* 3 bufs: dst, src, scale; push: 8B */
+    Pipeline pipe_patch_embed;       /* 4 bufs: out, image, W, bias; push: 24B */
     bool pipelines_created = false;
+
+    /* ---- DINOv3 weights ---- */
+    BufInfo dino_patch_w, dino_patch_b;
+    BufInfo dino_cls_token, dino_storage_tokens;
+    t2_dino_layer_vk dino_layers[DINO_LAYERS];
+    BufInfo dino_rope_cos, dino_rope_sin;
+    bool dino_has_layerscale = false;
 
     /* ---- DiT weights ---- */
     BufInfo dit_t_fc1_w, dit_t_fc1_b, dit_t_fc2_w, dit_t_fc2_b;
@@ -539,6 +562,53 @@ static void bufferZero(VulkanRunner &runner, BufInfo &buf, size_t bytes) {
     runner.unmapBuffer(buf);
 }
 
+/* ---- DINOv3-specific ops ---- */
+
+/* 2D RoPE for DINOv3 (rotate_half, patch tokens only) */
+static void opRope2dDinov3(vulkan_trellis2_runner *r, BufInfo &Q, BufInfo &K,
+                             BufInfo &cos_tab, BufInfo &sin_tab,
+                             int n_patches, int n_prefix, int dim, int n_heads, int head_dim) {
+    struct { uint32_t n_patches, n_prefix, dim, n_heads, head_dim; } pc = {
+        (uint32_t)n_patches, (uint32_t)n_prefix, (uint32_t)dim,
+        (uint32_t)n_heads, (uint32_t)head_dim
+    };
+    dispatchSync(r, r->pipe_rope_2d_dinov3, {Q, K, cos_tab, sin_tab}, &pc, sizeof(pc),
+                 (uint32_t)n_patches);
+}
+
+/* Prepend CLS + register tokens */
+static void opDinov3PrependTokens(vulkan_trellis2_runner *r, BufInfo &hidden,
+                                    BufInfo &patches, BufInfo &cls, BufInfo &reg,
+                                    int n_patches, int n_reg, int dim) {
+    struct { uint32_t n_patches, n_reg, dim; } pc = {
+        (uint32_t)n_patches, (uint32_t)n_reg, (uint32_t)dim
+    };
+    int n_prefix = 1 + n_reg;
+    int total = (n_prefix + n_patches) * dim;
+    dispatchSync(r, r->pipe_dinov3_prepend, {hidden, patches, cls, reg}, &pc, sizeof(pc),
+                 (uint32_t)((total + 255) / 256));
+}
+
+/* LayerScale add: dst[i] += src[i] * scale[i % dim] */
+static void opLayerscaleAdd(vulkan_trellis2_runner *r, BufInfo &dst, BufInfo &src,
+                              BufInfo &scale, int n, int dim) {
+    struct { uint32_t n, dim; } pc = {(uint32_t)n, (uint32_t)dim};
+    dispatchSync(r, r->pipe_layerscale_add, {dst, src, scale}, &pc, sizeof(pc),
+                 (uint32_t)((n + 255) / 256));
+}
+
+/* Patch embedding: conv2d-like from image patches */
+static void opPatchEmbed(vulkan_trellis2_runner *r, BufInfo &out, BufInfo &image,
+                           BufInfo &w, BufInfo &bias,
+                           int n_patches, int dim, int patch_size, int grid_w, int img_w) {
+    struct { uint32_t n_patches, dim, kernel_size, gw, width, patch_size; } pc = {
+        (uint32_t)n_patches, (uint32_t)dim, (uint32_t)(patch_size * patch_size * 3),
+        (uint32_t)grid_w, (uint32_t)img_w, (uint32_t)patch_size
+    };
+    dispatchSync(r, r->pipe_patch_embed, {image, w, bias, out}, &pc, sizeof(pc),
+                 (uint32_t)n_patches);
+}
+
 /* ======================================================================== */
 /* Pipeline creation                                                        */
 /* ======================================================================== */
@@ -591,6 +661,12 @@ static bool createPipelines(vulkan_trellis2_runner *r) {
     if (!createPipe("shaders/trellis2/pixel_shuffle_3d_f32",    2, 16, r->pipe_pixel_shuffle)) return false;
     if (!createPipe("shaders/trellis2/self_attn_tiled_f32",   4, 28, r->pipe_self_attn_tiled)) return false;
 
+    /* DINOv3-specific */
+    if (!createPipe("shaders/trellis2/rope_2d_dinov3_f32",     4, 20, r->pipe_rope_2d_dinov3)) return false;
+    if (!createPipe("shaders/trellis2/dinov3_prepend_tokens_f32", 4, 12, r->pipe_dinov3_prepend)) return false;
+    if (!createPipe("shaders/hy3d/layerscale_add_f32",          3,  8, r->pipe_layerscale_add)) return false;
+    if (!createPipe("shaders/patch_embed_f32",                  4, 24, r->pipe_patch_embed)) return false;
+
     r->pipelines_created = true;
 
     /* Create a small dummy buffer for unused descriptor bindings */
@@ -602,6 +678,157 @@ static bool createPipelines(vulkan_trellis2_runner *r) {
 /* ======================================================================== */
 /* Weight loading                                                           */
 /* ======================================================================== */
+
+/* Helper: get tensor data as F32 vector (handles F16/BF16/F32 conversion) */
+static std::vector<float> stGetF32(st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return {};
+    void *data = safetensors_data(st, idx);
+    size_t nbytes = safetensors_nbytes(st, idx);
+    const char *dtype = safetensors_dtype(st, idx);
+
+    if (strcmp(dtype, "F32") == 0) {
+        size_t n = nbytes / sizeof(float);
+        std::vector<float> v(n);
+        memcpy(v.data(), data, nbytes);
+        return v;
+    } else if (strcmp(dtype, "F16") == 0) {
+        size_t n = nbytes / sizeof(uint16_t);
+        std::vector<float> v(n);
+        const uint16_t *f16 = (const uint16_t *)data;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t sign = (f16[i] >> 15) & 0x1;
+            uint32_t exp = (f16[i] >> 10) & 0x1f;
+            uint32_t mant = f16[i] & 0x3ff;
+            uint32_t f;
+            if (exp == 0) f = sign << 31;
+            else if (exp == 31) f = (sign << 31) | 0x7f800000 | (mant << 13);
+            else f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+            memcpy(&v[i], &f, sizeof(float));
+        }
+        return v;
+    } else if (strcmp(dtype, "BF16") == 0) {
+        size_t n = nbytes / sizeof(uint16_t);
+        std::vector<float> v(n);
+        const uint16_t *bf16 = (const uint16_t *)data;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t f = (uint32_t)bf16[i] << 16;
+            memcpy(&v[i], &f, sizeof(float));
+        }
+        return v;
+    }
+    return {};
+}
+
+/* Upload F32 data to GPU buffer */
+static BufInfo uploadF32(VulkanRunner &runner, const float *data, size_t n) {
+    BufInfo buf = createGpuBuffer(runner, n * sizeof(float));
+    uploadToBuffer(runner, buf, data, n * sizeof(float));
+    return buf;
+}
+
+static int loadDinov3Weights(vulkan_trellis2_runner *r, const char *path) {
+    st_context *st = safetensors_open(path);
+    if (!st) { fprintf(stderr, "T2VK: cannot open DINOv3: %s\n", path); return -1; }
+    fprintf(stderr, "T2VK: loading DINOv3 from %s (%d tensors)\n", path, st->n_tensors);
+    int v = r->verbose;
+
+    /* Patch embedding + tokens (timm naming) */
+    r->dino_patch_w = stUploadF32(r->runner, st, "patch_embed.proj.weight", v);
+    r->dino_patch_b = stUploadF32(r->runner, st, "patch_embed.proj.bias", v);
+    r->dino_cls_token = stUploadF32(r->runner, st, "cls_token", v);
+    r->dino_storage_tokens = stUploadF32(r->runner, st, "reg_token", v);
+
+    r->dino_has_layerscale = false;
+
+    /* Per-layer weights */
+    for (int L = 0; L < DINO_LAYERS; L++) {
+        t2_dino_layer_vk &l = r->dino_layers[L];
+        char name[256];
+
+        #define DINO_LOAD(field, suffix) do { \
+            snprintf(name, sizeof(name), "blocks.%d.%s", L, suffix); \
+            l.field = stUploadF32(r->runner, st, name, v >= 2 ? v : 0); \
+        } while(0)
+
+        DINO_LOAD(ln1_w, "norm1.weight");
+        DINO_LOAD(ln1_b, "norm1.bias");
+
+        /* Split fused QKV [3*dim, dim] into separate Q, K, V on CPU */
+        snprintf(name, sizeof(name), "blocks.%d.attn.qkv.weight", L);
+        auto qkv_f32 = stGetF32(st, name);
+        if (!qkv_f32.empty()) {
+            int dim = DINO_HIDDEN;
+            l.q_w = uploadF32(r->runner, qkv_f32.data(), (size_t)dim * dim);
+            l.k_w = uploadF32(r->runner, qkv_f32.data() + dim * dim, (size_t)dim * dim);
+            l.v_w = uploadF32(r->runner, qkv_f32.data() + 2 * dim * dim, (size_t)dim * dim);
+            /* timm QKV has no bias — create zeros */
+            std::vector<float> zeros(dim, 0.0f);
+            l.q_b = uploadF32(r->runner, zeros.data(), dim);
+            l.k_b = uploadF32(r->runner, zeros.data(), dim);
+            l.v_b = uploadF32(r->runner, zeros.data(), dim);
+        }
+
+        DINO_LOAD(out_w, "attn.proj.weight");
+        DINO_LOAD(out_b, "attn.proj.bias");
+        DINO_LOAD(ln2_w, "norm2.weight");
+        DINO_LOAD(ln2_b, "norm2.bias");
+        DINO_LOAD(fc1_w, "mlp.fc1.weight");
+        DINO_LOAD(fc1_b, "mlp.fc1.bias");
+        DINO_LOAD(fc2_w, "mlp.fc2.weight");
+        DINO_LOAD(fc2_b, "mlp.fc2.bias");
+
+        /* LayerScale (timm: gamma_1, gamma_2) */
+        snprintf(name, sizeof(name), "blocks.%d.gamma_1", L);
+        l.ls1 = stUploadF32(r->runner, st, name, 0);
+        snprintf(name, sizeof(name), "blocks.%d.gamma_2", L);
+        l.ls2 = stUploadF32(r->runner, st, name, 0);
+        if (isValid(l.ls1)) r->dino_has_layerscale = true;
+
+        #undef DINO_LOAD
+    }
+
+    /* Precompute 2D RoPE tables for 32×32 grid */
+    {
+        const int gh = DINO_IMG_SIZE / DINO_PATCH;  /* 32 */
+        const int np = gh * gh;                      /* 1024 */
+        const int hd = DINO_HEAD_DIM;               /* 64 */
+        const float rope_theta = 100.0f;
+        const int n_freqs = hd / 4;                 /* 16 */
+
+        std::vector<float> inv_freq(n_freqs);
+        for (int j = 0; j < n_freqs; j++)
+            inv_freq[j] = 1.0f / powf(rope_theta, (float)(4 * j) / (float)hd);
+
+        std::vector<float> cos_tab(np * hd), sin_tab(np * hd);
+        for (int p = 0; p < np; p++) {
+            int py = p / gh, px = p % gh;
+            float cy = ((0.5f + py) / gh) * 2.0f - 1.0f;
+            float cx = ((0.5f + px) / gh) * 2.0f - 1.0f;
+
+            /* angles: [y_freqs(16), x_freqs(16)] tiled 2x = [y16, x16, y16, x16] = 64 */
+            float angles[64];
+            for (int j = 0; j < n_freqs; j++) {
+                angles[j]              = 2.0f * 3.14159265358979f * cy * inv_freq[j];
+                angles[n_freqs + j]    = 2.0f * 3.14159265358979f * cx * inv_freq[j];
+                angles[2*n_freqs + j]  = angles[j];        /* tile */
+                angles[3*n_freqs + j]  = angles[n_freqs + j];
+            }
+            for (int d = 0; d < hd; d++) {
+                cos_tab[p * hd + d] = cosf(angles[d]);
+                sin_tab[p * hd + d] = sinf(angles[d]);
+            }
+        }
+        r->dino_rope_cos = uploadF32(r->runner, cos_tab.data(), np * hd);
+        r->dino_rope_sin = uploadF32(r->runner, sin_tab.data(), np * hd);
+        fprintf(stderr, "T2VK: DINOv3 RoPE tables uploaded (%d freqs, %dx%d grid)\n", n_freqs, gh, gh);
+    }
+
+    safetensors_close(st);
+    fprintf(stderr, "T2VK: DINOv3 loaded (%d blocks, layerscale=%d)\n",
+            DINO_LAYERS, r->dino_has_layerscale ? 1 : 0);
+    return 0;
+}
 
 static int loadDitWeights(vulkan_trellis2_runner *r, const char *path) {
     st_context *st = safetensors_open(path);
@@ -741,6 +968,101 @@ static int loadDecoderWeights(vulkan_trellis2_runner *r, const char *path) {
     r->dec_loaded = true;
     fprintf(stderr, "T2VK: decoder loaded\n");
     return 0;
+}
+
+/* ======================================================================== */
+/* DINOv3 forward pass                                                      */
+/* ======================================================================== */
+
+static void runDinov3(vulkan_trellis2_runner *r,
+                        BufInfo &d_image, BufInfo &d_out) {
+    const int dim = DINO_HIDDEN;        /* 1024 */
+    const int heads = DINO_HEADS;       /* 16 */
+    const int hd = DINO_HEAD_DIM;       /* 64 */
+    const int ffn = DINO_FFN;           /* 4096 */
+    const int ps = DINO_PATCH;          /* 16 */
+    const int gw = DINO_IMG_SIZE / ps;  /* 32 */
+    const int np = DINO_N_PATCHES;      /* 1024 */
+    const int ns = DINO_N_STORAGE;      /* 4 */
+    const int seq = DINO_SEQ_LEN;       /* 1029 */
+    const int n_prefix = 1 + ns;        /* 5 */
+
+    if (r->verbose) fprintf(stderr, "T2VK: DINOv3 forward (seq=%d)\n", seq);
+    r->runner.resetDynamicDescriptorPool();
+
+    /* Scratch buffers */
+    BufInfo d_hidden = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
+    BufInfo d_Q      = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
+    BufInfo d_K      = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
+    BufInfo d_V      = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
+    BufInfo d_attn   = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
+    BufInfo d_mlp    = createGpuBuffer(r->runner, (size_t)seq * ffn * sizeof(float));
+    BufInfo d_normed = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
+
+    /* 1. Patch embedding: image [3, 512, 512] -> patches [1024, 1024] */
+    BufInfo d_patches = createGpuBuffer(r->runner, (size_t)np * dim * sizeof(float));
+    opPatchEmbed(r, d_patches, d_image, r->dino_patch_w, r->dino_patch_b,
+                 np, dim, ps, gw, DINO_IMG_SIZE);
+
+    /* 2. Prepend CLS + register tokens -> hidden [1029, 1024] */
+    opDinov3PrependTokens(r, d_hidden, d_patches, r->dino_cls_token,
+                           r->dino_storage_tokens, np, ns, dim);
+    r->runner.destroyBuffer(d_patches);
+
+    /* 3. Transformer blocks */
+    for (int li = 0; li < DINO_LAYERS; li++) {
+        t2_dino_layer_vk &l = r->dino_layers[li];
+
+        /* LN1 -> Q, K, V projections */
+        opLayerNorm(r, d_normed, d_hidden, l.ln1_w, l.ln1_b, seq, dim);
+        opGemm(r, d_Q, l.q_w, d_normed, l.q_b, dim, dim, seq);
+        opGemm(r, d_K, l.k_w, d_normed, l.k_b, dim, dim, seq);
+        opGemm(r, d_V, l.v_w, d_normed, l.v_b, dim, dim, seq);
+
+        /* 2D RoPE on Q and K (patch tokens only, skip prefix) */
+        opRope2dDinov3(r, d_Q, d_K, r->dino_rope_cos, r->dino_rope_sin,
+                        np, n_prefix, dim, heads, hd);
+
+        /* Self-attention (seq=1029 is small enough for shared-memory version) */
+        opCrossAttn(r, d_attn, d_Q, d_K, d_V, seq, seq, dim, heads, hd);
+
+        /* Output projection */
+        opGemm(r, d_normed, l.out_w, d_attn, l.out_b, dim, dim, seq);
+
+        /* LayerScale 1 + residual */
+        if (isValid(l.ls1)) {
+            opLayerscaleAdd(r, d_hidden, d_normed, l.ls1, seq * dim, dim);
+        } else {
+            opAdd(r, d_hidden, d_normed, seq * dim);
+        }
+
+        /* LN2 -> MLP -> LayerScale 2 + residual */
+        opLayerNorm(r, d_normed, d_hidden, l.ln2_w, l.ln2_b, seq, dim);
+        opGemm(r, d_mlp, l.fc1_w, d_normed, l.fc1_b, ffn, dim, seq);
+        opGelu(r, d_mlp, seq * ffn);
+        opGemm(r, d_normed, l.fc2_w, d_mlp, l.fc2_b, dim, ffn, seq);
+
+        if (isValid(l.ls2)) {
+            opLayerscaleAdd(r, d_hidden, d_normed, l.ls2, seq * dim, dim);
+        } else {
+            opAdd(r, d_hidden, d_normed, seq * dim);
+        }
+
+        /* Reset pool periodically to avoid exhaustion */
+        if ((li & 7) == 7) r->runner.resetDynamicDescriptorPool();
+    }
+
+    /* 4. Final LayerNorm (no affine) */
+    opLayerNormNoAffine(r, d_out, d_hidden, seq, dim);
+
+    /* Free scratch buffers */
+    r->runner.destroyBuffer(d_hidden);
+    r->runner.destroyBuffer(d_Q);
+    r->runner.destroyBuffer(d_K);
+    r->runner.destroyBuffer(d_V);
+    r->runner.destroyBuffer(d_attn);
+    r->runner.destroyBuffer(d_mlp);
+    r->runner.destroyBuffer(d_normed);
 }
 
 /* ======================================================================== */
@@ -1086,12 +1408,30 @@ int vulkan_trellis2_load_weights(vulkan_trellis2_runner *r,
                                   const char *dinov3_path,
                                   const char *dit_path,
                                   const char *decoder_path) {
+    if (dinov3_path && loadDinov3Weights(r, dinov3_path) != 0) return -1;
     if (dit_path && loadDitWeights(r, dit_path) != 0) return -1;
     if (decoder_path && loadDecoderWeights(r, decoder_path) != 0) return -1;
-    /* DINOv3 loading TODO — use CPU-computed features for now */
-    if (dinov3_path) {
-        fprintf(stderr, "T2VK: DINOv3 GPU encoding not yet implemented. Use pre-computed features.\n");
-    }
+    return 0;
+}
+
+int vulkan_trellis2_run_dinov3(vulkan_trellis2_runner *r,
+                                const float *image_f32,
+                                float *output) {
+    const int seq = DINO_SEQ_LEN;
+    const int dim = DINO_HIDDEN;
+
+    /* Upload image [3, 512, 512] */
+    BufInfo d_image = createGpuBuffer(r->runner, (size_t)3 * DINO_IMG_SIZE * DINO_IMG_SIZE * sizeof(float));
+    uploadToBuffer(r->runner, d_image, image_f32, (size_t)3 * DINO_IMG_SIZE * DINO_IMG_SIZE * sizeof(float));
+
+    BufInfo d_out = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
+
+    runDinov3(r, d_image, d_out);
+
+    downloadFromBuffer(r->runner, d_out, output, (size_t)seq * dim * sizeof(float));
+
+    r->runner.destroyBuffer(d_image);
+    r->runner.destroyBuffer(d_out);
     return 0;
 }
 

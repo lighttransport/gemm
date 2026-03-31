@@ -48,6 +48,14 @@ int vulkan_trellis2_load_weights(vulkan_trellis2_runner *r,
 
 /* ---- Per-stage verification API ---- */
 
+/* Run DINOv3 encoder.
+ *   image_f32: [3, 512, 512] F32 pre-processed image (ImageNet-normalized, CHW)
+ *   output:    [1029, 1024] F32 buffer (must be pre-allocated)
+ *   Returns 0 on success. */
+int vulkan_trellis2_run_dinov3(vulkan_trellis2_runner *r,
+                                const float *image_f32,
+                                float *output);
+
 /* Run DiT single forward pass.
  *   x_t:       [4096, 8] or [8, 16, 16, 16] F32 noisy latent (token-major)
  *   timestep:  scalar timestep (already rescaled)
