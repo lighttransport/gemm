@@ -82,9 +82,9 @@ static void save_ppm(const char *path, const float *rgb, int h, int w) {
 }
 
 int main(int argc, char **argv) {
-    const char *dit_path = "/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
-    const char *vae_path = "/mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors";
-    const char *enc_path = "/mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf";
+    const char *dit_path = "/mnt/nvme02/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
+    const char *vae_path = "/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors";
+    const char *enc_path = "/mnt/nvme02/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf";
     const char *prompt = "a red apple on a white table";
     int custom_prompt = 0;
     const char *mode = NULL;
@@ -314,7 +314,7 @@ int main(int argc, char **argv) {
         /* Try GPU text encoder (GGUF + biases, ~500× faster than CPU).
          * Uses primary CUDA context shared with DiT runner. */
         if (!txt_hidden) {
-            const char *bias_st = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
+            const char *bias_st = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
             qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, bias_st, 0);
             if (enc) {
                 txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
@@ -325,7 +325,7 @@ int main(int argc, char **argv) {
         }
         /* CPU GGUF fallback (slow but works without GPU LLM runner) */
         if (!txt_hidden) {
-            const char *bias_st = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
+            const char *bias_st = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
             qimg_text_enc *enc = qimg_text_enc_load_gguf_with_biases(enc_path, bias_st);
             if (enc) {
                 txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
@@ -336,7 +336,7 @@ int main(int argc, char **argv) {
         }
         /* FP8 safetensors fallback (dequants to F32 — 30GB, slow on CPU) */
         if (!txt_hidden) {
-            const char *st_enc = "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
+            const char *st_enc = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
             FILE *tf = fopen(st_enc, "rb");
             if (tf) {
                 fclose(tf);

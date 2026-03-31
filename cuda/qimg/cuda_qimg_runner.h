@@ -1191,15 +1191,13 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gemm_fp8w_f32, "gemm_fp8w_f32");
     GET(gemm_opt_f16, "gemm_opt_f16");
     GET(gemm_opt_fp8, "gemm_opt_fp8");
-    /* Try loading native FP8 GEMM (available on sm_89+) */
+    /* Enable FP8 weight format: LUT-based dequant works on any SM.
+     * Use FP8 byte uploads + LUT GEMM to save 4× VRAM vs F32 — critical for 8GB GPUs. */
     r->use_fp8_gemm = 0;
-    if (sm >= 89) {
-        CUresult fp8_rc = cuModuleGetFunction(&r->gemm_fp8_f32, module, "gemm_fp8_f32");
-        if (fp8_rc == CUDA_SUCCESS && r->gemm_fp8_f32) {
-            r->use_fp8_gemm = 1;
-            if (verbose)
-                fprintf(stderr, "cuda_qimg: native FP8 GEMM available (sm_%d)\n", sm);
-        }
+    if (r->gemm_opt_fp8 || r->gemm_fp8w_f32) {
+        r->use_fp8_gemm = 1;
+        if (verbose)
+            fprintf(stderr, "cuda_qimg: FP8 LUT GEMM enabled (sm_%d)\n", sm);
     }
     GET(layernorm_f32, "layernorm_f32");
     GET(gelu_f32, "gelu_f32");
@@ -1318,9 +1316,9 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
         else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
         size_t workspace = 2ULL * 1024 * 1024 * 1024; /* 2GB reserved for activations + scratch */
-        int max_preload = (int)((free_mem - workspace) / block_bytes);
+        int max_preload = (free_mem > workspace)
+            ? (int)((free_mem - workspace) / block_bytes) : 0;
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
-        if (max_preload < 0) max_preload = 0;
 
         r->gpu_blocks = (qimg_block_gpu *)calloc((size_t)r->dit_n_blocks,
                                                   sizeof(qimg_block_gpu));
