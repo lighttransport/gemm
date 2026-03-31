@@ -56,6 +56,9 @@ void cuda_trellis2_set_f32_gemm(cuda_trellis2_runner *r, int enable);
  * Call BEFORE loading weights. Reduces VRAM at the cost of CPU↔GPU transfer. */
 void cuda_trellis2_set_max_gpu_layers(cuda_trellis2_runner *r, int n);
 
+/* Invalidate cross-attention KV cache (call when conditioning changes) */
+void cuda_trellis2_invalidate_kv_cache(cuda_trellis2_runner *r);
+
 void cuda_trellis2_free(cuda_trellis2_runner *r);
 
 /* ---- Per-stage API (for testing/debugging) ---- */
@@ -100,6 +103,9 @@ int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
 
 /* Load shape decoder (SC-VAE) weights */
 int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path);
+
+/* Load texture decoder (SC-VAE, 6 output channels) */
+int cuda_trellis2_load_texture_decoder(cuda_trellis2_runner *r, const char *path);
 
 /* Run shape decoder on GPU. Currently runs stage 0 ConvNeXt blocks only.
  * slat: [N, 32], coords: [N, 4] int32, out_feats: [N, 7], out_coords: [N, 4] */
