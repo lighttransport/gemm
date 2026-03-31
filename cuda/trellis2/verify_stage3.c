@@ -1,5 +1,5 @@
-/* verify_stage2.c — Verify CUDA Stage 2 DiT single step vs PyTorch.
- * Usage: ./verify_stage2 <stage2.st> <noise.npy> <coords.npy> <cond.npy> <ref_output.npy> */
+/* verify_stage3.c — Verify CUDA Stage 3 DiT single step vs PyTorch.
+ * Usage: ./verify_stage3 <stage3.st> <xt.npy> <coords.npy> <cond.npy> <ref.npy> */
 #include "cuda_trellis2_runner.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,34 +32,31 @@ static int32_t *read_npy_i32(const char *p, int *nd, int *dd) {
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "Usage: %s <stage2.st> <noise.npy> <coords.npy> <cond.npy> <ref.npy>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <stage3.st> <xt.npy> <coords.npy> <cond.npy> <ref.npy>\n", argv[0]);
         return 1;
     }
     cuda_trellis2_runner *r = cuda_trellis2_init(0, 1);
     if (!r) return 1;
-    if (cuda_trellis2_load_stage2(r, argv[1]) != 0) return 1;
+    if (cuda_trellis2_load_stage3(r, argv[1]) != 0) return 1;
 
     int nd, dd[8];
-    float *noise = read_npy_f32(argv[2], &nd, dd);
-    int N = dd[0]; int C = dd[1];
-    fprintf(stderr, "Noise: [%d, %d]\n", N, C);
+    float *xt = read_npy_f32(argv[2], &nd, dd);
+    int N = dd[0], in_ch = dd[1];
+    fprintf(stderr, "x_t: [%d, %d]\n", N, in_ch);
 
     int32_t *coords = read_npy_i32(argv[3], &nd, dd);
-    fprintf(stderr, "Coords: [%d, %d]\n", dd[0], dd[1]);
-
     float *cond = read_npy_f32(argv[4], &nd, dd);
     float *ref = read_npy_f32(argv[5], &nd, dd);
+    int out_ch = dd[1];  /* ref shape [N, 32] */
+    fprintf(stderr, "ref: [%d, %d]\n", dd[0], out_ch);
 
-    float *output = (float *)malloc((size_t)N * C * sizeof(float));
-    /* t_raw=1.0: the function internally multiplies by 1000,
-     * so the model sees 1000.0 matching PyTorch's torch.tensor([1000*1.0]) */
-    float t_raw = 1.0f;
-    fprintf(stderr, "Running Stage 2 DiT (t_raw=%.1f, model sees %.1f)...\n", t_raw, t_raw * 1000.0f);
-    cuda_trellis2_run_stage2_dit(r, noise, t_raw, cond, coords, N, output);
+    float *output = (float *)malloc((size_t)N * out_ch * sizeof(float));
+    fprintf(stderr, "Running Stage 3 DiT (t_raw=1.0)...\n");
+    cuda_trellis2_run_stage3_dit(r, xt, 1.0f, cond, coords, N, output);
 
     /* Compare */
     double sr=0,sc=0,sr2=0,sc2=0,src2=0;
-    int total = N * C;
+    int total = N * out_ch;
     for (int i=0;i<total;i++) {
         sr+=ref[i]; sc+=output[i];
         sr2+=(double)ref[i]*ref[i]; sc2+=(double)output[i]*output[i];
@@ -73,7 +70,7 @@ int main(int argc, char **argv) {
             sqrt(sc2/total-mc*mc), output[0],output[1],output[2],output[3]);
     fprintf(stderr, "Correlation: %.8f\n", corr);
 
-    free(noise); free(coords); free(cond); free(ref); free(output);
+    free(xt); free(coords); free(cond); free(ref); free(output);
     cuda_trellis2_free(r);
-    return (corr > 0.99) ? 0 : 1;
+    return (corr > 0.999) ? 0 : 1;
 }
