@@ -1419,10 +1419,17 @@ int vulkan_trellis2_run_dinov3(vulkan_trellis2_runner *r,
                                 float *output) {
     const int seq = DINO_SEQ_LEN;
     const int dim = DINO_HIDDEN;
+    const int S = DINO_IMG_SIZE;
 
-    /* Upload image [3, 512, 512] */
-    BufInfo d_image = createGpuBuffer(r->runner, (size_t)3 * DINO_IMG_SIZE * DINO_IMG_SIZE * sizeof(float));
-    uploadToBuffer(r->runner, d_image, image_f32, (size_t)3 * DINO_IMG_SIZE * DINO_IMG_SIZE * sizeof(float));
+    /* Convert image from CHW [3, 512, 512] to HWC [512, 512, 3] for patch_embed shader */
+    std::vector<float> hwc(3 * S * S);
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++)
+            for (int c = 0; c < 3; c++)
+                hwc[(y * S + x) * 3 + c] = image_f32[c * S * S + y * S + x];
+
+    BufInfo d_image = createGpuBuffer(r->runner, (size_t)3 * S * S * sizeof(float));
+    uploadToBuffer(r->runner, d_image, hwc.data(), (size_t)3 * S * S * sizeof(float));
 
     BufInfo d_out = createGpuBuffer(r->runner, (size_t)seq * dim * sizeof(float));
 
