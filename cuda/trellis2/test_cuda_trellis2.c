@@ -25,6 +25,12 @@
 #include "../../common/sparse3d.h"
 /* trellis2_shape_decoder.h compiled in cuda_trellis2_runner.c */
 #include "../../common/trellis2_shape_decoder.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "../../common/stb_image.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "../../common/stb_image_resize2.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../../common/stb_image_write.h"
 #define T2_PBR_IMPLEMENTATION
 #include "../../common/trellis2_pbr.h"
 #define T2_FDG_MESH_IMPLEMENTATION
@@ -101,6 +107,37 @@ static float rng_randn(rng_state *r) {
 }
 static float rescale_t(float t, float rt) { return t*rt/(1.0f+(rt-1.0f)*t); }
 
+/* Load image and preprocess for DINOv3: resize to 512x512, normalize to [3,512,512] CHW */
+static float *load_image_for_dinov3(const char *path) {
+    int w, h, c;
+    uint8_t *img = stbi_load(path, &w, &h, &c, 3);
+    if (!img) { fprintf(stderr, "Cannot load image: %s\n", path); return NULL; }
+    fprintf(stderr, "Loaded image %s: %dx%d\n", path, w, h);
+
+    /* Center crop to square */
+    int sz = w < h ? w : h;
+    int ox = (w - sz) / 2, oy = (h - sz) / 2;
+
+    /* Resize to 512x512 */
+    uint8_t *resized = (uint8_t *)malloc(512 * 512 * 3);
+    stbir_resize_uint8_linear(img + (oy * w + ox) * 3, sz, sz, w * 3,
+                               resized, 512, 512, 512 * 3, STBIR_RGB);
+    stbi_image_free(img);
+
+    /* Normalize: ImageNet mean/std, output CHW [3, 512, 512] */
+    float mean[3] = {0.485f, 0.456f, 0.406f};
+    float std_[3] = {0.229f, 0.224f, 0.225f};
+    float *out = (float *)malloc(3 * 512 * 512 * sizeof(float));
+    for (int ch = 0; ch < 3; ch++)
+        for (int y = 0; y < 512; y++)
+            for (int x = 0; x < 512; x++) {
+                float v = (float)resized[(y * 512 + x) * 3 + ch] / 255.0f;
+                out[ch * 512 * 512 + y * 512 + x] = (v - mean[ch]) / std_[ch];
+            }
+    free(resized);
+    return out;
+}
+
 /* Normalization constants from pipeline.json */
 static const float shape_slat_mean[32] = {0.781296f, 0.018091f, -0.495192f, -0.558457f, 1.060530f, 0.093252f, 1.518149f, -0.933218f, -0.732996f, 2.604095f, -0.118341f, -2.143904f, 0.495076f, -2.179512f, -2.130751f, -0.996944f, 0.261421f, -2.217463f, 1.260067f, -0.150213f, 3.790713f, 1.481266f, -1.046058f, -1.523667f, -0.059621f, 2.220780f, 1.621212f, 0.877230f, 0.567247f, -3.175944f, -3.186688f, 1.578665f};
 static const float shape_slat_std[32]  = {5.972266f, 4.706852f, 5.445010f, 5.209927f, 5.320220f, 4.547237f, 5.020802f, 5.444004f, 5.226681f, 5.683095f, 4.831436f, 5.286469f, 5.652043f, 5.367606f, 5.525084f, 4.730578f, 4.805265f, 5.124013f, 5.530808f, 5.619001f, 5.103930f, 5.417670f, 5.269677f, 5.547194f, 5.634698f, 5.235274f, 6.110351f, 5.511298f, 6.237273f, 4.879207f, 5.347008f, 5.405691f};
@@ -118,6 +155,8 @@ int main(int argc, char **argv) {
                 "  --grid <N>       Marching cubes grid resolution (default: 64, try 32 for lighter mesh)\n"
                 "  --threshold <t>  Occupancy threshold (default: 0.0)\n"
                 "  --npy <path>     Also save latent as .npy\n"
+                "  --image <path>   Input image (JPEG/PNG) — runs DINOv3 on GPU\n"
+                "  --dinov3 <path>  DINOv3 weights .safetensors\n"
                 "  --noise <path>   Load noise from .npy instead of generating\n"
                 "  --occ <path>     Save occupancy grid as .npy\n"
                 "\nStage 2 (shape generation):\n"
@@ -131,6 +170,7 @@ int main(int argc, char **argv) {
                 "                       Use 1-10 to reduce VRAM at cost of speed\n"
                 "\nStage 3 (texture generation):\n"
                 "  --stage3 <path>      Stage 3 texture flow model .safetensors\n"
+                "  --tex-dec <path>     Texture decoder .safetensors\n"
                 "  --s3-steps <N>       Stage 3 Euler steps (default: 12)\n"
                 , argv[0]);
         return 1;
@@ -155,7 +195,10 @@ int main(int argc, char **argv) {
     const char *s2_npy_path = NULL;
     int n_threads = 4;
     int max_gpu_layers = 0;
+    const char *image_path = NULL;
+    const char *dinov3_path = NULL;
     const char *stage3_path = NULL;
+    const char *tex_dec_path = NULL;
     int s3_steps = 12;
 
     for (int i = 4; i < argc; i++) {
@@ -176,27 +219,53 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-gpu-layers") && i+1 < argc)
             max_gpu_layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--image") && i+1 < argc) image_path = argv[++i];
+        else if (!strcmp(argv[i], "--dinov3") && i+1 < argc) dinov3_path = argv[++i];
         else if (!strcmp(argv[i], "--stage3") && i+1 < argc) stage3_path = argv[++i];
+        else if (!strcmp(argv[i], "--tex-dec") && i+1 < argc) tex_dec_path = argv[++i];
         else if (!strcmp(argv[i], "--s3-steps") && i+1 < argc) s3_steps = atoi(argv[++i]);
     }
-
-    /* Load features */
-    int ndim, dims[8];
-    float *features = read_npy_f32(features_path, &ndim, dims);
-    if (!features) return 1;
-    int n_cond = dims[0];
-    fprintf(stderr, "Conditioning: %d tokens, %d dim\n", n_cond, ndim >= 2 ? dims[1] : 0);
 
     /* Init CUDA runner */
     fprintf(stderr, "\n=== Initializing CUDA runner ===\n");
     cuda_trellis2_runner *r = cuda_trellis2_init(0, 1);
-    if (!r) { free(features); return 1; }
+    if (!r) return 1;
+
+    /* Load or compute DINOv3 features */
+    int ndim, dims[8];
+    float *features = NULL;
+    int n_cond = 1029;
+    if (image_path) {
+        /* Load image and run DINOv3 on GPU */
+        if (!dinov3_path) {
+            fprintf(stderr, "Error: --image requires --dinov3 <weights.st>\n");
+            cuda_trellis2_free(r); return 1;
+        }
+        float *img_f32 = load_image_for_dinov3(image_path);
+        if (!img_f32) { cuda_trellis2_free(r); return 1; }
+        fprintf(stderr, "\n=== DINOv3 Encoding ===\n");
+        if (cuda_trellis2_load_weights(r, dinov3_path, NULL, NULL) != 0) {
+            free(img_f32); cuda_trellis2_free(r); return 1;
+        }
+        features = (float *)malloc((size_t)n_cond * 1024 * sizeof(float));
+        cuda_trellis2_run_dinov3(r, img_f32, features);
+        free(img_f32);
+        fprintf(stderr, "DINOv3: [%d, 1024] features computed\n", n_cond);
+    } else {
+        /* Load pre-computed features from .npy */
+        features = read_npy_f32(features_path, &ndim, dims);
+        if (!features) { cuda_trellis2_free(r); return 1; }
+        n_cond = dims[0];
+        fprintf(stderr, "Conditioning: %d tokens, %d dim\n", n_cond, ndim >= 2 ? dims[1] : 0);
+    }
 
     /* Load weights (DINOv3 skipped — we already have features) */
     fprintf(stderr, "\n=== Loading weights ===\n");
     if (max_gpu_layers > 0)
         cuda_trellis2_set_max_gpu_layers(r, max_gpu_layers);
-    if (cuda_trellis2_load_weights(r, NULL, stage1_path, decoder_path) != 0) {
+    /* Load Stage 1 + decoder (DINOv3 may already be loaded via --image) */
+    if (cuda_trellis2_load_weights(r, image_path ? NULL : NULL,
+                                     stage1_path, decoder_path) != 0) {
         cuda_trellis2_free(r); free(features); return 1;
     }
     if (stage2_path) {
@@ -585,11 +654,10 @@ int main(int argc, char **argv) {
         t2_fdg_mesh fdg_mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
 
         if (fdg_mesh.n_tris > 0) {
-            if (tex_slat && shape_dec_path) {
-                /* Run texture decoder on CPU to get 6-channel PBR voxel field */
+            if (tex_slat && stage3_path) {
+                /* Run texture decoder to get 6-channel PBR voxel field */
                 fprintf(stderr, "\n=== Texture Decoder (CPU, %d threads) ===\n", n_threads);
-                t2_shape_dec *tex_dec = t2_shape_dec_load(
-                    "/mnt/disk01/models/trellis2-4b/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors");
+                t2_shape_dec *tex_dec = t2_shape_dec_load(tex_dec_path);
                 if (tex_dec) {
                     /* Create sparse tensor from texture latent + shape coords */
                     sp3d_tensor *tex_tensor = sp3d_create(sparse_coords, tex_slat,
