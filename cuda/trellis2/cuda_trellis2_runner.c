@@ -217,8 +217,17 @@ struct cuda_trellis2_runner {
         int loaded;
     } shape_dec;
 
-    /* CPU-side shape decoder for C2S (uses t2sd_c2s from trellis2_shape_decoder.h) */
-    t2_shape_dec *shape_dec_cpu;  /* full CPU decoder for C2S operations */
+    /* CPU-side decoders for C2S operations */
+    t2_shape_dec *shape_dec_cpu;
+    t2_shape_dec *tex_dec_cpu;
+    int tex_dec_loaded;
+
+    /* Cross-attention KV cache (precomputed per-block, reused across timesteps) */
+    CUdeviceptr ca_kv_cache_K[DIT_DEPTH];
+    CUdeviceptr ca_kv_cache_V[DIT_DEPTH];
+    int ca_kv_cache_n_blocks;
+    int ca_kv_cache_model_id;  /* which model's weights were cached */
+    int ca_kv_cache_valid;
 
     /* Scratch buffers (expanded to 12 for shape decoder use) */
     CUdeviceptr scratch[12];
@@ -1118,6 +1127,16 @@ int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) 
     return 0;
 }
 
+int cuda_trellis2_load_texture_decoder(cuda_trellis2_runner *r, const char *path) {
+    /* Texture decoder uses the same SC-VAE architecture as shape decoder.
+     * Load as CPU decoder (AVX2+pthreads optimized). */
+    r->tex_dec_cpu = t2_shape_dec_load(path);
+    if (!r->tex_dec_cpu) return -1;
+    r->tex_dec_loaded = 1;
+    fprintf(stderr, "T2: texture decoder loaded (out_ch=%d)\n", r->tex_dec_cpu->out_channels);
+    return 0;
+}
+
 int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
                                 const char *dinov3_path,
                                 const char *stage1_path,
@@ -1276,7 +1295,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                                       dit_block_gpu *blocks,
                                       dit_block_cpu *blocks_cpu, /* CPU copies for streaming (NULL = all on GPU) */
                                       CUdeviceptr rope_cos, CUdeviceptr rope_sin,
-                                      int n_freqs, int axis_dim) {
+                                      int n_freqs, int axis_dim,
+                                      int model_id) {  /* 1=Stage1, 2=Stage2, 3=Stage3 */
     t2_ops *ops = &r->ops;
     CUstream stream = r->stream;
     const int D = DIT_DIM;        /* 1536 */
@@ -1349,6 +1369,47 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     /* Now d_temb = [D] timestep embedding */
 
     if (r->verbose >= 2) { cuStreamSynchronize(stream); float _d[4]; cuMemcpyDtoH(_d, d_temb, 16); fprintf(stderr, "  t_emb_mlp: [:4]=%.6f %.6f %.6f %.6f\n", _d[0],_d[1],_d[2],_d[3]); }
+
+    /* Precompute cross-attention KV for all blocks if not cached.
+     * KV depends on block weights (different per block) but NOT on timestep or x_t.
+     * So we compute once and cache for all subsequent calls with same cond. */
+    int use_kv_cache = (r->ca_kv_cache_valid && r->ca_kv_cache_model_id == model_id);
+    if (!use_kv_cache && d_cond) {
+        /* Allocate/reallocate cache */
+        size_t kv_sz = (size_t)ctx_len * D * sizeof(float);
+        if (r->ca_kv_cache_n_blocks != n_blocks) {
+            for (int bi = 0; bi < DIT_DEPTH; bi++) {
+                if (r->ca_kv_cache_K[bi]) cuMemFree(r->ca_kv_cache_K[bi]);
+                if (r->ca_kv_cache_V[bi]) cuMemFree(r->ca_kv_cache_V[bi]);
+                r->ca_kv_cache_K[bi] = 0; r->ca_kv_cache_V[bi] = 0;
+            }
+        }
+        for (int bi = 0; bi < n_blocks; bi++) {
+            dit_block_gpu *blk = &blocks[bi];
+            int blk_streamed = 0;
+            if (blocks_cpu && !blk->sa_qkv_w) {
+                cuStreamSynchronize(stream);
+                dit_block_upload_to_gpu(blk, &blocks_cpu[bi]);
+                blk_streamed = 1;
+            }
+            if (!r->ca_kv_cache_K[bi]) cuMemAlloc(&r->ca_kv_cache_K[bi], kv_sz);
+            if (!r->ca_kv_cache_V[bi]) cuMemAlloc(&r->ca_kv_cache_V[bi], kv_sz);
+            /* KV GEMM: [ctx, cond_dim] -> [ctx, 2*D] */
+            t2_op_gemm(ops, stream, d_qkv, blk->ca_kv_w, d_cond, blk->ca_kv_b,
+                       2 * D, DIT_COND_DIM, ctx_len);
+            t2_op_split_kv_chunk(ops, stream, r->ca_kv_cache_K[bi], r->ca_kv_cache_V[bi],
+                                  d_qkv, ctx_len, D);
+            if (blk->ca_k_norm)
+                t2_op_rms_norm_perhead(ops, stream, r->ca_kv_cache_K[bi], blk->ca_k_norm,
+                                      ctx_len, H, HD, D);
+            if (blk_streamed) { cuStreamSynchronize(stream); dit_block_free_gpu(blk); }
+        }
+        r->ca_kv_cache_n_blocks = n_blocks;
+        r->ca_kv_cache_model_id = model_id;
+        r->ca_kv_cache_valid = 1;
+        if (r->verbose >= 1)
+            fprintf(stderr, "  Cross-attn KV cached for %d blocks\n", n_blocks);
+    }
 
     /* 3. Transformer blocks */
     for (int bi = 0; bi < n_blocks; bi++) {
@@ -1465,18 +1526,12 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
         if (blk->ca_q_norm)
             t2_op_rms_norm_perhead(ops, stream, d_cross_Q, blk->ca_q_norm, N, H, HD, D);
 
-        /* KV from conditioning (recompute per block — different weights) */
-        /* KV GEMM: [ctx, cond_dim] -> [ctx, 2*D] */
-        t2_op_gemm(ops, stream, d_qkv, blk->ca_kv_w, d_cond, blk->ca_kv_b,
-                   2 * D, DIT_COND_DIM, ctx_len);
-        /* Split KV (standard chunk, NOT interleaved) */
-        t2_op_split_kv_chunk(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, D);
-        if (blk->ca_k_norm)
-            t2_op_rms_norm_perhead(ops, stream, d_ca_K, blk->ca_k_norm,
-                                  ctx_len, H, HD, D);
+        /* KV from conditioning (cached — precomputed above) */
+        CUdeviceptr d_ca_K_cached = r->ca_kv_cache_K[bi];
+        CUdeviceptr d_ca_V_cached = r->ca_kv_cache_V[bi];
 
-        /* Cross-attention */
-        t2_op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K, d_ca_V,
+        /* Cross-attention (using cached KV) */
+        t2_op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K_cached, d_ca_V_cached,
                          N, ctx_len, D, H, HD);
 
         if (bi==0 && r->verbose>=2) dbg4("cross_attn_out", d_attn, stream);
@@ -1564,7 +1619,7 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         r->dit_out_w, r->dit_out_b,
         r->dit_blocks, r->dit_blocks_cpu,
         r->dit_rope_cos, r->dit_rope_sin,
-        r->dit_n_freqs, r->dit_axis_dim);
+        r->dit_n_freqs, r->dit_axis_dim, 1);
 
     r->ops.use_f32_gemm = saved_f32;
     r->ops.use_mma_gemm = saved_mma;
@@ -1576,7 +1631,8 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
                                      dit_model_gpu *m, dit_block_cpu *blocks_cpu,
                                      CUdeviceptr d_x, float timestep,
                                      CUdeviceptr d_cond, CUdeviceptr d_output,
-                                     int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin) {
+                                     int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin,
+                                     int model_id) {
     /* Save GEMM mode and set F16 MMA if available */
     int saved_f32 = r->ops.use_f32_gemm;
     int saved_mma = r->ops.use_mma_gemm;
@@ -1596,7 +1652,7 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
         m->out_w, m->out_b,
         m->blocks, blocks_cpu,
         rope_cos, rope_sin,
-        m->n_rope_freqs, m->rope_axis_dim);
+        m->n_rope_freqs, m->rope_axis_dim, model_id);
 
     r->ops.use_f32_gemm = saved_f32;
     r->ops.use_mma_gemm = saved_mma;
@@ -1729,9 +1785,16 @@ float *cuda_trellis2_predict(cuda_trellis2_runner *r,
 
 /* ---- Per-stage APIs ---- */
 
+void cuda_trellis2_invalidate_kv_cache(cuda_trellis2_runner *r) {
+    r->ca_kv_cache_valid = 0;
+    r->ca_kv_cache_model_id = 0;
+}
+
 int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
                            const float *x_t, float timestep,
                            const float *cond_features, float *output) {
+    /* Invalidate KV cache since cond may differ between CFG passes */
+    cuda_trellis2_invalidate_kv_cache(r);
     CUstream s = r->stream;
     int N = DIT_N_TOKENS, in_ch = DIT_IN_CH;
     int ctx_len = DINO_SEQ_LEN;
@@ -2004,6 +2067,8 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
                                   const float *cond_features,
                                   const int32_t *coords, int N,
                                   float *output) {
+    /* Invalidate cache since CFG uses different cond per pass */
+    cuda_trellis2_invalidate_kv_cache(r);
     if (!r->stage2_loaded) {
         fprintf(stderr, "T2: Stage 2 not loaded\n"); return -1;
     }
@@ -2050,7 +2115,7 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
 
     /* Run Stage 2 DiT forward */
     run_sparse_dit_forward(r, m, r->stage2_blocks_cpu,
-                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin);
+                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin, 2);
 
     cuStreamSynchronize(s);
     cuMemcpyDtoH(output, d_out, (size_t)N * in_ch * sizeof(float));
@@ -2107,7 +2172,7 @@ int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
     cuMemAlloc(&d_out, (size_t)N * out_ch * sizeof(float));
 
     run_sparse_dit_forward(r, m, r->stage3_blocks_cpu,
-                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin);
+                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin, 3);
 
     cuStreamSynchronize(s);
     cuMemcpyDtoH(output, d_out, (size_t)N * out_ch * sizeof(float));
