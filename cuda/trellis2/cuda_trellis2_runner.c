@@ -15,6 +15,8 @@
 #include "../../common/ggml_dequant.h"
 #define SPARSE3D_IMPLEMENTATION
 #include "../../common/sparse3d.h"
+#define T2_SHAPE_DEC_IMPLEMENTATION
+#include "../../common/trellis2_shape_decoder.h"
 #include "cuda_trellis2_runner.h"
 #include "../cuew.h"
 #include "../cuda_kernels_common.h"
@@ -214,6 +216,9 @@ struct cuda_trellis2_runner {
         int channels[5];    /* {1024, 512, 256, 128, 64} */
         int loaded;
     } shape_dec;
+
+    /* CPU-side shape decoder for C2S (uses t2sd_c2s from trellis2_shape_decoder.h) */
+    t2_shape_dec *shape_dec_cpu;  /* full CPU decoder for C2S operations */
 
     /* Scratch buffers (expanded to 12 for shape decoder use) */
     CUdeviceptr scratch[12];
@@ -1103,7 +1108,13 @@ int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) 
 
     safetensors_close(st);
     r->shape_dec.loaded = 1;
-    fprintf(stderr, "T2: shape decoder loaded (weights=%s)\n", use_f16 ? "F16" : "F32");
+
+    /* Also load full CPU decoder for C2S operations (needs F32 weights) */
+    r->shape_dec_cpu = t2_shape_dec_load(path);
+    if (!r->shape_dec_cpu)
+        fprintf(stderr, "T2: WARNING: failed to load CPU shape decoder for C2S\n");
+
+    fprintf(stderr, "T2: shape decoder loaded (GPU=%s, CPU for C2S)\n", use_f16 ? "F16" : "F32");
     return 0;
 }
 
@@ -1871,11 +1882,15 @@ int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
 
     fprintf(stderr, "T2: shape decoder: gather map built (N=%d, hash_cap=%d)\n", N, hash_cap);
 
-    /* Run ConvNeXt blocks for each stage (without C2S for now) */
+    /* Current CPU-side copies of features and coords for C2S round-trips */
+    int32_t *cur_coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
+    memcpy(cur_coords, coords, (size_t)N * 4 * sizeof(int32_t));
+
+    /* Run ConvNeXt blocks + C2S for each stage */
     for (int stage = 0; stage < 4; stage++) {
         int nblk = r->shape_dec.n_convnext[stage];
         C = r->shape_dec.channels[stage];
-        fprintf(stderr, "T2: shape decoder: stage %d: %d ConvNeXt(%d), N=%d\n",
+        fprintf(stderr, "T2: shape dec: stage %d: %d ConvNeXt(%d), N=%d\n",
                 stage, nblk, C, N);
 
         struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -1895,31 +1910,83 @@ int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
 
         cuStreamSynchronize(s);
         struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
-        double dt = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
-        fprintf(stderr, "T2: shape decoder: stage %d done (%.1f ms)\n", stage, dt);
+        double dt_conv = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+        fprintf(stderr, "T2: shape dec: stage %d convnext %.1f ms\n", stage, dt_conv);
 
-        /* TODO: C2S upsampling between stages.
-         * For now, skip C2S — output at input resolution with stage 0 features.
-         * This means we only run stage 0 ConvNeXt blocks and output [N, 1024].
-         * Full C2S requires: subdivision prediction, coordinate expansion,
-         * hash rebuild at new resolution, and conv at new resolution. */
-        if (stage == 0) break;  /* TEMP: only run stage 0 */
+        /* C2S upsampling (hybrid: CPU subdivision + GPU conv) */
+        if (stage < 3) {
+            /* Download features to CPU */
+            float *feats_cpu = (float *)malloc((size_t)N * C * sizeof(float));
+            cuMemcpyDtoH(feats_cpu, d_feats, (size_t)N * C * sizeof(float));
+
+            /* Build CPU sparse tensor for C2S */
+            sp3d_tensor *t_cpu = sp3d_create(cur_coords, feats_cpu, N, C, 1);
+            free(feats_cpu);
+
+            /* Run C2S on CPU using the full CPU decoder's C2S weights */
+            sp3d_tensor *t_new = t2sd_c2s_forward(t_cpu, &r->shape_dec_cpu->c2s[stage], 4);
+
+            int N_new = t_new->N;
+            int C_new = t_new->C;
+            fprintf(stderr, "T2: shape dec: c2s %d->%d: N %d -> %d, C %d -> %d\n",
+                    stage, stage + 1, N, N_new, C, C_new);
+
+            /* Free old GPU buffers */
+            cuMemFree(d_feats); cuMemFree(d_coords);
+            cuMemFree(d_gather_map); cuMemFree(d_hash_keys); cuMemFree(d_hash_vals);
+            sp3d_hash_free(hash); sp3d_free(t_cpu);
+
+            /* Upload new features and coords to GPU */
+            N = N_new; C = C_new;
+            d_feats = cu_upload_raw(t_new->feats, (size_t)N * C * sizeof(float));
+            d_coords = cu_upload_raw(t_new->coords, (size_t)N * 4 * sizeof(int));
+
+            /* Save CPU coords for next round */
+            free(cur_coords);
+            cur_coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
+            memcpy(cur_coords, t_new->coords, (size_t)N * 4 * sizeof(int32_t));
+
+            /* Rebuild hash table and gather map */
+            hash = sp3d_hash_build(t_new->coords, N);
+            d_hash_keys = cu_upload_raw(hash->keys, (size_t)hash->capacity * sizeof(uint64_t));
+            d_hash_vals = cu_upload_raw(hash->vals, (size_t)hash->capacity * sizeof(int32_t));
+            hash_cap = hash->capacity;
+
+            cuMemAlloc(&d_gather_map, (size_t)N * 27 * sizeof(int));
+            t2_op_sparse_build_gather_map(ops, s, d_gather_map, d_coords, N,
+                                           d_hash_keys, d_hash_vals, hash_cap);
+            sp3d_free(t_new);
+
+            struct timespec ts2; clock_gettime(CLOCK_MONOTONIC, &ts2);
+            double dt_c2s = (ts2.tv_sec - ts1.tv_sec) * 1000.0 + (ts2.tv_nsec - ts1.tv_nsec) / 1e6;
+            fprintf(stderr, "T2: shape dec: c2s %.1f ms, N=%d\n", dt_c2s, N);
+        }
     }
 
-    /* output_layer: [N, C] -> [N, 7] (skipped if C != 64, since no C2S) */
-    /* For now, just download features and coords */
+    /* output_layer: [N, C=64] -> [N, out_ch] */
+    int out_ch = r->shape_dec.channels[4]; /* 64 -> detect from weight */
+    {
+        /* Detect actual output channels from out_w shape:
+         * For shape decoder: 7, for texture decoder: 6 */
+        /* For now use a fixed value based on what was loaded */
+        out_ch = 7;  /* shape decoder default */
+    }
+
     cuStreamSynchronize(s);
-    float *feats_cpu = (float *)malloc((size_t)N * C * sizeof(float));
-    cuMemcpyDtoH(feats_cpu, d_feats, (size_t)N * C * sizeof(float));
-    /* Copy first 7 channels as output (placeholder) */
-    for (int i = 0; i < N; i++)
-        for (int j = 0; j < 7 && j < C; j++)
-            out_feats[i * 7 + j] = feats_cpu[i * C + j];
-    free(feats_cpu);
-    memcpy(out_coords, coords, (size_t)N * 4 * sizeof(int32_t));
+    CUdeviceptr d_output;
+    cuMemAlloc(&d_output, (size_t)N * out_ch * sizeof(float));
+    t2_op_gemm(ops, s, d_output, r->shape_dec.out_w, d_feats, r->shape_dec.out_b,
+               out_ch, C, N);
+    cuStreamSynchronize(s);
+
+    /* Download results — caller must have allocated enough for max possible N */
+    cuMemcpyDtoH(out_feats, d_output, (size_t)N * out_ch * sizeof(float));
+    memcpy(out_coords, cur_coords, (size_t)N * 4 * sizeof(int32_t));
     *out_N = N;
+    cuMemFree(d_output);
 
     /* Cleanup */
+    free(cur_coords);
     cuMemFree(d_feats);
     cuMemFree(d_coords);
     cuMemFree(d_gather_map);
