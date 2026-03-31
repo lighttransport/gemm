@@ -175,12 +175,12 @@ ResBlock3d: `ChannelLN → SiLU → Conv3d → ChannelLN → SiLU → Conv3d + s
 | Component | CUDA | CPU | PyTorch Ref | Status |
 |-----------|------|-----|-------------|--------|
 | Sparse tensor infrastructure | — | `common/sparse3d.h` | — | CPU ops verified |
-| Stage 2 shape flow DiT | — | — | — | Not started |
-| Stage 2 shape decoder (SC-VAE) | — | — | — | Not started |
-| Stage 3 texture flow DiT | — | — | — | Not started |
-| Stage 3 texture decoder (SC-VAE) | — | — | — | Not started |
-| FlexGEMM sparse conv | — | — | — | Not started |
-| Mesh extraction from shape | — | — | — | Not started |
+| Stage 2 shape flow DiT | `cuda_trellis2_runner.c` | `trellis2_dit.h` | `run_stage2_ref.py` | **CUDA verified (corr=1.0)** |
+| Stage 2 shape decoder (SC-VAE) | — | `trellis2_shape_decoder.h` | — | CPU verified |
+| Stage 3 texture flow DiT | — | `trellis2_dit.h` | `run_stage3_tex_ref.py` | CPU 1-step verified |
+| Stage 3 texture decoder (SC-VAE) | — | `trellis2_shape_decoder.h` | — | CPU verified (small N) |
+| FDG mesh extraction | — | `trellis2_fdg_mesh.h` | — | CPU verified, .obj export |
+| Mesh extraction (marching cubes) | `test_cuda_trellis2.c` | `test_trellis2.c` | — | Both work |
 
 ## Numerical Verification Results
 
@@ -197,6 +197,11 @@ All results below use **matched initial noise** (same tensor loaded from .npy).
 | Decoder (zero input) | 0.99999952 | ~1e-4 | All-negative output (correct) |
 | Decoder (real latent) | 0.99999998 | 9.3e-5 | 26750 occupied = exact match |
 | **Full pipeline** | **1.00000000** | **~1e-4** | **10.2% occupancy = 10.2%** |
+| Stage 2 DiT step (N=100) | 1.00000000 | — | F32 weights |
+| Stage 2 DiT step (N=1000) | 1.00000000 | — | F32 weights |
+| Stage 2 DiT step (N=100, F16 MMA) | 0.99999990 | ~3e-4 | F16 weights, MMA tensor cores |
+| Stage 2 DiT step (N=5000, F16 MMA) | 0.99999992 | ~3e-4 | F16 MMA on sm_120 Blackwell |
+| **Stage 1→2 full pipeline** | — | — | **Stage 1: 45s, Stage 2: 58s (N=28K)** |
 
 ### Per-block DiT comparison (block 0)
 
@@ -292,15 +297,15 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 | CFG rescale std | Minor numerical diff | RMS instead of proper torch.std (mean-subtracted, Bessel) | Use double-precision proper std |
 | **Decoder norm type** | **Decoder output flipped** | **Used GroupNorm, official uses ChannelLayerNorm** | **New channel_layernorm_3d_f32 kernel** |
 | DINOv3 final norm | Features range differs | TRELLIS.2 uses unparameterized LN, not learned norm | Apply plain LN in encoder |
+| **Stage 2 F16 GEMM** | **All GEMM output garbage** | **`use_f32_gemm` not set when loading Stage 2 standalone** | **Set flag in `cuda_trellis2_load_stage2`** |
+| **Stage 2 scratch overflow** | **Cross-attn produces 5e26** | **`scratch[1]` sized for self-attn N only, not cross-attn ctx_len*2D** | **Include `ca_kv_gemm_sz` in max** |
 
 ## Next Steps
 
-1. **DINOv3 GPU encoding**: Port the timm→transformers weight conversion to C, or implement
-   DINOv3 directly on GPU using the existing HY3D DINOv2 CUDA encoder as reference.
-2. **Stage 2 Shape DiT**: Sparse transformer on occupied voxel coordinates. Requires
-   FlexGEMM or equivalent sparse convolution backend.
-3. **Stage 2 Shape Decoder**: SC-VAE with sparse convolution + cross-attention decoder.
-4. **Stage 3 Texture**: Similar to Stage 2 but conditioned on shape + image.
-5. **F16 GEMM**: Switch from F32 tiled GEMM to F16 tensor-core GEMM for ~10x speedup
-   (would bring CUDA DiT from 8 min to ~1 min on RTX 5060 Ti).
-6. **CPU decoder fix**: Port ChannelLayerNorm fix to `trellis2_ss_decoder.h`.
+1. **Stage 2 full sampling**: Integrate Stage 2 DiT into end-to-end flow sampling with CFG
+   on GPU (DiT forward verified, need sampling loop + shape decoder).
+2. **Stage 3 Texture CUDA**: Port Stage 3 texture flow DiT to GPU (same architecture).
+3. **Shape decoder CUDA**: Sparse conv SC-VAE decoder on GPU.
+4. **Texture decoder CUDA**: Sparse conv SC-VAE texture decoder on GPU.
+5. **F16 GEMM**: Switch from F32 tiled GEMM to F16 tensor-core GEMM for ~10x speedup.
+6. **Full GPU pipeline**: Image → DINOv3 → Stage 1 → Stage 2 → Stage 3 → mesh, all on GPU.
