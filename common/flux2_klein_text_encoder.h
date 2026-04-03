@@ -18,7 +18,9 @@
  *   flux2_text_enc *flux2_text_enc_load_safetensors(const char *st_path,
  *                                                    const char *tok_gguf_path);
  *   flux2_text_enc *flux2_text_enc_load(const char *gguf_path);   // GGUF fallback
- *   flux2_text_enc *flux2_text_enc_load_gpu(const char *gguf_path, int device);
+ *   flux2_text_enc *flux2_text_enc_load_gpu(const char *model_path,
+ *                                           const char *tok_gguf_path,
+ *                                           int device);
  *   void            flux2_text_enc_free(flux2_text_enc *enc);
  *   float          *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
  *                                         int *out_n_tokens);
@@ -56,8 +58,12 @@ flux2_text_enc *flux2_text_enc_load_safetensors_dir(const char *dir_path,
 /* Fallback: load from GGUF (requires convert_hf_to_gguf conversion). */
 flux2_text_enc *flux2_text_enc_load(const char *gguf_path);
 
-/* GPU text encoder via CUDA LLM runner (requires cuda_llm_runner.h). */
-flux2_text_enc *flux2_text_enc_load_gpu(const char *gguf_path, int gpu_device);
+/* GPU text encoder via CUDA LLM runner (requires cuda_llm_runner.h).
+ * model_path may be a GGUF file or safetensors file/directory.
+ * tok_gguf_path provides the tokenizer when model_path is safetensors. */
+flux2_text_enc *flux2_text_enc_load_gpu(const char *model_path,
+                                        const char *tok_gguf_path,
+                                        int gpu_device);
 
 void   flux2_text_enc_free(flux2_text_enc *enc);
 
@@ -349,6 +355,7 @@ flux2_text_enc *flux2_text_enc_load_safetensors_dir(const char *dir_path,
                                                      const char *tok_gguf_path) {
     /* Enumerate shards: try model-00001-of-NNNNN.safetensors pattern */
     char path[512];
+    struct stat sb;
     st_context *shards[16];
     int n_shards = 0;
 
@@ -356,6 +363,7 @@ flux2_text_enc *flux2_text_enc_load_safetensors_dir(const char *dir_path,
         for (int total = i; total <= 16; total++) {
             snprintf(path, sizeof(path), "%s/model-%05d-of-%05d.safetensors",
                      dir_path, i, total);
+            if (stat(path, &sb) != 0) continue;
             st_context *s = safetensors_open(path);
             if (s) {
                 shards[n_shards++] = s;
@@ -436,34 +444,63 @@ flux2_text_enc *flux2_text_enc_load(const char *gguf_path) {
 
 /* ---- GPU loader ---- */
 
-flux2_text_enc *flux2_text_enc_load_gpu(const char *gguf_path, int gpu_device) {
+flux2_text_enc *flux2_text_enc_load_gpu(const char *model_path,
+                                        const char *tok_gguf_path,
+                                        int gpu_device) {
 #ifdef CUDA_LLM_RUNNER_H
-    fprintf(stderr, "flux2_text_enc: GPU %s (device %d)\n", gguf_path, gpu_device);
+    fprintf(stderr, "flux2_text_enc: GPU %s (device %d)\n", model_path, gpu_device);
 
-    gguf_context *gguf = gguf_open(gguf_path, 1);
-    if (!gguf) { fprintf(stderr, "flux2_text_enc: failed to open GGUF\n"); return NULL; }
+    int is_gguf = 0;
+    size_t model_len = strlen(model_path);
+    if (model_len >= 5 && strcmp(model_path + model_len - 5, ".gguf") == 0) is_gguf = 1;
 
-    bpe_vocab *vocab = bpe_vocab_load(gguf);
-    if (!vocab) { gguf_close(gguf); return NULL; }
+    gguf_context *tok_gguf = NULL;
+    bpe_vocab *vocab = NULL;
+    if (tok_gguf_path) tok_gguf = gguf_open(tok_gguf_path, 1);
+    if (!tok_gguf && is_gguf) tok_gguf = gguf_open(model_path, 1);
+    if (!tok_gguf) { fprintf(stderr, "flux2_text_enc: failed to open tokenizer GGUF\n"); return NULL; }
+
+    vocab = bpe_vocab_load(tok_gguf);
+    if (!vocab) { gguf_close(tok_gguf); return NULL; }
 
     cuda_llm_runner *gpu_model = cuda_llm_init(gpu_device, 1);
-    if (!gpu_model) { bpe_vocab_free(vocab); gguf_close(gguf); return NULL; }
+    if (!gpu_model) { bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL; }
 
-    if (cuda_llm_load_weights(gpu_model, gguf, 2048) != 0) {
-        cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(gguf); return NULL;
+    if (is_gguf) {
+        gguf_context *model_gguf = gguf_open(model_path, 1);
+        if (!model_gguf) {
+            cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
+        }
+        if (cuda_llm_load_weights(gpu_model, model_gguf, 2048) != 0) {
+            gguf_close(model_gguf);
+            cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
+        }
+        gguf_close(model_gguf);
+    } else {
+        if (cuda_llm_load_weights_qwen3_safetensors(gpu_model, model_path, 2048) != 0) {
+            cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
+        }
+    }
+
+    {
+        const int hs_layers[3] = {8, 17, 26};
+        if (cuda_llm_set_hidden_snapshot_layers(gpu_model, hs_layers, 3) != 0) {
+            cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
+        }
     }
 
     flux2_text_enc *enc = (flux2_text_enc *)calloc(1, sizeof(flux2_text_enc));
     enc->model        = gpu_model;
     enc->vocab        = vocab;
-    enc->gguf         = gguf;
+    enc->gguf         = tok_gguf;
     enc->n_embd_inner = cuda_llm_n_embd(gpu_model);
     enc->n_embd       = 3 * cuda_llm_n_embd(gpu_model);
     enc->n_vocab      = cuda_llm_n_vocab(gpu_model);
+    enc->n_layers     = cuda_llm_n_layers(gpu_model);
     enc->use_gpu      = 1;
     return enc;
 #else
-    (void)gguf_path; (void)gpu_device;
+    (void)model_path; (void)tok_gguf_path; (void)gpu_device;
     fprintf(stderr, "flux2_text_enc: GPU path requires CUDA_LLM_RUNNER_H\n");
     return NULL;
 #endif
@@ -532,18 +569,33 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
 
     if (enc->use_gpu) {
 #ifdef CUDA_LLM_RUNNER_H
-        /* GPU path: no multi-layer extraction yet, fallthrough to 1-layer repeated */
+        /* GPU path: capture the same intermediate hidden states as the CPU
+         * reference after layers 8, 17, and 26. */
         cuda_llm_runner *gpu = (cuda_llm_runner *)enc->model;
         cuda_llm_reset_state(gpu);
-        float *tmp = (float *)malloc((size_t)n_tok * n_inner * sizeof(float));
-        for (int i = 0; i < n_tok; i++)
-            cuda_llm_forward(gpu, toks[i], i);
-        cuda_llm_read_hidden(gpu, tmp, n_tok * n_inner);
-        /* Replicate to 3x until proper multi-layer extraction is implemented */
+        float *tmp = (float *)malloc((size_t)n_inner * sizeof(float));
+        if (!tmp) { free(hidden); return NULL; }
         for (int i = 0; i < n_tok; i++) {
-            memcpy(hidden + (size_t)i * n_out,              tmp + (size_t)i * n_inner, n_inner * sizeof(float));
-            memcpy(hidden + (size_t)i * n_out + n_inner,    tmp + (size_t)i * n_inner, n_inner * sizeof(float));
-            memcpy(hidden + (size_t)i * n_out + 2*n_inner,  tmp + (size_t)i * n_inner, n_inner * sizeof(float));
+            float *dst = hidden + (size_t)i * n_out;
+            cuda_llm_forward(gpu, toks[i], i);
+            if (cuda_llm_read_hidden_snapshot(gpu, 0, tmp, n_inner) != 0) {
+                free(tmp);
+                free(hidden);
+                return NULL;
+            }
+            memcpy(dst, tmp, n_inner * sizeof(float));
+            if (cuda_llm_read_hidden_snapshot(gpu, 1, tmp, n_inner) != 0) {
+                free(tmp);
+                free(hidden);
+                return NULL;
+            }
+            memcpy(dst + n_inner, tmp, n_inner * sizeof(float));
+            if (cuda_llm_read_hidden_snapshot(gpu, 2, tmp, n_inner) != 0) {
+                free(tmp);
+                free(hidden);
+                return NULL;
+            }
+            memcpy(dst + 2 * n_inner, tmp, n_inner * sizeof(float));
         }
         free(tmp);
 #endif
