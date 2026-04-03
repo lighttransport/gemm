@@ -30,6 +30,13 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose);
  * Returns 0 on success, -1 on error. */
 int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_len);
 
+/* Load Qwen3-family weights from HF/ComfyUI safetensors shards onto GPU.
+ * Supports a directory containing model-xxxxx-of-yyyyy.safetensors shards or
+ * a single safetensors file. */
+int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
+                                            const char *model_path,
+                                            int max_seq_len);
+
 /* Run one token through the transformer. Returns pointer to F32 hidden state [n_embd].
  * The returned pointer is valid until the next call (host-side buffer). */
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position);
@@ -52,6 +59,14 @@ void cuda_llm_reset_state(cuda_llm_runner *r);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */
 int cuda_llm_read_hidden(const cuda_llm_runner *r, float *dst, int n);
+
+/* Configure optional per-token hidden snapshots captured after specific layer
+ * indices (0-based, after residual). n_slots may be 0..3. */
+int cuda_llm_set_hidden_snapshot_layers(cuda_llm_runner *r, const int *layers, int n_slots);
+
+/* Read a previously captured hidden snapshot into dst. slot must be in the
+ * configured range passed to cuda_llm_set_hidden_snapshot_layers(). */
+int cuda_llm_read_hidden_snapshot(const cuda_llm_runner *r, int slot, float *dst, int n);
 
 /* Enable per-layer debug output (print hidden state norm after each layer). */
 void cuda_llm_set_debug(cuda_llm_runner *r, int debug_layers);

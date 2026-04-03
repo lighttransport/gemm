@@ -6,6 +6,7 @@
  *   --test-load    : Load DiT + VAE weights
  *   --test-dit     : Run single DiT step
  *   --test-vae     : Run VAE decoder
+ *   --test-text-enc: Compare CPU and GPU text encoders
  *   --generate     : Full text-to-image pipeline
  *
  * Build:
@@ -187,13 +188,8 @@ static int test_dit(const char *dit_path, int lat_h, int lat_w) {
     for (int i=0;i<n_img*pin;i++) { if(vel_out[i]<mn) mn=vel_out[i]; if(vel_out[i]>mx) mx=vel_out[i]; }
     fprintf(stderr, "GPU velocity: min=%.4f max=%.4f\n", mn, mx);
 
-    /* CPU comparison (also skip single blocks to match GPU) */
-    int saved_sgl = r->dit->n_single_blocks;
-    int saved_dbl = r->dit->n_double_blocks;
     float *cpu_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
     flux2_dit_forward(cpu_out, img_tok, n_img, txt_tok, n_txt, 750.0f, r->dit, 1);
-    r->dit->n_single_blocks = saved_sgl;
-    r->dit->n_double_blocks = saved_dbl;
     mn=cpu_out[0]; mx=cpu_out[0];
     for (int i=0;i<n_img*pin;i++) { if(cpu_out[i]<mn) mn=cpu_out[i]; if(cpu_out[i]>mx) mx=cpu_out[i]; }
     fprintf(stderr, "CPU velocity: min=%.4f max=%.4f\n", mn, mx);
@@ -206,6 +202,121 @@ static int test_dit(const char *dit_path, int lat_h, int lat_w) {
 
     free(img_tok); free(txt_tok); free(vel_out);
     cuda_flux2_free(r); return 0;
+}
+
+static int test_vae(const char *vae_path, int lat_h, int lat_w) {
+    fprintf(stderr, "=== CUDA VAE Decode Test ===\n");
+    cuda_flux2_runner *r = cuda_flux2_init(0, 1);
+    if (!r) return 1;
+    if (cuda_flux2_load_vae(r, vae_path) != 0) { cuda_flux2_free(r); return 1; }
+
+    int lc = FLUX2_VAE_LATENT_CHANNELS;
+    size_t lat_sz = (size_t)lc * lat_h * lat_w;
+    int out_h = lat_h * 8, out_w = lat_w * 8;
+    float *latent = (float *)malloc(lat_sz * sizeof(float));
+    float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
+    float *cpu_rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
+    if (!latent || !rgb || !cpu_rgb) {
+        free(latent); free(rgb); free(cpu_rgb); cuda_flux2_free(r); return 1;
+    }
+
+    rng_state = 12345;
+    for (size_t i = 0; i < lat_sz; i++) latent[i] = randn() * 0.5f;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (cuda_flux2_vae_decode(r, latent, lat_h, lat_w, rgb) != 0) {
+        free(latent); free(rgb); cuda_flux2_free(r); return 1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (t1.tv_sec-t0.tv_sec) + (t1.tv_nsec-t0.tv_nsec)*1e-9;
+    fprintf(stderr, "VAE decode: %.2f s (%dx%d -> %dx%d)\n", dt, lat_w, lat_h, out_w, out_h);
+
+    float mn = rgb[0], mx = rgb[0];
+    for (int i = 0; i < 3 * out_h * out_w; i++) {
+        if (rgb[i] < mn) mn = rgb[i];
+        if (rgb[i] > mx) mx = rgb[i];
+    }
+    fprintf(stderr, "GPU rgb: min=%.4f max=%.4f\n", mn, mx);
+
+    flux2_vae_decode(cpu_rgb, latent, lat_h, lat_w, r->vae);
+    float max_diff = 0.0f, sum_diff = 0.0f;
+    for (int i = 0; i < 3 * out_h * out_w; i++) {
+        float d = fabsf(rgb[i] - cpu_rgb[i]);
+        if (d > max_diff) max_diff = d;
+        sum_diff += d;
+    }
+    fprintf(stderr, "GPU vs CPU VAE: max_diff=%.6f mean_diff=%.6f\n",
+            max_diff, sum_diff / (float)(3 * out_h * out_w));
+    save_ppm("cuda_flux2_vae_output.ppm", rgb, out_h, out_w);
+
+    free(latent);
+    free(rgb);
+    free(cpu_rgb);
+    cuda_flux2_free(r);
+    return 0;
+}
+
+static int test_text_enc(const char *enc_path, const char *tok_path,
+                         const char *prompt, int device_id) {
+    fprintf(stderr, "=== Flux.2 Klein Text Encoder Test ===\n");
+    fprintf(stderr, "Prompt: '%s'\n", prompt);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    flux2_text_enc *cpu = flux2_text_enc_load_safetensors(enc_path, tok_path);
+    if (!cpu) return 1;
+    int n_tok_cpu = 0;
+    float *cpu_hidden = flux2_text_enc_encode(cpu, prompt, &n_tok_cpu);
+    int n_embd = cpu->n_embd;
+    flux2_text_enc_free(cpu);
+    if (!cpu_hidden) return 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "CPU text enc: %.2f s (%d tokens × %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_cpu, n_embd);
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
+    flux2_text_enc *gpu = flux2_text_enc_load_gpu(enc_path, tok_path, device_id);
+    if (!gpu) { free(cpu_hidden); return 1; }
+    int n_tok_gpu = 0;
+    float *gpu_hidden = flux2_text_enc_encode(gpu, prompt, &n_tok_gpu);
+    flux2_text_enc_free(gpu);
+    if (!gpu_hidden) { free(cpu_hidden); return 1; }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "GPU text enc: %.2f s (%d tokens × %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_gpu, n_embd);
+
+    if (n_tok_cpu != n_tok_gpu) {
+        fprintf(stderr, "Token count mismatch: CPU=%d GPU=%d\n", n_tok_cpu, n_tok_gpu);
+        free(cpu_hidden);
+        free(gpu_hidden);
+        return 1;
+    }
+
+    size_t total = (size_t)n_tok_cpu * n_embd;
+    float max_diff = 0.0f, sum_diff = 0.0f;
+    size_t max_idx = 0;
+    for (size_t i = 0; i < total; i++) {
+        float d = fabsf(cpu_hidden[i] - gpu_hidden[i]);
+        if (d > max_diff) {
+            max_diff = d;
+            max_idx = i;
+        }
+        sum_diff += d;
+    }
+    fprintf(stderr, "GPU vs CPU text enc: max_diff=%.6f mean_diff=%.6f\n",
+            max_diff, sum_diff / (float)total);
+    fprintf(stderr, "  max_idx=%zu GPU=%.6f CPU=%.6f\n",
+            max_idx, gpu_hidden[max_idx], cpu_hidden[max_idx]);
+
+    for (int i = 0; i < 6 && i < n_embd; i++) {
+        fprintf(stderr, "  tok0[%d] GPU=%.6f CPU=%.6f\n", i, gpu_hidden[i], cpu_hidden[i]);
+    }
+
+    free(cpu_hidden);
+    free(gpu_hidden);
+    return 0;
 }
 
 static int run_generate(const char *dit_path, const char *vae_path,
@@ -225,9 +336,10 @@ static int run_generate(const char *dit_path, const char *vae_path,
     /* Text encoding */
     fprintf(stderr, "\n[1/4] Text encoding (%s)...\n", use_gpu_enc ? "GPU" : "CPU");
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (use_gpu_enc) fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
 
     flux2_text_enc *enc = use_gpu_enc
-        ? flux2_text_enc_load_gpu(enc_path, device_id)
+        ? flux2_text_enc_load_gpu(enc_path, tok_path, device_id)
         : flux2_text_enc_load_safetensors(enc_path, tok_path);
     if (!enc) return 1;
 
@@ -363,6 +475,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit")  == 0) mode = "dit";
         else if (strcmp(argv[i], "--test-vae")  == 0) mode = "vae";
+        else if (strcmp(argv[i], "--test-text-enc") == 0) mode = "text";
         else if (strcmp(argv[i], "--generate")  == 0) mode = "gen";
         else if (strcmp(argv[i], "--base")       == 0) { is_distilled = 0; n_steps = 20; }
         else if (strcmp(argv[i], "--distilled")  == 0) { is_distilled = 1; n_steps = 4; }
@@ -383,7 +496,7 @@ int main(int argc, char **argv) {
 
     if (!mode) {
         fprintf(stderr,
-            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--generate]\n"
+            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--generate]\n"
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--seed S] [--cfg SCALE]\n"
@@ -395,6 +508,8 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "init") == 0) return test_init();
     if (strcmp(mode, "load") == 0) return test_load(dit_path, vae_path);
     if (strcmp(mode, "dit")  == 0) return test_dit(dit_path, out_h/16, out_w/16);
+    if (strcmp(mode, "vae")  == 0) return test_vae(vae_path, out_h/8, out_w/8);
+    if (strcmp(mode, "text") == 0) return test_text_enc(enc_path, tok_path, prompt, device_id);
     if (strcmp(mode, "gen")  == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,
