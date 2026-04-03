@@ -281,16 +281,39 @@ static int test_text_enc(const char *enc_path, const char *tok_path,
     if (!gpu) { free(cpu_hidden); return 1; }
     int n_tok_gpu = 0;
     float *gpu_hidden = flux2_text_enc_encode(gpu, prompt, &n_tok_gpu);
-    flux2_text_enc_free(gpu);
     if (!gpu_hidden) { free(cpu_hidden); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "GPU text enc: %.2f s (%d tokens × %d)\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_gpu, n_embd);
 
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    flux2_text_enc *gpu_cached = flux2_text_enc_load_gpu(enc_path, tok_path, device_id);
+    if (!gpu_cached) { free(cpu_hidden); free(gpu_hidden); flux2_text_enc_free(gpu); return 1; }
+    int n_tok_gpu_cached = 0;
+    float *gpu_hidden_cached = flux2_text_enc_encode(gpu_cached, prompt, &n_tok_gpu_cached);
+    if (!gpu_hidden_cached) {
+        free(cpu_hidden); free(gpu_hidden); flux2_text_enc_free(gpu_cached); flux2_text_enc_free(gpu); return 1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "GPU text enc (cached): %.2f s (%d tokens × %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_gpu_cached, n_embd);
+
     if (n_tok_cpu != n_tok_gpu) {
         fprintf(stderr, "Token count mismatch: CPU=%d GPU=%d\n", n_tok_cpu, n_tok_gpu);
         free(cpu_hidden);
         free(gpu_hidden);
+        free(gpu_hidden_cached);
+        flux2_text_enc_free(gpu_cached);
+        flux2_text_enc_free(gpu);
+        return 1;
+    }
+    if (n_tok_cpu != n_tok_gpu_cached) {
+        fprintf(stderr, "Token count mismatch: CPU=%d GPU(cached)=%d\n", n_tok_cpu, n_tok_gpu_cached);
+        free(cpu_hidden);
+        free(gpu_hidden);
+        free(gpu_hidden_cached);
+        flux2_text_enc_free(gpu_cached);
+        flux2_text_enc_free(gpu);
         return 1;
     }
 
@@ -310,12 +333,22 @@ static int test_text_enc(const char *enc_path, const char *tok_path,
     fprintf(stderr, "  max_idx=%zu GPU=%.6f CPU=%.6f\n",
             max_idx, gpu_hidden[max_idx], cpu_hidden[max_idx]);
 
+    float max_diff_cached = 0.0f;
+    for (size_t i = 0; i < total; i++) {
+        float d = fabsf(gpu_hidden[i] - gpu_hidden_cached[i]);
+        if (d > max_diff_cached) max_diff_cached = d;
+    }
+    fprintf(stderr, "GPU cached vs first load: max_diff=%.6f\n", max_diff_cached);
+
     for (int i = 0; i < 6 && i < n_embd; i++) {
         fprintf(stderr, "  tok0[%d] GPU=%.6f CPU=%.6f\n", i, gpu_hidden[i], cpu_hidden[i]);
     }
 
     free(cpu_hidden);
     free(gpu_hidden);
+    free(gpu_hidden_cached);
+    flux2_text_enc_free(gpu_cached);
+    flux2_text_enc_free(gpu);
     return 0;
 }
 
