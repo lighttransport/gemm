@@ -158,7 +158,10 @@ static int test_load(const char *dit_path, const char *vae_path) {
     return 0;
 }
 
-static int test_dit(const char *dit_path, int lat_h, int lat_w) {
+static int test_dit(const char *dit_path, const char *enc_path, const char *tok_path,
+                    const char *prompt, int lat_h, int lat_w, int n_txt,
+                    float img_scale, float txt_scale, float timestep,
+                    int use_real_text, int use_real_latent) {
     fprintf(stderr, "=== CUDA DiT Step Test ===\n");
     cuda_flux2_runner *r = cuda_flux2_init(0, 1);
     if (!r) return 1;
@@ -167,29 +170,64 @@ static int test_dit(const char *dit_path, int lat_h, int lat_w) {
     int ps = 2;
     int n_img = (lat_h/ps) * (lat_w/ps);
     int pin = r->pin;
-    int n_txt = 8, txt_dim = r->txt_dim;
+    int txt_dim = r->txt_dim;
 
     float *img_tok = (float *)calloc((size_t)n_img * pin, sizeof(float));
-    float *txt_tok = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
+    float *txt_tok = NULL;
     float *vel_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
+    if (!img_tok || !vel_out) {
+        free(img_tok); free(vel_out); cuda_flux2_free(r); return 1;
+    }
 
-    rng_state = 12345;
-    for (int i = 0; i < n_img*pin; i++) img_tok[i] = randn() * 0.1f;
-    for (int i = 0; i < n_txt*txt_dim; i++) txt_tok[i] = randn() * 0.1f;
+    if (use_real_latent) {
+        int lc = FLUX2_VAE_LATENT_CHANNELS;
+        size_t lat_sz = (size_t)lc * lat_h * lat_w;
+        float *latent = (float *)malloc(lat_sz * sizeof(float));
+        if (!latent) {
+            free(img_tok); free(vel_out); cuda_flux2_free(r); return 1;
+        }
+        for (size_t i = 0; i < lat_sz; i++) latent[i] = randn() * img_scale;
+        flux2_patchify(img_tok, latent, lc, lat_h, lat_w, ps);
+        free(latent);
+        fprintf(stderr, "Using real latent patchify path: lc=%d lat=%dx%d ps=%d\n",
+                lc, lat_w, lat_h, ps);
+    } else {
+        for (int i = 0; i < n_img*pin; i++) img_tok[i] = randn() * img_scale;
+    }
+    if (use_real_text) {
+        flux2_text_enc *enc = flux2_text_enc_load_safetensors(enc_path, tok_path);
+        if (!enc) {
+            free(img_tok); free(vel_out); cuda_flux2_free(r); return 1;
+        }
+        txt_tok = flux2_text_enc_encode(enc, prompt, &n_txt);
+        flux2_text_enc_free(enc);
+        if (!txt_tok) {
+            free(img_tok); free(vel_out); cuda_flux2_free(r); return 1;
+        }
+        txt_dim = r->txt_dim;
+        fprintf(stderr, "Using real text hidden states: n_txt=%d txt_dim=%d\n", n_txt, txt_dim);
+    } else {
+        txt_tok = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
+        if (!txt_tok) {
+            free(img_tok); free(vel_out); cuda_flux2_free(r); return 1;
+        }
+        for (int i = 0; i < n_txt*txt_dim; i++) txt_tok[i] = randn() * txt_scale;
+    }
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    cuda_flux2_dit_step(r, img_tok, n_img, txt_tok, n_txt, 750.0f, 0.0f, vel_out);
+    cuda_flux2_dit_step(r, img_tok, n_img, txt_tok, n_txt, timestep, 0.0f, vel_out);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dt = (t1.tv_sec-t0.tv_sec) + (t1.tv_nsec-t0.tv_nsec)*1e-9;
-    fprintf(stderr, "DiT step: %.2f s (n_img=%d, pin=%d)\n", dt, n_img, pin);
+    fprintf(stderr, "DiT step: %.2f s (n_img=%d, n_txt=%d, pin=%d, img_scale=%.3f, txt_scale=%.3f, t=%.3f)\n",
+            dt, n_img, n_txt, pin, img_scale, txt_scale, timestep);
 
     float mn=vel_out[0], mx=vel_out[0];
     for (int i=0;i<n_img*pin;i++) { if(vel_out[i]<mn) mn=vel_out[i]; if(vel_out[i]>mx) mx=vel_out[i]; }
     fprintf(stderr, "GPU velocity: min=%.4f max=%.4f\n", mn, mx);
 
     float *cpu_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
-    flux2_dit_forward(cpu_out, img_tok, n_img, txt_tok, n_txt, 750.0f, r->dit, 1);
+    flux2_dit_forward(cpu_out, img_tok, n_img, txt_tok, n_txt, timestep, r->dit, 1);
     mn=cpu_out[0]; mx=cpu_out[0];
     for (int i=0;i<n_img*pin;i++) { if(cpu_out[i]<mn) mn=cpu_out[i]; if(cpu_out[i]>mx) mx=cpu_out[i]; }
     fprintf(stderr, "CPU velocity: min=%.4f max=%.4f\n", mn, mx);
@@ -352,52 +390,21 @@ static int test_text_enc(const char *enc_path, const char *tok_path,
     return 0;
 }
 
-static int run_generate(const char *dit_path, const char *vae_path,
-                         const char *enc_path, const char *tok_path,
+static int run_generate_once(cuda_flux2_runner *r,
                          const char *prompt,
+                         const float *txt_hidden, int n_txt, int enc_embd,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
-                         int use_gpu_enc, int device_id) {
-    fprintf(stderr, "\n=== Flux.2 Klein GPU Pipeline ===\n");
+                         const char *out_path) {
+    struct timespec t_start, t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     fprintf(stderr, "Prompt: '%s'\n", prompt);
     fprintf(stderr, "Output: %dx%d, %d steps, seed=%llu, distilled=%d, cfg=%.1f\n",
             out_w, out_h, n_steps, (unsigned long long)seed, is_distilled, cfg_scale);
 
-    struct timespec t_start, t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-    /* Text encoding */
-    fprintf(stderr, "\n[1/4] Text encoding (%s)...\n", use_gpu_enc ? "GPU" : "CPU");
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    if (use_gpu_enc) fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
-
-    flux2_text_enc *enc = use_gpu_enc
-        ? flux2_text_enc_load_gpu(enc_path, tok_path, device_id)
-        : flux2_text_enc_load_safetensors(enc_path, tok_path);
-    if (!enc) return 1;
-
-    int n_txt = 0;
-    int enc_embd = enc->n_embd;
-    float *txt_hidden = flux2_text_enc_encode(enc, prompt, &n_txt);
-    flux2_text_enc_free(enc);
-    if (!txt_hidden) return 1;
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    fprintf(stderr, "Text enc: %.1f s (%d tokens × %d)\n",
-            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_txt, enc_embd);
-
-    /* Init CUDA runner */
-    fprintf(stderr, "\n[2/4] Init CUDA + load DiT + VAE...\n");
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    cuda_flux2_runner *r = cuda_flux2_init(device_id, 1);
-    if (!r) { free(txt_hidden); return 1; }
-    if (cuda_flux2_load_dit(r, dit_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
-    if (cuda_flux2_load_vae(r, vae_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    fprintf(stderr, "Init+load: %.1f s\n",
-            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
+    fprintf(stderr, "\n[1/3] Text encoding...\n");
+    fprintf(stderr, "Text enc: cached (%d tokens × %d)\n", n_txt, enc_embd);
 
     /* Latent setup */
     int lat_h = out_h / 8, lat_w = out_w / 8;
@@ -422,7 +429,7 @@ static int run_generate(const char *dit_path, const char *vae_path,
     else              flux2_sched_base(&sched, n_steps, n_img);
 
     /* Denoising loop */
-    fprintf(stderr, "\n[3/4] Denoising (%d steps)...\n", n_steps);
+    fprintf(stderr, "\n[2/3] Denoising (%d steps)...\n", n_steps);
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     for (int step = 0; step < n_steps; step++) {
@@ -433,8 +440,11 @@ static int run_generate(const char *dit_path, const char *vae_path,
         flux2_patchify(img_tok, latent, lc, lat_h, lat_w, ps);
 
         if (is_distilled || cfg_scale <= 1.0f) {
-            cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
-                                t_sigma, 0.0f, vel_out);
+            if (cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
+                                    t_sigma, 0.0f, vel_out) != 0) {
+                free(img_tok); free(vel_out); free(latent);
+                return 1;
+            }
             /* Velocity stats */
             float vmn=vel_out[0], vmx=vel_out[0]; double vsum=0;
             for(int i=0;i<n_img*pin;i++){if(vel_out[i]<vmn)vmn=vel_out[i];if(vel_out[i]>vmx)vmx=vel_out[i];vsum+=vel_out[i];}
@@ -442,13 +452,27 @@ static int run_generate(const char *dit_path, const char *vae_path,
         } else {
             float *txt_uncond = (float *)calloc((size_t)n_txt * r->txt_dim, sizeof(float));
             float *vel_uncond = (float *)malloc((size_t)n_img * pin * sizeof(float));
-            cuda_flux2_dit_step(r, img_tok, n_img, txt_uncond, n_txt,
-                                t_sigma, 0.0f, vel_uncond);
-            cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
-                                t_sigma, 0.0f, vel_out);
+            if (cuda_flux2_dit_step(r, img_tok, n_img, txt_uncond, n_txt,
+                                    t_sigma, 0.0f, vel_uncond) != 0 ||
+                cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
+                                    t_sigma, 0.0f, vel_out) != 0) {
+                free(txt_uncond); free(vel_uncond);
+                free(img_tok); free(vel_out); free(latent);
+                return 1;
+            }
             for (int i = 0; i < n_img * pin; i++)
                 vel_out[i] = vel_uncond[i] + cfg_scale * (vel_out[i] - vel_uncond[i]);
             free(txt_uncond); free(vel_uncond);
+        }
+
+        {
+            CUresult err = cuCtxSynchronize();
+            if (err != CUDA_SUCCESS) {
+                fprintf(stderr, "generate: cuCtxSynchronize failed after DiT step %d/%d (%d)\n",
+                        step + 1, n_steps, (int)err);
+                free(img_tok); free(vel_out); free(latent);
+                return 1;
+            }
         }
 
         float *vel_lat = (float *)calloc(lat_sz, sizeof(float));
@@ -467,25 +491,88 @@ static int run_generate(const char *dit_path, const char *vae_path,
     free(img_tok); free(vel_out);
 
     /* VAE decode */
-    fprintf(stderr, "\n[4/4] VAE decoding...\n");
+    fprintf(stderr, "\n[3/3] VAE decoding...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
-    cuda_flux2_vae_decode(r, latent, lat_h, lat_w, rgb);
+    if (cuda_flux2_vae_decode(r, latent, lat_h, lat_w, rgb) != 0) {
+        free(rgb); free(latent);
+        return 1;
+    }
+    {
+        CUresult err = cuCtxSynchronize();
+        if (err != CUDA_SUCCESS) {
+            fprintf(stderr, "generate: cuCtxSynchronize failed after VAE decode (%d)\n", (int)err);
+            free(rgb); free(latent);
+            return 1;
+        }
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "VAE: %.1f s\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
-    save_ppm("cuda_flux2_output.ppm", rgb, out_h, out_w);
+    save_ppm(out_path, rgb, out_h, out_w);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double total = (t1.tv_sec-t_start.tv_sec)+(t1.tv_nsec-t_start.tv_nsec)*1e-9;
     fprintf(stderr, "\nTotal: %.1f s\n", total);
 
-    free(rgb); free(latent); free(txt_hidden);
-    cuda_flux2_free(r);
+    free(rgb); free(latent);
     return 0;
+}
+
+static int run_generate(const char *dit_path, const char *vae_path,
+                         const char *enc_path, const char *tok_path,
+                         const char *prompt,
+                         int out_h, int out_w, int n_steps,
+                         uint64_t seed, int is_distilled, float cfg_scale,
+                         int use_gpu_enc, int device_id, int repeat) {
+    fprintf(stderr, "\n=== Flux.2 Klein GPU Pipeline ===\n");
+    fprintf(stderr, "Runs: %d\n", repeat);
+    if (use_gpu_enc) fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
+
+    fprintf(stderr, "\n[setup] Text encoder (%s)...\n", use_gpu_enc ? "GPU" : "CPU");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    flux2_text_enc *enc = use_gpu_enc
+        ? flux2_text_enc_load_gpu(enc_path, tok_path, device_id)
+        : flux2_text_enc_load_safetensors(enc_path, tok_path);
+    if (!enc) return 1;
+
+    int n_txt = 0;
+    int enc_embd = enc->n_embd;
+    float *txt_hidden = flux2_text_enc_encode(enc, prompt, &n_txt);
+    flux2_text_enc_free(enc);
+    if (!txt_hidden) return 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "Shared text enc: %.1f s (%d tokens × %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_txt, enc_embd);
+
+    fprintf(stderr, "\n[setup] Init CUDA + load DiT + VAE...\n");
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    cuda_flux2_runner *r = cuda_flux2_init(device_id, 1);
+    if (!r) { free(txt_hidden); return 1; }
+    if (cuda_flux2_load_dit(r, dit_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
+    if (cuda_flux2_load_vae(r, vae_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "Shared init+load: %.1f s\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
+
+    int rc = 0;
+    for (int i = 0; i < repeat; i++) {
+        char out_path[256];
+        if (repeat == 1) snprintf(out_path, sizeof(out_path), "cuda_flux2_output.ppm");
+        else snprintf(out_path, sizeof(out_path), "cuda_flux2_output_%02d.ppm", i);
+        fprintf(stderr, "\n--- Run %d/%d ---\n", i + 1, repeat);
+        rc = run_generate_once(r, prompt, txt_hidden, n_txt, enc_embd, out_h, out_w, n_steps,
+                               seed + (uint64_t)i, is_distilled, cfg_scale, out_path);
+        if (rc != 0) break;
+    }
+
+    free(txt_hidden);
+    cuda_flux2_free(r);
+    return rc;
 }
 
 int main(int argc, char **argv) {
@@ -496,9 +583,12 @@ int main(int argc, char **argv) {
     const char *prompt = "a red apple on a white table";
     const char *mode = NULL;
 
-    int out_h = 256, out_w = 256, n_steps = 4;
+    int out_h = 256, out_w = 256, n_steps = 4, repeat = 1, n_txt = 8;
     int is_distilled = 1, use_gpu_enc = 0, device_id = 0;
     float cfg_scale = 1.0f;
+    float img_scale = 0.1f, txt_scale = 0.1f;
+    float timestep = 750.0f;
+    int use_real_text = 0, use_real_latent = 0;
     uint64_t seed = 42;
     int verbose = 1;
     (void)verbose;
@@ -521,6 +611,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--height") == 0 && i+1<argc) out_h    = atoi(argv[++i]);
         else if (strcmp(argv[i], "--width")  == 0 && i+1<argc) out_w    = atoi(argv[++i]);
         else if (strcmp(argv[i], "--steps")  == 0 && i+1<argc) n_steps  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--repeat") == 0 && i+1<argc) repeat   = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--n-txt")  == 0 && i+1<argc) n_txt    = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--img-scale") == 0 && i+1<argc) img_scale = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--txt-scale") == 0 && i+1<argc) txt_scale = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--timestep") == 0 && i+1<argc) timestep = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--real-text") == 0) use_real_text = 1;
+        else if (strcmp(argv[i], "--real-latent") == 0) use_real_latent = 1;
         else if (strcmp(argv[i], "--seed")   == 0 && i+1<argc) seed     = (uint64_t)atoll(argv[++i]);
         else if (strcmp(argv[i], "--cfg")    == 0 && i+1<argc) cfg_scale= (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--device") == 0 && i+1<argc) device_id= atoi(argv[++i]);
@@ -532,7 +629,7 @@ int main(int argc, char **argv) {
             "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--generate]\n"
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
-            "          [--steps N] [--seed S] [--cfg SCALE]\n"
+            "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
             "          [--base|--distilled] [--gpu-enc] [--device N]\n",
             argv[0]);
         return 1;
@@ -540,13 +637,16 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "init") == 0) return test_init();
     if (strcmp(mode, "load") == 0) return test_load(dit_path, vae_path);
-    if (strcmp(mode, "dit")  == 0) return test_dit(dit_path, out_h/16, out_w/16);
+    if (strcmp(mode, "dit")  == 0) return test_dit(dit_path, enc_path, tok_path, prompt,
+                                                   out_h/16, out_w/16, n_txt,
+                                                   img_scale, txt_scale, timestep,
+                                                   use_real_text, use_real_latent);
     if (strcmp(mode, "vae")  == 0) return test_vae(vae_path, out_h/8, out_w/8);
     if (strcmp(mode, "text") == 0) return test_text_enc(enc_path, tok_path, prompt, device_id);
     if (strcmp(mode, "gen")  == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,
-                            cfg_scale, use_gpu_enc, device_id);
+                            cfg_scale, use_gpu_enc, device_id, repeat);
 
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 1;
