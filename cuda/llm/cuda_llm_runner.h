@@ -68,6 +68,10 @@ int cuda_llm_set_hidden_snapshot_layers(cuda_llm_runner *r, const int *layers, i
  * configured range passed to cuda_llm_set_hidden_snapshot_layers(). */
 int cuda_llm_read_hidden_snapshot(const cuda_llm_runner *r, int slot, float *dst, int n);
 
+/* Read several captured hidden snapshots into a packed host buffer laid out as
+ * [slot0, slot1, ...], each span having n floats. */
+int cuda_llm_read_hidden_snapshots(const cuda_llm_runner *r, float *dst, int n_slots, int n);
+
 /* Enable per-layer debug output (print hidden state norm after each layer). */
 void cuda_llm_set_debug(cuda_llm_runner *r, int debug_layers);
 

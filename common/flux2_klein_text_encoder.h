@@ -573,31 +573,14 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
          * reference after layers 8, 17, and 26. */
         cuda_llm_runner *gpu = (cuda_llm_runner *)enc->model;
         cuda_llm_reset_state(gpu);
-        float *tmp = (float *)malloc((size_t)n_inner * sizeof(float));
-        if (!tmp) { free(hidden); return NULL; }
         for (int i = 0; i < n_tok; i++) {
             float *dst = hidden + (size_t)i * n_out;
             cuda_llm_forward(gpu, toks[i], i);
-            if (cuda_llm_read_hidden_snapshot(gpu, 0, tmp, n_inner) != 0) {
-                free(tmp);
+            if (cuda_llm_read_hidden_snapshots(gpu, dst, 3, n_inner) != 0) {
                 free(hidden);
                 return NULL;
             }
-            memcpy(dst, tmp, n_inner * sizeof(float));
-            if (cuda_llm_read_hidden_snapshot(gpu, 1, tmp, n_inner) != 0) {
-                free(tmp);
-                free(hidden);
-                return NULL;
-            }
-            memcpy(dst + n_inner, tmp, n_inner * sizeof(float));
-            if (cuda_llm_read_hidden_snapshot(gpu, 2, tmp, n_inner) != 0) {
-                free(tmp);
-                free(hidden);
-                return NULL;
-            }
-            memcpy(dst + 2 * n_inner, tmp, n_inner * sizeof(float));
         }
-        free(tmp);
 #endif
     } else {
         transformer_model *mdl = (transformer_model *)enc->model;
