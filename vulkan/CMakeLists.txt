@@ -73,49 +73,33 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/attn_prefill_f32.comp
 )
 
-# DA3 depth estimation shaders
-set(DA3_SHADER_SOURCES
-    ${SHADER_SOURCE_DIR}/da3/resize_normalize_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/cls_pos_embed_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/rope_2d_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/swiglu_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/kv_transpose_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/flash_attn_tiled_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/cat_local_global_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/dpt_cls_concat_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/strided_layernorm_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/dpt_tok_to_chw_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/deconv_scatter_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/conv2d_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/bilinear_upsample_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/depth_activation_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/sinusoidal_uv_posembed_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/relu_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/channel_layernorm_f32.comp
-    ${SHADER_SOURCE_DIR}/da3/qk_layernorm_offset_f32.comp
-)
+# HY3D shaders
+set(HY3D_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders/hy3d)
+set(HY3D_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/hy3d)
+file(MAKE_DIRECTORY ${HY3D_SHADER_OUTPUT_DIR})
 
-# HY3D shaders (reused by DA3 for layerscale_add and qk_layernorm)
-set(HY3D_SHADER_SOURCES
-    ${SHADER_SOURCE_DIR}/hy3d/layerscale_add_f32.comp
-    ${SHADER_SOURCE_DIR}/hy3d/qk_layernorm_f32.comp
-)
+# TRELLIS2 shaders
+set(T2_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders/trellis2)
+set(T2_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/trellis2)
+file(MAKE_DIRECTORY ${T2_SHADER_OUTPUT_DIR})
 
-# Custom function to compile GLSL to SPIR-V (supports subdirectories)
-function(compile_shader_subdir SHADER_SOURCE SUBDIR)
-    get_filename_component(SHADER_NAME ${SHADER_SOURCE} NAME_WE)
-    file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR}/${SUBDIR})
-    set(SPIRV_OUTPUT ${SHADER_OUTPUT_DIR}/${SUBDIR}/${SHADER_NAME}.spv)
-    add_custom_command(
-        OUTPUT ${SPIRV_OUTPUT}
-        COMMAND ${GLSLC_EXECUTABLE} -fshader-stage=compute -O -o ${SPIRV_OUTPUT} ${SHADER_SOURCE}
-        DEPENDS ${SHADER_SOURCE}
-        COMMENT "Compiling ${SUBDIR}/${SHADER_NAME}.comp -> ${SUBDIR}/${SHADER_NAME}.spv"
-        VERBATIM
-    )
-    list(APPEND SPIRV_OUTPUTS ${SPIRV_OUTPUT})
-    set(SPIRV_OUTPUTS ${SPIRV_OUTPUTS} PARENT_SCOPE)
-endfunction()
+set(T2_SHADER_SOURCES
+    ${T2_SHADER_SOURCE_DIR}/adaln_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/gated_add_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/modulation_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/rope_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/timestep_embed_cossin_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/split_qkv_chunk_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/split_kv_chunk_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/layernorm_noaffine_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/silu_inplace_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/conv3d_k3_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/channel_layernorm_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/pixel_shuffle_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/self_attn_tiled_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/rope_2d_dinov3_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/dinov3_prepend_tokens_f32.comp
+)
 
 # Custom function to compile GLSL to SPIR-V
 function(compile_shader SHADER_SOURCE)
@@ -164,24 +148,6 @@ foreach(SHADER ${SHADER_SOURCES})
         compile_shader(${SHADER})
     else()
         message(WARNING "Shader not found: ${SHADER}")
-    endif()
-endforeach()
-
-# Compile DA3 shaders
-foreach(SHADER ${DA3_SHADER_SOURCES})
-    if(EXISTS ${SHADER})
-        compile_shader_subdir(${SHADER} "da3")
-    else()
-        message(WARNING "DA3 shader not found: ${SHADER}")
-    endif()
-endforeach()
-
-# Compile HY3D shaders (needed by DA3 for layerscale_add, qk_layernorm)
-foreach(SHADER ${HY3D_SHADER_SOURCES})
-    if(EXISTS ${SHADER})
-        compile_shader_subdir(${SHADER} "hy3d")
-    else()
-        message(WARNING "HY3D shader not found: ${SHADER}")
     endif()
 endforeach()
 
@@ -352,35 +318,98 @@ if(SPIRV_OUTPUTS)
     )
 endif()
 
-# DA3 Depth Estimation test executable
-set(DA3_TARGET test_vulkan_da3)
+# Compile TRELLIS2 shaders
+set(T2_SPIRV_OUTPUTS "")
+foreach(SHADER ${T2_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+        set(SPIRV_OUTPUT ${T2_SHADER_OUTPUT_DIR}/${SHADER_NAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPIRV_OUTPUT}
+            COMMAND ${GLSLC_EXECUTABLE}
+                    -fshader-stage=compute
+                    -O
+                    -o ${SPIRV_OUTPUT}
+                    ${SHADER}
+            DEPENDS ${SHADER}
+            COMMENT "Compiling trellis2/${SHADER_NAME}.comp -> ${SHADER_NAME}.spv"
+            VERBATIM
+        )
+        list(APPEND T2_SPIRV_OUTPUTS ${SPIRV_OUTPUT})
+    endif()
+endforeach()
 
-add_executable(${DA3_TARGET}
-    da3/test_vulkan_da3.cc
-    da3/vulkan_da3_runner.cc
-    da3/stb_impl.c
+if(T2_SPIRV_OUTPUTS)
+    add_custom_target(trellis2_shaders ALL DEPENDS ${T2_SPIRV_OUTPUTS})
+endif()
+
+# Compile HY3D shaders (needed by TRELLIS2 for reused ops)
+file(GLOB HY3D_SHADER_COMPS ${HY3D_SHADER_SOURCE_DIR}/*.comp)
+set(HY3D_SPIRV_OUTPUTS "")
+foreach(SHADER ${HY3D_SHADER_COMPS})
+    if(EXISTS ${SHADER})
+        get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+        set(SPIRV_OUTPUT ${HY3D_SHADER_OUTPUT_DIR}/${SHADER_NAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPIRV_OUTPUT}
+            COMMAND ${GLSLC_EXECUTABLE}
+                    -fshader-stage=compute
+                    -O
+                    -o ${SPIRV_OUTPUT}
+                    ${SHADER}
+            DEPENDS ${SHADER}
+            COMMENT "Compiling hy3d/${SHADER_NAME}.comp -> ${SHADER_NAME}.spv"
+            VERBATIM
+        )
+        list(APPEND HY3D_SPIRV_OUTPUTS ${SPIRV_OUTPUT})
+    endif()
+endforeach()
+
+if(HY3D_SPIRV_OUTPUTS)
+    add_custom_target(hy3d_shaders ALL DEPENDS ${HY3D_SPIRV_OUTPUTS})
+endif()
+
+# TRELLIS2 Vulkan test executable
+set(TRELLIS2_VK_TARGET test_vulkan_trellis2)
+
+add_executable(${TRELLIS2_VK_TARGET}
+    trellis2/test_vulkan_trellis2.cc
+    trellis2/vulkan_trellis2_runner.cc
     ${DEPS_DIR}/vulkan-runner.cc
     ${DEPS_DIR}/vkew.cc
 )
 
-target_include_directories(${DA3_TARGET} PRIVATE
+target_include_directories(${TRELLIS2_VK_TARGET} PRIVATE
     ${DEPS_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
-    ${CMAKE_CURRENT_SOURCE_DIR}/da3
 )
 
-target_link_libraries(${DA3_TARGET} PRIVATE
+target_link_libraries(${TRELLIS2_VK_TARGET} PRIVATE
     ${CMAKE_DL_LIBS}
     m
-    Threads::Threads
 )
 
-target_compile_definitions(${DA3_TARGET} PRIVATE
+target_compile_definitions(${TRELLIS2_VK_TARGET} PRIVATE
     USE_VULKAN=1
 )
 
+if(TARGET trellis2_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} trellis2_shaders)
+endif()
+if(TARGET hy3d_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} hy3d_shaders)
+endif()
 if(TARGET coopmat_shaders)
-    add_dependencies(${DA3_TARGET} coopmat_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} coopmat_shaders)
+endif()
+
+# Copy all shader SPVs to build directory
+if(T2_SPIRV_OUTPUTS OR HY3D_SPIRV_OUTPUTS)
+    add_custom_command(TARGET ${TRELLIS2_VK_TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders/trellis2
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders/hy3d
+        COMMENT "Shader directories created for trellis2"
+    )
 endif()
 
 message(STATUS "")
