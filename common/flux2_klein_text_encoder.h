@@ -643,8 +643,14 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
         cuda_llm_reset_state(gpu);
         for (int i = 0; i < n_tok; i++) {
             float *dst = hidden + (size_t)i * n_out;
-            cuda_llm_forward(gpu, toks[i], i);
+            if (!cuda_llm_forward(gpu, toks[i], i)) {
+                fprintf(stderr, "flux2_text_enc: cuda_llm_forward failed at token %d/%d\n", i + 1, n_tok);
+                free(hidden);
+                return NULL;
+            }
             if (cuda_llm_read_hidden_snapshots(gpu, dst, 3, n_inner) != 0) {
+                fprintf(stderr, "flux2_text_enc: cuda_llm_read_hidden_snapshots failed at token %d/%d\n",
+                        i + 1, n_tok);
                 free(hidden);
                 return NULL;
             }
