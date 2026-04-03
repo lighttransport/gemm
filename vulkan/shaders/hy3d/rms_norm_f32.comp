@@ -37,6 +37,6 @@ void main() {
 
     // Normalize in-place with weight
     for (uint i = 0; i < pc.head_dim; i++) {
-        data[base + i] = data[base + i] * inv * w[h * pc.head_dim + i];
+        data[base + i] = data[base + i] * inv * w[i];
     }
 }
