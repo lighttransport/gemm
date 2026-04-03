@@ -3073,6 +3073,18 @@ struct cuda_llm_runner {
     int _ds_embd_stride;
 };
 
+static int cuda_llm_bind_context(cuda_llm_runner *r) {
+    if (!r) return -1;
+    CUresult err = cuCtxSetCurrent(r->context);
+    if (err != CUDA_SUCCESS) {
+        if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: cuCtxSetCurrent failed (%d)\n", (int)err);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 /* ======================================================================== */
 /* NVRTC kernel compilation                                                 */
 /* ======================================================================== */
@@ -4817,6 +4829,7 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (cuda_llm_bind_context(r) != 0) return NULL;
 
     int n_embd = r->n_embd;
 
@@ -5823,6 +5836,7 @@ float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int positio
 float *cuda_llm_forward_embd(cuda_llm_runner *r, const float *embd, int embd_stride, int position) {
     if (!r || !r->weights_loaded || !embd) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (cuda_llm_bind_context(r) != 0) return NULL;
 
     int n_embd = r->n_embd;
 
@@ -5861,7 +5875,10 @@ float *cuda_llm_forward_embd_logits(cuda_llm_runner *r, const float *embd, int e
 /* Read last hidden state (d_x) from GPU */
 int cuda_llm_read_hidden(const cuda_llm_runner *r, float *dst, int n) {
     if (!r || !dst || n <= 0) return -1;
-    CUresult err = cuMemcpyDtoH(dst, r->d_x, (size_t)n * sizeof(float));
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    err = cuMemcpyDtoH(dst, r->d_x, (size_t)n * sizeof(float));
     return (err == CUDA_SUCCESS) ? 0 : -1;
 }
 
@@ -5882,8 +5899,11 @@ int cuda_llm_set_hidden_snapshot_layers(cuda_llm_runner *r, const int *layers, i
 int cuda_llm_read_hidden_snapshot(const cuda_llm_runner *r, int slot, float *dst, int n) {
     if (!r || !dst || n <= 0) return -1;
     if (slot < 0 || slot >= r->n_hidden_snapshots) return -1;
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
     CUdeviceptr src = r->d_hidden_snapshots + (size_t)slot * n * sizeof(float);
-    CUresult err = cuMemcpyDtoH(dst, src, (size_t)n * sizeof(float));
+    err = cuMemcpyDtoH(dst, src, (size_t)n * sizeof(float));
     return (err == CUDA_SUCCESS) ? 0 : -1;
 }
 
@@ -5891,7 +5911,10 @@ int cuda_llm_read_hidden_snapshots(const cuda_llm_runner *r, float *dst, int n_s
     if (!r || !dst || n <= 0) return -1;
     if (n_slots < 0 || n_slots > r->n_hidden_snapshots) return -1;
     if (n_slots == 0) return 0;
-    CUresult err = cuMemcpyDtoH(dst, r->d_hidden_snapshots, (size_t)n_slots * n * sizeof(float));
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    err = cuMemcpyDtoH(dst, r->d_hidden_snapshots, (size_t)n_slots * n * sizeof(float));
     return (err == CUDA_SUCCESS) ? 0 : -1;
 }
 
@@ -6017,7 +6040,25 @@ void cuda_llm_free(cuda_llm_runner *r) {
 /* ======================================================================== */
 
 void cuda_llm_reset_state(cuda_llm_runner *r) {
-    if (!r || !r->is_hybrid) return;
+    if (!r) return;
+    if (cuda_llm_bind_context(r) != 0) return;
+
+    int kv_dim = r->n_kv_heads * r->head_dim;
+    if (kv_dim > 0 && r->max_seq_len > 0) {
+        size_t kv_cache_bytes = (size_t)r->max_seq_len * kv_dim * sizeof(float);
+        if (r->d_key_cache && r->d_value_cache) {
+            for (int l = 0; l < r->n_layers; l++) {
+                if (r->d_key_cache[l]) cuMemsetD8(r->d_key_cache[l], 0, kv_cache_bytes);
+                if (r->d_value_cache[l]) cuMemsetD8(r->d_value_cache[l], 0, kv_cache_bytes);
+            }
+        }
+    }
+    if (r->d_hidden_snapshots && r->n_hidden_snapshots > 0 && r->n_embd > 0) {
+        size_t snap_bytes = (size_t)r->n_hidden_snapshots * r->n_embd * sizeof(float);
+        cuMemsetD8(r->d_hidden_snapshots, 0, snap_bytes);
+    }
+
+    if (!r->is_hybrid) return;
     for (int l = 0; l < r->n_layers; l++) {
         cuda_layer *cl = &r->layers[l];
         if (!cl->is_ssm) continue;
