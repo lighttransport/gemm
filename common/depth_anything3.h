@@ -1831,64 +1831,34 @@ void da3_free(da3_model *m) {
 da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, int n_threads) {
     da3_result result = {0};
     int ps = m->patch_size;
+    int gh = m->grid_h, gw = m->grid_w;
+    int np = m->n_patches;
+    int nt = m->n_tokens;
     int dim = m->dim;
-
-    /* Compute aspect-ratio preserving target (matching official DA3 preprocessing) */
-    int process_res = 504;
-    int longest = (img_w > img_h) ? img_w : img_h;
-    float scale = (float)process_res / (float)longest;
-    int new_w = (int)(img_w * scale + 0.5f); if (new_w < 1) new_w = 1;
-    int new_h = (int)(img_h * scale + 0.5f); if (new_h < 1) new_h = 1;
-    /* Round to nearest multiple of patch_size */
-    { int down_w = (new_w / ps) * ps, up_w = down_w + ps;
-      int down_h = (new_h / ps) * ps, up_h = down_h + ps;
-      int target_w2 = (up_w - new_w <= new_w - down_w) ? up_w : down_w;
-      int target_h2 = (up_h - new_h <= new_h - down_h) ? up_h : down_h;
-      new_w = target_w2 > 0 ? target_w2 : ps;
-      new_h = target_h2 > 0 ? target_h2 : ps; }
-
-    int target_w = new_w, target_h = new_h;
-    int gh = target_h / ps, gw = target_w / ps;
-    int np = gh * gw, nt = np + 1;
+    int target_h = gh * ps;
+    int target_w = gw * ps;
 
     if (n_threads < 1) n_threads = 1;
     double t_start = da3_time_ms();
 
     /* ─── Step 1: Preprocess ─── */
-    /* Area-based resize (matching cv2.INTER_AREA) + ImageNet normalize */
+    /* Resize to target_h x target_w, normalize */
     float *img_norm = (float *)malloc((size_t)3 * target_h * target_w * sizeof(float));
-    {
-        float scale_y = (float)img_h / target_h;
-        float scale_x = (float)img_w / target_w;
-        for (int c = 0; c < 3; c++) {
-            for (int oh = 0; oh < target_h; oh++) {
-                float sy0f = oh * scale_y;
-                float sy1f = (oh + 1) * scale_y;
-                int iy0 = (int)sy0f;
-                int iy1 = (int)sy1f; if (iy1 >= img_h) iy1 = img_h - 1;
-                for (int ow = 0; ow < target_w; ow++) {
-                    float sx0f = ow * scale_x;
-                    float sx1f = (ow + 1) * scale_x;
-                    int ix0 = (int)sx0f;
-                    int ix1 = (int)sx1f; if (ix1 >= img_w) ix1 = img_w - 1;
-                    float sum = 0.0f, wsum = 0.0f;
-                    for (int iy = iy0; iy <= iy1; iy++) {
-                        float wy = 1.0f;
-                        if (iy == iy0) wy = 1.0f - (sy0f - iy0);
-                        if (iy == iy1 && iy1 != iy0) { float e = sy1f - iy1; if (e < wy) wy = e; }
-                        for (int ix = ix0; ix <= ix1; ix++) {
-                            float wx = 1.0f;
-                            if (ix == ix0) wx = 1.0f - (sx0f - ix0);
-                            if (ix == ix1 && ix1 != ix0) { float e = sx1f - ix1; if (e < wx) wx = e; }
-                            float w = wy * wx;
-                            sum += (float)rgb[(iy * img_w + ix) * 3 + c] * w;
-                            wsum += w;
-                        }
-                    }
-                    float v = (wsum > 0.0f) ? sum / wsum : 0.0f;
-                    img_norm[c * target_h * target_w + oh * target_w + ow] =
-                        (v / 255.0f - m->image_mean[c]) / m->image_std[c];
-                }
+    for (int c = 0; c < 3; c++) {
+        for (int oh = 0; oh < target_h; oh++) {
+            float fy = (target_h > 1) ? (float)oh * (img_h - 1) / (target_h - 1) : 0.0f;
+            int y0 = (int)fy; int y1 = y0 + 1 < img_h ? y0 + 1 : y0;
+            float dy = fy - y0;
+            for (int ow = 0; ow < target_w; ow++) {
+                float fx = (target_w > 1) ? (float)ow * (img_w - 1) / (target_w - 1) : 0.0f;
+                int x0 = (int)fx; int x1 = x0 + 1 < img_w ? x0 + 1 : x0;
+                float dx = fx - x0;
+                float v = (float)rgb[(y0 * img_w + x0) * 3 + c] * (1-dy)*(1-dx)
+                        + (float)rgb[(y0 * img_w + x1) * 3 + c] * (1-dy)*dx
+                        + (float)rgb[(y1 * img_w + x0) * 3 + c] * dy*(1-dx)
+                        + (float)rgb[(y1 * img_w + x1) * 3 + c] * dy*dx;
+                img_norm[c * target_h * target_w + oh * target_w + ow] =
+                    (v / 255.0f - m->image_mean[c]) / m->image_std[c];
             }
         }
     }
@@ -1931,49 +1901,8 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         memcpy(hidden, cls, (size_t)dim * sizeof(float));
         free(cls);
 
-        float *pe_orig = da3_dequant(&m->pos_embed);
-        /* pos_embed: originally [M*M+1, dim] for M×M grid. Interpolate if grid differs. */
-        int M = m->grid_h;  /* original square grid (37 for DA3-Small) */
-        float *pe;
-        if (gh == M && gw == M) {
-            pe = pe_orig;
-        } else {
-            /* Bicubic interpolation from M×M to gh×gw (Keys a=-0.75, scale_factor with offset) */
-            pe = (float *)malloc((size_t)nt * dim * sizeof(float));
-            memcpy(pe, pe_orig, (size_t)dim * sizeof(float));  /* CLS token */
-            float *patch_pe = pe_orig + dim;  /* [M*M, dim] */
-            float interp_offset = 0.1f;
-            float sx = (float)(gw + interp_offset) / M;
-            float sy = (float)(gh + interp_offset) / M;
-            for (int y = 0; y < gh; y++) {
-                float fy = ((float)y + 0.5f) / sy - 0.5f;
-                if (fy < 0) fy = 0; if (fy > M - 1) fy = (float)(M - 1);
-                int iy = (int)fy; float dy = fy - iy;
-                for (int x = 0; x < gw; x++) {
-                    float fx = ((float)x + 0.5f) / sx - 0.5f;
-                    if (fx < 0) fx = 0; if (fx > M - 1) fx = (float)(M - 1);
-                    int ix = (int)fx; float dx = fx - ix;
-                    for (int d = 0; d < dim; d++) {
-                        float val = 0.0f;
-                        for (int jj = -1; jj <= 2; jj++) {
-                            int sy2 = iy + jj; if (sy2 < 0) sy2 = 0; if (sy2 >= M) sy2 = M - 1;
-                            float ay = fabsf(dy - jj);
-                            float wy = (ay <= 1.0f) ? ((1.25f*ay - 2.25f)*ay)*ay + 1.0f :
-                                        (ay < 2.0f) ? ((-0.75f*ay + 3.75f)*ay - 6.0f)*ay + 3.0f : 0.0f;
-                            for (int ii = -1; ii <= 2; ii++) {
-                                int sx2 = ix + ii; if (sx2 < 0) sx2 = 0; if (sx2 >= M) sx2 = M - 1;
-                                float ax = fabsf(dx - ii);
-                                float wx = (ax <= 1.0f) ? ((1.25f*ax - 2.25f)*ax)*ax + 1.0f :
-                                            (ax < 2.0f) ? ((-0.75f*ax + 3.75f)*ax - 6.0f)*ax + 3.0f : 0.0f;
-                                val += patch_pe[sy2 * M * dim + sx2 * dim + d] * wy * wx;
-                            }
-                        }
-                        pe[(1 + y * gw + x) * dim + d] = val;
-                    }
-                }
-            }
-            free(pe_orig);
-        }
+        float *pe = da3_dequant(&m->pos_embed);
+        /* pos_embed: [n_tokens, dim], add to all tokens */
         for (int t = 0; t < nt; t++)
             for (int i = 0; i < dim; i++)
                 hidden[t * dim + i] += pe[t * dim + i];

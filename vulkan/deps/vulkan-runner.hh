@@ -269,24 +269,7 @@ public:
   bool mapBuffer(const BufferInfo& bufferInfo, void** data);
   void unmapBuffer(const BufferInfo& bufferInfo);
   bool copyBuffer(const BufferInfo& srcBuffer, const BufferInfo& dstBuffer, size_t size);
-
-  // DEVICE_LOCAL buffer management (GPU-only, not CPU-mappable)
-  bool createDeviceLocalBuffer(size_t size, BufferInfo& bufferInfo);
-  bool createStagingBuffer(size_t size, BufferInfo& bufferInfo);
-  bool uploadToDeviceLocal(const BufferInfo& deviceBuf, const void* data, size_t size);
-  bool downloadFromDeviceLocal(const BufferInfo& deviceBuf, void* data, size_t size);
-
-  // Fence-based synchronization
-  bool createFence(VkFence& fence, bool signaled = false);
-  void destroyFence(VkFence fence);
-  bool endRecordingAndSubmitFenced(VkFence fence);
-  bool waitForFence(VkFence fence, uint64_t timeout = UINT64_MAX);
-  void resetFence(VkFence fence);
-
-  // Record transfer ops into current command buffer (for batched dispatch)
-  void recordCopyBuffer(const BufferInfo& src, const BufferInfo& dst, size_t size);
-  void recordFillBuffer(const BufferInfo& buf, uint32_t value, size_t offset, size_t size);
-
+  
   // Error handling
   std::string getLastError() const { return lastError_; }
 

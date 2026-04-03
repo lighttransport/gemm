@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: MIT
+// 3D RoPE for dense grid (complex-pair convention)
+// data: [N, dim], rope_cos/sin: [N, 3, n_freqs]
+// Grid: (N, 1, 1), workgroup: (256, 1, 1) -- one thread per head
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DataBuffer { float data_buf[]; };
+layout(std430, binding = 1) readonly buffer CosBuffer { float rope_cos[]; };
+layout(std430, binding = 2) readonly buffer SinBuffer { float rope_sin[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint dim;
+    uint n_heads;
+    uint head_dim;
+    uint n_freqs;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.N) return;
+
+    uint base = tok * pc.dim;
+    uint cs_base = tok * 3 * pc.n_freqs;
+
+    for (uint h = gl_LocalInvocationID.x; h < pc.n_heads; h += 256) {
+        uint vh = base + h * pc.head_dim;
+
+        // Complex-pair rotation: (data[2k], data[2k+1]) * (cos + i*sin)
+        uint pair = 0;
+        for (uint axis = 0; axis < 3; axis++) {
+            uint ca = cs_base + axis * pc.n_freqs;
+            uint sa = cs_base + axis * pc.n_freqs;
+            for (uint j = 0; j < pc.n_freqs; j++, pair++) {
+                uint idx = vh + pair * 2;
+                float re = data_buf[idx];
+                float im = data_buf[idx + 1];
+                float c = rope_cos[ca + j];
+                float s = rope_sin[sa + j];
+                data_buf[idx]     = re * c - im * s;
+                data_buf[idx + 1] = re * s + im * c;
+            }
+        }
+        // Remaining pairs (if head_dim/2 > 3*n_freqs): identity (no rotation)
+    }
+}

@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: MIT
+// SiLU activation in-place: x = x / (1 + exp(-x))
+// Grid: (ceil(n/256), 1, 1), workgroup: (256, 1, 1)
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DataBuffer { float data_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    if (i < pc.n) {
+        float v = data_buf[i];
+        data_buf[i] = v / (1.0 + exp(-v));
+    }
+}
