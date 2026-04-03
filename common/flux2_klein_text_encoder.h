@@ -43,6 +43,7 @@ typedef struct {
     int   n_vocab;
     int   n_layers;     /* total transformer layers */
     int   use_gpu;
+    int   owns_resources;
 } flux2_text_enc;
 
 /* Load from a single merged safetensors file (ComfyUI qwen_3_4b.safetensors).
@@ -86,6 +87,24 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
 #include "transformer.h"
 #include "bpe_tokenizer.h"
 #include "safetensors.h"
+
+#ifdef CUDA_LLM_RUNNER_H
+typedef struct {
+    char model_path[512];
+    char tok_path[512];
+    int gpu_device;
+    int ref_count;
+    cuda_llm_runner *model;
+    bpe_vocab *vocab;
+    gguf_context *tok_gguf;
+    int n_embd_inner;
+    int n_embd;
+    int n_vocab;
+    int n_layers;
+} flux2_enc_gpu_cache;
+
+static flux2_enc_gpu_cache g_flux2_enc_gpu_cache = {0};
+#endif
 
 /* ---- BF16 dequant helper ---- */
 static float flux2_enc_bf16_to_f32(uint16_t v) {
@@ -316,6 +335,7 @@ static flux2_text_enc *flux2_enc_build_from_shards(st_context **shards, int n_sh
     enc->n_vocab      = n_vocab;
     enc->n_layers     = n_layers;
     enc->use_gpu      = 0;
+    enc->owns_resources = 1;
     return enc;
 }
 
@@ -437,6 +457,7 @@ flux2_text_enc *flux2_text_enc_load(const char *gguf_path) {
     enc->n_vocab      = model->n_vocab;
     enc->n_layers     = model->n_layers;
     enc->use_gpu      = 0;
+    enc->owns_resources = 1;
     fprintf(stderr, "flux2_text_enc: n_embd_inner=%d output_dim=%d n_vocab=%d\n",
             enc->n_embd_inner, enc->n_embd, enc->n_vocab);
     return enc;
@@ -448,6 +469,26 @@ flux2_text_enc *flux2_text_enc_load_gpu(const char *model_path,
                                         const char *tok_gguf_path,
                                         int gpu_device) {
 #ifdef CUDA_LLM_RUNNER_H
+    if (g_flux2_enc_gpu_cache.model &&
+        g_flux2_enc_gpu_cache.gpu_device == gpu_device &&
+        strcmp(g_flux2_enc_gpu_cache.model_path, model_path) == 0 &&
+        strcmp(g_flux2_enc_gpu_cache.tok_path, tok_gguf_path ? tok_gguf_path : "") == 0) {
+        flux2_text_enc *enc = (flux2_text_enc *)calloc(1, sizeof(flux2_text_enc));
+        if (!enc) return NULL;
+        g_flux2_enc_gpu_cache.ref_count++;
+        enc->model = g_flux2_enc_gpu_cache.model;
+        enc->vocab = g_flux2_enc_gpu_cache.vocab;
+        enc->gguf = g_flux2_enc_gpu_cache.tok_gguf;
+        enc->n_embd_inner = g_flux2_enc_gpu_cache.n_embd_inner;
+        enc->n_embd = g_flux2_enc_gpu_cache.n_embd;
+        enc->n_vocab = g_flux2_enc_gpu_cache.n_vocab;
+        enc->n_layers = g_flux2_enc_gpu_cache.n_layers;
+        enc->use_gpu = 1;
+        enc->owns_resources = 0;
+        fprintf(stderr, "flux2_text_enc: reusing cached GPU encoder\n");
+        return enc;
+    }
+
     fprintf(stderr, "flux2_text_enc: GPU %s (device %d)\n", model_path, gpu_device);
 
     int is_gguf = 0;
@@ -498,6 +539,20 @@ flux2_text_enc *flux2_text_enc_load_gpu(const char *model_path,
     enc->n_vocab      = cuda_llm_n_vocab(gpu_model);
     enc->n_layers     = cuda_llm_n_layers(gpu_model);
     enc->use_gpu      = 1;
+    enc->owns_resources = 0;
+
+    strncpy(g_flux2_enc_gpu_cache.model_path, model_path, sizeof(g_flux2_enc_gpu_cache.model_path) - 1);
+    strncpy(g_flux2_enc_gpu_cache.tok_path, tok_gguf_path ? tok_gguf_path : "",
+            sizeof(g_flux2_enc_gpu_cache.tok_path) - 1);
+    g_flux2_enc_gpu_cache.gpu_device = gpu_device;
+    g_flux2_enc_gpu_cache.ref_count = 1;
+    g_flux2_enc_gpu_cache.model = gpu_model;
+    g_flux2_enc_gpu_cache.vocab = vocab;
+    g_flux2_enc_gpu_cache.tok_gguf = tok_gguf;
+    g_flux2_enc_gpu_cache.n_embd_inner = enc->n_embd_inner;
+    g_flux2_enc_gpu_cache.n_embd = enc->n_embd;
+    g_flux2_enc_gpu_cache.n_vocab = enc->n_vocab;
+    g_flux2_enc_gpu_cache.n_layers = enc->n_layers;
     return enc;
 #else
     (void)model_path; (void)tok_gguf_path; (void)gpu_device;
@@ -512,13 +567,26 @@ void flux2_text_enc_free(flux2_text_enc *enc) {
     if (!enc) return;
     if (enc->use_gpu) {
 #ifdef CUDA_LLM_RUNNER_H
-        cuda_llm_free((cuda_llm_runner *)enc->model);
+        if (g_flux2_enc_gpu_cache.model == (cuda_llm_runner *)enc->model &&
+            g_flux2_enc_gpu_cache.ref_count > 0) {
+            g_flux2_enc_gpu_cache.ref_count--;
+            if (g_flux2_enc_gpu_cache.ref_count == 0) {
+                cuda_llm_free(g_flux2_enc_gpu_cache.model);
+                bpe_vocab_free(g_flux2_enc_gpu_cache.vocab);
+                if (g_flux2_enc_gpu_cache.tok_gguf) gguf_close(g_flux2_enc_gpu_cache.tok_gguf);
+                memset(&g_flux2_enc_gpu_cache, 0, sizeof(g_flux2_enc_gpu_cache));
+            }
+        } else if (enc->owns_resources) {
+            cuda_llm_free((cuda_llm_runner *)enc->model);
+            bpe_vocab_free((bpe_vocab *)enc->vocab);
+            if (enc->gguf) gguf_close((gguf_context *)enc->gguf);
+        }
 #endif
     } else {
         transformer_free((transformer_model *)enc->model);
+        bpe_vocab_free((bpe_vocab *)enc->vocab);
+        if (enc->gguf) gguf_close((gguf_context *)enc->gguf);
     }
-    bpe_vocab_free((bpe_vocab *)enc->vocab);
-    if (enc->gguf) gguf_close((gguf_context *)enc->gguf);
     free(enc);
 }
 
