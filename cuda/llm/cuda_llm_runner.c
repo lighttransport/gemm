@@ -3057,7 +3057,7 @@ struct cuda_llm_runner {
     /* INT8 quantization scratch (for dp4a path) */
     CUdeviceptr d_xb_q;     /* INT8 [max_dim] */
     CUdeviceptr d_xb_scale; /* F32 [1] */
-    CUdeviceptr d_hidden_snapshots[3]; /* optional [n_embd] per snapshot slot */
+    CUdeviceptr d_hidden_snapshots; /* optional packed [3 * n_embd] snapshot buffer */
 
     /* Host output buffer */
     float *h_output;     /* [n_embd] or [n_vocab] for logits */
@@ -3605,9 +3605,7 @@ static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_
 
     CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
     CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
-    for (int i = 0; i < 3; i++) {
-        CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots[i], r->n_embd * sizeof(float)));
-    }
+    CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
 
@@ -4114,9 +4112,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     /* INT8 quantization scratch (for dp4a path) */
     CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
     CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
-    for (int i = 0; i < 3; i++) {
-        CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots[i], r->n_embd * sizeof(float)));
-    }
+    CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     /* Logits buffer (GPU + host) */
     CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
@@ -5687,7 +5683,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
 
         for (int si = 0; si < r->n_hidden_snapshots; si++) {
             if (r->hidden_snapshot_layers[si] == l) {
-                cuMemcpyDtoDAsync(r->d_hidden_snapshots[si], r->d_x,
+                CUdeviceptr dst = r->d_hidden_snapshots + (size_t)si * n_embd * sizeof(float);
+                cuMemcpyDtoDAsync(dst, r->d_x,
                                   (size_t)n_embd * sizeof(float), r->stream);
             }
         }
@@ -5809,7 +5806,16 @@ int cuda_llm_set_hidden_snapshot_layers(cuda_llm_runner *r, const int *layers, i
 int cuda_llm_read_hidden_snapshot(const cuda_llm_runner *r, int slot, float *dst, int n) {
     if (!r || !dst || n <= 0) return -1;
     if (slot < 0 || slot >= r->n_hidden_snapshots) return -1;
-    CUresult err = cuMemcpyDtoH(dst, r->d_hidden_snapshots[slot], (size_t)n * sizeof(float));
+    CUdeviceptr src = r->d_hidden_snapshots + (size_t)slot * n * sizeof(float);
+    CUresult err = cuMemcpyDtoH(dst, src, (size_t)n * sizeof(float));
+    return (err == CUDA_SUCCESS) ? 0 : -1;
+}
+
+int cuda_llm_read_hidden_snapshots(const cuda_llm_runner *r, float *dst, int n_slots, int n) {
+    if (!r || !dst || n <= 0) return -1;
+    if (n_slots < 0 || n_slots > r->n_hidden_snapshots) return -1;
+    if (n_slots == 0) return 0;
+    CUresult err = cuMemcpyDtoH(dst, r->d_hidden_snapshots, (size_t)n_slots * n * sizeof(float));
     return (err == CUDA_SUCCESS) ? 0 : -1;
 }
 
@@ -5849,9 +5855,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_ds_tmp)   cuMemFree(r->d_ds_tmp);
     if (r->d_router_logits) cuMemFree(r->d_router_logits);
     if (r->d_moe_accum)    cuMemFree(r->d_moe_accum);
-    for (int i = 0; i < 3; i++) {
-        if (r->d_hidden_snapshots[i]) cuMemFree(r->d_hidden_snapshots[i]);
-    }
+    if (r->d_hidden_snapshots) cuMemFree(r->d_hidden_snapshots);
     free(r->h_router_logits);
     if (r->d_xb_q)    cuMemFree(r->d_xb_q);
     if (r->d_xb_scale) cuMemFree(r->d_xb_scale);
