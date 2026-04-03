@@ -9,8 +9,8 @@ Text Prompt
     │
     ▼
 ┌─────────────────┐
-│  Text Encoder    │  Qwen3-4B (28 layers, GQA)
-│  [CUDA or CPU]   │  GGUF Q8_0 weights
+│  Text Encoder    │  Klein/Qwen3 text encoder
+│  [CUDA or CPU]   │  2-shard safetensors weights
 │                  │  → hidden states [N_txt, 7680]
 └────────┬────────┘
          │
@@ -34,23 +34,25 @@ Text Prompt
 
 ## Model Specifications
 
-### Text Encoder — Qwen3-4B
+### Text Encoder — Klein/Qwen3 Text Encoder
 
 | Parameter | Value |
 |---|---|
 | Architecture | `qwen3` (GQA transformer) |
-| Hidden dim | 2048 |
-| Output projected dim | 7680 (output of last layer norm) |
-| Layers | 28 |
-| Attention heads | 16 (8 KV heads, 2:1 GQA) |
+| Hidden dim | 2560 |
+| Output projected dim | 7680 (3 layer snapshots × 2560) |
+| Layers | 36 |
+| Attention heads | 32 (8 KV heads, 4:1 GQA) |
 | Head dim | 128 |
-| FFN intermediate | 11008 |
+| FFN intermediate | 9728 |
 | RoPE theta | 1,000,000 |
 | Activation | SiLU (SwiGLU) |
 
-Output: per-token hidden states `[N_real_tokens, 7680]` — no padding, no pooling. Only real tokens (not pad tokens) are returned, so N_txt is typically 10–20 for short prompts.
+Output: per-token hidden states `[N_real_tokens, 7680]`, built by concatenating hidden snapshots after layers 8, 17, and 26. Only real tokens are returned, so `N_txt` is typically 10–20 for short prompts.
 
-**Chat template:** The model uses a system prompt prefix. Our implementation uses the raw Qwen3 embedding without the VL chat template, relying on a clean text-only system prompt stripped to just the user message tokens.
+**Weights:** CPU and GPU paths both use the Klein `text_encoder/` safetensors shards. The GGUF file is used only for tokenizer/BPE vocab.
+
+**Chat template:** The implementation uses a text-only prompt path, not the full VL chat template.
 
 ### DiT — Flux.2 Klein (5+20 Block Architecture)
 
@@ -175,8 +177,8 @@ All are single-header libraries — define `*_IMPLEMENTATION` before include.
 
 | File | Description |
 |---|---|
-| `cuda_flux2_runner.h` | GPU runner: NVRTC kernels, F32 GEMM, FA2 flash attention, 4-axis RoPE, DiT forward |
-| `test_cuda_flux2.c` | CUDA test harness: init, load, DiT step, full generation |
+| `cuda_flux2_runner.h` | GPU runner: NVRTC kernels, F32 GEMM, FA2 flash attention, 4-axis RoPE, DiT forward, VAE decode |
+| `test_cuda_flux2.c` | CUDA test harness: init, load, DiT step, text encoder, VAE, full generation |
 | `Makefile` | Build targets |
 
 ## Build & Run
@@ -272,18 +274,19 @@ make test-gen-dist    # Distilled pipeline
 make test-gen-base    # Base pipeline
 ```
 
-**CUDA performance (256×256, 4 steps, RTX 5060 Ti 16GB sm_120):**
+**CUDA performance (RTX 5060 Ti 16GB sm_120):**
 
 | Stage | Time |
 |---|---|
-| Text encoder (GPU) | ~3s (CUDA LLM runner, GGUF Q8_0) |
-| DiT load | ~0.5s |
-| DiT per step | ~9.5s (F32 GEMM, FA2 flash attention) |
-| DiT total (4 steps) | ~38s |
-| VAE decode (GPU) | ~0.14s at 8×8 latent test size (64×64 RGB) |
-| **Total** | DiT-dominated; old CPU VAE bottleneck removed |
+| GPU text encode cold start | ~9.6–9.8s |
+| GPU text encode cached in-process | ~0.3s |
+| Shared DiT+VAE load | ~16.4–16.6s |
+| 64×64, 1-step generation after setup | ~0.3s |
+| VAE decode (64×64 output) | ~0.1s |
 
-> **Note:** The heavy VAE path is now on CUDA. The current implementation still bridges the single mid-block attention through CPU, but conv/groupnorm/resblock/upsample work is on GPU.
+> **Note:** The heavy VAE path is on CUDA. The current implementation still bridges the single VAE mid-block attention through CPU, but conv/groupnorm/resblock/upsample work is on GPU.
+
+> **Memory note:** `--generate --gpu-enc` now pre-encodes text once, frees the GPU text encoder, and then loads DiT/VAE. This avoids VRAM exhaustion from keeping both the CUDA LLM runner and Flux2 weights resident at the same time on 16 GB cards.
 
 ## Implementation Status
 
@@ -293,14 +296,17 @@ make test-gen-base    # Base pipeline
 |---|---|---|
 | **Scheduler** | Verified | sigma schedule matches CPU reference |
 | **Text encoder (CPU)** | Verified | hidden states match transformer.h reference |
-| **Text encoder (GPU)** | Working | CUDA LLM runner, GGUF Q8_0 via NVRTC |
+| **Text encoder (GPU)** | Working | CUDA LLM runner, Klein safetensors weights, layer snapshots 8/17/26 |
 | **VAE decoder** | Verified | GPU vs CPU `max_diff≈3e-6` on 64×64 decode; visual output correct |
+| **Full `--generate --gpu-enc` path** | Working | Prompt is encoded once, encoder is freed, then DiT/VAE load |
 | **DiT CPU** | Visual PASS | 64×64 correct red apple (4 steps) |
 | **DiT CUDA** | Visual PASS | 256×256 clear red apple (4 steps), max_diff vs CPU < 1e-5 |
 | **Full pipeline (CPU)** | Working | 256×256 "a red apple" correct |
 | **Full pipeline (CUDA)** | Working | 256×256 "a red apple" correct |
 
 Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-stream blocks and the 20 single-stream blocks, and the VAE decode is GPU-accelerated as well. For A/B checks, the old double-stream CPU fallback can still be forced with `FLUX2_CPU_DBL_ATTN=1`. The only remaining CPU bridge in the VAE path is the single mid-block attention calculation.
+
+The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on RTX 5060 Ti was not a DiT math bug. It was VRAM exhaustion during DiT/VAE load while the GPU text encoder session was still resident. Allocation checks in `cuda_flux2_runner.h` now fail explicitly, and the generation path frees the GPU text encoder before loading DiT/VAE.
 
 ### Critical Bugs Fixed
 
@@ -313,6 +319,7 @@ Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-s
 | **Double-stream attention path** | Needed verification on sm_120 after earlier divergence during bring-up | Re-verified on RTX 5060 Ti: GPU flash attention now matches CPU (`max_diff≈6e-6` on `--test-dit` 64×64); CPU fallback kept behind `FLUX2_CPU_DBL_ATTN=1` |
 | **512-token text padding** | 35× GEMM overhead | Remove padding; return only real tokens (~15 tokens typical) |
 | **Chat template** | Wrong hidden states | Strip system/chat prefix; use clean user message tokens only |
+| **GPU generate VRAM conflict** | `CUDA_ERROR_ILLEGAL_ADDRESS (700)` or later bad pointers in `--generate --gpu-enc` | Make CUDA allocations fail explicitly and free GPU text encoder before DiT/VAE load |
 
 ### Key Architecture Gotchas
 
@@ -333,7 +340,7 @@ Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-s
 - [ ] **All-GPU VAE attention**: the VAE mid-block attention still bridges through CPU for now. The heavy conv/groupnorm/upsample path is on GPU already.
 - [ ] **F16/FP8 GEMM**: Current GPU GEMM is F32 (`gemm_f32_f32`). The `gemm_tiled_f16_f32` kernel produces ~27% error on sm_120 (Blackwell); `gemm_f16_f32` (MMA-based) outputs near-zero. Investigation needed — likely an NVRTC wmma intrinsic issue on sm_120.
 - [ ] **Attention kernel scaling**: Single-block-per-head FA2 flash attention works but may not scale to large resolutions. No multi-block flash attention.
-- [ ] **GPU text encoder startup cost**: The GPU text encoder now runs on the correct Klein safetensors weights, but it still compiles kernels and uploads the encoder in a separate CUDA session each run.
+- [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + weight upload. PTX cache and in-process reuse help, but `--generate` currently pre-encodes once and frees the runner rather than keeping text and DiT resident together.
 
 ### Quality
 
@@ -343,4 +350,4 @@ Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-s
 ### Features
 
 - [ ] **512×512 and larger**: Only 256×256 verified. Latent sizes scale as H/8 × W/8 tokens.
-- [ ] **GPU-only pipeline**: DiT and the text encoder run on GPU, but the encoder still uses a separate CUDA session and the VAE mid attention still bridges through CPU.
+- [ ] **Single-session GPU pipeline**: text encoding and DiT both run on GPU, but generation currently frees the text encoder before DiT/VAE load to stay within VRAM budget on 16 GB cards; VAE mid attention still bridges through CPU.
