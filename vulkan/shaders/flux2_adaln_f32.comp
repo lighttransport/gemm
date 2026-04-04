@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Adaptive Layer Normalization for Flux.2 Klein DiT
+// out = LN(x) * (1 + scale) + shift
+// One workgroup per token. Shared memory reduction for mean/var.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuffer { float x_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 2) readonly buffer ShiftBuffer { float shift_buf[]; };
+layout(std430, binding = 3) readonly buffer ScaleBuffer { float scale_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint dim;
+} pc;
+
+shared float s_sum[256];
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.N) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = tok * pc.dim;
+
+    // Mean reduction
+    float psum = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256)
+        psum += x_buf[base + i];
+    s_sum[tid] = psum;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        barrier();
+    }
+    float mean = s_sum[0] / float(pc.dim);
+    barrier();
+
+    // Variance reduction
+    float pvar = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256) {
+        float d = x_buf[base + i] - mean;
+        pvar += d * d;
+    }
+    s_sum[tid] = pvar;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        barrier();
+    }
+    float inv_std = inversesqrt(s_sum[0] / float(pc.dim) + 1e-6);
+
+    // Apply modulation
+    for (uint i = tid; i < pc.dim; i += 256)
+        out_buf[base + i] = ((x_buf[base + i] - mean) * inv_std)
+                            * (1.0 + scale_buf[i]) + shift_buf[i];
+}
