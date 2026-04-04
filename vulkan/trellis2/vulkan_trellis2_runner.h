@@ -94,6 +94,90 @@ int vulkan_trellis2_run_stage1(vulkan_trellis2_runner *r,
                                 float cfg_rescale,
                                 uint32_t seed);
 
+/* ---- Stage 2/3 sparse DiT API ---- */
+
+/* Load Stage 2 (shape flow) DiT weights (separate file from Stage 1) */
+int vulkan_trellis2_load_stage2(vulkan_trellis2_runner *r, const char *path);
+
+/* Load Stage 3 (texture flow) DiT weights */
+int vulkan_trellis2_load_stage3(vulkan_trellis2_runner *r, const char *path);
+
+/* Run Stage 2 shape DiT single forward step.
+ *   x_t:    [N, 32] F32 sparse voxel features (token-major)
+ *   coords: [N, 4] int32 (batch, z, y, x) — for RoPE computation
+ *   cond:   [1029, 1024] F32 DINOv3 features
+ *   output: [N, 32] F32 predicted velocity */
+int vulkan_trellis2_run_stage2_dit(vulkan_trellis2_runner *r,
+                                     const float *x_t, float timestep,
+                                     const float *cond_features,
+                                     const int32_t *coords, int N,
+                                     float *output);
+
+/* Run Stage 3 texture DiT single forward step.
+ *   x_t:    [N, 64] = [noise_32, shape_slat_norm_32] concatenated
+ *   coords: [N, 4] int32 — same sparse coords as Stage 2
+ *   cond:   [1029, 1024] F32 DINOv3 features
+ *   output: [N, 32] F32 predicted velocity (texture channels only) */
+int vulkan_trellis2_run_stage3_dit(vulkan_trellis2_runner *r,
+                                     const float *x_t, float timestep,
+                                     const float *cond_features,
+                                     const int32_t *coords, int N,
+                                     float *output);
+
+/* ---- Shape decoder (SC-VAE) ---- */
+
+/* Run shape decoder (currently CPU-based, uses sparse 3D conv).
+ *   dec_path:   path to shape decoder safetensors
+ *   slat:       [N, 32] F32 denormalized shape latent from Stage 2
+ *   coords:     [N, 4] int32 sparse coordinates
+ *   out_feats:  [*out_N, 7] F32 per-voxel predictions (pre-allocated for max)
+ *   out_coords: [*out_N, 4] int32 upsampled coords (pre-allocated for max)
+ *   out_N:      actual number of output voxels (written on return) */
+int vulkan_trellis2_run_shape_decoder(vulkan_trellis2_runner *r,
+                                        const char *dec_path,
+                                        const float *slat,
+                                        const int32_t *coords, int N,
+                                        float *out_feats,
+                                        int32_t *out_coords,
+                                        int *out_N);
+
+/* ---- Full Stage 2/3 sampling pipelines ---- */
+
+/* Run full Stage 2 pipeline: occupancy + features -> shape latent.
+ *   features:     [1029, 1024] F32 DINOv3 conditioning
+ *   occupancy:    [64*64*64] F32 occupancy logits from Stage 1
+ *   shape_latent: [*out_N, 32] F32 output (must be pre-allocated for max N)
+ *   out_coords:   [*out_N, 4] int32 output (must be pre-allocated)
+ *   out_N:        number of sparse voxels (written on return)
+ *   n_steps:      Euler steps (default 12)
+ *   cfg_scale:    guidance scale (default 7.5)
+ *   cfg_rescale:  rescale factor (default 0.7, 0 = none) */
+int vulkan_trellis2_run_stage2(vulkan_trellis2_runner *r,
+                                const float *features,
+                                const float *occupancy,
+                                float *shape_latent,
+                                int32_t *out_coords,
+                                int *out_N,
+                                int n_steps,
+                                float cfg_scale,
+                                float cfg_rescale,
+                                uint32_t seed);
+
+/* Run full Stage 3 pipeline: shape_latent + features -> texture latent.
+ *   features:     [1029, 1024] F32 DINOv3 conditioning
+ *   shape_latent: [N, 32] F32 denormalized shape latent from Stage 2
+ *   coords:       [N, 4] int32 sparse coordinates from Stage 2
+ *   tex_latent:   [N, 32] F32 output (must be pre-allocated)
+ *   n_steps:      Euler steps (default 12)
+ *   seed:         Random seed (Stage 3 uses seed+2 internally) */
+int vulkan_trellis2_run_stage3(vulkan_trellis2_runner *r,
+                                const float *features,
+                                const float *shape_latent,
+                                const int32_t *coords, int N,
+                                float *tex_latent,
+                                int n_steps,
+                                uint32_t seed);
+
 /* Free runner and all GPU resources */
 void vulkan_trellis2_free(vulkan_trellis2_runner *r);
 
