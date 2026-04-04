@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: MIT
+// Add bias: out[oc * spatial + s] += bias[oc]
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer OutBuf { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer BiasBuf { float bias_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint co, spatial;
+} pc;
+
+void main() {
+    uint idx = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    if (idx >= pc.co * pc.spatial) return;
+    uint oc = idx / pc.spatial;
+    out_buf[idx] += bias_buf[oc];
+}
