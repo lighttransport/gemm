@@ -71,6 +71,7 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/rope_mrope_batch_f32.comp
     ${SHADER_SOURCE_DIR}/kv_cache_store_batch_f32.comp
     ${SHADER_SOURCE_DIR}/attn_prefill_f32.comp
+    ${SHADER_SOURCE_DIR}/silu_f32.comp
 )
 
 # DA3 depth estimation shaders
@@ -99,6 +100,25 @@ set(DA3_SHADER_SOURCES
 set(HY3D_SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/hy3d/layerscale_add_f32.comp
     ${SHADER_SOURCE_DIR}/hy3d/qk_layernorm_f32.comp
+)
+
+# Flux.2 Klein text-to-image shaders
+set(FLUX2_SHADER_SOURCES
+    ${SHADER_SOURCE_DIR}/flux2_adaln_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_rmsnorm_per_head_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_rope_img_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_rope_txt_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_swiglu_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_gated_add_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_bf16_trunc_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_gemm_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_attn_flash_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_conv2d_3x3_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_conv2d_1x1_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_groupnorm_silu_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_upsample2x_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_transpose_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_add_bias_f32.comp
 )
 
 # Custom function to compile GLSL to SPIR-V (supports subdirectories)
@@ -182,6 +202,15 @@ foreach(SHADER ${HY3D_SHADER_SOURCES})
         compile_shader_subdir(${SHADER} "hy3d")
     else()
         message(WARNING "HY3D shader not found: ${SHADER}")
+    endif()
+endforeach()
+
+# Compile Flux2 shaders
+foreach(SHADER ${FLUX2_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        compile_shader(${SHADER})
+    else()
+        message(WARNING "Flux2 shader not found: ${SHADER}")
     endif()
 endforeach()
 
@@ -381,6 +410,37 @@ target_compile_definitions(${DA3_TARGET} PRIVATE
 
 if(TARGET coopmat_shaders)
     add_dependencies(${DA3_TARGET} coopmat_shaders)
+endif()
+
+# Flux.2 Klein text-to-image test executable
+set(FLUX2_TARGET test_vulkan_flux2)
+
+add_executable(${FLUX2_TARGET}
+    flux2/test_vulkan_flux2.cc
+    flux2/vulkan_flux2_runner.cc
+    flux2/ggml_dequant_impl.c
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${FLUX2_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${CMAKE_CURRENT_SOURCE_DIR}/flux2
+)
+
+target_link_libraries(${FLUX2_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+    Threads::Threads
+)
+
+target_compile_definitions(${FLUX2_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET coopmat_shaders)
+    add_dependencies(${FLUX2_TARGET} coopmat_shaders)
 endif()
 
 message(STATUS "")

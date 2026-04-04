@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// 1D Text RoPE for Flux.2 Klein text tokens
+// Only applies to axis3 (last quarter of head_dim), using token index as position.
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { float x_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    float theta;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.z;
+    uint head = gl_WorkGroupID.y;
+    uint pair = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+
+    if (tok >= pc.n_tok || head >= pc.n_heads || pair >= pc.head_dim / 2) return;
+
+    uint axis_dim = pc.head_dim / 4;
+    uint n_pairs = axis_dim / 2;
+
+    // Only axis3: pairs [3*n_pairs, 4*n_pairs)
+    if (pair < 3 * n_pairs) return;
+
+    uint p_in_ax = pair - 3 * n_pairs;
+    float freq = float(tok) / pow(pc.theta, float(2 * p_in_ax) / float(axis_dim));
+    float cos_f = cos(freq);
+    float sin_f = sin(freq);
+
+    uint idx = tok * pc.n_heads * pc.head_dim + head * pc.head_dim + pair * 2;
+    float a = x_buf[idx];
+    float b = x_buf[idx + 1];
+    x_buf[idx]     = a * cos_f - b * sin_f;
+    x_buf[idx + 1] = a * sin_f + b * cos_f;
+}
