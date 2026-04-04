@@ -10,6 +10,19 @@
 #define SAFETENSORS_IMPLEMENTATION
 #include "../../common/safetensors.h"
 
+/* sparse3d.h and trellis2_shape_decoder.h reference ggml_dequant types.
+ * Include header-only part for type definitions, provide minimal stub
+ * for the implementation (shape decoder uses F32/F16 via safetensors,
+ * not GGML quantized types). */
+#include "../../common/ggml_dequant.h"
+/* Stub: shape decoder never calls dequant_row with quantized types */
+int dequant_row(uint32_t /*type*/, const void * /*src*/, float * /*dst*/, int /*n*/) { return 0; }
+
+#define SPARSE3D_IMPLEMENTATION
+#include "../../common/sparse3d.h"
+#define T2_SHAPE_DEC_IMPLEMENTATION
+#include "../../common/trellis2_shape_decoder.h"
+
 #include "vulkan_trellis2_runner.h"
 #include "../deps/vulkan-runner.hh"
 
@@ -80,6 +93,19 @@ struct t2_dit_block_vk {
     BufInfo mod_bias;  /* [6*DIT_DIM] = [9216] */
 };
 
+/* Generic DiT model (shared structure for Stage 1/2/3) */
+struct t2_dit_model_vk {
+    int in_channels, out_channels;
+    BufInfo t_fc1_w, t_fc1_b, t_fc2_w, t_fc2_b;  /* timestep MLP */
+    BufInfo mod_w, mod_b;                           /* adaLN modulation */
+    BufInfo x_emb_w, x_emb_b;                      /* input projection */
+    BufInfo out_w, out_b;                           /* output projection */
+    t2_dit_block_vk blocks[DIT_DEPTH];
+    BufInfo rope_cos, rope_sin;                     /* precomputed for Stage 1, runtime for 2/3 */
+    int n_freqs = 0;
+    bool loaded = false;
+};
+
 /* DINOv3 per-layer weights */
 struct t2_dino_layer_vk {
     BufInfo ln1_w, ln1_b;
@@ -127,6 +153,9 @@ struct vulkan_trellis2_runner {
     Pipeline pipe_pixel_shuffle;     /* 2 bufs: dst, src; push: 16B */
     Pipeline pipe_self_attn_tiled;   /* 4 bufs: out, Q, K, V; push: 28B */
 
+    /* Sparse decoder */
+    Pipeline pipe_sparse_conv3d;     /* 7 bufs: out, feats, w, bias, keys, vals, coords; push: 16B */
+
     /* DINOv3-specific */
     Pipeline pipe_rope_2d_dinov3;    /* 4 bufs: Q, K, cos, sin; push: 20B */
     Pipeline pipe_dinov3_prepend;    /* 4 bufs: hidden, patches, cls, reg; push: 12B */
@@ -141,16 +170,19 @@ struct vulkan_trellis2_runner {
     BufInfo dino_rope_cos, dino_rope_sin;
     bool dino_has_layerscale = false;
 
-    /* ---- DiT weights ---- */
-    BufInfo dit_t_fc1_w, dit_t_fc1_b, dit_t_fc2_w, dit_t_fc2_b;
-    BufInfo dit_mod_w, dit_mod_b;
-    BufInfo dit_x_emb_w, dit_x_emb_b;
-    BufInfo dit_out_w, dit_out_b;
-    t2_dit_block_vk dit_blocks[DIT_DEPTH];
-    BufInfo dit_rope_cos, dit_rope_sin;
-    int dit_n_freqs = 0;
+    /* ---- DiT models ---- */
+    t2_dit_model_vk stage1_dit;   /* Stage 1: in=8, out=8, N=4096 */
+    t2_dit_model_vk stage2_dit;   /* Stage 2: in=32, out=32, sparse N */
+    t2_dit_model_vk stage3_dit;   /* Stage 3: in=64, out=32, sparse N */
 
-    /* ---- Decoder weights ---- */
+    /* ---- Shape decoder (SC-VAE) ---- */
+    /* Stored on CPU; ConvNeXt blocks dispatched to GPU, C2S runs on CPU */
+    bool shape_dec_loaded = false;
+    /* We use the CPU shape decoder from common/trellis2_shape_decoder.h
+     * loaded at runtime. The Vulkan runner accelerates the ConvNeXt conv+MLP
+     * but delegates C2S subdivision to CPU. */
+
+    /* ---- Stage 1 Decoder weights ---- */
     BufInfo dec_conv_in_w, dec_conv_in_b;
     t2_dec_resblock_vk dec_middle[2];
     t2_dec_resblock_vk dec_res16[2];
@@ -162,14 +194,14 @@ struct vulkan_trellis2_runner {
     BufInfo dec_out_conv_w, dec_out_conv_b;
 
     /* Scratch buffers */
-    BufInfo scratch[8];
-    size_t scratch_size[8] = {};
+    BufInfo scratch[12];
+    size_t scratch_size[12] = {};
 
     /* Dummy buffer for unused bindings (Vulkan requires all to be valid) */
     BufInfo dummy_buf;
 
     /* Load status */
-    bool dit_loaded = false, dec_loaded = false;
+    bool dec_loaded = false;
     bool initialized = false;
 };
 
@@ -606,7 +638,7 @@ static void opPatchEmbed(vulkan_trellis2_runner *r, BufInfo &out, BufInfo &image
         (uint32_t)grid_w, (uint32_t)img_w, (uint32_t)patch_size
     };
     dispatchSync(r, r->pipe_patch_embed, {image, w, bias, out}, &pc, sizeof(pc),
-                 (uint32_t)n_patches);
+                 (uint32_t)((n_patches * dim + 255) / 256));
 }
 
 /* ======================================================================== */
@@ -660,6 +692,9 @@ static bool createPipelines(vulkan_trellis2_runner *r) {
     if (!createPipe("shaders/trellis2/channel_layernorm_3d_f32", 4, 12, r->pipe_channel_layernorm)) return false;
     if (!createPipe("shaders/trellis2/pixel_shuffle_3d_f32",    2, 16, r->pipe_pixel_shuffle)) return false;
     if (!createPipe("shaders/trellis2/self_attn_tiled_f32",   4, 28, r->pipe_self_attn_tiled)) return false;
+
+    /* Sparse decoder */
+    if (!createPipe("shaders/trellis2/sparse_conv3d_f32",      7, 16, r->pipe_sparse_conv3d)) return false;
 
     /* DINOv3-specific */
     if (!createPipe("shaders/trellis2/rope_2d_dinov3_f32",     4, 20, r->pipe_rope_2d_dinov3)) return false;
@@ -830,27 +865,47 @@ static int loadDinov3Weights(vulkan_trellis2_runner *r, const char *path) {
     return 0;
 }
 
-static int loadDitWeights(vulkan_trellis2_runner *r, const char *path) {
+/* Generic DiT weight loader: loads into a t2_dit_model_vk struct.
+ * label is for log messages (e.g. "Stage 1", "Stage 2"). */
+static int loadDitModelWeights(vulkan_trellis2_runner *r, const char *path,
+                                t2_dit_model_vk *m, const char *label) {
     st_context *st = safetensors_open(path);
-    if (!st) { fprintf(stderr, "T2VK: cannot open DiT: %s\n", path); return -1; }
-    fprintf(stderr, "T2VK: loading DiT from %s (%d tensors)\n", path, st->n_tensors);
+    if (!st) { fprintf(stderr, "T2VK: cannot open %s DiT: %s\n", label, path); return -1; }
+    fprintf(stderr, "T2VK: loading %s DiT from %s (%d tensors)\n", label, path, st->n_tensors);
     int v = r->verbose;
 
+    /* Detect in/out channels from input_layer.weight shape */
+    {
+        int idx = safetensors_find(st, "input_layer.weight");
+        if (idx >= 0 && safetensors_ndims(st, idx) >= 2) {
+            const uint64_t *sh = safetensors_shape(st, idx);
+            m->in_channels = (int)sh[1];
+            fprintf(stderr, "T2VK:   in_channels=%d (from input_layer.weight[%llu, %llu])\n",
+                    m->in_channels, (unsigned long long)sh[0], (unsigned long long)sh[1]);
+        }
+        idx = safetensors_find(st, "out_layer.weight");
+        if (idx >= 0 && safetensors_ndims(st, idx) >= 2) {
+            const uint64_t *sh = safetensors_shape(st, idx);
+            m->out_channels = (int)sh[0];
+            fprintf(stderr, "T2VK:   out_channels=%d\n", m->out_channels);
+        }
+    }
+
     /* Top-level */
-    r->dit_t_fc1_w = stUploadF32(r->runner, st, "t_embedder.mlp.0.weight", v);
-    r->dit_t_fc1_b = stUploadF32(r->runner, st, "t_embedder.mlp.0.bias", v);
-    r->dit_t_fc2_w = stUploadF32(r->runner, st, "t_embedder.mlp.2.weight", v);
-    r->dit_t_fc2_b = stUploadF32(r->runner, st, "t_embedder.mlp.2.bias", v);
-    r->dit_mod_w   = stUploadF32(r->runner, st, "adaLN_modulation.1.weight", v);
-    r->dit_mod_b   = stUploadF32(r->runner, st, "adaLN_modulation.1.bias", v);
-    r->dit_x_emb_w = stUploadF32(r->runner, st, "input_layer.weight", v);
-    r->dit_x_emb_b = stUploadF32(r->runner, st, "input_layer.bias", v);
-    r->dit_out_w   = stUploadF32(r->runner, st, "out_layer.weight", v);
-    r->dit_out_b   = stUploadF32(r->runner, st, "out_layer.bias", v);
+    m->t_fc1_w = stUploadF32(r->runner, st, "t_embedder.mlp.0.weight", v);
+    m->t_fc1_b = stUploadF32(r->runner, st, "t_embedder.mlp.0.bias", v);
+    m->t_fc2_w = stUploadF32(r->runner, st, "t_embedder.mlp.2.weight", v);
+    m->t_fc2_b = stUploadF32(r->runner, st, "t_embedder.mlp.2.bias", v);
+    m->mod_w   = stUploadF32(r->runner, st, "adaLN_modulation.1.weight", v);
+    m->mod_b   = stUploadF32(r->runner, st, "adaLN_modulation.1.bias", v);
+    m->x_emb_w = stUploadF32(r->runner, st, "input_layer.weight", v);
+    m->x_emb_b = stUploadF32(r->runner, st, "input_layer.bias", v);
+    m->out_w   = stUploadF32(r->runner, st, "out_layer.weight", v);
+    m->out_b   = stUploadF32(r->runner, st, "out_layer.bias", v);
 
     /* Per-block */
     for (int L = 0; L < DIT_DEPTH; L++) {
-        t2_dit_block_vk &blk = r->dit_blocks[L];
+        t2_dit_block_vk &blk = m->blocks[L];
         char name[256];
 
         #define BLK(field, suffix) do { \
@@ -886,42 +941,79 @@ static int loadDitWeights(vulkan_trellis2_runner *r, const char *path) {
         #undef BLK
     }
 
-    /* Precompute 3D RoPE tables on CPU, upload to GPU */
-    {
-        const int gs = DIT_GRID, nt = DIT_N_TOKENS;
-        const int n_freqs = DIT_HEAD_DIM / 6;  /* 21 */
-        r->dit_n_freqs = n_freqs;
+    m->n_freqs = DIT_HEAD_DIM / 6;  /* 21 */
+    safetensors_close(st);
+    m->loaded = true;
+    fprintf(stderr, "T2VK: %s DiT loaded (%d blocks, in=%d, out=%d)\n",
+            label, DIT_DEPTH, m->in_channels, m->out_channels);
+    return 0;
+}
 
-        std::vector<float> freqs(n_freqs);
-        for (int j = 0; j < n_freqs; j++)
-            freqs[j] = 1.0f / powf(10000.0f, (float)j / (float)n_freqs);
+/* Precompute 3D RoPE tables for a regular grid (Stage 1) */
+static void precomputeGridRope(vulkan_trellis2_runner *r, t2_dit_model_vk *m,
+                                int grid_size) {
+    const int nt = grid_size * grid_size * grid_size;
+    const int n_freqs = m->n_freqs;
 
-        size_t table_sz = (size_t)nt * 3 * n_freqs;
-        std::vector<float> cos_tab(table_sz), sin_tab(table_sz);
+    std::vector<float> freqs(n_freqs);
+    for (int j = 0; j < n_freqs; j++)
+        freqs[j] = 1.0f / powf(10000.0f, (float)j / (float)n_freqs);
 
-        for (int i = 0; i < nt; i++) {
-            int z = i / (gs * gs), y = (i / gs) % gs, x = i % gs;
-            float coords[3] = {(float)z, (float)y, (float)x};
-            for (int axis = 0; axis < 3; axis++) {
-                for (int j = 0; j < n_freqs; j++) {
-                    float theta = coords[axis] * freqs[j];
-                    cos_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(theta);
-                    sin_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(theta);
-                }
+    size_t table_sz = (size_t)nt * 3 * n_freqs;
+    std::vector<float> cos_tab(table_sz), sin_tab(table_sz);
+
+    for (int i = 0; i < nt; i++) {
+        int z = i / (grid_size * grid_size), y = (i / grid_size) % grid_size, x = i % grid_size;
+        float coords[3] = {(float)z, (float)y, (float)x};
+        for (int axis = 0; axis < 3; axis++) {
+            for (int j = 0; j < n_freqs; j++) {
+                float theta = coords[axis] * freqs[j];
+                cos_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(theta);
+                sin_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(theta);
             }
         }
-
-        r->dit_rope_cos = createGpuBuffer(r->runner, table_sz * sizeof(float));
-        uploadToBuffer(r->runner, r->dit_rope_cos, cos_tab.data(), table_sz * sizeof(float));
-        r->dit_rope_sin = createGpuBuffer(r->runner, table_sz * sizeof(float));
-        uploadToBuffer(r->runner, r->dit_rope_sin, sin_tab.data(), table_sz * sizeof(float));
-        fprintf(stderr, "T2VK: RoPE tables uploaded (%d freqs/axis)\n", n_freqs);
     }
 
-    safetensors_close(st);
-    r->dit_loaded = true;
-    fprintf(stderr, "T2VK: DiT loaded (%d blocks)\n", DIT_DEPTH);
-    return 0;
+    m->rope_cos = createGpuBuffer(r->runner, table_sz * sizeof(float));
+    uploadToBuffer(r->runner, m->rope_cos, cos_tab.data(), table_sz * sizeof(float));
+    m->rope_sin = createGpuBuffer(r->runner, table_sz * sizeof(float));
+    uploadToBuffer(r->runner, m->rope_sin, sin_tab.data(), table_sz * sizeof(float));
+    fprintf(stderr, "T2VK: RoPE tables uploaded (%d freqs/axis, grid=%d)\n", n_freqs, grid_size);
+}
+
+/* Compute 3D RoPE tables from sparse coordinates (Stage 2/3) */
+static void computeSparseRope(vulkan_trellis2_runner *r, const int32_t *coords, int N,
+                               int n_freqs, BufInfo &rope_cos, BufInfo &rope_sin) {
+    std::vector<float> freqs(n_freqs);
+    for (int j = 0; j < n_freqs; j++)
+        freqs[j] = 1.0f / powf(10000.0f, (float)j / (float)n_freqs);
+
+    size_t table_sz = (size_t)N * 3 * n_freqs;
+    std::vector<float> cos_tab(table_sz), sin_tab(table_sz);
+
+    for (int i = 0; i < N; i++) {
+        /* coords[i*4 + 0] = batch, [1]=z, [2]=y, [3]=x */
+        for (int axis = 0; axis < 3; axis++) {
+            float c = (float)coords[i * 4 + 1 + axis];
+            for (int j = 0; j < n_freqs; j++) {
+                float theta = c * freqs[j];
+                cos_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(theta);
+                sin_tab[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(theta);
+            }
+        }
+    }
+
+    rope_cos = uploadF32(r->runner, cos_tab.data(), table_sz);
+    rope_sin = uploadF32(r->runner, sin_tab.data(), table_sz);
+}
+
+static int loadDitWeights(vulkan_trellis2_runner *r, const char *path) {
+    r->stage1_dit.in_channels = DIT_IN_CH;
+    r->stage1_dit.out_channels = DIT_IN_CH;
+    int ret = loadDitModelWeights(r, path, &r->stage1_dit, "Stage 1");
+    if (ret == 0)
+        precomputeGridRope(r, &r->stage1_dit, DIT_GRID);
+    return ret;
 }
 
 static int loadDecoderWeights(vulkan_trellis2_runner *r, const char *path) {
@@ -1048,6 +1140,14 @@ static void runDinov3(vulkan_trellis2_runner *r,
             opAdd(r, d_hidden, d_normed, seq * dim);
         }
 
+        /* Debug: print hidden state after each block */
+        if (r->verbose >= 1) {
+            float hs[4];
+            downloadFromBuffer(r->runner, d_hidden, hs, 4 * sizeof(float));
+            fprintf(stderr, "  DINO block %2d: h[0,:4]=%.6f %.6f %.6f %.6f\n",
+                    li, hs[0], hs[1], hs[2], hs[3]);
+        }
+
         /* Reset pool periodically to avoid exhaustion */
         if ((li & 7) == 7) r->runner.resetDynamicDescriptorPool();
     }
@@ -1069,87 +1169,127 @@ static void runDinov3(vulkan_trellis2_runner *r,
 /* DiT forward pass                                                         */
 /* ======================================================================== */
 
-static void runDitForward(vulkan_trellis2_runner *r,
-                            BufInfo &d_x, float timestep,
-                            BufInfo &d_cond, BufInfo &d_output) {
-    const int N = DIT_N_TOKENS;     /* 4096 */
+/* Cross-attention KV cache: precomputed K,V for all 30 blocks.
+ * Valid when conditioning doesn't change between forward passes. */
+struct dit_kv_cache {
+    BufInfo K[DIT_DEPTH];  /* [ctx_len, D] per block */
+    BufInfo V[DIT_DEPTH];  /* [ctx_len, D] per block */
+    bool valid = false;
+};
+
+/* Precompute cross-attention KV for all blocks. Allocates GPU buffers. */
+static void precomputeKvCache(vulkan_trellis2_runner *r, t2_dit_model_vk &m,
+                                BufInfo &d_cond, dit_kv_cache &cache) {
+    const int D = DIT_DIM;
+    const int H = DIT_HEADS;
+    const int HD = DIT_HEAD_DIM;
+    const int ctx_len = DINO_SEQ_LEN;
+    size_t kv_sz = (size_t)ctx_len * D * sizeof(float);
+
+    /* Temp buffer for fused KV projection */
+    BufInfo d_kv_tmp = createGpuBuffer(r->runner, (size_t)ctx_len * 2 * D * sizeof(float));
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        t2_dit_block_vk &blk = m.blocks[bi];
+
+        cache.K[bi] = createGpuBuffer(r->runner, kv_sz);
+        cache.V[bi] = createGpuBuffer(r->runner, kv_sz);
+
+        /* KV projection: [ctx_len, cond_dim] @ W^T + b -> [ctx_len, 2*D] */
+        opGemm(r, d_kv_tmp, blk.ca_kv_w, d_cond, blk.ca_kv_b, 2 * D, DIT_COND_DIM, ctx_len);
+        opSplitKvChunk(r, cache.K[bi], cache.V[bi], d_kv_tmp, ctx_len, D);
+
+        /* K RMSNorm */
+        if (isValid(blk.ca_k_norm))
+            opRmsNorm(r, cache.K[bi], blk.ca_k_norm, ctx_len, H, HD, D);
+
+        if ((bi & 7) == 7) r->runner.resetDynamicDescriptorPool();
+    }
+
+    r->runner.destroyBuffer(d_kv_tmp);
+    cache.valid = true;
+}
+
+static void freeKvCache(vulkan_trellis2_runner *r, dit_kv_cache &cache) {
+    if (!cache.valid) return;
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        if (isValid(cache.K[bi])) r->runner.destroyBuffer(cache.K[bi]);
+        if (isValid(cache.V[bi])) r->runner.destroyBuffer(cache.V[bi]);
+    }
+    cache.valid = false;
+}
+
+/* Generic DiT forward pass: works for Stage 1 (dense) and Stage 2/3 (sparse).
+ * N = number of tokens, in_ch/out_ch from model, RoPE tables from model. */
+/* kv_cache: if non-null and valid, skip cross-attention KV projection (use cached).
+ *           if non-null and !valid, compute and cache (first call). */
+static void runDitForwardGeneric(vulkan_trellis2_runner *r,
+                                   BufInfo &d_x, float timestep,
+                                   BufInfo &d_cond, BufInfo &d_output,
+                                   int N, t2_dit_model_vk &m,
+                                   BufInfo &rope_cos, BufInfo &rope_sin,
+                                   dit_kv_cache *kv_cache = nullptr) {
     const int D = DIT_DIM;          /* 1536 */
     const int H = DIT_HEADS;        /* 12 */
     const int HD = DIT_HEAD_DIM;    /* 128 */
     const int FFN = DIT_FFN;        /* 8192 */
-    const int in_ch = DIT_IN_CH;    /* 8 */
+    const int in_ch = m.in_channels;
+    const int out_ch = m.out_channels;
     const int ctx_len = DINO_SEQ_LEN; /* 1029 */
+    const int n_freqs = m.n_freqs;
 
     /* Scratch layout */
     size_t qkv_sz = (size_t)3 * N * D * sizeof(float);
     size_t mlp_sz = (size_t)N * FFN * sizeof(float);
     size_t sh1 = std::max(qkv_sz, mlp_sz);
     size_t ca_kv_sz = (size_t)ctx_len * D * sizeof(float);
-    size_t buf3_sz = (size_t)(6 * D + D) * sizeof(float)
-                   + (size_t)N * D * sizeof(float) + 2 * ca_kv_sz
-                   + (size_t)N * D * sizeof(float);
 
     ensureScratch(r, 0, (size_t)N * D * sizeof(float));
     ensureScratch(r, 1, sh1);
     ensureScratch(r, 2, (size_t)2 * N * D * sizeof(float));
-    ensureScratch(r, 3, buf3_sz);
 
-    /* Create BufInfo aliases for sub-regions using offset buffers.
-     * Since HOST_VISIBLE memory is contiguous, we use byte offsets. */
     BufInfo d_hidden = r->scratch[0];
     BufInfo d_qkv    = r->scratch[1];
     BufInfo d_mlp    = r->scratch[1]; /* alias */
     BufInfo d_attn   = r->scratch[2];
 
-    /* For sub-buffer regions in scratch[2] and scratch[3], we'll create
-     * separate small buffers. Scratch[2] is split: attn[N*D] + normed[N*D] */
     BufInfo d_normed = createGpuBuffer(r->runner, (size_t)N * D * sizeof(float));
     BufInfo d_mod    = createGpuBuffer(r->runner, (size_t)6 * D * sizeof(float));
-    BufInfo d_temb   = createGpuBuffer(r->runner, (size_t)D * sizeof(float)); /* t_emb MLP output is D */
-    BufInfo d_temb_raw = createGpuBuffer(r->runner, 256 * sizeof(float)); /* raw sinusoidal */
+    BufInfo d_temb   = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
+    BufInfo d_temb_raw = createGpuBuffer(r->runner, 256 * sizeof(float));
     BufInfo d_cross_Q = createGpuBuffer(r->runner, (size_t)N * D * sizeof(float));
     BufInfo d_ca_K   = createGpuBuffer(r->runner, ca_kv_sz);
     BufInfo d_ca_V   = createGpuBuffer(r->runner, ca_kv_sz);
     BufInfo d_split_V = createGpuBuffer(r->runner, (size_t)N * D * sizeof(float));
 
-    /* Dummy bias buffer for GEMM calls without bias */
-    BufInfo no_bias{};
+    /* Pre-allocate modulation sub-buffers (reused across all 30 blocks) */
+    BufInfo d_shift_sa  = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
+    BufInfo d_scale_sa  = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
+    BufInfo d_gate_sa   = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
+    BufInfo d_shift_mlp = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
+    BufInfo d_scale_mlp = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
+    BufInfo d_gate_mlp  = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
 
-    /* Reset descriptor pool to avoid exhaustion over many dispatches */
     r->runner.resetDynamicDescriptorPool();
 
     /* 1. Input embedding: [N, in_ch] -> [N, D] */
-    opGemm(r, d_hidden, r->dit_x_emb_w, d_x, r->dit_x_emb_b, D, in_ch, N);
+    opGemm(r, d_hidden, m.x_emb_w, d_x, m.x_emb_b, D, in_ch, N);
 
     /* 2. Timestep embedding: sinusoidal(256) -> MLP(256->D->D) */
     float t_scaled = timestep * 1000.0f;
     opTimestepEmbedCosSin(r, d_temb_raw, t_scaled, 256);
-
-    /* t_fc1: [D, 256] */
-    opGemm(r, d_normed, r->dit_t_fc1_w, d_temb_raw, r->dit_t_fc1_b, D, 256, 1);
-    /* SiLU */
+    opGemm(r, d_normed, m.t_fc1_w, d_temb_raw, m.t_fc1_b, D, 256, 1);
     opSiluInplace(r, d_normed, D);
-    /* t_fc2: [D, D] */
-    opGemm(r, d_temb, r->dit_t_fc2_w, d_normed, r->dit_t_fc2_b, D, D, 1);
+    opGemm(r, d_temb, m.t_fc2_w, d_normed, m.t_fc2_b, D, D, 1);
 
     /* 3. Transformer blocks */
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
-        t2_dit_block_vk &blk = r->dit_blocks[bi];
+        t2_dit_block_vk &blk = m.blocks[bi];
 
         /* 3a. Modulation */
-        opModulation(r, d_mod, d_temb, r->dit_mod_w, r->dit_mod_b, blk.mod_bias, D, 6 * D);
+        opModulation(r, d_mod, d_temb, m.mod_w, m.mod_b, blk.mod_bias, D, 6 * D);
 
-        /* Sub-regions of d_mod (each D floats).
-         * Since we can't do pointer arithmetic on BufInfo, we need separate buffers
-         * for shift/scale/gate. Copy from d_mod to separate buffers. */
-        BufInfo d_shift_sa  = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
-        BufInfo d_scale_sa  = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
-        BufInfo d_gate_sa   = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
-        BufInfo d_shift_mlp = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
-        BufInfo d_scale_mlp = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
-        BufInfo d_gate_mlp  = createGpuBuffer(r->runner, (size_t)D * sizeof(float));
-
-        /* Copy modulation sub-regions from d_mod HOST_VISIBLE buffer */
+        /* Copy modulation sub-regions from d_mod into pre-allocated buffers */
         {
             void *mod_ptr = nullptr;
             r->runner.mapBuffer(d_mod, &mod_ptr);
@@ -1174,31 +1314,28 @@ static void runDitForward(vulkan_trellis2_runner *r,
             opRmsNorm(r, d_cross_Q, blk.sa_q_norm, N, H, HD, D);
         if (isValid(blk.sa_k_norm))
             opRmsNorm(r, d_normed, blk.sa_k_norm, N, H, HD, D);
-        opRope3D(r, d_cross_Q, r->dit_rope_cos, r->dit_rope_sin, N, D, H, HD, r->dit_n_freqs);
-        opRope3D(r, d_normed, r->dit_rope_cos, r->dit_rope_sin, N, D, H, HD, r->dit_n_freqs);
+        opRope3D(r, d_cross_Q, rope_cos, rope_sin, N, D, H, HD, n_freqs);
+        opRope3D(r, d_normed, rope_cos, rope_sin, N, D, H, HD, n_freqs);
         opSelfAttn(r, d_attn, d_cross_Q, d_normed, d_split_V, N, D, H, HD);
         opGemm(r, d_normed, blk.sa_out_w, d_attn, blk.sa_out_b, D, D, N);
         opGatedAdd(r, d_hidden, d_normed, d_gate_sa, N * D, D);
 
         /* === Cross-attention === */
-        /* === Cross-attention === */
         opLayerNorm(r, d_normed, d_hidden, blk.norm2_w, blk.norm2_b, N, D);
-
-        /* Q from tokens */
         opGemm(r, d_cross_Q, blk.ca_q_w, d_normed, blk.ca_q_b, D, D, N);
         if (isValid(blk.ca_q_norm))
             opRmsNorm(r, d_cross_Q, blk.ca_q_norm, N, H, HD, D);
 
-        /* KV from conditioning */
-        opGemm(r, d_qkv, blk.ca_kv_w, d_cond, blk.ca_kv_b, 2 * D, DIT_COND_DIM, ctx_len);
-        opSplitKvChunk(r, d_ca_K, d_ca_V, d_qkv, ctx_len, D);
-        if (isValid(blk.ca_k_norm))
-            opRmsNorm(r, d_ca_K, blk.ca_k_norm, ctx_len, H, HD, D);
-
-        /* Cross-attention */
-        opCrossAttn(r, d_attn, d_cross_Q, d_ca_K, d_ca_V, N, ctx_len, D, H, HD);
-
-        /* Output projection + plain residual (no gate) */
+        /* KV: use cache if available, otherwise compute from conditioning */
+        BufInfo &use_K = (kv_cache && kv_cache->valid) ? kv_cache->K[bi] : d_ca_K;
+        BufInfo &use_V = (kv_cache && kv_cache->valid) ? kv_cache->V[bi] : d_ca_V;
+        if (!kv_cache || !kv_cache->valid) {
+            opGemm(r, d_qkv, blk.ca_kv_w, d_cond, blk.ca_kv_b, 2 * D, DIT_COND_DIM, ctx_len);
+            opSplitKvChunk(r, d_ca_K, d_ca_V, d_qkv, ctx_len, D);
+            if (isValid(blk.ca_k_norm))
+                opRmsNorm(r, d_ca_K, blk.ca_k_norm, ctx_len, H, HD, D);
+        }
+        opCrossAttn(r, d_attn, d_cross_Q, use_K, use_V, N, ctx_len, D, H, HD);
         opGemm(r, d_normed, blk.ca_out_w, d_attn, blk.ca_out_b, D, D, N);
         opAdd(r, d_hidden, d_normed, N * D);
 
@@ -1209,27 +1346,21 @@ static void runDitForward(vulkan_trellis2_runner *r,
         opGemm(r, d_normed, blk.mlp_fc2_w, d_mlp, blk.mlp_fc2_b, D, FFN, N);
         opGatedAdd(r, d_hidden, d_normed, d_gate_mlp, N * D, D);
 
-        /* Free per-block modulation buffers */
-        r->runner.destroyBuffer(d_shift_sa);
-        r->runner.destroyBuffer(d_scale_sa);
-        r->runner.destroyBuffer(d_gate_sa);
-        r->runner.destroyBuffer(d_shift_mlp);
-        r->runner.destroyBuffer(d_scale_mlp);
-        r->runner.destroyBuffer(d_gate_mlp);
-
         if (r->verbose >= 1 && (bi == 0 || bi == DIT_DEPTH - 1)) {
             float hs[4];
             downloadFromBuffer(r->runner, d_hidden, hs, 4 * sizeof(float));
             fprintf(stderr, "  T2VK block %2d: h[:4]=%.4f %.4f %.4f %.4f\n",
                     bi, hs[0], hs[1], hs[2], hs[3]);
         }
+
+        /* Reset pool periodically */
+        if ((bi & 7) == 7) r->runner.resetDynamicDescriptorPool();
     }
 
     /* 4. Final LayerNorm (no affine) + output projection */
     opLayerNormNoAffine(r, d_hidden, d_hidden, N, D);
-    opGemm(r, d_output, r->dit_out_w, d_hidden, r->dit_out_b, in_ch, D, N);
+    opGemm(r, d_output, m.out_w, d_hidden, m.out_b, out_ch, D, N);
 
-    /* Free temp buffers */
     r->runner.destroyBuffer(d_normed);
     r->runner.destroyBuffer(d_mod);
     r->runner.destroyBuffer(d_temb);
@@ -1238,6 +1369,23 @@ static void runDitForward(vulkan_trellis2_runner *r,
     r->runner.destroyBuffer(d_ca_K);
     r->runner.destroyBuffer(d_ca_V);
     r->runner.destroyBuffer(d_split_V);
+    r->runner.destroyBuffer(d_shift_sa);
+    r->runner.destroyBuffer(d_scale_sa);
+    r->runner.destroyBuffer(d_gate_sa);
+    r->runner.destroyBuffer(d_shift_mlp);
+    r->runner.destroyBuffer(d_scale_mlp);
+    r->runner.destroyBuffer(d_gate_mlp);
+}
+
+/* Stage 1 wrapper: fixed N=4096, precomputed RoPE */
+static void runDitForward(vulkan_trellis2_runner *r,
+                            BufInfo &d_x, float timestep,
+                            BufInfo &d_cond, BufInfo &d_output,
+                            dit_kv_cache *kv_cache = nullptr) {
+    runDitForwardGeneric(r, d_x, timestep, d_cond, d_output,
+                         DIT_N_TOKENS, r->stage1_dit,
+                         r->stage1_dit.rope_cos, r->stage1_dit.rope_sin,
+                         kv_cache);
 }
 
 /* ======================================================================== */
@@ -1353,7 +1501,7 @@ vulkan_trellis2_runner *vulkan_trellis2_init(int device_id, int verbose) {
 
     auto *r = new vulkan_trellis2_runner();
     memset(r->scratch_size, 0, sizeof(r->scratch_size));
-    for (int i = 0; i < 8; i++) r->scratch[i] = {};
+    for (int i = 0; i < 12; i++) r->scratch[i] = {};
     r->verbose = verbose;
 
     if (!r->runner.initialize(false)) {
@@ -1528,6 +1676,15 @@ int vulkan_trellis2_run_stage1(vulkan_trellis2_runner *r,
     BufInfo d_zero_cond = createGpuBuffer(r->runner, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
     bufferZero(r->runner, d_zero_cond, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
 
+    /* Precompute cross-attention KV cache */
+    dit_kv_cache cond_kv = {}, uncond_kv = {};
+    precomputeKvCache(r, r->stage1_dit, d_cond, cond_kv);
+    precomputeKvCache(r, r->stage1_dit, d_zero_cond, uncond_kv);
+
+    /* Pre-allocate GPU buffers (reused across steps) */
+    BufInfo d_x = createGpuBuffer(r->runner, n_elem * sizeof(float));
+    BufInfo d_v_out = createGpuBuffer(r->runner, n_elem * sizeof(float));
+
     std::vector<float> v_cond(n_elem), v_uncond(n_elem), pred_v(n_elem);
 
     /* Euler sampling loop */
@@ -1540,37 +1697,31 @@ int vulkan_trellis2_run_stage1(vulkan_trellis2_runner *r,
         bool apply_cfg = (t_cur >= guidance_min && t_cur <= guidance_max && cfg_scale != 1.0f);
 
         if (apply_cfg) {
-            /* Conditioned forward pass */
             /* Transpose x to token-major for GPU */
             std::vector<float> x_tok(n_elem);
             for (int pos = 0; pos < N; pos++)
                 for (int ch = 0; ch < in_ch; ch++)
                     x_tok[pos * in_ch + ch] = x[ch * N + pos];
 
-            BufInfo d_x = createGpuBuffer(r->runner, n_elem * sizeof(float));
             uploadToBuffer(r->runner, d_x, x_tok.data(), n_elem * sizeof(float));
-            BufInfo d_v_out = createGpuBuffer(r->runner, n_elem * sizeof(float));
 
-            runDitForward(r, d_x, t_cur, d_cond, d_v_out);
+            /* Conditioned forward (with KV cache) */
+            runDitForward(r, d_x, t_cur, d_cond, d_v_out, &cond_kv);
 
-            /* Download and transpose back */
             std::vector<float> v_tok(n_elem);
             downloadFromBuffer(r->runner, d_v_out, v_tok.data(), n_elem * sizeof(float));
             for (int pos = 0; pos < N; pos++)
                 for (int ch = 0; ch < in_ch; ch++)
                     v_cond[ch * N + pos] = v_tok[pos * in_ch + ch];
 
-            /* Unconditioned forward pass */
+            /* Unconditioned forward (with KV cache) */
             uploadToBuffer(r->runner, d_x, x_tok.data(), n_elem * sizeof(float));
-            runDitForward(r, d_x, t_cur, d_zero_cond, d_v_out);
+            runDitForward(r, d_x, t_cur, d_zero_cond, d_v_out, &uncond_kv);
 
             downloadFromBuffer(r->runner, d_v_out, v_tok.data(), n_elem * sizeof(float));
             for (int pos = 0; pos < N; pos++)
                 for (int ch = 0; ch < in_ch; ch++)
                     v_uncond[ch * N + pos] = v_tok[pos * in_ch + ch];
-
-            r->runner.destroyBuffer(d_x);
-            r->runner.destroyBuffer(d_v_out);
 
             /* CFG combination */
             for (int i = 0; i < n_elem; i++)
@@ -1613,20 +1764,14 @@ int vulkan_trellis2_run_stage1(vulkan_trellis2_runner *r,
                 for (int ch = 0; ch < in_ch; ch++)
                     x_tok[pos * in_ch + ch] = x[ch * N + pos];
 
-            BufInfo d_x = createGpuBuffer(r->runner, n_elem * sizeof(float));
             uploadToBuffer(r->runner, d_x, x_tok.data(), n_elem * sizeof(float));
-            BufInfo d_v_out = createGpuBuffer(r->runner, n_elem * sizeof(float));
-
-            runDitForward(r, d_x, t_cur, d_cond, d_v_out);
+            runDitForward(r, d_x, t_cur, d_cond, d_v_out, &cond_kv);
 
             std::vector<float> v_tok(n_elem);
             downloadFromBuffer(r->runner, d_v_out, v_tok.data(), n_elem * sizeof(float));
             for (int pos = 0; pos < N; pos++)
                 for (int ch = 0; ch < in_ch; ch++)
                     v_cond[ch * N + pos] = v_tok[pos * in_ch + ch];
-
-            r->runner.destroyBuffer(d_x);
-            r->runner.destroyBuffer(d_v_out);
 
             float dt = t_cur - t_next;
             for (int i = 0; i < n_elem; i++)
@@ -1650,15 +1795,592 @@ int vulkan_trellis2_run_stage1(vulkan_trellis2_runner *r,
 
     r->runner.destroyBuffer(d_lat);
     r->runner.destroyBuffer(d_occ);
+    r->runner.destroyBuffer(d_x);
+    r->runner.destroyBuffer(d_v_out);
     r->runner.destroyBuffer(d_cond);
     r->runner.destroyBuffer(d_zero_cond);
+    freeKvCache(r, cond_kv);
+    freeKvCache(r, uncond_kv);
 
+    return 0;
+}
+
+/* ======================================================================== */
+/* Stage 2/3 API                                                            */
+/* ======================================================================== */
+
+int vulkan_trellis2_load_stage2(vulkan_trellis2_runner *r, const char *path) {
+    return loadDitModelWeights(r, path, &r->stage2_dit, "Stage 2");
+}
+
+int vulkan_trellis2_load_stage3(vulkan_trellis2_runner *r, const char *path) {
+    return loadDitModelWeights(r, path, &r->stage3_dit, "Stage 3");
+}
+
+int vulkan_trellis2_run_stage2_dit(vulkan_trellis2_runner *r,
+                                     const float *x_t, float timestep,
+                                     const float *cond_features,
+                                     const int32_t *coords, int N,
+                                     float *output) {
+    if (!r->stage2_dit.loaded) {
+        fprintf(stderr, "T2VK: Stage 2 weights not loaded\n");
+        return -1;
+    }
+
+    const int in_ch = r->stage2_dit.in_channels;
+    const int out_ch = r->stage2_dit.out_channels;
+    const int ctx_len = DINO_SEQ_LEN;
+    const int n_freqs = r->stage2_dit.n_freqs;
+
+    /* Compute RoPE from sparse coords */
+    BufInfo rope_cos, rope_sin;
+    computeSparseRope(r, coords, N, n_freqs, rope_cos, rope_sin);
+
+    /* Upload x_t (already token-major [N, in_ch] — no transpose needed for sparse) */
+    BufInfo d_x = uploadF32(r->runner, x_t, (size_t)N * in_ch);
+    BufInfo d_cond = uploadF32(r->runner, cond_features, (size_t)ctx_len * DIT_COND_DIM);
+    BufInfo d_out = createGpuBuffer(r->runner, (size_t)N * out_ch * sizeof(float));
+
+    runDitForwardGeneric(r, d_x, timestep, d_cond, d_out,
+                         N, r->stage2_dit, rope_cos, rope_sin);
+
+    downloadFromBuffer(r->runner, d_out, output, (size_t)N * out_ch * sizeof(float));
+
+    r->runner.destroyBuffer(d_x);
+    r->runner.destroyBuffer(d_cond);
+    r->runner.destroyBuffer(d_out);
+    r->runner.destroyBuffer(rope_cos);
+    r->runner.destroyBuffer(rope_sin);
+    return 0;
+}
+
+int vulkan_trellis2_run_stage3_dit(vulkan_trellis2_runner *r,
+                                     const float *x_t, float timestep,
+                                     const float *cond_features,
+                                     const int32_t *coords, int N,
+                                     float *output) {
+    if (!r->stage3_dit.loaded) {
+        fprintf(stderr, "T2VK: Stage 3 weights not loaded\n");
+        return -1;
+    }
+
+    const int in_ch = r->stage3_dit.in_channels;
+    const int out_ch = r->stage3_dit.out_channels;
+    const int ctx_len = DINO_SEQ_LEN;
+    const int n_freqs = r->stage3_dit.n_freqs;
+
+    BufInfo rope_cos, rope_sin;
+    computeSparseRope(r, coords, N, n_freqs, rope_cos, rope_sin);
+
+    BufInfo d_x = uploadF32(r->runner, x_t, (size_t)N * in_ch);
+    BufInfo d_cond = uploadF32(r->runner, cond_features, (size_t)ctx_len * DIT_COND_DIM);
+    BufInfo d_out = createGpuBuffer(r->runner, (size_t)N * out_ch * sizeof(float));
+
+    runDitForwardGeneric(r, d_x, timestep, d_cond, d_out,
+                         N, r->stage3_dit, rope_cos, rope_sin);
+
+    downloadFromBuffer(r->runner, d_out, output, (size_t)N * out_ch * sizeof(float));
+
+    r->runner.destroyBuffer(d_x);
+    r->runner.destroyBuffer(d_cond);
+    r->runner.destroyBuffer(d_out);
+    r->runner.destroyBuffer(rope_cos);
+    r->runner.destroyBuffer(rope_sin);
+    return 0;
+}
+
+/* ======================================================================== */
+/* Sparse conv op (for shape decoder GPU acceleration)                      */
+/* ======================================================================== */
+
+static void opSparseConv3d(vulkan_trellis2_runner *r,
+                            BufInfo &out, BufInfo &feats,
+                            BufInfo &w, BufInfo &bias,
+                            BufInfo &hash_keys, BufInfo &hash_vals,
+                            BufInfo &coords, int N, int Ci, int Co, int hash_mask) {
+    struct { uint32_t N, Ci, Co, hash_mask; } pc = {
+        (uint32_t)N, (uint32_t)Ci, (uint32_t)Co, (uint32_t)hash_mask
+    };
+    uint32_t gx = (uint32_t)((Co + 31) / 32);  /* TILE_CO = 32 */
+    uint32_t gy = (uint32_t)N;
+    dispatchSync(r, r->pipe_sparse_conv3d, {out, feats, w, bias, hash_keys, hash_vals, coords},
+                 &pc, sizeof(pc), gx, gy);
+}
+
+/* ======================================================================== */
+/* Shape decoder (GPU ConvNeXt + CPU C2S subdivision)                       */
+/* ======================================================================== */
+
+/* Build hash table on CPU, upload keys+vals to GPU */
+static void buildAndUploadHash(vulkan_trellis2_runner *r,
+                                const int32_t *coords, int N,
+                                BufInfo &d_keys, BufInfo &d_vals, int *out_mask) {
+    sp3d_hash *h = sp3d_hash_build(coords, N);
+    int cap = h->capacity;
+    *out_mask = cap - 1;
+
+    d_keys = createGpuBuffer(r->runner, (size_t)cap * sizeof(uint64_t));
+    uploadToBuffer(r->runner, d_keys, h->keys, (size_t)cap * sizeof(uint64_t));
+    d_vals = createGpuBuffer(r->runner, (size_t)cap * sizeof(int32_t));
+    uploadToBuffer(r->runner, d_vals, h->vals, (size_t)cap * sizeof(int32_t));
+
+    sp3d_hash_free(h);
+}
+
+/* Run one ConvNeXt block on GPU:
+ *   sparse_conv3d → LayerNorm → GEMM(C→4C) → GELU → GEMM(4C→C) → residual add */
+static void runConvNeXtBlockGpu(vulkan_trellis2_runner *r,
+                                  BufInfo &d_feats, BufInfo &d_tmp, BufInfo &d_normed,
+                                  BufInfo &d_mlp,
+                                  BufInfo &d_conv_w, BufInfo &d_conv_b,
+                                  BufInfo &d_norm_w, BufInfo &d_norm_b,
+                                  BufInfo &d_mlp0_w, BufInfo &d_mlp0_b,
+                                  BufInfo &d_mlp2_w, BufInfo &d_mlp2_b,
+                                  BufInfo &d_hash_keys, BufInfo &d_hash_vals,
+                                  BufInfo &d_coords,
+                                  int N, int C, int hash_mask) {
+    /* sparse conv: feats → tmp */
+    opSparseConv3d(r, d_tmp, d_feats, d_conv_w, d_conv_b,
+                   d_hash_keys, d_hash_vals, d_coords, N, C, C, hash_mask);
+
+    /* layernorm: tmp → normed */
+    opLayerNorm(r, d_normed, d_tmp, d_norm_w, d_norm_b, N, C);
+
+    /* mlp: normed → 4C → C */
+    opGemm(r, d_mlp, d_mlp0_w, d_normed, d_mlp0_b, 4 * C, C, N);
+    opGelu(r, d_mlp, N * 4 * C);
+    opGemm(r, d_tmp, d_mlp2_w, d_mlp, d_mlp2_b, C, 4 * C, N);
+
+    /* residual: feats += tmp */
+    opAdd(r, d_feats, d_tmp, N * C);
+}
+
+int vulkan_trellis2_run_shape_decoder(vulkan_trellis2_runner *r,
+                                        const char *dec_path,
+                                        const float *slat,
+                                        const int32_t *coords, int N,
+                                        float *out_feats,
+                                        int32_t *out_coords,
+                                        int *out_N) {
+    /* Load decoder weights (CPU struct — we'll upload per-block to GPU) */
+    t2_shape_dec *dec = t2_shape_dec_load(dec_path);
+    if (!dec) {
+        fprintf(stderr, "T2VK: failed to load shape decoder from %s\n", dec_path);
+        return -1;
+    }
+
+    fprintf(stderr, "T2VK: shape decoder (GPU ConvNeXt + CPU C2S), N=%d\n", N);
+    r->runner.resetDynamicDescriptorPool();
+
+    int C = dec->channels[0]; /* 1024 */
+
+    /* from_latent: Linear(32 → 1024) on GPU */
+    BufInfo d_slat = uploadF32(r->runner, slat, (size_t)N * 32);
+    BufInfo d_from_w = uploadF32(r->runner, dec->from_latent_w, (size_t)C * 32);
+    BufInfo d_from_b = uploadF32(r->runner, dec->from_latent_b, C);
+    BufInfo d_feats = createGpuBuffer(r->runner, (size_t)N * C * sizeof(float));
+
+    opGemm(r, d_feats, d_from_w, d_slat, d_from_b, C, 32, N);
+    r->runner.destroyBuffer(d_slat);
+    r->runner.destroyBuffer(d_from_w);
+    r->runner.destroyBuffer(d_from_b);
+
+    /* Upload initial coords + build hash */
+    BufInfo d_coords = createGpuBuffer(r->runner, (size_t)N * 4 * sizeof(int32_t));
+    uploadToBuffer(r->runner, d_coords, coords, (size_t)N * 4 * sizeof(int32_t));
+    BufInfo d_hash_keys, d_hash_vals;
+    int hash_mask;
+    buildAndUploadHash(r, coords, N, d_hash_keys, d_hash_vals, &hash_mask);
+
+    /* Working copy of coords/feats for CPU C2S */
+    std::vector<int32_t> cur_coords(coords, coords + N * 4);
+    int cur_N = N;
+
+    /* Process stages */
+    for (int stage = 0; stage < dec->n_stages; stage++) {
+        int nc = dec->n_convnext[stage];
+        int ch = dec->channels[stage];
+
+        fprintf(stderr, "  stage %d: %d ConvNeXt(%d), N=%d\n", stage, nc, ch, cur_N);
+
+        /* Scratch buffers for this stage */
+        BufInfo d_tmp    = createGpuBuffer(r->runner, (size_t)cur_N * ch * sizeof(float));
+        BufInfo d_normed = createGpuBuffer(r->runner, (size_t)cur_N * ch * sizeof(float));
+        BufInfo d_mlp    = createGpuBuffer(r->runner, (size_t)cur_N * 4 * ch * sizeof(float));
+
+        /* Run ConvNeXt blocks on GPU */
+        for (int b = 0; b < nc; b++) {
+            t2sd_convnext &blk = dec->convnext[stage][b];
+
+            /* Upload block weights */
+            BufInfo d_cw  = uploadF32(r->runner, blk.conv_w, (size_t)ch * 27 * ch);
+            BufInfo d_cb  = uploadF32(r->runner, blk.conv_b, ch);
+            BufInfo d_nw  = uploadF32(r->runner, blk.norm_w, ch);
+            BufInfo d_nb  = uploadF32(r->runner, blk.norm_b, ch);
+            BufInfo d_m0w = uploadF32(r->runner, blk.mlp0_w, (size_t)4 * ch * ch);
+            BufInfo d_m0b = uploadF32(r->runner, blk.mlp0_b, 4 * ch);
+            BufInfo d_m2w = uploadF32(r->runner, blk.mlp2_w, (size_t)ch * 4 * ch);
+            BufInfo d_m2b = uploadF32(r->runner, blk.mlp2_b, ch);
+
+            runConvNeXtBlockGpu(r, d_feats, d_tmp, d_normed, d_mlp,
+                                d_cw, d_cb, d_nw, d_nb,
+                                d_m0w, d_m0b, d_m2w, d_m2b,
+                                d_hash_keys, d_hash_vals, d_coords,
+                                cur_N, ch, hash_mask);
+
+            /* Free block weights */
+            r->runner.destroyBuffer(d_cw);  r->runner.destroyBuffer(d_cb);
+            r->runner.destroyBuffer(d_nw);  r->runner.destroyBuffer(d_nb);
+            r->runner.destroyBuffer(d_m0w); r->runner.destroyBuffer(d_m0b);
+            r->runner.destroyBuffer(d_m2w); r->runner.destroyBuffer(d_m2b);
+
+            if ((b & 3) == 3) r->runner.resetDynamicDescriptorPool();
+        }
+
+        r->runner.destroyBuffer(d_tmp);
+        r->runner.destroyBuffer(d_normed);
+        r->runner.destroyBuffer(d_mlp);
+
+        /* C2S subdivision (CPU) */
+        if (dec->c2s[stage].conv1_w) {
+            /* Download features from GPU */
+            std::vector<float> cpu_feats(cur_N * ch);
+            downloadFromBuffer(r->runner, d_feats, cpu_feats.data(),
+                              (size_t)cur_N * ch * sizeof(float));
+
+            /* Build CPU sparse tensor for C2S */
+            sp3d_tensor *t_cpu = sp3d_create(cur_coords.data(), cpu_feats.data(),
+                                              cur_N, ch, 1);
+
+            /* Run C2S on CPU */
+            sp3d_tensor *t_new = t2sd_c2s_forward(t_cpu, &dec->c2s[stage], 4);
+            sp3d_free(t_cpu);
+
+            int new_N = t_new->N;
+            int new_C = t_new->C;
+            fprintf(stderr, "    c2s -> N=%d, C=%d\n", new_N, new_C);
+
+            /* Free old GPU buffers */
+            r->runner.destroyBuffer(d_feats);
+            r->runner.destroyBuffer(d_coords);
+            r->runner.destroyBuffer(d_hash_keys);
+            r->runner.destroyBuffer(d_hash_vals);
+
+            /* Upload new data to GPU */
+            d_feats = uploadF32(r->runner, t_new->feats, (size_t)new_N * new_C);
+            d_coords = createGpuBuffer(r->runner, (size_t)new_N * 4 * sizeof(int32_t));
+            uploadToBuffer(r->runner, d_coords, t_new->coords,
+                          (size_t)new_N * 4 * sizeof(int32_t));
+            buildAndUploadHash(r, t_new->coords, new_N,
+                              d_hash_keys, d_hash_vals, &hash_mask);
+
+            /* Update CPU state */
+            cur_coords.assign(t_new->coords, t_new->coords + new_N * 4);
+            cur_N = new_N;
+
+            sp3d_free(t_new);
+        }
+
+        r->runner.resetDynamicDescriptorPool();
+    }
+
+    /* output_layer: Linear(64 → out_channels) on GPU */
+    int out_ch = dec->out_channels;
+    BufInfo d_out_w = uploadF32(r->runner, dec->output_w, (size_t)out_ch * dec->channels[dec->n_stages]);
+    BufInfo d_out_b = uploadF32(r->runner, dec->output_b, out_ch);
+    BufInfo d_output = createGpuBuffer(r->runner, (size_t)cur_N * out_ch * sizeof(float));
+
+    opGemm(r, d_output, d_out_w, d_feats, d_out_b, out_ch, dec->channels[dec->n_stages], cur_N);
+
+    /* Download results */
+    downloadFromBuffer(r->runner, d_output, out_feats,
+                      (size_t)cur_N * out_ch * sizeof(float));
+    memcpy(out_coords, cur_coords.data(), (size_t)cur_N * 4 * sizeof(int32_t));
+    *out_N = cur_N;
+
+    /* Cleanup */
+    r->runner.destroyBuffer(d_feats);
+    r->runner.destroyBuffer(d_coords);
+    r->runner.destroyBuffer(d_hash_keys);
+    r->runner.destroyBuffer(d_hash_vals);
+    r->runner.destroyBuffer(d_out_w);
+    r->runner.destroyBuffer(d_out_b);
+    r->runner.destroyBuffer(d_output);
+
+    t2_shape_dec_free(dec);
+    fprintf(stderr, "T2VK: shape decoder done, output N=%d, C=%d\n", cur_N, out_ch);
+    return 0;
+}
+
+/* ---- Normalization constants for Stage 2/3 sparse latents ---- */
+static const float shape_slat_mean[32] = {0.781296f, 0.018091f, -0.495192f, -0.558457f, 1.060530f, 0.093252f, 1.518149f, -0.933218f, -0.732996f, 2.604095f, -0.118341f, -2.143904f, 0.495076f, -2.179512f, -2.130751f, -0.996944f, 0.261421f, -2.217463f, 1.260067f, -0.150213f, 3.790713f, 1.481266f, -1.046058f, -1.523667f, -0.059621f, 2.220780f, 1.621212f, 0.877230f, 0.567247f, -3.175944f, -3.186688f, 1.578665f};
+static const float shape_slat_std[32]  = {5.972266f, 4.706852f, 5.445010f, 5.209927f, 5.320220f, 4.547237f, 5.020802f, 5.444004f, 5.226681f, 5.683095f, 4.831436f, 5.286469f, 5.652043f, 5.367606f, 5.525084f, 4.730578f, 4.805265f, 5.124013f, 5.530808f, 5.619001f, 5.103930f, 5.417670f, 5.269677f, 5.547194f, 5.634698f, 5.235274f, 6.110351f, 5.511298f, 6.237273f, 4.879207f, 5.347008f, 5.405691f};
+static const float tex_slat_mean[32] = {3.501659f, 2.212398f, 2.226094f, 0.251093f, -0.026248f, -0.687364f, 0.439898f, -0.928075f, 0.029398f, -0.339596f, -0.869527f, 1.038479f, -0.972385f, 0.126042f, -1.129303f, 0.455149f, -1.209521f, 2.069067f, 0.544735f, 2.569128f, -0.323407f, 2.293000f, -1.925608f, -1.217717f, 1.213905f, 0.971588f, -0.023631f, 0.106750f, 2.021786f, 0.250524f, -0.662387f, -0.768862f};
+static const float tex_slat_std[32]  = {2.665652f, 2.743913f, 2.765121f, 2.595319f, 3.037293f, 2.291316f, 2.144656f, 2.911822f, 2.969419f, 2.501689f, 2.154811f, 3.163343f, 2.621215f, 2.381943f, 3.186697f, 3.021588f, 2.295916f, 3.234985f, 3.233086f, 2.260140f, 2.874801f, 2.810596f, 3.292720f, 2.674999f, 2.680878f, 2.372054f, 2.451546f, 2.353556f, 2.995195f, 2.379849f, 2.786195f, 2.775190f};
+
+int vulkan_trellis2_run_stage2(vulkan_trellis2_runner *r,
+                                const float *features,
+                                const float *occupancy,
+                                float *shape_latent,
+                                int32_t *out_coords,
+                                int *out_N,
+                                int n_steps,
+                                float cfg_scale,
+                                float cfg_rescale,
+                                uint32_t seed) {
+    if (!r->stage2_dit.loaded) {
+        fprintf(stderr, "T2VK: Stage 2 weights not loaded\n");
+        return -1;
+    }
+
+    /* 1. Extract sparse coords from occupancy grid (threshold > 0) */
+    int N_sparse = 0;
+    for (int i = 0; i < 64 * 64 * 64; i++)
+        if (occupancy[i] > 0.0f) N_sparse++;
+
+    std::vector<int32_t> coords(N_sparse * 4);
+    int idx = 0;
+    for (int z = 0; z < 64; z++)
+        for (int y = 0; y < 64; y++)
+            for (int x = 0; x < 64; x++)
+                if (occupancy[z * 64 * 64 + y * 64 + x] > 0.0f) {
+                    coords[idx * 4 + 0] = 0;  /* batch */
+                    coords[idx * 4 + 1] = z;
+                    coords[idx * 4 + 2] = y;
+                    coords[idx * 4 + 3] = x;
+                    idx++;
+                }
+
+    fprintf(stderr, "T2VK: Stage 2: %d sparse voxels, %d steps, cfg=%.1f\n",
+            N_sparse, n_steps, cfg_scale);
+
+    const int ch = 32;
+    const int n_elem = N_sparse * ch;
+    const float rescale_t_val = 3.0f;
+    const float guidance_min = 0.6f, guidance_max = 1.0f;
+    const float sigma_min = 1e-5f;
+
+    /* 2. Generate noise [N, 32] */
+    std::vector<float> x(n_elem);
+    {
+        t2_rng rng;
+        uint64_t s = seed + 1;
+        rng.s[0] = s; rng.s[1] = s ^ 0x9E3779B97F4A7C15ULL;
+        rng.s[2] = s ^ 0x6C62272E07BB0142ULL; rng.s[3] = s ^ 0xBF58476D1CE4E5B9ULL;
+        for (int i = 0; i < 8; i++) t2_next(&rng);
+        for (int i = 0; i < n_elem; i++) x[i] = t2_randn(&rng);
+    }
+
+    std::vector<float> v_cond(n_elem), v_uncond(n_elem);
+
+    /* Upload conditioning */
+    const int ctx_len = DINO_SEQ_LEN;
+    BufInfo d_cond = uploadF32(r->runner, features, (size_t)ctx_len * DIT_COND_DIM);
+    BufInfo d_zero_cond = createGpuBuffer(r->runner, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+    bufferZero(r->runner, d_zero_cond, (size_t)ctx_len * DIT_COND_DIM * sizeof(float));
+
+    /* Precompute sparse RoPE once (coords don't change during sampling) */
+    BufInfo rope_cos, rope_sin;
+    computeSparseRope(r, coords.data(), N_sparse, r->stage2_dit.n_freqs, rope_cos, rope_sin);
+
+    /* Precompute cross-attention KV cache for conditioned + unconditioned */
+    dit_kv_cache cond_kv = {}, uncond_kv = {};
+    precomputeKvCache(r, r->stage2_dit, d_cond, cond_kv);
+    precomputeKvCache(r, r->stage2_dit, d_zero_cond, uncond_kv);
+    fprintf(stderr, "T2VK: Stage 2 KV cache precomputed (30 blocks × 2)\n");
+
+    /* Pre-allocate x_t and output buffers (reused across steps) */
+    BufInfo d_x = createGpuBuffer(r->runner, n_elem * sizeof(float));
+    BufInfo d_out = createGpuBuffer(r->runner, n_elem * sizeof(float));
+
+    /* 3. Euler sampling loop */
+    for (int step = 0; step < n_steps; step++) {
+        float t_start = 1.0f - (float)step / (float)n_steps;
+        float t_end = 1.0f - (float)(step + 1) / (float)n_steps;
+        float t_cur = t2_rescale(t_start, rescale_t_val);
+        float t_next = t2_rescale(t_end, rescale_t_val);
+
+        bool apply_cfg = (t_cur >= guidance_min && t_cur <= guidance_max && cfg_scale != 1.0f);
+
+        /* Upload x_t */
+        uploadToBuffer(r->runner, d_x, x.data(), n_elem * sizeof(float));
+
+        if (apply_cfg) {
+            /* Conditioned forward (with KV cache) */
+            runDitForwardGeneric(r, d_x, t_cur, d_cond, d_out,
+                                 N_sparse, r->stage2_dit, rope_cos, rope_sin, &cond_kv);
+            downloadFromBuffer(r->runner, d_out, v_cond.data(), n_elem * sizeof(float));
+
+            /* Unconditioned forward (with KV cache) */
+            uploadToBuffer(r->runner, d_x, x.data(), n_elem * sizeof(float));
+            runDitForwardGeneric(r, d_x, t_cur, d_zero_cond, d_out,
+                                 N_sparse, r->stage2_dit, rope_cos, rope_sin, &uncond_kv);
+            downloadFromBuffer(r->runner, d_out, v_uncond.data(), n_elem * sizeof(float));
+
+            /* CFG combine: pred = cfg*cond + (1-cfg)*uncond */
+            for (int i = 0; i < n_elem; i++)
+                v_uncond[i] = cfg_scale * v_cond[i] + (1.0f - cfg_scale) * v_uncond[i];
+
+            /* CFG rescale */
+            if (cfg_rescale > 0.0f) {
+                float tc = sigma_min + (1.0f - sigma_min) * t_cur;
+                float one_m_sm = 1.0f - sigma_min;
+                double sum_pos = 0, sum2_pos = 0, sum_cfg = 0, sum2_cfg = 0;
+                for (int i = 0; i < n_elem; i++) {
+                    float x0p = one_m_sm * x[i] - tc * v_cond[i];
+                    float x0c = one_m_sm * x[i] - tc * v_uncond[i];
+                    sum_pos += x0p; sum2_pos += (double)x0p * x0p;
+                    sum_cfg += x0c; sum2_cfg += (double)x0c * x0c;
+                }
+                double n_d = (double)n_elem;
+                double std_pos = sqrt((sum2_pos - sum_pos * sum_pos / n_d) / (n_d - 1.0));
+                double std_cfg = sqrt((sum2_cfg - sum_cfg * sum_cfg / n_d) / (n_d - 1.0));
+                float ratio = (std_cfg > 1e-8) ? (float)(std_pos / std_cfg) : 1.0f;
+                float sc = cfg_rescale * ratio + (1.0f - cfg_rescale);
+                for (int i = 0; i < n_elem; i++) {
+                    float x0c = one_m_sm * x[i] - tc * v_uncond[i];
+                    v_uncond[i] = (one_m_sm * x[i] - sc * x0c) / tc;
+                }
+            }
+
+            float dt = t_cur - t_next;
+            for (int i = 0; i < n_elem; i++) x[i] -= dt * v_uncond[i];
+        } else {
+            runDitForwardGeneric(r, d_x, t_cur, d_cond, d_out,
+                                 N_sparse, r->stage2_dit, rope_cos, rope_sin, &cond_kv);
+            downloadFromBuffer(r->runner, d_out, v_cond.data(), n_elem * sizeof(float));
+            float dt = t_cur - t_next;
+            for (int i = 0; i < n_elem; i++) x[i] -= dt * v_cond[i];
+        }
+
+        if (r->verbose >= 1)
+            fprintf(stderr, "  Stage2 step %d/%d  t=%.4f->%.4f  %s\n",
+                    step + 1, n_steps, t_cur, t_next, apply_cfg ? "CFG" : "noG");
+    }
+
+    r->runner.destroyBuffer(d_x);
+    r->runner.destroyBuffer(d_out);
+    r->runner.destroyBuffer(d_cond);
+    r->runner.destroyBuffer(d_zero_cond);
+    r->runner.destroyBuffer(rope_cos);
+    r->runner.destroyBuffer(rope_sin);
+    freeKvCache(r, cond_kv);
+    freeKvCache(r, uncond_kv);
+
+    /* 4. Denormalize shape latent: slat = x * std + mean */
+    for (int i = 0; i < N_sparse; i++)
+        for (int c = 0; c < ch; c++)
+            x[i * ch + c] = x[i * ch + c] * shape_slat_std[c] + shape_slat_mean[c];
+
+    /* Output */
+    memcpy(shape_latent, x.data(), n_elem * sizeof(float));
+    memcpy(out_coords, coords.data(), N_sparse * 4 * sizeof(int32_t));
+    *out_N = N_sparse;
+
+    fprintf(stderr, "T2VK: Stage 2 complete (N=%d)\n", N_sparse);
+    return 0;
+}
+
+int vulkan_trellis2_run_stage3(vulkan_trellis2_runner *r,
+                                const float *features,
+                                const float *shape_latent,
+                                const int32_t *coords, int N,
+                                float *tex_latent,
+                                int n_steps,
+                                uint32_t seed) {
+    if (!r->stage3_dit.loaded) {
+        fprintf(stderr, "T2VK: Stage 3 weights not loaded\n");
+        return -1;
+    }
+
+    fprintf(stderr, "T2VK: Stage 3: %d sparse voxels, %d steps, no CFG\n", N, n_steps);
+
+    const int noise_ch = 32;
+    const int in_ch = 64;  /* [noise_32, shape_norm_32] */
+    const float rescale_t_val = 3.0f;
+
+    /* 1. Normalize shape latent for concatenation */
+    std::vector<float> shape_norm(N * 32);
+    for (int i = 0; i < N; i++)
+        for (int c = 0; c < 32; c++)
+            shape_norm[i * 32 + c] = (shape_latent[i * 32 + c] - shape_slat_mean[c]) / shape_slat_std[c];
+
+    /* 2. Generate noise [N, 32] */
+    std::vector<float> noise(N * noise_ch);
+    {
+        t2_rng rng;
+        uint64_t s = seed + 2;
+        rng.s[0] = s; rng.s[1] = s ^ 0x9E3779B97F4A7C15ULL;
+        rng.s[2] = s ^ 0x6C62272E07BB0142ULL; rng.s[3] = s ^ 0xBF58476D1CE4E5B9ULL;
+        for (int i = 0; i < 8; i++) t2_next(&rng);
+        for (int i = 0; i < N * noise_ch; i++) noise[i] = t2_randn(&rng);
+    }
+
+    /* Upload conditioning + precompute RoPE + KV cache */
+    const int ctx_len = DINO_SEQ_LEN;
+    BufInfo d_cond = uploadF32(r->runner, features, (size_t)ctx_len * DIT_COND_DIM);
+    BufInfo rope_cos, rope_sin;
+    computeSparseRope(r, coords, N, r->stage3_dit.n_freqs, rope_cos, rope_sin);
+
+    dit_kv_cache cond_kv = {};
+    precomputeKvCache(r, r->stage3_dit, d_cond, cond_kv);
+    fprintf(stderr, "T2VK: Stage 3 KV cache precomputed\n");
+
+    std::vector<float> x_t(N * in_ch);
+    std::vector<float> v(N * noise_ch);
+
+    /* Pre-allocate GPU buffers (reused across steps) */
+    BufInfo d_x = createGpuBuffer(r->runner, (size_t)N * in_ch * sizeof(float));
+    BufInfo d_out = createGpuBuffer(r->runner, (size_t)N * noise_ch * sizeof(float));
+
+    /* 3. Euler sampling loop (no CFG) */
+    for (int step = 0; step < n_steps; step++) {
+        float t_start = 1.0f - (float)step / (float)n_steps;
+        float t_end = 1.0f - (float)(step + 1) / (float)n_steps;
+        float t_cur = t2_rescale(t_start, rescale_t_val);
+        float t_next = t2_rescale(t_end, rescale_t_val);
+
+        /* Build x_t = [noise, shape_norm] per token */
+        for (int i = 0; i < N; i++) {
+            memcpy(x_t.data() + i * in_ch, noise.data() + i * noise_ch, noise_ch * sizeof(float));
+            memcpy(x_t.data() + i * in_ch + noise_ch, shape_norm.data() + i * 32, 32 * sizeof(float));
+        }
+
+        uploadToBuffer(r->runner, d_x, x_t.data(), (size_t)N * in_ch * sizeof(float));
+
+        runDitForwardGeneric(r, d_x, t_cur, d_cond, d_out,
+                             N, r->stage3_dit, rope_cos, rope_sin, &cond_kv);
+        downloadFromBuffer(r->runner, d_out, v.data(), (size_t)N * noise_ch * sizeof(float));
+
+        /* Euler step: noise -= dt * v */
+        float dt = t_cur - t_next;
+        for (int i = 0; i < N * noise_ch; i++) noise[i] -= dt * v[i];
+
+        if (r->verbose >= 1)
+            fprintf(stderr, "  Stage3 step %d/%d  t=%.4f->%.4f\n",
+                    step + 1, n_steps, t_cur, t_next);
+    }
+
+    r->runner.destroyBuffer(d_x);
+    r->runner.destroyBuffer(d_out);
+    r->runner.destroyBuffer(d_cond);
+    r->runner.destroyBuffer(rope_cos);
+    r->runner.destroyBuffer(rope_sin);
+    freeKvCache(r, cond_kv);
+
+    /* 4. Denormalize texture latent */
+    for (int i = 0; i < N; i++)
+        for (int c = 0; c < noise_ch; c++)
+            noise[i * noise_ch + c] = noise[i * noise_ch + c] * tex_slat_std[c] + tex_slat_mean[c];
+
+    memcpy(tex_latent, noise.data(), (size_t)N * noise_ch * sizeof(float));
+    fprintf(stderr, "T2VK: Stage 3 complete\n");
     return 0;
 }
 
 void vulkan_trellis2_free(vulkan_trellis2_runner *r) {
     if (!r) return;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 12; i++) {
         if (r->scratch[i].buffer != VK_NULL_HANDLE)
             r->runner.destroyBuffer(r->scratch[i]);
     }
