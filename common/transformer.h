@@ -1712,6 +1712,15 @@ void transformer_free(transformer_model *model) {
 }
 
 /* ---- Thread pool ---- */
+/* Portable spin-wait hint */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#define tf_cpu_pause() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define tf_cpu_pause() __asm__ __volatile__("yield")
+#else
+#define tf_cpu_pause() ((void)0)
+#endif
+
 typedef struct {
     transformer_model *model;
     int tid;
@@ -1728,7 +1737,7 @@ static void *tf_pool_worker_main(void *arg) {
         /* Spin-wait for work */
         while (m->pool_phase == last_phase) {
             if (!m->pool_alive) return NULL;
-            __builtin_ia32_pause();
+            tf_cpu_pause();
         }
         last_phase = m->pool_phase;
         if (!m->pool_alive) return NULL;
@@ -1783,7 +1792,7 @@ static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
 
     /* Spin-wait for all workers */
     while (model->pool_done < nt)
-        __builtin_ia32_pause();
+        tf_cpu_pause();
 }
 
 void transformer_set_threads(transformer_model *model, int n_threads) {
