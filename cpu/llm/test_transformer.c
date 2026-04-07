@@ -181,17 +181,20 @@ static int run_bench(int n_embd, int n_heads, int n_kv_heads, int head_dim,
 }
 
 int main(int argc, char **argv) {
-    /* Synthetic benchmark mode: --bench [n_threads] [n_tokens] */
+    /* Synthetic benchmark mode: --bench [n_threads] [n_tokens] [model_size] */
     if (argc >= 2 && strcmp(argv[1], "--bench") == 0) {
         int nt = (argc >= 3) ? atoi(argv[2]) : 1;
         int ntok = (argc >= 4) ? atoi(argv[3]) : 20;
-        /* Qwen3.5-2B dimensions */
-        return run_bench(2048, 8, 2, 256, 6144, 24, ntok, nt);
+        const char *size = (argc >= 5) ? argv[4] : "2b";
+        if (strcmp(size, "9b") == 0 || strcmp(size, "9B") == 0)
+            return run_bench(4096, 16, 4, 256, 12288, 32, ntok, nt);
+        else
+            return run_bench(2048, 8, 2, 256, 6144, 24, ntok, nt);
     }
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <model.gguf> [prompt] [max_gen_tokens] [n_threads]\n", argv[0]);
-        fprintf(stderr, "       %s --bench [n_threads] [n_tokens]\n", argv[0]);
+        fprintf(stderr, "       %s --bench [n_threads] [n_tokens] [2b|9b]\n", argv[0]);
         return 1;
     }
 
