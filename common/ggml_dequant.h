@@ -1184,26 +1184,29 @@ static inline float bf16_to_f32_scalar(uint16_t h) {
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 
+/* SVE BF16→FP32 conversion helper: load BF16 half-words, shift to FP32 */
+#define SVE_BF16_TO_F32(pg, ptr) svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, ptr), 16))
+
 static inline float vec_dot_bf16_f32(const uint16_t *a, const float *b, int n) {
     int i = 0;
     svfloat32_t acc0 = svdup_f32(0.0f);
     svfloat32_t acc1 = svdup_f32(0.0f);
     svfloat32_t acc2 = svdup_f32(0.0f);
     svfloat32_t acc3 = svdup_f32(0.0f);
-    int vl = (int)svcntw();  /* FP32 elements per vector (16 on A64FX) */
+    int vl = (int)svcntw();  /* 16 FP32 elements on A64FX (512-bit SVE) */
+    int stride4 = 4 * vl;
+    svbool_t pg = svptrue_b32();
 
-    /* Process 4*vl elements per iteration */
-    for (; i + 4 * vl - 1 < n; i += 4 * vl) {
-        svbool_t pg = svptrue_b32();
-        /* Load BF16 as u16, zero-extend to u32, shift left 16 to get FP32 bits */
-        svuint32_t raw0 = svlsl_x(pg, svld1uh_u32(pg, &a[i]),           16);
-        svuint32_t raw1 = svlsl_x(pg, svld1uh_u32(pg, &a[i + vl]),     16);
-        svuint32_t raw2 = svlsl_x(pg, svld1uh_u32(pg, &a[i + 2 * vl]), 16);
-        svuint32_t raw3 = svlsl_x(pg, svld1uh_u32(pg, &a[i + 3 * vl]), 16);
-        svfloat32_t va0 = svreinterpret_f32(raw0);
-        svfloat32_t va1 = svreinterpret_f32(raw1);
-        svfloat32_t va2 = svreinterpret_f32(raw2);
-        svfloat32_t va3 = svreinterpret_f32(raw3);
+    /* Software-pipelined loop: prefetch 2 iterations ahead.
+     * A64FX L2 latency ~40 cycles; prefetch distance = 2 * 4*vl * 2 bytes = 256 bytes */
+    for (; i + stride4 - 1 < n; i += stride4) {
+        /* Prefetch BF16 weights and FP32 activations 2 iterations ahead */
+        svprfh(pg, &a[i + 2 * stride4], SV_PLDL1STRM);
+        svprfw(pg, &b[i + 2 * stride4], SV_PLDL1STRM);
+        svfloat32_t va0 = SVE_BF16_TO_F32(pg, &a[i]);
+        svfloat32_t va1 = SVE_BF16_TO_F32(pg, &a[i + vl]);
+        svfloat32_t va2 = SVE_BF16_TO_F32(pg, &a[i + 2 * vl]);
+        svfloat32_t va3 = SVE_BF16_TO_F32(pg, &a[i + 3 * vl]);
         svfloat32_t vb0 = svld1(pg, &b[i]);
         svfloat32_t vb1 = svld1(pg, &b[i + vl]);
         svfloat32_t vb2 = svld1(pg, &b[i + 2 * vl]);
@@ -1213,20 +1216,15 @@ static inline float vec_dot_bf16_f32(const uint16_t *a, const float *b, int n) {
         acc2 = svmla_x(pg, acc2, va2, vb2);
         acc3 = svmla_x(pg, acc3, va3, vb3);
     }
-    /* Predicated tail: remaining elements */
     for (; i < n; i += vl) {
-        svbool_t pg = svwhilelt_b32(i, n);
-        svuint32_t raw = svlsl_x(pg, svld1uh_u32(pg, &a[i]), 16);
-        svfloat32_t va = svreinterpret_f32(raw);
-        svfloat32_t vb = svld1(pg, &b[i]);
-        acc0 = svmla_m(pg, acc0, va, vb);
+        svbool_t ptail = svwhilelt_b32(i, n);
+        acc0 = svmla_m(ptail, acc0, SVE_BF16_TO_F32(ptail, &a[i]), svld1(ptail, &b[i]));
     }
-    svfloat32_t sum = svadd_x(svptrue_b32(),
-                     svadd_x(svptrue_b32(), acc0, acc1),
-                     svadd_x(svptrue_b32(), acc2, acc3));
-    return svaddv(svptrue_b32(), sum);
+    return svaddv(pg, svadd_x(pg, svadd_x(pg, acc0, acc1), svadd_x(pg, acc2, acc3)));
 }
 
+/* 4-row BF16 matvec: compute 4 dot products with shared activation vector.
+ * Uses SVE prefetch to hide L2 latency for weight streams. */
 static inline void matvec_bf16_4row(float *dst, const uint16_t *w0, const uint16_t *w1,
                                      const uint16_t *w2, const uint16_t *w3,
                                      const float *x, int n) {
@@ -1234,55 +1232,135 @@ static inline void matvec_bf16_4row(float *dst, const uint16_t *w0, const uint16
     svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
     svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
     int vl = (int)svcntw();
+    svbool_t pg = svptrue_b32();
 
     for (; i + vl - 1 < n; i += vl) {
-        svbool_t pg = svptrue_b32();
+        /* Prefetch 4 weight rows and activation 2 iterations ahead */
+        svprfh(pg, &w0[i + 2 * vl], SV_PLDL1STRM);
+        svprfh(pg, &w1[i + 2 * vl], SV_PLDL1STRM);
+        svprfh(pg, &w2[i + 2 * vl], SV_PLDL1STRM);
+        svprfh(pg, &w3[i + 2 * vl], SV_PLDL1STRM);
         svfloat32_t vx = svld1(pg, &x[i]);
-        svfloat32_t v0 = svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w0[i]), 16));
-        svfloat32_t v1 = svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w1[i]), 16));
-        svfloat32_t v2 = svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w2[i]), 16));
-        svfloat32_t v3 = svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w3[i]), 16));
-        a0 = svmla_x(pg, a0, v0, vx);
-        a1 = svmla_x(pg, a1, v1, vx);
-        a2 = svmla_x(pg, a2, v2, vx);
-        a3 = svmla_x(pg, a3, v3, vx);
+        a0 = svmla_x(pg, a0, SVE_BF16_TO_F32(pg, &w0[i]), vx);
+        a1 = svmla_x(pg, a1, SVE_BF16_TO_F32(pg, &w1[i]), vx);
+        a2 = svmla_x(pg, a2, SVE_BF16_TO_F32(pg, &w2[i]), vx);
+        a3 = svmla_x(pg, a3, SVE_BF16_TO_F32(pg, &w3[i]), vx);
     }
     if (i < n) {
-        svbool_t pg = svwhilelt_b32(i, n);
-        svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_m(pg, a0, svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w0[i]), 16)), vx);
-        a1 = svmla_m(pg, a1, svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w1[i]), 16)), vx);
-        a2 = svmla_m(pg, a2, svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w2[i]), 16)), vx);
-        a3 = svmla_m(pg, a3, svreinterpret_f32(svlsl_x(pg, svld1uh_u32(pg, &w3[i]), 16)), vx);
+        svbool_t ptail = svwhilelt_b32(i, n);
+        svfloat32_t vx = svld1(ptail, &x[i]);
+        a0 = svmla_m(ptail, a0, SVE_BF16_TO_F32(ptail, &w0[i]), vx);
+        a1 = svmla_m(ptail, a1, SVE_BF16_TO_F32(ptail, &w1[i]), vx);
+        a2 = svmla_m(ptail, a2, SVE_BF16_TO_F32(ptail, &w2[i]), vx);
+        a3 = svmla_m(ptail, a3, SVE_BF16_TO_F32(ptail, &w3[i]), vx);
     }
-    svbool_t pg = svptrue_b32();
     dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
     dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
 }
 
+/* 8-row BF16 matvec: compute 8 dot products with shared activation vector.
+ * Reads activation once from L1, amortizes across 8 weight streams from L2/HBM2.
+ * This doubles the compute-to-load ratio vs 4-row: 8 FMAs per activation load. */
+static inline void matvec_bf16_8row(float *dst,
+                                     const uint16_t *w0, const uint16_t *w1,
+                                     const uint16_t *w2, const uint16_t *w3,
+                                     const uint16_t *w4, const uint16_t *w5,
+                                     const uint16_t *w6, const uint16_t *w7,
+                                     const float *x, int n) {
+    int i = 0;
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
+    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    int vl = (int)svcntw();
+    svbool_t pg = svptrue_b32();
+
+    for (; i + vl - 1 < n; i += vl) {
+        svprfh(pg, &w0[i + 2 * vl], SV_PLDL1STRM);
+        svprfh(pg, &w4[i + 2 * vl], SV_PLDL1STRM);
+        svfloat32_t vx = svld1(pg, &x[i]);
+        a0 = svmla_x(pg, a0, SVE_BF16_TO_F32(pg, &w0[i]), vx);
+        a1 = svmla_x(pg, a1, SVE_BF16_TO_F32(pg, &w1[i]), vx);
+        a2 = svmla_x(pg, a2, SVE_BF16_TO_F32(pg, &w2[i]), vx);
+        a3 = svmla_x(pg, a3, SVE_BF16_TO_F32(pg, &w3[i]), vx);
+        a4 = svmla_x(pg, a4, SVE_BF16_TO_F32(pg, &w4[i]), vx);
+        a5 = svmla_x(pg, a5, SVE_BF16_TO_F32(pg, &w5[i]), vx);
+        a6 = svmla_x(pg, a6, SVE_BF16_TO_F32(pg, &w6[i]), vx);
+        a7 = svmla_x(pg, a7, SVE_BF16_TO_F32(pg, &w7[i]), vx);
+    }
+    if (i < n) {
+        svbool_t ptail = svwhilelt_b32(i, n);
+        svfloat32_t vx = svld1(ptail, &x[i]);
+        a0 = svmla_m(ptail, a0, SVE_BF16_TO_F32(ptail, &w0[i]), vx);
+        a1 = svmla_m(ptail, a1, SVE_BF16_TO_F32(ptail, &w1[i]), vx);
+        a2 = svmla_m(ptail, a2, SVE_BF16_TO_F32(ptail, &w2[i]), vx);
+        a3 = svmla_m(ptail, a3, SVE_BF16_TO_F32(ptail, &w3[i]), vx);
+        a4 = svmla_m(ptail, a4, SVE_BF16_TO_F32(ptail, &w4[i]), vx);
+        a5 = svmla_m(ptail, a5, SVE_BF16_TO_F32(ptail, &w5[i]), vx);
+        a6 = svmla_m(ptail, a6, SVE_BF16_TO_F32(ptail, &w6[i]), vx);
+        a7 = svmla_m(ptail, a7, SVE_BF16_TO_F32(ptail, &w7[i]), vx);
+    }
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* Tiled BF16 GEMM: Y[tok, row] = W[row, K] · X[tok, K]^T
+ * Token-major output: Y[t * Y_stride + r].
+ * Processes 4 rows × N tokens with column-tiled inner loop for L1 reuse. */
 static inline void gemm_bf16_f32_tokmajor(float *Y, const uint16_t *W, const float *X,
                                            int n_rows, int K, int N, int Y_stride, int X_stride) {
     int r;
+    /* 4-row blocks: amortize weight loads across multiple tokens */
     for (r = 0; r + 3 < n_rows; r += 4) {
         const uint16_t *w0 = W + (size_t)(r)     * K;
         const uint16_t *w1 = W + (size_t)(r + 1) * K;
         const uint16_t *w2 = W + (size_t)(r + 2) * K;
         const uint16_t *w3 = W + (size_t)(r + 3) * K;
-        for (int t = 0; t < N; t++) {
-            float tmp[4];
-            matvec_bf16_4row(tmp, w0, w1, w2, w3, X + (size_t)t * X_stride, K);
-            Y[t * Y_stride + r]     = tmp[0];
-            Y[t * Y_stride + r + 1] = tmp[1];
-            Y[t * Y_stride + r + 2] = tmp[2];
-            Y[t * Y_stride + r + 3] = tmp[3];
+
+        if (N == 1) {
+            /* Single token: direct 4-row matvec */
+            matvec_bf16_4row(&Y[r], w0, w1, w2, w3, X, K);
+        } else {
+            /* Multi-token: tile over K to reuse weight cache lines across tokens.
+             * Tile size chosen to fit 4 weight rows in L1D (~256KB per tile). */
+            int TILE_K = 512;  /* 4 rows × 512 × 2B = 4KB per row, fits L1 */
+            if (TILE_K > K) TILE_K = K;
+
+            /* Initialize output */
+            for (int t = 0; t < N; t++) {
+                Y[t * Y_stride + r]     = 0.0f;
+                Y[t * Y_stride + r + 1] = 0.0f;
+                Y[t * Y_stride + r + 2] = 0.0f;
+                Y[t * Y_stride + r + 3] = 0.0f;
+            }
+
+            for (int k0 = 0; k0 < K; k0 += TILE_K) {
+                int klen = K - k0 < TILE_K ? K - k0 : TILE_K;
+                const uint16_t *tw0 = w0 + k0, *tw1 = w1 + k0;
+                const uint16_t *tw2 = w2 + k0, *tw3 = w3 + k0;
+                for (int t = 0; t < N; t++) {
+                    float tmp[4];
+                    matvec_bf16_4row(tmp, tw0, tw1, tw2, tw3,
+                                     X + (size_t)t * X_stride + k0, klen);
+                    Y[t * Y_stride + r]     += tmp[0];
+                    Y[t * Y_stride + r + 1] += tmp[1];
+                    Y[t * Y_stride + r + 2] += tmp[2];
+                    Y[t * Y_stride + r + 3] += tmp[3];
+                }
+            }
         }
     }
+    /* Remainder rows */
     for (; r < n_rows; r++) {
         const uint16_t *wr = W + (size_t)r * K;
         for (int t = 0; t < N; t++)
             Y[t * Y_stride + r] = vec_dot_bf16_f32(wr, X + (size_t)t * X_stride, K);
     }
 }
+
+#undef SVE_BF16_TO_F32
 
 #elif defined(__F16C__) && defined(__AVX2__) && defined(__FMA__)
 
