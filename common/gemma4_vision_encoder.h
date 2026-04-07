@@ -124,7 +124,8 @@ static void g4v_matvec(float *out, const qtensor *mat, const float *vec, int n_r
     }
 }
 
-/* Batched matmul: out[N, n_rows] = mat[n_rows, n_cols] @ inp[N, n_cols] */
+/* Batched matmul: out[N, n_rows] = mat[n_rows, n_cols] @ inp[N, n_cols].
+ * Dequantizes the full matrix once, then dot-products all N tokens. */
 static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
                               int N, int n_rows, float *tmp) {
     int n_cols = mat->n_cols;
@@ -270,7 +271,7 @@ g4v_model *g4v_load(gguf_context *g) {
 
 void g4v_free(g4v_model *vm) {
     if (!vm) return;
-    free(vm->blocks);
+    free(vm->blocks); /* qtensor fields point into GGUF mmap, not owned */
     free(vm);
 }
 
@@ -394,12 +395,15 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
     int hd = vm->head_dim;
     float eps = vm->ln_eps;
 
-    /* Allocate scratch */
-    float *xn = (float *)malloc(N * dim * sizeof(float));  /* normalized */
-    float *q  = (float *)malloc(N * dim * sizeof(float));
-    float *k  = (float *)malloc(N * dim * sizeof(float));
-    float *v  = (float *)malloc(N * dim * sizeof(float));
-    float *att_out = (float *)malloc(N * dim * sizeof(float));
+    /* Allocate all scratch in one block: 5 × [N, dim] for attention + 1 × [N, dim] for FFN proj */
+    size_t attn_scratch_size = (size_t)N * dim * 6 * sizeof(float);
+    float *attn_scratch = (float *)malloc(attn_scratch_size);
+    float *xn = attn_scratch;
+    float *q  = attn_scratch + N * dim;
+    float *k  = attn_scratch + N * dim * 2;
+    float *v  = attn_scratch + N * dim * 3;
+    float *att_out = attn_scratch + N * dim * 4;
+    float *proj_out = attn_scratch + N * dim * 5;
 
     /* Pre-attention RMSNorm */
     for (int t = 0; t < N; t++)
@@ -461,8 +465,7 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
         free(scores);
     }
 
-    /* Output projection */
-    float *proj_out = (float *)malloc(N * dim * sizeof(float));
+    /* Output projection (proj_out already allocated in attn_scratch) */
     g4v_matmul_batch(proj_out, &blk->attn_out_w, att_out, N, dim, tmp);
 
     /* Post-attention norm */
@@ -477,11 +480,12 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
     for (int t = 0; t < N; t++)
         g4v_rmsnorm(xn + t * dim, x + t * dim, &blk->ln2_w, dim, eps, tmp);
 
-    /* Gate/Up projections */
+    /* Gate/Up projections — single allocation for 3 × [N, ff] */
     int ff = vm->ffn_dim;
-    float *gate = (float *)malloc(N * ff * sizeof(float));
-    float *up   = (float *)malloc(N * ff * sizeof(float));
-    float *ffn_out = (float *)malloc(N * ff * sizeof(float));
+    float *ffn_scratch = (float *)malloc((size_t)N * ff * 3 * sizeof(float));
+    float *gate = ffn_scratch;
+    float *up   = ffn_scratch + N * ff;
+    float *ffn_out = ffn_scratch + N * ff * 2;
 
     g4v_matmul_batch(gate, &blk->ffn_gate_w, xn, N, ff, tmp);
     g4v_matmul_batch(up,   &blk->ffn_up_w,   xn, N, ff, tmp);
@@ -493,8 +497,8 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
         ffn_out[i] = gelu_g * up[i];
     }
 
-    /* Down projection */
-    float *ffn_proj = (float *)malloc(N * dim * sizeof(float));
+    /* Down projection — reuse proj_out (attention is done, safe to overwrite) */
+    float *ffn_proj = proj_out;
     g4v_matmul_batch(ffn_proj, &blk->ffn_down_w, ffn_out, N, dim, tmp);
 
     /* Post-FFN norm */
@@ -504,8 +508,8 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
     /* Residual add */
     for (int i = 0; i < N * dim; i++) x[i] += ffn_proj[i];
 
-    free(xn); free(q); free(k); free(v); free(att_out);
-    free(proj_out); free(gate); free(up); free(ffn_out); free(ffn_proj);
+    free(attn_scratch); /* xn, q, k, v, att_out, proj_out */
+    free(ffn_scratch);  /* gate, up, ffn_out */
 }
 
 /* Average pooling: [ph, pw, dim] -> [ph/k, pw/k, dim] */
@@ -534,11 +538,13 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
 
     int dim = vm->dim;
     int ps = vm->patch_size;
+    int merge = vm->spatial_merge;
     int ph = height / ps, pw = width / ps;
     int N = ph * pw;
+    int n_merged = (ph / merge) * (pw / merge);
 
-    fprintf(stderr, "g4v_encode: image %dx%d -> %dx%d patches = %d tokens\n",
-            width, height, pw, ph, N);
+    fprintf(stderr, "g4v_encode: %dx%d -> %d patches -> %d tokens\n",
+            width, height, N, n_merged);
 
     /* 1. Normalize image: patches * 2 - 1 (Gemma4 specific) */
     float *img_norm = (float *)malloc(height * width * 3 * sizeof(float));
@@ -550,7 +556,7 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     g4v_patch_embed(vm, patches, img_norm, height, width);
     free(img_norm);
 
-    fprintf(stderr, "g4v_encode: patch embedding done\n");
+    /* patch embedding done */
 
     /* 3. Add 2D positional embeddings */
     g4v_add_pos_embd(vm, patches, ph, pw);
@@ -568,17 +574,11 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     float *tmp = (float *)malloc(dim * 16 * sizeof(float)); /* scratch */
     for (int b = 0; b < vm->n_blocks; b++) {
         g4v_block_forward(vm, &vm->blocks[b], patches, N, pos_x, pos_y, tmp);
-        if (b == 0 || b == vm->n_blocks - 1) {
-            float norm = 0.0f;
-            for (int i = 0; i < N * dim; i++) norm += patches[i] * patches[i];
-            fprintf(stderr, "g4v_encode: block %d output norm = %.4f\n", b, sqrtf(norm));
-        }
+        (void)0; /* blocks processed */
     }
     free(pos_x); free(pos_y); free(tmp);
 
     /* 6. Average pooling: [ph, pw, dim] -> [ph/merge, pw/merge, dim] */
-    int merge = vm->spatial_merge;
-    int n_merged = (ph / merge) * (pw / merge);
     float *pooled = (float *)malloc(n_merged * dim * sizeof(float));
     g4v_avg_pool(pooled, patches, ph, pw, dim, merge);
     free(patches);
@@ -587,7 +587,7 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     float scale = sqrtf((float)dim);
     for (int i = 0; i < n_merged * dim; i++) pooled[i] *= scale;
 
-    fprintf(stderr, "g4v_encode: pooled %d tokens, scaled by %.2f\n", n_merged, scale);
+    /* pooled and scaled */
 
     /* 8. MM projection: [dim] -> [proj_dim] per token */
     int proj_dim = vm->proj_dim;
@@ -607,7 +607,7 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
         for (int i = 0; i < proj_dim; i++) p[i] *= ss;
     }
 
-    fprintf(stderr, "g4v_encode: output %d tokens x %d dim\n", n_merged, proj_dim);
+    /* output: n_merged tokens of proj_dim dims */
     return projected;
 }
 
