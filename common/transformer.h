@@ -2857,13 +2857,14 @@ static void *tf_persistent_worker(void *arg) {
         tf_spin_barrier(m, &local_sense, nt);  /* B1: xb ready */
 
         if (m->is_hybrid && layer->is_ssm) {
-            /* SSM: thread 0 runs entire SSM (single-threaded, pool disabled
-             * since pool workers are busy with persistent forward). */
+            /* SSM: thread 0 runs SSM with pool disabled (pool_alive=0 prevents
+             * tf_pool_dispatch from being called, forcing single-thread fallback).
+             * Other threads wait at barrier. */
             if (tid == 0) {
-                int saved_nt = m->n_threads;
-                m->n_threads = 1;
+                int saved_alive = m->pool_alive;
+                m->pool_alive = 0;
                 tf_ssm_deltanet_forward(m, l);
-                m->n_threads = saved_nt;
+                m->pool_alive = saved_alive;
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B2: SSM done */
         } else {
@@ -2989,8 +2990,8 @@ static void *tf_persistent_worker(void *arg) {
         } else {
             /* MoE: thread 0 only (complex routing) */
             if (tid == 0) {
-                int saved_nt = m->n_threads;
-                m->n_threads = 1;  /* disable pool dispatch */
+                int saved_alive = m->pool_alive;
+                m->pool_alive = 0;  /* disable pool dispatch */
                 const int n_expert = m->n_expert;
                 const int n_top = m->n_expert_used;
                 const int n_ff_exp = m->n_ff_expert;
@@ -3006,7 +3007,7 @@ static void *tf_persistent_worker(void *arg) {
                 tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf3, m->ffn_buf2, n_ff_exp);
                 tf_qmatvec_expert(m->q, &layer->ffn_down_exps, best, m->ffn_buf3, n_embd, m->matvec_tmp);
                 for (int i = 0; i < n_embd; i++) m->x[i] += ew * m->q[i];
-                m->n_threads = saved_nt;
+                m->pool_alive = saved_alive;
             }
             tf_spin_barrier(m, &local_sense, nt);  /* MoE done */
         }
@@ -3083,9 +3084,8 @@ float *transformer_forward_logits(transformer_model *model, int32_t token_id, in
 }
 
 static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
-    /* TODO: tf_forward_persistent has a deadlock when SSM layers use tf_pool_dispatch
-     * internally while pool workers are occupied with persistent forward. Need to
-     * refactor SSM to not use pool dispatch, or use a separate "persistent mode" flag. */
+    if (m->n_threads > 1 && m->pool_alive)
+        return tf_forward_persistent(m, position, pos_t, pos_h, pos_w);
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
 
