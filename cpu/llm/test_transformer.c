@@ -69,16 +69,8 @@ static int run_bench(int n_embd, int n_heads, int n_kv_heads, int head_dim,
         return 1;
     }
 
-    /* NUMA distribute the weight buffer if multi-threaded */
-    if (n_threads > 1 && getenv("NUMA_DISTRIBUTE")) {
-        fprintf(stderr, "bench: NUMA distributing weights...\n");
-        size_t chunk = alloc_size / n_threads;
-        /* Touch each thread's partition from the corresponding thread
-         * (simplified: main thread touches all for now) */
-        memset(weights, 0, alloc_size);
-    } else {
-        memset(weights, 0, alloc_size);
-    }
+    /* Don't touch pages yet — defer to NUMA-aware first-touch after thread setup */
+    (void)alloc_size;
 
     /* Build a minimal transformer_model manually */
     int max_seq_len = 256;
@@ -138,6 +130,39 @@ static int run_bench(int n_embd, int n_heads, int n_kv_heads, int head_dim,
     m->thread_tmp[0] = m->matvec_tmp;
 
     if (n_threads > 1) transformer_set_threads(m, n_threads);
+
+    /* NUMA first-touch: each thread zeroes its partition of the weight buffer.
+     * With demand paging, pages land on the touching thread's CMG.
+     * Distribute per-tensor (row-partitioned) to match matvec row distribution. */
+    {
+        size_t used = (size_t)((uint8_t *)wp - (uint8_t *)weights);
+        if (n_threads > 1) {
+            fprintf(stderr, "bench: NUMA distributing %.1f GB across %d threads...\n",
+                    (double)used / (1024.0*1024.0*1024.0), n_threads);
+            for (int l = 0; l < n_layers; l++) {
+                transformer_layer *layer = &m->layers[l];
+                const qtensor *tensors[] = {
+                    &layer->attn_q, &layer->attn_k, &layer->attn_v, &layer->attn_output,
+                    &layer->ffn_gate, &layer->ffn_up, &layer->ffn_down, NULL
+                };
+                for (int ti = 0; tensors[ti]; ti++) {
+                    const qtensor *t = tensors[ti];
+                    if (t->data && t->n_rows >= n_threads)
+                        tf_numa_distribute_buffer(m, t->data, (size_t)t->n_rows * t->n_cols * 2);
+                }
+                /* Small tensors (norms): touch from thread 0 */
+                if (layer->attn_norm.data) memset(layer->attn_norm.data, 0, layer->attn_norm.n_cols * 2);
+                if (layer->ffn_norm.data) memset(layer->ffn_norm.data, 0, layer->ffn_norm.n_cols * 2);
+            }
+            /* Token embedding: distribute */
+            if (m->token_embd.data)
+                tf_numa_distribute_buffer(m, m->token_embd.data,
+                    (size_t)m->token_embd.n_rows * m->token_embd.n_cols * 2);
+            fprintf(stderr, "bench: NUMA distribution done\n");
+        } else {
+            memset(weights, 0, used);
+        }
+    }
 
     /* Warmup: 2 forward passes */
     for (int w = 0; w < 2; w++) {
