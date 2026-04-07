@@ -1201,8 +1201,7 @@ static inline float vec_dot_bf16_f32(const uint16_t *a, const float *b, int n) {
      * A64FX L2 latency ~40 cycles; prefetch distance = 2 * 4*vl * 2 bytes = 256 bytes */
     for (; i + stride4 - 1 < n; i += stride4) {
         /* Prefetch BF16 weights and FP32 activations 2 iterations ahead */
-        svprfh(pg, &a[i + 2 * stride4], SV_PLDL1STRM);
-        svprfw(pg, &b[i + 2 * stride4], SV_PLDL1STRM);
+        /* No SW prefetch: A64FX HW stream prefetcher handles sequential patterns */
         svfloat32_t va0 = SVE_BF16_TO_F32(pg, &a[i]);
         svfloat32_t va1 = SVE_BF16_TO_F32(pg, &a[i + vl]);
         svfloat32_t va2 = SVE_BF16_TO_F32(pg, &a[i + 2 * vl]);
@@ -1236,10 +1235,7 @@ static inline void matvec_bf16_4row(float *dst, const uint16_t *w0, const uint16
 
     for (; i + vl - 1 < n; i += vl) {
         /* Prefetch 4 weight rows and activation 2 iterations ahead */
-        svprfh(pg, &w0[i + 2 * vl], SV_PLDL1STRM);
-        svprfh(pg, &w1[i + 2 * vl], SV_PLDL1STRM);
-        svprfh(pg, &w2[i + 2 * vl], SV_PLDL1STRM);
-        svprfh(pg, &w3[i + 2 * vl], SV_PLDL1STRM);
+        /* No SW prefetch: A64FX HW stream prefetcher handles sequential patterns */
         svfloat32_t vx = svld1(pg, &x[i]);
         a0 = svmla_x(pg, a0, SVE_BF16_TO_F32(pg, &w0[i]), vx);
         a1 = svmla_x(pg, a1, SVE_BF16_TO_F32(pg, &w1[i]), vx);
@@ -1276,8 +1272,7 @@ static inline void matvec_bf16_8row(float *dst,
     svbool_t pg = svptrue_b32();
 
     for (; i + vl - 1 < n; i += vl) {
-        svprfh(pg, &w0[i + 2 * vl], SV_PLDL1STRM);
-        svprfh(pg, &w4[i + 2 * vl], SV_PLDL1STRM);
+        /* No SW prefetch: A64FX HW stream prefetcher handles sequential patterns */
         svfloat32_t vx = svld1(pg, &x[i]);
         a0 = svmla_x(pg, a0, SVE_BF16_TO_F32(pg, &w0[i]), vx);
         a1 = svmla_x(pg, a1, SVE_BF16_TO_F32(pg, &w1[i]), vx);
