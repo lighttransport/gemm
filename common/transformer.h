@@ -2827,17 +2827,30 @@ static inline void tf_hw_barrier_w0(void) {
 }
 #endif
 
-/* Software spin barrier: sense-reversing, no syscalls.
- * Used for cross-CMG sync or when hardware barrier is unavailable. */
+/* Barrier: sense-reversing with SEV/WFE on aarch64 for low-power wait.
+ * WFE puts the core in low-power state until an event (SEV from the last
+ * arriving thread). No bandwidth consumption while waiting. */
 static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt) {
     int my_sense = !(*local_sense);
     if (__sync_add_and_fetch(&m->bar_count, 1) == nt) {
         m->bar_count = 0;
         __sync_synchronize();
         m->bar_sense = my_sense;
+#if defined(__aarch64__)
+        __asm__ __volatile__("sev");  /* wake all WFE-sleeping cores */
+#endif
     } else {
+#if defined(__aarch64__)
+        /* SEV/WFE spin: core sleeps until event, then rechecks.
+         * SEVL ensures first WFE doesn't stall if event pending. */
+        __asm__ __volatile__("sevl");
+        do {
+            __asm__ __volatile__("wfe");
+        } while (m->bar_sense != my_sense);
+#else
         while (m->bar_sense != my_sense)
             tf_cpu_pause();
+#endif
     }
     *local_sense = my_sense;
 }
@@ -2937,9 +2950,7 @@ static void *tf_persistent_worker(void *arg) {
         tf_spin_barrier(m, &local_sense, nt);  /* B1: xb ready */
 
         if (m->is_hybrid && layer->is_ssm) {
-            /* SSM: thread 0 runs SSM with pool disabled (pool_alive=0 prevents
-             * tf_pool_dispatch from being called, forcing single-thread fallback).
-             * Other threads wait at barrier. */
+            /* SSM: thread 0 runs with pool disabled. Other threads wait. */
             if (tid == 0) {
                 int saved_alive = m->pool_alive;
                 m->pool_alive = 0;
@@ -3037,12 +3048,12 @@ static void *tf_persistent_worker(void *arg) {
             tf_spin_barrier(m, &local_sense, nt);  /* B5: xb ready */
         }
 
-        /* Thread 0: residual + FFN norm */
+        /* Thread 0: residual + FFN norm (merged B5+B6: saves 1 barrier) */
         if (tid == 0) {
             tf_vadd(m->x, m->xb, n_embd);
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         }
-        tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN */
+        tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN (merged) */
 
         if (!m->use_moe || !layer->ffn_gate_inp.data) {
             /* Dense SwiGLU FFN: gate+up matvec (parallel) */
@@ -3091,8 +3102,9 @@ static void *tf_persistent_worker(void *arg) {
             }
             tf_spin_barrier(m, &local_sense, nt);  /* MoE done */
         }
-
-        tf_spin_barrier(m, &local_sense, nt);  /* End of layer: x ready for next */
+        /* No end-of-layer barrier needed: only thread 0 writes m->x (vadd),
+         * and only thread 0 reads it at the start of next layer (RMSNorm).
+         * The next layer's B1 barrier ensures all threads wait for the norm. */
     }
 
     /* Final norm: thread 0 only */
@@ -3164,7 +3176,7 @@ float *transformer_forward_logits(transformer_model *model, int32_t token_id, in
 }
 
 static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
-    if (m->n_threads > 1 && m->pool_alive && getenv("PERSISTENT_FWD"))
+    if (m->n_threads > 1 && m->pool_alive)
         return tf_forward_persistent(m, position, pos_t, pos_h, pos_w);
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
