@@ -410,16 +410,38 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         struct stat st;
         if (fstat(ctx->fd, &st) != 0) goto fail;
         ctx->map_size = (size_t)st.st_size;
-        ctx->map_base = mmap(NULL, ctx->map_size, PROT_READ, MAP_PRIVATE, ctx->fd, 0);
+        {
+            int flags = MAP_PRIVATE;
+            if (!getenv("NUMA_DISTRIBUTE")) flags |= MAP_POPULATE;
+            ctx->map_base = mmap(NULL, ctx->map_size, PROT_READ, flags, ctx->fd, 0);
+        }
         if (ctx->map_base == MAP_FAILED) { ctx->map_base = NULL; goto fail; }
+#ifdef MADV_HUGEPAGE
+        madvise(ctx->map_base, ctx->map_size, MADV_HUGEPAGE);
+#endif
         ctx->data = (uint8_t *)ctx->map_base + ctx->data_offset;
 #endif
     } else {
-        ctx->data = (uint8_t *)malloc(ctx->data_size);
-        if (!ctx->data) goto fail;
-        fseek(f, (long)ctx->data_offset, SEEK_SET);
-        if (fread(ctx->data, 1, ctx->data_size, f) != ctx->data_size) goto fail;
-        fclose(f); f = NULL;
+        /* Aligned allocation for hugepage compatibility and SVE alignment.
+         * 2MB alignment ensures hugepage-friendly boundaries with libmpg. */
+        size_t align = (ctx->data_size >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 256;
+        size_t alloc_size = (ctx->data_size + align - 1) & ~(align - 1);
+        if (posix_memalign((void **)&ctx->data, align, alloc_size) != 0) {
+            ctx->data = NULL; goto fail;
+        }
+        if (getenv("NUMA_DISTRIBUTE")) {
+            /* NUMA mode: keep fd open for parallel pread later.
+             * Don't fread here — let transformer_numa_distribute() do
+             * parallel pread so first-touch places pages on correct CMG. */
+            ctx->fd = fileno(f);
+            /* Duplicate fd since fclose will close it */
+            ctx->fd = dup(ctx->fd);
+            fclose(f); f = NULL;
+        } else {
+            fseek(f, (long)ctx->data_offset, SEEK_SET);
+            if (fread(ctx->data, 1, ctx->data_size, f) != ctx->data_size) goto fail;
+            fclose(f); f = NULL;
+        }
     }
 
     if (f) fclose(f);
