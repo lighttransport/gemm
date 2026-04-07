@@ -55,8 +55,9 @@ int main(int argc, char **argv) {
     srand((unsigned)time(NULL));
 
     /* Load GGUF */
-    fprintf(stderr, "Loading GGUF: %s\n", model_path);
-    gguf_context *gguf = gguf_open(model_path, 1);
+    int use_mmap = (getenv("NO_MMAP") == NULL) ? 1 : 0;
+    fprintf(stderr, "Loading GGUF: %s (mmap=%d)\n", model_path, use_mmap);
+    gguf_context *gguf = gguf_open(model_path, use_mmap);
     if (!gguf) {
         fprintf(stderr, "Failed to open GGUF\n");
         return 1;
@@ -84,6 +85,7 @@ int main(int argc, char **argv) {
     }
 
     if (n_threads > 1) transformer_set_threads(model, n_threads);
+    if (n_threads > 1 && getenv("NUMA_DISTRIBUTE")) transformer_numa_distribute(model, gguf);
 
     /* Tokenize prompt */
     fprintf(stderr, "Prompt: \"%s\"\n", prompt);
