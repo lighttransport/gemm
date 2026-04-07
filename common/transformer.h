@@ -164,6 +164,7 @@ void transformer_free(transformer_model *model);
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
+void transformer_numa_distribute(transformer_model *m, const gguf_context *gguf);
 
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
  * For embedding models (no output projection), this is the final hidden state. */
@@ -267,6 +268,7 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <time.h>
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 
 /* Profiling macros: active only if profiler.h was included before this file */
 #ifdef PROFILER_H
@@ -321,6 +323,18 @@ static float tf_get_float(const gguf_context *gguf, const char *key, float defau
     return default_val;
 }
 
+/* ---- Aligned allocation helper ---- */
+/* Returns zeroed memory aligned to 'alignment' bytes.
+ * alignment must be a power of 2 and >= sizeof(void*). */
+static void *tf_aligned_calloc(size_t alignment, size_t count, size_t elem_size) {
+    size_t size = count * elem_size;
+    size = (size + alignment - 1) & ~(alignment - 1);  /* round up */
+    void *p = NULL;
+    if (posix_memalign(&p, alignment, size) != 0) return NULL;
+    memset(p, 0, size);
+    return p;
+}
+
 /* ---- Compute helpers ---- */
 
 /* Dequantize one row of a quantized matrix.
@@ -342,6 +356,7 @@ static void tf_dequant_row(const qtensor *t, int row, float *dst) {
         case GGML_TYPE_IQ4_XS: block_size = 256; type_size = 136; break;
         case GGML_TYPE_F32:    block_size = 1;   type_size = 4;   break;
         case GGML_TYPE_F16:    block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_BF16:   block_size = 1;   type_size = 2;   break;
         default:
             fprintf(stderr, "tf_dequant_row: unsupported type %u\n", t->type);
             memset(dst, 0, (size_t)n_cols * sizeof(float));
@@ -364,6 +379,7 @@ static int tf_is_supported_weight_type(uint32_t type) {
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             return 1;
         default:
             return 0;
@@ -381,6 +397,7 @@ static size_t tf_row_bytes(uint32_t type, int n_cols) {
         case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
         case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
         case GGML_TYPE_F16:  block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_BF16: block_size = 1;   type_size = 2;   break;
         default: return 0;
     }
     return (size_t)((n_cols + block_size - 1) / block_size) * type_size;
@@ -400,6 +417,13 @@ static void tf_qmatvec_expert(float *dst, const qtensor *mat, int expert, const 
         for (int i = 0; i < rows_per_expert; i++) {
             const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
             dst[i] = vec_dot_f16_f32(row, x, mat->n_cols);
+        }
+        return;
+    }
+    if (mat->type == GGML_TYPE_BF16) {
+        for (int i = 0; i < rows_per_expert; i++) {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+            dst[i] = vec_dot_bf16_f32(row, x, mat->n_cols);
         }
         return;
     }
@@ -520,6 +544,24 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         return NULL;
     }
+    if (t->mat->type == GGML_TYPE_BF16) {
+        const uint8_t *base = (const uint8_t *)t->mat->data;
+        size_t row_bytes = (size_t)n_cols * 2;
+        int i = t->row_start;
+        for (; i + 3 < t->row_end; i += 4) {
+            matvec_bf16_4row(t->dst + i,
+                (const uint16_t *)(base + (size_t)i * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
+                t->x, n_cols);
+        }
+        for (; i < t->row_end; i++) {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+            t->dst[i] = vec_dot_bf16_f32(row, t->x, n_cols);
+        }
+        return NULL;
+    }
     if (t->mat->type == GGML_TYPE_Q8_0) {
         int nb = n_cols / 32;
         size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
@@ -582,6 +624,23 @@ static void tf_matvec_q8_rows(float *dst, const uint8_t *base, size_t row_bytes,
     }
 }
 
+static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                  const float *x, int n_cols, int row_start, int row_end) {
+    int i = row_start;
+    for (; i + 3 < row_end; i += 4) {
+        matvec_bf16_4row(dst + i,
+            (const uint16_t *)(base + (size_t)i * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
+            x, n_cols);
+    }
+    for (; i < row_end; i++) {
+        const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+        dst[i] = vec_dot_bf16_f32(row, x, n_cols);
+    }
+}
+
 static void tf_matvec_f16_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                  const float *x, int n_cols, int row_start, int row_end) {
     int i = row_start;
@@ -610,6 +669,12 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                             t->x, n_cols, t->row_start, t->row_end);
         tf_matvec_f16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                             t->x, n_cols, t->row_start, t->row_end);
+    } else if (t->mat1->type == GGML_TYPE_BF16) {
+        size_t row_bytes = (size_t)n_cols * 2;
+        tf_matvec_bf16_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
+        tf_matvec_bf16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
     } else if (t->mat1->type == GGML_TYPE_Q8_0) {
         int nb = n_cols / 32;
         size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
@@ -715,6 +780,9 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
     if (mat->type == GGML_TYPE_F16) {
         size_t rb = (size_t)n_cols * 2;
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+    } else if (mat->type == GGML_TYPE_BF16) {
+        size_t rb = (size_t)n_cols * 2;
+        tf_matvec_bf16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else if (mat->type == GGML_TYPE_Q8_0) {
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q8_0);
         tf_matvec_q8_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
@@ -791,6 +859,24 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         for (; i < n_rows; i++) {
             const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
             dst[i] = vec_dot_f16_f32(row, x, n_cols);
+        }
+        return;
+    }
+    if (mat->type == GGML_TYPE_BF16) {
+        const uint8_t *base = (const uint8_t *)mat->data;
+        size_t row_bytes = (size_t)n_cols * 2;
+        int i = 0;
+        for (; i + 3 < n_rows; i += 4) {
+            matvec_bf16_4row(dst + i,
+                (const uint16_t *)(base + (size_t)i * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
+                x, n_cols);
+        }
+        for (; i < n_rows; i++) {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+            dst[i] = vec_dot_bf16_f32(row, x, n_cols);
         }
         return;
     }
@@ -1577,8 +1663,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
     for (int l = 0; l < m->n_layers; l++) {
         if (m->is_hybrid && m->layers[l].is_ssm) continue;
-        m->key_cache[l]   = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
-        m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+        m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
+        m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
     }
 
     /* Allocate SSM state for hybrid models */
@@ -1621,18 +1707,18 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     int q_buf_dim = q_dim;
     if (m->is_hybrid && m->ssm_dt_rank * m->ssm_d_state > q_buf_dim)
         q_buf_dim = m->ssm_dt_rank * m->ssm_d_state;
-    m->x         = (float *)calloc(m->n_embd, sizeof(float));
-    m->xb        = (float *)calloc(m->n_embd, sizeof(float));
-    m->xb2       = (float *)calloc(xb2_dim, sizeof(float));
-    m->q         = (float *)calloc(q_buf_dim, sizeof(float));
-    m->k         = (float *)calloc(kv_dim, sizeof(float));
-    m->v         = (float *)calloc(kv_dim, sizeof(float));
-    m->att       = (float *)calloc(m->n_heads * max_seq_len, sizeof(float));
-    m->ffn_buf1  = (float *)calloc(max_ff, sizeof(float));
-    m->ffn_buf2  = (float *)calloc(max_ff, sizeof(float));
-    m->ffn_buf3  = (float *)calloc(max_ff, sizeof(float));
-    m->logits     = m->has_lm_head ? (float *)calloc(m->n_vocab, sizeof(float)) : NULL;
-    m->matvec_tmp = (float *)calloc(max_dim, sizeof(float));
+    m->x         = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+    m->xb        = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+    m->xb2       = (float *)tf_aligned_calloc(256, xb2_dim, sizeof(float));
+    m->q         = (float *)tf_aligned_calloc(256, q_buf_dim, sizeof(float));
+    m->k         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
+    m->v         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
+    m->att       = (float *)tf_aligned_calloc(256, m->n_heads * max_seq_len, sizeof(float));
+    m->ffn_buf1  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
+    m->ffn_buf2  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
+    m->ffn_buf3  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
+    m->logits     = m->has_lm_head ? (float *)tf_aligned_calloc(256, m->n_vocab, sizeof(float)) : NULL;
+    m->matvec_tmp = (float *)tf_aligned_calloc(256, max_dim, sizeof(float));
 
     /* Default: single-threaded, no tensor parallelism */
     m->n_threads = 1;
@@ -1757,7 +1843,7 @@ static void tf_pool_shutdown(transformer_model *model) {
     model->pool_alive = 0;
     __sync_synchronize();
     model->pool_phase++;
-    for (int t = 0; t < model->n_threads; t++)
+    for (int t = 1; t < model->n_threads; t++)
         pthread_join(model->pool_threads[t], NULL);
     free(model->pool_threads);
     model->pool_threads = NULL;
@@ -1770,7 +1856,9 @@ static void tf_pool_start(transformer_model *model) {
     model->pool_done = 0;
     model->pool_alive = 1;
     __sync_synchronize();
-    for (int t = 0; t < nt; t++) {
+    /* Create nt-1 background workers (tid 1..nt-1).
+     * tid 0 is executed by the main thread in tf_pool_dispatch. */
+    for (int t = 1; t < nt; t++) {
         tf_pool_worker_ctx *ctx = (tf_pool_worker_ctx *)malloc(sizeof(*ctx));
         ctx->model = model;
         ctx->tid = t;
@@ -1790,8 +1878,12 @@ static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
     __sync_synchronize();
     model->pool_phase++;
 
-    /* Spin-wait for all workers */
-    while (model->pool_done < nt)
+    /* Main thread executes worker 0's task directly instead of spin-waiting */
+    void *task0 = (char *)args;
+    fn(task0);
+
+    /* Wait for remaining workers (1..nt-1) */
+    while (model->pool_done < nt - 1)
         tf_cpu_pause();
 }
 
@@ -1812,12 +1904,101 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
     model->thread_tmp[0] = model->matvec_tmp;
     for (int t = 1; t < n_threads; t++) {
-        model->thread_tmp[t] = (float *)calloc(max_dim, sizeof(float));
+        model->thread_tmp[t] = (float *)tf_aligned_calloc(256, max_dim, sizeof(float));
     }
 
     /* Start new pool */
     if (n_threads > 1) tf_pool_start(model);
     fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
+}
+
+/* ---- NUMA first-touch weight distribution ---- */
+/* With demand paging (XOS_MMM_L_PAGING_POLICY=demand:demand:demand), pages are
+ * placed on the NUMA node of the first-touching core. This function dispatches
+ * a parallel read pass over each weight tensor so that each thread touches its
+ * own row partition, placing those pages on the thread's CMG. */
+
+typedef struct {
+    void *dst;         /* destination buffer */
+    int fd;            /* file descriptor */
+    size_t file_off;   /* base file offset */
+    size_t byte_start; /* byte offset within dst to start writing */
+    size_t byte_end;   /* byte offset within dst to stop writing */
+} tf_numa_pread_task;
+
+static void *tf_numa_pread_worker(void *arg) {
+    tf_numa_pread_task *t = (tf_numa_pread_task *)arg;
+    uint8_t *base = (uint8_t *)t->dst;
+    size_t start = t->byte_start;
+    size_t len   = t->byte_end - start;
+    if (len == 0) return NULL;
+
+    /* pread into our partition — first-touch places pages on this thread's CMG */
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 1024 * 1024) chunk = 1024 * 1024; /* limit per-call to 1MB */
+        ssize_t n = pread(t->fd, base + start + off, chunk, (off_t)(t->file_off + start + off));
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    return NULL;
+}
+
+void transformer_numa_distribute(transformer_model *m, const gguf_context *gguf) {
+    if (m->n_threads <= 1 || !m->pool_alive) return;
+    if (gguf->fd < 0) {
+        fprintf(stderr, "transformer: NUMA distribute requires open file descriptor\n");
+        return;
+    }
+
+    fprintf(stderr, "transformer: NUMA parallel-loading weights across %d threads (fd=%d, data_offset=%zu, data=%p)...\n",
+            m->n_threads, gguf->fd, (size_t)gguf->data_offset, (void *)gguf->data);
+
+    int fd = gguf->fd;
+    int nt = m->n_threads;
+
+    /* For each tensor in the GGUF, do parallel pread with row-level partitioning.
+     * Each thread reads its row partition, triggering first-touch page placement
+     * on its CMG. This aligns with how tf_qmatvec_pool distributes rows. */
+    for (uint64_t ti = 0; ti < gguf->n_tensors; ti++) {
+        void *tdata = gguf_tensor_data(gguf, (int)ti);
+        size_t tsz = gguf_tensor_size(gguf, (int)ti);
+        if (!tdata || tsz == 0) continue;
+
+        size_t toff = gguf->data_offset + ((uint8_t *)tdata - gguf->data);
+
+        /* Determine row structure. For 2D+ tensors, distribute rows.
+         * For 1D tensors (norms, biases), just load from thread 0. */
+        int n_dims = (int)gguf->tensors[ti].n_dims;
+        int n_cols = (int)gguf->tensors[ti].dims[0];
+        int n_rows = 1;
+        for (int d = 1; d < n_dims; d++) n_rows *= (int)gguf->tensors[ti].dims[d];
+
+        size_t row_bytes = (n_rows > 0) ? tsz / (size_t)n_rows : tsz;
+
+        if (n_rows < nt || n_dims <= 1) {
+            /* Small tensor or 1D: single-thread load */
+            tf_numa_pread_task task = {tdata, fd, toff, 0, tsz};
+            tf_numa_pread_worker(&task);
+        } else {
+            /* Distribute rows across threads */
+            tf_numa_pread_task *tasks = (tf_numa_pread_task *)alloca(nt * sizeof(tf_numa_pread_task));
+            int rp = n_rows / nt, re = n_rows % nt, ro = 0;
+            for (int t = 0; t < nt; t++) {
+                int rc = rp + (t < re ? 1 : 0);
+                size_t s = (size_t)ro * row_bytes;
+                size_t e = (size_t)(ro + rc) * row_bytes;
+                if (e > tsz) e = tsz;
+                tasks[t] = (tf_numa_pread_task){tdata, fd, toff, s, e};
+                ro += rc;
+            }
+            tf_pool_dispatch(m, tf_numa_pread_worker, tasks, sizeof(tf_numa_pread_task));
+        }
+    }
+    (void)nt;
+
+    fprintf(stderr, "transformer: NUMA distribution complete\n");
 }
 
 /* ---- SSM Delta-Net forward (single token, autoregressive) ---- */
