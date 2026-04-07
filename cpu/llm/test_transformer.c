@@ -89,8 +89,8 @@ int main(int argc, char **argv) {
 
     /* Tokenize prompt */
     fprintf(stderr, "Prompt: \"%s\"\n", prompt);
-    int32_t tokens[256];
-    int n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, 256);
+    int32_t tokens[2048];
+    int n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, 2048);
     fprintf(stderr, "Tokens (%d):", n_tokens);
     for (int i = 0; i < n_tokens; i++) {
         fprintf(stderr, " %d(\"%s\")", tokens[i], bpe_token_to_str(vocab, tokens[i]));
