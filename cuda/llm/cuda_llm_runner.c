@@ -5080,7 +5080,6 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 }
             }
 
-
             /* Output projection */
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
@@ -5133,7 +5132,6 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 /* Residual add */
                 launch_add(r, r->d_x, r->d_ple_proj, n_embd);
             }
-
 
             /* Layer output scale */
             if (cl->layer_scale_val != 1.0f) {

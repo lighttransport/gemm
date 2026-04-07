@@ -387,23 +387,24 @@ static void g4v_rope_2d(float *qk, int n_heads, int head_dim, int n_tokens,
     }
 }
 
-/* ViT block forward for all N tokens at once */
+/* ViT block forward for all N tokens at once.
+ * attn_scratch: caller-allocated [N*dim*6 + N*N] floats
+ * ffn_scratch:  caller-allocated [N*ff*3] floats */
 static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
-                               const int *pos_x, const int *pos_y, float *tmp) {
+                               const int *pos_x, const int *pos_y, float *tmp,
+                               float *attn_scratch, float *ffn_scratch) {
     int dim = vm->dim;
     int n_heads = vm->n_heads;
     int hd = vm->head_dim;
     float eps = vm->ln_eps;
 
-    /* Allocate all scratch in one block: 5 × [N, dim] for attention + 1 × [N, dim] for FFN proj */
-    size_t attn_scratch_size = (size_t)N * dim * 6 * sizeof(float);
-    float *attn_scratch = (float *)malloc(attn_scratch_size);
     float *xn = attn_scratch;
     float *q  = attn_scratch + N * dim;
     float *k  = attn_scratch + N * dim * 2;
     float *v  = attn_scratch + N * dim * 3;
     float *att_out = attn_scratch + N * dim * 4;
     float *proj_out = attn_scratch + N * dim * 5;
+    float *scores = attn_scratch + N * dim * 6; /* [N * N] */
 
     /* Pre-attention RMSNorm */
     for (int t = 0; t < N; t++)
@@ -427,7 +428,6 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
     /* Multi-head attention (all N tokens attend to all N tokens) */
     {
         float scale = 1.0f; /* Gemma4 vision uses scale=1.0 since Q/K are normalized */
-        float *scores = (float *)malloc(N * N * sizeof(float));
 
         memset(att_out, 0, N * dim * sizeof(float));
         for (int h = 0; h < n_heads; h++) {
@@ -462,7 +462,6 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
                 }
             }
         }
-        free(scores);
     }
 
     /* Output projection (proj_out already allocated in attn_scratch) */
@@ -480,9 +479,8 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
     for (int t = 0; t < N; t++)
         g4v_rmsnorm(xn + t * dim, x + t * dim, &blk->ln2_w, dim, eps, tmp);
 
-    /* Gate/Up projections — single allocation for 3 × [N, ff] */
+    /* Gate/Up projections */
     int ff = vm->ffn_dim;
-    float *ffn_scratch = (float *)malloc((size_t)N * ff * 3 * sizeof(float));
     float *gate = ffn_scratch;
     float *up   = ffn_scratch + N * ff;
     float *ffn_out = ffn_scratch + N * ff * 2;
@@ -508,8 +506,7 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
     /* Residual add */
     for (int i = 0; i < N * dim; i++) x[i] += ffn_proj[i];
 
-    free(attn_scratch); /* xn, q, k, v, att_out, proj_out */
-    free(ffn_scratch);  /* gate, up, ffn_out */
+    /* scratch owned by caller */
 }
 
 /* Average pooling: [ph, pw, dim] -> [ph/k, pw/k, dim] */
@@ -570,12 +567,15 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
             pos_y[y * pw + x] = y;
         }
 
-    /* 5. ViT transformer blocks */
-    float *tmp = (float *)malloc(dim * 16 * sizeof(float)); /* scratch */
+    /* 5. ViT transformer blocks — allocate scratch once for all blocks */
+    float *tmp = (float *)malloc(dim * 16 * sizeof(float));
+    float *attn_scratch = (float *)malloc(((size_t)N * dim * 6 + (size_t)N * N) * sizeof(float));
+    float *ffn_scratch  = (float *)malloc((size_t)N * vm->ffn_dim * 3 * sizeof(float));
     for (int b = 0; b < vm->n_blocks; b++) {
-        g4v_block_forward(vm, &vm->blocks[b], patches, N, pos_x, pos_y, tmp);
-        (void)0; /* blocks processed */
+        g4v_block_forward(vm, &vm->blocks[b], patches, N, pos_x, pos_y, tmp,
+                          attn_scratch, ffn_scratch);
     }
+    free(attn_scratch); free(ffn_scratch);
     free(pos_x); free(pos_y); free(tmp);
 
     /* 6. Average pooling: [ph, pw, dim] -> [ph/merge, pw/merge, dim] */
