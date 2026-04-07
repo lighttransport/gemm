@@ -2794,6 +2794,24 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 4b. raw_rmsnorm_heads_f32: Per-head RMSNorm without learned weight (for V norm) ---- */\n"
+"__global__ void raw_rmsnorm_heads_f32(float *vec, int n_heads, int head_dim, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int tid = threadIdx.x;\n"
+"    float *v = vec + h * head_dim;\n"
+"    float val = (tid < head_dim) ? v[tid] : 0.0f;\n"
+"    sdata[tid] = val * val;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    if (tid < head_dim) v[tid] = val * scale;\n"
+"}\n"
+"\n"
 "/* ---- Gemma4 kernels ---- */\n"
 "\n"
 "/* GELU(gate) * up: gate[i] = gelu(gate[i]) * up[i] */\n"
@@ -3182,6 +3200,7 @@ struct cuda_llm_runner {
     qtensor h_ple_model_proj;       /* BF16 per_layer_model_proj */
     qtensor h_ple_proj_norm;        /* F32 per_layer_proj_norm */
     /* Gemma4 kernel functions */
+    CUfunction fn_raw_rmsnorm_heads_f32;
     CUfunction fn_gelu_mul_f32;
     CUfunction fn_gelu_elementwise_mul_f32;
     CUfunction fn_scale_f32;
@@ -3377,6 +3396,7 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
+    GET_FUNC(raw_rmsnorm_heads_f32);
     /* Gemma4 kernels */
     GET_FUNC(gelu_mul_f32);
     GET_FUNC(gelu_elementwise_mul_f32);
@@ -4980,9 +5000,24 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             int local_kv_dim = n_kv_heads * hd;
             int local_q_dim  = n_heads * hd;
 
+            /* Debug helper for Gemma4 layer 0 */
+            #define G4_DBG(label, dptr, sz) do { \
+                if (r->debug_layers >= 2 && l == 0) { \
+                    cuStreamSynchronize(r->stream); \
+                    float _b[8]; int _n = (sz)<8?(sz):8; \
+                    cuMemcpyDtoH(_b, (dptr), _n*sizeof(float)); \
+                    float _s=0; for(int _i=0;_i<_n;_i++) _s+=_b[_i]*_b[_i]; \
+                    fprintf(stderr, "  [G4 L0] %-20s norm~%.3f [%.4f,%.4f,%.4f,%.4f]\n", \
+                            label, sqrtf(_s*(float)(sz)/(float)_n), _b[0],_b[1],_b[2],_b[3]); \
+                } \
+            } while(0)
+
+            G4_DBG("attn_norm_in(xb)", r->d_xb, n_embd);
+
             /* Q projection */
             launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb,
                               cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+            G4_DBG("Q_proj", r->d_q, local_q_dim);
 
             /* K/V projections (skip if sharing KV) */
             if (cl->shared_kv_source < 0) {
@@ -4995,14 +5030,21 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             /* Q/K/V norm */
             if (cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, hd, eps);
+                G4_DBG("Q_normed", r->d_q, local_q_dim);
                 if (cl->shared_kv_source < 0) {
                     if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, hd, eps);
-                    /* V norm: raw RMSNorm per-head (no learned weight).
-                     * The qknorm kernel applies weight, so we need the V after qknorm to be
-                     * just x/rms(x). We achieve this by using the K norm weight (close to 1.0)
-                     * or by a dedicated launch. For correctness, skip V norm for now —
-                     * the CPU reference also uses raw RMSNorm on V which is close to identity
-                     * for normalized values. TODO: add a raw per-head RMSNorm kernel. */
+                    G4_DBG("K_normed", r->d_k, local_kv_dim);
+                    /* V norm: raw RMSNorm per-head (no learned weight) */
+                    {
+                        int block_dim = hd;
+                        /* Round up to power of 2 for reduction */
+                        int bd = 1; while (bd < block_dim) bd <<= 1;
+                        void *vargs[] = { &r->d_v, &n_kv_heads, &hd, &eps };
+                        cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32,
+                                       n_kv_heads, 1, 1, bd, 1, 1,
+                                       bd * sizeof(float), r->stream, vargs, NULL);
+                    }
+                    G4_DBG("V_normed", r->d_v, local_kv_dim);
                 }
             }
 
@@ -5056,15 +5098,20 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 }
             }
 
+            G4_DBG("attn_wsum", r->d_xb2, local_q_dim);
+
             /* Output projection */
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+            G4_DBG("attn_out", r->d_xb, n_embd);
 
             /* Post-attention RMSNorm */
             launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_attn_norm_w, n_embd, eps);
+            G4_DBG("post_attn_norm", r->d_xb, n_embd);
 
             /* Residual: x += xb */
             launch_add(r, r->d_x, r->d_xb, n_embd);
+            G4_DBG("attn_residual", r->d_x, n_embd);
 
             /* FFN with GELU */
             launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
@@ -5075,12 +5122,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             launch_gelu_mul(r, r->d_gate, r->d_up, n_ff);
             launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                               cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+            G4_DBG("ffn_down", r->d_xb, n_embd);
 
             /* Post-FFN RMSNorm */
             launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_ffw_norm_w, n_embd, eps);
 
             /* Residual: x += xb */
             launch_add(r, r->d_x, r->d_xb, n_embd);
+            G4_DBG("ffn_residual", r->d_x, n_embd);
 
             /* Per-layer embedding injection */
             if (r->d_ple_combined) {
@@ -5109,10 +5158,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 launch_add(r, r->d_x, r->d_ple_proj, n_embd);
             }
 
+            G4_DBG("after_ple", r->d_x, n_embd);
+
             /* Layer output scale */
             if (cl->layer_scale_val != 1.0f) {
                 launch_scale(r, r->d_x, cl->layer_scale_val, n_embd);
             }
+            G4_DBG("after_scale", r->d_x, n_embd);
+            #undef G4_DBG
 
         } else if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
@@ -5627,6 +5680,9 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
         }
 
+        /* Gemma4 already did its own residual + FFN above — skip shared code */
+        if (r->is_gemma4) goto cuda_layer_done;
+
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
 
@@ -5934,6 +5990,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
 
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
+
+        cuda_layer_done:
 
         /* DeepStack injection: add deepstack slice after each early layer */
         if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {

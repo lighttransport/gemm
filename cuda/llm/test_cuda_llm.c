@@ -153,6 +153,7 @@ int main(int argc, char **argv) {
 
     /* Load weights to GPU */
     fprintf(stderr, "\n=== Loading weights to GPU ===\n");
+    /* cuda_llm_set_debug(gpu, 1); */
     if (cuda_llm_load_weights(gpu, gguf, max_seq_len) != 0) {
         fprintf(stderr, "Failed to load weights to GPU\n");
         cuda_llm_free(gpu);
