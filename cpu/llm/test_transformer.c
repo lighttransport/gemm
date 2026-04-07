@@ -139,9 +139,11 @@ static int run_bench(int n_embd, int n_heads, int n_kv_heads, int head_dim,
 
     if (n_threads > 1) transformer_set_threads(m, n_threads);
 
-    /* Warmup: 1 forward pass */
-    for (int i = 0; i < n_embd; i++) m->x[i] = 0.01f * (i % 100);
-    tf_forward_blocks_range(m, 0, 0, 0, 0, 0, n_layers);
+    /* Warmup: 2 forward passes */
+    for (int w = 0; w < 2; w++) {
+        for (int i = 0; i < n_embd; i++) m->x[i] = 0.01f * (i % 100);
+        transformer_forward(m, 0, w);
+    }
 
     /* Benchmark */
     fprintf(stderr, "bench: running %d tokens with %d threads...\n", n_tokens, n_threads);
@@ -150,7 +152,7 @@ static int run_bench(int n_embd, int n_heads, int n_kv_heads, int head_dim,
 
     for (int t = 0; t < n_tokens; t++) {
         for (int i = 0; i < n_embd; i++) m->x[i] = 0.01f * ((t + i) % 100);
-        tf_forward_blocks_range(m, t % max_seq_len, t, t, t, 0, n_layers);
+        transformer_forward(m, 0, (t + 2) % max_seq_len);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);

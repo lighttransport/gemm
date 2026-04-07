@@ -2792,7 +2792,29 @@ typedef struct {
     int position, pos_t, pos_h, pos_w;
 } tf_persistent_ctx;
 
-/* Spin barrier: sense-reversing, no syscalls. */
+/* ---- Barrier implementations ---- */
+
+/* A64FX hardware barrier via W0 window register (intra-CMG only).
+ * Uses WFE (wait-for-event) instead of spin-polling — near-zero power
+ * and ~20 cycle latency. Requires libfjomphk.so (link with -Kopenmp)
+ * to have initialized the barrier blade. */
+#if defined(__aarch64__)
+static inline void tf_hw_barrier_w0(void) {
+    uint64_t bst, lbsy;
+    __asm__ __volatile__("mrs %0, S3_3_C15_C15_0" : "=r"(lbsy));
+    bst = (~lbsy) & 1ULL;
+    __asm__ __volatile__("msr S3_3_C15_C15_0, %0" :: "r"(bst));
+    __asm__ __volatile__("sevl");
+    do {
+        __asm__ __volatile__("wfe");
+        __asm__ __volatile__("mrs %0, S3_3_C15_C15_0" : "=r"(lbsy));
+        lbsy &= 1ULL;
+    } while (lbsy != bst);
+}
+#endif
+
+/* Software spin barrier: sense-reversing, no syscalls.
+ * Used for cross-CMG sync or when hardware barrier is unavailable. */
 static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt) {
     int my_sense = !(*local_sense);
     if (__sync_add_and_fetch(&m->bar_count, 1) == nt) {
@@ -2804,6 +2826,50 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
             tf_cpu_pause();
     }
     *local_sense = my_sense;
+}
+
+/* Two-level barrier for multi-CMG:
+ * Level 1: Hardware barrier within each CMG (cores on same CMG sync via W0)
+ * Level 2: Software atomic barrier across CMG leaders
+ *
+ * For single-CMG (all threads on 1 CMG): use hardware barrier directly.
+ * For multi-CMG: each CMG's threads hw-barrier locally, then one thread
+ * per CMG does a software barrier with other CMG leaders. */
+static inline void tf_barrier(transformer_model *m, int tid, int *local_sense, int nt) {
+#if defined(__aarch64__)
+    int n_cmgs = m->numa.enabled ? m->numa.n_cmgs : 1;
+    if (n_cmgs <= 1 || nt <= n_cmgs) {
+        /* Single CMG or 1 thread/CMG: just use hw barrier */
+        tf_hw_barrier_w0();
+    } else {
+        /* Multi-CMG with multiple threads per CMG */
+        int threads_per_cmg = nt / n_cmgs;
+        int cmg_id = tid / threads_per_cmg;
+        int local_tid = tid % threads_per_cmg;
+
+        /* Level 1: intra-CMG hardware barrier */
+        tf_hw_barrier_w0();
+
+        /* Level 2: inter-CMG software barrier (only CMG leaders, local_tid==0) */
+        if (local_tid == 0) {
+            int my_sense = !(*local_sense);
+            if (__sync_add_and_fetch(&m->bar_count, 1) == n_cmgs) {
+                m->bar_count = 0;
+                __sync_synchronize();
+                m->bar_sense = my_sense;
+            } else {
+                while (m->bar_sense != my_sense)
+                    tf_cpu_pause();
+            }
+            *local_sense = my_sense;
+        }
+
+        /* Level 1 again: intra-CMG hw barrier to release non-leaders */
+        tf_hw_barrier_w0();
+    }
+#else
+    tf_spin_barrier(m, local_sense, nt);
+#endif
 }
 
 /* Per-thread matvec: thread tid computes its static row partition */
@@ -3084,7 +3150,7 @@ float *transformer_forward_logits(transformer_model *model, int32_t token_id, in
 }
 
 static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
-    if (m->n_threads > 1 && m->pool_alive)
+    if (m->n_threads > 1 && m->pool_alive && getenv("PERSISTENT_FWD"))
         return tf_forward_persistent(m, position, pos_t, pos_h, pos_w);
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
