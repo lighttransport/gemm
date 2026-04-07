@@ -143,7 +143,7 @@ typedef struct {
     int rope_inv_freq_len;       /* head_dim/2 */
     int rope_mrope_inv_freq_len; /* sect_dims */
 
-    /* Thread pool (persistent workers, no per-call pthread_create) */
+    /* Thread pool (persistent workers with cond-var sleep between dispatches) */
     pthread_t *pool_threads;   /* [n_threads] worker threads */
     void *(*pool_fn)(void *);  /* current work function */
     void *pool_args;           /* array of per-thread task structs */
@@ -151,6 +151,8 @@ typedef struct {
     volatile int pool_phase;   /* incremented to signal work */
     volatile int pool_done;    /* number of workers done */
     int pool_alive;            /* 1 if pool is running */
+    pthread_mutex_t pool_mutex;/* protects pool_phase signaling */
+    pthread_cond_t pool_cond;  /* workers sleep here between dispatches */
     volatile int bar_count;    /* barrier arrival counter */
     volatile int bar_sense;    /* barrier sense flag (alternates 0/1) */
 
@@ -1941,11 +1943,13 @@ static void *tf_pool_worker_main(void *arg) {
 
     int last_phase = 0;
     while (1) {
-        /* Spin-wait for work */
-        while (m->pool_phase == last_phase) {
-            if (!m->pool_alive) return NULL;
-            tf_cpu_pause();
-        }
+        /* Sleep until dispatcher signals new work via cond_broadcast.
+         * Workers consume ZERO bandwidth while sleeping (futex-based). */
+        pthread_mutex_lock(&m->pool_mutex);
+        while (m->pool_phase == last_phase && m->pool_alive)
+            pthread_cond_wait(&m->pool_cond, &m->pool_mutex);
+        pthread_mutex_unlock(&m->pool_mutex);
+
         last_phase = m->pool_phase;
         if (!m->pool_alive) return NULL;
 
@@ -1961,13 +1965,18 @@ static void *tf_pool_worker_main(void *arg) {
 
 static void tf_pool_shutdown(transformer_model *model) {
     if (!model->pool_alive) return;
+    /* Signal workers to exit */
+    pthread_mutex_lock(&model->pool_mutex);
     model->pool_alive = 0;
-    __sync_synchronize();
     model->pool_phase++;
+    pthread_cond_broadcast(&model->pool_cond);
+    pthread_mutex_unlock(&model->pool_mutex);
     for (int t = 1; t < model->n_threads; t++)
         pthread_join(model->pool_threads[t], NULL);
     free(model->pool_threads);
     model->pool_threads = NULL;
+    pthread_mutex_destroy(&model->pool_mutex);
+    pthread_cond_destroy(&model->pool_cond);
 }
 
 static void tf_pool_start(transformer_model *model) {
@@ -1976,9 +1985,9 @@ static void tf_pool_start(transformer_model *model) {
     model->pool_phase = 0;
     model->pool_done = 0;
     model->pool_alive = 1;
+    pthread_mutex_init(&model->pool_mutex, NULL);
+    pthread_cond_init(&model->pool_cond, NULL);
     __sync_synchronize();
-    /* Create nt-1 background workers (tid 1..nt-1).
-     * tid 0 is executed by the main thread in tf_pool_dispatch. */
     for (int t = 1; t < nt; t++) {
         tf_pool_worker_ctx *ctx = (tf_pool_worker_ctx *)malloc(sizeof(*ctx));
         ctx->model = model;
@@ -1987,23 +1996,28 @@ static void tf_pool_start(transformer_model *model) {
     }
 }
 
-/* Dispatch work to the thread pool: calls fn(args + tid * arg_stride) for each thread */
+/* Dispatch work to the thread pool: calls fn(args + tid * arg_stride) for each thread.
+ * Workers sleep on cond_var between dispatches — zero bandwidth when idle. */
 static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
                               void *args, size_t arg_stride) {
     int nt = model->n_threads;
     model->pool_fn = fn;
     model->pool_args = args;
     model->pool_arg_stride = arg_stride;
-
     model->pool_done = 0;
     __sync_synchronize();
-    model->pool_phase++;
 
-    /* Main thread executes worker 0's task directly instead of spin-waiting */
+    /* Wake workers via cond_broadcast */
+    pthread_mutex_lock(&model->pool_mutex);
+    model->pool_phase++;
+    pthread_cond_broadcast(&model->pool_cond);
+    pthread_mutex_unlock(&model->pool_mutex);
+
+    /* Main thread executes worker 0's task directly */
     void *task0 = (char *)args;
     fn(task0);
 
-    /* Wait for remaining workers (1..nt-1) */
+    /* Wait for remaining workers (brief spin — workers are doing useful work) */
     while (model->pool_done < nt - 1)
         tf_cpu_pause();
 }
