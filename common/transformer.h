@@ -157,6 +157,15 @@ typedef struct {
     int tp_size;               /* size of the TP group (1 if no TP) */
     void (*tp_allreduce_fn)(float *buf, int count, void *ctx);  /* allreduce callback */
     void *tp_allreduce_ctx;    /* opaque context passed to allreduce (e.g. parallel_config*) */
+
+    /* NUMA allocator state */
+    struct {
+        int n_cmgs;                   /* number of CMGs (default: 4) */
+        size_t per_cmg_budget;        /* usable bytes per CMG (default: 6GB) */
+        size_t per_cmg_used[8];       /* current usage per CMG */
+        size_t alignment;             /* minimum alignment (default: 2MB) */
+        int enabled;                  /* 0=fallback, 1=active */
+    } numa;
 } transformer_model;
 
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len);
@@ -164,7 +173,12 @@ void transformer_free(transformer_model *model);
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
-void transformer_numa_distribute(transformer_model *m, const gguf_context *gguf);
+
+/* Configure NUMA-aware weight/buffer distribution across CMGs.
+ * Must be called after transformer_set_threads, before inference.
+ * Env vars: NUMA_DISTRIBUTE=1 (enable), NUMA_N_CMGS (default 4),
+ *           NUMA_CMG_BUDGET_GB (default 6), NUMA_ALIGNMENT (default 2MB). */
+void transformer_numa_setup(transformer_model *m, const gguf_context *gguf);
 
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
  * For embedding models (no output projection), this is the final hidden state. */
@@ -323,15 +337,25 @@ static float tf_get_float(const gguf_context *gguf, const char *key, float defau
     return default_val;
 }
 
-/* ---- Aligned allocation helper ---- */
-/* Returns zeroed memory aligned to 'alignment' bytes.
- * alignment must be a power of 2 and >= sizeof(void*). */
+/* ---- Aligned allocation helpers ---- */
+/* Returns zeroed memory aligned to 'alignment' bytes. */
 static void *tf_aligned_calloc(size_t alignment, size_t count, size_t elem_size) {
     size_t size = count * elem_size;
-    size = (size + alignment - 1) & ~(alignment - 1);  /* round up */
+    size = (size + alignment - 1) & ~(alignment - 1);
     void *p = NULL;
     if (posix_memalign(&p, alignment, size) != 0) return NULL;
     memset(p, 0, size);
+    return p;
+}
+
+/* Allocate aligned memory WITHOUT touching pages.
+ * With demand paging, first-touch from a worker thread will place pages
+ * on that thread's NUMA node. Safe for buffers that are always written
+ * before read (e.g. dequant scratch). */
+static void *tf_aligned_alloc_notouch(size_t alignment, size_t size) {
+    size = (size + alignment - 1) & ~(alignment - 1);
+    void *p = NULL;
+    if (posix_memalign(&p, alignment, size) != 0) return NULL;
     return p;
 }
 
@@ -1904,7 +1928,11 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
     model->thread_tmp[0] = model->matvec_tmp;
     for (int t = 1; t < n_threads; t++) {
-        model->thread_tmp[t] = (float *)tf_aligned_calloc(256, max_dim, sizeof(float));
+        /* Use notouch alloc: dequant always writes before read, so uninitialized is safe.
+         * With demand paging, first actual use from worker thread t places pages on
+         * thread t's NUMA node for optimal locality. */
+        model->thread_tmp[t] = (float *)tf_aligned_alloc_notouch(256,
+                                    (size_t)max_dim * sizeof(float));
     }
 
     /* Start new pool */
@@ -1912,93 +1940,198 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
 }
 
-/* ---- NUMA first-touch weight distribution ---- */
+/* ---- NUMA-aware memory allocator ---- */
 /* With demand paging (XOS_MMM_L_PAGING_POLICY=demand:demand:demand), pages are
- * placed on the NUMA node of the first-touching core. This function dispatches
- * a parallel read pass over each weight tensor so that each thread touches its
- * own row partition, placing those pages on the thread's CMG. */
+ * placed on the NUMA node of the first-touching core. The NUMA allocator ensures
+ * each thread's data partition is first-touched by that thread, placing pages on
+ * the thread's CMG for optimal memory bandwidth. */
 
+/* Task for parallel pread (weight loading) or memset (buffer first-touch) */
 typedef struct {
-    void *dst;         /* destination buffer */
-    int fd;            /* file descriptor */
-    size_t file_off;   /* base file offset */
-    size_t byte_start; /* byte offset within dst to start writing */
-    size_t byte_end;   /* byte offset within dst to stop writing */
-} tf_numa_pread_task;
+    void *dst;
+    int fd;            /* -1 for memset-only (no pread) */
+    size_t file_off;   /* base file offset (ignored if fd < 0) */
+    size_t byte_start;
+    size_t byte_end;
+} tf_numa_task;
 
 static void *tf_numa_pread_worker(void *arg) {
-    tf_numa_pread_task *t = (tf_numa_pread_task *)arg;
+    tf_numa_task *t = (tf_numa_task *)arg;
     uint8_t *base = (uint8_t *)t->dst;
     size_t start = t->byte_start;
     size_t len   = t->byte_end - start;
     if (len == 0) return NULL;
-
-    /* pread into our partition — first-touch places pages on this thread's CMG */
     size_t off = 0;
     while (off < len) {
         size_t chunk = len - off;
-        if (chunk > 1024 * 1024) chunk = 1024 * 1024; /* limit per-call to 1MB */
-        ssize_t n = pread(t->fd, base + start + off, chunk, (off_t)(t->file_off + start + off));
+        if (chunk > 1024 * 1024) chunk = 1024 * 1024;
+        ssize_t n = pread(t->fd, base + start + off, chunk,
+                          (off_t)(t->file_off + start + off));
         if (n <= 0) break;
         off += (size_t)n;
     }
     return NULL;
 }
 
-void transformer_numa_distribute(transformer_model *m, const gguf_context *gguf) {
-    if (m->n_threads <= 1 || !m->pool_alive) return;
-    if (gguf->fd < 0) {
-        fprintf(stderr, "transformer: NUMA distribute requires open file descriptor\n");
+static void *tf_numa_memset_worker(void *arg) {
+    tf_numa_task *t = (tf_numa_task *)arg;
+    uint8_t *base = (uint8_t *)t->dst;
+    size_t len = t->byte_end - t->byte_start;
+    if (len > 0) memset(base + t->byte_start, 0, len);
+    return NULL;
+}
+
+/* Initialize NUMA config from environment or defaults */
+static void tf_numa_init(transformer_model *m) {
+    memset(&m->numa, 0, sizeof(m->numa));
+    m->numa.n_cmgs = 4;
+    m->numa.per_cmg_budget = 6ULL * 1024 * 1024 * 1024;
+    m->numa.alignment = 2 * 1024 * 1024;
+    m->numa.enabled = 0;
+
+    const char *env;
+    if ((env = getenv("NUMA_N_CMGS")))       m->numa.n_cmgs = atoi(env);
+    if ((env = getenv("NUMA_CMG_BUDGET_GB"))) m->numa.per_cmg_budget = (size_t)(atof(env) * 1024.0 * 1024.0 * 1024.0);
+    if ((env = getenv("NUMA_ALIGNMENT")))     m->numa.alignment = (size_t)atol(env);
+    if (getenv("NUMA_DISTRIBUTE"))            m->numa.enabled = 1;
+}
+
+/* Distribute a buffer across threads via parallel memset (first-touch placement) */
+static void tf_numa_distribute_buffer(transformer_model *m, void *buf, size_t total_bytes) {
+    int nt = m->n_threads;
+    if (!buf || total_bytes == 0 || nt <= 1) return;
+
+    tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+    size_t part = total_bytes / nt;
+    size_t off = 0;
+    for (int t = 0; t < nt; t++) {
+        size_t end = (t == nt - 1) ? total_bytes : off + part;
+        tasks[t] = (tf_numa_task){buf, -1, 0, off, end};
+        off = end;
+    }
+    tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
+}
+
+/* Print per-CMG usage */
+static void tf_numa_print_usage(transformer_model *m) {
+    int nc = m->numa.n_cmgs < m->n_threads ? m->numa.n_cmgs : m->n_threads;
+    fprintf(stderr, "numa: per-CMG usage:");
+    for (int c = 0; c < nc; c++)
+        fprintf(stderr, " CMG%d=%.1fMB", c, (double)m->numa.per_cmg_used[c] / (1024.0 * 1024.0));
+    fprintf(stderr, " (budget=%.1fGB)\n", (double)m->numa.per_cmg_budget / (1024.0 * 1024.0 * 1024.0));
+}
+
+void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
+    tf_numa_init(m);
+    if (!m->numa.enabled || m->n_threads <= 1 || !m->pool_alive) {
+        m->numa.enabled = 0;
         return;
     }
 
-    fprintf(stderr, "transformer: NUMA parallel-loading weights across %d threads (fd=%d, data_offset=%zu, data=%p)...\n",
-            m->n_threads, gguf->fd, (size_t)gguf->data_offset, (void *)gguf->data);
-
-    int fd = gguf->fd;
     int nt = m->n_threads;
+    int fd = gguf->fd;
 
-    /* For each tensor in the GGUF, do parallel pread with row-level partitioning.
-     * Each thread reads its row partition, triggering first-touch page placement
-     * on its CMG. This aligns with how tf_qmatvec_pool distributes rows. */
-    for (uint64_t ti = 0; ti < gguf->n_tensors; ti++) {
-        void *tdata = gguf_tensor_data(gguf, (int)ti);
-        size_t tsz = gguf_tensor_size(gguf, (int)ti);
-        if (!tdata || tsz == 0) continue;
+    fprintf(stderr, "numa: setup %d CMGs, %.1fGB/CMG, %d threads\n",
+            m->numa.n_cmgs,
+            (double)m->numa.per_cmg_budget / (1024.0 * 1024.0 * 1024.0), nt);
 
-        size_t toff = gguf->data_offset + ((uint8_t *)tdata - gguf->data);
+    /* ---- Phase 1: Distribute weight data via parallel pread ---- */
+    if (fd >= 0) {
+        fprintf(stderr, "numa: phase 1 - loading weights (fd=%d, %zu tensors)...\n",
+                fd, (size_t)gguf->n_tensors);
+        size_t weight_bytes = 0;
 
-        /* Determine row structure. For 2D+ tensors, distribute rows.
-         * For 1D tensors (norms, biases), just load from thread 0. */
-        int n_dims = (int)gguf->tensors[ti].n_dims;
-        int n_cols = (int)gguf->tensors[ti].dims[0];
-        int n_rows = 1;
-        for (int d = 1; d < n_dims; d++) n_rows *= (int)gguf->tensors[ti].dims[d];
+        for (uint64_t ti = 0; ti < gguf->n_tensors; ti++) {
+            void *tdata = gguf_tensor_data(gguf, (int)ti);
+            size_t tsz = gguf_tensor_size(gguf, (int)ti);
+            if (!tdata || tsz == 0) continue;
 
-        size_t row_bytes = (n_rows > 0) ? tsz / (size_t)n_rows : tsz;
+            size_t toff = gguf->data_offset + ((uint8_t *)tdata - gguf->data);
+            int n_dims = (int)gguf->tensors[ti].n_dims;
+            int n_rows = 1;
+            for (int d = 1; d < n_dims; d++)
+                n_rows *= (int)gguf->tensors[ti].dims[d];
+            size_t row_bytes = (n_rows > 0) ? tsz / (size_t)n_rows : tsz;
 
-        if (n_rows < nt || n_dims <= 1) {
-            /* Small tensor or 1D: single-thread load */
-            tf_numa_pread_task task = {tdata, fd, toff, 0, tsz};
-            tf_numa_pread_worker(&task);
-        } else {
-            /* Distribute rows across threads */
-            tf_numa_pread_task *tasks = (tf_numa_pread_task *)alloca(nt * sizeof(tf_numa_pread_task));
-            int rp = n_rows / nt, re = n_rows % nt, ro = 0;
-            for (int t = 0; t < nt; t++) {
-                int rc = rp + (t < re ? 1 : 0);
-                size_t s = (size_t)ro * row_bytes;
-                size_t e = (size_t)(ro + rc) * row_bytes;
-                if (e > tsz) e = tsz;
-                tasks[t] = (tf_numa_pread_task){tdata, fd, toff, s, e};
-                ro += rc;
+            if (n_rows < nt || n_dims <= 1) {
+                tf_numa_task task = {tdata, fd, toff, 0, tsz};
+                tf_numa_pread_worker(&task);
+                m->numa.per_cmg_used[0] += tsz;
+            } else {
+                tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+                int rp = n_rows / nt, re = n_rows % nt, ro = 0;
+                for (int t = 0; t < nt; t++) {
+                    int rc = rp + (t < re ? 1 : 0);
+                    size_t s = (size_t)ro * row_bytes;
+                    size_t e = (size_t)(ro + rc) * row_bytes;
+                    if (e > tsz) e = tsz;
+                    tasks[t] = (tf_numa_task){tdata, fd, toff, s, e};
+                    int cmg = t < m->numa.n_cmgs ? t : t % m->numa.n_cmgs;
+                    m->numa.per_cmg_used[cmg] += e - s;
+                    ro += rc;
+                }
+                tf_pool_dispatch(m, tf_numa_pread_worker, tasks, sizeof(tf_numa_task));
             }
-            tf_pool_dispatch(m, tf_numa_pread_worker, tasks, sizeof(tf_numa_pread_task));
+            weight_bytes += tsz;
         }
+        fprintf(stderr, "numa: phase 1 done (%.1fGB weights loaded)\n",
+                (double)weight_bytes / (1024.0 * 1024.0 * 1024.0));
     }
-    (void)nt;
 
-    fprintf(stderr, "transformer: NUMA distribution complete\n");
+    /* ---- Phase 2: First-touch thread scratch from each worker ---- */
+    /* thread_tmp[t>=1] allocated with notouch; first memset places pages on CMG t */
+    {
+        int max_ff = tf_compute_max_ff(m);
+        int max_dim = m->n_embd > max_ff ? m->n_embd : max_ff;
+        size_t buf_sz = (size_t)max_dim * sizeof(float);
+        tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+        for (int t = 0; t < nt; t++) {
+            tasks[t] = (tf_numa_task){m->thread_tmp[t], -1, 0, 0, buf_sz};
+        }
+        tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
+        fprintf(stderr, "numa: phase 2 - thread scratch distributed\n");
+    }
+
+    /* ---- Phase 3: Distribute logits buffer (row-partitioned) ---- */
+    if (m->logits && m->n_vocab > 0) {
+        size_t logits_sz = (size_t)m->n_vocab * sizeof(float);
+        tf_numa_distribute_buffer(m, m->logits, logits_sz);
+        size_t per_cmg = logits_sz / nt;
+        for (int t = 0; t < nt && t < m->numa.n_cmgs; t++)
+            m->numa.per_cmg_used[t] += per_cmg;
+        fprintf(stderr, "numa: phase 3 - logits distributed (%.1fKB)\n",
+                (double)logits_sz / 1024.0);
+    }
+
+    /* ---- Phase 4: Distribute SSM recurrent state (head-partitioned) ---- */
+    if (m->is_hybrid && m->recurrent_state) {
+        int dt_rank = m->ssm_dt_rank;
+        int d2 = m->ssm_d_state * m->ssm_d_state;
+        size_t head_bytes = (size_t)d2 * sizeof(float);
+        int distributed = 0;
+
+        for (int l = 0; l < m->n_layers; l++) {
+            if (!m->layers[l].is_ssm || !m->recurrent_state[l]) continue;
+            if (dt_rank < nt) continue;
+
+            tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+            int hp = dt_rank / nt, he = dt_rank % nt, ho = 0;
+            for (int t = 0; t < nt; t++) {
+                int hc = hp + (t < he ? 1 : 0);
+                size_t s = (size_t)ho * head_bytes;
+                size_t e = (size_t)(ho + hc) * head_bytes;
+                tasks[t] = (tf_numa_task){m->recurrent_state[l], -1, 0, s, e};
+                ho += hc;
+            }
+            tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
+            distributed++;
+        }
+        if (distributed > 0)
+            fprintf(stderr, "numa: phase 4 - SSM state distributed (%d layers)\n", distributed);
+    }
+
+    tf_numa_print_usage(m);
+    fprintf(stderr, "numa: setup complete\n");
 }
 
 /* ---- SSM Delta-Net forward (single token, autoregressive) ---- */
