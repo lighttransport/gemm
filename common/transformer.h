@@ -2659,28 +2659,26 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
     if (layer_end > m->n_layers) layer_end = m->n_layers;
     if (layer_start < 0) layer_start = 0;
 
-    /* Gemma4: precompute per-layer inputs (token embedding + model projection, combined) */
+    /* Gemma4: precompute per-layer inputs (token embedding + model projection, combined).
+     * Uses heap allocation instead of alloca (total_ple = 256*42 = 10752 floats ≈ 43KB × 3). */
     float *ple_combined = NULL; /* [n_layers * n_embd_per_layer] if Gemma4 */
     if (m->is_gemma4 && m->per_layer_token_embd.data && m->current_token_id >= 0) {
         int ple_dim = m->n_embd_per_layer;
         int total_ple = ple_dim * m->n_layers;
-        ple_combined = (float *)alloca(total_ple * sizeof(float));
+        ple_combined = (float *)malloc(total_ple * sizeof(float));
+        float *tok_ple = (float *)malloc(total_ple * sizeof(float));
+        float *proj_out = (float *)malloc(total_ple * sizeof(float));
 
         /* 1. Look up per-layer token embedding: dequant row for this token */
-        float *tok_ple = (float *)alloca(total_ple * sizeof(float));
         dequant_row(m->per_layer_token_embd.type,
                     (const uint8_t *)m->per_layer_token_embd.data +
                     (size_t)m->current_token_id * tf_row_bytes(m->per_layer_token_embd.type, total_ple),
                     tok_ple, total_ple);
-        /* Scale by sqrt(n_embd_per_layer) */
         float ple_tok_scale = sqrtf((float)ple_dim);
         for (int i = 0; i < total_ple; i++) tok_ple[i] *= ple_tok_scale;
 
         /* 2. Project x through per_layer_model_proj: [10752, 2560] @ [2560] = [10752] */
-        float *proj_out = (float *)alloca(total_ple * sizeof(float));
         tf_qmatvec(proj_out, &m->per_layer_model_proj, m->x, total_ple, m->matvec_tmp);
-
-        /* Scale by 1/sqrt(n_embd) */
         float proj_scale = 1.0f / sqrtf((float)n_embd);
         for (int i = 0; i < total_ple; i++) proj_out[i] *= proj_scale;
 
@@ -2688,7 +2686,6 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         if (m->per_layer_proj_norm.data) {
             float norm_w[256];
             dequant_row(m->per_layer_proj_norm.type, m->per_layer_proj_norm.data, norm_w, ple_dim);
-            /* Reshape proj_out to [ple_dim, n_layers], apply RMSNorm to each [ple_dim] slice */
             for (int ll = 0; ll < m->n_layers; ll++) {
                 float *slice = proj_out + ll * ple_dim;
                 float ss = 0.0f;
@@ -2702,6 +2699,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         float input_scale = 1.0f / sqrtf(2.0f);
         for (int i = 0; i < total_ple; i++)
             ple_combined[i] = (proj_out[i] + tok_ple[i]) * input_scale;
+        free(proj_out);
+        free(tok_ple);
     }
 
     /* 2. Transformer blocks */
@@ -3226,6 +3225,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         TF_PROF_END("final_norm", 5.0 * n_embd, 0);
     }
 
+    free(ple_combined); /* NULL-safe: no-op if not Gemma4 */
     return m->x;
 }
 

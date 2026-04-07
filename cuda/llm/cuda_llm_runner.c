@@ -5000,24 +5000,9 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             int local_kv_dim = n_kv_heads * hd;
             int local_q_dim  = n_heads * hd;
 
-            /* Debug helper for Gemma4 layer 0 */
-            #define G4_DBG(label, dptr, sz) do { \
-                if (r->debug_layers >= 2 && l == 0) { \
-                    cuStreamSynchronize(r->stream); \
-                    float _b[8]; int _n = (sz)<8?(sz):8; \
-                    cuMemcpyDtoH(_b, (dptr), _n*sizeof(float)); \
-                    float _s=0; for(int _i=0;_i<_n;_i++) _s+=_b[_i]*_b[_i]; \
-                    fprintf(stderr, "  [G4 L0] %-20s norm~%.3f [%.4f,%.4f,%.4f,%.4f]\n", \
-                            label, sqrtf(_s*(float)(sz)/(float)_n), _b[0],_b[1],_b[2],_b[3]); \
-                } \
-            } while(0)
-
-            G4_DBG("attn_norm_in(xb)", r->d_xb, n_embd);
-
             /* Q projection */
             launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb,
                               cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
-            G4_DBG("Q_proj", r->d_q, local_q_dim);
 
             /* K/V projections (skip if sharing KV) */
             if (cl->shared_kv_source < 0) {
@@ -5030,10 +5015,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             /* Q/K/V norm */
             if (cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, hd, eps);
-                G4_DBG("Q_normed", r->d_q, local_q_dim);
                 if (cl->shared_kv_source < 0) {
                     if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, hd, eps);
-                    G4_DBG("K_normed", r->d_k, local_kv_dim);
                     /* V norm: raw RMSNorm per-head (no learned weight) */
                     {
                         int block_dim = hd;
@@ -5044,7 +5027,6 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                                        n_kv_heads, 1, 1, bd, 1, 1,
                                        bd * sizeof(float), r->stream, vargs, NULL);
                     }
-                    G4_DBG("V_normed", r->d_v, local_kv_dim);
                 }
             }
 
@@ -5098,20 +5080,16 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 }
             }
 
-            G4_DBG("attn_wsum", r->d_xb2, local_q_dim);
 
             /* Output projection */
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
-            G4_DBG("attn_out", r->d_xb, n_embd);
 
             /* Post-attention RMSNorm */
             launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_attn_norm_w, n_embd, eps);
-            G4_DBG("post_attn_norm", r->d_xb, n_embd);
 
             /* Residual: x += xb */
             launch_add(r, r->d_x, r->d_xb, n_embd);
-            G4_DBG("attn_residual", r->d_x, n_embd);
 
             /* FFN with GELU */
             launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
@@ -5122,14 +5100,12 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             launch_gelu_mul(r, r->d_gate, r->d_up, n_ff);
             launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                               cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
-            G4_DBG("ffn_down", r->d_xb, n_embd);
 
             /* Post-FFN RMSNorm */
             launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_ffw_norm_w, n_embd, eps);
 
             /* Residual: x += xb */
             launch_add(r, r->d_x, r->d_xb, n_embd);
-            G4_DBG("ffn_residual", r->d_x, n_embd);
 
             /* Per-layer embedding injection */
             if (r->d_ple_combined) {
@@ -5158,14 +5134,11 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 launch_add(r, r->d_x, r->d_ple_proj, n_embd);
             }
 
-            G4_DBG("after_ple", r->d_x, n_embd);
 
             /* Layer output scale */
             if (cl->layer_scale_val != 1.0f) {
                 launch_scale(r, r->d_x, cl->layer_scale_val, n_embd);
             }
-            G4_DBG("after_scale", r->d_x, n_embd);
-            #undef G4_DBG
 
         } else if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
@@ -6198,6 +6171,12 @@ void cuda_llm_free(cuda_llm_runner *r) {
             if (cl->ssm_norm_w)     cuMemFree(cl->ssm_norm_w);
             if (cl->d_conv_state)      cuMemFree(cl->d_conv_state);
             if (cl->d_recurrent_state) cuMemFree(cl->d_recurrent_state);
+            /* Gemma4 per-layer weights */
+            if (cl->post_attn_norm_w) cuMemFree(cl->post_attn_norm_w);
+            if (cl->post_ffw_norm_w)  cuMemFree(cl->post_ffw_norm_w);
+            if (cl->ple_inp_gate_w)   cuMemFree(cl->ple_inp_gate_w);
+            if (cl->ple_proj_w)       cuMemFree(cl->ple_proj_w);
+            if (cl->ple_post_norm_w)  cuMemFree(cl->ple_post_norm_w);
             /* MoE weights */
             if (cl->moe_gate_w)             cuMemFree(cl->moe_gate_w);
             if (cl->moe_gate_exps_w)        cuMemFree(cl->moe_gate_exps_w);
