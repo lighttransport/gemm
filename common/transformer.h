@@ -63,7 +63,19 @@ typedef struct {
     qtensor ssm_norm;      /* [d_state] RMS norm for gated output */
     qtensor ssm_out;       /* [d_inner, n_embd] output projection */
 
+    /* Gemma4 tensors */
+    qtensor attn_v_norm;         /* [head_dim] V RMSNorm (Gemma4) */
+    qtensor post_attention_norm; /* [n_embd] after attn output, before residual */
+    qtensor post_ffw_norm;       /* [n_embd] after FFN output, before residual */
+    qtensor layer_output_scale;  /* [1] scalar per layer */
+    /* Per-layer embedding (Gemma4) */
+    qtensor ple_inp_gate;        /* [n_embd_per_layer, n_embd] gated input */
+    qtensor ple_proj;            /* [n_embd, n_embd_per_layer] project back */
+    qtensor ple_post_norm;       /* [n_embd] post-projection norm */
+
     int is_ssm;            /* 1 = Delta-Net SSM layer, 0 = full attention */
+    int is_swa;            /* 1 = sliding window attention (Gemma4) */
+    int shared_kv_source;  /* layer idx to reuse KV from, -1 = own KV (Gemma4) */
 } transformer_layer;
 
 typedef struct {
@@ -103,6 +115,30 @@ typedef struct {
     int n_deepstack;       /* number of deepstack layers (Qwen3-VL) */
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
     int ds_embd_stride;    /* total embedding dim = proj_dim * (1 + n_deepstack) */
+
+    /* Gemma4 architecture */
+    int is_gemma4;                  /* 1 if gemma4 architecture */
+    int swa_window_size;            /* sliding window size (512) */
+    int head_dim_full;              /* head dim for full-attention layers (512) */
+    int head_dim_swa;               /* head dim for SWA layers (256) */
+    int n_embd_per_layer;           /* per-layer embedding dim (256) */
+    int n_layer_kv_from_start;      /* layers 0..N-1 have own KV, rest share */
+    float final_logit_softcapping;  /* tanh softcap on output logits (30.0) */
+    float rope_freq_base_swa;       /* RoPE freq base for SWA layers (10000) */
+    float embd_scale;               /* sqrt(n_embd) for token embedding scaling */
+    int ffn_activation;             /* 0 = SiLU (default), 1 = GELU (Gemma4) */
+    int *swa_pattern;               /* [n_layers] 1=SWA, 0=full attention */
+    /* Per-layer embedding global tensors */
+    qtensor per_layer_token_embd;   /* [n_embd_per_layer*n_layer, n_vocab] */
+    qtensor per_layer_model_proj;   /* [n_embd_per_layer*n_layer, n_embd] */
+    qtensor per_layer_proj_norm;    /* [n_embd_per_layer*n_layer] */
+    /* Proportional RoPE for full-attention layers */
+    float *rope_freq_factors;       /* [head_dim_full/2] from rope_freqs.weight */
+    float *rope_inv_freq_swa;       /* [head_dim_swa/2] precomputed for SWA */
+    /* Per-layer embedding scratch */
+    float *ple_buf;                 /* [n_embd_per_layer] */
+    float *ple_proj_buf;            /* [n_embd] */
+    int current_token_id;           /* stashed for per-layer embd lookup */
 
     /* Global tensors */
     qtensor token_embd;  /* [n_vocab, n_embd] */
@@ -338,6 +374,7 @@ static void tf_dequant_row(const qtensor *t, int row, float *dst) {
         case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
         case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
         case GGML_TYPE_F16:  block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_BF16: block_size = 1;   type_size = 2;   break;
         default:
             fprintf(stderr, "tf_dequant_row: unsupported type %u\n", t->type);
             memset(dst, 0, n_cols * sizeof(float));
@@ -359,6 +396,7 @@ static int tf_is_supported_weight_type(uint32_t type) {
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             return 1;
         default:
             return 0;
@@ -376,6 +414,7 @@ static size_t tf_row_bytes(uint32_t type, int n_cols) {
         case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
         case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
         case GGML_TYPE_F16:  block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_BF16: block_size = 1;   type_size = 2;   break;
         default: return 0;
     }
     return (size_t)((n_cols + block_size - 1) / block_size) * type_size;
@@ -1283,7 +1322,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     /* Detect architecture prefix. */
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "qwen35.block_count") >= 0) {
+    if (gguf_find_key(gguf, "gemma4.block_count") >= 0) {
+        arch = "gemma4";
+    } else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) {
         arch = "qwen35";
     } else if (gguf_find_key(gguf, "qwen3vlmoe.block_count") >= 0) {
         arch = "qwen3vlmoe";
@@ -1385,6 +1426,55 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                 m->full_attn_interval, m->ssm_qkv_dim);
     }
 
+    /* Gemma4 architecture */
+    m->is_gemma4 = 0;
+    m->swa_pattern = NULL;
+    m->rope_freq_factors = NULL;
+    m->rope_inv_freq_swa = NULL;
+    m->ple_buf = NULL;
+    m->ple_proj_buf = NULL;
+    if (strcmp(arch, "gemma4") == 0) {
+        m->is_gemma4 = 1;
+        m->head_dim_full = tf_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
+        m->head_dim_swa  = tf_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
+        m->head_dim = m->head_dim_full; /* use max for buffer sizing */
+        m->swa_window_size = tf_get_int(gguf, ARCH_KEY("attention.sliding_window"), 512);
+        m->n_embd_per_layer = tf_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 256);
+        int shared_kv_layers = tf_get_int(gguf, ARCH_KEY("attention.shared_kv_layers"), 0);
+        m->n_layer_kv_from_start = m->n_layers - shared_kv_layers;
+        m->final_logit_softcapping = tf_get_float(gguf, ARCH_KEY("final_logit_softcapping"), 30.0f);
+        m->rope_freq_base_swa = tf_get_float(gguf, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
+        m->embd_scale = sqrtf((float)m->n_embd);
+        m->ffn_activation = 1; /* GELU */
+
+        /* Parse SWA layer pattern from GGUF bool array */
+        m->swa_pattern = (int *)calloc(m->n_layers, sizeof(int));
+        {
+            int idx = gguf_find_key(gguf, ARCH_KEY("attention.sliding_window_pattern"));
+            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
+                int n = (int)gguf->kv[idx].value.arr.n;
+                if (n > m->n_layers) n = m->n_layers;
+                /* GGUF bool arrays are stored as GGUF_TYPE_BOOL (uint8) */
+                uint8_t *data = (uint8_t *)gguf->kv[idx].value.arr.data;
+                for (int i = 0; i < n; i++)
+                    m->swa_pattern[i] = data[i] ? 1 : 0;
+                fprintf(stderr, "transformer: Gemma4 SWA pattern loaded (%d layers)\n", n);
+            } else {
+                /* Fallback: every 6th layer is full attention (0-indexed: 5,11,...) */
+                for (int i = 0; i < m->n_layers; i++)
+                    m->swa_pattern[i] = ((i + 1) % 6 != 0) ? 1 : 0;
+                fprintf(stderr, "transformer: Gemma4 SWA pattern defaulting to every-6th-full\n");
+            }
+        }
+
+        fprintf(stderr, "transformer: Gemma4: head_dim_full=%d head_dim_swa=%d swa_window=%d\n",
+                m->head_dim_full, m->head_dim_swa, m->swa_window_size);
+        fprintf(stderr, "transformer: Gemma4: n_embd_per_layer=%d n_layer_kv_from_start=%d\n",
+                m->n_embd_per_layer, m->n_layer_kv_from_start);
+        fprintf(stderr, "transformer: Gemma4: softcap=%.1f rope_base_swa=%.0f\n",
+                m->final_logit_softcapping, m->rope_freq_base_swa);
+    }
+
     #undef ARCH_KEY
     fprintf(stderr, "transformer: architecture=%s\n", arch);
     m->max_seq_len = max_seq_len;
@@ -1424,6 +1514,26 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     }
     fprintf(stderr, "transformer: n_vocab=%d has_lm_head=%d\n", m->n_vocab, m->has_lm_head);
 
+    /* Gemma4 global tensors */
+    if (m->is_gemma4) {
+        m->per_layer_token_embd = tf_load_tensor(gguf, "per_layer_token_embd.weight", 1);
+        m->per_layer_model_proj = tf_load_tensor(gguf, "per_layer_model_proj.weight", 1);
+        m->per_layer_proj_norm = tf_load_tensor(gguf, "per_layer_proj_norm.weight", 1);
+        if (!m->per_layer_token_embd.data || !m->per_layer_model_proj.data) {
+            fprintf(stderr, "transformer: Gemma4 missing per-layer embedding tensors\n");
+            transformer_free(m);
+            return NULL;
+        }
+        /* Load proportional RoPE frequency factors */
+        qtensor rope_freqs_qt = tf_load_tensor(gguf, "rope_freqs.weight", 0);
+        if (rope_freqs_qt.data) {
+            int n_freq = rope_freqs_qt.n_cols;
+            m->rope_freq_factors = (float *)calloc(n_freq, sizeof(float));
+            dequant_row(rope_freqs_qt.type, rope_freqs_qt.data, m->rope_freq_factors, n_freq);
+            fprintf(stderr, "transformer: Gemma4 loaded rope_freqs (%d elements)\n", n_freq);
+        }
+    }
+
     /* Per-layer tensors */
     m->layers = (transformer_layer *)calloc(m->n_layers, sizeof(transformer_layer));
     if (!m->layers) {
@@ -1453,7 +1563,64 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
         LOAD(attn_norm,    "attn_norm",   1)
 
-        if (m->is_hybrid) {
+        if (m->is_gemma4) {
+            /* --- Gemma4 per-layer tensors --- */
+            m->layers[l].is_swa = m->swa_pattern[l];
+            m->layers[l].shared_kv_source = -1; /* default: own KV */
+
+            /* Determine shared KV source for layers beyond n_layer_kv_from_start */
+            if (l >= m->n_layer_kv_from_start) {
+                /* SWA layers reuse KV from (n_layer_kv_from_start - 2),
+                 * full-attn layers from (n_layer_kv_from_start - 1) */
+                m->layers[l].shared_kv_source = m->n_layer_kv_from_start - (m->layers[l].is_swa ? 2 : 1);
+                if (m->layers[l].shared_kv_source < 0) m->layers[l].shared_kv_source = 0;
+            }
+
+            /* Q projection (always present) */
+            LOAD(attn_q,       "attn_q",      1)
+            LOAD(attn_q_norm,  "attn_q_norm", 1)
+            LOAD(attn_output,  "attn_output", 1)
+
+            /* K/V only for layers with own KV */
+            if (m->layers[l].shared_kv_source < 0) {
+                LOAD(attn_k,       "attn_k",      1)
+                LOAD(attn_v,       "attn_v",      1)
+                LOAD(attn_k_norm,  "attn_k_norm", 1)
+            } else {
+                /* Try loading K/V anyway — some shared layers may still have them */
+                LOAD(attn_k,       "attn_k",      0)
+                LOAD(attn_v,       "attn_v",      0)
+                LOAD(attn_k_norm,  "attn_k_norm", 0)
+            }
+            /* V normalization (Gemma4 normalizes V too) */
+            LOAD(attn_v_norm,  "attn_v_norm", 0)
+
+            /* Post-attention norm */
+            LOAD(post_attention_norm, "post_attention_norm", 1)
+
+            /* FFN */
+            LOAD(ffn_norm,     "ffn_norm",    1)
+            LOAD(ffn_gate,     "ffn_gate",    1)
+            LOAD(ffn_up,       "ffn_up",      1)
+            LOAD(ffn_down,     "ffn_down",    1)
+            LOAD(post_ffw_norm, "post_ffw_norm", 1)
+
+            /* Layer output scale (optional) */
+            LOAD(layer_output_scale, "layer_output_scale", 0)
+
+            /* Per-layer embedding tensors */
+            LOAD(ple_inp_gate,  "inp_gate",  1)
+            LOAD(ple_proj,      "proj",      1)
+            LOAD(ple_post_norm, "post_norm", 1)
+
+            REQUIRE_SUPPORTED(attn_q,      "attn_q");
+            REQUIRE_SUPPORTED(attn_output, "attn_output");
+            REQUIRE_SUPPORTED(ffn_gate, "ffn_gate");
+            REQUIRE_SUPPORTED(ffn_up,   "ffn_up");
+            REQUIRE_SUPPORTED(ffn_down, "ffn_down");
+            if (m->layers[l].attn_k.data) REQUIRE_SUPPORTED(attn_k, "attn_k");
+            if (m->layers[l].attn_v.data) REQUIRE_SUPPORTED(attn_v, "attn_v");
+        } else if (m->is_hybrid) {
             int is_attn = (m->full_attn_interval > 0 && (l + 1) % m->full_attn_interval == 0);
             m->layers[l].is_ssm = !is_attn;
             if (is_attn) {
@@ -1560,14 +1727,42 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         return NULL;
     }
 
-    /* Allocate KV cache (skip SSM layers in hybrid mode) */
+    /* Allocate KV cache */
     int kv_dim = m->n_kv_heads * m->head_dim;
     m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
     m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
-    for (int l = 0; l < m->n_layers; l++) {
-        if (m->is_hybrid && m->layers[l].is_ssm) continue;
-        m->key_cache[l]   = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
-        m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+    if (m->is_gemma4) {
+        int kv_dim_full = m->n_kv_heads * m->head_dim_full;
+        int kv_dim_swa  = m->n_kv_heads * m->head_dim_swa;
+        int n_own = 0, n_shared = 0;
+        for (int l = 0; l < m->n_layers; l++) {
+            if (m->layers[l].shared_kv_source >= 0) { n_shared++; continue; }
+            if (m->layers[l].is_swa) {
+                int cache_len = m->swa_window_size;
+                m->key_cache[l]   = (float *)calloc(cache_len * kv_dim_swa, sizeof(float));
+                m->value_cache[l] = (float *)calloc(cache_len * kv_dim_swa, sizeof(float));
+            } else {
+                m->key_cache[l]   = (float *)calloc(max_seq_len * kv_dim_full, sizeof(float));
+                m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim_full, sizeof(float));
+            }
+            n_own++;
+        }
+        /* Point shared layers to their source */
+        for (int l = 0; l < m->n_layers; l++) {
+            int src = m->layers[l].shared_kv_source;
+            if (src >= 0) {
+                m->key_cache[l]   = m->key_cache[src];
+                m->value_cache[l] = m->value_cache[src];
+            }
+        }
+        fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers\n", n_own, n_shared);
+        kv_dim = kv_dim_full > kv_dim_swa ? kv_dim_full : kv_dim_swa; /* for scratch sizing */
+    } else {
+        for (int l = 0; l < m->n_layers; l++) {
+            if (m->is_hybrid && m->layers[l].is_ssm) continue;
+            m->key_cache[l]   = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+            m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+        }
     }
 
     /* Allocate SSM state for hybrid models */
@@ -1652,6 +1847,29 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         }
     }
 
+    /* Gemma4: precompute SWA RoPE table and per-layer embedding buffers */
+    if (m->is_gemma4) {
+        /* SWA RoPE: standard with freq_base_swa, head_dim_swa */
+        int half_swa = m->head_dim_swa / 2;
+        m->rope_inv_freq_swa = (float *)calloc(half_swa, sizeof(float));
+        for (int j = 0; j < half_swa; j++)
+            m->rope_inv_freq_swa[j] = 1.0f / powf(m->rope_freq_base_swa, (float)(2 * j) / m->head_dim_swa);
+
+        /* Full-attention RoPE: if rope_freq_factors is available, apply proportional RoPE.
+         * The standard rope_inv_freq (already computed above) uses head_dim_full and rope_freq_base.
+         * For proportional RoPE: inv_freq[j] /= freq_factors[j] */
+        if (m->rope_freq_factors) {
+            int half_full = m->head_dim_full / 2;
+            for (int j = 0; j < half_full && j < m->rope_inv_freq_len; j++)
+                m->rope_inv_freq[j] /= m->rope_freq_factors[j];
+            fprintf(stderr, "transformer: Gemma4 proportional RoPE applied (%d dims)\n", half_full);
+        }
+
+        /* Per-layer embedding scratch buffers */
+        m->ple_buf = (float *)calloc(m->n_embd_per_layer, sizeof(float));
+        m->ple_proj_buf = (float *)calloc(m->n_embd, sizeof(float));
+    }
+
     return m;
 }
 
@@ -1660,12 +1878,21 @@ void transformer_free(transformer_model *model) {
     free(model->layers);
     if (model->key_cache) {
         for (int l = 0; l < model->n_layers; l++) {
+            /* Skip shared KV caches (freed by their source layer) */
+            if (model->is_gemma4 && l < model->n_layers &&
+                model->layers && model->layers[l].shared_kv_source >= 0) continue;
             free(model->key_cache[l]);
             free(model->value_cache[l]);
         }
         free(model->key_cache);
         free(model->value_cache);
     }
+    /* Gemma4 resources */
+    free(model->swa_pattern);
+    free(model->rope_freq_factors);
+    free(model->rope_inv_freq_swa);
+    free(model->ple_buf);
+    free(model->ple_proj_buf);
     if (model->conv_state) {
         for (int l = 0; l < model->n_layers; l++) free(model->conv_state[l]);
         free(model->conv_state);
@@ -2335,6 +2562,23 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
 }
 
+/* Vectorized GELU(gate) × up: out[i] = gelu(gate[i]) * up[i]
+ * Uses exact GELU: x * 0.5 * (1 + erf(x / sqrt(2))) */
+static void tf_gelu_mul(float *out, const float *gate, const float *up, int n) {
+    for (int i = 0; i < n; i++) {
+        float g = gate[i];
+        float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f)); /* 1/sqrt(2) */
+        out[i] = gelu_g * up[i];
+    }
+}
+
+/* Logit soft-capping: logits[i] = cap * tanh(logits[i] / cap) */
+static void tf_logit_softcap(float *logits, int n, float cap) {
+    float inv_cap = 1.0f / cap;
+    for (int i = 0; i < n; i++)
+        logits[i] = cap * tanhf(logits[i] * inv_cap);
+}
+
 /* Helper: apply standard or M-RoPE depending on model config */
 static void tf_apply_rope(transformer_model *m, float *q, float *k,
                            int n_heads, int n_kv_heads, int head_dim,
@@ -2368,6 +2612,12 @@ float *transformer_forward_pos(transformer_model *model, int32_t token_id, int c
         return NULL;
     }
     tf_dequant_row(&model->token_embd, token_id, model->x);
+    /* Gemma4: scale token embeddings by sqrt(n_embd), stash token_id for per-layer embd */
+    if (model->is_gemma4) {
+        float scale = model->embd_scale;
+        for (int i = 0; i < model->n_embd; i++) model->x[i] *= scale;
+        model->current_token_id = token_id;
+    }
     return tf_forward_blocks(model, cache_pos, pos_t, pos_h, pos_w);
 }
 
@@ -2381,6 +2631,10 @@ float *transformer_forward_logits_pos(transformer_model *model, int32_t token_id
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
     tf_qmatvec_pool(model, model->logits, &model->output, hidden, model->n_vocab);
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
+    /* Gemma4: final logit soft-capping */
+    if (model->is_gemma4 && model->final_logit_softcapping > 0.0f) {
+        tf_logit_softcap(model->logits, model->n_vocab, model->final_logit_softcapping);
+    }
     return model->logits;
 }
 
@@ -2405,6 +2659,51 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
     if (layer_end > m->n_layers) layer_end = m->n_layers;
     if (layer_start < 0) layer_start = 0;
 
+    /* Gemma4: precompute per-layer inputs (token embedding + model projection, combined) */
+    float *ple_combined = NULL; /* [n_layers * n_embd_per_layer] if Gemma4 */
+    if (m->is_gemma4 && m->per_layer_token_embd.data && m->current_token_id >= 0) {
+        int ple_dim = m->n_embd_per_layer;
+        int total_ple = ple_dim * m->n_layers;
+        ple_combined = (float *)alloca(total_ple * sizeof(float));
+
+        /* 1. Look up per-layer token embedding: dequant row for this token */
+        float *tok_ple = (float *)alloca(total_ple * sizeof(float));
+        dequant_row(m->per_layer_token_embd.type,
+                    (const uint8_t *)m->per_layer_token_embd.data +
+                    (size_t)m->current_token_id * tf_row_bytes(m->per_layer_token_embd.type, total_ple),
+                    tok_ple, total_ple);
+        /* Scale by sqrt(n_embd_per_layer) */
+        float ple_tok_scale = sqrtf((float)ple_dim);
+        for (int i = 0; i < total_ple; i++) tok_ple[i] *= ple_tok_scale;
+
+        /* 2. Project x through per_layer_model_proj: [10752, 2560] @ [2560] = [10752] */
+        float *proj_out = (float *)alloca(total_ple * sizeof(float));
+        tf_qmatvec(proj_out, &m->per_layer_model_proj, m->x, total_ple, m->matvec_tmp);
+
+        /* Scale by 1/sqrt(n_embd) */
+        float proj_scale = 1.0f / sqrtf((float)n_embd);
+        for (int i = 0; i < total_ple; i++) proj_out[i] *= proj_scale;
+
+        /* 3. RMSNorm with per_layer_proj_norm (shared [256] weights, applied per-layer slice) */
+        if (m->per_layer_proj_norm.data) {
+            float norm_w[256];
+            dequant_row(m->per_layer_proj_norm.type, m->per_layer_proj_norm.data, norm_w, ple_dim);
+            /* Reshape proj_out to [ple_dim, n_layers], apply RMSNorm to each [ple_dim] slice */
+            for (int ll = 0; ll < m->n_layers; ll++) {
+                float *slice = proj_out + ll * ple_dim;
+                float ss = 0.0f;
+                for (int i = 0; i < ple_dim; i++) ss += slice[i] * slice[i];
+                ss = 1.0f / sqrtf(ss / ple_dim + m->rms_norm_eps);
+                for (int i = 0; i < ple_dim; i++) slice[i] = slice[i] * ss * norm_w[i];
+            }
+        }
+
+        /* 4. Add token embedding + projection, scale by 1/sqrt(2) */
+        float input_scale = 1.0f / sqrtf(2.0f);
+        for (int i = 0; i < total_ple; i++)
+            ple_combined[i] = (proj_out[i] + tok_ple[i]) * input_scale;
+    }
+
     /* 2. Transformer blocks */
     for (int l = layer_start; l < layer_end; l++) {
         transformer_layer *layer = &m->layers[l];
@@ -2415,7 +2714,230 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         TF_PROF_END("attn_norm", 5.0 * n_embd, 0);
 
-        if (m->is_hybrid && layer->is_ssm) {
+        if (m->is_gemma4) {
+            /* --- Gemma4 layer --- */
+            int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
+            int local_kv_dim = n_kv_heads * hd;
+            int local_q_dim  = n_heads * hd;
+            int local_gqa    = n_heads / n_kv_heads;
+            float eps = m->rms_norm_eps;
+
+            /* Q projection (always present) */
+            tf_qmatvec_pool(m, m->q, &layer->attn_q, m->xb, local_q_dim);
+
+            /* K/V projections (skip if sharing KV) */
+            int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
+            if (layer->shared_kv_source < 0) {
+                tf_qmatvec_pool(m, m->k, &layer->attn_k, m->xb, local_kv_dim);
+                tf_qmatvec_pool(m, m->v, &layer->attn_v, m->xb, local_kv_dim);
+            }
+
+            /* Q norm (always) */
+            tf_qk_norm(m->q, n_heads, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
+
+            /* K/V norm (only if we projected them) */
+            if (layer->shared_kv_source < 0) {
+                tf_qk_norm(m->k, n_kv_heads, hd, &layer->attn_k_norm, eps, m->matvec_tmp);
+                /* V norm — Gemma4 normalizes V too (raw RMSNorm, no weight) */
+                if (layer->attn_v_norm.data) {
+                    tf_qk_norm(m->v, n_kv_heads, hd, &layer->attn_v_norm, eps, m->matvec_tmp);
+                } else {
+                    /* V gets raw RMSNorm without learned weight */
+                    for (int h = 0; h < n_kv_heads; h++) {
+                        float *vh = m->v + h * hd;
+                        float ss = 0.0f;
+                        for (int i = 0; i < hd; i++) ss += vh[i] * vh[i];
+                        ss = 1.0f / sqrtf(ss / hd + eps);
+                        for (int i = 0; i < hd; i++) vh[i] *= ss;
+                    }
+                }
+            }
+
+            /* RoPE: use SWA or full-attention inv_freq table */
+            {
+                float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
+                int half = hd / 2;
+                /* Apply RoPE to Q */
+                for (int h = 0; h < n_heads; h++) {
+                    float *qh = m->q + h * hd;
+                    for (int j = 0; j < half; j++) {
+                        float freq = (float)position * inv_freq[j];
+                        float cos_v = cosf(freq), sin_v = sinf(freq);
+                        float r0 = qh[j], r1 = qh[j + half];
+                        qh[j]        = r0 * cos_v - r1 * sin_v;
+                        qh[j + half] = r0 * sin_v + r1 * cos_v;
+                    }
+                }
+                /* Apply RoPE to K (only if we projected K) */
+                if (layer->shared_kv_source < 0) {
+                    for (int h = 0; h < n_kv_heads; h++) {
+                        float *kh = m->k + h * hd;
+                        for (int j = 0; j < half; j++) {
+                            float freq = (float)position * inv_freq[j];
+                            float cos_v = cosf(freq), sin_v = sinf(freq);
+                            float r0 = kh[j], r1 = kh[j + half];
+                            kh[j]        = r0 * cos_v - r1 * sin_v;
+                            kh[j + half] = r0 * sin_v + r1 * cos_v;
+                        }
+                    }
+                }
+            }
+
+            /* KV cache store */
+            if (layer->shared_kv_source < 0) {
+                if (layer->is_swa) {
+                    int slot = position % m->swa_window_size;
+                    memcpy(m->key_cache[l]   + slot * local_kv_dim, m->k, local_kv_dim * sizeof(float));
+                    memcpy(m->value_cache[l] + slot * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                } else {
+                    memcpy(m->key_cache[l]   + position * local_kv_dim, m->k, local_kv_dim * sizeof(float));
+                    memcpy(m->value_cache[l] + position * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                }
+            }
+
+            /* Attention with scale=1.0 (QK norms handle scaling) */
+            {
+                float attn_scale = 1.0f;
+                int seq_len;
+                float *kc = m->key_cache[kv_src];
+                float *vc = m->value_cache[kv_src];
+
+                if (layer->is_swa) {
+                    /* SWA: attend to window [max(0, pos-window+1), pos] via circular buffer */
+                    int win = m->swa_window_size;
+                    int start = (position >= win) ? (position - win + 1) : 0;
+                    seq_len = position - start + 1;
+
+                    /* Compute attention scores over the window */
+                    memset(m->xb2, 0, local_q_dim * sizeof(float));
+                    for (int h = 0; h < n_heads; h++) {
+                        float *qh = m->q + h * hd;
+                        float *att_h = m->att + h * seq_len;
+                        int kv_h = h / local_gqa;
+
+                        /* Compute QK scores */
+                        for (int p = 0; p < seq_len; p++) {
+                            int abs_pos = start + p;
+                            int slot = abs_pos % win;
+                            float *kp = kc + slot * local_kv_dim + kv_h * hd;
+                            float score = 0.0f;
+                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
+                            att_h[p] = score * attn_scale;
+                        }
+
+                        /* Softmax */
+                        float max_s = att_h[0];
+                        for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
+                        float sum_e = 0.0f;
+                        for (int p = 0; p < seq_len; p++) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }
+                        float inv_sum = 1.0f / sum_e;
+                        for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
+
+                        /* Weighted sum of values */
+                        float *out_h = m->xb2 + h * hd;
+                        for (int p = 0; p < seq_len; p++) {
+                            int abs_pos = start + p;
+                            int slot = abs_pos % win;
+                            float *vp = vc + slot * local_kv_dim + kv_h * hd;
+                            float w = att_h[p];
+                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
+                        }
+                    }
+                } else {
+                    /* Full attention */
+                    seq_len = position + 1;
+                    memset(m->xb2, 0, local_q_dim * sizeof(float));
+                    for (int h = 0; h < n_heads; h++) {
+                        float *qh = m->q + h * hd;
+                        float *att_h = m->att + h * seq_len;
+                        int kv_h = h / local_gqa;
+
+                        for (int p = 0; p < seq_len; p++) {
+                            float *kp = kc + p * local_kv_dim + kv_h * hd;
+                            float score = 0.0f;
+                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
+                            att_h[p] = score * attn_scale;
+                        }
+
+                        float max_s = att_h[0];
+                        for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
+                        float sum_e = 0.0f;
+                        for (int p = 0; p < seq_len; p++) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }
+                        float inv_sum = 1.0f / sum_e;
+                        for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
+
+                        float *out_h = m->xb2 + h * hd;
+                        for (int p = 0; p < seq_len; p++) {
+                            float *vp = vc + p * local_kv_dim + kv_h * hd;
+                            float w = att_h[p];
+                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
+                        }
+                    }
+                }
+            }
+
+            /* Output projection */
+            tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
+
+            /* Post-attention norm (before residual) */
+            tf_rmsnorm(m->xb, m->xb, &layer->post_attention_norm, n_embd, eps, m->matvec_tmp);
+
+            /* Residual */
+            tf_vadd(m->x, m->xb, n_embd);
+
+            /* --- FFN with GELU --- */
+            tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
+
+            tf_qmatvec_fused2_pool(m, m->ffn_buf1, &layer->ffn_gate,
+                                    m->ffn_buf2, &layer->ffn_up, m->xb, m->n_ff);
+            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff);
+
+            tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
+
+            /* Post-FFN norm (before residual) */
+            tf_rmsnorm(m->xb, m->xb, &layer->post_ffw_norm, n_embd, eps, m->matvec_tmp);
+
+            /* Residual */
+            tf_vadd(m->x, m->xb, n_embd);
+
+            /* Per-layer embedding injection (BEFORE layer_output_scale) */
+            if (ple_combined) {
+                int ple_dim = m->n_embd_per_layer;
+                float *ple = m->ple_buf;      /* [ple_dim] */
+                float *proj = m->ple_proj_buf; /* [n_embd] */
+
+                /* Take precomputed per-layer input slice for this layer */
+                memcpy(ple, ple_combined + l * ple_dim, ple_dim * sizeof(float));
+
+                /* inp_gate: hidden -> [ple_dim], GELU, element-wise multiply */
+                tf_qmatvec_pool(m, proj, &layer->ple_inp_gate, m->x, ple_dim);
+                for (int i = 0; i < ple_dim; i++) {
+                    float g = proj[i];
+                    float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));
+                    ple[i] *= gelu_g;
+                }
+
+                /* Project back to n_embd via ple_proj */
+                tf_qmatvec_pool(m, proj, &layer->ple_proj, ple, n_embd);
+
+                /* Post-norm on projected output */
+                if (layer->ple_post_norm.data) {
+                    tf_rmsnorm(proj, proj, &layer->ple_post_norm, n_embd, eps, m->matvec_tmp);
+                }
+
+                /* Residual add */
+                tf_vadd(m->x, proj, n_embd);
+            }
+
+            /* Layer output scaling (AFTER per-layer embedding) */
+            if (layer->layer_output_scale.data) {
+                float scale_val;
+                dequant_row(layer->layer_output_scale.type, layer->layer_output_scale.data, &scale_val, 1);
+                for (int i = 0; i < n_embd; i++) m->x[i] *= scale_val;
+            }
+
+            goto gemma4_layer_done;
+        } else if (m->is_hybrid && layer->is_ssm) {
             /* --- SSM (Delta-Net) layer --- */
             tf_ssm_deltanet_forward(m, l);
         } else if (m->is_hybrid) {
@@ -2684,6 +3206,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             tf_vadd(m->x, m->xb, n_embd);
         }
 
+        gemma4_layer_done:
+
         /* DeepStack injection: add deepstack slice after each early layer */
         if (m->ds_embd && l < m->n_deepstack && m->ds_embd_stride > n_embd) {
             const float *ds_slice = m->ds_embd + (1 + l) * n_embd;
@@ -2855,6 +3379,9 @@ float *transformer_forward_embd_pos(transformer_model *model, const float *embd,
         return NULL;
     }
     memcpy(model->x, embd, model->n_embd * sizeof(float));
+    /* Gemma4: use padding token (ID=0) for per-layer embeddings on vision tokens.
+     * llama.cpp gemma4-iswa.cpp: vision path uses row 0 of per_layer_token_embd. */
+    if (model->is_gemma4) model->current_token_id = 0;
     /* Store full embedding pointer for deepstack injection in tf_forward_blocks */
     model->ds_embd = embd;
     float *result = tf_forward_blocks(model, cache_pos, pos_t, pos_h, pos_w);
