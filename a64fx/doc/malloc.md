@@ -186,6 +186,35 @@ All scratch buffers are allocated with 256-byte alignment (`posix_memalign`) for
 
 The thread pool uses a master-worker pattern: the main thread executes worker 0's task directly instead of spin-waiting. This eliminates one idle core and reduces cross-CMG atomic synchronization overhead. Only `n_threads - 1` background workers are created.
 
+## NUMA allocator: `transformer_numa_setup`
+
+The NUMA allocator runs 4 phases after model load and thread pool creation:
+
+1. **Weight distribution** — parallel `pread` per tensor, row-partitioned across threads. Each thread reads its row partition from the GGUF file, triggering first-touch page placement on its CMG.
+2. **Thread scratch** — per-thread dequant buffers (`thread_tmp[t]`) first-touched by their owning thread. Allocated with `posix_memalign` without `memset` (notouch), so demand paging places pages on the first-touching worker.
+3. **Logits buffer** — row-partitioned first-touch across threads (248K rows = ~1MB, split 4 ways).
+4. **SSM recurrent state** — head-partitioned first-touch. Each thread's `dt_rank/4` heads placed on its CMG (~3MB per SSM layer).
+
+### NUMA allocator env vars
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NUMA_DISTRIBUTE` | unset | Set to `1` to enable NUMA distribution |
+| `NUMA_N_CMGS` | `4` | Number of CMGs |
+| `NUMA_CMG_BUDGET_GB` | `6` | Usable GB per CMG (7GB total, 1GB reserved) |
+| `NUMA_ALIGNMENT` | `2097152` | Allocation alignment in bytes (2MB) |
+
+### Memory budget output
+
+The allocator prints per-CMG usage at startup:
+```
+numa: per-CMG usage: CMG0=898.1MB CMG1=897.7MB CMG2=897.7MB CMG3=897.7MB (budget=6.0GB)
+```
+
+### What is NOT distributed (stays shared)
+
+Small scratch buffers (x, xb, xb2, q, k, v, att, ffn_buf*) are <40KB each and stay on CMG0. Cross-CMG access for these is negligible. KV cache is accessed by all threads during attention, so it stays shared.
+
 ## Additional tuning options
 
 | Variable | Value | Purpose |

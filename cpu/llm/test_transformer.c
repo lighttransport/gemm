@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     }
 
     if (n_threads > 1) transformer_set_threads(model, n_threads);
-    if (n_threads > 1 && getenv("NUMA_DISTRIBUTE")) transformer_numa_distribute(model, gguf);
+    if (n_threads > 1) transformer_numa_setup(model, gguf);
 
     /* Tokenize prompt */
     fprintf(stderr, "Prompt: \"%s\"\n", prompt);
