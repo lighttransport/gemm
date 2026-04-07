@@ -4443,10 +4443,10 @@ static inline void launch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
 
 static inline void launch_qknorm(cuda_llm_runner *r, CUdeviceptr vec, CUdeviceptr w,
                                    int n_heads, int head_dim, float eps) {
-    /* blockDim = next power of 2 >= head_dim, capped at 256 */
+    /* blockDim = next power of 2 >= head_dim (Gemma4 needs 512 for full-attn heads) */
     int bdim = 1;
     while (bdim < head_dim) bdim <<= 1;
-    if (bdim > 256) bdim = 256;
+    if (bdim > 1024) bdim = 1024;
     void *args[] = { &vec, &w, &n_heads, &head_dim, &eps };
     cuLaunchKernel(r->fn_qknorm_f32,
                    n_heads, 1, 1,
