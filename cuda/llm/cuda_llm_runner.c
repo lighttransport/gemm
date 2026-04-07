@@ -3219,6 +3219,7 @@ struct cuda_llm_runner {
     CUdeviceptr d_ple_buf;          /* F32 [ple_dim] scratch */
     CUdeviceptr d_ple_proj;         /* F32 [n_embd] scratch */
     int current_token_id;           /* stashed for PLE lookup */
+    int ple_use_f32;                /* 1 = keep PLE weights in F32 for accuracy */
     /* Host-side PLE data (mmap pointers from GGUF, valid while GGUF is open) */
     qtensor h_ple_token_embd;       /* Q8_0 per_layer_token_embd */
     qtensor h_ple_model_proj;       /* BF16 per_layer_model_proj */
@@ -3580,6 +3581,22 @@ static uint16_t cllm_f32_to_f16(float f) {
 }
 
 /* Upload a weight matrix - dispatches based on type */
+/* Upload weight matrix as F32 (dequant any type to F32, copy to GPU) */
+static int upload_weight_f32(CUdeviceptr *d_ptr, const qtensor *t) {
+    if (!t->data) { *d_ptr = 0; return 0; }
+    int n_elements = t->n_rows * t->n_cols;
+    float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
+    if (!f32_buf) return -1;
+    dequant_row(t->type, t->data, f32_buf, n_elements);
+    size_t nbytes = (size_t)n_elements * sizeof(float);
+    CUresult err = cuMemAlloc(d_ptr, nbytes);
+    if (err != CUDA_SUCCESS) { free(f32_buf); return -1; }
+    err = cuMemcpyHtoD(*d_ptr, f32_buf, nbytes);
+    free(f32_buf);
+    if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    return 0;
+}
+
 static int upload_weight_matrix(CUdeviceptr *d_ptr, const qtensor *t, int *out_type) {
     *out_type = t->type;
     if (t->type == GGML_TYPE_Q8_0) {
@@ -3785,6 +3802,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->swa_pattern = NULL;
     if (strcmp(arch, "gemma4") == 0) {
         r->is_gemma4 = 1;
+        r->ple_use_f32 = 1; /* F32 PLE weights for accuracy (costs ~105MB extra VRAM) */
         r->head_dim_full = cllm_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
         r->head_dim_swa  = cllm_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
         r->head_dim = r->head_dim_full; /* max for buffer sizing */
@@ -4174,16 +4192,28 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 cl->layer_scale_val = sv;
             }
 
-            /* Per-layer embedding tensors */
-            #define LOAD_PLE_W(field, suffix, rows_f, cols_f, type_f) do { \
-                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
-                t = cllm_load_tensor(gguf, name, 1); \
-                cl->rows_f = t.n_rows; cl->cols_f = t.n_cols; \
-                if (upload_weight_matrix(&cl->field, &t, &cl->type_f) != 0) return -1; \
-            } while(0)
-            LOAD_PLE_W(ple_inp_gate_w, "inp_gate", ple_inp_gate_rows, ple_inp_gate_cols, ple_inp_gate_type);
-            LOAD_PLE_W(ple_proj_w,     "proj",     ple_proj_rows,     ple_proj_cols,     ple_proj_type);
-            #undef LOAD_PLE_W
+            /* Per-layer embedding tensors (F32 path optional for accuracy) */
+            {
+                snprintf(name, sizeof(name), "blk.%d.inp_gate.weight", l);
+                t = cllm_load_tensor(gguf, name, 1);
+                cl->ple_inp_gate_rows = t.n_rows; cl->ple_inp_gate_cols = t.n_cols;
+                if (r->ple_use_f32) {
+                    cl->ple_inp_gate_type = GGML_TYPE_F32;
+                    if (upload_weight_f32(&cl->ple_inp_gate_w, &t) != 0) return -1;
+                } else {
+                    if (upload_weight_matrix(&cl->ple_inp_gate_w, &t, &cl->ple_inp_gate_type) != 0) return -1;
+                }
+
+                snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
+                t = cllm_load_tensor(gguf, name, 1);
+                cl->ple_proj_rows = t.n_rows; cl->ple_proj_cols = t.n_cols;
+                if (r->ple_use_f32) {
+                    cl->ple_proj_type = GGML_TYPE_F32;
+                    if (upload_weight_f32(&cl->ple_proj_w, &t) != 0) return -1;
+                } else {
+                    if (upload_weight_matrix(&cl->ple_proj_w, &t, &cl->ple_proj_type) != 0) return -1;
+                }
+            }
 
             /* PLE post-norm (F32) */
             snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
@@ -4669,6 +4699,10 @@ static inline void launch_embed_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdevi
                    (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+/* Forward declaration for F32 matvec (defined later, used by auto-dispatch) */
+static inline void launch_matvec_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                      CUdeviceptr x, int n_rows, int n_cols);
+
 /* Auto-dispatch matvec based on weight type */
 static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                        CUdeviceptr x, int n_rows, int n_cols, int weight_type) {
@@ -4694,6 +4728,7 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
         case GGML_TYPE_IQ1_M:   launch_matvec_iq1_m(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_TQ1_0:   launch_matvec_tq1_0(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_TQ2_0:   launch_matvec_tq2_0(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_F32:     launch_matvec_f32(r, dst, mat, x, n_rows, n_cols); break;
         default:             launch_matvec(r, dst, mat, x, n_rows, n_cols); break;
     }
 }
