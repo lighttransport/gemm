@@ -215,6 +215,84 @@ numa: per-CMG usage: CMG0=898.1MB CMG1=897.7MB CMG2=897.7MB CMG3=897.7MB (budget
 
 Small scratch buffers (x, xb, xb2, q, k, v, att, ffn_buf*) are <40KB each and stay on CMG0. Cross-CMG access for these is negligible. KV cache is accessed by all threads during attention, so it stays shared.
 
+## Per-CMG Memory Pool with mbind (recommended)
+
+The highest-performance approach uses `mmap` + `mbind` to create per-CMG memory pools with explicit NUMA node binding. This guarantees zero cross-CMG weight access.
+
+### Why mbind instead of first-touch
+
+First-touch (demand paging) relies on which thread touches each page first. This is fragile — a single `memset` or `fread` from the wrong thread places pages on the wrong CMG. `mbind` is explicit and deterministic.
+
+### Key system facts
+
+- **A64FX page size: 64KB** (not 4KB). Use `getpagesize()` to confirm.
+- **NUMA nodes**: 4-7 correspond to CMG0-3 (each with ~7GB HBM2).
+- **mbind works**: verified on Fugaku compute nodes. No special permissions needed.
+
+### Implementation
+
+```c
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#define mbind(a,l,m,nm,mx,f) syscall(SYS_mbind,(a),(l),(m),(nm),(mx),(f))
+#define MPOL_BIND 2
+
+/* Allocate pool pinned to a specific CMG */
+void *cmg_pool_alloc(int cmg, size_t size) {
+    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    unsigned long mask = 1UL << (4 + cmg);  /* nodes 4-7 */
+    mbind(p, size, MPOL_BIND, &mask, 64, 0);
+    return p;
+}
+```
+
+Combine with `pthread_setaffinity_np` to pin each thread to the correct CMG's cores:
+```c
+cpu_set_t cpuset;
+CPU_ZERO(&cpuset);
+CPU_SET(12 + cmg * 12 + local_tid, &cpuset);  /* cores 12-23, 24-35, 36-47, 48-59 */
+pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+```
+
+### Benchmark results (FP16 4r×2vl matvec [12288, 4096] = 96MB)
+
+| Config | Total GB/s | Per-CMG GB/s | % of 833 streaming peak |
+|--------|-----------|-------------|------------------------|
+| 1CMG 4T | 105 | 105 | — |
+| 1CMG 8T | 181 | 181 | — |
+| 1CMG 12T | 211 | 211 | — |
+| 4CMG 16T (4/CMG) | 399 | 100 | 48% |
+| 4CMG 32T (8/CMG) | 655 | 164 | 79% |
+| 4CMG 40T (10/CMG) | 741 | 185 | 89% |
+| **4CMG 48T (12/CMG)** | **756** | **189** | **91%** |
+
+**756 GB/s aggregate = 91% of A64FX HBM2 streaming peak (833 GB/s).**
+
+Each CMG achieves 189 GB/s independently — matching single-CMG results with zero cross-CMG penalty.
+
+### Why first-touch fails for multi-CMG
+
+With a single `posix_memalign` buffer, weight rows for different CMGs are on adjacent pages in the same allocation. Even with per-thread `memset` for first-touch, the 64KB page granularity can cause rows intended for different CMGs to share pages. With `mbind` per-CMG pools, each CMG's weights are in a completely separate virtual memory region with guaranteed node binding.
+
+### Multi-CMG barrier: WFE intra-CMG only
+
+The WFE (wait-for-event) barrier works within a single CMG. For multi-CMG, each CMG runs independently with its own WFE barrier group. Cross-CMG synchronization (when needed for the full inference pipeline) uses a lightweight atomic barrier between CMG leaders only — 4 threads instead of 48.
+
+### BF16 vs FP16 kernel performance
+
+| Kernel | Per-core GB/s | % of 32 GB/s peak | Notes |
+|--------|-------------|-------------------|-------|
+| BF16 `ld1uh_u32 + lsl + fmla32` | 18.0 | 56% | Current production |
+| FP16 `ld1h + fmla16` (8r×1vl) | 24.3 | 76% | No conversion overhead |
+| **FP16 `ld1h + fmla16` (4r×2vl)** | **27.8** | **87%** | **Best kernel** |
+| FP32 ceiling `ld1w + fmla32` | 24.9 | 78% | Theoretical limit for 32-bit |
+
+FP16 4r×2vl exceeds FP32 ceiling because FP16 processes 32 elements per SVE vector (64 bytes) vs 16 for FP32 — same memory bandwidth, 2× compute throughput.
+
+For production LLM inference: pre-convert BF16 weights to FP16 at load time (one-time cost, same memory footprint), then use FP16 kernel throughout decode.
+
 ## Additional tuning options
 
 | Variable | Value | Purpose |
