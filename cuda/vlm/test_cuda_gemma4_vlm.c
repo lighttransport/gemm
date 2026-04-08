@@ -266,38 +266,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Using synthetic checkerboard %dx%d\n", img_w, img_h);
     }
 
-    /* 3. Encode image (CPU) */
-    fprintf(stderr, "\n=== Vision Encoding (CPU) ===\n");
-    double t0 = get_time_ms();
-    float *vision_embd = g4v_encode(vision, image, img_w, img_h);
-    double t1 = get_time_ms();
-    free(image);
-    if (!vision_embd) { fprintf(stderr, "vision encoding failed\n"); return 1; }
-
+    /* Done with CPU vision model (not needed for GPU path) */
     int n_vision = vision->n_merged;
-    int proj_dim = vision->proj_dim;
-    fprintf(stderr, "Vision: %d tokens x %d dim (%.1f ms)\n", n_vision, proj_dim, t1 - t0);
-
-    {
-        float vmin = vision_embd[0], vmax = vision_embd[0], sum = 0;
-        int total = n_vision * proj_dim;
-        for (int i = 0; i < total; i++) {
-            if (vision_embd[i] < vmin) vmin = vision_embd[i];
-            if (vision_embd[i] > vmax) vmax = vision_embd[i];
-            sum += vision_embd[i];
-        }
-        fprintf(stderr, "Vision embedding: min=%.4f max=%.4f mean=%.6f\n",
-                vmin, vmax, sum / total);
-    }
-
-    /* Done with vision model */
+    (void)vision->proj_dim; /* GPU path computes proj_dim from mmproj GGUF */
     g4v_free(vision);
-    gguf_close(gguf_mm);
 
-    /* 4. Load LLM on CUDA */
+    /* 3. Load LLM on CUDA first (need CUDA context for GPU vision) */
     fprintf(stderr, "\nLoading LLM: %s\n", model_path);
     gguf_context *gguf_main = gguf_open(model_path, 1);
-    if (!gguf_main) { fprintf(stderr, "failed to open LLM GGUF\n"); return 1; }
 
     bpe_vocab *vocab = bpe_vocab_load(gguf_main);
     if (!vocab) { fprintf(stderr, "failed to load vocab\n"); return 1; }
@@ -317,6 +293,29 @@ int main(int argc, char **argv) {
     int n_vocab = cuda_llm_n_vocab(llm);
     fprintf(stderr, "LLM: n_embd=%d n_vocab=%d n_layers=%d\n",
             n_embd, n_vocab, cuda_llm_n_layers(llm));
+
+    /* 4. Encode image on GPU */
+    fprintf(stderr, "\n=== Vision Encoding (GPU) ===\n");
+    int proj_dim = 0;
+    double t0 = get_time_ms();
+    float *vision_embd = cuda_llm_vision_encode(llm, gguf_mm, image, img_w, img_h, &n_vision, &proj_dim);
+    double t1 = get_time_ms();
+    free(image);
+    gguf_close(gguf_mm);
+
+    if (!vision_embd) { fprintf(stderr, "GPU vision encoding failed\n"); return 1; }
+    fprintf(stderr, "Vision: %d tokens x %d dim (%.1f ms)\n", n_vision, proj_dim, t1 - t0);
+    {
+        float vmin = vision_embd[0], vmax = vision_embd[0], sum = 0;
+        int total = n_vision * proj_dim;
+        for (int i = 0; i < total; i++) {
+            if (vision_embd[i] < vmin) vmin = vision_embd[i];
+            if (vision_embd[i] > vmax) vmax = vision_embd[i];
+            sum += vision_embd[i];
+        }
+        fprintf(stderr, "Vision embedding: min=%.4f max=%.4f mean=%.6f\n",
+                vmin, vmax, sum / total);
+    }
 
     if (proj_dim != n_embd) {
         fprintf(stderr, "ERROR: vision proj_dim=%d != LLM n_embd=%d\n", proj_dim, n_embd);
