@@ -2,7 +2,11 @@
  * test_gemma4_vision.c - End-to-end vision inference test for Gemma4
  *
  * Usage:
- *   ./test_gemma4_vision <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen]
+ *   ./test_gemma4_vision <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen] [--budget N]
+ *
+ * --budget N: reasoning token budget (default 200). The model can think for up
+ *             to N tokens inside <|channel>thought...<channel|> before being
+ *             forced to exit and produce visible output.
  *
  * If no image is provided, generates a synthetic checkerboard test pattern.
  * Supports JPEG, PNG, BMP, PPM, and other formats via stb_image.
@@ -32,6 +36,118 @@
 #include <math.h>
 #include <time.h>
 
+typedef struct {
+    char pre_image[256];
+    char post_image[512];
+} gemma4_prompt_parts;
+
+typedef struct {
+    int32_t eos_id;
+    int32_t eot_id;
+    int32_t turn_end_id;
+    int32_t channel_start_id;
+    int32_t channel_end_id;
+    int in_thought;
+} gemma4_decode_state;
+
+/* ---- Reasoning budget state machine ---- */
+
+typedef enum {
+    RB_IDLE,      /* waiting for start token sequence */
+    RB_COUNTING,  /* inside thought channel, counting tokens */
+    RB_FORCING,   /* forcing end_tokens one at a time */
+    RB_DONE       /* passthrough */
+} rb_state;
+
+typedef struct {
+    rb_state state;
+    int      budget;
+    int      count;
+    int32_t  start_tokens[8];
+    int      n_start;
+    int      start_matched;
+    int32_t  end_tokens[8];
+    int      n_end;
+    int      end_matched;
+    int      force_idx;
+} reasoning_budget;
+
+static reasoning_budget rb_init(const bpe_vocab *vocab, int budget) {
+    reasoning_budget rb;
+    memset(&rb, 0, sizeof(rb));
+    rb.budget = budget;
+    rb.state = RB_IDLE;
+
+    rb.n_start = bpe_tokenize(vocab, "<|channel>thought\n", -1, rb.start_tokens, 8);
+    if (rb.n_start < 0) rb.n_start = 0;
+
+    rb.n_end = bpe_tokenize(vocab, "<channel|>", -1, rb.end_tokens, 8);
+    if (rb.n_end < 0) rb.n_end = 0;
+
+    return rb;
+}
+
+static void rb_observe(reasoning_budget *rb, int32_t token) {
+    switch (rb->state) {
+    case RB_IDLE:
+        if (rb->n_start > 0 && token == rb->start_tokens[rb->start_matched]) {
+            rb->start_matched++;
+            if (rb->start_matched >= rb->n_start) {
+                rb->state = RB_COUNTING;
+                rb->count = 0;
+                rb->start_matched = 0;
+            }
+        } else {
+            rb->start_matched = 0;
+            /* check if this token starts a new match */
+            if (rb->n_start > 0 && token == rb->start_tokens[0])
+                rb->start_matched = 1;
+        }
+        break;
+
+    case RB_COUNTING:
+        rb->count++;
+        /* detect natural end sequence */
+        if (rb->n_end > 0 && token == rb->end_tokens[rb->end_matched]) {
+            rb->end_matched++;
+            if (rb->end_matched >= rb->n_end) {
+                rb->state = RB_DONE;
+                rb->end_matched = 0;
+            }
+        } else {
+            rb->end_matched = 0;
+            if (rb->n_end > 0 && token == rb->end_tokens[0])
+                rb->end_matched = 1;
+        }
+        /* check budget */
+        if (rb->state == RB_COUNTING && rb->count >= rb->budget) {
+            rb->state = RB_FORCING;
+            rb->force_idx = 0;
+        }
+        break;
+
+    case RB_FORCING:
+    case RB_DONE:
+        break;
+    }
+}
+
+static int rb_needs_forcing(const reasoning_budget *rb) {
+    return rb->state == RB_FORCING;
+}
+
+static int32_t rb_force_next(reasoning_budget *rb) {
+    if (rb->state != RB_FORCING) return -1;
+    if (rb->force_idx >= rb->n_end) {
+        rb->state = RB_DONE;
+        return -1;
+    }
+    int32_t tok = rb->end_tokens[rb->force_idx++];
+    if (rb->force_idx >= rb->n_end)
+        rb->state = RB_DONE;
+    return tok;
+}
+
 /* Generate a synthetic checkerboard test image (224x224 RGB) */
 static uint8_t *generate_test_image(int size) {
     uint8_t *img = (uint8_t *)malloc(size * size * 3);
@@ -49,9 +165,60 @@ static uint8_t *generate_test_image(int size) {
     return img;
 }
 
+static gemma4_prompt_parts build_gemma4_prompt(const char *user_prompt) {
+    gemma4_prompt_parts parts;
+    snprintf(parts.pre_image, sizeof(parts.pre_image),
+             "<|turn>system\n<|think|><turn|>\n<|turn>user\n<|image>");
+    snprintf(parts.post_image, sizeof(parts.post_image),
+             "<image|>%s<turn|>\n<|turn>model\n",
+             user_prompt);
+    return parts;
+}
+
+static gemma4_decode_state init_decode_state(const bpe_vocab *vocab) {
+    gemma4_decode_state st;
+    st.eos_id = bpe_eos_id(vocab);
+    st.eot_id = bpe_eot_id(vocab);
+    st.turn_end_id = -1;
+    st.channel_start_id = -1;
+    st.channel_end_id = -1;
+    st.in_thought = 0;
+
+    int32_t tmp[4];
+    int n = bpe_tokenize(vocab, "<|channel>", -1, tmp, 4);
+    if (n == 1) st.channel_start_id = tmp[0];
+    n = bpe_tokenize(vocab, "<channel|>", -1, tmp, 4);
+    if (n == 1) st.channel_end_id = tmp[0];
+    n = bpe_tokenize(vocab, "<turn|>", -1, tmp, 4);
+    if (n == 1) st.turn_end_id = tmp[0];
+
+    return st;
+}
+
+static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st, int32_t token) {
+    if (token == st->channel_start_id) {
+        st->in_thought = 1;
+        return;
+    }
+    if (token == st->channel_end_id) {
+        st->in_thought = 0;
+        return;
+    }
+    if (st->in_thought) return;
+
+    const char *tok_str = bpe_token_to_str(vocab, token);
+    if (!tok_str) return;
+
+    int dec_len = 0;
+    char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
+    fwrite(decoded, 1, dec_len, stdout);
+    fflush(stdout);
+    free(decoded);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen] [--budget N]\n", argv[0]);
         return 1;
     }
 
@@ -60,10 +227,13 @@ int main(int argc, char **argv) {
     const char *image_path = NULL;
     const char *user_prompt = "explain the image";
     int max_gen = 100;
+    int reasoning_budget_tokens = 200;
 
     /* Parse optional args: image path (has . extension), prompt (text), max_gen (number) */
     for (int i = 3; i < argc; i++) {
-        if (strchr(argv[i], '.') && (strstr(argv[i], ".jpg") || strstr(argv[i], ".jpeg") ||
+        if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) {
+            reasoning_budget_tokens = atoi(argv[++i]);
+        } else if (strchr(argv[i], '.') && (strstr(argv[i], ".jpg") || strstr(argv[i], ".jpeg") ||
             strstr(argv[i], ".png") || strstr(argv[i], ".bmp") || strstr(argv[i], ".ppm"))) {
             image_path = argv[i];
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
@@ -83,6 +253,7 @@ int main(int argc, char **argv) {
 
     transformer_model *model = transformer_load(gguf_main, 512);
     if (!model) { fprintf(stderr, "failed to load model\n"); return 1; }
+    transformer_set_trace_hidden_norms(model, 0);
 
     /* 2. Load vision encoder */
     fprintf(stderr, "Loading mmproj: %s\n", mmproj_path);
@@ -114,7 +285,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Using synthetic checkerboard %dx%d\n", img_w, img_h);
     }
 
-    fprintf(stderr, "Prompt: \"%s\"\n", user_prompt);
+    fprintf(stderr, "Prompt: \"%s\" (reasoning budget: %d)\n",
+            user_prompt, reasoning_budget_tokens);
 
     /* 4. Encode image through vision encoder */
     fprintf(stderr, "\n=== Vision Encoding ===\n");
@@ -144,18 +316,19 @@ int main(int argc, char **argv) {
                 min_v, max_v, sum / total);
     }
 
-    /* 5. Build multimodal prompt */
-    /* Gemma4 chat format:
-     *   <|turn>user\n<|image>...<image|>{prompt}<turn|>\n<|turn>model\n
-     * <|image> = token 255999, <image|> = token 258882
-     */
-    char pre_image_buf[256];
-    snprintf(pre_image_buf, sizeof(pre_image_buf), "<|turn>user\n<|image>");
-    const char *pre_image = pre_image_buf;
+    /* 5. Build multimodal prompt (llama.cpp-style system turn + user turn).
+     * Layout: BOS <|turn>system\n<|think|><turn|>\n <|turn>user\n<|image>
+     *         [vision embeddings] <image|>{prompt}<turn|>\n <|turn>model\n
+     * The system turn enables thinking; the model enters/exits thought
+     * channel naturally. Reasoning budget caps thought tokens. */
+    gemma4_prompt_parts prompt_parts = build_gemma4_prompt(user_prompt);
+    const char *pre_image = prompt_parts.pre_image;
+    const char *post_image = prompt_parts.post_image;
 
-    char post_image_buf[512];
-    snprintf(post_image_buf, sizeof(post_image_buf), "<image|>%s<turn|>\n<|turn>model\n", user_prompt);
-    const char *post_image = post_image_buf;
+    int32_t bos_id = vocab->bos_id;
+    if (bos_id >= 0) {
+        fprintf(stderr, "BOS token: %d(\"%s\")\n", bos_id, bpe_token_to_str(vocab, bos_id));
+    }
 
     /* Tokenize pre-image text */
     int32_t pre_tokens[64];
@@ -178,6 +351,11 @@ int main(int argc, char **argv) {
     int pos = 0;
     int n_vision = vision->n_merged;
     int proj_dim = vision->proj_dim;
+
+    if (bos_id >= 0) {
+        transformer_forward(model, bos_id, pos++);
+        fprintf(stderr, "Prefilled BOS token\n");
+    }
 
     /* Prefill pre-image text tokens */
     for (int i = 0; i < n_pre; i++) {
@@ -205,35 +383,38 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "First generated token: %d \"%s\" (logit=%.4f)\n",
                         argmax, bpe_token_to_str(vocab, argmax), logits[argmax]);
 
-                /* 7. Generate tokens with top-k sampling (temperature=0.7, top_k=40) */
-                fprintf(stderr, "\n=== Generation ===\n");
+                /* 7. Generate tokens with reasoning budget */
+                fprintf(stderr, "\n=== Generation (budget=%d) ===\n",
+                        reasoning_budget_tokens);
                 int32_t next_token = argmax;
-                int eos_id = bpe_eos_id(vocab);
-                int eot_id = bpe_eot_id(vocab);
+                gemma4_decode_state decode_state = init_decode_state(vocab);
+                reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
                 float temperature = 0.7f;
                 int top_k = 40;
                 srand((unsigned)time(NULL));
 
                 for (int g = 0; g < max_gen; g++) {
-                    const char *tok_str = bpe_token_to_str(vocab, next_token);
-                    if (tok_str) {
-                        int dec_len;
-                        char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
-                        fwrite(decoded, 1, dec_len, stdout);
-                        fflush(stdout);
-                        free(decoded);
-                    }
+                    emit_visible_token(vocab, &decode_state, next_token);
+                    rb_observe(&rb, next_token);
 
-                    if (next_token == eos_id || next_token == eot_id) break;
-                    /* Also stop on <turn|> (end of turn) */
-                    if (next_token == 106) break;
+                    if (next_token == decode_state.eos_id ||
+                        next_token == decode_state.eot_id ||
+                        next_token == decode_state.turn_end_id) break;
 
                     logits = transformer_forward_logits(model, next_token, pos++);
                     if (!logits) break;
 
+                    /* If reasoning budget exhausted, force end tokens */
+                    if (rb_needs_forcing(&rb)) {
+                        int32_t forced = rb_force_next(&rb);
+                        if (forced >= 0) {
+                            next_token = forced;
+                            continue;
+                        }
+                    }
+
                     /* Top-k sampling with temperature */
                     int n_vocab = model->n_vocab;
-                    /* Apply temperature */
                     float inv_temp = 1.0f / temperature;
                     for (int j = 0; j < n_vocab; j++) logits[j] *= inv_temp;
 
@@ -273,6 +454,8 @@ int main(int argc, char **argv) {
                     free(topk_val);
                 }
                 printf("\n");
+                fprintf(stderr, "[thought: %d/%d tokens used]\n",
+                        rb.count, rb.budget);
             }
         } else {
             transformer_forward(model, post_tokens[i], pos++);
