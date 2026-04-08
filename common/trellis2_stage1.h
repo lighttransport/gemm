@@ -194,19 +194,15 @@ float *t2_stage1_sample(t2_stage1 *s, const float *cond, int n_cond,
             for (int i = 0; i < n_elem; i++)
                 pred_v[i] = s->cfg_scale * v_cond[i] + (1.0f - s->cfg_scale) * v_uncond[i];
 
-            /* CFG rescale: match std of unconditioned x_0 prediction */
+            /* CFG rescale: blend x0_cfg toward x0_uncond by matching std.
+             * x0_uncond = (1-sm)*x - t_coeff*v_uncond (reference)
+             * x0_cfg    = (1-sm)*x - t_coeff*pred_v   (CFG-boosted)
+             * scale = cfg_rescale*(std_uncond/std_cfg) + (1-cfg_rescale) */
             if (s->cfg_rescale > 0.0f) {
                 float sm = s->sigma_min;
                 float t_coeff = sm + (1.0f - sm) * t_cur;
-                /* x_0_pos = (1-sm)*x - t_coeff * v_cond_orig */
-                /* But v_cond was already overwritten. Use v_uncond for pos estimate. */
-                /* Recompute: we need the original v_cond. Since we overwrote it,
-                 * recover it: v_cond_orig = (pred_v - (1-g)*v_uncond) / g */
-                /* Simpler: compute std of pred_x0 from pred_v and from v_cond(recomputed) */
-                /* For now, compute the std-ratio rescaling */
                 float sum_pos2 = 0, sum_cfg2 = 0;
                 for (int i = 0; i < n_elem; i++) {
-                    /* Use v_uncond as proxy for v_cond_orig (approximate) */
                     float x0_pos = (1.0f - sm) * x[i] - t_coeff * v_uncond[i];
                     float x0_cfg = (1.0f - sm) * x[i] - t_coeff * pred_v[i];
                     sum_pos2 += x0_pos * x0_pos;
@@ -215,16 +211,10 @@ float *t2_stage1_sample(t2_stage1 *s, const float *cond, int n_cond,
                 float std_pos = sqrtf(sum_pos2 / n_elem);
                 float std_cfg = sqrtf(sum_cfg2 / n_elem);
                 if (std_cfg > 1e-8f) {
-                    float ratio = std_pos / std_cfg;
-                    /* x0_rescaled = x0_cfg * ratio */
-                    /* x0_final = cfg_rescale * x0_rescaled + (1 - cfg_rescale) * x0_cfg */
-                    /* Equivalent: scale factor = cfg_rescale * ratio + (1 - cfg_rescale) */
-                    /* Then recompute pred_v from x0_final */
-                    float scale = s->cfg_rescale * ratio + (1.0f - s->cfg_rescale);
+                    float scale = s->cfg_rescale * (std_pos / std_cfg) + (1.0f - s->cfg_rescale);
                     for (int i = 0; i < n_elem; i++) {
                         float x0_cfg = (1.0f - sm) * x[i] - t_coeff * pred_v[i];
-                        float x0_final = scale * x0_cfg;
-                        pred_v[i] = ((1.0f - sm) * x[i] - x0_final) / t_coeff;
+                        pred_v[i] = ((1.0f - sm) * x[i] - scale * x0_cfg) / t_coeff;
                     }
                 }
             }

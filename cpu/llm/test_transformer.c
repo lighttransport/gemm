@@ -41,9 +41,185 @@ static void print_hidden_stats(const float *hidden, int n_embd) {
             mean, norm, min_val, max_val);
 }
 
+/* Synthetic benchmark: allocate a fake model with zero weights, run forward passes.
+ * No file I/O, pure compute+memory measurement. */
+static int run_bench(int n_embd, int n_heads, int n_kv_heads, int head_dim,
+                      int n_ff, int n_layers, int n_tokens, int n_threads) {
+    /* Allocate a fake GGUF data block sized for BF16 weights */
+    size_t per_layer = (size_t)(
+        (size_t)n_embd * n_heads * head_dim +    /* attn_q */
+        (size_t)n_embd * n_kv_heads * head_dim + /* attn_k */
+        (size_t)n_embd * n_kv_heads * head_dim + /* attn_v */
+        (size_t)n_embd * n_heads * head_dim +    /* attn_output */
+        (size_t)n_embd * n_ff +                  /* ffn_gate */
+        (size_t)n_embd * n_ff +                  /* ffn_up */
+        (size_t)n_ff * n_embd +                  /* ffn_down */
+        (size_t)n_embd * 2                       /* norms */
+    ) * 2;  /* BF16 = 2 bytes per element */
+    size_t total = per_layer * n_layers + (size_t)n_embd * 248320 * 2; /* + token_embd */
+    fprintf(stderr, "bench: synthetic model %dx%d, %d layers, %.1f GB BF16\n",
+            n_embd, n_ff, n_layers, (double)total / (1024.0*1024.0*1024.0));
+
+    /* Allocate zeroed weight buffer */
+    void *weights = NULL;
+    size_t align = 2 * 1024 * 1024;
+    size_t alloc_size = (total + align - 1) & ~(align - 1);
+    if (posix_memalign(&weights, align, alloc_size) != 0) {
+        fprintf(stderr, "bench: failed to allocate %.1f GB\n", (double)alloc_size/(1024.0*1024.0*1024.0));
+        return 1;
+    }
+
+    /* Don't touch pages yet — defer to NUMA-aware first-touch after thread setup */
+    (void)alloc_size;
+
+    /* Build a minimal transformer_model manually */
+    int max_seq_len = 256;
+    int kv_dim = n_kv_heads * head_dim;
+    int q_dim = n_heads * head_dim;
+    int max_dim = n_embd > n_ff ? n_embd : n_ff;
+
+    transformer_model *m = (transformer_model *)calloc(1, sizeof(transformer_model));
+    m->n_layers = n_layers; m->n_embd = n_embd; m->n_heads = n_heads;
+    m->n_kv_heads = n_kv_heads; m->head_dim = head_dim; m->n_ff = n_ff;
+    m->n_vocab = 248320; m->max_seq_len = max_seq_len; m->has_lm_head = 0;
+    m->rms_norm_eps = 1e-6f;
+
+    /* Point all weight tensors into the zeroed buffer */
+    uint8_t *wp = (uint8_t *)weights;
+    #define MAKE_TENSOR(rows, cols) \
+        (qtensor){wp, GGML_TYPE_BF16, (rows), (cols), 2, {(cols), (rows), 0, 0}}; \
+        wp += (size_t)(rows) * (cols) * 2
+
+    m->token_embd = MAKE_TENSOR(m->n_vocab, n_embd);
+    m->output_norm = MAKE_TENSOR(1, n_embd);
+    m->layers = (transformer_layer *)calloc(n_layers, sizeof(transformer_layer));
+
+    m->key_cache = (float **)calloc(n_layers, sizeof(float *));
+    m->value_cache = (float **)calloc(n_layers, sizeof(float *));
+    for (int l = 0; l < n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+        layer->attn_norm = MAKE_TENSOR(1, n_embd);
+        layer->attn_q = MAKE_TENSOR(q_dim, n_embd);
+        layer->attn_k = MAKE_TENSOR(kv_dim, n_embd);
+        layer->attn_v = MAKE_TENSOR(kv_dim, n_embd);
+        layer->attn_output = MAKE_TENSOR(n_embd, q_dim);
+        layer->ffn_norm = MAKE_TENSOR(1, n_embd);
+        layer->ffn_gate = MAKE_TENSOR(n_ff, n_embd);
+        layer->ffn_up = MAKE_TENSOR(n_ff, n_embd);
+        layer->ffn_down = MAKE_TENSOR(n_embd, n_ff);
+        m->key_cache[l] = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+        m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+    }
+    #undef MAKE_TENSOR
+
+    /* Scratch buffers */
+    m->x = (float *)calloc(n_embd, sizeof(float));
+    m->xb = (float *)calloc(n_embd, sizeof(float));
+    m->xb2 = (float *)calloc(q_dim > n_ff ? q_dim : n_ff, sizeof(float));
+    m->q = (float *)calloc(q_dim, sizeof(float));
+    m->k = (float *)calloc(kv_dim, sizeof(float));
+    m->v = (float *)calloc(kv_dim, sizeof(float));
+    m->att = (float *)calloc(n_heads * max_seq_len, sizeof(float));
+    m->ffn_buf1 = (float *)calloc(n_ff, sizeof(float));
+    m->ffn_buf2 = (float *)calloc(n_ff, sizeof(float));
+    m->ffn_buf3 = (float *)calloc(n_ff, sizeof(float));
+    m->matvec_tmp = (float *)calloc(max_dim, sizeof(float));
+    m->rope_inv_freq = (float *)calloc(head_dim / 2, sizeof(float));
+    m->n_threads = 1;
+    m->thread_tmp = (float **)calloc(1, sizeof(float *));
+    m->thread_tmp[0] = m->matvec_tmp;
+
+    if (n_threads > 1) transformer_set_threads(m, n_threads);
+
+    /* NUMA first-touch: each thread zeroes its partition of the weight buffer.
+     * With demand paging, pages land on the touching thread's CMG.
+     * Distribute per-tensor (row-partitioned) to match matvec row distribution. */
+    {
+        size_t used = (size_t)((uint8_t *)wp - (uint8_t *)weights);
+        if (n_threads > 1) {
+            fprintf(stderr, "bench: NUMA distributing %.1f GB across %d threads...\n",
+                    (double)used / (1024.0*1024.0*1024.0), n_threads);
+            for (int l = 0; l < n_layers; l++) {
+                transformer_layer *layer = &m->layers[l];
+                const qtensor *tensors[] = {
+                    &layer->attn_q, &layer->attn_k, &layer->attn_v, &layer->attn_output,
+                    &layer->ffn_gate, &layer->ffn_up, &layer->ffn_down, NULL
+                };
+                for (int ti = 0; tensors[ti]; ti++) {
+                    const qtensor *t = tensors[ti];
+                    if (t->data && t->n_rows >= n_threads)
+                        tf_numa_distribute_buffer(m, t->data, (size_t)t->n_rows * t->n_cols * 2);
+                }
+                /* Small tensors (norms): touch from thread 0 */
+                if (layer->attn_norm.data) memset(layer->attn_norm.data, 0, layer->attn_norm.n_cols * 2);
+                if (layer->ffn_norm.data) memset(layer->ffn_norm.data, 0, layer->ffn_norm.n_cols * 2);
+            }
+            /* Token embedding: distribute */
+            if (m->token_embd.data)
+                tf_numa_distribute_buffer(m, m->token_embd.data,
+                    (size_t)m->token_embd.n_rows * m->token_embd.n_cols * 2);
+            fprintf(stderr, "bench: NUMA distribution done\n");
+        } else {
+            memset(weights, 0, used);
+        }
+    }
+
+    /* Warmup: 2 forward passes */
+    for (int w = 0; w < 2; w++) {
+        for (int i = 0; i < n_embd; i++) m->x[i] = 0.01f * (i % 100);
+        transformer_forward(m, 0, w);
+    }
+
+    /* Benchmark */
+    fprintf(stderr, "bench: running %d tokens with %d threads...\n", n_tokens, n_threads);
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    for (int t = 0; t < n_tokens; t++) {
+        for (int i = 0; i < n_embd; i++) m->x[i] = 0.01f * ((t + i) % 100);
+        transformer_forward(m, 0, (t + 2) % max_seq_len);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double elapsed = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+    double tok_per_sec = n_tokens / elapsed;
+    double gb_per_sec = (double)total * n_tokens / elapsed / (1024.0*1024.0*1024.0);
+    double ms_per_tok = elapsed / n_tokens * 1000.0;
+
+    fprintf(stderr, "\nbench: %d tokens in %.3f s\n", n_tokens, elapsed);
+    fprintf(stderr, "bench: %.1f ms/tok, %.1f tok/s\n", ms_per_tok, tok_per_sec);
+    fprintf(stderr, "bench: %.1f GB/s effective bandwidth\n", gb_per_sec);
+
+    /* Cleanup */
+    for (int l = 0; l < n_layers; l++) {
+        free(m->key_cache[l]); free(m->value_cache[l]);
+    }
+    free(m->key_cache); free(m->value_cache); free(m->layers);
+    free(m->x); free(m->xb); free(m->xb2); free(m->q); free(m->k); free(m->v);
+    free(m->att); free(m->ffn_buf1); free(m->ffn_buf2); free(m->ffn_buf3);
+    free(m->matvec_tmp); free(m->rope_inv_freq);
+    if (m->n_threads > 1) {
+        for (int t = 1; t < m->n_threads; t++) free(m->thread_tmp[t]);
+    }
+    free(m->thread_tmp); free(m); free(weights);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    /* Synthetic benchmark mode: --bench [n_threads] [n_tokens] [model_size] */
+    if (argc >= 2 && strcmp(argv[1], "--bench") == 0) {
+        int nt = (argc >= 3) ? atoi(argv[2]) : 1;
+        int ntok = (argc >= 4) ? atoi(argv[3]) : 20;
+        const char *size = (argc >= 5) ? argv[4] : "2b";
+        if (strcmp(size, "9b") == 0 || strcmp(size, "9B") == 0)
+            return run_bench(4096, 16, 4, 256, 12288, 32, ntok, nt);
+        else
+            return run_bench(2048, 8, 2, 256, 6144, 24, ntok, nt);
+    }
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <model.gguf> [prompt] [max_gen_tokens] [n_threads]\n", argv[0]);
+        fprintf(stderr, "       %s --bench [n_threads] [n_tokens] [2b|9b]\n", argv[0]);
         return 1;
     }
 
@@ -55,8 +231,9 @@ int main(int argc, char **argv) {
     srand((unsigned)time(NULL));
 
     /* Load GGUF */
-    fprintf(stderr, "Loading GGUF: %s\n", model_path);
-    gguf_context *gguf = gguf_open(model_path, 1);
+    int use_mmap = (getenv("NO_MMAP") == NULL) ? 1 : 0;
+    fprintf(stderr, "Loading GGUF: %s (mmap=%d)\n", model_path, use_mmap);
+    gguf_context *gguf = gguf_open(model_path, use_mmap);
     if (!gguf) {
         fprintf(stderr, "Failed to open GGUF\n");
         return 1;
@@ -84,11 +261,12 @@ int main(int argc, char **argv) {
     }
 
     if (n_threads > 1) transformer_set_threads(model, n_threads);
+    if (n_threads > 1) transformer_numa_setup(model, gguf);
 
     /* Tokenize prompt */
     fprintf(stderr, "Prompt: \"%s\"\n", prompt);
-    int32_t tokens[256];
-    int n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, 256);
+    int32_t tokens[2048];
+    int n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, 2048);
     fprintf(stderr, "Tokens (%d):", n_tokens);
     for (int i = 0; i < n_tokens; i++) {
         fprintf(stderr, " %d(\"%s\")", tokens[i], bpe_token_to_str(vocab, tokens[i]));

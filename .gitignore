@@ -70,6 +70,15 @@ zen2/bench_*
 # Fugaku job scheduler logs
 *.err
 
+# Build artifact binaries — sparse3d
+cpu/sparse3d/test_sparse3d
+cpu/dinov3/test_dinov3
+
+# Verification output directories
+cpu/sparse3d/ref_output/
+cpu/sparse3d/c_output/
+cpu/sparse3d/.venv/
+
 # External / generated
 ref/
 result/

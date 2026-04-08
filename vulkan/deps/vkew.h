@@ -873,6 +873,22 @@ typedef void (VKAPI_PTR *PFN_vkGetDeviceQueue)(VkDevice, uint32_t, uint32_t, VkQ
 typedef VkResult (VKAPI_PTR *PFN_vkDeviceWaitIdle)(VkDevice);
 typedef VkResult (VKAPI_PTR *PFN_vkQueueWaitIdle)(VkQueue);
 
+// Fence types and functions
+typedef struct VkFenceCreateInfo {
+    VkStructureType sType;
+    const void* pNext;
+    VkFlags flags;
+} VkFenceCreateInfo;
+enum { VK_FENCE_CREATE_SIGNALED_BIT = 0x00000001 };
+
+typedef VkResult (VKAPI_PTR *PFN_vkCreateFence)(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence*);
+typedef void (VKAPI_PTR *PFN_vkDestroyFence)(VkDevice, VkFence, const VkAllocationCallbacks*);
+typedef VkResult (VKAPI_PTR *PFN_vkWaitForFences)(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
+typedef VkResult (VKAPI_PTR *PFN_vkResetFences)(VkDevice, uint32_t, const VkFence*);
+
+// Fill buffer (GPU memset)
+typedef void (VKAPI_PTR *PFN_vkCmdFillBuffer)(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, uint32_t);
+
 // Memory functions
 typedef VkResult (VKAPI_PTR *PFN_vkAllocateMemory)(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory*);
 typedef void (VKAPI_PTR *PFN_vkFreeMemory)(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*);
@@ -972,6 +988,11 @@ extern PFN_vkDestroyDevice vkDestroyDevice;
 extern PFN_vkGetDeviceQueue vkGetDeviceQueue;
 extern PFN_vkDeviceWaitIdle vkDeviceWaitIdle;
 extern PFN_vkQueueWaitIdle vkQueueWaitIdle;
+extern PFN_vkCreateFence vkCreateFence;
+extern PFN_vkDestroyFence vkDestroyFence;
+extern PFN_vkWaitForFences vkWaitForFences;
+extern PFN_vkResetFences vkResetFences;
+extern PFN_vkCmdFillBuffer vkCmdFillBuffer;
 
 // Memory
 extern PFN_vkAllocateMemory vkAllocateMemory;

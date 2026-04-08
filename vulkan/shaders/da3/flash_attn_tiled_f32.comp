@@ -1,0 +1,108 @@
+#version 450
+
+// BQ=64 threads per workgroup, BKV=16 tile, HEAD_DIM=64
+#define FA_BQ  64
+#define FA_BKV 16
+#define FA_HEAD_DIM 64
+
+layout(local_size_x = FA_BQ) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint dim;
+    uint n_heads;
+    uint head_dim;
+    float scale;
+} pc;
+
+layout(std430, binding = 0) writeonly buffer OutBuf { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer QkvBuf { float qkv[]; };
+layout(std430, binding = 2) readonly buffer KtBuf { float K_t[]; };
+layout(std430, binding = 3) readonly buffer VtBuf { float V_t[]; };
+
+shared float smK[FA_BKV * FA_HEAD_DIM];
+shared float smV[FA_BKV * FA_HEAD_DIM];
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint qi = gl_WorkGroupID.y * FA_BQ + gl_LocalInvocationID.x;
+    if (h >= pc.n_heads) return;
+
+    uint dim3 = 3u * pc.dim;
+    uint qi_safe = (qi < pc.n_tok) ? qi : 0u;
+    uint qt_base = qi_safe * dim3 + h * pc.head_dim;
+    uint kt_h_base = h * pc.n_tok * pc.head_dim;
+    uint vt_h_base = h * pc.n_tok * pc.head_dim;
+
+    uint tid = gl_LocalInvocationID.x;
+
+    // Load Q into registers
+    float q_reg[FA_HEAD_DIM];
+    for (int d = 0; d < FA_HEAD_DIM; d++)
+        q_reg[d] = (qi < pc.n_tok) ? qkv[qt_base + uint(d)] : 0.0;
+
+    float m_i = -1e30;
+    float l_i = 0.0;
+    float O_i[FA_HEAD_DIM];
+    for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] = 0.0;
+
+    uint kv_tiles = (pc.n_tok + FA_BKV - 1u) / FA_BKV;
+
+    for (uint tile = 0u; tile < kv_tiles; tile++) {
+        uint kv = tile * FA_BKV;
+
+        // Load K and V tiles into shared memory
+        for (uint load_idx = tid; load_idx < FA_BKV * FA_HEAD_DIM; load_idx += FA_BQ) {
+            uint kj = load_idx / FA_HEAD_DIM;
+            uint d  = load_idx % FA_HEAD_DIM;
+            uint kv_tok = kv + kj;
+            smK[load_idx] = (kv_tok < pc.n_tok) ? K_t[kt_h_base + kv_tok * pc.head_dim + d] : 0.0;
+            smV[load_idx] = (kv_tok < pc.n_tok) ? V_t[vt_h_base + kv_tok * pc.head_dim + d] : 0.0;
+        }
+        barrier();
+
+        // Compute attention scores
+        float sc[FA_BKV];
+        for (int kj = 0; kj < FA_BKV; kj++) sc[kj] = 0.0;
+        for (int d = 0; d < FA_HEAD_DIM; d++) {
+            float qd = q_reg[d];
+            for (int kj = 0; kj < FA_BKV; kj++)
+                sc[kj] += qd * smK[kj * FA_HEAD_DIM + d];
+        }
+
+        // Online softmax
+        float mx_tile = -1e30;
+        for (int kj = 0; kj < FA_BKV; kj++) {
+            sc[kj] = (kv + uint(kj) < pc.n_tok) ? sc[kj] * pc.scale : -1e30;
+            if (sc[kj] > mx_tile) mx_tile = sc[kj];
+        }
+
+        float mn_i = max(m_i, mx_tile);
+        float alpha = exp(m_i - mn_i);
+        l_i *= alpha;
+        for (int d = 0; d < FA_HEAD_DIM; d++) O_i[d] *= alpha;
+        m_i = mn_i;
+
+        float ej[FA_BKV];
+        for (int kj = 0; kj < FA_BKV; kj++) {
+            ej[kj] = (kv + uint(kj) < pc.n_tok) ? exp(sc[kj] - m_i) : 0.0;
+            l_i += ej[kj];
+        }
+
+        for (int kj = 0; kj < FA_BKV; kj++) {
+            float e = ej[kj];
+            for (int d = 0; d < FA_HEAD_DIM; d++)
+                O_i[d] += e * smV[kj * FA_HEAD_DIM + d];
+        }
+
+        barrier();
+    }
+
+    // Write output
+    if (qi < pc.n_tok) {
+        float inv_l = (l_i > 0.0) ? 1.0 / l_i : 0.0;
+        uint out_base = qi * pc.dim + h * pc.head_dim;
+        for (int d = 0; d < FA_HEAD_DIM; d++)
+            out_buf[out_base + uint(d)] = O_i[d] * inv_l;
+    }
+}

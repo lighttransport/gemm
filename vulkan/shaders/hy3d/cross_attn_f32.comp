@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: MIT
+// Cross-attention with different Q/KV lengths.
+// One workgroup per (head, query_token). Uses shared memory for scores + softmax.
+// Grid: (n_heads, q_len), workgroup size: 128
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer QBuffer { float Q[]; };
+layout(std430, binding = 2) readonly buffer KBuffer { float K[]; };
+layout(std430, binding = 3) readonly buffer VBuffer { float V[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint q_len;
+    uint kv_len;
+    uint dim;
+    uint n_heads;
+    uint head_dim;
+    float scale;
+} pc;
+
+// Shared memory: scores[kv_len] + rbuf[128]
+// We use a fixed max size; the host must ensure kv_len + 128 fits.
+// For dynamic sizing, use specialization constants. Here we use a generous limit.
+shared float sdata[8320]; // supports kv_len up to 8192
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint qi = gl_WorkGroupID.y;
+    if (h >= pc.n_heads || qi >= pc.q_len) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint nt = 128;
+
+    uint q_offset = qi * pc.dim + h * pc.head_dim;
+
+    // scores occupies sdata[0 .. kv_len-1], rbuf occupies sdata[kv_len .. kv_len+127]
+
+    // Phase 1: Q @ K^T
+    for (uint ki = tid; ki < pc.kv_len; ki += nt) {
+        uint k_offset = ki * pc.dim + h * pc.head_dim;
+        float dot = 0.0;
+        for (uint d = 0; d < pc.head_dim; d++) {
+            dot += Q[q_offset + d] * K[k_offset + d];
+        }
+        sdata[ki] = dot * pc.scale;
+    }
+    barrier();
+
+    // Phase 2: Softmax -- find max
+    float lmax = -1.0e30;
+    for (uint ki = tid; ki < pc.kv_len; ki += nt) {
+        lmax = max(lmax, sdata[ki]);
+    }
+    sdata[pc.kv_len + tid] = lmax;
+    barrier();
+
+    for (uint r = nt / 2; r > 0; r >>= 1) {
+        if (tid < r) {
+            sdata[pc.kv_len + tid] = max(sdata[pc.kv_len + tid], sdata[pc.kv_len + tid + r]);
+        }
+        barrier();
+    }
+    float mx = sdata[pc.kv_len];
+    barrier();
+
+    // Exp + sum
+    float lsum = 0.0;
+    for (uint ki = tid; ki < pc.kv_len; ki += nt) {
+        sdata[ki] = exp(sdata[ki] - mx);
+        lsum += sdata[ki];
+    }
+    sdata[pc.kv_len + tid] = lsum;
+    barrier();
+
+    for (uint r = nt / 2; r > 0; r >>= 1) {
+        if (tid < r) {
+            sdata[pc.kv_len + tid] += sdata[pc.kv_len + tid + r];
+        }
+        barrier();
+    }
+    float inv_sum = (sdata[pc.kv_len] > 0.0) ? 1.0 / sdata[pc.kv_len] : 0.0;
+
+    for (uint ki = tid; ki < pc.kv_len; ki += nt) {
+        sdata[ki] *= inv_sum;
+    }
+    barrier();
+
+    // Phase 3: Weighted sum of V
+    for (uint d = tid; d < pc.head_dim; d += nt) {
+        float acc = 0.0;
+        for (uint ki = 0; ki < pc.kv_len; ki++) {
+            acc += sdata[ki] * V[ki * pc.dim + h * pc.head_dim + d];
+        }
+        out_buf[qi * pc.dim + h * pc.head_dim + d] = acc;
+    }
+}

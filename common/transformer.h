@@ -41,6 +41,9 @@ typedef struct {
     qtensor attn_v;      /* [n_kv_dim, n_embd] */
     qtensor attn_q_norm; /* [head_dim] */
     qtensor attn_k_norm; /* [head_dim] */
+    qtensor attn_q_bias; /* [n_embd] Q projection bias (Qwen2.5-VL) */
+    qtensor attn_k_bias; /* [n_kv_dim] K projection bias */
+    qtensor attn_v_bias; /* [n_kv_dim] V projection bias */
     qtensor attn_output; /* [n_embd, n_embd] */
     qtensor ffn_norm;    /* [n_embd] */
     qtensor ffn_gate;    /* [n_ff, n_embd] */
@@ -63,19 +66,7 @@ typedef struct {
     qtensor ssm_norm;      /* [d_state] RMS norm for gated output */
     qtensor ssm_out;       /* [d_inner, n_embd] output projection */
 
-    /* Gemma4 tensors */
-    qtensor attn_v_norm;         /* [head_dim] V RMSNorm (Gemma4) */
-    qtensor post_attention_norm; /* [n_embd] after attn output, before residual */
-    qtensor post_ffw_norm;       /* [n_embd] after FFN output, before residual */
-    qtensor layer_output_scale;  /* [1] scalar per layer */
-    /* Per-layer embedding (Gemma4) */
-    qtensor ple_inp_gate;        /* [n_embd_per_layer, n_embd] gated input */
-    qtensor ple_proj;            /* [n_embd, n_embd_per_layer] project back */
-    qtensor ple_post_norm;       /* [n_embd] post-projection norm */
-
     int is_ssm;            /* 1 = Delta-Net SSM layer, 0 = full attention */
-    int is_swa;            /* 1 = sliding window attention (Gemma4) */
-    int shared_kv_source;  /* layer idx to reuse KV from, -1 = own KV (Gemma4) */
 } transformer_layer;
 
 typedef struct {
@@ -116,30 +107,6 @@ typedef struct {
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
     int ds_embd_stride;    /* total embedding dim = proj_dim * (1 + n_deepstack) */
 
-    /* Gemma4 architecture */
-    int is_gemma4;                  /* 1 if gemma4 architecture */
-    int swa_window_size;            /* sliding window size (512) */
-    int head_dim_full;              /* head dim for full-attention layers (512) */
-    int head_dim_swa;               /* head dim for SWA layers (256) */
-    int n_embd_per_layer;           /* per-layer embedding dim (256) */
-    int n_layer_kv_from_start;      /* layers 0..N-1 have own KV, rest share */
-    float final_logit_softcapping;  /* tanh softcap on output logits (30.0) */
-    float rope_freq_base_swa;       /* RoPE freq base for SWA layers (10000) */
-    float embd_scale;               /* sqrt(n_embd) for token embedding scaling */
-    int ffn_activation;             /* 0 = SiLU (default), 1 = GELU (Gemma4) */
-    int *swa_pattern;               /* [n_layers] 1=SWA, 0=full attention */
-    /* Per-layer embedding global tensors */
-    qtensor per_layer_token_embd;   /* [n_embd_per_layer*n_layer, n_vocab] */
-    qtensor per_layer_model_proj;   /* [n_embd_per_layer*n_layer, n_embd] */
-    qtensor per_layer_proj_norm;    /* [n_embd_per_layer*n_layer] */
-    /* Proportional RoPE for full-attention layers */
-    float *rope_freq_factors;       /* [head_dim_full/2] from rope_freqs.weight */
-    float *rope_inv_freq_swa;       /* [head_dim_swa/2] precomputed for SWA */
-    /* Per-layer embedding scratch */
-    float *ple_buf;                 /* [n_embd_per_layer] */
-    float *ple_proj_buf;            /* [n_embd] */
-    int current_token_id;           /* stashed for per-layer embd lookup */
-
     /* Global tensors */
     qtensor token_embd;  /* [n_vocab, n_embd] */
     qtensor output_norm; /* [n_embd] */
@@ -165,7 +132,6 @@ typedef struct {
     float *ffn_buf3; /* [n_ff] */
     float *logits;     /* [n_vocab] output logits (only if has_lm_head) */
     float *matvec_tmp; /* max(n_embd, n_ff) for row dequant (thread 0) */
-    int trace_hidden_norms; /* print per-layer hidden norms during forward */
 
     /* Multi-threading */
     int n_threads;           /* number of threads (default: 1) */
@@ -177,7 +143,7 @@ typedef struct {
     int rope_inv_freq_len;       /* head_dim/2 */
     int rope_mrope_inv_freq_len; /* sect_dims */
 
-    /* Thread pool (persistent workers, no per-call pthread_create) */
+    /* Thread pool (persistent workers with cond-var sleep between dispatches) */
     pthread_t *pool_threads;   /* [n_threads] worker threads */
     void *(*pool_fn)(void *);  /* current work function */
     void *pool_args;           /* array of per-thread task structs */
@@ -185,12 +151,25 @@ typedef struct {
     volatile int pool_phase;   /* incremented to signal work */
     volatile int pool_done;    /* number of workers done */
     int pool_alive;            /* 1 if pool is running */
+    pthread_mutex_t pool_mutex;/* protects pool_phase signaling */
+    pthread_cond_t pool_cond;  /* workers sleep here between dispatches */
+    volatile int bar_count;    /* barrier arrival counter */
+    volatile int bar_sense;    /* barrier sense flag (alternates 0/1) */
 
     /* Tensor parallelism */
     int tp_rank;               /* this rank's position in the TP group (0 if no TP) */
     int tp_size;               /* size of the TP group (1 if no TP) */
     void (*tp_allreduce_fn)(float *buf, int count, void *ctx);  /* allreduce callback */
     void *tp_allreduce_ctx;    /* opaque context passed to allreduce (e.g. parallel_config*) */
+
+    /* NUMA allocator state */
+    struct {
+        int n_cmgs;                   /* number of CMGs (default: 4) */
+        size_t per_cmg_budget;        /* usable bytes per CMG (default: 6GB) */
+        size_t per_cmg_used[8];       /* current usage per CMG */
+        size_t alignment;             /* minimum alignment (default: 2MB) */
+        int enabled;                  /* 0=fallback, 1=active */
+    } numa;
 } transformer_model;
 
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len);
@@ -198,7 +177,12 @@ void transformer_free(transformer_model *model);
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
-void transformer_set_trace_hidden_norms(transformer_model *model, int enable);
+
+/* Configure NUMA-aware weight/buffer distribution across CMGs.
+ * Must be called after transformer_set_threads, before inference.
+ * Env vars: NUMA_DISTRIBUTE=1 (enable), NUMA_N_CMGS (default 4),
+ *           NUMA_CMG_BUDGET_GB (default 6), NUMA_ALIGNMENT (default 2MB). */
+void transformer_numa_setup(transformer_model *m, const gguf_context *gguf);
 
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
  * For embedding models (no output projection), this is the final hidden state. */
@@ -302,6 +286,7 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <time.h>
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 
 /* Profiling macros: active only if profiler.h was included before this file */
 #ifdef PROFILER_H
@@ -356,6 +341,28 @@ static float tf_get_float(const gguf_context *gguf, const char *key, float defau
     return default_val;
 }
 
+/* ---- Aligned allocation helpers ---- */
+/* Returns zeroed memory aligned to 'alignment' bytes. */
+static void *tf_aligned_calloc(size_t alignment, size_t count, size_t elem_size) {
+    size_t size = count * elem_size;
+    size = (size + alignment - 1) & ~(alignment - 1);
+    void *p = NULL;
+    if (posix_memalign(&p, alignment, size) != 0) return NULL;
+    memset(p, 0, size);
+    return p;
+}
+
+/* Allocate aligned memory WITHOUT touching pages.
+ * With demand paging, first-touch from a worker thread will place pages
+ * on that thread's NUMA node. Safe for buffers that are always written
+ * before read (e.g. dequant scratch). */
+static void *tf_aligned_alloc_notouch(size_t alignment, size_t size) {
+    size = (size + alignment - 1) & ~(alignment - 1);
+    void *p = NULL;
+    if (posix_memalign(&p, alignment, size) != 0) return NULL;
+    return p;
+}
+
 /* ---- Compute helpers ---- */
 
 /* Dequantize one row of a quantized matrix.
@@ -373,18 +380,19 @@ static void tf_dequant_row(const qtensor *t, int row, float *dst) {
         case GGML_TYPE_Q8_0: block_size = 32;  type_size = 34;  break;
         case GGML_TYPE_Q4_K: block_size = 256; type_size = 144; break;
         case GGML_TYPE_Q5_K: block_size = 256; type_size = 176; break;
-        case GGML_TYPE_Q6_K: block_size = 256; type_size = 210; break;
-        case GGML_TYPE_F32:  block_size = 1;   type_size = 4;   break;
-        case GGML_TYPE_F16:  block_size = 1;   type_size = 2;   break;
-        case GGML_TYPE_BF16: block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_Q6_K:   block_size = 256; type_size = 210; break;
+        case GGML_TYPE_IQ4_XS: block_size = 256; type_size = 136; break;
+        case GGML_TYPE_F32:    block_size = 1;   type_size = 4;   break;
+        case GGML_TYPE_F16:    block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_BF16:   block_size = 1;   type_size = 2;   break;
         default:
             fprintf(stderr, "tf_dequant_row: unsupported type %u\n", t->type);
-            memset(dst, 0, n_cols * sizeof(float));
+            memset(dst, 0, (size_t)n_cols * sizeof(float));
             return;
     }
 
     size_t row_bytes = (size_t)((n_cols + block_size - 1) / block_size) * type_size;
-    const void *row_data = (const uint8_t *)t->data + row * row_bytes;
+    const void *row_data = (const uint8_t *)t->data + (size_t)row * row_bytes;
     dequant_row(t->type, row_data, dst, n_cols);
 }
 
@@ -396,6 +404,7 @@ static int tf_is_supported_weight_type(uint32_t type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
@@ -436,6 +445,13 @@ static void tf_qmatvec_expert(float *dst, const qtensor *mat, int expert, const 
         for (int i = 0; i < rows_per_expert; i++) {
             const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
             dst[i] = vec_dot_f16_f32(row, x, mat->n_cols);
+        }
+        return;
+    }
+    if (mat->type == GGML_TYPE_BF16) {
+        for (int i = 0; i < rows_per_expert; i++) {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+            dst[i] = vec_dot_bf16_f32(row, x, mat->n_cols);
         }
         return;
     }
@@ -556,6 +572,24 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         return NULL;
     }
+    if (t->mat->type == GGML_TYPE_BF16) {
+        const uint8_t *base = (const uint8_t *)t->mat->data;
+        size_t row_bytes = (size_t)n_cols * 2;
+        int i = t->row_start;
+        for (; i + 3 < t->row_end; i += 4) {
+            matvec_bf16_4row(t->dst + i,
+                (const uint16_t *)(base + (size_t)i * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
+                t->x, n_cols);
+        }
+        for (; i < t->row_end; i++) {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+            t->dst[i] = vec_dot_bf16_f32(row, t->x, n_cols);
+        }
+        return NULL;
+    }
     if (t->mat->type == GGML_TYPE_Q8_0) {
         int nb = n_cols / 32;
         size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
@@ -618,6 +652,36 @@ static void tf_matvec_q8_rows(float *dst, const uint8_t *base, size_t row_bytes,
     }
 }
 
+static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                  const float *x, int n_cols, int row_start, int row_end) {
+    int i = row_start;
+    /* 8-row blocks: 8 FMAs per activation load, doubles compute/memory ratio */
+    for (; i + 7 < row_end; i += 8) {
+        matvec_bf16_8row(dst + i,
+            (const uint16_t *)(base + (size_t)(i)   * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+4) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+5) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+6) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+7) * row_bytes),
+            x, n_cols);
+    }
+    for (; i + 3 < row_end; i += 4) {
+        matvec_bf16_4row(dst + i,
+            (const uint16_t *)(base + (size_t)(i)   * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
+            (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
+            x, n_cols);
+    }
+    for (; i < row_end; i++) {
+        const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
+        dst[i] = vec_dot_bf16_f32(row, x, n_cols);
+    }
+}
+
 static void tf_matvec_f16_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                  const float *x, int n_cols, int row_start, int row_end) {
     int i = row_start;
@@ -646,6 +710,12 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                             t->x, n_cols, t->row_start, t->row_end);
         tf_matvec_f16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                             t->x, n_cols, t->row_start, t->row_end);
+    } else if (t->mat1->type == GGML_TYPE_BF16) {
+        size_t row_bytes = (size_t)n_cols * 2;
+        tf_matvec_bf16_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
+        tf_matvec_bf16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
     } else if (t->mat1->type == GGML_TYPE_Q8_0) {
         int nb = n_cols / 32;
         size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
@@ -734,6 +804,62 @@ static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qten
     tf_pool_dispatch(m, tf_qmatvec_fused2_worker, tasks, sizeof(tf_matvec_fused2_task));
 }
 
+/* Forward declaration for fused FFN worker */
+static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *x,
+                                    int row_start, int row_end);
+
+/* Fused gate+up+SiLU: compute gate and up matvec for each thread's rows,
+ * then immediately apply silu(gate[i]) * up[i] → dst[i].
+ * Eliminates the SiLU barrier between gate+up and down projections.
+ * dst = silu(gate_mat @ x) * (up_mat @ x) */
+typedef struct {
+    float *dst;           /* output: silu(gate) * up, [n_rows] */
+    const qtensor *gate_mat, *up_mat;
+    const float *x;
+    int row_start, row_end;
+} tf_fused_ffn_silu_task;
+
+static void *tf_fused_ffn_silu_worker(void *arg) {
+    tf_fused_ffn_silu_task *t = (tf_fused_ffn_silu_task *)arg;
+    int rs = t->row_start, re = t->row_end;
+
+    /* Phase 1: Compute gate and up matvec for this thread's row range.
+     * tf_matvec_qtensor_rows writes to dst[row_start..row_end).
+     * Use dst as gate buffer, allocate up on stack. */
+    int n_rows = re - rs;
+    float *up_buf = (float *)alloca((size_t)n_rows * sizeof(float));
+
+    /* gate → dst[rs..re), up → up_buf[0..n_rows) */
+    tf_matvec_qtensor_rows(t->dst, t->gate_mat, t->x, rs, re);
+    tf_matvec_qtensor_rows(up_buf - rs, t->up_mat, t->x, rs, re);
+
+    /* Phase 2: Fused SiLU×mul in-place: dst[i] = silu(gate[i]) * up[i] */
+    for (int i = rs; i < re; i++) {
+        float g = t->dst[i];
+        t->dst[i] = g / (1.0f + expf(-g)) * up_buf[i - rs];
+    }
+    return NULL;
+}
+
+static void tf_qmatvec_fused2_silu_pool(transformer_model *m, float *dst,
+                                          const qtensor *gate_mat, const qtensor *up_mat,
+                                          const float *x, int n_rows) {
+    int nt = m->n_threads;
+    if (nt <= 1 || !m->pool_alive) {
+        tf_fused_ffn_silu_task t = {dst, gate_mat, up_mat, x, 0, n_rows};
+        tf_fused_ffn_silu_worker(&t);
+        return;
+    }
+    tf_fused_ffn_silu_task *tasks = (tf_fused_ffn_silu_task *)alloca(nt * sizeof(tf_fused_ffn_silu_task));
+    int rp = n_rows / nt, re = n_rows % nt, ro = 0;
+    for (int t = 0; t < nt; t++) {
+        int rc = rp + (t < re ? 1 : 0);
+        tasks[t] = (tf_fused_ffn_silu_task){dst, gate_mat, up_mat, x, ro, ro + rc};
+        ro += rc;
+    }
+    tf_pool_dispatch(m, tf_fused_ffn_silu_worker, tasks, sizeof(tf_fused_ffn_silu_task));
+}
+
 /* Fused triple-matrix matvec: Q/K/V in one dispatch.
  * mat1 has n_rows1 rows, mat2 and mat3 have n_rows2 rows each. All same n_cols. */
 typedef struct {
@@ -751,6 +877,9 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
     if (mat->type == GGML_TYPE_F16) {
         size_t rb = (size_t)n_cols * 2;
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+    } else if (mat->type == GGML_TYPE_BF16) {
+        size_t rb = (size_t)n_cols * 2;
+        tf_matvec_bf16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else if (mat->type == GGML_TYPE_Q8_0) {
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q8_0);
         tf_matvec_q8_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
@@ -791,9 +920,7 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
         tf_qmatvec(v, mat_v, m->xb, n_kv, m->thread_tmp[0]);
         return;
     }
-    /* Distribute total_rows = n_q + 2*n_kv across threads.
-     * Each thread gets a proportional slice of Q rows and KV rows. */
-    int total = n_q + 2 * n_kv;
+    /* Distribute rows across threads: n_q Q rows and n_kv K+V rows each. */
     tf_matvec_fused3_task *tasks = (tf_matvec_fused3_task *)alloca(nt * sizeof(tf_matvec_fused3_task));
     int q_per = n_q / nt, q_extra = n_q % nt, q_off = 0;
     int kv_per = n_kv / nt, kv_extra = n_kv % nt, kv_off = 0;
@@ -830,6 +957,12 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
             const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
             dst[i] = vec_dot_f16_f32(row, x, n_cols);
         }
+        return;
+    }
+    if (mat->type == GGML_TYPE_BF16) {
+        const uint8_t *base = (const uint8_t *)mat->data;
+        size_t row_bytes = (size_t)n_cols * 2;
+        tf_matvec_bf16_rows(dst, base, row_bytes, x, n_cols, 0, n_rows);
         return;
     }
     if (mat->type == GGML_TYPE_Q8_0) {
@@ -1195,7 +1328,6 @@ static void *tf_attn_worker(void *arg) {
             _mm256_storeu_ps(out_h+48,o6); _mm256_storeu_ps(out_h+56,o7);
         } else {
             /* Generic AVX2 attention for any head_dim (with prefetch) */
-            __m256 vscale = _mm256_set1_ps(t->scale);
             for (int p = 0; p < seq_len; p++) {
                 const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
                 if (p + 2 < seq_len)
@@ -1225,6 +1357,44 @@ static void *tf_attn_worker(void *arg) {
                 for (int d = 0; d < hd; d += 8)
                     _mm256_storeu_ps(out_h + d, _mm256_fmadd_ps(a, _mm256_loadu_ps(v_p + d),
                                                                   _mm256_loadu_ps(out_h + d)));
+            }
+        }
+#elif defined(__ARM_FEATURE_SVE)
+        {
+            /* SVE attention with prefetch */
+            svbool_t pg = svptrue_b32();
+            for (int p = 0; p < seq_len; p++) {
+                const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
+                if (p + 2 < seq_len)
+                    __builtin_prefetch(t->key_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd, 0, 1);
+                svfloat32_t acc = svdup_f32(0.0f);
+                int d = 0;
+                for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw())
+                    acc = svmla_x(pg, acc, svld1(pg, q_h + d), svld1(pg, k_p + d));
+                if (d < hd) {
+                    svbool_t ptail = svwhilelt_b32(d, hd);
+                    acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), svld1(ptail, k_p + d));
+                }
+                att_h[p] = svaddv(pg, acc) * t->scale;
+            }
+            tf_softmax(att_h, seq_len);
+            float *out_h = t->xb2 + h * hd;
+            /* Zero output with SVE */
+            for (int d = 0; d < hd; d += (int)svcntw())
+                svst1(svwhilelt_b32(d, hd), out_h + d, svdup_f32(0.0f));
+            /* V accumulation with prefetch */
+            for (int p = 0; p < seq_len; p++) {
+                const float *v_p = t->value_cache + (size_t)p * t->kv_dim + kv_h * hd;
+                if (p + 2 < seq_len)
+                    __builtin_prefetch(t->value_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd, 0, 1);
+                svfloat32_t va = svdup_f32(att_h[p]);
+                int d = 0;
+                for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw())
+                    svst1(pg, out_h + d, svmla_x(pg, svld1(pg, out_h + d), va, svld1(pg, v_p + d)));
+                if (d < hd) {
+                    svbool_t ptail = svwhilelt_b32(d, hd);
+                    svst1(ptail, out_h + d, svmla_m(ptail, svld1(ptail, out_h + d), va, svld1(ptail, v_p + d)));
+                }
             }
         }
 #else
@@ -1324,8 +1494,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     /* Detect architecture prefix. */
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "gemma4.block_count") >= 0) {
-        arch = "gemma4";
+    if (gguf_find_key(gguf, "qwen2vl.block_count") >= 0) {
+        arch = "qwen2vl";
     } else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) {
         arch = "qwen35";
     } else if (gguf_find_key(gguf, "qwen3vlmoe.block_count") >= 0) {
@@ -1428,55 +1598,6 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                 m->full_attn_interval, m->ssm_qkv_dim);
     }
 
-    /* Gemma4 architecture */
-    m->is_gemma4 = 0;
-    m->swa_pattern = NULL;
-    m->rope_freq_factors = NULL;
-    m->rope_inv_freq_swa = NULL;
-    m->ple_buf = NULL;
-    m->ple_proj_buf = NULL;
-    if (strcmp(arch, "gemma4") == 0) {
-        m->is_gemma4 = 1;
-        m->head_dim_full = tf_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
-        m->head_dim_swa  = tf_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
-        m->head_dim = m->head_dim_full; /* use max for buffer sizing */
-        m->swa_window_size = tf_get_int(gguf, ARCH_KEY("attention.sliding_window"), 512);
-        m->n_embd_per_layer = tf_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 256);
-        int shared_kv_layers = tf_get_int(gguf, ARCH_KEY("attention.shared_kv_layers"), 0);
-        m->n_layer_kv_from_start = m->n_layers - shared_kv_layers;
-        m->final_logit_softcapping = tf_get_float(gguf, ARCH_KEY("final_logit_softcapping"), 30.0f);
-        m->rope_freq_base_swa = tf_get_float(gguf, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
-        m->embd_scale = sqrtf((float)m->n_embd);
-        m->ffn_activation = 1; /* GELU */
-
-        /* Parse SWA layer pattern from GGUF bool array */
-        m->swa_pattern = (int *)calloc(m->n_layers, sizeof(int));
-        {
-            int idx = gguf_find_key(gguf, ARCH_KEY("attention.sliding_window_pattern"));
-            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
-                int n = (int)gguf->kv[idx].value.arr.n;
-                if (n > m->n_layers) n = m->n_layers;
-                /* GGUF bool arrays are stored as GGUF_TYPE_BOOL (uint8) */
-                uint8_t *data = (uint8_t *)gguf->kv[idx].value.arr.data;
-                for (int i = 0; i < n; i++)
-                    m->swa_pattern[i] = data[i] ? 1 : 0;
-                fprintf(stderr, "transformer: Gemma4 SWA pattern loaded (%d layers)\n", n);
-            } else {
-                /* Fallback: every 6th layer is full attention (0-indexed: 5,11,...) */
-                for (int i = 0; i < m->n_layers; i++)
-                    m->swa_pattern[i] = ((i + 1) % 6 != 0) ? 1 : 0;
-                fprintf(stderr, "transformer: Gemma4 SWA pattern defaulting to every-6th-full\n");
-            }
-        }
-
-        fprintf(stderr, "transformer: Gemma4: head_dim_full=%d head_dim_swa=%d swa_window=%d\n",
-                m->head_dim_full, m->head_dim_swa, m->swa_window_size);
-        fprintf(stderr, "transformer: Gemma4: n_embd_per_layer=%d n_layer_kv_from_start=%d\n",
-                m->n_embd_per_layer, m->n_layer_kv_from_start);
-        fprintf(stderr, "transformer: Gemma4: softcap=%.1f rope_base_swa=%.0f\n",
-                m->final_logit_softcapping, m->rope_freq_base_swa);
-    }
-
     #undef ARCH_KEY
     fprintf(stderr, "transformer: architecture=%s\n", arch);
     m->max_seq_len = max_seq_len;
@@ -1516,26 +1637,6 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     }
     fprintf(stderr, "transformer: n_vocab=%d has_lm_head=%d\n", m->n_vocab, m->has_lm_head);
 
-    /* Gemma4 global tensors */
-    if (m->is_gemma4) {
-        m->per_layer_token_embd = tf_load_tensor(gguf, "per_layer_token_embd.weight", 1);
-        m->per_layer_model_proj = tf_load_tensor(gguf, "per_layer_model_proj.weight", 1);
-        m->per_layer_proj_norm = tf_load_tensor(gguf, "per_layer_proj_norm.weight", 1);
-        if (!m->per_layer_token_embd.data || !m->per_layer_model_proj.data) {
-            fprintf(stderr, "transformer: Gemma4 missing per-layer embedding tensors\n");
-            transformer_free(m);
-            return NULL;
-        }
-        /* Load proportional RoPE frequency factors */
-        qtensor rope_freqs_qt = tf_load_tensor(gguf, "rope_freqs.weight", 0);
-        if (rope_freqs_qt.data) {
-            int n_freq = rope_freqs_qt.n_cols;
-            m->rope_freq_factors = (float *)calloc(n_freq, sizeof(float));
-            dequant_row(rope_freqs_qt.type, rope_freqs_qt.data, m->rope_freq_factors, n_freq);
-            fprintf(stderr, "transformer: Gemma4 loaded rope_freqs (%d elements)\n", n_freq);
-        }
-    }
-
     /* Per-layer tensors */
     m->layers = (transformer_layer *)calloc(m->n_layers, sizeof(transformer_layer));
     if (!m->layers) {
@@ -1565,64 +1666,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
         LOAD(attn_norm,    "attn_norm",   1)
 
-        if (m->is_gemma4) {
-            /* --- Gemma4 per-layer tensors --- */
-            m->layers[l].is_swa = m->swa_pattern[l];
-            m->layers[l].shared_kv_source = -1; /* default: own KV */
-
-            /* Determine shared KV source for layers beyond n_layer_kv_from_start */
-            if (l >= m->n_layer_kv_from_start) {
-                /* SWA layers reuse KV from (n_layer_kv_from_start - 2),
-                 * full-attn layers from (n_layer_kv_from_start - 1) */
-                m->layers[l].shared_kv_source = m->n_layer_kv_from_start - (m->layers[l].is_swa ? 2 : 1);
-                if (m->layers[l].shared_kv_source < 0) m->layers[l].shared_kv_source = 0;
-            }
-
-            /* Q projection (always present) */
-            LOAD(attn_q,       "attn_q",      1)
-            LOAD(attn_q_norm,  "attn_q_norm", 1)
-            LOAD(attn_output,  "attn_output", 1)
-
-            /* K/V only for layers with own KV */
-            if (m->layers[l].shared_kv_source < 0) {
-                LOAD(attn_k,       "attn_k",      1)
-                LOAD(attn_v,       "attn_v",      1)
-                LOAD(attn_k_norm,  "attn_k_norm", 1)
-            } else {
-                /* Try loading K/V anyway — some shared layers may still have them */
-                LOAD(attn_k,       "attn_k",      0)
-                LOAD(attn_v,       "attn_v",      0)
-                LOAD(attn_k_norm,  "attn_k_norm", 0)
-            }
-            /* V normalization (Gemma4 normalizes V too) */
-            LOAD(attn_v_norm,  "attn_v_norm", 0)
-
-            /* Post-attention norm */
-            LOAD(post_attention_norm, "post_attention_norm", 1)
-
-            /* FFN */
-            LOAD(ffn_norm,     "ffn_norm",    1)
-            LOAD(ffn_gate,     "ffn_gate",    1)
-            LOAD(ffn_up,       "ffn_up",      1)
-            LOAD(ffn_down,     "ffn_down",    1)
-            LOAD(post_ffw_norm, "post_ffw_norm", 1)
-
-            /* Layer output scale (optional) */
-            LOAD(layer_output_scale, "layer_output_scale", 0)
-
-            /* Per-layer embedding tensors */
-            LOAD(ple_inp_gate,  "inp_gate",  1)
-            LOAD(ple_proj,      "proj",      1)
-            LOAD(ple_post_norm, "post_norm", 1)
-
-            REQUIRE_SUPPORTED(attn_q,      "attn_q");
-            REQUIRE_SUPPORTED(attn_output, "attn_output");
-            REQUIRE_SUPPORTED(ffn_gate, "ffn_gate");
-            REQUIRE_SUPPORTED(ffn_up,   "ffn_up");
-            REQUIRE_SUPPORTED(ffn_down, "ffn_down");
-            if (m->layers[l].attn_k.data) REQUIRE_SUPPORTED(attn_k, "attn_k");
-            if (m->layers[l].attn_v.data) REQUIRE_SUPPORTED(attn_v, "attn_v");
-        } else if (m->is_hybrid) {
+        if (m->is_hybrid) {
             int is_attn = (m->full_attn_interval > 0 && (l + 1) % m->full_attn_interval == 0);
             m->layers[l].is_ssm = !is_attn;
             if (is_attn) {
@@ -1660,6 +1704,13 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             LOAD(attn_k_norm,  "attn_k_norm", 0)
             LOAD(attn_output,  "attn_output", 1)
             LOAD(ffn_norm,     "ffn_norm",    1)
+            /* Q/K/V biases (optional, e.g. Qwen2.5-VL) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+            m->layers[l].attn_q_bias = tf_load_tensor(gguf, name, 0);
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+            m->layers[l].attn_k_bias = tf_load_tensor(gguf, name, 0);
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);
+            m->layers[l].attn_v_bias = tf_load_tensor(gguf, name, 0);
         }
         if (m->use_moe) {
             LOAD(ffn_gate_inp,  "ffn_gate_inp",  1)
@@ -1729,52 +1780,25 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         return NULL;
     }
 
-    /* Allocate KV cache */
+    /* Allocate KV cache (skip SSM layers in hybrid mode) */
     int kv_dim = m->n_kv_heads * m->head_dim;
     m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
     m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
-    if (m->is_gemma4) {
-        int kv_dim_full = m->n_kv_heads * m->head_dim_full;
-        int kv_dim_swa  = m->n_kv_heads * m->head_dim_swa;
-        int n_own = 0, n_shared = 0;
-        for (int l = 0; l < m->n_layers; l++) {
-            if (m->layers[l].shared_kv_source >= 0) { n_shared++; continue; }
-            if (m->layers[l].is_swa) {
-                int cache_len = m->swa_window_size;
-                m->key_cache[l]   = (float *)calloc(cache_len * kv_dim_swa, sizeof(float));
-                m->value_cache[l] = (float *)calloc(cache_len * kv_dim_swa, sizeof(float));
-            } else {
-                m->key_cache[l]   = (float *)calloc(max_seq_len * kv_dim_full, sizeof(float));
-                m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim_full, sizeof(float));
-            }
-            n_own++;
-        }
-        /* Point shared layers to their source */
-        for (int l = 0; l < m->n_layers; l++) {
-            int src = m->layers[l].shared_kv_source;
-            if (src >= 0) {
-                m->key_cache[l]   = m->key_cache[src];
-                m->value_cache[l] = m->value_cache[src];
-            }
-        }
-        fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers\n", n_own, n_shared);
-        kv_dim = kv_dim_full > kv_dim_swa ? kv_dim_full : kv_dim_swa; /* for scratch sizing */
-    } else {
-        for (int l = 0; l < m->n_layers; l++) {
-            if (m->is_hybrid && m->layers[l].is_ssm) continue;
-            m->key_cache[l]   = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
-            m->value_cache[l] = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
-        }
+    for (int l = 0; l < m->n_layers; l++) {
+        if (m->is_hybrid && m->layers[l].is_ssm) continue;
+        m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
+        m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
     }
 
     /* Allocate SSM state for hybrid models */
     m->conv_state = NULL;
     m->conv_state_pos = NULL;
     m->recurrent_state = NULL;
-    if (m->is_hybrid) {
-        m->conv_state = (float **)calloc(m->n_layers, sizeof(float *));
-        m->conv_state_pos = (int *)calloc(m->n_layers, sizeof(int));
-        m->recurrent_state = (float **)calloc(m->n_layers, sizeof(float *));
+    if (m->is_hybrid && m->n_layers > 0) {
+        size_t nl = (size_t)m->n_layers;
+        m->conv_state = (float **)calloc(nl, sizeof(float *));
+        m->conv_state_pos = (int *)calloc(nl, sizeof(int));
+        m->recurrent_state = (float **)calloc(nl, sizeof(float *));
         int n_ssm = 0;
         for (int l = 0; l < m->n_layers; l++) {
             if (!m->layers[l].is_ssm) continue;
@@ -1806,19 +1830,18 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     int q_buf_dim = q_dim;
     if (m->is_hybrid && m->ssm_dt_rank * m->ssm_d_state > q_buf_dim)
         q_buf_dim = m->ssm_dt_rank * m->ssm_d_state;
-    m->x         = (float *)calloc(m->n_embd, sizeof(float));
-    m->xb        = (float *)calloc(m->n_embd, sizeof(float));
-    m->xb2       = (float *)calloc(xb2_dim, sizeof(float));
-    m->q         = (float *)calloc(q_buf_dim, sizeof(float));
-    m->k         = (float *)calloc(kv_dim, sizeof(float));
-    m->v         = (float *)calloc(kv_dim, sizeof(float));
-    m->att       = (float *)calloc(m->n_heads * max_seq_len, sizeof(float));
-    m->ffn_buf1  = (float *)calloc(max_ff, sizeof(float));
-    m->ffn_buf2  = (float *)calloc(max_ff, sizeof(float));
-    m->ffn_buf3  = (float *)calloc(max_ff, sizeof(float));
-    m->logits     = m->has_lm_head ? (float *)calloc(m->n_vocab, sizeof(float)) : NULL;
-    m->matvec_tmp = (float *)calloc(max_dim, sizeof(float));
-    m->trace_hidden_norms = 1;
+    m->x         = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+    m->xb        = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+    m->xb2       = (float *)tf_aligned_calloc(256, xb2_dim, sizeof(float));
+    m->q         = (float *)tf_aligned_calloc(256, q_buf_dim, sizeof(float));
+    m->k         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
+    m->v         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
+    m->att       = (float *)tf_aligned_calloc(256, m->n_heads * max_seq_len, sizeof(float));
+    m->ffn_buf1  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
+    m->ffn_buf2  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
+    m->ffn_buf3  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
+    m->logits     = m->has_lm_head ? (float *)tf_aligned_calloc(256, m->n_vocab, sizeof(float)) : NULL;
+    m->matvec_tmp = (float *)tf_aligned_calloc(256, max_dim, sizeof(float));
 
     /* Default: single-threaded, no tensor parallelism */
     m->n_threads = 1;
@@ -1850,29 +1873,6 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         }
     }
 
-    /* Gemma4: precompute SWA RoPE table and per-layer embedding buffers */
-    if (m->is_gemma4) {
-        /* SWA RoPE: standard with freq_base_swa, head_dim_swa */
-        int half_swa = m->head_dim_swa / 2;
-        m->rope_inv_freq_swa = (float *)calloc(half_swa, sizeof(float));
-        for (int j = 0; j < half_swa; j++)
-            m->rope_inv_freq_swa[j] = 1.0f / powf(m->rope_freq_base_swa, (float)(2 * j) / m->head_dim_swa);
-
-        /* Full-attention RoPE: if rope_freq_factors is available, apply proportional RoPE.
-         * The standard rope_inv_freq (already computed above) uses head_dim_full and rope_freq_base.
-         * For proportional RoPE: inv_freq[j] /= freq_factors[j] */
-        if (m->rope_freq_factors) {
-            int half_full = m->head_dim_full / 2;
-            for (int j = 0; j < half_full && j < m->rope_inv_freq_len; j++)
-                m->rope_inv_freq[j] /= m->rope_freq_factors[j];
-            fprintf(stderr, "transformer: Gemma4 proportional RoPE applied (%d dims)\n", half_full);
-        }
-
-        /* Per-layer embedding scratch buffers */
-        m->ple_buf = (float *)calloc(m->n_embd_per_layer, sizeof(float));
-        m->ple_proj_buf = (float *)calloc(m->n_embd, sizeof(float));
-    }
-
     return m;
 }
 
@@ -1881,21 +1881,12 @@ void transformer_free(transformer_model *model) {
     free(model->layers);
     if (model->key_cache) {
         for (int l = 0; l < model->n_layers; l++) {
-            /* Skip shared KV caches (freed by their source layer) */
-            if (model->is_gemma4 && l < model->n_layers &&
-                model->layers && model->layers[l].shared_kv_source >= 0) continue;
             free(model->key_cache[l]);
             free(model->value_cache[l]);
         }
         free(model->key_cache);
         free(model->value_cache);
     }
-    /* Gemma4 resources */
-    free(model->swa_pattern);
-    free(model->rope_freq_factors);
-    free(model->rope_inv_freq_swa);
-    free(model->ple_buf);
-    free(model->ple_proj_buf);
     if (model->conv_state) {
         for (int l = 0; l < model->n_layers; l++) free(model->conv_state[l]);
         free(model->conv_state);
@@ -1930,6 +1921,15 @@ void transformer_free(transformer_model *model) {
 }
 
 /* ---- Thread pool ---- */
+/* Portable spin-wait hint */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#define tf_cpu_pause() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define tf_cpu_pause() __asm__ __volatile__("yield")
+#else
+#define tf_cpu_pause() ((void)0)
+#endif
+
 typedef struct {
     transformer_model *model;
     int tid;
@@ -1943,11 +1943,13 @@ static void *tf_pool_worker_main(void *arg) {
 
     int last_phase = 0;
     while (1) {
-        /* Spin-wait for work */
-        while (m->pool_phase == last_phase) {
-            if (!m->pool_alive) return NULL;
-            __builtin_ia32_pause();
-        }
+        /* Sleep until dispatcher signals new work via cond_broadcast.
+         * Workers consume ZERO bandwidth while sleeping (futex-based). */
+        pthread_mutex_lock(&m->pool_mutex);
+        while (m->pool_phase == last_phase && m->pool_alive)
+            pthread_cond_wait(&m->pool_cond, &m->pool_mutex);
+        pthread_mutex_unlock(&m->pool_mutex);
+
         last_phase = m->pool_phase;
         if (!m->pool_alive) return NULL;
 
@@ -1963,13 +1965,18 @@ static void *tf_pool_worker_main(void *arg) {
 
 static void tf_pool_shutdown(transformer_model *model) {
     if (!model->pool_alive) return;
+    /* Signal workers to exit */
+    pthread_mutex_lock(&model->pool_mutex);
     model->pool_alive = 0;
-    __sync_synchronize();
     model->pool_phase++;
-    for (int t = 0; t < model->n_threads; t++)
+    pthread_cond_broadcast(&model->pool_cond);
+    pthread_mutex_unlock(&model->pool_mutex);
+    for (int t = 1; t < model->n_threads; t++)
         pthread_join(model->pool_threads[t], NULL);
     free(model->pool_threads);
     model->pool_threads = NULL;
+    pthread_mutex_destroy(&model->pool_mutex);
+    pthread_cond_destroy(&model->pool_cond);
 }
 
 static void tf_pool_start(transformer_model *model) {
@@ -1978,8 +1985,10 @@ static void tf_pool_start(transformer_model *model) {
     model->pool_phase = 0;
     model->pool_done = 0;
     model->pool_alive = 1;
+    pthread_mutex_init(&model->pool_mutex, NULL);
+    pthread_cond_init(&model->pool_cond, NULL);
     __sync_synchronize();
-    for (int t = 0; t < nt; t++) {
+    for (int t = 1; t < nt; t++) {
         tf_pool_worker_ctx *ctx = (tf_pool_worker_ctx *)malloc(sizeof(*ctx));
         ctx->model = model;
         ctx->tid = t;
@@ -1987,21 +1996,30 @@ static void tf_pool_start(transformer_model *model) {
     }
 }
 
-/* Dispatch work to the thread pool: calls fn(args + tid * arg_stride) for each thread */
+/* Dispatch work to the thread pool: calls fn(args + tid * arg_stride) for each thread.
+ * Workers sleep on cond_var between dispatches — zero bandwidth when idle. */
 static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
                               void *args, size_t arg_stride) {
     int nt = model->n_threads;
     model->pool_fn = fn;
     model->pool_args = args;
     model->pool_arg_stride = arg_stride;
-
     model->pool_done = 0;
     __sync_synchronize();
-    model->pool_phase++;
 
-    /* Spin-wait for all workers */
-    while (model->pool_done < nt)
-        __builtin_ia32_pause();
+    /* Wake workers via cond_broadcast */
+    pthread_mutex_lock(&model->pool_mutex);
+    model->pool_phase++;
+    pthread_cond_broadcast(&model->pool_cond);
+    pthread_mutex_unlock(&model->pool_mutex);
+
+    /* Main thread executes worker 0's task directly */
+    void *task0 = (char *)args;
+    fn(task0);
+
+    /* Wait for remaining workers (brief spin — workers are doing useful work) */
+    while (model->pool_done < nt - 1)
+        tf_cpu_pause();
 }
 
 void transformer_set_threads(transformer_model *model, int n_threads) {
@@ -2021,7 +2039,11 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
     model->thread_tmp[0] = model->matvec_tmp;
     for (int t = 1; t < n_threads; t++) {
-        model->thread_tmp[t] = (float *)calloc(max_dim, sizeof(float));
+        /* Use notouch alloc: dequant always writes before read, so uninitialized is safe.
+         * With demand paging, first actual use from worker thread t places pages on
+         * thread t's NUMA node for optimal locality. */
+        model->thread_tmp[t] = (float *)tf_aligned_alloc_notouch(256,
+                                    (size_t)max_dim * sizeof(float));
     }
 
     /* Start new pool */
@@ -2029,9 +2051,198 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
 }
 
-void transformer_set_trace_hidden_norms(transformer_model *model, int enable) {
-    if (!model) return;
-    model->trace_hidden_norms = enable ? 1 : 0;
+/* ---- NUMA-aware memory allocator ---- */
+/* With demand paging (XOS_MMM_L_PAGING_POLICY=demand:demand:demand), pages are
+ * placed on the NUMA node of the first-touching core. The NUMA allocator ensures
+ * each thread's data partition is first-touched by that thread, placing pages on
+ * the thread's CMG for optimal memory bandwidth. */
+
+/* Task for parallel pread (weight loading) or memset (buffer first-touch) */
+typedef struct {
+    void *dst;
+    int fd;            /* -1 for memset-only (no pread) */
+    size_t file_off;   /* base file offset (ignored if fd < 0) */
+    size_t byte_start;
+    size_t byte_end;
+} tf_numa_task;
+
+static void *tf_numa_pread_worker(void *arg) {
+    tf_numa_task *t = (tf_numa_task *)arg;
+    uint8_t *base = (uint8_t *)t->dst;
+    size_t start = t->byte_start;
+    size_t len   = t->byte_end - start;
+    if (len == 0) return NULL;
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 1024 * 1024) chunk = 1024 * 1024;
+        ssize_t n = pread(t->fd, base + start + off, chunk,
+                          (off_t)(t->file_off + start + off));
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    return NULL;
+}
+
+static void *tf_numa_memset_worker(void *arg) {
+    tf_numa_task *t = (tf_numa_task *)arg;
+    uint8_t *base = (uint8_t *)t->dst;
+    size_t len = t->byte_end - t->byte_start;
+    if (len > 0) memset(base + t->byte_start, 0, len);
+    return NULL;
+}
+
+/* Initialize NUMA config from environment or defaults */
+static void tf_numa_init(transformer_model *m) {
+    memset(&m->numa, 0, sizeof(m->numa));
+    m->numa.n_cmgs = 4;
+    m->numa.per_cmg_budget = 6ULL * 1024 * 1024 * 1024;
+    m->numa.alignment = 2 * 1024 * 1024;
+    m->numa.enabled = 0;
+
+    const char *env;
+    if ((env = getenv("NUMA_N_CMGS")))       m->numa.n_cmgs = atoi(env);
+    if ((env = getenv("NUMA_CMG_BUDGET_GB"))) m->numa.per_cmg_budget = (size_t)(atof(env) * 1024.0 * 1024.0 * 1024.0);
+    if ((env = getenv("NUMA_ALIGNMENT")))     m->numa.alignment = (size_t)atol(env);
+    if (getenv("NUMA_DISTRIBUTE"))            m->numa.enabled = 1;
+}
+
+/* Distribute a buffer across threads via parallel memset (first-touch placement) */
+static void tf_numa_distribute_buffer(transformer_model *m, void *buf, size_t total_bytes) {
+    int nt = m->n_threads;
+    if (!buf || total_bytes == 0 || nt <= 1) return;
+
+    tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+    size_t part = total_bytes / nt;
+    size_t off = 0;
+    for (int t = 0; t < nt; t++) {
+        size_t end = (t == nt - 1) ? total_bytes : off + part;
+        tasks[t] = (tf_numa_task){buf, -1, 0, off, end};
+        off = end;
+    }
+    tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
+}
+
+/* Print per-CMG usage */
+static void tf_numa_print_usage(transformer_model *m) {
+    int nc = m->numa.n_cmgs < m->n_threads ? m->numa.n_cmgs : m->n_threads;
+    fprintf(stderr, "numa: per-CMG usage:");
+    for (int c = 0; c < nc; c++)
+        fprintf(stderr, " CMG%d=%.1fMB", c, (double)m->numa.per_cmg_used[c] / (1024.0 * 1024.0));
+    fprintf(stderr, " (budget=%.1fGB)\n", (double)m->numa.per_cmg_budget / (1024.0 * 1024.0 * 1024.0));
+}
+
+void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
+    tf_numa_init(m);
+    if (!m->numa.enabled || m->n_threads <= 1 || !m->pool_alive) {
+        m->numa.enabled = 0;
+        return;
+    }
+
+    int nt = m->n_threads;
+    int fd = gguf->fd;
+
+    fprintf(stderr, "numa: setup %d CMGs, %.1fGB/CMG, %d threads\n",
+            m->numa.n_cmgs,
+            (double)m->numa.per_cmg_budget / (1024.0 * 1024.0 * 1024.0), nt);
+
+    /* ---- Phase 1: Distribute weight data via parallel pread ---- */
+    if (fd >= 0) {
+        fprintf(stderr, "numa: phase 1 - loading weights (fd=%d, %zu tensors)...\n",
+                fd, (size_t)gguf->n_tensors);
+        size_t weight_bytes = 0;
+
+        for (uint64_t ti = 0; ti < gguf->n_tensors; ti++) {
+            void *tdata = gguf_tensor_data(gguf, (int)ti);
+            size_t tsz = gguf_tensor_size(gguf, (int)ti);
+            if (!tdata || tsz == 0) continue;
+
+            size_t toff = gguf->data_offset + ((uint8_t *)tdata - gguf->data);
+            int n_dims = (int)gguf->tensors[ti].n_dims;
+            int n_rows = 1;
+            for (int d = 1; d < n_dims; d++)
+                n_rows *= (int)gguf->tensors[ti].dims[d];
+            size_t row_bytes = (n_rows > 0) ? tsz / (size_t)n_rows : tsz;
+
+            if (n_rows < nt || n_dims <= 1) {
+                tf_numa_task task = {tdata, fd, toff, 0, tsz};
+                tf_numa_pread_worker(&task);
+                m->numa.per_cmg_used[0] += tsz;
+            } else {
+                tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+                int rp = n_rows / nt, re = n_rows % nt, ro = 0;
+                for (int t = 0; t < nt; t++) {
+                    int rc = rp + (t < re ? 1 : 0);
+                    size_t s = (size_t)ro * row_bytes;
+                    size_t e = (size_t)(ro + rc) * row_bytes;
+                    if (e > tsz) e = tsz;
+                    tasks[t] = (tf_numa_task){tdata, fd, toff, s, e};
+                    int cmg = t < m->numa.n_cmgs ? t : t % m->numa.n_cmgs;
+                    m->numa.per_cmg_used[cmg] += e - s;
+                    ro += rc;
+                }
+                tf_pool_dispatch(m, tf_numa_pread_worker, tasks, sizeof(tf_numa_task));
+            }
+            weight_bytes += tsz;
+        }
+        fprintf(stderr, "numa: phase 1 done (%.1fGB weights loaded)\n",
+                (double)weight_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    /* ---- Phase 2: First-touch thread scratch from each worker ---- */
+    /* thread_tmp[t>=1] allocated with notouch; first memset places pages on CMG t */
+    {
+        int max_ff = tf_compute_max_ff(m);
+        int max_dim = m->n_embd > max_ff ? m->n_embd : max_ff;
+        size_t buf_sz = (size_t)max_dim * sizeof(float);
+        tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+        for (int t = 0; t < nt; t++) {
+            tasks[t] = (tf_numa_task){m->thread_tmp[t], -1, 0, 0, buf_sz};
+        }
+        tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
+        fprintf(stderr, "numa: phase 2 - thread scratch distributed\n");
+    }
+
+    /* ---- Phase 3: Distribute logits buffer (row-partitioned) ---- */
+    if (m->logits && m->n_vocab > 0) {
+        size_t logits_sz = (size_t)m->n_vocab * sizeof(float);
+        tf_numa_distribute_buffer(m, m->logits, logits_sz);
+        size_t per_cmg = logits_sz / nt;
+        for (int t = 0; t < nt && t < m->numa.n_cmgs; t++)
+            m->numa.per_cmg_used[t] += per_cmg;
+        fprintf(stderr, "numa: phase 3 - logits distributed (%.1fKB)\n",
+                (double)logits_sz / 1024.0);
+    }
+
+    /* ---- Phase 4: Distribute SSM recurrent state (head-partitioned) ---- */
+    if (m->is_hybrid && m->recurrent_state) {
+        int dt_rank = m->ssm_dt_rank;
+        int d2 = m->ssm_d_state * m->ssm_d_state;
+        size_t head_bytes = (size_t)d2 * sizeof(float);
+        int distributed = 0;
+
+        for (int l = 0; l < m->n_layers; l++) {
+            if (!m->layers[l].is_ssm || !m->recurrent_state[l]) continue;
+            if (dt_rank < nt) continue;
+
+            tf_numa_task *tasks = (tf_numa_task *)alloca(nt * sizeof(tf_numa_task));
+            int hp = dt_rank / nt, he = dt_rank % nt, ho = 0;
+            for (int t = 0; t < nt; t++) {
+                int hc = hp + (t < he ? 1 : 0);
+                size_t s = (size_t)ho * head_bytes;
+                size_t e = (size_t)(ho + hc) * head_bytes;
+                tasks[t] = (tf_numa_task){m->recurrent_state[l], -1, 0, s, e};
+                ho += hc;
+            }
+            tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
+            distributed++;
+        }
+        if (distributed > 0)
+            fprintf(stderr, "numa: phase 4 - SSM state distributed (%d layers)\n", distributed);
+    }
+
+    tf_numa_print_usage(m);
+    fprintf(stderr, "numa: setup complete\n");
 }
 
 /* ---- SSM Delta-Net forward (single token, autoregressive) ---- */
@@ -2570,23 +2781,6 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
 }
 
-/* Vectorized GELU(gate) × up: out[i] = gelu(gate[i]) * up[i]
- * Uses exact GELU: x * 0.5 * (1 + erf(x / sqrt(2))) */
-static void tf_gelu_mul(float *out, const float *gate, const float *up, int n) {
-    for (int i = 0; i < n; i++) {
-        float g = gate[i];
-        float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f)); /* 1/sqrt(2) */
-        out[i] = gelu_g * up[i];
-    }
-}
-
-/* Logit soft-capping: logits[i] = cap * tanh(logits[i] / cap) */
-static void tf_logit_softcap(float *logits, int n, float cap) {
-    float inv_cap = 1.0f / cap;
-    for (int i = 0; i < n; i++)
-        logits[i] = cap * tanhf(logits[i] * inv_cap);
-}
-
 /* Helper: apply standard or M-RoPE depending on model config */
 static void tf_apply_rope(transformer_model *m, float *q, float *k,
                            int n_heads, int n_kv_heads, int head_dim,
@@ -2598,6 +2792,347 @@ static void tf_apply_rope(transformer_model *m, float *q, float *k,
         tf_rope(q, n_heads,    head_dim, pos_t, m->rope_freq_base, m->rope_inv_freq);
         tf_rope(k, n_kv_heads, head_dim, pos_t, m->rope_freq_base, m->rope_inv_freq);
     }
+}
+
+/* ---- Persistent-thread forward pass ---- */
+/* Each thread runs the entire layer loop for its static partition.
+ * Sync uses pthread_barrier (kernel-backed, no spin-wait).
+ * Thread 0 does sequential work (RMSNorm, RoPE, KV cache); others wait at barrier.
+ * All threads participate in parallel work (matvec rows, attention heads). */
+
+typedef struct {
+    transformer_model *m;
+    int tid;
+    int position, pos_t, pos_h, pos_w;
+} tf_persistent_ctx;
+
+/* ---- Barrier implementations ---- */
+
+/* A64FX hardware barrier via W0 window register (intra-CMG only).
+ * Uses WFE (wait-for-event) instead of spin-polling — near-zero power
+ * and ~20 cycle latency. Requires libfjomphk.so (link with -Kopenmp)
+ * to have initialized the barrier blade. */
+#if defined(__aarch64__)
+static inline void tf_hw_barrier_w0(void) {
+    uint64_t bst, lbsy;
+    __asm__ __volatile__("mrs %0, S3_3_C15_C15_0" : "=r"(lbsy));
+    bst = (~lbsy) & 1ULL;
+    __asm__ __volatile__("msr S3_3_C15_C15_0, %0" :: "r"(bst));
+    __asm__ __volatile__("sevl");
+    do {
+        __asm__ __volatile__("wfe");
+        __asm__ __volatile__("mrs %0, S3_3_C15_C15_0" : "=r"(lbsy));
+        lbsy &= 1ULL;
+    } while (lbsy != bst);
+}
+#endif
+
+/* Barrier: sense-reversing with SEV/WFE on aarch64 for low-power wait.
+ * WFE puts the core in low-power state until an event (SEV from the last
+ * arriving thread). No bandwidth consumption while waiting. */
+static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt) {
+    int my_sense = !(*local_sense);
+    if (__sync_add_and_fetch(&m->bar_count, 1) == nt) {
+        m->bar_count = 0;
+        __sync_synchronize();
+        m->bar_sense = my_sense;
+#if defined(__aarch64__)
+        __asm__ __volatile__("sev");  /* wake all WFE-sleeping cores */
+#endif
+    } else {
+#if defined(__aarch64__)
+        /* SEV/WFE spin: core sleeps until event, then rechecks.
+         * SEVL ensures first WFE doesn't stall if event pending. */
+        __asm__ __volatile__("sevl");
+        do {
+            __asm__ __volatile__("wfe");
+        } while (m->bar_sense != my_sense);
+#else
+        while (m->bar_sense != my_sense)
+            tf_cpu_pause();
+#endif
+    }
+    *local_sense = my_sense;
+}
+
+/* Two-level barrier for multi-CMG:
+ * Level 1: Hardware barrier within each CMG (cores on same CMG sync via W0)
+ * Level 2: Software atomic barrier across CMG leaders
+ *
+ * For single-CMG (all threads on 1 CMG): use hardware barrier directly.
+ * For multi-CMG: each CMG's threads hw-barrier locally, then one thread
+ * per CMG does a software barrier with other CMG leaders. */
+static inline void tf_barrier(transformer_model *m, int tid, int *local_sense, int nt) {
+#if defined(__aarch64__)
+    int n_cmgs = m->numa.enabled ? m->numa.n_cmgs : 1;
+    if (n_cmgs <= 1 || nt <= n_cmgs) {
+        /* Single CMG or 1 thread/CMG: just use hw barrier */
+        tf_hw_barrier_w0();
+    } else {
+        /* Multi-CMG with multiple threads per CMG */
+        int threads_per_cmg = nt / n_cmgs;
+        int cmg_id = tid / threads_per_cmg;
+        int local_tid = tid % threads_per_cmg;
+
+        /* Level 1: intra-CMG hardware barrier */
+        tf_hw_barrier_w0();
+
+        /* Level 2: inter-CMG software barrier (only CMG leaders, local_tid==0) */
+        if (local_tid == 0) {
+            int my_sense = !(*local_sense);
+            if (__sync_add_and_fetch(&m->bar_count, 1) == n_cmgs) {
+                m->bar_count = 0;
+                __sync_synchronize();
+                m->bar_sense = my_sense;
+            } else {
+                while (m->bar_sense != my_sense)
+                    tf_cpu_pause();
+            }
+            *local_sense = my_sense;
+        }
+
+        /* Level 1 again: intra-CMG hw barrier to release non-leaders */
+        tf_hw_barrier_w0();
+    }
+#else
+    tf_spin_barrier(m, local_sense, nt);
+#endif
+}
+
+/* Per-thread matvec: thread tid computes its static row partition */
+static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
+                              int n_rows, int tid, int nt) {
+    int rp = n_rows / nt, re = n_rows % nt;
+    int rs = tid * rp + (tid < re ? tid : re);
+    int rc = rp + (tid < re ? 1 : 0);
+    if (rc <= 0) return;
+    int n_cols = mat->n_cols;
+
+    if (mat->type == GGML_TYPE_BF16) {
+        tf_matvec_bf16_rows(dst, (const uint8_t *)mat->data,
+                             (size_t)n_cols * 2, x, n_cols, rs, rs + rc);
+    } else if (mat->type == GGML_TYPE_F16) {
+        tf_matvec_f16_rows(dst, (const uint8_t *)mat->data,
+                            (size_t)n_cols * 2, x, n_cols, rs, rs + rc);
+    } else {
+        tf_matvec_qtensor_rows(dst, mat, x, rs, rs + rc);
+    }
+}
+
+static void *tf_persistent_worker(void *arg) {
+    tf_persistent_ctx *ctx = (tf_persistent_ctx *)arg;
+    transformer_model *m = ctx->m;
+    int tid = ctx->tid;
+    int nt = m->n_threads;
+    int position = ctx->position;
+    int pos_t = ctx->pos_t, pos_h = ctx->pos_h, pos_w = ctx->pos_w;
+    int local_sense = 0;
+
+    int n_embd = m->n_embd;
+    int n_heads = m->n_heads;
+    int n_kv_heads = m->n_kv_heads;
+    int head_dim = m->head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int q_dim = n_heads * head_dim;
+    int gqa_ratio = n_heads / n_kv_heads;
+    int n_ff = m->n_ff;
+    /* Head partition for attention */
+    int h_per = n_heads / nt, h_extra = n_heads % nt;
+    int h_start = tid * h_per + (tid < h_extra ? tid : h_extra);
+    int h_count = h_per + (tid < h_extra ? 1 : 0);
+
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+
+        /* Thread 0: RMSNorm (sequential, cheap) */
+        if (tid == 0)
+            tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        tf_spin_barrier(m, &local_sense, nt);  /* B1: xb ready */
+
+        if (m->is_hybrid && layer->is_ssm) {
+            /* SSM: thread 0 runs with pool disabled. Other threads wait. */
+            if (tid == 0) {
+                int saved_alive = m->pool_alive;
+                m->pool_alive = 0;
+                tf_ssm_deltanet_forward(m, l);
+                m->pool_alive = saved_alive;
+            }
+            tf_spin_barrier(m, &local_sense, nt);  /* B2: SSM done */
+        } else {
+            /* --- Attention layer --- */
+
+            /* QKV projection: all threads compute their row partition */
+            if (m->is_hybrid) {
+                /* Gated attention: Q+gate combined [2*q_dim] */
+                int q2_dim = 2 * q_dim;
+                tf_thread_matvec(m->xb2, &layer->attn_q, m->xb, q2_dim, tid, nt);
+                tf_thread_matvec(m->k, &layer->attn_k, m->xb, kv_dim, tid, nt);
+                tf_thread_matvec(m->v, &layer->attn_v, m->xb, kv_dim, tid, nt);
+            } else {
+                tf_thread_matvec(m->q, &layer->attn_q, m->xb, q_dim, tid, nt);
+                tf_thread_matvec(m->k, &layer->attn_k, m->xb, kv_dim, tid, nt);
+                tf_thread_matvec(m->v, &layer->attn_v, m->xb, kv_dim, tid, nt);
+            }
+            tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
+
+            /* Thread 0: de-interleave (gated), QK-norm, RoPE, KV cache */
+            if (tid == 0) {
+                if (m->is_hybrid) {
+                    for (int h = 0; h < n_heads; h++) {
+                        memcpy(m->q + h * head_dim, m->xb2 + h * 2 * head_dim, head_dim * sizeof(float));
+                        memcpy(m->ffn_buf1 + h * head_dim, m->xb2 + h * 2 * head_dim + head_dim, head_dim * sizeof(float));
+                    }
+                }
+                if (layer->attn_q_norm.data)
+                    tf_qk_norm(m->q, n_heads, head_dim, &layer->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
+                if (layer->attn_k_norm.data)
+                    tf_qk_norm(m->k, n_kv_heads, head_dim, &layer->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
+                /* Bias additions */
+                if (layer->attn_q_bias.data) {
+                    if (layer->attn_q_bias.type == GGML_TYPE_F32) {
+                        float *qb = (float *)layer->attn_q_bias.data;
+                        for (int i = 0; i < q_dim; i++) m->q[i] += qb[i];
+                    } else {
+                        tf_dequant_row(&layer->attn_q_bias, 0, m->matvec_tmp);
+                        for (int i = 0; i < q_dim; i++) m->q[i] += m->matvec_tmp[i];
+                    }
+                }
+                if (layer->attn_k_bias.data) {
+                    if (layer->attn_k_bias.type == GGML_TYPE_F32) {
+                        float *kb = (float *)layer->attn_k_bias.data;
+                        for (int i = 0; i < kv_dim; i++) m->k[i] += kb[i];
+                    } else {
+                        tf_dequant_row(&layer->attn_k_bias, 0, m->matvec_tmp);
+                        for (int i = 0; i < kv_dim; i++) m->k[i] += m->matvec_tmp[i];
+                    }
+                }
+                if (layer->attn_v_bias.data) {
+                    if (layer->attn_v_bias.type == GGML_TYPE_F32) {
+                        float *vb = (float *)layer->attn_v_bias.data;
+                        for (int i = 0; i < kv_dim; i++) m->v[i] += vb[i];
+                    } else {
+                        tf_dequant_row(&layer->attn_v_bias, 0, m->matvec_tmp);
+                        for (int i = 0; i < kv_dim; i++) m->v[i] += m->matvec_tmp[i];
+                    }
+                }
+                tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
+                memcpy(m->key_cache[l] + position * kv_dim, m->k, kv_dim * sizeof(float));
+                memcpy(m->value_cache[l] + position * kv_dim, m->v, kv_dim * sizeof(float));
+            }
+            tf_spin_barrier(m, &local_sense, nt);  /* B3: Q/K ready for attention */
+
+            /* Attention: each thread handles its head partition */
+            {
+                int seq_len = position + 1;
+                float scale = 1.0f / sqrtf((float)head_dim);
+                if (h_count > 0) {
+                    tf_attn_task at = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
+                                       h_start, h_start + h_count, head_dim, kv_dim, gqa_ratio,
+                                       seq_len, m->max_seq_len, scale};
+                    memset(m->xb2 + h_start * head_dim, 0, (size_t)h_count * head_dim * sizeof(float));
+                    tf_attn_worker(&at);
+                }
+            }
+
+            /* Sigmoid gate for hybrid gated attention */
+            if (m->is_hybrid) {
+                for (int i = h_start * head_dim; i < (h_start + h_count) * head_dim; i++) {
+                    float g = m->ffn_buf1[i];
+                    m->xb2[i] *= 1.0f / (1.0f + expf(-g));
+                }
+            }
+            tf_spin_barrier(m, &local_sense, nt);  /* B4: xb2 ready */
+
+            /* Output projection: all threads compute their row partition */
+            tf_thread_matvec(m->xb, &layer->attn_output, m->xb2, n_embd, tid, nt);
+            tf_spin_barrier(m, &local_sense, nt);  /* B5: xb ready */
+        }
+
+        /* Thread 0: residual + FFN norm (merged B5+B6: saves 1 barrier) */
+        if (tid == 0) {
+            tf_vadd(m->x, m->xb, n_embd);
+            tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN (merged) */
+
+        if (!m->use_moe || !layer->ffn_gate_inp.data) {
+            /* Dense SwiGLU FFN: gate+up matvec (parallel) */
+            tf_thread_matvec(m->ffn_buf1, &layer->ffn_gate, m->xb, n_ff, tid, nt);
+            tf_thread_matvec(m->ffn_buf2, &layer->ffn_up, m->xb, n_ff, tid, nt);
+
+            /* SiLU×mul on this thread's row partition (no barrier needed) */
+            {
+                int rp = n_ff / nt, re = n_ff % nt;
+                int rs = tid * rp + (tid < re ? tid : re);
+                int rc = rp + (tid < re ? 1 : 0);
+                for (int i = rs; i < rs + rc; i++) {
+                    float g = m->ffn_buf1[i];
+                    m->ffn_buf3[i] = g / (1.0f + expf(-g)) * m->ffn_buf2[i];
+                }
+            }
+            tf_spin_barrier(m, &local_sense, nt);  /* B7: ffn_buf3 ready for down */
+
+            /* Down projection */
+            tf_thread_matvec(m->xb, &layer->ffn_down, m->ffn_buf3, n_embd, tid, nt);
+            tf_spin_barrier(m, &local_sense, nt);  /* B8: xb ready */
+
+            /* Thread 0: residual */
+            if (tid == 0) tf_vadd(m->x, m->xb, n_embd);
+        } else {
+            /* MoE: thread 0 only (complex routing) */
+            if (tid == 0) {
+                int saved_alive = m->pool_alive;
+                m->pool_alive = 0;  /* disable pool dispatch */
+                const int n_expert = m->n_expert;
+                const int n_top = m->n_expert_used;
+                const int n_ff_exp = m->n_ff_expert;
+                tf_qmatvec_pool(m, m->ffn_buf1, &layer->ffn_gate_inp, m->xb, n_expert);
+                tf_softmax(m->ffn_buf1, n_expert);
+                /* ... MoE routing simplified: use single-thread for now ... */
+                int best = 0;
+                for (int e = 1; e < n_expert; e++)
+                    if (m->ffn_buf1[e] > m->ffn_buf1[best]) best = e;
+                float ew = m->ffn_buf1[best];
+                tf_qmatvec_expert(m->ffn_buf2, &layer->ffn_up_exps, best, m->xb, n_ff_exp, m->matvec_tmp);
+                tf_qmatvec_expert(m->ffn_buf3, &layer->ffn_gate_exps, best, m->xb, n_ff_exp, m->matvec_tmp);
+                tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf3, m->ffn_buf2, n_ff_exp);
+                tf_qmatvec_expert(m->q, &layer->ffn_down_exps, best, m->ffn_buf3, n_embd, m->matvec_tmp);
+                for (int i = 0; i < n_embd; i++) m->x[i] += ew * m->q[i];
+                m->pool_alive = saved_alive;
+            }
+            tf_spin_barrier(m, &local_sense, nt);  /* MoE done */
+        }
+        /* No end-of-layer barrier needed: only thread 0 writes m->x (vadd),
+         * and only thread 0 reads it at the start of next layer (RMSNorm).
+         * The next layer's B1 barrier ensures all threads wait for the norm. */
+    }
+
+    /* Final norm: thread 0 only */
+    if (tid == 0) {
+        tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+    }
+    return NULL;
+}
+
+/* Persistent forward: dispatch tf_persistent_worker to ALL threads via pool,
+ * then main thread runs worker 0 (master-worker pattern). Workers communicate
+ * via spin barrier — the old pool dispatch mechanism is NOT used during forward. */
+static float *tf_forward_persistent(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
+    int nt = m->n_threads;
+
+    m->bar_count = 0;
+    m->bar_sense = 0;
+    __sync_synchronize();
+
+    tf_persistent_ctx *ctxs = (tf_persistent_ctx *)alloca(nt * sizeof(tf_persistent_ctx));
+    for (int t = 0; t < nt; t++)
+        ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w};
+
+    /* Use the existing pool to dispatch the persistent worker to threads 1..nt-1.
+     * Main thread (worker 0) runs inline. */
+    tf_pool_dispatch(m, tf_persistent_worker, ctxs, sizeof(tf_persistent_ctx));
+
+    return m->x;
 }
 
 /* ---- Forward pass ---- */
@@ -2620,12 +3155,6 @@ float *transformer_forward_pos(transformer_model *model, int32_t token_id, int c
         return NULL;
     }
     tf_dequant_row(&model->token_embd, token_id, model->x);
-    /* Gemma4: scale token embeddings by sqrt(n_embd), stash token_id for per-layer embd */
-    if (model->is_gemma4) {
-        float scale = model->embd_scale;
-        for (int i = 0; i < model->n_embd; i++) model->x[i] *= scale;
-        model->current_token_id = token_id;
-    }
     return tf_forward_blocks(model, cache_pos, pos_t, pos_h, pos_w);
 }
 
@@ -2639,10 +3168,6 @@ float *transformer_forward_logits_pos(transformer_model *model, int32_t token_id
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
     tf_qmatvec_pool(model, model->logits, &model->output, hidden, model->n_vocab);
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
-    /* Gemma4: final logit soft-capping */
-    if (model->is_gemma4 && model->final_logit_softcapping > 0.0f) {
-        tf_logit_softcap(model->logits, model->n_vocab, model->final_logit_softcapping);
-    }
     return model->logits;
 }
 
@@ -2651,6 +3176,8 @@ float *transformer_forward_logits(transformer_model *model, int32_t token_id, in
 }
 
 static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
+    if (m->n_threads > 1 && m->pool_alive)
+        return tf_forward_persistent(m, position, pos_t, pos_h, pos_w);
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
 
@@ -2667,57 +3194,6 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
     if (layer_end > m->n_layers) layer_end = m->n_layers;
     if (layer_start < 0) layer_start = 0;
 
-    /* Gemma4: precompute per-layer inputs (token embedding + model projection, combined).
-     * Uses heap allocation instead of alloca (total_ple = 256*42 = 10752 floats ≈ 43KB × 3). */
-    float *ple_combined = NULL; /* [n_layers * n_embd_per_layer] if Gemma4 */
-    if (m->is_gemma4 && m->per_layer_token_embd.data && m->current_token_id >= 0) {
-        int ple_dim = m->n_embd_per_layer;
-        int total_ple = ple_dim * m->n_layers;
-        ple_combined = (float *)malloc(total_ple * sizeof(float));
-        float *tok_ple = (float *)malloc(total_ple * sizeof(float));
-        float *proj_out = (float *)malloc(total_ple * sizeof(float));
-        if (!ple_combined || !tok_ple || !proj_out) {
-            fprintf(stderr, "transformer: Gemma4 PLE alloc failed (total_ple=%d)\n", total_ple);
-            free(proj_out);
-            free(tok_ple);
-            free(ple_combined);
-            return NULL;
-        }
-
-        /* 1. Look up per-layer token embedding: dequant row for this token */
-        dequant_row(m->per_layer_token_embd.type,
-                    (const uint8_t *)m->per_layer_token_embd.data +
-                    (size_t)m->current_token_id * tf_row_bytes(m->per_layer_token_embd.type, total_ple),
-                    tok_ple, total_ple);
-        float ple_tok_scale = sqrtf((float)ple_dim);
-        for (int i = 0; i < total_ple; i++) tok_ple[i] *= ple_tok_scale;
-
-        /* 2. Project x through per_layer_model_proj: [10752, 2560] @ [2560] = [10752] */
-        tf_qmatvec(proj_out, &m->per_layer_model_proj, m->x, total_ple, m->matvec_tmp);
-        float proj_scale = 1.0f / sqrtf((float)n_embd);
-        for (int i = 0; i < total_ple; i++) proj_out[i] *= proj_scale;
-
-        /* 3. RMSNorm with per_layer_proj_norm (shared [256] weights, applied per-layer slice) */
-        if (m->per_layer_proj_norm.data) {
-            float norm_w[256];
-            dequant_row(m->per_layer_proj_norm.type, m->per_layer_proj_norm.data, norm_w, ple_dim);
-            for (int ll = 0; ll < m->n_layers; ll++) {
-                float *slice = proj_out + ll * ple_dim;
-                float ss = 0.0f;
-                for (int i = 0; i < ple_dim; i++) ss += slice[i] * slice[i];
-                ss = 1.0f / sqrtf(ss / ple_dim + m->rms_norm_eps);
-                for (int i = 0; i < ple_dim; i++) slice[i] = slice[i] * ss * norm_w[i];
-            }
-        }
-
-        /* 4. Add token embedding + projection, scale by 1/sqrt(2) */
-        float input_scale = 1.0f / sqrtf(2.0f);
-        for (int i = 0; i < total_ple; i++)
-            ple_combined[i] = (proj_out[i] + tok_ple[i]) * input_scale;
-        free(proj_out);
-        free(tok_ple);
-    }
-
     /* 2. Transformer blocks */
     for (int l = layer_start; l < layer_end; l++) {
         transformer_layer *layer = &m->layers[l];
@@ -2728,230 +3204,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         TF_PROF_END("attn_norm", 5.0 * n_embd, 0);
 
-        if (m->is_gemma4) {
-            /* --- Gemma4 layer --- */
-            int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
-            int local_kv_dim = n_kv_heads * hd;
-            int local_q_dim  = n_heads * hd;
-            int local_gqa    = n_heads / n_kv_heads;
-            float eps = m->rms_norm_eps;
-
-            /* Q projection (always present) */
-            tf_qmatvec_pool(m, m->q, &layer->attn_q, m->xb, local_q_dim);
-
-            /* K/V projections (skip if sharing KV) */
-            int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
-            if (layer->shared_kv_source < 0) {
-                tf_qmatvec_pool(m, m->k, &layer->attn_k, m->xb, local_kv_dim);
-                tf_qmatvec_pool(m, m->v, &layer->attn_v, m->xb, local_kv_dim);
-            }
-
-            /* Q norm (always) */
-            tf_qk_norm(m->q, n_heads, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
-
-            /* K/V norm (only if we projected them) */
-            if (layer->shared_kv_source < 0) {
-                tf_qk_norm(m->k, n_kv_heads, hd, &layer->attn_k_norm, eps, m->matvec_tmp);
-                /* V norm — Gemma4 normalizes V too (raw RMSNorm, no weight) */
-                if (layer->attn_v_norm.data) {
-                    tf_qk_norm(m->v, n_kv_heads, hd, &layer->attn_v_norm, eps, m->matvec_tmp);
-                } else {
-                    /* V gets raw RMSNorm without learned weight */
-                    for (int h = 0; h < n_kv_heads; h++) {
-                        float *vh = m->v + h * hd;
-                        float ss = 0.0f;
-                        for (int i = 0; i < hd; i++) ss += vh[i] * vh[i];
-                        ss = 1.0f / sqrtf(ss / hd + eps);
-                        for (int i = 0; i < hd; i++) vh[i] *= ss;
-                    }
-                }
-            }
-
-            /* RoPE: use SWA or full-attention inv_freq table */
-            {
-                float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
-                int half = hd / 2;
-                /* Apply RoPE to Q */
-                for (int h = 0; h < n_heads; h++) {
-                    float *qh = m->q + h * hd;
-                    for (int j = 0; j < half; j++) {
-                        float freq = (float)position * inv_freq[j];
-                        float cos_v = cosf(freq), sin_v = sinf(freq);
-                        float r0 = qh[j], r1 = qh[j + half];
-                        qh[j]        = r0 * cos_v - r1 * sin_v;
-                        qh[j + half] = r0 * sin_v + r1 * cos_v;
-                    }
-                }
-                /* Apply RoPE to K (only if we projected K) */
-                if (layer->shared_kv_source < 0) {
-                    for (int h = 0; h < n_kv_heads; h++) {
-                        float *kh = m->k + h * hd;
-                        for (int j = 0; j < half; j++) {
-                            float freq = (float)position * inv_freq[j];
-                            float cos_v = cosf(freq), sin_v = sinf(freq);
-                            float r0 = kh[j], r1 = kh[j + half];
-                            kh[j]        = r0 * cos_v - r1 * sin_v;
-                            kh[j + half] = r0 * sin_v + r1 * cos_v;
-                        }
-                    }
-                }
-            }
-
-            /* KV cache store */
-            if (layer->shared_kv_source < 0) {
-                if (layer->is_swa) {
-                    int slot = position % m->swa_window_size;
-                    memcpy(m->key_cache[l]   + slot * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + slot * local_kv_dim, m->v, local_kv_dim * sizeof(float));
-                } else {
-                    memcpy(m->key_cache[l]   + position * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + position * local_kv_dim, m->v, local_kv_dim * sizeof(float));
-                }
-            }
-
-            /* Attention with scale=1.0 (QK norms handle scaling) */
-            {
-                float attn_scale = 1.0f;
-                int seq_len;
-                float *kc = m->key_cache[kv_src];
-                float *vc = m->value_cache[kv_src];
-
-                if (layer->is_swa) {
-                    /* SWA: attend to window [max(0, pos-window+1), pos] via circular buffer */
-                    int win = m->swa_window_size;
-                    int start = (position >= win) ? (position - win + 1) : 0;
-                    seq_len = position - start + 1;
-
-                    /* Compute attention scores over the window */
-                    memset(m->xb2, 0, local_q_dim * sizeof(float));
-                    for (int h = 0; h < n_heads; h++) {
-                        float *qh = m->q + h * hd;
-                        float *att_h = m->att + h * seq_len;
-                        int kv_h = h / local_gqa;
-
-                        /* Compute QK scores */
-                        for (int p = 0; p < seq_len; p++) {
-                            int abs_pos = start + p;
-                            int slot = abs_pos % win;
-                            float *kp = kc + slot * local_kv_dim + kv_h * hd;
-                            float score = 0.0f;
-                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
-                            att_h[p] = score * attn_scale;
-                        }
-
-                        /* Softmax */
-                        float max_s = att_h[0];
-                        for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
-                        float sum_e = 0.0f;
-                        for (int p = 0; p < seq_len; p++) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }
-                        float inv_sum = 1.0f / sum_e;
-                        for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
-
-                        /* Weighted sum of values */
-                        float *out_h = m->xb2 + h * hd;
-                        for (int p = 0; p < seq_len; p++) {
-                            int abs_pos = start + p;
-                            int slot = abs_pos % win;
-                            float *vp = vc + slot * local_kv_dim + kv_h * hd;
-                            float w = att_h[p];
-                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
-                        }
-                    }
-                } else {
-                    /* Full attention */
-                    seq_len = position + 1;
-                    memset(m->xb2, 0, local_q_dim * sizeof(float));
-                    for (int h = 0; h < n_heads; h++) {
-                        float *qh = m->q + h * hd;
-                        float *att_h = m->att + h * seq_len;
-                        int kv_h = h / local_gqa;
-
-                        for (int p = 0; p < seq_len; p++) {
-                            float *kp = kc + p * local_kv_dim + kv_h * hd;
-                            float score = 0.0f;
-                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
-                            att_h[p] = score * attn_scale;
-                        }
-
-                        float max_s = att_h[0];
-                        for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
-                        float sum_e = 0.0f;
-                        for (int p = 0; p < seq_len; p++) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }
-                        float inv_sum = 1.0f / sum_e;
-                        for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
-
-                        float *out_h = m->xb2 + h * hd;
-                        for (int p = 0; p < seq_len; p++) {
-                            float *vp = vc + p * local_kv_dim + kv_h * hd;
-                            float w = att_h[p];
-                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
-                        }
-                    }
-                }
-            }
-
-            /* Output projection */
-            tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
-
-            /* Post-attention norm (before residual) */
-            tf_rmsnorm(m->xb, m->xb, &layer->post_attention_norm, n_embd, eps, m->matvec_tmp);
-
-            /* Residual */
-            tf_vadd(m->x, m->xb, n_embd);
-
-            /* --- FFN with GELU --- */
-            tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
-
-            tf_qmatvec_fused2_pool(m, m->ffn_buf1, &layer->ffn_gate,
-                                    m->ffn_buf2, &layer->ffn_up, m->xb, m->n_ff);
-            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff);
-
-            tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
-
-            /* Post-FFN norm (before residual) */
-            tf_rmsnorm(m->xb, m->xb, &layer->post_ffw_norm, n_embd, eps, m->matvec_tmp);
-
-            /* Residual */
-            tf_vadd(m->x, m->xb, n_embd);
-
-            /* Per-layer embedding injection (BEFORE layer_output_scale) */
-            if (ple_combined) {
-                int ple_dim = m->n_embd_per_layer;
-                float *ple = m->ple_buf;      /* [ple_dim] */
-                float *proj = m->ple_proj_buf; /* [n_embd] */
-
-                /* Take precomputed per-layer input slice for this layer */
-                memcpy(ple, ple_combined + l * ple_dim, ple_dim * sizeof(float));
-
-                /* inp_gate: hidden -> [ple_dim], GELU, element-wise multiply */
-                tf_qmatvec_pool(m, proj, &layer->ple_inp_gate, m->x, ple_dim);
-                for (int i = 0; i < ple_dim; i++) {
-                    float g = proj[i];
-                    float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));
-                    ple[i] *= gelu_g;
-                }
-
-                /* Project back to n_embd via ple_proj */
-                tf_qmatvec_pool(m, proj, &layer->ple_proj, ple, n_embd);
-
-                /* Post-norm on projected output */
-                if (layer->ple_post_norm.data) {
-                    tf_rmsnorm(proj, proj, &layer->ple_post_norm, n_embd, eps, m->matvec_tmp);
-                }
-
-                /* Residual add */
-                tf_vadd(m->x, proj, n_embd);
-            }
-
-            /* Layer output scaling (AFTER per-layer embedding) */
-            if (layer->layer_output_scale.data) {
-                float scale_val;
-                dequant_row(layer->layer_output_scale.type, layer->layer_output_scale.data, &scale_val, 1);
-                for (int i = 0; i < n_embd; i++) m->x[i] *= scale_val;
-            }
-
-            goto gemma4_layer_done;
-        } else if (m->is_hybrid && layer->is_ssm) {
+        if (m->is_hybrid && layer->is_ssm) {
             /* --- SSM (Delta-Net) layer --- */
             tf_ssm_deltanet_forward(m, l);
         } else if (m->is_hybrid) {
@@ -3046,6 +3299,34 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             TF_PROF_BEGIN("qkv_proj", l, "matvec", "FP32");
             tf_qmatvec_fused_qkv_pool(m, m->q, &layer->attn_q, q_dim,
                                        m->k, &layer->attn_k, m->v, &layer->attn_v, kv_dim);
+            /* Add Q/K/V biases if present (Qwen2.5-VL) */
+            if (layer->attn_q_bias.data) {
+                if (layer->attn_q_bias.type == GGML_TYPE_F32) {
+                    float *qb = (float *)layer->attn_q_bias.data;
+                    for (int i = 0; i < q_dim; i++) m->q[i] += qb[i];
+                } else {
+                    tf_dequant_row(&layer->attn_q_bias, 0, m->matvec_tmp);
+                    for (int i = 0; i < q_dim; i++) m->q[i] += m->matvec_tmp[i];
+                }
+            }
+            if (layer->attn_k_bias.data) {
+                if (layer->attn_k_bias.type == GGML_TYPE_F32) {
+                    float *kb = (float *)layer->attn_k_bias.data;
+                    for (int i = 0; i < kv_dim; i++) m->k[i] += kb[i];
+                } else {
+                    tf_dequant_row(&layer->attn_k_bias, 0, m->matvec_tmp);
+                    for (int i = 0; i < kv_dim; i++) m->k[i] += m->matvec_tmp[i];
+                }
+            }
+            if (layer->attn_v_bias.data) {
+                if (layer->attn_v_bias.type == GGML_TYPE_F32) {
+                    float *vb = (float *)layer->attn_v_bias.data;
+                    for (int i = 0; i < kv_dim; i++) m->v[i] += vb[i];
+                } else {
+                    tf_dequant_row(&layer->attn_v_bias, 0, m->matvec_tmp);
+                    for (int i = 0; i < kv_dim; i++) m->v[i] += m->matvec_tmp[i];
+                }
+            }
             TF_PROF_END("qkv_proj", 2.0 * (q_dim + 2.0 * kv_dim) * n_embd, 0);
 
             /* QK-Norm (if present) */
@@ -3220,17 +3501,13 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             tf_vadd(m->x, m->xb, n_embd);
         }
 
-        gemma4_layer_done:
-
         /* DeepStack injection: add deepstack slice after each early layer */
         if (m->ds_embd && l < m->n_deepstack && m->ds_embd_stride > n_embd) {
             const float *ds_slice = m->ds_embd + (1 + l) * n_embd;
             tf_vadd(m->x, ds_slice, n_embd);
         }
 
-        if (m->trace_hidden_norms && (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0)) {
-            fprintf(stderr, "  layer %2d: hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(m->x, n_embd)));
-        }
+        (void)0; /* hidden norm profiling available via tf_sum_squares if needed */
     }
 
     /* Final RMSNorm (only if we processed through the last layer) */
@@ -3240,7 +3517,6 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         TF_PROF_END("final_norm", 5.0 * n_embd, 0);
     }
 
-    free(ple_combined); /* NULL-safe: no-op if not Gemma4 */
     return m->x;
 }
 
@@ -3309,9 +3585,7 @@ static void tf_qmatvec_row_slice(transformer_model *m, float *dst, const qtensor
  * dst has n_rows elements (partial sums). */
 static void tf_qmatvec_col_slice(float *dst, const qtensor *mat, const float *x_local,
                                   int n_rows, int col_start, int col_end, float *tmp) {
-    int n_cols = mat->n_cols;
     int local_cols = col_end - col_start;
-    size_t row_bytes = tf_row_bytes(mat->type, n_cols);
     for (int i = 0; i < n_rows; i++) {
         /* Dequant full row to tmp, then dot with local slice */
         tf_dequant_row(mat, i, tmp);
@@ -3394,9 +3668,6 @@ float *transformer_forward_embd_pos(transformer_model *model, const float *embd,
         return NULL;
     }
     memcpy(model->x, embd, model->n_embd * sizeof(float));
-    /* Gemma4: use padding token (ID=0) for per-layer embeddings on vision tokens.
-     * llama.cpp gemma4-iswa.cpp: vision path uses row 0 of per_layer_token_embd. */
-    if (model->is_gemma4) model->current_token_id = 0;
     /* Store full embedding pointer for deepstack injection in tf_forward_blocks */
     model->ds_embd = embd;
     float *result = tf_forward_blocks(model, cache_pos, pos_t, pos_h, pos_w);
@@ -3520,11 +3791,18 @@ typedef struct {
 static void *tf_gemm_tm_worker(void *arg) {
     tf_gemm_tm_task *t = (tf_gemm_tm_task *)arg;
     int nrows = t->row_end - t->row_start;
-    /* Write to Y[tok * Y_stride + row], offset row by row_start */
-    /* We need a shifted Y pointer that accounts for row_start offset in the token-major layout */
     gemm_f16_f32_tokmajor(t->Y + t->row_start,
                            t->W + (size_t)t->row_start * t->K,
                            t->X, nrows, t->K, t->N, t->Y_stride, t->X_stride);
+    return NULL;
+}
+
+static void *tf_gemm_bf16_tm_worker(void *arg) {
+    tf_gemm_tm_task *t = (tf_gemm_tm_task *)arg;
+    int nrows = t->row_end - t->row_start;
+    gemm_bf16_f32_tokmajor(t->Y + t->row_start,
+                            t->W + (size_t)t->row_start * t->K,
+                            t->X, nrows, t->K, t->N, t->Y_stride, t->X_stride);
     return NULL;
 }
 
@@ -3560,8 +3838,6 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
             gemm_q8_0_f32_tokmajor(Y_out, mat->data, X, n_rows, K, N, out_stride, X_stride);
             return;
         }
-        int nb = K / 32;
-        size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
         pthread_t *threads = (pthread_t *)alloca(n_threads * sizeof(pthread_t));
         tf_gemm_q8_tm_task *tasks = (tf_gemm_q8_tm_task *)alloca(n_threads * sizeof(tf_gemm_q8_tm_task));
         int rows_per = n_rows / n_threads, extra = n_rows % n_threads, offset = 0;
@@ -3578,8 +3854,30 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
         return;
     }
+    if (mat->type == GGML_TYPE_BF16) {
+        /* BF16 GEMM path */
+        int K = mat->n_cols;
+        if (n_threads <= 1 || n_rows < n_threads * 4) {
+            gemm_bf16_f32_tokmajor(Y_out, (const uint16_t *)mat->data, X,
+                                    n_rows, K, N, out_stride, X_stride);
+            return;
+        }
+        pthread_t *threads = (pthread_t *)alloca(n_threads * sizeof(pthread_t));
+        tf_gemm_tm_task *tasks = (tf_gemm_tm_task *)alloca(n_threads * sizeof(tf_gemm_tm_task));
+        int rows_per = n_rows / n_threads, extra = n_rows % n_threads, offset = 0;
+        for (int i = 0; i < n_threads; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_tm_task){Y_out, (const uint16_t *)mat->data,
+                                          X, offset, offset + count, K, N, out_stride, X_stride};
+            offset += count;
+        }
+        for (int i = 0; i < n_threads; i++)
+            pthread_create(&threads[i], NULL, tf_gemm_bf16_tm_worker, &tasks[i]);
+        for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
+        return;
+    }
     if (mat->type != GGML_TYPE_F16) {
-        /* Fallback for other non-F16: per-token matvec (AVX2 dot product) */
+        /* Fallback for other non-F16/BF16: per-token matvec */
         int n_cols = mat->n_cols;
         float *row_buf = (float *)malloc(n_cols * sizeof(float));
         size_t rb = tf_row_bytes(mat->type, n_cols);
@@ -3697,8 +3995,6 @@ static void tf_gemm_f16_mt_fused2(float *Y1, const qtensor *mat1,
 static inline __m256 fast_exp_avx2(__m256 x) {
     const __m256 log2e  = _mm256_set1_ps(1.442695040f);
     const __m256 c0     = _mm256_set1_ps(12582912.0f); /* 1.5 * 2^23 (magic bias) */
-    const __m256 c1     = _mm256_set1_ps(1065353216.0f); /* 127 * 2^23 */
-    const __m256 c2     = _mm256_set1_ps(8388608.0f);  /* 2^23 */
     /* Polynomial coefficients for fractional part */
     const __m256 p0     = _mm256_set1_ps(0.9999999f);
     const __m256 p1     = _mm256_set1_ps(0.6931472f);
@@ -4410,10 +4706,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
 
         t_deepstack += tf_time_ms() - t0p;
 
-        if (m->trace_hidden_norms && (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0)) {
-            float *last = bx + (size_t)(N-1) * n_embd;
-            fprintf(stderr, "  [batch] layer %2d: last token hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(last, n_embd)));
-        }
+        (void)0; /* batch hidden norm profiling available via tf_sum_squares if needed */
     }
 
     /* Print batch profiling summary */

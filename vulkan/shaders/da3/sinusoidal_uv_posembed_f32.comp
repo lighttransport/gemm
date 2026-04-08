@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint H;
+    uint W;
+    float span_x;
+    float span_y;
+    float ratio;
+} pc;
+
+layout(std430, binding = 0) buffer DataBuf { float data[]; };
+
+void main() {
+    uint idx = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint total = pc.C * pc.H * pc.W;
+    if (idx >= total) return;
+
+    uint c = idx / (pc.H * pc.W);
+    uint hw = idx % (pc.H * pc.W);
+    uint h = hw / pc.W;
+    uint w = hw % pc.W;
+
+    uint quarter = pc.C / 4u;
+
+    float u = (pc.W > 1u) ? pc.span_x * (2.0 * float(w) - float(pc.W - 1u)) / float(pc.W) : 0.0;
+    float v = (pc.H > 1u) ? pc.span_y * (2.0 * float(h) - float(pc.H - 1u)) / float(pc.H) : 0.0;
+
+    uint band;
+    float coord;
+    bool is_cos;
+
+    if (c < quarter) {
+        band = c; coord = u; is_cos = false;
+    } else if (c < 2u * quarter) {
+        band = c - quarter; coord = u; is_cos = true;
+    } else if (c < 3u * quarter) {
+        band = c - 2u * quarter; coord = v; is_cos = false;
+    } else {
+        band = c - 3u * quarter; coord = v; is_cos = true;
+    }
+
+    float omega = 1.0 / pow(100.0, float(band) / float(quarter));
+    float angle = coord * omega;
+    float emb = is_cos ? cos(angle) : sin(angle);
+
+    data[idx] += emb * pc.ratio;
+}

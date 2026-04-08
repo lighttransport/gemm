@@ -1,0 +1,45 @@
+#version 450
+// DA3 patch embedding: Conv2D with stride=patch_size
+// Image input in CHW format: img[c * img_h * img_w + y * img_w + x]
+// Weight: w[(co * 3 + ci) * ps * ps + kh * ps + kw]  (PyTorch Conv2d order)
+// Output: hidden[(1 + patch) * dim + co]  (CLS token at index 0, patches at 1..np)
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer HiddenBuf { float hidden[]; };
+layout(std430, binding = 1) readonly buffer ImageBuf { float img[]; };
+layout(std430, binding = 2) readonly buffer WeightBuf { float w[]; };
+layout(std430, binding = 3) readonly buffer BiasBuf { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint gw;       // grid width
+    uint dim;      // embedding dim (output channels)
+    uint ps;       // patch size (14)
+    uint img_w;    // target image width
+    uint img_h;    // target image height
+} pc;
+
+void main() {
+    // One workgroup per patch, threads iterate over output channels
+    uint pid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint py = pid / pc.gw;
+    uint px = pid % pc.gw;
+    uint tok = 1u + pid;  // skip CLS at 0
+    uint img_hw = pc.img_h * pc.img_w;
+
+    for (uint co = tid; co < pc.dim; co += gl_WorkGroupSize.x) {
+        float sum = bias[co];
+        for (uint ci = 0u; ci < 3u; ci++) {
+            for (uint kh = 0u; kh < pc.ps; kh++) {
+                for (uint kw = 0u; kw < pc.ps; kw++) {
+                    uint ih = py * pc.ps + kh;
+                    uint iw = px * pc.ps + kw;
+                    sum += w[((co * 3u + ci) * pc.ps + kh) * pc.ps + kw]
+                         * img[ci * img_hw + ih * pc.img_w + iw];
+                }
+            }
+        }
+        hidden[tok * pc.dim + co] = sum;
+    }
+}
