@@ -2924,6 +2924,120 @@ static const char *cuda_kernel_source =
 "    v[j + n_pairs] = r0 * sin_v + r1 * cos_v;\n"
 "}\n"
 "\n"
+"/* ==== Batched Prefill Kernels ==== */\n"
+"\n"
+"/* Batched Q2_K matvec: process n_tokens through weight matrix simultaneously */\n"
+"/* Grid: [ceil(out_dim/8), n_tokens], Block: 256 (8 warps) */\n"
+"__global__ void batch_matvec_q2_K(float *output, const unsigned char *mat, const float *input,\n"
+"                                    int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 84;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 84;\n"
+"        const unsigned char *scales = bp;\n"
+"        const unsigned char *qs = bp + 16;\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 80));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 82));\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int is = 0, yi = 0;\n"
+"        for (int n0 = 0; n0 < 2; n0++) {\n"
+"            for (int j = 0; j < 4; j++) {\n"
+"                int shift = j * 2;\n"
+"                unsigned char sc = scales[is++];\n"
+"                float dl = d * (sc & 0xF), ml = dmin * (sc >> 4);\n"
+"                for (int l = 0; l < 16; l++) partial += (dl * ((qs[l] >> shift) & 3) - ml) * xb[yi++];\n"
+"                sc = scales[is++];\n"
+"                dl = d * (sc & 0xF); ml = dmin * (sc >> 4);\n"
+"                for (int l = 0; l < 16; l++) partial += (dl * ((qs[l+16] >> shift) & 3) - ml) * xb[yi++];\n"
+"            }\n"
+"            qs += 32;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"/* Batched Q3_K matvec */\n"
+"__global__ void batch_matvec_q3_K(float *output, const unsigned char *mat, const float *input,\n"
+"                                    int out_dim, int in_dim, int n_tokens) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= out_dim || token >= n_tokens) return;\n"
+"    int nb = in_dim / 256;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 110;\n"
+"    const float *x = input + (size_t)token * in_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        const unsigned char *hm = bp;\n"
+"        const unsigned char *qs = bp + 32;\n"
+"        const unsigned char *raw_sc = bp + 96;\n"
+"        float d_all = half_to_float(*(const half_raw *)(bp + 108));\n"
+"        unsigned int a0=raw_sc[0]|(raw_sc[1]<<8)|(raw_sc[2]<<16)|(raw_sc[3]<<24);\n"
+"        unsigned int a1=raw_sc[4]|(raw_sc[5]<<8)|(raw_sc[6]<<16)|(raw_sc[7]<<24);\n"
+"        unsigned int tmp2=raw_sc[8]|(raw_sc[9]<<8)|(raw_sc[10]<<16)|(raw_sc[11]<<24);\n"
+"        unsigned int km1=0x03030303u, km2=0x0f0f0f0fu;\n"
+"        unsigned int aux[4];\n"
+"        aux[0]=(a0&km2)|(((tmp2>>0)&km1)<<4); aux[1]=(a1&km2)|(((tmp2>>2)&km1)<<4);\n"
+"        aux[2]=((a0>>4)&km2)|(((tmp2>>4)&km1)<<4); aux[3]=((a1>>4)&km2)|(((tmp2>>6)&km1)<<4);\n"
+"        const signed char *scales = (const signed char *)aux;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int is = 0, yi = 0;\n"
+"        unsigned char m_bit = 1;\n"
+"        for (int n0 = 0; n0 < 2; n0++) {\n"
+"            for (int j = 0; j < 4; j++) {\n"
+"                int shift = j * 2;\n"
+"                float dl1 = d_all * (scales[is++] - 32);\n"
+"                for (int l = 0; l < 16; l++) { int qv=((qs[l]>>shift)&3)-((hm[l]&m_bit)?0:4); partial+=dl1*qv*xb[yi++]; }\n"
+"                float dl2 = d_all * (scales[is++] - 32);\n"
+"                for (int l = 0; l < 16; l++) { int qv=((qs[l+16]>>shift)&3)-((hm[l+16]&m_bit)?0:4); partial+=dl2*qv*xb[yi++]; }\n"
+"                m_bit <<= 1;\n"
+"            }\n"
+"            qs += 32;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
+"}\n"
+"\n"
+"/* Batched F16 KV store: store n_tokens K/V at consecutive positions */\n"
+"/* Grid: [ceil(kv_dim/256), n_tokens], Block: 256 */\n"
+"__global__ void batch_kv_store_f16(half_raw *key_cache, half_raw *value_cache,\n"
+"                                    const float *k_batch, const float *v_batch,\n"
+"                                    int start_pos, int kv_dim, int n_tokens) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int t = blockIdx.y;\n"
+"    if (i >= kv_dim || t >= n_tokens) return;\n"
+"    int pos = start_pos + t;\n"
+"    key_cache[(size_t)pos * kv_dim + i] = float_to_half(k_batch[(size_t)t * kv_dim + i]);\n"
+"    value_cache[(size_t)pos * kv_dim + i] = float_to_half(v_batch[(size_t)t * kv_dim + i]);\n"
+"}\n"
+"\n"
+"/* Batched SWA KV store: store at circular buffer positions */\n"
+"__global__ void batch_kv_store_swa_f16(half_raw *key_cache, half_raw *value_cache,\n"
+"                                        const float *k_batch, const float *v_batch,\n"
+"                                        int start_pos, int kv_dim, int n_tokens, int window_size) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int t = blockIdx.y;\n"
+"    if (i >= kv_dim || t >= n_tokens) return;\n"
+"    int slot = (start_pos + t) % window_size;\n"
+"    key_cache[(size_t)slot * kv_dim + i] = float_to_half(k_batch[(size_t)t * kv_dim + i]);\n"
+"    value_cache[(size_t)slot * kv_dim + i] = float_to_half(v_batch[(size_t)t * kv_dim + i]);\n"
+"}\n"
+"\n"
 "/* ==== Vision Encoder Kernels ==== */\n"
 "\n"
 "/* Batched F16 linear: weight[out_dim, in_dim] (F16) × input[N, in_dim] (F32) → output[N, out_dim] (F32) */\n"
@@ -2979,6 +3093,37 @@ static const char *cuda_kernel_source =
 "    if (weight) {\n"
 "        for (int i = tid; i < dim; i += blockDim.x)\n"
 "            v[i] = v[i] * scale * half_to_float(weight[i]);\n"
+"    } else {\n"
+"        for (int i = tid; i < dim; i += blockDim.x)\n"
+"            v[i] *= scale;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Batched RMSNorm with F32 weights (for LLM layer norms) */\n"
+"__global__ void batch_rmsnorm_f32(float *x, const float *weight, int dim, float eps, int n_tokens) {\n"
+"    int token = blockIdx.x;\n"
+"    if (token >= n_tokens) return;\n"
+"    int tid = threadIdx.x;\n"
+"    float *v = x + (size_t)token * dim;\n"
+"    float ss = 0.0f;\n"
+"    for (int i = tid; i < dim; i += blockDim.x) ss += v[i] * v[i];\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        ss += __shfl_down_sync(0xFFFFFFFF, ss, offset);\n"
+"    __shared__ float ws[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws[wid] = ss;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float s = 0.0f;\n"
+"        int nw = (blockDim.x + 31) / 32;\n"
+"        for (int w2 = 0; w2 < nw; w2++) s += ws[w2];\n"
+"        ws[0] = rsqrtf(s / dim + eps);\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float scale = ws[0];\n"
+"    if (weight) {\n"
+"        for (int i = tid; i < dim; i += blockDim.x)\n"
+"            v[i] = v[i] * scale * weight[i];\n"
 "    } else {\n"
 "        for (int i = tid; i < dim; i += blockDim.x)\n"
 "            v[i] *= scale;\n"
@@ -3346,6 +3491,13 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_tq1_0_f32;
     CUfunction fn_matvec_tq2_0_f32;
 
+    /* Batched prefill kernels */
+    CUfunction fn_batch_matvec_q2_K;
+    CUfunction fn_batch_matvec_q3_K;
+    CUfunction fn_batch_kv_store_f16;
+    CUfunction fn_batch_kv_store_swa_f16;
+    CUfunction fn_batch_rmsnorm_f32;
+
     /* Vision encoder kernels */
     CUfunction fn_vision_linear_f16;
     CUfunction fn_vision_rmsnorm;
@@ -3621,6 +3773,12 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(attn_decode_swa_f32);
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(rope_with_factors_f32);
+    /* Batched prefill kernels */
+    GET_FUNC(batch_matvec_q2_K);
+    GET_FUNC(batch_matvec_q3_K);
+    GET_FUNC(batch_kv_store_f16);
+    GET_FUNC(batch_kv_store_swa_f16);
+    GET_FUNC(batch_rmsnorm_f32);
     /* Vision encoder kernels */
     GET_FUNC(vision_linear_f16);
     GET_FUNC(vision_rmsnorm);
@@ -6539,6 +6697,385 @@ void cuda_llm_set_debug(cuda_llm_runner *r, int debug_layers) {
 
 void cuda_llm_set_max_layers(cuda_llm_runner *r, int max_layers) {
     if (r) r->max_layers = max_layers;
+}
+
+/* ======================================================================== */
+/* GPU Vision Encoder                                                       */
+/* ======================================================================== */
+
+/* ======================================================================== */
+/* Batched Prefill                                                          */
+/* ======================================================================== */
+
+/* Helper: launch batched matvec for a given weight type */
+static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                 CUdeviceptr input, int out_dim, int in_dim,
+                                 int n_tokens, int weight_type) {
+    if (weight_type == GGML_TYPE_Q2_K) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_q2_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_Q3_K) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_batch_matvec_q3_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else if (weight_type == GGML_TYPE_F16) {
+        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
+        cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    } else {
+        /* Fallback: sequential per-token matvec */
+        for (int t = 0; t < n_tokens; t++) {
+            CUdeviceptr in_t = input + (size_t)t * in_dim * sizeof(float);
+            CUdeviceptr out_t = dst + (size_t)t * out_dim * sizeof(float);
+            launch_matvec_auto(r, out_t, mat, in_t, out_dim, in_dim, weight_type);
+        }
+    }
+}
+
+float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
+                         const float *embeddings, int embd_stride,
+                         int n_tokens, int start_pos) {
+    if (!r || n_tokens <= 0) return NULL;
+
+    /* Fall back to sequential for models with PLE (needs GPU PLE precomputation) */
+    if (r->n_embd_per_layer > 0 && r->d_ple_combined) {
+        float *result = NULL;
+        for (int t = 0; t < n_tokens; t++) {
+            if (token_ids)
+                result = cuda_llm_forward(r, token_ids[t], start_pos + t);
+            else if (embeddings)
+                result = cuda_llm_forward_embd(r, embeddings + t * embd_stride, embd_stride, start_pos + t);
+        }
+        return result;
+    }
+
+    int n_embd = r->n_embd;
+    int n_heads = r->n_heads;
+    int n_ff = r->n_ff;
+    float eps = r->rms_norm_eps;
+
+    /* Allocate batch buffers */
+    size_t batch_embd = (size_t)n_tokens * n_embd * sizeof(float);
+    int max_kv_dim = r->n_kv_heads * r->head_dim;
+    if (r->is_gemma4) {
+        int kv1 = r->n_kv_heads * r->head_dim_full;
+        int kv2 = r->n_kv_heads * r->head_dim_swa;
+        max_kv_dim = kv1 > kv2 ? kv1 : kv2;
+    }
+    int max_q_dim = n_heads * r->head_dim;
+    if (r->is_gemma4) {
+        int q1 = n_heads * r->head_dim_full;
+        int q2 = n_heads * r->head_dim_swa;
+        max_q_dim = q1 > q2 ? q1 : q2;
+    }
+
+    CUdeviceptr d_batch_x, d_batch_xb, d_batch_q, d_batch_k, d_batch_v;
+    CUdeviceptr d_batch_xb2, d_batch_gate, d_batch_up;
+    cuMemAlloc(&d_batch_x, batch_embd);
+    cuMemAlloc(&d_batch_xb, batch_embd);
+    cuMemAlloc(&d_batch_q, (size_t)n_tokens * max_q_dim * sizeof(float));
+    cuMemAlloc(&d_batch_k, (size_t)n_tokens * max_kv_dim * sizeof(float));
+    cuMemAlloc(&d_batch_v, (size_t)n_tokens * max_kv_dim * sizeof(float));
+    cuMemAlloc(&d_batch_xb2, (size_t)n_tokens * max_q_dim * sizeof(float));
+    cuMemAlloc(&d_batch_gate, (size_t)n_tokens * n_ff * sizeof(float));
+    cuMemAlloc(&d_batch_up, (size_t)n_tokens * n_ff * sizeof(float));
+
+    /* Upload token embeddings */
+    if (token_ids) {
+        /* Token ID path: use single-token forward for embedding, read back from GPU */
+        float *h_embd = (float *)malloc(batch_embd);
+        for (int t = 0; t < n_tokens; t++) {
+            /* Use the existing embed kernel (handles Q8_0 padding, Q4_K, etc.) */
+            if (r->token_embd_type == GGML_TYPE_Q8_0) {
+                launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+            } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
+                launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+            } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
+                void *ea[] = { &r->d_x, &r->d_token_embd, &token_ids[t], &n_embd };
+                cuLaunchKernel(r->fn_embed_q4_K, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
+            } else {
+                launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
+            }
+            if (r->is_gemma4) launch_scale(r, r->d_x, r->embd_scale, n_embd);
+            cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x, n_embd * sizeof(float), r->stream);
+        }
+        cuStreamSynchronize(r->stream);
+        cuMemcpyHtoD(d_batch_x, h_embd, batch_embd);
+        free(h_embd);
+    } else if (embeddings) {
+        /* Pre-computed embeddings path */
+        if (embd_stride == n_embd) {
+            cuMemcpyHtoD(d_batch_x, embeddings, batch_embd);
+        } else {
+            for (int t = 0; t < n_tokens; t++)
+                cuMemcpyHtoDAsync(d_batch_x + (size_t)t * n_embd * sizeof(float),
+                                   embeddings + t * embd_stride,
+                                   n_embd * sizeof(float), r->stream);
+        }
+        /* Gemma4: scale embeddings only for token inputs, not vision embeddings */
+    } else {
+        return NULL;
+    }
+
+    /* Gemma4: stash token_id for PLE (use last token) */
+    if (r->is_gemma4 && token_ids)
+        r->current_token_id = token_ids[n_tokens - 1];
+
+    int n_layers = r->n_layers;
+    if (r->max_layers > 0 && r->max_layers < n_layers) n_layers = r->max_layers;
+
+    /* Process transformer blocks */
+    for (int l = 0; l < n_layers; l++) {
+        cuda_layer *cl = &r->layers[l];
+        if (cl->is_ssm) {
+            /* SSM layers: fall back to per-token processing */
+            for (int t = 0; t < n_tokens; t++) {
+                cuMemcpyDtoDAsync(r->d_x, d_batch_x + (size_t)t * n_embd * sizeof(float),
+                                   n_embd * sizeof(float), r->stream);
+                /* TODO: SSM forward for this token */
+                cuMemcpyDtoDAsync(d_batch_x + (size_t)t * n_embd * sizeof(float),
+                                   r->d_x, n_embd * sizeof(float), r->stream);
+            }
+            continue;
+        }
+
+        if (!r->is_gemma4) continue; /* Only Gemma4 batched prefill implemented */
+
+        int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
+        int layer_kv_heads = cl->n_kv_heads;
+        int local_kv_dim = layer_kv_heads * hd;
+        int local_q_dim = n_heads * hd;
+
+        /* 1. Pre-attention RMSNorm: batch_xb = rmsnorm(batch_x) */
+        cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd, r->stream);
+        { void *a[] = { &d_batch_xb, &cl->attn_norm_w, &n_embd, &eps, &n_tokens };
+          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+        /* 2. Q/K/V projections (batched) */
+        launch_batch_matvec(r, d_batch_q, cl->attn_q_w, d_batch_xb,
+                            cl->attn_q_rows, cl->attn_q_cols, n_tokens, cl->attn_q_type);
+        if (cl->shared_kv_source < 0) {
+            launch_batch_matvec(r, d_batch_k, cl->attn_k_w, d_batch_xb,
+                                cl->attn_k_rows, cl->attn_k_cols, n_tokens, cl->attn_k_type);
+            if (cl->has_v_proj) {
+                launch_batch_matvec(r, d_batch_v, cl->attn_v_w, d_batch_xb,
+                                    cl->attn_v_rows, cl->attn_v_cols, n_tokens, cl->attn_v_type);
+            } else {
+                cuMemcpyDtoDAsync(d_batch_v, d_batch_k, (size_t)n_tokens * local_kv_dim * sizeof(float), r->stream);
+            }
+        }
+
+        /* 3. Per-token Q/K norm + RoPE + KV store + attention (sequential per token) */
+        for (int t = 0; t < n_tokens; t++) {
+            int pos = start_pos + t;
+            CUdeviceptr q_t = d_batch_q + (size_t)t * local_q_dim * sizeof(float);
+            CUdeviceptr k_t = d_batch_k + (size_t)t * local_kv_dim * sizeof(float);
+            CUdeviceptr v_t = d_batch_v + (size_t)t * local_kv_dim * sizeof(float);
+            CUdeviceptr xb2_t = d_batch_xb2 + (size_t)t * local_q_dim * sizeof(float);
+
+            /* Q/K norm */
+            if (cl->has_qk_norm) {
+                if (cl->attn_q_norm_w) launch_qknorm(r, q_t, cl->attn_q_norm_w, n_heads, hd, eps);
+                if (cl->shared_kv_source < 0) {
+                    if (cl->attn_k_norm_w) launch_qknorm(r, k_t, cl->attn_k_norm_w, layer_kv_heads, hd, eps);
+                    int bd = 1; while (bd < hd) bd <<= 1;
+                    void *va[] = { &v_t, &layer_kv_heads, &hd, &eps };
+                    cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, layer_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, va, NULL);
+                }
+            }
+
+            /* RoPE */
+            if (cl->is_swa) {
+                int half_swa = hd / 2, zero = 0;
+                void *qa[] = { &q_t, &n_heads, &hd, &pos, &r->rope_freq_base_swa, &zero };
+                cuLaunchKernel(r->fn_rope_neox_f32, n_heads, 1, 1, half_swa, 1, 1, 0, r->stream, qa, NULL);
+                if (cl->shared_kv_source < 0) {
+                    void *ka[] = { &k_t, &layer_kv_heads, &hd, &pos, &r->rope_freq_base_swa, &zero };
+                    cuLaunchKernel(r->fn_rope_neox_f32, layer_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, ka, NULL);
+                }
+            } else {
+                launch_rope_with_factors(r, q_t, n_heads, hd, pos, r->d_rope_inv_freq_full);
+                if (cl->shared_kv_source < 0)
+                    launch_rope_with_factors(r, k_t, layer_kv_heads, hd, pos, r->d_rope_inv_freq_full);
+            }
+
+            /* KV store */
+            if (cl->shared_kv_source < 0) {
+                if (cl->is_swa) {
+                    int slot = pos % r->swa_window_size;
+                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, slot, local_kv_dim);
+                } else {
+                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, pos, local_kv_dim);
+                }
+            }
+
+            /* Attention */
+            int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
+            float attn_scale = 1.0f;
+            if (cl->is_swa) {
+                launch_attention_swa(r, xb2_t, q_t,
+                                    r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                                    n_heads, layer_kv_heads, hd, local_kv_dim,
+                                    pos, r->swa_window_size, attn_scale);
+            } else {
+                int seq_len = pos + 1;
+                launch_attention(r, xb2_t, q_t,
+                               r->d_key_cache[kv_src], r->d_value_cache[kv_src],
+                               n_heads, layer_kv_heads, hd, local_kv_dim, seq_len, attn_scale);
+            }
+        }
+
+        /* 4. Batched output projection */
+        launch_batch_matvec(r, d_batch_xb, cl->attn_output_w, d_batch_xb2,
+                            cl->attn_output_rows, cl->attn_output_cols, n_tokens, cl->attn_output_type);
+
+        /* 5. Batched post-attention norm */
+        { void *a[] = { &d_batch_xb, &cl->post_attn_norm_w, &n_embd, &eps, &n_tokens };
+          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+        /* 6. Residual: batch_x += batch_xb */
+        { int total = n_tokens * n_embd;
+          void *a[] = { &d_batch_x, &d_batch_xb, &total };
+          cuLaunchKernel(r->fn_vision_add, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+        /* 7. Batched FFN */
+        cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd, r->stream);
+        { void *a[] = { &d_batch_xb, &cl->ffn_norm_w, &n_embd, &eps, &n_tokens };
+          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+        launch_batch_matvec(r, d_batch_gate, cl->ffn_gate_w, d_batch_xb,
+                            cl->ffn_gate_rows, cl->ffn_gate_cols, n_tokens, cl->ffn_gate_type);
+        launch_batch_matvec(r, d_batch_up, cl->ffn_up_w, d_batch_xb,
+                            cl->ffn_up_rows, cl->ffn_up_cols, n_tokens, cl->ffn_up_type);
+
+        { int total = n_tokens * n_ff;
+          void *a[] = { &d_batch_gate, &d_batch_up, &total };
+          cuLaunchKernel(r->fn_gelu_mul_f32, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+        launch_batch_matvec(r, d_batch_xb, cl->ffn_down_w, d_batch_gate,
+                            cl->ffn_down_rows, cl->ffn_down_cols, n_tokens, cl->ffn_down_type);
+
+        /* Post-FFN norm */
+        { void *a[] = { &d_batch_xb, &cl->post_ffw_norm_w, &n_embd, &eps, &n_tokens };
+          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+        /* Residual: batch_x += batch_xb */
+        { int total = n_tokens * n_embd;
+          void *a[] = { &d_batch_x, &d_batch_xb, &total };
+          cuLaunchKernel(r->fn_vision_add, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
+
+        /* Per-layer embedding injection — skip in batched mode, fall back to sequential for PLE models */
+        if (0 && r->d_ple_combined && r->n_embd_per_layer > 0) {
+            int ple_dim = r->n_embd_per_layer;
+            for (int t = 0; t < n_tokens; t++) {
+                CUdeviceptr x_t = d_batch_x + (size_t)t * n_embd * sizeof(float);
+                /* Need per-token PLE combined for this token */
+                /* For now, precompute PLE for this token using r->d_x as scratch */
+                /* Copy token hidden state to d_x */
+                cuMemcpyDtoDAsync(r->d_x, x_t, n_embd * sizeof(float), r->stream);
+
+                /* PLE combined must have been precomputed for each token.
+                   Since we can't easily batch-precompute PLE for all tokens,
+                   we need to do it here per token per layer. This is the PLE slice for layer l. */
+                /* For token_ids path: PLE uses token_id to look up per_layer_token_embd */
+                /* For embedding path: PLE uses pad token (0) */
+                int tok_id = (token_ids && t < n_tokens) ? token_ids[t] : 0;
+
+                /* Precompute PLE for this token at this layer */
+                float *h_ple = (float *)alloca(ple_dim * sizeof(float));
+                /* tok_ple = per_layer_token_embd[tok_id][l*ple_dim .. (l+1)*ple_dim-1] */
+                {
+                    size_t row_bytes = dequant_row_size(r->h_ple_token_embd.type, r->h_ple_token_embd.n_cols);
+                    const unsigned char *row = (const unsigned char *)r->h_ple_token_embd.data + (size_t)tok_id * row_bytes;
+                    float *full_ple = (float *)alloca(r->h_ple_token_embd.n_cols * sizeof(float));
+                    dequant_row(r->h_ple_token_embd.type, row, full_ple, r->h_ple_token_embd.n_cols);
+                    memcpy(h_ple, full_ple + l * ple_dim, ple_dim * sizeof(float));
+                }
+                /* model_proj @ x for this layer slice */
+                {
+                    float h_x[8192]; /* n_embd max */
+                    cuStreamSynchronize(r->stream);
+                    cuMemcpyDtoH(h_x, r->d_x, n_embd * sizeof(float));
+                    size_t proj_row_bytes = dequant_row_size(r->h_ple_model_proj.type, r->h_ple_model_proj.n_cols);
+                    float *proj_row = (float *)alloca(n_embd * sizeof(float));
+                    for (int p = 0; p < ple_dim; p++) {
+                        const unsigned char *prow = (const unsigned char *)r->h_ple_model_proj.data
+                            + (size_t)(l * ple_dim + p) * proj_row_bytes;
+                        float *pdata = (float *)alloca(n_embd * sizeof(float));
+                        dequant_row(r->h_ple_model_proj.type, prow, pdata, n_embd);
+                        float dot = 0;
+                        for (int i = 0; i < n_embd; i++) dot += pdata[i] * h_x[i];
+                        h_ple[p] += dot;
+                    }
+                }
+                /* Normalize */
+                if (r->h_ple_proj_norm.data) {
+                    float *nw = (float *)alloca(ple_dim * n_layers * sizeof(float));
+                    dequant_row(r->h_ple_proj_norm.type, r->h_ple_proj_norm.data, nw, ple_dim * n_layers);
+                    for (int p = 0; p < ple_dim; p++) h_ple[p] *= nw[l * ple_dim + p];
+                }
+                cuMemcpyHtoD(r->d_ple_buf, h_ple, ple_dim * sizeof(float));
+
+                /* GPU: inp_gate @ x */
+                launch_matvec_auto(r, r->d_ple_proj, cl->ple_inp_gate_w, r->d_x,
+                                  cl->ple_inp_gate_rows, cl->ple_inp_gate_cols, cl->ple_inp_gate_type);
+                /* GELU(gate) * ple */
+                launch_gelu_elementwise_mul(r, r->d_ple_buf, r->d_ple_proj, ple_dim);
+                /* proj @ ple → [n_embd] */
+                launch_matvec_auto(r, r->d_ple_proj, cl->ple_proj_w, r->d_ple_buf,
+                                  cl->ple_proj_rows, cl->ple_proj_cols, cl->ple_proj_type);
+                /* Post-norm */
+                if (cl->ple_post_norm_w)
+                    launch_rmsnorm(r, r->d_ple_proj, r->d_ple_proj, cl->ple_post_norm_w, n_embd, eps);
+                /* Add to batch token */
+                launch_add(r, x_t, r->d_ple_proj, n_embd);
+            }
+        }
+
+        /* Layer output scaling */
+        if (cl->layer_scale_val != 1.0f) {
+            float sv = cl->layer_scale_val;
+            int total = n_tokens * n_embd;
+            void *a[] = { &d_batch_x, &sv, &total };
+            cuLaunchKernel(r->fn_vision_scale, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
+        }
+    }
+
+    /* Final RMSNorm on last token */
+    CUdeviceptr d_last = d_batch_x + (size_t)(n_tokens - 1) * n_embd * sizeof(float);
+    cuMemcpyDtoDAsync(r->d_x, d_last, n_embd * sizeof(float), r->stream);
+    launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, n_embd, eps);
+
+    /* Sync and copy to host */
+    cuStreamSynchronize(r->stream);
+    float *result = r->h_output;
+    cuMemcpyDtoH(result, r->d_x, n_embd * sizeof(float));
+
+    /* Free batch buffers */
+    cuMemFree(d_batch_x); cuMemFree(d_batch_xb);
+    cuMemFree(d_batch_q); cuMemFree(d_batch_k); cuMemFree(d_batch_v);
+    cuMemFree(d_batch_xb2); cuMemFree(d_batch_gate); cuMemFree(d_batch_up);
+
+    return result;
+}
+
+float *cuda_llm_prefill_logits(cuda_llm_runner *r, const int32_t *token_ids,
+                                const float *embeddings, int embd_stride,
+                                int n_tokens, int start_pos) {
+    float *hidden = cuda_llm_prefill(r, token_ids, embeddings, embd_stride, n_tokens, start_pos);
+    if (!hidden) return NULL;
+
+    /* Run lm_head on the last token's hidden state (already in r->d_x) */
+    launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
+                       r->n_vocab, r->n_embd, r->output_w_type);
+
+    /* Logit softcapping (Gemma4) */
+    if (r->is_gemma4 && r->final_logit_softcapping > 0) {
+        void *a[] = { &r->d_logits, &r->n_vocab, &r->final_logit_softcapping };
+        cuLaunchKernel(r->fn_logit_softcap_f32, (r->n_vocab+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    }
+
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float));
+    return r->h_output;
 }
 
 /* ======================================================================== */
