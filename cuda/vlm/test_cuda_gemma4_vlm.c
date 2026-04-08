@@ -4,9 +4,9 @@
  * Usage:
  *   ./test_cuda_gemma4_vlm <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen] [--budget N]
  *
- * --budget N: reasoning token budget (default 200). The model can think for up
- *             to N tokens inside <|channel>thought...<channel|> before being
- *             forced to exit and produce visible output.
+ * --budget N: reasoning token budget (default 200). If the model emits hidden
+ *             thought-channel tokens, cap them to N tokens before forcing an
+ *             exit back to visible output.
  *
  * Vision encoding runs on CPU (gemma4_vision_encoder.h).
  * LLM inference runs on CUDA (cuda_llm_runner).
@@ -21,6 +21,10 @@
 /* GGUF loader */
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
+
+/* SafeTensors loader needed by cuda_llm_runner.c helper paths */
+#define SAFETENSORS_IMPLEMENTATION
+#include "../../common/safetensors.h"
 
 /* Dequantization */
 #define GGML_DEQUANT_IMPLEMENTATION
@@ -47,8 +51,8 @@
 /* ---- Prompt helpers ---- */
 
 typedef struct {
-    char pre_image[256];
-    char post_image[512];
+    char *pre_image;
+    char *post_image;
 } gemma4_prompt_parts;
 
 typedef struct {
@@ -59,6 +63,17 @@ typedef struct {
     int32_t channel_end_id;
     int in_thought;
 } gemma4_decode_state;
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} visible_text;
+
+typedef struct {
+    int32_t *ids;
+    int count;
+} token_buffer;
 
 /* ---- Reasoning budget state machine ---- */
 
@@ -149,43 +164,111 @@ static int32_t rb_force_next(reasoning_budget *rb) {
 /* ---- Prompt / decode helpers ---- */
 
 static gemma4_prompt_parts build_gemma4_prompt(const char *user_prompt) {
-    gemma4_prompt_parts parts;
-    snprintf(parts.pre_image, sizeof(parts.pre_image),
-             "<|turn>system\n<|think|><turn|>\n<|turn>user\n<|image>");
-    snprintf(parts.post_image, sizeof(parts.post_image),
-             "<image|>%s<turn|>\n<|turn>model\n", user_prompt);
+    gemma4_prompt_parts parts = {0};
+    const char *pre =
+        "<|turn>system\n"
+        "You are a helpful visual assistant. Answer briefly and directly in plain text.\n"
+        "<turn|>\n<|turn>user\n<|image>";
+    const char *post_fmt = "<image|>%s<turn|>\n<|turn>model\n";
+    size_t pre_len = strlen(pre);
+    parts.pre_image = (char *)malloc(pre_len + 1);
+    if (parts.pre_image) memcpy(parts.pre_image, pre, pre_len + 1);
+    int post_len = snprintf(NULL, 0, post_fmt, user_prompt ? user_prompt : "");
+    if (post_len >= 0) {
+        parts.post_image = (char *)malloc((size_t)post_len + 1);
+        if (parts.post_image)
+            snprintf(parts.post_image, (size_t)post_len + 1, post_fmt, user_prompt ? user_prompt : "");
+    }
     return parts;
+}
+
+static void free_gemma4_prompt(gemma4_prompt_parts *parts) {
+    if (!parts) return;
+    free(parts->pre_image);
+    free(parts->post_image);
+    parts->pre_image = NULL;
+    parts->post_image = NULL;
+}
+
+static void visible_text_free(visible_text *out) {
+    if (!out) return;
+    free(out->data);
+    out->data = NULL;
+    out->len = 0;
+    out->cap = 0;
+}
+
+static int visible_text_append(visible_text *out, const char *buf, size_t n) {
+    if (!out || !buf || n == 0) return 0;
+    size_t need = out->len + n + 1;
+    if (need > out->cap) {
+        size_t new_cap = out->cap ? out->cap * 2 : 128;
+        while (new_cap < need) new_cap *= 2;
+        char *p = (char *)realloc(out->data, new_cap);
+        if (!p) return -1;
+        out->data = p;
+        out->cap = new_cap;
+    }
+    memcpy(out->data + out->len, buf, n);
+    out->len += n;
+    out->data[out->len] = '\0';
+    return 0;
+}
+
+static void token_buffer_free(token_buffer *buf) {
+    if (!buf) return;
+    free(buf->ids);
+    buf->ids = NULL;
+    buf->count = 0;
+}
+
+static token_buffer tokenize_text_alloc(const bpe_vocab *vocab, const char *text) {
+    token_buffer buf = {0};
+    int count = bpe_tokenize(vocab, text, -1, NULL, 0);
+    if (count <= 0) return buf;
+    buf.ids = (int32_t *)malloc((size_t)count * sizeof(int32_t));
+    if (!buf.ids) return buf;
+    buf.count = bpe_tokenize(vocab, text, -1, buf.ids, count);
+    if (buf.count != count) {
+        token_buffer_free(&buf);
+    }
+    return buf;
+}
+
+static int32_t find_exact_token_id(const bpe_vocab *vocab, const char *text) {
+    if (!vocab || !text) return -1;
+    return bpe_hm_get(&vocab->token_to_id, text, (int)strlen(text));
 }
 
 static gemma4_decode_state init_decode_state(const bpe_vocab *vocab) {
     gemma4_decode_state st;
     st.eos_id = bpe_eos_id(vocab);
     st.eot_id = bpe_eot_id(vocab);
-    st.turn_end_id = -1;
-    st.channel_start_id = -1;
-    st.channel_end_id = -1;
+    st.turn_end_id = find_exact_token_id(vocab, "<turn|>");
+    st.channel_start_id = find_exact_token_id(vocab, "<|channel>");
+    st.channel_end_id = find_exact_token_id(vocab, "<channel|>");
     st.in_thought = 0;
-
-    int32_t tmp[4];
-    int n = bpe_tokenize(vocab, "<|channel>", -1, tmp, 4);
-    if (n == 1) st.channel_start_id = tmp[0];
-    n = bpe_tokenize(vocab, "<channel|>", -1, tmp, 4);
-    if (n == 1) st.channel_end_id = tmp[0];
-    n = bpe_tokenize(vocab, "<turn|>", -1, tmp, 4);
-    if (n == 1) st.turn_end_id = tmp[0];
     return st;
 }
 
-static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st, int32_t token) {
-    if (token == st->channel_start_id) { st->in_thought = 1; }
-    if (token == st->channel_end_id)   { st->in_thought = 0; }
+static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st,
+                               int32_t token, visible_text *out) {
+    if (token == st->eos_id || token == st->eot_id || token == st->turn_end_id) return;
+    if (token == st->channel_start_id) {
+        st->in_thought = 1;
+        return;
+    }
+    if (token == st->channel_end_id) {
+        st->in_thought = 0;
+        return;
+    }
+    if (st->in_thought) return;
 
     const char *tok_str = bpe_token_to_str(vocab, token);
     if (!tok_str) return;
     int dec_len = 0;
     char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
-    fwrite(decoded, 1, dec_len, stdout);
-    fflush(stdout);
+    if (decoded && dec_len > 0) (void)visible_text_append(out, decoded, (size_t)dec_len);
     free(decoded);
 }
 
@@ -274,6 +357,7 @@ int main(int argc, char **argv) {
     /* 3. Load LLM on CUDA first (need CUDA context for GPU vision) */
     fprintf(stderr, "\nLoading LLM: %s\n", model_path);
     gguf_context *gguf_main = gguf_open(model_path, 1);
+    if (!gguf_main) { fprintf(stderr, "failed to open LLM GGUF\n"); return 1; }
 
     bpe_vocab *vocab = bpe_vocab_load(gguf_main);
     if (!vocab) { fprintf(stderr, "failed to load vocab\n"); return 1; }
@@ -324,24 +408,28 @@ int main(int argc, char **argv) {
 
     /* 5. Build prompt */
     gemma4_prompt_parts prompt_parts = build_gemma4_prompt(user_prompt);
+    if (!prompt_parts.pre_image || !prompt_parts.post_image) {
+        fprintf(stderr, "ERROR: prompt allocation failed\n");
+        free_gemma4_prompt(&prompt_parts);
+        return 1;
+    }
 
     int32_t bos_id = vocab->bos_id;
     if (bos_id >= 0)
         fprintf(stderr, "BOS: %d(\"%s\")\n", bos_id, bpe_token_to_str(vocab, bos_id));
 
-    int32_t pre_tokens[64];
-    int n_pre = bpe_tokenize(vocab, prompt_parts.pre_image, -1, pre_tokens, 64);
-    fprintf(stderr, "Pre-image tokens (%d):", n_pre);
-    for (int i = 0; i < n_pre; i++)
-        fprintf(stderr, " %d(\"%s\")", pre_tokens[i], bpe_token_to_str(vocab, pre_tokens[i]));
+    token_buffer pre_tokens = tokenize_text_alloc(vocab, prompt_parts.pre_image);
+    fprintf(stderr, "Pre-image tokens (%d):", pre_tokens.count);
+    for (int i = 0; i < pre_tokens.count; i++)
+        fprintf(stderr, " %d(\"%s\")", pre_tokens.ids[i], bpe_token_to_str(vocab, pre_tokens.ids[i]));
     fprintf(stderr, "\n");
 
-    int32_t post_tokens[64];
-    int n_post = bpe_tokenize(vocab, prompt_parts.post_image, -1, post_tokens, 64);
-    fprintf(stderr, "Post-image tokens (%d):", n_post);
-    for (int i = 0; i < n_post; i++)
-        fprintf(stderr, " %d(\"%s\")", post_tokens[i], bpe_token_to_str(vocab, post_tokens[i]));
+    token_buffer post_tokens = tokenize_text_alloc(vocab, prompt_parts.post_image);
+    fprintf(stderr, "Post-image tokens (%d):", post_tokens.count);
+    for (int i = 0; i < post_tokens.count; i++)
+        fprintf(stderr, " %d(\"%s\")", post_tokens.ids[i], bpe_token_to_str(vocab, post_tokens.ids[i]));
     fprintf(stderr, "\n");
+    free_gemma4_prompt(&prompt_parts);
 
     /* 6. Batched Prefill */
     fprintf(stderr, "\n=== LLM Prefill (CUDA, batched) ===\n");
@@ -355,11 +443,11 @@ int main(int argc, char **argv) {
 
     /* Batch: pre-image tokens */
     t0 = get_time_ms();
-    cuda_llm_prefill(llm, pre_tokens, NULL, 0, n_pre, pos);
-    pos += n_pre;
+    cuda_llm_prefill(llm, pre_tokens.ids, NULL, 0, pre_tokens.count, pos);
+    pos += pre_tokens.count;
     t1 = get_time_ms();
     fprintf(stderr, "Pre-image: %d tokens (%.1f ms, %.2f ms/tok)\n",
-            n_pre, t1 - t0, n_pre > 0 ? (t1 - t0) / n_pre : 0);
+            pre_tokens.count, t1 - t0, pre_tokens.count > 0 ? (t1 - t0) / pre_tokens.count : 0);
 
     /* Batch: vision embeddings */
     t0 = get_time_ms();
@@ -372,11 +460,11 @@ int main(int argc, char **argv) {
     /* Batch: post-image tokens (last one returns logits) */
     float *logits = NULL;
     t0 = get_time_ms();
-    logits = cuda_llm_prefill_logits(llm, post_tokens, NULL, 0, n_post, pos);
-    pos += n_post;
+    logits = cuda_llm_prefill_logits(llm, post_tokens.ids, NULL, 0, post_tokens.count, pos);
+    pos += post_tokens.count;
     t1 = get_time_ms();
     fprintf(stderr, "Post-image: %d tokens (%.1f ms, %.2f ms/tok)\n",
-            n_post, t1 - t0, n_post > 0 ? (t1 - t0) / n_post : 0);
+            post_tokens.count, t1 - t0, post_tokens.count > 0 ? (t1 - t0) / post_tokens.count : 0);
 
     if (!logits) { fprintf(stderr, "ERROR: forward_logits returned NULL\n"); return 1; }
 
@@ -392,15 +480,16 @@ int main(int argc, char **argv) {
     int32_t next_token = argmax;
     gemma4_decode_state ds = init_decode_state(vocab);
     reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
-    float temperature = 1.0f;
-    int top_k = 64;
+    visible_text out = {0};
+    float temperature = 0.7f;
+    int top_k = 40;
     srand((unsigned)time(NULL));
 
     t0 = get_time_ms();
     int gen_count = 0;
 
     for (int g = 0; g < max_gen; g++) {
-        emit_visible_token(vocab, &ds, next_token);
+        emit_visible_token(vocab, &ds, next_token, &out);
         rb_observe(&rb, next_token);
 
         if (next_token == ds.eos_id || next_token == ds.eot_id ||
@@ -450,13 +539,18 @@ int main(int argc, char **argv) {
         free(topk_idx);
         free(topk_val);
     }
+    if (out.len > 0) fwrite(out.data, 1, out.len, stdout);
     printf("\n");
+    fflush(stdout);
+    visible_text_free(&out);
     t1 = get_time_ms();
     fprintf(stderr, "[thought: %d/%d tokens used]\n", rb.count, rb.budget);
     fprintf(stderr, "[generation: %d tokens, %.1f ms, %.2f ms/tok]\n",
             gen_count, t1 - t0, gen_count > 0 ? (t1 - t0) / gen_count : 0);
 
     /* Cleanup */
+    token_buffer_free(&pre_tokens);
+    token_buffer_free(&post_tokens);
     free(vision_embd);
     cuda_llm_free(llm);
     bpe_vocab_free(vocab);
