@@ -165,6 +165,7 @@ typedef struct {
     float *ffn_buf3; /* [n_ff] */
     float *logits;     /* [n_vocab] output logits (only if has_lm_head) */
     float *matvec_tmp; /* max(n_embd, n_ff) for row dequant (thread 0) */
+    int trace_hidden_norms; /* print per-layer hidden norms during forward */
 
     /* Multi-threading */
     int n_threads;           /* number of threads (default: 1) */
@@ -197,6 +198,7 @@ void transformer_free(transformer_model *model);
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
+void transformer_set_trace_hidden_norms(transformer_model *model, int enable);
 
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
  * For embedding models (no output projection), this is the final hidden state. */
@@ -1816,6 +1818,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->ffn_buf3  = (float *)calloc(max_ff, sizeof(float));
     m->logits     = m->has_lm_head ? (float *)calloc(m->n_vocab, sizeof(float)) : NULL;
     m->matvec_tmp = (float *)calloc(max_dim, sizeof(float));
+    m->trace_hidden_norms = 1;
 
     /* Default: single-threaded, no tensor parallelism */
     m->n_threads = 1;
@@ -2024,6 +2027,11 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     /* Start new pool */
     if (n_threads > 1) tf_pool_start(model);
     fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
+}
+
+void transformer_set_trace_hidden_norms(transformer_model *model, int enable) {
+    if (!model) return;
+    model->trace_hidden_norms = enable ? 1 : 0;
 }
 
 /* ---- SSM Delta-Net forward (single token, autoregressive) ---- */
@@ -2668,6 +2676,13 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
         ple_combined = (float *)malloc(total_ple * sizeof(float));
         float *tok_ple = (float *)malloc(total_ple * sizeof(float));
         float *proj_out = (float *)malloc(total_ple * sizeof(float));
+        if (!ple_combined || !tok_ple || !proj_out) {
+            fprintf(stderr, "transformer: Gemma4 PLE alloc failed (total_ple=%d)\n", total_ple);
+            free(proj_out);
+            free(tok_ple);
+            free(ple_combined);
+            return NULL;
+        }
 
         /* 1. Look up per-layer token embedding: dequant row for this token */
         dequant_row(m->per_layer_token_embd.type,
@@ -3213,7 +3228,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             tf_vadd(m->x, ds_slice, n_embd);
         }
 
-        if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
+        if (m->trace_hidden_norms && (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0)) {
             fprintf(stderr, "  layer %2d: hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(m->x, n_embd)));
         }
     }
@@ -4395,7 +4410,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
 
         t_deepstack += tf_time_ms() - t0p;
 
-        if (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0) {
+        if (m->trace_hidden_norms && (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0)) {
             float *last = bx + (size_t)(N-1) * n_embd;
             fprintf(stderr, "  [batch] layer %2d: last token hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(last, n_embd)));
         }

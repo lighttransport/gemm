@@ -177,9 +177,8 @@ static gemma4_decode_state init_decode_state(const bpe_vocab *vocab) {
 }
 
 static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st, int32_t token) {
-    if (token == st->channel_start_id) { st->in_thought = 1; return; }
-    if (token == st->channel_end_id)   { st->in_thought = 0; return; }
-    if (st->in_thought) return;
+    if (token == st->channel_start_id) { st->in_thought = 1; }
+    if (token == st->channel_end_id)   { st->in_thought = 0; }
 
     const char *tok_str = bpe_token_to_str(vocab, token);
     if (!tok_str) return;
@@ -313,6 +312,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "CUDA LLM weight load failed\n"); return 1;
     }
 
+    /* cuda_llm_set_debug(llm, 3); */
     int n_embd = cuda_llm_n_embd(llm);
     int n_vocab = cuda_llm_n_vocab(llm);
     fprintf(stderr, "LLM: n_embd=%d n_vocab=%d n_layers=%d\n",
@@ -393,8 +393,8 @@ int main(int argc, char **argv) {
     int32_t next_token = argmax;
     gemma4_decode_state ds = init_decode_state(vocab);
     reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
-    float temperature = 0.7f;
-    int top_k = 40;
+    float temperature = 1.0f;
+    int top_k = 64;
     srand((unsigned)time(NULL));
 
     t0 = get_time_ms();

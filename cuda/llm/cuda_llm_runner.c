@@ -813,6 +813,37 @@ static const char *cuda_kernel_source =
 "    dst[i] = dl * ((qs[qs_idx] >> shift) & 3) - ml;\n"
 "}\n"
 "\n"
+"/* ---- 18b. embed_q4_K: Q4_K embedding lookup -> F32 ---- */\n"
+"__global__ void embed_q4_K(float *dst, const unsigned char *embd_table,\n"
+"                             int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n_embd) return;\n"
+"    int nb_per_row = n_embd / 256;\n"
+"    int row_bytes = nb_per_row * 144;\n"
+"    const unsigned char *row = embd_table + (size_t)token_id * row_bytes;\n"
+"    int block_idx = i / 256;\n"
+"    int elem = i % 256;\n"
+"    const unsigned char *bp = row + block_idx * 144;\n"
+"    float d = half_to_float(*(const half_raw *)(bp));\n"
+"    float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"    const unsigned char *sc = bp + 4;\n"
+"    const unsigned char *qs = bp + 16;\n"
+"    /* 256 elements = 4 groups of 64, each group has 2 sub-blocks of 32 */\n"
+"    int j = elem / 64;\n"             /* group 0-3 */
+"    int within = elem % 64;\n"
+"    int sub = within / 32;\n"          /* sub-block 0-1 */
+"    int l = within % 32;\n"            /* element within sub-block */
+"    int is = j * 2 + sub;\n"
+"    unsigned char sv, mv;\n"
+"    if (is < 4) { sv = sc[is] & 63; mv = sc[is+4] & 63; }\n"
+"    else { sv = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"    float dl = d * sv;\n"
+"    float ml = dmin * mv;\n"
+"    unsigned char q = qs[j * 32 + l];\n"
+"    float val = sub == 0 ? (dl * (q & 0xF) - ml) : (dl * (q >> 4) - ml);\n"
+"    dst[i] = val;\n"
+"}\n"
+"\n"
 "/* ==== SSM Delta-Net kernels ==== */\n"
 "\n"
 "/* ---- 19. softplus_mul_f32: out[i] = softplus(in[i]+bias[i]) * a[i] ---- */\n"
@@ -3110,6 +3141,8 @@ typedef struct {
     int ple_proj_rows, ple_proj_cols;
     int is_swa;
     int shared_kv_source; /* -1 = own KV, >= 0 = source layer index */
+    int n_kv_heads;       /* per-layer KV head count (may differ from global for Gemma4 31B) */
+    int has_v_proj;       /* 0 = V uses K (Gemma4 full-attn layers without V tensor) */
 } cuda_layer;
 
 struct cuda_llm_runner {
@@ -3140,6 +3173,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q5_K_f32;
     CUfunction fn_matvec_q6_K_f32;
     CUfunction fn_embed_q2_K;
+    CUfunction fn_embed_q4_K;
     /* SSM kernels */
     CUfunction fn_softplus_mul_f32;
     CUfunction fn_sigmoid_inplace_f32;
@@ -3212,6 +3246,7 @@ struct cuda_llm_runner {
     float rope_freq_base_swa;
     float embd_scale;
     int *swa_pattern;               /* [n_layers] host array: 1=SWA, 0=full */
+    int *per_layer_kv_heads;        /* [n_layers] per-layer KV head count (NULL = use global n_kv_heads) */
     CUdeviceptr d_rope_inv_freq_full; /* F32 [head_dim_full/2] with proportional factors */
     CUdeviceptr d_rope_inv_freq_swa;  /* F32 [head_dim_swa/2] */
     /* Per-layer embedding globals on GPU */
@@ -3393,6 +3428,7 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
+    GET_FUNC(embed_q4_K);
     /* SSM kernels */
     GET_FUNC(softplus_mul_f32);
     GET_FUNC(sigmoid_inplace_f32);
@@ -3586,14 +3622,35 @@ static int upload_weight_f32(CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
     int n_elements = t->n_rows * t->n_cols;
     float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
-    if (!f32_buf) return -1;
-    dequant_row(t->type, t->data, f32_buf, n_elements);
+    if (!f32_buf) {
+        fprintf(stderr, "cuda_llm: upload_weight_f32 malloc failed (rows=%d, cols=%d)\n",
+                t->n_rows, t->n_cols);
+        return -1;
+    }
+    size_t row_bytes = dequant_row_size(t->type, t->n_cols);
+    const uint8_t *base = (const uint8_t *)t->data;
+    for (int row = 0; row < t->n_rows; row++) {
+        dequant_row(t->type,
+                    base + (size_t)row * row_bytes,
+                    f32_buf + (size_t)row * t->n_cols,
+                    t->n_cols);
+    }
     size_t nbytes = (size_t)n_elements * sizeof(float);
     CUresult err = cuMemAlloc(d_ptr, nbytes);
-    if (err != CUDA_SUCCESS) { free(f32_buf); return -1; }
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_llm: upload_weight_f32 alloc failed (%zu bytes, err=%d)\n",
+                nbytes, (int)err);
+        free(f32_buf);
+        return -1;
+    }
     err = cuMemcpyHtoD(*d_ptr, f32_buf, nbytes);
     free(f32_buf);
-    if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_llm: upload_weight_f32 copy failed\n");
+        cuMemFree(*d_ptr);
+        *d_ptr = 0;
+        return -1;
+    }
     return 0;
 }
 
@@ -3640,6 +3697,16 @@ static int upload_weight_matrix(CUdeviceptr *d_ptr, const qtensor *t, int *out_t
         return 0;
     } else if (t->type == GGML_TYPE_F16) {
         return upload_f16_matrix(d_ptr, t);
+    } else if (t->type == GGML_TYPE_IQ2_XXS || t->type == GGML_TYPE_IQ2_XS ||
+               t->type == GGML_TYPE_IQ2_S   || t->type == GGML_TYPE_IQ3_XXS ||
+               t->type == GGML_TYPE_IQ3_S   || t->type == GGML_TYPE_IQ4_NL ||
+               t->type == GGML_TYPE_IQ4_XS  || t->type == GGML_TYPE_IQ1_S ||
+               t->type == GGML_TYPE_IQ1_M   || t->type == GGML_TYPE_Q4_0 ||
+               t->type == GGML_TYPE_Q4_1    || t->type == GGML_TYPE_Q5_0 ||
+               t->type == GGML_TYPE_Q5_1    || t->type == GGML_TYPE_TQ1_0 ||
+               t->type == GGML_TYPE_TQ2_0) {
+        /* Upload raw quantized data — dequant happens in-kernel during matvec */
+        return upload_kquant_raw(d_ptr, t);
     } else {
         /* Default: unknown type */
         fprintf(stderr, "cuda_llm: upload_weight_matrix: unhandled type %d (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
@@ -3731,6 +3798,16 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->n_embd      = cllm_get_int(gguf, ARCH_KEY("embedding_length"), 4096);
     r->n_heads     = cllm_get_int(gguf, ARCH_KEY("attention.head_count"), 32);
     r->n_kv_heads  = cllm_get_int(gguf, ARCH_KEY("attention.head_count_kv"), 8);
+    /* head_count_kv may be a per-layer array (e.g. Gemma4 31B) — use first element */
+    {
+        int idx = gguf_find_key(gguf, ARCH_KEY("attention.head_count_kv"));
+        if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY &&
+            gguf->kv[idx].value.arr.n > 0) {
+            uint32_t atype = gguf->kv[idx].value.arr.type;
+            if (atype == GGUF_TYPE_UINT32) r->n_kv_heads = (int)((uint32_t *)gguf->kv[idx].value.arr.data)[0];
+            else if (atype == GGUF_TYPE_INT32) r->n_kv_heads = ((int32_t *)gguf->kv[idx].value.arr.data)[0];
+        }
+    }
     r->n_layers    = cllm_get_int(gguf, ARCH_KEY("block_count"), 36);
     r->n_ff        = cllm_get_int(gguf, ARCH_KEY("feed_forward_length"), 12288);
     r->n_vocab     = cllm_get_int(gguf, ARCH_KEY("vocab_size"), 0);
@@ -3816,6 +3893,10 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
 
         /* Parse SWA layer pattern */
         r->swa_pattern = (int *)calloc(r->n_layers, sizeof(int));
+        if (!r->swa_pattern) {
+            fprintf(stderr, "cuda_llm: Gemma4 swa_pattern alloc failed (n_layers=%d)\n", r->n_layers);
+            return -1;
+        }
         {
             int idx = gguf_find_key(gguf, ARCH_KEY("attention.sliding_window_pattern"));
             if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
@@ -3829,20 +3910,75 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             }
         }
 
+        /* Parse per-layer KV head counts (may vary for 31B: 16 for SWA, 4 for full) */
+        r->per_layer_kv_heads = NULL;
+        {
+            int idx = gguf_find_key(gguf, ARCH_KEY("attention.head_count_kv"));
+            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY &&
+                gguf->kv[idx].value.arr.n >= (uint64_t)r->n_layers) {
+                r->per_layer_kv_heads = (int *)calloc(r->n_layers, sizeof(int));
+                int n = r->n_layers;
+                uint32_t atype = gguf->kv[idx].value.arr.type;
+                void *data = gguf->kv[idx].value.arr.data;
+                for (int i = 0; i < n; i++) {
+                    if (atype == GGUF_TYPE_UINT32) r->per_layer_kv_heads[i] = (int)((uint32_t *)data)[i];
+                    else if (atype == GGUF_TYPE_INT32) r->per_layer_kv_heads[i] = ((int32_t *)data)[i];
+                    else r->per_layer_kv_heads[i] = r->n_kv_heads;
+                }
+                if (r->verbose >= 1) {
+                    int same = 1;
+                    for (int i = 1; i < n; i++)
+                        if (r->per_layer_kv_heads[i] != r->per_layer_kv_heads[0]) { same = 0; break; }
+                    fprintf(stderr, "cuda_llm: Gemma4 per-layer kv_heads: %s", same ? "uniform" : "varies");
+                    if (!same) {
+                        fprintf(stderr, " [");
+                        for (int i = 0; i < n && i < 10; i++) fprintf(stderr, "%s%d", i?",":"", r->per_layer_kv_heads[i]);
+                        if (n > 10) fprintf(stderr, ",...");
+                        fprintf(stderr, "]");
+                    } else {
+                        fprintf(stderr, " (%d)", r->per_layer_kv_heads[0]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+
         /* Precompute RoPE inv_freq tables and upload to GPU */
         {
             /* SWA RoPE */
             int half_swa = r->head_dim_swa / 2;
             float *inv_freq_swa = (float *)malloc(half_swa * sizeof(float));
+            if (!inv_freq_swa) {
+                fprintf(stderr, "cuda_llm: Gemma4 inv_freq_swa alloc failed (n=%d)\n", half_swa);
+                return -1;
+            }
             for (int j = 0; j < half_swa; j++)
                 inv_freq_swa[j] = 1.0f / powf(r->rope_freq_base_swa, (float)(2*j) / r->head_dim_swa);
-            cuMemAlloc(&r->d_rope_inv_freq_swa, half_swa * sizeof(float));
-            cuMemcpyHtoD(r->d_rope_inv_freq_swa, inv_freq_swa, half_swa * sizeof(float));
+            {
+                CUresult err = cuMemAlloc(&r->d_rope_inv_freq_swa, half_swa * sizeof(float));
+                if (err != CUDA_SUCCESS) {
+                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_swa alloc failed (err=%d)\n", (int)err);
+                    free(inv_freq_swa);
+                    return -1;
+                }
+                err = cuMemcpyHtoD(r->d_rope_inv_freq_swa, inv_freq_swa, half_swa * sizeof(float));
+                if (err != CUDA_SUCCESS) {
+                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_swa copy failed (err=%d)\n", (int)err);
+                    cuMemFree(r->d_rope_inv_freq_swa);
+                    r->d_rope_inv_freq_swa = 0;
+                    free(inv_freq_swa);
+                    return -1;
+                }
+            }
             free(inv_freq_swa);
 
             /* Full-attention proportional RoPE */
             int half_full = r->head_dim_full / 2;
             float *inv_freq_full = (float *)malloc(half_full * sizeof(float));
+            if (!inv_freq_full) {
+                fprintf(stderr, "cuda_llm: Gemma4 inv_freq_full alloc failed (n=%d)\n", half_full);
+                return -1;
+            }
             for (int j = 0; j < half_full; j++)
                 inv_freq_full[j] = 1.0f / powf(r->rope_freq_base, (float)(2*j) / r->head_dim_full);
 
@@ -3850,12 +3986,31 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             qtensor rope_freqs_qt = cllm_load_tensor(gguf, "rope_freqs.weight", 0);
             if (rope_freqs_qt.data) {
                 float *ff = (float *)malloc(half_full * sizeof(float));
+                if (!ff) {
+                    fprintf(stderr, "cuda_llm: Gemma4 rope_freqs host buffer alloc failed (n=%d)\n", half_full);
+                    free(inv_freq_full);
+                    return -1;
+                }
                 dequant_row(rope_freqs_qt.type, rope_freqs_qt.data, ff, half_full);
                 for (int j = 0; j < half_full; j++) inv_freq_full[j] /= ff[j];
                 free(ff);
             }
-            cuMemAlloc(&r->d_rope_inv_freq_full, half_full * sizeof(float));
-            cuMemcpyHtoD(r->d_rope_inv_freq_full, inv_freq_full, half_full * sizeof(float));
+            {
+                CUresult err = cuMemAlloc(&r->d_rope_inv_freq_full, half_full * sizeof(float));
+                if (err != CUDA_SUCCESS) {
+                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_full alloc failed (err=%d)\n", (int)err);
+                    free(inv_freq_full);
+                    return -1;
+                }
+                err = cuMemcpyHtoD(r->d_rope_inv_freq_full, inv_freq_full, half_full * sizeof(float));
+                if (err != CUDA_SUCCESS) {
+                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_full copy failed (err=%d)\n", (int)err);
+                    cuMemFree(r->d_rope_inv_freq_full);
+                    r->d_rope_inv_freq_full = 0;
+                    free(inv_freq_full);
+                    return -1;
+                }
+            }
             free(inv_freq_full);
         }
 
@@ -3974,8 +4129,10 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         cl->is_ssm = is_ssm;
         cl->is_swa = 0;
         cl->shared_kv_source = -1;
+        cl->n_kv_heads = r->n_kv_heads;
         if (r->is_gemma4) {
             cl->is_swa = r->swa_pattern[l];
+            if (r->per_layer_kv_heads) cl->n_kv_heads = r->per_layer_kv_heads[l];
             if (l >= r->n_layer_kv_from_start)
                 cl->shared_kv_source = r->n_layer_kv_from_start - (cl->is_swa ? 2 : 1);
         }
@@ -4048,9 +4205,20 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             if (upload_weight_matrix(&cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
-            t = cllm_load_tensor(gguf, name, 1);
-            cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
+            t = cllm_load_tensor(gguf, name, r->is_gemma4 ? 0 : 1); /* optional for Gemma4 full-attn layers */
+            cl->has_v_proj = (t.data != NULL);
+            if (cl->has_v_proj) {
+                cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
+                if (upload_weight_matrix(&cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
+            } else {
+                /* V = K for this layer (Gemma4 pattern) */
+                cl->attn_v_rows = cl->attn_k_rows;
+                cl->attn_v_cols = cl->attn_k_cols;
+                cl->attn_v_w = 0;
+                cl->attn_v_type = 0;
+                if (r->verbose >= 2)
+                    fprintf(stderr, "cuda_llm: layer %d: no V tensor, will use K as V\n", l);
+            }
 
             snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
@@ -4192,8 +4360,8 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 cl->layer_scale_val = sv;
             }
 
-            /* Per-layer embedding tensors (F32 path optional for accuracy) */
-            {
+            /* Per-layer embedding tensors (only if model has PLE, i.e. n_embd_per_layer > 0) */
+            if (r->n_embd_per_layer > 0) {
                 snprintf(name, sizeof(name), "blk.%d.inp_gate.weight", l);
                 t = cllm_load_tensor(gguf, name, 1);
                 cl->ple_inp_gate_rows = t.n_rows; cl->ple_inp_gate_cols = t.n_cols;
@@ -4213,12 +4381,12 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 } else {
                     if (upload_weight_matrix(&cl->ple_proj_w, &t, &cl->ple_proj_type) != 0) return -1;
                 }
-            }
 
-            /* PLE post-norm (F32) */
-            snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
-            t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ple_post_norm_w, &t, r->n_embd) != 0) return -1;
+                /* PLE post-norm (F32) */
+                snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
+                t = cllm_load_tensor(gguf, name, 1);
+                if (upload_norm_f32(&cl->ple_post_norm_w, &t, r->n_embd) != 0) return -1;
+            }
 
             /* QK norm for Gemma4 uses per-layer head_dim */
             if (cl->has_qk_norm) {
@@ -4228,34 +4396,42 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 if (hd != r->head_dim) {
                     if (cl->attn_q_norm_w) cuMemFree(cl->attn_q_norm_w);
                     if (cl->attn_k_norm_w) cuMemFree(cl->attn_k_norm_w);
+                    cl->attn_q_norm_w = 0;
+                    cl->attn_k_norm_w = 0;
                     snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
                     t = cllm_load_tensor(gguf, name, 0);
-                    if (t.data) upload_norm_f32(&cl->attn_q_norm_w, &t, hd);
+                    if (t.data && upload_norm_f32(&cl->attn_q_norm_w, &t, hd) != 0) return -1;
                     snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l);
                     t = cllm_load_tensor(gguf, name, 0);
-                    if (t.data) upload_norm_f32(&cl->attn_k_norm_w, &t, hd);
+                    if (t.data && upload_norm_f32(&cl->attn_k_norm_w, &t, hd) != 0) return -1;
                 }
             }
         }
     }
 
     /* Gemma4: load global per-layer embedding tensors and allocate PLE scratch */
-    if (r->is_gemma4) {
+    if (r->is_gemma4 && r->n_embd_per_layer > 0) {
         int ple_dim = r->n_embd_per_layer;
         int total_ple = ple_dim * r->n_layers;
-        cuMemAlloc(&r->d_ple_combined, (size_t)total_ple * sizeof(float));
-        cuMemAlloc(&r->d_ple_buf, (size_t)ple_dim * sizeof(float));
-        cuMemAlloc(&r->d_ple_proj, (size_t)r->n_embd * sizeof(float));
-
         /* Store host-side PLE tensor pointers for CPU precomputation */
         r->h_ple_token_embd = cllm_load_tensor(gguf, "per_layer_token_embd.weight", 1);
         r->h_ple_model_proj = cllm_load_tensor(gguf, "per_layer_model_proj.weight", 1);
         r->h_ple_proj_norm = cllm_load_tensor(gguf, "per_layer_proj_norm.weight", 0);
+        if (!r->h_ple_token_embd.data || !r->h_ple_model_proj.data) {
+            fprintf(stderr, "cuda_llm: Gemma4 missing required global PLE tensors\n");
+            return -1;
+        }
+
+        CHECK_CU(cuMemAlloc(&r->d_ple_combined, (size_t)total_ple * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ple_buf, (size_t)ple_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ple_proj, (size_t)r->n_embd * sizeof(float)));
 
         if (r->verbose >= 1)
             fprintf(stderr, "cuda_llm: Gemma4 PLE buffers allocated (ple_dim=%d, tok_embd=%s, proj=%s)\n",
                     ple_dim, r->h_ple_token_embd.data ? "OK" : "MISSING",
                     r->h_ple_model_proj.data ? "OK" : "MISSING");
+    } else if (r->is_gemma4 && r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: Gemma4 model has no PLE (n_embd_per_layer=0)\n");
     }
 
     /* Allocate KV cache (skip SSM layers; Gemma4 has per-layer sizing) */
@@ -4263,15 +4439,16 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->d_value_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
     int n_attn_layers = 0;
     if (r->is_gemma4) {
-        int kv_dim_full = r->n_kv_heads * r->head_dim_full;
-        int kv_dim_swa  = r->n_kv_heads * r->head_dim_swa;
         for (int l = 0; l < r->n_layers; l++) {
             if (r->layers[l].shared_kv_source >= 0) continue;
+            int layer_kv_heads = r->layers[l].n_kv_heads;
+            int hd = r->layers[l].is_swa ? r->head_dim_swa : r->head_dim_full;
+            int kv_dim = layer_kv_heads * hd;
             size_t cache_sz;
             if (r->layers[l].is_swa) {
-                cache_sz = (size_t)r->swa_window_size * kv_dim_swa * sizeof(float);
+                cache_sz = (size_t)r->swa_window_size * kv_dim * sizeof(float);
             } else {
-                cache_sz = (size_t)max_seq_len * kv_dim_full * sizeof(float);
+                cache_sz = (size_t)max_seq_len * kv_dim * sizeof(float);
             }
             CHECK_CU(cuMemAlloc(&r->d_key_cache[l], cache_sz));
             CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, cache_sz));
@@ -4878,6 +5055,10 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
+        void *args[] = { &r->d_x, &r->d_token_embd, &token_id, &n_embd };
+        cuLaunchKernel(r->fn_embed_q4_K,
+                       (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -4890,30 +5071,30 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
                 dbg[0],dbg[1],dbg[2],dbg[3],dbg[4],dbg[5],dbg[6],dbg[7]);
     }
 
-    /* Embedding cross-check: verify Q2_K embed kernel against CPU dequant */
-    if (r->debug_layers >= 3 && r->token_embd_type == GGML_TYPE_Q2_K) {
+    /* Embedding cross-check: verify embed kernel against CPU dequant */
+    if (r->debug_layers >= 3 && (r->token_embd_type == GGML_TYPE_Q2_K || r->token_embd_type == GGML_TYPE_Q4_K)) {
         cuStreamSynchronize(r->stream);
         float *gpu_emb = (float *)malloc(n_embd * sizeof(float));
         cuMemcpyDtoH(gpu_emb, r->d_x, n_embd * sizeof(float));
 
-        /* Download Q2_K embedding weights from GPU */
+        /* Download embedding weights from GPU */
         int nb_per_row = n_embd / 256;
-        int row_bytes = nb_per_row * 84;
-        size_t total_embd_bytes = (size_t)r->n_vocab * row_bytes;
+        int blk_bytes = (r->token_embd_type == GGML_TYPE_Q4_K) ? 144 : 84;
+        int row_bytes = nb_per_row * blk_bytes;
         /* Only download the one row we need */
         unsigned char *row_data = (unsigned char *)malloc(row_bytes);
         cuMemcpyDtoH(row_data, r->d_token_embd + (size_t)token_id * row_bytes, row_bytes);
 
         /* CPU dequantize this row */
         float *cpu_emb = (float *)malloc(n_embd * sizeof(float));
-        dequant_row(GGML_TYPE_Q2_K, row_data, cpu_emb, n_embd);
+        dequant_row(r->token_embd_type, row_data, cpu_emb, n_embd);
 
         float emb_max_err = 0; int emb_max_idx = 0;
         for (int i = 0; i < n_embd; i++) {
             float err = fabsf(gpu_emb[i] - cpu_emb[i]);
             if (err > emb_max_err) { emb_max_err = err; emb_max_idx = i; }
         }
-        fprintf(stderr, "  [EMB xchk] Q2_K embed max_err=%.6f at idx=%d (GPU=%.6f CPU=%.6f)\n",
+        fprintf(stderr, "  [EMB xchk] embed max_err=%.6f at idx=%d (GPU=%.6f CPU=%.6f)\n",
                 emb_max_err, emb_max_idx, gpu_emb[emb_max_idx], cpu_emb[emb_max_idx]);
         if (emb_max_err > 0.001f) {
             fprintf(stderr, "    GPU[0:4]=[%.6f,%.6f,%.6f,%.6f]\n",
@@ -4950,17 +5131,30 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
 
     /* Gemma4: precompute per-layer embeddings on CPU and upload to GPU.
      * Mirrors transformer.h: combine token_embd lookup + model_proj @ x + normalize */
-    if (r->is_gemma4 && r->current_token_id >= 0 && r->h_ple_token_embd.data) {
+    if (r->is_gemma4 && r->current_token_id >= 0 &&
+        r->h_ple_token_embd.data && r->h_ple_model_proj.data) {
         int ple_dim = r->n_embd_per_layer;
         int total_ple = ple_dim * r->n_layers;
 
         /* Read current hidden state from GPU for projection */
         float *h_x = (float *)malloc(n_embd * sizeof(float));
-        cuMemcpyDtoH(h_x, r->d_x, n_embd * sizeof(float));
-        cuStreamSynchronize(r->stream);
+        float *tok_ple = NULL;
+        float *proj_out = NULL;
+        float *ple_host = NULL;
+        if (!h_x) {
+            fprintf(stderr, "cuda_llm: Gemma4 PLE hidden buffer alloc failed (n_embd=%d)\n", n_embd);
+            return NULL;
+        }
+        CHECK_CU_NULL(cuStreamSynchronize(r->stream));
+        CHECK_CU_NULL(cuMemcpyDtoH(h_x, r->d_x, n_embd * sizeof(float)));
 
         /* 1. Token embedding lookup */
-        float *tok_ple = (float *)malloc(total_ple * sizeof(float));
+        tok_ple = (float *)malloc(total_ple * sizeof(float));
+        if (!tok_ple) {
+            fprintf(stderr, "cuda_llm: Gemma4 PLE token buffer alloc failed (n=%d)\n", total_ple);
+            free(h_x);
+            return NULL;
+        }
         {
             size_t row_bytes = dequant_row_size(r->h_ple_token_embd.type, total_ple);
             dequant_row(r->h_ple_token_embd.type,
@@ -4971,11 +5165,24 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
         }
 
         /* 2. Project hidden state: proj = per_layer_model_proj @ h_x → [total_ple] */
-        float *proj_out = (float *)malloc(total_ple * sizeof(float));
+        proj_out = (float *)malloc(total_ple * sizeof(float));
+        if (!proj_out) {
+            fprintf(stderr, "cuda_llm: Gemma4 PLE proj buffer alloc failed (n=%d)\n", total_ple);
+            free(tok_ple);
+            free(h_x);
+            return NULL;
+        }
         {
             int n_cols = r->h_ple_model_proj.n_cols;
             size_t row_bytes = dequant_row_size(r->h_ple_model_proj.type, n_cols);
             float *row_buf = (float *)malloc(n_cols * sizeof(float));
+            if (!row_buf) {
+                fprintf(stderr, "cuda_llm: Gemma4 PLE row buffer alloc failed (n_cols=%d)\n", n_cols);
+                free(proj_out);
+                free(tok_ple);
+                free(h_x);
+                return NULL;
+            }
             const uint8_t *base = (const uint8_t *)r->h_ple_model_proj.data;
             for (int rr = 0; rr < total_ple; rr++) {
                 dequant_row(r->h_ple_model_proj.type, base + (size_t)rr * row_bytes, row_buf, n_cols);
@@ -5005,12 +5212,20 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
 
         /* 4. Combine: (proj + tok) * 1/sqrt(2) */
         float input_scale = 1.0f / sqrtf(2.0f);
-        float *ple_host = (float *)malloc(total_ple * sizeof(float));
+        ple_host = (float *)malloc(total_ple * sizeof(float));
+        if (!ple_host) {
+            fprintf(stderr, "cuda_llm: Gemma4 PLE upload buffer alloc failed (n=%d)\n", total_ple);
+            free(proj_out);
+            free(tok_ple);
+            free(h_x);
+            return NULL;
+        }
         for (int i = 0; i < total_ple; i++)
             ple_host[i] = (proj_out[i] + tok_ple[i]) * input_scale;
 
         /* Upload to GPU */
-        cuMemcpyHtoDAsync(r->d_ple_combined, ple_host, total_ple * sizeof(float), r->stream);
+        CHECK_CU_NULL(cuMemcpyHtoDAsync(r->d_ple_combined, ple_host,
+                                        total_ple * sizeof(float), r->stream));
         free(ple_host); free(proj_out); free(tok_ple); free(h_x);
     }
 
@@ -5056,7 +5271,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
         if (r->is_gemma4) {
             /* === Gemma4 layer === */
             int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
-            int local_kv_dim = n_kv_heads * hd;
+            int layer_kv_heads = cl->n_kv_heads;
+            int local_kv_dim = layer_kv_heads * hd;
             int local_q_dim  = n_heads * hd;
 
             /* Q projection */
@@ -5067,23 +5283,28 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             if (cl->shared_kv_source < 0) {
                 launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb,
                                   cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
-                launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb,
-                                  cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+                if (cl->has_v_proj) {
+                    launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb,
+                                      cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+                } else {
+                    /* V = K for layers without V projection */
+                    cuMemcpyDtoDAsync(r->d_v, r->d_k, (size_t)local_kv_dim * sizeof(float), r->stream);
+                }
             }
 
             /* Q/K/V norm */
             if (cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, hd, eps);
                 if (cl->shared_kv_source < 0) {
-                    if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, hd, eps);
+                    if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, layer_kv_heads, hd, eps);
                     /* V norm: raw RMSNorm per-head (no learned weight) */
                     {
                         int block_dim = hd;
                         /* Round up to power of 2 for reduction */
                         int bd = 1; while (bd < block_dim) bd <<= 1;
-                        void *vargs[] = { &r->d_v, &n_kv_heads, &hd, &eps };
+                        void *vargs[] = { &r->d_v, &layer_kv_heads, &hd, &eps };
                         cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32,
-                                       n_kv_heads, 1, 1, bd, 1, 1,
+                                       layer_kv_heads, 1, 1, bd, 1, 1,
                                        bd * sizeof(float), r->stream, vargs, NULL);
                     }
                 }
@@ -5097,14 +5318,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 void *qargs[] = { &r->d_q, &n_heads, &hd, &position, &r->rope_freq_base_swa, &zero_pairs };
                 cuLaunchKernel(r->fn_rope_neox_f32, n_heads, 1, 1, half_swa, 1, 1, 0, r->stream, qargs, NULL);
                 if (cl->shared_kv_source < 0) {
-                    void *kargs[] = { &r->d_k, &n_kv_heads, &hd, &position, &r->rope_freq_base_swa, &zero_pairs };
-                    cuLaunchKernel(r->fn_rope_neox_f32, n_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, kargs, NULL);
+                    void *kargs[] = { &r->d_k, &layer_kv_heads, &hd, &position, &r->rope_freq_base_swa, &zero_pairs };
+                    cuLaunchKernel(r->fn_rope_neox_f32, layer_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, kargs, NULL);
                 }
             } else {
                 /* Full-attention: proportional RoPE with precomputed freq factors */
                 launch_rope_with_factors(r, r->d_q, n_heads, hd, position, r->d_rope_inv_freq_full);
                 if (cl->shared_kv_source < 0)
-                    launch_rope_with_factors(r, r->d_k, n_kv_heads, hd, position, r->d_rope_inv_freq_full);
+                    launch_rope_with_factors(r, r->d_k, layer_kv_heads, hd, position, r->d_rope_inv_freq_full);
             }
 
             /* KV cache store */
@@ -5129,13 +5350,13 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 if (cl->is_swa) {
                     launch_attention_swa(r, r->d_xb2, r->d_q,
                                         r->d_key_cache[kv_src], r->d_value_cache[kv_src],
-                                        n_heads, n_kv_heads, hd, local_kv_dim,
+                                        n_heads, layer_kv_heads, hd, local_kv_dim,
                                         position, r->swa_window_size, attn_scale);
                 } else {
                     int seq_len = position + 1;
                     launch_attention(r, r->d_xb2, r->d_q,
                                    r->d_key_cache[kv_src], r->d_value_cache[kv_src],
-                                   n_heads, n_kv_heads, hd, local_kv_dim, seq_len, attn_scale);
+                                   n_heads, layer_kv_heads, hd, local_kv_dim, seq_len, attn_scale);
                 }
             }
 
@@ -5169,9 +5390,9 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             if (r->d_ple_combined) {
                 int ple_dim = r->n_embd_per_layer;
                 /* Copy slice for this layer from d_ple_combined to d_ple_buf */
-                cuMemcpyDtoDAsync(r->d_ple_buf,
-                                  r->d_ple_combined + (size_t)l * ple_dim * sizeof(float),
-                                  ple_dim * sizeof(float), r->stream);
+                CHECK_CU_NULL(cuMemcpyDtoDAsync(r->d_ple_buf,
+                                                r->d_ple_combined + (size_t)l * ple_dim * sizeof(float),
+                                                ple_dim * sizeof(float), r->stream));
 
                 /* inp_gate: gate_out = inp_gate @ x → [ple_dim] */
                 launch_matvec_auto(r, r->d_ple_proj, cl->ple_inp_gate_w, r->d_x,
