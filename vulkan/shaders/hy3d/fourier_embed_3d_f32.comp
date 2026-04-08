@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: MIT
+// 3D Fourier coordinate embedding.
+// Input: [N, 3], Output: [N, out_dim] where out_dim = 3*(2*num_freqs+1)
+// Layout: [x,y,z, sin(f0*x),...sin(fn*x), sin(f0*y),..., cos(f0*x),...]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer CoordsBuffer { float coords[]; };
+layout(std430, binding = 2) readonly buffer FreqsBuffer { float freqs[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint num_freqs;
+    uint out_dim;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.N) return;
+
+    uint in_base = idx * 3;
+    uint o_base = idx * pc.out_dim;
+
+    float cx = coords[in_base + 0];
+    float cy = coords[in_base + 1];
+    float cz = coords[in_base + 2];
+
+    uint p = 0;
+
+    // Raw input coordinates
+    out_buf[o_base + p] = cx; p++;
+    out_buf[o_base + p] = cy; p++;
+    out_buf[o_base + p] = cz; p++;
+
+    // Sin embeddings: for each dimension, for each frequency
+    for (uint d = 0; d < 3; d++) {
+        float val = (d == 0) ? cx : ((d == 1) ? cy : cz);
+        for (uint f = 0; f < pc.num_freqs; f++) {
+            out_buf[o_base + p] = sin(val * freqs[f]);
+            p++;
+        }
+    }
+
+    // Cos embeddings: for each dimension, for each frequency
+    for (uint d = 0; d < 3; d++) {
+        float val = (d == 0) ? cx : ((d == 1) ? cy : cz);
+        for (uint f = 0; f < pc.num_freqs; f++) {
+            out_buf[o_base + p] = cos(val * freqs[f]);
+            p++;
+        }
+    }
+}
