@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint Hi;
+    uint Wi;
+    uint Ho;
+    uint Wo;
+} pc;
+
+layout(std430, binding = 0) writeonly buffer DstBuf { float dst[]; };
+layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
+
+void main() {
+    uint idx = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint total = pc.C * pc.Ho * pc.Wo;
+    if (idx >= total) return;
+
+    uint c = idx / (pc.Ho * pc.Wo);
+    uint rem = idx % (pc.Ho * pc.Wo);
+    uint oh = rem / pc.Wo;
+    uint ow = rem % pc.Wo;
+
+    // align_corners=True
+    float fy = (pc.Ho > 1u) ? float(oh) * float(pc.Hi - 1u) / float(pc.Ho - 1u) : 0.0;
+    float fx = (pc.Wo > 1u) ? float(ow) * float(pc.Wi - 1u) / float(pc.Wo - 1u) : 0.0;
+
+    int y0 = int(fy);
+    int x0 = int(fx);
+    int y1 = (y0 + 1 < int(pc.Hi)) ? y0 + 1 : y0;
+    int x1 = (x0 + 1 < int(pc.Wi)) ? x0 + 1 : x0;
+    float dy = fy - float(y0);
+    float dx = fx - float(x0);
+
+    uint s_base = c * pc.Hi * pc.Wi;
+    dst[idx] = src[s_base + uint(y0) * pc.Wi + uint(x0)] * (1.0 - dy) * (1.0 - dx)
+             + src[s_base + uint(y0) * pc.Wi + uint(x1)] * (1.0 - dy) * dx
+             + src[s_base + uint(y1) * pc.Wi + uint(x0)] * dy * (1.0 - dx)
+             + src[s_base + uint(y1) * pc.Wi + uint(x1)] * dy * dx;
+}

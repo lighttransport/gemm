@@ -14,10 +14,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/stat.h>
 
 /* transformer.h header-only: gives us qtensor type + dequant declarations */
 #include "../../common/ggml_dequant.h"
 #include "../../common/transformer.h"
+/* safetensors.h for cuda_llm_inject_biases — IMPLEMENTATION must be defined
+ * by the translation unit that includes this .c file (e.g. test_cuda_qimg.c) */
+#include "../../common/safetensors.h"
 
 /* ======================================================================== */
 /* CUDA C kernel source (compiled at runtime via NVRTC)                     */
@@ -32,12 +36,6 @@ static const char *cuda_kernel_source =
 "    float f;\n"
 "    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h));\n"
 "    return f;\n"
-"}\n"
-"\n"
-"__device__ __forceinline__ half_raw float_to_half(float f) {\n"
-"    half_raw h;\n"
-"    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(f));\n"
-"    return h;\n"
 "}\n"
 "\n"
 "extern \"C\" {\n"
@@ -173,7 +171,6 @@ static const char *cuda_kernel_source =
 "}\n"
 "\n"
 "/* ---- 6. kv_cache_store: Copy K,V into cache at position ---- */\n"
-"/* F32 KV cache store (legacy) */\n"
 "__global__ void kv_cache_store(float *key_cache, float *value_cache,\n"
 "                                const float *k, const float *v,\n"
 "                                int position, int kv_dim) {\n"
@@ -184,81 +181,98 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
-"/* F16 KV cache store: convert F32 K/V to F16 and write */\n"
-"__global__ void kv_cache_store_f16(half_raw *key_cache, half_raw *value_cache,\n"
-"                                    const float *k, const float *v,\n"
-"                                    int position, int kv_dim) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < kv_dim) {\n"
-"        key_cache[(size_t)position * kv_dim + i] = float_to_half(k[i]);\n"
-"        value_cache[(size_t)position * kv_dim + i] = float_to_half(v[i]);\n"
-"    }\n"
-"}\n"
-"\n"
-"/* ---- 7. attn_decode_f32: Flash-style decode attention with online softmax ---- */\n"
-"/* Fuses QK scoring + softmax + V accumulation into 2 passes over KV cache. */\n"
-"/* Pass 1: compute scores + online max/sum. Pass 2: V-weighted accumulation. */\n"
-"/* Grid: n_heads, blockDim: 256, shared: seq_len * sizeof(float) */\n"
+"/* ---- 7. attn_decode_f32: Single-token decode attention with GQA ---- */\n"
+"/* Grid: n_heads blocks, blockDim: 256 threads */\n"
+"/* Shared memory: seq_len * sizeof(float) for attention scores */\n"
 "__global__ void attn_decode_f32(float *out, const float *q,\n"
-"                                 const half_raw *key_cache, const half_raw *value_cache,\n"
+"                                 const float *key_cache, const float *value_cache,\n"
 "                                 int n_heads, int n_kv_heads, int head_dim,\n"
 "                                 int kv_dim, int seq_len, float scale) {\n"
-"    extern __shared__ float smem[];\n"
+"    extern __shared__ float att[];\n"
 "    int h = blockIdx.x;\n"
 "    if (h >= n_heads) return;\n"
 "    int tid = threadIdx.x;\n"
 "    int nthreads = blockDim.x;\n"
 "    int gqa_ratio = n_heads / n_kv_heads;\n"
 "    int kv_h = h / gqa_ratio;\n"
-"    const float *q_h = q + h * head_dim;\n"
-"    int warp_id = tid / 32, lane = tid % 32;\n"
 "\n"
-"    /* Pass 1: QK scores with fused online softmax max+sum */\n"
-"    float *scores = smem;\n"
+"    const float *q_h = q + h * head_dim;\n"
+"\n"
+"    /* Phase 1: Compute QK^T scores */\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        const float *k_t = key_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"        float score = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) {\n"
+"            score += q_h[d] * k_t[d];\n"
+"        }\n"
+"        att[t] = score * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"\n"
+"    /* Phase 2: Softmax over att[0..seq_len-1] */\n"
+"    /* Find max (parallel reduction in registers) */\n"
 "    float local_max = -1e30f;\n"
 "    for (int t = tid; t < seq_len; t += nthreads) {\n"
-"        const half_raw *k_t = key_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
-"        float s = 0.0f;\n"
-"        for (int d = 0; d < head_dim; d++) s += q_h[d] * half_to_float(k_t[d]);\n"
-"        s *= scale;\n"
-"        scores[t] = s;\n"
-"        if (s > local_max) local_max = s;\n"
+"        if (att[t] > local_max) local_max = att[t];\n"
 "    }\n"
-"    /* Cross-warp max reduction */\n"
-"    for (int off = 16; off > 0; off >>= 1)\n"
-"        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, off));\n"
-"    __shared__ float wm[8];\n"
-"    if (lane == 0) wm[warp_id] = local_max;\n"
+"    /* Warp reduce max */\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        float other = __shfl_down_sync(0xFFFFFFFF, local_max, offset);\n"
+"        if (other > local_max) local_max = other;\n"
+"    }\n"
+"    __shared__ float warp_max[8];\n"
+"    int warp_id = tid / 32;\n"
+"    int lane = tid % 32;\n"
+"    if (lane == 0) warp_max[warp_id] = local_max;\n"
 "    __syncthreads();\n"
-"    if (tid == 0) { float m = wm[0]; for (int w = 1; w < (nthreads+31)/32; w++) if(wm[w]>m) m=wm[w]; wm[0]=m; }\n"
+"    if (tid == 0) {\n"
+"        float m = warp_max[0];\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 1; w < n_warps; w++) {\n"
+"            if (warp_max[w] > m) m = warp_max[w];\n"
+"        }\n"
+"        warp_max[0] = m;\n"
+"    }\n"
 "    __syncthreads();\n"
-"    float max_val = wm[0];\n"
+"    float max_val = warp_max[0];\n"
 "\n"
-"    /* Exp + sum (fused) */\n"
+"    /* Exp and sum */\n"
 "    float local_sum = 0.0f;\n"
 "    for (int t = tid; t < seq_len; t += nthreads) {\n"
-"        float e = expf(scores[t] - max_val);\n"
-"        scores[t] = e;\n"
+"        float e = expf(att[t] - max_val);\n"
+"        att[t] = e;\n"
 "        local_sum += e;\n"
 "    }\n"
-"    for (int off = 16; off > 0; off >>= 1)\n"
-"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);\n"
-"    __shared__ float ws[8];\n"
-"    if (lane == 0) ws[warp_id] = local_sum;\n"
+"    /* Warp reduce sum */\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);\n"
+"    }\n"
+"    __shared__ float warp_sum[8];\n"
+"    if (lane == 0) warp_sum[warp_id] = local_sum;\n"
 "    __syncthreads();\n"
-"    if (tid == 0) { float s = 0.0f; for (int w = 0; w < (nthreads+31)/32; w++) s+=ws[w]; ws[0]=1.0f/s; }\n"
+"    if (tid == 0) {\n"
+"        float s = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) s += warp_sum[w];\n"
+"        warp_sum[0] = s;\n"
+"    }\n"
 "    __syncthreads();\n"
-"    float inv_sum = ws[0];\n"
-"    for (int t = tid; t < seq_len; t += nthreads) scores[t] *= inv_sum;\n"
+"    float inv_sum = 1.0f / warp_sum[0];\n"
+"\n"
+"    /* Normalize */\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        att[t] *= inv_sum;\n"
+"    }\n"
 "    __syncthreads();\n"
 "\n"
-"    /* Pass 2: V accumulation */\n"
+"    /* Phase 3: Weighted V accumulation: out_h[d] = sum_t att[t] * V[t][d] */\n"
 "    float *out_h = out + h * head_dim;\n"
 "    for (int d = tid; d < head_dim; d += nthreads) {\n"
-"        float acc = 0.0f;\n"
-"        for (int t = 0; t < seq_len; t++)\n"
-"            acc += scores[t] * half_to_float(value_cache[(size_t)t * kv_dim + kv_h * head_dim + d]);\n"
-"        out_h[d] = acc;\n"
+"        float sum = 0.0f;\n"
+"        for (int t = 0; t < seq_len; t++) {\n"
+"            sum += att[t] * value_cache[(size_t)t * kv_dim + kv_h * head_dim + d];\n"
+"        }\n"
+"        out_h[d] = sum;\n"
 "    }\n"
 "}\n"
 "\n"
@@ -494,19 +508,18 @@ static const char *cuda_kernel_source =
 "}\n"
 "\n"
 "/* ---- 14. matvec_q2_K_f32: Q2_K matrix x F32 vector -> F32 ---- */\n"
-"/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q2_K block: 84 bytes = scales[16] + qs[64] + d(f16) + dmin(f16), 256 elements */\n"
 "__global__ void matvec_q2_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 84;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 84;\n"
 "        const unsigned char *scales = bp;\n"
 "        const unsigned char *qs = bp + 16;\n"
@@ -535,23 +548,31 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float warp_sums[8];\n"
+"    int warp_id = tid / 32, lane = tid % 32;\n"
+"    if (lane == 0) warp_sums[warp_id] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += warp_sums[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- 15. matvec_q3_K_f32: Q3_K matrix x F32 vector -> F32 ---- */\n"
-"/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q3_K block: 110 bytes = hmask[32] + qs[64] + scales[12] + d(f16), 256 elements */\n"
 "__global__ void matvec_q3_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 110;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 110;\n"
 "        const unsigned char *hm = bp;\n"
 "        const unsigned char *qs = bp + 32;\n"
@@ -592,23 +613,31 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws3[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws3[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) total += ws3[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- 16. matvec_q4_K_f32: Q4_K matrix x F32 vector -> F32 ---- */\n"
-"/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q4_K block: 144 bytes = d(f16) + dmin(f16) + scales[12] + qs[128], 256 elements */\n"
 "__global__ void matvec_q4_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 144;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 144;\n"
 "        float d = half_to_float(*(const half_raw *)(bp));\n"
 "        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
@@ -637,22 +666,31 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws4[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws4[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) total += ws4[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
 "__global__ void matvec_q6_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 210;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 210;\n"
 "        const unsigned char *ql = bp;\n"
 "        const unsigned char *qh = bp + 128;\n"
@@ -679,22 +717,31 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws6[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws6[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) total += ws6[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- 17b. matvec_q5_K_f32: Q5_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q5_K block: 176 bytes = d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128], 256 elements */\n"
 "__global__ void matvec_q5_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 176;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 176;\n"
 "        float d = half_to_float(*(const half_raw *)(bp));\n"
 "        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
@@ -729,7 +776,16 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws5[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws5[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) total += ws5[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- 18. embed_q2_K: Q2_K embedding lookup -> F32 ---- */\n"
@@ -759,37 +815,6 @@ static const char *cuda_kernel_source =
 "    float dl = d * (sc & 0xF);\n"
 "    float ml = dmin * (sc >> 4);\n"
 "    dst[i] = dl * ((qs[qs_idx] >> shift) & 3) - ml;\n"
-"}\n"
-"\n"
-"/* ---- 18b. embed_q4_K: Q4_K embedding lookup -> F32 ---- */\n"
-"__global__ void embed_q4_K(float *dst, const unsigned char *embd_table,\n"
-"                             int token_id, int n_embd) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n_embd) return;\n"
-"    int nb_per_row = n_embd / 256;\n"
-"    int row_bytes = nb_per_row * 144;\n"
-"    const unsigned char *row = embd_table + (size_t)token_id * row_bytes;\n"
-"    int block_idx = i / 256;\n"
-"    int elem = i % 256;\n"
-"    const unsigned char *bp = row + block_idx * 144;\n"
-"    float d = half_to_float(*(const half_raw *)(bp));\n"
-"    float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
-"    const unsigned char *sc = bp + 4;\n"
-"    const unsigned char *qs = bp + 16;\n"
-"    /* 256 elements = 4 groups of 64, each group has 2 sub-blocks of 32 */\n"
-"    int j = elem / 64;\n"             /* group 0-3 */
-"    int within = elem % 64;\n"
-"    int sub = within / 32;\n"          /* sub-block 0-1 */
-"    int l = within % 32;\n"            /* element within sub-block */
-"    int is = j * 2 + sub;\n"
-"    unsigned char sv, mv;\n"
-"    if (is < 4) { sv = sc[is] & 63; mv = sc[is+4] & 63; }\n"
-"    else { sv = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
-"    float dl = d * sv;\n"
-"    float ml = dmin * mv;\n"
-"    unsigned char q = qs[j * 32 + l];\n"
-"    float val = sub == 0 ? (dl * (q & 0xF) - ml) : (dl * (q >> 4) - ml);\n"
-"    dst[i] = val;\n"
 "}\n"
 "\n"
 "/* ==== SSM Delta-Net kernels ==== */\n"
@@ -1027,15 +1052,15 @@ static const char *cuda_kernel_source =
 "\n"
 "__global__ void matvec_iq2_xxs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                     int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 66;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 66;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
@@ -1060,7 +1085,16 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws_iq2[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq2[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq2[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 "\n"
 "__device__ static const unsigned long long iq2xs_grid_dev[512] = {\n"
@@ -2242,15 +2276,15 @@ static const char *cuda_kernel_source =
 "/* ---- matvec_iq4_nl_f32: IQ4_NL matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq4_nl_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                    int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 32;\n"
 "    int row_bytes = nb * 18;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 18;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs = bp + 2;\n"
@@ -2265,21 +2299,30 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws_iq4nl[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq4nl[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq4nl[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 
 "/* ---- matvec_iq4_xs_f32: IQ4_XS matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq4_xs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                    int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 136;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 136;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
@@ -2302,21 +2345,30 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws_iq4xs[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq4xs[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq4xs[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 
 "/* ---- matvec_iq2_xs_f32: IQ2_XS matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq2_xs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                    int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 74;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 74;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
@@ -2342,21 +2394,30 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws_iq2xs[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq2xs[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq2xs[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 
 "/* ---- matvec_iq3_xxs_f32: IQ3_XXS matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq3_xxs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                     int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 98;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 98;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs = bp + 2;\n"
@@ -2385,21 +2446,30 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws_iq3xxs[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq3xxs[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq3xxs[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 
 "/* ---- matvec_iq2_s_f32: IQ2_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq2_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 82;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 82;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        /* block_iq2_s layout: d(2) + qs(64)[grid(32)+signs(32)] + qh(8) + scales(8) */\n"
@@ -2430,21 +2500,30 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws_iq2s[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq2s[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq2s[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 
 "/* ---- matvec_iq3_s_f32: IQ3_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq3_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x;\n"
 "    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 110;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
 "        const unsigned char *bp = row_ptr + b * 110;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        /* block_iq3_s layout: d(2) + qs(64) + qh(8) + signs(32) + scales(4) */\n"
@@ -2488,7 +2567,16 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) dst[row] = sum;\n"
+"    __shared__ float ws_iq3s[8];\n"
+"    int wid = tid / 32, ln = tid % 32;\n"
+"    if (ln == 0) ws_iq3s[wid] = sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float total = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) total += ws_iq3s[w];\n"
+"        dst[row] = total;\n"
+"    }\n"
 "}\n"
 
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
@@ -2710,566 +2798,6 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
-"/* ---- 4b. raw_rmsnorm_heads_f32: Per-head RMSNorm without learned weight (for V norm) ---- */\n"
-"__global__ void raw_rmsnorm_heads_f32(float *vec, int n_heads, int head_dim, float eps) {\n"
-"    extern __shared__ float sdata[];\n"
-"    int h = blockIdx.x;\n"
-"    if (h >= n_heads) return;\n"
-"    int tid = threadIdx.x;\n"
-"    float *v = vec + h * head_dim;\n"
-"    float val = (tid < head_dim) ? v[tid] : 0.0f;\n"
-"    sdata[tid] = val * val;\n"
-"    __syncthreads();\n"
-"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
-"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
-"        __syncthreads();\n"
-"    }\n"
-"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
-"    if (tid < head_dim) v[tid] = val * scale;\n"
-"}\n"
-"\n"
-"/* ---- Gemma4 kernels ---- */\n"
-"\n"
-"/* GELU(gate) * up: gate[i] = gelu(gate[i]) * up[i] */\n"
-"__global__ void gelu_mul_f32(float *gate, const float *up, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    float g = gate[i];\n"
-"    float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));\n"
-"    gate[i] = gelu_g * up[i];\n"
-"}\n"
-"\n"
-"/* GELU element-wise multiply: out[i] = gelu(gate[i]) * ple[i] */\n"
-"__global__ void gelu_elementwise_mul_f32(float *ple, const float *gate, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    float g = gate[i];\n"
-"    float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));\n"
-"    ple[i] *= gelu_g;\n"
-"}\n"
-"\n"
-"/* Scale vector: x[i] *= scale */\n"
-"__global__ void scale_f32(float *x, float scale_val, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    x[i] *= scale_val;\n"
-"}\n"
-"\n"
-"/* Logit soft-capping: x[i] = cap * tanh(x[i] / cap) */\n"
-"__global__ void logit_softcap_f32(float *x, int n, float cap) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i >= n) return;\n"
-"    x[i] = cap * tanhf(x[i] / cap);\n"
-"}\n"
-"\n"
-"/* SWA attention decode with circular KV cache.\n"
-"   One block per head, blockDim.x threads for head_dim parallelism. */\n"
-"/* SWA attention decode with circular KV cache.\n"
-"   One block per head, 256 threads. Shared memory: seq_len floats for scores.\n"
-"   Uses cross-warp reduction for softmax (same pattern as attn_decode_f32). */\n"
-"__global__ void attn_decode_swa_f32(\n"
-"    float *out, const float *Q,\n"
-"    const half_raw *K_cache, const half_raw *V_cache,\n"
-"    int n_heads, int n_kv_heads, int head_dim, int kv_dim,\n"
-"    int position, int window_size, float scale) {\n"
-"    extern __shared__ float smem[];\n"
-"    int h = blockIdx.x;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
-"    int gqa_ratio = n_heads / n_kv_heads;\n"
-"    int kv_h = h / gqa_ratio;\n"
-"    int start = (position >= window_size) ? (position - window_size + 1) : 0;\n"
-"    int seq_len = position - start + 1;\n"
-"    float *scores = smem;\n"
-"    const float *q_h = Q + h * head_dim;\n"
-"    int warp_id = tid / 32;\n"
-"    int lane = tid % 32;\n"
-"\n"
-"    /* Phase 1: QK scores */\n"
-"    for (int p = tid; p < seq_len; p += nthreads) {\n"
-"        int slot = (start + p) % window_size;\n"
-"        const half_raw *k_p = K_cache + slot * kv_dim + kv_h * head_dim;\n"
-"        float dot = 0.0f;\n"
-"        for (int d = 0; d < head_dim; d++) dot += q_h[d] * half_to_float(k_p[d]);\n"
-"        scores[p] = dot * scale;\n"
-"    }\n"
-"    __syncthreads();\n"
-"\n"
-"    /* Phase 2: Softmax with cross-warp reduction */\n"
-"    float local_max = -1e30f;\n"
-"    for (int p = tid; p < seq_len; p += nthreads)\n"
-"        if (scores[p] > local_max) local_max = scores[p];\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));\n"
-"    __shared__ float warp_max[8];\n"
-"    if (lane == 0) warp_max[warp_id] = local_max;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float m = warp_max[0];\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 1; w < n_warps; w++)\n"
-"            if (warp_max[w] > m) m = warp_max[w];\n"
-"        warp_max[0] = m;\n"
-"    }\n"
-"    __syncthreads();\n"
-"    float max_val = warp_max[0];\n"
-"\n"
-"    float local_sum = 0.0f;\n"
-"    for (int p = tid; p < seq_len; p += nthreads) {\n"
-"        float e = expf(scores[p] - max_val);\n"
-"        scores[p] = e;\n"
-"        local_sum += e;\n"
-"    }\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);\n"
-"    __shared__ float warp_sum[8];\n"
-"    if (lane == 0) warp_sum[warp_id] = local_sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float s = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) s += warp_sum[w];\n"
-"        warp_sum[0] = s;\n"
-"    }\n"
-"    __syncthreads();\n"
-"    float inv_sum = 1.0f / warp_sum[0];\n"
-"    for (int p = tid; p < seq_len; p += nthreads)\n"
-"        scores[p] *= inv_sum;\n"
-"    __syncthreads();\n"
-"\n"
-"    /* Phase 3: Weighted V sum */\n"
-"    float *out_h = out + h * head_dim;\n"
-"    for (int d = tid; d < head_dim; d += nthreads) {\n"
-"        float acc = 0.0f;\n"
-"        for (int p = 0; p < seq_len; p++) {\n"
-"            int slot = (start + p) % window_size;\n"
-"            acc += scores[p] * half_to_float(V_cache[slot * kv_dim + kv_h * head_dim + d]);\n"
-"        }\n"
-"        out_h[d] = acc;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* BF16 matvec: out[row] = sum(mat[row][c] * vec[c]) for BF16 matrix */\n"
-"__global__ void matvec_bf16_f32(float *dst, const unsigned short *mat,\n"
-"    const float *vec, int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
-"    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
-"    const unsigned short *row_data = mat + (long long)row * n_cols;\n"
-"    float sum = 0.0f;\n"
-"    for (int c = tid; c < n_cols; c += nthreads) {\n"
-"        /* BF16 to F32: shift left by 16 bits */\n"
-"        unsigned int bits = (unsigned int)row_data[c] << 16;\n"
-"        float val;\n"
-"        asm volatile(\"mov.b32 %0, %1;\" : \"=f\"(val) : \"r\"(bits));\n"
-"        sum += val * vec[c];\n"
-"    }\n"
-"    /* Warp reduce */\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_bf16[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_bf16[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_bf16[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* RoPE with per-dimension frequency factors (proportional RoPE for Gemma4 full-attn).\n"
-"   freq_factors[j] is the precomputed inv_freq (already divided by rope_freqs). */\n"
-"__global__ void rope_with_factors_f32(\n"
-"    float *vec, int n_heads, int head_dim, int position,\n"
-"    const float *inv_freq, int n_pairs) {\n"
-"    int h = blockIdx.x;\n"
-"    int j = threadIdx.x;\n"
-"    if (j >= n_pairs) return;\n"
-"    float freq = (float)position * inv_freq[j];\n"
-"    float cos_v = cosf(freq), sin_v = sinf(freq);\n"
-"    float *v = vec + h * head_dim;\n"
-"    float r0 = v[j], r1 = v[j + n_pairs];\n"
-"    v[j]           = r0 * cos_v - r1 * sin_v;\n"
-"    v[j + n_pairs] = r0 * sin_v + r1 * cos_v;\n"
-"}\n"
-"\n"
-"/* ==== Batched Prefill Kernels ==== */\n"
-"\n"
-"/* Batched Q2_K matvec: process n_tokens through weight matrix simultaneously */\n"
-"/* Grid: [ceil(out_dim/8), n_tokens], Block: 256 (8 warps) */\n"
-"__global__ void batch_matvec_q2_K(float *output, const unsigned char *mat, const float *input,\n"
-"                                    int out_dim, int in_dim, int n_tokens) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
-"    int token = blockIdx.y;\n"
-"    if (row >= out_dim || token >= n_tokens) return;\n"
-"    int nb = in_dim / 256;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * nb * 84;\n"
-"    const float *x = input + (size_t)token * in_dim;\n"
-"    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
-"        const unsigned char *bp = row_ptr + b * 84;\n"
-"        const unsigned char *scales = bp;\n"
-"        const unsigned char *qs = bp + 16;\n"
-"        float d = half_to_float(*(const half_raw *)(bp + 80));\n"
-"        float dmin = half_to_float(*(const half_raw *)(bp + 82));\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        int is = 0, yi = 0;\n"
-"        for (int n0 = 0; n0 < 2; n0++) {\n"
-"            for (int j = 0; j < 4; j++) {\n"
-"                int shift = j * 2;\n"
-"                unsigned char sc = scales[is++];\n"
-"                float dl = d * (sc & 0xF), ml = dmin * (sc >> 4);\n"
-"                for (int l = 0; l < 16; l++) partial += (dl * ((qs[l] >> shift) & 3) - ml) * xb[yi++];\n"
-"                sc = scales[is++];\n"
-"                dl = d * (sc & 0xF); ml = dmin * (sc >> 4);\n"
-"                for (int l = 0; l < 16; l++) partial += (dl * ((qs[l+16] >> shift) & 3) - ml) * xb[yi++];\n"
-"            }\n"
-"            qs += 32;\n"
-"        }\n"
-"        sum += partial;\n"
-"    }\n"
-"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
-"}\n"
-"\n"
-"/* Batched Q3_K matvec */\n"
-"__global__ void batch_matvec_q3_K(float *output, const unsigned char *mat, const float *input,\n"
-"                                    int out_dim, int in_dim, int n_tokens) {\n"
-"    int warp_id = threadIdx.x / 32;\n"
-"    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
-"    int token = blockIdx.y;\n"
-"    if (row >= out_dim || token >= n_tokens) return;\n"
-"    int nb = in_dim / 256;\n"
-"    const unsigned char *row_ptr = mat + (size_t)row * nb * 110;\n"
-"    const float *x = input + (size_t)token * in_dim;\n"
-"    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
-"        const unsigned char *bp = row_ptr + b * 110;\n"
-"        const unsigned char *hm = bp;\n"
-"        const unsigned char *qs = bp + 32;\n"
-"        const unsigned char *raw_sc = bp + 96;\n"
-"        float d_all = half_to_float(*(const half_raw *)(bp + 108));\n"
-"        unsigned int a0=raw_sc[0]|(raw_sc[1]<<8)|(raw_sc[2]<<16)|(raw_sc[3]<<24);\n"
-"        unsigned int a1=raw_sc[4]|(raw_sc[5]<<8)|(raw_sc[6]<<16)|(raw_sc[7]<<24);\n"
-"        unsigned int tmp2=raw_sc[8]|(raw_sc[9]<<8)|(raw_sc[10]<<16)|(raw_sc[11]<<24);\n"
-"        unsigned int km1=0x03030303u, km2=0x0f0f0f0fu;\n"
-"        unsigned int aux[4];\n"
-"        aux[0]=(a0&km2)|(((tmp2>>0)&km1)<<4); aux[1]=(a1&km2)|(((tmp2>>2)&km1)<<4);\n"
-"        aux[2]=((a0>>4)&km2)|(((tmp2>>4)&km1)<<4); aux[3]=((a1>>4)&km2)|(((tmp2>>6)&km1)<<4);\n"
-"        const signed char *scales = (const signed char *)aux;\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        int is = 0, yi = 0;\n"
-"        unsigned char m_bit = 1;\n"
-"        for (int n0 = 0; n0 < 2; n0++) {\n"
-"            for (int j = 0; j < 4; j++) {\n"
-"                int shift = j * 2;\n"
-"                float dl1 = d_all * (scales[is++] - 32);\n"
-"                for (int l = 0; l < 16; l++) { int qv=((qs[l]>>shift)&3)-((hm[l]&m_bit)?0:4); partial+=dl1*qv*xb[yi++]; }\n"
-"                float dl2 = d_all * (scales[is++] - 32);\n"
-"                for (int l = 0; l < 16; l++) { int qv=((qs[l+16]>>shift)&3)-((hm[l+16]&m_bit)?0:4); partial+=dl2*qv*xb[yi++]; }\n"
-"                m_bit <<= 1;\n"
-"            }\n"
-"            qs += 32;\n"
-"        }\n"
-"        sum += partial;\n"
-"    }\n"
-"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    if (lane == 0) output[(size_t)token * out_dim + row] = sum;\n"
-"}\n"
-"\n"
-"/* Batched F16 KV store: store n_tokens K/V at consecutive positions */\n"
-"/* Grid: [ceil(kv_dim/256), n_tokens], Block: 256 */\n"
-"__global__ void batch_kv_store_f16(half_raw *key_cache, half_raw *value_cache,\n"
-"                                    const float *k_batch, const float *v_batch,\n"
-"                                    int start_pos, int kv_dim, int n_tokens) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int t = blockIdx.y;\n"
-"    if (i >= kv_dim || t >= n_tokens) return;\n"
-"    int pos = start_pos + t;\n"
-"    key_cache[(size_t)pos * kv_dim + i] = float_to_half(k_batch[(size_t)t * kv_dim + i]);\n"
-"    value_cache[(size_t)pos * kv_dim + i] = float_to_half(v_batch[(size_t)t * kv_dim + i]);\n"
-"}\n"
-"\n"
-"/* Batched SWA KV store: store at circular buffer positions */\n"
-"__global__ void batch_kv_store_swa_f16(half_raw *key_cache, half_raw *value_cache,\n"
-"                                        const float *k_batch, const float *v_batch,\n"
-"                                        int start_pos, int kv_dim, int n_tokens, int window_size) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int t = blockIdx.y;\n"
-"    if (i >= kv_dim || t >= n_tokens) return;\n"
-"    int slot = (start_pos + t) % window_size;\n"
-"    key_cache[(size_t)slot * kv_dim + i] = float_to_half(k_batch[(size_t)t * kv_dim + i]);\n"
-"    value_cache[(size_t)slot * kv_dim + i] = float_to_half(v_batch[(size_t)t * kv_dim + i]);\n"
-"}\n"
-"\n"
-"/* ==== Vision Encoder Kernels ==== */\n"
-"\n"
-"/* Batched F16 linear: weight[out_dim, in_dim] (F16) × input[N, in_dim] (F32) → output[N, out_dim] (F32) */\n"
-"/* Grid: [out_dim, N], Block: 256 */\n"
-"__global__ void vision_linear_f16(float *output, const half_raw *weight,\n"
-"                                   const float *input, int out_dim, int in_dim, int n_tokens) {\n"
-"    int row = blockIdx.x;\n"
-"    int token = blockIdx.y;\n"
-"    if (row >= out_dim || token >= n_tokens) return;\n"
-"    int tid = threadIdx.x;\n"
-"    const half_raw *w = weight + (size_t)row * in_dim;\n"
-"    const float *x = input + (size_t)token * in_dim;\n"
-"    float sum = 0.0f;\n"
-"    for (int i = tid; i < in_dim; i += blockDim.x)\n"
-"        sum += half_to_float(w[i]) * x[i];\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int nw = (blockDim.x + 31) / 32;\n"
-"        for (int w2 = 0; w2 < nw; w2++) total += ws[w2];\n"
-"        output[(size_t)token * out_dim + row] = total;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* Batched RMSNorm: normalize each of N tokens independently */\n"
-"/* Grid: [N], Block: 256.  If weight != NULL, multiply by weight. */\n"
-"__global__ void vision_rmsnorm(float *x, const half_raw *weight, int dim, float eps, int n_tokens) {\n"
-"    int token = blockIdx.x;\n"
-"    if (token >= n_tokens) return;\n"
-"    int tid = threadIdx.x;\n"
-"    float *v = x + (size_t)token * dim;\n"
-"    float ss = 0.0f;\n"
-"    for (int i = tid; i < dim; i += blockDim.x) ss += v[i] * v[i];\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        ss += __shfl_down_sync(0xFFFFFFFF, ss, offset);\n"
-"    __shared__ float ws[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws[wid] = ss;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float s = 0.0f;\n"
-"        int nw = (blockDim.x + 31) / 32;\n"
-"        for (int w2 = 0; w2 < nw; w2++) s += ws[w2];\n"
-"        ws[0] = rsqrtf(s / dim + eps);\n"
-"    }\n"
-"    __syncthreads();\n"
-"    float scale = ws[0];\n"
-"    if (weight) {\n"
-"        for (int i = tid; i < dim; i += blockDim.x)\n"
-"            v[i] = v[i] * scale * half_to_float(weight[i]);\n"
-"    } else {\n"
-"        for (int i = tid; i < dim; i += blockDim.x)\n"
-"            v[i] *= scale;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* Batched RMSNorm with F32 weights (for LLM layer norms) */\n"
-"__global__ void batch_rmsnorm_f32(float *x, const float *weight, int dim, float eps, int n_tokens) {\n"
-"    int token = blockIdx.x;\n"
-"    if (token >= n_tokens) return;\n"
-"    int tid = threadIdx.x;\n"
-"    float *v = x + (size_t)token * dim;\n"
-"    float ss = 0.0f;\n"
-"    for (int i = tid; i < dim; i += blockDim.x) ss += v[i] * v[i];\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        ss += __shfl_down_sync(0xFFFFFFFF, ss, offset);\n"
-"    __shared__ float ws[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws[wid] = ss;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float s = 0.0f;\n"
-"        int nw = (blockDim.x + 31) / 32;\n"
-"        for (int w2 = 0; w2 < nw; w2++) s += ws[w2];\n"
-"        ws[0] = rsqrtf(s / dim + eps);\n"
-"    }\n"
-"    __syncthreads();\n"
-"    float scale = ws[0];\n"
-"    if (weight) {\n"
-"        for (int i = tid; i < dim; i += blockDim.x)\n"
-"            v[i] = v[i] * scale * weight[i];\n"
-"    } else {\n"
-"        for (int i = tid; i < dim; i += blockDim.x)\n"
-"            v[i] *= scale;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* Per-head RMSNorm for Q/K: normalize each head independently */\n"
-"/* Grid: [n_tokens, n_heads], Block: head_dim (padded to power of 2) */\n"
-"__global__ void vision_head_rmsnorm(float *x, const half_raw *weight, int n_tokens,\n"
-"                                     int n_heads, int head_dim, int dim, float eps) {\n"
-"    int token = blockIdx.x;\n"
-"    int head = blockIdx.y;\n"
-"    if (token >= n_tokens || head >= n_heads) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
-"    float *v = x + (size_t)token * dim + head * head_dim;\n"
-"    float ss = 0.0f;\n"
-"    if (tid < head_dim) ss = v[tid] * v[tid];\n"
-"    /* Cross-warp reduction */\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        ss += __shfl_down_sync(0xFFFFFFFF, ss, offset);\n"
-"    __shared__ float warp_ss[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) warp_ss[wid] = ss;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int nw = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < nw; w++) total += warp_ss[w];\n"
-"        warp_ss[0] = rsqrtf(total / head_dim + eps);\n"
-"    }\n"
-"    __syncthreads();\n"
-"    float scale = warp_ss[0];\n"
-"    if (tid < head_dim) {\n"
-"        v[tid] = v[tid] * scale * (weight ? half_to_float(weight[tid]) : 1.0f);\n"
-"    }\n"
-"}\n"
-"\n"
-"/* 2D RoPE for vision tokens: apply rotation based on pos_x/pos_y coordinates */\n"
-"/* Grid: [n_tokens, n_heads], Block: head_dim/4 */\n"
-"__global__ void vision_rope_2d(float *x, const int *pos_x, const int *pos_y,\n"
-"                                int n_tokens, int n_heads, int head_dim, int dim, float theta) {\n"
-"    int token = blockIdx.x;\n"
-"    int head = blockIdx.y;\n"
-"    if (token >= n_tokens || head >= n_heads) return;\n"
-"    int j = threadIdx.x;\n"
-"    int half = head_dim / 2;\n"
-"    int quarter = half / 2;\n"
-"    if (j >= quarter) return;\n"
-"    float *v = x + (size_t)token * dim + head * head_dim;\n"
-"    /* First half: rotate by pos_x */\n"
-"    float freq_x = (float)pos_x[token] / powf(theta, (float)(2*j) / half);\n"
-"    float cx = cosf(freq_x), sx = sinf(freq_x);\n"
-"    float r0 = v[j], r1 = v[j + quarter];\n"
-"    v[j]           = r0 * cx - r1 * sx;\n"
-"    v[j + quarter] = r0 * sx + r1 * cx;\n"
-"    /* Second half: rotate by pos_y */\n"
-"    float freq_y = (float)pos_y[token] / powf(theta, (float)(2*j) / half);\n"
-"    float cy = cosf(freq_y), sy = sinf(freq_y);\n"
-"    float r2 = v[half + j], r3 = v[half + j + quarter];\n"
-"    v[half + j]           = r2 * cy - r3 * sy;\n"
-"    v[half + j + quarter] = r2 * sy + r3 * cy;\n"
-"}\n"
-"\n"
-"/* Vision attention: full NxN attention for all heads */\n"
-"/* Grid: [n_heads, n_tokens], Block: 256 */\n"
-"/* Each block computes one output row (one token, one head) */\n"
-"__global__ void vision_attention(float *out, const float *Q, const float *K, const float *V,\n"
-"                                  int n_tokens, int n_heads, int head_dim, int dim) {\n"
-"    int head = blockIdx.x;\n"
-"    int qi = blockIdx.y;  /* query token index */\n"
-"    if (head >= n_heads || qi >= n_tokens) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
-"    extern __shared__ float smem[];\n"
-"    float *scores = smem;\n"
-"\n"
-"    const float *q_h = Q + (size_t)qi * dim + head * head_dim;\n"
-"    float scale = 1.0f;  /* Gemma4 uses Q/K norm so scale=1 */\n"
-"\n"
-"    /* Compute Q·K^T scores for this query against all keys */\n"
-"    for (int ki = tid; ki < n_tokens; ki += nthreads) {\n"
-"        const float *k_h = K + (size_t)ki * dim + head * head_dim;\n"
-"        float dot = 0.0f;\n"
-"        for (int d = 0; d < head_dim; d++) dot += q_h[d] * k_h[d];\n"
-"        scores[ki] = dot * scale;\n"
-"    }\n"
-"    __syncthreads();\n"
-"\n"
-"    /* Softmax */\n"
-"    float local_max = -1e30f;\n"
-"    for (int t = tid; t < n_tokens; t += nthreads)\n"
-"        if (scores[t] > local_max) local_max = scores[t];\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));\n"
-"    __shared__ float warp_vals[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) warp_vals[wid] = local_max;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float m = warp_vals[0];\n"
-"        int nw = (nthreads + 31) / 32;\n"
-"        for (int w2 = 1; w2 < nw; w2++) if (warp_vals[w2] > m) m = warp_vals[w2];\n"
-"        warp_vals[0] = m;\n"
-"    }\n"
-"    __syncthreads();\n"
-"    float max_val = warp_vals[0];\n"
-"\n"
-"    float local_sum = 0.0f;\n"
-"    for (int t = tid; t < n_tokens; t += nthreads) {\n"
-"        float e = expf(scores[t] - max_val);\n"
-"        scores[t] = e;\n"
-"        local_sum += e;\n"
-"    }\n"
-"    for (int offset = 16; offset > 0; offset >>= 1)\n"
-"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);\n"
-"    if (ln == 0) warp_vals[wid] = local_sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float s = 0.0f;\n"
-"        int nw = (nthreads + 31) / 32;\n"
-"        for (int w2 = 0; w2 < nw; w2++) s += warp_vals[w2];\n"
-"        warp_vals[0] = s;\n"
-"    }\n"
-"    __syncthreads();\n"
-"    float inv_sum = 1.0f / warp_vals[0];\n"
-"    for (int t = tid; t < n_tokens; t += nthreads) scores[t] *= inv_sum;\n"
-"    __syncthreads();\n"
-"\n"
-"    /* Weighted V sum */\n"
-"    float *out_h = out + (size_t)qi * dim + head * head_dim;\n"
-"    for (int d = tid; d < head_dim; d += nthreads) {\n"
-"        float acc = 0.0f;\n"
-"        for (int t = 0; t < n_tokens; t++)\n"
-"            acc += scores[t] * V[(size_t)t * dim + head * head_dim + d];\n"
-"        out_h[d] = acc;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* GELU gate: out[i] = gelu(gate[i]) * up[i] */\n"
-"__global__ void vision_gelu_gate(float *gate, const float *up, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) {\n"
-"        float x = gate[i];\n"
-"        float g = x * 0.5f * (1.0f + erff(x * 0.7071067811865475f));\n"
-"        gate[i] = g * up[i];\n"
-"    }\n"
-"}\n"
-"\n"
-"/* Element-wise add: dst[i] += src[i] */\n"
-"__global__ void vision_add(float *dst, const float *src, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) dst[i] += src[i];\n"
-"}\n"
-"\n"
-"/* Scale: dst[i] *= scale */\n"
-"__global__ void vision_scale(float *dst, float scale, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) dst[i] *= scale;\n"
-"}\n"
-"\n"
-"/* Add bias from F16 lookup: dst[token*dim + i] += half_to_float(table[idx*dim + i]) */\n"
-"/* Grid: [n_tokens], Block: 256 */\n"
-"__global__ void vision_add_pos_embd(float *dst, const half_raw *table, const int *indices,\n"
-"                                      int dim, int n_tokens) {\n"
-"    int token = blockIdx.x;\n"
-"    if (token >= n_tokens) return;\n"
-"    int idx = indices[token];\n"
-"    float *d = dst + (size_t)token * dim;\n"
-"    const half_raw *s = table + (size_t)idx * dim;\n"
-"    for (int i = threadIdx.x; i < dim; i += blockDim.x)\n"
-"        d[i] += half_to_float(s[i]);\n"
-"}\n"
-"\n"
 "} /* extern \"C\" */\n"
 ;
 
@@ -3322,6 +2850,9 @@ typedef struct {
     CUdeviceptr attn_v_w;
     CUdeviceptr attn_q_norm_w; /* F32 [head_dim] */
     CUdeviceptr attn_k_norm_w; /* F32 [head_dim] */
+    CUdeviceptr attn_q_bias;   /* F32 [q_dim], 0 if absent (Qwen2.5-VL) */
+    CUdeviceptr attn_k_bias;   /* F32 [kv_dim] */
+    CUdeviceptr attn_v_bias;   /* F32 [kv_dim] */
     CUdeviceptr attn_output_w; /* F16 */
     CUdeviceptr ffn_norm_w;    /* F32 [n_embd] */
     CUdeviceptr ffn_gate_w;    /* F16 */
@@ -3387,21 +2918,6 @@ typedef struct {
     /* SSM persistent state */
     CUdeviceptr d_conv_state;    /* [(conv_k-1) * qkv_dim] F32 */
     CUdeviceptr d_recurrent_state; /* [dt_rank * d_state * d_state] F32 */
-
-    /* Gemma4 per-layer */
-    CUdeviceptr post_attn_norm_w;  /* F32 [n_embd] */
-    CUdeviceptr post_ffw_norm_w;   /* F32 [n_embd] */
-    float layer_scale_val;         /* cached output scale scalar */
-    CUdeviceptr ple_inp_gate_w;    /* per-layer embedding gate weight */
-    CUdeviceptr ple_proj_w;        /* per-layer embedding projection */
-    CUdeviceptr ple_post_norm_w;   /* per-layer embedding post-norm */
-    int ple_inp_gate_type, ple_proj_type;
-    int ple_inp_gate_rows, ple_inp_gate_cols;
-    int ple_proj_rows, ple_proj_cols;
-    int is_swa;
-    int shared_kv_source; /* -1 = own KV, >= 0 = source layer index */
-    int n_kv_heads;       /* per-layer KV head count (may differ from global for Gemma4 31B) */
-    int has_v_proj;       /* 0 = V uses K (Gemma4 full-attn layers without V tensor) */
 } cuda_layer;
 
 struct cuda_llm_runner {
@@ -3419,7 +2935,6 @@ struct cuda_llm_runner {
     CUfunction fn_qknorm_f32;
     CUfunction fn_rope_neox_f32;
     CUfunction fn_kv_cache_store;
-    CUfunction fn_kv_cache_store_f16;
     CUfunction fn_attn_decode_f32;
     CUfunction fn_silu_mul_f32;
     CUfunction fn_add_f32;
@@ -3433,7 +2948,6 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q5_K_f32;
     CUfunction fn_matvec_q6_K_f32;
     CUfunction fn_embed_q2_K;
-    CUfunction fn_embed_q4_K;
     /* SSM kernels */
     CUfunction fn_softplus_mul_f32;
     CUfunction fn_sigmoid_inplace_f32;
@@ -3463,24 +2977,6 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_tq1_0_f32;
     CUfunction fn_matvec_tq2_0_f32;
 
-    /* Batched prefill kernels */
-    CUfunction fn_batch_matvec_q2_K;
-    CUfunction fn_batch_matvec_q3_K;
-    CUfunction fn_batch_kv_store_f16;
-    CUfunction fn_batch_kv_store_swa_f16;
-    CUfunction fn_batch_rmsnorm_f32;
-
-    /* Vision encoder kernels */
-    CUfunction fn_vision_linear_f16;
-    CUfunction fn_vision_rmsnorm;
-    CUfunction fn_vision_head_rmsnorm;
-    CUfunction fn_vision_rope_2d;
-    CUfunction fn_vision_attention;
-    CUfunction fn_vision_gelu_gate;
-    CUfunction fn_vision_add;
-    CUfunction fn_vision_scale;
-    CUfunction fn_vision_add_pos_embd;
-
     /* Model params */
     int n_layers;
     int n_embd;
@@ -3496,6 +2992,8 @@ struct cuda_llm_runner {
     int debug_layers;       /* if > 0, print hidden state norm after each layer */
     int max_layers;         /* if > 0, process only first N layers (debug) */
     int n_deepstack;        /* number of deepstack layers (VLM injection, 0 = none) */
+    int hidden_snapshot_layers[3];
+    int n_hidden_snapshots;
 
     /* Hybrid SSM params (Qwen3.5) */
     int is_hybrid;
@@ -3513,39 +3011,6 @@ struct cuda_llm_runner {
     int n_experts_used;   /* top-k */
     int expert_ff;        /* per-expert FFN dim */
     int shared_expert_ff; /* shared expert FFN dim */
-
-    /* Gemma4 params */
-    int is_gemma4;
-    int head_dim_full, head_dim_swa;
-    int swa_window_size;
-    int n_layer_kv_from_start;
-    int n_embd_per_layer;
-    float final_logit_softcapping;
-    float rope_freq_base_swa;
-    float embd_scale;
-    int *swa_pattern;               /* [n_layers] host array: 1=SWA, 0=full */
-    int *per_layer_kv_heads;        /* [n_layers] per-layer KV head count (NULL = use global n_kv_heads) */
-    CUdeviceptr d_rope_inv_freq_full; /* F32 [head_dim_full/2] with proportional factors */
-    CUdeviceptr d_rope_inv_freq_swa;  /* F32 [head_dim_swa/2] */
-    /* Per-layer embedding globals on GPU */
-    CUdeviceptr d_ple_combined;     /* F32 [n_layers * ple_dim] precomputed per token */
-    CUdeviceptr d_ple_buf;          /* F32 [ple_dim] scratch */
-    CUdeviceptr d_ple_proj;         /* F32 [n_embd] scratch */
-    int current_token_id;           /* stashed for PLE lookup */
-    int ple_use_f32;                /* 1 = keep PLE weights in F32 for accuracy */
-    /* Host-side PLE data (mmap pointers from GGUF, valid while GGUF is open) */
-    qtensor h_ple_token_embd;       /* Q8_0 per_layer_token_embd */
-    qtensor h_ple_model_proj;       /* BF16 per_layer_model_proj */
-    qtensor h_ple_proj_norm;        /* F32 per_layer_proj_norm */
-    /* Gemma4 kernel functions */
-    CUfunction fn_raw_rmsnorm_heads_f32;
-    CUfunction fn_gelu_mul_f32;
-    CUfunction fn_gelu_elementwise_mul_f32;
-    CUfunction fn_scale_f32;
-    CUfunction fn_logit_softcap_f32;
-    CUfunction fn_attn_decode_swa_f32;
-    CUfunction fn_matvec_bf16_f32;
-    CUfunction fn_rope_with_factors_f32;
 
     /* MoE scratch buffers */
     CUdeviceptr d_router_logits;  /* [n_experts] F32 */
@@ -3592,10 +3057,13 @@ struct cuda_llm_runner {
     /* INT8 quantization scratch (for dp4a path) */
     CUdeviceptr d_xb_q;     /* INT8 [max_dim] */
     CUdeviceptr d_xb_scale; /* F32 [1] */
+    CUdeviceptr d_hidden_snapshots; /* optional packed [3 * n_embd] snapshot buffer */
 
     /* Host output buffer */
     float *h_output;     /* [n_embd] or [n_vocab] for logits */
     CUdeviceptr d_logits; /* [n_vocab] GPU logits buffer */
+    void *h_stage;
+    size_t h_stage_bytes;
 
     /* Weight loading state */
     int weights_loaded;
@@ -3605,15 +3073,76 @@ struct cuda_llm_runner {
     int _ds_embd_stride;
 };
 
+static int cuda_llm_bind_context(cuda_llm_runner *r) {
+    if (!r) return -1;
+    CUresult err = cuCtxSetCurrent(r->context);
+    if (err != CUDA_SUCCESS) {
+        if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: cuCtxSetCurrent failed (%d)\n", (int)err);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 /* ======================================================================== */
 /* NVRTC kernel compilation                                                 */
 /* ======================================================================== */
+
+#define CLLM_PTX_CACHE_VERSION 1
+
+static int cllm_read_file(const char *path, char **out_data, size_t *out_size) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return -1; }
+    long sz = ftell(fp);
+    if (sz <= 0) { fclose(fp); return -1; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return -1; }
+    char *buf = (char *)malloc((size_t)sz);
+    if (!buf) { fclose(fp); return -1; }
+    if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(buf);
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    *out_data = buf;
+    *out_size = (size_t)sz;
+    return 0;
+}
+
+static void cllm_write_file(const char *path, const char *data, size_t size) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(data, 1, size, fp);
+    fclose(fp);
+}
 
 static int compile_kernels(cuda_llm_runner *r) {
     int major, minor;
     cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, r->device);
     cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, r->device);
     int sm = major * 10 + minor;
+    char cache_path[128];
+    snprintf(cache_path, sizeof(cache_path), "/tmp/cuda_llm_sm_%d_v%d.ptx",
+             sm, CLLM_PTX_CACHE_VERSION);
+
+    char *ptx = NULL;
+    size_t ptx_size = 0;
+    if (cllm_read_file(cache_path, &ptx, &ptx_size) == 0) {
+        if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: loading cached PTX %s\n", cache_path);
+        }
+        CUresult err = cuModuleLoadDataEx(&r->module, ptx, 0, NULL, NULL);
+        free(ptx);
+        if (err == CUDA_SUCCESS) goto lookup_funcs;
+        if (r->verbose >= 1) {
+            const char *errStr = NULL;
+            cuGetErrorString(err, &errStr);
+            fprintf(stderr, "cuda_llm: cached PTX load failed (%s), recompiling\n",
+                    errStr ? errStr : "unknown");
+        }
+    }
 
     if (r->verbose >= 1) {
         fprintf(stderr, "cuda_llm: compiling kernels for sm_%d via NVRTC...\n", sm);
@@ -3658,9 +3187,9 @@ static int compile_kernels(cuda_llm_runner *r) {
     }
 
     /* Get PTX */
-    size_t ptx_size;
+    ptx_size = 0;
     nvrtcGetPTXSize(prog, &ptx_size);
-    char *ptx = (char *)malloc(ptx_size);
+    ptx = (char *)malloc(ptx_size);
     nvrtcGetPTX(prog, ptx);
     nvrtcDestroyProgram(&prog);
 
@@ -3670,6 +3199,7 @@ static int compile_kernels(cuda_llm_runner *r) {
 
     /* Load module from PTX */
     CUresult err = cuModuleLoadDataEx(&r->module, ptx, 0, NULL, NULL);
+    if (err == CUDA_SUCCESS) cllm_write_file(cache_path, ptx, ptx_size);
     free(ptx);
     if (err != CUDA_SUCCESS) {
         const char *errStr;
@@ -3679,6 +3209,7 @@ static int compile_kernels(cuda_llm_runner *r) {
     }
 
     /* Look up kernel functions */
+lookup_funcs:
     #define GET_FUNC(name) do { \
         err = cuModuleGetFunction(&r->fn_##name, r->module, #name); \
         if (err != CUDA_SUCCESS) { \
@@ -3693,7 +3224,6 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(qknorm_f32);
     GET_FUNC(rope_neox_f32);
     GET_FUNC(kv_cache_store);
-    GET_FUNC(kv_cache_store_f16);
     GET_FUNC(attn_decode_f32);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
@@ -3707,7 +3237,6 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
-    GET_FUNC(embed_q4_K);
     /* SSM kernels */
     GET_FUNC(softplus_mul_f32);
     GET_FUNC(sigmoid_inplace_f32);
@@ -3736,36 +3265,11 @@ static int compile_kernels(cuda_llm_runner *r) {
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
-    GET_FUNC(raw_rmsnorm_heads_f32);
-    /* Gemma4 kernels */
-    GET_FUNC(gelu_mul_f32);
-    GET_FUNC(gelu_elementwise_mul_f32);
-    GET_FUNC(scale_f32);
-    GET_FUNC(logit_softcap_f32);
-    GET_FUNC(attn_decode_swa_f32);
-    GET_FUNC(matvec_bf16_f32);
-    GET_FUNC(rope_with_factors_f32);
-    /* Batched prefill kernels */
-    GET_FUNC(batch_matvec_q2_K);
-    GET_FUNC(batch_matvec_q3_K);
-    GET_FUNC(batch_kv_store_f16);
-    GET_FUNC(batch_kv_store_swa_f16);
-    GET_FUNC(batch_rmsnorm_f32);
-    /* Vision encoder kernels */
-    GET_FUNC(vision_linear_f16);
-    GET_FUNC(vision_rmsnorm);
-    GET_FUNC(vision_head_rmsnorm);
-    GET_FUNC(vision_rope_2d);
-    GET_FUNC(vision_attention);
-    GET_FUNC(vision_gelu_gate);
-    GET_FUNC(vision_add);
-    GET_FUNC(vision_scale);
-    GET_FUNC(vision_add_pos_embd);
 
     #undef GET_FUNC
 
     if (r->verbose >= 1) {
-        fprintf(stderr, "cuda_llm: all kernels compiled successfully\n");
+        fprintf(stderr, "cuda_llm: all %d kernels compiled successfully\n", 31 + 14);
     }
     return 0;
 }
@@ -3792,7 +3296,8 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
     r->verbose = verbose;
 
     CHECK_CU_NULL(cuDeviceGet(&r->device, device_id));
-    CHECK_CU_NULL(cuCtxCreate(&r->context, 0, r->device));
+    CHECK_CU_NULL(cuDevicePrimaryCtxRetain(&r->context, r->device));
+    CHECK_CU_NULL(cuCtxSetCurrent(r->context));
     CHECK_CU_NULL(cuStreamCreate(&r->stream, CU_STREAM_NON_BLOCKING));
 
     if (verbose >= 1) {
@@ -3810,7 +3315,6 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
     /* Compile kernels */
     if (compile_kernels(r) != 0) {
         cuStreamDestroy(r->stream);
-        cuCtxDestroy(r->context);
         free(r);
         return NULL;
     }
@@ -3826,6 +3330,16 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
 /* For this model (Qwen3-Embedding-0.6B-f16), all weight matrices are F16. */
 /* Norms are F32. We handle both cases. */
 
+static void *cllm_stage_buf(cuda_llm_runner *r, size_t nbytes) {
+    if (!r) return NULL;
+    if (nbytes <= r->h_stage_bytes) return r->h_stage;
+    void *p = realloc(r->h_stage, nbytes);
+    if (!p) return NULL;
+    r->h_stage = p;
+    r->h_stage_bytes = nbytes;
+    return p;
+}
+
 /* Upload F16 tensor data directly to GPU */
 static int upload_f16_matrix(CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
@@ -3838,15 +3352,18 @@ static int upload_f16_matrix(CUdeviceptr *d_ptr, const qtensor *t) {
 }
 
 /* Dequant a 1D norm tensor to F32 and upload */
-static int upload_norm_f32(CUdeviceptr *d_ptr, const qtensor *t, int n) {
+static int upload_norm_f32(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t, int n) {
     if (!t->data) { *d_ptr = 0; return 0; }
-    float *buf = (float *)malloc(n * sizeof(float));
-    if (!buf) { fprintf(stderr, "cuda_llm: upload_norm_f32 malloc failed (n=%d)\n", n); return -1; }
-    dequant_row(t->type, t->data, buf, n);
+    const void *src = t->data;
+    if (t->type != GGML_TYPE_F32) {
+        float *buf = (float *)cllm_stage_buf(r, (size_t)n * sizeof(float));
+        if (!buf) { fprintf(stderr, "cuda_llm: upload_norm_f32 stage alloc failed (n=%d)\n", n); return -1; }
+        dequant_row(t->type, t->data, buf, n);
+        src = buf;
+    }
     CUresult err = cuMemAlloc(d_ptr, n * sizeof(float));
-    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 alloc failed (n=%d, err=%d)\n", n, (int)err); free(buf); return -1; }
-    err = cuMemcpyHtoD(*d_ptr, buf, n * sizeof(float));
-    free(buf);
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 alloc failed (n=%d, err=%d)\n", n, (int)err); return -1; }
+    err = cuMemcpyHtoD(*d_ptr, src, n * sizeof(float));
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
@@ -3854,14 +3371,14 @@ static int upload_norm_f32(CUdeviceptr *d_ptr, const qtensor *t, int n) {
 /* Upload Q8_0 tensor data to GPU with padding for alignment.
  * Each 34-byte Q8_0 block (2B scale + 32B qs) is padded to 36 bytes
  * (2B scale + 2B pad + 32B qs) so int32 reads of qs data are 4-byte aligned. */
-static int upload_q8_0_raw(CUdeviceptr *d_ptr, const qtensor *t) {
+static int upload_q8_0_raw(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
     int n_elements = t->n_rows * t->n_cols;
     int n_blocks = n_elements / 32;
     size_t nbytes_padded = (size_t)n_blocks * 36;  /* 36 bytes per padded block */
 
     /* Repack on host: insert 2-byte padding after each scale */
-    uint8_t *padded = (uint8_t *)malloc(nbytes_padded);
+    uint8_t *padded = (uint8_t *)cllm_stage_buf(r, nbytes_padded);
     if (!padded) return -1;
     const uint8_t *src = (const uint8_t *)t->data;
     for (int i = 0; i < n_blocks; i++) {
@@ -3875,9 +3392,8 @@ static int upload_q8_0_raw(CUdeviceptr *d_ptr, const qtensor *t) {
     }
 
     CUresult err = cuMemAlloc(d_ptr, nbytes_padded);
-    if (err != CUDA_SUCCESS) { free(padded); return -1; }
+    if (err != CUDA_SUCCESS) { return -1; }
     err = cuMemcpyHtoD(*d_ptr, padded, nbytes_padded);
-    free(padded);
     if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
@@ -3911,100 +3427,48 @@ static uint16_t cllm_f32_to_f16(float f) {
     return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
 }
 
-/* Upload a weight matrix - dispatches based on type */
-/* Upload weight matrix as F32 (dequant any type to F32, copy to GPU) */
-static int upload_weight_f32(CUdeviceptr *d_ptr, const qtensor *t) {
-    if (!t->data) { *d_ptr = 0; return 0; }
-    int n_elements = t->n_rows * t->n_cols;
-    float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
-    if (!f32_buf) {
-        fprintf(stderr, "cuda_llm: upload_weight_f32 malloc failed (rows=%d, cols=%d)\n",
-                t->n_rows, t->n_cols);
-        return -1;
+static uint16_t cllm_bf16_to_f16(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
+    int32_t exp = (int32_t)((bits >> 23) & 0xFF) - 127;
+    uint32_t mant = bits & 0x7FFFFF;
+    if (exp > 15) return sign | 0x7C00;
+    if (exp < -14) {
+        if (exp < -24) return sign;
+        mant |= 0x800000;
+        mant >>= (-1 - exp);
+        return sign | (uint16_t)(mant >> 13);
     }
-    size_t row_bytes = dequant_row_size(t->type, t->n_cols);
-    const uint8_t *base = (const uint8_t *)t->data;
-    for (int row = 0; row < t->n_rows; row++) {
-        dequant_row(t->type,
-                    base + (size_t)row * row_bytes,
-                    f32_buf + (size_t)row * t->n_cols,
-                    t->n_cols);
-    }
-    size_t nbytes = (size_t)n_elements * sizeof(float);
-    CUresult err = cuMemAlloc(d_ptr, nbytes);
-    if (err != CUDA_SUCCESS) {
-        fprintf(stderr, "cuda_llm: upload_weight_f32 alloc failed (%zu bytes, err=%d)\n",
-                nbytes, (int)err);
-        free(f32_buf);
-        return -1;
-    }
-    err = cuMemcpyHtoD(*d_ptr, f32_buf, nbytes);
-    free(f32_buf);
-    if (err != CUDA_SUCCESS) {
-        fprintf(stderr, "cuda_llm: upload_weight_f32 copy failed\n");
-        cuMemFree(*d_ptr);
-        *d_ptr = 0;
-        return -1;
-    }
-    return 0;
+    return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
 }
 
-static int upload_weight_matrix(CUdeviceptr *d_ptr, const qtensor *t, int *out_type) {
+/* Upload a weight matrix - dispatches based on type */
+static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t, int *out_type) {
     *out_type = t->type;
     if (t->type == GGML_TYPE_Q8_0) {
-        return upload_q8_0_raw(d_ptr, t);
+        return upload_q8_0_raw(r, d_ptr, t);
     } else if (t->type == GGML_TYPE_Q2_K || t->type == GGML_TYPE_Q3_K ||
                t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K ||
-               t->type == GGML_TYPE_Q6_K) {
+               t->type == GGML_TYPE_Q6_K ||
+               t->type == GGML_TYPE_IQ4_XS || t->type == GGML_TYPE_IQ4_NL) {
         return upload_kquant_raw(d_ptr, t);
-    } else if (t->type == GGML_TYPE_F32) {
-        /* F32 → F16, then upload */
-        *out_type = GGML_TYPE_F16;
-        int n_elements = t->n_rows * t->n_cols;
-        const float *f32_data = (const float *)t->data;
-        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
-        if (!f16_buf) return -1;
-        for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_f32_to_f16(f32_data[i]);
-        size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
-        CUresult err = cuMemAlloc(d_ptr, nbytes);
-        if (err != CUDA_SUCCESS) { free(f16_buf); return -1; }
-        err = cuMemcpyHtoD(*d_ptr, f16_buf, nbytes);
-        free(f16_buf);
-        if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
-        return 0;
     } else if (t->type == GGML_TYPE_BF16) {
-        /* BF16 → F32 → F16, then upload as F16 */
+        /* BF16 -> F16 in one host pass, then upload as F16. */
         *out_type = GGML_TYPE_F16;
         int n_elements = t->n_rows * t->n_cols;
-        float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
-        if (!f32_buf) return -1;
-        dequant_row(GGML_TYPE_BF16, t->data, f32_buf, n_elements);
-        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
-        if (!f16_buf) { free(f32_buf); return -1; }
-        for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_f32_to_f16(f32_buf[i]);
-        free(f32_buf);
+        uint16_t *f16_buf = (uint16_t *)cllm_stage_buf(r, (size_t)n_elements * sizeof(uint16_t));
+        if (!f16_buf) return -1;
+        const uint16_t *src = (const uint16_t *)t->data;
+        for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_bf16_to_f16(src[i]);
         size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
         CUresult err = cuMemAlloc(d_ptr, nbytes);
-        if (err != CUDA_SUCCESS) { free(f16_buf); return -1; }
+        if (err != CUDA_SUCCESS) { return -1; }
         err = cuMemcpyHtoD(*d_ptr, f16_buf, nbytes);
-        free(f16_buf);
         if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
         return 0;
-    } else if (t->type == GGML_TYPE_F16) {
-        return upload_f16_matrix(d_ptr, t);
-    } else if (t->type == GGML_TYPE_IQ2_XXS || t->type == GGML_TYPE_IQ2_XS ||
-               t->type == GGML_TYPE_IQ2_S   || t->type == GGML_TYPE_IQ3_XXS ||
-               t->type == GGML_TYPE_IQ3_S   || t->type == GGML_TYPE_IQ4_NL ||
-               t->type == GGML_TYPE_IQ4_XS  || t->type == GGML_TYPE_IQ1_S ||
-               t->type == GGML_TYPE_IQ1_M   || t->type == GGML_TYPE_Q4_0 ||
-               t->type == GGML_TYPE_Q4_1    || t->type == GGML_TYPE_Q5_0 ||
-               t->type == GGML_TYPE_Q5_1    || t->type == GGML_TYPE_TQ1_0 ||
-               t->type == GGML_TYPE_TQ2_0) {
-        /* Upload raw quantized data — dequant happens in-kernel during matvec */
-        return upload_kquant_raw(d_ptr, t);
     } else {
-        /* Default: unknown type */
-        fprintf(stderr, "cuda_llm: upload_weight_matrix: unhandled type %d (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
+        /* Default: F16 (or treat as F16) */
+        fprintf(stderr, "cuda_llm: upload_weight_matrix: unhandled type %d, treating as F16 (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
         return upload_f16_matrix(d_ptr, t);
     }
 }
@@ -4072,6 +3536,177 @@ static qtensor cllm_load_tensor(const gguf_context *gguf, const char *name, int 
     return t;
 }
 
+static int cllm_st_dtype_to_ggml(const char *dtype) {
+    if (!dtype) return -1;
+    if (strcmp(dtype, "F32") == 0) return GGML_TYPE_F32;
+    if (strcmp(dtype, "F16") == 0) return GGML_TYPE_F16;
+    if (strcmp(dtype, "BF16") == 0) return GGML_TYPE_BF16;
+    return -1;
+}
+
+static qtensor cllm_st_load_tensor_multi(st_context **shards, int n_shards,
+                                         const char *name, int required) {
+    qtensor t = {0};
+    st_context *st = NULL;
+    int idx = -1;
+    for (int s = 0; s < n_shards && idx < 0; s++) {
+        idx = safetensors_find(shards[s], name);
+        if (idx >= 0) st = shards[s];
+    }
+    if (idx < 0) {
+        if (required) fprintf(stderr, "cuda_llm: missing safetensors tensor '%s'\n", name);
+        return t;
+    }
+
+    int ggml_type = cllm_st_dtype_to_ggml(safetensors_dtype(st, idx));
+    if (ggml_type < 0) {
+        fprintf(stderr, "cuda_llm: unsupported safetensors dtype '%s' for %s\n",
+                safetensors_dtype(st, idx), name);
+        return t;
+    }
+
+    const uint64_t *sh = safetensors_shape(st, idx);
+    int nd = safetensors_ndims(st, idx);
+    t.data = safetensors_data(st, idx);
+    t.type = ggml_type;
+    t.n_dims = nd > 4 ? 4 : nd;
+    if (nd <= 1) {
+        int n = (int)sh[0];
+        t.n_rows = 1;
+        t.n_cols = n;
+        t.dims[0] = (uint64_t)n;
+    } else {
+        t.n_rows = (int)sh[0];
+        t.n_cols = (int)sh[1];
+        t.dims[0] = sh[1];
+        t.dims[1] = sh[0];
+        for (int d = 2; d < t.n_dims; d++) t.dims[d] = sh[d];
+    }
+    return t;
+}
+
+static int cllm_open_safetensors_shards(const char *model_path, st_context **shards,
+                                        int max_shards) {
+    struct stat sb;
+    if (stat(model_path, &sb) != 0) return -1;
+
+    if (S_ISDIR(sb.st_mode)) {
+        char path[512];
+        int n_shards = 0;
+        for (int i = 1; i <= max_shards && n_shards < max_shards; i++) {
+            int found = 0;
+            for (int total = i; total <= max_shards; total++) {
+                snprintf(path, sizeof(path), "%s/model-%05d-of-%05d.safetensors",
+                         model_path, i, total);
+                if (stat(path, &sb) != 0) continue;
+                st_context *s = safetensors_open(path);
+                if (s) {
+                    shards[n_shards++] = s;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) break;
+        }
+        return n_shards;
+    }
+
+    st_context *st = safetensors_open(model_path);
+    if (!st) return -1;
+    shards[0] = st;
+    return 1;
+}
+
+static void cllm_close_safetensors_shards(st_context **shards, int n_shards) {
+    for (int i = 0; i < n_shards; i++) {
+        if (shards[i]) safetensors_close(shards[i]);
+    }
+}
+
+static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_dim,
+                                          int max_seq_len) {
+    size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
+    int n_attn_layers = 0;
+    r->d_key_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+    r->d_value_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+    if (!r->d_key_cache || !r->d_value_cache) return -1;
+    for (int l = 0; l < r->n_layers; l++) {
+        if (r->layers[l].is_ssm) continue;
+        CHECK_CU(cuMemAlloc(&r->d_key_cache[l], kv_cache_size));
+        CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, kv_cache_size));
+        CHECK_CU(cuMemAlloc(&r->d_value_cache[l], kv_cache_size));
+        CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, kv_cache_size));
+        n_attn_layers++;
+    }
+    if (r->is_hybrid && r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: %d attention layers (KV cache), %d SSM layers\n",
+                n_attn_layers, r->n_layers - n_attn_layers);
+    }
+
+    int max_dim = r->n_embd;
+    if (q_dim > max_dim) max_dim = q_dim;
+    if (r->n_ff > max_dim) max_dim = r->n_ff;
+    int xb2_dim = max_dim;
+    if (r->is_hybrid) {
+        if (r->ssm_qkv_dim > xb2_dim) xb2_dim = r->ssm_qkv_dim;
+        if (2 * q_dim > xb2_dim) xb2_dim = 2 * q_dim;
+    }
+
+    CHECK_CU(cuMemAlloc(&r->d_x,   max_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb,  max_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb2, xb2_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_q,   q_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_k,   kv_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_v,   kv_dim * sizeof(float)));
+    {
+        int ff_dim = r->n_ff;
+        if (r->is_moe && r->shared_expert_ff > ff_dim) ff_dim = r->shared_expert_ff;
+        CHECK_CU(cuMemAlloc(&r->d_gate, ff_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_up,   ff_dim * sizeof(float)));
+    }
+
+    if (r->is_moe) {
+        CHECK_CU(cuMemAlloc(&r->d_router_logits, r->n_experts * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_moe_accum, r->n_embd * sizeof(float)));
+        r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
+        if (!r->h_router_logits) return -1;
+    }
+
+    if (r->is_hybrid) {
+        int d_inner = r->ssm_d_inner;
+        int dt_rank = r->ssm_dt_rank;
+        int d_state = r->ssm_d_state;
+        CHECK_CU(cuMemAlloc(&r->d_ssm_qkv,      r->ssm_qkv_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_z,         d_inner * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_alpha,     dt_rank * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_beta,      dt_rank * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_Q_exp,     dt_rank * d_state * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_K_exp,     dt_rank * d_state * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_out,       d_inner * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_conv_out,  r->ssm_qkv_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_attn_gate,     q_dim * sizeof(float)));
+    }
+
+    if (r->n_deepstack > 0) {
+        CHECK_CU(cuMemAlloc(&r->d_ds_tmp, r->n_embd * sizeof(float)));
+    }
+
+    CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
+
+    CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
+
+    {
+        int out_sz = r->n_vocab > r->n_embd ? r->n_vocab : r->n_embd;
+        r->h_output = (float *)malloc((size_t)out_sz * sizeof(float));
+        if (!r->h_output) return -1;
+    }
+
+    r->weights_loaded = 1;
+    return 0;
+}
+
 /* ======================================================================== */
 /* Public API: load_weights                                                 */
 /* ======================================================================== */
@@ -4081,11 +3716,11 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
 
     /* Detect architecture prefix */
     const char *arch = "qwen2";
-    if (gguf_find_key(gguf, "gemma4.block_count") >= 0) arch = "gemma4";
-    else if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
+    if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
     else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
     else if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
+    else if (gguf_find_key(gguf, "qwen2vl.block_count") >= 0) arch = "qwen2vl";
 
     char kbuf[128];
     #define ARCH_KEY(suffix) (snprintf(kbuf, sizeof(kbuf), "%s." suffix, arch), kbuf)
@@ -4093,16 +3728,6 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     r->n_embd      = cllm_get_int(gguf, ARCH_KEY("embedding_length"), 4096);
     r->n_heads     = cllm_get_int(gguf, ARCH_KEY("attention.head_count"), 32);
     r->n_kv_heads  = cllm_get_int(gguf, ARCH_KEY("attention.head_count_kv"), 8);
-    /* head_count_kv may be a per-layer array (e.g. Gemma4 31B) — use first element */
-    {
-        int idx = gguf_find_key(gguf, ARCH_KEY("attention.head_count_kv"));
-        if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY &&
-            gguf->kv[idx].value.arr.n > 0) {
-            uint32_t atype = gguf->kv[idx].value.arr.type;
-            if (atype == GGUF_TYPE_UINT32) r->n_kv_heads = (int)((uint32_t *)gguf->kv[idx].value.arr.data)[0];
-            else if (atype == GGUF_TYPE_INT32) r->n_kv_heads = ((int32_t *)gguf->kv[idx].value.arr.data)[0];
-        }
-    }
     r->n_layers    = cllm_get_int(gguf, ARCH_KEY("block_count"), 36);
     r->n_ff        = cllm_get_int(gguf, ARCH_KEY("feed_forward_length"), 12288);
     r->n_vocab     = cllm_get_int(gguf, ARCH_KEY("vocab_size"), 0);
@@ -4169,154 +3794,6 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         fprintf(stderr, "cuda_llm: n_deepstack=%d\n", r->n_deepstack);
     }
 
-    /* Gemma4 architecture */
-    r->is_gemma4 = 0;
-    r->swa_pattern = NULL;
-    if (strcmp(arch, "gemma4") == 0) {
-        r->is_gemma4 = 1;
-        r->ple_use_f32 = 1; /* F32 PLE weights for accuracy (costs ~105MB extra VRAM) */
-        r->head_dim_full = cllm_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
-        r->head_dim_swa  = cllm_get_int(gguf, ARCH_KEY("attention.key_length_swa"), 256);
-        r->head_dim = r->head_dim_full; /* max for buffer sizing */
-        r->swa_window_size = cllm_get_int(gguf, ARCH_KEY("attention.sliding_window"), 512);
-        r->n_embd_per_layer = cllm_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 256);
-        int shared_kv_layers = cllm_get_int(gguf, ARCH_KEY("attention.shared_kv_layers"), 0);
-        r->n_layer_kv_from_start = r->n_layers - shared_kv_layers;
-        r->final_logit_softcapping = cllm_get_float(gguf, ARCH_KEY("final_logit_softcapping"), 30.0f);
-        r->rope_freq_base_swa = cllm_get_float(gguf, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
-        r->embd_scale = sqrtf((float)r->n_embd);
-
-        /* Parse SWA layer pattern */
-        r->swa_pattern = (int *)calloc(r->n_layers, sizeof(int));
-        if (!r->swa_pattern) {
-            fprintf(stderr, "cuda_llm: Gemma4 swa_pattern alloc failed (n_layers=%d)\n", r->n_layers);
-            return -1;
-        }
-        {
-            int idx = gguf_find_key(gguf, ARCH_KEY("attention.sliding_window_pattern"));
-            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY) {
-                int n = (int)gguf->kv[idx].value.arr.n;
-                if (n > r->n_layers) n = r->n_layers;
-                uint8_t *data = (uint8_t *)gguf->kv[idx].value.arr.data;
-                for (int i = 0; i < n; i++) r->swa_pattern[i] = data[i] ? 1 : 0;
-            } else {
-                for (int i = 0; i < r->n_layers; i++)
-                    r->swa_pattern[i] = ((i + 1) % 6 != 0) ? 1 : 0;
-            }
-        }
-
-        /* Parse per-layer KV head counts (may vary for 31B: 16 for SWA, 4 for full) */
-        r->per_layer_kv_heads = NULL;
-        {
-            int idx = gguf_find_key(gguf, ARCH_KEY("attention.head_count_kv"));
-            if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY &&
-                gguf->kv[idx].value.arr.n >= (uint64_t)r->n_layers) {
-                r->per_layer_kv_heads = (int *)calloc(r->n_layers, sizeof(int));
-                int n = r->n_layers;
-                uint32_t atype = gguf->kv[idx].value.arr.type;
-                void *data = gguf->kv[idx].value.arr.data;
-                for (int i = 0; i < n; i++) {
-                    if (atype == GGUF_TYPE_UINT32) r->per_layer_kv_heads[i] = (int)((uint32_t *)data)[i];
-                    else if (atype == GGUF_TYPE_INT32) r->per_layer_kv_heads[i] = ((int32_t *)data)[i];
-                    else r->per_layer_kv_heads[i] = r->n_kv_heads;
-                }
-                if (r->verbose >= 1) {
-                    int same = 1;
-                    for (int i = 1; i < n; i++)
-                        if (r->per_layer_kv_heads[i] != r->per_layer_kv_heads[0]) { same = 0; break; }
-                    fprintf(stderr, "cuda_llm: Gemma4 per-layer kv_heads: %s", same ? "uniform" : "varies");
-                    if (!same) {
-                        fprintf(stderr, " [");
-                        for (int i = 0; i < n && i < 10; i++) fprintf(stderr, "%s%d", i?",":"", r->per_layer_kv_heads[i]);
-                        if (n > 10) fprintf(stderr, ",...");
-                        fprintf(stderr, "]");
-                    } else {
-                        fprintf(stderr, " (%d)", r->per_layer_kv_heads[0]);
-                    }
-                    fprintf(stderr, "\n");
-                }
-            }
-        }
-
-        /* Precompute RoPE inv_freq tables and upload to GPU */
-        {
-            /* SWA RoPE */
-            int half_swa = r->head_dim_swa / 2;
-            float *inv_freq_swa = (float *)malloc(half_swa * sizeof(float));
-            if (!inv_freq_swa) {
-                fprintf(stderr, "cuda_llm: Gemma4 inv_freq_swa alloc failed (n=%d)\n", half_swa);
-                return -1;
-            }
-            for (int j = 0; j < half_swa; j++)
-                inv_freq_swa[j] = 1.0f / powf(r->rope_freq_base_swa, (float)(2*j) / r->head_dim_swa);
-            {
-                CUresult err = cuMemAlloc(&r->d_rope_inv_freq_swa, half_swa * sizeof(float));
-                if (err != CUDA_SUCCESS) {
-                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_swa alloc failed (err=%d)\n", (int)err);
-                    free(inv_freq_swa);
-                    return -1;
-                }
-                err = cuMemcpyHtoD(r->d_rope_inv_freq_swa, inv_freq_swa, half_swa * sizeof(float));
-                if (err != CUDA_SUCCESS) {
-                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_swa copy failed (err=%d)\n", (int)err);
-                    cuMemFree(r->d_rope_inv_freq_swa);
-                    r->d_rope_inv_freq_swa = 0;
-                    free(inv_freq_swa);
-                    return -1;
-                }
-            }
-            free(inv_freq_swa);
-
-            /* Full-attention proportional RoPE */
-            int half_full = r->head_dim_full / 2;
-            float *inv_freq_full = (float *)malloc(half_full * sizeof(float));
-            if (!inv_freq_full) {
-                fprintf(stderr, "cuda_llm: Gemma4 inv_freq_full alloc failed (n=%d)\n", half_full);
-                return -1;
-            }
-            for (int j = 0; j < half_full; j++)
-                inv_freq_full[j] = 1.0f / powf(r->rope_freq_base, (float)(2*j) / r->head_dim_full);
-
-            /* Apply proportional freq_factors from rope_freqs.weight */
-            qtensor rope_freqs_qt = cllm_load_tensor(gguf, "rope_freqs.weight", 0);
-            if (rope_freqs_qt.data) {
-                float *ff = (float *)malloc(half_full * sizeof(float));
-                if (!ff) {
-                    fprintf(stderr, "cuda_llm: Gemma4 rope_freqs host buffer alloc failed (n=%d)\n", half_full);
-                    free(inv_freq_full);
-                    return -1;
-                }
-                dequant_row(rope_freqs_qt.type, rope_freqs_qt.data, ff, half_full);
-                for (int j = 0; j < half_full; j++) inv_freq_full[j] /= ff[j];
-                free(ff);
-            }
-            {
-                CUresult err = cuMemAlloc(&r->d_rope_inv_freq_full, half_full * sizeof(float));
-                if (err != CUDA_SUCCESS) {
-                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_full alloc failed (err=%d)\n", (int)err);
-                    free(inv_freq_full);
-                    return -1;
-                }
-                err = cuMemcpyHtoD(r->d_rope_inv_freq_full, inv_freq_full, half_full * sizeof(float));
-                if (err != CUDA_SUCCESS) {
-                    fprintf(stderr, "cuda_llm: Gemma4 d_rope_inv_freq_full copy failed (err=%d)\n", (int)err);
-                    cuMemFree(r->d_rope_inv_freq_full);
-                    r->d_rope_inv_freq_full = 0;
-                    free(inv_freq_full);
-                    return -1;
-                }
-            }
-            free(inv_freq_full);
-        }
-
-        if (r->verbose >= 1) {
-            fprintf(stderr, "cuda_llm: Gemma4: head_full=%d head_swa=%d swa_window=%d ple_dim=%d\n",
-                    r->head_dim_full, r->head_dim_swa, r->swa_window_size, r->n_embd_per_layer);
-            fprintf(stderr, "cuda_llm: Gemma4: n_layer_kv_start=%d softcap=%.1f\n",
-                    r->n_layer_kv_from_start, r->final_logit_softcapping);
-        }
-    }
-
     #undef ARCH_KEY
 
     int kv_dim = r->n_kv_heads * r->head_dim;
@@ -4335,12 +3812,14 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     if (r->n_vocab == 0) r->n_vocab = embd.n_rows;
     r->token_embd_type = embd.type;
     if (embd.type == GGML_TYPE_Q8_0) {
-        if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q2_K || embd.type == GGML_TYPE_Q3_K ||
-               embd.type == GGML_TYPE_Q4_K || embd.type == GGML_TYPE_Q6_K) {
+        if (upload_q8_0_raw(r, &r->d_token_embd, &embd) != 0) return -1;
+    } else if (embd.type == GGML_TYPE_Q2_K) {
+        /* Q2_K has a dedicated GPU embed kernel */
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q5_K) {
-        /* Q5_K → dequant to F16 at load time (no Q5_K embed kernel) */
+    } else if (embd.type == GGML_TYPE_Q3_K || embd.type == GGML_TYPE_Q4_K ||
+               embd.type == GGML_TYPE_Q5_K || embd.type == GGML_TYPE_Q6_K ||
+               embd.type == GGML_TYPE_IQ4_XS || embd.type == GGML_TYPE_IQ4_NL) {
+        /* K-quants without GPU embed kernels → dequant to F16 at load time */
         int n_elements = embd.n_rows * embd.n_cols;
         float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
         if (!f32_buf) return -1;
@@ -4387,7 +3866,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     if (!onorm.data) { fprintf(stderr, "cuda_llm: output_norm.weight not found!\n"); return -1; }
     if (r->verbose) fprintf(stderr, "cuda_llm: output_norm type=%d n_rows=%d n_cols=%d\n",
         onorm.type, onorm.n_rows, onorm.n_cols);
-    if (upload_norm_f32(&r->d_output_norm, &onorm, r->n_embd) != 0) {
+    if (upload_norm_f32(r, &r->d_output_norm, &onorm, r->n_embd) != 0) {
         fprintf(stderr, "cuda_llm: upload output_norm failed!\n"); return -1;
     }
 
@@ -4396,7 +3875,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     {
         qtensor output = cllm_load_tensor(gguf, "output.weight", 0);
         if (output.data) {
-            if (upload_weight_matrix(&r->d_output_w, &output, &r->output_w_type) != 0) { fprintf(stderr, "cuda_llm: output.weight upload failed!\n"); return -1; }
+            if (upload_weight_matrix(r, &r->d_output_w, &output, &r->output_w_type) != 0) { fprintf(stderr, "cuda_llm: output.weight upload failed!\n"); return -1; }
             r->has_lm_head = 1;
             if (r->verbose) fprintf(stderr, "cuda_llm: output.weight loaded (type=%d)\n", r->output_w_type);
         } else {
@@ -4418,24 +3897,15 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         cuda_layer *cl = &r->layers[l];
         if (r->verbose >= 2) fprintf(stderr, "cuda_llm: loading layer %d/%d\n", l, r->n_layers);
 
-        /* Determine layer type */
+        /* Determine layer type for hybrid models */
         int is_ssm = (r->is_hybrid && r->full_attn_interval > 0 &&
                       (l + 1) % r->full_attn_interval != 0);
         cl->is_ssm = is_ssm;
-        cl->is_swa = 0;
-        cl->shared_kv_source = -1;
-        cl->n_kv_heads = r->n_kv_heads;
-        if (r->is_gemma4) {
-            cl->is_swa = r->swa_pattern[l];
-            if (r->per_layer_kv_heads) cl->n_kv_heads = r->per_layer_kv_heads[l];
-            if (l >= r->n_layer_kv_from_start)
-                cl->shared_kv_source = r->n_layer_kv_from_start - (cl->is_swa ? 2 : 1);
-        }
 
         /* Attention norm (F32) — shared by all layer types */
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
         qtensor t = cllm_load_tensor(gguf, name, 1);
-        if (upload_norm_f32(&cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
+        if (upload_norm_f32(r, &cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
 
         if (r->verbose >= 2) fprintf(stderr, "cuda_llm: layer %d (%s)...\n", l, is_ssm ? "SSM" : "ATT");
         if (is_ssm) {
@@ -4444,7 +3914,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
                 t = cllm_load_tensor(gguf, name, 1); \
                 cl->rows_f = t.n_rows; cl->cols_f = t.n_cols; \
-                if (upload_weight_matrix(&cl->field, &t, &cl->type_f) != 0) return -1; \
+                if (upload_weight_matrix(r, &cl->field, &t, &cl->type_f) != 0) return -1; \
             } while(0)
             LOAD_SSM_W(ssm_qkv_w,   "attn_qkv",  ssm_qkv_rows,   ssm_qkv_cols,   ssm_qkv_type);
             LOAD_SSM_W(ssm_gate_w,   "attn_gate",  ssm_gate_rows,  ssm_gate_cols,  ssm_gate_type);
@@ -4456,22 +3926,22 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             /* ssm_a (F32, no .weight suffix) */
             snprintf(name, sizeof(name), "blk.%d.ssm_a", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_a, &t, r->ssm_dt_rank) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_a, &t, r->ssm_dt_rank) != 0) return -1;
 
             /* ssm_dt.bias (F32) */
             snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_dt_bias, &t, r->ssm_dt_rank) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_dt_bias, &t, r->ssm_dt_rank) != 0) return -1;
 
             /* ssm_conv1d (F32) */
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_conv1d_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_conv1d_w, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             /* ssm_norm (F32) */
             snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_norm_w, &t, r->ssm_d_state) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_norm_w, &t, r->ssm_d_state) != 0) return -1;
 
             /* Allocate SSM persistent state */
             size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
@@ -4492,65 +3962,87 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
-            t = cllm_load_tensor(gguf, name, r->is_gemma4 ? 0 : 1); /* optional for Gemma4 full-attn layers */
-            cl->has_v_proj = (t.data != NULL);
-            if (cl->has_v_proj) {
-                cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
-                if (upload_weight_matrix(&cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
-            } else {
-                /* V = K for this layer (Gemma4 pattern) */
-                cl->attn_v_rows = cl->attn_k_rows;
-                cl->attn_v_cols = cl->attn_k_cols;
-                cl->attn_v_w = 0;
-                cl->attn_v_type = 0;
-                if (r->verbose >= 2)
-                    fprintf(stderr, "cuda_llm: layer %d: no V tensor, will use K as V\n", l);
-            }
+            t = cllm_load_tensor(gguf, name, 1);
+            cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
+            if (upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
 
             /* QK norms (F32, optional) */
             snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
             t = cllm_load_tensor(gguf, name, 0);
             cl->has_qk_norm = (t.data != NULL);
             if (t.data) {
-                if (upload_norm_f32(&cl->attn_q_norm_w, &t, r->head_dim) != 0) return -1;
+                if (upload_norm_f32(r, &cl->attn_q_norm_w, &t, r->head_dim) != 0) return -1;
             }
             snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l);
             t = cllm_load_tensor(gguf, name, 0);
             if (t.data) {
-                if (upload_norm_f32(&cl->attn_k_norm_w, &t, r->head_dim) != 0) return -1;
+                if (upload_norm_f32(r, &cl->attn_k_norm_w, &t, r->head_dim) != 0) return -1;
+            }
+
+            /* Q/K/V biases (F32, optional — Qwen2.5-VL has these) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+            t = cllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                size_t sz = (size_t)t.n_cols * sizeof(float);
+                cuMemAlloc(&cl->attn_q_bias, sz);
+                /* Dequant to F32 and upload */
+                float *tmp = (float *)malloc(sz);
+                dequant_row(t.type, t.data, tmp, t.n_cols);
+                cuMemcpyHtoD(cl->attn_q_bias, tmp, sz);
+                free(tmp);
+            }
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+            t = cllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                size_t sz = (size_t)t.n_cols * sizeof(float);
+                cuMemAlloc(&cl->attn_k_bias, sz);
+                float *tmp = (float *)malloc(sz);
+                dequant_row(t.type, t.data, tmp, t.n_cols);
+                cuMemcpyHtoD(cl->attn_k_bias, tmp, sz);
+                free(tmp);
+            }
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);
+            t = cllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                size_t sz = (size_t)t.n_cols * sizeof(float);
+                cuMemAlloc(&cl->attn_v_bias, sz);
+                float *tmp = (float *)malloc(sz);
+                dequant_row(t.type, t.data, tmp, t.n_cols);
+                cuMemcpyHtoD(cl->attn_v_bias, tmp, sz);
+                free(tmp);
             }
 
             if (r->verbose >= 2) {
-                fprintf(stderr, "  layer %d [ATT]: Q[%d×%d] K[%d×%d] V[%d×%d] O[%d×%d] qk_norm=%d\n",
+                fprintf(stderr, "  layer %d [ATT]: Q[%d×%d] K[%d×%d] V[%d×%d] O[%d×%d] qk_norm=%d bias=%d\n",
                         l, cl->attn_q_rows, cl->attn_q_cols,
                         cl->attn_k_rows, cl->attn_k_cols,
                         cl->attn_v_rows, cl->attn_v_cols,
                         cl->attn_output_rows, cl->attn_output_cols,
-                        cl->has_qk_norm);
+                        cl->has_qk_norm, cl->attn_q_bias ? 1 : 0);
             }
         }
 
         /* FFN norm (F32) — shared by all layer types */
-        if (r->is_hybrid && !r->is_gemma4) {
+        if (r->is_hybrid) {
             snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l);
         } else {
             snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
         }
         t = cllm_load_tensor(gguf, name, 1);
-        if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
+        if (upload_norm_f32(r, &cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
 
         /* FFN weights */
         if (r->is_moe) {
@@ -4561,7 +4053,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_gate_rows = t.n_rows; cl->moe_gate_cols = t.n_cols;
-            if (upload_norm_f32(&cl->moe_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_f32(r, &cl->moe_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             /* Expert 3D weights (K-quant packed) */
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
@@ -4586,23 +4078,23 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             /* Shared expert gate: ffn_gate_inp_shexp [n_embd] F32 (1D sigmoid gate) */
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->moe_shared_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_f32(r, &cl->moe_shared_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             /* Shared expert FFN (BF16 → F16 via upload_weight_matrix) */
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_gate_rows = t.n_rows; cl->moe_shared_gate_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->moe_shared_ffn_gate_w, &t, &cl->moe_shared_gate_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_gate_w, &t, &cl->moe_shared_gate_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_up_rows = t.n_rows; cl->moe_shared_up_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->moe_shared_ffn_up_w, &t, &cl->moe_shared_up_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_up_w, &t, &cl->moe_shared_up_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_down_rows = t.n_rows; cl->moe_shared_down_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->moe_shared_ffn_down_w, &t, &cl->moe_shared_down_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_down_w, &t, &cl->moe_shared_down_type) != 0) return -1;
 
             if (r->verbose >= 2) {
                 fprintf(stderr, "  layer %d [MoE]: router[%d×%d] exp_gu[%d×%d] exp_d[%d×%d] stride_gu=%zu stride_d=%zu\n",
@@ -4620,159 +4112,32 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
-        }
-
-        /* Gemma4 per-layer extra tensors */
-        if (r->is_gemma4) {
-            /* Post-attention norm */
-            snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l);
-            t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->post_attn_norm_w, &t, r->n_embd) != 0) return -1;
-
-            /* Post-FFW norm */
-            snprintf(name, sizeof(name), "blk.%d.post_ffw_norm.weight", l);
-            t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->post_ffw_norm_w, &t, r->n_embd) != 0) return -1;
-
-            /* Layer output scale (cached as float) */
-            snprintf(name, sizeof(name), "blk.%d.layer_output_scale.weight", l);
-            t = cllm_load_tensor(gguf, name, 0);
-            cl->layer_scale_val = 1.0f;
-            if (t.data) {
-                float sv;
-                dequant_row(t.type, t.data, &sv, 1);
-                cl->layer_scale_val = sv;
-            }
-
-            /* Per-layer embedding tensors (only if model has PLE, i.e. n_embd_per_layer > 0) */
-            if (r->n_embd_per_layer > 0) {
-                snprintf(name, sizeof(name), "blk.%d.inp_gate.weight", l);
-                t = cllm_load_tensor(gguf, name, 1);
-                cl->ple_inp_gate_rows = t.n_rows; cl->ple_inp_gate_cols = t.n_cols;
-                if (r->ple_use_f32) {
-                    cl->ple_inp_gate_type = GGML_TYPE_F32;
-                    if (upload_weight_f32(&cl->ple_inp_gate_w, &t) != 0) return -1;
-                } else {
-                    if (upload_weight_matrix(&cl->ple_inp_gate_w, &t, &cl->ple_inp_gate_type) != 0) return -1;
-                }
-
-                snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
-                t = cllm_load_tensor(gguf, name, 1);
-                cl->ple_proj_rows = t.n_rows; cl->ple_proj_cols = t.n_cols;
-                if (r->ple_use_f32) {
-                    cl->ple_proj_type = GGML_TYPE_F32;
-                    if (upload_weight_f32(&cl->ple_proj_w, &t) != 0) return -1;
-                } else {
-                    if (upload_weight_matrix(&cl->ple_proj_w, &t, &cl->ple_proj_type) != 0) return -1;
-                }
-
-                /* PLE post-norm (F32) */
-                snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
-                t = cllm_load_tensor(gguf, name, 1);
-                if (upload_norm_f32(&cl->ple_post_norm_w, &t, r->n_embd) != 0) return -1;
-            }
-
-            /* QK norm for Gemma4 uses per-layer head_dim */
-            if (cl->has_qk_norm) {
-                int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
-                /* Re-upload if head_dim differs — already uploaded with r->head_dim above,
-                 * but Gemma4 head_dim varies. Re-upload with correct size. */
-                if (hd != r->head_dim) {
-                    if (cl->attn_q_norm_w) cuMemFree(cl->attn_q_norm_w);
-                    if (cl->attn_k_norm_w) cuMemFree(cl->attn_k_norm_w);
-                    cl->attn_q_norm_w = 0;
-                    cl->attn_k_norm_w = 0;
-                    snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
-                    t = cllm_load_tensor(gguf, name, 0);
-                    if (t.data && upload_norm_f32(&cl->attn_q_norm_w, &t, hd) != 0) return -1;
-                    snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l);
-                    t = cllm_load_tensor(gguf, name, 0);
-                    if (t.data && upload_norm_f32(&cl->attn_k_norm_w, &t, hd) != 0) return -1;
-                }
-            }
+            if (upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
         }
     }
 
-    /* Gemma4: load global per-layer embedding tensors and allocate PLE scratch */
-    if (r->is_gemma4 && r->n_embd_per_layer > 0) {
-        int ple_dim = r->n_embd_per_layer;
-        int total_ple = ple_dim * r->n_layers;
-        /* Store host-side PLE tensor pointers for CPU precomputation */
-        r->h_ple_token_embd = cllm_load_tensor(gguf, "per_layer_token_embd.weight", 1);
-        r->h_ple_model_proj = cllm_load_tensor(gguf, "per_layer_model_proj.weight", 1);
-        r->h_ple_proj_norm = cllm_load_tensor(gguf, "per_layer_proj_norm.weight", 0);
-        if (!r->h_ple_token_embd.data || !r->h_ple_model_proj.data) {
-            fprintf(stderr, "cuda_llm: Gemma4 missing required global PLE tensors\n");
-            return -1;
-        }
-
-        CHECK_CU(cuMemAlloc(&r->d_ple_combined, (size_t)total_ple * sizeof(float)));
-        CHECK_CU(cuMemAlloc(&r->d_ple_buf, (size_t)ple_dim * sizeof(float)));
-        CHECK_CU(cuMemAlloc(&r->d_ple_proj, (size_t)r->n_embd * sizeof(float)));
-
-        if (r->verbose >= 1)
-            fprintf(stderr, "cuda_llm: Gemma4 PLE buffers allocated (ple_dim=%d, tok_embd=%s, proj=%s)\n",
-                    ple_dim, r->h_ple_token_embd.data ? "OK" : "MISSING",
-                    r->h_ple_model_proj.data ? "OK" : "MISSING");
-    } else if (r->is_gemma4 && r->verbose >= 1) {
-        fprintf(stderr, "cuda_llm: Gemma4 model has no PLE (n_embd_per_layer=0)\n");
-    }
-
-    /* Allocate KV cache (skip SSM layers; Gemma4 has per-layer sizing) */
+    /* Allocate KV cache (skip SSM layers) */
     r->d_key_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
     r->d_value_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+    size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
     int n_attn_layers = 0;
-    if (r->is_gemma4) {
-        for (int l = 0; l < r->n_layers; l++) {
-            if (r->layers[l].shared_kv_source >= 0) continue;
-            int layer_kv_heads = r->layers[l].n_kv_heads;
-            int hd = r->layers[l].is_swa ? r->head_dim_swa : r->head_dim_full;
-            int kv_dim = layer_kv_heads * hd;
-            size_t cache_sz;
-            if (r->layers[l].is_swa) {
-                cache_sz = (size_t)r->swa_window_size * kv_dim * sizeof(uint16_t);
-            } else {
-                cache_sz = (size_t)max_seq_len * kv_dim * sizeof(uint16_t);
-            }
-            CHECK_CU(cuMemAlloc(&r->d_key_cache[l], cache_sz));
-            CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, cache_sz));
-            CHECK_CU(cuMemAlloc(&r->d_value_cache[l], cache_sz));
-            CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, cache_sz));
-            n_attn_layers++;
-        }
-        /* Point shared layers to source */
-        for (int l = 0; l < r->n_layers; l++) {
-            int src = r->layers[l].shared_kv_source;
-            if (src >= 0 && src < r->n_layers) {
-                r->d_key_cache[l] = r->d_key_cache[src];
-                r->d_value_cache[l] = r->d_value_cache[src];
-            }
-        }
-        if (r->verbose >= 1) {
-            int n_shared = r->n_layers - r->n_layer_kv_from_start;
-            fprintf(stderr, "cuda_llm: Gemma4 KV cache: %d own, %d shared\n", n_attn_layers, n_shared);
-        }
-    } else {
-        size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(uint16_t);
-        for (int l = 0; l < r->n_layers; l++) {
-            if (r->layers[l].is_ssm) continue;
-            CHECK_CU(cuMemAlloc(&r->d_key_cache[l], kv_cache_size));
-            CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, kv_cache_size));
-            CHECK_CU(cuMemAlloc(&r->d_value_cache[l], kv_cache_size));
-            CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, kv_cache_size));
-            n_attn_layers++;
-        }
+    for (int l = 0; l < r->n_layers; l++) {
+        if (r->layers[l].is_ssm) continue;
+        CHECK_CU(cuMemAlloc(&r->d_key_cache[l], kv_cache_size));
+        CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, kv_cache_size));
+        CHECK_CU(cuMemAlloc(&r->d_value_cache[l], kv_cache_size));
+        CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, kv_cache_size));
+        n_attn_layers++;
     }
     if (r->is_hybrid && r->verbose >= 1) {
         fprintf(stderr, "cuda_llm: %d attention layers (KV cache), %d SSM layers\n",
@@ -4835,6 +4200,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     /* INT8 quantization scratch (for dp4a path) */
     CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
     CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     /* Logits buffer (GPU + host) */
     CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
@@ -4890,8 +4256,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             }
         }
         #undef WEIGHT_BYTES
-        size_t kv_cache_size_est = (size_t)max_seq_len * kv_dim * sizeof(uint16_t); /* F16 KV cache */
-        size_t cache_bytes = (size_t)r->n_layers * 2 * kv_cache_size_est;
+        size_t cache_bytes = (size_t)r->n_layers * 2 * kv_cache_size;
         size_t scratch_bytes = (size_t)(max_dim * 3 + q_dim + kv_dim * 2 + r->n_ff * 2) * sizeof(float)
                              + max_dim + sizeof(float);  /* INT8 scratch */
         cuda_layer *cl0 = &r->layers[0];
@@ -4909,6 +4274,184 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 (double)scratch_bytes / 1024.0);
     }
 
+    return 0;
+}
+
+int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
+                                            const char *model_path,
+                                            int max_seq_len) {
+    if (!r || !model_path) return -1;
+
+    st_context *shards[16] = {0};
+    int n_shards = cllm_open_safetensors_shards(model_path, shards, 16);
+    if (n_shards <= 0) {
+        fprintf(stderr, "cuda_llm: failed to open safetensors model %s\n", model_path);
+        return -1;
+    }
+
+    int n_layers = 0;
+    for (int s = 0; s < n_shards; s++) {
+        for (int i = 0; i < shards[s]->n_tensors; i++) {
+            const char *nm = safetensors_name(shards[s], i);
+            if (strncmp(nm, "model.layers.", 13) == 0) {
+                int l = atoi(nm + 13);
+                if (l + 1 > n_layers) n_layers = l + 1;
+            }
+        }
+    }
+
+    int r0, c0;
+    qtensor embd = cllm_st_load_tensor_multi(shards, n_shards, "model.embed_tokens.weight", 1);
+    if (!embd.data) { cllm_close_safetensors_shards(shards, n_shards); return -1; }
+    qtensor q0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.q_proj.weight", 1);
+    qtensor k0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.k_proj.weight", 1);
+    qtensor qn0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.q_norm.weight", 1);
+    qtensor ff0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.mlp.gate_proj.weight", 1);
+    (void)r0; (void)c0;
+
+    r->n_embd = embd.n_cols;
+    r->n_vocab = embd.n_rows;
+    r->n_layers = n_layers;
+    r->head_dim = qn0.n_cols ? qn0.n_cols : 128;
+    r->n_heads = q0.n_rows / r->head_dim;
+    r->n_kv_heads = k0.n_rows / r->head_dim;
+    r->n_ff = ff0.n_rows;
+    r->rms_norm_eps = 1e-6f;
+    r->rope_freq_base = 1000000.0f;
+    r->n_rope_pairs = 0;
+    r->is_hybrid = 0;
+    r->is_moe = 0;
+    r->n_deepstack = 0;
+    if (max_seq_len <= 0) max_seq_len = 2048;
+    r->max_seq_len = max_seq_len;
+
+    if (r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: safetensors qwen3 n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d\n",
+                r->n_embd, r->n_heads, r->n_kv_heads, r->n_layers, r->n_ff, r->head_dim);
+    }
+
+    if (upload_weight_matrix(r, &r->d_token_embd, &embd, &r->token_embd_type) != 0) {
+        cllm_close_safetensors_shards(shards, n_shards);
+        return -1;
+    }
+
+    qtensor onorm = cllm_st_load_tensor_multi(shards, n_shards, "model.norm.weight", 1);
+    if (!onorm.data || upload_norm_f32(r, &r->d_output_norm, &onorm, r->n_embd) != 0) {
+        cllm_close_safetensors_shards(shards, n_shards);
+        return -1;
+    }
+
+    r->d_output_w = r->d_token_embd;
+    r->output_w_type = r->token_embd_type;
+    r->has_lm_head = 1;
+
+    r->layers = (cuda_layer *)calloc(r->n_layers, sizeof(cuda_layer));
+    if (!r->layers) {
+        cllm_close_safetensors_shards(shards, n_shards);
+        return -1;
+    }
+
+    for (int l = 0; l < r->n_layers; l++) {
+        char name[160];
+        cuda_layer *cl = &r->layers[l];
+        qtensor t;
+
+        snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        if (!t.data || upload_norm_f32(r, &cl->attn_norm_w, &t, r->n_embd) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->has_qk_norm = 1;
+        if (!t.data || upload_norm_f32(r, &cl->attn_q_norm_w, &t, r->head_dim) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        if (!t.data || upload_norm_f32(r, &cl->attn_k_norm_w, &t, r->head_dim) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        if (!t.data || upload_norm_f32(r, &cl->ffn_norm_w, &t, r->n_embd) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+    }
+
+    {
+        int kv_dim = r->n_kv_heads * r->head_dim;
+        int q_dim = r->n_heads * r->head_dim;
+        if (cuda_llm_alloc_runtime_buffers(r, q_dim, kv_dim, max_seq_len) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+    }
+
+    cllm_close_safetensors_shards(shards, n_shards);
     return 0;
 }
 
@@ -4945,10 +4488,10 @@ static inline void launch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdevicept
 
 static inline void launch_qknorm(cuda_llm_runner *r, CUdeviceptr vec, CUdeviceptr w,
                                    int n_heads, int head_dim, float eps) {
-    /* blockDim = next power of 2 >= head_dim (Gemma4 needs 512 for full-attn heads) */
+    /* blockDim = next power of 2 >= head_dim, capped at 256 */
     int bdim = 1;
     while (bdim < head_dim) bdim <<= 1;
-    if (bdim > 1024) bdim = 1024;
+    if (bdim > 256) bdim = 256;
     void *args[] = { &vec, &w, &n_heads, &head_dim, &eps };
     cuLaunchKernel(r->fn_qknorm_f32,
                    n_heads, 1, 1,
@@ -4970,7 +4513,7 @@ static inline void launch_rope(cuda_llm_runner *r, CUdeviceptr vec, int n_heads,
 static inline void launch_kv_store(cuda_llm_runner *r, CUdeviceptr key_cache, CUdeviceptr value_cache,
                                     CUdeviceptr k, CUdeviceptr v, int position, int kv_dim) {
     void *args[] = { &key_cache, &value_cache, &k, &v, &position, &kv_dim };
-    cuLaunchKernel(r->fn_kv_cache_store_f16,
+    cuLaunchKernel(r->fn_kv_cache_store,
                    (kv_dim + 255) / 256, 1, 1,
                    256, 1, 1,
                    0, r->stream, args, NULL);
@@ -5004,57 +4547,6 @@ static inline void launch_add(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr s
                    (n + 255) / 256, 1, 1,
                    256, 1, 1,
                    0, r->stream, args, NULL);
-}
-
-/* ---- Gemma4 launch helpers ---- */
-
-static inline void launch_gelu_mul(cuda_llm_runner *r, CUdeviceptr gate, CUdeviceptr up, int n) {
-    void *args[] = { &gate, &up, &n };
-    cuLaunchKernel(r->fn_gelu_mul_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static inline void launch_gelu_elementwise_mul(cuda_llm_runner *r, CUdeviceptr ple, CUdeviceptr gate, int n) {
-    void *args[] = { &ple, &gate, &n };
-    cuLaunchKernel(r->fn_gelu_elementwise_mul_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static inline void launch_scale(cuda_llm_runner *r, CUdeviceptr x, float scale_val, int n) {
-    void *args[] = { &x, &scale_val, &n };
-    cuLaunchKernel(r->fn_scale_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static inline void launch_logit_softcap(cuda_llm_runner *r, CUdeviceptr x, int n, float cap) {
-    void *args[] = { &x, &n, &cap };
-    cuLaunchKernel(r->fn_logit_softcap_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-}
-
-static inline void launch_attention_swa(cuda_llm_runner *r, CUdeviceptr out, CUdeviceptr q,
-                                         CUdeviceptr key_cache, CUdeviceptr value_cache,
-                                         int n_heads, int n_kv_heads, int head_dim,
-                                         int kv_dim, int position, int window_size, float scale) {
-    int start = (position >= window_size) ? (position - window_size + 1) : 0;
-    int seq_len = position - start + 1;
-    size_t smem = seq_len * sizeof(float);
-    void *args[] = { &out, &q, &key_cache, &value_cache,
-                     &n_heads, &n_kv_heads, &head_dim, &kv_dim,
-                     &position, &window_size, &scale };
-    cuLaunchKernel(r->fn_attn_decode_swa_f32,
-                   n_heads, 1, 1, 256, 1, 1, smem, r->stream, args, NULL);
-}
-
-static inline void launch_rope_with_factors(cuda_llm_runner *r, CUdeviceptr vec, int n_heads,
-                                             int head_dim, int pos, CUdeviceptr inv_freq) {
-    int n_pairs = head_dim / 2;
-    void *args[] = { &vec, &n_heads, &head_dim, &pos, &inv_freq, &n_pairs };
-    cuLaunchKernel(r->fn_rope_with_factors_f32,
-                   n_heads, 1, 1, n_pairs, 1, 1, 0, r->stream, args, NULL);
-}
-
-static inline void launch_matvec_bf16(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
-                                       CUdeviceptr vec, int n_rows, int n_cols) {
-    void *args[] = { &dst, &mat, &vec, &n_rows, &n_cols };
-    int threads = (n_cols < 256) ? ((n_cols + 31) / 32 * 32) : 256;
-    cuLaunchKernel(r->fn_matvec_bf16_f32, n_rows, 1, 1, threads, 1, 1, 0, r->stream, args, NULL);
 }
 
 /* ---- Q8_0 dp4a launch helpers ---- */
@@ -5102,42 +4594,42 @@ static inline void launch_matvec_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q2_K_f32,
-                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q3_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q3_K_f32,
-                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q4_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q4_K_f32,
-                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q5_K_f32,
-                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q6_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q6_K_f32,
-                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_iq2_xxs_f32,
-                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 #define DEFINE_LAUNCH_MATVEC(name, fn_field) \
@@ -5147,31 +4639,22 @@ static inline void launch_matvec_##name(cuda_llm_runner *r, CUdeviceptr dst, CUd
     cuLaunchKernel(r->fn_field, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL); \
 }
 
-/* Multi-warp variant: 8 warps/block, grid = ceil(n_rows/8) */
-#define DEFINE_LAUNCH_MATVEC_MW(name, fn_field) \
-static inline void launch_matvec_##name(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat, \
-                                        CUdeviceptr x, int n_rows, int n_cols) { \
-    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols }; \
-    cuLaunchKernel(r->fn_field, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL); \
-}
-
 DEFINE_LAUNCH_MATVEC(q4_0, fn_matvec_q4_0_f32)
 DEFINE_LAUNCH_MATVEC(q4_1, fn_matvec_q4_1_f32)
 DEFINE_LAUNCH_MATVEC(q5_0, fn_matvec_q5_0_f32)
 DEFINE_LAUNCH_MATVEC(q5_1, fn_matvec_q5_1_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq4_xs, fn_matvec_iq4_xs_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq2_xs, fn_matvec_iq2_xs_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq3_xxs, fn_matvec_iq3_xxs_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq2_s, fn_matvec_iq2_s_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq3_s, fn_matvec_iq3_s_f32)
+DEFINE_LAUNCH_MATVEC(iq4_nl, fn_matvec_iq4_nl_f32)
+DEFINE_LAUNCH_MATVEC(iq4_xs, fn_matvec_iq4_xs_f32)
+DEFINE_LAUNCH_MATVEC(iq2_xs, fn_matvec_iq2_xs_f32)
+DEFINE_LAUNCH_MATVEC(iq3_xxs, fn_matvec_iq3_xxs_f32)
+DEFINE_LAUNCH_MATVEC(iq2_s, fn_matvec_iq2_s_f32)
+DEFINE_LAUNCH_MATVEC(iq3_s, fn_matvec_iq3_s_f32)
 DEFINE_LAUNCH_MATVEC(iq1_s, fn_matvec_iq1_s_f32)
 DEFINE_LAUNCH_MATVEC(iq1_m, fn_matvec_iq1_m_f32)
 DEFINE_LAUNCH_MATVEC(tq1_0, fn_matvec_tq1_0_f32)
 DEFINE_LAUNCH_MATVEC(tq2_0, fn_matvec_tq2_0_f32)
 
 #undef DEFINE_LAUNCH_MATVEC
-#undef DEFINE_LAUNCH_MATVEC_MW
 
 static inline void launch_embed_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr embd_table,
                                        int token_id, int n_embd) {
@@ -5179,10 +4662,6 @@ static inline void launch_embed_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdevi
     cuLaunchKernel(r->fn_embed_q2_K,
                    (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
-
-/* Forward declaration for F32 matvec (defined later, used by auto-dispatch) */
-static inline void launch_matvec_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
-                                      CUdeviceptr x, int n_rows, int n_cols);
 
 /* Auto-dispatch matvec based on weight type */
 static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
@@ -5209,7 +4688,6 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
         case GGML_TYPE_IQ1_M:   launch_matvec_iq1_m(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_TQ1_0:   launch_matvec_tq1_0(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_TQ2_0:   launch_matvec_tq2_0(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_F32:     launch_matvec_f32(r, dst, mat, x, n_rows, n_cols); break;
         default:             launch_matvec(r, dst, mat, x, n_rows, n_cols); break;
     }
 }
@@ -5351,6 +4829,7 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (cuda_llm_bind_context(r) != 0) return NULL;
 
     int n_embd = r->n_embd;
 
@@ -5359,10 +4838,6 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
         launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
-    } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
-        void *args[] = { &r->d_x, &r->d_token_embd, &token_id, &n_embd };
-        cuLaunchKernel(r->fn_embed_q4_K,
-                       (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -5375,30 +4850,29 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
                 dbg[0],dbg[1],dbg[2],dbg[3],dbg[4],dbg[5],dbg[6],dbg[7]);
     }
 
-    /* Embedding cross-check: verify embed kernel against CPU dequant */
-    if (r->debug_layers >= 3 && (r->token_embd_type == GGML_TYPE_Q2_K || r->token_embd_type == GGML_TYPE_Q4_K)) {
+    /* Embedding cross-check: verify Q2_K embed kernel against CPU dequant */
+    if (r->debug_layers >= 3 && r->token_embd_type == GGML_TYPE_Q2_K) {
         cuStreamSynchronize(r->stream);
         float *gpu_emb = (float *)malloc(n_embd * sizeof(float));
         cuMemcpyDtoH(gpu_emb, r->d_x, n_embd * sizeof(float));
 
-        /* Download embedding weights from GPU */
+        /* Download Q2_K embedding weights from GPU */
         int nb_per_row = n_embd / 256;
-        int blk_bytes = (r->token_embd_type == GGML_TYPE_Q4_K) ? 144 : 84;
-        int row_bytes = nb_per_row * blk_bytes;
+        int row_bytes = nb_per_row * 84;
         /* Only download the one row we need */
         unsigned char *row_data = (unsigned char *)malloc(row_bytes);
         cuMemcpyDtoH(row_data, r->d_token_embd + (size_t)token_id * row_bytes, row_bytes);
 
         /* CPU dequantize this row */
         float *cpu_emb = (float *)malloc(n_embd * sizeof(float));
-        dequant_row(r->token_embd_type, row_data, cpu_emb, n_embd);
+        dequant_row(GGML_TYPE_Q2_K, row_data, cpu_emb, n_embd);
 
         float emb_max_err = 0; int emb_max_idx = 0;
         for (int i = 0; i < n_embd; i++) {
             float err = fabsf(gpu_emb[i] - cpu_emb[i]);
             if (err > emb_max_err) { emb_max_err = err; emb_max_idx = i; }
         }
-        fprintf(stderr, "  [EMB xchk] embed max_err=%.6f at idx=%d (GPU=%.6f CPU=%.6f)\n",
+        fprintf(stderr, "  [EMB xchk] Q2_K embed max_err=%.6f at idx=%d (GPU=%.6f CPU=%.6f)\n",
                 emb_max_err, emb_max_idx, gpu_emb[emb_max_idx], cpu_emb[emb_max_idx]);
         if (emb_max_err > 0.001f) {
             fprintf(stderr, "    GPU[0:4]=[%.6f,%.6f,%.6f,%.6f]\n",
@@ -5407,12 +4881,6 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
                     cpu_emb[0], cpu_emb[1], cpu_emb[2], cpu_emb[3]);
         }
         free(gpu_emb); free(cpu_emb); free(row_data);
-    }
-
-    /* Gemma4: scale token embeddings by sqrt(n_embd), stash token_id for PLE */
-    if (r->is_gemma4) {
-        launch_scale(r, r->d_x, r->embd_scale, n_embd);
-        r->current_token_id = token_id;
     }
 
     /* Run transformer blocks (shared with forward_embd) */
@@ -5432,107 +4900,6 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
 
     int n_run_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
-
-    /* Gemma4: precompute per-layer embeddings on CPU and upload to GPU.
-     * Mirrors transformer.h: combine token_embd lookup + model_proj @ x + normalize */
-    if (r->is_gemma4 && r->current_token_id >= 0 &&
-        r->h_ple_token_embd.data && r->h_ple_model_proj.data) {
-        int ple_dim = r->n_embd_per_layer;
-        int total_ple = ple_dim * r->n_layers;
-
-        /* Read current hidden state from GPU for projection */
-        float *h_x = (float *)malloc(n_embd * sizeof(float));
-        float *tok_ple = NULL;
-        float *proj_out = NULL;
-        float *ple_host = NULL;
-        if (!h_x) {
-            fprintf(stderr, "cuda_llm: Gemma4 PLE hidden buffer alloc failed (n_embd=%d)\n", n_embd);
-            return NULL;
-        }
-        CHECK_CU_NULL(cuStreamSynchronize(r->stream));
-        CHECK_CU_NULL(cuMemcpyDtoH(h_x, r->d_x, n_embd * sizeof(float)));
-
-        /* 1. Token embedding lookup */
-        tok_ple = (float *)malloc(total_ple * sizeof(float));
-        if (!tok_ple) {
-            fprintf(stderr, "cuda_llm: Gemma4 PLE token buffer alloc failed (n=%d)\n", total_ple);
-            free(h_x);
-            return NULL;
-        }
-        {
-            size_t row_bytes = dequant_row_size(r->h_ple_token_embd.type, total_ple);
-            dequant_row(r->h_ple_token_embd.type,
-                        (const uint8_t *)r->h_ple_token_embd.data + (size_t)r->current_token_id * row_bytes,
-                        tok_ple, total_ple);
-            float tok_scale = sqrtf((float)ple_dim);
-            for (int i = 0; i < total_ple; i++) tok_ple[i] *= tok_scale;
-        }
-
-        /* 2. Project hidden state: proj = per_layer_model_proj @ h_x → [total_ple] */
-        proj_out = (float *)malloc(total_ple * sizeof(float));
-        if (!proj_out) {
-            fprintf(stderr, "cuda_llm: Gemma4 PLE proj buffer alloc failed (n=%d)\n", total_ple);
-            free(tok_ple);
-            free(h_x);
-            return NULL;
-        }
-        {
-            int n_cols = r->h_ple_model_proj.n_cols;
-            size_t row_bytes = dequant_row_size(r->h_ple_model_proj.type, n_cols);
-            float *row_buf = (float *)malloc(n_cols * sizeof(float));
-            if (!row_buf) {
-                fprintf(stderr, "cuda_llm: Gemma4 PLE row buffer alloc failed (n_cols=%d)\n", n_cols);
-                free(proj_out);
-                free(tok_ple);
-                free(h_x);
-                return NULL;
-            }
-            const uint8_t *base = (const uint8_t *)r->h_ple_model_proj.data;
-            for (int rr = 0; rr < total_ple; rr++) {
-                dequant_row(r->h_ple_model_proj.type, base + (size_t)rr * row_bytes, row_buf, n_cols);
-                float dot = 0.0f;
-                for (int c = 0; c < n_cols; c++) dot += row_buf[c] * h_x[c];
-                proj_out[rr] = dot;
-            }
-            free(row_buf);
-        }
-
-        /* Scale by 1/sqrt(n_embd) */
-        float proj_scale = 1.0f / sqrtf((float)n_embd);
-        for (int i = 0; i < total_ple; i++) proj_out[i] *= proj_scale;
-
-        /* 3. RMSNorm with shared proj_norm [ple_dim] per layer slice */
-        if (r->h_ple_proj_norm.data) {
-            float norm_w[256];
-            dequant_row(r->h_ple_proj_norm.type, r->h_ple_proj_norm.data, norm_w, ple_dim);
-            for (int ll = 0; ll < r->n_layers; ll++) {
-                float *slice = proj_out + ll * ple_dim;
-                float ss = 0.0f;
-                for (int i = 0; i < ple_dim; i++) ss += slice[i] * slice[i];
-                ss = 1.0f / sqrtf(ss / ple_dim + eps);
-                for (int i = 0; i < ple_dim; i++) slice[i] = slice[i] * ss * norm_w[i];
-            }
-        }
-
-        /* 4. Combine: (proj + tok) * 1/sqrt(2) */
-        float input_scale = 1.0f / sqrtf(2.0f);
-        ple_host = (float *)malloc(total_ple * sizeof(float));
-        if (!ple_host) {
-            fprintf(stderr, "cuda_llm: Gemma4 PLE upload buffer alloc failed (n=%d)\n", total_ple);
-            free(proj_out);
-            free(tok_ple);
-            free(h_x);
-            return NULL;
-        }
-        for (int i = 0; i < total_ple; i++)
-            ple_host[i] = (proj_out[i] + tok_ple[i]) * input_scale;
-
-        /* Upload to GPU */
-        CHECK_CU_NULL(cuMemcpyHtoDAsync(r->d_ple_combined, ple_host,
-                                        total_ple * sizeof(float), r->stream));
-        free(ple_host); free(proj_out); free(tok_ple); free(h_x);
-    }
-
     for (int l = 0; l < n_run_layers; l++) {
         cuda_layer *cl = &r->layers[l];
 
@@ -5572,154 +4939,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             free(gpu_x); free(gpu_xb); free(gpu_norm_w);
         }
 
-        if (r->is_gemma4) {
-            /* === Gemma4 layer === */
-            int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
-            int layer_kv_heads = cl->n_kv_heads;
-            int local_kv_dim = layer_kv_heads * hd;
-            int local_q_dim  = n_heads * hd;
-
-            /* Q projection */
-            launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb,
-                              cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
-
-            /* K/V projections (skip if sharing KV) */
-            if (cl->shared_kv_source < 0) {
-                launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb,
-                                  cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
-                if (cl->has_v_proj) {
-                    launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb,
-                                      cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
-                } else {
-                    /* V = K for layers without V projection */
-                    cuMemcpyDtoDAsync(r->d_v, r->d_k, (size_t)local_kv_dim * sizeof(float), r->stream);
-                }
-            }
-
-            /* Q/K/V norm */
-            if (cl->has_qk_norm) {
-                if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, hd, eps);
-                if (cl->shared_kv_source < 0) {
-                    if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, layer_kv_heads, hd, eps);
-                    /* V norm: raw RMSNorm per-head (no learned weight) */
-                    {
-                        int block_dim = hd;
-                        /* Round up to power of 2 for reduction */
-                        int bd = 1; while (bd < block_dim) bd <<= 1;
-                        void *vargs[] = { &r->d_v, &layer_kv_heads, &hd, &eps };
-                        cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32,
-                                       layer_kv_heads, 1, 1, bd, 1, 1,
-                                       bd * sizeof(float), r->stream, vargs, NULL);
-                    }
-                }
-            }
-
-            /* RoPE */
-            if (cl->is_swa) {
-                /* SWA: standard RoPE with freq_base_swa and ALL dims rotated (n_rope_pairs=0) */
-                int half_swa = hd / 2;
-                int zero_pairs = 0; /* 0 = rotate all, rope_dim = head_dim */
-                void *qargs[] = { &r->d_q, &n_heads, &hd, &position, &r->rope_freq_base_swa, &zero_pairs };
-                cuLaunchKernel(r->fn_rope_neox_f32, n_heads, 1, 1, half_swa, 1, 1, 0, r->stream, qargs, NULL);
-                if (cl->shared_kv_source < 0) {
-                    void *kargs[] = { &r->d_k, &layer_kv_heads, &hd, &position, &r->rope_freq_base_swa, &zero_pairs };
-                    cuLaunchKernel(r->fn_rope_neox_f32, layer_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, kargs, NULL);
-                }
-            } else {
-                /* Full-attention: proportional RoPE with precomputed freq factors */
-                launch_rope_with_factors(r, r->d_q, n_heads, hd, position, r->d_rope_inv_freq_full);
-                if (cl->shared_kv_source < 0)
-                    launch_rope_with_factors(r, r->d_k, layer_kv_heads, hd, position, r->d_rope_inv_freq_full);
-            }
-
-            /* KV cache store (F16) */
-            if (cl->shared_kv_source < 0) {
-                if (cl->is_swa) {
-                    int slot = position % r->swa_window_size;
-                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                                   r->d_k, r->d_v, slot, local_kv_dim);
-                } else {
-                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                                   r->d_k, r->d_v, position, local_kv_dim);
-                }
-            }
-
-            /* Attention (scale=1.0 since Q/K are normalized) */
-            {
-                int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
-                float attn_scale = 1.0f;
-                if (cl->is_swa) {
-                    launch_attention_swa(r, r->d_xb2, r->d_q,
-                                        r->d_key_cache[kv_src], r->d_value_cache[kv_src],
-                                        n_heads, layer_kv_heads, hd, local_kv_dim,
-                                        position, r->swa_window_size, attn_scale);
-                } else {
-                    int seq_len = position + 1;
-                    launch_attention(r, r->d_xb2, r->d_q,
-                                   r->d_key_cache[kv_src], r->d_value_cache[kv_src],
-                                   n_heads, layer_kv_heads, hd, local_kv_dim, seq_len, attn_scale);
-                }
-            }
-
-            /* Output projection */
-            launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
-                              cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
-
-            /* Post-attention RMSNorm */
-            launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_attn_norm_w, n_embd, eps);
-
-            /* Residual: x += xb */
-            launch_add(r, r->d_x, r->d_xb, n_embd);
-
-            /* FFN with GELU */
-            launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
-            launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
-                              cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
-            launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
-                              cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
-            launch_gelu_mul(r, r->d_gate, r->d_up, n_ff);
-            launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
-                              cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
-
-            /* Post-FFN RMSNorm */
-            launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_ffw_norm_w, n_embd, eps);
-
-            /* Residual: x += xb */
-            launch_add(r, r->d_x, r->d_xb, n_embd);
-
-            /* Per-layer embedding injection */
-            if (r->d_ple_combined) {
-                int ple_dim = r->n_embd_per_layer;
-                /* Copy slice for this layer from d_ple_combined to d_ple_buf */
-                CHECK_CU_NULL(cuMemcpyDtoDAsync(r->d_ple_buf,
-                                                r->d_ple_combined + (size_t)l * ple_dim * sizeof(float),
-                                                ple_dim * sizeof(float), r->stream));
-
-                /* inp_gate: gate_out = inp_gate @ x → [ple_dim] */
-                launch_matvec_auto(r, r->d_ple_proj, cl->ple_inp_gate_w, r->d_x,
-                                  cl->ple_inp_gate_rows, cl->ple_inp_gate_cols, cl->ple_inp_gate_type);
-
-                /* GELU(gate) * ple */
-                launch_gelu_elementwise_mul(r, r->d_ple_buf, r->d_ple_proj, ple_dim);
-
-                /* Project back: proj = ple_proj @ ple → [n_embd] */
-                launch_matvec_auto(r, r->d_ple_proj, cl->ple_proj_w, r->d_ple_buf,
-                                  cl->ple_proj_rows, cl->ple_proj_cols, cl->ple_proj_type);
-
-                /* Post-norm */
-                if (cl->ple_post_norm_w)
-                    launch_rmsnorm(r, r->d_ple_proj, r->d_ple_proj, cl->ple_post_norm_w, n_embd, eps);
-
-                /* Residual add */
-                launch_add(r, r->d_x, r->d_ple_proj, n_embd);
-            }
-
-            /* Layer output scale */
-            if (cl->layer_scale_val != 1.0f) {
-                launch_scale(r, r->d_x, cl->layer_scale_val, n_embd);
-            }
-
-        } else if (r->is_hybrid && cl->is_ssm) {
+        if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
             int qkv_dim = r->ssm_qkv_dim;
             int d_state = r->ssm_d_state;
@@ -6127,14 +5347,11 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
                 cuMemcpyDtoH(gpu_k, r->d_k, kv_dim * sizeof(float));
                 cuMemcpyDtoH(gpu_gate, r->d_attn_gate, q_dim_total * sizeof(float));
 
-                /* Read V from KV cache at position 0 to verify it was stored correctly (F16 cache) */
-                uint16_t *cache_v_f16 = (uint16_t *)malloc(kv_dim * sizeof(uint16_t));
+                /* Read V from KV cache at position 0 to verify it was stored correctly */
                 float *cache_v = (float *)malloc(kv_dim * sizeof(float));
-                cuMemcpyDtoH(cache_v_f16, r->d_value_cache[l], kv_dim * sizeof(uint16_t));
-                for (int i = 0; i < kv_dim; i++) cache_v[i] = ggml_fp16_to_fp32(cache_v_f16[i]);
-                free(cache_v_f16);
+                cuMemcpyDtoH(cache_v, r->d_value_cache[l], kv_dim * sizeof(float));
 
-                /* Check V was stored correctly in cache (F16 precision) */
+                /* Check V was stored correctly in cache */
                 float v_cache_err = 0;
                 for (int i = 0; i < kv_dim; i++) {
                     float err = fabsf(gpu_v[i] - cache_v[i]);
@@ -6206,8 +5423,11 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             /* === Standard attention (non-hybrid) === */
             /* Q/K/V projections (auto-dispatch) */
             launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+            if (cl->attn_q_bias) launch_add(r, r->d_q, cl->attn_q_bias, cl->attn_q_rows);
             launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+            if (cl->attn_k_bias) launch_add(r, r->d_k, cl->attn_k_bias, cl->attn_k_rows);
             launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            if (cl->attn_v_bias) launch_add(r, r->d_v, cl->attn_v_bias, cl->attn_v_rows);
 
             /* QK-Norm (if present) */
             if (cl->has_qk_norm) {
@@ -6234,9 +5454,6 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
         }
-
-        /* Gemma4 already did its own residual + FFN above — skip shared code */
-        if (r->is_gemma4) goto cuda_layer_done;
 
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
@@ -6546,13 +5763,19 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
         /* Residual: x += xb */
         launch_add(r, r->d_x, r->d_xb, n_embd);
 
-        cuda_layer_done:
-
         /* DeepStack injection: add deepstack slice after each early layer */
         if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
             const float *ds_slice = r->_ds_embd + (1 + l) * n_embd;
             cuMemcpyHtoDAsync(r->d_ds_tmp, (const void *)ds_slice, n_embd * sizeof(float), r->stream);
             launch_add(r, r->d_x, r->d_ds_tmp, n_embd);
+        }
+
+        for (int si = 0; si < r->n_hidden_snapshots; si++) {
+            if (r->hidden_snapshot_layers[si] == l) {
+                CUdeviceptr dst = r->d_hidden_snapshots + (size_t)si * n_embd * sizeof(float);
+                cuMemcpyDtoDAsync(dst, r->d_x,
+                                  (size_t)n_embd * sizeof(float), r->stream);
+            }
         }
 
         /* Debug: print hidden state norm after each layer */
@@ -6599,11 +5822,6 @@ float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int positio
     launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
                        r->n_vocab, r->n_embd, r->output_w_type);
 
-    /* Gemma4: logit soft-capping */
-    if (r->is_gemma4 && r->final_logit_softcapping > 0.0f) {
-        launch_logit_softcap(r, r->d_logits, r->n_vocab, r->final_logit_softcapping);
-    }
-
     /* Copy logits to host */
     cuMemcpyDtoHAsync(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float), r->stream);
     cuStreamSynchronize(r->stream);
@@ -6618,14 +5836,12 @@ float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int positio
 float *cuda_llm_forward_embd(cuda_llm_runner *r, const float *embd, int embd_stride, int position) {
     if (!r || !r->weights_loaded || !embd) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (cuda_llm_bind_context(r) != 0) return NULL;
 
     int n_embd = r->n_embd;
 
-    /* Upload F32 embedding to d_x (first n_embd floats) — no scaling for vision tokens */
+    /* Upload F32 embedding to d_x (first n_embd floats) */
     cuMemcpyHtoDAsync(r->d_x, (const void *)embd, n_embd * sizeof(float), r->stream);
-
-    /* Gemma4: use pad token (ID=0) for per-layer embeddings on vision tokens */
-    if (r->is_gemma4) r->current_token_id = 0;
 
     /* Set deepstack state for the forward loop */
     r->_ds_embd = embd;
@@ -6659,7 +5875,46 @@ float *cuda_llm_forward_embd_logits(cuda_llm_runner *r, const float *embd, int e
 /* Read last hidden state (d_x) from GPU */
 int cuda_llm_read_hidden(const cuda_llm_runner *r, float *dst, int n) {
     if (!r || !dst || n <= 0) return -1;
-    CUresult err = cuMemcpyDtoH(dst, r->d_x, (size_t)n * sizeof(float));
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    err = cuMemcpyDtoH(dst, r->d_x, (size_t)n * sizeof(float));
+    return (err == CUDA_SUCCESS) ? 0 : -1;
+}
+
+int cuda_llm_set_hidden_snapshot_layers(cuda_llm_runner *r, const int *layers, int n_slots) {
+    if (!r) return -1;
+    if (n_slots < 0 || n_slots > 3) return -1;
+    r->n_hidden_snapshots = 0;
+    for (int i = 0; i < 3; i++) r->hidden_snapshot_layers[i] = -1;
+    for (int i = 0; i < n_slots; i++) {
+        int layer = layers ? layers[i] : -1;
+        if (layer < 0 || layer >= r->n_layers) return -1;
+        r->hidden_snapshot_layers[i] = layer;
+        r->n_hidden_snapshots++;
+    }
+    return 0;
+}
+
+int cuda_llm_read_hidden_snapshot(const cuda_llm_runner *r, int slot, float *dst, int n) {
+    if (!r || !dst || n <= 0) return -1;
+    if (slot < 0 || slot >= r->n_hidden_snapshots) return -1;
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    CUdeviceptr src = r->d_hidden_snapshots + (size_t)slot * n * sizeof(float);
+    err = cuMemcpyDtoH(dst, src, (size_t)n * sizeof(float));
+    return (err == CUDA_SUCCESS) ? 0 : -1;
+}
+
+int cuda_llm_read_hidden_snapshots(const cuda_llm_runner *r, float *dst, int n_slots, int n) {
+    if (!r || !dst || n <= 0) return -1;
+    if (n_slots < 0 || n_slots > r->n_hidden_snapshots) return -1;
+    if (n_slots == 0) return 0;
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    err = cuMemcpyDtoH(dst, r->d_hidden_snapshots, (size_t)n_slots * n * sizeof(float));
     return (err == CUDA_SUCCESS) ? 0 : -1;
 }
 
@@ -6669,752 +5924,6 @@ void cuda_llm_set_debug(cuda_llm_runner *r, int debug_layers) {
 
 void cuda_llm_set_max_layers(cuda_llm_runner *r, int max_layers) {
     if (r) r->max_layers = max_layers;
-}
-
-/* ======================================================================== */
-/* GPU Vision Encoder                                                       */
-/* ======================================================================== */
-
-/* ======================================================================== */
-/* Batched Prefill                                                          */
-/* ======================================================================== */
-
-/* Helper: launch batched matvec for a given weight type */
-static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
-                                 CUdeviceptr input, int out_dim, int in_dim,
-                                 int n_tokens, int weight_type) {
-    if (weight_type == GGML_TYPE_Q2_K) {
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_batch_matvec_q2_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
-    } else if (weight_type == GGML_TYPE_Q3_K) {
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_batch_matvec_q3_K, (out_dim+7)/8, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
-    } else if (weight_type == GGML_TYPE_F16) {
-        void *a[] = { &dst, &mat, &input, &out_dim, &in_dim, &n_tokens };
-        cuLaunchKernel(r->fn_vision_linear_f16, out_dim, n_tokens, 1, 256, 1, 1, 0, r->stream, a, NULL);
-    } else {
-        /* Fallback: sequential per-token matvec */
-        for (int t = 0; t < n_tokens; t++) {
-            CUdeviceptr in_t = input + (size_t)t * in_dim * sizeof(float);
-            CUdeviceptr out_t = dst + (size_t)t * out_dim * sizeof(float);
-            launch_matvec_auto(r, out_t, mat, in_t, out_dim, in_dim, weight_type);
-        }
-    }
-}
-
-float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
-                         const float *embeddings, int embd_stride,
-                         int n_tokens, int start_pos) {
-    if (!r || n_tokens <= 0) return NULL;
-
-    /* Fall back to sequential for models with PLE (needs GPU PLE precomputation) */
-    if (r->n_embd_per_layer > 0 && r->d_ple_combined) {
-        float *result = NULL;
-        for (int t = 0; t < n_tokens; t++) {
-            if (token_ids)
-                result = cuda_llm_forward(r, token_ids[t], start_pos + t);
-            else if (embeddings)
-                result = cuda_llm_forward_embd(r, embeddings + t * embd_stride, embd_stride, start_pos + t);
-        }
-        return result;
-    }
-
-    int n_embd = r->n_embd;
-    int n_heads = r->n_heads;
-    int n_ff = r->n_ff;
-    float eps = r->rms_norm_eps;
-
-    /* Allocate batch buffers */
-    size_t batch_embd = (size_t)n_tokens * n_embd * sizeof(float);
-    int max_kv_dim = r->n_kv_heads * r->head_dim;
-    if (r->is_gemma4) {
-        int kv1 = r->n_kv_heads * r->head_dim_full;
-        int kv2 = r->n_kv_heads * r->head_dim_swa;
-        max_kv_dim = kv1 > kv2 ? kv1 : kv2;
-    }
-    int max_q_dim = n_heads * r->head_dim;
-    if (r->is_gemma4) {
-        int q1 = n_heads * r->head_dim_full;
-        int q2 = n_heads * r->head_dim_swa;
-        max_q_dim = q1 > q2 ? q1 : q2;
-    }
-
-    CUdeviceptr d_batch_x, d_batch_xb, d_batch_q, d_batch_k, d_batch_v;
-    CUdeviceptr d_batch_xb2, d_batch_gate, d_batch_up;
-    cuMemAlloc(&d_batch_x, batch_embd);
-    cuMemAlloc(&d_batch_xb, batch_embd);
-    cuMemAlloc(&d_batch_q, (size_t)n_tokens * max_q_dim * sizeof(float));
-    cuMemAlloc(&d_batch_k, (size_t)n_tokens * max_kv_dim * sizeof(float));
-    cuMemAlloc(&d_batch_v, (size_t)n_tokens * max_kv_dim * sizeof(float));
-    cuMemAlloc(&d_batch_xb2, (size_t)n_tokens * max_q_dim * sizeof(float));
-    cuMemAlloc(&d_batch_gate, (size_t)n_tokens * n_ff * sizeof(float));
-    cuMemAlloc(&d_batch_up, (size_t)n_tokens * n_ff * sizeof(float));
-
-    /* Upload token embeddings */
-    if (token_ids) {
-        /* Token ID path: use single-token forward for embedding, read back from GPU */
-        float *h_embd = (float *)malloc(batch_embd);
-        for (int t = 0; t < n_tokens; t++) {
-            /* Use the existing embed kernel (handles Q8_0 padding, Q4_K, etc.) */
-            if (r->token_embd_type == GGML_TYPE_Q8_0) {
-                launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
-            } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
-                launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
-            } else if (r->token_embd_type == GGML_TYPE_Q4_K) {
-                void *ea[] = { &r->d_x, &r->d_token_embd, &token_ids[t], &n_embd };
-                cuLaunchKernel(r->fn_embed_q4_K, (n_embd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, ea, NULL);
-            } else {
-                launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
-            }
-            if (r->is_gemma4) launch_scale(r, r->d_x, r->embd_scale, n_embd);
-            cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x, n_embd * sizeof(float), r->stream);
-        }
-        cuStreamSynchronize(r->stream);
-        cuMemcpyHtoD(d_batch_x, h_embd, batch_embd);
-        free(h_embd);
-    } else if (embeddings) {
-        /* Pre-computed embeddings path */
-        if (embd_stride == n_embd) {
-            cuMemcpyHtoD(d_batch_x, embeddings, batch_embd);
-        } else {
-            for (int t = 0; t < n_tokens; t++)
-                cuMemcpyHtoDAsync(d_batch_x + (size_t)t * n_embd * sizeof(float),
-                                   embeddings + t * embd_stride,
-                                   n_embd * sizeof(float), r->stream);
-        }
-        /* Gemma4: scale embeddings only for token inputs, not vision embeddings */
-    } else {
-        return NULL;
-    }
-
-    /* Gemma4: stash token_id for PLE (use last token) */
-    if (r->is_gemma4 && token_ids)
-        r->current_token_id = token_ids[n_tokens - 1];
-
-    int n_layers = r->n_layers;
-    if (r->max_layers > 0 && r->max_layers < n_layers) n_layers = r->max_layers;
-
-    /* Process transformer blocks */
-    for (int l = 0; l < n_layers; l++) {
-        cuda_layer *cl = &r->layers[l];
-        if (cl->is_ssm) {
-            /* SSM layers: fall back to per-token processing */
-            for (int t = 0; t < n_tokens; t++) {
-                cuMemcpyDtoDAsync(r->d_x, d_batch_x + (size_t)t * n_embd * sizeof(float),
-                                   n_embd * sizeof(float), r->stream);
-                /* TODO: SSM forward for this token */
-                cuMemcpyDtoDAsync(d_batch_x + (size_t)t * n_embd * sizeof(float),
-                                   r->d_x, n_embd * sizeof(float), r->stream);
-            }
-            continue;
-        }
-
-        if (!r->is_gemma4) continue; /* Only Gemma4 batched prefill implemented */
-
-        int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
-        int layer_kv_heads = cl->n_kv_heads;
-        int local_kv_dim = layer_kv_heads * hd;
-        int local_q_dim = n_heads * hd;
-
-        /* 1. Pre-attention RMSNorm: batch_xb = rmsnorm(batch_x) */
-        cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd, r->stream);
-        { void *a[] = { &d_batch_xb, &cl->attn_norm_w, &n_embd, &eps, &n_tokens };
-          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* 2. Q/K/V projections (batched) */
-        launch_batch_matvec(r, d_batch_q, cl->attn_q_w, d_batch_xb,
-                            cl->attn_q_rows, cl->attn_q_cols, n_tokens, cl->attn_q_type);
-        if (cl->shared_kv_source < 0) {
-            launch_batch_matvec(r, d_batch_k, cl->attn_k_w, d_batch_xb,
-                                cl->attn_k_rows, cl->attn_k_cols, n_tokens, cl->attn_k_type);
-            if (cl->has_v_proj) {
-                launch_batch_matvec(r, d_batch_v, cl->attn_v_w, d_batch_xb,
-                                    cl->attn_v_rows, cl->attn_v_cols, n_tokens, cl->attn_v_type);
-            } else {
-                cuMemcpyDtoDAsync(d_batch_v, d_batch_k, (size_t)n_tokens * local_kv_dim * sizeof(float), r->stream);
-            }
-        }
-
-        /* 3. Per-token Q/K norm + RoPE + KV store + attention (sequential per token) */
-        for (int t = 0; t < n_tokens; t++) {
-            int pos = start_pos + t;
-            CUdeviceptr q_t = d_batch_q + (size_t)t * local_q_dim * sizeof(float);
-            CUdeviceptr k_t = d_batch_k + (size_t)t * local_kv_dim * sizeof(float);
-            CUdeviceptr v_t = d_batch_v + (size_t)t * local_kv_dim * sizeof(float);
-            CUdeviceptr xb2_t = d_batch_xb2 + (size_t)t * local_q_dim * sizeof(float);
-
-            /* Q/K norm */
-            if (cl->has_qk_norm) {
-                if (cl->attn_q_norm_w) launch_qknorm(r, q_t, cl->attn_q_norm_w, n_heads, hd, eps);
-                if (cl->shared_kv_source < 0) {
-                    if (cl->attn_k_norm_w) launch_qknorm(r, k_t, cl->attn_k_norm_w, layer_kv_heads, hd, eps);
-                    int bd = 1; while (bd < hd) bd <<= 1;
-                    void *va[] = { &v_t, &layer_kv_heads, &hd, &eps };
-                    cuLaunchKernel(r->fn_raw_rmsnorm_heads_f32, layer_kv_heads, 1, 1, bd, 1, 1, bd*sizeof(float), r->stream, va, NULL);
-                }
-            }
-
-            /* RoPE */
-            if (cl->is_swa) {
-                int half_swa = hd / 2, zero = 0;
-                void *qa[] = { &q_t, &n_heads, &hd, &pos, &r->rope_freq_base_swa, &zero };
-                cuLaunchKernel(r->fn_rope_neox_f32, n_heads, 1, 1, half_swa, 1, 1, 0, r->stream, qa, NULL);
-                if (cl->shared_kv_source < 0) {
-                    void *ka[] = { &k_t, &layer_kv_heads, &hd, &pos, &r->rope_freq_base_swa, &zero };
-                    cuLaunchKernel(r->fn_rope_neox_f32, layer_kv_heads, 1, 1, half_swa, 1, 1, 0, r->stream, ka, NULL);
-                }
-            } else {
-                launch_rope_with_factors(r, q_t, n_heads, hd, pos, r->d_rope_inv_freq_full);
-                if (cl->shared_kv_source < 0)
-                    launch_rope_with_factors(r, k_t, layer_kv_heads, hd, pos, r->d_rope_inv_freq_full);
-            }
-
-            /* KV store */
-            if (cl->shared_kv_source < 0) {
-                if (cl->is_swa) {
-                    int slot = pos % r->swa_window_size;
-                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, slot, local_kv_dim);
-                } else {
-                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l], k_t, v_t, pos, local_kv_dim);
-                }
-            }
-
-            /* Attention */
-            int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
-            float attn_scale = 1.0f;
-            if (cl->is_swa) {
-                launch_attention_swa(r, xb2_t, q_t,
-                                    r->d_key_cache[kv_src], r->d_value_cache[kv_src],
-                                    n_heads, layer_kv_heads, hd, local_kv_dim,
-                                    pos, r->swa_window_size, attn_scale);
-            } else {
-                int seq_len = pos + 1;
-                launch_attention(r, xb2_t, q_t,
-                               r->d_key_cache[kv_src], r->d_value_cache[kv_src],
-                               n_heads, layer_kv_heads, hd, local_kv_dim, seq_len, attn_scale);
-            }
-        }
-
-        /* 4. Batched output projection */
-        launch_batch_matvec(r, d_batch_xb, cl->attn_output_w, d_batch_xb2,
-                            cl->attn_output_rows, cl->attn_output_cols, n_tokens, cl->attn_output_type);
-
-        /* 5. Batched post-attention norm */
-        { void *a[] = { &d_batch_xb, &cl->post_attn_norm_w, &n_embd, &eps, &n_tokens };
-          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* 6. Residual: batch_x += batch_xb */
-        { int total = n_tokens * n_embd;
-          void *a[] = { &d_batch_x, &d_batch_xb, &total };
-          cuLaunchKernel(r->fn_vision_add, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* 7. Batched FFN */
-        cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd, r->stream);
-        { void *a[] = { &d_batch_xb, &cl->ffn_norm_w, &n_embd, &eps, &n_tokens };
-          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        launch_batch_matvec(r, d_batch_gate, cl->ffn_gate_w, d_batch_xb,
-                            cl->ffn_gate_rows, cl->ffn_gate_cols, n_tokens, cl->ffn_gate_type);
-        launch_batch_matvec(r, d_batch_up, cl->ffn_up_w, d_batch_xb,
-                            cl->ffn_up_rows, cl->ffn_up_cols, n_tokens, cl->ffn_up_type);
-
-        { int total = n_tokens * n_ff;
-          void *a[] = { &d_batch_gate, &d_batch_up, &total };
-          cuLaunchKernel(r->fn_gelu_mul_f32, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        launch_batch_matvec(r, d_batch_xb, cl->ffn_down_w, d_batch_gate,
-                            cl->ffn_down_rows, cl->ffn_down_cols, n_tokens, cl->ffn_down_type);
-
-        /* Post-FFN norm */
-        { void *a[] = { &d_batch_xb, &cl->post_ffw_norm_w, &n_embd, &eps, &n_tokens };
-          cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Residual: batch_x += batch_xb */
-        { int total = n_tokens * n_embd;
-          void *a[] = { &d_batch_x, &d_batch_xb, &total };
-          cuLaunchKernel(r->fn_vision_add, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Per-layer embedding injection — skip in batched mode, fall back to sequential for PLE models */
-        if (0 && r->d_ple_combined && r->n_embd_per_layer > 0) {
-            int ple_dim = r->n_embd_per_layer;
-            for (int t = 0; t < n_tokens; t++) {
-                CUdeviceptr x_t = d_batch_x + (size_t)t * n_embd * sizeof(float);
-                /* Need per-token PLE combined for this token */
-                /* For now, precompute PLE for this token using r->d_x as scratch */
-                /* Copy token hidden state to d_x */
-                cuMemcpyDtoDAsync(r->d_x, x_t, n_embd * sizeof(float), r->stream);
-
-                /* PLE combined must have been precomputed for each token.
-                   Since we can't easily batch-precompute PLE for all tokens,
-                   we need to do it here per token per layer. This is the PLE slice for layer l. */
-                /* For token_ids path: PLE uses token_id to look up per_layer_token_embd */
-                /* For embedding path: PLE uses pad token (0) */
-                int tok_id = (token_ids && t < n_tokens) ? token_ids[t] : 0;
-
-                /* Precompute PLE for this token at this layer */
-                float *h_ple = (float *)alloca(ple_dim * sizeof(float));
-                /* tok_ple = per_layer_token_embd[tok_id][l*ple_dim .. (l+1)*ple_dim-1] */
-                {
-                    size_t row_bytes = dequant_row_size(r->h_ple_token_embd.type, r->h_ple_token_embd.n_cols);
-                    const unsigned char *row = (const unsigned char *)r->h_ple_token_embd.data + (size_t)tok_id * row_bytes;
-                    float *full_ple = (float *)alloca(r->h_ple_token_embd.n_cols * sizeof(float));
-                    dequant_row(r->h_ple_token_embd.type, row, full_ple, r->h_ple_token_embd.n_cols);
-                    memcpy(h_ple, full_ple + l * ple_dim, ple_dim * sizeof(float));
-                }
-                /* model_proj @ x for this layer slice */
-                {
-                    float h_x[8192]; /* n_embd max */
-                    cuStreamSynchronize(r->stream);
-                    cuMemcpyDtoH(h_x, r->d_x, n_embd * sizeof(float));
-                    size_t proj_row_bytes = dequant_row_size(r->h_ple_model_proj.type, r->h_ple_model_proj.n_cols);
-                    float *proj_row = (float *)alloca(n_embd * sizeof(float));
-                    for (int p = 0; p < ple_dim; p++) {
-                        const unsigned char *prow = (const unsigned char *)r->h_ple_model_proj.data
-                            + (size_t)(l * ple_dim + p) * proj_row_bytes;
-                        float *pdata = (float *)alloca(n_embd * sizeof(float));
-                        dequant_row(r->h_ple_model_proj.type, prow, pdata, n_embd);
-                        float dot = 0;
-                        for (int i = 0; i < n_embd; i++) dot += pdata[i] * h_x[i];
-                        h_ple[p] += dot;
-                    }
-                }
-                /* Normalize */
-                if (r->h_ple_proj_norm.data) {
-                    float *nw = (float *)alloca(ple_dim * n_layers * sizeof(float));
-                    dequant_row(r->h_ple_proj_norm.type, r->h_ple_proj_norm.data, nw, ple_dim * n_layers);
-                    for (int p = 0; p < ple_dim; p++) h_ple[p] *= nw[l * ple_dim + p];
-                }
-                cuMemcpyHtoD(r->d_ple_buf, h_ple, ple_dim * sizeof(float));
-
-                /* GPU: inp_gate @ x */
-                launch_matvec_auto(r, r->d_ple_proj, cl->ple_inp_gate_w, r->d_x,
-                                  cl->ple_inp_gate_rows, cl->ple_inp_gate_cols, cl->ple_inp_gate_type);
-                /* GELU(gate) * ple */
-                launch_gelu_elementwise_mul(r, r->d_ple_buf, r->d_ple_proj, ple_dim);
-                /* proj @ ple → [n_embd] */
-                launch_matvec_auto(r, r->d_ple_proj, cl->ple_proj_w, r->d_ple_buf,
-                                  cl->ple_proj_rows, cl->ple_proj_cols, cl->ple_proj_type);
-                /* Post-norm */
-                if (cl->ple_post_norm_w)
-                    launch_rmsnorm(r, r->d_ple_proj, r->d_ple_proj, cl->ple_post_norm_w, n_embd, eps);
-                /* Add to batch token */
-                launch_add(r, x_t, r->d_ple_proj, n_embd);
-            }
-        }
-
-        /* Layer output scaling */
-        if (cl->layer_scale_val != 1.0f) {
-            float sv = cl->layer_scale_val;
-            int total = n_tokens * n_embd;
-            void *a[] = { &d_batch_x, &sv, &total };
-            cuLaunchKernel(r->fn_vision_scale, (total+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
-        }
-    }
-
-    /* Final RMSNorm on last token */
-    CUdeviceptr d_last = d_batch_x + (size_t)(n_tokens - 1) * n_embd * sizeof(float);
-    cuMemcpyDtoDAsync(r->d_x, d_last, n_embd * sizeof(float), r->stream);
-    launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, n_embd, eps);
-
-    /* Sync and copy to host */
-    cuStreamSynchronize(r->stream);
-    float *result = r->h_output;
-    cuMemcpyDtoH(result, r->d_x, n_embd * sizeof(float));
-
-    /* Free batch buffers */
-    cuMemFree(d_batch_x); cuMemFree(d_batch_xb);
-    cuMemFree(d_batch_q); cuMemFree(d_batch_k); cuMemFree(d_batch_v);
-    cuMemFree(d_batch_xb2); cuMemFree(d_batch_gate); cuMemFree(d_batch_up);
-
-    return result;
-}
-
-float *cuda_llm_prefill_logits(cuda_llm_runner *r, const int32_t *token_ids,
-                                const float *embeddings, int embd_stride,
-                                int n_tokens, int start_pos) {
-    float *hidden = cuda_llm_prefill(r, token_ids, embeddings, embd_stride, n_tokens, start_pos);
-    if (!hidden) return NULL;
-
-    /* Run lm_head on the last token's hidden state (already in r->d_x) */
-    launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
-                       r->n_vocab, r->n_embd, r->output_w_type);
-
-    /* Logit softcapping (Gemma4) */
-    if (r->is_gemma4 && r->final_logit_softcapping > 0) {
-        void *a[] = { &r->d_logits, &r->n_vocab, &r->final_logit_softcapping };
-        cuLaunchKernel(r->fn_logit_softcap_f32, (r->n_vocab+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
-    }
-
-    cuStreamSynchronize(r->stream);
-    cuMemcpyDtoH(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float));
-    return r->h_output;
-}
-
-/* ======================================================================== */
-/* GPU Vision Encoder                                                       */
-/* ======================================================================== */
-
-/* Helper: upload F16 weight tensor to GPU. Dequant non-F16 types to F16. */
-static CUdeviceptr vis_upload_f16(const qtensor *t) {
-    if (!t->data) return 0;
-    int n = t->n_rows * t->n_cols;
-    size_t nbytes = (size_t)n * sizeof(uint16_t);
-
-    if (t->type == GGML_TYPE_F16) {
-        CUdeviceptr d; cuMemAlloc(&d, nbytes);
-        cuMemcpyHtoD(d, t->data, nbytes);
-        return d;
-    }
-    /* Dequant to F32, then F32→F16 */
-    float *f32 = (float *)malloc((size_t)n * sizeof(float));
-    dequant_row(t->type, t->data, f32, n);
-    uint16_t *f16 = (uint16_t *)malloc(nbytes);
-    for (int i = 0; i < n; i++) f16[i] = cllm_f32_to_f16(f32[i]);
-    free(f32);
-    CUdeviceptr d; cuMemAlloc(&d, nbytes);
-    cuMemcpyHtoD(d, f16, nbytes);
-    free(f16);
-    return d;
-}
-
-/* Helper: upload F32 norm weight to GPU as F16 */
-static CUdeviceptr vis_upload_norm_f16(const qtensor *t, int n) {
-    if (!t->data) return 0;
-    float *f32 = (float *)malloc((size_t)n * sizeof(float));
-    dequant_row(t->type, t->data, f32, n);
-    uint16_t *f16 = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
-    for (int i = 0; i < n; i++) f16[i] = cllm_f32_to_f16(f32[i]);
-    free(f32);
-    CUdeviceptr d; cuMemAlloc(&d, (size_t)n * sizeof(uint16_t));
-    cuMemcpyHtoD(d, f16, (size_t)n * sizeof(uint16_t));
-    free(f16);
-    return d;
-}
-
-/* Per-block GPU weights */
-typedef struct {
-    CUdeviceptr qw, kw, vw, outw;  /* [dim, dim] F16 */
-    CUdeviceptr q_norm, k_norm;     /* [head_dim] F16 */
-    CUdeviceptr attn_post_norm;     /* [dim] F16 */
-    CUdeviceptr gate_w, up_w, down_w; /* FFN F16 */
-    CUdeviceptr ffn_post_norm;      /* [dim] F16 */
-    CUdeviceptr ln1_w, ln2_w;       /* [dim] F16 */
-} vis_gpu_block;
-
-float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
-                               const uint8_t *image, int image_w, int image_h,
-                               int *out_tokens, int *out_dim) {
-    /* Load vision model config from GGUF */
-    int dim = 768, n_heads = 12, ffn_dim = 3072, n_blocks = 16;
-    int patch_size = 16, image_size = 224, proj_dim = 2560, spatial_merge = 3;
-    float ln_eps = 1e-6f;
-    {
-        int idx;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.embedding_length");
-        if (idx >= 0) dim = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.attention.head_count");
-        if (idx >= 0) n_heads = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.feed_forward_length");
-        if (idx >= 0) ffn_dim = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.block_count");
-        if (idx >= 0) n_blocks = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.patch_size");
-        if (idx >= 0) patch_size = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.image_size");
-        if (idx >= 0) image_size = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.projection_dim");
-        if (idx >= 0) proj_dim = mmproj_gguf->kv[idx].value.u32;
-        idx = gguf_find_key(mmproj_gguf, "clip.vision.attention.layer_norm_epsilon");
-        if (idx >= 0) ln_eps = mmproj_gguf->kv[idx].value.f32;
-    }
-    int head_dim = dim / n_heads;
-    int ph = image_size / patch_size, pw = ph;
-    int n_patches = ph * pw;
-    int n_merged = (ph / spatial_merge) * (pw / spatial_merge);
-
-    if (r->verbose >= 1)
-        fprintf(stderr, "cuda_vision: dim=%d heads=%d blocks=%d patches=%d merged=%d proj=%d\n",
-                dim, n_heads, n_blocks, n_patches, n_merged, proj_dim);
-
-    /* --- 1. Patch embedding on CPU (fast, ~2% of total) --- */
-    qtensor patch_embd_w = cllm_load_tensor(mmproj_gguf, "v.patch_embd.weight", 1);
-    float *patches = (float *)calloc((size_t)n_patches * dim, sizeof(float));
-    {
-        /* Normalize image and extract patches */
-        int ps = patch_size;
-        float *filters = (float *)malloc((size_t)dim * ps * ps * 3 * sizeof(float));
-        dequant_row(patch_embd_w.type, patch_embd_w.data, filters, dim * ps * ps * 3);
-        int filter_size = ps * ps * 3;
-
-        for (int py = 0; py < ph; py++) {
-            for (int px = 0; px < pw; px++) {
-                /* Extract and normalize patch in CHW format (channel-first) */
-                float patch_buf[16*16*3]; /* max patch_size=16 */
-                for (int c = 0; c < 3; c++) {
-                    for (int dy = 0; dy < ps; dy++) {
-                        for (int dx = 0; dx < ps; dx++) {
-                            int iy = py * ps + dy, ix = px * ps + dx;
-                            uint8_t val = image[(iy * image_w + ix) * 3 + c];
-                            patch_buf[c * ps * ps + dy * ps + dx] = val / 255.0f * 2.0f - 1.0f;
-                        }
-                    }
-                }
-                /* Dot product with each filter */
-                float *out = patches + (py * pw + px) * dim;
-                for (int f = 0; f < dim; f++) {
-                    float sum = 0;
-                    const float *fw = filters + f * filter_size;
-                    for (int k = 0; k < filter_size; k++) sum += fw[k] * patch_buf[k];
-                    out[f] = sum;
-                }
-            }
-        }
-        free(filters);
-    }
-
-    /* --- 2. Upload patches + position embedding to GPU --- */
-    CUdeviceptr d_tokens;
-    cuMemAlloc(&d_tokens, (size_t)n_patches * dim * sizeof(float));
-    cuMemcpyHtoD(d_tokens, patches, (size_t)n_patches * dim * sizeof(float));
-    free(patches);
-
-    /* Position embedding: add X and Y components */
-    qtensor pos_embd = cllm_load_tensor(mmproj_gguf, "v.position_embd.weight", 1);
-    int n_pos = (int)pos_embd.dims[1];
-    CUdeviceptr d_pos_embd = vis_upload_f16(&pos_embd);
-
-    /* Build position index arrays on host, upload */
-    int *pos_x = (int *)malloc(n_patches * sizeof(int));
-    int *pos_y = (int *)malloc(n_patches * sizeof(int));
-    for (int y = 0; y < ph; y++)
-        for (int x = 0; x < pw; x++) {
-            pos_x[y * pw + x] = x;
-            pos_y[y * pw + x] = y;
-        }
-    CUdeviceptr d_pos_x, d_pos_y;
-    cuMemAlloc(&d_pos_x, n_patches * sizeof(int));
-    cuMemAlloc(&d_pos_y, n_patches * sizeof(int));
-    cuMemcpyHtoD(d_pos_x, pos_x, n_patches * sizeof(int));
-    cuMemcpyHtoD(d_pos_y, pos_y, n_patches * sizeof(int));
-
-    /* Add X position embeddings (first plane) */
-    {
-        void *args[] = { &d_tokens, &d_pos_embd, &d_pos_x, &dim, &n_patches };
-        cuLaunchKernel(r->fn_vision_add_pos_embd, n_patches, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-    }
-    /* Add Y position embeddings (second plane, offset by n_pos*dim) */
-    {
-        CUdeviceptr d_pos_y_table = d_pos_embd + (size_t)n_pos * dim * sizeof(uint16_t);
-        void *args[] = { &d_tokens, &d_pos_y_table, &d_pos_y, &dim, &n_patches };
-        cuLaunchKernel(r->fn_vision_add_pos_embd, n_patches, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
-    }
-
-    /* --- 3. Upload per-block weights --- */
-    vis_gpu_block *gblocks = (vis_gpu_block *)calloc(n_blocks, sizeof(vis_gpu_block));
-    for (int b = 0; b < n_blocks; b++) {
-        char name[128];
-        qtensor t;
-        #define VIS_LOAD(field, suffix) \
-            snprintf(name, sizeof(name), "v.blk.%d." suffix ".weight", b); \
-            t = cllm_load_tensor(mmproj_gguf, name, 1); \
-            gblocks[b].field = vis_upload_f16(&t);
-        #define VIS_LOAD_NORM(field, suffix, sz) \
-            snprintf(name, sizeof(name), "v.blk.%d." suffix ".weight", b); \
-            t = cllm_load_tensor(mmproj_gguf, name, 1); \
-            gblocks[b].field = vis_upload_norm_f16(&t, sz);
-
-        VIS_LOAD(qw, "attn_q")
-        VIS_LOAD(kw, "attn_k")
-        VIS_LOAD(vw, "attn_v")
-        VIS_LOAD(outw, "attn_out")
-        VIS_LOAD_NORM(q_norm, "attn_q_norm", head_dim)
-        VIS_LOAD_NORM(k_norm, "attn_k_norm", head_dim)
-        VIS_LOAD_NORM(attn_post_norm, "attn_post_norm", dim)
-        VIS_LOAD(gate_w, "ffn_gate")
-        VIS_LOAD(up_w, "ffn_up")
-        VIS_LOAD(down_w, "ffn_down")
-        VIS_LOAD_NORM(ffn_post_norm, "ffn_post_norm", dim)
-        VIS_LOAD_NORM(ln1_w, "ln1", dim)
-        VIS_LOAD_NORM(ln2_w, "ln2", dim)
-        #undef VIS_LOAD
-        #undef VIS_LOAD_NORM
-    }
-
-    /* Upload projection weight */
-    qtensor mm_proj_w = cllm_load_tensor(mmproj_gguf, "mm.input_projection.weight", 1);
-    CUdeviceptr d_proj_w = vis_upload_f16(&mm_proj_w);
-
-    /* Allocate work buffers */
-    CUdeviceptr d_qkv, d_out, d_ffn_gate, d_ffn_up;
-    size_t tok_buf = (size_t)n_patches * dim * sizeof(float);
-    cuMemAlloc(&d_qkv, tok_buf * 3);  /* Q, K, V concatenated */
-    cuMemAlloc(&d_out, tok_buf);
-    cuMemAlloc(&d_ffn_gate, (size_t)n_patches * ffn_dim * sizeof(float));
-    cuMemAlloc(&d_ffn_up, (size_t)n_patches * ffn_dim * sizeof(float));
-
-    CUdeviceptr d_Q = d_qkv;
-    CUdeviceptr d_K = d_qkv + tok_buf;
-    CUdeviceptr d_V = d_qkv + tok_buf * 2;
-
-    if (r->verbose >= 1) fprintf(stderr, "cuda_vision: weights uploaded, running %d blocks...\n", n_blocks);
-
-    /* --- 4. Transformer blocks --- */
-    for (int b = 0; b < n_blocks; b++) {
-        vis_gpu_block *gb = &gblocks[b];
-
-        /* Pre-attention RMSNorm → d_out */
-        cuMemcpyDtoDAsync(d_out, d_tokens, tok_buf, r->stream);
-        { void *a[] = { &d_out, &gb->ln1_w, &dim, &ln_eps, &n_patches };
-          cuLaunchKernel(r->fn_vision_rmsnorm, n_patches, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Q/K/V projections */
-        { void *a[] = { &d_Q, &gb->qw, &d_out, &dim, &dim, &n_patches };
-          cuLaunchKernel(r->fn_vision_linear_f16, dim, n_patches, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-        { void *a[] = { &d_K, &gb->kw, &d_out, &dim, &dim, &n_patches };
-          cuLaunchKernel(r->fn_vision_linear_f16, dim, n_patches, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-        { void *a[] = { &d_V, &gb->vw, &d_out, &dim, &dim, &n_patches };
-          cuLaunchKernel(r->fn_vision_linear_f16, dim, n_patches, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Per-head Q/K RMSNorm */
-        int hd_pow2 = 1; while (hd_pow2 < head_dim) hd_pow2 <<= 1;
-        { void *a[] = { &d_Q, &gb->q_norm, &n_patches, &n_heads, &head_dim, &dim, &ln_eps };
-          cuLaunchKernel(r->fn_vision_head_rmsnorm, n_patches, n_heads, 1, hd_pow2, 1, 1, 0, r->stream, a, NULL); }
-        { void *a[] = { &d_K, &gb->k_norm, &n_patches, &n_heads, &head_dim, &dim, &ln_eps };
-          cuLaunchKernel(r->fn_vision_head_rmsnorm, n_patches, n_heads, 1, hd_pow2, 1, 1, 0, r->stream, a, NULL); }
-
-        /* 2D RoPE */
-        float theta = 100.0f;
-        int quarter = head_dim / 4;
-        { void *a[] = { &d_Q, &d_pos_x, &d_pos_y, &n_patches, &n_heads, &head_dim, &dim, &theta };
-          cuLaunchKernel(r->fn_vision_rope_2d, n_patches, n_heads, 1, quarter, 1, 1, 0, r->stream, a, NULL); }
-        { void *a[] = { &d_K, &d_pos_x, &d_pos_y, &n_patches, &n_heads, &head_dim, &dim, &theta };
-          cuLaunchKernel(r->fn_vision_rope_2d, n_patches, n_heads, 1, quarter, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Full NxN attention */
-        size_t attn_smem = (size_t)n_patches * sizeof(float);
-        { void *a[] = { &d_out, &d_Q, &d_K, &d_V, &n_patches, &n_heads, &head_dim, &dim };
-          cuLaunchKernel(r->fn_vision_attention, n_heads, n_patches, 1, 256, 1, 1, attn_smem, r->stream, a, NULL); }
-
-        /* Output projection */
-        { void *a[] = { &d_Q, &gb->outw, &d_out, &dim, &dim, &n_patches }; /* reuse d_Q as temp */
-          cuLaunchKernel(r->fn_vision_linear_f16, dim, n_patches, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Post-attention RMSNorm */
-        { void *a[] = { &d_Q, &gb->attn_post_norm, &dim, &ln_eps, &n_patches };
-          cuLaunchKernel(r->fn_vision_rmsnorm, n_patches, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Residual add: tokens += attn_output */
-        int total_elem = n_patches * dim;
-        { void *a[] = { &d_tokens, &d_Q, &total_elem };
-          cuLaunchKernel(r->fn_vision_add, (total_elem + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Pre-FFN RMSNorm → d_out */
-        cuMemcpyDtoDAsync(d_out, d_tokens, tok_buf, r->stream);
-        { void *a[] = { &d_out, &gb->ln2_w, &dim, &ln_eps, &n_patches };
-          cuLaunchKernel(r->fn_vision_rmsnorm, n_patches, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* FFN: gate + up projections */
-        { void *a[] = { &d_ffn_gate, &gb->gate_w, &d_out, &ffn_dim, &dim, &n_patches };
-          cuLaunchKernel(r->fn_vision_linear_f16, ffn_dim, n_patches, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-        { void *a[] = { &d_ffn_up, &gb->up_w, &d_out, &ffn_dim, &dim, &n_patches };
-          cuLaunchKernel(r->fn_vision_linear_f16, ffn_dim, n_patches, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* GELU gate */
-        int ffn_total = n_patches * ffn_dim;
-        { void *a[] = { &d_ffn_gate, &d_ffn_up, &ffn_total };
-          cuLaunchKernel(r->fn_vision_gelu_gate, (ffn_total + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Down projection → d_out */
-        { void *a[] = { &d_out, &gb->down_w, &d_ffn_gate, &dim, &ffn_dim, &n_patches };
-          cuLaunchKernel(r->fn_vision_linear_f16, dim, n_patches, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Post-FFN RMSNorm */
-        { void *a[] = { &d_out, &gb->ffn_post_norm, &dim, &ln_eps, &n_patches };
-          cuLaunchKernel(r->fn_vision_rmsnorm, n_patches, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-        /* Residual add: tokens += ffn_output */
-        { void *a[] = { &d_tokens, &d_out, &total_elem };
-          cuLaunchKernel(r->fn_vision_add, (total_elem + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-    }
-
-    /* --- 5. Average pooling: [n_patches, dim] → [n_merged, dim] --- */
-    cuStreamSynchronize(r->stream);
-    float *h_tokens = (float *)malloc(tok_buf);
-    cuMemcpyDtoH(h_tokens, d_tokens, tok_buf);
-
-    float *pooled = (float *)calloc((size_t)n_merged * dim, sizeof(float));
-    {
-        int k = spatial_merge;
-        int out_h = ph / k, out_w = pw / k;
-        float inv_k2 = 1.0f / (k * k);
-        for (int oy = 0; oy < out_h; oy++) {
-            for (int ox = 0; ox < out_w; ox++) {
-                float *dst = pooled + (oy * out_w + ox) * dim;
-                for (int dy = 0; dy < k; dy++) {
-                    for (int dx = 0; dx < k; dx++) {
-                        int iy = oy * k + dy, ix = ox * k + dx;
-                        if (iy < ph && ix < pw) {
-                            const float *src = h_tokens + (iy * pw + ix) * dim;
-                            for (int d = 0; d < dim; d++) dst[d] += src[d];
-                        }
-                    }
-                }
-                for (int d = 0; d < dim; d++) dst[d] *= inv_k2;
-            }
-        }
-    }
-    free(h_tokens);
-
-    /* --- 6. Scale + Projection + Final norm on GPU --- */
-    CUdeviceptr d_pooled;
-    cuMemAlloc(&d_pooled, (size_t)n_merged * dim * sizeof(float));
-    cuMemcpyHtoD(d_pooled, pooled, (size_t)n_merged * dim * sizeof(float));
-    free(pooled);
-
-    /* Scale by sqrt(dim) */
-    float scale = sqrtf((float)dim);
-    int pool_total = n_merged * dim;
-    { void *a[] = { &d_pooled, &scale, &pool_total };
-      cuLaunchKernel(r->fn_vision_scale, (pool_total + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-    /* MM projection: [n_merged, dim] → [n_merged, proj_dim] */
-    CUdeviceptr d_projected;
-    cuMemAlloc(&d_projected, (size_t)n_merged * proj_dim * sizeof(float));
-    { void *a[] = { &d_projected, &d_proj_w, &d_pooled, &proj_dim, &dim, &n_merged };
-      cuLaunchKernel(r->fn_vision_linear_f16, proj_dim, n_merged, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-    /* Final RMSNorm (no learned weights) */
-    CUdeviceptr null_weight = 0;
-    { void *a[] = { &d_projected, &null_weight, &proj_dim, &ln_eps, &n_merged };
-      cuLaunchKernel(r->fn_vision_rmsnorm, n_merged, 1, 1, 256, 1, 1, 0, r->stream, a, NULL); }
-
-    /* --- 7. Download result --- */
-    cuStreamSynchronize(r->stream);
-    float *result = (float *)malloc((size_t)n_merged * proj_dim * sizeof(float));
-    cuMemcpyDtoH(result, d_projected, (size_t)n_merged * proj_dim * sizeof(float));
-
-    *out_tokens = n_merged;
-    *out_dim = proj_dim;
-
-    /* Cleanup GPU resources */
-    cuMemFree(d_tokens); cuMemFree(d_pos_embd);
-    cuMemFree(d_pos_x); cuMemFree(d_pos_y);
-    cuMemFree(d_qkv); cuMemFree(d_out);
-    cuMemFree(d_ffn_gate); cuMemFree(d_ffn_up);
-    cuMemFree(d_pooled); cuMemFree(d_projected);
-    cuMemFree(d_proj_w);
-    for (int b = 0; b < n_blocks; b++) {
-        vis_gpu_block *gb = &gblocks[b];
-        cuMemFree(gb->qw); cuMemFree(gb->kw); cuMemFree(gb->vw); cuMemFree(gb->outw);
-        cuMemFree(gb->q_norm); cuMemFree(gb->k_norm); cuMemFree(gb->attn_post_norm);
-        cuMemFree(gb->gate_w); cuMemFree(gb->up_w); cuMemFree(gb->down_w);
-        cuMemFree(gb->ffn_post_norm); cuMemFree(gb->ln1_w); cuMemFree(gb->ln2_w);
-    }
-    free(gblocks);
-    free(pos_x); free(pos_y);
-
-    return result;
 }
 
 /* ======================================================================== */
@@ -7443,30 +5952,23 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_ssm_conv_out) cuMemFree(r->d_ssm_conv_out);
     if (r->d_attn_gate)    cuMemFree(r->d_attn_gate);
     if (r->d_ds_tmp)   cuMemFree(r->d_ds_tmp);
-    /* Gemma4 scratch */
-    if (r->d_rope_inv_freq_full) cuMemFree(r->d_rope_inv_freq_full);
-    if (r->d_rope_inv_freq_swa) cuMemFree(r->d_rope_inv_freq_swa);
-    if (r->d_ple_combined) cuMemFree(r->d_ple_combined);
-    if (r->d_ple_buf) cuMemFree(r->d_ple_buf);
-    if (r->d_ple_proj) cuMemFree(r->d_ple_proj);
-    free(r->swa_pattern);
     if (r->d_router_logits) cuMemFree(r->d_router_logits);
     if (r->d_moe_accum)    cuMemFree(r->d_moe_accum);
+    if (r->d_hidden_snapshots) cuMemFree(r->d_hidden_snapshots);
     free(r->h_router_logits);
+    free(r->h_stage);
     if (r->d_xb_q)    cuMemFree(r->d_xb_q);
     if (r->d_xb_scale) cuMemFree(r->d_xb_scale);
 
-    /* Free KV cache (skip shared caches for Gemma4) */
+    /* Free KV cache */
     if (r->d_key_cache) {
         for (int l = 0; l < r->n_layers; l++) {
-            if (r->is_gemma4 && r->layers && r->layers[l].shared_kv_source >= 0) continue;
             if (r->d_key_cache[l]) cuMemFree(r->d_key_cache[l]);
         }
         free(r->d_key_cache);
     }
     if (r->d_value_cache) {
         for (int l = 0; l < r->n_layers; l++) {
-            if (r->is_gemma4 && r->layers && r->layers[l].shared_kv_source >= 0) continue;
             if (r->d_value_cache[l]) cuMemFree(r->d_value_cache[l]);
         }
         free(r->d_value_cache);
@@ -7482,6 +5984,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
             if (cl->attn_v_w)      cuMemFree(cl->attn_v_w);
             if (cl->attn_q_norm_w) cuMemFree(cl->attn_q_norm_w);
             if (cl->attn_k_norm_w) cuMemFree(cl->attn_k_norm_w);
+            if (cl->attn_q_bias)   cuMemFree(cl->attn_q_bias);
+            if (cl->attn_k_bias)   cuMemFree(cl->attn_k_bias);
+            if (cl->attn_v_bias)   cuMemFree(cl->attn_v_bias);
             if (cl->attn_output_w) cuMemFree(cl->attn_output_w);
             if (cl->ffn_norm_w)    cuMemFree(cl->ffn_norm_w);
             if (cl->ffn_gate_w)    cuMemFree(cl->ffn_gate_w);
@@ -7499,12 +6004,6 @@ void cuda_llm_free(cuda_llm_runner *r) {
             if (cl->ssm_norm_w)     cuMemFree(cl->ssm_norm_w);
             if (cl->d_conv_state)      cuMemFree(cl->d_conv_state);
             if (cl->d_recurrent_state) cuMemFree(cl->d_recurrent_state);
-            /* Gemma4 per-layer weights */
-            if (cl->post_attn_norm_w) cuMemFree(cl->post_attn_norm_w);
-            if (cl->post_ffw_norm_w)  cuMemFree(cl->post_ffw_norm_w);
-            if (cl->ple_inp_gate_w)   cuMemFree(cl->ple_inp_gate_w);
-            if (cl->ple_proj_w)       cuMemFree(cl->ple_proj_w);
-            if (cl->ple_post_norm_w)  cuMemFree(cl->ple_post_norm_w);
             /* MoE weights */
             if (cl->moe_gate_w)             cuMemFree(cl->moe_gate_w);
             if (cl->moe_gate_exps_w)        cuMemFree(cl->moe_gate_exps_w);
@@ -7530,9 +6029,8 @@ void cuda_llm_free(cuda_llm_runner *r) {
     /* Free host buffer */
     free(r->h_output);
 
-    /* Destroy CUDA objects */
+    /* Destroy CUDA objects (keep primary context alive for other runners) */
     if (r->stream) cuStreamDestroy(r->stream);
-    if (r->context) cuCtxDestroy(r->context);
 
     free(r);
 }
@@ -7542,7 +6040,25 @@ void cuda_llm_free(cuda_llm_runner *r) {
 /* ======================================================================== */
 
 void cuda_llm_reset_state(cuda_llm_runner *r) {
-    if (!r || !r->is_hybrid) return;
+    if (!r) return;
+    if (cuda_llm_bind_context(r) != 0) return;
+
+    int kv_dim = r->n_kv_heads * r->head_dim;
+    if (kv_dim > 0 && r->max_seq_len > 0) {
+        size_t kv_cache_bytes = (size_t)r->max_seq_len * kv_dim * sizeof(float);
+        if (r->d_key_cache && r->d_value_cache) {
+            for (int l = 0; l < r->n_layers; l++) {
+                if (r->d_key_cache[l]) cuMemsetD8(r->d_key_cache[l], 0, kv_cache_bytes);
+                if (r->d_value_cache[l]) cuMemsetD8(r->d_value_cache[l], 0, kv_cache_bytes);
+            }
+        }
+    }
+    if (r->d_hidden_snapshots && r->n_hidden_snapshots > 0 && r->n_embd > 0) {
+        size_t snap_bytes = (size_t)r->n_hidden_snapshots * r->n_embd * sizeof(float);
+        cuMemsetD8(r->d_hidden_snapshots, 0, snap_bytes);
+    }
+
+    if (!r->is_hybrid) return;
     for (int l = 0; l < r->n_layers; l++) {
         cuda_layer *cl = &r->layers[l];
         if (!cl->is_ssm) continue;
@@ -7555,6 +6071,75 @@ void cuda_llm_reset_state(cuda_llm_runner *r) {
             cuMemsetD8(cl->d_recurrent_state, 0, rec_bytes);
         }
     }
+}
+
+int cuda_llm_inject_biases(cuda_llm_runner *r, const char *safetensors_path) {
+    if (!r || !safetensors_path) return 0;
+
+    st_context *st = safetensors_open(safetensors_path);
+    if (!st) {
+        fprintf(stderr, "cuda_llm: cannot open safetensors for biases: %s\n", safetensors_path);
+        return 0;
+    }
+
+    int n_loaded = 0;
+    for (int l = 0; l < r->n_layers; l++) {
+        cuda_layer *cl = &r->layers[l];
+        if (cl->is_ssm) continue;  /* SSM layers don't have attention biases */
+
+        char wn[256];
+        for (int qi = 0; qi < 3; qi++) {
+            const char *proj = (qi == 0) ? "q" : (qi == 1) ? "k" : "v";
+            snprintf(wn, sizeof(wn), "model.layers.%d.self_attn.%s_proj.bias", l, proj);
+            int idx = safetensors_find(st, wn);
+            if (idx < 0) continue;
+
+            const uint64_t *shape = safetensors_shape(st, idx);
+            int n = (int)shape[0];
+            const char *dtype = safetensors_dtype(st, idx);
+            const void *raw = safetensors_data(st, idx);
+
+            /* Dequant to F32 */
+            float *f32 = (float *)malloc((size_t)n * sizeof(float));
+            if (strcmp(dtype, "BF16") == 0) {
+                const uint16_t *bf = (const uint16_t *)raw;
+                for (int i = 0; i < n; i++) {
+                    uint32_t bits = (uint32_t)bf[i] << 16;
+                    memcpy(&f32[i], &bits, 4);
+                }
+            } else if (strcmp(dtype, "F32") == 0) {
+                memcpy(f32, raw, (size_t)n * sizeof(float));
+            } else if (strcmp(dtype, "F16") == 0) {
+                /* F16 to F32 — simple conversion */
+                const uint16_t *fp16 = (const uint16_t *)raw;
+                for (int i = 0; i < n; i++) {
+                    uint32_t h = fp16[i];
+                    uint32_t sign = (h >> 15) & 1;
+                    uint32_t exp = (h >> 10) & 0x1F;
+                    uint32_t mant = h & 0x3FF;
+                    uint32_t f;
+                    if (exp == 0) f = sign << 31;
+                    else if (exp == 31) f = (sign << 31) | 0x7F800000 | (mant << 13);
+                    else f = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+                    memcpy(&f32[i], &f, 4);
+                }
+            }
+
+            CUdeviceptr *dst = (qi == 0) ? &cl->attn_q_bias :
+                               (qi == 1) ? &cl->attn_k_bias : &cl->attn_v_bias;
+            size_t sz = (size_t)n * sizeof(float);
+            if (*dst) cuMemFree(*dst);  /* free existing if any */
+            cuMemAlloc(dst, sz);
+            cuMemcpyHtoD(*dst, f32, sz);
+            free(f32);
+            n_loaded++;
+        }
+    }
+
+    safetensors_close(st);
+    if (r->verbose >= 1)
+        fprintf(stderr, "cuda_llm: injected %d Q/K/V biases from %s\n", n_loaded, safetensors_path);
+    return n_loaded;
 }
 
 int cuda_llm_n_embd(const cuda_llm_runner *r) { return r ? r->n_embd : 0; }
