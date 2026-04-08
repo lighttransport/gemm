@@ -522,18 +522,19 @@ static const char *cuda_kernel_source =
 "}\n"
 "\n"
 "/* ---- 14. matvec_q2_K_f32: Q2_K matrix x F32 vector -> F32 ---- */\n"
+"/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q2_K block: 84 bytes = scales[16] + qs[64] + d(f16) + dmin(f16), 256 elements */\n"
 "__global__ void matvec_q2_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 84;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 84;\n"
 "        const unsigned char *scales = bp;\n"
 "        const unsigned char *qs = bp + 16;\n"
@@ -562,31 +563,23 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float warp_sums[8];\n"
-"    int warp_id = tid / 32, lane = tid % 32;\n"
-"    if (lane == 0) warp_sums[warp_id] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += warp_sums[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "/* ---- 15. matvec_q3_K_f32: Q3_K matrix x F32 vector -> F32 ---- */\n"
+"/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q3_K block: 110 bytes = hmask[32] + qs[64] + scales[12] + d(f16), 256 elements */\n"
 "__global__ void matvec_q3_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 110;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 110;\n"
 "        const unsigned char *hm = bp;\n"
 "        const unsigned char *qs = bp + 32;\n"
@@ -627,31 +620,23 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws3[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws3[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int nw = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < nw; w++) total += ws3[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "/* ---- 16. matvec_q4_K_f32: Q4_K matrix x F32 vector -> F32 ---- */\n"
+"/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q4_K block: 144 bytes = d(f16) + dmin(f16) + scales[12] + qs[128], 256 elements */\n"
 "__global__ void matvec_q4_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 144;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 144;\n"
 "        float d = half_to_float(*(const half_raw *)(bp));\n"
 "        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
@@ -680,31 +665,22 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws4[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws4[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int nw = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < nw; w++) total += ws4[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
 "__global__ void matvec_q6_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 210;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 210;\n"
 "        const unsigned char *ql = bp;\n"
 "        const unsigned char *qh = bp + 128;\n"
@@ -731,31 +707,22 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws6[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws6[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int nw = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < nw; w++) total += ws6[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "/* ---- 17b. matvec_q5_K_f32: Q5_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q5_K block: 176 bytes = d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128], 256 elements */\n"
 "__global__ void matvec_q5_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                  int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 176;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 176;\n"
 "        float d = half_to_float(*(const half_raw *)(bp));\n"
 "        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
@@ -790,16 +757,7 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws5[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws5[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int nw = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < nw; w++) total += ws5[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "/* ---- 18. embed_q2_K: Q2_K embedding lookup -> F32 ---- */\n"
@@ -1097,15 +1055,15 @@ static const char *cuda_kernel_source =
 "\n"
 "__global__ void matvec_iq2_xxs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                     int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 66;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 66;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
@@ -1130,16 +1088,7 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_iq2[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq2[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq2[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "__device__ static const unsigned long long iq2xs_grid_dev[512] = {\n"
@@ -2321,15 +2270,15 @@ static const char *cuda_kernel_source =
 "/* ---- matvec_iq4_nl_f32: IQ4_NL matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq4_nl_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                    int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 32;\n"
 "    int row_bytes = nb * 18;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 18;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs = bp + 2;\n"
@@ -2344,30 +2293,21 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_iq4nl[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq4nl[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq4nl[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
 "/* ---- matvec_iq4_xs_f32: IQ4_XS matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq4_xs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                    int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 136;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 136;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
@@ -2390,30 +2330,21 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_iq4xs[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq4xs[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq4xs[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
 "/* ---- matvec_iq2_xs_f32: IQ2_XS matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq2_xs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                    int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 74;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 74;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
@@ -2439,30 +2370,21 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_iq2xs[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq2xs[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq2xs[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
 "/* ---- matvec_iq3_xxs_f32: IQ3_XXS matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq3_xxs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                     int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 98;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 98;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs = bp + 2;\n"
@@ -2491,30 +2413,21 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_iq3xxs[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq3xxs[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq3xxs[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
 "/* ---- matvec_iq2_s_f32: IQ2_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq2_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 82;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 82;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        /* block_iq2_s layout: d(2) + qs(64)[grid(32)+signs(32)] + qh(8) + scales(8) */\n"
@@ -2545,30 +2458,21 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_iq2s[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq2s[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq2s[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
 "/* ---- matvec_iq3_s_f32: IQ3_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq3_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 110;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
 "        const unsigned char *bp = row_ptr + b * 110;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        /* block_iq3_s layout: d(2) + qs(64) + qh(8) + signs(32) + scales(4) */\n"
@@ -2612,16 +2516,7 @@ static const char *cuda_kernel_source =
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
-"    __shared__ float ws_iq3s[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq3s[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq3s[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
@@ -5077,42 +4972,42 @@ static inline void launch_matvec_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q2_K_f32,
-                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q3_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q3_K_f32,
-                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q4_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q4_K_f32,
-                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q5_K_f32,
-                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q6_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q6_K_f32,
-                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_iq2_xxs(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_iq2_xxs_f32,
-                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 #define DEFINE_LAUNCH_MATVEC(name, fn_field) \
@@ -5122,22 +5017,31 @@ static inline void launch_matvec_##name(cuda_llm_runner *r, CUdeviceptr dst, CUd
     cuLaunchKernel(r->fn_field, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL); \
 }
 
+/* Multi-warp variant: 8 warps/block, grid = ceil(n_rows/8) */
+#define DEFINE_LAUNCH_MATVEC_MW(name, fn_field) \
+static inline void launch_matvec_##name(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat, \
+                                        CUdeviceptr x, int n_rows, int n_cols) { \
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols }; \
+    cuLaunchKernel(r->fn_field, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL); \
+}
+
 DEFINE_LAUNCH_MATVEC(q4_0, fn_matvec_q4_0_f32)
 DEFINE_LAUNCH_MATVEC(q4_1, fn_matvec_q4_1_f32)
 DEFINE_LAUNCH_MATVEC(q5_0, fn_matvec_q5_0_f32)
 DEFINE_LAUNCH_MATVEC(q5_1, fn_matvec_q5_1_f32)
-DEFINE_LAUNCH_MATVEC(iq4_nl, fn_matvec_iq4_nl_f32)
-DEFINE_LAUNCH_MATVEC(iq4_xs, fn_matvec_iq4_xs_f32)
-DEFINE_LAUNCH_MATVEC(iq2_xs, fn_matvec_iq2_xs_f32)
-DEFINE_LAUNCH_MATVEC(iq3_xxs, fn_matvec_iq3_xxs_f32)
-DEFINE_LAUNCH_MATVEC(iq2_s, fn_matvec_iq2_s_f32)
-DEFINE_LAUNCH_MATVEC(iq3_s, fn_matvec_iq3_s_f32)
+DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
+DEFINE_LAUNCH_MATVEC_MW(iq4_xs, fn_matvec_iq4_xs_f32)
+DEFINE_LAUNCH_MATVEC_MW(iq2_xs, fn_matvec_iq2_xs_f32)
+DEFINE_LAUNCH_MATVEC_MW(iq3_xxs, fn_matvec_iq3_xxs_f32)
+DEFINE_LAUNCH_MATVEC_MW(iq2_s, fn_matvec_iq2_s_f32)
+DEFINE_LAUNCH_MATVEC_MW(iq3_s, fn_matvec_iq3_s_f32)
 DEFINE_LAUNCH_MATVEC(iq1_s, fn_matvec_iq1_s_f32)
 DEFINE_LAUNCH_MATVEC(iq1_m, fn_matvec_iq1_m_f32)
 DEFINE_LAUNCH_MATVEC(tq1_0, fn_matvec_tq1_0_f32)
 DEFINE_LAUNCH_MATVEC(tq2_0, fn_matvec_tq2_0_f32)
 
 #undef DEFINE_LAUNCH_MATVEC
+#undef DEFINE_LAUNCH_MATVEC_MW
 
 static inline void launch_embed_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr embd_table,
                                        int token_id, int n_embd) {
