@@ -65,6 +65,17 @@ int cuda_llm_n_layers(const cuda_llm_runner *r);
 int cuda_llm_n_vocab(const cuda_llm_runner *r);
 int cuda_llm_max_seq_len(const cuda_llm_runner *r);
 
+/* GPU Vision Encoder: run Gemma4 ViT on GPU using runner's CUDA context.
+ * mmproj_gguf: opened mmproj GGUF (must stay open during encode).
+ * image: RGB uint8 [image_size x image_size x 3].
+ * out_tokens: set to number of output tokens.
+ * out_dim: set to projection dimension.
+ * Returns host-allocated F32 array [out_tokens * out_dim] or NULL on error.
+ * Caller must free() the result. */
+float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
+                               const uint8_t *image, int image_w, int image_h,
+                               int *out_tokens, int *out_dim);
+
 #ifdef __cplusplus
 }
 #endif
