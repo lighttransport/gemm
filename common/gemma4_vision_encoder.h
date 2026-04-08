@@ -486,7 +486,7 @@ static void g4v_add_pos_embd(g4v_model *vm, float *patches, int ph, int pw) {
 
 /* Per-head RMSNorm on [n_heads, head_dim] packed as [n_heads * head_dim] */
 static void g4v_head_norm(float *x, int n_heads, int head_dim, const qtensor *w, float eps, float *tmp) {
-    float norm_w[64]; /* head_dim <= 64 */
+    float norm_w[128]; /* head_dim up to 128 */
     dequant_row(w->type, w->data, norm_w, head_dim);
     for (int h = 0; h < n_heads; h++) {
         float *xh = x + h * head_dim;
