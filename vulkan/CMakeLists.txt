@@ -73,6 +73,50 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/attn_prefill_f32.comp
 )
 
+# DA3 depth estimation shaders
+set(DA3_SHADER_SOURCES
+    ${SHADER_SOURCE_DIR}/da3/resize_normalize_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/cls_pos_embed_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/rope_2d_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/swiglu_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/kv_transpose_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/flash_attn_tiled_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/cat_local_global_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/dpt_cls_concat_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/strided_layernorm_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/dpt_tok_to_chw_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/deconv_scatter_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/conv2d_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/bilinear_upsample_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/depth_activation_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/sinusoidal_uv_posembed_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/relu_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/channel_layernorm_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/qk_layernorm_offset_f32.comp
+)
+
+# HY3D shaders (reused by DA3 for layerscale_add and qk_layernorm)
+set(HY3D_SHADER_SOURCES
+    ${SHADER_SOURCE_DIR}/hy3d/layerscale_add_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/qk_layernorm_f32.comp
+)
+
+# Custom function to compile GLSL to SPIR-V (supports subdirectories)
+function(compile_shader_subdir SHADER_SOURCE SUBDIR)
+    get_filename_component(SHADER_NAME ${SHADER_SOURCE} NAME_WE)
+    file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR}/${SUBDIR})
+    set(SPIRV_OUTPUT ${SHADER_OUTPUT_DIR}/${SUBDIR}/${SHADER_NAME}.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_OUTPUT}
+        COMMAND ${GLSLC_EXECUTABLE} -fshader-stage=compute -O -o ${SPIRV_OUTPUT} ${SHADER_SOURCE}
+        DEPENDS ${SHADER_SOURCE}
+        COMMENT "Compiling ${SUBDIR}/${SHADER_NAME}.comp -> ${SUBDIR}/${SHADER_NAME}.spv"
+        VERBATIM
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_OUTPUT})
+    set(SPIRV_OUTPUTS ${SPIRV_OUTPUTS} PARENT_SCOPE)
+endfunction()
+
 # Custom function to compile GLSL to SPIR-V
 function(compile_shader SHADER_SOURCE)
     get_filename_component(SHADER_NAME ${SHADER_SOURCE} NAME_WE)
@@ -120,6 +164,24 @@ foreach(SHADER ${SHADER_SOURCES})
         compile_shader(${SHADER})
     else()
         message(WARNING "Shader not found: ${SHADER}")
+    endif()
+endforeach()
+
+# Compile DA3 shaders
+foreach(SHADER ${DA3_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        compile_shader_subdir(${SHADER} "da3")
+    else()
+        message(WARNING "DA3 shader not found: ${SHADER}")
+    endif()
+endforeach()
+
+# Compile HY3D shaders (needed by DA3 for layerscale_add, qk_layernorm)
+foreach(SHADER ${HY3D_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        compile_shader_subdir(${SHADER} "hy3d")
+    else()
+        message(WARNING "HY3D shader not found: ${SHADER}")
     endif()
 endforeach()
 
@@ -288,6 +350,37 @@ if(SPIRV_OUTPUTS)
                 ${CMAKE_BINARY_DIR}/shaders/
         COMMENT "Copying compiled shaders to build directory (llm)"
     )
+endif()
+
+# DA3 Depth Estimation test executable
+set(DA3_TARGET test_vulkan_da3)
+
+add_executable(${DA3_TARGET}
+    da3/test_vulkan_da3.cc
+    da3/vulkan_da3_runner.cc
+    da3/stb_impl.c
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${DA3_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${CMAKE_CURRENT_SOURCE_DIR}/da3
+)
+
+target_link_libraries(${DA3_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+    Threads::Threads
+)
+
+target_compile_definitions(${DA3_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET coopmat_shaders)
+    add_dependencies(${DA3_TARGET} coopmat_shaders)
 endif()
 
 message(STATUS "")
