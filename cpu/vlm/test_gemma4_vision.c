@@ -4,9 +4,9 @@
  * Usage:
  *   ./test_gemma4_vision <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen] [--budget N]
  *
- * --budget N: reasoning token budget (default 200). The model can think for up
- *             to N tokens inside <|channel>thought...<channel|> before being
- *             forced to exit and produce visible output.
+ * --budget N: reasoning token budget (default 200). If the model emits hidden
+ *             thought-channel tokens, cap them to N tokens before forcing an
+ *             exit back to visible output.
  *
  * If no image is provided, generates a synthetic checkerboard test pattern.
  * Supports JPEG, PNG, BMP, PPM, and other formats via stb_image.
@@ -37,8 +37,8 @@
 #include <time.h>
 
 typedef struct {
-    char pre_image[256];
-    char post_image[512];
+    char *pre_image;
+    char *post_image;
 } gemma4_prompt_parts;
 
 typedef struct {
@@ -49,6 +49,17 @@ typedef struct {
     int32_t channel_end_id;
     int in_thought;
 } gemma4_decode_state;
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} visible_text;
+
+typedef struct {
+    int32_t *ids;
+    int count;
+} token_buffer;
 
 /* ---- Reasoning budget state machine ---- */
 
@@ -166,36 +177,97 @@ static uint8_t *generate_test_image(int size) {
 }
 
 static gemma4_prompt_parts build_gemma4_prompt(const char *user_prompt) {
-    gemma4_prompt_parts parts;
-    snprintf(parts.pre_image, sizeof(parts.pre_image),
-             "<|turn>system\n<|think|><turn|>\n<|turn>user\n<|image>");
-    snprintf(parts.post_image, sizeof(parts.post_image),
-             "<image|>%s<turn|>\n<|turn>model\n",
-             user_prompt);
+    gemma4_prompt_parts parts = {0};
+    const char *pre =
+        "<|turn>system\n"
+        "You are a helpful visual assistant. Answer briefly and directly in plain text.\n"
+        "<turn|>\n<|turn>user\n<|image>";
+    const char *post_fmt = "<image|>%s<turn|>\n<|turn>model\n";
+    size_t pre_len = strlen(pre);
+    parts.pre_image = (char *)malloc(pre_len + 1);
+    if (parts.pre_image) memcpy(parts.pre_image, pre, pre_len + 1);
+    int post_len = snprintf(NULL, 0, post_fmt, user_prompt ? user_prompt : "");
+    if (post_len >= 0) {
+        parts.post_image = (char *)malloc((size_t)post_len + 1);
+        if (parts.post_image)
+            snprintf(parts.post_image, (size_t)post_len + 1, post_fmt, user_prompt ? user_prompt : "");
+    }
     return parts;
+}
+
+static void free_gemma4_prompt(gemma4_prompt_parts *parts) {
+    if (!parts) return;
+    free(parts->pre_image);
+    free(parts->post_image);
+    parts->pre_image = NULL;
+    parts->post_image = NULL;
+}
+
+static void visible_text_free(visible_text *out) {
+    if (!out) return;
+    free(out->data);
+    out->data = NULL;
+    out->len = 0;
+    out->cap = 0;
+}
+
+static int visible_text_append(visible_text *out, const char *buf, size_t n) {
+    if (!out || !buf || n == 0) return 0;
+    size_t need = out->len + n + 1;
+    if (need > out->cap) {
+        size_t new_cap = out->cap ? out->cap * 2 : 128;
+        while (new_cap < need) new_cap *= 2;
+        char *p = (char *)realloc(out->data, new_cap);
+        if (!p) return -1;
+        out->data = p;
+        out->cap = new_cap;
+    }
+    memcpy(out->data + out->len, buf, n);
+    out->len += n;
+    out->data[out->len] = '\0';
+    return 0;
+}
+
+static void token_buffer_free(token_buffer *buf) {
+    if (!buf) return;
+    free(buf->ids);
+    buf->ids = NULL;
+    buf->count = 0;
+}
+
+static token_buffer tokenize_text_alloc(const bpe_vocab *vocab, const char *text) {
+    token_buffer buf = {0};
+    int count = bpe_tokenize(vocab, text, -1, NULL, 0);
+    if (count <= 0) return buf;
+    buf.ids = (int32_t *)malloc((size_t)count * sizeof(int32_t));
+    if (!buf.ids) return buf;
+    buf.count = bpe_tokenize(vocab, text, -1, buf.ids, count);
+    if (buf.count != count) {
+        token_buffer_free(&buf);
+    }
+    return buf;
+}
+
+static int32_t find_exact_token_id(const bpe_vocab *vocab, const char *text) {
+    if (!vocab || !text) return -1;
+    return bpe_hm_get(&vocab->token_to_id, text, (int)strlen(text));
 }
 
 static gemma4_decode_state init_decode_state(const bpe_vocab *vocab) {
     gemma4_decode_state st;
     st.eos_id = bpe_eos_id(vocab);
     st.eot_id = bpe_eot_id(vocab);
-    st.turn_end_id = -1;
-    st.channel_start_id = -1;
-    st.channel_end_id = -1;
+    st.turn_end_id = find_exact_token_id(vocab, "<turn|>");
+    st.channel_start_id = find_exact_token_id(vocab, "<|channel>");
+    st.channel_end_id = find_exact_token_id(vocab, "<channel|>");
     st.in_thought = 0;
-
-    int32_t tmp[4];
-    int n = bpe_tokenize(vocab, "<|channel>", -1, tmp, 4);
-    if (n == 1) st.channel_start_id = tmp[0];
-    n = bpe_tokenize(vocab, "<channel|>", -1, tmp, 4);
-    if (n == 1) st.channel_end_id = tmp[0];
-    n = bpe_tokenize(vocab, "<turn|>", -1, tmp, 4);
-    if (n == 1) st.turn_end_id = tmp[0];
 
     return st;
 }
 
-static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st, int32_t token) {
+static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st,
+                               int32_t token, visible_text *out) {
+    if (token == st->eos_id || token == st->eot_id || token == st->turn_end_id) return;
     if (token == st->channel_start_id) {
         st->in_thought = 1;
         return;
@@ -211,8 +283,7 @@ static void emit_visible_token(const bpe_vocab *vocab, gemma4_decode_state *st, 
 
     int dec_len = 0;
     char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
-    fwrite(decoded, 1, dec_len, stdout);
-    fflush(stdout);
+    if (decoded && dec_len > 0) (void)visible_text_append(out, decoded, (size_t)dec_len);
     free(decoded);
 }
 
@@ -316,12 +387,15 @@ int main(int argc, char **argv) {
                 min_v, max_v, sum / total);
     }
 
-    /* 5. Build multimodal prompt (llama.cpp-style system turn + user turn).
-     * Layout: BOS <|turn>system\n<|think|><turn|>\n <|turn>user\n<|image>
-     *         [vision embeddings] <image|>{prompt}<turn|>\n <|turn>model\n
-     * The system turn enables thinking; the model enters/exits thought
-     * channel naturally. Reasoning budget caps thought tokens. */
+    /* 5. Build multimodal prompt.
+     * Layout: BOS <|turn>system\n...<turn|>\n <|turn>user\n<|image>
+     *         [vision embeddings] <image|>{prompt}<turn|>\n <|turn>model\n */
     gemma4_prompt_parts prompt_parts = build_gemma4_prompt(user_prompt);
+    if (!prompt_parts.pre_image || !prompt_parts.post_image) {
+        fprintf(stderr, "prompt allocation failed\n");
+        free_gemma4_prompt(&prompt_parts);
+        return 1;
+    }
     const char *pre_image = prompt_parts.pre_image;
     const char *post_image = prompt_parts.post_image;
 
@@ -331,20 +405,19 @@ int main(int argc, char **argv) {
     }
 
     /* Tokenize pre-image text */
-    int32_t pre_tokens[64];
-    int n_pre = bpe_tokenize(vocab, pre_image, -1, pre_tokens, 64);
-    fprintf(stderr, "Pre-image tokens (%d):", n_pre);
-    for (int i = 0; i < n_pre; i++)
-        fprintf(stderr, " %d(\"%s\")", pre_tokens[i], bpe_token_to_str(vocab, pre_tokens[i]));
+    token_buffer pre_tokens = tokenize_text_alloc(vocab, pre_image);
+    fprintf(stderr, "Pre-image tokens (%d):", pre_tokens.count);
+    for (int i = 0; i < pre_tokens.count; i++)
+        fprintf(stderr, " %d(\"%s\")", pre_tokens.ids[i], bpe_token_to_str(vocab, pre_tokens.ids[i]));
     fprintf(stderr, "\n");
 
     /* Tokenize post-image text */
-    int32_t post_tokens[64];
-    int n_post = bpe_tokenize(vocab, post_image, -1, post_tokens, 64);
-    fprintf(stderr, "Post-image tokens (%d):", n_post);
-    for (int i = 0; i < n_post; i++)
-        fprintf(stderr, " %d(\"%s\")", post_tokens[i], bpe_token_to_str(vocab, post_tokens[i]));
+    token_buffer post_tokens = tokenize_text_alloc(vocab, post_image);
+    fprintf(stderr, "Post-image tokens (%d):", post_tokens.count);
+    for (int i = 0; i < post_tokens.count; i++)
+        fprintf(stderr, " %d(\"%s\")", post_tokens.ids[i], bpe_token_to_str(vocab, post_tokens.ids[i]));
     fprintf(stderr, "\n");
+    free_gemma4_prompt(&prompt_parts);
 
     /* 6. Prefill: text tokens + vision embeddings + text tokens */
     fprintf(stderr, "\n=== LLM Prefill ===\n");
@@ -358,10 +431,10 @@ int main(int argc, char **argv) {
     }
 
     /* Prefill pre-image text tokens */
-    for (int i = 0; i < n_pre; i++) {
-        transformer_forward(model, pre_tokens[i], pos++);
+    for (int i = 0; i < pre_tokens.count; i++) {
+        transformer_forward(model, pre_tokens.ids[i], pos++);
     }
-    fprintf(stderr, "Prefilled %d pre-image tokens\n", n_pre);
+    fprintf(stderr, "Prefilled %d pre-image tokens\n", pre_tokens.count);
 
     /* Inject vision embeddings (using transformer_forward_embd) */
     for (int i = 0; i < n_vision; i++) {
@@ -371,10 +444,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Injected %d vision tokens\n", n_vision);
 
     /* Prefill post-image text tokens */
-    for (int i = 0; i < n_post; i++) {
-        if (i == n_post - 1) {
+    for (int i = 0; i < post_tokens.count; i++) {
+        if (i == post_tokens.count - 1) {
             /* Last token: get logits */
-            float *logits = transformer_forward_logits(model, post_tokens[i], pos++);
+            float *logits = transformer_forward_logits(model, post_tokens.ids[i], pos++);
             if (logits) {
                 /* Find argmax */
                 int32_t argmax = 0;
@@ -389,12 +462,13 @@ int main(int argc, char **argv) {
                 int32_t next_token = argmax;
                 gemma4_decode_state decode_state = init_decode_state(vocab);
                 reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
+                visible_text out = {0};
                 float temperature = 0.7f;
                 int top_k = 40;
                 srand((unsigned)time(NULL));
 
                 for (int g = 0; g < max_gen; g++) {
-                    emit_visible_token(vocab, &decode_state, next_token);
+                    emit_visible_token(vocab, &decode_state, next_token, &out);
                     rb_observe(&rb, next_token);
 
                     if (next_token == decode_state.eos_id ||
@@ -453,17 +527,22 @@ int main(int argc, char **argv) {
                     free(topk_idx);
                     free(topk_val);
                 }
+                if (out.len > 0) fwrite(out.data, 1, out.len, stdout);
                 printf("\n");
+                fflush(stdout);
+                visible_text_free(&out);
                 fprintf(stderr, "[thought: %d/%d tokens used]\n",
                         rb.count, rb.budget);
             }
         } else {
-            transformer_forward(model, post_tokens[i], pos++);
+            transformer_forward(model, post_tokens.ids[i], pos++);
         }
     }
 
     fprintf(stderr, "Done.\n");
 
+    token_buffer_free(&pre_tokens);
+    token_buffer_free(&post_tokens);
     free(vision_embd);
     g4v_free(vision);
     transformer_free(model);
