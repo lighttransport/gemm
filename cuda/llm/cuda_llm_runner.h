@@ -44,6 +44,20 @@ float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int positio
 float *cuda_llm_forward_embd(cuda_llm_runner *r, const float *embd, int embd_stride, int position);
 float *cuda_llm_forward_embd_logits(cuda_llm_runner *r, const float *embd, int embd_stride, int position);
 
+/* Batched prefill: process n_tokens tokens through the transformer.
+ * token_ids: array of n_tokens token IDs (NULL if using embeddings).
+ * embeddings: F32 [n_tokens * embd_stride] pre-computed embeddings (NULL if using token_ids).
+ * start_pos: position of the first token in the sequence.
+ * Returns pointer to last token's hidden state, or NULL on error. */
+float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
+                         const float *embeddings, int embd_stride,
+                         int n_tokens, int start_pos);
+
+/* Same as prefill but returns logits for the last token. */
+float *cuda_llm_prefill_logits(cuda_llm_runner *r, const int32_t *token_ids,
+                                const float *embeddings, int embd_stride,
+                                int n_tokens, int start_pos);
+
 /* Free all GPU resources and the runner. */
 void cuda_llm_free(cuda_llm_runner *r);
 

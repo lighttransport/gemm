@@ -343,40 +343,40 @@ int main(int argc, char **argv) {
         fprintf(stderr, " %d(\"%s\")", post_tokens[i], bpe_token_to_str(vocab, post_tokens[i]));
     fprintf(stderr, "\n");
 
-    /* 6. Prefill */
-    fprintf(stderr, "\n=== LLM Prefill (CUDA) ===\n");
+    /* 6. Batched Prefill */
+    fprintf(stderr, "\n=== LLM Prefill (CUDA, batched) ===\n");
     int pos = 0;
 
+    /* BOS token */
     if (bos_id >= 0) {
         cuda_llm_forward(llm, bos_id, pos++);
         fprintf(stderr, "Prefilled BOS\n");
     }
 
+    /* Batch: pre-image tokens */
     t0 = get_time_ms();
-    for (int i = 0; i < n_pre; i++)
-        cuda_llm_forward(llm, pre_tokens[i], pos++);
+    cuda_llm_prefill(llm, pre_tokens, NULL, 0, n_pre, pos);
+    pos += n_pre;
     t1 = get_time_ms();
-    fprintf(stderr, "Pre-image: %d tokens (%.1f ms)\n", n_pre, t1 - t0);
+    fprintf(stderr, "Pre-image: %d tokens (%.1f ms, %.2f ms/tok)\n",
+            n_pre, t1 - t0, n_pre > 0 ? (t1 - t0) / n_pre : 0);
 
+    /* Batch: vision embeddings */
     t0 = get_time_ms();
-    for (int i = 0; i < n_vision; i++) {
-        float *embd_i = vision_embd + i * proj_dim;
-        cuda_llm_forward_embd(llm, embd_i, proj_dim, pos++);
-    }
+    cuda_llm_prefill(llm, NULL, vision_embd, proj_dim, n_vision, pos);
+    pos += n_vision;
     t1 = get_time_ms();
     fprintf(stderr, "Vision: %d tokens (%.1f ms, %.2f ms/tok)\n",
             n_vision, t1 - t0, (t1 - t0) / n_vision);
 
+    /* Batch: post-image tokens (last one returns logits) */
     float *logits = NULL;
     t0 = get_time_ms();
-    for (int i = 0; i < n_post; i++) {
-        if (i == n_post - 1)
-            logits = cuda_llm_forward_logits(llm, post_tokens[i], pos++);
-        else
-            cuda_llm_forward(llm, post_tokens[i], pos++);
-    }
+    logits = cuda_llm_prefill_logits(llm, post_tokens, NULL, 0, n_post, pos);
+    pos += n_post;
     t1 = get_time_ms();
-    fprintf(stderr, "Post-image: %d tokens (%.1f ms)\n", n_post, t1 - t0);
+    fprintf(stderr, "Post-image: %d tokens (%.1f ms, %.2f ms/tok)\n",
+            n_post, t1 - t0, n_post > 0 ? (t1 - t0) / n_post : 0);
 
     if (!logits) { fprintf(stderr, "ERROR: forward_logits returned NULL\n"); return 1; }
 
