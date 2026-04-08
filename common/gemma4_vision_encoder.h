@@ -84,17 +84,143 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height);
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+/* ---- AVX2 helpers ---- */
+
+static inline float g4v_dot(const float *a, const float *b, int n) {
+#ifdef __AVX2__
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),     _mm256_loadu_ps(b + i),     sum0);
+        sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), sum1);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    for (; i + 7 < n; i += 8)
+        sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), sum0);
+    /* horizontal sum */
+    __m128 lo = _mm256_castps256_ps128(sum0);
+    __m128 hi = _mm256_extractf128_ps(sum0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float result = _mm_cvtss_f32(lo);
+    for (; i < n; i++) result += a[i] * b[i];
+    return result;
+#else
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += a[i] * b[i];
+    return sum;
+#endif
+}
+
+static inline float g4v_sum_sq(const float *a, int n) {
+    return g4v_dot(a, a, n);
+}
+
+static inline void g4v_vec_mul(float *out, const float *a, const float *b, int n) {
+#ifdef __AVX2__
+    int i = 0;
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    for (; i < n; i++) out[i] = a[i] * b[i];
+#else
+    for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
+#endif
+}
+
+static inline void g4v_vec_scale(float *x, float s, int n) {
+#ifdef __AVX2__
+    __m256 vs = _mm256_set1_ps(s);
+    int i = 0;
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vs));
+    for (; i < n; i++) x[i] *= s;
+#else
+    for (int i = 0; i < n; i++) x[i] *= s;
+#endif
+}
+
+static inline void g4v_vec_add(float *dst, const float *src, int n) {
+#ifdef __AVX2__
+    int i = 0;
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i), _mm256_loadu_ps(src + i)));
+    for (; i < n; i++) dst[i] += src[i];
+#else
+    for (int i = 0; i < n; i++) dst[i] += src[i];
+#endif
+}
+
+static inline void g4v_vec_fmadd(float *dst, float s, const float *src, int n) {
+#ifdef __AVX2__
+    __m256 vs = _mm256_set1_ps(s);
+    int i = 0;
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_fmadd_ps(vs, _mm256_loadu_ps(src + i), _mm256_loadu_ps(dst + i)));
+    for (; i < n; i++) dst[i] += s * src[i];
+#else
+    for (int i = 0; i < n; i++) dst[i] += s * src[i];
+#endif
+}
+
+/* ---- Threading helpers ---- */
+
+static int g4v_n_threads(void) {
+    int n = 4;
+#ifdef _SC_NPROCESSORS_ONLN
+    int hw = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (hw > 0) n = hw > 16 ? 16 : hw;
+#endif
+    return n;
+}
+
+typedef struct {
+    const float *mat_f32;
+    const float *inp;
+    float *out;
+    int n_cols, n_rows, N;
+    int row_start, row_end;
+} g4v_matmul_task;
+
+static void *g4v_matmul_worker(void *arg) {
+    g4v_matmul_task *t = (g4v_matmul_task *)arg;
+    for (int r = t->row_start; r < t->row_end; r++) {
+        const float *row = t->mat_f32 + (size_t)r * t->n_cols;
+        for (int tok = 0; tok < t->N; tok++) {
+            const float *x = t->inp + tok * t->n_cols;
+            t->out[tok * t->n_rows + r] = g4v_dot(row, x, t->n_cols);
+        }
+    }
+    return NULL;
+}
 
 /* ---- Helpers ---- */
 
 static void g4v_rmsnorm(float *out, const float *x, const qtensor *w, int n, float eps, float *tmp) {
-    float ss = 0.0f;
-    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    float ss = g4v_sum_sq(x, n);
     ss = 1.0f / sqrtf(ss / n + eps);
-    /* Dequant weight if needed */
     float *wf = tmp;
     dequant_row(w->type, w->data, wf, n);
+    /* out[i] = x[i] * ss * wf[i] */
+#ifdef __AVX2__
+    __m256 vss = _mm256_set1_ps(ss);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vw = _mm256_loadu_ps(wf + i);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_mul_ps(vx, vss), vw));
+    }
+    for (; i < n; i++) out[i] = x[i] * ss * wf[i];
+#else
     for (int i = 0; i < n; i++) out[i] = x[i] * ss * wf[i];
+#endif
 }
 
 static void g4v_rmsnorm_inplace(float *x, const qtensor *w, int n, float eps, float *tmp) {
@@ -125,7 +251,8 @@ static void g4v_matvec(float *out, const qtensor *mat, const float *vec, int n_r
 }
 
 /* Batched matmul: out[N, n_rows] = mat[n_rows, n_cols] @ inp[N, n_cols].
- * Dequantizes the full matrix once, then dot-products all N tokens. */
+ * Dequantizes the full matrix once, then dot-products all N tokens.
+ * Uses AVX2 dot products and pthreads for row parallelism. */
 static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
                               int N, int n_rows, float *tmp) {
     int n_cols = mat->n_cols;
@@ -141,21 +268,39 @@ static void g4v_matmul_batch(float *out, const qtensor *mat, const float *inp,
         row_bytes = (size_t)((n_cols + bs - 1) / bs) * ts;
     }
     const uint8_t *base = (const uint8_t *)mat->data;
-    /* Dequant all rows first into a buffer */
+
+    /* Dequant all rows into a contiguous F32 buffer */
     float *mat_f32 = (float *)malloc((size_t)n_rows * n_cols * sizeof(float));
     for (int r = 0; r < n_rows; r++)
-        dequant_row(mat->type, base + r * row_bytes, mat_f32 + r * n_cols, n_cols);
+        dequant_row(mat->type, base + r * row_bytes, mat_f32 + (size_t)r * n_cols, n_cols);
 
-    /* Compute all N tokens */
-    for (int t = 0; t < N; t++) {
-        const float *x = inp + t * n_cols;
-        float *y = out + t * n_rows;
+    /* Threaded + AVX2 dot products */
+    int nt = g4v_n_threads();
+    if (nt > n_rows) nt = n_rows;
+    if (nt <= 1) {
+        /* Single-threaded fast path */
         for (int r = 0; r < n_rows; r++) {
-            float dot = 0.0f;
-            const float *row = mat_f32 + r * n_cols;
-            for (int c = 0; c < n_cols; c++) dot += row[c] * x[c];
-            y[r] = dot;
+            const float *row = mat_f32 + (size_t)r * n_cols;
+            for (int t = 0; t < N; t++)
+                out[t * n_rows + r] = g4v_dot(row, inp + t * n_cols, n_cols);
         }
+    } else {
+        pthread_t *threads = (pthread_t *)alloca(nt * sizeof(pthread_t));
+        g4v_matmul_task *tasks = (g4v_matmul_task *)alloca(nt * sizeof(g4v_matmul_task));
+        int rows_per = (n_rows + nt - 1) / nt;
+        for (int i = 0; i < nt; i++) {
+            tasks[i].mat_f32 = mat_f32;
+            tasks[i].inp = inp;
+            tasks[i].out = out;
+            tasks[i].n_cols = n_cols;
+            tasks[i].n_rows = n_rows;
+            tasks[i].N = N;
+            tasks[i].row_start = i * rows_per;
+            tasks[i].row_end = (i + 1) * rows_per;
+            if (tasks[i].row_end > n_rows) tasks[i].row_end = n_rows;
+            pthread_create(&threads[i], NULL, g4v_matmul_worker, &tasks[i]);
+        }
+        for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
     }
     free(mat_f32);
 }
@@ -290,32 +435,29 @@ static void g4v_patch_embed(g4v_model *vm, float *out, const float *inp,
     float *filters = (float *)malloc((size_t)dim * filter_size * sizeof(float));
     dequant_row(vm->patch_embd_w.type, vm->patch_embd_w.data, filters, dim * filter_size);
 
-    /* For each patch, compute conv2d (dot product of patch with each filter) */
+    /* For each patch, extract pixels into contiguous buffer then dot with filters */
+    float *patch_buf = (float *)malloc(filter_size * sizeof(float));
     for (int py = 0; py < ph; py++) {
         for (int px = 0; px < pw; px++) {
             int patch_idx = py * pw + px;
             float *patch_out = out + patch_idx * dim;
 
-            for (int d = 0; d < dim; d++) {
-                float sum = 0.0f;
-                const float *f = filters + d * filter_size;
-                /* GGUF conv2d filter layout: [kw, kh, n_in, n_out]
-                 * = [16, 16, 3, 768] in dims order. Data: [out_ch][in_ch][ky][kx]
-                 * Filter offset for (d, c, fy, fx) = d*filter_size + c*ps*ps + fy*ps + fx */
-                for (int c = 0; c < 3; c++) {
-                    for (int fy = 0; fy < ps; fy++) {
-                        int iy = py * ps + fy;
-                        for (int fx = 0; fx < ps; fx++) {
-                            int ix = px * ps + fx;
-                            float pixel = inp[(iy * img_w + ix) * 3 + c];
-                            sum += pixel * f[c * ps * ps + fy * ps + fx];
-                        }
+            /* Extract patch pixels: [3, ps, ps] in filter order */
+            for (int c = 0; c < 3; c++) {
+                for (int fy = 0; fy < ps; fy++) {
+                    int iy = py * ps + fy;
+                    for (int fx = 0; fx < ps; fx++) {
+                        int ix = px * ps + fx;
+                        patch_buf[c * ps * ps + fy * ps + fx] = inp[(iy * img_w + ix) * 3 + c];
                     }
                 }
-                patch_out[d] = sum;
             }
+            /* Dot product with each filter using AVX2 */
+            for (int d = 0; d < dim; d++)
+                patch_out[d] = g4v_dot(filters + d * filter_size, patch_buf, filter_size);
         }
     }
+    free(patch_buf);
     free(filters);
 }
 
@@ -335,11 +477,8 @@ static void g4v_add_pos_embd(g4v_model *vm, float *patches, int ph, int pw) {
         for (int px = 0; px < pw; px++) {
             int patch_idx = py * pw + px;
             float *p = patches + patch_idx * dim;
-            /* Add X embedding for column px and Y embedding for row py */
-            for (int d = 0; d < dim; d++) {
-                p[d] += tbl_x[px * dim + d];  /* x lookup: tbl_x[px][d] */
-                p[d] += tbl_y[py * dim + d];  /* y lookup: tbl_y[py][d] */
-            }
+            g4v_vec_add(p, tbl_x + px * dim, dim);
+            g4v_vec_add(p, tbl_y + py * dim, dim);
         }
     }
     free(pos_data);
@@ -351,10 +490,21 @@ static void g4v_head_norm(float *x, int n_heads, int head_dim, const qtensor *w,
     dequant_row(w->type, w->data, norm_w, head_dim);
     for (int h = 0; h < n_heads; h++) {
         float *xh = x + h * head_dim;
-        float ss = 0.0f;
-        for (int i = 0; i < head_dim; i++) ss += xh[i] * xh[i];
+        float ss = g4v_sum_sq(xh, head_dim);
         ss = 1.0f / sqrtf(ss / head_dim + eps);
+        /* xh[i] = xh[i] * ss * norm_w[i] */
+#ifdef __AVX2__
+        __m256 vss = _mm256_set1_ps(ss);
+        int i = 0;
+        for (; i + 7 < head_dim; i += 8) {
+            __m256 vx = _mm256_loadu_ps(xh + i);
+            __m256 vw = _mm256_loadu_ps(norm_w + i);
+            _mm256_storeu_ps(xh + i, _mm256_mul_ps(_mm256_mul_ps(vx, vss), vw));
+        }
+        for (; i < head_dim; i++) xh[i] = xh[i] * ss * norm_w[i];
+#else
         for (int i = 0; i < head_dim; i++) xh[i] = xh[i] * ss * norm_w[i];
+#endif
     }
 }
 
@@ -427,19 +577,13 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
 
     /* Multi-head attention (all N tokens attend to all N tokens) */
     {
-        float scale = 1.0f; /* Gemma4 vision uses scale=1.0 since Q/K are normalized */
-
         memset(att_out, 0, N * dim * sizeof(float));
         for (int h = 0; h < n_heads; h++) {
-            /* Compute attention scores for this head */
+            /* Compute attention scores: scores[i][j] = dot(q_i, k_j) */
             for (int i = 0; i < N; i++) {
-                float *qi = q + i * dim + h * hd;
-                for (int j = 0; j < N; j++) {
-                    float *kj = k + j * dim + h * hd;
-                    float dot = 0.0f;
-                    for (int d = 0; d < hd; d++) dot += qi[d] * kj[d];
-                    scores[i * N + j] = dot * scale;
-                }
+                const float *qi = q + i * dim + h * hd;
+                for (int j = 0; j < N; j++)
+                    scores[i * N + j] = g4v_dot(qi, k + j * dim + h * hd, hd);
             }
             /* Softmax per row */
             for (int i = 0; i < N; i++) {
@@ -448,18 +592,14 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
                 for (int j = 1; j < N; j++) if (s[j] > max_s) max_s = s[j];
                 float sum_e = 0.0f;
                 for (int j = 0; j < N; j++) { s[j] = expf(s[j] - max_s); sum_e += s[j]; }
-                float inv = 1.0f / sum_e;
-                for (int j = 0; j < N; j++) s[j] *= inv;
+                g4v_vec_scale(s, 1.0f / sum_e, N);
             }
-            /* Weighted sum of values */
+            /* Weighted sum of values: att_out[i] += sum_j(s[j] * v[j]) */
             for (int i = 0; i < N; i++) {
                 float *out_i = att_out + i * dim + h * hd;
-                float *s = scores + i * N;
-                for (int j = 0; j < N; j++) {
-                    float w = s[j];
-                    float *vj = v + j * dim + h * hd;
-                    for (int d = 0; d < hd; d++) out_i[d] += w * vj[d];
-                }
+                const float *s = scores + i * N;
+                for (int j = 0; j < N; j++)
+                    g4v_vec_fmadd(out_i, s[j], v + j * dim + h * hd, hd);
             }
         }
     }
@@ -472,7 +612,7 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
         g4v_rmsnorm_inplace(proj_out + t * dim, &blk->attn_post_norm, dim, eps, tmp);
 
     /* Residual add */
-    for (int i = 0; i < N * dim; i++) x[i] += proj_out[i];
+    g4v_vec_add(x, proj_out, N * dim);
 
     /* --- FFN --- */
     /* Pre-FFN RMSNorm */
@@ -489,10 +629,23 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
     g4v_matmul_batch(up,   &blk->ffn_up_w,   xn, N, ff, tmp);
 
     /* GELU(gate) * up */
-    for (int i = 0; i < N * ff; i++) {
-        float g = gate[i];
-        float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));
-        ffn_out[i] = gelu_g * up[i];
+    {
+        int total = N * ff;
+#ifdef __AVX2__
+        /* GELU approx: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+         * But exact GELU uses erf. We keep erff for accuracy, vectorize the mul. */
+        for (int i = 0; i < total; i++) {
+            float g = gate[i];
+            gate[i] = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));
+        }
+        g4v_vec_mul(ffn_out, gate, up, total);
+#else
+        for (int i = 0; i < total; i++) {
+            float g = gate[i];
+            float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));
+            ffn_out[i] = gelu_g * up[i];
+        }
+#endif
     }
 
     /* Down projection — reuse proj_out (attention is done, safe to overwrite) */
@@ -504,7 +657,7 @@ static void g4v_block_forward(g4v_model *vm, g4v_block *blk, float *x, int N,
         g4v_rmsnorm_inplace(ffn_proj + t * dim, &blk->ffn_post_norm, dim, eps, tmp);
 
     /* Residual add */
-    for (int i = 0; i < N * dim; i++) x[i] += ffn_proj[i];
+    g4v_vec_add(x, ffn_proj, N * dim);
 
     /* scratch owned by caller */
 }
@@ -522,10 +675,10 @@ static void g4v_avg_pool(float *out, const float *in, int ph, int pw, int dim, i
                     int iy = y * kernel + ky;
                     int ix = x * kernel + kx;
                     const float *p = in + (iy * pw + ix) * dim;
-                    for (int d = 0; d < dim; d++) o[d] += p[d];
+                    g4v_vec_add(o, p, dim);
                 }
             }
-            for (int d = 0; d < dim; d++) o[d] *= inv_area;
+            g4v_vec_scale(o, inv_area, dim);
         }
     }
 }
@@ -539,19 +692,37 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     int ph = height / ps, pw = width / ps;
     int N = ph * pw;
     int n_merged = (ph / merge) * (pw / merge);
+    float *img_norm = NULL;
+    float *patches = NULL;
+    int *pos_x = NULL;
+    int *pos_y = NULL;
+    float *tmp = NULL;
+    float *attn_scratch = NULL;
+    float *ffn_scratch = NULL;
+    float *pooled = NULL;
+    float *projected = NULL;
 
     fprintf(stderr, "g4v_encode: %dx%d -> %d patches -> %d tokens\n",
             width, height, N, n_merged);
 
     /* 1. Normalize image: patches * 2 - 1 (Gemma4 specific) */
-    float *img_norm = (float *)malloc(height * width * 3 * sizeof(float));
+    img_norm = (float *)malloc(height * width * 3 * sizeof(float));
+    if (!img_norm) {
+        fprintf(stderr, "g4v_encode: img_norm alloc failed (%d x %d)\n", width, height);
+        goto fail;
+    }
     for (int i = 0; i < height * width * 3; i++)
         img_norm[i] = ((float)rgb[i] / 255.0f) * 2.0f - 1.0f;
 
     /* 2. Patch embedding (conv2d stride=patch_size) */
-    float *patches = (float *)calloc(N * dim, sizeof(float));
+    patches = (float *)calloc(N * dim, sizeof(float));
+    if (!patches) {
+        fprintf(stderr, "g4v_encode: patches alloc failed (N=%d dim=%d)\n", N, dim);
+        goto fail;
+    }
     g4v_patch_embed(vm, patches, img_norm, height, width);
     free(img_norm);
+    img_norm = NULL;
 
     /* patch embedding done */
 
@@ -559,8 +730,12 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
     g4v_add_pos_embd(vm, patches, ph, pw);
 
     /* 4. Build position arrays for 2D RoPE */
-    int *pos_x = (int *)malloc(N * sizeof(int));
-    int *pos_y = (int *)malloc(N * sizeof(int));
+    pos_x = (int *)malloc(N * sizeof(int));
+    pos_y = (int *)malloc(N * sizeof(int));
+    if (!pos_x || !pos_y) {
+        fprintf(stderr, "g4v_encode: position alloc failed (N=%d)\n", N);
+        goto fail;
+    }
     for (int y = 0; y < ph; y++)
         for (int x = 0; x < pw; x++) {
             pos_x[y * pw + x] = x;
@@ -568,47 +743,83 @@ float *g4v_encode(g4v_model *vm, const uint8_t *rgb, int width, int height) {
         }
 
     /* 5. ViT transformer blocks — allocate scratch once for all blocks */
-    float *tmp = (float *)malloc(dim * 16 * sizeof(float));
-    float *attn_scratch = (float *)malloc(((size_t)N * dim * 6 + (size_t)N * N) * sizeof(float));
-    float *ffn_scratch  = (float *)malloc((size_t)N * vm->ffn_dim * 3 * sizeof(float));
+    tmp = (float *)malloc(dim * 16 * sizeof(float));
+    attn_scratch = (float *)malloc(((size_t)N * dim * 6 + (size_t)N * N) * sizeof(float));
+    ffn_scratch  = (float *)malloc((size_t)N * vm->ffn_dim * 3 * sizeof(float));
+    if (!tmp || !attn_scratch || !ffn_scratch) {
+        fprintf(stderr, "g4v_encode: block scratch alloc failed (N=%d dim=%d ffn=%d)\n",
+                N, dim, vm->ffn_dim);
+        goto fail;
+    }
     for (int b = 0; b < vm->n_blocks; b++) {
         g4v_block_forward(vm, &vm->blocks[b], patches, N, pos_x, pos_y, tmp,
                           attn_scratch, ffn_scratch);
     }
     free(attn_scratch); free(ffn_scratch);
+    attn_scratch = NULL; ffn_scratch = NULL;
     free(pos_x); free(pos_y); free(tmp);
+    pos_x = NULL; pos_y = NULL; tmp = NULL;
 
     /* 6. Average pooling: [ph, pw, dim] -> [ph/merge, pw/merge, dim] */
-    float *pooled = (float *)malloc(n_merged * dim * sizeof(float));
+    pooled = (float *)malloc(n_merged * dim * sizeof(float));
+    if (!pooled) {
+        fprintf(stderr, "g4v_encode: pooled alloc failed (tokens=%d dim=%d)\n", n_merged, dim);
+        goto fail;
+    }
     g4v_avg_pool(pooled, patches, ph, pw, dim, merge);
     free(patches);
+    patches = NULL;
 
     /* 7. Scale by sqrt(dim) */
-    float scale = sqrtf((float)dim);
-    for (int i = 0; i < n_merged * dim; i++) pooled[i] *= scale;
+    {
+        float scale = sqrtf((float)dim);
+        g4v_vec_scale(pooled, scale, n_merged * dim);
+    }
 
     /* pooled and scaled */
 
     /* 8. MM projection: [dim] -> [proj_dim] per token */
     int proj_dim = vm->proj_dim;
-    float *projected = (float *)malloc(n_merged * proj_dim * sizeof(float));
+    projected = (float *)malloc(n_merged * proj_dim * sizeof(float));
+    if (!projected) {
+        fprintf(stderr, "g4v_encode: projected alloc failed (tokens=%d dim=%d)\n", n_merged, proj_dim);
+        goto fail;
+    }
     tmp = (float *)malloc(dim * sizeof(float));
+    if (!tmp) {
+        fprintf(stderr, "g4v_encode: projection tmp alloc failed (dim=%d)\n", dim);
+        goto fail;
+    }
     g4v_matmul_batch(projected, &vm->mm_proj_w, pooled, n_merged, proj_dim, tmp);
     free(pooled); free(tmp);
+    pooled = NULL; tmp = NULL;
 
     /* 9. Final RMSNorm on projected embeddings (embedding_post_projection_norm)
      * This is a raw RMSNorm without learned weights */
-    float eps = vm->ln_eps;
-    for (int t = 0; t < n_merged; t++) {
-        float *p = projected + t * proj_dim;
-        float ss = 0.0f;
-        for (int i = 0; i < proj_dim; i++) ss += p[i] * p[i];
-        ss = 1.0f / sqrtf(ss / proj_dim + eps);
-        for (int i = 0; i < proj_dim; i++) p[i] *= ss;
+    {
+        float eps = vm->ln_eps;
+        for (int t = 0; t < n_merged; t++) {
+            float *p = projected + t * proj_dim;
+            float ss = g4v_sum_sq(p, proj_dim);
+            ss = 1.0f / sqrtf(ss / proj_dim + eps);
+            g4v_vec_scale(p, ss, proj_dim);
+        }
     }
 
     /* output: n_merged tokens of proj_dim dims */
     return projected;
+
+fail:
+    free(projected);
+    free(pooled);
+    free(tmp);
+    free(ffn_scratch);
+    free(attn_scratch);
+    free(pos_y);
+    free(pos_x);
+    free(patches);
+    free(img_norm);
+    return NULL;
 }
 
 #endif /* GEMMA4_VISION_IMPLEMENTATION */
