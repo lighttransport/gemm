@@ -9,6 +9,7 @@ LDFLAGS = -ldl -lm -lpthread
 
 # Sources
 CUEW_SRC = ../cuew.c
+CUBLASEW_SRC = ../cublasew.c
 RUNNER_SRC = cuda_llm_runner.c
 TEST_SRC = test_cuda_llm.c
 
@@ -19,8 +20,8 @@ TARGET = test_cuda_llm
 
 all: $(TARGET)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) cuda_llm_runner.h ../cuew.h
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) cuda_llm_runner.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
