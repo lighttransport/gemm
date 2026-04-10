@@ -93,6 +93,10 @@ set(DA3_SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/da3/relu_f32.comp
     ${SHADER_SOURCE_DIR}/da3/channel_layernorm_f32.comp
     ${SHADER_SOURCE_DIR}/da3/qk_layernorm_offset_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/patch_embed_conv2d_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/copy_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/silu_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/matmul_bias_f16_f32.comp
 )
 
 # TRELLIS2 shaders
@@ -119,10 +123,15 @@ set(T2_SHADER_SOURCES
     ${T2_SHADER_SOURCE_DIR}/dinov3_prepend_tokens_f32.comp
 )
 
-# HY3D shaders (reused by DA3 for layerscale_add and qk_layernorm)
+# HY3D shaders (reused by DA3 and TRELLIS2)
 set(HY3D_SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/hy3d/layerscale_add_f32.comp
     ${SHADER_SOURCE_DIR}/hy3d/qk_layernorm_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/gemm_f32_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/rms_norm_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/cross_attn_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/cfg_combine_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/euler_step_f32.comp
 )
 
 # Custom function to compile GLSL to SPIR-V (supports subdirectories)
