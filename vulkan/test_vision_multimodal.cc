@@ -27,8 +27,8 @@ extern "C" {
 
 #include "vulkan_vision_encoder.hh"
 #include "vulkan_llm_runner.hh"
-#include "../common/stb_image.h"
-#include "../common/stb_image_resize2.h"
+#include "deps/stb_image.h"
+#include "deps/stb_image_resize2.h"
 
 static const char *gguf_get_kv_string(const gguf_context *g, const char *key) {
     int idx = gguf_find_key(g, key);

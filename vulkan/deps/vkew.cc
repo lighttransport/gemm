@@ -143,6 +143,11 @@ PFN_vkDestroyDevice vkDestroyDevice = nullptr;
 PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
 PFN_vkDeviceWaitIdle vkDeviceWaitIdle = nullptr;
 PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
+PFN_vkCreateFence vkCreateFence = nullptr;
+PFN_vkDestroyFence vkDestroyFence = nullptr;
+PFN_vkWaitForFences vkWaitForFences = nullptr;
+PFN_vkResetFences vkResetFences = nullptr;
+PFN_vkCmdFillBuffer vkCmdFillBuffer = nullptr;
 
 // Memory
 PFN_vkAllocateMemory vkAllocateMemory = nullptr;
@@ -276,6 +281,11 @@ void vkewShutdown(void) {
     vkGetDeviceQueue = nullptr;
     vkDeviceWaitIdle = nullptr;
     vkQueueWaitIdle = nullptr;
+    vkCreateFence = nullptr;
+    vkDestroyFence = nullptr;
+    vkWaitForFences = nullptr;
+    vkResetFences = nullptr;
+    vkCmdFillBuffer = nullptr;
     vkAllocateMemory = nullptr;
     vkFreeMemory = nullptr;
     vkMapMemory = nullptr;
@@ -359,6 +369,11 @@ bool vkewLoadDevice(VkDevice device) {
     VKEW_LOAD_DEVICE(vkGetDeviceQueue);
     VKEW_LOAD_DEVICE(vkDeviceWaitIdle);
     VKEW_LOAD_DEVICE(vkQueueWaitIdle);
+    VKEW_LOAD_DEVICE(vkCreateFence);
+    VKEW_LOAD_DEVICE(vkDestroyFence);
+    VKEW_LOAD_DEVICE(vkWaitForFences);
+    VKEW_LOAD_DEVICE(vkResetFences);
+    VKEW_LOAD_DEVICE(vkCmdFillBuffer);
 
     // Memory
     VKEW_LOAD_DEVICE(vkAllocateMemory);

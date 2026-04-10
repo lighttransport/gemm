@@ -680,6 +680,101 @@ bool VulkanComputeRunner::copyBuffer(const BufferInfo& srcBuffer, const BufferIn
     return true;
 }
 
+/* ---- DEVICE_LOCAL buffer support ---- */
+
+bool VulkanComputeRunner::createDeviceLocalBuffer(size_t size, BufferInfo& bufferInfo) {
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkMemoryPropertyFlags props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    return createBuffer(size, usage, props, bufferInfo);
+}
+
+bool VulkanComputeRunner::createStagingBuffer(size_t size, BufferInfo& bufferInfo) {
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkMemoryPropertyFlags props = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return createBuffer(size, usage, props, bufferInfo);
+}
+
+bool VulkanComputeRunner::uploadToDeviceLocal(const BufferInfo& deviceBuf, const void* data, size_t size) {
+    /* Create temp staging buffer, upload data, GPU copy to device-local, cleanup */
+    BufferInfo staging{};
+    if (!createStagingBuffer(size, staging)) return false;
+    void *ptr = nullptr;
+    if (!mapBuffer(staging, &ptr)) { destroyBuffer(staging); return false; }
+    memcpy(ptr, data, size);
+    unmapBuffer(staging);
+    copyBuffer(staging, deviceBuf, size);
+    destroyBuffer(staging);
+    return true;
+}
+
+bool VulkanComputeRunner::downloadFromDeviceLocal(const BufferInfo& deviceBuf, void* data, size_t size) {
+    BufferInfo staging{};
+    if (!createStagingBuffer(size, staging)) return false;
+    copyBuffer(deviceBuf, staging, size);
+    void *ptr = nullptr;
+    if (!mapBuffer(staging, &ptr)) { destroyBuffer(staging); return false; }
+    memcpy(data, ptr, size);
+    unmapBuffer(staging);
+    destroyBuffer(staging);
+    return true;
+}
+
+/* ---- Fence support ---- */
+
+bool VulkanComputeRunner::createFence(VkFence& fence, bool signaled) {
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = signaled ? VK_FENCE_CREATE_SIGNALED_BIT : 0;
+    return vkCreateFence(device_, &fenceInfo, nullptr, &fence) == VK_SUCCESS;
+}
+
+void VulkanComputeRunner::destroyFence(VkFence fence) {
+    if (fence != VK_NULL_HANDLE)
+        vkDestroyFence(device_, fence, nullptr);
+}
+
+bool VulkanComputeRunner::endRecordingAndSubmitFenced(VkFence fence) {
+    if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
+        setError("Failed to end command buffer recording");
+        return false;
+    }
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer_;
+    if (vkQueueSubmit(computeQueue_, 1, &submitInfo, fence) != VK_SUCCESS) {
+        setError("Failed to submit command buffer with fence");
+        return false;
+    }
+    return true;
+}
+
+bool VulkanComputeRunner::waitForFence(VkFence fence, uint64_t timeout) {
+    return vkWaitForFences(device_, 1, &fence, VK_TRUE, timeout) == VK_SUCCESS;
+}
+
+void VulkanComputeRunner::resetFence(VkFence fence) {
+    vkResetFences(device_, 1, &fence);
+}
+
+/* ---- Record transfer ops into current command buffer ---- */
+
+void VulkanComputeRunner::recordCopyBuffer(const BufferInfo& src, const BufferInfo& dst, size_t size) {
+    VkBufferCopy copyRegion{};
+    copyRegion.size = size;
+    vkCmdCopyBuffer(commandBuffer_, src.buffer, dst.buffer, 1, &copyRegion);
+}
+
+void VulkanComputeRunner::recordFillBuffer(const BufferInfo& buf, uint32_t value, size_t offset, size_t size) {
+    vkCmdFillBuffer(commandBuffer_, buf.buffer, (VkDeviceSize)offset, (VkDeviceSize)size, value);
+}
+
+/* ---- Instance creation ---- */
+
 bool VulkanComputeRunner::createInstance(bool enableValidation) {
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
