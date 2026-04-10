@@ -216,9 +216,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Token %d: CPU forward failed\n", i);
             pass = 0;
         } else {
-            /* Compare (dp4a INT8 quantization widens tolerance) */
+            /* Compare (dp4a INT8 quantization widens expected error) */
             float err = rel_l2_error(gpu_out, cpu_out, n_embd);
-            float tol = getenv("CUDA_LLM_NO_DP4A") ? 1e-2f : 0.5f;
+            float tol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
             const char *status = (err < tol) ? "OK" : "MISMATCH";
             if (err >= tol) pass = 0;
 
@@ -283,9 +283,11 @@ int main(int argc, char **argv) {
     double prefill_ms = get_time_ms() - t0;
     if (prefill_hidden) {
         float err = rel_l2_error(prefill_hidden, last_gpu_hidden, n_embd);
+        /* dp4a decode vs non-dp4a prefill will diverge — relax threshold */
+        float ptol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
         fprintf(stderr, "Prefill hidden: %.1f ms (%.1f tok/s) rel_L2_vs_seq=%.6f\n",
                 prefill_ms, prefill_ms > 0 ? (1000.0 * max_tokens / prefill_ms) : 0.0, err);
-        if (err >= 1e-2f) pass = 0;
+        if (err >= ptol) pass = 0;
     } else {
         fprintf(stderr, "Prefill hidden failed\n");
         pass = 0;

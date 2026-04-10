@@ -98,11 +98,12 @@ void cuda_llm_set_max_layers(cuda_llm_runner *r, int max_layers);
  * where GGUF doesn't include biases). Returns number of biases loaded. */
 int cuda_llm_inject_biases(cuda_llm_runner *r, const char *safetensors_path);
 
-/* Query model dimensions (valid after load_weights). */
+/* Query model dimensions and capabilities (valid after load_weights). */
 int cuda_llm_n_embd(const cuda_llm_runner *r);
 int cuda_llm_n_layers(const cuda_llm_runner *r);
 int cuda_llm_n_vocab(const cuda_llm_runner *r);
 int cuda_llm_max_seq_len(const cuda_llm_runner *r);
+int cuda_llm_uses_dp4a(const cuda_llm_runner *r);
 
 /* GPU Vision Encoder: run Gemma4 ViT on GPU using runner's CUDA context.
  * mmproj_gguf: opened mmproj GGUF (must stay open during encode).
