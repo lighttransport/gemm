@@ -16,6 +16,13 @@
 #include <string.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+
+static double get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 /* transformer.h header-only: gives us qtensor type + dequant declarations */
 #include "../../common/ggml_dequant.h"
@@ -474,6 +481,86 @@ static const char *cuda_kernel_source =
 "        int n_warps = (nthreads + 31) / 32;\n"
 "        for (int w = 0; w < n_warps; w++) total += warp_sums[w];\n"
 "        dst[row] = total;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 12c. matvec_q8_0_f32_fused2: Fused gate+up Q8_0 matvec ---- */\n"
+"/* Computes dst1[row] = mat1[row] . x and dst2[row] = mat2[row] . x simultaneously. */\n"
+"/* Each block handles one row, reading input x from shared memory. */\n"
+"__global__ void matvec_q8_0_f32_fused2(float *dst1, float *dst2,\n"
+"                                        const unsigned char *mat1, const unsigned char *mat2,\n"
+"                                        const float *x, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int n_blocks_per_row = n_cols / 32;\n"
+"    int row_bytes = n_blocks_per_row * 36;\n"
+"    const unsigned char *rp1 = mat1 + (size_t)row * row_bytes;\n"
+"    const unsigned char *rp2 = mat2 + (size_t)row * row_bytes;\n"
+"    float sum1 = 0.0f, sum2 = 0.0f;\n"
+"    for (int b = tid; b < n_blocks_per_row; b += nthreads) {\n"
+"        const unsigned char *bp1 = rp1 + b * 36;\n"
+"        const unsigned char *bp2 = rp2 + b * 36;\n"
+"        float d1 = half_to_float(*(const half_raw *)bp1);\n"
+"        float d2 = half_to_float(*(const half_raw *)bp2);\n"
+"        const signed char *qs1 = (const signed char *)(bp1 + 4);\n"
+"        const signed char *qs2 = (const signed char *)(bp2 + 4);\n"
+"        const float *xb = x + b * 32;\n"
+"        float p1 = 0.0f, p2 = 0.0f;\n"
+"        for (int k = 0; k < 32; k++) {\n"
+"            float xv = xb[k];\n"
+"            p1 += (float)qs1[k] * xv;\n"
+"            p2 += (float)qs2[k] * xv;\n"
+"        }\n"
+"        sum1 += p1 * d1;\n"
+"        sum2 += p2 * d2;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        sum1 += __shfl_down_sync(0xFFFFFFFF, sum1, offset);\n"
+"        sum2 += __shfl_down_sync(0xFFFFFFFF, sum2, offset);\n"
+"    }\n"
+"    __shared__ float ws1[8], ws2[8];\n"
+"    int warp_id = tid / 32, lane = tid % 32;\n"
+"    if (lane == 0) { ws1[warp_id] = sum1; ws2[warp_id] = sum2; }\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float t1 = 0.0f, t2 = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) { t1 += ws1[w]; t2 += ws2[w]; }\n"
+"        dst1[row] = t1; dst2[row] = t2;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 12d. matvec_f16_f32_fused2: Fused gate+up F16 matvec ---- */\n"
+"__global__ void matvec_f16_f32_fused2(float *dst1, float *dst2,\n"
+"                                       const half_raw *mat1, const half_raw *mat2,\n"
+"                                       const float *x, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    const half_raw *rp1 = mat1 + (size_t)row * n_cols;\n"
+"    const half_raw *rp2 = mat2 + (size_t)row * n_cols;\n"
+"    float sum1 = 0.0f, sum2 = 0.0f;\n"
+"    for (int i = tid; i < n_cols; i += nthreads) {\n"
+"        float xv = x[i];\n"
+"        sum1 += half_to_float(rp1[i]) * xv;\n"
+"        sum2 += half_to_float(rp2[i]) * xv;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        sum1 += __shfl_down_sync(0xFFFFFFFF, sum1, offset);\n"
+"        sum2 += __shfl_down_sync(0xFFFFFFFF, sum2, offset);\n"
+"    }\n"
+"    __shared__ float ws1[8], ws2[8];\n"
+"    int warp_id = tid / 32, lane = tid % 32;\n"
+"    if (lane == 0) { ws1[warp_id] = sum1; ws2[warp_id] = sum2; }\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float t1 = 0.0f, t2 = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) { t1 += ws1[w]; t2 += ws2[w]; }\n"
+"        dst1[row] = t1; dst2[row] = t2;\n"
 "    }\n"
 "}\n"
 "\n"
@@ -2903,6 +2990,13 @@ static const char *cuda_kernel_source =
 "\n"
 "/* ==== Batched Prefill Kernels ==== */\n"
 "\n"
+"/* Convert F32 array to F16 in-place (output to separate buffer) */\n"
+"__global__ void convert_f32_to_f16(half_raw *out, const float *in, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    out[i] = float_to_half(in[i]);\n"
+"}\n"
+"\n"
 "/* Batched F16 embedding lookup: output[token, i] = embd[token_ids[token], i] */\n"
 "__global__ void batch_embed_f16(float *output, const half_raw *embd_table, const int *token_ids,\n"
 "                                 int n_embd, int n_tokens) {\n"
@@ -3609,9 +3703,11 @@ typedef struct {
     CUdeviceptr ssm_qkv_w;      /* [qkv_dim, n_embd] quantized */
     CUdeviceptr ssm_qkv_w_f16;  /* optional F16 shadow copy for batched Q8_0 prefill */
     CUdeviceptr ssm_gate_w;     /* [d_inner, n_embd] quantized */
+    CUdeviceptr ssm_gate_w_f16; /* optional F16 shadow */
     CUdeviceptr ssm_alpha_w;    /* [dt_rank, n_embd] quantized */
     CUdeviceptr ssm_beta_w;     /* [dt_rank, n_embd] quantized */
     CUdeviceptr ssm_out_w;      /* [n_embd, d_inner] quantized */
+    CUdeviceptr ssm_out_w_f16;  /* optional F16 shadow */
     CUdeviceptr ssm_a;          /* [dt_rank] F32 */
     CUdeviceptr ssm_dt_bias;    /* [dt_rank] F32 */
     CUdeviceptr ssm_conv1d_w;   /* [qkv_dim * conv_k] F32 */
@@ -3667,6 +3763,8 @@ struct cuda_llm_runner {
     CUfunction fn_quantize_f32_to_int8;
     CUfunction fn_matvec_q8_0_dp4a;
     CUfunction fn_matvec_q8_0_f32;
+    CUfunction fn_matvec_q8_0_f32_fused2;
+    CUfunction fn_matvec_f16_f32_fused2;
     CUfunction fn_embed_q8_0;
     CUfunction fn_matvec_q2_K_f32;
     CUfunction fn_matvec_q3_K_f32;
@@ -3705,6 +3803,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_tq2_0_f32;
 
     /* Batched prefill kernels */
+    CUfunction fn_convert_f32_to_f16;
     CUfunction fn_batch_embed_f16;
     CUfunction fn_batch_matvec_q8_0_f32;
     CUfunction fn_batch_matvec_q2_K;
@@ -3845,6 +3944,23 @@ struct cuda_llm_runner {
     CUdeviceptr d_xb_scale; /* F32 [1] */
     CUdeviceptr d_hidden_snapshots; /* optional packed [3 * n_embd] snapshot buffer */
 
+    /* Pre-allocated batch prefill buffers (allocated on first use, reused) */
+    int batch_buf_max_tokens;   /* max tokens these buffers can handle */
+    CUdeviceptr d_batch_x;      /* [max_tokens * n_embd] */
+    CUdeviceptr d_batch_xb;     /* [max_tokens * n_embd] */
+    CUdeviceptr d_batch_wide;   /* [max_tokens * wide_dim] */
+    CUdeviceptr d_batch_q;      /* [max_tokens * q_dim] */
+    CUdeviceptr d_batch_mid;    /* [max_tokens * mid_dim] */
+    CUdeviceptr d_batch_k;      /* [max_tokens * kv_dim] */
+    CUdeviceptr d_batch_v;      /* [max_tokens * kv_dim] */
+    CUdeviceptr d_batch_ff1;    /* [max_tokens * n_ff] */
+    CUdeviceptr d_batch_ff2;    /* [max_tokens * n_ff] */
+    CUdeviceptr d_batch_alpha;  /* [max_tokens * dt_rank] */
+    CUdeviceptr d_batch_beta;   /* [max_tokens * dt_rank] */
+    CUdeviceptr d_batch_token_ids; /* [max_tokens] int32 */
+    CUdeviceptr d_batch_f16_scratch; /* [max_tokens * max_dim] F16 for cuBLAS input conversion */
+    int cublas_needs_f16_input; /* 1 = mixed F16×F32 GEMM not supported (Blackwell) */
+
     /* Host output buffer */
     float *h_output;     /* [n_embd] or [n_vocab] for logits */
     CUdeviceptr d_logits; /* [n_vocab] GPU logits buffer */
@@ -3875,7 +3991,7 @@ static int cuda_llm_bind_context(cuda_llm_runner *r) {
 /* NVRTC kernel compilation                                                 */
 /* ======================================================================== */
 
-#define CLLM_PTX_CACHE_VERSION 5
+#define CLLM_PTX_CACHE_VERSION 7
 
 static int cllm_read_file(const char *path, char **out_data, size_t *out_size) {
     FILE *fp = fopen(path, "rb");
@@ -4017,6 +4133,8 @@ lookup_funcs:
     GET_FUNC(quantize_f32_to_int8);
     GET_FUNC(matvec_q8_0_dp4a);
     GET_FUNC(matvec_q8_0_f32);
+    GET_FUNC(matvec_q8_0_f32_fused2);
+    GET_FUNC(matvec_f16_f32_fused2);
     GET_FUNC(embed_q8_0);
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q3_K_f32);
@@ -4063,6 +4181,7 @@ lookup_funcs:
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(rope_with_factors_f32);
     /* Batched prefill kernels */
+    GET_FUNC(convert_f32_to_f16);
     GET_FUNC(batch_embed_f16);
     GET_FUNC(batch_matvec_q8_0_f32);
     GET_FUNC(batch_matvec_q2_K);
@@ -5020,9 +5139,11 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             LOAD_SSM_W(ssm_qkv_w,   "attn_qkv",  ssm_qkv_rows,   ssm_qkv_cols,   ssm_qkv_type);
             if (upload_q8_0_shadow_f16(r, &cl->ssm_qkv_w_f16, &t) != 0) return -1;
             LOAD_SSM_W(ssm_gate_w,   "attn_gate",  ssm_gate_rows,  ssm_gate_cols,  ssm_gate_type);
+            if (upload_q8_0_shadow_f16(r, &cl->ssm_gate_w_f16, &t) != 0) return -1;
             LOAD_SSM_W(ssm_alpha_w,  "ssm_alpha",  ssm_alpha_rows, ssm_alpha_cols, ssm_alpha_type);
             LOAD_SSM_W(ssm_beta_w,   "ssm_beta",   ssm_beta_rows,  ssm_beta_cols,  ssm_beta_type);
             LOAD_SSM_W(ssm_out_w,    "ssm_out",    ssm_out_rows,   ssm_out_cols,   ssm_out_type);
+            if (upload_q8_0_shadow_f16(r, &cl->ssm_out_w_f16, &t) != 0) return -1;
             #undef LOAD_SSM_W
 
             /* ssm_a (F32, no .weight suffix) */
@@ -5878,6 +5999,28 @@ static inline void launch_matvec_q8(cuda_llm_runner *r, CUdeviceptr dst, CUdevic
                    0, r->stream, args, NULL);
 }
 
+static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                       CUdeviceptr x, int n_rows, int n_cols, int weight_type);
+
+static inline void launch_matvec_fused2(cuda_llm_runner *r,
+                                         CUdeviceptr dst1, CUdeviceptr dst2,
+                                         CUdeviceptr mat1, CUdeviceptr mat2,
+                                         CUdeviceptr x, int n_rows, int n_cols, int type) {
+    if (type == GGML_TYPE_Q8_0) {
+        void *args[] = { &dst1, &dst2, &mat1, &mat2, &x, &n_rows, &n_cols };
+        cuLaunchKernel(r->fn_matvec_q8_0_f32_fused2,
+                       n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else if (type == GGML_TYPE_F16) {
+        void *args[] = { &dst1, &dst2, &mat1, &mat2, &x, &n_rows, &n_cols };
+        cuLaunchKernel(r->fn_matvec_f16_f32_fused2,
+                       n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else {
+        /* Fallback: two separate launches */
+        launch_matvec_auto(r, dst1, mat1, x, n_rows, n_cols, type);
+        launch_matvec_auto(r, dst2, mat2, x, n_rows, n_cols, type);
+    }
+}
+
 static inline void launch_matvec_q8_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                          CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -6354,6 +6497,10 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
         free(ple_host); free(proj_out); free(tok_ple); free(h_x);
     }
 
+    /* Decode profiling (debug_layers >= 2 and first 3 positions) */
+    double dec_prof_ssm = 0, dec_prof_attn = 0, dec_prof_ffn = 0, dec_prof_proj = 0;
+    int dec_do_prof = (r->debug_layers >= 2 && position < 3);
+
     for (int l = 0; l < n_run_layers; l++) {
         cuda_layer *cl = &r->layers[l];
 
@@ -6547,11 +6694,23 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             int dt_rank = r->ssm_dt_rank;
             int conv_k  = r->ssm_conv_kernel;
 
+            if (dec_do_prof) cuStreamSynchronize(r->stream);
+            double _dp0 = dec_do_prof ? get_time_ms() : 0;
             /* 1. Linear projections */
             launch_matvec_auto(r, r->d_ssm_qkv,   cl->ssm_qkv_w,   r->d_xb, cl->ssm_qkv_rows,   cl->ssm_qkv_cols,   cl->ssm_qkv_type);
             launch_matvec_auto(r, r->d_ssm_z,      cl->ssm_gate_w,  r->d_xb, cl->ssm_gate_rows,  cl->ssm_gate_cols,  cl->ssm_gate_type);
-            launch_matvec_auto(r, r->d_ssm_alpha,  cl->ssm_alpha_w, r->d_xb, cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
-            launch_matvec_auto(r, r->d_ssm_beta,   cl->ssm_beta_w,  r->d_xb, cl->ssm_beta_rows,  cl->ssm_beta_cols,  cl->ssm_beta_type);
+            /* Fuse alpha+beta when same type+dims */
+            if (cl->ssm_alpha_type == cl->ssm_beta_type &&
+                cl->ssm_alpha_rows == cl->ssm_beta_rows &&
+                cl->ssm_alpha_cols == cl->ssm_beta_cols) {
+                launch_matvec_fused2(r, r->d_ssm_alpha, r->d_ssm_beta,
+                    cl->ssm_alpha_w, cl->ssm_beta_w, r->d_xb,
+                    cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
+            } else {
+                launch_matvec_auto(r, r->d_ssm_alpha,  cl->ssm_alpha_w, r->d_xb, cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
+                launch_matvec_auto(r, r->d_ssm_beta,   cl->ssm_beta_w,  r->d_xb, cl->ssm_beta_rows,  cl->ssm_beta_cols,  cl->ssm_beta_type);
+            }
+            if (dec_do_prof) { cuStreamSynchronize(r->stream); dec_prof_proj += get_time_ms() - _dp0; }
 
             /* Detailed debug output for layer 0 */
             if (r->debug_layers >= 2 && l == 0) {
@@ -6575,6 +6734,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                         beta_dbg[0],beta_dbg[1],beta_dbg[2],beta_dbg[3],beta_dbg[4],beta_dbg[5],beta_dbg[6],beta_dbg[7],beta_dbg[8],beta_dbg[9]);
             }
 
+            if (dec_do_prof) { cuStreamSynchronize(r->stream); _dp0 = get_time_ms(); }
             /* 2. alpha = softplus(alpha + dt_bias) * ssm_a */
             launch_softplus_mul(r, r->d_ssm_alpha, r->d_ssm_alpha, cl->ssm_dt_bias, cl->ssm_a, dt_rank);
 
@@ -6833,12 +6993,16 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                 xchk_conv_out = NULL; /* prevent double free */
             }
 
+            if (dec_do_prof) { cuStreamSynchronize(r->stream); dec_prof_ssm += get_time_ms() - _dp0; _dp0 = get_time_ms(); }
             /* 9. Output projection: xb = ssm_out @ out */
             launch_matvec_auto(r, r->d_xb, cl->ssm_out_w, r->d_ssm_out,
                               cl->ssm_out_rows, cl->ssm_out_cols, cl->ssm_out_type);
+            if (dec_do_prof) { cuStreamSynchronize(r->stream); dec_prof_proj += get_time_ms() - _dp0; }
 
         } else if (r->is_hybrid) {
             /* === Gated attention layer (Qwen3.5) === */
+            if (dec_do_prof) cuStreamSynchronize(r->stream);
+            double _dp0 = dec_do_prof ? get_time_ms() : 0;
             /* Q+gate combined projection into xb2 */
             launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
                               cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
@@ -7024,6 +7188,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
         } else {
             /* === Standard attention (non-hybrid) === */
+            if (dec_do_prof) cuStreamSynchronize(r->stream);
+            double _dp0 = dec_do_prof ? get_time_ms() : 0;
             /* Q/K/V projections (auto-dispatch) */
             launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
             if (cl->attn_q_bias) launch_add(r, r->d_q, cl->attn_q_bias, cl->attn_q_rows);
@@ -7056,6 +7222,7 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             /* Output projection */
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+            if (dec_do_prof) { cuStreamSynchronize(r->stream); dec_prof_attn += get_time_ms() - _dp0; }
         }
 
         /* Gemma4 already did its own residual + FFN above — skip shared code */
@@ -7080,6 +7247,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
         }
 
         /* FFN RMSNorm: xb = rmsnorm(x, ffn_norm) */
+        if (dec_do_prof) cuStreamSynchronize(r->stream);
+        double _dfn0 = dec_do_prof ? get_time_ms() : 0;
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
 
         if (cl->is_moe) {
@@ -7234,11 +7403,19 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
         } else {
             /* ---- Dense FFN ---- */
-            /* FFN gate and up projections */
-            launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
-                          cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
-            launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
-                          cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+            /* FFN gate and up projections (fused when same type+dims) */
+            if (cl->ffn_gate_type == cl->ffn_up_type &&
+                cl->ffn_gate_rows == cl->ffn_up_rows &&
+                cl->ffn_gate_cols == cl->ffn_up_cols) {
+                launch_matvec_fused2(r, r->d_gate, r->d_up,
+                    cl->ffn_gate_w, cl->ffn_up_w, r->d_xb,
+                    cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
+            } else {
+                launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                              cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
+                launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                              cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+            }
 
             /* SiLU(gate) * up */
             launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
@@ -7247,6 +7424,8 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                           cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
         }
+
+        if (dec_do_prof) { cuStreamSynchronize(r->stream); dec_prof_ffn += get_time_ms() - _dfn0; }
 
         /* CPU cross-check of FFN matvecs for layer 0 (debug_layers >= 3, dense only) */
         if (r->debug_layers >= 3 && l == 0 && !cl->is_moe) {
@@ -7406,6 +7585,12 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             free(full_x);
         }
 
+    }
+
+    if (dec_do_prof) {
+        fprintf(stderr, "cuda_llm: decode profile (pos=%d): proj=%.2fms ssm=%.2fms attn=%.2fms ffn=%.2fms total=%.2fms\n",
+                position, dec_prof_proj, dec_prof_ssm, dec_prof_attn, dec_prof_ffn,
+                dec_prof_proj + dec_prof_ssm + dec_prof_attn + dec_prof_ffn);
     }
 
     if (apply_final_norm) {
@@ -7588,13 +7773,20 @@ static void launch_batch_matvec(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr
                                  CUdeviceptr mat_f16, CUdeviceptr input, int out_dim, int in_dim,
                                  int n_tokens, int weight_type) {
     if (n_tokens > 1 && r->use_cublas && r->cublas) {
-        if (weight_type == GGML_TYPE_F16) {
-            if (cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, dst, mat, input, n_tokens, out_dim, in_dim) == 0) {
+        CUdeviceptr w_f16 = (weight_type == GGML_TYPE_F16) ? mat : mat_f16;
+        if (w_f16) {
+            /* Try mixed F16×F32 first (fast path, pre-Blackwell) */
+            if (cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, dst, w_f16, input, n_tokens, out_dim, in_dim) == 0) {
                 return;
             }
-        } else if (mat_f16) {
-            if (cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, dst, mat_f16, input, n_tokens, out_dim, in_dim) == 0) {
-                return;
+            /* Fallback: convert F32 input to F16, use all-F16 GEMM (Blackwell) */
+            if (r->d_batch_f16_scratch) {
+                int n_elems = n_tokens * in_dim;
+                void *cvt_args[] = { &r->d_batch_f16_scratch, &input, &n_elems };
+                cuLaunchKernel(r->fn_convert_f32_to_f16, (n_elems + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, cvt_args, NULL);
+                if (cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, dst, w_f16, r->d_batch_f16_scratch, n_tokens, out_dim, in_dim) == 0) {
+                    return;
+                }
             }
         }
     }
@@ -7685,10 +7877,82 @@ static void launch_batch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevice
                    256, 1, 1, smem, r->stream, args, NULL);
 }
 
+/* Ensure pre-allocated batch buffers are large enough for n_tokens */
+static int cuda_llm_ensure_batch_buffers(cuda_llm_runner *r, int n_tokens) {
+    if (n_tokens <= r->batch_buf_max_tokens) return 0;
+
+    int n_embd = r->n_embd;
+    int n_heads = r->n_heads;
+    int n_kv_heads = r->n_kv_heads;
+    int head_dim = r->head_dim;
+    int n_ff = r->n_ff;
+    int q_dim = n_heads * head_dim;
+    int q2_dim = 2 * q_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int qkv_dim = r->ssm_qkv_dim;
+    int d_inner = r->ssm_d_inner;
+    int dt_rank = r->ssm_dt_rank;
+    int wide_dim = q2_dim > qkv_dim ? q2_dim : qkv_dim;
+    int mid_dim = q_dim > d_inner ? q_dim : d_inner;
+
+    /* Free old buffers */
+    if (r->d_batch_x)     { cuMemFree(r->d_batch_x);     r->d_batch_x = 0; }
+    if (r->d_batch_xb)    { cuMemFree(r->d_batch_xb);    r->d_batch_xb = 0; }
+    if (r->d_batch_wide)  { cuMemFree(r->d_batch_wide);  r->d_batch_wide = 0; }
+    if (r->d_batch_q)     { cuMemFree(r->d_batch_q);     r->d_batch_q = 0; }
+    if (r->d_batch_mid)   { cuMemFree(r->d_batch_mid);   r->d_batch_mid = 0; }
+    if (r->d_batch_k)     { cuMemFree(r->d_batch_k);     r->d_batch_k = 0; }
+    if (r->d_batch_v)     { cuMemFree(r->d_batch_v);     r->d_batch_v = 0; }
+    if (r->d_batch_ff1)   { cuMemFree(r->d_batch_ff1);   r->d_batch_ff1 = 0; }
+    if (r->d_batch_ff2)   { cuMemFree(r->d_batch_ff2);   r->d_batch_ff2 = 0; }
+    if (r->d_batch_alpha) { cuMemFree(r->d_batch_alpha);  r->d_batch_alpha = 0; }
+    if (r->d_batch_beta)  { cuMemFree(r->d_batch_beta);   r->d_batch_beta = 0; }
+    if (r->d_batch_token_ids) { cuMemFree(r->d_batch_token_ids); r->d_batch_token_ids = 0; }
+    r->batch_buf_max_tokens = 0;
+
+    /* Allocate with some headroom to avoid frequent reallocations */
+    int alloc_tokens = n_tokens < 128 ? 128 : ((n_tokens + 63) & ~63);
+
+    #define ALLOC_BATCH(field, elems) do { \
+        if (cuMemAlloc(&r->field, (size_t)(alloc_tokens) * (elems) * sizeof(float)) != CUDA_SUCCESS) return -1; \
+    } while(0)
+    ALLOC_BATCH(d_batch_x, n_embd);
+    ALLOC_BATCH(d_batch_xb, n_embd);
+    ALLOC_BATCH(d_batch_wide, wide_dim);
+    ALLOC_BATCH(d_batch_q, q_dim);
+    ALLOC_BATCH(d_batch_mid, mid_dim);
+    ALLOC_BATCH(d_batch_k, kv_dim);
+    ALLOC_BATCH(d_batch_v, kv_dim);
+    ALLOC_BATCH(d_batch_ff1, n_ff);
+    ALLOC_BATCH(d_batch_ff2, n_ff);
+    ALLOC_BATCH(d_batch_alpha, dt_rank);
+    ALLOC_BATCH(d_batch_beta, dt_rank);
+    #undef ALLOC_BATCH
+    if (cuMemAlloc(&r->d_batch_token_ids, (size_t)alloc_tokens * sizeof(int32_t)) != CUDA_SUCCESS) return -1;
+
+    /* Allocate F16 scratch for cuBLAS input conversion if needed */
+    int max_in_dim = n_embd > n_ff ? n_embd : n_ff;
+    if (max_in_dim < qkv_dim) max_in_dim = qkv_dim;
+    if (max_in_dim < d_inner) max_in_dim = d_inner;
+    if (r->d_batch_f16_scratch) { cuMemFree(r->d_batch_f16_scratch); r->d_batch_f16_scratch = 0; }
+    if (r->use_cublas && r->cublas) {
+        if (cuMemAlloc(&r->d_batch_f16_scratch, (size_t)alloc_tokens * max_in_dim * sizeof(uint16_t)) != CUDA_SUCCESS) {
+            r->d_batch_f16_scratch = 0;
+        }
+    }
+
+    r->batch_buf_max_tokens = alloc_tokens;
+    if (r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: allocated batch buffers for %d tokens\n", alloc_tokens);
+    }
+    return 0;
+}
+
 static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_ids,
                                        const float *embeddings, int embd_stride,
                                        int n_tokens, int start_pos) {
     if (cuda_llm_bind_context(r) != 0) return NULL;
+    if (cuda_llm_ensure_batch_buffers(r, n_tokens) != 0) return NULL;
 
     int n_embd = r->n_embd;
     int n_heads = r->n_heads;
@@ -7712,36 +7976,24 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
     if (r->max_layers > 0 && r->max_layers < n_layers) n_layers = r->max_layers;
 
     size_t batch_embd_bytes = (size_t)n_tokens * n_embd * sizeof(float);
-    size_t batch_wide_bytes = (size_t)n_tokens * wide_dim * sizeof(float);
-    size_t batch_q_bytes = (size_t)n_tokens * q_dim * sizeof(float);
-    size_t batch_mid_bytes = (size_t)n_tokens * mid_dim * sizeof(float);
-    size_t batch_k_bytes = (size_t)n_tokens * kv_dim * sizeof(float);
-    size_t batch_ff_bytes = (size_t)n_tokens * n_ff * sizeof(float);
-    size_t batch_alpha_bytes = (size_t)n_tokens * dt_rank * sizeof(float);
 
-    CUdeviceptr d_batch_x = 0, d_batch_xb = 0, d_batch_wide = 0;
-    CUdeviceptr d_batch_q = 0, d_batch_mid = 0, d_batch_k = 0, d_batch_v = 0;
-    CUdeviceptr d_batch_ff1 = 0, d_batch_ff2 = 0;
-    CUdeviceptr d_batch_alpha = 0, d_batch_beta = 0, d_token_ids = 0;
+    CUdeviceptr d_batch_x = r->d_batch_x;
+    CUdeviceptr d_batch_xb = r->d_batch_xb;
+    CUdeviceptr d_batch_wide = r->d_batch_wide;
+    CUdeviceptr d_batch_q = r->d_batch_q;
+    CUdeviceptr d_batch_mid = r->d_batch_mid;
+    CUdeviceptr d_batch_k = r->d_batch_k;
+    CUdeviceptr d_batch_v = r->d_batch_v;
+    CUdeviceptr d_batch_ff1 = r->d_batch_ff1;
+    CUdeviceptr d_batch_ff2 = r->d_batch_ff2;
+    CUdeviceptr d_batch_alpha = r->d_batch_alpha;
+    CUdeviceptr d_batch_beta = r->d_batch_beta;
     float *result = NULL;
-
-    if (cuMemAlloc(&d_batch_x, batch_embd_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_xb, batch_embd_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_wide, batch_wide_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_q, batch_q_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_mid, batch_mid_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_k, batch_k_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_v, batch_k_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_ff1, batch_ff_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_ff2, batch_ff_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_alpha, batch_alpha_bytes) != CUDA_SUCCESS) goto cleanup;
-    if (cuMemAlloc(&d_batch_beta, batch_alpha_bytes) != CUDA_SUCCESS) goto cleanup;
 
     if (token_ids) {
         if (r->token_embd_type == GGML_TYPE_F16) {
-            if (cuMemAlloc(&d_token_ids, (size_t)n_tokens * sizeof(int32_t)) != CUDA_SUCCESS) goto cleanup;
-            if (cuMemcpyHtoD(d_token_ids, token_ids, (size_t)n_tokens * sizeof(int32_t)) != CUDA_SUCCESS) goto cleanup;
-            launch_batch_embed_f16(r, d_batch_x, r->d_token_embd, d_token_ids, n_embd, n_tokens);
+            if (cuMemcpyHtoD(r->d_batch_token_ids, token_ids, (size_t)n_tokens * sizeof(int32_t)) != CUDA_SUCCESS) return NULL;
+            launch_batch_embed_f16(r, d_batch_x, r->d_token_embd, r->d_batch_token_ids, n_embd, n_tokens);
         } else {
             for (int t = 0; t < n_tokens; t++) {
                 if (r->token_embd_type == GGML_TYPE_Q8_0) {
@@ -7761,7 +8013,7 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
         }
     } else if (embeddings) {
         if (embd_stride == n_embd) {
-            if (cuMemcpyHtoD(d_batch_x, embeddings, batch_embd_bytes) != CUDA_SUCCESS) goto cleanup;
+            if (cuMemcpyHtoD(d_batch_x, embeddings, batch_embd_bytes) != CUDA_SUCCESS) return NULL;
         } else {
             for (int t = 0; t < n_tokens; t++) {
                 CUdeviceptr dst_t = d_batch_x + (size_t)t * n_embd * sizeof(float);
@@ -7770,8 +8022,12 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
             }
         }
     } else {
-        goto cleanup;
+        return NULL;
     }
+
+    /* Profiling accumulators */
+    double prof_gemm_ms = 0, prof_ssm_ms = 0, prof_attn_ms = 0, prof_ffn_ms = 0, prof_other_ms = 0;
+    int do_prof = (r->verbose >= 1 && n_tokens > 1);
 
     for (int l = 0; l < n_layers; l++) {
         cuda_layer *cl = &r->layers[l];
@@ -7783,14 +8039,17 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
         }
 
         if (cl->is_ssm) {
+            if (do_prof) cuStreamSynchronize(r->stream);
+            double _t0 = do_prof ? get_time_ms() : 0;
             launch_batch_matvec(r, d_batch_wide, cl->ssm_qkv_w, cl->ssm_qkv_w_f16, d_batch_xb,
                                 qkv_dim, n_embd, n_tokens, cl->ssm_qkv_type);
-            launch_batch_matvec(r, d_batch_q, cl->ssm_gate_w, 0, d_batch_xb,
+            launch_batch_matvec(r, d_batch_q, cl->ssm_gate_w, cl->ssm_gate_w_f16, d_batch_xb,
                                 d_inner, n_embd, n_tokens, cl->ssm_gate_type);
             launch_batch_matvec(r, d_batch_alpha, cl->ssm_alpha_w, 0, d_batch_xb,
                                 dt_rank, n_embd, n_tokens, cl->ssm_alpha_type);
             launch_batch_matvec(r, d_batch_beta, cl->ssm_beta_w, 0, d_batch_xb,
                                 dt_rank, n_embd, n_tokens, cl->ssm_beta_type);
+            if (do_prof) { cuStreamSynchronize(r->stream); prof_gemm_ms += get_time_ms() - _t0; _t0 = get_time_ms(); }
 
             launch_batch_softplus_mul(r, d_batch_alpha, d_batch_alpha,
                                       cl->ssm_dt_bias, cl->ssm_a, dt_rank, n_tokens);
@@ -7807,15 +8066,20 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
                                        d_batch_alpha, d_batch_beta, n_tokens, dt_rank, d_state, n_group);
             launch_gated_rmsnorm_silu(r, d_batch_mid, d_batch_q, cl->ssm_norm_w,
                                       n_tokens * dt_rank, d_state, eps);
-            launch_batch_matvec(r, d_batch_xb, cl->ssm_out_w, 0, d_batch_mid,
+            if (do_prof) { cuStreamSynchronize(r->stream); prof_ssm_ms += get_time_ms() - _t0; _t0 = get_time_ms(); }
+            launch_batch_matvec(r, d_batch_xb, cl->ssm_out_w, cl->ssm_out_w_f16, d_batch_mid,
                                 n_embd, d_inner, n_tokens, cl->ssm_out_type);
+            if (do_prof) { cuStreamSynchronize(r->stream); prof_gemm_ms += get_time_ms() - _t0; }
         } else {
+            if (do_prof) cuStreamSynchronize(r->stream);
+            double _t0 = do_prof ? get_time_ms() : 0;
             launch_batch_matvec(r, d_batch_wide, cl->attn_q_w, cl->attn_q_w_f16, d_batch_xb,
                                 q2_dim, n_embd, n_tokens, cl->attn_q_type);
             launch_batch_matvec(r, d_batch_k, cl->attn_k_w, cl->attn_k_w_f16, d_batch_xb,
                                 kv_dim, n_embd, n_tokens, cl->attn_k_type);
             launch_batch_matvec(r, d_batch_v, cl->attn_v_w, cl->attn_v_w_f16, d_batch_xb,
                                 kv_dim, n_embd, n_tokens, cl->attn_v_type);
+            if (do_prof) { cuStreamSynchronize(r->stream); prof_gemm_ms += get_time_ms() - _t0; _t0 = get_time_ms(); }
 
             launch_deinterleave_qgate(r, d_batch_q, d_batch_mid, d_batch_wide, n_tokens * n_heads, head_dim);
 
@@ -7844,10 +8108,13 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
             launch_sigmoid_mul(r, d_batch_wide, d_batch_mid, n_tokens * q_dim);
             launch_batch_matvec(r, d_batch_xb, cl->attn_output_w, cl->attn_output_w_f16, d_batch_wide,
                                 n_embd, q_dim, n_tokens, cl->attn_output_type);
+            if (do_prof) { cuStreamSynchronize(r->stream); prof_attn_ms += get_time_ms() - _t0; }
         }
 
         launch_add(r, d_batch_x, d_batch_xb, n_tokens * n_embd);
 
+        if (do_prof) cuStreamSynchronize(r->stream);
+        double _ft0 = do_prof ? get_time_ms() : 0;
         cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd_bytes, r->stream);
         {
             void *a[] = { &d_batch_xb, &cl->ffn_norm_w, &n_embd, &eps, &n_tokens };
@@ -7862,6 +8129,7 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
         launch_batch_matvec(r, d_batch_xb, cl->ffn_down_w, cl->ffn_down_w_f16, d_batch_ff1,
                             n_embd, n_ff, n_tokens, cl->ffn_down_type);
         launch_add(r, d_batch_x, d_batch_xb, n_tokens * n_embd);
+        if (do_prof) { cuStreamSynchronize(r->stream); prof_ffn_ms += get_time_ms() - _ft0; }
 
         if (embeddings && l < r->n_deepstack && embd_stride > n_embd) {
             const float *base = embeddings + (size_t)(1 + l) * n_embd;
@@ -7874,6 +8142,12 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
         }
     }
 
+    if (do_prof) {
+        fprintf(stderr, "cuda_llm: prefill profile (%d tok): gemm=%.1fms ssm=%.1fms attn=%.1fms ffn=%.1fms total=%.1fms\n",
+                n_tokens, prof_gemm_ms, prof_ssm_ms, prof_attn_ms, prof_ffn_ms,
+                prof_gemm_ms + prof_ssm_ms + prof_attn_ms + prof_ffn_ms);
+    }
+
     {
         CUdeviceptr d_last = d_batch_x + (size_t)(n_tokens - 1) * n_embd * sizeof(float);
         cuMemcpyDtoDAsync(r->d_x, d_last, (size_t)n_embd * sizeof(float), r->stream);
@@ -7883,19 +8157,6 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
         result = r->h_output;
     }
 
-cleanup:
-    if (d_token_ids) cuMemFree(d_token_ids);
-    if (d_batch_beta) cuMemFree(d_batch_beta);
-    if (d_batch_alpha) cuMemFree(d_batch_alpha);
-    if (d_batch_ff2) cuMemFree(d_batch_ff2);
-    if (d_batch_ff1) cuMemFree(d_batch_ff1);
-    if (d_batch_v) cuMemFree(d_batch_v);
-    if (d_batch_k) cuMemFree(d_batch_k);
-    if (d_batch_mid) cuMemFree(d_batch_mid);
-    if (d_batch_q) cuMemFree(d_batch_q);
-    if (d_batch_wide) cuMemFree(d_batch_wide);
-    if (d_batch_xb) cuMemFree(d_batch_xb);
-    if (d_batch_x) cuMemFree(d_batch_x);
     return result;
 }
 
@@ -7906,25 +8167,7 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     if (cuda_llm_bind_context(r) != 0) return NULL;
 
     if (r->is_hybrid && !r->is_gemma4) {
-        const char *experimental = getenv("CUDA_LLM_EXPERIMENTAL_QWEN_PREFILL");
-        if (experimental && experimental[0] && strcmp(experimental, "0") != 0) {
-            if (r->verbose >= 1) {
-                fprintf(stderr, "cuda_llm: using experimental Qwen batched prefill\n");
-            }
-            return cuda_llm_prefill_qwen35(r, token_ids, embeddings, embd_stride, n_tokens, start_pos);
-        }
-        {
-            float *result = NULL;
-            for (int t = 0; t < n_tokens; t++) {
-                if (token_ids) {
-                    result = cuda_llm_forward(r, token_ids[t], start_pos + t);
-                } else if (embeddings) {
-                    result = cuda_llm_forward_embd(r, embeddings + (size_t)t * embd_stride,
-                                                   embd_stride, start_pos + t);
-                }
-            }
-            return result;
-        }
+        return cuda_llm_prefill_qwen35(r, token_ids, embeddings, embd_stride, n_tokens, start_pos);
     }
 
     /* Fall back to sequential for models with PLE (needs GPU PLE precomputation) */
@@ -8723,9 +8966,11 @@ void cuda_llm_free(cuda_llm_runner *r) {
             if (cl->ssm_qkv_w)      cuMemFree(cl->ssm_qkv_w);
             if (cl->ssm_qkv_w_f16)  cuMemFree(cl->ssm_qkv_w_f16);
             if (cl->ssm_gate_w)     cuMemFree(cl->ssm_gate_w);
+            if (cl->ssm_gate_w_f16) cuMemFree(cl->ssm_gate_w_f16);
             if (cl->ssm_alpha_w)    cuMemFree(cl->ssm_alpha_w);
             if (cl->ssm_beta_w)     cuMemFree(cl->ssm_beta_w);
             if (cl->ssm_out_w)      cuMemFree(cl->ssm_out_w);
+            if (cl->ssm_out_w_f16)  cuMemFree(cl->ssm_out_w_f16);
             if (cl->ssm_a)          cuMemFree(cl->ssm_a);
             if (cl->ssm_dt_bias)    cuMemFree(cl->ssm_dt_bias);
             if (cl->ssm_conv1d_w)   cuMemFree(cl->ssm_conv1d_w);
@@ -8756,6 +9001,21 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_output_norm) cuMemFree(r->d_output_norm);
     if (r->d_output_w && r->d_output_w != r->d_token_embd) cuMemFree(r->d_output_w);
     if (r->d_logits) cuMemFree(r->d_logits);
+
+    /* Free batch prefill buffers */
+    if (r->d_batch_x)     cuMemFree(r->d_batch_x);
+    if (r->d_batch_xb)    cuMemFree(r->d_batch_xb);
+    if (r->d_batch_wide)  cuMemFree(r->d_batch_wide);
+    if (r->d_batch_q)     cuMemFree(r->d_batch_q);
+    if (r->d_batch_mid)   cuMemFree(r->d_batch_mid);
+    if (r->d_batch_k)     cuMemFree(r->d_batch_k);
+    if (r->d_batch_v)     cuMemFree(r->d_batch_v);
+    if (r->d_batch_ff1)   cuMemFree(r->d_batch_ff1);
+    if (r->d_batch_ff2)   cuMemFree(r->d_batch_ff2);
+    if (r->d_batch_alpha) cuMemFree(r->d_batch_alpha);
+    if (r->d_batch_beta)  cuMemFree(r->d_batch_beta);
+    if (r->d_batch_token_ids) cuMemFree(r->d_batch_token_ids);
+    if (r->d_batch_f16_scratch) cuMemFree(r->d_batch_f16_scratch);
 
     /* Free module */
     if (r->module) cuModuleUnload(r->module);

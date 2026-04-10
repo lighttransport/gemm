@@ -40,6 +40,18 @@ int cublasew_gemm_f16_f32_rowmajor_nt(cublasew_context *ctx,
                                       int n_out,
                                       int n_in);
 
+/* Row-major Y[m, n_out] = X[m, n_in] * W[n_out, n_in]^T
+ * W and X are FP16, Y is FP32, compute is FP32.
+ * Use when mixed F16×F32 is not supported (Blackwell).
+ */
+int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
+                                           CUdeviceptr d_Y,
+                                           CUdeviceptr d_W_f16,
+                                           CUdeviceptr d_X_f16,
+                                           int n_tok,
+                                           int n_out,
+                                           int n_in);
+
 #ifdef __cplusplus
 }
 #endif

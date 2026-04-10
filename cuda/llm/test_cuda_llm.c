@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    cuda_llm_set_debug(gpu, 2);  /* Print per-layer hidden state norms */
+    cuda_llm_set_debug(gpu, 0);  /* 0=off, 2=per-layer norms (adds sync overhead) */
     int n_embd = cuda_llm_n_embd(gpu);
     fprintf(stderr, "\n=== Running %d tokens (n_embd=%d)%s ===\n",
             max_tokens, n_embd, gpu_only ? " [GPU-only]" : "");
