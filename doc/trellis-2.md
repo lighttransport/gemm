@@ -178,7 +178,11 @@ ResBlock3d: `ChannelLN → SiLU → Conv3d → ChannelLN → SiLU → Conv3d + s
 | Stage 1 DiT (single step) | ✓ CORRECT | matches PyTorch exactly with same noise |
 | Stage 1 DiT + decoder (same noise) | ✓ CORRECT | 94% IoU with PyTorch reference |
 | Full pipeline (random noise) | ✓ WORKS | 7.8% occupancy with seed=42 |
-| Stages 2–3 | — | Not yet implemented |
+| Stage 2 shape flow DiT | ✓ IMPLEMENTED | Generic DiT, sparse RoPE, 12-step Euler + CFG |
+| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | GPU ConvNeXt + CPU C2S hybrid |
+| Stage 3 texture flow DiT | ✓ IMPLEMENTED | No CFG, [noise\|shape_norm] concat input |
+| Stage 3 texture decoder | ✓ IMPLEMENTED | Same GPU decoder, 6 output channels |
+| Cross-attn KV cache | ✓ IMPLEMENTED | Precomputed for all 30 blocks, saves ~2160 dispatches/stage |
 
 ### Stages 2-3
 
@@ -262,15 +266,16 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `vulkan_trellis2_runner.h` | 104 | Public API |
-| `vulkan_trellis2_runner.cc` | ~1674 | DINOv3 + DiT + decoder forward, weight loading, RoPE tables |
-| `test_vulkan_trellis2.cc` | 290 | Test harness: full/dit-only/decode-only/encode modes, .npy I/O, mesh export |
+| `vulkan_trellis2_runner.h` | ~175 | Public API (Stages 1-3, DINOv3, decoders) |
+| `vulkan_trellis2_runner.cc` | ~2500 | DINOv3 + generic DiT + Stages 1-3 sampling + GPU shape decoder + KV cache |
+| `test_vulkan_trellis2.cc` | ~400 | Test harness: full/dit-only/decode-only/encode/stage2/stage3/shape-dec/tex-dec modes |
 
 **Shaders** (`vulkan/shaders/trellis2/` — DiT + decoder):
 
 `adaln_f32`, `channel_layernorm_3d_f32`, `conv3d_k3_f32`, `dinov3_prepend_tokens_f32`,
 `gated_add_f32`, `layernorm_noaffine_f32`, `modulation_f32`, `pixel_shuffle_3d_f32`,
 `rope_2d_dinov3_f32`, `rope_3d_f32`, `self_attn_tiled_f32`, `silu_inplace_f32`,
+`sparse_conv3d_f32` (hash-table neighbor lookup, uint64 keys),
 `split_qkv_chunk_f32`, `split_kv_chunk_f32`, `timestep_embed_cossin_f32`
 
 **Shared shaders** (`vulkan/shaders/` — used by all Vulkan models):
@@ -345,8 +350,10 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 6. **Full GPU pipeline (CUDA)**: Image → DINOv3 → Stage 1 → Stage 2 → Stage 3 → mesh.
 
 ### Vulkan
-1. **DINOv3 on Vulkan**: Already working (max diff 0.011). Currently requires pre-computed
-   features passed as `.npy`; integrate into the full pipeline via `--encode` mode.
-2. **Stages 2–3 on Vulkan**: Port Stage 2 sparse DiT + shape decoder and Stage 3 texture
-   DiT + texture decoder (same architecture as Stage 1, but sparse).
-3. **F16 GEMM**: Use `matmul_coopmat_f16` for tensor-core acceleration on RDNA4.
+1. **Test Stages 2–3 on GPU**: Validate Stage 2/3 DiT + decoder against CUDA/Python reference.
+   Needs Stage 2/3 weight files downloaded to `/mnt/disk1/models/`.
+2. **F16 GEMM**: Use `matmul_coopmat_f16` for cooperative matrix acceleration on RDNA4
+   (biggest remaining perf win — all stages bottlenecked by F32 GEMM).
+3. **GPU C2S subdivision**: Move coordinate expansion + hash build to GPU to eliminate
+   CPU roundtrip in shape/texture decoder (currently hybrid GPU+CPU).
+4. **FDG mesh extraction**: Port `trellis2_fdg_mesh.h` for final textured mesh output.
