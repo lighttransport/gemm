@@ -36,7 +36,9 @@ enum {
     CUBLAS_OP_T = 1,
     CUDA_R_32F = 0,
     CUDA_R_16F = 2,
+    CUBLAS_COMPUTE_16F = 64,
     CUBLAS_COMPUTE_32F = 68,
+    CUBLAS_COMPUTE_32F_FAST_TF32 = 77,
     CUBLAS_GEMM_DEFAULT = -1
 };
 
@@ -176,12 +178,38 @@ int cublasew_gemm_f16_f32_rowmajor_nt(cublasew_context *ctx,
     const float alpha = 1.0f;
     const float beta = 0.0f;
     if (!ctx || !ctx->handle) return -1;
-    return p_cublasGemmEx(ctx->handle,
+    /* Try mixed F16×F32 first (works on pre-Blackwell) */
+    cublasStatus_t st = p_cublasGemmEx(ctx->handle,
                           CUBLAS_OP_T, CUBLAS_OP_N,
                           n_out, n_tok, n_in,
                           &alpha,
                           (const void *)(uintptr_t)d_W_f16, CUDA_R_16F, n_in,
                           (const void *)(uintptr_t)d_X_f32, CUDA_R_32F, n_in,
+                          &beta,
+                          (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) return 0;
+
+    /* Blackwell fallback: caller must provide F16 input buffer via d_X_f16 */
+    return -1;
+}
+
+int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
+                                           CUdeviceptr d_Y,
+                                           CUdeviceptr d_W_f16,
+                                           CUdeviceptr d_X_f16,
+                                           int n_tok,
+                                           int n_out,
+                                           int n_in) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    if (!ctx || !ctx->handle) return -1;
+    return p_cublasGemmEx(ctx->handle,
+                          CUBLAS_OP_T, CUBLAS_OP_N,
+                          n_out, n_tok, n_in,
+                          &alpha,
+                          (const void *)(uintptr_t)d_W_f16, CUDA_R_16F, n_in,
+                          (const void *)(uintptr_t)d_X_f16, CUDA_R_16F, n_in,
                           &beta,
                           (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
