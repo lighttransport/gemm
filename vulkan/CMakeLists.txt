@@ -97,6 +97,7 @@ set(T2_SHADER_SOURCES
     ${T2_SHADER_SOURCE_DIR}/channel_layernorm_3d_f32.comp
     ${T2_SHADER_SOURCE_DIR}/pixel_shuffle_3d_f32.comp
     ${T2_SHADER_SOURCE_DIR}/self_attn_tiled_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/sparse_conv3d_f32.comp
     ${T2_SHADER_SOURCE_DIR}/rope_2d_dinov3_f32.comp
     ${T2_SHADER_SOURCE_DIR}/dinov3_prepend_tokens_f32.comp
 )
