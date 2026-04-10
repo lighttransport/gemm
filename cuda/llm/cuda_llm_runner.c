@@ -438,6 +438,57 @@ static const char *cuda_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 11b. matvec_q8_0_dp4a_fused2: Fused gate+up Q8_0 × INT8 via dp4a ---- */\n"
+"__global__ void matvec_q8_0_dp4a_fused2(float *dst1, float *dst2,\n"
+"                                         const unsigned char *mat1, const unsigned char *mat2,\n"
+"                                         const signed char *x_q, const float *x_scale_ptr,\n"
+"                                         int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int nb = n_cols / 32;\n"
+"    int row_bytes = nb * 36;\n"
+"    const unsigned char *rp1 = mat1 + (size_t)row * row_bytes;\n"
+"    const unsigned char *rp2 = mat2 + (size_t)row * row_bytes;\n"
+"    float x_scale = *x_scale_ptr;\n"
+"    float sum1 = 0.0f, sum2 = 0.0f;\n"
+"    for (int b = tid; b < nb; b += nthreads) {\n"
+"        const unsigned char *bp1 = rp1 + b * 36;\n"
+"        const unsigned char *bp2 = rp2 + b * 36;\n"
+"        float d1 = half_to_float(*(const half_raw *)bp1);\n"
+"        float d2 = half_to_float(*(const half_raw *)bp2);\n"
+"        const int *w1 = (const int *)(bp1 + 4);\n"
+"        const int *w2 = (const int *)(bp2 + 4);\n"
+"        const int *x4 = (const int *)(x_q + b * 32);\n"
+"        int a1 = 0, a2 = 0;\n"
+"        a1 = dp4a_s8(w1[0], x4[0], a1); a2 = dp4a_s8(w2[0], x4[0], a2);\n"
+"        a1 = dp4a_s8(w1[1], x4[1], a1); a2 = dp4a_s8(w2[1], x4[1], a2);\n"
+"        a1 = dp4a_s8(w1[2], x4[2], a1); a2 = dp4a_s8(w2[2], x4[2], a2);\n"
+"        a1 = dp4a_s8(w1[3], x4[3], a1); a2 = dp4a_s8(w2[3], x4[3], a2);\n"
+"        a1 = dp4a_s8(w1[4], x4[4], a1); a2 = dp4a_s8(w2[4], x4[4], a2);\n"
+"        a1 = dp4a_s8(w1[5], x4[5], a1); a2 = dp4a_s8(w2[5], x4[5], a2);\n"
+"        a1 = dp4a_s8(w1[6], x4[6], a1); a2 = dp4a_s8(w2[6], x4[6], a2);\n"
+"        a1 = dp4a_s8(w1[7], x4[7], a1); a2 = dp4a_s8(w2[7], x4[7], a2);\n"
+"        sum1 += (float)a1 * d1 * x_scale;\n"
+"        sum2 += (float)a2 * d2 * x_scale;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        sum1 += __shfl_down_sync(0xFFFFFFFF, sum1, offset);\n"
+"        sum2 += __shfl_down_sync(0xFFFFFFFF, sum2, offset);\n"
+"    }\n"
+"    __shared__ float ws1[8], ws2[8];\n"
+"    int warp_id = tid / 32, lane = tid % 32;\n"
+"    if (lane == 0) { ws1[warp_id] = sum1; ws2[warp_id] = sum2; }\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float t1 = 0.0f, t2 = 0.0f;\n"
+"        int nw = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < nw; w++) { t1 += ws1[w]; t2 += ws2[w]; }\n"
+"        dst1[row] = t1; dst2[row] = t2;\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- 12b. matvec_q8_0_f32: Q8_0 matrix x F32 vector -> F32 (accurate) ---- */\n"
 "/* Dequants Q8_0 weights on-the-fly, no input quantization needed. */\n"
 "/* Padded block: 36 bytes = [uint16 d_half][2B pad][int8 qs[32]] */\n"
@@ -3764,6 +3815,7 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_q8_0_dp4a;
     CUfunction fn_matvec_q8_0_f32;
     CUfunction fn_matvec_q8_0_f32_fused2;
+    CUfunction fn_matvec_q8_0_dp4a_fused2;
     CUfunction fn_matvec_f16_f32_fused2;
     CUfunction fn_embed_q8_0;
     CUfunction fn_matvec_q2_K_f32;
@@ -3942,6 +3994,9 @@ struct cuda_llm_runner {
     /* INT8 quantization scratch (for dp4a path) */
     CUdeviceptr d_xb_q;     /* INT8 [max_dim] */
     CUdeviceptr d_xb_scale; /* F32 [1] */
+    CUdeviceptr d_xb_q2;    /* INT8 [max_dim] second buffer for FFN down / ATT output */
+    CUdeviceptr d_xb_scale2;/* F32 [1] */
+    int use_dp4a;            /* 1 = use dp4a INT8 path for Q8_0 matvecs */
     CUdeviceptr d_hidden_snapshots; /* optional packed [3 * n_embd] snapshot buffer */
 
     /* Pre-allocated batch prefill buffers (allocated on first use, reused) */
@@ -3991,7 +4046,7 @@ static int cuda_llm_bind_context(cuda_llm_runner *r) {
 /* NVRTC kernel compilation                                                 */
 /* ======================================================================== */
 
-#define CLLM_PTX_CACHE_VERSION 7
+#define CLLM_PTX_CACHE_VERSION 8
 
 static int cllm_read_file(const char *path, char **out_data, size_t *out_size) {
     FILE *fp = fopen(path, "rb");
@@ -4134,6 +4189,7 @@ lookup_funcs:
     GET_FUNC(matvec_q8_0_dp4a);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(matvec_q8_0_f32_fused2);
+    GET_FUNC(matvec_q8_0_dp4a_fused2);
     GET_FUNC(matvec_f16_f32_fused2);
     GET_FUNC(embed_q8_0);
     GET_FUNC(matvec_q2_K_f32);
@@ -4263,6 +4319,17 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
         cublasewCreate(&r->cublas, r->stream) == 0) {
         r->use_cublas = 1;
         if (verbose >= 1) fprintf(stderr, "cuda_llm: cuBLAS GEMM fast path enabled\n");
+    }
+
+    /* Enable dp4a INT8 path for sm >= 6.1 (Pascal+) unless disabled */
+    {
+        int major = 0, minor = 0;
+        cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, r->device);
+        cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, r->device);
+        int sm = major * 10 + minor;
+        r->use_dp4a = (sm >= 61 && !getenv("CUDA_LLM_NO_DP4A"));
+        if (r->use_dp4a && verbose >= 1)
+            fprintf(stderr, "cuda_llm: dp4a INT8 matvec enabled (sm_%d)\n", sm);
     }
 
     return r;
@@ -4743,8 +4810,10 @@ static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_
         CHECK_CU(cuMemAlloc(&r->d_ds_tmp, r->n_embd * sizeof(float)));
     }
 
-    CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
-    CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_q,      max_dim * sizeof(int8_t)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_scale,  sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_q2,     max_dim * sizeof(int8_t)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_scale2, sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
@@ -5566,8 +5635,10 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     }
 
     /* INT8 quantization scratch (for dp4a path) */
-    CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
-    CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_q,      max_dim * sizeof(int8_t)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_scale,  sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_q2,     max_dim * sizeof(int8_t)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_scale2, sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     /* Logits buffer (GPU + host) */
@@ -6019,6 +6090,17 @@ static inline void launch_matvec_fused2(cuda_llm_runner *r,
         launch_matvec_auto(r, dst1, mat1, x, n_rows, n_cols, type);
         launch_matvec_auto(r, dst2, mat2, x, n_rows, n_cols, type);
     }
+}
+
+/* dp4a fused gate+up: both matrices are Q8_0, input is pre-quantized INT8 */
+static inline void launch_matvec_dp4a_fused2(cuda_llm_runner *r,
+                                              CUdeviceptr dst1, CUdeviceptr dst2,
+                                              CUdeviceptr mat1, CUdeviceptr mat2,
+                                              CUdeviceptr x_q, CUdeviceptr x_scale,
+                                              int n_rows, int n_cols) {
+    void *args[] = { &dst1, &dst2, &mat1, &mat2, &x_q, &x_scale, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q8_0_dp4a_fused2,
+                   n_rows, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
 static inline void launch_matvec_q8_f32(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
@@ -6696,8 +6778,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
             if (dec_do_prof) cuStreamSynchronize(r->stream);
             double _dp0 = dec_do_prof ? get_time_ms() : 0;
-            /* 1. Linear projections */
-            launch_matvec_auto(r, r->d_ssm_qkv,   cl->ssm_qkv_w,   r->d_xb, cl->ssm_qkv_rows,   cl->ssm_qkv_cols,   cl->ssm_qkv_type);
+            /* 1. Linear projections (dp4a for Q8_0 weights) */
+            if (r->use_dp4a && cl->ssm_qkv_type == GGML_TYPE_Q8_0) {
+                launch_quantize(r, r->d_xb_q, r->d_xb_scale, r->d_xb, n_embd);
+                launch_matvec_q8(r, r->d_ssm_qkv, cl->ssm_qkv_w, r->d_xb_q, r->d_xb_scale,
+                                 cl->ssm_qkv_rows, cl->ssm_qkv_cols);
+            } else {
+                launch_matvec_auto(r, r->d_ssm_qkv, cl->ssm_qkv_w, r->d_xb, cl->ssm_qkv_rows, cl->ssm_qkv_cols, cl->ssm_qkv_type);
+            }
             launch_matvec_auto(r, r->d_ssm_z,      cl->ssm_gate_w,  r->d_xb, cl->ssm_gate_rows,  cl->ssm_gate_cols,  cl->ssm_gate_type);
             /* Fuse alpha+beta when same type+dims */
             if (cl->ssm_alpha_type == cl->ssm_beta_type &&
@@ -7003,9 +7091,16 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             /* === Gated attention layer (Qwen3.5) === */
             if (dec_do_prof) cuStreamSynchronize(r->stream);
             double _dp0 = dec_do_prof ? get_time_ms() : 0;
-            /* Q+gate combined projection into xb2 */
-            launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
-                              cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+            /* Quantize input for dp4a Q8_0 projections */
+            if (r->use_dp4a && cl->attn_q_type == GGML_TYPE_Q8_0) {
+                launch_quantize(r, r->d_xb_q, r->d_xb_scale, r->d_xb, n_embd);
+                /* Q+gate combined projection via dp4a */
+                launch_matvec_q8(r, r->d_xb2, cl->attn_q_w, r->d_xb_q, r->d_xb_scale,
+                                 cl->attn_q_rows, cl->attn_q_cols);
+            } else {
+                launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
+                                  cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+            }
 
             /* De-interleave Q and gate */
             launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate, r->d_xb2, n_heads, head_dim);
@@ -7021,9 +7116,16 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                         dbg[0],dbg[1],dbg[2],dbg[3],dbg[4],dbg[5],dbg[6],dbg[7]);
             }
 
-            /* K, V projections */
-            launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
-            launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            /* K, V projections (dp4a reuses d_xb_q from above) */
+            if (r->use_dp4a && cl->attn_k_type == GGML_TYPE_Q8_0) {
+                launch_matvec_q8(r, r->d_k, cl->attn_k_w, r->d_xb_q, r->d_xb_scale,
+                                 cl->attn_k_rows, cl->attn_k_cols);
+                launch_matvec_q8(r, r->d_v, cl->attn_v_w, r->d_xb_q, r->d_xb_scale,
+                                 cl->attn_v_rows, cl->attn_v_cols);
+            } else {
+                launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+                launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            }
 
             if (r->debug_layers >= 2 && l == 3) {
                 cuStreamSynchronize(r->stream);
@@ -7182,9 +7284,16 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
                         dbg[0],dbg[1],dbg[2],dbg[3],dbg[4],dbg[5],dbg[6],dbg[7]);
             }
 
-            /* Output projection */
-            launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
-                              cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+            /* Output projection (dp4a for Q8_0) */
+            if (r->use_dp4a && cl->attn_output_type == GGML_TYPE_Q8_0) {
+                launch_quantize(r, r->d_xb_q2, r->d_xb_scale2, r->d_xb2, cl->attn_output_cols);
+                launch_matvec_q8(r, r->d_xb, cl->attn_output_w, r->d_xb_q2, r->d_xb_scale2,
+                                 cl->attn_output_rows, cl->attn_output_cols);
+            } else {
+                launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
+                                  cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+            }
+            if (dec_do_prof) { cuStreamSynchronize(r->stream); dec_prof_attn += get_time_ms() - _dp0; }
 
         } else {
             /* === Standard attention (non-hybrid) === */
@@ -7403,8 +7512,16 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 
         } else {
             /* ---- Dense FFN ---- */
-            /* FFN gate and up projections (fused when same type+dims) */
-            if (cl->ffn_gate_type == cl->ffn_up_type &&
+            /* FFN gate and up projections (fused, dp4a when Q8_0) */
+            if (r->use_dp4a && cl->ffn_gate_type == GGML_TYPE_Q8_0 &&
+                cl->ffn_gate_type == cl->ffn_up_type &&
+                cl->ffn_gate_rows == cl->ffn_up_rows &&
+                cl->ffn_gate_cols == cl->ffn_up_cols) {
+                launch_quantize(r, r->d_xb_q, r->d_xb_scale, r->d_xb, cl->ffn_gate_cols);
+                launch_matvec_dp4a_fused2(r, r->d_gate, r->d_up,
+                    cl->ffn_gate_w, cl->ffn_up_w, r->d_xb_q, r->d_xb_scale,
+                    cl->ffn_gate_rows, cl->ffn_gate_cols);
+            } else if (cl->ffn_gate_type == cl->ffn_up_type &&
                 cl->ffn_gate_rows == cl->ffn_up_rows &&
                 cl->ffn_gate_cols == cl->ffn_up_cols) {
                 launch_matvec_fused2(r, r->d_gate, r->d_up,
@@ -7420,9 +7537,15 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
             /* SiLU(gate) * up */
             launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
 
-            /* FFN down projection: xb = ffn_down @ gate */
-            launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
-                          cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+            /* FFN down projection (dp4a for Q8_0) */
+            if (r->use_dp4a && cl->ffn_down_type == GGML_TYPE_Q8_0) {
+                launch_quantize(r, r->d_xb_q2, r->d_xb_scale2, r->d_gate, cl->ffn_down_cols);
+                launch_matvec_q8(r, r->d_xb, cl->ffn_down_w, r->d_xb_q2, r->d_xb_scale2,
+                                 cl->ffn_down_rows, cl->ffn_down_cols);
+            } else {
+                launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
+                              cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+            }
         }
 
         if (dec_do_prof) { cuStreamSynchronize(r->stream); dec_prof_ffn += get_time_ms() - _dfn0; }
@@ -8918,8 +9041,10 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_hidden_snapshots) cuMemFree(r->d_hidden_snapshots);
     free(r->h_router_logits);
     free(r->h_stage);
-    if (r->d_xb_q)    cuMemFree(r->d_xb_q);
-    if (r->d_xb_scale) cuMemFree(r->d_xb_scale);
+    if (r->d_xb_q)     cuMemFree(r->d_xb_q);
+    if (r->d_xb_scale)  cuMemFree(r->d_xb_scale);
+    if (r->d_xb_q2)    cuMemFree(r->d_xb_q2);
+    if (r->d_xb_scale2) cuMemFree(r->d_xb_scale2);
 
     /* Free KV cache (skip shared caches for Gemma4) */
     if (r->d_key_cache) {
