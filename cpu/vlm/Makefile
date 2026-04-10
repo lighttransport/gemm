@@ -52,10 +52,13 @@ HEADERS = $(wildcard $(COMMON)/*.h)
 
 .PHONY: all clean
 
-all: test_vision
+all: test_vision test_gemma4_vision
 
 test_vision: test_vision.c $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+test_gemma4_vision: test_gemma4_vision.c $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f test_vision
+	rm -f test_vision test_gemma4_vision
