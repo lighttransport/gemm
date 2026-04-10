@@ -4014,7 +4014,6 @@ struct cuda_llm_runner {
     CUdeviceptr d_batch_beta;   /* [max_tokens * dt_rank] */
     CUdeviceptr d_batch_token_ids; /* [max_tokens] int32 */
     CUdeviceptr d_batch_f16_scratch; /* [max_tokens * max_dim] F16 for cuBLAS input conversion */
-    int cublas_needs_f16_input; /* 1 = mixed F16×F32 GEMM not supported (Blackwell) */
 
     /* Host output buffer */
     float *h_output;     /* [n_embd] or [n_vocab] for logits */
@@ -8091,8 +8090,6 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
     int d_state = r->ssm_d_state;
     int n_group = r->ssm_n_group;
     int conv_k = r->ssm_conv_kernel;
-    int wide_dim = q2_dim > qkv_dim ? q2_dim : qkv_dim;
-    int mid_dim = q_dim > d_inner ? q_dim : d_inner;
     int n_layers = r->n_layers;
     float eps = r->rms_norm_eps;
 
@@ -8149,7 +8146,7 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
     }
 
     /* Profiling accumulators */
-    double prof_gemm_ms = 0, prof_ssm_ms = 0, prof_attn_ms = 0, prof_ffn_ms = 0, prof_other_ms = 0;
+    double prof_gemm_ms = 0, prof_ssm_ms = 0, prof_attn_ms = 0, prof_ffn_ms = 0;
     int do_prof = (r->verbose >= 1 && n_tokens > 1);
 
     for (int l = 0; l < n_layers; l++) {
@@ -9266,3 +9263,4 @@ int cuda_llm_n_embd(const cuda_llm_runner *r) { return r ? r->n_embd : 0; }
 int cuda_llm_n_layers(const cuda_llm_runner *r) { return r ? r->n_layers : 0; }
 int cuda_llm_n_vocab(const cuda_llm_runner *r) { return r ? r->n_vocab : 0; }
 int cuda_llm_max_seq_len(const cuda_llm_runner *r) { return r ? r->max_seq_len : 0; }
+int cuda_llm_uses_dp4a(const cuda_llm_runner *r) { return r ? r->use_dp4a : 0; }
