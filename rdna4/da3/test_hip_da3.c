@@ -193,6 +193,7 @@ int main(int argc, char **argv) {
     const char *npy_path = NULL;
     const char *npy_dir = NULL;
     const char *resize_mode = NULL;
+    const char *pose_str = NULL;
     int device_id = 0;
     int verbose = 1;
     int output_flags = DA3_OUTPUT_DEPTH;
@@ -209,6 +210,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
         else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
         else if (strcmp(argv[i], "--gaussians") == 0) output_flags |= DA3_OUTPUT_GAUSSIANS;
+        else if (strcmp(argv[i], "--pose-in") == 0 && i + 1 < argc) pose_str = argv[++i];
     }
 
     /* Detect file format */
@@ -278,11 +280,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\nInput: synthetic gradient (%dx%d)\n", img_w, img_h);
     }
 
+    /* Parse pose for conditioning (format: "tx,ty,tz,qx,qy,qz,qw,fov_h,fov_w") */
+    float pose_vals[9] = {0};
+    const float *pose_ptr = NULL;
+    if (pose_str) {
+        if (sscanf(pose_str, "%f,%f,%f,%f,%f,%f,%f,%f,%f",
+                   &pose_vals[0], &pose_vals[1], &pose_vals[2],
+                   &pose_vals[3], &pose_vals[4], &pose_vals[5], &pose_vals[6],
+                   &pose_vals[7], &pose_vals[8]) == 9) {
+            pose_ptr = pose_vals;
+            fprintf(stderr, "Pose conditioning: t=[%.3f,%.3f,%.3f] q=[%.3f,%.3f,%.3f,%.3f] fov=[%.3f,%.3f]\n",
+                    pose_vals[0], pose_vals[1], pose_vals[2],
+                    pose_vals[3], pose_vals[4], pose_vals[5], pose_vals[6],
+                    pose_vals[7], pose_vals[8]);
+        } else {
+            fprintf(stderr, "WARNING: invalid pose format (expected 9 comma-separated floats)\n");
+        }
+    }
+
     /* Run inference */
     fprintf(stderr, "\n=== Running HIP DA3 inference (flags=0x%02x) ===\n", output_flags);
     double t0 = get_time_ms();
 
-    da3_full_result result = hip_da3_predict_full(gpu, img, img_w, img_h, output_flags, NULL);
+    da3_full_result result = hip_da3_predict_full(gpu, img, img_w, img_h, output_flags, pose_ptr);
 
     double elapsed = get_time_ms() - t0;
     fprintf(stderr, "\nTotal inference time: %.1f ms\n", elapsed);
