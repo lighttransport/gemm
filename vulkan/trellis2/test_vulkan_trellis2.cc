@@ -1,11 +1,11 @@
 /*
- * test_vulkan_trellis2.cc - Test Vulkan TRELLIS.2 Stage 1 runner
+ * test_vulkan_trellis2.cc - Test Vulkan TRELLIS.2 Stages 1-3
  *
  * Usage:
  *   ./test_vulkan_trellis2 <stage1.st> <decoder.st> <features.npy> [options]
  *
  * Runs Stage 1 DiT + decoder on Vulkan GPU, exports mesh via marching cubes.
- * DINOv3 features must be pre-computed on CPU (pass as .npy).
+ * Stage 2/3 require additional --stage2 / --stage3 flags with weight paths.
  *
  * SPDX-License-Identifier: MIT
  * Copyright 2025 - Present, Light Transport Entertainment Inc.
@@ -116,6 +116,8 @@ int main(int argc, char **argv) {
             "  --dit-only       Only run DiT (no decoder)\n"
             "  --decode-only <latent.npy>  Only run decoder\n"
             "  --encode <dinov3.st> <image.npy>  Run DINOv3 encoder only\n"
+            "  --stage2 <path>  Stage 2 shape flow DiT weights\n"
+            "  --stage3 <path>  Stage 3 texture flow DiT weights\n"
             "  -v               Verbose\n",
             argv[0]);
         return 1;
@@ -130,6 +132,10 @@ int main(int argc, char **argv) {
     const char *decode_only_path = nullptr;
     const char *encode_dinov3_path = nullptr;
     const char *encode_image_path = nullptr;
+    const char *stage2_path = nullptr;
+    const char *stage3_path = nullptr;
+    const char *shape_dec_path = nullptr;
+    const char *tex_dec_path = nullptr;
     uint32_t seed = 42;
     int n_steps = 12;
     float cfg_scale = 7.5f;
@@ -148,6 +154,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dit-only") == 0) dit_only = true;
         else if (strcmp(argv[i], "--decode-only") == 0 && i + 1 < argc) decode_only_path = argv[++i];
         else if (strcmp(argv[i], "--encode") == 0 && i + 2 < argc) { encode_dinov3_path = argv[++i]; encode_image_path = argv[++i]; }
+        else if (strcmp(argv[i], "--stage2") == 0 && i + 1 < argc) stage2_path = argv[++i];
+        else if (strcmp(argv[i], "--stage3") == 0 && i + 1 < argc) stage3_path = argv[++i];
+        else if (strcmp(argv[i], "--shape-dec") == 0 && i + 1 < argc) shape_dec_path = argv[++i];
+        else if (strcmp(argv[i], "--tex-dec") == 0 && i + 1 < argc) tex_dec_path = argv[++i];
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
     }
 
@@ -186,6 +196,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to load weights\n");
         vulkan_trellis2_free(r);
         return 1;
+    }
+    if (stage2_path) {
+        if (vulkan_trellis2_load_stage2(r, stage2_path) != 0) {
+            fprintf(stderr, "Failed to load Stage 2 weights\n");
+            vulkan_trellis2_free(r); return 1;
+        }
+    }
+    if (stage3_path) {
+        if (vulkan_trellis2_load_stage3(r, stage3_path) != 0) {
+            fprintf(stderr, "Failed to load Stage 3 weights\n");
+            vulkan_trellis2_free(r); return 1;
+        }
     }
 
     /* Decode-only mode */
@@ -280,6 +302,101 @@ int main(int argc, char **argv) {
             mc_write_obj(output_path, &mesh);
         }
         mc_mesh_free(&mesh);
+
+        /* === Stage 2: Shape flow sampling === */
+        if (stage2_path) {
+            fprintf(stderr, "\n=== Stage 2: Shape Flow Sampling (%d steps) ===\n", n_steps);
+
+            /* Allocate max possible (all 64^3 occupied, unlikely) */
+            std::vector<float> shape_latent(n_occ * 32);
+            std::vector<int32_t> sparse_coords(n_occ * 4);
+            int N_sparse = 0;
+
+            vulkan_trellis2_run_stage2(r, features, occ.data(),
+                                        shape_latent.data(), sparse_coords.data(), &N_sparse,
+                                        n_steps, cfg_scale, cfg_rescale, seed);
+
+            fprintf(stderr, "Stage 2 output: N=%d, shape_latent[:4]=%.4f %.4f %.4f %.4f\n",
+                    N_sparse, shape_latent[0], shape_latent[1], shape_latent[2], shape_latent[3]);
+
+            if (npy_path) {
+                char s2path[512];
+                snprintf(s2path, sizeof(s2path), "%s_stage2.npy", npy_path);
+                int od[] = {N_sparse, 32};
+                write_npy_f32(s2path, shape_latent.data(), od, 2);
+            }
+
+            /* === Shape Decoder === */
+            if (shape_dec_path) {
+                fprintf(stderr, "\n=== Shape Decoder (CPU) ===\n");
+
+                /* Max output: ~16× input (4 C2S stages, each ~2× expansion) */
+                int max_out = N_sparse * 16;
+                std::vector<float> dec_feats(max_out * 7);
+                std::vector<int32_t> dec_coords(max_out * 4);
+                int dec_N = 0;
+
+                vulkan_trellis2_run_shape_decoder(r, shape_dec_path,
+                    shape_latent.data(), sparse_coords.data(), N_sparse,
+                    dec_feats.data(), dec_coords.data(), &dec_N);
+
+                fprintf(stderr, "Shape decoder output: %d voxels, 7 channels\n", dec_N);
+                if (dec_N > 0) {
+                    fprintf(stderr, "  feats[:4]=%.4f %.4f %.4f %.4f\n",
+                            dec_feats[0], dec_feats[1], dec_feats[2], dec_feats[3]);
+                }
+
+                if (npy_path) {
+                    char dpath[512];
+                    snprintf(dpath, sizeof(dpath), "%s_shape_dec.npy", npy_path);
+                    int od[] = {dec_N, 7};
+                    write_npy_f32(dpath, dec_feats.data(), od, 2);
+                }
+            }
+
+            /* === Stage 3: Texture flow sampling === */
+            if (stage3_path) {
+                fprintf(stderr, "\n=== Stage 3: Texture Flow Sampling (%d steps, no CFG) ===\n", n_steps);
+
+                std::vector<float> tex_latent(N_sparse * 32);
+                vulkan_trellis2_run_stage3(r, features, shape_latent.data(),
+                                            sparse_coords.data(), N_sparse,
+                                            tex_latent.data(), n_steps, seed);
+
+                fprintf(stderr, "Stage 3 output: tex_latent[:4]=%.4f %.4f %.4f %.4f\n",
+                        tex_latent[0], tex_latent[1], tex_latent[2], tex_latent[3]);
+
+                if (npy_path) {
+                    char s3path[512];
+                    snprintf(s3path, sizeof(s3path), "%s_stage3.npy", npy_path);
+                    int od[] = {N_sparse, 32};
+                    write_npy_f32(s3path, tex_latent.data(), od, 2);
+                }
+
+                /* === Texture Decoder === */
+                if (tex_dec_path) {
+                    fprintf(stderr, "\n=== Texture Decoder (GPU ConvNeXt + CPU C2S) ===\n");
+
+                    int max_out = N_sparse * 16;
+                    std::vector<float> tex_feats(max_out * 6);
+                    std::vector<int32_t> tex_coords(max_out * 4);
+                    int tex_N = 0;
+
+                    vulkan_trellis2_run_shape_decoder(r, tex_dec_path,
+                        tex_latent.data(), sparse_coords.data(), N_sparse,
+                        tex_feats.data(), tex_coords.data(), &tex_N);
+
+                    fprintf(stderr, "Texture decoder output: %d voxels, 6 channels\n", tex_N);
+
+                    if (npy_path) {
+                        char tpath[512];
+                        snprintf(tpath, sizeof(tpath), "%s_tex_dec.npy", npy_path);
+                        int od[] = {tex_N, 6};
+                        write_npy_f32(tpath, tex_feats.data(), od, 2);
+                    }
+                }
+            }
+        }
     }
 
     free(features);
