@@ -78,7 +78,8 @@ struct hip_qimg_runner {
     int verbose;
 
     hipModule_t mod;
-    hipFunction_t fn_gemm, fn_gemm_fp8, fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
+    hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_opt_fp8;
+    hipFunction_t fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_flash_attn;
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
@@ -297,6 +298,16 @@ static void op_gemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
 /* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT */
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                         int n_out, int n_in, int n_tok) {
+    /* Use optimized 128×128 tiled kernel for large matrices (fused BF16 trunc) */
+    if (r->fn_gemm_opt_fp8 && n_tok >= 32) {
+        /* gemm_opt_fp8: Y[M,N] = X[M,K] × W[N,K]^T  (N=n_out, K=n_in, M=n_tok) */
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        hipModuleLaunchKernel(r->fn_gemm_opt_fp8, gx, gy, 1, 256, 1, 1,
+                              0, NULL, args, NULL);
+        return;  /* BF16 truncation fused into kernel */
+    }
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
@@ -320,6 +331,11 @@ static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
 /* Weight GEMM + BF16 truncation */
 static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           int n_out, int n_in, int n_tok) {
+    if (r->use_fp8 && r->fn_gemm_opt_fp8 && n_tok >= 32) {
+        /* Optimized FP8 GEMM has fused BF16 trunc — no separate pass needed */
+        op_gemm_fp8(r, Y, W, X, bias, n_out, n_in, n_tok);
+        return;
+    }
     op_wgemm(r, Y, W, X, bias, n_out, n_in, n_tok);
     op_bf16_trunc(r, Y, n_out * n_tok);
 }
@@ -502,6 +518,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     #define GET(field, name) hipModuleGetFunction(&r->field, mod, name)
     GET(fn_gemm, "gemm_f32_f32");
     GET(fn_gemm_fp8, "gemm_fp8w_f32");
+    GET(fn_gemm_opt_fp8, "gemm_opt_fp8");
     GET(fn_layernorm, "layernorm_f32");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
