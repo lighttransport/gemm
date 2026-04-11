@@ -1070,6 +1070,9 @@ typedef struct {
     void *attn_q_w;       /* F16 [n_rows * n_cols] */
     void *attn_k_w;
     void *attn_v_w;
+    void *attn_q_bias;    /* F32 [n_embd] Q projection bias (Qwen2.5-VL) */
+    void *attn_k_bias;    /* F32 [kv_dim] K projection bias */
+    void *attn_v_bias;    /* F32 [kv_dim] V projection bias */
     void *attn_q_norm_w;  /* F32 [head_dim] */
     void *attn_k_norm_w;  /* F32 [head_dim] */
     void *attn_output_w;  /* F16 */
@@ -1490,12 +1493,8 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
         return upload_q8_0_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_Q2_K || t->type == GGML_TYPE_Q3_K ||
                t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K ||
-               t->type == GGML_TYPE_Q6_K ||
-               t->type == GGML_TYPE_IQ4_XS || t->type == GGML_TYPE_IQ4_NL ||
-               t->type == GGML_TYPE_IQ3_S || t->type == GGML_TYPE_IQ3_XXS ||
-               t->type == GGML_TYPE_IQ2_XS || t->type == GGML_TYPE_IQ2_S ||
-               t->type == GGML_TYPE_IQ2_XXS || t->type == GGML_TYPE_IQ1_S ||
-               t->type == GGML_TYPE_IQ1_M) {
+               t->type == GGML_TYPE_Q6_K) {
+        /* K-quant types with real GPU kernels — upload raw */
         return upload_kquant_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_BF16) {
         *out_type = GGML_TYPE_F16;
@@ -1515,7 +1514,7 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
         if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
         return 0;
     } else {
-        /* Unsupported quant type (IQ4_XS, IQ3_S, etc.) — dequant to F32 on CPU, convert to F16, upload */
+        /* IQ types + other unsupported quant types — dequant to F32 on CPU, convert to F16, upload */
         int n_elements = t->n_rows * t->n_cols;
         if (n_elements <= 0 || !t->data) {
             fprintf(stderr, "hip_llm: upload_weight_matrix: unhandled type %d, treating as F16 (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
@@ -1834,6 +1833,20 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             t = hllm_load_tensor(gguf, name, 1);
             cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
             if (upload_weight_matrix(&cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
+
+            /* Attention biases (optional, e.g. Qwen2.5-VL) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                if (l == 0) fprintf(stderr, "hip_llm: loading attention biases (Q/K/V)\n");
+                if (upload_norm_f32(&cl->attn_q_bias, &t, cl->attn_q_rows) != 0) return -1;
+            }
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_norm_f32(&cl->attn_k_bias, &t, cl->attn_k_rows) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_norm_f32(&cl->attn_v_bias, &t, cl->attn_v_rows) != 0) return -1; }
 
             snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
             t = hllm_load_tensor(gguf, name, 0);
@@ -2368,6 +2381,11 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
             launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
             launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
 
+            /* Attention biases (Qwen2.5-VL) */
+            if (cl->attn_q_bias) launch_add(r, r->d_q, cl->attn_q_bias, cl->attn_q_rows);
+            if (cl->attn_k_bias) launch_add(r, r->d_k, cl->attn_k_bias, cl->attn_k_rows);
+            if (cl->attn_v_bias) launch_add(r, r->d_v, cl->attn_v_bias, cl->attn_v_rows);
+
             if (cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, head_dim, eps);
                 if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
@@ -2456,6 +2474,7 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
                           cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
             launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
                           cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+
             launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
             launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                           cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
@@ -2651,6 +2670,9 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->attn_q_w)      hipFree(cl->attn_q_w);
             if (cl->attn_k_w)      hipFree(cl->attn_k_w);
             if (cl->attn_v_w)      hipFree(cl->attn_v_w);
+            if (cl->attn_q_bias)   hipFree(cl->attn_q_bias);
+            if (cl->attn_k_bias)   hipFree(cl->attn_k_bias);
+            if (cl->attn_v_bias)   hipFree(cl->attn_v_bias);
             if (cl->attn_q_norm_w) hipFree(cl->attn_q_norm_w);
             if (cl->attn_k_norm_w) hipFree(cl->attn_k_norm_w);
             if (cl->attn_output_w) hipFree(cl->attn_output_w);

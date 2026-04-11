@@ -379,7 +379,18 @@ int main(int argc, char **argv) {
                             img_tokens[tok * in_ch + idx++];
         }
 
-        /* VAE decode */
+        /* Un-standardize latent: DiT normalized space → VAE natural space */
+        /* Values from diffusers autoencoder_kl_qwenimage.py config */
+        {
+            static const float lm[16] = {-0.7571f,-0.7089f,-0.9113f,0.1075f,-0.1745f,0.9653f,-0.1517f,1.5508f,
+                                          0.4134f,-0.0715f,0.5517f,-0.3632f,-0.1922f,-0.9497f,0.2503f,-0.2921f};
+            static const float ls[16] = {2.8184f,1.4541f,2.3275f,2.6558f,1.2196f,1.7708f,2.6052f,2.0743f,
+                                          3.2687f,2.1526f,2.8652f,1.5579f,1.6382f,1.1253f,2.8251f,1.9160f};
+            for (int c = 0; c < lat_ch; c++)
+                for (int i = 0; i < lat_h * lat_w; i++)
+                    latent[c * lat_h * lat_w + i] = latent[c * lat_h * lat_w + i] * ls[c] + lm[c];
+        }
+
         /* 3. VAE decode */
         fprintf(stderr, "\n[3/3] VAE decode...\n");
         if (vae_path) {
