@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+// Conv2D 1x1: [ci, spatial] -> [co, spatial]
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuf { float out_buf[]; };
+layout(std430, binding = 2) readonly buffer WBuf { float w_buf[]; };
+layout(std430, binding = 3) readonly buffer BiasBuf { float bias_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ci, spatial, co;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint idx = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    if (idx >= pc.co * pc.spatial) return;
+    uint oc = idx / pc.spatial;
+    uint s  = idx % pc.spatial;
+    float sum = (pc.has_bias != 0) ? bias_buf[oc] : 0.0;
+    for (uint ic = 0; ic < pc.ci; ic++)
+        sum += in_buf[ic * pc.spatial + s] * w_buf[oc * pc.ci + ic];
+    out_buf[idx] = sum;
+}
