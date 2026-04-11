@@ -34,6 +34,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 /* ---- PRNG: Box-Muller ---- */
 static uint64_t rng_state = 42;
@@ -119,10 +121,57 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "=== HIP Qwen-Image: %s ===\n", mode);
 
-    /* Precomputed text tokens (not used in current flow) */
+    /* GPU text encoder runs in a forked child process to avoid ROCm HIPRTC
+     * context corruption (hipSetDevice fails after hipModuleUnload in same process).
+     * Child writes hidden states to a temp file, parent reads them back. */
     int n_txt_precomputed = 0;
     float *txt_precomputed = NULL;
-    (void)n_txt_precomputed; (void)txt_precomputed;
+    if (!strcmp(mode, "gen") && enc_path) {
+        const char *tmp_path = "/tmp/qimg_text_hidden.bin";
+        fprintf(stderr, "\n[1/3] Text conditioning (GPU, forked)...\n");
+        clock_t enc_t0 = clock();
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Child: run GPU text encoder, write result to file, exit */
+            qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, NULL, device_id);
+            if (!enc) _exit(1);
+            int n_out = 0;
+            float *hidden = qimg_text_enc_encode(enc, prompt, &n_out);
+            qimg_text_enc_free(enc);
+            if (!hidden || n_out <= 0) _exit(2);
+            FILE *fp = fopen(tmp_path, "wb");
+            if (!fp) _exit(3);
+            fwrite(&n_out, sizeof(int), 1, fp);
+            fwrite(hidden, sizeof(float), (size_t)n_out * 3584, fp);
+            fclose(fp);
+            free(hidden);
+            _exit(0);
+        } else if (pid > 0) {
+            /* Parent: wait for child, read result */
+            int status;
+            waitpid(pid, &status, 0);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                FILE *fp = fopen(tmp_path, "rb");
+                if (fp) {
+                    int n_out;
+                    if (fread(&n_out, sizeof(int), 1, fp) == 1 && n_out > 0) {
+                        txt_precomputed = (float *)malloc((size_t)n_out * 3584 * sizeof(float));
+                        if (fread(txt_precomputed, sizeof(float), (size_t)n_out * 3584, fp) == (size_t)n_out * 3584) {
+                            n_txt_precomputed = n_out;
+                            fprintf(stderr, "  Text hidden: [%d, 3584] (%.1fs, GPU forked)\n",
+                                    n_out, (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+                        } else {
+                            free(txt_precomputed); txt_precomputed = NULL;
+                        }
+                    }
+                    fclose(fp);
+                    unlink(tmp_path);
+                }
+            }
+            if (!txt_precomputed)
+                fprintf(stderr, "  GPU text encoder (forked) failed, will use CPU fallback\n");
+        }
+    }
 
     /* Init HIP + compile qimg kernels */
     hip_qimg_runner *r = hip_qimg_init(device_id, verbose);
@@ -199,12 +248,16 @@ int main(int argc, char **argv) {
         int in_ch = 64, lat_ch = 16;
         int txt_dim = 3584;
 
-        /* 1. Text encoder (CPU — GPU text encoder requires qwen2vl HIP LLM support) */
-        fprintf(stderr, "\n[1/3] Text conditioning...\n");
+        /* 1. Text encoder — use GPU (forked) result, or fall back to CPU */
         int n_txt = 0;
         float *txt_tokens = NULL;
 
-        if (enc_path) {
+        if (txt_precomputed) {
+            txt_tokens = txt_precomputed;
+            n_txt = n_txt_precomputed;
+            txt_precomputed = NULL;
+        } else if (enc_path) {
+            fprintf(stderr, "\n[1/3] Text conditioning (CPU fallback)...\n");
             fprintf(stderr, "  Loading text encoder: %s\n", enc_path);
             clock_t enc_t0 = clock();
             qimg_text_enc *enc = qimg_text_enc_load(enc_path);
