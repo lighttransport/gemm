@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/stat.h>
 
 /* transformer.h header-only: gives us qtensor type + dequant declarations */
 #include "../../common/ggml_dequant.h"
@@ -2991,6 +2992,8 @@ struct cuda_llm_runner {
     int debug_layers;       /* if > 0, print hidden state norm after each layer */
     int max_layers;         /* if > 0, process only first N layers (debug) */
     int n_deepstack;        /* number of deepstack layers (VLM injection, 0 = none) */
+    int hidden_snapshot_layers[3];
+    int n_hidden_snapshots;
 
     /* Hybrid SSM params (Qwen3.5) */
     int is_hybrid;
@@ -3054,10 +3057,13 @@ struct cuda_llm_runner {
     /* INT8 quantization scratch (for dp4a path) */
     CUdeviceptr d_xb_q;     /* INT8 [max_dim] */
     CUdeviceptr d_xb_scale; /* F32 [1] */
+    CUdeviceptr d_hidden_snapshots; /* optional packed [3 * n_embd] snapshot buffer */
 
     /* Host output buffer */
     float *h_output;     /* [n_embd] or [n_vocab] for logits */
     CUdeviceptr d_logits; /* [n_vocab] GPU logits buffer */
+    void *h_stage;
+    size_t h_stage_bytes;
 
     /* Weight loading state */
     int weights_loaded;
@@ -3067,15 +3073,76 @@ struct cuda_llm_runner {
     int _ds_embd_stride;
 };
 
+static int cuda_llm_bind_context(cuda_llm_runner *r) {
+    if (!r) return -1;
+    CUresult err = cuCtxSetCurrent(r->context);
+    if (err != CUDA_SUCCESS) {
+        if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: cuCtxSetCurrent failed (%d)\n", (int)err);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 /* ======================================================================== */
 /* NVRTC kernel compilation                                                 */
 /* ======================================================================== */
+
+#define CLLM_PTX_CACHE_VERSION 1
+
+static int cllm_read_file(const char *path, char **out_data, size_t *out_size) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return -1; }
+    long sz = ftell(fp);
+    if (sz <= 0) { fclose(fp); return -1; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return -1; }
+    char *buf = (char *)malloc((size_t)sz);
+    if (!buf) { fclose(fp); return -1; }
+    if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(buf);
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    *out_data = buf;
+    *out_size = (size_t)sz;
+    return 0;
+}
+
+static void cllm_write_file(const char *path, const char *data, size_t size) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(data, 1, size, fp);
+    fclose(fp);
+}
 
 static int compile_kernels(cuda_llm_runner *r) {
     int major, minor;
     cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, r->device);
     cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, r->device);
     int sm = major * 10 + minor;
+    char cache_path[128];
+    snprintf(cache_path, sizeof(cache_path), "/tmp/cuda_llm_sm_%d_v%d.ptx",
+             sm, CLLM_PTX_CACHE_VERSION);
+
+    char *ptx = NULL;
+    size_t ptx_size = 0;
+    if (cllm_read_file(cache_path, &ptx, &ptx_size) == 0) {
+        if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_llm: loading cached PTX %s\n", cache_path);
+        }
+        CUresult err = cuModuleLoadDataEx(&r->module, ptx, 0, NULL, NULL);
+        free(ptx);
+        if (err == CUDA_SUCCESS) goto lookup_funcs;
+        if (r->verbose >= 1) {
+            const char *errStr = NULL;
+            cuGetErrorString(err, &errStr);
+            fprintf(stderr, "cuda_llm: cached PTX load failed (%s), recompiling\n",
+                    errStr ? errStr : "unknown");
+        }
+    }
 
     if (r->verbose >= 1) {
         fprintf(stderr, "cuda_llm: compiling kernels for sm_%d via NVRTC...\n", sm);
@@ -3120,9 +3187,9 @@ static int compile_kernels(cuda_llm_runner *r) {
     }
 
     /* Get PTX */
-    size_t ptx_size;
+    ptx_size = 0;
     nvrtcGetPTXSize(prog, &ptx_size);
-    char *ptx = (char *)malloc(ptx_size);
+    ptx = (char *)malloc(ptx_size);
     nvrtcGetPTX(prog, ptx);
     nvrtcDestroyProgram(&prog);
 
@@ -3132,6 +3199,7 @@ static int compile_kernels(cuda_llm_runner *r) {
 
     /* Load module from PTX */
     CUresult err = cuModuleLoadDataEx(&r->module, ptx, 0, NULL, NULL);
+    if (err == CUDA_SUCCESS) cllm_write_file(cache_path, ptx, ptx_size);
     free(ptx);
     if (err != CUDA_SUCCESS) {
         const char *errStr;
@@ -3141,6 +3209,7 @@ static int compile_kernels(cuda_llm_runner *r) {
     }
 
     /* Look up kernel functions */
+lookup_funcs:
     #define GET_FUNC(name) do { \
         err = cuModuleGetFunction(&r->fn_##name, r->module, #name); \
         if (err != CUDA_SUCCESS) { \
@@ -3261,6 +3330,16 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
 /* For this model (Qwen3-Embedding-0.6B-f16), all weight matrices are F16. */
 /* Norms are F32. We handle both cases. */
 
+static void *cllm_stage_buf(cuda_llm_runner *r, size_t nbytes) {
+    if (!r) return NULL;
+    if (nbytes <= r->h_stage_bytes) return r->h_stage;
+    void *p = realloc(r->h_stage, nbytes);
+    if (!p) return NULL;
+    r->h_stage = p;
+    r->h_stage_bytes = nbytes;
+    return p;
+}
+
 /* Upload F16 tensor data directly to GPU */
 static int upload_f16_matrix(CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
@@ -3273,15 +3352,18 @@ static int upload_f16_matrix(CUdeviceptr *d_ptr, const qtensor *t) {
 }
 
 /* Dequant a 1D norm tensor to F32 and upload */
-static int upload_norm_f32(CUdeviceptr *d_ptr, const qtensor *t, int n) {
+static int upload_norm_f32(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t, int n) {
     if (!t->data) { *d_ptr = 0; return 0; }
-    float *buf = (float *)malloc(n * sizeof(float));
-    if (!buf) { fprintf(stderr, "cuda_llm: upload_norm_f32 malloc failed (n=%d)\n", n); return -1; }
-    dequant_row(t->type, t->data, buf, n);
+    const void *src = t->data;
+    if (t->type != GGML_TYPE_F32) {
+        float *buf = (float *)cllm_stage_buf(r, (size_t)n * sizeof(float));
+        if (!buf) { fprintf(stderr, "cuda_llm: upload_norm_f32 stage alloc failed (n=%d)\n", n); return -1; }
+        dequant_row(t->type, t->data, buf, n);
+        src = buf;
+    }
     CUresult err = cuMemAlloc(d_ptr, n * sizeof(float));
-    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 alloc failed (n=%d, err=%d)\n", n, (int)err); free(buf); return -1; }
-    err = cuMemcpyHtoD(*d_ptr, buf, n * sizeof(float));
-    free(buf);
+    if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 alloc failed (n=%d, err=%d)\n", n, (int)err); return -1; }
+    err = cuMemcpyHtoD(*d_ptr, src, n * sizeof(float));
     if (err != CUDA_SUCCESS) { fprintf(stderr, "cuda_llm: upload_norm_f32 copy failed\n"); cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
@@ -3289,14 +3371,14 @@ static int upload_norm_f32(CUdeviceptr *d_ptr, const qtensor *t, int n) {
 /* Upload Q8_0 tensor data to GPU with padding for alignment.
  * Each 34-byte Q8_0 block (2B scale + 32B qs) is padded to 36 bytes
  * (2B scale + 2B pad + 32B qs) so int32 reads of qs data are 4-byte aligned. */
-static int upload_q8_0_raw(CUdeviceptr *d_ptr, const qtensor *t) {
+static int upload_q8_0_raw(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
     int n_elements = t->n_rows * t->n_cols;
     int n_blocks = n_elements / 32;
     size_t nbytes_padded = (size_t)n_blocks * 36;  /* 36 bytes per padded block */
 
     /* Repack on host: insert 2-byte padding after each scale */
-    uint8_t *padded = (uint8_t *)malloc(nbytes_padded);
+    uint8_t *padded = (uint8_t *)cllm_stage_buf(r, nbytes_padded);
     if (!padded) return -1;
     const uint8_t *src = (const uint8_t *)t->data;
     for (int i = 0; i < n_blocks; i++) {
@@ -3310,9 +3392,8 @@ static int upload_q8_0_raw(CUdeviceptr *d_ptr, const qtensor *t) {
     }
 
     CUresult err = cuMemAlloc(d_ptr, nbytes_padded);
-    if (err != CUDA_SUCCESS) { free(padded); return -1; }
+    if (err != CUDA_SUCCESS) { return -1; }
     err = cuMemcpyHtoD(*d_ptr, padded, nbytes_padded);
-    free(padded);
     if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
     return 0;
 }
@@ -3346,32 +3427,43 @@ static uint16_t cllm_f32_to_f16(float f) {
     return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
 }
 
+static uint16_t cllm_bf16_to_f16(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
+    int32_t exp = (int32_t)((bits >> 23) & 0xFF) - 127;
+    uint32_t mant = bits & 0x7FFFFF;
+    if (exp > 15) return sign | 0x7C00;
+    if (exp < -14) {
+        if (exp < -24) return sign;
+        mant |= 0x800000;
+        mant >>= (-1 - exp);
+        return sign | (uint16_t)(mant >> 13);
+    }
+    return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
+}
+
 /* Upload a weight matrix - dispatches based on type */
-static int upload_weight_matrix(CUdeviceptr *d_ptr, const qtensor *t, int *out_type) {
+static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t, int *out_type) {
     *out_type = t->type;
     if (t->type == GGML_TYPE_Q8_0) {
-        return upload_q8_0_raw(d_ptr, t);
+        return upload_q8_0_raw(r, d_ptr, t);
     } else if (t->type == GGML_TYPE_Q2_K || t->type == GGML_TYPE_Q3_K ||
                t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K ||
                t->type == GGML_TYPE_Q6_K ||
                t->type == GGML_TYPE_IQ4_XS || t->type == GGML_TYPE_IQ4_NL) {
         return upload_kquant_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_BF16) {
-        /* BF16 → F32 → F16, then upload as F16 */
+        /* BF16 -> F16 in one host pass, then upload as F16. */
         *out_type = GGML_TYPE_F16;
         int n_elements = t->n_rows * t->n_cols;
-        float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
-        if (!f32_buf) return -1;
-        dequant_row(GGML_TYPE_BF16, t->data, f32_buf, n_elements);
-        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
-        if (!f16_buf) { free(f32_buf); return -1; }
-        for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_f32_to_f16(f32_buf[i]);
-        free(f32_buf);
+        uint16_t *f16_buf = (uint16_t *)cllm_stage_buf(r, (size_t)n_elements * sizeof(uint16_t));
+        if (!f16_buf) return -1;
+        const uint16_t *src = (const uint16_t *)t->data;
+        for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_bf16_to_f16(src[i]);
         size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
         CUresult err = cuMemAlloc(d_ptr, nbytes);
-        if (err != CUDA_SUCCESS) { free(f16_buf); return -1; }
+        if (err != CUDA_SUCCESS) { return -1; }
         err = cuMemcpyHtoD(*d_ptr, f16_buf, nbytes);
-        free(f16_buf);
         if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
         return 0;
     } else {
@@ -3442,6 +3534,177 @@ static qtensor cllm_load_tensor(const gguf_context *gguf, const char *name, int 
         n_rows *= gguf->tensors[idx].dims[d];
     t.n_rows = (int)n_rows;
     return t;
+}
+
+static int cllm_st_dtype_to_ggml(const char *dtype) {
+    if (!dtype) return -1;
+    if (strcmp(dtype, "F32") == 0) return GGML_TYPE_F32;
+    if (strcmp(dtype, "F16") == 0) return GGML_TYPE_F16;
+    if (strcmp(dtype, "BF16") == 0) return GGML_TYPE_BF16;
+    return -1;
+}
+
+static qtensor cllm_st_load_tensor_multi(st_context **shards, int n_shards,
+                                         const char *name, int required) {
+    qtensor t = {0};
+    st_context *st = NULL;
+    int idx = -1;
+    for (int s = 0; s < n_shards && idx < 0; s++) {
+        idx = safetensors_find(shards[s], name);
+        if (idx >= 0) st = shards[s];
+    }
+    if (idx < 0) {
+        if (required) fprintf(stderr, "cuda_llm: missing safetensors tensor '%s'\n", name);
+        return t;
+    }
+
+    int ggml_type = cllm_st_dtype_to_ggml(safetensors_dtype(st, idx));
+    if (ggml_type < 0) {
+        fprintf(stderr, "cuda_llm: unsupported safetensors dtype '%s' for %s\n",
+                safetensors_dtype(st, idx), name);
+        return t;
+    }
+
+    const uint64_t *sh = safetensors_shape(st, idx);
+    int nd = safetensors_ndims(st, idx);
+    t.data = safetensors_data(st, idx);
+    t.type = ggml_type;
+    t.n_dims = nd > 4 ? 4 : nd;
+    if (nd <= 1) {
+        int n = (int)sh[0];
+        t.n_rows = 1;
+        t.n_cols = n;
+        t.dims[0] = (uint64_t)n;
+    } else {
+        t.n_rows = (int)sh[0];
+        t.n_cols = (int)sh[1];
+        t.dims[0] = sh[1];
+        t.dims[1] = sh[0];
+        for (int d = 2; d < t.n_dims; d++) t.dims[d] = sh[d];
+    }
+    return t;
+}
+
+static int cllm_open_safetensors_shards(const char *model_path, st_context **shards,
+                                        int max_shards) {
+    struct stat sb;
+    if (stat(model_path, &sb) != 0) return -1;
+
+    if (S_ISDIR(sb.st_mode)) {
+        char path[512];
+        int n_shards = 0;
+        for (int i = 1; i <= max_shards && n_shards < max_shards; i++) {
+            int found = 0;
+            for (int total = i; total <= max_shards; total++) {
+                snprintf(path, sizeof(path), "%s/model-%05d-of-%05d.safetensors",
+                         model_path, i, total);
+                if (stat(path, &sb) != 0) continue;
+                st_context *s = safetensors_open(path);
+                if (s) {
+                    shards[n_shards++] = s;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) break;
+        }
+        return n_shards;
+    }
+
+    st_context *st = safetensors_open(model_path);
+    if (!st) return -1;
+    shards[0] = st;
+    return 1;
+}
+
+static void cllm_close_safetensors_shards(st_context **shards, int n_shards) {
+    for (int i = 0; i < n_shards; i++) {
+        if (shards[i]) safetensors_close(shards[i]);
+    }
+}
+
+static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_dim,
+                                          int max_seq_len) {
+    size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
+    int n_attn_layers = 0;
+    r->d_key_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+    r->d_value_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
+    if (!r->d_key_cache || !r->d_value_cache) return -1;
+    for (int l = 0; l < r->n_layers; l++) {
+        if (r->layers[l].is_ssm) continue;
+        CHECK_CU(cuMemAlloc(&r->d_key_cache[l], kv_cache_size));
+        CHECK_CU(cuMemsetD8(r->d_key_cache[l], 0, kv_cache_size));
+        CHECK_CU(cuMemAlloc(&r->d_value_cache[l], kv_cache_size));
+        CHECK_CU(cuMemsetD8(r->d_value_cache[l], 0, kv_cache_size));
+        n_attn_layers++;
+    }
+    if (r->is_hybrid && r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: %d attention layers (KV cache), %d SSM layers\n",
+                n_attn_layers, r->n_layers - n_attn_layers);
+    }
+
+    int max_dim = r->n_embd;
+    if (q_dim > max_dim) max_dim = q_dim;
+    if (r->n_ff > max_dim) max_dim = r->n_ff;
+    int xb2_dim = max_dim;
+    if (r->is_hybrid) {
+        if (r->ssm_qkv_dim > xb2_dim) xb2_dim = r->ssm_qkv_dim;
+        if (2 * q_dim > xb2_dim) xb2_dim = 2 * q_dim;
+    }
+
+    CHECK_CU(cuMemAlloc(&r->d_x,   max_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb,  max_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_xb2, xb2_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_q,   q_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_k,   kv_dim * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_v,   kv_dim * sizeof(float)));
+    {
+        int ff_dim = r->n_ff;
+        if (r->is_moe && r->shared_expert_ff > ff_dim) ff_dim = r->shared_expert_ff;
+        CHECK_CU(cuMemAlloc(&r->d_gate, ff_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_up,   ff_dim * sizeof(float)));
+    }
+
+    if (r->is_moe) {
+        CHECK_CU(cuMemAlloc(&r->d_router_logits, r->n_experts * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_moe_accum, r->n_embd * sizeof(float)));
+        r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
+        if (!r->h_router_logits) return -1;
+    }
+
+    if (r->is_hybrid) {
+        int d_inner = r->ssm_d_inner;
+        int dt_rank = r->ssm_dt_rank;
+        int d_state = r->ssm_d_state;
+        CHECK_CU(cuMemAlloc(&r->d_ssm_qkv,      r->ssm_qkv_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_z,         d_inner * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_alpha,     dt_rank * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_beta,      dt_rank * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_Q_exp,     dt_rank * d_state * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_K_exp,     dt_rank * d_state * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_out,       d_inner * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_ssm_conv_out,  r->ssm_qkv_dim * sizeof(float)));
+        CHECK_CU(cuMemAlloc(&r->d_attn_gate,     q_dim * sizeof(float)));
+    }
+
+    if (r->n_deepstack > 0) {
+        CHECK_CU(cuMemAlloc(&r->d_ds_tmp, r->n_embd * sizeof(float)));
+    }
+
+    CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
+    CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
+
+    CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
+
+    {
+        int out_sz = r->n_vocab > r->n_embd ? r->n_vocab : r->n_embd;
+        r->h_output = (float *)malloc((size_t)out_sz * sizeof(float));
+        if (!r->h_output) return -1;
+    }
+
+    r->weights_loaded = 1;
+    return 0;
 }
 
 /* ======================================================================== */
@@ -3549,7 +3812,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     if (r->n_vocab == 0) r->n_vocab = embd.n_rows;
     r->token_embd_type = embd.type;
     if (embd.type == GGML_TYPE_Q8_0) {
-        if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
+        if (upload_q8_0_raw(r, &r->d_token_embd, &embd) != 0) return -1;
     } else if (embd.type == GGML_TYPE_Q2_K) {
         /* Q2_K has a dedicated GPU embed kernel */
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
@@ -3603,7 +3866,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     if (!onorm.data) { fprintf(stderr, "cuda_llm: output_norm.weight not found!\n"); return -1; }
     if (r->verbose) fprintf(stderr, "cuda_llm: output_norm type=%d n_rows=%d n_cols=%d\n",
         onorm.type, onorm.n_rows, onorm.n_cols);
-    if (upload_norm_f32(&r->d_output_norm, &onorm, r->n_embd) != 0) {
+    if (upload_norm_f32(r, &r->d_output_norm, &onorm, r->n_embd) != 0) {
         fprintf(stderr, "cuda_llm: upload output_norm failed!\n"); return -1;
     }
 
@@ -3612,7 +3875,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     {
         qtensor output = cllm_load_tensor(gguf, "output.weight", 0);
         if (output.data) {
-            if (upload_weight_matrix(&r->d_output_w, &output, &r->output_w_type) != 0) { fprintf(stderr, "cuda_llm: output.weight upload failed!\n"); return -1; }
+            if (upload_weight_matrix(r, &r->d_output_w, &output, &r->output_w_type) != 0) { fprintf(stderr, "cuda_llm: output.weight upload failed!\n"); return -1; }
             r->has_lm_head = 1;
             if (r->verbose) fprintf(stderr, "cuda_llm: output.weight loaded (type=%d)\n", r->output_w_type);
         } else {
@@ -3642,7 +3905,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
         /* Attention norm (F32) — shared by all layer types */
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
         qtensor t = cllm_load_tensor(gguf, name, 1);
-        if (upload_norm_f32(&cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
+        if (upload_norm_f32(r, &cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
 
         if (r->verbose >= 2) fprintf(stderr, "cuda_llm: layer %d (%s)...\n", l, is_ssm ? "SSM" : "ATT");
         if (is_ssm) {
@@ -3651,7 +3914,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
                 t = cllm_load_tensor(gguf, name, 1); \
                 cl->rows_f = t.n_rows; cl->cols_f = t.n_cols; \
-                if (upload_weight_matrix(&cl->field, &t, &cl->type_f) != 0) return -1; \
+                if (upload_weight_matrix(r, &cl->field, &t, &cl->type_f) != 0) return -1; \
             } while(0)
             LOAD_SSM_W(ssm_qkv_w,   "attn_qkv",  ssm_qkv_rows,   ssm_qkv_cols,   ssm_qkv_type);
             LOAD_SSM_W(ssm_gate_w,   "attn_gate",  ssm_gate_rows,  ssm_gate_cols,  ssm_gate_type);
@@ -3663,22 +3926,22 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             /* ssm_a (F32, no .weight suffix) */
             snprintf(name, sizeof(name), "blk.%d.ssm_a", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_a, &t, r->ssm_dt_rank) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_a, &t, r->ssm_dt_rank) != 0) return -1;
 
             /* ssm_dt.bias (F32) */
             snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_dt_bias, &t, r->ssm_dt_rank) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_dt_bias, &t, r->ssm_dt_rank) != 0) return -1;
 
             /* ssm_conv1d (F32) */
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_conv1d_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_conv1d_w, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             /* ssm_norm (F32) */
             snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->ssm_norm_w, &t, r->ssm_d_state) != 0) return -1;
+            if (upload_norm_f32(r, &cl->ssm_norm_w, &t, r->ssm_d_state) != 0) return -1;
 
             /* Allocate SSM persistent state */
             size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
@@ -3699,34 +3962,34 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
 
             /* QK norms (F32, optional) */
             snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
             t = cllm_load_tensor(gguf, name, 0);
             cl->has_qk_norm = (t.data != NULL);
             if (t.data) {
-                if (upload_norm_f32(&cl->attn_q_norm_w, &t, r->head_dim) != 0) return -1;
+                if (upload_norm_f32(r, &cl->attn_q_norm_w, &t, r->head_dim) != 0) return -1;
             }
             snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l);
             t = cllm_load_tensor(gguf, name, 0);
             if (t.data) {
-                if (upload_norm_f32(&cl->attn_k_norm_w, &t, r->head_dim) != 0) return -1;
+                if (upload_norm_f32(r, &cl->attn_k_norm_w, &t, r->head_dim) != 0) return -1;
             }
 
             /* Q/K/V biases (F32, optional — Qwen2.5-VL has these) */
@@ -3779,7 +4042,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
         }
         t = cllm_load_tensor(gguf, name, 1);
-        if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
+        if (upload_norm_f32(r, &cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
 
         /* FFN weights */
         if (r->is_moe) {
@@ -3790,7 +4053,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_gate_rows = t.n_rows; cl->moe_gate_cols = t.n_cols;
-            if (upload_norm_f32(&cl->moe_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_f32(r, &cl->moe_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             /* Expert 3D weights (K-quant packed) */
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
@@ -3815,23 +4078,23 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             /* Shared expert gate: ffn_gate_inp_shexp [n_embd] F32 (1D sigmoid gate) */
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
-            if (upload_norm_f32(&cl->moe_shared_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (upload_norm_f32(r, &cl->moe_shared_gate_w, &t, t.n_rows * t.n_cols) != 0) return -1;
 
             /* Shared expert FFN (BF16 → F16 via upload_weight_matrix) */
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_gate_rows = t.n_rows; cl->moe_shared_gate_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->moe_shared_ffn_gate_w, &t, &cl->moe_shared_gate_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_gate_w, &t, &cl->moe_shared_gate_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_up_rows = t.n_rows; cl->moe_shared_up_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->moe_shared_ffn_up_w, &t, &cl->moe_shared_up_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_up_w, &t, &cl->moe_shared_up_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_down_rows = t.n_rows; cl->moe_shared_down_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->moe_shared_ffn_down_w, &t, &cl->moe_shared_down_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_down_w, &t, &cl->moe_shared_down_type) != 0) return -1;
 
             if (r->verbose >= 2) {
                 fprintf(stderr, "  layer %d [MoE]: router[%d×%d] exp_gu[%d×%d] exp_d[%d×%d] stride_gu=%zu stride_d=%zu\n",
@@ -3849,17 +4112,17 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
-            if (upload_weight_matrix(&cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
         }
     }
 
@@ -3937,6 +4200,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     /* INT8 quantization scratch (for dp4a path) */
     CHECK_CU(cuMemAlloc(&r->d_xb_q,     max_dim * sizeof(int8_t)));
     CHECK_CU(cuMemAlloc(&r->d_xb_scale, sizeof(float)));
+    CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     /* Logits buffer (GPU + host) */
     CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
@@ -4010,6 +4274,184 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 (double)scratch_bytes / 1024.0);
     }
 
+    return 0;
+}
+
+int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
+                                            const char *model_path,
+                                            int max_seq_len) {
+    if (!r || !model_path) return -1;
+
+    st_context *shards[16] = {0};
+    int n_shards = cllm_open_safetensors_shards(model_path, shards, 16);
+    if (n_shards <= 0) {
+        fprintf(stderr, "cuda_llm: failed to open safetensors model %s\n", model_path);
+        return -1;
+    }
+
+    int n_layers = 0;
+    for (int s = 0; s < n_shards; s++) {
+        for (int i = 0; i < shards[s]->n_tensors; i++) {
+            const char *nm = safetensors_name(shards[s], i);
+            if (strncmp(nm, "model.layers.", 13) == 0) {
+                int l = atoi(nm + 13);
+                if (l + 1 > n_layers) n_layers = l + 1;
+            }
+        }
+    }
+
+    int r0, c0;
+    qtensor embd = cllm_st_load_tensor_multi(shards, n_shards, "model.embed_tokens.weight", 1);
+    if (!embd.data) { cllm_close_safetensors_shards(shards, n_shards); return -1; }
+    qtensor q0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.q_proj.weight", 1);
+    qtensor k0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.k_proj.weight", 1);
+    qtensor qn0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.q_norm.weight", 1);
+    qtensor ff0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.mlp.gate_proj.weight", 1);
+    (void)r0; (void)c0;
+
+    r->n_embd = embd.n_cols;
+    r->n_vocab = embd.n_rows;
+    r->n_layers = n_layers;
+    r->head_dim = qn0.n_cols ? qn0.n_cols : 128;
+    r->n_heads = q0.n_rows / r->head_dim;
+    r->n_kv_heads = k0.n_rows / r->head_dim;
+    r->n_ff = ff0.n_rows;
+    r->rms_norm_eps = 1e-6f;
+    r->rope_freq_base = 1000000.0f;
+    r->n_rope_pairs = 0;
+    r->is_hybrid = 0;
+    r->is_moe = 0;
+    r->n_deepstack = 0;
+    if (max_seq_len <= 0) max_seq_len = 2048;
+    r->max_seq_len = max_seq_len;
+
+    if (r->verbose >= 1) {
+        fprintf(stderr, "cuda_llm: safetensors qwen3 n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d\n",
+                r->n_embd, r->n_heads, r->n_kv_heads, r->n_layers, r->n_ff, r->head_dim);
+    }
+
+    if (upload_weight_matrix(r, &r->d_token_embd, &embd, &r->token_embd_type) != 0) {
+        cllm_close_safetensors_shards(shards, n_shards);
+        return -1;
+    }
+
+    qtensor onorm = cllm_st_load_tensor_multi(shards, n_shards, "model.norm.weight", 1);
+    if (!onorm.data || upload_norm_f32(r, &r->d_output_norm, &onorm, r->n_embd) != 0) {
+        cllm_close_safetensors_shards(shards, n_shards);
+        return -1;
+    }
+
+    r->d_output_w = r->d_token_embd;
+    r->output_w_type = r->token_embd_type;
+    r->has_lm_head = 1;
+
+    r->layers = (cuda_layer *)calloc(r->n_layers, sizeof(cuda_layer));
+    if (!r->layers) {
+        cllm_close_safetensors_shards(shards, n_shards);
+        return -1;
+    }
+
+    for (int l = 0; l < r->n_layers; l++) {
+        char name[160];
+        cuda_layer *cl = &r->layers[l];
+        qtensor t;
+
+        snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        if (!t.data || upload_norm_f32(r, &cl->attn_norm_w, &t, r->n_embd) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->has_qk_norm = 1;
+        if (!t.data || upload_norm_f32(r, &cl->attn_q_norm_w, &t, r->head_dim) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        if (!t.data || upload_norm_f32(r, &cl->attn_k_norm_w, &t, r->head_dim) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        if (!t.data || upload_norm_f32(r, &cl->ffn_norm_w, &t, r->n_embd) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+        cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+    }
+
+    {
+        int kv_dim = r->n_kv_heads * r->head_dim;
+        int q_dim = r->n_heads * r->head_dim;
+        if (cuda_llm_alloc_runtime_buffers(r, q_dim, kv_dim, max_seq_len) != 0) {
+            cllm_close_safetensors_shards(shards, n_shards);
+            return -1;
+        }
+    }
+
+    cllm_close_safetensors_shards(shards, n_shards);
     return 0;
 }
 
@@ -4387,6 +4829,7 @@ float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (cuda_llm_bind_context(r) != 0) return NULL;
 
     int n_embd = r->n_embd;
 
@@ -5327,6 +5770,14 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position) {
             launch_add(r, r->d_x, r->d_ds_tmp, n_embd);
         }
 
+        for (int si = 0; si < r->n_hidden_snapshots; si++) {
+            if (r->hidden_snapshot_layers[si] == l) {
+                CUdeviceptr dst = r->d_hidden_snapshots + (size_t)si * n_embd * sizeof(float);
+                cuMemcpyDtoDAsync(dst, r->d_x,
+                                  (size_t)n_embd * sizeof(float), r->stream);
+            }
+        }
+
         /* Debug: print hidden state norm after each layer */
         if (r->debug_layers) {
             cuStreamSynchronize(r->stream);
@@ -5385,6 +5836,7 @@ float *cuda_llm_forward_logits(cuda_llm_runner *r, int32_t token_id, int positio
 float *cuda_llm_forward_embd(cuda_llm_runner *r, const float *embd, int embd_stride, int position) {
     if (!r || !r->weights_loaded || !embd) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (cuda_llm_bind_context(r) != 0) return NULL;
 
     int n_embd = r->n_embd;
 
@@ -5423,7 +5875,46 @@ float *cuda_llm_forward_embd_logits(cuda_llm_runner *r, const float *embd, int e
 /* Read last hidden state (d_x) from GPU */
 int cuda_llm_read_hidden(const cuda_llm_runner *r, float *dst, int n) {
     if (!r || !dst || n <= 0) return -1;
-    CUresult err = cuMemcpyDtoH(dst, r->d_x, (size_t)n * sizeof(float));
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    err = cuMemcpyDtoH(dst, r->d_x, (size_t)n * sizeof(float));
+    return (err == CUDA_SUCCESS) ? 0 : -1;
+}
+
+int cuda_llm_set_hidden_snapshot_layers(cuda_llm_runner *r, const int *layers, int n_slots) {
+    if (!r) return -1;
+    if (n_slots < 0 || n_slots > 3) return -1;
+    r->n_hidden_snapshots = 0;
+    for (int i = 0; i < 3; i++) r->hidden_snapshot_layers[i] = -1;
+    for (int i = 0; i < n_slots; i++) {
+        int layer = layers ? layers[i] : -1;
+        if (layer < 0 || layer >= r->n_layers) return -1;
+        r->hidden_snapshot_layers[i] = layer;
+        r->n_hidden_snapshots++;
+    }
+    return 0;
+}
+
+int cuda_llm_read_hidden_snapshot(const cuda_llm_runner *r, int slot, float *dst, int n) {
+    if (!r || !dst || n <= 0) return -1;
+    if (slot < 0 || slot >= r->n_hidden_snapshots) return -1;
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    CUdeviceptr src = r->d_hidden_snapshots + (size_t)slot * n * sizeof(float);
+    err = cuMemcpyDtoH(dst, src, (size_t)n * sizeof(float));
+    return (err == CUDA_SUCCESS) ? 0 : -1;
+}
+
+int cuda_llm_read_hidden_snapshots(const cuda_llm_runner *r, float *dst, int n_slots, int n) {
+    if (!r || !dst || n <= 0) return -1;
+    if (n_slots < 0 || n_slots > r->n_hidden_snapshots) return -1;
+    if (n_slots == 0) return 0;
+    if (cuda_llm_bind_context((cuda_llm_runner *)r) != 0) return -1;
+    CUresult err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) return -1;
+    err = cuMemcpyDtoH(dst, r->d_hidden_snapshots, (size_t)n_slots * n * sizeof(float));
     return (err == CUDA_SUCCESS) ? 0 : -1;
 }
 
@@ -5463,7 +5954,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_ds_tmp)   cuMemFree(r->d_ds_tmp);
     if (r->d_router_logits) cuMemFree(r->d_router_logits);
     if (r->d_moe_accum)    cuMemFree(r->d_moe_accum);
+    if (r->d_hidden_snapshots) cuMemFree(r->d_hidden_snapshots);
     free(r->h_router_logits);
+    free(r->h_stage);
     if (r->d_xb_q)    cuMemFree(r->d_xb_q);
     if (r->d_xb_scale) cuMemFree(r->d_xb_scale);
 
@@ -5547,7 +6040,25 @@ void cuda_llm_free(cuda_llm_runner *r) {
 /* ======================================================================== */
 
 void cuda_llm_reset_state(cuda_llm_runner *r) {
-    if (!r || !r->is_hybrid) return;
+    if (!r) return;
+    if (cuda_llm_bind_context(r) != 0) return;
+
+    int kv_dim = r->n_kv_heads * r->head_dim;
+    if (kv_dim > 0 && r->max_seq_len > 0) {
+        size_t kv_cache_bytes = (size_t)r->max_seq_len * kv_dim * sizeof(float);
+        if (r->d_key_cache && r->d_value_cache) {
+            for (int l = 0; l < r->n_layers; l++) {
+                if (r->d_key_cache[l]) cuMemsetD8(r->d_key_cache[l], 0, kv_cache_bytes);
+                if (r->d_value_cache[l]) cuMemsetD8(r->d_value_cache[l], 0, kv_cache_bytes);
+            }
+        }
+    }
+    if (r->d_hidden_snapshots && r->n_hidden_snapshots > 0 && r->n_embd > 0) {
+        size_t snap_bytes = (size_t)r->n_hidden_snapshots * r->n_embd * sizeof(float);
+        cuMemsetD8(r->d_hidden_snapshots, 0, snap_bytes);
+    }
+
+    if (!r->is_hybrid) return;
     for (int l = 0; l < r->n_layers; l++) {
         cuda_layer *cl = &r->layers[l];
         if (!cl->is_ssm) continue;
