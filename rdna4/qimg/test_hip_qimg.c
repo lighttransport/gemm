@@ -13,11 +13,20 @@
 
 #define SAFETENSORS_IMPLEMENTATION
 #define GGML_DEQUANT_IMPLEMENTATION
+#define GGUF_LOADER_IMPLEMENTATION
+#define BPE_TOKENIZER_IMPLEMENTATION
+#define TRANSFORMER_IMPLEMENTATION
 #define QIMG_SCHEDULER_IMPLEMENTATION
+#define QIMG_TEXT_ENCODER_IMPLEMENTATION
 
 #include "../../common/safetensors.h"
 #include "../../common/ggml_dequant.h"
+#include "../../common/gguf_loader.h"
+#include "../../common/bpe_tokenizer.h"
+#include "../../common/transformer.h"
 #include "../../common/qwen_image_scheduler.h"
+#include "../llm/hip_llm_runner.h"  /* must be before text_encoder.h for GPU path */
+#include "../../common/qwen_image_text_encoder.h"
 #include "hip_qimg_runner.h"
 
 #include <stdio.h>
@@ -67,6 +76,8 @@ static void save_ppm(const char *path, const float *rgb, int h, int w) {
 int main(int argc, char **argv) {
     const char *dit_path = NULL;
     const char *vae_path = NULL;
+    const char *enc_path = NULL;
+    const char *prompt = "a red apple on a white table";
     const char *out_path = "hip_qimg_out.ppm";
     const char *mode = NULL;
     int device_id = 0;
@@ -81,6 +92,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--generate")) mode = "gen";
         else if (!strcmp(argv[i], "--dit") && i+1 < argc) dit_path = argv[++i];
         else if (!strcmp(argv[i], "--vae") && i+1 < argc) vae_path = argv[++i];
+        else if (!strcmp(argv[i], "--enc") && i+1 < argc) enc_path = argv[++i];
+        else if (!strcmp(argv[i], "--prompt") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--height") && i+1 < argc) out_h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--width") && i+1 < argc) out_w = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--steps") && i+1 < argc) n_steps = atoi(argv[++i]);
@@ -90,8 +103,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-v")) verbose = 2;
         else {
             fprintf(stderr, "Usage: %s --test-init|--test-dit|--test-vae|--generate\n"
-                    "  --dit <st>  --vae <st>  --height <h>  --width <w>\n"
-                    "  --steps <n>  --seed <s>  [-o out.ppm] [-d dev] [-v]\n", argv[0]);
+                    "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
+                    "  --height <h>  --width <w>  --steps <n>  --seed <s>\n"
+                    "  [-o out.ppm] [-d dev] [-v]\n", argv[0]);
             return 1;
         }
     }
@@ -105,7 +119,12 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "=== HIP Qwen-Image: %s ===\n", mode);
 
-    /* Init HIP */
+    /* Precomputed text tokens (not used in current flow) */
+    int n_txt_precomputed = 0;
+    float *txt_precomputed = NULL;
+    (void)n_txt_precomputed; (void)txt_precomputed;
+
+    /* Init HIP + compile qimg kernels */
     hip_qimg_runner *r = hip_qimg_init(device_id, verbose);
     if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
 
@@ -178,13 +197,42 @@ int main(int argc, char **argv) {
         int hp = lat_h / ps, wp = lat_w / ps;
         int n_img = hp * wp;
         int in_ch = 64, lat_ch = 16;
+        int txt_dim = 3584;
 
-        /* Generate random initial noise (no text encoder in HIP build) */
+        /* 1. Text encoder (CPU — GPU text encoder requires qwen2vl HIP LLM support) */
+        fprintf(stderr, "\n[1/3] Text conditioning...\n");
+        int n_txt = 0;
+        float *txt_tokens = NULL;
+
+        if (enc_path) {
+            fprintf(stderr, "  Loading text encoder: %s\n", enc_path);
+            clock_t enc_t0 = clock();
+            qimg_text_enc *enc = qimg_text_enc_load(enc_path);
+            if (enc) {
+                fprintf(stderr, "  Encoding: \"%s\"\n", prompt);
+                txt_tokens = qimg_text_enc_encode(enc, prompt, &n_txt);
+                if (txt_tokens)
+                    fprintf(stderr, "  Text hidden: [%d, %d] (%.1fs)\n",
+                            n_txt, txt_dim,
+                            (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+                qimg_text_enc_free(enc);
+            }
+        }
+        if (!txt_tokens) {
+            fprintf(stderr, "  No text encoder -- using random conditioning\n");
+            n_txt = 7;
+            rng_state = seed + 1;
+            txt_tokens = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
+            for (int i = 0; i < n_txt * txt_dim; i++) txt_tokens[i] = randn() * 0.1f;
+        }
+
+        /* 2. Generate initial noise */
+        fprintf(stderr, "\n[2/3] Denoising (%dx%d, %d steps)...\n", out_w, out_h, n_steps);
         rng_state = seed;
         float *latent = (float *)malloc((size_t)lat_ch * lat_h * lat_w * sizeof(float));
         for (int i = 0; i < lat_ch * lat_h * lat_w; i++) latent[i] = randn();
 
-        /* Patchify latent → img_tokens */
+        /* Patchify latent -> img_tokens */
         float *img_tokens = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
         for (int tok = 0; tok < n_img; tok++) {
             int py = tok / wp, px = tok % wp;
@@ -195,12 +243,6 @@ int main(int argc, char **argv) {
                         img_tokens[tok * in_ch + idx++] =
                             latent[c * lat_h * lat_w + (py*ps+dy) * lat_w + (px*ps+dx)];
         }
-
-        /* Dummy text tokens (random) — real pipeline needs text encoder */
-        int n_txt = 7;
-        int txt_dim = 3584;
-        float *txt_tokens = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
-        for (int i = 0; i < n_txt * txt_dim; i++) txt_tokens[i] = randn() * 0.1f;
 
         /* FlowMatch schedule */
         qimg_scheduler sched;
@@ -226,7 +268,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  step %d/%d: t=%.1f dt=%.4f\n", step+1, n_steps, t, dt);
         }
 
-        fprintf(stderr, "Denoising done in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+        fprintf(stderr, "Denoising done in %.1fs (%.2fs/step)\n",
+                (double)(clock()-t0)/CLOCKS_PER_SEC,
+                (double)(clock()-t0)/CLOCKS_PER_SEC/n_steps);
 
         /* Unpatchify → latent */
         for (int tok = 0; tok < n_img; tok++) {
@@ -240,6 +284,8 @@ int main(int argc, char **argv) {
         }
 
         /* VAE decode */
+        /* 3. VAE decode */
+        fprintf(stderr, "\n[3/3] VAE decode...\n");
         if (vae_path) {
             hip_qimg_load_vae(r, vae_path);
             float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
