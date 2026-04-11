@@ -2537,6 +2537,48 @@ void hip_llm_set_max_layers(hip_llm_runner *r, int max_layers) {
 /* Public API: free                                                         */
 /* ======================================================================== */
 
+void hip_llm_offload(hip_llm_runner *r) {
+    if (!r) return;
+    /* Free GPU weight and activation buffers only — keep module, stream, context */
+    if (r->d_x)    { hipFree(r->d_x);    r->d_x = NULL; }
+    if (r->d_xb)   { hipFree(r->d_xb);   r->d_xb = NULL; }
+    if (r->d_xb2)  { hipFree(r->d_xb2);  r->d_xb2 = NULL; }
+    if (r->d_q)    { hipFree(r->d_q);    r->d_q = NULL; }
+    if (r->d_k)    { hipFree(r->d_k);    r->d_k = NULL; }
+    if (r->d_v)    { hipFree(r->d_v);    r->d_v = NULL; }
+    if (r->d_gate) { hipFree(r->d_gate); r->d_gate = NULL; }
+    if (r->d_up)   { hipFree(r->d_up);   r->d_up = NULL; }
+    if (r->d_xb_q)    { hipFree(r->d_xb_q);    r->d_xb_q = NULL; }
+    if (r->d_xb_scale){ hipFree(r->d_xb_scale); r->d_xb_scale = NULL; }
+    if (r->d_logits)  { hipFree(r->d_logits);   r->d_logits = NULL; }
+    if (r->d_token_embd) { hipFree(r->d_token_embd); r->d_token_embd = NULL; }
+    if (r->d_output_norm){ hipFree(r->d_output_norm); r->d_output_norm = NULL; }
+    if (r->d_output_w && r->d_output_w != r->d_token_embd) { hipFree(r->d_output_w); }
+    r->d_output_w = NULL;
+    if (r->d_key_cache) {
+        for (int l = 0; l < r->n_layers; l++)
+            if (r->d_key_cache[l]) hipFree(r->d_key_cache[l]);
+        free(r->d_key_cache); r->d_key_cache = NULL;
+    }
+    if (r->d_value_cache) {
+        for (int l = 0; l < r->n_layers; l++)
+            if (r->d_value_cache[l]) hipFree(r->d_value_cache[l]);
+        free(r->d_value_cache); r->d_value_cache = NULL;
+    }
+    if (r->layers) {
+        for (int l = 0; l < r->n_layers; l++) {
+            hip_layer *cl = &r->layers[l];
+            void **ptrs = (void **)cl;
+            /* Free all non-NULL GPU pointers in the layer struct */
+            for (size_t i = 0; i < sizeof(hip_layer) / sizeof(void *); i++)
+                if (ptrs[i]) { hipFree(ptrs[i]); ptrs[i] = NULL; }
+        }
+        free(r->layers); r->layers = NULL;
+    }
+    hipDeviceSynchronize();
+    fprintf(stderr, "hip_llm: offloaded GPU weights (VRAM freed)\n");
+}
+
 void hip_llm_free(hip_llm_runner *r) {
     if (!r) return;
 
@@ -2619,14 +2661,11 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_output_w && r->d_output_w != r->d_token_embd) hipFree(r->d_output_w);
     if (r->d_logits) hipFree(r->d_logits);
 
-    /* Don't unload module — hipModuleUnload corrupts the runtime
-     * state on some ROCm versions, preventing other HIPRTC modules
-     * from loading on the same device. The OS reclaims on exit. */
+    if (r->module) hipModuleUnload(r->module);
 
     free(r->h_output);
 
-    /* Stream cleanup deferred — destroying it can corrupt the runtime
-     * state on some ROCm versions when another HIPRTC runner follows. */
+    if (r->stream) hipStreamDestroy(r->stream);
 
     free(r);
 }
