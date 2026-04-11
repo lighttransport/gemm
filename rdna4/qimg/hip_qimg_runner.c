@@ -78,7 +78,7 @@ struct hip_qimg_runner {
     int verbose;
 
     hipModule_t mod;
-    hipFunction_t fn_gemm, fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
+    hipFunction_t fn_gemm, fn_gemm_fp8, fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_flash_attn;
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
@@ -89,6 +89,7 @@ struct hip_qimg_runner {
     /* DiT config */
     int dim, n_heads, head_dim, n_blocks;
     int in_ch, txt_dim, mlp_h;
+    int use_fp8;  /* 1 = upload FP8 raw + use LUT GEMM (4x less VRAM) */
 
     /* Safetensors context (mmap'd) */
     void *dit_st;
@@ -168,6 +169,28 @@ static void *qimg_st_upload_f32(st_context *st, const char *name) {
     return d;
 }
 
+/* Upload safetensor as raw FP8 bytes to GPU (no conversion, 1 byte/element) */
+static void *qimg_st_upload_fp8_raw(st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return NULL;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    void *data = safetensors_data(st, idx);
+    void *d = NULL;
+    if (hipMalloc(&d, nbytes) != hipSuccess) {
+        fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for %s (fp8)\n",
+                (float)nbytes / (1 << 20), name);
+        return NULL;
+    }
+    hipMemcpy(d, data, nbytes, hipMemcpyHostToDevice);
+    return d;
+}
+
+/* Upload weight: FP8 raw if use_fp8, else F32 */
+static void *qimg_upload_weight(hip_qimg_runner *r, st_context *st, const char *name) {
+    if (r->use_fp8) return qimg_st_upload_fp8_raw(st, name);
+    return qimg_st_upload_f32(st, name);
+}
+
 /* Upload 3D conv weight → 2D by taking last temporal slice */
 static void *qimg_upload_conv3d(st_context *st, const char *name,
                                  int *out_co, int *out_ci) {
@@ -213,36 +236,44 @@ static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b)
     char name[256];
     int ok = 1;
 
+    /* BLK_W: upload as FP8 raw or F32 depending on use_fp8 */
     #define BLK_W(field, suffix) do { if (ok) { \
+        snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
+        b->field = qimg_upload_weight(r, st, name); \
+        if (!b->field) ok = 0; \
+    } } while(0)
+    /* BLK_F32: always upload as F32 (biases, norms) */
+    #define BLK_F32(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
         b->field = qimg_st_upload_f32(st, name); \
         if (!b->field) ok = 0; \
     } } while(0)
 
-    BLK_W(attn_q_w, "attn.to_q.weight"); BLK_W(attn_q_b, "attn.to_q.bias");
-    BLK_W(attn_k_w, "attn.to_k.weight"); BLK_W(attn_k_b, "attn.to_k.bias");
-    BLK_W(attn_v_w, "attn.to_v.weight"); BLK_W(attn_v_b, "attn.to_v.bias");
-    BLK_W(attn_out_w, "attn.to_out.0.weight"); BLK_W(attn_out_b, "attn.to_out.0.bias");
+    BLK_W(attn_q_w, "attn.to_q.weight"); BLK_F32(attn_q_b, "attn.to_q.bias");
+    BLK_W(attn_k_w, "attn.to_k.weight"); BLK_F32(attn_k_b, "attn.to_k.bias");
+    BLK_W(attn_v_w, "attn.to_v.weight"); BLK_F32(attn_v_b, "attn.to_v.bias");
+    BLK_W(attn_out_w, "attn.to_out.0.weight"); BLK_F32(attn_out_b, "attn.to_out.0.bias");
 
-    BLK_W(attn_add_q_w, "attn.add_q_proj.weight"); BLK_W(attn_add_q_b, "attn.add_q_proj.bias");
-    BLK_W(attn_add_k_w, "attn.add_k_proj.weight"); BLK_W(attn_add_k_b, "attn.add_k_proj.bias");
-    BLK_W(attn_add_v_w, "attn.add_v_proj.weight"); BLK_W(attn_add_v_b, "attn.add_v_proj.bias");
-    BLK_W(attn_add_out_w, "attn.to_add_out.weight"); BLK_W(attn_add_out_b, "attn.to_add_out.bias");
+    BLK_W(attn_add_q_w, "attn.add_q_proj.weight"); BLK_F32(attn_add_q_b, "attn.add_q_proj.bias");
+    BLK_W(attn_add_k_w, "attn.add_k_proj.weight"); BLK_F32(attn_add_k_b, "attn.add_k_proj.bias");
+    BLK_W(attn_add_v_w, "attn.add_v_proj.weight"); BLK_F32(attn_add_v_b, "attn.add_v_proj.bias");
+    BLK_W(attn_add_out_w, "attn.to_add_out.weight"); BLK_F32(attn_add_out_b, "attn.to_add_out.bias");
 
-    BLK_W(norm_q_w, "attn.norm_q.weight");
-    BLK_W(norm_k_w, "attn.norm_k.weight");
-    BLK_W(norm_added_q_w, "attn.norm_added_q.weight");
-    BLK_W(norm_added_k_w, "attn.norm_added_k.weight");
+    BLK_F32(norm_q_w, "attn.norm_q.weight");
+    BLK_F32(norm_k_w, "attn.norm_k.weight");
+    BLK_F32(norm_added_q_w, "attn.norm_added_q.weight");
+    BLK_F32(norm_added_k_w, "attn.norm_added_k.weight");
 
-    BLK_W(img_mod_w, "img_mod.1.weight"); BLK_W(img_mod_b, "img_mod.1.bias");
-    BLK_W(img_mlp_fc1_w, "img_mlp.net.0.proj.weight"); BLK_W(img_mlp_fc1_b, "img_mlp.net.0.proj.bias");
-    BLK_W(img_mlp_fc2_w, "img_mlp.net.2.weight"); BLK_W(img_mlp_fc2_b, "img_mlp.net.2.bias");
+    BLK_W(img_mod_w, "img_mod.1.weight"); BLK_F32(img_mod_b, "img_mod.1.bias");
+    BLK_W(img_mlp_fc1_w, "img_mlp.net.0.proj.weight"); BLK_F32(img_mlp_fc1_b, "img_mlp.net.0.proj.bias");
+    BLK_W(img_mlp_fc2_w, "img_mlp.net.2.weight"); BLK_F32(img_mlp_fc2_b, "img_mlp.net.2.bias");
 
-    BLK_W(txt_mod_w, "txt_mod.1.weight"); BLK_W(txt_mod_b, "txt_mod.1.bias");
-    BLK_W(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight"); BLK_W(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias");
-    BLK_W(txt_mlp_fc2_w, "txt_mlp.net.2.weight"); BLK_W(txt_mlp_fc2_b, "txt_mlp.net.2.bias");
+    BLK_W(txt_mod_w, "txt_mod.1.weight"); BLK_F32(txt_mod_b, "txt_mod.1.bias");
+    BLK_W(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight"); BLK_F32(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias");
+    BLK_W(txt_mlp_fc2_w, "txt_mlp.net.2.weight"); BLK_F32(txt_mlp_fc2_b, "txt_mlp.net.2.bias");
 
     #undef BLK_W
+    #undef BLK_F32
 
     if (!ok) {
         qimg_free_block(b);
@@ -256,28 +287,44 @@ static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b)
 
 static void op_gemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                     int n_out, int n_in, int n_tok) {
-    struct { void *Y; void *W; void *X; void *bias; int n_out; int n_in; int n_tok; } args =
-        { Y, W, X, bias, n_out, n_in, n_tok };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     hipModuleLaunchKernel(r->fn_gemm, gx, gy, 1, 16, 16, 1,
-                          0, NULL, NULL, config);
+                          0, NULL, args, NULL);
+}
+
+/* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT */
+static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
+                        int n_out, int n_in, int n_tok) {
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+    unsigned gx = (unsigned)((n_out + 63) / 64);
+    unsigned gy = (unsigned)((n_tok + 15) / 16);
+    hipModuleLaunchKernel(r->fn_gemm_fp8, gx, gy, 1, 16, 16, 1,
+                          0, NULL, args, NULL);
+}
+
+/* Weight GEMM: dispatch FP8 or F32 based on runner config */
+static void op_wgemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
+                     int n_out, int n_in, int n_tok) {
+    if (r->use_fp8) op_gemm_fp8(r, Y, W, X, bias, n_out, n_in, n_tok);
+    else            op_gemm(r, Y, W, X, bias, n_out, n_in, n_tok);
 }
 
 static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
-    struct { void *x; int n; } args = { x, n };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_bf16_trunc, (unsigned)((n+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
 }
 
+/* Weight GEMM + BF16 truncation */
+static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
+                          int n_out, int n_in, int n_tok) {
+    op_wgemm(r, Y, W, X, bias, n_out, n_in, n_tok);
+    op_bf16_trunc(r, Y, n_out * n_tok);
+}
+
+/* F32-only GEMM + BF16 truncation (for non-weight GEMMs) */
 static void op_gemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                          int n_out, int n_in, int n_tok) {
     op_gemm(r, Y, W, X, bias, n_out, n_in, n_tok);
@@ -285,60 +332,37 @@ static void op_gemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bi
 }
 
 static void op_silu(hip_qimg_runner *r, void *x, int n) {
-    struct { void *x; int n; } args = { x, n };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_silu, (unsigned)((n+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
 }
 
 static void op_gelu(hip_qimg_runner *r, void *x, int n) {
-    struct { void *x; int n; } args = { x, n };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_gelu, (unsigned)((n+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
 }
 
 static void op_adaln(hip_qimg_runner *r, void *out, void *x,
                      void *shift, void *scale, int N, int dim) {
-    struct { void *out; void *x; void *shift; void *scale; int N; int dim; } args =
-        { out, x, shift, scale, N, dim };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&out, &x, &shift, &scale, &N, &dim};
     hipModuleLaunchKernel(r->fn_adaln, (unsigned)N, 1, 1, 256, 1, 1,
-                          256 * sizeof(float), NULL, NULL, config);
+                          256 * sizeof(float), NULL, args, NULL);
 }
 
 static void op_rmsnorm_ph(hip_qimg_runner *r, void *x, void *w,
                           int N, int n_heads, int head_dim) {
-    struct { void *x; void *w; int N; int n_heads; int head_dim; } args =
-        { x, w, N, n_heads, head_dim };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&x, &w, &N, &n_heads, &head_dim};
     hipModuleLaunchKernel(r->fn_rmsnorm_ph, (unsigned)N, (unsigned)n_heads, 1,
-                          32, 1, 1, 0, NULL, NULL, config);
+                          32, 1, 1, 0, NULL, args, NULL);
 }
 
 static void op_gated_add(hip_qimg_runner *r, void *x, void *proj,
                          void *gate, int N, int dim) {
     int total = N * dim;
-    struct { void *x; void *proj; void *gate; int N; int dim; } args =
-        { x, proj, gate, N, dim };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&x, &proj, &gate, &N, &dim};
     hipModuleLaunchKernel(r->fn_gated_add, (unsigned)((total+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
 }
 
 static void op_attn(hip_qimg_runner *r, void *d_out, void *d_q,
@@ -348,26 +372,17 @@ static void op_attn(hip_qimg_runner *r, void *d_out, void *d_q,
     unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
     unsigned n_threads = (unsigned)(32 * fa2_warps);
     size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
-    struct { void *out; void *Q; void *K; void *V; int N; int nh; int hd; } args =
-        { d_out, d_q, d_k, d_v, n_tok, n_heads, head_dim };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
     hipModuleLaunchKernel(r->fn_flash_attn,
                           (unsigned)n_heads, gy, 1,
                           n_threads, 1, 1,
-                          smem, NULL, NULL, config);
+                          smem, NULL, args, NULL);
 }
 
 static void op_rmsnorm_weighted(hip_qimg_runner *r, void *x, void *w, int N, int dim) {
-    struct { void *x; void *w; int N; int dim; } args = { x, w, N, dim };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&x, &w, &N, &dim};
     hipModuleLaunchKernel(r->fn_rmsnorm_weighted, (unsigned)N, 1, 1,
-                          256, 1, 1, 256 * sizeof(float), NULL, NULL, config);
+                          256, 1, 1, 256 * sizeof(float), NULL, args, NULL);
 }
 
 /* ---- VAE kernel helpers ---- */
@@ -376,37 +391,22 @@ static void vae_op_conv2d(hip_qimg_runner *r, void *out, void *inp,
                           void *w, void *b,
                           int ci, int h, int w_s, int co, int kh, int kw, int rep_pad) {
     int total = co * h * w_s;
-    struct { void *out; void *inp; void *w; void *b;
-             int ci; int h; int ws; int co; int kh; int kw; int rp; } args =
-        { out, inp, w, b, ci, h, w_s, co, kh, kw, rep_pad };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&out, &inp, &w, &b, &ci, &h, &w_s, &co, &kh, &kw, &rep_pad};
     hipModuleLaunchKernel(r->fn_vae_conv2d, (unsigned)((total+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
 }
 
 static void vae_op_gn(hip_qimg_runner *r, void *out, void *inp,
                       void *gamma, int C, int spatial) {
-    struct { void *out; void *inp; void *gamma; int C; int sp; } args =
-        { out, inp, gamma, C, spatial };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&out, &inp, &gamma, &C, &spatial};
     hipModuleLaunchKernel(r->fn_vae_rmsnorm, (unsigned)((spatial+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
 }
 
 static void vae_op_silu(hip_qimg_runner *r, void *x, int n) {
-    struct { void *x; int n; } args = { x, n };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_vae_silu, (unsigned)((n+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
 }
 
 static void *vae_op_upsample(hip_qimg_runner *r, void *inp, int c, int h, int w) {
@@ -414,14 +414,9 @@ static void *vae_op_upsample(hip_qimg_runner *r, void *inp, int c, int h, int w)
     void *out = NULL;
     hipMalloc(&out, (size_t)c*oh*ow*sizeof(float));
     int total = c*oh*ow;
-    struct { void *out; void *inp; int C; int H; int W; } args =
-        { out, inp, c, h, w };
-    size_t sz = sizeof(args);
-    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz,
-                       HIP_LAUNCH_PARAM_END };
+    void *args[] = {&out, &inp, &c, &h, &w};
     hipModuleLaunchKernel(r->fn_vae_up2x, (unsigned)((total+255)/256), 1, 1,
-                          256, 1, 1, 0, NULL, NULL, config);
+                          256, 1, 1, 0, NULL, args, NULL);
     return out;
 }
 
@@ -449,25 +444,18 @@ static void *vae_resblock_gpu(hip_qimg_runner *r, void *x,
     void *out = NULL; hipMalloc(&out, (size_t)co*sp*sizeof(float));
     if (sc_w) {
         vae_op_conv2d(r, out, x, sc_w, sc_b, ci, h, w, co, 1, 1, 0);
-        /* out += c2_out (euler_step with dt=1) */
         int n = co * sp;
-        struct { void *x; void *v; float dt; int n; } ea = { out, c2_out, 1.0f, n };
-        size_t esz = sizeof(ea);
-        void *ecfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &ea,
-                         HIP_LAUNCH_PARAM_BUFFER_SIZE, &esz,
-                         HIP_LAUNCH_PARAM_END };
+        float dt = 1.0f;
+        void *ea[] = {&out, &c2_out, &dt, &n};
         hipModuleLaunchKernel(r->fn_euler_step, (unsigned)((n+255)/256), 1, 1,
-                              256, 1, 1, 0, NULL, NULL, ecfg);
+                              256, 1, 1, 0, NULL, ea, NULL);
     } else {
         int n = co * sp;
         hipMemcpy(out, x, (size_t)n * sizeof(float), hipMemcpyDeviceToDevice);
-        struct { void *x; void *v; float dt; int n; } ea = { out, c2_out, 1.0f, n };
-        size_t esz = sizeof(ea);
-        void *ecfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &ea,
-                         HIP_LAUNCH_PARAM_BUFFER_SIZE, &esz,
-                         HIP_LAUNCH_PARAM_END };
+        float dt = 1.0f;
+        void *ea[] = {&out, &c2_out, &dt, &n};
         hipModuleLaunchKernel(r->fn_euler_step, (unsigned)((n+255)/256), 1, 1,
-                              256, 1, 1, 0, NULL, NULL, ecfg);
+                              256, 1, 1, 0, NULL, ea, NULL);
     }
     hipFree(c2_out);
     return out;
@@ -477,8 +465,8 @@ static void *vae_resblock_gpu(hip_qimg_runner *r, void *x,
 /* ---- Init ---- */
 
 hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
-    if (rocewInit() != 0) {
-        fprintf(stderr, "hip_qimg: rocewInit failed (no HIP runtime?)\n");
+    if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
+        fprintf(stderr, "hip_qimg: rocewInit failed (HIP/HIPRTC libraries not found)\n");
         return NULL;
     }
     HIP_CHECK_NULL(hipSetDevice(device_id));
@@ -510,6 +498,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
 
     #define GET(field, name) hipModuleGetFunction(&r->field, mod, name)
     GET(fn_gemm, "gemm_f32_f32");
+    GET(fn_gemm_fp8, "gemm_fp8w_f32");
     GET(fn_layernorm, "layernorm_f32");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
@@ -531,6 +520,21 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_vae_silu, "vae_silu_f32");
     GET(fn_vae_up2x, "nn_upsample2x_f32");
     #undef GET
+
+    /* Enable FP8 mode: upload FP8→F32 LUT to GPU constant memory */
+    r->use_fp8 = 0;
+    if (r->fn_gemm_fp8) {
+        init_fp8_to_f32_lut();
+        hipDeviceptr_t d_lut;
+        size_t lut_size;
+        hipError_t lut_err = hipModuleGetGlobal(&d_lut, &lut_size, mod, "d_fp8_to_f32_lut");
+        if (lut_err == hipSuccess && lut_size == 256 * sizeof(float)) {
+            hipMemcpyHtoD(d_lut, hip_fp8_to_f32_lut, 256 * sizeof(float));
+            r->use_fp8 = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: FP8 LUT GEMM enabled (4x less VRAM per block)\n");
+        }
+    }
 
     if (verbose) fprintf(stderr, "hip_qimg: kernels compiled OK\n");
     return r;
@@ -558,27 +562,31 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
         }
     }
 
-    /* Upload global weights (F32) */
-    r->d_img_in_w = qimg_st_upload_f32(st, "img_in.weight");
+    /* Upload global weights (FP8 raw for weights if enabled, F32 for biases/norms) */
+    #define GW(nm) qimg_upload_weight(r, st, nm)
+    r->d_img_in_w = GW("img_in.weight");
     r->d_img_in_b = qimg_st_upload_f32(st, "img_in.bias");
-    r->d_txt_in_w = qimg_st_upload_f32(st, "txt_in.weight");
+    r->d_txt_in_w = GW("txt_in.weight");
     r->d_txt_in_b = qimg_st_upload_f32(st, "txt_in.bias");
     r->d_txt_norm_w = qimg_st_upload_f32(st, "txt_norm.weight");
-    r->d_t_fc1_w = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_1.weight");
+    r->d_t_fc1_w = GW("time_text_embed.timestep_embedder.linear_1.weight");
     r->d_t_fc1_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_1.bias");
-    r->d_t_fc2_w = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_2.weight");
+    r->d_t_fc2_w = GW("time_text_embed.timestep_embedder.linear_2.weight");
     r->d_t_fc2_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_2.bias");
-    r->d_norm_out_w = qimg_st_upload_f32(st, "norm_out.linear.weight");
+    r->d_norm_out_w = GW("norm_out.linear.weight");
     r->d_norm_out_b = qimg_st_upload_f32(st, "norm_out.linear.bias");
-    r->d_proj_out_w = qimg_st_upload_f32(st, "proj_out.weight");
+    r->d_proj_out_w = GW("proj_out.weight");
     r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
+    #undef GW
 
     /* Preload as many blocks as fit in VRAM */
     {
         size_t free_mem = 0, total_mem = 0;
         hipMemGetInfo(&free_mem, &total_mem);
-        /* ~324M params/block × 4 bytes = ~1.3 GB/block in F32 */
-        size_t block_bytes = 1296ULL * 1024 * 1024;
+        /* FP8: ~324M params × 1 byte = ~324 MB/block (+ ~20MB F32 biases/norms)
+         * F32:  ~324M params × 4 bytes = ~1296 MB/block */
+        size_t block_bytes = r->use_fp8 ? 344ULL * 1024 * 1024
+                                        : 1296ULL * 1024 * 1024;
         size_t workspace = 2ULL * 1024 * 1024 * 1024;
         int max_preload = (free_mem > workspace)
             ? (int)((free_mem - workspace) / block_bytes) : 0;
@@ -688,11 +696,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     hipMalloc(&d_t_sin, 256 * sizeof(float));
     hipMemcpy(d_t_sin, t_sin, 256 * sizeof(float), hipMemcpyHostToDevice);
 
-    op_gemm_bf16(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
+    op_wgemm_bf16(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
     void *d_t_emb2 = NULL;
     hipMalloc(&d_t_emb2, (size_t)dim * sizeof(float));
-    op_gemm_bf16(r, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
+    op_wgemm_bf16(r, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
     hipFree(d_t_emb); d_t_emb = d_t_emb2;
     hipFree(d_t_sin);
 
@@ -700,11 +708,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     if (r->d_txt_norm_w) {
         op_rmsnorm_weighted(r, d_txt_in, r->d_txt_norm_w, n_txt, txt_dim);
     }
-    op_gemm_bf16(r, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
+    op_wgemm_bf16(r, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
     hipFree(d_txt_in);
 
     /* 3. Image input: GEMM(64→3072) */
-    op_gemm_bf16(r, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
+    op_wgemm_bf16(r, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
     hipFree(d_img_in);
 
     /* BF16 truncation after projection */
@@ -757,11 +765,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         void *d_img_mod = NULL;
         hipMalloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
-        op_gemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
+        op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
 
         void *d_txt_mod = NULL;
         hipMalloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
-        op_gemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
         hipFree(d_t_silu);
 
         /* Modulation offsets */
@@ -790,17 +798,17 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         void *d_img_q = (char *)d_q + (size_t)n_txt * dim * sizeof(float);
         void *d_img_k = (char *)d_k + (size_t)n_txt * dim * sizeof(float);
         void *d_img_v = (char *)d_v + (size_t)n_txt * dim * sizeof(float);
-        op_gemm_bf16(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img);
-        op_gemm_bf16(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img);
-        op_gemm_bf16(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img);
+        op_wgemm_bf16(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img);
+        op_wgemm_bf16(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img);
+        op_wgemm_bf16(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img);
 
         /* Text QKV → offset at [0:n_txt] */
         void *d_txt_q = d_q;
         void *d_txt_k = d_k;
         void *d_txt_v = d_v;
-        op_gemm_bf16(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt);
-        op_gemm_bf16(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt);
-        op_gemm_bf16(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt);
+        op_wgemm_bf16(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt);
+        op_wgemm_bf16(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt);
+        op_wgemm_bf16(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt);
 
         /* QK RMSNorm */
         op_rmsnorm_ph(r, d_img_q, blk.norm_q_w, n_img, nh, hd);
@@ -810,28 +818,18 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         /* RoPE */
         {
-            struct { void *q; void *k; int n_tok; int nh; int hd;
-                     int hp; int wp; int td; int hd2; int wd; float theta; } rope_args =
-                { d_img_q, d_img_k, n_img, nh, hd, hp_rope, wp_rope,
-                  t_dim_rope, h_dim_rope, w_dim_rope, rope_theta };
-            size_t rsz = sizeof(rope_args);
-            void *rcfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &rope_args,
-                             HIP_LAUNCH_PARAM_BUFFER_SIZE, &rsz,
-                             HIP_LAUNCH_PARAM_END };
+            void *rope2d_args[] = {&d_img_q, &d_img_k,
+                                   &n_img, &nh, &hd, &hp_rope, &wp_rope,
+                                   &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
             hipModuleLaunchKernel(r->fn_rope_2d, (unsigned)n_img, 1, 1,
-                                  (unsigned)nh, 1, 1, 0, NULL, NULL, rcfg);
+                                  (unsigned)nh, 1, 1, 0, NULL, rope2d_args, NULL);
 
             int txt_start = hp_rope > wp_rope ? hp_rope / 2 : wp_rope / 2;
-            struct { void *q; void *k; int n_tok; int nh; int hd; int ts;
-                     int td; int hd2; int wd; float theta; } trope_args =
-                { d_txt_q, d_txt_k, n_txt, nh, hd, txt_start,
-                  t_dim_rope, h_dim_rope, w_dim_rope, rope_theta };
-            size_t trsz = sizeof(trope_args);
-            void *trcfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &trope_args,
-                              HIP_LAUNCH_PARAM_BUFFER_SIZE, &trsz,
-                              HIP_LAUNCH_PARAM_END };
+            void *rope1d_args[] = {&d_txt_q, &d_txt_k,
+                                   &n_txt, &nh, &hd, &txt_start,
+                                   &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
             hipModuleLaunchKernel(r->fn_rope_1d, (unsigned)n_txt, 1, 1,
-                                  (unsigned)nh, 1, 1, 0, NULL, NULL, trcfg);
+                                  (unsigned)nh, 1, 1, 0, NULL, rope1d_args, NULL);
         }
 
         /* Joint attention */
@@ -840,8 +838,8 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         /* Output projections */
         void *d_img_attn = (char *)d_attn_out + (size_t)n_txt * dim * sizeof(float);
         void *d_txt_attn = d_attn_out;
-        op_gemm_bf16(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img);
-        op_gemm_bf16(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt);
+        op_wgemm_bf16(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img);
+        op_wgemm_bf16(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt);
 
         /* Gated residual */
         op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
@@ -849,19 +847,19 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         /* MLP: Image (GELU) */
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
-        op_gemm_bf16(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b,
+        op_wgemm_bf16(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b,
                      mlp_h, dim, n_img);
         op_gelu(r, d_scratch3, n_img * mlp_h);
-        op_gemm_bf16(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b,
+        op_wgemm_bf16(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b,
                      dim, mlp_h, n_img);
         op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
 
         /* MLP: Text (GELU) */
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
-        op_gemm_bf16(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b,
+        op_wgemm_bf16(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b,
                      mlp_h, dim, n_txt);
         op_gelu(r, d_scratch3, n_txt * mlp_h);
-        op_gemm_bf16(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
+        op_wgemm_bf16(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
                      dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
 
@@ -889,7 +887,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         op_silu(r, d_t_silu, dim);
         void *d_final_mod = NULL;
         hipMalloc(&d_final_mod, (size_t)2 * dim * sizeof(float));
-        op_gemm_bf16(r, d_final_mod, r->d_norm_out_w, d_t_silu, r->d_norm_out_b,
+        op_wgemm_bf16(r, d_final_mod, r->d_norm_out_w, d_t_silu, r->d_norm_out_b,
                      2 * dim, dim, 1);
         hipFree(d_t_silu);
 
@@ -900,7 +898,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         void *d_out = NULL;
         hipMalloc(&d_out, (size_t)n_img * in_ch * sizeof(float));
-        op_gemm_bf16(r, d_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
+        op_wgemm_bf16(r, d_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
                      in_ch, dim, n_img);
 
         hipDeviceSynchronize();
@@ -1063,13 +1061,10 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         /* Residual: d_x += d_proj_out_v */
         {
             int n = c * spatial;
-            struct { void *x; void *v; float dt; int n; } ea = { d_x, d_proj_out_v, 1.0f, n };
-            size_t esz = sizeof(ea);
-            void *ecfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &ea,
-                             HIP_LAUNCH_PARAM_BUFFER_SIZE, &esz,
-                             HIP_LAUNCH_PARAM_END };
+            float dt_one = 1.0f;
+            void *ea[] = {&d_x, &d_proj_out_v, &dt_one, &n};
             hipModuleLaunchKernel(r->fn_euler_step, (unsigned)((n+255)/256), 1, 1,
-                                  256, 1, 1, 0, NULL, NULL, ecfg);
+                                  256, 1, 1, 0, NULL, ea, NULL);
         }
         hipFree(d_proj_out_v);
         hipDeviceSynchronize();
