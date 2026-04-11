@@ -383,7 +383,9 @@ void qimg_text_enc_free(qimg_text_enc *enc) {
 #endif
 #ifdef HIP_LLM_RUNNER_H
     if (enc->use_gpu == 2 && enc->model) {
-        hip_llm_free((hip_llm_runner *)enc->model);
+        /* Offload weights only — keep module/stream alive so the HIP
+         * context remains valid for other runners on the same device. */
+        hip_llm_offload((hip_llm_runner *)enc->model);
         enc->model = NULL;
     }
 #endif

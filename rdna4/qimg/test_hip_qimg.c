@@ -25,6 +25,7 @@
 #include "../../common/bpe_tokenizer.h"
 #include "../../common/transformer.h"
 #include "../../common/qwen_image_scheduler.h"
+#include "../rocew.h"
 #include "../llm/hip_llm_runner.h"  /* must be before text_encoder.h for GPU path */
 #include "../../common/qwen_image_text_encoder.h"
 #include "hip_qimg_runner.h"
@@ -34,8 +35,6 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <unistd.h>
-#include <sys/wait.h>
 
 /* ---- PRNG: Box-Muller ---- */
 static uint64_t rng_state = 42;
@@ -121,60 +120,35 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "=== HIP Qwen-Image: %s ===\n", mode);
 
-    /* GPU text encoder runs in a forked child process to avoid ROCm HIPRTC
-     * context corruption (hipSetDevice fails after hipModuleUnload in same process).
-     * Child writes hidden states to a temp file, parent reads them back. */
+    /* For generate mode with GPU text encoder:
+     * 1. Init qimg runner FIRST (compiles qimg kernels, gets module loaded)
+     * 2. Load LLM, encode text, offload LLM weights
+     * 3. Load DiT weights into already-compiled qimg module
+     * This avoids the ROCm bug where hipModuleLoadData fails after
+     * another module was loaded then unloaded in the same process. */
+    extern int g_hip_initialized;
     int n_txt_precomputed = 0;
     float *txt_precomputed = NULL;
-    if (!strcmp(mode, "gen") && enc_path) {
-        const char *tmp_path = "/tmp/qimg_text_hidden.bin";
-        fprintf(stderr, "\n[1/3] Text conditioning (GPU, forked)...\n");
-        clock_t enc_t0 = clock();
-        pid_t pid = fork();
-        if (pid == 0) {
-            /* Child: run GPU text encoder, write result to file, exit */
-            qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, NULL, device_id);
-            if (!enc) _exit(1);
-            int n_out = 0;
-            float *hidden = qimg_text_enc_encode(enc, prompt, &n_out);
-            qimg_text_enc_free(enc);
-            if (!hidden || n_out <= 0) _exit(2);
-            FILE *fp = fopen(tmp_path, "wb");
-            if (!fp) _exit(3);
-            fwrite(&n_out, sizeof(int), 1, fp);
-            fwrite(hidden, sizeof(float), (size_t)n_out * 3584, fp);
-            fclose(fp);
-            free(hidden);
-            _exit(0);
-        } else if (pid > 0) {
-            /* Parent: wait for child, read result */
-            int status;
-            waitpid(pid, &status, 0);
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                FILE *fp = fopen(tmp_path, "rb");
-                if (fp) {
-                    int n_out;
-                    if (fread(&n_out, sizeof(int), 1, fp) == 1 && n_out > 0) {
-                        txt_precomputed = (float *)malloc((size_t)n_out * 3584 * sizeof(float));
-                        if (fread(txt_precomputed, sizeof(float), (size_t)n_out * 3584, fp) == (size_t)n_out * 3584) {
-                            n_txt_precomputed = n_out;
-                            fprintf(stderr, "  Text hidden: [%d, 3584] (%.1fs, GPU forked)\n",
-                                    n_out, (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
-                        } else {
-                            free(txt_precomputed); txt_precomputed = NULL;
-                        }
-                    }
-                    fclose(fp);
-                    unlink(tmp_path);
-                }
-            }
-            if (!txt_precomputed)
-                fprintf(stderr, "  GPU text encoder (forked) failed, will use CPU fallback\n");
-        }
-    }
 
-    /* Init HIP + compile qimg kernels */
+    /* Init HIP + compile qimg kernels FIRST */
     hip_qimg_runner *r = hip_qimg_init(device_id, verbose);
+
+    /* Now run GPU text encoder (LLM module loads as second module — this works) */
+    if (r && !strcmp(mode, "gen") && enc_path) {
+        fprintf(stderr, "\n[1/3] Text conditioning (GPU)...\n");
+        clock_t enc_t0 = clock();
+        qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, NULL, device_id);
+        if (enc) {
+            fprintf(stderr, "  Encoding: \"%s\"\n", prompt);
+            txt_precomputed = qimg_text_enc_encode(enc, prompt, &n_txt_precomputed);
+            if (txt_precomputed)
+                fprintf(stderr, "  Text hidden: [%d, 3584] (%.1fs)\n",
+                        n_txt_precomputed, (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+            qimg_text_enc_free(enc);
+        }
+        if (!txt_precomputed)
+            fprintf(stderr, "  GPU text encoder failed, will use CPU fallback\n");
+    }
     if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
 
     if (!strcmp(mode, "init")) { hip_qimg_free(r); return 0; }

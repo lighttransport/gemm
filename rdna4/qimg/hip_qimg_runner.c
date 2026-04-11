@@ -464,22 +464,15 @@ static void *vae_resblock_gpu(hip_qimg_runner *r, void *x,
 
 /* ---- Init ---- */
 
+int g_hip_initialized = 0;  /* track if HIP was already init'd by another runner */
+char g_hip_arch[64] = {0};  /* cached arch string (e.g. "gfx1201") */
+
 hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
         fprintf(stderr, "hip_qimg: rocewInit failed (HIP/HIPRTC libraries not found)\n");
         return NULL;
     }
-    /* hipSetDevice: try normally, if it fails (e.g. after another HIPRTC runner),
-     * just verify a device is already active via hipGetDevice */
-    if (hipSetDevice(device_id) != hipSuccess) {
-        int cur_dev = -1;
-        if (hipGetDevice(&cur_dev) != hipSuccess || cur_dev < 0) {
-            fprintf(stderr, "hip_qimg: no HIP device available\n");
-            return NULL;
-        }
-        if (verbose)
-            fprintf(stderr, "hip_qimg: reusing active device %d\n", cur_dev);
-    }
+    HIP_CHECK_NULL(hipSetDevice(device_id));
 
     if (verbose) {
         hipDeviceProp_t props;
