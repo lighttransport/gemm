@@ -469,7 +469,17 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         fprintf(stderr, "hip_qimg: rocewInit failed (HIP/HIPRTC libraries not found)\n");
         return NULL;
     }
-    HIP_CHECK_NULL(hipSetDevice(device_id));
+    /* hipSetDevice: try normally, if it fails (e.g. after another HIPRTC runner),
+     * just verify a device is already active via hipGetDevice */
+    if (hipSetDevice(device_id) != hipSuccess) {
+        int cur_dev = -1;
+        if (hipGetDevice(&cur_dev) != hipSuccess || cur_dev < 0) {
+            fprintf(stderr, "hip_qimg: no HIP device available\n");
+            return NULL;
+        }
+        if (verbose)
+            fprintf(stderr, "hip_qimg: reusing active device %d\n", cur_dev);
+    }
 
     if (verbose) {
         hipDeviceProp_t props;
