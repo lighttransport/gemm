@@ -298,8 +298,8 @@ static void op_gemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
 /* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT */
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                         int n_out, int n_in, int n_tok) {
-    /* Use optimized 128×128 tiled kernel for large matrices (fused BF16 trunc) */
-    if (r->fn_gemm_opt_fp8 && n_tok >= 32) {
+    /* Use optimized 128×128 tiled kernel (fused BF16 trunc) */
+    if (r->fn_gemm_opt_fp8 && n_tok >= 16) {
         /* gemm_opt_fp8: Y[M,N] = X[M,K] × W[N,K]^T  (N=n_out, K=n_in, M=n_tok) */
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
         unsigned gx = (unsigned)((n_out + 127) / 128);
@@ -331,7 +331,7 @@ static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
 /* Weight GEMM + BF16 truncation */
 static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           int n_out, int n_in, int n_tok) {
-    if (r->use_fp8 && r->fn_gemm_opt_fp8 && n_tok >= 32) {
+    if (r->use_fp8 && r->fn_gemm_opt_fp8 && n_tok >= 16) {
         /* Optimized FP8 GEMM has fused BF16 trunc — no separate pass needed */
         op_gemm_fp8(r, Y, W, X, bias, n_out, n_in, n_tok);
         return;
@@ -761,6 +761,12 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     float rope_theta = 10000.0f;
     int t_dim_rope = 16, h_dim_rope = 56, w_dim_rope = 56;
 
+    /* Pre-allocate per-block modulation buffers (avoid malloc/free inside loop) */
+    void *d_t_silu = NULL, *d_img_mod = NULL, *d_txt_mod = NULL;
+    hipMalloc(&d_t_silu, (size_t)dim * sizeof(float));
+    hipMalloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
+    hipMalloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
+
     /* 4. Process all blocks */
     for (int L = 0; L < r->n_blocks; L++) {
         if (r->verbose && (L % 10 == 0 || L == r->n_blocks - 1))
@@ -778,19 +784,12 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         }
 
         /* Image modulation: SiLU(t_emb) → Linear → 6×dim */
-        void *d_t_silu = NULL;
-        hipMalloc(&d_t_silu, (size_t)dim * sizeof(float));
-        hipMemcpy(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), hipMemcpyDeviceToDevice);
+        hipMemcpyAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float),
+                       hipMemcpyDeviceToDevice, NULL);
         op_silu(r, d_t_silu, dim);
 
-        void *d_img_mod = NULL;
-        hipMalloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
         op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
-
-        void *d_txt_mod = NULL;
-        hipMalloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
         op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
-        hipFree(d_t_silu);
 
         /* Modulation offsets */
         #define MOD_OFF(base, idx) ((void *)((char *)(base) + (size_t)(idx) * dim * sizeof(float)))
@@ -883,14 +882,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
                      dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
 
-        /* BF16 truncation */
+        /* BF16 truncation (image only — text is tiny, not worth a separate launch) */
         op_bf16_trunc(r, d_img, n_img * dim);
-        op_bf16_trunc(r, d_txt, n_txt * dim);
 
-        /* Free modulation + on-demand block weights */
-        hipFree(d_img_mod); hipFree(d_txt_mod);
+        /* Free on-demand block weights (async — no sync needed, hipFree is ordered) */
         if (need_free) {
-            hipDeviceSynchronize();
             void **ptrs = (void **)&blk;
             int np = sizeof(qimg_block_gpu) / sizeof(void *);
             for (int pi = 0; pi < np; pi++)
@@ -898,6 +894,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         }
     }
     if (r->verbose) fprintf(stderr, "\n");
+
+    /* Free pre-allocated modulation buffers */
+    hipFree(d_t_silu); hipFree(d_img_mod); hipFree(d_txt_mod);
 
     /* 5. Final output: adaLN → proj_out */
     {
