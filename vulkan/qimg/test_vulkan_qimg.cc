@@ -192,7 +192,8 @@ int main(int argc, char **argv) {
 
         qimg_scheduler sched;
         int seq_len = n_img + n_txt;
-        qimg_scheduler_init(&sched, n_steps, seq_len);
+        qimg_sched_init(&sched);
+        qimg_sched_set_timesteps(&sched, n_steps, seq_len);
 
         float *vel = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
 
