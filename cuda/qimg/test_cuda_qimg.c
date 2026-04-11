@@ -518,6 +518,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Saved latent [%d,%d,%d] to cuda_latent.bin\n", lat_ch, lat_h, lat_w); }
         }
 
+        /* Un-standardize latent to VAE's natural space */
+        qimg_dit_unnormalize_latent(latent, lat_ch, lat_h, lat_w);
+
         /* 3. VAE decode */
         fprintf(stderr, "\n[3/3] VAE decode (CPU)...\n");
         cuda_qimg_load_vae(r, vae_path);
