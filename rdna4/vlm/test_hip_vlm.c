@@ -215,7 +215,7 @@ int main(int argc, char **argv) {
 
     /* ---- 5. HIP vision encode ---- */
     fprintf(stderr, "Initializing HIP vision encoder...\n");
-    hip_vision_runner *hip_vis = hip_vision_init(0, 1, 0);  /* F32 mode */
+    hip_vision_runner *hip_vis = hip_vision_init(0, 1, 1);  /* F16 mode */
     if (!hip_vis) { fprintf(stderr, "HIP vision init failed\n"); return 1; }
     hip_vision_set_max_pixels(hip_vis, dyn_max_pixels);
     if (hip_vision_load_weights(hip_vis, gguf_mmproj) != 0) {
