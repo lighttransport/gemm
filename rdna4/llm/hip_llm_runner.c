@@ -1490,7 +1490,12 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
         return upload_q8_0_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_Q2_K || t->type == GGML_TYPE_Q3_K ||
                t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K ||
-               t->type == GGML_TYPE_Q6_K) {
+               t->type == GGML_TYPE_Q6_K ||
+               t->type == GGML_TYPE_IQ4_XS || t->type == GGML_TYPE_IQ4_NL ||
+               t->type == GGML_TYPE_IQ3_S || t->type == GGML_TYPE_IQ3_XXS ||
+               t->type == GGML_TYPE_IQ2_XS || t->type == GGML_TYPE_IQ2_S ||
+               t->type == GGML_TYPE_IQ2_XXS || t->type == GGML_TYPE_IQ1_S ||
+               t->type == GGML_TYPE_IQ1_M) {
         return upload_kquant_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_BF16) {
         *out_type = GGML_TYPE_F16;
@@ -1510,8 +1515,27 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
         if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
         return 0;
     } else {
-        fprintf(stderr, "hip_llm: upload_weight_matrix: unhandled type %d, treating as F16 (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
-        return upload_f16_matrix(d_ptr, t);
+        /* Unsupported quant type (IQ4_XS, IQ3_S, etc.) — dequant to F32 on CPU, convert to F16, upload */
+        int n_elements = t->n_rows * t->n_cols;
+        if (n_elements <= 0 || !t->data) {
+            fprintf(stderr, "hip_llm: upload_weight_matrix: unhandled type %d, treating as F16 (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
+            return upload_f16_matrix(d_ptr, t);
+        }
+        float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
+        if (!f32_buf) return -1;
+        dequant_row(t->type, t->data, f32_buf, n_elements);
+        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
+        if (!f16_buf) { free(f32_buf); return -1; }
+        for (int i = 0; i < n_elements; i++) f16_buf[i] = hllm_f32_to_f16(f32_buf[i]);
+        free(f32_buf);
+        size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
+        hipError_t err = hipMalloc(d_ptr, nbytes);
+        if (err != hipSuccess) { free(f16_buf); return -1; }
+        err = hipMemcpy(*d_ptr, f16_buf, nbytes, hipMemcpyHostToDevice);
+        free(f16_buf);
+        *out_type = GGML_TYPE_F16;
+        if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
+        return 0;
     }
 }
 
@@ -1692,10 +1716,11 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     r->token_embd_type = embd.type;
     if (embd.type == GGML_TYPE_Q8_0) {
         if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q2_K || embd.type == GGML_TYPE_Q3_K ||
-               embd.type == GGML_TYPE_Q4_K || embd.type == GGML_TYPE_Q6_K) {
+    } else if (embd.type == GGML_TYPE_Q2_K) {
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q5_K) {
+    } else if (embd.type == GGML_TYPE_Q3_K || embd.type == GGML_TYPE_Q4_K ||
+               embd.type == GGML_TYPE_Q5_K || embd.type == GGML_TYPE_Q6_K) {
+        /* Dequant to F16 for embedding lookup (no dedicated Q4_K/Q5_K embed kernel) */
         int n_elements = embd.n_rows * embd.n_cols;
         float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
         if (!f32_buf) return -1;
