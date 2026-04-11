@@ -376,8 +376,14 @@ qimg_text_enc *qimg_text_enc_load_safetensors(const char *st_path,
 void qimg_text_enc_free(qimg_text_enc *enc) {
     if (!enc) return;
 #ifdef CUDA_LLM_RUNNER_H
-    if (enc->use_gpu && enc->model) {
+    if (enc->use_gpu == 1 && enc->model) {
         cuda_llm_free((cuda_llm_runner *)enc->model);
+        enc->model = NULL;
+    }
+#endif
+#ifdef HIP_LLM_RUNNER_H
+    if (enc->use_gpu == 2 && enc->model) {
+        hip_llm_free((hip_llm_runner *)enc->model);
         enc->model = NULL;
     }
 #endif
@@ -452,7 +458,7 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
     float *hidden_states = (float *)malloc((size_t)n_tokens * n_embd * sizeof(float));
 
 #ifdef CUDA_LLM_RUNNER_H
-    if (enc->use_gpu) {
+    if (enc->use_gpu == 1) {
         cuda_llm_runner *gpu = (cuda_llm_runner *)enc->model;
         for (int i = 0; i < n_tokens; i++) {
             float *h = cuda_llm_forward(gpu, tokens[i], i);
@@ -463,7 +469,24 @@ float *qimg_text_enc_encode(qimg_text_enc *enc, const char *text,
             }
             memcpy(hidden_states + (size_t)i * n_embd, h, (size_t)n_embd * sizeof(float));
             if (i == 0 || (i + 1) % 10 == 0 || i == n_tokens - 1)
-                fprintf(stderr, "\r  qimg_text_enc: token %d/%d (GPU)", i + 1, n_tokens);
+                fprintf(stderr, "\r  qimg_text_enc: token %d/%d (CUDA GPU)", i + 1, n_tokens);
+        }
+        fprintf(stderr, "\n");
+    } else
+#endif
+#ifdef HIP_LLM_RUNNER_H
+    if (enc->use_gpu == 2) {
+        hip_llm_runner *gpu = (hip_llm_runner *)enc->model;
+        for (int i = 0; i < n_tokens; i++) {
+            float *h = hip_llm_forward(gpu, tokens[i], i);
+            if (!h) {
+                fprintf(stderr, "qimg_text_enc: HIP GPU forward failed at token %d\n", i);
+                free(tokens); free(hidden_states);
+                *out_n_tokens = 0; return NULL;
+            }
+            memcpy(hidden_states + (size_t)i * n_embd, h, (size_t)n_embd * sizeof(float));
+            if (i == 0 || (i + 1) % 10 == 0 || i == n_tokens - 1)
+                fprintf(stderr, "\r  qimg_text_enc: token %d/%d (HIP GPU)", i + 1, n_tokens);
         }
         fprintf(stderr, "\n");
     } else
@@ -570,6 +593,49 @@ qimg_text_enc *qimg_text_enc_load_gpu(const char *gguf_path,
 }
 
 #endif /* CUDA_LLM_RUNNER_H */
+
+/* ---- GPU text encoder (HIP/ROCm LLM runner) ---- */
+#ifdef HIP_LLM_RUNNER_H
+
+qimg_text_enc *qimg_text_enc_load_gpu(const char *gguf_path,
+                                       const char *bias_st_path,
+                                       int gpu_device) {
+    fprintf(stderr, "qimg_text_enc: loading GPU encoder (HIP) from %s\n", gguf_path);
+
+    gguf_context *gguf = gguf_open(gguf_path, 1);
+    if (!gguf) { fprintf(stderr, "qimg_text_enc: failed to open GGUF\n"); return NULL; }
+    bpe_vocab *vocab = bpe_vocab_load(gguf);
+    if (!vocab) { gguf_close(gguf); return NULL; }
+
+    hip_llm_runner *gpu = hip_llm_init(gpu_device, 1);
+    if (!gpu) {
+        fprintf(stderr, "qimg_text_enc: HIP init failed\n");
+        bpe_vocab_free(vocab); gguf_close(gguf);
+        return NULL;
+    }
+
+    if (hip_llm_load_weights(gpu, gguf, 2048) != 0) {
+        fprintf(stderr, "qimg_text_enc: GPU weight loading failed\n");
+        hip_llm_free(gpu); bpe_vocab_free(vocab); gguf_close(gguf);
+        return NULL;
+    }
+
+    (void)bias_st_path; /* HIP LLM runner does not support bias injection yet */
+
+    qimg_text_enc *enc = (qimg_text_enc *)calloc(1, sizeof(qimg_text_enc));
+    enc->model = gpu;
+    enc->vocab = vocab;
+    enc->gguf = gguf;
+    enc->n_embd = hip_llm_n_embd(gpu);
+    enc->n_vocab = hip_llm_n_vocab(gpu);
+    enc->use_gpu = 2;  /* 2 = HIP GPU */
+
+    fprintf(stderr, "qimg_text_enc: HIP GPU encoder ready (n_embd=%d, n_layers=%d)\n",
+            enc->n_embd, hip_llm_n_layers(gpu));
+    return enc;
+}
+
+#endif /* HIP_LLM_RUNNER_H */
 
 #endif /* QIMG_TEXT_ENCODER_IMPLEMENTATION */
 #endif /* QIMG_TEXT_ENCODER_H */

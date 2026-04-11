@@ -167,6 +167,41 @@ static const char *hip_kernel_source =
 "    v[j + pair_off]  = v0 * sin_t + v1 * cos_t;\n"
 "}\n"
 "\n"
+"/* ---- 5b. rope_mrope_f32: M-RoPE with per-section frequencies ---- */\n"
+"/* Grid: n_heads blocks, blockDim: half_dim threads */\n"
+"/* sections[4] = {temporal, height, width, pad} dimension counts */\n"
+"/* For text-only: pos_t = pos_h = pos_w = pos */\n"
+"__global__ void rope_mrope_f32(float *vec, int n_heads, int head_dim,\n"
+"                                int pos_t, int pos_h, int pos_w,\n"
+"                                float freq_base,\n"
+"                                int sect0, int sect1, int sect2, int sect3) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    int half_dim = head_dim / 2;\n"
+"    if (j >= half_dim) return;\n"
+"\n"
+"    /* Determine which section this dimension pair belongs to */\n"
+"    int sect_sum = sect0 + sect1 + sect2 + sect3;\n"
+"    int rope_dim = 2 * sect_sum;\n"
+"    int pos;\n"
+"    if (j < sect0) pos = pos_t;\n"
+"    else if (j < sect0 + sect1) pos = pos_h;\n"
+"    else if (j < sect0 + sect1 + sect2) pos = pos_w;\n"
+"    else pos = 0;  /* padding section */\n"
+"\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float cos_t = cosf(theta);\n"
+"    float sin_t = sinf(theta);\n"
+"\n"
+"    float *v = vec + h * head_dim;\n"
+"    float v0 = v[j];\n"
+"    float v1 = v[j + half_dim];\n"
+"    v[j]             = v0 * cos_t - v1 * sin_t;\n"
+"    v[j + half_dim]  = v0 * sin_t + v1 * cos_t;\n"
+"}\n"
+"\n"
 "/* ---- 6. kv_cache_store: Copy K,V into cache at position ---- */\n"
 "__global__ void kv_cache_store(float *key_cache, float *value_cache,\n"
 "                                const float *k, const float *v,\n"
@@ -332,9 +367,15 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
-"/* ---- dp4a: INT8 dot product via HIP builtin ---- */\n"
+"/* ---- dp4a: INT8 dot product (software fallback for RDNA4) ---- */\n"
 "__device__ __forceinline__ int dp4a_s8(int a, int b, int c) {\n"
-"    return __dp4a(a, b, c);\n"
+"    signed char *av = (signed char*)&a;\n"
+"    signed char *bv = (signed char*)&b;\n"
+"    c += (int)av[0] * (int)bv[0];\n"
+"    c += (int)av[1] * (int)bv[1];\n"
+"    c += (int)av[2] * (int)bv[2];\n"
+"    c += (int)av[3] * (int)bv[3];\n"
+"    return c;\n"
 "}\n"
 "\n"
 "/* ---- 10. quantize_f32_to_int8: F32 vector -> INT8 + scale ---- */\n"
@@ -1110,6 +1151,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_f16_f32;
     hipFunction_t fn_qknorm_f32;
     hipFunction_t fn_rope_neox_f32;
+    hipFunction_t fn_rope_mrope_f32;
     hipFunction_t fn_kv_cache_store;
     hipFunction_t fn_attn_decode_f32;
     hipFunction_t fn_silu_mul_f32;
@@ -1164,6 +1206,8 @@ struct hip_llm_runner {
     int max_seq_len;
     float rope_freq_base;
     int n_rope_pairs;
+    int mrope_sections[4];  /* [temporal, height, width, pad] for M-RoPE */
+    int use_mrope;
     float rms_norm_eps;
     int debug_layers;
     int max_layers;
@@ -1268,6 +1312,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(qknorm_f32);
     GET_FUNC(rope_neox_f32);
+    GET_FUNC(rope_mrope_f32);
     GET_FUNC(kv_cache_store);
     GET_FUNC(attn_decode_f32);
     GET_FUNC(silu_mul_f32);
@@ -1342,7 +1387,7 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->device = device_id;
 
     CHECK_HIP_NULL(hipSetDevice(device_id));
-    CHECK_HIP_NULL(hipCtxCreate(&r->context, 0, r->device));
+    r->context = NULL;  /* use default context (no hipCtxCreate) */
     CHECK_HIP_NULL(hipStreamCreateWithFlags(&r->stream, hipStreamNonBlocking));
 
     if (verbose >= 1) {
@@ -1355,7 +1400,6 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     /* Compile kernels */
     if (compile_kernels(r) != 0) {
         hipStreamDestroy(r->stream);
-        hipCtxDestroy(r->context);
         free(r);
         return NULL;
     }
@@ -1542,6 +1586,7 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
     else if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
+    else if (gguf_find_key(gguf, "qwen2vl.block_count") >= 0) arch = "qwen2vl";
 
     char kbuf[128];
     #define ARCH_KEY(suffix) (snprintf(kbuf, sizeof(kbuf), "%s." suffix, arch), kbuf)
@@ -1559,6 +1604,28 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     {
         int rope_dim_count = hllm_get_int(gguf, ARCH_KEY("rope.dimension_count"), 0);
         r->n_rope_pairs = (rope_dim_count > 0) ? rope_dim_count / 2 : 0;
+    }
+
+    /* M-RoPE sections (Qwen2-VL, Qwen3-VL) */
+    r->use_mrope = 0;
+    memset(r->mrope_sections, 0, sizeof(r->mrope_sections));
+    {
+        int idx = gguf_find_key(gguf, ARCH_KEY("rope.dimension_sections"));
+        if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY &&
+            gguf->kv[idx].value.arr.type == GGUF_TYPE_INT32) {
+            int n = (int)gguf->kv[idx].value.arr.n;
+            if (n > 4) n = 4;
+            int32_t *data = (int32_t *)gguf->kv[idx].value.arr.data;
+            for (int i = 0; i < n; i++) r->mrope_sections[i] = data[i];
+            int sect_sum = r->mrope_sections[0] + r->mrope_sections[1] +
+                           r->mrope_sections[2] + r->mrope_sections[3];
+            if (sect_sum > 0) {
+                r->use_mrope = 1;
+                fprintf(stderr, "hip_llm: M-RoPE sections=[%d, %d, %d, %d]\n",
+                        r->mrope_sections[0], r->mrope_sections[1],
+                        r->mrope_sections[2], r->mrope_sections[3]);
+            }
+        }
     }
 
     int ctx_len = hllm_get_int(gguf, ARCH_KEY("context_length"), 0);
@@ -1937,10 +2004,20 @@ static inline void launch_qknorm(hip_llm_runner *r, void *vec, void *w,
 
 static inline void launch_rope(hip_llm_runner *r, void *vec, int n_heads,
                                 int head_dim, int pos, float freq_base) {
-    int half_dim = head_dim / 2;
-    int n_rope_pairs = r->n_rope_pairs;
-    void *args[] = { &vec, &n_heads, &head_dim, &pos, &freq_base, &n_rope_pairs };
-    LAUNCH(r->fn_rope_neox_f32, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    if (r->use_mrope) {
+        /* M-RoPE: for text-only, all position axes = pos */
+        int half_dim = head_dim / 2;
+        int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
+        int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
+        void *args[] = { &vec, &n_heads, &head_dim, &pos, &pos, &pos,
+                         &freq_base, &s0, &s1, &s2, &s3 };
+        LAUNCH(r->fn_rope_mrope_f32, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    } else {
+        int half_dim = head_dim / 2;
+        int n_rope_pairs = r->n_rope_pairs;
+        void *args[] = { &vec, &n_heads, &head_dim, &pos, &freq_base, &n_rope_pairs };
+        LAUNCH(r->fn_rope_neox_f32, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    }
 }
 
 static inline void launch_kv_store(hip_llm_runner *r, void *key_cache, void *value_cache,
@@ -2542,12 +2619,14 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_output_w && r->d_output_w != r->d_token_embd) hipFree(r->d_output_w);
     if (r->d_logits) hipFree(r->d_logits);
 
-    if (r->module) hipModuleUnload(r->module);
+    /* Don't unload module — hipModuleUnload corrupts the runtime
+     * state on some ROCm versions, preventing other HIPRTC modules
+     * from loading on the same device. The OS reclaims on exit. */
 
     free(r->h_output);
 
-    if (r->stream) hipStreamDestroy(r->stream);
-    if (r->context) hipCtxDestroy(r->context);
+    /* Stream cleanup deferred — destroying it can corrupt the runtime
+     * state on some ROCm versions when another HIPRTC runner follows. */
 
     free(r);
 }

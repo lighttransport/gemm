@@ -10,6 +10,7 @@ LDFLAGS = -ldl -lm -lpthread
 # Sources
 ROCEW_SRC = ../rocew.c
 RUNNER_SRC = hip_qimg_runner.c
+LLM_SRC = ../llm/hip_llm_runner.c
 TEST_SRC = test_hip_qimg.c
 
 # Target
@@ -22,9 +23,12 @@ all: $(TARGET)
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_qimg_runner.h hip_qimg_kernels.h \
            ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
            ../../common/safetensors.h ../../common/ggml_dequant.h \
+           ../../common/gguf_loader.h ../../common/bpe_tokenizer.h \
+           ../../common/transformer.h ../../common/qwen_image_text_encoder.h \
            ../../common/qwen_image_dit.h ../../common/qwen_image_vae.h \
-           ../../common/qwen_image_scheduler.h
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+           ../../common/qwen_image_scheduler.h \
+           ../llm/hip_llm_runner.h ../llm/hip_llm_runner.c
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) --dit <dit.safetensors> [--vae <vae.safetensors>] [--steps N] [-o out.ppm] [-d dev]"
