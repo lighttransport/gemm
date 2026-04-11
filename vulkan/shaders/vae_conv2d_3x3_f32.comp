@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: MIT
+// Conv2D 3x3 (same padding): [ci,H,W] -> [co,H,W]
+// Spatial tiling with shared-memory input halo.
+// Grid: (n_tiles, co), Workgroup: (16, 16) = 256.
+#version 450
+
+#define TH 16
+#define TW 16
+#define SM_W (TW + 2)
+#define SM_H (TH + 2)
+#define SM_SZ (SM_H * SM_W)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuf { float out_buf[]; };
+layout(std430, binding = 2) readonly buffer WBuf { float w_buf[]; };
+layout(std430, binding = 3) readonly buffer BiasBuf { float bias_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ci, H, W, co;
+    uint has_bias;
+} pc;
+
+shared float sm[SM_SZ];
+shared float sw[9];
+
+void main() {
+    uint oc = gl_WorkGroupID.y;
+    uint tile_idx = gl_WorkGroupID.x;
+    uint tiles_w = (pc.W + TW - 1) / TW;
+    uint tile_y0 = (tile_idx / tiles_w) * TH;
+    uint tile_x0 = (tile_idx % tiles_w) * TW;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint ox = tile_x0 + lx, oy = tile_y0 + ly;
+    uint tid = ly * TW + lx;
+
+    float sum = (oc < pc.co && pc.has_bias != 0) ? bias_buf[oc] : 0.0;
+
+    for (uint ic = 0; ic < pc.ci; ic++) {
+        for (uint idx = tid; idx < SM_SZ; idx += TH * TW) {
+            uint sy = idx / SM_W, sx = idx % SM_W;
+            int iy = int(tile_y0 + sy) - 1;
+            int ix = int(tile_x0 + sx) - 1;
+            sm[idx] = (iy >= 0 && iy < int(pc.H) && ix >= 0 && ix < int(pc.W))
+                      ? in_buf[ic * pc.H * pc.W + uint(iy) * pc.W + uint(ix)] : 0.0;
+        }
+        if (tid < 9) sw[tid] = w_buf[(oc * pc.ci + ic) * 9 + tid];
+        barrier();
+
+        if (ox < pc.W && oy < pc.H) {
+            sum += sm[(ly  ) * SM_W + (lx  )] * sw[0]
+                 + sm[(ly  ) * SM_W + (lx+1)] * sw[1]
+                 + sm[(ly  ) * SM_W + (lx+2)] * sw[2]
+                 + sm[(ly+1) * SM_W + (lx  )] * sw[3]
+                 + sm[(ly+1) * SM_W + (lx+1)] * sw[4]
+                 + sm[(ly+1) * SM_W + (lx+2)] * sw[5]
+                 + sm[(ly+2) * SM_W + (lx  )] * sw[6]
+                 + sm[(ly+2) * SM_W + (lx+1)] * sw[7]
+                 + sm[(ly+2) * SM_W + (lx+2)] * sw[8];
+        }
+        barrier();
+    }
+
+    if (ox < pc.W && oy < pc.H && oc < pc.co)
+        out_buf[oc * pc.H * pc.W + oy * pc.W + ox] = sum;
+}
