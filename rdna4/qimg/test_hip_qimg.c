@@ -91,6 +91,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--test-dit")) mode = "dit";
         else if (!strcmp(argv[i], "--test-vae")) mode = "vae";
         else if (!strcmp(argv[i], "--generate")) mode = "gen";
+        else if (!strcmp(argv[i], "--test-enc")) mode = "enc";
         else if (!strcmp(argv[i], "--dit") && i+1 < argc) dit_path = argv[++i];
         else if (!strcmp(argv[i], "--vae") && i+1 < argc) vae_path = argv[++i];
         else if (!strcmp(argv[i], "--enc") && i+1 < argc) enc_path = argv[++i];
@@ -153,16 +154,20 @@ int main(int argc, char **argv) {
 
     if (!strcmp(mode, "init")) { hip_qimg_free(r); return 0; }
 
-    /* Load DiT */
-    if (!dit_path) {
-        fprintf(stderr, "Error: --dit <path> is required\n");
-        hip_qimg_free(r); return 1;
+    clock_t t0;
+
+    /* Load DiT (deferred for gen/enc modes — GPU text encoder runs first) */
+    if (strcmp(mode, "gen") != 0 && strcmp(mode, "enc") != 0) {
+        if (!dit_path) {
+            fprintf(stderr, "Error: --dit <path> is required\n");
+            hip_qimg_free(r); return 1;
+        }
+        t0 = clock();
+        if (hip_qimg_load_dit(r, dit_path) != 0) {
+            hip_qimg_free(r); return 1;
+        }
+        fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     }
-    clock_t t0 = clock();
-    if (hip_qimg_load_dit(r, dit_path) != 0) {
-        hip_qimg_free(r); return 1;
-    }
-    fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
     /* ---- test-vae ---- */
     if (!strcmp(mode, "vae")) {
@@ -184,6 +189,61 @@ int main(int argc, char **argv) {
 
         save_ppm("hip_qimg_vae_test.ppm", rgb, out_h, out_w);
         free(latent); free(rgb);
+        hip_qimg_free(r); return 0;
+    }
+
+    /* ---- test-enc: compare GPU vs CPU text encoder ---- */
+    if (!strcmp(mode, "enc")) {
+        if (!enc_path) {
+            fprintf(stderr, "Error: --enc required\n");
+            hip_qimg_free(r); return 1;
+        }
+        int dim = 3584;
+
+        /* GPU (runs first while full VRAM is available — no DiT loaded yet) */
+        fprintf(stderr, "\n=== GPU Text Encoder ===\n");
+        int n_gpu = 0;
+        float *gpu_h = NULL;
+        {
+            qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, NULL, device_id);
+            if (enc) {
+                hip_llm_set_debug((hip_llm_runner *)enc->model, 1);
+                gpu_h = qimg_text_enc_encode(enc, prompt, &n_gpu);
+                qimg_text_enc_free(enc);
+            }
+        }
+
+        /* CPU */
+        fprintf(stderr, "\n=== CPU Text Encoder ===\n");
+        int n_cpu = 0;
+        float *cpu_h = NULL;
+        {
+            qimg_text_enc *enc = qimg_text_enc_load(enc_path);
+            if (enc) {
+                cpu_h = qimg_text_enc_encode(enc, prompt, &n_cpu);
+                qimg_text_enc_free(enc);
+            }
+        }
+
+        fprintf(stderr, "\n=== Comparison ===\n");
+        fprintf(stderr, "GPU: %d tokens, CPU: %d tokens\n", n_gpu, n_cpu);
+        if (gpu_h && cpu_h) {
+            int n = n_gpu < n_cpu ? n_gpu : n_cpu;
+            for (int t = 0; t < n && t < 5; t++) {
+                float *g = gpu_h + t * dim, *c = cpu_h + t * dim;
+                float max_d = 0, gn = 0, cn = 0;
+                for (int d = 0; d < dim; d++) {
+                    float diff = fabsf(g[d] - c[d]);
+                    if (diff > max_d) max_d = diff;
+                    gn += g[d]*g[d]; cn += c[d]*c[d];
+                }
+                fprintf(stderr, "  tok %d: gpu_norm=%.2f cpu_norm=%.2f max_diff=%.4f "
+                        "gpu[0..3]=[%.4f,%.4f,%.4f,%.4f] cpu[0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
+                        t, sqrtf(gn), sqrtf(cn), max_d,
+                        g[0],g[1],g[2],g[3], c[0],c[1],c[2],c[3]);
+            }
+        }
+        free(gpu_h); free(cpu_h);
         hip_qimg_free(r); return 0;
     }
 
@@ -216,6 +276,15 @@ int main(int argc, char **argv) {
 
     /* ---- generate: full pipeline ---- */
     if (!strcmp(mode, "gen")) {
+        /* Load DiT now (after GPU text encoder freed VRAM) */
+        if (dit_path) {
+            clock_t t0_dit = clock();
+            if (hip_qimg_load_dit(r, dit_path) != 0) {
+                hip_qimg_free(r); return 1;
+            }
+            fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0_dit)/CLOCKS_PER_SEC);
+        }
+
         int ps = 2;
         int hp = lat_h / ps, wp = lat_w / ps;
         int n_img = hp * wp;
