@@ -41,7 +41,7 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
                         const float *txt_tokens, int n_txt,
                         float timestep, float guidance, float *out);
 
-/* VAE decode on GPU (currently CPU fallback).
+/* VAE decode on GPU.
  *   latent:   [32, lat_h, lat_w] F32 (CPU)
  *   out_rgb:  [3, lat_h*8, lat_w*8] F32 (CPU, pre-allocated)
  * Returns 0 on success. */
@@ -61,6 +61,7 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "../cuew.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
@@ -132,6 +133,112 @@ static const char *flux2_kernel_src =
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i >= N * dim) return;\n"
 "    x[i] += gate[i % dim] * proj[i];\n"
+"}\n"
+
+/* GroupNorm over channel groups on CHW tensor flattened as [C, spatial]. */
+"__global__ void flux2_vae_groupnorm_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ in, const float *__restrict__ gamma,\n"
+"    const float *__restrict__ beta, int C, int spatial, int num_groups) {\n"
+"    int g = blockIdx.x;\n"
+"    if (g >= num_groups) return;\n"
+"    extern __shared__ float sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    int group_size = C / num_groups;\n"
+"    int c0 = g * group_size;\n"
+"    int n = group_size * spatial;\n"
+"    float sum = 0.0f;\n"
+"    for (int i = tid; i < n; i += blockDim.x) {\n"
+"        int ch = c0 + i / spatial;\n"
+"        int s = i % spatial;\n"
+"        sum += in[(long)ch * spatial + s];\n"
+"    }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int r = blockDim.x / 2; r > 0; r >>= 1) {\n"
+"        if (tid < r) sdata[tid] += sdata[tid + r];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float mean = sdata[0] / (float)n;\n"
+"    __syncthreads();\n"
+"    float var = 0.0f;\n"
+"    for (int i = tid; i < n; i += blockDim.x) {\n"
+"        int ch = c0 + i / spatial;\n"
+"        int s = i % spatial;\n"
+"        float d = in[(long)ch * spatial + s] - mean;\n"
+"        var += d * d;\n"
+"    }\n"
+"    sdata[tid] = var;\n"
+"    __syncthreads();\n"
+"    for (int r = blockDim.x / 2; r > 0; r >>= 1) {\n"
+"        if (tid < r) sdata[tid] += sdata[tid + r];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float inv = rsqrtf(sdata[0] / (float)n + 1e-6f);\n"
+"    for (int i = tid; i < n; i += blockDim.x) {\n"
+"        int ch = c0 + i / spatial;\n"
+"        int s = i % spatial;\n"
+"        float v = (in[(long)ch * spatial + s] - mean) * inv;\n"
+"        float gv = gamma ? gamma[ch] : 1.0f;\n"
+"        float bv = beta ? beta[ch] : 0.0f;\n"
+"        out[(long)ch * spatial + s] = v * gv + bv;\n"
+"    }\n"
+"}\n"
+
+/* Conv2D on CHW tensor with same-padding semantics. */
+"__global__ void flux2_vae_conv2d_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp, const float *__restrict__ weight,\n"
+"    const float *__restrict__ bias,\n"
+"    int ci, int h, int w, int co, int kh, int kw, int pad) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = co * h * w;\n"
+"    if (idx >= total) return;\n"
+"    int oc = idx / (h * w);\n"
+"    int rem = idx % (h * w);\n"
+"    int oy = rem / w, ox = rem % w;\n"
+"    int ph = pad, pw = pad;\n"
+"    float sum = bias ? bias[oc] : 0.0f;\n"
+"    for (int ic = 0; ic < ci; ic++) {\n"
+"        for (int fy = 0; fy < kh; fy++) {\n"
+"            int iy = oy + fy - ph;\n"
+"            if (iy < 0 || iy >= h) continue;\n"
+"            for (int fx = 0; fx < kw; fx++) {\n"
+"                int ix = ox + fx - pw;\n"
+"                if (ix < 0 || ix >= w) continue;\n"
+"                sum += inp[(long)ic * h * w + iy * w + ix] *\n"
+"                       weight[(((long)oc * ci + ic) * kh + fy) * kw + fx];\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    out[idx] = sum;\n"
+"}\n"
+
+/* Nearest-neighbor 2x upsample on CHW tensor. */
+"__global__ void flux2_vae_upsample2x_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp, int C, int H, int W) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int oH = H * 2, oW = W * 2;\n"
+"    int total = C * oH * oW;\n"
+"    if (idx >= total) return;\n"
+"    int c = idx / (oH * oW);\n"
+"    int rem = idx % (oH * oW);\n"
+"    int oy = rem / oW, ox = rem % oW;\n"
+"    int iy = oy / 2, ix = ox / 2;\n"
+"    out[idx] = inp[(long)c * H * W + iy * W + ix];\n"
+"}\n"
+
+/* Patch-space latent affine using BN stats indexed by 2x2 patch position. */
+"__global__ void flux2_vae_latent_bn_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp, const float *__restrict__ mean,\n"
+"    const float *__restrict__ std, int lc, int h, int w, int ps) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = lc * h * w;\n"
+"    if (idx >= total) return;\n"
+"    int ch = idx / (h * w);\n"
+"    int rem = idx % (h * w);\n"
+"    int y = rem / w, x = rem % w;\n"
+"    int pr = y % ps, pc = x % ps;\n"
+"    int bn_ch = ch * ps * ps + pr * ps + pc;\n"
+"    out[idx] = inp[idx] * std[bn_ch] + mean[bn_ch];\n"
 "}\n"
 
 /* BF16 truncation: round F32 to BF16 precision in-place */
@@ -325,7 +432,8 @@ struct cuda_flux2_runner {
 
     CUmodule   mod;
     CUfunction fn_gemm, fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
-    CUfunction fn_rmsnorm_ph, fn_swiglu, fn_flash_attn;
+    CUfunction fn_rmsnorm_ph, fn_swiglu, fn_flash_attn, fn_add;
+    CUfunction fn_vae_groupnorm, fn_vae_conv2d, fn_vae_upsample2x, fn_vae_latent_bn;
     CUfunction fn_rope_img, fn_rope_txt, fn_bf16_trunc;
 
     /* CPU model (kept for arch params + VAE fallback) */
@@ -352,6 +460,8 @@ struct cuda_flux2_runner {
     CUdeviceptr d_img_in_buf, d_txt_in_buf;  /* input upload buffers */
     int max_tok;
     int gpu_loaded;
+    int use_gpu_dbl_attn;
+    int debug_dbl_attn;
 };
 
 /* ---- F32 to F16 conversion ---- */
@@ -374,18 +484,40 @@ static uint16_t f2h(float f) {
 static CUdeviceptr gpu_upload_f16(const float *data, int n) {
     uint16_t *tmp = (uint16_t *)malloc((size_t)n * 2);
     for (int i = 0; i < n; i++) tmp[i] = f2h(data[i]);
-    CUdeviceptr d;
-    cuMemAlloc(&d, (size_t)n * 2);
-    cuMemcpyHtoD(d, tmp, (size_t)n * 2);
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, (size_t)n * 2);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_f16 alloc failed (%zu bytes, err=%d)\n",
+                (size_t)n * 2, (int)err);
+        free(tmp);
+        return 0;
+    }
+    err = cuMemcpyHtoD(d, tmp, (size_t)n * 2);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_f16 copy failed (%d)\n", (int)err);
+        cuMemFree(d);
+        free(tmp);
+        return 0;
+    }
     free(tmp);
     return d;
 }
 
 /* Upload F32 array as F32 to GPU */
 static CUdeviceptr gpu_upload_f32(const float *data, int n) {
-    CUdeviceptr d;
-    cuMemAlloc(&d, (size_t)n * sizeof(float));
-    cuMemcpyHtoD(d, data, (size_t)n * sizeof(float));
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, (size_t)n * sizeof(float));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_f32 alloc failed (%zu bytes, err=%d)\n",
+                (size_t)n * sizeof(float), (int)err);
+        return 0;
+    }
+    err = cuMemcpyHtoD(d, data, (size_t)n * sizeof(float));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_f32 copy failed (%d)\n", (int)err);
+        cuMemFree(d);
+        return 0;
+    }
     return d;
 }
 
@@ -486,6 +618,48 @@ static void op_layernorm(cuda_flux2_runner *r, CUdeviceptr dst, CUdeviceptr src,
                    256 * sizeof(float), r->stream, args, NULL);
 }
 
+static void op_add(cuda_flux2_runner *r, CUdeviceptr dst, CUdeviceptr src, int n) {
+    void *args[] = {&dst, &src, &n};
+    cuLaunchKernel(r->fn_add, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
+}
+
+static void op_vae_groupnorm(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr in,
+                             CUdeviceptr gamma, CUdeviceptr beta,
+                             int C, int spatial, int num_groups) {
+    void *args[] = {&out, &in, &gamma, &beta, &C, &spatial, &num_groups};
+    cuLaunchKernel(r->fn_vae_groupnorm, (unsigned)num_groups, 1, 1,
+                   256, 1, 1, 256 * sizeof(float), r->stream, args, NULL);
+}
+
+static void op_vae_conv2d(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr in,
+                          CUdeviceptr w, CUdeviceptr b,
+                          int ci, int h, int wid, int co, int kh, int kw, int pad) {
+    int total = co * h * wid;
+    void *args[] = {&out, &in, &w, &b, &ci, &h, &wid, &co, &kh, &kw, &pad};
+    cuLaunchKernel(r->fn_vae_conv2d, (unsigned)((total + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
+}
+
+static CUdeviceptr op_vae_upsample2x(cuda_flux2_runner *r, CUdeviceptr in, int c, int h, int w) {
+    int oh = h * 2, ow = w * 2;
+    CUdeviceptr out;
+    cuMemAlloc(&out, (size_t)c * oh * ow * sizeof(float));
+    int total = c * oh * ow;
+    void *args[] = {&out, &in, &c, &h, &w};
+    cuLaunchKernel(r->fn_vae_upsample2x, (unsigned)((total + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
+    return out;
+}
+
+static void op_vae_latent_bn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr in,
+                             CUdeviceptr mean, CUdeviceptr std, int lc, int h, int w, int ps) {
+    int total = lc * h * w;
+    void *args[] = {&out, &in, &mean, &std, &lc, &h, &w, &ps};
+    cuLaunchKernel(r->fn_vae_latent_bn, (unsigned)((total + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
+}
+
 /* Sinusoidal timestep embedding (CPU, small) */
 static void flux2_ts_embed(float *out, float t, int dim) {
     int half = dim / 2;
@@ -494,6 +668,12 @@ static void flux2_ts_embed(float *out, float t, int dim) {
         out[i] = cosf(t * freq);
         out[half + i] = sinf(t * freq);
     }
+}
+
+static int flux2_env_enabled(const char *name) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return 0;
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "FALSE") == 0);
 }
 
 /* ---- Init ---- */
@@ -534,6 +714,8 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     r->ctx = ctx;
     r->verbose = verbose;
     r->mod = mod;
+    r->use_gpu_dbl_attn = !flux2_env_enabled("FLUX2_CPU_DBL_ATTN");
+    r->debug_dbl_attn = flux2_env_enabled("FLUX2_DEBUG_DBL_ATTN");
 
     cuStreamCreate(&r->stream, 0);
 
@@ -546,11 +728,21 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     cuModuleGetFunction(&r->fn_rmsnorm_ph,  mod, "rmsnorm_per_head_f32");
     cuModuleGetFunction(&r->fn_swiglu,      mod, "flux2_swiglu");
     cuModuleGetFunction(&r->fn_flash_attn,  mod, "flash_attn_f32");
+    cuModuleGetFunction(&r->fn_add,         mod, "add_f32");
+    cuModuleGetFunction(&r->fn_vae_groupnorm, mod, "flux2_vae_groupnorm_f32");
+    cuModuleGetFunction(&r->fn_vae_conv2d,    mod, "flux2_vae_conv2d_f32");
+    cuModuleGetFunction(&r->fn_vae_upsample2x, mod, "flux2_vae_upsample2x_f32");
+    cuModuleGetFunction(&r->fn_vae_latent_bn, mod, "flux2_vae_latent_bn_f32");
     cuModuleGetFunction(&r->fn_rope_img,    mod, "flux2_rope_img_f32");
     cuModuleGetFunction(&r->fn_rope_txt,    mod, "flux2_rope_txt_f32");
     cuModuleGetFunction(&r->fn_bf16_trunc,  mod, "truncate_bf16_f32");
 
-    if (verbose >= 1) fprintf(stderr, "cuda_flux2: init OK\n");
+    if (verbose >= 1) {
+        fprintf(stderr, "cuda_flux2: init OK");
+        if (r->use_gpu_dbl_attn) fprintf(stderr, " [gpu-dbl-attn]");
+        if (r->debug_dbl_attn) fprintf(stderr, " [debug-dbl-attn]");
+        fprintf(stderr, "\n");
+    }
     return r;
 }
 
@@ -660,58 +852,70 @@ int cuda_flux2_load_vae(cuda_flux2_runner *r, const char *path) {
 
 /* ---- Activation buffer allocation ---- */
 
-static void flux2_alloc_bufs(cuda_flux2_runner *r, int n_img, int n_txt) {
+static int flux2_alloc_one(CUdeviceptr *dst, size_t bytes, const char *name) {
+    *dst = 0;
+    CUresult err = cuMemAlloc(dst, bytes);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: cuMemAlloc failed for %s (%zu bytes, err=%d)\n",
+                name, bytes, (int)err);
+        return -1;
+    }
+    return 0;
+}
+
+static int flux2_alloc_bufs(cuda_flux2_runner *r, int n_img, int n_txt) {
     int n_tot = n_img + n_txt;
     int H = r->H, n_ff = r->n_ff;
 
-    if (r->max_tok >= n_tot) return;  /* already big enough */
+    if (r->max_tok >= n_tot) return 0;  /* already big enough */
 
     /* Free old buffers */
-    if (r->d_img)      cuMemFree(r->d_img);
-    if (r->d_txt)      cuMemFree(r->d_txt);
-    if (r->d_joint)    cuMemFree(r->d_joint);
-    if (r->d_temb)     cuMemFree(r->d_temb);
-    if (r->d_temb_silu)cuMemFree(r->d_temb_silu);
-    if (r->d_mod_img_v)cuMemFree(r->d_mod_img_v);
-    if (r->d_mod_txt_v)cuMemFree(r->d_mod_txt_v);
-    if (r->d_mod_sgl_v)cuMemFree(r->d_mod_sgl_v);
-    if (r->d_q)        cuMemFree(r->d_q);
-    if (r->d_k)        cuMemFree(r->d_k);
-    if (r->d_v)        cuMemFree(r->d_v);
-    if (r->d_attn_out) cuMemFree(r->d_attn_out);
-    if (r->d_scratch1) cuMemFree(r->d_scratch1);
-    if (r->d_scratch2) cuMemFree(r->d_scratch2);
-    if (r->d_scratch3) cuMemFree(r->d_scratch3);
-    if (r->d_img_in_buf) cuMemFree(r->d_img_in_buf);
-    if (r->d_txt_in_buf) cuMemFree(r->d_txt_in_buf);
+    if (r->d_img)        { cuMemFree(r->d_img); r->d_img = 0; }
+    if (r->d_txt)        { cuMemFree(r->d_txt); r->d_txt = 0; }
+    if (r->d_joint)      { cuMemFree(r->d_joint); r->d_joint = 0; }
+    if (r->d_temb)       { cuMemFree(r->d_temb); r->d_temb = 0; }
+    if (r->d_temb_silu)  { cuMemFree(r->d_temb_silu); r->d_temb_silu = 0; }
+    if (r->d_mod_img_v)  { cuMemFree(r->d_mod_img_v); r->d_mod_img_v = 0; }
+    if (r->d_mod_txt_v)  { cuMemFree(r->d_mod_txt_v); r->d_mod_txt_v = 0; }
+    if (r->d_mod_sgl_v)  { cuMemFree(r->d_mod_sgl_v); r->d_mod_sgl_v = 0; }
+    if (r->d_q)          { cuMemFree(r->d_q); r->d_q = 0; }
+    if (r->d_k)          { cuMemFree(r->d_k); r->d_k = 0; }
+    if (r->d_v)          { cuMemFree(r->d_v); r->d_v = 0; }
+    if (r->d_attn_out)   { cuMemFree(r->d_attn_out); r->d_attn_out = 0; }
+    if (r->d_scratch1)   { cuMemFree(r->d_scratch1); r->d_scratch1 = 0; }
+    if (r->d_scratch2)   { cuMemFree(r->d_scratch2); r->d_scratch2 = 0; }
+    if (r->d_scratch3)   { cuMemFree(r->d_scratch3); r->d_scratch3 = 0; }
+    if (r->d_img_in_buf) { cuMemFree(r->d_img_in_buf); r->d_img_in_buf = 0; }
+    if (r->d_txt_in_buf) { cuMemFree(r->d_txt_in_buf); r->d_txt_in_buf = 0; }
 
     size_t F = sizeof(float);
-    cuMemAlloc(&r->d_img,        (size_t)n_img * H * F);
-    cuMemAlloc(&r->d_txt,        (size_t)n_txt * H * F);
-    cuMemAlloc(&r->d_joint,      (size_t)n_tot * H * F);
-    cuMemAlloc(&r->d_temb,       (size_t)H * F);
-    cuMemAlloc(&r->d_temb_silu,  (size_t)H * F);
-    cuMemAlloc(&r->d_mod_img_v,  (size_t)6 * H * F);
-    cuMemAlloc(&r->d_mod_txt_v,  (size_t)6 * H * F);
-    cuMemAlloc(&r->d_mod_sgl_v,  (size_t)3 * H * F);
-    cuMemAlloc(&r->d_q,          (size_t)n_tot * H * F);
-    cuMemAlloc(&r->d_k,          (size_t)n_tot * H * F);
-    cuMemAlloc(&r->d_v,          (size_t)n_tot * H * F);
-    cuMemAlloc(&r->d_attn_out,   (size_t)n_tot * H * F);
+    if (flux2_alloc_one(&r->d_img,        (size_t)n_img * H * F, "d_img") != 0) return -1;
+    if (flux2_alloc_one(&r->d_txt,        (size_t)n_txt * H * F, "d_txt") != 0) return -1;
+    if (flux2_alloc_one(&r->d_joint,      (size_t)n_tot * H * F, "d_joint") != 0) return -1;
+    if (flux2_alloc_one(&r->d_temb,       (size_t)H * F, "d_temb") != 0) return -1;
+    if (flux2_alloc_one(&r->d_temb_silu,  (size_t)H * F, "d_temb_silu") != 0) return -1;
+    if (flux2_alloc_one(&r->d_mod_img_v,  (size_t)6 * H * F, "d_mod_img_v") != 0) return -1;
+    if (flux2_alloc_one(&r->d_mod_txt_v,  (size_t)6 * H * F, "d_mod_txt_v") != 0) return -1;
+    if (flux2_alloc_one(&r->d_mod_sgl_v,  (size_t)3 * H * F, "d_mod_sgl_v") != 0) return -1;
+    if (flux2_alloc_one(&r->d_q,          (size_t)n_tot * H * F, "d_q") != 0) return -1;
+    if (flux2_alloc_one(&r->d_k,          (size_t)n_tot * H * F, "d_k") != 0) return -1;
+    if (flux2_alloc_one(&r->d_v,          (size_t)n_tot * H * F, "d_v") != 0) return -1;
+    if (flux2_alloc_one(&r->d_attn_out,   (size_t)n_tot * H * F, "d_attn_out") != 0) return -1;
     /* scratch1: for QKV/lin1 output [n_tot, max(3H, 3H+2*n_ff)] */
     int lin1_dim = 3 * H + 2 * n_ff;
-    cuMemAlloc(&r->d_scratch1,   (size_t)n_tot * lin1_dim * F);
+    if (flux2_alloc_one(&r->d_scratch1,   (size_t)n_tot * lin1_dim * F, "d_scratch1") != 0) return -1;
     /* scratch2: for MLP gate_up [n_tot, 2*n_ff] */
-    cuMemAlloc(&r->d_scratch2,   (size_t)n_tot * 2 * n_ff * F);
+    if (flux2_alloc_one(&r->d_scratch2,   (size_t)n_tot * 2 * n_ff * F, "d_scratch2") != 0) return -1;
     /* scratch3: for MLP out / proj [n_tot, max(n_ff, H)] */
     int s3 = n_ff > H ? n_ff : H;
-    cuMemAlloc(&r->d_scratch3,   (size_t)n_tot * s3 * F);
-    cuMemAlloc(&r->d_img_in_buf, (size_t)n_img * r->pin * F);
-    cuMemAlloc(&r->d_txt_in_buf, (size_t)n_txt * r->txt_dim * F);
+    if (flux2_alloc_one(&r->d_scratch3,   (size_t)n_tot * s3 * F, "d_scratch3") != 0) return -1;
+    if (flux2_alloc_one(&r->d_img_in_buf, (size_t)n_img * r->pin * F, "d_img_in_buf") != 0) return -1;
+    if (flux2_alloc_one(&r->d_txt_in_buf, (size_t)n_txt * r->txt_dim * F, "d_txt_in_buf") != 0) return -1;
 
     r->max_tok = n_tot;
     if (r->verbose >= 1)
         fprintf(stderr, "cuda_flux2: allocated activation buffers for %d tokens\n", n_tot);
+    return 0;
 }
 
 /* ---- GPU DiT forward pass ---- */
@@ -730,7 +934,7 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
     int n_tot = n_img + n_txt;
     size_t F = sizeof(float);
 
-    flux2_alloc_bufs(r, n_img, n_txt);
+    if (flux2_alloc_bufs(r, n_img, n_txt) != 0) return -1;
 
     /* Upload inputs */
     cuMemcpyHtoD(r->d_img_in_buf, img_tokens, (size_t)n_img * r->pin * F);
@@ -758,19 +962,6 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
             H, r->pin, n_img);
     op_gemm(r, r->d_txt, r->d_txt_in_w, r->d_txt_in_buf, r->d_txt_in_b,
             H, r->txt_dim, n_txt);
-
-    /* DEBUG: check projected img */
-    if (1) {
-        cuCtxSynchronize();
-        float dbg[8];
-        cuMemcpyDtoH(dbg, r->d_img, 8 * F);
-        fprintf(stderr, "  GPU img_proj[0:4] = %.6f %.6f %.6f %.6f\n", dbg[0], dbg[1], dbg[2], dbg[3]);
-        /* CPU comparison */
-        float *cpu_img = (float *)malloc((size_t)n_img * H * F);
-        flux2_gemm(cpu_img, img_tokens, n_img, r->pin, &r->dit->img_in, r->dit->img_in_b);
-        fprintf(stderr, "  CPU img_proj[0:4] = %.6f %.6f %.6f %.6f\n", cpu_img[0], cpu_img[1], cpu_img[2], cpu_img[3]);
-        free(cpu_img);
-    }
 
     /* 3. Compute global modulations: SiLU(temb) → mod vectors */
     cuMemcpyDtoD(r->d_temb, d_temb_final, (size_t)H * F);
@@ -816,30 +1007,6 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         /* IMG stream: adaLN → QKV */
         op_adaln(r, r->d_scratch1, r->d_img, mi_shift_a, mi_scale_a, n_img, H);
 
-        /* DEBUG: verify adaln kernel */
-        if (bi == 0) {
-            cuCtxSynchronize();
-            float *gpu_adaln = (float*)malloc((size_t)n_img * H * F);
-            float *gpu_img   = (float*)malloc((size_t)n_img * H * F);
-            float *gpu_shift = (float*)malloc((size_t)H * F);
-            float *gpu_scale = (float*)malloc((size_t)H * F);
-            cuMemcpyDtoH(gpu_adaln, r->d_scratch1, (size_t)n_img * H * F);
-            cuMemcpyDtoH(gpu_img, r->d_img, (size_t)n_img * H * F);
-            cuMemcpyDtoH(gpu_shift, mi_shift_a, (size_t)H * F);
-            cuMemcpyDtoH(gpu_scale, mi_scale_a, (size_t)H * F);
-            /* CPU adaln: LN(img) * (1 + scale) + shift */
-            float mean = 0, var = 0;
-            for (int j = 0; j < H; j++) mean += gpu_img[j];
-            mean /= (float)H;
-            for (int j = 0; j < H; j++) { float d = gpu_img[j] - mean; var += d*d; }
-            float inv = 1.0f / sqrtf(var / (float)H + 1e-6f);
-            float cpu_adaln0 = ((gpu_img[0] - mean) * inv) * (1.0f + gpu_scale[0]) + gpu_shift[0];
-            float cpu_adaln1 = ((gpu_img[1] - mean) * inv) * (1.0f + gpu_scale[1]) + gpu_shift[1];
-            fprintf(stderr, "  adaln[0]: GPU=%.6f CPU=%.6f (img=%.6f sh=%.6f sc=%.6f)\n",
-                    gpu_adaln[0], cpu_adaln0, gpu_img[0], gpu_shift[0], gpu_scale[0]);
-            fprintf(stderr, "  adaln[1]: GPU=%.6f CPU=%.6f\n", gpu_adaln[1], cpu_adaln1);
-            free(gpu_adaln); free(gpu_img); free(gpu_shift); free(gpu_scale);
-        }
         /* Q,K,V projections from img stream (use weight slices of [3H, H]) */
         CUdeviceptr img_q_w = b->img.qkv_w;
         CUdeviceptr img_k_w = b->img.qkv_w + (size_t)H * H * 4;  /* F32: 4 bytes */
@@ -861,96 +1028,80 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         op_gemm(r, tk, txt_k_w, r->d_scratch1, d0, H, H, n_txt);
         op_gemm(r, tv, txt_v_w, r->d_scratch1, d0, H, H, n_txt);
 
-        float *_dbg_q_cpu = NULL;
-        if (bi == 0) {
-            size_t sz = (size_t)n_img * H * F;
-            float *q_pre = (float*)malloc(sz);
-            cuCtxSynchronize();
-            cuMemcpyDtoH(q_pre, r->d_q, sz);
-            float *norm_w = (float*)malloc((size_t)hd * F);
-            cuMemcpyDtoH(norm_w, b->img.q_norm, (size_t)hd * F);
-            /* Debug head 5 of tok 1 */
-            int off = 1*H + 5*hd; /* tok=1, head=5 */
-            float ss_manual = 0;
-            for (int i = 0; i < hd; i++) ss_manual += q_pre[off+i]*q_pre[off+i];
-            float inv_manual = 1.0f/sqrtf(ss_manual/(float)hd + 1e-6f);
-            /* Also run CPU function on a copy and check */
-            float *q_copy = (float*)malloc(sz);
-            memcpy(q_copy, q_pre, sz);
-            flux2_rms_norm_heads(q_copy, norm_w, n_img, nH, hd);
-            fprintf(stderr, "  h5 manual: ss=%.4f inv=%.6f pre[64]=%.6f post=%.6f\n",
-                    ss_manual, inv_manual, q_pre[off+64], q_pre[off+64]*inv_manual*norm_w[64]);
-            fprintf(stderr, "  h5 CPU fn: post[64]=%.6f (diff from manual: %.8f)\n",
-                    q_copy[off+64], fabsf(q_copy[off+64] - q_pre[off+64]*inv_manual*norm_w[64]));
-            free(q_copy);
-            _dbg_q_cpu = (float*)malloc(sz);
-            memcpy(_dbg_q_cpu, q_pre, sz);
-            flux2_rms_norm_heads(_dbg_q_cpu, norm_w, n_img, nH, hd);
-            fprintf(stderr, "  after CPU rmsnorm [3776]=%.6f\n", _dbg_q_cpu[3776]);
-            flux2_rope_img(_dbg_q_cpu, n_img, nH, hd, (int)sqrtf((float)n_img), (int)sqrtf((float)n_img), theta);
-            fprintf(stderr, "  after CPU rope    [3776]=%.6f\n", _dbg_q_cpu[3776]);
-            free(norm_w); free(q_pre);
-        }
-
         /* Per-head RMSNorm on Q, K (separate norms for img/txt) */
         op_rmsnorm_ph(r, r->d_q, b->img.q_norm, n_img, nH, hd);
         op_rmsnorm_ph(r, r->d_k, b->img.k_norm, n_img, nH, hd);
         op_rmsnorm_ph(r, tq, b->txt.q_norm, n_txt, nH, hd);
         op_rmsnorm_ph(r, tk, b->txt.k_norm, n_txt, nH, hd);
 
-        if (0) { /* placeholder */ }
-
         /* RoPE: img=2D spatial, txt=1D sequence */
         op_rope_img(r, r->d_q, n_img, nH, hd, lat_w_p, theta);
         op_rope_img(r, r->d_k, n_img, nH, hd, lat_w_p, theta);
         op_rope_txt(r, tq, n_txt, nH, hd, theta);
         op_rope_txt(r, tk, n_txt, nH, hd, theta);
-
-        /* DEBUG: compare GPU Q after RMSNorm+RoPE with CPU */
-        if (bi == 0 && _dbg_q_cpu) {
-            size_t sz = (size_t)n_img * H * F;
-            float *q_gpu = (float*)malloc(sz);
-            cuCtxSynchronize();
-            cuMemcpyDtoH(q_gpu, r->d_q, sz);
-            float maxd = 0, sumd = 0;
-            for (int i = 0; i < n_img * H; i++) {
-                float d = fabsf(q_gpu[i] - _dbg_q_cpu[i]);
-                if (d > maxd) maxd = d;
-                sumd += d;
-            }
-            int maxi = 0;
-            for (int i = 0; i < n_img * H; i++) {
-                float d = fabsf(q_gpu[i] - _dbg_q_cpu[i]);
-                if (d > maxd - 0.001f) maxi = i;
-            }
-            int tok_i = maxi / H, dim_i = maxi % H;
-            fprintf(stderr, "  Q norm+rope: max_diff=%.8f at [tok=%d,dim=%d] GPU=%.6f CPU=%.6f\n",
-                    maxd, tok_i, dim_i, q_gpu[maxi], _dbg_q_cpu[maxi]);
-            fprintf(stderr, "    GPU Q[64..67]= %.6f %.6f %.6f %.6f\n", q_gpu[64],q_gpu[65],q_gpu[66],q_gpu[67]);
-            fprintf(stderr, "    CPU Q[64..67]= %.6f %.6f %.6f %.6f\n", _dbg_q_cpu[64],_dbg_q_cpu[65],_dbg_q_cpu[66],_dbg_q_cpu[67]);
-            free(q_gpu); free(_dbg_q_cpu);
-        }
-
-        /* Joint attention: Q=[img,txt], K=[img,txt], V=[img,txt] */
-        /* DEBUG: use CPU attention to isolate GPU attention bugs */
-        {
+        /* Joint attention: GPU path is the default. Set FLUX2_CPU_DBL_ATTN=1
+         * to force the previous CPU fallback for A/B checks. */
+        if (r->use_gpu_dbl_attn) {
+            op_attn(r, r->d_attn_out, r->d_q, r->d_k, r->d_v, n_tot, nH, hd);
+        } else {
             size_t sz = (size_t)n_tot * H * F;
-            float *cq = (float*)malloc(sz), *ck = (float*)malloc(sz), *cv = (float*)malloc(sz);
-            float *co = (float*)malloc(sz);
+            float *cq = (float *)malloc(sz);
+            float *ck = (float *)malloc(sz);
+            float *cv = (float *)malloc(sz);
+            float *co = (float *)malloc(sz);
             cuCtxSynchronize();
             cuMemcpyDtoH(cq, r->d_q, sz);
             cuMemcpyDtoH(ck, r->d_k, sz);
             cuMemcpyDtoH(cv, r->d_v, sz);
             flux2_mha(co, cq, ck, cv, n_tot, n_tot, nH, hd);
             cuMemcpyHtoD(r->d_attn_out, co, sz);
-            free(cq); free(ck); free(cv); free(co);
+            free(cq);
+            free(ck);
+            free(cv);
+            free(co);
         }
 
-        /* DEBUG: check attention output */
-        if (bi == 0) {
+        if (r->debug_dbl_attn && bi == 0) {
+            size_t sz = (size_t)n_tot * H * F;
+            float *q_cpu = (float *)malloc(sz);
+            float *k_cpu = (float *)malloc(sz);
+            float *v_cpu = (float *)malloc(sz);
+            float *attn_gpu = (float *)malloc(sz);
+            float *attn_cpu = (float *)malloc(sz);
             cuCtxSynchronize();
-            float adbg[8]; cuMemcpyDtoH(adbg, r->d_attn_out, 8*F);
-            fprintf(stderr, "  GPU attn[0:4]= %.6f %.6f %.6f %.6f\n", adbg[0],adbg[1],adbg[2],adbg[3]);
+            cuMemcpyDtoH(q_cpu, r->d_q, sz);
+            cuMemcpyDtoH(k_cpu, r->d_k, sz);
+            cuMemcpyDtoH(v_cpu, r->d_v, sz);
+            cuMemcpyDtoH(attn_gpu, r->d_attn_out, sz);
+            flux2_mha(attn_cpu, q_cpu, k_cpu, v_cpu, n_tot, n_tot, nH, hd);
+            float max_diff = 0.0f, mean_diff = 0.0f;
+            int max_idx = 0;
+            int total = n_tot * H;
+            for (int i = 0; i < total; i++) {
+                float d = fabsf(attn_gpu[i] - attn_cpu[i]);
+                mean_diff += d;
+                if (d > max_diff) {
+                    max_diff = d;
+                    max_idx = i;
+                }
+            }
+            fprintf(stderr,
+                    "cuda_flux2: dbl_attn blk0 compare max_diff=%.6g mean_diff=%.6g idx=%d gpu=%.6g cpu=%.6g\n",
+                    max_diff, mean_diff / (float)total, max_idx, attn_gpu[max_idx], attn_cpu[max_idx]);
+            fprintf(stderr,
+                    "cuda_flux2: dbl_attn blk0 q[0..3]=%.6g %.6g %.6g %.6g\n",
+                    q_cpu[0], q_cpu[1], q_cpu[2], q_cpu[3]);
+            fprintf(stderr,
+                    "cuda_flux2: dbl_attn blk0 attn_gpu[0..3]=%.6g %.6g %.6g %.6g\n",
+                    attn_gpu[0], attn_gpu[1], attn_gpu[2], attn_gpu[3]);
+            fprintf(stderr,
+                    "cuda_flux2: dbl_attn blk0 attn_cpu[0..3]=%.6g %.6g %.6g %.6g\n",
+                    attn_cpu[0], attn_cpu[1], attn_cpu[2], attn_cpu[3]);
+            free(q_cpu);
+            free(k_cpu);
+            free(v_cpu);
+            free(attn_gpu);
+            free(attn_cpu);
         }
 
         /* Output projections (img and txt use different weights) */
@@ -963,7 +1114,6 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         op_gated_add(r, r->d_txt, r->d_scratch2, mt_gate_a, n_txt, H);
 
         /* FFN img */
-        {
         op_adaln(r, r->d_scratch1, r->d_img, mi_shift_f, mi_scale_f, n_img, H);
         op_gemm(r, r->d_scratch2, b->img.mlp_up_w, r->d_scratch1, d0, 2*n_ff, H, n_img);
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_img, n_ff);
@@ -976,15 +1126,6 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_txt, n_ff);
         op_gemm(r, r->d_scratch1, b->txt.mlp_dn_w, r->d_scratch3, d0, H, n_ff, n_txt);
         op_gated_add(r, r->d_txt, r->d_scratch1, mt_gate_f, n_txt, H);
-        }
-
-        /* DEBUG: check after double block 0 */
-        if (bi == 0) {
-            cuCtxSynchronize();
-            float dbg[4];
-            cuMemcpyDtoH(dbg, r->d_img, 4 * sizeof(float));
-            fprintf(stderr, "  GPU after dblk[0] img[0:4] = %.6f %.6f %.6f %.6f\n", dbg[0], dbg[1], dbg[2], dbg[3]);
-        }
     }
 
     /* ---- Single-stream blocks ---- */
@@ -1035,15 +1176,7 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         op_gemm(r, r->d_scratch2, b->l2_mlp_w, r->d_scratch3, d0, H, n_ff, n_tot);
 
         /* Add the two halves: scratch1 += scratch2 */
-        {
-            int total = n_tot * H;
-            CUdeviceptr s1 = r->d_scratch1, s2 = r->d_scratch2;
-            void *args[] = {&s1, &s2, &total};
-            CUfunction fn_add;
-            cuModuleGetFunction(&fn_add, r->mod, "add_f32");
-            cuLaunchKernel(fn_add, (unsigned)((total+255)/256), 1, 1,
-                           256, 1, 1, 0, r->stream, args, NULL);
-        }
+        op_add(r, r->d_scratch1, r->d_scratch2, n_tot * H);
 
         /* Gated residual */
         op_gated_add(r, r->d_joint, r->d_scratch1, ms_gate, n_tot, H);
@@ -1138,7 +1271,81 @@ void cuda_flux2_free(cuda_flux2_runner *r) {
     free(r);
 }
 
-/* ---- VAE decode: CPU fallback ---- */
+/* ---- VAE decode ---- */
+
+static CUdeviceptr flux2_vae_resblock_gpu(cuda_flux2_runner *r, CUdeviceptr x,
+                                          const flux2_vae_resblock *rb,
+                                          int h, int w, int num_groups) {
+    int ci = rb->c_in, co = rb->c_out;
+    int spatial = h * w;
+    CUdeviceptr d_n1_w = gpu_upload_f32_or0(rb->norm1_w, ci);
+    CUdeviceptr d_n1_b = gpu_upload_f32_or0(rb->norm1_b, ci);
+    CUdeviceptr d_c1_w = gpu_upload_f32(rb->conv1_w, co * ci * 3 * 3);
+    CUdeviceptr d_c1_b = gpu_upload_f32_or0(rb->conv1_b, co);
+    CUdeviceptr d_n2_w = gpu_upload_f32_or0(rb->norm2_w, co);
+    CUdeviceptr d_n2_b = gpu_upload_f32_or0(rb->norm2_b, co);
+    CUdeviceptr d_c2_w = gpu_upload_f32(rb->conv2_w, co * co * 3 * 3);
+    CUdeviceptr d_c2_b = gpu_upload_f32_or0(rb->conv2_b, co);
+    CUdeviceptr d_sc_w = rb->skip_w ? gpu_upload_f32(rb->skip_w, co * ci) : 0;
+    CUdeviceptr d_sc_b = gpu_upload_f32_or0(rb->skip_b, co);
+
+    CUdeviceptr d_tmp1, d_tmp2, d_out;
+    cuMemAlloc(&d_tmp1, (size_t)ci * spatial * sizeof(float));
+    op_vae_groupnorm(r, d_tmp1, x, d_n1_w, d_n1_b, ci, spatial, num_groups);
+    op_silu(r, d_tmp1, ci * spatial);
+
+    cuMemAlloc(&d_tmp2, (size_t)co * spatial * sizeof(float));
+    op_vae_conv2d(r, d_tmp2, d_tmp1, d_c1_w, d_c1_b, ci, h, w, co, 3, 3, 1);
+    cuMemFree(d_tmp1);
+
+    cuMemAlloc(&d_tmp1, (size_t)co * spatial * sizeof(float));
+    op_vae_groupnorm(r, d_tmp1, d_tmp2, d_n2_w, d_n2_b, co, spatial, num_groups);
+    op_silu(r, d_tmp1, co * spatial);
+    cuMemFree(d_tmp2);
+
+    cuMemAlloc(&d_tmp2, (size_t)co * spatial * sizeof(float));
+    op_vae_conv2d(r, d_tmp2, d_tmp1, d_c2_w, d_c2_b, co, h, w, co, 3, 3, 1);
+    cuMemFree(d_tmp1);
+
+    cuMemAlloc(&d_out, (size_t)co * spatial * sizeof(float));
+    if (d_sc_w) {
+        op_vae_conv2d(r, d_out, x, d_sc_w, d_sc_b, ci, h, w, co, 1, 1, 0);
+    } else {
+        cuMemcpyDtoD(d_out, x, (size_t)co * spatial * sizeof(float));
+    }
+    op_add(r, d_out, d_tmp2, co * spatial);
+    cuMemFree(d_tmp2);
+
+    if (d_n1_w) cuMemFree(d_n1_w);
+    if (d_n1_b) cuMemFree(d_n1_b);
+    if (d_c1_w) cuMemFree(d_c1_w);
+    if (d_c1_b) cuMemFree(d_c1_b);
+    if (d_n2_w) cuMemFree(d_n2_w);
+    if (d_n2_b) cuMemFree(d_n2_b);
+    if (d_c2_w) cuMemFree(d_c2_w);
+    if (d_c2_b) cuMemFree(d_c2_b);
+    if (d_sc_w) cuMemFree(d_sc_w);
+    if (d_sc_b) cuMemFree(d_sc_b);
+
+    return d_out;
+}
+
+static CUdeviceptr flux2_vae_mid_attn_bridge(cuda_flux2_runner *r, CUdeviceptr x,
+                                             const flux2_vae_attn *attn,
+                                             int h, int w, int num_groups) {
+    int c = attn->c;
+    size_t n = (size_t)c * h * w;
+    float *cpu_in = (float *)malloc(n * sizeof(float));
+    float *cpu_out = (float *)malloc(n * sizeof(float));
+    cuCtxSynchronize();
+    cuMemcpyDtoH(cpu_in, x, n * sizeof(float));
+    flux2_vae_mid_attn_forward(cpu_out, cpu_in, attn, h, w, num_groups);
+    CUdeviceptr d_out = gpu_upload_f32(cpu_out, (int)n);
+    free(cpu_in);
+    free(cpu_out);
+    return d_out;
+}
+
 int cuda_flux2_vae_decode(cuda_flux2_runner *r,
                           const float *latent, int lat_h, int lat_w,
                           float *out_rgb) {
@@ -1146,7 +1353,131 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
         fprintf(stderr, "cuda_flux2: VAE not loaded\n");
         return -1;
     }
-    flux2_vae_decode(out_rgb, latent, lat_h, lat_w, r->vae);
+
+    flux2_vae_model *m = r->vae;
+    int lc = m->latent_channels;
+    int ng = m->num_groups;
+    int h = lat_h, w = lat_w;
+    int c = lc;
+    int ps = 2;
+    int spatial = h * w;
+
+    CUdeviceptr d_x = gpu_upload_f32(latent, lc * h * w);
+
+    if (m->bn_mean && m->bn_var) {
+        float bn_std[128];
+        for (int i = 0; i < 128; i++) bn_std[i] = sqrtf(m->bn_var[i] + m->bn_eps);
+        CUdeviceptr d_bn_mean = gpu_upload_f32(m->bn_mean, 128);
+        CUdeviceptr d_bn_std = gpu_upload_f32(bn_std, 128);
+        CUdeviceptr d_tmp;
+        cuMemAlloc(&d_tmp, (size_t)lc * h * w * sizeof(float));
+        op_vae_latent_bn(r, d_tmp, d_x, d_bn_mean, d_bn_std, lc, h, w, ps);
+        cuMemFree(d_x);
+        cuMemFree(d_bn_mean);
+        cuMemFree(d_bn_std);
+        d_x = d_tmp;
+    }
+
+    if (m->pqc_w) {
+        CUdeviceptr d_pqc_w = gpu_upload_f32(m->pqc_w, lc * lc);
+        CUdeviceptr d_pqc_b = gpu_upload_f32_or0(m->pqc_b, lc);
+        CUdeviceptr d_tmp;
+        cuMemAlloc(&d_tmp, (size_t)lc * h * w * sizeof(float));
+        op_vae_conv2d(r, d_tmp, d_x, d_pqc_w, d_pqc_b, lc, h, w, lc, 1, 1, 0);
+        cuMemFree(d_x);
+        cuMemFree(d_pqc_w);
+        if (d_pqc_b) cuMemFree(d_pqc_b);
+        d_x = d_tmp;
+    }
+
+    {
+        int co = m->conv_in_out_ch;
+        CUdeviceptr d_w = gpu_upload_f32(m->conv_in_w, co * lc * 3 * 3);
+        CUdeviceptr d_b = gpu_upload_f32_or0(m->conv_in_b, co);
+        CUdeviceptr d_tmp;
+        cuMemAlloc(&d_tmp, (size_t)co * h * w * sizeof(float));
+        op_vae_conv2d(r, d_tmp, d_x, d_w, d_b, lc, h, w, co, 3, 3, 1);
+        cuMemFree(d_x);
+        cuMemFree(d_w);
+        if (d_b) cuMemFree(d_b);
+        d_x = d_tmp;
+        c = co;
+    }
+
+    {
+        CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->mid_res0, h, w, ng);
+        cuMemFree(d_x);
+        d_x = d_tmp;
+    }
+    {
+        CUdeviceptr d_tmp = flux2_vae_mid_attn_bridge(r, d_x, &m->mid_attn, h, w, ng);
+        cuMemFree(d_x);
+        d_x = d_tmp;
+    }
+    {
+        CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->mid_res1, h, w, ng);
+        cuMemFree(d_x);
+        d_x = d_tmp;
+    }
+
+    for (int bi = 0; bi < 4; bi++) {
+        {
+            CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][0], h, w, ng);
+            cuMemFree(d_x);
+            d_x = d_tmp;
+            c = m->up_res[bi][0].c_out;
+        }
+        {
+            CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][1], h, w, ng);
+            cuMemFree(d_x);
+            d_x = d_tmp;
+            c = m->up_res[bi][1].c_out;
+        }
+        if (m->up_has_sample[bi]) {
+            CUdeviceptr d_up = op_vae_upsample2x(r, d_x, c, h, w);
+            CUdeviceptr d_w = gpu_upload_f32(m->up_sample[bi].conv_w, c * c * 3 * 3);
+            CUdeviceptr d_b = gpu_upload_f32_or0(m->up_sample[bi].conv_b, c);
+            CUdeviceptr d_tmp;
+            h *= 2;
+            w *= 2;
+            cuMemAlloc(&d_tmp, (size_t)c * h * w * sizeof(float));
+            op_vae_conv2d(r, d_tmp, d_up, d_w, d_b, c, h, w, c, 3, 3, 1);
+            cuMemFree(d_x);
+            cuMemFree(d_up);
+            cuMemFree(d_w);
+            if (d_b) cuMemFree(d_b);
+            d_x = d_tmp;
+        }
+    }
+
+    spatial = h * w;
+    {
+        CUdeviceptr d_g = gpu_upload_f32_or0(m->norm_out_w, c);
+        CUdeviceptr d_b = gpu_upload_f32_or0(m->norm_out_b, c);
+        CUdeviceptr d_tmp;
+        cuMemAlloc(&d_tmp, (size_t)c * spatial * sizeof(float));
+        op_vae_groupnorm(r, d_tmp, d_x, d_g, d_b, c, spatial, ng);
+        op_silu(r, d_tmp, c * spatial);
+        cuMemFree(d_x);
+        if (d_g) cuMemFree(d_g);
+        if (d_b) cuMemFree(d_b);
+        d_x = d_tmp;
+    }
+    {
+        CUdeviceptr d_w = gpu_upload_f32(m->conv_out_w, 3 * c * 3 * 3);
+        CUdeviceptr d_b = gpu_upload_f32_or0(m->conv_out_b, 3);
+        CUdeviceptr d_rgb;
+        cuMemAlloc(&d_rgb, (size_t)3 * spatial * sizeof(float));
+        op_vae_conv2d(r, d_rgb, d_x, d_w, d_b, c, h, w, 3, 3, 3, 1);
+        cuMemFree(d_x);
+        cuMemFree(d_w);
+        if (d_b) cuMemFree(d_b);
+        d_x = d_rgb;
+    }
+
+    cuCtxSynchronize();
+    cuMemcpyDtoH(out_rgb, d_x, (size_t)3 * h * w * sizeof(float));
+    cuMemFree(d_x);
     return 0;
 }
 
