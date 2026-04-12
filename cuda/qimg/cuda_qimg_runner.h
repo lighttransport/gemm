@@ -70,6 +70,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 #include "../cuda_kernels_common.h"
+#include "../cuda_fp8_mma_kernels.h"
 #include "../../common/safetensors.h"
 
 /* ---- FP8 E4M3 → F32 CPU conversion ---- */
@@ -757,6 +758,11 @@ struct cuda_qimg_runner {
     CUfunction gemm_fp8w_f32;   /* FP8 weight (LUT dequant) × F32 input */
     CUfunction gemm_opt_f16;    /* optimized 128×128 tiled F16 GEMM */
     CUfunction gemm_opt_fp8;    /* optimized 128×128 tiled FP8 LUT GEMM */
+    CUfunction gemm_fp8_mma;    /* mma.sync m16n8k32 FP8 tensor-core GEMM (sm_89+) */
+    CUfunction flash_attn_fp8;  /* mma.sync m16n8k32 FP8 flash attention (sm_89+) */
+    CUfunction quantize_fp8;    /* F32 → e4m3 with per-tensor scale */
+    CUfunction reduce_max_abs;  /* atomic-max reduce to a single F32 slot */
+    CUfunction fn_zero_f32;     /* memset(F32 slot, 0) helper */
     CUfunction layernorm_f32;
     CUfunction gelu_f32;
     CUfunction silu_f32;
@@ -766,6 +772,13 @@ struct cuda_qimg_runner {
     CUfunction adaln_modulate;
     CUfunction dequant_fp8_to_f16;  /* GPU-side FP8→F16 via LUT */
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
+    int use_fp8_mma;   /* 1 to use mma.sync FP8 tensor-core GEMM (env QIMG_FP8_MMA=1) */
+    int use_fp8_attn;  /* 1 to use mma.sync FP8 flash attention (env QIMG_FP8_ATTN=1) */
+    /* Lazy FP8 attention workspace (re-used across blocks; sized to max n_tok*dim) */
+    CUdeviceptr d_q_fp8, d_k_fp8, d_v_fp8;  /* [n_tok*dim] uint8 e4m3 */
+    CUdeviceptr d_qkv_scales;               /* [3] float (sQ, sK, sV) */
+    CUdeviceptr d_qkv_max;                  /* [1] float scratch */
+    size_t      fp8_attn_buf_n;             /* current allocation size in bytes */
     int use_f16_gemm;  /* 1 to use F16 weights + gemm_f16_f32 (better precision) */
     CUfunction truncate_bf16;
     CUfunction quantize_fp8_rt;  /* FP8 roundtrip quantization */
@@ -1034,6 +1047,23 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
 
+    if (r->use_fp8_mma && r->gemm_fp8_mma && !r->use_old_gemm) {
+        /* mma.sync m16n8k32 FP8 tensor-core GEMM with per-tensor weight scale.
+         * qwen-image FP8 weights are raw e4m3 (no scale) → w_scale = 1.0f.
+         * Grid: (ceil(n_out/256), ceil(n_tok/32)), Block: 128 threads (4 warps).
+         * Shared mem: (16*MTILE) * 32 * sizeof(float) = 2048 bytes for X tile. */
+        float w_scale = 1.0f;
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok +  31) /  32);
+        size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);  /* MTILE=2 */
+        cuLaunchKernel(r->gemm_fp8_mma, gx, gy, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+        /* Match the downstream BF16 precision of the tiled-FP8 path. */
+        op_bf16_trunc(r, Y, n_out * n_tok);
+        return;
+    }
+
     if (r->use_f16_gemm && r->gemm_opt_f16 && n_tok >= 16 && !r->use_old_gemm) {
         /* Optimized 128×128 tiled GEMM with fused BF16 truncation.
          * Grid: (ceil(n_out/128), ceil(n_tok/128)), Block: (256, 1, 1) */
@@ -1119,9 +1149,76 @@ static void op_gated_add(cuda_qimg_runner *r, CUdeviceptr x, CUdeviceptr proj,
                    0, r->stream, args, NULL);
 }
 
+/* ---- FP8 flash attention workspace ---- */
+
+/* Lazily (re)allocate the Q/K/V FP8 scratch buffers for attention.
+ * Returns 0 on success, -1 on OOM (any partial allocs are freed). */
+static int ensure_fp8_attn_buf(cuda_qimg_runner *r, size_t n_bytes) {
+    if (n_bytes <= r->fp8_attn_buf_n) return 0;
+    if (r->d_q_fp8)      { cuMemFree(r->d_q_fp8);      r->d_q_fp8 = 0; }
+    if (r->d_k_fp8)      { cuMemFree(r->d_k_fp8);      r->d_k_fp8 = 0; }
+    if (r->d_v_fp8)      { cuMemFree(r->d_v_fp8);      r->d_v_fp8 = 0; }
+    if (r->d_qkv_scales) { cuMemFree(r->d_qkv_scales); r->d_qkv_scales = 0; }
+    if (r->d_qkv_max)    { cuMemFree(r->d_qkv_max);    r->d_qkv_max = 0; }
+    r->fp8_attn_buf_n = 0;
+    if (cuMemAlloc(&r->d_q_fp8, n_bytes)          != CUDA_SUCCESS) { r->d_q_fp8 = 0; return -1; }
+    if (cuMemAlloc(&r->d_k_fp8, n_bytes)          != CUDA_SUCCESS) { r->d_k_fp8 = 0; return -1; }
+    if (cuMemAlloc(&r->d_v_fp8, n_bytes)          != CUDA_SUCCESS) { r->d_v_fp8 = 0; return -1; }
+    if (cuMemAlloc(&r->d_qkv_scales, 3*sizeof(float)) != CUDA_SUCCESS) { r->d_qkv_scales = 0; return -1; }
+    if (cuMemAlloc(&r->d_qkv_max, sizeof(float))      != CUDA_SUCCESS) { r->d_qkv_max = 0; return -1; }
+    r->fp8_attn_buf_n = n_bytes;
+    return 0;
+}
+
+/* Two-pass F32 → e4m3 quantization with per-tensor scale.
+ * Writes out[n] uint8 e4m3 bytes and out_scale (1 float = max_abs/448). */
+static void quantize_buf_fp8(cuda_qimg_runner *r,
+                              CUdeviceptr fp8_out, CUdeviceptr scale_out,
+                              CUdeviceptr in, int n) {
+    /* Zero the shared max slot (works for fp32 since +0.0 bits == 0) */
+    cuMemsetD32Async(r->d_qkv_max, 0, 1, r->stream);
+    void *a0[] = {&r->d_qkv_max, &in, &n};
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    cuLaunchKernel(r->reduce_max_abs, blocks, 1, 1, 256, 1, 1,
+                   0, r->stream, a0, NULL);
+    void *a1[] = {&fp8_out, &scale_out, &in, &r->d_qkv_max, &n};
+    cuLaunchKernel(r->quantize_fp8, blocks, 1, 1, 256, 1, 1,
+                   0, r->stream, a1, NULL);
+}
+
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
                     CUdeviceptr d_k, CUdeviceptr d_v,
                     int n_tok, int n_heads, int head_dim) {
+    /* FP8 MMA flash attention path — per-tensor quantize Q/K/V, then mma.sync */
+    if (r->use_fp8_attn && r->flash_attn_fp8 && r->quantize_fp8 && r->reduce_max_abs) {
+        int dim = n_heads * head_dim;
+        size_t need = (size_t)n_tok * dim;
+        if (ensure_fp8_attn_buf(r, need) == 0) {
+            CUdeviceptr s_q = r->d_qkv_scales + 0 * sizeof(float);
+            CUdeviceptr s_k = r->d_qkv_scales + 1 * sizeof(float);
+            CUdeviceptr s_v = r->d_qkv_scales + 2 * sizeof(float);
+            int n = (int)need;
+            quantize_buf_fp8(r, r->d_q_fp8, s_q, d_q, n);
+            quantize_buf_fp8(r, r->d_k_fp8, s_k, d_k, n);
+            quantize_buf_fp8(r, r->d_v_fp8, s_v, d_v, n);
+            /* Read scales back for kernel args. Single 3-float DtoH (synchronous). */
+            float scales[3];
+            cuStreamSynchronize(r->stream);
+            cuMemcpyDtoH(scales, r->d_qkv_scales, 3 * sizeof(float));
+            /* flash_attn_fp8 launch: grid=(n_heads, ceil(N/64)), block=128 (4 warps) */
+            unsigned gy = (unsigned)((n_tok + 63) / 64);
+            size_t smem = (size_t)(32 * 128 + 128 * 32 + 4 * 16 * 32 * sizeof(float));  /* smK+smVT+smP */
+            void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
+                            &n_tok, &n_heads, &head_dim,
+                            &scales[0], &scales[1], &scales[2]};
+            cuLaunchKernel(r->flash_attn_fp8,
+                           (unsigned)n_heads, gy, 1,
+                           128, 1, 1, smem, r->stream, args, NULL);
+            return;
+        }
+        /* ensure_fp8_attn_buf OOM → fall through to F32 path */
+    }
+
     /* flash_attn_f32: warp-cooperative, FA2_WARPS queries per block.
      * Each warp handles one query, 32 threads × 4 elems = 128 head_dim.
      * Grid: (n_heads, ceil(n_tok/FA2_WARPS)), Block: (32*FA2_WARPS) */
@@ -1168,13 +1265,27 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         fprintf(stderr, "cuda_qimg: %s (sm_%d, %.1f GB)\n", name, sm, (float)mem/(1<<30));
     }
 
-    /* Compile kernels */
+    /* Compile kernels. Concat order:
+     *   cuda_kernels_common_src (opens extern "C")
+     *   + qimg_kernel_src (closes extern "C" — provides to_bf16 device fn)
+     *   + extern "C" { + fp8_mma_kernels_src + }
+     * The FP8 MMA kernels live in a second extern "C" block so they're callable
+     * by name via NVRTC, and can reference to_bf16 from the previous block. */
+    const char *mma_open  = "\nextern \"C\" {\n";
+    const char *mma_close = "\n} /* extern C (fp8_mma_kernels) */\n";
     size_t len1 = strlen(cuda_kernels_common_src);
     size_t len2 = strlen(qimg_kernel_src);
-    char *full_src = (char *)malloc(len1 + len2 + 1);
-    memcpy(full_src, cuda_kernels_common_src, len1);
-    memcpy(full_src + len1, qimg_kernel_src, len2);
-    full_src[len1 + len2] = '\0';
+    size_t len3 = strlen(fp8_mma_kernels_src);
+    size_t lo = strlen(mma_open);
+    size_t lc = strlen(mma_close);
+    char *full_src = (char *)malloc(len1 + len2 + lo + len3 + lc + 1);
+    char *p = full_src;
+    memcpy(p, cuda_kernels_common_src, len1); p += len1;
+    memcpy(p, qimg_kernel_src, len2);         p += len2;
+    memcpy(p, mma_open, lo);                  p += lo;
+    memcpy(p, fp8_mma_kernels_src, len3);     p += len3;
+    memcpy(p, mma_close, lc);                 p += lc;
+    *p = '\0';
 
     CUmodule module;
     int rc = cu_compile_kernels(&module, dev, full_src, "qimg.cu", verbose, "cuda_qimg");
@@ -1191,6 +1302,16 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gemm_fp8w_f32, "gemm_fp8w_f32");
     GET(gemm_opt_f16, "gemm_opt_f16");
     GET(gemm_opt_fp8, "gemm_opt_fp8");
+    if (cuModuleGetFunction(&r->gemm_fp8_mma, module, "gemm_fp8_scaled_f32") != CUDA_SUCCESS)
+        r->gemm_fp8_mma = NULL;
+    if (cuModuleGetFunction(&r->flash_attn_fp8, module, "flash_attn_fp8") != CUDA_SUCCESS)
+        r->flash_attn_fp8 = NULL;
+    if (cuModuleGetFunction(&r->quantize_fp8, module, "quantize_to_fp8_e4m3") != CUDA_SUCCESS)
+        r->quantize_fp8 = NULL;
+    if (cuModuleGetFunction(&r->reduce_max_abs, module, "reduce_max_abs_f32") != CUDA_SUCCESS)
+        r->reduce_max_abs = NULL;
+    if (cuModuleGetFunction(&r->fn_zero_f32, module, "zero_f32") != CUDA_SUCCESS)
+        r->fn_zero_f32 = NULL;
     /* Enable FP8 weight format: LUT-based dequant works on any SM.
      * Use FP8 byte uploads + LUT GEMM to save 4× VRAM vs F32 — critical for 8GB GPUs. */
     r->use_fp8_gemm = 0;
@@ -1198,6 +1319,27 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->use_fp8_gemm = 1;
         if (verbose)
             fprintf(stderr, "cuda_qimg: FP8 LUT GEMM enabled (sm_%d)\n", sm);
+    }
+    /* FP8 tensor-core MMA path: opt-in via QIMG_FP8_MMA=1. Requires sm_89+ and
+     * FP8 weight upload (uses raw e4m3 bytes as mma.sync A operand). */
+    r->use_fp8_mma = 0;
+    {
+        const char *env = getenv("QIMG_FP8_MMA");
+        if (env && env[0] != '0' && r->gemm_fp8_mma && r->use_fp8_gemm && sm >= 89) {
+            r->use_fp8_mma = 1;
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: FP8 MMA tensor-core GEMM enabled (sm_%d)\n", sm);
+        }
+    }
+    /* FP8 flash attention: opt-in via QIMG_FP8_ATTN=1. */
+    r->use_fp8_attn = 0;
+    {
+        const char *env = getenv("QIMG_FP8_ATTN");
+        if (env && env[0] != '0' && r->flash_attn_fp8 && r->quantize_fp8 && r->reduce_max_abs && sm >= 89) {
+            r->use_fp8_attn = 1;
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: FP8 MMA flash attention enabled (sm_%d)\n", sm);
+        }
     }
     GET(layernorm_f32, "layernorm_f32");
     GET(gelu_f32, "gelu_f32");
@@ -1366,6 +1508,12 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     }
     CUdeviceptr *globals = &r->d_img_in_w;
     for (int i = 0; i < 13; i++) { if (globals[i]) cuMemFree(globals[i]); }
+    /* FP8 attention workspace (lazily allocated by ensure_fp8_attn_buf) */
+    if (r->d_q_fp8)      cuMemFree(r->d_q_fp8);
+    if (r->d_k_fp8)      cuMemFree(r->d_k_fp8);
+    if (r->d_v_fp8)      cuMemFree(r->d_v_fp8);
+    if (r->d_qkv_scales) cuMemFree(r->d_qkv_scales);
+    if (r->d_qkv_max)    cuMemFree(r->d_qkv_max);
     if (r->dit_st) safetensors_close((st_context *)r->dit_st);
     if (r->vae_st) safetensors_close((st_context *)r->vae_st);
     if (r->stream) cuStreamDestroy(r->stream);
