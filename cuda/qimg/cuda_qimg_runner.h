@@ -1047,11 +1047,14 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
 
-    if (r->use_fp8_mma && r->gemm_fp8_mma && !r->use_old_gemm) {
+    if (r->use_fp8_mma && r->gemm_fp8_mma && n_tok >= 16 && !r->use_old_gemm) {
         /* mma.sync m16n8k32 FP8 tensor-core GEMM with per-tensor weight scale.
          * qwen-image FP8 weights are raw e4m3 (no scale) → w_scale = 1.0f.
          * Grid: (ceil(n_out/256), ceil(n_tok/32)), Block: 128 threads (4 warps).
-         * Shared mem: (16*MTILE) * 32 * sizeof(float) = 2048 bytes for X tile. */
+         * Shared mem: (16*MTILE) * 32 * sizeof(float) = 2048 bytes for X tile.
+         * n_tok >= 16 gate: matches the MTILE=2 minimum-row assumption and
+         * routes single-token ops (timestep embed, modulation) to the LUT path
+         * which has been validated for those shapes. */
         float w_scale = 1.0f;
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale};
         unsigned gx = (unsigned)((n_out + 255) / 256);
