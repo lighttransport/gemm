@@ -285,6 +285,90 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
     return 0;
 }
 
+/* Test 3: img_in linear projection against PyTorch reference.
+ * Loads dit_img_input.npy (16,64) F32 reference input, runs our FP8 GEMM
+ * against the img_in.weight + bias from the safetensors, and compares
+ * against dit_img_projected.npy (16, 3072) reference output. */
+static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path) {
+    fprintf(stderr, "  [kernel] img_in FP8 GEMM vs PyTorch reference... ");
+    if (!r->gemm_fp8_mma || !r->gemm_opt_fp8) {
+        fprintf(stderr, "SKIP (gemm kernels not loaded)\n");
+        return 0;
+    }
+    /* Load references */
+    const char *ref_dir = "/home/syoyo/work/gemm/diffusion/ref/qwen_image/output/";
+    char in_path[512], proj_path[512];
+    snprintf(in_path,   sizeof(in_path),   "%sdit_img_input.npy", ref_dir);
+    snprintf(proj_path, sizeof(proj_path), "%sdit_img_projected.npy", ref_dir);
+    FILE *f_in = fopen(in_path, "rb");
+    FILE *f_pj = fopen(proj_path, "rb");
+    if (!f_in || !f_pj) {
+        fprintf(stderr, "SKIP (reference %s or %s missing)\n", in_path, proj_path);
+        if (f_in) fclose(f_in);
+        if (f_pj) fclose(f_pj);
+        return 0;
+    }
+    /* crude .npy header skip: read magic+ver (8), header_len (2), header */
+    uint8_t hdr[10];
+    if (fread(hdr, 1, 10, f_in) != 10 || fread(hdr, 1, 10, f_pj) != 10) { fclose(f_in); fclose(f_pj); fprintf(stderr, "FAIL (npy header)\n"); return 1; }
+    fseek(f_in, 0, SEEK_SET); fseek(f_pj, 0, SEEK_SET);
+    fread(hdr, 1, 8, f_in); uint16_t hl_in; fread(&hl_in, 2, 1, f_in); fseek(f_in, 10 + hl_in, SEEK_SET);
+    fread(hdr, 1, 8, f_pj); uint16_t hl_pj; fread(&hl_pj, 2, 1, f_pj); fseek(f_pj, 10 + hl_pj, SEEK_SET);
+
+    const int n_tok = 16, n_in = 64, n_out = 3072;
+    size_t n_inp = (size_t)n_tok * n_in;
+    size_t n_out_elem = (size_t)n_tok * n_out;
+    float *inp = (float *)malloc(n_inp * sizeof(float));
+    float *ref = (float *)malloc(n_out_elem * sizeof(float));
+    float *out_f = (float *)malloc(n_out_elem * sizeof(float));
+    if (fread(inp, sizeof(float), n_inp, f_in) != n_inp ||
+        fread(ref, sizeof(float), n_out_elem, f_pj) != n_out_elem) {
+        fclose(f_in); fclose(f_pj); free(inp); free(ref); free(out_f);
+        fprintf(stderr, "FAIL (ref read)\n"); return 1;
+    }
+    fclose(f_in); fclose(f_pj);
+
+    /* Upload input + bias + weight (img_in is uploaded in cuda_qimg_load_dit, we
+     * re-upload via direct safetensors access to avoid loading the whole DiT) */
+    st_context *st = safetensors_open(dit_path);
+    if (!st) { fprintf(stderr, "SKIP (cannot open %s)\n", dit_path); free(inp); free(ref); free(out_f); return 0; }
+    CUdeviceptr d_w = qimg_st_upload_fp8_raw(st, "img_in.weight");
+    CUdeviceptr d_b = qimg_st_upload_f32(st, "img_in.bias");
+    safetensors_close(st);
+    CUdeviceptr d_x = upload_f32(inp, n_inp);
+    CUdeviceptr d_y = 0; cuMemAlloc(&d_y, n_out_elem * sizeof(float));
+
+    /* Run through op_gemm (respects use_fp8_mma flag) */
+    op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(out_f, d_y, n_out_elem * sizeof(float));
+
+    cuMemFree(d_w); cuMemFree(d_b); cuMemFree(d_x); cuMemFree(d_y);
+
+    /* Stats */
+    double ss_d = 0, ss_r = 0, mean_o = 0, mean_r = 0;
+    double max_abs = 0;
+    for (size_t i = 0; i < n_out_elem; i++) { mean_o += out_f[i]; mean_r += ref[i]; }
+    mean_o /= n_out_elem; mean_r /= n_out_elem;
+    double cov = 0, vo = 0, vr = 0;
+    for (size_t i = 0; i < n_out_elem; i++) {
+        double o = out_f[i] - mean_o, rr = ref[i] - mean_r;
+        cov += o * rr; vo += o * o; vr += rr * rr;
+        double d = out_f[i] - ref[i];
+        ss_d += d * d; ss_r += ref[i] * ref[i];
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+    }
+    double corr = cov / (sqrt(vo * vr) + 1e-30);
+    double rms_diff = sqrt(ss_d / n_out_elem);
+    double rms_ref  = sqrt(ss_r / n_out_elem);
+    free(inp); free(ref); free(out_f);
+
+    int fail = (corr < 0.999);
+    fprintf(stderr, "%s (corr=%.6f rms_diff=%.4f rms_ref=%.4f max_abs=%.4f use_fp8_mma=%d)\n",
+            fail ? "FAIL" : "OK", corr, rms_diff, rms_ref, max_abs, r->use_fp8_mma);
+    return fail;
+}
+
 static int test_kernels(void) {
     fprintf(stderr, "=== Qwen-Image Kernel Unit Tests ===\n");
     cuda_qimg_runner *r = cuda_qimg_init(0, 0);
@@ -292,6 +376,10 @@ static int test_kernels(void) {
     int fail = 0;
     fail += test_kernel_fp8_gemm(r);
     fail += test_kernel_fp8_attn(r);
+    /* The DiT-weight-vs-reference test needs a safetensors path; allow override */
+    const char *ref_dit = getenv("QIMG_TEST_DIT");
+    if (!ref_dit) ref_dit = "/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
+    fail += test_kernel_fp8_proj_vs_ref(r, ref_dit);
     cuda_qimg_free(r);
     if (fail) fprintf(stderr, "=== Kernel Tests: %d FAILED ===\n", fail);
     else      fprintf(stderr, "=== Kernel Tests: all OK ===\n");
