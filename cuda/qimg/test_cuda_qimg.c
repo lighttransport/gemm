@@ -698,6 +698,12 @@ int main(int argc, char **argv) {
          * ComfyUI's Timesteps has internal scale=1000 so t=sigma*1000) */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
+        /* ComfyUI chain: ModelSamplingAdvanced(multiplier=1.0) passes sigma to the
+         * model; internally QwenTimestepProjEmbeddings uses Timesteps(scale=1000)
+         * which multiplies by 1000 before sinusoidal freq. Our qimg_timestep_embed
+         * takes the raw timestep and uses angle=t*freq (no internal scale=1000),
+         * so we must pre-scale by 1000 here. Effective angle = sigma*1000*freq,
+         * identical to Diffusers. */
         qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f, 1000.0f);
 
         /* CONST.noise_scaling: sigma * noise + (1-sigma) * latent_image
@@ -799,6 +805,36 @@ int main(int argc, char **argv) {
 
         free(img_tokens); free(vel_cond); free(vel_uncond);
         free(txt_hidden); free(txt_neg_hidden);
+
+        /* Save pre-Wan21 latent for comparison against ComfyUI reference
+         * (ComfyUI's sample() output is in normalized DiT sampling space, before
+         * VAE's process_latent_out applies std/mean). Save as .npy for direct
+         * numpy load in compare scripts. */
+        {
+            int lat_n = lat_ch * lat_h * lat_w;
+            FILE *lf = fopen("cuda_latent_prenorm.npy", "wb");
+            if (lf) {
+                /* .npy header for shape (1,16,1,lat_h,lat_w) F32 little-endian */
+                char hdr[256];
+                int body = snprintf(hdr, sizeof(hdr),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1, 16, 1, %d, %d), }",
+                    lat_h, lat_w);
+                int total_hdr = 10 + body;
+                int pad = 64 - (total_hdr % 64); if (pad == 64) pad = 0;
+                for (int i = 0; i < pad - 1; i++) hdr[body + i] = ' ';
+                hdr[body + pad - 1] = '\n';
+                int header_len = body + pad;
+                uint8_t magic[10] = {0x93,'N','U','M','P','Y',1,0,
+                                     (uint8_t)(header_len & 0xFF),
+                                     (uint8_t)((header_len >> 8) & 0xFF)};
+                fwrite(magic, 1, 10, lf);
+                fwrite(hdr, 1, header_len, lf);
+                fwrite(latent, sizeof(float), (size_t)lat_n, lf);
+                fclose(lf);
+                fprintf(stderr, "Saved pre-Wan21 latent [1,%d,1,%d,%d] to cuda_latent_prenorm.npy\n",
+                        lat_ch, lat_h, lat_w);
+            }
+        }
 
         /* Wan21 process_latent_out: latent = latent * latents_std + latents_mean
          * The DiT operates in normalized space. Denormalize before VAE decode. */
