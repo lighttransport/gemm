@@ -1320,16 +1320,17 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         if (verbose)
             fprintf(stderr, "cuda_qimg: FP8 LUT GEMM enabled (sm_%d)\n", sm);
     }
-    /* FP8 tensor-core MMA path: opt-in via QIMG_FP8_MMA=1. Requires sm_89+ and
-     * FP8 weight upload (uses raw e4m3 bytes as mma.sync A operand). */
+    /* FP8 tensor-core MMA path. Default ON when available because it matches
+     * ComfyUI's fp8_linear semantics: clamp input to [-448, 448] then quantize
+     * to e4m3 before matmul. The gemm_opt_fp8 (LUT) path keeps input in F32
+     * and therefore drifts from the PyTorch reference. Opt out with
+     * QIMG_FP8_MMA=0 to A/B test against the old LUT path. */
     r->use_fp8_mma = 0;
-    {
+    if (r->gemm_fp8_mma && r->use_fp8_gemm && sm >= 89) {
         const char *env = getenv("QIMG_FP8_MMA");
-        if (env && env[0] != '0' && r->gemm_fp8_mma && r->use_fp8_gemm && sm >= 89) {
-            r->use_fp8_mma = 1;
-            if (verbose)
-                fprintf(stderr, "cuda_qimg: FP8 MMA tensor-core GEMM enabled (sm_%d)\n", sm);
-        }
+        r->use_fp8_mma = (env && env[0] == '0') ? 0 : 1;
+        if (verbose && r->use_fp8_mma)
+            fprintf(stderr, "cuda_qimg: FP8 MMA tensor-core GEMM enabled (sm_%d)\n", sm);
     }
     /* FP8 flash attention: opt-in via QIMG_FP8_ATTN=1. */
     r->use_fp8_attn = 0;
