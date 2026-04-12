@@ -1323,15 +1323,19 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         if (verbose)
             fprintf(stderr, "cuda_qimg: FP8 LUT GEMM enabled (sm_%d)\n", sm);
     }
-    /* FP8 tensor-core MMA path. Default ON when available because it matches
-     * ComfyUI's fp8_linear semantics: clamp input to [-448, 448] then quantize
-     * to e4m3 before matmul. The gemm_opt_fp8 (LUT) path keeps input in F32
-     * and therefore drifts from the PyTorch reference. Opt out with
-     * QIMG_FP8_MMA=0 to A/B test against the old LUT path. */
+    /* FP8 tensor-core MMA path: opt-in via QIMG_FP8_MMA=1.
+     *
+     * NOTE (2026-04): this path currently causes a ~3x velocity inflation in
+     * end-to-end qwen-image generation (see trace_cfg_velocities.py: LUT
+     * v_cond_std=1.11 matches ComfyUI, MMA v_cond_std=3.28). Single-layer unit
+     * tests pass (corr=0.9995 vs PyTorch img_projected, ratio=1.000 vs LUT on
+     * production shapes 3072x3072x256 and 3072x12288x256). The bug is
+     * emergent — it appears only when all block GEMMs are routed through
+     * MMA together. Left as opt-in until the root cause is traced. */
     r->use_fp8_mma = 0;
     if (r->gemm_fp8_mma && r->use_fp8_gemm && sm >= 89) {
         const char *env = getenv("QIMG_FP8_MMA");
-        r->use_fp8_mma = (env && env[0] == '0') ? 0 : 1;
+        r->use_fp8_mma = (env && env[0] != '0' && env[0] != 0) ? 1 : 0;
         if (verbose && r->use_fp8_mma)
             fprintf(stderr, "cuda_qimg: FP8 MMA tensor-core GEMM enabled (sm_%d)\n", sm);
     }

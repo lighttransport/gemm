@@ -369,6 +369,79 @@ static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path
     return fail;
 }
 
+/* Test 4: FP8 MMA vs LUT on production shape 3072x3072 with n_tok=256.
+ * Regression test for the FP8 MMA 3x-output bug found via trace_cfg_velocities.py:
+ * at 256x256 generation, img attn_q GEMM takes (n_tok=256, n_in=3072, n_out=3072)
+ * and the MMA output was 3x larger than the LUT output, breaking the pipeline. */
+static int test_kernel_fp8_gemm_production_shape(cuda_qimg_runner *r, const char *dit_path) {
+    fprintf(stderr, "  [kernel] gemm 3072x3072x256 MMA vs LUT (production shape)... ");
+    if (!r->gemm_fp8_mma || !r->gemm_opt_fp8) {
+        fprintf(stderr, "SKIP\n");
+        return 0;
+    }
+    st_context *st = safetensors_open(dit_path);
+    if (!st) { fprintf(stderr, "SKIP (cannot open %s)\n", dit_path); return 0; }
+    CUdeviceptr d_w = qimg_st_upload_fp8_raw(st, "transformer_blocks.0.attn.to_q.weight");
+    CUdeviceptr d_b = qimg_st_upload_f32(st, "transformer_blocks.0.attn.to_q.bias");
+    safetensors_close(st);
+    if (!d_w) { fprintf(stderr, "SKIP (weight missing)\n"); return 0; }
+
+    const int n_tok = 256, n_in = 3072, n_out = 3072;
+    size_t nX = (size_t)n_tok * n_in;
+    size_t nY = (size_t)n_tok * n_out;
+    float *X = (float *)malloc(nX * sizeof(float));
+    float *Y_mma = (float *)malloc(nY * sizeof(float));
+    float *Y_lut = (float *)malloc(nY * sizeof(float));
+    /* Prefer real pipeline data if the caller has dumped block0 adaln via
+     * --verbose 3, else fall back to random. */
+    FILE *af = fopen("cuda_block0_adaln.bin", "rb");
+    if (af) {
+        size_t got = fread(X, sizeof(float), nX, af);
+        fclose(af);
+        if (got != nX) {
+            rng_state = 99;
+            for (size_t i = 0; i < nX; i++) X[i] = randn() * 0.5f;
+        }
+    } else {
+        rng_state = 99;
+        for (size_t i = 0; i < nX; i++) X[i] = randn() * 0.5f;
+    }
+    CUdeviceptr d_x = upload_f32(X, nX);
+    CUdeviceptr d_y = 0; cuMemAlloc(&d_y, nY * sizeof(float));
+
+    int saved_mma = r->use_fp8_mma;
+    r->use_fp8_mma = 1;
+    op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(Y_mma, d_y, nY * sizeof(float));
+
+    r->use_fp8_mma = 0;
+    op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(Y_lut, d_y, nY * sizeof(float));
+    r->use_fp8_mma = saved_mma;
+
+    cuMemFree(d_w); cuMemFree(d_b); cuMemFree(d_x); cuMemFree(d_y);
+
+    double ss_d = 0, ss_lut = 0, ss_mma = 0;
+    for (size_t i = 0; i < nY; i++) {
+        double d = (double)Y_mma[i] - (double)Y_lut[i];
+        ss_d   += d * d;
+        ss_lut += (double)Y_lut[i] * Y_lut[i];
+        ss_mma += (double)Y_mma[i] * Y_mma[i];
+    }
+    double rms_lut = sqrt(ss_lut / nY);
+    double rms_mma = sqrt(ss_mma / nY);
+    double rms_d   = sqrt(ss_d   / nY);
+    double ratio = rms_mma / (rms_lut + 1e-30);
+    free(X); free(Y_mma); free(Y_lut);
+
+    int fail = (ratio > 1.5 || ratio < 0.67 || rms_d > 0.3 * rms_lut);
+    fprintf(stderr, "%s (rms_mma=%.4f rms_lut=%.4f ratio=%.3f rms_d=%.4f)\n",
+            fail ? "FAIL" : "OK", rms_mma, rms_lut, ratio, rms_d);
+    return fail;
+}
+
 static int test_kernels(void) {
     fprintf(stderr, "=== Qwen-Image Kernel Unit Tests ===\n");
     cuda_qimg_runner *r = cuda_qimg_init(0, 0);
@@ -380,6 +453,7 @@ static int test_kernels(void) {
     const char *ref_dit = getenv("QIMG_TEST_DIT");
     if (!ref_dit) ref_dit = "/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
     fail += test_kernel_fp8_proj_vs_ref(r, ref_dit);
+    fail += test_kernel_fp8_gemm_production_shape(r, ref_dit);
     cuda_qimg_free(r);
     if (fail) fprintf(stderr, "=== Kernel Tests: %d FAILED ===\n", fail);
     else      fprintf(stderr, "=== Kernel Tests: all OK ===\n");
