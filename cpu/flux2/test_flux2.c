@@ -141,25 +141,18 @@ static int load_npy_f32(const char *path, float *buf, size_t max_elems) {
 /* ---- Flux.2 Klein scheduler parameters ----
  * Distilled: shift=1.0 (nearly linear), 4 steps
  * Base: shift adaptive or 3.5, 20+ steps */
+/* Flux.2 Klein uses Flux-style time shift mu=2.02 → AuraFlow alpha=exp(2.02)≈7.539 */
+#define FLUX2_KLEIN_SHIFT_MU 2.02f
+
 static void flux2_sched_init_distilled(qimg_scheduler *s, int n_steps) {
-    /* For distilled model: shift=1.0 (no shift), 4 steps, sigma in [1.0, 0.0] */
     qimg_sched_init(s);
-    /* Override params for Flux.2 Klein */
-    s->base_shift = 0.5f;
-    s->max_shift  = 1.15f;
-    s->base_image_seq_len = 256;
-    s->max_image_seq_len  = 4096;
-    qimg_sched_set_timesteps_comfyui(s, n_steps, 1.0f /* shift */, 1.0f /* multiplier */);
+    qimg_sched_set_timesteps_comfyui(s, n_steps, expf(FLUX2_KLEIN_SHIFT_MU), 1.0f);
 }
 
 static void flux2_sched_init_base(qimg_scheduler *s, int n_steps, int n_img_tokens) {
-    /* For base model: dynamic shift based on sequence length */
+    (void)n_img_tokens;
     qimg_sched_init(s);
-    s->base_shift = 0.5f;
-    s->max_shift  = 1.15f;
-    s->base_image_seq_len = 256;
-    s->max_image_seq_len  = 4096;
-    qimg_sched_set_timesteps(s, n_steps, n_img_tokens);
+    qimg_sched_set_timesteps_comfyui(s, n_steps, expf(FLUX2_KLEIN_SHIFT_MU), 1.0f);
 }
 
 /* ---- Test modes ---- */
@@ -231,7 +224,17 @@ static int test_vae(const char *vae_path, int lat_h, int lat_w, uint64_t seed, i
     return 0;
 }
 
-static int test_dit(const char *dit_path, int lat_h, int lat_w, int n_threads) {
+/* Dump callback for --dump-block: saves each intermediate as .npy */
+static void flux2_dit_dump_cb(const char *name, const float *data, int n, void *ctx) {
+    (void)ctx;
+    char path[256];
+    snprintf(path, sizeof(path), "flux2_%s.npy", name);
+    int sh[] = {n};
+    save_npy_f32(path, data, 1, sh);
+    fprintf(stderr, "  dump: %s (%d floats)\n", path, n);
+}
+
+static int test_dit(const char *dit_path, int lat_h, int lat_w, int n_threads, int dump_block) {
     fprintf(stderr, "\n=== Flux.2 Klein DiT Single-Step Test ===\n");
 
     flux2_dit_model *dit = flux2_dit_load_safetensors(dit_path);
@@ -255,6 +258,20 @@ static int test_dit(const char *dit_path, int lat_h, int lat_w, int n_threads) {
     for (int i = 0; i < n_txt * txt_dim; i++) txt_tok[i] = randn() * 0.1f;
 
     float timestep = 750.0f;
+
+    /* Set up dump if requested */
+    if (dump_block >= 0) {
+        int n_dbl = dit->n_double_blocks;
+        if (dump_block < n_dbl) {
+            dit->dump_dblk = dump_block;
+            fprintf(stderr, "Dumping double-block %d intermediates\n", dump_block);
+        } else {
+            dit->dump_sblk = dump_block - n_dbl;
+            fprintf(stderr, "Dumping single-block %d intermediates\n", dump_block - n_dbl);
+        }
+        dit->dump_fn = flux2_dit_dump_cb;
+        dit->dump_ctx = NULL;
+    }
 
     fprintf(stderr, "Running DiT forward (t=%.0f)...\n", timestep);
     struct timespec t0, t1;
@@ -409,6 +426,22 @@ static int run_generate(const char *dit_path, const char *vae_path,
     }
 
     /* txt_dim is enc->n_embd; DiT will read it from context_embedder weight */
+
+    /* Front-pad text to 512 tokens with zeros (matches ComfyUI Flux2.extra_conds) */
+    {
+        const int FLUX2_KLEIN_TXT_LEN = 512;
+        const int txt_dim_pad = 7680;
+        if (n_txt < FLUX2_KLEIN_TXT_LEN) {
+            float *padded = (float *)calloc((size_t)FLUX2_KLEIN_TXT_LEN * txt_dim_pad, sizeof(float));
+            int pad_front = FLUX2_KLEIN_TXT_LEN - n_txt;
+            memcpy(padded + (size_t)pad_front * txt_dim_pad, txt_hidden,
+                   (size_t)n_txt * txt_dim_pad * sizeof(float));
+            free(txt_hidden);
+            txt_hidden = padded;
+            n_txt = FLUX2_KLEIN_TXT_LEN;
+            fprintf(stderr, "Front-padded text to %d tokens\n", n_txt);
+        }
+    }
 
     /* Step 2: Load DiT */
     fprintf(stderr, "\n[2/4] Loading DiT...\n");
@@ -568,6 +601,7 @@ int main(int argc, char **argv) {
     int is_distilled = 1;
     float cfg_scale = 1.0f;
     uint64_t seed = 42;
+    int dump_block = -1;  /* --dump-block N: dump intermediates for block N */
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--test-sched") == 0) mode = "sched";
@@ -590,6 +624,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) n_threads  = atoi(argv[++i]);
         else if (strcmp(argv[i], "--latent-npy") == 0 && i+1 < argc) { latent_npy = argv[++i]; (void)latent_npy; }
         else if (strcmp(argv[i], "--hidden-npy") == 0 && i+1 < argc) hidden_npy = argv[++i];
+        else if (strcmp(argv[i], "--dump-block") == 0 && i+1 < argc) dump_block = atoi(argv[++i]);
         /* Positional: DIT VAE ENC (legacy compat) */
         else if (argv[i][0] != '-' && !dit_path[0]) dit_path = argv[i];
         else if (argv[i][0] != '-' && !vae_path[0]) vae_path = argv[i];
@@ -611,7 +646,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "sched") == 0) return test_scheduler();
     if (strcmp(mode, "vae")   == 0) return test_vae(vae_path, out_h/8, out_w/8, seed, n_threads);
-    if (strcmp(mode, "dit")   == 0) return test_dit(dit_path, out_h/16, out_w/16, n_threads);
+    if (strcmp(mode, "dit")   == 0) return test_dit(dit_path, out_h/16, out_w/16, n_threads, dump_block);
     if (strcmp(mode, "enc")   == 0) return test_encoder(enc_path, tok_path, prompt);
     if (strcmp(mode, "gen")   == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, hidden_npy,

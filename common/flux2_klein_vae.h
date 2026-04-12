@@ -77,8 +77,8 @@ typedef struct {
     flux2_vae_resblock mid_res1;
 
     /* up_blocks[4]: index 0 = closest to mid (highest ch) */
-    /* Each has layers_per_block=2 resblocks + optional upsample */
-    flux2_vae_resblock up_res[4][2];   /* [block][layer] */
+    /* Each has layers_per_block+1=3 resblocks + optional upsample */
+    flux2_vae_resblock up_res[4][3];   /* [block][layer] */
     flux2_vae_upsample up_sample[4];   /* non-NULL if block has upsample */
     int up_has_sample[4];
     int up_in_ch[4];                   /* input channels for each block */
@@ -581,13 +581,15 @@ flux2_vae_model *flux2_vae_load(const char *path) {
         m->up_in_ch[bi]  = blk_in;
         m->up_out_ch[bi] = blk_out;
 
-        /* Load resnets.0 and resnets.1 */
+        /* Load resnets.0, resnets.1, resnets.2 (layers_per_block+1 = 3) */
         snprintf(key, sizeof(key), "decoder.up_blocks.%d.resnets.0", bi);
         flux2_vae_load_resblock(&m->up_res[bi][0], st, key, blk_in, blk_out);
 
-        /* resnets.1: input = blk_out (output of resnets.0) */
         snprintf(key, sizeof(key), "decoder.up_blocks.%d.resnets.1", bi);
         flux2_vae_load_resblock(&m->up_res[bi][1], st, key, blk_out, blk_out);
+
+        snprintf(key, sizeof(key), "decoder.up_blocks.%d.resnets.2", bi);
+        flux2_vae_load_resblock(&m->up_res[bi][2], st, key, blk_out, blk_out);
 
         /* Upsample: check for upsamplers.0.conv.weight */
         snprintf(key, sizeof(key), "decoder.up_blocks.%d.upsamplers.0.conv.weight", bi);
@@ -643,7 +645,7 @@ void flux2_vae_free(flux2_vae_model *m) {
     free(m->mid_attn.out_w); free(m->mid_attn.out_b);
     /* up_blocks */
     for (int bi = 0; bi < 4; bi++) {
-        FREE_RB(m->up_res[bi][0]); FREE_RB(m->up_res[bi][1]);
+        FREE_RB(m->up_res[bi][0]); FREE_RB(m->up_res[bi][1]); FREE_RB(m->up_res[bi][2]);
         free(m->up_sample[bi].conv_w); free(m->up_sample[bi].conv_b);
     }
 #undef FREE_RB
@@ -665,35 +667,13 @@ void flux2_vae_decode(float *rgb_out, const float *latent,
     int lc = m->latent_channels;
     int ng = m->num_groups;
     int h = lat_h, w = lat_w;
-    int ps = 2; /* patch_size used by patchify/unpatchify */
-
-    /* Stage 0: Batch-norm de-normalization in patchified latent space.
-     * The pipeline applies: latent_p[c] = latent_p[c] * bn_std[c] + bn_mean[c]
-     * where latent_p is the patchified form [lc*ps*ps, H_p, W_p].
-     * In the unpatchified form [lc, lat_h, lat_w], this is equivalent to a
-     * per-(ch, pr, pc) scale+shift where bn_ch = ch*ps*ps + pr*ps + pc. */
+    /* NOTE: The BN stats (bn.running_mean/var) in the safetensors are training
+     * artifacts and should NOT be applied during inference. The DiT outputs
+     * latents already in the correct space for the VAE decoder. Applying the
+     * BN denormalization (latent * sqrt(var) + mean) over-saturates the image
+     * and introduces visible artifacts. Verified against diffusers VAE. */
     float *latent_bn = (float *)malloc((size_t)lc * lat_h * lat_w * sizeof(float));
-    if (m->bn_mean && m->bn_var) {
-        int lat_h_p = lat_h / ps, lat_w_p = lat_w / ps;
-        for (int ch = 0; ch < lc; ch++) {
-            for (int pr = 0; pr < ps; pr++) {
-                for (int pc = 0; pc < ps; pc++) {
-                    int bn_ch = ch * (ps * ps) + pr * ps + pc;
-                    float mn = m->bn_mean[bn_ch];
-                    float sd = sqrtf(m->bn_var[bn_ch] + m->bn_eps);
-                    for (int hp = 0; hp < lat_h_p; hp++) {
-                        for (int wp = 0; wp < lat_w_p; wp++) {
-                            int sh = hp * ps + pr, sw = wp * ps + pc;
-                            size_t idx = (size_t)ch * lat_h * lat_w + (size_t)sh * lat_w + sw;
-                            latent_bn[idx] = latent[idx] * sd + mn;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        memcpy(latent_bn, latent, (size_t)lc * lat_h * lat_w * sizeof(float));
-    }
+    memcpy(latent_bn, latent, (size_t)lc * lat_h * lat_w * sizeof(float));
     latent = latent_bn;
 
     /* Stage 1: post_quant_conv (1×1) */
@@ -742,6 +722,13 @@ void flux2_vae_decode(float *rgb_out, const float *latent,
             int new_c = m->up_res[bi][1].c_out;
             float *tmp = (float *)malloc((size_t)new_c * h * w * sizeof(float));
             flux2_vae_resblock_forward(tmp, x, &m->up_res[bi][1], h, w, ng);
+            free(x); x = tmp; c = new_c;
+        }
+        /* resnets.2 */
+        {
+            int new_c = m->up_res[bi][2].c_out;
+            float *tmp = (float *)malloc((size_t)new_c * h * w * sizeof(float));
+            flux2_vae_resblock_forward(tmp, x, &m->up_res[bi][2], h, w, ng);
             free(x); x = tmp; c = new_c;
         }
         /* Upsample */

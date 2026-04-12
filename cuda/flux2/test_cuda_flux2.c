@@ -72,6 +72,38 @@ static float randn(void) {
     return (float)(rv * cos(theta));
 }
 
+static void save_npy_f32(const char *path, const float *data, int ndims, const int *shape) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+    char shape_str[256] = "(";
+    for (int d = 0; d < ndims; d++) {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%d%s", shape[d], d < ndims-1 ? ", " : "");
+        strcat(shape_str, tmp);
+    }
+    if (ndims == 1) strcat(shape_str, ",");
+    strcat(shape_str, ")");
+    char dict[512];
+    int dlen = snprintf(dict, sizeof(dict),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': %s, }", shape_str);
+    int total_hdr = 10 + dlen + 1;
+    int pad = 64 - (total_hdr % 64);
+    if (pad == 64) pad = 0;
+    int hdr_data_len = dlen + pad + 1;
+    uint8_t magic[10] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0, 0, 0};
+    magic[8] = (uint8_t)(hdr_data_len & 0xFF);
+    magic[9] = (uint8_t)((hdr_data_len >> 8) & 0xFF);
+    fwrite(magic, 1, 10, f);
+    fwrite(dict, 1, (size_t)dlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    size_t n = 1;
+    for (int d = 0; d < ndims; d++) n *= (size_t)shape[d];
+    fwrite(data, sizeof(float), n, f);
+    fclose(f);
+    fprintf(stderr, "Saved %s\n", path);
+}
+
 static void save_ppm(const char *path, const float *rgb, int h, int w) {
     FILE *fp = fopen(path, "wb");
     if (!fp) return;
@@ -122,18 +154,22 @@ static void flux2_unpatchify(float *latent, const float *tok,
 
 /* ---- Flux.2 Klein scheduler helpers ---- */
 
+/* Flux.2 Klein uses Flux-style time shift with mu=2.02 (from ComfyUI's
+ * ModelSamplingFlux). The Flux shift formula is:
+ *   sigma(t) = exp(mu)*t / (1 + (exp(mu)-1)*t)
+ * which equals the AuraFlow shift `alpha*t/(1+(alpha-1)*t)` when alpha=exp(mu).
+ * So we pass alpha=exp(2.02)≈7.539 to qimg_sched_set_timesteps_comfyui. */
+#define FLUX2_KLEIN_SHIFT_MU 2.02f
+
 static void flux2_sched_distilled(qimg_scheduler *s, int n_steps) {
     qimg_sched_init(s);
-    s->base_shift = 0.5f; s->max_shift = 1.15f;
-    s->base_image_seq_len = 256; s->max_image_seq_len = 4096;
-    qimg_sched_set_timesteps_comfyui(s, n_steps, 1.0f, 1.0f);
+    qimg_sched_set_timesteps_comfyui(s, n_steps, expf(FLUX2_KLEIN_SHIFT_MU), 1.0f);
 }
 
 static void flux2_sched_base(qimg_scheduler *s, int n_steps, int n_img) {
+    (void)n_img;
     qimg_sched_init(s);
-    s->base_shift = 0.5f; s->max_shift = 1.15f;
-    s->base_image_seq_len = 256; s->max_image_seq_len = 4096;
-    qimg_sched_set_timesteps(s, n_steps, n_img);
+    qimg_sched_set_timesteps_comfyui(s, n_steps, expf(FLUX2_KLEIN_SHIFT_MU), 1.0f);
 }
 
 /* ---- Test modes ---- */
@@ -261,6 +297,9 @@ static int test_vae(const char *vae_path, int lat_h, int lat_w) {
     rng_state = 12345;
     for (size_t i = 0; i < lat_sz; i++) latent[i] = randn() * 0.5f;
 
+    /* Save latent for external comparison */
+    { int sh[] = {lc, lat_h, lat_w}; save_npy_f32("cuda_flux2_vae_latent.npy", latent, 3, sh); }
+
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     if (cuda_flux2_vae_decode(r, latent, lat_h, lat_w, rgb) != 0) {
@@ -276,6 +315,7 @@ static int test_vae(const char *vae_path, int lat_h, int lat_w) {
         if (rgb[i] > mx) mx = rgb[i];
     }
     fprintf(stderr, "GPU rgb: min=%.4f max=%.4f\n", mn, mx);
+    { int sh[] = {3, out_h, out_w}; save_npy_f32("cuda_flux2_vae_rgb.npy", rgb, 3, sh); }
 
     flux2_vae_decode(cpu_rgb, latent, lat_h, lat_w, r->vae);
     float max_diff = 0.0f, sum_diff = 0.0f;
@@ -477,8 +517,25 @@ static int run_generate_once(cuda_flux2_runner *r,
 
         float *vel_lat = (float *)calloc(lat_sz, sizeof(float));
         flux2_unpatchify(vel_lat, vel_out, lc, lat_h, lat_w, ps);
+
+        /* Save raw velocity for comparison */
+        {
+            char path[64];
+            snprintf(path, sizeof(path), "cuda_flux2_vel%d.npy", step);
+            int sh3[] = {(int)lc, lat_h, lat_w};
+            save_npy_f32(path, vel_lat, 3, sh3);
+        }
+
         qimg_sched_step(latent, vel_lat, (int)lat_sz, step, &sched);
         free(vel_lat);
+
+        /* Save per-step latent for comparison */
+        {
+            char path[64];
+            snprintf(path, sizeof(path), "cuda_flux2_step%d.npy", step);
+            int sh3[] = {(int)lc, lat_h, lat_w};
+            save_npy_f32(path, latent, 3, sh3);
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &ts1);
         double sdt = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_nsec-ts0.tv_nsec)*1e-9;
@@ -489,6 +546,16 @@ static int run_generate_once(cuda_flux2_runner *r,
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
     free(img_tok); free(vel_out);
+
+    /* Save final latent and text hidden states for comparison */
+    {
+        int sh3[] = {(int)lc, lat_h, lat_w};
+        save_npy_f32("cuda_flux2_latent_final.npy", latent, 3, sh3);
+    }
+    if (txt_hidden) {
+        int sh2[] = {n_txt, (int)r->txt_dim};
+        save_npy_f32("cuda_flux2_text_hidden.npy", txt_hidden, 2, sh2);
+    }
 
     /* VAE decode */
     fprintf(stderr, "\n[3/3] VAE decoding...\n");
@@ -542,12 +609,24 @@ static int run_generate(const char *dit_path, const char *vae_path,
 
     int n_txt = 0;
     int enc_embd = enc->n_embd;
-    float *txt_hidden = flux2_text_enc_encode(enc, prompt, &n_txt);
+    float *txt_hidden_raw = flux2_text_enc_encode(enc, prompt, &n_txt);
     flux2_text_enc_free(enc);
-    if (!txt_hidden) return 1;
+    if (!txt_hidden_raw) return 1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    fprintf(stderr, "Shared text enc: %.1f s (%d tokens × %d)\n",
+    fprintf(stderr, "Shared text enc: %.1f s (%d real tokens × %d)\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_txt, enc_embd);
+
+    /* Front-pad text to 512 tokens with zeros (matches ComfyUI Flux2.extra_conds) */
+    const int FLUX2_KLEIN_TXT_LEN = 512;
+    float *txt_hidden = (float *)calloc((size_t)FLUX2_KLEIN_TXT_LEN * enc_embd, sizeof(float));
+    int pad_front = FLUX2_KLEIN_TXT_LEN - n_txt;
+    if (pad_front < 0) pad_front = 0;
+    int real_txt = (n_txt < FLUX2_KLEIN_TXT_LEN) ? n_txt : FLUX2_KLEIN_TXT_LEN;
+    memcpy(txt_hidden + (size_t)pad_front * enc_embd, txt_hidden_raw,
+           (size_t)real_txt * enc_embd * sizeof(float));
+    free(txt_hidden_raw);
+    n_txt = FLUX2_KLEIN_TXT_LEN;
+    fprintf(stderr, "Padded text to %d tokens (front-pad zeros)\n", n_txt);
 
     fprintf(stderr, "\n[setup] Init CUDA + load DiT + VAE...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
