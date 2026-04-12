@@ -81,6 +81,223 @@ static void save_ppm(const char *path, const float *rgb, int h, int w) {
     fprintf(stderr, "Saved %s (%dx%d)\n", path, w, h);
 }
 
+/* ---------------- Kernel unit tests (QIMG_FP8 paths) ---------------- */
+
+/* Local FP8 e4m3 decode (matches cuda_qimg_runner.h). */
+static float test_fp8_e4m3_to_f32(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp  = (b >> 3) & 0xF;
+    uint32_t mant = b & 0x7;
+    if (exp == 0 && mant == 0) return sign ? -0.0f : 0.0f;
+    float f;
+    if (exp == 0)                   f = ldexpf((float)mant / 8.0f, -6);
+    else if (exp == 15 && mant == 7) return 0.0f;  /* NaN → 0 */
+    else                             f = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
+    return sign ? -f : f;
+}
+
+static CUdeviceptr upload_f32(const float *h, size_t n) {
+    CUdeviceptr d = 0;
+    cuMemAlloc(&d, n * sizeof(float));
+    cuMemcpyHtoD(d, h, n * sizeof(float));
+    return d;
+}
+
+static CUdeviceptr upload_fp8_bytes(const uint8_t *h, size_t n) {
+    CUdeviceptr d = 0;
+    cuMemAlloc(&d, n);
+    cuMemcpyHtoD(d, h, n);
+    return d;
+}
+
+/* Test 1: FP8 MMA GEMM vs FP8 LUT GEMM (gemm_opt_fp8).
+ * Both consume the same raw e4m3 weight bytes; MMA quantizes X to e4m3 on the fly
+ * while gemm_opt_fp8 keeps X in F32. Tolerance is loose (FP8 drift). */
+static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] gemm_fp8_scaled_f32 (MMA) vs gemm_opt_fp8 (LUT)... ");
+    if (!r->gemm_fp8_mma || !r->gemm_opt_fp8) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+    const int n_out = 256, n_in = 128, n_tok = 64;
+    size_t nW = (size_t)n_out * n_in;
+    size_t nX = (size_t)n_tok * n_in;
+    size_t nY = (size_t)n_tok * n_out;
+    uint8_t *W = (uint8_t *)malloc(nW);
+    float *X = (float *)malloc(nX * sizeof(float));
+    float *Y_mma = (float *)malloc(nY * sizeof(float));
+    float *Y_lut = (float *)malloc(nY * sizeof(float));
+    /* Generate small-magnitude random weights via round-to-e4m3 to avoid NaN
+     * (byte 0x7F / 0xFF) and saturating values that overflow the accumulator. */
+    rng_state = 12345;
+    for (size_t i = 0; i < nW; i++) {
+        /* Sample small F32, quantize to e4m3 via linear scan of the LUT */
+        float v = randn() * 0.05f;
+        float best = 1e30f; uint8_t bb = 0;
+        for (int b = 0; b < 256; b++) {
+            if (b == 0x7F || b == 0xFF) continue;  /* skip NaN */
+            float fv = test_fp8_e4m3_to_f32((uint8_t)b);
+            float d = fabsf(fv - v);
+            if (d < best) { best = d; bb = (uint8_t)b; }
+        }
+        W[i] = bb;
+    }
+    for (size_t i = 0; i < nX; i++) X[i] = randn() * 0.5f;
+
+    CUdeviceptr d_W = upload_fp8_bytes(W, nW);
+    CUdeviceptr d_X = upload_f32(X, nX);
+    CUdeviceptr d_Y = 0; cuMemAlloc(&d_Y, nY * sizeof(float));
+    CUdeviceptr bias = 0;
+
+    /* MMA path */
+    {
+        float w_scale = 1.0f;
+        int no = n_out, ni = n_in, nt = n_tok;
+        void *args[] = {&d_Y, &d_W, &d_X, &bias, &no, &ni, &nt, &w_scale};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok +  31) /  32);
+        size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);
+        cuLaunchKernel(r->gemm_fp8_mma, gx, gy, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(Y_mma, d_Y, nY * sizeof(float));
+    }
+    /* LUT path */
+    {
+        int no = n_out, ni = n_in, nt = n_tok;
+        void *args[] = {&d_Y, &d_W, &d_X, &bias, &no, &ni, &nt};
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        cuLaunchKernel(r->gemm_opt_fp8, gx, gy, 1, 256, 1, 1,
+                       0, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(Y_lut, d_Y, nY * sizeof(float));
+    }
+    cuMemFree(d_W); cuMemFree(d_X); cuMemFree(d_Y);
+
+    /* Statistics: both paths quantize W the same way, so the main diff is
+     * X quantization (MMA path rounds X to e4m3, LUT path keeps F32). */
+    double ss = 0, sref = 0, max_abs = 0;
+    for (size_t i = 0; i < nY; i++) {
+        double d = (double)Y_mma[i] - (double)Y_lut[i];
+        ss += d * d; sref += (double)Y_lut[i] * Y_lut[i];
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+    }
+    double rms_ref = sqrt(sref / nY);
+    double rms_err = sqrt(ss / nY);
+    free(W); free(X); free(Y_mma); free(Y_lut);
+    /* Tolerance: FP8 input quantization adds ~5% noise relative to baseline */
+    if (rms_err > 0.15 * rms_ref) {
+        fprintf(stderr, "FAIL (rms_err=%.4g rms_ref=%.4g max_abs=%.4g)\n", rms_err, rms_ref, max_abs);
+        return 1;
+    }
+    fprintf(stderr, "OK (rms_err=%.4g rms_ref=%.4g max_abs=%.4g)\n", rms_err, rms_ref, max_abs);
+    return 0;
+}
+
+/* Test 2: flash_attn_fp8 MMA vs flash_attn_fp8_ref scalar.
+ * Both consume identical FP8-quantized Q/K/V; only the numerical order of the
+ * mma reductions differs. max_diff should be small (< 0.1). */
+static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_fp8 MMA vs scalar ref... ");
+    if (!r->flash_attn_fp8 || !r->quantize_fp8 || !r->reduce_max_abs) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+    /* Also need the scalar reference */
+    CUfunction fn_ref = NULL;
+    cuModuleGetFunction(&fn_ref, r->module, "flash_attn_fp8_ref");
+    if (!fn_ref) { fprintf(stderr, "SKIP (flash_attn_fp8_ref not loaded)\n"); return 0; }
+
+    const int n_tok = 48;
+    const int n_heads = 4;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_mma = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    rng_state = 999;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.7f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_out = 0; cuMemAlloc(&d_out, n_elems * sizeof(float));
+
+    /* Quantize Q/K/V (uses the runner's workspace via ensure_fp8_attn_buf) */
+    ensure_fp8_attn_buf(r, n_elems);
+    CUdeviceptr s_q = r->d_qkv_scales + 0 * sizeof(float);
+    CUdeviceptr s_k = r->d_qkv_scales + 1 * sizeof(float);
+    CUdeviceptr s_v = r->d_qkv_scales + 2 * sizeof(float);
+    int n_int = (int)n_elems;
+    quantize_buf_fp8(r, r->d_q_fp8, s_q, d_Q, n_int);
+    quantize_buf_fp8(r, r->d_k_fp8, s_k, d_K, n_int);
+    quantize_buf_fp8(r, r->d_v_fp8, s_v, d_V, n_int);
+    float scales[3];
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(scales, r->d_qkv_scales, 3 * sizeof(float));
+
+    int nt = n_tok, nh = n_heads, hd = head_dim;
+    /* MMA path */
+    {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        size_t smem = (size_t)(32 * 128 + 128 * 32 + 4 * 16 * 32 * sizeof(float));
+        void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
+                        &nt, &nh, &hd,
+                        &scales[0], &scales[1], &scales[2]};
+        cuLaunchKernel(r->flash_attn_fp8, (unsigned)nh, gy, 1,
+                       128, 1, 1, smem, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(out_mma, d_out, n_elems * sizeof(float));
+    }
+    /* Scalar ref path: grid=(n_heads, ceil(n_tok/32)), block=32 */
+    {
+        void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
+                        &nt, &nh, &hd,
+                        &scales[0], &scales[1], &scales[2]};
+        unsigned gy = (unsigned)((n_tok + 31) / 32);
+        cuLaunchKernel(fn_ref, (unsigned)nh, gy, 1,
+                       32, 1, 1, 0, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(out_ref, d_out, n_elems * sizeof(float));
+    }
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V); cuMemFree(d_out);
+
+    float max_diff = 0.0f, mean_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_mma[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+    }
+    mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_mma); free(out_ref);
+    if (max_diff > 0.15f) {
+        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+        return 1;
+    }
+    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+    return 0;
+}
+
+static int test_kernels(void) {
+    fprintf(stderr, "=== Qwen-Image Kernel Unit Tests ===\n");
+    cuda_qimg_runner *r = cuda_qimg_init(0, 0);
+    if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    int fail = 0;
+    fail += test_kernel_fp8_gemm(r);
+    fail += test_kernel_fp8_attn(r);
+    cuda_qimg_free(r);
+    if (fail) fprintf(stderr, "=== Kernel Tests: %d FAILED ===\n", fail);
+    else      fprintf(stderr, "=== Kernel Tests: all OK ===\n");
+    return fail;
+}
+
 int main(int argc, char **argv) {
     const char *dit_path = "/mnt/nvme02/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
     const char *vae_path = "/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors";
@@ -96,6 +313,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--test-init") == 0) mode = "init";
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
+        else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
         else if (strcmp(argv[i], "--test-vae") == 0) mode = "vae";
         else if (strcmp(argv[i], "--generate") == 0) mode = "gen";
         else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
@@ -113,8 +331,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (uint64_t)atoll(argv[++i]);
     }
 
+    if (mode && strcmp(mode, "kernels") == 0) return test_kernels();
+
     if (!mode) {
-        fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--generate\n"
+        fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--test-kernels|--generate\n"
                 "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
                 "  --height <h>  --width <w>  --steps <n>  --seed <s>  --no-fp8\n", argv[0]);
         return 1;
