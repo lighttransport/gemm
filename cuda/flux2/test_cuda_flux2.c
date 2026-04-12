@@ -183,6 +183,204 @@ static int test_init(void) {
     return 0;
 }
 
+/* ---- Kernel unit tests ----
+ * Micro-tests for the new MMA kernels. No model weights required — only the
+ * NVRTC module needs to compile cleanly, so this runs quickly. */
+
+/* Test 1: f32_to_bf16_bulk (AVX2 path vs scalar fallback).
+ * Pure host-side — checks the AVX2 and scalar branches agree bit-for-bit. */
+static int test_kernel_f32_to_bf16_bulk(void) {
+    fprintf(stderr, "  [kernel] f32_to_bf16_bulk round-trip... ");
+    const int N = 1003;  /* intentionally not a multiple of 8 */
+    float *src = (float *)malloc((size_t)N * sizeof(float));
+    uint16_t *out = (uint16_t *)malloc((size_t)N * sizeof(uint16_t));
+    uint16_t *ref = (uint16_t *)malloc((size_t)N * sizeof(uint16_t));
+    if (!src || !out || !ref) { free(src); free(out); free(ref); return 1; }
+    rng_state = 123456;
+    for (int i = 0; i < N; i++) src[i] = randn() * 3.0f;
+    f32_to_bf16_bulk(out, src, N);
+    /* scalar reference */
+    for (int i = 0; i < N; i++) {
+        unsigned int b;
+        memcpy(&b, &src[i], 4);
+        unsigned int r = 0x7FFFu + ((b >> 16) & 1u);
+        ref[i] = (uint16_t)((b + r) >> 16);
+    }
+    int mismatches = 0;
+    for (int i = 0; i < N; i++) if (out[i] != ref[i]) mismatches++;
+    free(src); free(out); free(ref);
+    if (mismatches) {
+        fprintf(stderr, "FAIL (%d/%d mismatches)\n", mismatches, N);
+        return 1;
+    }
+    fprintf(stderr, "OK (%d elements)\n", N);
+    return 0;
+}
+
+/* Test 2: gemm_bf16_f32 vs CPU F32 reference.
+ * Tolerates BF16 rounding (~1/256 relative). */
+static int test_kernel_gemm_bf16(cuda_flux2_runner *r) {
+    fprintf(stderr, "  [kernel] gemm_bf16_f32 vs CPU F32 ref... ");
+    if (!r->fn_gemm_bf16) {
+        fprintf(stderr, "SKIP (kernel not loaded)\n");
+        return 0;
+    }
+    /* Small dims that exercise M/N/K padding without blowing up alloc */
+    const int M = 48, K = 80, N = 72;
+    size_t n_w = (size_t)N * K, n_x = (size_t)M * K, n_y = (size_t)M * N;
+
+    float *W = (float *)malloc(n_w * sizeof(float));
+    float *X = (float *)malloc(n_x * sizeof(float));
+    float *Y_gpu = (float *)malloc(n_y * sizeof(float));
+    float *Y_cpu = (float *)malloc(n_y * sizeof(float));
+    uint16_t *W_bf = (uint16_t *)malloc(n_w * sizeof(uint16_t));
+    if (!W || !X || !Y_gpu || !Y_cpu || !W_bf) {
+        free(W); free(X); free(Y_gpu); free(Y_cpu); free(W_bf); return 1;
+    }
+    rng_state = 7654321;
+    for (size_t i = 0; i < n_w; i++) W[i] = randn() * 0.1f;
+    for (size_t i = 0; i < n_x; i++) X[i] = randn() * 0.3f;
+    f32_to_bf16_bulk(W_bf, W, (int)n_w);
+
+    /* CPU F32 ref (using BF16-rounded W to match what the kernel sees) */
+    float *W_deq = (float *)malloc(n_w * sizeof(float));
+    for (size_t i = 0; i < n_w; i++) {
+        unsigned int b = ((unsigned int)W_bf[i]) << 16;
+        memcpy(&W_deq[i], &b, 4);
+    }
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float s = 0.0f;
+            for (int k = 0; k < K; k++) s += X[(size_t)m * K + k] * W_deq[(size_t)n * K + k];
+            Y_cpu[(size_t)m * N + n] = s;
+        }
+    }
+    free(W_deq);
+
+    /* Upload, launch, download */
+    CUdeviceptr d_W = gpu_upload_bytes(W_bf, n_w * sizeof(uint16_t));
+    CUdeviceptr d_X = gpu_upload_f32(X, (int)n_x);
+    CUdeviceptr d_Y;
+    cuMemAlloc(&d_Y, n_y * sizeof(float));
+    op_gemm_bf16(r, d_Y, d_W, d_X, 0, N, K, M);
+    cuCtxSynchronize();
+    cuMemcpyDtoH(Y_gpu, d_Y, n_y * sizeof(float));
+    cuMemFree(d_W); cuMemFree(d_X); cuMemFree(d_Y);
+
+    /* Compare: BF16 has ~1/256 relative precision. For near-zero reference
+     * values, a direct abs threshold based on the expected RMS magnitude of
+     * the output is more meaningful than relative error. */
+    float max_abs = 0.0f;   /* max absolute diff */
+    float rms_cpu = 0.0f;   /* RMS of reference values (for scale) */
+    for (size_t i = 0; i < n_y; i++) {
+        float d = fabsf(Y_gpu[i] - Y_cpu[i]);
+        if (d > max_abs) max_abs = d;
+        rms_cpu += Y_cpu[i] * Y_cpu[i];
+    }
+    rms_cpu = sqrtf(rms_cpu / (float)n_y);
+    free(W); free(X); free(Y_gpu); free(Y_cpu); free(W_bf);
+    /* Allow max_abs up to 3% of the reference RMS (BF16 rounds both operands). */
+    float tol = 0.03f * rms_cpu;
+    if (max_abs > tol) {
+        fprintf(stderr, "FAIL (max_abs=%.6g rms_cpu=%.6g tol=%.6g)\n", max_abs, rms_cpu, tol);
+        return 1;
+    }
+    fprintf(stderr, "OK (max_abs=%.6g rms_cpu=%.6g)\n", max_abs, rms_cpu);
+    return 0;
+}
+
+/* Test 3: flash_attn_fp8 MMA vs flash_attn_fp8_ref scalar.
+ * Both paths share the same per-tensor FP8 quantization, so their outputs
+ * should match within a small tolerance (FP8 quant noise is identical; only
+ * the numerical order of the mma reductions differs). */
+static int test_kernel_fp8_attn(cuda_flux2_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_fp8 MMA vs scalar ref... ");
+    if (!r->fn_flash_attn_fp8 || !r->fn_flash_attn_fp8_ref ||
+        !r->fn_quant_fp8 || !r->fn_reduce_max_abs) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+    const int n_tok = 48;
+    const int n_heads = 4;
+    const int head_dim = 128;  /* kernel hardcodes this */
+    const int dim = n_heads * head_dim;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_mma = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_mma || !out_ref) {
+        free(Q); free(K); free(V); free(out_mma); free(out_ref); return 1;
+    }
+    rng_state = 999;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.7f;
+
+    CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
+    CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
+    CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
+    CUdeviceptr d_out;
+    cuMemAlloc(&d_out, n_elems * sizeof(float));
+
+    /* Run MMA path */
+    int saved_attn = r->use_fp8_attn;
+    r->use_fp8_attn = 1;
+    unsetenv("FLUX2_FP8_ATTN_REF");
+    op_attn(r, d_out, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    cuCtxSynchronize();
+    cuMemcpyDtoH(out_mma, d_out, n_elems * sizeof(float));
+
+    /* Run scalar ref path */
+    setenv("FLUX2_FP8_ATTN_REF", "1", 1);
+    op_attn(r, d_out, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    cuCtxSynchronize();
+    cuMemcpyDtoH(out_ref, d_out, n_elems * sizeof(float));
+    unsetenv("FLUX2_FP8_ATTN_REF");
+    r->use_fp8_attn = saved_attn;
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V); cuMemFree(d_out);
+
+    /* Compare — both paths quantize to the same FP8, so max diff should be small */
+    float max_diff = 0.0f, mean_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_mma[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+    }
+    mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_mma); free(out_ref);
+    /* Tolerance: online softmax ordering + FP8 P-requant can differ slightly */
+    if (max_diff > 0.1f) {
+        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+        return 1;
+    }
+    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+    return 0;
+}
+
+static int test_kernels(void) {
+    fprintf(stderr, "=== Kernel Unit Tests ===\n");
+    int fail = 0;
+    /* Host-side test first — doesn't need the runner */
+    fail += test_kernel_f32_to_bf16_bulk();
+
+    cuda_flux2_runner *r = cuda_flux2_init(0, 0);
+    if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    fail += test_kernel_gemm_bf16(r);
+    fail += test_kernel_fp8_attn(r);
+    cuda_flux2_free(r);
+
+    if (fail) {
+        fprintf(stderr, "=== Kernel Tests: %d FAIL(S) ===\n", fail);
+        return 1;
+    }
+    fprintf(stderr, "=== Kernel Tests: all OK ===\n");
+    return 0;
+}
+
 static int test_load(const char *dit_path, const char *vae_path) {
     fprintf(stderr, "=== CUDA Load Test ===\n");
     cuda_flux2_runner *r = cuda_flux2_init(0, 1);
@@ -678,6 +876,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-dit")  == 0) mode = "dit";
         else if (strcmp(argv[i], "--test-vae")  == 0) mode = "vae";
         else if (strcmp(argv[i], "--test-text-enc") == 0) mode = "text";
+        else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
         else if (strcmp(argv[i], "--generate")  == 0) mode = "gen";
         else if (strcmp(argv[i], "--base")       == 0) { is_distilled = 0; n_steps = 20; }
         else if (strcmp(argv[i], "--distilled")  == 0) { is_distilled = 1; n_steps = 4; }
@@ -705,7 +904,7 @@ int main(int argc, char **argv) {
 
     if (!mode) {
         fprintf(stderr,
-            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--generate]\n"
+            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--test-kernels|--generate]\n"
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
@@ -715,6 +914,7 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(mode, "init") == 0) return test_init();
+    if (strcmp(mode, "kernels") == 0) return test_kernels();
     if (strcmp(mode, "load") == 0) return test_load(dit_path, vae_path);
     if (strcmp(mode, "dit")  == 0) return test_dit(dit_path, enc_path, tok_path, prompt,
                                                    out_h/16, out_w/16, n_txt,
