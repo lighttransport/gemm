@@ -114,6 +114,12 @@ typedef struct {
     /* Memory tracking */
     float **bufs;
     int     n_bufs, cap_bufs;
+
+    /* Debug: dump per-block intermediates (-1 = disabled) */
+    int dump_dblk;    /* double-block index to dump */
+    int dump_sblk;    /* single-block index to dump */
+    void (*dump_fn)(const char *name, const float *data, int n, void *ctx);
+    void *dump_ctx;
 } flux2_dit_model;
 
 flux2_dit_model *flux2_dit_load_safetensors(const char *path);
@@ -249,6 +255,18 @@ static flux2_mat flux2_mat_fp8(flux2_dit_model *m, st_context *st,
     return mat;
 }
 
+/* Auto-detect dtype: FP8 E4M3 → dequant with scale, BF16/F32 → direct load. */
+static flux2_mat flux2_mat_auto(flux2_dit_model *m, st_context *st,
+                                 const char *wname, const char *sname) {
+    int idx = safetensors_find(st, wname);
+    if (idx < 0) { flux2_mat mat = {0}; return mat; }
+    const char *dtype = safetensors_dtype(st, idx);
+    if (strcmp(dtype, "F8_E4M3") == 0)
+        return flux2_mat_fp8(m, st, wname, sname);
+    else
+        return flux2_mat_bf16(m, st, wname);
+}
+
 /* ---- Load ---- */
 
 flux2_dit_model *flux2_dit_load_safetensors(const char *path) {
@@ -258,6 +276,8 @@ flux2_dit_model *flux2_dit_load_safetensors(const char *path) {
     if (!st) { fprintf(stderr, "flux2_dit: failed to open %s\n", path); return NULL; }
 
     flux2_dit_model *m = (flux2_dit_model *)calloc(1, sizeof(flux2_dit_model));
+    m->dump_dblk = -1;
+    m->dump_sblk = -1;
 
     /* Detect dims from key tensor shapes */
     {
@@ -337,19 +357,19 @@ flux2_dit_model *flux2_dit_load_safetensors(const char *path) {
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.img_attn.qkv.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.img_attn.qkv.weight_scale", bi);
-        b->img.qkv = flux2_mat_fp8(m, st, wn, sn);
+        b->img.qkv = flux2_mat_auto(m, st, wn, sn);
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.img_attn.proj.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.img_attn.proj.weight_scale", bi);
-        b->img.proj = flux2_mat_fp8(m, st, wn, sn);
+        b->img.proj = flux2_mat_auto(m, st, wn, sn);
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.img_mlp.0.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.img_mlp.0.weight_scale", bi);
-        b->img.mlp_up = flux2_mat_fp8(m, st, wn, sn);
+        b->img.mlp_up = flux2_mat_auto(m, st, wn, sn);
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.img_mlp.2.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.img_mlp.2.weight_scale", bi);
-        b->img.mlp_down = flux2_mat_fp8(m, st, wn, sn);
+        b->img.mlp_down = flux2_mat_auto(m, st, wn, sn);
 
         /* txt stream */
         snprintf(wn, sizeof(wn), "double_blocks.%d.txt_attn.norm.query_norm.scale", bi);
@@ -359,19 +379,19 @@ flux2_dit_model *flux2_dit_load_safetensors(const char *path) {
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.txt_attn.qkv.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.txt_attn.qkv.weight_scale", bi);
-        b->txt.qkv = flux2_mat_fp8(m, st, wn, sn);
+        b->txt.qkv = flux2_mat_auto(m, st, wn, sn);
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.txt_attn.proj.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.txt_attn.proj.weight_scale", bi);
-        b->txt.proj = flux2_mat_fp8(m, st, wn, sn);
+        b->txt.proj = flux2_mat_auto(m, st, wn, sn);
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.txt_mlp.0.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.txt_mlp.0.weight_scale", bi);
-        b->txt.mlp_up = flux2_mat_fp8(m, st, wn, sn);
+        b->txt.mlp_up = flux2_mat_auto(m, st, wn, sn);
 
         snprintf(wn, sizeof(wn), "double_blocks.%d.txt_mlp.2.weight", bi);
         snprintf(sn, sizeof(sn), "double_blocks.%d.txt_mlp.2.weight_scale", bi);
-        b->txt.mlp_down = flux2_mat_fp8(m, st, wn, sn);
+        b->txt.mlp_down = flux2_mat_auto(m, st, wn, sn);
 
         if ((bi + 1) % 2 == 0 || bi == m->n_double_blocks - 1)
             fprintf(stderr, "\r  double block %d/%d", bi + 1, m->n_double_blocks);
@@ -391,11 +411,11 @@ flux2_dit_model *flux2_dit_load_safetensors(const char *path) {
 
         snprintf(wn, sizeof(wn), "single_blocks.%d.linear1.weight", bi);
         snprintf(sn, sizeof(sn), "single_blocks.%d.linear1.weight_scale", bi);
-        b->linear1 = flux2_mat_fp8(m, st, wn, sn);
+        b->linear1 = flux2_mat_auto(m, st, wn, sn);
 
         snprintf(wn, sizeof(wn), "single_blocks.%d.linear2.weight", bi);
         snprintf(sn, sizeof(sn), "single_blocks.%d.linear2.weight_scale", bi);
-        b->linear2 = flux2_mat_fp8(m, st, wn, sn);
+        b->linear2 = flux2_mat_auto(m, st, wn, sn);
 
         if ((bi + 1) % 5 == 0 || bi == m->n_single_blocks - 1)
             fprintf(stderr, "\r  single block %d/%d", bi + 1, m->n_single_blocks);
@@ -724,6 +744,27 @@ void flux2_dit_forward(float *out,
     float *jv_s = (float *)malloc((size_t)n_tot_all * H * sizeof(float));
     float *jg_s = (float *)malloc((size_t)n_tot_all * 2 * n_ff * sizeof(float));
 
+    /* Dump macros */
+#define DUMP_DBL(name, data, n) do { \
+    if (m->dump_fn && bi == m->dump_dblk) \
+        m->dump_fn(name, data, n, m->dump_ctx); \
+} while(0)
+#define DUMP_SGL(name, data, n) do { \
+    if (m->dump_fn && bi == m->dump_sblk) \
+        m->dump_fn(name, data, n, m->dump_ctx); \
+} while(0)
+#define DUMP_GLOBAL(name, data, n) do { \
+    if (m->dump_fn) m->dump_fn(name, data, n, m->dump_ctx); \
+} while(0)
+
+    /* Dump global checkpoints */
+    DUMP_GLOBAL("temb", temb, H);
+    DUMP_GLOBAL("img_projected", img, n_img * H);
+    DUMP_GLOBAL("txt_projected", txt, n_txt * H);
+    DUMP_GLOBAL("mod_img_vec", mod_img_vec, 6 * H);
+    DUMP_GLOBAL("mod_txt_vec", mod_txt_vec, 6 * H);
+    DUMP_GLOBAL("mod_sgl_vec", mod_sgl_vec, 3 * H);
+
     /* ---- Double-stream blocks ---- */
     for (int bi = 0; bi < m->n_double_blocks; bi++) {
         flux2_double_block *b = &m->dblk[bi];
@@ -733,6 +774,7 @@ void flux2_dit_forward(float *out,
         memcpy(img_norm, img, (size_t)n_img * H * sizeof(float));
         flux2_layernorm(img_norm, n_img, H, 1e-6f);
         flux2_apply_mod(img_norm, n_img, H, mi_shift_a, mi_scale_a);
+        DUMP_DBL("img_adaln", img_norm, n_img * H);
 
         /* QKV projection: output [n_img, 3H] interleaved per token → de-interleave */
         flux2_gemm(img_qkv, img_norm, n_img, H, &b->img.qkv, NULL);
@@ -750,11 +792,13 @@ void flux2_dit_forward(float *out,
         /* Reshape for rope: treat img_q as [n_img, nH, hd] */
         flux2_rope_img(img_q, n_img, nH, hd, lat_h_p, lat_w_p, FLUX2_ROPE_THETA);
         flux2_rope_img(img_k, n_img, nH, hd, lat_h_p, lat_w_p, FLUX2_ROPE_THETA);
+        DUMP_DBL("img_q_normed", img_q, n_img * H);
 
         /* --- TXT stream (parallel) --- */
         memcpy(txt_norm, txt, (size_t)n_txt * H * sizeof(float));
         flux2_layernorm(txt_norm, n_txt, H, 1e-6f);
         flux2_apply_mod(txt_norm, n_txt, H, mt_shift_a, mt_scale_a);
+        DUMP_DBL("txt_adaln", txt_norm, n_txt * H);
 
         flux2_gemm(txt_qkv, txt_norm, n_txt, H, &b->txt.qkv, NULL);
         for (int t = 0; t < n_txt; t++) {
@@ -793,6 +837,8 @@ void flux2_dit_forward(float *out,
         /* Gated residual add */
         for (int i = 0; i < n_img * H; i++) img[i] += mi_gate_a[i % H] * img_attn_out[i];
         for (int i = 0; i < n_txt * H; i++) txt[i] += mt_gate_a[i % H] * txt_attn_out[i];
+        DUMP_DBL("img_after_attn", img, n_img * H);
+        DUMP_DBL("txt_after_attn", txt, n_txt * H);
 
         /* FFN img */
         memcpy(img_norm, img, (size_t)n_img * H * sizeof(float));
@@ -802,6 +848,7 @@ void flux2_dit_forward(float *out,
         flux2_swiglu(img_mlp_out, img_gate_up, n_img, n_ff);
         flux2_gemm(img_proj_out, img_mlp_out, n_img, n_ff, &b->img.mlp_down, NULL);
         for (int i = 0; i < n_img * H; i++) img[i] += mi_gate_f[i % H] * img_proj_out[i];
+        DUMP_DBL("img_after_mlp", img, n_img * H);
 
         /* FFN txt */
         memcpy(txt_norm, txt, (size_t)n_txt * H * sizeof(float));
@@ -811,6 +858,7 @@ void flux2_dit_forward(float *out,
         flux2_swiglu(txt_mlp_out, txt_gate_up, n_txt, n_ff);
         flux2_gemm(txt_proj_out, txt_mlp_out, n_txt, n_ff, &b->txt.mlp_down, NULL);
         for (int i = 0; i < n_txt * H; i++) txt[i] += mt_gate_f[i % H] * txt_proj_out[i];
+        DUMP_DBL("txt_after_mlp", txt, n_txt * H);
     }
 
     /* ---- Single-stream blocks ---- */
@@ -840,6 +888,7 @@ void flux2_dit_forward(float *out,
         memcpy(joint_norm, joint, (size_t)n_tot * H * sizeof(float));
         flux2_layernorm(joint_norm, n_tot, H, 1e-6f);
         flux2_apply_mod(joint_norm, n_tot, H, ms_shift, ms_scale);
+        DUMP_SGL("adaln", joint_norm, n_tot * H);
 
         /* Linear1: [9H, H] → split Q[3H slice → nH,hd], K, V, gate, up */
         flux2_gemm(lin1_buf, joint_norm, n_tot, H, &b->linear1, NULL);
@@ -864,6 +913,7 @@ void flux2_dit_forward(float *out,
                        lat_h_p, lat_w_p, FLUX2_ROPE_THETA);
         flux2_rope_img(jk + (size_t)n_txt * H, n_img, nH, hd,
                        lat_h_p, lat_w_p, FLUX2_ROPE_THETA);
+        DUMP_SGL("q_normed", jq, n_tot * H);
 
         /* Self-attention over all tokens */
         float *attn_h = (float *)malloc((size_t)n_tot * nH * hd * sizeof(float));
@@ -886,6 +936,7 @@ void flux2_dit_forward(float *out,
 
         /* Gated residual */
         for (int i = 0; i < n_tot * H; i++) joint[i] += ms_gate[i % H] * lin2_out[i];
+        DUMP_SGL("after_block", joint, n_tot * H);
     }
 
     /* ---- Output ---- */
@@ -910,6 +961,11 @@ void flux2_dit_forward(float *out,
 
     /* Final linear: [patch_in, H] → out[n_img, patch_in] */
     flux2_gemm(out, img_final, n_img, H, &m->out_proj, NULL);
+    DUMP_GLOBAL("dit_output", out, n_img * m->patch_in_channels);
+
+#undef DUMP_DBL
+#undef DUMP_SGL
+#undef DUMP_GLOBAL
 
     /* Cleanup */
     free(img_final);

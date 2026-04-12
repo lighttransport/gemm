@@ -297,14 +297,14 @@ make test-gen-base    # Base pipeline
 | **Scheduler** | Verified | sigma schedule matches CPU reference |
 | **Text encoder (CPU)** | Verified | hidden states match transformer.h reference |
 | **Text encoder (GPU)** | Working | CUDA LLM runner, Klein safetensors weights, layer snapshots 8/17/26 |
-| **VAE decoder** | Verified | GPU vs CPU `max_diff≈3e-6` on 64×64 decode; visual output correct |
+| **VAE decoder** | Verified | GPU vs CPU `max_diff≈1e-5`; vs diffusers `corr=0.999999` `max_diff≈1e-3` on 64×64; pixel-identical at 256×256 (max pixel diff=1, PSNR=51dB) |
 | **Full `--generate --gpu-enc` path** | Working | Prompt is encoded once, encoder is freed, then DiT/VAE load |
 | **DiT CPU** | Visual PASS | 64×64 correct red apple (4 steps) |
 | **DiT CUDA** | Visual PASS | 256×256 clear red apple (4 steps), max_diff vs CPU < 1e-5 |
 | **Full pipeline (CPU)** | Working | 256×256 "a red apple" correct |
 | **Full pipeline (CUDA)** | Working | 256×256 "a red apple" correct |
 
-Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-stream blocks and the 20 single-stream blocks, and the VAE decode is GPU-accelerated as well. For A/B checks, the old double-stream CPU fallback can still be forced with `FLUX2_CPU_DBL_ATTN=1`. The only remaining CPU bridge in the VAE path is the single mid-block attention calculation.
+Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-stream blocks and the 20 single-stream blocks, and the VAE decode is fully GPU-accelerated including the mid-block attention. For A/B checks, the old double-stream CPU fallback can still be forced with `FLUX2_CPU_DBL_ATTN=1`. The old CPU-bridge VAE attention path is still available in the source (`flux2_vae_mid_attn_bridge`).
 
 The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on RTX 5060 Ti was not a DiT math bug. It was VRAM exhaustion during DiT/VAE load while the GPU text encoder session was still resident. Allocation checks in `cuda_flux2_runner.h` now fail explicitly, and the generation path frees the GPU text encoder before loading DiT/VAE.
 
@@ -316,6 +316,13 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 | **linear2 column split byte offset** | All-black output | Row-by-row column extraction during upload (stride is H+n_ff, not H) |
 | **Redundant fused lin1 GEMM** | NaN/Inf at 256×256 | Buffer overflow: removed redundant fused call, keep only split Q/K/V/gate/up GEMMs |
 | **MMA GEMM on sm_120** | Near-zero velocity | Switch to `gemm_f32_f32` (pure F32 tiled), skips `wmma` |
+| **F16 GEMM weight offset** | All-zero with F16 GEMM | QKV/linear1 weight pointer arithmetic used `*4` (F32 bytes) instead of `*WE` (2 bytes for F16) |
+| **VAE BN denormalization** | Over-saturated image with speckle artifacts | BN stats (`bn.running_mean/var`) are training artifacts — should NOT be applied during inference. Removed the `latent * sqrt(var) + mean` pre-processing |
+| **VAE missing 3rd resnet** | Low correlation (0.74) vs diffusers VAE | Diffusers decoder uses `layers_per_block+1=3` resnets per up_block; our code only had 2. Added `up_res[4][3]` and loading/running of `resnets.2` |
+| **Base model FP8/BF16 mixed dtype** | Grid pattern output with base model | Base model `double_blocks.0.*.proj.weight` is BF16 (not FP8) but loader always called `flux2_mat_fp8`. Added `flux2_mat_auto` that detects dtype and dispatches to the correct loader |
+| **Base model scheduler** | sigma=1000 (double 1000× application) | Base scheduler used `qimg_sched_set_timesteps` which multiplied by `num_train_timesteps=1000`, but DiT also does `timestep*1000`. Switched to `qimg_sched_set_timesteps_comfyui` with `multiplier=1.0` |
+| **Wrong sigma shift formula** | Spotty pixel artifacts, wrong sigma values | Used AuraFlow shift `alpha*t/(1+(alpha-1)*t)` with alpha=2.02. ComfyUI uses Flux shift `exp(mu)*t/(...)` with mu=2.02. Fix: pass `expf(2.02)` ≈ 7.539 as alpha to our scheduler |
+| **Text not padded to 512** | Velocity corr=0.92 vs ComfyUI; pixel-level quantization-like artifacts | ComfyUI's `Flux2.extra_conds` front-pads text to 512 tokens with zeros (`comfy/model_base.py:960`). We were using ~15 real tokens. Fix: front-pad text to 512 tokens before passing to DiT. After fix: corr=0.997, std_ratio=0.997 |
 | **Double-stream attention path** | Needed verification on sm_120 after earlier divergence during bring-up | Re-verified on RTX 5060 Ti: GPU flash attention now matches CPU (`max_diff≈6e-6` on `--test-dit` 64×64); CPU fallback kept behind `FLUX2_CPU_DBL_ATTN=1` |
 | **512-token text padding** | 35× GEMM overhead | Remove padding; return only real tokens (~15 tokens typical) |
 | **Chat template** | Wrong hidden states | Strip system/chat prefix; use clean user message tokens only |
@@ -337,17 +344,17 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 
 ### Performance
 
-- [ ] **All-GPU VAE attention**: the VAE mid-block attention still bridges through CPU for now. The heavy conv/groupnorm/upsample path is on GPU already.
-- [ ] **F16/FP8 GEMM**: Current GPU GEMM is F32 (`gemm_f32_f32`). The `gemm_tiled_f16_f32` kernel produces ~27% error on sm_120 (Blackwell); `gemm_f16_f32` (MMA-based) outputs near-zero. Investigation needed — likely an NVRTC wmma intrinsic issue on sm_120.
+- [x] **All-GPU VAE attention**: VAE mid-block single-head attention now runs on GPU via a dedicated `vae_attn_f32` flash-attention kernel (FA2 style, BKV=8, EPT=16). GPU vs CPU max_diff≈3e-6 at 64×64, ≈4e-4 at 512×512.
+- [x] **F16 GEMM**: `FLUX2_F16_GEMM=1` enables `gemm_tiled_f16_f32` with F16 weight upload (round-to-nearest via `f2h()`). GPU vs CPU max_diff≈4e-4 at 64×64 DiT step. Halves VRAM for weights. The root cause of the earlier ~27% error was hardcoded `*4` byte offsets for QKV weight slicing (should be `*2` for F16). MMA-based `gemm_f16_f32` still has a known fragment mapping bug on sm_120 — not needed since tiled kernel works.
 - [ ] **Attention kernel scaling**: Single-block-per-head FA2 flash attention works but may not scale to large resolutions. No multi-block flash attention.
 - [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + weight upload. PTX cache and in-process reuse help, but `--generate` currently pre-encodes once and frees the runner rather than keeping text and DiT resident together.
 
 ### Quality
 
-- [ ] **No ComfyUI numerical verification**: No per-block .npy comparison against ComfyUI reference yet. Visual match confirmed but no correlation metrics.
-- [ ] **Base model CFG**: Base model path not verified against reference — distilled path is primary.
+- [ ] **ComfyUI numerical verification**: Per-block .npy dump infrastructure added (`--dump-block N` in CPU test, dump callback in `flux2_klein_dit.h`). Comparison script at `ref/flux2_klein/compare_blocks.py`. ComfyUI trace script (`trace_blocks.py`) is a skeleton — needs completion with actual model sub-module calls once ComfyUI model structure is inspected.
+- [x] **Base model**: Base model (20-step) now works with CFG=3.5. Fixed mixed BF16/FP8 dtype loading and scheduler timestep convention. Visual output confirmed.
 
 ### Features
 
-- [ ] **512×512 and larger**: Only 256×256 verified. Latent sizes scale as H/8 × W/8 tokens.
-- [ ] **Single-session GPU pipeline**: text encoding and DiT both run on GPU, but generation currently frees the text encoder before DiT/VAE load to stay within VRAM budget on 16 GB cards; VAE mid attention still bridges through CPU.
+- [x] **512×512**: VAE decode verified at 512×512 (GPU vs CPU max_diff≈4e-4), DiT step runs at 512×512 (1.02s for 256 img tokens on RTX 5060 Ti). Larger resolutions untested.
+- [ ] **Single-session GPU pipeline**: text encoding and DiT both run on GPU, but generation currently frees the text encoder before DiT/VAE load to stay within VRAM budget on 16 GB cards.
