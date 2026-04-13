@@ -170,14 +170,26 @@ static const char *qimg_kernel_src =
 "        out[tok*dim+i] = ((x[tok*dim+i] - mean) * inv) * (1.0f + scale[i]) + shift[i];\n"
 "}\n"
 
-/* Gated residual: x += gate * proj */
+/* Gated residual: x += gate * proj, output BF16-truncated inline.
+ *
+ * Eliminates the trailing op_bf16_trunc(x) pass the caller used to do
+ * separately: proj is already BF16 from the GEMM writeback, x is BF16
+ * from the previous block end, so the F32 sum is rounded straight to
+ * BF16 here instead of stored at F32 precision and rounded again later. */
 "__global__ void gated_add_f32(float *__restrict__ x,\n"
 "    const float *__restrict__ proj, const float *__restrict__ gate,\n"
 "    int N, int dim) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i >= N * dim) return;\n"
 "    int col = i % dim;\n"
-"    x[i] += gate[col] * proj[i];\n"
+"    float v = x[i] + gate[col] * proj[i];\n"
+"    /* Inline BF16 rounding (round-to-nearest-even) to avoid depending on\n"
+"     * a forward-declared helper. */\n"
+"    unsigned int _b; memcpy(&_b, &v, 4);\n"
+"    _b += 0x7FFFu + ((_b >> 16) & 1u);\n"
+"    _b &= 0xFFFF0000u;\n"
+"    memcpy(&v, &_b, 4);\n"
+"    x[i] = v;\n"
 "}\n"
 
 /* Patchify: latent [C, H, W] → tokens [H/ps*W/ps, C*ps*ps] */
@@ -2088,10 +2100,7 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     op_gemm(r, d_scratch2, blk->txt_mlp_fc2_w, d_scratch3, blk->txt_mlp_fc2_b,
             dim, mlp_h, n_txt);
     op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
-
-    /* Truncate block output to BF16 precision (match ComfyUI's BF16 compute) */
-    op_bf16_trunc(r, d_img, n_img * dim);
-    op_bf16_trunc(r, d_txt, n_txt * dim);
+    /* gated_add writes BF16-rounded output — no trailing op_bf16_trunc needed. */
 
     (void)L;  /* unused in refactored body — verbose dumps moved to caller */
     return 0;
