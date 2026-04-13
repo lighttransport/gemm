@@ -1204,16 +1204,14 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
             quantize_buf_fp8(r, r->d_q_fp8, s_q, d_q, n);
             quantize_buf_fp8(r, r->d_k_fp8, s_k, d_k, n);
             quantize_buf_fp8(r, r->d_v_fp8, s_v, d_v, n);
-            /* Read scales back for kernel args. Single 3-float DtoH (synchronous). */
-            float scales[3];
-            cuStreamSynchronize(r->stream);
-            cuMemcpyDtoH(scales, r->d_qkv_scales, 3 * sizeof(float));
-            /* flash_attn_fp8 launch: grid=(n_heads, ceil(N/64)), block=128 (4 warps) */
+            /* flash_attn_fp8 launch: grid=(n_heads, ceil(N/64)), block=128 (4 warps).
+             * Scales are passed as a device pointer — kernel reads them directly,
+             * so no DtoH sync per attention call. */
             unsigned gy = (unsigned)((n_tok + 63) / 64);
             size_t smem = (size_t)(32 * 128 + 128 * 32 + 4 * 16 * 32 * sizeof(float));  /* smK+smVT+smP */
             void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
                             &n_tok, &n_heads, &head_dim,
-                            &scales[0], &scales[1], &scales[2]};
+                            &r->d_qkv_scales};
             cuLaunchKernel(r->flash_attn_fp8,
                            (unsigned)n_heads, gy, 1,
                            128, 1, 1, smem, r->stream, args, NULL);
