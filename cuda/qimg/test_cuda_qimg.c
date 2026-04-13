@@ -239,9 +239,6 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
     quantize_buf_fp8(r, r->d_q_fp8, s_q, d_Q, n_int);
     quantize_buf_fp8(r, r->d_k_fp8, s_k, d_K, n_int);
     quantize_buf_fp8(r, r->d_v_fp8, s_v, d_V, n_int);
-    float scales[3];
-    cuStreamSynchronize(r->stream);
-    cuMemcpyDtoH(scales, r->d_qkv_scales, 3 * sizeof(float));
 
     int nt = n_tok, nh = n_heads, hd = head_dim;
     /* MMA path */
@@ -249,8 +246,7 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
         unsigned gy = (unsigned)((n_tok + 63) / 64);
         size_t smem = (size_t)(32 * 128 + 128 * 32 + 4 * 16 * 32 * sizeof(float));
         void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
-                        &nt, &nh, &hd,
-                        &scales[0], &scales[1], &scales[2]};
+                        &nt, &nh, &hd, &r->d_qkv_scales};
         cuLaunchKernel(r->flash_attn_fp8, (unsigned)nh, gy, 1,
                        128, 1, 1, smem, r->stream, args, NULL);
         cuStreamSynchronize(r->stream);
@@ -259,8 +255,7 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
     /* Scalar ref path: grid=(n_heads, ceil(n_tok/32)), block=32 */
     {
         void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
-                        &nt, &nh, &hd,
-                        &scales[0], &scales[1], &scales[2]};
+                        &nt, &nh, &hd, &r->d_qkv_scales};
         unsigned gy = (unsigned)((n_tok + 31) / 32);
         cuLaunchKernel(fn_ref, (unsigned)nh, gy, 1,
                        32, 1, 1, 0, r->stream, args, NULL);
