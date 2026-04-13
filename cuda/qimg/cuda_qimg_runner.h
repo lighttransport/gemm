@@ -813,6 +813,14 @@ struct cuda_qimg_runner {
     qimg_block_gpu *gpu_blocks;  /* [dit_n_blocks] array, some may be zero */
     int n_preloaded;             /* how many blocks are resident on GPU */
 
+    /* Block scratch slot for on-demand loads. Pre-allocated once at init so
+     * qimg_load_block doesn't pay the ~30 cuMemAlloc + 30 cuMemFree driver
+     * calls per block (measured ~86 ms/load at 512x512). The slot holds one
+     * block at a time — blocks are loaded sequentially within a forward
+     * and the next kernel reads from the slot. */
+    qimg_block_gpu scratch_block;
+    int scratch_block_ready;  /* non-zero if scratch_block buffers are allocated */
+
     /* Persistent GPU: global weights (~50MB) */
     CUdeviceptr d_img_in_w, d_img_in_b;
     CUdeviceptr d_txt_in_w, d_txt_in_b;
@@ -973,6 +981,59 @@ static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     return d;
 }
 
+/* Async HtoD on r->stream — queues after pending kernels, stream ordering
+ * guarantees scratch-slot writes are serialized with prior compute. This
+ * removes the explicit cuStreamSynchronize before each slot load. */
+static int qimg_st_upload_fp8_raw_async(st_context *st, const char *name,
+                                         CUdeviceptr dst, size_t dst_nbytes,
+                                         CUstream s) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return -1;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    if (nbytes != dst_nbytes) return -1;
+    void *data = safetensors_data(st, idx);
+    cuMemcpyHtoDAsync(dst, data, nbytes, s);
+    return 0;
+}
+
+static int qimg_st_upload_f32_async(st_context *st, const char *name,
+                                    CUdeviceptr dst, size_t dst_nelem,
+                                    CUstream s) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return -1;
+    const uint64_t *shape = safetensors_shape(st, idx);
+    int ndims = safetensors_ndims(st, idx);
+    size_t n = 1;
+    for (int d = 0; d < ndims; d++) n *= shape[d];
+    if (n != dst_nelem) return -1;
+    const char *dtype = safetensors_dtype(st, idx);
+    const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
+    if (strcmp(dtype, "F32") == 0) {
+        cuMemcpyHtoDAsync(dst, src, n * sizeof(float), s);
+        return 0;
+    }
+    /* Conversion path (BF16/F16/FP8) via a temporary host buffer. Rare.
+     * Must sync so we can free the host buffer safely. */
+    float *f32 = (float *)malloc(n * sizeof(float));
+    if (!f32) return -1;
+    if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0) {
+        qimg_init_fp8_to_f32_lut();
+        for (size_t i = 0; i < n; i++) f32[i] = qimg_cuda_fp8_to_f32_lut[src[i]];
+    } else if (strcmp(dtype, "BF16") == 0) {
+        const uint16_t *bf = (const uint16_t *)src;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t bits = (uint32_t)bf[i] << 16;
+            memcpy(&f32[i], &bits, 4);
+        }
+    } else {
+        free(f32); return -1;
+    }
+    cuMemcpyHtoDAsync(dst, f32, n * sizeof(float), s);
+    cuStreamSynchronize(s);
+    free(f32);
+    return 0;
+}
+
 /* ---- Load/free one DiT block ---- */
 
 /* Upload block weights as raw FP8 (for native FP8 GEMM) or dequant to F16 */
@@ -1041,6 +1102,144 @@ static void qimg_free_block(qimg_block_gpu *b) {
     for (int i = 0; i < n; i++) {
         if (ptrs[i]) { cuMemFree(ptrs[i]); ptrs[i] = 0; }
     }
+}
+
+/* Allocate the per-runner scratch block slot once. Reserves one block's
+ * worth of device memory so on-demand loads can just H2D-copy into the
+ * existing buffers instead of cuMemAlloc/cuMemFree per block. Assumes
+ * use_fp8_gemm (FP8 raw bytes for *_w tensors). Returns 0 on success. */
+static int qimg_alloc_scratch_block(cuda_qimg_runner *r) {
+    if (r->scratch_block_ready) return 0;
+    st_context *st = (st_context *)r->dit_st;
+    if (!st || r->dit_n_blocks <= 0) return -1;
+    int i0 = 0;  /* probe block 0 for tensor sizes */
+    char name[256];
+    qimg_block_gpu *b = &r->scratch_block;
+    memset(b, 0, sizeof(*b));
+    int ok = 1;
+#define ALLOC_FROM_ST(field, suffix) do { if (ok) { \
+        snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
+        int _ti = safetensors_find(st, name); \
+        if (_ti < 0) { ok = 0; break; } \
+        size_t _nb = safetensors_nbytes(st, _ti); \
+        if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
+    } } while(0)
+#define ALLOC_F32(field, suffix) do { if (ok) { \
+        snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
+        int _ti = safetensors_find(st, name); \
+        if (_ti < 0) { ok = 0; break; } \
+        const uint64_t *_sh = safetensors_shape(st, _ti); \
+        int _nd = safetensors_ndims(st, _ti); \
+        size_t _n = 1; for (int _d=0;_d<_nd;_d++) _n *= _sh[_d]; \
+        if (cuMemAlloc(&b->field, _n * sizeof(float)) != CUDA_SUCCESS) { ok = 0; break; } \
+    } } while(0)
+    ALLOC_FROM_ST(attn_q_w, "attn.to_q.weight");
+    ALLOC_F32(attn_q_b, "attn.to_q.bias");
+    ALLOC_FROM_ST(attn_k_w, "attn.to_k.weight");
+    ALLOC_F32(attn_k_b, "attn.to_k.bias");
+    ALLOC_FROM_ST(attn_v_w, "attn.to_v.weight");
+    ALLOC_F32(attn_v_b, "attn.to_v.bias");
+    ALLOC_FROM_ST(attn_out_w, "attn.to_out.0.weight");
+    ALLOC_F32(attn_out_b, "attn.to_out.0.bias");
+    ALLOC_FROM_ST(attn_add_q_w, "attn.add_q_proj.weight");
+    ALLOC_F32(attn_add_q_b, "attn.add_q_proj.bias");
+    ALLOC_FROM_ST(attn_add_k_w, "attn.add_k_proj.weight");
+    ALLOC_F32(attn_add_k_b, "attn.add_k_proj.bias");
+    ALLOC_FROM_ST(attn_add_v_w, "attn.add_v_proj.weight");
+    ALLOC_F32(attn_add_v_b, "attn.add_v_proj.bias");
+    ALLOC_FROM_ST(attn_add_out_w, "attn.to_add_out.weight");
+    ALLOC_F32(attn_add_out_b, "attn.to_add_out.bias");
+    ALLOC_F32(norm_q_w, "attn.norm_q.weight");
+    ALLOC_F32(norm_k_w, "attn.norm_k.weight");
+    ALLOC_F32(norm_added_q_w, "attn.norm_added_q.weight");
+    ALLOC_F32(norm_added_k_w, "attn.norm_added_k.weight");
+    ALLOC_FROM_ST(img_mod_w, "img_mod.1.weight");
+    ALLOC_F32(img_mod_b, "img_mod.1.bias");
+    ALLOC_FROM_ST(img_mlp_fc1_w, "img_mlp.net.0.proj.weight");
+    ALLOC_F32(img_mlp_fc1_b, "img_mlp.net.0.proj.bias");
+    ALLOC_FROM_ST(img_mlp_fc2_w, "img_mlp.net.2.weight");
+    ALLOC_F32(img_mlp_fc2_b, "img_mlp.net.2.bias");
+    ALLOC_FROM_ST(txt_mod_w, "txt_mod.1.weight");
+    ALLOC_F32(txt_mod_b, "txt_mod.1.bias");
+    ALLOC_FROM_ST(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight");
+    ALLOC_F32(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias");
+    ALLOC_FROM_ST(txt_mlp_fc2_w, "txt_mlp.net.2.weight");
+    ALLOC_F32(txt_mlp_fc2_b, "txt_mlp.net.2.bias");
+#undef ALLOC_FROM_ST
+#undef ALLOC_F32
+    if (!ok) {
+        qimg_free_block(b);
+        return -1;
+    }
+    r->scratch_block_ready = 1;
+    return 0;
+}
+
+/* Copy block i into the pre-allocated scratch slot. Caller gets a
+ * qimg_block_gpu struct whose pointers alias the scratch slot.
+ *
+ * Must cuStreamSynchronize before reusing the slot — the slot is shared
+ * across all on-demand blocks, and the previous block's kernels may still
+ * be reading from it when we overwrite with the next block's weights. */
+static int qimg_load_block_into_slot(cuda_qimg_runner *r, int block_idx,
+                                     qimg_block_gpu *b) {
+    if (!r->scratch_block_ready) {
+        if (qimg_alloc_scratch_block(r) != 0) return -1;
+    }
+    st_context *st = (st_context *)r->dit_st;
+    CUstream s = r->stream;
+    *b = r->scratch_block;  /* copy pointers; stream ordering protects slot reuse */
+    char name[256];
+    int ok = 1;
+#define UPLOAD_FP8(field, suffix, _bytes) do { if (ok) { \
+        snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
+        if (qimg_st_upload_fp8_raw_async(st, name, b->field, _bytes, s) != 0) ok = 0; \
+    } } while(0)
+#define UPLOAD_F32(field, suffix, _nelem) do { if (ok) { \
+        snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
+        if (qimg_st_upload_f32_async(st, name, b->field, _nelem, s) != 0) ok = 0; \
+    } } while(0)
+    int dim = r->dit_dim, mlp = r->dit_mlp_h;
+    size_t sq = (size_t)dim * dim;               /* FP8 bytes */
+    size_t s_mod = (size_t)6 * dim * dim;        /* img_mod, txt_mod: [6*dim, dim] */
+    size_t s_fc1 = (size_t)mlp * dim;
+    size_t s_fc2 = (size_t)dim * mlp;
+    int hd = r->dit_head_dim;
+    UPLOAD_FP8(attn_q_w, "attn.to_q.weight", sq);
+    UPLOAD_F32(attn_q_b, "attn.to_q.bias", (size_t)dim);
+    UPLOAD_FP8(attn_k_w, "attn.to_k.weight", sq);
+    UPLOAD_F32(attn_k_b, "attn.to_k.bias", (size_t)dim);
+    UPLOAD_FP8(attn_v_w, "attn.to_v.weight", sq);
+    UPLOAD_F32(attn_v_b, "attn.to_v.bias", (size_t)dim);
+    UPLOAD_FP8(attn_out_w, "attn.to_out.0.weight", sq);
+    UPLOAD_F32(attn_out_b, "attn.to_out.0.bias", (size_t)dim);
+    UPLOAD_FP8(attn_add_q_w, "attn.add_q_proj.weight", sq);
+    UPLOAD_F32(attn_add_q_b, "attn.add_q_proj.bias", (size_t)dim);
+    UPLOAD_FP8(attn_add_k_w, "attn.add_k_proj.weight", sq);
+    UPLOAD_F32(attn_add_k_b, "attn.add_k_proj.bias", (size_t)dim);
+    UPLOAD_FP8(attn_add_v_w, "attn.add_v_proj.weight", sq);
+    UPLOAD_F32(attn_add_v_b, "attn.add_v_proj.bias", (size_t)dim);
+    UPLOAD_FP8(attn_add_out_w, "attn.to_add_out.weight", sq);
+    UPLOAD_F32(attn_add_out_b, "attn.to_add_out.bias", (size_t)dim);
+    UPLOAD_F32(norm_q_w, "attn.norm_q.weight", (size_t)hd);
+    UPLOAD_F32(norm_k_w, "attn.norm_k.weight", (size_t)hd);
+    UPLOAD_F32(norm_added_q_w, "attn.norm_added_q.weight", (size_t)hd);
+    UPLOAD_F32(norm_added_k_w, "attn.norm_added_k.weight", (size_t)hd);
+    UPLOAD_FP8(img_mod_w, "img_mod.1.weight", s_mod);
+    UPLOAD_F32(img_mod_b, "img_mod.1.bias", (size_t)6 * dim);
+    UPLOAD_FP8(img_mlp_fc1_w, "img_mlp.net.0.proj.weight", s_fc1);
+    UPLOAD_F32(img_mlp_fc1_b, "img_mlp.net.0.proj.bias", (size_t)mlp);
+    UPLOAD_FP8(img_mlp_fc2_w, "img_mlp.net.2.weight", s_fc2);
+    UPLOAD_F32(img_mlp_fc2_b, "img_mlp.net.2.bias", (size_t)dim);
+    UPLOAD_FP8(txt_mod_w, "txt_mod.1.weight", s_mod);
+    UPLOAD_F32(txt_mod_b, "txt_mod.1.bias", (size_t)6 * dim);
+    UPLOAD_FP8(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight", s_fc1);
+    UPLOAD_F32(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias", (size_t)mlp);
+    UPLOAD_FP8(txt_mlp_fc2_w, "txt_mlp.net.2.weight", s_fc2);
+    UPLOAD_F32(txt_mlp_fc2_b, "txt_mlp.net.2.bias", (size_t)dim);
+#undef UPLOAD_FP8
+#undef UPLOAD_F32
+    return ok ? 0 : -1;
 }
 
 
@@ -1534,7 +1733,12 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
         else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
-        size_t workspace = 2ULL * 1024 * 1024 * 1024; /* 2GB reserved for activations + scratch */
+        /* Scratch working set at 512x512 is ~300 MB (d_scratch1/2/3,
+         * d_q/d_k/d_v/d_attn_out, d_img/d_txt, modulation). Also reserve
+         * one block (324 MB) for the on-demand scratch slot that
+         * qimg_load_block_into_slot uses — it eliminates the cuMemAlloc
+         * cost per block load. */
+        size_t workspace = (500ULL + 324ULL) * 1024 * 1024;
         int max_preload = (free_mem > workspace)
             ? (int)((free_mem - workspace) / block_bytes) : 0;
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
@@ -1561,6 +1765,19 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
                 (float)free_mem / (1<<30));
     }
 
+    /* Allocate the on-demand scratch slot once if we didn't preload every
+     * block. Uses ~324 MB on top of the preloaded weights but eliminates
+     * the 30 cuMemAlloc/cuMemFree per on-demand load. */
+    if (r->n_preloaded < r->dit_n_blocks) {
+        if (qimg_alloc_scratch_block(r) == 0) {
+            if (r->verbose)
+                fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
+        } else {
+            fprintf(stderr, "cuda_qimg: scratch slot alloc failed — "
+                            "falling back to per-block alloc\n");
+        }
+    }
+
     fprintf(stderr, "cuda_qimg: loaded %d blocks, dim=%d\n",
             r->dit_n_blocks, r->dit_dim);
     return 0;
@@ -1582,6 +1799,10 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
         for (int i = 0; i < r->n_preloaded; i++)
             qimg_free_block(&r->gpu_blocks[i]);
         free(r->gpu_blocks);
+    }
+    if (r->scratch_block_ready) {
+        qimg_free_block(&r->scratch_block);
+        r->scratch_block_ready = 0;
     }
     CUdeviceptr *globals = &r->d_img_in_w;
     for (int i = 0; i < 13; i++) { if (globals[i]) cuMemFree(globals[i]); }
@@ -1784,6 +2005,14 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemAlloc(&d_v, (size_t)n_total * dim * sizeof(float));
     cuMemAlloc(&d_attn_out, (size_t)n_total * dim * sizeof(float));
 
+    /* Per-block scratch buffers hoisted out of the loop — cuMemAlloc/cuMemFree
+     * are synchronous driver calls, each costs ~0.5-1 ms. Allocating these
+     * per-block adds ~90 ms/block of overhead on a 60-block, 2-CFG pipeline. */
+    CUdeviceptr d_t_silu, d_img_mod, d_txt_mod;
+    cuMemAlloc(&d_t_silu,  (size_t)dim * sizeof(float));
+    cuMemAlloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
+    cuMemAlloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
+
     /* Compute image patch grid for RoPE */
     int hp_rope = (int)sqrtf((float)n_img);
     int wp_rope = n_img / hp_rope;
@@ -1795,35 +2024,47 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         if (r->verbose && (L % 10 == 0 || L == r->dit_n_blocks - 1))
             fprintf(stderr, "\r  cuda_qimg: block %d/%d", L + 1, r->dit_n_blocks);
 
-        /* Use preloaded block if available, otherwise load on-demand */
+        /* Use preloaded block if available, else copy into the pre-allocated
+         * scratch slot via async H2D. The slot is reused for every on-demand
+         * block, so we pay the cuMemAlloc cost exactly once (at init) instead
+         * of 30× per block. */
         qimg_block_gpu blk;
         int need_free = 0;
         if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
             blk = r->gpu_blocks[L];
         } else {
-            memset(&blk, 0, sizeof(blk));
-            qimg_load_block(r, L, &blk);
-            need_free = 1;
+            struct timespec _lt0, _lt1;
+            if (L <= 15 && r->verbose >= 2) clock_gettime(CLOCK_MONOTONIC, &_lt0);
+            if (qimg_load_block_into_slot(r, L, &blk) != 0) {
+                fprintf(stderr, "cuda_qimg: block %d slot load failed\n", L);
+                return -1;
+            }
+            /* No per-block free — slot is owned by the runner. */
+            if (L <= 15 && r->verbose >= 2) {
+                cuStreamSynchronize(s);
+                clock_gettime(CLOCK_MONOTONIC, &_lt1);
+                long _dns = (_lt1.tv_sec-_lt0.tv_sec)*1000000000L + (_lt1.tv_nsec-_lt0.tv_nsec);
+                fprintf(stderr, "    block %d slot-load: %.2f ms\n", L, _dns/1e6);
+            }
         }
 
-        /* -- Image modulation: SiLU(t_emb) → Linear → 6×dim -- */
-        CUdeviceptr d_t_silu;
-        cuMemAlloc(&d_t_silu, (size_t)dim * sizeof(float));
+        /* -- Image modulation: SiLU(t_emb) → Linear → 6×dim --
+         * d_t_silu/d_img_mod/d_txt_mod are pre-allocated outside the loop. */
         cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
 
         /* Image mod */
-        CUdeviceptr d_img_mod;
-        cuMemAlloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
         op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b,
                 6 * dim, dim, 1);
 
         /* Text mod */
-        CUdeviceptr d_txt_mod;
-        cuMemAlloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
         op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b,
                 6 * dim, dim, 1);
-        cuMemFree(d_t_silu);
+#define PROF_INIT() struct timespec _ts0, _ts1; long _prof_total = 0
+#define PROF_TIC()  do { if (L==0 && r->verbose>=2) { cuStreamSynchronize(s); clock_gettime(CLOCK_MONOTONIC,&_ts0); } } while(0)
+#define PROF_TOC(name) do { if (L==0 && r->verbose>=2) { cuStreamSynchronize(s); clock_gettime(CLOCK_MONOTONIC,&_ts1); long _dns = (_ts1.tv_sec-_ts0.tv_sec)*1000000000L + (_ts1.tv_nsec-_ts0.tv_nsec); _prof_total += _dns; fprintf(stderr, "    prof [%-14s] %.3f ms\n", name, _dns/1e6); } } while(0)
+#define PROF_END() do { if (L==0 && r->verbose>=2) fprintf(stderr, "    prof [%-14s] %.3f ms\n", "TOTAL", _prof_total/1e6); } while(0)
+        PROF_INIT();
 
         /* -- adaLN + QKV projections -- */
         /* img_shift1 = d_img_mod[0..dim-1], img_scale1 = [dim..2*dim-1], etc. */
@@ -1848,7 +2089,9 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             DUMP_MAX("img_mod_scale1", img_sc1, dim);
             DUMP_MAX("img_mod_gate1", img_g1, dim);
         }
+        PROF_TIC();
         op_adaln(r, d_scratch1, d_img, img_sh1, img_sc1, n_img, dim);
+        PROF_TOC("adaln_img");
         if (L == 0 && r->verbose >= 2) { DUMP_MAX("img_adaln", d_scratch1, n_img*dim); }
         /* Save block 0 intermediates for comparison */
         if (L == 0 && r->verbose >= 3) {
@@ -1869,29 +2112,40 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         CUdeviceptr d_img_q = d_q + (size_t)n_txt * dim * sizeof(float);
         CUdeviceptr d_img_k = d_k + (size_t)n_txt * dim * sizeof(float);
         CUdeviceptr d_img_v = d_v + (size_t)n_txt * dim * sizeof(float);
+        PROF_TIC();
         op_gemm(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img);
+        PROF_TOC("img_q");
         if (L == 0 && r->verbose >= 3) SAVE_GPU("cuda_block0_img_q.bin", d_img_q, n_img*dim);
+        PROF_TIC();
         op_gemm(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img);
+        PROF_TOC("img_k");
+        PROF_TIC();
         op_gemm(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img);
+        PROF_TOC("img_v");
 
         /* Text QKV → offset at [0:n_txt] */
         CUdeviceptr d_txt_q = d_q;
         CUdeviceptr d_txt_k = d_k;
         CUdeviceptr d_txt_v = d_v;
+        PROF_TIC();
         op_gemm(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt);
         op_gemm(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt);
         op_gemm(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt);
+        PROF_TOC("txt_qkv");
 
         /* QK RMSNorm (per-head) */
+        PROF_TIC();
         op_rmsnorm_ph(r, d_img_q, blk.norm_q_w, n_img, nh, hd);
         op_rmsnorm_ph(r, d_img_k, blk.norm_k_w, n_img, nh, hd);
         op_rmsnorm_ph(r, d_txt_q, blk.norm_added_q_w, n_txt, nh, hd);
         op_rmsnorm_ph(r, d_txt_k, blk.norm_added_k_w, n_txt, nh, hd);
+        PROF_TOC("rmsnorm_ph");
 
         /* RoPE: 3-axis for both image and text tokens.
          * Image: positions = centered height/width, 0 for temporal.
          * Text: positions = txt_start + tok for ALL 3 axes.
          * txt_start = max(hp/2, wp/2) to match ComfyUI convention. */
+        PROF_TIC();
         {
             void *rope2d_args[] = {&d_img_q, &d_img_k,
                                    &n_img, &nh, &hd, &hp_rope, &wp_rope,
@@ -1906,14 +2160,19 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             cuLaunchKernel(r->rope_1d, (unsigned)n_txt, 1, 1,
                            (unsigned)nh, 1, 1, 0, s, rope1d_args, NULL);
         }
+        PROF_TOC("rope");
 
         /* Joint attention: Q/K/V already concatenated as [txt, img] */
+        PROF_TIC();
         op_attn(r, d_attn_out, d_q, d_k, d_v, n_total, nh, hd);
+        PROF_TOC("attn");
 
         /* Output projections */
         CUdeviceptr d_img_attn = d_attn_out + (size_t)n_txt * dim * sizeof(float);
         CUdeviceptr d_txt_attn = d_attn_out;
+        PROF_TIC();
         op_gemm(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img);
+        PROF_TOC("img_attn_out");
         op_gemm(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt);
 
         /* Gated residual */
@@ -1925,15 +2184,21 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         /* -- MLP with adaLN -- */
         /* Image MLP */
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
+        PROF_TIC();
         op_gemm(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b,
                 mlp_h, dim, n_img);
+        PROF_TOC("img_fc1");
         op_gelu(r, d_scratch3, n_img * mlp_h);
+        PROF_TIC();
         op_gemm(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b,
                 dim, mlp_h, n_img);
+        PROF_TOC("img_fc2");
         op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
+        if (L == 0 && r->verbose >= 2) PROF_END();
         if (L == 0) { DUMP_MAX("img_after_mlp", d_img, n_img*dim); }
 
         /* Text MLP */
+        PROF_TIC();
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
         op_gemm(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b,
                 mlp_h, dim, n_txt);
@@ -1941,6 +2206,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_gemm(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
                 dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
+        PROF_TOC("txt_mlp_all");
 
         /* Save every block output for comparison */
         if (r->verbose >= 3) {
@@ -1955,8 +2221,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         op_bf16_trunc(r, d_img, n_img * dim);
         op_bf16_trunc(r, d_txt, n_txt * dim);
 
-        /* Free modulation (always per-step), block weights only if loaded on-demand */
-        cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
+        /* Modulation scratch is hoisted — no per-block free.
+         * Block weights only freed if loaded on-demand. */
         if (need_free) {
             cuStreamSynchronize(s);  /* must sync before freeing on-demand weights */
             CUdeviceptr *ptrs = (CUdeviceptr *)&blk;
@@ -2006,6 +2272,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemFree(d_scratch1); cuMemFree(d_scratch2); cuMemFree(d_scratch3);
     cuMemFree(d_mod);
     cuMemFree(d_q); cuMemFree(d_k); cuMemFree(d_v); cuMemFree(d_attn_out);
+    cuMemFree(d_t_silu); cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
 
     return 0;
 }
