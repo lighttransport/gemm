@@ -759,6 +759,8 @@ struct cuda_qimg_runner {
     CUfunction gemm_opt_f16;    /* optimized 128×128 tiled F16 GEMM */
     CUfunction gemm_opt_fp8;    /* optimized 128×128 tiled FP8 LUT GEMM */
     CUfunction gemm_fp8_mma;    /* mma.sync m16n8k32 FP8 tensor-core GEMM (sm_89+) */
+    CUfunction gemm_fp8_mma_bf16; /* same, BF16 X pre-rounding + inline BF16 output */
+    CUfunction gemm_fp8_mma_tc128; /* 128×128 tile, 16 warps, 8 MMAs/warp (sm_89+) */
     CUfunction flash_attn_fp8;  /* mma.sync m16n8k32 FP8 flash attention (sm_89+) */
     CUfunction quantize_fp8;    /* F32 → e4m3 with per-tensor scale */
     CUfunction reduce_max_abs;  /* atomic-max reduce to a single F32 slot */
@@ -773,6 +775,8 @@ struct cuda_qimg_runner {
     CUfunction dequant_fp8_to_f16;  /* GPU-side FP8→F16 via LUT */
     int use_fp8_gemm;  /* 1 if sm >= 89 and gemm_fp8_f32 available */
     int use_fp8_mma;   /* 1 to use mma.sync FP8 tensor-core GEMM (env QIMG_FP8_MMA=1) */
+    int use_fp8_mma_bf16; /* 1 to prefer BF16-X variant (env QIMG_FP8_MMA_BF16=0 opts out) */
+    int use_fp8_mma_tc128; /* 1 to use 128×128-tile FP8 MMA (env QIMG_FP8_TC128=1) */
     int use_fp8_attn;  /* 1 to use mma.sync FP8 flash attention (env QIMG_FP8_ATTN=1) */
     /* Lazy FP8 attention workspace (re-used across blocks; sized to max n_tok*dim) */
     CUdeviceptr d_q_fp8, d_k_fp8, d_v_fp8;  /* [n_tok*dim] uint8 e4m3 */
@@ -1061,6 +1065,10 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
          * torch._scaled_mm, we pre-compute max(|X|) via reduce_max_abs_f32
          * and pass a device pointer so the kernel divides X by max/448 at
          * load and multiplies the accumulator by max/448 at writeback. */
+        /* Always compute max(|X|) for the MMA GEMM. Initially tried gating
+         * this on n_in >= 4096 (only mlp_fc2) but that broke correctness
+         * (corr dropped from 0.999 to 0.951), indicating other GEMMs also
+         * have inputs with outliers that exceed ±448. */
         CUdeviceptr x_max_ptr = 0;
         if (r->reduce_max_abs) {
             if (!r->d_qkv_max) cuMemAlloc(&r->d_qkv_max, sizeof(float));
@@ -1074,9 +1082,28 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         }
         float w_scale = 1.0f;
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale, &x_max_ptr};
+        /* 128×128-tile variant: 16 warps (512 threads), 16 KB smem for X tile.
+         * Requires n_tok >= 128 to fill a CTA row; smaller shapes fall through. */
+        if (r->use_fp8_mma_tc128 && r->gemm_fp8_mma_tc128 && n_tok >= 128 && n_out >= 128) {
+            unsigned gx128 = (unsigned)((n_out + 127) / 128);
+            unsigned gy128 = (unsigned)((n_tok + 127) / 128);
+            size_t smem128 = (size_t)128 * 32 * sizeof(float);
+            cuLaunchKernel(r->gemm_fp8_mma_tc128, gx128, gy128, 1, 512, 1, 1,
+                           smem128, r->stream, args, NULL);
+            op_bf16_trunc(r, Y, n_out * n_tok);
+            return;
+        }
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok +  31) /  32);
         size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);  /* MTILE=2 */
+        /* Prefer the BF16-X sibling when available: pre-rounds X to BF16 before
+         * the e4m3 cvt to match ComfyUI's BF16 inference dtype, and truncates
+         * the output to BF16 inline so we skip the downstream op_bf16_trunc. */
+        if (r->use_fp8_mma_bf16 && r->gemm_fp8_mma_bf16) {
+            cuLaunchKernel(r->gemm_fp8_mma_bf16, gx, gy, 1, 128, 1, 1,
+                           smem, r->stream, args, NULL);
+            return;
+        }
         cuLaunchKernel(r->gemm_fp8_mma, gx, gy, 1, 128, 1, 1,
                        smem, r->stream, args, NULL);
         /* Match the downstream BF16 precision of the tiled-FP8 path. */
@@ -1322,6 +1349,10 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gemm_opt_fp8, "gemm_opt_fp8");
     if (cuModuleGetFunction(&r->gemm_fp8_mma, module, "gemm_fp8_scaled_f32") != CUDA_SUCCESS)
         r->gemm_fp8_mma = NULL;
+    if (cuModuleGetFunction(&r->gemm_fp8_mma_bf16, module, "gemm_fp8_scaled_bf16") != CUDA_SUCCESS)
+        r->gemm_fp8_mma_bf16 = NULL;
+    if (cuModuleGetFunction(&r->gemm_fp8_mma_tc128, module, "gemm_fp8_scaled_tc128_f32") != CUDA_SUCCESS)
+        r->gemm_fp8_mma_tc128 = NULL;
     if (cuModuleGetFunction(&r->flash_attn_fp8, module, "flash_attn_fp8") != CUDA_SUCCESS)
         r->flash_attn_fp8 = NULL;
     if (cuModuleGetFunction(&r->quantize_fp8, module, "quantize_to_fp8_e4m3") != CUDA_SUCCESS)
@@ -1352,6 +1383,30 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->use_fp8_mma = (env && env[0] == '0') ? 0 : 1;
         if (verbose && r->use_fp8_mma)
             fprintf(stderr, "cuda_qimg: FP8 MMA tensor-core GEMM enabled (sm_%d)\n", sm);
+    }
+    /* BF16-X MMA variant: opt-in via QIMG_FP8_MMA_BF16=1. Measured 0.86 dB
+     * WORSE than the F32-X variant vs ComfyUI (256x256/10steps/seed42,
+     * 29.34 vs 30.20 dB), so default is off. Kept around for future A/B. */
+    r->use_fp8_mma_bf16 = 0;
+    if (r->use_fp8_mma && r->gemm_fp8_mma_bf16) {
+        const char *env = getenv("QIMG_FP8_MMA_BF16");
+        if (env && env[0] == '1') {
+            r->use_fp8_mma_bf16 = 1;
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: FP8 MMA BF16-X sibling enabled (opt-in)\n");
+        }
+    }
+    /* 128×128-tile MMA variant: opt-in via QIMG_FP8_TC128=1 during bring-up.
+     * Larger CTA tile (16 warps, 8 MMAs/warp) for higher throughput at typical
+     * qwen-image DiT shapes (n_out/n_in ≥ 3072). */
+    r->use_fp8_mma_tc128 = 0;
+    if (r->use_fp8_mma && r->gemm_fp8_mma_tc128) {
+        const char *env = getenv("QIMG_FP8_TC128");
+        if (env && env[0] == '1') {
+            r->use_fp8_mma_tc128 = 1;
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: FP8 MMA tc128 (128×128 tile) enabled (opt-in)\n");
+        }
     }
     /* FP8 flash attention: opt-in via QIMG_FP8_ATTN=1. */
     r->use_fp8_attn = 0;
