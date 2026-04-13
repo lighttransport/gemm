@@ -836,6 +836,16 @@ struct cuda_qimg_runner {
     qimg_block_gpu scratch_block;
     int scratch_block_ready;  /* non-zero if scratch_block buffers are allocated */
 
+    /* Double-buffered block scratch + copy stream for overlapping the
+     * PCIe block load with the previous block's compute. Allocated lazily
+     * together with scratch_block. Enabled when n_preloaded < n_blocks. */
+    qimg_block_gpu scratch_block_b;  /* second slot (first is scratch_block) */
+    int scratch_block_b_ready;
+    CUstream    copy_stream;
+    CUevent     slot_ready[2];  /* signal: slot has been fully HtoD'd */
+    CUevent     slot_free[2];   /* signal: compute has released the slot */
+    int         slot_initial_loaded;  /* 0 = nothing prefetched; 1+ = slots primed */
+
     /* Persistent GPU: global weights (~50MB) */
     CUdeviceptr d_img_in_w, d_img_in_b;
     CUdeviceptr d_txt_in_w, d_txt_in_b;
@@ -1189,20 +1199,103 @@ static int qimg_alloc_scratch_block(cuda_qimg_runner *r) {
     return 0;
 }
 
-/* Copy block i into the pre-allocated scratch slot. Caller gets a
- * qimg_block_gpu struct whose pointers alias the scratch slot.
- *
- * Must cuStreamSynchronize before reusing the slot — the slot is shared
- * across all on-demand blocks, and the previous block's kernels may still
- * be reading from it when we overwrite with the next block's weights. */
-static int qimg_load_block_into_slot(cuda_qimg_runner *r, int block_idx,
-                                     qimg_block_gpu *b) {
+/* Same thing, for the second slot in the double-buffer pool. Also creates
+ * the copy stream and slot events on first successful call. Returns 0 OK. */
+static int qimg_alloc_scratch_block_b(cuda_qimg_runner *r) {
+    if (r->scratch_block_b_ready) return 0;
     if (!r->scratch_block_ready) {
         if (qimg_alloc_scratch_block(r) != 0) return -1;
     }
     st_context *st = (st_context *)r->dit_st;
-    CUstream s = r->stream;
-    *b = r->scratch_block;  /* copy pointers; stream ordering protects slot reuse */
+    if (!st || r->dit_n_blocks <= 0) return -1;
+    int i0 = 0;
+    char name[256];
+    qimg_block_gpu *b = &r->scratch_block_b;
+    memset(b, 0, sizeof(*b));
+    int ok = 1;
+#define ALLOC_FROM_ST(field, suffix) do { if (ok) { \
+        snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
+        int _ti = safetensors_find(st, name); \
+        if (_ti < 0) { ok = 0; break; } \
+        size_t _nb = safetensors_nbytes(st, _ti); \
+        if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
+    } } while(0)
+#define ALLOC_F32(field, suffix) do { if (ok) { \
+        snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, i0); \
+        int _ti = safetensors_find(st, name); \
+        if (_ti < 0) { ok = 0; break; } \
+        const uint64_t *_sh = safetensors_shape(st, _ti); \
+        int _nd = safetensors_ndims(st, _ti); \
+        size_t _n = 1; for (int _d=0;_d<_nd;_d++) _n *= _sh[_d]; \
+        if (cuMemAlloc(&b->field, _n * sizeof(float)) != CUDA_SUCCESS) { ok = 0; break; } \
+    } } while(0)
+    ALLOC_FROM_ST(attn_q_w, "attn.to_q.weight");
+    ALLOC_F32(attn_q_b, "attn.to_q.bias");
+    ALLOC_FROM_ST(attn_k_w, "attn.to_k.weight");
+    ALLOC_F32(attn_k_b, "attn.to_k.bias");
+    ALLOC_FROM_ST(attn_v_w, "attn.to_v.weight");
+    ALLOC_F32(attn_v_b, "attn.to_v.bias");
+    ALLOC_FROM_ST(attn_out_w, "attn.to_out.0.weight");
+    ALLOC_F32(attn_out_b, "attn.to_out.0.bias");
+    ALLOC_FROM_ST(attn_add_q_w, "attn.add_q_proj.weight");
+    ALLOC_F32(attn_add_q_b, "attn.add_q_proj.bias");
+    ALLOC_FROM_ST(attn_add_k_w, "attn.add_k_proj.weight");
+    ALLOC_F32(attn_add_k_b, "attn.add_k_proj.bias");
+    ALLOC_FROM_ST(attn_add_v_w, "attn.add_v_proj.weight");
+    ALLOC_F32(attn_add_v_b, "attn.add_v_proj.bias");
+    ALLOC_FROM_ST(attn_add_out_w, "attn.to_add_out.weight");
+    ALLOC_F32(attn_add_out_b, "attn.to_add_out.bias");
+    ALLOC_F32(norm_q_w, "attn.norm_q.weight");
+    ALLOC_F32(norm_k_w, "attn.norm_k.weight");
+    ALLOC_F32(norm_added_q_w, "attn.norm_added_q.weight");
+    ALLOC_F32(norm_added_k_w, "attn.norm_added_k.weight");
+    ALLOC_FROM_ST(img_mod_w, "img_mod.1.weight");
+    ALLOC_F32(img_mod_b, "img_mod.1.bias");
+    ALLOC_FROM_ST(img_mlp_fc1_w, "img_mlp.net.0.proj.weight");
+    ALLOC_F32(img_mlp_fc1_b, "img_mlp.net.0.proj.bias");
+    ALLOC_FROM_ST(img_mlp_fc2_w, "img_mlp.net.2.weight");
+    ALLOC_F32(img_mlp_fc2_b, "img_mlp.net.2.bias");
+    ALLOC_FROM_ST(txt_mod_w, "txt_mod.1.weight");
+    ALLOC_F32(txt_mod_b, "txt_mod.1.bias");
+    ALLOC_FROM_ST(txt_mlp_fc1_w, "txt_mlp.net.0.proj.weight");
+    ALLOC_F32(txt_mlp_fc1_b, "txt_mlp.net.0.proj.bias");
+    ALLOC_FROM_ST(txt_mlp_fc2_w, "txt_mlp.net.2.weight");
+    ALLOC_F32(txt_mlp_fc2_b, "txt_mlp.net.2.bias");
+#undef ALLOC_FROM_ST
+#undef ALLOC_F32
+    if (!ok) {
+        qimg_free_block(b);
+        return -1;
+    }
+    /* Create copy stream + slot events. Use cuEventDisableTiming for speed. */
+    if (!r->copy_stream) {
+        if (cuStreamCreate(&r->copy_stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) {
+            qimg_free_block(b);
+            return -1;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (!r->slot_ready[i])
+            cuEventCreate(&r->slot_ready[i], CU_EVENT_DISABLE_TIMING);
+        if (!r->slot_free[i])
+            cuEventCreate(&r->slot_free[i], CU_EVENT_DISABLE_TIMING);
+    }
+    r->scratch_block_b_ready = 1;
+    return 0;
+}
+
+/* Copy block i into a pre-allocated scratch slot. Caller gets a
+ * qimg_block_gpu struct whose pointers alias the slot.
+ *
+ * Uses async H2D copies on the given stream. Stream ordering on the same
+ * stream serializes with prior compute; to reuse a slot across streams,
+ * the caller must use events. */
+static int qimg_load_block_into_slot_ex(cuda_qimg_runner *r, int block_idx,
+                                         qimg_block_gpu *slot,
+                                         qimg_block_gpu *out_b, CUstream s) {
+    st_context *st = (st_context *)r->dit_st;
+    *out_b = *slot;  /* copy pointers (slot buffers stay owned by runner) */
+    qimg_block_gpu *b = out_b;
     char name[256];
     int ok = 1;
 #define UPLOAD_FP8(field, suffix, _bytes) do { if (ok) { \
@@ -1254,6 +1347,16 @@ static int qimg_load_block_into_slot(cuda_qimg_runner *r, int block_idx,
 #undef UPLOAD_FP8
 #undef UPLOAD_F32
     return ok ? 0 : -1;
+}
+
+/* Single-slot compat wrapper: copies into r->scratch_block on r->stream. */
+static int qimg_load_block_into_slot(cuda_qimg_runner *r, int block_idx,
+                                     qimg_block_gpu *out_b) {
+    if (!r->scratch_block_ready) {
+        if (qimg_alloc_scratch_block(r) != 0) return -1;
+    }
+    return qimg_load_block_into_slot_ex(r, block_idx, &r->scratch_block,
+                                         out_b, r->stream);
 }
 
 
@@ -1749,15 +1852,20 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
         else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
-        /* Scratch working set at 512x512 is ~300 MB (d_scratch1/2/3,
-         * d_q/d_k/d_v/d_attn_out, d_img/d_txt, modulation). Also reserve
-         * one block (324 MB) for the on-demand scratch slot that
-         * qimg_load_block_into_slot uses — it eliminates the cuMemAlloc
-         * cost per block load. */
+        /* Scratch working set at 512x512 is ~300 MB. Reserve 324 MB for the
+         * one on-demand scratch slot (+324 MB for the optional second slot
+         * when QIMG_PIPELINE=1 — see dit_step block loop comment). */
         size_t workspace = (500ULL + 324ULL) * 1024 * 1024;
+        if (getenv("QIMG_PIPELINE")) workspace += 324ULL * 1024 * 1024;
         int max_preload = (free_mem > workspace)
             ? (int)((free_mem - workspace) / block_bytes) : 0;
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
+        /* QIMG_MAX_PRELOAD env var to cap preload count (for perf testing). */
+        const char *_mp_env = getenv("QIMG_MAX_PRELOAD");
+        if (_mp_env) {
+            int cap = atoi(_mp_env);
+            if (cap >= 0 && cap < max_preload) max_preload = cap;
+        }
 
         r->gpu_blocks = (qimg_block_gpu *)calloc((size_t)r->dit_n_blocks,
                                                   sizeof(qimg_block_gpu));
@@ -1781,9 +1889,11 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
                 (float)free_mem / (1<<30));
     }
 
-    /* Allocate the on-demand scratch slot once if we didn't preload every
-     * block. Uses ~324 MB on top of the preloaded weights but eliminates
-     * the 30 cuMemAlloc/cuMemFree per on-demand load. */
+    /* Allocate the on-demand scratch slot(s) once if we didn't preload every
+     * block. Uses ~324 MB per slot on top of the preloaded weights but
+     * eliminates the 30 cuMemAlloc/cuMemFree per on-demand load. A second
+     * slot + copy stream + events enables prefetching block L+1's weights
+     * while block L's kernels are still running. */
     if (r->n_preloaded < r->dit_n_blocks) {
         if (qimg_alloc_scratch_block(r) == 0) {
             if (r->verbose)
@@ -1791,6 +1901,18 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         } else {
             fprintf(stderr, "cuda_qimg: scratch slot alloc failed — "
                             "falling back to per-block alloc\n");
+        }
+        /* Only allocate the second scratch slot + copy stream when
+         * QIMG_PIPELINE=1 (see dit_step block loop comment). Saves 324 MB. */
+        if (getenv("QIMG_PIPELINE")) {
+            if (qimg_alloc_scratch_block_b(r) == 0) {
+                if (r->verbose)
+                    fprintf(stderr, "cuda_qimg: double-buffered scratch enabled "
+                            "(copy stream + 2 slots)\n");
+            } else {
+                fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed — "
+                                "single-slot mode\n");
+            }
         }
     }
 
@@ -1820,6 +1942,15 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
         qimg_free_block(&r->scratch_block);
         r->scratch_block_ready = 0;
     }
+    if (r->scratch_block_b_ready) {
+        qimg_free_block(&r->scratch_block_b);
+        r->scratch_block_b_ready = 0;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (r->slot_ready[i]) cuEventDestroy(r->slot_ready[i]);
+        if (r->slot_free[i])  cuEventDestroy(r->slot_free[i]);
+    }
+    if (r->copy_stream) cuStreamDestroy(r->copy_stream);
     CUdeviceptr *globals = &r->d_img_in_w;
     for (int i = 0; i < 13; i++) { if (globals[i]) cuMemFree(globals[i]); }
     /* FP8 attention workspace (lazily allocated by ensure_fp8_attn_buf) */
@@ -2165,43 +2296,67 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     float rope_theta = 10000.0f;
     int t_dim_rope = 16, h_dim_rope = 56, w_dim_rope = 56;
 
-    /* 4. Process all blocks */
+    /* 4. Process all blocks with double-buffered on-demand loading.
+     *
+     * Pipeline: while block L's kernels run on r->stream, block L+1's
+     * weights are copied into the OTHER scratch slot on r->copy_stream.
+     * cuEvents coordinate slot reuse safely.
+     *
+     *  - slot_ready[i] : fires when copy_stream finished filling slot i
+     *  - slot_free[i]  : fires when r->stream finished reading slot i
+     */
+    /* Double-buffered on-demand block load is OFF by default — measured
+     * identical to the single-slot path (7.19 s/step at 512x512 with
+     * max_preload=12 → 48 on-demand blocks, pipeline on vs off differs
+     * by 10 ms). The copy engine on sm_89+ GPUs already runs concurrent
+     * with SM compute even when both are queued on one stream, so manual
+     * double-buffering adds event overhead without unlocking new parallelism.
+     * Kept behind QIMG_PIPELINE=1 for future experimentation. */
+    int use_pipeline = 0;
+    if (getenv("QIMG_PIPELINE") && r->scratch_block_b_ready &&
+        r->n_preloaded < r->dit_n_blocks) {
+        use_pipeline = 1;
+    }
+    qimg_block_gpu *slot_ptrs[2] = { &r->scratch_block, &r->scratch_block_b };
+
+    /* Prefetch initial 2 slots before the loop begins, if pipelining. */
+    if (use_pipeline) {
+        for (int i = 0; i < 2; i++) {
+            int L0 = r->n_preloaded + i;
+            if (L0 >= r->dit_n_blocks) break;
+            qimg_block_gpu tmp;
+            qimg_load_block_into_slot_ex(r, L0, slot_ptrs[i], &tmp, r->copy_stream);
+            cuEventRecord(r->slot_ready[i], r->copy_stream);
+        }
+    }
+
     for (int L = 0; L < r->dit_n_blocks; L++) {
         if (r->verbose && (L % 10 == 0 || L == r->dit_n_blocks - 1))
             fprintf(stderr, "\r  cuda_qimg: block %d/%d", L + 1, r->dit_n_blocks);
 
-        /* Use preloaded block if available, else copy into the pre-allocated
-         * scratch slot via async H2D. The slot is reused for every on-demand
-         * block, so we pay the cuMemAlloc cost exactly once (at init) instead
-         * of 30× per block. */
         qimg_block_gpu blk;
-        int need_free = 0;
+        int slot_used = -1;  /* which double-buffer slot (0/1) this block consumed */
         if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
             blk = r->gpu_blocks[L];
+        } else if (use_pipeline) {
+            int od = L - r->n_preloaded;
+            slot_used = od % 2;
+            /* Wait for the copy_stream to have finished filling this slot. */
+            cuStreamWaitEvent(s, r->slot_ready[slot_used], 0);
+            blk = *slot_ptrs[slot_used];
         } else {
-            struct timespec _lt0, _lt1;
-            if (L <= 15 && r->verbose >= 2) clock_gettime(CLOCK_MONOTONIC, &_lt0);
+            /* Single-slot fallback: synchronous copy on r->stream. */
             if (qimg_load_block_into_slot(r, L, &blk) != 0) {
                 fprintf(stderr, "cuda_qimg: block %d slot load failed\n", L);
                 return -1;
             }
-            /* No per-block free — slot is owned by the runner. */
-            if (L <= 15 && r->verbose >= 2) {
-                cuStreamSynchronize(s);
-                clock_gettime(CLOCK_MONOTONIC, &_lt1);
-                long _dns = (_lt1.tv_sec-_lt0.tv_sec)*1000000000L + (_lt1.tv_nsec-_lt0.tv_nsec);
-                fprintf(stderr, "    block %d slot-load: %.2f ms\n", L, _dns/1e6);
-            }
         }
 
-        /* -- Image modulation: SiLU(t_emb) → Linear → 6×dim --
-         * d_t_silu/d_img_mod/d_txt_mod are pre-allocated outside the loop. */
+        /* Modulation + shared block forward */
         cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
         op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
-
-        /* Pack state and run the shared block forward */
         qimg_fwd_state_t _st;
         _st.d_img = d_img; _st.d_txt = d_txt;
         _st.d_q = d_q; _st.d_k = d_k; _st.d_v = d_v; _st.d_attn_out = d_attn_out;
@@ -2219,13 +2374,18 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             DIT_SAVE_NPY(_fn, d_txt, n_txt, dim);
         }
 
-        /* Block weights only freed if loaded on-demand (and not using slot). */
-        if (need_free) {
-            cuStreamSynchronize(s);
-            CUdeviceptr *ptrs = (CUdeviceptr *)&blk;
-            int np = sizeof(qimg_block_gpu) / sizeof(CUdeviceptr);
-            for (int pi = 0; pi < np; pi++)
-                if (ptrs[pi]) cuMemFree(ptrs[pi]);
+        /* If we just consumed a slot, release it and prefetch block L+2
+         * into it on copy_stream. */
+        if (use_pipeline && slot_used >= 0) {
+            cuEventRecord(r->slot_free[slot_used], s);
+            int next_L = L + 2;
+            if (next_L < r->dit_n_blocks && next_L >= r->n_preloaded) {
+                cuStreamWaitEvent(r->copy_stream, r->slot_free[slot_used], 0);
+                qimg_block_gpu tmp;
+                qimg_load_block_into_slot_ex(r, next_L, slot_ptrs[slot_used], &tmp,
+                                             r->copy_stream);
+                cuEventRecord(r->slot_ready[slot_used], r->copy_stream);
+            }
         }
     }
     if (r->verbose) fprintf(stderr, "\n");
@@ -2393,15 +2553,37 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     float rope_theta = 10000.0f;
     int t_dim_rope = 16, h_dim_rope = 56, w_dim_rope = 56;
 
-    /* ---- 4. Block loop: each block loaded ONCE, applied to both passes ---- */
+    /* ---- 4. Block loop with optional double-buffered on-demand loading.
+     *       OFF by default — see dit_step comment above. ---- */
+    int use_pipeline = 0;
+    if (getenv("QIMG_PIPELINE") && r->scratch_block_b_ready &&
+        r->n_preloaded < r->dit_n_blocks) {
+        use_pipeline = 1;
+    }
+    qimg_block_gpu *slot_ptrs[2] = { &r->scratch_block, &r->scratch_block_b };
+    if (use_pipeline) {
+        for (int i = 0; i < 2; i++) {
+            int L0 = r->n_preloaded + i;
+            if (L0 >= r->dit_n_blocks) break;
+            qimg_block_gpu tmp;
+            qimg_load_block_into_slot_ex(r, L0, slot_ptrs[i], &tmp, r->copy_stream);
+            cuEventRecord(r->slot_ready[i], r->copy_stream);
+        }
+    }
+
     for (int L = 0; L < r->dit_n_blocks; L++) {
         if (r->verbose && (L % 10 == 0 || L == r->dit_n_blocks - 1))
             fprintf(stderr, "\r  cuda_qimg: block %d/%d", L + 1, r->dit_n_blocks);
 
         qimg_block_gpu blk;
-        int need_free = 0;
+        int slot_used = -1;
         if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
             blk = r->gpu_blocks[L];
+        } else if (use_pipeline) {
+            int od = L - r->n_preloaded;
+            slot_used = od % 2;
+            cuStreamWaitEvent(s, r->slot_ready[slot_used], 0);
+            blk = *slot_ptrs[slot_used];
         } else {
             if (qimg_load_block_into_slot(r, L, &blk) != 0) {
                 fprintf(stderr, "cuda_qimg: block %d slot load failed\n", L);
@@ -2436,12 +2618,17 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
                                hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta);
         }
 
-        if (need_free) {
-            cuStreamSynchronize(s);
-            CUdeviceptr *ptrs = (CUdeviceptr *)&blk;
-            int np = sizeof(qimg_block_gpu) / sizeof(CUdeviceptr);
-            for (int pi = 0; pi < np; pi++)
-                if (ptrs[pi]) cuMemFree(ptrs[pi]);
+        /* If we consumed a double-buffer slot, release it and prefetch L+2. */
+        if (use_pipeline && slot_used >= 0) {
+            cuEventRecord(r->slot_free[slot_used], s);
+            int next_L = L + 2;
+            if (next_L < r->dit_n_blocks && next_L >= r->n_preloaded) {
+                cuStreamWaitEvent(r->copy_stream, r->slot_free[slot_used], 0);
+                qimg_block_gpu tmp;
+                qimg_load_block_into_slot_ex(r, next_L, slot_ptrs[slot_used], &tmp,
+                                             r->copy_stream);
+                cuEventRecord(r->slot_ready[slot_used], r->copy_stream);
+            }
         }
     }
     if (r->verbose) fprintf(stderr, "\n");
