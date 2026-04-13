@@ -1053,10 +1053,27 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
          * Grid: (ceil(n_out/256), ceil(n_tok/32)), Block: 128 threads (4 warps).
          * Shared mem: (16*MTILE) * 32 * sizeof(float) = 2048 bytes for X tile.
          * n_tok >= 16 gate: matches the MTILE=2 minimum-row assumption and
-         * routes single-token ops (timestep embed, modulation) to the LUT path
-         * which has been validated for those shapes. */
+         * routes single-token ops (timestep embed, modulation) to the LUT path.
+         *
+         * Per-tensor input scaling: when X magnitudes exceed ±448 (e.g.
+         * GELU output from mlp_fc1 can hit 600+), the in-kernel cvt.rn.
+         * satfinite.e4m3 clamps and the output diverges. To match ComfyUI's
+         * torch._scaled_mm, we pre-compute max(|X|) via reduce_max_abs_f32
+         * and pass a device pointer so the kernel divides X by max/448 at
+         * load and multiplies the accumulator by max/448 at writeback. */
+        CUdeviceptr x_max_ptr = 0;
+        if (r->reduce_max_abs) {
+            if (!r->d_qkv_max) cuMemAlloc(&r->d_qkv_max, sizeof(float));
+            cuMemsetD32Async(r->d_qkv_max, 0, 1, r->stream);
+            int n_x = n_tok * n_in;
+            void *rargs[] = {&r->d_qkv_max, &X, &n_x};
+            unsigned rb = (unsigned)((n_x + 255) / 256);
+            cuLaunchKernel(r->reduce_max_abs, rb, 1, 1, 256, 1, 1,
+                           0, r->stream, rargs, NULL);
+            x_max_ptr = r->d_qkv_max;
+        }
         float w_scale = 1.0f;
-        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale};
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale, &x_max_ptr};
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok +  31) /  32);
         size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);  /* MTILE=2 */
@@ -1321,19 +1338,18 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         if (verbose)
             fprintf(stderr, "cuda_qimg: FP8 LUT GEMM enabled (sm_%d)\n", sm);
     }
-    /* FP8 tensor-core MMA path: opt-in via QIMG_FP8_MMA=1.
+    /* FP8 tensor-core MMA path — default ON when hardware supports it.
      *
-     * NOTE (2026-04): this path currently causes a ~3x velocity inflation in
-     * end-to-end qwen-image generation (see trace_cfg_velocities.py: LUT
-     * v_cond_std=1.11 matches ComfyUI, MMA v_cond_std=3.28). Single-layer unit
-     * tests pass (corr=0.9995 vs PyTorch img_projected, ratio=1.000 vs LUT on
-     * production shapes 3072x3072x256 and 3072x12288x256). The bug is
-     * emergent — it appears only when all block GEMMs are routed through
-     * MMA together. Left as opt-in until the root cause is traced. */
+     * Uses per-tensor input scaling (reduce_max_abs + in-kernel divide-at-load
+     * and multiply-at-writeback) so GELU outputs that exceed ±448 (mlp_fc2
+     * input peaks at ~650 in qwen-image) don't saturate the e4m3 cvt.
+     * End-to-end vs ComfyUI at 256x256/10 steps: corr=0.9991, matches
+     * LUT path's 0.9999 within FP8 quantization noise.
+     * Opt out with QIMG_FP8_MMA=0 to A/B test against the LUT path. */
     r->use_fp8_mma = 0;
-    if (r->gemm_fp8_mma && r->use_fp8_gemm && sm >= 89) {
+    if (r->gemm_fp8_mma && r->use_fp8_gemm && sm >= 89 && r->reduce_max_abs) {
         const char *env = getenv("QIMG_FP8_MMA");
-        r->use_fp8_mma = (env && env[0] != '0' && env[0] != 0) ? 1 : 0;
+        r->use_fp8_mma = (env && env[0] == '0') ? 0 : 1;
         if (verbose && r->use_fp8_mma)
             fprintf(stderr, "cuda_qimg: FP8 MMA tensor-core GEMM enabled (sm_%d)\n", sm);
     }

@@ -152,8 +152,9 @@ static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
     /* MMA path */
     {
         float w_scale = 1.0f;
+        CUdeviceptr x_max_ptr = 0;  /* skip per-tensor scaling in unit test */
         int no = n_out, ni = n_in, nt = n_tok;
-        void *args[] = {&d_Y, &d_W, &d_X, &bias, &no, &ni, &nt, &w_scale};
+        void *args[] = {&d_Y, &d_W, &d_X, &bias, &no, &ni, &nt, &w_scale, &x_max_ptr};
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok +  31) /  32);
         size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);
