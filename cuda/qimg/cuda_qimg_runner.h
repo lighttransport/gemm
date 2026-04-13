@@ -1389,7 +1389,7 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
 
-    if (r->use_fp8_mma && r->gemm_fp8_mma && n_tok >= 16 && !r->use_old_gemm) {
+    if (r->use_fp8_mma && r->gemm_fp8_mma && n_tok >= 4 && !r->use_old_gemm) {
         /* mma.sync m16n8k32 FP8 tensor-core GEMM with per-tensor weight scale.
          * qwen-image FP8 weights are raw e4m3 (no scale) → w_scale = 1.0f.
          * Grid: (ceil(n_out/256), ceil(n_tok/32)), Block: 128 threads (4 warps).
