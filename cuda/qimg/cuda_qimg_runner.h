@@ -1306,6 +1306,8 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
             op_bf16_trunc(r, Y, n_out * n_tok);
             return;
         }
+        /* Default kernel: MTILE=2 × NWARPS=4 × NTILE=8 × 8 = 256 N cols/CTA,
+         * 32 M rows/CTA. BF16 truncation is fused into the writeback. */
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok +  31) /  32);
         size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);  /* MTILE=2 */
@@ -1319,8 +1321,7 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         }
         cuLaunchKernel(r->gemm_fp8_mma, gx, gy, 1, 128, 1, 1,
                        smem, r->stream, args, NULL);
-        /* Match the downstream BF16 precision of the tiled-FP8 path. */
-        op_bf16_trunc(r, Y, n_out * n_tok);
+        /* BF16 truncation is fused into the MMA kernel writeback (to_bf16 inline). */
         return;
     }
 
