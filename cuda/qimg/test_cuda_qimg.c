@@ -797,15 +797,13 @@ int main(int argc, char **argv) {
             /* Patchify latent */
             qimg_dit_patchify(img_tokens, latent, lat_ch, lat_h, lat_w, ps);
 
-            /* Conditional DiT forward (with text) */
-            cuda_qimg_dit_step(r, img_tokens, n_img, txt_hidden, n_txt,
-                               t_val, vel_cond);
-
             int lat_n = lat_ch * lat_h * lat_w;
             float *vel_latent = (float *)malloc((size_t)lat_n * sizeof(float));
 
             /* Euler step: x += v * dt (model output is velocity) */
             if (no_cfg) {
+                cuda_qimg_dit_step(r, img_tokens, n_img, txt_hidden, n_txt,
+                                   t_val, vel_cond);
                 qimg_dit_unpatchify(vel_latent, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
                 /* Debug: save step 1 model output (verbose >= 3) */
                 if (step == 0 && r->verbose >= 3) {
@@ -816,8 +814,13 @@ int main(int argc, char **argv) {
                     if (lf2) { fwrite(vel_latent, sizeof(float), (size_t)lat_n, lf2); fclose(lf2); }
                 }
             } else {
-                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt_neg,
-                                   t_val, vel_uncond);
+                /* CFG batched: run cond and uncond through each block with a
+                 * single block-weight load per block (halves PCIe traffic on
+                 * the on-demand loader path). */
+                cuda_qimg_dit_step_cfg(r, img_tokens, n_img,
+                                       txt_hidden,      n_txt,
+                                       txt_neg_hidden,  n_txt_neg,
+                                       t_val, vel_cond, vel_uncond);
 
                 float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
                 float *vu_lat = (float *)malloc((size_t)lat_n * sizeof(float));
