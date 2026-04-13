@@ -788,6 +788,7 @@ struct cuda_qimg_runner {
     CUfunction gemm_fp8_mma;    /* mma.sync m16n8k32 FP8 tensor-core GEMM (sm_89+) */
     CUfunction gemm_fp8_mma_bf16; /* same, BF16 X pre-rounding + inline BF16 output */
     CUfunction gemm_fp8_mma_tc128; /* 128×128 tile, 16 warps, 8 MMAs/warp (sm_89+) */
+    CUfunction gemm_fp8_mma_pipe;  /* 2-stage cp.async pipelined W-in-smem variant (sm_80+) */
     CUfunction flash_attn_fp8;  /* mma.sync m16n8k32 FP8 flash attention (sm_89+) */
     CUfunction quantize_fp8;    /* F32 → e4m3 with per-tensor scale */
     CUfunction reduce_max_abs;  /* atomic-max reduce to a single F32 slot */
@@ -804,6 +805,7 @@ struct cuda_qimg_runner {
     int use_fp8_mma;   /* 1 to use mma.sync FP8 tensor-core GEMM (env QIMG_FP8_MMA=1) */
     int use_fp8_mma_bf16; /* 1 to prefer BF16-X variant (env QIMG_FP8_MMA_BF16=0 opts out) */
     int use_fp8_mma_tc128; /* 1 to use 128×128-tile FP8 MMA (env QIMG_FP8_TC128=1) */
+    int use_fp8_pipe;  /* 1 to use cp.async pipelined FP8 MMA GEMM (env QIMG_FP8_PIPE=1) */
     int use_fp8_attn;  /* 1 to use mma.sync FP8 flash attention (env QIMG_FP8_ATTN=1) */
     /* Lazy FP8 attention workspace (re-used across blocks; sized to max n_tok*dim) */
     CUdeviceptr d_q_fp8, d_k_fp8, d_v_fp8;  /* [n_tok*dim] uint8 e4m3 */
@@ -1436,6 +1438,17 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok +  31) /  32);
         size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);  /* MTILE=2 */
+        /* Pipelined variant: cp.async loads W into smem double-buffered so
+         * the next k-tile's weight prefetch overlaps with the current tile's
+         * MMAs. Requires divisible shapes (n_out%256==0, n_in%32==0) and
+         * n_tok >= 16 — these hold for all qwen-image block linears. */
+        if (r->use_fp8_pipe && r->gemm_fp8_mma_pipe && n_tok >= 16 &&
+            (n_out % 256) == 0 && (n_in % 32) == 0) {
+            size_t smem_pipe = 1024 + 8192 * 2;  /* FP8 X tile + 2 × W tile = 17408 B */
+            cuLaunchKernel(r->gemm_fp8_mma_pipe, gx, gy, 1, 128, 1, 1,
+                           smem_pipe, r->stream, args, NULL);
+            return;
+        }
         /* Prefer the BF16-X sibling when available: pre-rounds X to BF16 before
          * the e4m3 cvt to match ComfyUI's BF16 inference dtype, and truncates
          * the output to BF16 inline so we skip the downstream op_bf16_trunc. */
@@ -1692,6 +1705,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_fp8_mma_bf16 = NULL;
     if (cuModuleGetFunction(&r->gemm_fp8_mma_tc128, module, "gemm_fp8_scaled_tc128_f32") != CUDA_SUCCESS)
         r->gemm_fp8_mma_tc128 = NULL;
+    if (cuModuleGetFunction(&r->gemm_fp8_mma_pipe, module, "gemm_fp8_scaled_f32_pipe") != CUDA_SUCCESS)
+        r->gemm_fp8_mma_pipe = NULL;
     if (cuModuleGetFunction(&r->flash_attn_fp8, module, "flash_attn_fp8") != CUDA_SUCCESS)
         r->flash_attn_fp8 = NULL;
     if (cuModuleGetFunction(&r->quantize_fp8, module, "quantize_to_fp8_e4m3") != CUDA_SUCCESS)
@@ -1746,6 +1761,18 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
             if (verbose)
                 fprintf(stderr, "cuda_qimg: FP8 MMA tc128 (128×128 tile) enabled (opt-in)\n");
         }
+    }
+    /* Pipelined cp.async W-in-smem variant: ON by default on sm_80+.
+     * Prefetches each k-tile's W slab into smem while MMAs run on the
+     * current tile, hiding operand-load latency. Measured +6% at 256x256
+     * / +9% at 512x512 and bit-identical to the baseline MMA path.
+     * Opt out with QIMG_FP8_PIPE=0 to A/B test. */
+    r->use_fp8_pipe = 0;
+    if (r->use_fp8_mma && r->gemm_fp8_mma_pipe && sm >= 80) {
+        const char *env = getenv("QIMG_FP8_PIPE");
+        r->use_fp8_pipe = (env && env[0] == '0') ? 0 : 1;
+        if (verbose && r->use_fp8_pipe)
+            fprintf(stderr, "cuda_qimg: FP8 MMA pipelined cp.async GEMM enabled\n");
     }
     /* Parallel CFG streams: opt-in via QIMG_CFG_STREAMS=1.
      * Creates a secondary compute stream + synchronization events so
