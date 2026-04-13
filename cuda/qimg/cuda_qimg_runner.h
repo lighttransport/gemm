@@ -858,6 +858,16 @@ struct cuda_qimg_runner {
     CUevent     slot_free[2];   /* signal: compute has released the slot */
     int         slot_initial_loaded;  /* 0 = nothing prefetched; 1+ = slots primed */
 
+    /* Parallel CFG streams: when QIMG_CFG_STREAMS=1, dit_step_cfg runs the
+     * cond pass on r->stream and the uncond pass on r->uncond_stream
+     * concurrently within each block. Their computations can overlap on the
+     * GPU because ops on different streams without explicit dependencies
+     * run concurrently. */
+    CUstream    uncond_stream;
+    CUevent     block_barrier_cond;  /* cond-done barrier for next iter sync */
+    CUevent     block_barrier_unc;   /* uncond-done barrier */
+    CUevent     mod_ready;           /* modulation computed (both streams wait on this) */
+
     /* Persistent GPU: global weights (~50MB) */
     CUdeviceptr d_img_in_w, d_img_in_b;
     CUdeviceptr d_txt_in_w, d_txt_in_b;
@@ -1737,6 +1747,18 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
                 fprintf(stderr, "cuda_qimg: FP8 MMA tc128 (128×128 tile) enabled (opt-in)\n");
         }
     }
+    /* Parallel CFG streams: opt-in via QIMG_CFG_STREAMS=1.
+     * Creates a secondary compute stream + synchronization events so
+     * dit_step_cfg can run cond and uncond passes concurrently. */
+    if (getenv("QIMG_CFG_STREAMS")) {
+        if (cuStreamCreate(&r->uncond_stream, CU_STREAM_NON_BLOCKING) == CUDA_SUCCESS) {
+            cuEventCreate(&r->block_barrier_cond, CU_EVENT_DISABLE_TIMING);
+            cuEventCreate(&r->block_barrier_unc,  CU_EVENT_DISABLE_TIMING);
+            cuEventCreate(&r->mod_ready,          CU_EVENT_DISABLE_TIMING);
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: parallel CFG streams enabled\n");
+        }
+    }
     /* FP8 flash attention: opt-in via QIMG_FP8_ATTN=1. */
     r->use_fp8_attn = 0;
     {
@@ -1963,6 +1985,10 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
         if (r->slot_free[i])  cuEventDestroy(r->slot_free[i]);
     }
     if (r->copy_stream) cuStreamDestroy(r->copy_stream);
+    if (r->uncond_stream) cuStreamDestroy(r->uncond_stream);
+    if (r->block_barrier_cond) cuEventDestroy(r->block_barrier_cond);
+    if (r->block_barrier_unc)  cuEventDestroy(r->block_barrier_unc);
+    if (r->mod_ready)          cuEventDestroy(r->mod_ready);
     CUdeviceptr *globals = &r->d_img_in_w;
     for (int i = 0; i < 13; i++) { if (globals[i]) cuMemFree(globals[i]); }
     /* FP8 attention workspace (lazily allocated by ensure_fp8_attn_buf) */
@@ -2600,13 +2626,13 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             }
         }
 
-        /* Modulation (shared between cond/uncond) */
+        /* Modulation (shared between cond/uncond) — always on r->stream */
         cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
         op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
 
-        /* --- Cond pass --- */
+        /* --- Cond pass (on r->stream) --- */
         {
             qimg_fwd_state_t st_c;
             st_c.d_img = d_img_c; st_c.d_txt = d_txt_c;
@@ -2616,7 +2642,19 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             qimg_forward_block(r, &st_c, &blk, L, d_img_mod, d_txt_mod,
                                hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta);
         }
-        /* --- Uncond pass --- */
+        /* --- Uncond pass ---
+         * When parallel CFG is enabled, record mod_ready on r->stream then
+         * temporarily swap r->stream to uncond_stream so op_* helpers dispatch
+         * their kernels there. uncond_stream waits on mod_ready so it starts
+         * its own work only after modulation is produced. At end of block we
+         * sync so next iter's modulation sees both passes complete. */
+        int use_parallel = (r->uncond_stream != NULL);
+        CUstream saved_stream = r->stream;
+        if (use_parallel) {
+            cuEventRecord(r->mod_ready, s);
+            cuStreamWaitEvent(r->uncond_stream, r->mod_ready, 0);
+            r->stream = r->uncond_stream;
+        }
         {
             qimg_fwd_state_t st_u;
             st_u.d_img = d_img_u; st_u.d_txt = d_txt_u;
@@ -2625,6 +2663,14 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             st_u.n_img = n_img; st_u.n_txt = n_txt_uncond; st_u.n_total = n_total_uncond;
             qimg_forward_block(r, &st_u, &blk, L, d_img_mod, d_txt_mod,
                                hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta);
+        }
+        if (use_parallel) {
+            /* Rejoin: next block's modulation depends on shared d_img_mod/
+             * d_txt_mod, which is on saved_stream. Make the saved stream
+             * wait for uncond_stream to finish this block's uncond work. */
+            cuEventRecord(r->block_barrier_unc, r->uncond_stream);
+            r->stream = saved_stream;
+            cuStreamWaitEvent(r->stream, r->block_barrier_unc, 0);
         }
 
         /* If we consumed a double-buffer slot, release it and prefetch L+2. */
