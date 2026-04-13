@@ -981,9 +981,9 @@ static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     return d;
 }
 
-/* Async HtoD on r->stream — queues after pending kernels, stream ordering
- * guarantees scratch-slot writes are serialized with prior compute. This
- * removes the explicit cuStreamSynchronize before each slot load. */
+/* Async HtoD on r->stream — queues after pending compute kernels, stream
+ * ordering serializes scratch-slot writes with prior compute so no explicit
+ * cuStreamSynchronize is needed between block loads. */
 static int qimg_st_upload_fp8_raw_async(st_context *st, const char *name,
                                          CUdeviceptr dst, size_t dst_nbytes,
                                          CUstream s) {
@@ -991,8 +991,7 @@ static int qimg_st_upload_fp8_raw_async(st_context *st, const char *name,
     if (idx < 0) return -1;
     size_t nbytes = safetensors_nbytes(st, idx);
     if (nbytes != dst_nbytes) return -1;
-    void *data = safetensors_data(st, idx);
-    cuMemcpyHtoDAsync(dst, data, nbytes, s);
+    cuMemcpyHtoDAsync(dst, safetensors_data(st, idx), nbytes, s);
     return 0;
 }
 
@@ -1690,6 +1689,7 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     r->dit_st = st;
+
 
     r->dit_dim = 3072; r->dit_n_heads = 24; r->dit_head_dim = 128;
     r->dit_in_ch = 64; r->dit_txt_dim = 3584; r->dit_mlp_h = 12288;
