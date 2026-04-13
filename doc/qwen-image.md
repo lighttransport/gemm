@@ -268,31 +268,49 @@ python verify_pipeline.py --cuda-dir ../../cuda/qimg/ --ref-dir output/
 | **VAE (CUDA)** | SSIM=1.0000 | Pixel-perfect (max diff=2/255) |
 | **VAE (CPU)** | SSIM=1.0000 | Pixel-perfect (same 3 fixes as CUDA) |
 | **DiT (per-block)** | corr=1.000000 | All 60 blocks match (FP8 LUT = ComfyUI FP8) |
-| **DiT (per-block, 6-tok neg)** | corr=1.000000 | Separate token counts work correctly |
-| **Text encoder** | corr=1.000000 | FP8 scaled safetensors with Q/K/V biases + template stripping |
+| **DiT img_in FP8 linear** | corr=0.999547 | MMA kernel vs ComfyUI reference (FP8 noise floor) |
+| **Full pipeline latent** | corr=0.999107 | 256×256/10-step vs cf_ournoise2 reference, PSNR 51 dB |
 | **Scheduler sigmas** | exact match | Pre-shifted table + simple sampling |
-| **Full pipeline (10 steps)** | SSIM≈0.73 | FP8 precision compounds over 10 steps |
 
 ### Performance (CUDA, RTX 5060 Ti 16GB)
 
-**End-to-end pipeline (256×256, 10 steps, CFG):**
+**Denoising-only per-step (seed=42, cfg=2.5, simple scheduler, warm cache):**
 
-| Stage | Time | Notes |
-|---|---|---|
-| Text encoder (GPU) | 12.8s | GGUF Q4_K via CUDA LLM runner (CPU fallback: ~710s) |
-| DiT load | 1.7s | 41/60 blocks preloaded to VRAM |
-| DiT denoising (10 steps) | 36.7s | 3.67s/step, 128×128 tiled GEMM |
-| VAE decode | 1.2s | GPU conv2d + CPU middle attention |
-| **Total** | **52.4s** | **14.3× faster than initial 748s** |
+| Mode | 256×256 (10 steps) | 512×512 (4 steps) | Gap vs ComfyUI |
+|---|---:|---:|---:|
+| ComfyUI (cuDNN+cuBLAS) | 1.28 s/step | 1.61 s/step | 1.00× |
+| ours — LUT baseline | 4.81 s/step | 9.25 s/step | 3.76×–5.75× |
+| ours — FP8 MMA (default) | 3.77 s/step | 6.07 s/step | 2.94×–3.77× |
+| **ours — FP8 MMA + FP8 ATTN** | **3.71 s/step** | **5.05 s/step** | **2.90×–3.14×** |
 
-**DiT per-step performance:**
+Correctness: corr=0.999107 vs `cf_ournoise2_10step_latent.npy`, every channel corr ≥ 0.998.
+`QIMG_FP8_MMA=0` opts back to the LUT path, `QIMG_FP8_ATTN=1` enables FP8 flash attention.
 
-| Resolution | Latent | Tokens | Time/step (CFG) | Time/step (no-CFG) |
-|---|---|---|---|---|
-| 256×256 | 32×32 | 256 | 3.67s | ~1.8s |
-| 512×512 | 64×64 | 1024 | ~12s | ~6s |
+**FP8 stack wins from this optimization pass** (512×512, 4-step):
+- LUT baseline:                 21.85 s/step
+- +FP8 MMA GEMM (fix P7'):      11.55 s/step  (1.89×)
+- +scratch-slot block loader:   10.22 s/step  (2.14×)
+- +FP8 flash attention:          5.05 s/step  (4.33×)
 
-**GPU memory strategy:** Text encoder (4.1 GB) runs first, then releases VRAM. DiT weights (13.3 GB) loaded after. Both share the primary CUDA context via `cuDevicePrimaryCtxRetain`.
+**Dominant remaining cost**: PCIe block loading. Only 11/60 blocks fit in 16 GB VRAM
+at 512×512 so 48 blocks are loaded on-demand per forward (~85 ms each through
+pageable HtoD). Per-block profile at 512×512:
+
+```
+img_q/k/v         2.7 ms    txt_qkv        1.5 ms
+attn (FP8)        1.2 ms    rmsnorm_ph     0.1 ms
+img_attn_out      0.9 ms    rope           0.2 ms
+img_fc1           5.6 ms    img_fc2        4.5 ms
+img_adaLN         0.1 ms    txt_mlp_all    2.9 ms
+─────────────────────────
+img block compute ~20 ms    block load (on-demand) ~85 ms
+```
+
+**GPU memory strategy:** Text encoder (4.1 GB) runs first, then releases VRAM. DiT
+weights (13.3 GB in FP8) loaded after. Per-runner pre-allocated scratch block slot
+(324 MB) reused for all on-demand blocks — eliminates the 30 cuMemAlloc/cuMemFree
+per-block driver calls. Both text encoder and DiT share the primary CUDA context
+via `cuDevicePrimaryCtxRetain`.
 
 ### Critical Bugs Fixed
 
@@ -319,11 +337,24 @@ python verify_pipeline.py --cuda-dir ../../cuda/qimg/ --ref-dir output/
 
 | Change | Pipeline Time | Speedup |
 |---|---|---|
-| Baseline (16×16 GEMM, CPU text encoder) | 748s | 1× |
-| 128×128 tiled GEMM with register blocking | 714s | 1.05× |
-| Multi-threaded CPU text encoder (16 threads) | 710s | 1.05× |
-| GGUF Q4_K encoder + injected biases | 710s | 1.05× |
-| **GPU text encoder via CUDA LLM runner** | **52s** | **14.3×** |
+| Baseline (16×16 GEMM, CPU text encoder) | 748 s | 1× |
+| 128×128 tiled GEMM with register blocking | 714 s | 1.05× |
+| Multi-threaded CPU text encoder (16 threads) | 710 s | 1.05× |
+| GGUF Q4_K encoder + injected biases | 710 s | 1.05× |
+| **GPU text encoder via CUDA LLM runner** | **52 s** | **14.3×** |
+| FP8 MMA GEMM default (P7' per-tensor input scaling) | 37 s (10-step 256²) | 1.4× |
+| Scratch-slot block loader + hoisted alloc | 38 s | ~1.0× |
+| FP8 flash attention (P6 device-ptr scales) | **37 s** | **20×** total vs 748 s |
+
+### Recently fixed FP8 bugs (cuda/qimg, 2026-04)
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| **FP8 MMA 3× velocity inflation** | End-to-end corr=0.43, latent magnitudes 3× too big | Add per-tensor input scaling to `gemm_fp8_scaled_f32`: reduce_max_abs + divide-at-load / multiply-at-writeback. GELU output from mlp_fc1 peaks at ~650, saturated the `cvt.rn.satfinite.e4m3` at ±448. (commit `a99b9a3`) |
+| **Pipeline non-determinism** | v_cond_std varied 0.39..3.28 across runs with same seed | `cuMemcpyDtoD` on default stream raced with t_emb ops on r->stream. Use `cuMemcpyDtoDAsync(…, r->stream)`. (commit `97f426b`) |
+| **Wrong latent compare space** | corr 0.03 vs ComfyUI reference | ComfyUI `sample()` output is post-Wan21 `process_out` (VAE-native space). We saved pre-Wan21 (DiT-normalized). Added `cuda_latent_vae.npy` dump after the `latent * wan21_std + wan21_mean` step. (commit `97f426b`) |
+| **Per-block cuMemAlloc overhead** | ~85 ms/block load, 1440 driver calls/step | Pre-allocated `scratch_block` slot in runner, on-demand `qimg_load_block_into_slot` uses async HtoD into the shared buffers. (commit `4e22c88`) |
+| **flash_attn_fp8 host DtoH stall** | 1-2 ms per attention call | Pass device pointer `&r->d_qkv_scales` to kernel, drop the per-call `cuMemcpyDtoH(scales, 3*f32)`. (commit `95e5536`) |
 
 ## TODO / FIXME
 
@@ -331,11 +362,15 @@ python verify_pipeline.py --cuda-dir ../../cuda/qimg/ --ref-dir output/
 
 - [x] **GEMM optimization**: 128×128 tiled GEMM with 8×8 register blocking + fused BF16 truncation. 6.67s → 3.67s/step (1.82×).
 - [x] **GPU text encoder**: CUDA LLM runner with GGUF Q4_K weights + injected Q/K/V biases. 710s → 12.8s (56×).
-- [ ] **Attention kernel**: Single-block-per-head flash attention works but doesn't scale well to 1024+ tokens. Implement multi-block flash attention or use cuDNN.
+- [x] **FP8 MMA GEMM** (sm_89+, per-tensor input scaling). `gemm_fp8_scaled_f32` via `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`. Default ON (`QIMG_FP8_MMA=0` opts out). 1.25× over LUT at 512×512.
+- [x] **FP8 flash attention** (FA2-style, head_dim=128, 4 warps/CTA, device-pointer scales). Opt-in via `QIMG_FP8_ATTN=1`. 7.5× vs F32 attention at 512×512.
+- [x] **Block scratch slot** + hoisted modulation allocs. Eliminates 30 cuMemAlloc/cuMemFree per on-demand block (~1440 driver calls/step → 30).
+- [ ] **Block streaming / prefetch**: Still ~85 ms/block PCIe load (48/60 on-demand at 512×512, ~4 s/forward). Needs a copy stream + cuEvent-based double buffer to hide latency behind compute. Tried pinned staging buffer, was slower (memcpy 324 MB/block dominated).
+- [ ] **CFG batching**: Process cond/uncond in single DiT pass (batch_size=2 for img GEMMs). Halves per-block load count → ~30% DiT speedup. *In progress.*
+- [ ] **MMA kernel tuning**: Current default runs ~5% of FP8 tensor-core peak. 128×128 `gemm_fp8_scaled_tc128_f32` variant exists but is currently slower than MTILE=2 default; needs register-blocking / `cp.async` work.
+- [ ] **Attention kernel for n_tok > 1536**: flash_attn_fp8 handles our sizes, but won't scale beyond 2K tokens without tiling.
 - [ ] **VAE on GPU**: Conv2d kernel is naive (one thread per output element). Large convolutions (384 channels × 256×256) would benefit from im2col + GEMM or Winograd.
-- [ ] **Block streaming**: Only 41/60 blocks preloaded in 16GB VRAM. On-demand loading adds ~0.5s/block. Pipeline: overlap block loading with computation.
 - [ ] **AdaLN + GEMM fusion**: 4 standalone adaln kernels per block → fuse into GEMM input load. ~5-10% DiT speedup.
-- [ ] **CFG batching**: Process cond/uncond in single DiT pass (batch_size=2). ~30% DiT speedup.
 
 ### Quality
 
