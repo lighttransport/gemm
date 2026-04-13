@@ -1740,7 +1740,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         /* -- Image modulation: SiLU(t_emb) → Linear → 6×dim -- */
         CUdeviceptr d_t_silu;
         cuMemAlloc(&d_t_silu, (size_t)dim * sizeof(float));
-        cuMemcpyDtoD(d_t_silu, d_t_emb, (size_t)dim * sizeof(float));
+        cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
 
         /* Image mod */
@@ -1902,7 +1902,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     {
         CUdeviceptr d_t_silu;
         cuMemAlloc(&d_t_silu, (size_t)dim * sizeof(float));
-        cuMemcpyDtoD(d_t_silu, d_t_emb, (size_t)dim * sizeof(float));
+        cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_t_silu, dim);
         CUdeviceptr d_final_mod;
         cuMemAlloc(&d_final_mod, (size_t)2 * dim * sizeof(float));
