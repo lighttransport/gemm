@@ -880,10 +880,9 @@ int main(int argc, char **argv) {
         free(img_tokens); free(vel_cond); free(vel_uncond);
         free(txt_hidden); free(txt_neg_hidden);
 
-        /* Save pre-Wan21 latent for comparison against ComfyUI reference
-         * (ComfyUI's sample() output is in normalized DiT sampling space, before
-         * VAE's process_latent_out applies std/mean). Save as .npy for direct
-         * numpy load in compare scripts. */
+        /* Save pre-Wan21 latent (DiT-normalized space, useful for per-block
+         * debugging) — ComfyUI's sample() output is actually in VAE-native
+         * space after process_out, saved separately below. */
         {
             int lat_n = lat_ch * lat_h * lat_w;
             FILE *lf = fopen("cuda_latent_prenorm.npy", "wb");
@@ -934,6 +933,33 @@ int main(int argc, char **argv) {
             FILE *lf = fopen("cuda_latent.bin", "wb");
             if (lf) { fwrite(latent, sizeof(float), (size_t)lat_n, lf); fclose(lf);
                 fprintf(stderr, "Saved latent [%d,%d,%d] to cuda_latent.bin\n", lat_ch, lat_h, lat_w); }
+        }
+
+        /* Save post-Wan21 latent as .npy for direct comparison against
+         * ComfyUI's cf_ournoise2_*_latent.npy (which is in VAE-native space). */
+        {
+            int lat_n = lat_ch * lat_h * lat_w;
+            FILE *lf = fopen("cuda_latent_vae.npy", "wb");
+            if (lf) {
+                char hdr[256];
+                int body = snprintf(hdr, sizeof(hdr),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1, 16, 1, %d, %d), }",
+                    lat_h, lat_w);
+                int total_hdr = 10 + body;
+                int pad = 64 - (total_hdr % 64); if (pad == 64) pad = 0;
+                for (int i = 0; i < pad - 1; i++) hdr[body + i] = ' ';
+                hdr[body + pad - 1] = '\n';
+                int header_len = body + pad;
+                uint8_t magic[10] = {0x93,'N','U','M','P','Y',1,0,
+                                     (uint8_t)(header_len & 0xFF),
+                                     (uint8_t)((header_len >> 8) & 0xFF)};
+                fwrite(magic, 1, 10, lf);
+                fwrite(hdr, 1, header_len, lf);
+                fwrite(latent, sizeof(float), (size_t)lat_n, lf);
+                fclose(lf);
+                fprintf(stderr, "Saved post-Wan21 latent [1,%d,1,%d,%d] to cuda_latent_vae.npy\n",
+                        lat_ch, lat_h, lat_w);
+            }
         }
 
         /* Un-standardize latent to VAE's natural space */
