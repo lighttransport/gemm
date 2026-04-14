@@ -18,6 +18,7 @@
 #define TRANSFORMER_IMPLEMENTATION
 #define QIMG_SCHEDULER_IMPLEMENTATION
 #define QIMG_TEXT_ENCODER_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
 
 #include "../../common/safetensors.h"
 #include "../../common/ggml_dequant.h"
@@ -25,6 +26,7 @@
 #include "../../common/bpe_tokenizer.h"
 #include "../../common/transformer.h"
 #include "../../common/qwen_image_scheduler.h"
+#include "../../common/stb_image_write.h"
 #include "../rocew.h"
 #include "../llm/hip_llm_runner.h"  /* must be before text_encoder.h for GPU path */
 #include "../../common/qwen_image_text_encoder.h"
@@ -55,23 +57,94 @@ static float randn(void) {
     return (float)(r * cos(theta));
 }
 
-static void save_ppm(const char *path, const float *rgb, int h, int w) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) { fprintf(stderr, "Cannot write %s\n", path); return; }
-    fprintf(fp, "P6\n%d %d\n255\n", w, h);
+/* CHW float [-1,1] → HWC uint8 [0,255] */
+static unsigned char *rgb_to_u8(const float *rgb, int h, int w) {
+    unsigned char *u8 = (unsigned char *)malloc((size_t)h * w * 3);
     for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) {
-            unsigned char px[3];
+        for (int x = 0; x < w; x++)
             for (int c = 0; c < 3; c++) {
                 float v = rgb[c * h * w + y * w + x];
-                v = v * 0.5f + 0.5f;  /* [-1,1] → [0,1] */
+                v = v * 0.5f + 0.5f;
                 v = v < 0 ? 0 : (v > 1 ? 1 : v);
-                px[c] = (unsigned char)(v * 255.0f + 0.5f);
+                u8[(y * w + x) * 3 + c] = (unsigned char)(v * 255.0f + 0.5f);
             }
-            fwrite(px, 1, 3, fp);
+    return u8;
+}
+
+static int ends_with_icase(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    if (lf > ls) return 0;
+    for (size_t i = 0; i < lf; i++) {
+        char a = s[ls - lf + i], b = suf[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static void save_image(const char *path, const float *rgb, int h, int w) {
+    unsigned char *u8 = rgb_to_u8(rgb, h, w);
+    int ok = 0;
+    if (ends_with_icase(path, ".png")) {
+        ok = stbi_write_png(path, w, h, 3, u8, w * 3);
+    } else if (ends_with_icase(path, ".jpg") || ends_with_icase(path, ".jpeg")) {
+        ok = stbi_write_jpg(path, w, h, 3, u8, 95);
+    } else {
+        FILE *fp = fopen(path, "wb");
+        if (fp) {
+            fprintf(fp, "P6\n%d %d\n255\n", w, h);
+            fwrite(u8, 1, (size_t)h * w * 3, fp);
+            fclose(fp);
+            ok = 1;
         }
+    }
+    free(u8);
+    if (ok) fprintf(stderr, "Saved %s (%dx%d)\n", path, w, h);
+    else    fprintf(stderr, "Failed to write %s\n", path);
+}
+
+static void save_ppm(const char *path, const float *rgb, int h, int w) {
+    save_image(path, rgb, h, w);
+}
+
+/* Load a raw F32 binary of known element count. */
+static float *load_f32_bin(const char *path, size_t n_elems) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { fprintf(stderr, "Cannot open %s\n", path); return NULL; }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    size_t want = n_elems * sizeof(float);
+    if ((size_t)sz != want) {
+        fprintf(stderr, "%s: size %ld != expected %zu\n", path, sz, want);
+        fclose(fp); return NULL;
+    }
+    float *buf = (float *)malloc(want);
+    if (fread(buf, 1, want, fp) != want) { free(buf); fclose(fp); return NULL; }
     fclose(fp);
-    fprintf(stderr, "Saved %s (%dx%d)\n", path, w, h);
+    return buf;
+}
+
+/* Load text hidden states from raw F32 file (any token count, fixed dim). */
+static float *load_txt_bin(const char *path, int *n_tok, int txt_dim) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { fprintf(stderr, "Cannot open %s\n", path); return NULL; }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz % (txt_dim * (int)sizeof(float)) != 0) {
+        fprintf(stderr, "txt-bin %s size %ld not multiple of %d*%zu\n",
+                path, sz, txt_dim, sizeof(float));
+        fclose(fp); return NULL;
+    }
+    int n = (int)(sz / (txt_dim * (int)sizeof(float)));
+    float *buf = (float *)malloc((size_t)n * txt_dim * sizeof(float));
+    if (fread(buf, 1, sz, fp) != (size_t)sz) { free(buf); fclose(fp); return NULL; }
+    fclose(fp);
+    *n_tok = n;
+    fprintf(stderr, "Loaded %s: %d tokens × %d dim\n", path, n, txt_dim);
+    return buf;
 }
 
 int main(int argc, char **argv) {
@@ -81,6 +154,11 @@ int main(int argc, char **argv) {
     const char *prompt = "a red apple on a white table";
     const char *out_path = "hip_qimg_out.ppm";
     const char *mode = NULL;
+    const char *init_bin_path = NULL;
+    const char *txt_bin_path = NULL;
+    const char *sigmas_bin_path = NULL;
+    const char *dump_final_path = NULL;
+    int skip_unstd = 0;   /* skip latent un-standardization (e.g. when init came pre-normalized) */
     int device_id = 0;
     int verbose = 1;
     int out_h = 256, out_w = 256, n_steps = 20;
@@ -103,6 +181,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-o") && i+1 < argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "-d") && i+1 < argc) device_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 2;
+        else if (!strcmp(argv[i], "--init-bin") && i+1 < argc) init_bin_path = argv[++i];
+        else if (!strcmp(argv[i], "--txt-bin") && i+1 < argc) txt_bin_path = argv[++i];
+        else if (!strcmp(argv[i], "--sigmas-bin") && i+1 < argc) sigmas_bin_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-final") && i+1 < argc) dump_final_path = argv[++i];
+        else if (!strcmp(argv[i], "--skip-unstd")) skip_unstd = 1;
         else {
             fprintf(stderr, "Usage: %s --test-init|--test-dit|--test-vae|--generate\n"
                     "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
@@ -291,11 +374,14 @@ int main(int argc, char **argv) {
         int in_ch = 64, lat_ch = 16;
         int txt_dim = 3584;
 
-        /* 1. Text encoder — use GPU (forked) result, or fall back to CPU */
+        /* 1. Text encoder — pinned --txt-bin > GPU encoder > CPU fallback > random */
         int n_txt = 0;
         float *txt_tokens = NULL;
 
-        if (txt_precomputed) {
+        if (txt_bin_path) {
+            txt_tokens = load_txt_bin(txt_bin_path, &n_txt, txt_dim);
+            if (!txt_tokens) { hip_qimg_free(r); return 1; }
+        } else if (txt_precomputed) {
             txt_tokens = txt_precomputed;
             n_txt = n_txt_precomputed;
             txt_precomputed = NULL;
@@ -322,29 +408,46 @@ int main(int argc, char **argv) {
             for (int i = 0; i < n_txt * txt_dim; i++) txt_tokens[i] = randn() * 0.1f;
         }
 
-        /* 2. Generate initial noise */
+        /* 2. Initial latent: pinned --init-bin (already packed) > random+patchify */
         fprintf(stderr, "\n[2/3] Denoising (%dx%d, %d steps)...\n", out_w, out_h, n_steps);
-        rng_state = seed;
         float *latent = (float *)malloc((size_t)lat_ch * lat_h * lat_w * sizeof(float));
-        for (int i = 0; i < lat_ch * lat_h * lat_w; i++) latent[i] = randn();
-
-        /* Patchify latent -> img_tokens */
         float *img_tokens = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
-        for (int tok = 0; tok < n_img; tok++) {
-            int py = tok / wp, px = tok % wp;
-            int idx = 0;
-            for (int c = 0; c < lat_ch; c++)
-                for (int dy = 0; dy < ps; dy++)
-                    for (int dx = 0; dx < ps; dx++)
-                        img_tokens[tok * in_ch + idx++] =
-                            latent[c * lat_h * lat_w + (py*ps+dy) * lat_w + (px*ps+dx)];
+
+        if (init_bin_path) {
+            float *loaded = load_f32_bin(init_bin_path, (size_t)n_img * in_ch);
+            if (!loaded) { hip_qimg_free(r); return 1; }
+            memcpy(img_tokens, loaded, (size_t)n_img * in_ch * sizeof(float));
+            free(loaded);
+            fprintf(stderr, "  loaded pinned init latent from %s\n", init_bin_path);
+        } else {
+            rng_state = seed;
+            for (int i = 0; i < lat_ch * lat_h * lat_w; i++) latent[i] = randn();
+            for (int tok = 0; tok < n_img; tok++) {
+                int py = tok / wp, px = tok % wp;
+                int idx = 0;
+                for (int c = 0; c < lat_ch; c++)
+                    for (int dy = 0; dy < ps; dy++)
+                        for (int dx = 0; dx < ps; dx++)
+                            img_tokens[tok * in_ch + idx++] =
+                                latent[c * lat_h * lat_w + (py*ps+dy) * lat_w + (px*ps+dx)];
+            }
         }
 
-        /* FlowMatch schedule */
+        /* FlowMatch schedule: pinned --sigmas-bin > scheduler default */
         qimg_scheduler sched;
         int seq_len = n_img + n_txt;
         qimg_sched_init(&sched);
-        qimg_sched_set_timesteps(&sched, n_steps, seq_len);
+        if (sigmas_bin_path) {
+            float *loaded = load_f32_bin(sigmas_bin_path, (size_t)(n_steps + 1));
+            if (!loaded) { hip_qimg_free(r); return 1; }
+            for (int i = 0; i <= n_steps; i++) sched.sigmas[i] = loaded[i];
+            for (int i = 0; i < n_steps; i++) sched.dt[i] = sched.sigmas[i+1] - sched.sigmas[i];
+            sched.n_steps = n_steps;
+            free(loaded);
+            fprintf(stderr, "  loaded pinned sigmas from %s\n", sigmas_bin_path);
+        } else {
+            qimg_sched_set_timesteps(&sched, n_steps, seq_len);
+        }
 
         float *vel = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
 
@@ -368,6 +471,15 @@ int main(int argc, char **argv) {
                 (double)(clock()-t0)/CLOCKS_PER_SEC,
                 (double)(clock()-t0)/CLOCKS_PER_SEC/n_steps);
 
+        if (dump_final_path) {
+            FILE *fp = fopen(dump_final_path, "wb");
+            if (fp) {
+                fwrite(img_tokens, sizeof(float), (size_t)n_img * in_ch, fp);
+                fclose(fp);
+                fprintf(stderr, "  dumped final packed latent to %s\n", dump_final_path);
+            }
+        }
+
         /* Unpatchify → latent */
         for (int tok = 0; tok < n_img; tok++) {
             int py = tok / wp, px = tok % wp;
@@ -379,9 +491,10 @@ int main(int argc, char **argv) {
                             img_tokens[tok * in_ch + idx++];
         }
 
-        /* Un-standardize latent: DiT normalized space → VAE natural space */
-        /* Values from diffusers autoencoder_kl_qwenimage.py config */
-        {
+        /* Un-standardize latent: DiT normalized space → VAE natural space.
+         * Values from diffusers autoencoder_kl_qwenimage.py config.
+         * Skip when --skip-unstd is set (e.g. when --init-bin pre-normalized). */
+        if (!skip_unstd) {
             static const float lm[16] = {-0.7571f,-0.7089f,-0.9113f,0.1075f,-0.1745f,0.9653f,-0.1517f,1.5508f,
                                           0.4134f,-0.0715f,0.5517f,-0.3632f,-0.1922f,-0.9497f,0.2503f,-0.2921f};
             static const float ls[16] = {2.8184f,1.4541f,2.3275f,2.6558f,1.2196f,1.7708f,2.6052f,2.0743f,

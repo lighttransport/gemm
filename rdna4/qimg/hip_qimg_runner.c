@@ -79,6 +79,7 @@ struct hip_qimg_runner {
 
     hipModule_t mod;
     hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_opt_fp8;
+    hipFunction_t fn_gemm_fp8_wmma;  /* gfx12 BF16 act × FP8 wt matrix-core GEMM */
     hipFunction_t fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_flash_attn;
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
@@ -91,6 +92,7 @@ struct hip_qimg_runner {
     int dim, n_heads, head_dim, n_blocks;
     int in_ch, txt_dim, mlp_h;
     int use_fp8;  /* 1 = upload FP8 raw + use LUT GEMM (4x less VRAM) */
+    int use_wmma; /* 1 = use BF16 WMMA matrix cores for FP8 GEMMs (gfx12 only) */
 
     /* Safetensors context (mmap'd) */
     void *dit_st;
@@ -295,10 +297,22 @@ static void op_gemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           0, NULL, args, NULL);
 }
 
-/* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT */
+/* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT.
+ * Dispatch order:
+ *   1. BF16 WMMA matrix-core (gfx12, n_tok ≥ 16) — fastest, when QIMG_FP8_WMMA=1
+ *   2. 128×128 tiled scalar LUT (n_tok ≥ 16) — default fast path
+ *   3. 16×16 scalar LUT — fallback for small token batches
+ */
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                         int n_out, int n_in, int n_tok) {
-    /* Use optimized 128×128 tiled kernel (fused BF16 trunc) */
+    if (r->use_wmma && r->fn_gemm_fp8_wmma && n_tok >= 16) {
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        hipModuleLaunchKernel(r->fn_gemm_fp8_wmma, gx, gy, 1, 256, 1, 1,
+                              0, NULL, args, NULL);
+        return;
+    }
     if (r->fn_gemm_opt_fp8 && n_tok >= 16) {
         /* gemm_opt_fp8: Y[M,N] = X[M,K] × W[N,K]^T  (N=n_out, K=n_in, M=n_tok) */
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
@@ -331,8 +345,12 @@ static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
 /* Weight GEMM + BF16 truncation */
 static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           int n_out, int n_in, int n_tok) {
-    if (r->use_fp8 && r->fn_gemm_opt_fp8 && n_tok >= 16) {
-        /* Optimized FP8 GEMM has fused BF16 trunc — no separate pass needed */
+    if (r->use_fp8 && (r->fn_gemm_opt_fp8 || (r->use_wmma && r->fn_gemm_fp8_wmma)) && n_tok >= 16) {
+        /* Optimized FP8 paths produce already-effectively-BF16 outputs:
+         *  - gemm_opt_fp8 has fused BF16 trunc on writeback
+         *  - WMMA path computes BF16×BF16 with F32 accum; downstream code is
+         *    tolerant of either F32 or BF16-truncated outputs, so skip the
+         *    extra trunc pass to save a kernel launch. */
         op_gemm_fp8(r, Y, W, X, bias, n_out, n_in, n_tok);
         return;
     }
@@ -506,7 +524,10 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     full_src[len1 + len2] = '\0';
 
     hipModule_t mod;
-    int rc = hip_compile_kernels(&mod, device_id, full_src, "qimg.hip", verbose, "hip_qimg");
+    int compile_verbose = verbose;
+    { const char *e = getenv("QIMG_COMPILE_VERBOSE");
+      if (e) compile_verbose = atoi(e); }
+    int rc = hip_compile_kernels(&mod, device_id, full_src, "qimg.hip", compile_verbose, "hip_qimg");
     free(full_src);
     if (rc < 0) return NULL;
 
@@ -519,6 +540,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_gemm, "gemm_f32_f32");
     GET(fn_gemm_fp8, "gemm_fp8w_f32");
     GET(fn_gemm_opt_fp8, "gemm_opt_fp8");
+    if (hipModuleGetFunction(&r->fn_gemm_fp8_wmma, mod, "gemm_fp8w_bf16a_wmma_t") != hipSuccess)
+        r->fn_gemm_fp8_wmma = NULL;
     GET(fn_layernorm, "layernorm_f32");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
@@ -553,6 +576,23 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
             r->use_fp8 = 1;
             if (verbose)
                 fprintf(stderr, "hip_qimg: FP8 LUT GEMM enabled (4x less VRAM per block)\n");
+        }
+    }
+
+    /* WMMA matrix-core path (gfx12). Opt-in via QIMG_FP8_WMMA=1. */
+    r->use_wmma = 0;
+    {
+        const char *v = getenv("QIMG_FP8_WMMA");
+        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+            if (!r->fn_gemm_fp8_wmma) {
+                fprintf(stderr, "hip_qimg: WMMA kernel not present (need gfx12); ignoring QIMG_FP8_WMMA\n");
+            } else if (!r->use_fp8) {
+                fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA requires FP8 mode; ignoring\n");
+            } else {
+                r->use_wmma = 1;
+                if (verbose)
+                    fprintf(stderr, "hip_qimg: BF16xFP8 WMMA (gfx12 matrix cores) enabled\n");
+            }
         }
     }
 
