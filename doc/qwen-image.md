@@ -474,6 +474,22 @@ via `cuDevicePrimaryCtxRetain`.
   512×512 VAE decode drops from **21.6 s → 1.7 s** (12.7×); the middle
   attention phase alone drops **19.7 s → 0.04 s**. 256×256 VAE drops
   **1.5 s → 0.5 s**. Correctness unchanged (mean pixel diff 1.877 / 255).
+- [x] **1024×1024 generation** with dynamic preload eviction + tiled im2col.
+  `cuda_qimg_dit_step_cfg` now computes the activation working set up-front
+  (`d_img`, QKV, CFG-batched MLP buffers, scratch) and calls a new helper
+  `qimg_evict_preloaded_until_free` to drop preloaded DiT blocks from the
+  tail until free VRAM covers the workload plus a 64 MB safety margin.
+  Freed blocks automatically fall back to the existing on-demand
+  `scratch_block` / `scratch_block_b` loader. VAE `vae_op_conv2d_mma` also
+  tiles im2col along the token axis so the unfold buffer is capped at
+  ~256 MB regardless of spatial dims — the 1024×1024 96→96 conv would
+  otherwise need 3.5 GB of im2col buffer alone.
+  Measured at 1024×1024:
+  - 16 GB default (45/60 preloaded): **6.6 s/step** DiT, **1.6 s** VAE.
+  - 8 GB simulated (`QIMG_MAX_PRELOAD=16`): 8.5 s/step DiT, 1.6 s VAE — the
+    ~1.9 s/step regression is pure disk I/O for the 44 streamed blocks.
+  - Pure on-demand (`QIMG_MAX_PRELOAD=0`): 9.9 s/step DiT.
+  512×512 and 256×256 are unaffected.
 - [x] **Tensor-core VAE conv2d via im2col + FP8 MMA**. `vae_op_conv2d`
   now routes 3×3 convs with `ci*kh*kw % 32 == 0` through:
   (1) on-device `vae_f32_to_fp8_padded` kernel that quantizes the F32
