@@ -2966,8 +2966,16 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         need += (size_t)2 * n_img * mlp_b;                                   /* d_img_mlp_h */
         need += (size_t)2 * n_img * dim_b;                                   /* d_img_mlp_out */
         need += 32 * sizeof(float) * 6;  /* modulation buffers, misc */
-        qimg_evict_preloaded_until_free(r, need, (size_t)64 << 20);
+        /* Safety margin of 256 MB. Empirically, when free VRAM after the
+         * working-set alloc drops below ~100 MB the CUDA driver starts
+         * doing heavy per-launch bookkeeping (~7x per-kernel slowdown on
+         * first step at 1328x1328). Keeping >=256 MB headroom avoids it. */
+        qimg_evict_preloaded_until_free(r, need, (size_t)256 << 20);
     }
+
+    int alloc_timing = (getenv("QIMG_ALLOC_TIMING") != NULL);
+    double alloc_t0 = 0;
+    if (alloc_timing) { cuStreamSynchronize(s); alloc_t0 = (double)clock()/CLOCKS_PER_SEC; }
 
     /* Allocate paired img/txt buffers. Both passes share the same img_tokens
      * at input (same noise) but the hidden states diverge after block 0 so
@@ -3089,6 +3097,13 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     float rope_theta = 10000.0f;
     int t_dim_rope = 16, h_dim_rope = 56, w_dim_rope = 56;
 
+    if (alloc_timing) {
+        cuStreamSynchronize(s);
+        double dt = (double)clock()/CLOCKS_PER_SEC - alloc_t0;
+        size_t fm = 0, tm = 0; cuMemGetInfo(&fm, &tm);
+        fprintf(stderr, "  [alloc] %6.3fs (free now: %.2f GB)\n", dt, (float)fm/(1<<30));
+    }
+
     /* ---- 4. Block loop with optional double-buffered on-demand loading.
      *       OFF by default — see dit_step comment above. ---- */
     int use_pipeline = 0;
@@ -3107,7 +3122,10 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         }
     }
 
+    int vae_blk_timing = (getenv("QIMG_BLK_TIMING") != NULL);
+    double blk_t0 = 0;
     for (int L = 0; L < r->dit_n_blocks; L++) {
+        if (vae_blk_timing) { cuStreamSynchronize(s); blk_t0 = (double)clock()/CLOCKS_PER_SEC; }
         if (r->verbose && (L % 10 == 0 || L == r->dit_n_blocks - 1))
             fprintf(stderr, "\r  cuda_qimg: block %d/%d", L + 1, r->dit_n_blocks);
 
@@ -3196,6 +3214,12 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
                                              r->copy_stream);
                 cuEventRecord(r->slot_ready[slot_used], r->copy_stream);
             }
+        }
+        if (vae_blk_timing) {
+            cuStreamSynchronize(s);
+            double dt = (double)clock()/CLOCKS_PER_SEC - blk_t0;
+            fprintf(stderr, "  [blk %2d] %.3fs%s\n", L, dt,
+                    L < r->n_preloaded ? "" : " (on-demand)");
         }
     }
     if (r->verbose) fprintf(stderr, "\n");
