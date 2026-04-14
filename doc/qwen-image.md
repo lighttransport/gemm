@@ -243,6 +243,16 @@ WMMA gives ~18 % step-time speedup at 256×256 and ~10 % at 512×512. End-to-end
 
 The HIP runner is **3× faster** than the pytorch-rocm diffusers reference (sequential cpu offload is forced because the BF16 transformer doesn't fit in 16 GB VRAM resident — even with the FP8 transformer loaded via `from_single_file`, the text encoder + VAE + activations push past 16 GB during inference). The BF16 WMMA quantization noise on activations introduces only ~0.5 LSB of pixel error, so the apple is visually indistinguishable from the diffusers reference at PSNR ≈ 49 dB.
 
+**Mixed-dtype checkpoint support** (`unsloth/Qwen-Image-2512-FP8`): the December 2025 refresh stores 1093/1933 tensors as BF16 instead of FP8 — biases, norm scales, and 5 of the global GEMM weights (`img_in.weight`, `txt_in.weight`, `time_text_embed.timestep_embedder.linear_1/2.weight`, `norm_out.linear.weight`, `proj_out.weight`). `qimg_upload_weight_auto` detects the dtype per global weight and tags the device pointer; `op_wgemm_bf16_auto` then dispatches the F32 GEMM path (`gemm_f32_f32` + downstream BF16 trunc) for BF16-stored globals while keeping FP8 GEMM for the FP8 ones. Per-block weights are still 100% FP8 in the 2512 file, so they stay on the existing FP8 LUT / WMMA tracks unchanged.
+
+| | diffusers 2512 (FP8 from_single_file) | HIP 2512 |
+|---|---|---|
+| Wall time at 256×256/20 steps | 186 s | **30 s** |
+| Final latent cosine vs ref | 1.0 (self) | **0.9936** |
+| PNG PSNR vs ref | ∞ | **30.0 dB** |
+
+PSNR is lower than the original ComfyUI FP8 file (30 dB vs 49 dB) because the 6 BF16-stored global GEMMs run through F32 + downstream BF16 trunc instead of the FP8 LUT/WMMA fused-trunc path. The visual output still matches the diffusers reference closely (same pose/colour/shape).
+
 ### PyTorch Reference (`ref/qwen_image/`)
 
 ### PyTorch Reference (`ref/qwen_image/`)
