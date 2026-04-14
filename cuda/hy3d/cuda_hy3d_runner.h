@@ -68,6 +68,14 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
  *   1 = F32 weights, F32 compute (matches PyTorch reference exactly) */
 void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable);
 
+/* Per-step mesh dumping for diagnosing diffusion trajectory.
+ *   every  : decode + dump every N diffusion steps (0 to disable)
+ *   grid   : marching-cubes grid resolution for the per-step dumps
+ *            (a small value like 48 keeps it quick)
+ *   prefix : output filename prefix; dumps are written as
+ *            "<prefix>_<step:03d>.obj" alongside SDF-range stats. */
+void cuda_hy3d_set_dump(cuda_hy3d_runner *r, int every, int grid, const char *prefix);
+
 /* Free runner and all GPU resources */
 void cuda_hy3d_free(cuda_hy3d_runner *r);
 

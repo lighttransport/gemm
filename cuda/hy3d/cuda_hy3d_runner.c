@@ -230,6 +230,13 @@ struct cuda_hy3d_runner {
     CUdeviceptr scratch[8];        /* General purpose scratch buffers */
     size_t scratch_size[8];
 
+    /* Per-step mesh dumping (diagnostic). When dump_every > 0, predict()
+     * decodes the latent through ShapeVAE + marching cubes every N steps
+     * and writes an OBJ file named <dump_prefix>_<step>.obj. */
+    int dump_every;
+    int dump_grid;        /* grid resolution for intermediate dumps */
+    char dump_prefix[512];
+
     /* Pre-computed cross-attention K,V for DiT (constant across diffusion steps) */
     CUdeviceptr dit_ca_K[DIT_DEPTH];   /* [DINO_SEQ_LEN, DIT_HIDDEN] */
     CUdeviceptr dit_ca_V[DIT_DEPTH];   /* [DINO_SEQ_LEN, DIT_HIDDEN] */
@@ -1722,6 +1729,19 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
     return r;
 }
 
+void cuda_hy3d_set_dump(cuda_hy3d_runner *r, int every, int grid, const char *prefix) {
+    if (!r) return;
+    r->dump_every = every > 0 ? every : 0;
+    r->dump_grid  = grid  > 0 ? grid  : 48;
+    r->dump_prefix[0] = '\0';
+    if (prefix && *prefix) {
+        size_t n = strlen(prefix);
+        if (n >= sizeof(r->dump_prefix)) n = sizeof(r->dump_prefix) - 1;
+        memcpy(r->dump_prefix, prefix, n);
+        r->dump_prefix[n] = '\0';
+    }
+}
+
 void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable) {
     if (!r) return;
     r->ops.use_f32_gemm = enable;
@@ -1850,6 +1870,39 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
 
         /* Euler step: x <- x - dt * v */
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
+
+        /* Diagnostic per-step dump: decode current latent and write OBJ. */
+        if (r->dump_every > 0 && ((step + 1) % r->dump_every == 0 ||
+                                   step == n_steps - 1)) {
+            int dg = r->dump_grid;
+            int total = dg * dg * dg;
+            float *sdf = (float *)malloc((size_t)total * sizeof(float));
+            if (sdf) {
+                run_shapevae(r, d_latents, dg, sdf);
+                float mn = sdf[0], mx = sdf[0], sm = 0;
+                int pos = 0, neg = 0;
+                for (int i = 0; i < total; i++) {
+                    float v = sdf[i];
+                    if (v < mn) mn = v; if (v > mx) mx = v; sm += v;
+                    if (v > 0) pos++; else if (v < 0) neg++;
+                }
+                mc_mesh mc = mc_marching_cubes(sdf, dg, dg, dg, 0.0f, NULL);
+                char path[640];
+                snprintf(path, sizeof(path), "%s_%03d.obj", r->dump_prefix, step + 1);
+                if (mc.n_verts > 0) {
+                    mc_write_obj(path, &mc);
+                    if (r->verbose)
+                        fprintf(stderr, "    dump step %d: sdf[%.3f,%.3f] pos=%d (%d v, %d t) -> %s\n",
+                                step + 1, mn, mx, pos, mc.n_verts, mc.n_tris, path);
+                } else if (r->verbose) {
+                    fprintf(stderr, "    dump step %d: sdf[%.3f,%.3f] pos=%d neg=%d (empty mesh)\n",
+                            step + 1, mn, mx, pos, neg);
+                }
+                free(mc.vertices);
+                free(mc.triangles);
+                free(sdf);
+            }
+        }
     }
 
     cuMemFree(d_pred_cond);
