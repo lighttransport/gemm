@@ -131,6 +131,20 @@ All weights stored under `/mnt/disk01/models/qwen-image-st/` (ComfyUI FP8 format
 | Text Encoder | `text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors` | Scaled FP8 | ~8.7 GB |
 | VAE | `vae/qwen_image_vae.safetensors` | BF16 | 254 MB (194 tensors) |
 
+The ComfyUI single-file FP8 weights live in the [`Comfy-Org/Qwen-Image_ComfyUI`](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI) HuggingFace repo:
+
+- DiT (original): <https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_fp8_e4m3fn.safetensors>
+- Text encoder: <https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors>
+- VAE: <https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors>
+
+The **Qwen-Image-2512** refresh (Dec 2025) has its own single-file FP8 release on the [Unsloth tutorial page](https://unsloth.ai/docs/jp/moderu/tutorials/qwen-image-2512):
+
+- DiT (2512 FP8): <https://huggingface.co/unsloth/Qwen-Image-2512-FP8/resolve/main/qwen-image-2512-fp8.safetensors> (~20 GB)
+- Also available as 4-bit BnB: <https://huggingface.co/unsloth/Qwen-Image-2512-unsloth-bnb-4bit>
+- And as GGUF: <https://huggingface.co/unsloth/Qwen-Image-2512-GGUF>
+
+The pytorch-rocm reference under `ref/qwen_image/` defaults to loading the local ComfyUI FP8 DiT via `diffusers.QwenImageTransformer2DModel.from_single_file(...)` so it produces an apples-to-apples comparison against the HIP runner. Pass `--fp8-dit <path>` to point at a different single-file checkpoint (e.g. the 2512 release), or `--fp8-dit ""` to fall back to the BF16 multi-shard transformer from the official `Qwen/Qwen-Image` HF repo.
+
 **Alternative GGUF weights** (at `/mnt/disk01/models/qwen-image/`):
 
 | Component | File | Format | Size |
@@ -194,12 +208,52 @@ All are single-header libraries (define `*_IMPLEMENTATION` before include).
 | `cuda_llm_runner.{h,c}` | GPU LLM inference: Qwen2/2.5-VL/3/3.5, GGUF weights, Q/K/V biases |
 | `test_cuda_llm.c` | LLM test: CPU vs GPU hidden state comparison |
 
+### HIP/ROCm Implementation (`rdna4/qimg/`)
+
+Targets RDNA4 (gfx1200/gfx1201). Kernels compiled at runtime via HIPRTC (no `hipcc` required).
+
+| File | Description |
+|---|---|
+| `hip_qimg_runner.{c,h}` | GPU runner: HIPRTC kernel compilation, FP8 LUT GEMM, optional BF16 WMMA matrix-core path, per-block streaming with up to ~40 preloaded blocks on a 16 GB card, GPU VAE decode |
+| `hip_qimg_kernels.h` | HIP kernel strings: `gemm_fp8w_f32` (16×16 scalar LUT), `gemm_opt_fp8` (128×128 tiled LUT with fused BF16 trunc), `gemm_fp8w_bf16a_wmma_t` (BF16×FP8 matrix-core WMMA, 256 threads / 128×128 CTA) |
+| `test_hip_qimg.c` | Test harness: `--test-init / --test-dit / --test-vae / --test-enc / --generate`. Supports pinned-input options (`--init-bin`, `--txt-bin`, `--sigmas-bin`, `--dump-final`, `--skip-unstd`) plus PNG output via `stb_image_write.h`. |
+| `verify_qimg_dit.c` | CPU↔HIP single-step DiT comparison (max_diff / mean_diff / corr) |
+| `Makefile` | Builds `test_hip_qimg` and `verify_qimg_dit` |
+
+**FP8 LUT GEMM** (default ON when the FP8 LUT compiles): raw FP8 E4M3 bytes are uploaded to VRAM (~4× smaller than F32) and dequantized via a 256-entry constant-memory LUT. Qwen-Image FP8 weights have **no per-tensor scale** (unlike Flux.2 Klein), so the kernels do not take a `w_scale` argument.
+
+**BF16×FP8 WMMA** (`QIMG_FP8_WMMA=1`): same 128×128 CTA tile layout as the Flux.2 Klein WMMA path — 256 threads = 8 waves arranged 2×4, each wave computes a 64×32 sub-tile via 4×2 = 8 `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` instructions reusing 8 KB of shared memory per K=16 slab. Activations F32→BF16 truncated at SMEM load; FP8 weights LUT-dequanted then BF16-truncated; F32 accumulator. Verified on RX 9070 XT via `verify_qimg_dit --lat 8`: corr ≈ 0.9765 vs CPU reference (matches the LUT path's 0.9777 floor — the BF16-trunc-on-output noise dominates either way).
+
+| Mode | 256×256 / 20-step DiT | 512×512 / 20-step DiT | VAE 256 | VAE 512 |
+|---|---|---|---|---|
+| HIP 128×128 tiled FP8 LUT (default) | **36.1 s (1.80 s/step)** | **91.2 s (4.56 s/step)** | 1.5 s | 20.5 s |
+| HIP 128×128 BF16×FP8 WMMA (`QIMG_FP8_WMMA=1`) | **29.4 s (1.47 s/step)** | **81.8 s (4.09 s/step)** | 1.5 s | 20.2 s |
+
+WMMA gives ~18 % step-time speedup at 256×256 and ~10 % at 512×512. End-to-end gain is modest because per-block PCIe streaming and (especially at 512×512) the VAE decode dominate; ~40/60 DiT blocks are preloaded into VRAM and the remaining 20 are streamed each step.
+
+**Apples-to-apples vs diffusers reference** (256×256 / 20 steps / cfg=1, both runners loading the same `qwen_image_fp8_e4m3fn.safetensors` and using `init_latent_256.bin / apple_text_256.bin / sigmas_256.bin` from `dump_diffusers_pipeline.py`):
+
+| | diffusers (FP8, sequential cpu offload) | HIP BF16 WMMA |
+|---|---|---|
+| Wall time | 102 s | **34 s** |
+| Final latent cosine vs ref | 1.0 (self) | **0.999962** |
+| Final latent max \|diff\| | 0 | 0.0273 |
+| PNG PSNR vs ref | ∞ | **49.48 dB** |
+| PNG mean \|diff\| | 0 | 0.54 / 255 |
+
+The HIP runner is **3× faster** than the pytorch-rocm diffusers reference (sequential cpu offload is forced because the BF16 transformer doesn't fit in 16 GB VRAM resident — even with the FP8 transformer loaded via `from_single_file`, the text encoder + VAE + activations push past 16 GB during inference). The BF16 WMMA quantization noise on activations introduces only ~0.5 LSB of pixel error, so the apple is visually indistinguishable from the diffusers reference at PSNR ≈ 49 dB.
+
+### PyTorch Reference (`ref/qwen_image/`)
+
 ### PyTorch Reference (`ref/qwen_image/`)
 
 | Script | Description |
 |---|---|
-| `generate_reference.py` | **Consolidated** reference data generator (text + DiT + VAE) |
-| `verify_pipeline.py` | **End-to-end** verification against ComfyUI reference |
+| `gen_diffusers_reference.py` | **diffusers-based** reference (`QwenImagePipeline`, pytorch-rocm 7.2, BF16 + cpu offload). Generates `apple_ref_<size>.png`. |
+| `dump_diffusers_pipeline.py` | Same pipeline plus dumps `apple_text*.bin`, `init_latent*.bin`, `final_latent_packed*.bin`, `sigmas*.bin`, `vae_meta*.txt` for layer-by-layer comparison against the HIP runner via `--init-bin`/`--txt-bin`/`--sigmas-bin`. |
+| `make_comparison.py` | Build a 2×2 `apple_benchmark.png` (diffusers vs HIP at 256 / 512). |
+| `generate_reference.py` | (legacy) ComfyUI reference data generator |
+| `verify_pipeline.py` | End-to-end verification against ComfyUI reference |
 | `compare.py` | Single-file .npy comparison tool (corr, max diff, PASS/FAIL) |
 | `generate_comfyui.py` | ComfyUI ground truth generator (PyTorch noise) |
 | `generate_comfyui_ournoise.py` | ComfyUI ground truth with our PRNG (cos+sin pair caching) |

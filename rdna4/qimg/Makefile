@@ -15,26 +15,32 @@ TEST_SRC = test_hip_qimg.c
 
 # Target
 TARGET = test_hip_qimg
+VERIFY_DIT = verify_qimg_dit
+
+COMMON_DEPS = hip_qimg_runner.h hip_qimg_kernels.h \
+              ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
+              ../../common/safetensors.h ../../common/ggml_dequant.h \
+              ../../common/gguf_loader.h ../../common/bpe_tokenizer.h \
+              ../../common/transformer.h ../../common/qwen_image_text_encoder.h \
+              ../../common/qwen_image_dit.h ../../common/qwen_image_vae.h \
+              ../../common/qwen_image_scheduler.h \
+              ../llm/hip_llm_runner.h ../llm/hip_llm_runner.c
 
 .PHONY: all clean run help
 
-all: $(TARGET)
+all: $(TARGET) $(VERIFY_DIT)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_qimg_runner.h hip_qimg_kernels.h \
-           ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
-           ../../common/safetensors.h ../../common/ggml_dequant.h \
-           ../../common/gguf_loader.h ../../common/bpe_tokenizer.h \
-           ../../common/transformer.h ../../common/qwen_image_text_encoder.h \
-           ../../common/qwen_image_dit.h ../../common/qwen_image_vae.h \
-           ../../common/qwen_image_scheduler.h \
-           ../llm/hip_llm_runner.h ../llm/hip_llm_runner.c
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
+
+$(VERIFY_DIT): verify_qimg_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_qimg_dit.c $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) --dit <dit.safetensors> [--vae <vae.safetensors>] [--steps N] [-o out.ppm] [-d dev]"
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(VERIFY_DIT)
 
 help:
 	@echo "HIP/ROCm Qwen-Image Text-to-Image Runner (HIPRTC-based, no hipcc needed)"
