@@ -1456,7 +1456,7 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
             unsigned gx = (unsigned)((n_out + 255) / 256);
             /* MTILE=4 variant: 64 rows/CTA. Used when n_tok is a multiple of 64,
              * which holds for img stream at >=512 (n_img=1024+) and qkv shapes. */
-            if (r->gemm_fp8_pipe_perrow_mt4 && n_tok >= 64 && (n_tok % 64) == 0) {
+            if (!getenv("QIMG_DISABLE_MT4") && r->gemm_fp8_pipe_perrow_mt4 && n_tok >= 64 && (n_tok % 64) == 0) {
                 unsigned gy4 = (unsigned)((n_tok + 63) / 64);
                 /* smem: 2048 (smX 64x32) + 2*8192 (W) + 512 (64 inv + 64 fwd) = 18944 B */
                 size_t smem_mt4 = 2048 + 8192 * 2 + 512;
