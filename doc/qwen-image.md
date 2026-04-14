@@ -296,15 +296,17 @@ ComfyUI-encoded text hidden states for a fair correctness comparison):**
 | ours — FP8 MMA + FP8 attn (old default) | 1.98 s/step | 3.02 s/step | 5.01 | 1.55×–1.88× (blurry) |
 | ours — BF16 MMA + BF16 attn | 3.66 s/step | 9.14 s/step | 0.85 | 2.86×–5.68× |
 | ours — PER-ROW FP8 MT2 + BF16 attn | 1.98 s/step | 2.96 s/step | 1.88 | 1.55×–1.84× |
-| **ours — PER-ROW FP8 MT4 + vectorized BF16 attn (new default)** | **1.95 s/step** | **2.69 s/step** | **1.88** | **1.52×–1.67×** |
+| ours — PER-ROW FP8 MT4 + vectorized BF16 attn | 2.00 s/step | 2.74 s/step | 1.88 | 1.56×–1.70× |
+| **ours — PER-ROW FP8 MT4 + cp.async ldmatrix.trans BF16 attn (new default)** | **2.00 s/step** | **2.67 s/step** | **1.88** | **1.56×–1.66×** |
 
-The "PER-ROW MT4 + BF16 attn" recipe reaches **2.94× faster than gold at 512×512
-(7.90 → 2.69 s/step)** while staying visually indistinguishable from
-ComfyUI/gold (mean pixel diff 1.88 / 255 ≈ 0.7%). At 256×256 it hits the
-~1.5× ComfyUI target (1.95 vs 1.28 s/step). At 512×512 the gap is 1.67×.
+The new default reaches **2.96× faster than gold at 512×512 (7.90 → 2.67
+s/step)** while staying visually indistinguishable from ComfyUI/gold (mean
+pixel diff 1.88 / 255 ≈ 0.7%). At 256×256 it hits the ~1.5× ComfyUI target
+(2.00 vs 1.28 s/step). At 512×512 the gap is 1.66×.
 
-Stable 3-run averages confirmed by `QIMG_DISABLE_MT4=1` A/B at 512×512:
-MT2 = 2.96 s/step, MT4 = 2.69 s/step (9.1% MT4 win).
+Stable 3-run averages (256×256/10 steps, 512×512/5 steps) confirm cp.async +
+ldmatrix.trans BF16 attention saves ~70 ms/step at 512×512 vs the vectorized
+sync-load variant (2.74 → 2.67), while 256×256 is unchanged within noise.
 
 **Recommended invocation (new default):**
 
@@ -334,7 +336,8 @@ Correctness: corr=0.999107 vs `cf_ournoise2_10step_latent.npy`, every channel co
 - +FP8 flash attention:                     5.05 s/step  (4.33×)
 - +CFG batching, cp.async pipe FP8 MMA:     3.02 s/step  (7.23×)
 - +per-row FP8 MMA + BF16 attention:        2.96 s/step  (7.38×)
-- **+MTILE=4 GEMM + vectorized BF16 attn:   2.69 s/step  (8.12×)**
+- +MTILE=4 GEMM + vectorized BF16 attn:     2.74 s/step  (7.97×)
+- **+cp.async + ldmatrix.trans BF16 attn:   2.67 s/step  (8.18×)**
 
 (Apple gen at 512×512: 2.69 s/step is **2.94× faster** than the LUT scalar
 gold path 7.90 s/step, **1.67× slower** than ComfyUI 1.61 s/step.)
@@ -431,7 +434,18 @@ via `cuDevicePrimaryCtxRetain`.
 - [x] **CFG batching**: cond/uncond run through each block under a single block-weight load (`cuda_qimg_dit_step_cfg`). Halves per-block PCIe traffic.
 - [ ] **Block streaming / prefetch**: Still ~85 ms/block PCIe load (48/60 on-demand at 512×512). `cuMemHostRegister` on the mmap'd safetensors was rejected (operation not supported); a pinned-staging ring was net-slower because the driver already pipelines pageable HtoDAsync via its own copy engine. Real fix needs `cp.async.bulk` (sm_90+) which Blackwell consumer doesn't expose.
 - [x] **MTILE=4 GEMM**: ~10% gain at 512×512, see entry above.
-- [ ] **cp.async pipeline for flash attention**: Blocked by the V transpose (`cp.async` can't do strided/transposed copies). Either need a separate transpose pass with extra `__syncthreads` or `ldmatrix.trans` integration. Vectorized cooperative load got ~50 ms back; the remaining gap to a fully-pipelined version is uncertain. Tried BKV=64 (slower due to occupancy drop). ~5–10% expected gain.
+- [x] **cp.async + ldmatrix.trans BF16 flash attention**. Switched `smV` from
+  col-major `smVT` to row-major so both K and V can be loaded via contiguous
+  `cp.async.ca.shared.global` into smem. The PV MMA's B-operand is now loaded
+  with one `ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16` per N-tile — the
+  4 result regs map directly to the m16n8k16 B layout we need for both PV
+  K-chunks without any per-lane packing. Additionally, `P` is held in per-lane
+  `u32` registers (`P_pack[kc][4]`) instead of round-tripping through `smP`
+  — each lane already owns its own `P_data`, and the sm_120 a1↔a2 swap is
+  applied in-register. smem drops 20 KB → 16 KB (5 → 6 CTAs/SM occupancy).
+  Single-buffer `cp.async` (no prefetch) chosen over 2-stage double-buffer
+  (32 KB, 3 CTAs/SM) because the occupancy hit outweighed the pipeline gain
+  at 256×256. Saves ~70 ms/step at 512×512 (2.74 → 2.67).
 - [ ] **Attention kernel for n_tok > 1536**: `flash_attn_bf16` handles our sizes, but won't scale beyond 2K tokens without tiling.
 - [ ] **VAE on GPU**: Conv2d kernel is naive (one thread per output element). Large convolutions (384 channels × 256×256) would benefit from im2col + GEMM or Winograd.
 - [ ] **AdaLN + GEMM fusion**: 4 standalone adaln kernels per block → fuse into GEMM input load. ~5-10% DiT speedup.
