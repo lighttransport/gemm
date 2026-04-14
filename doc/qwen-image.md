@@ -228,8 +228,11 @@ Targets RDNA4 (gfx1200/gfx1201). Kernels compiled at runtime via HIPRTC (no `hip
 |---|---|---|---|---|
 | HIP 128×128 tiled FP8 LUT (default) | **36.1 s (1.80 s/step)** | **91.2 s (4.56 s/step)** | 1.5 s | 20.5 s |
 | HIP 128×128 BF16×FP8 WMMA (`QIMG_FP8_WMMA=1`) | **29.4 s (1.47 s/step)** | **81.8 s (4.09 s/step)** | 1.5 s | 20.2 s |
+| + 512 MB activation reserve (45/60 preload) | **24.0 s (1.20 s/step)** | **74.5 s (3.73 s/step)** | 1.3 s | 11.2 s |
 
-WMMA gives ~18 % step-time speedup at 256×256 and ~10 % at 512×512. End-to-end gain is modest because per-block PCIe streaming and (especially at 512×512) the VAE decode dominate; ~40/60 DiT blocks are preloaded into VRAM and the remaining 20 are streamed each step.
+**Activation reserve tuning**: the preload planner used to reserve 2 GB of VRAM for per-step activations, but actual peak usage at 512×512 is ~300 MB (Q/K/V 72 MB, scratch3 48 MB, scratch1/2 18 MB each, d_q/d_k/d_v/d_attn 264 MB total, plus the img/txt buffers). Lowering the reserve to 512 MB frees up room for 5 more preloaded blocks (45/60 instead of 40/60) on a 16 GB card, eliminating ~5 × ~85 ms = ~425 ms/step of PCIe streaming. This is bit-for-bit equivalent to the old path (no math changes — only which blocks live in VRAM vs stream on-demand). For higher resolutions where activation scratch grows past 512 MB, override with `QIMG_WORKSPACE_MB=<n>` (e.g. `QIMG_WORKSPACE_MB=2048` at 1024×1024+).
+
+**Note on the prefetch / copy-stream approach**: the natural next step — running block streaming on a separate `hipStream` concurrently with compute on the default stream (pinned host staging + `hipMemcpyAsync` + slot ring buffer) — was implemented and tested but **regressed ~0.7–1.0 s/step at 512×512** on gfx1201. Tracing showed that (1) sync `hipMemcpy` on the default stream already achieves good implicit overlap with queued compute (the "85 ms/block" really breaks down as ~60 ms compute catchup + ~25 ms DMA), and (2) explicit DMA on a copy stream contends with compute for HBM bandwidth. The current WMMA GEMM is memory-bandwidth-bound, so running DMA in parallel slows compute by more than the DMA saves. The simpler residency win above beats the prefetch approach on this GPU.
 
 **Apples-to-apples vs diffusers reference** (256×256 / 20 steps / cfg=1, both runners loading the same `qwen_image_fp8_e4m3fn.safetensors` and using `init_latent_256.bin / apple_text_256.bin / sigmas_256.bin` from `dump_diffusers_pipeline.py`):
 
