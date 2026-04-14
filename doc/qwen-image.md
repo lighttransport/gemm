@@ -474,11 +474,23 @@ via `cuDevicePrimaryCtxRetain`.
   512×512 VAE decode drops from **21.6 s → 1.7 s** (12.7×); the middle
   attention phase alone drops **19.7 s → 0.04 s**. 256×256 VAE drops
   **1.5 s → 0.5 s**. Correctness unchanged (mean pixel diff 1.877 / 255).
-- [ ] **VAE conv2d tiling**: one thread per output element is still the
-  bottleneck at higher resolutions (upsampled to 512 with 96 channels runs
-  ~0.4 s total). A shared-memory tiled kernel was attempted and neither
-  helped nor hurt — the conv2d phase is now small enough that further
-  tuning has diminishing returns.
+- [x] **Tensor-core VAE conv2d via im2col + FP8 MMA**. `vae_op_conv2d`
+  now routes 3×3 convs with `ci*kh*kw % 32 == 0` through:
+  (1) on-device `vae_f32_to_fp8_padded` kernel that quantizes the F32
+  weight to e4m3 and pads `[co, n_in]` up to `[pad_co, n_in_pad]` with
+  `pad_co % 256 == 0` and `n_in_pad % 32 == 0`;
+  (2) `vae_im2col_f32` unfolds the F32 input `[ci, H, W]` into
+  `[H*W, n_in_pad]` row-major with zero-padded trailing K cols;
+  (3) the existing `gemm_fp8_pipe_perrow_mt4` FP8 MMA tensor-core GEMM
+  produces `[H*W, pad_co]` in F32;
+  (4) `vae_crop_transpose_add_bias_f32` crops the padded cols, transposes
+  to `[co, H*W]` CHW, and fuses the bias add.
+  512×512 VAE decode drops **1.7 s → 0.5 s** (3.4×); 256×256 drops
+  **0.5 s → 0.2 s** (2.5×). Per-phase conv speedups are 3-6× depending on
+  resolution. Mean pixel diff shifts from 1.877 → 2.099 (~0.09% increase)
+  from the FP8 weight quantization — visually indistinguishable. Layers
+  with `n_in % 32 != 0` (head conv 96→3, and conv1 16→384 where `ci*9=144`)
+  fall back to the naive kernel.
 - [ ] **AdaLN + GEMM fusion**: 4 standalone adaln kernels per block → fuse into GEMM input load. ~5-10% DiT speedup.
 
 ### Quality
