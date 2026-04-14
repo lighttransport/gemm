@@ -110,6 +110,13 @@ struct hip_qimg_runner {
     void *d_t_fc2_w, *d_t_fc2_b;
     void *d_norm_out_w, *d_norm_out_b;
     void *d_proj_out_w, *d_proj_out_b;
+    /* Per-global-weight FP8/F32 tags. Mixed-dtype checkpoints
+     * (e.g. unsloth/Qwen-Image-2512-FP8) store some global GEMM weights as
+     * BF16 instead of FP8. is_fp8_<name> = 1 if the device pointer is raw
+     * FP8 bytes (use op_gemm_fp8); 0 if it's an F32 array (use op_gemm). */
+    int is_fp8_img_in, is_fp8_txt_in;
+    int is_fp8_t_fc1, is_fp8_t_fc2;
+    int is_fp8_norm_out, is_fp8_proj_out;
 };
 
 
@@ -208,6 +215,25 @@ static void *qimg_st_upload_fp8_raw(st_context *st, const char *name) {
 /* Upload weight: FP8 raw if use_fp8, else F32 */
 static void *qimg_upload_weight(hip_qimg_runner *r, st_context *st, const char *name) {
     if (r->use_fp8) return qimg_st_upload_fp8_raw(st, name);
+    return qimg_st_upload_f32(st, name);
+}
+
+/* Upload a weight whose source dtype may be FP8 or BF16/F16/F32 (mixed-dtype
+ * checkpoints like unsloth/Qwen-Image-2512-FP8). Returns a device pointer and
+ * sets *out_is_fp8 to 1 when the data is FP8 raw bytes (caller dispatches
+ * through the FP8 GEMM path) or 0 when it's an F32 array (caller uses the
+ * F32 GEMM path). Returns NULL on failure. */
+static void *qimg_upload_weight_auto(hip_qimg_runner *r, st_context *st,
+                                      const char *name, int *out_is_fp8) {
+    *out_is_fp8 = 0;
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return NULL;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (r->use_fp8 && (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0)) {
+        *out_is_fp8 = 1;
+        return qimg_st_upload_fp8_raw(st, name);
+    }
+    /* BF16/F16/F32 → F32 dequant on host (qimg_st_upload_f32 handles all dtypes) */
     return qimg_st_upload_f32(st, name);
 }
 
@@ -372,6 +398,22 @@ static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *b
         return;
     }
     op_wgemm(r, Y, W, X, bias, n_out, n_in, n_tok);
+    op_bf16_trunc(r, Y, n_out * n_tok);
+}
+
+/* Like op_wgemm_bf16 but with explicit per-weight FP8 flag. Used for global
+ * GEMM weights when the checkpoint is mixed-dtype (some globals are BF16
+ * stored as F32 device buffers, others are FP8 raw bytes). */
+static void op_wgemm_bf16_auto(hip_qimg_runner *r, int is_fp8,
+                                void *Y, void *W, void *X, void *bias,
+                                int n_out, int n_in, int n_tok) {
+    if (is_fp8) {
+        op_wgemm_bf16(r, Y, W, X, bias, n_out, n_in, n_tok);
+        return;
+    }
+    /* F32 weight path: gemm_f32_f32 + downstream BF16 trunc to keep
+     * activation magnitudes consistent with the FP8 path's output. */
+    op_gemm(r, Y, W, X, bias, n_out, n_in, n_tok);
     op_bf16_trunc(r, Y, n_out * n_tok);
 }
 
@@ -639,22 +681,43 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
         }
     }
 
-    /* Upload global weights (FP8 raw for weights if enabled, F32 for biases/norms) */
-    #define GW(nm) qimg_upload_weight(r, st, nm)
-    r->d_img_in_w = GW("img_in.weight");
+    /* Upload global weights. Each *.weight may be FP8 or BF16/F32 depending on
+     * the checkpoint (mixed-dtype like unsloth/Qwen-Image-2512-FP8). The auto
+     * helper sets the per-weight is_fp8 flag, which is_fp8_<name> later uses
+     * for FP8 vs F32 GEMM dispatch. Biases/norms always go through F32. */
+    r->d_img_in_w = qimg_upload_weight_auto(r, st, "img_in.weight", &r->is_fp8_img_in);
     r->d_img_in_b = qimg_st_upload_f32(st, "img_in.bias");
-    r->d_txt_in_w = GW("txt_in.weight");
+    r->d_txt_in_w = qimg_upload_weight_auto(r, st, "txt_in.weight", &r->is_fp8_txt_in);
     r->d_txt_in_b = qimg_st_upload_f32(st, "txt_in.bias");
     r->d_txt_norm_w = qimg_st_upload_f32(st, "txt_norm.weight");
-    r->d_t_fc1_w = GW("time_text_embed.timestep_embedder.linear_1.weight");
+    r->d_t_fc1_w = qimg_upload_weight_auto(r, st,
+        "time_text_embed.timestep_embedder.linear_1.weight", &r->is_fp8_t_fc1);
     r->d_t_fc1_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_1.bias");
-    r->d_t_fc2_w = GW("time_text_embed.timestep_embedder.linear_2.weight");
+    r->d_t_fc2_w = qimg_upload_weight_auto(r, st,
+        "time_text_embed.timestep_embedder.linear_2.weight", &r->is_fp8_t_fc2);
     r->d_t_fc2_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_2.bias");
-    r->d_norm_out_w = GW("norm_out.linear.weight");
+    r->d_norm_out_w = qimg_upload_weight_auto(r, st,
+        "norm_out.linear.weight", &r->is_fp8_norm_out);
     r->d_norm_out_b = qimg_st_upload_f32(st, "norm_out.linear.bias");
-    r->d_proj_out_w = GW("proj_out.weight");
+    r->d_proj_out_w = qimg_upload_weight_auto(r, st, "proj_out.weight", &r->is_fp8_proj_out);
     r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
-    #undef GW
+
+    /* Diagnostic: report which globals are FP8 vs F32 */
+    if (r->verbose) {
+        int n_f32 = (!r->is_fp8_img_in) + (!r->is_fp8_txt_in) + (!r->is_fp8_t_fc1)
+                  + (!r->is_fp8_t_fc2) + (!r->is_fp8_norm_out) + (!r->is_fp8_proj_out);
+        if (n_f32 > 0) {
+            fprintf(stderr, "hip_qimg: %d/6 global weights are F32 (BF16-stored): "
+                    "img_in=%s txt_in=%s t_fc1=%s t_fc2=%s norm_out=%s proj_out=%s\n",
+                    n_f32,
+                    r->is_fp8_img_in ? "fp8" : "f32",
+                    r->is_fp8_txt_in ? "fp8" : "f32",
+                    r->is_fp8_t_fc1  ? "fp8" : "f32",
+                    r->is_fp8_t_fc2  ? "fp8" : "f32",
+                    r->is_fp8_norm_out ? "fp8" : "f32",
+                    r->is_fp8_proj_out ? "fp8" : "f32");
+        }
+    }
 
     /* Bail early on any failed global weight upload — this happens when the
      * checkpoint is mixed-dtype (e.g. unsloth/Qwen-Image-2512-FP8 stores some
@@ -803,11 +866,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     hipMalloc(&d_t_sin, 256 * sizeof(float));
     hipMemcpy(d_t_sin, t_sin, 256 * sizeof(float), hipMemcpyHostToDevice);
 
-    op_wgemm_bf16(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
+    op_wgemm_bf16_auto(r, r->is_fp8_t_fc1, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
     void *d_t_emb2 = NULL;
     hipMalloc(&d_t_emb2, (size_t)dim * sizeof(float));
-    op_wgemm_bf16(r, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
+    op_wgemm_bf16_auto(r, r->is_fp8_t_fc2, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
     hipFree(d_t_emb); d_t_emb = d_t_emb2;
     hipFree(d_t_sin);
 
@@ -815,11 +878,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     if (r->d_txt_norm_w) {
         op_rmsnorm_weighted(r, d_txt_in, r->d_txt_norm_w, n_txt, txt_dim);
     }
-    op_wgemm_bf16(r, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
+    op_wgemm_bf16_auto(r, r->is_fp8_txt_in, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
     hipFree(d_txt_in);
 
     /* 3. Image input: GEMM(64→3072) */
-    op_wgemm_bf16(r, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
+    op_wgemm_bf16_auto(r, r->is_fp8_img_in, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
     hipFree(d_img_in);
 
     /* BF16 truncation after projection */
@@ -993,8 +1056,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         op_silu(r, d_t_silu, dim);
         void *d_final_mod = NULL;
         hipMalloc(&d_final_mod, (size_t)2 * dim * sizeof(float));
-        op_wgemm_bf16(r, d_final_mod, r->d_norm_out_w, d_t_silu, r->d_norm_out_b,
-                     2 * dim, dim, 1);
+        op_wgemm_bf16_auto(r, r->is_fp8_norm_out, d_final_mod,
+                           r->d_norm_out_w, d_t_silu, r->d_norm_out_b,
+                           2 * dim, dim, 1);
         hipFree(d_t_silu);
 
         void *f_scale = d_final_mod;
@@ -1004,8 +1068,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         void *d_out = NULL;
         hipMalloc(&d_out, (size_t)n_img * in_ch * sizeof(float));
-        op_wgemm_bf16(r, d_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
-                     in_ch, dim, n_img);
+        op_wgemm_bf16_auto(r, r->is_fp8_proj_out, d_out,
+                           r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
+                           in_ch, dim, n_img);
 
         hipDeviceSynchronize();
         hipMemcpy(out, d_out, (size_t)n_img * in_ch * sizeof(float), hipMemcpyDeviceToHost);
