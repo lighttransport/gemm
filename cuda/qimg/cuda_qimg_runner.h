@@ -240,6 +240,76 @@ static const char *qimg_kernel_src =
 "    if (i < n) out[i] = v_uncond[i] + cfg_scale * (v_cond[i] - v_uncond[i]);\n"
 "}\n"
 
+/* On-device F32 -> FP8 e4m3 encoder for VAE conv weights. Flattens
+ * [co, ci*kh*kw] to [pad_co, n_in_pad] with trailing rows / cols zeroed.
+ * Grid: (ceil(n_in_pad/32), ceil(pad_co/8)); Block: (32, 8). */
+"__global__ void vae_f32_to_fp8_padded(unsigned char *__restrict__ out,\n"
+"    const float *__restrict__ inp, int co, int n_in, int pad_co, int n_in_pad) {\n"
+"    int k = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int c = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    if (k >= n_in_pad || c >= pad_co) return;\n"
+"    unsigned char bits = 0;\n"
+"    if (c < co && k < n_in) {\n"
+"        float f = inp[(long)c * n_in + k];\n"
+"        /* satfinite cvt.e4m3 via PTX. */\n"
+"        unsigned int u;\n"
+"        asm(\"{\\n\\t\"\n"
+"            \".reg .b16 h;\\n\\t\"\n"
+"            \"cvt.rn.satfinite.e4m3x2.f32 h, 0f00000000, %1;\\n\\t\"\n"
+"            \"cvt.u32.u16 %0, h;\\n\\t\"\n"
+"            \"}\\n\"\n"
+"            : \"=r\"(u) : \"f\"(f));\n"
+"        bits = (unsigned char)(u & 0xFF);\n"
+"    }\n"
+"    out[(long)c * n_in_pad + k] = bits;\n"
+"}\n"
+"\n"
+/* im2col for VAE conv2d->GEMM path. Input [ci, H, W] row-major, output
+ * [H*W, n_in_pad] row-major where n_in_pad = ceil(ci*kh*kw / 32) * 32.
+ * Trailing K cols (beyond ci*kh*kw) are zero-filled so the FP8 MMA kernel
+ * can be called with n_in = n_in_pad without reading stale memory.
+ * Each thread produces one output element. */
+"__global__ void vae_im2col_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp,\n"
+"    int ci, int h, int w, int kh, int kw, int pad_replicate, int n_in_pad) {\n"
+"    int tok = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    int k   = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int n_tok = h * w;\n"
+"    if (tok >= n_tok || k >= n_in_pad) return;\n"
+"    int n_in = ci * kh * kw;\n"
+"    if (k >= n_in) { out[(long)tok * n_in_pad + k] = 0.0f; return; }\n"
+"    int ph = (kh - 1) / 2, pw = (kw - 1) / 2;\n"
+"    int oy = tok / w, ox = tok - oy * w;\n"
+"    int ic = k / (kh * kw);\n"
+"    int rem = k - ic * (kh * kw);\n"
+"    int fy = rem / kw, fx = rem - fy * kw;\n"
+"    int iy = oy + fy - ph, ix = ox + fx - pw;\n"
+"    float v = 0.0f;\n"
+"    if (pad_replicate) {\n"
+"        if (iy < 0) iy = 0; else if (iy >= h) iy = h - 1;\n"
+"        if (ix < 0) ix = 0; else if (ix >= w) ix = w - 1;\n"
+"        v = inp[(long)ic * h * w + (long)iy * w + ix];\n"
+"    } else {\n"
+"        if (iy >= 0 && iy < h && ix >= 0 && ix < w)\n"
+"            v = inp[(long)ic * h * w + (long)iy * w + ix];\n"
+"    }\n"
+"    out[(long)tok * n_in_pad + k] = v;\n"
+"}\n"
+"\n"
+/* Crop + transpose output of vae_op_conv2d_mma: the GEMM writes [n_tok,
+ * pad_co] row-major; the rest of the VAE wants [co, h, w] = [co, n_tok]
+ * row-major. Each thread reads one (co, tok) and stores to the CHW slot. */
+"__global__ void vae_crop_transpose_add_bias_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp, const float *__restrict__ bias,\n"
+"    int co, int pad_co, int n_tok) {\n"
+"    int tok = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int c   = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    if (tok >= n_tok || c >= co) return;\n"
+"    float v = inp[(long)tok * pad_co + c];\n"
+"    if (bias) v += bias[c];\n"
+"    out[(long)c * n_tok + tok] = v;\n"
+"}\n"
+"\n"
 /* Transpose [C, spatial] -> [spatial, C] (F32). Used before VAE middle
  * self-attention so the attention kernel can do coalesced K/V row loads. */
 "__global__ void vae_transpose_chw_to_sc_f32(float *__restrict__ out,\n"
@@ -914,6 +984,9 @@ struct cuda_qimg_runner {
     CUfunction rope_2d;
     CUfunction rope_1d;
     CUfunction vae_conv2d;
+    CUfunction vae_f32_to_fp8_padded;
+    CUfunction vae_im2col;
+    CUfunction vae_crop_transpose_add_bias;
     CUfunction vae_transpose_chw_to_sc;
     CUfunction vae_transpose_sc_to_chw;
     CUfunction vae_attn_sc;
@@ -2076,6 +2149,12 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(rope_2d, "rope_2d_f32");
     GET(rope_1d, "rope_1d_f32");
     GET(vae_conv2d, "vae_conv2d_f32");
+    if (cuModuleGetFunction(&r->vae_f32_to_fp8_padded, module, "vae_f32_to_fp8_padded") != CUDA_SUCCESS)
+        r->vae_f32_to_fp8_padded = NULL;
+    if (cuModuleGetFunction(&r->vae_im2col, module, "vae_im2col_f32") != CUDA_SUCCESS)
+        r->vae_im2col = NULL;
+    if (cuModuleGetFunction(&r->vae_crop_transpose_add_bias, module, "vae_crop_transpose_add_bias_f32") != CUDA_SUCCESS)
+        r->vae_crop_transpose_add_bias = NULL;
     if (cuModuleGetFunction(&r->vae_transpose_chw_to_sc, module, "vae_transpose_chw_to_sc_f32") != CUDA_SUCCESS)
         r->vae_transpose_chw_to_sc = NULL;
     if (cuModuleGetFunction(&r->vae_transpose_sc_to_chw, module, "vae_transpose_sc_to_chw_f32") != CUDA_SUCCESS)
@@ -3153,14 +3232,84 @@ static CUdeviceptr vae_upload_conv3d(st_context *st, const char *name,
     return dp;
 }
 
-/* GPU VAE conv2d launch */
+/* GPU VAE conv2d launch. When shapes match the FP8 MMA GEMM's constraints
+ * (kh==kw>=2, ci*kh*kw % 32 == 0, n_tok >= 16) we route through the tensor-
+ * core im2col + GEMM + transpose path. Otherwise fall back to the naive
+ * per-output-thread kernel. */
+static void vae_op_conv2d_mma(cuda_qimg_runner *r,
+                              CUdeviceptr out, CUdeviceptr inp,
+                              CUdeviceptr w_fp8, CUdeviceptr bias,
+                              int ci, int h, int w_s, int co, int kh, int kw,
+                              int rep_pad, int pad_co, int n_in_pad);
 static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
                           CUdeviceptr w, CUdeviceptr b,
                           int ci, int h, int w_s, int co, int kh, int kw, int rep_pad) {
+    int n_tok = h * w_s;
+    int n_in = ci * kh * kw;
+    int n_in_pad = (n_in + 31) / 32 * 32;
+    int pad_co = (co + 255) / 256 * 256;
+    if (r->vae_im2col && r->vae_f32_to_fp8_padded && r->vae_crop_transpose_add_bias &&
+        kh >= 2 && kw >= 2 && (n_in % 32) == 0 && n_tok >= 16 &&
+        r->gemm_fp8_pipe_perrow && r->use_fp8_pipe_perrow) {
+        /* Quantize the (already uploaded) F32 weight to padded FP8 on the fly. */
+        CUdeviceptr d_w_fp8;
+        if (cuMemAlloc(&d_w_fp8, (size_t)pad_co * n_in_pad) == CUDA_SUCCESS) {
+            unsigned bx = 32, by = 8;
+            unsigned gx = (unsigned)((n_in_pad + bx - 1) / bx);
+            unsigned gy = (unsigned)((pad_co   + by - 1) / by);
+            void *args[] = {&d_w_fp8, &w, &co, &n_in, &pad_co, &n_in_pad};
+            cuLaunchKernel(r->vae_f32_to_fp8_padded, gx, gy, 1, bx, by, 1,
+                           0, r->stream, args, NULL);
+            vae_op_conv2d_mma(r, out, inp, d_w_fp8, b, ci, h, w_s, co,
+                              kh, kw, rep_pad, pad_co, n_in_pad);
+            cuMemFree(d_w_fp8);
+            return;
+        }
+    }
     int total = co * h * w_s;
     void *args[] = {&out, &inp, &w, &b, &ci, &h, &w_s, &co, &kh, &kw, &rep_pad};
     cuLaunchKernel(r->vae_conv2d, (unsigned)((total+255)/256), 1, 1,
                    256, 1, 1, 0, r->stream, args, NULL);
+}
+
+/* Tensor-core conv2d path: im2col the F32 input into an [n_tok, n_in_pad]
+ * row-major buffer, run the existing FP8 per-row MMA GEMM on pre-quantized
+ * FP8 weights, then crop the trailing pad_co cols off the output and
+ * transpose [n_tok, pad_co] -> [co, h*w] with an optional bias add.
+ * The FP8 GEMM path autoselects MT4 / perrow based on shape. */
+static void vae_op_conv2d_mma(cuda_qimg_runner *r,
+                              CUdeviceptr out, CUdeviceptr inp,
+                              CUdeviceptr w_fp8, CUdeviceptr bias,
+                              int ci, int h, int w_s, int co, int kh, int kw,
+                              int rep_pad, int pad_co, int n_in_pad) {
+    int n_tok = h * w_s;
+    CUstream s = r->stream;
+
+    CUdeviceptr d_unfold;
+    cuMemAlloc(&d_unfold, (size_t)n_tok * n_in_pad * sizeof(float));
+    {
+        unsigned bx = 32, by = 8;  /* 32 K cols x 8 tokens per block */
+        unsigned gx = (unsigned)((n_in_pad + bx - 1) / bx);
+        unsigned gy = (unsigned)((n_tok    + by - 1) / by);
+        void *args[] = {&d_unfold, &inp, &ci, &h, &w_s, &kh, &kw, &rep_pad, &n_in_pad};
+        cuLaunchKernel(r->vae_im2col, gx, gy, 1, bx, by, 1, 0, s, args, NULL);
+    }
+
+    CUdeviceptr d_gemm_out;
+    cuMemAlloc(&d_gemm_out, (size_t)n_tok * pad_co * sizeof(float));
+    /* op_gemm writes [n_tok, pad_co] row-major. Pass NULL bias here and
+     * add it during the crop-transpose so the padded co tail stays zero. */
+    op_gemm(r, d_gemm_out, w_fp8, d_unfold, (CUdeviceptr)0, pad_co, n_in_pad, n_tok);
+    cuMemFree(d_unfold);
+
+    {
+        unsigned bx = 32, by = 8;
+        unsigned gx = (unsigned)((n_tok + bx - 1) / bx);
+        unsigned gy = (unsigned)((co    + by - 1) / by);
+        void *args[] = {&out, &d_gemm_out, &bias, &co, &pad_co, &n_tok};
+        cuLaunchKernel(r->vae_crop_transpose_add_bias, gx, gy, 1, bx, by, 1, 0, s, args, NULL);
+    }
+    cuMemFree(d_gemm_out);
 }
 
 /* GPU VAE RMS norm launch: L2-normalize along channels, scale by sqrt(C) * gamma */
