@@ -467,7 +467,18 @@ via `cuDevicePrimaryCtxRetain`.
   = 1024 was below the MMA kernel's preferred M tile count; doubling to 2048
   fills the CTAs more evenly.
 - [ ] **Attention kernel for n_tok > 1536**: `flash_attn_bf16` handles our sizes, but won't scale beyond 2K tokens without tiling.
-- [ ] **VAE on GPU**: Conv2d kernel is naive (one thread per output element). Large convolutions (384 channels × 256×256) would benefit from im2col + GEMM or Winograd.
+- [x] **VAE middle attention on GPU**. Replaced the CPU DtoH/HtoD round-trip
+  and O(N²D) Python-like loop with two F32 transpose kernels (`[c, spatial]
+  ↔ [spatial, c]`) plus a warp-per-query online-softmax kernel
+  (`vae_attn_sc_f32`) that streams K and V tokens from row-major smem.
+  512×512 VAE decode drops from **21.6 s → 1.7 s** (12.7×); the middle
+  attention phase alone drops **19.7 s → 0.04 s**. 256×256 VAE drops
+  **1.5 s → 0.5 s**. Correctness unchanged (mean pixel diff 1.877 / 255).
+- [ ] **VAE conv2d tiling**: one thread per output element is still the
+  bottleneck at higher resolutions (upsampled to 512 with 96 channels runs
+  ~0.4 s total). A shared-memory tiled kernel was attempted and neither
+  helped nor hurt — the conv2d phase is now small enough that further
+  tuning has diminishing returns.
 - [ ] **AdaLN + GEMM fusion**: 4 standalone adaln kernels per block → fuse into GEMM input load. ~5-10% DiT speedup.
 
 ### Quality

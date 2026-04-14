@@ -240,8 +240,76 @@ static const char *qimg_kernel_src =
 "    if (i < n) out[i] = v_uncond[i] + cfg_scale * (v_cond[i] - v_uncond[i]);\n"
 "}\n"
 
-/* Conv2D for VAE: replicate or zero padding, handles any spatial size.
- * Grid: (ceil(co*oh*ow / 256)), Block: (256) */
+/* Transpose [C, spatial] -> [spatial, C] (F32). Used before VAE middle
+ * self-attention so the attention kernel can do coalesced K/V row loads. */
+"__global__ void vae_transpose_chw_to_sc_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp, int C, int spatial) {\n"
+"    int s = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int c = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    if (s >= spatial || c >= C) return;\n"
+"    out[(long)s * C + c] = inp[(long)c * spatial + s];\n"
+"}\n"
+"\n"
+/* Transpose back [spatial, C] -> [C, spatial] after the attention output. */
+"__global__ void vae_transpose_sc_to_chw_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp, int C, int spatial) {\n"
+"    int s = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int c = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    if (s >= spatial || c >= C) return;\n"
+"    out[(long)c * spatial + s] = inp[(long)s * C + c];\n"
+"}\n"
+"\n"
+/* Single-head F32 self-attention for VAE middle block.
+ * Q, K, V are each [n_tok, c] row-major (spatial-major). One CTA per query
+ * row, 1 warp (32 threads) per CTA. Online softmax in registers, Q cached in
+ * smem once at start, output accumulator in smem. K and V are streamed
+ * one token at a time (row-contiguous reads -> fully coalesced). */
+"__global__ void vae_attn_sc_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ Q, const float *__restrict__ K, const float *__restrict__ V,\n"
+"    int n_tok, int c, float scale) {\n"
+"    int q = blockIdx.x;\n"
+"    if (q >= n_tok) return;\n"
+"    int tid = threadIdx.x;  /* 0..31 */\n"
+"    extern __shared__ float va_smem[];\n"
+"    float *smQ = va_smem;           /* [c] */\n"
+"    float *smO = va_smem + c;       /* [c] */\n"
+"    for (int d = tid; d < c; d += 32) {\n"
+"        smQ[d] = Q[(long)q * c + d];\n"
+"        smO[d] = 0.0f;\n"
+"    }\n"
+"    __syncwarp();\n"
+"\n"
+"    float m_state = -1e30f;\n"
+"    float l_state = 0.0f;\n"
+"    for (int j = 0; j < n_tok; j++) {\n"
+"        const float *kp = K + (long)j * c;\n"
+"        float dot = 0.0f;\n"
+"        for (int d = tid; d < c; d += 32) dot += smQ[d] * kp[d];\n"
+"        /* warp reduce */\n"
+"        for (int off = 16; off > 0; off >>= 1)\n"
+"            dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);\n"
+"        dot *= scale;\n"
+"        float new_m = fmaxf(m_state, dot);\n"
+"        float alpha = expf(m_state - new_m);\n"
+"        float beta  = expf(dot - new_m);\n"
+"        const float *vp = V + (long)j * c;\n"
+"        for (int d = tid; d < c; d += 32) {\n"
+"            smO[d] = smO[d] * alpha + beta * vp[d];\n"
+"        }\n"
+"        l_state = l_state * alpha + beta;\n"
+"        m_state = new_m;\n"
+"    }\n"
+"    float inv_l = 1.0f / l_state;\n"
+"    for (int d = tid; d < c; d += 32) {\n"
+"        out[(long)q * c + d] = smO[d] * inv_l;\n"
+"    }\n"
+"}\n"
+"\n"
+/* Conv2D for VAE: replicate or zero padding, any spatial size.
+ * One thread per output element -- not the fastest shape, but all VAE conv
+ * layers combined run in ~1.5s at 512x512 so further tiling has diminishing
+ * returns (the middle attention used to dwarf everything before it moved
+ * to the GPU). Grid: (ceil(co*oh*ow/256)), Block: (256) */
 "__global__ void vae_conv2d_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ inp, const float *__restrict__ weight,\n"
 "    const float *__restrict__ bias,\n"
@@ -846,6 +914,9 @@ struct cuda_qimg_runner {
     CUfunction rope_2d;
     CUfunction rope_1d;
     CUfunction vae_conv2d;
+    CUfunction vae_transpose_chw_to_sc;
+    CUfunction vae_transpose_sc_to_chw;
+    CUfunction vae_attn_sc;
     CUfunction vae_rmsnorm;
     CUfunction vae_silu;
     CUfunction nn_upsample2x;
@@ -2005,6 +2076,12 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(rope_2d, "rope_2d_f32");
     GET(rope_1d, "rope_1d_f32");
     GET(vae_conv2d, "vae_conv2d_f32");
+    if (cuModuleGetFunction(&r->vae_transpose_chw_to_sc, module, "vae_transpose_chw_to_sc_f32") != CUDA_SUCCESS)
+        r->vae_transpose_chw_to_sc = NULL;
+    if (cuModuleGetFunction(&r->vae_transpose_sc_to_chw, module, "vae_transpose_sc_to_chw_f32") != CUDA_SUCCESS)
+        r->vae_transpose_sc_to_chw = NULL;
+    if (cuModuleGetFunction(&r->vae_attn_sc, module, "vae_attn_sc_f32") != CUDA_SUCCESS)
+        r->vae_attn_sc = NULL;
     GET(vae_rmsnorm, "vae_rmsnorm_f32");
     GET(vae_silu, "vae_silu_f32");
     GET(nn_upsample2x, "nn_upsample2x_f32");
@@ -3244,6 +3321,14 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     cuMemcpyHtoD(d_x, latent, (size_t)c * h * w * sizeof(float));
     VAE_DUMP("latent_input", d_x, c*h*w);
 
+    /* Per-phase wall-clock timer driven by QIMG_VAE_TIMING=1 */
+    int vae_timing = (getenv("QIMG_VAE_TIMING") != NULL);
+    double vae_phase_t0 = 0;
+    #define VAE_PHASE_BEGIN() do { if (vae_timing) { cuStreamSynchronize(s); vae_phase_t0 = (double)clock()/CLOCKS_PER_SEC; } } while (0)
+    #define VAE_PHASE_END(label) do { if (vae_timing) { cuStreamSynchronize(s); \
+        double _dt = (double)clock()/CLOCKS_PER_SEC - vae_phase_t0; \
+        fprintf(stderr, "  [vae] %-24s %6.3fs\n", label, _dt); } } while (0)
+
     /* post_quant_conv (conv2): 1×1×1 → effectively pointwise */
     CUdeviceptr d_pqc_w = vae_upload_f32(st, "conv2.weight", s);
     CUdeviceptr d_pqc_b = vae_upload_f32(st, "conv2.bias", s);
@@ -3262,6 +3347,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     CUdeviceptr d_c1_w = vae_upload_conv3d(st, "decoder.conv1.weight", &co_c1, &ci_c1, s);
     CUdeviceptr d_c1_b = vae_upload_f32(st, "decoder.conv1.bias", s);
     c = co_c1;
+    VAE_PHASE_BEGIN();
     {
         CUdeviceptr d_tmp; cuMemAlloc(&d_tmp, (size_t)c*h*w*sizeof(float));
         vae_op_conv2d(r, d_tmp, d_x, d_c1_w, d_c1_b, ci_c1, h, w, c, 3, 3, 0);
@@ -3269,6 +3355,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         cuMemFree(d_x); d_x = d_tmp;
         cuMemFree(d_c1_w); cuMemFree(d_c1_b);
     }
+    VAE_PHASE_END("conv1");
     fprintf(stderr, "  after conv1: [%d, %d, %d]\n", c, h, w);
     VAE_DUMP("conv1_out", d_x, c*h*w);
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_conv1.npy", d_x, 3, _d); }
@@ -3289,14 +3376,19 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             snprintf(_nm, sizeof(_nm), "%s.shortcut.bias", pfx_str); scb = vae_upload_f32(st, _nm, s); } }
 
     /* mid.0 */
+    VAE_PHASE_BEGIN();
     { LOAD_RB_NAMED("decoder.middle.0", n1, c1w, c1b, n2, c2w, c2b, scw, scb);
       CUdeviceptr d_tmp = vae_resblock_gpu(r, d_x, n1, c1w, c1b, n2, c2w, c2b, scw, scb, c, c, h, w);
       cuMemFree(d_x); d_x = d_tmp;
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
       if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); } }
+    VAE_PHASE_END("mid.0 resblock");
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_0.npy", d_x, 3, _d); }
 
-    /* Middle attention: GroupNorm → QKV → spatial self-attention → proj + residual */
+    /* Middle attention: GroupNorm -> QKV conv1x1 -> spatial self-attention -> proj + residual.
+     * Entirely on GPU: transposes [c,S] -> [S,c] for coalesced K/V row loads,
+     * then runs the warp-per-query online-softmax kernel. */
+    VAE_PHASE_BEGIN();
     {
         int spatial = h * w;
         CUdeviceptr d_gn_g = vae_upload_f32(st, "decoder.middle.1.norm.gamma", s);
@@ -3310,86 +3402,62 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         vae_op_gn(r, d_normed, d_x, d_gn_g, c, spatial);
         cuMemFree(d_gn_g);
 
-        /* QKV: 1×1 conv = per-spatial-position linear: [3*C, C] @ [C, S] → [3*C, S]
-         * Layout: data is [C, spatial] (CHW). QKV weight is [3*C, C, 1, 1].
-         * Treat as GEMM: out[3C, S] = W[3C, C] @ inp[C, S] */
+        /* QKV 1x1 conv: [3c, c] W times [c, spatial] x -> [3c, spatial] out (CHW). */
         CUdeviceptr d_qkv; cuMemAlloc(&d_qkv, (size_t)3*c*spatial*sizeof(float));
-        /* We need a transposed GEMM since data is [C, S] not [S, C].
-         * Simple approach: use conv2d with k=1 */
         vae_op_conv2d(r, d_qkv, d_normed, d_qkv_w, d_qkv_b, c, h, w, 3*c, 1, 1, 0);
         cuMemFree(d_normed); cuMemFree(d_qkv_w); cuMemFree(d_qkv_b);
 
-        /* Attention: Q, K, V are each [C, spatial] in CHW layout.
-         * We need to compute attention over spatial positions with C as feature dim.
-         * Reshape to [spatial, C] (row per spatial position), then run attention with 1 head.
-         * But our data is [C, spatial] (channel-first). We need to transpose. */
-
-        /* For simplicity: download to CPU, run CPU attention, upload result */
-        float *h_qkv = (float *)malloc((size_t)3 * c * spatial * sizeof(float));
-        cuMemcpyDtoH(h_qkv, d_qkv, (size_t)3 * c * spatial * sizeof(float));
+        /* Transpose each [c, spatial] slice -> [spatial, c] (row-major). */
+        CUdeviceptr d_Q_sc, d_K_sc, d_V_sc;
+        cuMemAlloc(&d_Q_sc, (size_t)spatial*c*sizeof(float));
+        cuMemAlloc(&d_K_sc, (size_t)spatial*c*sizeof(float));
+        cuMemAlloc(&d_V_sc, (size_t)spatial*c*sizeof(float));
+        {
+            CUdeviceptr d_Q_chw = d_qkv;
+            CUdeviceptr d_K_chw = d_qkv + (size_t)c * spatial * sizeof(float);
+            CUdeviceptr d_V_chw = d_qkv + (size_t)2 * c * spatial * sizeof(float);
+            unsigned bx = 16, by = 16;
+            unsigned gx = (unsigned)((spatial + 15) / 16);
+            unsigned gy = (unsigned)((c + 15) / 16);
+            int sp = spatial;
+            void *tq[] = {&d_Q_sc, &d_Q_chw, &c, &sp};
+            void *tk[] = {&d_K_sc, &d_K_chw, &c, &sp};
+            void *tv[] = {&d_V_sc, &d_V_chw, &c, &sp};
+            cuLaunchKernel(r->vae_transpose_chw_to_sc, gx, gy, 1, bx, by, 1, 0, s, tq, NULL);
+            cuLaunchKernel(r->vae_transpose_chw_to_sc, gx, gy, 1, bx, by, 1, 0, s, tk, NULL);
+            cuLaunchKernel(r->vae_transpose_chw_to_sc, gx, gy, 1, bx, by, 1, 0, s, tv, NULL);
+        }
         cuMemFree(d_qkv);
 
-        /* Transpose from [3C, spatial] to [spatial, 3C] for attention */
-        float *h_qkv_t = (float *)malloc((size_t)3 * c * spatial * sizeof(float));
-        for (int s_pos = 0; s_pos < spatial; s_pos++)
-            for (int ch = 0; ch < 3 * c; ch++)
-                h_qkv_t[s_pos * 3 * c + ch] = h_qkv[ch * spatial + s_pos];
-        free(h_qkv);
-
-        /* Split Q[spatial, C], K[spatial, C], V[spatial, C] from interleaved [spatial, 3C] */
-        float *h_q = (float *)malloc((size_t)spatial * c * sizeof(float));
-        float *h_k = (float *)malloc((size_t)spatial * c * sizeof(float));
-        float *h_v = (float *)malloc((size_t)spatial * c * sizeof(float));
-        for (int s_pos = 0; s_pos < spatial; s_pos++) {
-            memcpy(h_q + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c,           (size_t)c * sizeof(float));
-            memcpy(h_k + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c + c,       (size_t)c * sizeof(float));
-            memcpy(h_v + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c + 2 * c,   (size_t)c * sizeof(float));
+        /* Self-attention: one CTA per query, 1 warp, online softmax. */
+        CUdeviceptr d_attn_sc; cuMemAlloc(&d_attn_sc, (size_t)spatial*c*sizeof(float));
+        {
+            float scale_at = 1.0f / sqrtf((float)c);
+            int sp = spatial;
+            size_t smem_bytes = (size_t)2 * c * sizeof(float);  /* smQ + smO */
+            void *args[] = {&d_attn_sc, &d_Q_sc, &d_K_sc, &d_V_sc, &sp, &c, &scale_at};
+            cuLaunchKernel(r->vae_attn_sc, (unsigned)spatial, 1, 1,
+                           32, 1, 1, smem_bytes, s, args, NULL);
         }
+        cuMemFree(d_Q_sc); cuMemFree(d_K_sc); cuMemFree(d_V_sc);
 
-        /* Run attention: 1 head with head_dim=C */
-        float *h_attn = (float *)malloc((size_t)spatial * c * sizeof(float));
-        float scale_at = 1.0f / sqrtf((float)c);
-        for (int i = 0; i < spatial; i++) {
-            float mx = -1e30f;
-            for (int j = 0; j < spatial; j++) {
-                float dot = 0;
-                for (int d = 0; d < c; d++) dot += h_q[i*c+d] * h_k[j*c+d];
-                dot *= scale_at;
-                if (dot > mx) mx = dot;
-            }
-            float esum = 0;
-            memset(h_attn + i*c, 0, (size_t)c * sizeof(float));
-            for (int j = 0; j < spatial; j++) {
-                float dot = 0;
-                for (int d = 0; d < c; d++) dot += h_q[i*c+d] * h_k[j*c+d];
-                float w_at = expf(dot * scale_at - mx);
-                esum += w_at;
-                for (int d = 0; d < c; d++) h_attn[i*c+d] += w_at * h_v[j*c+d];
-            }
-            float inv = 1.0f / esum;
-            for (int d = 0; d < c; d++) h_attn[i*c+d] *= inv;
-        }
-        free(h_qkv_t);
-        free(h_q); free(h_k); free(h_v);
-
-        /* Output projection: [C, C] @ attn_out[C, spatial] + residual
-         * First transpose attn back to [C, spatial] */
-        float *h_attn_chw = (float *)malloc((size_t)c * spatial * sizeof(float));
-        for (int s_pos = 0; s_pos < spatial; s_pos++)
-            for (int ch = 0; ch < c; ch++)
-                h_attn_chw[ch * spatial + s_pos] = h_attn[s_pos * c + ch];
-        free(h_attn);
-
-        /* Upload, conv 1×1, add residual */
+        /* Transpose attn output [spatial, c] -> [c, spatial] for the 1x1 proj. */
         CUdeviceptr d_attn_chw; cuMemAlloc(&d_attn_chw, (size_t)c*spatial*sizeof(float));
-        cuMemcpyHtoD(d_attn_chw, h_attn_chw, (size_t)c*spatial*sizeof(float));
-        free(h_attn_chw);
+        {
+            unsigned bx = 16, by = 16;
+            unsigned gx = (unsigned)((spatial + 15) / 16);
+            unsigned gy = (unsigned)((c + 15) / 16);
+            int sp = spatial;
+            void *args[] = {&d_attn_chw, &d_attn_sc, &c, &sp};
+            cuLaunchKernel(r->vae_transpose_sc_to_chw, gx, gy, 1, bx, by, 1, 0, s, args, NULL);
+        }
+        cuMemFree(d_attn_sc);
 
+        /* proj 1x1 conv + residual add. */
         CUdeviceptr d_proj_out; cuMemAlloc(&d_proj_out, (size_t)c*spatial*sizeof(float));
         vae_op_conv2d(r, d_proj_out, d_attn_chw, d_proj_w, d_proj_b, c, h, w, c, 1, 1, 0);
         cuMemFree(d_attn_chw); cuMemFree(d_proj_w); cuMemFree(d_proj_b);
 
-        /* Residual: d_x += d_proj_out */
         {
             int n = c * spatial;
             float one = 1.0f;
@@ -3399,21 +3467,25 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         }
         cuMemFree(d_proj_out);
         vae_bf16(r, d_x, c * spatial);
-        cuStreamSynchronize(s);
     }
+    VAE_PHASE_END("mid.1 attention(GPU)");
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_1.npy", d_x, 3, _d); }
 
     /* mid.2 */
+    VAE_PHASE_BEGIN();
     { LOAD_RB_NAMED("decoder.middle.2", n1, c1w, c1b, n2, c2w, c2b, scw, scb);
       CUdeviceptr d_tmp = vae_resblock_gpu(r, d_x, n1, c1w, c1b, n2, c2w, c2b, scw, scb, c, c, h, w);
       cuMemFree(d_x); d_x = d_tmp;
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
       if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); } }
+    VAE_PHASE_END("mid.2 resblock");
     fprintf(stderr, "  after middle: [%d, %d, %d]\n", c, h, w);
     VAE_DUMP("middle_out", d_x, c*h*w);
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_2.npy", d_x, 3, _d); }
 
     /* Upsample blocks 0-14 */
+    VAE_PHASE_BEGIN();
+    int last_res_h = h, last_res_w = w;
     for (int i = 0; i < 15; i++) {
         char pfx[128];
         /* Check if this block has residual weights */
@@ -3464,10 +3536,25 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
           VAE_DUMP(_lbl, d_x, c*h*w); }
         { char _fn[64]; snprintf(_fn, sizeof(_fn), "cuda_vae_upsample_%d.npy", i);
           int _d[] = {c, h, w}; VAE_SAVE_NPY(_fn, d_x, 3, _d); }
+
+        /* Per-stage timing: resolution changed means we started a new stage */
+        if (vae_timing && (h != last_res_h || w != last_res_w)) {
+            char _lbl2[32];
+            snprintf(_lbl2, sizeof(_lbl2), "upsamples @ %dx%d", last_res_h, last_res_w);
+            VAE_PHASE_END(_lbl2);
+            VAE_PHASE_BEGIN();
+            last_res_h = h; last_res_w = w;
+        }
+    }
+    if (vae_timing) {
+        char _lbl2[32];
+        snprintf(_lbl2, sizeof(_lbl2), "upsamples @ %dx%d", last_res_h, last_res_w);
+        VAE_PHASE_END(_lbl2);
     }
     #undef LOAD_RB_NAMED
 
     /* Head: GroupNorm → SiLU → Conv(96→3) */
+    VAE_PHASE_BEGIN();
     {
         VAE_DUMP("pre_head", d_x, c*h*w);
         CUdeviceptr d_gn = vae_upload_f32(st, "decoder.head.0.gamma", s);
@@ -3492,6 +3579,8 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         c = 3;
     }
 
+    VAE_PHASE_END("head");
+
     /* Download result (sync stream first to ensure all GPU ops complete) */
     cuStreamSynchronize(s);
     cuMemcpyDtoH(out_rgb, d_x, (size_t)3 * h * w * sizeof(float));
@@ -3499,6 +3588,8 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
 
     fprintf(stderr, "cuda_qimg_vae: decode complete [%d, %d, %d]\n", c, h, w);
     return 0;
+    #undef VAE_PHASE_BEGIN
+    #undef VAE_PHASE_END
 }
 
 #endif /* CUDA_QIMG_RUNNER_IMPLEMENTATION */
