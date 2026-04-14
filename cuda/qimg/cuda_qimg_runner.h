@@ -811,6 +811,14 @@ struct cuda_qimg_runner {
     int use_fp8_pipe;  /* 1 to use cp.async pipelined FP8 MMA GEMM (env QIMG_FP8_PIPE=1) */
     int use_bf16_mma;  /* 1 to use BF16 MMA GEMM with FP8→BF16 dequant (env QIMG_BF16_MMA=1) */
     CUfunction gemm_bf16_mma_pipe;
+    /* Per-row FP8 MMA pipe — eliminates per-tensor outlier crush.
+     * Drops pixel_mean from 1.81 (per-tensor) to ~1.0 (near gold) at the same
+     * speed as the per-tensor FP8 pipe. Env: QIMG_FP8_PIPE_PERROW=1. */
+    int use_fp8_pipe_perrow;
+    CUfunction gemm_fp8_pipe_perrow;
+    CUfunction reduce_max_abs_per_row;
+    CUdeviceptr d_row_max_buf;     /* [max_n_tok] f32, lazily allocated */
+    size_t      row_max_buf_n;
     int use_fp8_attn;  /* 1 to use mma.sync FP8 flash attention (env QIMG_FP8_ATTN=1) */
     /* Lazy FP8 attention workspace (re-used across blocks; sized to max n_tok*dim) */
     CUdeviceptr d_q_fp8, d_k_fp8, d_v_fp8;  /* [n_tok*dim] uint8 e4m3 */
@@ -1421,9 +1429,42 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
 
-    /* BF16 MMA pipelined GEMM — highest priority. Reads FP8 weights and decodes
-     * to BF16 inline at MMA time, eliminating the X→FP8 cvt step that
-     * introduces blur in the FP8 MMA path. Matches ComfyUI's BF16 reference. */
+    /* Per-row FP8 MMA pipelined GEMM — top priority when enabled. Same speed
+     * as the per-tensor FP8 pipe but drops pixel_mean blur from ~1.81 to ~1.0
+     * by computing one X scale per output row instead of one scale for the
+     * whole tensor. Cost: one extra reduce_max_abs_per_row launch per call. */
+    if (r->use_fp8_pipe_perrow && r->gemm_fp8_pipe_perrow && r->reduce_max_abs_per_row &&
+        n_tok >= 16 && (n_out % 256) == 0 && (n_in % 32) == 0 && !r->use_old_gemm) {
+        /* Allocate / grow per-row max buffer as needed. */
+        size_t need = (size_t)n_tok * sizeof(float);
+        if (need > r->row_max_buf_n) {
+            if (r->d_row_max_buf) { cuMemFree(r->d_row_max_buf); r->d_row_max_buf = 0; }
+            if (cuMemAlloc(&r->d_row_max_buf, need) == CUDA_SUCCESS) {
+                r->row_max_buf_n = need;
+            } else {
+                r->d_row_max_buf = 0; r->row_max_buf_n = 0;
+            }
+        }
+        if (r->d_row_max_buf) {
+            /* Launch per-row reduce: one CTA per row, 256 threads. */
+            void *rargs[] = {&r->d_row_max_buf, &X, &n_tok, &n_in};
+            cuLaunchKernel(r->reduce_max_abs_per_row, (unsigned)n_tok, 1, 1,
+                           256, 1, 1, 0, r->stream, rargs, NULL);
+            float w_scale = 1.0f;
+            void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale, &r->d_row_max_buf};
+            unsigned gx = (unsigned)((n_out + 255) / 256);
+            unsigned gy = (unsigned)((n_tok +  31) /  32);
+            /* smem: 1024 (smX FP8) + 2*8192 (W stages) + 256 (32 inv + 32 fwd scales) = 17664 B */
+            size_t smem_pr = 1024 + 8192 * 2 + 256;
+            cuLaunchKernel(r->gemm_fp8_pipe_perrow, gx, gy, 1, 128, 1, 1,
+                           smem_pr, r->stream, args, NULL);
+            return;
+        }
+        /* OOM → fall through */
+    }
+
+    /* BF16 MMA pipelined GEMM — highest precision, slower. Reads FP8 weights
+     * and decodes to BF16 inline at MMA time. Matches ComfyUI's BF16 reference. */
     if (r->use_bf16_mma && r->gemm_bf16_mma_pipe && n_tok >= 16 &&
         (n_out % 256) == 0 && (n_in % 32) == 0 && !r->use_old_gemm) {
         unsigned gx = (unsigned)((n_out + 255) / 256);
@@ -1802,6 +1843,10 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_fp8_mma_pipe = NULL;
     if (cuModuleGetFunction(&r->gemm_bf16_mma_pipe, module, "gemm_bf16_pipe_f32") != CUDA_SUCCESS)
         r->gemm_bf16_mma_pipe = NULL;
+    if (cuModuleGetFunction(&r->gemm_fp8_pipe_perrow, module, "gemm_fp8_pipe_perrow_f32") != CUDA_SUCCESS)
+        r->gemm_fp8_pipe_perrow = NULL;
+    if (cuModuleGetFunction(&r->reduce_max_abs_per_row, module, "reduce_max_abs_per_row_f32") != CUDA_SUCCESS)
+        r->reduce_max_abs_per_row = NULL;
     if (cuModuleGetFunction(&r->flash_attn_fp8, module, "flash_attn_fp8") != CUDA_SUCCESS)
         r->flash_attn_fp8 = NULL;
     if (cuModuleGetFunction(&r->flash_attn_bf16, module, "flash_attn_bf16") != CUDA_SUCCESS)
@@ -1918,6 +1963,17 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
             r->use_bf16_mma = 1;
             if (verbose)
                 fprintf(stderr, "cuda_qimg: BF16 MMA pipelined GEMM enabled (sm_%d)\n", sm);
+        }
+    }
+    /* Per-row FP8 MMA pipe: opt-in via QIMG_FP8_PIPE_PERROW=1.
+     * Eliminates per-tensor outlier crush by using one X scale per row. */
+    r->use_fp8_pipe_perrow = 0;
+    {
+        const char *env = getenv("QIMG_FP8_PIPE_PERROW");
+        if (env && env[0] == '1' && r->gemm_fp8_pipe_perrow && r->reduce_max_abs_per_row && sm >= 80) {
+            r->use_fp8_pipe_perrow = 1;
+            if (verbose)
+                fprintf(stderr, "cuda_qimg: FP8 MMA per-row pipelined GEMM enabled (sm_%d)\n", sm);
         }
     }
     GET(layernorm_f32, "layernorm_f32");
@@ -2165,6 +2221,8 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->d_q_bf16) cuMemFree(r->d_q_bf16);
     if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
     if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
+    /* Per-row FP8 MMA scale buffer */
+    if (r->d_row_max_buf) cuMemFree(r->d_row_max_buf);
     if (r->dit_st) safetensors_close((st_context *)r->dit_st);
     if (r->vae_st) safetensors_close((st_context *)r->vae_st);
     if (r->stream) cuStreamDestroy(r->stream);
