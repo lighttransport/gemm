@@ -1721,8 +1721,9 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
             cast_buf_f32_to_bf16(r, r->d_k_bf16, d_k, n_elem);
             cast_buf_f32_to_bf16(r, r->d_v_bf16, d_v, n_elem);
             unsigned gy = (unsigned)((n_tok + 63) / 64);
-            /* smem: smK 8KB + smV 8KB BF16 + smP 4KB BF16 = 20480 B */
-            size_t smem = (size_t)(32 * 128 * 2 + 128 * 32 * 2 + 4 * 16 * 32 * sizeof(unsigned short));
+            /* smem: smK 8 KB + smV 8 KB = 16 KB. P held in per-lane regs (no smP),
+             * leaving ~6 CTAs/SM on sm_120. */
+            size_t smem = (size_t)(32 * 128 * 2 + 32 * 128 * 2);
             void *args[] = {&d_out, &r->d_q_bf16, &r->d_k_bf16, &r->d_v_bf16,
                             &n_tok, &n_heads, &head_dim};
             cuLaunchKernel(r->flash_attn_bf16,
