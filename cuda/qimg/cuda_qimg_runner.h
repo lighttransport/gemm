@@ -264,22 +264,24 @@ static const char *qimg_kernel_src =
 "    out[(long)c * n_in_pad + k] = bits;\n"
 "}\n"
 "\n"
-/* im2col for VAE conv2d->GEMM path. Input [ci, H, W] row-major, output
- * [H*W, n_in_pad] row-major where n_in_pad = ceil(ci*kh*kw / 32) * 32.
- * Trailing K cols (beyond ci*kh*kw) are zero-filled so the FP8 MMA kernel
- * can be called with n_in = n_in_pad without reading stale memory.
- * Each thread produces one output element. */
+/* Tiled im2col for VAE conv2d->GEMM path. Input [ci, H, W] row-major,
+ * output [chunk_n_tok, n_in_pad] row-major where n_in_pad = ceil(ci*kh*kw
+ * / 32) * 32. The `tok_offset` arg lets the caller process a sub-range of
+ * H*W tokens at a time so the im2col buffer stays bounded for very large
+ * spatial dimensions (e.g. 1024x1024 with 96 ci would be 3.5 GB in one
+ * shot; tiled in 64K-token chunks it peaks at ~220 MB). */
 "__global__ void vae_im2col_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ inp,\n"
-"    int ci, int h, int w, int kh, int kw, int pad_replicate, int n_in_pad) {\n"
-"    int tok = blockIdx.y * blockDim.y + threadIdx.y;\n"
-"    int k   = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int n_tok = h * w;\n"
-"    if (tok >= n_tok || k >= n_in_pad) return;\n"
+"    int ci, int h, int w, int kh, int kw, int pad_replicate,\n"
+"    int n_in_pad, int tok_offset, int chunk_n_tok) {\n"
+"    int tok_local = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    int k         = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (tok_local >= chunk_n_tok || k >= n_in_pad) return;\n"
 "    int n_in = ci * kh * kw;\n"
-"    if (k >= n_in) { out[(long)tok * n_in_pad + k] = 0.0f; return; }\n"
+"    if (k >= n_in) { out[(long)tok_local * n_in_pad + k] = 0.0f; return; }\n"
 "    int ph = (kh - 1) / 2, pw = (kw - 1) / 2;\n"
-"    int oy = tok / w, ox = tok - oy * w;\n"
+"    int tok_global = tok_offset + tok_local;\n"
+"    int oy = tok_global / w, ox = tok_global - oy * w;\n"
 "    int ic = k / (kh * kw);\n"
 "    int rem = k - ic * (kh * kw);\n"
 "    int fy = rem / kw, fx = rem - fy * kw;\n"
@@ -293,21 +295,23 @@ static const char *qimg_kernel_src =
 "        if (iy >= 0 && iy < h && ix >= 0 && ix < w)\n"
 "            v = inp[(long)ic * h * w + (long)iy * w + ix];\n"
 "    }\n"
-"    out[(long)tok * n_in_pad + k] = v;\n"
+"    out[(long)tok_local * n_in_pad + k] = v;\n"
 "}\n"
 "\n"
-/* Crop + transpose output of vae_op_conv2d_mma: the GEMM writes [n_tok,
- * pad_co] row-major; the rest of the VAE wants [co, h, w] = [co, n_tok]
- * row-major. Each thread reads one (co, tok) and stores to the CHW slot. */
+/* Crop + transpose output of vae_op_conv2d_mma's chunked GEMM: the GEMM
+ * writes [chunk_n_tok, pad_co] row-major; the VAE wants [co, n_tok] row-
+ * major. Each thread reads one (c, tok_local) and stores to
+ * out[c * n_tok_full + (tok_offset + tok_local)] so chunks land in the
+ * correct global spatial slot. */
 "__global__ void vae_crop_transpose_add_bias_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ inp, const float *__restrict__ bias,\n"
-"    int co, int pad_co, int n_tok) {\n"
-"    int tok = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int c   = blockIdx.y * blockDim.y + threadIdx.y;\n"
-"    if (tok >= n_tok || c >= co) return;\n"
-"    float v = inp[(long)tok * pad_co + c];\n"
+"    int co, int pad_co, int n_tok_full, int tok_offset, int chunk_n_tok) {\n"
+"    int tok_local = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int c         = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    if (tok_local >= chunk_n_tok || c >= co) return;\n"
+"    float v = inp[(long)tok_local * pad_co + c];\n"
 "    if (bias) v += bias[c];\n"
-"    out[(long)c * n_tok + tok] = v;\n"
+"    out[(long)c * n_tok_full + tok_offset + tok_local] = v;\n"
 "}\n"
 "\n"
 /* Transpose [C, spatial] -> [spatial, C] (F32). Used before VAE middle
@@ -2880,6 +2884,46 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     return 0;
 }
 
+/* Evict preloaded DiT blocks from the end until `need_bytes` of VRAM is
+ * free (plus a safety margin). Freed blocks fall back to the on-demand
+ * loader via scratch_block / scratch_block_b. Called at dit_step entry so
+ * high-resolution activation buffers always have room. Returns how many
+ * blocks were evicted. */
+static int qimg_evict_preloaded_until_free(cuda_qimg_runner *r,
+                                            size_t need_bytes,
+                                            size_t safety_margin_bytes) {
+    size_t free_mem = 0, total_mem = 0;
+    cuMemGetInfo(&free_mem, &total_mem);
+    size_t want = need_bytes + safety_margin_bytes;
+    if (free_mem >= want) return 0;
+
+    int evicted = 0;
+    /* Free from the tail so prefetch logic stays happy (low-index blocks
+     * remain resident; high-index ones use the on-demand scratch slot). */
+    while (r->n_preloaded > 0 && free_mem < want) {
+        int idx = r->n_preloaded - 1;
+        if (r->gpu_blocks[idx].attn_q_w) {
+            qimg_free_block(&r->gpu_blocks[idx]);
+        }
+        r->n_preloaded--;
+        evicted++;
+        cuMemGetInfo(&free_mem, &total_mem);
+    }
+    if (evicted > 0 && r->verbose) {
+        fprintf(stderr, "cuda_qimg: evicted %d preloaded blocks for activation "
+                        "workspace (now %d preloaded, %.1f GB free)\n",
+                evicted, r->n_preloaded, (float)free_mem / (1<<30));
+    }
+    /* If we freed all preloaded blocks, make sure the on-demand scratch
+     * slot exists so the loader has somewhere to stage. */
+    if (r->n_preloaded < r->dit_n_blocks &&
+        r->scratch_block.attn_q_w == 0) {
+        if (qimg_alloc_scratch_block(r) == 0 && r->verbose)
+            fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
+    }
+    return evicted;
+}
+
 /* ---- CFG-batched DiT step ---- */
 
 int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
@@ -2896,6 +2940,34 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     int n_total_uncond = n_img + n_txt_uncond;
     int n_total_max = n_total_cond > n_total_uncond ? n_total_cond : n_total_uncond;
     CUstream s = r->stream;
+
+    /* Evict preloaded DiT blocks if the transient activation working set
+     * would leave us short of VRAM. This protects 1024x1024 and larger
+     * runs where the static preload sized for 512x512 no longer fits
+     * the 2*n_img MLP buffers + per-pass QKV/attn_out/scratch. Numbers
+     * mirror the cuMemAlloc calls below. */
+    {
+        size_t dim_b  = (size_t)dim   * sizeof(float);
+        size_t mlp_b  = (size_t)mlp_h * sizeof(float);
+        size_t need = 0;
+        need += (size_t)n_img          * dim_b * 2;                          /* d_img_c,u */
+        need += (size_t)(n_txt_cond + n_txt_uncond) * dim_b;                 /* d_txt_c,u */
+        need += (size_t)n_img          * in_ch * sizeof(float);              /* d_img_in */
+        need += (size_t)(n_txt_cond + n_txt_uncond) * txt_dim * sizeof(float);
+        need += (size_t)n_img          * dim_b;                              /* d_scratch1_c */
+        need += (size_t)n_txt_cond     * dim_b;                              /* d_scratch2_c */
+        need += (size_t)n_txt_cond     * mlp_b;                              /* d_scratch3_c */
+        need += (size_t)n_img          * dim_b;                              /* d_scratch1_u */
+        need += (size_t)n_txt_uncond   * dim_b;                              /* d_scratch2_u */
+        need += (size_t)n_txt_uncond   * mlp_b;                              /* d_scratch3_u */
+        need += (size_t)n_total_cond   * dim_b * 4;                          /* d_q/k/v/attn_out cond */
+        need += (size_t)n_total_uncond * dim_b * 4;                          /* d_q/k/v/attn_out uncond */
+        need += (size_t)2 * n_img * dim_b;                                   /* d_img_mlp_in */
+        need += (size_t)2 * n_img * mlp_b;                                   /* d_img_mlp_h */
+        need += (size_t)2 * n_img * dim_b;                                   /* d_img_mlp_out */
+        need += 32 * sizeof(float) * 6;  /* modulation buffers, misc */
+        qimg_evict_preloaded_until_free(r, need, (size_t)64 << 20);
+    }
 
     /* Allocate paired img/txt buffers. Both passes share the same img_tokens
      * at input (same noise) but the hidden states diverge after block 0 so
@@ -3272,11 +3344,11 @@ static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
                    256, 1, 1, 0, r->stream, args, NULL);
 }
 
-/* Tensor-core conv2d path: im2col the F32 input into an [n_tok, n_in_pad]
- * row-major buffer, run the existing FP8 per-row MMA GEMM on pre-quantized
- * FP8 weights, then crop the trailing pad_co cols off the output and
- * transpose [n_tok, pad_co] -> [co, h*w] with an optional bias add.
- * The FP8 GEMM path autoselects MT4 / perrow based on shape. */
+/* Tensor-core conv2d path: tiled im2col the F32 input, run the existing
+ * FP8 per-row MMA GEMM on pre-quantized FP8 weights, then crop/transpose
+ * + bias-add each chunk into the [co, H*W] CHW output. Chunking the n_tok
+ * dimension keeps peak VRAM bounded so 1024x1024 (1 M tokens) fits in a
+ * 16 GB (and usually 8 GB) budget. */
 static void vae_op_conv2d_mma(cuda_qimg_runner *r,
                               CUdeviceptr out, CUdeviceptr inp,
                               CUdeviceptr w_fp8, CUdeviceptr bias,
@@ -3285,30 +3357,68 @@ static void vae_op_conv2d_mma(cuda_qimg_runner *r,
     int n_tok = h * w_s;
     CUstream s = r->stream;
 
-    CUdeviceptr d_unfold;
-    cuMemAlloc(&d_unfold, (size_t)n_tok * n_in_pad * sizeof(float));
-    {
-        unsigned bx = 32, by = 8;  /* 32 K cols x 8 tokens per block */
-        unsigned gx = (unsigned)((n_in_pad + bx - 1) / bx);
-        unsigned gy = (unsigned)((n_tok    + by - 1) / by);
-        void *args[] = {&d_unfold, &inp, &ci, &h, &w_s, &kh, &kw, &rep_pad, &n_in_pad};
-        cuLaunchKernel(r->vae_im2col, gx, gy, 1, bx, by, 1, 0, s, args, NULL);
+    /* Cap each chunk so the unfold buffer stays under ~256 MB.
+     * unfold_bytes = chunk_n_tok * n_in_pad * sizeof(float) */
+    int chunk_n_tok = n_tok;
+    const size_t UNFOLD_CAP = (size_t)256 << 20;  /* 256 MB per chunk */
+    if (n_in_pad > 0) {
+        size_t max_chunk = UNFOLD_CAP / ((size_t)n_in_pad * sizeof(float));
+        if (max_chunk < 1) max_chunk = 1;
+        /* Round chunk_n_tok down to a multiple of 64 so MT4 GEMM applies
+         * inside the inner dispatch. Last chunk can be smaller. */
+        size_t aligned = max_chunk & ~(size_t)63;
+        if (aligned == 0) aligned = max_chunk;
+        if (aligned < (size_t)n_tok) chunk_n_tok = (int)aligned;
+    }
+    if (chunk_n_tok < 1) chunk_n_tok = 1;
+
+    size_t unfold_bytes = (size_t)chunk_n_tok * n_in_pad * sizeof(float);
+    size_t gemm_out_bytes = (size_t)chunk_n_tok * pad_co   * sizeof(float);
+
+    CUdeviceptr d_unfold, d_gemm_out;
+    if (cuMemAlloc(&d_unfold,   unfold_bytes)   != CUDA_SUCCESS ||
+        cuMemAlloc(&d_gemm_out, gemm_out_bytes) != CUDA_SUCCESS) {
+        /* Fall back to naive conv2d on OOM. */
+        fprintf(stderr, "cuda_qimg_vae: mma conv OOM (chunk=%d, n_in_pad=%d), "
+                        "falling back to naive\n", chunk_n_tok, n_in_pad);
+        int total = co * n_tok;
+        void *args[] = {&out, &inp, &w_fp8, &bias, &ci, &h, &w_s, &co, &kh, &kw, &rep_pad};
+        cuLaunchKernel(r->vae_conv2d, (unsigned)((total + 255) / 256), 1, 1,
+                       256, 1, 1, 0, s, args, NULL);
+        return;
     }
 
-    CUdeviceptr d_gemm_out;
-    cuMemAlloc(&d_gemm_out, (size_t)n_tok * pad_co * sizeof(float));
-    /* op_gemm writes [n_tok, pad_co] row-major. Pass NULL bias here and
-     * add it during the crop-transpose so the padded co tail stays zero. */
-    op_gemm(r, d_gemm_out, w_fp8, d_unfold, (CUdeviceptr)0, pad_co, n_in_pad, n_tok);
+    for (int tok0 = 0; tok0 < n_tok; tok0 += chunk_n_tok) {
+        int tok1 = tok0 + chunk_n_tok;
+        if (tok1 > n_tok) tok1 = n_tok;
+        int cnk = tok1 - tok0;
+
+        /* im2col for [tok0, tok1) -> d_unfold[0:cnk, :] */
+        {
+            unsigned bx = 32, by = 8;
+            unsigned gx = (unsigned)((n_in_pad + bx - 1) / bx);
+            unsigned gy = (unsigned)((cnk      + by - 1) / by);
+            void *args[] = {&d_unfold, &inp, &ci, &h, &w_s, &kh, &kw, &rep_pad,
+                            &n_in_pad, &tok0, &cnk};
+            cuLaunchKernel(r->vae_im2col, gx, gy, 1, bx, by, 1, 0, s, args, NULL);
+        }
+
+        /* GEMM: [cnk, pad_co] = unfold[cnk, n_in_pad] * W_fp8[pad_co, n_in_pad]^T
+         * (op_gemm semantics). */
+        op_gemm(r, d_gemm_out, w_fp8, d_unfold, (CUdeviceptr)0, pad_co, n_in_pad, cnk);
+
+        /* Crop + transpose into out[c, tok0..tok1). */
+        {
+            unsigned bx = 32, by = 8;
+            unsigned gx = (unsigned)((cnk + bx - 1) / bx);
+            unsigned gy = (unsigned)((co  + by - 1) / by);
+            void *args[] = {&out, &d_gemm_out, &bias, &co, &pad_co, &n_tok, &tok0, &cnk};
+            cuLaunchKernel(r->vae_crop_transpose_add_bias, gx, gy, 1, bx, by, 1,
+                           0, s, args, NULL);
+        }
+    }
+
     cuMemFree(d_unfold);
-
-    {
-        unsigned bx = 32, by = 8;
-        unsigned gx = (unsigned)((n_tok + bx - 1) / bx);
-        unsigned gy = (unsigned)((co    + by - 1) / by);
-        void *args[] = {&out, &d_gemm_out, &bias, &co, &pad_co, &n_tok};
-        cuLaunchKernel(r->vae_crop_transpose_add_bias, gx, gy, 1, bx, by, 1, 0, s, args, NULL);
-    }
     cuMemFree(d_gemm_out);
 }
 
