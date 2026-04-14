@@ -1,0 +1,5 @@
+.venv/
+*.bin
+*.png
+*.log
+__pycache__/
