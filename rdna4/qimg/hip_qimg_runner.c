@@ -172,12 +172,29 @@ static void *qimg_st_upload_f32(st_context *st, const char *name) {
     return d;
 }
 
-/* Upload safetensor as raw FP8 bytes to GPU (no conversion, 1 byte/element) */
+/* Upload safetensor as raw FP8 bytes to GPU (no conversion, 1 byte/element).
+ *
+ * Note: this function only accepts F8_E4M3 dtype. Mixed-dtype FP8 files like
+ * `unsloth/Qwen-Image-2512-FP8` (which stores 1093 of 1933 tensors as BF16
+ * — biases, norm scales, AND some global GEMM weights like img_in.weight,
+ * proj_out.weight, time_text_embed.*) require an FP8/F32 dispatch flag on
+ * each weight pointer plus a parallel F32 GEMM path for the BF16-stored
+ * weights. The current runner assumes "all GW weights are FP8 bytes", so
+ * `from_single_file`-style mixed checkpoints don't load correctly yet.
+ * TODO: per-weight dtype tagging + dispatch in op_wgemm. */
 static void *qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     int idx = safetensors_find(st, name);
     if (idx < 0) return NULL;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (strcmp(dtype, "F8_E4M3") != 0 && strcmp(dtype, "F8_E4M3FN") != 0) {
+        fprintf(stderr, "hip_qimg: %s has dtype '%s' (expected F8_E4M3) — "
+                "mixed-dtype checkpoints (e.g. Qwen-Image-2512) not yet supported on HIP. "
+                "Use the original ComfyUI qwen_image_fp8_e4m3fn.safetensors.\n",
+                name, dtype);
+        return NULL;
+    }
     size_t nbytes = safetensors_nbytes(st, idx);
-    void *data = safetensors_data(st, idx);
+    const void *data = safetensors_data(st, idx);
     void *d = NULL;
     if (hipMalloc(&d, nbytes) != hipSuccess) {
         fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for %s (fp8)\n",
@@ -638,6 +655,36 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
     r->d_proj_out_w = GW("proj_out.weight");
     r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
     #undef GW
+
+    /* Bail early on any failed global weight upload — this happens when the
+     * checkpoint is mixed-dtype (e.g. unsloth/Qwen-Image-2512-FP8 stores some
+     * global weights as BF16 instead of FP8) and `qimg_st_upload_fp8_raw`
+     * returns NULL with a printed error. Without this check the runner would
+     * crash or hang in the GEMM kernel with a NULL device pointer. */
+    {
+        void *globals[] = {
+            r->d_img_in_w,  r->d_img_in_b,  r->d_txt_in_w,  r->d_txt_in_b,
+            r->d_txt_norm_w, r->d_t_fc1_w,  r->d_t_fc1_b,  r->d_t_fc2_w,
+            r->d_t_fc2_b,   r->d_norm_out_w, r->d_norm_out_b,
+            r->d_proj_out_w, r->d_proj_out_b
+        };
+        const char *names[] = {
+            "img_in.weight", "img_in.bias", "txt_in.weight", "txt_in.bias",
+            "txt_norm.weight", "time_text_embed.timestep_embedder.linear_1.weight",
+            "time_text_embed.timestep_embedder.linear_1.bias",
+            "time_text_embed.timestep_embedder.linear_2.weight",
+            "time_text_embed.timestep_embedder.linear_2.bias",
+            "norm_out.linear.weight", "norm_out.linear.bias",
+            "proj_out.weight", "proj_out.bias"
+        };
+        for (int i = 0; i < 13; i++) {
+            if (!globals[i]) {
+                fprintf(stderr, "hip_qimg: global weight '%s' failed to upload — aborting load_dit.\n",
+                        names[i]);
+                return -1;
+            }
+        }
+    }
 
     /* Preload as many blocks as fit in VRAM */
     {
