@@ -1,0 +1,21 @@
+[project]
+name = "hy3d-reference"
+version = "0.1.0"
+description = "PyTorch reference for Hunyuan3D-2.1 verification"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "torchvision",
+    "safetensors",
+    "numpy",
+    "Pillow",
+    "transformers",
+    "pyyaml",
+    "trimesh",
+    "einops",
+    "diffusers",
+    "scikit-image",
+    "timm>=1.0.26",
+    "omegaconf>=2.3.0",
+    "opencv-python>=4.13.0.92",
+]

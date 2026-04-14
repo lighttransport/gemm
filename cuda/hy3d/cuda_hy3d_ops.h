@@ -81,7 +81,9 @@ static int hy3d_ops_load(hy3d_ops *ops, CUmodule module, int sm_version) {
     GET_FN("layernorm_f32",          layernorm);
     GET_FN("gemm_f16_f32",           gemm);
     GET_FN("gemm_tiled_f16_f32",     gemm_tiled);
-    GET_FN("gelu_f32",               gelu);
+    /* DINOv2 + DiT + ShapeVAE all use torch nn.GELU() with exact erf form.
+     * The tanh-approx gelu_f32 accumulates ~1e-2 mean err over 24 blocks. */
+    GET_FN("gelu_exact_f32",         gelu);
     GET_FN("add_f32",                add);
     GET_FN("silu_f32",               silu);
     GET_FN("resize_normalize",       resize_normalize);
