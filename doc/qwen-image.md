@@ -474,6 +474,16 @@ via `cuDevicePrimaryCtxRetain`.
   512×512 VAE decode drops from **21.6 s → 1.7 s** (12.7×); the middle
   attention phase alone drops **19.7 s → 0.04 s**. 256×256 VAE drops
   **1.5 s → 0.5 s**. Correctness unchanged (mean pixel diff 1.877 / 255).
+- [x] **1328×1328 (Qwen-Image max res)** w/ memory-pressure aware eviction.
+  The empirical 256 MB safety margin in `qimg_evict_preloaded_until_free`
+  is tuned to keep post-alloc free VRAM above a threshold where the CUDA
+  driver starts doing heavy per-launch bookkeeping: at 1328 with only
+  50 MB free after alloc, every block was running **6.7× slower on the
+  first step** (95 s/step one-time penalty → 14 s/step steady). Kernels
+  are identical but driver overhead on memory-tight launches is not.
+  Bumping the margin to 256 MB restores steady-state speed on the first
+  step. Measured at 1328x1328 (10-step gen): **13.96 s/step DiT, 3.3 s
+  VAE**. 1024 and 512 paths unchanged.
 - [x] **1024×1024 generation** with dynamic preload eviction + tiled im2col.
   `cuda_qimg_dit_step_cfg` now computes the activation working set up-front
   (`d_img`, QKV, CFG-batched MLP buffers, scratch) and calls a new helper
