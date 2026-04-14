@@ -295,13 +295,16 @@ ComfyUI-encoded text hidden states for a fair correctness comparison):**
 | ours — FP8 MMA + scalar attn | 2.04 s/step | — | 1.81 | 1.59× |
 | ours — FP8 MMA + FP8 attn (old default) | 1.98 s/step | 3.02 s/step | 5.01 | 1.55×–1.88× (blurry) |
 | ours — BF16 MMA + BF16 attn | 3.66 s/step | 9.14 s/step | 0.85 | 2.86×–5.68× |
-| ours — PER-ROW FP8 MT2 + BF16 attn | 1.98 s/step | 2.92 s/step | 1.88 | 1.55×–1.81× |
-| **ours — PER-ROW FP8 MT4 + vectorized BF16 attn (new default)** | **1.94 s/step** | **2.61 s/step** | **1.88** | **1.52×–1.62×** |
+| ours — PER-ROW FP8 MT2 + BF16 attn | 1.98 s/step | 2.96 s/step | 1.88 | 1.55×–1.84× |
+| **ours — PER-ROW FP8 MT4 + vectorized BF16 attn (new default)** | **1.95 s/step** | **2.69 s/step** | **1.88** | **1.52×–1.67×** |
 
-The "PER-ROW MT4 + BF16 attn" recipe reaches **3.03× faster than gold at 512×512
-(7.90 → 2.61 s/step)** while staying visually indistinguishable from
+The "PER-ROW MT4 + BF16 attn" recipe reaches **2.94× faster than gold at 512×512
+(7.90 → 2.69 s/step)** while staying visually indistinguishable from
 ComfyUI/gold (mean pixel diff 1.88 / 255 ≈ 0.7%). At 256×256 it hits the
-~1.5× ComfyUI target (1.94 vs 1.28 s/step).
+~1.5× ComfyUI target (1.95 vs 1.28 s/step). At 512×512 the gap is 1.67×.
+
+Stable 3-run averages confirmed by `QIMG_DISABLE_MT4=1` A/B at 512×512:
+MT2 = 2.96 s/step, MT4 = 2.69 s/step (9.1% MT4 win).
 
 **Recommended invocation (new default):**
 
@@ -330,11 +333,11 @@ Correctness: corr=0.999107 vs `cf_ournoise2_10step_latent.npy`, every channel co
 - +scratch-slot block loader:              10.22 s/step  (2.14×)
 - +FP8 flash attention:                     5.05 s/step  (4.33×)
 - +CFG batching, cp.async pipe FP8 MMA:     3.02 s/step  (7.23×)
-- +per-row FP8 MMA + BF16 attention:        2.92 s/step  (7.48×)
-- **+MTILE=4 GEMM + vectorized BF16 attn:   2.61 s/step  (8.37×)**
+- +per-row FP8 MMA + BF16 attention:        2.96 s/step  (7.38×)
+- **+MTILE=4 GEMM + vectorized BF16 attn:   2.69 s/step  (8.12×)**
 
-(Apple gen at 512×512: 2.61 s/step is **3.03× faster** than the LUT scalar
-gold path 7.90 s/step, **1.62× slower** than ComfyUI 1.61 s/step.)
+(Apple gen at 512×512: 2.69 s/step is **2.94× faster** than the LUT scalar
+gold path 7.90 s/step, **1.67× slower** than ComfyUI 1.61 s/step.)
 
 **Dominant remaining cost**: PCIe block loading. Only 11/60 blocks fit in 16 GB VRAM
 at 512×512 so 48 blocks are loaded on-demand per forward (~85 ms each through
