@@ -2263,13 +2263,21 @@ typedef struct {
  * modulation tensors (d_img_mod, d_txt_mod) are SHARED across passes when
  * CFG batching calls this twice per block for cond and uncond.
  *
+ * When `img_mlp_in_external` is non-zero, the img adaLN2 output is written
+ * there instead of d_scratch1, and the img MLP (fc1+gelu+fc2) plus the
+ * post-MLP img gated_add are SKIPPED — the caller is expected to run a
+ * batched version that processes cond+uncond together. Text MLP still runs
+ * here since n_txt differs between passes. The caller is responsible for
+ * the post-MLP img gated_add using the batched MLP output.
+ *
  * Returns 0 on success. */
 static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
                               const qimg_block_gpu *blk, int L,
                               CUdeviceptr d_img_mod, CUdeviceptr d_txt_mod,
                               int hp_rope, int wp_rope,
                               int t_dim_rope, int h_dim_rope, int w_dim_rope,
-                              float rope_theta)
+                              float rope_theta,
+                              CUdeviceptr img_mlp_in_external)
 {
     CUstream s = r->stream;
     int dim = r->dit_dim, nh = r->dit_n_heads, hd = r->dit_head_dim, mlp_h = r->dit_mlp_h;
@@ -2349,14 +2357,20 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
     op_gated_add(r, d_txt, d_scratch2, txt_g1, n_txt, dim);
 
-    /* Image MLP */
-    op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
-    op_gemm(r, d_scratch3, blk->img_mlp_fc1_w, d_scratch1, blk->img_mlp_fc1_b,
-            mlp_h, dim, n_img);
-    op_gelu(r, d_scratch3, n_img * mlp_h);
-    op_gemm(r, d_scratch1, blk->img_mlp_fc2_w, d_scratch3, blk->img_mlp_fc2_b,
-            dim, mlp_h, n_img);
-    op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
+    /* Image MLP. When `img_mlp_in_external` is set, run adaLN2 into that
+     * external buffer and skip the MLP + gated_add — the caller will do a
+     * CFG-batched MLP across cond+uncond before running its own gated_add. */
+    if (img_mlp_in_external) {
+        op_adaln(r, img_mlp_in_external, d_img, img_sh2, img_sc2, n_img, dim);
+    } else {
+        op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
+        op_gemm(r, d_scratch3, blk->img_mlp_fc1_w, d_scratch1, blk->img_mlp_fc1_b,
+                mlp_h, dim, n_img);
+        op_gelu(r, d_scratch3, n_img * mlp_h);
+        op_gemm(r, d_scratch1, blk->img_mlp_fc2_w, d_scratch3, blk->img_mlp_fc2_b,
+                dim, mlp_h, n_img);
+        op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
+    }
 
     /* Text MLP */
     op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
@@ -2638,7 +2652,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         _st.d_scratch1 = d_scratch1; _st.d_scratch2 = d_scratch2; _st.d_scratch3 = d_scratch3;
         _st.n_img = n_img; _st.n_txt = n_txt; _st.n_total = n_total;
         qimg_forward_block(r, &_st, &blk, L, d_img_mod, d_txt_mod,
-                           hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta);
+                           hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta,
+                           (CUdeviceptr)0);
 
         /* Save every block output for comparison */
         if (r->verbose >= 3) {
@@ -2750,20 +2765,24 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     CUdeviceptr d_t_emb;
     cuMemAlloc(&d_t_emb, (size_t)dim * sizeof(float));
 
-    /* Scratch buffers sized for the LARGER of the two passes (since we
-     * reuse them per-pass via the state struct). */
-    size_t scratch_toks = (n_total_max > mlp_h / (sizeof(float))) ? n_total_max : n_total_max;
-    (void)scratch_toks;
-    size_t max_scratch  = (size_t)n_total_max * dim * sizeof(float);
-    size_t ffn_scratch  = (size_t)n_total_max * mlp_h * sizeof(float);
+    /* Scratch buffers. scratch1 only ever holds n_img rows (img adaLN output
+     * / attn_out). scratch2 only ever holds n_txt rows (text adaLN output /
+     * attn_out / MLP output). scratch3 only holds the text MLP intermediate
+     * of size (n_txt * mlp_h) — the img MLP now runs CFG-batched outside
+     * forward_block so it no longer needs scratch3. */
+    int n_txt_max = n_txt_cond > n_txt_uncond ? n_txt_cond : n_txt_uncond;
+    size_t img_scratch = (size_t)n_img     * dim   * sizeof(float);
+    size_t txt_scratch = (size_t)n_txt_max * dim   * sizeof(float);
+    size_t txt_ffn     = (size_t)n_txt_max * mlp_h * sizeof(float);
     CUdeviceptr d_scratch1_c, d_scratch2_c, d_scratch3_c;
     CUdeviceptr d_scratch1_u, d_scratch2_u, d_scratch3_u;
-    cuMemAlloc(&d_scratch1_c, max_scratch);
-    cuMemAlloc(&d_scratch2_c, max_scratch);
-    cuMemAlloc(&d_scratch3_c, ffn_scratch);
-    cuMemAlloc(&d_scratch1_u, max_scratch);
-    cuMemAlloc(&d_scratch2_u, max_scratch);
-    cuMemAlloc(&d_scratch3_u, ffn_scratch);
+    cuMemAlloc(&d_scratch1_c, img_scratch);
+    cuMemAlloc(&d_scratch2_c, txt_scratch);
+    cuMemAlloc(&d_scratch3_c, txt_ffn);
+    cuMemAlloc(&d_scratch1_u, img_scratch);
+    cuMemAlloc(&d_scratch2_u, txt_scratch);
+    cuMemAlloc(&d_scratch3_u, txt_ffn);
+    (void)n_total_max;
 
     /* Joint QKV + attention scratch, sized per-pass since n_total differs. */
     CUdeviceptr d_q_c, d_k_c, d_v_c, d_attn_out_c;
@@ -2776,6 +2795,20 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     cuMemAlloc(&d_k_u,        (size_t)n_total_uncond * dim * sizeof(float));
     cuMemAlloc(&d_v_u,        (size_t)n_total_uncond * dim * sizeof(float));
     cuMemAlloc(&d_attn_out_u, (size_t)n_total_uncond * dim * sizeof(float));
+
+    /* CFG-batched img-MLP buffers: cond/uncond adaLN2 output is packed into
+     * the first / second half of d_img_mlp_in, then one batched fc1+gelu+fc2
+     * runs on 2*n_img rows, halving W traffic for the two heaviest GEMMs in
+     * the block (mlp_h=14336 x dim=3072 each direction). Post-MLP gated_add
+     * is then dispatched per-pass by reading from d_img_mlp_out halves. */
+    CUdeviceptr d_img_mlp_in, d_img_mlp_h, d_img_mlp_out;
+    cuMemAlloc(&d_img_mlp_in,  (size_t)2 * n_img * dim   * sizeof(float));
+    cuMemAlloc(&d_img_mlp_h,   (size_t)2 * n_img * mlp_h * sizeof(float));
+    cuMemAlloc(&d_img_mlp_out, (size_t)2 * n_img * dim   * sizeof(float));
+    CUdeviceptr d_img_mlp_in_c  = d_img_mlp_in;
+    CUdeviceptr d_img_mlp_in_u  = d_img_mlp_in  + (size_t)n_img * dim * sizeof(float);
+    CUdeviceptr d_img_mlp_out_c = d_img_mlp_out;
+    CUdeviceptr d_img_mlp_out_u = d_img_mlp_out + (size_t)n_img * dim * sizeof(float);
 
     /* Modulation buffers — same for cond and uncond since t_emb is shared */
     CUdeviceptr d_t_silu, d_img_mod, d_txt_mod;
@@ -2872,7 +2905,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         op_gemm(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         op_gemm(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
 
-        /* --- Cond pass (on r->stream) --- */
+        /* --- Cond pass (on r->stream). Skips img MLP; adaLN2 output goes
+         * into the first half of d_img_mlp_in for the batched MLP below. --- */
         {
             qimg_fwd_state_t st_c;
             st_c.d_img = d_img_c; st_c.d_txt = d_txt_c;
@@ -2880,14 +2914,10 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             st_c.d_scratch1 = d_scratch1_c; st_c.d_scratch2 = d_scratch2_c; st_c.d_scratch3 = d_scratch3_c;
             st_c.n_img = n_img; st_c.n_txt = n_txt_cond; st_c.n_total = n_total_cond;
             qimg_forward_block(r, &st_c, &blk, L, d_img_mod, d_txt_mod,
-                               hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta);
+                               hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta,
+                               d_img_mlp_in_c);
         }
-        /* --- Uncond pass ---
-         * When parallel CFG is enabled, record mod_ready on r->stream then
-         * temporarily swap r->stream to uncond_stream so op_* helpers dispatch
-         * their kernels there. uncond_stream waits on mod_ready so it starts
-         * its own work only after modulation is produced. At end of block we
-         * sync so next iter's modulation sees both passes complete. */
+        /* --- Uncond pass. Same deal, into the second half of d_img_mlp_in. --- */
         int use_parallel = (r->uncond_stream != NULL);
         CUstream saved_stream = r->stream;
         if (use_parallel) {
@@ -2902,7 +2932,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             st_u.d_scratch1 = d_scratch1_u; st_u.d_scratch2 = d_scratch2_u; st_u.d_scratch3 = d_scratch3_u;
             st_u.n_img = n_img; st_u.n_txt = n_txt_uncond; st_u.n_total = n_total_uncond;
             qimg_forward_block(r, &st_u, &blk, L, d_img_mod, d_txt_mod,
-                               hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta);
+                               hp_rope, wp_rope, t_dim_rope, h_dim_rope, w_dim_rope, rope_theta,
+                               d_img_mlp_in_u);
         }
         if (use_parallel) {
             /* Rejoin: next block's modulation depends on shared d_img_mod/
@@ -2911,6 +2942,19 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             cuEventRecord(r->block_barrier_unc, r->uncond_stream);
             r->stream = saved_stream;
             cuStreamWaitEvent(r->stream, r->block_barrier_unc, 0);
+        }
+
+        /* --- CFG-batched img MLP. W is loaded once for both cond and uncond. --- */
+        {
+            int two_n_img = 2 * n_img;
+            op_gemm(r, d_img_mlp_h, blk.img_mlp_fc1_w, d_img_mlp_in, blk.img_mlp_fc1_b,
+                    mlp_h, dim, two_n_img);
+            op_gelu(r, d_img_mlp_h, two_n_img * mlp_h);
+            op_gemm(r, d_img_mlp_out, blk.img_mlp_fc2_w, d_img_mlp_h, blk.img_mlp_fc2_b,
+                    dim, mlp_h, two_n_img);
+            CUdeviceptr img_g2 = d_img_mod + (size_t)5 * dim * sizeof(float);
+            op_gated_add(r, d_img_c, d_img_mlp_out_c, img_g2, n_img, dim);
+            op_gated_add(r, d_img_u, d_img_mlp_out_u, img_g2, n_img, dim);
         }
 
         /* If we consumed a double-buffer slot, release it and prefetch L+2. */
@@ -2966,6 +3010,7 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     cuMemFree(d_scratch1_u); cuMemFree(d_scratch2_u); cuMemFree(d_scratch3_u);
     cuMemFree(d_q_c); cuMemFree(d_k_c); cuMemFree(d_v_c); cuMemFree(d_attn_out_c);
     cuMemFree(d_q_u); cuMemFree(d_k_u); cuMemFree(d_v_u); cuMemFree(d_attn_out_u);
+    cuMemFree(d_img_mlp_in); cuMemFree(d_img_mlp_h); cuMemFree(d_img_mlp_out);
     cuMemFree(d_t_silu); cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
     return 0;
 }

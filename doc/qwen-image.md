@@ -297,16 +297,20 @@ ComfyUI-encoded text hidden states for a fair correctness comparison):**
 | ours — BF16 MMA + BF16 attn | 3.66 s/step | 9.14 s/step | 0.85 | 2.86×–5.68× |
 | ours — PER-ROW FP8 MT2 + BF16 attn | 1.98 s/step | 2.96 s/step | 1.88 | 1.55×–1.84× |
 | ours — PER-ROW FP8 MT4 + vectorized BF16 attn | 2.00 s/step | 2.74 s/step | 1.88 | 1.56×–1.70× |
-| **ours — PER-ROW FP8 MT4 + cp.async ldmatrix.trans BF16 attn (new default)** | **2.00 s/step** | **2.67 s/step** | **1.88** | **1.56×–1.66×** |
+| ours — + cp.async ldmatrix.trans BF16 attn | 2.00 s/step | 2.67 s/step | 1.88 | 1.56×–1.66× |
+| **ours — + CFG-batched img MLP (new default)** | **1.95 s/step** | **2.65 s/step** | **1.88** | **1.52×–1.65×** |
 
-The new default reaches **2.96× faster than gold at 512×512 (7.90 → 2.67
+The new default reaches **2.98× faster than gold at 512×512 (7.90 → 2.65
 s/step)** while staying visually indistinguishable from ComfyUI/gold (mean
-pixel diff 1.88 / 255 ≈ 0.7%). At 256×256 it hits the ~1.5× ComfyUI target
-(2.00 vs 1.28 s/step). At 512×512 the gap is 1.66×.
+pixel diff 1.88 / 255 ≈ 0.7%). At 256×256 it hits **1.52× ComfyUI** (1.95 vs
+1.28 s/step). At 512×512 the gap is 1.65×.
 
-Stable 3-run averages (256×256/10 steps, 512×512/5 steps) confirm cp.async +
-ldmatrix.trans BF16 attention saves ~70 ms/step at 512×512 vs the vectorized
-sync-load variant (2.74 → 2.67), while 256×256 is unchanged within noise.
+Stable 3-run averages (256×256/10 steps, 512×512/5 steps) across this
+session: cp.async + ldmatrix.trans saves ~70 ms/step at 512 (2.74 → 2.67).
+CFG-batched image MLP (fc1 + GELU + fc2) saves another ~50 ms at 256 and
+~20 ms at 512 — at 256 the small n_img (1024) means doubling to 2048 rows
+lands in a more efficient MMA tile shape; at 512 n_img=4096 is already
+saturated so the gain is mostly W-traffic dedup.
 
 **Recommended invocation (new default):**
 
@@ -337,7 +341,8 @@ Correctness: corr=0.999107 vs `cf_ournoise2_10step_latent.npy`, every channel co
 - +CFG batching, cp.async pipe FP8 MMA:     3.02 s/step  (7.23×)
 - +per-row FP8 MMA + BF16 attention:        2.96 s/step  (7.38×)
 - +MTILE=4 GEMM + vectorized BF16 attn:     2.74 s/step  (7.97×)
-- **+cp.async + ldmatrix.trans BF16 attn:   2.67 s/step  (8.18×)**
+- +cp.async + ldmatrix.trans BF16 attn:     2.67 s/step  (8.18×)
+- **+CFG-batched img MLP:                   2.65 s/step  (8.24×)**
 
 (Apple gen at 512×512: 2.69 s/step is **2.94× faster** than the LUT scalar
 gold path 7.90 s/step, **1.67× slower** than ComfyUI 1.61 s/step.)
@@ -446,6 +451,21 @@ via `cuDevicePrimaryCtxRetain`.
   Single-buffer `cp.async` (no prefetch) chosen over 2-stage double-buffer
   (32 KB, 3 CTAs/SM) because the occupancy hit outweighed the pipeline gain
   at 256×256. Saves ~70 ms/step at 512×512 (2.74 → 2.67).
+- [x] **CFG-batched image MLP**. `cuda_qimg_dit_step_cfg` now allocates one
+  contiguous `[2*n_img, dim]` MLP input buffer (`d_img_mlp_in`) and one
+  `[2*n_img, mlp_h]` intermediate (`d_img_mlp_h`). Both the cond and uncond
+  `forward_block` calls skip their img MLP; instead they write the img
+  adaLN2 output into the first / second half of `d_img_mlp_in` via a new
+  `img_mlp_in_external` argument. A single batched `fc1 + gelu + fc2` then
+  runs on 2*n_img rows, halving W traffic for the two largest GEMMs in the
+  block (mlp_h=14336 × dim=3072 each direction). The post-MLP `gated_add` is
+  dispatched per-pass by slicing `d_img_mlp_out` into halves. To make this
+  fit VRAM, `d_scratch1` / `d_scratch2` / `d_scratch3` are shrunk to their
+  actual minimum sizes (`n_img*dim`, `n_txt*dim`, `n_txt*mlp_h` respectively)
+  — the img MLP intermediate no longer lives in `d_scratch3`. Saves ~50 ms
+  at 256×256 and ~20 ms at 512×512. The 256×256 win is larger because n_img
+  = 1024 was below the MMA kernel's preferred M tile count; doubling to 2048
+  fills the CTAs more evenly.
 - [ ] **Attention kernel for n_tok > 1536**: `flash_attn_bf16` handles our sizes, but won't scale beyond 2K tokens without tiling.
 - [ ] **VAE on GPU**: Conv2d kernel is naive (one thread per output element). Large convolutions (384 channels × 256×256) would benefit from im2col + GEMM or Winograd.
 - [ ] **AdaLN + GEMM fusion**: 4 standalone adaln kernels per block → fuse into GEMM input load. ~5-10% DiT speedup.
