@@ -37,6 +37,40 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdint.h>
+
+/* Env-var gated device-to-.npy debug dump. Set HY3D_DUMP_DIR=/path to enable;
+ * individual stages write files like cuda_dinov2_hidden_0.npy into it. */
+static void hy3d_dbg_dump_npy(CUstream stream, CUdeviceptr d_buf,
+                              int rows, int cols, const char *fname) {
+    const char *dir = getenv("HY3D_DUMP_DIR");
+    if (!dir || !*dir) return;
+    size_t n = (size_t)rows * (size_t)cols;
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) return;
+    cuStreamSynchronize(stream);
+    cuMemcpyDtoH(h, d_buf, n * sizeof(float));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir, fname);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(h); return; }
+    static const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t ver[2] = {1, 0}; fwrite(ver, 1, 2, f);
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", rows, cols);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(hdr, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(h, sizeof(float), n, f);
+    fclose(f);
+    free(h);
+}
 
 /* ======================================================================== */
 /* Model constants                                                          */
@@ -783,6 +817,7 @@ static void run_dinov2(cuda_hy3d_runner *r, CUdeviceptr d_image, CUdeviceptr d_o
                        (unsigned)((seq*dim+255)/256), 1, 1,
                        256, 1, 1, 0, stream, args, NULL);
     }
+    hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "cuda_dinov2_hidden_0.npy");
 
     /* 3. Encoder layers */
     for (int li = 0; li < DINO_LAYERS; li++) {
@@ -821,6 +856,14 @@ static void run_dinov2(cuda_hy3d_runner *r, CUdeviceptr d_image, CUdeviceptr d_o
             op_layerscale_add(ops, stream, d_hidden, d_normed, l->ls2, seq * dim, dim);
         else
             op_add(ops, stream, d_hidden, d_normed, seq * dim);
+
+        /* HF hidden_states index = block_index + 1 */
+        if (li == 11)
+            hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "cuda_dinov2_hidden_12.npy");
+        else if (li == 22)
+            hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "cuda_dinov2_hidden_23.npy");
+        else if (li == 23)
+            hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "cuda_dinov2_hidden_24.npy");
     }
 
     /* 4. Final LN */
@@ -1312,8 +1355,13 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         }
 
         if (blk->use_moe) {
-            /* Fix 2: MoE with 8 experts + shared expert, top-2 gating */
-            CUdeviceptr d_moe_out = d_mlp; /* reuse mlp scratch for MoE output [N1 * H_dim] */
+            /* Fix 2: MoE with 8 experts + shared expert, top-2 gating.
+             * Bug fix: d_moe_out must NOT alias d_moe_scratch. d_mlp and
+             * d_moe_scratch both point to scratch[1]; d_exp_h inside
+             * run_dit_moe sits at offset 131KB (size ~134MB) and overlaps
+             * d_moe_out [0..33.5MB] at scratch[1] base, corrupting the
+             * accumulator. Use d_attn (scratch[2], free during MLP phase). */
+            CUdeviceptr d_moe_out = d_attn;
             run_dit_moe(r, blk, d_normed, d_moe_out, N1, d_moe_scratch);
             op_add(ops, stream, d_hidden, d_moe_out, N1 * H_dim);
         } else {
@@ -1322,6 +1370,14 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             op_gelu(ops, stream, d_mlp, N1 * ffn);
             op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b, H_dim, ffn, N1);
             op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
+        }
+
+        /* Per-block hidden dump (for error localization vs PyTorch) */
+        if (bi == 0 || bi == 5 || bi == 10 || bi == 11 ||
+            bi == 14 || bi == 15 || bi == 20) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "cuda_dit_block_%d.npy", bi);
+            hy3d_dbg_dump_npy(stream, d_hidden, N1, H_dim, fname);
         }
 
         /* Per-block debug stats */
