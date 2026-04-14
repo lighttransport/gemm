@@ -816,6 +816,7 @@ struct cuda_qimg_runner {
      * speed as the per-tensor FP8 pipe. Env: QIMG_FP8_PIPE_PERROW=1. */
     int use_fp8_pipe_perrow;
     CUfunction gemm_fp8_pipe_perrow;
+    CUfunction gemm_fp8_pipe_perrow_mt4;  /* MTILE=4 variant for n_tok % 64 == 0 */
     CUfunction reduce_max_abs_per_row;
     CUdeviceptr d_row_max_buf;     /* [max_n_tok] f32, lazily allocated */
     size_t      row_max_buf_n;
@@ -1453,6 +1454,16 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
             float w_scale = 1.0f;
             void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale, &r->d_row_max_buf};
             unsigned gx = (unsigned)((n_out + 255) / 256);
+            /* MTILE=4 variant: 64 rows/CTA. Used when n_tok is a multiple of 64,
+             * which holds for img stream at >=512 (n_img=1024+) and qkv shapes. */
+            if (r->gemm_fp8_pipe_perrow_mt4 && n_tok >= 64 && (n_tok % 64) == 0) {
+                unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+                /* smem: 2048 (smX 64x32) + 2*8192 (W) + 512 (64 inv + 64 fwd) = 18944 B */
+                size_t smem_mt4 = 2048 + 8192 * 2 + 512;
+                cuLaunchKernel(r->gemm_fp8_pipe_perrow_mt4, gx, gy4, 1, 128, 1, 1,
+                               smem_mt4, r->stream, args, NULL);
+                return;
+            }
             unsigned gy = (unsigned)((n_tok +  31) /  32);
             /* smem: 1024 (smX FP8) + 2*8192 (W stages) + 256 (32 inv + 32 fwd scales) = 17664 B */
             size_t smem_pr = 1024 + 8192 * 2 + 256;
@@ -1710,7 +1721,7 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
             cast_buf_f32_to_bf16(r, r->d_k_bf16, d_k, n_elem);
             cast_buf_f32_to_bf16(r, r->d_v_bf16, d_v, n_elem);
             unsigned gy = (unsigned)((n_tok + 63) / 64);
-            /* smem: smK + smV both 8KB BF16 + smP 4KB BF16 = 20480 B */
+            /* smem: smK 8KB + smV 8KB BF16 + smP 4KB BF16 = 20480 B */
             size_t smem = (size_t)(32 * 128 * 2 + 128 * 32 * 2 + 4 * 16 * 32 * sizeof(unsigned short));
             void *args[] = {&d_out, &r->d_q_bf16, &r->d_k_bf16, &r->d_v_bf16,
                             &n_tok, &n_heads, &head_dim};
@@ -1845,6 +1856,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_bf16_mma_pipe = NULL;
     if (cuModuleGetFunction(&r->gemm_fp8_pipe_perrow, module, "gemm_fp8_pipe_perrow_f32") != CUDA_SUCCESS)
         r->gemm_fp8_pipe_perrow = NULL;
+    if (cuModuleGetFunction(&r->gemm_fp8_pipe_perrow_mt4, module, "gemm_fp8_pipe_perrow_mt4_f32") != CUDA_SUCCESS)
+        r->gemm_fp8_pipe_perrow_mt4 = NULL;
     if (cuModuleGetFunction(&r->reduce_max_abs_per_row, module, "reduce_max_abs_per_row_f32") != CUDA_SUCCESS)
         r->reduce_max_abs_per_row = NULL;
     if (cuModuleGetFunction(&r->flash_attn_fp8, module, "flash_attn_fp8") != CUDA_SUCCESS)
