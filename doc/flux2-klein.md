@@ -181,6 +181,23 @@ All are single-header libraries — define `*_IMPLEMENTATION` before include.
 | `test_cuda_flux2.c` | CUDA test harness: init, load, DiT step, text encoder, VAE, full generation |
 | `Makefile` | Build targets |
 
+### HIP/ROCm Implementation (`rdna4/flux2/`)
+
+Targets RDNA4 (gfx1200/gfx1201). Kernels compiled at runtime via HIPRTC (no `hipcc` required).
+
+| File | Description |
+|---|---|
+| `hip_flux2_runner.c/.h` | GPU runner: HIPRTC kernels, FP8 LUT GEMM + F32 fallback, 4-axis RoPE, DiT forward, GPU VAE decode |
+| `hip_flux2_kernels.h` | HIP kernel strings: `gemm_f32_f32`, `gemm_fp8_scaled_f32`, flash attention, RoPE, VAE conv, etc. |
+| `test_hip_flux2.c` | Test harness: `--test-dit`, `--generate` (scheduler + VAE + PPM) with CPU text encoder or `--txt-bin` |
+| `verify_dit.c` | CPU↔GPU single-step DiT numerical verification (max_diff vs CPU reference) |
+| `verify_vae.c` | CPU↔GPU VAE decode verification |
+| `Makefile` | Build targets: `make test_hip_flux2 verify_dit verify_vae`, plus `test-gen`/`test-verify-dit` shortcuts |
+
+**FP8 LUT GEMM** (default ON, set `FLUX2_FP8_GEMM=0` to force F32): raw FP8 E4M3 bytes are uploaded to VRAM (~4× smaller than F32), dequantized per-element on load via a 256-entry constant-memory LUT. Per-tensor `weight_scale` is passed to the kernel as a scalar argument. Verified on RTX 9070 XT (gfx1201) — `verify_dit --lat 8` reports `max_diff≈3e-4 corr=1.0` vs CPU reference in both FP8 and F32 modes.
+
+**End-to-end `--generate`**: full denoising pipeline on GPU. Text encoding runs on CPU via `flux2_klein_text_encoder.h` when `--enc`/`--tok` are supplied, or a precomputed `[n_tok, 7680]` F32 tensor can be supplied via `--txt-bin`. If neither is given, the pipeline falls back to a seeded random text hidden tensor (shakeout only — output is not a real image). Text tokens are front-padded to 512 per ComfyUI convention; scheduler uses `qimg_sched_set_timesteps_comfyui` with `shift=expf(2.02)`, `multiplier=1.0`.
+
 ## Build & Run
 
 ### Prerequisites
@@ -301,8 +318,15 @@ make test-gen-base    # Base pipeline
 | **Full `--generate --gpu-enc` path** | Working | Prompt is encoded once, encoder is freed, then DiT/VAE load |
 | **DiT CPU** | Visual PASS | 64×64 correct red apple (4 steps) |
 | **DiT CUDA** | Visual PASS | 256×256 clear red apple (4 steps), max_diff vs CPU < 1e-5 |
+| **DiT HIP (RX 9070 XT, gfx1201)** | Numerical PASS | `verify_dit --lat 8`: max_diff 3e-4, corr=1.0 vs CPU (both FP8-LUT and F32) |
+| **HIP FP8 LUT GEMM** | Verified | Weight upload ~2.4 s (vs 4.0 s F32), no correctness regression |
+| **HIP FP8 128x128 tiled LUT** | Verified | 0.64 s/step at 256×256 (vs 1.87 s/step scalar), corr unchanged |
+| **HIP BF16xFP8 WMMA (gfx12 matrix cores)** | Verified | 0.51 s/step at 256×256; 128x128 tile, 8 waves/CTA; corr=0.9991, PSNR 38 dB vs ref |
+| **HIP VAE decode** | Numerical PASS | Post `resnets.2` fix: vs diffusers F32 ref cos=0.9999977, PNG PSNR 52.9 dB (near bit-exact) |
+| **HIP scheduler** | Verified | Ported FlowMatchEuler exponential dynamic shift; sigmas match diffusers exactly |
 | **Full pipeline (CPU)** | Working | 256×256 "a red apple" correct |
 | **Full pipeline (CUDA)** | Working | 256×256 "a red apple" correct |
+| **Full pipeline (HIP)** | Working | 256×256 end-to-end runs clean (DiT 1.86 s/step, VAE 0.32 s); visual parity pending real text-encoder weights on the test box |
 
 Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-stream blocks and the 20 single-stream blocks, and the VAE decode is fully GPU-accelerated including the mid-block attention. For A/B checks, the old double-stream CPU fallback can still be forced with `FLUX2_CPU_DBL_ATTN=1`. The old CPU-bridge VAE attention path is still available in the source (`flux2_vae_mid_attn_bridge`).
 
@@ -319,6 +343,7 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 | **F16 GEMM weight offset** | All-zero with F16 GEMM | QKV/linear1 weight pointer arithmetic used `*4` (F32 bytes) instead of `*WE` (2 bytes for F16) |
 | **VAE BN denormalization** | Over-saturated image with speckle artifacts | BN stats (`bn.running_mean/var`) are training artifacts — should NOT be applied during inference. Removed the `latent * sqrt(var) + mean` pre-processing |
 | **VAE missing 3rd resnet** | Low correlation (0.74) vs diffusers VAE | Diffusers decoder uses `layers_per_block+1=3` resnets per up_block; our code only had 2. Added `up_res[4][3]` and loading/running of `resnets.2` |
+| **HIP VAE missing 3rd resnet** | ~1.19× over-saturated HIP image (PSNR 25.7 dB) | Same bug re-surfaced on HIP side — loader had `up_res[4][3]` but `hip_flux2_vae_decode` only looped over `up_res[bi][0..1]`. Added `resnets.2` call in HIP up_block loop; PSNR jumped to 52.9 dB |
 | **Base model FP8/BF16 mixed dtype** | Grid pattern output with base model | Base model `double_blocks.0.*.proj.weight` is BF16 (not FP8) but loader always called `flux2_mat_fp8`. Added `flux2_mat_auto` that detects dtype and dispatches to the correct loader |
 | **Base model scheduler** | sigma=1000 (double 1000× application) | Base scheduler used `qimg_sched_set_timesteps` which multiplied by `num_train_timesteps=1000`, but DiT also does `timestep*1000`. Switched to `qimg_sched_set_timesteps_comfyui` with `multiplier=1.0` |
 | **Wrong sigma shift formula** | Spotty pixel artifacts, wrong sigma values | Used AuraFlow shift `alpha*t/(1+(alpha-1)*t)` with alpha=2.02. ComfyUI uses Flux shift `exp(mu)*t/(...)` with mu=2.02. Fix: pass `expf(2.02)` ≈ 7.539 as alpha to our scheduler |
