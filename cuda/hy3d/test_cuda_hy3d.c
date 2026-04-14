@@ -65,6 +65,9 @@ int main(int argc, char **argv) {
     uint32_t seed = 42;
     int device_id = 0;
     int verbose = 1;
+    int dump_every = 0;
+    int dump_grid = 48;
+    const char *dump_prefix = NULL;
 
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i+1 < argc) img_path = argv[++i];
@@ -76,11 +79,21 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "-d") == 0 && i+1 < argc) device_id = atoi(argv[++i]);
         else if (strcmp(argv[i], "-v") == 0 && i+1 < argc) verbose = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dump-every") == 0 && i+1 < argc) dump_every = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dump-grid") == 0 && i+1 < argc) dump_grid = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dump-prefix") == 0 && i+1 < argc) dump_prefix = argv[++i];
     }
 
     fprintf(stderr, "Initializing CUDA Hunyuan3D runner...\n");
     cuda_hy3d_runner *r = cuda_hy3d_init(device_id, verbose);
     if (!r) { fprintf(stderr, "Failed to init CUDA\n"); return 1; }
+
+    if (dump_every > 0) {
+        const char *pfx = dump_prefix ? dump_prefix : "hy3d_step";
+        cuda_hy3d_set_dump(r, dump_every, dump_grid, pfx);
+        fprintf(stderr, "Per-step dump: every=%d grid=%d prefix=%s_NNN.obj\n",
+                dump_every, dump_grid, pfx);
+    }
 
     fprintf(stderr, "Loading weights...\n");
     if (cuda_hy3d_load_weights(r, cond_path, model_path, vae_path) != 0) {
