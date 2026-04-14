@@ -985,10 +985,11 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
 
         /* Scale-add: d_output[t,:] += scale[t] * d_exp_o[t,:]  (on CPU) */
         cuStreamSynchronize(stream);
-        float *exp_out_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
-        float *accum_cpu = (float *)malloc((size_t)N_tok * H_dim * sizeof(float));
-        cuMemcpyDtoH(exp_out_cpu, d_exp_o, (size_t)N_tok * H_dim * sizeof(float));
-        cuMemcpyDtoH(accum_cpu, d_output, (size_t)N_tok * H_dim * sizeof(float));
+        size_t bytes = (size_t)N_tok * H_dim * sizeof(float);
+        float *exp_out_cpu = (float *)malloc(bytes);
+        float *accum_cpu = (float *)malloc(bytes);
+        cuMemcpyDtoH(exp_out_cpu, d_exp_o, bytes);
+        cuMemcpyDtoH(accum_cpu, d_output, bytes);
 
         for (int t = 0; t < N_tok; t++) {
             float w = expert_scale_cpu[t];
@@ -999,6 +1000,10 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
 
         cuMemcpyHtoDAsync(d_output, accum_cpu,
                           (size_t)N_tok * H_dim * sizeof(float), stream);
+        /* Must sync before freeing accum_cpu — HtoDAsync reads from host
+         * memory, and freeing before the copy drains causes UAF/heap
+         * corruption over the 360+ MoE calls in a 30-step predict loop. */
+        cuStreamSynchronize(stream);
         free(exp_out_cpu);
         free(accum_cpu);
     }
@@ -1552,6 +1557,8 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             coords[i*3+2] = bounds[2] + iz * dz;
         }
         cuMemcpyHtoDAsync(d_coords, coords, (size_t)count * 3 * sizeof(float), stream);
+        /* sync before free: HtoDAsync reads coords on the stream */
+        cuStreamSynchronize(stream);
         free(coords);
 
         /* Fourier embedding */
@@ -1667,9 +1674,11 @@ static void generate_randn(float *buf, int n, uint32_t seed) {
         s1 = x ^ y ^ (x >> 17) ^ (y >> 26);
         uint64_t r2 = s1 + y;
 
-        /* Box-Muller */
-        double u1 = ((r1 >> 11) + 0.5) / 2097152.0;
-        double u2 = ((r2 >> 11) + 0.5) / 2097152.0;
+        /* Box-Muller: u1, u2 uniform in (2^-53, 1] (avoids log(0) = -inf).
+         * Previous form divided a 53-bit value by 2^21, producing u1 up to
+         * ~4.3e9 → log(u1) > 0 → sqrt(-2·log(u1)) = NaN. */
+        double u1 = ((r1 >> 11) + 1.0) * 0x1.0p-53;
+        double u2 = ((r2 >> 11) + 1.0) * 0x1.0p-53;
         double rr = sqrt(-2.0 * log(u1));
         double theta = 2.0 * 3.141592653589793 * u2;
         buf[i] = (float)(rr * cos(theta));
@@ -1793,6 +1802,9 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
 
     CUdeviceptr d_latents = gpu_alloc((size_t)latent_size * sizeof(float));
     cuMemcpyHtoDAsync(d_latents, noise_cpu, (size_t)latent_size * sizeof(float), stream);
+    /* HtoDAsync reads from noise_cpu on the stream — sync before freeing
+     * or the GPU copy races against libc recycling the host buffer. */
+    cuStreamSynchronize(stream);
     free(noise_cpu);
 
     CUdeviceptr d_pred_cond = gpu_alloc((size_t)latent_size * sizeof(float));
@@ -1803,26 +1815,40 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     CUdeviceptr d_uncond_ctx = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
     cuMemsetD8Async(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), stream);
 
-    /* Flow matching: timestep schedule from 1.0 -> 0.0 */
+    /* Flow matching schedule, matching hy3dshape FlowMatchEulerDiscreteScheduler:
+     *   timesteps = linspace(num_train_ts=1000, 1, n_steps)   (model t values)
+     *   sigmas    = timesteps / 1000                           (normalized)
+     *   sigmas   += [1.0]                                      (sentinel appended)
+     *   step i: prev = sample + (sigmas[i+1] - sigmas[i]) * v
+     *           which is equivalent to our op_euler_step(x, v, dt=sigmas[i]-sigmas[i+1])
+     *
+     * The DiT is trained on timesteps in [1, 1000]; passing a sigma in [0, 1]
+     * to the timestep_embed kernel produces an entirely different sinusoidal
+     * embedding and collapses the SDF output (everything turns "inside"). */
+    const float num_train_ts = 1000.0f;
     for (int step = 0; step < n_steps; step++) {
-        float t_current = 1.0f - (float)step / (float)n_steps;
-        float t_next = 1.0f - (float)(step + 1) / (float)n_steps;
-        float dt = t_current - t_next;
+        float model_t  = num_train_ts - (float)step * (num_train_ts - 1.0f) / (float)(n_steps - 1);
+        float sigma     = model_t / num_train_ts;
+        float sigma_next = (step == n_steps - 1)
+                              ? 1.0f  /* scheduler sentinel */
+                              : (num_train_ts - (float)(step + 1) * (num_train_ts - 1.0f) / (float)(n_steps - 1)) / num_train_ts;
+        float dt = sigma - sigma_next;  /* positive except on last step */
 
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
-            fprintf(stderr, "  step %d/%d (t=%.3f)\n", step+1, n_steps, t_current);
+            fprintf(stderr, "  step %d/%d (t=%.1f sigma=%.3f)\n",
+                    step + 1, n_steps, model_t, sigma);
 
         /* Conditional pass */
-        run_dit_forward(r, d_latents, t_current, d_dino_out, d_pred_cond);
+        run_dit_forward(r, d_latents, model_t, d_dino_out, d_pred_cond);
 
         /* Unconditional pass */
-        run_dit_forward(r, d_latents, t_current, d_uncond_ctx, d_pred_uncond);
+        run_dit_forward(r, d_latents, model_t, d_uncond_ctx, d_pred_uncond);
 
         /* CFG combination */
         op_cfg_combine(ops, stream, d_pred_combined, d_pred_cond, d_pred_uncond,
                        guidance_scale, latent_size);
 
-        /* Euler step: x_{t-dt} = x_t - dt * v */
+        /* Euler step: x <- x - dt * v */
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
     }
 
@@ -1839,6 +1865,17 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     float *sdf_grid = (float *)malloc((size_t)total_pts * sizeof(float));
     run_shapevae(r, d_latents, grid_res, sdf_grid);
     cuMemFree(d_latents);
+    if (r->verbose) {
+        float mn = sdf_grid[0], mx = sdf_grid[0], sm = 0;
+        int pos = 0, neg = 0;
+        for (int i = 0; i < total_pts; i++) {
+            float v = sdf_grid[i];
+            if (v < mn) mn = v; if (v > mx) mx = v; sm += v;
+            if (v > 0) pos++; else if (v < 0) neg++;
+        }
+        fprintf(stderr, "HY3D: SDF stats: min=%.4f max=%.4f mean=%.4f pos=%d neg=%d\n",
+                mn, mx, sm / total_pts, pos, neg);
+    }
 
     /* ---- Stage 4: Marching cubes ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 4 - Marching cubes...\n");
