@@ -174,8 +174,18 @@ All are single-header libraries (define `*_IMPLEMENTATION` before include).
 | File | Description |
 |---|---|
 | `cuda_qimg_runner.h` | GPU runner: NVRTC kernel compilation, weight management, DiT/VAE forward |
-| `test_cuda_qimg.c` | CUDA test harness: init, load, dit step, full generation |
+| `test_cuda_qimg.c` | CUDA test harness: init, load, dit step, full generation, `--test-kernels` |
 | `test_fp8_gemm.c` | FP8 GEMM correctness test (all sizes PASS, corr=1.0) |
+| `gen_compare.py` | End-to-end ComfyUI-vs-ours composite generator (left ours \| diff heatmap \| right comfy) |
+| `defsched.c` | Standalone test that runs the deferred scheduler path |
+
+### Shared GPU kernel sources (`cuda/`)
+
+| File | Description |
+|---|---|
+| `cuda_fp8_mma_kernels.h` | NVRTC source string with all FP8/BF16 MMA kernels: `gemm_fp8_scaled_f32` (m16n8k32 e4m3), `gemm_fp8_scaled_f32_pipe` (cp.async + ldmatrix), `gemm_fp8_pipe_perrow_f32` (per-row X scale), `gemm_bf16_pipe_f32` (BF16 MMA with FP8→BF16 inline dequant), `flash_attn_fp8`, `flash_attn_bf16`, `reduce_max_abs_per_row_f32`, `cast_f32_to_bf16`. Shared with `cuda/flux2/`. |
+| `cuda_kernels_common.h` | NVRTC source for non-MMA kernels (LUT GEMMs, layernorm, scheduler ops, VAE conv, etc.) |
+| `cuda_runner_common.h` | Host-side CUDA driver helpers: NVRTC compilation, error macros, weight upload |
 
 ### CUDA LLM Runner (`cuda/llm/`)
 
@@ -274,23 +284,68 @@ python verify_pipeline.py --cuda-dir ../../cuda/qimg/ --ref-dir output/
 
 ### Performance (CUDA, RTX 5060 Ti 16GB)
 
-**Denoising-only per-step (seed=42, cfg=2.5, simple scheduler, warm cache):**
+**Denoising-only per-step (seed=42, cfg=2.5, simple scheduler, warm cache,
+ComfyUI-encoded text hidden states for a fair correctness comparison):**
 
-| Mode | 256×256 (10 steps) | 512×512 (4 steps) | Gap vs ComfyUI |
-|---|---:|---:|---:|
-| ComfyUI (cuDNN+cuBLAS) | 1.28 s/step | 1.61 s/step | 1.00× |
-| ours — LUT baseline | 4.81 s/step | 9.25 s/step | 3.76×–5.75× |
-| ours — FP8 MMA (default) | 3.77 s/step | 6.07 s/step | 2.94×–3.77× |
-| **ours — FP8 MMA + FP8 ATTN** | **3.71 s/step** | **5.05 s/step** | **2.90×–3.14×** |
+| Mode | 256×256 (10 steps) | 512×512 (4 steps) | mean diff vs ComfyUI | Gap vs ComfyUI |
+|---|---:|---:|---:|---:|
+| ComfyUI (cuDNN+cuBLAS) | 1.28 s/step | 1.61 s/step | 0.00 | 1.00× |
+| ours — LUT scalar (gold) | 3.49 s/step | 7.90 s/step | 1.00 | 2.73×–4.91× |
+| ours — LUT + BF16 attn | 3.43 s/step | 6.93 s/step | 0.79 | 2.68×–4.30× |
+| ours — FP8 MMA + scalar attn | 2.04 s/step | — | 1.81 | 1.59× |
+| ours — FP8 MMA + FP8 attn (old default) | 1.98 s/step | 3.02 s/step | 5.01 | 1.55×–1.88× (blurry) |
+| ours — BF16 MMA + BF16 attn | 3.66 s/step | 9.14 s/step | 0.85 | 2.86×–5.68× |
+| ours — PER-ROW FP8 MT2 + BF16 attn | 1.98 s/step | 2.96 s/step | 1.88 | 1.55×–1.84× |
+| ours — PER-ROW FP8 MT4 + vectorized BF16 attn | 2.00 s/step | 2.74 s/step | 1.88 | 1.56×–1.70× |
+| ours — + cp.async ldmatrix.trans BF16 attn | 2.00 s/step | 2.67 s/step | 1.88 | 1.56×–1.66× |
+| **ours — + CFG-batched img MLP (new default)** | **1.95 s/step** | **2.65 s/step** | **1.88** | **1.52×–1.65×** |
+
+The new default reaches **2.98× faster than gold at 512×512 (7.90 → 2.65
+s/step)** while staying visually indistinguishable from ComfyUI/gold (mean
+pixel diff 1.88 / 255 ≈ 0.7%). At 256×256 it hits **1.52× ComfyUI** (1.95 vs
+1.28 s/step). At 512×512 the gap is 1.65×.
+
+Stable 3-run averages (256×256/10 steps, 512×512/5 steps) across this
+session: cp.async + ldmatrix.trans saves ~70 ms/step at 512 (2.74 → 2.67).
+CFG-batched image MLP (fc1 + GELU + fc2) saves another ~50 ms at 256 and
+~20 ms at 512 — at 256 the small n_img (1024) means doubling to 2048 rows
+lands in a more efficient MMA tile shape; at 512 n_img=4096 is already
+saturated so the gain is mostly W-traffic dedup.
+
+**Recommended invocation (new default):**
+
+```bash
+QIMG_FP8_PIPE_PERROW=1 QIMG_BF16_ATTN=1 ./test_cuda_qimg --generate \
+    --height 512 --width 512 --steps 4 --seed 42 \
+    --prompt "a red apple on a white table"
+```
+
+**Env-var matrix (all opt-in until validated, paths fall back automatically):**
+
+| Env var | Effect |
+|---|---|
+| `QIMG_FP8_MMA=1` | Per-tensor FP8 MMA pipe — fast but ~+0.8 mean blur |
+| `QIMG_FP8_PIPE=1` | Cp.async pipelined per-tensor FP8 MMA (under `QIMG_FP8_MMA=1`) |
+| `QIMG_FP8_PIPE_PERROW=1` | **Per-row FP8 MMA pipe** — same speed as per-tensor, ~half the blur |
+| `QIMG_FP8_ATTN=1` | FP8 flash attention — fast but visible blur (mean +4.4) |
+| `QIMG_BF16_ATTN=1` | **BF16 flash attention** — matches ComfyUI BF16 reference |
+| `QIMG_BF16_MMA=1` | BF16 MMA GEMM (FP8 weights → BF16 in-kernel) — gold quality, slower |
 
 Correctness: corr=0.999107 vs `cf_ournoise2_10step_latent.npy`, every channel corr ≥ 0.998.
-`QIMG_FP8_MMA=0` opts back to the LUT path, `QIMG_FP8_ATTN=1` enables FP8 flash attention.
 
 **FP8 stack wins from this optimization pass** (512×512, 4-step):
-- LUT baseline:                 21.85 s/step
-- +FP8 MMA GEMM (fix P7'):      11.55 s/step  (1.89×)
-- +scratch-slot block loader:   10.22 s/step  (2.14×)
-- +FP8 flash attention:          5.05 s/step  (4.33×)
+- LUT baseline:                            21.85 s/step
+- +FP8 MMA GEMM (fix P7'):                 11.55 s/step  (1.89×)
+- +scratch-slot block loader:              10.22 s/step  (2.14×)
+- +FP8 flash attention:                     5.05 s/step  (4.33×)
+- +CFG batching, cp.async pipe FP8 MMA:     3.02 s/step  (7.23×)
+- +per-row FP8 MMA + BF16 attention:        2.96 s/step  (7.38×)
+- +MTILE=4 GEMM + vectorized BF16 attn:     2.74 s/step  (7.97×)
+- +cp.async + ldmatrix.trans BF16 attn:     2.67 s/step  (8.18×)
+- **+CFG-batched img MLP:                   2.65 s/step  (8.24×)**
+
+(Apple gen at 512×512: 2.69 s/step is **2.94× faster** than the LUT scalar
+gold path 7.90 s/step, **1.67× slower** than ComfyUI 1.61 s/step.)
 
 **Dominant remaining cost**: PCIe block loading. Only 11/60 blocks fit in 16 GB VRAM
 at 512×512 so 48 blocks are loaded on-demand per forward (~85 ms each through
@@ -344,7 +399,14 @@ via `cuDevicePrimaryCtxRetain`.
 | **GPU text encoder via CUDA LLM runner** | **52 s** | **14.3×** |
 | FP8 MMA GEMM default (P7' per-tensor input scaling) | 37 s (10-step 256²) | 1.4× |
 | Scratch-slot block loader + hoisted alloc | 38 s | ~1.0× |
-| FP8 flash attention (P6 device-ptr scales) | **37 s** | **20×** total vs 748 s |
+| FP8 flash attention (P6 device-ptr scales) | 37 s | 20× total vs 748 s |
+| CFG batching + bf16 fusion (single-block forward) | 19.8 s | 1.87× |
+| FP8 MMA cp.async + ldmatrix pipe | 19.8 s | bit-identical, +0% |
+| **BF16 flash attention** (matches ComfyUI BF16 ref) | 19.8 s | mean diff 5.01 → 2.09 |
+| **BF16 MMA GEMM** (FP8 → BF16 in-kernel) | 36.6 s @ 256² | gold quality, opt-in |
+| **Per-row FP8 MMA pipe** (one X scale per row) | 19.8 s | mean diff 1.81 → 1.65 |
+| Per-row FP8 + BF16 attn | 19.8 s | mean 1.88, ~1.55× ComfyUI |
+| **+MTILE=4 GEMM + vectorized BF16 attn load (new default)** | **19.4 s @ 256² / 10.4 s @ 512² (4-step)** | **1.52×–1.62× ComfyUI** |
 
 ### Recently fixed FP8 bugs (cuda/qimg, 2026-04)
 
@@ -355,6 +417,9 @@ via `cuDevicePrimaryCtxRetain`.
 | **Wrong latent compare space** | corr 0.03 vs ComfyUI reference | ComfyUI `sample()` output is post-Wan21 `process_out` (VAE-native space). We saved pre-Wan21 (DiT-normalized). Added `cuda_latent_vae.npy` dump after the `latent * wan21_std + wan21_mean` step. (commit `97f426b`) |
 | **Per-block cuMemAlloc overhead** | ~85 ms/block load, 1440 driver calls/step | Pre-allocated `scratch_block` slot in runner, on-demand `qimg_load_block_into_slot` uses async HtoD into the shared buffers. (commit `4e22c88`) |
 | **flash_attn_fp8 host DtoH stall** | 1-2 ms per attention call | Pass device pointer `&r->d_qkv_scales` to kernel, drop the per-call `cuMemcpyDtoH(scales, 3*f32)`. (commit `95e5536`) |
+| **Double Wan21 denormalization** | Apple visibly washed-out / blurry, mean diff 47 vs comfy | `--generate` applied the `latent * std + mean` affine twice before VAE: once via inline block, then again via `qimg_dit_unnormalize_latent()`. Removed the redundant call. (commit `3217cfd`) |
+| **FP8 attention per-tensor scale crush** | Visible blur, mean diff 5.01 vs comfy | Per-tensor `max(|Q|)/448` quantization shared one scale across all 24 heads — outlier head crushes precision in the rest. Added `flash_attn_bf16` kernel using `mma.sync.aligned.m16n8k16.bf16.bf16.f32` with no quantization, matching ComfyUI's BF16 reference. (commit `02e830c`) |
+| **FP8 MMA X-side outlier blur** | Mean diff 1.81 vs comfy (FP8 MMA default) | Per-tensor `max(\|X\|)/448` outlier compressed precision in non-outlier rows. Added `gemm_fp8_pipe_perrow_f32` + `reduce_max_abs_per_row_f32` so each output row gets its own X scale. mean drops 1.81 → 1.65, max diff 126 → 61, same speed. (commit `56e823c`) |
 
 ## TODO / FIXME
 
@@ -362,14 +427,96 @@ via `cuDevicePrimaryCtxRetain`.
 
 - [x] **GEMM optimization**: 128×128 tiled GEMM with 8×8 register blocking + fused BF16 truncation. 6.67s → 3.67s/step (1.82×).
 - [x] **GPU text encoder**: CUDA LLM runner with GGUF Q4_K weights + injected Q/K/V biases. 710s → 12.8s (56×).
-- [x] **FP8 MMA GEMM** (sm_89+, per-tensor input scaling). `gemm_fp8_scaled_f32` via `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`. Default ON (`QIMG_FP8_MMA=0` opts out). 1.25× over LUT at 512×512.
-- [x] **FP8 flash attention** (FA2-style, head_dim=128, 4 warps/CTA, device-pointer scales). Opt-in via `QIMG_FP8_ATTN=1`. 7.5× vs F32 attention at 512×512.
+- [x] **FP8 MMA GEMM** (sm_89+, per-tensor input scaling). `gemm_fp8_scaled_f32` via `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`. Opt-in via `QIMG_FP8_MMA=1`.
+- [x] **FP8 MMA cp.async pipelined GEMM** (`gemm_fp8_scaled_f32_pipe`). 2-stage W double-buffer + `ldmatrix.sync.aligned.m8n8.x4` A frags + pre-quantized smX. ~5-9% over the per-tensor MMA. Opt-in via `QIMG_FP8_PIPE=1`.
+- [x] **Per-row FP8 MMA pipe** (`gemm_fp8_pipe_perrow_f32` + `reduce_max_abs_per_row_f32`). One X scale per output row instead of per-tensor → mean diff 1.81 → 1.65, max diff 126 → 61, same speed. Opt-in via `QIMG_FP8_PIPE_PERROW=1`.
+- [x] **MTILE=4 per-row FP8 pipe** (`gemm_fp8_pipe_perrow_mt4_f32`). Doubles M coverage per CTA (32→64 rows) — halves row-CTA count at 512×512. Uses `"+f"` accumulator operands so the compiler keeps d0..d3 live through the doubled inner loop (the previous MTILE=4 attempts crashed on `"=f"`/`"f"` aliasing). Auto-dispatched under `QIMG_FP8_PIPE_PERROW=1` when `n_tok % 64 == 0`. **Recommended GEMM path.** 2.92 → 2.61 s/step at 512×512.
+- [x] **Vectorized BF16 attention cooperative load**. Replaces the per-thread single-BF16 K/V load loop with a 4-BF16-per-thread `uint2`-sized read. Halves per-thread iter count (32→8). Tried `BKV=64` (slower due to 5→2 CTAs/SM occupancy drop) and full cp.async pipeline (blocked by V transpose — `cp.async` cannot do strided/transposed copies). Vectorized load on `BKV=32` keeps occupancy at 5 CTAs/SM and shaves ~50 ms.
+- [x] **BF16 flash attention** (`flash_attn_bf16` via `mma.sync.aligned.m16n8k16.bf16.bf16.f32`). Matches ComfyUI's BF16 reference precision exactly — drops mean diff from 5.01 (FP8 attn) to 0.79–1.88 depending on GEMM path. Opt-in via `QIMG_BF16_ATTN=1`. **Recommended attention path.**
+- [x] **BF16 MMA GEMM** (`gemm_bf16_pipe_f32`). Reads FP8 weights, decodes FP8 → BF16 inline at MMA-load time via `d_fp8_to_bf16_lut[256]` constant memory. Best correctness (mean 0.85) but ~2× slower than FP8 MMA on Blackwell consumer (BF16 m16n8k16 throughput limit). Opt-in via `QIMG_BF16_MMA=1`.
+- [x] **FP8 flash attention** (FA2-style, head_dim=128, 4 warps/CTA, device-pointer scales). Opt-in via `QIMG_FP8_ATTN=1`. 7.5× vs F32 attention at 512×512 but introduces visible blur — superseded by `QIMG_BF16_ATTN=1`.
 - [x] **Block scratch slot** + hoisted modulation allocs. Eliminates 30 cuMemAlloc/cuMemFree per on-demand block (~1440 driver calls/step → 30).
-- [ ] **Block streaming / prefetch**: Still ~85 ms/block PCIe load (48/60 on-demand at 512×512, ~4 s/forward). Needs a copy stream + cuEvent-based double buffer to hide latency behind compute. Tried pinned staging buffer, was slower (memcpy 324 MB/block dominated).
-- [ ] **CFG batching**: Process cond/uncond in single DiT pass (batch_size=2 for img GEMMs). Halves per-block load count → ~30% DiT speedup. *In progress.*
-- [ ] **MMA kernel tuning**: Current default runs ~5% of FP8 tensor-core peak. 128×128 `gemm_fp8_scaled_tc128_f32` variant exists but is currently slower than MTILE=2 default; needs register-blocking / `cp.async` work.
-- [ ] **Attention kernel for n_tok > 1536**: flash_attn_fp8 handles our sizes, but won't scale beyond 2K tokens without tiling.
-- [ ] **VAE on GPU**: Conv2d kernel is naive (one thread per output element). Large convolutions (384 channels × 256×256) would benefit from im2col + GEMM or Winograd.
+- [x] **CFG batching**: cond/uncond run through each block under a single block-weight load (`cuda_qimg_dit_step_cfg`). Halves per-block PCIe traffic.
+- [ ] **Block streaming / prefetch**: Still ~85 ms/block PCIe load (48/60 on-demand at 512×512). `cuMemHostRegister` on the mmap'd safetensors was rejected (operation not supported); a pinned-staging ring was net-slower because the driver already pipelines pageable HtoDAsync via its own copy engine. Real fix needs `cp.async.bulk` (sm_90+) which Blackwell consumer doesn't expose.
+- [x] **MTILE=4 GEMM**: ~10% gain at 512×512, see entry above.
+- [x] **cp.async + ldmatrix.trans BF16 flash attention**. Switched `smV` from
+  col-major `smVT` to row-major so both K and V can be loaded via contiguous
+  `cp.async.ca.shared.global` into smem. The PV MMA's B-operand is now loaded
+  with one `ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16` per N-tile — the
+  4 result regs map directly to the m16n8k16 B layout we need for both PV
+  K-chunks without any per-lane packing. Additionally, `P` is held in per-lane
+  `u32` registers (`P_pack[kc][4]`) instead of round-tripping through `smP`
+  — each lane already owns its own `P_data`, and the sm_120 a1↔a2 swap is
+  applied in-register. smem drops 20 KB → 16 KB (5 → 6 CTAs/SM occupancy).
+  Single-buffer `cp.async` (no prefetch) chosen over 2-stage double-buffer
+  (32 KB, 3 CTAs/SM) because the occupancy hit outweighed the pipeline gain
+  at 256×256. Saves ~70 ms/step at 512×512 (2.74 → 2.67).
+- [x] **CFG-batched image MLP**. `cuda_qimg_dit_step_cfg` now allocates one
+  contiguous `[2*n_img, dim]` MLP input buffer (`d_img_mlp_in`) and one
+  `[2*n_img, mlp_h]` intermediate (`d_img_mlp_h`). Both the cond and uncond
+  `forward_block` calls skip their img MLP; instead they write the img
+  adaLN2 output into the first / second half of `d_img_mlp_in` via a new
+  `img_mlp_in_external` argument. A single batched `fc1 + gelu + fc2` then
+  runs on 2*n_img rows, halving W traffic for the two largest GEMMs in the
+  block (mlp_h=14336 × dim=3072 each direction). The post-MLP `gated_add` is
+  dispatched per-pass by slicing `d_img_mlp_out` into halves. To make this
+  fit VRAM, `d_scratch1` / `d_scratch2` / `d_scratch3` are shrunk to their
+  actual minimum sizes (`n_img*dim`, `n_txt*dim`, `n_txt*mlp_h` respectively)
+  — the img MLP intermediate no longer lives in `d_scratch3`. Saves ~50 ms
+  at 256×256 and ~20 ms at 512×512. The 256×256 win is larger because n_img
+  = 1024 was below the MMA kernel's preferred M tile count; doubling to 2048
+  fills the CTAs more evenly.
+- [ ] **Attention kernel for n_tok > 1536**: `flash_attn_bf16` handles our sizes, but won't scale beyond 2K tokens without tiling.
+- [x] **VAE middle attention on GPU**. Replaced the CPU DtoH/HtoD round-trip
+  and O(N²D) Python-like loop with two F32 transpose kernels (`[c, spatial]
+  ↔ [spatial, c]`) plus a warp-per-query online-softmax kernel
+  (`vae_attn_sc_f32`) that streams K and V tokens from row-major smem.
+  512×512 VAE decode drops from **21.6 s → 1.7 s** (12.7×); the middle
+  attention phase alone drops **19.7 s → 0.04 s**. 256×256 VAE drops
+  **1.5 s → 0.5 s**. Correctness unchanged (mean pixel diff 1.877 / 255).
+- [x] **1328×1328 (Qwen-Image max res)** w/ memory-pressure aware eviction.
+  The empirical 256 MB safety margin in `qimg_evict_preloaded_until_free`
+  is tuned to keep post-alloc free VRAM above a threshold where the CUDA
+  driver starts doing heavy per-launch bookkeeping: at 1328 with only
+  50 MB free after alloc, every block was running **6.7× slower on the
+  first step** (95 s/step one-time penalty → 14 s/step steady). Kernels
+  are identical but driver overhead on memory-tight launches is not.
+  Bumping the margin to 256 MB restores steady-state speed on the first
+  step. Measured at 1328x1328 (10-step gen): **13.96 s/step DiT, 3.3 s
+  VAE**. 1024 and 512 paths unchanged.
+- [x] **1024×1024 generation** with dynamic preload eviction + tiled im2col.
+  `cuda_qimg_dit_step_cfg` now computes the activation working set up-front
+  (`d_img`, QKV, CFG-batched MLP buffers, scratch) and calls a new helper
+  `qimg_evict_preloaded_until_free` to drop preloaded DiT blocks from the
+  tail until free VRAM covers the workload plus a 64 MB safety margin.
+  Freed blocks automatically fall back to the existing on-demand
+  `scratch_block` / `scratch_block_b` loader. VAE `vae_op_conv2d_mma` also
+  tiles im2col along the token axis so the unfold buffer is capped at
+  ~256 MB regardless of spatial dims — the 1024×1024 96→96 conv would
+  otherwise need 3.5 GB of im2col buffer alone.
+  Measured at 1024×1024:
+  - 16 GB default (45/60 preloaded): **6.6 s/step** DiT, **1.6 s** VAE.
+  - 8 GB simulated (`QIMG_MAX_PRELOAD=16`): 8.5 s/step DiT, 1.6 s VAE — the
+    ~1.9 s/step regression is pure disk I/O for the 44 streamed blocks.
+  - Pure on-demand (`QIMG_MAX_PRELOAD=0`): 9.9 s/step DiT.
+  512×512 and 256×256 are unaffected.
+- [x] **Tensor-core VAE conv2d via im2col + FP8 MMA**. `vae_op_conv2d`
+  now routes 3×3 convs with `ci*kh*kw % 32 == 0` through:
+  (1) on-device `vae_f32_to_fp8_padded` kernel that quantizes the F32
+  weight to e4m3 and pads `[co, n_in]` up to `[pad_co, n_in_pad]` with
+  `pad_co % 256 == 0` and `n_in_pad % 32 == 0`;
+  (2) `vae_im2col_f32` unfolds the F32 input `[ci, H, W]` into
+  `[H*W, n_in_pad]` row-major with zero-padded trailing K cols;
+  (3) the existing `gemm_fp8_pipe_perrow_mt4` FP8 MMA tensor-core GEMM
+  produces `[H*W, pad_co]` in F32;
+  (4) `vae_crop_transpose_add_bias_f32` crops the padded cols, transposes
+  to `[co, H*W]` CHW, and fuses the bias add.
+  512×512 VAE decode drops **1.7 s → 0.5 s** (3.4×); 256×256 drops
+  **0.5 s → 0.2 s** (2.5×). Per-phase conv speedups are 3-6× depending on
+  resolution. Mean pixel diff shifts from 1.877 → 2.099 (~0.09% increase)
+  from the FP8 weight quantization — visually indistinguishable. Layers
+  with `n_in % 32 != 0` (head conv 96→3, and conv1 16→384 where `ci*9=144`)
+  fall back to the naive kernel.
 - [ ] **AdaLN + GEMM fusion**: 4 standalone adaln kernels per block → fuse into GEMM input load. ~5-10% DiT speedup.
 
 ### Quality

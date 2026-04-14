@@ -961,11 +961,13 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Un-standardize latent to VAE's natural space */
-        qimg_dit_unnormalize_latent(latent, lat_ch, lat_h, lat_w);
+        /* NOTE: do not call qimg_dit_unnormalize_latent here — the inline
+         * Wan21 block above (latent = latent * std + mean) already put the
+         * tensor in VAE-natural space. Calling it again applies the same
+         * affine a second time and produces a blurry washed-out image. */
 
         /* 3. VAE decode */
-        fprintf(stderr, "\n[3/3] VAE decode (CPU)...\n");
+        fprintf(stderr, "\n[3/3] VAE decode (GPU)...\n");
         cuda_qimg_load_vae(r, vae_path);
         float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
         t0 = clock();
