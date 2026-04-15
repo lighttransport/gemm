@@ -140,41 +140,42 @@ layer-by-layer diffing against a future CUDA port.
 
 ## CUDA port sequence
 
-Earliest → hardest. Each step has a small, testable slice.
+Earliest → hardest. Each step has a small, testable slice. Status as of
+**2026-04-15**:
 
-1. **xatlas UV unwrap, native C++ binary** — `cuda/hy3d_paint/test_uv_unwrap.cc`
-   - Loads OBJ via a minimal reader (or `common/stb_*.h` equivalent)
-   - Calls `xatlas::AddMesh` / `Generate`
-   - Writes OBJ with per-face UV indices
-   - Verification: round-trip against the Python `xatlas` binding
-2. **Native triangle rasterizer** — `cuda/hy3d_paint/cuda_raster_kernels.h`
-   - Ports `rasterizeTriangleCPU` + the `rasterizeImage` GPU wrapper as an
-     NVRTC-compiled kernel taking `CUdeviceptr pos/tri/out`
-   - First output: 512×512 depth + triangle-index buffer for a single view
-   - Verification: compare against PyTorch `custom_rasterizer.rasterize`
-3. **Per-view normal + position maps** — use the rasterizer + barycentric
-   interpolation to produce `[V, H, W, 3]` normal maps and position maps
-4. **DINOv2-giant encoder** — reuse the existing `cuda/hy3d` DINOv2-L
-   runner with:
-   - `hidden_size = 1536`, `num_heads = 24`, `num_layers = 40`,
-     `intermediate_size = 4096` (dinov2-giant specifics)
-   - Same attention / LayerScale / GELU kernels, just different weight
-     sizes
-5. **Multiview SD-2.1 UNet** — the big one. SD-2.1 backbone (unet_2d
-   condition) with custom multiview cross-attention. Architecture is
-   similar to flux2 / qwen-image in this repo, but with different block
-   types and an extra multiview attention layer. Plan: stand up a new
-   runner `cuda/hy3d_paint/cuda_paint_unet.*` iteratively, one block
-   type at a time, using `run_texturegen.py --trace-dir` for per-step
-   reference.
-6. **SD VAE decoder** — small, similar to the shape-gen ShapeVAE.
-   Probably reusable from an existing SD runner (qimg / flux2).
-7. **Real-ESRGAN x4** — RRDBNet. Small enough to port as its own runner.
-8. **Back-projection bake** — native CUDA kernel consuming the rasterized
-   UV maps + RGB views and scattering colors into the UV texture.
-9. **Texture inpaint** — port `mesh_inpaint_processor.cpp` to a native
-   CUDA kernel; it's a simple diffusion-based fill over the uncovered
-   pixels in the UV atlas.
+1. ✅ **xatlas UV unwrap** — `cuda/hy3d_paint/test_uv_unwrap.cc`. Matches
+   Python `xatlas` binding on 2084 charts / 54413 verts.
+2. ✅ **Native triangle rasterizer** — `cuda/hy3d_paint/cuda_paint_raster_kernels.h`
+   (`rasterize_faces_f32`, `resolve_bary_f32`, `interpolate_attr_f32`).
+   `test_raster.c` reports 96086/96087 face-id match vs PyTorch
+   `custom_rasterizer.rasterize`. Uses int64 atomicMin packed
+   `(depth_quant, face_id+1)` tokens.
+3. ✅ **Per-view normal + position maps** — `test_view_maps.c`, 6-view
+   render at F32 noise floor on 5/6 views.
+4. ✅ **DINOv2-giant encoder** — `test_dinov2_giant.c` (~680 lines).
+   `hidden=1536, heads=24, layers=40, ffn_half=4096, seq=257`. Reuses
+   shape-gen kernels + new `split_silu_gate_f32` (SwiGLU) from
+   `cuda_paint_nn_kernels.h`. Host-side Catmull-Rom bicubic pos_embed
+   interpolation 37×37→16×16 (bilinear gave 6.3e-4, bicubic gives
+   8.3e-8). Final output mean abs err **1.26e-03** (0.086% relative);
+   same accumulation profile as DINOv2-L.
+5. ⏳ **Multiview SD-2.1 UNet** — pending (biggest piece). Reference
+   trace already available via `run_texturegen.py --trace-dir`.
+6. ⏳ **SD VAE decoder** — pending.
+7. 🟡 **Real-ESRGAN x4** — PyTorch reference dump landed
+   (`ref/hy3d/dump_realesrgan.py`, commit `d817d5e`). Produces
+   `/tmp/hy3d_resrgan/resrgan_{input,output,rdb0}.npy` (16.7M params,
+   `[1,3,128,128]→[1,3,512,512]`). Native CUDA RRDBNet runner pending —
+   needs only `conv2d_f32` + `leaky_relu_f32` kernels on top of the
+   existing common ops.
+8. ✅ **Back-projection bake** — `test_back_project.c` +
+   `back_project_sample_f32` kernel. Round-trip F32 noise floor at
+   three Htex/Himg ratios.
+9. ✅ **Texture inpaint** — `mesh_vertex_inpaint.h` (header-only with
+   `MESH_VERTEX_INPAINT_IMPLEMENTATION`). Methods: `MVI_SMOOTH`
+   (1/d² weighted neighbour averaging, 2-pass), `MVI_FORWARD` (BFS).
+   `test_vertex_inpaint.cc` reports byte-identical match vs upstream
+   pybind `mesh_inpaint_processor`.
 
 The Python runner continues to work in parallel throughout; each CUDA
 step swaps in one piece at a time and is diffed against the trace
@@ -190,12 +191,18 @@ common/
 
 cuda/hy3d_paint/
   Makefile
-  test_uv_unwrap.cc              [xatlas native smoke test]
-  cuda_hy3d_paint_kernels.h      [NVRTC kernels: raster, bake, inpaint]
-  cuda_hy3d_paint_ops.h          [op wrappers / ops table]
-  cuda_hy3d_paint_runner.h       [public runner API]
-  cuda_hy3d_paint_runner.c       [runner impl, stages wired up]
-  test_cuda_hy3d_paint.c         [end-to-end CLI]
+  test_uv_unwrap.cc                [xatlas native, done]
+  cuda_paint_raster_kernels.h      [raster + bary + attr interp + back-project]
+  cuda_paint_nn_kernels.h          [SwiGLU split_silu_gate; conv2d/leaky_relu pending]
+  mesh_vertex_inpaint.h            [header-only, vertex graph diffusion fill]
+  test_raster.c                    [rasterizer vs custom_rasterizer]
+  test_view_maps.c                 [6-view normal+position maps]
+  test_back_project.c              [UV-space bake]
+  test_vertex_inpaint.cc           [vs upstream pybind]
+  test_swiglu.c                    [split_silu_gate_f32]
+  test_dinov2_giant.c              [DINOv2-giant runner + verify]
+  cuda_hy3d_paint_runner.{h,c}     [TODO: end-to-end runner wiring]
+  test_cuda_hy3d_paint.c           [TODO: end-to-end CLI]
 
 ref/hy3d/
   run_texturegen.py              [PyTorch reference + --trace-dir, done]
@@ -204,11 +211,13 @@ doc/hy3d/
   paint.md                       [this file]
 ```
 
-## First milestone
+## First milestone — ✅ done
 
-Working `test_uv_unwrap` that loads `/tmp/hy3d_ref.obj` (the shape-gen
-output, unwelded 233k verts / 78k tris) and emits an OBJ with UV
-coords. Success metric: resulting atlas width/height agree with the
-Python `xatlas` binding to within the library's own non-determinism,
-and the file can be loaded into the Python texturegen pipeline as a
-drop-in replacement for its own UV unwrap output.
+`test_uv_unwrap` matches the Python `xatlas` binding on the shape-gen
+output mesh.
+
+## Next milestone
+
+Native CUDA RRDBNet runner consuming `/tmp/hy3d_resrgan/resrgan_*.npy`.
+After that, the only remaining ML stages are the multiview SD-2.1 UNet
+and the SD VAE decoder.
