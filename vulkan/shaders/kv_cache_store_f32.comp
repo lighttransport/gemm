@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+// Store K and V vectors into KV cache at a given position.
+// k_cache[cache_pos * kv_dim + i] = k_vec[i]
+// v_cache[cache_pos * kv_dim + i] = v_vec[i]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer KVecBuffer { float k_vec[]; };
+layout(std430, binding = 1) readonly buffer VVecBuffer { float v_vec[]; };
+layout(std430, binding = 2) buffer KCacheBuffer { float k_cache[]; };
+layout(std430, binding = 3) buffer VCacheBuffer { float v_cache[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint cache_pos;
+    uint kv_dim;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.kv_dim) return;
+
+    uint offset = pc.cache_pos * pc.kv_dim + i;
+    k_cache[offset] = k_vec[i];
+    v_cache[offset] = v_vec[i];
+}

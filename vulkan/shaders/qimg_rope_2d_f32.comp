@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// 2D Spatial RoPE for Qwen-Image image tokens
+// Applies height + width rotary embeddings with centered positions.
+// axes_dim = [t_dim, h_dim, w_dim] where t_dim is skipped for image tokens.
+// Grid: (n_tok, n_heads, 1), local_size = (1,1,1)
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer QBuffer { float q_buf[]; };
+layout(std430, binding = 1) buffer KBuffer { float k_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    uint h_patches;
+    uint w_patches;
+    uint t_dim;
+    uint h_dim;
+    uint w_dim;
+    float theta;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (tok >= pc.n_tok || head >= pc.n_heads) return;
+
+    uint dim = pc.n_heads * pc.head_dim;
+    uint ph = tok / pc.w_patches;
+    uint pw = tok % pc.w_patches;
+    float ph_f = float(ph) - float(pc.h_patches / 2);
+    float pw_f = float(pw) - float(pc.w_patches / 2);
+    uint off = head * pc.head_dim;
+
+    // Height RoPE at offset t_dim
+    for (uint i = 0; i < pc.h_dim / 2; i++) {
+        float freq = 1.0 / pow(pc.theta, 2.0 * float(i) / float(pc.h_dim));
+        float angle = ph_f * freq;
+        float cs = cos(angle), sn = sin(angle);
+        uint idx = off + pc.t_dim + 2 * i;
+        float q0 = q_buf[tok*dim+idx], q1 = q_buf[tok*dim+idx+1];
+        q_buf[tok*dim+idx]   = q0*cs - q1*sn;
+        q_buf[tok*dim+idx+1] = q0*sn + q1*cs;
+        float k0 = k_buf[tok*dim+idx], k1 = k_buf[tok*dim+idx+1];
+        k_buf[tok*dim+idx]   = k0*cs - k1*sn;
+        k_buf[tok*dim+idx+1] = k0*sn + k1*cs;
+    }
+
+    // Width RoPE at offset t_dim + h_dim
+    for (uint i = 0; i < pc.w_dim / 2; i++) {
+        float freq = 1.0 / pow(pc.theta, 2.0 * float(i) / float(pc.w_dim));
+        float angle = pw_f * freq;
+        float cs = cos(angle), sn = sin(angle);
+        uint idx = off + pc.t_dim + pc.h_dim + 2 * i;
+        float q0 = q_buf[tok*dim+idx], q1 = q_buf[tok*dim+idx+1];
+        q_buf[tok*dim+idx]   = q0*cs - q1*sn;
+        q_buf[tok*dim+idx+1] = q0*sn + q1*cs;
+        float k0 = k_buf[tok*dim+idx], k1 = k_buf[tok*dim+idx+1];
+        k_buf[tok*dim+idx]   = k0*cs - k1*sn;
+        k_buf[tok*dim+idx+1] = k0*sn + k1*cs;
+    }
+}
