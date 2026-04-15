@@ -752,6 +752,8 @@ bool VulkanLLMRunner::loadWeights(gguf_context *g) {
         arch = "qwen3vl";
     } else if (gguf_find_key(g, "qwen3.block_count") >= 0) {
         arch = "qwen3";
+    } else if (gguf_find_key(g, "qwen2vl.block_count") >= 0) {
+        arch = "qwen2vl";
     }
 
     char kbuf[128];

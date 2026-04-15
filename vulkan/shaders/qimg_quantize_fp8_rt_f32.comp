@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// FP8 E4M3 roundtrip quantization: F32 -> FP8 -> F32
+// Simulates ComfyUI's fp8_linear input quantization.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { float x_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float v = x_buf[i];
+    if (v > 448.0) v = 448.0;
+    if (v < -448.0) v = -448.0;
+
+    uint bits = floatBitsToUint(v);
+    uint sign = bits >> 31;
+    int exp_val = int((bits >> 23) & 0xFFu) - 127;
+    uint mant = bits & 0x7FFFFFu;
+    int fp8_exp = exp_val + 7;
+    float result;
+
+    if (exp_val < -9) { result = 0.0; }
+    else if (fp8_exp <= 0) {
+        uint full_mant = mant | 0x800000u;
+        int shift = 1 - fp8_exp + 20;
+        if (shift >= 24) { result = 0.0; }
+        else {
+            uint fp8_mant = (full_mant + (1u << (shift-1))) >> shift;
+            if (fp8_mant > 7u) fp8_mant = 7u;
+            result = ldexp(float(fp8_mant) / 8.0, -6);
+            if (sign != 0u) result = -result;
+        }
+    } else if (fp8_exp >= 15) {
+        result = (sign != 0u) ? -448.0 : 448.0;
+    } else {
+        uint fp8_mant = (mant + (1u << 19)) >> 20;
+        if (fp8_mant > 7u) { fp8_mant = 0u; fp8_exp++; }
+        if (fp8_exp >= 15) { result = (sign != 0u) ? -448.0 : 448.0; }
+        else {
+            result = ldexp(1.0 + float(fp8_mant) / 8.0, fp8_exp - 7);
+            if (sign != 0u) result = -result;
+        }
+    }
+    x_buf[i] = result;
+}

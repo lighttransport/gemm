@@ -71,6 +71,7 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/rope_mrope_batch_f32.comp
     ${SHADER_SOURCE_DIR}/kv_cache_store_batch_f32.comp
     ${SHADER_SOURCE_DIR}/attn_prefill_f32.comp
+    ${SHADER_SOURCE_DIR}/silu_f32.comp
 )
 
 # DA3 depth estimation shaders
@@ -132,6 +133,41 @@ set(HY3D_SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/hy3d/cross_attn_f32.comp
     ${SHADER_SOURCE_DIR}/hy3d/cfg_combine_f32.comp
     ${SHADER_SOURCE_DIR}/hy3d/euler_step_f32.comp
+)
+
+# Flux.2 Klein text-to-image shaders
+set(FLUX2_SHADER_SOURCES
+    ${SHADER_SOURCE_DIR}/flux2_adaln_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_rmsnorm_per_head_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_rope_img_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_rope_txt_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_swiglu_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_gated_add_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_bf16_trunc_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_gemm_f32.comp
+    ${SHADER_SOURCE_DIR}/flux2_attn_flash_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_conv2d_3x3_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_conv2d_1x1_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_groupnorm_silu_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_upsample2x_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_transpose_f32.comp
+    ${SHADER_SOURCE_DIR}/vae_add_bias_f32.comp
+)
+
+# Qwen-Image text-to-image shaders
+set(QIMG_SHADER_SOURCES
+    ${SHADER_SOURCE_DIR}/qimg_rope_2d_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_rope_1d_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_patchify_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_unpatchify_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_euler_step_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_cfg_combine_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_rmsnorm_weighted_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_quantize_fp8_rt_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_vae_conv2d_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_vae_rmsnorm_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_vae_silu_f32.comp
+    ${SHADER_SOURCE_DIR}/qimg_vae_upsample2x_f32.comp
 )
 
 # Custom function to compile GLSL to SPIR-V (supports subdirectories)
@@ -242,6 +278,24 @@ endforeach()
 if(T2_SPIRV_OUTPUTS)
     add_custom_target(trellis2_shaders ALL DEPENDS ${T2_SPIRV_OUTPUTS})
 endif()
+
+# Compile Flux2 shaders
+foreach(SHADER ${FLUX2_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        compile_shader(${SHADER})
+    else()
+        message(WARNING "Flux2 shader not found: ${SHADER}")
+    endif()
+endforeach()
+
+# Compile Qwen-Image shaders
+foreach(SHADER ${QIMG_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        compile_shader(${SHADER})
+    else()
+        message(WARNING "Qwen-Image shader not found: ${SHADER}")
+    endif()
+endforeach()
 
 # Custom target for shader compilation
 if(SPIRV_OUTPUTS)
@@ -470,6 +524,68 @@ if(TARGET trellis2_shaders)
 endif()
 if(TARGET coopmat_shaders)
     add_dependencies(${TRELLIS2_VK_TARGET} coopmat_shaders)
+endif()
+
+# Flux.2 Klein text-to-image test executable
+set(FLUX2_TARGET test_vulkan_flux2)
+
+add_executable(${FLUX2_TARGET}
+    flux2/test_vulkan_flux2.cc
+    flux2/vulkan_flux2_runner.cc
+    flux2/ggml_dequant_impl.c
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${FLUX2_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${CMAKE_CURRENT_SOURCE_DIR}/flux2
+)
+
+target_link_libraries(${FLUX2_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+    Threads::Threads
+)
+
+target_compile_definitions(${FLUX2_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET coopmat_shaders)
+    add_dependencies(${FLUX2_TARGET} coopmat_shaders)
+endif()
+
+# Qwen-Image text-to-image test executable
+set(QIMG_TARGET test_vulkan_qimg)
+
+add_executable(${QIMG_TARGET}
+    qimg/test_vulkan_qimg.cc
+    qimg/vulkan_qimg_runner.cc
+    qimg/ggml_dequant_impl.c
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${QIMG_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${CMAKE_CURRENT_SOURCE_DIR}/qimg
+)
+
+target_link_libraries(${QIMG_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+    Threads::Threads
+)
+
+target_compile_definitions(${QIMG_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET coopmat_shaders)
+    add_dependencies(${QIMG_TARGET} coopmat_shaders)
 endif()
 
 message(STATUS "")

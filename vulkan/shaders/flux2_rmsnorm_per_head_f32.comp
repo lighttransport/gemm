@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Per-head RMSNorm for Flux.2 Klein DiT Q/K normalization
+// x[tok, head] = x * rsqrt(mean(x^2) + eps) * weight
+// Dispatch: one workgroup per (token, head) pair.
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { float x_buf[]; };
+layout(std430, binding = 1) readonly buffer WeightBuffer { float weight[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint n_heads;
+    uint head_dim;
+} pc;
+
+shared float s_sum[128];
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    if (tok >= pc.N || h >= pc.n_heads) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.n_heads * pc.head_dim;
+    uint base = tok * dim + h * pc.head_dim;
+
+    // Sum of squares reduction
+    float psum = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += 128)
+        psum += x_buf[base + i] * x_buf[base + i];
+    s_sum[tid] = psum;
+    barrier();
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        barrier();
+    }
+    float inv = inversesqrt(s_sum[0] / float(pc.head_dim) + 1e-6);
+
+    // Scale
+    for (uint i = tid; i < pc.head_dim; i += 128)
+        x_buf[base + i] *= inv * weight[i];
+}

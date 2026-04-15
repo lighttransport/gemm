@@ -1,0 +1,12 @@
+.venv/
+*.bin
+*.npy
+output/
+__pycache__/
+qwen_ref_run.log
+
+# Generated/dumped images (keep .py scripts; don't keep the large generated files)
+apple_ref*.png
+apple_qimg*.png
+apple_benchmark*.png
+apple_comparison*.png

@@ -666,6 +666,9 @@ static int test_full_pipeline(const char *dit_path, const char *vae_path,
     free(img_tokens);
     free(txt_tokens);
 
+    /* Un-standardize latent to VAE's natural space */
+    qimg_dit_unnormalize_latent(latent, lat_ch, lat_h, lat_w);
+
     /* VAE decode */
     float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
     qimg_vae_decode(rgb, latent, lat_h, lat_w, vae);

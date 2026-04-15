@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// RMSNorm with learned weight: x *= rsqrt(mean(x^2)) * w
+// Grid: (N, 1, 1), Block: (256, 1, 1)
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { float x_buf[]; };
+layout(std430, binding = 1) readonly buffer WBuffer { float w_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint dim;
+} pc;
+
+shared float s_sum[256];
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.N) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = tok * pc.dim;
+
+    float s = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256) {
+        float v = x_buf[base + i];
+        s += v * v;
+    }
+    s_sum[tid] = s;
+    barrier();
+    for (uint r = 128; r > 0; r >>= 1) {
+        if (tid < r) s_sum[tid] += s_sum[tid + r];
+        barrier();
+    }
+    float inv = inversesqrt(s_sum[0] / float(pc.dim) + 1e-6);
+    for (uint i = tid; i < pc.dim; i += 256)
+        x_buf[base + i] *= inv * w_buf[i];
+}
