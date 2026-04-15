@@ -1835,28 +1835,37 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     CUdeviceptr d_uncond_ctx = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
     cuMemsetD8Async(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), stream);
 
-    /* Flow matching schedule, matching hy3dshape FlowMatchEulerDiscreteScheduler:
-     *   timesteps = linspace(num_train_ts=1000, 1, n_steps)   (model t values)
-     *   sigmas    = timesteps / 1000                           (normalized)
-     *   sigmas   += [1.0]                                      (sentinel appended)
-     *   step i: prev = sample + (sigmas[i+1] - sigmas[i]) * v
-     *           which is equivalent to our op_euler_step(x, v, dt=sigmas[i]-sigmas[i+1])
+    /* Flow matching schedule — matches Hunyuan3DDiTFlowMatchingPipeline.__call__
+     * (hy3dshape/pipelines.py line 736-764), NOT the parent class loop:
      *
-     * The DiT is trained on timesteps in [1, 1000]; passing a sigma in [0, 1]
-     * to the timestep_embed kernel produces an entirely different sinusoidal
-     * embedding and collapses the SDF output (everything turns "inside"). */
-    const float num_train_ts = 1000.0f;
+     *   sigmas = np.linspace(0, 1, n_steps)          # ASCENDING from 0
+     *   scheduler.set_timesteps(sigmas=sigmas)       # timesteps = sigmas*1000
+     *   for t in timesteps:
+     *       t_model = t / num_train_timesteps        # rescales back to [0, 1]
+     *       v = model(latents, t_model, ctx)
+     *       latents = latents + (sigmas[i+1] - sigmas[i]) * v
+     *
+     * Key facts:
+     *   - The DiT is fed t in [0, 1], NOT [1, 1000]. The TimestepEmbedder in
+     *     hunyuandit.py consumes it raw (no internal /1000).
+     *   - Sigmas ASCEND 0 -> 1 with a sentinel 1.0 at position n_steps (so the
+     *     final step's dsigma is 0 and does nothing).
+     *   - Update direction is prev = sample + (sn - s) * v, i.e. additive
+     *     with positive dsigma. Our op_euler_step does x -= dt*v, so we pass
+     *     dt = sigma - sigma_next (negative) to get x = x - (s-sn)*v
+     *                                              = x + (sn-s)*v. */
     for (int step = 0; step < n_steps; step++) {
-        float model_t  = num_train_ts - (float)step * (num_train_ts - 1.0f) / (float)(n_steps - 1);
-        float sigma     = model_t / num_train_ts;
+        float sigma      = (float)step / (float)(n_steps - 1);
         float sigma_next = (step == n_steps - 1)
                               ? 1.0f  /* scheduler sentinel */
-                              : (num_train_ts - (float)(step + 1) * (num_train_ts - 1.0f) / (float)(n_steps - 1)) / num_train_ts;
-        float dt = sigma - sigma_next;  /* positive except on last step */
+                              : (float)(step + 1) / (float)(n_steps - 1);
+        float dt         = sigma - sigma_next; /* negative except last step */
+
+        /* DiT input timestep equals sigma (model was trained in [0, 1]). */
+        float model_t = sigma;
 
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
-            fprintf(stderr, "  step %d/%d (t=%.1f sigma=%.3f)\n",
-                    step + 1, n_steps, model_t, sigma);
+            fprintf(stderr, "  step %d/%d (t=%.4f)\n", step + 1, n_steps, model_t);
 
         /* Conditional pass */
         run_dit_forward(r, d_latents, model_t, d_dino_out, d_pred_cond);
