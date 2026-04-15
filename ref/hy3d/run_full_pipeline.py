@@ -66,14 +66,23 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
     parser.add_argument("--low-vram", dest="low_vram", action="store_true",
-                        default=True,
-                        help="enable model CPU offload (default)")
+                        default=False,
+                        help="try accelerate.cpu_offload on each sub-module. "
+                             "WARNING: upstream's enable_model_cpu_offload is "
+                             "half-ported from diffusers and the straight "
+                             "accelerate.cpu_offload path triggers a "
+                             "meta-tensor bug in torchvision Normalize inside "
+                             "the conditioner. Full-resident is recommended "
+                             "if your GPU has >=10 GB VRAM.")
     parser.add_argument("--no-low-vram", dest="low_vram", action="store_false",
-                        help="keep all models resident on GPU")
+                        help="keep all models resident on GPU (default)")
     parser.add_argument("--sequential-offload", action="store_true",
-                        help="use accelerate sequential CPU offload (lowest VRAM, slowest)")
+                        help="use accelerate sequential CPU offload (lowest VRAM, slowest, broken)")
     parser.add_argument("--save-latents", default=None,
                         help="if set, dump the final DiT latents to this .npy path")
+    parser.add_argument("--trace-dir", default=None,
+                        help="dump per-stage .npy tensors for layer-by-layer "
+                             "comparison vs the CUDA runner")
     args = parser.parse_args()
 
     _setup_sys_path()
@@ -91,12 +100,22 @@ def main():
         use_safetensors=False, variant="fp16")
     print(f"  loaded in {time.time() - t0:.1f}s")
 
-    if args.sequential_offload:
-        print("Enabling sequential CPU offload (accelerate)...")
-        pipe.enable_sequential_cpu_offload()
-    elif args.low_vram:
-        print("Enabling model CPU offload (one stage on GPU at a time)...")
-        pipe.enable_model_cpu_offload()
+    # Upstream Hunyuan3DDiTPipeline inherits enable_model_cpu_offload from
+    # diffusers.DiffusionPipeline but never sets up .components / .device /
+    # .to, and the pipeline's __call__ mixes CPU latents with CUDA model
+    # outputs after offload. Instead, apply accelerate.cpu_offload directly
+    # to each top-level sub-module — it attaches forward hooks that move
+    # just the model weights onto execution_device during forward and back
+    # to CPU after, leaving all other tensors (latents, contexts) on CUDA.
+    if args.sequential_offload or args.low_vram:
+        from accelerate import cpu_offload
+        tag = "sequential CPU offload" if args.sequential_offload \
+                else "model CPU offload"
+        print(f"Enabling {tag} (accelerate.cpu_offload on each sub-module)...")
+        for name in ("conditioner", "model", "vae"):
+            mod = getattr(pipe, name)
+            if mod is not None:
+                cpu_offload(mod, execution_device=args.device)
     else:
         print("All models resident on GPU (no offload).")
 
@@ -106,7 +125,76 @@ def main():
         from hy3dshape.rembg import BackgroundRemover
         image = BackgroundRemover()(image)
 
+    # With accelerate.cpu_offload each sub-module still reports execution_device
+    # as cuda, so the pipeline's latents/prepare_latents path stays on cuda.
     generator = torch.Generator(device=args.device).manual_seed(args.seed)
+
+    # ---- Tracing hooks (layer-by-layer debug vs CUDA runner) ----
+    hook_handles = []
+    if args.trace_dir:
+        import numpy as np
+        os.makedirs(args.trace_dir, exist_ok=True)
+
+        def _save(name, tensor):
+            if hasattr(tensor, "detach"):
+                tensor = tensor.detach()
+            if hasattr(tensor, "float"):
+                tensor = tensor.float().cpu().numpy()
+            path = os.path.join(args.trace_dir, name + ".npy")
+            np.save(path, tensor)
+            print(f"    trace: {name} shape={tensor.shape} "
+                  f"min={tensor.min():+.4f} max={tensor.max():+.4f} "
+                  f"mean={tensor.mean():+.4f} std={tensor.std():.4f}")
+
+        # Hook the Dinov2 HF model inside the ImageEncoder
+        dino = pipe.conditioner.main_image_encoder.model
+
+        def _dino_pre(module, args_):
+            _save("01_dino_input", args_[0])
+
+        def _dino_post(module, args_, output):
+            # transformers returns a BaseModelOutput[WithPooling]
+            lhs = getattr(output, "last_hidden_state", None)
+            if lhs is None and isinstance(output, tuple):
+                lhs = output[0]
+            _save("02_dino_output", lhs)
+
+        hook_handles.append(dino.register_forward_pre_hook(_dino_pre))
+        hook_handles.append(dino.register_forward_hook(_dino_post))
+
+        # Hook the DiT model itself: inputs (x, t, contexts) + output
+        _dit_state = {"step": 0}
+
+        def _dit_pre(module, args_):
+            x, t, contexts = args_[0], args_[1], args_[2]
+            step = _dit_state["step"]
+            main_ctx = contexts["main"] if isinstance(contexts, dict) else contexts
+            if step == 0:
+                _save("03_dit_context_cfg", main_ctx)  # first step carries the CFG-doubled context
+                _save("04_dit_latents_step0", x)
+            _save(f"05_dit_input_x_{step:03d}", x)
+            _save(f"05_dit_input_t_{step:03d}",
+                  torch.as_tensor(t).reshape(-1))
+
+        def _dit_post(module, args_, output):
+            step = _dit_state["step"]
+            _save(f"06_dit_output_{step:03d}", output)
+            _dit_state["step"] += 1
+
+        hook_handles.append(pipe.model.register_forward_pre_hook(_dit_pre))
+        hook_handles.append(pipe.model.register_forward_hook(_dit_post))
+
+        # Hook the ShapeVAE forward (post-KL + decoder). It's called once in _export.
+        def _vae_pre(module, args_):
+            _save("07_vae_input_latents", args_[0])
+
+        def _vae_post(module, args_, output):
+            _save("08_vae_decoded", output)
+
+        hook_handles.append(pipe.vae.register_forward_pre_hook(_vae_pre))
+        hook_handles.append(pipe.vae.register_forward_hook(_vae_post))
+
+        print(f"Tracing enabled: {args.trace_dir}")
 
     print(f"Sampling: steps={args.steps} guidance={args.guidance} "
           f"octree={args.octree} seed={args.seed}")
@@ -126,6 +214,9 @@ def main():
     mesh = outputs[0]
     print(f"  sampled in {elapsed:.1f}s: "
           f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+
+    for h in hook_handles:
+        h.remove()
 
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
