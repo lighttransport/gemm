@@ -21,4 +21,10 @@ dependencies = [
     "pymeshlab>=2025.7.post1",
     "accelerate>=1.13.0",
     "pygltflib>=1.16.5",
+    "xatlas>=0.0.11",
+    "basicsr>=1.4.2",
+    "realesrgan>=0.3.0",
+    "pybind11>=3.0.3",
+    "pytorch-lightning>=2.6.1",
+    "fast-simplification>=0.1.13",
 ]
