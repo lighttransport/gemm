@@ -14,7 +14,7 @@ CUEW_SRC = ../cuew.c
 
 .PHONY: all clean help
 
-all: test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project
+all: test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project test_swiglu
 
 test_uv_unwrap: test_uv_unwrap.cc ../../common/xatlas.cc ../../common/xatlas.h
 	$(CXX) $(CXXFLAGS) -o $@ test_uv_unwrap.cc ../../common/xatlas.cc $(LDFLAGS)
@@ -31,8 +31,11 @@ test_vertex_inpaint: test_vertex_inpaint.cc mesh_vertex_inpaint.h
 test_back_project: test_back_project.c cuda_paint_raster_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_back_project.c $(CUEW_SRC) $(CULDFLAGS)
 
+test_swiglu: test_swiglu.c cuda_paint_nn_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_swiglu.c $(CUEW_SRC) $(CULDFLAGS)
+
 clean:
-	rm -f test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project
+	rm -f test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project test_swiglu
 
 help:
 	@echo "Hunyuan3D-2.1 texture-gen native runners"
