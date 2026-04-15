@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: MIT
+// Per-head RMSNorm (QK-norm): normalize each head_dim-sized chunk.
+// One workgroup per head.
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer VecBuffer { float vec[]; };
+layout(std430, binding = 1) readonly buffer WeightBuffer { float weight[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_heads;
+    uint head_dim;
+    float eps;
+} pc;
+
+shared float s_reduce[128];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (h >= pc.n_heads) return;
+
+    uint base = h * pc.head_dim;
+
+    // Sum of squares
+    float ss = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += 128) {
+        float v = vec[base + i];
+        ss += v * v;
+    }
+
+    s_reduce[tid] = ss;
+    barrier();
+
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        barrier();
+    }
+
+    float scale = 1.0 / sqrt(s_reduce[0] / float(pc.head_dim) + pc.eps);
+
+    for (uint i = tid; i < pc.head_dim; i += 128) {
+        vec[base + i] = vec[base + i] * scale * weight[i];
+    }
+}

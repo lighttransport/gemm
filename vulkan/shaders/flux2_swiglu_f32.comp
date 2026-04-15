@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// SwiGLU activation for Flux.2 Klein MLP
+// in: [n_tok, 2*mlp_h], out: [n_tok, mlp_h]
+// out[t,i] = silu(gate[t,i]) * val[t,i]
+// where gate = in[t, 0:mlp_h], val = in[t, mlp_h:2*mlp_h]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuffer { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuffer { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint mlp_h;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint i = gl_WorkGroupID.y * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (tok >= pc.n_tok || i >= pc.mlp_h) return;
+
+    float gate = in_buf[tok * 2 * pc.mlp_h + i];
+    float val  = in_buf[tok * 2 * pc.mlp_h + pc.mlp_h + i];
+    out_buf[tok * pc.mlp_h + i] = (gate / (1.0 + exp(-gate))) * val;
+}
