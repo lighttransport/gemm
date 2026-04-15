@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// CFG combine: out = v_uncond + cfg_scale * (v_cond - v_uncond)
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer CondBuffer { float cond_buf[]; };
+layout(std430, binding = 2) readonly buffer UncondBuffer { float uncond_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    float cfg_scale;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    out_buf[i] = uncond_buf[i] + pc.cfg_scale * (cond_buf[i] - uncond_buf[i]);
+}

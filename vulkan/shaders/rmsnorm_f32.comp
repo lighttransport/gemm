@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: MIT
+// RMSNorm: dst[i] = src[i] * weight[i] / sqrt(mean(src^2) + eps)
+// One workgroup per token (row). Reduction via shared memory.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuffer { float src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuffer { float dst[]; };
+layout(std430, binding = 2) readonly buffer WeightBuffer { float weight[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;
+    uint dim;
+    float eps;
+} pc;
+
+shared float s_reduce[256];
+
+void main() {
+    uint token = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (token >= pc.n_tokens) return;
+
+    uint base = token * pc.dim;
+
+    // Compute sum of squares
+    float ss = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256) {
+        float v = src[base + i];
+        ss += v * v;
+    }
+
+    s_reduce[tid] = ss;
+    barrier();
+
+    // Reduction
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        barrier();
+    }
+
+    float scale = 1.0 / sqrt(s_reduce[0] / float(pc.dim) + pc.eps);
+
+    // Apply normalization
+    for (uint i = tid; i < pc.dim; i += 256) {
+        dst[base + i] = src[base + i] * scale * weight[i];
+    }
+}

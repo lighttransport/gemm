@@ -70,6 +70,221 @@ static const char *hip_vlm_specific_kernels =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- gemm_opt_f16_f32: Optimized 128x128 tiled F16 GEMM ---- */\n"
+"/* Y[M,N] = X[M,K] * W^T[N,K] + bias[N].  Grid: (ceil(N/128), ceil(M/128)), Block: 256 */\n"
+"#define G16_BM 128\n"
+"#define G16_BN 128\n"
+"#define G16_BK 16\n"
+"#define G16_TM 8\n"
+"#define G16_TN 8\n"
+"__global__ void gemm_opt_f16_f32(float *Y, const half_raw *W, const float *X,\n"
+"                                  const float *bias, int N, int K, int M) {\n"
+"    __shared__ float smA[G16_BK][G16_BM];\n"
+"    __shared__ float smB[G16_BK][G16_BN];\n"
+"    int tid = threadIdx.x;\n"
+"    int bm = blockIdx.y * G16_BM, bn = blockIdx.x * G16_BN;\n"
+"    int tr = tid / 16, tc = tid % 16;\n"
+"    float acc[G16_TM][G16_TN];\n"
+"    for (int i = 0; i < G16_TM; i++)\n"
+"        for (int j = 0; j < G16_TN; j++) acc[i][j] = 0.0f;\n"
+"    for (int k = 0; k < K; k += G16_BK) {\n"
+"        for (int _i = tid; _i < G16_BM*G16_BK; _i += 256) {\n"
+"            int _r = _i % G16_BM, _c = _i / G16_BM;\n"
+"            int gr = bm+_r, gk = k+_c;\n"
+"            smA[_c][_r] = (gr<M&&gk<K) ? X[(size_t)gr*K+gk] : 0.0f;\n"
+"        }\n"
+"        for (int _i = tid; _i < G16_BN*G16_BK; _i += 256) {\n"
+"            int _r = _i % G16_BN, _c = _i / G16_BN;\n"
+"            int gn = bn+_r, gk = k+_c;\n"
+"            smB[_c][_r] = (gn<N&&gk<K) ? half_to_float(W[(size_t)gn*K+gk]) : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int kk = 0; kk < G16_BK; kk++) {\n"
+"            float af[G16_TM], bf[G16_TN];\n"
+"            for (int i=0;i<G16_TM;i++) af[i] = smA[kk][tr*G16_TM+i];\n"
+"            for (int j=0;j<G16_TN;j++) bf[j] = smB[kk][tc*G16_TN+j];\n"
+"            for (int i=0;i<G16_TM;i++)\n"
+"                for (int j=0;j<G16_TN;j++) acc[i][j] += af[i]*bf[j];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int i=0;i<G16_TM;i++) {\n"
+"        int gr = bm+tr*G16_TM+i; if(gr>=M) continue;\n"
+"        for (int j=0;j<G16_TN;j++) {\n"
+"            int gn = bn+tc*G16_TN+j;\n"
+"            if(gn<N) Y[(size_t)gr*N+gn] = acc[i][j]+(bias?bias[gn]:0.0f);\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- gemm_opt_f16_f32_gelu: 128x128 F16 GEMM with fused GELU ---- */\n"
+"__global__ void gemm_opt_f16_f32_gelu(float *Y, const half_raw *W, const float *X,\n"
+"                                       const float *bias, int N, int K, int M) {\n"
+"    __shared__ float smA[G16_BK][G16_BM];\n"
+"    __shared__ float smB[G16_BK][G16_BN];\n"
+"    int tid = threadIdx.x;\n"
+"    int bm = blockIdx.y * G16_BM, bn = blockIdx.x * G16_BN;\n"
+"    int tr = tid / 16, tc = tid % 16;\n"
+"    float acc[G16_TM][G16_TN];\n"
+"    for (int i = 0; i < G16_TM; i++)\n"
+"        for (int j = 0; j < G16_TN; j++) acc[i][j] = 0.0f;\n"
+"    for (int k = 0; k < K; k += G16_BK) {\n"
+"        for (int _i = tid; _i < G16_BM*G16_BK; _i += 256) {\n"
+"            int _r = _i % G16_BM, _c = _i / G16_BM;\n"
+"            int gr = bm+_r, gk = k+_c;\n"
+"            smA[_c][_r] = (gr<M&&gk<K) ? X[(size_t)gr*K+gk] : 0.0f;\n"
+"        }\n"
+"        for (int _i = tid; _i < G16_BN*G16_BK; _i += 256) {\n"
+"            int _r = _i % G16_BN, _c = _i / G16_BN;\n"
+"            int gn = bn+_r, gk = k+_c;\n"
+"            smB[_c][_r] = (gn<N&&gk<K) ? half_to_float(W[(size_t)gn*K+gk]) : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int kk = 0; kk < G16_BK; kk++) {\n"
+"            float af[G16_TM], bf[G16_TN];\n"
+"            for (int i=0;i<G16_TM;i++) af[i] = smA[kk][tr*G16_TM+i];\n"
+"            for (int j=0;j<G16_TN;j++) bf[j] = smB[kk][tc*G16_TN+j];\n"
+"            for (int i=0;i<G16_TM;i++)\n"
+"                for (int j=0;j<G16_TN;j++) acc[i][j] += af[i]*bf[j];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int i=0;i<G16_TM;i++) {\n"
+"        int gr = bm+tr*G16_TM+i; if(gr>=M) continue;\n"
+"        for (int j=0;j<G16_TN;j++) {\n"
+"            int gn = bn+tc*G16_TN+j;\n"
+"            if(gn<N) {\n"
+"                float v = acc[i][j]+(bias?bias[gn]:0.0f);\n"
+"                v = 0.5f*v*(1.0f+tanhf(0.7978845608f*(v+0.044715f*v*v*v)));\n"
+"                Y[(size_t)gr*N+gn] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- gemm_opt_f16_f32_res: 128x128 F16 GEMM with fused residual add ---- */\n"
+"__global__ void gemm_opt_f16_f32_res(float *Y, const half_raw *W, const float *X,\n"
+"                                      const float *bias, const float *residual,\n"
+"                                      int N, int K, int M) {\n"
+"    __shared__ float smA[G16_BK][G16_BM];\n"
+"    __shared__ float smB[G16_BK][G16_BN];\n"
+"    int tid = threadIdx.x;\n"
+"    int bm = blockIdx.y * G16_BM, bn = blockIdx.x * G16_BN;\n"
+"    int tr = tid / 16, tc = tid % 16;\n"
+"    float acc[G16_TM][G16_TN];\n"
+"    for (int i = 0; i < G16_TM; i++)\n"
+"        for (int j = 0; j < G16_TN; j++) acc[i][j] = 0.0f;\n"
+"    for (int k = 0; k < K; k += G16_BK) {\n"
+"        for (int _i = tid; _i < G16_BM*G16_BK; _i += 256) {\n"
+"            int _r = _i % G16_BM, _c = _i / G16_BM;\n"
+"            int gr = bm+_r, gk = k+_c;\n"
+"            smA[_c][_r] = (gr<M&&gk<K) ? X[(size_t)gr*K+gk] : 0.0f;\n"
+"        }\n"
+"        for (int _i = tid; _i < G16_BN*G16_BK; _i += 256) {\n"
+"            int _r = _i % G16_BN, _c = _i / G16_BN;\n"
+"            int gn = bn+_r, gk = k+_c;\n"
+"            smB[_c][_r] = (gn<N&&gk<K) ? half_to_float(W[(size_t)gn*K+gk]) : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int kk = 0; kk < G16_BK; kk++) {\n"
+"            float af[G16_TM], bf[G16_TN];\n"
+"            for (int i=0;i<G16_TM;i++) af[i] = smA[kk][tr*G16_TM+i];\n"
+"            for (int j=0;j<G16_TN;j++) bf[j] = smB[kk][tc*G16_TN+j];\n"
+"            for (int i=0;i<G16_TM;i++)\n"
+"                for (int j=0;j<G16_TN;j++) acc[i][j] += af[i]*bf[j];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int i=0;i<G16_TM;i++) {\n"
+"        int gr = bm+tr*G16_TM+i; if(gr>=M) continue;\n"
+"        for (int j=0;j<G16_TN;j++) {\n"
+"            int gn = bn+tc*G16_TN+j;\n"
+"            if(gn<N) Y[(size_t)gr*N+gn] = acc[i][j]+(bias?bias[gn]:0.0f)+residual[(size_t)gr*N+gn];\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#undef G16_BM\n"
+"#undef G16_BN\n"
+"#undef G16_BK\n"
+"#undef G16_TM\n"
+"#undef G16_TN\n"
+"\n"
+"/* ---- flash_attn_dyn_f32: FlashAttention with dynamic head_dim ---- */\n"
+"/* Grid: (n_heads, ceil(n_tok/FA_DYN_BQ)), Block: FA_DYN_BQ=64 */\n"
+"#define FA_DYN_BQ  64\n"
+"#define FA_DYN_BKV 16\n"
+"#define FA_DYN_MAX_HD 128\n"
+"__global__ void flash_attn_dyn_f32(float *out, const float *qkv,\n"
+"    const float *K_t, const float *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qi = blockIdx.y * FA_DYN_BQ + threadIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int dim3 = 3 * dim;\n"
+"    const float *qt = qkv + (qi < n_tok ? qi : 0) * dim3 + h * head_dim;\n"
+"    const float *kt_h = K_t + (size_t)h * n_tok * head_dim;\n"
+"    const float *vt_h = V_t + (size_t)h * n_tok * head_dim;\n"
+"    extern __shared__ float smem[];\n"
+"    float *smK = smem;\n"
+"    float *smV = smem + FA_DYN_BKV * head_dim;\n"
+"    /* Use register arrays sized to max, only use head_dim elements */\n"
+"    float q_reg[FA_DYN_MAX_HD];\n"
+"    float O_i[FA_DYN_MAX_HD];\n"
+"    for (int d = 0; d < head_dim; d++)\n"
+"        q_reg[d] = (qi < n_tok) ? qt[d] : 0.0f;\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    for (int d = 0; d < head_dim; d++) O_i[d] = 0.0f;\n"
+"    int tid = threadIdx.x;\n"
+"    int kv_tiles = (n_tok + FA_DYN_BKV - 1) / FA_DYN_BKV;\n"
+"    int smem_per_tile = FA_DYN_BKV * head_dim;\n"
+"    for (int tile = 0; tile < kv_tiles; tile++) {\n"
+"        int kv = tile * FA_DYN_BKV;\n"
+"        for (int idx = tid; idx < smem_per_tile; idx += FA_DYN_BQ) {\n"
+"            int kj = idx / head_dim, d = idx % head_dim;\n"
+"            int kv_tok = kv + kj;\n"
+"            smK[idx] = (kv_tok < n_tok) ? kt_h[(size_t)kv_tok * head_dim + d] : 0.0f;\n"
+"            smV[idx] = (kv_tok < n_tok) ? vt_h[(size_t)kv_tok * head_dim + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        float sc[FA_DYN_BKV];\n"
+"        for (int kj = 0; kj < FA_DYN_BKV; kj++) sc[kj] = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) {\n"
+"            float qd = q_reg[d];\n"
+"            for (int kj = 0; kj < FA_DYN_BKV; kj++)\n"
+"                sc[kj] += qd * smK[kj * head_dim + d];\n"
+"        }\n"
+"        float mx_tile = -1e30f;\n"
+"        for (int kj = 0; kj < FA_DYN_BKV; kj++) {\n"
+"            sc[kj] = (kv + kj < n_tok) ? sc[kj] * scale : -1e30f;\n"
+"            if (sc[kj] > mx_tile) mx_tile = sc[kj];\n"
+"        }\n"
+"        float mn_i = fmaxf(m_i, mx_tile);\n"
+"        float alpha = expf(m_i - mn_i);\n"
+"        l_i *= alpha;\n"
+"        for (int d = 0; d < head_dim; d++) O_i[d] *= alpha;\n"
+"        m_i = mn_i;\n"
+"        float ej[FA_DYN_BKV];\n"
+"        for (int kj = 0; kj < FA_DYN_BKV; kj++) {\n"
+"            ej[kj] = (kv + kj < n_tok) ? expf(sc[kj] - m_i) : 0.0f;\n"
+"            l_i += ej[kj];\n"
+"        }\n"
+"        for (int kj = 0; kj < FA_DYN_BKV; kj++) {\n"
+"            float e = ej[kj];\n"
+"            for (int d = 0; d < head_dim; d++) O_i[d] += e * smV[kj * head_dim + d];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (qi < n_tok) {\n"
+"        float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;\n"
+"        float *out_qi = out + (size_t)qi * dim + h * head_dim;\n"
+"        for (int d = 0; d < head_dim; d++)\n"
+"            out_qi[d] = O_i[d] * inv_l;\n"
+"    }\n"
+"}\n"
+"#undef FA_DYN_BQ\n"
+"#undef FA_DYN_BKV\n"
+"#undef FA_DYN_MAX_HD\n"
+"\n"
 "/* ---- patch_embed_dual_f32: Dual Conv2D patch extraction ---- */\n"
 "/* Grid: (n_patches), Block: (256) */\n"
 "__global__ void patch_embed_dual_f32(float *out, const float *rgb,\n"
@@ -278,6 +493,12 @@ struct hip_vision_runner {
     hipFunction_t fn_add_pos_embd_direct;
     hipFunction_t fn_rope_vision_f32;
     hipFunction_t fn_attn_full_f32;
+    hipFunction_t fn_flash_attn_tiled_f32;
+    hipFunction_t fn_flash_attn_dyn_f32;
+    hipFunction_t fn_kv_transpose;
+    hipFunction_t fn_gemm_opt_f16_f32;
+    hipFunction_t fn_gemm_opt_f16_f32_gelu;
+    hipFunction_t fn_gemm_opt_f16_f32_res;
     hipFunction_t fn_spatial_merge_f32;
 
     /* Model hyperparams */
@@ -330,6 +551,8 @@ struct hip_vision_runner {
     void *d_hidden;     /* [max_patches * dim] */
     void *d_hidden2;    /* [max_patches * dim] */
     void *d_qkv;        /* [max_patches * 3 * dim] */
+    void *d_kt;         /* [max_patches * dim] - transposed K for flash attn */
+    void *d_vt;         /* [max_patches * dim] - transposed V for flash attn */
     void *d_attn_out;   /* [max_patches * dim] */
     void *d_ffn_buf;    /* [max_patches * ffn_dim] */
     void *d_ln_buf;     /* [max_patches * dim] */
@@ -384,12 +607,18 @@ static int vlm_compile_kernels(hip_vision_runner *r) {
     GET_FN(add_pos_embd_direct);
     GET_FN(rope_vision_f32);
     GET_FN(attn_full_f32);
+    GET_FN(flash_attn_tiled_f32);
+    GET_FN(flash_attn_dyn_f32);
+    GET_FN(kv_transpose);
+    GET_FN(gemm_opt_f16_f32);
+    GET_FN(gemm_opt_f16_f32_gelu);
+    GET_FN(gemm_opt_f16_f32_res);
     GET_FN(spatial_merge_f32);
 
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "hip_vlm: %d kernels compiled\n", 12);
+        fprintf(stderr, "hip_vlm: %d kernels compiled\n", 17);
     return 0;
 }
 
@@ -743,6 +972,8 @@ int hip_vision_load_weights(hip_vision_runner *r, gguf_context *g) {
         CHECK_HIP(hipMalloc(&r->d_hidden,    (size_t)mp * dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_hidden2,   (size_t)mp * dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_qkv,       (size_t)mp * 3 * dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_kt,        (size_t)mp * dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_vt,        (size_t)mp * dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_attn_out,  (size_t)mp * dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ffn_buf,   (size_t)mp * r->ffn_dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ln_buf,    (size_t)mp * dim * sizeof(float)));
@@ -786,14 +1017,14 @@ static void vlm_gemm(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
     void *d_W, *d_bias;
     d_bias = w->bias;
     if (r->use_f16 && w->w_f16) {
-        /* F16 tiled GEMM (primary path for RDNA4) */
+        /* Optimized 128x128 tiled F16 GEMM */
         d_W = w->w_f16;
-        int grid_x = (n_out + 63) / 64;
-        int grid_y = (n_tok + 15) / 16;
+        int grid_x = (n_out + 127) / 128;
+        int grid_y = (n_tok + 127) / 128;
         void *args[] = { &d_Y, &d_W, &d_X, &d_bias, &n_out, &n_in, &n_tok };
-        hipModuleLaunchKernel(r->fn_gemm_tiled_f16_f32,
+        hipModuleLaunchKernel(r->fn_gemm_opt_f16_f32,
                        grid_x, grid_y, 1,
-                       16, 16, 1,
+                       256, 1, 1,
                        0, r->stream,
                        args, NULL);
     } else {
@@ -807,6 +1038,54 @@ static void vlm_gemm(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
                        16, 16, 1,
                        0, r->stream,
                        args, NULL);
+    }
+}
+
+/* GEMM + fused GELU (for FFN-up) */
+static void vlm_gemm_gelu(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
+                            void *d_X, int n_tok, int n_out, int n_in) {
+    if (r->use_f16 && w->w_f16) {
+        void *d_W = w->w_f16, *d_bias = w->bias;
+        int grid_x = (n_out + 127) / 128;
+        int grid_y = (n_tok + 127) / 128;
+        void *args[] = { &d_Y, &d_W, &d_X, &d_bias, &n_out, &n_in, &n_tok };
+        hipModuleLaunchKernel(r->fn_gemm_opt_f16_f32_gelu,
+                       grid_x, grid_y, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else {
+        vlm_gemm(r, d_Y, w, d_X, n_tok, n_out, n_in);
+        /* Separate GELU for F32 path */
+        int n = n_tok * n_out;
+        int grid = (n + 255) / 256;
+        void *args[] = { &d_Y, &n };
+        hipModuleLaunchKernel(r->fn_gelu_f32, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    }
+}
+
+/* GEMM + fused residual add (for attn-out and FFN-down).
+ * d_Y and d_residual may alias (in-place residual). F16 fused kernel handles
+ * this atomically; F32 fallback uses d_hidden2 as scratch to avoid aliasing. */
+static void vlm_gemm_res(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
+                           void *d_X, void *d_residual, int n_tok, int n_out, int n_in) {
+    if (r->use_f16 && w->w_f16) {
+        void *d_W = w->w_f16, *d_bias = w->bias;
+        int grid_x = (n_out + 127) / 128;
+        int grid_y = (n_tok + 127) / 128;
+        void *args[] = { &d_Y, &d_W, &d_X, &d_bias, &d_residual, &n_out, &n_in, &n_tok };
+        hipModuleLaunchKernel(r->fn_gemm_opt_f16_f32_res,
+                       grid_x, grid_y, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    } else {
+        /* Write GEMM to scratch, then add residual */
+        vlm_gemm(r, r->d_hidden2, w, d_X, n_tok, n_out, n_in);
+        /* Copy scratch to output: d_Y = d_hidden2 + d_residual */
+        int n = n_tok * n_out;
+        int grid = (n + 255) / 256;
+        /* d_Y = d_residual (copy first if not aliased, then add) */
+        if (d_Y != d_residual) {
+            hipMemcpyAsync(d_Y, d_residual, (size_t)n * sizeof(float),
+                          hipMemcpyDeviceToDevice, r->stream);
+        }
+        void *args[] = { &d_Y, &r->d_hidden2, &n };
+        hipModuleLaunchKernel(r->fn_add_f32, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
     }
 }
 
@@ -1039,36 +1318,42 @@ float *hip_vision_encode(hip_vision_runner *r, const float *rgb_norm, int width,
                            args, NULL);
         }
 
-        /* Multi-head self-attention */
+        /* Multi-head self-attention (flash attention) */
         {
+            /* Transpose K,V to per-head contiguous layout */
+            int total = n_patches * dim;
+            int grid_kv = (total + 255) / 256;
+            void *kv_args[] = { &r->d_kt, &r->d_vt, &r->d_qkv,
+                                &n_patches, &dim, &n_heads, &head_dim };
+            hipModuleLaunchKernel(r->fn_kv_transpose,
+                           grid_kv, 1, 1, 256, 1, 1,
+                           0, r->stream, kv_args, NULL);
+
             float scale = 1.0f / sqrtf((float)head_dim);
-            /* Shared memory: n_patches (scores) + 256 (reduction scratch) */
-            size_t smem = (n_patches + 256) * sizeof(float);
+            int bq = 64;  /* queries per block */
+            int n_q_blocks = (n_patches + bq - 1) / bq;
             void *args[] = {
-                &r->d_attn_out, &r->d_qkv,
+                &r->d_attn_out, &r->d_qkv, &r->d_kt, &r->d_vt,
                 &n_patches, &dim, &n_heads, &head_dim, &scale
             };
-            hipModuleLaunchKernel(r->fn_attn_full_f32,
-                           n_heads, 1, 1,
-                           256, 1, 1,
-                           smem, r->stream,
-                           args, NULL);
+
+            if (head_dim == 64) {
+                size_t smem = 2 * 16 * 64 * sizeof(float);
+                hipModuleLaunchKernel(r->fn_flash_attn_tiled_f32,
+                               n_heads, n_q_blocks, 1,
+                               bq, 1, 1, smem, r->stream, args, NULL);
+            } else {
+                /* Dynamic head_dim version (supports up to 128) */
+                size_t smem = 2 * 16 * head_dim * sizeof(float);
+                hipModuleLaunchKernel(r->fn_flash_attn_dyn_f32,
+                               n_heads, n_q_blocks, 1,
+                               bq, 1, 1, smem, r->stream, args, NULL);
+            }
         }
 
-        /* Attn output projection */
-        vlm_gemm(r, r->d_hidden2, &blk->attn_out, r->d_attn_out, n_patches, dim, dim);
-
-        /* Residual: hidden += hidden2 */
-        {
-            int n = n_patches * dim;
-            int grid = (n + 255) / 256;
-            void *args[] = { &r->d_hidden, &r->d_hidden2, &n };
-            hipModuleLaunchKernel(r->fn_add_f32,
-                           grid, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
+        /* Attn output projection + fused residual add */
+        vlm_gemm_res(r, r->d_hidden, &blk->attn_out, r->d_attn_out, r->d_hidden,
+                     n_patches, dim, dim);
 
         /* LayerNorm2 */
         {
@@ -1082,33 +1367,10 @@ float *hip_vision_encode(hip_vision_runner *r, const float *rgb_norm, int width,
                            args, NULL);
         }
 
-        /* FFN: up -> GELU -> down */
-        vlm_gemm(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim);
-
-        {
-            int n = n_patches * ffn_dim;
-            int grid = (n + 255) / 256;
-            void *args[] = { &r->d_ffn_buf, &n };
-            hipModuleLaunchKernel(r->fn_gelu_f32,
-                           grid, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
-
-        vlm_gemm(r, r->d_hidden2, &blk->ffn_down, r->d_ffn_buf, n_patches, dim, ffn_dim);
-
-        /* Residual: hidden += hidden2 */
-        {
-            int n = n_patches * dim;
-            int grid = (n + 255) / 256;
-            void *args[] = { &r->d_hidden, &r->d_hidden2, &n };
-            hipModuleLaunchKernel(r->fn_add_f32,
-                           grid, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
+        /* FFN: up+GELU fused -> down+residual fused */
+        vlm_gemm_gelu(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim);
+        vlm_gemm_res(r, r->d_hidden, &blk->ffn_down, r->d_ffn_buf, r->d_hidden,
+                     n_patches, dim, ffn_dim);
 
         /* Debug: check hidden and qkv after first block */
         if (l == 0 && r->verbose >= 2) {
@@ -1345,6 +1607,8 @@ void hip_vision_free(hip_vision_runner *r) {
     if (r->d_hidden) hipFree(r->d_hidden);
     if (r->d_hidden2) hipFree(r->d_hidden2);
     if (r->d_qkv) hipFree(r->d_qkv);
+    if (r->d_kt) hipFree(r->d_kt);
+    if (r->d_vt) hipFree(r->d_vt);
     if (r->d_attn_out) hipFree(r->d_attn_out);
     if (r->d_ffn_buf) hipFree(r->d_ffn_buf);
     if (r->d_ln_buf) hipFree(r->d_ln_buf);
