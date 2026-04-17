@@ -1,0 +1,6 @@
+*.npy
+*.obj
+*.ply
+*.glb
+trellis2_repo/
+__pycache__/
