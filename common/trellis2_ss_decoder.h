@@ -152,42 +152,30 @@ static float *t2dec_dequant(const qtensor *t) {
     return buf;
 }
 
-/* ---- GroupNorm: groups channels into G groups, normalize each ---- */
-/* Input/Output: NCDHW layout [1, C, D, H, W] (batch=1) */
+/* ---- ChannelLayerNorm: LayerNorm across C per spatial position ---- */
+/* Input/Output: NCDHW layout [1, C, D, H, W] (batch=1)                */
+/* G arg retained for ABI compat but ignored.                          */
 
 static void t2dec_groupnorm(float *dst, const float *src,
                               const float *w, const float *b,
                               int C, int D, int H, int W, int G) {
+    (void)G;
     int spatial = D * H * W;
-    int cpg = C / G;  /* channels per group */
     float eps = 1e-5f;
-
-    for (int g = 0; g < G; g++) {
-        int c_start = g * cpg;
-        int n = cpg * spatial;
-        /* Compute mean */
-        float mean = 0.0f;
-        for (int c = c_start; c < c_start + cpg; c++)
-            for (int s = 0; s < spatial; s++)
-                mean += src[(size_t)c * spatial + s];
-        mean /= n;
-        /* Compute variance */
-        float var = 0.0f;
-        for (int c = c_start; c < c_start + cpg; c++)
-            for (int s = 0; s < spatial; s++) {
-                float d = src[(size_t)c * spatial + s] - mean;
-                var += d * d;
-            }
-        var /= n;
+    for (int s = 0; s < spatial; s++) {
+        float mean = 0.0f, m2 = 0.0f;
+        for (int c = 0; c < C; c++) {
+            float v = src[(size_t)c * spatial + s];
+            mean += v; m2 += v * v;
+        }
+        mean /= (float)C;
+        float var = m2 / (float)C - mean * mean;
         float inv = 1.0f / sqrtf(var + eps);
-        /* Normalize + scale + bias */
-        for (int c = c_start; c < c_start + cpg; c++) {
+        for (int c = 0; c < C; c++) {
             float wc = w ? w[c] : 1.0f;
             float bc = b ? b[c] : 0.0f;
-            for (int s = 0; s < spatial; s++) {
-                dst[(size_t)c * spatial + s] =
-                    (src[(size_t)c * spatial + s] - mean) * inv * wc + bc;
-            }
+            dst[(size_t)c * spatial + s] =
+                (src[(size_t)c * spatial + s] - mean) * inv * wc + bc;
         }
     }
 }

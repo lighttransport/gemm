@@ -1,0 +1,506 @@
+/*
+ * hip_trellis2_kernels.h - HIP kernel source strings for TRELLIS.2 Stage 1
+ *
+ * Contains TRELLIS.2-specific HIP kernels as a C string literal for
+ * HIPRTC runtime compilation. Concatenated after hip_kernels_common_src
+ * (which opens extern "C" {) and closes it at the end.
+ *
+ * Port of cuda_trellis2_kernels.h for AMD ROCm/HIP (RDNA4, gfx1201).
+ * Key differences from CUDA version:
+ *   - __shfl_xor_sync -> __shfl_xor (no sync mask on HIP)
+ *   - __shfl_down_sync -> __shfl_down
+ *   - No PTX MMA; self-attention uses warp-cooperative FA2 (scalar)
+ *   - Cross-attention uses tiled scalar approach
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright 2025 - Present, Light Transport Entertainment Inc.
+ */
+#ifndef HIP_TRELLIS2_KERNELS_H
+#define HIP_TRELLIS2_KERNELS_H
+
+static const char hip_trellis2_specific_kernels[] =
+"\n"
+
+/* ---- adaLN: y = LN_noaffine(x) * (1 + scale) + shift ---- */
+/* x: [N, dim], shift/scale: [dim], y: [N, dim] */
+/* Grid: N, Block: 256 */
+"__global__ void adaln_f32(\n"
+"    float *y, const float *x, const float *shift, const float *scale,\n"
+"    int dim, float eps) {\n"
+"    int tok = blockIdx.x;\n"
+"    const float *xi = x + tok * dim;\n"
+"    float *yi = y + tok * dim;\n"
+"    extern __shared__ float smem[];\n"
+"    float sum = 0, sum2 = 0;\n"
+"    for (int i = threadIdx.x; i < dim; i += blockDim.x) {\n"
+"        float v = xi[i]; sum += v; sum2 += v * v;\n"
+"    }\n"
+"    smem[threadIdx.x] = sum; smem[threadIdx.x + 256] = sum2;\n"
+"    __syncthreads();\n"
+"    for (int s = 128; s > 0; s >>= 1) {\n"
+"        if (threadIdx.x < s) {\n"
+"            smem[threadIdx.x] += smem[threadIdx.x + s];\n"
+"            smem[threadIdx.x + 256] += smem[threadIdx.x + 256 + s];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float mean = smem[0] / dim;\n"
+"    float var = smem[256] / dim - mean * mean;\n"
+"    float inv = rsqrtf(var + eps);\n"
+"    for (int i = threadIdx.x; i < dim; i += blockDim.x)\n"
+"        yi[i] = (xi[i] - mean) * inv * (1.0f + scale[i]) + shift[i];\n"
+"}\n\n"
+
+/* ---- gated_add: dst[i] += gate[i % dim] * src[i] ---- */
+/* Grid: ceil(n/256), Block: 256 */
+"__global__ void gated_add_f32(\n"
+"    float *dst, const float *src, const float *gate, int n, int dim) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) dst[i] += gate[i % dim] * src[i];\n"
+"}\n\n"
+
+/* ---- residual_add: dst[i] += src[i] ---- */
+"__global__ void residual_add_f32(float *dst, const float *src, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) dst[i] += src[i];\n"
+"}\n\n"
+
+/* ---- modulation_f32: shared t_emb adaLN modulation + per-block bias ---- */
+/* t_emb: [dim] (already SiLU'd), mod_w: F16[6*dim, dim], mod_b: [6*dim],  */
+/* blk_bias: [6*dim], out: [6*dim]                                           */
+/* Single block, 256 threads — small vector computation */
+"__global__ void modulation_f32(\n"
+"    float *out, const float *t_emb, const float *mod_w, const float *mod_b,\n"
+"    const float *blk_bias, int dim, int out_dim) {\n"
+"    extern __shared__ float silu_emb[];\n"
+"    for (int i = threadIdx.x; i < dim; i += blockDim.x)\n"
+"        silu_emb[i] = t_emb[i] / (1.0f + expf(-t_emb[i]));\n"
+"    __syncthreads();\n"
+"    for (int r = threadIdx.x; r < out_dim; r += blockDim.x) {\n"
+"        float sum = 0;\n"
+"        const float *wr = mod_w + (size_t)r * dim;\n"
+"        for (int j = 0; j < dim; j++) sum += wr[j] * silu_emb[j];\n"
+"        sum += mod_b   ? mod_b[r]   : 0.0f;\n"
+"        sum += blk_bias ? blk_bias[r] : 0.0f;\n"
+"        out[r] = sum;\n"
+"    }\n"
+"}\n\n"
+
+/* ---- timestep_embed_cossin_f32: sinusoidal embed [cos, sin] order ---- */
+/* TRELLIS.2 uses [cos, sin] order. dim must be even. */
+/* Grid: ceil(dim/2 / 256), Block: 256 */
+"__global__ void timestep_embed_cossin_f32(float *out, float t, int dim) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int half = dim / 2;\n"
+"    if (i >= half) return;\n"
+"    float exponent = -logf(10000.0f) * (float)i / (float)half;\n"
+"    float emb = expf(exponent) * t;\n"
+"    out[i]        = cosf(emb);\n"
+"    out[half + i] = sinf(emb);\n"
+"}\n\n"
+
+/* ---- silu_inplace_f32 ---- */
+"__global__ void silu_inplace_f32(float *x, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) x[i] = x[i] / (1.0f + expf(-x[i]));\n"
+"}\n\n"
+
+/* ---- gelu_inplace_f32 (for MLP FC1 of DiT) ---- */
+/* Tanh-approx GELU (PyTorch 'tanh' variant, matches CPU reference) */
+"__global__ void gelu_inplace_f32(float *x, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    float v = x[i];\n"
+"    float c = 0.7978845608f;  /* sqrt(2/pi) */\n"
+"    float t = tanhf(c * (v + 0.044715f * v * v * v));\n"
+"    x[i] = 0.5f * v * (1.0f + t);\n"
+"}\n\n"
+
+/* ---- split_qkv_chunk_f32: split [N, 3*W] by chunk -> Q,K,V [N, W] ---- */
+/* Grid: ceil(N*W/256), Block: 256 */
+"__global__ void split_qkv_chunk_f32(\n"
+"    float *Q, float *K, float *V,\n"
+"    const float *qkv, int N, int W) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = N * W;\n"
+"    if (idx >= total) return;\n"
+"    int n = idx / W;\n"
+"    int d = idx % W;\n"
+"    int base = n * 3 * W;\n"
+"    Q[idx] = qkv[base + d];\n"
+"    K[idx] = qkv[base + W + d];\n"
+"    V[idx] = qkv[base + 2*W + d];\n"
+"}\n\n"
+
+/* ---- split_kv_chunk_f32: split [M, 2*W] by chunk -> K,V [M, W] ---- */
+"__global__ void split_kv_chunk_f32(\n"
+"    float *K, float *V,\n"
+"    const float *kv, int M, int W) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = M * W;\n"
+"    if (idx >= total) return;\n"
+"    int n = idx / W;\n"
+"    int d = idx % W;\n"
+"    int base = n * 2 * W;\n"
+"    K[idx] = kv[base + d];\n"
+"    V[idx] = kv[base + W + d];\n"
+"}\n\n"
+
+/* ---- rms_norm_perhead_f32: per-head RMSNorm, gamma [n_heads * head_dim] ---- */
+/* CRITICAL: gamma index must be w[h*head_dim+i] NOT w[i] */
+/* Grid: ceil(N*n_heads/256), Block: 256 */
+"__global__ void rms_norm_perhead_f32(\n"
+"    float *data, const float *gamma,\n"
+"    int n_tok, int n_heads, int head_dim, int stride, float eps) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_tok * n_heads;\n"
+"    if (idx >= total) return;\n"
+"    int tok = idx / n_heads;\n"
+"    int h   = idx % n_heads;\n"
+"    float *v = data + (size_t)tok * stride + h * head_dim;\n"
+"    const float *g = gamma + h * head_dim;  /* correct per-head gamma */\n"
+"    float ss = 0;\n"
+"    for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];\n"
+"    float rms = rsqrtf(ss / head_dim + eps);\n"
+"    for (int i = 0; i < head_dim; i++) v[i] *= rms * g[i];\n"
+"}\n\n"
+
+/* ---- 3D RoPE for dense 16³ grid (complex-pair convention) ---- */
+/* TRELLIS.2: consecutive pairs (x[2k], x[2k+1]) rotated by phase[k].      */
+/* rope_cos/sin: [N, 3, n_freqs]. n_freqs=21 freqs per axis = 63 pairs/head */
+/* Grid: N, Block: 256 (one thread per head, n_heads=12) */
+"__global__ void rope_3d_f32(\n"
+"    float *data, const float *rope_cos, const float *rope_sin,\n"
+"    int N, int dim, int n_heads, int head_dim,\n"
+"    int n_freqs, int axis_dim) {\n"
+"    int tok = blockIdx.x;\n"
+"    if (tok >= N) return;\n"
+"    float *v = data + (size_t)tok * dim;\n"
+"    const float *cs = rope_cos + (size_t)tok * 3 * n_freqs;\n"
+"    const float *sn = rope_sin + (size_t)tok * 3 * n_freqs;\n"
+"    for (int h = threadIdx.x; h < n_heads; h += blockDim.x) {\n"
+"        float *vh = v + h * head_dim;\n"
+"        int pair = 0;\n"
+"        for (int axis = 0; axis < 3; axis++) {\n"
+"            const float *ca = cs + axis * n_freqs;\n"
+"            const float *sa = sn + axis * n_freqs;\n"
+"            for (int j = 0; j < n_freqs; j++, pair++) {\n"
+"                int idx = pair * 2;\n"
+"                float re = vh[idx], im = vh[idx + 1];\n"
+"                vh[idx]     = re * ca[j] - im * sa[j];\n"
+"                vh[idx + 1] = re * sa[j] + im * ca[j];\n"
+"            }\n"
+"        }\n"
+"        /* remaining pairs beyond 3*n_freqs: identity */\n"
+"    }\n"
+"}\n\n"
+
+/* ---- layernorm_noaffine_f32: LN without learned params ---- */
+/* Grid: N, Block: 256 */
+"__global__ void layernorm_noaffine_f32(\n"
+"    float *y, const float *x, int dim, float eps) {\n"
+"    int tok = blockIdx.x;\n"
+"    const float *xi = x + tok * dim;\n"
+"    float *yi = y + tok * dim;\n"
+"    extern __shared__ float smem[];\n"
+"    float sum = 0, sum2 = 0;\n"
+"    for (int i = threadIdx.x; i < dim; i += blockDim.x) {\n"
+"        float v = xi[i]; sum += v; sum2 += v * v;\n"
+"    }\n"
+"    smem[threadIdx.x] = sum; smem[threadIdx.x + 256] = sum2;\n"
+"    __syncthreads();\n"
+"    for (int s = 128; s > 0; s >>= 1) {\n"
+"        if (threadIdx.x < s) {\n"
+"            smem[threadIdx.x] += smem[threadIdx.x + s];\n"
+"            smem[threadIdx.x + 256] += smem[threadIdx.x + 256 + s];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float mean = smem[0] / dim;\n"
+"    float var  = smem[256] / dim - mean * mean;\n"
+"    float inv  = rsqrtf(var + eps);\n"
+"    for (int i = threadIdx.x; i < dim; i += blockDim.x)\n"
+"        yi[i] = (xi[i] - mean) * inv;\n"
+"}\n\n"
+
+/* ---- Flash self-attention (warp-cooperative FA2 for RDNA4 wave32) ---- */
+/* Q/K/V: [N, n_heads*head_dim]. Grid: (n_heads, ceil(N/FA_WARPS)), Block: FA_WARPS*32 */
+/* Shared memory: 2 * FA_BKV * FA_HD floats */
+"#define FA_WARPS 4\n"
+"#define FA_BKV  16\n"
+"#define FA_HD  128\n"
+"#define FA_EPT   4\n"
+"\n"
+"__global__ void flash_attn_sa_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ Q, const float *__restrict__ K,\n"
+"    const float *__restrict__ V,\n"
+"    int N, int n_heads, int head_dim) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int dim = n_heads * head_dim;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane    = threadIdx.x % 32;\n"
+"    int qi = blockIdx.y * FA_WARPS + warp_id;\n"
+"    float scale = rsqrtf((float)head_dim);\n"
+"    float q_r[FA_EPT];\n"
+"    for (int e = 0; e < FA_EPT; e++) {\n"
+"        int d = lane * FA_EPT + e;\n"
+"        q_r[e] = (qi < N && d < head_dim) ? Q[(long)qi*dim + h*head_dim + d] : 0.0f;\n"
+"    }\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O_r[FA_EPT];\n"
+"    for (int e = 0; e < FA_EPT; e++) O_r[e] = 0.0f;\n"
+"    extern __shared__ float smem[];\n"
+"    float *smK = smem, *smV = smem + FA_BKV * FA_HD;\n"
+"    int n_tiles = (N + FA_BKV - 1) / FA_BKV;\n"
+"    int n_threads = FA_WARPS * 32;\n"
+"    for (int tile = 0; tile < n_tiles; tile++) {\n"
+"        int kv_base = tile * FA_BKV;\n"
+"        for (int idx = threadIdx.x; idx < FA_BKV * FA_HD; idx += n_threads) {\n"
+"            int kj = idx / FA_HD, d = idx % FA_HD;\n"
+"            int kv_tok = kv_base + kj;\n"
+"            smK[idx] = (kv_tok < N) ? K[(long)kv_tok*dim + h*head_dim + d] : 0.0f;\n"
+"            smV[idx] = (kv_tok < N) ? V[(long)kv_tok*dim + h*head_dim + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int kj = 0; kj < FA_BKV; kj++) {\n"
+"            float dot = 0.0f;\n"
+"            for (int e = 0; e < FA_EPT; e++)\n"
+"                dot += q_r[e] * smK[kj*FA_HD + lane*FA_EPT + e];\n"
+"            for (int off = 16; off > 0; off >>= 1)\n"
+"                dot += __shfl_xor(dot, off);\n"
+"            float score = (kv_base + kj < N) ? dot * scale : -1e30f;\n"
+"            float new_max = fmaxf(m_i, score);\n"
+"            float alpha = expf(m_i - new_max);\n"
+"            float p = expf(score - new_max);\n"
+"            l_i = l_i * alpha + p;\n"
+"            for (int e = 0; e < FA_EPT; e++)\n"
+"                O_r[e] = O_r[e] * alpha + p * smV[kj*FA_HD + lane*FA_EPT + e];\n"
+"            m_i = new_max;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (qi < N) {\n"
+"        float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;\n"
+"        for (int e = 0; e < FA_EPT; e++) {\n"
+"            int d = lane * FA_EPT + e;\n"
+"            if (d < head_dim)\n"
+"                out[(long)qi*dim + h*head_dim + d] = O_r[e] * inv_l;\n"
+"        }\n"
+"    }\n"
+"}\n\n"
+
+/* ---- Cross-attention (tiled scalar, online softmax) ---- */
+/* Q: [q_len, dim], K/V: [kv_len, dim]. No RoPE. No gate (direct residual). */
+/* Grid: (n_heads, q_len), Block: 128. Processes KV in tiles of 32. */
+"__global__ void cross_attn_tiled_f32(float *out,\n"
+"    const float *Q, const float *K, const float *V,\n"
+"    int q_len, int kv_len, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qi = blockIdx.y;\n"
+"    if (h >= n_heads || qi >= q_len) return;\n"
+"    const float *q = Q + qi * dim + h * head_dim;\n"
+"    float running_max = -1e30f, running_sum = 0.0f;\n"
+"    float acc[128];\n"
+"    for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;\n"
+"    for (int ki_base = 0; ki_base < kv_len; ki_base += 32) {\n"
+"        int tile_end = ki_base + 32;\n"
+"        if (tile_end > kv_len) tile_end = kv_len;\n"
+"        float tile_max = -1e30f;\n"
+"        float scores[32];\n"
+"        for (int j = 0; j < tile_end - ki_base; j++) {\n"
+"            const float *k = K + (ki_base + j) * dim + h * head_dim;\n"
+"            float dot = 0;\n"
+"            for (int d = 0; d < head_dim; d++) dot += q[d] * k[d];\n"
+"            scores[j] = dot * scale;\n"
+"            if (scores[j] > tile_max) tile_max = scores[j];\n"
+"        }\n"
+"        float new_max = fmaxf(running_max, tile_max);\n"
+"        float correction = expf(running_max - new_max);\n"
+"        running_sum *= correction;\n"
+"        for (int d = 0; d < head_dim; d++) acc[d] *= correction;\n"
+"        for (int j = 0; j < tile_end - ki_base; j++) {\n"
+"            float w = expf(scores[j] - new_max);\n"
+"            running_sum += w;\n"
+"            const float *v = V + (ki_base + j) * dim + h * head_dim;\n"
+"            for (int d = 0; d < head_dim; d++) acc[d] += w * v[d];\n"
+"        }\n"
+"        running_max = new_max;\n"
+"    }\n"
+"    float inv = (running_sum > 0) ? 1.0f / running_sum : 0.0f;\n"
+"    float *o = out + qi * dim + h * head_dim;\n"
+"    for (int d = 0; d < head_dim; d++) o[d] = acc[d] * inv;\n"
+"}\n\n"
+
+/* ---- Dense Conv3D k=3 pad=1 stride=1 ---- */
+/* input: [Ci, D, H, W], weight: [Co, Ci, 3, 3, 3], bias: [Co], out: [Co, D, H, W] */
+/* Grid: (Co, ceil(D*H*W/64)), Block: 64 */
+"__global__ void conv3d_k3_f32(\n"
+"    float *out, const float *inp, const float *weight, const float *bias,\n"
+"    int Ci, int Co, int D, int H, int W) {\n"
+"    int co = blockIdx.x;\n"
+"    int spatial_idx = blockIdx.y * blockDim.x + threadIdx.x;\n"
+"    int spatial = D * H * W;\n"
+"    if (co >= Co || spatial_idx >= spatial) return;\n"
+"    int d = spatial_idx / (H * W);\n"
+"    int h = (spatial_idx / W) % H;\n"
+"    int w = spatial_idx % W;\n"
+"    float sum = bias ? bias[co] : 0.0f;\n"
+"    for (int ci = 0; ci < Ci; ci++) {\n"
+"        const float *kern = weight + ((size_t)co * Ci + ci) * 27;\n"
+"        for (int kd = 0; kd < 3; kd++) {\n"
+"            int dd = d + kd - 1;\n"
+"            if (dd < 0 || dd >= D) continue;\n"
+"            for (int kh = 0; kh < 3; kh++) {\n"
+"                int hh = h + kh - 1;\n"
+"                if (hh < 0 || hh >= H) continue;\n"
+"                for (int kw = 0; kw < 3; kw++) {\n"
+"                    int ww = w + kw - 1;\n"
+"                    if (ww < 0 || ww >= W) continue;\n"
+"                    sum += kern[kd*9 + kh*3 + kw]\n"
+"                         * inp[(size_t)ci*spatial + dd*H*W + hh*W + ww];\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    out[(size_t)co * spatial + spatial_idx] = sum;\n"
+"}\n\n"
+
+/* ---- Channel LayerNorm 3D: normalize across C per spatial position ---- */
+/* ChannelLayerNorm over C channels per spatial position. Input: [C,D,H,W]. */
+/* Grid: spatial, Block: 256. G arg retained for ABI compat (unused). */
+"__global__ void channel_layernorm_3d_f32(\n"
+"    float *dst, const float *src, const float *w, const float *b,\n"
+"    int C, int spatial, int G) {\n"
+"    int s = blockIdx.x;\n"
+"    if (s >= spatial) return;\n"
+"    extern __shared__ float smem[];\n"
+"    float sum = 0, sum2 = 0;\n"
+"    for (int c = threadIdx.x; c < C; c += blockDim.x) {\n"
+"        float v = src[((size_t)c) * spatial + s];\n"
+"        sum += v; sum2 += v * v;\n"
+"    }\n"
+"    smem[threadIdx.x] = sum;\n"
+"    smem[threadIdx.x + 256] = sum2;\n"
+"    __syncthreads();\n"
+"    for (int r = 128; r > 0; r >>= 1) {\n"
+"        if (threadIdx.x < r) {\n"
+"            smem[threadIdx.x] += smem[threadIdx.x + r];\n"
+"            smem[threadIdx.x + 256] += smem[threadIdx.x + 256 + r];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float mean = smem[0] / (float)C;\n"
+"    float var  = smem[256] / (float)C - mean * mean;\n"
+"    float inv  = rsqrtf(var + 1e-5f);\n"
+"    for (int c = threadIdx.x; c < C; c += blockDim.x) {\n"
+"        size_t idx = ((size_t)c) * spatial + s;\n"
+"        float v = (src[idx] - mean) * inv;\n"
+"        float wc = w ? w[c] : 1.0f;\n"
+"        float bc = b ? b[c] : 0.0f;\n"
+"        dst[idx] = v * wc + bc;\n"
+"    }\n"
+"}\n\n"
+
+/* ---- pixel_shuffle_3d: [C*8, D, H, W] -> [C, 2D, 2H, 2W] ---- */
+/* factor=2 upsampling by rearranging 8 sub-channels into 2x spatial dims  */
+/* Grid: ceil(total/256), Block: 256 where total = C * 2D * 2H * 2W */
+"__global__ void pixel_shuffle_3d_f32(\n"
+"    float *dst, const float *src, int C, int D, int H, int W) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int D2 = 2*D, H2 = 2*H, W2 = 2*W;\n"
+"    int total = C * D2 * H2 * W2;\n"
+"    if (idx >= total) return;\n"
+"    int c = idx / (D2 * H2 * W2);\n"
+"    int rem = idx % (D2 * H2 * W2);\n"
+"    int od = rem / (H2 * W2);\n"
+"    rem = rem % (H2 * W2);\n"
+"    int oh = rem / W2;\n"
+"    int ow = rem % W2;\n"
+"    int d = od / 2, sd = od % 2;\n"
+"    int h = oh / 2, sh = oh % 2;\n"
+"    int w = ow / 2, sw = ow % 2;\n"
+"    int src_ch = c * 8 + (sd * 2 + sh) * 2 + sw;\n"
+"    int spatial_in = D * H * W;\n"
+"    dst[idx] = src[(size_t)src_ch * spatial_in + d*H*W + h*W + w];\n"
+"}\n\n"
+
+/* ---- Euler step: x = x - (t_cur - t_prev) * v ---- */
+/* Grid: ceil(n/256), Block: 256 */
+"__global__ void euler_step_f32(\n"
+"    float *x, const float *v, float dt, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) x[i] -= dt * v[i];\n"
+"}\n\n"
+
+/* ---- CFG combine + rescale ---- */
+/* v_pos, v_neg: [n], v_out: [n]                                                 */
+/* cfg=7.5, rescale=0.7. First does CFG, then std-ratio rescaling.               */
+/* x0_pos = (1-smin)*x - (smin + (1-smin)*t)*v_pos (for std computation)        */
+/* For simplicity, caller passes v_pos, v_neg, x, t, sigma_min separately.      */
+/* This kernel does: v_cfg = cfg*v_pos + (1-cfg)*v_neg, then rescale.            */
+/* Grid: ceil(n/256), Block: 256. Rescaling done per-batch element (N=n).        */
+"__global__ void cfg_combine_f32(\n"
+"    float *v_out, const float *v_pos, const float *v_neg,\n"
+"    float cfg, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) v_out[i] = cfg * v_pos[i] + (1.0f - cfg) * v_neg[i];\n"
+"}\n\n"
+
+/* ---- Compute x0 from x and v: x0 = (1-smin)*x - (smin+(1-smin)*t)*v ---- */
+"__global__ void compute_x0_f32(\n"
+"    float *x0, const float *x, const float *v, float t, float sigma_min, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    float a = 1.0f - sigma_min;\n"
+"    float b = sigma_min + a * t;\n"
+"    x0[i] = a * x[i] - b * v[i];\n"
+"}\n\n"
+
+/* ---- CFG rescale: v_out = rescale*(v_cfg*std_pos/std_cfg) + (1-rescale)*v_cfg ---- */
+/* std_pos, std_cfg: scalars (pre-computed on host or by reduce kernel) */
+"__global__ void cfg_rescale_f32(\n"
+"    float *v_out, const float *v_cfg, const float *x0_pos, const float *x0_cfg,\n"
+"    float rescale, float t, float sigma_min, int n) {\n"
+"    /* Compute std_pos and std_cfg via shared reduction */\n"
+"    extern __shared__ float smem[];\n"
+"    float ss_pos = 0, ss_cfg = 0;\n"
+"    float mp = 0, mc = 0;\n"
+"    /* Pass 1: compute means */\n"
+"    for (int i = threadIdx.x; i < n; i += blockDim.x) { mp += x0_pos[i]; mc += x0_cfg[i]; }\n"
+"    smem[threadIdx.x] = mp; smem[threadIdx.x + 256] = mc;\n"
+"    __syncthreads();\n"
+"    for (int s = 128; s > 0; s >>= 1) { if (threadIdx.x < s) { smem[threadIdx.x]+=smem[threadIdx.x+s]; smem[256+threadIdx.x]+=smem[256+threadIdx.x+s]; } __syncthreads(); }\n"
+"    float mean_p = smem[0] / n, mean_c = smem[256] / n;\n"
+"    __syncthreads();\n"
+"    /* Pass 2: compute vars */\n"
+"    for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
+"        float dp = x0_pos[i] - mean_p, dc = x0_cfg[i] - mean_c;\n"
+"        ss_pos += dp*dp; ss_cfg += dc*dc;\n"
+"    }\n"
+"    smem[threadIdx.x] = ss_pos; smem[threadIdx.x + 256] = ss_cfg;\n"
+"    __syncthreads();\n"
+"    for (int s = 128; s > 0; s >>= 1) { if (threadIdx.x < s) { smem[threadIdx.x]+=smem[threadIdx.x+s]; smem[256+threadIdx.x]+=smem[256+threadIdx.x+s]; } __syncthreads(); }\n"
+"    float std_pos = sqrtf(smem[0] / (n - 1.0f) + 1e-30f);\n"
+"    float std_cfg = sqrtf(smem[256] / (n - 1.0f) + 1e-30f);\n"
+"    float ratio = (std_cfg > 0) ? std_pos / std_cfg : 1.0f;\n"
+"    __syncthreads();\n"
+"    /* Recompute v_cfg from x0_cfg: v = ((1-smin)*x - x0) / (smin+(1-smin)*t) */\n"
+"    /* But we don't have x here; caller should pass the already-combined v_cfg. */\n"
+"    /* Just apply: v_out = rescale*(v_cfg*ratio) + (1-rescale)*v_cfg            */\n"
+"    for (int i = threadIdx.x; i < n; i += blockDim.x)\n"
+"        v_out[i] = rescale * v_cfg[i] * ratio + (1.0f - rescale) * v_cfg[i];\n"
+"}\n\n"
+
+/* ---- broadcast_bias_f32: out[tok*C + c] += bias[c] ---- */
+"__global__ void broadcast_bias_f32(float *out, const float *bias, int N, int C) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (idx >= N * C) return;\n"
+"    if (bias) out[idx] += bias[idx % C];\n"
+"}\n\n"
+
+/* Close extern "C" opened by hip_kernels_common_src */
+"} /* close extern C */\n"
+; /* end kernel source string */
+
+#endif /* HIP_TRELLIS2_KERNELS_H */
