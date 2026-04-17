@@ -103,7 +103,9 @@ struct hip_trellis2_runner {
     hipModule_t mod;
 
     /* GEMM and common ops (from hip_kernels_common_src) */
-    hipFunction_t fn_gemm;           /* gemm_tiled_f32_f32 */
+    hipFunction_t fn_gemm;           /* gemm_tiled_f32_f32 (scalar F32 fallback) */
+    hipFunction_t fn_gemm_wmma;      /* gemm_bf16w_bf16a_wmma_t (gfx12 only) */
+    int use_wmma;                    /* 1 iff WMMA kernel is loaded & enabled */
     hipFunction_t fn_layernorm;      /* layernorm_f32 */
 
     /* TRELLIS.2-specific ops */
@@ -119,8 +121,10 @@ struct hip_trellis2_runner {
     hipFunction_t fn_rms_norm_ph;
     hipFunction_t fn_rope_3d;
     hipFunction_t fn_ln_noaffine;
-    hipFunction_t fn_flash_sa;       /* flash_attn_sa_f32 */
-    hipFunction_t fn_cross_attn;     /* cross_attn_tiled_f32 */
+    hipFunction_t fn_flash_sa;       /* flash_attn_sa_f32 (scalar fallback) */
+    hipFunction_t fn_flash_sa_wmma;  /* flash_attn_sa_wmma_f32 (gfx12) */
+    hipFunction_t fn_cross_attn;     /* cross_attn_tiled_f32 (scalar fallback) */
+    hipFunction_t fn_cross_attn_wmma;/* cross_attn_wmma_f32 (gfx12) */
     hipFunction_t fn_broadcast_bias;
 
     /* Decoder ops */
@@ -372,7 +376,17 @@ static void compute_rope_phases(int grid, int n_freqs,
 
 static int gemm(hip_trellis2_runner *r, void *Y, const void *W, const void *X,
                 const void *bias, int n_out, int n_in, int n_tok) {
-    /* Grid: (ceil(n_out/64), ceil(n_tok/16)), Block: (16,16) */
+    /* BF16 WMMA path: n_tok, n_in, n_out all multiples of 16 (padded rounding ok
+     * because the kernel guards row/col bounds). Requires gfx12 + kernel loaded. */
+    if (r->use_wmma && n_tok >= 16 && n_in >= 16 &&
+        (n_out % 16) == 0 && (n_in % 16) == 0) {
+        int gdx = (n_out + 127) / 128;
+        int gdy = (n_tok + 127) / 128;
+        void *args[] = { &Y, &W, &X, &bias, &n_out, &n_in, &n_tok };
+        return hipModuleLaunchKernel(r->fn_gemm_wmma,
+            gdx, gdy, 1, 256, 1, 1, 0, 0, args, NULL) == hipSuccess ? 0 : -1;
+    }
+    /* Scalar F32 fallback: Grid (ceil(n_out/64), ceil(n_tok/16)), Block (16,16) */
     int gdx = (n_out + 63) / 64;
     int gdy = (n_tok + 15) / 16;
     void *args[] = { &Y, &W, &X, &bias, &n_out, &n_in, &n_tok };
@@ -457,6 +471,33 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
     LOAD_FN(fn_compute_x0,   "compute_x0_f32");
     LOAD_FN(fn_cfg_rescale,  "cfg_rescale_f32");
 #undef LOAD_FN
+
+    /* Optional: BF16 WMMA kernels (gfx1200/gfx1201 only). Missing on other
+     * archs is not an error — we fall back to scalar F32 paths. */
+    r->use_wmma = 0;
+    if (hipModuleGetFunction(&r->fn_gemm_wmma, r->mod, "gemm_bf16w_bf16a_wmma_t") == hipSuccess) {
+        const char *env = getenv("T2_WMMA");
+        if (!env || strcmp(env, "0") != 0) {
+            r->use_wmma = 1;
+            fprintf(stderr, "T2-HIP: BF16 WMMA GEMM enabled (gfx12 matrix cores)\n");
+        } else {
+            fprintf(stderr, "T2-HIP: BF16 WMMA GEMM disabled by T2_WMMA=0\n");
+        }
+    } else {
+        fprintf(stderr, "T2-HIP: BF16 WMMA GEMM not available (non-gfx12 arch); using F32 fallback\n");
+    }
+    if (hipModuleGetFunction(&r->fn_flash_sa_wmma, r->mod, "flash_attn_sa_wmma_f32") != hipSuccess) {
+        r->fn_flash_sa_wmma = NULL;
+        fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn not available; using scalar FA\n");
+    } else if (r->use_wmma) {
+        fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn enabled\n");
+    }
+    if (hipModuleGetFunction(&r->fn_cross_attn_wmma, r->mod, "cross_attn_wmma_f32") != hipSuccess) {
+        r->fn_cross_attn_wmma = NULL;
+        fprintf(stderr, "T2-HIP: BF16 WMMA cross-attn not available; using scalar CA\n");
+    } else if (r->use_wmma) {
+        fprintf(stderr, "T2-HIP: BF16 WMMA cross-attn enabled\n");
+    }
 
     fprintf(stderr, "T2-HIP: all %d kernels loaded OK\n", 24);
 
@@ -743,19 +784,24 @@ static void run_rope_3d(hip_trellis2_runner *r, void *data, int N) {
     hipModuleLaunchKernel(r->fn_rope_3d, N, 1, 1, 256, 1, 1, 0, 0, args, NULL);
 }
 
-/* flash_attn_sa_f32: warp-cooperative FA2 self-attention */
+/* Self-attention dispatch: prefers gfx12 BF16 WMMA kernel when eligible. */
 static void run_flash_sa(hip_trellis2_runner *r, void *out,
                           const void *Q, const void *K, const void *V, int N) {
     int n_heads  = DIT_HEADS;
     int head_dim = DIT_HEAD_DIM;
+    void *args[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim};
+    if (r->use_wmma && r->fn_flash_sa_wmma && head_dim == 128 && (N % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma, n_heads, N / 64, 1, 128, 1, 1,
+                              0, 0, args, NULL);
+        return;
+    }
     int gY = (N + 3) / 4;  /* FA_WARPS=4 */
     size_t smem = 2 * 16 * 128 * sizeof(float);  /* FA_BKV=16, FA_HD=128 */
-    void *args[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim};
     hipModuleLaunchKernel(r->fn_flash_sa, DIT_HEADS, gY, 1, 128, 1, 1,
                           smem, 0, args, NULL);
 }
 
-/* cross_attn_tiled_f32 */
+/* Cross-attention dispatch: WMMA path when eligible. */
 static void run_cross_attn(hip_trellis2_runner *r, void *out,
                              const void *Q, const void *K, const void *V,
                              int q_len, int kv_len) {
@@ -764,6 +810,11 @@ static void run_cross_attn(hip_trellis2_runner *r, void *out,
     int n_heads  = DIT_HEADS;
     int head_dim = DIT_HEAD_DIM;
     void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale};
+    if (r->use_wmma && r->fn_cross_attn_wmma && head_dim == 128 && (q_len % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_cross_attn_wmma, n_heads, q_len / 64, 1, 128, 1, 1,
+                              0, 0, args, NULL);
+        return;
+    }
     hipModuleLaunchKernel(r->fn_cross_attn, DIT_HEADS, q_len, 1, 128, 1, 1,
                           0, 0, args, NULL);
 }
