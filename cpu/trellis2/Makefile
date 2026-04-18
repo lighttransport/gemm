@@ -54,10 +54,13 @@ HEADERS = $(wildcard $(COMMON)/*.h)
 
 .PHONY: all clean
 
-all: test_trellis2
+all: test_trellis2 test_tex_dec
 
 test_trellis2: test_trellis2.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
 
+test_tex_dec: test_tex_dec.c $(HEADERS)
+	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f test_trellis2
+	rm -f test_trellis2 test_tex_dec
