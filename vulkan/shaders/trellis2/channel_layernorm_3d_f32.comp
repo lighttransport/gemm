@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: MIT
+// Channel LayerNorm 3D: normalize across C at each spatial position
+// Input: [C, D, H, W] (NCDHW batch=1). w, b: [C]
+// Grid: (ceil(spatial/256), 1, 1), workgroup: (256, 1, 1)
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DstBuffer { float dst[]; };
+layout(std430, binding = 1) readonly buffer SrcBuffer { float src[]; };
+layout(std430, binding = 2) readonly buffer WBuffer { float w_buf[]; };
+layout(std430, binding = 3) readonly buffer BBuffer { float b_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint spatial;
+    uint has_wb;
+} pc;
+
+void main() {
+    uint s = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    if (s >= pc.spatial) return;
+
+    // Compute mean and variance over channel dimension
+    float sum = 0.0, sum2 = 0.0;
+    for (uint c = 0; c < pc.C; c++) {
+        float v = src[c * pc.spatial + s];
+        sum += v;
+        sum2 += v * v;
+    }
+    float mean = sum / float(pc.C);
+    float var = sum2 / float(pc.C) - mean * mean;
+    float inv = inversesqrt(var + 1e-5);
+
+    // Normalize and apply affine
+    for (uint c = 0; c < pc.C; c++) {
+        float v = (src[c * pc.spatial + s] - mean) * inv;
+        if (pc.has_wb != 0) {
+            v = v * w_buf[c] + b_buf[c];
+        }
+        dst[c * pc.spatial + s] = v;
+    }
+}
