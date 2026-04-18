@@ -76,6 +76,34 @@ void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable);
  *            "<prefix>_<step:03d>.obj" alongside SDF-range stats. */
 void cuda_hy3d_set_dump(cuda_hy3d_runner *r, int every, int grid, const char *prefix);
 
+/* Per-step latent dumping for DiT trajectory checks.
+ *   steps_csv : comma-separated 1-based step list (e.g. "1,15,30"), or NULL to disable
+ *   prefix    : output filename prefix; dumps are written as
+ *               "<prefix>_<step:03d>.npy" (shape [4096,64], f32). */
+void cuda_hy3d_set_latent_dump(cuda_hy3d_runner *r, const char *steps_csv, const char *prefix);
+
+/* Per-step DiT velocity dumping for trajectory checks.
+ *   steps_csv : comma-separated 1-based step list (e.g. "1,15,30"), or NULL to disable
+ *   prefix    : output filename prefix; dumps are written as
+ *               "<prefix>_<step:03d>.npy" (shape [4096,64], f32). */
+void cuda_hy3d_set_velocity_dump(cuda_hy3d_runner *r, const char *steps_csv, const char *prefix);
+
+/* Override initial DiT noise latents for deterministic trajectory checks.
+ *   latents: host pointer to [4096,64] f32 values (copied internally)
+ *   n:       number of elements, must be 4096*64
+ * Returns 0 on success. */
+int cuda_hy3d_set_init_latents(cuda_hy3d_runner *r, const float *latents, int n);
+
+/* Override DiT CFG contexts for deterministic trajectory checks.
+ *   cond:   host pointer to conditional context [1370,1024] f32
+ *   uncond: optional host pointer to unconditional context [1370,1024] f32 (NULL => zeros)
+ *   n:      number of elements per context, must be 1370*1024
+ * Returns 0 on success. */
+int cuda_hy3d_set_init_contexts(cuda_hy3d_runner *r,
+                                const float *cond,
+                                const float *uncond,
+                                int n);
+
 /* Free runner and all GPU resources */
 void cuda_hy3d_free(cuda_hy3d_runner *r);
 

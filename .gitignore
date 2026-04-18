@@ -80,5 +80,6 @@ cpu/sparse3d/c_output/
 cpu/sparse3d/.venv/
 
 # External / generated
-ref/
+ref/*
+!ref/hy3d/
 result/

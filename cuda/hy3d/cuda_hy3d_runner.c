@@ -25,6 +25,7 @@
 #include "cuda_hy3d_runner.h"
 #include "../cuew.h"
 #include "../cuda_kernels_common.h"
+#include "../cuda_rng.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 
@@ -72,6 +73,114 @@ static void hy3d_dbg_dump_npy(CUstream stream, CUdeviceptr d_buf,
     free(h);
 }
 
+static void hy3d_write_npy_f32_2d(const char *path, const float *buf, int rows, int cols) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    static const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t ver[2] = {1, 0}; fwrite(ver, 1, 2, f);
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", rows, cols);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(hdr, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(buf, sizeof(float), (size_t)rows * (size_t)cols, f);
+    fclose(f);
+}
+
+static float hy3d_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    union { uint32_t u; float f; } out;
+    if (exp == 0) {
+        if (mant == 0) {
+            out.u = sign;
+            return out.f;
+        }
+        while ((mant & 0x400u) == 0) {
+            mant <<= 1;
+            exp--;
+        }
+        mant &= 0x3FFu;
+        exp = 1;
+    } else if (exp == 0x1Fu) {
+        out.u = sign | 0x7F800000u | (mant << 13);
+        return out.f;
+    }
+    exp = exp + (127u - 15u);
+    out.u = sign | (exp << 23) | (mant << 13);
+    return out.f;
+}
+
+static void hy3d_make_dbg_name(char *dst, size_t dst_sz,
+                               const char *base, const char *pass_tag) {
+    if (pass_tag && *pass_tag) snprintf(dst, dst_sz, "%s_%s.npy", base, pass_tag);
+    else snprintf(dst, dst_sz, "%s.npy", base);
+}
+
+static void hy3d_dbg_dump_tagged_npy(CUstream stream, CUdeviceptr d_buf,
+                                     int rows, int cols,
+                                     const char *base, const char *pass_tag) {
+    char fname[256];
+    hy3d_make_dbg_name(fname, sizeof(fname), base, pass_tag);
+    hy3d_dbg_dump_npy(stream, d_buf, rows, cols, fname);
+}
+
+static void cpu_gemm_f32(float *Y, const float *W, const float *X,
+                         int n_out, int n_in, int n_tok) {
+    for (int t = 0; t < n_tok; t++) {
+        const float *x = X + (size_t)t * n_in;
+        float *y = Y + (size_t)t * n_out;
+        for (int o = 0; o < n_out; o++) {
+            const float *w = W + (size_t)o * n_in;
+            float acc = 0.0f;
+            for (int i = 0; i < n_in; i++) acc += w[i] * x[i];
+            y[o] = acc;
+        }
+    }
+}
+
+static void cpu_dump_npy_f32_2d(const char *path, const float *buf, int rows, int cols) {
+    hy3d_write_npy_f32_2d(path, buf, rows, cols);
+}
+
+static int hy3d_copy_gemm_weights_to_host_f32(float *dst, CUdeviceptr d_w,
+                                              int n_out, int n_in, int use_f32_gemm) {
+    size_t n = (size_t)n_out * (size_t)n_in;
+    if (use_f32_gemm) {
+        return cuMemcpyDtoH(dst, d_w, n * sizeof(float)) == CUDA_SUCCESS ? 0 : -1;
+    }
+    uint16_t *tmp = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!tmp) return -1;
+    if (cuMemcpyDtoH(tmp, d_w, n * sizeof(uint16_t)) != CUDA_SUCCESS) {
+        free(tmp);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) dst[i] = hy3d_f16_to_f32(tmp[i]);
+    free(tmp);
+    return 0;
+}
+
+static void hy3d_dump_latent(CUstream stream, CUdeviceptr d_latents,
+                             int rows, int cols, const char *prefix, int step1) {
+    if (!prefix || !*prefix) return;
+    size_t n = (size_t)rows * (size_t)cols;
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) return;
+    cuStreamSynchronize(stream);
+    cuMemcpyDtoH(h, d_latents, n * sizeof(float));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%03d.npy", prefix, step1);
+    hy3d_write_npy_f32_2d(path, h, rows, cols);
+    free(h);
+}
+
 /* ======================================================================== */
 /* Model constants                                                          */
 /* ======================================================================== */
@@ -111,6 +220,8 @@ static void hy3d_dbg_dump_npy(CUstream stream, CUdeviceptr d_buf,
 #define VAE_NUM_FREQS    8
 #define VAE_FOURIER_DIM  51   /* 3*(2*8+1) */
 
+#define HY3D_MAX_LATENT_DUMP_STEPS 64
+
 /* ======================================================================== */
 /* Internal structures                                                      */
 /* ======================================================================== */
@@ -136,10 +247,12 @@ typedef struct {
     CUdeviceptr sa_qkv_w;              /* [3*2048, 2048] = concat(to_q.w, to_k.w, to_v.w) */
     CUdeviceptr sa_out_w, sa_out_b;
     CUdeviceptr sa_q_norm_w, sa_k_norm_w;  /* RMSNorm weight only */
-    /* Cross-attention — Q separate (from hidden), K/V fused (from context) */
+    /* Cross-attention — Q/K/V separate to mirror the PyTorch reference
+     * exactly before any view/split reshaping. */
     CUdeviceptr norm2_w, norm2_b;
     CUdeviceptr ca_q_w;                /* [2048, 2048] */
-    CUdeviceptr ca_kv_w;              /* [2*2048, 1024] = concat(to_k.w, to_v.w) */
+    CUdeviceptr ca_k_w;                /* [2048, 1024] */
+    CUdeviceptr ca_v_w;                /* [2048, 1024] */
     CUdeviceptr ca_out_w, ca_out_b;
     CUdeviceptr ca_q_norm_w, ca_k_norm_w;
     /* Norm3 + MLP/MoE */
@@ -236,6 +349,17 @@ struct cuda_hy3d_runner {
     int dump_every;
     int dump_grid;        /* grid resolution for intermediate dumps */
     char dump_prefix[512];
+    int latent_dump_count;
+    int latent_dump_steps[HY3D_MAX_LATENT_DUMP_STEPS];  /* 1-based diffusion steps */
+    char latent_dump_prefix[512];
+    int velocity_dump_count;
+    int velocity_dump_steps[HY3D_MAX_LATENT_DUMP_STEPS];
+    char velocity_dump_prefix[512];
+    float *init_latents;      /* host-side [4096,64] override */
+    int init_latents_n;
+    float *init_ctx_cond;     /* host-side [1370,1024] override */
+    float *init_ctx_uncond;   /* host-side [1370,1024] override (optional) */
+    int init_ctx_n;
 
     /* Pre-computed cross-attention K,V for DiT (constant across diffusion steps) */
     CUdeviceptr dit_ca_K[DIT_DEPTH];   /* [DINO_SEQ_LEN, DIT_HIDDEN] */
@@ -245,6 +369,20 @@ struct cuda_hy3d_runner {
     /* Load status */
     int dino_loaded, dit_loaded, vae_loaded;
 };
+
+static int hy3d_should_dump_latent(const struct cuda_hy3d_runner *r, int step1) {
+    for (int i = 0; i < r->latent_dump_count; i++) {
+        if (r->latent_dump_steps[i] == step1) return 1;
+    }
+    return 0;
+}
+
+static int hy3d_should_dump_velocity(const struct cuda_hy3d_runner *r, int step1) {
+    for (int i = 0; i < r->velocity_dump_count; i++) {
+        if (r->velocity_dump_steps[i] == step1) return 1;
+    }
+    return 0;
+}
 
 /* ======================================================================== */
 /* Kernel compilation                                                       */
@@ -611,13 +749,8 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
         DIT_F32(norm2_w,     "norm2.weight");
         DIT_F32(norm2_b,     "norm2.bias");
         DIT_GW(ca_q_w,      "attn2.to_q.weight");
-        /* Fuse K/V weights for correct head interleaving */
-        {
-            char nk[256], nv[256];
-            snprintf(nk, sizeof(nk), "blocks.%d.attn2.to_k.weight", i);
-            snprintf(nv, sizeof(nv), "blocks.%d.attn2.to_v.weight", i);
-            b->ca_kv_w = st_fuse_2_gemm_w(st, nk, nv, f32g, r->verbose);
-        }
+        DIT_GW(ca_k_w,      "attn2.to_k.weight");
+        DIT_GW(ca_v_w,      "attn2.to_v.weight");
         DIT_GW(ca_out_w,    "attn2.out_proj.weight");
         DIT_F32(ca_out_b,    "attn2.out_proj.bias");
         DIT_F32(ca_q_norm_w, "attn2.q_norm.weight");
@@ -1037,7 +1170,7 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
  * Output: d_output [4096, 64] F32 */
 static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
                              float timestep, CUdeviceptr d_context,
-                             CUdeviceptr d_output) {
+                             CUdeviceptr d_output, const char *pass_tag) {
     hy3d_ops *ops = &r->ops;
     CUstream stream = r->stream;
     const int N = DIT_INPUT_SIZE;       /* 4096 */
@@ -1170,6 +1303,10 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         free(hcpu);
     }
 
+    if (r->verbose > 1)
+        hy3d_dbg_dump_tagged_npy(stream, d_context, ctx_len, DIT_CONTEXT_DIM,
+                                 "cuda_dit_context", pass_tag);
+
     /* Skip value stack pointer: blocks 0..DIT_HALF_DEPTH save hidden states */
     int skip_sp = 0;
 
@@ -1215,6 +1352,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
          * fused QKV weight [3*dim, dim] = concat(to_q.w, to_k.w, to_v.w) and
          * computing a single GEMM → [N1, 3*dim], then split_qkv_interleaved. */
         op_layernorm(ops, stream, d_normed, d_hidden, blk->norm1_w, blk->norm1_b, N1, H_dim);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_norm1", pass_tag);
+        }
 
         /* Fused QKV GEMM: [N1, dim] @ [3*dim, dim]^T → [N1, 3*dim] */
         op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, 0, 3 * H_dim, H_dim, N1);
@@ -1259,6 +1399,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             op_rms_norm(ops, stream, d_Q, blk->sa_q_norm_w, N1, heads, hd, H_dim);
         if (blk->sa_k_norm_w)
             op_rms_norm(ops, stream, d_K, blk->sa_k_norm_w, N1, heads, hd, H_dim);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_attn1_in", pass_tag);
+        }
 
         if (r->verbose > 1 && bi == 0) {
             cuStreamSynchronize(stream);
@@ -1280,6 +1423,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N1, H_dim, heads, hd);
 
         op_gemm(ops, stream, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b, H_dim, H_dim, N1);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_attn1_out", pass_tag);
+        }
         op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
 
         if (r->verbose > 1 && bi == 0) {
@@ -1314,36 +1460,113 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
 
         /* === Cross-attention === */
         op_layernorm(ops, stream, d_normed, d_hidden, blk->norm2_w, blk->norm2_b, N1, H_dim);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_norm2", pass_tag);
+        }
 
         /* Q from hidden */
         op_gemm(ops, stream, d_cross_Q, blk->ca_q_w, d_normed, 0, H_dim, H_dim, N1);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_cross_Q, N1, H_dim,
+                                     "cuda_b0_attn2_to_q_raw", pass_tag);
+        }
         if (blk->ca_q_norm_w)
             op_rms_norm(ops, stream, d_cross_Q, blk->ca_q_norm_w, N1, heads, hd, H_dim);
-
-        /* Fused KV from context: cat(to_k(ctx), to_v(ctx)) → view(H, 2*HD) → split
-         * PyTorch: kv=cat(k,v)→view(1,-1,H,2*HD)→split → k,v each [ctx_len, H, HD]
-         * Fused weight ca_kv_w = [2*dim, ctx_dim] */
-        {
-            /* Compute fused KV → d_qkv (reuse, large enough: 2*ctx*dim < 3*N1*dim) */
-            op_gemm(ops, stream, d_qkv, blk->ca_kv_w, d_context, 0,
-                    2 * H_dim, DIT_CONTEXT_DIM, ctx_len);
-            /* Split interleaved KV → K, V
-             * Output to d_ca_K, d_ca_V (non-aliased with d_qkv) */
-            op_split_kv(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, heads, hd);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_cross_Q, N1, H_dim,
+                                     "cuda_b0_attn2_to_q", pass_tag);
         }
 
-        /* Q: just reshape per-head (no interleaving needed for single projection) */
-        /* Actually Q in PyTorch CrossAttention is just: q.view(b,s1,H,HD)
-         * No interleaving. So separate Q GEMM is correct. */
+        /* Reference-faithful K/V path: compute them separately, then compare or
+         * combine later if needed. */
+        const char *cpu_kv_env = getenv("HY3D_CPU_DIT_KV_GEMM");
+        if (cpu_kv_env && cpu_kv_env[0] && cpu_kv_env[0] != '0') {
+            float *h_k = (float *)malloc((size_t)ctx_len * H_dim * sizeof(float));
+            float *h_v = (float *)malloc((size_t)ctx_len * H_dim * sizeof(float));
+            float *h_ctx = (float *)malloc((size_t)ctx_len * DIT_CONTEXT_DIM * sizeof(float));
+            if (h_k && h_v && h_ctx) {
+                cuMemcpyDtoH(h_ctx, d_context, (size_t)ctx_len * DIT_CONTEXT_DIM * sizeof(float));
+                /* Upload weights into host-visible buffers for a verification fallback. */
+                float *w_k = (float *)malloc((size_t)H_dim * DIT_CONTEXT_DIM * sizeof(float));
+                float *w_v = (float *)malloc((size_t)H_dim * DIT_CONTEXT_DIM * sizeof(float));
+                if (w_k && w_v) {
+                    if (hy3d_copy_gemm_weights_to_host_f32(w_k, blk->ca_k_w,
+                                                           H_dim, DIT_CONTEXT_DIM,
+                                                           r->ops.use_f32_gemm) == 0 &&
+                        hy3d_copy_gemm_weights_to_host_f32(w_v, blk->ca_v_w,
+                                                           H_dim, DIT_CONTEXT_DIM,
+                                                           r->ops.use_f32_gemm) == 0) {
+                        cpu_gemm_f32(h_k, w_k, h_ctx, H_dim, DIT_CONTEXT_DIM, ctx_len);
+                        cpu_gemm_f32(h_v, w_v, h_ctx, H_dim, DIT_CONTEXT_DIM, ctx_len);
+                        if (r->verbose > 1 && bi == 0) {
+                            const char *dir = getenv("HY3D_DUMP_DIR");
+                            if (dir && *dir) {
+                                char path[1024];
+                                char name[256];
+                                hy3d_make_dbg_name(name, sizeof(name), "cpu_b0_attn2_to_k", pass_tag);
+                                snprintf(path, sizeof(path), "%s/%s", dir, name);
+                                cpu_dump_npy_f32_2d(path, h_k, ctx_len, H_dim);
+                                hy3d_make_dbg_name(name, sizeof(name), "cpu_b0_attn2_to_v", pass_tag);
+                                snprintf(path, sizeof(path), "%s/%s", dir, name);
+                                cpu_dump_npy_f32_2d(path, h_v, ctx_len, H_dim);
+                            }
+                        }
+                        cuMemcpyHtoDAsync(d_ca_K, h_k, (size_t)ctx_len * H_dim * sizeof(float), stream);
+                        cuMemcpyHtoDAsync(d_ca_V, h_v, (size_t)ctx_len * H_dim * sizeof(float), stream);
+                    } else {
+                        fprintf(stderr, "HY3D: failed to stage attn2.to_k/to_v weights for CPU fallback\n");
+                    }
+                    free(w_k);
+                    free(w_v);
+                }
+            }
+            free(h_k);
+            free(h_v);
+            free(h_ctx);
+        } else {
+            op_gemm(ops, stream, d_ca_K, blk->ca_k_w, d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
+            op_gemm(ops, stream, d_ca_V, blk->ca_v_w, d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
+        }
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_ca_K, ctx_len, H_dim,
+                                     "cuda_b0_attn2_to_k", pass_tag);
+            hy3d_dbg_dump_tagged_npy(stream, d_ca_V, ctx_len, H_dim,
+                                     "cuda_b0_attn2_to_v", pass_tag);
+            hy3d_dbg_dump_tagged_npy(stream, d_cross_Q, N1, H_dim,
+                                     "cuda_b0_attn2_q_norm", pass_tag);
+        }
+
+        /* PyTorch CrossAttention does:
+         *   kv = cat(to_k(y), to_v(y), dim=-1)
+         *   kv = kv.view(B, S, heads, 2*hd)
+         *   k, v = split(kv, hd, dim=-1)
+         * before k_norm / SDPA. Rebuild that interleaved per-head KV layout so
+         * our K/V grouping matches the reference path. */
+        op_concat_last_dim(ops, stream, d_qkv, d_ca_K, d_ca_V, ctx_len, H_dim);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_qkv, ctx_len, 2 * H_dim,
+                                     "cuda_b0_attn2_kv_gemm", pass_tag);
+        }
+        op_split_kv(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, heads, hd);
 
         if (blk->ca_k_norm_w)
             op_rms_norm(ops, stream, d_ca_K, blk->ca_k_norm_w,
                         ctx_len, heads, hd, H_dim);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_ca_K, ctx_len, H_dim,
+                                     "cuda_b0_attn2_k_norm", pass_tag);
+        }
 
         op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K, d_ca_V,
                       N1, ctx_len, H_dim, heads, hd);
 
         op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b, H_dim, H_dim, N1);
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_attn, N1, H_dim,
+                                     "cuda_b0_attn2_out", pass_tag);
+            hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim,
+                                     "cuda_b0_attn2_out_proj", pass_tag);
+        }
         op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
 
         if (r->verbose > 1 && bi == 0) {
@@ -1365,6 +1588,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         } else {
             cuMemcpyDtoDAsync(d_normed, d_hidden, (size_t)N1 * H_dim * sizeof(float), stream);
         }
+        if (r->verbose > 1 && bi == 0) {
+            hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_norm3", pass_tag);
+        }
 
         if (blk->use_moe) {
             /* Fix 2: MoE with 8 experts + shared expert, top-2 gating.
@@ -1381,6 +1607,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             op_gemm(ops, stream, d_mlp, blk->mlp_fc1_w, d_normed, blk->mlp_fc1_b, ffn, H_dim, N1);
             op_gelu(ops, stream, d_mlp, N1 * ffn);
             op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b, H_dim, ffn, N1);
+            if (r->verbose > 1 && bi == 0) {
+                hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_mlp_out", pass_tag);
+            }
             op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
         }
 
@@ -1388,7 +1617,8 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         if (bi == 0 || bi == 5 || bi == 10 || bi == 11 ||
             bi == 14 || bi == 15 || bi == 20) {
             char fname[64];
-            snprintf(fname, sizeof(fname), "cuda_dit_block_%d.npy", bi);
+            if (pass_tag && *pass_tag) snprintf(fname, sizeof(fname), "cuda_dit_block_%d_%s.npy", bi, pass_tag);
+            else snprintf(fname, sizeof(fname), "cuda_dit_block_%d.npy", bi);
             hy3d_dbg_dump_npy(stream, d_hidden, N1, H_dim, fname);
         }
 
@@ -1659,41 +1889,6 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
 }
 
 /* ======================================================================== */
-/* Random noise generation (CPU, Box-Muller)                                */
-/* ======================================================================== */
-
-static void generate_randn(float *buf, int n, uint32_t seed) {
-    /* Simple xorshift128+ PRNG + Box-Muller */
-    uint64_t s0 = seed ? seed : (uint64_t)time(NULL);
-    uint64_t s1 = s0 ^ 0x6c62272e07bb0142ULL;
-
-    for (int i = 0; i < n; i += 2) {
-        /* xorshift128+ */
-        uint64_t x = s0;
-        uint64_t y = s1;
-        s0 = y;
-        x ^= x << 23;
-        s1 = x ^ y ^ (x >> 17) ^ (y >> 26);
-        uint64_t r1 = s1 + y;
-
-        x = s0; y = s1; s0 = y;
-        x ^= x << 23;
-        s1 = x ^ y ^ (x >> 17) ^ (y >> 26);
-        uint64_t r2 = s1 + y;
-
-        /* Box-Muller: u1, u2 uniform in (2^-53, 1] (avoids log(0) = -inf).
-         * Previous form divided a 53-bit value by 2^21, producing u1 up to
-         * ~4.3e9 → log(u1) > 0 → sqrt(-2·log(u1)) = NaN. */
-        double u1 = ((r1 >> 11) + 1.0) * 0x1.0p-53;
-        double u2 = ((r2 >> 11) + 1.0) * 0x1.0p-53;
-        double rr = sqrt(-2.0 * log(u1));
-        double theta = 2.0 * 3.141592653589793 * u2;
-        buf[i] = (float)(rr * cos(theta));
-        if (i + 1 < n) buf[i+1] = (float)(rr * sin(theta));
-    }
-}
-
-/* ======================================================================== */
 /* Public API                                                               */
 /* ======================================================================== */
 
@@ -1740,6 +1935,118 @@ void cuda_hy3d_set_dump(cuda_hy3d_runner *r, int every, int grid, const char *pr
         memcpy(r->dump_prefix, prefix, n);
         r->dump_prefix[n] = '\0';
     }
+}
+
+void cuda_hy3d_set_latent_dump(cuda_hy3d_runner *r, const char *steps_csv, const char *prefix) {
+    if (!r) return;
+    r->latent_dump_count = 0;
+    r->latent_dump_prefix[0] = '\0';
+    if (prefix && *prefix) {
+        size_t n = strlen(prefix);
+        if (n >= sizeof(r->latent_dump_prefix)) n = sizeof(r->latent_dump_prefix) - 1;
+        memcpy(r->latent_dump_prefix, prefix, n);
+        r->latent_dump_prefix[n] = '\0';
+    }
+    if (!steps_csv || !*steps_csv) return;
+
+    const char *p = steps_csv;
+    while (*p && r->latent_dump_count < HY3D_MAX_LATENT_DUMP_STEPS) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        if (v > 0 && v <= 1000000) {
+            int step = (int)v;
+            int seen = 0;
+            for (int i = 0; i < r->latent_dump_count; i++) {
+                if (r->latent_dump_steps[i] == step) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (!seen) r->latent_dump_steps[r->latent_dump_count++] = step;
+        }
+        p = end;
+        while (*p == ' ' || *p == ',') p++;
+    }
+}
+
+void cuda_hy3d_set_velocity_dump(cuda_hy3d_runner *r, const char *steps_csv, const char *prefix) {
+    if (!r) return;
+    r->velocity_dump_count = 0;
+    r->velocity_dump_prefix[0] = '\0';
+    if (prefix && *prefix) {
+        size_t n = strlen(prefix);
+        if (n >= sizeof(r->velocity_dump_prefix)) n = sizeof(r->velocity_dump_prefix) - 1;
+        memcpy(r->velocity_dump_prefix, prefix, n);
+        r->velocity_dump_prefix[n] = '\0';
+    }
+    if (!steps_csv || !*steps_csv) return;
+
+    const char *p = steps_csv;
+    while (*p && r->velocity_dump_count < HY3D_MAX_LATENT_DUMP_STEPS) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        if (v > 0 && v <= 1000000) {
+            int step = (int)v;
+            int seen = 0;
+            for (int i = 0; i < r->velocity_dump_count; i++) {
+                if (r->velocity_dump_steps[i] == step) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (!seen) r->velocity_dump_steps[r->velocity_dump_count++] = step;
+        }
+        p = end;
+        while (*p == ' ' || *p == ',') p++;
+    }
+}
+
+int cuda_hy3d_set_init_latents(cuda_hy3d_runner *r, const float *latents, int n) {
+    if (!r || !latents) return -1;
+    const int expected = DIT_INPUT_SIZE * DIT_IN_CHANNELS;
+    if (n != expected) return -1;
+    float *tmp = (float *)malloc((size_t)n * sizeof(float));
+    if (!tmp) return -1;
+    memcpy(tmp, latents, (size_t)n * sizeof(float));
+    free(r->init_latents);
+    r->init_latents = tmp;
+    r->init_latents_n = n;
+    return 0;
+}
+
+int cuda_hy3d_set_init_contexts(cuda_hy3d_runner *r,
+                                const float *cond,
+                                const float *uncond,
+                                int n) {
+    if (!r || !cond) return -1;
+    const int expected = DINO_SEQ_LEN * DIT_CONTEXT_DIM;
+    if (n != expected) return -1;
+    float *c = (float *)malloc((size_t)n * sizeof(float));
+    if (!c) return -1;
+    memcpy(c, cond, (size_t)n * sizeof(float));
+
+    float *u = NULL;
+    if (uncond) {
+        u = (float *)malloc((size_t)n * sizeof(float));
+        if (!u) {
+            free(c);
+            return -1;
+        }
+        memcpy(u, uncond, (size_t)n * sizeof(float));
+    }
+
+    free(r->init_ctx_cond);
+    free(r->init_ctx_uncond);
+    r->init_ctx_cond = c;
+    r->init_ctx_uncond = u;
+    r->init_ctx_n = n;
+    return 0;
 }
 
 void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable) {
@@ -1807,6 +2114,14 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     /* DINOv2 forward */
     CUdeviceptr d_dino_out = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
     run_dinov2(r, d_image, d_dino_out);
+    if (r->init_ctx_cond && r->init_ctx_n == DINO_SEQ_LEN * DIT_CONTEXT_DIM) {
+        cuMemcpyHtoDAsync(d_dino_out, r->init_ctx_cond,
+                          (size_t)r->init_ctx_n * sizeof(float), stream);
+        if (r->verbose) fprintf(stderr, "HY3D: using user-provided conditional context\n");
+    }
+    if (r->verbose > 1) {
+        hy3d_dbg_dump_npy(stream, d_dino_out, DINO_SEQ_LEN, DIT_CONTEXT_DIM, "cuda_dino_context_after_override.npy");
+    }
     cuMemFree(d_rgb);
     cuMemFree(d_image);
 
@@ -1818,7 +2133,13 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     /* Create initial noise */
     int latent_size = DIT_INPUT_SIZE * DIT_IN_CHANNELS;
     float *noise_cpu = (float *)malloc((size_t)latent_size * sizeof(float));
-    generate_randn(noise_cpu, latent_size, seed);
+    if (r->init_latents && r->init_latents_n == latent_size) {
+        memcpy(noise_cpu, r->init_latents, (size_t)latent_size * sizeof(float));
+        if (r->verbose) fprintf(stderr, "HY3D: using user-provided initial latents\n");
+    } else {
+        uint64_t rng_seed = seed ? (uint64_t)seed : (uint64_t)time(NULL);
+        cuda_rng_fill_normal_f32(noise_cpu, (size_t)latent_size, rng_seed, 0);
+    }
 
     CUdeviceptr d_latents = gpu_alloc((size_t)latent_size * sizeof(float));
     cuMemcpyHtoDAsync(d_latents, noise_cpu, (size_t)latent_size * sizeof(float), stream);
@@ -1833,7 +2154,13 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
 
     /* Create zero context for unconditional pass */
     CUdeviceptr d_uncond_ctx = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
-    cuMemsetD8Async(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), stream);
+    if (r->init_ctx_uncond && r->init_ctx_n == DINO_SEQ_LEN * DIT_CONTEXT_DIM) {
+        cuMemcpyHtoDAsync(d_uncond_ctx, r->init_ctx_uncond,
+                          (size_t)r->init_ctx_n * sizeof(float), stream);
+        if (r->verbose) fprintf(stderr, "HY3D: using user-provided unconditional context\n");
+    } else {
+        cuMemsetD8Async(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), stream);
+    }
 
     /* Flow matching schedule — matches Hunyuan3DDiTFlowMatchingPipeline.__call__
      * (hy3dshape/pipelines.py line 736-764), NOT the parent class loop:
@@ -1855,10 +2182,16 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
      *     dt = sigma - sigma_next (negative) to get x = x - (s-sn)*v
      *                                              = x + (sn-s)*v. */
     for (int step = 0; step < n_steps; step++) {
-        float sigma      = (float)step / (float)(n_steps - 1);
-        float sigma_next = (step == n_steps - 1)
+        float sigma, sigma_next;
+        if (n_steps == 1) {
+            sigma = 0.0f;
+            sigma_next = 1.0f;
+        } else {
+            sigma = (float)step / (float)(n_steps - 1);
+            sigma_next = (step == n_steps - 1)
                               ? 1.0f  /* scheduler sentinel */
                               : (float)(step + 1) / (float)(n_steps - 1);
+        }
         float dt         = sigma - sigma_next; /* negative except last step */
 
         /* DiT input timestep equals sigma (model was trained in [0, 1]). */
@@ -1867,15 +2200,30 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
             fprintf(stderr, "  step %d/%d (t=%.4f)\n", step + 1, n_steps, model_t);
 
+        if (r->latent_dump_count > 0 && hy3d_should_dump_latent(r, step + 1)) {
+            hy3d_dump_latent(stream, d_latents, DIT_INPUT_SIZE, DIT_IN_CHANNELS,
+                             r->latent_dump_prefix, step + 1);
+            if (r->verbose)
+                fprintf(stderr, "    dumped latent step %d -> %s_%03d.npy\n",
+                        step + 1, r->latent_dump_prefix, step + 1);
+        }
+
         /* Conditional pass */
-        run_dit_forward(r, d_latents, model_t, d_dino_out, d_pred_cond);
+        run_dit_forward(r, d_latents, model_t, d_dino_out, d_pred_cond, "cond");
 
         /* Unconditional pass */
-        run_dit_forward(r, d_latents, model_t, d_uncond_ctx, d_pred_uncond);
+        run_dit_forward(r, d_latents, model_t, d_uncond_ctx, d_pred_uncond, "uncond");
 
         /* CFG combination */
         op_cfg_combine(ops, stream, d_pred_combined, d_pred_cond, d_pred_uncond,
                        guidance_scale, latent_size);
+        if (r->velocity_dump_count > 0 && hy3d_should_dump_velocity(r, step + 1)) {
+            hy3d_dump_latent(stream, d_pred_combined, DIT_INPUT_SIZE, DIT_IN_CHANNELS,
+                             r->velocity_dump_prefix, step + 1);
+            if (r->verbose)
+                fprintf(stderr, "    dumped velocity step %d -> %s_%03d.npy\n",
+                        step + 1, r->velocity_dump_prefix, step + 1);
+        }
 
         /* Euler step: x <- x - dt * v */
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
@@ -2019,7 +2367,7 @@ int cuda_hy3d_run_dit(cuda_hy3d_runner *r,
     cuMemcpyHtoDAsync(d_context, context, ctx_bytes, r->stream);
 
     /* K,V computed per-block inside run_dit_forward (saves GPU memory) */
-    run_dit_forward(r, d_latents, timestep, d_context, d_output);
+    run_dit_forward(r, d_latents, timestep, d_context, d_output, "single");
 
     cuMemcpyDtoHAsync(output, d_output, out_bytes, r->stream);
     cuStreamSynchronize(r->stream);
@@ -2032,6 +2380,16 @@ int cuda_hy3d_run_dit(cuda_hy3d_runner *r,
 
 void cuda_hy3d_free(cuda_hy3d_runner *r) {
     if (!r) return;
+    free(r->init_latents);
+    r->init_latents = NULL;
+    r->init_latents_n = 0;
+    free(r->init_ctx_cond);
+    free(r->init_ctx_uncond);
+    r->init_ctx_cond = NULL;
+    r->init_ctx_uncond = NULL;
+    r->init_ctx_n = 0;
+    r->velocity_dump_count = 0;
+    r->latent_dump_count = 0;
 
     /* Free scratch buffers */
     for (int i = 0; i < 8; i++) {

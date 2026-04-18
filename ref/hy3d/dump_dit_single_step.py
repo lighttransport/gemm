@@ -40,6 +40,9 @@ def main():
     parser.add_argument("--outdir", type=str, default="output")
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--hy3d-repo", type=str, default=HY3D_REPO)
+    parser.add_argument("--latents", type=str, default=None)
+    parser.add_argument("--context", type=str, default=None)
+    parser.add_argument("--timestep", type=float, default=0.5)
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -105,16 +108,27 @@ def main():
     print(f"  Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
     model = model.float().eval()  # CPU — DiT doesn't fit on small GPUs w/ activations
-    torch.manual_seed(42)
-    latents = torch.randn(1, 4096, 64)
-    context = torch.randn(1, 1370, 1024)
-    t = torch.tensor([0.5])
+    if args.latents:
+        lat_np = np.load(args.latents)
+        latents = torch.from_numpy(lat_np if lat_np.ndim == 3 else lat_np[None, ...]).float()
+    else:
+        torch.manual_seed(42)
+        latents = torch.randn(1, 4096, 64)
+    if args.context:
+        ctx_np = np.load(args.context)
+        context = torch.from_numpy(ctx_np if ctx_np.ndim == 3 else ctx_np[None, ...]).float()
+    else:
+        if not args.latents:
+            torch.manual_seed(42)
+        context = torch.randn(1, 1370, 1024)
+    t = torch.full((latents.shape[0],), args.timestep)
 
     np.save(os.path.join(args.outdir, "dit_input_latents.npy"), latents.numpy()[0])
     np.save(os.path.join(args.outdir, "dit_input_context.npy"), context.numpy()[0])
 
     # Hook every block to capture its output (after the block's residual stream).
     block_outs = {}
+    block0_io = {}
     hooks = []
     for i, blk in enumerate(model.blocks):
         def _make_hook(idx):
@@ -122,6 +136,28 @@ def main():
                 block_outs[idx] = out.detach().float().cpu().numpy()[0]
             return _hook
         hooks.append(blk.register_forward_hook(_make_hook(i)))
+
+    # Block-0 submodule traces for first-failure localization.
+    blk0 = model.blocks[0]
+
+    def _save(name, tensor):
+        block0_io[name] = tensor.detach().float().cpu().numpy()[0]
+
+    hooks.append(blk0.norm1.register_forward_hook(lambda m, inp, out: _save("b0_norm1", out)))
+    hooks.append(blk0.attn1.register_forward_pre_hook(lambda m, inp: _save("b0_attn1_in", inp[0])))
+    hooks.append(blk0.attn1.register_forward_hook(lambda m, inp, out: _save("b0_attn1_out", out)))
+    hooks.append(blk0.norm2.register_forward_hook(lambda m, inp, out: _save("b0_norm2", out)))
+    hooks.append(blk0.attn2.register_forward_pre_hook(lambda m, inp: _save("b0_attn2_in", inp[0])))
+    hooks.append(blk0.attn2.register_forward_hook(lambda m, inp, out: _save("b0_attn2_out", out)))
+    hooks.append(blk0.attn2.to_q.register_forward_hook(lambda m, inp, out: _save("b0_attn2_to_q", out)))
+    hooks.append(blk0.attn2.to_k.register_forward_hook(lambda m, inp, out: _save("b0_attn2_to_k", out)))
+    hooks.append(blk0.attn2.to_v.register_forward_hook(lambda m, inp, out: _save("b0_attn2_to_v", out)))
+    hooks.append(blk0.attn2.q_norm.register_forward_hook(lambda m, inp, out: _save("b0_attn2_q_norm", out)))
+    hooks.append(blk0.attn2.k_norm.register_forward_hook(lambda m, inp, out: _save("b0_attn2_k_norm", out)))
+    hooks.append(blk0.attn2.out_proj.register_forward_hook(lambda m, inp, out: _save("b0_attn2_out_proj", out)))
+    hooks.append(blk0.norm3.register_forward_hook(lambda m, inp, out: _save("b0_norm3", out)))
+    hooks.append(blk0.mlp.register_forward_pre_hook(lambda m, inp: _save("b0_mlp_in", inp[0])))
+    hooks.append(blk0.mlp.register_forward_hook(lambda m, inp, out: _save("b0_mlp_out", out)))
 
     with torch.no_grad():
         output = model(latents, t, {"main": context})
@@ -139,6 +175,10 @@ def main():
             np.save(os.path.join(args.outdir, f"dit_block_{i}.npy"), block_outs[i])
             b = block_outs[i]
             print(f"  block_{i}: shape={b.shape} mean={b.mean():+.4f} std={b.std():.4f}")
+
+    for name, arr in sorted(block0_io.items()):
+        np.save(os.path.join(args.outdir, f"dit_{name}.npy"), arr)
+        print(f"  {name}: shape={arr.shape} mean={arr.mean():+.4f} std={arr.std():.4f}")
 
     # Timestep embedding reference
     class Timesteps(nn.Module):

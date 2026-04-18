@@ -1,0 +1,48 @@
+{
+  "profiles": {
+    "f16": {
+      "dinov2_output.npy": {
+        "required": true,
+        "max_abs": 0.05,
+        "mean_abs": 0.0015
+      },
+      "dit_timestep_embed.npy": {
+        "required": true,
+        "max_abs": 1e-5,
+        "mean_abs": 1e-6
+      },
+      "dit_output.npy": {
+        "required": true,
+        "max_abs": 0.02,
+        "mean_abs": 0.0005
+      },
+      "vae_sdf_grid.npy": {
+        "required": true,
+        "max_abs": 0.001,
+        "mean_abs": 0.0001
+      }
+    },
+    "f32": {
+      "dinov2_output.npy": {
+        "required": true,
+        "max_abs": 0.06,
+        "mean_abs": 0.002
+      },
+      "dit_timestep_embed.npy": {
+        "required": true,
+        "max_abs": 1e-5,
+        "mean_abs": 1e-6
+      },
+      "dit_output.npy": {
+        "required": true,
+        "max_abs": 0.03,
+        "mean_abs": 0.0008
+      },
+      "vae_sdf_grid.npy": {
+        "required": true,
+        "max_abs": 0.001,
+        "mean_abs": 0.0001
+      }
+    }
+  }
+}
