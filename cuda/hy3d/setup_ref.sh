@@ -128,12 +128,10 @@ Generate PyTorch reference outputs (from ${REF_DIR}):
 
 Build & verify CUDA runner:
   cd ${SCRIPT_DIR} && make verify
-  ./verify_dinov2 ${MODELS_DIR}/conditioner.safetensors \\
-      --ref-dir ${REF_DIR}/output --out-dir cuda_output
-  ./verify_vae   ${MODELS_DIR}/vae.safetensors \\
-      --ref-dir ${REF_DIR}/output --out-dir cuda_output
-  ./verify_dit   ${MODELS_DIR}/model.safetensors \\
-      --ref-dir ${REF_DIR}/output --out-dir cuda_output
+  ./verify_suite.sh \\
+      --models-dir ${MODELS_DIR} \\
+      --ref-dir ${REF_DIR}/output \\
+      --profile both
 
 End-to-end run:
   ./test_cuda_hy3d \\
