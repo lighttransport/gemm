@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.10)
+project(cpu_inference C)
+
+add_subdirectory(da3)
+add_subdirectory(dinov3)
+add_subdirectory(flux2)
+add_subdirectory(hy3d)
+add_subdirectory(llm)
+add_subdirectory(ppd)
+add_subdirectory(qwen_image)
+add_subdirectory(sparse3d)
+add_subdirectory(trellis2)
+add_subdirectory(vlm)
