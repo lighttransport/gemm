@@ -182,6 +182,23 @@ def main():
           f'coords={tuple(shape_slat.coords.shape)}', flush=True)
     _save(args.output_dir, 'shape_slat_feats', shape_slat.feats)
     _save(args.output_dir, 'shape_slat_coords', shape_slat.coords)
+
+    # Dump the subdivision caches the encoder populated on shape_slat's
+    # _spatial_cache — the tex decoder's C2S blocks consume these (see
+    # SparseChannel2Spatial.forward). Each entry is (new_coords, idx, subidx).
+    cache = getattr(shape_slat, '_spatial_cache', None) or {}
+    for k, v in cache.items():
+        if not k.startswith('channel2spatial_'):
+            continue
+        if not (isinstance(v, tuple) and len(v) == 3):
+            continue
+        new_coords, idx, subidx = v
+        _save(args.output_dir, f'cache_{k}_coords', new_coords)
+        _save(args.output_dir, f'cache_{k}_idx', idx)
+        _save(args.output_dir, f'cache_{k}_subidx', subidx)
+        print(f'[cache] {k}: coords={tuple(new_coords.shape)} idx={tuple(idx.shape)} '
+              f'subidx={tuple(subidx.shape)}', flush=True)
+
     gc.collect(); torch.cuda.empty_cache()
     _vram('after_shape_slat')
 
