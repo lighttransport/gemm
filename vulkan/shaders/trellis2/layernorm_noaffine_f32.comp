@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+// LayerNorm without affine params: y = (x - mean) / sqrt(var + eps)
+// Grid: (N_tokens, 1, 1), workgroup: (256, 1, 1)
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DstBuffer { float dst[]; };
+layout(std430, binding = 1) readonly buffer SrcBuffer { float src[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint dim;
+    float eps;
+} pc;
+
+shared float smem[512]; // [0..255] sum, [256..511] sum2
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.n_tok) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = tok * pc.dim;
+
+    float s = 0.0, s2 = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256) {
+        float v = src[base + i];
+        s += v;
+        s2 += v * v;
+    }
+    smem[tid] = s;
+    smem[tid + 256] = s2;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+            smem[tid + 256] += smem[tid + 256 + stride];
+        }
+        barrier();
+    }
+
+    float mean = smem[0] / float(pc.dim);
+    float var = smem[256] / float(pc.dim) - mean * mean;
+    float inv = inversesqrt(var + pc.eps);
+
+    for (uint i = tid; i < pc.dim; i += 256) {
+        dst[base + i] = (src[base + i] - mean) * inv;
+    }
+}

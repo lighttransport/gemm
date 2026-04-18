@@ -42,9 +42,12 @@ const char *bpe_token_to_str(const bpe_vocab *vocab, int32_t token_id);
 int32_t bpe_eos_id(const bpe_vocab *vocab);
 int32_t bpe_eot_id(const bpe_vocab *vocab);
 
-/* Decode byte-encoded token string (e.g. <0x41> -> 'A').
+/* Decode byte-encoded token string (e.g. <0x41> -> 'A', ▁ -> ' ').
  * Returns malloc'd buffer. Caller must free. */
 char *bpe_byte_decode(const char *data, int data_len, int *out_len);
+
+/* Get the pre-tokenizer type (to choose decoding method) */
+int bpe_pre_type(const bpe_vocab *vocab);
 
 #ifdef __cplusplus
 }
@@ -161,6 +164,7 @@ static char *bpe_byte_encode(const char *data, int data_len, int *out_len) {
 }
 
 /* Decode GPT-2 byte-level UTF-8 string back to raw bytes.
+ * Also handles Gemma4 SPM-style: ▁ (U+2581, UTF-8: E2 96 81) -> space.
  * Returns malloc'd string and sets *out_len. */
 char *bpe_byte_decode(const char *data, int data_len, int *out_len) {
     bpe_init_byte_encoding();
@@ -168,6 +172,13 @@ char *bpe_byte_decode(const char *data, int data_len, int *out_len) {
     int opos = 0;
     int pos = 0;
     while (pos < data_len) {
+        /* Check for ▁ (U+2581, UTF-8: E2 96 81) → space */
+        if (pos + 2 < data_len &&
+            (uint8_t)data[pos] == 0xE2 && (uint8_t)data[pos+1] == 0x96 && (uint8_t)data[pos+2] == 0x81) {
+            out[opos++] = ' ';
+            pos += 3;
+            continue;
+        }
         int clen;
         uint32_t cpt = bpe_utf8_to_cpt(data + pos, data_len - pos, &clen);
         if (cpt < 512 && bpe_utf8_to_byte_valid[cpt]) {
@@ -183,6 +194,8 @@ char *bpe_byte_decode(const char *data, int data_len, int *out_len) {
     *out_len = opos;
     return out;
 }
+
+/* bpe_pre_type() implemented after struct definition */
 
 /* ---- Unicode flag lookup (binary search on range table) ---- */
 
@@ -314,6 +327,7 @@ static int32_t bpe_hm_get(const bpe_hashmap *hm, const char *key, int key_len) {
 /* Pre-tokenizer types */
 #define BPE_PRE_TYPE_QWEN2  11
 #define BPE_PRE_TYPE_QWEN35 46
+#define BPE_PRE_TYPE_GEMMA4 50
 
 struct bpe_vocab {
     int n_tokens;
@@ -330,6 +344,8 @@ struct bpe_vocab {
     char **special_strs;
     int *special_lens;
 };
+
+int bpe_pre_type(const bpe_vocab *vocab) { return vocab ? vocab->pre_type : 0; }
 
 /* ---- GGUF vocab loading ---- */
 
@@ -370,6 +386,15 @@ bpe_vocab *bpe_vocab_load(gguf_context *gguf) {
             if (strcmp(pre_str, "qwen35") == 0) {
                 vocab->pre_type = BPE_PRE_TYPE_QWEN35;
                 fprintf(stderr, "bpe: using qwen35 pre-tokenizer\n");
+            }
+        }
+        /* Also check tokenizer.ggml.model for Gemma4 */
+        int model_idx = gguf_find_key(gguf, "tokenizer.ggml.model");
+        if (model_idx >= 0 && gguf->kv[model_idx].type == GGUF_TYPE_STRING) {
+            const char *model_str = gguf->kv[model_idx].value.str.str;
+            if (strcmp(model_str, "gemma4") == 0) {
+                vocab->pre_type = BPE_PRE_TYPE_GEMMA4;
+                fprintf(stderr, "bpe: using gemma4 pre-tokenizer (SPM-style BPE)\n");
             }
         }
     }
@@ -564,6 +589,48 @@ static void bpe_wl_push(bpe_word_list *wl, int start, int len) {
 static void bpe_wl_free(bpe_word_list *wl) {
     free(wl->starts);
     free(wl->lens);
+}
+
+/*
+ * Pretokenizer for Gemma4 models (SPM-style BPE).
+ * 1. Replace all spaces with ▁ (U+2581, UTF-8: 0xE2 0x96 0x81)
+ * 2. Split on newlines only (BPE merge lookup doesn't handle newlines)
+ *
+ * Returns a normalized text buffer (malloc'd) and word list referencing it.
+ * The caller must free norm_out after tokenization.
+ */
+static bpe_word_list bpe_pretokenize_gemma4(const char *text, int text_len, char **norm_out) {
+    bpe_word_list wl;
+    bpe_wl_init(&wl);
+
+    /* Normalize: replace space (0x20) with ▁ (3-byte UTF-8: E2 96 81) */
+    /* Worst case: every byte is a space → 3x expansion */
+    char *norm = (char *)malloc(text_len * 3 + 1);
+    int npos = 0;
+    for (int i = 0; i < text_len; i++) {
+        if (text[i] == ' ') {
+            norm[npos++] = (char)0xE2;
+            norm[npos++] = (char)0x96;
+            norm[npos++] = (char)0x81;
+        } else {
+            norm[npos++] = text[i];
+        }
+    }
+    norm[npos] = '\0';
+    *norm_out = norm;
+
+    /* Split on newlines */
+    int start = 0;
+    for (int i = 0; i < npos; i++) {
+        if (norm[i] == '\n') {
+            if (i > start) bpe_wl_push(&wl, start, i - start);
+            bpe_wl_push(&wl, i, 1);
+            start = i + 1;
+        }
+    }
+    if (start < npos) bpe_wl_push(&wl, start, npos - start);
+
+    return wl;
 }
 
 /*
@@ -802,9 +869,19 @@ static int bpe_tokenize_word(const bpe_vocab *vocab, const char *word, int word_
                              int32_t *out_tokens, int max_tokens) {
     if (word_len <= 0) return 0;
 
-    /* Byte-encode the word for GPT-2 byte-level BPE */
+    /* Byte-encode the word for GPT-2 byte-level BPE.
+     * Gemma4 uses raw UTF-8 (no byte encoding). */
     int enc_len;
-    char *encoded = bpe_byte_encode(word, word_len, &enc_len);
+    char *encoded;
+    if (vocab->pre_type == BPE_PRE_TYPE_GEMMA4) {
+        /* Gemma4: use raw UTF-8, no byte encoding */
+        encoded = (char *)malloc(word_len + 1);
+        memcpy(encoded, word, word_len);
+        encoded[word_len] = '\0';
+        enc_len = word_len;
+    } else {
+        encoded = bpe_byte_encode(word, word_len, &enc_len);
+    }
 
     /* Split encoded word into UTF-8 characters → symbols */
     int n_syms = 0;
@@ -878,9 +955,23 @@ static int bpe_tokenize_word(const bpe_vocab *vocab, const char *word, int word_
         } else {
             /* Byte fallback: look up each byte as a token */
             for (int b = 0; b < syms[i].n; b++) {
-                char hex_buf[8];
-                snprintf(hex_buf, sizeof(hex_buf), "<0x%02X>", (uint8_t)syms[i].text[b]);
-                int32_t byte_token = bpe_hm_get(&vocab->token_to_id, hex_buf, (int)strlen(hex_buf));
+                int32_t byte_token = -1;
+                if (vocab->pre_type == BPE_PRE_TYPE_GEMMA4) {
+                    /* Gemma4: try raw single byte as token */
+                    char raw_byte[1];
+                    raw_byte[0] = syms[i].text[b];
+                    byte_token = bpe_hm_get(&vocab->token_to_id, raw_byte, 1);
+                    if (byte_token < 0) {
+                        /* Fallback: try <0xXX> format too */
+                        char hex_buf[8];
+                        snprintf(hex_buf, sizeof(hex_buf), "<0x%02X>", (uint8_t)syms[i].text[b]);
+                        byte_token = bpe_hm_get(&vocab->token_to_id, hex_buf, (int)strlen(hex_buf));
+                    }
+                } else {
+                    char hex_buf[8];
+                    snprintf(hex_buf, sizeof(hex_buf), "<0x%02X>", (uint8_t)syms[i].text[b]);
+                    byte_token = bpe_hm_get(&vocab->token_to_id, hex_buf, (int)strlen(hex_buf));
+                }
                 if (byte_token >= 0) {
                     if (out_tokens) {
                         if (n_out < max_tokens) out_tokens[n_out] = byte_token;
@@ -903,6 +994,23 @@ static int bpe_tokenize_word(const bpe_vocab *vocab, const char *word, int word_
 static int bpe_tokenize_segment(const bpe_vocab *vocab, const char *text, int text_len,
                                 int32_t *tokens, int max_tokens) {
     if (text_len <= 0) return 0;
+
+    if (vocab->pre_type == BPE_PRE_TYPE_GEMMA4) {
+        /* Gemma4: SPM-style BPE with space→▁ normalization */
+        char *norm_text = NULL;
+        bpe_word_list wl = bpe_pretokenize_gemma4(text, text_len, &norm_text);
+        int total = 0;
+        for (int w = 0; w < wl.n; w++) {
+            int32_t *dst = tokens ? tokens + total : NULL;
+            int remaining = tokens ? max_tokens - total : 0;
+            int n = bpe_tokenize_word(vocab, norm_text + wl.starts[w], wl.lens[w], dst, remaining);
+            total += n;
+        }
+        bpe_wl_free(&wl);
+        free(norm_text);
+        return total;
+    }
+
     int marks_with_letters = (vocab->pre_type == BPE_PRE_TYPE_QWEN35) ? 1 : 0;
     bpe_word_list wl = bpe_pretokenize_qwen(text, text_len, marks_with_letters);
     int total = 0;

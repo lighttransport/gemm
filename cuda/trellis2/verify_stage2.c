@@ -51,8 +51,11 @@ int main(int argc, char **argv) {
     float *ref = read_npy_f32(argv[5], &nd, dd);
 
     float *output = (float *)malloc((size_t)N * C * sizeof(float));
-    fprintf(stderr, "Running Stage 2 DiT...\n");
-    cuda_trellis2_run_stage2_dit(r, noise, 1000.0f, cond, coords, N, output);
+    /* t_raw=1.0: the function internally multiplies by 1000,
+     * so the model sees 1000.0 matching PyTorch's torch.tensor([1000*1.0]) */
+    float t_raw = 1.0f;
+    fprintf(stderr, "Running Stage 2 DiT (t_raw=%.1f, model sees %.1f)...\n", t_raw, t_raw * 1000.0f);
+    cuda_trellis2_run_stage2_dit(r, noise, t_raw, cond, coords, N, output);
 
     /* Compare */
     double sr=0,sc=0,sr2=0,sc2=0,src2=0;

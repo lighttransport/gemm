@@ -94,12 +94,45 @@ set(DA3_SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/da3/relu_f32.comp
     ${SHADER_SOURCE_DIR}/da3/channel_layernorm_f32.comp
     ${SHADER_SOURCE_DIR}/da3/qk_layernorm_offset_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/patch_embed_conv2d_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/copy_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/silu_f32.comp
+    ${SHADER_SOURCE_DIR}/da3/matmul_bias_f16_f32.comp
 )
 
-# HY3D shaders (reused by DA3 for layerscale_add and qk_layernorm)
+# TRELLIS2 shaders
+set(T2_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders/trellis2)
+set(T2_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/trellis2)
+file(MAKE_DIRECTORY ${T2_SHADER_OUTPUT_DIR})
+
+set(T2_SHADER_SOURCES
+    ${T2_SHADER_SOURCE_DIR}/adaln_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/gated_add_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/modulation_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/rope_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/timestep_embed_cossin_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/split_qkv_chunk_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/split_kv_chunk_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/layernorm_noaffine_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/silu_inplace_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/conv3d_k3_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/channel_layernorm_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/pixel_shuffle_3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/self_attn_tiled_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/sparse_conv3d_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/rope_2d_dinov3_f32.comp
+    ${T2_SHADER_SOURCE_DIR}/dinov3_prepend_tokens_f32.comp
+)
+
+# HY3D shaders (reused by DA3 and TRELLIS2)
 set(HY3D_SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/hy3d/layerscale_add_f32.comp
     ${SHADER_SOURCE_DIR}/hy3d/qk_layernorm_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/gemm_f32_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/rms_norm_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/cross_attn_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/cfg_combine_f32.comp
+    ${SHADER_SOURCE_DIR}/hy3d/euler_step_f32.comp
 )
 
 # Flux.2 Klein text-to-image shaders
@@ -220,6 +253,31 @@ foreach(SHADER ${HY3D_SHADER_SOURCES})
         message(WARNING "HY3D shader not found: ${SHADER}")
     endif()
 endforeach()
+
+# Compile TRELLIS2 shaders
+set(T2_SPIRV_OUTPUTS "")
+foreach(SHADER ${T2_SHADER_SOURCES})
+    if(EXISTS ${SHADER})
+        get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+        set(SPIRV_OUTPUT ${T2_SHADER_OUTPUT_DIR}/${SHADER_NAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPIRV_OUTPUT}
+            COMMAND ${GLSLC_EXECUTABLE}
+                    -fshader-stage=compute
+                    -O
+                    -o ${SPIRV_OUTPUT}
+                    ${SHADER}
+            DEPENDS ${SHADER}
+            COMMENT "Compiling trellis2/${SHADER_NAME}.comp -> ${SHADER_NAME}.spv"
+            VERBATIM
+        )
+        list(APPEND T2_SPIRV_OUTPUTS ${SPIRV_OUTPUT})
+    endif()
+endforeach()
+
+if(T2_SPIRV_OUTPUTS)
+    add_custom_target(trellis2_shaders ALL DEPENDS ${T2_SPIRV_OUTPUTS})
+endif()
 
 # Compile Flux2 shaders
 foreach(SHADER ${FLUX2_SHADER_SOURCES})
@@ -435,6 +493,37 @@ target_compile_definitions(${DA3_TARGET} PRIVATE
 
 if(TARGET coopmat_shaders)
     add_dependencies(${DA3_TARGET} coopmat_shaders)
+endif()
+
+# TRELLIS2 Vulkan test executable
+set(TRELLIS2_VK_TARGET test_vulkan_trellis2)
+
+add_executable(${TRELLIS2_VK_TARGET}
+    trellis2/test_vulkan_trellis2.cc
+    trellis2/vulkan_trellis2_runner.cc
+    ${DEPS_DIR}/vulkan-runner.cc
+    ${DEPS_DIR}/vkew.cc
+)
+
+target_include_directories(${TRELLIS2_VK_TARGET} PRIVATE
+    ${DEPS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+)
+
+target_link_libraries(${TRELLIS2_VK_TARGET} PRIVATE
+    ${CMAKE_DL_LIBS}
+    m
+)
+
+target_compile_definitions(${TRELLIS2_VK_TARGET} PRIVATE
+    USE_VULKAN=1
+)
+
+if(TARGET trellis2_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} trellis2_shaders)
+endif()
+if(TARGET coopmat_shaders)
+    add_dependencies(${TRELLIS2_VK_TARGET} coopmat_shaders)
 endif()
 
 # Flux.2 Klein text-to-image test executable
