@@ -151,6 +151,7 @@ static inline void op_gemm(hy3d_ops *ops, CUstream stream,
     cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, stream, args, NULL);
 }
 
+/* Force the pure F32 GEMM backend for a single call. */
 /* ---- GELU activation in-place ---- */
 static inline void op_gelu(hy3d_ops *ops, CUstream stream,
                            CUdeviceptr x, int n) {
