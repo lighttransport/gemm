@@ -149,21 +149,45 @@ uv run python dump_dit_single_step.py \
 # 4. Build & run CUDA verifiers
 cd ../../cuda/hy3d
 make verify
-./verify_dinov2 /mnt/disk01/models/Hunyuan3D-2.1/conditioner.safetensors \
-  --ref-dir ../../ref/hy3d/output --out-dir cuda_output
-./verify_vae /mnt/disk01/models/Hunyuan3D-2.1/vae.safetensors \
-  --ref-dir ../../ref/hy3d/output --out-dir cuda_output
-./verify_dit /mnt/disk01/models/Hunyuan3D-2.1/model.safetensors \
-  --ref-dir ../../ref/hy3d/output --out-dir cuda_output
+./verify_suite.sh \
+  --models-dir /mnt/disk01/models/Hunyuan3D-2.1 \
+  --ref-dir ../../ref/hy3d/output \
+  --profile both
 
-# 5. Cross-compare
+# 5. Optional: DiT trajectory spot-checks (selected steps)
+#    For deterministic parity against a local PyTorch trace, reuse the traced
+#    step-0 latents/context instead of relying on CUDA's local RNG path.
+./test_cuda_hy3d \
+  /mnt/disk01/models/Hunyuan3D-2.1/conditioner.safetensors \
+  /mnt/disk01/models/Hunyuan3D-2.1/model.safetensors \
+  /mnt/disk01/models/Hunyuan3D-2.1/vae.safetensors \
+  -i input.ppm -o /tmp/hy3d_cuda.obj -s 30 \
+  --init-trace-dir /tmp/hy3d_trace \
+  --dump-latent-steps 1,15,30 \
+  --dump-latent-prefix /tmp/hy3d_latent/dit_latent_step \
+  --dump-velocity-steps 1,15,30 \
+  --dump-velocity-prefix /tmp/hy3d_latent/dit_velocity_step
+
 cd ../../ref/hy3d
-uv run python compare.py output ../../cuda/hy3d/cuda_output
+uv run python compare_trajectory.py \
+  /tmp/hy3d_trace /tmp/hy3d_latent \
+  --steps 1,15,30 --cuda-prefix dit_latent_step
+uv run python compare_trajectory.py \
+  /tmp/hy3d_trace /tmp/hy3d_latent \
+  --steps 1,15,30 --cuda-prefix dit_velocity_step --kind velocity
 ```
 
-Tolerance defaults: `rtol=1e-3`, `atol=1e-4` (same as `ref/qwen_image/`).
-Fall back to `cuda_hy3d_set_f32_gemm(r, 1)` to isolate F16-weight rounding
-from structural bugs.
+`--init-trace-dir` expands to:
+
+- `04_dit_latents_step0.npy` for the initial latent tensor
+- `03_dit_context_cfg.npy` for the conditional/unconditional CFG context
+
+Use this mode when you want DiT trajectory parity independent of the currently
+non-matching CUDA-vs-PyTorch initial RNG path.
+
+`verify_suite.sh` writes `cuda_output/f16/` and `cuda_output/f32/` and calls
+`ref/hy3d/compare.py --manifest ref/hy3d/verify_manifest.json` so pass/fail is
+stage-specific (`max_abs` + `mean_abs`) instead of one global `allclose`.
 
 ## Completed vs pending
 
@@ -172,7 +196,7 @@ from structural bugs.
 | Preprocess (resize+normalize) | ✅ | — | — | kernel `resize_normalize` |
 | DINOv2-L encoder | ✅ | ✅ `verify_dinov2` | ✅ `dump_dinov2.py` | 24 blocks, layerscale, patch embed |
 | DiT forward | ✅ | ✅ `verify_dit` | ✅ `dump_dit_single_step.py` | skip 11–20, MoE 15–20, timestep token |
-| DiT flow-matching loop + CFG | ✅ | — | ⚠️ single-step only | Euler; full-schedule ref script TBD |
+| DiT flow-matching loop + CFG | ✅ | ⚠️ spot-check | ⚠️ partial | trajectory compare via selected latent dumps |
 | ShapeVAE decoder | ✅ | ✅ `verify_vae` | ✅ `dump_vae.py` | post-KL + 16 blocks + Fourier geo decoder |
 | Marching cubes | ✅ | — | — | `common/marching_cubes.h` |
 | F32 GEMM fallback | ✅ | — | — | `cuda_hy3d_set_f32_gemm` |
@@ -207,7 +231,7 @@ from structural bugs.
 ## Verification status
 
 Reference regenerated against `/mnt/disk01/models/Hunyuan3D-2.1` on
-**2026-04-15** with the repo-committed `ref/hy3d/` scripts and an RTX 5060 Ti
+**2026-04-16** with the repo-committed `ref/hy3d/` scripts and an RTX 5060 Ti
 (sm_120), F16 weights + F32 compute.
 
 | Stage | max abs err | mean abs err | target (<1e-4 mean) |
