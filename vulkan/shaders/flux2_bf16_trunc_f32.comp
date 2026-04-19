@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// BF16 truncation: round F32 to BF16 precision in-place
+// Rounds to nearest even.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { uint x_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (i >= pc.n) return;
+    uint bits = x_buf[i];
+    uint rounding = 0x7FFFu + ((bits >> 16) & 1u);
+    bits += rounding;
+    bits &= 0xFFFF0000u;
+    x_buf[i] = bits;
+}

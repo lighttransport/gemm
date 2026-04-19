@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Flash Attention with separate Q/K/V buffers for Flux.2 Klein DiT
+//
+// Q: [N, n_heads * head_dim]  (separate buffer)
+// K: [N, n_heads * head_dim]  (separate buffer)
+// V: [N, n_heads * head_dim]  (separate buffer)
+// out: [N, n_heads * head_dim]
+//
+// Dispatch: one workgroup per (head, query_block).
+// Each invocation handles one query token, processes K/V in tiles.
+//
+// FlashAttention-1 style single-pass online softmax.
+#version 450
+
+#define TILE_KV 16
+#define HEAD_DIM 128
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QBuffer { float Q[]; };
+layout(std430, binding = 1) readonly buffer KBuffer { float K[]; };
+layout(std430, binding = 2) readonly buffer VBuffer { float V[]; };
+layout(std430, binding = 3) writeonly buffer OutBuffer { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint n_heads;
+    uint head_dim;
+    float scale;
+} pc;
+
+// Shared memory for K/V tiles
+shared float smK[TILE_KV * HEAD_DIM];
+shared float smV[TILE_KV * HEAD_DIM];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint qi = gl_WorkGroupID.y * 4 + gl_LocalInvocationID.x / 64;
+    uint lane = gl_LocalInvocationID.x % 64;
+
+    if (h >= pc.n_heads) return;
+
+    uint dim = pc.n_heads * pc.head_dim;
+
+    // Load Q into registers (4 elements per lane, 64 lanes * 4 = 256 >= HEAD_DIM=128)
+    // Only need 128/4 = 32 lanes per query, but 64 threads per warp
+    float q_r[4];
+    for (uint e = 0; e < 4; e++) {
+        uint d = lane * 4 + e;
+        q_r[e] = (qi < pc.N && d < pc.head_dim) ? Q[qi * dim + h * pc.head_dim + d] : 0.0;
+    }
+
+    float m_i = -1e30;
+    float l_i = 0.0;
+    float O_r[4] = {0.0, 0.0, 0.0, 0.0};
+
+    uint n_tiles = (pc.N + TILE_KV - 1) / TILE_KV;
+    uint n_threads = 256;
+
+    for (uint tile = 0; tile < n_tiles; tile++) {
+        uint kv_base = tile * TILE_KV;
+
+        // Collaborative K/V tile loading
+        for (uint idx = gl_LocalInvocationID.x; idx < TILE_KV * HEAD_DIM; idx += n_threads) {
+            uint kj = idx / HEAD_DIM;
+            uint d = idx % HEAD_DIM;
+            uint kv_tok = kv_base + kj;
+            smK[idx] = (kv_tok < pc.N) ? K[kv_tok * dim + h * pc.head_dim + d] : 0.0;
+            smV[idx] = (kv_tok < pc.N) ? V[kv_tok * dim + h * pc.head_dim + d] : 0.0;
+        }
+        barrier();
+
+        // For each K/V token in tile
+        for (uint kj = 0; kj < TILE_KV; kj++) {
+            // Dot product Q @ K^T (partial per lane)
+            float dot = 0.0;
+            for (uint e = 0; e < 4; e++)
+                dot += q_r[e] * smK[kj * HEAD_DIM + lane * 4 + e];
+
+            // Cross-lane reduction (manual since no subgroup guarantee for all lanes)
+            // For lane < 32: accumulate with lane+32
+            // This is a simplification - full subgroup reduction would be better
+            // but we store partial sums in shared memory
+            // Instead, compute full dot in shared memory for correctness
+        }
+
+        // Simple approach: each thread computes full dot product for its query
+        // (thread qi is assigned based on workgroup, 4 queries per workgroup)
+        if (qi < pc.N) {
+            for (uint kj = 0; kj < TILE_KV; kj++) {
+                float dot = 0.0;
+                for (uint d = 0; d < pc.head_dim; d++)
+                    dot += ((d < pc.head_dim) ? Q[qi * dim + h * pc.head_dim + d] : 0.0)
+                         * smK[kj * HEAD_DIM + d];
+
+                float score = (kv_base + kj < pc.N) ? dot * pc.scale : -1e30;
+                float new_max = max(m_i, score);
+                float alpha = exp(m_i - new_max);
+                float p = exp(score - new_max);
+                l_i = l_i * alpha + p;
+                for (uint e = 0; e < 4; e++) {
+                    uint d = lane * 4 + e;
+                    O_r[e] = O_r[e] * alpha + ((d < pc.head_dim)
+                             ? p * smV[kj * HEAD_DIM + d] : 0.0);
+                }
+                m_i = new_max;
+            }
+        }
+        barrier();
+    }
+
+    // Write output
+    if (qi < pc.N) {
+        float inv_l = (l_i > 0.0) ? 1.0 / l_i : 0.0;
+        for (uint e = 0; e < 4; e++) {
+            uint d = lane * 4 + e;
+            if (d < pc.head_dim)
+                out_buf[qi * dim + h * pc.head_dim + d] = O_r[e] * inv_l;
+        }
+    }
+}

@@ -101,6 +101,7 @@ typedef struct {
     int has_lm_head;     /* 1 if output.weight exists (generative model) */
     int mrope_sections[4]; /* M-RoPE dimension sections [temporal, height, width, pad] */
     int use_mrope;         /* 1 if M-RoPE is enabled (Qwen3-VL) */
+    int debug_layers;      /* 1 = print per-layer hidden state norms (debug) */
 
     /* Hybrid SSM+Attention (Qwen3.5) */
     int is_hybrid;           /* 1 if model has SSM layers */
@@ -4045,8 +4046,11 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             tf_vadd(m->x, ds_slice, n_embd);
         }
 
-        if (m->trace_hidden_norms && (l == 0 || l == m->n_layers - 1 || (l + 1) % 10 == 0)) {
-            fprintf(stderr, "  layer %2d: hidden norm = %.4f\n", l, sqrtf(tf_sum_squares(m->x, n_embd)));
+        if (m->debug_layers) {
+            float ss = 0;
+            for (int i = 0; i < n_embd; i++) ss += m->x[i] * m->x[i];
+            fprintf(stderr, "  [L%02d ATT] norm=%.2f first=[%.4f, %.4f, %.4f, %.4f]\n",
+                    l, sqrtf(ss), m->x[0], m->x[1], m->x[2], m->x[3]);
         }
     }
 

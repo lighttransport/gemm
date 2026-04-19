@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Unpatchify: tokens [seq, C*ps*ps] -> latent [C, H, W]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuffer { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuffer { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint H;
+    uint W;
+    uint ps;
+} pc;
+
+void main() {
+    uint tok = gl_GlobalInvocationID.x;
+    uint hp = pc.H / pc.ps, wp = pc.W / pc.ps;
+    if (tok >= hp * wp) return;
+    uint py = tok / wp, px = tok % wp;
+    uint tok_dim = pc.C * pc.ps * pc.ps;
+    uint idx = 0;
+    for (uint c = 0; c < pc.C; c++)
+        for (uint dy = 0; dy < pc.ps; dy++)
+            for (uint dx = 0; dx < pc.ps; dx++)
+                out_buf[c * pc.H * pc.W + (py*pc.ps+dy) * pc.W + (px*pc.ps+dx)] =
+                    in_buf[tok * tok_dim + idx++];
+}

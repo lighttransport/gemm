@@ -47,6 +47,10 @@ float *hip_llm_forward_embd_logits(hip_llm_runner *r, const float *embd, int emb
 /* Free all GPU resources and the runner. */
 void hip_llm_free(hip_llm_runner *r);
 
+/* Free only GPU weight/activation buffers (keep module, stream, context alive).
+ * Call this to reclaim VRAM for another model while keeping the HIP context valid. */
+void hip_llm_offload(hip_llm_runner *r);
+
 /* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
 void hip_llm_reset_state(hip_llm_runner *r);
 

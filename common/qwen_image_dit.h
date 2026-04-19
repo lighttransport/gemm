@@ -670,6 +670,23 @@ void qimg_dit_unpatchify(float *out, const float *tokens,
     }
 }
 
+/* ---- Latent un-standardization (DiT normalized space → VAE natural space) ---- */
+/* From diffusers autoencoder_kl_qwenimage.py config: latents_mean, latents_std */
+/* Must be applied AFTER denoising, BEFORE VAE decode. */
+
+static void qimg_dit_unnormalize_latent(float *latent, int ch, int h, int w) {
+    static const float lat_mean[16] = {
+        -0.7571f,-0.7089f,-0.9113f, 0.1075f,-0.1745f, 0.9653f,-0.1517f, 1.5508f,
+         0.4134f,-0.0715f, 0.5517f,-0.3632f,-0.1922f,-0.9497f, 0.2503f,-0.2921f};
+    static const float lat_std[16] = {
+         2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f,
+         3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f};
+    int spatial = h * w;
+    for (int c = 0; c < ch && c < 16; c++)
+        for (int i = 0; i < spatial; i++)
+            latent[c * spatial + i] = latent[c * spatial + i] * lat_std[c] + lat_mean[c];
+}
+
 /* ---- Single dual-stream block forward ---- */
 
 static void qimg_dit_block_forward(

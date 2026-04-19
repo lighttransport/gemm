@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// 2D Spatial RoPE for Flux.2 Klein image tokens
+// Applies rotary position embedding based on row/col spatial positions.
+// head_dim split into 4 axes: axis0 (unused), axis1 (row), axis2 (col), axis3 (unused for img)
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { float x_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    uint lat_w;
+    float theta;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.z;
+    uint head = gl_WorkGroupID.y;
+    uint pair = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+
+    if (tok >= pc.n_tok || head >= pc.n_heads || pair >= pc.head_dim / 2) return;
+
+    uint axis_dim = pc.head_dim / 4;
+    uint n_pairs = axis_dim / 2;
+
+    // Determine axis and position within axis
+    int ax = -1;
+    uint p_in_ax = 0;
+    if (pair >= n_pairs && pair < 2 * n_pairs) {
+        ax = 1; p_in_ax = pair - n_pairs;  // row axis
+    } else if (pair >= 2 * n_pairs && pair < 3 * n_pairs) {
+        ax = 2; p_in_ax = pair - 2 * n_pairs;  // col axis
+    }
+    if (ax < 0) return;
+
+    uint row = tok / pc.lat_w;
+    uint col = tok % pc.lat_w;
+    float pos = (ax == 1) ? float(row) : float(col);
+    float freq = pos / pow(pc.theta, float(2 * p_in_ax) / float(axis_dim));
+    float cos_f = cos(freq);
+    float sin_f = sin(freq);
+
+    uint idx = tok * pc.n_heads * pc.head_dim + head * pc.head_dim + pair * 2;
+    float a = x_buf[idx];
+    float b = x_buf[idx + 1];
+    x_buf[idx]     = a * cos_f - b * sin_f;
+    x_buf[idx + 1] = a * sin_f + b * cos_f;
+}

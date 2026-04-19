@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: MIT
+// Split [M, 2*W] by chunk -> K[M,W], V[M,W]
+// Grid: (ceil(M*W/256), 1, 1), workgroup: (256, 1, 1)
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer KBuffer { float K[]; };
+layout(std430, binding = 1) writeonly buffer VBuffer { float V[]; };
+layout(std430, binding = 2) readonly buffer KVBuffer { float kv[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint W;
+} pc;
+
+void main() {
+    uint idx = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    uint total = pc.M * pc.W;
+    if (idx >= total) return;
+
+    uint n = idx / pc.W;
+    uint d = idx % pc.W;
+    uint base = n * 2 * pc.W;
+    K[idx] = kv[base + d];
+    V[idx] = kv[base + pc.W + d];
+}
