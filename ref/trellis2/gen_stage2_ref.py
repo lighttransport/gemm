@@ -33,7 +33,10 @@ flash_attn_sdpa_shim.install_as_flash_attn()
 
 import numpy as np
 import torch
-import trimesh
+try:
+    import trimesh
+except ModuleNotFoundError:
+    trimesh = None
 from PIL import Image
 from safetensors.torch import load_file
 
@@ -126,7 +129,13 @@ from trellis2.pipelines import Trellis2TexturingPipeline
 
 def _save(od, name, t):
     if torch.is_tensor(t):
-        t = t.detach().cpu().numpy()
+        # Cast to fp32 for float tensors so C-side read_npy_f32 consumers
+        # (e.g. test_hip_tex_dec) don't misinterpret fp16 bytes. Keep int
+        # tensors as-is.
+        if t.dtype.is_floating_point:
+            t = t.detach().float().cpu().numpy()
+        else:
+            t = t.detach().cpu().numpy()
     np.save(os.path.join(od, name), t)
 
 
@@ -143,6 +152,12 @@ def main():
     ap.add_argument('--config', default='texturing_pipeline.json')
     ap.add_argument('--dinov3', default='/mnt/disk1/models/dinov3-vitl16/model.safetensors',
                     help='Local timm DINOv3 ViT-L/16 safetensors (avoids HF gated repo)')
+    ap.add_argument('--dump-stages', action='store_true',
+                    help='Dump tex_slat_decoder per-stage hidden feats for HIP bisection')
+    ap.add_argument('--skip-dit', action='store_true',
+                    help='Reuse cached tex_slat_{feats,coords}.npy from --output-dir; '
+                         'still runs shape encoder so the decoder inherits the real '
+                         '_spatial_cache. Huge speedup for decoder-only bisection.')
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -153,11 +168,14 @@ def main():
     pipeline.to('cuda')
 
     # Install intermediate-dump hooks by calling stage methods manually.
-    image = Image.open(args.image)
     mesh = trimesh.load(args.mesh, process=False)
 
-    pre_image = pipeline.preprocess_image(image)
-    pre_image.save(os.path.join(args.output_dir, 'preprocess_image.png'))
+    if not args.skip_dit:
+        image = Image.open(args.image)
+        pre_image = pipeline.preprocess_image(image)
+        pre_image.save(os.path.join(args.output_dir, 'preprocess_image.png'))
+    else:
+        pre_image = None
 
     pre_mesh = pipeline.preprocess_mesh(mesh)
     pre_mesh.export(os.path.join(args.output_dir, 'preprocess_mesh.obj'))
@@ -171,9 +189,12 @@ def main():
 
     _vram('after_init')
     torch.manual_seed(args.seed)
-    cond = pipeline.get_cond([pre_image], args.resolution)
-    _save(args.output_dir, 'cond_features', cond['cond'])
-    _save(args.output_dir, 'cond_neg_features', cond['neg_cond'])
+    if not args.skip_dit:
+        cond = pipeline.get_cond([pre_image], args.resolution)
+        _save(args.output_dir, 'cond_features', cond['cond'])
+        _save(args.output_dir, 'cond_neg_features', cond['neg_cond'])
+    else:
+        cond = None
     gc.collect(); torch.cuda.empty_cache()
     _vram('after_cond')
 
@@ -186,18 +207,28 @@ def main():
     # Dump the subdivision caches the encoder populated on shape_slat's
     # _spatial_cache — the tex decoder's C2S blocks consume these (see
     # SparseChannel2Spatial.forward). Each entry is (new_coords, idx, subidx).
+    # _spatial_cache is {scale_tuple_str: {op_name: value}}. We want
+    # 'channel2spatial_2' entries at every scale so the CPU tex decoder can
+    # reproduce the pruned 8x expansion without running the shape encoder.
+    # We tag each dump with its coarse scale (scale of the tensor holding it).
+    import re
     cache = getattr(shape_slat, '_spatial_cache', None) or {}
-    for k, v in cache.items():
-        if not k.startswith('channel2spatial_'):
+    for scale_key, sub in cache.items():
+        if not isinstance(sub, dict):
             continue
+        m = re.search(r'Fraction\((\d+),\s*1\)', scale_key)
+        if not m:
+            continue
+        scale = int(m.group(1))
+        v = sub.get('channel2spatial_2')
         if not (isinstance(v, tuple) and len(v) == 3):
             continue
-        new_coords, idx, subidx = v
-        _save(args.output_dir, f'cache_{k}_coords', new_coords)
-        _save(args.output_dir, f'cache_{k}_idx', idx)
-        _save(args.output_dir, f'cache_{k}_subidx', subidx)
-        print(f'[cache] {k}: coords={tuple(new_coords.shape)} idx={tuple(idx.shape)} '
-              f'subidx={tuple(subidx.shape)}', flush=True)
+        x_coords, idx, subidx = v
+        tag = f'cache_scale{scale}_c2s'
+        _save(args.output_dir, f'{tag}_x_coords', x_coords)
+        _save(args.output_dir, f'{tag}_idx', idx)
+        _save(args.output_dir, f'{tag}_subidx', subidx)
+        print(f'[cache] scale={scale} c2s: N_fine={x_coords.shape[0]}', flush=True)
 
     gc.collect(); torch.cuda.empty_cache()
     _vram('after_shape_slat')
@@ -205,15 +236,163 @@ def main():
     tex_model = pipeline.models[
         'tex_slat_flow_model_512' if args.resolution == 512 else 'tex_slat_flow_model_1024'
     ]
-    tex_slat = pipeline.sample_tex_slat(cond, tex_model, shape_slat, {})
-    _save(args.output_dir, 'tex_slat_feats', tex_slat.feats)
-    _save(args.output_dir, 'tex_slat_coords', tex_slat.coords)
+    if args.skip_dit:
+        # Reuse cached DiT output. Start from shape_slat (which carries the real
+        # _spatial_cache from the shape encoder), then overwrite feats/coords
+        # with the cached tensors. sample_tex_slat normally re-uses shape_slat's
+        # structure, so this preserves cache identity.
+        import trellis2.modules.sparse as sp
+        cached_feats = torch.from_numpy(
+            np.load(os.path.join(args.output_dir, 'tex_slat_feats.npy'))).cuda()
+        cached_coords = torch.from_numpy(
+            np.load(os.path.join(args.output_dir, 'tex_slat_coords.npy'))).cuda().int()
+        tex_slat = sp.SparseTensor(feats=cached_feats, coords=cached_coords,
+                                   scale=shape_slat._scale)
+        tex_slat._spatial_cache = shape_slat._spatial_cache
+        print(f'[skip-dit] reused tex_slat: N={cached_feats.shape[0]} C={cached_feats.shape[1]}',
+              flush=True)
+    else:
+        tex_slat = pipeline.sample_tex_slat(cond, tex_model, shape_slat, {})
+        _save(args.output_dir, 'tex_slat_feats', tex_slat.feats)
+        _save(args.output_dir, 'tex_slat_coords', tex_slat.coords)
     torch.cuda.empty_cache()
 
-    pbr_voxel = pipeline.decode_tex_slat(tex_slat)
+    # Optional per-stage hidden-state dumps for HIP bisection.
+    if args.dump_stages:
+        import torch.nn.functional as F
+        dec = pipeline.models['tex_slat_decoder']
+        dec.to('cuda')
+        orig = dec.forward
+        def hooked(x, guide_subs=None, return_subs=False):
+            h = dec.from_latent(x).type(dec.dtype)
+            _save(args.output_dir, 'stage0_from_latent_feats', h.feats)
+
+            # Sub-op dump inside stage 0 block 0 for HIP bisection.
+            b0 = dec.blocks[0][0]
+            hc = b0.conv(h)
+            _save(args.output_dir, 'stage0_b0_post_conv_feats', hc.feats)
+            # Dump flex_gemm's neighbor cache for this conv so HIP can reproduce
+            # its neighbor-indexing convention.
+            _nc_key = 'SubMConv3d_neighbor_cache_3x3x3_dilation(1, 1, 1)'
+            _nc = h.get_spatial_cache(_nc_key)
+            if _nc is not None:
+                print(f'[neighbor_cache] type={type(_nc).__name__}', flush=True)
+                if isinstance(_nc, (tuple, list)):
+                    for idx, item in enumerate(_nc):
+                        if torch.is_tensor(item):
+                            _save(args.output_dir, f'stage0_b0_nbr_cache_{idx}', item)
+                            print(f'  [{idx}] tensor shape={tuple(item.shape)} dtype={item.dtype}', flush=True)
+                        else:
+                            print(f'  [{idx}] non-tensor: {item!r}', flush=True)
+                elif torch.is_tensor(_nc):
+                    _save(args.output_dir, 'stage0_b0_nbr_cache_0', _nc)
+                    print(f'  tensor shape={tuple(_nc.shape)}', flush=True)
+                else:
+                    # Custom object (e.g. SubMConv3dNeighborCache). Walk ALL attrs.
+                    print(f'  dir: {[a for a in dir(_nc) if not a.startswith("__")]}', flush=True)
+                    for attr in dir(_nc):
+                        if attr.startswith('__'):
+                            continue
+                        try:
+                            val = getattr(_nc, attr)
+                        except Exception as e:
+                            print(f'    .{attr}: <err {e}>', flush=True)
+                            continue
+                        if torch.is_tensor(val):
+                            _save(args.output_dir, f'stage0_b0_nbr_cache_{attr}', val)
+                            print(f'    .{attr}: tensor shape={tuple(val.shape)} dtype={val.dtype}', flush=True)
+                        elif callable(val):
+                            continue
+                        else:
+                            print(f'    .{attr}: {type(val).__name__} = {val!r}', flush=True)
+            hn = hc.replace(b0.norm(hc.feats))
+            _save(args.output_dir, 'stage0_b0_post_ln_feats', hn.feats)
+            hm = hn.replace(b0.mlp(hn.feats))
+            _save(args.output_dir, 'stage0_b0_post_mlp_feats', hm.feats)
+
+            _nc_key = 'SubMConv3d_neighbor_cache_3x3x3_dilation(1, 1, 1)'
+            def _dump_nmap(tag, tensor):
+                _nc = tensor.get_spatial_cache(_nc_key)
+                if _nc is not None and hasattr(_nc, 'neighbor_map'):
+                    _save(args.output_dir, f'{tag}_nmap', _nc.neighbor_map)
+            for i, res in enumerate(dec.blocks):
+                is_last = (i == len(dec.blocks) - 1)
+                for j, block in enumerate(res):
+                    if not is_last and j == len(res) - 1:
+                        _save(args.output_dir, f'stage{i}_pre_c2s_feats', h.feats)
+                        _save(args.output_dir, f'stage{i}_pre_c2s_coords', h.coords)
+                        _dump_nmap(f'stage{i}_convnext', h)
+                        if i == 0:
+                            # Inline stage 0 C2S with per-op dumps for HIP bisection.
+                            _dump_nmap(f'stage{i}_convnext', h)
+                            x_in = h
+                            hh = h.replace(block.norm1(h.feats))
+                            hh = hh.replace(F.silu(hh.feats))
+                            _save(args.output_dir, f'stage{i}_c2s_pre_conv1', hh.feats)
+                            hh = block.conv1(hh)
+                            _save(args.output_dir, f'stage{i}_c2s_post_conv1', hh.feats)
+                            hh = block.updown(hh, None)
+                            _save(args.output_dir, f'stage{i}_c2s_post_updown_h', hh.feats)
+                            xx = block.updown(x_in, None)
+                            _save(args.output_dir, f'stage{i}_c2s_post_updown_x', xx.feats)
+                            hh = hh.replace(block.norm2(hh.feats))
+                            hh = hh.replace(F.silu(hh.feats))
+                            _save(args.output_dir, f'stage{i}_c2s_pre_conv2', hh.feats)
+                            hh = block.conv2(hh)
+                            _save(args.output_dir, f'stage{i}_c2s_post_conv2', hh.feats)
+                            skip = block.skip_connection(xx)
+                            _save(args.output_dir, f'stage{i}_c2s_skip', skip.feats)
+                            h = hh + skip
+                        else:
+                            h = block(h, subdiv=guide_subs[i] if guide_subs else None)
+                        _dump_nmap(f'stage{i}_post_c2s', h)
+                        _save(args.output_dir, f'stage{i}_post_c2s_feats', h.feats)
+                    else:
+                        h = block(h)
+                        # Per-block dumps for stage 0 bisection.
+                        if i == 0:
+                            _save(args.output_dir, f'stage0_block{j}_feats', h.feats)
+                if is_last:
+                    _dump_nmap(f'stage{i}_convnext', h)
+                if is_last:
+                    _save(args.output_dir, f'stage{i}_pre_out_feats', h.feats)
+                    _save(args.output_dir, f'stage{i}_pre_out_coords', h.coords)
+            print('[dtype] x.dtype', x.dtype, 'h.feats.dtype before cast', h.feats.dtype, flush=True)
+            h = h.type(x.dtype)
+            print('[dtype] after h.type(x.dtype):', h.feats.dtype, flush=True)
+            _save(args.output_dir, 'final_pre_ln_feats', h.feats)
+            h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+            _save(args.output_dir, 'final_post_ln_feats', h.feats)
+            _save(args.output_dir, 'output_layer_weight', dec.output_layer.weight.detach())
+            _save(args.output_dir, 'output_layer_bias', dec.output_layer.bias.detach())
+            h_in = h.feats.detach().clone()
+            W_ol = dec.output_layer.weight
+            b_ol = dec.output_layer.bias
+            print('[ol] h_in', h_in.dtype, h_in.device, 'contig', h_in.is_contiguous(),
+                  'stride', h_in.stride(), 'W', W_ol.dtype, W_ol.device, flush=True)
+            print('[ol] h_in stats:', h_in.min().item(), h_in.max().item(),
+                  'any nan', torch.isnan(h_in).any().item(), flush=True)
+            h = dec.output_layer(h)
+            _save(args.output_dir, 'final_post_outlayer_feats', h.feats)
+            import torch.nn.functional as F2
+            manual = F2.linear(h_in, W_ol, b_ol)
+            _save(args.output_dir, 'final_post_outlayer_manual', manual)
+            manual_c = F2.linear(h_in.contiguous().float(), W_ol.float(), b_ol.float())
+            print('[check] max|hooked - manual| =', (h.feats - manual).abs().max().item(),
+                  'max|hooked - manual_contig_f32| =', (h.feats.float() - manual_c).abs().max().item(),
+                  'manual_c stats', manual_c.min().item(), manual_c.max().item(), flush=True)
+            return h
+        dec.forward = hooked
+        pbr_voxel = dec(tex_slat) * 0.5 + 0.5
+        dec.forward = orig
+    else:
+        pbr_voxel = pipeline.decode_tex_slat(tex_slat)
     _save(args.output_dir, 'pbr_voxel_feats', pbr_voxel.feats)
     _save(args.output_dir, 'pbr_voxel_coords', pbr_voxel.coords)
 
+    if args.skip_dit:
+        print('[skip-dit] skipping postprocess_mesh (decoder dumps complete)', flush=True)
+        return
     textured = pipeline.postprocess_mesh(pre_mesh, pbr_voxel, args.resolution, args.texture_size)
     out_glb = os.path.join(args.output_dir, 'textured.glb')
     textured.export(out_glb)
