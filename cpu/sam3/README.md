@@ -34,8 +34,13 @@ GEMM for verification, or accept the F16 tolerance for HIP parity.
 
 CLIP text encoder (24 layers, causal, erf-GELU) matches ref at valid
 token positions. Padded positions differ (attention mask for PAD keys
-not yet wired — downstream only consumes valid tokens). BPE tokenizer
-still pending; use `input_input_ids.npy` from `gen_image_ref.py` for now.
+not yet wired — downstream only consumes valid tokens).
+
+CLIP BPE tokenizer (`sam3_clip_bpe.{c,h}`) matches HF `CLIPTokenizer`
+exactly on ASCII phrases. Loads `vocab.json` + `merges.txt` from
+`/mnt/disk1/models/clip-bpe/` (copy from `openai/clip-vit-base-patch32`
+snapshot). `verify_bpe --text "cat" --refdir /tmp/sam3_ref_cat` prints
+`match: OK`. Wired into `./test_sam3 <ckpt> <image> --phrase "cat"`.
 
 DETR encoder (6 layers, self-attn + text-cross-attn + MLP, ReLU, sine
 pos encoding, hidden=256/8h/32hd/MLP=2048) matches ref mean within
@@ -106,7 +111,13 @@ Then:
     --refdir /tmp/sam3_ref_cat --target block0    # or block31, final
 ```
 
-## Run (stub)
+## Run
 
-`./test_sam3` currently only runs the implemented stages; text-prompt
-inference path will come online once the remaining stages land.
+```bash
+./test_sam3 /mnt/disk1/models/sam3/sam3.model.safetensors \
+    /tmp/sam2_cat.jpg --phrase "cat" -o /tmp/sam3_cat.npy -t 16
+```
+
+Runs full pipeline (live-tokenized phrase → ViT → FPN → text → DETR →
+dot_score → mask_dec → post-process) and writes kept masks as
+`(N, H, W)` uint8 `.npy`. ~75s on 16 threads.
