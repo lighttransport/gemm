@@ -14,6 +14,10 @@ TEST_SRC    = test_hip_trellis2.c
 TARGET       = test_hip_trellis2
 VERIFY_DIT   = verify_dit
 VERIFY_DEC   = verify_decoder
+TEX_SPCONV   = test_hip_sparse_conv
+TEX_CNEXT    = test_hip_convnext
+TEX_C2S      = test_hip_c2s
+TEX_DEC_FULL = test_hip_tex_dec
 
 COMMON_DEPS = hip_trellis2_runner.h hip_trellis2_kernels.h \
               ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
@@ -22,7 +26,41 @@ COMMON_DEPS = hip_trellis2_runner.h hip_trellis2_kernels.h \
 
 .PHONY: all clean run help verify-dit verify-dec
 
-all: $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC)
+all: $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC) $(TEX_SPCONV) $(TEX_CNEXT) $(TEX_C2S) $(TEX_DEC_FULL)
+
+$(TEX_DEC_FULL): test_hip_tex_dec.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
+                 ../rocew.h ../hip_runner_common.h \
+                 ../../common/safetensors.h ../../common/ggml_dequant.h \
+                 ../../common/sparse3d.h ../../common/trellis2_shape_decoder.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_tex_dec.c $(ROCEW_SRC) $(LDFLAGS)
+
+$(TEX_C2S): test_hip_c2s.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
+            ../rocew.h ../hip_runner_common.h \
+            ../../common/safetensors.h ../../common/ggml_dequant.h \
+            ../../common/sparse3d.h ../../common/trellis2_shape_decoder.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_c2s.c $(ROCEW_SRC) $(LDFLAGS)
+
+$(TEX_CNEXT): test_hip_convnext.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
+              ../rocew.h ../hip_runner_common.h \
+              ../../common/safetensors.h ../../common/ggml_dequant.h \
+              ../../common/sparse3d.h ../../common/trellis2_shape_decoder.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_convnext.c $(ROCEW_SRC) $(LDFLAGS)
+
+$(TEX_SPCONV): test_hip_sparse_conv.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
+               ../rocew.h ../hip_runner_common.h \
+               ../../common/safetensors.h ../../common/ggml_dequant.h \
+               ../../common/sparse3d.h ../../common/trellis2_shape_decoder.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_sparse_conv.c $(ROCEW_SRC) $(LDFLAGS)
+
+TEX_NMAP = test_hip_nmap
+$(TEX_NMAP): test_hip_nmap.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
+             ../rocew.h ../hip_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_hip_nmap.c $(ROCEW_SRC) $(LDFLAGS)
+
+TEX_NMAP_CONV = test_hip_nmap_conv
+$(TEX_NMAP_CONV): test_hip_nmap_conv.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
+                  ../rocew.h ../hip_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_hip_nmap_conv.c $(ROCEW_SRC) $(LDFLAGS)
 
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
 	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
@@ -58,6 +96,21 @@ full: $(TARGET)
 	  --features $(FEATURES) --noise $(NOISE) \
 	  --full --output-dir $(OUTDIR) --steps 12
 
+# Build CPU-correct pbr oracle (works around ROCm F.linear bug; see
+# build_pbr_cpu_oracle.py docstring). REF_DIR must contain dumped
+# stage<L>_pre_out_feats.npy + output_layer_{weight,bias}.npy from
+# `gen_stage2_ref.py --dump-stages`.
+REF_DIR ?= /tmp/tex_knight_r512_v2
+pbr-cpu-oracle:
+	python3 build_pbr_cpu_oracle.py --dir $(REF_DIR)
+
+# Run end-to-end HIP tex_dec and compare against CPU-correct pbr oracle.
+TEX_DEC_WEIGHTS ?= /mnt/disk1/hf-cache/hub/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors
+verify-tex-dec: $(TEX_DEC_FULL) pbr-cpu-oracle
+	./$(TEX_DEC_FULL) $(TEX_DEC_WEIGHTS) \
+	  $(REF_DIR)/tex_slat_feats.npy $(REF_DIR)/tex_slat_coords.npy \
+	  --cache $(REF_DIR) --full --ref $(REF_DIR)/pbr_voxel_feats_cpu.npy
+
 compare-blocks:
 	@echo "Comparing block hidden states with PyTorch reference..."
 	@for N in $$(seq -f '%02g' 0 29); do \
@@ -68,7 +121,7 @@ compare-blocks:
 	done
 
 clean:
-	rm -f $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC)
+	rm -f $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC) $(TEX_SPCONV) $(TEX_CNEXT)
 
 help:
 	@echo "HIP/ROCm TRELLIS.2 Stage 1 Runner (HIPRTC-based, no hipcc needed)"
