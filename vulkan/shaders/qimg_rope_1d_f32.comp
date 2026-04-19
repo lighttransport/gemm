@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// 3-axis RoPE for Qwen-Image text tokens
+// Same position (txt_start + tok) used for all 3 axes (temporal, height, width).
+// Grid: (n_tok, n_heads, 1), local_size = (1,1,1)
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer QBuffer { float q_buf[]; };
+layout(std430, binding = 1) buffer KBuffer { float k_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    uint txt_start;
+    uint t_dim;
+    uint h_dim;
+    uint w_dim;
+    float theta;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (tok >= pc.n_tok || head >= pc.n_heads) return;
+
+    uint dim = pc.n_heads * pc.head_dim;
+    uint off = head * pc.head_dim;
+    float pos = float(pc.txt_start + tok);
+
+    // Temporal RoPE
+    for (uint i = 0; i < pc.t_dim / 2; i++) {
+        float freq = 1.0 / pow(pc.theta, 2.0 * float(i) / float(pc.t_dim));
+        float angle = pos * freq;
+        float cs = cos(angle), sn = sin(angle);
+        uint idx = off + 2 * i;
+        float q0 = q_buf[tok*dim+idx], q1 = q_buf[tok*dim+idx+1];
+        q_buf[tok*dim+idx]   = q0*cs - q1*sn;
+        q_buf[tok*dim+idx+1] = q0*sn + q1*cs;
+        float k0 = k_buf[tok*dim+idx], k1 = k_buf[tok*dim+idx+1];
+        k_buf[tok*dim+idx]   = k0*cs - k1*sn;
+        k_buf[tok*dim+idx+1] = k0*sn + k1*cs;
+    }
+
+    // Height RoPE
+    for (uint i = 0; i < pc.h_dim / 2; i++) {
+        float freq = 1.0 / pow(pc.theta, 2.0 * float(i) / float(pc.h_dim));
+        float angle = pos * freq;
+        float cs = cos(angle), sn = sin(angle);
+        uint idx = off + pc.t_dim + 2 * i;
+        float q0 = q_buf[tok*dim+idx], q1 = q_buf[tok*dim+idx+1];
+        q_buf[tok*dim+idx]   = q0*cs - q1*sn;
+        q_buf[tok*dim+idx+1] = q0*sn + q1*cs;
+        float k0 = k_buf[tok*dim+idx], k1 = k_buf[tok*dim+idx+1];
+        k_buf[tok*dim+idx]   = k0*cs - k1*sn;
+        k_buf[tok*dim+idx+1] = k0*sn + k1*cs;
+    }
+
+    // Width RoPE
+    for (uint i = 0; i < pc.w_dim / 2; i++) {
+        float freq = 1.0 / pow(pc.theta, 2.0 * float(i) / float(pc.w_dim));
+        float angle = pos * freq;
+        float cs = cos(angle), sn = sin(angle);
+        uint idx = off + pc.t_dim + pc.h_dim + 2 * i;
+        float q0 = q_buf[tok*dim+idx], q1 = q_buf[tok*dim+idx+1];
+        q_buf[tok*dim+idx]   = q0*cs - q1*sn;
+        q_buf[tok*dim+idx+1] = q0*sn + q1*cs;
+        float k0 = k_buf[tok*dim+idx], k1 = k_buf[tok*dim+idx+1];
+        k_buf[tok*dim+idx]   = k0*cs - k1*sn;
+        k_buf[tok*dim+idx+1] = k0*sn + k1*cs;
+    }
+}

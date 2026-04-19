@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: MIT
+// Dense Conv3D: kernel=3, padding=1, stride=1
+// input: [Ci, D, H, W], weight: [Co, Ci, 3, 3, 3], bias: [Co], output: [Co, D, H, W]
+// Grid: (Co, ceil(D*H*W / 64), 1), workgroup: (64, 1, 1)
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer InpBuffer { float inp[]; };
+layout(std430, binding = 2) readonly buffer WeightBuffer { float weight[]; };
+layout(std430, binding = 3) readonly buffer BiasBuffer { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint Ci;
+    uint Co;
+    uint D;
+    uint H;
+    uint W;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint co = gl_WorkGroupID.x;
+    uint spatial_idx = gl_WorkGroupID.y * 64 + gl_LocalInvocationID.x;
+    uint spatial = pc.D * pc.H * pc.W;
+
+    if (co >= pc.Co || spatial_idx >= spatial) return;
+
+    uint d = spatial_idx / (pc.H * pc.W);
+    uint h = (spatial_idx / pc.W) % pc.H;
+    uint w = spatial_idx % pc.W;
+
+    float sum = (pc.has_bias != 0) ? bias[co] : 0.0;
+
+    for (uint ci = 0; ci < pc.Ci; ci++) {
+        uint kern_base = (co * pc.Ci + ci) * 27;
+        for (uint kd = 0; kd < 3; kd++) {
+            int dd = int(d) + int(kd) - 1;
+            if (dd < 0 || dd >= int(pc.D)) continue;
+            for (uint kh = 0; kh < 3; kh++) {
+                int hh = int(h) + int(kh) - 1;
+                if (hh < 0 || hh >= int(pc.H)) continue;
+                for (uint kw = 0; kw < 3; kw++) {
+                    int ww = int(w) + int(kw) - 1;
+                    if (ww < 0 || ww >= int(pc.W)) continue;
+                    sum += weight[kern_base + kd * 9 + kh * 3 + kw]
+                         * inp[ci * spatial + uint(dd) * pc.H * pc.W + uint(hh) * pc.W + uint(ww)];
+                }
+            }
+        }
+    }
+    out_buf[co * spatial + spatial_idx] = sum;
+}

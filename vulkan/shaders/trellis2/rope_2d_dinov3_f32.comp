@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// DINOv3 2D RoPE: rotate_half convention, applied to patch tokens only
+// Q, K: [seq, dim] where first n_prefix tokens are skipped
+// cos/sin: [n_patches, head_dim] precomputed 2D positional angles
+// Grid: (n_patches, 1, 1), workgroup: (256, 1, 1) — one thread per head
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer QBuffer { float Q[]; };
+layout(std430, binding = 1) buffer KBuffer { float K[]; };
+layout(std430, binding = 2) readonly buffer CosBuffer { float cos_tab[]; };
+layout(std430, binding = 3) readonly buffer SinBuffer { float sin_tab[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_patches;
+    uint n_prefix;   // CLS + register tokens to skip (5)
+    uint dim;
+    uint n_heads;
+    uint head_dim;
+} pc;
+
+void main() {
+    uint p = gl_WorkGroupID.x;
+    if (p >= pc.n_patches) return;
+
+    uint tok = pc.n_prefix + p;  // skip CLS + register tokens
+    uint half_hd = pc.head_dim / 2;
+
+    for (uint h = gl_LocalInvocationID.x; h < pc.n_heads; h += 256) {
+        // rotate_half: x' = x[:d/2]*cos - x[d/2:]*sin, x[d/2:]' = x[d/2:]*cos + x[:d/2]*sin
+        uint q_base = tok * pc.dim + h * pc.head_dim;
+        uint k_base = tok * pc.dim + h * pc.head_dim;
+        uint c_base = p * pc.head_dim;
+
+        for (uint d = 0; d < half_hd; d++) {
+            float c0 = cos_tab[c_base + d];
+            float s0 = sin_tab[c_base + d];
+            float c1 = cos_tab[c_base + half_hd + d];
+            float s1 = sin_tab[c_base + half_hd + d];
+
+            float q0 = Q[q_base + d];
+            float q1 = Q[q_base + half_hd + d];
+            Q[q_base + d]           = q0 * c0 + (-q1) * s0;
+            Q[q_base + half_hd + d] = q1 * c1 + q0 * s1;
+
+            float k0 = K[k_base + d];
+            float k1 = K[k_base + half_hd + d];
+            K[k_base + d]           = k0 * c0 + (-k1) * s0;
+            K[k_base + half_hd + d] = k1 * c1 + k0 * s1;
+        }
+    }
+}

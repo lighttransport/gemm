@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Gated residual addition for Flux.2 Klein DiT
+// x[i] += gate[i % dim] * proj[i]
+// Gate vector broadcasts across tokens.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer XBuffer { float x_buf[]; };
+layout(std430, binding = 1) readonly buffer ProjBuffer { float proj_buf[]; };
+layout(std430, binding = 2) readonly buffer GateBuffer { float gate_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint dim;
+} pc;
+
+void main() {
+    uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint total = pc.N * pc.dim;
+    if (i >= total) return;
+    x_buf[i] += gate_buf[i % pc.dim] * proj_buf[i];
+}
