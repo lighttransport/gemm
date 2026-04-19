@@ -81,6 +81,381 @@ static void save_ppm(const char *path, const float *rgb, int h, int w) {
     fprintf(stderr, "Saved %s (%dx%d)\n", path, w, h);
 }
 
+/* ---------------- Kernel unit tests (QIMG_FP8 paths) ---------------- */
+
+/* Local FP8 e4m3 decode (matches cuda_qimg_runner.h). */
+static float test_fp8_e4m3_to_f32(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp  = (b >> 3) & 0xF;
+    uint32_t mant = b & 0x7;
+    if (exp == 0 && mant == 0) return sign ? -0.0f : 0.0f;
+    float f;
+    if (exp == 0)                   f = ldexpf((float)mant / 8.0f, -6);
+    else if (exp == 15 && mant == 7) return 0.0f;  /* NaN → 0 */
+    else                             f = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
+    return sign ? -f : f;
+}
+
+static CUdeviceptr upload_f32(const float *h, size_t n) {
+    CUdeviceptr d = 0;
+    cuMemAlloc(&d, n * sizeof(float));
+    cuMemcpyHtoD(d, h, n * sizeof(float));
+    return d;
+}
+
+static CUdeviceptr upload_fp8_bytes(const uint8_t *h, size_t n) {
+    CUdeviceptr d = 0;
+    cuMemAlloc(&d, n);
+    cuMemcpyHtoD(d, h, n);
+    return d;
+}
+
+/* Test 1: FP8 MMA GEMM vs FP8 LUT GEMM (gemm_opt_fp8).
+ * Both consume the same raw e4m3 weight bytes; MMA quantizes X to e4m3 on the fly
+ * while gemm_opt_fp8 keeps X in F32. Tolerance is loose (FP8 drift). */
+static int test_kernel_fp8_gemm(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] gemm_fp8_scaled_f32 (MMA) vs gemm_opt_fp8 (LUT)... ");
+    if (!r->gemm_fp8_mma || !r->gemm_opt_fp8) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+    const int n_out = 256, n_in = 128, n_tok = 64;
+    size_t nW = (size_t)n_out * n_in;
+    size_t nX = (size_t)n_tok * n_in;
+    size_t nY = (size_t)n_tok * n_out;
+    uint8_t *W = (uint8_t *)malloc(nW);
+    float *X = (float *)malloc(nX * sizeof(float));
+    float *Y_mma = (float *)malloc(nY * sizeof(float));
+    float *Y_lut = (float *)malloc(nY * sizeof(float));
+    /* Generate small-magnitude random weights via round-to-e4m3 to avoid NaN
+     * (byte 0x7F / 0xFF) and saturating values that overflow the accumulator. */
+    rng_state = 12345;
+    for (size_t i = 0; i < nW; i++) {
+        /* Sample small F32, quantize to e4m3 via linear scan of the LUT */
+        float v = randn() * 0.05f;
+        float best = 1e30f; uint8_t bb = 0;
+        for (int b = 0; b < 256; b++) {
+            if (b == 0x7F || b == 0xFF) continue;  /* skip NaN */
+            float fv = test_fp8_e4m3_to_f32((uint8_t)b);
+            float d = fabsf(fv - v);
+            if (d < best) { best = d; bb = (uint8_t)b; }
+        }
+        W[i] = bb;
+    }
+    for (size_t i = 0; i < nX; i++) X[i] = randn() * 0.5f;
+
+    CUdeviceptr d_W = upload_fp8_bytes(W, nW);
+    CUdeviceptr d_X = upload_f32(X, nX);
+    CUdeviceptr d_Y = 0; cuMemAlloc(&d_Y, nY * sizeof(float));
+    CUdeviceptr bias = 0;
+
+    /* MMA path */
+    {
+        float w_scale = 1.0f;
+        CUdeviceptr x_max_ptr = 0;  /* skip per-tensor scaling in unit test */
+        int no = n_out, ni = n_in, nt = n_tok;
+        void *args[] = {&d_Y, &d_W, &d_X, &bias, &no, &ni, &nt, &w_scale, &x_max_ptr};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok +  31) /  32);
+        size_t smem = (size_t)(16 * 2) * 32 * sizeof(float);
+        cuLaunchKernel(r->gemm_fp8_mma, gx, gy, 1, 128, 1, 1,
+                       smem, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(Y_mma, d_Y, nY * sizeof(float));
+    }
+    /* LUT path */
+    {
+        int no = n_out, ni = n_in, nt = n_tok;
+        void *args[] = {&d_Y, &d_W, &d_X, &bias, &no, &ni, &nt};
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        cuLaunchKernel(r->gemm_opt_fp8, gx, gy, 1, 256, 1, 1,
+                       0, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(Y_lut, d_Y, nY * sizeof(float));
+    }
+    cuMemFree(d_W); cuMemFree(d_X); cuMemFree(d_Y);
+
+    /* Statistics: both paths quantize W the same way, so the main diff is
+     * X quantization (MMA path rounds X to e4m3, LUT path keeps F32). */
+    double ss = 0, sref = 0, max_abs = 0;
+    for (size_t i = 0; i < nY; i++) {
+        double d = (double)Y_mma[i] - (double)Y_lut[i];
+        ss += d * d; sref += (double)Y_lut[i] * Y_lut[i];
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+    }
+    double rms_ref = sqrt(sref / nY);
+    double rms_err = sqrt(ss / nY);
+    free(W); free(X); free(Y_mma); free(Y_lut);
+    /* Tolerance: FP8 input quantization adds ~5% noise relative to baseline */
+    if (rms_err > 0.15 * rms_ref) {
+        fprintf(stderr, "FAIL (rms_err=%.4g rms_ref=%.4g max_abs=%.4g)\n", rms_err, rms_ref, max_abs);
+        return 1;
+    }
+    fprintf(stderr, "OK (rms_err=%.4g rms_ref=%.4g max_abs=%.4g)\n", rms_err, rms_ref, max_abs);
+    return 0;
+}
+
+/* Test 2: flash_attn_fp8 MMA vs flash_attn_fp8_ref scalar.
+ * Both consume identical FP8-quantized Q/K/V; only the numerical order of the
+ * mma reductions differs. max_diff should be small (< 0.1). */
+static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_fp8 MMA vs scalar ref... ");
+    if (!r->flash_attn_fp8 || !r->quantize_fp8 || !r->reduce_max_abs) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+    /* Also need the scalar reference */
+    CUfunction fn_ref = NULL;
+    cuModuleGetFunction(&fn_ref, r->module, "flash_attn_fp8_ref");
+    if (!fn_ref) { fprintf(stderr, "SKIP (flash_attn_fp8_ref not loaded)\n"); return 0; }
+
+    const int n_tok = 48;
+    const int n_heads = 4;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_mma = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    rng_state = 999;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.7f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_out = 0; cuMemAlloc(&d_out, n_elems * sizeof(float));
+
+    /* Quantize Q/K/V (uses the runner's workspace via ensure_fp8_attn_buf) */
+    ensure_fp8_attn_buf(r, n_elems);
+    CUdeviceptr s_q = r->d_qkv_scales + 0 * sizeof(float);
+    CUdeviceptr s_k = r->d_qkv_scales + 1 * sizeof(float);
+    CUdeviceptr s_v = r->d_qkv_scales + 2 * sizeof(float);
+    int n_int = (int)n_elems;
+    quantize_buf_fp8(r, r->d_q_fp8, s_q, d_Q, n_int);
+    quantize_buf_fp8(r, r->d_k_fp8, s_k, d_K, n_int);
+    quantize_buf_fp8(r, r->d_v_fp8, s_v, d_V, n_int);
+
+    int nt = n_tok, nh = n_heads, hd = head_dim;
+    /* MMA path */
+    {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        size_t smem = (size_t)(32 * 128 + 128 * 32 + 4 * 16 * 32 * sizeof(float));
+        void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
+                        &nt, &nh, &hd, &r->d_qkv_scales};
+        cuLaunchKernel(r->flash_attn_fp8, (unsigned)nh, gy, 1,
+                       128, 1, 1, smem, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(out_mma, d_out, n_elems * sizeof(float));
+    }
+    /* Scalar ref path: grid=(n_heads, ceil(n_tok/32)), block=32 */
+    {
+        void *args[] = {&d_out, &r->d_q_fp8, &r->d_k_fp8, &r->d_v_fp8,
+                        &nt, &nh, &hd, &r->d_qkv_scales};
+        unsigned gy = (unsigned)((n_tok + 31) / 32);
+        cuLaunchKernel(fn_ref, (unsigned)nh, gy, 1,
+                       32, 1, 1, 0, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(out_ref, d_out, n_elems * sizeof(float));
+    }
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V); cuMemFree(d_out);
+
+    float max_diff = 0.0f, mean_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_mma[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+    }
+    mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_mma); free(out_ref);
+    if (max_diff > 0.15f) {
+        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+        return 1;
+    }
+    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g)\n", max_diff, mean_diff);
+    return 0;
+}
+
+/* Test 3: img_in linear projection against PyTorch reference.
+ * Loads dit_img_input.npy (16,64) F32 reference input, runs our FP8 GEMM
+ * against the img_in.weight + bias from the safetensors, and compares
+ * against dit_img_projected.npy (16, 3072) reference output. */
+static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path) {
+    fprintf(stderr, "  [kernel] img_in FP8 GEMM vs PyTorch reference... ");
+    if (!r->gemm_fp8_mma || !r->gemm_opt_fp8) {
+        fprintf(stderr, "SKIP (gemm kernels not loaded)\n");
+        return 0;
+    }
+    /* Load references */
+    const char *ref_dir = "/home/syoyo/work/gemm/diffusion/ref/qwen_image/output/";
+    char in_path[512], proj_path[512];
+    snprintf(in_path,   sizeof(in_path),   "%sdit_img_input.npy", ref_dir);
+    snprintf(proj_path, sizeof(proj_path), "%sdit_img_projected.npy", ref_dir);
+    FILE *f_in = fopen(in_path, "rb");
+    FILE *f_pj = fopen(proj_path, "rb");
+    if (!f_in || !f_pj) {
+        fprintf(stderr, "SKIP (reference %s or %s missing)\n", in_path, proj_path);
+        if (f_in) fclose(f_in);
+        if (f_pj) fclose(f_pj);
+        return 0;
+    }
+    /* crude .npy header skip: read magic+ver (8), header_len (2), header */
+    uint8_t hdr[10];
+    if (fread(hdr, 1, 10, f_in) != 10 || fread(hdr, 1, 10, f_pj) != 10) { fclose(f_in); fclose(f_pj); fprintf(stderr, "FAIL (npy header)\n"); return 1; }
+    fseek(f_in, 0, SEEK_SET); fseek(f_pj, 0, SEEK_SET);
+    fread(hdr, 1, 8, f_in); uint16_t hl_in; fread(&hl_in, 2, 1, f_in); fseek(f_in, 10 + hl_in, SEEK_SET);
+    fread(hdr, 1, 8, f_pj); uint16_t hl_pj; fread(&hl_pj, 2, 1, f_pj); fseek(f_pj, 10 + hl_pj, SEEK_SET);
+
+    const int n_tok = 16, n_in = 64, n_out = 3072;
+    size_t n_inp = (size_t)n_tok * n_in;
+    size_t n_out_elem = (size_t)n_tok * n_out;
+    float *inp = (float *)malloc(n_inp * sizeof(float));
+    float *ref = (float *)malloc(n_out_elem * sizeof(float));
+    float *out_f = (float *)malloc(n_out_elem * sizeof(float));
+    if (fread(inp, sizeof(float), n_inp, f_in) != n_inp ||
+        fread(ref, sizeof(float), n_out_elem, f_pj) != n_out_elem) {
+        fclose(f_in); fclose(f_pj); free(inp); free(ref); free(out_f);
+        fprintf(stderr, "FAIL (ref read)\n"); return 1;
+    }
+    fclose(f_in); fclose(f_pj);
+
+    /* Upload input + bias + weight (img_in is uploaded in cuda_qimg_load_dit, we
+     * re-upload via direct safetensors access to avoid loading the whole DiT) */
+    st_context *st = safetensors_open(dit_path);
+    if (!st) { fprintf(stderr, "SKIP (cannot open %s)\n", dit_path); free(inp); free(ref); free(out_f); return 0; }
+    CUdeviceptr d_w = qimg_st_upload_fp8_raw(st, "img_in.weight");
+    CUdeviceptr d_b = qimg_st_upload_f32(st, "img_in.bias");
+    safetensors_close(st);
+    CUdeviceptr d_x = upload_f32(inp, n_inp);
+    CUdeviceptr d_y = 0; cuMemAlloc(&d_y, n_out_elem * sizeof(float));
+
+    /* Run through op_gemm (respects use_fp8_mma flag) */
+    op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(out_f, d_y, n_out_elem * sizeof(float));
+
+    cuMemFree(d_w); cuMemFree(d_b); cuMemFree(d_x); cuMemFree(d_y);
+
+    /* Stats */
+    double ss_d = 0, ss_r = 0, mean_o = 0, mean_r = 0;
+    double max_abs = 0;
+    for (size_t i = 0; i < n_out_elem; i++) { mean_o += out_f[i]; mean_r += ref[i]; }
+    mean_o /= n_out_elem; mean_r /= n_out_elem;
+    double cov = 0, vo = 0, vr = 0;
+    for (size_t i = 0; i < n_out_elem; i++) {
+        double o = out_f[i] - mean_o, rr = ref[i] - mean_r;
+        cov += o * rr; vo += o * o; vr += rr * rr;
+        double d = out_f[i] - ref[i];
+        ss_d += d * d; ss_r += ref[i] * ref[i];
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+    }
+    double corr = cov / (sqrt(vo * vr) + 1e-30);
+    double rms_diff = sqrt(ss_d / n_out_elem);
+    double rms_ref  = sqrt(ss_r / n_out_elem);
+    free(inp); free(ref); free(out_f);
+
+    int fail = (corr < 0.999);
+    fprintf(stderr, "%s (corr=%.6f rms_diff=%.4f rms_ref=%.4f max_abs=%.4f use_fp8_mma=%d)\n",
+            fail ? "FAIL" : "OK", corr, rms_diff, rms_ref, max_abs, r->use_fp8_mma);
+    return fail;
+}
+
+/* Test 4: FP8 MMA vs LUT on production shape 3072x3072 with n_tok=256.
+ * Regression test for the FP8 MMA 3x-output bug found via trace_cfg_velocities.py:
+ * at 256x256 generation, img attn_q GEMM takes (n_tok=256, n_in=3072, n_out=3072)
+ * and the MMA output was 3x larger than the LUT output, breaking the pipeline. */
+static int test_kernel_fp8_gemm_production_shape(cuda_qimg_runner *r, const char *dit_path) {
+    fprintf(stderr, "  [kernel] gemm 3072x3072x256 MMA vs LUT (production shape)... ");
+    if (!r->gemm_fp8_mma || !r->gemm_opt_fp8) {
+        fprintf(stderr, "SKIP\n");
+        return 0;
+    }
+    st_context *st = safetensors_open(dit_path);
+    if (!st) { fprintf(stderr, "SKIP (cannot open %s)\n", dit_path); return 0; }
+    CUdeviceptr d_w = qimg_st_upload_fp8_raw(st, "transformer_blocks.0.attn.to_q.weight");
+    CUdeviceptr d_b = qimg_st_upload_f32(st, "transformer_blocks.0.attn.to_q.bias");
+    safetensors_close(st);
+    if (!d_w) { fprintf(stderr, "SKIP (weight missing)\n"); return 0; }
+
+    const int n_tok = 256, n_in = 3072, n_out = 3072;
+    size_t nX = (size_t)n_tok * n_in;
+    size_t nY = (size_t)n_tok * n_out;
+    float *X = (float *)malloc(nX * sizeof(float));
+    float *Y_mma = (float *)malloc(nY * sizeof(float));
+    float *Y_lut = (float *)malloc(nY * sizeof(float));
+    /* Prefer real pipeline data if the caller has dumped block0 adaln via
+     * --verbose 3, else fall back to random. */
+    FILE *af = fopen("cuda_block0_adaln.bin", "rb");
+    if (af) {
+        size_t got = fread(X, sizeof(float), nX, af);
+        fclose(af);
+        if (got != nX) {
+            rng_state = 99;
+            for (size_t i = 0; i < nX; i++) X[i] = randn() * 0.5f;
+        }
+    } else {
+        rng_state = 99;
+        for (size_t i = 0; i < nX; i++) X[i] = randn() * 0.5f;
+    }
+    CUdeviceptr d_x = upload_f32(X, nX);
+    CUdeviceptr d_y = 0; cuMemAlloc(&d_y, nY * sizeof(float));
+
+    int saved_mma = r->use_fp8_mma;
+    r->use_fp8_mma = 1;
+    op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(Y_mma, d_y, nY * sizeof(float));
+
+    r->use_fp8_mma = 0;
+    op_gemm(r, d_y, d_w, d_x, d_b, n_out, n_in, n_tok);
+    cuStreamSynchronize(r->stream);
+    cuMemcpyDtoH(Y_lut, d_y, nY * sizeof(float));
+    r->use_fp8_mma = saved_mma;
+
+    cuMemFree(d_w); cuMemFree(d_b); cuMemFree(d_x); cuMemFree(d_y);
+
+    double ss_d = 0, ss_lut = 0, ss_mma = 0;
+    for (size_t i = 0; i < nY; i++) {
+        double d = (double)Y_mma[i] - (double)Y_lut[i];
+        ss_d   += d * d;
+        ss_lut += (double)Y_lut[i] * Y_lut[i];
+        ss_mma += (double)Y_mma[i] * Y_mma[i];
+    }
+    double rms_lut = sqrt(ss_lut / nY);
+    double rms_mma = sqrt(ss_mma / nY);
+    double rms_d   = sqrt(ss_d   / nY);
+    double ratio = rms_mma / (rms_lut + 1e-30);
+    free(X); free(Y_mma); free(Y_lut);
+
+    int fail = (ratio > 1.5 || ratio < 0.67 || rms_d > 0.3 * rms_lut);
+    fprintf(stderr, "%s (rms_mma=%.4f rms_lut=%.4f ratio=%.3f rms_d=%.4f)\n",
+            fail ? "FAIL" : "OK", rms_mma, rms_lut, ratio, rms_d);
+    return fail;
+}
+
+static int test_kernels(void) {
+    fprintf(stderr, "=== Qwen-Image Kernel Unit Tests ===\n");
+    cuda_qimg_runner *r = cuda_qimg_init(0, 0);
+    if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    int fail = 0;
+    fail += test_kernel_fp8_gemm(r);
+    fail += test_kernel_fp8_attn(r);
+    /* The DiT-weight-vs-reference test needs a safetensors path; allow override */
+    const char *ref_dit = getenv("QIMG_TEST_DIT");
+    if (!ref_dit) ref_dit = "/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
+    fail += test_kernel_fp8_proj_vs_ref(r, ref_dit);
+    fail += test_kernel_fp8_gemm_production_shape(r, ref_dit);
+    cuda_qimg_free(r);
+    if (fail) fprintf(stderr, "=== Kernel Tests: %d FAILED ===\n", fail);
+    else      fprintf(stderr, "=== Kernel Tests: all OK ===\n");
+    return fail;
+}
+
 int main(int argc, char **argv) {
     const char *dit_path = "/mnt/nvme02/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
     const char *vae_path = "/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors";
@@ -96,6 +471,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--test-init") == 0) mode = "init";
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
+        else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
         else if (strcmp(argv[i], "--test-vae") == 0) mode = "vae";
         else if (strcmp(argv[i], "--generate") == 0) mode = "gen";
         else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
@@ -113,8 +489,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (uint64_t)atoll(argv[++i]);
     }
 
+    if (mode && strcmp(mode, "kernels") == 0) return test_kernels();
+
     if (!mode) {
-        fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--generate\n"
+        fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--test-kernels|--generate\n"
                 "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
                 "  --height <h>  --width <w>  --steps <n>  --seed <s>  --no-fp8\n", argv[0]);
         return 1;
@@ -390,6 +768,12 @@ int main(int argc, char **argv) {
          * ComfyUI's Timesteps has internal scale=1000 so t=sigma*1000) */
         qimg_scheduler sched;
         qimg_sched_init(&sched);
+        /* ComfyUI chain: ModelSamplingAdvanced(multiplier=1.0) passes sigma to the
+         * model; internally QwenTimestepProjEmbeddings uses Timesteps(scale=1000)
+         * which multiplies by 1000 before sinusoidal freq. Our qimg_timestep_embed
+         * takes the raw timestep and uses angle=t*freq (no internal scale=1000),
+         * so we must pre-scale by 1000 here. Effective angle = sigma*1000*freq,
+         * identical to Diffusers. */
         qimg_sched_set_timesteps_comfyui(&sched, n_steps, 3.1f, 1000.0f);
 
         /* CONST.noise_scaling: sigma * noise + (1-sigma) * latent_image
@@ -413,15 +797,13 @@ int main(int argc, char **argv) {
             /* Patchify latent */
             qimg_dit_patchify(img_tokens, latent, lat_ch, lat_h, lat_w, ps);
 
-            /* Conditional DiT forward (with text) */
-            cuda_qimg_dit_step(r, img_tokens, n_img, txt_hidden, n_txt,
-                               t_val, vel_cond);
-
             int lat_n = lat_ch * lat_h * lat_w;
             float *vel_latent = (float *)malloc((size_t)lat_n * sizeof(float));
 
             /* Euler step: x += v * dt (model output is velocity) */
             if (no_cfg) {
+                cuda_qimg_dit_step(r, img_tokens, n_img, txt_hidden, n_txt,
+                                   t_val, vel_cond);
                 qimg_dit_unpatchify(vel_latent, vel_cond, n_img, lat_ch, lat_h, lat_w, ps);
                 /* Debug: save step 1 model output (verbose >= 3) */
                 if (step == 0 && r->verbose >= 3) {
@@ -432,8 +814,13 @@ int main(int argc, char **argv) {
                     if (lf2) { fwrite(vel_latent, sizeof(float), (size_t)lat_n, lf2); fclose(lf2); }
                 }
             } else {
-                cuda_qimg_dit_step(r, img_tokens, n_img, txt_neg_hidden, n_txt_neg,
-                                   t_val, vel_uncond);
+                /* CFG batched: run cond and uncond through each block with a
+                 * single block-weight load per block (halves PCIe traffic on
+                 * the on-demand loader path). */
+                cuda_qimg_dit_step_cfg(r, img_tokens, n_img,
+                                       txt_hidden,      n_txt,
+                                       txt_neg_hidden,  n_txt_neg,
+                                       t_val, vel_cond, vel_uncond);
 
                 float *vc_lat = (float *)malloc((size_t)lat_n * sizeof(float));
                 float *vu_lat = (float *)malloc((size_t)lat_n * sizeof(float));
@@ -492,6 +879,35 @@ int main(int argc, char **argv) {
         free(img_tokens); free(vel_cond); free(vel_uncond);
         free(txt_hidden); free(txt_neg_hidden);
 
+        /* Save pre-Wan21 latent (DiT-normalized space, useful for per-block
+         * debugging) — ComfyUI's sample() output is actually in VAE-native
+         * space after process_out, saved separately below. */
+        {
+            int lat_n = lat_ch * lat_h * lat_w;
+            FILE *lf = fopen("cuda_latent_prenorm.npy", "wb");
+            if (lf) {
+                /* .npy header for shape (1,16,1,lat_h,lat_w) F32 little-endian */
+                char hdr[256];
+                int body = snprintf(hdr, sizeof(hdr),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1, 16, 1, %d, %d), }",
+                    lat_h, lat_w);
+                int total_hdr = 10 + body;
+                int pad = 64 - (total_hdr % 64); if (pad == 64) pad = 0;
+                for (int i = 0; i < pad - 1; i++) hdr[body + i] = ' ';
+                hdr[body + pad - 1] = '\n';
+                int header_len = body + pad;
+                uint8_t magic[10] = {0x93,'N','U','M','P','Y',1,0,
+                                     (uint8_t)(header_len & 0xFF),
+                                     (uint8_t)((header_len >> 8) & 0xFF)};
+                fwrite(magic, 1, 10, lf);
+                fwrite(hdr, 1, header_len, lf);
+                fwrite(latent, sizeof(float), (size_t)lat_n, lf);
+                fclose(lf);
+                fprintf(stderr, "Saved pre-Wan21 latent [1,%d,1,%d,%d] to cuda_latent_prenorm.npy\n",
+                        lat_ch, lat_h, lat_w);
+            }
+        }
+
         /* Wan21 process_latent_out: latent = latent * latents_std + latents_mean
          * The DiT operates in normalized space. Denormalize before VAE decode. */
         {
@@ -518,8 +934,40 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Saved latent [%d,%d,%d] to cuda_latent.bin\n", lat_ch, lat_h, lat_w); }
         }
 
+        /* Save post-Wan21 latent as .npy for direct comparison against
+         * ComfyUI's cf_ournoise2_*_latent.npy (which is in VAE-native space). */
+        {
+            int lat_n = lat_ch * lat_h * lat_w;
+            FILE *lf = fopen("cuda_latent_vae.npy", "wb");
+            if (lf) {
+                char hdr[256];
+                int body = snprintf(hdr, sizeof(hdr),
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1, 16, 1, %d, %d), }",
+                    lat_h, lat_w);
+                int total_hdr = 10 + body;
+                int pad = 64 - (total_hdr % 64); if (pad == 64) pad = 0;
+                for (int i = 0; i < pad - 1; i++) hdr[body + i] = ' ';
+                hdr[body + pad - 1] = '\n';
+                int header_len = body + pad;
+                uint8_t magic[10] = {0x93,'N','U','M','P','Y',1,0,
+                                     (uint8_t)(header_len & 0xFF),
+                                     (uint8_t)((header_len >> 8) & 0xFF)};
+                fwrite(magic, 1, 10, lf);
+                fwrite(hdr, 1, header_len, lf);
+                fwrite(latent, sizeof(float), (size_t)lat_n, lf);
+                fclose(lf);
+                fprintf(stderr, "Saved post-Wan21 latent [1,%d,1,%d,%d] to cuda_latent_vae.npy\n",
+                        lat_ch, lat_h, lat_w);
+            }
+        }
+
+        /* NOTE: do not call qimg_dit_unnormalize_latent here — the inline
+         * Wan21 block above (latent = latent * std + mean) already put the
+         * tensor in VAE-natural space. Calling it again applies the same
+         * affine a second time and produces a blurry washed-out image. */
+
         /* 3. VAE decode */
-        fprintf(stderr, "\n[3/3] VAE decode (CPU)...\n");
+        fprintf(stderr, "\n[3/3] VAE decode (GPU)...\n");
         cuda_qimg_load_vae(r, vae_path);
         float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
         t0 = clock();

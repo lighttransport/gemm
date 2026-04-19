@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Nearest-neighbor 2x upsample: [C, H, W] -> [C, 2H, 2W]
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuffer { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuffer { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint H;
+    uint W;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint oH = pc.H * 2, oW = pc.W * 2;
+    uint total = pc.C * oH * oW;
+    if (idx >= total) return;
+
+    uint c = idx / (oH * oW);
+    uint rem = idx % (oH * oW);
+    uint oy = rem / oW, ox = rem % oW;
+    uint iy = oy / 2, ix = ox / 2;
+    out_buf[idx] = in_buf[c * pc.H * pc.W + iy * pc.W + ix];
+}

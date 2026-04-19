@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+// Sparse 3D Convolution (k=3, stride=1, submanifold) with hash-table neighbor lookup
+//
+// For each output voxel, accumulate over 27 kernel positions.
+// Neighbors found via Fibonacci hash table (linear probing, uint64 keys).
+//
+// Buffers:
+//   0: out[N * Co]        - output features (must be zeroed or bias-initialized)
+//   1: feats[N * Ci]      - input features
+//   2: weight[Co * 27 * Ci] - conv weights, layout [Co, 27, Ci]
+//   3: bias[Co]           - bias (added during initialization)
+//   4: hash_keys[cap]     - packed uint64 keys (batch|z|y|x as uint16 each)
+//   5: hash_vals[cap]     - int32 voxel indices
+//   6: coords[N * 4]      - int32 (batch, z, y, x) per voxel
+//
+// Grid: (ceil(Co / TILE_CO), N, 1)
+// Workgroup: (TILE_CO, 1, 1)
+//
+// Each workgroup processes one voxel and TILE_CO output channels.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 1) readonly buffer FeatBuffer { float feats[]; };
+layout(std430, binding = 2) readonly buffer WeightBuffer { float weights[]; };
+layout(std430, binding = 3) readonly buffer BiasBuffer { float bias_buf[]; };
+layout(std430, binding = 4) readonly buffer HashKeys { uint64_t hash_keys[]; };
+layout(std430, binding = 5) readonly buffer HashVals { int hash_vals[]; };
+layout(std430, binding = 6) readonly buffer CoordBuffer { int coords[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;          // number of voxels
+    uint Ci;         // input channels
+    uint Co;         // output channels
+    uint hash_mask;  // capacity - 1
+} pc;
+
+// 27-neighbor offsets for 3x3x3 kernel
+const ivec3 offsets[27] = ivec3[27](
+    ivec3(-1,-1,-1), ivec3(-1,-1, 0), ivec3(-1,-1, 1),
+    ivec3(-1, 0,-1), ivec3(-1, 0, 0), ivec3(-1, 0, 1),
+    ivec3(-1, 1,-1), ivec3(-1, 1, 0), ivec3(-1, 1, 1),
+    ivec3( 0,-1,-1), ivec3( 0,-1, 0), ivec3( 0,-1, 1),
+    ivec3( 0, 0,-1), ivec3( 0, 0, 0), ivec3( 0, 0, 1),
+    ivec3( 0, 1,-1), ivec3( 0, 1, 0), ivec3( 0, 1, 1),
+    ivec3( 1,-1,-1), ivec3( 1,-1, 0), ivec3( 1,-1, 1),
+    ivec3( 1, 0,-1), ivec3( 1, 0, 0), ivec3( 1, 0, 1),
+    ivec3( 1, 1,-1), ivec3( 1, 1, 0), ivec3( 1, 1, 1)
+);
+
+// Pack (batch, z, y, x) into uint64 key matching CPU sp3d_hash
+uint64_t pack_coord(int b, int z, int y, int x) {
+    return (uint64_t(uint(b) & 0xFFFFu) << 48) |
+           (uint64_t(uint(z) & 0xFFFFu) << 32) |
+           (uint64_t(uint(y) & 0xFFFFu) << 16) |
+           uint64_t(uint(x) & 0xFFFFu);
+}
+
+// Fibonacci hash lookup: returns voxel index or -1
+int hash_lookup(uint64_t key) {
+    uint64_t GOLDEN = 0x9E3779B97F4A7C15UL;
+    uint slot = uint(key * GOLDEN) & pc.hash_mask;  /* low 32 bits, matching CPU */
+    uint64_t EMPTY = 0xFFFFFFFFFFFFFFFFUL;
+    for (uint probe = 0; probe <= pc.hash_mask; probe++) {
+        uint64_t k = hash_keys[slot];
+        if (k == EMPTY) return -1;
+        if (k == key) return hash_vals[slot];
+        slot = (slot + 1) & pc.hash_mask;
+    }
+    return -1;
+}
+
+void main() {
+    uint oc = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x;
+    uint vi = gl_WorkGroupID.y;  // voxel index
+
+    if (vi >= pc.N || oc >= pc.Co) return;
+
+    // Load voxel coordinates
+    int batch = coords[vi * 4 + 0];
+    int vz    = coords[vi * 4 + 1];
+    int vy    = coords[vi * 4 + 2];
+    int vx    = coords[vi * 4 + 3];
+
+    // Initialize with bias
+    float sum = bias_buf[oc];
+
+    // Weight stride: W[oc, k, ci] at index oc * (27 * Ci) + k * Ci + ci
+    uint w_base = oc * (27 * pc.Ci);
+
+    // Iterate 27 neighbors
+    for (uint k = 0; k < 27; k++) {
+        int nz = vz + offsets[k].x;
+        int ny = vy + offsets[k].y;
+        int nx = vx + offsets[k].z;
+
+        uint64_t nkey = pack_coord(batch, nz, ny, nx);
+        int ni = hash_lookup(nkey);
+        if (ni < 0) continue;
+
+        // Accumulate: sum += dot(W[oc, k, :], feats[ni, :])
+        uint feat_base = uint(ni) * pc.Ci;
+        uint w_off = w_base + k * pc.Ci;
+        for (uint ci = 0; ci < pc.Ci; ci++) {
+            sum += weights[w_off + ci] * feats[feat_base + ci];
+        }
+    }
+
+    out_buf[vi * pc.Co + oc] = sum;
+}

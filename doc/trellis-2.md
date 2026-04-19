@@ -170,17 +170,31 @@ ResBlock3d: `ChannelLN → SiLU → Conv3d → ChannelLN → SiLU → Conv3d + s
 | Marching cubes → .obj | `test_cuda_trellis2.c` (MC lib) | `test_trellis2.c` (inline) | skimage | Both work |
 | Full pipeline (features→mesh) | `test_cuda_trellis2` | `test_trellis2` | `run_official_e2e.py` | **Exact match (10.2% = 10.2%)** |
 
+### Stage 1: Vulkan (AMD RX 9070 XT, GFX1201 / RDNA4)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| DINOv3 ViT-L/16 encoder | ✓ CORRECT | max diff 0.011 vs official (corr > 0.9999) |
+| Stage 1 DiT (single step) | ✓ CORRECT | matches PyTorch exactly with same noise |
+| Stage 1 DiT + decoder (same noise) | ✓ CORRECT | 94% IoU with PyTorch reference |
+| Full pipeline (random noise) | ✓ WORKS | 7.8% occupancy with seed=42 |
+| Stage 2 shape flow DiT | ✓ IMPLEMENTED | Generic DiT, sparse RoPE, 12-step Euler + CFG |
+| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | GPU ConvNeXt + CPU C2S hybrid |
+| Stage 3 texture flow DiT | ✓ IMPLEMENTED | No CFG, [noise\|shape_norm] concat input |
+| Stage 3 texture decoder | ✓ IMPLEMENTED | Same GPU decoder, 6 output channels |
+| Cross-attn KV cache | ✓ IMPLEMENTED | Precomputed for all 30 blocks, saves ~2160 dispatches/stage |
+
 ### Stages 2-3
 
 | Component | CUDA | CPU | PyTorch Ref | Status |
 |-----------|------|-----|-------------|--------|
 | Sparse tensor infrastructure | — | `common/sparse3d.h` | — | CPU ops verified |
-| Stage 2 shape flow DiT | — | — | — | Not started |
-| Stage 2 shape decoder (SC-VAE) | — | — | — | Not started |
-| Stage 3 texture flow DiT | — | — | — | Not started |
-| Stage 3 texture decoder (SC-VAE) | — | — | — | Not started |
-| FlexGEMM sparse conv | — | — | — | Not started |
-| Mesh extraction from shape | — | — | — | Not started |
+| Stage 2 shape flow DiT | `cuda_trellis2_runner.c` | `trellis2_dit.h` | `run_stage2_ref.py` | **CUDA verified (corr=1.0)** |
+| Stage 2 shape decoder (SC-VAE) | — | `trellis2_shape_decoder.h` | — | CPU verified |
+| Stage 3 texture flow DiT | — | `trellis2_dit.h` | `run_stage3_tex_ref.py` | CPU 1-step verified |
+| Stage 3 texture decoder (SC-VAE) | — | `trellis2_shape_decoder.h` | — | CPU verified (small N) |
+| FDG mesh extraction | — | `trellis2_fdg_mesh.h` | — | CPU verified, .obj export |
+| Mesh extraction (marching cubes) | `test_cuda_trellis2.c` | `test_trellis2.c` | — | Both work |
 
 ## Numerical Verification Results
 
@@ -197,6 +211,11 @@ All results below use **matched initial noise** (same tensor loaded from .npy).
 | Decoder (zero input) | 0.99999952 | ~1e-4 | All-negative output (correct) |
 | Decoder (real latent) | 0.99999998 | 9.3e-5 | 26750 occupied = exact match |
 | **Full pipeline** | **1.00000000** | **~1e-4** | **10.2% occupancy = 10.2%** |
+| Stage 2 DiT step (N=100) | 1.00000000 | — | F32 weights |
+| Stage 2 DiT step (N=1000) | 1.00000000 | — | F32 weights |
+| Stage 2 DiT step (N=100, F16 MMA) | 0.99999990 | ~3e-4 | F16 weights, MMA tensor cores |
+| Stage 2 DiT step (N=5000, F16 MMA) | 0.99999992 | ~3e-4 | F16 MMA on sm_120 Blackwell |
+| **Stage 1→2 full pipeline** | — | — | **Stage 1: 45s, Stage 2: 58s (N=28K)** |
 
 ### Per-block DiT comparison (block 0)
 
@@ -234,14 +253,35 @@ cuBLAS tensor-core F16 GEMM vs our F32 tiled GEMM.
 Download:
 ```bash
 uvx --from huggingface_hub hf download timm/vit_large_patch16_dinov3.lvd1689m model.safetensors \
-  --local-dir /mnt/disk01/models/dinov3-vitl16
+  --local-dir /mnt/disk1/models/dinov3-vitl16
 uvx --from huggingface_hub hf download microsoft/TRELLIS.2-4B \
-  ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors --local-dir /mnt/disk01/models/trellis2-4b
+  ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors --local-dir /mnt/disk1/models/trellis2-4b
 uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
-  ckpts/ss_dec_conv3d_16l8_fp16.safetensors --local-dir /mnt/disk01/models/trellis-image-large
+  ckpts/ss_dec_conv3d_16l8_fp16.safetensors --local-dir /mnt/disk1/models/trellis-image-large
 ```
 
 ## Source Files
+
+### Vulkan implementation (`vulkan/trellis2/`)
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `vulkan_trellis2_runner.h` | ~175 | Public API (Stages 1-3, DINOv3, decoders) |
+| `vulkan_trellis2_runner.cc` | ~2500 | DINOv3 + generic DiT + Stages 1-3 sampling + GPU shape decoder + KV cache |
+| `test_vulkan_trellis2.cc` | ~400 | Test harness: full/dit-only/decode-only/encode/stage2/stage3/shape-dec/tex-dec modes |
+
+**Shaders** (`vulkan/shaders/trellis2/` — DiT + decoder):
+
+`adaln_f32`, `channel_layernorm_3d_f32`, `conv3d_k3_f32`, `dinov3_prepend_tokens_f32`,
+`gated_add_f32`, `layernorm_noaffine_f32`, `modulation_f32`, `pixel_shuffle_3d_f32`,
+`rope_2d_dinov3_f32`, `rope_3d_f32`, `self_attn_tiled_f32`, `silu_inplace_f32`,
+`sparse_conv3d_f32` (hash-table neighbor lookup, uint64 keys),
+`split_qkv_chunk_f32`, `split_kv_chunk_f32`, `timestep_embed_cossin_f32`
+
+**Shared shaders** (`vulkan/shaders/` — used by all Vulkan models):
+
+`gelu_f32`, `gemm_f32_f32` (tiled 64×16), `layernorm_f32`, `layerscale_add_f32`,
+`patch_embed_f32`, `rms_norm_f32` (per-head QK norm), `cross_attn_f32`
 
 ### CUDA implementation (`cuda/trellis2/`)
 
@@ -292,15 +332,28 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 | CFG rescale std | Minor numerical diff | RMS instead of proper torch.std (mean-subtracted, Bessel) | Use double-precision proper std |
 | **Decoder norm type** | **Decoder output flipped** | **Used GroupNorm, official uses ChannelLayerNorm** | **New channel_layernorm_3d_f32 kernel** |
 | DINOv3 final norm | Features range differs | TRELLIS.2 uses unparameterized LN, not learned norm | Apply plain LN in encoder |
+| **Stage 2 F16 GEMM** | **All GEMM output garbage** | **`use_f32_gemm` not set when loading Stage 2 standalone** | **Set flag in `cuda_trellis2_load_stage2`** |
+| **Stage 2 scratch overflow** | **Cross-attn produces 5e26** | **`scratch[1]` sized for self-attn N only, not cross-attn ctx_len*2D** | **Include `ca_kv_gemm_sz` in max** |
+| **Vulkan: DiT QK RMSNorm gamma** | **11/12 heads use wrong gamma → 0% occupancy** | **`rms_norm_f32.comp` used `w[i]` (head 0 gamma) instead of `w[h*head_dim+i]`** | **Fix gamma index (commit 4306224)** |
+| **Vulkan: DINOv3 patch embed dispatch** | **Tokens 256-1023 all zeros → features diff 14.75** | **`opPatchEmbed` dispatched 1024 workgroups instead of 4096 (shader covers 256 elements/group)** | **`(n_patches*dim+255)/256` workgroups (commit 4306224)** |
+| **Vulkan: GELU approximation** | **DINOv3 features max diff 0.061 vs official** | **`gelu_f32.comp` used tanh approximation; DINOv3 specifies exact erf GELU** | **Replace with A&S erf polynomial, max intrinsic error ~1.5e-7 (commit 70c3b70)** |
 
 ## Next Steps
 
-1. **DINOv3 GPU encoding**: Port the timm→transformers weight conversion to C, or implement
-   DINOv3 directly on GPU using the existing HY3D DINOv2 CUDA encoder as reference.
-2. **Stage 2 Shape DiT**: Sparse transformer on occupied voxel coordinates. Requires
-   FlexGEMM or equivalent sparse convolution backend.
-3. **Stage 2 Shape Decoder**: SC-VAE with sparse convolution + cross-attention decoder.
-4. **Stage 3 Texture**: Similar to Stage 2 but conditioned on shape + image.
-5. **F16 GEMM**: Switch from F32 tiled GEMM to F16 tensor-core GEMM for ~10x speedup
-   (would bring CUDA DiT from 8 min to ~1 min on RTX 5060 Ti).
-6. **CPU decoder fix**: Port ChannelLayerNorm fix to `trellis2_ss_decoder.h`.
+### CUDA
+1. **Stage 2 full sampling**: Integrate Stage 2 DiT into end-to-end flow sampling with CFG
+   on GPU (DiT forward verified, need sampling loop + shape decoder).
+2. **Stage 3 Texture CUDA**: Port Stage 3 texture flow DiT to GPU (same architecture).
+3. **Shape decoder CUDA**: Sparse conv SC-VAE decoder on GPU.
+4. **Texture decoder CUDA**: Sparse conv SC-VAE texture decoder on GPU.
+5. **F16 GEMM**: Switch from F32 tiled GEMM to F16 tensor-core GEMM for ~10x speedup.
+6. **Full GPU pipeline (CUDA)**: Image → DINOv3 → Stage 1 → Stage 2 → Stage 3 → mesh.
+
+### Vulkan
+1. **Test Stages 2–3 on GPU**: Validate Stage 2/3 DiT + decoder against CUDA/Python reference.
+   Needs Stage 2/3 weight files downloaded to `/mnt/disk1/models/`.
+2. **F16 GEMM**: Use `matmul_coopmat_f16` for cooperative matrix acceleration on RDNA4
+   (biggest remaining perf win — all stages bottlenecked by F32 GEMM).
+3. **GPU C2S subdivision**: Move coordinate expansion + hash build to GPU to eliminate
+   CPU roundtrip in shape/texture decoder (currently hybrid GPU+CPU).
+4. **FDG mesh extraction**: Port `trellis2_fdg_mesh.h` for final textured mesh output.

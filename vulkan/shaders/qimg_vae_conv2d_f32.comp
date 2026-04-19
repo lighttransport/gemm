@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2025 - Present, Light Transport Entertainment Inc.
+//
+// Generic Conv2D for VAE: supports replicate or zero padding
+// Grid: (ceil(co*h*w / 256), 1, 1), Block: (256, 1, 1)
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuffer { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuffer { float out_buf[]; };
+layout(std430, binding = 2) readonly buffer WBuffer { float w_buf[]; };
+layout(std430, binding = 3) readonly buffer BBuffer { float b_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ci;
+    uint h;
+    uint w;
+    uint co;
+    uint kh;
+    uint kw;
+    uint pad_replicate;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.co * pc.h * pc.w;
+    if (idx >= total) return;
+
+    uint oc = idx / (pc.h * pc.w);
+    uint rem = idx % (pc.h * pc.w);
+    uint oy = rem / pc.w, ox = rem % pc.w;
+    uint ph = (pc.kh - 1) / 2, pw = (pc.kw - 1) / 2;
+
+    float sum = (pc.has_bias != 0) ? b_buf[oc] : 0.0;
+
+    for (uint ic = 0; ic < pc.ci; ic++) {
+        for (uint fy = 0; fy < pc.kh; fy++) {
+            for (uint fx = 0; fx < pc.kw; fx++) {
+                int iy = int(oy + fy) - int(ph);
+                int ix = int(ox + fx) - int(pw);
+                if (pc.pad_replicate != 0) {
+                    if (iy < 0) iy = 0; if (iy >= int(pc.h)) iy = int(pc.h) - 1;
+                    if (ix < 0) ix = 0; if (ix >= int(pc.w)) ix = int(pc.w) - 1;
+                } else {
+                    if (iy < 0 || iy >= int(pc.h) || ix < 0 || ix >= int(pc.w)) continue;
+                }
+                sum += in_buf[ic * pc.h * pc.w + uint(iy) * pc.w + uint(ix)] *
+                       w_buf[((oc * pc.ci + ic) * pc.kh + fy) * pc.kw + fx];
+            }
+        }
+    }
+    out_buf[idx] = sum;
+}

@@ -167,6 +167,41 @@ static const char *hip_kernel_source =
 "    v[j + pair_off]  = v0 * sin_t + v1 * cos_t;\n"
 "}\n"
 "\n"
+"/* ---- 5b. rope_mrope_f32: M-RoPE with per-section frequencies ---- */\n"
+"/* Grid: n_heads blocks, blockDim: half_dim threads */\n"
+"/* sections[4] = {temporal, height, width, pad} dimension counts */\n"
+"/* For text-only: pos_t = pos_h = pos_w = pos */\n"
+"__global__ void rope_mrope_f32(float *vec, int n_heads, int head_dim,\n"
+"                                int pos_t, int pos_h, int pos_w,\n"
+"                                float freq_base,\n"
+"                                int sect0, int sect1, int sect2, int sect3) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    int half_dim = head_dim / 2;\n"
+"    if (j >= half_dim) return;\n"
+"\n"
+"    /* Determine which section this dimension pair belongs to */\n"
+"    int sect_sum = sect0 + sect1 + sect2 + sect3;\n"
+"    int rope_dim = 2 * sect_sum;\n"
+"    int pos;\n"
+"    if (j < sect0) pos = pos_t;\n"
+"    else if (j < sect0 + sect1) pos = pos_h;\n"
+"    else if (j < sect0 + sect1 + sect2) pos = pos_w;\n"
+"    else pos = 0;  /* padding section */\n"
+"\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float cos_t = cosf(theta);\n"
+"    float sin_t = sinf(theta);\n"
+"\n"
+"    float *v = vec + h * head_dim;\n"
+"    float v0 = v[j];\n"
+"    float v1 = v[j + half_dim];\n"
+"    v[j]             = v0 * cos_t - v1 * sin_t;\n"
+"    v[j + half_dim]  = v0 * sin_t + v1 * cos_t;\n"
+"}\n"
+"\n"
 "/* ---- 6. kv_cache_store: Copy K,V into cache at position ---- */\n"
 "__global__ void kv_cache_store(float *key_cache, float *value_cache,\n"
 "                                const float *k, const float *v,\n"
@@ -332,9 +367,15 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
-"/* ---- dp4a: INT8 dot product via HIP builtin ---- */\n"
+"/* ---- dp4a: INT8 dot product (software fallback for RDNA4) ---- */\n"
 "__device__ __forceinline__ int dp4a_s8(int a, int b, int c) {\n"
-"    return __dp4a(a, b, c);\n"
+"    signed char *av = (signed char*)&a;\n"
+"    signed char *bv = (signed char*)&b;\n"
+"    c += (int)av[0] * (int)bv[0];\n"
+"    c += (int)av[1] * (int)bv[1];\n"
+"    c += (int)av[2] * (int)bv[2];\n"
+"    c += (int)av[3] * (int)bv[3];\n"
+"    return c;\n"
 "}\n"
 "\n"
 "/* ---- 10. quantize_f32_to_int8: F32 vector -> INT8 + scale ---- */\n"
@@ -1029,6 +1070,9 @@ typedef struct {
     void *attn_q_w;       /* F16 [n_rows * n_cols] */
     void *attn_k_w;
     void *attn_v_w;
+    void *attn_q_bias;    /* F32 [n_embd] Q projection bias (Qwen2.5-VL) */
+    void *attn_k_bias;    /* F32 [kv_dim] K projection bias */
+    void *attn_v_bias;    /* F32 [kv_dim] V projection bias */
     void *attn_q_norm_w;  /* F32 [head_dim] */
     void *attn_k_norm_w;  /* F32 [head_dim] */
     void *attn_output_w;  /* F16 */
@@ -1110,6 +1154,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_f16_f32;
     hipFunction_t fn_qknorm_f32;
     hipFunction_t fn_rope_neox_f32;
+    hipFunction_t fn_rope_mrope_f32;
     hipFunction_t fn_kv_cache_store;
     hipFunction_t fn_attn_decode_f32;
     hipFunction_t fn_silu_mul_f32;
@@ -1164,6 +1209,8 @@ struct hip_llm_runner {
     int max_seq_len;
     float rope_freq_base;
     int n_rope_pairs;
+    int mrope_sections[4];  /* [temporal, height, width, pad] for M-RoPE */
+    int use_mrope;
     float rms_norm_eps;
     int debug_layers;
     int max_layers;
@@ -1268,6 +1315,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(qknorm_f32);
     GET_FUNC(rope_neox_f32);
+    GET_FUNC(rope_mrope_f32);
     GET_FUNC(kv_cache_store);
     GET_FUNC(attn_decode_f32);
     GET_FUNC(silu_mul_f32);
@@ -1342,7 +1390,7 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->device = device_id;
 
     CHECK_HIP_NULL(hipSetDevice(device_id));
-    CHECK_HIP_NULL(hipCtxCreate(&r->context, 0, r->device));
+    r->context = NULL;  /* use default context (no hipCtxCreate) */
     CHECK_HIP_NULL(hipStreamCreateWithFlags(&r->stream, hipStreamNonBlocking));
 
     if (verbose >= 1) {
@@ -1355,7 +1403,6 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     /* Compile kernels */
     if (compile_kernels(r) != 0) {
         hipStreamDestroy(r->stream);
-        hipCtxDestroy(r->context);
         free(r);
         return NULL;
     }
@@ -1447,6 +1494,7 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
     } else if (t->type == GGML_TYPE_Q2_K || t->type == GGML_TYPE_Q3_K ||
                t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K ||
                t->type == GGML_TYPE_Q6_K) {
+        /* K-quant types with real GPU kernels — upload raw */
         return upload_kquant_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_BF16) {
         *out_type = GGML_TYPE_F16;
@@ -1466,8 +1514,27 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
         if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
         return 0;
     } else {
-        fprintf(stderr, "hip_llm: upload_weight_matrix: unhandled type %d, treating as F16 (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
-        return upload_f16_matrix(d_ptr, t);
+        /* IQ types + other unsupported quant types — dequant to F32 on CPU, convert to F16, upload */
+        int n_elements = t->n_rows * t->n_cols;
+        if (n_elements <= 0 || !t->data) {
+            fprintf(stderr, "hip_llm: upload_weight_matrix: unhandled type %d, treating as F16 (rows=%d, cols=%d)\n", t->type, t->n_rows, t->n_cols);
+            return upload_f16_matrix(d_ptr, t);
+        }
+        float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
+        if (!f32_buf) return -1;
+        dequant_row(t->type, t->data, f32_buf, n_elements);
+        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
+        if (!f16_buf) { free(f32_buf); return -1; }
+        for (int i = 0; i < n_elements; i++) f16_buf[i] = hllm_f32_to_f16(f32_buf[i]);
+        free(f32_buf);
+        size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
+        hipError_t err = hipMalloc(d_ptr, nbytes);
+        if (err != hipSuccess) { free(f16_buf); return -1; }
+        err = hipMemcpy(*d_ptr, f16_buf, nbytes, hipMemcpyHostToDevice);
+        free(f16_buf);
+        *out_type = GGML_TYPE_F16;
+        if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
+        return 0;
     }
 }
 
@@ -1542,6 +1609,7 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
     else if (gguf_find_key(gguf, "qwen3vl.block_count") >= 0) arch = "qwen3vl";
+    else if (gguf_find_key(gguf, "qwen2vl.block_count") >= 0) arch = "qwen2vl";
 
     char kbuf[128];
     #define ARCH_KEY(suffix) (snprintf(kbuf, sizeof(kbuf), "%s." suffix, arch), kbuf)
@@ -1559,6 +1627,28 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     {
         int rope_dim_count = hllm_get_int(gguf, ARCH_KEY("rope.dimension_count"), 0);
         r->n_rope_pairs = (rope_dim_count > 0) ? rope_dim_count / 2 : 0;
+    }
+
+    /* M-RoPE sections (Qwen2-VL, Qwen3-VL) */
+    r->use_mrope = 0;
+    memset(r->mrope_sections, 0, sizeof(r->mrope_sections));
+    {
+        int idx = gguf_find_key(gguf, ARCH_KEY("rope.dimension_sections"));
+        if (idx >= 0 && gguf->kv[idx].type == GGUF_TYPE_ARRAY &&
+            gguf->kv[idx].value.arr.type == GGUF_TYPE_INT32) {
+            int n = (int)gguf->kv[idx].value.arr.n;
+            if (n > 4) n = 4;
+            int32_t *data = (int32_t *)gguf->kv[idx].value.arr.data;
+            for (int i = 0; i < n; i++) r->mrope_sections[i] = data[i];
+            int sect_sum = r->mrope_sections[0] + r->mrope_sections[1] +
+                           r->mrope_sections[2] + r->mrope_sections[3];
+            if (sect_sum > 0) {
+                r->use_mrope = 1;
+                fprintf(stderr, "hip_llm: M-RoPE sections=[%d, %d, %d, %d]\n",
+                        r->mrope_sections[0], r->mrope_sections[1],
+                        r->mrope_sections[2], r->mrope_sections[3]);
+            }
+        }
     }
 
     int ctx_len = hllm_get_int(gguf, ARCH_KEY("context_length"), 0);
@@ -1625,10 +1715,11 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     r->token_embd_type = embd.type;
     if (embd.type == GGML_TYPE_Q8_0) {
         if (upload_q8_0_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q2_K || embd.type == GGML_TYPE_Q3_K ||
-               embd.type == GGML_TYPE_Q4_K || embd.type == GGML_TYPE_Q6_K) {
+    } else if (embd.type == GGML_TYPE_Q2_K) {
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
-    } else if (embd.type == GGML_TYPE_Q5_K) {
+    } else if (embd.type == GGML_TYPE_Q3_K || embd.type == GGML_TYPE_Q4_K ||
+               embd.type == GGML_TYPE_Q5_K || embd.type == GGML_TYPE_Q6_K) {
+        /* Dequant to F16 for embedding lookup (no dedicated Q4_K/Q5_K embed kernel) */
         int n_elements = embd.n_rows * embd.n_cols;
         float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
         if (!f32_buf) return -1;
@@ -1742,6 +1833,20 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             t = hllm_load_tensor(gguf, name, 1);
             cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
             if (upload_weight_matrix(&cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
+
+            /* Attention biases (optional, e.g. Qwen2.5-VL) */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) {
+                if (l == 0) fprintf(stderr, "hip_llm: loading attention biases (Q/K/V)\n");
+                if (upload_norm_f32(&cl->attn_q_bias, &t, cl->attn_q_rows) != 0) return -1;
+            }
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_norm_f32(&cl->attn_k_bias, &t, cl->attn_k_rows) != 0) return -1; }
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);
+            t = hllm_load_tensor(gguf, name, 0);
+            if (t.data) { if (upload_norm_f32(&cl->attn_v_bias, &t, cl->attn_v_rows) != 0) return -1; }
 
             snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l);
             t = hllm_load_tensor(gguf, name, 0);
@@ -1937,10 +2042,20 @@ static inline void launch_qknorm(hip_llm_runner *r, void *vec, void *w,
 
 static inline void launch_rope(hip_llm_runner *r, void *vec, int n_heads,
                                 int head_dim, int pos, float freq_base) {
-    int half_dim = head_dim / 2;
-    int n_rope_pairs = r->n_rope_pairs;
-    void *args[] = { &vec, &n_heads, &head_dim, &pos, &freq_base, &n_rope_pairs };
-    LAUNCH(r->fn_rope_neox_f32, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    if (r->use_mrope) {
+        /* M-RoPE: for text-only, all position axes = pos */
+        int half_dim = head_dim / 2;
+        int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
+        int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
+        void *args[] = { &vec, &n_heads, &head_dim, &pos, &pos, &pos,
+                         &freq_base, &s0, &s1, &s2, &s3 };
+        LAUNCH(r->fn_rope_mrope_f32, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    } else {
+        int half_dim = head_dim / 2;
+        int n_rope_pairs = r->n_rope_pairs;
+        void *args[] = { &vec, &n_heads, &head_dim, &pos, &freq_base, &n_rope_pairs };
+        LAUNCH(r->fn_rope_neox_f32, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    }
 }
 
 static inline void launch_kv_store(hip_llm_runner *r, void *key_cache, void *value_cache,
@@ -2266,6 +2381,11 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
             launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
             launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
 
+            /* Attention biases (Qwen2.5-VL) */
+            if (cl->attn_q_bias) launch_add(r, r->d_q, cl->attn_q_bias, cl->attn_q_rows);
+            if (cl->attn_k_bias) launch_add(r, r->d_k, cl->attn_k_bias, cl->attn_k_rows);
+            if (cl->attn_v_bias) launch_add(r, r->d_v, cl->attn_v_bias, cl->attn_v_rows);
+
             if (cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, head_dim, eps);
                 if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
@@ -2354,6 +2474,7 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
                           cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
             launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
                           cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+
             launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
             launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                           cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
@@ -2460,6 +2581,48 @@ void hip_llm_set_max_layers(hip_llm_runner *r, int max_layers) {
 /* Public API: free                                                         */
 /* ======================================================================== */
 
+void hip_llm_offload(hip_llm_runner *r) {
+    if (!r) return;
+    /* Free GPU weight and activation buffers only — keep module, stream, context */
+    if (r->d_x)    { hipFree(r->d_x);    r->d_x = NULL; }
+    if (r->d_xb)   { hipFree(r->d_xb);   r->d_xb = NULL; }
+    if (r->d_xb2)  { hipFree(r->d_xb2);  r->d_xb2 = NULL; }
+    if (r->d_q)    { hipFree(r->d_q);    r->d_q = NULL; }
+    if (r->d_k)    { hipFree(r->d_k);    r->d_k = NULL; }
+    if (r->d_v)    { hipFree(r->d_v);    r->d_v = NULL; }
+    if (r->d_gate) { hipFree(r->d_gate); r->d_gate = NULL; }
+    if (r->d_up)   { hipFree(r->d_up);   r->d_up = NULL; }
+    if (r->d_xb_q)    { hipFree(r->d_xb_q);    r->d_xb_q = NULL; }
+    if (r->d_xb_scale){ hipFree(r->d_xb_scale); r->d_xb_scale = NULL; }
+    if (r->d_logits)  { hipFree(r->d_logits);   r->d_logits = NULL; }
+    if (r->d_token_embd) { hipFree(r->d_token_embd); r->d_token_embd = NULL; }
+    if (r->d_output_norm){ hipFree(r->d_output_norm); r->d_output_norm = NULL; }
+    if (r->d_output_w && r->d_output_w != r->d_token_embd) { hipFree(r->d_output_w); }
+    r->d_output_w = NULL;
+    if (r->d_key_cache) {
+        for (int l = 0; l < r->n_layers; l++)
+            if (r->d_key_cache[l]) hipFree(r->d_key_cache[l]);
+        free(r->d_key_cache); r->d_key_cache = NULL;
+    }
+    if (r->d_value_cache) {
+        for (int l = 0; l < r->n_layers; l++)
+            if (r->d_value_cache[l]) hipFree(r->d_value_cache[l]);
+        free(r->d_value_cache); r->d_value_cache = NULL;
+    }
+    if (r->layers) {
+        for (int l = 0; l < r->n_layers; l++) {
+            hip_layer *cl = &r->layers[l];
+            void **ptrs = (void **)cl;
+            /* Free all non-NULL GPU pointers in the layer struct */
+            for (size_t i = 0; i < sizeof(hip_layer) / sizeof(void *); i++)
+                if (ptrs[i]) { hipFree(ptrs[i]); ptrs[i] = NULL; }
+        }
+        free(r->layers); r->layers = NULL;
+    }
+    hipDeviceSynchronize();
+    fprintf(stderr, "hip_llm: offloaded GPU weights (VRAM freed)\n");
+}
+
 void hip_llm_free(hip_llm_runner *r) {
     if (!r) return;
 
@@ -2507,6 +2670,9 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->attn_q_w)      hipFree(cl->attn_q_w);
             if (cl->attn_k_w)      hipFree(cl->attn_k_w);
             if (cl->attn_v_w)      hipFree(cl->attn_v_w);
+            if (cl->attn_q_bias)   hipFree(cl->attn_q_bias);
+            if (cl->attn_k_bias)   hipFree(cl->attn_k_bias);
+            if (cl->attn_v_bias)   hipFree(cl->attn_v_bias);
             if (cl->attn_q_norm_w) hipFree(cl->attn_q_norm_w);
             if (cl->attn_k_norm_w) hipFree(cl->attn_k_norm_w);
             if (cl->attn_output_w) hipFree(cl->attn_output_w);
@@ -2547,7 +2713,6 @@ void hip_llm_free(hip_llm_runner *r) {
     free(r->h_output);
 
     if (r->stream) hipStreamDestroy(r->stream);
-    if (r->context) hipCtxDestroy(r->context);
 
     free(r);
 }
