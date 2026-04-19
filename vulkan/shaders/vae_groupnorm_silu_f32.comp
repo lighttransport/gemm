@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: MIT
+// GroupNorm + optional SiLU: [C, spatial] -> [C, spatial]
+// One workgroup per group. Shared-memory reduction for mean/var.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuf { float out_buf[]; };
+layout(std430, binding = 2) readonly buffer GammaBuf { float gamma_buf[]; };
+layout(std430, binding = 3) readonly buffer BetaBuf { float beta_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C, spatial, num_groups;
+    uint apply_silu;
+} pc;
+
+shared float s_sum[256];
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    if (g >= pc.num_groups) return;
+    uint group_size = pc.C / pc.num_groups;
+    uint c0 = g * group_size;
+    uint ne = group_size * pc.spatial;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Mean
+    float s = 0.0;
+    for (uint i = tid; i < ne; i += 256) {
+        uint ch = c0 + i / pc.spatial;
+        uint sp = i % pc.spatial;
+        s += in_buf[ch * pc.spatial + sp];
+    }
+    s_sum[tid] = s;
+    barrier();
+    for (uint r = 128; r > 0; r >>= 1) { if (tid < r) s_sum[tid] += s_sum[tid + r]; barrier(); }
+    float mean = s_sum[0] / float(ne);
+    barrier();
+
+    // Var
+    s = 0.0;
+    for (uint i = tid; i < ne; i += 256) {
+        uint ch = c0 + i / pc.spatial;
+        uint sp = i % pc.spatial;
+        float d = in_buf[ch * pc.spatial + sp] - mean;
+        s += d * d;
+    }
+    s_sum[tid] = s;
+    barrier();
+    for (uint r = 128; r > 0; r >>= 1) { if (tid < r) s_sum[tid] += s_sum[tid + r]; barrier(); }
+    float inv = inversesqrt(s_sum[0] / float(ne) + 1e-6);
+
+    // Normalize + scale + shift + optional SiLU
+    for (uint i = tid; i < ne; i += 256) {
+        uint ch = c0 + i / pc.spatial;
+        uint sp = i % pc.spatial;
+        float v = (in_buf[ch * pc.spatial + sp] - mean) * inv;
+        v = v * gamma_buf[ch] + beta_buf[ch];
+        if (pc.apply_silu != 0) v = v / (1.0 + exp(-v));
+        out_buf[ch * pc.spatial + sp] = v;
+    }
+}

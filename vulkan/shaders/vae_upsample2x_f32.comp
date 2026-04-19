@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: MIT
+// Nearest-neighbor 2x upsample: [C,H,W] -> [C,2H,2W]
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C, H, W;
+} pc;
+
+void main() {
+    uint idx = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    uint total = pc.C * pc.H * pc.W;
+    if (idx >= total) return;
+    uint ch = idx / (pc.H * pc.W);
+    uint rem = idx % (pc.H * pc.W);
+    uint y = rem / pc.W, x = rem % pc.W;
+    float v = in_buf[idx];
+    uint oH = 2 * pc.H, oW = 2 * pc.W;
+    uint base = ch * oH * oW;
+    out_buf[base + (2*y)   * oW + 2*x]     = v;
+    out_buf[base + (2*y)   * oW + 2*x + 1] = v;
+    out_buf[base + (2*y+1) * oW + 2*x]     = v;
+    out_buf[base + (2*y+1) * oW + 2*x + 1] = v;
+}
