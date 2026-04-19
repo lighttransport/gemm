@@ -35,10 +35,10 @@ endif
 HEADERS = $(wildcard $(COMMON)/*.h) sam3_runner.h
 
 .PHONY: all clean
-all: test_sam3 verify_patch_embed verify_vit verify_fpn verify_text verify_detr verify_detr_dec verify_dot_score verify_mask verify_final
+all: test_sam3 verify_patch_embed verify_vit verify_fpn verify_text verify_detr verify_detr_dec verify_dot_score verify_mask verify_final verify_bpe
 
-test_sam3: test_sam3.c sam3_runner.c $(HEADERS)
-	$(CC) $(CFLAGS) -I$(COMMON) -I. -o $@ test_sam3.c sam3_runner.c $(LDFLAGS)
+test_sam3: test_sam3.c sam3_runner.c sam3_clip_bpe.c $(HEADERS) sam3_clip_bpe.h
+	$(CC) $(CFLAGS) -I$(COMMON) -I. -o $@ test_sam3.c sam3_runner.c sam3_clip_bpe.c $(LDFLAGS)
 
 verify_patch_embed: verify_patch_embed.c sam3_runner.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -I. -o $@ verify_patch_embed.c sam3_runner.c $(LDFLAGS)
@@ -67,7 +67,10 @@ verify_mask: verify_mask.c sam3_runner.c $(HEADERS)
 verify_final: verify_final.c sam3_runner.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -I. -o $@ verify_final.c sam3_runner.c $(LDFLAGS)
 
+verify_bpe: verify_bpe.c sam3_clip_bpe.c sam3_clip_bpe.h
+	$(CC) $(CFLAGS) -I$(COMMON) -I. -o $@ verify_bpe.c sam3_clip_bpe.c $(LDFLAGS)
+
 clean:
 	rm -f test_sam3 verify_patch_embed verify_vit verify_fpn \
 	      verify_text verify_detr verify_detr_dec \
-	      verify_dot_score verify_mask
+	      verify_dot_score verify_mask verify_final verify_bpe
