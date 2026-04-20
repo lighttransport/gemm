@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAM3 Segmentation Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
+    main { max-width: 920px; margin: 0 auto; padding: 28px 18px; }
+    h1 { font-size: 28px; margin: 0 0 18px; }
+    form, .output { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    label { display: block; font-size: 13px; font-weight: 650; margin: 12px 0 6px; }
+    input, textarea, select, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 10px; }
+    textarea { min-height: 84px; resize: vertical; }
+    button { margin-top: 14px; background: #1b6f5f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111; color: #f4f4f4; padding: 12px; border-radius: 6px; min-height: 70px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SAM3 Segmentation</h1>
+  <form id="form">
+    <div class="row">
+      <div><label for="backend">Backend</label><select id="backend"><option>cpu</option><option>hip</option></select></div>
+      <div><label for="image">Image</label><input id="image" type="file" accept="image/*"></div>
+    </div>
+    <label for="text">Text prompt</label>
+    <input id="text" placeholder="object to segment">
+    <label for="points">Points JSON</label>
+    <textarea id="points">[]</textarea>
+    <label for="boxes">Boxes JSON</label>
+    <textarea id="boxes">[]</textarea>
+    <button type="submit">Segment</button>
+  </form>
+  <section class="output">
+    <pre id="log">SAM3 is exposed as a v1 API stub until native CPU/HIP runners are added.</pre>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+function readFileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1] || '');
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+document.getElementById('form').addEventListener('submit', async event => {
+  event.preventDefault();
+  $('log').textContent = 'Sending request...';
+  const file = $('image').files[0];
+  const payload = {
+    model: 'sam3',
+    task: 'segmentation',
+    backend: $('backend').value,
+    inputs: {
+      text: $('text').value,
+      image_base64: file ? await readFileBase64(file) : null,
+      image_mime: file ? file.type : null,
+      points: JSON.parse($('points').value || '[]'),
+      boxes: JSON.parse($('boxes').value || '[]')
+    },
+    weights: {},
+    params: {}
+  };
+  try {
+    const res = await fetch('/v1/infer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    $('log').textContent = JSON.stringify(await res.json(), null, 2);
+  } catch (err) {
+    $('log').textContent = String(err);
+  }
+});
+</script>
+</body>
+</html>

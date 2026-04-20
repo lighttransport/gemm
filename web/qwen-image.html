@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen-Image Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
+    main { max-width: 1040px; margin: 0 auto; padding: 28px 18px; }
+    h1 { font-size: 28px; margin: 0 0 18px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 420px) minmax(0, 1fr); gap: 20px; align-items: start; }
+    form, .output { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 16px; }
+    label { display: block; font-size: 13px; font-weight: 650; margin: 12px 0 6px; }
+    input, textarea, select, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 10px; }
+    textarea { min-height: 84px; resize: vertical; }
+    button { margin-top: 14px; background: #1b6f5f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    img { max-width: 100%; height: auto; display: block; border-radius: 6px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111; color: #f4f4f4; padding: 12px; border-radius: 6px; min-height: 58px; }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Qwen-Image</h1>
+  <div class="grid">
+    <form id="form">
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt">a red apple on a white table</textarea>
+
+      <div class="row">
+        <div><label for="backend">Backend</label><select id="backend"><option>hip</option><option>cpu</option><option>cuda</option><option>vulkan</option></select></div>
+        <div><label for="seed">Seed</label><input id="seed" type="number" value="42"></div>
+      </div>
+      <div class="row">
+        <div><label for="width">Width</label><input id="width" type="number" value="256"></div>
+        <div><label for="height">Height</label><input id="height" type="number" value="256"></div>
+      </div>
+      <div class="row">
+        <div><label for="steps">Steps</label><input id="steps" type="number" value="20"></div>
+        <div><label for="device">Device</label><input id="device" type="number" value="0"></div>
+      </div>
+
+      <label for="dit">DiT path</label>
+      <input id="dit" placeholder="/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors">
+      <label for="vae">VAE path</label>
+      <input id="vae" placeholder="/mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors">
+      <label for="enc">Text encoder path</label>
+      <input id="enc" placeholder="/mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf">
+      <label for="bias">Text encoder bias path</label>
+      <input id="bias" placeholder="optional">
+      <button type="submit">Generate</button>
+    </form>
+
+    <section class="output">
+      <div id="image"></div>
+      <pre id="log">Ready.</pre>
+    </section>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+document.getElementById('form').addEventListener('submit', async event => {
+  event.preventDefault();
+  $('log').textContent = 'Generating...';
+  $('image').innerHTML = '';
+  const weights = {
+    dit: $('dit').value || null,
+    vae: $('vae').value || null,
+    text_encoder: $('enc').value || null,
+    text_encoder_bias: $('bias').value || null
+  };
+  Object.keys(weights).forEach(k => weights[k] === null && delete weights[k]);
+  const payload = {
+    model: 'qwen-image',
+    task: 'text-to-image',
+    backend: $('backend').value,
+    inputs: { text: $('prompt').value },
+    weights,
+    params: {
+      width: Number($('width').value),
+      height: Number($('height').value),
+      steps: Number($('steps').value),
+      seed: Number($('seed').value),
+      device: Number($('device').value)
+    }
+  };
+  try {
+    const res = await fetch('/v1/infer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const json = await res.json();
+    $('log').textContent = JSON.stringify(json.ok ? { ok: true, model: json.model, backend: json.backend, timings_ms: json.timings_ms } : json, null, 2);
+    if (json.ok && json.outputs && json.outputs[0]) {
+      const img = new Image();
+      img.src = `data:${json.outputs[0].mime};base64,${json.outputs[0].data_base64}`;
+      $('image').appendChild(img);
+    }
+  } catch (err) {
+    $('log').textContent = String(err);
+  }
+});
+</script>
+</body>
+</html>
