@@ -1,0 +1,4 @@
+{"cmd":"health"}
+{"cmd":"models"}
+{"cmd":"infer","request":{"model":"sam3","task":"segmentation","backend":"cpu","inputs":{"text":"cat"}}}
+{"model":"qwen-image","task":"text-to-image","backend":"cpu","inputs":{"text":"cat"},"params":{"width":64,"height":64,"steps":1}}
