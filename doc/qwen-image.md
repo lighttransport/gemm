@@ -254,7 +254,34 @@ The HIP runner is **3× faster** than the pytorch-rocm diffusers reference (sequ
 | Final latent cosine vs ref | 1.0 (self) | **0.9936** |
 | PNG PSNR vs ref | ∞ | **30.0 dB** |
 
-PSNR is lower than the original ComfyUI FP8 file (30 dB vs 49 dB) because the 6 BF16-stored global GEMMs run through F32 + downstream BF16 trunc instead of the FP8 LUT/WMMA fused-trunc path. The visual output still matches the diffusers reference closely (same pose/colour/shape).
+PSNR is lower than the original ComfyUI FP8 file (30 dB vs 49 dB) because the 6 BF16-stored global GEMMs run through F32 + downstream BF16 trunc instead of the FP8 LUT/WMMA fused-trunc path. Note: the earlier 30 dB number was measured against a diffusers *reference* generated at **cfg=1** (single forward) with the same 2512 checkpoint, which turned out to be a weak reference — see the next subsection.
+
+**Current 2512 state (2026-04-15) — KNOWN BROKEN at cfg=1.**
+
+Free-running 2512 generations at `true_cfg_scale=1` produce semantically-wrong outputs in **both** diffusers and HIP for most prompts. Side-by-side at 256×256 / 20 steps / seed=42 / cfg=1 (`ref/qwen_image/compare_2512/compare_grid.png`):
+
+| prompt | diffusers 2512 (cfg=1) | HIP 2512 (cfg=1) |
+|---|---|---|
+| `"a photo of a cat sitting on grass"`   | fox-like creature (not a cat) | woman in a field (not a cat) |
+| `"a modern glass office building at sunset"` | abstract coloured grid  | abstract glassy grid |
+| `"a snowy mountain landscape with pine trees"` | snowy mountains ✓  | clear mountains ✓ |
+
+Only the mountain prompt reliably grounds. Both runners drift on object/subject prompts, which strongly hints the **text conditioning is the problem**, not the DiT or VAE: mountain-landscape embeddings sit in a denser part of the Qwen2.5-VL latent space and survive even weak guidance, while object prompts need CFG to break out of the "average scene" mode. Hypotheses to rule out (in order):
+
+1. **cfg=1 was inappropriate.** Qwen-Image-2512 was trained with CFG; the released examples (e.g. unsloth tutorial) use `true_cfg_scale=4.0`. The whole cfg=1 regression test needs to be redone at cfg=4. *(IN PROGRESS — HIP runner is single-forward only, so HIP apples-to-apples at cfg=4 requires adding a CFG combine step.)*
+2. **2512 text encoder preprocessing differs from the original.** The 2512 refresh may require a different chat template / system prompt / attention-mask layout before the Qwen2.5-VL text hidden states are fed into `txt_in`. `dump_diffusers_pipeline.py` currently calls `pipe.encode_prompt(prompt, …, max_sequence_length=512)` which doesn't thread a prompt template — need to compare the raw `prompt_embeds` tensor from the 2512 pipeline against the original FP8 pipeline for the same prompt to see if they agree up to a shape.
+3. **2512's sigma / timestep schedule differs.** The unsloth page advertises "2-step" variants. We've been running the 20-step schedule unchanged from the original checkpoint — if 2512 ships a different `FlowMatchEulerDiscreteScheduler` config (different `shift` / `num_train_timesteps`), running with the old schedule would mis-time every step.
+4. **BF16 global GEMMs drift the modulation projections.** The 6 BF16-stored globals include `time_text_embed.timestep_embedder.linear_{1,2}.weight`, which produces the per-block `img_mod / txt_mod` vectors. If our F32 fallback GEMM accumulates differently than diffusers' BF16 matmul, every block's adaLN is off by a few LSBs — which matters most at early timesteps where the signal is smallest.
+
+**TODOs** (in priority order):
+
+- [ ] Re-run `gen_diffusers_reference.py` with `--cfg 4.0` for cat / building / mountain / detailed-retriever prompts; confirm diffusers 2512 at cfg=4 actually produces good images. If yes, (1) is confirmed and the issue is "HIP is single-forward only at the moment".
+- [ ] Add `--cfg <scale>` + `--negative <prompt>` to `test_hip_qimg --generate`: runs two DiT forwards per step (positive + negative) and combines via `vel = uncond + cfg * (cond - uncond)`. This roughly doubles DiT wall time but enables apples-to-apples vs diffusers 2512.
+- [ ] Dump `prompt_embeds` from both diffusers pipelines (original FP8 vs 2512) for the same prompt+seed and diff them. If they already agree, the text encoder path is fine and only CFG matters; if they disagree, hypothesis (2) is live and we need to match preprocessing.
+- [ ] Check `pipe.scheduler.config` on the 2512 pipeline vs original and diff any field that affects sigma generation.
+- [ ] Regenerate the `apple_ref_2512.png` reference at cfg=4 and re-measure HIP PSNR against it (once HIP supports CFG).
+
+**What is NOT broken:** the DiT numerics themselves (`verify_qimg_dit` still passes at max_diff < 1e-3 vs the CPU reference on random inputs), the VAE (mountain output is sharp, and the original ComfyUI FP8 file at cfg=1 still reaches 49 dB PSNR), and the per-block FP8 vs BF16 dispatch for mixed-dtype checkpoints (it loads, runs, and decodes without NaNs). Only the free-running 2512 pipeline at cfg=1 is producing weak outputs.
 
 ### PyTorch Reference (`ref/qwen_image/`)
 
