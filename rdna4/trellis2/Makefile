@@ -72,8 +72,8 @@ $(VERIFY_DEC): verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
 	$(CC) $(CFLAGS) -fopenmp -o $@ verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
 # Default weight paths — override on the command line
-DIT     ?= /mnt/disk1/models/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors
-DECODER ?= /mnt/disk1/models/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors
+DIT     ?= /path/to/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors
+DECODER ?= /path/to/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors
 FEATURES ?= /tmp/t2ref/ref_features.npy
 NOISE    ?= /tmp/t2ref/ref_noise_init.npy
 OUTDIR   ?= /tmp/t2hip
@@ -105,7 +105,7 @@ pbr-cpu-oracle:
 	python3 build_pbr_cpu_oracle.py --dir $(REF_DIR)
 
 # Run end-to-end HIP tex_dec and compare against CPU-correct pbr oracle.
-TEX_DEC_WEIGHTS ?= /mnt/disk1/hf-cache/hub/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors
+TEX_DEC_WEIGHTS ?= /path/to/TRELLIS.2-4B/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors
 verify-tex-dec: $(TEX_DEC_FULL) pbr-cpu-oracle
 	./$(TEX_DEC_FULL) $(TEX_DEC_WEIGHTS) \
 	  $(REF_DIR)/tex_slat_feats.npy $(REF_DIR)/tex_slat_coords.npy \
