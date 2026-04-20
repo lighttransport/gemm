@@ -4,9 +4,12 @@ Loads a mesh (from Stage 1) + image, runs the texturing pipeline end-to-end,
 saves intermediate tensors + a final textured GLB.
 
 Prereqs:
-  - venv: /mnt/disk1/work/gemm/main/rdna4/trellis2/.venv (torch 2.11+rocm7.2)
+  - venv: $RDNA4_DIR/.venv (torch 2.11+rocm7.2)
   - shims: rdna4/trellis2/texgen_sw_rast.py + cumesh_xatlas_shim.py
   - env: ATTN_BACKEND=sdpa (set automatically)
+
+Paths are resolved relative to the repo root (two levels up from this file)
+by default, and may be overridden with the RDNA4_DIR / REPO_DIR env vars.
 """
 
 import argparse
@@ -15,8 +18,9 @@ import sys
 
 os.environ.setdefault('ATTN_BACKEND', 'sdpa')
 
-RDNA4_DIR = '/mnt/disk1/work/gemm/main/rdna4/trellis2'
-REPO_DIR = '/mnt/disk1/work/gemm/main/cpu/trellis2/trellis2_repo'
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+RDNA4_DIR = os.environ.get('RDNA4_DIR', os.path.join(_REPO_ROOT, 'rdna4', 'trellis2'))
+REPO_DIR = os.environ.get('REPO_DIR', os.path.join(_REPO_ROOT, 'cpu', 'trellis2', 'trellis2_repo'))
 sys.path.insert(0, RDNA4_DIR)
 sys.path.insert(0, REPO_DIR)
 
@@ -150,8 +154,11 @@ def main():
     ap.add_argument('--texture-size', type=int, default=1024)
     ap.add_argument('--model-id', default='microsoft/TRELLIS.2-4B')
     ap.add_argument('--config', default='texturing_pipeline.json')
-    ap.add_argument('--dinov3', default='/mnt/disk1/models/dinov3-vitl16/model.safetensors',
-                    help='Local timm DINOv3 ViT-L/16 safetensors (avoids HF gated repo)')
+    ap.add_argument('--dinov3',
+                    default=os.environ.get('DINOV3_WEIGHTS',
+                                           '/path/to/dinov3-vitl16/model.safetensors'),
+                    help='Local timm DINOv3 ViT-L/16 safetensors (avoids HF gated repo). '
+                         'Defaults to $DINOV3_WEIGHTS if set.')
     ap.add_argument('--dump-stages', action='store_true',
                     help='Dump tex_slat_decoder per-stage hidden feats for HIP bisection')
     ap.add_argument('--skip-dit', action='store_true',

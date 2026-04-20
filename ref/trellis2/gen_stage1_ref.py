@@ -9,9 +9,9 @@ layer-by-layer comparison with the HIP implementation.
 Usage:
   python gen_stage1_ref.py \
     --image teapot.png \
-    --dinov3 /mnt/disk1/models/dinov3-vitl16/model.safetensors \
-    --stage1 /mnt/disk1/models/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors \
-    --decoder /mnt/disk1/models/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors \
+    --dinov3 /path/to/dinov3-vitl16/model.safetensors \
+    --stage1 /path/to/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors \
+    --decoder /path/to/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors \
     --seed 42 --output-dir /tmp/t2ref
 """
 import sys, os, time, argparse

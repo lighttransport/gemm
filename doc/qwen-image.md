@@ -123,7 +123,7 @@ The "simple" scheduler pre-computes 1000 shifted sigmas, then picks `n_steps` ev
 
 ## Weight Files
 
-All weights stored under `/mnt/disk01/models/qwen-image-st/` (ComfyUI FP8 format):
+All weights stored under `/path/to/qwen-image-st/` (ComfyUI FP8 format):
 
 | Component | File | Format | Size |
 |---|---|---|---|
@@ -145,7 +145,7 @@ The **Qwen-Image-2512** refresh (Dec 2025) has its own single-file FP8 release o
 
 The pytorch-rocm reference under `ref/qwen_image/` defaults to loading the local ComfyUI FP8 DiT via `diffusers.QwenImageTransformer2DModel.from_single_file(...)` so it produces an apples-to-apples comparison against the HIP runner. Pass `--fp8-dit <path>` to point at a different single-file checkpoint (e.g. the 2512 release), or `--fp8-dit ""` to fall back to the BF16 multi-shard transformer from the official `Qwen/Qwen-Image` HF repo.
 
-**Alternative GGUF weights** (at `/mnt/disk01/models/qwen-image/`):
+**Alternative GGUF weights** (at `/path/to/qwen-image/`):
 
 | Component | File | Format | Size |
 |---|---|---|---|
@@ -339,9 +339,9 @@ make test_qwen_image
 
 # Full pipeline (128×128, 20 steps)
 ./test_qwen_image --generate \
-    /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors \
-    /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors \
-    /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
+    /path/to/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors \
+    /path/to/qwen-image-st/vae/qwen_image_vae.safetensors \
+    /path/to/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
     --height 128 --width 128 --steps 20 --prompt "a red apple on a white table"
 ```
 
@@ -351,8 +351,8 @@ make test_qwen_image
 # Step 1: Generate ComfyUI reference data (requires ComfyUI + GPU)
 cd ref/qwen_image
 python generate_reference.py --all \
-    --comfyui-dir /mnt/disk01/ComfyUI \
-    --model-dir /mnt/disk01/models/qwen-image-st
+    --comfyui-dir /path/to/ComfyUI \
+    --model-dir /path/to/qwen-image-st
 
 # Step 2: Generate our output with debug dumps
 cd cuda/qimg
