@@ -127,8 +127,8 @@ Image (RGB)
 
 | Parameter | Value |
 |-----------|-------|
-| Normalization | **ChannelLayerNorm** (LayerNorm across C per spatial position) |
-| Groups | N/A (not GroupNorm) |
+| Normalization | **GroupNorm(32)** (32 groups; with C=32 → 1 channel/group = per-channel spatial norm) |
+| Groups | 32 (always, regardless of channel count) |
 
 ```
 input_layer:  Conv3d(8 → 512, k=3, pad=1)        [512, 16³]
@@ -140,11 +140,11 @@ blocks.3-4:   2× ResBlock3d(128)                    [128, 32³]
 blocks.5:     Conv3d(128 → 256, k=3, pad=1)        [256, 32³]
               pixel_shuffle_3d(factor=2)             → [32, 64³]
 blocks.6-7:   2× ResBlock3d(32)                     [32, 64³]
-out_layer:    ChannelLayerNorm(32) → SiLU → Conv3d(32→1, k=3)
+out_layer:    GroupNorm(32) → SiLU → Conv3d(32→1, k=3)
 Output:       [1, 64, 64, 64] occupancy logits
 ```
 
-ResBlock3d: `ChannelLN → SiLU → Conv3d → ChannelLN → SiLU → Conv3d + skip`
+ResBlock3d: `GN(32) → SiLU → Conv3d → GN(32) → SiLU → Conv3d + skip`
 
 ### Stages 2-3 (Not Yet Implemented)
 
@@ -183,6 +183,35 @@ ResBlock3d: `ChannelLN → SiLU → Conv3d → ChannelLN → SiLU → Conv3d + s
 | Stage 3 texture flow DiT | ✓ IMPLEMENTED | No CFG, [noise\|shape_norm] concat input |
 | Stage 3 texture decoder | ✓ IMPLEMENTED | Same GPU decoder, 6 output channels |
 | Cross-attn KV cache | ✓ IMPLEMENTED | Precomputed for all 30 blocks, saves ~2160 dispatches/stage |
+
+### Stage 1: HIP/ROCm (AMD RX 9070 XT, GFX1201 / RDNA4)
+
+| Component | Status | Correlation | Notes |
+|-----------|--------|-------------|-------|
+| DINOv3 ViT-L/16 encoder | CPU only | — | Uses `common/dinov3.h` (210s @ 16 threads) |
+| Stage 1 DiT (single step) | ✓ CORRECT | **0.99999754** | F16 GEMM (BF16→F16 weights), corr target 0.9999 exceeded |
+| Stage 1 Decoder (zero input) | ✓ CORRECT | **1.00000000** | GroupNorm kernel, 866x speedup vs CPU |
+| Full pipeline (12-step CFG + decode) | ⚠ RUNS | — | Pipeline completes; occupancy too high (~70% vs expected ~2-10%). DiT+decoder individually verified, CFG sampling loop under investigation |
+| DiT per-step time | — | — | 144s/step (F16 tiled GEMM, not yet optimized) |
+| Decoder time | — | — | 0.4s |
+| DINOv3 features (C vs PyTorch) | ✓ MATCH | **0.99999326** | max_diff=0.116, C encoder features essentially correct |
+| PyTorch reference (ROCm 7.2) | ✓ WORKS | — | `gen_stage1_ref.py` runs on ROCm GPU (~110s for 12 steps + decode) |
+
+**Bugs fixed during HIP port** (in order of discovery):
+
+| Bug | Symptom | Root Cause | Fix |
+|-----|---------|-----------|-----|
+| HIP kernel launch ABI | SIGSEGV on GPU forward | Struct-buffer `extra` param crashes on ROCm gfx1201 | Use pointer-array `kernelParams` style |
+| DiT tensor names | SIGSEGV (NULL weights) | Wrong safetensors tensor names for block weights | Match `common/trellis2_dit.h` names |
+| adaLN_modulation weight dtype | All-zero output | `mod_w` uploaded as F16, kernel reads as F32 | Upload as F32 (`st_upload_f32`) |
+| Timestep scaling | Wrong modulation | CPU uses `t * 1000`, GPU used `t` raw | Scale by 1000 before sinusoidal embed |
+| RoPE frequencies | Wrong attention | `10000^(-2i/head_dim)` vs correct `10000^(-i/n_freqs)` | Match CPU formula |
+| Epsilon value | Minor numerical diff | GPU used eps=1e-5, CPU uses eps=1e-6 | Set all eps to 1e-6 |
+| GELU variant | Minor numerical diff | GPU used exact erf GELU, CPU uses tanh approx | Use tanh GELU |
+| Double bias add | Bias added 2× | `gemm(bias=x)` then `broadcast_bias(x)` in CA KV cache | Pass NULL bias to gemm |
+| **d_t_out buffer aliasing** | **Block 1+ diverges (corr 0.75)** | **FC2 output stored in d_mod, overwritten by per-block modulation** | **Use d_ada_out as FC2 output buffer** |
+| **Decoder normalization** | **Decoder output all zeros / wrong sign** | **Used per-spatial ChannelLN instead of GroupNorm(32)** | **Replace kernel with GroupNorm** |
+| **ResBlock skip aliasing** | **Decoder output corrupted** | **conv_out = d_dec[1] same as buf (skip), destroying residual** | **3-buffer resblock: buf + tmp1 + tmp2** |
 
 ### Stages 2-3
 
@@ -232,15 +261,16 @@ All results below use **matched initial noise** (same tensor loaded from .npy).
 
 ## Performance
 
-| Stage | CPU (Zen2, 4T) | CUDA (RTX 5060 Ti) | PyTorch (RTX 5060 Ti) |
-|-------|----------------|---------------------|----------------------|
-| DINOv3 encode | ~3.5 min | — (CPU features) | ~8 sec |
-| Stage 1 DiT (12 steps, CFG) | ~9 hours | **~8 min** | ~34 sec |
-| Decoder | ~22 min | ~0.5 sec | ~0.2 sec |
-| **Total** | **~9.5 hours** | **~8 min** | **~42 sec** |
+| Stage | CPU (Zen4, 16T) | CUDA (RTX 5060 Ti) | HIP (RX 9070 XT) | PyTorch (RX 9070 XT) |
+|-------|----------------|---------------------|-------------------|----------------------|
+| DINOv3 encode | ~3.5 min | — (CPU features) | — (CPU features) | ~10 sec |
+| Stage 1 DiT (12 steps, CFG) | ~9 hours | **~8 min** | **~53 min** | ~110 sec |
+| Decoder | ~6.3 min | ~0.5 sec | ~0.4 sec | ~0.2 sec |
+| **Total** | **~9.5 hours** | **~8 min** | **~53 min** | **~2 min** |
 
-CUDA DiT is ~65x faster than CPU. PyTorch is ~14x faster than our CUDA due to
-cuBLAS tensor-core F16 GEMM vs our F32 tiled GEMM.
+HIP DiT at 144s/step uses F16 tiled GEMM (not WMMA). Main bottleneck is the
+tiled GEMM kernel; WMMA cooperative matrix GEMM would give ~10x speedup.
+PyTorch ROCm uses rocBLAS which is ~26x faster than our tiled GEMM.
 
 ## Weight Files
 
@@ -295,6 +325,18 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 | `verify_decoder.c` | ~65 | Standalone decoder verification |
 | `Makefile` | 20 | gcc build (no nvcc, NVRTC runtime compilation) |
 
+### HIP/ROCm implementation (`rdna4/trellis2/`)
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `hip_trellis2_runner.h` | ~65 | Public C API |
+| `hip_trellis2_runner.c` | ~1200 | DiT forward, decoder forward, weight loading, kernel launches |
+| `hip_trellis2_kernels.h` | ~500 | HIPRTC kernel strings: adaLN, GroupNorm, conv3d, RoPE, flash-attn, etc. |
+| `test_hip_trellis2.c` | ~450 | Test harness: full/dit-only/decode-only/dump-blocks modes |
+| `verify_dit.c` | ~150 | DiT single-step CPU vs GPU comparison |
+| `verify_decoder.c` | ~180 | Decoder CPU vs GPU comparison |
+| `Makefile` | ~100 | gcc build (no hipcc, HIPRTC runtime compilation via `rocew`) |
+
 ### CPU implementation (`common/`)
 
 | File | Lines | Description |
@@ -303,7 +345,19 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 | `dinov3.h` | ~900 | DINOv3 ViT-L/16 encoder |
 | `trellis2_dit.h` | ~1000 | DiT blocks, F32 GEMM, adaLN, QK RMSNorm, 3D RoPE |
 | `trellis2_stage1.h` | ~250 | Euler flow sampling, CFG, guidance interval |
-| `trellis2_ss_decoder.h` | ~620 | Conv3D, ChannelLayerNorm, pixel_shuffle_3d, ResBlock3d |
+| `trellis2_ss_decoder.h` | ~620 | Conv3D, GroupNorm, pixel_shuffle_3d, ResBlock3d |
+
+### PyTorch reference (`ref/trellis2/`)
+
+| File | Description |
+|------|-------------|
+| `gen_stage1_ref.py` | Full Stage 1 pipeline: DINOv3 → DiT 12-step CFG → decoder → .npy outputs |
+| `dump_dit_intermediates.py` | Per-block hidden state dump for layer-by-layer comparison |
+| `make_comparison.py` | Compare .npy pairs (corr, max_diff, relative L2) |
+
+Requires: `torch>=2.3` with ROCm/CUDA, `transformers`, `safetensors`, `numpy`, `Pillow`.
+Existing venv: `/mnt/disk1/work/gemm/diffusion/ref/flux2_klein/.venv` (ROCm 7.2, torch 2.11).
+TRELLIS.2 model code: `cpu/trellis2/trellis2_repo/` (cloned from github.com/microsoft/TRELLIS.2).
 
 ### Test harness & verification (`cpu/trellis2/`)
 
@@ -330,7 +384,7 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 | **t_emb buffer overflow** | **Block 1+ explodes 23x** | **d_temb allocated 256 floats, MLP writes 1536** | **Allocate D floats** |
 | CFG rescale x0_pos | Wrong std ratio | Used v_uncond for x0_pos, should use v_cond | Save original v_cond before combining |
 | CFG rescale std | Minor numerical diff | RMS instead of proper torch.std (mean-subtracted, Bessel) | Use double-precision proper std |
-| **Decoder norm type** | **Decoder output flipped** | **Used GroupNorm, official uses ChannelLayerNorm** | **New channel_layernorm_3d_f32 kernel** |
+| **Decoder norm type (CUDA)** | **Decoder output flipped** | **Used per-spatial ChannelLN, actual is GroupNorm(32)** | **GroupNorm kernel (groups=32)** |
 | DINOv3 final norm | Features range differs | TRELLIS.2 uses unparameterized LN, not learned norm | Apply plain LN in encoder |
 | **Stage 2 F16 GEMM** | **All GEMM output garbage** | **`use_f32_gemm` not set when loading Stage 2 standalone** | **Set flag in `cuda_trellis2_load_stage2`** |
 | **Stage 2 scratch overflow** | **Cross-attn produces 5e26** | **`scratch[1]` sized for self-attn N only, not cross-attn ctx_len*2D** | **Include `ca_kv_gemm_sz` in max** |
@@ -348,6 +402,15 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 4. **Texture decoder CUDA**: Sparse conv SC-VAE texture decoder on GPU.
 5. **F16 GEMM**: Switch from F32 tiled GEMM to F16 tensor-core GEMM for ~10x speedup.
 6. **Full GPU pipeline (CUDA)**: Image → DINOv3 → Stage 1 → Stage 2 → Stage 3 → mesh.
+
+### HIP/ROCm (RX 9070 XT)
+1. **Fix E2E sampling**: 12-step CFG + rescale produces ~70% occupancy vs PyTorch's ~2%.
+   Single-step DiT (corr=0.99999754) and decoder (corr=1.0) individually verified.
+   Per-step latent comparison with PyTorch ref needed to isolate the CFG/sampling bug.
+   PyTorch reference outputs saved at `/tmp/chair_ref/ref_latent_step{0-11}.npy`.
+2. **WMMA GEMM**: Replace F16 tiled GEMM with RDNA4 WMMA cooperative matrix GEMM
+   for ~10x speedup (144s/step → ~15s/step target).
+3. **DINOv3 on GPU**: Port DINOv3 encoder to HIP (currently CPU-only, 210s).
 
 ### Vulkan
 1. **Test Stages 2–3 on GPU**: Validate Stage 2/3 DiT + decoder against CUDA/Python reference.

@@ -43,8 +43,36 @@ typedef struct {
 
 typedef struct t2_shape_dec t2_shape_dec;
 
+/* Per-stage subdivision guide (from shape encoder's _spatial_cache
+ * 'channel2spatial_2'). Each stage's (idx, subidx) tells the C2S block
+ * which of the 8 children to emit from each coarse voxel: for fine voxel k
+ * its parent index is idx[k] and its child slot is subidx[k] (0..7).
+ * Provide for every C2S stage in the decoder (n_stages = num_C2S_blocks).
+ *
+ * Ordering: stages must be listed coarse -> fine (i.e. matching the
+ * decoder's traversal). For a 4-stage decoder with input scale 16 and
+ * output scale 1, pass caches from scales 16, 8, 4, 2 in that order. */
+typedef struct {
+    const int64_t *idx;      /* [N_fine]: parent index in coarse input */
+    const int64_t *subidx;   /* [N_fine]: child slot 0..7 */
+    const int32_t *x_coords; /* [N_fine, 4]: fine voxel coords (b,x,y,z) —
+                                used directly as C2S output coords to match
+                                upstream cache semantics exactly */
+    int N_fine;
+} t2_shape_dec_subdiv_stage;
+
+typedef struct {
+    const t2_shape_dec_subdiv_stage *stages;  /* [n_stages] */
+    int n_stages;
+} t2_shape_dec_guide;
+
 t2_shape_dec *t2_shape_dec_load(const char *st_path);
 void          t2_shape_dec_free(t2_shape_dec *d);
+/* guide may be NULL for shape decoder (pred_subdiv=true) or dense
+ * texture decode (all 8 children per voxel). For the texture decoder
+ * matched to shape_enc output, pass the dumped subdivision caches. */
+t2_shape_dec_result t2_shape_dec_forward_guided(t2_shape_dec *d,
+    const sp3d_tensor *slat, const t2_shape_dec_guide *guide, int n_threads);
 t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
     const sp3d_tensor *slat, int n_threads);
 void t2_shape_dec_result_free(t2_shape_dec_result *r);
@@ -468,75 +496,158 @@ static void t2sd_convnext_forward(float *feats, int N, const t2sd_convnext *blk,
     free(mlp_buf);
 }
 
-static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk, int n_threads) {
+static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
+    const t2_shape_dec_subdiv_stage *guide, int n_threads) {
+    /* Upstream SparseResBlockC2S3d._forward (sparse_unet_vae.py:240):
+     *   h = silu(norm1_affine(x.feats))
+     *   h = conv1(h)                        # C_in -> C_out*8
+     *   h = C2S(h, subdiv)                  # N_coarse,C_out*8 -> N_fine,C_out
+     *   x = C2S(x, subdiv)                  # N_coarse,C_in    -> N_fine,C_in/8
+     *   h = silu(norm2_noaffine(h.feats))
+     *   h = conv2(h)                        # C_out -> C_out
+     *   h = h + repeat_interleave(x, C_out/(C_in/8))
+     */
     int N = t->N;
     int C_in = blk->C_in, C_out = blk->C_out;
-
-    /* 1. Predict subdivision: which sub-voxels to activate */
-    float *sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
-    if (blk->to_subdiv_w) {
-        t2sd_linear_mt(sub_logits, t->feats, N, blk->to_subdiv_w, blk->to_subdiv_b, 8, C_in, n_threads);
-    } else {
-        /* No subdivision prediction — activate all 8 sub-voxels (for texture decoder) */
-        for (int i = 0; i < N * 8; i++) sub_logits[i] = 1.0f;
+    if (C_in <= 0 || (C_in % 8) != 0) {
+        fprintf(stderr, "t2sd_c2s_forward: invalid C_in=%d (must be >0 and divisible by 8)\n", C_in);
+        return NULL;
     }
 
-    /* Threshold: activate sub-voxels where logit > 0 */
+    /* 1. Determine which sub-voxels to emit. */
+    float *sub_logits = NULL;
     int total_sub = 0;
-    for (int i = 0; i < N * 8; i++)
-        if (sub_logits[i] > 0) total_sub++;
+    if (guide) {
+        if (!guide->idx || !guide->subidx || !guide->x_coords) {
+            fprintf(stderr, "t2sd_c2s_forward: guide has NULL pointers\n");
+            return NULL;
+        }
+        if (guide->N_fine < 0) {
+            fprintf(stderr, "t2sd_c2s_forward: guide->N_fine is negative (%d)\n", guide->N_fine);
+            return NULL;
+        }
+        total_sub = guide->N_fine;
+        fprintf(stderr, "    C2S %d->%d: %d voxels -> %d sub-voxels (guide, %.1f avg)\n",
+                C_in, C_out, N, total_sub, (float)total_sub / N);
+    } else if (blk->to_subdiv_w) {
+        sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
+        t2sd_linear_mt(sub_logits, t->feats, N, blk->to_subdiv_w, blk->to_subdiv_b, 8, C_in, n_threads);
+        for (int i = 0; i < N * 8; i++)
+            if (sub_logits[i] > 0) total_sub++;
+        fprintf(stderr, "    C2S %d->%d: %d voxels -> %d sub-voxels (pred, %.1f avg)\n",
+                C_in, C_out, N, total_sub, (float)total_sub / N);
+    } else {
+        total_sub = N * 8;
+        fprintf(stderr, "    C2S %d->%d: %d voxels -> %d sub-voxels (dense 8x)\n",
+                C_in, C_out, N, total_sub);
+    }
 
-    fprintf(stderr, "    C2S %d->%d: %d voxels -> %d sub-voxels (%.1f avg)\n",
-            C_in, C_out, N, total_sub, (float)total_sub / N);
-
-    /* 2. LayerNorm input */
+    /* 2. h = silu(norm1_affine(x.feats)); then conv1 -> expanded [N, C_out*8] */
     float *normed = (float *)malloc((size_t)N * C_in * sizeof(float));
     t2sd_layernorm_mt(normed, t->feats, blk->norm1_w, blk->norm1_b, N, C_in, 1e-6f, n_threads);
-
-    /* 3. conv1: [C_out*8, 27, C_in] -> [N, C_out*8] */
+    for (size_t i = 0; i < (size_t)N * C_in; i++) {
+        float v = normed[i];
+        normed[i] = v / (1.0f + expf(-v));  /* SiLU */
+    }
     float *expanded = (float *)malloc((size_t)N * C_out * 8 * sizeof(float));
-    /* Need a temp tensor with normed features for conv */
     sp3d_tensor *t_normed = sp3d_replace_feats(t, normed, C_in);
     t2sd_sparse_conv(expanded, t_normed, blk->conv1_w, blk->conv1_b,
                          C_in, C_out * 8, n_threads);
+    sp3d_free(t_normed);
+    free(normed);
 
-    /* 4. Create sub-voxel coordinates and features */
+    /* 3. Gather fine-voxel coords + h_fine [total_sub, C_out] via subdiv. */
     int32_t *sub_coords = (int32_t *)malloc((size_t)total_sub * 4 * sizeof(int32_t));
-    float *sub_feats = (float *)malloc((size_t)total_sub * C_out * sizeof(float));
-    int si = 0;
-    for (int i = 0; i < N; i++) {
-        int32_t bz = t->coords[i * 4 + 0];
-        int32_t z  = t->coords[i * 4 + 1];
-        int32_t y  = t->coords[i * 4 + 2];
-        int32_t x  = t->coords[i * 4 + 3];
-        for (int s = 0; s < 8; s++) {
-            if (sub_logits[i * 8 + s] <= 0) continue;
-            /* Sub-voxel offset: s = (dz*4 + dy*2 + dx) */
-            int dz = (s >> 2) & 1, dy = (s >> 1) & 1, dx = s & 1;
-            sub_coords[si * 4 + 0] = bz;
-            sub_coords[si * 4 + 1] = z * 2 + dz;
-            sub_coords[si * 4 + 2] = y * 2 + dy;
-            sub_coords[si * 4 + 3] = x * 2 + dx;
-            /* Feature: extract sub-channel from expanded[i, s*C_out : (s+1)*C_out] */
-            memcpy(sub_feats + (size_t)si * C_out,
-                   expanded + (size_t)i * C_out * 8 + (size_t)s * C_out,
+    float *h_fine = (float *)malloc((size_t)total_sub * C_out * sizeof(float));
+    /* Also gather x_fine [total_sub, C_in/8] for residual: C2S on raw x.feats. */
+    int C_in8 = C_in / 8;
+    if (C_in8 <= 0 || (C_out % C_in8) != 0) {
+        fprintf(stderr, "t2sd_c2s_forward: invalid channel ratio C_in=%d C_out=%d\n", C_in, C_out);
+        free(sub_coords);
+        free(h_fine);
+        if (sub_logits) free(sub_logits);
+        free(expanded);
+        return NULL;
+    }
+    float *x_fine = (float *)malloc((size_t)total_sub * C_in8 * sizeof(float));
+    if (guide) {
+        memcpy(sub_coords, guide->x_coords, (size_t)total_sub * 4 * sizeof(int32_t));
+        for (int k = 0; k < total_sub; k++) {
+            int parent = (int)guide->idx[k];
+            int s = (int)guide->subidx[k];
+            if (parent < 0 || parent >= N || s < 0 || s > 7) {
+                fprintf(stderr, "t2sd_c2s_forward: invalid guide entry k=%d parent=%d subidx=%d (N=%d)\n",
+                        k, parent, s, N);
+                free(sub_coords);
+                free(h_fine);
+                free(x_fine);
+                if (sub_logits) free(sub_logits);
+                free(expanded);
+                return NULL;
+            }
+            memcpy(h_fine + (size_t)k * C_out,
+                   expanded + (size_t)parent * C_out * 8 + (size_t)s * C_out,
                    (size_t)C_out * sizeof(float));
-            si++;
+            memcpy(x_fine + (size_t)k * C_in8,
+                   t->feats + (size_t)parent * C_in + (size_t)s * C_in8,
+                   (size_t)C_in8 * sizeof(float));
+        }
+    } else {
+        int si = 0;
+        for (int i = 0; i < N; i++) {
+            int32_t bz = t->coords[i * 4 + 0];
+            int32_t z  = t->coords[i * 4 + 1];
+            int32_t y  = t->coords[i * 4 + 2];
+            int32_t x  = t->coords[i * 4 + 3];
+            for (int s = 0; s < 8; s++) {
+                if (sub_logits && sub_logits[i * 8 + s] <= 0) continue;
+                int dz = (s >> 2) & 1, dy = (s >> 1) & 1, dx = s & 1;
+                sub_coords[si * 4 + 0] = bz;
+                sub_coords[si * 4 + 1] = z * 2 + dz;
+                sub_coords[si * 4 + 2] = y * 2 + dy;
+                sub_coords[si * 4 + 3] = x * 2 + dx;
+                memcpy(h_fine + (size_t)si * C_out,
+                       expanded + (size_t)i * C_out * 8 + (size_t)s * C_out,
+                       (size_t)C_out * sizeof(float));
+                memcpy(x_fine + (size_t)si * C_in8,
+                       t->feats + (size_t)i * C_in + (size_t)s * C_in8,
+                       (size_t)C_in8 * sizeof(float));
+                si++;
+            }
         }
     }
+    if (sub_logits) free(sub_logits);
+    free(expanded);
 
-    free(sub_logits); free(normed); free(expanded);
-    sp3d_free(t_normed);
+    /* 4. Build fine sparse tensor from h_fine for conv2. */
+    sp3d_tensor *t_sub = sp3d_create(sub_coords, h_fine, total_sub, C_out, 1);
+    free(sub_coords);
 
-    /* 5. Create new sparse tensor at higher resolution */
-    sp3d_tensor *t_sub = sp3d_create(sub_coords, sub_feats, total_sub, C_out, 1);
-    free(sub_coords); free(sub_feats);
-
-    /* 6. conv2: [C_out, 27, C_out] at new resolution */
+    /* 5. h = silu(norm2_noaffine(h)); then conv2(h). Store in tmp; */
+    float *h_normed = (float *)malloc((size_t)total_sub * C_out * sizeof(float));
+    t2sd_layernorm_mt(h_normed, t_sub->feats, NULL, NULL, total_sub, C_out, 1e-6f, n_threads);
+    for (size_t i = 0; i < (size_t)total_sub * C_out; i++) {
+        float v = h_normed[i];
+        h_normed[i] = v / (1.0f + expf(-v));
+    }
+    sp3d_tensor *t_sub_normed = sp3d_replace_feats(t_sub, h_normed, C_out);
     float *conv2_out = (float *)malloc((size_t)total_sub * C_out * sizeof(float));
-    t2sd_sparse_conv(conv2_out, t_sub, blk->conv2_w, blk->conv2_b,
+    t2sd_sparse_conv(conv2_out, t_sub_normed, blk->conv2_w, blk->conv2_b,
                          C_out, C_out, n_threads);
-    /* Replace features */
+    sp3d_free(t_sub_normed);
+    free(h_normed);
+    free(h_fine);
+
+    /* 6. Residual: h += repeat_interleave(x_fine, rep, dim=1), rep=C_out/C_in8. */
+    int rep = C_out / C_in8;
+    for (int k = 0; k < total_sub; k++) {
+        const float *xr = x_fine + (size_t)k * C_in8;
+        float *hr = conv2_out + (size_t)k * C_out;
+        for (int c = 0; c < C_out; c++) hr[c] += xr[c / rep];
+    }
+    free(x_fine);
+
+    /* 7. Move final feats into t_sub. */
     memcpy(t_sub->feats, conv2_out, (size_t)total_sub * C_out * sizeof(float));
     free(conv2_out);
 
@@ -545,8 +656,8 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk, int n_
 
 /* ---- Full forward ---- */
 
-t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
-    const sp3d_tensor *slat, int n_threads) {
+t2_shape_dec_result t2_shape_dec_forward_guided(t2_shape_dec *d,
+    const sp3d_tensor *slat, const t2_shape_dec_guide *guide, int n_threads) {
     t2_shape_dec_result result = {0};
     double t0 = t2sd_time_ms();
     int N = slat->N;
@@ -554,16 +665,26 @@ t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
 
     fprintf(stderr, "shape_dec: input N=%d, C=%d\n", N, slat->C);
 
-    /* from_latent: Linear(32 -> 1024) */
+    /* from_latent: Linear(latent_channels -> model_channels[0]) */
     float *feats = (float *)malloc((size_t)N * C * sizeof(float));
     t2sd_linear(feats, slat->feats, N, d->from_latent_w, d->from_latent_b, C, slat->C);
     fprintf(stderr, "shape_dec: from_latent -> [%d, %d]\n", N, C);
 
-    /* Create working sparse tensor */
     sp3d_tensor *t = sp3d_create(slat->coords, feats, N, C, 1);
     free(feats);
 
-    /* Process stages */
+    int required_guide_stages = 0;
+    for (int stage = 0; stage < d->n_stages; stage++) {
+        if (d->c2s[stage].conv1_w) required_guide_stages++;
+    }
+    if (guide && guide->n_stages != required_guide_stages) {
+        fprintf(stderr, "shape_dec: guide stage mismatch: got %d, expected %d\n",
+                guide->n_stages, required_guide_stages);
+        sp3d_free(t);
+        return result;
+    }
+
+    int guide_stage = 0;
     for (int stage = 0; stage < d->n_stages; stage++) {
         int nc = d->n_convnext[stage];
         int ch = d->channels[stage];
@@ -572,7 +693,6 @@ t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
                 stage, nc, ch, t->N);
         double ts0 = t2sd_time_ms();
 
-        /* ConvNeXt blocks */
         for (int b = 0; b < nc; b++) {
             t2sd_convnext_forward(t->feats, t->N, &d->convnext[stage][b], t, n_threads);
         }
@@ -580,9 +700,15 @@ t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
         double ts1 = t2sd_time_ms();
         fprintf(stderr, "  convnext: %.1f s\n", (ts1 - ts0) / 1000.0);
 
-        /* C2S upsample (if not last stage, or if c2s weights exist) */
         if (d->c2s[stage].conv1_w) {
-            sp3d_tensor *t_new = t2sd_c2s_forward(t, &d->c2s[stage], n_threads);
+            const t2_shape_dec_subdiv_stage *g = NULL;
+            if (guide && guide_stage < guide->n_stages) g = &guide->stages[guide_stage++];
+            sp3d_tensor *t_new = t2sd_c2s_forward(t, &d->c2s[stage], g, n_threads);
+            if (!t_new) {
+                fprintf(stderr, "shape_dec: C2S failed at stage %d\n", stage);
+                sp3d_free(t);
+                return result;
+            }
             sp3d_free(t);
             t = t_new;
             fprintf(stderr, "  c2s: -> N=%d, C=%d (%.1f s)\n",
@@ -590,7 +716,25 @@ t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
         }
     }
 
-    /* output_layer: Linear(64 -> out_channels) */
+    /* Pre-output LayerNorm (no learnable params — matches upstream
+     * SparseUnetVaeDecoder.forward: `F.layer_norm(h.feats, h.feats.shape[-1:])`). */
+    {
+        int Cn = t->C;
+        for (int i = 0; i < t->N; i++) {
+            float *row = t->feats + (size_t)i * Cn;
+            double s = 0, s2 = 0;
+            for (int c = 0; c < Cn; c++) {
+                s += row[c];
+                s2 += (double)row[c] * row[c];
+            }
+            double mean = s / Cn;
+            double var = s2 / Cn - mean * mean;
+            float inv = (float)(1.0 / sqrt(var + 1e-5));
+            for (int c = 0; c < Cn; c++) row[c] = (row[c] - (float)mean) * inv;
+        }
+    }
+
+    /* output_layer: Linear(C_last -> out_channels) */
     int out_ch = d->out_channels;
     float *out_feats = (float *)malloc((size_t)t->N * out_ch * sizeof(float));
     t2sd_linear_mt(out_feats, t->feats, t->N, d->output_w, d->output_b, out_ch, t->C, n_threads);
@@ -607,6 +751,11 @@ t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
     fprintf(stderr, "shape_dec: done in %.1f s, output N=%d\n",
             (t1 - t0) / 1000.0, result.N);
     return result;
+}
+
+t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
+    const sp3d_tensor *slat, int n_threads) {
+    return t2_shape_dec_forward_guided(d, slat, NULL, n_threads);
 }
 
 void t2_shape_dec_result_free(t2_shape_dec_result *r) {
