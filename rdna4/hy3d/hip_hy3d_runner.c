@@ -44,6 +44,62 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdint.h>
+
+/* ======================================================================== */
+/* .npy dump helpers (HY3D_DUMP_DIR env + per-step latent/velocity dumps)   */
+/* ======================================================================== */
+
+static void hy3d_write_npy_f32_2d(const char *path, const float *buf, int rows, int cols) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    static const char magic[] = "\x93NUMPY";
+    fwrite(magic, 1, 6, f);
+    uint8_t ver[2] = {1, 0}; fwrite(ver, 1, 2, f);
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", rows, cols);
+    int total = 10 + hlen + 1;
+    int pad = ((total + 63) / 64) * 64 - total;
+    uint16_t header_len = (uint16_t)(hlen + pad + 1);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(hdr, 1, (size_t)hlen, f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
+    fwrite(buf, sizeof(float), (size_t)rows * (size_t)cols, f);
+    fclose(f);
+}
+
+static void hy3d_dbg_dump_npy(hipStream_t stream, void *d_buf,
+                              int rows, int cols, const char *fname) {
+    const char *dir = getenv("HY3D_DUMP_DIR");
+    if (!dir || !*dir) return;
+    size_t n = (size_t)rows * (size_t)cols;
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) return;
+    hipStreamSynchronize(stream);
+    hipMemcpy(h, d_buf, n * sizeof(float), hipMemcpyDeviceToHost);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir, fname);
+    hy3d_write_npy_f32_2d(path, h, rows, cols);
+    free(h);
+}
+
+static void hy3d_dump_latent(hipStream_t stream, void *d_latents,
+                             int rows, int cols, const char *prefix, int step1) {
+    if (!prefix || !*prefix) return;
+    size_t n = (size_t)rows * (size_t)cols;
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) return;
+    hipStreamSynchronize(stream);
+    hipMemcpy(h, d_latents, n * sizeof(float), hipMemcpyDeviceToHost);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%03d.npy", prefix, step1);
+    hy3d_write_npy_f32_2d(path, h, rows, cols);
+    free(h);
+}
+
+#define HY3D_MAX_LATENT_DUMP_STEPS 64
 
 /* ======================================================================== */
 /* Model constants                                                          */
@@ -208,9 +264,38 @@ struct hip_hy3d_runner {
     void *dit_ca_V[DIT_DEPTH];   /* [DINO_SEQ_LEN, DIT_HIDDEN] */
     int ca_kv_precomputed;
 
+    /* Per-step latent/velocity .npy dumps for trajectory checks */
+    int latent_dump_count;
+    int latent_dump_steps[HY3D_MAX_LATENT_DUMP_STEPS];
+    char latent_dump_prefix[512];
+    int velocity_dump_count;
+    int velocity_dump_steps[HY3D_MAX_LATENT_DUMP_STEPS];
+    char velocity_dump_prefix[512];
+
+    /* Deterministic trajectory overrides */
+    float *init_latents;      /* host-side [4096,64] override */
+    int init_latents_n;
+    float *init_ctx_cond;     /* host-side [1370,1024] override */
+    float *init_ctx_uncond;   /* host-side [1370,1024] override (optional) */
+    int init_ctx_n;
+
     /* Load status */
     int dino_loaded, dit_loaded, vae_loaded;
 };
+
+static int hy3d_should_dump_latent(const struct hip_hy3d_runner *r, int step1) {
+    for (int i = 0; i < r->latent_dump_count; i++) {
+        if (r->latent_dump_steps[i] == step1) return 1;
+    }
+    return 0;
+}
+
+static int hy3d_should_dump_velocity(const struct hip_hy3d_runner *r, int step1) {
+    for (int i = 0; i < r->velocity_dump_count; i++) {
+        if (r->velocity_dump_steps[i] == step1) return 1;
+    }
+    return 0;
+}
 
 /* ======================================================================== */
 /* Kernel compilation                                                       */
@@ -364,8 +449,12 @@ static void *st_fuse_3_f16(st_context *st,
 /* Allocate GPU buffer */
 static void *gpu_alloc(size_t bytes) {
     void *d = NULL;
-    if (hipMalloc(&d, bytes) != hipSuccess) {
-        fprintf(stderr, "HY3D: GPU alloc failed for %zu bytes\n", bytes);
+    hipError_t e = hipMalloc(&d, bytes);
+    if (e != hipSuccess) {
+        size_t mfree = 0, mtotal = 0;
+        if (hipMemGetInfo) hipMemGetInfo(&mfree, &mtotal);
+        fprintf(stderr, "HY3D: GPU alloc failed for %zu bytes (err=%d; free=%zu total=%zu)\n",
+                bytes, (int)e, mfree, mtotal);
         return NULL;
     }
     return d;
@@ -447,8 +536,20 @@ static void *st_fuse_2_gemm_w(st_context *st,
 
 static void ensure_scratch(hip_hy3d_runner *r, int idx, size_t bytes) {
     if (r->scratch_size[idx] < bytes) {
-        if (r->scratch[idx]) hipFree(r->scratch[idx]);
-        r->scratch[idx] = gpu_alloc(bytes);
+        if (r->scratch[idx]) {
+            hipFree(r->scratch[idx]);
+            r->scratch[idx] = NULL;
+            r->scratch_size[idx] = 0;
+            hipDeviceSynchronize();
+        }
+        void *d = NULL;
+        if (hipMalloc(&d, bytes) != hipSuccess) {
+            fprintf(stderr, "HY3D: scratch[%d] GPU alloc failed for %zu bytes\n",
+                    idx, bytes);
+            r->scratch[idx] = NULL;
+            return;
+        }
+        r->scratch[idx] = d;
         r->scratch_size[idx] = bytes;
     }
 }
@@ -772,9 +873,9 @@ static void run_dinov2(hip_hy3d_runner *r, void *d_image, void *d_out) {
     /* 1. Patch embedding: conv2d -> [num_patches, dim] */
     {
         int gw2 = gw;
-        int dim2 = dim, ps2 = ps, img_w = DINO_IMG_SIZE;
+        int dim2 = dim, ps2 = ps, img_w = DINO_IMG_SIZE, img_h = DINO_IMG_SIZE;
         void *pw = r->dino_patch_w, *pb = r->dino_patch_b;
-        void *args[] = {&d_hidden, &d_image, &pw, &pb, &gw2, &dim2, &ps2, &img_w};
+        void *args[] = {&d_hidden, &d_image, &pw, &pb, &gw2, &dim2, &ps2, &img_w, &img_h};
         hipModuleLaunchKernel(ops->patch_embed,
                        (unsigned)(gw * gw), 1, 1,
                        256, 1, 1, 0, stream, args, NULL);
@@ -789,10 +890,16 @@ static void run_dinov2(hip_hy3d_runner *r, void *d_image, void *d_out) {
                        (unsigned)((seq*dim+255)/256), 1, 1,
                        256, 1, 1, 0, stream, args, NULL);
     }
+    hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "hip_dinov2_hidden_0.npy");
 
     /* 3. Encoder layers */
     for (int li = 0; li < DINO_LAYERS; li++) {
         dino_layer_gpu *l = &r->dino_layers[li];
+
+        if (getenv("HY3D_TRACE_DINO")) {
+            hipStreamSynchronize(stream);
+            fprintf(stderr, "  DINO block %d start\n", li);
+        }
 
         /* LN1 -> Q,K,V -> Attention -> LayerScale + residual */
         op_layernorm(ops, stream, d_normed, d_hidden, l->ln1_w, l->ln1_b, seq, dim);
@@ -820,13 +927,26 @@ static void run_dinov2(hip_hy3d_runner *r, void *d_image, void *d_out) {
         /* LN2 -> MLP -> LayerScale + residual */
         op_layernorm(ops, stream, d_normed, d_hidden, l->ln2_w, l->ln2_b, seq, dim);
         op_gemm(ops, stream, d_mlp, l->fc1_w, d_normed, l->fc1_b, ffn, dim, seq);
-        op_gelu(ops, stream, d_mlp, seq * ffn);
+        op_gelu_exact(ops, stream, d_mlp, seq * ffn);
         op_gemm(ops, stream, d_normed, l->fc2_w, d_mlp, l->fc2_b, dim, ffn, seq);
 
         if (l->ls2)
             op_layerscale_add(ops, stream, d_hidden, d_normed, l->ls2, seq * dim, dim);
         else
             op_add(ops, stream, d_hidden, d_normed, seq * dim);
+
+        if (getenv("HY3D_TRACE_DINO")) {
+            hipStreamSynchronize(stream);
+            fprintf(stderr, "  DINO block %d done\n", li);
+        }
+
+        /* HF hidden_states index = block_index + 1 */
+        if (li == 11)
+            hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "hip_dinov2_hidden_12.npy");
+        else if (li == 22)
+            hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "hip_dinov2_hidden_23.npy");
+        else if (li == 23)
+            hy3d_dbg_dump_npy(stream, d_hidden, seq, dim, "hip_dinov2_hidden_24.npy");
     }
 
     /* 4. Final LN */
@@ -902,13 +1022,11 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
             top_val[k] = best_v;
         }
 
-        /* Renormalize top-k weights so they sum to 1 */
-        float top_sum = 0.0f;
-        for (int k = 0; k < DIT_MOE_TOP_K; k++) top_sum += top_val[k];
-        float top_inv = (top_sum > 0.0f) ? 1.0f / top_sum : 0.0f;
+        /* Ref MoEGate has norm_topk_prob=False — use raw softmax values as
+         * top-k weights (no renormalization). */
         for (int k = 0; k < DIT_MOE_TOP_K; k++) {
             if (top_idx[k] >= 0)
-                gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k] * top_inv;
+                gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k];
         }
     }
     free(gate_cpu);
@@ -930,7 +1048,7 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
         /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e */
         op_gemm(ops, stream, d_exp_h, blk->moe_expert_fc1_w[e], d_input,
                 blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
-        op_gelu(ops, stream, d_exp_h, N_tok * ffn);
+        op_gelu_exact(ops, stream, d_exp_h, N_tok * ffn);
         op_gemm(ops, stream, d_exp_o, blk->moe_expert_fc2_w[e], d_exp_h,
                 blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
 
@@ -950,6 +1068,7 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
 
         hipMemcpyAsync(d_output, accum_cpu,
                           (size_t)N_tok * H_dim * sizeof(float), hipMemcpyHostToDevice, stream);
+        hipStreamSynchronize(stream);  /* copy reads from accum_cpu; must finish before free */
         free(exp_out_cpu);
         free(accum_cpu);
     }
@@ -959,7 +1078,7 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     /* Step 5: Add shared expert output */
     op_gemm(ops, stream, d_exp_h, blk->moe_shared_fc1_w, d_input,
             blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
-    op_gelu(ops, stream, d_exp_h, N_tok * ffn);
+    op_gelu_exact(ops, stream, d_exp_h, N_tok * ffn);
     op_gemm(ops, stream, d_exp_o, blk->moe_shared_fc2_w, d_exp_h,
             blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
     op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
@@ -1033,7 +1152,7 @@ static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
     op_timestep_embed(ops, stream, d_temb, timestep, H_dim);
     op_gemm(ops, stream, d_tmlp, r->dit_t_mlp0_w, d_temb, r->dit_t_mlp0_b,
             ffn, H_dim, 1);
-    op_gelu(ops, stream, d_tmlp, ffn);
+    op_gelu_exact(ops, stream, d_tmlp, ffn);
     op_gemm(ops, stream, d_temb, r->dit_t_mlp2_w, d_tmlp, r->dit_t_mlp2_b,
             H_dim, ffn, 1);
 
@@ -1193,14 +1312,27 @@ static void run_dit_forward(hip_hy3d_runner *r, void *d_latents,
         }
 
         if (blk->use_moe) {
-            void *d_moe_out = d_mlp;
+            /* d_mlp aliases d_moe_scratch (both = scratch[1]); using it as
+             * output would corrupt MoE working buffers. Use d_attn (scratch[2]
+             * offset 0) instead — cross-attn output was already consumed by
+             * op_add above, so d_attn is free and does not overlap d_normed
+             * (at scratch[2] + N1*H_dim). */
+            void *d_moe_out = d_attn;
             run_dit_moe(r, blk, d_normed, d_moe_out, N1, d_moe_scratch);
             op_add(ops, stream, d_hidden, d_moe_out, N1 * H_dim);
         } else {
             op_gemm(ops, stream, d_mlp, blk->mlp_fc1_w, d_normed, blk->mlp_fc1_b, ffn, H_dim, N1);
-            op_gelu(ops, stream, d_mlp, N1 * ffn);
+            op_gelu_exact(ops, stream, d_mlp, N1 * ffn);
             op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b, H_dim, ffn, N1);
             op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
+        }
+
+        /* Per-block hidden dump (for error localization vs PyTorch) */
+        if (bi == 0 || bi == 5 || bi == 10 || bi == 11 ||
+            bi == 14 || bi == 15 || bi == 20) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "hip_dit_block_%d.npy", bi);
+            hy3d_dbg_dump_npy(stream, d_hidden, N1, H_dim, fname);
         }
 
         /* Per-block debug stats */
@@ -1293,7 +1425,7 @@ static void run_vae_block(hip_hy3d_runner *r, vae_block_gpu *b,
     /* LN2 -> MLP -> Residual 2 */
     op_layernorm(ops, stream, d_ln2, d_res1, b->ln2_w, b->ln2_b, N, W);
     op_gemm(ops, stream, d_mlph, b->mlp_fc_w, d_ln2, b->mlp_fc_b, MLP, W, N);
-    op_gelu(ops, stream, d_mlph, N * MLP);
+    op_gelu_exact(ops, stream, d_mlph, N * MLP);
     op_gemm(ops, stream, d_mlpo, b->mlp_proj_w, d_mlph, b->mlp_proj_b, W, MLP, N);
 
     /* Output = res1 + mlp_out */
@@ -1410,7 +1542,7 @@ static void run_shapevae(hip_hy3d_runner *r, void *d_latents,
 
         op_layernorm(ops, stream, d_g_ln3, d_g_res, g->ln3_w, g->ln3_b, count, W);
         op_gemm(ops, stream, d_g_mlph, g->mlp_fc_w, d_g_ln3, g->mlp_fc_b, 4 * W, W, count);
-        op_gelu(ops, stream, d_g_mlph, count * 4 * W);
+        op_gelu_exact(ops, stream, d_g_mlph, count * 4 * W);
         op_gemm(ops, stream, d_g_mlpo, g->mlp_proj_w, d_g_mlph, g->mlp_proj_b, W, 4 * W, count);
         hipMemcpyAsync(d_g_post, d_g_res, (size_t)count * W * sizeof(float), hipMemcpyDeviceToDevice, stream);
         op_add(ops, stream, d_g_post, d_g_mlpo, count * W);
@@ -1516,6 +1648,97 @@ void hip_hy3d_set_f32_gemm(hip_hy3d_runner *r, int enable) {
                 enable ? "F32 (PyTorch-compatible)" : "F16 (default)");
 }
 
+static void hy3d_parse_csv_steps(const char *csv,
+                                 int *steps, int *count_out, int max_count) {
+    *count_out = 0;
+    if (!csv || !*csv) return;
+    const char *p = csv;
+    while (*p && *count_out < max_count) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        if (v > 0 && v <= 1000000) {
+            int step = (int)v;
+            int seen = 0;
+            for (int i = 0; i < *count_out; i++) {
+                if (steps[i] == step) { seen = 1; break; }
+            }
+            if (!seen) steps[(*count_out)++] = step;
+        }
+        p = end;
+        while (*p == ' ' || *p == ',') p++;
+    }
+}
+
+void hip_hy3d_set_latent_dump(hip_hy3d_runner *r, const char *steps_csv, const char *prefix) {
+    if (!r) return;
+    r->latent_dump_count = 0;
+    r->latent_dump_prefix[0] = '\0';
+    if (prefix && *prefix) {
+        size_t n = strlen(prefix);
+        if (n >= sizeof(r->latent_dump_prefix)) n = sizeof(r->latent_dump_prefix) - 1;
+        memcpy(r->latent_dump_prefix, prefix, n);
+        r->latent_dump_prefix[n] = '\0';
+    }
+    hy3d_parse_csv_steps(steps_csv, r->latent_dump_steps,
+                         &r->latent_dump_count, HY3D_MAX_LATENT_DUMP_STEPS);
+}
+
+void hip_hy3d_set_velocity_dump(hip_hy3d_runner *r, const char *steps_csv, const char *prefix) {
+    if (!r) return;
+    r->velocity_dump_count = 0;
+    r->velocity_dump_prefix[0] = '\0';
+    if (prefix && *prefix) {
+        size_t n = strlen(prefix);
+        if (n >= sizeof(r->velocity_dump_prefix)) n = sizeof(r->velocity_dump_prefix) - 1;
+        memcpy(r->velocity_dump_prefix, prefix, n);
+        r->velocity_dump_prefix[n] = '\0';
+    }
+    hy3d_parse_csv_steps(steps_csv, r->velocity_dump_steps,
+                         &r->velocity_dump_count, HY3D_MAX_LATENT_DUMP_STEPS);
+}
+
+int hip_hy3d_set_init_latents(hip_hy3d_runner *r, const float *latents, int n) {
+    if (!r || !latents) return -1;
+    const int expected = DIT_INPUT_SIZE * DIT_IN_CHANNELS;
+    if (n != expected) return -1;
+    float *tmp = (float *)malloc((size_t)n * sizeof(float));
+    if (!tmp) return -1;
+    memcpy(tmp, latents, (size_t)n * sizeof(float));
+    free(r->init_latents);
+    r->init_latents = tmp;
+    r->init_latents_n = n;
+    return 0;
+}
+
+int hip_hy3d_set_init_contexts(hip_hy3d_runner *r,
+                               const float *cond,
+                               const float *uncond,
+                               int n) {
+    if (!r || !cond) return -1;
+    const int expected = DINO_SEQ_LEN * DIT_CONTEXT_DIM;
+    if (n != expected) return -1;
+    float *c = (float *)malloc((size_t)n * sizeof(float));
+    if (!c) return -1;
+    memcpy(c, cond, (size_t)n * sizeof(float));
+
+    float *u = NULL;
+    if (uncond) {
+        u = (float *)malloc((size_t)n * sizeof(float));
+        if (!u) { free(c); return -1; }
+        memcpy(u, uncond, (size_t)n * sizeof(float));
+    }
+
+    free(r->init_ctx_cond);
+    free(r->init_ctx_uncond);
+    r->init_ctx_cond = c;
+    r->init_ctx_uncond = u;
+    r->init_ctx_n = n;
+    return 0;
+}
+
 int hip_hy3d_load_weights(hip_hy3d_runner *r,
                            const char *conditioner_path,
                            const char *model_path,
@@ -1571,6 +1794,16 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
 
     void *d_dino_out = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
     run_dinov2(r, d_image, d_dino_out);
+    if (r->init_ctx_cond && r->init_ctx_n == DINO_SEQ_LEN * DIT_CONTEXT_DIM) {
+        hipMemcpyAsync(d_dino_out, r->init_ctx_cond,
+                       (size_t)r->init_ctx_n * sizeof(float),
+                       hipMemcpyHostToDevice, stream);
+        if (r->verbose) fprintf(stderr, "HY3D: using user-provided conditional context\n");
+    }
+    if (r->verbose > 1) {
+        hy3d_dbg_dump_npy(stream, d_dino_out, DINO_SEQ_LEN, DIT_CONTEXT_DIM,
+                          "hip_dino_context_after_override.npy");
+    }
     hipFree(d_rgb);
     hipFree(d_image);
 
@@ -1601,10 +1834,18 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
 
     int latent_size = DIT_INPUT_SIZE * DIT_IN_CHANNELS;
     float *noise_cpu = (float *)malloc((size_t)latent_size * sizeof(float));
-    generate_randn(noise_cpu, latent_size, seed);
+    if (r->init_latents && r->init_latents_n == latent_size) {
+        memcpy(noise_cpu, r->init_latents, (size_t)latent_size * sizeof(float));
+        if (r->verbose) fprintf(stderr, "HY3D: using user-provided initial latents\n");
+    } else {
+        generate_randn(noise_cpu, latent_size, seed);
+    }
 
     void *d_latents = gpu_alloc((size_t)latent_size * sizeof(float));
     hipMemcpyAsync(d_latents, noise_cpu, (size_t)latent_size * sizeof(float), hipMemcpyHostToDevice, stream);
+    /* HtoDAsync reads from noise_cpu on the stream — sync before freeing
+     * or the GPU copy races against libc recycling the host buffer. */
+    hipStreamSynchronize(stream);
     free(noise_cpu);
 
     void *d_pred_cond = gpu_alloc((size_t)latent_size * sizeof(float));
@@ -1612,21 +1853,68 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
     void *d_pred_combined = gpu_alloc((size_t)latent_size * sizeof(float));
 
     void *d_uncond_ctx = gpu_alloc((size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float));
-    hipMemsetAsync(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), stream);
+    if (r->init_ctx_uncond && r->init_ctx_n == DINO_SEQ_LEN * DIT_CONTEXT_DIM) {
+        hipMemcpyAsync(d_uncond_ctx, r->init_ctx_uncond,
+                       (size_t)r->init_ctx_n * sizeof(float),
+                       hipMemcpyHostToDevice, stream);
+        if (r->verbose) fprintf(stderr, "HY3D: using user-provided unconditional context\n");
+    } else {
+        hipMemsetAsync(d_uncond_ctx, 0, (size_t)DINO_SEQ_LEN * DINO_HIDDEN * sizeof(float), stream);
+    }
 
+    /* Flow matching schedule — matches Hunyuan3DDiTFlowMatchingPipeline.__call__
+     * (hy3dshape/pipelines.py line 736-764):
+     *
+     *   sigmas = np.linspace(0, 1, n_steps)          # ASCENDING from 0
+     *   scheduler.set_timesteps(sigmas=sigmas)       # timesteps = sigmas*1000
+     *   for t in timesteps:
+     *       t_model = t / num_train_timesteps        # rescales back to [0, 1]
+     *       v = model(latents, t_model, ctx)
+     *       latents = latents + (sigmas[i+1] - sigmas[i]) * v
+     *
+     *   - The DiT is fed t in [0, 1] (no internal /1000).
+     *   - Sigmas ASCEND 0 -> 1 with sentinel 1.0 at position n_steps (final
+     *     step's dsigma is 0, no-op).
+     *   - Update is prev = sample + (sn - s) * v. op_euler_step does
+     *     x -= dt*v, so dt = sigma - sigma_next (negative except last). */
     for (int step = 0; step < n_steps; step++) {
-        float t_current = 1.0f - (float)step / (float)n_steps;
-        float t_next = 1.0f - (float)(step + 1) / (float)n_steps;
-        float dt = t_current - t_next;
+        float sigma, sigma_next;
+        if (n_steps == 1) {
+            sigma = 0.0f;
+            sigma_next = 1.0f;
+        } else {
+            sigma = (float)step / (float)(n_steps - 1);
+            sigma_next = (step == n_steps - 1)
+                              ? 1.0f  /* scheduler sentinel */
+                              : (float)(step + 1) / (float)(n_steps - 1);
+        }
+        float dt = sigma - sigma_next; /* negative except last step */
+        float model_t = sigma;
 
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
-            fprintf(stderr, "  step %d/%d (t=%.3f)\n", step+1, n_steps, t_current);
+            fprintf(stderr, "  step %d/%d (t=%.4f)\n", step + 1, n_steps, model_t);
 
-        run_dit_forward(r, d_latents, t_current, d_dino_out, d_pred_cond);
-        run_dit_forward(r, d_latents, t_current, d_uncond_ctx, d_pred_uncond);
+        if (r->latent_dump_count > 0 && hy3d_should_dump_latent(r, step + 1)) {
+            hy3d_dump_latent(stream, d_latents, DIT_INPUT_SIZE, DIT_IN_CHANNELS,
+                             r->latent_dump_prefix, step + 1);
+            if (r->verbose)
+                fprintf(stderr, "    dumped latent step %d -> %s_%03d.npy\n",
+                        step + 1, r->latent_dump_prefix, step + 1);
+        }
+
+        run_dit_forward(r, d_latents, model_t, d_dino_out, d_pred_cond);
+        run_dit_forward(r, d_latents, model_t, d_uncond_ctx, d_pred_uncond);
 
         op_cfg_combine(ops, stream, d_pred_combined, d_pred_cond, d_pred_uncond,
                        guidance_scale, latent_size);
+
+        if (r->velocity_dump_count > 0 && hy3d_should_dump_velocity(r, step + 1)) {
+            hy3d_dump_latent(stream, d_pred_combined, DIT_INPUT_SIZE, DIT_IN_CHANNELS,
+                             r->velocity_dump_prefix, step + 1);
+            if (r->verbose)
+                fprintf(stderr, "    dumped velocity step %d -> %s_%03d.npy\n",
+                        step + 1, r->velocity_dump_prefix, step + 1);
+        }
 
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
 
@@ -1650,6 +1938,25 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
     hipFree(d_pred_combined);
     hipFree(d_uncond_ctx);
     hipFree(d_dino_out);
+
+    /* Final latent stats for debugging */
+    if (r->verbose) {
+        hipStreamSynchronize(stream);
+        float *lcpu = (float *)malloc((size_t)latent_size * sizeof(float));
+        hipMemcpy(lcpu, d_latents, (size_t)latent_size * sizeof(float), hipMemcpyDeviceToHost);
+        float lmn = lcpu[0], lmx = lcpu[0], lsm = 0;
+        for (int i = 0; i < latent_size; i++) {
+            if (lcpu[i] < lmn) lmn = lcpu[i];
+            if (lcpu[i] > lmx) lmx = lcpu[i];
+            lsm += lcpu[i];
+        }
+        float lmean = lsm / (float)latent_size;
+        float lvar = 0;
+        for (int i = 0; i < latent_size; i++) { float d = lcpu[i]-lmean; lvar += d*d; }
+        fprintf(stderr, "HY3D: final latent: min=%.4f max=%.4f mean=%.4f std=%.4f\n",
+                lmn, lmx, lmean, sqrtf(lvar/(float)latent_size));
+        free(lcpu);
+    }
 
     /* ---- Stage 3: ShapeVAE decode + SDF query ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 3 - ShapeVAE decode (grid %d^3)...\n", grid_res);
@@ -1780,6 +2087,16 @@ void hip_hy3d_free(hip_hy3d_runner *r) {
 
     /* Free Fourier frequencies */
     if (r->vae_fourier_freqs) hipFree(r->vae_fourier_freqs);
+
+    /* Free host-side trajectory overrides */
+    free(r->init_latents);
+    r->init_latents = NULL;
+    r->init_latents_n = 0;
+    free(r->init_ctx_cond);
+    free(r->init_ctx_uncond);
+    r->init_ctx_cond = NULL;
+    r->init_ctx_uncond = NULL;
+    r->init_ctx_n = 0;
 
     /* Note: individual weight buffers are GPU allocations that should also be freed.
      * For a full cleanup, iterate all void* fields. For now, destroying

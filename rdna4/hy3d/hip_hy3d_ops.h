@@ -42,6 +42,7 @@ typedef struct {
     hipFunction_t gemm;              /* unused on RDNA4 (no MMA) */
     hipFunction_t gemm_tiled;
     hipFunction_t gelu;
+    hipFunction_t gelu_exact;
     hipFunction_t add;
     hipFunction_t silu;
     hipFunction_t resize_normalize;
@@ -68,9 +69,11 @@ typedef struct {
     hipFunction_t strip_first;      /* drop first token */
     hipFunction_t concat_last_dim;  /* concat along last dim */
     hipFunction_t gemm_f32;         /* pure F32 GEMM (no F16 conversion) */
+    hipFunction_t gemm_wmma;        /* F16w + BF16a WMMA (gfx12 only; NULL on older) */
 
     int sm_version;
     int use_f32_gemm;            /* 0=F16 weights (default), 1=F32 weights */
+    int use_wmma;                /* 1 if gemm_wmma is available (gfx1200/1201) */
 } hy3d_ops;
 
 /* ======================================================================== */
@@ -92,6 +95,7 @@ static int hy3d_ops_load(hy3d_ops *ops, hipModule_t module, int sm_version) {
     /* No gemm_f16_f32 (MMA) on RDNA4 -- skip ops->gemm */
     GET_FN("gemm_tiled_f16_f32",     gemm_tiled);
     GET_FN("gelu_f32",               gelu);
+    GET_FN("gelu_exact_f32",         gelu_exact);
     GET_FN("add_f32",                add);
     GET_FN("silu_f32",               silu);
     GET_FN("resize_normalize",       resize_normalize);
@@ -121,6 +125,18 @@ static int hy3d_ops_load(hy3d_ops *ops, hipModule_t module, int sm_version) {
     GET_FN("concat_f32",                  concat_last_dim);
     GET_FN("gemm_f32_f32",               gemm_f32);
 
+    /* Optional: WMMA kernel is only valid on gfx1200/1201. hipModuleGetFunction
+     * returns failure on older archs when the compiled PTX lacked the symbol.
+     * Treat failure here as "WMMA not available" and fall back to tiled GEMM.
+     * Default is OFF — set env HIP_HY3D_WMMA=1 to enable (A/B testing). */
+    if (hipModuleGetFunction(&ops->gemm_wmma, module, "gemm_f16w_bf16a_wmma_t") == hipSuccess) {
+        const char *wenv = getenv("HIP_HY3D_WMMA");
+        ops->use_wmma = (wenv && *wenv && wenv[0] != '0') ? 1 : 0;
+    } else {
+        ops->gemm_wmma = NULL;
+        ops->use_wmma = 0;
+    }
+
     #undef GET_FN
     return 0;
 }
@@ -149,6 +165,16 @@ static inline void op_gemm(hy3d_ops *ops, hipStream_t stream,
                            void *X, void *bias,
                            int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+    /* WMMA path: F16 weights only, n_in must be multiple of 16. Tile is 128x128
+     * with in-kernel bounds checks, so ragged M/N shapes are fine. Skip tiny
+     * problems where the scalar tile is already cheap. */
+    if (!ops->use_f32_gemm && ops->use_wmma && ops->gemm_wmma &&
+        (n_in & 15) == 0 && n_out >= 64 && n_tok >= 16) {
+        unsigned gx = (unsigned)((n_out + 127) / 128);
+        unsigned gy = (unsigned)((n_tok + 127) / 128);
+        hipModuleLaunchKernel(ops->gemm_wmma, gx, gy, 1, 256, 1, 1, 0, stream, args, NULL);
+        return;
+    }
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     hipFunction_t fn = ops->use_f32_gemm ? ops->gemm_f32 : ops->gemm_tiled;
@@ -160,6 +186,14 @@ static inline void op_gelu(hy3d_ops *ops, hipStream_t stream,
                            void *x, int n) {
     void *args[] = {&x, &n};
     hipModuleLaunchKernel(ops->gelu, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, stream, args, NULL);
+}
+
+/* ---- Exact GELU (erf) — matches nn.GELU default approximate='none' ---- */
+static inline void op_gelu_exact(hy3d_ops *ops, hipStream_t stream,
+                                 void *x, int n) {
+    void *args[] = {&x, &n};
+    hipModuleLaunchKernel(ops->gelu_exact, (unsigned)((n + 255) / 256), 1, 1,
                    256, 1, 1, 0, stream, args, NULL);
 }
 
