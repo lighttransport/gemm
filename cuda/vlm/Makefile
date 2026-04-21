@@ -9,6 +9,7 @@ LDFLAGS = -ldl -lm -lpthread
 
 # Sources
 CUEW_SRC = ../cuew.c
+CBLASW_SRC = ../cublasew.c
 RUNNER_SRC = cuda_vision_encoder.c
 LLM_RUNNER_SRC = ../llm/cuda_llm_runner.c
 TEST_SRC = test_cuda_vision.c
@@ -23,14 +24,14 @@ GEMMA4_VLM = test_cuda_gemma4_vlm
 
 all: $(TARGET) $(COMPARE)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../cuew.h
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_vision_encoder.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
 
-$(COMPARE): compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../cuew.h
-	$(CC) $(CFLAGS) -o $@ compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+$(COMPARE): compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_vision_encoder.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -o $@ compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
 
-$(VLM): test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) cuda_vision_encoder.h ../llm/cuda_llm_runner.h ../cuew.h
-	$(CC) $(CFLAGS) -o $@ test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+$(VLM): test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_vision_encoder.h ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -o $@ test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
 
 $(GEMMA4_VLM): test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) ../llm/cuda_llm_runner.h ../cuew.h
 	$(CC) $(CFLAGS) -o $@ test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
