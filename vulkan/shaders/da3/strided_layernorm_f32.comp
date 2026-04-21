@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 512) in;
+
+layout(push_constant) uniform PushConstants {
+    uint np;
+    uint dim;
+    uint stride;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) buffer DataBuf { float data[]; };
+layout(std430, binding = 1) readonly buffer WBuf { float w[]; };
+layout(std430, binding = 2) readonly buffer BBuf { float b[]; };
+
+shared float sdata[512];
+
+void main() {
+    uint p = gl_WorkGroupID.x;
+    if (p >= pc.np) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint row_base = p * pc.stride + pc.dim;
+
+    float val = (tid < pc.dim) ? data[row_base + tid] : 0.0;
+
+    // Reduce for mean
+    sdata[tid] = (tid < pc.dim) ? val : 0.0;
+    barrier();
+    for (uint r = gl_WorkGroupSize.x / 2u; r > 0u; r >>= 1u) {
+        if (tid < r) sdata[tid] += sdata[tid + r];
+        barrier();
+    }
+    float mean = sdata[0] / float(pc.dim);
+
+    // Reduce for variance
+    float d = (tid < pc.dim) ? (val - mean) : 0.0;
+    sdata[tid] = d * d;
+    barrier();
+    for (uint r = gl_WorkGroupSize.x / 2u; r > 0u; r >>= 1u) {
+        if (tid < r) sdata[tid] += sdata[tid + r];
+        barrier();
+    }
+    float var_val = sdata[0] / float(pc.dim);
+    float rstd = inversesqrt(var_val + pc.eps);
+
+    if (tid < pc.dim)
+        data[row_base + tid] = (val - mean) * rstd * w[tid] + b[tid];
+}
