@@ -95,7 +95,7 @@ multiplying). Run with `./verify_mma_gemm` (no args, no model needed).
 Generate ref dumps first via `ref/sam3/gen_image_ref.py`, then:
 
 ```bash
-# defaults: CKPT=/mnt/disk01/models/sam3/sam3.model.safetensors  REFDIR=/tmp/sam3_ref_cat
+# defaults: CKPT=/path/to/sam3.model.safetensors  REFDIR=/tmp/sam3_ref_cat
 make verify-patch-embed   # vit_embed: max_abs≈2e-3 mean_abs≈1e-4
 make verify-vit-block0    # block 0
 make verify-vit-block31   # block 31 (last)

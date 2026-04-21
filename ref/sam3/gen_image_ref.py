@@ -42,8 +42,8 @@ def save(refdir, name, t):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt",   default="/mnt/disk01/models/sam3/sam3.model.safetensors")
-    ap.add_argument("--image",  default="/home/syoyo/work/gemm/vlm-ptx/cuda/da3/indoor.jpg")
+    ap.add_argument("--ckpt",   default="sam3.model.safetensors")
+    ap.add_argument("--image",  default="indoor.jpg")
     ap.add_argument("--phrase", default="cat")
     ap.add_argument("--refdir", default="/tmp/sam3_ref_cat")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

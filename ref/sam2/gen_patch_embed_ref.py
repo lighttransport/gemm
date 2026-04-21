@@ -20,7 +20,7 @@ from transformers.utils import logging as hf_logging
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/mnt/disk01/sam2/sam2.1-hiera-tiny")
+    ap.add_argument("--model", default="sam2.1-hiera-tiny")
     ap.add_argument("--image", required=True)
     ap.add_argument("--outdir", required=True)
     args = ap.parse_args()
