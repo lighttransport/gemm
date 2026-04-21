@@ -1,3 +1,95 @@
+# Hy3D HIP (RDNA4) end-to-end tasks
+
+The HIP shape-gen pipeline (`rdna4/hy3d/`) already runs end-to-end on
+GPU: `test_hip_hy3d` executes Preprocess → DINOv2-L → DiT flow-matching
+(+ CFG + MoE + U-Net skip) → ShapeVAE → Marching Cubes with no CPU
+fallback in the hot path. Remaining items before it reaches CUDA-level
+maturity:
+
+1. **Trace / dump tooling parity with CUDA** — DONE
+    - Ported `--init-latents`, `--init-context`, `--init-trace-dir`,
+      `--dump-latent-{steps,prefix}`, `--dump-velocity-{steps,prefix}`
+      CLI flags and corresponding `hip_hy3d_set_*` setters from
+      `cuda/hy3d/`. HIP trajectory can now be diffed against the
+      same PyTorch traces that CUDA uses (`ref/hy3d/local_trace_demo_seed42/`).
+    - `HY3D_DUMP_DIR`-gated `.npy` dumps wired into `hip_hy3d_predict`
+      (post-override DINOv2 context), `run_dinov2` (hidden_0, 12, 23, 24),
+      and `run_dit_forward` (blocks 0, 5, 10, 11, 14, 15, 20). Filenames
+      use `hip_` prefix so dumps can coexist with CUDA's `cuda_` dumps.
+      VAE per-block dumps skipped to match CUDA (reference `dump_vae.py`
+      already emits them; `verify_vae.c` only compares the final SDF grid).
+2. **Flow-matching schedule mismatch vs CUDA** — DONE
+    - Replaced legacy `t = 1 - step/n_steps` loop with the ASCENDING
+      sigmas schedule (sigma=step/(n_steps-1), sentinel 1.0 on the
+      last step, dt = sigma - sigma_next) matching
+      `Hunyuan3DDiTFlowMatchingPipeline` and the CUDA runner.
+3. **DiT correctness vs PyTorch** — DONE (2026-04-21)
+    - `verify_dit` now passes with `dit_output` max diff 7.3e-3 and
+      per-block diff uniformly below 0.015 vs `/tmp/hy3d_ref_dit_fixed/`
+      (regen via `ref/hy3d/dump_dit_single_step.py` with
+      `HY3D_REPO=/tmp/Hunyuan3D-2.1/hy3dshape`).
+    - End-to-end `test_hip_hy3d` produces a real mesh on apple_512.ppm:
+      30 steps / grid 64 / guidance 5.0 / seed 42 → 79416 verts /
+      26472 tris (SDF range -1.02 … +1.02, 20005 positive voxels).
+      5 steps is too few — SDF saturates near -1 everywhere and
+      marching cubes returns an empty mesh; that's a step-count issue,
+      not a correctness bug.
+    - Four bugs were fixed in this session:
+      a. `patch_embed_conv2d` call site passed 8 args instead of 9;
+         the missing `img_h` left stack garbage and produced a sticky
+         `hipErrorIllegalAddress` that looked like OOM much later.
+      b. MoE gate weights were being renormalized after top-k, but
+         the reference `MoEGate` has `norm_topk_prob=False`. Use the
+         raw softmax values per selected expert.
+      c. MoE output buffer aliased with MoE working scratch
+         (`d_moe_out = d_mlp = scratch[1]` collided with gate/expert
+         temps). `d_moe_out` now points to `d_attn` (scratch[2]),
+         which is free after the cross-attn residual add.
+      d. **Dominant bug:** `op_gelu` used the tanh approximation
+         (`gelu_f32` in `rdna4/hip_kernels_common.h`), but
+         `nn.GELU()` defaults to `approximate='none'` (erf-based).
+         Added a local `gelu_exact_f32` kernel and routed every
+         DINOv2 / DiT MLP / MoE expert & shared / timestep-MLP /
+         VAE GELU through a new `op_gelu_exact`. This alone dropped
+         DiT output max diff from 0.244 to 0.0073.
+4. **WMMA GEMM optimization** — LANDED, awaiting verification
+    - New kernel `gemm_f16w_bf16a_wmma_t` appended to
+      `rdna4/hy3d/hip_hy3d_kernels.h`. Port of trellis2's
+      `gemm_bf16w_bf16a_wmma_t` but reads F16 weights (via
+      `half_to_float`) then truncates to BF16 at SMEM load. Same 128x128
+      CTA tile, 8 waves, 8 WMMA calls per wave, bounds-checked M/N edges.
+      Requires `n_in % 16 == 0`; n_out/n_tok can be ragged.
+    - `hy3d_ops` grew `gemm_wmma` + `use_wmma` fields. `hy3d_ops_load`
+      looks up the optional symbol; failure is non-fatal and falls back
+      to the scalar tiled path. Dispatch in `op_gemm` now selects WMMA
+      automatically when (F16 weights, `n_in` aligned, `n_out >= 64`,
+      `n_tok >= 16`). gfx1200/1201 only.
+    - Default is OFF (opt-in): set `HIP_HY3D_WMMA=1` to enable. The
+      kernel lookup still runs so `hy3d_ops` exposes the function
+      pointer either way; the gate is purely runtime.
+    - TODO: numerical verify vs `verify_dinov2`/`verify_dit`/`verify_vae`
+      and measure step-time improvement on the full pipeline. Reference
+      dumps under `/mnt/disk1/work/gemm/ref/hy3d/output/` do **not**
+      exist yet — regenerate with `ref/hy3d/dump_dinov2.py`,
+      `ref/hy3d/dump_dit_single_step.py`, `ref/hy3d/dump_vae.py` before
+      the verify binaries can be used.
+    - Observed during smoke: `test_hip_hy3d` hangs for 20+ minutes inside
+      DINOv2 stage on repeat runs (seen both with and without WMMA).
+      GPU is only 3% busy, process at 99% CPU — separate issue from
+      GEMM throughput; suggests a kernel-launch / sync bottleneck
+      surfaced after the `ensure_scratch` hardening, or driver-state
+      persistence after a hard kill. Needs investigation on a freshly
+      booted driver state.
+5. **Texture / paint pipeline (hy3d_paint)** — OPEN (scope)
+    - No `rdna4/hy3d_paint/` exists. CUDA-side is itself only partially
+      ported (`doc/hy3d/paint.md`). If end-to-end includes textured
+      meshes, this is a separate larger project.
+6. **Minor test-harness parity** — OPEN
+    - `-h`/`--help`, `--f32` flag exposing `hip_hy3d_set_f32_gemm`,
+      per-step OBJ dump (`--dump-every`/`--dump-grid`/`--dump-prefix`).
+
+---
+
 # Hy3D CUDA Verification Task
 
 ## Current Status
