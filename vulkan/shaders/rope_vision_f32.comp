@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: MIT
+// Vision M-RoPE: independent sections, rotation pairs (i, i+half).
+// Applies to Q and K in QKV buffer. V is untouched.
+// Sections: pair 0..sect_size-1 uses p_t, sect_size..2*sect_size-1 uses p_h, etc.
+// For d_head=64, sect_size=16: only sections 0 (p_t) and 1 (p_h) are used.
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer QKVBuffer { float qkv[]; };
+layout(std430, binding = 1) buffer PosBuffer { int pos_ids[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_patches;
+    uint dim;        // n_embd
+    uint head_dim;
+    uint n_heads;
+    uint sect_size;  // head_dim / 4
+    float freq_base; // 10000.0
+} pc;
+
+void main() {
+    uint pid = gl_WorkGroupID.x;
+    uint head  = gl_WorkGroupID.y;
+    uint pair  = gl_LocalInvocationID.x;  // 0..half-1
+
+    uint half_dim = pc.head_dim / 2;
+    if (pair >= half_dim) return;
+
+    // Determine section and local index within section
+    uint section = pair / pc.sect_size;
+    uint local_i = pair % pc.sect_size;
+
+    // Look up position for this section
+    // pos_ids layout: [4][n_patches] = {p_t, p_h, p_w, p_e}
+    int pos = pos_ids[section * pc.n_patches + pid];
+
+    // Compute rotation angle: theta = pos * base^(-2*local_i / half_dim)
+    float freq = pow(pc.freq_base, -2.0 * float(local_i) / float(half_dim));
+    float theta = float(pos) * freq;
+    float cos_t = cos(theta);
+    float sin_t = sin(theta);
+
+    // Apply to Q: qkv[patch * 3*dim + head*head_dim + ...]
+    uint q_base = pid * 3 * pc.dim + head * pc.head_dim;
+    float q0 = qkv[q_base + pair];
+    float q1 = qkv[q_base + pair + half_dim];
+    qkv[q_base + pair]            = q0 * cos_t - q1 * sin_t;
+    qkv[q_base + pair + half_dim] = q0 * sin_t + q1 * cos_t;
+
+    // Apply to K: qkv[patch * 3*dim + dim + head*head_dim + ...]
+    uint k_base = pid * 3 * pc.dim + pc.dim + head * pc.head_dim;
+    float k0 = qkv[k_base + pair];
+    float k1 = qkv[k_base + pair + half_dim];
+    qkv[k_base + pair]            = k0 * cos_t - k1 * sin_t;
+    qkv[k_base + pair + half_dim] = k0 * sin_t + k1 * cos_t;
+}
