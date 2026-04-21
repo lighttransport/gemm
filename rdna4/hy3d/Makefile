@@ -16,7 +16,7 @@ HDRS = hip_hy3d_runner.h hip_hy3d_kernels.h hip_hy3d_ops.h \
 
 .PHONY: all verify clean help
 
-all: test_hip_hy3d
+all: test_hip_hy3d wmma_selftest
 
 verify: verify_dinov2 verify_vae verify_dit
 
@@ -32,8 +32,11 @@ verify_vae: verify_vae.c $(RUNNER_SRC) $(ROCEW_SRC) $(HDRS)
 verify_dit: verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
+wmma_selftest: wmma_selftest.c $(ROCEW_SRC) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ wmma_selftest.c $(ROCEW_SRC) $(LDFLAGS)
+
 clean:
-	rm -f test_hip_hy3d verify_dinov2 verify_vae verify_dit
+	rm -f test_hip_hy3d verify_dinov2 verify_vae verify_dit wmma_selftest
 
 help:
 	@echo "HIP/ROCm Hunyuan3D-2.1 Runner (HIPRTC-based, no hipcc needed)"
