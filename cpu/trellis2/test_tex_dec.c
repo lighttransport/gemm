@@ -58,6 +58,38 @@ static float *read_npy_f32(const char *p, int *nd, int *dd) {
     return d;
 }
 
+static int64_t *read_npy_i64(const char *p, int *nd, int *dd) {
+    FILE *f = fopen(p, "rb");
+    if (!f) return NULL;
+    fseek(f, 8, SEEK_SET);
+    uint16_t hl;
+    fread(&hl, 2, 1, f);
+    char *h = malloc(hl + 1);
+    fread(h, 1, hl, f);
+    h[hl] = 0;
+    *nd = 0;
+    char *sp = strstr(h, "shape");
+    if (sp) {
+        sp = strchr(sp, '(');
+        if (sp) {
+            sp++;
+            while (*sp && *sp != ')') {
+                while (*sp == ' ' || *sp == ',') sp++;
+                if (*sp == ')') break;
+                dd[*nd] = (int)strtol(sp, &sp, 10);
+                (*nd)++;
+            }
+        }
+    }
+    size_t n = 1;
+    for (int i = 0; i < *nd; i++) n *= dd[i];
+    int64_t *d = malloc(n * sizeof(int64_t));
+    fread(d, sizeof(int64_t), n, f);
+    fclose(f);
+    free(h);
+    return d;
+}
+
 static int32_t *read_npy_i32(const char *p, int *nd, int *dd) {
     FILE *f = fopen(p, "rb");
     if (!f) return NULL;
@@ -99,28 +131,42 @@ static uint64_t pack_coord(int32_t z, int32_t y, int32_t x) {
 }
 
 int main(int argc, char **argv) {
+    int exit_code = 1;
+    t2_shape_dec *dec = NULL;
+    sp3d_tensor *slat = NULL;
+    t2_shape_dec_result r = {0};
+    float *ref_feats = NULL;
+    int64_t *alloced_idx[4] = {0}, *alloced_sub[4] = {0};
+    int32_t *alloced_xc[4] = {0};
+
     if (argc < 5) {
         fprintf(stderr,
                 "Usage: %s <tex_dec.st> <tex_slat_feats.npy> "
                 "<tex_slat_coords.npy> <pbr_voxel_feats.npy> "
                 "[pbr_voxel_coords.npy] [-t threads]\n",
                 argv[0]);
-        return 1;
+        goto cleanup;
     }
     int n_threads = 4;
     const char *ref_coords_path = NULL;
+    const char *cache_dir = NULL;
+    const char *dump_prefix = NULL;
     for (int i = 5; i < argc; i++) {
         if (!strcmp(argv[i], "-t") && i + 1 < argc) {
             n_threads = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--caches") && i + 1 < argc) {
+            cache_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--dump") && i + 1 < argc) {
+            dump_prefix = argv[++i];
         } else if (argv[i][0] != '-') {
             ref_coords_path = argv[i];
         }
     }
 
-    t2_shape_dec *dec = t2_shape_dec_load(argv[1]);
+    dec = t2_shape_dec_load(argv[1]);
     if (!dec) {
         fprintf(stderr, "failed to load %s\n", argv[1]);
-        return 1;
+        goto cleanup;
     }
 
     int nd, dd[8];
@@ -132,12 +178,85 @@ int main(int argc, char **argv) {
     int32_t *slat_coords = read_npy_i32(argv[3], &nd, dd);
     fprintf(stderr, "tex_slat coords: [%d, %d]\n", dd[0], dd[1]);
 
-    sp3d_tensor *slat = sp3d_create(slat_coords, slat_feats, N, C, 1);
+    slat = sp3d_create(slat_coords, slat_feats, N, C, 1);
     free(slat_feats);
     free(slat_coords);
 
-    fprintf(stderr, "\nRunning tex decoder (%d threads)...\n", n_threads);
-    t2_shape_dec_result r = t2_shape_dec_forward(dec, slat, n_threads);
+    /* Load subdivision guide (4 scales: 16 -> 8 -> 4 -> 2). */
+    t2_shape_dec_subdiv_stage stages[4] = {0};
+    t2_shape_dec_guide guide_buf = {.stages = stages, .n_stages = 0};
+    t2_shape_dec_guide *guide = NULL;
+    if (cache_dir) {
+        int scales[4] = {16, 8, 4, 2};
+        guide_buf.n_stages = 4;
+        for (int s = 0; s < 4; s++) {
+            char pidx[512], psub[512], pxc[512];
+            snprintf(pidx, sizeof pidx, "%s/cache_scale%d_c2s_idx.npy", cache_dir, scales[s]);
+            snprintf(psub, sizeof psub, "%s/cache_scale%d_c2s_subidx.npy", cache_dir, scales[s]);
+            snprintf(pxc,  sizeof pxc,  "%s/cache_scale%d_c2s_x_coords.npy", cache_dir, scales[s]);
+            int idx_n, idx_d[8];
+            int64_t *idx = read_npy_i64(pidx, &idx_n, idx_d);
+            int sub_n, sub_d[8];
+            int64_t *sub = read_npy_i64(psub, &sub_n, sub_d);
+            int xn, xd[8];
+            int32_t *xc = read_npy_i32(pxc, &xn, xd);
+            if (!idx || !sub || !xc) {
+                fprintf(stderr, "failed to load cache for scale %d\n", scales[s]);
+                goto cleanup;
+            }
+            if (idx_n != 1 || idx_d[0] <= 0) {
+                fprintf(stderr, "invalid idx shape for scale %d\n", scales[s]);
+                free(idx);
+                free(sub);
+                free(xc);
+                goto cleanup;
+            }
+            if (sub_n != 1 || sub_d[0] != idx_d[0]) {
+                fprintf(stderr, "invalid subidx shape for scale %d: expected [%d]\n",
+                        scales[s], idx_d[0]);
+                free(idx);
+                free(sub);
+                free(xc);
+                goto cleanup;
+            }
+            if (xn != 2 || xd[0] != idx_d[0] || xd[1] != 4) {
+                fprintf(stderr, "invalid x_coords shape for scale %d: expected [%d,4]\n",
+                        scales[s], idx_d[0]);
+                free(idx);
+                free(sub);
+                free(xc);
+                goto cleanup;
+            }
+            int N_fine = idx_d[0];
+            for (int i = 0; i < N_fine; i++) {
+                if (idx[i] < 0 || sub[i] < 0 || sub[i] > 7) {
+                    fprintf(stderr, "invalid cache entry scale %d i=%d idx=%lld subidx=%lld\n",
+                            scales[s], i, (long long)idx[i], (long long)sub[i]);
+                    free(idx);
+                    free(sub);
+                    free(xc);
+                    goto cleanup;
+                }
+            }
+            alloced_idx[s] = idx;
+            alloced_sub[s] = sub;
+            alloced_xc[s]  = xc;
+            stages[s].idx = idx;
+            stages[s].subidx = sub;
+            stages[s].x_coords = xc;
+            stages[s].N_fine = N_fine;
+            fprintf(stderr, "guide scale %d: N_fine=%d\n", scales[s], N_fine);
+        }
+        guide = &guide_buf;
+    }
+
+    fprintf(stderr, "\nRunning tex decoder (%d threads, guide=%s)...\n",
+            n_threads, guide ? "yes" : "no");
+    r = t2_shape_dec_forward_guided(dec, slat, guide, n_threads);
+    if (!r.feats || !r.coords || r.N <= 0 || r.C <= 0) {
+        fprintf(stderr, "decoder forward failed\n");
+        goto cleanup;
+    }
     fprintf(stderr, "decoded: N=%d, C=%d\n", r.N, r.C);
     if (r.C != 6) {
         fprintf(stderr,
@@ -149,8 +268,50 @@ int main(int argc, char **argv) {
     /* Pipeline applies `* 0.5 + 0.5` after decoder forward. */
     for (int i = 0; i < r.N * r.C; i++) r.feats[i] = r.feats[i] * 0.5f + 0.5f;
 
+    if (dump_prefix) {
+        char path[512];
+        /* feats: float32 [N, C] */
+        snprintf(path, sizeof path, "%s_feats.npy", dump_prefix);
+        FILE *fp = fopen(path, "wb");
+        if (fp) {
+            char hdr[128];
+            int hlen = snprintf(hdr, sizeof hdr,
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                r.N, r.C);
+            int pad = 64 - ((10 + hlen + 1) % 64);
+            fwrite("\x93NUMPY\x01\x00", 1, 8, fp);
+            uint16_t hl = (uint16_t)(hlen + pad + 1);
+            fwrite(&hl, 2, 1, fp);
+            fwrite(hdr, 1, hlen, fp);
+            for (int k = 0; k < pad; k++) fputc(' ', fp);
+            fputc('\n', fp);
+            fwrite(r.feats, sizeof(float), (size_t)r.N * r.C, fp);
+            fclose(fp);
+            fprintf(stderr, "dumped %s\n", path);
+        }
+        /* coords: int32 [N, 4] */
+        snprintf(path, sizeof path, "%s_coords.npy", dump_prefix);
+        fp = fopen(path, "wb");
+        if (fp) {
+            char hdr[128];
+            int hlen = snprintf(hdr, sizeof hdr,
+                "{'descr': '<i4', 'fortran_order': False, 'shape': (%d, 4), }",
+                r.N);
+            int pad = 64 - ((10 + hlen + 1) % 64);
+            fwrite("\x93NUMPY\x01\x00", 1, 8, fp);
+            uint16_t hl = (uint16_t)(hlen + pad + 1);
+            fwrite(&hl, 2, 1, fp);
+            fwrite(hdr, 1, hlen, fp);
+            for (int k = 0; k < pad; k++) fputc(' ', fp);
+            fputc('\n', fp);
+            fwrite(r.coords, sizeof(int32_t), (size_t)r.N * 4, fp);
+            fclose(fp);
+            fprintf(stderr, "dumped %s\n", path);
+        }
+    }
+
     int ref_nd, ref_dd[8];
-    float *ref_feats = read_npy_f32(argv[4], &ref_nd, ref_dd);
+    ref_feats = read_npy_f32(argv[4], &ref_nd, ref_dd);
     int ref_N = ref_dd[0], ref_C = ref_nd >= 2 ? ref_dd[1] : 1;
     fprintf(stderr, "ref pbr_voxel feats: [%d, %d]\n", ref_N, ref_C);
 
@@ -175,8 +336,9 @@ int main(int argc, char **argv) {
             uint64_t k;
             int v;
         } kv;
-        kv *map = (kv *)calloc((size_t)r.N * 2, sizeof(kv));
-        int mcap = r.N * 2;
+        int mcap = 1;
+        while (mcap < r.N * 2) mcap <<= 1;
+        kv *map = (kv *)calloc((size_t)mcap, sizeof(kv));
         for (int i = 0; i < r.N; i++) {
             int32_t z = r.coords[i * stride_out + 1];
             int32_t y = r.coords[i * stride_out + 2];
@@ -241,9 +403,17 @@ stats_only: {
     }
 }
 
+    exit_code = 0;
+
+cleanup:
+    for (int s = 0; s < 4; s++) {
+        free(alloced_idx[s]);
+        free(alloced_sub[s]);
+        free(alloced_xc[s]);
+    }
     free(ref_feats);
     t2_shape_dec_result_free(&r);
     sp3d_free(slat);
     t2_shape_dec_free(dec);
-    return 0;
+    return exit_code;
 }
