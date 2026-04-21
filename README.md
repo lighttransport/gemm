@@ -19,8 +19,8 @@ High-performance GEMM, FlashAttention kernels, and full LLM/VLM inference engine
 | CUDA DA3 Runner | `cuda/da3/` | CUDA depth estimation (all output modalities) |
 | CUDA PPD Runner | `cuda/ppd/` | CUDA diffusion-based depth |
 | Vulkan LLM Runner | `vulkan/` | Vulkan LLM with cooperative matrix |
-| SAM 2 / SAM 2.1 | `ref/sam2/`, `cpu/sam2/`, `rdna4/sam2/` | Point/box-prompted image (+ video) segmentation (Meta). Shared arch for 2.0 and 2.1 weights. |
-| SAM 3 | `ref/sam3/`, `cpu/sam3/`, `rdna4/sam3/` | Concept-level (text + exemplar) promptable segmentation (Meta, 2025). |
+| SAM 2 / SAM 2.1 | `ref/sam2/`, `cuda/sam2/` | Point/box-prompted segmentation. CUDA runner scaffold + reference tooling in progress. |
+| SAM 3 | `cpu/sam3/`, `rdna4/sam3/`, `cuda/sam3/` | Concept-level (text + exemplar) promptable segmentation (Meta, 2025). |
 
 See [VLM_LLM.md](VLM_LLM.md) for detailed VLM/LLM feature matrix, supported models, and TODOs.
 
