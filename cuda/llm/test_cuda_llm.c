@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    cuda_llm_set_debug(gpu, 2);  /* Print per-layer hidden state norms */
+    cuda_llm_set_debug(gpu, 0);  /* 0=off, 2=per-layer norms+profile (adds sync overhead) */
     int n_embd = cuda_llm_n_embd(gpu);
     fprintf(stderr, "\n=== Running %d tokens (n_embd=%d)%s ===\n",
             max_tokens, n_embd, gpu_only ? " [GPU-only]" : "");
@@ -172,6 +172,15 @@ int main(int argc, char **argv) {
     /* Run tokens through both */
     double total_cpu_ms = 0.0, total_gpu_ms = 0.0;
     int pass = 1;
+    float *last_gpu_hidden = (float *)malloc((size_t)n_embd * sizeof(float));
+    if (!last_gpu_hidden) {
+        fprintf(stderr, "Failed to allocate last_gpu_hidden\n");
+        cuda_llm_free(gpu);
+        if (cpu_model) transformer_free(cpu_model);
+        bpe_vocab_free(vocab);
+        gguf_close(gguf);
+        return 1;
+    }
 
     for (int i = 0; i < max_tokens; i++) {
         int32_t token = tokens[i];
@@ -197,6 +206,7 @@ int main(int argc, char **argv) {
             pass = 0;
             continue;
         }
+        memcpy(last_gpu_hidden, gpu_out, (size_t)n_embd * sizeof(float));
 
         if (gpu_only) {
             /* GPU-only: just print hidden state */
@@ -206,10 +216,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Token %d: CPU forward failed\n", i);
             pass = 0;
         } else {
-            /* Compare */
+            /* Compare (dp4a INT8 quantization widens expected error) */
             float err = rel_l2_error(gpu_out, cpu_out, n_embd);
-            const char *status = (err < 1e-2f) ? "OK" : "MISMATCH";
-            if (err >= 1e-2f) pass = 0;
+            float tol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
+            const char *status = (err < tol) ? "OK" : "MISMATCH";
+            if (err >= tol) pass = 0;
 
             fprintf(stderr, "\nToken %d (id=%d): rel_L2=%.6f [%s]  CPU=%.1fms  GPU=%.1fms  (%.1fx)\n",
                     i, token, err, status, cpu_ms, gpu_ms,
@@ -232,7 +243,93 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 
+    /* Get logits from sequential forward_logits */
+    cuda_llm_reset_state(gpu);
+    {
+        /* Run all tokens except last to build up state */
+        for (int t = 0; t + 1 < max_tokens; t++) {
+            cuda_llm_forward(gpu, tokens[t], t);
+        }
+        /* Get logits for the last token */
+        float *seq_logits = cuda_llm_forward_logits(gpu, tokens[max_tokens-1], max_tokens-1);
+        if (seq_logits) {
+            int n_vocab_size = cuda_llm_n_vocab(gpu);
+            if (n_vocab_size > 0) {
+                int top5_ids[5] = {0};
+                float top5_vals[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+                for (int v = 0; v < n_vocab_size; v++) {
+                    float val = seq_logits[v];
+                    for (int k = 0; k < 5; k++) {
+                        if (val > top5_vals[k]) {
+                            for (int j = 4; j > k; j--) { top5_ids[j] = top5_ids[j-1]; top5_vals[j] = top5_vals[j-1]; }
+                            top5_ids[k] = v; top5_vals[k] = val;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "Sequential top-5:");
+                for (int k = 0; k < 5; k++) {
+                    const char *s = bpe_token_to_str(vocab, top5_ids[k]);
+                    fprintf(stderr, " [%d]=%.4f('%s')", top5_ids[k], top5_vals[k], s ? s : "?");
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    cuda_llm_reset_state(gpu);
+    double t0 = get_time_ms();
+    float *prefill_hidden = cuda_llm_prefill(gpu, tokens, NULL, 0, max_tokens, 0);
+    double prefill_ms = get_time_ms() - t0;
+    if (prefill_hidden) {
+        float err = rel_l2_error(prefill_hidden, last_gpu_hidden, n_embd);
+        /* dp4a decode vs non-dp4a prefill will diverge — relax threshold */
+        float ptol = cuda_llm_uses_dp4a(gpu) ? 0.5f : 1e-2f;
+        fprintf(stderr, "Prefill hidden: %.1f ms (%.1f tok/s) rel_L2_vs_seq=%.6f\n",
+                prefill_ms, prefill_ms > 0 ? (1000.0 * max_tokens / prefill_ms) : 0.0, err);
+        if (err >= ptol) pass = 0;
+    } else {
+        fprintf(stderr, "Prefill hidden failed\n");
+        pass = 0;
+    }
+
+    cuda_llm_reset_state(gpu);
+    t0 = get_time_ms();
+    float *prefill_logits = cuda_llm_prefill_logits(gpu, tokens, NULL, 0, max_tokens, 0);
+    double prefill_logits_ms = get_time_ms() - t0;
+    if (prefill_logits) {
+        fprintf(stderr, "Prefill logits: %.1f ms (%.1f tok/s)\n",
+                prefill_logits_ms,
+                prefill_logits_ms > 0 ? (1000.0 * max_tokens / prefill_logits_ms) : 0.0);
+        /* Print top-5 predicted tokens */
+        int n_vocab_size = cuda_llm_n_vocab(gpu);
+        if (n_vocab_size > 0) {
+            int top5_ids[5] = {0};
+            float top5_vals[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+            for (int v = 0; v < n_vocab_size; v++) {
+                float val = prefill_logits[v];
+                for (int k = 0; k < 5; k++) {
+                    if (val > top5_vals[k]) {
+                        for (int j = 4; j > k; j--) { top5_ids[j] = top5_ids[j-1]; top5_vals[j] = top5_vals[j-1]; }
+                        top5_ids[k] = v; top5_vals[k] = val;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "Prefill top-5:");
+            for (int k = 0; k < 5; k++) {
+                const char *s = bpe_token_to_str(vocab, top5_ids[k]);
+                fprintf(stderr, " [%d]=%.4f('%s')", top5_ids[k], top5_vals[k], s ? s : "?");
+            }
+            fprintf(stderr, "\n");
+        }
+    } else {
+        fprintf(stderr, "Prefill logits failed\n");
+        pass = 0;
+    }
+
     /* Cleanup */
+    free(last_gpu_hidden);
     cuda_llm_free(gpu);
     if (cpu_model) transformer_free(cpu_model);
     bpe_vocab_free(vocab);

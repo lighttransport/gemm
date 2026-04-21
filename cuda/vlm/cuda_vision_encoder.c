@@ -10,6 +10,7 @@
 
 #include "cuda_vision_encoder.h"
 #include "../cuew.h"
+#include "../cublasew.h"
 #include "../cuda_kernels_common.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
@@ -18,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 /* Aliases for shared macros */
 #define CHECK_CU CU_CHECK
@@ -228,6 +230,79 @@ static const char *cuda_vlm_specific_kernels =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- reorder_rows_f32: dst[row] = src[index[row]] ---- */\n"
+"__global__ void reorder_rows_f32(float *dst, const float *src,\n"
+"                                 const int *index, int row_dim) {\n"
+"    int row = blockIdx.x;\n"
+"    int src_row = index[row];\n"
+"    for (int d = threadIdx.x; d < row_dim; d += blockDim.x) {\n"
+"        dst[(size_t)row * row_dim + d] = src[(size_t)src_row * row_dim + d];\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- attn_window_f32: local self-attention on contiguous windows ---- */\n"
+"/* Grid: (n_heads, n_windows), Block: (256) */\n"
+"__global__ void attn_window_f32(float *out, const float *qkv,\n"
+"                                const int *win_start, const int *win_size,\n"
+"                                int dim, int n_heads, int head_dim, float scale) {\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    int w = blockIdx.y;\n"
+"    if (h >= n_heads) return;\n"
+"    int start = win_start[w];\n"
+"    int size = win_size[w];\n"
+"    int tid = threadIdx.x;\n"
+"    int nt = blockDim.x;\n"
+"    int dim3 = 3 * dim;\n"
+"    if (size <= 0) return;\n"
+"    for (int ql = 0; ql < size; ql++) {\n"
+"        int qi = start + ql;\n"
+"        const float *q_h = qkv + (size_t)qi * dim3 + h * head_dim;\n"
+"        for (int kl = tid; kl < size; kl += nt) {\n"
+"            int ki = start + kl;\n"
+"            const float *k_h = qkv + (size_t)ki * dim3 + dim + h * head_dim;\n"
+"            float score = 0.0f;\n"
+"            for (int d = 0; d < head_dim; d++) score += q_h[d] * k_h[d];\n"
+"            smem[kl] = score * scale;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        float local_max = -1e30f;\n"
+"        for (int kl = tid; kl < size; kl += nt)\n"
+"            if (smem[kl] > local_max) local_max = smem[kl];\n"
+"        smem[size + tid] = local_max;\n"
+"        __syncthreads();\n"
+"        for (int r = nt/2; r > 0; r >>= 1) {\n"
+"            if (tid < r && smem[size + tid + r] > smem[size + tid])\n"
+"                smem[size + tid] = smem[size + tid + r];\n"
+"            __syncthreads();\n"
+"        }\n"
+"        float max_val = smem[size];\n"
+"        float local_sum = 0.0f;\n"
+"        for (int kl = tid; kl < size; kl += nt) {\n"
+"            smem[kl] = expf(smem[kl] - max_val);\n"
+"            local_sum += smem[kl];\n"
+"        }\n"
+"        smem[size + tid] = local_sum;\n"
+"        __syncthreads();\n"
+"        for (int r = nt/2; r > 0; r >>= 1) {\n"
+"            if (tid < r) smem[size + tid] += smem[size + tid + r];\n"
+"            __syncthreads();\n"
+"        }\n"
+"        float inv_sum = 1.0f / smem[size];\n"
+"        for (int kl = tid; kl < size; kl += nt) smem[kl] *= inv_sum;\n"
+"        __syncthreads();\n"
+"        for (int d = tid; d < head_dim; d += nt) {\n"
+"            float sum = 0.0f;\n"
+"            for (int vl = 0; vl < size; vl++) {\n"
+"                int vi = start + vl;\n"
+"                sum += smem[vl] * qkv[(size_t)vi * dim3 + 2 * dim + h * head_dim + d];\n"
+"            }\n"
+"            out[(size_t)qi * dim + h * head_dim + d] = sum;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern C */\n"
 ;
 
@@ -260,8 +335,10 @@ struct cuda_vision_runner {
     CUdevice device;
     CUcontext context;
     CUstream stream;
+    cublasew_context *cublas;
     int verbose;
     int use_f16;
+    int use_cublas;
 
     CUmodule module;
     /* Shared kernels */
@@ -277,6 +354,8 @@ struct cuda_vision_runner {
     CUfunction fn_add_pos_embd_direct;
     CUfunction fn_rope_vision_f32;
     CUfunction fn_attn_full_f32;
+    CUfunction fn_attn_window_f32;
+    CUfunction fn_reorder_rows_f32;
     CUfunction fn_spatial_merge_f32;
 
     /* Model hyperparams */
@@ -291,6 +370,8 @@ struct cuda_vision_runner {
     int proj_dim;
     int spatial_merge;
     int n_merged;
+    int n_wa_pattern;
+    int attn_window_size;
     float ln_eps;
     float image_mean[3];
     float image_std[3];
@@ -339,6 +420,10 @@ struct cuda_vision_runner {
     CUdeviceptr d_rope_cos;   /* [max_patches * head_dim] */
     CUdeviceptr d_rope_sin;   /* [max_patches * head_dim] */
     CUdeviceptr d_pos_map;    /* [max_patches] int */
+    CUdeviceptr d_token_perm;     /* [max_patches] int */
+    CUdeviceptr d_token_inv_perm; /* [max_patches] int */
+    CUdeviceptr d_window_starts;  /* [max_merged] int */
+    CUdeviceptr d_window_sizes;   /* [max_merged] int */
     CUdeviceptr d_ds_feats;   /* deepstack feature accumulation */
 
     /* Host output */
@@ -434,12 +519,87 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
     GET_FN(add_pos_embd_direct);
     GET_FN(rope_vision_f32);
     GET_FN(attn_full_f32);
+    GET_FN(attn_window_f32);
+    GET_FN(reorder_rows_f32);
     GET_FN(spatial_merge_f32);
 
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 12, sm);
+        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 14, sm);
+    return 0;
+}
+
+static double vlm_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static void vlm_swap_ptrs(CUdeviceptr *a, CUdeviceptr *b) {
+    CUdeviceptr tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+static int vlm_build_qwen_window_maps(int gw, int gh, int sm, int patch_size,
+                                      int attn_window_size, int use_window_attn,
+                                      int *token_perm, int *token_inv_perm,
+                                      int *window_starts, int *window_sizes,
+                                      int *n_windows_out) {
+    const int pw = gw / sm;
+    const int ph = gh / sm;
+    const int mpow = sm * sm;
+    const int n_groups = pw * ph;
+    int *group_perm = (int *)malloc((size_t)n_groups * sizeof(int));
+    if (!group_perm) return -1;
+
+    int n_windows = 0;
+    if (use_window_attn) {
+        int grid_window = attn_window_size / patch_size / sm;
+        if (grid_window < 1) grid_window = 1;
+        int dst = 0;
+        for (int y = 0; y < ph; y += grid_window) {
+            for (int x = 0; x < pw; x += grid_window) {
+                int win_h = (y + grid_window <= ph) ? grid_window : (ph - y);
+                int win_w = (x + grid_window <= pw) ? grid_window : (pw - x);
+                int dst0 = dst;
+                for (int dy = 0; dy < win_h; dy++) {
+                    for (int dx = 0; dx < win_w; dx++) {
+                        int src = (y + dy) * pw + (x + dx);
+                        group_perm[src] = dst++;
+                    }
+                }
+                window_starts[n_windows] = dst0 * mpow;
+                window_sizes[n_windows] = (dst - dst0) * mpow;
+                n_windows++;
+            }
+        }
+    } else {
+        for (int i = 0; i < n_groups; i++) group_perm[i] = i;
+        window_starts[0] = 0;
+        window_sizes[0] = gw * gh;
+        n_windows = 1;
+    }
+
+    for (int gy = 0; gy < ph; gy++) {
+        for (int gx = 0; gx < pw; gx++) {
+            int src_group = gy * pw + gx;
+            int dst_group = group_perm[src_group];
+            for (int sy = 0; sy < sm; sy++) {
+                for (int sx = 0; sx < sm; sx++) {
+                    int sub = sy * sm + sx;
+                    int src_token = (gy * sm + sy) * gw + (gx * sm + sx);
+                    int dst_token = dst_group * mpow + sub;
+                    token_perm[dst_token] = src_token;
+                    token_inv_perm[src_token] = dst_token;
+                }
+            }
+        }
+    }
+
+    free(group_perm);
+    *n_windows_out = n_windows;
     return 0;
 }
 
@@ -495,6 +655,13 @@ static float vlm_get_float(const gguf_context *g, const char *key, float def) {
     if (idx < 0) return def;
     if (g->kv[idx].type == GGUF_TYPE_FLOAT32) return g->kv[idx].value.f32;
     return def;
+}
+
+static const char *vlm_get_string(const gguf_context *g, const char *key) {
+    int idx = gguf_find_key(g, key);
+    if (idx < 0) return NULL;
+    if (g->kv[idx].type != GGUF_TYPE_STRING) return NULL;
+    return g->kv[idx].value.str.str;
 }
 
 /* Dequantize full tensor to F32 and upload */
@@ -590,8 +757,18 @@ cuda_vision_runner *cuda_vision_init(int device_id, int verbose, int use_f16) {
     CU_CHECK_NULL(cuCtxCreate(&r->context, 0, r->device));
     CU_CHECK_NULL(cuStreamCreate(&r->stream, CU_STREAM_DEFAULT));
 
+    if (cublasewCreate(&r->cublas, r->stream) == 0) {
+        r->use_cublas = 1;
+        if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_vlm: cuBLAS GEMM fast path enabled\n");
+        }
+    } else if (r->verbose >= 1) {
+        fprintf(stderr, "cuda_vlm: cuBLAS unavailable, using built-in GEMM kernels\n");
+    }
+
     if (vlm_compile_kernels(r) != 0) {
         fprintf(stderr, "cuda_vlm: kernel compilation failed\n");
+        if (r->cublas) cublasewDestroy(r->cublas);
         free(r);
         return NULL;
     }
@@ -609,6 +786,8 @@ void cuda_vision_set_max_pixels(cuda_vision_runner *r, int max_pixels) {
 
 int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
     if (!r || !g) return -1;
+    const char *proj_type = vlm_get_string(g, "clip.projector_type");
+    if (!proj_type) proj_type = vlm_get_string(g, "clip.vision.projector_type");
 
     /* Read hyperparameters */
     r->n_blocks    = vlm_get_int(g, "clip.vision.block_count", 24);
@@ -619,6 +798,14 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
     r->image_size  = vlm_get_int(g, "clip.vision.image_size", 768);
     r->proj_dim    = vlm_get_int(g, "clip.vision.projection_dim", 2048);
     r->spatial_merge = vlm_get_int(g, "clip.vision.spatial_merge_size", 2);
+    r->n_wa_pattern = vlm_get_int(g, "clip.vision.n_wa_pattern", 0);
+    r->attn_window_size = vlm_get_int(g, "clip.vision.window_size", 112);
+    if (r->n_wa_pattern == 0 && proj_type &&
+        (strstr(proj_type, "qwen2.5vl") || strstr(proj_type, "qwen25vl") ||
+         strstr(proj_type, "qwen3vl") || strstr(proj_type, "qwen3.5vl") ||
+         strstr(proj_type, "qwen3-5"))) {
+        r->n_wa_pattern = 4;
+    }
     r->ln_eps      = vlm_get_float(g, "clip.vision.attention.layer_norm_epsilon", 1e-6f);
     r->head_dim    = r->dim / r->n_heads;
 
@@ -647,10 +834,11 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
         r->image_std[0] = d[0]; r->image_std[1] = d[1]; r->image_std[2] = d[2];
     }
 
-    fprintf(stderr, "cuda_vlm: dim=%d heads=%d blocks=%d ffn=%d patch=%d image=%d patches=%d merged=%d proj=%d f16=%d max_patches=%d\n",
+    fprintf(stderr, "cuda_vlm: dim=%d heads=%d blocks=%d ffn=%d patch=%d image=%d patches=%d merged=%d proj=%d f16=%d max_patches=%d wa_pattern=%d window=%d proj_type=%s\n",
             r->dim, r->n_heads, r->n_blocks, r->ffn_dim,
             r->patch_size, r->image_size, r->n_patches, r->n_merged, r->proj_dim, r->use_f16,
-            r->max_patches);
+            r->max_patches, r->n_wa_pattern, r->attn_window_size,
+            proj_type ? proj_type : "(unknown)");
 
     int dim = r->dim;
     int mp = r->max_patches;
@@ -802,6 +990,10 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
         CHECK_CU(cuMemAlloc(&r->d_rope_cos,  (size_t)mp * r->head_dim * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_rope_sin,  (size_t)mp * r->head_dim * sizeof(float)));
         CHECK_CU(cuMemAlloc(&r->d_pos_map,   (size_t)mp * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&r->d_token_perm, (size_t)mp * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&r->d_token_inv_perm, (size_t)mp * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&r->d_window_starts, (size_t)max_merged * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&r->d_window_sizes, (size_t)max_merged * sizeof(int)));
         CHECK_CU(cuMemAlloc(&r->d_pos_interp,(size_t)mp * dim * sizeof(float)));
     }
 
@@ -835,6 +1027,35 @@ static void vlm_gemm(cuda_vision_runner *r, CUdeviceptr d_Y, const gpu_weight *w
     /* Copy const fields to locals for void* args array */
     CUdeviceptr d_W, d_bias;
     d_bias = w->bias;
+    if (r->use_cublas && r->cublas) {
+        int ok;
+        if (r->use_f16 && w->w_f16) {
+            ok = cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, d_Y, w->w_f16, d_X,
+                                                   n_tok, n_out, n_in);
+        } else if (w->w_f32) {
+            ok = cublasew_gemm_f32_rowmajor_nt(r->cublas, d_Y, w->w_f32, d_X,
+                                               n_tok, n_out, n_in);
+        } else {
+            ok = -1;
+        }
+        if (ok == 0) {
+            if (d_bias) {
+                int total = n_out * n_tok;
+                int grid = (total + 255) / 256;
+                void *args[] = { &d_Y, &d_bias, &n_out, &n_tok };
+                cuLaunchKernel(r->fn_add_bias_f32,
+                               grid, 1, 1,
+                               256, 1, 1,
+                               0, r->stream,
+                               args, NULL);
+            }
+            return;
+        }
+        if (r->verbose >= 1) {
+            fprintf(stderr, "cuda_vlm: cuBLAS GEMM failed, falling back to built-in kernels\n");
+        }
+        r->use_cublas = 0;
+    }
     if (r->use_f16 && w->w_f16) {
         /* F16 MMA tensor core path */
         d_W = w->w_f16;
@@ -879,6 +1100,12 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     int sm = r->spatial_merge;
     int merged_dim = dim * sm * sm;
     int n_merged = n_patches / (sm * sm);
+    int use_window_attn = (r->n_wa_pattern > 0);
+    int n_windows = 0;
+    int max_window_tokens = 0;
+    double t_patch = 0.0, t_pos = 0.0, t_rope = 0.0, t_vit = 0.0;
+    double t_postln = 0.0, t_merge = 0.0, t_mmproj = 0.0;
+    double t0;
 
     if (n_patches > r->max_patches) {
         fprintf(stderr, "cuda_vlm: too many patches %d (max %d)\n", n_patches, r->max_patches);
@@ -887,12 +1114,17 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
 
     fprintf(stderr, "cuda_vlm: encoding %dx%d image (%d patches, %d merged tokens)\n",
             width, height, n_patches, n_merged);
+    if (use_window_attn) {
+        fprintf(stderr, "cuda_vlm: Qwen window attention enabled (pattern=%d window=%d)\n",
+                r->n_wa_pattern, r->attn_window_size);
+    }
 
     /* 1. Upload RGB to GPU */
     cuMemcpyHtoD(r->d_rgb, rgb_norm, (size_t)width * height * 3 * sizeof(float));
 
     /* 2. Patch embedding (dual conv2d) */
     fprintf(stderr, "  patch embedding (dual conv2d)...\n");
+    t0 = vlm_time_ms();
     {
         int img_w = width;
         void *args[] = {
@@ -906,6 +1138,8 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                        0, r->stream,
                        args, NULL);
     }
+    cuStreamSynchronize(r->stream);
+    t_patch = vlm_time_ms() - t0;
 
     /* Debug: check patch embedding output */
     if (r->verbose >= 2) {
@@ -918,6 +1152,7 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
 
     /* 3. Position embeddings (bilinear interpolation for dynamic resolution) */
     fprintf(stderr, "  position embeddings...\n");
+    t0 = vlm_time_ms();
     {
         int orig_gw = r->image_size / ps;
         int orig_gh = orig_gw;  /* original grid is square */
@@ -976,8 +1211,62 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                            args, NULL);
         }
     }
+    cuStreamSynchronize(r->stream);
+    t_pos = vlm_time_ms() - t0;
+
+    /* 3b. Match llama.cpp token ordering for Qwen window attention. */
+    {
+        int *token_perm = (int *)malloc((size_t)n_patches * sizeof(int));
+        int *token_inv_perm = (int *)malloc((size_t)n_patches * sizeof(int));
+        int *window_starts = (int *)malloc((size_t)n_merged * sizeof(int));
+        int *window_sizes = (int *)malloc((size_t)n_merged * sizeof(int));
+        if (!token_perm || !token_inv_perm || !window_starts || !window_sizes) {
+            free(token_perm);
+            free(token_inv_perm);
+            free(window_starts);
+            free(window_sizes);
+            fprintf(stderr, "cuda_vlm: failed to allocate window maps\n");
+            return NULL;
+        }
+
+        if (vlm_build_qwen_window_maps(gw, gh, sm, ps, r->attn_window_size, use_window_attn,
+                                       token_perm, token_inv_perm,
+                                       window_starts, window_sizes, &n_windows) != 0) {
+            free(token_perm);
+            free(token_inv_perm);
+            free(window_starts);
+            free(window_sizes);
+            fprintf(stderr, "cuda_vlm: failed to build window maps\n");
+            return NULL;
+        }
+
+        cuMemcpyHtoD(r->d_token_perm, token_perm, (size_t)n_patches * sizeof(int));
+        cuMemcpyHtoD(r->d_token_inv_perm, token_inv_perm, (size_t)n_patches * sizeof(int));
+        cuMemcpyHtoD(r->d_window_starts, window_starts, (size_t)n_windows * sizeof(int));
+        cuMemcpyHtoD(r->d_window_sizes, window_sizes, (size_t)n_windows * sizeof(int));
+        for (int i = 0; i < n_windows; i++) {
+            if (window_sizes[i] > max_window_tokens) max_window_tokens = window_sizes[i];
+        }
+        if (max_window_tokens == 0) max_window_tokens = n_patches;
+
+        if (use_window_attn) {
+            void *args[] = { &r->d_hidden2, &r->d_hidden, &r->d_token_perm, &dim };
+            cuLaunchKernel(r->fn_reorder_rows_f32,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+            vlm_swap_ptrs(&r->d_hidden, &r->d_hidden2);
+        }
+
+        free(token_perm);
+        free(token_inv_perm);
+        free(window_starts);
+        free(window_sizes);
+    }
 
     /* 4. Precompute M-RoPE cos/sin on host, upload to GPU */
+    t0 = vlm_time_ms();
     {
         int half = head_dim / 2;
         int sect_size = head_dim / 4;
@@ -985,10 +1274,14 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
         float theta_scale = powf(freq_base, -2.0f / (float)half);
         float *rope_cos = (float *)malloc(n_patches * head_dim * sizeof(float));
         float *rope_sin = (float *)malloc(n_patches * head_dim * sizeof(float));
+        int *token_perm = (int *)malloc((size_t)n_patches * sizeof(int));
+
+        cuMemcpyDtoH(token_perm, r->d_token_perm, (size_t)n_patches * sizeof(int));
 
         for (int p = 0; p < n_patches; p++) {
-            int py = p / gw;
-            int px = p % gw;
+            int src = use_window_attn ? token_perm[p] : p;
+            int py = src / gw;
+            int px = src % gw;
             float p_t = (float)py, p_h = (float)px, p_w = (float)py, p_e = (float)px;
             float cur_t = p_t, cur_h = p_h, cur_w = p_w, cur_e = p_e;
 
@@ -1019,13 +1312,17 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
 
         cuMemcpyHtoD(r->d_rope_cos, rope_cos, n_patches * head_dim * sizeof(float));
         cuMemcpyHtoD(r->d_rope_sin, rope_sin, n_patches * head_dim * sizeof(float));
+        free(token_perm);
         free(rope_cos);
         free(rope_sin);
     }
+    cuStreamSynchronize(r->stream);
+    t_rope = vlm_time_ms() - t0;
 
     /* 5. ViT blocks */
     int half = head_dim / 2;
     int ds_count = 0;
+    t0 = vlm_time_ms();
 
     for (int l = 0; l < r->n_blocks; l++) {
         if (l == 0 || l == r->n_blocks - 1 || (l + 1) % 6 == 0)
@@ -1093,17 +1390,32 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
         /* Multi-head self-attention */
         {
             float scale = 1.0f / sqrtf((float)head_dim);
-            /* Shared memory: n_patches (scores) + 256 (reduction scratch) */
-            size_t smem = (n_patches + 256) * sizeof(float);
-            void *args[] = {
-                &r->d_attn_out, &r->d_qkv,
-                &n_patches, &dim, &n_heads, &head_dim, &scale
-            };
-            cuLaunchKernel(r->fn_attn_full_f32,
-                           n_heads, 1, 1,
-                           256, 1, 1,
-                           smem, r->stream,
-                           args, NULL);
+            int use_local_attn = use_window_attn && ((l + 1) % r->n_wa_pattern != 0);
+            if (use_local_attn) {
+                size_t smem = (size_t)(max_window_tokens + 256) * sizeof(float);
+                void *args[] = {
+                    &r->d_attn_out, &r->d_qkv,
+                    &r->d_window_starts, &r->d_window_sizes,
+                    &dim, &n_heads, &head_dim, &scale
+                };
+                cuLaunchKernel(r->fn_attn_window_f32,
+                               n_heads, n_windows, 1,
+                               256, 1, 1,
+                               smem, r->stream,
+                               args, NULL);
+            } else {
+                /* Shared memory: n_patches (scores) + 256 (reduction scratch) */
+                size_t smem = (n_patches + 256) * sizeof(float);
+                void *args[] = {
+                    &r->d_attn_out, &r->d_qkv,
+                    &n_patches, &dim, &n_heads, &head_dim, &scale
+                };
+                cuLaunchKernel(r->fn_attn_full_f32,
+                               n_heads, 1, 1,
+                               256, 1, 1,
+                               smem, r->stream,
+                               args, NULL);
+            }
         }
 
         /* Attn output projection */
@@ -1232,9 +1544,23 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
             ds_count++;
         }
     }
+    cuStreamSynchronize(r->stream);
+    t_vit = vlm_time_ms() - t0;
+
+    if (use_window_attn) {
+        void *args[] = { &r->d_hidden2, &r->d_hidden, &r->d_token_inv_perm, &dim };
+        cuLaunchKernel(r->fn_reorder_rows_f32,
+                       n_patches, 1, 1,
+                       256, 1, 1,
+                       0, r->stream,
+                       args, NULL);
+        vlm_swap_ptrs(&r->d_hidden, &r->d_hidden2);
+        cuStreamSynchronize(r->stream);
+    }
 
     /* 6. Post LayerNorm */
     fprintf(stderr, "  post layernorm...\n");
+    t0 = vlm_time_ms();
     {
         float eps = r->ln_eps;
         size_t smem = 256 * sizeof(float);
@@ -1245,9 +1571,12 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                        smem, r->stream,
                        args, NULL);
     }
+    cuStreamSynchronize(r->stream);
+    t_postln = vlm_time_ms() - t0;
 
     /* 7. Final spatial merge */
     fprintf(stderr, "  spatial merge...\n");
+    t0 = vlm_time_ms();
     {
         void *args[] = { &r->d_merge_buf, &r->d_hidden, &gw, &sm, &dim };
         cuLaunchKernel(r->fn_spatial_merge_f32,
@@ -1256,9 +1585,12 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                        0, r->stream,
                        args, NULL);
     }
+    cuStreamSynchronize(r->stream);
+    t_merge = vlm_time_ms() - t0;
 
     /* 8. MM projection: mm.0 -> GELU -> mm.2 */
     fprintf(stderr, "  mm projection...\n");
+    t0 = vlm_time_ms();
     vlm_gemm(r, r->d_mm_buf, &r->mm0, r->d_merge_buf, n_merged, merged_dim, merged_dim);
 
     {
@@ -1273,6 +1605,8 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     }
 
     vlm_gemm(r, r->d_mm_out, &r->mm2, r->d_mm_buf, n_merged, r->proj_dim, merged_dim);
+    cuStreamSynchronize(r->stream);
+    t_mmproj = vlm_time_ms() - t0;
 
     /* Debug: check mm_out */
     if (r->verbose >= 2) {
@@ -1321,6 +1655,11 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     free(mm_host);
     free(ds_host);
 
+    if (r->verbose >= 1) {
+        fprintf(stderr,
+                "cuda_vlm: profile patch=%.1f ms pos=%.1f ms rope=%.1f ms vit=%.1f ms postln=%.1f ms merge=%.1f ms mm=%.1f ms\n",
+                t_patch, t_pos, t_rope, t_vit, t_postln, t_merge, t_mmproj);
+    }
     fprintf(stderr, "  vision encoding done: %d tokens of dim %d (main %d + %d deepstack)\n",
             n_merged, total_embd, r->proj_dim, ds_count);
 
@@ -1408,11 +1747,16 @@ void cuda_vision_free(cuda_vision_runner *r) {
     if (r->d_rope_cos) cuMemFree(r->d_rope_cos);
     if (r->d_rope_sin) cuMemFree(r->d_rope_sin);
     if (r->d_pos_map) cuMemFree(r->d_pos_map);
+    if (r->d_token_perm) cuMemFree(r->d_token_perm);
+    if (r->d_token_inv_perm) cuMemFree(r->d_token_inv_perm);
+    if (r->d_window_starts) cuMemFree(r->d_window_starts);
+    if (r->d_window_sizes) cuMemFree(r->d_window_sizes);
     if (r->d_pos_interp) cuMemFree(r->d_pos_interp);
     if (r->d_ds_feats) cuMemFree(r->d_ds_feats);
 
     free(r->h_pos_embd);
     free(r->h_output);
+    if (r->cublas) cublasewDestroy(r->cublas);
 
     /* Destroy CUDA objects */
     if (r->module) cuModuleUnload(r->module);
