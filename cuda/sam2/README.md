@@ -16,7 +16,7 @@ CUDA model kernels are being ported.
 
 ## Weights
 
-Download SAM2.1 tiny/small checkpoints into `/mnt/disk01/sam2/`:
+Download SAM2.1 tiny/small checkpoints into `/path/to/sam2/`:
 
 ```bash
 ./scripts/download_sam2_weights.sh
@@ -33,12 +33,12 @@ Patch-embed verification (native CUDA vs PyTorch):
 
 ```bash
 python3 ref/sam2/gen_patch_embed_ref.py \
-  --model /mnt/disk01/sam2/sam2.1-hiera-tiny \
+  --model /path/to/sam2/sam2.1-hiera-tiny \
   --image /tmp/hy3d_textured.jpg \
   --outdir /tmp/sam2_patch_ref
 
 ./verify_patch_embed \
-  /mnt/disk01/sam2/sam2.1-hiera-tiny/model.safetensors \
+  /path/to/sam2/sam2.1-hiera-tiny/model.safetensors \
   /tmp/sam2_patch_ref
 ```
 
@@ -46,12 +46,12 @@ Block-0 trace verification (native CUDA vs PyTorch):
 
 ```bash
 python3 ref/sam2/gen_block0_trace_ref.py \
-  --model /mnt/disk01/sam2/sam2.1-hiera-tiny \
+  --model /path/to/sam2/sam2.1-hiera-tiny \
   --image /tmp/hy3d_textured.jpg \
   --outdir /tmp/sam2_b0_trace_ref
 
 ./verify_block0 \
-  /mnt/disk01/sam2/sam2.1-hiera-tiny/model.safetensors \
+  /path/to/sam2/sam2.1-hiera-tiny/model.safetensors \
   /tmp/sam2_b0_trace_ref
 ```
 
@@ -62,14 +62,14 @@ Current status for block-0 CUDA verifier:
 ## Run
 
 ```bash
-./test_cuda_sam2 /mnt/disk01/sam2/sam2.1-hiera-tiny /path/to/image.jpg \
+./test_cuda_sam2 /path/to/sam2/sam2.1-hiera-tiny /path/to/image.jpg \
   --point 256 256 1 -o /tmp/sam2_masks.npy
 ```
 
 Multiple prompts:
 
 ```bash
-./test_cuda_sam2 /mnt/disk01/sam2/sam2.1-hiera-small /path/to/image.jpg \
+./test_cuda_sam2 /path/to/sam2/sam2.1-hiera-small /path/to/image.jpg \
   --point 220 280 1 --point 300 320 1 --box 150 180 420 460
 ```
 

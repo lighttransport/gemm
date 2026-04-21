@@ -49,8 +49,9 @@ int main(int argc, char **argv) {
     const char *img_path = argv[2];
     const char *phrase = NULL;
     const char *out_path = "mask.npy";
-    const char *vocab  = "/mnt/disk01/ComfyUI/comfy/sd1_tokenizer/vocab.json";
-    const char *merges = "/mnt/disk01/ComfyUI/comfy/sd1_tokenizer/merges.txt";
+    /* Override via --vocab / --merges. Any CLIP (SD1-style) tokenizer works. */
+    const char *vocab  = "vocab.json";
+    const char *merges = "merges.txt";
     float score_thr = 0.3f, mask_thr = 0.5f;
 
     for (int i = 3; i < argc; i++) {
