@@ -7,7 +7,6 @@ Only replaces the one call site in trellis2_texturing.py:
 
 import numpy as np
 import torch
-import xatlas
 
 
 class CuMesh:
@@ -16,10 +15,13 @@ class CuMesh:
         self._faces = None
 
     def init(self, vertices, faces):
+        import xatlas  # lazy: not required for --skip-dit paths
+        self._xatlas = xatlas
         self._verts = vertices.detach().cpu().numpy().astype(np.float32)
         self._faces = faces.detach().cpu().numpy().astype(np.uint32)
 
     def uv_unwrap(self, return_vmaps=False):
+        import xatlas
         vmap, indices, uvs = xatlas.parametrize(self._verts, self._faces)
         verts_out = torch.from_numpy(self._verts[vmap]).float()
         faces_out = torch.from_numpy(indices.astype(np.int32)).int()
