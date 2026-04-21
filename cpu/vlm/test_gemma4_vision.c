@@ -4,7 +4,7 @@
  * Usage:
  *   ./test_gemma4_vision <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen] [--budget N]
  *
- * --budget N: reasoning token budget (default 200). If the model emits hidden
+ * --budget N: reasoning token budget (default 32). If the model emits hidden
  *             thought-channel tokens, cap them to N tokens before forcing an
  *             exit back to visible output.
  *
@@ -60,6 +60,13 @@ typedef struct {
     int32_t *ids;
     int count;
 } token_buffer;
+
+typedef struct {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+} gemma4_sampling_params;
 
 /* ---- Reasoning budget state machine ---- */
 
@@ -180,8 +187,8 @@ static gemma4_prompt_parts build_gemma4_prompt(const char *user_prompt) {
     gemma4_prompt_parts parts = {0};
     const char *pre =
         "<|turn>system\n"
-        "You are a helpful visual assistant. Answer briefly and directly in plain text.\n"
-        "<turn|>\n<|turn>user\n<|image>";
+        "<|think|><turn|>\n"
+        "<|turn>user\n<|image>";
     const char *post_fmt = "<image|>%s<turn|>\n<|turn>model\n";
     size_t pre_len = strlen(pre);
     parts.pre_image = (char *)malloc(pre_len + 1);
@@ -253,6 +260,104 @@ static int32_t find_exact_token_id(const bpe_vocab *vocab, const char *text) {
     return bpe_hm_get(&vocab->token_to_id, text, (int)strlen(text));
 }
 
+static int32_t sample_gemma4_token(const float *logits, int n_vocab,
+                                   const gemma4_sampling_params *params) {
+    if (!logits || !params || n_vocab <= 0) return -1;
+
+    const int top_k = params->top_k > 0 && params->top_k < n_vocab ? params->top_k : n_vocab;
+    int *topk_idx = (int *)malloc((size_t)top_k * sizeof(int));
+    float *topk_val = (float *)malloc((size_t)top_k * sizeof(float));
+    if (!topk_idx || !topk_val) {
+        free(topk_idx);
+        free(topk_val);
+        return 0;
+    }
+
+    for (int k = 0; k < top_k; k++) {
+        topk_idx[k] = 0;
+        topk_val[k] = -1e30f;
+    }
+
+    const float inv_temp = params->temperature > 0.0f ? (1.0f / params->temperature) : 1.0f;
+    for (int j = 0; j < n_vocab; j++) {
+        const float scaled = logits[j] * inv_temp;
+        if (scaled > topk_val[top_k - 1]) {
+            topk_idx[top_k - 1] = j;
+            topk_val[top_k - 1] = scaled;
+            for (int k = top_k - 2; k >= 0; k--) {
+                if (topk_val[k + 1] > topk_val[k]) {
+                    int ti = topk_idx[k];
+                    float tv = topk_val[k];
+                    topk_idx[k] = topk_idx[k + 1];
+                    topk_val[k] = topk_val[k + 1];
+                    topk_idx[k + 1] = ti;
+                    topk_val[k + 1] = tv;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    const float max_logit = topk_val[0];
+    float sum_exp = 0.0f;
+    for (int k = 0; k < top_k; k++) {
+        topk_val[k] = expf(topk_val[k] - max_logit);
+        sum_exp += topk_val[k];
+    }
+    const int32_t fallback = topk_idx[0];
+    if (sum_exp <= 0.0f) {
+        free(topk_idx);
+        free(topk_val);
+        return fallback;
+    }
+
+    for (int k = 0; k < top_k; k++) {
+        topk_val[k] /= sum_exp;
+    }
+
+    int kept = top_k;
+    if (params->top_p > 0.0f && params->top_p < 1.0f) {
+        float cum = 0.0f;
+        kept = 0;
+        for (int k = 0; k < top_k; k++) {
+            cum += topk_val[k];
+            kept = k + 1;
+            if (cum >= params->top_p) break;
+        }
+    }
+
+    if (params->min_p > 0.0f) {
+        const float threshold = topk_val[0] * params->min_p;
+        int minp_kept = 0;
+        while (minp_kept < kept && topk_val[minp_kept] >= threshold) minp_kept++;
+        if (minp_kept > 0) kept = minp_kept;
+    }
+
+    float kept_sum = 0.0f;
+    for (int k = 0; k < kept; k++) kept_sum += topk_val[k];
+    if (kept_sum <= 0.0f) {
+        free(topk_idx);
+        free(topk_val);
+        return fallback;
+    }
+
+    float r = (float)rand() / (float)RAND_MAX * kept_sum;
+    float cumsum = 0.0f;
+    int32_t next_token = fallback;
+    for (int k = 0; k < kept; k++) {
+        cumsum += topk_val[k];
+        if (cumsum >= r) {
+            next_token = topk_idx[k];
+            break;
+        }
+    }
+
+    free(topk_idx);
+    free(topk_val);
+    return next_token;
+}
+
 static gemma4_decode_state init_decode_state(const bpe_vocab *vocab) {
     gemma4_decode_state st;
     st.eos_id = bpe_eos_id(vocab);
@@ -298,7 +403,7 @@ int main(int argc, char **argv) {
     const char *image_path = NULL;
     const char *user_prompt = "explain the image";
     int max_gen = 100;
-    int reasoning_budget_tokens = 200;
+    int reasoning_budget_tokens = 32;
 
     /* Parse optional args: image path (has . extension), prompt (text), max_gen (number) */
     for (int i = 3; i < argc; i++) {
@@ -463,8 +568,12 @@ int main(int argc, char **argv) {
                 gemma4_decode_state decode_state = init_decode_state(vocab);
                 reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
                 visible_text out = {0};
-                float temperature = 0.7f;
-                int top_k = 40;
+                gemma4_sampling_params sampling = {
+                    .temperature = 0.8f,
+                    .top_k = 40,
+                    .top_p = 0.95f,
+                    .min_p = 0.05f,
+                };
                 srand((unsigned)time(NULL));
 
                 for (int g = 0; g < max_gen; g++) {
@@ -487,45 +596,7 @@ int main(int argc, char **argv) {
                         }
                     }
 
-                    /* Top-k sampling with temperature */
-                    int n_vocab = model->n_vocab;
-                    float inv_temp = 1.0f / temperature;
-                    for (int j = 0; j < n_vocab; j++) logits[j] *= inv_temp;
-
-                    /* Find top-k */
-                    int *topk_idx = (int *)malloc(top_k * sizeof(int));
-                    float *topk_val = (float *)malloc(top_k * sizeof(float));
-                    for (int k = 0; k < top_k; k++) { topk_idx[k] = 0; topk_val[k] = -1e30f; }
-                    for (int j = 0; j < n_vocab; j++) {
-                        if (logits[j] > topk_val[top_k-1]) {
-                            topk_idx[top_k-1] = j; topk_val[top_k-1] = logits[j];
-                            for (int k = top_k-2; k >= 0; k--) {
-                                if (topk_val[k+1] > topk_val[k]) {
-                                    int ti = topk_idx[k]; topk_idx[k] = topk_idx[k+1]; topk_idx[k+1] = ti;
-                                    float tv = topk_val[k]; topk_val[k] = topk_val[k+1]; topk_val[k+1] = tv;
-                                } else break;
-                            }
-                        }
-                    }
-
-                    /* Softmax over top-k */
-                    float max_logit = topk_val[0];
-                    float sum_exp = 0;
-                    for (int k = 0; k < top_k; k++) {
-                        topk_val[k] = expf(topk_val[k] - max_logit);
-                        sum_exp += topk_val[k];
-                    }
-
-                    /* Sample */
-                    float r = (float)rand() / RAND_MAX * sum_exp;
-                    float cumsum = 0;
-                    next_token = topk_idx[0];
-                    for (int k = 0; k < top_k; k++) {
-                        cumsum += topk_val[k];
-                        if (cumsum >= r) { next_token = topk_idx[k]; break; }
-                    }
-                    free(topk_idx);
-                    free(topk_val);
+                    next_token = sample_gemma4_token(logits, model->n_vocab, &sampling);
                 }
                 if (out.len > 0) fwrite(out.data, 1, out.len, stdout);
                 printf("\n");

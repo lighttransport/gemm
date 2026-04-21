@@ -21,6 +21,10 @@
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
 
+/* SafeTensors loader needed by cuda_llm_runner helper paths */
+#define SAFETENSORS_IMPLEMENTATION
+#include "../../common/safetensors.h"
+
 /* Dequantization */
 #define GGML_DEQUANT_IMPLEMENTATION
 #include "../../common/ggml_dequant.h"
@@ -105,11 +109,146 @@ static int32_t argmax_i32(const float *x, int n) {
     return best;
 }
 
+typedef struct {
+    int32_t eos_id;
+    int32_t eot_id;
+    int32_t think_start_id;
+    int32_t think_end_id;
+    int in_thought;
+} qwen_decode_state;
+
+typedef enum {
+    RB_IDLE,
+    RB_COUNTING,
+    RB_FORCING,
+    RB_DONE
+} rb_state;
+
+typedef struct {
+    rb_state state;
+    int budget;
+    int count;
+    int32_t start_tokens[16];
+    int n_start;
+    int start_matched;
+    int32_t end_tokens[16];
+    int n_end;
+    int end_matched;
+    int force_idx;
+} reasoning_budget;
+
 static const char *gguf_get_kv_string(const gguf_context *g, const char *key) {
     int idx = gguf_find_key(g, key);
     if (idx < 0) return NULL;
     if (g->kv[idx].type != GGUF_TYPE_STRING) return NULL;
     return g->kv[idx].value.str.str;
+}
+
+static int32_t find_exact_token_id(const bpe_vocab *vocab, const char *text) {
+    if (!vocab || !text) return -1;
+    return bpe_hm_get(&vocab->token_to_id, text, (int)strlen(text));
+}
+
+static qwen_decode_state init_decode_state(const bpe_vocab *vocab) {
+    qwen_decode_state st;
+    st.eos_id = bpe_eos_id(vocab);
+    st.eot_id = bpe_eot_id(vocab);
+    st.think_start_id = find_exact_token_id(vocab, "<think>");
+    st.think_end_id = find_exact_token_id(vocab, "</think>");
+    st.in_thought = 0;
+    return st;
+}
+
+static reasoning_budget rb_init(const bpe_vocab *vocab, int budget) {
+    reasoning_budget rb;
+    memset(&rb, 0, sizeof(rb));
+    rb.state = RB_IDLE;
+    rb.budget = budget;
+    rb.n_start = bpe_tokenize(vocab, "<think>\n", -1, rb.start_tokens, 16);
+    if (rb.n_start < 0) rb.n_start = 0;
+    rb.n_end = bpe_tokenize(vocab, "</think>\n\n", -1, rb.end_tokens, 16);
+    if (rb.n_end < 0) rb.n_end = 0;
+    return rb;
+}
+
+static void rb_observe(reasoning_budget *rb, int32_t token) {
+    switch (rb->state) {
+    case RB_IDLE:
+        if (rb->n_start > 0 && token == rb->start_tokens[rb->start_matched]) {
+            rb->start_matched++;
+            if (rb->start_matched >= rb->n_start) {
+                rb->state = RB_COUNTING;
+                rb->count = 0;
+                rb->start_matched = 0;
+            }
+        } else {
+            rb->start_matched = 0;
+            if (rb->n_start > 0 && token == rb->start_tokens[0]) rb->start_matched = 1;
+        }
+        break;
+    case RB_COUNTING:
+        rb->count++;
+        if (rb->n_end > 0 && token == rb->end_tokens[rb->end_matched]) {
+            rb->end_matched++;
+            if (rb->end_matched >= rb->n_end) {
+                rb->state = RB_DONE;
+                rb->end_matched = 0;
+            }
+        } else {
+            rb->end_matched = 0;
+            if (rb->n_end > 0 && token == rb->end_tokens[0]) rb->end_matched = 1;
+        }
+        if (rb->state == RB_COUNTING && rb->count >= rb->budget) {
+            rb->state = RB_FORCING;
+            rb->force_idx = 0;
+        }
+        break;
+    case RB_FORCING:
+    case RB_DONE:
+        break;
+    }
+}
+
+static int rb_needs_forcing(const reasoning_budget *rb) {
+    return rb->state == RB_FORCING;
+}
+
+static int32_t rb_force_next(reasoning_budget *rb) {
+    if (rb->state != RB_FORCING) return -1;
+    if (rb->force_idx >= rb->n_end) {
+        rb->state = RB_DONE;
+        return -1;
+    }
+    {
+        int32_t tok = rb->end_tokens[rb->force_idx++];
+        if (rb->force_idx >= rb->n_end) rb->state = RB_DONE;
+        return tok;
+    }
+}
+
+static void emit_visible_token(const bpe_vocab *vocab, qwen_decode_state *st, int32_t token) {
+    if (token == st->eos_id || token == st->eot_id) return;
+    if (token == st->think_start_id) {
+        st->in_thought = 1;
+        return;
+    }
+    if (token == st->think_end_id) {
+        st->in_thought = 0;
+        return;
+    }
+    if (st->in_thought) return;
+
+    {
+        const char *tok_str = bpe_token_to_str(vocab, token);
+        if (!tok_str) return;
+        int dec_len = 0;
+        char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
+        if (decoded && dec_len > 0) {
+            fwrite(decoded, 1, (size_t)dec_len, stdout);
+            fflush(stdout);
+        }
+        free(decoded);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -122,9 +261,11 @@ int main(int argc, char **argv) {
     const char *mmproj_path = argv[2];
     const char *image_path = argv[3];
     int max_gen = 100;
+    int reasoning_budget_tokens = 32;
     int resize_mode = 0;  /* 0 = dynamic (default, matches llama.cpp), 1 = fit (simple) */
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) max_gen = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) reasoning_budget_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) {
             i++;
             if (strcmp(argv[i], "fit") == 0) resize_mode = 1;
@@ -137,7 +278,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "LLM model:   %s\n", model_path);
     fprintf(stderr, "Vision model: %s\n", mmproj_path);
     fprintf(stderr, "Image:       %s\n", image_path);
-    fprintf(stderr, "Max gen:     %d\n\n", max_gen);
+    fprintf(stderr, "Max gen:     %d\n", max_gen);
+    fprintf(stderr, "Budget:      %d\n\n", reasoning_budget_tokens);
 
     /* ---- 1. Load image ---- */
     fprintf(stderr, "Loading image...\n");
@@ -301,7 +443,9 @@ int main(int argc, char **argv) {
         (void)tmpl;  /* always use chatml+vision format */
         snprintf(text_before, sizeof(text_before), "<|im_start|>user\n<|vision_start|>");
         snprintf(text_after, sizeof(text_after),
-                 "<|vision_end|>Explain the image<|im_end|>\n<|im_start|>assistant\n");
+                 "<|vision_end|>Describe the image briefly.<|im_end|>\n"
+                 "<|im_start|>assistant\n"
+                 "<think>\n\n</think>\n\n");
     }
 
     int32_t tokens_before[64], tokens_after[64];
@@ -326,25 +470,21 @@ int main(int argc, char **argv) {
 
     /* Text tokens before vision */
     t0 = get_time_ms();
-    for (int i = 0; i < n_before; i++) {
-        cuda_llm_forward(llm, tokens_before[i], pos);
-        pos++;
+    if (!cuda_llm_prefill(llm, tokens_before, NULL, 0, n_before, pos)) {
+        fprintf(stderr, "ERROR: text-before prefill failed\n");
+        return 1;
     }
+    pos += n_before;
     t1 = get_time_ms();
     fprintf(stderr, "  Text before: %d tokens, %.1f ms\n", n_before, t1 - t0);
 
     /* Vision tokens */
     t0 = get_time_ms();
-    for (int i = 0; i < n_vision_tokens; i++) {
-        float *embd_i = vision_embd + i * total_embd;
-        cuda_llm_forward_embd(llm, embd_i, total_embd, pos);
-        pos++;
-        if (i == 0 || i == n_vision_tokens - 1 || (i + 1) % 100 == 0) {
-            double tc = get_time_ms();
-            fprintf(stderr, "  Vision token %d/%d, pos=%d (%.1f ms cumulative)\n",
-                    i + 1, n_vision_tokens, pos - 1, tc - t0);
-        }
+    if (!cuda_llm_prefill(llm, NULL, vision_embd, total_embd, n_vision_tokens, pos)) {
+        fprintf(stderr, "ERROR: vision prefill failed\n");
+        return 1;
     }
+    pos += n_vision_tokens;
     t1 = get_time_ms();
     fprintf(stderr, "  Vision prefill: %d tokens, %.1f ms (%.2f ms/token)\n",
             n_vision_tokens, t1 - t0, (t1 - t0) / n_vision_tokens);
@@ -352,14 +492,8 @@ int main(int argc, char **argv) {
     /* Text tokens after vision (last one returns logits) */
     float *logits = NULL;
     t0 = get_time_ms();
-    for (int i = 0; i < n_after; i++) {
-        if (i == n_after - 1) {
-            logits = cuda_llm_forward_logits(llm, tokens_after[i], pos);
-        } else {
-            cuda_llm_forward(llm, tokens_after[i], pos);
-        }
-        pos++;
-    }
+    logits = cuda_llm_prefill_logits(llm, tokens_after, NULL, 0, n_after, pos);
+    pos += n_after;
     t1 = get_time_ms();
     fprintf(stderr, "  Text after: %d tokens, %.1f ms\n", n_after, t1 - t0);
 
@@ -370,34 +504,34 @@ int main(int argc, char **argv) {
 
     /* ---- 9. Generate ---- */
     fprintf(stderr, "\n=== Generation ===\n");
-    int32_t eos_id = bpe_eos_id(vocab);
-    int32_t eot_id = bpe_eot_id(vocab);
-
+    qwen_decode_state decode_state = init_decode_state(vocab);
+    reasoning_budget rb = rb_init(vocab, reasoning_budget_tokens);
     int32_t next_token = argmax_i32(logits, n_vocab);
 
     for (int g = 0; g < max_gen; g++) {
-        if (next_token == eos_id || next_token == eot_id) {
+        emit_visible_token(vocab, &decode_state, next_token);
+        rb_observe(&rb, next_token);
+
+        if (next_token == decode_state.eos_id || next_token == decode_state.eot_id) {
             fprintf(stderr, "\n  [EOS/EOT token %d at step %d]\n", next_token, g);
             break;
-        }
-
-        /* Print token */
-        const char *tok_str = bpe_token_to_str(vocab, next_token);
-        if (tok_str) {
-            int dec_len;
-            char *decoded = bpe_byte_decode(tok_str, (int)strlen(tok_str), &dec_len);
-            fwrite(decoded, 1, dec_len, stdout);
-            fflush(stdout);
-            free(decoded);
         }
 
         /* Next step */
         logits = cuda_llm_forward_logits(llm, next_token, pos);
         pos++;
         if (!logits) break;
+        if (rb_needs_forcing(&rb)) {
+            int32_t forced = rb_force_next(&rb);
+            if (forced >= 0) {
+                next_token = forced;
+                continue;
+            }
+        }
         next_token = argmax_i32(logits, n_vocab);
     }
     printf("\n");
+    fprintf(stderr, "[thought: %d/%d tokens used]\n", rb.count, rb.budget);
 
     /* ---- 10. Cleanup ---- */
     fprintf(stderr, "\nCleaning up...\n");
