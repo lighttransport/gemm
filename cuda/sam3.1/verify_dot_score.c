@@ -34,7 +34,7 @@ static void *read_npy(const char *path, int *ndim, int *dims, int *itemsz_out) {
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
+    const char *refdir = "/tmp/sam3.1_ref";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt") && i+1 < argc) ckpt = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
@@ -71,7 +71,7 @@ int main(int argc, char **argv)
     float ours[6 * 200];
     cuda_sam3_1_get_dot_scores(ctx, ours);
 
-    snprintf(path, sizeof(path), "%s/dot_product_scoring.npy", refdir);
+    snprintf(path, sizeof(path), "%s/dot_prod_scoring_out.npy", refdir);
     float *ref = (float *)read_npy(path, &nd, d, &isz);
     if (ref) {
         for (int li = 0; li < 6; li++) {

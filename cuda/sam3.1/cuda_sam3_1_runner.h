@@ -21,6 +21,12 @@ typedef struct {
     int image_size;          /* fixed 1008 */
     int device_ordinal;
     int verbose;
+    /* precision: "fp16" (default, MMA m16n8k16 tensor cores on sm_80+),
+     * "fp32" (tiled shared-memory GEMM, F16 weight × F32 compute; slower
+     * but avoids ~1e-4 per-GEMM drift that compounds over 32 ViT blocks).
+     * "bf16" and "fp8" are accepted but not yet implemented — they fall
+     * back to fp16 with a warning. NULL or empty is equivalent to "fp16". */
+    const char *precision;
 } cuda_sam3_1_config;
 
 cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg);
@@ -69,6 +75,14 @@ int cuda_sam3_1_get_text_output(const cuda_sam3_1_ctx *ctx, float *out_host,
 /* DETR encoder (6 layers). Requires ViT, FPN, text to have run.
  * Uses FPN level 2 (256, 72, 72) as vision input. */
 int cuda_sam3_1_run_detr_enc(cuda_sam3_1_ctx *ctx);
+
+/* Debug: override FPN level 2 (256×72×72 F32 NCHW) and text tokens
+ * (32×1024 F32, post-ln_final) with host buffers, bypassing the
+ * vision/text stacks. Marks fpn_ready/text_done. Used by verify_detr to
+ * isolate DETR numerics from upstream drift. */
+int cuda_sam3_1_debug_override_detr_inputs(cuda_sam3_1_ctx *ctx,
+                                           const float *fpn2_nchw,
+                                           const float *text_tokens);
 int cuda_sam3_1_get_detr_enc(const cuda_sam3_1_ctx *ctx, float *out_host,
                             int *out_n, int *out_dim);
 
