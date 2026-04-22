@@ -662,10 +662,28 @@ cuda_sam3_ctx *cuda_sam3_create(const cuda_sam3_config *cfg) {
          * available as an escape hatch. */
         const char *force = getenv("SAM3_GEMM");
         int force_tiled = (force && (!strcmp(force, "tiled") || !strcmp(force, "TILED")));
-        c->use_mma = (c->sm >= 80) && !force_tiled;
-        if (c->verbose) fprintf(stderr, "sam3: sm_%d -> gemm=%s%s\n",
+        const char *prec = cfg->precision;
+        int prec_forces_tiled = 0;
+        const char *prec_note = "";
+        if (prec && *prec) {
+            if (!strcmp(prec, "fp16") || !strcmp(prec, "FP16") || !strcmp(prec, "half")) {
+                prec_note = " (precision=fp16)";
+            } else if (!strcmp(prec, "fp32") || !strcmp(prec, "FP32") || !strcmp(prec, "float")) {
+                prec_forces_tiled = 1;
+                prec_note = " (precision=fp32: forcing tiled F32-accum path)";
+            } else if (!strcmp(prec, "bf16") || !strcmp(prec, "BF16") || !strcmp(prec, "bfloat16")) {
+                prec_note = " (precision=bf16 not yet implemented, falling back to fp16)";
+            } else if (!strcmp(prec, "fp8") || !strcmp(prec, "FP8")) {
+                prec_note = " (precision=fp8 not yet implemented, falling back to fp16)";
+            } else {
+                fprintf(stderr, "sam3: unknown precision '%s' — using fp16\n", prec);
+            }
+        }
+        c->use_mma = (c->sm >= 80) && !force_tiled && !prec_forces_tiled;
+        if (c->verbose) fprintf(stderr, "sam3: sm_%d -> gemm=%s%s%s\n",
             c->sm, c->use_mma ? "mma" : "tiled",
-            force_tiled ? " (SAM3_GEMM=tiled override)" : "");
+            force_tiled ? " (SAM3_GEMM=tiled override)" : "",
+            prec_note);
     }
 
     if (compile_kernels(c) != 0) { free(c); return NULL; }

@@ -44,7 +44,7 @@ static float *read_npy_f32(const char *path, int *ndim, int *dims) {
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL, *img_path = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
+    const char *refdir = "/tmp/sam3.1_ref";
     const char *target = "block0";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt")   && i+1 < argc) ckpt = argv[++i];
@@ -56,9 +56,10 @@ int main(int argc, char **argv)
 
     int stop_at = 0;
     const char *ref_name = NULL;
-    if (!strcmp(target, "block0"))       { stop_at = 0;  ref_name = "vit_block00.npy"; }
-    else if (!strcmp(target, "block31")) { stop_at = 31; ref_name = "vit_block31.npy"; }
-    else if (!strcmp(target, "final"))   { stop_at = 31; ref_name = "vision_encoder.npy"; }
+    if (!strcmp(target, "block0"))       { stop_at = 0;  ref_name = "block00.npy"; }
+    else if (!strcmp(target, "block15"))  { stop_at = 15; ref_name = "block15.npy"; }
+    else if (!strcmp(target, "block31")) { stop_at = 31; ref_name = "block31.npy"; }
+    else if (!strcmp(target, "final"))   { stop_at = 31; ref_name = "block31.npy"; }
     else { fprintf(stderr, "unknown --target '%s'\n", target); return 1; }
 
     cuda_sam3_1_config cfg = { .ckpt_path = ckpt, .image_size = 1008,
@@ -118,6 +119,16 @@ int main(int argc, char **argv)
             "(ref mean=%.4e ours mean=%.4e) >0.1=%zu >1.0=%zu\n",
             target, n_tok, dim, max_abs, sd / (double)n,
             sa / (double)n, sb / (double)n, cnt_gt_0_1, cnt_gt_1);
+    /* Scan for non-zero count to distinguish "literally zero" vs "small". */
+    size_t nz = 0; double ours_max = 0;
+    for (size_t i = 0; i < n; i++) { if (ours[i] != 0.0f) nz++; if (fabs(ours[i]) > ours_max) ours_max = fabs(ours[i]); }
+    fprintf(stderr, "ours: nonzero=%zu/%zu  max_abs=%.4e\n", nz, n, ours_max);
+    fprintf(stderr, "ours[:8] :"); for (int i = 0; i < 8; i++) fprintf(stderr, " %+.4e", ours[i]); fprintf(stderr, "\n");
+    fprintf(stderr, "ref[:8]  :"); for (int i = 0; i < 8; i++) fprintf(stderr, " %+.4f", ref[i]); fprintf(stderr, "\n");
+    /* Middle token sample. */
+    int mid = (5184/2) * dim + 16;
+    fprintf(stderr, "ours[mid]:"); for (int i = 0; i < 8; i++) fprintf(stderr, " %+.4f", ours[mid+i]); fprintf(stderr, "\n");
+    fprintf(stderr, "ref[mid] :"); for (int i = 0; i < 8; i++) fprintf(stderr, " %+.4f", ref[mid+i]); fprintf(stderr, "\n");
     free(ref); free(ours);
     cuda_sam3_1_destroy(ctx);
     return 0;

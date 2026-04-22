@@ -12,8 +12,8 @@ from safetensors.torch import save_file
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pt", default="/mnt/nvme02/models/sam3.1/sam3.1_multiplex.pt")
-    ap.add_argument("--out", default="/mnt/nvme02/models/sam3.1/sam3.1.model.safetensors")
+    ap.add_argument("--pt", default="/mnt/disk01/models/sam3.1/sam3.1_multiplex.pt")
+    ap.add_argument("--out", default="/mnt/disk01/models/sam3.1/sam3.1.model.safetensors")
     ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
     ap.add_argument("--split", action="store_true",
                     help="Also emit detector.safetensors and tracker.safetensors")

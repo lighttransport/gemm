@@ -38,7 +38,7 @@ static void *read_npy(const char *path, const char *want_dtype,
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
+    const char *refdir = "/tmp/sam3.1_ref";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt")   && i+1 < argc) ckpt = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
@@ -73,14 +73,10 @@ int main(int argc, char **argv)
     cuda_sam3_1_get_text_output(ctx, ours, &out_len, &out_dim);
     size_t n = (size_t)out_len * out_dim;
 
-    snprintf(path, sizeof(path), "%s/text_encoder.npy", refdir);
+    snprintf(path, sizeof(path), "%s/text_ln_final.npy", refdir);
     int rnd, rd[8];
     float *ref = (float *)read_npy(path, "f4", &rnd, rd);
-    if (!ref) {
-        snprintf(path, sizeof(path), "%s/text_enc.npy", refdir);
-        ref = (float *)read_npy(path, "f4", &rnd, rd);
-    }
-    if (!ref) { fprintf(stderr, "no text_encoder.npy/text_enc.npy\n"); return 6; }
+    if (!ref) { fprintf(stderr, "no text_ln_final.npy\n"); return 6; }
     size_t rn = 1; for (int i = 0; i < rnd; i++) rn *= (size_t)rd[i];
     if (rn != n) {
         fprintf(stderr, "shape mismatch ref=%zu ours=%zu\n", rn, n);

@@ -17,7 +17,14 @@
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 #include "../cuda_hip_compat.h"
+/* SAFETENSORS_IMPLEMENTATION emits external-linkage symbols. When linked
+ * alongside another TU that already supplies them (e.g. diffusion-server
+ * links server.c which carries SAFETENSORS_IMPLEMENTATION, or alongside
+ * cuda/sam3/cuda_sam3_runner.c), define CUDA_SAM3_1_RUNNER_EXTERNAL_IMPLS
+ * to skip. Standalone cuda/sam3.1 build is unaffected. */
+#ifndef CUDA_SAM3_1_RUNNER_EXTERNAL_IMPLS
 #define SAFETENSORS_IMPLEMENTATION
+#endif
 #include "../../common/safetensors.h"
 
 #include <math.h>
@@ -48,7 +55,9 @@
 #define S3_EPS     1e-6f
 #define S3_THETA   10000.0f
 #define S3_FPN_DIM 256
-#define S3_FPN_LEV 4
+/* sam3.1 has 3 conv stages (convs.0..2): ×4, ×2, ×1 upsample; no ×0.5
+ * downsample stage like sam3. */
+#define S3_FPN_LEV 3
 #define S3_T_DIM    1024
 #define S3_T_HEADS  16
 #define S3_T_HD     64
@@ -115,7 +124,7 @@ struct cuda_sam3_1_ctx {
     hipFunction_t fn_patch, fn_pos_add;
     hipFunction_t fn_win_part, fn_win_unpart, fn_rope;
     hipFunction_t fn_kv_tx, fn_fa;
-    hipFunction_t fn_tok2nchw, fn_c1x1, fn_c3x3, fn_ct2, fn_mp2;
+    hipFunction_t fn_tok2nchw, fn_c1x1, fn_c3x3, fn_c1x1_f32, fn_c3x3_f32, fn_ct2, fn_mp2;
     hipFunction_t fn_gelu_erf, fn_clip_causal;
 
     st_context *st;
@@ -338,55 +347,59 @@ static const float *host_f32(const st_context *st, const char *s) {
     return (const float *)safetensors_data((st_context *)st, i);
 }
 
-/* Fuse separately-keyed Q/K/V weights and biases for a text block. */
-static int fuse_qkv_text(const st_context *st, int li,
-                          void **out_w, void **out_b) {
-    char kq[192], kk[192], kv[192];
-    #define KEY(buf, suf) \
-        snprintf(buf, sizeof(buf), \
-            "text_encoder.text_model.encoder.layers.%d." suf, li)
-    const float *qw, *kw, *vw, *qb, *kb, *vb;
-    KEY(kq, "self_attn.q_proj.weight"); qw = host_f32(st, kq);
-    KEY(kk, "self_attn.k_proj.weight"); kw = host_f32(st, kk);
-    KEY(kv, "self_attn.v_proj.weight"); vw = host_f32(st, kv);
-    KEY(kq, "self_attn.q_proj.bias");   qb = host_f32(st, kq);
-    KEY(kk, "self_attn.k_proj.bias");   kb = host_f32(st, kk);
-    KEY(kv, "self_attn.v_proj.bias");   vb = host_f32(st, kv);
-    #undef KEY
-    if (!qw || !kw || !vw || !qb || !kb || !vb) return -1;
-    size_t DD = (size_t)S3_T_DIM * S3_T_DIM;
-    uint16_t *buf = (uint16_t *)malloc(3 * DD * 2);
-    for (size_t i = 0; i < DD; i++) buf[i]         = hip_f32_to_f16(qw[i]);
-    for (size_t i = 0; i < DD; i++) buf[DD + i]    = hip_f32_to_f16(kw[i]);
-    for (size_t i = 0; i < DD; i++) buf[2*DD + i]  = hip_f32_to_f16(vw[i]);
-    *out_w = hip_upload_raw(buf, 3 * DD * 2);
-    free(buf);
-    float *bb = (float *)malloc(3 * S3_T_DIM * 4);
-    memcpy(bb + 0*S3_T_DIM, qb, S3_T_DIM * 4);
-    memcpy(bb + 1*S3_T_DIM, kb, S3_T_DIM * 4);
-    memcpy(bb + 2*S3_T_DIM, vb, S3_T_DIM * 4);
-    *out_b = hip_upload_raw(bb, 3 * S3_T_DIM * 4);
-    free(bb);
+/* Split an OpenAI-MHA fused in_proj_{weight,bias} tensor into three
+ * separate Q/K/V weight (F16) + bias (F32) device uploads. Weight shape
+ * (3*D, D) → three (D, D) F16 blocks; bias shape (3*D,) → three (D,). */
+static int split_fused_qkv(const st_context *st, const char *wkey,
+                            const char *bkey, int D,
+                            void **qw, void **kw, void **vw,
+                            void **qb, void **kb, void **vb) {
+    const float *w = host_f32(st, wkey);
+    const float *b = host_f32(st, bkey);
+    if (!w || !b) return -1;
+    size_t DD = (size_t)D * D;
+    uint16_t *tw = (uint16_t *)malloc(DD * 2);
+    for (int part = 0; part < 3; part++) {
+        for (size_t i = 0; i < DD; i++) tw[i] = hip_f32_to_f16(w[part*DD + i]);
+        void *d = hip_upload_raw(tw, DD * 2);
+        if (part == 0) *qw = d; else if (part == 1) *kw = d; else *vw = d;
+    }
+    free(tw);
+    *qb = hip_upload_raw(b + 0*D, (size_t)D * 4);
+    *kb = hip_upload_raw(b + 1*D, (size_t)D * 4);
+    *vb = hip_upload_raw(b + 2*D, (size_t)D * 4);
     return 0;
 }
 
+/* Upload a fused OpenAI-MHA in_proj_{weight,bias} without splitting —
+ * weight as F16 (3*D, D), bias as F32 (3*D,). */
+static int load_fused_qkv(const st_context *st, const char *wkey,
+                           const char *bkey, void **w_out, void **b_out) {
+    *w_out = upload_f16(st, wkey, NULL);
+    *b_out = upload_f32(st, bkey, NULL);
+    return (*w_out && *b_out) ? 0 : -1;
+}
+
+/* sam3.1 text encoder is OpenAI-CLIP: pre-norm, fused in-checkpoint
+ * attn.in_proj_{weight,bias} as (3*D, D) / (3*D), c_fc/c_proj MLP. */
 static int load_text_block(cuda_sam3_1_ctx *c, int li) {
     s3_block *b = &c->t_blk[li];
     b->is_global = 0;
     char k[192];
     #define TK(suf) (snprintf(k, sizeof(k), \
-        "text_encoder.text_model.encoder.layers.%d." suf, li), k)
-    b->norm1_w = upload_f32(c->st, TK("layer_norm1.weight"), NULL);
-    b->norm1_b = upload_f32(c->st, TK("layer_norm1.bias"),   NULL);
-    b->norm2_w = upload_f32(c->st, TK("layer_norm2.weight"), NULL);
-    b->norm2_b = upload_f32(c->st, TK("layer_norm2.bias"),   NULL);
-    if (fuse_qkv_text(c->st, li, &b->qkv_w, &b->qkv_b)) return -1;
-    b->o_w  = upload_f16(c->st, TK("self_attn.out_proj.weight"), NULL);
-    b->o_b  = upload_f32(c->st, TK("self_attn.out_proj.bias"),   NULL);
-    b->fc1_w = upload_f16(c->st, TK("mlp.fc1.weight"), NULL);
-    b->fc1_b = upload_f32(c->st, TK("mlp.fc1.bias"),   NULL);
-    b->fc2_w = upload_f16(c->st, TK("mlp.fc2.weight"), NULL);
-    b->fc2_b = upload_f32(c->st, TK("mlp.fc2.bias"),   NULL);
+        "backbone.language_backbone.encoder.transformer.resblocks.%d." suf, li), k)
+    b->norm1_w = upload_f32(c->st, TK("ln_1.weight"), NULL);
+    b->norm1_b = upload_f32(c->st, TK("ln_1.bias"),   NULL);
+    b->norm2_w = upload_f32(c->st, TK("ln_2.weight"), NULL);
+    b->norm2_b = upload_f32(c->st, TK("ln_2.bias"),   NULL);
+    b->qkv_w = upload_f16(c->st, TK("attn.in_proj_weight"), NULL);
+    b->qkv_b = upload_f32(c->st, TK("attn.in_proj_bias"),   NULL);
+    b->o_w  = upload_f16(c->st, TK("attn.out_proj.weight"), NULL);
+    b->o_b  = upload_f32(c->st, TK("attn.out_proj.bias"),   NULL);
+    b->fc1_w = upload_f16(c->st, TK("mlp.c_fc.weight"), NULL);
+    b->fc1_b = upload_f32(c->st, TK("mlp.c_fc.bias"),   NULL);
+    b->fc2_w = upload_f16(c->st, TK("mlp.c_proj.weight"), NULL);
+    b->fc2_b = upload_f32(c->st, TK("mlp.c_proj.bias"),   NULL);
     #undef TK
     if (!b->norm1_w || !b->norm1_b || !b->norm2_w || !b->norm2_b ||
         !b->qkv_w || !b->qkv_b || !b->o_w || !b->o_b ||
@@ -394,63 +407,26 @@ static int load_text_block(cuda_sam3_1_ctx *c, int li) {
     return 0;
 }
 
-/* Fuse Q/K/V weights into (3*D, D) F16 on device. */
-static void *fuse_qkv(const st_context *st, int bi) {
-    char kq[160], kk[160], kv[160];
-    snprintf(kq, sizeof(kq), "vision_encoder.backbone.layers.%d.attention.q_proj.weight", bi);
-    snprintf(kk, sizeof(kk), "vision_encoder.backbone.layers.%d.attention.k_proj.weight", bi);
-    snprintf(kv, sizeof(kv), "vision_encoder.backbone.layers.%d.attention.v_proj.weight", bi);
-    int iq = st_find_pfx(st, kq), ik = st_find_pfx(st, kk), iv = st_find_pfx(st, kv);
-    if (iq < 0 || ik < 0 || iv < 0) return NULL;
-    const float *q = (const float *)safetensors_data((st_context *)st, iq);
-    const float *kk_ = (const float *)safetensors_data((st_context *)st, ik);
-    const float *v = (const float *)safetensors_data((st_context *)st, iv);
-    size_t DD = (size_t)S3_DIM * S3_DIM;
-    uint16_t *buf = (uint16_t *)malloc(3 * DD * 2);
-    for (size_t i = 0; i < DD; i++) buf[i] = hip_f32_to_f16(q[i]);
-    for (size_t i = 0; i < DD; i++) buf[DD + i] = hip_f32_to_f16(kk_[i]);
-    for (size_t i = 0; i < DD; i++) buf[2*DD + i] = hip_f32_to_f16(v[i]);
-    void *d = hip_upload_raw(buf, 3 * DD * 2);
-    free(buf);
-    return d;
-}
-
-static void *fuse_qkv_bias(const st_context *st, int bi) {
-    char kq[160], kk[160], kv[160];
-    snprintf(kq, sizeof(kq), "vision_encoder.backbone.layers.%d.attention.q_proj.bias", bi);
-    snprintf(kk, sizeof(kk), "vision_encoder.backbone.layers.%d.attention.k_proj.bias", bi);
-    snprintf(kv, sizeof(kv), "vision_encoder.backbone.layers.%d.attention.v_proj.bias", bi);
-    int iq = st_find_pfx(st, kq), ik = st_find_pfx(st, kk), iv = st_find_pfx(st, kv);
-    if (iq < 0 || ik < 0 || iv < 0) return NULL;
-    const float *q = (const float *)safetensors_data((st_context *)st, iq);
-    const float *kk_ = (const float *)safetensors_data((st_context *)st, ik);
-    const float *v = (const float *)safetensors_data((st_context *)st, iv);
-    float *buf = (float *)malloc(3 * S3_DIM * 4);
-    memcpy(buf, q, S3_DIM * 4);
-    memcpy(buf + S3_DIM, kk_, S3_DIM * 4);
-    memcpy(buf + 2*S3_DIM, v, S3_DIM * 4);
-    void *d = hip_upload_raw(buf, 3 * S3_DIM * 4);
-    free(buf);
-    return d;
-}
-
+/* sam3.1: qkv is pre-fused in-checkpoint as (3*D, D). Direct F16 upload. */
 static int load_block(cuda_sam3_1_ctx *c, int bi) {
     s3_block *b = &c->blk[bi];
     b->is_global = is_global(bi);
     char k[192];
-    #define K(suf) (snprintf(k, sizeof(k), "vision_encoder.backbone.layers.%d." suf, bi), k)
-    b->norm1_w = upload_f32(c->st, K("layer_norm1.weight"), NULL);
-    b->norm1_b = upload_f32(c->st, K("layer_norm1.bias"),   NULL);
-    b->norm2_w = upload_f32(c->st, K("layer_norm2.weight"), NULL);
-    b->norm2_b = upload_f32(c->st, K("layer_norm2.bias"),   NULL);
-    b->qkv_w = fuse_qkv(c->st, bi);
-    b->qkv_b = fuse_qkv_bias(c->st, bi);
-    b->o_w  = upload_f16(c->st, K("attention.o_proj.weight"), NULL);
-    b->o_b  = upload_f32(c->st, K("attention.o_proj.bias"),   NULL);
+    #define K(suf) (snprintf(k, sizeof(k), "backbone.vision_backbone.trunk.blocks.%d." suf, bi), k)
+    b->norm1_w = upload_f32(c->st, K("norm1.weight"), NULL);
+    b->norm1_b = upload_f32(c->st, K("norm1.bias"),   NULL);
+    b->norm2_w = upload_f32(c->st, K("norm2.weight"), NULL);
+    b->norm2_b = upload_f32(c->st, K("norm2.bias"),   NULL);
+    b->qkv_w = upload_f16(c->st, K("attn.qkv.weight"), NULL);
+    b->qkv_b = upload_f32(c->st, K("attn.qkv.bias"),   NULL);
+    b->o_w  = upload_f16(c->st, K("attn.proj.weight"), NULL);
+    b->o_b  = upload_f32(c->st, K("attn.proj.bias"),   NULL);
     b->fc1_w = upload_f16(c->st, K("mlp.fc1.weight"), NULL);
     b->fc1_b = upload_f32(c->st, K("mlp.fc1.bias"),   NULL);
     b->fc2_w = upload_f16(c->st, K("mlp.fc2.weight"), NULL);
     b->fc2_b = upload_f32(c->st, K("mlp.fc2.bias"),   NULL);
+    /* TODO(Phase C): load attn.freqs_cis (complex64, (576, 32)) for 2D RoPE
+     * once the ViT attention kernel is switched from RPB → RoPE. */
     #undef K
     if (!b->norm1_w || !b->norm1_b || !b->norm2_w || !b->norm2_b ||
         !b->qkv_w || !b->qkv_b || !b->o_w || !b->o_b ||
@@ -522,6 +498,8 @@ static int compile_kernels(cuda_sam3_1_ctx *c) {
     GET(fn_tok2nchw,  "tokens_to_nchw_f32");
     GET(fn_c1x1,      "conv2d_1x1_f16");
     GET(fn_c3x3,      "conv2d_3x3_pad1_f16");
+    GET(fn_c1x1_f32,  "conv2d_1x1_f32");
+    GET(fn_c3x3_f32,  "conv2d_3x3_pad1_f32");
     GET(fn_ct2,       "convT_k2s2_f16");
     GET(fn_mp2,       "maxpool_k2s2_f32");
     GET(fn_gelu_erf,  "gelu_erf_f32");
@@ -648,10 +626,30 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
         c->sm = major * 10 + minor;
         const char *force = getenv("SAM3_GEMM");
         int force_tiled = (force && (!strcmp(force, "tiled") || !strcmp(force, "TILED")));
-        c->use_mma = (c->sm >= 80) && !force_tiled;
-        if (c->verbose) fprintf(stderr, "sam3.1: sm_%d -> gemm=%s%s\n",
+        /* cfg.precision: fp16 = MMA (fast, default), fp32 = tiled F32-accum
+         * (slower, lower drift). bf16/fp8 not yet implemented -> fall back to fp16. */
+        const char *prec = cfg->precision;
+        int prec_forces_tiled = 0;
+        const char *prec_note = "";
+        if (prec && *prec) {
+            if (!strcmp(prec, "fp16") || !strcmp(prec, "FP16") || !strcmp(prec, "half")) {
+                prec_note = " (precision=fp16)";
+            } else if (!strcmp(prec, "fp32") || !strcmp(prec, "FP32") || !strcmp(prec, "float")) {
+                prec_forces_tiled = 1;
+                prec_note = " (precision=fp32: forcing tiled F32-accum path)";
+            } else if (!strcmp(prec, "bf16") || !strcmp(prec, "BF16") || !strcmp(prec, "bfloat16")) {
+                prec_note = " (precision=bf16 not yet implemented, falling back to fp16)";
+            } else if (!strcmp(prec, "fp8") || !strcmp(prec, "FP8")) {
+                prec_note = " (precision=fp8 not yet implemented, falling back to fp16)";
+            } else {
+                fprintf(stderr, "sam3.1: unknown precision '%s' — using fp16\n", prec);
+            }
+        }
+        c->use_mma = (c->sm >= 80) && !force_tiled && !prec_forces_tiled;
+        if (c->verbose) fprintf(stderr, "sam3.1: sm_%d -> gemm=%s%s%s\n",
             c->sm, c->use_mma ? "mma" : "tiled",
-            force_tiled ? " (SAM3_GEMM=tiled override)" : "");
+            force_tiled ? " (SAM3_GEMM=tiled override)" : "",
+            prec_note);
     }
 
     if (compile_kernels(c) != 0) { free(c); return NULL; }
@@ -659,20 +657,41 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
     c->st = safetensors_open(cfg->ckpt_path);
     if (!c->st) { fprintf(stderr, "sam3.1: safetensors_open failed\n"); free(c); return NULL; }
 
-    c->w_patch    = upload_f16(c->st, "vision_encoder.backbone.embeddings.patch_embeddings.projection.weight", NULL);
-    c->w_pos      = upload_f32(c->st, "vision_encoder.backbone.embeddings.position_embeddings", NULL);
-    c->w_pre_ln_w = upload_f32(c->st, "vision_encoder.backbone.layer_norm.weight", NULL);
-    c->w_pre_ln_b = upload_f32(c->st, "vision_encoder.backbone.layer_norm.bias",   NULL);
-    if (!c->w_patch || !c->w_pos || !c->w_pre_ln_w || !c->w_pre_ln_b) { cuda_sam3_1_destroy(c); return NULL; }
+    c->w_patch    = upload_f16(c->st, "backbone.vision_backbone.trunk.patch_embed.proj.weight", NULL);
+    /* sam3.1 DOES have a learned pos_embed (1, 577, 1024): cls_token row +
+     * 24×24 grid. Reference forward (ViT.forward in vitdet.py) drops the
+     * cls row and tiles the remaining (24,24,1024) 3× to (72,72,1024)
+     * before the blocks. pos_embed_tile_add already implements that tile
+     * when P=24. (2D RoPE is still applied inside each attention block;
+     * the two are stacked, not exclusive.) */
+    {
+        const float *pe = host_f32(c->st, "backbone.vision_backbone.trunk.pos_embed");
+        if (!pe) { fprintf(stderr, "sam3.1: missing trunk.pos_embed\n"); cuda_sam3_1_destroy(c); return NULL; }
+        /* Skip the first (cls_token) row, leaving (24*24, 1024) = (P,P,D). */
+        c->w_pos = hip_upload_raw(pe + S3_DIM, (size_t)S3_PRE * S3_PRE * S3_DIM * 4);
+        if (!c->w_pos) { cuda_sam3_1_destroy(c); return NULL; }
+    }
+    /* sam3.1 trunk has ln_pre (before blocks) only; no post-block norm in
+     * the trunk — post-trunk ops live in the `convs` stack. */
+    c->w_pre_ln_w = upload_f32(c->st, "backbone.vision_backbone.trunk.ln_pre.weight", NULL);
+    c->w_pre_ln_b = upload_f32(c->st, "backbone.vision_backbone.trunk.ln_pre.bias",   NULL);
+    if (!c->w_patch || !c->w_pre_ln_w || !c->w_pre_ln_b) { cuda_sam3_1_destroy(c); return NULL; }
 
     if (c->verbose) fprintf(stderr, "sam3.1: loading %d ViT blocks ...\n", S3_NBLK);
     for (int bi = 0; bi < S3_NBLK; bi++) {
         if (load_block(c, bi)) { cuda_sam3_1_destroy(c); return NULL; }
     }
 
-    /* FPN neck. */
-    if (c->verbose) fprintf(stderr, "sam3.1: loading FPN neck ...\n");
-    const float scales[4] = { 4.0f, 2.0f, 1.0f, 0.5f };
+    /* sam3.1 vision-backbone conv stack: `backbone.vision_backbone.convs.{0..2}`.
+     *   convs.0 (×4): dconv_2x2_0 (1024→512) + dconv_2x2_1 (512→256) + conv_1x1 (256→256) + conv_3x3 (256→256)
+     *   convs.1 (×2): dconv_2x2   (1024→512) + conv_1x1 (512→256)  + conv_3x3 (256→256)
+     *   convs.2 (×1):                           conv_1x1 (1024→256) + conv_3x3 (256→256)
+     * (interactive_convs.*, propagation_convs.* have the same shape but are
+     * used only by the interactive/propagation paths — loading them is
+     * deferred until the forward-pass wiring lands in Phase C.)
+     */
+    if (c->verbose) fprintf(stderr, "sam3.1: loading vision-backbone conv stack ...\n");
+    const float scales[3] = { 4.0f, 2.0f, 1.0f };
     for (int li = 0; li < S3_FPN_LEV; li++) {
         s3_fpn_layer *L = &c->fpn[li];
         memset(L, 0, sizeof(*L));
@@ -680,46 +699,46 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
         int in_c = S3_DIM, inter = in_c;
         char k[192];
         if (scales[li] == 4.0f) {
-            snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.scale_layers.0.weight", li);
+            snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.dconv_2x2_0.weight", li);
             L->ct0_w = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.scale_layers.0.bias", li);
+            snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.dconv_2x2_0.bias", li);
             L->ct0_b = upload_f32(c->st, k, NULL);
-            L->ct0_in = in_c; L->ct0_out = in_c / 2;
-            snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.scale_layers.2.weight", li);
+            L->ct0_in = in_c; L->ct0_out = in_c / 2;                  /* 1024→512 */
+            snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.dconv_2x2_1.weight", li);
             L->ct1_w = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.scale_layers.2.bias", li);
+            snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.dconv_2x2_1.bias", li);
             L->ct1_b = upload_f32(c->st, k, NULL);
-            L->ct1_in = in_c / 2; L->ct1_out = in_c / 4;
+            L->ct1_in = in_c / 2; L->ct1_out = in_c / 4;              /* 512→256 */
             L->has_gelu_between = 1;
             inter = in_c / 4;
             L->out_h = L->out_w = S3_GRID * 4;
         } else if (scales[li] == 2.0f) {
-            snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.scale_layers.0.weight", li);
+            snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.dconv_2x2.weight", li);
             L->ct0_w = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.scale_layers.0.bias", li);
+            snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.dconv_2x2.bias", li);
             L->ct0_b = upload_f32(c->st, k, NULL);
-            L->ct0_in = in_c; L->ct0_out = in_c / 2;
+            L->ct0_in = in_c; L->ct0_out = in_c / 2;                  /* 1024→512 */
             inter = in_c / 2;
             L->out_h = L->out_w = S3_GRID * 2;
-        } else if (scales[li] == 1.0f) {
+        } else {
+            /* scales[li] == 1.0f — no ConvTranspose; p1 goes directly 1024→256. */
             inter = in_c;
             L->out_h = L->out_w = S3_GRID;
-        } else {
-            L->has_maxpool = 1;
-            inter = in_c;
-            L->out_h = L->out_w = S3_GRID / 2;
         }
         L->inter_c = inter;
-        snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.proj1.weight", li);
-        L->p1_w = upload_f16(c->st, k, NULL);
-        snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.proj1.bias", li);
+        /* Keep FPN conv projections in F32 — with Ci up to 1024 the F16
+         * weight-quant drift on the 1x1 would compound ~0.5 max_abs on
+         * level 2, which then feeds the DETR encoder. F32 cost is ~4 MB. */
+        snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.conv_1x1.weight", li);
+        L->p1_w = upload_f32(c->st, k, NULL);
+        snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.conv_1x1.bias", li);
         L->p1_b = upload_f32(c->st, k, NULL);
-        snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.proj2.weight", li);
-        L->p2_w = upload_f16(c->st, k, NULL);
-        snprintf(k, sizeof(k), "vision_encoder.neck.fpn_layers.%d.proj2.bias", li);
+        snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.conv_3x3.weight", li);
+        L->p2_w = upload_f32(c->st, k, NULL);
+        snprintf(k, sizeof(k), "backbone.vision_backbone.convs.%d.conv_3x3.bias", li);
         L->p2_b = upload_f32(c->st, k, NULL);
         if (!L->p1_w || !L->p1_b || !L->p2_w || !L->p2_b) {
-            fprintf(stderr, "sam3.1: fpn level %d missing proj weights\n", li);
+            fprintf(stderr, "sam3.1: convs stage %d missing proj weights\n", li);
             cuda_sam3_1_destroy(c); return NULL;
         }
         size_t out_sz = (size_t)S3_FPN_DIM * L->out_h * L->out_w * 4;
@@ -728,12 +747,59 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
         }
     }
 
-    /* CLIP text encoder. */
-    if (c->verbose) fprintf(stderr, "sam3.1: loading CLIP text encoder ...\n");
-    c->h_tok_embed = host_f32(c->st, "text_encoder.text_model.embeddings.token_embedding.weight");
-    c->h_pos_embed = host_f32(c->st, "text_encoder.text_model.embeddings.position_embedding.weight");
-    c->t_final_ln_w = upload_f32(c->st, "text_encoder.text_model.final_layer_norm.weight", NULL);
-    c->t_final_ln_b = upload_f32(c->st, "text_encoder.text_model.final_layer_norm.bias", NULL);
+    /* Vision activation buffers (must live before any forward pass). */
+    {
+        size_t tok_b  = (size_t)S3_NTOK * S3_DIM * 4;             /* 21 MB */
+        size_t qkv_b  = (size_t)S3_NTOK * 3 * S3_DIM * 4;         /* 64 MB */
+        size_t mlp_b  = (size_t)S3_NTOK * S3_MLP * 4;             /* 97 MB */
+        size_t kv_b   = (size_t)S3_HEADS * S3_NTOK * S3_HEAD * 4; /* 21 MB */
+        size_t img_b  = (size_t)3 * S3_IMG * S3_IMG * 4;
+        if (hipMalloc(&c->d_img_f32, img_b) != hipSuccess ||
+            hipMalloc(&c->d_tok,  tok_b)  != hipSuccess ||
+            hipMalloc(&c->d_tmp,  tok_b)  != hipSuccess ||
+            hipMalloc(&c->d_win,  tok_b)  != hipSuccess ||
+            hipMalloc(&c->d_qkv,  qkv_b)  != hipSuccess ||
+            hipMalloc(&c->d_attn, tok_b)  != hipSuccess ||
+            hipMalloc(&c->d_mlp,  mlp_b)  != hipSuccess ||
+            hipMalloc(&c->d_Kt,   kv_b)   != hipSuccess ||
+            hipMalloc(&c->d_Vt,   kv_b)   != hipSuccess) {
+            fprintf(stderr, "sam3.1: hipMalloc failed\n");
+            cuda_sam3_1_destroy(c); return NULL;
+        }
+    }
+
+    /* RoPE tables (built eagerly so the vision-only path still works). */
+    {
+        size_t nwin = (size_t)S3_WIN * S3_WIN * S3_HEAD;
+        size_t nglb = (size_t)S3_GRID * S3_GRID * S3_HEAD;
+        float *tcos = (float *)malloc(nwin * 4), *tsin = (float *)malloc(nwin * 4);
+        build_rope(tcos, tsin, S3_WIN, S3_WIN, 1.0f);
+        c->d_rope_win_cos = hip_upload_raw(tcos, nwin * 4);
+        c->d_rope_win_sin = hip_upload_raw(tsin, nwin * 4);
+        free(tcos); free(tsin);
+        tcos = (float *)malloc(nglb * 4); tsin = (float *)malloc(nglb * 4);
+        build_rope(tcos, tsin, S3_GRID, S3_GRID, (float)S3_WIN / (float)S3_GRID);
+        c->d_rope_glb_cos = hip_upload_raw(tcos, nglb * 4);
+        c->d_rope_glb_sin = hip_upload_raw(tsin, nglb * 4);
+        free(tcos); free(tsin);
+    }
+
+    /* Phase-C escape hatch: skip everything past the vision backbone so
+     * vision-only verify binaries (verify_patch_embed / verify_vit) can
+     * run before the text encoder + heads have been retargeted to the
+     * sam3.1 key layout. */
+    if (getenv("SAM31_VISION_ONLY")) {
+        if (c->verbose) fprintf(stderr,
+            "sam3.1: SAM31_VISION_ONLY set — stopping after vision backbone\n");
+        return c;
+    }
+
+    /* OpenAI-CLIP text encoder. */
+    if (c->verbose) fprintf(stderr, "sam3.1: loading OpenAI-CLIP text encoder ...\n");
+    c->h_tok_embed = host_f32(c->st, "backbone.language_backbone.encoder.token_embedding.weight");
+    c->h_pos_embed = host_f32(c->st, "backbone.language_backbone.encoder.positional_embedding");
+    c->t_final_ln_w = upload_f32(c->st, "backbone.language_backbone.encoder.ln_final.weight", NULL);
+    c->t_final_ln_b = upload_f32(c->st, "backbone.language_backbone.encoder.ln_final.bias", NULL);
     if (!c->h_tok_embed || !c->h_pos_embed || !c->t_final_ln_w || !c->t_final_ln_b) {
         fprintf(stderr, "sam3.1: missing CLIP text encoder weights\n");
         cuda_sam3_1_destroy(c); return NULL;
@@ -756,63 +822,58 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
         cuda_sam3_1_destroy(c); return NULL;
     }
 
-    /* Text projection (1024 -> 256). */
-    c->w_text_proj_w = upload_f16(c->st, "text_projection.weight", NULL);
-    c->w_text_proj_b = upload_f32(c->st, "text_projection.bias",   NULL);
+    /* language_backbone.resizer: Linear(1024 -> 256) that projects ln_final
+     * tokens into DETR's d_model (256). This is NOT the OpenAI-CLIP
+     * `text_projection` (1024 -> 512, used for similarity heads); the DETR
+     * path consumes the resizer output.  Weight layout is (out=256, in=1024). */
+    c->w_text_proj_w = upload_f16(c->st, "backbone.language_backbone.resizer.weight", NULL);
+    c->w_text_proj_b = upload_f32(c->st, "backbone.language_backbone.resizer.bias", NULL);
     if (!c->w_text_proj_w || !c->w_text_proj_b) {
-        fprintf(stderr, "sam3.1: missing text_projection weights\n");
+        fprintf(stderr, "sam3.1: missing language_backbone.resizer weights\n");
         cuda_sam3_1_destroy(c); return NULL;
     }
 
     /* DETR encoder layers. */
     if (c->verbose) fprintf(stderr, "sam3.1: loading DETR encoder (%d layers) ...\n", S3_DETR_LAYERS);
     for (int li = 0; li < S3_DETR_LAYERS; li++) {
-        char k[192];
-        #define DK(suf) (snprintf(k, sizeof(k), "detr_encoder.layers.%d." suf, li), k)
-        c->detr_enc[li].ln1_w = upload_f32(c->st, DK("layer_norm1.weight"), NULL);
-        c->detr_enc[li].ln1_b = upload_f32(c->st, DK("layer_norm1.bias"),   NULL);
-        c->detr_enc[li].ln2_w = upload_f32(c->st, DK("layer_norm2.weight"), NULL);
-        c->detr_enc[li].ln2_b = upload_f32(c->st, DK("layer_norm2.bias"),   NULL);
-        c->detr_enc[li].ln3_w = upload_f32(c->st, DK("layer_norm3.weight"), NULL);
-        c->detr_enc[li].ln3_b = upload_f32(c->st, DK("layer_norm3.bias"),   NULL);
+        char k[192], wk[192], bk[192];
+        #define DK(suf) (snprintf(k, sizeof(k), "transformer.encoder.layers.%d." suf, li), k)
+        #define DKWB(path, w, b) do { \
+            snprintf(wk, sizeof(wk), "transformer.encoder.layers.%d." path ".%s", li, w); \
+            snprintf(bk, sizeof(bk), "transformer.encoder.layers.%d." path ".%s", li, b); \
+        } while (0)
+        c->detr_enc[li].ln1_w = upload_f32(c->st, DK("norm1.weight"), NULL);
+        c->detr_enc[li].ln1_b = upload_f32(c->st, DK("norm1.bias"),   NULL);
+        c->detr_enc[li].ln2_w = upload_f32(c->st, DK("norm2.weight"), NULL);
+        c->detr_enc[li].ln2_b = upload_f32(c->st, DK("norm2.bias"),   NULL);
+        c->detr_enc[li].ln3_w = upload_f32(c->st, DK("norm3.weight"), NULL);
+        c->detr_enc[li].ln3_b = upload_f32(c->st, DK("norm3.bias"),   NULL);
 
-        /* Self-attn fused QKV weight/bias. */
-        const float *qw = host_f32(c->st, DK("self_attn.q_proj.weight"));
-        const float *kw = host_f32(c->st, DK("self_attn.k_proj.weight"));
-        const float *vw = host_f32(c->st, DK("self_attn.v_proj.weight"));
-        const float *qb = host_f32(c->st, DK("self_attn.q_proj.bias"));
-        const float *kbn = host_f32(c->st, DK("self_attn.k_proj.bias"));
-        const float *vb = host_f32(c->st, DK("self_attn.v_proj.bias"));
-        if (!qw || !kw || !vw || !qb || !kbn || !vb) { cuda_sam3_1_destroy(c); return NULL; }
-        size_t DD = (size_t)S3_DETR_DIM * S3_DETR_DIM;
-        uint16_t *bufw = (uint16_t *)malloc(3 * DD * 2);
-        for (size_t i = 0; i < DD; i++) bufw[i]        = hip_f32_to_f16(qw[i]);
-        for (size_t i = 0; i < DD; i++) bufw[DD + i]   = hip_f32_to_f16(kw[i]);
-        for (size_t i = 0; i < DD; i++) bufw[2*DD + i] = hip_f32_to_f16(vw[i]);
-        c->detr_enc[li].qkv_w = hip_upload_raw(bufw, 3 * DD * 2);
-        free(bufw);
-        float *bufb = (float *)malloc(3 * S3_DETR_DIM * 4);
-        memcpy(bufb + 0*S3_DETR_DIM, qb, S3_DETR_DIM * 4);
-        memcpy(bufb + 1*S3_DETR_DIM, kbn, S3_DETR_DIM * 4);
-        memcpy(bufb + 2*S3_DETR_DIM, vb, S3_DETR_DIM * 4);
-        c->detr_enc[li].qkv_b = hip_upload_raw(bufb, 3 * S3_DETR_DIM * 4);
-        free(bufb);
+        /* Self-attn: fused in_proj_weight (3D, D) / in_proj_bias (3D,). */
+        DKWB("self_attn", "in_proj_weight", "in_proj_bias");
+        if (load_fused_qkv(c->st, wk, bk, &c->detr_enc[li].qkv_w, &c->detr_enc[li].qkv_b)) {
+            cuda_sam3_1_destroy(c); return NULL;
+        }
+        c->detr_enc[li].o_w = upload_f16(c->st, DK("self_attn.out_proj.weight"), NULL);
+        c->detr_enc[li].o_b = upload_f32(c->st, DK("self_attn.out_proj.bias"),   NULL);
 
-        c->detr_enc[li].o_w = upload_f16(c->st, DK("self_attn.o_proj.weight"), NULL);
-        c->detr_enc[li].o_b = upload_f32(c->st, DK("self_attn.o_proj.bias"),   NULL);
-        c->detr_enc[li].cq_w = upload_f16(c->st, DK("cross_attn.q_proj.weight"), NULL);
-        c->detr_enc[li].cq_b = upload_f32(c->st, DK("cross_attn.q_proj.bias"),   NULL);
-        c->detr_enc[li].ck_w = upload_f16(c->st, DK("cross_attn.k_proj.weight"), NULL);
-        c->detr_enc[li].ck_b = upload_f32(c->st, DK("cross_attn.k_proj.bias"),   NULL);
-        c->detr_enc[li].cv_w = upload_f16(c->st, DK("cross_attn.v_proj.weight"), NULL);
-        c->detr_enc[li].cv_b = upload_f32(c->st, DK("cross_attn.v_proj.bias"),   NULL);
-        c->detr_enc[li].co_w = upload_f16(c->st, DK("cross_attn.o_proj.weight"), NULL);
-        c->detr_enc[li].co_b = upload_f32(c->st, DK("cross_attn.o_proj.bias"),   NULL);
-        c->detr_enc[li].fc1_w = upload_f16(c->st, DK("mlp.fc1.weight"), NULL);
-        c->detr_enc[li].fc1_b = upload_f32(c->st, DK("mlp.fc1.bias"),   NULL);
-        c->detr_enc[li].fc2_w = upload_f16(c->st, DK("mlp.fc2.weight"), NULL);
-        c->detr_enc[li].fc2_b = upload_f32(c->st, DK("mlp.fc2.bias"),   NULL);
+        /* Cross-attn-image: fused in_proj → split into q/k/v. */
+        DKWB("cross_attn_image", "in_proj_weight", "in_proj_bias");
+        if (split_fused_qkv(c->st, wk, bk, S3_DETR_DIM,
+                             &c->detr_enc[li].cq_w, &c->detr_enc[li].ck_w, &c->detr_enc[li].cv_w,
+                             &c->detr_enc[li].cq_b, &c->detr_enc[li].ck_b, &c->detr_enc[li].cv_b)) {
+            cuda_sam3_1_destroy(c); return NULL;
+        }
+        c->detr_enc[li].co_w = upload_f16(c->st, DK("cross_attn_image.out_proj.weight"), NULL);
+        c->detr_enc[li].co_b = upload_f32(c->st, DK("cross_attn_image.out_proj.bias"),   NULL);
+
+        /* MLP: linear1/linear2 (sam3's mlp.fc1/fc2 equivalent). */
+        c->detr_enc[li].fc1_w = upload_f16(c->st, DK("linear1.weight"), NULL);
+        c->detr_enc[li].fc1_b = upload_f32(c->st, DK("linear1.bias"),   NULL);
+        c->detr_enc[li].fc2_w = upload_f16(c->st, DK("linear2.weight"), NULL);
+        c->detr_enc[li].fc2_b = upload_f32(c->st, DK("linear2.bias"),   NULL);
         #undef DK
+        #undef DKWB
         if (!c->detr_enc[li].o_w || !c->detr_enc[li].fc2_w) {
             fprintf(stderr, "sam3.1: detr layer %d missing weights\n", li);
             cuda_sam3_1_destroy(c); return NULL;
@@ -871,60 +932,77 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
     /* DETR decoder. */
     if (c->verbose) fprintf(stderr, "sam3.1: loading DETR decoder ...\n");
     {
-        /* Static tensors. */
-        c->dd_query_embed = upload_f32(c->st, "detr_decoder.query_embed.weight", NULL);
-        const float *rp = host_f32(c->st, "detr_decoder.reference_points.weight");
+        /* Static tensors. sam3 → sam3.1 rename map:
+         *   detr_decoder                    → transformer.decoder
+         *   output_layer_norm               → norm
+         *   presence_layer_norm             → presence_token_out_norm
+         *   box_head.layer{1,2,3}           → bbox_embed.layers.{0,1,2}
+         *   presence_head.layer{1,2,3}      → presence_token_head.layers.{0,1,2}
+         *   ref_point_head.layer{1,2}       → ref_point_head.layers.{0,1}
+         *   box_rpb_embed_{x,y}.layer{1,2}  → boxRPB_embed_{x,y}.layers.{0,1}
+         * Per-layer attention renames applied below. */
+        c->dd_query_embed = upload_f32(c->st, "transformer.decoder.query_embed.weight", NULL);
+        const float *rp = host_f32(c->st, "transformer.decoder.reference_points.weight");
         if (!c->dd_query_embed || !rp) { cuda_sam3_1_destroy(c); return NULL; }
         c->dd_ref_points_host = (float *)malloc(S3_DETR_Q * 4 * 4);
         memcpy(c->dd_ref_points_host, rp, S3_DETR_Q * 4 * 4);
-        c->dd_presence_token = upload_f32(c->st, "detr_decoder.presence_token.weight", NULL);
-        c->dd_output_ln_w = upload_f32(c->st, "detr_decoder.output_layer_norm.weight", NULL);
-        c->dd_output_ln_b = upload_f32(c->st, "detr_decoder.output_layer_norm.bias", NULL);
-        c->dd_presence_ln_w = upload_f32(c->st, "detr_decoder.presence_layer_norm.weight", NULL);
-        c->dd_presence_ln_b = upload_f32(c->st, "detr_decoder.presence_layer_norm.bias", NULL);
+        c->dd_presence_token = upload_f32(c->st, "transformer.decoder.presence_token.weight", NULL);
+        c->dd_output_ln_w = upload_f32(c->st, "transformer.decoder.norm.weight", NULL);
+        c->dd_output_ln_b = upload_f32(c->st, "transformer.decoder.norm.bias", NULL);
+        c->dd_presence_ln_w = upload_f32(c->st, "transformer.decoder.presence_token_out_norm.weight", NULL);
+        c->dd_presence_ln_b = upload_f32(c->st, "transformer.decoder.presence_token_out_norm.bias", NULL);
         if (!c->dd_presence_token || !c->dd_output_ln_w || !c->dd_presence_ln_w) {
             cuda_sam3_1_destroy(c); return NULL;
         }
 
         char k[192];
-        /* box_head: 256→256→256→4. */
+        /* bbox_embed: 256→256→256→4. */
         for (int i = 0; i < 3; i++) {
-            snprintf(k, sizeof(k), "detr_decoder.box_head.layer%d.weight", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.bbox_embed.layers.%d.weight", i);
             c->dd_box_w[i] = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "detr_decoder.box_head.layer%d.bias", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.bbox_embed.layers.%d.bias", i);
             c->dd_box_b[i] = upload_f32(c->st, k, NULL);
             if (!c->dd_box_w[i] || !c->dd_box_b[i]) { cuda_sam3_1_destroy(c); return NULL; }
         }
-        /* presence_head: 256→256→256→1. */
+        /* presence_token_head: 256→256→256→1. */
         for (int i = 0; i < 3; i++) {
-            snprintf(k, sizeof(k), "detr_decoder.presence_head.layer%d.weight", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.presence_token_head.layers.%d.weight", i);
             c->dd_pres_w[i] = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "detr_decoder.presence_head.layer%d.bias", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.presence_token_head.layers.%d.bias", i);
             c->dd_pres_b[i] = upload_f32(c->st, k, NULL);
             if (!c->dd_pres_w[i] || !c->dd_pres_b[i]) { cuda_sam3_1_destroy(c); return NULL; }
         }
         /* ref_point_head: 512→256→256. */
         for (int i = 0; i < 2; i++) {
-            snprintf(k, sizeof(k), "detr_decoder.ref_point_head.layer%d.weight", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.ref_point_head.layers.%d.weight", i);
             c->dd_rph_w[i] = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "detr_decoder.ref_point_head.layer%d.bias", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.ref_point_head.layers.%d.bias", i);
             c->dd_rph_b[i] = upload_f32(c->st, k, NULL);
             if (!c->dd_rph_w[i] || !c->dd_rph_b[i]) { cuda_sam3_1_destroy(c); return NULL; }
         }
-        /* box_rpb_embed_{x,y}: 2→256→8. */
+        /* boxRPB_embed_{x,y}: 2→256→8. */
         for (int i = 0; i < 2; i++) {
-            snprintf(k, sizeof(k), "detr_decoder.box_rpb_embed_x.layer%d.weight", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.boxRPB_embed_x.layers.%d.weight", i);
             c->dd_rpbx_w[i] = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "detr_decoder.box_rpb_embed_x.layer%d.bias", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.boxRPB_embed_x.layers.%d.bias", i);
             c->dd_rpbx_b[i] = upload_f32(c->st, k, NULL);
-            snprintf(k, sizeof(k), "detr_decoder.box_rpb_embed_y.layer%d.weight", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.boxRPB_embed_y.layers.%d.weight", i);
             c->dd_rpby_w[i] = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "detr_decoder.box_rpb_embed_y.layer%d.bias", i+1);
+            snprintf(k, sizeof(k), "transformer.decoder.boxRPB_embed_y.layers.%d.bias", i);
             c->dd_rpby_b[i] = upload_f32(c->st, k, NULL);
             if (!c->dd_rpbx_w[i] || !c->dd_rpby_w[i]) { cuda_sam3_1_destroy(c); return NULL; }
         }
 
-        /* 6 decoder layers. */
+        /* 6 decoder layers.
+         * sam3 → sam3.1 per-layer attention names:
+         *   self_attn           → self_attn         (fused in_proj)
+         *   text_cross_attn     → ca_text           (fused in_proj)
+         *   vision_cross_attn   → cross_attn        (fused in_proj)
+         *   self_attn_layer_norm         → norm1
+         *   text_cross_attn_layer_norm   → catext_norm
+         *   vision_cross_attn_layer_norm → norm2
+         *   mlp_layer_norm               → norm3
+         *   mlp.fc1/fc2                  → linear1/linear2 */
         #define DLOAD_F16(dst, fmt, ...) do { \
             snprintf(k, sizeof(k), fmt, __VA_ARGS__); \
             dst = upload_f16(c->st, k, NULL); \
@@ -936,31 +1014,38 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
             if (!dst) { fprintf(stderr, "sam3.1: missing %s\n", k); cuda_sam3_1_destroy(c); return NULL; } \
         } while (0)
         for (int li = 0; li < S3_DETR_LAYERS; li++) {
-            #define LOAD_QKVO(P, dq, dk, dv, dO, dqb, dkb, dvb, dob, lnw, lnb, LN) do { \
-                DLOAD_F16(c->dd[li].dq,  "detr_decoder.layers.%d." P ".q_proj.weight", li); \
-                DLOAD_F32(c->dd[li].dqb, "detr_decoder.layers.%d." P ".q_proj.bias",   li); \
-                DLOAD_F16(c->dd[li].dk,  "detr_decoder.layers.%d." P ".k_proj.weight", li); \
-                DLOAD_F32(c->dd[li].dkb, "detr_decoder.layers.%d." P ".k_proj.bias",   li); \
-                DLOAD_F16(c->dd[li].dv,  "detr_decoder.layers.%d." P ".v_proj.weight", li); \
-                DLOAD_F32(c->dd[li].dvb, "detr_decoder.layers.%d." P ".v_proj.bias",   li); \
-                DLOAD_F16(c->dd[li].dO,  "detr_decoder.layers.%d." P ".o_proj.weight", li); \
-                DLOAD_F32(c->dd[li].dob, "detr_decoder.layers.%d." P ".o_proj.bias",   li); \
-                DLOAD_F32(c->dd[li].lnw, "detr_decoder.layers.%d." LN "_layer_norm.weight", li); \
-                DLOAD_F32(c->dd[li].lnb, "detr_decoder.layers.%d." LN "_layer_norm.bias",   li); \
+            #define LOAD_FUSED_ATT(P, dq, dk, dv, dO, dqb, dkb, dvb, dob) do { \
+                char wk[192], bk[192]; \
+                snprintf(wk, sizeof(wk), "transformer.decoder.layers.%d." P ".in_proj_weight", li); \
+                snprintf(bk, sizeof(bk), "transformer.decoder.layers.%d." P ".in_proj_bias",   li); \
+                if (split_fused_qkv(c->st, wk, bk, S3_DETR_DIM, \
+                                     &c->dd[li].dq, &c->dd[li].dk, &c->dd[li].dv, \
+                                     &c->dd[li].dqb, &c->dd[li].dkb, &c->dd[li].dvb)) { \
+                    fprintf(stderr, "sam3.1: decoder layer %d " P " in_proj split failed\n", li); \
+                    cuda_sam3_1_destroy(c); return NULL; \
+                } \
+                DLOAD_F16(c->dd[li].dO,  "transformer.decoder.layers.%d." P ".out_proj.weight", li); \
+                DLOAD_F32(c->dd[li].dob, "transformer.decoder.layers.%d." P ".out_proj.bias",   li); \
             } while (0)
-            LOAD_QKVO("self_attn",         sa_q, sa_k, sa_v, sa_o, sa_qb, sa_kb, sa_vb, sa_ob,
-                      sa_ln_w, sa_ln_b, "self_attn");
-            LOAD_QKVO("text_cross_attn",   ta_q, ta_k, ta_v, ta_o, ta_qb, ta_kb, ta_vb, ta_ob,
-                      ta_ln_w, ta_ln_b, "text_cross_attn");
-            LOAD_QKVO("vision_cross_attn", va_q, va_k, va_v, va_o, va_qb, va_kb, va_vb, va_ob,
-                      va_ln_w, va_ln_b, "vision_cross_attn");
-            #undef LOAD_QKVO
-            DLOAD_F16(c->dd[li].fc1,   "detr_decoder.layers.%d.mlp.fc1.weight", li);
-            DLOAD_F32(c->dd[li].fc1_b, "detr_decoder.layers.%d.mlp.fc1.bias",   li);
-            DLOAD_F16(c->dd[li].fc2,   "detr_decoder.layers.%d.mlp.fc2.weight", li);
-            DLOAD_F32(c->dd[li].fc2_b, "detr_decoder.layers.%d.mlp.fc2.bias",   li);
-            DLOAD_F32(c->dd[li].mlp_ln_w, "detr_decoder.layers.%d.mlp_layer_norm.weight", li);
-            DLOAD_F32(c->dd[li].mlp_ln_b, "detr_decoder.layers.%d.mlp_layer_norm.bias",   li);
+            LOAD_FUSED_ATT("self_attn",  sa_q, sa_k, sa_v, sa_o, sa_qb, sa_kb, sa_vb, sa_ob);
+            DLOAD_F32(c->dd[li].sa_ln_w, "transformer.decoder.layers.%d.norm1.weight", li);
+            DLOAD_F32(c->dd[li].sa_ln_b, "transformer.decoder.layers.%d.norm1.bias",   li);
+
+            LOAD_FUSED_ATT("ca_text",    ta_q, ta_k, ta_v, ta_o, ta_qb, ta_kb, ta_vb, ta_ob);
+            DLOAD_F32(c->dd[li].ta_ln_w, "transformer.decoder.layers.%d.catext_norm.weight", li);
+            DLOAD_F32(c->dd[li].ta_ln_b, "transformer.decoder.layers.%d.catext_norm.bias",   li);
+
+            LOAD_FUSED_ATT("cross_attn", va_q, va_k, va_v, va_o, va_qb, va_kb, va_vb, va_ob);
+            DLOAD_F32(c->dd[li].va_ln_w, "transformer.decoder.layers.%d.norm2.weight", li);
+            DLOAD_F32(c->dd[li].va_ln_b, "transformer.decoder.layers.%d.norm2.bias",   li);
+            #undef LOAD_FUSED_ATT
+
+            DLOAD_F16(c->dd[li].fc1,   "transformer.decoder.layers.%d.linear1.weight", li);
+            DLOAD_F32(c->dd[li].fc1_b, "transformer.decoder.layers.%d.linear1.bias",   li);
+            DLOAD_F16(c->dd[li].fc2,   "transformer.decoder.layers.%d.linear2.weight", li);
+            DLOAD_F32(c->dd[li].fc2_b, "transformer.decoder.layers.%d.linear2.bias",   li);
+            DLOAD_F32(c->dd[li].mlp_ln_w, "transformer.decoder.layers.%d.norm3.weight", li);
+            DLOAD_F32(c->dd[li].mlp_ln_b, "transformer.decoder.layers.%d.norm3.bias",   li);
         }
         #undef DLOAD_F16
         #undef DLOAD_F32
@@ -1000,16 +1085,18 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
     if (c->verbose) fprintf(stderr, "sam3.1: loading dot_product_scoring ...\n");
     {
         const int DD = S3_DETR_DIM, T = S3_T_CTX, MLP = S3_DETR_MLP, Nq = S3_DETR_Q;
-        c->ds_tmlp_w[0] = upload_f16(c->st, "dot_product_scoring.text_mlp.layer1.weight", NULL);
-        c->ds_tmlp_b[0] = upload_f32(c->st, "dot_product_scoring.text_mlp.layer1.bias", NULL);
-        c->ds_tmlp_w[1] = upload_f16(c->st, "dot_product_scoring.text_mlp.layer2.weight", NULL);
-        c->ds_tmlp_b[1] = upload_f32(c->st, "dot_product_scoring.text_mlp.layer2.bias", NULL);
-        c->ds_tnorm_w  = upload_f32(c->st, "dot_product_scoring.text_mlp_out_norm.weight", NULL);
-        c->ds_tnorm_b  = upload_f32(c->st, "dot_product_scoring.text_mlp_out_norm.bias", NULL);
-        c->ds_tproj_w  = upload_f16(c->st, "dot_product_scoring.text_proj.weight", NULL);
-        c->ds_tproj_b  = upload_f32(c->st, "dot_product_scoring.text_proj.bias", NULL);
-        c->ds_qproj_w  = upload_f16(c->st, "dot_product_scoring.query_proj.weight", NULL);
-        c->ds_qproj_b  = upload_f32(c->st, "dot_product_scoring.query_proj.bias", NULL);
+        /* sam3.1: dot_prod_scoring (singular). text_mlp/text_proj/query_proj
+         * renamed to prompt_mlp/prompt_proj/hs_proj (pointer semantics same). */
+        c->ds_tmlp_w[0] = upload_f16(c->st, "dot_prod_scoring.prompt_mlp.layers.0.weight", NULL);
+        c->ds_tmlp_b[0] = upload_f32(c->st, "dot_prod_scoring.prompt_mlp.layers.0.bias", NULL);
+        c->ds_tmlp_w[1] = upload_f16(c->st, "dot_prod_scoring.prompt_mlp.layers.1.weight", NULL);
+        c->ds_tmlp_b[1] = upload_f32(c->st, "dot_prod_scoring.prompt_mlp.layers.1.bias", NULL);
+        c->ds_tnorm_w  = upload_f32(c->st, "dot_prod_scoring.prompt_mlp.out_norm.weight", NULL);
+        c->ds_tnorm_b  = upload_f32(c->st, "dot_prod_scoring.prompt_mlp.out_norm.bias", NULL);
+        c->ds_tproj_w  = upload_f16(c->st, "dot_prod_scoring.prompt_proj.weight", NULL);
+        c->ds_tproj_b  = upload_f32(c->st, "dot_prod_scoring.prompt_proj.bias", NULL);
+        c->ds_qproj_w  = upload_f16(c->st, "dot_prod_scoring.hs_proj.weight", NULL);
+        c->ds_qproj_b  = upload_f32(c->st, "dot_prod_scoring.hs_proj.bias", NULL);
         if (!c->ds_tmlp_w[0] || !c->ds_tnorm_w || !c->ds_tproj_w || !c->ds_qproj_w) {
             fprintf(stderr, "sam3.1: failed dot_product_scoring load\n");
             cuda_sam3_1_destroy(c); return NULL;
@@ -1031,38 +1118,50 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
     {
         const int DD = S3_DETR_DIM, T = S3_T_CTX, N = S3_NTOK, Nq = S3_DETR_Q;
         const int H2 = 72, W2 = 72, H1 = 144, W1 = 144, H0 = 288, W0 = 288;
-        c->md_pca_q_w = upload_f16(c->st, "mask_decoder.prompt_cross_attn.q_proj.weight", NULL);
-        c->md_pca_q_b = upload_f32(c->st, "mask_decoder.prompt_cross_attn.q_proj.bias", NULL);
-        c->md_pca_k_w = upload_f16(c->st, "mask_decoder.prompt_cross_attn.k_proj.weight", NULL);
-        c->md_pca_k_b = upload_f32(c->st, "mask_decoder.prompt_cross_attn.k_proj.bias", NULL);
-        c->md_pca_v_w = upload_f16(c->st, "mask_decoder.prompt_cross_attn.v_proj.weight", NULL);
-        c->md_pca_v_b = upload_f32(c->st, "mask_decoder.prompt_cross_attn.v_proj.bias", NULL);
-        c->md_pca_o_w = upload_f16(c->st, "mask_decoder.prompt_cross_attn.o_proj.weight", NULL);
-        c->md_pca_o_b = upload_f32(c->st, "mask_decoder.prompt_cross_attn.o_proj.bias", NULL);
-        c->md_pca_ln_w= upload_f32(c->st, "mask_decoder.prompt_cross_attn_norm.weight", NULL);
-        c->md_pca_ln_b= upload_f32(c->st, "mask_decoder.prompt_cross_attn_norm.bias", NULL);
+        /* sam3 → sam3.1 rename map:
+         *   mask_decoder                → segmentation_head
+         *   prompt_cross_attn.{q,k,v,o}_proj → cross_attend_prompt (fused in_proj)
+         *   prompt_cross_attn_norm      → cross_attn_norm
+         *   mask_embedder.layers        → mask_predictor.mask_embed.layers
+         *   instance_projection         → instance_seg_head
+         *   semantic_projection         → semantic_seg_head
+         * sam3.1 has 3 pixel_decoder conv_layers (layer 2 currently unused in
+         * the sam3 forward path — loading only 2 for now). */
+        if (split_fused_qkv(c->st,
+                             "segmentation_head.cross_attend_prompt.in_proj_weight",
+                             "segmentation_head.cross_attend_prompt.in_proj_bias",
+                             S3_DETR_DIM,
+                             &c->md_pca_q_w, &c->md_pca_k_w, &c->md_pca_v_w,
+                             &c->md_pca_q_b, &c->md_pca_k_b, &c->md_pca_v_b)) {
+            fprintf(stderr, "sam3.1: failed cross_attend_prompt split\n");
+            cuda_sam3_1_destroy(c); return NULL;
+        }
+        c->md_pca_o_w = upload_f16(c->st, "segmentation_head.cross_attend_prompt.out_proj.weight", NULL);
+        c->md_pca_o_b = upload_f32(c->st, "segmentation_head.cross_attend_prompt.out_proj.bias", NULL);
+        c->md_pca_ln_w= upload_f32(c->st, "segmentation_head.cross_attn_norm.weight", NULL);
+        c->md_pca_ln_b= upload_f32(c->st, "segmentation_head.cross_attn_norm.bias", NULL);
         for (int i = 0; i < 2; i++) {
             char k[192];
-            snprintf(k, sizeof(k), "mask_decoder.pixel_decoder.conv_layers.%d.weight", i);
+            snprintf(k, sizeof(k), "segmentation_head.pixel_decoder.conv_layers.%d.weight", i);
             c->md_conv_w[i] = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "mask_decoder.pixel_decoder.conv_layers.%d.bias", i);
+            snprintf(k, sizeof(k), "segmentation_head.pixel_decoder.conv_layers.%d.bias", i);
             c->md_conv_b[i] = upload_f32(c->st, k, NULL);
-            snprintf(k, sizeof(k), "mask_decoder.pixel_decoder.norms.%d.weight", i);
+            snprintf(k, sizeof(k), "segmentation_head.pixel_decoder.norms.%d.weight", i);
             c->md_gn_w[i]   = upload_f32(c->st, k, NULL);
-            snprintf(k, sizeof(k), "mask_decoder.pixel_decoder.norms.%d.bias", i);
+            snprintf(k, sizeof(k), "segmentation_head.pixel_decoder.norms.%d.bias", i);
             c->md_gn_b[i]   = upload_f32(c->st, k, NULL);
         }
         for (int i = 0; i < 3; i++) {
             char k[192];
-            snprintf(k, sizeof(k), "mask_decoder.mask_embedder.layers.%d.weight", i);
+            snprintf(k, sizeof(k), "segmentation_head.mask_predictor.mask_embed.layers.%d.weight", i);
             c->md_me_w[i] = upload_f16(c->st, k, NULL);
-            snprintf(k, sizeof(k), "mask_decoder.mask_embedder.layers.%d.bias", i);
+            snprintf(k, sizeof(k), "segmentation_head.mask_predictor.mask_embed.layers.%d.bias", i);
             c->md_me_b[i] = upload_f32(c->st, k, NULL);
         }
-        c->md_ip_w = upload_f16(c->st, "mask_decoder.instance_projection.weight", NULL);
-        c->md_ip_b = upload_f32(c->st, "mask_decoder.instance_projection.bias", NULL);
-        c->md_sp_w = upload_f16(c->st, "mask_decoder.semantic_projection.weight", NULL);
-        c->md_sp_b = upload_f32(c->st, "mask_decoder.semantic_projection.bias", NULL);
+        c->md_ip_w = upload_f16(c->st, "segmentation_head.instance_seg_head.weight", NULL);
+        c->md_ip_b = upload_f32(c->st, "segmentation_head.instance_seg_head.bias", NULL);
+        c->md_sp_w = upload_f16(c->st, "segmentation_head.semantic_seg_head.weight", NULL);
+        c->md_sp_b = upload_f32(c->st, "segmentation_head.semantic_seg_head.bias", NULL);
         if (!c->md_pca_q_w || !c->md_conv_w[0] || !c->md_me_w[0] ||
             !c->md_ip_w || !c->md_sp_w) {
             fprintf(stderr, "sam3.1: failed mask_decoder load\n");
@@ -1090,38 +1189,6 @@ cuda_sam3_1_ctx *cuda_sam3_1_create(const cuda_sam3_1_config *cfg) {
         }
     }
 
-    /* RoPE tables. */
-    size_t nwin = (size_t)S3_WIN * S3_WIN * S3_HEAD;
-    size_t nglb = (size_t)S3_GRID * S3_GRID * S3_HEAD;
-    float *tcos = (float *)malloc(nwin * 4), *tsin = (float *)malloc(nwin * 4);
-    build_rope(tcos, tsin, S3_WIN, S3_WIN, 1.0f);
-    c->d_rope_win_cos = hip_upload_raw(tcos, nwin * 4);
-    c->d_rope_win_sin = hip_upload_raw(tsin, nwin * 4);
-    free(tcos); free(tsin);
-    tcos = (float *)malloc(nglb * 4); tsin = (float *)malloc(nglb * 4);
-    build_rope(tcos, tsin, S3_GRID, S3_GRID, (float)S3_WIN / (float)S3_GRID);
-    c->d_rope_glb_cos = hip_upload_raw(tcos, nglb * 4);
-    c->d_rope_glb_sin = hip_upload_raw(tsin, nglb * 4);
-    free(tcos); free(tsin);
-
-    /* Activation buffers. */
-    size_t tok_b  = (size_t)S3_NTOK * S3_DIM * 4;             /* 21 MB */
-    size_t qkv_b  = (size_t)S3_NTOK * 3 * S3_DIM * 4;         /* 64 MB */
-    size_t mlp_b  = (size_t)S3_NTOK * S3_MLP * 4;             /* 97 MB */
-    size_t kv_b   = (size_t)S3_HEADS * S3_NTOK * S3_HEAD * 4; /* 21 MB */
-    size_t img_b  = (size_t)3 * S3_IMG * S3_IMG * 4;
-    if (hipMalloc(&c->d_img_f32, img_b) != hipSuccess ||
-        hipMalloc(&c->d_tok,  tok_b)  != hipSuccess ||
-        hipMalloc(&c->d_tmp,  tok_b)  != hipSuccess ||
-        hipMalloc(&c->d_win,  tok_b)  != hipSuccess ||
-        hipMalloc(&c->d_qkv,  qkv_b)  != hipSuccess ||
-        hipMalloc(&c->d_attn, tok_b)  != hipSuccess ||
-        hipMalloc(&c->d_mlp,  mlp_b)  != hipSuccess ||
-        hipMalloc(&c->d_Kt,   kv_b)   != hipSuccess ||
-        hipMalloc(&c->d_Vt,   kv_b)   != hipSuccess) {
-        fprintf(stderr, "sam3.1: hipMalloc failed\n");
-        cuda_sam3_1_destroy(c); return NULL;
-    }
     if (c->verbose) fprintf(stderr, "sam3.1: ready (patch+pos ready, 32 ViT blocks loaded)\n");
     return c;
 }
@@ -1139,9 +1206,13 @@ static int run_patch_pos(cuda_sam3_1_ctx *c) {
     struct __attribute__((packed)) { void *out; const void *w, *img; int grid, img_size, D; } pe =
         { c->d_tok, c->w_patch, c->d_img_f32, S3_GRID, S3_IMG, S3_DIM };
     if (launch(c->fn_patch, S3_GRID, S3_GRID, 1, 128, 1, 1, 0, &pe, sizeof(pe))) return -1;
-    struct __attribute__((packed)) { void *t; const void *p; int g, P, D; } pp =
-        { c->d_tok, c->w_pos, S3_GRID, S3_PRE, S3_DIM };
-    if (launch(c->fn_pos_add, S3_GRID, S3_GRID, 1, 256, 1, 1, 0, &pp, sizeof(pp))) return -1;
+    /* sam3.1 uses 2D RoPE inside each ViT block — no learned pos_embed at the
+     * trunk entrance. w_pos is NULL; skip pos_add entirely. */
+    if (c->w_pos) {
+        struct __attribute__((packed)) { void *t; const void *p; int g, P, D; } pp =
+            { c->d_tok, c->w_pos, S3_GRID, S3_PRE, S3_DIM };
+        if (launch(c->fn_pos_add, S3_GRID, S3_GRID, 1, 256, 1, 1, 0, &pp, sizeof(pp))) return -1;
+    }
     hipDeviceSynchronize();
     c->ready = 1;
     c->vit_started = 0;
@@ -1242,10 +1313,12 @@ int cuda_sam3_1_run_vit(cuda_sam3_1_ctx *c, int stop_at_block) {
     }
     int start = c->last_block + 1;
     for (int bi = start; bi <= stop_at_block; bi++) {
-        if (block_forward(c, bi)) return -1;
+        if (block_forward(c, bi)) {
+            fprintf(stderr, "sam3.1: block_forward(%d) failed\n", bi);
+            return -1;
+        }
         c->last_block = bi;
     }
-    hipDeviceSynchronize();
     return 0;
 }
 
@@ -1266,6 +1339,16 @@ static int r_c3x3(cuda_sam3_1_ctx *c, void *y, const void *w, const void *b,
                     const void *x, int Ci, int Co, int H, int W) {
     struct __attribute__((packed)) { void *y; const void *w, *b, *x; int Ci, Co, H, W; } p = { y, w, b, x, Ci, Co, H, W };
     return launch(c->fn_c3x3, (W+15)/16, (H+15)/16, Co, 16, 16, 1, 0, &p, sizeof(p));
+}
+static int r_c1x1_f32(cuda_sam3_1_ctx *c, void *y, const void *w, const void *b,
+                      const void *x, int Ci, int Co, int H, int W) {
+    struct __attribute__((packed)) { void *y; const void *w, *b, *x; int Ci, Co, H, W; } p = { y, w, b, x, Ci, Co, H, W };
+    return launch(c->fn_c1x1_f32, (W+15)/16, (H+15)/16, Co, 16, 16, 1, 0, &p, sizeof(p));
+}
+static int r_c3x3_f32(cuda_sam3_1_ctx *c, void *y, const void *w, const void *b,
+                      const void *x, int Ci, int Co, int H, int W) {
+    struct __attribute__((packed)) { void *y; const void *w, *b, *x; int Ci, Co, H, W; } p = { y, w, b, x, Ci, Co, H, W };
+    return launch(c->fn_c3x3_f32, (W+15)/16, (H+15)/16, Co, 16, 16, 1, 0, &p, sizeof(p));
 }
 static int r_ct2(cuda_sam3_1_ctx *c, void *y, const void *w, const void *b,
                    const void *x, int Ci, int Co, int H, int W) {
@@ -1324,12 +1407,12 @@ int cuda_sam3_1_run_fpn(cuda_sam3_1_ctx *c) {
             if (r_mp2(c, d_sc1, nchw, S3_DIM, S3_GRID, S3_GRID)) goto fail;
             scaled = d_sc1; sc_c = S3_DIM; sc_h = S3_GRID/2; sc_w = S3_GRID/2;
         }
-        /* proj1 1x1: inter_c → 256 */
-        if (r_c1x1(c, d_p1, L->p1_w, L->p1_b, scaled,
-                   sc_c, S3_FPN_DIM, sc_h, sc_w)) goto fail;
-        /* proj2 3x3 pad=1: 256 → 256 into final output. */
-        if (r_c3x3(c, L->d_out, L->p2_w, L->p2_b, d_p1,
-                   S3_FPN_DIM, S3_FPN_DIM, sc_h, sc_w)) goto fail;
+        /* proj1 1x1: inter_c → 256 (F32 weights to avoid F16 quant drift). */
+        if (r_c1x1_f32(c, d_p1, L->p1_w, L->p1_b, scaled,
+                       sc_c, S3_FPN_DIM, sc_h, sc_w)) goto fail;
+        /* proj2 3x3 pad=1: 256 → 256 into final output (F32 weights). */
+        if (r_c3x3_f32(c, L->d_out, L->p2_w, L->p2_b, d_p1,
+                       S3_FPN_DIM, S3_FPN_DIM, sc_h, sc_w)) goto fail;
     }
     hipDeviceSynchronize();
     if (d_sc1) hipFree(d_sc1);
@@ -1342,6 +1425,23 @@ fail:
     if (d_sc2) hipFree(d_sc2);
     if (d_p1)  hipFree(d_p1);
     return -1;
+}
+
+int cuda_sam3_1_debug_override_detr_inputs(cuda_sam3_1_ctx *c,
+                                           const float *fpn2_nchw,
+                                           const float *text_tokens) {
+    if (!c || !fpn2_nchw || !text_tokens) return -1;
+    const s3_fpn_layer *L2 = &c->fpn[2];
+    size_t vsz = (size_t)S3_FPN_DIM * L2->out_h * L2->out_w * 4;
+    if (hipMemcpy(L2->d_out, fpn2_nchw, vsz, hipMemcpyHostToDevice) != hipSuccess)
+        return -1;
+    size_t tsz = (size_t)S3_T_CTX * S3_T_DIM * 4;
+    if (hipMemcpy(c->d_text_tok, text_tokens, tsz, hipMemcpyHostToDevice) != hipSuccess)
+        return -1;
+    c->fpn_ready = 1;
+    c->text_done = 1;
+    c->last_block = S3_NBLK - 1; /* satisfy run_detr_enc precondition */
+    return 0;
 }
 
 int cuda_sam3_1_get_fpn(const cuda_sam3_1_ctx *c, int level, float *out,
@@ -1583,7 +1683,10 @@ int cuda_sam3_1_run_detr_enc(cuda_sam3_1_ctx *c) {
     /* Text projection (1024 -> 256) on final LN'd text output. */
     if (r_gemm(c, c->d_detr_text_pooled, c->w_text_proj_w, c->d_text_tok,
                c->w_text_proj_b, D, S3_T_DIM, T)) return -1;
-    for (int li = 0; li < S3_DETR_LAYERS; li++) {
+    int nl = S3_DETR_LAYERS;
+    const char *env = getenv("SAM3_1_DETR_ENC_LAYERS");
+    if (env) { int v = atoi(env); if (v >= 0 && v <= S3_DETR_LAYERS) nl = v; }
+    for (int li = 0; li < nl; li++) {
         if (detr_enc_layer(c, li)) return -1;
     }
     hipDeviceSynchronize();
@@ -2168,7 +2271,9 @@ const uint8_t *cuda_sam3_1_get_final_masks(const cuda_sam3_1_ctx *c,
 
 int cuda_sam3_1_get_vit_embed(const cuda_sam3_1_ctx *c, float *out, int *n, int *d) {
     if (!c || !c->ready || !out) return -1;
-    hipMemcpy(out, c->d_tok, (size_t)S3_NTOK * S3_DIM * 4, hipMemcpyDeviceToHost);
+    hipDeviceSynchronize();
+    if (hipMemcpy(out, c->d_tok, (size_t)S3_NTOK * S3_DIM * 4, hipMemcpyDeviceToHost) != hipSuccess)
+        return -1;
     if (n) *n = S3_NTOK;
     if (d) *d = S3_DIM;
     return 0;

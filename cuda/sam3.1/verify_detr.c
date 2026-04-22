@@ -37,10 +37,12 @@ static void *read_npy(const char *path, int *ndim, int *dims, int *itemsz_out) {
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
+    const char *refdir = "/tmp/sam3.1_ref";
+    int use_ref_inputs = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt")   && i+1 < argc) ckpt = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
+        else if (!strcmp(argv[i], "--use-ref-inputs")) use_ref_inputs = 1;
     }
     if (!ckpt) { fprintf(stderr, "--ckpt required\n"); return 1; }
 
@@ -69,17 +71,36 @@ int main(int argc, char **argv)
     cuda_sam3_1_ctx *ctx = cuda_sam3_1_create(&cfg);
     if (!ctx) return 4;
 
-    if (cuda_sam3_1_set_pixel_values(ctx, px) != 0) return 5;
-    free(px);
-    fprintf(stderr, "running ViT (32) ...\n");
-    if (cuda_sam3_1_run_vit(ctx, 31) != 0) return 6;
-    fprintf(stderr, "running FPN ...\n");
-    if (cuda_sam3_1_run_fpn(ctx) != 0) return 7;
-    if (cuda_sam3_1_set_input_ids(ctx, ids, amask_p) != 0) return 8;
-    fprintf(stderr, "running CLIP text ...\n");
-    if (cuda_sam3_1_run_text(ctx) != 0) return 9;
-    fprintf(stderr, "running DETR encoder (6 layers) ...\n");
-    if (cuda_sam3_1_run_detr_enc(ctx) != 0) return 10;
+    if (use_ref_inputs) {
+        free(px);
+        /* Populate text_mask (d_text_mask_i32) from ref input_ids so the
+         * DETR cross-attn key mask is valid; override below only replaces
+         * the FPN/text activation buffers. */
+        if (cuda_sam3_1_set_input_ids(ctx, ids, amask_p) != 0) return 8;
+        snprintf(path, sizeof(path), "%s/convs2.npy", refdir);
+        float *fpn2 = (float *)read_npy(path, &nd, d, &isz);
+        if (!fpn2) { fprintf(stderr, "need %s\n", path); return 5; }
+        snprintf(path, sizeof(path), "%s/text_ln_final.npy", refdir);
+        float *txt = (float *)read_npy(path, &nd, d, &isz);
+        if (!txt) { fprintf(stderr, "need %s\n", path); return 5; }
+        if (cuda_sam3_1_debug_override_detr_inputs(ctx, fpn2, txt) != 0) return 6;
+        free(fpn2); free(txt);
+        fprintf(stderr, "OVERRIDE: using ref FPN2 + text_ln_final directly\n");
+        fprintf(stderr, "running DETR encoder (6 layers) ...\n");
+        if (cuda_sam3_1_run_detr_enc(ctx) != 0) return 10;
+    } else {
+        if (cuda_sam3_1_set_pixel_values(ctx, px) != 0) return 5;
+        free(px);
+        fprintf(stderr, "running ViT (32) ...\n");
+        if (cuda_sam3_1_run_vit(ctx, 31) != 0) return 6;
+        fprintf(stderr, "running FPN ...\n");
+        if (cuda_sam3_1_run_fpn(ctx) != 0) return 7;
+        if (cuda_sam3_1_set_input_ids(ctx, ids, amask_p) != 0) return 8;
+        fprintf(stderr, "running CLIP text ...\n");
+        if (cuda_sam3_1_run_text(ctx) != 0) return 9;
+        fprintf(stderr, "running DETR encoder (6 layers) ...\n");
+        if (cuda_sam3_1_run_detr_enc(ctx) != 0) return 10;
+    }
 
     int on, od;
     size_t cap = (size_t)5184 * 256;
@@ -87,14 +108,24 @@ int main(int argc, char **argv)
     cuda_sam3_1_get_detr_enc(ctx, ours, &on, &od);
     size_t n = (size_t)on * od;
 
-    snprintf(path, sizeof(path), "%s/detr_enc.npy", refdir);
+    const char *env_nl = getenv("SAM3_1_DETR_ENC_LAYERS");
     int rnd, rd[8];
-    float *ref = (float *)read_npy(path, &rnd, rd, &isz);
-    if (!ref) {
-        snprintf(path, sizeof(path), "%s/detr_encoder.npy", refdir);
+    float *ref = NULL;
+    if (env_nl) {
+        int L = atoi(env_nl);
+        if (L == 0) {
+            snprintf(path, sizeof(path), "%s/detr_enc_input.npy", refdir);
+        } else {
+            snprintf(path, sizeof(path), "%s/detr_enc_layer%02d.npy", refdir, L - 1);
+        }
         ref = (float *)read_npy(path, &rnd, rd, &isz);
     }
-    if (!ref) { fprintf(stderr, "no detr_enc.npy\n"); return 11; }
+    if (!ref) {
+        snprintf(path, sizeof(path), "%s/detr_enc_memory.npy", refdir);
+        ref = (float *)read_npy(path, &rnd, rd, &isz);
+    }
+    if (!ref) { fprintf(stderr, "no detr_enc ref at %s\n", path); return 11; }
+    fprintf(stderr, "comparing against %s\n", path);
     size_t rn = 1; for (int i = 0; i < rnd; i++) rn *= (size_t)rd[i];
     if (rn != n) {
         fprintf(stderr, "shape mismatch ref=%zu ours=%zu\n", rn, n);

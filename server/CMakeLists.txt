@@ -6,6 +6,7 @@ option(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_CPU "Enable Qwen-Image CPU backend" ON
 option(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP "Enable Qwen-Image HIP backend" ON)
 option(DIFFUSION_SERVER_ENABLE_SAM3 "Enable SAM3 API surface" ON)
 option(DIFFUSION_SERVER_ENABLE_SAM3_CUDA "Enable SAM3 CUDA backend (NVRTC via cuew)" OFF)
+option(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA "Enable SAM3.1 CUDA backend (NVRTC via cuew)" OFF)
 option(DIFFUSION_SERVER_ENABLE_MCP "Enable minimal MCP stdio mode" OFF)
 
 set(ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -31,6 +32,7 @@ target_compile_definitions(diffusion-server PRIVATE
     $<$<BOOL:${DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP}>:DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP=1>
     $<$<BOOL:${DIFFUSION_SERVER_ENABLE_SAM3}>:DIFFUSION_SERVER_ENABLE_SAM3=1>
     $<$<BOOL:${DIFFUSION_SERVER_ENABLE_SAM3_CUDA}>:DIFFUSION_SERVER_ENABLE_SAM3_CUDA=1>
+    $<$<BOOL:${DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA}>:DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA=1>
     $<$<BOOL:${DIFFUSION_SERVER_ENABLE_MCP}>:DIFFUSION_SERVER_ENABLE_MCP=1>)
 
 target_compile_options(diffusion-server PRIVATE -Wall -Wextra -Wno-unused-function -Wno-unused-parameter)
@@ -89,4 +91,23 @@ if(DIFFUSION_SERVER_ENABLE_SAM3_CUDA)
         ${ROOT_DIR}/cuda/sam3)
     set_source_files_properties(${ROOT_DIR}/cuda/sam3/cuda_sam3_runner.c
         PROPERTIES COMPILE_DEFINITIONS "CUDA_SAM3_RUNNER_EXTERNAL_IMPLS=1")
+endif()
+
+if(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
+    if(NOT DIFFUSION_SERVER_ENABLE_SAM3)
+        message(FATAL_ERROR "DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA requires DIFFUSION_SERVER_ENABLE_SAM3 (for the shared BPE tokenizer / stb helpers)")
+    endif()
+    # SAM3.1 CUDA runner — reuses cuew from the sam3 CUDA build when present,
+    # otherwise links it directly here.
+    target_sources(diffusion-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/server_sam3_1_cuda.c
+        ${ROOT_DIR}/cuda/sam3.1/cuda_sam3_1_runner.c)
+    if(NOT DIFFUSION_SERVER_ENABLE_SAM3_CUDA)
+        target_sources(diffusion-server PRIVATE ${ROOT_DIR}/cuda/cuew.c)
+        target_include_directories(diffusion-server PRIVATE ${ROOT_DIR}/cuda)
+    endif()
+    target_include_directories(diffusion-server PRIVATE
+        ${ROOT_DIR}/cuda/sam3.1)
+    set_source_files_properties(${ROOT_DIR}/cuda/sam3.1/cuda_sam3_1_runner.c
+        PROPERTIES COMPILE_DEFINITIONS "CUDA_SAM3_1_RUNNER_EXTERNAL_IMPLS=1")
 endif()
