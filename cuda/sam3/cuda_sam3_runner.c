@@ -14,10 +14,20 @@
 #include "../cuew.h"
 #include "../cuda_kernels_common.h"
 #include "cuda_sam3_kernels.h"
+/* CUDA_RUNNER_COMMON_IMPLEMENTATION expands to file-scope `static` helpers,
+ * so each TU keeps its own copy — always define here.
+ *
+ * SAFETENSORS_IMPLEMENTATION emits external-linkage symbols. When this TU is
+ * linked alongside another that already supplies them (e.g. the diffusion
+ * server links server.c which carries SAFETENSORS_IMPLEMENTATION), define
+ * CUDA_SAM3_RUNNER_EXTERNAL_IMPLS=1 to skip ours and avoid duplicate symbols.
+ * The standalone cuda/sam3 build is unaffected. */
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 #include "../cuda_hip_compat.h"
+#ifndef CUDA_SAM3_RUNNER_EXTERNAL_IMPLS
 #define SAFETENSORS_IMPLEMENTATION
+#endif
 #include "../../common/safetensors.h"
 
 #include <math.h>
@@ -646,6 +656,10 @@ cuda_sam3_ctx *cuda_sam3_create(const cuda_sam3_config *cfg) {
             cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
         }
         c->sm = major * 10 + minor;
+        /* MMA tensor-core path is now correct after fixing the m16n8k16
+         * fragment-A layout in cuda_kernels_common.h (a1/a2 were swapped on
+         * sm_70-90). Default back to MMA on sm >= 80; SAM3_GEMM=tiled is
+         * available as an escape hatch. */
         const char *force = getenv("SAM3_GEMM");
         int force_tiled = (force && (!strcmp(force, "tiled") || !strcmp(force, "TILED")));
         c->use_mma = (c->sm >= 80) && !force_tiled;
