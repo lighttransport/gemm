@@ -161,13 +161,13 @@ latent mismatches that will surface during verification:
 
 PyTorch reference dumps live at `/tmp/sam3.1_ref/` produced by
 `ref/sam3.1/gen_image_ref.py` (uses Meta's `build_sam3_image_model` on
-`/mnt/disk01/models/sam3.1/sam3.1_multiplex.pt` with an fp32
+`<path-to-models>/sam3.1/sam3.1_multiplex.pt` with an fp32
 `addmm_act` monkey-patch — Meta's fused kernel hard-codes bf16).
 
 ## Smoke test
 ```
 SAM31_VISION_ONLY=1 ./verify_patch_embed \
-    --ckpt /mnt/disk01/models/sam3.1/sam3.1.model.safetensors \
+    --ckpt <path-to-models>/sam3.1/sam3.1.model.safetensors \
     --refdir /tmp/sam3.1_ref
 # → patch_embed: max_abs=2.807e-03 mean_abs=1.209e-04
 ```

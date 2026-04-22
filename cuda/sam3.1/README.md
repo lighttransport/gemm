@@ -21,8 +21,8 @@ Produces `test_cuda_sam3_1` plus `verify_*` binaries (same set as `cuda/sam3/`).
 - Safetensors top-level prefix changed from `detector_model.` to `detector.`.
 - `Makefile` updated (source names, default `CKPT` path, reuses
   `cpu/sam3/sam3_clip_bpe.{c,h}` which is architecture-independent).
-- Weight converter: `convert_pt_to_safetensors.py` (flat `.pt` → safetensors,
-  default path now `/mnt/disk01/models/sam3.1/sam3.1.model.safetensors`).
+- Weight converter: `convert_pt_to_safetensors.py` (flat `.pt` → safetensors;
+  pass `--pt <multiplex.pt> --out <model.safetensors>`).
 - **ViT backbone loader ported** (2026-04-22): entry-level `patch_embed` +
   `ln_pre` and all 32 blocks (`backbone.vision_backbone.trunk.blocks.N.*`,
   `attn.qkv`/`attn.proj`, `norm1/norm2`, `mlp.fc1/fc2`) load without errors.
