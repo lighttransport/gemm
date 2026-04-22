@@ -61,7 +61,7 @@ $(VERIFY_FINAL): verify_final.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS)
 $(VERIFY_MMA): verify_mma_gemm.c $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h ../cuda_kernels_common.h
 	$(CC) $(CFLAGS) -o $@ verify_mma_gemm.c $(CUEW_SRC) $(LDFLAGS)
 
-CKPT   ?= /mnt/disk01/models/sam3.1/sam3.1.model.safetensors
+CKPT   ?= $(MODELS)/sam3.1/sam3.1.model.safetensors
 REFDIR ?= /tmp/sam3_ref_cat
 
 verify-patch-embed: $(VERIFY_PE)
