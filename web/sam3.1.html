@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SAM 3 / 3.1 Segmentation</title>
+  <title>SAM 3.1 Segmentation</title>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
@@ -43,8 +43,8 @@
 <body>
 <div id="toast"></div>
 <main>
-  <h1>SAM 3 segmentation
-    <span class="pill" id="modelPill">sam3</span>
+  <h1>SAM 3.1 segmentation
+    <span class="pill warn" id="modelPill">sam3.1</span>
   </h1>
   <div class="sub">Text-prompted instance segmentation. POSTs <code>/v1/infer</code> with the selected backend.</div>
 
@@ -52,15 +52,13 @@
     <div class="row">
       <div>
         <label for="model">Model</label>
-        <select id="model">
-          <option value="sam3">sam3</option>
-          <option value="sam3.1">sam3.1 (pending runner)</option>
+        <select id="model" disabled>
+          <option value="sam3.1" selected>sam3.1</option>
         </select>
       </div>
       <div>
         <label for="backend">Backend</label>
         <select id="backend">
-          <option value="cpu">cpu</option>
           <option value="cuda">cuda</option>
         </select>
       </div>

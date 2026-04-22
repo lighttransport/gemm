@@ -39,7 +39,7 @@ static void *read_npy(const char *path, int *nd, int *dims, size_t *esz)
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
+    const char *refdir = "/tmp/sam3.1_ref";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt") && i+1 < argc) ckpt = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
@@ -75,7 +75,11 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "ours: (%d, %d)\n", n_tok, D);
 
-    snprintf(path, sizeof(path), "%s/vit_embed.npy", refdir);
+    /* sam3.1 has no learned pos_embed; Phase 1 output is patch_embed only
+     * (conv 14×14 stride 14). ln_pre is applied downstream inside the ViT
+     * loop. Ref is (1, 72, 72, 1024) HWC; ours is (5184, 1024) row-major
+     * which matches H*W flatten. */
+    snprintf(path, sizeof(path), "%s/patch_embed.npy", refdir);
     float *ref = (float *)read_npy(path, &nd, dims, &esz);
     if (!ref) {
         fprintf(stderr, "no ref %s — dumping ours[0][:8] only\n", path);
@@ -88,7 +92,7 @@ int main(int argc, char **argv)
             if (d > mx) mx = d;
             sum += d;
         }
-        fprintf(stderr, "vit_embed: max_abs=%.3e mean_abs=%.3e\n",
+        fprintf(stderr, "patch_embed: max_abs=%.3e mean_abs=%.3e\n",
                 mx, sum / (double)n);
         free(ref);
     }

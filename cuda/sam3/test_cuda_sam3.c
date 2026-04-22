@@ -40,7 +40,8 @@ static void usage(const char *p) {
     fprintf(stderr,
         "Usage: %s <ckpt> <image> --phrase \"cat\" [-o mask.npy]\n"
         "       [--vocab vocab.json] [--merges merges.txt]\n"
-        "       [--score-thr 0.3] [--mask-thr 0.5]\n", p);
+        "       [--score-thr 0.3] [--mask-thr 0.5]\n"
+        "       [--precision fp16|fp32|bf16|fp8]   (default fp16; bf16/fp8 fall back)\n", p);
 }
 
 int main(int argc, char **argv) {
@@ -53,6 +54,7 @@ int main(int argc, char **argv) {
     const char *vocab  = "vocab.json";
     const char *merges = "merges.txt";
     float score_thr = 0.3f, mask_thr = 0.5f;
+    const char *precision = "fp16";
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--phrase") && i+1 < argc) phrase = argv[++i];
@@ -61,6 +63,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--merges") && i+1 < argc) merges = argv[++i];
         else if (!strcmp(argv[i], "--score-thr") && i+1 < argc) score_thr = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--mask-thr")  && i+1 < argc) mask_thr  = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--precision") && i+1 < argc) precision = argv[++i];
         else { usage(argv[0]); return 1; }
     }
     if (!phrase) { fprintf(stderr, "--phrase required\n"); return 1; }
@@ -77,7 +80,8 @@ int main(int argc, char **argv) {
     sam3_clip_bpe_free(tok);
 
     cuda_sam3_config cfg = { .ckpt_path = ckpt, .image_size = 1008,
-                             .device_ordinal = 0, .verbose = 1 };
+                             .device_ordinal = 0, .verbose = 1,
+                             .precision = precision };
     cuda_sam3_ctx *ctx = cuda_sam3_create(&cfg);
     if (!ctx) { stbi_image_free(rgb); return 4; }
 

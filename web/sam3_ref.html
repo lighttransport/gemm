@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SAM 3 / 3.1 Segmentation</title>
+  <title>SAM 3.0 Segmentation — PyTorch ref</title>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
@@ -13,14 +13,13 @@
     form, .panel { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
     label { display: block; font-size: 13px; font-weight: 650; margin: 10px 0 6px; }
     input, select, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 9px 10px; background: #fff; }
-    button { margin-top: 14px; background: #1b6f5f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
+    button { margin-top: 14px; background: #5b3b8f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
     button[disabled] { background: #9aa4b1; cursor: not-allowed; }
     button.cancel { background: #b94a48; }
     .btn-row { display: flex; gap: 10px; margin-top: 14px; }
     .btn-row button { margin-top: 0; }
     .status { margin-top: 8px; font-size: 12px; color: #6a7180; min-height: 16px; }
     .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
-    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .canvas-wrap { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
     .canvas-wrap canvas { max-width: 640px; border: 1px solid #d9dde5; border-radius: 6px; background: #1a1c20; }
     .masks { flex: 1 1 280px; min-width: 240px; }
@@ -31,8 +30,7 @@
     .meta { font-size: 12px; color: #6a7180; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #15171a; color: #e6e8ec; padding: 12px; border-radius: 6px; max-height: 240px; overflow: auto; font-size: 12px; }
     details summary { cursor: pointer; font-size: 13px; color: #4d5563; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e6f3ef; color: #1b6f5f; margin-left: 8px; }
-    .pill.warn { background: #fdf0e2; color: #a55a14; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #efeaf7; color: #5b3b8f; margin-left: 8px; }
     #toast { position: fixed; top: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(420px, 90vw); }
     .toast-item { pointer-events: auto; background: #15171a; color: #fff; padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.18); font-size: 13px; line-height: 1.35; border-left: 4px solid #8a8f98; cursor: pointer; word-break: break-word; }
     .toast-item.error { border-left-color: #e5484d; background: #2a1416; }
@@ -43,39 +41,40 @@
 <body>
 <div id="toast"></div>
 <main>
-  <h1>SAM 3 segmentation
-    <span class="pill" id="modelPill">sam3</span>
+  <h1>SAM 3.0 segmentation
+    <span class="pill" id="modelPill">pytorch-ref</span>
   </h1>
-  <div class="sub">Text-prompted instance segmentation. POSTs <code>/v1/infer</code> with the selected backend.</div>
+  <div class="sub">
+    PyTorch-reference runner for SAM 3.0 via HF transformers
+    (ground truth, for side-by-side comparison against the C runner).
+    POSTs <code>/v1/infer</code>. Endpoint is configurable via
+    <code>window.SERVER_URL</code>.
+  </div>
 
   <form id="form" class="panel">
     <div class="row">
       <div>
-        <label for="model">Model</label>
-        <select id="model">
-          <option value="sam3">sam3</option>
-          <option value="sam3.1">sam3.1 (pending runner)</option>
-        </select>
-      </div>
-      <div>
-        <label for="backend">Backend</label>
+        <label for="backend">Backend (torch device)</label>
         <select id="backend">
-          <option value="cpu">cpu</option>
           <option value="cuda">cuda</option>
+          <option value="cpu">cpu</option>
         </select>
       </div>
       <div>
         <label for="precision">Precision</label>
         <select id="precision">
-          <option value="fp16" selected>fp16 (MMA, fast)</option>
-          <option value="fp32">fp32 (tiled, accurate)</option>
-          <option value="bf16">bf16 (N/I → fp16)</option>
-          <option value="fp8">fp8 (N/I → fp16)</option>
+          <option value="fp32" selected>fp32</option>
+          <option value="fp16">fp16</option>
+          <option value="bf16">bf16</option>
         </select>
       </div>
       <div>
         <label for="image">Image</label>
         <input id="image" type="file" accept="image/*">
+      </div>
+      <div>
+        <label for="server">Server</label>
+        <input id="server" value="">
       </div>
     </div>
 
@@ -92,7 +91,7 @@
     </details>
 
     <div class="btn-row">
-      <button type="submit" id="go">Segment</button>
+      <button type="submit" id="go">Segment (ref)</button>
       <button type="button" id="cancel" class="cancel" disabled>Cancel</button>
     </div>
     <div class="status" id="status"></div>
@@ -153,8 +152,11 @@ const COLORS = [
   [244, 143, 177], [156, 204, 101], [102, 187, 106], [171, 71, 188]
 ];
 
-let srcImage = null;     // HTMLImageElement
-let masks = [];          // [{img: HTMLImageElement, score, box, color, on}]
+// Default to same-origin so opening the page at :8081 just works.
+$('server').value = window.SERVER_URL || location.origin;
+
+let srcImage = null;
+let masks = [];
 
 function readFile(file) {
   return new Promise((res, rej) => {
@@ -182,7 +184,6 @@ function redraw() {
   const ctx = c.getContext('2d');
   ctx.drawImage(srcImage, 0, 0);
 
-  // Overlay each enabled mask with its color at alpha.
   const tmp = document.createElement('canvas');
   tmp.width = W; tmp.height = H;
   const tctx = tmp.getContext('2d');
@@ -195,12 +196,11 @@ function redraw() {
     const [r, g, b] = m.color;
     const data = id.data;
     for (let i = 0; i < data.length; i += 4) {
-      // mask PNG is grayscale (R=G=B, A=255). Treat any nonzero R as mask hit.
       if (data[i] > 127) {
         data[i]   = r;
         data[i+1] = g;
         data[i+2] = b;
-        data[i+3] = 140; // alpha
+        data[i+3] = 140;
       } else {
         data[i+3] = 0;
       }
@@ -208,7 +208,6 @@ function redraw() {
     tctx.putImageData(id, 0, 0);
     ctx.drawImage(tmp, 0, 0);
 
-    // box outline
     ctx.strokeStyle = `rgb(${r},${g},${b})`;
     ctx.lineWidth = Math.max(2, Math.round(W / 400));
     const [x0, y0, x1, y1] = m.box;
@@ -239,29 +238,8 @@ function buildMaskList() {
   });
 }
 
-function syncModelUI(value) {
-  $('modelPill').textContent = value;
-  $('modelPill').className = 'pill' + (value === 'sam3.1' ? ' warn' : '');
-  document.title = value === 'sam3.1'
-    ? 'SAM 3.1 Segmentation (preview)'
-    : 'SAM 3 Segmentation';
-}
-
-$('model').addEventListener('change', e => syncModelUI(e.target.value));
-
-/* Pick the initial model from the URL path: /sam3.1 -> sam3.1, /sam3 -> sam3.
- * Falls back to whatever the <select> says (default first <option>). */
-(function initFromPath() {
-  const p = location.pathname.replace(/\/+$/, '');
-  let m = null;
-  if (p === '/sam3.1' || p.endsWith('/sam3.1')) m = 'sam3.1';
-  else if (p === '/sam3' || p.endsWith('/sam3') || p.endsWith('/sam3.html')) m = 'sam3';
-  if (m) $('model').value = m;
-  syncModelUI($('model').value);
-})();
-
-let activeAbort = null;       // AbortController for in-flight fetch
-let elapsedTimer = null;      // setInterval id for ticking the status line
+let activeAbort = null;
+let elapsedTimer = null;
 
 function setRunning(on) {
   $('go').disabled = on;
@@ -272,7 +250,7 @@ function startElapsed(t0) {
   stopElapsed();
   elapsedTimer = setInterval(() => {
     const s = ((performance.now() - t0) / 1000).toFixed(1);
-    $('status').textContent = `Inference running… ${s}s (Cancel detaches the request; the server keeps computing until it finishes)`;
+    $('status').textContent = `Inference running… ${s}s`;
   }, 100);
 }
 
@@ -295,10 +273,9 @@ $('form').addEventListener('submit', async ev => {
   $('log').textContent = 'Encoding image and POSTing /v1/infer...';
   $('status').textContent = '';
 
-  // If a previous request is somehow still active, abort it first.
   if (activeAbort) { try { activeAbort.abort(); } catch (_) {} }
   activeAbort = new AbortController();
-  const myAbort = activeAbort; // capture
+  const myAbort = activeAbort;
 
   try {
     const b64 = await readFile(file);
@@ -309,7 +286,7 @@ $('form').addEventListener('submit', async ev => {
     $('resultPanel').hidden = false;
 
     const payload = {
-      model: $('model').value,
+      model: 'sam3',
       task: 'segmentation',
       backend: $('backend').value,
       inputs: { text: $('text').value, image_base64: b64 },
@@ -318,13 +295,14 @@ $('form').addEventListener('submit', async ev => {
         score_threshold: parseFloat($('score').value) || 0.3,
         mask_threshold:  parseFloat($('mask').value)  || 0.5,
         max_masks:       parseInt($('maxn').value, 10) || 8,
-        precision:       $('precision') ? $('precision').value : 'fp16'
+        precision:       $('precision') ? $('precision').value : 'fp32'
       }
     };
 
+    const base = ($('server').value || location.origin).replace(/\/+$/, '');
     const t0 = performance.now();
     startElapsed(t0);
-    const res = await fetch('/v1/infer', {
+    const res = await fetch(base + '/v1/infer', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -356,7 +334,7 @@ $('form').addEventListener('submit', async ev => {
   } catch (err) {
     stopElapsed();
     if (err && err.name === 'AbortError') {
-      $('log').textContent = 'Request canceled by user.\nNote: the server-side computation continues until completion (no internal cancel hook in the sam3 runner). The next /v1/infer will be queued behind it.';
+      $('log').textContent = 'Request canceled by user.\nNote: the PyTorch ref server continues computing until finished.';
       $('status').textContent = 'Canceled.';
     } else {
       const msg = String(err && err.message || err);

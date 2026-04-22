@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static double cuda_now_ms(void) {
     struct timespec ts;
@@ -42,14 +43,18 @@ static double cuda_now_ms(void) {
 static cuda_sam3_ctx *g_cuda_ctx        = NULL;
 static char          *g_cuda_ckpt       = NULL;
 static int            g_cuda_device_ord = -1;
+static char          *g_cuda_precision  = NULL;
 
 static cuda_sam3_ctx *cuda_get_or_create_ctx(const char *ckpt_path, int device_ord,
+                                              const char *precision,
                                               char *err_buf, size_t err_cap,
                                               int *out_was_cached) {
     *out_was_cached = 0;
+    const char *prec = (precision && *precision) ? precision : "fp16";
     if (g_cuda_ctx && g_cuda_ckpt &&
         strcmp(g_cuda_ckpt, ckpt_path) == 0 &&
-        g_cuda_device_ord == device_ord) {
+        g_cuda_device_ord == device_ord &&
+        g_cuda_precision && strcmp(g_cuda_precision, prec) == 0) {
         *out_was_cached = 1;
         return g_cuda_ctx;
     }
@@ -59,12 +64,15 @@ static cuda_sam3_ctx *cuda_get_or_create_ctx(const char *ckpt_path, int device_o
     }
     free(g_cuda_ckpt);
     g_cuda_ckpt = NULL;
+    free(g_cuda_precision);
+    g_cuda_precision = NULL;
 
     cuda_sam3_config cfg = {
         .ckpt_path      = ckpt_path,
         .image_size     = 1008,
         .device_ordinal = device_ord,
         .verbose        = 1,
+        .precision      = prec,
     };
     double t0 = cuda_now_ms();
     fprintf(stderr, "sam3-cuda: NVRTC compile + weight upload to device %d (one-time, will be cached) ...\n",
@@ -79,6 +87,7 @@ static cuda_sam3_ctx *cuda_get_or_create_ctx(const char *ckpt_path, int device_o
     g_cuda_ctx        = ctx;
     g_cuda_ckpt       = strdup(ckpt_path);
     g_cuda_device_ord = device_ord;
+    g_cuda_precision  = strdup(prec);
     return ctx;
 }
 
@@ -105,6 +114,7 @@ int server_sam3_cuda_segment(const char *ckpt_path,
                               const char *phrase,
                               float score_thr, float mask_thr,
                               int device_ordinal,
+                              const char *precision,
                               server_sam3_mask *out_masks, int out_cap,
                               int *out_n,
                               char *err_buf, size_t err_cap);
@@ -116,6 +126,7 @@ int server_sam3_cuda_segment(const char *ckpt_path,
                               const char *phrase,
                               float score_thr, float mask_thr,
                               int device_ordinal,
+                              const char *precision,
                               server_sam3_mask *out_masks, int out_cap,
                               int *out_n,
                               char *err_buf, size_t err_cap) {
@@ -134,6 +145,26 @@ int server_sam3_cuda_segment(const char *ckpt_path,
     }
     if (!img_bytes || img_len == 0) {
         snprintf(err_buf, err_cap, "image bytes missing");
+        return 1;
+    }
+    /* Validate file paths upfront so an invalid ckpt/vocab/merges fails
+     * fast instead of first spending 15-30 s on NVRTC compile inside
+     * cuda_sam3_create. Skipped when the ctx is already cached. */
+    const char *prec_eff = (precision && *precision) ? precision : "fp16";
+    int _cached_match = (g_cuda_ctx && g_cuda_ckpt &&
+                         strcmp(g_cuda_ckpt, ckpt_path) == 0 &&
+                         g_cuda_device_ord == device_ordinal &&
+                         g_cuda_precision && strcmp(g_cuda_precision, prec_eff) == 0);
+    if (!_cached_match && access(ckpt_path, R_OK) != 0) {
+        snprintf(err_buf, err_cap, "sam3 ckpt not readable: %s", ckpt_path);
+        return 1;
+    }
+    if (access(vocab_path, R_OK) != 0) {
+        snprintf(err_buf, err_cap, "sam3 vocab not readable: %s", vocab_path);
+        return 1;
+    }
+    if (access(merges_path, R_OK) != 0) {
+        snprintf(err_buf, err_cap, "sam3 merges not readable: %s", merges_path);
         return 1;
     }
 
@@ -161,7 +192,7 @@ int server_sam3_cuda_segment(const char *ckpt_path,
     }
 
     int was_cached = 0;
-    cuda_sam3_ctx *ctx = cuda_get_or_create_ctx(ckpt_path, device_ordinal,
+    cuda_sam3_ctx *ctx = cuda_get_or_create_ctx(ckpt_path, device_ordinal, prec_eff,
                                                  err_buf, err_cap, &was_cached);
     if (!ctx) {
         stbi_image_free(rgb);
