@@ -27,8 +27,11 @@ request GET /health
 echo "[smoke] GET /models"
 request GET /models
 
-echo "[smoke] POST /v1/infer (sam3 stub)"
-request POST /v1/infer '{"model":"sam3","task":"segmentation","backend":"cpu","inputs":{"text":"cat"}}'
+echo "[smoke] POST /v1/infer (sam3 — expect 'ckpt path not set' unless --sam3-ckpt was passed)"
+request POST /v1/infer '{"model":"sam3","task":"segmentation","backend":"cpu","inputs":{"text":"cat","image_base64":"aGVsbG8="}}'
+
+echo "[smoke] POST /v1/infer (sam3.1 — expect 501 pending_runner)"
+request POST /v1/infer '{"model":"sam3.1","task":"segmentation","backend":"cpu","inputs":{"text":"cat","image_base64":"aGVsbG8="}}'
 
 echo "[smoke] POST /v1/infer (unsupported qwen backend)"
 request POST /v1/infer '{"model":"qwen-image","task":"text-to-image","backend":"cuda","inputs":{"text":"cat"},"params":{"width":64,"height":64,"steps":1}}'

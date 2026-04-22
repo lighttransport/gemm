@@ -32,6 +32,10 @@
 #include "../rdna4/qimg/hip_qimg_runner.h"
 #endif
 
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3)
+#include "server_sam3.h"
+#endif
+
 #include "../common/qwen_image_text_encoder.h"
 #include "../common/qwen_image_dit.h"
 #include "../common/qwen_image_vae.h"
@@ -64,6 +68,10 @@ typedef struct {
     const char *qwen_vae;
     const char *qwen_enc;
     const char *qwen_enc_bias;
+    const char *sam3_ckpt;
+    const char *sam3_ckpt_v31;
+    const char *sam3_vocab;
+    const char *sam3_merges;
     int device;
     int mcp_stdio;
     int stdio_mode;
@@ -221,6 +229,12 @@ static unsigned long long json_u64(const json_val *obj, const char *key, unsigne
     return (unsigned long long)v->num;
 }
 
+static double json_f64(const json_val *obj, const char *key, double def) {
+    json_val *v = json_obj_get(obj, key);
+    if (!v || v->type != JSON_NUMBER) return def;
+    return v->num;
+}
+
 static json_val *json_obj(const json_val *obj, const char *key) {
     json_val *v = json_obj_get(obj, key);
     return (v && v->type == JSON_OBJECT) ? v : NULL;
@@ -245,6 +259,58 @@ static char *base64_encode(const uint8_t *data, size_t len) {
         out[o++] = rem > 2 ? b64_table[v & 63] : '=';
     }
     out[o] = 0;
+    return out;
+}
+
+/* base64 decode (whitespace-tolerant, stops at '=' or end). Returns caller-free
+ * byte buffer or NULL on invalid input. */
+uint8_t *base64_decode_buf(const char *s, size_t in_len, size_t *out_len);
+uint8_t *base64_decode_buf(const char *s, size_t in_len, size_t *out_len) {
+    size_t n = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        char c = s[i];
+        if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+        if (c == '=') break;
+        n++;
+    }
+    size_t pad = (4 - (n % 4)) % 4;
+    size_t out_cap = ((n + pad) / 4) * 3;
+    uint8_t *out = (uint8_t *)malloc(out_cap + 4);
+    if (!out) return NULL;
+    static const int8_t tbl[256] = {
+        ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,['I']=8,
+        ['J']=9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,['Q']=16,
+        ['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,['Y']=24,
+        ['Z']=25,
+        ['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,['g']=32,['h']=33,
+        ['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,['o']=40,['p']=41,
+        ['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,['w']=48,['x']=49,
+        ['y']=50,['z']=51,
+        ['0']=52,['1']=53,['2']=54,['3']=55,['4']=56,['5']=57,['6']=58,['7']=59,
+        ['8']=60,['9']=61,['+']=62,['/']=63,
+    };
+    size_t oi = 0;
+    int buf[4]; int bc = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+        if (c == '=') break;
+        int v = tbl[c];
+        if (v == 0 && c != 'A') { free(out); return NULL; }
+        buf[bc++] = v;
+        if (bc == 4) {
+            out[oi++] = (uint8_t)((buf[0] << 2) | (buf[1] >> 4));
+            out[oi++] = (uint8_t)(((buf[1] & 0xF) << 4) | (buf[2] >> 2));
+            out[oi++] = (uint8_t)(((buf[2] & 0x3) << 6) | buf[3]);
+            bc = 0;
+        }
+    }
+    if (bc == 2) out[oi++] = (uint8_t)((buf[0] << 2) | (buf[1] >> 4));
+    else if (bc == 3) {
+        out[oi++] = (uint8_t)((buf[0] << 2) | (buf[1] >> 4));
+        out[oi++] = (uint8_t)(((buf[1] & 0xF) << 4) | (buf[2] >> 2));
+    }
+    *out_len = oi;
     return out;
 }
 
@@ -606,6 +672,37 @@ static char *build_qwen_infer_body_from_mcp_args(json_val *args) {
     return b.ptr;
 }
 
+/* Build a sam3 segmentation infer-body from MCP tool arguments. */
+static char *build_sam3_infer_body_from_mcp_args(json_val *args, const char *model_id) {
+    const char *backend = args ? json_str(args, "backend", "cpu") : "cpu";
+    const char *text = args ? json_str(args, "text", "") : "";
+    const char *image_b64 = args ? json_str(args, "image_base64", "") : "";
+    char *be = json_escape_dup(backend);
+    char *tx = json_escape_dup(text);
+    char *ib = json_escape_dup(image_b64);
+    sbuf b;
+    sbuf_init(&b);
+    sbuf_printf(&b,
+        "{\"model\":\"%s\",\"task\":\"segmentation\",\"backend\":\"%s\","
+        "\"inputs\":{\"text\":\"%s\",\"image_base64\":\"%s\"},\"weights\":",
+        model_id, be, tx, ib);
+    json_val *weights = args ? json_obj(args, "weights") : NULL;
+    if (weights) json_append_value(&b, weights); else sbuf_append(&b, "{}");
+    sbuf_append(&b, ",\"params\":");
+    json_val *params = args ? json_obj(args, "params") : NULL;
+    if (params) json_append_value(&b, params);
+    else {
+        double st = args ? json_f64(args, "score_threshold", 0.3) : 0.3;
+        double mt = args ? json_f64(args, "mask_threshold",  0.5) : 0.5;
+        int mm    = args ? json_int(args, "max_masks",       16)  : 16;
+        sbuf_printf(&b, "{\"score_threshold\":%.3f,\"mask_threshold\":%.3f,\"max_masks\":%d}",
+                    st, mt, mm);
+    }
+    sbuf_append(&b, "}");
+    free(be); free(tx); free(ib);
+    return b.ptr;
+}
+
 static char *mcp_error_result_json(const char *idbuf, const char *message) {
     char *em = json_escape_dup(message ? message : "error");
     sbuf out;
@@ -664,6 +761,47 @@ static char *mcp_qwen_result_from_infer(const char *idbuf, const char *infer_res
         "{\"type\":\"image\",\"mimeType\":\"%s\",\"data\":\"%s\"}]}}",
         idbuf, width, height, emime, b64);
     free(emime);
+    json_free(root);
+    return out.ptr;
+}
+
+/* Wrap a sam3 segmentation infer response into MCP tool-call result form. */
+static char *mcp_sam3_result_from_infer(const char *idbuf, const char *infer_resp, int status) {
+    json_val *root = json_parse(infer_resp, (int)strlen(infer_resp));
+    if (!root || root->type != JSON_OBJECT) {
+        if (root) json_free(root);
+        return mcp_error_result_json(idbuf, "failed to parse inference response");
+    }
+    json_val *okv = json_obj_get(root, "ok");
+    int ok = (okv && okv->type == JSON_TRUE);
+    if (!ok || status != 200) {
+        json_val *err = json_obj(root, "error");
+        const char *msg = err ? json_str(err, "message", "inference failed") : "inference failed";
+        char *msg_copy = xstrdup(msg ? msg : "inference failed");
+        json_free(root);
+        char *out = mcp_error_result_json(idbuf, msg_copy ? msg_copy : "inference failed");
+        free(msg_copy);
+        return out;
+    }
+    json_val *outputs = json_obj_get(root, "outputs");
+    int nm = (outputs && outputs->type == JSON_ARRAY) ? outputs->arr.count : 0;
+    sbuf out; sbuf_init(&out);
+    sbuf_printf(&out,
+        "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"isError\":false,"
+        "\"content\":[{\"type\":\"text\",\"text\":\"sam3: %d masks\"}",
+        idbuf, nm);
+    for (int i = 0; i < nm; i++) {
+        json_val *m = &outputs->arr.items[i];
+        if (m->type != JSON_OBJECT) continue;
+        const char *mime = json_str(m, "mime", "image/png");
+        const char *b64  = json_str(m, "data_base64", "");
+        if (!b64 || !b64[0]) continue;
+        char *em = json_escape_dup(mime);
+        sbuf_printf(&out,
+            ",{\"type\":\"image\",\"mimeType\":\"%s\",\"data\":\"%s\"}", em, b64);
+        free(em);
+    }
+    sbuf_append(&out, "]}}");
     json_free(root);
     return out.ptr;
 }
@@ -727,9 +865,185 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
             }
             pthread_mutex_unlock(&g_infer_mu);
         }
-    } else if (strcmp(model, "sam3") == 0 && strcmp(task, "segmentation") == 0) {
-        snprintf(err, sizeof(err), "sam3 segmentation is a stub in this server build; native cpu/hip runners are not present yet");
+    } else if ((strcmp(model, "sam3") == 0 || strcmp(model, "sam3.1") == 0)
+               && strcmp(task, "segmentation") == 0) {
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3)
+        if (strcmp(model, "sam3.1") == 0) {
+            /* sam3.1: only cuda/sam3.1 scaffold exists, runner port in progress.
+             * See cuda/sam3.1/PORT.md for required kernel work. */
+            snprintf(err, sizeof(err),
+                "sam3.1 runner port is in progress (see cuda/sam3.1/PORT.md); "
+                "no executable backend wired into the server yet");
+            *status = 501;
+        } else if (strcmp(backend, "cpu") != 0 && strcmp(backend, "cuda") != 0) {
+            snprintf(err, sizeof(err),
+                "sam3 backend '%s' not yet wired into the server; use backend=cpu or cuda", backend);
+            *status = 501;
+        } else if (strcmp(backend, "cuda") == 0) {
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_CUDA)
+            const char *ckpt = weights ? json_str(weights, "ckpt",
+                                    cfg->sam3_ckpt ? cfg->sam3_ckpt : "")
+                                       : (cfg->sam3_ckpt ? cfg->sam3_ckpt : "");
+            const char *vocab = weights ? json_str(weights, "vocab",
+                                    cfg->sam3_vocab ? cfg->sam3_vocab : "")
+                                        : (cfg->sam3_vocab ? cfg->sam3_vocab : "");
+            const char *merges = weights ? json_str(weights, "merges",
+                                    cfg->sam3_merges ? cfg->sam3_merges : "")
+                                         : (cfg->sam3_merges ? cfg->sam3_merges : "");
+            const char *phrase  = inputs ? json_str(inputs, "text", "") : "";
+            const char *img_b64 = inputs ? json_str(inputs, "image_base64", "") : "";
+            float score_thr = params ? (float)json_f64(params, "score_threshold", 0.3) : 0.3f;
+            float mask_thr  = params ? (float)json_f64(params, "mask_threshold",  0.5) : 0.5f;
+            int device_ord  = params ? json_int(params, "device", cfg->device) : cfg->device;
+            int max_masks   = params ? json_int(params, "max_masks", 16) : 16;
+            if (max_masks < 1) max_masks = 1;
+            if (max_masks > 64) max_masks = 64;
+
+            size_t img_len = 0;
+            uint8_t *img_bytes = NULL;
+            if (img_b64 && *img_b64) {
+                extern uint8_t *base64_decode_buf(const char *s, size_t in_len, size_t *out_len);
+                img_bytes = base64_decode_buf(img_b64, strlen(img_b64), &img_len);
+            }
+            if (!img_bytes) {
+                snprintf(err, sizeof(err), "inputs.image_base64 missing or invalid");
+                *status = 400;
+            } else if (pthread_mutex_trylock(&g_infer_mu) != 0) {
+                free(img_bytes);
+                snprintf(err, sizeof(err), "another inference request is currently running");
+                *status = 429;
+            } else {
+                server_sam3_mask *masks = (server_sam3_mask *)calloc((size_t)max_masks, sizeof(*masks));
+                int n_out = 0;
+                int src = server_sam3_cuda_segment(
+                    ckpt, vocab, merges, img_bytes, img_len, phrase,
+                    score_thr, mask_thr, device_ord,
+                    masks, max_masks, &n_out, err, sizeof(err));
+                free(img_bytes);
+                pthread_mutex_unlock(&g_infer_mu);
+                if (src != 0) {
+                    for (int i = 0; i < n_out; i++) server_sam3_free_mask(&masks[i]);
+                    free(masks);
+                    *status = 500;
+                } else {
+                    char *mm = json_escape_dup(model);
+                    char *tt = json_escape_dup(task);
+                    char *bb = json_escape_dup(backend);
+                    sbuf out; sbuf_init(&out);
+                    sbuf_printf(&out,
+                        "{\"ok\":true,\"model\":\"%s\",\"task\":\"%s\",\"backend\":\"%s\","
+                        "\"outputs\":[", mm, tt, bb);
+                    for (int i = 0; i < n_out; i++) {
+                        char *b64 = base64_encode(masks[i].png, (size_t)masks[i].png_len);
+                        if (!b64) { b64 = xstrdup(""); }
+                        sbuf_printf(&out,
+                            "%s{\"type\":\"mask\",\"mime\":\"image/png\","
+                            "\"width\":%d,\"height\":%d,\"score\":%.6f,"
+                            "\"box\":[%.3f,%.3f,%.3f,%.3f],"
+                            "\"data_base64\":\"%s\"}",
+                            i ? "," : "",
+                            masks[i].width, masks[i].height, masks[i].score,
+                            masks[i].box[0], masks[i].box[1], masks[i].box[2], masks[i].box[3],
+                            b64);
+                        free(b64);
+                        server_sam3_free_mask(&masks[i]);
+                    }
+                    free(masks);
+                    sbuf_printf(&out,
+                        "],\"num_masks\":%d,\"timings_ms\":{\"total\":0}}", n_out);
+                    free(mm); free(tt); free(bb);
+                    json_free(root);
+                    return out.ptr;
+                }
+            }
+#else
+            snprintf(err, sizeof(err),
+                "sam3 cuda backend not compiled (rebuild with -DDIFFUSION_SERVER_ENABLE_SAM3_CUDA=ON)");
+            *status = 501;
+#endif
+        } else {
+            const char *ckpt = weights ? json_str(weights, "ckpt",
+                                    cfg->sam3_ckpt ? cfg->sam3_ckpt : "")
+                                       : (cfg->sam3_ckpt ? cfg->sam3_ckpt : "");
+            const char *vocab = weights ? json_str(weights, "vocab",
+                                    cfg->sam3_vocab ? cfg->sam3_vocab : "")
+                                        : (cfg->sam3_vocab ? cfg->sam3_vocab : "");
+            const char *merges = weights ? json_str(weights, "merges",
+                                    cfg->sam3_merges ? cfg->sam3_merges : "")
+                                         : (cfg->sam3_merges ? cfg->sam3_merges : "");
+            const char *phrase = inputs ? json_str(inputs, "text", "") : "";
+            const char *img_b64 = inputs ? json_str(inputs, "image_base64", "") : "";
+            float score_thr = params ? (float)json_f64(params, "score_threshold", 0.3) : 0.3f;
+            float mask_thr  = params ? (float)json_f64(params, "mask_threshold",  0.5) : 0.5f;
+            int threads     = params ? json_int(params, "threads", 0) : 0;
+            int max_masks   = params ? json_int(params, "max_masks", 16) : 16;
+            if (max_masks < 1) max_masks = 1;
+            if (max_masks > 64) max_masks = 64;
+
+            size_t img_len = 0;
+            uint8_t *img_bytes = NULL;
+            if (img_b64 && *img_b64) {
+                extern uint8_t *base64_decode_buf(const char *s, size_t in_len, size_t *out_len);
+                img_bytes = base64_decode_buf(img_b64, strlen(img_b64), &img_len);
+            }
+            if (!img_bytes) {
+                snprintf(err, sizeof(err), "inputs.image_base64 missing or invalid");
+                *status = 400;
+            } else if (pthread_mutex_trylock(&g_infer_mu) != 0) {
+                free(img_bytes);
+                snprintf(err, sizeof(err), "another inference request is currently running");
+                *status = 429;
+            } else {
+                server_sam3_mask *masks = (server_sam3_mask *)calloc((size_t)max_masks, sizeof(*masks));
+                int n_out = 0;
+                int src = server_sam3_cpu_segment(
+                    ckpt, vocab, merges, img_bytes, img_len, phrase,
+                    score_thr, mask_thr, threads,
+                    masks, max_masks, &n_out, err, sizeof(err));
+                free(img_bytes);
+                pthread_mutex_unlock(&g_infer_mu);
+                if (src != 0) {
+                    for (int i = 0; i < n_out; i++) server_sam3_free_mask(&masks[i]);
+                    free(masks);
+                    *status = 500;
+                } else {
+                    /* Build success JSON here and early-return. */
+                    char *mm = json_escape_dup(model);
+                    char *tt = json_escape_dup(task);
+                    char *bb = json_escape_dup(backend);
+                    sbuf out; sbuf_init(&out);
+                    sbuf_printf(&out,
+                        "{\"ok\":true,\"model\":\"%s\",\"task\":\"%s\",\"backend\":\"%s\","
+                        "\"outputs\":[", mm, tt, bb);
+                    for (int i = 0; i < n_out; i++) {
+                        char *b64 = base64_encode(masks[i].png, (size_t)masks[i].png_len);
+                        if (!b64) { b64 = xstrdup(""); }
+                        sbuf_printf(&out,
+                            "%s{\"type\":\"mask\",\"mime\":\"image/png\","
+                            "\"width\":%d,\"height\":%d,\"score\":%.6f,"
+                            "\"box\":[%.3f,%.3f,%.3f,%.3f],"
+                            "\"data_base64\":\"%s\"}",
+                            i ? "," : "",
+                            masks[i].width, masks[i].height, masks[i].score,
+                            masks[i].box[0], masks[i].box[1], masks[i].box[2], masks[i].box[3],
+                            b64);
+                        free(b64);
+                        server_sam3_free_mask(&masks[i]);
+                    }
+                    free(masks);
+                    sbuf_printf(&out,
+                        "],\"num_masks\":%d,\"timings_ms\":{\"total\":0}}", n_out);
+                    free(mm); free(tt); free(bb);
+                    json_free(root);
+                    return out.ptr;
+                }
+            }
+        }
+#else
+        snprintf(err, sizeof(err),
+            "sam3 support not compiled (rebuild with -DDIFFUSION_SERVER_ENABLE_SAM3=ON)");
         *status = 501;
+#endif
     } else {
         snprintf(err, sizeof(err), "unsupported model/task: %s/%s", model, task);
         *status = 400;
@@ -810,7 +1124,20 @@ static char *models_json(void) {
     return xstrdup(
         "{\"ok\":true,\"models\":["
         "{\"id\":\"qwen-image\",\"tasks\":[\"text-to-image\"],\"backends\":[\"cpu\",\"hip\",\"cuda\",\"vulkan\"]},"
-        "{\"id\":\"sam3\",\"tasks\":[\"segmentation\"],\"backends\":[\"cpu\",\"hip\"],\"status\":\"stub\"}"
+        "{\"id\":\"sam3\",\"tasks\":[\"segmentation\"],\"backends\":["
+        "\"cpu\""
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_CUDA)
+        ",\"cuda\""
+#endif
+        "],\"status\":\""
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3)
+        "ready"
+#else
+        "stub"
+#endif
+        "\"},"
+        "{\"id\":\"sam3.1\",\"tasks\":[\"segmentation\"],\"backends\":[\"cpu\",\"cuda\"],"
+        "\"status\":\"pending_runner\",\"note\":\"see cuda/sam3.1/PORT.md\"}"
         "]}");
 }
 
@@ -869,7 +1196,10 @@ static int path_is_safe(const char *p) {
 
 static void handle_static(int fd, const server_config *cfg, const char *url_path) {
     const char *rel = url_path;
-    if (strcmp(rel, "/") == 0) rel = "/qwen-image.html";
+    if (strcmp(rel, "/") == 0)        rel = "/qwen-image.html";
+    else if (strcmp(rel, "/sam3") == 0)   rel = "/sam3.html";
+    else if (strcmp(rel, "/sam3.1") == 0) rel = "/sam3.html"; /* same UI, sam3.1 toggle */
+    else if (strcmp(rel, "/qwen-image") == 0) rel = "/qwen-image.html";
     if (!path_is_safe(rel)) {
         char *e = json_error_response("bad_path", "invalid static path");
         send_response(fd, 400, "application/json", e, strlen(e));
@@ -1128,12 +1458,18 @@ static int run_mcp_stdio(const server_config *cfg) {
                    "\"properties\":{\"dit\":{\"type\":\"string\"},\"vae\":{\"type\":\"string\"},"
                    "\"text_encoder\":{\"type\":\"string\"},\"text_encoder_bias\":{\"type\":\"string\"}}}}"
                    ",\"required\":[\"prompt\"]}},"
-                   "{\"name\":\"sam3_segment\",\"description\":\"Segment an image with SAM3 (stub in this build)\","
+                   "{\"name\":\"sam3_segment\",\"description\":\"Segment an image by text phrase with SAM 3 (CPU backend)\","
                    "\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false,"
-                   "\"properties\":{\"backend\":{\"type\":\"string\",\"enum\":[\"cpu\",\"hip\"]},"
+                   "\"properties\":{\"backend\":{\"type\":\"string\",\"enum\":[\"cpu\"]},"
                    "\"text\":{\"type\":\"string\"},\"image_base64\":{\"type\":\"string\"},"
-                   "\"image_mime\":{\"type\":\"string\"},\"points\":{\"type\":\"array\"},\"boxes\":{\"type\":\"array\"}}"
-                   "}}"
+                   "\"score_threshold\":{\"type\":\"number\"},\"mask_threshold\":{\"type\":\"number\"},"
+                   "\"max_masks\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64},"
+                   "\"weights\":{\"type\":\"object\",\"additionalProperties\":false,"
+                   "\"properties\":{\"ckpt\":{\"type\":\"string\"},\"vocab\":{\"type\":\"string\"},"
+                   "\"merges\":{\"type\":\"string\"}}}},\"required\":[\"text\",\"image_base64\"]}},"
+                   "{\"name\":\"sam3_1_segment\",\"description\":\"Segment with SAM 3.1 (runner port in progress; currently 501)\","
+                   "\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false,"
+                   "\"properties\":{\"text\":{\"type\":\"string\"},\"image_base64\":{\"type\":\"string\"}}}}"
                    "]}}\n", idbuf);
             fflush(stdout);
         } else if (strcmp(method, "tools/call") == 0) {
@@ -1149,10 +1485,17 @@ static int run_mcp_stdio(const server_config *cfg) {
                 free(mcp_resp);
                 free(resp);
                 free(body);
-            } else if (strcmp(name, "sam3_segment") == 0) {
-                char *mcp_resp = mcp_error_result_json(idbuf, "sam3 segmentation is a stub in this server build");
+            } else if (strcmp(name, "sam3_segment") == 0 ||
+                       strcmp(name, "sam3_1_segment") == 0) {
+                const char *model_id = strcmp(name, "sam3_1_segment") == 0 ? "sam3.1" : "sam3";
+                char *body = build_sam3_infer_body_from_mcp_args(args, model_id);
+                int status = 200;
+                char *resp = infer_json(cfg, body, strlen(body), &status);
+                char *mcp_resp = mcp_sam3_result_from_infer(idbuf, resp, status);
                 mcp_write_json(mcp_resp);
                 free(mcp_resp);
+                free(resp);
+                free(body);
             } else {
                 printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32602,\"message\":\"unknown tool\"}}\n", idbuf);
                 fflush(stdout);
@@ -1182,6 +1525,10 @@ static void usage(const char *prog) {
         "  --qwen-vae <path>\n"
         "  --qwen-enc <path>\n"
         "  --qwen-enc-bias <path>\n"
+        "  --sam3-ckpt <path>       default sam3.model.safetensors\n"
+        "  --sam3-ckpt-v31 <path>   default sam3.1.model.safetensors (not yet runnable)\n"
+        "  --sam3-vocab <path>      CLIP BPE vocab.json\n"
+        "  --sam3-merges <path>     CLIP BPE merges.txt\n"
         "  --device <n>             default 0\n"
         "  --stdio                  line-delimited JSON transport for local debugging\n"
         "  --mcp-stdio              run MCP stdio mode when compiled\n",
@@ -1203,6 +1550,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--qwen-vae") == 0 && i + 1 < argc) cfg.qwen_vae = argv[++i];
         else if (strcmp(argv[i], "--qwen-enc") == 0 && i + 1 < argc) cfg.qwen_enc = argv[++i];
         else if (strcmp(argv[i], "--qwen-enc-bias") == 0 && i + 1 < argc) cfg.qwen_enc_bias = argv[++i];
+        else if (strcmp(argv[i], "--sam3-ckpt") == 0 && i + 1 < argc) cfg.sam3_ckpt = argv[++i];
+        else if (strcmp(argv[i], "--sam3-ckpt-v31") == 0 && i + 1 < argc) cfg.sam3_ckpt_v31 = argv[++i];
+        else if (strcmp(argv[i], "--sam3-vocab") == 0 && i + 1 < argc) cfg.sam3_vocab = argv[++i];
+        else if (strcmp(argv[i], "--sam3-merges") == 0 && i + 1 < argc) cfg.sam3_merges = argv[++i];
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) cfg.device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stdio") == 0) cfg.stdio_mode = 1;
         else if (strcmp(argv[i], "--mcp-stdio") == 0) cfg.mcp_stdio = 1;
