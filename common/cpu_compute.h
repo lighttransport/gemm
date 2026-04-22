@@ -41,13 +41,62 @@ static inline float cpu_hsum_avx(__m256 v) {
 }
 #endif
 
-/* ---- LayerNorm: y = (x - mean) / sqrt(var + eps) * w + b ---- */
+/* ---- LayerNorm: y = (x - mean) / sqrt(var + eps) * w + b ----
+ * AVX2 + OpenMP. Per-token mean/var via 8-lane horizontal reduce, normalize
+ * via FMA. Token loop is OMP-parallel (each token is independent). */
+
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float cpu_hsum256(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+#endif
 
 static void cpu_layernorm(float *dst, const float *src, const float *w,
                            const float *b, int n_tok, int dim, float eps) {
+#if defined(__AVX2__) && defined(__FMA__)
+    if ((dim & 7) == 0) {
+        const float inv_dim = 1.0f / (float)dim;
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int t = 0; t < n_tok; t++) {
+            const float *x = src + (size_t)t * dim;
+            float *y = dst + (size_t)t * dim;
+            __m256 sum = _mm256_setzero_ps();
+            for (int i = 0; i < dim; i += 8)
+                sum = _mm256_add_ps(sum, _mm256_loadu_ps(x + i));
+            float mean = cpu_hsum256(sum) * inv_dim;
+            __m256 vmean = _mm256_set1_ps(mean);
+            __m256 sq = _mm256_setzero_ps();
+            for (int i = 0; i < dim; i += 8) {
+                __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), vmean);
+                sq = _mm256_fmadd_ps(d, d, sq);
+            }
+            float var = cpu_hsum256(sq) * inv_dim;
+            float inv = 1.0f / sqrtf(var + eps);
+            __m256 vinv = _mm256_set1_ps(inv);
+            for (int i = 0; i < dim; i += 8) {
+                __m256 d  = _mm256_sub_ps(_mm256_loadu_ps(x + i), vmean);
+                __m256 wv = _mm256_loadu_ps(w + i);
+                __m256 bv = _mm256_loadu_ps(b + i);
+                __m256 r  = _mm256_fmadd_ps(_mm256_mul_ps(d, vinv), wv, bv);
+                _mm256_storeu_ps(y + i, r);
+            }
+        }
+        return;
+    }
+#endif
+    #if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int t = 0; t < n_tok; t++) {
-        const float *x = src + t * dim;
-        float *y = dst + t * dim;
+        const float *x = src + (size_t)t * dim;
+        float *y = dst + (size_t)t * dim;
         float mean = 0.0f;
         for (int i = 0; i < dim; i++) mean += x[i];
         mean /= dim;
@@ -125,10 +174,15 @@ static void cpu_softmax(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
-/* ---- GELU (tanh approximation) ---- */
-
+/* ---- GELU (tanh approximation) ----
+ * Just OMP-parallel over the array; tanhf is accurate (libm). A SIMD rational
+ * approximation was tried but its ~3e-3 error compounded across 32 ViT blocks
+ * and shifted post-process mask counts. Stick with libm. */
 static void cpu_gelu(float *x, int n) {
     const float c = 0.7978845608f; /* sqrt(2/pi) */
+    #if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int i = 0; i < n; i++) {
         float v = x[i];
         float t = tanhf(c * (v + 0.044715f * v * v * v));
@@ -195,6 +249,41 @@ static void *cpu_gemm_worker(void *arg) {
 static void cpu_gemm_f16(float *dst, const uint16_t *W, const float *bias,
                            const float *src, int n_tok, int n_out, int n_in,
                            int n_threads) {
+#if defined(_OPENMP)
+    /* OpenMP path: persistent thread pool — no pthread_create/join per call.
+     * In a sam3 ViT pass we hit this ~200 times; the saved spawn-join cost
+     * adds up. Tile the row range into n_threads chunks of multiples of 3
+     * (the inner GEMM has a 3-row inner tile). */
+    if (n_threads > 1 && n_out >= n_threads * 3) {
+        int rows_per = ((n_out / n_threads) / 3) * 3;
+        if (rows_per < 3) rows_per = 3;
+        int n_chunks = (n_out + rows_per - 1) / rows_per;
+        if (n_chunks > n_threads) n_chunks = n_threads;
+        #pragma omp parallel for schedule(static) num_threads(n_chunks)
+        for (int i = 0; i < n_chunks; i++) {
+            int r = i * rows_per;
+            int end = (i == n_chunks - 1) ? n_out : r + rows_per;
+            if (end > n_out) end = n_out;
+            int count = end - r;
+            if (count > 0) {
+                gemm_f16_f32_tokmajor(dst + r,
+                                       W + (size_t)r * n_in,
+                                       src,
+                                       count, n_in, n_tok,
+                                       n_out, n_in);
+            }
+        }
+    } else {
+        gemm_f16_f32_tokmajor(dst, W, src, n_out, n_in, n_tok, n_out, n_in);
+    }
+    if (bias) {
+        #pragma omp parallel for schedule(static)
+        for (int t = 0; t < n_tok; t++)
+            for (int i = 0; i < n_out; i++)
+                dst[t * n_out + i] += bias[i];
+    }
+    return;
+#else
     if (n_threads > 1 && n_out >= n_threads * 3) {
         cpu_gemm_task *tasks = (cpu_gemm_task *)calloc((size_t)n_threads, sizeof(cpu_gemm_task));
         pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
@@ -219,6 +308,7 @@ static void cpu_gemm_f16(float *dst, const uint16_t *W, const float *bias,
             for (int i = 0; i < n_out; i++)
                 dst[t * n_out + i] += bias[i];
     }
+#endif
 }
 
 /* ---- Flash Attention: tiled online softmax with K/V transpose ---- */
@@ -630,6 +720,21 @@ static void cpu_attention(float *out, const float *qkv, int n_tok, int dim,
     }
 
     int nt = n_threads < n_heads ? n_threads : n_heads;
+#if defined(_OPENMP)
+    /* OpenMP path: persistent thread pool. Each iteration handles a contiguous
+     * range of heads. cpu_attn_worker is reentrant (per-call malloc'd K/V
+     * buffers), so we just construct the task on the stack per chunk. */
+    int heads_per = n_heads / nt;
+    int extra = n_heads % nt;
+    #pragma omp parallel for schedule(static) num_threads(nt)
+    for (int i = 0; i < nt; i++) {
+        int h_start = i * heads_per + (i < extra ? i : extra);
+        int count   = heads_per + (i < extra ? 1 : 0);
+        cpu_attn_task task = {qkv, out, n_tok, dim, head_dim, n_heads,
+                              h_start, h_start + count, scale};
+        cpu_attn_worker(&task);
+    }
+#else
     cpu_attn_task *tasks = (cpu_attn_task *)calloc((size_t)nt, sizeof(cpu_attn_task));
     pthread_t *threads = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
     int heads_per = n_heads / nt;
@@ -644,6 +749,7 @@ static void cpu_attention(float *out, const float *qkv, int n_tok, int dim,
     }
     for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
     free(tasks); free(threads);
+#endif
 }
 
 #endif /* CPU_COMPUTE_IMPLEMENTATION */
