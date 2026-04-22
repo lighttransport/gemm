@@ -36,6 +36,7 @@ int  server_sam3_cuda_segment(const char *ckpt_path,
                                const char *phrase,
                                float score_thr, float mask_thr,
                                int device_ordinal,
+                               const char *precision,
                                server_sam3_mask *out_masks, int out_cap,
                                int *out_n,
                                char *err_buf, size_t err_cap);

@@ -21,6 +21,11 @@ typedef struct {
     int image_size;          /* fixed 1008 */
     int device_ordinal;
     int verbose;
+    /* precision: "fp16" (default, MMA tensor cores on sm_80+), "fp32"
+     * (tiled F32-accum GEMM path, slower but lower drift). "bf16" and
+     * "fp8" are accepted but fall back to fp16 with a warning. NULL or
+     * empty is equivalent to "fp16". */
+    const char *precision;
 } cuda_sam3_config;
 
 cuda_sam3_ctx *cuda_sam3_create(const cuda_sam3_config *cfg);

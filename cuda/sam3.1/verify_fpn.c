@@ -35,7 +35,7 @@ static float *read_npy_f32(const char *path, int *ndim, int *dims) {
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
+    const char *refdir = "/tmp/sam3.1_ref";
     int level = -1;  /* -1 = all */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt")   && i+1 < argc) ckpt = argv[++i];
@@ -71,7 +71,7 @@ int main(int argc, char **argv)
         cuda_sam3_1_get_fpn(ctx, li, ours, &oc, &oh, &ow);
         size_t n = (size_t)oc * oh * ow;
 
-        snprintf(path, sizeof(path), "%s/vit_fpn%d.npy", refdir, li);
+        snprintf(path, sizeof(path), "%s/convs%d.npy", refdir, li);
         int nd, d[8]; float *ref = read_npy_f32(path, &nd, d);
         if (!ref) { fprintf(stderr, "cannot read %s\n", path); free(ours); continue; }
         size_t rn = 1; for (int i = 0; i < nd; i++) rn *= (size_t)d[i];

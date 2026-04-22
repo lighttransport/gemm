@@ -36,7 +36,7 @@ static void *read_npy(const char *path, int *ndim, int *dims, int *itemsz_out) {
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
+    const char *refdir = "/tmp/sam3.1_ref";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt")   && i+1 < argc) ckpt = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
@@ -72,31 +72,37 @@ int main(int argc, char **argv)
     if (cuda_sam3_1_run_detr_dec(ctx) != 0) return 10;
 
     float ours_boxes[200 * 4], ours_pres[6];
+    float ours_hidden[200 * 256];
     cuda_sam3_1_get_detr_dec_boxes(ctx, ours_boxes);
     cuda_sam3_1_get_detr_dec_presence(ctx, ours_pres);
+    cuda_sam3_1_get_detr_dec_hidden(ctx, ours_hidden);
 
-    /* pred_boxes (1, 200, 4). */
-    snprintf(path, sizeof(path), "%s/pred_boxes.npy", refdir);
+    /* detr_dec_out: (6, 200, 1, 256) — last layer hidden (post output_layer_norm). */
     int rnd, rd[8];
-    float *ref_boxes = (float *)read_npy(path, &rnd, rd, &isz);
-    if (ref_boxes) {
+    snprintf(path, sizeof(path), "%s/detr_dec_out.npy", refdir);
+    float *ref_dec = (float *)read_npy(path, &rnd, rd, &isz);
+    if (ref_dec) {
+        /* Last layer index 5, (200, 1, 256). */
+        const float *ref_last = ref_dec + (size_t)5 * 200 * 256;
         double sd = 0, maxd = 0;
-        for (int i = 0; i < 200 * 4; i++) {
-            double dd = fabs(ref_boxes[i] - ours_boxes[i]);
+        for (int i = 0; i < 200 * 256; i++) {
+            double dd = fabs((double)ref_last[i] - (double)ours_hidden[i]);
             sd += dd; if (dd > maxd) maxd = dd;
         }
-        fprintf(stderr, "pred_boxes (200,4): max_abs=%.4e mean_abs=%.4e\n",
-                maxd, sd / (200.0 * 4));
-        free(ref_boxes);
+        fprintf(stderr, "detr_dec_out last-layer (200,256): "
+                "max_abs=%.4e mean_abs=%.4e\n", maxd, sd / (200.0 * 256));
+        free(ref_dec);
+    } else {
+        fprintf(stderr, "no %s\n", path);
     }
 
-    /* presence_logits (1,1): compare vs last layer. */
-    snprintf(path, sizeof(path), "%s/presence_logits.npy", refdir);
-    float *ref_pres = (float *)read_npy(path, &rnd, rd, &isz);
-    if (ref_pres) {
-        fprintf(stderr, "presence (last layer): ref=%.4f ours=%.4f |diff|=%.4e\n",
-                ref_pres[0], ours_pres[5], fabsf(ref_pres[0] - ours_pres[5]));
-        free(ref_pres);
+    /* final_boxes (N, 4) xyxy in input-image pixels, final_scores (N,). */
+    snprintf(path, sizeof(path), "%s/final_scores.npy", refdir);
+    float *ref_scores = (float *)read_npy(path, &rnd, rd, &isz);
+    if (ref_scores) {
+        fprintf(stderr, "ref kept detections: %d (top score=%.4f)\n",
+                rd[0], rd[0] > 0 ? ref_scores[0] : 0.0f);
+        free(ref_scores);
     }
     cuda_sam3_1_destroy(ctx);
     return 0;

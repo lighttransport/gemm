@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static double now_ms(void) {
     struct timespec ts;
@@ -200,6 +201,20 @@ int server_sam3_cpu_segment(const char *ckpt_path,
     }
     if (!img_bytes || img_len == 0) {
         snprintf(err_buf, err_cap, "image bytes missing");
+        return 1;
+    }
+    /* Validate weight/tokenizer files upfront so an invalid path fails
+     * fast instead of wedging inside the model loader. */
+    if (access(ckpt_path, R_OK) != 0) {
+        snprintf(err_buf, err_cap, "sam3 ckpt not readable: %s", ckpt_path);
+        return 1;
+    }
+    if (access(vocab_path, R_OK) != 0) {
+        snprintf(err_buf, err_cap, "sam3 vocab not readable: %s", vocab_path);
+        return 1;
+    }
+    if (access(merges_path, R_OK) != 0) {
+        snprintf(err_buf, err_cap, "sam3 merges not readable: %s", merges_path);
         return 1;
     }
 

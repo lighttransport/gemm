@@ -36,8 +36,8 @@ static void *read_npy(const char *path, int *ndim, int *dims, int *itemsz_out) {
 int main(int argc, char **argv)
 {
     const char *ckpt = NULL;
-    const char *refdir = "/tmp/sam3_ref_cat";
-    int target_h = 426, target_w = 640;
+    const char *refdir = "/tmp/sam3.1_ref";
+    int target_h = 952, target_w = 1693;
     float score_th = 0.01f, mask_th = 0.5f;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ckpt") && i+1 < argc) ckpt = argv[++i];
@@ -100,19 +100,25 @@ int main(int argc, char **argv)
             boxes[0], boxes[1], boxes[2], boxes[3]); }
 
     snprintf(path, sizeof(path), "%s/final_masks.npy", refdir);
-    uint8_t *rm = (uint8_t *)read_npy(path, &nd, d, &isz);
-    if (rm && n_ref && n_ours) {
-        size_t tot = (size_t)d[1] * d[2];
+    void *rm_raw = read_npy(path, &nd, d, &isz);
+    if (rm_raw && n_ref && n_ours) {
+        /* ref shape may be (N,H,W) or (1,N,H,W); dtype may be u1 or f4. */
+        int rh = (nd == 4) ? d[2] : d[1];
+        int rw = (nd == 4) ? d[3] : d[2];
+        size_t tot = (size_t)rh * rw;
         size_t inter = 0, uni = 0;
         for (size_t i = 0; i < tot; i++) {
-            int a = rm[i] ? 1 : 0, b = masks[i] ? 1 : 0;
+            int a;
+            if (isz == 4) a = ((const float *)rm_raw)[i] > 0.5f;
+            else          a = ((const uint8_t *)rm_raw)[i] ? 1 : 0;
+            int b = masks[i] ? 1 : 0;
             inter += (a & b); uni += (a | b);
         }
         double iou = uni ? (double)inter / (double)uni : 0.0;
         fprintf(stderr, "mask IoU (ref #0 vs ours #0): %.4f (inter=%zu uni=%zu)\n",
                 iou, inter, uni);
     }
-    free(rs); free(rb); free(rm);
+    free(rs); free(rb); free(rm_raw);
     cuda_sam3_1_destroy(ctx);
     return 0;
 }
