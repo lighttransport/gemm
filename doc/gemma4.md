@@ -48,7 +48,7 @@ This note now includes local end-to-end quality checks against the 2B Gemma4 VLM
 - `cuda/vlm/test_cuda_gemma4_vlm` builds successfully from the current tree.
 - The CPU build still emits several unrelated warnings from shared headers, but no build failure in the reviewed path.
 - The CUDA build still emits several unrelated warnings from shared headers and `cuda_llm_runner.c`, but no build failure in the reviewed path.
-- End-to-end CPU and CUDA runs on `fujisan.jpg` both produce visible descriptions that identify the mountain as Mount Fuji.
+- End-to-end CPU and CUDA runs on the test image both produce visible descriptions that identify the mountain as Mount Fuji.
 
 ## Key Findings
 
@@ -79,7 +79,7 @@ This note now includes local end-to-end quality checks against the 2B Gemma4 VLM
 
 - After prompt and sampler alignment, the CUDA harness now produces outputs such as:
   - `A majestic view of Mount Fuji dominates the background...`
-- This matches the core quality behavior seen in `llama.cpp`: the model correctly identifies `fujisan.jpg` as Mount Fuji.
+- This matches the core quality behavior seen in `llama.cpp`: the model correctly identifies the test image as Mount Fuji.
 
 ## Repro Procedure
 
@@ -87,7 +87,7 @@ Model assets used:
 
 - `/mnt/disk01/models/gemma4/2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf`
 - `/mnt/disk01/models/gemma4/2b/mmproj-F16.gguf`
-- `/home/syoyo/work/gemm/main/fujisan.jpg`
+- `path/to/image.jpg`
 
 ### Build
 
@@ -102,7 +102,7 @@ make -C cuda/vlm test_cuda_gemma4_vlm
 ./cpu/vlm/test_gemma4_vision \
   /mnt/disk01/models/gemma4/2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf \
   /mnt/disk01/models/gemma4/2b/mmproj-F16.gguf \
-  /home/syoyo/work/gemm/main/fujisan.jpg \
+  path/to/image.jpg \
   "describe the image briefly" 128
 ```
 
@@ -117,7 +117,7 @@ Expected behavior:
 ./cuda/vlm/test_cuda_gemma4_vlm \
   /mnt/disk01/models/gemma4/2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf \
   /mnt/disk01/models/gemma4/2b/mmproj-F16.gguf \
-  /home/syoyo/work/gemm/main/fujisan.jpg \
+  path/to/image.jpg \
   "describe the image briefly" 128
 ```
 
@@ -137,7 +137,7 @@ Baseline `llama.cpp` Gemma4 VLM run:
 /home/syoyo/work/llama.cpp/build/bin/llama-mtmd-cli \
   -m /mnt/disk01/models/gemma4/2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf \
   --mmproj /mnt/disk01/models/gemma4/2b/mmproj-F16.gguf \
-  --image /home/syoyo/work/gemm/main/fujisan.jpg \
+  --image path/to/image.jpg \
   -p "describe the image briefly" \
   --n-predict 128 \
   --ctx-size 1024 \
@@ -151,7 +151,7 @@ Matched-sampler `llama.cpp` run used during comparison:
 /home/syoyo/work/llama.cpp/build/bin/llama-mtmd-cli \
   -m /mnt/disk01/models/gemma4/2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf \
   --mmproj /mnt/disk01/models/gemma4/2b/mmproj-F16.gguf \
-  --image /home/syoyo/work/gemm/main/fujisan.jpg \
+  --image path/to/image.jpg \
   -p "describe the image briefly" \
   --n-predict 128 \
   --ctx-size 1024 \
