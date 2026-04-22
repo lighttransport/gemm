@@ -1,0 +1,1623 @@
+detector.backbone.language_backbone.encoder.ln_final.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.ln_final.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.positional_embedding	(32, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.text_projection	(1024, 512)	torch.float32
+detector.backbone.language_backbone.encoder.token_embedding.weight	(49408, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.attn.in_proj_bias	(3072,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.attn.in_proj_weight	(3072, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.attn.out_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.attn.out_proj.weight	(1024, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.ln_1.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.ln_1.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.ln_2.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.ln_2.weight	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_fc.bias	(4096,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_fc.weight	(4096, 1024)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_proj.bias	(1024,)	torch.float32
+detector.backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_proj.weight	(1024, 4096)	torch.float32
+detector.backbone.language_backbone.resizer.bias	(256,)	torch.float32
+detector.backbone.language_backbone.resizer.weight	(256, 1024)	torch.float32
+detector.backbone.vision_backbone.convs.0.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.convs.0.conv_1x1.weight	(256, 256, 1, 1)	torch.float32
+detector.backbone.vision_backbone.convs.0.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.convs.0.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.convs.0.dconv_2x2_0.bias	(512,)	torch.float32
+detector.backbone.vision_backbone.convs.0.dconv_2x2_0.weight	(1024, 512, 2, 2)	torch.float32
+detector.backbone.vision_backbone.convs.0.dconv_2x2_1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.convs.0.dconv_2x2_1.weight	(512, 256, 2, 2)	torch.float32
+detector.backbone.vision_backbone.convs.1.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.convs.1.conv_1x1.weight	(256, 512, 1, 1)	torch.float32
+detector.backbone.vision_backbone.convs.1.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.convs.1.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.convs.1.dconv_2x2.bias	(512,)	torch.float32
+detector.backbone.vision_backbone.convs.1.dconv_2x2.weight	(1024, 512, 2, 2)	torch.float32
+detector.backbone.vision_backbone.convs.2.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.convs.2.conv_1x1.weight	(256, 1024, 1, 1)	torch.float32
+detector.backbone.vision_backbone.convs.2.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.convs.2.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.conv_1x1.weight	(256, 256, 1, 1)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.dconv_2x2_0.bias	(512,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.dconv_2x2_0.weight	(1024, 512, 2, 2)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.dconv_2x2_1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.0.dconv_2x2_1.weight	(512, 256, 2, 2)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.1.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.1.conv_1x1.weight	(256, 512, 1, 1)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.1.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.1.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.1.dconv_2x2.bias	(512,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.1.dconv_2x2.weight	(1024, 512, 2, 2)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.2.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.2.conv_1x1.weight	(256, 1024, 1, 1)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.2.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.interactive_convs.2.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.conv_1x1.weight	(256, 256, 1, 1)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.dconv_2x2_0.bias	(512,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.dconv_2x2_0.weight	(1024, 512, 2, 2)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.dconv_2x2_1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.0.dconv_2x2_1.weight	(512, 256, 2, 2)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.1.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.1.conv_1x1.weight	(256, 512, 1, 1)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.1.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.1.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.1.dconv_2x2.bias	(512,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.1.dconv_2x2.weight	(1024, 512, 2, 2)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.2.conv_1x1.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.2.conv_1x1.weight	(256, 1024, 1, 1)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.2.conv_3x3.bias	(256,)	torch.float32
+detector.backbone.vision_backbone.propagation_convs.2.conv_3x3.weight	(256, 256, 3, 3)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.0.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.0.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.1.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.1.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.10.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.10.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.11.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.11.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.12.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.12.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.13.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.13.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.14.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.14.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.attn.freqs_cis	(5184, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.15.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.15.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.16.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.16.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.17.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.17.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.18.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.18.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.19.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.19.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.2.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.2.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.20.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.20.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.21.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.21.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.22.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.22.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.attn.freqs_cis	(5184, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.23.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.23.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.24.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.24.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.25.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.25.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.26.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.26.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.27.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.27.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.28.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.28.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.29.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.29.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.3.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.3.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.30.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.30.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.attn.freqs_cis	(5184, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.31.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.31.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.4.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.4.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.5.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.5.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.6.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.6.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.attn.freqs_cis	(5184, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.7.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.7.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.8.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.8.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.attn.freqs_cis	(576, 32)	torch.complex64
+detector.backbone.vision_backbone.trunk.blocks.9.attn.proj.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.attn.proj.weight	(1024, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.attn.qkv.bias	(3072,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.attn.qkv.weight	(3072, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.mlp.fc1.bias	(4736,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.mlp.fc1.weight	(4736, 1024)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.mlp.fc2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.mlp.fc2.weight	(1024, 4736)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.norm1.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.norm1.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.norm2.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.blocks.9.norm2.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.ln_pre.bias	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.ln_pre.weight	(1024,)	torch.float32
+detector.backbone.vision_backbone.trunk.patch_embed.proj.weight	(1024, 3, 14, 14)	torch.float32
+detector.backbone.vision_backbone.trunk.pos_embed	(1, 577, 1024)	torch.float32
+detector.dot_prod_scoring.hs_proj.bias	(256,)	torch.float32
+detector.dot_prod_scoring.hs_proj.weight	(256, 256)	torch.float32
+detector.dot_prod_scoring.prompt_mlp.layers.0.bias	(2048,)	torch.float32
+detector.dot_prod_scoring.prompt_mlp.layers.0.weight	(2048, 256)	torch.float32
+detector.dot_prod_scoring.prompt_mlp.layers.1.bias	(256,)	torch.float32
+detector.dot_prod_scoring.prompt_mlp.layers.1.weight	(256, 2048)	torch.float32
+detector.dot_prod_scoring.prompt_mlp.out_norm.bias	(256,)	torch.float32
+detector.dot_prod_scoring.prompt_mlp.out_norm.weight	(256,)	torch.float32
+detector.dot_prod_scoring.prompt_proj.bias	(256,)	torch.float32
+detector.dot_prod_scoring.prompt_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.boxes_direct_project.bias	(256,)	torch.float32
+detector.geometry_encoder.boxes_direct_project.weight	(256, 4)	torch.float32
+detector.geometry_encoder.boxes_pool_project.bias	(256,)	torch.float32
+detector.geometry_encoder.boxes_pool_project.weight	(256, 256, 7, 7)	torch.float32
+detector.geometry_encoder.boxes_pos_enc_project.bias	(256,)	torch.float32
+detector.geometry_encoder.boxes_pos_enc_project.weight	(256, 258)	torch.float32
+detector.geometry_encoder.cls_embed.weight	(1, 256)	torch.float32
+detector.geometry_encoder.encode.0.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.geometry_encoder.encode.0.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.geometry_encoder.encode.0.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.0.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.encode.0.linear1.bias	(2048,)	torch.float32
+detector.geometry_encoder.encode.0.linear1.weight	(2048, 256)	torch.float32
+detector.geometry_encoder.encode.0.linear2.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.0.linear2.weight	(256, 2048)	torch.float32
+detector.geometry_encoder.encode.0.norm1.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.0.norm1.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.0.norm2.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.0.norm2.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.0.norm3.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.0.norm3.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.0.self_attn.in_proj_bias	(768,)	torch.float32
+detector.geometry_encoder.encode.0.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.geometry_encoder.encode.0.self_attn.out_proj.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.0.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.encode.1.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.geometry_encoder.encode.1.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.geometry_encoder.encode.1.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.1.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.encode.1.linear1.bias	(2048,)	torch.float32
+detector.geometry_encoder.encode.1.linear1.weight	(2048, 256)	torch.float32
+detector.geometry_encoder.encode.1.linear2.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.1.linear2.weight	(256, 2048)	torch.float32
+detector.geometry_encoder.encode.1.norm1.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.1.norm1.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.1.norm2.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.1.norm2.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.1.norm3.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.1.norm3.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.1.self_attn.in_proj_bias	(768,)	torch.float32
+detector.geometry_encoder.encode.1.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.geometry_encoder.encode.1.self_attn.out_proj.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.1.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.encode.2.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.geometry_encoder.encode.2.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.geometry_encoder.encode.2.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.2.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.encode.2.linear1.bias	(2048,)	torch.float32
+detector.geometry_encoder.encode.2.linear1.weight	(2048, 256)	torch.float32
+detector.geometry_encoder.encode.2.linear2.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.2.linear2.weight	(256, 2048)	torch.float32
+detector.geometry_encoder.encode.2.norm1.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.2.norm1.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.2.norm2.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.2.norm2.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.2.norm3.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.2.norm3.weight	(256,)	torch.float32
+detector.geometry_encoder.encode.2.self_attn.in_proj_bias	(768,)	torch.float32
+detector.geometry_encoder.encode.2.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.geometry_encoder.encode.2.self_attn.out_proj.bias	(256,)	torch.float32
+detector.geometry_encoder.encode.2.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.encode_norm.bias	(256,)	torch.float32
+detector.geometry_encoder.encode_norm.weight	(256,)	torch.float32
+detector.geometry_encoder.final_proj.bias	(256,)	torch.float32
+detector.geometry_encoder.final_proj.weight	(256, 256)	torch.float32
+detector.geometry_encoder.img_pre_norm.bias	(256,)	torch.float32
+detector.geometry_encoder.img_pre_norm.weight	(256,)	torch.float32
+detector.geometry_encoder.label_embed.weight	(2, 256)	torch.float32
+detector.geometry_encoder.norm.bias	(256,)	torch.float32
+detector.geometry_encoder.norm.weight	(256,)	torch.float32
+detector.geometry_encoder.points_direct_project.bias	(256,)	torch.float32
+detector.geometry_encoder.points_direct_project.weight	(256, 2)	torch.float32
+detector.geometry_encoder.points_pool_project.bias	(256,)	torch.float32
+detector.geometry_encoder.points_pool_project.weight	(256, 256)	torch.float32
+detector.geometry_encoder.points_pos_enc_project.bias	(256,)	torch.float32
+detector.geometry_encoder.points_pos_enc_project.weight	(256, 256)	torch.float32
+detector.segmentation_head.cross_attend_prompt.in_proj_bias	(768,)	torch.float32
+detector.segmentation_head.cross_attend_prompt.in_proj_weight	(768, 256)	torch.float32
+detector.segmentation_head.cross_attend_prompt.out_proj.bias	(256,)	torch.float32
+detector.segmentation_head.cross_attend_prompt.out_proj.weight	(256, 256)	torch.float32
+detector.segmentation_head.cross_attn_norm.bias	(256,)	torch.float32
+detector.segmentation_head.cross_attn_norm.weight	(256,)	torch.float32
+detector.segmentation_head.instance_seg_head.bias	(256,)	torch.float32
+detector.segmentation_head.instance_seg_head.weight	(256, 256, 1, 1)	torch.float32
+detector.segmentation_head.mask_predictor.mask_embed.layers.0.bias	(256,)	torch.float32
+detector.segmentation_head.mask_predictor.mask_embed.layers.0.weight	(256, 256)	torch.float32
+detector.segmentation_head.mask_predictor.mask_embed.layers.1.bias	(256,)	torch.float32
+detector.segmentation_head.mask_predictor.mask_embed.layers.1.weight	(256, 256)	torch.float32
+detector.segmentation_head.mask_predictor.mask_embed.layers.2.bias	(256,)	torch.float32
+detector.segmentation_head.mask_predictor.mask_embed.layers.2.weight	(256, 256)	torch.float32
+detector.segmentation_head.pixel_decoder.conv_layers.0.bias	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.conv_layers.0.weight	(256, 256, 3, 3)	torch.float32
+detector.segmentation_head.pixel_decoder.conv_layers.1.bias	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.conv_layers.1.weight	(256, 256, 3, 3)	torch.float32
+detector.segmentation_head.pixel_decoder.conv_layers.2.bias	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.conv_layers.2.weight	(256, 256, 3, 3)	torch.float32
+detector.segmentation_head.pixel_decoder.norms.0.bias	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.norms.0.weight	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.norms.1.bias	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.norms.1.weight	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.norms.2.bias	(256,)	torch.float32
+detector.segmentation_head.pixel_decoder.norms.2.weight	(256,)	torch.float32
+detector.segmentation_head.semantic_seg_head.bias	(1,)	torch.float32
+detector.segmentation_head.semantic_seg_head.weight	(1, 256, 1, 1)	torch.float32
+detector.transformer.decoder.bbox_embed.layers.0.bias	(256,)	torch.float32
+detector.transformer.decoder.bbox_embed.layers.0.weight	(256, 256)	torch.float32
+detector.transformer.decoder.bbox_embed.layers.1.bias	(256,)	torch.float32
+detector.transformer.decoder.bbox_embed.layers.1.weight	(256, 256)	torch.float32
+detector.transformer.decoder.bbox_embed.layers.2.bias	(4,)	torch.float32
+detector.transformer.decoder.bbox_embed.layers.2.weight	(4, 256)	torch.float32
+detector.transformer.decoder.boxRPB_embed_x.layers.0.bias	(256,)	torch.float32
+detector.transformer.decoder.boxRPB_embed_x.layers.0.weight	(256, 2)	torch.float32
+detector.transformer.decoder.boxRPB_embed_x.layers.1.bias	(8,)	torch.float32
+detector.transformer.decoder.boxRPB_embed_x.layers.1.weight	(8, 256)	torch.float32
+detector.transformer.decoder.boxRPB_embed_y.layers.0.bias	(256,)	torch.float32
+detector.transformer.decoder.boxRPB_embed_y.layers.0.weight	(256, 2)	torch.float32
+detector.transformer.decoder.boxRPB_embed_y.layers.1.bias	(8,)	torch.float32
+detector.transformer.decoder.boxRPB_embed_y.layers.1.weight	(8, 256)	torch.float32
+detector.transformer.decoder.layers.0.ca_text.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.0.ca_text.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.0.ca_text.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.ca_text.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.0.catext_norm.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.catext_norm.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.0.cross_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.0.cross_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.0.cross_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.cross_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.0.linear1.bias	(2048,)	torch.float32
+detector.transformer.decoder.layers.0.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.decoder.layers.0.linear2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.decoder.layers.0.norm1.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.norm1.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.0.norm2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.norm2.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.0.norm3.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.norm3.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.0.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.0.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.0.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.0.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.1.ca_text.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.1.ca_text.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.1.ca_text.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.ca_text.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.1.catext_norm.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.catext_norm.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.1.cross_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.1.cross_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.1.cross_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.cross_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.1.linear1.bias	(2048,)	torch.float32
+detector.transformer.decoder.layers.1.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.decoder.layers.1.linear2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.decoder.layers.1.norm1.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.norm1.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.1.norm2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.norm2.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.1.norm3.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.norm3.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.1.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.1.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.1.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.1.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.2.ca_text.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.2.ca_text.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.2.ca_text.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.ca_text.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.2.catext_norm.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.catext_norm.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.2.cross_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.2.cross_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.2.cross_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.cross_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.2.linear1.bias	(2048,)	torch.float32
+detector.transformer.decoder.layers.2.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.decoder.layers.2.linear2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.decoder.layers.2.norm1.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.norm1.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.2.norm2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.norm2.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.2.norm3.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.norm3.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.2.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.2.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.2.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.2.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.3.ca_text.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.3.ca_text.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.3.ca_text.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.ca_text.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.3.catext_norm.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.catext_norm.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.3.cross_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.3.cross_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.3.cross_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.cross_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.3.linear1.bias	(2048,)	torch.float32
+detector.transformer.decoder.layers.3.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.decoder.layers.3.linear2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.decoder.layers.3.norm1.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.norm1.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.3.norm2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.norm2.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.3.norm3.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.norm3.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.3.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.3.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.3.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.3.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.4.ca_text.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.4.ca_text.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.4.ca_text.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.ca_text.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.4.catext_norm.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.catext_norm.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.4.cross_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.4.cross_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.4.cross_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.cross_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.4.linear1.bias	(2048,)	torch.float32
+detector.transformer.decoder.layers.4.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.decoder.layers.4.linear2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.decoder.layers.4.norm1.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.norm1.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.4.norm2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.norm2.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.4.norm3.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.norm3.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.4.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.4.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.4.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.4.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.5.ca_text.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.5.ca_text.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.5.ca_text.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.ca_text.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.5.catext_norm.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.catext_norm.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.5.cross_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.5.cross_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.5.cross_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.cross_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.layers.5.linear1.bias	(2048,)	torch.float32
+detector.transformer.decoder.layers.5.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.decoder.layers.5.linear2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.decoder.layers.5.norm1.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.norm1.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.5.norm2.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.norm2.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.5.norm3.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.norm3.weight	(256,)	torch.float32
+detector.transformer.decoder.layers.5.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.decoder.layers.5.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.decoder.layers.5.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.decoder.layers.5.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.decoder.norm.bias	(256,)	torch.float32
+detector.transformer.decoder.norm.weight	(256,)	torch.float32
+detector.transformer.decoder.presence_token.weight	(1, 256)	torch.float32
+detector.transformer.decoder.presence_token_head.layers.0.bias	(256,)	torch.float32
+detector.transformer.decoder.presence_token_head.layers.0.weight	(256, 256)	torch.float32
+detector.transformer.decoder.presence_token_head.layers.1.bias	(256,)	torch.float32
+detector.transformer.decoder.presence_token_head.layers.1.weight	(256, 256)	torch.float32
+detector.transformer.decoder.presence_token_head.layers.2.bias	(1,)	torch.float32
+detector.transformer.decoder.presence_token_head.layers.2.weight	(1, 256)	torch.float32
+detector.transformer.decoder.presence_token_out_norm.bias	(256,)	torch.float32
+detector.transformer.decoder.presence_token_out_norm.weight	(256,)	torch.float32
+detector.transformer.decoder.query_embed.weight	(200, 256)	torch.float32
+detector.transformer.decoder.ref_point_head.layers.0.bias	(256,)	torch.float32
+detector.transformer.decoder.ref_point_head.layers.0.weight	(256, 512)	torch.float32
+detector.transformer.decoder.ref_point_head.layers.1.bias	(256,)	torch.float32
+detector.transformer.decoder.ref_point_head.layers.1.weight	(256, 256)	torch.float32
+detector.transformer.decoder.reference_points.weight	(200, 4)	torch.float32
+detector.transformer.encoder.layers.0.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.0.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.0.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.0.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.0.linear1.bias	(2048,)	torch.float32
+detector.transformer.encoder.layers.0.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.encoder.layers.0.linear2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.0.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.encoder.layers.0.norm1.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.0.norm1.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.0.norm2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.0.norm2.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.0.norm3.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.0.norm3.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.0.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.0.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.0.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.0.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.1.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.1.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.1.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.1.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.1.linear1.bias	(2048,)	torch.float32
+detector.transformer.encoder.layers.1.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.encoder.layers.1.linear2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.1.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.encoder.layers.1.norm1.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.1.norm1.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.1.norm2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.1.norm2.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.1.norm3.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.1.norm3.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.1.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.1.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.1.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.1.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.2.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.2.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.2.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.2.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.2.linear1.bias	(2048,)	torch.float32
+detector.transformer.encoder.layers.2.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.encoder.layers.2.linear2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.2.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.encoder.layers.2.norm1.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.2.norm1.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.2.norm2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.2.norm2.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.2.norm3.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.2.norm3.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.2.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.2.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.2.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.2.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.3.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.3.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.3.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.3.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.3.linear1.bias	(2048,)	torch.float32
+detector.transformer.encoder.layers.3.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.encoder.layers.3.linear2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.3.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.encoder.layers.3.norm1.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.3.norm1.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.3.norm2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.3.norm2.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.3.norm3.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.3.norm3.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.3.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.3.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.3.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.3.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.4.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.4.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.4.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.4.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.4.linear1.bias	(2048,)	torch.float32
+detector.transformer.encoder.layers.4.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.encoder.layers.4.linear2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.4.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.encoder.layers.4.norm1.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.4.norm1.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.4.norm2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.4.norm2.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.4.norm3.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.4.norm3.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.4.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.4.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.4.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.4.self_attn.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.5.cross_attn_image.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.5.cross_attn_image.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.5.cross_attn_image.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.5.cross_attn_image.out_proj.weight	(256, 256)	torch.float32
+detector.transformer.encoder.layers.5.linear1.bias	(2048,)	torch.float32
+detector.transformer.encoder.layers.5.linear1.weight	(2048, 256)	torch.float32
+detector.transformer.encoder.layers.5.linear2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.5.linear2.weight	(256, 2048)	torch.float32
+detector.transformer.encoder.layers.5.norm1.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.5.norm1.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.5.norm2.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.5.norm2.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.5.norm3.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.5.norm3.weight	(256,)	torch.float32
+detector.transformer.encoder.layers.5.self_attn.in_proj_bias	(768,)	torch.float32
+detector.transformer.encoder.layers.5.self_attn.in_proj_weight	(768, 256)	torch.float32
+detector.transformer.encoder.layers.5.self_attn.out_proj.bias	(256,)	torch.float32
+detector.transformer.encoder.layers.5.self_attn.out_proj.weight	(256, 256)	torch.float32
+tracker.model.image_pe_layer.positional_encoding_gaussian_matrix	(2, 128)	torch.float32
+tracker.model.interactive_mask_downsample.bias	(1,)	torch.float32
+tracker.model.interactive_mask_downsample.weight	(1, 1, 4, 4)	torch.float32
+tracker.model.interactive_obj_ptr_proj.layers.0.bias	(256,)	torch.float32
+tracker.model.interactive_obj_ptr_proj.layers.0.weight	(256, 256)	torch.float32
+tracker.model.interactive_obj_ptr_proj.layers.1.bias	(256,)	torch.float32
+tracker.model.interactive_obj_ptr_proj.layers.1.weight	(256, 256)	torch.float32
+tracker.model.interactive_obj_ptr_proj.layers.2.bias	(256,)	torch.float32
+tracker.model.interactive_obj_ptr_proj.layers.2.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.conv_s0.bias	(32,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.conv_s0.weight	(32, 256, 1, 1)	torch.float32
+tracker.model.interactive_sam_mask_decoder.conv_s1.bias	(64,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.conv_s1.weight	(64, 256, 1, 1)	torch.float32
+tracker.model.interactive_sam_mask_decoder.iou_prediction_head.layers.0.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.iou_prediction_head.layers.0.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.iou_prediction_head.layers.1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.iou_prediction_head.layers.1.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.iou_prediction_head.layers.2.bias	(4,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.iou_prediction_head.layers.2.weight	(4, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.iou_token.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.mask_tokens.weight	(4, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.obj_score_token.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.0.layers.0.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.0.layers.0.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.0.layers.1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.0.layers.1.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.0.layers.2.bias	(32,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.0.layers.2.weight	(32, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.1.layers.0.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.1.layers.0.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.1.layers.1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.1.layers.1.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.1.layers.2.bias	(32,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.1.layers.2.weight	(32, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.2.layers.0.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.2.layers.0.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.2.layers.1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.2.layers.1.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.2.layers.2.bias	(32,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.2.layers.2.weight	(32, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.3.layers.0.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.3.layers.0.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.3.layers.1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.3.layers.1.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.3.layers.2.bias	(32,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_hypernetworks_mlps.3.layers.2.weight	(32, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_upscaling.0.bias	(64,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_upscaling.0.weight	(256, 64, 2, 2)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_upscaling.1.bias	(64,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_upscaling.1.weight	(64,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_upscaling.3.bias	(32,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.output_upscaling.3.weight	(64, 32, 2, 2)	torch.float32
+tracker.model.interactive_sam_mask_decoder.pred_obj_score_head.layers.0.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.pred_obj_score_head.layers.0.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.pred_obj_score_head.layers.1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.pred_obj_score_head.layers.1.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.pred_obj_score_head.layers.2.bias	(1,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.pred_obj_score_head.layers.2.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.k_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.k_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.out_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.out_proj.weight	(256, 128)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.q_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.q_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.v_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.v_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.k_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.k_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.out_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.out_proj.weight	(256, 128)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.q_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.q_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.v_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.v_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.k_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.k_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.out_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.out_proj.weight	(256, 128)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.q_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.q_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.v_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.v_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.mlp.lin1.bias	(2048,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.mlp.lin1.weight	(2048, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.mlp.lin2.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.mlp.lin2.weight	(256, 2048)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm1.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm2.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm2.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm3.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm3.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm4.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.norm4.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.k_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.k_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.out_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.out_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.q_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.q_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.v_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.0.self_attn.v_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.k_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.k_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.out_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.out_proj.weight	(256, 128)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.q_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.q_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.v_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.v_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.k_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.k_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.out_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.out_proj.weight	(256, 128)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.q_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.q_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.v_proj.bias	(128,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.v_proj.weight	(128, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.mlp.lin1.bias	(2048,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.mlp.lin1.weight	(2048, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.mlp.lin2.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.mlp.lin2.weight	(256, 2048)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm1.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm1.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm2.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm2.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm3.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm3.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm4.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.norm4.weight	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.k_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.k_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.out_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.out_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.q_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.q_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.v_proj.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.layers.1.self_attn.v_proj.weight	(256, 256)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.norm_final_attn.bias	(256,)	torch.float32
+tracker.model.interactive_sam_mask_decoder.transformer.norm_final_attn.weight	(256,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.0.bias	(4,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.0.weight	(4, 1, 2, 2)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.1.bias	(4,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.1.weight	(4,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.3.bias	(16,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.3.weight	(16, 4, 2, 2)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.4.bias	(16,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.4.weight	(16,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.6.bias	(256,)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.mask_downscaling.6.weight	(256, 16, 1, 1)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.no_mask_embed.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.not_a_point_embed.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.pe_layer.positional_encoding_gaussian_matrix	(2, 128)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.point_embeddings.0.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.point_embeddings.1.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.point_embeddings.2.weight	(1, 256)	torch.float32
+tracker.model.interactive_sam_prompt_encoder.point_embeddings.3.weight	(1, 256)	torch.float32
+tracker.model.interactivity_no_mem_embed	(1, 1, 256)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.dwconv.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.dwconv.weight	(256, 1, 7, 7)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.gamma	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.norm.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.norm.weight	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.pwconv1.bias	(1024,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.pwconv1.weight	(1024, 256)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.pwconv2.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.0.pwconv2.weight	(256, 1024)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.dwconv.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.dwconv.weight	(256, 1, 7, 7)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.gamma	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.norm.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.norm.weight	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.pwconv1.bias	(1024,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.pwconv1.weight	(1024, 256)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.pwconv2.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.fuser.layers.1.pwconv2.weight	(256, 1024)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.0.bias	(16,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.0.weight	(16, 32, 3, 3)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.1.bias	(16,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.1.weight	(16,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.10.bias	(1024,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.10.weight	(1024,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.12.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.12.weight	(256, 1024, 1, 1)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.3.bias	(64,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.3.weight	(64, 16, 3, 3)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.4.bias	(64,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.4.weight	(64,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.6.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.6.weight	(256, 64, 3, 3)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.7.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.7.weight	(256,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.9.bias	(1024,)	torch.float32
+tracker.model.maskmem_backbone.mask_downsampler.encoder.9.weight	(1024, 256, 3, 3)	torch.float32
+tracker.model.maskmem_backbone.pix_feat_proj.bias	(256,)	torch.float32
+tracker.model.maskmem_backbone.pix_feat_proj.weight	(256, 256, 1, 1)	torch.float32
+tracker.model.maskmem_tpos_enc	(7, 1, 1, 256)	torch.float32
+tracker.model.no_obj_embed_spatial	(16, 256)	torch.float32
+tracker.model.no_obj_ptr_linear.bias	(256,)	torch.float32
+tracker.model.no_obj_ptr_linear.weight	(256, 256)	torch.float32
+tracker.model.obj_ptr_proj.layers.0.bias	(256,)	torch.float32
+tracker.model.obj_ptr_proj.layers.0.weight	(256, 256)	torch.float32
+tracker.model.obj_ptr_proj.layers.1.bias	(256,)	torch.float32
+tracker.model.obj_ptr_proj.layers.1.weight	(256, 256)	torch.float32
+tracker.model.obj_ptr_proj.layers.2.bias	(256,)	torch.float32
+tracker.model.obj_ptr_proj.layers.2.weight	(256, 256)	torch.float32
+tracker.model.obj_ptr_tpos_proj.bias	(256,)	torch.float32
+tracker.model.obj_ptr_tpos_proj.weight	(256, 256)	torch.float32
+tracker.model.output_invalid_embed	(16, 256)	torch.float32
+tracker.model.output_valid_embed	(16, 256)	torch.float32
+tracker.model.sam_mask_decoder.conv_s0.bias	(32,)	torch.float32
+tracker.model.sam_mask_decoder.conv_s0.weight	(32, 256, 1, 1)	torch.float32
+tracker.model.sam_mask_decoder.conv_s1.bias	(64,)	torch.float32
+tracker.model.sam_mask_decoder.conv_s1.weight	(64, 256, 1, 1)	torch.float32
+tracker.model.sam_mask_decoder.iou_prediction_head.layers.0.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.iou_prediction_head.layers.0.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.iou_prediction_head.layers.1.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.iou_prediction_head.layers.1.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.iou_prediction_head.layers.2.bias	(3,)	torch.float32
+tracker.model.sam_mask_decoder.iou_prediction_head.layers.2.weight	(3, 256)	torch.float32
+tracker.model.sam_mask_decoder.iou_token.weight	(16, 256)	torch.float32
+tracker.model.sam_mask_decoder.mask_tokens.weight	(48, 256)	torch.float32
+tracker.model.sam_mask_decoder.obj_score_token.weight	(16, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.0.layers.0.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.0.layers.0.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.0.layers.1.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.0.layers.1.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.0.layers.2.bias	(32,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.0.layers.2.weight	(32, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.1.layers.0.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.1.layers.0.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.1.layers.1.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.1.layers.1.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.1.layers.2.bias	(32,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.1.layers.2.weight	(32, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.2.layers.0.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.2.layers.0.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.2.layers.1.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.2.layers.1.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.2.layers.2.bias	(32,)	torch.float32
+tracker.model.sam_mask_decoder.output_hypernetworks_mlps.2.layers.2.weight	(32, 256)	torch.float32
+tracker.model.sam_mask_decoder.output_upscaling.0.bias	(64,)	torch.float32
+tracker.model.sam_mask_decoder.output_upscaling.0.weight	(256, 64, 2, 2)	torch.float32
+tracker.model.sam_mask_decoder.output_upscaling.1.bias	(64,)	torch.float32
+tracker.model.sam_mask_decoder.output_upscaling.1.weight	(64,)	torch.float32
+tracker.model.sam_mask_decoder.output_upscaling.3.bias	(32,)	torch.float32
+tracker.model.sam_mask_decoder.output_upscaling.3.weight	(64, 32, 2, 2)	torch.float32
+tracker.model.sam_mask_decoder.pred_obj_score_head.layers.0.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.pred_obj_score_head.layers.0.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.pred_obj_score_head.layers.1.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.pred_obj_score_head.layers.1.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.pred_obj_score_head.layers.2.bias	(1,)	torch.float32
+tracker.model.sam_mask_decoder.pred_obj_score_head.layers.2.weight	(1, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.k_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.k_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.out_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.out_proj.weight	(256, 128)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.q_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.q_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.v_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.final_attn_token_to_image.v_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.k_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.k_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.out_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.out_proj.weight	(256, 128)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.q_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.q_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.v_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_image_to_token.v_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.k_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.k_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.out_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.out_proj.weight	(256, 128)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.q_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.q_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.v_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.cross_attn_token_to_image.v_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.mlp.lin1.bias	(2048,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.mlp.lin1.weight	(2048, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.mlp.lin2.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.mlp.lin2.weight	(256, 2048)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm1.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm1.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm2.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm2.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm3.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm3.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm4.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.norm4.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.k_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.k_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.out_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.out_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.q_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.q_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.v_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.0.self_attn.v_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.k_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.k_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.out_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.out_proj.weight	(256, 128)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.q_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.q_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.v_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_image_to_token.v_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.k_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.k_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.out_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.out_proj.weight	(256, 128)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.q_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.q_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.v_proj.bias	(128,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.cross_attn_token_to_image.v_proj.weight	(128, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.mlp.lin1.bias	(2048,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.mlp.lin1.weight	(2048, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.mlp.lin2.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.mlp.lin2.weight	(256, 2048)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm1.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm1.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm2.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm2.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm3.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm3.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm4.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.norm4.weight	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.k_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.k_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.out_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.out_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.q_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.q_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.v_proj.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.layers.1.self_attn.v_proj.weight	(256, 256)	torch.float32
+tracker.model.sam_mask_decoder.transformer.norm_final_attn.bias	(256,)	torch.float32
+tracker.model.sam_mask_decoder.transformer.norm_final_attn.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.cross_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.image_cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.image_cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.image_cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.image_cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.linear1.bias	(2048,)	torch.float32
+tracker.model.transformer.encoder.layers.0.linear1.weight	(2048, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.linear2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.linear2.weight	(256, 2048)	torch.float32
+tracker.model.transformer.encoder.layers.0.norm1.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.norm1.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.norm2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.norm2.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.norm3.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.norm3.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.0.self_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.cross_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.image_cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.image_cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.image_cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.image_cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.linear1.bias	(2048,)	torch.float32
+tracker.model.transformer.encoder.layers.1.linear1.weight	(2048, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.linear2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.linear2.weight	(256, 2048)	torch.float32
+tracker.model.transformer.encoder.layers.1.norm1.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.norm1.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.norm2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.norm2.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.norm3.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.norm3.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.1.self_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.cross_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.image_cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.image_cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.image_cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.image_cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.linear1.bias	(2048,)	torch.float32
+tracker.model.transformer.encoder.layers.2.linear1.weight	(2048, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.linear2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.linear2.weight	(256, 2048)	torch.float32
+tracker.model.transformer.encoder.layers.2.norm1.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.norm1.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.norm2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.norm2.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.norm3.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.norm3.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.2.self_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.cross_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.image_cross_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.image_cross_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.image_cross_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.image_cross_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.linear1.bias	(2048,)	torch.float32
+tracker.model.transformer.encoder.layers.3.linear1.weight	(2048, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.linear2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.linear2.weight	(256, 2048)	torch.float32
+tracker.model.transformer.encoder.layers.3.norm1.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.norm1.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.norm2.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.norm2.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.norm3.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.norm3.weight	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_k_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_k_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_out_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_out_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_q_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_q_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_v_proj.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.layers.3.self_attn_v_proj.weight	(256, 256)	torch.float32
+tracker.model.transformer.encoder.norm.bias	(256,)	torch.float32
+tracker.model.transformer.encoder.norm.weight	(256,)	torch.float32
