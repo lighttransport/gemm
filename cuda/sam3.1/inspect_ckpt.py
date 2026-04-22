@@ -1,8 +1,13 @@
-"""Inspect sam3.1_multiplex.pt structure."""
+"""Inspect sam3.1_multiplex.pt structure.
+
+Usage: python inspect_ckpt.py <path-to-sam3.1_multiplex.pt>
+"""
 import sys
 import torch
 
-PATH = "/mnt/nvme02/models/sam3.1/sam3.1_multiplex.pt"
+if len(sys.argv) < 2:
+    sys.exit("usage: inspect_ckpt.py <sam3.1_multiplex.pt>")
+PATH = sys.argv[1]
 
 obj = torch.load(PATH, map_location="cpu", weights_only=False)
 print("type:", type(obj).__name__)
