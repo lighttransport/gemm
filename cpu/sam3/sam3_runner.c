@@ -16,12 +16,34 @@
 #include <string.h>
 #include <unistd.h>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
+/* F16C intrinsics for fast fp32->fp16 batch conversion (8 lanes per call).
+ * Falls back to scalar when not available. -mf16c is on by default in the
+ * standalone Makefile (-march=znver# / -march=x86-64-v3) and the server
+ * CMake (-mf16c is appended for x86_64). */
+#if defined(__F16C__) || (defined(__AVX2__) && defined(__GNUC__))
+#include <immintrin.h>
+#define SAM3_HAS_F16C 1
+#endif
+
+/* When embedded in a larger build that already provides these single-header
+ * implementations (e.g. server/ links server.c + sam3_runner.c), define
+ * SAM3_RUNNER_EXTERNAL_IMPLS=1 to get declarations only from safetensors
+ * and ggml_dequant. STB_IMAGE_RESIZE and CPU_COMPUTE are sam3-runner-only
+ * and never conflict, so always implemented here. */
+#ifndef SAM3_RUNNER_EXTERNAL_IMPLS
 #define SAFETENSORS_IMPLEMENTATION
+#endif
 #include "safetensors.h"
 #include <stddef.h>
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include "stb_image_resize2.h"
+#ifndef SAM3_RUNNER_EXTERNAL_IMPLS
 #define GGML_DEQUANT_IMPLEMENTATION
+#endif
 #include "ggml_dequant.h"
 #define CPU_COMPUTE_IMPLEMENTATION
 #include "cpu_compute.h"
@@ -55,10 +77,36 @@ static uint16_t sam3_f32_to_f16(float f) {
     return (uint16_t)(sign | (exp << 10) | mant);
 }
 
+/* Convert n floats → uint16 fp16 into a caller-provided buffer.
+ * Uses F16C VCVTPS2PH (8 lanes) when available, with OpenMP for cross-core
+ * parallelism. Single-threaded scalar fallback. */
+static void sam3_f32_to_f16_buf(const float *src, uint16_t *dst, size_t n)
+{
+#if defined(SAM3_HAS_F16C)
+    const size_t tail = n & 7;
+    const size_t simd_n = n - tail;
+    /* Each OMP thread processes a contiguous span of 8-aligned floats. */
+    #if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (size_t i = 0; i < simd_n; i += 8) {
+        __m256  v = _mm256_loadu_ps(src + i);
+        __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm_storeu_si128((__m128i *)(dst + i), h);
+    }
+    for (size_t i = simd_n; i < n; i++) dst[i] = sam3_f32_to_f16(src[i]);
+#else
+    #if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (size_t i = 0; i < n; i++) dst[i] = sam3_f32_to_f16(src[i]);
+#endif
+}
+
 static uint16_t *sam3_alloc_f16(const float *src, size_t n) {
     uint16_t *dst = (uint16_t *)malloc(n * sizeof(uint16_t));
     if (!dst) return NULL;
-    for (size_t i = 0; i < n; i++) dst[i] = sam3_f32_to_f16(src[i]);
+    sam3_f32_to_f16_buf(src, dst, n);
     return dst;
 }
 
@@ -489,15 +537,14 @@ static int sam3_load_block(sam3_ctx *ctx, int bi)
     const float *ob = GETF32(BK(b, "attention.o_proj.bias"), D * 4);
     if (!qw || !kw || !vw || !qb || !kb || !vb || !ow || !ob) return -1;
 
-    /* Fuse Q/K/V into one (3*D, D) F16 matrix. */
-    float *fused = (float *)malloc((size_t)3 * D * D * sizeof(float));
-    if (!fused) return -1;
-    memcpy(fused + (size_t)0 * D * D, qw, (size_t)D * D * sizeof(float));
-    memcpy(fused + (size_t)1 * D * D, kw, (size_t)D * D * sizeof(float));
-    memcpy(fused + (size_t)2 * D * D, vw, (size_t)D * D * sizeof(float));
-    b->qkv_w = sam3_alloc_f16(fused, (size_t)3 * D * D);
-    free(fused);
+    /* Fuse Q/K/V into one (3*D, D) F16 matrix.
+     * Convert each source slice directly into its slot — no fp32 fused
+     * scratch (saves a 12 MB malloc+memcpy per ViT block, 384 MB total). */
+    b->qkv_w = (uint16_t *)malloc((size_t)3 * D * D * sizeof(uint16_t));
     if (!b->qkv_w) return -1;
+    sam3_f32_to_f16_buf(qw, b->qkv_w + (size_t)0 * D * D, (size_t)D * D);
+    sam3_f32_to_f16_buf(kw, b->qkv_w + (size_t)1 * D * D, (size_t)D * D);
+    sam3_f32_to_f16_buf(vw, b->qkv_w + (size_t)2 * D * D, (size_t)D * D);
 
     b->qkv_b = (float *)malloc((size_t)3 * D * sizeof(float));
     if (!b->qkv_b) return -1;
@@ -537,11 +584,113 @@ static void sam3_free_block(sam3_vit_block *b)
 
 /* 2D conv: kernel k×k, stride 1, pad=p. Input (Ci,H,W), output (Co,H,W)
  * when pad=(k-1)/2. Weight (Co,Ci,k,k). OpenMP over output pixels. */
+/* AVX2-accelerated 2D convolution, NCHW layout, per-output-channel + 8-pixel
+ * SIMD tile along W. Vectorizes the dominant FPN cost (32s scalar -> a few
+ * seconds). Layout match: W[oc, ic, kh, kw] (PyTorch), in[ic, ih, iw],
+ * out[oc, oh, ow]. Padded with zeros (border pixels get masked out via
+ * skipping when ih/iw out of range). */
 static void sam3_conv2d(float *out, const float *in, const float *W,
                         const float *bias, int Ci, int Co, int H, int W_,
                         int k, int pad)
 {
     const int Ho = H, Wo = W_;
+#if defined(SAM3_HAS_F16C)
+    /* Tile width (pixels per inner SIMD step). 8 = one __m256. */
+    enum { TILE = 8 };
+    const int row_in = W_;            /* stride between rows for one ic plane */
+    const int plane_in = H * W_;      /* stride between ic planes */
+    const int rowstr_w_oc = Ci * k * k;  /* W stride per oc */
+    const int kstr = k * k;              /* W stride per ic */
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int oc = 0; oc < Co; oc++) {
+        for (int oh = 0; oh < Ho; oh++) {
+            float *out_row = out + ((size_t)oc * Ho + oh) * Wo;
+            const float bv = bias ? bias[oc] : 0.0f;
+            const __m256 vbias = _mm256_set1_ps(bv);
+            const float *Wb = W + (size_t)oc * rowstr_w_oc;
+
+            int ow = 0;
+            for (; ow + TILE <= Wo; ow += TILE) {
+                __m256 acc = vbias;
+                for (int kh = 0; kh < k; kh++) {
+                    int ih = oh + kh - pad;
+                    if (ih < 0 || ih >= H) continue;
+                    for (int kw = 0; kw < k; kw++) {
+                        int iw_base = ow + kw - pad;
+                        const float *w_kk = Wb + (size_t)kh * k + kw;
+                        /* Need 8 contiguous input pixels at ih, iw_base..iw_base+7.
+                         * If any of those are out of bounds, fall back to scalar
+                         * for this (kh,kw); else vectorize the ic reduction. */
+                        if (iw_base >= 0 && iw_base + (TILE - 1) < W_) {
+                            const float *in_pix = in + (size_t)ih * row_in + iw_base;
+                            int ic = 0;
+                            /* 4-way unrolled FMA chain over ic. */
+                            __m256 a0 = _mm256_setzero_ps();
+                            __m256 a1 = _mm256_setzero_ps();
+                            __m256 a2 = _mm256_setzero_ps();
+                            __m256 a3 = _mm256_setzero_ps();
+                            for (; ic + 3 < Ci; ic += 4) {
+                                __m256 w0 = _mm256_set1_ps(w_kk[(ic + 0) * kstr]);
+                                __m256 w1 = _mm256_set1_ps(w_kk[(ic + 1) * kstr]);
+                                __m256 w2 = _mm256_set1_ps(w_kk[(ic + 2) * kstr]);
+                                __m256 w3 = _mm256_set1_ps(w_kk[(ic + 3) * kstr]);
+                                __m256 x0 = _mm256_loadu_ps(in_pix + (size_t)(ic + 0) * plane_in);
+                                __m256 x1 = _mm256_loadu_ps(in_pix + (size_t)(ic + 1) * plane_in);
+                                __m256 x2 = _mm256_loadu_ps(in_pix + (size_t)(ic + 2) * plane_in);
+                                __m256 x3 = _mm256_loadu_ps(in_pix + (size_t)(ic + 3) * plane_in);
+                                a0 = _mm256_fmadd_ps(w0, x0, a0);
+                                a1 = _mm256_fmadd_ps(w1, x1, a1);
+                                a2 = _mm256_fmadd_ps(w2, x2, a2);
+                                a3 = _mm256_fmadd_ps(w3, x3, a3);
+                            }
+                            for (; ic < Ci; ic++) {
+                                __m256 w0 = _mm256_set1_ps(w_kk[ic * kstr]);
+                                __m256 x0 = _mm256_loadu_ps(in_pix + (size_t)ic * plane_in);
+                                a0 = _mm256_fmadd_ps(w0, x0, a0);
+                            }
+                            acc = _mm256_add_ps(acc, _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+                        } else {
+                            /* Scalar fallback for tiles that straddle the W
+                             * boundary (only the leftmost / rightmost tile). */
+                            float lane[TILE];
+                            _mm256_storeu_ps(lane, acc);
+                            for (int j = 0; j < TILE; j++) {
+                                int iw = ow + j + kw - pad;
+                                if (iw < 0 || iw >= W_) continue;
+                                const float *in_pix = in + (size_t)ih * row_in + iw;
+                                float s = 0.0f;
+                                for (int ic = 0; ic < Ci; ic++)
+                                    s += w_kk[ic * kstr] * in_pix[(size_t)ic * plane_in];
+                                lane[j] += s;
+                            }
+                            acc = _mm256_loadu_ps(lane);
+                        }
+                    }
+                }
+                _mm256_storeu_ps(out_row + ow, acc);
+            }
+            /* Tail pixels (ow not a multiple of TILE). */
+            for (; ow < Wo; ow++) {
+                float acc = bv;
+                for (int kh = 0; kh < k; kh++) {
+                    int ih = oh + kh - pad;
+                    if (ih < 0 || ih >= H) continue;
+                    for (int kw = 0; kw < k; kw++) {
+                        int iw = ow + kw - pad;
+                        if (iw < 0 || iw >= W_) continue;
+                        const float *w_kk = Wb + (size_t)kh * k + kw;
+                        const float *in_pix = in + (size_t)ih * row_in + iw;
+                        for (int ic = 0; ic < Ci; ic++)
+                            acc += w_kk[ic * kstr] * in_pix[(size_t)ic * plane_in];
+                    }
+                }
+                out_row[ow] = acc;
+            }
+        }
+    }
+#else
+    /* Scalar fallback (original loop). */
     #pragma omp parallel for collapse(2) schedule(static)
     for (int oh = 0; oh < Ho; oh++) {
         for (int ow = 0; ow < Wo; ow++) {
@@ -565,15 +714,91 @@ static void sam3_conv2d(float *out, const float *in, const float *W,
             }
         }
     }
+#endif
 }
 
 /* ConvTranspose2d k=2, s=2, no padding. Input (Ci, Hi, Wi) →
- * Output (Co, Hi*2, Wi*2). PyTorch weight layout (Ci, Co, 2, 2). */
+ * Output (Co, Hi*2, Wi*2). PyTorch weight layout (Ci, Co, 2, 2).
+ *
+ * AVX2 path: vectorize over the iw dimension (8 input pixels = 16 output
+ * pixels per inner loop). For each (oc, ih, iw_base), accumulate the
+ * sum_ic in[ic, ih, iw:iw+8] * W[ic, oc, kh, kw] with FMA, then write
+ * 16 contiguous output pixels (2x2 expansion) to two output rows. */
 static void sam3_convT_k2s2(float *out, const float *in, const float *W,
                             const float *bias, int Ci, int Co, int Hi, int Wi)
 {
     const int Ho = Hi * 2, Wo = Wi * 2;
-    /* Zero-init (or fill with bias). */
+#if defined(SAM3_HAS_F16C)
+    enum { TILE = 8 };
+    const size_t plane_in = (size_t)Hi * Wi;
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int oc = 0; oc < Co; oc++) {
+        for (int ih = 0; ih < Hi; ih++) {
+            float *out_row0 = out + ((size_t)oc * Ho + ih * 2) * Wo;
+            float *out_row1 = out_row0 + Wo;
+            const float bv = bias ? bias[oc] : 0.0f;
+            const __m256 vbias = _mm256_set1_ps(bv);
+
+            int iw = 0;
+            for (; iw + TILE <= Wi; iw += TILE) {
+                /* Compute four (kh, kw) in [0,1] x [0,1] sums over ic for
+                 * the 8 contiguous input pixels. */
+                __m256 acc00 = _mm256_setzero_ps(), acc01 = _mm256_setzero_ps();
+                __m256 acc10 = _mm256_setzero_ps(), acc11 = _mm256_setzero_ps();
+
+                const float *in_ic_base = in + (size_t)ih * Wi + iw;
+                for (int ic = 0; ic < Ci; ic++) {
+                    __m256 x = _mm256_loadu_ps(in_ic_base + (size_t)ic * plane_in);
+                    /* W layout (Ci, Co, 2, 2) -> 4 scalars per (ic, oc). */
+                    const float *wp = W + ((size_t)ic * Co + oc) * 4;
+                    __m256 w00 = _mm256_set1_ps(wp[0]);
+                    __m256 w01 = _mm256_set1_ps(wp[1]);
+                    __m256 w10 = _mm256_set1_ps(wp[2]);
+                    __m256 w11 = _mm256_set1_ps(wp[3]);
+                    acc00 = _mm256_fmadd_ps(w00, x, acc00);
+                    acc01 = _mm256_fmadd_ps(w01, x, acc01);
+                    acc10 = _mm256_fmadd_ps(w10, x, acc10);
+                    acc11 = _mm256_fmadd_ps(w11, x, acc11);
+                }
+                acc00 = _mm256_add_ps(acc00, vbias);
+                acc01 = _mm256_add_ps(acc01, vbias);
+                acc10 = _mm256_add_ps(acc10, vbias);
+                acc11 = _mm256_add_ps(acc11, vbias);
+
+                /* Interleave (kw=0, kw=1) into 16 output pixels per row.
+                 * acc00[j] -> out_row0[ow=iw*2 + j*2 + 0]
+                 * acc01[j] -> out_row0[ow=iw*2 + j*2 + 1]
+                 * acc10[j] -> out_row1[..., +0]
+                 * acc11[j] -> out_row1[..., +1] */
+                float a00[8], a01[8], a10[8], a11[8];
+                _mm256_storeu_ps(a00, acc00); _mm256_storeu_ps(a01, acc01);
+                _mm256_storeu_ps(a10, acc10); _mm256_storeu_ps(a11, acc11);
+                int ow_base = iw * 2;
+                for (int j = 0; j < TILE; j++) {
+                    out_row0[ow_base + j*2 + 0] = a00[j];
+                    out_row0[ow_base + j*2 + 1] = a01[j];
+                    out_row1[ow_base + j*2 + 0] = a10[j];
+                    out_row1[ow_base + j*2 + 1] = a11[j];
+                }
+            }
+            /* Scalar tail (Wi not a multiple of 8). */
+            for (; iw < Wi; iw++) {
+                float s00 = 0, s01 = 0, s10 = 0, s11 = 0;
+                for (int ic = 0; ic < Ci; ic++) {
+                    float xv = in[(size_t)ic * plane_in + ih * Wi + iw];
+                    const float *wp = W + ((size_t)ic * Co + oc) * 4;
+                    s00 += wp[0] * xv; s01 += wp[1] * xv;
+                    s10 += wp[2] * xv; s11 += wp[3] * xv;
+                }
+                int ow_base = iw * 2;
+                out_row0[ow_base + 0] = s00 + bv; out_row0[ow_base + 1] = s01 + bv;
+                out_row1[ow_base + 0] = s10 + bv; out_row1[ow_base + 1] = s11 + bv;
+            }
+        }
+    }
+#else
+    /* Scalar fallback. */
     #pragma omp parallel for collapse(2) schedule(static)
     for (int oc = 0; oc < Co; oc++) {
         for (int oh = 0; oh < Ho; oh++) {
@@ -582,7 +807,6 @@ static void sam3_convT_k2s2(float *out, const float *in, const float *W,
             for (int ow = 0; ow < Wo; ow++) row[ow] = bv;
         }
     }
-    /* Scatter-add: for each input pixel, add contributions to 2x2 output. */
     #pragma omp parallel for collapse(2) schedule(static)
     for (int oc = 0; oc < Co; oc++) {
         for (int ih = 0; ih < Hi; ih++) {
@@ -592,7 +816,6 @@ static void sam3_convT_k2s2(float *out, const float *in, const float *W,
                         int oh = ih * 2 + kh, ow = iw * 2 + kw;
                         float acc = 0.0f;
                         for (int ic = 0; ic < Ci; ic++) {
-                            /* W shape (Ci, Co, 2, 2) */
                             float w = W[((size_t)ic * Co + oc) * 4 + kh * 2 + kw];
                             acc += w * in[((size_t)ic * Hi + ih) * Wi + iw];
                         }
@@ -602,6 +825,7 @@ static void sam3_convT_k2s2(float *out, const float *in, const float *W,
             }
         }
     }
+#endif
 }
 
 /* MaxPool2d k=2, s=2. Input (C, H, W) → Output (C, H/2, W/2). */
@@ -780,9 +1004,30 @@ sam3_ctx *sam3_create(const sam3_config *cfg)
     }
 
     fprintf(stderr, "sam3: loading 32 ViT blocks ...\n");
-    for (int bi = 0; bi < SAM3_N_BLOCKS; bi++) {
-        if (sam3_load_block(ctx, bi) != 0) {
-            fprintf(stderr, "sam3: failed to load block %d\n", bi);
+    {
+        /* Load blocks in parallel: each block's weights are independent and
+         * sam3_get() only does read-only lookups into the mmap'd safetensors.
+         * Disable nested parallelism so sam3_f32_to_f16_buf inside
+         * sam3_alloc_f16 doesn't oversubscribe. */
+        int block_err = 0;
+        #if defined(_OPENMP)
+        int prev_nested = omp_get_nested();
+        omp_set_nested(0);
+        #pragma omp parallel for schedule(dynamic, 1)
+        #endif
+        for (int bi = 0; bi < SAM3_N_BLOCKS; bi++) {
+            if (sam3_load_block(ctx, bi) != 0) {
+                #if defined(_OPENMP)
+                #pragma omp atomic write
+                #endif
+                block_err = 1;
+            }
+        }
+        #if defined(_OPENMP)
+        omp_set_nested(prev_nested);
+        #endif
+        if (block_err) {
+            fprintf(stderr, "sam3: failed to load one or more ViT blocks\n");
             sam3_destroy(ctx); return NULL;
         }
     }
@@ -810,9 +1055,26 @@ sam3_ctx *sam3_create(const sam3_config *cfg)
         sam3_destroy(ctx); return NULL;
     }
     fprintf(stderr, "sam3: loading 24 text blocks ...\n");
-    for (int li = 0; li < SAM3_TEXT_LAYERS; li++) {
-        if (sam3_load_text_block(ctx, li) != 0) {
-            fprintf(stderr, "sam3: failed text block %d\n", li);
+    {
+        int text_err = 0;
+        #if defined(_OPENMP)
+        int prev_nested = omp_get_nested();
+        omp_set_nested(0);
+        #pragma omp parallel for schedule(dynamic, 1)
+        #endif
+        for (int li = 0; li < SAM3_TEXT_LAYERS; li++) {
+            if (sam3_load_text_block(ctx, li) != 0) {
+                #if defined(_OPENMP)
+                #pragma omp atomic write
+                #endif
+                text_err = 1;
+            }
+        }
+        #if defined(_OPENMP)
+        omp_set_nested(prev_nested);
+        #endif
+        if (text_err) {
+            fprintf(stderr, "sam3: failed text block load\n");
             sam3_destroy(ctx); return NULL;
         }
     }
@@ -1124,6 +1386,9 @@ static void sam3_vit_block_forward(sam3_ctx *ctx, int bi, float *x)
         const int hd = SAM3_HEAD_DIM, heads = SAM3_HEADS;
         const int pairs = hd / 2;
         const int stride3 = 3 * D;
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+        #endif
         for (int t = 0; t < total_tok; t++) {
             int ri = t % attn_n_tok;
             const float *c = rope_cos + (size_t)ri * hd;
@@ -1168,7 +1433,21 @@ static void sam3_vit_block_forward(sam3_ctx *ctx, int bi, float *x)
         sam3_window_unpartition(ctx->attn_buf, ctx->tok_b, H, W, D, SAM3_WIN);
         attn_result = ctx->attn_buf;
     }
-    for (int i = 0; i < n_tok * D; i++) x[i] += attn_result[i];
+    {
+        const size_t total = (size_t)n_tok * D;
+#if defined(SAM3_HAS_F16C)
+        size_t i = 0;
+        #pragma omp parallel for schedule(static)
+        for (size_t ii = 0; ii < total; ii += 8) {
+            __m256 a = _mm256_loadu_ps(x + ii);
+            __m256 b = _mm256_loadu_ps(attn_result + ii);
+            _mm256_storeu_ps(x + ii, _mm256_add_ps(a, b));
+        }
+        for (i = (total & ~(size_t)7); i < total; i++) x[i] += attn_result[i];
+#else
+        for (size_t i = 0; i < total; i++) x[i] += attn_result[i];
+#endif
+    }
 
     /* ---- MLP branch ---- */
     /* y = ln2(x) into tok_b */
@@ -1180,7 +1459,20 @@ static void sam3_vit_block_forward(sam3_ctx *ctx, int bi, float *x)
     /* fc2: (n_tok, D) into attn_buf (reuse) */
     cpu_gemm_f16(ctx->attn_buf, b->fc2_w, b->fc2_b, ctx->mlp_buf,
                  n_tok, D, MLP, nt);
-    for (int i = 0; i < n_tok * D; i++) x[i] += ctx->attn_buf[i];
+    {
+        const size_t total = (size_t)n_tok * D;
+#if defined(SAM3_HAS_F16C)
+        #pragma omp parallel for schedule(static)
+        for (size_t ii = 0; ii < total; ii += 8) {
+            __m256 a = _mm256_loadu_ps(x + ii);
+            __m256 b = _mm256_loadu_ps(ctx->attn_buf + ii);
+            _mm256_storeu_ps(x + ii, _mm256_add_ps(a, b));
+        }
+        for (size_t i = (total & ~(size_t)7); i < total; i++) x[i] += ctx->attn_buf[i];
+#else
+        for (size_t i = 0; i < total; i++) x[i] += ctx->attn_buf[i];
+#endif
+    }
 }
 
 int sam3_run_vit(sam3_ctx *ctx, int stop_at_block)

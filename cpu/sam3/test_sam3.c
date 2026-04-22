@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void write_npy_u8(const char *path, const uint8_t *data,
                           int n, int h, int w) {
@@ -75,19 +76,36 @@ int main(int argc, char **argv) {
     sam3_clip_bpe_free(tok);
 
     sam3_config cfg = { .ckpt_path = ckpt, .image_size = 1008, .num_threads = threads };
+    struct timespec _t0, _t1;
+    clock_gettime(CLOCK_MONOTONIC, &_t0);
     sam3_ctx *ctx = sam3_create(&cfg);
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    fprintf(stderr, "[timing] sam3_create (weight load+dequant): %.2f s\n",
+            (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9);
     if (!ctx) return 4;
+    clock_gettime(CLOCK_MONOTONIC, &_t0);
 
-    if (sam3_set_image(ctx, rgb, H, W)) return 5;
-    if (sam3_run_vit(ctx, 31)) return 6;
-    if (sam3_run_fpn(ctx)) return 7;
-    if (sam3_set_input_ids(ctx, ids, mask)) return 8;
-    if (sam3_run_text(ctx)) return 9;
-    if (sam3_run_detr_enc(ctx)) return 10;
-    if (sam3_run_detr_dec(ctx)) return 11;
-    if (sam3_run_dot_score(ctx)) return 12;
-    if (sam3_run_mask_dec(ctx)) return 13;
-    if (sam3_run_postprocess(ctx, H, W, score_thr, mask_thr)) return 14;
+    #define TIME_STAGE(label, call) do { \
+        struct timespec _s0, _s1; \
+        clock_gettime(CLOCK_MONOTONIC, &_s0); \
+        if ((call)) return 99; \
+        clock_gettime(CLOCK_MONOTONIC, &_s1); \
+        fprintf(stderr, "[stage] %-20s %.2f s\n", (label), \
+            (_s1.tv_sec - _s0.tv_sec) + (_s1.tv_nsec - _s0.tv_nsec) / 1e9); \
+    } while (0)
+    TIME_STAGE("set_image",       sam3_set_image(ctx, rgb, H, W));
+    TIME_STAGE("run_vit (32 blk)", sam3_run_vit(ctx, 31));
+    TIME_STAGE("run_fpn",          sam3_run_fpn(ctx));
+    TIME_STAGE("set_input_ids",    sam3_set_input_ids(ctx, ids, mask));
+    TIME_STAGE("run_text",         sam3_run_text(ctx));
+    TIME_STAGE("run_detr_enc",     sam3_run_detr_enc(ctx));
+    TIME_STAGE("run_detr_dec",     sam3_run_detr_dec(ctx));
+    TIME_STAGE("run_dot_score",    sam3_run_dot_score(ctx));
+    TIME_STAGE("run_mask_dec",     sam3_run_mask_dec(ctx));
+    TIME_STAGE("run_postprocess",  sam3_run_postprocess(ctx, H, W, score_thr, mask_thr));
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    fprintf(stderr, "[timing] inference total: %.2f s\n",
+            (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9);
 
     int nk, oh, ow;
     const float   *scores = sam3_get_final_scores(ctx, &nk);
