@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
     }
 
     const char *model_path = argv[1];
-    const char *image_path = "../../common/fujisan.jpg";
+    const char *image_path = "../../common/test.jpg";
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) image_path = argv[++i];
