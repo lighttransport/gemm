@@ -3,78 +3,316 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SAM3 Segmentation Demo</title>
+  <title>SAM 3 / 3.1 Segmentation</title>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
-    main { max-width: 920px; margin: 0 auto; padding: 28px 18px; }
-    h1 { font-size: 28px; margin: 0 0 18px; }
-    form, .output { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-    label { display: block; font-size: 13px; font-weight: 650; margin: 12px 0 6px; }
-    input, textarea, select, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 10px; }
-    textarea { min-height: 84px; resize: vertical; }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px 18px; }
+    h1 { font-size: 26px; margin: 0 0 4px; }
+    .sub { color: #6a7180; font-size: 13px; margin-bottom: 18px; }
+    form, .panel { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    label { display: block; font-size: 13px; font-weight: 650; margin: 10px 0 6px; }
+    input, select, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 9px 10px; background: #fff; }
     button { margin-top: 14px; background: #1b6f5f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111; color: #f4f4f4; padding: 12px; border-radius: 6px; min-height: 70px; }
+    button[disabled] { background: #9aa4b1; cursor: not-allowed; }
+    button.cancel { background: #b94a48; }
+    .btn-row { display: flex; gap: 10px; margin-top: 14px; }
+    .btn-row button { margin-top: 0; }
+    .status { margin-top: 8px; font-size: 12px; color: #6a7180; min-height: 16px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .canvas-wrap { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+    .canvas-wrap canvas { max-width: 640px; border: 1px solid #d9dde5; border-radius: 6px; background: #1a1c20; }
+    .masks { flex: 1 1 280px; min-width: 240px; }
+    .mask-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+    .mask-row:hover { background: #eef1f6; }
+    .mask-row.off { opacity: 0.45; }
+    .swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+    .meta { font-size: 12px; color: #6a7180; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #15171a; color: #e6e8ec; padding: 12px; border-radius: 6px; max-height: 240px; overflow: auto; font-size: 12px; }
+    details summary { cursor: pointer; font-size: 13px; color: #4d5563; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e6f3ef; color: #1b6f5f; margin-left: 8px; }
+    .pill.warn { background: #fdf0e2; color: #a55a14; }
   </style>
 </head>
 <body>
 <main>
-  <h1>SAM3 Segmentation</h1>
-  <form id="form">
+  <h1>SAM 3 segmentation
+    <span class="pill" id="modelPill">sam3</span>
+  </h1>
+  <div class="sub">Text-prompted instance segmentation. POSTs <code>/v1/infer</code> with the selected backend.</div>
+
+  <form id="form" class="panel">
     <div class="row">
-      <div><label for="backend">Backend</label><select id="backend"><option>cpu</option><option>hip</option></select></div>
-      <div><label for="image">Image</label><input id="image" type="file" accept="image/*"></div>
+      <div>
+        <label for="model">Model</label>
+        <select id="model">
+          <option value="sam3">sam3</option>
+          <option value="sam3.1">sam3.1 (pending runner)</option>
+        </select>
+      </div>
+      <div>
+        <label for="backend">Backend</label>
+        <select id="backend">
+          <option value="cpu">cpu</option>
+          <option value="cuda">cuda</option>
+        </select>
+      </div>
+      <div>
+        <label for="image">Image</label>
+        <input id="image" type="file" accept="image/*">
+      </div>
     </div>
+
     <label for="text">Text prompt</label>
-    <input id="text" placeholder="object to segment">
-    <label for="points">Points JSON</label>
-    <textarea id="points">[]</textarea>
-    <label for="boxes">Boxes JSON</label>
-    <textarea id="boxes">[]</textarea>
-    <button type="submit">Segment</button>
+    <input id="text" placeholder="e.g. cat, mountain, person" required>
+
+    <details>
+      <summary>Advanced (thresholds, max masks)</summary>
+      <div class="row">
+        <div><label for="score">score_threshold</label><input id="score" type="number" step="0.05" value="0.3"></div>
+        <div><label for="mask">mask_threshold</label><input id="mask" type="number" step="0.05" value="0.5"></div>
+        <div><label for="maxn">max_masks</label><input id="maxn" type="number" min="1" max="64" value="8"></div>
+      </div>
+    </details>
+
+    <div class="btn-row">
+      <button type="submit" id="go">Segment</button>
+      <button type="button" id="cancel" class="cancel" disabled>Cancel</button>
+    </div>
+    <div class="status" id="status"></div>
   </form>
-  <section class="output">
-    <pre id="log">SAM3 is exposed as a v1 API stub until native CPU/HIP runners are added.</pre>
+
+  <section class="panel" id="resultPanel" hidden>
+    <div class="canvas-wrap">
+      <canvas id="canvas"></canvas>
+      <div class="masks" id="maskList"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <details>
+      <summary>Raw JSON response</summary>
+      <pre id="log">No request sent yet.</pre>
+    </details>
   </section>
 </main>
+
 <script>
 const $ = id => document.getElementById(id);
-function readFileBase64(file) {
-  return new Promise((resolve, reject) => {
+const COLORS = [
+  [255, 87, 87], [88, 167, 255], [255, 198, 60], [126, 217, 87],
+  [186, 104, 200], [255, 138, 101], [77, 208, 225], [240, 98, 146],
+  [129, 199, 132], [149, 117, 205], [255, 167, 38], [79, 195, 247],
+  [244, 143, 177], [156, 204, 101], [102, 187, 106], [171, 71, 188]
+];
+
+let srcImage = null;     // HTMLImageElement
+let masks = [];          // [{img: HTMLImageElement, score, box, color, on}]
+
+function readFile(file) {
+  return new Promise((res, rej) => {
     const r = new FileReader();
-    r.onload = () => resolve(String(r.result).split(',')[1] || '');
-    r.onerror = reject;
+    r.onload = () => res(String(r.result).split(',')[1] || '');
+    r.onerror = rej;
     r.readAsDataURL(file);
   });
 }
-document.getElementById('form').addEventListener('submit', async event => {
-  event.preventDefault();
-  $('log').textContent = 'Sending request...';
+
+function loadImg(dataUrl) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = rej;
+    im.src = dataUrl;
+  });
+}
+
+function redraw() {
+  const c = $('canvas');
+  if (!srcImage) return;
+  const W = srcImage.naturalWidth, H = srcImage.naturalHeight;
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(srcImage, 0, 0);
+
+  // Overlay each enabled mask with its color at alpha.
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  const tctx = tmp.getContext('2d');
+
+  for (const m of masks) {
+    if (!m.on) continue;
+    tctx.clearRect(0, 0, W, H);
+    tctx.drawImage(m.img, 0, 0, W, H);
+    const id = tctx.getImageData(0, 0, W, H);
+    const [r, g, b] = m.color;
+    const data = id.data;
+    for (let i = 0; i < data.length; i += 4) {
+      // mask PNG is grayscale (R=G=B, A=255). Treat any nonzero R as mask hit.
+      if (data[i] > 127) {
+        data[i]   = r;
+        data[i+1] = g;
+        data[i+2] = b;
+        data[i+3] = 140; // alpha
+      } else {
+        data[i+3] = 0;
+      }
+    }
+    tctx.putImageData(id, 0, 0);
+    ctx.drawImage(tmp, 0, 0);
+
+    // box outline
+    ctx.strokeStyle = `rgb(${r},${g},${b})`;
+    ctx.lineWidth = Math.max(2, Math.round(W / 400));
+    const [x0, y0, x1, y1] = m.box;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  }
+}
+
+function buildMaskList() {
+  const list = $('maskList');
+  list.innerHTML = '';
+  masks.forEach((m, i) => {
+    const row = document.createElement('div');
+    row.className = 'mask-row';
+    const sw = document.createElement('div');
+    sw.className = 'swatch';
+    sw.style.background = `rgb(${m.color.join(',')})`;
+    const label = document.createElement('div');
+    label.innerHTML = `<div>mask ${i+1} <span class="meta">score ${m.score.toFixed(3)}</span></div>` +
+                      `<div class="meta">box [${m.box.map(v => v.toFixed(0)).join(', ')}]</div>`;
+    row.appendChild(sw);
+    row.appendChild(label);
+    row.addEventListener('click', () => {
+      m.on = !m.on;
+      row.classList.toggle('off', !m.on);
+      redraw();
+    });
+    list.appendChild(row);
+  });
+}
+
+function syncModelUI(value) {
+  $('modelPill').textContent = value;
+  $('modelPill').className = 'pill' + (value === 'sam3.1' ? ' warn' : '');
+  document.title = value === 'sam3.1'
+    ? 'SAM 3.1 Segmentation (preview)'
+    : 'SAM 3 Segmentation';
+}
+
+$('model').addEventListener('change', e => syncModelUI(e.target.value));
+
+/* Pick the initial model from the URL path: /sam3.1 -> sam3.1, /sam3 -> sam3.
+ * Falls back to whatever the <select> says (default first <option>). */
+(function initFromPath() {
+  const p = location.pathname.replace(/\/+$/, '');
+  let m = null;
+  if (p === '/sam3.1' || p.endsWith('/sam3.1')) m = 'sam3.1';
+  else if (p === '/sam3' || p.endsWith('/sam3') || p.endsWith('/sam3.html')) m = 'sam3';
+  if (m) $('model').value = m;
+  syncModelUI($('model').value);
+})();
+
+let activeAbort = null;       // AbortController for in-flight fetch
+let elapsedTimer = null;      // setInterval id for ticking the status line
+
+function setRunning(on) {
+  $('go').disabled = on;
+  $('cancel').disabled = !on;
+}
+
+function startElapsed(t0) {
+  stopElapsed();
+  elapsedTimer = setInterval(() => {
+    const s = ((performance.now() - t0) / 1000).toFixed(1);
+    $('status').textContent = `Inference running… ${s}s (Cancel detaches the request; the server keeps computing until it finishes)`;
+  }, 100);
+}
+
+function stopElapsed() {
+  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+}
+
+$('cancel').addEventListener('click', () => {
+  if (activeAbort) {
+    activeAbort.abort();
+    $('status').textContent = 'Cancel sent — fetch aborted on the client.';
+  }
+});
+
+$('form').addEventListener('submit', async ev => {
+  ev.preventDefault();
   const file = $('image').files[0];
-  const payload = {
-    model: 'sam3',
-    task: 'segmentation',
-    backend: $('backend').value,
-    inputs: {
-      text: $('text').value,
-      image_base64: file ? await readFileBase64(file) : null,
-      image_mime: file ? file.type : null,
-      points: JSON.parse($('points').value || '[]'),
-      boxes: JSON.parse($('boxes').value || '[]')
-    },
-    weights: {},
-    params: {}
-  };
+  if (!file) { $('log').textContent = 'Pick an image first.'; return; }
+  setRunning(true);
+  $('log').textContent = 'Encoding image and POSTing /v1/infer...';
+  $('status').textContent = '';
+
+  // If a previous request is somehow still active, abort it first.
+  if (activeAbort) { try { activeAbort.abort(); } catch (_) {} }
+  activeAbort = new AbortController();
+  const myAbort = activeAbort; // capture
+
   try {
+    const b64 = await readFile(file);
+    srcImage = await loadImg('data:' + (file.type || 'image/png') + ';base64,' + b64);
+    masks = [];
+    buildMaskList();
+    redraw();
+    $('resultPanel').hidden = false;
+
+    const payload = {
+      model: $('model').value,
+      task: 'segmentation',
+      backend: $('backend').value,
+      inputs: { text: $('text').value, image_base64: b64 },
+      weights: {},
+      params: {
+        score_threshold: parseFloat($('score').value) || 0.3,
+        mask_threshold:  parseFloat($('mask').value)  || 0.5,
+        max_masks:       parseInt($('maxn').value, 10) || 8
+      }
+    };
+
+    const t0 = performance.now();
+    startElapsed(t0);
     const res = await fetch('/v1/infer', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: myAbort.signal
     });
-    $('log').textContent = JSON.stringify(await res.json(), null, 2);
+    const dt = (performance.now() - t0).toFixed(0);
+    const json = await res.json();
+    stopElapsed();
+    $('status').textContent = `Done in ${dt} ms.`;
+    $('log').textContent = `HTTP ${res.status} (${dt} ms)\n` + JSON.stringify(json, null, 2);
+
+    if (!json.ok) return;
+
+    const outs = (json.outputs || []).filter(o => o.type === 'mask');
+    masks = await Promise.all(outs.map(async (o, i) => ({
+      img:   await loadImg('data:' + (o.mime || 'image/png') + ';base64,' + o.data_base64),
+      score: o.score,
+      box:   o.box,
+      color: COLORS[i % COLORS.length],
+      on:    true
+    })));
+    buildMaskList();
+    redraw();
   } catch (err) {
-    $('log').textContent = String(err);
+    stopElapsed();
+    if (err && err.name === 'AbortError') {
+      $('log').textContent = 'Request canceled by user.\nNote: the server-side computation continues until completion (no internal cancel hook in the sam3 runner). The next /v1/infer will be queued behind it.';
+      $('status').textContent = 'Canceled.';
+    } else {
+      $('log').textContent = String(err && err.stack || err);
+      $('status').textContent = 'Error.';
+    }
+  } finally {
+    if (activeAbort === myAbort) activeAbort = null;
+    setRunning(false);
   }
 });
 </script>
