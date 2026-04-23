@@ -1331,6 +1331,10 @@ static const char *mime_for_path(const char *path) {
     if (has_suffix(path, ".png")) return "image/png";
     if (has_suffix(path, ".jpg") || has_suffix(path, ".jpeg")) return "image/jpeg";
     if (has_suffix(path, ".webp")) return "image/webp";
+    if (has_suffix(path, ".glb")) return "model/gltf-binary";
+    if (has_suffix(path, ".gltf")) return "model/gltf+json";
+    if (has_suffix(path, ".obj")) return "text/plain; charset=utf-8";
+    if (has_suffix(path, ".ply")) return "application/octet-stream";
     return "application/octet-stream";
 }
 
@@ -1474,6 +1478,10 @@ static void handle_static(int fd, const server_config *cfg, const char *url_path
     else if (strcmp(rel, "/qwen_image_compare") == 0) rel = "/qwen_image_compare.html";
     else if (strcmp(rel, "/flux2") == 0) rel = "/flux2.html";
     else if (strcmp(rel, "/flux2_compare") == 0) rel = "/flux2_compare.html";
+    else if (strcmp(rel, "/hy3d") == 0) rel = "/hy3d.html";
+    else if (strcmp(rel, "/hy3d_compare") == 0) rel = "/hy3d.html";
+    else if (strcmp(rel, "/trellis2") == 0) rel = "/trellis2.html";
+    else if (strcmp(rel, "/trellis2_compare") == 0) rel = "/trellis2.html";
     if (!path_is_safe(rel)) {
         char *e = json_error_response("bad_path", "invalid static path");
         send_response(fd, 400, "application/json", e, strlen(e));
