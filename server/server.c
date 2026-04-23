@@ -46,6 +46,8 @@
 #include <errno.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <strings.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -72,6 +74,8 @@ typedef struct {
     const char *sam3_ckpt_v31;
     const char *sam3_vocab;
     const char *sam3_merges;
+    const char *sam3_ref_url;     /* http://host:port forwarded via /v1/ref/sam3   */
+    const char *sam3_1_ref_url;   /* http://host:port forwarded via /v1/ref/sam3.1 */
     int device;
     int mcp_stdio;
     int stdio_mode;
@@ -1177,6 +1181,7 @@ static const char *mime_for_path(const char *path) {
     if (has_suffix(path, ".js")) return "application/javascript; charset=utf-8";
     if (has_suffix(path, ".png")) return "image/png";
     if (has_suffix(path, ".jpg") || has_suffix(path, ".jpeg")) return "image/jpeg";
+    if (has_suffix(path, ".webp")) return "image/webp";
     return "application/octet-stream";
 }
 
@@ -1291,6 +1296,7 @@ static void handle_static(int fd, const server_config *cfg, const char *url_path
     if (strcmp(rel, "/") == 0)        rel = "/qwen-image.html";
     else if (strcmp(rel, "/sam3") == 0)   rel = "/sam3.html";
     else if (strcmp(rel, "/sam3.1") == 0) rel = "/sam3.1.html";
+    else if (strcmp(rel, "/sam3_compare") == 0) rel = "/sam3_compare.html";
     else if (strcmp(rel, "/qwen-image") == 0) rel = "/qwen-image.html";
     if (!path_is_safe(rel)) {
         char *e = json_error_response("bad_path", "invalid static path");
@@ -1356,6 +1362,156 @@ static size_t parse_content_length(const char *headers) {
 #endif
 }
 
+/* ------------------------------------------------------------------ *
+ * Ref-server HTTP proxy
+ *
+ * Parses http://host[:port] from ref_url, opens a TCP connection,
+ * writes METHOD upstream_path HTTP/1.1 + headers + body, then reads the
+ * response and forwards the body back to the browser with our CORS
+ * headers. Deliberately minimal — no chunked encoding, no keep-alive.
+ * ------------------------------------------------------------------ */
+static int parse_http_url(const char *url, char *host, size_t host_cap, int *port_out, const char **tail) {
+    if (!url) return -1;
+    const char *p = url;
+    if (strncmp(p, "http://", 7) == 0) p += 7;
+    else if (strncmp(p, "https://", 8) == 0) return -1; /* TLS not supported */
+    const char *slash = strchr(p, '/');
+    const char *hostend = slash ? slash : p + strlen(p);
+    const char *colon = memchr(p, ':', (size_t)(hostend - p));
+    size_t hlen = (size_t)((colon ? colon : hostend) - p);
+    if (hlen == 0 || hlen >= host_cap) return -1;
+    memcpy(host, p, hlen); host[hlen] = 0;
+    *port_out = colon ? atoi(colon + 1) : 80;
+    if (tail) *tail = slash ? slash : "";
+    return 0;
+}
+
+static int tcp_connect(const char *host, int port) {
+    char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
+    int s = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s < 0) continue;
+        if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(s); s = -1;
+    }
+    freeaddrinfo(res);
+    return s;
+}
+
+/* Send a fixed-body request and read the response into resp (including
+ * status line + headers + body). Returns 0 on success. */
+static int http_forward(const char *ref_url, const char *method,
+                        const char *upstream_path,
+                        const char *body, size_t body_len,
+                        bbuf *resp) {
+    char host[256]; int port = 0; const char *tail = NULL;
+    if (parse_http_url(ref_url, host, sizeof(host), &port, &tail) != 0) return -1;
+    int s = tcp_connect(host, port);
+    if (s < 0) return -2;
+    char hdr[1024];
+    int n = snprintf(hdr, sizeof(hdr),
+        "%s %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        method, upstream_path, host, port, body_len);
+    if (n <= 0 || (size_t)n >= sizeof(hdr)) { close(s); return -3; }
+    send_all(s, hdr, (size_t)n);
+    if (body_len) send_all(s, body, body_len);
+    char tmp[READ_CHUNK];
+    for (;;) {
+        ssize_t r = recv(s, tmp, sizeof(tmp), 0);
+        if (r <= 0) break;
+        bbuf_append(resp, tmp, (size_t)r);
+        if (resp->len > MAX_BODY_BYTES) break;
+    }
+    close(s);
+    return 0;
+}
+
+/* Extract body + content-type + status from a full HTTP response.
+ * Returns pointer into resp->data (no copy). */
+static const char *parse_http_response(const bbuf *resp, int *status_out,
+                                       char *ctype, size_t ctype_cap,
+                                       size_t *body_off, size_t *body_len) {
+    const char *d = (const char *)resp->data;
+    size_t L = resp->len;
+    if (L < 12 || strncmp(d, "HTTP/", 5) != 0) return NULL;
+    const char *sp = memchr(d, ' ', L);
+    if (!sp) return NULL;
+    *status_out = atoi(sp + 1);
+    /* find header end */
+    size_t hend = 0;
+    for (size_t i = 3; i < L; i++) {
+        if (d[i-3] == '\r' && d[i-2] == '\n' && d[i-1] == '\r' && d[i] == '\n') {
+            hend = i + 1; break;
+        }
+    }
+    if (!hend) return NULL;
+    ctype[0] = 0;
+    const char *p = d;
+    while (p < d + hend) {
+        const char *eol = memchr(p, '\n', (size_t)(d + hend - p));
+        if (!eol) break;
+        size_t ll = (size_t)(eol - p);
+        if (ll > 14 && strncasecmp(p, "content-type:", 13) == 0) {
+            const char *v = p + 13;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            size_t vl = (size_t)(eol - v);
+            while (vl && (v[vl-1] == '\r' || v[vl-1] == ' ')) vl--;
+            if (vl >= ctype_cap) vl = ctype_cap - 1;
+            memcpy(ctype, v, vl); ctype[vl] = 0;
+        }
+        p = eol + 1;
+    }
+    *body_off = hend;
+    *body_len = L - hend;
+    return d;
+}
+
+static void proxy_ref(int fd, const char *ref_url, const char *method,
+                      const char *upstream_path,
+                      const char *body, size_t body_len) {
+    if (!ref_url || !*ref_url) {
+        char *e = json_error_response("ref_not_configured",
+            "ref URL not configured — pass --sam3-ref-url / --sam3-1-ref-url to the server");
+        send_response(fd, 503, "application/json", e, strlen(e));
+        free(e);
+        return;
+    }
+    bbuf resp; bbuf_init(&resp);
+    int rc = http_forward(ref_url, method, upstream_path, body, body_len, &resp);
+    if (rc != 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "proxy to %s failed (rc=%d) — is the ref server running?", ref_url, rc);
+        char *e = json_error_response("ref_unreachable", msg);
+        send_response(fd, 502, "application/json", e, strlen(e));
+        free(e);
+        bbuf_free(&resp);
+        return;
+    }
+    int status = 500;
+    char ctype[128] = "application/json";
+    size_t body_off = 0, rlen = 0;
+    const char *raw = parse_http_response(&resp, &status, ctype, sizeof(ctype), &body_off, &rlen);
+    if (!raw) {
+        char *e = json_error_response("ref_bad_response", "malformed response from ref server");
+        send_response(fd, 502, "application/json", e, strlen(e));
+        free(e);
+        bbuf_free(&resp);
+        return;
+    }
+    send_response(fd, status, ctype, raw + body_off, rlen);
+    bbuf_free(&resp);
+}
+
 static void handle_client(int fd, const server_config *cfg) {
     bbuf req;
     bbuf_init(&req);
@@ -1395,7 +1551,8 @@ static void handle_client(int fd, const server_config *cfg) {
         char *j = health_json();
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
-    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/models") == 0) {
+    } else if (strcmp(method, "GET") == 0 &&
+               (strcmp(path, "/models") == 0 || strcmp(path, "/v1/models") == 0)) {
         char *j = models_json();
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
@@ -1404,6 +1561,20 @@ static void handle_client(int fd, const server_config *cfg) {
         char *j = infer_json(cfg, body, content_len, &status);
         send_response(fd, status, "application/json", j, strlen(j));
         free(j);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3/infer") == 0) {
+        proxy_ref(fd, cfg->sam3_ref_url, "POST", "/v1/infer", body, content_len);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3.1/infer") == 0) {
+        proxy_ref(fd, cfg->sam3_1_ref_url, "POST", "/v1/infer", body, content_len);
+    } else if (strcmp(method, "GET") == 0 &&
+               (strcmp(path, "/v1/ref/sam3/models") == 0 ||
+                strcmp(path, "/v1/ref/sam3/health") == 0)) {
+        const char *up = strchr(path + 8, '/'); /* /v1/ref/sam3<here> */
+        proxy_ref(fd, cfg->sam3_ref_url, "GET", up, NULL, 0);
+    } else if (strcmp(method, "GET") == 0 &&
+               (strcmp(path, "/v1/ref/sam3.1/models") == 0 ||
+                strcmp(path, "/v1/ref/sam3.1/health") == 0)) {
+        const char *up = strchr(path + 10, '/'); /* /v1/ref/sam3.1<here> */
+        proxy_ref(fd, cfg->sam3_1_ref_url, "GET", up, NULL, 0);
     } else if (strcmp(method, "GET") == 0) {
         handle_static(fd, cfg, path);
     } else {
@@ -1621,6 +1792,8 @@ static void usage(const char *prog) {
         "  --sam3-ckpt-v31 <path>   default sam3.1.model.safetensors (cuda only)\n"
         "  --sam3-vocab <path>      CLIP BPE vocab.json\n"
         "  --sam3-merges <path>     CLIP BPE merges.txt\n"
+        "  --sam3-ref-url <url>     proxy /v1/ref/sam3/*   to URL (pytorch ref, sam3)\n"
+        "  --sam3-1-ref-url <url>   proxy /v1/ref/sam3.1/* to URL (pytorch ref, sam3.1)\n"
         "  --device <n>             default 0\n"
         "  --stdio                  line-delimited JSON transport for local debugging\n"
         "  --mcp-stdio              run MCP stdio mode when compiled\n",
@@ -1646,6 +1819,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--sam3-ckpt-v31") == 0 && i + 1 < argc) cfg.sam3_ckpt_v31 = argv[++i];
         else if (strcmp(argv[i], "--sam3-vocab") == 0 && i + 1 < argc) cfg.sam3_vocab = argv[++i];
         else if (strcmp(argv[i], "--sam3-merges") == 0 && i + 1 < argc) cfg.sam3_merges = argv[++i];
+        else if (strcmp(argv[i], "--sam3-ref-url") == 0 && i + 1 < argc) cfg.sam3_ref_url = argv[++i];
+        else if (strcmp(argv[i], "--sam3-1-ref-url") == 0 && i + 1 < argc) cfg.sam3_1_ref_url = argv[++i];
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) cfg.device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stdio") == 0) cfg.stdio_mode = 1;
         else if (strcmp(argv[i], "--mcp-stdio") == 0) cfg.mcp_stdio = 1;

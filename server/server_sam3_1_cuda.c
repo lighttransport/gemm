@@ -15,6 +15,7 @@
 #include "../common/stb_image.h"
 #include "../common/stb_image_write.h"
 #include "server_sam3.h"
+#include "image_decode.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -156,8 +157,8 @@ int server_sam3_1_cuda_segment(const char *ckpt_path,
         return 1;
     }
 
-    int W, H, C;
-    unsigned char *rgb = stbi_load_from_memory(img_bytes, (int)img_len, &W, &H, &C, 3);
+    int W, H;
+    unsigned char *rgb = server_decode_image_rgb(img_bytes, img_len, &W, &H);
     if (!rgb) {
         snprintf(err_buf, err_cap, "failed to decode input image");
         return 2;
