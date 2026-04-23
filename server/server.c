@@ -58,9 +58,21 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <glob.h>
+#include <dirent.h>
 
 #define MAX_BODY_BYTES (64u * 1024u * 1024u)
 #define READ_CHUNK 8192
+
+typedef struct {
+    char *name;
+    char *model_dir;
+    char *dit;
+    char *vae;
+    char *enc;
+    char *bias;
+    char *kind;   /* "gguf" or "safetensors" */
+} qwen_variant;
 
 typedef struct {
     const char *host;
@@ -70,6 +82,9 @@ typedef struct {
     const char *qwen_vae;
     const char *qwen_enc;
     const char *qwen_enc_bias;
+    const char *qwen_variants_spec;   /* raw "name:dir,name:dir" string */
+    qwen_variant *qwen_variants;
+    int qwen_variant_count;
     const char *sam3_ckpt;
     const char *sam3_ckpt_v31;
     const char *sam3_vocab;
@@ -193,6 +208,131 @@ static char *xstrdup(const char *s) {
     char *p = (char *)malloc(n);
     if (p) memcpy(p, s, n);
     return p;
+}
+
+/* Qwen-Image variant registry.
+ *
+ * Directory layout (hyphen/underscore tolerant): diffusion_models/ for the
+ * DiT, vae/ for the VAE, text_encoders/ or text_encoder/ for the encoder.
+ * Parsed at startup from --qwen-variants "name:dir,name:dir,..."  The client
+ * may pass params.variant to auto-fill the three weight paths.
+ */
+static int str_has_suffix(const char *s, const char *suf) {
+    if (!s || !suf) return 0;
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
+
+static char *variant_first_glob(const char *root, const char *const *patterns, int n_patterns) {
+    char pat[1024];
+    for (int i = 0; i < n_patterns; i++) {
+        snprintf(pat, sizeof(pat), "%s/%s", root, patterns[i]);
+        glob_t gl = {0};
+        if (glob(pat, 0, NULL, &gl) == 0 && gl.gl_pathc > 0) {
+            char *out = xstrdup(gl.gl_pathv[0]);
+            globfree(&gl);
+            return out;
+        }
+        globfree(&gl);
+    }
+    return NULL;
+}
+
+static int variant_detect_paths(qwen_variant *v) {
+    static const char *dit_pats[] = {
+        "diffusion_models/*.safetensors",
+        "diffusion_models/*.gguf",
+        "diffusion-models/*.safetensors",
+        "diffusion-models/*.gguf",
+    };
+    static const char *vae_pats[] = {
+        "vae/*.safetensors",
+        "vae/*.gguf",
+    };
+    static const char *enc_pats[] = {
+        "text_encoders/*.safetensors",
+        "text_encoders/*.gguf",
+        "text-encoder/*.gguf",
+        "text-encoder/*.safetensors",
+        "text_encoder/*.safetensors",
+        "text_encoder/*.gguf",
+    };
+    v->dit = variant_first_glob(v->model_dir, dit_pats, (int)(sizeof(dit_pats)/sizeof(*dit_pats)));
+    v->vae = variant_first_glob(v->model_dir, vae_pats, (int)(sizeof(vae_pats)/sizeof(*vae_pats)));
+    v->enc = variant_first_glob(v->model_dir, enc_pats, (int)(sizeof(enc_pats)/sizeof(*enc_pats)));
+    /* Skip multimodal projector if a real encoder sits alongside. */
+    if (v->enc) {
+        const char *base = strrchr(v->enc, '/');
+        base = base ? base + 1 : v->enc;
+        if (strncasecmp(base, "mmproj", 6) == 0) {
+            static const char *enc2_pats[] = {
+                "text-encoder/Qwen*",
+                "text_encoders/Qwen*",
+                "text_encoder/Qwen*",
+            };
+            char *alt = variant_first_glob(v->model_dir, enc2_pats,
+                                           (int)(sizeof(enc2_pats)/sizeof(*enc2_pats)));
+            if (alt) { free(v->enc); v->enc = alt; }
+        }
+    }
+    v->kind = v->dit && str_has_suffix(v->dit, ".gguf") ? xstrdup("gguf") : xstrdup("safetensors");
+    return v->dit && v->vae && v->enc ? 0 : -1;
+}
+
+static void variant_free(qwen_variant *v) {
+    free(v->name); free(v->model_dir); free(v->dit); free(v->vae);
+    free(v->enc); free(v->bias); free(v->kind);
+    memset(v, 0, sizeof(*v));
+}
+
+static int qwen_variants_parse(server_config *cfg, const char *spec) {
+    cfg->qwen_variants = NULL;
+    cfg->qwen_variant_count = 0;
+    if (!spec || !*spec) return 0;
+    /* First pass: count commas + 1. */
+    int n = 1;
+    for (const char *p = spec; *p; p++) if (*p == ',') n++;
+    qwen_variant *arr = (qwen_variant *)calloc((size_t)n, sizeof(*arr));
+    if (!arr) return -1;
+    int k = 0;
+    char *dup = xstrdup(spec);
+    char *save = NULL;
+    for (char *tok = strtok_r(dup, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!*tok) continue;
+        char *colon = strchr(tok, ':');
+        if (!colon) {
+            fprintf(stderr, "[qwen-variants] bad entry '%s' (want name:dir)\n", tok);
+            continue;
+        }
+        *colon = '\0';
+        arr[k].name = xstrdup(tok);
+        arr[k].model_dir = xstrdup(colon + 1);
+        if (variant_detect_paths(&arr[k]) != 0) {
+            fprintf(stderr, "[qwen-variants] '%s' at %s: missing dit/vae/enc (dit=%s vae=%s enc=%s)\n",
+                    arr[k].name, arr[k].model_dir,
+                    arr[k].dit ? arr[k].dit : "(none)",
+                    arr[k].vae ? arr[k].vae : "(none)",
+                    arr[k].enc ? arr[k].enc : "(none)");
+            variant_free(&arr[k]);
+            continue;
+        }
+        fprintf(stderr, "[qwen-variants] %s (%s): dit=%s\n",
+                arr[k].name, arr[k].kind, arr[k].dit);
+        k++;
+    }
+    free(dup);
+    cfg->qwen_variants = arr;
+    cfg->qwen_variant_count = k;
+    return k;
+}
+
+static const qwen_variant *qwen_variants_find(const server_config *cfg, const char *name) {
+    if (!cfg || !name || !*name) return NULL;
+    for (int i = 0; i < cfg->qwen_variant_count; i++) {
+        if (strcmp(cfg->qwen_variants[i].name, name) == 0) return &cfg->qwen_variants[i];
+    }
+    return NULL;
 }
 
 static char *json_escape_dup(const char *s) {
@@ -827,10 +967,19 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
     json_val *params = json_obj(root, "params");
 
     const char *prompt = inputs ? json_str(inputs, "text", "") : "";
-    const char *dit = weights ? json_str(weights, "dit", cfg->qwen_dit) : cfg->qwen_dit;
-    const char *vae = weights ? json_str(weights, "vae", cfg->qwen_vae) : cfg->qwen_vae;
-    const char *enc = weights ? json_str(weights, "text_encoder", cfg->qwen_enc) : cfg->qwen_enc;
-    const char *bias = weights ? json_str(weights, "text_encoder_bias", cfg->qwen_enc_bias) : cfg->qwen_enc_bias;
+    /* Variant lookup: if params.variant matches a registered qwen variant,
+     * use its auto-detected weight paths as fallbacks. Explicit per-request
+     * weights.{dit,vae,text_encoder} still override. */
+    const char *variant_name = params ? json_str(params, "variant", "") : "";
+    const qwen_variant *qv = qwen_variants_find(cfg, variant_name);
+    const char *qv_dit  = qv ? qv->dit  : cfg->qwen_dit;
+    const char *qv_vae  = qv ? qv->vae  : cfg->qwen_vae;
+    const char *qv_enc  = qv ? qv->enc  : cfg->qwen_enc;
+    const char *qv_bias = qv && qv->bias ? qv->bias : cfg->qwen_enc_bias;
+    const char *dit = weights ? json_str(weights, "dit", qv_dit) : qv_dit;
+    const char *vae = weights ? json_str(weights, "vae", qv_vae) : qv_vae;
+    const char *enc = weights ? json_str(weights, "text_encoder", qv_enc) : qv_enc;
+    const char *bias = weights ? json_str(weights, "text_encoder_bias", qv_bias) : qv_bias;
     int width = params ? json_int(params, "width", 256) : 256;
     int height = params ? json_int(params, "height", 256) : 256;
     int steps = params ? json_int(params, "steps", 20) : 20;
@@ -1217,10 +1366,30 @@ static void send_response(int fd, int status, const char *ctype, const void *bod
     if (body_len) send_all(fd, body, body_len);
 }
 
-static char *models_json(void) {
-    return xstrdup(
-        "{\"ok\":true,\"models\":["
-        "{\"id\":\"qwen-image\",\"tasks\":[\"text-to-image\"],\"backends\":[\"cpu\",\"hip\",\"cuda\",\"vulkan\"]},"
+static char *models_json(const server_config *cfg) {
+    sbuf out;
+    sbuf_init(&out);
+    sbuf_append(&out, "{\"ok\":true,\"models\":[");
+    /* qwen-image with variants (if registered) */
+    sbuf_append(&out,
+        "{\"id\":\"qwen-image\",\"tasks\":[\"text-to-image\"],"
+        "\"backends\":[\"cpu\""
+#if defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
+        ",\"hip\""
+#endif
+        "],\"variants\":[");
+    if (cfg) {
+        for (int i = 0; i < cfg->qwen_variant_count; i++) {
+            const qwen_variant *v = &cfg->qwen_variants[i];
+            char *en = json_escape_dup(v->name);
+            char *ek = json_escape_dup(v->kind ? v->kind : "");
+            sbuf_printf(&out, "%s{\"name\":\"%s\",\"kind\":\"%s\"}",
+                        i ? "," : "", en, ek);
+            free(en); free(ek);
+        }
+    }
+    sbuf_append(&out, "]},");
+    sbuf_append(&out,
         "{\"id\":\"sam3\",\"tasks\":[\"segmentation\"],\"backends\":["
         "\"cpu\""
 #if defined(DIFFUSION_SERVER_ENABLE_SAM3_CUDA)
@@ -1232,10 +1401,12 @@ static char *models_json(void) {
 #else
         "stub"
 #endif
-        "\"},"
+        "\"},");
+    sbuf_append(&out,
         "{\"id\":\"sam3.1\",\"tasks\":[\"segmentation\"],\"backends\":[\"cpu\",\"cuda\"],"
         "\"status\":\"pending_runner\",\"note\":\"see cuda/sam3.1/PORT.md\"}"
         "]}");
+    return out.ptr;
 }
 
 static char *health_json(void) {
@@ -1301,6 +1472,7 @@ static void handle_static(int fd, const server_config *cfg, const char *url_path
     else if (strcmp(rel, "/sam3_1_ref") == 0) rel = "/sam3_1_ref.html";
     else if (strcmp(rel, "/qwen-image") == 0) rel = "/qwen-image.html";
     else if (strcmp(rel, "/qwen_image_compare") == 0) rel = "/qwen_image_compare.html";
+    else if (strcmp(rel, "/flux2") == 0) rel = "/flux2.html";
     else if (strcmp(rel, "/flux2_compare") == 0) rel = "/flux2_compare.html";
     if (!path_is_safe(rel)) {
         char *e = json_error_response("bad_path", "invalid static path");
@@ -1557,7 +1729,7 @@ static void handle_client(int fd, const server_config *cfg) {
         free(j);
     } else if (strcmp(method, "GET") == 0 &&
                (strcmp(path, "/models") == 0 || strcmp(path, "/v1/models") == 0)) {
-        char *j = models_json();
+        char *j = models_json(cfg);
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/infer") == 0) {
@@ -1662,7 +1834,7 @@ static int run_stdio(const server_config *cfg) {
             if (strcmp(cmd, "health") == 0) {
                 resp = health_json();
             } else if (strcmp(cmd, "models") == 0) {
-                resp = models_json();
+                resp = models_json(cfg);
             } else {
                 char *infer_body = NULL;
                 if (strcmp(cmd, "infer") == 0) {
@@ -1792,6 +1964,7 @@ static void usage(const char *prog) {
         "  --qwen-vae <path>\n"
         "  --qwen-enc <path>\n"
         "  --qwen-enc-bias <path>\n"
+        "  --qwen-variants <spec>   name:dir,name:dir (or env QWEN_IMAGE_VARIANTS)\n"
         "  --sam3-ckpt <path>       default sam3.model.safetensors\n"
         "  --sam3-ckpt-v31 <path>   default sam3.1.model.safetensors (cuda only)\n"
         "  --sam3-vocab <path>      CLIP BPE vocab.json\n"
@@ -1819,6 +1992,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--qwen-vae") == 0 && i + 1 < argc) cfg.qwen_vae = argv[++i];
         else if (strcmp(argv[i], "--qwen-enc") == 0 && i + 1 < argc) cfg.qwen_enc = argv[++i];
         else if (strcmp(argv[i], "--qwen-enc-bias") == 0 && i + 1 < argc) cfg.qwen_enc_bias = argv[++i];
+        else if (strcmp(argv[i], "--qwen-variants") == 0 && i + 1 < argc) cfg.qwen_variants_spec = argv[++i];
         else if (strcmp(argv[i], "--sam3-ckpt") == 0 && i + 1 < argc) cfg.sam3_ckpt = argv[++i];
         else if (strcmp(argv[i], "--sam3-ckpt-v31") == 0 && i + 1 < argc) cfg.sam3_ckpt_v31 = argv[++i];
         else if (strcmp(argv[i], "--sam3-vocab") == 0 && i + 1 < argc) cfg.sam3_vocab = argv[++i];
@@ -1830,6 +2004,12 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--mcp-stdio") == 0) cfg.mcp_stdio = 1;
         else { usage(argv[0]); return 1; }
     }
+    /* Env fallback for variant spec (easier to set in launchers). */
+    if (!cfg.qwen_variants_spec) {
+        const char *e = getenv("QWEN_IMAGE_VARIANTS");
+        if (e && *e) cfg.qwen_variants_spec = e;
+    }
+    qwen_variants_parse(&cfg, cfg.qwen_variants_spec);
     if (cfg.stdio_mode) return run_stdio(&cfg);
     if (cfg.mcp_stdio) return run_mcp_stdio(&cfg);
     signal(SIGINT, on_signal);
