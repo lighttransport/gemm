@@ -322,13 +322,15 @@ class DualDPTHead(nn.Module):
         self.refinenet2 = FeatureFusionBlock(features, has_skip=True)
         self.refinenet1 = FeatureFusionBlock(features, has_skip=True)
 
-        # Output conv: Conv2d(64, 32, 3, pad=1) + ReLU
+        # Output conv: Conv2d(features, features//2, 3) + ReLU
         self.output_conv1 = nn.Conv2d(features, features // 2, 3, padding=1)
-        # Output conv2: Sequential(Conv2d(32, 32, 3, pad=1), ReLU, Conv2d(32, out_dim, 1))
+        # Output conv2: Sequential(Conv2d(features//2, 32, 3), ReLU, Conv2d(32, out_dim, 1))
+        # Inner channel is fixed at 32 in DA3 (both da3-small features=64 and
+        # da3-base features=128 use 32 as the penultimate channel).
         self.output_conv2 = nn.Sequential(
-            nn.Conv2d(features // 2, features // 2, 3, padding=1),
+            nn.Conv2d(features // 2, 32, 3, padding=1),
             nn.ReLU(True),
-            nn.Conv2d(features // 2, output_dim, 1),
+            nn.Conv2d(32, output_dim, 1),
         )
 
     def forward(self, features, grid_size, patch_size=14, backbone_norm=None):
