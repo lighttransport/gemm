@@ -19,6 +19,7 @@
 #include "../cpu/sam3/sam3_clip_bpe.h"
 #include "../common/stb_image.h"
 #include "../common/stb_image_write.h"
+#include "image_decode.h"
 #include "server_sam3.h"  /* server_sam3_mask + server_sam3_free_mask */
 
 /* CUDA_RUNNER_COMMON helpers are static and live inside cuda_sam3_runner.c. */
@@ -168,8 +169,8 @@ int server_sam3_cuda_segment(const char *ckpt_path,
         return 1;
     }
 
-    int W, H, C;
-    unsigned char *rgb = stbi_load_from_memory(img_bytes, (int)img_len, &W, &H, &C, 3);
+    int W, H;
+    unsigned char *rgb = server_decode_image_rgb(img_bytes, img_len, &W, &H);
     if (!rgb) {
         snprintf(err_buf, err_cap, "failed to decode input image");
         return 2;
