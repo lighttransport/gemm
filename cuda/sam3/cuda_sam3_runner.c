@@ -2157,22 +2157,25 @@ int cuda_sam3_run_postprocess(cuda_sam3_ctx *c, int target_h, int target_w,
         memcpy(kept + (size_t)i * HW, all_masks + (size_t)keep[i] * HW, HW * 4);
     free(all_masks); free(keep);
 
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++) {
-        float *row = kept + (size_t)i * HW;
-        for (size_t j = 0; j < HW; j++)
-            row[j] = 1.0f / (1.0f + expf(-row[j]));
-    }
-
+    /* Match pytorch Sam3Processor: bilinear-upsample the LOGITS to the
+     * output resolution, then threshold. Applying sigmoid in low-res
+     * first near-saturates the field into a step function and the
+     * subsequent upsample produces jaggy boundaries on thin structures.
+     * sigmoid(x) > t  <=>  x > logit(t). */
     float *resized = (float *)malloc((size_t)n * target_h * target_w * sizeof(float));
     if (!resized) { free(kept); return -1; }
     pp_bilinear_acf(resized, kept, n, H0, W0, target_h, target_w);
     free(kept);
 
+    float t = mask_threshold;
+    if (!(t > 0.0f)) t = 1e-6f;
+    if (!(t < 1.0f)) t = 1.0f - 1e-6f;
+    const float logit_thr = logf(t / (1.0f - t));
+
     size_t tot = (size_t)n * target_h * target_w;
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < tot; i++)
-        c->pp_masks[i] = (resized[i] > mask_threshold) ? 1 : 0;
+        c->pp_masks[i] = (resized[i] > logit_thr) ? 1 : 0;
     free(resized);
 
     c->pp_n_kept = n; c->pp_th = target_h; c->pp_tw = target_w; c->pp_done = 1;
