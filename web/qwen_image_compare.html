@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen-Image side-by-side compare</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
+    main { max-width: 1400px; margin: 0 auto; padding: 20px 16px; }
+    h1 { font-size: 24px; margin: 0 0 4px; }
+    .sub { color: #6a7180; font-size: 13px; margin-bottom: 16px; }
+    .panel, form { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    label { display: block; font-size: 13px; font-weight: 650; margin: 8px 0 4px; }
+    input, select, textarea, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 8px 10px; background: #fff; }
+    textarea { resize: vertical; min-height: 64px; }
+    button { background: #1b6f5f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
+    button[disabled] { background: #9aa4b1; cursor: not-allowed; }
+    button.cancel { background: #b94a48; }
+    .row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 10px; }
+    .minirow { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; }
+    .btn-row { display: flex; gap: 10px; margin-top: 12px; }
+    .btn-row button { margin-top: 0; }
+    .status { margin-top: 8px; font-size: 12px; color: #6a7180; min-height: 16px; }
+    .backends { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px; margin-top: 6px; }
+    .be-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #e1e5ec; border-radius: 6px; font-size: 13px; }
+    .be-row input[type=checkbox] { width: auto; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
+    .cell { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 12px; }
+    .cell h3 { margin: 0 0 6px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .cell .meta { font-size: 12px; color: #6a7180; margin-bottom: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .cell canvas { width: 100%; max-width: 100%; display: block; border: 1px solid #d9dde5; border-radius: 6px; background: #1a1c20; }
+    .cell .err { color: #b94a48; font-size: 13px; padding: 8px; background: #fdecec; border-radius: 6px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e6f3ef; color: #1b6f5f; }
+    .pill.run  { background: #e7effa; color: #2a4a7a; }
+    .pill.err  { background: #fdecec; color: #b94a48; }
+    #toast { position: fixed; top: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(420px, 90vw); }
+    .toast-item { pointer-events: auto; background: #15171a; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.35; border-left: 4px solid #8a8f98; cursor: pointer; word-break: break-word; }
+    .toast-item.error { border-left-color: #e5484d; background: #2a1416; }
+    .toast-item.info  { border-left-color: #1b6f5f; }
+  </style>
+</head>
+<body>
+<div id="toast"></div>
+<main>
+  <h1>Qwen-Image side-by-side compare</h1>
+  <div class="sub">Fans out one prompt to each checked backend in parallel and renders the generated image + timings.</div>
+
+  <form id="form" class="panel">
+    <div class="row">
+      <div>
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt">a red apple on a white table</textarea>
+        <label for="negative" style="margin-top:8px;">Negative prompt (optional)</label>
+        <input id="negative" type="text" value="">
+        <div class="minirow" style="margin-top:8px;">
+          <div><label for="width">Width</label><input id="width" type="number" min="64" step="16" value="256"></div>
+          <div><label for="height">Height</label><input id="height" type="number" min="64" step="16" value="256"></div>
+          <div><label for="steps">Steps</label><input id="steps" type="number" min="1" value="20"></div>
+          <div><label for="seed">Seed</label><input id="seed" type="number" value="42"></div>
+        </div>
+      </div>
+      <div>
+        <label for="variant">Variant</label>
+        <select id="variant"><option>loading…</option></select>
+        <label style="margin-top:10px;">Backends</label>
+        <div id="backends" class="backends"></div>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <div class="btn-row">
+          <button type="submit" id="go">Compare</button>
+          <button type="button" id="cancel" class="cancel" disabled>Cancel all</button>
+        </div>
+        <div class="status" id="status"></div>
+      </div>
+    </div>
+  </form>
+
+  <section id="grid" class="grid"></section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const DEFAULT_BACKENDS = [
+  { label: "ours (cpu)",     id: "ours-cpu"     },
+  { label: "ours (cuda)",    id: "ours-cuda"    },
+  { label: "pytorch (cuda)", id: "pytorch-cuda" },
+];
+
+function loadBackends() {
+  try {
+    const p = new URLSearchParams(location.search).get("backends");
+    if (p) return JSON.parse(atob(p));
+  } catch (e) { console.warn("bad ?backends=", e); }
+  return DEFAULT_BACKENDS;
+}
+const BACKENDS = loadBackends();
+
+function showToast(msg, opts) {
+  opts = opts || {};
+  const host = $('toast');
+  const el = document.createElement('div');
+  el.className = 'toast-item ' + (opts.kind || 'error');
+  if (opts.title) {
+    const t = document.createElement('div');
+    t.style.fontWeight = '700'; t.textContent = opts.title;
+    el.appendChild(t);
+  }
+  const b = document.createElement('div'); b.textContent = msg;
+  el.appendChild(b);
+  host.appendChild(el);
+  el.addEventListener('click', () => el.remove());
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),400); }, 5500);
+}
+
+function extractError(res, body) {
+  if (body && typeof body === 'object' && body.error) return body.error;
+  if (!res) return 'network error';
+  return `HTTP ${res.status} ${res.statusText || ''}`.trim();
+}
+
+let AVAILABLE_BACKENDS = null;
+
+async function loadVariants() {
+  try {
+    const r = await fetch('/v1/models');
+    const d = await r.json();
+    const m = (d.models && d.models[0]) || {};
+    const vs = m.variants || [];
+    AVAILABLE_BACKENDS = new Set(m.backends || []);
+    const sel = $('variant'); sel.innerHTML = '';
+    if (!vs.length) {
+      sel.innerHTML = '<option value="default">default</option>';
+      return;
+    }
+    vs.forEach(v => {
+      const o = document.createElement('option');
+      o.value = v.name; o.textContent = `${v.name}  (${v.kind})`;
+      sel.appendChild(o);
+    });
+    renderBackends();
+  } catch (e) {
+    showToast('failed to load variants: ' + e, {title:'variants'});
+    $('variant').innerHTML = '<option value="default">default</option>';
+  }
+}
+loadVariants();
+
+function renderBackends() {
+  const host = $('backends'); host.innerHTML = '';
+  BACKENDS.forEach((b, i) => {
+    const row = document.createElement('label');
+    row.className = 'be-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.dataset.idx = i;
+    const advertised = !AVAILABLE_BACKENDS || AVAILABLE_BACKENDS.has(b.id);
+    cb.checked = advertised;
+    cb.disabled = !advertised;
+    row.appendChild(cb);
+    const lab = document.createElement('span');
+    lab.textContent = b.label + (advertised ? '' : ' (n/a)');
+    row.appendChild(lab);
+    host.appendChild(row);
+  });
+}
+renderBackends();
+
+function mkCell(label, variant) {
+  const sec = document.createElement('section');
+  sec.className = 'cell';
+  sec.innerHTML = `
+    <h3><span class="label"></span> <small style="color:#6a7180;font-weight:400" class="vlabel"></small> <span class="pill run status">running</span></h3>
+    <div class="meta"></div>
+    <canvas></canvas>
+    <div class="err" style="display:none;"></div>
+  `;
+  sec.querySelector('.label').textContent = label;
+  sec.querySelector('.vlabel').textContent = variant ? '— ' + variant : '';
+  return sec;
+}
+
+let running = [];
+
+function cancelAll() {
+  for (const c of running) { try { c.abort(); } catch(_){} }
+  running = [];
+  $('cancel').disabled = true;
+  $('go').disabled = false;
+  $('status').textContent = 'cancelled.';
+}
+$('cancel').addEventListener('click', cancelAll);
+
+async function runOne(be, body, grid) {
+  const cell = mkCell(be.label, $('variant').value);
+  grid.appendChild(cell);
+  const pill = cell.querySelector('.pill');
+  const meta = cell.querySelector('.meta');
+  const canvas = cell.querySelector('canvas');
+  const errEl = cell.querySelector('.err');
+
+  const ctrl = new AbortController(); running.push(ctrl);
+  const t0 = performance.now();
+  const ticker = setInterval(() => {
+    pill.textContent = 'running ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
+  }, 100);
+
+  try {
+    const payload = Object.assign({}, body);
+    payload.params = Object.assign({}, body.params || {}, {
+      backend: be.id,
+      variant: $('variant').value || 'default',
+    });
+    const res = await fetch('/v1/infer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    let data = null;
+    try { data = await res.json(); } catch(_) { data = null; }
+    if (!res.ok || !data || data.ok === false) {
+      throw new Error(extractError(res, data));
+    }
+
+    clearInterval(ticker);
+    const dt = ((performance.now() - t0) / 1000).toFixed(2) + 's';
+    pill.className = 'pill'; pill.textContent = 'ok ' + dt;
+
+    const out = (data.outputs && data.outputs[0]) || null;
+    if (!out || !out.data_base64) throw new Error('no image output');
+    const tm = data.timings_ms || {};
+    meta.textContent =
+      `${out.width}×${out.height}  ` +
+      `infer=${tm.infer||0}ms total=${tm.total||0}ms`;
+
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+    };
+    img.src = 'data:' + (out.mime || 'image/png') + ';base64,' + out.data_base64;
+  } catch (e) {
+    clearInterval(ticker);
+    pill.className = 'pill err'; pill.textContent = 'error';
+    errEl.style.display = 'block';
+    errEl.textContent = String(e.message || e);
+    if (e.name !== 'AbortError') showToast(String(e.message || e), {title: be.label});
+  }
+}
+
+$('form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const text = $('prompt').value.trim();
+  if (!text) { showToast('enter a prompt'); return; }
+
+  const checked = Array.from(document.querySelectorAll('#backends input[type=checkbox]:checked'))
+    .map(cb => BACKENDS[+cb.dataset.idx]);
+  if (!checked.length) { showToast('check at least one backend'); return; }
+
+  $('go').disabled = true; $('cancel').disabled = false;
+  const grid = $('grid'); grid.innerHTML = '';
+
+  const body = {
+    inputs: {
+      text,
+      negative_text: $('negative').value.trim() || undefined,
+    },
+    params: {
+      width: +$('width').value,
+      height: +$('height').value,
+      steps: +$('steps').value,
+      seed: +$('seed').value,
+    },
+  };
+
+  $('status').textContent = `running ${checked.length} backend(s)…`;
+  await Promise.allSettled(checked.map(be => runOne(be, body, grid)));
+
+  running = [];
+  $('cancel').disabled = true;
+  $('go').disabled = false;
+  $('status').textContent = 'done.';
+});
+</script>
+</body>
+</html>
