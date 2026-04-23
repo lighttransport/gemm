@@ -36,12 +36,12 @@
     <div class="task">text-to-image</div>
     <ul>
       <li>
-        <a href="/qwen-image">Qwen-Image generator</a>
-        <div class="desc">Prompt → 256–1024 px image. Backends: cpu, hip, (cuda/vulkan coming).</div>
+        <a href="/qwen-image">Qwen-Image <span class="pill cmp">side-by-side</span></a>
+        <div class="desc">Variants (Q4_0 / FP8) × backends (cpu / hip) in parallel — served by the C server. Set <code>QWEN_IMAGE_VARIANTS</code> to register variant dirs.</div>
       </li>
       <li>
-        <a href="http://localhost:8085/qwen_image_compare">Qwen-Image compare <span class="pill cmp">side-by-side</span><span class="port">:8085</span></a>
-        <div class="desc">Variants (Q4_0 / FP8) × backends in parallel, served by <code>ref/qwen_image/qwen_image_server.py</code>.</div>
+        <a href="http://localhost:8085/qwen_image_compare">Qwen-Image (pytorch ref) <span class="pill cmp">side-by-side</span><span class="port">:8085</span></a>
+        <div class="desc">Adds <code>pytorch-cuda</code> shell-out via <code>ref/qwen_image/qwen_image_server.py</code>.</div>
       </li>
     </ul>
   </section>
@@ -51,8 +51,12 @@
     <div class="task">text-to-image</div>
     <ul>
       <li>
-        <a href="http://localhost:8086/flux2_compare">Flux.2 klein compare <span class="pill cmp">side-by-side</span><span class="port">:8086</span></a>
-        <div class="desc">Distilled (4-step) and base (20-step) variants × ours-cuda / ours-hip / pytorch-cuda, served by <code>ref/flux2_klein/flux2_server.py</code>.</div>
+        <a href="/flux2">Flux.2 klein <span class="pill cmp">side-by-side</span></a>
+        <div class="desc">Distilled (4-step) and base (20-step) variants × ours-cpu / ours-cuda / ours-hip / pytorch-cuda. Page served by the C server; inference dispatched to the flux2 compare server on <code>:8086</code> (start it with <code>./server/run-flux2-compare.sh</code>).</div>
+      </li>
+      <li>
+        <a href="http://localhost:8086/flux2_compare">Flux.2 klein (direct) <span class="port">:8086</span></a>
+        <div class="desc">Same UI but served straight by <code>ref/flux2_klein/flux2_server.py</code> on its own port.</div>
       </li>
     </ul>
   </section>

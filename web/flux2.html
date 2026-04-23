@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Qwen-Image side-by-side compare</title>
+  <title>Flux.2-klein side-by-side compare</title>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
     main { max-width: 1400px; margin: 0 auto; padding: 20px 16px; }
     h1 { font-size: 24px; margin: 0 0 4px; }
     .sub { color: #6a7180; font-size: 13px; margin-bottom: 16px; }
+    .sub code { background: #eceff3; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
     .panel, form { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
     label { display: block; font-size: 13px; font-weight: 650; margin: 8px 0 4px; }
     input, select, textarea, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 8px 10px; background: #fff; }
@@ -34,6 +35,7 @@
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e6f3ef; color: #1b6f5f; }
     .pill.run  { background: #e7effa; color: #2a4a7a; }
     .pill.err  { background: #fdecec; color: #b94a48; }
+    .origin-pill { display: inline-block; padding: 1px 6px; border-radius: 4px; background: #eceff3; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #2a4a7a; }
     #toast { position: fixed; top: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(420px, 90vw); }
     .toast-item { pointer-events: auto; background: #15171a; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.35; border-left: 4px solid #8a8f98; cursor: pointer; word-break: break-word; }
     .toast-item.error { border-left-color: #e5484d; background: #2a1416; }
@@ -43,20 +45,22 @@
 <body>
 <div id="toast"></div>
 <main>
-  <h1>Qwen-Image</h1>
-  <div class="sub">Fans out one prompt to each checked backend in parallel and renders the generated image + timings. Variants come from the C server's <code>--qwen-variants</code> registry.</div>
+  <h1>Flux.2-klein</h1>
+  <div class="sub">
+    Fans out one prompt to each checked backend in parallel. <b>ours-cpu</b> is unchecked by default (256² ≈ 7&nbsp;min).
+    Backend origin: <span class="origin-pill" id="origin-label"></span>
+    <span style="color:#6a7180;"> — override with <code>?origin=http://host:port</code>.</span>
+  </div>
 
   <form id="form" class="panel">
     <div class="row">
       <div>
         <label for="prompt">Prompt</label>
         <textarea id="prompt">a red apple on a white table</textarea>
-        <label for="negative" style="margin-top:8px;">Negative prompt (optional)</label>
-        <input id="negative" type="text" value="">
         <div class="minirow" style="margin-top:8px;">
           <div><label for="width">Width</label><input id="width" type="number" min="64" step="16" value="256"></div>
           <div><label for="height">Height</label><input id="height" type="number" min="64" step="16" value="256"></div>
-          <div><label for="steps">Steps</label><input id="steps" type="number" min="1" value="20"></div>
+          <div><label for="steps">Steps</label><input id="steps" type="number" min="1" value="4"></div>
           <div><label for="seed">Seed</label><input id="seed" type="number" value="42"></div>
         </div>
       </div>
@@ -83,12 +87,24 @@
 <script>
 const $ = id => document.getElementById(id);
 
-const BACKEND_LABELS = {
-  "cpu":    "ours (cpu)",
-  "hip":    "ours (hip)",
-  "cuda":   "ours (cuda)",
-  "vulkan": "ours (vulkan)",
-};
+/* Backend lives on the flux2_server.py (default port 8086).
+ * Override with ?origin=http://host:port or window.FLUX2_ORIGIN. */
+function resolveOrigin() {
+  const q = new URLSearchParams(location.search).get('origin');
+  if (q) return q;
+  if (window.FLUX2_ORIGIN) return window.FLUX2_ORIGIN;
+  return `${location.protocol}//${location.hostname}:8086`;
+}
+const ORIGIN = resolveOrigin();
+$('origin-label').textContent = ORIGIN;
+
+const DEFAULT_BACKENDS = [
+  { label: "ours (cpu)",     id: "ours-cpu",     defaultOff: true },
+  { label: "ours (cuda)",    id: "ours-cuda"    },
+  { label: "ours (hip)",     id: "ours-hip"     },
+  { label: "pytorch (cuda)", id: "pytorch-cuda" },
+];
+const BACKENDS = DEFAULT_BACKENDS;
 
 function showToast(msg, opts) {
   opts = opts || {};
@@ -108,64 +124,72 @@ function showToast(msg, opts) {
 }
 
 function extractError(res, body) {
-  if (body && typeof body === 'object') {
-    if (body.error && typeof body.error === 'object') return body.error.message || body.error.code || JSON.stringify(body.error);
-    if (typeof body.error === 'string') return body.error;
-  }
+  if (body && typeof body === 'object' && body.error) return body.error;
   if (!res) return 'network error';
   return `HTTP ${res.status} ${res.statusText || ''}`.trim();
 }
 
-let BACKENDS = [];
+let AVAILABLE_BACKENDS = null;
+let VARIANT_MAP = {};
+let STEPS_TOUCHED = false;
 
 async function loadVariants() {
   try {
-    const r = await fetch('/v1/models');
+    const r = await fetch(ORIGIN + '/v1/models');
     const d = await r.json();
-    const m = (d.models || []).find(x => x.id === 'qwen-image') || {};
+    const m = (d.models && d.models[0]) || {};
     const vs = m.variants || [];
+    AVAILABLE_BACKENDS = new Set(m.backends || []);
+    VARIANT_MAP = {};
     const sel = $('variant'); sel.innerHTML = '';
     if (!vs.length) {
-      const o = document.createElement('option');
-      o.value = ''; o.textContent = '(no variants registered — set QWEN_IMAGE_VARIANTS)';
-      sel.appendChild(o);
-    } else {
-      vs.forEach(v => {
-        const o = document.createElement('option');
-        o.value = v.name; o.textContent = `${v.name}  (${v.kind || 'st'})`;
-        sel.appendChild(o);
-      });
+      sel.innerHTML = '<option value="default">default</option>';
+      return;
     }
-    BACKENDS = (m.backends || []).map(id => ({ id, label: BACKEND_LABELS[id] || ('ours (' + id + ')') }));
+    vs.forEach(v => {
+      VARIANT_MAP[v.name] = v;
+      const o = document.createElement('option');
+      o.value = v.name;
+      o.textContent = `${v.name}  (${v.kind}${v.default_steps?`, ${v.default_steps} steps`:''})`;
+      sel.appendChild(o);
+    });
     renderBackends();
+    onVariantChange();
   } catch (e) {
-    showToast('failed to load /v1/models: ' + e, {title:'models'});
-    $('variant').innerHTML = '<option value="">(load failed)</option>';
-    BACKENDS = [{id:'cpu', label:'ours (cpu)'}];
+    showToast(`failed to reach ${ORIGIN}/v1/models: ${e}. Start the flux2 compare server: PORT=8086 ./server/run-flux2-compare.sh`,
+              {title:'flux2 server'});
+    $('variant').innerHTML = '<option value="default">default</option>';
     renderBackends();
   }
 }
 loadVariants();
 
+function onVariantChange() {
+  const v = VARIANT_MAP[$('variant').value];
+  if (!v || STEPS_TOUCHED) return;
+  if (v.default_steps) $('steps').value = v.default_steps;
+}
+$('variant').addEventListener('change', onVariantChange);
+$('steps').addEventListener('input', () => { STEPS_TOUCHED = true; });
+
 function renderBackends() {
   const host = $('backends'); host.innerHTML = '';
-  if (!BACKENDS.length) {
-    host.innerHTML = '<div style="font-size:12px;color:#6a7180;">(no backends advertised)</div>';
-    return;
-  }
   BACKENDS.forEach((b, i) => {
     const row = document.createElement('label');
     row.className = 'be-row';
     const cb = document.createElement('input');
     cb.type = 'checkbox'; cb.dataset.idx = i;
-    cb.checked = true;
+    const advertised = !AVAILABLE_BACKENDS || AVAILABLE_BACKENDS.has(b.id);
+    cb.checked = advertised && !b.defaultOff;
+    cb.disabled = !advertised;
     row.appendChild(cb);
     const lab = document.createElement('span');
-    lab.textContent = b.label;
+    lab.textContent = b.label + (advertised ? '' : ' (n/a)');
     row.appendChild(lab);
     host.appendChild(row);
   });
 }
+renderBackends();
 
 function mkCell(label, variant) {
   const sec = document.createElement('section');
@@ -208,11 +232,11 @@ async function runOne(be, body, grid) {
 
   try {
     const payload = Object.assign({}, body);
-    payload.backend = be.id;
     payload.params = Object.assign({}, body.params || {}, {
-      variant: $('variant').value || undefined,
+      backend: be.id,
+      variant: $('variant').value || 'default',
     });
-    const res = await fetch('/v1/infer', {
+    const res = await fetch(ORIGIN + '/v1/infer', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -232,7 +256,7 @@ async function runOne(be, body, grid) {
     if (!out || !out.data_base64) throw new Error('no image output');
     const tm = data.timings_ms || {};
     meta.textContent =
-      `${out.width||'?'}×${out.height||'?'}  ` +
+      `${out.width}×${out.height}  ` +
       `infer=${tm.infer||0}ms total=${tm.total||0}ms`;
 
     const img = new Image();
@@ -264,12 +288,7 @@ $('form').addEventListener('submit', async (ev) => {
   const grid = $('grid'); grid.innerHTML = '';
 
   const body = {
-    model: 'qwen-image',
-    task:  'text-to-image',
-    inputs: {
-      text,
-      negative_text: $('negative').value.trim() || undefined,
-    },
+    inputs: { text },
     params: {
       width:  +$('width').value,
       height: +$('height').value,
