@@ -91,4 +91,5 @@ cpu/sparse3d/.venv/
 # External / generated
 ref/*
 !ref/hy3d/
+!ref/trellis2/
 result/
