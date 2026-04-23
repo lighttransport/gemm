@@ -1293,11 +1293,15 @@ static int path_is_safe(const char *p) {
 
 static void handle_static(int fd, const server_config *cfg, const char *url_path) {
     const char *rel = url_path;
-    if (strcmp(rel, "/") == 0)        rel = "/qwen-image.html";
+    if (strcmp(rel, "/") == 0 || strcmp(rel, "/index.html") == 0) rel = "/index.html";
     else if (strcmp(rel, "/sam3") == 0)   rel = "/sam3.html";
     else if (strcmp(rel, "/sam3.1") == 0) rel = "/sam3.1.html";
     else if (strcmp(rel, "/sam3_compare") == 0) rel = "/sam3_compare.html";
+    else if (strcmp(rel, "/sam3_ref") == 0) rel = "/sam3_ref.html";
+    else if (strcmp(rel, "/sam3_1_ref") == 0) rel = "/sam3_1_ref.html";
     else if (strcmp(rel, "/qwen-image") == 0) rel = "/qwen-image.html";
+    else if (strcmp(rel, "/qwen_image_compare") == 0) rel = "/qwen_image_compare.html";
+    else if (strcmp(rel, "/flux2_compare") == 0) rel = "/flux2_compare.html";
     if (!path_is_safe(rel)) {
         char *e = json_error_response("bad_path", "invalid static path");
         send_response(fd, 400, "application/json", e, strlen(e));
