@@ -99,6 +99,28 @@
     </ul>
   </section>
 
+  <section>
+    <h2>Hunyuan3D-2.1</h2>
+    <div class="task">image-to-3D mesh</div>
+    <ul>
+      <li>
+        <a href="/hy3d">Hy3D compare <span class="pill cmp">side-by-side</span><span class="port">:8087</span></a>
+        <div class="desc">DINOv2-L + DiT + ShapeVAE → marching cubes → GLB preview. Backends: ours-cuda / pytorch-cuda (ours-cpu off by default, too slow). Start the sidecar with <code>./server/run-hy3d-compare.sh</code>.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>TRELLIS.2 (Stage 1)</h2>
+    <div class="task">image-to-3D structure</div>
+    <ul>
+      <li>
+        <a href="/trellis2">TRELLIS.2 compare <span class="pill cmp">side-by-side</span><span class="port">:8088</span></a>
+        <div class="desc">DINOv3 + Stage 1 DiT + conv3d decoder → occupancy grid → marching cubes → GLB. Backends: ours-cuda / pytorch-cuda (ours-cpu disabled by default). Start the sidecar with <code>./server/run-trellis2-compare.sh</code>.</div>
+      </li>
+    </ul>
+  </section>
+
   <footer>
     Each compare page lives on its own port (python reference sidecar).
     Single-backend pages are served straight from the C server at <code>/</code>.
