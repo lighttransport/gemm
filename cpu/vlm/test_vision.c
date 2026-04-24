@@ -1,11 +1,13 @@
 /*
- * test_vision.c - End-to-end vision inference test for Qwen3-VL
+ * test_vision.c - End-to-end vision inference test for Qwen3-VL / Qwen3.6-VL
  *
  * Usage:
- *   ./test_vision <model.gguf> <mmproj.gguf> [max_gen_tokens]
+ *   ./test_vision <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen]
  *
- * Generates a synthetic checkerboard image, encodes it through the vision
- * encoder (mmproj), builds a multimodal prompt, and runs LLM generation.
+ * If no image path is given, a synthetic checkerboard is used and prompt
+ * defaults to "Explain the image". Otherwise the image is loaded, resized
+ * so both dims are multiples of (patch_size * spatial_merge), and fed to
+ * the Qwen3-VL vision encoder before running LLM generation.
  */
 
 #define GGUF_LOADER_IMPLEMENTATION
@@ -22,6 +24,9 @@
 
 #define VISION_ENCODER_IMPLEMENTATION
 #include "../../common/vision_encoder.h"
+
+#define IMAGE_UTILS_IMPLEMENTATION
+#include "../../common/image_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,16 +85,44 @@ static uint8_t *generate_checkerboard(int width, int height, int cell_size) {
     return img;
 }
 
+static int arg_looks_like_image(const char *s) {
+    if (!s) return 0;
+    int n = (int)strlen(s);
+    if (n < 4) return 0;
+    const char *ext = s + n - 4;
+    const char *ext5 = (n >= 5) ? s + n - 5 : NULL;
+    if (strcasecmp(ext, ".png") == 0) return 1;
+    if (strcasecmp(ext, ".jpg") == 0) return 1;
+    if (strcasecmp(ext, ".bmp") == 0) return 1;
+    if (strcasecmp(ext, ".ppm") == 0) return 1;
+    if (ext5 && strcasecmp(ext5, ".jpeg") == 0) return 1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> [max_gen] [image_size]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen] [image_size]\n", argv[0]);
         return 1;
     }
 
     const char *model_path = argv[1];
     const char *mmproj_path = argv[2];
-    int max_gen = (argc >= 4) ? atoi(argv[3]) : 30;
-    int img_size_override = (argc >= 5) ? atoi(argv[4]) : 192; /* default small for speed */
+    const char *image_path = NULL;
+    const char *user_prompt = "Explain the image";
+    int max_gen = 30;
+    int img_size_override = 384;
+
+    for (int i = 3; i < argc; i++) {
+        if (arg_looks_like_image(argv[i])) {
+            image_path = argv[i];
+        } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
+            int v = atoi(argv[i]);
+            if (v > 0 && v <= 512) max_gen = v;
+            else if (v > 512) img_size_override = v;
+        } else {
+            user_prompt = argv[i];
+        }
+    }
 
     srand((unsigned)time(NULL));
 
@@ -115,14 +148,37 @@ int main(int argc, char **argv) {
     vision_model *vm = vision_load(gguf_mmproj);
     if (!vm) { fprintf(stderr, "Failed to load vision model\n"); return 1; }
 
-    /* ---- Generate and encode image ---- */
+    /* ---- Load or synthesize image ---- */
     int img_w = img_size_override, img_h = img_size_override;
-    if (img_w % vm->patch_size != 0) {
-        fprintf(stderr, "Image size %d must be multiple of patch size %d\n", img_w, vm->patch_size);
-        return 1;
+    uint8_t *img_rgb = NULL;
+    int grid = vm->patch_size * vm->spatial_merge;  /* dims must be multiple */
+    if (image_path) {
+        int sw = 0, sh = 0;
+        uint8_t *src = img_load(image_path, &sw, &sh);
+        if (!src) {
+            fprintf(stderr, "Failed to load image: %s\n", image_path);
+            return 1;
+        }
+        /* Preserve aspect ratio, longer side = img_size_override, snap to grid. */
+        int long_side = (sw > sh) ? sw : sh;
+        float scale = (float)img_size_override / (float)long_side;
+        int dw = (int)(sw * scale); if (dw < grid) dw = grid;
+        int dh = (int)(sh * scale); if (dh < grid) dh = grid;
+        dw = (dw / grid) * grid;
+        dh = (dh / grid) * grid;
+        fprintf(stderr, "Loaded %dx%d, resizing to %dx%d (grid %d)\n", sw, sh, dw, dh, grid);
+        img_rgb = img_resize_ac(src, sw, sh, dw, dh);
+        free(src);
+        img_w = dw;
+        img_h = dh;
+    } else {
+        if (img_w % grid != 0) {
+            fprintf(stderr, "Image size %d must be multiple of %d (patch*merge)\n", img_w, grid);
+            return 1;
+        }
+        fprintf(stderr, "Generating %dx%d checkerboard image...\n", img_w, img_h);
+        img_rgb = generate_checkerboard(img_w, img_h, 64);
     }
-    fprintf(stderr, "Generating %dx%d checkerboard image...\n", img_w, img_h);
-    uint8_t *img_rgb = generate_checkerboard(img_w, img_h, 64);
 
     fprintf(stderr, "Normalizing image...\n");
     float *img_norm = vision_normalize_image(vm, img_rgb, img_w, img_h);
@@ -157,8 +213,8 @@ int main(int argc, char **argv) {
 
     /* ---- Build token sequence ---- */
     char text_before[256];
-    char text_after[512];
-    build_multimodal_chat_prompt(gguf_main, "Explain the image",
+    char text_after[1024];
+    build_multimodal_chat_prompt(gguf_main, user_prompt,
                                  text_before, sizeof(text_before),
                                  text_after, sizeof(text_after));
 
