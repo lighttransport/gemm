@@ -1482,6 +1482,8 @@ static void handle_static(int fd, const server_config *cfg, const char *url_path
     else if (strcmp(rel, "/hy3d_compare") == 0) rel = "/hy3d.html";
     else if (strcmp(rel, "/trellis2") == 0) rel = "/trellis2.html";
     else if (strcmp(rel, "/trellis2_compare") == 0) rel = "/trellis2.html";
+    else if (strcmp(rel, "/llm") == 0) rel = "/llm_chat.html";
+    else if (strcmp(rel, "/llm_chat") == 0) rel = "/llm_chat.html";
     if (!path_is_safe(rel)) {
         char *e = json_error_response("bad_path", "invalid static path");
         send_response(fd, 400, "application/json", e, strlen(e));
