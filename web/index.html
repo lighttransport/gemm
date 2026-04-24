@@ -107,6 +107,10 @@
         <a href="/llm">LLM / VLM compare <span class="pill cmp">side-by-side</span><span class="port">:8089</span></a>
         <div class="desc">Qwen3.5 (LLM, GGUF via <code>test_transformer</code>), Gemma4 VLM (GGUF via <code>test_gemma4_vision</code> / <code>test_cuda_gemma4_vlm</code>), and Qwen3.6-27B VLM (hybrid SSM + Qwen3-VL mmproj via <code>test_vision</code>) vs. pytorch-cuda reference (HF transformers). Variant family is auto-detected from the GGUF header and each backend is gated accordingly. Image upload + preset images; similarity panel computes token-level agreement (HF tokenizer) and char-level edit distance vs. a chosen reference response. Start the sidecar with <code>./server/run-llm-compare.sh</code>.</div>
       </li>
+      <li>
+        <a href="/image_chat">Image chat — Qwen3.6-VL <span class="pill">single</span><span class="port">:8089</span></a>
+        <div class="desc">Upload an image, pan / zoom / rotate 90°, crop to a selected region, and burn horizontal / vertical OCR guide lines on top. Each turn re-rasterizes the edited view and ships a PNG (max side 1024) to the first available Qwen VLM backend (cuda &gt; cpu &gt; pytorch). Multi-turn by default — prior turns are concatenated into the next prompt (stateless model). Shares the <code>/v1/chat</code> endpoint with the LLM/VLM compare page, so <code>./server/run-llm-compare.sh</code> is the same launcher.</div>
+      </li>
     </ul>
   </section>
 
