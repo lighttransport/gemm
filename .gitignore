@@ -92,4 +92,5 @@ cpu/sparse3d/.venv/
 ref/*
 !ref/hy3d/
 !ref/trellis2/
+!ref/llm/
 result/

@@ -100,6 +100,17 @@
   </section>
 
   <section>
+    <h2>Qwen3.5 + Gemma4 + Qwen3.6 chat</h2>
+    <div class="task">text-generation / image-text-to-text</div>
+    <ul>
+      <li>
+        <a href="/llm">LLM / VLM compare <span class="pill cmp">side-by-side</span><span class="port">:8089</span></a>
+        <div class="desc">Qwen3.5 (LLM, GGUF via <code>test_transformer</code>), Gemma4 VLM (GGUF via <code>test_gemma4_vision</code> / <code>test_cuda_gemma4_vlm</code>), and Qwen3.6-27B VLM (hybrid SSM + Qwen3-VL mmproj via <code>test_vision</code>) vs. pytorch-cuda reference (HF transformers). Variant family is auto-detected from the GGUF header and each backend is gated accordingly. Image upload + preset images; similarity panel computes token-level agreement (HF tokenizer) and char-level edit distance vs. a chosen reference response. Start the sidecar with <code>./server/run-llm-compare.sh</code>.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
     <h2>Hunyuan3D-2.1</h2>
     <div class="task">image-to-3D mesh</div>
     <ul>
