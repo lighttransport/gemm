@@ -270,19 +270,22 @@ static void vit_batch_gemm_bias(float *dst, const qtensor *mat, const qtensor *b
         gemm_f16_f32_tokmajor(dst, (const uint16_t *)mat->data, src,
                               n_out, n_in, n_tokens, n_out, n_in);
     } else {
-        /* Fallback: per-token matvec */
-        float *tmp = (float *)malloc(n_in * sizeof(float));
+        /* Dequant whole W once → per-token F32 matvec. Previously
+         * dequanted each row n_tokens times inside the loop. */
+        float *Wf = (float *)malloc((size_t)n_out * n_in * sizeof(float));
+        for (int i = 0; i < n_out; i++)
+            vit_dequant_row(mat, i, Wf + (size_t)i * n_in);
         for (int b = 0; b < n_tokens; b++) {
-            const float *x = src + b * n_in;
-            float *y = dst + b * n_out;
+            const float *x = src + (size_t)b * n_in;
+            float *y = dst + (size_t)b * n_out;
             for (int i = 0; i < n_out; i++) {
-                vit_dequant_row(mat, i, tmp);
+                const float *w = Wf + (size_t)i * n_in;
                 float sum = 0.0f;
-                for (int j = 0; j < n_in; j++) sum += tmp[j] * x[j];
+                for (int j = 0; j < n_in; j++) sum += w[j] * x[j];
                 y[i] = sum;
             }
         }
-        free(tmp);
+        free(Wf);
     }
     /* Add bias */
     if (bias && bias->data) {
