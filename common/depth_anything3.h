@@ -368,29 +368,30 @@ static void da3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
         fprintf(stderr, "da3_batch_gemm: weight has %d elements, expected %d*%d=%d\n",
                 w_numel, n_out, n_in, n_out * n_in);
     }
+    float *bf_alloc = NULL;
+    const float *bf = NULL;
+    if (bias && bias->data) {
+        if (bias->type == GGML_TYPE_F32) {
+            bf = (const float *)bias->data;
+        } else {
+            bf_alloc = (float *)malloc((size_t)n_out * sizeof(float));
+            da3_dequant_row(bias, 0, bf_alloc);
+            bf = bf_alloc;
+        }
+    }
     if (W->type == GGML_TYPE_F16) {
-        /* Dequant bias first, then delegate to cpu_gemm_f16 */
-        float *b = NULL;
-        if (bias && bias->data) {
-            b = (float *)malloc((size_t)n_out * sizeof(float));
-            da3_dequant_row(bias, 0, b);
-        }
-        cpu_gemm_f16(dst, (const uint16_t *)W->data, b, src,
+        cpu_gemm_f16(dst, (const uint16_t *)W->data, (float *)bf, src,
                      n_tok, n_out, n_in, n_threads);
-        free(b);
+    } else if (W->type == GGML_TYPE_F32) {
+        cpu_gemm_f32(dst, (const float *)W->data, bf, src,
+                     n_tok, n_out, n_in, n_threads);
     } else {
-        /* Dequant whole W once → F32 GEMM. The previous code dequanted
-         * each row n_tok times inside the loop, ~n_tok× redundant work. */
+        /* Quantized: dequant whole W once, then F32 GEMM. */
         float *Wf = da3_dequant(W);
-        float *bf = NULL;
-        if (bias && bias->data) {
-            bf = (float *)malloc((size_t)n_out * sizeof(float));
-            da3_dequant_row(bias, 0, bf);
-        }
         cpu_gemm_f32(dst, Wf, bf, src, n_tok, n_out, n_in, n_threads);
         free(Wf);
-        free(bf);
     }
+    free(bf_alloc);
 }
 
 /* ---- LayerNorm: y = (x - mean) / sqrt(var + eps) * w + b ---- */
