@@ -379,24 +379,17 @@ static void da3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
                      n_tok, n_out, n_in, n_threads);
         free(b);
     } else {
-        float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
-        for (int t = 0; t < n_tok; t++) {
-            for (int r = 0; r < n_out; r++) {
-                da3_dequant_row(W, r, tmp);
-                float s = 0.0f;
-                for (int j = 0; j < n_in; j++) s += tmp[j] * src[t * n_in + j];
-                dst[t * n_out + r] = s;
-            }
-        }
-        free(tmp);
+        /* Dequant whole W once → F32 GEMM. The previous code dequanted
+         * each row n_tok times inside the loop, ~n_tok× redundant work. */
+        float *Wf = da3_dequant(W);
+        float *bf = NULL;
         if (bias && bias->data) {
-            float *b = (float *)malloc((size_t)n_out * sizeof(float));
-            da3_dequant_row(bias, 0, b);
-            for (int t = 0; t < n_tok; t++)
-                for (int i = 0; i < n_out; i++)
-                    dst[t * n_out + i] += b[i];
-            free(b);
+            bf = (float *)malloc((size_t)n_out * sizeof(float));
+            da3_dequant_row(bias, 0, bf);
         }
+        cpu_gemm_f32(dst, Wf, bf, src, n_tok, n_out, n_in, n_threads);
+        free(Wf);
+        free(bf);
     }
 }
 
