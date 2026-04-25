@@ -561,6 +561,26 @@ static void *sp3d_gemm_worker(void *arg) {
     return NULL;
 }
 
+static void sp3d_gemm_f32_dispatch(float *dst, const float *src,
+                                    const float *Wf, const float *bf,
+                                    int N, int out_C, int in_C, int n_threads) {
+    if (n_threads <= 1 || N < n_threads * 4) {
+        sp3d_gemm_f32_range(dst, src, Wf, bf, 0, N, out_C, in_C);
+        return;
+    }
+    sp3d_gemm_task *tasks = (sp3d_gemm_task *)calloc((size_t)n_threads, sizeof(sp3d_gemm_task));
+    pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
+    int per = N / n_threads, rem = N % n_threads, v = 0;
+    for (int ti = 0; ti < n_threads; ti++) {
+        int cnt = per + (ti < rem ? 1 : 0);
+        tasks[ti] = (sp3d_gemm_task){dst, src, Wf, bf, v, v + cnt, out_C, in_C};
+        v += cnt;
+        pthread_create(&threads[ti], NULL, sp3d_gemm_worker, &tasks[ti]);
+    }
+    for (int ti = 0; ti < n_threads; ti++) pthread_join(threads[ti], NULL);
+    free(tasks); free(threads);
+}
+
 void sp3d_linear(float *dst, const float *src, int N,
                   const qtensor *W, const qtensor *bias,
                   int out_C, int in_C, int n_threads) {
@@ -580,44 +600,21 @@ void sp3d_linear(float *dst, const float *src, int N,
                      N, out_C, in_C, n_threads);
         free(b);
     } else if (W->type == GGML_TYPE_F32) {
-        /* F32 GEMM: dst[i][j] = sum_k src[i][k] * W[j][k] + bias[j] */
         const float *Wf = (const float *)W->data;
         const float *bf = (bias && bias->data) ? (const float *)bias->data : NULL;
-        if (n_threads <= 1 || N < n_threads * 4) {
-            sp3d_gemm_f32_range(dst, src, Wf, bf, 0, N, out_C, in_C);
-        } else {
-            sp3d_gemm_task *tasks = (sp3d_gemm_task *)calloc((size_t)n_threads, sizeof(sp3d_gemm_task));
-            pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-            int per = N / n_threads, rem = N % n_threads, v = 0;
-            for (int ti = 0; ti < n_threads; ti++) {
-                int cnt = per + (ti < rem ? 1 : 0);
-                tasks[ti] = (sp3d_gemm_task){dst, src, Wf, bf, v, v + cnt, out_C, in_C};
-                v += cnt;
-                pthread_create(&threads[ti], NULL, sp3d_gemm_worker, &tasks[ti]);
-            }
-            for (int ti = 0; ti < n_threads; ti++) pthread_join(threads[ti], NULL);
-            free(tasks); free(threads);
-        }
+        sp3d_gemm_f32_dispatch(dst, src, Wf, bf, N, out_C, in_C, n_threads);
     } else {
-        /* Quantized: dequant row by row */
-        float *tmp = (float *)malloc((size_t)in_C * sizeof(float));
-        for (int i = 0; i < N; i++) {
-            for (int r = 0; r < out_C; r++) {
-                qt_dequant_row(W, r, tmp);
-                float s = 0.0f;
-                for (int k = 0; k < in_C; k++) s += tmp[k] * src[i * in_C + k];
-                dst[i * out_C + r] = s;
-            }
-        }
-        free(tmp);
+        /* Dequant whole W once → F32 GEMM. The previous code dequanted
+         * each row N times inside the loop, ~N× redundant work. */
+        float *Wf = qt_dequant(W);
+        float *bf = NULL;
         if (bias && bias->data) {
-            float *b = (float *)malloc((size_t)out_C * sizeof(float));
-            qt_dequant_row(bias, 0, b);
-            for (int i = 0; i < N; i++)
-                for (int j = 0; j < out_C; j++)
-                    dst[i * out_C + j] += b[j];
-            free(b);
+            bf = (float *)malloc((size_t)out_C * sizeof(float));
+            qt_dequant_row(bias, 0, bf);
         }
+        sp3d_gemm_f32_dispatch(dst, src, Wf, bf, N, out_C, in_C, n_threads);
+        free(Wf);
+        free(bf);
     }
     sp3d_prof_end(SP3D_OP_LINEAR, _t0, (int64_t)N * out_C * sizeof(float));
 }
