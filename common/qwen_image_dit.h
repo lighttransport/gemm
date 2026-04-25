@@ -35,25 +35,7 @@
 extern "C" {
 #endif
 
-/* Reuse qtensor if not already defined */
-#ifndef TRANSFORMER_H
-#ifndef DEPTH_ANYTHING3_H
-#ifndef DINOV3_H
-#ifndef SPARSE3D_H
-#ifndef T2DIT_H
-typedef struct {
-    void    *data;
-    uint32_t type;
-    int      n_rows;
-    int      n_cols;
-    int      n_dims;
-    uint64_t dims[4];
-} qtensor;
-#endif
-#endif
-#endif
-#endif
-#endif
+#include "qtensor_utils.h"
 
 typedef struct {
     /* Image attention (separate Q/K/V) */

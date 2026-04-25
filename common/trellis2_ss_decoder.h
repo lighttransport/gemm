@@ -37,25 +37,7 @@
 extern "C" {
 #endif
 
-/* Reuse qtensor if not already defined */
-#ifndef TRANSFORMER_H
-#ifndef DEPTH_ANYTHING3_H
-#ifndef DINOV3_H
-#ifndef SPARSE3D_H
-#ifndef T2DIT_H
-typedef struct {
-    void    *data;
-    uint32_t type;
-    int      n_rows;
-    int      n_cols;
-    int      n_dims;
-    uint64_t dims[4];
-} qtensor;
-#endif
-#endif
-#endif
-#endif
-#endif
+#include "qtensor_utils.h"
 
 /* ResBlock3d: GN -> SiLU -> Conv3d -> GN -> SiLU -> Conv3d [+ skip conv] */
 typedef struct {
@@ -187,17 +169,20 @@ static void t2dec_conv3d(float *dst, const float *src, const float *weight,
                            const float *bias, int Ci, int Co,
                            int D, int H, int Wi) {
     int spatial = D * H * Wi;
-    /* Zero output and add bias */
-    for (int co = 0; co < Co; co++) {
-        float bv = bias ? bias[co] : 0.0f;
-        for (int s = 0; s < spatial; s++)
-            dst[(size_t)co * spatial + s] = bv;
-    }
 
-    /* Convolve: weight layout [Co, Ci, kD, kH, kW] */
+    /* Parallel over output channels: each `co` writes an independent slab.
+     * Kernel layout [Co, Ci, kD, kH, kW]. */
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
     for (int co = 0; co < Co; co++) {
+        float *dst_co = dst + (size_t)co * spatial;
+        float bv = bias ? bias[co] : 0.0f;
+        for (int s = 0; s < spatial; s++) dst_co[s] = bv;
+
         for (int ci = 0; ci < Ci; ci++) {
             const float *kern = weight + ((size_t)co * Ci + ci) * 27;
+            const float *src_ci = src + (size_t)ci * spatial;
             for (int d = 0; d < D; d++) {
                 for (int h = 0; h < H; h++) {
                     for (int w_pos = 0; w_pos < Wi; w_pos++) {
@@ -212,11 +197,11 @@ static void t2dec_conv3d(float *dst, const float *src, const float *weight,
                                     int ww = w_pos + kw - 1;
                                     if (ww < 0 || ww >= Wi) continue;
                                     sum += kern[kd * 9 + kh * 3 + kw]
-                                         * src[(size_t)ci * spatial + dd * H * Wi + hh * Wi + ww];
+                                         * src_ci[dd * H * Wi + hh * Wi + ww];
                                 }
                             }
                         }
-                        dst[(size_t)co * spatial + d * H * Wi + h * Wi + w_pos] += sum;
+                        dst_co[d * H * Wi + h * Wi + w_pos] += sum;
                     }
                 }
             }
@@ -419,42 +404,6 @@ float *t2_ss_dec_forward(t2_ss_dec *d, const float *latent, int n_threads) {
 
 #ifdef SAFETENSORS_H
 
-static qtensor t2dec_make_tensor(st_context *st, int idx) {
-    qtensor t = {0};
-    if (idx < 0) return t;
-    t.data = safetensors_data(st, idx);
-    const char *dt = safetensors_dtype(st, idx);
-    if (strcmp(dt, "F32") == 0)       t.type = GGML_TYPE_F32;
-    else if (strcmp(dt, "F16") == 0)  t.type = GGML_TYPE_F16;
-    else if (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_F32;
-    else return (qtensor){0};
-    int nd = safetensors_ndims(st, idx);
-    t.n_dims = nd < 4 ? nd : 4;  /* qtensor.dims only has 4 slots */
-    const uint64_t *shape = safetensors_shape(st, idx);
-    for (int d = 0; d < t.n_dims; d++) t.dims[d] = shape[d];
-    if (nd >= 2) {
-        t.n_rows = (int)shape[0];
-        t.n_cols = 1;
-        for (int d = 1; d < nd; d++) t.n_cols *= (int)shape[d];
-    } else {
-        t.n_cols = (int)shape[0];
-        t.n_rows = 1;
-    }
-    /* BF16 -> F32 conversion */
-    if (strcmp(dt, "BF16") == 0) {
-        int numel = t.n_cols * t.n_rows;
-        float *buf = (float *)malloc((size_t)numel * sizeof(float));
-        const uint16_t *src = (const uint16_t *)t.data;
-        for (int i = 0; i < numel; i++) {
-            uint32_t bits = (uint32_t)src[i] << 16;
-            memcpy(&buf[i], &bits, 4);
-        }
-        t.data = buf;
-        t.type = GGML_TYPE_F32;
-    }
-    return t;
-}
-
 static void t2dec_load_resblock(st_context *st, t2_ss_dec_resblock *blk,
                                   const char *prefix, int Ci, int Co) {
     char name[512];
@@ -463,7 +412,7 @@ static void t2dec_load_resblock(st_context *st, t2_ss_dec_resblock *blk,
     #define DEC_LOAD(field, suffix) do { \
         snprintf(name, sizeof(name), "%s%s", prefix, suffix); \
         idx = safetensors_find(st, name); \
-        if (idx >= 0) blk->field = t2dec_make_tensor(st, idx); \
+        if (idx >= 0) blk->field = qt_make_tensor(st, idx); \
     } while(0)
 
     DEC_LOAD(gn1_w,   "norm1.weight");
@@ -530,7 +479,7 @@ t2_ss_dec *t2_ss_dec_load(const char *st_path) {
         char _buf[512]; \
         snprintf(_buf, sizeof(_buf), "%s%s", prefix, suffix); \
         int _idx = safetensors_find(st, _buf); \
-        (_idx >= 0) ? t2dec_make_tensor(st, _idx) : (qtensor){0}; \
+        (_idx >= 0) ? qt_make_tensor(st, _idx) : (qtensor){0}; \
     })
 
     t2_ss_dec *d = (t2_ss_dec *)calloc(1, sizeof(t2_ss_dec));

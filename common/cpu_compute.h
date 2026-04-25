@@ -311,6 +311,101 @@ static void cpu_gemm_f16(float *dst, const uint16_t *W, const float *bias,
 #endif
 }
 
+/* OpenMP-parallel F32 GEMM:
+ *   dst[t, r] = sum_j W[r, j] * src[t, j] + (bias ? bias[r] : 0)
+ *   W:   [n_out, n_in] f32 row-major
+ *   src: [n_tok, n_in] f32 row-major
+ *   dst: [n_tok, n_out] f32 row-major
+ *
+ * Used as the quantized-weight fallback (dequant once → call this) and
+ * for any pre-dequantized F32 matmul. Simple AVX2 fmadd inner loop;
+ * for very large GEMMs the F16 path (cpu_gemm_f16) is faster. */
+static void cpu_gemm_f32(float *dst, const float *W, const float *bias,
+                         const float *src, int n_tok, int n_out, int n_in,
+                         int n_threads) {
+#if defined(_OPENMP)
+    #pragma omp parallel for collapse(2) schedule(static) num_threads(n_threads)
+#else
+    (void)n_threads;
+#endif
+    for (int t = 0; t < n_tok; t++) {
+        for (int r = 0; r < n_out; r++) {
+            const float *a = src + (size_t)t * n_in;
+            const float *w = W   + (size_t)r * n_in;
+            float s = bias ? bias[r] : 0.0f;
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 acc = _mm256_setzero_ps();
+            int j = 0;
+            for (; j + 8 <= n_in; j += 8) {
+                __m256 va = _mm256_loadu_ps(a + j);
+                __m256 vw = _mm256_loadu_ps(w + j);
+                acc = _mm256_fmadd_ps(va, vw, acc);
+            }
+            float tail[8];
+            _mm256_storeu_ps(tail, acc);
+            s += tail[0] + tail[1] + tail[2] + tail[3]
+               + tail[4] + tail[5] + tail[6] + tail[7];
+            for (; j < n_in; j++) s += a[j] * w[j];
+#else
+            for (int j = 0; j < n_in; j++) s += a[j] * w[j];
+#endif
+            dst[(size_t)t * n_out + r] = s;
+        }
+    }
+}
+
+/* ==================================================================== */
+/* Bicubic positional-embedding interpolation                            */
+/*                                                                       */
+/* Keys cubic-convolution kernel (a = -0.75). Matches                    */
+/* torch.nn.functional.interpolate(antialias=False, mode='bicubic',      */
+/* align_corners=False) plus the DINOv2 "+0.1" interp_offset trick used  */
+/* by interpolate_pos_encoding to avoid edge oscillation when a learned  */
+/* M×M positional embedding is upsampled to gh×gw.                       */
+/*                                                                       */
+/* pe_orig is the patch grid only (no CLS): [M*M, dim].                  */
+/* pe_out  is the patch grid only:           [gh*gw, dim].               */
+/* The caller is responsible for prepending the CLS token.               */
+/* ==================================================================== */
+static inline float cpu_keys_bicubic(float a) {
+    a = fabsf(a);
+    if (a <= 1.0f) return ((1.25f * a - 2.25f) * a) * a + 1.0f;
+    if (a <  2.0f) return (((-0.75f * a + 3.75f) * a) - 6.0f) * a + 3.0f;
+    return 0.0f;
+}
+
+static void cpu_interp_pos_embed_bicubic(const float *pe_orig, int M,
+                                         float *pe_out, int gh, int gw, int dim) {
+    const float interp_offset = 0.1f;
+    float sx = ((float)gw + interp_offset) / (float)M;
+    float sy = ((float)gh + interp_offset) / (float)M;
+    for (int y = 0; y < gh; y++) {
+        float fy = ((float)y + 0.5f) / sy - 0.5f;
+        if (fy < 0) fy = 0;
+        if (fy > (float)(M - 1)) fy = (float)(M - 1);
+        int iy = (int)fy; float dy = fy - iy;
+        for (int x = 0; x < gw; x++) {
+            float fx = ((float)x + 0.5f) / sx - 0.5f;
+            if (fx < 0) fx = 0;
+            if (fx > (float)(M - 1)) fx = (float)(M - 1);
+            int ix = (int)fx; float dx = fx - ix;
+            for (int d = 0; d < dim; d++) {
+                float val = 0.0f;
+                for (int jj = -1; jj <= 2; jj++) {
+                    int sy2 = iy + jj; if (sy2 < 0) sy2 = 0; if (sy2 >= M) sy2 = M - 1;
+                    float wy = cpu_keys_bicubic(dy - (float)jj);
+                    for (int ii = -1; ii <= 2; ii++) {
+                        int sx2 = ix + ii; if (sx2 < 0) sx2 = 0; if (sx2 >= M) sx2 = M - 1;
+                        float wx = cpu_keys_bicubic(dx - (float)ii);
+                        val += pe_orig[sy2 * M * dim + sx2 * dim + d] * wy * wx;
+                    }
+                }
+                pe_out[(y * gw + x) * dim + d] = val;
+            }
+        }
+    }
+}
+
 /* ---- Flash Attention: tiled online softmax with K/V transpose ---- */
 
 #define CPU_ATTN_TILE 64

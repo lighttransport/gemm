@@ -29,17 +29,7 @@
 extern "C" {
 #endif
 
-/* Reuse qtensor from transformer.h if available, else define it */
-#ifndef TRANSFORMER_H
-typedef struct {
-    void    *data;
-    uint32_t type;
-    int      n_rows;
-    int      n_cols;
-    int      n_dims;
-    uint64_t dims[4];
-} qtensor;
-#endif
+#include "qtensor_utils.h"
 
 typedef struct {
     qtensor ln1_w, ln1_b;
@@ -877,46 +867,6 @@ da3_model *da3_load(gguf_context *gguf) {
 /* Helper: create qtensor from safetensors by internal name */
 typedef struct { char st_name[256]; char gg_name[256]; } da3_name_map;
 
-static qtensor da3s_make_tensor(st_context *st, int idx) {
-    qtensor t = {0};
-    if (idx < 0) return t;
-    t.data = safetensors_data(st, idx);
-    const char *dt = safetensors_dtype(st, idx);
-    if (strcmp(dt, "F32") == 0)       t.type = GGML_TYPE_F32;
-    else if (strcmp(dt, "F16") == 0)  t.type = GGML_TYPE_F16;
-    else if (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_F32; /* BF16 needs convert */
-    else return (qtensor){0}; /* unsupported type */
-    t.n_dims = safetensors_ndims(st, idx);
-    const uint64_t *shape = safetensors_shape(st, idx);
-    for (int d = 0; d < t.n_dims; d++) t.dims[d] = shape[d];
-    /* Set n_rows/n_cols for GEMM compatibility:
-     * - 1D: n_rows=1, n_cols=N
-     * - 2D [out, in]: n_rows=out, n_cols=in
-     * - 4D [out, in, kH, kW]: n_rows=out, n_cols=in*kH*kW
-     * This matches how da3_dequant_row indexes the data. */
-    if (t.n_dims >= 2) {
-        t.n_rows = (int)shape[0];
-        t.n_cols = 1;
-        for (int d = 1; d < t.n_dims; d++) t.n_cols *= (int)shape[d];
-    } else {
-        t.n_cols = (int)shape[0];
-        t.n_rows = 1;
-    }
-    /* Handle BF16 → F32 conversion (in-place not possible with mmap, allocate) */
-    if (strcmp(dt, "BF16") == 0) {
-        int numel = t.n_cols * t.n_rows;
-        float *buf = (float *)malloc((size_t)numel * sizeof(float));
-        const uint16_t *src = (const uint16_t *)t.data;
-        for (int i = 0; i < numel; i++) {
-            uint32_t bits = (uint32_t)src[i] << 16;
-            memcpy(&buf[i], &bits, 4);
-        }
-        t.data = buf;
-        t.type = GGML_TYPE_F32;
-    }
-    return t;
-}
-
 /* Map PyTorch safetensors name to internal GGUF name.
  * Returns 1 if mapped, 0 if not recognized. */
 static int da3s_map_name(const char *st_name, char *gg_name, int gg_size) {
@@ -1283,7 +1233,7 @@ static qtensor da3s_find(st_context *st, const da3_name_map *map, int map_count,
     for (int i = 0; i < map_count; i++) {
         if (strcmp(map[i].gg_name, gg_name) == 0) {
             int idx = safetensors_find(st, map[i].st_name);
-            if (idx >= 0) return da3s_make_tensor(st, idx);
+            if (idx >= 0) return qt_make_tensor(st, idx);
             break;
         }
     }
@@ -1938,40 +1888,10 @@ da3_result da3_predict(da3_model *m, const uint8_t *rgb, int img_w, int img_h, i
         if (gh == M && gw == M) {
             pe = pe_orig;
         } else {
-            /* Bicubic interpolation from M×M to gh×gw (Keys a=-0.75, scale_factor with offset) */
             pe = (float *)malloc((size_t)nt * dim * sizeof(float));
             memcpy(pe, pe_orig, (size_t)dim * sizeof(float));  /* CLS token */
-            float *patch_pe = pe_orig + dim;  /* [M*M, dim] */
-            float interp_offset = 0.1f;
-            float sx = (float)(gw + interp_offset) / M;
-            float sy = (float)(gh + interp_offset) / M;
-            for (int y = 0; y < gh; y++) {
-                float fy = ((float)y + 0.5f) / sy - 0.5f;
-                if (fy < 0) fy = 0; if (fy > M - 1) fy = (float)(M - 1);
-                int iy = (int)fy; float dy = fy - iy;
-                for (int x = 0; x < gw; x++) {
-                    float fx = ((float)x + 0.5f) / sx - 0.5f;
-                    if (fx < 0) fx = 0; if (fx > M - 1) fx = (float)(M - 1);
-                    int ix = (int)fx; float dx = fx - ix;
-                    for (int d = 0; d < dim; d++) {
-                        float val = 0.0f;
-                        for (int jj = -1; jj <= 2; jj++) {
-                            int sy2 = iy + jj; if (sy2 < 0) sy2 = 0; if (sy2 >= M) sy2 = M - 1;
-                            float ay = fabsf(dy - jj);
-                            float wy = (ay <= 1.0f) ? ((1.25f*ay - 2.25f)*ay)*ay + 1.0f :
-                                        (ay < 2.0f) ? ((-0.75f*ay + 3.75f)*ay - 6.0f)*ay + 3.0f : 0.0f;
-                            for (int ii = -1; ii <= 2; ii++) {
-                                int sx2 = ix + ii; if (sx2 < 0) sx2 = 0; if (sx2 >= M) sx2 = M - 1;
-                                float ax = fabsf(dx - ii);
-                                float wx = (ax <= 1.0f) ? ((1.25f*ax - 2.25f)*ax)*ax + 1.0f :
-                                            (ax < 2.0f) ? ((-0.75f*ax + 3.75f)*ax - 6.0f)*ax + 3.0f : 0.0f;
-                                val += patch_pe[sy2 * M * dim + sx2 * dim + d] * wy * wx;
-                            }
-                        }
-                        pe[(1 + y * gw + x) * dim + d] = val;
-                    }
-                }
-            }
+            cpu_interp_pos_embed_bicubic(pe_orig + dim, M,
+                                         pe + dim, gh, gw, dim);
             free(pe_orig);
         }
         for (int t = 0; t < nt; t++)
