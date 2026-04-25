@@ -262,29 +262,13 @@ static void t2dit_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
         cpu_gemm_f16(dst, (const uint16_t *)W->data, bias_f, src,
                      n_tok, n_out, n_in, n_threads);
     } else {
-        /* Slow fallback: row-by-row dequant */
-        float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
-        for (int t = 0; t < n_tok; t++) {
-            for (int r = 0; r < n_out; r++) {
-                const float *row;
-                if (W->type == GGML_TYPE_F32) {
-                    row = (const float *)W->data + (size_t)r * n_in;
-                } else {
-                    dequant_row(W->type, (const uint8_t *)W->data + (size_t)r * W->n_cols * 2,
-                                tmp, n_in);
-                    row = tmp;
-                }
-                float s = 0.0f;
-                for (int j = 0; j < n_in; j++) s += row[j] * src[(size_t)t * n_in + j];
-                dst[(size_t)t * n_out + r] = s;
-            }
-        }
-        free(tmp);
-        if (bias_f) {
-            for (int t = 0; t < n_tok; t++)
-                for (int i = 0; i < n_out; i++)
-                    dst[(size_t)t * n_out + i] += bias_f[i];
-        }
+        /* Dequant whole W once → F32 GEMM. The previous fallback both
+         * dequanted W's row per-(token, row) (n_tok× redundant) and
+         * hardcoded a 2-byte row stride (`W->n_cols * 2`) that only
+         * works for F16/BF16 — broken for Q-types. */
+        float *Wf = qt_dequant(W);
+        t2dit_gemm_f32(dst, Wf, bias_f, src, n_tok, n_out, n_in, n_threads);
+        free(Wf);
     }
     /* Free bias_f only if we allocated it (non-F32 original) */
     if (bias_f && bias && bias->type != GGML_TYPE_F32)
