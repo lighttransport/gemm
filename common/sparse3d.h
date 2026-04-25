@@ -195,7 +195,7 @@ static inline double sp3d_clock_ms(void) {
 }
 
 static inline void sp3d_prof_begin(double *t0) {
-    if (sp3d_g_prof.enabled) *t0 = sp3d_clock_ms();
+    *t0 = sp3d_g_prof.enabled ? sp3d_clock_ms() : 0.0;
 }
 
 static inline void sp3d_prof_end(enum sp3d_op op, double t0, int64_t mem_bytes) {
