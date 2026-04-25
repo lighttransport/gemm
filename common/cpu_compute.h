@@ -56,7 +56,7 @@ static inline float cpu_hsum256(__m256 v) {
 }
 #endif
 
-static void cpu_layernorm(float *dst, const float *src, const float *w,
+static inline void cpu_layernorm(float *dst, const float *src, const float *w,
                            const float *b, int n_tok, int dim, float eps) {
 #if defined(__AVX2__) && defined(__FMA__)
     if ((dim & 7) == 0) {
@@ -111,7 +111,7 @@ static void cpu_layernorm(float *dst, const float *src, const float *w,
 
 /* ---- QK Normalization: per-head LayerNorm on Q/K with stride ---- */
 
-static void cpu_qk_norm(float *vec, int n_tok, int n_heads, int head_dim,
+static inline void cpu_qk_norm(float *vec, int n_tok, int n_heads, int head_dim,
                           int stride, const float *w, const float *b, float eps) {
     for (int t = 0; t < n_tok; t++) {
         for (int h = 0; h < n_heads; h++) {
@@ -131,7 +131,7 @@ static void cpu_qk_norm(float *vec, int n_tok, int n_heads, int head_dim,
 
 /* ---- 2D RoPE: split head_dim in half for y/x positions ---- */
 
-static void cpu_rope_2d(float *vec, int n_tok, int n_heads, int head_dim,
+static inline void cpu_rope_2d(float *vec, int n_tok, int n_heads, int head_dim,
                           int stride, const int *pos_y, const int *pos_x,
                           float freq_base) {
     int half = head_dim / 2;
@@ -165,7 +165,7 @@ static void cpu_rope_2d(float *vec, int n_tok, int n_heads, int head_dim,
 
 /* ---- Softmax ---- */
 
-static void cpu_softmax(float *x, int n) {
+static inline void cpu_softmax(float *x, int n) {
     float mx = x[0];
     for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
     float sum = 0.0f;
@@ -178,7 +178,7 @@ static void cpu_softmax(float *x, int n) {
  * Just OMP-parallel over the array; tanhf is accurate (libm). A SIMD rational
  * approximation was tried but its ~3e-3 error compounded across 32 ViT blocks
  * and shifted post-process mask counts. Stick with libm. */
-static void cpu_gelu(float *x, int n) {
+static inline void cpu_gelu(float *x, int n) {
     const float c = 0.7978845608f; /* sqrt(2/pi) */
     #if defined(_OPENMP)
     #pragma omp parallel for schedule(static)
@@ -192,7 +192,7 @@ static void cpu_gelu(float *x, int n) {
 
 /* ---- SiLU: x * sigmoid(x) ---- */
 
-static void cpu_silu(float *x, int n) {
+static inline void cpu_silu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float v = x[i];
         x[i] = v / (1.0f + expf(-v));
@@ -201,7 +201,7 @@ static void cpu_silu(float *x, int n) {
 
 /* ---- Bilinear resize (CHW layout, align_corners=True) ---- */
 
-static void cpu_bilinear_resize(float *dst, const float *src,
+static inline void cpu_bilinear_resize(float *dst, const float *src,
                                   int C, int Hi, int Wi, int Ho, int Wo) {
     for (int c = 0; c < C; c++) {
         for (int oh = 0; oh < Ho; oh++) {
@@ -234,7 +234,7 @@ typedef struct {
     int r_start, r_end;
 } cpu_gemm_task;
 
-static void *cpu_gemm_worker(void *arg) {
+static inline void *cpu_gemm_worker(void *arg) {
     cpu_gemm_task *t = (cpu_gemm_task *)arg;
     int count = t->r_end - t->r_start;
     if (count <= 0) return NULL;
@@ -246,7 +246,7 @@ static void *cpu_gemm_worker(void *arg) {
     return NULL;
 }
 
-static void cpu_gemm_f16(float *dst, const uint16_t *W, const float *bias,
+static inline void cpu_gemm_f16(float *dst, const uint16_t *W, const float *bias,
                            const float *src, int n_tok, int n_out, int n_in,
                            int n_threads) {
 #if defined(_OPENMP)
@@ -320,7 +320,7 @@ static void cpu_gemm_f16(float *dst, const uint16_t *W, const float *bias,
  * Used as the quantized-weight fallback (dequant once → call this) and
  * for any pre-dequantized F32 matmul. Simple AVX2 fmadd inner loop;
  * for very large GEMMs the F16 path (cpu_gemm_f16) is faster. */
-static void cpu_gemm_f32(float *dst, const float *W, const float *bias,
+static inline void cpu_gemm_f32(float *dst, const float *W, const float *bias,
                          const float *src, int n_tok, int n_out, int n_in,
                          int n_threads) {
 #if defined(_OPENMP)
@@ -374,7 +374,7 @@ static inline float cpu_keys_bicubic(float a) {
     return 0.0f;
 }
 
-static void cpu_interp_pos_embed_bicubic(const float *pe_orig, int M,
+static inline void cpu_interp_pos_embed_bicubic(const float *pe_orig, int M,
                                          float *pe_out, int gh, int gw, int dim) {
     const float interp_offset = 0.1f;
     float sx = ((float)gw + interp_offset) / (float)M;
@@ -420,7 +420,7 @@ typedef struct {
 
 #if defined(__AVX2__) && defined(__FMA__)
 
-static void *cpu_attn_worker(void *arg) {
+static inline void *cpu_attn_worker(void *arg) {
     cpu_attn_task *t = (cpu_attn_task *)arg;
     int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
     float scale = t->scale;
@@ -543,7 +543,7 @@ static void *cpu_attn_worker(void *arg) {
 
 #else /* Scalar fallback */
 
-static void *cpu_attn_worker(void *arg) {
+static inline void *cpu_attn_worker(void *arg) {
     cpu_attn_task *t = (cpu_attn_task *)arg;
     int N = t->n_tok, hd = t->head_dim, dim3 = 3 * t->dim;
     float scale = t->scale;
@@ -624,7 +624,7 @@ typedef struct {
 
 #if defined(__AVX2__) && defined(__FMA__)
 
-static void *cpu_xattn_worker(void *arg) {
+static inline void *cpu_xattn_worker(void *arg) {
     cpu_xattn_task *t = (cpu_xattn_task *)arg;
     int Nq = t->n_q, Nk = t->n_kv, hd = t->head_dim, dim = t->dim;
     float scale = t->scale;
@@ -709,7 +709,7 @@ static void *cpu_xattn_worker(void *arg) {
 
 #else /* Scalar fallback */
 
-static void *cpu_xattn_worker(void *arg) {
+static inline void *cpu_xattn_worker(void *arg) {
     cpu_xattn_task *t = (cpu_xattn_task *)arg;
     int Nq = t->n_q, Nk = t->n_kv, hd = t->head_dim, dim = t->dim;
     float scale = t->scale;
@@ -774,7 +774,7 @@ static void *cpu_xattn_worker(void *arg) {
 
 #endif /* AVX2+FMA */
 
-static void cpu_cross_attention(float *out, const float *Q, const float *KV,
+static inline void cpu_cross_attention(float *out, const float *Q, const float *KV,
                                  int n_q, int n_kv, int dim, int n_heads,
                                  int head_dim, int n_threads) {
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -803,7 +803,7 @@ static void cpu_cross_attention(float *out, const float *Q, const float *KV,
     free(tasks); free(threads);
 }
 
-static void cpu_attention(float *out, const float *qkv, int n_tok, int dim,
+static inline void cpu_attention(float *out, const float *qkv, int n_tok, int dim,
                            int n_heads, int head_dim, int n_threads) {
     float scale = 1.0f / sqrtf((float)head_dim);
 
