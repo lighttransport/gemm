@@ -17,6 +17,8 @@
 
 /* ======================================================================== */
 #ifdef CPU_COMPUTE_IMPLEMENTATION
+#ifndef CPU_COMPUTE_IMPL_DEFINED
+#define CPU_COMPUTE_IMPL_DEFINED
 
 #include <stdlib.h>
 #include <string.h>
@@ -847,5 +849,6 @@ static inline void cpu_attention(float *out, const float *qkv, int n_tok, int di
 #endif
 }
 
+#endif /* CPU_COMPUTE_IMPL_DEFINED */
 #endif /* CPU_COMPUTE_IMPLEMENTATION */
 #endif /* CPU_COMPUTE_H */
