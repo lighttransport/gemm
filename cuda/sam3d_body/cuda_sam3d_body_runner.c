@@ -93,7 +93,7 @@ static double sb_time_ms(void)
 #define SB_N_PATCH   (SB_GRID * SB_GRID)      /* 1024 */
 #define SB_N_STORAGE 4
 #define SB_N_TOK     (1 + SB_N_STORAGE + SB_N_PATCH)  /* 1029 */
-#define SB_LN_EPS    1e-6f
+#define SB_LN_EPS    1e-5f
 
 /* ViT-H/16 (vit_hmr_512_384) constants — see common/sam3d_body_vit.h.
  * dim=1280, heads=16, head_dim=80, depth=32, ffn=5120, patch=16 (pad=2),

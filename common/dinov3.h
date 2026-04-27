@@ -135,6 +135,46 @@ static double dinov3_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static int dinov3_timing_enabled(void) {
+    const char *env = getenv("SAM3D_BODY_TIMING");
+    if (!env || !env[0]) env = getenv("DINOV3_TIMING");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int dinov3_swiglu_fused_enabled(void) {
+    const char *env = getenv("DINOV3_SWIGLU_FUSED");
+    return !env || !env[0] || strcmp(env, "0") != 0;
+}
+
+static void dinov3_dump_block_if_requested(const char *dir, int block,
+                                           const float *x, int n_tok, int dim) {
+    if (!dir || !dir[0]) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/c_block%02d.bin", dir, block);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(x, sizeof(float), (size_t)n_tok * dim, f);
+    fclose(f);
+}
+
+static float dinov3_f32_to_bf16_roundtrip(float x) {
+    union { float f; uint32_t u; } v = { x };
+    uint32_t lsb = (v.u >> 16) & 1u;
+    v.u += 0x7fffu + lsb;
+    v.u &= 0xffff0000u;
+    return v.f;
+}
+
+static void dinov3_bf16_roundtrip_inplace(float *x, size_t n) {
+    for (size_t i = 0; i < n; i++) x[i] = dinov3_f32_to_bf16_roundtrip(x[i]);
+}
+
+static int dinov3_emulate_bf16_activations(const dinov3_model *m) {
+    const char *env = getenv("DINOV3_EMULATE_BF16");
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    return m && m->use_learned_final_norm;
+}
+
 /* ---- Tensor helpers ---- */
 
 /* ---- Batch GEMM ---- */
@@ -170,6 +210,81 @@ static void dinov3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
         free(Wf);
     }
     free(bf_alloc);
+}
+
+static void dinov3_batch_gemm_fused2(float *dst1, const qtensor *W1, const qtensor *bias1,
+                                     float *dst2, const qtensor *W2, const qtensor *bias2,
+                                     const float *src, int n_tok, int n_out, int n_in,
+                                     int n_threads) {
+    if (!W1->data || !W2->data || W1->type != GGML_TYPE_F16 ||
+        W2->type != GGML_TYPE_F16) {
+        dinov3_batch_gemm(dst1, W1, bias1, src, n_tok, n_out, n_in, n_threads);
+        dinov3_batch_gemm(dst2, W2, bias2, src, n_tok, n_out, n_in, n_threads);
+        return;
+    }
+
+    float *b1_alloc = NULL, *b2_alloc = NULL;
+    const float *b1 = NULL, *b2 = NULL;
+    if (bias1 && bias1->data) {
+        if (bias1->type == GGML_TYPE_F32) b1 = (const float *)bias1->data;
+        else {
+            b1_alloc = (float *)malloc((size_t)n_out * sizeof(float));
+            qt_dequant_row(bias1, 0, b1_alloc);
+            b1 = b1_alloc;
+        }
+    }
+    if (bias2 && bias2->data) {
+        if (bias2->type == GGML_TYPE_F32) b2 = (const float *)bias2->data;
+        else {
+            b2_alloc = (float *)malloc((size_t)n_out * sizeof(float));
+            qt_dequant_row(bias2, 0, b2_alloc);
+            b2 = b2_alloc;
+        }
+    }
+
+#if defined(_OPENMP)
+    if (n_threads > 1 && n_out >= n_threads * 2) {
+        int rows_per = ((n_out / n_threads) / 2) * 2;
+        if (rows_per < 2) rows_per = 2;
+        int n_chunks = (n_out + rows_per - 1) / rows_per;
+        if (n_chunks > n_threads) n_chunks = n_threads;
+        #pragma omp parallel for schedule(static) num_threads(n_chunks)
+        for (int i = 0; i < n_chunks; i++) {
+            int r = i * rows_per;
+            int end = (i == n_chunks - 1) ? n_out : r + rows_per;
+            if (end > n_out) end = n_out;
+            int count = end - r;
+            if (count > 0) {
+                gemm_f16_f32_tokmajor_fused2(
+                    dst1 + r, (const uint16_t *)W1->data + (size_t)r * n_in,
+                    dst2 + r, (const uint16_t *)W2->data + (size_t)r * n_in,
+                    src, count, n_in, n_tok, n_out, n_out, n_in);
+            }
+        }
+    } else
+#endif
+    {
+        gemm_f16_f32_tokmajor_fused2(dst1, (const uint16_t *)W1->data,
+                                     dst2, (const uint16_t *)W2->data,
+                                     src, n_out, n_in, n_tok,
+                                     n_out, n_out, n_in);
+    }
+
+    if (b1 || b2) {
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
+        for (int t = 0; t < n_tok; t++) {
+            float *d1 = dst1 + (size_t)t * n_out;
+            float *d2 = dst2 + (size_t)t * n_out;
+            for (int i = 0; i < n_out; i++) {
+                if (b1) d1[i] += b1[i];
+                if (b2) d2[i] += b2[i];
+            }
+        }
+    }
+    free(b1_alloc);
+    free(b2_alloc);
 }
 
 /* ---- LayerNorm ---- */
@@ -343,7 +458,7 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
     m->n_patches = n_patches;
     m->n_storage = n_storage;
     m->n_tokens = n_tokens;
-    m->ln_eps = 1e-6f;
+    m->ln_eps = 1e-5f;
     m->rope_freq_base = 100.0f;
     m->has_qk_norm = has_qk_norm;
     m->has_layerscale = has_layerscale;
@@ -579,6 +694,7 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
 
     if (n_threads < 1) n_threads = 1;
     double t_start = dinov3_time_ms();
+    int emulate_bf16 = dinov3_emulate_bf16_activations(m);
 
     /* ─── Step 2: Patch embedding ─── */
     /* Token layout: [CLS, stor1..stor_ns, patch1..patch_np] */
@@ -589,20 +705,25 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
         float *pb = qt_dequant(&m->patch_embed_b);
         /* patch_embed_w: [Co=dim, Ci=3, kH=ps, kW=ps] in PyTorch row-major order */
         int Co = dim, Ci = 3;
+        #if defined(_OPENMP)
+        #pragma omp parallel for collapse(2) schedule(static) num_threads(n_threads)
+        #endif
         for (int py = 0; py < gh; py++) {
             for (int px = 0; px < gw; px++) {
                 int tok = patch_start + py * gw + px;
-                float *out = hidden + tok * dim;
+                float *out = hidden + (size_t)tok * dim;
                 if (pb) memcpy(out, pb, (size_t)dim * sizeof(float));
                 for (int co = 0; co < Co; co++) {
+                    const float *wco = pw + (size_t)co * Ci * ps * ps;
                     float sum = 0.0f;
                     for (int ci = 0; ci < Ci; ci++) {
+                        const float *img_c = img_norm + (size_t)ci * target_h * target_w;
+                        const float *wci = wco + (size_t)ci * ps * ps;
                         for (int kh = 0; kh < ps; kh++) {
+                            const float *img_row = img_c + (size_t)(py * ps + kh) * target_w + px * ps;
+                            const float *wrow = wci + (size_t)kh * ps;
                             for (int kw = 0; kw < ps; kw++) {
-                                int ih = py * ps + kh;
-                                int iw = px * ps + kw;
-                                sum += pw[((co * Ci + ci) * ps + kh) * ps + kw]
-                                     * img_norm[ci * target_h * target_w + ih * target_w + iw];
+                                sum += wrow[kw] * img_row[kw];
                             }
                         }
                     }
@@ -641,6 +762,7 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
 
         /* DINOv3: NO learned positional embeddings — RoPE is the only position encoding */
     }
+    if (emulate_bf16) dinov3_bf16_roundtrip_inplace(hidden, (size_t)nt * dim);
 
     /* ─── Build DINOv3 RoPE sin/cos embedding for patch tokens ─── */
     /* DINOv3 RoPE: 0.5-centered coords normalized to [-1,1], periods = temp^(2i/(dim//2))
@@ -671,6 +793,9 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
             }
         }
         /* Compute coords: (0.5 + i) / N * 2 - 1 for each patch position */
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
         for (int p = 0; p < np; p++) {
             int py = p / gw;
             int px = p % gw;
@@ -700,25 +825,39 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
 
     /* ─── Step 4: Transformer blocks ─── */
     double t_backbone = dinov3_time_ms();
+    int timing = dinov3_timing_enabled();
+    double tm_ln1 = 0.0, tm_qkv = 0.0, tm_qknorm = 0.0, tm_rope = 0.0;
+    double tm_attn = 0.0, tm_proj = 0.0, tm_res1 = 0.0;
+    double tm_ln2 = 0.0, tm_ffn_gate = 0.0, tm_ffn_up = 0.0;
+    double tm_ffn_act = 0.0, tm_ffn_down = 0.0, tm_res2 = 0.0;
+    const char *block_dump_dir = getenv("DINOV3_DUMP_BLOCKS_DIR");
     float *ln_buf   = (float *)malloc((size_t)nt * dim * sizeof(float));
     float *qkv      = (float *)malloc((size_t)nt * 3 * dim * sizeof(float));
     float *attn_out = (float *)malloc((size_t)nt * dim * sizeof(float));
     int ffn_dim = m->ffn_hidden;
-    float *ffn_buf  = (float *)malloc((size_t)nt * ffn_dim * sizeof(float));
+    float *ffn_buf    = (float *)malloc((size_t)nt * ffn_dim * sizeof(float));
+    float *ffn_up_buf = (float *)malloc((size_t)nt * ffn_dim * sizeof(float));
+    float *proj_out   = (float *)malloc((size_t)nt * dim * sizeof(float));
+    float *ffn_out    = (float *)malloc((size_t)nt * dim * sizeof(float));
 
     for (int L = 0; L < m->n_blocks; L++) {
         dinov3_block *blk = &m->blocks[L];
+        double t0 = 0.0;
 
-        /* LayerNorm 1 */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layernorm_batch(ln_buf, hidden, &blk->ln1_w, &blk->ln1_b,
                                nt, dim, m->ln_eps);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ln_buf, (size_t)nt * dim);
+        if (timing) tm_ln1 += dinov3_time_ms() - t0;
 
-        /* QKV projection */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_batch_gemm(qkv, &blk->attn_qkv_w, &blk->attn_qkv_b,
                           ln_buf, nt, 3 * dim, dim, n_threads);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(qkv, (size_t)nt * 3 * dim);
+        if (timing) tm_qkv += dinov3_time_ms() - t0;
 
-        /* QK normalization (if present) */
         if (m->has_qk_norm && blk->attn_q_norm_w.data) {
+            if (timing) t0 = dinov3_time_ms();
             float *q_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             float *k_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             for (int t = 0; t < nt; t++) {
@@ -734,24 +873,24 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
                 memcpy(qkv + t * 3 * dim + dim, k_flat + t * dim, (size_t)dim * sizeof(float));
             }
             free(q_flat); free(k_flat);
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(qkv, (size_t)nt * 3 * dim);
+            if (timing) tm_qknorm += dinov3_time_ms() - t0;
         }
 
-        /* DINOv3 RoPE: apply only to patch tokens (skip prefix tokens)
-         * rotate_half convention: out = x * cos + rotate_half(x) * sin
-         * where rotate_half([x0..x_{D/2-1}, x_{D/2}..x_{D-1}]) =
-         *       [-x_{D/2}..-x_{D-1}, x_0..x_{D/2-1}] */
+        if (timing) t0 = dinov3_time_ms();
         {
             int half_hd = hd / 2;
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(static) num_threads(n_threads)
+            #endif
             for (int p = 0; p < np; p++) {
                 int t = patch_start + p;
                 const float *s = rope_sin + p * hd;
                 const float *c = rope_cos + p * hd;
-                /* Apply to Q and K for each head */
                 for (int qk = 0; qk < 2; qk++) {
                     for (int h = 0; h < m->n_heads; h++) {
-                        float *v = qkv + t * 3 * dim + qk * dim + h * hd;
-                        /* rotate_half: [-v[D/2..D-1], v[0..D/2-1]] */
-                        float tmp[128]; /* max head_dim */
+                        float *v = qkv + (size_t)t * 3 * dim + qk * dim + h * hd;
+                        float tmp[128];
                         for (int j = 0; j < half_hd; j++) {
                             tmp[j]           = -v[half_hd + j];
                             tmp[half_hd + j] =  v[j];
@@ -759,73 +898,134 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
                         for (int j = 0; j < hd; j++) {
                             v[j] = v[j] * c[j] + tmp[j] * s[j];
                         }
+                        if (emulate_bf16) {
+                            for (int j = 0; j < hd; j++) v[j] = dinov3_f32_to_bf16_roundtrip(v[j]);
+                        }
                     }
                 }
             }
         }
+        if (timing) tm_rope += dinov3_time_ms() - t0;
 
-        /* Multi-head attention */
+        if (timing) t0 = dinov3_time_ms();
         cpu_attention(attn_out, qkv, nt, dim, m->n_heads, m->head_dim, n_threads);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(attn_out, (size_t)nt * dim);
+        if (timing) tm_attn += dinov3_time_ms() - t0;
 
-        /* Attention output projection */
-        float *proj_out = (float *)malloc((size_t)nt * dim * sizeof(float));
+        if (timing) t0 = dinov3_time_ms();
         dinov3_batch_gemm(proj_out, &blk->attn_out_w, &blk->attn_out_b,
                           attn_out, nt, dim, dim, n_threads);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(proj_out, (size_t)nt * dim);
+        if (timing) tm_proj += dinov3_time_ms() - t0;
 
-        /* LayerScale 1 + residual */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layerscale(proj_out, &blk->ls1, nt, dim);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(proj_out, (size_t)nt * dim);
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
         for (int i = 0; i < nt * dim; i++) hidden[i] += proj_out[i];
-        free(proj_out);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(hidden, (size_t)nt * dim);
+        if (timing) tm_res1 += dinov3_time_ms() - t0;
 
-        /* LayerNorm 2 */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layernorm_batch(ln_buf, hidden, &blk->ln2_w, &blk->ln2_b,
                                nt, dim, m->ln_eps);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ln_buf, (size_t)nt * dim);
+        if (timing) tm_ln2 += dinov3_time_ms() - t0;
 
-        /* FFN: GELU MLP (fc1 → GELU → fc2), or SwiGLU (w3(silu(w1x+b1)*(w2x+b2))+b3) */
-        float *ffn_out = (float *)malloc((size_t)nt * dim * sizeof(float));
         if (m->has_swiglu && blk->ffn_w1_w.data && blk->ffn_w3_w.data) {
             int fd = blk->ffn_w1_w.n_rows;
-            float *gate = ffn_buf;  /* reuse */
-            float *up   = (float *)malloc((size_t)nt * fd * sizeof(float));
-            dinov3_batch_gemm(gate, &blk->ffn_w1_w, &blk->ffn_w1_b,
-                              ln_buf, nt, fd, dim, n_threads);
-            dinov3_batch_gemm(up,   &blk->ffn_w2_w, &blk->ffn_w2_b,
-                              ln_buf, nt, fd, dim, n_threads);
-            /* SiLU(gate) * up */
+            float *gate = ffn_buf;
+            float *up   = ffn_up_buf;
+            if (timing) t0 = dinov3_time_ms();
+            if (dinov3_swiglu_fused_enabled()) {
+                dinov3_batch_gemm_fused2(gate, &blk->ffn_w1_w, &blk->ffn_w1_b,
+                                         up,   &blk->ffn_w2_w, &blk->ffn_w2_b,
+                                         ln_buf, nt, fd, dim, n_threads);
+            } else {
+                dinov3_batch_gemm(gate, &blk->ffn_w1_w, &blk->ffn_w1_b,
+                                  ln_buf, nt, fd, dim, n_threads);
+                dinov3_batch_gemm(up, &blk->ffn_w2_w, &blk->ffn_w2_b,
+                                  ln_buf, nt, fd, dim, n_threads);
+            }
+            if (emulate_bf16) {
+                dinov3_bf16_roundtrip_inplace(gate, (size_t)nt * fd);
+                dinov3_bf16_roundtrip_inplace(up, (size_t)nt * fd);
+            }
+            if (timing) {
+                double fused_ms = dinov3_time_ms() - t0;
+                tm_ffn_gate += fused_ms;
+            }
+            if (timing) t0 = dinov3_time_ms();
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(static) num_threads(n_threads)
+            #endif
             for (int i = 0; i < nt * fd; i++) {
                 float g = gate[i];
                 gate[i] = (g / (1.0f + expf(-g))) * up[i];
             }
-            free(up);
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(gate, (size_t)nt * fd);
+            if (timing) tm_ffn_act += dinov3_time_ms() - t0;
+            if (timing) t0 = dinov3_time_ms();
             dinov3_batch_gemm(ffn_out, &blk->ffn_w3_w, &blk->ffn_w3_b,
                               gate, nt, dim, fd, n_threads);
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_out, (size_t)nt * dim);
+            if (timing) tm_ffn_down += dinov3_time_ms() - t0;
         } else if (blk->ffn_up_w.data) {
             int fd = blk->ffn_up_w.n_rows;
+            if (timing) t0 = dinov3_time_ms();
             dinov3_batch_gemm(ffn_buf, &blk->ffn_up_w, &blk->ffn_up_b,
                               ln_buf, nt, fd, dim, n_threads);
-            /* GELU activation */
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_buf, (size_t)nt * fd);
+            if (timing) tm_ffn_gate += dinov3_time_ms() - t0;
+            if (timing) t0 = dinov3_time_ms();
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(static) num_threads(n_threads)
+            #endif
             for (int i = 0; i < nt * fd; i++) {
                 float v = ffn_buf[i];
                 ffn_buf[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
             }
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_buf, (size_t)nt * fd);
+            if (timing) tm_ffn_act += dinov3_time_ms() - t0;
+            if (timing) t0 = dinov3_time_ms();
             dinov3_batch_gemm(ffn_out, &blk->ffn_down_w, &blk->ffn_down_b,
                               ffn_buf, nt, dim, fd, n_threads);
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_out, (size_t)nt * dim);
+            if (timing) tm_ffn_down += dinov3_time_ms() - t0;
         } else {
             memset(ffn_out, 0, (size_t)nt * dim * sizeof(float));
         }
 
-        /* LayerScale 2 + residual */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layerscale(ffn_out, &blk->ls2, nt, dim);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_out, (size_t)nt * dim);
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
         for (int i = 0; i < nt * dim; i++) hidden[i] += ffn_out[i];
-        free(ffn_out);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(hidden, (size_t)nt * dim);
+        if (timing) tm_res2 += dinov3_time_ms() - t0;
+
+        dinov3_dump_block_if_requested(block_dump_dir, L, hidden, nt, dim);
     }
 
     free(ln_buf); free(qkv); free(attn_out); free(ffn_buf);
+    free(ffn_up_buf); free(proj_out); free(ffn_out);
     free(rope_sin); free(rope_cos);
 
     double t_norm = dinov3_time_ms();
     fprintf(stderr, "dinov3: preprocess+embed %.1f ms, backbone %.1f ms (%d threads)\n",
             t_backbone - t_start, t_norm - t_backbone, n_threads);
+    if (timing) {
+        fprintf(stderr,
+                "dinov3[timing]: ln1 %.1f qkv %.1f qknorm %.1f rope %.1f "
+                "attn %.1f proj %.1f res1 %.1f ln2 %.1f ffn_gate %.1f "
+                "ffn_up %.1f ffn_act %.1f ffn_down %.1f res2 %.1f ms\n",
+                tm_ln1, tm_qkv, tm_qknorm, tm_rope, tm_attn, tm_proj, tm_res1,
+                tm_ln2, tm_ffn_gate, tm_ffn_up, tm_ffn_act, tm_ffn_down, tm_res2);
+    }
 
     /* ─── Step 5: Final LayerNorm ─── */
     /* Two modes:
@@ -851,6 +1051,7 @@ static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
             for (int i = 0; i < dim; i++) yi[i] = (xi[i] - mean) * inv;
         }
     }
+    if (emulate_bf16) dinov3_bf16_roundtrip_inplace(output, (size_t)nt * dim);
     free(hidden);
 
     double t_end = dinov3_time_ms();
