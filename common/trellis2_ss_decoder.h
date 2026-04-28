@@ -144,6 +144,9 @@ static void t2dec_groupnorm(float *dst, const float *src,
     (void)G;
     int spatial = D * H * W;
     float eps = 1e-5f;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
     for (int s = 0; s < spatial; s++) {
         float mean = 0.0f, m2 = 0.0f;
         for (int c = 0; c < C; c++) {
@@ -169,6 +172,7 @@ static void t2dec_conv3d(float *dst, const float *src, const float *weight,
                            const float *bias, int Ci, int Co,
                            int D, int H, int Wi) {
     int spatial = D * H * Wi;
+    int HW = H * Wi;
 
     /* Parallel over output channels: each `co` writes an independent slab.
      * Kernel layout [Co, Ci, kD, kH, kW]. */
@@ -183,9 +187,70 @@ static void t2dec_conv3d(float *dst, const float *src, const float *weight,
         for (int ci = 0; ci < Ci; ci++) {
             const float *kern = weight + ((size_t)co * Ci + ci) * 27;
             const float *src_ci = src + (size_t)ci * spatial;
+
+            /* Hoist 27 kernel taps into named locals so the inner loop
+             * has no kern[*] indirection — helps the compiler vectorize
+             * over `w_pos` in the interior fast path. */
+            float k000 = kern[0],  k001 = kern[1],  k002 = kern[2];
+            float k010 = kern[3],  k011 = kern[4],  k012 = kern[5];
+            float k020 = kern[6],  k021 = kern[7],  k022 = kern[8];
+            float k100 = kern[9],  k101 = kern[10], k102 = kern[11];
+            float k110 = kern[12], k111 = kern[13], k112 = kern[14];
+            float k120 = kern[15], k121 = kern[16], k122 = kern[17];
+            float k200 = kern[18], k201 = kern[19], k202 = kern[20];
+            float k210 = kern[21], k211 = kern[22], k212 = kern[23];
+            float k220 = kern[24], k221 = kern[25], k222 = kern[26];
+
+            /* Fast path: interior d in [1, D-1), h in [1, H-1), w in [1, Wi-1).
+             * No bounds checks → autovectorizable over the w_pos run. */
+            for (int d = 1; d + 1 < D; d++) {
+                for (int h = 1; h + 1 < H; h++) {
+                    float       *dst_row = dst_co  + d * HW + h * Wi;
+                    const float *src_dm  = src_ci  + (d-1) * HW + (h-1) * Wi;
+                    const float *src_d0  = src_ci  + (d  ) * HW + (h-1) * Wi;
+                    const float *src_dp  = src_ci  + (d+1) * HW + (h-1) * Wi;
+                    int wlo = 1, whi = Wi - 1;
+                    for (int w_pos = wlo; w_pos < whi; w_pos++) {
+                        const float *r0 = src_dm + w_pos - 1;       /* h-1 row */
+                        const float *r1 = src_dm + Wi + w_pos - 1;  /* h   row */
+                        const float *r2 = src_dm + 2*Wi + w_pos - 1;/* h+1 row */
+                        const float *s0 = src_d0 + w_pos - 1;
+                        const float *s1 = src_d0 + Wi + w_pos - 1;
+                        const float *s2 = src_d0 + 2*Wi + w_pos - 1;
+                        const float *t0 = src_dp + w_pos - 1;
+                        const float *t1 = src_dp + Wi + w_pos - 1;
+                        const float *t2 = src_dp + 2*Wi + w_pos - 1;
+                        float sum =
+                            k000*r0[0] + k001*r0[1] + k002*r0[2] +
+                            k010*r1[0] + k011*r1[1] + k012*r1[2] +
+                            k020*r2[0] + k021*r2[1] + k022*r2[2] +
+                            k100*s0[0] + k101*s0[1] + k102*s0[2] +
+                            k110*s1[0] + k111*s1[1] + k112*s1[2] +
+                            k120*s2[0] + k121*s2[1] + k122*s2[2] +
+                            k200*t0[0] + k201*t0[1] + k202*t0[2] +
+                            k210*t1[0] + k211*t1[1] + k212*t1[2] +
+                            k220*t2[0] + k221*t2[1] + k222*t2[2];
+                        dst_row[w_pos] += sum;
+                    }
+                }
+            }
+
+            /* Boundary: d ∈ {0, D-1}, h ∈ {0, H-1}, or w ∈ {0, Wi-1}.
+             * Use the original guarded loop only on these cells. */
             for (int d = 0; d < D; d++) {
+                int d_boundary = (d == 0 || d == D - 1);
                 for (int h = 0; h < H; h++) {
-                    for (int w_pos = 0; w_pos < Wi; w_pos++) {
+                    int h_boundary = (h == 0 || h == H - 1);
+                    int wlo, whi;
+                    if (d_boundary || h_boundary) {
+                        wlo = 0; whi = Wi;
+                    } else {
+                        /* interior d,h: only w=0 and w=Wi-1 left to do */
+                        wlo = 0; whi = Wi;
+                    }
+                    for (int w_pos = wlo; w_pos < whi; w_pos++) {
+                        if (!d_boundary && !h_boundary &&
+                            w_pos != 0 && w_pos != Wi - 1) continue;
                         float sum = 0.0f;
                         for (int kd = 0; kd < 3; kd++) {
                             int dd = d + kd - 1;
@@ -197,11 +262,11 @@ static void t2dec_conv3d(float *dst, const float *src, const float *weight,
                                     int ww = w_pos + kw - 1;
                                     if (ww < 0 || ww >= Wi) continue;
                                     sum += kern[kd * 9 + kh * 3 + kw]
-                                         * src_ci[dd * H * Wi + hh * Wi + ww];
+                                         * src_ci[dd * HW + hh * Wi + ww];
                                 }
                             }
                         }
-                        dst_co[d * H * Wi + h * Wi + w_pos] += sum;
+                        dst_co[d * HW + h * Wi + w_pos] += sum;
                     }
                 }
             }
@@ -218,6 +283,9 @@ static void t2dec_pixel_shuffle_3d(float *dst, const float *src,
     int D2 = 2 * D, H2 = 2 * H, W2 = 2 * W;
     int spatial_out = D2 * H2 * W2;
 
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
     for (int c = 0; c < C; c++) {
         for (int d = 0; d < D; d++) {
             for (int h = 0; h < H; h++) {
@@ -244,6 +312,9 @@ static void t2dec_pixel_shuffle_3d(float *dst, const float *src,
 /* ---- SiLU activation (in-place) ---- */
 
 static void t2dec_silu(float *x, int n) {
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
     for (int i = 0; i < n; i++)
         x[i] = x[i] / (1.0f + expf(-x[i]));
 }
@@ -290,6 +361,9 @@ static void t2dec_resblock(float *dst, const float *src,
         /* 1x1x1 conv: dst[co, s] = sum_ci skip_w[co, ci] * src[ci, s] + skip_b[co] */
         float *skip_w = t2dec_dequant(&blk->skip_w);
         float *skip_b = t2dec_dequant(&blk->skip_b);
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
         for (int co = 0; co < Co; co++) {
             float bv = skip_b ? skip_b[co] : 0.0f;
             for (int s = 0; s < spatial; s++) {
@@ -302,6 +376,9 @@ static void t2dec_resblock(float *dst, const float *src,
         free(skip_w); free(skip_b);
     } else {
         /* Identity skip: dst = h2 + src */
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
         for (int i = 0; i < Co * spatial; i++)
             dst[i] = h2[i] + src[i];
     }

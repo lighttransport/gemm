@@ -1,0 +1,17 @@
+Sample images for web/sam3d_body.html.
+All images licensed CC0 1.0 (public-domain dedication).
+
+  person_portrait.jpg — "Tsvetana Todorova, personal portrait"
+                        via Wikimedia Commons
+                        https://commons.wikimedia.org/wiki/File:Tsvetana_Todorova,_personal_portrait.jpg
+                        resized to 768px wide, JPEG q80
+
+To extend the gallery, drop additional CC0 images into this
+directory. The server's /v1/samples endpoint enumerates the
+directory at request time, so new files appear in the web UI on
+the next page load (no server restart needed).
+
+Recommended properties:
+  - single, full-body person, mostly upright
+  - moderate occlusion / clutter is fine — RT-DETR-S handles it
+  - 768–1280px on the long edge keeps inference under ~10s

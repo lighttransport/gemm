@@ -47,11 +47,27 @@ cpu/llm/test_transformer*
 cpu/vlm/test_vision
 cpu/da3/test_da3
 cpu/ppd/test_ppd
+cpu/sam3d/test_sam3d
+cpu/sam3d/verify_*
+!cpu/sam3d/verify_*.c
+!cpu/sam3d/verify_*.h
+cpu/sam3d_body/test_sam3d_body
+cpu/sam3d_body/verify_*
+!cpu/sam3d_body/verify_*.c
+cpu/sam3d_body/samples/*.obj
+cpu/sam3d_body/samples/*.obj.json
 
 # Build artifact binaries — CUDA runners
 cuda/llm/test_cuda_llm
 cuda/vlm/test_cuda_vlm
 cuda/fp8/fp8_gemm
+cuda/sam3d/test_*
+!cuda/sam3d/test_*.c
+cuda/sam3d/verify_*
+!cuda/sam3d/verify_*.c
+cuda/sam3d_body/test_cuda_sam3d_body
+cuda/sam3d_body/verify_*
+!cuda/sam3d_body/verify_*.c
 
 # Build artifact binaries — unit tests
 tests/test_bpe_tokenizer
@@ -87,6 +103,8 @@ rdna4/trellis2/verify_*
 cpu/sparse3d/ref_output/
 cpu/sparse3d/c_output/
 cpu/sparse3d/.venv/
+ref/sam3d/.venv/
+server/sam3d/__pycache__/
 
 # External / generated
 ref/*
@@ -94,3 +112,6 @@ ref/*
 !ref/trellis2/
 !ref/llm/
 result/
+
+# Local (uncommitted) runner scripts — per-box model paths / env
+server/run-*.local.sh
