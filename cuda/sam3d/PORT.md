@@ -30,8 +30,9 @@ driver as a CUDA hook inside the SLAT ODE body while CPU still owns
 sparse IO resblocks; 5b.17 reuses resident conditioning tokens inside
 that hook; 5b.18 keeps hook activation/timestep scratch buffers
 persistent across SLAT ODE steps; 5b.19 adds a real-weight CUDA gate
-for `input_blocks[0]`. Next: move the remaining sparse IO path out of
-the CPU fallback.
+for `input_blocks[0]`; 5b.20 adds the real-weight CUDA gate for
+downsampling `input_blocks[1]`. Next: move the sparse output resblocks
+out of the CPU fallback.
 
 ## Drift table (live)
 
@@ -39,6 +40,19 @@ See `doc/sam3d.md` § "Status — drift table".
 
 ## Recent entries (most recent first)
 
+- **5b.20 — real-weight SLAT input block 1 CUDA verifier (GREEN).**
+  Added `verify_slat_input_block1_realw`, which starts from traced
+  `c_h_after_input_block_0.npy` / `c_coords_after_input_block_0.npy`,
+  runs the factor-2 sparse downsample plus real checkpoint
+  `input_blocks[1]` skip projection and submanifold conv sequence, and
+  compares to `c_h_after_input_block_1.npy` /
+  `c_coords_after_input_block_1.npy`. Gate against regenerated current
+  trace `/tmp/sam3d_ref_5b20`: N0=1024, N1=1007, C_in=128,
+  C_out=1024, dim=1024, max_abs=7.390976e-06,
+  mean_abs=3.324221e-07, coord_bad=0, avg=65.4651 ms over 20 launches.
+  The older `/tmp/sam3d_ref` intermediate is stale for block1 features
+  (coords match; feature max_abs=6.041392), so use regenerated current
+  traces when validating this gate.
 - **5b.19 — real-weight SLAT input block 0 CUDA verifier (GREEN).**
   Added `verify_slat_input_block0_realw`, which starts from traced
   `c_h_after_input_layer.npy`, uses traced `c_t_emb.npy` and real
