@@ -114,8 +114,8 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
 
     char arch_flag[64];
     snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=%s", arch);
-    const char *opts[] = { arch_flag, "-ffast-math" };
-    hiprtcResult nres = hiprtcCompileProgram(prog, 2, opts);
+    const char *opts[] = { arch_flag, "-O3", "-ffast-math" };
+    hiprtcResult nres = hiprtcCompileProgram(prog, 3, opts);
 
     if (nres != HIPRTC_SUCCESS) {
         fprintf(stderr, "%s: HIPRTC compile error %d\n", prefix, (int)nres);

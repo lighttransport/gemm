@@ -2,7 +2,7 @@
  * hip_vision_encoder.h - HIP/ROCm vision encoder for Qwen3-VL mmproj
  *
  * Uses HIPRTC to compile HIP C kernels at runtime (no hipcc needed).
- * Supports F32 (verification) and F16 (performance) weight modes.
+ * Supports F32 (verification), F16, and BF16 weight modes.
  * Targets RDNA4 (gfx1200/gfx1201).
  *
  * Usage:
@@ -26,8 +26,12 @@ typedef struct hip_vision_runner hip_vision_runner;
 /* Initialize HIP vision encoder.
  * device_id: HIP device index (0 = first GPU)
  * verbose: 0=quiet, 1=info, 2=debug, 3=dump code object
- * use_f16: 0=F32 weights (exact match with CPU), 1=F16 weights (faster, ~1e-2 error) */
+ * use_f16: 0=F32 weights, 1=F16 weights, 2=BF16 weights. Activations and accumulators stay F32. */
 hip_vision_runner *hip_vision_init(int device_id, int verbose, int use_f16);
+
+/* Infer preferred weight precision from the mmproj GGUF tensor storage.
+ * Returns 0=F32, 1=F16, 2=BF16. */
+int hip_vision_infer_precision(const gguf_context *mmproj_gguf);
 
 /* Set maximum pixel budget for dynamic resolution. Must be called BEFORE load_weights.
  * max_pixels=0 means use model default (image_size^2). */
