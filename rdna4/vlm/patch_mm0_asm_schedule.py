@@ -701,6 +701,134 @@ def patch_barriersig_early(src: str) -> str:
     return src
 
 
+def patch_bb5setup_hoist(src: str) -> str:
+    """Hoist 9 bb.5 setup instructions (s_xor s6 toggle, s_add s[0:1] global
+    address bump, s_mul/s_add/v_add LDS write address compute) from the head
+    of bb.5 to the tail of bb.4 — placed right before s_cbranch_vccnz so they
+    overlap with WMMA pipeline drain.
+
+    On last iter (cbranch_vccnz falls through to bb.5/exit pre-summary):
+    actually the cbranch_vccnz BRANCHES BACK to .LBB0_1 on continuing iter
+    and falls through to bb.5 on last (vccz) — wait, summary says reverse:
+    bb.4 falls through to bb.5 on continuing iter, cbranch jumps elsewhere
+    on last. Either way: hoisted s_xor/s_add adjust state for the NEXT bb.5;
+    on last iter that state is unused (post-loop epilogue does not read s6).
+    """
+    setup_block = """\
+\ts_xor_b32 s6, s6, 1
+\ts_add_nc_u64 s[0:1], s[0:1], 64
+\ts_wait_alu 0xfffe
+\ts_mul_i32 s9, s6, 0x2400
+\ts_add_co_i32 s7, s7, 32
+\ts_wait_alu 0xfffe
+\tv_add_nc_u32_e32 v174, s9, v166
+\tv_add_nc_u32_e32 v175, s9, v169
+\ts_wait_alu 0xfffe
+"""
+    # Insert before s_cbranch_vccnz .LBB0_1 (works whether or not bse already
+    # inserted a s_barrier_signal between the last WMMA and the cbranch).
+    cb_marker = "\ts_cbranch_vccnz .LBB0_1\n"
+    idx = src.find(cb_marker)
+    if idx < 0:
+        raise RuntimeError("could not find s_cbranch_vccnz .LBB0_1")
+    # walk back to start of the s_wait_alu just before the cbranch, insert
+    # before it.
+    wait_marker = "\ts_wait_alu 0xfffe\n"
+    wait_idx = src.rfind(wait_marker, 0, idx)
+    if wait_idx < 0:
+        raise RuntimeError("could not find s_wait_alu before cbranch")
+    src = src[:wait_idx] + setup_block + src[wait_idx:]
+
+    bb5_old = """\
+; %bb.5:                                ;   in Loop: Header=BB0_2 Depth=1
+\ts_xor_b32 s6, s6, 1
+\ts_add_nc_u64 s[0:1], s[0:1], 64
+\ts_wait_alu 0xfffe
+\ts_mul_i32 s8, s6, 0x2400
+\ts_add_co_i32 s7, s7, 32
+\ts_wait_alu 0xfffe
+\tv_add_nc_u32_e32 v174, s8, v166
+\tv_add_nc_u32_e32 v175, s8, v169
+\ts_mov_b32 s8, 0
+\ts_wait_loadcnt 0x7
+"""
+    bb5_new = """\
+; %bb.5:                                ;   in Loop: Header=BB0_2 Depth=1
+\ts_mov_b32 s8, 0
+\ts_wait_loadcnt 0x7
+"""
+    if bb5_old not in src:
+        raise RuntimeError("could not find bb.5 setup block")
+    src = src.replace(bb5_old, bb5_new, 1)
+    return src
+
+
+def patch_dscnt_collapse(src: str) -> str:
+    """Replace per-WMMA s_wait_dscnt countdown in bb.4 with grouped waits.
+
+    Original:
+      s_wait_dscnt 0xe; wmma1
+      s_wait_dscnt 0xd; wmma2
+      s_wait_dscnt 0xc; wmma3
+      s_wait_dscnt 0xb; wmma4
+      s_wait_dscnt 0xa; wmma5..wmma8
+      ...
+    Collapsed (first-half):
+      s_wait_dscnt 0xb; wmma1..wmma4
+      s_wait_dscnt 0xa; wmma5..wmma8
+      ...
+
+    Theory: HW scoreboard handles WMMA-vs-pending-load operand dependence.
+    The 4 individual wait_dscnt before wmma1..4 are redundant — only the
+    LAST one (wait_dscnt 0xb, ensuring all 4 fragments loaded) is needed.
+    Saves 3 wait_dscnt × ~1 cycle each = ~3 cycles per iter."""
+
+    # First-half: collapse 4 individual waits before wmma 1..4 to one wait.
+    fh_old = """\
+\ts_wait_dscnt 0xe
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[174:177], v[178:181], v[121:128]
+\ts_wait_dscnt 0xd
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[174:177], v[182:185], v[113:120]
+\ts_wait_dscnt 0xc
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[174:177], v[186:189], v[105:112]
+\ts_wait_dscnt 0xb
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[174:177], v[190:193], v[97:104]
+"""
+    fh_new = """\
+\ts_wait_dscnt 0xb
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[174:177], v[178:181], v[121:128]
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[174:177], v[182:185], v[113:120]
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[174:177], v[186:189], v[105:112]
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[174:177], v[190:193], v[97:104]
+"""
+    if fh_old not in src:
+        raise RuntimeError("could not find first-half wait/wmma block")
+    src = src.replace(fh_old, fh_new, 1)
+
+    # Second-half: collapse 3 individual waits before wmma 17..19 to one wait.
+    sh_old = """\
+\ts_wait_dscnt 0x3
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[206:209], v[222:225], v[121:128]
+\ts_wait_dscnt 0x2
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[206:209], v[226:229], v[113:120]
+\ts_wait_dscnt 0x1
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[206:209], v[230:233], v[105:112]
+\ts_wait_dscnt 0x0
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[206:209], v[234:237], v[97:104]
+"""
+    sh_new = """\
+\ts_wait_dscnt 0x0
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[206:209], v[222:225], v[121:128]
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[206:209], v[226:229], v[113:120]
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[206:209], v[230:233], v[105:112]
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[206:209], v[234:237], v[97:104]
+"""
+    if sh_old not in src:
+        raise RuntimeError("could not find second-half wait/wmma block")
+    src = src.replace(sh_old, sh_new, 1)
+    return src
+
+
 def patch_storewait0(src: str) -> str:
     """Collapse per-store s_wait_loadcnt 0x7→0x0 countdown in bb.5 into a
     single s_wait_loadcnt 0x0 followed by 8 back-to-back ds_store_b128.
@@ -757,6 +885,10 @@ def main() -> None:
             "barriersig-early",
             "topnowait-barriersig-early",
             "topnowait-storewait0-barriersig-early",
+            "bb5setup-hoist",
+            "bb5setup-hoist-bse",
+            "dscnt-collapse",
+            "dscnt-collapse-bse",
         ],
         default="halfsplit",
     )
@@ -789,6 +921,14 @@ def main() -> None:
         out = patch_barriersig_early(patch_topnowait(src))
     elif args.variant == "topnowait-storewait0-barriersig-early":
         out = patch_barriersig_early(patch_storewait0(patch_topnowait(src)))
+    elif args.variant == "bb5setup-hoist":
+        out = patch_bb5setup_hoist(src)
+    elif args.variant == "bb5setup-hoist-bse":
+        out = patch_bb5setup_hoist(patch_barriersig_early(src))
+    elif args.variant == "dscnt-collapse":
+        out = patch_dscnt_collapse(src)
+    elif args.variant == "dscnt-collapse-bse":
+        out = patch_barriersig_early(patch_dscnt_collapse(src))
     else:
         raise AssertionError(args.variant)
     Path(args.output).write_text(out, encoding="utf-8")
