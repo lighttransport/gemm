@@ -19,7 +19,7 @@ VERIFIES = verify_dinov2 verify_cond_fuser verify_ss_dit verify_ss_decoder \
            verify_slat_dit verify_slat_gs verify_ssdit_block_realw \
            verify_ssdit_full_realw verify_ss_dit_ode \
            verify_slat_transformer_block_realw verify_slat_input_block0_realw \
-           verify_slat_input_block1_realw
+           verify_slat_input_block1_realw verify_slat_out_block0_realw
 
 KERNEL_TESTS = test_layernorm_token test_dinov2_gpu_upload test_dinov2_patch_embed \
                test_dinov2_prepend_pos test_gemm_f32_bias test_qkv_split_sdpa \
@@ -240,6 +240,12 @@ verify_slat_input_block1_realw: verify_slat_input_block1_realw.c cuda_sam3d_kern
                                 ../../common/sam3d_slat_dit.h ../../common/npy_io.h \
                                 $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC)
 	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_input_block1_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+
+verify_slat_out_block0_realw: verify_slat_out_block0_realw.c cuda_sam3d_kernels.h \
+                              ../cuew.h ../cuda_runner_common.h ../cuda_hip_compat.h \
+                              ../../common/sam3d_slat_dit.h ../../common/npy_io.h \
+                              $(RUNNER_SRC) $(CPU_DEPS) $(CUEW_SRC)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_slat_out_block0_realw.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
 
 verify_ssdit_block_realw: verify_ssdit_block_realw.c cuda_sam3d_ssdit_gpu.h \
                           cuda_sam3d_ssdit_forward.h cuda_sam3d_kernels.h \
