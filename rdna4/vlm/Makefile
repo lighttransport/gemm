@@ -40,10 +40,19 @@ MM0_ASM_STOREEARLY20_CO = $(GEN_DIR)/mm0_bf16_asm_storeearly20.co
 MM0_ASM_BFIRST2_S = $(GEN_DIR)/mm0_bf16_asm_bfirst2.s
 MM0_ASM_BFIRST2_O = $(GEN_DIR)/mm0_bf16_asm_bfirst2.o
 MM0_ASM_BFIRST2_CO = $(GEN_DIR)/mm0_bf16_asm_bfirst2.co
+MM0_ASM_PGR1MID_S = $(GEN_DIR)/mm0_bf16_asm_pgr1mid.s
+MM0_ASM_PGR1MID_O = $(GEN_DIR)/mm0_bf16_asm_pgr1mid.o
+MM0_ASM_PGR1MID_CO = $(GEN_DIR)/mm0_bf16_asm_pgr1mid.co
+MM0_ASM_TOPNOWAIT_S = $(GEN_DIR)/mm0_bf16_asm_topnowait.s
+MM0_ASM_TOPNOWAIT_O = $(GEN_DIR)/mm0_bf16_asm_topnowait.o
+MM0_ASM_TOPNOWAIT_CO = $(GEN_DIR)/mm0_bf16_asm_topnowait.co
+MM0_ASM_GLINLINE_S = $(GEN_DIR)/mm0_bf16_asm_glinline.s
+MM0_ASM_GLINLINE_O = $(GEN_DIR)/mm0_bf16_asm_glinline.o
+MM0_ASM_GLINLINE_CO = $(GEN_DIR)/mm0_bf16_asm_glinline.co
 MM0_DIRECTA_HIP = $(GEN_DIR)/mm0_bf16_directa.hip
 MM0_DIRECTA_CO = $(GEN_DIR)/mm0_bf16_directa.co
 
-.PHONY: all clean run help gen-mm0-asm bench-mm0-asm bench-mm0-asm-gload bench-mm0-asm-s bench-mm0-asm-halfsplit bench-mm0-asm-storeearly20 bench-mm0-asm-bfirst2 bench-mm0-directa
+.PHONY: all clean run help gen-mm0-asm bench-mm0-asm bench-mm0-asm-gload bench-mm0-asm-s bench-mm0-asm-halfsplit bench-mm0-asm-storeearly20 bench-mm0-asm-bfirst2 bench-mm0-asm-pgr1mid bench-mm0-directa
 
 all: $(VISION) $(VLM) $(BENCH_GEMM)
 
@@ -113,6 +122,39 @@ $(MM0_ASM_BFIRST2_O): $(MM0_ASM_BFIRST2_S)
 $(MM0_ASM_BFIRST2_CO): $(MM0_ASM_BFIRST2_O)
 	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
 
+$(MM0_ASM_PGR1MID_S): $(MM0_ASM_S) patch_mm0_asm_schedule.py
+	python3 patch_mm0_asm_schedule.py --variant pgr1mid $< $@
+
+$(MM0_ASM_PGR1MID_O): $(MM0_ASM_PGR1MID_S)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c -o $@ $<
+
+$(MM0_ASM_PGR1MID_CO): $(MM0_ASM_PGR1MID_O)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
+
+$(MM0_ASM_TOPNOWAIT_S): $(MM0_ASM_S) patch_mm0_asm_schedule.py
+	python3 patch_mm0_asm_schedule.py --variant topnowait $< $@
+
+$(MM0_ASM_TOPNOWAIT_O): $(MM0_ASM_TOPNOWAIT_S)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c -o $@ $<
+
+$(MM0_ASM_TOPNOWAIT_CO): $(MM0_ASM_TOPNOWAIT_O)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
+
+# NOTE: glinline variant is broken — see patch_mm0_asm_schedule.patch_glinline:
+# moving global_loads out of bb.3 (where they're scc-guarded) into .LBB0_4
+# causes the last iteration to load with garbage v137/v138 base → kernel hang.
+# At the .s level the bb.3 loads already run in parallel with all 32 WMMAs in
+# .LBB0_4, so further interleaving cannot extend overlap under PGR1. Need PGR2
+# (loads issued 2 K-stages ahead) for additional gain. Targets kept commented.
+#$(MM0_ASM_GLINLINE_S): $(MM0_ASM_S) patch_mm0_asm_schedule.py
+#	python3 patch_mm0_asm_schedule.py --variant glinline $< $@
+#
+#$(MM0_ASM_GLINLINE_O): $(MM0_ASM_GLINLINE_S)
+#	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c -o $@ $<
+#
+#$(MM0_ASM_GLINLINE_CO): $(MM0_ASM_GLINLINE_O)
+#	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
+
 $(MM0_DIRECTA_HIP): gen_mm0_bf16_directa.py
 	python3 gen_mm0_bf16_directa.py --out-dir $(GEN_DIR)
 
@@ -136,6 +178,9 @@ bench-mm0-asm-storeearly20: $(BENCH_GEMM) $(MM0_ASM_STOREEARLY20_CO)
 
 bench-mm0-asm-bfirst2: $(BENCH_GEMM) $(MM0_ASM_BFIRST2_CO)
 	VLM_GEMM_ASM_CO=$(MM0_ASM_BFIRST2_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
+
+bench-mm0-asm-pgr1mid: $(BENCH_GEMM) $(MM0_ASM_PGR1MID_CO)
+	VLM_GEMM_ASM_CO=$(MM0_ASM_PGR1MID_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
 
 bench-mm0-directa: $(BENCH_GEMM) $(MM0_DIRECTA_CO)
 	VLM_GEMM_ASM_CO=$(MM0_DIRECTA_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check

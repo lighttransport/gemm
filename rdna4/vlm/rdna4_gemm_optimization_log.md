@@ -47,6 +47,49 @@ rebuild the old unpadded baseline.
 | asm storeearly20 | moved next-buffer LDS stores after the first 20 WMMAs and left the barrier after all WMMAs | 0.3303 | 131.643 | 67.5% | correct, but added mid-loop control/dependency cost and did not hide handoff |
 | asm bfirst2 | reordered second K16 LDS loads so B4-B7 arrive before A5-A7 | 0.3300 | 131.792 | 67.6% | correct, but no gain over the editable `.s` baseline in the current run |
 | direct-A/LDS-B diagnostic | generated kernel keeps A fragments in VGPRs from global loads and stages only B through LDS | 0.6724 | 64.677 | 33.2% | correct, but naïve wave-fragment global loads are too inefficient; hipBLASLt's direct operand path also depends on its packed/global-read mapping |
+| asm pgr1mid | hipBLASLt-style WMMA/store interleave at K-pair boundary (8 ds_store_b128 woven between WMMAs #21-#28, barrier mid-stream, 4 final WMMAs after barrier) | 0.3290 | 132.170 | 67.8% | correct (`max_abs=0`, `cosine=1.0`); regresses ~6% versus the 0.3095 ms baseline — the per-store `s_wait_loadcnt` countdown in PGR1 actually serializes the WMMA stream because global loads aren't yet complete when stores begin; the interleave needs PGR2 (loads issued 2 stages ahead) before it can hide latency |
+| asm topnowait | dropped redundant `s_wait_loadcnt 0x4`/`s_wait_loadcnt 0x0` in bb.3 before `v_add_co_u32` writes to v137/v145 | 0.3102 | 140.171 | 71.9% | correct; matches baseline (0.3095 ms / 140.501 TFLOP/s) within run-to-run variance — the bb.5 store countdown already drains all loads before next iter's bb.3 reuses v137/v145, so the waits were no-ops on hot path |
+| asm glinline (broken) | move 8 `global_load_b128` out of scc-guarded bb.3 to be 1:1 interleaved with first 8 first-half WMMAs in `.LBB0_4` | hang | n/a | n/a | last iteration skips bb.3 (`s_cbranch_scc1 .LBB0_4` when `s7 > 0x11df`), so v137/v138 base address is stale on the last pass — moved loads then fault. Confirms that under PGR1 the bb.3 loads already overlap all 32 WMMAs in `.LBB0_4`; further interleaving cannot extend overlap without true PGR2 prefetch (loads for K+2 issued during K's WMMAs) |
+
+## Profiler Snapshot (rocprofv3, 2026-04-28)
+
+Counter set: `SQ_WAVES SQ_BUSY_CYCLES SQC_LDS_BANK_CONFLICT`, baseline
+`mm0_bf16_asm.co`, `iters=50`. Profiling overhead drops bench rate to
+~97 TFLOP/s (vs 140.501 unprofiled at 0.3095 ms), but the cycle ratios
+are still meaningful.
+
+| metric | value | target (hipBLASLt 73823) | gap |
+| --- | ---: | ---: | ---: |
+| `SQ_WAVES` per dispatch | 1152 (288 CTAs × 4 waves) | 1152 | ✓ |
+| `SQ_BUSY_CYCLES` median, steady | ~28.3 M | ~25.3 M | ~12% |
+| busy cycles / wave (steady, profiled) | ~24,540 | ~21,979 | ~12% |
+| `SQC_LDS_BANK_CONFLICT` | **0** across all dispatches | 0 | ✓ |
+
+Theoretical minimum is ~18,432 cycles/wave (4608 WMMAs/wave at 1 issue per
+4 cycles/SIMD), so the baseline holds ~25% bubble vs theoretical and
+hipBLASLt holds ~16%. The achievable next-step is to close ~9% by closing
+some of the wave-cycle gap to hipBLASLt.
+
+LDS bank conflicts are confirmed zero with `LDS_STRIDE=144` — the remaining
+~12% wave-cycle bubble is **not** LDS contention. Conventional next levers:
+
+1. **PGR2 prefetch.** Issue `global_load_b128` for K+2 while K's WMMAs run
+   so the K+1 LDS stores at iteration K never wait on memory. Requires a
+   third LDS slot or in-register holding of K+2 fragments; needs direct `.s`
+   emission since LLVM cannot be steered into this layout via HIP source
+   (see `pipegl` regression and `glinline` hang).
+2. **buffer_load with bounded descriptor.** Replace `global_load_b128` with
+   `buffer_load_b128 + V#` so OOB loads silently return 0; this removes the
+   need for the bb.3 scc guard and unlocks unconditional placement of loads
+   inside the WMMA stream (the prerequisite that defeated `glinline`).
+3. **Wave-tile reshape.** Move from 4×4 fragment grid (4 A × 4 B) per wave
+   to 2×8 or 8×2; reduces A-side or B-side LDS reuse, may collapse some
+   `s_wait_dscnt` chains. VGPR budget at 248/256 leaves headroom.
+
+Other counters attempted (`SQ_WAIT_ANY`, `SQ_INSTS_VALU`, `SQ_INST_CYCLES_VMEM`,
+`SQ_WAVE_CYCLES`) all return `0` on gfx1201 — appear unimplemented or need
+multi-pass collection. `SQ_BUSY_CYCLES` and `SQC_LDS_BANK_CONFLICT` are the
+two reliable steering counters here.
 
 Current-session control measurements:
 
