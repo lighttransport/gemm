@@ -51,6 +51,27 @@ rebuild the old unpadded baseline.
 | asm topnowait | dropped redundant `s_wait_loadcnt 0x4`/`s_wait_loadcnt 0x0` in bb.3 before `v_add_co_u32` writes to v137/v145 | 0.3102 | 140.171 | 71.9% | correct; matches baseline (0.3095 ms / 140.501 TFLOP/s) within run-to-run variance — the bb.5 store countdown already drains all loads before next iter's bb.3 reuses v137/v145, so the waits were no-ops on hot path |
 | asm glinline (broken) | move 8 `global_load_b128` out of scc-guarded bb.3 to be 1:1 interleaved with first 8 first-half WMMAs in `.LBB0_4` | hang | n/a | n/a | last iteration skips bb.3 (`s_cbranch_scc1 .LBB0_4` when `s7 > 0x11df`), so v137/v138 base address is stale on the last pass — moved loads then fault. Confirms that under PGR1 the bb.3 loads already overlap all 32 WMMAs in `.LBB0_4`; further interleaving cannot extend overlap without true PGR2 prefetch (loads for K+2 issued during K's WMMAs) |
 | asm dsmove | hoist 16 `ds_load_b128` from top of `.LBB0_4` to end of bb.5 (after barrier) and prologue, replacing the per-WMMA `s_wait_dscnt 0xe→0x0` countdown with a single `s_wait_dscnt 0x0` | 0.3411 | 127.510 | 65.4% | correct (`max_abs=0`, `cosine=1.0`); regresses ~3.7% from baseline 132.5 (same throttled-state run). Hypothesis was wrong: the `s_wait_dscnt` countdown wasn't a stall but a *pipelined* issue — WMMAs fire as ds_loads complete, with load-issue cycles overlapping WMMA-issue cycles. Moving the load issue out of the WMMA stream removed that overlap and added 16 idle cycles per iter |
+| asm storewait0 | collapse bb.5's per-store `s_wait_loadcnt 0x7→0x0` countdown to a single `s_wait_loadcnt 0x0` followed by 8 back-to-back `ds_store_b128` (stride-144 register layout) | 0.3270 | 133.0 | 68.2% | correct; matches baseline 133.2 within run-to-run noise (same throttled state). Confirms the per-store waits weren't blocking — bb.4's 32 WMMAs gave global_loads enough time to all complete by bb.5 entry, so the `s_wait_loadcnt` countdown was already at 0 |
+
+## Conclusion: PGR1 schedule is well-pipelined
+
+Three independent attempts (`pgr1mid`, `dsmove`, `storewait0`) confirm
+the PGR1 schedule overlaps memory ops with WMMAs maximally given the
+current basic-block layout:
+
+- **dsmove** showed `s_wait_dscnt` countdown was *pipelined issue*, not
+  a stall — moving ds_loads out of the WMMA stream lost ~16 cycles/iter
+  of load/WMMA issue overlap.
+- **storewait0** showed `s_wait_loadcnt` countdown was no-op — by bb.5
+  entry global_loads had all completed during the 32 WMMAs of bb.4.
+- **pgr1mid** showed even careful interleaving of ds_stores with WMMAs
+  costs 6% by adding cross-stream dependencies (store→barrier ordering).
+
+The remaining ~12% busy-cycle gap to hipBLASLt requires structural
+changes: PGR2 prefetch (extra LDS or in-register K+1 holding), a
+different macro-tile shape, or moving the barrier into the WMMA stream
+(only safe if global_loads use V#-bounded `buffer_load_b128` for OOB
+silent-zero on the last iter). All three are direct-`.s` rewrites.
 
 ## Profiler Snapshot (rocprofv3, 2026-04-28)
 
