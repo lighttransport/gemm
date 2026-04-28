@@ -124,7 +124,7 @@ fallback in the runner.
 | ss_dit (single)| GPU  | fp32      | 1.05e-05             | **Phase 2c.13 GREEN** — `cs3d_ssdit_outer_forward` via runner |
 | ss_dit (ODE)   | GPU  | fp32      | 2.19e-05 @ steps=2   | **Phase 2c.16 GREEN** — upstream sampler semantics: rescale_t=3, reversed=0, d=0, add_flag CFG |
 | ss_decoder     | GPU  | fp32      | 2.77e-04             | **Phase 4b GREEN** — 3D conv + channel-LN + SiLU + pixel-shuffle GPU forward; ~558 ms verifier path |
-| slat_dit       | mix  | fp32      | 4.41e-05             | **Phase 5b.21 GREEN** — hybrid SLAT ODE body plus real-weight CUDA gates for both SLAT input resblocks and output upsample block; final output resblock still CPU-backed |
+| slat_dit       | mix  | fp32      | 4.41e-05             | **Phase 5b.22 GREEN** — hybrid SLAT ODE body plus real-weight CUDA gates for all SLAT IO resblocks; runner sparse IO wiring still pending |
 | slat_gs        | CPU  | fp32      | 7.77e-05             | **Phase 6a GREEN** — CPU fallback. Phase 6b kernelization pending |
 | End-to-end PLY | mix  | fp32      | visual (GS viewer)   | **Phase 7a GREEN** — full sampled path writes 38016 gaussians in 126.92–128.21 s after 5b.17/5b.18; `--slat-ref` smoke writes 8192 gaussians in 2.77 s |
 
@@ -243,7 +243,7 @@ inside the CFG interval `[0,500]`, then velocity mixing
 
 ### Next phase — Phase 5b
 
-Continue SLAT Flow DiT kernelization beyond the 5b.21 hybrid
+Continue SLAT Flow DiT kernelization beyond the 5b.22 hybrid
 CPU-sparse-IO / GPU-transformer ODE body with resident cond and hook
 scratch reuse.
 The current end-to-end path is correct enough for pipeline/perf smoke
@@ -399,10 +399,22 @@ traced `c_h_after_block_23.npy`, concatenates the reverse skip
 `c_h_after_input_block_1.npy`, upsamples into
 `c_coords_after_input_block_0.npy`, runs real `out_blocks[0]` skip
 projection and two submanifold convs, then compares to
-`c_h_after_out_block_0.npy`. Gate against local `/tmp/sam3d_ref`:
+`c_h_after_out_block_0.npy`. Gate against `/tmp/sam3d_ref_5b20`:
 Nsrc=1007, Ndst=1024, C_in=2048, C_out=128, dim=1024,
-max_abs=6.675720e-05, mean_abs=4.467770e-06, avg=5.7740 ms over one
-launch.
+max_abs=7.247925e-05, mean_abs=4.278031e-06, avg=5.8301 ms over
+20 launches.
+Phase 5b.22 adds `verify_slat_out_block1_realw`, the final real-weight
+CUDA gate for the SLAT IO SparseResBlock3d set. It starts from traced
+`c_h_after_out_block_0.npy`, concatenates the shallow skip
+`c_h_after_input_block_0.npy`, runs real `out_blocks[1]` skip
+projection and two submanifold convs on
+`c_coords_after_input_block_0.npy`, then compares to
+`c_h_after_out_block_1.npy`. Gate against `/tmp/sam3d_ref_5b20`:
+N=1024, C_in=256, C_out=128, dim=1024, max_abs=2.670288e-05,
+mean_abs=1.852996e-06, avg=0.8912 ms over 20 launches. All four SLAT
+IO resblocks now have real-weight CUDA verifier coverage; the next
+step is wiring those verified launch sequences into the SLAT runner
+path.
 
 ### Phase 6b — SLAT GS decoder kernelization
 
