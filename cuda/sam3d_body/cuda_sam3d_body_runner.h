@@ -37,8 +37,8 @@ typedef struct {
                               * is the input height (W is fixed at 384) */
     int device_ordinal;
     int verbose;
-    /* precision: "fp16" (tensor cores on sm_80+), "bf16", "fp32".
-     * NULL or "" → "fp16". bf16 matches upstream's inference path. */
+    /* precision: "bf16" (upstream/PyTorch reference), "fp16" (faster).
+     * NULL or "" -> "bf16". */
     const char *precision;
     /* Backbone variant. Defaults to DINOV3 (=0) when zero-initialized. */
     cuda_sam3d_body_backbone_t backbone;

@@ -5,7 +5,7 @@
  *   test_cuda_sam3d_body --safetensors-dir <DIR> --image <image.jpg>
  *       --mhr-assets <DIR>
  *       [--bbox x0 y0 x1 y1] [--focal F]
- *       [-o body.obj] [--precision fp16|bf16|fp32] [--device N] [-v]
+ *       [-o body.obj] [--precision bf16|fp16] [--device N] [-v]
  *
  *   test_cuda_sam3d_body <safetensors-dir> <image.jpg> ...
  */
@@ -45,7 +45,7 @@ static void print_usage(const char *prog)
             "[--bbox x0 y0 x1 y1 | --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]] "
             "[--focal F] [-o body.obj] "
             "[--backbone dinov3|vith] "
-            "[--precision fp16|bf16|fp32] [--device N] [-v]\n"
+            "[--precision bf16|fp16] [--device N] [-v]\n"
             "  %s SFT_DIR IMG.jpg ...   (legacy positional)\n",
             prog, prog);
 }
@@ -61,7 +61,7 @@ int main(int argc, char **argv)
     const char *image_path = NULL;
     const char *mhr_assets = NULL;
     const char *out_path   = "body.obj";
-    const char *precision  = "fp16";
+    const char *precision  = "bf16";
     float bbox[4] = {0}; int has_bbox = 0;
     float focal_hint = 0;
     int device = 0, verbose = 0;
