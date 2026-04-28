@@ -650,34 +650,38 @@ def patch_dsmove(src: str) -> str:
 
 
 def patch_storewait0(src: str) -> str:
+    """Collapse per-store s_wait_loadcnt 0x7→0x0 countdown in bb.5 into a
+    single s_wait_loadcnt 0x0 followed by 8 back-to-back ds_store_b128.
+    Total stall is bounded by the longest load (same as countdown), but
+    we save 7 wait-instruction overheads per iteration."""
     old = """\
 \ts_wait_loadcnt 0x7
-\tds_store_b128 v174, v[141:144]
+\tds_store_b128 v174, v[129:132]
 \ts_wait_loadcnt 0x6
-\tds_store_b128 v174, v[137:140] offset:2048
+\tds_store_b128 v174, v[133:136] offset:2304
 \ts_wait_loadcnt 0x5
-\tds_store_b128 v174, v[133:136] offset:4096
+\tds_store_b128 v174, v[141:144] offset:4608
 \ts_wait_loadcnt 0x4
-\tds_store_b128 v174, v[129:132] offset:6144
+\tds_store_b128 v174, v[137:140] offset:6912
 \ts_wait_loadcnt 0x3
 \tds_store_b128 v175, v[157:160]
 \ts_wait_loadcnt 0x2
-\tds_store_b128 v175, v[153:156] offset:2048
+\tds_store_b128 v175, v[153:156] offset:2304
 \ts_wait_loadcnt 0x1
-\tds_store_b128 v175, v[149:152] offset:4096
+\tds_store_b128 v175, v[149:152] offset:4608
 \ts_wait_loadcnt 0x0
-\tds_store_b128 v175, v[145:148] offset:6144
+\tds_store_b128 v175, v[145:148] offset:6912
 """
     new = """\
 \ts_wait_loadcnt 0x0
-\tds_store_b128 v174, v[141:144]
-\tds_store_b128 v174, v[137:140] offset:2048
-\tds_store_b128 v174, v[133:136] offset:4096
-\tds_store_b128 v174, v[129:132] offset:6144
+\tds_store_b128 v174, v[129:132]
+\tds_store_b128 v174, v[133:136] offset:2304
+\tds_store_b128 v174, v[141:144] offset:4608
+\tds_store_b128 v174, v[137:140] offset:6912
 \tds_store_b128 v175, v[157:160]
-\tds_store_b128 v175, v[153:156] offset:2048
-\tds_store_b128 v175, v[149:152] offset:4096
-\tds_store_b128 v175, v[145:148] offset:6144
+\tds_store_b128 v175, v[153:156] offset:2304
+\tds_store_b128 v175, v[149:152] offset:4608
+\tds_store_b128 v175, v[145:148] offset:6912
 """
     if old not in src:
         raise RuntimeError("could not find end-of-loop store wait block")
