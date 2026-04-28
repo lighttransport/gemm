@@ -52,10 +52,13 @@ MM0_ASM_GLINLINE_CO = $(GEN_DIR)/mm0_bf16_asm_glinline.co
 MM0_ASM_DSMOVE_S = $(GEN_DIR)/mm0_bf16_asm_dsmove.s
 MM0_ASM_DSMOVE_O = $(GEN_DIR)/mm0_bf16_asm_dsmove.o
 MM0_ASM_DSMOVE_CO = $(GEN_DIR)/mm0_bf16_asm_dsmove.co
+MM0_ASM_STOREWAIT0_S = $(GEN_DIR)/mm0_bf16_asm_storewait0.s
+MM0_ASM_STOREWAIT0_O = $(GEN_DIR)/mm0_bf16_asm_storewait0.o
+MM0_ASM_STOREWAIT0_CO = $(GEN_DIR)/mm0_bf16_asm_storewait0.co
 MM0_DIRECTA_HIP = $(GEN_DIR)/mm0_bf16_directa.hip
 MM0_DIRECTA_CO = $(GEN_DIR)/mm0_bf16_directa.co
 
-.PHONY: all clean run help gen-mm0-asm bench-mm0-asm bench-mm0-asm-gload bench-mm0-asm-s bench-mm0-asm-halfsplit bench-mm0-asm-storeearly20 bench-mm0-asm-bfirst2 bench-mm0-asm-pgr1mid bench-mm0-asm-dsmove bench-mm0-directa
+.PHONY: all clean run help gen-mm0-asm bench-mm0-asm bench-mm0-asm-gload bench-mm0-asm-s bench-mm0-asm-halfsplit bench-mm0-asm-storeearly20 bench-mm0-asm-bfirst2 bench-mm0-asm-pgr1mid bench-mm0-asm-dsmove bench-mm0-asm-storewait0 bench-mm0-directa
 
 all: $(VISION) $(VLM) $(BENCH_GEMM)
 
@@ -167,6 +170,15 @@ $(MM0_ASM_DSMOVE_O): $(MM0_ASM_DSMOVE_S)
 $(MM0_ASM_DSMOVE_CO): $(MM0_ASM_DSMOVE_O)
 	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
 
+$(MM0_ASM_STOREWAIT0_S): $(MM0_ASM_S) patch_mm0_asm_schedule.py
+	python3 patch_mm0_asm_schedule.py --variant storewait0 $< $@
+
+$(MM0_ASM_STOREWAIT0_O): $(MM0_ASM_STOREWAIT0_S)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c -o $@ $<
+
+$(MM0_ASM_STOREWAIT0_CO): $(MM0_ASM_STOREWAIT0_O)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
+
 $(MM0_DIRECTA_HIP): gen_mm0_bf16_directa.py
 	python3 gen_mm0_bf16_directa.py --out-dir $(GEN_DIR)
 
@@ -196,6 +208,9 @@ bench-mm0-asm-pgr1mid: $(BENCH_GEMM) $(MM0_ASM_PGR1MID_CO)
 
 bench-mm0-asm-dsmove: $(BENCH_GEMM) $(MM0_ASM_DSMOVE_CO)
 	VLM_GEMM_ASM_CO=$(MM0_ASM_DSMOVE_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
+
+bench-mm0-asm-storewait0: $(BENCH_GEMM) $(MM0_ASM_STOREWAIT0_CO)
+	VLM_GEMM_ASM_CO=$(MM0_ASM_STOREWAIT0_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
 
 bench-mm0-directa: $(BENCH_GEMM) $(MM0_DIRECTA_CO)
 	VLM_GEMM_ASM_CO=$(MM0_DIRECTA_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
