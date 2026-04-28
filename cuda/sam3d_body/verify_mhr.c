@@ -76,7 +76,7 @@ int main(int argc, char **argv)
         .image_size      = 512,
         .device_ordinal  = device,
         .verbose         = verbose,
-        .precision       = "fp32",
+        .precision       = "bf16",
     };
     cuda_sam3d_body_ctx *ctx = cuda_sam3d_body_create(&cfg);
     if (!ctx) {

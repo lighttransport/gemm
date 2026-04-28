@@ -47,7 +47,7 @@ int main(int argc, char **argv)
     float threshold = 2e-3f;
     float mean_threshold = 3e-4f;
     int one_layer = -1, device = 0, verbose = 0;
-    const char *precision = "fp16";
+    const char *precision = "bf16";
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
@@ -63,7 +63,7 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] [--layer N] "
-                        "[--device N] [--precision fp16|bf16|fp32] [-v]\n",
+                        "[--device N] [--precision bf16|fp16] [-v]\n",
                 argv[0]);
         return 2;
     }

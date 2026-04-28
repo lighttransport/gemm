@@ -72,6 +72,21 @@ static const char cuda_sam3d_body_kernels_src[] =
     "    else                  out[idx] = storage[(row - 1) * dim + col];\n"
     "}\n"
 
+    /* bf16_round_inplace_f32
+     *
+     * Round a float buffer through bf16 precision, keeping f32 storage.
+     * This is used for the default bf16 reference path.
+     */
+    "__global__ void bf16_round_inplace_f32(float *x, int n) {\n"
+    "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    if (i >= n) return;\n"
+    "    unsigned int u = __float_as_uint(x[i]);\n"
+    "    unsigned int lsb = (u >> 16) & 1u;\n"
+    "    u += 0x7fffu + lsb;\n"
+    "    u &= 0xffff0000u;\n"
+    "    x[i] = __uint_as_float(u);\n"
+    "}\n"
+
     /* rope_apply_qk_rh_sam3d
      *
      * In-place rotate-half RoPE applied to Q and K slots of a fused QKV
