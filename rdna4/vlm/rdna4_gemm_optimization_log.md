@@ -52,6 +52,22 @@ rebuild the old unpadded baseline.
 | asm glinline (broken) | move 8 `global_load_b128` out of scc-guarded bb.3 to be 1:1 interleaved with first 8 first-half WMMAs in `.LBB0_4` | hang | n/a | n/a | last iteration skips bb.3 (`s_cbranch_scc1 .LBB0_4` when `s7 > 0x11df`), so v137/v138 base address is stale on the last pass — moved loads then fault. Confirms that under PGR1 the bb.3 loads already overlap all 32 WMMAs in `.LBB0_4`; further interleaving cannot extend overlap without true PGR2 prefetch (loads for K+2 issued during K's WMMAs) |
 | asm dsmove | hoist 16 `ds_load_b128` from top of `.LBB0_4` to end of bb.5 (after barrier) and prologue, replacing the per-WMMA `s_wait_dscnt 0xe→0x0` countdown with a single `s_wait_dscnt 0x0` | 0.3411 | 127.510 | 65.4% | correct (`max_abs=0`, `cosine=1.0`); regresses ~3.7% from baseline 132.5 (same throttled-state run). Hypothesis was wrong: the `s_wait_dscnt` countdown wasn't a stall but a *pipelined* issue — WMMAs fire as ds_loads complete, with load-issue cycles overlapping WMMA-issue cycles. Moving the load issue out of the WMMA stream removed that overlap and added 16 idle cycles per iter |
 | asm storewait0 | collapse bb.5's per-store `s_wait_loadcnt 0x7→0x0` countdown to a single `s_wait_loadcnt 0x0` followed by 8 back-to-back `ds_store_b128` (stride-144 register layout) | 0.3270 | 133.0 | 68.2% | correct; matches baseline 133.2 within run-to-run noise (same throttled state). Confirms the per-store waits weren't blocking — bb.4's 32 WMMAs gave global_loads enough time to all complete by bb.5 entry, so the `s_wait_loadcnt` countdown was already at 0 |
+| asm barriersig-early | move `s_barrier_signal -1` from bb.5 (after the 8 ds_stores) to the end of bb.4 (right before `s_cbranch_vccnz .LBB0_1`); `s_barrier_wait` stays in bb.5 after stores | 0.3068 (median of 10) | 142.07 | 72.86% | correct (`max_abs=0`, `cosine=1.0` over 1000 iters); +1.5% vs baseline 139.95 in same-run comparison. SQ_BUSY_CYCLES drops ~200 cycles/wave (24,100 vs 24,330). Theory: signal-to-wait window now spans the entire bb.5 store sequence (~10 cycles), so by the time bb.5's `s_barrier_wait` fires, slow waves have already signaled — wait completes in ~1 cycle instead of waiting on a straggler. Empirically race-free on RDNA4 even though signal precedes the ds_stores; the LDS double-buffer (s6 toggle) means next-iter reads target the OTHER buffer, so any in-flight store from the *current* iter doesn't conflict with next iter's read |
+| asm topnowait+barriersig-early | stack `topnowait` (drop bb.3 redundant `s_wait_loadcnt`) on top of `barriersig-early` | 0.3061 (median of 5) | 142.42 | 73.0% | correct; matches barriersig-early alone within noise — `topnowait` does not stack with bse |
+
+## New best: barriersig-early at 142.07 TFLOP/s (72.9% peak)
+
+`barriersig-early` is the first patch to deliver a measurable gain over
+the PGR1 baseline (~+1.5%). It works by giving the cross-wave barrier
+sync extra slack: with the signal at the end of bb.4 and the wait at
+the end of bb.5, the ~10-cycle bb.5 store sequence acts as the slack
+window so waves that finished bb.4 early no longer wait at the barrier
+for stragglers — by the time the wait fires, all 4 waves have signaled.
+
+This is a sub-ISA-spec move: the signal precedes the writes that the
+next iteration's reads consume. It is safe in this kernel because the
+double-buffered LDS (s6 toggle) routes next-iter reads to the OTHER
+buffer, decoupling them from in-flight stores in the current bb.5.
 
 ## Conclusion: PGR1 schedule is well-pipelined
 
