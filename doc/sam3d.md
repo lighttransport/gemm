@@ -411,7 +411,7 @@ projection and two submanifold convs on
 `c_coords_after_input_block_0.npy`, then compares to
 `c_h_after_out_block_1.npy`. Gate against `/tmp/sam3d_ref_5b20`:
 N=1024, C_in=256, C_out=128, dim=1024, max_abs=2.670288e-05,
-mean_abs=1.852996e-06, avg=0.8912 ms over 20 launches. All four SLAT
+mean_abs=1.852996e-06, avg=~0.89 ms over 20 launches. All four SLAT
 IO resblocks now have real-weight CUDA verifier coverage; the next
 step is wiring those verified launch sequences into the SLAT runner
 path.
