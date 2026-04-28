@@ -829,6 +829,114 @@ def patch_dscnt_collapse(src: str) -> str:
     return src
 
 
+def patch_storefuse(src: str) -> str:
+    """Fuse bb.5 ds_stores+setup into bb.4 tail, leaving bb.5 with only
+    barrier_wait + branch.
+
+    Layout after patch:
+      bb.4: ds_loads, 32 WMMAs, [setup: s_xor s6, s_mul s8, v_add v174/v175],
+            s_wait_loadcnt 0x0, 8 ds_stores back-to-back, s_barrier_signal -1,
+            s_cbranch_vccnz .LBB0_1
+      bb.5: s_mov s8 0, s_add s[0:1] 64, s_barrier_wait 0xffff, s_branch .LBB0_1
+
+    Theory: bb.5 setup (s_xor, s_mul, s_add, v_add ×2) is currently serial
+    after the cbranch — moving it into bb.4 lets it overlap with WMMA pipeline
+    drain. Saves ~5 cycles/iter × 144 iters = ~720 cycles. The combined block
+    also makes the early-signal pattern safer (signal still after all stores
+    in bb.4, with the ~3-cycle cbranch+branch gap before barrier_wait acting
+    as the cross-wave slack window).
+
+    Note: store address compute uses scratch sgpr s9 (not s8) to preserve
+    s8=-1 for next iter's bb.4 vcc setup."""
+
+    # 1. Append store sequence to end of bb.4 (after last WMMA, before
+    #    s_cbranch_vccnz). Use s9 as temp scale reg.
+    bb4_old = """\
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[218:221], v[234:237], v[1:8]
+\ts_wait_alu 0xfffe
+\ts_cbranch_vccnz .LBB0_1
+"""
+    bb4_new = """\
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[218:221], v[234:237], v[1:8]
+\ts_xor_b32 s6, s6, 1
+\ts_wait_alu 0xfffe
+\ts_mul_i32 s9, s6, 0x2400
+\ts_wait_alu 0xfffe
+\tv_add_nc_u32_e32 v174, s9, v166
+\tv_add_nc_u32_e32 v175, s9, v169
+\ts_wait_loadcnt 0x0
+\tds_store_b128 v174, v[129:132]
+\tds_store_b128 v174, v[133:136] offset:2304
+\tds_store_b128 v174, v[141:144] offset:4608
+\tds_store_b128 v174, v[137:140] offset:6912
+\tds_store_b128 v175, v[157:160]
+\tds_store_b128 v175, v[153:156] offset:2304
+\tds_store_b128 v175, v[149:152] offset:4608
+\tds_store_b128 v175, v[145:148] offset:6912
+\t;;#ASMSTART
+\ts_barrier_signal -1
+\t;;#ASMEND
+\ts_wait_alu 0xfffe
+\ts_cbranch_vccnz .LBB0_1
+"""
+    if bb4_old not in src:
+        raise RuntimeError("could not find bb.4 final WMMA + cbranch")
+    src = src.replace(bb4_old, bb4_new, 1)
+
+    # 2. Replace bb.5 with: s_mov s8 0, s_add s[0:1] 64, s_add_co_i32 s7 32,
+    #    barrier_wait, s_branch. (s_xor s6, s_mul/v_add for store addr now
+    #    in bb.4; the rest still needed.)
+    bb5_old = """\
+; %bb.5:                                ;   in Loop: Header=BB0_2 Depth=1
+\ts_xor_b32 s6, s6, 1
+\ts_add_nc_u64 s[0:1], s[0:1], 64
+\ts_wait_alu 0xfffe
+\ts_mul_i32 s8, s6, 0x2400
+\ts_add_co_i32 s7, s7, 32
+\ts_wait_alu 0xfffe
+\tv_add_nc_u32_e32 v174, s8, v166
+\tv_add_nc_u32_e32 v175, s8, v169
+\ts_mov_b32 s8, 0
+\ts_wait_loadcnt 0x7
+\tds_store_b128 v174, v[129:132]
+\ts_wait_loadcnt 0x6
+\tds_store_b128 v174, v[133:136] offset:2304
+\ts_wait_loadcnt 0x5
+\tds_store_b128 v174, v[141:144] offset:4608
+\ts_wait_loadcnt 0x4
+\tds_store_b128 v174, v[137:140] offset:6912
+\ts_wait_loadcnt 0x3
+\tds_store_b128 v175, v[157:160]
+\ts_wait_loadcnt 0x2
+\tds_store_b128 v175, v[153:156] offset:2304
+\ts_wait_loadcnt 0x1
+\tds_store_b128 v175, v[149:152] offset:4608
+\ts_wait_loadcnt 0x0
+\tds_store_b128 v175, v[145:148] offset:6912
+\t;;#ASMSTART
+\ts_barrier_signal -1
+\t;;#ASMEND
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+\ts_branch .LBB0_1
+"""
+    bb5_new = """\
+; %bb.5:                                ;   in Loop: Header=BB0_2 Depth=1
+\ts_add_nc_u64 s[0:1], s[0:1], 64
+\ts_add_co_i32 s7, s7, 32
+\ts_mov_b32 s8, 0
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+\ts_branch .LBB0_1
+"""
+    if bb5_old not in src:
+        raise RuntimeError("could not find bb.5 store sequence")
+    src = src.replace(bb5_old, bb5_new, 1)
+    return src
+
+
 def patch_storewait0(src: str) -> str:
     """Collapse per-store s_wait_loadcnt 0x7→0x0 countdown in bb.5 into a
     single s_wait_loadcnt 0x0 followed by 8 back-to-back ds_store_b128.
@@ -889,6 +997,7 @@ def main() -> None:
             "bb5setup-hoist-bse",
             "dscnt-collapse",
             "dscnt-collapse-bse",
+            "storefuse",
         ],
         default="halfsplit",
     )
@@ -929,6 +1038,8 @@ def main() -> None:
         out = patch_dscnt_collapse(src)
     elif args.variant == "dscnt-collapse-bse":
         out = patch_barriersig_early(patch_dscnt_collapse(src))
+    elif args.variant == "storefuse":
+        out = patch_storefuse(src)
     else:
         raise AssertionError(args.variant)
     Path(args.output).write_text(out, encoding="utf-8")
