@@ -649,6 +649,58 @@ def patch_dsmove(src: str) -> str:
     return src
 
 
+def patch_barriersig_early(src: str) -> str:
+    """Move s_barrier_signal from bb.5 (after stores) to end of bb.4
+    (before cbranch_vccnz .LBB0_1).  Signal runs on every iteration —
+    on the last iter, the unmatched signal is harmless (kernel ends
+    after epilogue, so the bumped barrier counter doesn't matter).
+
+    Theory: the signal-to-wait window now includes the entire bb.5
+    store sequence (~10 cycles), giving cross-wave sync more slack.
+    By the time bb.5's barrier_wait fires, all 4 waves have already
+    signaled, so the wait completes in ~1 cycle instead of waiting
+    for a slow wave to catch up."""
+
+    # 1. End of bb.4: insert s_barrier_signal -1 right before s_cbranch_vccnz.
+    bb4_old = """\
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[218:221], v[234:237], v[1:8]
+\ts_wait_alu 0xfffe
+\ts_cbranch_vccnz .LBB0_1
+"""
+    bb4_new = """\
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[218:221], v[234:237], v[1:8]
+\t;;#ASMSTART
+\ts_barrier_signal -1
+\t;;#ASMEND
+\ts_wait_alu 0xfffe
+\ts_cbranch_vccnz .LBB0_1
+"""
+    if bb4_old not in src:
+        raise RuntimeError("could not find bb.4 final WMMA + cbranch")
+    src = src.replace(bb4_old, bb4_new, 1)
+
+    # 2. Remove s_barrier_signal from bb.5 (keep barrier_wait).
+    bb5_old = """\
+\t;;#ASMSTART
+\ts_barrier_signal -1
+\t;;#ASMEND
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+\ts_branch .LBB0_1
+"""
+    bb5_new = """\
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+\ts_branch .LBB0_1
+"""
+    if bb5_old not in src:
+        raise RuntimeError("could not find bb.5 barrier signal+wait pair")
+    src = src.replace(bb5_old, bb5_new, 1)
+    return src
+
+
 def patch_storewait0(src: str) -> str:
     """Collapse per-store s_wait_loadcnt 0x7→0x0 countdown in bb.5 into a
     single s_wait_loadcnt 0x0 followed by 8 back-to-back ds_store_b128.
@@ -702,6 +754,9 @@ def main() -> None:
             "storewait0",
             "topnowait-storewait0",
             "dsmove",
+            "barriersig-early",
+            "topnowait-barriersig-early",
+            "topnowait-storewait0-barriersig-early",
         ],
         default="halfsplit",
     )
@@ -728,6 +783,12 @@ def main() -> None:
         out = patch_storewait0(patch_topnowait(src))
     elif args.variant == "dsmove":
         out = patch_dsmove(src)
+    elif args.variant == "barriersig-early":
+        out = patch_barriersig_early(src)
+    elif args.variant == "topnowait-barriersig-early":
+        out = patch_barriersig_early(patch_topnowait(src))
+    elif args.variant == "topnowait-storewait0-barriersig-early":
+        out = patch_barriersig_early(patch_storewait0(patch_topnowait(src)))
     else:
         raise AssertionError(args.variant)
     Path(args.output).write_text(out, encoding="utf-8")

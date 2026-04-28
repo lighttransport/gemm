@@ -55,10 +55,19 @@ MM0_ASM_DSMOVE_CO = $(GEN_DIR)/mm0_bf16_asm_dsmove.co
 MM0_ASM_STOREWAIT0_S = $(GEN_DIR)/mm0_bf16_asm_storewait0.s
 MM0_ASM_STOREWAIT0_O = $(GEN_DIR)/mm0_bf16_asm_storewait0.o
 MM0_ASM_STOREWAIT0_CO = $(GEN_DIR)/mm0_bf16_asm_storewait0.co
+MM0_ASM_BARRIERSIG_EARLY_S = $(GEN_DIR)/mm0_bf16_asm_barriersig_early.s
+MM0_ASM_BARRIERSIG_EARLY_O = $(GEN_DIR)/mm0_bf16_asm_barriersig_early.o
+MM0_ASM_BARRIERSIG_EARLY_CO = $(GEN_DIR)/mm0_bf16_asm_barriersig_early.co
+MM0_ASM_TNWBSE_S = $(GEN_DIR)/mm0_bf16_asm_tnw_bse.s
+MM0_ASM_TNWBSE_O = $(GEN_DIR)/mm0_bf16_asm_tnw_bse.o
+MM0_ASM_TNWBSE_CO = $(GEN_DIR)/mm0_bf16_asm_tnw_bse.co
+MM0_ASM_TNWSWBSE_S = $(GEN_DIR)/mm0_bf16_asm_tnw_sw_bse.s
+MM0_ASM_TNWSWBSE_O = $(GEN_DIR)/mm0_bf16_asm_tnw_sw_bse.o
+MM0_ASM_TNWSWBSE_CO = $(GEN_DIR)/mm0_bf16_asm_tnw_sw_bse.co
 MM0_DIRECTA_HIP = $(GEN_DIR)/mm0_bf16_directa.hip
 MM0_DIRECTA_CO = $(GEN_DIR)/mm0_bf16_directa.co
 
-.PHONY: all clean run help gen-mm0-asm bench-mm0-asm bench-mm0-asm-gload bench-mm0-asm-s bench-mm0-asm-halfsplit bench-mm0-asm-storeearly20 bench-mm0-asm-bfirst2 bench-mm0-asm-pgr1mid bench-mm0-asm-dsmove bench-mm0-asm-storewait0 bench-mm0-directa
+.PHONY: all clean run help gen-mm0-asm bench-mm0-asm bench-mm0-asm-gload bench-mm0-asm-s bench-mm0-asm-halfsplit bench-mm0-asm-storeearly20 bench-mm0-asm-bfirst2 bench-mm0-asm-pgr1mid bench-mm0-asm-dsmove bench-mm0-asm-storewait0 bench-mm0-asm-barriersig-early bench-mm0-asm-tnwbse bench-mm0-asm-tnwswbse bench-mm0-directa
 
 all: $(VISION) $(VLM) $(BENCH_GEMM)
 
@@ -179,6 +188,33 @@ $(MM0_ASM_STOREWAIT0_O): $(MM0_ASM_STOREWAIT0_S)
 $(MM0_ASM_STOREWAIT0_CO): $(MM0_ASM_STOREWAIT0_O)
 	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
 
+$(MM0_ASM_BARRIERSIG_EARLY_S): $(MM0_ASM_S) patch_mm0_asm_schedule.py
+	python3 patch_mm0_asm_schedule.py --variant barriersig-early $< $@
+
+$(MM0_ASM_BARRIERSIG_EARLY_O): $(MM0_ASM_BARRIERSIG_EARLY_S)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c -o $@ $<
+
+$(MM0_ASM_BARRIERSIG_EARLY_CO): $(MM0_ASM_BARRIERSIG_EARLY_O)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
+
+$(MM0_ASM_TNWBSE_S): $(MM0_ASM_S) patch_mm0_asm_schedule.py
+	python3 patch_mm0_asm_schedule.py --variant topnowait-barriersig-early $< $@
+
+$(MM0_ASM_TNWBSE_O): $(MM0_ASM_TNWBSE_S)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c -o $@ $<
+
+$(MM0_ASM_TNWBSE_CO): $(MM0_ASM_TNWBSE_O)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
+
+$(MM0_ASM_TNWSWBSE_S): $(MM0_ASM_S) patch_mm0_asm_schedule.py
+	python3 patch_mm0_asm_schedule.py --variant topnowait-storewait0-barriersig-early $< $@
+
+$(MM0_ASM_TNWSWBSE_O): $(MM0_ASM_TNWSWBSE_S)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c -o $@ $<
+
+$(MM0_ASM_TNWSWBSE_CO): $(MM0_ASM_TNWSWBSE_O)
+	$(ROCM_LLVM)/clang++ -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nostdlib -Wl,-shared -o $@ $<
+
 $(MM0_DIRECTA_HIP): gen_mm0_bf16_directa.py
 	python3 gen_mm0_bf16_directa.py --out-dir $(GEN_DIR)
 
@@ -211,6 +247,15 @@ bench-mm0-asm-dsmove: $(BENCH_GEMM) $(MM0_ASM_DSMOVE_CO)
 
 bench-mm0-asm-storewait0: $(BENCH_GEMM) $(MM0_ASM_STOREWAIT0_CO)
 	VLM_GEMM_ASM_CO=$(MM0_ASM_STOREWAIT0_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
+
+bench-mm0-asm-barriersig-early: $(BENCH_GEMM) $(MM0_ASM_BARRIERSIG_EARLY_CO)
+	VLM_GEMM_ASM_CO=$(MM0_ASM_BARRIERSIG_EARLY_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
+
+bench-mm0-asm-tnwbse: $(BENCH_GEMM) $(MM0_ASM_TNWBSE_CO)
+	VLM_GEMM_ASM_CO=$(MM0_ASM_TNWBSE_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
+
+bench-mm0-asm-tnwswbse: $(BENCH_GEMM) $(MM0_ASM_TNWSWBSE_CO)
+	VLM_GEMM_ASM_CO=$(MM0_ASM_TNWSWBSE_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
 
 bench-mm0-directa: $(BENCH_GEMM) $(MM0_DIRECTA_CO)
 	VLM_GEMM_ASM_CO=$(MM0_DIRECTA_CO) ./$(BENCH_GEMM) --dtype bf16 --shape mm0 --mode mm0asm --iters 200 --check
