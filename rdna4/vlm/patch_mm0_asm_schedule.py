@@ -508,6 +508,147 @@ def patch_topnowait(src: str) -> str:
     return src.replace(old, new, 1)
 
 
+DSMOVE_PROLOGUE_INSERT = """\
+\ts_mov_b32 s9, 0
+\ts_wait_alu 0xfffe
+\tv_add_lshl_u32 v174, v172, s9, 4
+\tv_add_nc_u32_e32 v218, v173, v174
+\tv_add_nc_u32_e32 v230, v170, v174
+\tv_add_nc_u32_e32 v234, v171, v174
+\tds_load_b128 v[174:177], v218
+\tds_load_b128 v[178:181], v230
+\tds_load_b128 v[182:185], v230 offset:256
+\tds_load_b128 v[186:189], v230 offset:512
+\tds_load_b128 v[190:193], v234
+\tds_load_b128 v[194:197], v218 offset:256
+\tds_load_b128 v[198:201], v218 offset:512
+\tds_load_b128 v[202:205], v218 offset:768
+\tds_load_b128 v[206:209], v218 offset:4608
+\tds_load_b128 v[210:213], v218 offset:4864
+\tds_load_b128 v[214:217], v218 offset:5120
+\tds_load_b128 v[218:221], v218 offset:5376
+\tds_load_b128 v[222:225], v230 offset:4608
+\tds_load_b128 v[226:229], v230 offset:4864
+\tds_load_b128 v[230:233], v230 offset:5120
+\tds_load_b128 v[234:237], v234 offset:4608
+"""
+
+DSMOVE_BB4_BLOCK = """\
+.LBB0_4:                                ;   in Loop: Header=BB0_2 Depth=1
+\ts_wait_alu 0xfffe
+\ts_and_not1_b32 vcc_lo, exec_lo, s8
+\ts_mov_b32 s8, -1
+\ts_wait_dscnt 0x0
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[174:177], v[178:181], v[121:128]
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[174:177], v[182:185], v[113:120]
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[174:177], v[186:189], v[105:112]
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[174:177], v[190:193], v[97:104]
+\tv_wmma_f32_16x16x16_bf16 v[89:96], v[194:197], v[178:181], v[89:96]
+\tv_wmma_f32_16x16x16_bf16 v[81:88], v[194:197], v[182:185], v[81:88]
+\tv_wmma_f32_16x16x16_bf16 v[73:80], v[194:197], v[186:189], v[73:80]
+\tv_wmma_f32_16x16x16_bf16 v[65:72], v[194:197], v[190:193], v[65:72]
+\tv_wmma_f32_16x16x16_bf16 v[57:64], v[198:201], v[178:181], v[57:64]
+\tv_wmma_f32_16x16x16_bf16 v[49:56], v[198:201], v[182:185], v[49:56]
+\tv_wmma_f32_16x16x16_bf16 v[41:48], v[198:201], v[186:189], v[41:48]
+\tv_wmma_f32_16x16x16_bf16 v[33:40], v[198:201], v[190:193], v[33:40]
+\tv_wmma_f32_16x16x16_bf16 v[25:32], v[202:205], v[178:181], v[25:32]
+\tv_wmma_f32_16x16x16_bf16 v[17:24], v[202:205], v[182:185], v[17:24]
+\tv_wmma_f32_16x16x16_bf16 v[9:16], v[202:205], v[186:189], v[9:16]
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[202:205], v[190:193], v[1:8]
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[206:209], v[222:225], v[121:128]
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[206:209], v[226:229], v[113:120]
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[206:209], v[230:233], v[105:112]
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[206:209], v[234:237], v[97:104]
+\tv_wmma_f32_16x16x16_bf16 v[89:96], v[210:213], v[222:225], v[89:96]
+\tv_wmma_f32_16x16x16_bf16 v[81:88], v[210:213], v[226:229], v[81:88]
+\tv_wmma_f32_16x16x16_bf16 v[73:80], v[210:213], v[230:233], v[73:80]
+\tv_wmma_f32_16x16x16_bf16 v[65:72], v[210:213], v[234:237], v[65:72]
+\tv_wmma_f32_16x16x16_bf16 v[57:64], v[214:217], v[222:225], v[57:64]
+\tv_wmma_f32_16x16x16_bf16 v[49:56], v[214:217], v[226:229], v[49:56]
+\tv_wmma_f32_16x16x16_bf16 v[41:48], v[214:217], v[230:233], v[41:48]
+\tv_wmma_f32_16x16x16_bf16 v[33:40], v[214:217], v[234:237], v[33:40]
+\tv_wmma_f32_16x16x16_bf16 v[25:32], v[218:221], v[222:225], v[25:32]
+\tv_wmma_f32_16x16x16_bf16 v[17:24], v[218:221], v[226:229], v[17:24]
+\tv_wmma_f32_16x16x16_bf16 v[9:16], v[218:221], v[230:233], v[9:16]
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[218:221], v[234:237], v[1:8]
+\ts_wait_alu 0xfffe
+\ts_cbranch_vccnz .LBB0_1
+"""
+
+DSMOVE_BB5_TAIL_INSERT = """\
+\ts_mul_i32 s9, s6, 0x240
+\ts_wait_alu 0xfffe
+\tv_add_lshl_u32 v174, v172, s9, 4
+\tv_add_nc_u32_e32 v218, v173, v174
+\tv_add_nc_u32_e32 v230, v170, v174
+\tv_add_nc_u32_e32 v234, v171, v174
+\tds_load_b128 v[174:177], v218
+\tds_load_b128 v[178:181], v230
+\tds_load_b128 v[182:185], v230 offset:256
+\tds_load_b128 v[186:189], v230 offset:512
+\tds_load_b128 v[190:193], v234
+\tds_load_b128 v[194:197], v218 offset:256
+\tds_load_b128 v[198:201], v218 offset:512
+\tds_load_b128 v[202:205], v218 offset:768
+\tds_load_b128 v[206:209], v218 offset:4608
+\tds_load_b128 v[210:213], v218 offset:4864
+\tds_load_b128 v[214:217], v218 offset:5120
+\tds_load_b128 v[218:221], v218 offset:5376
+\tds_load_b128 v[222:225], v230 offset:4608
+\tds_load_b128 v[226:229], v230 offset:4864
+\tds_load_b128 v[230:233], v230 offset:5120
+\tds_load_b128 v[234:237], v234 offset:4608
+"""
+
+
+def patch_dsmove(src: str) -> str:
+    """Hoist the 16 ds_load_b128 from top of bb.4 into the end of bb.5
+    (after barrier_wait) and into the prologue (after the initial barrier,
+    before s_branch .LBB0_2).  Replaces the per-WMMA s_wait_dscnt countdown
+    with a single s_wait_dscnt 0x0 at top of bb.4.  LDS load latency now
+    overlaps with the loop branch / scc resolve / bb.3 global_load issue."""
+
+    # 1. Prologue: inject ds_loads after the prologue barrier_wait,
+    #    before the implicit-def block / s_branch .LBB0_2.
+    prologue_marker = "\ts_branch .LBB0_2\n"
+    if src.count(prologue_marker) != 1:
+        raise RuntimeError("expected exactly one s_branch .LBB0_2 in prologue")
+    src = src.replace(prologue_marker, DSMOVE_PROLOGUE_INSERT + prologue_marker, 1)
+
+    # 2. bb.4: replace the entire ds_load + 32-WMMA + cbranch block with the
+    #    single-wait variant.  Match from `.LBB0_4:` to `s_cbranch_vccnz .LBB0_1`.
+    lines = src.splitlines()
+    bb4_start = None
+    for i, line in enumerate(lines):
+        if line == ".LBB0_4:                                ;   in Loop: Header=BB0_2 Depth=1":
+            bb4_start = i
+            break
+    if bb4_start is None:
+        raise RuntimeError("could not find .LBB0_4 label")
+    bb4_end = None
+    for i in range(bb4_start + 1, len(lines)):
+        if lines[i] == "\ts_cbranch_vccnz .LBB0_1":
+            bb4_end = i + 1
+            break
+    if bb4_end is None:
+        raise RuntimeError("could not find bb.4 cbranch_vccnz")
+    new_block = DSMOVE_BB4_BLOCK.rstrip("\n").splitlines()
+    src = "\n".join(lines[:bb4_start] + new_block + lines[bb4_end:]) + "\n"
+
+    # 3. bb.5: inject ds_loads after the barrier_wait ASMEND but before
+    #    the s_branch .LBB0_1.  bb.5's barrier_wait is the second occurrence
+    #    in the file (first is prologue's).
+    bb5_marker = "\t;;#ASMEND\n\ts_branch .LBB0_1\n"
+    if bb5_marker not in src:
+        raise RuntimeError("could not find bb.5 barrier+branch tail")
+    src = src.replace(
+        bb5_marker,
+        "\t;;#ASMEND\n" + DSMOVE_BB5_TAIL_INSERT + "\ts_branch .LBB0_1\n",
+        1,
+    )
+    return src
+
+
 def patch_storewait0(src: str) -> str:
     old = """\
 \ts_wait_loadcnt 0x7
@@ -556,6 +697,7 @@ def main() -> None:
             "topnowait",
             "storewait0",
             "topnowait-storewait0",
+            "dsmove",
         ],
         default="halfsplit",
     )
@@ -580,6 +722,8 @@ def main() -> None:
         out = patch_storewait0(src)
     elif args.variant == "topnowait-storewait0":
         out = patch_storewait0(patch_topnowait(src))
+    elif args.variant == "dsmove":
+        out = patch_dsmove(src)
     else:
         raise AssertionError(args.variant)
     Path(args.output).write_text(out, encoding="utf-8")
