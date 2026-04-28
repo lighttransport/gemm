@@ -33,6 +33,24 @@ typedef struct {
     int8_t   qs[32];  /* quantized values */
 } block_q8_0;
 
+/* Q1_0 block: 128 elements, 18 bytes */
+typedef struct {
+    uint16_t d;       /* block scale (fp16) */
+    uint8_t  qs[16];  /* bits / quants */
+} block_q1_0;
+
+/* MXFP4 block: 32 elements, 17 bytes */
+typedef struct {
+    uint8_t e;        /* E8M0 scale */
+    uint8_t qs[16];   /* packed 4-bit E2M1 values */
+} block_mxfp4;
+
+/* NVFP4 block: 64 elements, 36 bytes */
+typedef struct {
+    uint8_t d[4];     /* UE4M3 scales, one per 16-element sub-block */
+    uint8_t qs[32];   /* packed 4-bit E2M1 values */
+} block_nvfp4;
+
 /* Q2_K block: 256 elements, 84 bytes */
 typedef struct {
     uint8_t scales[16]; /* packed low/high 4-bit scales/mins */
@@ -213,6 +231,9 @@ static inline float ggml_fp16_to_fp32(uint16_t h) {
 void dequantize_row_q2_K(const void *src, float *dst, int n);
 void dequantize_row_q3_K(const void *src, float *dst, int n);
 void dequantize_row_q8_0(const void *src, float *dst, int n);
+void dequantize_row_q1_0(const void *src, float *dst, int n);
+void dequantize_row_mxfp4(const void *src, float *dst, int n);
+void dequantize_row_nvfp4(const void *src, float *dst, int n);
 void dequantize_row_q4_K(const void *src, float *dst, int n);
 void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q6_K(const void *src, float *dst, int n);
@@ -243,6 +264,9 @@ static inline size_t dequant_row_size(uint32_t type, int n) {
         case GGML_TYPE_Q2_K:    bs = 256; ts = 84;  break;
         case GGML_TYPE_Q3_K:    bs = 256; ts = 110; break;
         case GGML_TYPE_Q8_0:    bs = 32;  ts = 34;  break;
+        case GGML_TYPE_Q1_0:    bs = 128; ts = 18;  break;
+        case GGML_TYPE_MXFP4:   bs = 32;  ts = 17;  break;
+        case GGML_TYPE_NVFP4:   bs = 64;  ts = 36;  break;
         case GGML_TYPE_Q4_K:    bs = 256; ts = 144; break;
         case GGML_TYPE_Q5_K:    bs = 256; ts = 176; break;
         case GGML_TYPE_Q6_K:    bs = 256; ts = 210; break;
@@ -1437,6 +1461,21 @@ static inline void gemm_bf16_f32_tokmajor(float *Y, const uint16_t *W, const flo
 #include <string.h>
 #include <math.h>
 
+static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits = x < 2 ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7f) return 0.0f;
+    int exp = (x >> 3) & 0xf;
+    int man = x & 0x7;
+    float raw = exp == 0 ? ldexpf((float)man, -9) : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
 void dequantize_row_q8_0(const void *src, float *dst, int n) {
     const int nb = n / 32;
     const block_q8_0 *blocks = (const block_q8_0 *)src;
@@ -1445,6 +1484,20 @@ void dequantize_row_q8_0(const void *src, float *dst, int n) {
         const float d = ggml_fp16_to_fp32(blocks[i].d);
         for (int j = 0; j < 32; j++) {
             dst[i * 32 + j] = d * blocks[i].qs[j];
+        }
+    }
+}
+
+void dequantize_row_q1_0(const void *src, float *dst, int n) {
+    const int nb = n / 128;
+    const block_q1_0 *blocks = (const block_q1_0 *)src;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_fp16_to_fp32(blocks[i].d);
+        const float neg_d = -d;
+        for (int j = 0; j < 128; j++) {
+            const uint8_t bit = (blocks[i].qs[j >> 3] >> (j & 7)) & 1u;
+            dst[i * 128 + j] = bit ? d : neg_d;
         }
     }
 }
@@ -1724,6 +1777,10 @@ static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 
 static const int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+static const int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 };
 
 static const uint32_t iq3xxs_grid[256] = {
@@ -2758,6 +2815,38 @@ void dequantize_row_iq2_xxs(const void *src, float *dst, int n) {
     }
 }
 
+void dequantize_row_mxfp4(const void *restrict vx, float *restrict y, int k) {
+    const block_mxfp4 *restrict x = (const block_mxfp4 *)vx;
+    const int nb = k / 32;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_e8m0_to_fp32_half(x[i].e);
+        for (int j = 0; j < 16; j++) {
+            const int8_t v0 = kvalues_mxfp4[x[i].qs[j] & 0x0f];
+            const int8_t v1 = kvalues_mxfp4[x[i].qs[j] >> 4];
+            y[i * 32 + j +  0] = (float)v0 * d;
+            y[i * 32 + j + 16] = (float)v1 * d;
+        }
+    }
+}
+
+void dequantize_row_nvfp4(const void *restrict vx, float *restrict y, int k) {
+    const block_nvfp4 *restrict x = (const block_nvfp4 *)vx;
+    const int nb = k / 64;
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < 4; s++) {
+            const float d = ggml_ue4m3_to_fp32(x[i].d[s]);
+            const uint8_t *qs = x[i].qs + s * 8;
+            float *yb = y + i * 64 + s * 16;
+            for (int j = 0; j < 8; j++) {
+                const int8_t v0 = kvalues_mxfp4[qs[j] & 0x0f];
+                const int8_t v1 = kvalues_mxfp4[qs[j] >> 4];
+                yb[j + 0] = (float)v0 * d;
+                yb[j + 8] = (float)v1 * d;
+            }
+        }
+    }
+}
+
 void dequantize_row_q4_0(const void *restrict vx, float *restrict y, int k) {
     const block_q4_0 *restrict x = (const block_q4_0 *)vx;
     const int nb = k / 32;
@@ -3095,6 +3184,15 @@ int dequant_row(uint32_t type, const void *src, float *dst, int n) {
             return 0;
         case GGML_TYPE_Q8_0:
             dequantize_row_q8_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q1_0:
+            dequantize_row_q1_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_MXFP4:
+            dequantize_row_mxfp4(src, dst, n);
+            return 0;
+        case GGML_TYPE_NVFP4:
+            dequantize_row_nvfp4(src, dst, n);
             return 0;
         case GGML_TYPE_Q4_K:
             dequantize_row_q4_K(src, dst, n);
