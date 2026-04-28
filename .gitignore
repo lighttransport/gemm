@@ -104,6 +104,9 @@ cpu/sparse3d/ref_output/
 cpu/sparse3d/c_output/
 cpu/sparse3d/.venv/
 ref/sam3d/.venv/
+ref/sam3d/__pycache__/
+ref/sam3d-body/.venv/
+ref/sam3d-body/__pycache__/
 server/sam3d/__pycache__/
 
 # External / generated
@@ -111,6 +114,12 @@ ref/*
 !ref/hy3d/
 !ref/trellis2/
 !ref/llm/
+!ref/sam3d/
+!ref/sam3d/*.py
+!ref/sam3d/README.md
+!ref/sam3d-body/
+!ref/sam3d-body/*.py
+!ref/sam3d-body/README.md
 result/
 
 # Local (uncommitted) runner scripts — per-box model paths / env
