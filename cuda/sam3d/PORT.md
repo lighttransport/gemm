@@ -50,7 +50,7 @@ See `doc/sam3d.md` § "Status — drift table".
   `out_blocks[1]` skip projection plus submanifold conv sequence. Gate
   against `/tmp/sam3d_ref_5b20`: N=1024, C_in=256, C_out=128,
   dim=1024, max_abs=2.670288e-05, mean_abs=1.852996e-06,
-  avg=0.8919 ms over 20 launches. This completes standalone real-weight
+  avg=~0.89 ms over 20 launches. This completes standalone real-weight
   CUDA gates for all four SLAT sparse IO resblocks; runner wiring is
   next.
 - **5b.21 — real-weight SLAT output block 0 CUDA verifier (GREEN).**
