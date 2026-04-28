@@ -124,7 +124,7 @@ fallback in the runner.
 | ss_dit (single)| GPU  | fp32      | 1.05e-05             | **Phase 2c.13 GREEN** — `cs3d_ssdit_outer_forward` via runner |
 | ss_dit (ODE)   | GPU  | fp32      | 2.19e-05 @ steps=2   | **Phase 2c.16 GREEN** — upstream sampler semantics: rescale_t=3, reversed=0, d=0, add_flag CFG |
 | ss_decoder     | GPU  | fp32      | 2.77e-04             | **Phase 4b GREEN** — 3D conv + channel-LN + SiLU + pixel-shuffle GPU forward; ~558 ms verifier path |
-| slat_dit       | mix  | fp32      | 4.41e-05             | **Phase 5b.19 GREEN** — hybrid SLAT ODE body plus real-weight CUDA gate for `input_blocks[0]`; remaining sparse IO resblocks still CPU-backed |
+| slat_dit       | mix  | fp32      | 4.41e-05             | **Phase 5b.20 GREEN** — hybrid SLAT ODE body plus real-weight CUDA gates for both SLAT input resblocks; remaining sparse output resblocks still CPU-backed |
 | slat_gs        | CPU  | fp32      | 7.77e-05             | **Phase 6a GREEN** — CPU fallback. Phase 6b kernelization pending |
 | End-to-end PLY | mix  | fp32      | visual (GS viewer)   | **Phase 7a GREEN** — full sampled path writes 38016 gaussians in 126.92–128.21 s after 5b.17/5b.18; `--slat-ref` smoke writes 8192 gaussians in 2.77 s |
 
@@ -243,7 +243,7 @@ inside the CFG interval `[0,500]`, then velocity mixing
 
 ### Next phase — Phase 5b
 
-Continue SLAT Flow DiT kernelization beyond the 5b.19 hybrid
+Continue SLAT Flow DiT kernelization beyond the 5b.20 hybrid
 CPU-sparse-IO / GPU-transformer ODE body with resident cond and hook
 scratch reuse.
 The current end-to-end path is correct enough for pipeline/perf smoke
@@ -380,6 +380,19 @@ N=1024, C=128, dim=1024, max_abs=5.722046e-06,
 mean_abs=2.371230e-07, avg=0.4729 ms over 20 launches. The verifier
 also fixes a 5D conv-weight upload hazard by sizing dequantized conv
 weights with `qtensor.n_rows * qtensor.n_cols`, not `qt_numel()`.
+Phase 5b.20 adds `verify_slat_input_block1_realw`, a real-checkpoint
+CUDA gate for the downsampling SLAT input SparseResBlock3d. It starts
+from traced `c_h_after_input_block_0.npy` /
+`c_coords_after_input_block_0.npy`, applies the deterministic factor-2
+mean downsample, runs the real `input_blocks[1]` skip projection and
+two submanifold convs, then compares features and coordinates to
+`c_h_after_input_block_1.npy` /
+`c_coords_after_input_block_1.npy`. Gate against the regenerated current
+trace in `/tmp/sam3d_ref_5b20`: N0=1024, N1=1007, C_in=128,
+C_out=1024, dim=1024, max_abs=7.390976e-06,
+mean_abs=3.324221e-07, coord_bad=0, avg=65.4651 ms over 20 launches.
+The older `/tmp/sam3d_ref` copy is stale for this intermediate: coords
+match but `c_h_after_input_block_1.npy` differs by max_abs=6.041392.
 
 ### Phase 6b — SLAT GS decoder kernelization
 
