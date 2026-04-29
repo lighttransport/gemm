@@ -1025,3 +1025,140 @@ levers. Full breakdown in `mm0_lever_attribution.md`. Key numbers:
 
 Generic recipe for future GEMM ports lives in `peak_efficiency_playbook.md`.
 
+## 2026-04-30 — VLM end-to-end optimization (status snapshot)
+
+mm0 closed at 174 TFLOP/s sustained (89% peak). Effort then shifted from
+"the projector GEMM" to "the rest of the vision encoder," which had
+become the dominant cost once mm0 was no longer it. Profile-driven
+attack of the actual hot kernels in `hip_vision_encoder.c` produced an
+end-to-end **18.4× speedup at 1024² (260 → 4793 tok/s)** and **21.3×
+at 2048² (77 → 1638 tok/s)** vs the original scalar-F32 attention
+reference, all with cosine ≥ 0.99996 vs llama.cpp.
+
+### Layered optimizations and headline numbers
+
+Measurements: RX 9070 XT, Qwen3.6-27B mmproj-BF16, fujisan.jpg.
+HIP path active by default; toggle with `HIP_VLM_FA=...`.
+
+| Path / step                        | 1024² ms | tok/s | 2048² ms | tok/s | cosine     |
+|---|---:|---:|---:|---:|---|
+| scalar F32 (`flash_attn_dyn_f32`)  | 3930 |  260 | 53180 |   77 | (ref)      |
+| WMMA BF16 BQ=16 1-wave             | 1085 |  943 | 11776 |  348 | 0.99996665 |
+| WMMA BF16 BQ=32 2-wave             |  758 | 1350 |  5702 |  718 | 0.99996665 |
+| + KV pre-pack (half-prec K/V)      |  713 | 1436 |  5078 |  807 | 0.99996665 |
+| + W0+W1 host-fold (patch_embed)    |  645 | 1586 |  4683 |  874 | 0.99996930 |
+| + patch_embed WMMA (im2col+F16)    |  608 | 1687 |  4596 |  891 | 0.99996577 |
+| + hipBLASLt for ViT block GEMMs    |  278 | 3689 |  3281 | 1248 | 0.99996593 |
+| + FA fixed-stride K/V loads        |  215 | 4544 |  2826 | 1450 | 0.99996593 |
+| **+ FA double-buffered KV (BF16)** |  **202** | **4793** |  **2500** | **1638** | 0.99996593 |
+
+Each row is the cumulative state with all prior optimizations active.
+
+### What each step does
+
+1. **WMMA flash-attn kernels** (`flash_attn_wmma_{bf16,f16}{,_2w}{,_pre}`).
+   1 wave / 32 threads, BQ=16, BKV=16, head_dim padded to 80. F32
+   inputs cast to half-precision in LDS. Online softmax with
+   `__shfl_xor` cross-lane. The `_2w` 2-wave BQ=32 variant doubles
+   queries-per-K/V-tile so DRAM K/V traffic halves and 64-thread
+   cooperative LDS load amortizes load-issue cost. Selected by env
+   `HIP_VLM_FA=wmma_bf16_2w` etc.
+2. **KV pre-pack** (`kv_transpose_{bf16,f16}` + `_2w_pre` kernels).
+   Writes half-precision K/V once per block from F32 qkv. Halves DRAM
+   read bandwidth in the FA hot loop and removes the per-element F32
+   cast inside the K/V load. Cosine bit-identical to non-pre.
+3. **W0+W1 host-fold** for the Qwen3-VL dual-conv2d patch embedding.
+   `(W0 + W1) @ pix` is algebraically equivalent to summing two
+   convolutions but requires only one GEMM at runtime. Done in init.
+   Cosine slightly *better* (a single rounding instead of two).
+4. **patch_embed WMMA** via `patch_unfold_f16` (im2col) +
+   `gemm_wmma_f16_f32`. F16 (10-bit mantissa) is required: BF16
+   (7-bit) fails the accuracy gate on small normalized RGB inputs.
+   patch_embed: 113 → 0.85 ms (133×).
+5. **hipBLASLt for ViT block GEMMs** (`HIP_VLM_HIPBLASLT_VIT=1`,
+   default on). 16-slot per-shape plan cache `hipblaslt_vit_plans[]`
+   with find-or-create keyed by (dtype, m, n, k, epilogue). Routes
+   `qkv` (BIAS), `attn_out` (BIAS+residual via β=1, C=residual),
+   `ffn_w0` (GELU+BIAS), `ffn_w1` (BIAS+residual) through hipBLASLt.
+   Encoder GEMMs total 350 → 32 ms (11×, ~100 TFLOP/s avg vs prior
+   ~10).
+6. **FA fixed-stride K/V loads**. Replaced `e/HD_PAD` and `e%HD_PAD`
+   divides (HD_PAD=80, non-power-of-2 = real integer divide on AMD
+   ISA — ~30 cycles each) with a static thread→(row, col) layout:
+   `ld_row = tid >> 2`, `ld_col0 = (tid & 3) * 20`, each thread
+   handles a fixed 20-col stripe of one row. FA: 7.0 → 4.92 ms/call
+   (-30%). DRAM coalescing modestly worse (stride-20 between adjacent
+   threads), but L2 absorbs it; the divide elimination dominates.
+7. **FA double-buffered KV** (BF16 path). Two K and two V LDS slots;
+   prologue loads tile 0; each iter prefetches tile *t+1* into the
+   alternate slot while WMMA computes on tile *t*. One
+   `__syncthreads()` per iter, at the end. LDS doubles to ~11 KB/WG
+   (still well under 64 KB/CU). FA: 4.92 → 4.60 ms/call (-7%, larger
+   gain at 2048² where n_kv is bigger so prefetch/compute overlap is
+   more frequent).
+
+### Profile after all of the above (1024², BF16, total GPU 174 ms)
+
+- `flash_attn_wmma_bf16_2w_pre`: 71.3% (124 ms over 27 calls = 4.6 ms/call)
+- hipBLASLt ViT GEMMs: 18.4% (32 ms over 110 calls = 0.29 ms/call)
+- `pack_bf16_from_f32` (GEMM input cast): 4.3% (7.5 ms / 110)
+- `layernorm_f32`: 2.0% (3.6 ms)
+- `rope_vision_f32`: 1.8% (3.1 ms)
+- `kv_transpose_bf16`: 1.2% (2.1 ms)
+- everything else: <1%
+
+FA is decisively the next bottleneck; GEMMs and the cast/norm/rope
+tail are below 4% each.
+
+### Remaining headroom
+
+FA at 4.6 ms/call corresponds to ~13 TFLOP/s vs WMMA peak ~195 — only
+~7% of peak. Likely attacks, in roughly decreasing expected ROI:
+
+1. **BQ=64 4-wave FA variant.** Halves grid_y (each WG covers 64
+   queries instead of 32) and shares one K/V tile across 4 waves
+   instead of 2. Reduces launch/sync overhead and per-iter K/V DRAM
+   re-reads. VGPRs per wave are stable (~168), so 4 waves × 168 =
+   672 VGPR/SIMD-WG, still leaving 2 WGs/SIMD. Expected: −10 to
+   −20% FA.
+2. **Vectorized b128 LDS loads/stores.** Current K/V loads do 20
+   `ds_store_b16` per thread per tile. Switching to a layout where
+   each thread writes a contiguous 16-byte chunk (1 `ds_store_b128`)
+   needs PAD=96 or 128 (multiple of 8 BF16 ≥ 80). Trade: more LDS,
+   fewer issue slots. Expected: −5 to −10% FA.
+3. **Pack V in [h, d, kv] layout in `kv_transpose`.** smV is
+   transposed [d × kv]; current V_t is [h, kv, d] so the LDS-side
+   transpose costs scattered writes. Pre-transposing in the pack
+   step gives contiguous DRAM reads matching the LDS layout.
+   Expected: small (kv_transpose itself is 1.2% of total).
+4. **88-stride or 96-stride LDS padding** to break bank conflicts on
+   stride-80 reads. Bank cycle is 128 B (= 32 banks × 4 B); 80-byte
+   rows are non-aligned. Matters more after b128 vectorization.
+5. **Faster F32→BF16 cast for hipBLASLt inputs**
+   (`pack_bf16_from_f32` is 4.3% at 88 GB/s effective, far below
+   DRAM peak — small grid suspected). Or fuse the cast into the
+   prior kernel's output.
+6. **Soft caps further along**:
+   - `rope_vision_f32` is scalar; could be vectorized.
+   - `layernorm_f32` could use a wave-cooperative reduction.
+   These are <2% each so worth only after FA is sub-3 ms.
+7. **Apply double-buffer to F16 path.** Currently only the BF16
+   `_2w_pre` is double-buffered; the F16 variant still uses the
+   single-buffer body. Mechanical port (a few hundred lines).
+
+### Files
+
+- Kernels and runner: `rdna4/vlm/hip_vision_encoder.c`
+- Bench/test driver: `rdna4/vlm/test_hip_vision.c`,
+  `rdna4/vlm/test_hip_vlm.c`
+
+Reproduce:
+
+```sh
+HIP_VLM_FA=wmma_bf16_2w_pre ./test_hip_vision \
+    /mnt/disk1/models/qwen36/27b/mmproj-BF16.gguf \
+    --image fujisan.jpg --image-size 1024 \
+    --ref /tmp/vlm_baseline_f32attn.bin --bf16 \
+    --warmup 2 --iters 5
+```
+

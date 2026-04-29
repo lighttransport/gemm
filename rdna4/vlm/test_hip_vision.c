@@ -203,6 +203,7 @@ int main(int argc, char **argv) {
     const char *model_path = argv[1];
     const char *image_path = NULL;
     const char *ref_path = NULL;
+    const char *save_path = NULL;
     int image_size = 0;
     int warmup = 1;
     int iters = 3;
@@ -213,6 +214,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) image_path = argv[++i];
         else if (strcmp(argv[i], "--image-size") == 0 && i + 1 < argc) image_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ref") == 0 && i + 1 < argc) ref_path = argv[++i];
+        else if (strcmp(argv[i], "--save-embd") == 0 && i + 1 < argc) save_path = argv[++i];
         else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iters = atoi(argv[++i]);
         else if (strcmp(argv[i], "--f32") == 0) vision_precision = 0;
@@ -374,6 +376,17 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     if (have_ref) rc = compare_ref(last, n_tokens, total_embd, &ref);
+    if (save_path) {
+        FILE *f = fopen(save_path, "wb");
+        if (!f) { fprintf(stderr, "save-embd: cannot open %s\n", save_path); }
+        else {
+            int32_t hdr[4] = { n_tokens, total_embd, target_w, target_h };
+            fwrite(hdr, sizeof(int32_t), 4, f);
+            fwrite(last, sizeof(float), (size_t)n_tokens * total_embd, f);
+            fclose(f);
+            printf("saved embedding -> %s (%d x %d)\n", save_path, n_tokens, total_embd);
+        }
+    }
 
     free(last);
     if (have_ref) free(ref.embd);
