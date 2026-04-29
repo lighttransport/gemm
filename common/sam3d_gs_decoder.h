@@ -135,6 +135,13 @@ int sam3d_gs_decoder_transformer(const sam3d_gs_decoder_model *m,
                                   const sp3d_tensor *x,
                                   float **out_feats,
                                   int n_threads);
+/* Same transformer body, stopping before final no-affine LN + out_layer.
+ * Returns malloc'd [N, dim] hidden features. Used by the mesh decoder,
+ * which shares the sparse transformer trunk with the GS decoder. */
+int sam3d_gs_decoder_hidden_transformer(const sam3d_gs_decoder_model *m,
+                                        const sp3d_tensor *x,
+                                        float **out_h,
+                                        int n_threads);
 
 typedef int (*sam3d_gs_input_ape_hook_fn)(void *user,
                                           const int32_t *coords,
@@ -628,24 +635,13 @@ static void sam3d_gs_windowed_attention(float *out, const float *qkv,
 
 /* ====== Transformer forward ============================================= */
 
-int sam3d_gs_decoder_transformer(const sam3d_gs_decoder_model *m,
-                                  const sp3d_tensor *x,
-                                  float **out_feats,
-                                  int n_threads) {
+int sam3d_gs_decoder_hidden_transformer(const sam3d_gs_decoder_model *m,
+                                        const sp3d_tensor *x,
+                                        float **out_feats,
+                                        int n_threads) {
     if (!m || !x || !out_feats) return -1;
     int N = x->N;
     int D = m->dim;
-    int G = m->out_channels;
-
-    if (g_gs_transformer_hook) {
-        float *hook_out = NULL;
-        if (g_gs_transformer_hook(g_gs_transformer_hook_user, x, m,
-                                  &hook_out) != 0 ||
-            !hook_out)
-            return -9;
-        *out_feats = hook_out;
-        return 0;
-    }
 
     float *h = (float *)malloc((size_t)N * D * sizeof(float));
     if (!h) return -2;
@@ -746,28 +742,56 @@ int sam3d_gs_decoder_transformer(const sam3d_gs_decoder_model *m,
     }
     }
 
+    free(h_norm); free(qkv); free(attn); free(mlp_h);
+    *out_feats = h;
+    return 0;
+}
+
+int sam3d_gs_decoder_transformer(const sam3d_gs_decoder_model *m,
+                                  const sp3d_tensor *x,
+                                  float **out_feats,
+                                  int n_threads) {
+    if (!m || !x || !out_feats) return -1;
+    int N = x->N;
+    int D = m->dim;
+    int G = m->out_channels;
+
+    if (g_gs_transformer_hook) {
+        float *hook_out = NULL;
+        if (g_gs_transformer_hook(g_gs_transformer_hook_user, x, m,
+                                  &hook_out) != 0 ||
+            !hook_out)
+            return -9;
+        *out_feats = hook_out;
+        return 0;
+    }
+
+    float *h = NULL;
+    int rc = sam3d_gs_decoder_hidden_transformer(m, x, &h, n_threads);
+    if (rc != 0 || !h) return rc ? rc : -2;
+
     float *feats_out = NULL;
     if (g_gs_final_layer_hook) {
         if (g_gs_final_layer_hook(g_gs_final_layer_hook_user, h, N, D,
                                   &m->out_w, &m->out_b, G, 1e-5f,
                                   &feats_out) != 0 ||
             !feats_out) {
-            free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
+            free(h);
             return -4;
         }
     } else {
-        /* Final no-affine LN with default pytorch eps=1e-5. */
         float *h_final = (float *)malloc((size_t)N * D * sizeof(float));
+        if (!h_final) { free(h); return -4; }
         sp3d_layernorm(h_final, h, NULL, NULL, N, D, 1e-5f);
 
-        /* out_layer: dim -> 448 */
         feats_out = (float *)malloc((size_t)N * G * sizeof(float));
+        if (!feats_out) { free(h); free(h_final); return -4; }
         sp3d_linear(feats_out, h_final, N, &m->out_w, &m->out_b,
                     G, D, n_threads);
         free(h_final);
     }
 
-    free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
+    free(h);
     *out_feats = feats_out;
     return 0;
 }
