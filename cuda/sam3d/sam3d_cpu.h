@@ -144,6 +144,46 @@ typedef int (*sam3d_cpu_slat_transformer_hook_fn)(void *user,
 void sam3d_cpu_slat_dit_set_transformer_hook(sam3d_cpu_slat_transformer_hook_fn fn,
                                              void *user);
 
+typedef int (*sam3d_cpu_slat_ape_transformer_hook_fn)(void *user,
+                                                      float *feats, int N,
+                                                      const int32_t *coords,
+                                                      const float *t_emb,
+                                                      const float *cond,
+                                                      int n_cond,
+                                                      int dim, int n_blocks);
+void sam3d_cpu_slat_dit_set_ape_transformer_hook(sam3d_cpu_slat_ape_transformer_hook_fn fn,
+                                                 void *user);
+
+typedef int (*sam3d_cpu_slat_input_layer_hook_fn)(void *user,
+                                                  void *xp,
+                                                  const void *input_w,
+                                                  const void *input_b,
+                                                  int out_channels);
+void sam3d_cpu_slat_dit_set_input_layer_hook(sam3d_cpu_slat_input_layer_hook_fn fn,
+                                             void *user);
+
+typedef int (*sam3d_cpu_slat_io_block_hook_fn)(void *user,
+                                               int is_output,
+                                               int block_idx,
+                                               const void *bk,
+                                               void *xp,
+                                               const float *t_emb,
+                                               const int32_t *up_target_coords,
+                                               int up_target_N,
+                                               int dim,
+                                               float ln_eps);
+void sam3d_cpu_slat_dit_set_io_block_hook(sam3d_cpu_slat_io_block_hook_fn fn,
+                                          void *user);
+
+typedef int (*sam3d_cpu_slat_final_layer_hook_fn)(void *user,
+                                                  void *xp,
+                                                  const void *out_w,
+                                                  const void *out_b,
+                                                  int out_channels,
+                                                  float eps);
+void sam3d_cpu_slat_dit_set_final_layer_hook(sam3d_cpu_slat_final_layer_hook_fn fn,
+                                             void *user);
+
 /* Single forward: coords[N,4] (b,z,y,x) i32, feats[N,in_ch] f32, returns
  * malloc'd out_feats[N,out_ch] f32 on success; NULL on failure. */
 float *sam3d_cpu_slat_dit_forward(sam3d_cpu_slat_dit *w,
@@ -184,6 +224,90 @@ void                  sam3d_cpu_gs_decoder_free(sam3d_cpu_gs_decoder *w);
 int sam3d_cpu_gs_decoder_in_channels  (const sam3d_cpu_gs_decoder *w);
 int sam3d_cpu_gs_decoder_out_channels (const sam3d_cpu_gs_decoder *w);
 int sam3d_cpu_gs_decoder_num_gaussians(const sam3d_cpu_gs_decoder *w);
+void *sam3d_cpu_gs_decoder_model(sam3d_cpu_gs_decoder *w);
+
+typedef int (*sam3d_cpu_gs_input_ape_hook_fn)(void *user,
+                                              const int32_t *coords,
+                                              const float *feats,
+                                              int N, int in_channels,
+                                              const void *input_w,
+                                              const void *input_b,
+                                              int dim,
+                                              float **out_h);
+typedef int (*sam3d_cpu_gs_final_layer_hook_fn)(void *user,
+                                                const float *h,
+                                                int N, int dim,
+                                                const void *out_w,
+                                                const void *out_b,
+                                                int out_channels,
+                                                float eps,
+                                                float **out_feats);
+typedef int (*sam3d_cpu_gs_window_attn_hook_fn)(void *user,
+                                                float *out,
+                                                const float *qkv,
+                                                const void *x,
+                                                int window_size,
+                                                const int shift[3],
+                                                int n_heads,
+                                                int head_dim);
+typedef int (*sam3d_cpu_gs_attn_block_hook_fn)(void *user,
+                                               float *h,
+                                               const void *x,
+                                               int N, int dim,
+                                               const void *blk,
+                                               int window_size,
+                                               const int shift[3],
+                                               int n_heads,
+                                               int head_dim,
+                                               float eps);
+typedef int (*sam3d_cpu_gs_mlp_hook_fn)(void *user,
+                                        float *h,
+                                        int N, int dim,
+                                        const void *blk,
+                                        int hidden,
+                                        float eps);
+typedef int (*sam3d_cpu_gs_block_hook_fn)(void *user,
+                                          float *h,
+                                          const void *x,
+                                          int N, int dim,
+                                          const void *blk,
+                                          int window_size,
+                                          const int shift[3],
+                                          int n_heads,
+                                          int head_dim,
+                                          int hidden,
+                                          float eps);
+typedef int (*sam3d_cpu_gs_stack_hook_fn)(void *user,
+                                          float *h,
+                                          const void *x,
+                                          int N, int dim,
+                                          const void *blocks,
+                                          int n_blocks,
+                                          int window_size,
+                                          int n_heads,
+                                          int head_dim,
+                                          int hidden,
+                                          float eps);
+typedef int (*sam3d_cpu_gs_transformer_hook_fn)(void *user,
+                                                const void *x,
+                                                const void *m,
+                                                float **out_feats);
+void sam3d_cpu_gs_decoder_set_input_ape_hook(sam3d_cpu_gs_input_ape_hook_fn fn,
+                                             void *user);
+void sam3d_cpu_gs_decoder_set_final_layer_hook(sam3d_cpu_gs_final_layer_hook_fn fn,
+                                               void *user);
+void sam3d_cpu_gs_decoder_set_window_attn_hook(sam3d_cpu_gs_window_attn_hook_fn fn,
+                                               void *user);
+void sam3d_cpu_gs_decoder_set_attn_block_hook(sam3d_cpu_gs_attn_block_hook_fn fn,
+                                              void *user);
+void sam3d_cpu_gs_decoder_set_mlp_hook(sam3d_cpu_gs_mlp_hook_fn fn,
+                                       void *user);
+void sam3d_cpu_gs_decoder_set_block_hook(sam3d_cpu_gs_block_hook_fn fn,
+                                         void *user);
+void sam3d_cpu_gs_decoder_set_stack_hook(sam3d_cpu_gs_stack_hook_fn fn,
+                                         void *user);
+void sam3d_cpu_gs_decoder_set_transformer_hook(sam3d_cpu_gs_transformer_hook_fn fn,
+                                               void *user);
 
 /* Run the SLAT GS decoder transformer (input_layer + APE + N blocks +
  * out_layer). Returns malloc'd [N × out_channels] f32; caller free()s. */

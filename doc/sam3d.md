@@ -1,6 +1,6 @@
 # SAM 3D Objects — Current State and TODOs
 
-Snapshot: 2026-04-28.
+Snapshot: 2026-04-29.
 
 ## What is sam-3d-objects?
 
@@ -43,7 +43,7 @@ points and accept the same converted safetensors checkpoint.
 | Backend | Path                          | Status                                                                 |
 |---------|-------------------------------|------------------------------------------------------------------------|
 | CPU     | `cpu/sam3d/`                  | All stages green vs pytorch refs. Reference for the CUDA port.         |
-| CUDA    | `cuda/sam3d/` (this document) | NVRTC runner (cuew, no nvcc). DINOv2 + CondFuser + SS Flow DiT (forward + shortcut ODE) GPU-resident; SS-VAE decoder GPU-resident; SLAT prune and SLAT transformer stack are GPU-resident; SLAT sparse IO resblocks and SLAT GS decoder still use CPU fallbacks being kernelized stage by stage. |
+| CUDA    | `cuda/sam3d/` (this document) | NVRTC runner (cuew, no nvcc). DINOv2 + CondFuser + SS Flow DiT (forward + shortcut ODE) GPU-resident; SS-VAE decoder GPU-resident; SLAT prune, input layer, sparse IO resblocks, APE+transformer stack, and final head are GPU-hooked; SLAT GS dense input/APE, full transformer stack, final head, and representation/PLY packing are GPU-hooked. |
 
 CUDA precision is configurable at `cuda_sam3d_create` time via
 `cfg.precision = "fp16" | "bf16" | "fp32"` (currently the GPU-resident
@@ -124,9 +124,9 @@ fallback in the runner.
 | ss_dit (single)| GPU  | fp32      | 1.05e-05             | **Phase 2c.13 GREEN** — `cs3d_ssdit_outer_forward` via runner |
 | ss_dit (ODE)   | GPU  | fp32      | 2.19e-05 @ steps=2   | **Phase 2c.16 GREEN** — upstream sampler semantics: rescale_t=3, reversed=0, d=0, add_flag CFG |
 | ss_decoder     | GPU  | fp32      | 2.77e-04             | **Phase 4b GREEN** — 3D conv + channel-LN + SiLU + pixel-shuffle GPU forward; ~558 ms verifier path |
-| slat_dit       | mix  | fp32      | 4.41e-05             | **Phase 5b.22 GREEN** — hybrid SLAT ODE body plus real-weight CUDA gates for all SLAT IO resblocks; runner sparse IO wiring still pending |
-| slat_gs        | CPU  | fp32      | 7.77e-05             | **Phase 6a GREEN** — CPU fallback. Phase 6b kernelization pending |
-| End-to-end PLY | mix  | fp32      | visual (GS viewer)   | **Phase 7a GREEN** — full sampled path writes 38016 gaussians in 126.92–128.21 s after 5b.17/5b.18; `--slat-ref` smoke writes 8192 gaussians in 2.77 s |
+| slat_dit       | mix  | fp32      | 4.37e-05             | **Phase 5b.28 GREEN** — SLAT APE+transformer hook reuses cached coords when the sparse layout is unchanged across ODE steps; CPU still owns ODE host tensor orchestration and final unnorm |
+| slat_gs        | mix  | fp32      | 1.04e-04             | **Phase 6b.10 GREEN** — full GS transformer consumes the SLAT device mirror in normal E2E and feeds CUDA PLY pack without host feature bounce; debug paths still return host tensors |
+| End-to-end PLY | mix  | fp32      | visual (GS viewer)   | **Phase 7a GREEN** — full sampled path writes 38016 gaussians in 118.12 s after 5b.28/6b.10; `--slat-ref` smoke writes 8192 gaussians in 2.77 s |
 
 ## Phase summaries
 
@@ -243,12 +243,12 @@ inside the CFG interval `[0,500]`, then velocity mixing
 
 ### Next phase — Phase 5b
 
-Continue SLAT Flow DiT kernelization beyond the 5b.22 hybrid
-CPU-sparse-IO / GPU-transformer ODE body with resident cond and hook
-scratch reuse.
+Continue SLAT Flow DiT kernelization beyond the 5b.27 hook-based
+GPU input-layer / sparse-IO / APE-transformer / final-head ODE body
+with resident cond and hook scratch reuse.
 The current end-to-end path is correct enough for pipeline/perf smoke
-but still uses CPU fallback for SLAT sparse IO resblocks and SLAT GS
-decode.
+but still uses CPU host tensor orchestration around SLAT DiT plus CPU
+hook orchestration around the SLAT GS 12-block loop.
 
 ### Phase 5b — SLAT Flow DiT kernelization
 
@@ -411,16 +411,190 @@ projection and two submanifold convs on
 `c_coords_after_input_block_0.npy`, then compares to
 `c_h_after_out_block_1.npy`. Gate against `/tmp/sam3d_ref_5b20`:
 N=1024, C_in=256, C_out=128, dim=1024, max_abs=2.670288e-05,
-mean_abs=1.852996e-06, avg=~0.89 ms over 20 launches. All four SLAT
+mean_abs=1.852996e-06, avg=0.8912 ms over 20 launches. All four SLAT
 IO resblocks now have real-weight CUDA verifier coverage; the next
 step is wiring those verified launch sequences into the SLAT runner
 path.
+Phase 5b.23 wires those verified IO launch sequences into the normal
+CUDA runner through a new `sam3d_slat_dit_set_io_block_hook` boundary.
+The runner keeps persistent device weights and cached kernel handles
+for all four SLAT IO resblocks; each hook invocation uploads the current
+host sparse tensor, runs the CUDA up/downsample + sparse resblock
+sequence, and returns a replacement `sp3d_tensor` to the existing CPU
+ODE scaffolding. `verify_slat_dit` now exercises both the sparse IO hook
+and transformer hook: max_abs=4.863739e-05, mean_abs=4.471638e-06.
+Full sampled CUDA E2E with `--steps 2 --slat-steps 12 --seed 42`
+writes 38016 gaussians to `/tmp/cuda_sam3d_5b23_timed.ply` in
+real=120.65 s (`/usr/bin/time -p`).
+Phase 5b.24 keeps the SLAT sparse IO hook's temporary device buffers
+resident in `cuda_sam3d_ctx`, growing them only when a later sparse
+block needs more capacity. This removes per-block `cuMemAlloc` /
+`cuMemFree` churn for input coords/features, up/downsample outputs,
+coord index, timestep scratch, embedding, skip, and intermediate
+activation buffers. `verify_slat_dit` remains unchanged:
+max_abs=4.863739e-05, mean_abs=4.471638e-06. Full sampled CUDA E2E
+writes 38016 gaussians to `/tmp/cuda_sam3d_5b24_timed.ply` in
+real=120.40 s; the small change from 5b.23 is within expected run
+variance rather than a proven throughput gain.
+Phase 5b.25 moves the final SLAT no-affine layernorm plus
+`out_layer` SparseLinear(128 -> 8) behind a new
+`sam3d_slat_dit_set_final_layer_hook` boundary. The CUDA runner uploads
+the final head weights with the sparse IO weight bundle, reuses the
+persistent IO scratch buffers, and installs the final-head hook beside
+the sparse IO and transformer hooks for both normal ODE and debug
+forward calls. `verify_slat_dit` remains green:
+max_abs=4.875660e-05, mean_abs=4.473753e-06. Full sampled CUDA E2E
+writes 38016 gaussians to `/tmp/cuda_sam3d_5b25_timed.ply` in
+real=120.62 s (`/usr/bin/time -p`), effectively flat versus 5b.24
+because the remaining cost is dominated by the SLAT ODE body and CPU
+GS decoder fallback.
+Phase 5b.26 combines SLAT APE with the existing GPU transformer-stack
+boundary through `sam3d_slat_dit_set_ape_transformer_hook`. The normal
+CUDA path now sends pre-APE features to the runner hook, applies
+`slat_ape_add_f32` on the same device buffer, then runs the 24-block
+SLAT stack before a single DtoH copy. The older post-APE transformer
+hook remains installed as a trace-preserving fallback when
+`SLAT_DIT_TRACE` is enabled. `verify_slat_dit` remains green:
+max_abs=3.898144e-05, mean_abs=4.255785e-06. Full sampled CUDA E2E
+writes 38016 gaussians to `/tmp/cuda_sam3d_5b26_timed.ply` in
+real=120.58 s (`/usr/bin/time -p`), flat versus 5b.25 as expected for
+this small CPU-host pass.
+Phase 5b.27 moves the SLAT `input_layer` SparseLinear(8 -> 128) behind
+`sam3d_slat_dit_set_input_layer_hook`. The CUDA runner uploads
+`input_layer.{weight,bias}` with the sparse IO/final-head bundle and
+reuses the persistent sparse IO scratch for the GEMM. This closes the
+last per-forward dense SLAT layer before the CPU-owned ODE
+orchestration. `verify_slat_dit` remains green:
+max_abs=4.374981e-05, mean_abs=4.012466e-06. Full sampled CUDA E2E
+with 6b.1 writes 38016 gaussians to
+`/tmp/cuda_sam3d_5b27_6b1_timed.ply` in real=120.52 s
+(`/usr/bin/time -p`).
 
 ### Phase 6b — SLAT GS decoder kernelization
 
 Sparse transformer (12 windowed self-attn blocks) + per-voxel decode
 head emitting (xyz_offset, dc_sh, scaling_log, quat, opacity_logit).
 Hammersley sub-sampling is deterministic and runs once on host.
+Phase 6b.1 adds a CUDA fused post-transformer pack:
+`sam3d_gs_pack_ply_f32` consumes GS transformer out_feats [N,448] and
+coords, applies `to_representation`, scaling/opacity biases, stable
+log-softplus scaling activation, and writes final INRIA PLY rows
+[N*32,17]. `verify_slat_gs` now directly compares this CUDA-packed PLY
+against CPU packing: max_abs=3.815e-06, mean_abs=1.005e-07, while the
+existing transformer and representation gates remain green. The GS
+transformer itself is still CPU-backed; next 6b work should move its
+input/APE/final head and then the 12 windowed self-attention blocks.
+Phase 6b.2 moves the dense ends of the GS transformer behind CUDA hooks:
+`sam3d_gs_decoder_set_input_ape_hook` runs input_layer SparseLinear
+(8 -> 768) plus APE on CUDA, and
+`sam3d_gs_decoder_set_final_layer_hook` runs final no-affine LN plus
+out_layer SparseLinear(768 -> 448) on CUDA. The middle 12 shifted
+window sparse transformer blocks remain CPU-backed. `verify_slat_gs`
+remains green: transformer out_feats max_abs=8.249e-05,
+mean_abs=6.375e-06; representation gates remain below threshold; CUDA
+packed PLY vs CPU pack is max_abs=2.861e-06, mean_abs=1.009e-07. Full
+sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_6b2_timed.ply` in real=119.55 s
+(`/usr/bin/time -p`).
+Phase 6b.3 moves the GS shifted-window attention core behind
+`sam3d_gs_decoder_set_window_attn_hook`. The CPU block scaffold still
+computes LN, QKV projection, output projection, MLP, and residual adds,
+but each window's Q/K/V gather, SDPA, and scatter now run through CUDA
+using `sam3d_gs_gather_qkv_window_f32`, `sdpa_f32`, and
+`sam3d_gs_scatter_window_f32`. `verify_slat_gs` remains green:
+transformer out_feats max_abs=1.192e-04, mean_abs=6.456e-06; all
+representation gates remain below threshold; CUDA packed PLY vs CPU
+pack is max_abs=2.861e-06, mean_abs=1.011e-07. Full sampled CUDA E2E
+writes 38016 gaussians to `/tmp/cuda_sam3d_6b3_timed.ply` in
+real=118.72 s (`/usr/bin/time -p`).
+Phase 6b.4 moves each GS block MLP subblock behind
+`sam3d_gs_decoder_set_mlp_hook`. The runner uploads all 12
+`mlp_fc{1,2}` weight/bias pairs persistently, runs no-affine LN,
+GEMM(768 -> 3072), tanh-approx GELU, GEMM(3072 -> 768), and residual
+add on CUDA, then returns the updated block features to the remaining
+CPU scaffold. The CUDA hook deliberately uses `gelu_tanh_inplace_f32`
+because `sp3d_gelu` uses tanh-approx GELU in the AVX2 CPU reference.
+`verify_slat_gs` remains green: transformer out_feats
+max_abs=6.604e-05, mean_abs=4.527e-06; all representation gates remain
+below threshold; CUDA packed PLY vs CPU pack is max_abs=2.861e-06,
+mean_abs=1.011e-07. Full sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_6b4_timed.ply` in real=118.34 s
+(`/usr/bin/time -p`).
+Phase 6b.5 moves each GS self-attention subblock behind
+`sam3d_gs_decoder_set_attn_block_hook`. The runner now uploads all 12
+`attn_qkv` and `attn_out` weight/bias pairs persistently and runs
+no-affine LN, QKV projection, shifted-window Q/K/V gather + SDPA +
+scatter, output projection, and residual add on CUDA before returning
+the updated block features to the CPU-owned loop. This supersedes the
+older inner window-attention-only hook in the normal path, while keeping
+that lower-level hook available as a fallback boundary. `verify_slat_gs`
+remains green: transformer out_feats max_abs=1.040e-04,
+mean_abs=4.753e-06; all representation gates remain below threshold;
+CUDA packed PLY vs CPU pack is max_abs=2.861e-06,
+mean_abs=1.011e-07. Full sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_6b5_timed.ply` in real=118.14 s
+(`/usr/bin/time -p`).
+Phase 6b.6 collapses the GS attention and MLP hooks into one
+`sam3d_gs_decoder_set_block_hook` boundary. The CUDA runner now uploads
+the block input once, runs self-attention and MLP back-to-back on the
+same resident `d_h`, and downloads the updated block features once.
+The lower-level attention-block and MLP hooks remain available as
+fallback/test boundaries, but the normal path uses the fused block hook.
+`verify_slat_gs` is unchanged from 6b.5: transformer out_feats
+max_abs=1.040e-04, mean_abs=4.753e-06; all representation gates remain
+below threshold; CUDA packed PLY vs CPU pack is max_abs=2.861e-06,
+mean_abs=1.011e-07. Full sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_6b6_timed.ply` in real=118.09 s
+(`/usr/bin/time -p`).
+Phase 6b.7 collapses the remaining GS 12-block loop into
+`sam3d_gs_decoder_set_stack_hook`. The CUDA runner uploads post-APE
+features once, executes all 12 shifted-window transformer blocks on the
+same resident `d_h`, and downloads once before the final head hook.
+The block, attention-block, and MLP hooks remain available as fallback
+and test boundaries, but the normal path uses the stack hook.
+`verify_slat_gs` is unchanged from 6b.6: transformer out_feats
+max_abs=1.040e-04, mean_abs=4.753e-06; all representation gates remain
+below threshold; CUDA packed PLY vs CPU pack is max_abs=2.861e-06,
+mean_abs=1.011e-07. Full sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_6b7_timed.ply` in real=118.09 s
+(`/usr/bin/time -p`).
+Phase 6b.8 collapses GS input+APE, the 12-block stack, and final
+no-affine LN/out_layer into a single `sam3d_gs_decoder_set_transformer_hook`
+boundary. The runner keeps activations resident from SparseLinear(8 ->
+768) through final SparseLinear(768 -> 448), then returns only the final
+`[N,448]` tensor to the existing CUDA PLY-pack path. Lower-level GS
+hooks remain available as fallback/test boundaries. `verify_slat_gs`
+is unchanged from 6b.7: transformer out_feats max_abs=1.040e-04,
+mean_abs=4.753e-06; all representation gates remain below threshold;
+CUDA packed PLY vs CPU pack is max_abs=2.861e-06,
+mean_abs=1.011e-07. Full sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_6b8_timed.ply` in real=118.09 s
+(`/usr/bin/time -p`).
+Phase 6b.9 removes the normal E2E `[N,448]` GS host bounce between the
+full-transformer CUDA path and the fused CUDA PLY pack. The transformer
+body is factored into `cs3d_gs_transformer_gpu_forward`, which can leave
+its final out_layer result in `gpu_gs_head_ws.d_out`; the normal
+`cuda_sam3d_run_slat_gs_decode` path now launches `sam3d_gs_pack_ply_f32`
+directly from that device pointer and the resident coords buffer. Debug
+APIs still download `[N,448]` for verifier comparisons. `verify_slat_gs`
+remains unchanged from 6b.8: transformer out_feats max_abs=1.040e-04,
+mean_abs=4.753e-06; CUDA packed PLY vs CPU pack is max_abs=2.861e-06,
+mean_abs=1.011e-07. Full sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_6b9_timed.ply` in real=118.01 s; the file is
+byte-identical to `/tmp/cuda_sam3d_6b8_timed.ply`.
+Phase 5b.28/6b.10 removes two small residual transfers around the
+still-CPU SLAT ODE scaffold. The SLAT APE+transformer hook now caches
+the host coordinate layout and skips repeated HtoD coordinate uploads
+when ODE steps reuse the same sparse transformer layout. The normal GS
+decode path also reuses the `cs3d_adopt_slat` device mirror: when
+`cuda_sam3d_run_slat_gs_decode` consumes the runner-owned SLAT output,
+`cs3d_gs_transformer_gpu_forward` DtoD-copies coords/features from
+`d_slat_coords`/`d_slat_feats` instead of uploading them from host.
+`verify_slat_dit` remains green with max_abs=4.374981e-05,
+mean_abs=4.012466e-06; `verify_slat_gs` remains unchanged from 6b.9.
+Full sampled CUDA E2E writes 38016 gaussians to
+`/tmp/cuda_sam3d_5b28_6b10_timed.ply` in real=118.12 s; the PLY is
+byte-identical to `/tmp/cuda_sam3d_6b9_timed.ply`.
 
 ### v1 deferred
 

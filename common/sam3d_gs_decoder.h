@@ -136,6 +136,89 @@ int sam3d_gs_decoder_transformer(const sam3d_gs_decoder_model *m,
                                   float **out_feats,
                                   int n_threads);
 
+typedef int (*sam3d_gs_input_ape_hook_fn)(void *user,
+                                          const int32_t *coords,
+                                          const float *feats,
+                                          int N, int in_channels,
+                                          const qtensor *input_w,
+                                          const qtensor *input_b,
+                                          int dim,
+                                          float **out_h);
+typedef int (*sam3d_gs_final_layer_hook_fn)(void *user,
+                                            const float *h,
+                                            int N, int dim,
+                                            const qtensor *out_w,
+                                            const qtensor *out_b,
+                                            int out_channels,
+                                            float eps,
+                                            float **out_feats);
+typedef int (*sam3d_gs_window_attn_hook_fn)(void *user,
+                                            float *out,
+                                            const float *qkv,
+                                            const sp3d_tensor *x,
+                                            int window_size,
+                                            const int shift[3],
+                                            int n_heads,
+                                            int head_dim);
+typedef int (*sam3d_gs_attn_block_hook_fn)(void *user,
+                                           float *h,
+                                           const sp3d_tensor *x,
+                                           int N, int dim,
+                                           const sam3d_gs_block *blk,
+                                           int window_size,
+                                           const int shift[3],
+                                           int n_heads,
+                                           int head_dim,
+                                           float eps);
+typedef int (*sam3d_gs_mlp_hook_fn)(void *user,
+                                    float *h,
+                                    int N, int dim,
+                                    const sam3d_gs_block *blk,
+                                    int hidden,
+                                    float eps);
+typedef int (*sam3d_gs_block_hook_fn)(void *user,
+                                      float *h,
+                                      const sp3d_tensor *x,
+                                      int N, int dim,
+                                      const sam3d_gs_block *blk,
+                                      int window_size,
+                                      const int shift[3],
+                                      int n_heads,
+                                      int head_dim,
+                                      int hidden,
+                                      float eps);
+typedef int (*sam3d_gs_stack_hook_fn)(void *user,
+                                      float *h,
+                                      const sp3d_tensor *x,
+                                      int N, int dim,
+                                      const sam3d_gs_block *blocks,
+                                      int n_blocks,
+                                      int window_size,
+                                      int n_heads,
+                                      int head_dim,
+                                      int hidden,
+                                      float eps);
+typedef int (*sam3d_gs_transformer_hook_fn)(void *user,
+                                            const sp3d_tensor *x,
+                                            const sam3d_gs_decoder_model *m,
+                                            float **out_feats);
+void sam3d_gs_decoder_set_input_ape_hook(sam3d_gs_input_ape_hook_fn fn,
+                                         void *user);
+void sam3d_gs_decoder_set_final_layer_hook(sam3d_gs_final_layer_hook_fn fn,
+                                           void *user);
+void sam3d_gs_decoder_set_window_attn_hook(sam3d_gs_window_attn_hook_fn fn,
+                                           void *user);
+void sam3d_gs_decoder_set_attn_block_hook(sam3d_gs_attn_block_hook_fn fn,
+                                          void *user);
+void sam3d_gs_decoder_set_mlp_hook(sam3d_gs_mlp_hook_fn fn,
+                                   void *user);
+void sam3d_gs_decoder_set_block_hook(sam3d_gs_block_hook_fn fn,
+                                     void *user);
+void sam3d_gs_decoder_set_stack_hook(sam3d_gs_stack_hook_fn fn,
+                                     void *user);
+void sam3d_gs_decoder_set_transformer_hook(sam3d_gs_transformer_hook_fn fn,
+                                           void *user);
+
 /* Apply to_representation on [N, 448] feats. Each output pointer may be
  * NULL to skip. Output shapes: xyz [N*G, 3] in (z,y,x) order matching the
  * pytorch ref; dc [N*G, 1, 3]; scaling [N*G, 3]; rotation [N*G, 4];
@@ -166,6 +249,79 @@ int sam3d_gs_decoder_to_representation(const sam3d_gs_decoder_model *m,
 #define CPU_COMPUTE_IMPLEMENTATION
 #include "cpu_compute.h"
 #endif
+
+static sam3d_gs_input_ape_hook_fn g_gs_input_ape_hook = NULL;
+static void *g_gs_input_ape_hook_user = NULL;
+static sam3d_gs_final_layer_hook_fn g_gs_final_layer_hook = NULL;
+static void *g_gs_final_layer_hook_user = NULL;
+static sam3d_gs_window_attn_hook_fn g_gs_window_attn_hook = NULL;
+static void *g_gs_window_attn_hook_user = NULL;
+static sam3d_gs_attn_block_hook_fn g_gs_attn_block_hook = NULL;
+static void *g_gs_attn_block_hook_user = NULL;
+static sam3d_gs_mlp_hook_fn g_gs_mlp_hook = NULL;
+static void *g_gs_mlp_hook_user = NULL;
+static sam3d_gs_block_hook_fn g_gs_block_hook = NULL;
+static void *g_gs_block_hook_user = NULL;
+static sam3d_gs_stack_hook_fn g_gs_stack_hook = NULL;
+static void *g_gs_stack_hook_user = NULL;
+static sam3d_gs_transformer_hook_fn g_gs_transformer_hook = NULL;
+static void *g_gs_transformer_hook_user = NULL;
+
+void sam3d_gs_decoder_set_input_ape_hook(sam3d_gs_input_ape_hook_fn fn,
+                                         void *user)
+{
+    g_gs_input_ape_hook = fn;
+    g_gs_input_ape_hook_user = user;
+}
+
+void sam3d_gs_decoder_set_final_layer_hook(sam3d_gs_final_layer_hook_fn fn,
+                                           void *user)
+{
+    g_gs_final_layer_hook = fn;
+    g_gs_final_layer_hook_user = user;
+}
+
+void sam3d_gs_decoder_set_window_attn_hook(sam3d_gs_window_attn_hook_fn fn,
+                                           void *user)
+{
+    g_gs_window_attn_hook = fn;
+    g_gs_window_attn_hook_user = user;
+}
+
+void sam3d_gs_decoder_set_attn_block_hook(sam3d_gs_attn_block_hook_fn fn,
+                                          void *user)
+{
+    g_gs_attn_block_hook = fn;
+    g_gs_attn_block_hook_user = user;
+}
+
+void sam3d_gs_decoder_set_mlp_hook(sam3d_gs_mlp_hook_fn fn,
+                                   void *user)
+{
+    g_gs_mlp_hook = fn;
+    g_gs_mlp_hook_user = user;
+}
+
+void sam3d_gs_decoder_set_block_hook(sam3d_gs_block_hook_fn fn,
+                                     void *user)
+{
+    g_gs_block_hook = fn;
+    g_gs_block_hook_user = user;
+}
+
+void sam3d_gs_decoder_set_stack_hook(sam3d_gs_stack_hook_fn fn,
+                                     void *user)
+{
+    g_gs_stack_hook = fn;
+    g_gs_stack_hook_user = user;
+}
+
+void sam3d_gs_decoder_set_transformer_hook(sam3d_gs_transformer_hook_fn fn,
+                                           void *user)
+{
+    g_gs_transformer_hook = fn;
+    g_gs_transformer_hook_user = user;
+}
 
 static int sam3d_gs_load_block(st_context *ctx, int idx, sam3d_gs_block *b) {
     char buf[256];
@@ -422,6 +578,11 @@ static void sam3d_gs_windowed_attention(float *out, const float *qkv,
                                          int window_size, const int shift[3],
                                          int n_heads, int head_dim,
                                          int n_threads) {
+    if (g_gs_window_attn_hook &&
+        g_gs_window_attn_hook(g_gs_window_attn_hook_user, out, qkv, x,
+                              window_size, shift, n_heads, head_dim) == 0)
+        return;
+
     int dim = n_heads * head_dim;
     int qkv_stride = 3 * dim;
 
@@ -476,15 +637,35 @@ int sam3d_gs_decoder_transformer(const sam3d_gs_decoder_model *m,
     int D = m->dim;
     int G = m->out_channels;
 
+    if (g_gs_transformer_hook) {
+        float *hook_out = NULL;
+        if (g_gs_transformer_hook(g_gs_transformer_hook_user, x, m,
+                                  &hook_out) != 0 ||
+            !hook_out)
+            return -9;
+        *out_feats = hook_out;
+        return 0;
+    }
+
     float *h = (float *)malloc((size_t)N * D * sizeof(float));
     if (!h) return -2;
 
     /* 1. input_layer: 8 -> 768 */
-    sp3d_linear(h, x->feats, N, &m->input_w, &m->input_b,
-                D, m->in_channels, n_threads);
+    if (g_gs_input_ape_hook) {
+        free(h);
+        h = NULL;
+        if (g_gs_input_ape_hook(g_gs_input_ape_hook_user, x->coords,
+                                x->feats, N, m->in_channels,
+                                &m->input_w, &m->input_b, D, &h) != 0 ||
+            !h)
+            return -2;
+    } else {
+        sp3d_linear(h, x->feats, N, &m->input_w, &m->input_b,
+                    D, m->in_channels, n_threads);
 
-    /* 2. h += pos_embedder(coords[:,1:]) */
-    sam3d_gs_ape_add(h, x->coords, N, D, 3);
+        /* 2. h += pos_embedder(coords[:,1:]) */
+        sam3d_gs_ape_add(h, x->coords, N, D, 3);
+    }
 
     /* Scratch buffers reused across blocks. */
     float *h_norm = (float *)malloc((size_t)N * D * sizeof(float));
@@ -497,46 +678,96 @@ int sam3d_gs_decoder_transformer(const sam3d_gs_decoder_model *m,
         return -3;
     }
 
-    for (int b = 0; b < m->n_blocks; b++) {
-        const sam3d_gs_block *blk = &m->blocks[b];
-        int shift_v = (b & 1) ? (m->window_size / 2) : 0;
-        int shift[3] = {shift_v, shift_v, shift_v};
+    if (g_gs_stack_hook) {
+        if (g_gs_stack_hook(g_gs_stack_hook_user, h, x, N, D,
+                            m->blocks, m->n_blocks, m->window_size,
+                            m->n_heads, m->head_dim, mlp_hidden,
+                            1e-6f) != 0) {
+            free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
+            return -8;
+        }
+    } else {
+        for (int b = 0; b < m->n_blocks; b++) {
+            const sam3d_gs_block *blk = &m->blocks[b];
+            int shift_v = (b & 1) ? (m->window_size / 2) : 0;
+            int shift[3] = {shift_v, shift_v, shift_v};
+
+        if (g_gs_block_hook) {
+            if (g_gs_block_hook(g_gs_block_hook_user, h, x,
+                                N, D, blk, m->window_size, shift,
+                                m->n_heads, m->head_dim, mlp_hidden,
+                                1e-6f) != 0) {
+                free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
+                return -7;
+            }
+            continue;
+        }
 
         /* --- Self-attn subblock --- */
-        /* norm1 (no affine, eps=1e-6) */
-        sp3d_layernorm(h_norm, h, NULL, NULL, N, D, 1e-6f);
-        /* attn.to_qkv: dim -> 3*dim */
-        sp3d_linear(qkv, h_norm, N, &blk->attn_qkv_w, &blk->attn_qkv_b,
-                    3 * D, D, n_threads);
-        /* Windowed sparse self-attention */
-        sam3d_gs_windowed_attention(attn, qkv, x,
-                                     m->window_size, shift,
-                                     m->n_heads, m->head_dim, n_threads);
-        /* attn.to_out: dim -> dim, into h_norm for re-use, then residual */
-        sp3d_linear(h_norm, attn, N, &blk->attn_out_w, &blk->attn_out_b,
-                    D, D, n_threads);
-        for (int i = 0; i < N * D; i++) h[i] += h_norm[i];
+        if (g_gs_attn_block_hook) {
+            if (g_gs_attn_block_hook(g_gs_attn_block_hook_user, h, x,
+                                     N, D, blk, m->window_size, shift,
+                                     m->n_heads, m->head_dim, 1e-6f) != 0) {
+                free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
+                return -6;
+            }
+        } else {
+            /* norm1 (no affine, eps=1e-6) */
+            sp3d_layernorm(h_norm, h, NULL, NULL, N, D, 1e-6f);
+            /* attn.to_qkv: dim -> 3*dim */
+            sp3d_linear(qkv, h_norm, N, &blk->attn_qkv_w, &blk->attn_qkv_b,
+                        3 * D, D, n_threads);
+            /* Windowed sparse self-attention */
+            sam3d_gs_windowed_attention(attn, qkv, x,
+                                         m->window_size, shift,
+                                         m->n_heads, m->head_dim, n_threads);
+            /* attn.to_out: dim -> dim, into h_norm for re-use, then residual */
+            sp3d_linear(h_norm, attn, N, &blk->attn_out_w, &blk->attn_out_b,
+                        D, D, n_threads);
+            for (int i = 0; i < N * D; i++) h[i] += h_norm[i];
+        }
 
         /* --- MLP subblock --- */
-        sp3d_layernorm(h_norm, h, NULL, NULL, N, D, 1e-6f);
-        sp3d_linear(mlp_h, h_norm, N, &blk->mlp_fc1_w, &blk->mlp_fc1_b,
-                    mlp_hidden, D, n_threads);
-        sp3d_gelu(mlp_h, N * mlp_hidden);
-        sp3d_linear(h_norm, mlp_h, N, &blk->mlp_fc2_w, &blk->mlp_fc2_b,
-                    D, mlp_hidden, n_threads);
-        for (int i = 0; i < N * D; i++) h[i] += h_norm[i];
+        if (g_gs_mlp_hook) {
+            if (g_gs_mlp_hook(g_gs_mlp_hook_user, h, N, D, blk,
+                              mlp_hidden, 1e-6f) != 0) {
+                free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
+                return -5;
+            }
+        } else {
+            sp3d_layernorm(h_norm, h, NULL, NULL, N, D, 1e-6f);
+            sp3d_linear(mlp_h, h_norm, N, &blk->mlp_fc1_w, &blk->mlp_fc1_b,
+                        mlp_hidden, D, n_threads);
+            sp3d_gelu(mlp_h, N * mlp_hidden);
+            sp3d_linear(h_norm, mlp_h, N, &blk->mlp_fc2_w, &blk->mlp_fc2_b,
+                        D, mlp_hidden, n_threads);
+            for (int i = 0; i < N * D; i++) h[i] += h_norm[i];
+        }
+    }
     }
 
-    /* Final no-affine LN with default pytorch eps=1e-5. */
-    float *h_final = (float *)malloc((size_t)N * D * sizeof(float));
-    sp3d_layernorm(h_final, h, NULL, NULL, N, D, 1e-5f);
+    float *feats_out = NULL;
+    if (g_gs_final_layer_hook) {
+        if (g_gs_final_layer_hook(g_gs_final_layer_hook_user, h, N, D,
+                                  &m->out_w, &m->out_b, G, 1e-5f,
+                                  &feats_out) != 0 ||
+            !feats_out) {
+            free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
+            return -4;
+        }
+    } else {
+        /* Final no-affine LN with default pytorch eps=1e-5. */
+        float *h_final = (float *)malloc((size_t)N * D * sizeof(float));
+        sp3d_layernorm(h_final, h, NULL, NULL, N, D, 1e-5f);
 
-    /* out_layer: dim -> 448 */
-    float *feats_out = (float *)malloc((size_t)N * G * sizeof(float));
-    sp3d_linear(feats_out, h_final, N, &m->out_w, &m->out_b,
-                G, D, n_threads);
+        /* out_layer: dim -> 448 */
+        feats_out = (float *)malloc((size_t)N * G * sizeof(float));
+        sp3d_linear(feats_out, h_final, N, &m->out_w, &m->out_b,
+                    G, D, n_threads);
+        free(h_final);
+    }
 
-    free(h); free(h_norm); free(qkv); free(attn); free(mlp_h); free(h_final);
+    free(h); free(h_norm); free(qkv); free(attn); free(mlp_h);
     *out_feats = feats_out;
     return 0;
 }

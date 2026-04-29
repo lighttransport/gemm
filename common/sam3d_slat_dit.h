@@ -169,6 +169,56 @@ typedef int (*sam3d_slat_dit_transformer_hook_fn)(void *user,
 void sam3d_slat_dit_set_transformer_hook(sam3d_slat_dit_transformer_hook_fn fn,
                                          void *user);
 
+/* Optional hook for replacing APE + all transformer blocks as one device
+ * boundary. This avoids doing APE on host before a GPU transformer hook.
+ * The hook receives pre-APE feats and must leave post-transformer feats. */
+typedef int (*sam3d_slat_dit_ape_transformer_hook_fn)(void *user,
+                                                      float *feats, int N,
+                                                      const int32_t *coords,
+                                                      const float *t_emb,
+                                                      const float *cond,
+                                                      int n_cond,
+                                                      int dim, int n_blocks);
+void sam3d_slat_dit_set_ape_transformer_hook(sam3d_slat_dit_ape_transformer_hook_fn fn,
+                                             void *user);
+
+/* Optional hook for input_layer SparseLinear(8 -> io_block_channels[0]).
+ * The hook must replace *xp features with width out_channels. */
+typedef int (*sam3d_slat_dit_input_layer_hook_fn)(void *user,
+                                                  sp3d_tensor **xp,
+                                                  const qtensor *input_w,
+                                                  const qtensor *input_b,
+                                                  int out_channels);
+void sam3d_slat_dit_set_input_layer_hook(sam3d_slat_dit_input_layer_hook_fn fn,
+                                         void *user);
+
+/* Optional hook for replacing individual sparse IO SparseResBlock3d calls.
+ * The hook must mutate *xp exactly like slat_resblock_forward: apply any
+ * up/down sampling, replace coords/features, and preserve batch_size. */
+typedef int (*sam3d_slat_dit_io_block_hook_fn)(void *user,
+                                               int is_output,
+                                               int block_idx,
+                                               const sam3d_slat_io_block *bk,
+                                               sp3d_tensor **xp,
+                                               const float *t_emb,
+                                               const int32_t *up_target_coords,
+                                               int up_target_N,
+                                               int dim,
+                                               float ln_eps);
+void sam3d_slat_dit_set_io_block_hook(sam3d_slat_dit_io_block_hook_fn fn,
+                                      void *user);
+
+/* Optional hook for the final no-affine LayerNorm + SparseLinear out_layer.
+ * The hook must replace *xp features with width out_channels. */
+typedef int (*sam3d_slat_dit_final_layer_hook_fn)(void *user,
+                                                  sp3d_tensor **xp,
+                                                  const qtensor *out_w,
+                                                  const qtensor *out_b,
+                                                  int out_channels,
+                                                  float eps);
+void sam3d_slat_dit_set_final_layer_hook(sam3d_slat_dit_final_layer_hook_fn fn,
+                                         void *user);
+
 #ifdef __cplusplus
 }
 #endif
@@ -182,12 +232,48 @@ void sam3d_slat_dit_set_transformer_hook(sam3d_slat_dit_transformer_hook_fn fn,
 
 static sam3d_slat_dit_transformer_hook_fn g_slat_transformer_hook = NULL;
 static void *g_slat_transformer_hook_user = NULL;
+static sam3d_slat_dit_ape_transformer_hook_fn g_slat_ape_transformer_hook = NULL;
+static void *g_slat_ape_transformer_hook_user = NULL;
+static sam3d_slat_dit_input_layer_hook_fn g_slat_input_layer_hook = NULL;
+static void *g_slat_input_layer_hook_user = NULL;
+static sam3d_slat_dit_io_block_hook_fn g_slat_io_block_hook = NULL;
+static void *g_slat_io_block_hook_user = NULL;
+static sam3d_slat_dit_final_layer_hook_fn g_slat_final_layer_hook = NULL;
+static void *g_slat_final_layer_hook_user = NULL;
 
 void sam3d_slat_dit_set_transformer_hook(sam3d_slat_dit_transformer_hook_fn fn,
                                          void *user)
 {
     g_slat_transformer_hook = fn;
     g_slat_transformer_hook_user = user;
+}
+
+void sam3d_slat_dit_set_ape_transformer_hook(sam3d_slat_dit_ape_transformer_hook_fn fn,
+                                             void *user)
+{
+    g_slat_ape_transformer_hook = fn;
+    g_slat_ape_transformer_hook_user = user;
+}
+
+void sam3d_slat_dit_set_input_layer_hook(sam3d_slat_dit_input_layer_hook_fn fn,
+                                         void *user)
+{
+    g_slat_input_layer_hook = fn;
+    g_slat_input_layer_hook_user = user;
+}
+
+void sam3d_slat_dit_set_io_block_hook(sam3d_slat_dit_io_block_hook_fn fn,
+                                      void *user)
+{
+    g_slat_io_block_hook = fn;
+    g_slat_io_block_hook_user = user;
+}
+
+void sam3d_slat_dit_set_final_layer_hook(sam3d_slat_dit_final_layer_hook_fn fn,
+                                         void *user)
+{
+    g_slat_final_layer_hook = fn;
+    g_slat_final_layer_hook_user = user;
 }
 
 /* ---- Loader: io_block (input or out) ---- */
@@ -691,12 +777,20 @@ int sam3d_slat_dit_forward(const sam3d_slat_dit_model *m,
 
     /* --- input_layer: SparseLinear(C_in=8 → 128) on x->feats --- */
     int io_C0 = m->input_blocks[0].C_in;     /* 128 */
-    float *h0 = (float *)malloc((size_t)x->N * io_C0 * sizeof(float));
-    sp3d_linear(h0, x->feats, x->N, &m->input_w, &m->input_b,
-                io_C0, m->in_channels, nthr);
-    free(x->feats);
-    x->feats = h0;
-    x->C = io_C0;
+    if (g_slat_input_layer_hook) {
+        if (g_slat_input_layer_hook(g_slat_input_layer_hook_user, &x,
+                                    &m->input_w, &m->input_b, io_C0) != 0) {
+            fprintf(stderr, "slat: input layer hook failed\n");
+            *xp = x; return -1;
+        }
+    } else {
+        float *h0 = (float *)malloc((size_t)x->N * io_C0 * sizeof(float));
+        sp3d_linear(h0, x->feats, x->N, &m->input_w, &m->input_b,
+                    io_C0, m->in_channels, nthr);
+        free(x->feats);
+        x->feats = h0;
+        x->C = io_C0;
+    }
     if (do_trace) {
         int sh[2] = {x->N, io_C0};
         slat_trace_npy(tdir, "c_h_after_input_layer", x->feats, 2, sh);
@@ -710,7 +804,12 @@ int sam3d_slat_dit_forward(const sam3d_slat_dit_model *m,
     int       *skip_N      = (int       *)calloc((size_t)n_io, sizeof(int));
     int       *skip_C      = (int       *)calloc((size_t)n_io, sizeof(int));
     for (int i = 0; i < n_io; i++) {
-        if (slat_resblock_forward(m, &m->input_blocks[i], &x, t_emb, NULL, 0, nthr) != 0) {
+        int brc = g_slat_io_block_hook
+            ? g_slat_io_block_hook(g_slat_io_block_hook_user, 0, i,
+                                   &m->input_blocks[i], &x, t_emb,
+                                   NULL, 0, dim, m->ln_eps)
+            : slat_resblock_forward(m, &m->input_blocks[i], &x, t_emb, NULL, 0, nthr);
+        if (brc != 0) {
             fprintf(stderr, "slat: input_block[%d] failed\n", i);
             *xp = x; return -2;
         }
@@ -733,15 +832,25 @@ int sam3d_slat_dit_forward(const sam3d_slat_dit_model *m,
         }
     }
 
-    /* --- APE pos emb (added to feats) --- */
-    slat_apply_ape(x->feats, x->coords, x->N, dim);
-    if (do_trace) {
-        int sh[2] = {x->N, dim};
-        slat_trace_npy(tdir, "c_h_after_ape", x->feats, 2, sh);
+    /* --- APE pos emb + Transformer blocks --- */
+    if (g_slat_ape_transformer_hook && !do_trace) {
+        if (g_slat_ape_transformer_hook(g_slat_ape_transformer_hook_user,
+                                        x->feats, x->N, x->coords,
+                                        t_emb, cond, n_cond, dim,
+                                        m->n_blocks) != 0) {
+            fprintf(stderr, "slat: APE+transformer hook failed\n");
+            *xp = x; return -3;
+        }
+    } else {
+        slat_apply_ape(x->feats, x->coords, x->N, dim);
+        if (do_trace) {
+            int sh[2] = {x->N, dim};
+            slat_trace_npy(tdir, "c_h_after_ape", x->feats, 2, sh);
+        }
     }
 
-    /* --- Transformer blocks --- */
-    if (g_slat_transformer_hook) {
+    if (!g_slat_ape_transformer_hook || do_trace) {
+      if (g_slat_transformer_hook) {
         if (g_slat_transformer_hook(g_slat_transformer_hook_user,
                                     x->feats, x->N, x->coords,
                                     t_emb, cond, n_cond, dim, m->n_blocks) != 0) {
@@ -752,7 +861,7 @@ int sam3d_slat_dit_forward(const sam3d_slat_dit_model *m,
             int sh[2] = {x->N, dim};
             slat_trace_npy(tdir, "c_h_after_block_23", x->feats, 2, sh);
         }
-    } else {
+      } else {
         for (int b = 0; b < m->n_blocks; b++) {
             if (slat_transformer_block(m, &m->blocks[b], x, t_emb, cond, n_cond, nthr) != 0) {
                 fprintf(stderr, "slat: transformer block[%d] failed\n", b);
@@ -764,6 +873,7 @@ int sam3d_slat_dit_forward(const sam3d_slat_dit_model *m,
                 slat_trace_npy(tdir, nm, x->feats, 2, sh);
             }
         }
+      }
     }
 
     /* --- out_blocks (skip-concat reversed) --- */
@@ -804,7 +914,12 @@ int sam3d_slat_dit_forward(const sam3d_slat_dit_model *m,
             up_target_coords = skip_coords[next_si];
             up_target_N      = skip_N[next_si];
         }
-        if (slat_resblock_forward(m, bk, &x, t_emb, up_target_coords, up_target_N, nthr) != 0) {
+        int brc = g_slat_io_block_hook
+            ? g_slat_io_block_hook(g_slat_io_block_hook_user, 1, oi,
+                                   bk, &x, t_emb, up_target_coords,
+                                   up_target_N, dim, m->ln_eps)
+            : slat_resblock_forward(m, bk, &x, t_emb, up_target_coords, up_target_N, nthr);
+        if (brc != 0) {
             fprintf(stderr, "slat: out_block[%d] failed\n", oi);
             *xp = x; return -6;
         }
@@ -815,19 +930,28 @@ int sam3d_slat_dit_forward(const sam3d_slat_dit_model *m,
         }
     }
 
-    /* --- F.layer_norm (no affine) on last dim --- */
-    float *ln = (float *)malloc((size_t)x->N * x->C * sizeof(float));
-    ssdit_layernorm(ln, x->feats, NULL, NULL, NULL, NULL, x->N, x->C, 1e-5f);
-    free(x->feats);
-    x->feats = ln;
+    if (g_slat_final_layer_hook) {
+        if (g_slat_final_layer_hook(g_slat_final_layer_hook_user, &x,
+                                    &m->out_w, &m->out_b,
+                                    m->out_channels, 1e-5f) != 0) {
+            fprintf(stderr, "slat: final layer hook failed\n");
+            *xp = x; return -7;
+        }
+    } else {
+        /* --- F.layer_norm (no affine) on last dim --- */
+        float *ln = (float *)malloc((size_t)x->N * x->C * sizeof(float));
+        ssdit_layernorm(ln, x->feats, NULL, NULL, NULL, NULL, x->N, x->C, 1e-5f);
+        free(x->feats);
+        x->feats = ln;
 
-    /* --- out_layer: SparseLinear(128 → 8) --- */
-    float *yo = (float *)malloc((size_t)x->N * m->out_channels * sizeof(float));
-    sp3d_linear(yo, x->feats, x->N, &m->out_w, &m->out_b,
-                m->out_channels, x->C, nthr);
-    free(x->feats);
-    x->feats = yo;
-    x->C = m->out_channels;
+        /* --- out_layer: SparseLinear(128 → 8) --- */
+        float *yo = (float *)malloc((size_t)x->N * m->out_channels * sizeof(float));
+        sp3d_linear(yo, x->feats, x->N, &m->out_w, &m->out_b,
+                    m->out_channels, x->C, nthr);
+        free(x->feats);
+        x->feats = yo;
+        x->C = m->out_channels;
+    }
 
     for (int i = 0; i < n_io; i++) { free(skip_feats[i]); free(skip_coords[i]); }
     free(skip_feats); free(skip_coords); free(skip_N); free(skip_C);
