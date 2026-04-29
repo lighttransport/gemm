@@ -21,6 +21,10 @@
 #include <math.h>
 #include <dlfcn.h>
 
+extern int  mm0_extracted_init(int M, int N, int K, const void *d_bias);
+extern int  mm0_extracted_run(void *d_y, const void *d_w, const void *d_x);
+extern int  mm0_extracted_destroy(void);
+
 /* Aliases for shared macros */
 #define CHECK_HIP HIP_CHECK
 #define CHECK_HIP_NULL HIP_CHECK_NULL
@@ -658,6 +662,885 @@ static const char *hip_vlm_specific_kernels =
 "#undef FA_DYN_BKV\n"
 "#undef FA_DYN_MAX_HD\n"
 "\n"
+"/* ==== flash_attn_wmma_*: WMMA-accelerated FlashAttention ====              */\n"
+"/* Each WG = 1 wave (32 threads) processing 1 head x BQ=16 queries.           */\n"
+"/* Tiles: BQ=16, BKV=16. WMMA 16x16x16; head_dim padded to FA_WM_HD_PAD=80    */\n"
+"/* (covers head_dim in {16,32,...,80}; suits Qwen3.6 head_dim=72).             */\n"
+"#define FA_WM_HD_PAD 80\n"
+"#define FA_WM_K_NB 5      /* HD_PAD / 16 */\n"
+"#define FA_WM_BQ 16\n"
+"#define FA_WM_BKV 16\n"
+"\n"
+"__global__ void flash_attn_wmma_bf16(float *out, const float *qkv,\n"
+"    const float *K_t, const float *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FA_WM_BQ;\n"
+"    int tid = threadIdx.x;\n"
+"    int half = tid >> 4;\n"
+"    int idx  = tid & 15;\n"
+"    int dim3 = 3 * dim;\n"
+"    extern __shared__ unsigned short smem_b[];\n"
+"    unsigned short *smK = smem_b;                      /* [16 x HD_PAD]      */\n"
+"    unsigned short *smV = smK + 16 * FA_WM_HD_PAD;     /* [HD_PAD x 16] V^T  */\n"
+"    unsigned short *smP = smV + FA_WM_HD_PAD * 16;     /* [16 x 16] BF16 P   */\n"
+"\n"
+"    /* Q tile [16 x HD_PAD] -> registers, pre-scaled, BF16. */\n"
+"    bf16x8 q_reg[FA_WM_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = kb * 16 + half * 8 + i;\n"
+"            int row = q0 + idx;\n"
+"            float v = 0.0f;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                v = qkv[(size_t)row * dim3 + h * head_dim + d];\n"
+"            }\n"
+"            q_reg[kb][i] = f32_to_bf16_bits(v * scale);\n"
+"        }\n"
+"    }\n"
+"\n"
+"    float8 O_acc[FA_WM_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM_K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"\n"
+"    int n_kv = (n_tok + FA_WM_BKV - 1) / FA_WM_BKV;\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        int kv0 = t * FA_WM_BKV;\n"
+"        for (int e = tid; e < 16 * FA_WM_HD_PAD; e += 32) {\n"
+"            int kv_row = e / FA_WM_HD_PAD;\n"
+"            int d = e % FA_WM_HD_PAD;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = K_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smK[kv_row * FA_WM_HD_PAD + d] = f32_to_bf16_bits(v);\n"
+"        }\n"
+"        for (int e = tid; e < FA_WM_HD_PAD * 16; e += 32) {\n"
+"            int d = e / 16;\n"
+"            int kv_row = e & 15;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = V_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smV[d * 16 + kv_row] = f32_to_bf16_bits(v);\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        /* QK^T: D[m,n=kv_row] = sum_d Q[m,d]*K[kv_row,d] */\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"            bf16x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK[idx * FA_WM_HD_PAD + dpos];\n"
+"            }\n"
+"            score = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(q_reg[kb], b_K, score);\n"
+"        }\n"
+"        bool col_valid = (kv0 + idx) < n_tok;\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            score[i] = col_valid ? score[i] : -1e30f;\n"
+"        }\n"
+"        /* Online softmax: reduce max + sum across 16 lanes within same half. */\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < FA_WM_K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP[m_row * 16 + n_col] = f32_to_bf16_bits(score[i]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        /* P @ V: O[m,d] += sum_kv P[m,kv]*V_T[d,kv] */\n"
+"        bf16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"            bf16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV[d_col * 16 + kv_k];\n"
+"            }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"\n"
+"    for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q0 + m_row;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void flash_attn_wmma_f16(float *out, const float *qkv,\n"
+"    const float *K_t, const float *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FA_WM_BQ;\n"
+"    int tid = threadIdx.x;\n"
+"    int half = tid >> 4;\n"
+"    int idx  = tid & 15;\n"
+"    int dim3 = 3 * dim;\n"
+"    extern __shared__ _Float16 smem_h[];\n"
+"    _Float16 *smK = smem_h;\n"
+"    _Float16 *smV = smK + 16 * FA_WM_HD_PAD;\n"
+"    _Float16 *smP = smV + FA_WM_HD_PAD * 16;\n"
+"\n"
+"    f16x8 q_reg[FA_WM_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = kb * 16 + half * 8 + i;\n"
+"            int row = q0 + idx;\n"
+"            float v = 0.0f;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                v = qkv[(size_t)row * dim3 + h * head_dim + d];\n"
+"            }\n"
+"            q_reg[kb][i] = (_Float16)(v * scale);\n"
+"        }\n"
+"    }\n"
+"    float8 O_acc[FA_WM_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM_K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"\n"
+"    int n_kv = (n_tok + FA_WM_BKV - 1) / FA_WM_BKV;\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        int kv0 = t * FA_WM_BKV;\n"
+"        for (int e = tid; e < 16 * FA_WM_HD_PAD; e += 32) {\n"
+"            int kv_row = e / FA_WM_HD_PAD;\n"
+"            int d = e % FA_WM_HD_PAD;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = K_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smK[kv_row * FA_WM_HD_PAD + d] = (_Float16)v;\n"
+"        }\n"
+"        for (int e = tid; e < FA_WM_HD_PAD * 16; e += 32) {\n"
+"            int d = e / 16;\n"
+"            int kv_row = e & 15;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = V_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smV[d * 16 + kv_row] = (_Float16)v;\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"            f16x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK[idx * FA_WM_HD_PAD + dpos];\n"
+"            }\n"
+"            score = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[kb], b_K, score);\n"
+"        }\n"
+"        bool col_valid = (kv0 + idx) < n_tok;\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            score[i] = col_valid ? score[i] : -1e30f;\n"
+"        }\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < FA_WM_K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP[m_row * 16 + n_col] = (_Float16)score[i];\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        f16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"            f16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV[d_col * 16 + kv_k];\n"
+"            }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int kb = 0; kb < FA_WM_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q0 + m_row;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#undef FA_WM_HD_PAD\n"
+"#undef FA_WM_K_NB\n"
+"#undef FA_WM_BQ\n"
+"#undef FA_WM_BKV\n"
+"\n"
+"/* ==== flash_attn_wmma_*_2w: BQ=32, 2 waves per WG ====                     */\n"
+"/* K/V loads amortize across 32 queries; cooperative 64-thread LDS load.      */\n"
+"#define FA_WM2_HD_PAD 80\n"
+"#define FA_WM2_K_NB 5\n"
+"#define FA_WM2_BQ 32\n"
+"#define FA_WM2_BKV 16\n"
+"\n"
+"__global__ void flash_attn_wmma_bf16_2w(float *out, const float *qkv,\n"
+"    const float *K_t, const float *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FA_WM2_BQ;\n"
+"    int tid = threadIdx.x;     /* 0..63 */\n"
+"    int wid = tid >> 5;\n"
+"    int lid = tid & 31;\n"
+"    int half = lid >> 4;\n"
+"    int idx  = lid & 15;\n"
+"    int dim3 = 3 * dim;\n"
+"    extern __shared__ unsigned short smem_b[];\n"
+"    unsigned short *smK = smem_b;                                /* [16xHD]  */\n"
+"    unsigned short *smV = smK + 16 * FA_WM2_HD_PAD;              /* [HDx16]  */\n"
+"    unsigned short *smP = smV + FA_WM2_HD_PAD * 16;              /* 2 x 16x16*/\n"
+"    unsigned short *smP_w = smP + wid * 16 * 16;\n"
+"\n"
+"    int q_base = q0 + wid * 16;\n"
+"    bf16x8 q_reg[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = kb * 16 + half * 8 + i;\n"
+"            int row = q_base + idx;\n"
+"            float v = 0.0f;\n"
+"            if (row < n_tok && d < head_dim)\n"
+"                v = qkv[(size_t)row * dim3 + h * head_dim + d];\n"
+"            q_reg[kb][i] = f32_to_bf16_bits(v * scale);\n"
+"        }\n"
+"    }\n"
+"    float8 O_acc[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"\n"
+"    int n_kv = (n_tok + FA_WM2_BKV - 1) / FA_WM2_BKV;\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        int kv0 = t * FA_WM2_BKV;\n"
+"        for (int e = tid; e < 16 * FA_WM2_HD_PAD; e += 64) {\n"
+"            int kv_row = e / FA_WM2_HD_PAD;\n"
+"            int d = e % FA_WM2_HD_PAD;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = K_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smK[kv_row * FA_WM2_HD_PAD + d] = f32_to_bf16_bits(v);\n"
+"        }\n"
+"        for (int e = tid; e < FA_WM2_HD_PAD * 16; e += 64) {\n"
+"            int d = e / 16;\n"
+"            int kv_row = e & 15;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = V_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smV[d * 16 + kv_row] = f32_to_bf16_bits(v);\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            bf16x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK[idx * FA_WM2_HD_PAD + dpos];\n"
+"            }\n"
+"            score = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(q_reg[kb], b_K, score);\n"
+"        }\n"
+"        bool col_valid = (kv0 + idx) < n_tok;\n"
+"        for (int i = 0; i < 8; i++) score[i] = col_valid ? score[i] : -1e30f;\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP_w[m_row * 16 + n_col] = f32_to_bf16_bits(score[i]);\n"
+"        }\n"
+"        bf16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP_w[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            bf16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV[d_col * 16 + kv_k];\n"
+"            }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q_base + m_row;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void flash_attn_wmma_f16_2w(float *out, const float *qkv,\n"
+"    const float *K_t, const float *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FA_WM2_BQ;\n"
+"    int tid = threadIdx.x;\n"
+"    int wid = tid >> 5;\n"
+"    int lid = tid & 31;\n"
+"    int half = lid >> 4;\n"
+"    int idx  = lid & 15;\n"
+"    int dim3 = 3 * dim;\n"
+"    extern __shared__ _Float16 smem_h[];\n"
+"    _Float16 *smK = smem_h;\n"
+"    _Float16 *smV = smK + 16 * FA_WM2_HD_PAD;\n"
+"    _Float16 *smP = smV + FA_WM2_HD_PAD * 16;\n"
+"    _Float16 *smP_w = smP + wid * 16 * 16;\n"
+"    int q_base = q0 + wid * 16;\n"
+"    f16x8 q_reg[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = kb * 16 + half * 8 + i;\n"
+"            int row = q_base + idx;\n"
+"            float v = 0.0f;\n"
+"            if (row < n_tok && d < head_dim)\n"
+"                v = qkv[(size_t)row * dim3 + h * head_dim + d];\n"
+"            q_reg[kb][i] = (_Float16)(v * scale);\n"
+"        }\n"
+"    }\n"
+"    float8 O_acc[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"    int n_kv = (n_tok + FA_WM2_BKV - 1) / FA_WM2_BKV;\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        int kv0 = t * FA_WM2_BKV;\n"
+"        for (int e = tid; e < 16 * FA_WM2_HD_PAD; e += 64) {\n"
+"            int kv_row = e / FA_WM2_HD_PAD;\n"
+"            int d = e % FA_WM2_HD_PAD;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = K_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smK[kv_row * FA_WM2_HD_PAD + d] = (_Float16)v;\n"
+"        }\n"
+"        for (int e = tid; e < FA_WM2_HD_PAD * 16; e += 64) {\n"
+"            int d = e / 16;\n"
+"            int kv_row = e & 15;\n"
+"            float v = 0.0f;\n"
+"            int kv = kv0 + kv_row;\n"
+"            if (kv < n_tok && d < head_dim)\n"
+"                v = V_t[((size_t)h * n_tok + kv) * head_dim + d];\n"
+"            smV[d * 16 + kv_row] = (_Float16)v;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            f16x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK[idx * FA_WM2_HD_PAD + dpos];\n"
+"            }\n"
+"            score = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[kb], b_K, score);\n"
+"        }\n"
+"        bool col_valid = (kv0 + idx) < n_tok;\n"
+"        for (int i = 0; i < 8; i++) score[i] = col_valid ? score[i] : -1e30f;\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP_w[m_row * 16 + n_col] = (_Float16)score[i];\n"
+"        }\n"
+"        f16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP_w[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            f16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV[d_col * 16 + kv_k];\n"
+"            }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q_base + m_row;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- kv_transpose_bf16/f16: pre-pack K,V into half-precision per-head layout ---- */\n"
+"/* Writes K_t/V_t as [n_heads, n_tok, head_dim] in BF16 (or F16). One thread/elt. */\n"
+"__global__ void kv_transpose_bf16(unsigned short *K_t, unsigned short *V_t,\n"
+"                                   const float *qkv,\n"
+"                                   int n_tok, int dim, int n_heads, int head_dim) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_tok * dim;\n"
+"    if (idx >= total) return;\n"
+"    int tok = idx / dim;\n"
+"    int hd_idx = idx % dim;\n"
+"    int h = hd_idx / head_dim;\n"
+"    int d = hd_idx % head_dim;\n"
+"    int dim3 = 3 * dim;\n"
+"    int dst_idx = h * n_tok * head_dim + tok * head_dim + d;\n"
+"    K_t[dst_idx] = f32_to_bf16_bits(qkv[tok * dim3 + dim     + hd_idx]);\n"
+"    V_t[dst_idx] = f32_to_bf16_bits(qkv[tok * dim3 + 2 * dim + hd_idx]);\n"
+"}\n"
+"\n"
+"__global__ void kv_transpose_f16(_Float16 *K_t, _Float16 *V_t,\n"
+"                                  const float *qkv,\n"
+"                                  int n_tok, int dim, int n_heads, int head_dim) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_tok * dim;\n"
+"    if (idx >= total) return;\n"
+"    int tok = idx / dim;\n"
+"    int hd_idx = idx % dim;\n"
+"    int h = hd_idx / head_dim;\n"
+"    int d = hd_idx % head_dim;\n"
+"    int dim3 = 3 * dim;\n"
+"    int dst_idx = h * n_tok * head_dim + tok * head_dim + d;\n"
+"    K_t[dst_idx] = (_Float16)qkv[tok * dim3 + dim     + hd_idx];\n"
+"    V_t[dst_idx] = (_Float16)qkv[tok * dim3 + 2 * dim + hd_idx];\n"
+"}\n"
+"\n"
+"/* ==== flash_attn_wmma_*_2w_pre: BQ=32 2-wave with pre-packed BF16/F16 K_t,V_t ==== */\n"
+"/* Same algorithm as _2w but reads K_t/V_t directly (no F32 read + cast in hot loop). */\n"
+"__global__ void flash_attn_wmma_bf16_2w_pre(float *out, const float *qkv,\n"
+"    const unsigned short *K_t, const unsigned short *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FA_WM2_BQ;\n"
+"    int tid = threadIdx.x;\n"
+"    int wid = tid >> 5;\n"
+"    int lid = tid & 31;\n"
+"    int half = lid >> 4;\n"
+"    int idx  = lid & 15;\n"
+"    int dim3 = 3 * dim;\n"
+"    extern __shared__ unsigned short smem_b[];\n"
+"    unsigned short *smK0 = smem_b;\n"
+"    unsigned short *smK1 = smK0 + 16 * FA_WM2_HD_PAD;\n"
+"    unsigned short *smV0 = smK1 + 16 * FA_WM2_HD_PAD;\n"
+"    unsigned short *smV1 = smV0 + FA_WM2_HD_PAD * 16;\n"
+"    unsigned short *smP = smV1 + FA_WM2_HD_PAD * 16;\n"
+"    unsigned short *smP_w = smP + wid * 16 * 16;\n"
+"\n"
+"    int q_base = q0 + wid * 16;\n"
+"    bf16x8 q_reg[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = kb * 16 + half * 8 + i;\n"
+"            int row = q_base + idx;\n"
+"            float v = 0.0f;\n"
+"            if (row < n_tok && d < head_dim)\n"
+"                v = qkv[(size_t)row * dim3 + h * head_dim + d];\n"
+"            q_reg[kb][i] = f32_to_bf16_bits(v * scale);\n"
+"        }\n"
+"    }\n"
+"    float8 O_acc[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"\n"
+"    int n_kv = (n_tok + FA_WM2_BKV - 1) / FA_WM2_BKV;\n"
+"    int ld_row = tid >> 2;\n"
+"    int ld_col0 = (tid & 3) * 20;\n"
+"\n"
+"    /* Prologue: load tile 0 into buffer 0 */\n"
+"    {\n"
+"        int kv = ld_row;\n"
+"        size_t k_base = ((size_t)h * n_tok + kv) * head_dim;\n"
+"        bool kv_ok = (kv < n_tok);\n"
+"        for (int j = 0; j < 20; j++) {\n"
+"            int d = ld_col0 + j;\n"
+"            unsigned short k_v = 0, v_v = 0;\n"
+"            if (kv_ok && d < head_dim) {\n"
+"                k_v = K_t[k_base + d];\n"
+"                v_v = V_t[k_base + d];\n"
+"            }\n"
+"            smK0[ld_row * FA_WM2_HD_PAD + d] = k_v;\n"
+"            smV0[d * 16 + ld_row] = v_v;\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        unsigned short *smK_cur = (t & 1) ? smK1 : smK0;\n"
+"        unsigned short *smV_cur = (t & 1) ? smV1 : smV0;\n"
+"        unsigned short *smK_pre = (t & 1) ? smK0 : smK1;\n"
+"        unsigned short *smV_pre = (t & 1) ? smV0 : smV1;\n"
+"        int t_next = t + 1;\n"
+"        bool prefetch = t_next < n_kv;\n"
+"\n"
+"        if (prefetch) {\n"
+"            int kv_pre = t_next * FA_WM2_BKV + ld_row;\n"
+"            size_t k_base_pre = ((size_t)h * n_tok + kv_pre) * head_dim;\n"
+"            bool pre_ok = (kv_pre < n_tok);\n"
+"            for (int j = 0; j < 20; j++) {\n"
+"                int d = ld_col0 + j;\n"
+"                unsigned short k_v = 0, v_v = 0;\n"
+"                if (pre_ok && d < head_dim) {\n"
+"                    k_v = K_t[k_base_pre + d];\n"
+"                    v_v = V_t[k_base_pre + d];\n"
+"                }\n"
+"                smK_pre[ld_row * FA_WM2_HD_PAD + d] = k_v;\n"
+"                smV_pre[d * 16 + ld_row] = v_v;\n"
+"            }\n"
+"        }\n"
+"\n"
+"        int kv0 = t * FA_WM2_BKV;\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            bf16x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK_cur[idx * FA_WM2_HD_PAD + dpos];\n"
+"            }\n"
+"            score = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(q_reg[kb], b_K, score);\n"
+"        }\n"
+"        bool col_valid = (kv0 + idx) < n_tok;\n"
+"        for (int i = 0; i < 8; i++) score[i] = col_valid ? score[i] : -1e30f;\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP_w[m_row * 16 + n_col] = f32_to_bf16_bits(score[i]);\n"
+"        }\n"
+"        bf16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP_w[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            bf16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV_cur[d_col * 16 + kv_k];\n"
+"            }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q_base + m_row;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void flash_attn_wmma_f16_2w_pre(float *out, const float *qkv,\n"
+"    const _Float16 *K_t, const _Float16 *V_t,\n"
+"    int n_tok, int dim, int n_heads, int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FA_WM2_BQ;\n"
+"    int tid = threadIdx.x;\n"
+"    int wid = tid >> 5;\n"
+"    int lid = tid & 31;\n"
+"    int half = lid >> 4;\n"
+"    int idx  = lid & 15;\n"
+"    int dim3 = 3 * dim;\n"
+"    extern __shared__ _Float16 smem_h[];\n"
+"    _Float16 *smK = smem_h;\n"
+"    _Float16 *smV = smK + 16 * FA_WM2_HD_PAD;\n"
+"    _Float16 *smP = smV + FA_WM2_HD_PAD * 16;\n"
+"    _Float16 *smP_w = smP + wid * 16 * 16;\n"
+"    int q_base = q0 + wid * 16;\n"
+"    f16x8 q_reg[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = kb * 16 + half * 8 + i;\n"
+"            int row = q_base + idx;\n"
+"            float v = 0.0f;\n"
+"            if (row < n_tok && d < head_dim)\n"
+"                v = qkv[(size_t)row * dim3 + h * head_dim + d];\n"
+"            q_reg[kb][i] = (_Float16)(v * scale);\n"
+"        }\n"
+"    }\n"
+"    float8 O_acc[FA_WM2_K_NB];\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"    int n_kv = (n_tok + FA_WM2_BKV - 1) / FA_WM2_BKV;\n"
+"    int ld_row = tid >> 2;\n"
+"    int ld_col0 = (tid & 3) * 20;\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        int kv0 = t * FA_WM2_BKV;\n"
+"        int kv = kv0 + ld_row;\n"
+"        size_t k_base = ((size_t)h * n_tok + kv) * head_dim;\n"
+"        bool kv_ok = (kv < n_tok);\n"
+"        for (int j = 0; j < 20; j++) {\n"
+"            int d = ld_col0 + j;\n"
+"            _Float16 k_v = (_Float16)0.0f, v_v = (_Float16)0.0f;\n"
+"            if (kv_ok && d < head_dim) {\n"
+"                k_v = K_t[k_base + d];\n"
+"                v_v = V_t[k_base + d];\n"
+"            }\n"
+"            smK[ld_row * FA_WM2_HD_PAD + d] = k_v;\n"
+"            smV[d * 16 + ld_row] = v_v;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            f16x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK[idx * FA_WM2_HD_PAD + dpos];\n"
+"            }\n"
+"            score = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[kb], b_K, score);\n"
+"        }\n"
+"        bool col_valid = (kv0 + idx) < n_tok;\n"
+"        for (int i = 0; i < 8; i++) score[i] = col_valid ? score[i] : -1e30f;\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP_w[m_row * 16 + n_col] = (_Float16)score[i];\n"
+"        }\n"
+"        f16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP_w[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"            f16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV[d_col * 16 + kv_k];\n"
+"            }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int kb = 0; kb < FA_WM2_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q_base + m_row;\n"
+"            if (row < n_tok && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#undef FA_WM2_HD_PAD\n"
+"#undef FA_WM2_K_NB\n"
+"#undef FA_WM2_BQ\n"
+"#undef FA_WM2_BKV\n"
+"\n"
+"/* ---- patch_unfold_{bf16,f16}: im2col for patch embedding into BF16/F16 ---- */\n"
+"/* Grid: (n_patches), Block: (256). Output [n_patches, ks=ps*ps*3].         */\n"
+"__global__ void patch_unfold_bf16(unsigned short *out, const float *rgb,\n"
+"                                   int gw, int ps, int ks, int img_w) {\n"
+"    int patch = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    int py = patch / gw, px = patch % gw;\n"
+"    int ps2 = ps * ps;\n"
+"    for (int k = tid; k < ks; k += blockDim.x) {\n"
+"        int c = k / ps2;\n"
+"        int rest = k - c * ps2;\n"
+"        int ky = rest / ps;\n"
+"        int kx = rest - ky * ps;\n"
+"        int iy = py * ps + ky;\n"
+"        int ix = px * ps + kx;\n"
+"        float v = rgb[(iy * img_w + ix) * 3 + c];\n"
+"        out[(size_t)patch * ks + k] = f32_to_bf16_bits(v);\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void patch_unfold_f16(half_raw *out, const float *rgb,\n"
+"                                  int gw, int ps, int ks, int img_w) {\n"
+"    int patch = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    int py = patch / gw, px = patch % gw;\n"
+"    int ps2 = ps * ps;\n"
+"    for (int k = tid; k < ks; k += blockDim.x) {\n"
+"        int c = k / ps2;\n"
+"        int rest = k - c * ps2;\n"
+"        int ky = rest / ps;\n"
+"        int kx = rest - ky * ps;\n"
+"        int iy = py * ps + ky;\n"
+"        int ix = px * ps + kx;\n"
+"        float v = rgb[(iy * img_w + ix) * 3 + c];\n"
+"        out[(size_t)patch * ks + k] = f32_to_f16_bits(v);\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- patch_embed_dual_f32: Dual Conv2D patch extraction ---- */\n"
 "/* Grid: (n_patches), Block: (256) */\n"
 "__global__ void patch_embed_dual_f32(float *out, const float *rgb,\n"
@@ -898,13 +1781,23 @@ struct hip_vision_runner {
     /* Vision-specific kernels */
     hipFunction_t fn_gemm_f32_f32;
     hipFunction_t fn_patch_embed_dual_f32;
+    hipFunction_t fn_patch_unfold_bf16;
+    hipFunction_t fn_patch_unfold_f16;
     hipFunction_t fn_add_pos_embd;
     hipFunction_t fn_add_pos_embd_direct;
     hipFunction_t fn_rope_vision_f32;
     hipFunction_t fn_attn_full_f32;
     hipFunction_t fn_flash_attn_tiled_f32;
     hipFunction_t fn_flash_attn_dyn_f32;
+    hipFunction_t fn_flash_attn_wmma_bf16;
+    hipFunction_t fn_flash_attn_wmma_f16;
+    hipFunction_t fn_flash_attn_wmma_bf16_2w;
+    hipFunction_t fn_flash_attn_wmma_f16_2w;
+    hipFunction_t fn_flash_attn_wmma_bf16_2w_pre;
+    hipFunction_t fn_flash_attn_wmma_f16_2w_pre;
     hipFunction_t fn_kv_transpose;
+    hipFunction_t fn_kv_transpose_bf16;
+    hipFunction_t fn_kv_transpose_f16;
     hipFunction_t fn_gemm_opt_f16_f32;
     hipFunction_t fn_gemm_opt_f16_f32_gelu;
     hipFunction_t fn_gemm_opt_f16_f32_res;
@@ -940,6 +1833,11 @@ struct hip_vision_runner {
     vlm_hipblaslt_matmul_fn hipblaslt_matmul;
     int hipblaslt_enabled;
     vlm_hipblaslt_plan hipblaslt_mm0_gelu;
+    /* Per-shape plan cache for ViT block GEMMs (qkv/attn_out/ffn_w0/ffn_w1).
+     * Slots are find-or-create keyed by (dtype, m, n, k, epilogue). */
+#define VLM_HIPBLASLT_VIT_MAX_PLANS 16
+    vlm_hipblaslt_plan hipblaslt_vit_plans[VLM_HIPBLASLT_VIT_MAX_PLANS];
+    int hipblaslt_vit_n_plans;
 
     /* Model hyperparams */
     int n_blocks;
@@ -966,7 +1864,11 @@ struct hip_vision_runner {
     void *d_pos_interp;        /* GPU buffer for interpolated pos embedding [max_patches * dim] */
 
     /* GPU weights: patch embeddings */
-    void *d_patch_w0;     /* F32 [dim, ps*ps*3] */
+    void *d_patch_w0;          /* F32 [dim, ps*ps*3] */
+    void *d_patch_w0_bf16;     /* BF16 [dim, ps*ps*3] (unused, kept for compat) */
+    void *d_patch_w0_f16;      /* F16  [dim, ps*ps*3] for WMMA patch embed */
+    void *d_patch_unfold_bf16; /* (unused) */
+    void *d_patch_unfold_f16;  /* F16  [max_patches, ks] im2col scratch */
     void *d_patch_w1;     /* F32 [dim, ps*ps*3] (second conv, may be NULL) */
     void *d_patch_bias;   /* F32 [dim] */
 
@@ -992,8 +1894,10 @@ struct hip_vision_runner {
     void *d_hidden;     /* [max_patches * dim] */
     void *d_hidden2;    /* [max_patches * dim] */
     void *d_qkv;        /* [max_patches * 3 * dim] */
-    void *d_kt;         /* [max_patches * dim] - transposed K for flash attn */
-    void *d_vt;         /* [max_patches * dim] - transposed V for flash attn */
+    void *d_kt;         /* [max_patches * dim] - transposed K for flash attn (F32) */
+    void *d_vt;         /* [max_patches * dim] - transposed V for flash attn (F32) */
+    void *d_kt_h;       /* [max_patches * dim] - transposed K BF16/F16 (half-size) */
+    void *d_vt_h;       /* [max_patches * dim] - transposed V BF16/F16 (half-size) */
     void *d_attn_out;   /* [max_patches * dim] */
     void *d_ffn_buf;    /* [max_patches * ffn_dim] */
     void *d_ln_buf;     /* [max_patches * dim] */
@@ -1045,13 +1949,23 @@ static int vlm_compile_kernels(hip_vision_runner *r) {
     /* Vision-specific kernels */
     GET_FN(gemm_f32_f32);
     GET_FN(patch_embed_dual_f32);
+    GET_FN(patch_unfold_bf16);
+    GET_FN(patch_unfold_f16);
     GET_FN(add_pos_embd);
     GET_FN(add_pos_embd_direct);
     GET_FN(rope_vision_f32);
     GET_FN(attn_full_f32);
     GET_FN(flash_attn_tiled_f32);
     GET_FN(flash_attn_dyn_f32);
+    GET_FN(flash_attn_wmma_bf16);
+    GET_FN(flash_attn_wmma_f16);
+    GET_FN(flash_attn_wmma_bf16_2w);
+    GET_FN(flash_attn_wmma_f16_2w);
+    GET_FN(flash_attn_wmma_bf16_2w_pre);
+    GET_FN(flash_attn_wmma_f16_2w_pre);
     GET_FN(kv_transpose);
+    GET_FN(kv_transpose_bf16);
+    GET_FN(kv_transpose_f16);
     GET_FN(gemm_opt_f16_f32);
     GET_FN(gemm_opt_f16_f32_gelu);
     GET_FN(gemm_opt_f16_f32_res);
@@ -1617,15 +2531,71 @@ int hip_vision_load_weights(hip_vision_runner *r, gguf_context *g) {
     int sm = r->spatial_merge;
     int merged_dim = dim * sm * sm;
 
-    /* Patch embeddings (always F32 -- small, applied once) */
+    /* Patch embeddings (always F32 -- small, applied once).
+     * Dual conv2d: out = (W0 + W1) @ pix. Fold W0+=W1 once at init so the
+     * runtime kernel issues 1 mul/load instead of 2 (halves inner-loop work). */
     vlm_tensor_info t_pw0 = vlm_get_tensor(g, "v.patch_embd.weight", 1);
     vlm_tensor_info t_pw1 = vlm_get_tensor(g, "v.patch_embd.weight.1", 0);
     vlm_tensor_info t_pb  = vlm_get_tensor(g, "v.patch_embd.bias", 0);
-    r->d_patch_w0 = vlm_upload_f32(&t_pw0);
-    r->d_patch_w1 = vlm_upload_f32(&t_pw1);
+    if (t_pw1.data) {
+        /* Dequant both, sum on host, upload combined. */
+        int n = t_pw0.n_elem;
+        float *w0 = (float *)malloc((size_t)n * sizeof(float));
+        float *w1 = (float *)malloc((size_t)n * sizeof(float));
+        if (t_pw0.type == GGML_TYPE_F32) memcpy(w0, t_pw0.data, (size_t)n * sizeof(float));
+        else if (t_pw0.type == GGML_TYPE_F16) {
+            const uint16_t *src = (const uint16_t *)t_pw0.data;
+            for (int i = 0; i < n; i++) w0[i] = ggml_fp16_to_fp32(src[i]);
+        } else {
+            size_t rb = dequant_row_size(t_pw0.type, t_pw0.n_cols);
+            for (int r0 = 0; r0 < t_pw0.n_rows; r0++)
+                dequant_row(t_pw0.type, (const uint8_t *)t_pw0.data + r0 * rb,
+                            w0 + r0 * t_pw0.n_cols, t_pw0.n_cols);
+        }
+        if (t_pw1.type == GGML_TYPE_F32) memcpy(w1, t_pw1.data, (size_t)n * sizeof(float));
+        else if (t_pw1.type == GGML_TYPE_F16) {
+            const uint16_t *src = (const uint16_t *)t_pw1.data;
+            for (int i = 0; i < n; i++) w1[i] = ggml_fp16_to_fp32(src[i]);
+        } else {
+            size_t rb = dequant_row_size(t_pw1.type, t_pw1.n_cols);
+            for (int r1 = 0; r1 < t_pw1.n_rows; r1++)
+                dequant_row(t_pw1.type, (const uint8_t *)t_pw1.data + r1 * rb,
+                            w1 + r1 * t_pw1.n_cols, t_pw1.n_cols);
+        }
+        for (int i = 0; i < n; i++) w0[i] += w1[i];
+        if (hipMalloc(&r->d_patch_w0, (size_t)n * sizeof(float)) != hipSuccess) {
+            free(w0); free(w1); return NULL;
+        }
+        hipMemcpy(r->d_patch_w0, w0, (size_t)n * sizeof(float), hipMemcpyHostToDevice);
+        free(w0); free(w1);
+        r->d_patch_w1 = NULL;
+        fprintf(stderr, "hip_vlm: loaded dual conv2d patch embeddings (W0+W1 folded)\n");
+    } else {
+        r->d_patch_w0 = vlm_upload_f32(&t_pw0);
+        r->d_patch_w1 = NULL;
+    }
     r->d_patch_bias = vlm_upload_f32(&t_pb);
-    if (t_pw1.data)
-        fprintf(stderr, "hip_vlm: loaded dual conv2d patch embeddings\n");
+
+    /* Pre-pack patch weight to F16 for WMMA-GEMM patch embedding.
+     * F16 (10-bit mantissa) is needed here for precision: BF16 (7-bit) loses
+     * too much on the small normalized RGB inputs and fails the accuracy gate.
+     * Layout: [dim, ks=ps*ps*3] (matches gemm_wmma_f16_f32 W). */
+    {
+        int n = t_pw0.n_elem;
+        if (hipMalloc(&r->d_patch_w0_f16, (size_t)n * sizeof(unsigned short)) == hipSuccess) {
+            int n_int = (int)n;
+            void *args[] = { &r->d_patch_w0_f16, &r->d_patch_w0, &n_int };
+            int grid = (n + 255) / 256;
+            hipModuleLaunchKernel(r->fn_pack_f16_from_f32,
+                           grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+            hipStreamSynchronize(r->stream);
+        }
+        int ks = r->patch_size * r->patch_size * 3;
+        size_t unfold_sz = (size_t)r->max_patches * ks * sizeof(unsigned short);
+        if (hipMalloc(&r->d_patch_unfold_f16, unfold_sz) != hipSuccess) {
+            r->d_patch_unfold_f16 = NULL;
+        }
+    }
 
     /* Position embedding (always F32) -- keep CPU copy for interpolation */
     vlm_tensor_info t_pos = vlm_get_tensor(g, "v.position_embd.weight", 1);
@@ -1756,6 +2726,8 @@ int hip_vision_load_weights(hip_vision_runner *r, gguf_context *g) {
         CHECK_HIP(hipMalloc(&r->d_qkv,       (size_t)mp * 3 * dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_kt,        (size_t)mp * dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_vt,        (size_t)mp * dim * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_kt_h,      (size_t)mp * dim * sizeof(unsigned short)));
+        CHECK_HIP(hipMalloc(&r->d_vt_h,      (size_t)mp * dim * sizeof(unsigned short)));
         CHECK_HIP(hipMalloc(&r->d_attn_out,  (size_t)mp * dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ffn_buf,   (size_t)mp * r->ffn_dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ln_buf,    (size_t)mp * dim * sizeof(float)));
@@ -1901,6 +2873,94 @@ static int vlm_gemm_hipblaslt(hip_vision_runner *r, void *d_Y, const gpu_weight 
     return 1;
 }
 
+/* Find-or-create cached hipBLASLt plan for a given (dtype, m, n, k, epilogue).
+ * Returns NULL if cache full or plan creation failed. */
+static vlm_hipblaslt_plan *vlm_hipblaslt_vit_get_plan(hip_vision_runner *r,
+        int dtype, int m, int n, int k, int epilogue, const void *bias) {
+    for (int i = 0; i < r->hipblaslt_vit_n_plans; i++) {
+        vlm_hipblaslt_plan *p = &r->hipblaslt_vit_plans[i];
+        if (p->valid && p->dtype == dtype && p->m == m && p->n == n &&
+            p->k == k && p->epilogue == epilogue) {
+            return p;
+        }
+    }
+    if (r->hipblaslt_vit_n_plans >= VLM_HIPBLASLT_VIT_MAX_PLANS) return NULL;
+    vlm_hipblaslt_plan *p = &r->hipblaslt_vit_plans[r->hipblaslt_vit_n_plans];
+    if (!vlm_hipblaslt_plan_init(r, p, dtype, m, n, k, epilogue, bias)) return NULL;
+    r->hipblaslt_vit_n_plans++;
+    return p;
+}
+
+/* Try hipBLASLt for ViT block GEMMs (qkv/attn_out/ffn_w0/ffn_w1).
+ * Handles epilogue ∈ {bias, GELU+bias, residual+bias} with bias != NULL.
+ * Residual is implemented via beta=1.0 with C=residual, D=Y. */
+static int vlm_gemm_hipblaslt_vit(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
+                                   void *d_X, void *d_residual, int epilogue,
+                                   int n_tok, int n_out, int n_in) {
+    static int env_checked = 0;
+    static int env_enabled = 1;
+    if (!env_checked) {
+        const char *e = getenv("HIP_VLM_HIPBLASLT_VIT");
+        env_enabled = (e == NULL) ? 1 : (atoi(e) != 0);
+        env_checked = 1;
+    }
+    if (!env_enabled) return 0;
+    if (!r->hipblaslt_enabled || !r->hipblaslt_matmul) return 0;
+    if (r->use_f16 != VLM_PREC_F16 && r->use_f16 != VLM_PREC_BF16) return 0;
+    if (r->use_f16 == VLM_PREC_F16 && !w->w_f16) return 0;
+    if (r->use_f16 == VLM_PREC_BF16 && !w->w_bf16) return 0;
+    if (!w->bias) return 0;
+
+    /* Determine hipBLASLt epilogue code from caller's epilogue+residual.
+     *   epilogue==0, no residual -> BIAS
+     *   epilogue==1, no residual -> GELU_BIAS
+     *   epilogue==2 + residual   -> BIAS with beta=1, C=residual */
+    int hbl_epi;
+    if (epilogue == 0 && !d_residual) hbl_epi = VLM_HIPBLASLT_EPILOGUE_BIAS;
+    else if (epilogue == 1 && !d_residual) hbl_epi = VLM_HIPBLASLT_EPILOGUE_GELU_BIAS;
+    else if (epilogue == 2 && d_residual) hbl_epi = VLM_HIPBLASLT_EPILOGUE_BIAS;
+    else return 0;
+
+    void *d_X_pack = vlm_pack_gemm_input(r, d_X, n_tok * n_in);
+    if (!d_X_pack) return 0;
+
+    const int dtype = (r->use_f16 == VLM_PREC_BF16) ? VLM_HIPBLASLT_DATATYPE_BF16
+                                                     : VLM_HIPBLASLT_DATATYPE_F16;
+    const void *d_W    = (r->use_f16 == VLM_PREC_BF16) ? w->w_bf16 : w->w_f16;
+    const void *d_bias = w->bias;
+
+    vlm_hipblaslt_plan *p = vlm_hipblaslt_vit_get_plan(r, dtype,
+            n_tok, n_out, n_in, hbl_epi, d_bias);
+    if (!p) return 0;
+
+    if (r->hipblaslt_matmul_desc_set_attr(p->matmul,
+                                          VLM_HIPBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                          &d_bias, sizeof(d_bias)) != VLM_HIPBLASLT_STATUS_SUCCESS) {
+        return 0;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = (epilogue == 2 && d_residual) ? 1.0f : 0.0f;
+    const void *d_C = (epilogue == 2 && d_residual) ? d_residual : d_Y;
+    int st = r->hipblaslt_matmul(r->hipblaslt, p->matmul,
+                                 &alpha,
+                                 d_W, p->a,
+                                 d_X_pack, p->b,
+                                 &beta,
+                                 d_C, p->c,
+                                 d_Y, p->d,
+                                 &p->algo,
+                                 NULL, 0,
+                                 r->stream);
+    if (st != VLM_HIPBLASLT_STATUS_SUCCESS) {
+        if (r->verbose >= 1)
+            fprintf(stderr, "hip_vlm: hipBLASLt VIT GEMM failed (%d) M=%d N=%d K=%d epi=%d, falling back\n",
+                    st, n_tok, n_out, n_in, hbl_epi);
+        return 0;
+    }
+    return 1;
+}
+
 static int vlm_gemm_rocblas(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
                             void *d_X, void *d_residual, int epilogue,
                             int n_tok, int n_out, int n_in) {
@@ -1948,6 +3008,10 @@ static int vlm_gemm_wmma(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
     if (n_tok < 16) return 0;
 
     if (vlm_gemm_hipblaslt(r, d_Y, w, d_X, d_residual, epilogue, n_tok, n_out, n_in)) {
+        return 1;
+    }
+
+    if (vlm_gemm_hipblaslt_vit(r, d_Y, w, d_X, d_residual, epilogue, n_tok, n_out, n_in)) {
         return 1;
     }
 
@@ -2066,8 +3130,48 @@ static void vlm_gemm_gelu(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
     }
 }
 
+/* Extracted-launcher path: hand-tuned hipBLASLt kernel sustaining 174 TFLOP/s
+ * (89% peak) on M=1024 N=4608 K=4608 BF16. See rdna4/vlm/mm0_lever_attribution.md.
+ * Skips libhipblaslt's per-call algo selection. Bias is fused; GELU runs as
+ * a separate kernel after. */
+static int vlm_projector_mm0_extracted(hip_vision_runner *r, void *d_Y,
+                                       const gpu_weight *w, void *d_X,
+                                       int n_tok, int n_out, int n_in) {
+    static int s_inited = 0;
+    static int s_init_failed = 0;
+    static const void *s_bias_at_init = NULL;
+    if (s_init_failed) return 0;
+    if (r->use_f16 != VLM_PREC_BF16 || !w->w_bf16 || !w->bias) return 0;
+    if (n_tok != 1024 || n_out != 4608 || n_in != 4608) return 0;
+    if (!getenv("HIP_VLM_MM0_EXTRACTED") || getenv("HIP_VLM_MM0_EXTRACTED")[0] == '0') return 0;
+
+    if (!s_inited) {
+        if (mm0_extracted_init(n_tok, n_out, n_in, w->bias) != 0) {
+            s_init_failed = 1;
+            return 0;
+        }
+        s_inited = 1;
+        s_bias_at_init = w->bias;
+    }
+    if (s_bias_at_init != w->bias) return 0; /* bias pointer changed; bail */
+
+    void *d_X_pack = vlm_pack_gemm_input(r, d_X, n_tok * n_in);
+    if (!d_X_pack) return 0;
+
+    if (mm0_extracted_run(d_Y, w->w_bf16, d_X_pack) != 0) return 0;
+
+    int n = n_tok * n_out;
+    int grid = (n + 255) / 256;
+    void *args[] = { &d_Y, &n };
+    hipModuleLaunchKernel(r->fn_gelu_f32, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    return 1;
+}
+
 static void vlm_projector_gemm_gelu(hip_vision_runner *r, void *d_Y, const gpu_weight *w,
                                     void *d_X, int n_tok, int n_out, int n_in) {
+    if (vlm_projector_mm0_extracted(r, d_Y, w, d_X, n_tok, n_out, n_in)) {
+        return;
+    }
     if (n_tok >= 512) {
         vlm_gemm_gelu(r, d_Y, w, d_X, n_tok, n_out, n_in);
         return;
@@ -2165,9 +3269,35 @@ float *hip_vision_encode(hip_vision_runner *r, const float *rgb_norm, int width,
     /* 1. Upload RGB to GPU */
     hipMemcpy(r->d_rgb, rgb_norm, (size_t)width * height * 3 * sizeof(float), hipMemcpyHostToDevice);
 
-    /* 2. Patch embedding (dual conv2d) */
+    /* 2. Patch embedding.
+     *  Fast path: im2col (rgb → BF16 unfold) + WMMA GEMM (W folded W0+W1).
+     *  Fallback: scalar dual-conv kernel. */
     fprintf(stderr, "  patch embedding (dual conv2d)...\n");
-    {
+    if (r->d_patch_w0_f16 && r->d_patch_unfold_f16) {
+        int img_w = width;
+        int ks = ps * ps * 3;
+        /* im2col into F16 [n_patches, ks] */
+        void *uf_args[] = { &r->d_patch_unfold_f16, &r->d_rgb,
+                            &gw, &ps, &ks, &img_w };
+        hipModuleLaunchKernel(r->fn_patch_unfold_f16,
+                       n_patches, 1, 1, 256, 1, 1,
+                       0, r->stream, uf_args, NULL);
+        /* GEMM: out = unfold @ W^T -> Y[n_patches, dim].
+         * gemm_wmma_f16_f32(Y, W, X, bias, residual, epilogue, N=dim, K=ks, M=n_patches)
+         * Bias path: qwen3vl drops the patch bias (use_qwen3vl_layout). */
+        void *patch_bias = r->use_qwen3vl_layout ? NULL : r->d_patch_bias;
+        void *residual = NULL;
+        int epilogue = 0;
+        int N = dim, K = ks, M = n_patches;
+        void *gemm_args[] = { &r->d_hidden, &r->d_patch_w0_f16, &r->d_patch_unfold_f16,
+                              &patch_bias, &residual, &epilogue, &N, &K, &M };
+        int grid_x = (N + 127) / 128;
+        int grid_y = (M + 127) / 128;
+        hipModuleLaunchKernel(r->fn_gemm_wmma_f16_f32,
+                       grid_x, grid_y, 1,
+                       256, 1, 1,
+                       0, r->stream, gemm_args, NULL);
+    } else {
         int img_w = width;
         void *patch_bias = r->use_qwen3vl_layout ? NULL : r->d_patch_bias;
         void *args[] = {
@@ -2423,34 +3553,95 @@ float *hip_vision_encode(hip_vision_runner *r, const float *rgb_norm, int width,
 
         /* Multi-head self-attention (flash attention) */
         {
-            /* Transpose K,V to per-head contiguous layout */
+            float scale = 1.0f / sqrtf((float)head_dim);
+
+            /* Select attention path:
+             *   HIP_VLM_FA=wmma_bf16        -> WMMA BF16 (BQ=16, 32-thread WG)
+             *   HIP_VLM_FA=wmma_f16         -> WMMA F16
+             *   HIP_VLM_FA=wmma_bf16_2w     -> WMMA BF16 BQ=32 2-wave (F32 K/V read+cast)
+             *   HIP_VLM_FA=wmma_f16_2w      -> WMMA F16 BQ=32 2-wave
+             *   HIP_VLM_FA=wmma_bf16_2w_pre -> WMMA BF16 BQ=32 2-wave w/ pre-packed BF16 K/V
+             *   HIP_VLM_FA=wmma_f16_2w_pre  -> WMMA F16 BQ=32 2-wave w/ pre-packed F16 K/V
+             *   HIP_VLM_FA=tiled or unset (head_dim==64) -> scalar tiled
+             *   default                                  -> scalar dynamic */
+            const char *fa_mode = getenv("HIP_VLM_FA");
+            int use_wmma_bf16        = (fa_mode && strcmp(fa_mode, "wmma_bf16") == 0);
+            int use_wmma_f16         = (fa_mode && strcmp(fa_mode, "wmma_f16")  == 0);
+            int use_wmma_bf16_2w     = (fa_mode && strcmp(fa_mode, "wmma_bf16_2w") == 0);
+            int use_wmma_f16_2w      = (fa_mode && strcmp(fa_mode, "wmma_f16_2w")  == 0);
+            int use_wmma_bf16_2w_pre = (fa_mode && strcmp(fa_mode, "wmma_bf16_2w_pre") == 0);
+            int use_wmma_f16_2w_pre  = (fa_mode && strcmp(fa_mode, "wmma_f16_2w_pre")  == 0);
+
+            /* Transpose K,V — choose precision matching the FA path. */
             int total = n_patches * dim;
             int grid_kv = (total + 255) / 256;
-            void *kv_args[] = { &r->d_kt, &r->d_vt, &r->d_qkv,
-                                &n_patches, &dim, &n_heads, &head_dim };
-            hipModuleLaunchKernel(r->fn_kv_transpose,
-                           grid_kv, 1, 1, 256, 1, 1,
-                           0, r->stream, kv_args, NULL);
+            if ((use_wmma_bf16_2w_pre || use_wmma_f16_2w_pre) && head_dim <= 80) {
+                hipFunction_t kv_fn = use_wmma_bf16_2w_pre ? r->fn_kv_transpose_bf16
+                                                            : r->fn_kv_transpose_f16;
+                void *kv_args[] = { &r->d_kt_h, &r->d_vt_h, &r->d_qkv,
+                                    &n_patches, &dim, &n_heads, &head_dim };
+                hipModuleLaunchKernel(kv_fn,
+                               grid_kv, 1, 1, 256, 1, 1,
+                               0, r->stream, kv_args, NULL);
+            } else {
+                void *kv_args[] = { &r->d_kt, &r->d_vt, &r->d_qkv,
+                                    &n_patches, &dim, &n_heads, &head_dim };
+                hipModuleLaunchKernel(r->fn_kv_transpose,
+                               grid_kv, 1, 1, 256, 1, 1,
+                               0, r->stream, kv_args, NULL);
+            }
 
-            float scale = 1.0f / sqrtf((float)head_dim);
-            int bq = 64;  /* queries per block */
-            int n_q_blocks = (n_patches + bq - 1) / bq;
             void *args[] = {
                 &r->d_attn_out, &r->d_qkv, &r->d_kt, &r->d_vt,
                 &n_patches, &dim, &n_heads, &head_dim, &scale
             };
+            void *args_pre[] = {
+                &r->d_attn_out, &r->d_qkv, &r->d_kt_h, &r->d_vt_h,
+                &n_patches, &dim, &n_heads, &head_dim, &scale
+            };
 
-            if (head_dim == 64) {
-                size_t smem = 2 * 16 * 64 * sizeof(float);
-                hipModuleLaunchKernel(r->fn_flash_attn_tiled_f32,
+            if ((use_wmma_bf16 || use_wmma_f16) && head_dim <= 80) {
+                int n_q_blocks = (n_patches + 16 - 1) / 16;
+                size_t smem_bytes = (16 * 80 + 80 * 16 + 16 * 16) * sizeof(unsigned short);
+                hipFunction_t fn = use_wmma_bf16 ? r->fn_flash_attn_wmma_bf16
+                                                 : r->fn_flash_attn_wmma_f16;
+                hipModuleLaunchKernel(fn,
                                n_heads, n_q_blocks, 1,
-                               bq, 1, 1, smem, r->stream, args, NULL);
+                               32, 1, 1, smem_bytes, r->stream, args, NULL);
+            } else if ((use_wmma_bf16_2w || use_wmma_f16_2w) && head_dim <= 80) {
+                int n_q_blocks = (n_patches + 32 - 1) / 32;
+                size_t smem_bytes = (16 * 80 + 80 * 16 + 2 * 16 * 16) * sizeof(unsigned short);
+                hipFunction_t fn = use_wmma_bf16_2w ? r->fn_flash_attn_wmma_bf16_2w
+                                                    : r->fn_flash_attn_wmma_f16_2w;
+                hipModuleLaunchKernel(fn,
+                               n_heads, n_q_blocks, 1,
+                               64, 1, 1, smem_bytes, r->stream, args, NULL);
+            } else if ((use_wmma_bf16_2w_pre || use_wmma_f16_2w_pre) && head_dim <= 80) {
+                int n_q_blocks = (n_patches + 32 - 1) / 32;
+                /* Double-buffered K/V (BF16 path): 2x16x80 K + 2x80x16 V + 2x16x16 P */
+                size_t smem_bytes_bf16 = (2 * 16 * 80 + 2 * 80 * 16 + 2 * 16 * 16) * sizeof(unsigned short);
+                /* F16 path is still single-buffered */
+                size_t smem_bytes_f16 = (16 * 80 + 80 * 16 + 2 * 16 * 16) * sizeof(unsigned short);
+                size_t smem_bytes = use_wmma_bf16_2w_pre ? smem_bytes_bf16 : smem_bytes_f16;
+                hipFunction_t fn = use_wmma_bf16_2w_pre ? r->fn_flash_attn_wmma_bf16_2w_pre
+                                                        : r->fn_flash_attn_wmma_f16_2w_pre;
+                hipModuleLaunchKernel(fn,
+                               n_heads, n_q_blocks, 1,
+                               64, 1, 1, smem_bytes, r->stream, args_pre, NULL);
             } else {
-                /* Dynamic head_dim version (supports up to 128) */
-                size_t smem = 2 * 16 * head_dim * sizeof(float);
-                hipModuleLaunchKernel(r->fn_flash_attn_dyn_f32,
-                               n_heads, n_q_blocks, 1,
-                               bq, 1, 1, smem, r->stream, args, NULL);
+                int bq = 64;  /* queries per block */
+                int n_q_blocks = (n_patches + bq - 1) / bq;
+                if (head_dim == 64) {
+                    size_t smem = 2 * 16 * 64 * sizeof(float);
+                    hipModuleLaunchKernel(r->fn_flash_attn_tiled_f32,
+                                   n_heads, n_q_blocks, 1,
+                                   bq, 1, 1, smem, r->stream, args, NULL);
+                } else {
+                    size_t smem = 2 * 16 * head_dim * sizeof(float);
+                    hipModuleLaunchKernel(r->fn_flash_attn_dyn_f32,
+                                   n_heads, n_q_blocks, 1,
+                                   bq, 1, 1, smem, r->stream, args, NULL);
+                }
             }
         }
 
@@ -2666,6 +3857,11 @@ void hip_vision_free(hip_vision_runner *r) {
     if (!r) return;
 
     vlm_hipblaslt_plan_destroy(r, &r->hipblaslt_mm0_gelu);
+    for (int i = 0; i < r->hipblaslt_vit_n_plans; i++) {
+        vlm_hipblaslt_plan_destroy(r, &r->hipblaslt_vit_plans[i]);
+    }
+    r->hipblaslt_vit_n_plans = 0;
+    mm0_extracted_destroy();
     if (r->hipblaslt && r->hipblaslt_destroy) r->hipblaslt_destroy(r->hipblaslt);
     if (r->hipblaslt_lib) dlclose(r->hipblaslt_lib);
     if (r->rocblas && r->rocblas_destroy_handle) r->rocblas_destroy_handle(r->rocblas);
@@ -2673,6 +3869,10 @@ void hip_vision_free(hip_vision_runner *r) {
 
     /* Free weights */
     if (r->d_patch_w0) hipFree(r->d_patch_w0);
+    if (r->d_patch_w0_bf16) hipFree(r->d_patch_w0_bf16);
+    if (r->d_patch_w0_f16) hipFree(r->d_patch_w0_f16);
+    if (r->d_patch_unfold_bf16) hipFree(r->d_patch_unfold_bf16);
+    if (r->d_patch_unfold_f16) hipFree(r->d_patch_unfold_f16);
     if (r->d_patch_w1) hipFree(r->d_patch_w1);
     if (r->d_patch_bias) hipFree(r->d_patch_bias);
     if (r->d_pos_embd) hipFree(r->d_pos_embd);
@@ -2714,6 +3914,8 @@ void hip_vision_free(hip_vision_runner *r) {
     if (r->d_qkv) hipFree(r->d_qkv);
     if (r->d_kt) hipFree(r->d_kt);
     if (r->d_vt) hipFree(r->d_vt);
+    if (r->d_kt_h) hipFree(r->d_kt_h);
+    if (r->d_vt_h) hipFree(r->d_vt_h);
     if (r->d_attn_out) hipFree(r->d_attn_out);
     if (r->d_ffn_buf) hipFree(r->d_ffn_buf);
     if (r->d_ln_buf) hipFree(r->d_ln_buf);
