@@ -49,7 +49,18 @@ stack, and final LN/out_layer into one full-transformer hook; 6b.9
 feeds that device-resident transformer output directly into the CUDA PLY
 pack in normal E2E; 5b.28 caches repeated SLAT transformer coords across
 ODE steps; 6b.10 feeds the GS transformer from the SLAT device mirror.
-Next: reduce the remaining SLAT ODE host tensor orchestration.
+5b.29/6b.11 adopts final SLAT features from the final-layer device output
+and applies the fixed SLAT unnormalization on CUDA before GS consumes the
+mirror; 5b.30/6b.12 adopts final SLAT coords from the argwhere device
+buffer; 5b.31/6b.13 shares a cached device timestep embedding across
+SLAT IO and transformer hooks; 5b.32/6b.14 caches repeated SLAT sparse
+IO coordinate uploads; 5b.33/6b.15 removes the stale SLAT IO timestep
+workspace buffer; 5b.34/6b.16 adds DtoD feature handoff between
+adjacent SLAT CUDA hooks; 5b.35/6b.17 hardens that handoff as one-shot
+and clear-on-mismatch; 5b.36/6b.18 adds matching one-shot coordinate
+handoff between adjacent SLAT CUDA hooks; 5b.37/6b.19 moves normal SLAT
+ODE orchestration into the CUDA runner while keeping the CPU hook path
+for debug/trace.
 
 ## Drift table (live)
 
@@ -57,6 +68,121 @@ See `doc/sam3d.md` § "Status — drift table".
 
 ## Recent entries (most recent first)
 
+- **5b.37 / 6b.19 — normal SLAT ODE device orchestration (GREEN).**
+  `cuda_sam3d_run_slat_dit` now bypasses
+  `sam3d_cpu_slat_dit_run_ode_from_coords` on the normal sampled path.
+  The runner seeds initial SLAT features once for CPU RNG parity, uploads
+  compact active coords/features, and executes every ODE step on device:
+  input_layer, sparse input IO blocks, APE+SLAT transformer stack,
+  row-wise skip concat, sparse output IO blocks, and final no-affine
+  LN/out_layer. Final host readback is retained for `ctx->slat_tokens`;
+  GS consumes the device SLAT mirror. Existing debug forward and trace
+  paths still use the CPU hook scaffold. `verify_slat_dit` remains green
+  with max_abs=4.374981e-05, mean_abs=4.012466e-06; `verify_slat_gs`
+  remains green with transformer out_feats max_abs=1.040e-04,
+  mean_abs=4.753e-06 and packed_ply max_abs=3.815e-06,
+  mean_abs=1.457e-07. Full sampled E2E writes 38016 gaussians to
+  `/tmp/cuda_sam3d_phase5_phase6_final_timed.ply` in real=118.04 s; the
+  PLY is byte-identical to `/tmp/cuda_sam3d_5b36_6b18_timed.ply`.
+- **5b.36 / 6b.18 — SLAT hook coordinate DtoD handoff (GREEN).**
+  Added a one-shot coordinate handoff cache keyed by the live
+  `sp3d_tensor->coords` pointer plus row count. Sparse IO hooks record
+  the matching device coordinate buffer after creating the CPU
+  replacement tensor; the next sparse IO or APE+transformer hook consumes
+  it with DtoD when the pointer and shape match. On mismatch, the cache
+  clears and the existing byte-keyed HtoD upload path remains the
+  fallback. `verify_slat_dit` remains green with max_abs=4.374981e-05,
+  mean_abs=4.012466e-06; `verify_slat_gs` remains green with transformer
+  out_feats max_abs=1.040e-04, mean_abs=4.753e-06 and packed_ply
+  max_abs=3.815e-06, mean_abs=1.457e-07. Full sampled E2E writes 38016
+  gaussians to `/tmp/cuda_sam3d_5b36_6b18_timed.ply` in real=119.04 s;
+  that PLY is byte-identical to `/tmp/cuda_sam3d_5b35_6b17_timed.ply`.
+- **5b.35 / 6b.17 — SLAT feature handoff lifetime hardening (GREEN).**
+  The runner-owned SLAT feature handoff cache is now one-shot: a
+  successful DtoD consume clears the metadata, and pointer/shape mismatch
+  clears it before falling back to HtoD. This keeps the cache limited to
+  adjacent CUDA hooks and avoids allocator host-pointer reuse aliasing
+  stale device data after unrelated CPU tensor allocations.
+  `verify_slat_dit` remains green with max_abs=4.374981e-05,
+  mean_abs=4.012466e-06; `verify_slat_gs` remains green with transformer
+  out_feats max_abs=1.040e-04, mean_abs=4.753e-06 and packed_ply
+  max_abs=3.815e-06, mean_abs=1.457e-07. Full sampled E2E writes 38016
+  gaussians to `/tmp/cuda_sam3d_5b35_6b17_timed.ply` in real=118.09 s;
+  that PLY is byte-identical to `/tmp/cuda_sam3d_5b34_6b16_timed.ply`.
+- **5b.34 / 6b.16 — SLAT hook feature DtoD handoff (GREEN).**
+  Added a runner-owned feature handoff cache keyed by the live
+  `sp3d_tensor->feats` pointer plus shape. CUDA hooks that download a
+  newly created tensor for the CPU ODE scaffold record the matching
+  device output buffer; the next input-layer, sparse IO, APE+transformer,
+  or final-layer hook consumes it with DtoD when the pointer and shape
+  match, avoiding re-upload of the same host features. This remains a
+  bridge until the SLAT ODE scaffold itself is device-resident.
+  `verify_slat_dit` remains green with max_abs=4.374981e-05,
+  mean_abs=4.012466e-06; `verify_slat_gs` remains green with transformer
+  out_feats max_abs=1.040e-04, mean_abs=4.753e-06 and packed_ply
+  max_abs=3.815e-06, mean_abs=1.457e-07. Full sampled E2E writes 38016
+  gaussians to `/tmp/cuda_sam3d_5b34_6b16_timed.ply` in real=118.07 s;
+  that PLY is byte-identical to `/tmp/cuda_sam3d_5b33_6b15_timed.ply`.
+- **5b.33 / 6b.15 — SLAT IO timestep dead-buffer cleanup (GREEN).**
+  Removed `cs3d_slat_io_ws.d_t/cap_t` and its free path. The IO hooks
+  now consume the shared `d_slat_hook_t_emb` cache directly and keep only
+  `ws->d_t_silu` for the SiLU-mutated timestep copy used by the block
+  MLP. `verify_slat_dit` remains green with max_abs=4.374981e-05,
+  mean_abs=4.012466e-06; `verify_slat_gs` remains green with transformer
+  out_feats max_abs=1.040e-04, mean_abs=4.753e-06 and packed_ply
+  max_abs=3.815e-06, mean_abs=1.457e-07. Full sampled E2E writes 38016
+  gaussians to `/tmp/cuda_sam3d_5b33_6b15_timed.ply` in real=118.04 s;
+  that PLY is byte-identical to `/tmp/cuda_sam3d_5b32_6b14_timed.ply`.
+- **5b.32 / 6b.14 — SLAT sparse IO coord upload cache (GREEN).**
+  Added byte-keyed host caches for `cs3d_slat_io_ws.d_in_coords` and
+  `cs3d_slat_io_ws.d_coords`. Input coords and upsample target coords
+  skip HtoD when unchanged; downsample invalidates the `d_coords` cache
+  because that kernel overwrites the buffer. `verify_slat_dit` remains
+  green with max_abs=4.374981e-05, mean_abs=4.012466e-06;
+  `verify_slat_gs` remains green with transformer out_feats
+  max_abs=1.040e-04, mean_abs=4.753e-06 and packed_ply max_abs=3.815e-06,
+  mean_abs=1.457e-07. Full sampled E2E writes 38016 gaussians to
+  `/tmp/cuda_sam3d_5b32_6b14_timed.ply` in real=118.13 s; that PLY is
+  byte-identical to `/tmp/cuda_sam3d_5b31_6b13_timed.ply`.
+- **5b.31 / 6b.13 — shared SLAT timestep embedding cache (GREEN).**
+  Added `cs3d_slat_cached_t_emb` and routed both sparse IO block hooks
+  and the APE+transformer hook through the same `d_slat_hook_t_emb`
+  device buffer. Within an ODE step, the first hook uploads the exact
+  fp32 `t_emb[dim]`; later hooks reuse it when the cached host bytes
+  match, avoiding repeated timestep HtoD uploads. `verify_slat_dit`
+  remains green with max_abs=4.374981e-05, mean_abs=4.012466e-06;
+  `verify_slat_gs` remains green with transformer out_feats
+  max_abs=1.040e-04, mean_abs=4.753e-06 and packed_ply max_abs=3.815e-06,
+  mean_abs=1.457e-07. Full sampled E2E writes 38016 gaussians to
+  `/tmp/cuda_sam3d_5b31_6b13_timed.ply` in real=118.08 s; that PLY is
+  byte-identical to `/tmp/cuda_sam3d_5b30_6b12_timed.ply`.
+- **5b.30 / 6b.12 — final SLAT coord device adoption (GREEN).**
+  `cs3d_slat_argwhere_gpu` can now return ownership of the compact
+  device coordinate buffer alongside the host copy required by the CPU
+  ODE scaffold. When final `out_n` still matches the active voxel count,
+  `cs3d_adopt_slat_device` DtoD-copies those coords into `d_slat_coords`
+  instead of uploading from host. This pairs with 5b.29's device feature
+  adoption so the normal GS path consumes a fully device-adopted SLAT
+  mirror. `verify_slat_dit` remains green with max_abs=4.374981e-05,
+  mean_abs=4.012466e-06; `verify_slat_gs` remains green with transformer
+  out_feats max_abs=1.040e-04, mean_abs=4.753e-06 and packed_ply
+  max_abs=3.815e-06, mean_abs=1.457e-07. Full sampled E2E writes 38016
+  gaussians to `/tmp/cuda_sam3d_5b30_6b12_timed.ply` in real=118.05 s;
+  that PLY is byte-identical to `/tmp/cuda_sam3d_5b29_6b11_timed.ply`.
+- **5b.29 / 6b.11 — final SLAT device adoption + CUDA unnorm (GREEN).**
+  Added `slat_unnormalize8_f32` and extended SLAT adoption so the normal
+  sampled path can DtoD-copy the final SLAT final-layer output into
+  `d_slat_feats`, unnormalize the fixed 8 latent channels on CUDA, and
+  feed that device mirror directly to the GS transformer. Host SLAT
+  tokens are still retained for readback/debug, and debug/override paths
+  keep host-upload fallbacks. `verify_slat_dit` remains green with
+  max_abs=4.374981e-05, mean_abs=4.012466e-06. `verify_slat_gs` remains
+  green with transformer out_feats max_abs=1.040e-04,
+  mean_abs=4.753e-06 and packed_ply max_abs=3.815e-06,
+  mean_abs=1.457e-07. Full sampled E2E writes 38016 gaussians to
+  `/tmp/cuda_sam3d_5b29_6b11_timed.ply` in real=118.07 s. Compared with
+  the previous host-unnormalized E2E PLY, the CUDA-unnormalized PLY
+  differs by max_abs=2.861e-06, mean_abs=2.129e-08 over 646272 floats.
 - **5b.28 / 6b.10 — SLAT coord cache + SLAT-to-GS device mirror
   (GREEN).** The SLAT APE+transformer CUDA hook now keeps a host-side
   coordinate cache and skips repeated HtoD coordinate uploads when the
