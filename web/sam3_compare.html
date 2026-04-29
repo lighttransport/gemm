@@ -1,0 +1,885 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAM 3 / 3.1 side-by-side compare</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
+    main { max-width: 1400px; margin: 0 auto; padding: 20px 16px; }
+    h1 { font-size: 24px; margin: 0 0 4px; }
+    .sub { color: #6a7180; font-size: 13px; margin-bottom: 16px; }
+    form, .panel { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    label { display: block; font-size: 13px; font-weight: 650; margin: 8px 0 4px; }
+    input, select, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 8px 10px; background: #fff; }
+    button { background: #1b6f5f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
+    button[disabled] { background: #9aa4b1; cursor: not-allowed; }
+    button.cancel { background: #b94a48; }
+    .row { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .btn-row { display: flex; gap: 10px; margin-top: 12px; }
+    .btn-row button { margin-top: 0; }
+    .status { margin-top: 8px; font-size: 12px; color: #6a7180; min-height: 16px; }
+    .backends { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 6px; margin-top: 6px; }
+    .be-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #e1e5ec; border-radius: 6px; font-size: 13px; }
+    .be-row input[type=checkbox] { width: auto; }
+    .be-row.disabled { opacity: 0.5; }
+    .be-row .url { color: #6a7180; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-left: auto; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; }
+    .cell { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 12px; }
+    .cell h3 { margin: 0 0 6px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .cell .cell-meta { font-size: 12px; color: #6a7180; margin-bottom: 8px; }
+    .cell canvas { width: 100%; max-width: 100%; border: 1px solid #d9dde5; border-radius: 6px; background: #1a1c20; }
+    .cell .err { color: #b94a48; font-size: 13px; padding: 8px; background: #fdecec; border-radius: 6px; }
+    .cell .score-list { font-size: 12px; color: #4d5563; margin-top: 6px; max-height: 140px; overflow: auto; }
+    .cell .score-row { padding: 2px 0; display: flex; gap: 6px; align-items: center; }
+    .cell .swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e6f3ef; color: #1b6f5f; }
+    .pill.warn { background: #fdf0e2; color: #a55a14; }
+    .pill.err  { background: #fdecec; color: #b94a48; }
+    .pill.run  { background: #e7effa; color: #2a4a7a; }
+    .diff-strip { font-size: 12px; color: #4d5563; }
+    .diff-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 4px; margin-top: 6px; }
+    .diff-cell { background: #f2f4f8; border-radius: 4px; padding: 4px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .mode-btn { width: auto; padding: 6px 12px; background: #e7effa; color: #2a4a7a; font-weight: 600; border: 1px solid #c4d4ea; }
+    .mode-btn.active { background: #2a4a7a; color: #fff; border-color: #2a4a7a; }
+    .scale-btn { width: auto; padding: 4px 10px; font-size: 12px; background: #f2f4f8; color: #4d5563; border: 1px solid #d0d6e0; }
+    .scale-btn.active { background: #4d5563; color: #fff; border-color: #4d5563; }
+    #toast { position: fixed; top: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(420px, 90vw); }
+    .toast-item { pointer-events: auto; background: #15171a; color: #fff; padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.18); font-size: 13px; line-height: 1.35; border-left: 4px solid #8a8f98; cursor: pointer; word-break: break-word; }
+    .toast-item.error { border-left-color: #e5484d; background: #2a1416; }
+    .toast-item.info  { border-left-color: #1b6f5f; }
+  </style>
+</head>
+<body>
+<div id="toast"></div>
+<main>
+  <h1>SAM 3 / 3.1 side-by-side compare</h1>
+  <div class="sub">Fans out a single (image, prompt) to every checked backend in parallel and renders the mask overlays + timings in a grid.</div>
+
+  <form id="form" class="panel">
+    <div class="row">
+      <div>
+        <label for="image">Image</label>
+        <input id="image" type="file" accept="image/*">
+        <div class="presets" id="presets" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+          <span style="opacity:.7;font-size:.85em;">presets:</span>
+          <button type="button" class="preset" data-src="/public/sam3_compare/cat.jpg"      data-prompt="cat">cat</button>
+          <button type="button" class="preset" data-src="/public/sam3_compare/mountain.jpg" data-prompt="mountain">mountain</button>
+          <button type="button" class="preset" data-src="/public/sam3_compare/person.jpg"   data-prompt="person">person</button>
+        </div>
+      </div>
+      <div>
+        <label for="score">score_threshold</label>
+        <input id="score" type="number" step="0.05" value="0.3">
+      </div>
+      <div>
+        <label for="mask">mask_threshold</label>
+        <input id="mask" type="number" step="0.05" value="0.5">
+      </div>
+      <div>
+        <label for="maxn">max_masks</label>
+        <input id="maxn" type="number" min="1" max="64" value="8">
+      </div>
+    </div>
+
+    <label for="text">Text prompt</label>
+    <input id="text" placeholder="e.g. cat, mountain, person" required>
+
+    <label>Backends</label>
+    <div id="backends" class="backends"></div>
+
+    <div class="btn-row">
+      <button type="submit" id="go">Compare</button>
+      <button type="button" id="cancel" class="cancel" disabled>Cancel all</button>
+    </div>
+    <div class="status" id="status"></div>
+  </form>
+
+  <section class="panel diff-strip" id="diffPanel" hidden>
+    <div><strong>Pairwise union-of-masks IoU</strong> (1.0 = identical, 0.0 = disjoint)</div>
+    <div id="diffGrid" class="diff-grid"></div>
+  </section>
+
+  <section class="panel" id="comparePanel" hidden>
+    <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:end; margin-bottom:10px;">
+      <div style="flex:1 1 220px;">
+        <label for="cmpA">A (left / top)</label>
+        <select id="cmpA"></select>
+      </div>
+      <div style="flex:1 1 220px;">
+        <label for="cmpB">B (right / bottom)</label>
+        <select id="cmpB"></select>
+      </div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button type="button" class="mode-btn" data-mode="diff">Diff (XOR)</button>
+        <button type="button" class="mode-btn" data-mode="swipe-h">Swipe ⟷</button>
+        <button type="button" class="mode-btn" data-mode="swipe-v">Swipe ⇅</button>
+        <button type="button" class="mode-btn" data-mode="swipe-d">Swipe ⟍</button>
+      </div>
+      <div style="display:flex; gap:12px; flex-wrap:wrap; font-size:13px;">
+        <label style="display:flex; align-items:center; gap:4px; margin:0;">
+          <input type="checkbox" id="boxesA" style="width:auto;"> A boxes
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; margin:0;">
+          <input type="checkbox" id="boxesB" style="width:auto;"> B boxes
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; margin:0;">
+          <input type="checkbox" id="loupe" style="width:auto;"> Loupe
+        </label>
+      </div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button type="button" class="scale-btn active" data-scale="fit">fit</button>
+        <button type="button" class="scale-btn" data-scale="0.5">0.5×</button>
+        <button type="button" class="scale-btn" data-scale="1">1×</button>
+        <button type="button" class="scale-btn" data-scale="2">2×</button>
+      </div>
+    </div>
+    <div id="cmpScroller" style="position:relative; overflow:auto; max-height: 90vh; border:1px solid #d9dde5; border-radius:6px; background:#1a1c20;">
+      <canvas id="cmpCanvas" style="display:block; cursor: crosshair;"></canvas>
+      <canvas id="loupeCanvas" width="220" height="220" style="position:absolute; pointer-events:none; border:2px solid #fff; border-radius:50%; box-shadow:0 4px 14px rgba(0,0,0,0.5); display:none;"></canvas>
+    </div>
+    <div id="cmpLegend" class="cell-meta" style="margin-top:6px;"></div>
+  </section>
+
+  <section id="grid" class="grid"></section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const COLORS = [
+  [255, 87, 87], [88, 167, 255], [255, 198, 60], [126, 217, 87],
+  [186, 104, 200], [255, 138, 101], [77, 208, 225], [240, 98, 146],
+  [129, 199, 132], [149, 117, 205], [255, 167, 38], [79, 195, 247],
+];
+
+/* BACKENDS: list of backends to fan out to. Override via
+ *   ?backends=<base64 of JSON array>
+ * Each entry: { label, url, model, backend, enabled? }
+ * url is the origin (scheme://host:port); /v1/infer and /v1/models are appended. */
+/* All rows are same-origin. The C server proxies the pytorch-ref rows
+ * to the actual ref servers — pass --sam3-ref-url / --sam3-1-ref-url
+ * to the server (see run-sam3-compare.sh). `pathPrefix` swaps the
+ * default /v1/infer for the proxy path. */
+const DEFAULT_BACKENDS = [
+  { label: "ours (cpu,  sam3)",    url: "", model: "sam3",   backend: "cpu"  },
+  { label: "ours (cuda, sam3)",    url: "", model: "sam3",   backend: "cuda" },
+  { label: "ours (cuda, sam3.1)",  url: "", model: "sam3.1", backend: "cuda" },
+  { label: "pytorch-ref (sam3)",   url: "", model: "sam3",   backend: "cuda", pathPrefix: "/v1/ref/sam3"   },
+  { label: "pytorch-ref (sam3.1)", url: "", model: "sam3.1", backend: "cuda", pathPrefix: "/v1/ref/sam3.1" },
+  { label: "ours (hip, sam3.1)",   url: "", model: "sam3.1", backend: "hip",    placeholder: true },
+  { label: "ours (vulkan, sam3.1)",url: "", model: "sam3.1", backend: "vulkan", placeholder: true },
+];
+
+function backendLabel(b) { return b.url || location.origin + '  (same-origin)'; }
+
+function loadBackends() {
+  try {
+    const p = new URLSearchParams(location.search).get("backends");
+    if (p) return JSON.parse(atob(p));
+  } catch (e) { console.warn("bad ?backends=", e); }
+  return DEFAULT_BACKENDS;
+}
+
+const BACKENDS = loadBackends();
+
+function showToast(msg, opts) {
+  opts = opts || {};
+  const host = $('toast');
+  const el = document.createElement('div');
+  el.className = 'toast-item ' + (opts.kind || 'error');
+  if (opts.title) {
+    const t = document.createElement('div');
+    t.style.fontWeight = '700'; t.textContent = opts.title;
+    el.appendChild(t);
+  }
+  const b = document.createElement('div'); b.textContent = msg;
+  el.appendChild(b);
+  host.appendChild(el);
+  const dismiss = () => { if (el.parentNode) el.parentNode.removeChild(el); };
+  el.addEventListener('click', dismiss);
+  setTimeout(dismiss, opts.timeout || 8000);
+}
+
+function extractError(json, status) {
+  if (!json) return 'HTTP ' + status;
+  if (typeof json.error === 'string') return json.error;
+  if (json.error && typeof json.error === 'object') {
+    return json.error.message || json.error.code || JSON.stringify(json.error);
+  }
+  return json.message || ('HTTP ' + status);
+}
+
+function readFile(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1] || '');
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}
+
+function loadImg(dataUrl) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im); im.onerror = rej;
+    im.src = dataUrl;
+  });
+}
+
+function renderBackendList() {
+  const host = $('backends');
+  host.innerHTML = '';
+  BACKENDS.forEach((b, i) => {
+    const row = document.createElement('label');
+    row.className = 'be-row' + (b.placeholder ? ' disabled' : '');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.index = i;
+    cb.checked = !b.placeholder;
+    cb.disabled = !!b.placeholder;
+    const name = document.createElement('span'); name.textContent = b.label;
+    const url = document.createElement('span'); url.className = 'url';
+    url.textContent = b.placeholder ? '(not configured)' : (b.url || 'same-origin');
+    row.appendChild(cb); row.appendChild(name); row.appendChild(url);
+    host.appendChild(row);
+  });
+}
+renderBackendList();
+
+/* Capability probe: for each unique URL hit GET /v1/models and hide/gray
+ * rows whose backend is not advertised. Tolerant of network failures. */
+async function probeCapabilities() {
+  const groups = {};
+  BACKENDS.forEach(b => {
+    if (b.placeholder) return;
+    const key = (b.url || '') + '|' + (b.pathPrefix || '/v1');
+    (groups[key] = groups[key] || { url: b.url || '', prefix: b.pathPrefix || '/v1', entries: [] }).entries.push(b);
+  });
+  await Promise.all(Object.values(groups).map(async g => {
+    try {
+      const r = await fetch(g.url + g.prefix + '/models', { cache: 'no-store' });
+      if (!r.ok) return;
+      const j = await r.json();
+      const models = (j && (j.models || j)) || [];
+      g.entries.forEach(b => {
+        const m = models.find(x => x.id === b.model);
+        if (!m) { b.unavailable = true; return; }
+        const backs = m.backends || [];
+        if (backs.length && !backs.includes(b.backend)) b.unavailable = true;
+      });
+    } catch (_) { /* leave as-is */ }
+  }));
+  // re-render to reflect unavailable flags
+  const host = $('backends');
+  const inputs = host.querySelectorAll('input[type=checkbox]');
+  inputs.forEach(cb => {
+    const b = BACKENDS[+cb.dataset.index];
+    if (b.unavailable) {
+      cb.disabled = true; cb.checked = false;
+      cb.parentElement.classList.add('disabled');
+      const url = cb.parentElement.querySelector('.url');
+      if (url && !url.textContent.includes('(')) url.textContent += '  (not advertised)';
+    }
+  });
+}
+probeCapabilities();
+
+function makeCell(b, idx) {
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+  cell.innerHTML = `
+    <h3>${b.label} <span class="pill run" data-role="pill">pending</span></h3>
+    <div class="cell-meta" data-role="meta">${b.url} · ${b.model}/${b.backend}</div>
+    <canvas data-role="canvas"></canvas>
+    <div class="score-list" data-role="scores"></div>
+  `;
+  cell.dataset.index = idx;
+  return cell;
+}
+
+function drawOverlay(canvas, srcImage, masksData, opts) {
+  opts = opts || {};
+  const drawBoxes = opts.drawBoxes !== false;
+  const W = srcImage.naturalWidth, H = srcImage.naturalHeight;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(srcImage, 0, 0);
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  const tctx = tmp.getContext('2d');
+  masksData.forEach((m, i) => {
+    const [r, g, b] = COLORS[i % COLORS.length];
+    tctx.clearRect(0, 0, W, H);
+    tctx.drawImage(m.img, 0, 0, W, H);
+    const id = tctx.getImageData(0, 0, W, H);
+    const d = id.data;
+    for (let p = 0; p < d.length; p += 4) {
+      if (d[p] > 127) { d[p] = r; d[p+1] = g; d[p+2] = b; d[p+3] = 140; }
+      else d[p+3] = 0;
+    }
+    tctx.putImageData(id, 0, 0);
+    ctx.drawImage(tmp, 0, 0);
+    if (drawBoxes) {
+      ctx.strokeStyle = `rgb(${r},${g},${b})`;
+      ctx.lineWidth = Math.max(2, Math.round(W / 400));
+      const [x0, y0, x1, y1] = m.box;
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    }
+  });
+}
+
+function drawBoxesOnly(ctx, masksData, stroke) {
+  const W = ctx.canvas.width;
+  ctx.lineWidth = Math.max(2, Math.round(W / 400));
+  masksData.forEach((m, i) => {
+    const [r, g, b] = COLORS[i % COLORS.length];
+    ctx.strokeStyle = stroke || `rgb(${r},${g},${b})`;
+    const [x0, y0, x1, y1] = m.box;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  });
+}
+
+/* Build a binary union mask at image resolution from a cell's masks. */
+function buildUnionMask(srcImage, masksData) {
+  const W = srcImage.naturalWidth, H = srcImage.naturalHeight;
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  const tctx = tmp.getContext('2d');
+  const out = new Uint8Array(W * H);
+  for (const m of masksData) {
+    tctx.clearRect(0, 0, W, H);
+    tctx.drawImage(m.img, 0, 0, W, H);
+    const d = tctx.getImageData(0, 0, W, H).data;
+    for (let p = 0, j = 0; p < d.length; p += 4, j++) {
+      if (d[p] > 127) out[j] = 1;
+    }
+  }
+  return { w: W, h: H, bits: out };
+}
+
+function iou(a, b) {
+  if (!a || !b || a.w !== b.w || a.h !== b.h) return null;
+  let inter = 0, uni = 0;
+  const A = a.bits, B = b.bits;
+  for (let i = 0; i < A.length; i++) {
+    const x = A[i], y = B[i];
+    if (x | y) uni++;
+    if (x & y) inter++;
+  }
+  return uni === 0 ? 1.0 : inter / uni;
+}
+
+let activeAborts = [];
+let activeTimer = null;
+
+/* ------------------------------------------------------------------ *
+ * Compare view: pick A/B among successful runs and show either
+ *   - Diff (XOR of mask unions, tinted)
+ *   - Swipe horizontal / vertical / diagonal
+ * Optionally overlay A boxes and/or B boxes.
+ * ------------------------------------------------------------------ */
+let runResults = [];          // successful { label, srcImage, masksData, composited, union }
+let cmpMode = 'swipe-h';      // 'diff' | 'swipe-h' | 'swipe-v' | 'swipe-d'
+let cmpSplit = 0.5;           // [0,1] swipe divider position
+let cmpDragging = false;
+let cmpScale = 'fit';         // 'fit' | '0.5' | '1' | '2'  (display size of cmpCanvas)
+const LOUPE_ZOOM = 3;         // how much the magnifier enlarges the underlying canvas
+
+function populateCompareSelectors() {
+  const selA = $('cmpA'), selB = $('cmpB');
+  const prevA = selA.value, prevB = selB.value;
+  selA.innerHTML = ''; selB.innerHTML = '';
+  runResults.forEach((r, i) => {
+    const oA = document.createElement('option'); oA.value = i; oA.textContent = r.label; selA.appendChild(oA);
+    const oB = document.createElement('option'); oB.value = i; oB.textContent = r.label; selB.appendChild(oB);
+  });
+  if (runResults.length >= 2) {
+    selA.value = runResults.find((r,i) => String(i) === prevA) ? prevA : '0';
+    selB.value = runResults.find((r,i) => String(i) === prevB && prevB !== selA.value) ? prevB : '1';
+    $('comparePanel').hidden = false;
+    renderCompare();
+  } else {
+    $('comparePanel').hidden = true;
+  }
+}
+
+function setCmpMode(mode) {
+  cmpMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  const canvas = $('cmpCanvas');
+  canvas.style.cursor = (mode === 'diff') ? 'default' :
+                        (mode === 'swipe-v') ? 'row-resize' :
+                        (mode === 'swipe-h') ? 'col-resize' : 'crosshair';
+  renderCompare();
+}
+
+function applyCmpScale() {
+  const canvas = $('cmpCanvas');
+  if (!canvas.width) return; // nothing rendered yet
+  if (cmpScale === 'fit') {
+    canvas.style.width = '100%';
+    canvas.style.height = 'auto';
+    canvas.style.maxWidth = '100%';
+  } else {
+    const f = parseFloat(cmpScale);
+    canvas.style.width = (canvas.width * f) + 'px';
+    canvas.style.height = (canvas.height * f) + 'px';
+    canvas.style.maxWidth = 'none';
+  }
+}
+
+function setCmpScale(s) {
+  cmpScale = s;
+  document.querySelectorAll('.scale-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.scale === s);
+  });
+  applyCmpScale();
+}
+
+function renderCompare() {
+  if (runResults.length < 2) return;
+  const A = runResults[+$('cmpA').value];
+  const B = runResults[+$('cmpB').value];
+  if (!A || !B) return;
+  const canvas = $('cmpCanvas');
+  // Use A's intrinsic resolution; both should match (same source image).
+  const W = A.srcImage.naturalWidth, H = A.srcImage.naturalHeight;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+
+  if (cmpMode === 'diff') {
+    renderDiff(ctx, A, B, W, H);
+  } else {
+    renderSwipe(ctx, A, B, W, H);
+  }
+
+  if ($('boxesA').checked) drawBoxesOnly(ctx, A.masksData, 'rgba(255,80,80,0.95)');
+  if ($('boxesB').checked) drawBoxesOnly(ctx, B.masksData, 'rgba(80,160,255,0.95)');
+
+  applyCmpScale();
+
+  // Legend
+  const leg = $('cmpLegend');
+  if (cmpMode === 'diff') {
+    leg.innerHTML = `<span style="color:#e25a5a">■</span> only in A &nbsp; ` +
+                    `<span style="color:#4d8ef0">■</span> only in B &nbsp; ` +
+                    `<span style="color:#3aa678">■</span> in both &nbsp; · &nbsp; ` +
+                    `IoU = ${(iou(A.union, B.union) || 0).toFixed(3)}`;
+  } else {
+    leg.innerHTML = `Drag on the canvas to move the divider &nbsp;·&nbsp; ` +
+                    `A=${A.label}, B=${B.label} &nbsp;·&nbsp; split=${cmpSplit.toFixed(2)}`;
+  }
+}
+
+function renderDiff(ctx, A, B, W, H) {
+  // Start from the plain source image (A and B share it).
+  ctx.drawImage(A.srcImage, 0, 0);
+  // Only-A red, only-B blue, both green.
+  const Ua = A.union, Ub = B.union;
+  if (!Ua || !Ub || Ua.w !== Ub.w || Ua.h !== Ub.h) {
+    ctx.fillStyle = 'rgba(180,20,20,0.4)';
+    ctx.fillRect(0, 0, W, H);
+    return;
+  }
+  const layer = ctx.getImageData(0, 0, W, H);
+  const d = layer.data;
+  const a = Ua.bits, b = Ub.bits;
+  for (let i = 0, p = 0; i < a.length; i++, p += 4) {
+    const av = a[i], bv = b[i];
+    // Blend original 45% with flat tint 55% so the photo stays readable.
+    const mix = (tr, tg, tb) => {
+      d[p]   = ((d[p]   * 45) + tr * 55) / 100 | 0;
+      d[p+1] = ((d[p+1] * 45) + tg * 55) / 100 | 0;
+      d[p+2] = ((d[p+2] * 45) + tb * 55) / 100 | 0;
+      d[p+3] = 255;
+    };
+    if (av && bv)       mix(0x3a, 0xa6, 0x78);
+    else if (av && !bv) mix(0xe2, 0x5a, 0x5a);
+    else if (!av && bv) mix(0x4d, 0x8e, 0xf0);
+    // else: leave source pixel as-is.
+  }
+  ctx.putImageData(layer, 0, 0);
+}
+
+function renderSwipe(ctx, A, B, W, H) {
+  // Draw A full-frame first, then clip to the "B" region and draw B.
+  ctx.drawImage(A.composited, 0, 0);
+  ctx.save();
+  ctx.beginPath();
+  if (cmpMode === 'swipe-h') {
+    const x = cmpSplit * W;
+    ctx.rect(x, 0, W - x, H);
+  } else if (cmpMode === 'swipe-v') {
+    const y = cmpSplit * H;
+    ctx.rect(0, y, W, H - y);
+  } else { // swipe-d: B below the diagonal from (split*W, 0) → (0, split*H)? Use a line
+    // Line with intercept t: x/W + y/H = 2*cmpSplit  (t=0 → upper-left corner only,
+    // t=1 → full image). Pixels with x/W + y/H >= 2*t are in B.
+    const t = cmpSplit;
+    // polygon enclosing B side: corners of the image where condition holds
+    const pts = [];
+    // Walk the 4 corners; for simplicity clip via a polygon spanning the B side.
+    // The dividing line: x/W + y/H = 2t  → x = (2t - y/H) * W
+    const Y = v => v * H;
+    const X = v => v * W;
+    const line_x_at = y => (2*t - y/H) * W;
+    const line_y_at = x => (2*t - x/W) * H;
+    // Start at top-right corner and go clockwise along edges, entering the line.
+    // Easier: build the polygon by listing corners whose cond >= 0 and inserting line-edge intersections.
+    const corners = [[0,0],[W,0],[W,H],[0,H]];
+    const cond = (x,y) => x/W + y/H - 2*t; // >= 0 means B side
+    for (let i = 0; i < 4; i++) {
+      const [cx, cy] = corners[i];
+      const [nx, ny] = corners[(i+1)%4];
+      const c0 = cond(cx, cy), c1 = cond(nx, ny);
+      if (c0 >= 0) pts.push([cx, cy]);
+      if ((c0 >= 0) !== (c1 >= 0)) {
+        // edge crosses the line; find intersection
+        const tt = c0 / (c0 - c1);
+        pts.push([cx + (nx-cx)*tt, cy + (ny-cy)*tt]);
+      }
+    }
+    if (pts.length) {
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.closePath();
+    }
+    // The above gives the B region; if cmpSplit=0 no pts matched cond>=0 → no B.
+  }
+  ctx.clip();
+  ctx.drawImage(B.composited, 0, 0);
+  ctx.restore();
+
+  // Divider line
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+  ctx.lineWidth = Math.max(2, Math.round(W / 400));
+  ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 4;
+  ctx.beginPath();
+  if (cmpMode === 'swipe-h') {
+    const x = cmpSplit * W;
+    ctx.moveTo(x, 0); ctx.lineTo(x, H);
+  } else if (cmpMode === 'swipe-v') {
+    const y = cmpSplit * H;
+    ctx.moveTo(0, y); ctx.lineTo(W, y);
+  } else {
+    const t = cmpSplit;
+    // Diagonal line from (2tW, 0) → (0, 2tH) clipped to image.
+    const x0 = Math.min(Math.max(2*t*W, 0), W);
+    const y0 = 0;
+    const y1 = Math.min(Math.max(2*t*H, 0), H);
+    const x1 = 0;
+    // But if 2t > 1 the line exits the top/right edge, reshape:
+    if (2*t <= 1) {
+      ctx.moveTo(2*t*W, 0); ctx.lineTo(0, 2*t*H);
+    } else {
+      const s = 2*t - 1;
+      ctx.moveTo(W, s*H); ctx.lineTo(s*W, H);
+    }
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function pointFromEvent(ev, canvas) {
+  const r = canvas.getBoundingClientRect();
+  const cx = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+  const cy = (ev.touches ? ev.touches[0].clientY : ev.clientY) - r.top;
+  return { x: cx / r.width, y: cy / r.height };
+}
+
+function updateLoupe(ev) {
+  const loupe = $('loupeCanvas');
+  if (!$('loupe').checked) { loupe.style.display = 'none'; return; }
+  const canvas = $('cmpCanvas');
+  const scroller = $('cmpScroller');
+  if (!canvas.width) { loupe.style.display = 'none'; return; }
+  const r = canvas.getBoundingClientRect();
+  const clientX = ev.touches ? ev.touches[0].clientX : ev.clientX;
+  const clientY = ev.touches ? ev.touches[0].clientY : ev.clientY;
+  if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) {
+    loupe.style.display = 'none'; return;
+  }
+  // Source point in canvas-pixel coords.
+  const sx = (clientX - r.left) * (canvas.width / r.width);
+  const sy = (clientY - r.top)  * (canvas.height / r.height);
+  const L = loupe.width, halfSrc = L / (2 * LOUPE_ZOOM);
+  const sX = Math.max(0, Math.min(canvas.width  - 2 * halfSrc, sx - halfSrc));
+  const sY = Math.max(0, Math.min(canvas.height - 2 * halfSrc, sy - halfSrc));
+  const lctx = loupe.getContext('2d');
+  lctx.save();
+  lctx.beginPath();
+  lctx.arc(L / 2, L / 2, L / 2 - 2, 0, Math.PI * 2);
+  lctx.clip();
+  lctx.imageSmoothingEnabled = false;
+  lctx.drawImage(canvas, sX, sY, 2 * halfSrc, 2 * halfSrc, 0, 0, L, L);
+  // Crosshair at center
+  lctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  lctx.lineWidth = 1;
+  lctx.beginPath();
+  lctx.moveTo(L / 2 - 8, L / 2); lctx.lineTo(L / 2 + 8, L / 2);
+  lctx.moveTo(L / 2, L / 2 - 8); lctx.lineTo(L / 2, L / 2 + 8);
+  lctx.stroke();
+  lctx.restore();
+  // Position loupe inside the scroller so it tracks scroll correctly.
+  const sRect = scroller.getBoundingClientRect();
+  let lx = clientX - sRect.left + scroller.scrollLeft + 18;
+  let ly = clientY - sRect.top  + scroller.scrollTop  + 18;
+  if (lx + L > scroller.scrollLeft + sRect.width)  lx -= (L + 36);
+  if (ly + L > scroller.scrollTop  + sRect.height) ly -= (L + 36);
+  loupe.style.left = lx + 'px';
+  loupe.style.top  = ly + 'px';
+  loupe.style.display = 'block';
+}
+
+function updateSplitFromEvent(ev) {
+  const canvas = $('cmpCanvas');
+  const p = pointFromEvent(ev, canvas);
+  if (cmpMode === 'swipe-h')      cmpSplit = Math.max(0, Math.min(1, p.x));
+  else if (cmpMode === 'swipe-v') cmpSplit = Math.max(0, Math.min(1, p.y));
+  else if (cmpMode === 'swipe-d') cmpSplit = Math.max(0, Math.min(1, (p.x + p.y) / 2));
+  renderCompare();
+}
+
+function bindCompareEvents() {
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.addEventListener('click', () => setCmpMode(b.dataset.mode));
+  });
+  document.querySelectorAll('.scale-btn').forEach(b => {
+    b.addEventListener('click', () => setCmpScale(b.dataset.scale));
+  });
+  $('cmpA').addEventListener('change', renderCompare);
+  $('cmpB').addEventListener('change', renderCompare);
+  $('boxesA').addEventListener('change', renderCompare);
+  $('boxesB').addEventListener('change', renderCompare);
+  $('loupe').addEventListener('change', () => {
+    if (!$('loupe').checked) $('loupeCanvas').style.display = 'none';
+  });
+  const canvas = $('cmpCanvas');
+  const down = ev => {
+    if (cmpMode === 'diff') { updateLoupe(ev); return; }
+    cmpDragging = true; updateSplitFromEvent(ev); updateLoupe(ev); ev.preventDefault();
+  };
+  const move = ev => {
+    if (cmpDragging) { updateSplitFromEvent(ev); ev.preventDefault(); }
+    updateLoupe(ev);
+  };
+  const up = () => { cmpDragging = false; };
+  canvas.addEventListener('mousedown', down);
+  canvas.addEventListener('mousemove', ev => updateLoupe(ev));
+  canvas.addEventListener('mouseleave', () => { $('loupeCanvas').style.display = 'none'; });
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+  canvas.addEventListener('touchstart', down, { passive: false });
+  window.addEventListener('touchmove', move, { passive: false });
+  window.addEventListener('touchend', up);
+  setCmpMode(cmpMode); // activate default button state
+}
+bindCompareEvents();
+
+function setRunning(on) {
+  $('go').disabled = on;
+  $('cancel').disabled = !on;
+}
+
+$('cancel').addEventListener('click', () => {
+  activeAborts.forEach(a => { try { a.abort(); } catch (_) {} });
+  $('status').textContent = 'Canceled on client.';
+});
+
+async function runOne(b, payload, cell, t0Global) {
+  const pill = cell.querySelector('[data-role=pill]');
+  const meta = cell.querySelector('[data-role=meta]');
+  const ac = new AbortController();
+  activeAborts.push(ac);
+  pill.textContent = 'running…'; pill.className = 'pill run';
+  const t0 = performance.now();
+  try {
+    const inferPath = (b.pathPrefix || '/v1') + '/infer';
+    const res = await fetch(b.url + inferPath, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
+    const dt = performance.now() - t0;
+    const json = await res.json().catch(() => null);
+    if (!res.ok || !json || !json.ok) {
+      const msg = extractError(json, res.status);
+      pill.textContent = 'error'; pill.className = 'pill err';
+      const box = document.createElement('div');
+      box.className = 'err'; box.textContent = `HTTP ${res.status}: ${msg}`;
+      cell.appendChild(box);
+      return { ok: false, error: msg, dt };
+    }
+    meta.textContent = `${b.url} · ${b.model}/${b.backend}  |  ${dt.toFixed(0)} ms (server: ${JSON.stringify(json.timings_ms || {})})`;
+    pill.textContent = `${(dt/1000).toFixed(2)}s`; pill.className = 'pill';
+    return { ok: true, json, dt };
+  } catch (err) {
+    const isAbort = err && err.name === 'AbortError';
+    let msg = isAbort ? 'canceled' : String(err && err.message || err);
+    if (!isAbort && /failed to fetch|networkerror/i.test(msg)) {
+      msg += ` — is the server at ${b.url || location.origin} reachable? ` +
+             `(check CORS, that the port is listening, and that the origin isn't blocked)`;
+    }
+    pill.textContent = isAbort ? 'canceled' : 'error';
+    pill.className = 'pill err';
+    const box = document.createElement('div');
+    box.className = 'err'; box.textContent = msg;
+    cell.appendChild(box);
+    return { ok: false, error: msg };
+  }
+}
+
+document.querySelectorAll('#presets .preset').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const src = btn.dataset.src;
+    const prompt = btn.dataset.prompt || '';
+    try {
+      const res = await fetch(src);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      const name = src.split('/').pop();
+      const file = new File([blob], name, { type: blob.type || 'image/jpeg' });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      $('image').files = dt.files;
+      if (prompt) $('text').value = prompt;
+      $('status').textContent = 'Loaded preset: ' + name;
+    } catch (e) {
+      showToast('Failed to load preset ' + src + ': ' + (e.message || e));
+    }
+  });
+});
+
+$('form').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const file = $('image').files[0];
+  if (!file) { showToast('Pick an image first.'); return; }
+
+  const selected = BACKENDS
+    .map((b, i) => ({ b, i }))
+    .filter(({ b, i }) => {
+      const cb = $('backends').querySelector(`input[data-index="${i}"]`);
+      return cb && cb.checked;
+    });
+
+  if (!selected.length) { showToast('No backends selected.'); return; }
+
+  setRunning(true);
+  $('status').textContent = 'Encoding image…';
+  activeAborts = [];
+
+  // Reset grid
+  const grid = $('grid');
+  grid.innerHTML = '';
+  const cells = selected.map(({ b, i }) => {
+    const c = makeCell(b, i);
+    grid.appendChild(c);
+    return c;
+  });
+
+  try {
+    const b64 = await readFile(file);
+    const srcImage = await loadImg('data:' + (file.type || 'image/png') + ';base64,' + b64);
+
+    const params = {
+      score_threshold: parseFloat($('score').value) || 0.3,
+      mask_threshold:  parseFloat($('mask').value)  || 0.5,
+      max_masks:       parseInt($('maxn').value, 10) || 8,
+      precision:       'fp16'
+    };
+
+    const tStart = performance.now();
+    $('status').textContent = 'Inference running…';
+    if (activeTimer) clearInterval(activeTimer);
+    activeTimer = setInterval(() => {
+      const s = ((performance.now() - tStart) / 1000).toFixed(1);
+      $('status').textContent = `Inference running… ${s}s`;
+    }, 100);
+
+    const results = await Promise.all(selected.map(async ({ b }, k) => {
+      const payload = {
+        model: b.model, task: 'segmentation', backend: b.backend,
+        inputs: { text: $('text').value, image_base64: b64 },
+        weights: {}, params
+      };
+      const r = await runOne(b, payload, cells[k], tStart);
+      if (r.ok) {
+        // render masks in this cell
+        const outs = (r.json.outputs || []).filter(o => o.type === 'mask');
+        const masksData = await Promise.all(outs.map(async (o, i) => ({
+          img:   await loadImg('data:' + (o.mime || 'image/png') + ';base64,' + o.data_base64),
+          score: o.score, box: o.box,
+        })));
+        const canvas = cells[k].querySelector('[data-role=canvas]');
+        drawOverlay(canvas, srcImage, masksData);
+        const sl = cells[k].querySelector('[data-role=scores]');
+        sl.innerHTML = `<div>num_masks=${r.json.num_masks} · ${masksData.length} drawn</div>` +
+          masksData.map((m, i) => `
+            <div class="score-row">
+              <div class="swatch" style="background:rgb(${COLORS[i % COLORS.length].join(',')})"></div>
+              <div>score ${m.score.toFixed(3)}  box [${m.box.map(v => v.toFixed(0)).join(', ')}]</div>
+            </div>`).join('');
+        // Build a reusable offscreen composited canvas (original + mask
+        // overlays, no boxes). Swipe / diff views draw this straight.
+        const composited = document.createElement('canvas');
+        composited.width = srcImage.naturalWidth;
+        composited.height = srcImage.naturalHeight;
+        drawOverlay(composited, srcImage, masksData, { drawBoxes: false });
+        return {
+          ok: true,
+          label: selected[k].b.label,
+          srcImage,
+          masksData,
+          composited,
+          union: buildUnionMask(srcImage, masksData),
+        };
+      }
+      return { ok: false, label: selected[k].b.label };
+    }));
+
+    // Stash for the compare view. Only successful runs are selectable.
+    runResults = results.filter(r => r.ok);
+    populateCompareSelectors();
+
+    clearInterval(activeTimer); activeTimer = null;
+    const dtTotal = ((performance.now() - tStart) / 1000).toFixed(2);
+    $('status').textContent = `Done in ${dtTotal}s.`;
+
+    // Diff strip — pairwise union-of-masks IoU
+    const succ = results.filter(r => r.ok);
+    const diffGrid = $('diffGrid');
+    diffGrid.innerHTML = '';
+    if (succ.length >= 2) {
+      for (let i = 0; i < succ.length; i++) {
+        for (let j = i + 1; j < succ.length; j++) {
+          const v = iou(succ[i].union, succ[j].union);
+          const el = document.createElement('div');
+          el.className = 'diff-cell';
+          el.textContent = `${succ[i].label} ↔ ${succ[j].label}: IoU=${v == null ? 'N/A' : v.toFixed(3)}`;
+          diffGrid.appendChild(el);
+        }
+      }
+      $('diffPanel').hidden = false;
+    } else {
+      $('diffPanel').hidden = true;
+    }
+  } catch (err) {
+    clearInterval(activeTimer); activeTimer = null;
+    const msg = String(err && err.message || err);
+    $('status').textContent = 'Error: ' + msg;
+    showToast(msg, { title: 'Compare failed', kind: 'error' });
+  } finally {
+    setRunning(false);
+    activeAborts = [];
+  }
+});
+</script>
+</body>
+</html>

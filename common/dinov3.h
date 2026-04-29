@@ -34,19 +34,7 @@
 extern "C" {
 #endif
 
-/* Reuse qtensor from transformer.h if available, else define it */
-#ifndef TRANSFORMER_H
-#ifndef DEPTH_ANYTHING3_H
-typedef struct {
-    void    *data;
-    uint32_t type;
-    int      n_rows;
-    int      n_cols;
-    int      n_dims;
-    uint64_t dims[4];
-} qtensor;
-#endif
-#endif
+#include "qtensor_utils.h"
 
 typedef struct {
     qtensor ln1_w, ln1_b;
@@ -58,6 +46,13 @@ typedef struct {
     qtensor ln2_w, ln2_b;
     qtensor ffn_up_w, ffn_up_b;            /* GELU MLP: fc1 [ffn_dim, dim] */
     qtensor ffn_down_w, ffn_down_b;        /* fc2 [dim, ffn_dim] */
+    /* SwiGLU MLP (DINOv3-H+ / sam-3d-body):
+     *   y = w3( silu(w1(x)+b1) * (w2(x)+b2) ) + b3
+     * w1, w2: [ffn_hidden, dim]; w3: [dim, ffn_hidden]. Populated when
+     * the checkpoint ships `mlp.w1/w2/w3` instead of `mlp.fc1/fc2`. */
+    qtensor ffn_w1_w, ffn_w1_b;
+    qtensor ffn_w2_w, ffn_w2_b;
+    qtensor ffn_w3_w, ffn_w3_b;
     qtensor ls2;                            /* optional: LayerScale */
 } dinov3_block;
 
@@ -72,11 +67,21 @@ typedef struct {
     float rope_freq_base;
     int has_qk_norm;    /* auto-detected from weights */
     int has_layerscale; /* auto-detected from weights */
+    int has_swiglu;     /* auto-detected: 1 if mlp.w1/w2/w3 present, 0 for fc1/fc2 */
+    int has_rope_periods_tensor; /* auto-detected: 1 if rope_embed.periods was loaded */
+
+    /* When set (default 0), dinov3_encode applies the learned final
+     * LayerNorm (norm_w/norm_b). Kept opt-in so existing TRELLIS.2
+     * call sites that use the historical unparameterized-LN feature
+     * extraction keep their behavior unchanged. sam-3d-body sets
+     * this to 1. */
+    int use_learned_final_norm;
 
     qtensor patch_embed_w, patch_embed_b;
     qtensor cls_token;
     qtensor storage_tokens;  /* [n_storage, dim] */
     qtensor norm_w, norm_b;  /* final LayerNorm */
+    qtensor rope_periods;    /* optional: saved [rope_dim4] fp/bf16 periods */
 
     dinov3_block *blocks;
 
@@ -94,6 +99,12 @@ dinov3_model  *dinov3_load_safetensors(const char *st_path);
 void           dinov3_free(dinov3_model *m);
 dinov3_result  dinov3_encode(dinov3_model *m, const uint8_t *rgb,
                              int w, int h, int n_threads);
+/* Bypass the built-in resize+normalize preprocessing. `chw` is a
+ * [3, H, W] f32 tensor already normalized with the model's mean/std.
+ * H, W must equal `m->image_size` for the default square layout.
+ * Used by verify_*.c to anchor on pytorch-produced normalized inputs. */
+dinov3_result  dinov3_encode_from_normalized(dinov3_model *m, const float *chw,
+                                             int w, int h, int n_threads);
 void           dinov3_result_free(dinov3_result *r);
 
 #ifdef __cplusplus
@@ -124,65 +135,47 @@ static double dinov3_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static int dinov3_timing_enabled(void) {
+    const char *env = getenv("SAM3D_BODY_TIMING");
+    if (!env || !env[0]) env = getenv("DINOV3_TIMING");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int dinov3_swiglu_fused_enabled(void) {
+    const char *env = getenv("DINOV3_SWIGLU_FUSED");
+    return !env || !env[0] || strcmp(env, "0") != 0;
+}
+
+static void dinov3_dump_block_if_requested(const char *dir, int block,
+                                           const float *x, int n_tok, int dim) {
+    if (!dir || !dir[0]) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/c_block%02d.bin", dir, block);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(x, sizeof(float), (size_t)n_tok * dim, f);
+    fclose(f);
+}
+
+static float dinov3_f32_to_bf16_roundtrip(float x) {
+    union { float f; uint32_t u; } v = { x };
+    uint32_t lsb = (v.u >> 16) & 1u;
+    v.u += 0x7fffu + lsb;
+    v.u &= 0xffff0000u;
+    return v.f;
+}
+
+static void dinov3_bf16_roundtrip_inplace(float *x, size_t n) {
+    for (size_t i = 0; i < n; i++) x[i] = dinov3_f32_to_bf16_roundtrip(x[i]);
+}
+
+static int dinov3_emulate_bf16_activations(const dinov3_model *m) {
+    const char *env = getenv("DINOV3_EMULATE_BF16");
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    return m && m->use_learned_final_norm;
+}
+
 /* ---- Tensor helpers ---- */
-
-static int dinov3_tensor_numel(const qtensor *t) {
-    if (!t->data) return 0;
-    int n = 1;
-    for (int d = 0; d < t->n_dims; d++) n *= (int)t->dims[d];
-    return n;
-}
-
-static float *dinov3_dequant(const qtensor *t) {
-    if (!t->data) return NULL;
-    int n = dinov3_tensor_numel(t);
-    if (n <= 0) return NULL;
-    float *buf = (float *)malloc((size_t)n * sizeof(float));
-    if (t->type == GGML_TYPE_F16) {
-        const uint16_t *src = (const uint16_t *)t->data;
-        for (int i = 0; i < n; i++) buf[i] = ggml_fp16_to_fp32(src[i]);
-    } else if (t->type == GGML_TYPE_F32) {
-        memcpy(buf, t->data, (size_t)n * sizeof(float));
-    } else {
-        int bs, ts;
-        switch (t->type) {
-            case GGML_TYPE_Q8_0: bs = 32; ts = 34; break;
-            case GGML_TYPE_Q4_K: bs = 256; ts = 144; break;
-            case GGML_TYPE_Q6_K: bs = 256; ts = 210; break;
-            default: memset(buf, 0, (size_t)n * sizeof(float)); return buf;
-        }
-        size_t row_bytes = (size_t)((t->n_cols + bs - 1) / bs) * ts;
-        for (int r = 0; r < t->n_rows; r++) {
-            const void *row = (const uint8_t *)t->data + r * row_bytes;
-            dequant_row(t->type, row, buf + r * t->n_cols, t->n_cols);
-        }
-    }
-    return buf;
-}
-
-static void dinov3_dequant_row(const qtensor *t, int row, float *dst) {
-    int n = t->n_cols;
-    if (row < 0 || row >= t->n_rows) {
-        memset(dst, 0, (size_t)n * sizeof(float));
-        return;
-    }
-    if (t->type == GGML_TYPE_F16) {
-        const uint16_t *src = (const uint16_t *)t->data + (size_t)row * n;
-        for (int i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(src[i]);
-    } else if (t->type == GGML_TYPE_F32) {
-        memcpy(dst, (const float *)t->data + (size_t)row * n, (size_t)n * sizeof(float));
-    } else {
-        int bs, ts;
-        switch (t->type) {
-            case GGML_TYPE_Q8_0: bs = 32; ts = 34; break;
-            case GGML_TYPE_Q4_K: bs = 256; ts = 144; break;
-            case GGML_TYPE_Q6_K: bs = 256; ts = 210; break;
-            default: memset(dst, 0, (size_t)n * sizeof(float)); return;
-        }
-        size_t row_bytes = (size_t)((n + bs - 1) / bs) * ts;
-        dequant_row(t->type, (const uint8_t *)t->data + row * row_bytes, dst, n);
-    }
-}
 
 /* ---- Batch GEMM ---- */
 
@@ -193,35 +186,105 @@ static void dinov3_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
         memset(dst, 0, (size_t)n_tok * n_out * sizeof(float));
         return;
     }
-    if (W->type == GGML_TYPE_F16) {
-        float *b = NULL;
-        if (bias && bias->data) {
-            b = (float *)malloc((size_t)n_out * sizeof(float));
-            dinov3_dequant_row(bias, 0, b);
-        }
-        cpu_gemm_f16(dst, (const uint16_t *)W->data, b, src,
-                     n_tok, n_out, n_in, n_threads);
-        free(b);
-    } else {
-        float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
-        for (int t = 0; t < n_tok; t++) {
-            for (int r = 0; r < n_out; r++) {
-                dinov3_dequant_row(W, r, tmp);
-                float s = 0.0f;
-                for (int j = 0; j < n_in; j++) s += tmp[j] * src[t * n_in + j];
-                dst[t * n_out + r] = s;
-            }
-        }
-        free(tmp);
-        if (bias && bias->data) {
-            float *b = (float *)malloc((size_t)n_out * sizeof(float));
-            dinov3_dequant_row(bias, 0, b);
-            for (int t = 0; t < n_tok; t++)
-                for (int i = 0; i < n_out; i++)
-                    dst[t * n_out + i] += b[i];
-            free(b);
+    float *bf_alloc = NULL;
+    const float *bf = NULL;
+    if (bias && bias->data) {
+        if (bias->type == GGML_TYPE_F32) {
+            bf = (const float *)bias->data;
+        } else {
+            bf_alloc = (float *)malloc((size_t)n_out * sizeof(float));
+            qt_dequant_row(bias, 0, bf_alloc);
+            bf = bf_alloc;
         }
     }
+    if (W->type == GGML_TYPE_F16) {
+        cpu_gemm_f16(dst, (const uint16_t *)W->data, (float *)bf, src,
+                     n_tok, n_out, n_in, n_threads);
+    } else if (W->type == GGML_TYPE_F32) {
+        cpu_gemm_f32(dst, (const float *)W->data, bf, src,
+                     n_tok, n_out, n_in, n_threads);
+    } else {
+        /* Quantized: dequant whole W once, then F32 GEMM. */
+        float *Wf = qt_dequant(W);
+        cpu_gemm_f32(dst, Wf, bf, src, n_tok, n_out, n_in, n_threads);
+        free(Wf);
+    }
+    free(bf_alloc);
+}
+
+static void dinov3_batch_gemm_fused2(float *dst1, const qtensor *W1, const qtensor *bias1,
+                                     float *dst2, const qtensor *W2, const qtensor *bias2,
+                                     const float *src, int n_tok, int n_out, int n_in,
+                                     int n_threads) {
+    if (!W1->data || !W2->data || W1->type != GGML_TYPE_F16 ||
+        W2->type != GGML_TYPE_F16) {
+        dinov3_batch_gemm(dst1, W1, bias1, src, n_tok, n_out, n_in, n_threads);
+        dinov3_batch_gemm(dst2, W2, bias2, src, n_tok, n_out, n_in, n_threads);
+        return;
+    }
+
+    float *b1_alloc = NULL, *b2_alloc = NULL;
+    const float *b1 = NULL, *b2 = NULL;
+    if (bias1 && bias1->data) {
+        if (bias1->type == GGML_TYPE_F32) b1 = (const float *)bias1->data;
+        else {
+            b1_alloc = (float *)malloc((size_t)n_out * sizeof(float));
+            qt_dequant_row(bias1, 0, b1_alloc);
+            b1 = b1_alloc;
+        }
+    }
+    if (bias2 && bias2->data) {
+        if (bias2->type == GGML_TYPE_F32) b2 = (const float *)bias2->data;
+        else {
+            b2_alloc = (float *)malloc((size_t)n_out * sizeof(float));
+            qt_dequant_row(bias2, 0, b2_alloc);
+            b2 = b2_alloc;
+        }
+    }
+
+#if defined(_OPENMP)
+    if (n_threads > 1 && n_out >= n_threads * 2) {
+        int rows_per = ((n_out / n_threads) / 2) * 2;
+        if (rows_per < 2) rows_per = 2;
+        int n_chunks = (n_out + rows_per - 1) / rows_per;
+        if (n_chunks > n_threads) n_chunks = n_threads;
+        #pragma omp parallel for schedule(static) num_threads(n_chunks)
+        for (int i = 0; i < n_chunks; i++) {
+            int r = i * rows_per;
+            int end = (i == n_chunks - 1) ? n_out : r + rows_per;
+            if (end > n_out) end = n_out;
+            int count = end - r;
+            if (count > 0) {
+                gemm_f16_f32_tokmajor_fused2(
+                    dst1 + r, (const uint16_t *)W1->data + (size_t)r * n_in,
+                    dst2 + r, (const uint16_t *)W2->data + (size_t)r * n_in,
+                    src, count, n_in, n_tok, n_out, n_out, n_in);
+            }
+        }
+    } else
+#endif
+    {
+        gemm_f16_f32_tokmajor_fused2(dst1, (const uint16_t *)W1->data,
+                                     dst2, (const uint16_t *)W2->data,
+                                     src, n_out, n_in, n_tok,
+                                     n_out, n_out, n_in);
+    }
+
+    if (b1 || b2) {
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
+        for (int t = 0; t < n_tok; t++) {
+            float *d1 = dst1 + (size_t)t * n_out;
+            float *d2 = dst2 + (size_t)t * n_out;
+            for (int i = 0; i < n_out; i++) {
+                if (b1) d1[i] += b1[i];
+                if (b2) d2[i] += b2[i];
+            }
+        }
+    }
+    free(b1_alloc);
+    free(b2_alloc);
 }
 
 /* ---- LayerNorm ---- */
@@ -230,8 +293,8 @@ static void dinov3_layernorm_batch(float *dst, const float *src, const qtensor *
                                     const qtensor *b, int n_tok, int dim, float eps) {
     float *wf = (float *)malloc((size_t)dim * sizeof(float));
     float *bf = (float *)malloc((size_t)dim * sizeof(float));
-    dinov3_dequant_row(w, 0, wf);
-    dinov3_dequant_row(b, 0, bf);
+    qt_dequant_row(w, 0, wf);
+    qt_dequant_row(b, 0, bf);
     cpu_layernorm(dst, src, wf, bf, n_tok, dim, eps);
     free(wf); free(bf);
 }
@@ -243,8 +306,8 @@ static void dinov3_qk_norm_batch(float *vec, int n_tok, int n_heads, int head_di
     if (!nw->data) return;
     float *w = (float *)malloc((size_t)head_dim * sizeof(float));
     float *b = (float *)malloc((size_t)head_dim * sizeof(float));
-    dinov3_dequant_row(nw, 0, w);
-    dinov3_dequant_row(nb, 0, b);
+    qt_dequant_row(nw, 0, w);
+    qt_dequant_row(nb, 0, b);
     cpu_qk_norm(vec, n_tok, n_heads, head_dim, n_heads * head_dim, w, b, eps);
     free(w); free(b);
 }
@@ -254,7 +317,7 @@ static void dinov3_qk_norm_batch(float *vec, int n_tok, int n_heads, int head_di
 static void dinov3_layerscale(float *x, const qtensor *gamma, int n_tok, int dim) {
     if (!gamma->data) return;
     float *g = (float *)malloc((size_t)dim * sizeof(float));
-    dinov3_dequant_row(gamma, 0, g);
+    qt_dequant_row(gamma, 0, g);
     for (int t = 0; t < n_tok; t++) {
         float *v = x + t * dim;
         for (int i = 0; i < dim; i++) v[i] *= g[i];
@@ -267,41 +330,6 @@ static void dinov3_layerscale(float *x, const qtensor *gamma, int n_tok, int dim
 /* ==================================================================== */
 
 #ifdef SAFETENSORS_H
-
-static qtensor dinov3_make_tensor(st_context *st, int idx) {
-    qtensor t = {0};
-    if (idx < 0) return t;
-    t.data = safetensors_data(st, idx);
-    const char *dt = safetensors_dtype(st, idx);
-    if (strcmp(dt, "F32") == 0)       t.type = GGML_TYPE_F32;
-    else if (strcmp(dt, "F16") == 0)  t.type = GGML_TYPE_F16;
-    else if (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_F32;
-    else return (qtensor){0};
-    t.n_dims = safetensors_ndims(st, idx);
-    const uint64_t *shape = safetensors_shape(st, idx);
-    for (int d = 0; d < t.n_dims; d++) t.dims[d] = shape[d];
-    if (t.n_dims >= 2) {
-        t.n_rows = (int)shape[0];
-        t.n_cols = 1;
-        for (int d = 1; d < t.n_dims; d++) t.n_cols *= (int)shape[d];
-    } else {
-        t.n_cols = (int)shape[0];
-        t.n_rows = 1;
-    }
-    /* BF16 → F32 conversion */
-    if (strcmp(dt, "BF16") == 0) {
-        int numel = t.n_cols * t.n_rows;
-        float *buf = (float *)malloc((size_t)numel * sizeof(float));
-        const uint16_t *src = (const uint16_t *)t.data;
-        for (int i = 0; i < numel; i++) {
-            uint32_t bits = (uint32_t)src[i] << 16;
-            memcpy(&buf[i], &bits, 4);
-        }
-        t.data = buf;
-        t.type = GGML_TYPE_F32;
-    }
-    return t;
-}
 
 dinov3_model *dinov3_load_safetensors(const char *st_path) {
     st_context *st = safetensors_open(st_path);
@@ -346,7 +374,7 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
         char _buf[512]; \
         snprintf(_buf, sizeof(_buf), "%s%s", prefix, name_suffix); \
         int _idx = safetensors_find(st, _buf); \
-        (_idx >= 0) ? dinov3_make_tensor(st, _idx) : (qtensor){0}; \
+        (_idx >= 0) ? qt_make_tensor(st, _idx) : (qtensor){0}; \
     })
 
     /* Auto-detect parameters */
@@ -389,6 +417,11 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
         if (strstr(nm, "blocks.0.mlp.fc1.weight") || strstr(nm, "blocks.0.ffn.fc1.weight")) {
             ffn_hidden = (int)sh[0];
         }
+        /* Detect SwiGLU MLP (mlp.w1 alongside mlp.w3). The presence of
+         * w1 is enough — sam-3d-body ckpt: [5120, 1280]. */
+        if (strstr(nm, "blocks.0.mlp.w1.weight")) {
+            ffn_hidden = (int)sh[0];
+        }
         /* Count blocks */
         const char *bp = strstr(nm, "blocks.");
         if (bp) {
@@ -425,7 +458,7 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
     m->n_patches = n_patches;
     m->n_storage = n_storage;
     m->n_tokens = n_tokens;
-    m->ln_eps = 1e-6f;
+    m->ln_eps = 1e-5f;
     m->rope_freq_base = 100.0f;
     m->has_qk_norm = has_qk_norm;
     m->has_layerscale = has_layerscale;
@@ -474,7 +507,7 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
             snprintf(name, sizeof(name), "%sblocks.%d.attn.norm1.weight", prefix, L);
             idx = safetensors_find(st, name);
         }
-        if (idx >= 0) blk->ln1_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ln1_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.norm1.bias", prefix, L);
         idx = safetensors_find(st, name);
@@ -482,42 +515,42 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
             snprintf(name, sizeof(name), "%sblocks.%d.attn.norm1.bias", prefix, L);
             idx = safetensors_find(st, name);
         }
-        if (idx >= 0) blk->ln1_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ln1_b = qt_make_tensor(st, idx);
 
         /* Attention QKV */
         snprintf(name, sizeof(name), "%sblocks.%d.attn.qkv.weight", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_qkv_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_qkv_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.attn.qkv.bias", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_qkv_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_qkv_b = qt_make_tensor(st, idx);
 
         /* QK norm (optional) */
         snprintf(name, sizeof(name), "%sblocks.%d.attn.q_norm.weight", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_q_norm_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_q_norm_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.attn.q_norm.bias", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_q_norm_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_q_norm_b = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.attn.k_norm.weight", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_k_norm_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_k_norm_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.attn.k_norm.bias", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_k_norm_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_k_norm_b = qt_make_tensor(st, idx);
 
         /* Attention output projection */
         snprintf(name, sizeof(name), "%sblocks.%d.attn.proj.weight", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_out_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_out_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.attn.proj.bias", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->attn_out_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->attn_out_b = qt_make_tensor(st, idx);
 
         /* LayerScale 1 (optional: "gamma_1" in timm, "ls1.gamma" in official) */
         snprintf(name, sizeof(name), "%sblocks.%d.gamma_1", prefix, L);
@@ -530,33 +563,53 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
             snprintf(name, sizeof(name), "%sblocks.%d.attn.ls1", prefix, L);
             idx = safetensors_find(st, name);
         }
-        if (idx >= 0) blk->ls1 = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ls1 = qt_make_tensor(st, idx);
 
         /* LayerNorm 2 */
         snprintf(name, sizeof(name), "%sblocks.%d.norm2.weight", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->ln2_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ln2_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.norm2.bias", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->ln2_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ln2_b = qt_make_tensor(st, idx);
 
         /* FFN (GELU MLP: fc1 + fc2) */
         snprintf(name, sizeof(name), "%sblocks.%d.mlp.fc1.weight", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->ffn_up_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ffn_up_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.mlp.fc1.bias", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->ffn_up_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ffn_up_b = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.mlp.fc2.weight", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->ffn_down_w = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ffn_down_w = qt_make_tensor(st, idx);
 
         snprintf(name, sizeof(name), "%sblocks.%d.mlp.fc2.bias", prefix, L);
         idx = safetensors_find(st, name);
-        if (idx >= 0) blk->ffn_down_b = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ffn_down_b = qt_make_tensor(st, idx);
+
+        /* SwiGLU FFN (DINOv3-H+: mlp.w1 / mlp.w2 / mlp.w3) */
+        snprintf(name, sizeof(name), "%sblocks.%d.mlp.w1.weight", prefix, L);
+        idx = safetensors_find(st, name);
+        if (idx >= 0) blk->ffn_w1_w = qt_make_tensor(st, idx);
+        snprintf(name, sizeof(name), "%sblocks.%d.mlp.w1.bias", prefix, L);
+        idx = safetensors_find(st, name);
+        if (idx >= 0) blk->ffn_w1_b = qt_make_tensor(st, idx);
+        snprintf(name, sizeof(name), "%sblocks.%d.mlp.w2.weight", prefix, L);
+        idx = safetensors_find(st, name);
+        if (idx >= 0) blk->ffn_w2_w = qt_make_tensor(st, idx);
+        snprintf(name, sizeof(name), "%sblocks.%d.mlp.w2.bias", prefix, L);
+        idx = safetensors_find(st, name);
+        if (idx >= 0) blk->ffn_w2_b = qt_make_tensor(st, idx);
+        snprintf(name, sizeof(name), "%sblocks.%d.mlp.w3.weight", prefix, L);
+        idx = safetensors_find(st, name);
+        if (idx >= 0) blk->ffn_w3_w = qt_make_tensor(st, idx);
+        snprintf(name, sizeof(name), "%sblocks.%d.mlp.w3.bias", prefix, L);
+        idx = safetensors_find(st, name);
+        if (idx >= 0) blk->ffn_w3_b = qt_make_tensor(st, idx);
 
         /* LayerScale 2 (optional: "gamma_2" in timm, "ls2.gamma" in official) */
         snprintf(name, sizeof(name), "%sblocks.%d.gamma_2", prefix, L);
@@ -569,21 +622,40 @@ dinov3_model *dinov3_load_safetensors(const char *st_path) {
             snprintf(name, sizeof(name), "%sblocks.%d.ls2", prefix, L);
             idx = safetensors_find(st, name);
         }
-        if (idx >= 0) blk->ls2 = dinov3_make_tensor(st, idx);
+        if (idx >= 0) blk->ls2 = qt_make_tensor(st, idx);
 
         /* Verify essential block tensors */
         if (L == 0) {
             if (!blk->ln1_w.data) fprintf(stderr, "dinov3: WARNING: block 0 ln1_w missing\n");
             if (!blk->attn_qkv_w.data) fprintf(stderr, "dinov3: WARNING: block 0 qkv_w missing\n");
             if (!blk->attn_out_w.data) fprintf(stderr, "dinov3: WARNING: block 0 attn_out_w missing\n");
-            if (!blk->ffn_up_w.data) fprintf(stderr, "dinov3: WARNING: block 0 ffn_up_w missing\n");
-            if (!blk->ffn_down_w.data) fprintf(stderr, "dinov3: WARNING: block 0 ffn_down_w missing\n");
+            int has_gelu = blk->ffn_up_w.data != NULL;
+            int has_swi  = blk->ffn_w1_w.data != NULL && blk->ffn_w3_w.data != NULL;
+            if (!has_gelu && !has_swi)
+                fprintf(stderr, "dinov3: WARNING: block 0 MLP missing (neither fc1/fc2 nor w1/w2/w3)\n");
+            m->has_swiglu = has_swi;
         }
     }
 
     #undef DINOV3_FIND
 
-    fprintf(stderr, "dinov3: loaded %d blocks\n", m->n_blocks);
+    /* Saved RoPE periods (DINOv3-H+ ships these in the checkpoint). */
+    int rp_idx = safetensors_find(st, "rope_embed.periods");
+    if (rp_idx < 0) {
+        char name[256];
+        snprintf(name, sizeof(name), "%srope_embed.periods", prefix);
+        rp_idx = safetensors_find(st, name);
+    }
+    if (rp_idx >= 0) {
+        m->rope_periods = qt_make_tensor(st, rp_idx);
+        m->has_rope_periods_tensor = 1;
+        fprintf(stderr, "dinov3: loaded saved rope_embed.periods (%d elems)\n",
+                qt_numel(&m->rope_periods));
+    }
+
+    fprintf(stderr, "dinov3: loaded %d blocks%s%s\n", m->n_blocks,
+            m->has_swiglu ? ", swiglu MLP" : ", gelu MLP",
+            m->has_rope_periods_tensor ? ", saved rope periods" : "");
     return m;
 }
 
@@ -606,8 +678,10 @@ void dinov3_free(dinov3_model *m) {
 /* API: dinov3_encode                                                    */
 /* ==================================================================== */
 
-dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
-                            int img_w, int img_h, int n_threads) {
+/* Forward pass after preprocessing. Takes ownership of `img_norm`
+ * (layout: [3, target_h, target_w], row-major). */
+static dinov3_result dinov3_encode_norm_(dinov3_model *m, float *img_norm,
+                                          int n_threads) {
     dinov3_result result = {0};
     int ps = m->patch_size;
     int gh = m->grid_h, gw = m->grid_w;
@@ -620,52 +694,36 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
 
     if (n_threads < 1) n_threads = 1;
     double t_start = dinov3_time_ms();
-
-    /* ─── Step 1: Preprocess ─── */
-    /* Resize to 512x512, normalize with ImageNet mean/std */
-    float *img_norm = (float *)malloc((size_t)3 * target_h * target_w * sizeof(float));
-    for (int c = 0; c < 3; c++) {
-        for (int oh = 0; oh < target_h; oh++) {
-            float fy = (target_h > 1) ? (float)oh * (img_h - 1) / (target_h - 1) : 0.0f;
-            int y0 = (int)fy; int y1 = y0 + 1 < img_h ? y0 + 1 : y0;
-            float dy = fy - y0;
-            for (int ow = 0; ow < target_w; ow++) {
-                float fx = (target_w > 1) ? (float)ow * (img_w - 1) / (target_w - 1) : 0.0f;
-                int x0 = (int)fx; int x1 = x0 + 1 < img_w ? x0 + 1 : x0;
-                float dx = fx - x0;
-                float v = (float)rgb[(y0 * img_w + x0) * 3 + c] * (1-dy)*(1-dx)
-                        + (float)rgb[(y0 * img_w + x1) * 3 + c] * (1-dy)*dx
-                        + (float)rgb[(y1 * img_w + x0) * 3 + c] * dy*(1-dx)
-                        + (float)rgb[(y1 * img_w + x1) * 3 + c] * dy*dx;
-                img_norm[c * target_h * target_w + oh * target_w + ow] =
-                    (v / 255.0f - m->image_mean[c]) / m->image_std[c];
-            }
-        }
-    }
+    int emulate_bf16 = dinov3_emulate_bf16_activations(m);
 
     /* ─── Step 2: Patch embedding ─── */
     /* Token layout: [CLS, stor1..stor_ns, patch1..patch_np] */
     int patch_start = 1 + ns;  /* index of first patch token */
     float *hidden = (float *)calloc((size_t)nt * dim, sizeof(float));
     {
-        float *pw = dinov3_dequant(&m->patch_embed_w);
-        float *pb = dinov3_dequant(&m->patch_embed_b);
+        float *pw = qt_dequant(&m->patch_embed_w);
+        float *pb = qt_dequant(&m->patch_embed_b);
         /* patch_embed_w: [Co=dim, Ci=3, kH=ps, kW=ps] in PyTorch row-major order */
         int Co = dim, Ci = 3;
+        #if defined(_OPENMP)
+        #pragma omp parallel for collapse(2) schedule(static) num_threads(n_threads)
+        #endif
         for (int py = 0; py < gh; py++) {
             for (int px = 0; px < gw; px++) {
                 int tok = patch_start + py * gw + px;
-                float *out = hidden + tok * dim;
+                float *out = hidden + (size_t)tok * dim;
                 if (pb) memcpy(out, pb, (size_t)dim * sizeof(float));
                 for (int co = 0; co < Co; co++) {
+                    const float *wco = pw + (size_t)co * Ci * ps * ps;
                     float sum = 0.0f;
                     for (int ci = 0; ci < Ci; ci++) {
+                        const float *img_c = img_norm + (size_t)ci * target_h * target_w;
+                        const float *wci = wco + (size_t)ci * ps * ps;
                         for (int kh = 0; kh < ps; kh++) {
+                            const float *img_row = img_c + (size_t)(py * ps + kh) * target_w + px * ps;
+                            const float *wrow = wci + (size_t)kh * ps;
                             for (int kw = 0; kw < ps; kw++) {
-                                int ih = py * ps + kh;
-                                int iw = px * ps + kw;
-                                sum += pw[((co * Ci + ci) * ps + kh) * ps + kw]
-                                     * img_norm[ci * target_h * target_w + ih * target_w + iw];
+                                sum += wrow[kw] * img_row[kw];
                             }
                         }
                     }
@@ -679,7 +737,7 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
 
     /* ─── Step 3: CLS token + storage tokens (NO positional embeddings) ─── */
     {
-        float *cls = dinov3_dequant(&m->cls_token);
+        float *cls = qt_dequant(&m->cls_token);
         if (cls) {
             /* cls_token may be [1, dim] or [dim] */
             memcpy(hidden, cls, (size_t)dim * sizeof(float));
@@ -687,7 +745,7 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
         }
 
         if (m->storage_tokens.data && ns > 0) {
-            float *stor = dinov3_dequant(&m->storage_tokens);
+            float *stor = qt_dequant(&m->storage_tokens);
             if (stor) {
                 /* storage_tokens: [1, n_storage, dim] or [n_storage, dim] */
                 int offset = 0;
@@ -704,6 +762,7 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
 
         /* DINOv3: NO learned positional embeddings — RoPE is the only position encoding */
     }
+    if (emulate_bf16) dinov3_bf16_roundtrip_inplace(hidden, (size_t)nt * dim);
 
     /* ─── Build DINOv3 RoPE sin/cos embedding for patch tokens ─── */
     /* DINOv3 RoPE: 0.5-centered coords normalized to [-1,1], periods = temp^(2i/(dim//2))
@@ -716,13 +775,27 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
     float *rope_sin = (float *)malloc((size_t)np * hd * sizeof(float));
     float *rope_cos = (float *)malloc((size_t)np * hd * sizeof(float));
     {
-        /* Compute periods: temp^(2*j / (dim//2)) for j in 0..rope_dim4-1 */
+        /* Periods: prefer the saved `rope_embed.periods` tensor (DINOv3-H+
+         * ships them in the checkpoint); fall back to computing from
+         * rope_freq_base when absent. */
         float periods[64]; /* max rope_dim4 */
-        for (int j = 0; j < rope_dim4; j++) {
-            float exponent = 2.0f * (float)j / (float)(hd / 2);
-            periods[j] = powf(m->rope_freq_base, exponent);
+        if (m->has_rope_periods_tensor && m->rope_periods.data) {
+            float *tmp = qt_dequant(&m->rope_periods);
+            int n = qt_numel(&m->rope_periods);
+            int k = n < rope_dim4 ? n : rope_dim4;
+            for (int j = 0; j < k; j++) periods[j] = tmp[j];
+            for (int j = k; j < rope_dim4; j++) periods[j] = tmp[k - 1];
+            free(tmp);
+        } else {
+            for (int j = 0; j < rope_dim4; j++) {
+                float exponent = 2.0f * (float)j / (float)(hd / 2);
+                periods[j] = powf(m->rope_freq_base, exponent);
+            }
         }
         /* Compute coords: (0.5 + i) / N * 2 - 1 for each patch position */
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
         for (int p = 0; p < np; p++) {
             int py = p / gw;
             int px = p % gw;
@@ -752,25 +825,39 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
 
     /* ─── Step 4: Transformer blocks ─── */
     double t_backbone = dinov3_time_ms();
+    int timing = dinov3_timing_enabled();
+    double tm_ln1 = 0.0, tm_qkv = 0.0, tm_qknorm = 0.0, tm_rope = 0.0;
+    double tm_attn = 0.0, tm_proj = 0.0, tm_res1 = 0.0;
+    double tm_ln2 = 0.0, tm_ffn_gate = 0.0, tm_ffn_up = 0.0;
+    double tm_ffn_act = 0.0, tm_ffn_down = 0.0, tm_res2 = 0.0;
+    const char *block_dump_dir = getenv("DINOV3_DUMP_BLOCKS_DIR");
     float *ln_buf   = (float *)malloc((size_t)nt * dim * sizeof(float));
     float *qkv      = (float *)malloc((size_t)nt * 3 * dim * sizeof(float));
     float *attn_out = (float *)malloc((size_t)nt * dim * sizeof(float));
     int ffn_dim = m->ffn_hidden;
-    float *ffn_buf  = (float *)malloc((size_t)nt * ffn_dim * sizeof(float));
+    float *ffn_buf    = (float *)malloc((size_t)nt * ffn_dim * sizeof(float));
+    float *ffn_up_buf = (float *)malloc((size_t)nt * ffn_dim * sizeof(float));
+    float *proj_out   = (float *)malloc((size_t)nt * dim * sizeof(float));
+    float *ffn_out    = (float *)malloc((size_t)nt * dim * sizeof(float));
 
     for (int L = 0; L < m->n_blocks; L++) {
         dinov3_block *blk = &m->blocks[L];
+        double t0 = 0.0;
 
-        /* LayerNorm 1 */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layernorm_batch(ln_buf, hidden, &blk->ln1_w, &blk->ln1_b,
                                nt, dim, m->ln_eps);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ln_buf, (size_t)nt * dim);
+        if (timing) tm_ln1 += dinov3_time_ms() - t0;
 
-        /* QKV projection */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_batch_gemm(qkv, &blk->attn_qkv_w, &blk->attn_qkv_b,
                           ln_buf, nt, 3 * dim, dim, n_threads);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(qkv, (size_t)nt * 3 * dim);
+        if (timing) tm_qkv += dinov3_time_ms() - t0;
 
-        /* QK normalization (if present) */
         if (m->has_qk_norm && blk->attn_q_norm_w.data) {
+            if (timing) t0 = dinov3_time_ms();
             float *q_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             float *k_flat = (float *)malloc((size_t)nt * dim * sizeof(float));
             for (int t = 0; t < nt; t++) {
@@ -786,24 +873,24 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
                 memcpy(qkv + t * 3 * dim + dim, k_flat + t * dim, (size_t)dim * sizeof(float));
             }
             free(q_flat); free(k_flat);
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(qkv, (size_t)nt * 3 * dim);
+            if (timing) tm_qknorm += dinov3_time_ms() - t0;
         }
 
-        /* DINOv3 RoPE: apply only to patch tokens (skip prefix tokens)
-         * rotate_half convention: out = x * cos + rotate_half(x) * sin
-         * where rotate_half([x0..x_{D/2-1}, x_{D/2}..x_{D-1}]) =
-         *       [-x_{D/2}..-x_{D-1}, x_0..x_{D/2-1}] */
+        if (timing) t0 = dinov3_time_ms();
         {
             int half_hd = hd / 2;
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(static) num_threads(n_threads)
+            #endif
             for (int p = 0; p < np; p++) {
                 int t = patch_start + p;
                 const float *s = rope_sin + p * hd;
                 const float *c = rope_cos + p * hd;
-                /* Apply to Q and K for each head */
                 for (int qk = 0; qk < 2; qk++) {
                     for (int h = 0; h < m->n_heads; h++) {
-                        float *v = qkv + t * 3 * dim + qk * dim + h * hd;
-                        /* rotate_half: [-v[D/2..D-1], v[0..D/2-1]] */
-                        float tmp[128]; /* max head_dim */
+                        float *v = qkv + (size_t)t * 3 * dim + qk * dim + h * hd;
+                        float tmp[128];
                         for (int j = 0; j < half_hd; j++) {
                             tmp[j]           = -v[half_hd + j];
                             tmp[half_hd + j] =  v[j];
@@ -811,74 +898,160 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
                         for (int j = 0; j < hd; j++) {
                             v[j] = v[j] * c[j] + tmp[j] * s[j];
                         }
+                        if (emulate_bf16) {
+                            for (int j = 0; j < hd; j++) v[j] = dinov3_f32_to_bf16_roundtrip(v[j]);
+                        }
                     }
                 }
             }
         }
+        if (timing) tm_rope += dinov3_time_ms() - t0;
 
-        /* Multi-head attention */
+        if (timing) t0 = dinov3_time_ms();
         cpu_attention(attn_out, qkv, nt, dim, m->n_heads, m->head_dim, n_threads);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(attn_out, (size_t)nt * dim);
+        if (timing) tm_attn += dinov3_time_ms() - t0;
 
-        /* Attention output projection */
-        float *proj_out = (float *)malloc((size_t)nt * dim * sizeof(float));
+        if (timing) t0 = dinov3_time_ms();
         dinov3_batch_gemm(proj_out, &blk->attn_out_w, &blk->attn_out_b,
                           attn_out, nt, dim, dim, n_threads);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(proj_out, (size_t)nt * dim);
+        if (timing) tm_proj += dinov3_time_ms() - t0;
 
-        /* LayerScale 1 + residual */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layerscale(proj_out, &blk->ls1, nt, dim);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(proj_out, (size_t)nt * dim);
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
         for (int i = 0; i < nt * dim; i++) hidden[i] += proj_out[i];
-        free(proj_out);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(hidden, (size_t)nt * dim);
+        if (timing) tm_res1 += dinov3_time_ms() - t0;
 
-        /* LayerNorm 2 */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layernorm_batch(ln_buf, hidden, &blk->ln2_w, &blk->ln2_b,
                                nt, dim, m->ln_eps);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ln_buf, (size_t)nt * dim);
+        if (timing) tm_ln2 += dinov3_time_ms() - t0;
 
-        /* FFN: GELU MLP (fc1 → GELU → fc2) */
-        float *ffn_out = (float *)malloc((size_t)nt * dim * sizeof(float));
-        if (blk->ffn_up_w.data) {
+        if (m->has_swiglu && blk->ffn_w1_w.data && blk->ffn_w3_w.data) {
+            int fd = blk->ffn_w1_w.n_rows;
+            float *gate = ffn_buf;
+            float *up   = ffn_up_buf;
+            if (timing) t0 = dinov3_time_ms();
+            if (dinov3_swiglu_fused_enabled()) {
+                dinov3_batch_gemm_fused2(gate, &blk->ffn_w1_w, &blk->ffn_w1_b,
+                                         up,   &blk->ffn_w2_w, &blk->ffn_w2_b,
+                                         ln_buf, nt, fd, dim, n_threads);
+            } else {
+                dinov3_batch_gemm(gate, &blk->ffn_w1_w, &blk->ffn_w1_b,
+                                  ln_buf, nt, fd, dim, n_threads);
+                dinov3_batch_gemm(up, &blk->ffn_w2_w, &blk->ffn_w2_b,
+                                  ln_buf, nt, fd, dim, n_threads);
+            }
+            if (emulate_bf16) {
+                dinov3_bf16_roundtrip_inplace(gate, (size_t)nt * fd);
+                dinov3_bf16_roundtrip_inplace(up, (size_t)nt * fd);
+            }
+            if (timing) {
+                double fused_ms = dinov3_time_ms() - t0;
+                tm_ffn_gate += fused_ms;
+            }
+            if (timing) t0 = dinov3_time_ms();
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(static) num_threads(n_threads)
+            #endif
+            for (int i = 0; i < nt * fd; i++) {
+                float g = gate[i];
+                gate[i] = (g / (1.0f + expf(-g))) * up[i];
+            }
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(gate, (size_t)nt * fd);
+            if (timing) tm_ffn_act += dinov3_time_ms() - t0;
+            if (timing) t0 = dinov3_time_ms();
+            dinov3_batch_gemm(ffn_out, &blk->ffn_w3_w, &blk->ffn_w3_b,
+                              gate, nt, dim, fd, n_threads);
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_out, (size_t)nt * dim);
+            if (timing) tm_ffn_down += dinov3_time_ms() - t0;
+        } else if (blk->ffn_up_w.data) {
             int fd = blk->ffn_up_w.n_rows;
+            if (timing) t0 = dinov3_time_ms();
             dinov3_batch_gemm(ffn_buf, &blk->ffn_up_w, &blk->ffn_up_b,
                               ln_buf, nt, fd, dim, n_threads);
-            /* GELU activation */
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_buf, (size_t)nt * fd);
+            if (timing) tm_ffn_gate += dinov3_time_ms() - t0;
+            if (timing) t0 = dinov3_time_ms();
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(static) num_threads(n_threads)
+            #endif
             for (int i = 0; i < nt * fd; i++) {
                 float v = ffn_buf[i];
                 ffn_buf[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
             }
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_buf, (size_t)nt * fd);
+            if (timing) tm_ffn_act += dinov3_time_ms() - t0;
+            if (timing) t0 = dinov3_time_ms();
             dinov3_batch_gemm(ffn_out, &blk->ffn_down_w, &blk->ffn_down_b,
                               ffn_buf, nt, dim, fd, n_threads);
+            if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_out, (size_t)nt * dim);
+            if (timing) tm_ffn_down += dinov3_time_ms() - t0;
         } else {
             memset(ffn_out, 0, (size_t)nt * dim * sizeof(float));
         }
 
-        /* LayerScale 2 + residual */
+        if (timing) t0 = dinov3_time_ms();
         dinov3_layerscale(ffn_out, &blk->ls2, nt, dim);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(ffn_out, (size_t)nt * dim);
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(n_threads)
+        #endif
         for (int i = 0; i < nt * dim; i++) hidden[i] += ffn_out[i];
-        free(ffn_out);
+        if (emulate_bf16) dinov3_bf16_roundtrip_inplace(hidden, (size_t)nt * dim);
+        if (timing) tm_res2 += dinov3_time_ms() - t0;
+
+        dinov3_dump_block_if_requested(block_dump_dir, L, hidden, nt, dim);
     }
 
     free(ln_buf); free(qkv); free(attn_out); free(ffn_buf);
+    free(ffn_up_buf); free(proj_out); free(ffn_out);
     free(rope_sin); free(rope_cos);
 
     double t_norm = dinov3_time_ms();
     fprintf(stderr, "dinov3: preprocess+embed %.1f ms, backbone %.1f ms (%d threads)\n",
             t_backbone - t_start, t_norm - t_backbone, n_threads);
+    if (timing) {
+        fprintf(stderr,
+                "dinov3[timing]: ln1 %.1f qkv %.1f qknorm %.1f rope %.1f "
+                "attn %.1f proj %.1f res1 %.1f ln2 %.1f ffn_gate %.1f "
+                "ffn_up %.1f ffn_act %.1f ffn_down %.1f res2 %.1f ms\n",
+                tm_ln1, tm_qkv, tm_qknorm, tm_rope, tm_attn, tm_proj, tm_res1,
+                tm_ln2, tm_ffn_gate, tm_ffn_up, tm_ffn_act, tm_ffn_down, tm_res2);
+    }
 
     /* ─── Step 5: Final LayerNorm ─── */
-    /* TRELLIS.2 uses unparameterized LN (no weight/bias) for feature extraction,
-     * NOT the model's learned norm. Apply plain (x-mean)/std normalization. */
+    /* Two modes:
+     *   - use_learned_final_norm=0 (default): unparameterized LN
+     *     (x-mean)/std — matches TRELLIS.2's feature-extraction hack.
+     *   - use_learned_final_norm=1: standard LayerNorm with the
+     *     model's norm_w / norm_b (sam-3d-body, DINOv3 feature path). */
     float *output = (float *)malloc((size_t)nt * dim * sizeof(float));
-    for (int t = 0; t < nt; t++) {
-        const float *xi = hidden + t * dim;
-        float *yi = output + t * dim;
-        float mean = 0.0f;
-        for (int i = 0; i < dim; i++) mean += xi[i];
-        mean /= dim;
-        float var = 0.0f;
-        for (int i = 0; i < dim; i++) { float d = xi[i] - mean; var += d * d; }
-        var /= dim;
-        float inv = 1.0f / sqrtf(var + m->ln_eps);
-        for (int i = 0; i < dim; i++) yi[i] = (xi[i] - mean) * inv;
+    if (m->use_learned_final_norm && m->norm_w.data) {
+        dinov3_layernorm_batch(output, hidden, &m->norm_w, &m->norm_b,
+                               nt, dim, m->ln_eps);
+    } else {
+        for (int t = 0; t < nt; t++) {
+            const float *xi = hidden + t * dim;
+            float *yi = output + t * dim;
+            float mean = 0.0f;
+            for (int i = 0; i < dim; i++) mean += xi[i];
+            mean /= dim;
+            float var = 0.0f;
+            for (int i = 0; i < dim; i++) { float d = xi[i] - mean; var += d * d; }
+            var /= dim;
+            float inv = 1.0f / sqrtf(var + m->ln_eps);
+            for (int i = 0; i < dim; i++) yi[i] = (xi[i] - mean) * inv;
+        }
     }
+    if (emulate_bf16) dinov3_bf16_roundtrip_inplace(output, (size_t)nt * dim);
     free(hidden);
 
     double t_end = dinov3_time_ms();
@@ -888,6 +1061,49 @@ dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
     result.n_tokens = nt;
     result.dim = dim;
     return result;
+}
+
+dinov3_result dinov3_encode(dinov3_model *m, const uint8_t *rgb,
+                            int img_w, int img_h, int n_threads) {
+    int ps = m->patch_size;
+    int target_h = m->grid_h * ps;
+    int target_w = m->grid_w * ps;
+    float *img_norm = (float *)malloc((size_t)3 * target_h * target_w * sizeof(float));
+    for (int c = 0; c < 3; c++) {
+        for (int oh = 0; oh < target_h; oh++) {
+            float fy = (target_h > 1) ? (float)oh * (img_h - 1) / (target_h - 1) : 0.0f;
+            int y0 = (int)fy; int y1 = y0 + 1 < img_h ? y0 + 1 : y0;
+            float dy = fy - y0;
+            for (int ow = 0; ow < target_w; ow++) {
+                float fx = (target_w > 1) ? (float)ow * (img_w - 1) / (target_w - 1) : 0.0f;
+                int x0 = (int)fx; int x1 = x0 + 1 < img_w ? x0 + 1 : x0;
+                float dx = fx - x0;
+                float v = (float)rgb[(y0 * img_w + x0) * 3 + c] * (1-dy)*(1-dx)
+                        + (float)rgb[(y0 * img_w + x1) * 3 + c] * (1-dy)*dx
+                        + (float)rgb[(y1 * img_w + x0) * 3 + c] * dy*(1-dx)
+                        + (float)rgb[(y1 * img_w + x1) * 3 + c] * dy*dx;
+                img_norm[c * target_h * target_w + oh * target_w + ow] =
+                    (v / 255.0f - m->image_mean[c]) / m->image_std[c];
+            }
+        }
+    }
+    return dinov3_encode_norm_(m, img_norm, n_threads);
+}
+
+dinov3_result dinov3_encode_from_normalized(dinov3_model *m, const float *chw,
+                                            int img_w, int img_h, int n_threads) {
+    dinov3_result zero = {0};
+    int target_h = m->grid_h * m->patch_size;
+    int target_w = m->grid_w * m->patch_size;
+    if (img_w != target_w || img_h != target_h) {
+        fprintf(stderr, "dinov3_encode_from_normalized: input %dx%d != expected %dx%d\n",
+                img_w, img_h, target_w, target_h);
+        return zero;
+    }
+    size_t nbytes = (size_t)3 * target_h * target_w * sizeof(float);
+    float *img_norm = (float *)malloc(nbytes);
+    memcpy(img_norm, chw, nbytes);
+    return dinov3_encode_norm_(m, img_norm, n_threads);
 }
 
 void dinov3_result_free(dinov3_result *r) {

@@ -1,0 +1,14 @@
+Preset images for web/sam3_compare.html
+All images licensed CC0 1.0 (public-domain dedication).
+
+  cat.jpg       — "Cat"                         via Openverse / Flickr
+                  https://live.staticflickr.com/1731/42700002412_c4e96ba054_b.jpg
+                  resized to 1024px, JPEG q82
+
+  mountain.jpg  — "Snow Covered Mountain Landscape"  via Openverse / Flickr
+                  https://live.staticflickr.com/7675/16662196134_44e1bf8836_b.jpg
+                  resized to 1024px, JPEG q82
+
+  person.jpg    — "Tsvetana Todorova, personal portrait"  Wikimedia Commons
+                  https://commons.wikimedia.org/wiki/File:Tsvetana_Todorova,_personal_portrait.jpg
+                  resized to 768px wide, JPEG q80
