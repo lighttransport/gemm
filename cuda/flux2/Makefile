@@ -21,7 +21,7 @@ test_cuda_flux2: test_cuda_flux2.c cuda_flux2_runner.h \
 		../../common/bpe_tokenizer.h ../../common/qwen_image_scheduler.h \
 		../../common/flux2_klein_dit.h ../../common/flux2_klein_vae.h \
 		../../common/flux2_klein_text_encoder.h
-	$(CC) $(CFLAGS) -o $@ $< ../llm/cuda_llm_runner.c ../cuew.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $< ../llm/cuda_llm_runner.c ../cuew.c ../cublasew.c $(LDFLAGS)
 
 test-init: test_cuda_flux2
 	./test_cuda_flux2 --test-init
