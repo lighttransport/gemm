@@ -640,6 +640,30 @@ void sam3d_cpu_slat_dit_set_transformer_hook(sam3d_cpu_slat_transformer_hook_fn 
     sam3d_slat_dit_set_transformer_hook((sam3d_slat_dit_transformer_hook_fn)fn, user);
 }
 
+void sam3d_cpu_slat_dit_set_ape_transformer_hook(sam3d_cpu_slat_ape_transformer_hook_fn fn,
+                                                 void *user)
+{
+    sam3d_slat_dit_set_ape_transformer_hook((sam3d_slat_dit_ape_transformer_hook_fn)fn, user);
+}
+
+void sam3d_cpu_slat_dit_set_input_layer_hook(sam3d_cpu_slat_input_layer_hook_fn fn,
+                                             void *user)
+{
+    sam3d_slat_dit_set_input_layer_hook((sam3d_slat_dit_input_layer_hook_fn)fn, user);
+}
+
+void sam3d_cpu_slat_dit_set_io_block_hook(sam3d_cpu_slat_io_block_hook_fn fn,
+                                          void *user)
+{
+    sam3d_slat_dit_set_io_block_hook((sam3d_slat_dit_io_block_hook_fn)fn, user);
+}
+
+void sam3d_cpu_slat_dit_set_final_layer_hook(sam3d_cpu_slat_final_layer_hook_fn fn,
+                                             void *user)
+{
+    sam3d_slat_dit_set_final_layer_hook((sam3d_slat_dit_final_layer_hook_fn)fn, user);
+}
+
 float *sam3d_cpu_slat_dit_forward(sam3d_cpu_slat_dit *w,
                                   const int32_t *coords,
                                   const float *feats, int N,
@@ -798,6 +822,55 @@ void sam3d_cpu_gs_decoder_free(sam3d_cpu_gs_decoder *w)
 int sam3d_cpu_gs_decoder_in_channels  (const sam3d_cpu_gs_decoder *w) { return (w && w->m) ? w->m->in_channels   : 0; }
 int sam3d_cpu_gs_decoder_out_channels (const sam3d_cpu_gs_decoder *w) { return (w && w->m) ? w->m->out_channels  : 0; }
 int sam3d_cpu_gs_decoder_num_gaussians(const sam3d_cpu_gs_decoder *w) { return (w && w->m) ? w->m->num_gaussians : 0; }
+void *sam3d_cpu_gs_decoder_model(sam3d_cpu_gs_decoder *w) { return w ? w->m : NULL; }
+
+void sam3d_cpu_gs_decoder_set_input_ape_hook(sam3d_cpu_gs_input_ape_hook_fn fn,
+                                             void *user)
+{
+    sam3d_gs_decoder_set_input_ape_hook((sam3d_gs_input_ape_hook_fn)fn, user);
+}
+
+void sam3d_cpu_gs_decoder_set_final_layer_hook(sam3d_cpu_gs_final_layer_hook_fn fn,
+                                               void *user)
+{
+    sam3d_gs_decoder_set_final_layer_hook((sam3d_gs_final_layer_hook_fn)fn, user);
+}
+
+void sam3d_cpu_gs_decoder_set_window_attn_hook(sam3d_cpu_gs_window_attn_hook_fn fn,
+                                               void *user)
+{
+    sam3d_gs_decoder_set_window_attn_hook((sam3d_gs_window_attn_hook_fn)fn, user);
+}
+
+void sam3d_cpu_gs_decoder_set_attn_block_hook(sam3d_cpu_gs_attn_block_hook_fn fn,
+                                              void *user)
+{
+    sam3d_gs_decoder_set_attn_block_hook((sam3d_gs_attn_block_hook_fn)fn, user);
+}
+
+void sam3d_cpu_gs_decoder_set_mlp_hook(sam3d_cpu_gs_mlp_hook_fn fn,
+                                       void *user)
+{
+    sam3d_gs_decoder_set_mlp_hook((sam3d_gs_mlp_hook_fn)fn, user);
+}
+
+void sam3d_cpu_gs_decoder_set_block_hook(sam3d_cpu_gs_block_hook_fn fn,
+                                         void *user)
+{
+    sam3d_gs_decoder_set_block_hook((sam3d_gs_block_hook_fn)fn, user);
+}
+
+void sam3d_cpu_gs_decoder_set_stack_hook(sam3d_cpu_gs_stack_hook_fn fn,
+                                         void *user)
+{
+    sam3d_gs_decoder_set_stack_hook((sam3d_gs_stack_hook_fn)fn, user);
+}
+
+void sam3d_cpu_gs_decoder_set_transformer_hook(sam3d_cpu_gs_transformer_hook_fn fn,
+                                               void *user)
+{
+    sam3d_gs_decoder_set_transformer_hook((sam3d_gs_transformer_hook_fn)fn, user);
+}
 
 float *sam3d_cpu_gs_decoder_transformer(sam3d_cpu_gs_decoder *w,
                                         const int32_t *coords,
