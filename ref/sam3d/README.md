@@ -50,7 +50,7 @@ output of each to `/tmp/sam3d_ref/<stage>.npy` as f32.
 |----------------------|---------------------|-------|----------------------------------------|
 | `input_image.npy`    | (H, W, 3)           | u8    | PIL load (always written)              |
 | `input_mask.npy`     | (H, W)              | u8    | PIL load (always written)              |
-| `pointmap.npy`       | (H, W, 3)           | f32   | MoGe (optional in v1)                  |
+| `pointmap.npy`       | (H, W, 3)           | f32   | MoGe or user-supplied pointmap         |
 | `dinov2_tokens.npy`  | (257, 768)          | f32   | DINOv2-B/14 @ 224                      |
 | `cond_tokens.npy`    | (N, C)              | f32   | CondEmbedderFuser                      |
 | `ss_latent.npy`      | (8, 16, 16, 16)     | f32   | SS Flow DiT → latent                   |
@@ -80,8 +80,33 @@ python ref/sam3d/gen_image_ref.py \
     --outdir /tmp/sam3d_ref --skip-run
 ```
 
+## MoGe pointmaps
+
+`moge_pointmap.py` runs the installed MoGe package and writes the
+`(H, W, 3)` float32 pointmap consumed by the C/CUDA runners:
+
+```bash
+ref/sam3d/.venv/bin/python ref/sam3d/moge_pointmap.py \
+    --image fujisan.jpg \
+    --out /tmp/sam3d_ref/pointmap.npy
+```
+
+The script defaults to `/mnt/disk01/models/moge-vitl/model.pt` when it
+exists, otherwise to the HF id `Ruicheng/moge-vitl`. The CUDA CLI can
+invoke this helper directly with `--moge`; `--moge-out p.npy` preserves
+the generated pointmap instead of using a temporary file.
+
 ## Deferred
 
-* MoGe depth model: not yet wired — user can supply `pointmap.npy`
-  manually and the C runner's `--pointmap` flag picks it up.
-* SLAT Mesh decoder / FlexiCubes / texture bake: out of v1.
+* SLAT mesh decoder: native SDF/deformation/vertex-RGB and
+  FlexiCubes-style beta/alpha/gamma topology extraction are wired in the
+  CUDA CLI via `--mesh-source slat`; upstream ambiguity/check-table
+  parity is implemented. `--mesh-texture-size N` unwraps with vendored
+  xatlas and writes an embedded PNG textured GLB; decoder RGB is the
+  fallback color source, while `--mesh-texture-color image` uses the
+  input image plus finite masked pointmap for deterministic single-view
+  source projection. `--mesh-texture-mode grid` forces the legacy
+  duplicated triangle-grid atlas for comparison; in that mode
+  `--mesh-texture-size` is a minimum and may grow to preserve 4x4 texel
+  tiles per triangle. High-quality multiview source/appearance
+  optimization remains out of v1.

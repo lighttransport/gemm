@@ -1,6 +1,6 @@
 # SAM 3D Objects — CUDA port journal
 
-The current state, drift table, phase summaries, and TODOs have been
+The current state, drift table, phase summaries, and deferred v1 work have been
 moved to **`doc/sam3d.md`** (project-root-relative). See that file for
 the doc-friendly snapshot.
 
@@ -11,10 +11,14 @@ fold summaries into `doc/sam3d.md`.
 ## Current focus
 
 Phase 4b (SS-VAE decoder) is GPU-resident and green in
-`verify_ss_decoder`. Phase 7a full sampled E2E is now green. Phase
-5b.0 moved the SLAT prune boundary to GPU; 5b.1 added the SLAT APE
-CUDA primitive; 5b.2 added deterministic sparse downsample; 5b.3
-added sparse upsample; 5b.4 added submanifold sparse Conv3d; 5b.5
+`verify_ss_decoder`. Phase 7a full sampled E2E is now green, and the
+CLI can generate MoGe pointmaps with `--moge` and export untextured
+occupancy meshes and learned SLAT meshes as `.obj`, `.ply`, or `.glb`;
+learned textured GLB export now uses xatlas UVs for decoder-RGB and
+source-image color texture paths.
+Phase 5b.0 moved the SLAT prune boundary to
+GPU; 5b.1 added the SLAT APE CUDA primitive; 5b.2 added deterministic
+sparse downsample; 5b.3 added sparse upsample; 5b.4 added submanifold sparse Conv3d; 5b.5
 validated full sparse self-attention; 5b.6 validated SLAT
 cross-attention geometry; 5b.7 composed the no-up/down IO resblock.
 5b.8 composed the SLAT transformer MLP residual path; 5b.9 composed
@@ -68,6 +72,165 @@ See `doc/sam3d.md` § "Status — drift table".
 
 ## Recent entries (most recent first)
 
+- **7f.3 — grid atlas minimum-size hardening (SMOKE).**
+  The legacy duplicated triangle-grid texture path now treats
+  `--mesh-texture-size` as a minimum and grows undersized requests to
+  preserve its 4x4 texel tile per triangle. This fixes the
+  `--mesh-texture-size 512 --mesh-texture-mode grid` slat-ref case:
+  image-color projection covers 13536/13536 vertices and writes
+  `/tmp/sam3d_image_grid_smoke.glb` with duplicated accessor counts
+  `[71628, 71628, 71628]`; the embedded PNG grows to 620x620, the
+  minimum for 23876 triangles.
+- **7f.2 — source-image texture color mode (SMOKE).**
+  Added `--mesh-texture-color auto|decoder|image`. `decoder` preserves
+  the learned mesh decoder RGB path. `image` projects source RGB onto
+  mesh vertices by using the finite masked pointmap as a nearest-neighbor
+  source cloud after bbox-normalizing camera-space MoGe points to the
+  canonical learned-mesh bbox; vertices without a local source match
+  keep decoder RGB. `auto` is the default and uses this source-image path
+  when image+pointmap data are available, otherwise it falls back to
+  decoder RGB. Smoke:
+  `/tmp/sam3d_ref` slat-ref with source image/mask/pointmap and
+  `--mesh-texture-size 1024 --mesh-texture-color image` projected
+  13536/13536 mesh vertices from 41688 masked pointmap texels, then
+  wrote `/tmp/sam3d_learned_mesh_image_tex.glb` with 29791 xatlas verts /
+  23876 tris / 3302 charts / 680x684 atlas in real=5.15 s. GLB JSON
+  validates with `POSITION`, `TEXCOORD_0`, indexed count 71628,
+  `baseColorTexture`, embedded `image/png`, and a valid PNG signature.
+  Full image->SLAT->source-color textured mesh writes
+  `/tmp/sam3d_learned_mesh_image_tex_full.glb` in real=224.47 s,
+  projecting 38633/38633 vertices from the same 41688 masked pointmap
+  texels before xatlas bake. The full GLB validates with 64834 atlas
+  verts, indexed count 228552, embedded PNG, and file size 3.94 MiB.
+  This is a deterministic single-view source projection, not the
+  upstream multiview nvdiffrast optimization bake.
+- **7f — xatlas UVs for decoder-RGB textured GLB (SMOKE).**
+  Added `common/sam3d_xatlas.{h,cc}`, a narrow C ABI wrapper around the
+  vendored C++ xatlas library. `test_cuda_sam3d` still exposes the same
+  `--mesh-texture-size N` flag, but now prefers xatlas-generated UVs and
+  indexed GLB output before falling back to the older triangle-grid atlas
+  path. `common/tiny_gltf.h` now has an indexed textured-GLB writer that
+  emits `POSITION`, `TEXCOORD_0`, indices, material texture, and embedded
+  PNG. The smoke run
+  `--slat-ref /tmp/sam3d_ref --mesh-only --mesh-texture-size 1024`
+  writes `/tmp/sam3d_learned_mesh_xatlas_tex.glb` with 29791 atlas verts
+  / 23876 tris / 3302 charts / 680x684 xatlas atlas in real=5.18 s.
+  GLB JSON validates with `POSITION`, `TEXCOORD_0`, indexed count 71628,
+  `baseColorTexture`, embedded `image/png`, and a valid PNG signature.
+  Full image->SLAT->xatlas-textured mesh writes
+  `/tmp/sam3d_learned_mesh_xatlas_tex_full.glb` with 64834 atlas verts /
+  76184 tris / 3710 charts / 1848x1844 xatlas atlas in real=225.50 s;
+  GLB JSON validates with indexed count 228552, embedded PNG, and file
+  size 5.6 MiB vs 8.5 MiB for the older duplicated triangle-grid
+  textured GLB.
+- **7f.1 — explicit texture bake mode switch (SMOKE).**
+  Added `--mesh-texture-mode xatlas|grid`; default is `xatlas`, while
+  `grid` forces the previous duplicated per-triangle atlas path for
+  regression comparison. Smoke:
+  `--mesh-texture-size 1024 --mesh-texture-mode grid` writes
+  `/tmp/sam3d_learned_mesh_grid_mode.glb` with `POSITION`,
+  `TEXCOORD_0`, embedded PNG, and accessor counts
+  `[71628, 71628, 71628]` in real=5.41 s. The equivalent xatlas smoke
+  uses `[29791, 29791, 71628]` and 1.3 MiB vs 2.3 MiB for grid.
+- **7e — MoGe pointmap helper and CLI wiring (SMOKE).**
+  Added `ref/sam3d/moge_pointmap.py`, which runs
+  `moge.model.v1.MoGeModel` and writes `(H,W,3)` float32 pointmaps.
+  `test_cuda_sam3d` now exposes `--moge`, `--moge-out`,
+  `--moge-python`, `--moge-script`, `--moge-model`, and
+  `--moge-device`; the default path uses
+  `ref/sam3d/.venv/bin/python`, `ref/sam3d/moge_pointmap.py`, and
+  `/mnt/disk01/models/moge-vitl/model.pt` when present. The C side
+  invokes Python via `fork`/`execvp`, not through a shell, then loads the
+  generated `.npy` through the normal `--pointmap` path. Smoke:
+  `--moge --moge-out /tmp/sam3d_moge_cli.npy --slat-ref /tmp/sam3d_ref`
+  generated a `(64,96,3)` pointmap and wrote 8192 gaussians to
+  `/tmp/sam3d_moge_cli_splat.ply` in real=24.21 s. Full reference image
+  MoGe generation writes `/tmp/sam3d_moge_full.npy` with shape
+  `(898,1600,3)` in real=20.68 s on CPU; it is byte-equivalent at tensor
+  level to the existing `/tmp/sam3d_ref/pointmap.npy` (`max_abs=0`,
+  identical NaN mask).
+- **7d — textured learned-mesh GLB smoke (SMOKE).**
+  `common/tiny_gltf.h` now supports a textured GLB path that duplicates
+  triangle vertices, generates per-triangle atlas UVs, bakes decoder
+  vertex RGB into an embedded PNG via `stb_image_write.h`, and emits a
+  glTF material using `baseColorTexture`. The CLI exposes this as
+  `--mesh-texture-size N` for learned `.glb` export; without the flag it
+  keeps the compact `COLOR_0` path. Smoke:
+  `/tmp/sam3d_learned_mesh_tex.glb` writes `TEXCOORD_0`, an embedded
+  `image/png`, and 71628 duplicated textured vertices in real=4.57 s.
+  Full image->SLAT->learned mesh writes
+  `/tmp/sam3d_learned_mesh_tex_full.glb` with 38633 source verts /
+  76184 tris, duplicated to 228552 textured vertices, in real=135.62 s.
+  Both GLBs validate as glTF 2.0 with material/texture/image links and
+  PNG signatures.
+- **7c.4 — FlexiCubes ambiguity check-table parity (SMOKE).**
+  Added upstream `check_table` to `common/flexicubes_tables.h` and
+  mirrored FlexiCubes `_get_case_id`: problematic DMC cases inspect the
+  configured neighboring cube and invert the case when both sides form
+  the ambiguous pair. Smoke: `/tmp/sam3d_learned_mesh_fc_check.glb`
+  writes 13536 verts / 23876 tris with `COLOR_0` in real=2.90 s. Full
+  image->SLAT->learned mesh writes
+  `/tmp/sam3d_learned_mesh_fc_check_full.glb` with 38633 verts /
+  76184 tris in real=135.67 s. Both GLBs validate as glTF 2.0 with
+  `POSITION`, `COLOR_0`, and matching index accessor counts.
+- **7c.3 — FlexiCubes-style learned mesh extractor (SMOKE).**
+  `common/flexicubes_tables.h` now carries the SAM3D DMC tables, and
+  `common/sam3d_mesh_decoder.h` uses the learned SDF, deformation,
+  vertex RGB, and beta/alpha/gamma channels to emit FlexiCubes-style
+  dual vertices and gamma-split quads before GLB export. Marching cubes
+  remains as a safety fallback if no faces are produced. Smoke:
+  `/tmp/sam3d_learned_mesh_fc.glb` writes 13536 verts / 23876 tris with
+  `COLOR_0` in real=5.56 s. Full image->SLAT->learned mesh writes
+  `/tmp/sam3d_learned_mesh_fc_full.glb` with 38603 verts / 76184 tris
+  in real=135.58 s. Both GLBs validate as glTF 2.0 with `POSITION`,
+  `COLOR_0`, and matching index accessor counts.
+- **7c.2 — learned mesh deformation field (SMOKE).**
+  The learned mesh extractor now also averages the decoder's 8x3
+  deformation channels into the dense 257^3 vertex grid and applies a
+  trilinear tanh-scaled displacement to exported mesh vertices. This
+  mirrored the deformation term used before upstream FlexiCubes, while
+  topology was still marching-cubes based at this stage. Smoke:
+  `/tmp/sam3d_learned_mesh_deform_color.glb` writes 62712 verts /
+  20904 tris with vertex RGB in real=3.74 s; GLB header validates and
+  JSON contains `COLOR_0`.
+- **7c.1 — learned mesh vertex-color GLB (SMOKE).**
+  `common/tiny_gltf.h` now supports optional float RGB vertex colors as
+  glTF `COLOR_0`, and the learned mesh path samples the decoder's
+  color channels onto marching-cubes vertices. Smoke:
+  `/tmp/sam3d_learned_mesh_color.glb` writes 62712 verts / 20904 tris
+  with vertex RGB in real=3.19 s; GLB JSON contains
+  `attributes: { POSITION: 0, COLOR_0: 1 }`.
+- **7c — learned SLAT mesh decoder GLB export (SMOKE).**
+  `cpu/sam3d/convert_ckpt.py` now converts `slat_decoder_mesh.ckpt` to
+  `sam3d_slat_mesh_decoder.safetensors`; the local converted file is
+  present at `/mnt/disk01/models/sam3d/safetensors/`. Added
+  `common/sam3d_mesh_decoder.h`, which runs the mesh checkpoint's
+  shared sparse transformer trunk, two SparseSubdivideBlock3d upsample
+  heads (768->192->96), and 101-channel mesh output head. The initial
+  native extractor ran marching cubes on the learned SDF channels,
+  applied learned deformation, and sampled learned RGB into GLB
+  `COLOR_0`; 7c.3 replaces that normal path with FlexiCubes-style
+  topology/weight extraction.
+  `test_cuda_sam3d` auto-selects this path for `.glb` when
+  the safetensors file exists, and also exposes
+  `--mesh-source occupancy|slat`, `--mesh-decoder`, and
+  `--mesh-threads`. Smoke: `--slat-ref /tmp/sam3d_ref --mesh-source
+  slat --mesh-only --mesh-out /tmp/sam3d_learned_mesh_ref.glb` writes
+  62712 verts / 20904 tris in real=2.97 s. Full image->SLAT->learned
+  mesh writes `/tmp/sam3d_learned_mesh_full.glb` with 229794 verts /
+  76598 tris in real=132.86 s. Both GLB headers validate as glTF 2.0
+  with matching byte lengths.
+- **7b — occupancy mesh and GLB export (SMOKE).**
+  `test_cuda_sam3d` now accepts `--mesh-out mesh.obj|mesh.ply|mesh.glb`,
+  `--mesh-iso F`, and `--mesh-only`; `-o out.glb` maps to mesh-only GLB
+  export. The mesh path runs marching cubes on the SS decoder occupancy
+  logits via `common/marching_cubes.h` and writes `.glb` through the new
+  minimal `common/tiny_gltf.h` binary glTF writer. This remains
+  available as `--mesh-source occupancy` even when the learned mesh
+  decoder is present. Smoke: `--mesh-source occupancy -o
+  /tmp/cuda_sam3d_mesh.glb --mesh-only` writes 11340 verts / 3780 tris
+  in real=92.26 s; the GLB header validates as glTF 2.0 with matching
+  byte length.
 - **5b.37 / 6b.19 — normal SLAT ODE device orchestration (GREEN).**
   `cuda_sam3d_run_slat_dit` now bypasses
   `sam3d_cpu_slat_dit_run_ode_from_coords` on the normal sampled path.
