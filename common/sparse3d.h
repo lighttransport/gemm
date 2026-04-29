@@ -45,21 +45,7 @@
 extern "C" {
 #endif
 
-/* Reuse qtensor if not already defined */
-#ifndef TRANSFORMER_H
-#ifndef DEPTH_ANYTHING3_H
-#ifndef DINOV3_H
-typedef struct {
-    void    *data;
-    uint32_t type;
-    int      n_rows;
-    int      n_cols;
-    int      n_dims;
-    uint64_t dims[4];
-} qtensor;
-#endif
-#endif
-#endif
+#include "qtensor_utils.h"
 
 /* ---- Spatial hash table (opaque) ---- */
 typedef struct sp3d_hash sp3d_hash;
@@ -209,7 +195,7 @@ static inline double sp3d_clock_ms(void) {
 }
 
 static inline void sp3d_prof_begin(double *t0) {
-    if (sp3d_g_prof.enabled) *t0 = sp3d_clock_ms();
+    *t0 = sp3d_g_prof.enabled ? sp3d_clock_ms() : 0.0;
 }
 
 static inline void sp3d_prof_end(enum sp3d_op op, double t0, int64_t mem_bytes) {
@@ -474,30 +460,6 @@ sp3d_tensor *sp3d_cat_feats(const sp3d_tensor *a, const sp3d_tensor *b) {
 /* Tensor helpers (dequant, GEMM)                                        */
 /* ==================================================================== */
 
-static void sp3d_dequant_row(const qtensor *t, int row, float *dst) {
-    int n = t->n_cols;
-    if (row < 0 || row >= t->n_rows) {
-        memset(dst, 0, (size_t)n * sizeof(float));
-        return;
-    }
-    if (t->type == GGML_TYPE_F16) {
-        const uint16_t *src = (const uint16_t *)t->data + (size_t)row * n;
-        for (int i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(src[i]);
-    } else if (t->type == GGML_TYPE_F32) {
-        memcpy(dst, (const float *)t->data + (size_t)row * n, (size_t)n * sizeof(float));
-    } else {
-        int bs, ts;
-        switch (t->type) {
-            case GGML_TYPE_Q8_0: bs = 32; ts = 34; break;
-            case GGML_TYPE_Q4_K: bs = 256; ts = 144; break;
-            case GGML_TYPE_Q6_K: bs = 256; ts = 210; break;
-            default: memset(dst, 0, (size_t)n * sizeof(float)); return;
-        }
-        size_t row_bytes = (size_t)((n + bs - 1) / bs) * ts;
-        dequant_row(t->type, (const uint8_t *)t->data + row * row_bytes, dst, n);
-    }
-}
-
 /* ==================================================================== */
 /* SIMD helpers                                                           */
 /* ==================================================================== */
@@ -599,6 +561,26 @@ static void *sp3d_gemm_worker(void *arg) {
     return NULL;
 }
 
+static void sp3d_gemm_f32_dispatch(float *dst, const float *src,
+                                    const float *Wf, const float *bf,
+                                    int N, int out_C, int in_C, int n_threads) {
+    if (n_threads <= 1 || N < n_threads * 4) {
+        sp3d_gemm_f32_range(dst, src, Wf, bf, 0, N, out_C, in_C);
+        return;
+    }
+    sp3d_gemm_task *tasks = (sp3d_gemm_task *)calloc((size_t)n_threads, sizeof(sp3d_gemm_task));
+    pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
+    int per = N / n_threads, rem = N % n_threads, v = 0;
+    for (int ti = 0; ti < n_threads; ti++) {
+        int cnt = per + (ti < rem ? 1 : 0);
+        tasks[ti] = (sp3d_gemm_task){dst, src, Wf, bf, v, v + cnt, out_C, in_C};
+        v += cnt;
+        pthread_create(&threads[ti], NULL, sp3d_gemm_worker, &tasks[ti]);
+    }
+    for (int ti = 0; ti < n_threads; ti++) pthread_join(threads[ti], NULL);
+    free(tasks); free(threads);
+}
+
 void sp3d_linear(float *dst, const float *src, int N,
                   const qtensor *W, const qtensor *bias,
                   int out_C, int in_C, int n_threads) {
@@ -612,50 +594,27 @@ void sp3d_linear(float *dst, const float *src, int N,
         float *b = NULL;
         if (bias && bias->data) {
             b = (float *)malloc((size_t)out_C * sizeof(float));
-            sp3d_dequant_row(bias, 0, b);
+            qt_dequant_row(bias, 0, b);
         }
         cpu_gemm_f16(dst, (const uint16_t *)W->data, b, src,
                      N, out_C, in_C, n_threads);
         free(b);
     } else if (W->type == GGML_TYPE_F32) {
-        /* F32 GEMM: dst[i][j] = sum_k src[i][k] * W[j][k] + bias[j] */
         const float *Wf = (const float *)W->data;
         const float *bf = (bias && bias->data) ? (const float *)bias->data : NULL;
-        if (n_threads <= 1 || N < n_threads * 4) {
-            sp3d_gemm_f32_range(dst, src, Wf, bf, 0, N, out_C, in_C);
-        } else {
-            sp3d_gemm_task *tasks = (sp3d_gemm_task *)calloc((size_t)n_threads, sizeof(sp3d_gemm_task));
-            pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-            int per = N / n_threads, rem = N % n_threads, v = 0;
-            for (int ti = 0; ti < n_threads; ti++) {
-                int cnt = per + (ti < rem ? 1 : 0);
-                tasks[ti] = (sp3d_gemm_task){dst, src, Wf, bf, v, v + cnt, out_C, in_C};
-                v += cnt;
-                pthread_create(&threads[ti], NULL, sp3d_gemm_worker, &tasks[ti]);
-            }
-            for (int ti = 0; ti < n_threads; ti++) pthread_join(threads[ti], NULL);
-            free(tasks); free(threads);
-        }
+        sp3d_gemm_f32_dispatch(dst, src, Wf, bf, N, out_C, in_C, n_threads);
     } else {
-        /* Quantized: dequant row by row */
-        float *tmp = (float *)malloc((size_t)in_C * sizeof(float));
-        for (int i = 0; i < N; i++) {
-            for (int r = 0; r < out_C; r++) {
-                sp3d_dequant_row(W, r, tmp);
-                float s = 0.0f;
-                for (int k = 0; k < in_C; k++) s += tmp[k] * src[i * in_C + k];
-                dst[i * out_C + r] = s;
-            }
-        }
-        free(tmp);
+        /* Dequant whole W once → F32 GEMM. The previous code dequanted
+         * each row N times inside the loop, ~N× redundant work. */
+        float *Wf = qt_dequant(W);
+        float *bf = NULL;
         if (bias && bias->data) {
-            float *b = (float *)malloc((size_t)out_C * sizeof(float));
-            sp3d_dequant_row(bias, 0, b);
-            for (int i = 0; i < N; i++)
-                for (int j = 0; j < out_C; j++)
-                    dst[i * out_C + j] += b[j];
-            free(b);
+            bf = (float *)malloc((size_t)out_C * sizeof(float));
+            qt_dequant_row(bias, 0, bf);
         }
+        sp3d_gemm_f32_dispatch(dst, src, Wf, bf, N, out_C, in_C, n_threads);
+        free(Wf);
+        free(bf);
     }
     sp3d_prof_end(SP3D_OP_LINEAR, _t0, (int64_t)N * out_C * sizeof(float));
 }
@@ -666,8 +625,12 @@ void sp3d_layernorm(float *dst, const float *src,
     double _t0; sp3d_prof_begin(&_t0);
     float *wf = (float *)malloc((size_t)C * sizeof(float));
     float *bf = (float *)malloc((size_t)C * sizeof(float));
-    sp3d_dequant_row(w, 0, wf);
-    sp3d_dequant_row(b, 0, bf);
+    /* No-affine path: pytorch nn.LayerNorm(elementwise_affine=False) and
+     * F.layer_norm without weight/bias both imply γ=1, β=0. */
+    if (w && w->data) qt_dequant_row(w, 0, wf);
+    else              for (int i = 0; i < C; i++) wf[i] = 1.0f;
+    if (b && b->data) qt_dequant_row(b, 0, bf);
+    else              memset(bf, 0, (size_t)C * sizeof(float));
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 v_eps = _mm256_set1_ps(eps);
     for (int t = 0; t < N; t++) {
@@ -1093,17 +1056,28 @@ sp3d_tensor *sp3d_downsample(const sp3d_tensor *t, int factor, int pool_mode) {
     float *out_feats = (float *)calloc((size_t)out_N * C, sizeof(float));
     int *counts = (int *)calloc((size_t)out_N, sizeof(int));
 
-    if (pool_mode == 0) {
-        /* Mean pooling */
+    if (pool_mode == 0 || pool_mode == 2) {
+        /* Mean pooling. pool_mode=0 divides by count (standard mean).
+         * pool_mode=2 divides by (count+1) to match pytorch's
+         * torch.scatter_reduce(reduce="mean", include_self=True) on a
+         * zero-initialized output — used by SparseDownsample in sam-3d-objects. */
         for (int i = 0; i < t->N; i++) {
             int oi = mapping[i];
             for (int c = 0; c < C; c++)
                 out_feats[oi * C + c] += t->feats[i * C + c];
             counts[oi]++;
         }
-        for (int i = 0; i < out_N; i++) {
-            if (counts[i] > 1) {
-                float inv = 1.0f / (float)counts[i];
+        if (pool_mode == 0) {
+            for (int i = 0; i < out_N; i++) {
+                if (counts[i] > 1) {
+                    float inv = 1.0f / (float)counts[i];
+                    for (int c = 0; c < C; c++)
+                        out_feats[i * C + c] *= inv;
+                }
+            }
+        } else {
+            for (int i = 0; i < out_N; i++) {
+                float inv = 1.0f / (float)(counts[i] + 1);
                 for (int c = 0; c < C; c++)
                     out_feats[i * C + c] *= inv;
             }

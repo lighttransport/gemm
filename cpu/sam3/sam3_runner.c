@@ -3123,28 +3123,27 @@ int sam3_run_postprocess(sam3_ctx *ctx, int target_h, int target_w,
     }
     free(keep_idx);
 
-    /* Sigmoid in-place. */
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++) {
-        float *row = kept + (size_t)i * HW;
-        for (size_t j = 0; j < HW; j++) {
-            float v = row[j];
-            row[j] = 1.0f / (1.0f + expf(-v));
-        }
-    }
-
-    /* Bilinear resize to target. */
+    /* Match pytorch Sam3Processor: bilinear-upsample the LOGITS first,
+     * then threshold. Applying sigmoid at 288x288 near-saturates the
+     * field into a step function and the subsequent upsample produces
+     * jaggy boundaries on thin structures (eye sclera etc.).
+     * sigmoid(x) > t  <=>  x > logit(t). */
     float *resized = (float *)malloc(
         (size_t)n * target_h * target_w * sizeof(float));
     if (!resized) { free(kept); return -1; }
     sam3_bilinear_resize_acf(resized, kept, n, H0, W0, target_h, target_w);
     free(kept);
 
+    float t = mask_threshold;
+    if (!(t > 0.0f)) t = 1e-6f;
+    if (!(t < 1.0f)) t = 1.0f - 1e-6f;
+    const float logit_thr = logf(t / (1.0f - t));
+
     /* Binarize to uint8. */
     size_t tot = (size_t)n * target_h * target_w;
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < tot; i++) {
-        ctx->pp_masks[i] = (resized[i] > mask_threshold) ? 1 : 0;
+        ctx->pp_masks[i] = (resized[i] > logit_thr) ? 1 : 0;
     }
     free(resized);
 
