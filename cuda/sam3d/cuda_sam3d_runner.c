@@ -64,6 +64,7 @@
 #include "cuda_sam3d_slat_dit_forward.h"
 #undef  CUDA_SAM3D_SLAT_DIT_FORWARD_IMPLEMENTATION
 #include "../../common/sam3d_shortcut_solver.h"
+#include "../../common/sam3d_gs_decoder.h"
 #include "sam3d_cpu.h"
 
 #include <stdio.h>
@@ -93,6 +94,75 @@ typedef struct {
     float   *feats;      /* host, malloc'd */
     int32_t *coords;     /* host, malloc'd */
 } cs3d_host_slat;
+
+typedef struct {
+    CUdeviceptr norm1_w, norm1_b;
+    CUdeviceptr conv1_w, conv1_b;
+    CUdeviceptr conv2_w, conv2_b;
+    CUdeviceptr emb_w, emb_b;
+    CUdeviceptr skip_w, skip_b;
+    int C_in, C_out;
+    int updown, has_skip;
+} cs3d_slat_io_block_gpu;
+
+typedef struct {
+    cs3d_slat_io_block_gpu input[2];
+    cs3d_slat_io_block_gpu output[2];
+    CUdeviceptr input_w, input_b;
+    int input_in, input_out;
+    CUdeviceptr out_w, out_b;
+    int out_in, out_out;
+    size_t total_bytes;
+    int loaded;
+} cs3d_slat_io_gpu;
+
+typedef struct {
+    hipFunction_t gemm, down, up, idx, ln, silu, conv, modln, resadd;
+    int loaded;
+} cs3d_slat_io_fns;
+
+typedef struct {
+    CUdeviceptr d_in_coords, d_in_feats;
+    CUdeviceptr d_coords, d_base;
+    CUdeviceptr d_counts, d_outN;
+    CUdeviceptr d_index;
+    CUdeviceptr d_t, d_t_silu, d_emb;
+    CUdeviceptr d_skip, d_h1, d_h2, d_h3, d_h4;
+    size_t cap_in_coords, cap_in_feats;
+    size_t cap_coords, cap_base;
+    size_t cap_counts, cap_outN;
+    size_t cap_index;
+    size_t cap_t, cap_t_silu, cap_emb;
+    size_t cap_skip, cap_h1, cap_h2, cap_h3, cap_h4;
+} cs3d_slat_io_ws;
+
+typedef struct {
+    CUdeviceptr qkv_w, qkv_b;
+    CUdeviceptr out_w, out_b;
+    CUdeviceptr fc1_w, fc1_b;
+    CUdeviceptr fc2_w, fc2_b;
+} cs3d_gs_mlp_block_gpu;
+
+typedef struct {
+    CUdeviceptr input_w, input_b;
+    CUdeviceptr out_w, out_b;
+    cs3d_gs_mlp_block_gpu *mlp_blocks;
+    int input_in, input_out;
+    int out_in, out_out;
+    int n_mlp_blocks, mlp_dim, mlp_hidden;
+    size_t total_bytes;
+    int loaded;
+} cs3d_gs_head_gpu;
+
+typedef struct { int64_t key; int idx; } cs3d_gs_win_kv;
+typedef struct { int start; int len; } cs3d_gs_win_run;
+
+typedef struct {
+    CUdeviceptr d_coords, d_in, d_h, d_ln, d_out;
+    CUdeviceptr d_qkv, d_fwd, d_attn, d_q, d_k, d_v, d_win, d_mlp;
+    size_t cap_coords, cap_in, cap_h, cap_ln, cap_out;
+    size_t cap_qkv, cap_fwd, cap_attn, cap_q, cap_k, cap_v, cap_win, cap_mlp;
+} cs3d_gs_head_ws;
 
 struct cuda_sam3d_ctx {
     cuda_sam3d_config cfg;
@@ -185,13 +255,22 @@ struct cuda_sam3d_ctx {
     int                    gpu_slatdit_ws_n;
     int                    gpu_slatdit_ws_nc;
     CUdeviceptr            d_slat_hook_x;
+    CUdeviceptr            d_slat_hook_coords;
     CUdeviceptr            d_slat_hook_t_emb;
     size_t                 slat_hook_x_bytes;
+    size_t                 slat_hook_coords_bytes;
     size_t                 slat_hook_t_emb_bytes;
+    int32_t               *slat_hook_coords_cache;
+    size_t                 slat_hook_coords_cache_bytes;
+    cs3d_slat_io_gpu       gpu_slat_io;
+    cs3d_slat_io_fns       gpu_slat_io_fns;
+    cs3d_slat_io_ws        gpu_slat_io_ws;
 
     sam3d_cpu_gs_decoder *cpu_gs;
     cs3d_host_2d          gaussians;      /* [N*G, 17] PLY-layout f32 */
     CUdeviceptr           d_gaussians;    /* device mirror */
+    cs3d_gs_head_gpu      gpu_gs_head;
+    cs3d_gs_head_ws       gpu_gs_head_ws;
 };
 
 /* ===== tiny helpers ===== */
@@ -228,6 +307,99 @@ static void cs3d_free_nd(cs3d_host_nd *t)   { free(t->data); t->data = NULL; t->
 static void cs3d_free_slat(cs3d_host_slat *t) {
     free(t->feats); free(t->coords);
     t->feats = NULL; t->coords = NULL; t->n = t->c = 0;
+}
+
+static void cs3d_slat_io_block_gpu_free(cs3d_slat_io_block_gpu *b)
+{
+    if (!b) return;
+    if (b->norm1_w) cuMemFree(b->norm1_w);
+    if (b->norm1_b) cuMemFree(b->norm1_b);
+    if (b->conv1_w) cuMemFree(b->conv1_w);
+    if (b->conv1_b) cuMemFree(b->conv1_b);
+    if (b->conv2_w) cuMemFree(b->conv2_w);
+    if (b->conv2_b) cuMemFree(b->conv2_b);
+    if (b->emb_w)   cuMemFree(b->emb_w);
+    if (b->emb_b)   cuMemFree(b->emb_b);
+    if (b->skip_w)  cuMemFree(b->skip_w);
+    if (b->skip_b)  cuMemFree(b->skip_b);
+    memset(b, 0, sizeof(*b));
+}
+
+static void cs3d_slat_io_gpu_free(cs3d_slat_io_gpu *g)
+{
+    if (!g) return;
+    for (int i = 0; i < 2; i++) {
+        cs3d_slat_io_block_gpu_free(&g->input[i]);
+        cs3d_slat_io_block_gpu_free(&g->output[i]);
+    }
+    if (g->input_w) cuMemFree(g->input_w);
+    if (g->input_b) cuMemFree(g->input_b);
+    if (g->out_w) cuMemFree(g->out_w);
+    if (g->out_b) cuMemFree(g->out_b);
+    memset(g, 0, sizeof(*g));
+}
+
+static void cs3d_slat_io_ws_free(cs3d_slat_io_ws *w)
+{
+    if (!w) return;
+    if (w->d_in_coords) cuMemFree(w->d_in_coords);
+    if (w->d_in_feats)  cuMemFree(w->d_in_feats);
+    if (w->d_coords)    cuMemFree(w->d_coords);
+    if (w->d_base)      cuMemFree(w->d_base);
+    if (w->d_counts)    cuMemFree(w->d_counts);
+    if (w->d_outN)      cuMemFree(w->d_outN);
+    if (w->d_index)     cuMemFree(w->d_index);
+    if (w->d_t)         cuMemFree(w->d_t);
+    if (w->d_t_silu)    cuMemFree(w->d_t_silu);
+    if (w->d_emb)       cuMemFree(w->d_emb);
+    if (w->d_skip)      cuMemFree(w->d_skip);
+    if (w->d_h1)        cuMemFree(w->d_h1);
+    if (w->d_h2)        cuMemFree(w->d_h2);
+    if (w->d_h3)        cuMemFree(w->d_h3);
+    if (w->d_h4)        cuMemFree(w->d_h4);
+    memset(w, 0, sizeof(*w));
+}
+
+static void cs3d_gs_head_gpu_free(cs3d_gs_head_gpu *g)
+{
+    if (!g) return;
+    if (g->input_w) cuMemFree(g->input_w);
+    if (g->input_b) cuMemFree(g->input_b);
+    if (g->out_w) cuMemFree(g->out_w);
+    if (g->out_b) cuMemFree(g->out_b);
+    if (g->mlp_blocks) {
+        for (int i = 0; i < g->n_mlp_blocks; i++) {
+            if (g->mlp_blocks[i].qkv_w) cuMemFree(g->mlp_blocks[i].qkv_w);
+            if (g->mlp_blocks[i].qkv_b) cuMemFree(g->mlp_blocks[i].qkv_b);
+            if (g->mlp_blocks[i].out_w) cuMemFree(g->mlp_blocks[i].out_w);
+            if (g->mlp_blocks[i].out_b) cuMemFree(g->mlp_blocks[i].out_b);
+            if (g->mlp_blocks[i].fc1_w) cuMemFree(g->mlp_blocks[i].fc1_w);
+            if (g->mlp_blocks[i].fc1_b) cuMemFree(g->mlp_blocks[i].fc1_b);
+            if (g->mlp_blocks[i].fc2_w) cuMemFree(g->mlp_blocks[i].fc2_w);
+            if (g->mlp_blocks[i].fc2_b) cuMemFree(g->mlp_blocks[i].fc2_b);
+        }
+        free(g->mlp_blocks);
+    }
+    memset(g, 0, sizeof(*g));
+}
+
+static void cs3d_gs_head_ws_free(cs3d_gs_head_ws *w)
+{
+    if (!w) return;
+    if (w->d_coords) cuMemFree(w->d_coords);
+    if (w->d_in)     cuMemFree(w->d_in);
+    if (w->d_h)      cuMemFree(w->d_h);
+    if (w->d_ln)     cuMemFree(w->d_ln);
+    if (w->d_out)    cuMemFree(w->d_out);
+    if (w->d_qkv)    cuMemFree(w->d_qkv);
+    if (w->d_fwd)    cuMemFree(w->d_fwd);
+    if (w->d_attn)   cuMemFree(w->d_attn);
+    if (w->d_q)      cuMemFree(w->d_q);
+    if (w->d_k)      cuMemFree(w->d_k);
+    if (w->d_v)      cuMemFree(w->d_v);
+    if (w->d_win)    cuMemFree(w->d_win);
+    if (w->d_mlp)    cuMemFree(w->d_mlp);
+    memset(w, 0, sizeof(*w));
 }
 
 /* ===== public API ===== */
@@ -332,12 +504,18 @@ void cuda_sam3d_destroy(cuda_sam3d_ctx *ctx)
     if (ctx->d_slat_feats)  cuMemFree(ctx->d_slat_feats);
     if (ctx->d_slat_coords) cuMemFree(ctx->d_slat_coords);
     if (ctx->d_slat_hook_x)     cuMemFree(ctx->d_slat_hook_x);
+    if (ctx->d_slat_hook_coords) cuMemFree(ctx->d_slat_hook_coords);
     if (ctx->d_slat_hook_t_emb) cuMemFree(ctx->d_slat_hook_t_emb);
+    free(ctx->slat_hook_coords_cache);
     if (ctx->gpu_slatdit_ws_alloced) cs3d_slatdit_block_ws_free(&ctx->gpu_slatdit_ws);
     if (ctx->gpu_slatdit_loaded)     cs3d_slatdit_gpu_free(&ctx->gpu_slatdit);
+    if (ctx->gpu_slat_io.loaded)     cs3d_slat_io_gpu_free(&ctx->gpu_slat_io);
+    cs3d_slat_io_ws_free(&ctx->gpu_slat_io_ws);
     if (ctx->cpu_slat_dit) sam3d_cpu_slat_dit_free(ctx->cpu_slat_dit);
     cs3d_free_2d(&ctx->gaussians);
     if (ctx->d_gaussians) cuMemFree(ctx->d_gaussians);
+    if (ctx->gpu_gs_head.loaded) cs3d_gs_head_gpu_free(&ctx->gpu_gs_head);
+    cs3d_gs_head_ws_free(&ctx->gpu_gs_head_ws);
     if (ctx->cpu_gs) sam3d_cpu_gs_decoder_free(ctx->cpu_gs);
     if (ctx->compiled) cuModuleUnload(ctx->mod);
     free(ctx->safetensors_dir_resolved);
@@ -1189,15 +1367,433 @@ static int cs3d_ensure_devbuf(CUdeviceptr *ptr, size_t *cap, size_t need)
     return 0;
 }
 
-static int cs3d_slat_transformer_gpu_hook(void *user, float *feats, int N,
-                                          const int32_t *coords,
-                                          const float *t_emb,
-                                          const float *cond, int n_cond,
-                                          int dim, int n_blocks)
+static int cs3d_slat_io_upload_qtensor(const qtensor *t, const char *name,
+                                       CUdeviceptr *out, size_t *total_bytes)
+{
+    if (!t || !t->data || t->n_rows <= 0 || t->n_cols <= 0 || !out)
+        return -1;
+    int n = t->n_rows * t->n_cols;
+    float *buf = (float *)malloc((size_t)n * sizeof(float));
+    if (!buf) return -1;
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(buf, t->data, (size_t)n * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        const uint16_t *src = (const uint16_t *)t->data;
+        for (int i = 0; i < n; i++) buf[i] = ggml_fp16_to_fp32(src[i]);
+    } else {
+        int bs = 0, ts = 0;
+        switch (t->type) {
+            case GGML_TYPE_Q8_0: bs = 32;  ts = 34;  break;
+            case GGML_TYPE_Q4_K: bs = 256; ts = 144; break;
+            case GGML_TYPE_Q6_K: bs = 256; ts = 210; break;
+            default:
+                free(buf);
+                fprintf(stderr, "cuda_sam3d: unsupported SLAT IO tensor %s\n", name);
+                return -1;
+        }
+        size_t row_bytes = (size_t)((t->n_cols + bs - 1) / bs) * ts;
+        for (int r = 0; r < t->n_rows; r++) {
+            const void *row = (const uint8_t *)t->data + (size_t)r * row_bytes;
+            dequant_row(t->type, row, buf + (size_t)r * t->n_cols, t->n_cols);
+        }
+    }
+    size_t bytes = (size_t)n * sizeof(float);
+    *out = cu_upload_raw(buf, bytes);
+    free(buf);
+    if (!*out) {
+        fprintf(stderr, "cuda_sam3d: SLAT IO upload failed for %s\n", name);
+        return -1;
+    }
+    if (total_bytes) *total_bytes += bytes;
+    return 0;
+}
+
+static int cs3d_slat_io_load_block(cs3d_slat_io_block_gpu *dst,
+                                   const sam3d_slat_io_block *src,
+                                   const char *name,
+                                   size_t *total_bytes)
+{
+    if (!dst || !src) return -1;
+    memset(dst, 0, sizeof(*dst));
+    dst->C_in = src->C_in;
+    dst->C_out = src->C_out;
+    dst->updown = src->updown;
+    dst->has_skip = src->has_skip;
+#define UP_IO_(field) do { \
+    char tname[128]; \
+    snprintf(tname, sizeof(tname), "%s.%s", name, #field); \
+    if (cs3d_slat_io_upload_qtensor(&src->field, tname, &dst->field, total_bytes) != 0) goto fail; \
+} while (0)
+    UP_IO_(norm1_w); UP_IO_(norm1_b);
+    UP_IO_(conv1_w); UP_IO_(conv1_b);
+    UP_IO_(conv2_w); UP_IO_(conv2_b);
+    UP_IO_(emb_w);   UP_IO_(emb_b);
+    if (src->has_skip) {
+        UP_IO_(skip_w); UP_IO_(skip_b);
+    }
+#undef UP_IO_
+    return 0;
+fail:
+    cs3d_slat_io_block_gpu_free(dst);
+    return -1;
+}
+
+static int cs3d_slat_io_fns_lookup(cs3d_slat_io_fns *f, CUmodule mod)
+{
+    if (!f) return -1;
+    if (f->loaded) return 0;
+    if (cuModuleGetFunction(&f->gemm, mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->down, mod, "slat_downsample2_mean_include_self_serial_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->up, mod, "slat_upsample2_nearest_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->idx, mod, "slat_build_coord_index64_i32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->ln, mod, "layernorm_token_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->silu, mod, "silu_inplace_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->conv, mod, "slat_submconv3x3_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->modln, mod, "modulated_ln_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&f->resadd, mod, "residual_add_f32") != CUDA_SUCCESS)
+        return -1;
+    f->loaded = 1;
+    return 0;
+}
+
+static int cs3d_ensure_slat_io_gpu(cuda_sam3d_ctx *ctx)
+{
+    int rc = cs3d_ensure_slat_dit(ctx);
+    if (rc != CUDA_SAM3D_E_OK) return rc;
+    sam3d_slat_dit_model *m = sam3d_cpu_slat_dit_model(ctx->cpu_slat_dit);
+    if (!m || m->n_io_res_blocks != 2) return CUDA_SAM3D_E_LOAD;
+    if (cs3d_slat_io_fns_lookup(&ctx->gpu_slat_io_fns, ctx->mod) != 0) {
+        fprintf(stderr, "cuda_sam3d: gpu slat IO fns lookup failed\n");
+        return CUDA_SAM3D_E_LOAD;
+    }
+    if (ctx->gpu_slat_io.loaded) return CUDA_SAM3D_E_OK;
+
+    size_t total = 0;
+    if (cs3d_slat_io_load_block(&ctx->gpu_slat_io.input[0], &m->input_blocks[0], "input_blocks.0", &total) != 0 ||
+        cs3d_slat_io_load_block(&ctx->gpu_slat_io.input[1], &m->input_blocks[1], "input_blocks.1", &total) != 0 ||
+        cs3d_slat_io_load_block(&ctx->gpu_slat_io.output[0], &m->out_blocks[0], "out_blocks.0", &total) != 0 ||
+        cs3d_slat_io_load_block(&ctx->gpu_slat_io.output[1], &m->out_blocks[1], "out_blocks.1", &total) != 0 ||
+        cs3d_slat_io_upload_qtensor(&m->input_w, "input_layer.weight", &ctx->gpu_slat_io.input_w, &total) != 0 ||
+        cs3d_slat_io_upload_qtensor(&m->input_b, "input_layer.bias", &ctx->gpu_slat_io.input_b, &total) != 0 ||
+        cs3d_slat_io_upload_qtensor(&m->out_w, "out_layer.weight", &ctx->gpu_slat_io.out_w, &total) != 0 ||
+        cs3d_slat_io_upload_qtensor(&m->out_b, "out_layer.bias", &ctx->gpu_slat_io.out_b, &total) != 0) {
+        cs3d_slat_io_gpu_free(&ctx->gpu_slat_io);
+        fprintf(stderr, "cuda_sam3d: gpu slat IO weight upload failed\n");
+        return CUDA_SAM3D_E_LOAD;
+    }
+    ctx->gpu_slat_io.input_in = m->input_w.n_cols;
+    ctx->gpu_slat_io.input_out = m->input_w.n_rows;
+    ctx->gpu_slat_io.out_in = m->out_w.n_cols;
+    ctx->gpu_slat_io.out_out = m->out_w.n_rows;
+    ctx->gpu_slat_io.total_bytes = total;
+    ctx->gpu_slat_io.loaded = 1;
+    if (ctx->cfg.verbose >= 1)
+        fprintf(stderr, "cuda_sam3d: SLAT IO GPU weights %.2f MiB\n",
+                (double)total / (1024.0 * 1024.0));
+    return CUDA_SAM3D_E_OK;
+}
+
+static int cs3d_slat_io_block_gpu_hook(void *user, int is_output,
+                                       int block_idx, const void *bk_void,
+                                       void *xp_void, const float *t_emb,
+                                       const int32_t *up_target_coords,
+                                       int up_target_N, int dim, float ln_eps)
 {
     cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
-    (void)coords;
-    if (!ctx || !feats || !t_emb || !cond || N <= 0 || n_cond <= 0)
+    sp3d_tensor **xp = (sp3d_tensor **)xp_void;
+    const sam3d_slat_io_block *bk = (const sam3d_slat_io_block *)bk_void;
+    if (!ctx || !xp || !*xp || !bk || !t_emb || block_idx < 0 || block_idx >= 2)
+        return -1;
+    sp3d_tensor *x = *xp;
+    if (x->N <= 0 || x->C != bk->C_in) return -1;
+    if (cs3d_ensure_slat_io_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    cs3d_slat_io_block_gpu *gb = is_output ? &ctx->gpu_slat_io.output[block_idx]
+                                           : &ctx->gpu_slat_io.input[block_idx];
+    cs3d_slat_io_fns *fn = &ctx->gpu_slat_io_fns;
+    int C_in = gb->C_in, C_out = gb->C_out;
+    if (C_in != bk->C_in || C_out != bk->C_out) return -1;
+    if (gb->updown == SAM3D_SLAT_UPDOWN_UP && (!up_target_coords || up_target_N <= 0))
+        return -1;
+
+    int inN = x->N;
+    int outN = (gb->updown == SAM3D_SLAT_UPDOWN_UP) ? up_target_N : inN;
+    cs3d_slat_io_ws *ws = &ctx->gpu_slat_io_ws;
+    CUdeviceptr d_coords = 0, d_base = 0;
+    int32_t *host_coords = NULL;
+    float *host_feats = NULL;
+    sp3d_tensor *new_t = NULL;
+    int rc = -1;
+
+    size_t in_coord_bytes = (size_t)inN * 4 * sizeof(int32_t);
+    size_t in_feat_bytes = (size_t)inN * C_in * sizeof(float);
+    size_t t_bytes = (size_t)dim * sizeof(float);
+    if (cs3d_ensure_devbuf(&ws->d_in_coords, &ws->cap_in_coords, in_coord_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_in_feats,  &ws->cap_in_feats,  in_feat_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_t,         &ws->cap_t,         t_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_in_coords, x->coords, in_coord_bytes) != CUDA_SUCCESS ||
+        cuMemcpyHtoD(ws->d_in_feats, x->feats, in_feat_bytes) != CUDA_SUCCESS ||
+        cuMemcpyHtoD(ws->d_t, t_emb, t_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    if (gb->updown == SAM3D_SLAT_UPDOWN_DOWN) {
+        if (cs3d_ensure_devbuf(&ws->d_coords, &ws->cap_coords, in_coord_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_base,   &ws->cap_base,   in_feat_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_counts, &ws->cap_counts, (size_t)inN * sizeof(int)) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_outN,   &ws->cap_outN,   sizeof(int)) != 0)
+            goto done;
+        d_coords = ws->d_coords;
+        d_base = ws->d_base;
+        void *a_down[] = { &ws->d_in_coords, &ws->d_in_feats, &inN, &C_in,
+                           &d_coords, &d_base, &ws->d_counts, &ws->d_outN };
+        if (cuLaunchKernel(fn->down, 1, 1, 1, 1, 1, 1, 0, 0, a_down, NULL) != CUDA_SUCCESS)
+            goto done;
+        if (cuMemcpyDtoH(&outN, ws->d_outN, sizeof(int)) != CUDA_SUCCESS ||
+            outN <= 0 || outN > inN)
+            goto done;
+    } else if (gb->updown == SAM3D_SLAT_UPDOWN_UP) {
+        size_t out_coord_bytes = (size_t)up_target_N * 4 * sizeof(int32_t);
+        size_t base_bytes = (size_t)up_target_N * C_in * sizeof(float);
+        if (cs3d_ensure_devbuf(&ws->d_coords, &ws->cap_coords, out_coord_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_base,   &ws->cap_base,   base_bytes) != 0)
+            goto done;
+        if (cuMemcpyHtoD(ws->d_coords, up_target_coords, out_coord_bytes) != CUDA_SUCCESS)
+            goto done;
+        d_coords = ws->d_coords;
+        d_base = ws->d_base;
+        void *a_up[] = { &ws->d_in_coords, &ws->d_in_feats, &inN, &C_in,
+                         &d_coords, &up_target_N, &d_base };
+        if (cuLaunchKernel(fn->up, (up_target_N + 127) / 128, 1, 1, 128, 1, 1, 0, 0, a_up, NULL) != CUDA_SUCCESS)
+            goto done;
+    } else {
+        d_coords = ws->d_in_coords;
+        d_base = ws->d_in_feats;
+    }
+
+    size_t index_bytes = (size_t)64 * 64 * 64 * sizeof(int);
+    size_t emb_bytes = (size_t)2 * C_out * sizeof(float);
+    size_t skip_bytes = (size_t)outN * C_out * sizeof(float);
+    size_t h1_bytes = (size_t)outN * C_in * sizeof(float);
+    if (cs3d_ensure_devbuf(&ws->d_index,  &ws->cap_index,  index_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_t_silu, &ws->cap_t_silu, t_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_emb,    &ws->cap_emb,    emb_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_skip,   &ws->cap_skip,   skip_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h1,     &ws->cap_h1,     h1_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h2,     &ws->cap_h2,     skip_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h3,     &ws->cap_h3,     skip_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h4,     &ws->cap_h4,     skip_bytes) != 0)
+        goto done;
+
+    if (cuMemsetD8(ws->d_index, 0xff, index_bytes) != CUDA_SUCCESS ||
+        cuMemcpyDtoD(ws->d_t_silu, ws->d_t, t_bytes) != CUDA_SUCCESS)
+        goto done;
+    void *a_idx[] = { &d_coords, &outN, &ws->d_index };
+    if (cuLaunchKernel(fn->idx, (outN + 255) / 256, 1, 1, 256, 1, 1, 0, 0, a_idx, NULL) != CUDA_SUCCESS)
+        goto done;
+    void *a_s0[] = { &ws->d_t_silu, &dim };
+    if (cuLaunchKernel(fn->silu, (dim + 255) / 256, 1, 1, 256, 1, 1, 0, 0, a_s0, NULL) != CUDA_SUCCESS)
+        goto done;
+    int twoCout = 2 * C_out, one = 1;
+    { unsigned gx = 1, gy = (twoCout + 15) / 16;
+      void *a[] = { &ws->d_emb, &ws->d_t_silu, &gb->emb_w, &gb->emb_b, &one, &dim, &twoCout };
+      if (cuLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS) goto done; }
+    if (gb->has_skip) {
+        unsigned gx = (outN + 15) / 16, gy = (C_out + 15) / 16;
+        void *a[] = { &ws->d_skip, &d_base, &gb->skip_w, &gb->skip_b, &outN, &C_in, &C_out };
+        if (cuLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS) goto done;
+    } else {
+        if (C_in != C_out ||
+            cuMemcpyDtoD(ws->d_skip, d_base, (size_t)outN * C_out * sizeof(float)) != CUDA_SUCCESS)
+            goto done;
+    }
+
+    int affine = 1;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    int n_elem_in = outN * C_in;
+    int n_elem_out = outN * C_out;
+    int total_conv = outN * C_out;
+    CUdeviceptr d_scale = ws->d_emb;
+    CUdeviceptr d_shift = ws->d_emb + (size_t)C_out * sizeof(float);
+    void *a_ln[] = { &ws->d_h1, &d_base, &gb->norm1_w, &gb->norm1_b,
+                     &outN, &C_in, &ln_eps, &affine };
+    if (cuLaunchKernel(fn->ln, outN, 1, 1, threads, 1, 1, (unsigned)ln_smem, 0, a_ln, NULL) != CUDA_SUCCESS)
+        goto done;
+    void *a_s1[] = { &ws->d_h1, &n_elem_in };
+    if (cuLaunchKernel(fn->silu, (n_elem_in + 255) / 256, 1, 1, 256, 1, 1, 0, 0, a_s1, NULL) != CUDA_SUCCESS)
+        goto done;
+    void *a_c1[] = { &d_coords, &ws->d_h1, &ws->d_index, &gb->conv1_w, &gb->conv1_b,
+                     &outN, &C_in, &C_out, &ws->d_h2 };
+    if (cuLaunchKernel(fn->conv, (total_conv + 255) / 256, 1, 1, 256, 1, 1, 0, 0, a_c1, NULL) != CUDA_SUCCESS)
+        goto done;
+    void *a_ml[] = { &ws->d_h3, &ws->d_h2, &d_shift, &d_scale, &outN, &C_out, &ln_eps };
+    if (cuLaunchKernel(fn->modln, outN, 1, 1, threads, 1, 1, (unsigned)ln_smem, 0, a_ml, NULL) != CUDA_SUCCESS)
+        goto done;
+    void *a_s2[] = { &ws->d_h3, &n_elem_out };
+    if (cuLaunchKernel(fn->silu, (n_elem_out + 255) / 256, 1, 1, 256, 1, 1, 0, 0, a_s2, NULL) != CUDA_SUCCESS)
+        goto done;
+    void *a_c2[] = { &d_coords, &ws->d_h3, &ws->d_index, &gb->conv2_w, &gb->conv2_b,
+                     &outN, &C_out, &C_out, &ws->d_h4 };
+    if (cuLaunchKernel(fn->conv, (total_conv + 255) / 256, 1, 1, 256, 1, 1, 0, 0, a_c2, NULL) != CUDA_SUCCESS)
+        goto done;
+    void *a_ra[] = { &ws->d_h4, &ws->d_skip, &n_elem_out };
+    if (cuLaunchKernel(fn->resadd, (n_elem_out + 255) / 256, 1, 1, 256, 1, 1, 0, 0, a_ra, NULL) != CUDA_SUCCESS)
+        goto done;
+
+    host_coords = (int32_t *)malloc((size_t)outN * 4 * sizeof(int32_t));
+    host_feats = (float *)malloc((size_t)outN * C_out * sizeof(float));
+    if (!host_coords || !host_feats) goto done;
+    if (cuMemcpyDtoH(host_coords, d_coords, (size_t)outN * 4 * sizeof(int32_t)) != CUDA_SUCCESS ||
+        cuMemcpyDtoH(host_feats, ws->d_h4, (size_t)outN * C_out * sizeof(float)) != CUDA_SUCCESS)
+        goto done;
+    new_t = sp3d_create(host_coords, host_feats, outN, C_out, x->batch_size);
+    if (!new_t) goto done;
+    sp3d_free(x);
+    *xp = new_t;
+    new_t = NULL;
+    rc = 0;
+
+done:
+    if (new_t) sp3d_free(new_t);
+    free(host_coords);
+    free(host_feats);
+    return rc;
+}
+
+static int cs3d_slat_input_layer_gpu_hook(void *user, void *xp_void,
+                                          const void *input_w_void,
+                                          const void *input_b_void,
+                                          int out_channels)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    sp3d_tensor **xp = (sp3d_tensor **)xp_void;
+    (void)input_w_void;
+    (void)input_b_void;
+    if (!ctx || !xp || !*xp || out_channels <= 0) return -1;
+    sp3d_tensor *x = *xp;
+    if (x->N <= 0 || x->C <= 0) return -1;
+    if (cs3d_ensure_slat_io_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    if (x->C != ctx->gpu_slat_io.input_in ||
+        out_channels != ctx->gpu_slat_io.input_out)
+        return -1;
+
+    cs3d_slat_io_ws *ws = &ctx->gpu_slat_io_ws;
+    cs3d_slat_io_fns *fn = &ctx->gpu_slat_io_fns;
+    int N = x->N;
+    int C = x->C;
+    int outC = out_channels;
+    size_t in_bytes = (size_t)N * C * sizeof(float);
+    size_t out_bytes = (size_t)N * outC * sizeof(float);
+    float *host_feats = NULL;
+    sp3d_tensor *new_t = NULL;
+    int rc = -1;
+
+    if (cs3d_ensure_devbuf(&ws->d_in_feats, &ws->cap_in_feats, in_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h1,       &ws->cap_h1,       out_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_in_feats, x->feats, in_bytes) != CUDA_SUCCESS)
+        goto done;
+    { unsigned gx = (N + 15) / 16, gy = (outC + 15) / 16;
+      void *a[] = { &ws->d_h1, &ws->d_in_feats, &ctx->gpu_slat_io.input_w,
+                    &ctx->gpu_slat_io.input_b, &N, &C, &outC };
+      if (cuLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+
+    host_feats = (float *)malloc(out_bytes);
+    if (!host_feats) goto done;
+    if (cuMemcpyDtoH(host_feats, ws->d_h1, out_bytes) != CUDA_SUCCESS)
+        goto done;
+    new_t = sp3d_create(x->coords, host_feats, N, outC, x->batch_size);
+    if (!new_t) goto done;
+    sp3d_free(x);
+    *xp = new_t;
+    new_t = NULL;
+    rc = 0;
+
+done:
+    if (new_t) sp3d_free(new_t);
+    free(host_feats);
+    return rc;
+}
+
+static int cs3d_slat_final_layer_gpu_hook(void *user, void *xp_void,
+                                          const void *out_w_void,
+                                          const void *out_b_void,
+                                          int out_channels, float eps)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    sp3d_tensor **xp = (sp3d_tensor **)xp_void;
+    (void)out_w_void;
+    (void)out_b_void;
+    if (!ctx || !xp || !*xp || out_channels <= 0) return -1;
+    sp3d_tensor *x = *xp;
+    if (x->N <= 0 || x->C <= 0) return -1;
+    if (cs3d_ensure_slat_io_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    if (x->C != ctx->gpu_slat_io.out_in ||
+        out_channels != ctx->gpu_slat_io.out_out)
+        return -1;
+
+    cs3d_slat_io_ws *ws = &ctx->gpu_slat_io_ws;
+    cs3d_slat_io_fns *fn = &ctx->gpu_slat_io_fns;
+    int N = x->N;
+    int C = x->C;
+    int outC = out_channels;
+    size_t in_bytes = (size_t)N * C * sizeof(float);
+    size_t out_bytes = (size_t)N * outC * sizeof(float);
+    float *host_feats = NULL;
+    sp3d_tensor *new_t = NULL;
+    int rc = -1;
+
+    if (cs3d_ensure_devbuf(&ws->d_in_feats, &ws->cap_in_feats, in_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h1,       &ws->cap_h1,       in_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h2,       &ws->cap_h2,       out_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_in_feats, x->feats, in_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    int affine = 0;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    void *a_ln[] = { &ws->d_h1, &ws->d_in_feats,
+                     &ctx->gpu_slat_io.out_w, &ctx->gpu_slat_io.out_b,
+                     &N, &C, &eps, &affine };
+    if (cuLaunchKernel(fn->ln, N, 1, 1, threads, 1, 1,
+                       (unsigned)ln_smem, 0, a_ln, NULL) != CUDA_SUCCESS)
+        goto done;
+
+    { unsigned gx = (N + 15) / 16, gy = (outC + 15) / 16;
+      void *a[] = { &ws->d_h2, &ws->d_h1, &ctx->gpu_slat_io.out_w,
+                    &ctx->gpu_slat_io.out_b, &N, &C, &outC };
+      if (cuLaunchKernel(fn->gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+
+    host_feats = (float *)malloc(out_bytes);
+    if (!host_feats) goto done;
+    if (cuMemcpyDtoH(host_feats, ws->d_h2, out_bytes) != CUDA_SUCCESS)
+        goto done;
+    new_t = sp3d_create(x->coords, host_feats, N, outC, x->batch_size);
+    if (!new_t) goto done;
+    sp3d_free(x);
+    *xp = new_t;
+    new_t = NULL;
+    rc = 0;
+
+done:
+    if (new_t) sp3d_free(new_t);
+    free(host_feats);
+    return rc;
+}
+
+static int cs3d_slat_transformer_gpu_hook_impl(void *user, float *feats, int N,
+                                               const int32_t *coords,
+                                               const float *t_emb,
+                                               const float *cond, int n_cond,
+                                               int dim, int n_blocks,
+                                               int apply_ape)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    if (!ctx || !feats || !t_emb || !cond || N <= 0 || n_cond <= 0 ||
+        (apply_ape && !coords))
         return -1;
     if (cs3d_ensure_slatdit_gpu(ctx, N, n_cond) != CUDA_SAM3D_E_OK)
         return -1;
@@ -1205,6 +1801,7 @@ static int cs3d_slat_transformer_gpu_hook(void *user, float *feats, int N,
         return -1;
 
     size_t x_bytes = (size_t)N * dim * sizeof(float);
+    size_t coord_bytes = (size_t)N * 4 * sizeof(int32_t);
     size_t c_bytes = (size_t)n_cond * dim * sizeof(float);
     if (cs3d_ensure_devbuf(&ctx->d_slat_hook_x, &ctx->slat_hook_x_bytes, x_bytes) != 0 ||
         cs3d_ensure_devbuf(&ctx->d_slat_hook_t_emb, &ctx->slat_hook_t_emb_bytes,
@@ -1213,6 +1810,37 @@ static int cs3d_slat_transformer_gpu_hook(void *user, float *feats, int N,
     if (cuMemcpyHtoD(ctx->d_slat_hook_x, feats, x_bytes) != CUDA_SUCCESS ||
         cuMemcpyHtoD(ctx->d_slat_hook_t_emb, t_emb, (size_t)dim * sizeof(float)) != CUDA_SUCCESS)
         return -1;
+    if (apply_ape) {
+        hipFunction_t ape_fn = NULL;
+        int freq_dim = dim / 3 / 2;
+        int filled = freq_dim * 2 * 3;
+        long long total = (long long)N * filled;
+        if (filled <= 0 ||
+            cs3d_ensure_devbuf(&ctx->d_slat_hook_coords, &ctx->slat_hook_coords_bytes,
+                               coord_bytes) != 0 ||
+            cuModuleGetFunction(&ape_fn, ctx->mod, "slat_ape_add_f32") != CUDA_SUCCESS)
+            return -1;
+        int coords_cached = 0;
+        if (ctx->slat_hook_coords_cache &&
+            ctx->slat_hook_coords_cache_bytes == coord_bytes &&
+            memcmp(ctx->slat_hook_coords_cache, coords, coord_bytes) == 0) {
+            coords_cached = 1;
+        }
+        if (!coords_cached) {
+            int32_t *cache = (int32_t *)realloc(ctx->slat_hook_coords_cache,
+                                                coord_bytes);
+            if (!cache) return -1;
+            memcpy(cache, coords, coord_bytes);
+            ctx->slat_hook_coords_cache = cache;
+            ctx->slat_hook_coords_cache_bytes = coord_bytes;
+            if (cuMemcpyHtoD(ctx->d_slat_hook_coords, coords, coord_bytes) != CUDA_SUCCESS)
+                return -1;
+        }
+        void *a_ape[] = { &ctx->d_slat_hook_x, &ctx->d_slat_hook_coords, &N, &dim };
+        if (cuLaunchKernel(ape_fn, (unsigned)((total + 255) / 256), 1, 1,
+                           256, 1, 1, 0, 0, a_ape, NULL) != CUDA_SUCCESS)
+            return -1;
+    }
 
     int own_cond = 1;
     CUdeviceptr d_cond = 0;
@@ -1238,6 +1866,26 @@ static int cs3d_slat_transformer_gpu_hook(void *user, float *feats, int N,
         ok = 0;
     if (own_cond) cuMemFree(d_cond);
     return ok ? 0 : -1;
+}
+
+static int cs3d_slat_ape_transformer_gpu_hook(void *user, float *feats, int N,
+                                              const int32_t *coords,
+                                              const float *t_emb,
+                                              const float *cond, int n_cond,
+                                              int dim, int n_blocks)
+{
+    return cs3d_slat_transformer_gpu_hook_impl(user, feats, N, coords, t_emb,
+                                               cond, n_cond, dim, n_blocks, 1);
+}
+
+static int cs3d_slat_transformer_gpu_hook(void *user, float *feats, int N,
+                                          const int32_t *coords,
+                                          const float *t_emb,
+                                          const float *cond, int n_cond,
+                                          int dim, int n_blocks)
+{
+    return cs3d_slat_transformer_gpu_hook_impl(user, feats, N, coords, t_emb,
+                                               cond, n_cond, dim, n_blocks, 0);
 }
 
 static int cs3d_adopt_slat(cuda_sam3d_ctx *ctx, int32_t *coords, float *feats,
@@ -1389,6 +2037,10 @@ int cuda_sam3d_run_slat_dit(cuda_sam3d_ctx *ctx) {
     int32_t *out_coords = NULL;
     float   *out_feats  = NULL;
     int      out_n      = 0;
+    sam3d_cpu_slat_dit_set_input_layer_hook(cs3d_slat_input_layer_gpu_hook, ctx);
+    sam3d_cpu_slat_dit_set_io_block_hook(cs3d_slat_io_block_gpu_hook, ctx);
+    sam3d_cpu_slat_dit_set_final_layer_hook(cs3d_slat_final_layer_gpu_hook, ctx);
+    sam3d_cpu_slat_dit_set_ape_transformer_hook(cs3d_slat_ape_transformer_gpu_hook, ctx);
     sam3d_cpu_slat_dit_set_transformer_hook(cs3d_slat_transformer_gpu_hook, ctx);
     int slat_rc = sam3d_cpu_slat_dit_run_ode_from_coords(ctx->cpu_slat_dit,
                                                          active_coords, active_voxels,
@@ -1396,6 +2048,10 @@ int cuda_sam3d_run_slat_dit(cuda_sam3d_ctx *ctx) {
                                                          steps, ctx->cfg.seed, nthr,
                                                          &out_coords, &out_feats, &out_n);
     sam3d_cpu_slat_dit_set_transformer_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_ape_transformer_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_final_layer_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_io_block_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_input_layer_hook(NULL, NULL);
     free(active_coords);
     if (slat_rc != 0) {
         free(out_coords); free(out_feats);
@@ -1423,11 +2079,19 @@ int cuda_sam3d_debug_slat_dit_forward(cuda_sam3d_ctx *ctx,
 #else
     int nthr = 1;
 #endif
+    sam3d_cpu_slat_dit_set_input_layer_hook(cs3d_slat_input_layer_gpu_hook, ctx);
+    sam3d_cpu_slat_dit_set_io_block_hook(cs3d_slat_io_block_gpu_hook, ctx);
+    sam3d_cpu_slat_dit_set_final_layer_hook(cs3d_slat_final_layer_gpu_hook, ctx);
+    sam3d_cpu_slat_dit_set_ape_transformer_hook(cs3d_slat_ape_transformer_gpu_hook, ctx);
     sam3d_cpu_slat_dit_set_transformer_hook(cs3d_slat_transformer_gpu_hook, ctx);
     float *out = sam3d_cpu_slat_dit_forward(ctx->cpu_slat_dit,
                                             coords, feats, N, t,
                                             cond, n_cond, nthr);
     sam3d_cpu_slat_dit_set_transformer_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_ape_transformer_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_final_layer_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_io_block_hook(NULL, NULL);
+    sam3d_cpu_slat_dit_set_input_layer_hook(NULL, NULL);
     if (!out) return CUDA_SAM3D_E_LOAD;
     int out_c = sam3d_cpu_slat_dit_out_channels(ctx->cpu_slat_dit);
     memcpy(out_feats, out, (size_t)N * out_c * sizeof(float));
@@ -1465,6 +2129,73 @@ static int cs3d_ensure_gs(cuda_sam3d_ctx *ctx) {
     return CUDA_SAM3D_E_OK;
 }
 
+static int cs3d_ensure_gs_head_gpu(cuda_sam3d_ctx *ctx)
+{
+    int rc = cs3d_ensure_gs(ctx);
+    if (rc != CUDA_SAM3D_E_OK) return rc;
+    if (ctx->gpu_gs_head.loaded) return CUDA_SAM3D_E_OK;
+    sam3d_gs_decoder_model *m =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    if (!m) return CUDA_SAM3D_E_LOAD;
+    size_t total = 0;
+    if (cs3d_slat_io_upload_qtensor(&m->input_w, "gs.input_layer.weight",
+                                    &ctx->gpu_gs_head.input_w, &total) != 0 ||
+        cs3d_slat_io_upload_qtensor(&m->input_b, "gs.input_layer.bias",
+                                    &ctx->gpu_gs_head.input_b, &total) != 0 ||
+        cs3d_slat_io_upload_qtensor(&m->out_w, "gs.out_layer.weight",
+                                    &ctx->gpu_gs_head.out_w, &total) != 0 ||
+        cs3d_slat_io_upload_qtensor(&m->out_b, "gs.out_layer.bias",
+                                    &ctx->gpu_gs_head.out_b, &total) != 0) {
+        goto fail;
+    }
+    ctx->gpu_gs_head.mlp_blocks = (cs3d_gs_mlp_block_gpu *)calloc(
+        (size_t)m->n_blocks, sizeof(ctx->gpu_gs_head.mlp_blocks[0]));
+    if (!ctx->gpu_gs_head.mlp_blocks) goto fail;
+    ctx->gpu_gs_head.n_mlp_blocks = m->n_blocks;
+    ctx->gpu_gs_head.mlp_dim = m->dim;
+    ctx->gpu_gs_head.mlp_hidden = (int)(m->dim * m->mlp_ratio + 0.5f);
+    for (int b = 0; b < m->n_blocks; b++) {
+        char name[128];
+        const sam3d_gs_block *blk = &m->blocks[b];
+        cs3d_gs_mlp_block_gpu *gb = &ctx->gpu_gs_head.mlp_blocks[b];
+        snprintf(name, sizeof(name), "gs.blocks.%d.attn_qkv.weight", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->attn_qkv_w, name, &gb->qkv_w, &total) != 0)
+            goto fail;
+        snprintf(name, sizeof(name), "gs.blocks.%d.attn_qkv.bias", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->attn_qkv_b, name, &gb->qkv_b, &total) != 0)
+            goto fail;
+        snprintf(name, sizeof(name), "gs.blocks.%d.attn_out.weight", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->attn_out_w, name, &gb->out_w, &total) != 0)
+            goto fail;
+        snprintf(name, sizeof(name), "gs.blocks.%d.attn_out.bias", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->attn_out_b, name, &gb->out_b, &total) != 0)
+            goto fail;
+        snprintf(name, sizeof(name), "gs.blocks.%d.mlp_fc1.weight", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->mlp_fc1_w, name, &gb->fc1_w, &total) != 0)
+            goto fail;
+        snprintf(name, sizeof(name), "gs.blocks.%d.mlp_fc1.bias", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->mlp_fc1_b, name, &gb->fc1_b, &total) != 0)
+            goto fail;
+        snprintf(name, sizeof(name), "gs.blocks.%d.mlp_fc2.weight", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->mlp_fc2_w, name, &gb->fc2_w, &total) != 0)
+            goto fail;
+        snprintf(name, sizeof(name), "gs.blocks.%d.mlp_fc2.bias", b);
+        if (cs3d_slat_io_upload_qtensor(&blk->mlp_fc2_b, name, &gb->fc2_b, &total) != 0)
+            goto fail;
+    }
+    ctx->gpu_gs_head.input_in = m->input_w.n_cols;
+    ctx->gpu_gs_head.input_out = m->input_w.n_rows;
+    ctx->gpu_gs_head.out_in = m->out_w.n_cols;
+    ctx->gpu_gs_head.out_out = m->out_w.n_rows;
+    ctx->gpu_gs_head.total_bytes = total;
+    ctx->gpu_gs_head.loaded = 1;
+    return CUDA_SAM3D_E_OK;
+
+fail:
+    cs3d_gs_head_gpu_free(&ctx->gpu_gs_head);
+    return CUDA_SAM3D_E_LOAD;
+}
+
 static int cs3d_adopt_gaussians(cuda_sam3d_ctx *ctx, float *data, int n_total)
 {
     cs3d_free_2d(&ctx->gaussians);
@@ -1477,6 +2208,1031 @@ static int cs3d_adopt_gaussians(cuda_sam3d_ctx *ctx, float *data, int n_total)
     ctx->gaussians.n    = n_total;
     ctx->gaussians.c    = CUDA_SAM3D_GS_STRIDE;
     return CUDA_SAM3D_E_OK;
+}
+
+static int cs3d_gs_input_ape_gpu_hook(void *user,
+                                      const int32_t *coords,
+                                      const float *feats,
+                                      int N, int in_channels,
+                                      const void *input_w_void,
+                                      const void *input_b_void,
+                                      int dim,
+                                      float **out_h)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    (void)input_w_void;
+    (void)input_b_void;
+    if (!ctx || !coords || !feats || !out_h || N <= 0 || in_channels <= 0 || dim <= 0)
+        return -1;
+    if (cs3d_ensure_gs_head_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    if (in_channels != ctx->gpu_gs_head.input_in ||
+        dim != ctx->gpu_gs_head.input_out)
+        return -1;
+    hipFunction_t gemm = NULL, ape = NULL;
+    if (cuModuleGetFunction(&gemm, ctx->mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ape, ctx->mod, "slat_ape_add_f32") != CUDA_SUCCESS)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    size_t coord_bytes = (size_t)N * 4 * sizeof(int32_t);
+    size_t in_bytes = (size_t)N * in_channels * sizeof(float);
+    size_t h_bytes = (size_t)N * dim * sizeof(float);
+    float *host_h = NULL;
+    int rc = -1;
+    if (cs3d_ensure_devbuf(&ws->d_coords, &ws->cap_coords, coord_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_in,     &ws->cap_in,     in_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h,      &ws->cap_h,      h_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_coords, coords, coord_bytes) != CUDA_SUCCESS ||
+        cuMemcpyHtoD(ws->d_in, feats, in_bytes) != CUDA_SUCCESS)
+        goto done;
+    { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+      void *a[] = { &ws->d_h, &ws->d_in, &ctx->gpu_gs_head.input_w,
+                    &ctx->gpu_gs_head.input_b, &N, &in_channels, &dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    int freq_dim = dim / 3 / 2;
+    int filled = freq_dim * 2 * 3;
+    long long total = (long long)N * filled;
+    void *a_ape[] = { &ws->d_h, &ws->d_coords, &N, &dim };
+    if (cuLaunchKernel(ape, (unsigned)((total + 255) / 256), 1, 1,
+                       256, 1, 1, 0, 0, a_ape, NULL) != CUDA_SUCCESS)
+        goto done;
+    host_h = (float *)malloc(h_bytes);
+    if (!host_h) goto done;
+    if (cuMemcpyDtoH(host_h, ws->d_h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+    *out_h = host_h;
+    host_h = NULL;
+    rc = 0;
+
+done:
+    free(host_h);
+    return rc;
+}
+
+static int cs3d_gs_final_layer_gpu_hook(void *user,
+                                        const float *h,
+                                        int N, int dim,
+                                        const void *out_w_void,
+                                        const void *out_b_void,
+                                        int out_channels,
+                                        float eps,
+                                        float **out_feats)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    (void)out_w_void;
+    (void)out_b_void;
+    if (!ctx || !h || !out_feats || N <= 0 || dim <= 0 || out_channels <= 0)
+        return -1;
+    if (cs3d_ensure_gs_head_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    if (dim != ctx->gpu_gs_head.out_in ||
+        out_channels != ctx->gpu_gs_head.out_out)
+        return -1;
+    hipFunction_t gemm = NULL, ln = NULL;
+    if (cuModuleGetFunction(&gemm, ctx->mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ln, ctx->mod, "layernorm_token_f32") != CUDA_SUCCESS)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    size_t h_bytes = (size_t)N * dim * sizeof(float);
+    size_t out_bytes = (size_t)N * out_channels * sizeof(float);
+    float *host_out = NULL;
+    int rc = -1;
+    if (cs3d_ensure_devbuf(&ws->d_h,   &ws->cap_h,   h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_ln,  &ws->cap_ln,  h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_out, &ws->cap_out, out_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_h, h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+    int affine = 0;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    void *a_ln[] = { &ws->d_ln, &ws->d_h, &ctx->gpu_gs_head.out_w,
+                     &ctx->gpu_gs_head.out_b, &N, &dim, &eps, &affine };
+    if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                       (unsigned)ln_smem, 0, a_ln, NULL) != CUDA_SUCCESS)
+        goto done;
+    { unsigned gx = (N + 15) / 16, gy = (out_channels + 15) / 16;
+      void *a[] = { &ws->d_out, &ws->d_ln, &ctx->gpu_gs_head.out_w,
+                    &ctx->gpu_gs_head.out_b, &N, &dim, &out_channels };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    host_out = (float *)malloc(out_bytes);
+    if (!host_out) goto done;
+    if (cuMemcpyDtoH(host_out, ws->d_out, out_bytes) != CUDA_SUCCESS)
+        goto done;
+    *out_feats = host_out;
+    host_out = NULL;
+    rc = 0;
+
+done:
+    free(host_out);
+    return rc;
+}
+
+static int cs3d_gs_mlp_gpu_hook(void *user,
+                                float *h,
+                                int N, int dim,
+                                const void *blk_void,
+                                int hidden,
+                                float eps)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    const sam3d_gs_block *blk = (const sam3d_gs_block *)blk_void;
+    if (!ctx || !h || !blk || N <= 0 || dim <= 0 || hidden <= 0)
+        return -1;
+    if (cs3d_ensure_gs_head_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    sam3d_gs_decoder_model *m =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    if (!m || dim != ctx->gpu_gs_head.mlp_dim ||
+        hidden != ctx->gpu_gs_head.mlp_hidden)
+        return -1;
+    int bi = (int)(blk - m->blocks);
+    if (bi < 0 || bi >= ctx->gpu_gs_head.n_mlp_blocks)
+        return -1;
+    cs3d_gs_mlp_block_gpu *gb = &ctx->gpu_gs_head.mlp_blocks[bi];
+    hipFunction_t gemm = NULL, ln = NULL, gelu = NULL, resadd = NULL;
+    if (cuModuleGetFunction(&gemm, ctx->mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ln, ctx->mod, "layernorm_token_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gelu, ctx->mod, "gelu_tanh_inplace_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&resadd, ctx->mod, "residual_add_f32") != CUDA_SUCCESS)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    size_t h_bytes = (size_t)N * dim * sizeof(float);
+    size_t mlp_bytes = (size_t)N * hidden * sizeof(float);
+    int n_h = N * dim;
+    int n_mlp = N * hidden;
+    int rc = -1;
+    if (cs3d_ensure_devbuf(&ws->d_h,   &ws->cap_h,   h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_ln,  &ws->cap_ln,  h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_out, &ws->cap_out, h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_mlp, &ws->cap_mlp, mlp_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_h, h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    int affine = 0;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    void *a_ln[] = { &ws->d_ln, &ws->d_h, &gb->fc2_w, &gb->fc2_b,
+                     &N, &dim, &eps, &affine };
+    if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                       (unsigned)ln_smem, 0, a_ln, NULL) != CUDA_SUCCESS)
+        goto done;
+    { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
+      void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
+                    &N, &dim, &hidden };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { void *a[] = { &ws->d_mlp, &n_mlp };
+      if (cuLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
+                         256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+      void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
+                    &N, &hidden, &dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+      if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                         256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    if (cuMemcpyDtoH(h, ws->d_h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+    rc = 0;
+
+done:
+    return rc;
+}
+
+static int cs3d_gs_win_kv_cmp(const void *a, const void *b)
+{
+    int64_t ka = ((const cs3d_gs_win_kv *)a)->key;
+    int64_t kb = ((const cs3d_gs_win_kv *)b)->key;
+    return (ka < kb) ? -1 : (ka > kb);
+}
+
+static int cs3d_gs_build_partition(const sp3d_tensor *x, int window_size,
+                                   const int shift[3], int **fwd_out,
+                                   cs3d_gs_win_run **runs_out,
+                                   int *n_runs_out, int *max_len_out)
+{
+    if (!x || x->N <= 0 || !fwd_out || !runs_out || !n_runs_out || !max_len_out)
+        return -1;
+    int N = x->N;
+    int32_t mx[3] = {0, 0, 0};
+    for (int i = 0; i < N; i++) {
+        for (int a = 0; a < 3; a++) {
+            int32_t v = x->coords[i * 4 + 1 + a] + shift[a];
+            if (v > mx[a]) mx[a] = v;
+        }
+    }
+    int nw[3];
+    for (int a = 0; a < 3; a++) nw[a] = (int)(mx[a] / window_size) + 1;
+    int64_t off[3];
+    off[2] = 1;
+    off[1] = (int64_t)nw[2];
+    off[0] = (int64_t)nw[1] * nw[2];
+    int64_t per_batch = (int64_t)nw[0] * nw[1] * nw[2];
+
+    cs3d_gs_win_kv *kv = (cs3d_gs_win_kv *)malloc((size_t)N * sizeof(*kv));
+    int *fwd = (int *)malloc((size_t)N * sizeof(int));
+    cs3d_gs_win_run *runs = (cs3d_gs_win_run *)malloc((size_t)N * sizeof(*runs));
+    if (!kv || !fwd || !runs) {
+        free(kv); free(fwd); free(runs);
+        return -1;
+    }
+    for (int i = 0; i < N; i++) {
+        int32_t b = x->coords[i * 4];
+        int64_t key = (int64_t)b * per_batch;
+        for (int a = 0; a < 3; a++) {
+            int32_t v = (x->coords[i * 4 + 1 + a] + shift[a]) / window_size;
+            key += (int64_t)v * off[a];
+        }
+        kv[i].key = key;
+        kv[i].idx = i;
+    }
+    qsort(kv, (size_t)N, sizeof(*kv), cs3d_gs_win_kv_cmp);
+    for (int i = 0; i < N; i++) fwd[i] = kv[i].idx;
+    int nr = 0, max_len = 0;
+    for (int i = 0; i < N;) {
+        int j = i + 1;
+        while (j < N && kv[j].key == kv[i].key) j++;
+        runs[nr].start = i;
+        runs[nr].len = j - i;
+        if (runs[nr].len > max_len) max_len = runs[nr].len;
+        nr++;
+        i = j;
+    }
+    free(kv);
+    *fwd_out = fwd;
+    *runs_out = runs;
+    *n_runs_out = nr;
+    *max_len_out = max_len;
+    return 0;
+}
+
+static int cs3d_gs_window_attn_gpu_hook(void *user,
+                                        float *out,
+                                        const float *qkv,
+                                        const void *x_void,
+                                        int window_size,
+                                        const int shift[3],
+                                        int n_heads,
+                                        int head_dim)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    const sp3d_tensor *x = (const sp3d_tensor *)x_void;
+    if (!ctx || !out || !qkv || !x || x->N <= 0 || !x->coords ||
+        window_size <= 0 || !shift || n_heads <= 0 || head_dim <= 0)
+        return -1;
+    hipFunction_t gather = NULL, scatter = NULL, sdpa = NULL;
+    if (cuModuleGetFunction(&gather, ctx->mod, "sam3d_gs_gather_qkv_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&scatter, ctx->mod, "sam3d_gs_scatter_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&sdpa, ctx->mod, "sdpa_f32") != CUDA_SUCCESS)
+        return -1;
+
+    int *fwd = NULL;
+    cs3d_gs_win_run *runs = NULL;
+    int n_runs = 0, max_len = 0;
+    if (cs3d_gs_build_partition(x, window_size, shift, &fwd, &runs,
+                                &n_runs, &max_len) != 0)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    int N = x->N;
+    int dim = n_heads * head_dim;
+    size_t qkv_bytes = (size_t)N * 3 * dim * sizeof(float);
+    size_t out_bytes = (size_t)N * dim * sizeof(float);
+    size_t fwd_bytes = (size_t)N * sizeof(int);
+    size_t win_bytes = (size_t)max_len * dim * sizeof(float);
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int rc = -1;
+
+    if (cs3d_ensure_devbuf(&ws->d_qkv,  &ws->cap_qkv,  qkv_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_fwd,  &ws->cap_fwd,  fwd_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_attn, &ws->cap_attn, out_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_q,    &ws->cap_q,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_k,    &ws->cap_k,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_v,    &ws->cap_v,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_win,  &ws->cap_win,  win_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_qkv, qkv, qkv_bytes) != CUDA_SUCCESS ||
+        cuMemcpyHtoD(ws->d_fwd, fwd, fwd_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    for (int r = 0; r < n_runs; r++) {
+        int start = runs[r].start;
+        int len = runs[r].len;
+        int elems = len * dim;
+        void *a_g[] = { &ws->d_q, &ws->d_k, &ws->d_v, &ws->d_qkv,
+                        &ws->d_fwd, &start, &len, &dim };
+        if (cuLaunchKernel(gather, (elems + 255) / 256, 1, 1,
+                           256, 1, 1, 0, 0, a_g, NULL) != CUDA_SUCCESS)
+            goto done;
+        size_t smem = (size_t)(256 + len) * sizeof(float);
+        void *a_s[] = { &ws->d_win, &ws->d_q, &ws->d_k, &ws->d_v,
+                        &len, &len, &n_heads, &head_dim, &scale };
+        if (cuLaunchKernel(sdpa, len, n_heads, 1,
+                           256, 1, 1, (unsigned)smem, 0, a_s, NULL) != CUDA_SUCCESS)
+            goto done;
+        void *a_sc[] = { &ws->d_attn, &ws->d_win, &ws->d_fwd,
+                         &start, &len, &dim };
+        if (cuLaunchKernel(scatter, (elems + 255) / 256, 1, 1,
+                           256, 1, 1, 0, 0, a_sc, NULL) != CUDA_SUCCESS)
+            goto done;
+    }
+    if (cuMemcpyDtoH(out, ws->d_attn, out_bytes) != CUDA_SUCCESS)
+        goto done;
+    rc = 0;
+
+done:
+    free(fwd);
+    free(runs);
+    return rc;
+}
+
+static int cs3d_gs_attn_block_gpu_hook(void *user,
+                                       float *h,
+                                       const void *x_void,
+                                       int N, int dim,
+                                       const void *blk_void,
+                                       int window_size,
+                                       const int shift[3],
+                                       int n_heads,
+                                       int head_dim,
+                                       float eps)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    const sp3d_tensor *x = (const sp3d_tensor *)x_void;
+    const sam3d_gs_block *blk = (const sam3d_gs_block *)blk_void;
+    if (!ctx || !h || !x || !x->coords || !blk || N <= 0 || x->N != N ||
+        dim <= 0 || window_size <= 0 || !shift ||
+        n_heads <= 0 || head_dim <= 0 || dim != n_heads * head_dim)
+        return -1;
+    if (cs3d_ensure_gs_head_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    sam3d_gs_decoder_model *m =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    if (!m || dim != ctx->gpu_gs_head.mlp_dim)
+        return -1;
+    int bi = (int)(blk - m->blocks);
+    if (bi < 0 || bi >= ctx->gpu_gs_head.n_mlp_blocks)
+        return -1;
+    cs3d_gs_mlp_block_gpu *gb = &ctx->gpu_gs_head.mlp_blocks[bi];
+
+    hipFunction_t gemm = NULL, ln = NULL, gather = NULL, scatter = NULL;
+    hipFunction_t sdpa = NULL, resadd = NULL;
+    if (cuModuleGetFunction(&gemm, ctx->mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ln, ctx->mod, "layernorm_token_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gather, ctx->mod, "sam3d_gs_gather_qkv_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&scatter, ctx->mod, "sam3d_gs_scatter_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&sdpa, ctx->mod, "sdpa_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&resadd, ctx->mod, "residual_add_f32") != CUDA_SUCCESS)
+        return -1;
+
+    int *fwd = NULL;
+    cs3d_gs_win_run *runs = NULL;
+    int n_runs = 0, max_len = 0;
+    if (cs3d_gs_build_partition(x, window_size, shift, &fwd, &runs,
+                                &n_runs, &max_len) != 0)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    size_t h_bytes = (size_t)N * dim * sizeof(float);
+    size_t qkv_bytes = (size_t)N * 3 * dim * sizeof(float);
+    size_t fwd_bytes = (size_t)N * sizeof(int);
+    size_t win_bytes = (size_t)max_len * dim * sizeof(float);
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int n_h = N * dim;
+    int rc = -1;
+
+    if (cs3d_ensure_devbuf(&ws->d_h,    &ws->cap_h,    h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_ln,   &ws->cap_ln,   h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_qkv,  &ws->cap_qkv,  qkv_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_fwd,  &ws->cap_fwd,  fwd_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_attn, &ws->cap_attn, h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_out,  &ws->cap_out,  h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_q,    &ws->cap_q,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_k,    &ws->cap_k,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_v,    &ws->cap_v,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_win,  &ws->cap_win,  win_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_h, h, h_bytes) != CUDA_SUCCESS ||
+        cuMemcpyHtoD(ws->d_fwd, fwd, fwd_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    int affine = 0;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    void *a_ln[] = { &ws->d_ln, &ws->d_h, &gb->out_w, &gb->out_b,
+                     &N, &dim, &eps, &affine };
+    if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                       (unsigned)ln_smem, 0, a_ln, NULL) != CUDA_SUCCESS)
+        goto done;
+    { int qkv_dim = 3 * dim;
+      unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
+      void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
+                    &N, &dim, &qkv_dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+
+    for (int r = 0; r < n_runs; r++) {
+        int start = runs[r].start;
+        int len = runs[r].len;
+        int elems = len * dim;
+        void *a_g[] = { &ws->d_q, &ws->d_k, &ws->d_v, &ws->d_qkv,
+                        &ws->d_fwd, &start, &len, &dim };
+        if (cuLaunchKernel(gather, (elems + 255) / 256, 1, 1,
+                           256, 1, 1, 0, 0, a_g, NULL) != CUDA_SUCCESS)
+            goto done;
+        size_t smem = (size_t)(256 + len) * sizeof(float);
+        void *a_s[] = { &ws->d_win, &ws->d_q, &ws->d_k, &ws->d_v,
+                        &len, &len, &n_heads, &head_dim, &scale };
+        if (cuLaunchKernel(sdpa, len, n_heads, 1,
+                           256, 1, 1, (unsigned)smem, 0, a_s, NULL) != CUDA_SUCCESS)
+            goto done;
+        void *a_sc[] = { &ws->d_attn, &ws->d_win, &ws->d_fwd,
+                         &start, &len, &dim };
+        if (cuLaunchKernel(scatter, (elems + 255) / 256, 1, 1,
+                           256, 1, 1, 0, 0, a_sc, NULL) != CUDA_SUCCESS)
+            goto done;
+    }
+    { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+      void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
+                    &N, &dim, &dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+      if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                         256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    if (cuMemcpyDtoH(h, ws->d_h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+    rc = 0;
+
+done:
+    free(fwd);
+    free(runs);
+    return rc;
+}
+
+static int cs3d_gs_block_gpu_hook(void *user,
+                                  float *h,
+                                  const void *x_void,
+                                  int N, int dim,
+                                  const void *blk_void,
+                                  int window_size,
+                                  const int shift[3],
+                                  int n_heads,
+                                  int head_dim,
+                                  int hidden,
+                                  float eps)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    const sp3d_tensor *x = (const sp3d_tensor *)x_void;
+    const sam3d_gs_block *blk = (const sam3d_gs_block *)blk_void;
+    if (!ctx || !h || !x || !x->coords || !blk || N <= 0 || x->N != N ||
+        dim <= 0 || hidden <= 0 || window_size <= 0 || !shift ||
+        n_heads <= 0 || head_dim <= 0 || dim != n_heads * head_dim)
+        return -1;
+    if (cs3d_ensure_gs_head_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    sam3d_gs_decoder_model *m =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    if (!m || dim != ctx->gpu_gs_head.mlp_dim ||
+        hidden != ctx->gpu_gs_head.mlp_hidden)
+        return -1;
+    int bi = (int)(blk - m->blocks);
+    if (bi < 0 || bi >= ctx->gpu_gs_head.n_mlp_blocks)
+        return -1;
+    cs3d_gs_mlp_block_gpu *gb = &ctx->gpu_gs_head.mlp_blocks[bi];
+
+    hipFunction_t gemm = NULL, ln = NULL, gather = NULL, scatter = NULL;
+    hipFunction_t sdpa = NULL, resadd = NULL, gelu = NULL;
+    if (cuModuleGetFunction(&gemm, ctx->mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ln, ctx->mod, "layernorm_token_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gather, ctx->mod, "sam3d_gs_gather_qkv_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&scatter, ctx->mod, "sam3d_gs_scatter_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&sdpa, ctx->mod, "sdpa_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&resadd, ctx->mod, "residual_add_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gelu, ctx->mod, "gelu_tanh_inplace_f32") != CUDA_SUCCESS)
+        return -1;
+
+    int *fwd = NULL;
+    cs3d_gs_win_run *runs = NULL;
+    int n_runs = 0, max_len = 0;
+    if (cs3d_gs_build_partition(x, window_size, shift, &fwd, &runs,
+                                &n_runs, &max_len) != 0)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    size_t h_bytes = (size_t)N * dim * sizeof(float);
+    size_t qkv_bytes = (size_t)N * 3 * dim * sizeof(float);
+    size_t mlp_bytes = (size_t)N * hidden * sizeof(float);
+    size_t fwd_bytes = (size_t)N * sizeof(int);
+    size_t win_bytes = (size_t)max_len * dim * sizeof(float);
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int n_h = N * dim;
+    int n_mlp = N * hidden;
+    int rc = -1;
+
+    if (cs3d_ensure_devbuf(&ws->d_h,    &ws->cap_h,    h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_ln,   &ws->cap_ln,   h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_qkv,  &ws->cap_qkv,  qkv_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_fwd,  &ws->cap_fwd,  fwd_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_attn, &ws->cap_attn, h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_out,  &ws->cap_out,  h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_q,    &ws->cap_q,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_k,    &ws->cap_k,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_v,    &ws->cap_v,    win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_win,  &ws->cap_win,  win_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_mlp,  &ws->cap_mlp,  mlp_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_h, h, h_bytes) != CUDA_SUCCESS ||
+        cuMemcpyHtoD(ws->d_fwd, fwd, fwd_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    int affine = 0;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    void *a_ln1[] = { &ws->d_ln, &ws->d_h, &gb->out_w, &gb->out_b,
+                      &N, &dim, &eps, &affine };
+    if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                       (unsigned)ln_smem, 0, a_ln1, NULL) != CUDA_SUCCESS)
+        goto done;
+    { int qkv_dim = 3 * dim;
+      unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
+      void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
+                    &N, &dim, &qkv_dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+
+    for (int r = 0; r < n_runs; r++) {
+        int start = runs[r].start;
+        int len = runs[r].len;
+        int elems = len * dim;
+        void *a_g[] = { &ws->d_q, &ws->d_k, &ws->d_v, &ws->d_qkv,
+                        &ws->d_fwd, &start, &len, &dim };
+        if (cuLaunchKernel(gather, (elems + 255) / 256, 1, 1,
+                           256, 1, 1, 0, 0, a_g, NULL) != CUDA_SUCCESS)
+            goto done;
+        size_t smem = (size_t)(256 + len) * sizeof(float);
+        void *a_s[] = { &ws->d_win, &ws->d_q, &ws->d_k, &ws->d_v,
+                        &len, &len, &n_heads, &head_dim, &scale };
+        if (cuLaunchKernel(sdpa, len, n_heads, 1,
+                           256, 1, 1, (unsigned)smem, 0, a_s, NULL) != CUDA_SUCCESS)
+            goto done;
+        void *a_sc[] = { &ws->d_attn, &ws->d_win, &ws->d_fwd,
+                         &start, &len, &dim };
+        if (cuLaunchKernel(scatter, (elems + 255) / 256, 1, 1,
+                           256, 1, 1, 0, 0, a_sc, NULL) != CUDA_SUCCESS)
+            goto done;
+    }
+    { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+      void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
+                    &N, &dim, &dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+      if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                         256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+
+    void *a_ln2[] = { &ws->d_ln, &ws->d_h, &gb->fc2_w, &gb->fc2_b,
+                      &N, &dim, &eps, &affine };
+    if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                       (unsigned)ln_smem, 0, a_ln2, NULL) != CUDA_SUCCESS)
+        goto done;
+    { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
+      void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
+                    &N, &dim, &hidden };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { void *a[] = { &ws->d_mlp, &n_mlp };
+      if (cuLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
+                         256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+      void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
+                    &N, &hidden, &dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+      if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                         256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+
+    if (cuMemcpyDtoH(h, ws->d_h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+    rc = 0;
+
+done:
+    free(fwd);
+    free(runs);
+    return rc;
+}
+
+static int cs3d_gs_stack_gpu_hook(void *user,
+                                  float *h,
+                                  const void *x_void,
+                                  int N, int dim,
+                                  const void *blocks_void,
+                                  int n_blocks,
+                                  int window_size,
+                                  int n_heads,
+                                  int head_dim,
+                                  int hidden,
+                                  float eps)
+{
+    cuda_sam3d_ctx *ctx = (cuda_sam3d_ctx *)user;
+    const sp3d_tensor *x = (const sp3d_tensor *)x_void;
+    const sam3d_gs_block *blocks = (const sam3d_gs_block *)blocks_void;
+    if (!ctx || !h || !x || !x->coords || !blocks || N <= 0 || x->N != N ||
+        dim <= 0 || hidden <= 0 || n_blocks <= 0 || window_size <= 0 ||
+        n_heads <= 0 || head_dim <= 0 || dim != n_heads * head_dim)
+        return -1;
+    if (cs3d_ensure_gs_head_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    sam3d_gs_decoder_model *m =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    if (!m || blocks != m->blocks || n_blocks != m->n_blocks ||
+        dim != ctx->gpu_gs_head.mlp_dim ||
+        hidden != ctx->gpu_gs_head.mlp_hidden)
+        return -1;
+
+    hipFunction_t gemm = NULL, ln = NULL, gather = NULL, scatter = NULL;
+    hipFunction_t sdpa = NULL, resadd = NULL, gelu = NULL;
+    if (cuModuleGetFunction(&gemm, ctx->mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ln, ctx->mod, "layernorm_token_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gather, ctx->mod, "sam3d_gs_gather_qkv_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&scatter, ctx->mod, "sam3d_gs_scatter_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&sdpa, ctx->mod, "sdpa_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&resadd, ctx->mod, "residual_add_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gelu, ctx->mod, "gelu_tanh_inplace_f32") != CUDA_SUCCESS)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    size_t h_bytes = (size_t)N * dim * sizeof(float);
+    size_t qkv_bytes = (size_t)N * 3 * dim * sizeof(float);
+    size_t mlp_bytes = (size_t)N * hidden * sizeof(float);
+    size_t fwd_bytes = (size_t)N * sizeof(int);
+    int n_h = N * dim;
+    int n_mlp = N * hidden;
+    int affine = 0;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    int rc = -1;
+
+    if (cs3d_ensure_devbuf(&ws->d_h,    &ws->cap_h,    h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_ln,   &ws->cap_ln,   h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_qkv,  &ws->cap_qkv,  qkv_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_fwd,  &ws->cap_fwd,  fwd_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_attn, &ws->cap_attn, h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_out,  &ws->cap_out,  h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_mlp,  &ws->cap_mlp,  mlp_bytes) != 0)
+        goto done;
+    if (cuMemcpyHtoD(ws->d_h, h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        cs3d_gs_mlp_block_gpu *gb = &ctx->gpu_gs_head.mlp_blocks[bi];
+        int shift_v = (bi & 1) ? (window_size / 2) : 0;
+        int shift[3] = {shift_v, shift_v, shift_v};
+        int *fwd = NULL;
+        cs3d_gs_win_run *runs = NULL;
+        int n_runs = 0, max_len = 0;
+        if (cs3d_gs_build_partition(x, window_size, shift, &fwd, &runs,
+                                    &n_runs, &max_len) != 0)
+            goto done;
+
+        size_t win_bytes = (size_t)max_len * dim * sizeof(float);
+        float scale = 1.0f / sqrtf((float)head_dim);
+        if (cs3d_ensure_devbuf(&ws->d_q,   &ws->cap_q,   win_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_k,   &ws->cap_k,   win_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_v,   &ws->cap_v,   win_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_win, &ws->cap_win, win_bytes) != 0 ||
+            cuMemcpyHtoD(ws->d_fwd, fwd, fwd_bytes) != CUDA_SUCCESS) {
+            free(fwd);
+            free(runs);
+            goto done;
+        }
+
+        void *a_ln1[] = { &ws->d_ln, &ws->d_h, &gb->out_w, &gb->out_b,
+                          &N, &dim, &eps, &affine };
+        if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                           (unsigned)ln_smem, 0, a_ln1, NULL) != CUDA_SUCCESS) {
+            free(fwd); free(runs); goto done;
+        }
+        { int qkv_dim = 3 * dim;
+          unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
+          void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
+                        &N, &dim, &qkv_dim };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS) {
+              free(fwd); free(runs); goto done;
+          } }
+
+        for (int r = 0; r < n_runs; r++) {
+            int start = runs[r].start;
+            int len = runs[r].len;
+            int elems = len * dim;
+            void *a_g[] = { &ws->d_q, &ws->d_k, &ws->d_v, &ws->d_qkv,
+                            &ws->d_fwd, &start, &len, &dim };
+            if (cuLaunchKernel(gather, (elems + 255) / 256, 1, 1,
+                               256, 1, 1, 0, 0, a_g, NULL) != CUDA_SUCCESS) {
+                free(fwd); free(runs); goto done;
+            }
+            size_t smem = (size_t)(256 + len) * sizeof(float);
+            void *a_s[] = { &ws->d_win, &ws->d_q, &ws->d_k, &ws->d_v,
+                            &len, &len, &n_heads, &head_dim, &scale };
+            if (cuLaunchKernel(sdpa, len, n_heads, 1,
+                               256, 1, 1, (unsigned)smem, 0, a_s, NULL) != CUDA_SUCCESS) {
+                free(fwd); free(runs); goto done;
+            }
+            void *a_sc[] = { &ws->d_attn, &ws->d_win, &ws->d_fwd,
+                             &start, &len, &dim };
+            if (cuLaunchKernel(scatter, (elems + 255) / 256, 1, 1,
+                               256, 1, 1, 0, 0, a_sc, NULL) != CUDA_SUCCESS) {
+                free(fwd); free(runs); goto done;
+            }
+        }
+        free(fwd);
+        free(runs);
+
+        { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+          void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
+                        &N, &dim, &dim };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+          if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                             256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+
+        void *a_ln2[] = { &ws->d_ln, &ws->d_h, &gb->fc2_w, &gb->fc2_b,
+                          &N, &dim, &eps, &affine };
+        if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                           (unsigned)ln_smem, 0, a_ln2, NULL) != CUDA_SUCCESS)
+            goto done;
+        { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
+          void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
+                        &N, &dim, &hidden };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { void *a[] = { &ws->d_mlp, &n_mlp };
+          if (cuLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
+                             256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+          void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
+                        &N, &hidden, &dim };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+          if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                             256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+    }
+
+    if (cuMemcpyDtoH(h, ws->d_h, h_bytes) != CUDA_SUCCESS)
+        goto done;
+    rc = 0;
+
+done:
+    return rc;
+}
+
+static int cs3d_gs_transformer_gpu_forward(cuda_sam3d_ctx *ctx,
+                                           const sp3d_tensor *x,
+                                           const sam3d_gs_decoder_model *m,
+                                           CUdeviceptr src_d_coords,
+                                           CUdeviceptr src_d_feats,
+                                           float **out_feats)
+{
+    if (!ctx || !x || !x->coords || !x->feats || !m || x->N <= 0 || x->C <= 0)
+        return -1;
+    if (cs3d_ensure_gs_head_gpu(ctx) != CUDA_SAM3D_E_OK) return -1;
+    sam3d_gs_decoder_model *ctx_m =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    if (m != ctx_m) return -1;
+
+    int N = x->N;
+    int in_channels = x->C;
+    int dim = m->dim;
+    int hidden = ctx->gpu_gs_head.mlp_hidden;
+    int n_heads = m->n_heads;
+    int head_dim = m->head_dim;
+    int window_size = m->window_size;
+    int out_channels = m->out_channels;
+    if (in_channels != ctx->gpu_gs_head.input_in ||
+        dim != ctx->gpu_gs_head.input_out ||
+        dim != ctx->gpu_gs_head.mlp_dim ||
+        dim != n_heads * head_dim ||
+        out_channels != ctx->gpu_gs_head.out_out ||
+        hidden <= 0)
+        return -1;
+
+    hipFunction_t gemm = NULL, ape = NULL, ln = NULL, gather = NULL;
+    hipFunction_t scatter = NULL, sdpa = NULL, resadd = NULL, gelu = NULL;
+    if (cuModuleGetFunction(&gemm, ctx->mod, "gemm_f32_bias") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ape, ctx->mod, "slat_ape_add_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&ln, ctx->mod, "layernorm_token_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gather, ctx->mod, "sam3d_gs_gather_qkv_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&scatter, ctx->mod, "sam3d_gs_scatter_window_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&sdpa, ctx->mod, "sdpa_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&resadd, ctx->mod, "residual_add_f32") != CUDA_SUCCESS ||
+        cuModuleGetFunction(&gelu, ctx->mod, "gelu_tanh_inplace_f32") != CUDA_SUCCESS)
+        return -1;
+
+    cs3d_gs_head_ws *ws = &ctx->gpu_gs_head_ws;
+    size_t coord_bytes = (size_t)N * 4 * sizeof(int32_t);
+    size_t in_bytes = (size_t)N * in_channels * sizeof(float);
+    size_t h_bytes = (size_t)N * dim * sizeof(float);
+    size_t qkv_bytes = (size_t)N * 3 * dim * sizeof(float);
+    size_t mlp_bytes = (size_t)N * hidden * sizeof(float);
+    size_t fwd_bytes = (size_t)N * sizeof(int);
+    size_t out_bytes = (size_t)N * out_channels * sizeof(float);
+    int n_h = N * dim;
+    int n_mlp = N * hidden;
+    int affine = 0;
+    unsigned threads = 256;
+    size_t ln_smem = 2 * threads * sizeof(float);
+    float eps_block = 1e-6f;
+    float eps_final = 1e-5f;
+    float *host_out = NULL;
+    int rc = -1;
+
+    if (cs3d_ensure_devbuf(&ws->d_coords, &ws->cap_coords, coord_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_in,     &ws->cap_in,     in_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_h,      &ws->cap_h,      h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_ln,     &ws->cap_ln,     h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_qkv,    &ws->cap_qkv,    qkv_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_fwd,    &ws->cap_fwd,    fwd_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_attn,   &ws->cap_attn,   h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_out,    &ws->cap_out,    h_bytes) != 0 ||
+        cs3d_ensure_devbuf(&ws->d_mlp,    &ws->cap_mlp,    mlp_bytes) != 0)
+        goto done;
+    if (src_d_coords) {
+        if (cuMemcpyDtoD(ws->d_coords, src_d_coords, coord_bytes) != CUDA_SUCCESS)
+            goto done;
+    } else if (cuMemcpyHtoD(ws->d_coords, x->coords, coord_bytes) != CUDA_SUCCESS) {
+        goto done;
+    }
+    if (src_d_feats) {
+        if (cuMemcpyDtoD(ws->d_in, src_d_feats, in_bytes) != CUDA_SUCCESS)
+            goto done;
+    } else if (cuMemcpyHtoD(ws->d_in, x->feats, in_bytes) != CUDA_SUCCESS) {
+        goto done;
+    }
+
+    { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+      void *a[] = { &ws->d_h, &ws->d_in, &ctx->gpu_gs_head.input_w,
+                    &ctx->gpu_gs_head.input_b, &N, &in_channels, &dim };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+    {
+      int freq_dim = dim / 3 / 2;
+      int filled = freq_dim * 2 * 3;
+      long long total = (long long)N * filled;
+      void *a_ape[] = { &ws->d_h, &ws->d_coords, &N, &dim };
+      if (filled <= 0 ||
+          cuLaunchKernel(ape, (unsigned)((total + 255) / 256), 1, 1,
+                         256, 1, 1, 0, 0, a_ape, NULL) != CUDA_SUCCESS)
+          goto done;
+    }
+
+    for (int bi = 0; bi < m->n_blocks; bi++) {
+        cs3d_gs_mlp_block_gpu *gb = &ctx->gpu_gs_head.mlp_blocks[bi];
+        int shift_v = (bi & 1) ? (window_size / 2) : 0;
+        int shift[3] = {shift_v, shift_v, shift_v};
+        int *fwd = NULL;
+        cs3d_gs_win_run *runs = NULL;
+        int n_runs = 0, max_len = 0;
+        if (cs3d_gs_build_partition(x, window_size, shift, &fwd, &runs,
+                                    &n_runs, &max_len) != 0)
+            goto done;
+
+        size_t win_bytes = (size_t)max_len * dim * sizeof(float);
+        float scale = 1.0f / sqrtf((float)head_dim);
+        if (cs3d_ensure_devbuf(&ws->d_q,   &ws->cap_q,   win_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_k,   &ws->cap_k,   win_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_v,   &ws->cap_v,   win_bytes) != 0 ||
+            cs3d_ensure_devbuf(&ws->d_win, &ws->cap_win, win_bytes) != 0 ||
+            cuMemcpyHtoD(ws->d_fwd, fwd, fwd_bytes) != CUDA_SUCCESS) {
+            free(fwd); free(runs); goto done;
+        }
+
+        void *a_ln1[] = { &ws->d_ln, &ws->d_h, &gb->out_w, &gb->out_b,
+                          &N, &dim, &eps_block, &affine };
+        if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                           (unsigned)ln_smem, 0, a_ln1, NULL) != CUDA_SUCCESS) {
+            free(fwd); free(runs); goto done;
+        }
+        { int qkv_dim = 3 * dim;
+          unsigned gx = (N + 15) / 16, gy = (qkv_dim + 15) / 16;
+          void *a[] = { &ws->d_qkv, &ws->d_ln, &gb->qkv_w, &gb->qkv_b,
+                        &N, &dim, &qkv_dim };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS) {
+              free(fwd); free(runs); goto done;
+          } }
+
+        for (int r = 0; r < n_runs; r++) {
+            int start = runs[r].start;
+            int len = runs[r].len;
+            int elems = len * dim;
+            void *a_g[] = { &ws->d_q, &ws->d_k, &ws->d_v, &ws->d_qkv,
+                            &ws->d_fwd, &start, &len, &dim };
+            if (cuLaunchKernel(gather, (elems + 255) / 256, 1, 1,
+                               256, 1, 1, 0, 0, a_g, NULL) != CUDA_SUCCESS) {
+                free(fwd); free(runs); goto done;
+            }
+            size_t smem = (size_t)(256 + len) * sizeof(float);
+            void *a_s[] = { &ws->d_win, &ws->d_q, &ws->d_k, &ws->d_v,
+                            &len, &len, &n_heads, &head_dim, &scale };
+            if (cuLaunchKernel(sdpa, len, n_heads, 1,
+                               256, 1, 1, (unsigned)smem, 0, a_s, NULL) != CUDA_SUCCESS) {
+                free(fwd); free(runs); goto done;
+            }
+            void *a_sc[] = { &ws->d_attn, &ws->d_win, &ws->d_fwd,
+                             &start, &len, &dim };
+            if (cuLaunchKernel(scatter, (elems + 255) / 256, 1, 1,
+                               256, 1, 1, 0, 0, a_sc, NULL) != CUDA_SUCCESS) {
+                free(fwd); free(runs); goto done;
+            }
+        }
+        free(fwd);
+        free(runs);
+
+        { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+          void *a[] = { &ws->d_out, &ws->d_attn, &gb->out_w, &gb->out_b,
+                        &N, &dim, &dim };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+          if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                             256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+
+        void *a_ln2[] = { &ws->d_ln, &ws->d_h, &gb->fc2_w, &gb->fc2_b,
+                          &N, &dim, &eps_block, &affine };
+        if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                           (unsigned)ln_smem, 0, a_ln2, NULL) != CUDA_SUCCESS)
+            goto done;
+        { unsigned gx = (N + 15) / 16, gy = (hidden + 15) / 16;
+          void *a[] = { &ws->d_mlp, &ws->d_ln, &gb->fc1_w, &gb->fc1_b,
+                        &N, &dim, &hidden };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { void *a[] = { &ws->d_mlp, &n_mlp };
+          if (cuLaunchKernel(gelu, (n_mlp + 255) / 256, 1, 1,
+                             256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { unsigned gx = (N + 15) / 16, gy = (dim + 15) / 16;
+          void *a[] = { &ws->d_out, &ws->d_mlp, &gb->fc2_w, &gb->fc2_b,
+                        &N, &hidden, &dim };
+          if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+        { void *a[] = { &ws->d_h, &ws->d_out, &n_h };
+          if (cuLaunchKernel(resadd, (n_h + 255) / 256, 1, 1,
+                             256, 1, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+              goto done; }
+    }
+
+    void *a_lnf[] = { &ws->d_ln, &ws->d_h, &ctx->gpu_gs_head.out_w,
+                      &ctx->gpu_gs_head.out_b, &N, &dim, &eps_final, &affine };
+    if (cuLaunchKernel(ln, N, 1, 1, threads, 1, 1,
+                       (unsigned)ln_smem, 0, a_lnf, NULL) != CUDA_SUCCESS)
+        goto done;
+    { unsigned gx = (N + 15) / 16, gy = (out_channels + 15) / 16;
+      void *a[] = { &ws->d_out, &ws->d_ln, &ctx->gpu_gs_head.out_w,
+                    &ctx->gpu_gs_head.out_b, &N, &dim, &out_channels };
+      if (cuLaunchKernel(gemm, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL) != CUDA_SUCCESS)
+          goto done; }
+
+    if (out_feats) {
+        host_out = (float *)malloc(out_bytes);
+        if (!host_out) goto done;
+        if (cuMemcpyDtoH(host_out, ws->d_out, out_bytes) != CUDA_SUCCESS)
+            goto done;
+        *out_feats = host_out;
+        host_out = NULL;
+    }
+    rc = 0;
+
+done:
+    free(host_out);
+    return rc;
+}
+
+static int cs3d_gs_transformer_gpu_hook(void *user,
+                                        const void *x_void,
+                                        const void *m_void,
+                                        float **out_feats)
+{
+    return cs3d_gs_transformer_gpu_forward((cuda_sam3d_ctx *)user,
+                                           (const sp3d_tensor *)x_void,
+                                           (const sam3d_gs_decoder_model *)m_void,
+                                           0, 0,
+                                           out_feats);
 }
 
 int cuda_sam3d_debug_slat_gs_transformer(cuda_sam3d_ctx *ctx,
@@ -1492,8 +3248,24 @@ int cuda_sam3d_debug_slat_gs_transformer(cuda_sam3d_ctx *ctx,
 #else
     int nthr = 1;
 #endif
+    sam3d_cpu_gs_decoder_set_input_ape_hook(cs3d_gs_input_ape_gpu_hook, ctx);
+    sam3d_cpu_gs_decoder_set_final_layer_hook(cs3d_gs_final_layer_gpu_hook, ctx);
+    sam3d_cpu_gs_decoder_set_window_attn_hook(cs3d_gs_window_attn_gpu_hook, ctx);
+    sam3d_cpu_gs_decoder_set_attn_block_hook(cs3d_gs_attn_block_gpu_hook, ctx);
+    sam3d_cpu_gs_decoder_set_mlp_hook(cs3d_gs_mlp_gpu_hook, ctx);
+    sam3d_cpu_gs_decoder_set_block_hook(cs3d_gs_block_gpu_hook, ctx);
+    sam3d_cpu_gs_decoder_set_stack_hook(cs3d_gs_stack_gpu_hook, ctx);
+    sam3d_cpu_gs_decoder_set_transformer_hook(cs3d_gs_transformer_gpu_hook, ctx);
     float *out = sam3d_cpu_gs_decoder_transformer(ctx->cpu_gs, coords, feats,
                                                   N, nthr);
+    sam3d_cpu_gs_decoder_set_transformer_hook(NULL, NULL);
+    sam3d_cpu_gs_decoder_set_stack_hook(NULL, NULL);
+    sam3d_cpu_gs_decoder_set_block_hook(NULL, NULL);
+    sam3d_cpu_gs_decoder_set_mlp_hook(NULL, NULL);
+    sam3d_cpu_gs_decoder_set_attn_block_hook(NULL, NULL);
+    sam3d_cpu_gs_decoder_set_window_attn_hook(NULL, NULL);
+    sam3d_cpu_gs_decoder_set_final_layer_hook(NULL, NULL);
+    sam3d_cpu_gs_decoder_set_input_ape_hook(NULL, NULL);
     if (!out) return CUDA_SAM3D_E_LOAD;
     *out_feats = out;
     if (out_c) *out_c = sam3d_cpu_gs_decoder_out_channels(ctx->cpu_gs);
@@ -1530,6 +3302,124 @@ int cuda_sam3d_slat_gs_info(cuda_sam3d_ctx *ctx,
     return CUDA_SAM3D_E_OK;
 }
 
+static int cs3d_gs_pack_ply_gpu_device(cuda_sam3d_ctx *ctx,
+                                       const sam3d_gs_decoder_model *m,
+                                       CUdeviceptr d_coords,
+                                       CUdeviceptr d_feats,
+                                       int N,
+                                       float **out_ply,
+                                       int *out_total)
+{
+    if (!ctx || !m || !d_coords || !d_feats || N <= 0 || !out_ply || !out_total)
+        return CUDA_SAM3D_E_INVAL;
+    hipFunction_t fn = NULL;
+    if (cuModuleGetFunction(&fn, ctx->mod, "sam3d_gs_pack_ply_f32") != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_sam3d: missing sam3d_gs_pack_ply_f32\n");
+        return CUDA_SAM3D_E_LOAD;
+    }
+
+    int C = m->out_channels;
+    int G = m->num_gaussians;
+    int stride = CUDA_SAM3D_GS_STRIDE;
+    int total = N * G;
+    size_t ply_bytes = (size_t)total * stride * sizeof(float);
+    CUdeviceptr d_ply = 0, d_perturb = 0;
+    float *ply = NULL;
+    int rc = CUDA_SAM3D_E_LOAD;
+
+    if (cuMemAlloc(&d_ply, ply_bytes) != CUDA_SUCCESS)
+        goto done;
+
+    int has_perturb = (m->perturb_offset && m->offset_perturbation.data) ? 1 : 0;
+    if (has_perturb &&
+        cs3d_slat_io_upload_qtensor(&m->offset_perturbation,
+                                    "gs.offset_perturbation",
+                                    &d_perturb, NULL) != 0)
+        goto done;
+
+    int resolution = m->resolution;
+    float voxel_size = m->voxel_size;
+    float scaling_bias = m->scaling_bias;
+    float opacity_bias = m->opacity_bias;
+    int r_xyz0 = m->r_xyz[0];
+    int r_dc0 = m->r_features_dc[0];
+    int r_scl0 = m->r_scaling[0];
+    int r_rot0 = m->r_rotation[0];
+    int r_op0 = m->r_opacity[0];
+    float lr_xyz = m->lr_xyz;
+    float lr_features_dc = m->lr_features_dc;
+    float lr_scaling = m->lr_scaling;
+    float lr_rotation = m->lr_rotation;
+    float lr_opacity = m->lr_opacity;
+    void *args[] = { &d_ply, &d_coords, &d_feats, &d_perturb, &has_perturb,
+                     &N, &C, &G, &stride, &resolution,
+                     &voxel_size, &scaling_bias, &opacity_bias,
+                     &r_xyz0, &r_dc0, &r_scl0, &r_rot0, &r_op0,
+                     &lr_xyz, &lr_features_dc, &lr_scaling,
+                     &lr_rotation, &lr_opacity };
+    if (cuLaunchKernel(fn, (total + 255) / 256, 1, 1,
+                       256, 1, 1, 0, 0, args, NULL) != CUDA_SUCCESS)
+        goto done;
+    ply = (float *)malloc(ply_bytes);
+    if (!ply) goto done;
+    if (cuMemcpyDtoH(ply, d_ply, ply_bytes) != CUDA_SUCCESS)
+        goto done;
+    *out_ply = ply;
+    *out_total = total;
+    ply = NULL;
+    rc = CUDA_SAM3D_E_OK;
+
+done:
+    free(ply);
+    if (d_ply) cuMemFree(d_ply);
+    if (d_perturb) cuMemFree(d_perturb);
+    return rc;
+}
+
+static int cs3d_gs_pack_ply_gpu(cuda_sam3d_ctx *ctx,
+                                const sam3d_gs_decoder_model *m,
+                                const int32_t *coords,
+                                const float *feats_out,
+                                int N,
+                                float **out_ply,
+                                int *out_total)
+{
+    if (!ctx || !m || !coords || !feats_out || N <= 0 || !out_ply || !out_total)
+        return CUDA_SAM3D_E_INVAL;
+
+    int C = m->out_channels;
+    size_t coord_bytes = (size_t)N * 4 * sizeof(int32_t);
+    size_t feat_bytes = (size_t)N * C * sizeof(float);
+    CUdeviceptr d_coords = cu_upload_raw(coords, coord_bytes);
+    CUdeviceptr d_feats = cu_upload_raw(feats_out, feat_bytes);
+    if (!d_coords || !d_feats) {
+        if (d_coords) cuMemFree(d_coords);
+        if (d_feats) cuMemFree(d_feats);
+        return CUDA_SAM3D_E_LOAD;
+    }
+
+    int rc = cs3d_gs_pack_ply_gpu_device(ctx, m, d_coords, d_feats, N,
+                                         out_ply, out_total);
+    cuMemFree(d_coords);
+    cuMemFree(d_feats);
+    return rc;
+}
+
+int cuda_sam3d_debug_slat_gs_pack_ply(cuda_sam3d_ctx *ctx,
+                                      const int32_t *coords,
+                                      const float *feats_out, int N,
+                                      float **out_ply, int *out_total)
+{
+    if (!ctx || !coords || !feats_out || N <= 0 || !out_ply || !out_total)
+        return CUDA_SAM3D_E_INVAL;
+    int rc = cs3d_ensure_gs(ctx);
+    if (rc != CUDA_SAM3D_E_OK) return rc;
+    sam3d_gs_decoder_model *gm =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    return cs3d_gs_pack_ply_gpu(ctx, gm, coords, feats_out, N,
+                                out_ply, out_total);
+}
+
 int cuda_sam3d_run_slat_gs_decode(cuda_sam3d_ctx *ctx) {
     if (!ctx) return CUDA_SAM3D_E_INVAL;
     const cs3d_host_slat *slat = cs3d_active_slat(ctx);
@@ -1541,39 +3431,47 @@ int cuda_sam3d_run_slat_gs_decode(cuda_sam3d_ctx *ctx) {
     int rc = cs3d_ensure_gs(ctx);
     if (rc != CUDA_SAM3D_E_OK) return rc;
 
-#if defined(_OPENMP)
-    int nthr = omp_get_max_threads(); if (nthr < 1) nthr = 1;
-#else
-    int nthr = 1;
-#endif
     int N = slat->n;
     int G = sam3d_cpu_gs_decoder_num_gaussians(ctx->cpu_gs);
     int total = N * G;
 
-    float *out_feats = sam3d_cpu_gs_decoder_transformer(ctx->cpu_gs,
-                                                        slat->coords,
-                                                        slat->feats, N, nthr);
-    if (!out_feats) return CUDA_SAM3D_E_LOAD;
+    sam3d_gs_decoder_model *gm =
+        (sam3d_gs_decoder_model *)sam3d_cpu_gs_decoder_model(ctx->cpu_gs);
+    sp3d_tensor x = {0};
+    x.coords = (int32_t *)slat->coords;
+    x.feats = (float *)slat->feats;
+    x.N = N;
+    x.C = slat->c;
+    x.batch_size = 1;
 
-    float *xyz = (float *)malloc((size_t)total * 3 * sizeof(float));
-    float *dc  = (float *)malloc((size_t)total * 3 * sizeof(float));
-    float *scl = (float *)malloc((size_t)total * 3 * sizeof(float));
-    float *rot = (float *)malloc((size_t)total * 4 * sizeof(float));
-    float *op  = (float *)malloc((size_t)total     * sizeof(float));
-    float *ply = (float *)malloc((size_t)total * CUDA_SAM3D_GS_STRIDE * sizeof(float));
-    if (!xyz || !dc || !scl || !rot || !op || !ply) {
-        free(xyz); free(dc); free(scl); free(rot); free(op); free(ply);
-        free(out_feats);
+    CUdeviceptr src_d_coords = 0;
+    CUdeviceptr src_d_feats = 0;
+    if (slat == &ctx->slat_tokens &&
+        ctx->d_slat_coords && ctx->d_slat_feats &&
+        ctx->slat_tokens.n == N && ctx->slat_tokens.c == slat->c) {
+        src_d_coords = ctx->d_slat_coords;
+        src_d_feats = ctx->d_slat_feats;
+    }
+    if (cs3d_gs_transformer_gpu_forward(ctx, &x, gm,
+                                        src_d_coords, src_d_feats,
+                                        NULL) != 0)
+        return CUDA_SAM3D_E_LOAD;
+
+    float *ply = NULL;
+    int packed_total = 0;
+    rc = cs3d_gs_pack_ply_gpu_device(ctx, gm,
+                                     ctx->gpu_gs_head_ws.d_coords,
+                                     ctx->gpu_gs_head_ws.d_out,
+                                     N, &ply, &packed_total);
+    if (rc != CUDA_SAM3D_E_OK) {
+        free(ply);
+        return rc;
+    }
+    if (packed_total != total) {
+        free(ply);
         return CUDA_SAM3D_E_LOAD;
     }
-    sam3d_cpu_gs_decoder_to_representation(ctx->cpu_gs, slat->coords,
-                                           out_feats, N,
-                                           xyz, dc, scl, rot, op);
-    free(out_feats);
-    sam3d_cpu_gs_decoder_pack_ply(ctx->cpu_gs, xyz, dc, scl, rot, op,
-                                  total, CUDA_SAM3D_GS_STRIDE, ply);
-    free(xyz); free(dc); free(scl); free(rot); free(op);
-    return cs3d_adopt_gaussians(ctx, ply, total);
+    return cs3d_adopt_gaussians(ctx, ply, packed_total);
 }
 
 /* ===== read-back stubs ===== */

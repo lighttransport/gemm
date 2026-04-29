@@ -149,6 +149,13 @@ int cuda_sam3d_debug_slat_gs_to_representation(cuda_sam3d_ctx *ctx,
                                                float *scaling_out, float *rotation_out,
                                                float *opacity_out);
 
+/* CUDA fused to_representation + PLY-layout pack for raw GS decoder
+ * out_feats. Returns malloc'd [N*G, CUDA_SAM3D_GS_STRIDE] f32. */
+int cuda_sam3d_debug_slat_gs_pack_ply(cuda_sam3d_ctx *ctx,
+                                      const int32_t *coords,
+                                      const float *feats_out, int N,
+                                      float **out_ply, int *out_total);
+
 /* Architecture query (lazy-loads SLAT GS decoder model). Any out_* may be NULL. */
 int cuda_sam3d_slat_gs_info(cuda_sam3d_ctx *ctx,
                             int *out_in_channels, int *out_out_channels,

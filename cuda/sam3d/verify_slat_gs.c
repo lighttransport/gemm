@@ -30,6 +30,40 @@ static int diff_and_report(const char *label, const float *a, const float *b,
     return ok;
 }
 
+static float verify_log_softplus(float x)
+{
+    if (x > 20.0f) return logf(x);
+    if (x < -15.0f) return x;
+    return logf(log1pf(expf(x)));
+}
+
+static void verify_pack_ply_cpu(const float *xyz, const float *dc,
+                                const float *scl, const float *rot,
+                                const float *op, int total, int stride,
+                                float *out_ply)
+{
+    const float scaling_bias = 0.004f;
+    const float opacity_bias = 0.1f;
+    const float inv_sp_sb = logf(expf(scaling_bias) - 1.0f);
+    for (int i = 0; i < total; i++) {
+        float *r = out_ply + (size_t)i * stride;
+        r[0] = xyz[i * 3 + 0];
+        r[1] = xyz[i * 3 + 1];
+        r[2] = xyz[i * 3 + 2];
+        r[3] = r[4] = r[5] = 0.0f;
+        r[6] = dc[i * 3 + 0];
+        r[7] = dc[i * 3 + 1];
+        r[8] = dc[i * 3 + 2];
+        r[9] = op[i] + opacity_bias;
+        for (int a = 0; a < 3; a++)
+            r[10 + a] = verify_log_softplus(scl[i * 3 + a] + inv_sp_sb);
+        r[13] = rot[i * 4 + 0];
+        r[14] = rot[i * 4 + 1];
+        r[15] = rot[i * 4 + 2];
+        r[16] = rot[i * 4 + 3];
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *yaml = NULL, *refdir = NULL;
@@ -152,6 +186,26 @@ int main(int argc, char **argv)
                              diffs[i].elts, threshold)) rc = 9;
         free(ref_buf);
     }
+
+    float *cpu_ply = (float *)malloc((size_t)total * CUDA_SAM3D_GS_STRIDE * sizeof(float));
+    float *gpu_ply = NULL;
+    int gpu_total = 0;
+    if (!cpu_ply) {
+        rc = 5;
+    } else if (cuda_sam3d_debug_slat_gs_pack_ply(ctx, coords, out_feats, N,
+                                                 &gpu_ply, &gpu_total) != 0 ||
+               gpu_total != total) {
+        fprintf(stderr, "[verify_slat_gs.cuda] gpu pack_ply failed\n");
+        rc = 8;
+    } else {
+        verify_pack_ply_cpu(xyz, dc, scl, rot, op, total,
+                            CUDA_SAM3D_GS_STRIDE, cpu_ply);
+        if (!diff_and_report("gpu packed_ply", gpu_ply, cpu_ply,
+                             total * CUDA_SAM3D_GS_STRIDE, threshold))
+            rc = 9;
+    }
+    free(cpu_ply);
+    free(gpu_ply);
 
     free(xyz); free(dc); free(scl); free(rot); free(op);
 
