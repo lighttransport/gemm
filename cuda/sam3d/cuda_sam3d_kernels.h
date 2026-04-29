@@ -524,6 +524,47 @@ static const char *cuda_sam3d_kernel_src =
 "    hidden[i] += proj[i];\n"
 "}\n"
 
+/* slat_concat_feats_f32
+ *
+ *   out[n,:] = concat(a[n,:], b[n,:])
+ *
+ * Row-wise feature concat used by the SLAT decoder-side skip joins.
+ * One thread per output element.
+ *
+ * Grid: (ceil(N*(Ca+Cb)/256),)   Block: (256,).
+ */
+"extern \"C\" __global__ void slat_concat_feats_f32(\n"
+"    float *out, const float *a, const float *b, int N, int Ca, int Cb) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int C = Ca + Cb;\n"
+"    int total = N * C;\n"
+"    if (i >= total) return;\n"
+"    int n = i / C;\n"
+"    int c = i - n * C;\n"
+"    out[i] = (c < Ca) ? a[n * Ca + c] : b[n * Cb + (c - Ca)];\n"
+"}\n"
+
+/* slat_unnormalize8_f32
+ *
+ *   x[n,c] = x[n,c] * std[c] + mean[c], c in [0,8)
+ *
+ * Final SLAT latent un-normalization for facebook/sam-3d-objects. This
+ * mirrors the fixed CPU stats used after the SLAT ODE loop.
+ *
+ * Grid: (ceil(N*8/256),)   Block: (256,).
+ */
+"extern \"C\" __global__ void slat_unnormalize8_f32(float *x, int N) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = N * 8;\n"
+"    if (i >= total) return;\n"
+"    int c = i & 7;\n"
+"    const float mean[8] = { 0.12211431f, 0.37204156f, -1.26521907f, -2.05276058f,\n"
+"                           -3.10432536f, -0.11294304f, -0.85146744f, 0.45506954f };\n"
+"    const float stdv[8] = { 2.37326008f, 2.13174402f, 2.24139530f, 2.30589401f,\n"
+"                           2.11918940f, 1.89695110f, 2.41684989f, 2.08374642f };\n"
+"    x[i] = x[i] * stdv[c] + mean[c];\n"
+"}\n"
+
 /* gelu_inplace_f32
  *
  *   x[i] = x[i] * 0.5 * (1 + erf(x[i] / sqrt(2)))
