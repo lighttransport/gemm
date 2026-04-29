@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DA3 side-by-side compare</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
+    main { max-width: 1400px; margin: 0 auto; padding: 20px 16px; }
+    h1 { font-size: 24px; margin: 0 0 4px; }
+    .sub { color: #6a7180; font-size: 13px; margin-bottom: 16px; }
+    .panel, form { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    label { display: block; font-size: 13px; font-weight: 650; margin: 8px 0 4px; }
+    input, select, button { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; font: inherit; padding: 8px 10px; background: #fff; }
+    button { background: #1b6f5f; color: #fff; border: 0; font-weight: 700; cursor: pointer; }
+    button[disabled] { background: #9aa4b1; cursor: not-allowed; }
+    button.cancel { background: #b94a48; }
+    .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .btn-row { display: flex; gap: 10px; margin-top: 12px; }
+    .btn-row button { margin-top: 0; }
+    .status { margin-top: 8px; font-size: 12px; color: #6a7180; min-height: 16px; }
+    .backends { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 6px; margin-top: 6px; }
+    .be-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #e1e5ec; border-radius: 6px; font-size: 13px; }
+    .be-row input[type=checkbox] { width: auto; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px; }
+    .cell { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 12px; }
+    .cell h3 { margin: 0 0 6px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .cell .meta { font-size: 12px; color: #6a7180; margin-bottom: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .cell canvas { width: 100%; max-width: 100%; display: block; border: 1px solid #d9dde5; border-radius: 6px; background: #1a1c20; }
+    .cell .err { color: #b94a48; font-size: 13px; padding: 8px; background: #fdecec; border-radius: 6px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e6f3ef; color: #1b6f5f; }
+    .pill.run  { background: #e7effa; color: #2a4a7a; }
+    .pill.err  { background: #fdecec; color: #b94a48; }
+    .presets { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .preset { width: auto; padding: 4px 10px; background: #e7effa; color: #2a4a7a; font-weight: 600; border: 1px solid #c4d4ea; font-size: 12px; }
+    #toast { position: fixed; top: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(420px, 90vw); }
+    .toast-item { pointer-events: auto; background: #15171a; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.35; border-left: 4px solid #8a8f98; cursor: pointer; word-break: break-word; }
+    .toast-item.error { border-left-color: #e5484d; background: #2a1416; }
+    .toast-item.info  { border-left-color: #1b6f5f; }
+  </style>
+</head>
+<body>
+<div id="toast"></div>
+<main>
+  <h1>DA3 depth side-by-side compare</h1>
+  <div class="sub">Fans out one image to each checked backend in parallel and renders colormapped depth + timings.</div>
+
+  <form id="form" class="panel">
+    <div class="row">
+      <div>
+        <label for="image">Image</label>
+        <input id="image" type="file" accept="image/*">
+        <div class="presets" id="presets">
+          <span style="opacity:.7;font-size:.85em;align-self:center;">presets:</span>
+          <button type="button" class="preset" data-src="/public/sam3_compare/cat.jpg">cat</button>
+          <button type="button" class="preset" data-src="/public/sam3_compare/mountain.jpg">mountain</button>
+          <button type="button" class="preset" data-src="/public/sam3_compare/person.jpg">person</button>
+        </div>
+      </div>
+      <div>
+        <label for="variant">Variant</label>
+        <select id="variant"><option>loading…</option></select>
+        <label style="margin-top:10px;">Backends</label>
+        <div id="backends" class="backends"></div>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <div class="btn-row">
+          <button type="submit" id="go">Compare</button>
+          <button type="button" id="cancel" class="cancel" disabled>Cancel all</button>
+        </div>
+        <div class="status" id="status"></div>
+      </div>
+    </div>
+  </form>
+
+  <section id="grid" class="grid"></section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const DEFAULT_BACKENDS = [
+  { label: "ours (cpu)",    id: "ours-cpu"     },
+  { label: "ours (cuda)",   id: "ours-cuda"    },
+  { label: "pytorch (cuda)", id: "pytorch-cuda" },
+];
+
+function loadBackends() {
+  try {
+    const p = new URLSearchParams(location.search).get("backends");
+    if (p) return JSON.parse(atob(p));
+  } catch (e) { console.warn("bad ?backends=", e); }
+  return DEFAULT_BACKENDS;
+}
+const BACKENDS = loadBackends();
+
+function showToast(msg, opts) {
+  opts = opts || {};
+  const host = $('toast');
+  const el = document.createElement('div');
+  el.className = 'toast-item ' + (opts.kind || 'error');
+  if (opts.title) {
+    const t = document.createElement('div');
+    t.style.fontWeight = '700'; t.textContent = opts.title;
+    el.appendChild(t);
+  }
+  const b = document.createElement('div'); b.textContent = msg;
+  el.appendChild(b);
+  host.appendChild(el);
+  el.addEventListener('click', () => el.remove());
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),400); }, 5500);
+}
+
+function extractError(res, body) {
+  if (body && typeof body === 'object' && body.error) return body.error;
+  if (!res) return 'network error';
+  return `HTTP ${res.status} ${res.statusText || ''}`.trim();
+}
+
+async function loadVariants() {
+  try {
+    const r = await fetch('/v1/models');
+    const d = await r.json();
+    const vs = (d.models && d.models[0] && d.models[0].variants) || [];
+    const sel = $('variant'); sel.innerHTML = '';
+    if (!vs.length) {
+      sel.innerHTML = '<option value="default">default</option>';
+      return;
+    }
+    vs.forEach(v => {
+      const o = document.createElement('option');
+      o.value = v.name; o.textContent = `${v.name}  (${v.kind})`;
+      sel.appendChild(o);
+    });
+  } catch (e) {
+    showToast('failed to load variants: ' + e, {title:'variants'});
+    $('variant').innerHTML = '<option value="default">default</option>';
+  }
+}
+loadVariants();
+
+function renderBackends() {
+  const host = $('backends'); host.innerHTML = '';
+  BACKENDS.forEach((b, i) => {
+    const row = document.createElement('label');
+    row.className = 'be-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = true; cb.dataset.idx = i;
+    row.appendChild(cb);
+    const lab = document.createElement('span');
+    lab.textContent = b.label;
+    row.appendChild(lab);
+    host.appendChild(row);
+  });
+}
+renderBackends();
+
+function setImageFromBlob(blob, filename) {
+  const f = new File([blob], filename, { type: blob.type || 'image/jpeg' });
+  const dt = new DataTransfer();
+  dt.items.add(f);
+  $('image').files = dt.files;
+}
+
+$('presets').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('.preset'); if (!btn) return;
+  ev.preventDefault();
+  try {
+    const r = await fetch(btn.dataset.src);
+    if (!r.ok) throw new Error('fetch ' + r.status);
+    const blob = await r.blob();
+    const name = btn.dataset.src.split('/').pop();
+    setImageFromBlob(blob, name);
+    $('status').textContent = 'loaded preset: ' + name;
+  } catch (e) { showToast(String(e), {title:'preset'}); }
+});
+
+async function fileToBase64(f) {
+  const buf = await f.arrayBuffer();
+  const u8 = new Uint8Array(buf);
+  let s = ''; const CH = 0x8000;
+  for (let i = 0; i < u8.length; i += CH)
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+  return btoa(s);
+}
+
+function mkCell(label, variant) {
+  const sec = document.createElement('section');
+  sec.className = 'cell';
+  sec.innerHTML = `
+    <h3><span class="label"></span> <small style="color:#6a7180;font-weight:400" class="vlabel"></small> <span class="pill run status">running</span></h3>
+    <div class="meta"></div>
+    <canvas></canvas>
+    <div class="err" style="display:none;"></div>
+  `;
+  sec.querySelector('.label').textContent = label;
+  sec.querySelector('.vlabel').textContent = variant ? '— ' + variant : '';
+  return sec;
+}
+
+let running = [];
+
+function cancelAll() {
+  for (const c of running) { try { c.abort(); } catch(_){} }
+  running = [];
+  $('cancel').disabled = true;
+  $('go').disabled = false;
+  $('status').textContent = 'cancelled.';
+}
+$('cancel').addEventListener('click', cancelAll);
+
+async function runOne(be, body, grid) {
+  const cell = mkCell(be.label, $('variant').value);
+  grid.appendChild(cell);
+  const pill = cell.querySelector('.pill');
+  const meta = cell.querySelector('.meta');
+  const canvas = cell.querySelector('canvas');
+  const errEl = cell.querySelector('.err');
+
+  const ctrl = new AbortController(); running.push(ctrl);
+  const t0 = performance.now();
+  const ticker = setInterval(() => {
+    pill.textContent = 'running ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
+  }, 100);
+
+  try {
+    const payload = Object.assign({}, body);
+    payload.params = Object.assign({}, body.params || {}, {
+      backend: be.id,
+      variant: $('variant').value || 'default',
+    });
+    const res = await fetch('/v1/infer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    let data = null;
+    try { data = await res.json(); } catch(_) { data = null; }
+    if (!res.ok || !data || data.ok === false) {
+      throw new Error(extractError(res, data));
+    }
+
+    clearInterval(ticker);
+    const dt = ((performance.now() - t0) / 1000).toFixed(2) + 's';
+    pill.className = 'pill'; pill.textContent = 'ok ' + dt;
+
+    const out = (data.outputs && data.outputs[0]) || null;
+    if (!out || !out.data_base64) throw new Error('no depth output');
+    const st = out.stats || {};
+    const tm = data.timings_ms || {};
+    meta.textContent =
+      `${out.width}×${out.height}  ` +
+      `min=${(st.min??0).toFixed(3)} max=${(st.max??0).toFixed(3)} mean=${(st.mean??0).toFixed(3)}  ` +
+      `infer=${tm.infer||0}ms total=${tm.total||0}ms`;
+
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+    };
+    img.src = 'data:' + (out.mime || 'image/png') + ';base64,' + out.data_base64;
+  } catch (e) {
+    clearInterval(ticker);
+    pill.className = 'pill err'; pill.textContent = 'error';
+    errEl.style.display = 'block';
+    errEl.textContent = String(e.message || e);
+    if (e.name !== 'AbortError') showToast(String(e.message || e), {title: be.label});
+  }
+}
+
+$('form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const f = $('image').files[0];
+  if (!f) { showToast('pick an image (or click a preset)'); return; }
+
+  const checked = Array.from(document.querySelectorAll('#backends input[type=checkbox]:checked'))
+    .map(cb => BACKENDS[+cb.dataset.idx]);
+  if (!checked.length) { showToast('check at least one backend'); return; }
+
+  $('go').disabled = true; $('cancel').disabled = false;
+  $('status').textContent = 'encoding image…';
+  const b64 = await fileToBase64(f);
+
+  const grid = $('grid'); grid.innerHTML = '';
+  const body = { inputs: { image_base64: b64 }, params: {} };
+
+  $('status').textContent = `running ${checked.length} backend(s)…`;
+  await Promise.allSettled(checked.map(be => runOne(be, body, grid)));
+
+  running = [];
+  $('cancel').disabled = true;
+  $('go').disabled = false;
+  $('status').textContent = 'done.';
+});
+</script>
+</body>
+</html>

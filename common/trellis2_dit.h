@@ -32,23 +32,7 @@
 extern "C" {
 #endif
 
-/* Reuse qtensor if not already defined */
-#ifndef TRANSFORMER_H
-#ifndef DEPTH_ANYTHING3_H
-#ifndef DINOV3_H
-#ifndef SPARSE3D_H
-typedef struct {
-    void    *data;
-    uint32_t type;
-    int      n_rows;
-    int      n_cols;
-    int      n_dims;
-    uint64_t dims[4];
-} qtensor;
-#endif
-#endif
-#endif
-#endif
+#include "qtensor_utils.h"
 
 typedef struct {
     /* Self-attention */
@@ -278,29 +262,13 @@ static void t2dit_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
         cpu_gemm_f16(dst, (const uint16_t *)W->data, bias_f, src,
                      n_tok, n_out, n_in, n_threads);
     } else {
-        /* Slow fallback: row-by-row dequant */
-        float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
-        for (int t = 0; t < n_tok; t++) {
-            for (int r = 0; r < n_out; r++) {
-                const float *row;
-                if (W->type == GGML_TYPE_F32) {
-                    row = (const float *)W->data + (size_t)r * n_in;
-                } else {
-                    dequant_row(W->type, (const uint8_t *)W->data + (size_t)r * W->n_cols * 2,
-                                tmp, n_in);
-                    row = tmp;
-                }
-                float s = 0.0f;
-                for (int j = 0; j < n_in; j++) s += row[j] * src[(size_t)t * n_in + j];
-                dst[(size_t)t * n_out + r] = s;
-            }
-        }
-        free(tmp);
-        if (bias_f) {
-            for (int t = 0; t < n_tok; t++)
-                for (int i = 0; i < n_out; i++)
-                    dst[(size_t)t * n_out + i] += bias_f[i];
-        }
+        /* Dequant whole W once → F32 GEMM. The previous fallback both
+         * dequanted W's row per-(token, row) (n_tok× redundant) and
+         * hardcoded a 2-byte row stride (`W->n_cols * 2`) that only
+         * works for F16/BF16 — broken for Q-types. */
+        float *Wf = qt_dequant(W);
+        t2dit_gemm_f32(dst, Wf, bias_f, src, n_tok, n_out, n_in, n_threads);
+        free(Wf);
     }
     /* Free bias_f only if we allocated it (non-F32 original) */
     if (bias_f && bias && bias->type != GGML_TYPE_F32)
@@ -758,41 +726,6 @@ float *t2dit_precompute_cond_kv(const float *cond, int n_cond,
 
 #ifdef SAFETENSORS_H
 
-static qtensor t2dit_make_tensor(st_context *st, int idx) {
-    qtensor t = {0};
-    if (idx < 0) return t;
-    t.data = safetensors_data(st, idx);
-    const char *dt = safetensors_dtype(st, idx);
-    if (strcmp(dt, "F32") == 0)       t.type = GGML_TYPE_F32;
-    else if (strcmp(dt, "F16") == 0)  t.type = GGML_TYPE_F16;
-    else if (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_F32;  /* will convert */
-    else return (qtensor){0};
-    t.n_dims = safetensors_ndims(st, idx);
-    const uint64_t *shape = safetensors_shape(st, idx);
-    for (int d = 0; d < t.n_dims; d++) t.dims[d] = shape[d];
-    if (t.n_dims >= 2) {
-        t.n_rows = (int)shape[0];
-        t.n_cols = 1;
-        for (int d = 1; d < t.n_dims; d++) t.n_cols *= (int)shape[d];
-    } else {
-        t.n_cols = (int)shape[0];
-        t.n_rows = 1;
-    }
-    /* BF16 -> F32 conversion */
-    if (strcmp(dt, "BF16") == 0) {
-        int numel = t.n_cols * t.n_rows;
-        float *buf = (float *)malloc((size_t)numel * sizeof(float));
-        const uint16_t *src = (const uint16_t *)t.data;
-        for (int i = 0; i < numel; i++) {
-            uint32_t bits = (uint32_t)src[i] << 16;
-            memcpy(&buf[i], &bits, 4);
-        }
-        t.data = buf;
-        t.type = GGML_TYPE_F32;
-    }
-    return t;
-}
-
 t2dit_model *t2dit_load_safetensors(const char *path) {
     st_context *st = safetensors_open(path);
     if (!st) return NULL;
@@ -838,7 +771,7 @@ prefix_found:
         char _buf[512]; \
         snprintf(_buf, sizeof(_buf), "%s%s", prefix, suffix); \
         int _idx = safetensors_find(st, _buf); \
-        (_idx >= 0) ? t2dit_make_tensor(st, _idx) : (qtensor){0}; \
+        (_idx >= 0) ? qt_make_tensor(st, _idx) : (qtensor){0}; \
     })
 
     /* Auto-detect architecture parameters */
@@ -939,7 +872,7 @@ prefix_found:
         #define T2DIT_LOAD(field, suffix) do { \
             snprintf(name, sizeof(name), "%sblocks.%d.%s", prefix, L, suffix); \
             idx = safetensors_find(st, name); \
-            if (idx >= 0) blk->field = t2dit_make_tensor(st, idx); \
+            if (idx >= 0) blk->field = qt_make_tensor(st, idx); \
         } while(0)
 
         /* Self-attention */

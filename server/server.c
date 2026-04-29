@@ -46,6 +46,8 @@
 #include <errno.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <strings.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -56,9 +58,21 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <glob.h>
+#include <dirent.h>
 
 #define MAX_BODY_BYTES (64u * 1024u * 1024u)
 #define READ_CHUNK 8192
+
+typedef struct {
+    char *name;
+    char *model_dir;
+    char *dit;
+    char *vae;
+    char *enc;
+    char *bias;
+    char *kind;   /* "gguf" or "safetensors" */
+} qwen_variant;
 
 typedef struct {
     const char *host;
@@ -68,10 +82,15 @@ typedef struct {
     const char *qwen_vae;
     const char *qwen_enc;
     const char *qwen_enc_bias;
+    const char *qwen_variants_spec;   /* raw "name:dir,name:dir" string */
+    qwen_variant *qwen_variants;
+    int qwen_variant_count;
     const char *sam3_ckpt;
     const char *sam3_ckpt_v31;
     const char *sam3_vocab;
     const char *sam3_merges;
+    const char *sam3_ref_url;     /* http://host:port forwarded via /v1/ref/sam3   */
+    const char *sam3_1_ref_url;   /* http://host:port forwarded via /v1/ref/sam3.1 */
     int device;
     int mcp_stdio;
     int stdio_mode;
@@ -189,6 +208,131 @@ static char *xstrdup(const char *s) {
     char *p = (char *)malloc(n);
     if (p) memcpy(p, s, n);
     return p;
+}
+
+/* Qwen-Image variant registry.
+ *
+ * Directory layout (hyphen/underscore tolerant): diffusion_models/ for the
+ * DiT, vae/ for the VAE, text_encoders/ or text_encoder/ for the encoder.
+ * Parsed at startup from --qwen-variants "name:dir,name:dir,..."  The client
+ * may pass params.variant to auto-fill the three weight paths.
+ */
+static int str_has_suffix(const char *s, const char *suf) {
+    if (!s || !suf) return 0;
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
+
+static char *variant_first_glob(const char *root, const char *const *patterns, int n_patterns) {
+    char pat[1024];
+    for (int i = 0; i < n_patterns; i++) {
+        snprintf(pat, sizeof(pat), "%s/%s", root, patterns[i]);
+        glob_t gl = {0};
+        if (glob(pat, 0, NULL, &gl) == 0 && gl.gl_pathc > 0) {
+            char *out = xstrdup(gl.gl_pathv[0]);
+            globfree(&gl);
+            return out;
+        }
+        globfree(&gl);
+    }
+    return NULL;
+}
+
+static int variant_detect_paths(qwen_variant *v) {
+    static const char *dit_pats[] = {
+        "diffusion_models/*.safetensors",
+        "diffusion_models/*.gguf",
+        "diffusion-models/*.safetensors",
+        "diffusion-models/*.gguf",
+    };
+    static const char *vae_pats[] = {
+        "vae/*.safetensors",
+        "vae/*.gguf",
+    };
+    static const char *enc_pats[] = {
+        "text_encoders/*.safetensors",
+        "text_encoders/*.gguf",
+        "text-encoder/*.gguf",
+        "text-encoder/*.safetensors",
+        "text_encoder/*.safetensors",
+        "text_encoder/*.gguf",
+    };
+    v->dit = variant_first_glob(v->model_dir, dit_pats, (int)(sizeof(dit_pats)/sizeof(*dit_pats)));
+    v->vae = variant_first_glob(v->model_dir, vae_pats, (int)(sizeof(vae_pats)/sizeof(*vae_pats)));
+    v->enc = variant_first_glob(v->model_dir, enc_pats, (int)(sizeof(enc_pats)/sizeof(*enc_pats)));
+    /* Skip multimodal projector if a real encoder sits alongside. */
+    if (v->enc) {
+        const char *base = strrchr(v->enc, '/');
+        base = base ? base + 1 : v->enc;
+        if (strncasecmp(base, "mmproj", 6) == 0) {
+            static const char *enc2_pats[] = {
+                "text-encoder/Qwen*",
+                "text_encoders/Qwen*",
+                "text_encoder/Qwen*",
+            };
+            char *alt = variant_first_glob(v->model_dir, enc2_pats,
+                                           (int)(sizeof(enc2_pats)/sizeof(*enc2_pats)));
+            if (alt) { free(v->enc); v->enc = alt; }
+        }
+    }
+    v->kind = v->dit && str_has_suffix(v->dit, ".gguf") ? xstrdup("gguf") : xstrdup("safetensors");
+    return v->dit && v->vae && v->enc ? 0 : -1;
+}
+
+static void variant_free(qwen_variant *v) {
+    free(v->name); free(v->model_dir); free(v->dit); free(v->vae);
+    free(v->enc); free(v->bias); free(v->kind);
+    memset(v, 0, sizeof(*v));
+}
+
+static int qwen_variants_parse(server_config *cfg, const char *spec) {
+    cfg->qwen_variants = NULL;
+    cfg->qwen_variant_count = 0;
+    if (!spec || !*spec) return 0;
+    /* First pass: count commas + 1. */
+    int n = 1;
+    for (const char *p = spec; *p; p++) if (*p == ',') n++;
+    qwen_variant *arr = (qwen_variant *)calloc((size_t)n, sizeof(*arr));
+    if (!arr) return -1;
+    int k = 0;
+    char *dup = xstrdup(spec);
+    char *save = NULL;
+    for (char *tok = strtok_r(dup, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!*tok) continue;
+        char *colon = strchr(tok, ':');
+        if (!colon) {
+            fprintf(stderr, "[qwen-variants] bad entry '%s' (want name:dir)\n", tok);
+            continue;
+        }
+        *colon = '\0';
+        arr[k].name = xstrdup(tok);
+        arr[k].model_dir = xstrdup(colon + 1);
+        if (variant_detect_paths(&arr[k]) != 0) {
+            fprintf(stderr, "[qwen-variants] '%s' at %s: missing dit/vae/enc (dit=%s vae=%s enc=%s)\n",
+                    arr[k].name, arr[k].model_dir,
+                    arr[k].dit ? arr[k].dit : "(none)",
+                    arr[k].vae ? arr[k].vae : "(none)",
+                    arr[k].enc ? arr[k].enc : "(none)");
+            variant_free(&arr[k]);
+            continue;
+        }
+        fprintf(stderr, "[qwen-variants] %s (%s): dit=%s\n",
+                arr[k].name, arr[k].kind, arr[k].dit);
+        k++;
+    }
+    free(dup);
+    cfg->qwen_variants = arr;
+    cfg->qwen_variant_count = k;
+    return k;
+}
+
+static const qwen_variant *qwen_variants_find(const server_config *cfg, const char *name) {
+    if (!cfg || !name || !*name) return NULL;
+    for (int i = 0; i < cfg->qwen_variant_count; i++) {
+        if (strcmp(cfg->qwen_variants[i].name, name) == 0) return &cfg->qwen_variants[i];
+    }
+    return NULL;
 }
 
 static char *json_escape_dup(const char *s) {
@@ -823,10 +967,19 @@ static char *infer_json(const server_config *cfg, const char *body, size_t body_
     json_val *params = json_obj(root, "params");
 
     const char *prompt = inputs ? json_str(inputs, "text", "") : "";
-    const char *dit = weights ? json_str(weights, "dit", cfg->qwen_dit) : cfg->qwen_dit;
-    const char *vae = weights ? json_str(weights, "vae", cfg->qwen_vae) : cfg->qwen_vae;
-    const char *enc = weights ? json_str(weights, "text_encoder", cfg->qwen_enc) : cfg->qwen_enc;
-    const char *bias = weights ? json_str(weights, "text_encoder_bias", cfg->qwen_enc_bias) : cfg->qwen_enc_bias;
+    /* Variant lookup: if params.variant matches a registered qwen variant,
+     * use its auto-detected weight paths as fallbacks. Explicit per-request
+     * weights.{dit,vae,text_encoder} still override. */
+    const char *variant_name = params ? json_str(params, "variant", "") : "";
+    const qwen_variant *qv = qwen_variants_find(cfg, variant_name);
+    const char *qv_dit  = qv ? qv->dit  : cfg->qwen_dit;
+    const char *qv_vae  = qv ? qv->vae  : cfg->qwen_vae;
+    const char *qv_enc  = qv ? qv->enc  : cfg->qwen_enc;
+    const char *qv_bias = qv && qv->bias ? qv->bias : cfg->qwen_enc_bias;
+    const char *dit = weights ? json_str(weights, "dit", qv_dit) : qv_dit;
+    const char *vae = weights ? json_str(weights, "vae", qv_vae) : qv_vae;
+    const char *enc = weights ? json_str(weights, "text_encoder", qv_enc) : qv_enc;
+    const char *bias = weights ? json_str(weights, "text_encoder_bias", qv_bias) : qv_bias;
     int width = params ? json_int(params, "width", 256) : 256;
     int height = params ? json_int(params, "height", 256) : 256;
     int steps = params ? json_int(params, "steps", 20) : 20;
@@ -1177,6 +1330,11 @@ static const char *mime_for_path(const char *path) {
     if (has_suffix(path, ".js")) return "application/javascript; charset=utf-8";
     if (has_suffix(path, ".png")) return "image/png";
     if (has_suffix(path, ".jpg") || has_suffix(path, ".jpeg")) return "image/jpeg";
+    if (has_suffix(path, ".webp")) return "image/webp";
+    if (has_suffix(path, ".glb")) return "model/gltf-binary";
+    if (has_suffix(path, ".gltf")) return "model/gltf+json";
+    if (has_suffix(path, ".obj")) return "text/plain; charset=utf-8";
+    if (has_suffix(path, ".ply")) return "application/octet-stream";
     return "application/octet-stream";
 }
 
@@ -1212,10 +1370,30 @@ static void send_response(int fd, int status, const char *ctype, const void *bod
     if (body_len) send_all(fd, body, body_len);
 }
 
-static char *models_json(void) {
-    return xstrdup(
-        "{\"ok\":true,\"models\":["
-        "{\"id\":\"qwen-image\",\"tasks\":[\"text-to-image\"],\"backends\":[\"cpu\",\"hip\",\"cuda\",\"vulkan\"]},"
+static char *models_json(const server_config *cfg) {
+    sbuf out;
+    sbuf_init(&out);
+    sbuf_append(&out, "{\"ok\":true,\"models\":[");
+    /* qwen-image with variants (if registered) */
+    sbuf_append(&out,
+        "{\"id\":\"qwen-image\",\"tasks\":[\"text-to-image\"],"
+        "\"backends\":[\"cpu\""
+#if defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
+        ",\"hip\""
+#endif
+        "],\"variants\":[");
+    if (cfg) {
+        for (int i = 0; i < cfg->qwen_variant_count; i++) {
+            const qwen_variant *v = &cfg->qwen_variants[i];
+            char *en = json_escape_dup(v->name);
+            char *ek = json_escape_dup(v->kind ? v->kind : "");
+            sbuf_printf(&out, "%s{\"name\":\"%s\",\"kind\":\"%s\"}",
+                        i ? "," : "", en, ek);
+            free(en); free(ek);
+        }
+    }
+    sbuf_append(&out, "]},");
+    sbuf_append(&out,
         "{\"id\":\"sam3\",\"tasks\":[\"segmentation\"],\"backends\":["
         "\"cpu\""
 #if defined(DIFFUSION_SERVER_ENABLE_SAM3_CUDA)
@@ -1227,10 +1405,12 @@ static char *models_json(void) {
 #else
         "stub"
 #endif
-        "\"},"
+        "\"},");
+    sbuf_append(&out,
         "{\"id\":\"sam3.1\",\"tasks\":[\"segmentation\"],\"backends\":[\"cpu\",\"cuda\"],"
         "\"status\":\"pending_runner\",\"note\":\"see cuda/sam3.1/PORT.md\"}"
         "]}");
+    return out.ptr;
 }
 
 static char *health_json(void) {
@@ -1288,10 +1468,25 @@ static int path_is_safe(const char *p) {
 
 static void handle_static(int fd, const server_config *cfg, const char *url_path) {
     const char *rel = url_path;
-    if (strcmp(rel, "/") == 0)        rel = "/qwen-image.html";
+    if (strcmp(rel, "/") == 0 || strcmp(rel, "/index.html") == 0) rel = "/index.html";
     else if (strcmp(rel, "/sam3") == 0)   rel = "/sam3.html";
     else if (strcmp(rel, "/sam3.1") == 0) rel = "/sam3.1.html";
+    else if (strcmp(rel, "/sam3_compare") == 0) rel = "/sam3_compare.html";
+    else if (strcmp(rel, "/sam3_ref") == 0) rel = "/sam3_ref.html";
+    else if (strcmp(rel, "/sam3_1_ref") == 0) rel = "/sam3_1_ref.html";
     else if (strcmp(rel, "/qwen-image") == 0) rel = "/qwen-image.html";
+    else if (strcmp(rel, "/qwen_image_compare") == 0) rel = "/qwen_image_compare.html";
+    else if (strcmp(rel, "/flux2") == 0) rel = "/flux2.html";
+    else if (strcmp(rel, "/flux2_compare") == 0) rel = "/flux2_compare.html";
+    else if (strcmp(rel, "/hy3d") == 0) rel = "/hy3d.html";
+    else if (strcmp(rel, "/hy3d_compare") == 0) rel = "/hy3d.html";
+    else if (strcmp(rel, "/trellis2") == 0) rel = "/trellis2.html";
+    else if (strcmp(rel, "/trellis2_compare") == 0) rel = "/trellis2.html";
+    else if (strcmp(rel, "/llm") == 0) rel = "/llm_chat.html";
+    else if (strcmp(rel, "/llm_chat") == 0) rel = "/llm_chat.html";
+    else if (strcmp(rel, "/image_chat") == 0) rel = "/image_chat.html";
+    else if (strcmp(rel, "/image-chat") == 0) rel = "/image_chat.html";
+    else if (strcmp(rel, "/image-explain") == 0) rel = "/image_chat.html";
     if (!path_is_safe(rel)) {
         char *e = json_error_response("bad_path", "invalid static path");
         send_response(fd, 400, "application/json", e, strlen(e));
@@ -1356,6 +1551,156 @@ static size_t parse_content_length(const char *headers) {
 #endif
 }
 
+/* ------------------------------------------------------------------ *
+ * Ref-server HTTP proxy
+ *
+ * Parses http://host[:port] from ref_url, opens a TCP connection,
+ * writes METHOD upstream_path HTTP/1.1 + headers + body, then reads the
+ * response and forwards the body back to the browser with our CORS
+ * headers. Deliberately minimal — no chunked encoding, no keep-alive.
+ * ------------------------------------------------------------------ */
+static int parse_http_url(const char *url, char *host, size_t host_cap, int *port_out, const char **tail) {
+    if (!url) return -1;
+    const char *p = url;
+    if (strncmp(p, "http://", 7) == 0) p += 7;
+    else if (strncmp(p, "https://", 8) == 0) return -1; /* TLS not supported */
+    const char *slash = strchr(p, '/');
+    const char *hostend = slash ? slash : p + strlen(p);
+    const char *colon = memchr(p, ':', (size_t)(hostend - p));
+    size_t hlen = (size_t)((colon ? colon : hostend) - p);
+    if (hlen == 0 || hlen >= host_cap) return -1;
+    memcpy(host, p, hlen); host[hlen] = 0;
+    *port_out = colon ? atoi(colon + 1) : 80;
+    if (tail) *tail = slash ? slash : "";
+    return 0;
+}
+
+static int tcp_connect(const char *host, int port) {
+    char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
+    int s = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s < 0) continue;
+        if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(s); s = -1;
+    }
+    freeaddrinfo(res);
+    return s;
+}
+
+/* Send a fixed-body request and read the response into resp (including
+ * status line + headers + body). Returns 0 on success. */
+static int http_forward(const char *ref_url, const char *method,
+                        const char *upstream_path,
+                        const char *body, size_t body_len,
+                        bbuf *resp) {
+    char host[256]; int port = 0; const char *tail = NULL;
+    if (parse_http_url(ref_url, host, sizeof(host), &port, &tail) != 0) return -1;
+    int s = tcp_connect(host, port);
+    if (s < 0) return -2;
+    char hdr[1024];
+    int n = snprintf(hdr, sizeof(hdr),
+        "%s %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        method, upstream_path, host, port, body_len);
+    if (n <= 0 || (size_t)n >= sizeof(hdr)) { close(s); return -3; }
+    send_all(s, hdr, (size_t)n);
+    if (body_len) send_all(s, body, body_len);
+    char tmp[READ_CHUNK];
+    for (;;) {
+        ssize_t r = recv(s, tmp, sizeof(tmp), 0);
+        if (r <= 0) break;
+        bbuf_append(resp, tmp, (size_t)r);
+        if (resp->len > MAX_BODY_BYTES) break;
+    }
+    close(s);
+    return 0;
+}
+
+/* Extract body + content-type + status from a full HTTP response.
+ * Returns pointer into resp->data (no copy). */
+static const char *parse_http_response(const bbuf *resp, int *status_out,
+                                       char *ctype, size_t ctype_cap,
+                                       size_t *body_off, size_t *body_len) {
+    const char *d = (const char *)resp->data;
+    size_t L = resp->len;
+    if (L < 12 || strncmp(d, "HTTP/", 5) != 0) return NULL;
+    const char *sp = memchr(d, ' ', L);
+    if (!sp) return NULL;
+    *status_out = atoi(sp + 1);
+    /* find header end */
+    size_t hend = 0;
+    for (size_t i = 3; i < L; i++) {
+        if (d[i-3] == '\r' && d[i-2] == '\n' && d[i-1] == '\r' && d[i] == '\n') {
+            hend = i + 1; break;
+        }
+    }
+    if (!hend) return NULL;
+    ctype[0] = 0;
+    const char *p = d;
+    while (p < d + hend) {
+        const char *eol = memchr(p, '\n', (size_t)(d + hend - p));
+        if (!eol) break;
+        size_t ll = (size_t)(eol - p);
+        if (ll > 14 && strncasecmp(p, "content-type:", 13) == 0) {
+            const char *v = p + 13;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            size_t vl = (size_t)(eol - v);
+            while (vl && (v[vl-1] == '\r' || v[vl-1] == ' ')) vl--;
+            if (vl >= ctype_cap) vl = ctype_cap - 1;
+            memcpy(ctype, v, vl); ctype[vl] = 0;
+        }
+        p = eol + 1;
+    }
+    *body_off = hend;
+    *body_len = L - hend;
+    return d;
+}
+
+static void proxy_ref(int fd, const char *ref_url, const char *method,
+                      const char *upstream_path,
+                      const char *body, size_t body_len) {
+    if (!ref_url || !*ref_url) {
+        char *e = json_error_response("ref_not_configured",
+            "ref URL not configured — pass --sam3-ref-url / --sam3-1-ref-url to the server");
+        send_response(fd, 503, "application/json", e, strlen(e));
+        free(e);
+        return;
+    }
+    bbuf resp; bbuf_init(&resp);
+    int rc = http_forward(ref_url, method, upstream_path, body, body_len, &resp);
+    if (rc != 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "proxy to %s failed (rc=%d) — is the ref server running?", ref_url, rc);
+        char *e = json_error_response("ref_unreachable", msg);
+        send_response(fd, 502, "application/json", e, strlen(e));
+        free(e);
+        bbuf_free(&resp);
+        return;
+    }
+    int status = 500;
+    char ctype[128] = "application/json";
+    size_t body_off = 0, rlen = 0;
+    const char *raw = parse_http_response(&resp, &status, ctype, sizeof(ctype), &body_off, &rlen);
+    if (!raw) {
+        char *e = json_error_response("ref_bad_response", "malformed response from ref server");
+        send_response(fd, 502, "application/json", e, strlen(e));
+        free(e);
+        bbuf_free(&resp);
+        return;
+    }
+    send_response(fd, status, ctype, raw + body_off, rlen);
+    bbuf_free(&resp);
+}
+
 static void handle_client(int fd, const server_config *cfg) {
     bbuf req;
     bbuf_init(&req);
@@ -1395,8 +1740,9 @@ static void handle_client(int fd, const server_config *cfg) {
         char *j = health_json();
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
-    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/models") == 0) {
-        char *j = models_json();
+    } else if (strcmp(method, "GET") == 0 &&
+               (strcmp(path, "/models") == 0 || strcmp(path, "/v1/models") == 0)) {
+        char *j = models_json(cfg);
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/infer") == 0) {
@@ -1404,6 +1750,20 @@ static void handle_client(int fd, const server_config *cfg) {
         char *j = infer_json(cfg, body, content_len, &status);
         send_response(fd, status, "application/json", j, strlen(j));
         free(j);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3/infer") == 0) {
+        proxy_ref(fd, cfg->sam3_ref_url, "POST", "/v1/infer", body, content_len);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/ref/sam3.1/infer") == 0) {
+        proxy_ref(fd, cfg->sam3_1_ref_url, "POST", "/v1/infer", body, content_len);
+    } else if (strcmp(method, "GET") == 0 &&
+               (strcmp(path, "/v1/ref/sam3/models") == 0 ||
+                strcmp(path, "/v1/ref/sam3/health") == 0)) {
+        const char *up = strchr(path + 8, '/'); /* /v1/ref/sam3<here> */
+        proxy_ref(fd, cfg->sam3_ref_url, "GET", up, NULL, 0);
+    } else if (strcmp(method, "GET") == 0 &&
+               (strcmp(path, "/v1/ref/sam3.1/models") == 0 ||
+                strcmp(path, "/v1/ref/sam3.1/health") == 0)) {
+        const char *up = strchr(path + 10, '/'); /* /v1/ref/sam3.1<here> */
+        proxy_ref(fd, cfg->sam3_1_ref_url, "GET", up, NULL, 0);
     } else if (strcmp(method, "GET") == 0) {
         handle_static(fd, cfg, path);
     } else {
@@ -1487,7 +1847,7 @@ static int run_stdio(const server_config *cfg) {
             if (strcmp(cmd, "health") == 0) {
                 resp = health_json();
             } else if (strcmp(cmd, "models") == 0) {
-                resp = models_json();
+                resp = models_json(cfg);
             } else {
                 char *infer_body = NULL;
                 if (strcmp(cmd, "infer") == 0) {
@@ -1617,10 +1977,13 @@ static void usage(const char *prog) {
         "  --qwen-vae <path>\n"
         "  --qwen-enc <path>\n"
         "  --qwen-enc-bias <path>\n"
+        "  --qwen-variants <spec>   name:dir,name:dir (or env QWEN_IMAGE_VARIANTS)\n"
         "  --sam3-ckpt <path>       default sam3.model.safetensors\n"
         "  --sam3-ckpt-v31 <path>   default sam3.1.model.safetensors (cuda only)\n"
         "  --sam3-vocab <path>      CLIP BPE vocab.json\n"
         "  --sam3-merges <path>     CLIP BPE merges.txt\n"
+        "  --sam3-ref-url <url>     proxy /v1/ref/sam3/*   to URL (pytorch ref, sam3)\n"
+        "  --sam3-1-ref-url <url>   proxy /v1/ref/sam3.1/* to URL (pytorch ref, sam3.1)\n"
         "  --device <n>             default 0\n"
         "  --stdio                  line-delimited JSON transport for local debugging\n"
         "  --mcp-stdio              run MCP stdio mode when compiled\n",
@@ -1642,15 +2005,24 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--qwen-vae") == 0 && i + 1 < argc) cfg.qwen_vae = argv[++i];
         else if (strcmp(argv[i], "--qwen-enc") == 0 && i + 1 < argc) cfg.qwen_enc = argv[++i];
         else if (strcmp(argv[i], "--qwen-enc-bias") == 0 && i + 1 < argc) cfg.qwen_enc_bias = argv[++i];
+        else if (strcmp(argv[i], "--qwen-variants") == 0 && i + 1 < argc) cfg.qwen_variants_spec = argv[++i];
         else if (strcmp(argv[i], "--sam3-ckpt") == 0 && i + 1 < argc) cfg.sam3_ckpt = argv[++i];
         else if (strcmp(argv[i], "--sam3-ckpt-v31") == 0 && i + 1 < argc) cfg.sam3_ckpt_v31 = argv[++i];
         else if (strcmp(argv[i], "--sam3-vocab") == 0 && i + 1 < argc) cfg.sam3_vocab = argv[++i];
         else if (strcmp(argv[i], "--sam3-merges") == 0 && i + 1 < argc) cfg.sam3_merges = argv[++i];
+        else if (strcmp(argv[i], "--sam3-ref-url") == 0 && i + 1 < argc) cfg.sam3_ref_url = argv[++i];
+        else if (strcmp(argv[i], "--sam3-1-ref-url") == 0 && i + 1 < argc) cfg.sam3_1_ref_url = argv[++i];
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) cfg.device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stdio") == 0) cfg.stdio_mode = 1;
         else if (strcmp(argv[i], "--mcp-stdio") == 0) cfg.mcp_stdio = 1;
         else { usage(argv[0]); return 1; }
     }
+    /* Env fallback for variant spec (easier to set in launchers). */
+    if (!cfg.qwen_variants_spec) {
+        const char *e = getenv("QWEN_IMAGE_VARIANTS");
+        if (e && *e) cfg.qwen_variants_spec = e;
+    }
+    qwen_variants_parse(&cfg, cfg.qwen_variants_spec);
     if (cfg.stdio_mode) return run_stdio(&cfg);
     if (cfg.mcp_stdio) return run_mcp_stdio(&cfg);
     signal(SIGINT, on_signal);

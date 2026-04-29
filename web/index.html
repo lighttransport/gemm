@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gemm — model demos</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
+    main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 26px; margin: 0 0 4px; }
+    .sub { color: #6a7180; font-size: 13px; margin-bottom: 24px; }
+    section { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 16px 18px; margin-bottom: 14px; }
+    section h2 { margin: 0 0 4px; font-size: 17px; }
+    section .task { color: #6a7180; font-size: 12px; margin-bottom: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; letter-spacing: .04em; }
+    ul { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
+    li { border: 1px solid #e1e5ec; border-radius: 6px; padding: 10px 12px; }
+    li a { display: block; font-weight: 650; color: #1b6f5f; text-decoration: none; font-size: 14px; }
+    li a:hover { text-decoration: underline; }
+    li .desc { color: #6a7180; font-size: 12px; margin-top: 2px; line-height: 1.4; }
+    li .port { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #6a7180; margin-left: 6px; }
+    .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 10px; background: #e7effa; color: #2a4a7a; font-weight: 700; vertical-align: middle; margin-left: 4px; }
+    .pill.cmp { background: #e6f3ef; color: #1b6f5f; }
+    .pill.ref { background: #f4e8e7; color: #8a3a37; }
+    footer { color: #6a7180; font-size: 12px; margin-top: 24px; text-align: center; }
+    footer code { background: #eceff3; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>gemm — local model demos</h1>
+  <div class="sub">Single page index of every demo served by the local C server (<code>diffusion-server</code>) and its python reference sidecars.</div>
+
+  <section>
+    <h2>Qwen-Image</h2>
+    <div class="task">text-to-image</div>
+    <ul>
+      <li>
+        <a href="/qwen-image">Qwen-Image <span class="pill cmp">side-by-side</span></a>
+        <div class="desc">Variants (Q4_0 / FP8) × backends (cpu / hip) in parallel — served by the C server. Set <code>QWEN_IMAGE_VARIANTS</code> to register variant dirs.</div>
+      </li>
+      <li>
+        <a href="http://localhost:8085/qwen_image_compare">Qwen-Image (pytorch ref) <span class="pill cmp">side-by-side</span><span class="port">:8085</span></a>
+        <div class="desc">Adds <code>pytorch-cuda</code> shell-out via <code>ref/qwen_image/qwen_image_server.py</code>.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Flux.2 klein 4B</h2>
+    <div class="task">text-to-image</div>
+    <ul>
+      <li>
+        <a href="/flux2">Flux.2 klein <span class="pill cmp">side-by-side</span></a>
+        <div class="desc">Distilled (4-step) and base (20-step) variants × ours-cpu / ours-cuda / ours-hip / pytorch-cuda. Page served by the C server; inference dispatched to the flux2 compare server on <code>:8086</code> (start it with <code>./server/run-flux2-compare.sh</code>).</div>
+      </li>
+      <li>
+        <a href="http://localhost:8086/flux2_compare">Flux.2 klein (direct) <span class="port">:8086</span></a>
+        <div class="desc">Same UI but served straight by <code>ref/flux2_klein/flux2_server.py</code> on its own port.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>SAM 3 / SAM 3.1</h2>
+    <div class="task">promptable segmentation</div>
+    <ul>
+      <li>
+        <a href="/sam3">SAM 3</a>
+        <div class="desc">Image + text prompt → masks. Backends: cpu, cuda.</div>
+      </li>
+      <li>
+        <a href="/sam3.1">SAM 3.1</a>
+        <div class="desc">Image + text prompt → masks. Backend: cuda.</div>
+      </li>
+      <li>
+        <a href="/sam3_compare">SAM 3 / 3.1 compare <span class="pill cmp">side-by-side</span></a>
+        <div class="desc">Ours (cpu / cuda) vs. pytorch reference in parallel.</div>
+      </li>
+      <li>
+        <a href="/sam3_ref">SAM 3 pytorch reference <span class="pill ref">reference</span><span class="port">:8082</span></a>
+        <div class="desc">Standalone pytorch SAM 3 server — debugging overlay.</div>
+      </li>
+      <li>
+        <a href="/sam3_1_ref">SAM 3.1 pytorch reference <span class="pill ref">reference</span><span class="port">:8081</span></a>
+        <div class="desc">Standalone pytorch SAM 3.1 server — debugging overlay.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Depth Anything 3</h2>
+    <div class="task">monocular depth</div>
+    <ul>
+      <li>
+        <a href="http://localhost:8083/da3_compare">DA3 compare <span class="pill cmp">side-by-side</span><span class="port">:8083</span></a>
+        <div class="desc">Full variant family (small / base / large±1.1 / giant±1.1 / nested±1.1) × ours-cpu / ours-cuda / pytorch-cuda.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Qwen3.5 + Gemma4 + Qwen3.6 chat</h2>
+    <div class="task">text-generation / image-text-to-text</div>
+    <ul>
+      <li>
+        <a href="/llm">LLM / VLM compare <span class="pill cmp">side-by-side</span><span class="port">:8089</span></a>
+        <div class="desc">Qwen3.5 (LLM, GGUF via <code>test_transformer</code>), Gemma4 VLM (GGUF via <code>test_gemma4_vision</code> / <code>test_cuda_gemma4_vlm</code>), and Qwen3.6-27B VLM (hybrid SSM + Qwen3-VL mmproj via <code>test_vision</code>) vs. pytorch-cuda reference (HF transformers). Variant family is auto-detected from the GGUF header and each backend is gated accordingly. Image upload + preset images; similarity panel computes token-level agreement (HF tokenizer) and char-level edit distance vs. a chosen reference response. Start the sidecar with <code>./server/run-llm-compare.sh</code>.</div>
+      </li>
+      <li>
+        <a href="/image_chat">Image chat — Qwen3.6-VL <span class="pill">single</span><span class="port">:8089</span></a>
+        <div class="desc">Upload an image, pan / zoom / rotate 90°, crop to a selected region, and burn horizontal / vertical OCR guide lines on top. Each turn re-rasterizes the edited view and ships a PNG (max side 1024) to the first available Qwen VLM backend (cuda &gt; cpu &gt; pytorch). Multi-turn by default — prior turns are concatenated into the next prompt (stateless model). Shares the <code>/v1/chat</code> endpoint with the LLM/VLM compare page, so <code>./server/run-llm-compare.sh</code> is the same launcher.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Hunyuan3D-2.1</h2>
+    <div class="task">image-to-3D mesh</div>
+    <ul>
+      <li>
+        <a href="/hy3d">Hy3D compare <span class="pill cmp">side-by-side</span><span class="port">:8087</span></a>
+        <div class="desc">DINOv2-L + DiT + ShapeVAE → marching cubes → GLB preview. Backends: ours-cuda / pytorch-cuda (ours-cpu off by default, too slow). Start the sidecar with <code>./server/run-hy3d-compare.sh</code>.</div>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>TRELLIS.2 (Stage 1)</h2>
+    <div class="task">image-to-3D structure</div>
+    <ul>
+      <li>
+        <a href="/trellis2">TRELLIS.2 compare <span class="pill cmp">side-by-side</span><span class="port">:8088</span></a>
+        <div class="desc">DINOv3 + Stage 1 DiT + conv3d decoder → occupancy grid → marching cubes → GLB. Backends: ours-cuda / pytorch-cuda (ours-cpu disabled by default). Start the sidecar with <code>./server/run-trellis2-compare.sh</code>.</div>
+      </li>
+    </ul>
+  </section>
+
+  <footer>
+    Each compare page lives on its own port (python reference sidecar).
+    Single-backend pages are served straight from the C server at <code>/</code>.
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Image chat — Qwen3.6-VL</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f7f8fb; color: #15171a; }
+    main { max-width: 1500px; margin: 0 auto; padding: 18px 14px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #6a7180; font-size: 13px; margin-bottom: 14px; }
+    .sub code, .sub .origin { background: #eceff3; padding: 1px 5px; border-radius: 4px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+    .panel { background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 12px; }
+    .layout { display: grid; grid-template-columns: minmax(480px, 1.3fr) minmax(360px, 1fr); gap: 12px; align-items: stretch; }
+    @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+
+    /* Editor */
+    .editor { display: flex; flex-direction: column; gap: 8px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .toolbar .group { display: flex; gap: 4px; align-items: center; padding: 2px 8px; border-left: 1px solid #e1e5ec; }
+    .toolbar .group:first-child { border-left: 0; padding-left: 0; }
+    .toolbar button, .toolbar label.btn { padding: 5px 9px; border: 1px solid #bcc4d0; border-radius: 5px; background: #fff; font-size: 12px; font-weight: 600; cursor: pointer; color: #15171a; }
+    .toolbar button:hover, .toolbar label.btn:hover { background: #eceff3; }
+    .toolbar button.active { background: #1b6f5f; color: #fff; border-color: #1b6f5f; }
+    .toolbar button.primary { background: #1b6f5f; color: #fff; border-color: #1b6f5f; }
+    .toolbar button.primary:hover { filter: brightness(1.08); background: #1b6f5f; }
+    .toolbar button.danger { background: #fdecec; color: #b94a48; border-color: #f0c4c2; }
+    .toolbar input[type=file] { display: none; }
+    .toolbar .sep { flex: 1; }
+    .toolbar .hint { font-size: 11px; color: #6a7180; }
+    .canvas-wrap { background: #0f1217; border-radius: 8px; border: 1px solid #212735; overflow: hidden; position: relative; aspect-ratio: 4 / 3; min-height: 400px; }
+    #view { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; background: repeating-conic-gradient(#1a1d24 0% 25%, #131620 0% 50%) 50% / 24px 24px; }
+    #view.tool-region, #view.tool-hline, #view.tool-vline { cursor: crosshair; }
+    #view.panning { cursor: grabbing; }
+    .canvas-info { position: absolute; bottom: 6px; left: 8px; color: #9aa4b1; font-family: ui-monospace, Menlo, monospace; font-size: 11px; pointer-events: none; background: rgba(15,18,23,0.7); padding: 2px 6px; border-radius: 4px; }
+    .canvas-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #6a7180; font-size: 14px; pointer-events: none; }
+    .canvas-empty.hide { display: none; }
+
+    /* Chat side */
+    .chat-panel { display: flex; flex-direction: column; gap: 8px; }
+    .status-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 12px; color: #6a7180; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e6f3ef; color: #1b6f5f; font-weight: 650; }
+    .pill.warn { background: #fef3c7; color: #8a6100; }
+    .pill.err  { background: #fdecec; color: #b94a48; }
+    .pill.run  { background: #e7effa; color: #2a4a7a; }
+    .history { flex: 1; min-height: 260px; max-height: 70vh; overflow-y: auto; background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 10px 12px; }
+    .history:empty::before { content: "Ask a question about the image — the response will appear here."; color: #9aa4b1; font-size: 13px; }
+    .turn { margin: 0 0 12px; padding: 8px 10px; border-radius: 6px; font-size: 13px; line-height: 1.5; }
+    .turn.user { background: #eff4ff; border: 1px solid #d3dcf0; }
+    .turn.assistant { background: #f4faf6; border: 1px solid #cfe4d8; white-space: pre-wrap; }
+    .turn.assistant.running { background: #fff9e6; border-color: #f2d694; }
+    .turn.assistant.errored { background: #fdecec; border-color: #f0c4c2; }
+    .turn .role { font-size: 10px; font-weight: 800; letter-spacing: .04em; color: #6a7180; text-transform: uppercase; margin-bottom: 3px; display: flex; gap: 6px; align-items: center; justify-content: space-between; }
+    .turn .thumb { float: right; max-width: 96px; max-height: 96px; border-radius: 4px; margin: 0 0 4px 8px; border: 1px solid #bcc4d0; }
+    .turn .stats { margin-top: 4px; color: #6a7180; font-size: 11px; font-family: ui-monospace, Menlo, monospace; }
+    .ask { display: flex; flex-direction: column; gap: 6px; background: #fff; border: 1px solid #d9dde5; border-radius: 8px; padding: 10px 12px; }
+    .ask textarea { width: 100%; border: 1px solid #bcc4d0; border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 13px; min-height: 54px; resize: vertical; font-family: ui-monospace, Menlo, monospace; }
+    .ask .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .ask .row label { font-size: 12px; display: flex; gap: 4px; align-items: center; }
+    .ask .row input[type=number] { width: 74px; border: 1px solid #bcc4d0; border-radius: 5px; padding: 4px 6px; font: inherit; }
+    .ask button { padding: 7px 14px; border: 0; border-radius: 6px; background: #1b6f5f; color: #fff; font-weight: 700; cursor: pointer; }
+    .ask button.ghost { background: #eceff3; color: #15171a; font-weight: 600; }
+    .ask button.cancel { background: #b94a48; }
+    .ask button[disabled] { background: #9aa4b1; cursor: not-allowed; }
+
+    /* OCR line list */
+    .overlay-list { font-size: 12px; color: #6a7180; min-height: 18px; }
+    .overlay-list b { color: #15171a; }
+    #toast { position: fixed; top: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(420px, 90vw); }
+    .toast-item { pointer-events: auto; background: #15171a; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.35; border-left: 4px solid #8a8f98; cursor: pointer; }
+    .toast-item.error { border-left-color: #e5484d; background: #2a1416; }
+    .toast-item.info  { border-left-color: #1b6f5f; }
+  </style>
+</head>
+<body>
+<div id="toast"></div>
+<main>
+  <h1>Image chat — Qwen3.6-VL</h1>
+  <div class="sub">
+    Upload an image, pan / zoom / rotate it, optionally crop to a region or burn
+    OCR helper lines on top, then chat with the VLM. Each message re-uploads the
+    edited image so you can iterate on the crop between turns. Backend origin:
+    <span class="origin" id="origin-label"></span>
+    <span style="color:#9aa4b1;"> — override with <code>?origin=http://host:port</code>.</span>
+  </div>
+
+  <div class="layout">
+    <!-- ============== Editor ============== -->
+    <div class="editor panel">
+      <div class="toolbar">
+        <div class="group">
+          <label class="btn" for="file">Open image</label>
+          <input id="file" type="file" accept="image/*">
+          <button type="button" id="btn-clear-img" class="danger" title="Remove image">Clear</button>
+        </div>
+        <div class="group">
+          <button type="button" id="btn-rot-l" title="Rotate 90° counter-clockwise">↺ 90°</button>
+          <button type="button" id="btn-rot-r" title="Rotate 90° clockwise">↻ 90°</button>
+        </div>
+        <div class="group">
+          <button type="button" id="btn-zoom-out" title="Zoom out">−</button>
+          <button type="button" id="btn-zoom-in" title="Zoom in">+</button>
+          <button type="button" id="btn-fit" title="Fit image">Fit</button>
+        </div>
+        <div class="group">
+          <button type="button" id="tool-region" title="Drag to select a rectangular region">Select region</button>
+          <button type="button" id="btn-clear-region" class="danger" title="Clear current region">✕ region</button>
+        </div>
+        <div class="group">
+          <button type="button" id="tool-hline" title="Click to place a horizontal guide line">+ H-line</button>
+          <button type="button" id="tool-vline" title="Click to place a vertical guide line">+ V-line</button>
+          <button type="button" id="btn-clear-lines" class="danger" title="Remove all guide lines">✕ lines</button>
+        </div>
+        <span class="sep"></span>
+        <span class="hint" id="tool-hint">drag to pan · wheel to zoom</span>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="view"></canvas>
+        <div id="canvas-info" class="canvas-info"></div>
+        <div id="canvas-empty" class="canvas-empty">Open an image to begin.</div>
+      </div>
+
+      <div class="overlay-list" id="overlay-list"></div>
+    </div>
+
+    <!-- ============== Chat ============== -->
+    <div class="chat-panel">
+      <div class="status-row">
+        <span id="variant-pill" class="pill warn">loading…</span>
+        <span id="backend-pill" class="pill warn">loading…</span>
+        <span id="status-text"></span>
+      </div>
+      <div id="history" class="history"></div>
+      <form id="ask" class="ask">
+        <textarea id="prompt" placeholder="Ask about the image — e.g. &quot;Read the text in the selected region.&quot;"></textarea>
+        <div class="row">
+          <label><input type="radio" name="send-mode" value="whole" checked> whole image</label>
+          <label><input type="radio" name="send-mode" value="region"> selected region</label>
+          <label>lines: <input type="checkbox" id="burn-lines" checked></label>
+          <label>ctx: <input type="checkbox" id="include-history" checked title="Include prior turns in the prompt (stateless model)"></label>
+          <label>max tok: <input type="number" id="max-tokens" min="1" max="2048" value="192"></label>
+        </div>
+        <div class="row">
+          <button id="go" type="submit">Send</button>
+          <button id="cancel" type="button" class="cancel" disabled>Cancel</button>
+          <button id="new-chat" type="button" class="ghost">New chat</button>
+          <span style="flex:1;"></span>
+          <span class="hint" id="send-hint" style="color:#6a7180; font-size:11px;"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+// -------------- Origin --------------
+function resolveOrigin() {
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('origin')) return qs.get('origin');
+  if (window.LLM_ORIGIN) return window.LLM_ORIGIN;
+  return `${location.protocol}//${location.hostname}:8089`;
+}
+const ORIGIN = resolveOrigin();
+$('origin-label').textContent = ORIGIN;
+
+// -------------- Toast --------------
+function showToast(msg, kind = 'error') {
+  const el = document.createElement('div');
+  el.className = `toast-item ${kind}`;
+  el.textContent = msg;
+  el.onclick = () => el.remove();
+  $('toast').appendChild(el);
+  setTimeout(() => el.remove(), 8000);
+}
+
+// -------------- Model discovery --------------
+// Pick a Qwen VLM variant and the best backend that supports it.
+// Priority: ours-cuda-qwen-vlm > ours-cpu-qwen-vlm > pytorch-cuda (iff has_hf).
+let MODELS = null;
+let ACTIVE = { variant: null, backend: null };
+
+function pickQwenVariantAndBackend(models) {
+  const variants = models.variants || [];
+  const backends = new Set(models.backends || []);
+  const qwen = variants.filter(v => v.kind === 'vlm' && v.family === 'qwen');
+  if (!qwen.length) return { variant: null, backend: null, reason: 'no qwen VLM variant registered' };
+  const v = qwen[0];
+  const order = ['ours-cuda-qwen-vlm', 'ours-cpu-qwen-vlm', 'pytorch-cuda'];
+  for (const b of order) {
+    if (!backends.has(b)) continue;
+    if (b === 'pytorch-cuda' && !v.has_hf) continue;
+    return { variant: v, backend: b, reason: '' };
+  }
+  return { variant: v, backend: null, reason: 'no backend for qwen VLM' };
+}
+
+async function loadModels() {
+  try {
+    const r = await fetch(`${ORIGIN}/v1/models`);
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || 'bad /v1/models');
+    MODELS = j.models[0];
+    const pick = pickQwenVariantAndBackend(MODELS);
+    ACTIVE.variant = pick.variant;
+    ACTIVE.backend = pick.backend;
+    if (!pick.variant) {
+      $('variant-pill').textContent = '(no qwen VLM)';
+      $('variant-pill').className = 'pill err';
+      $('backend-pill').textContent = '—';
+      $('backend-pill').className = 'pill err';
+      showToast(pick.reason);
+      return;
+    }
+    $('variant-pill').textContent = pick.variant.name;
+    $('variant-pill').className = 'pill';
+    $('variant-pill').title = `kind=${pick.variant.kind} family=${pick.variant.family}`;
+    if (pick.backend) {
+      $('backend-pill').textContent = pick.backend;
+      $('backend-pill').className = 'pill';
+    } else {
+      $('backend-pill').textContent = '(no backend)';
+      $('backend-pill').className = 'pill err';
+      showToast(pick.reason);
+    }
+  } catch (e) {
+    $('variant-pill').textContent = 'offline';
+    $('variant-pill').className = 'pill err';
+    $('backend-pill').textContent = 'offline';
+    $('backend-pill').className = 'pill err';
+    showToast(`Failed to load /v1/models from ${ORIGIN}: ${e.message || e}`);
+  }
+}
+
+// -------------- Editor state --------------
+const STATE = {
+  img: null,           // HTMLImageElement, raw uploaded image
+  imgW: 0, imgH: 0,    // original image size
+  rotation: 0,         // 0 | 90 | 180 | 270 (CW degrees)
+  zoom: 1.0,
+  tx: 0, ty: 0,        // pan, canvas px
+  region: null,        // {x,y,w,h} in ROTATED image coords, null when no selection
+  hlines: [],          // [y-in-rotated-image-coords]
+  vlines: [],          // [x-in-rotated-image-coords]
+  tool: 'pan',         // 'pan' | 'region' | 'hline' | 'vline'
+  dragging: null,      // {kind, sx, sy, ...}
+};
+
+const canvas = $('view');
+const ctx = canvas.getContext('2d');
+
+function rotatedSize() {
+  return (STATE.rotation % 180 === 0)
+    ? { w: STATE.imgW, h: STATE.imgH }
+    : { w: STATE.imgH, h: STATE.imgW };
+}
+
+function fitToView() {
+  if (!STATE.img) return;
+  const R = rotatedSize();
+  const cw = canvas.width, ch = canvas.height;
+  const pad = 16;
+  const s = Math.min((cw - 2*pad) / R.w, (ch - 2*pad) / R.h);
+  STATE.zoom = s > 0 ? s : 1;
+  STATE.tx = (cw - R.w * STATE.zoom) / 2;
+  STATE.ty = (ch - R.h * STATE.zoom) / 2;
+}
+
+function syncCanvasSize() {
+  const wrap = canvas.parentElement;
+  const cw = wrap.clientWidth;
+  const ch = wrap.clientHeight;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  canvas.style.width = cw + 'px';
+  canvas.style.height = ch + 'px';
+  // work in CSS pixels via transform
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+// Convert screen (canvas CSS) coords to rotated-image coords.
+function screenToImage(sx, sy) {
+  const ix = (sx - STATE.tx) / STATE.zoom;
+  const iy = (sy - STATE.ty) / STATE.zoom;
+  return { x: ix, y: iy };
+}
+
+function imageToScreen(ix, iy) {
+  return { x: ix * STATE.zoom + STATE.tx, y: iy * STATE.zoom + STATE.ty };
+}
+
+function drawRotatedImage(c, ox, oy, scale) {
+  // Draws the rotated image so that the top-left of the rotated bounding
+  // box lands at (ox, oy) in `c` coordinates, scaled by `scale`.
+  c.save();
+  c.translate(ox, oy);
+  c.scale(scale, scale);
+  const R = rotatedSize();
+  // Move to center of rotated box, rotate, draw unrotated image centered at origin.
+  c.translate(R.w / 2, R.h / 2);
+  c.rotate(STATE.rotation * Math.PI / 180);
+  c.drawImage(STATE.img, -STATE.imgW / 2, -STATE.imgH / 2);
+  c.restore();
+}
+
+function render() {
+  const wcss = canvas.clientWidth, hcss = canvas.clientHeight;
+  ctx.clearRect(0, 0, wcss, hcss);
+  if (!STATE.img) {
+    $('canvas-empty').classList.remove('hide');
+    $('canvas-info').textContent = '';
+    return;
+  }
+  $('canvas-empty').classList.add('hide');
+
+  drawRotatedImage(ctx, STATE.tx, STATE.ty, STATE.zoom);
+
+  // Overlays (in rotated-image coords, so transform to screen).
+  ctx.save();
+  ctx.translate(STATE.tx, STATE.ty);
+  ctx.scale(STATE.zoom, STATE.zoom);
+
+  const R = rotatedSize();
+  // Helper lines
+  ctx.lineWidth = 2 / STATE.zoom;
+  ctx.strokeStyle = '#ff4d4f';
+  for (const y of STATE.hlines) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(R.w, y); ctx.stroke();
+  }
+  ctx.strokeStyle = '#13c2c2';
+  for (const x of STATE.vlines) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, R.h); ctx.stroke();
+  }
+
+  // Region
+  if (STATE.region) {
+    const r = STATE.region;
+    ctx.save();
+    ctx.strokeStyle = '#ffd666';
+    ctx.lineWidth = 2 / STATE.zoom;
+    ctx.setLineDash([8 / STATE.zoom, 6 / STATE.zoom]);
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(255, 214, 102, 0.12)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.restore();
+  }
+  ctx.restore();
+
+  // Info strip
+  const info = [];
+  info.push(`${STATE.imgW}×${STATE.imgH}`);
+  if (STATE.rotation) info.push(`rot ${STATE.rotation}°`);
+  info.push(`zoom ${STATE.zoom.toFixed(2)}×`);
+  if (STATE.region) {
+    const r = STATE.region;
+    info.push(`region ${Math.round(r.w)}×${Math.round(r.h)} @(${Math.round(r.x)},${Math.round(r.y)})`);
+  }
+  $('canvas-info').textContent = info.join(' · ');
+  renderOverlayList();
+}
+
+function renderOverlayList() {
+  const parts = [];
+  if (STATE.hlines.length) parts.push(`<b>${STATE.hlines.length}</b> H-line(s)`);
+  if (STATE.vlines.length) parts.push(`<b>${STATE.vlines.length}</b> V-line(s)`);
+  if (STATE.region)        parts.push(`<b>1</b> region`);
+  if (!parts.length)       parts.push('no overlays');
+  $('overlay-list').innerHTML = parts.join(' · ');
+}
+
+// -------------- Image load --------------
+async function loadImageFromFile(f) {
+  const url = URL.createObjectURL(f);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = () => reject(new Error('could not decode image'));
+      im.src = url;
+    });
+    STATE.img = img;
+    STATE.imgW = img.naturalWidth;
+    STATE.imgH = img.naturalHeight;
+    STATE.rotation = 0;
+    STATE.region = null;
+    STATE.hlines = []; STATE.vlines = [];
+    syncCanvasSize();
+    fitToView();
+    render();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+}
+
+$('file').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try { await loadImageFromFile(f); }
+  catch (err) { showToast('load failed: ' + err.message); }
+});
+
+$('btn-clear-img').addEventListener('click', () => {
+  STATE.img = null; STATE.imgW = STATE.imgH = 0;
+  STATE.region = null; STATE.hlines = []; STATE.vlines = [];
+  $('file').value = '';
+  render();
+});
+
+// -------------- Rotate --------------
+function rotate(dirCW) {
+  if (!STATE.img) return;
+  const R = rotatedSize();              // pre-rotation dims
+  // Transform region and lines into new coord system.
+  // CW 90: (x,y) in (W,H) -> (H - y, x) in (H,W) when the content is rotated CW 90.
+  // CCW 90: (x,y) in (W,H) -> (y, W - x) in (H,W).
+  // The "region" rect must also be converted: new top-left and new size.
+  if (dirCW === +1) {
+    // CW 90
+    if (STATE.region) {
+      const r = STATE.region;
+      STATE.region = {
+        x: R.h - (r.y + r.h),
+        y: r.x,
+        w: r.h, h: r.w,
+      };
+    }
+    STATE.hlines = STATE.hlines.map(y => R.h - y);  // becomes vertical
+    STATE.vlines = STATE.vlines.map(x => x);        // becomes horizontal
+    const swap = STATE.hlines; STATE.hlines = STATE.vlines; STATE.vlines = swap;
+    STATE.rotation = (STATE.rotation + 90) % 360;
+  } else {
+    // CCW 90
+    if (STATE.region) {
+      const r = STATE.region;
+      STATE.region = {
+        x: r.y,
+        y: R.w - (r.x + r.w),
+        w: r.h, h: r.w,
+      };
+    }
+    const oldH = STATE.hlines, oldV = STATE.vlines;
+    STATE.hlines = oldV.map(x => R.w - x);
+    STATE.vlines = oldH.map(y => y);
+    STATE.rotation = (STATE.rotation + 270) % 360;
+  }
+  fitToView();
+  render();
+}
+$('btn-rot-l').addEventListener('click', () => rotate(-1));
+$('btn-rot-r').addEventListener('click', () => rotate(+1));
+
+// -------------- Zoom / fit --------------
+function zoomBy(factor, cx, cy) {
+  if (!STATE.img) return;
+  const wcss = canvas.clientWidth, hcss = canvas.clientHeight;
+  cx = cx ?? wcss / 2; cy = cy ?? hcss / 2;
+  const before = screenToImage(cx, cy);
+  const newZoom = Math.max(0.05, Math.min(12, STATE.zoom * factor));
+  STATE.zoom = newZoom;
+  const after = imageToScreen(before.x, before.y);
+  STATE.tx += cx - after.x;
+  STATE.ty += cy - after.y;
+  render();
+}
+$('btn-zoom-in').addEventListener('click', () => zoomBy(1.25));
+$('btn-zoom-out').addEventListener('click', () => zoomBy(1 / 1.25));
+$('btn-fit').addEventListener('click', () => { fitToView(); render(); });
+
+canvas.addEventListener('wheel', (e) => {
+  if (!STATE.img) return;
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+  const factor = Math.exp(-e.deltaY * 0.0015);
+  zoomBy(factor, cx, cy);
+}, { passive: false });
+
+// -------------- Tool selection --------------
+function setTool(t) {
+  STATE.tool = t;
+  for (const id of ['tool-region', 'tool-hline', 'tool-vline'])
+    $(id).classList.remove('active');
+  canvas.classList.remove('tool-region', 'tool-hline', 'tool-vline');
+  if (t === 'region') { $('tool-region').classList.add('active'); canvas.classList.add('tool-region'); }
+  else if (t === 'hline') { $('tool-hline').classList.add('active'); canvas.classList.add('tool-hline'); }
+  else if (t === 'vline') { $('tool-vline').classList.add('active'); canvas.classList.add('tool-vline'); }
+  const hints = {
+    'pan':    'drag to pan · wheel to zoom',
+    'region': 'drag on the image to draw a region',
+    'hline':  'click to place a horizontal guide line',
+    'vline':  'click to place a vertical guide line',
+  };
+  $('tool-hint').textContent = hints[t] || '';
+}
+$('tool-region').addEventListener('click', () => setTool(STATE.tool === 'region' ? 'pan' : 'region'));
+$('tool-hline').addEventListener('click',  () => setTool(STATE.tool === 'hline'  ? 'pan' : 'hline'));
+$('tool-vline').addEventListener('click',  () => setTool(STATE.tool === 'vline'  ? 'pan' : 'vline'));
+$('btn-clear-region').addEventListener('click', () => { STATE.region = null; render(); });
+$('btn-clear-lines').addEventListener('click',  () => { STATE.hlines = []; STATE.vlines = []; render(); });
+
+// -------------- Mouse interaction --------------
+canvas.addEventListener('mousedown', (e) => {
+  if (!STATE.img) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  const ip = screenToImage(sx, sy);
+  if (STATE.tool === 'hline') {
+    const R = rotatedSize();
+    if (ip.y >= 0 && ip.y <= R.h) STATE.hlines.push(ip.y);
+    render();
+    return;
+  }
+  if (STATE.tool === 'vline') {
+    const R = rotatedSize();
+    if (ip.x >= 0 && ip.x <= R.w) STATE.vlines.push(ip.x);
+    render();
+    return;
+  }
+  if (STATE.tool === 'region') {
+    STATE.dragging = { kind: 'region', x0: ip.x, y0: ip.y };
+    return;
+  }
+  // pan
+  STATE.dragging = { kind: 'pan', sx, sy, tx0: STATE.tx, ty0: STATE.ty };
+  canvas.classList.add('panning');
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!STATE.dragging || !STATE.img) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  if (STATE.dragging.kind === 'pan') {
+    STATE.tx = STATE.dragging.tx0 + (sx - STATE.dragging.sx);
+    STATE.ty = STATE.dragging.ty0 + (sy - STATE.dragging.sy);
+    render();
+  } else if (STATE.dragging.kind === 'region') {
+    const ip = screenToImage(sx, sy);
+    const R = rotatedSize();
+    const x0 = Math.max(0, Math.min(R.w, STATE.dragging.x0));
+    const y0 = Math.max(0, Math.min(R.h, STATE.dragging.y0));
+    const x1 = Math.max(0, Math.min(R.w, ip.x));
+    const y1 = Math.max(0, Math.min(R.h, ip.y));
+    STATE.region = {
+      x: Math.min(x0, x1), y: Math.min(y0, y1),
+      w: Math.abs(x1 - x0), h: Math.abs(y1 - y0),
+    };
+    render();
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  if (!STATE.dragging) return;
+  if (STATE.dragging.kind === 'region' && STATE.region &&
+      (STATE.region.w < 4 || STATE.region.h < 4)) {
+    STATE.region = null;
+  }
+  STATE.dragging = null;
+  canvas.classList.remove('panning');
+  render();
+});
+
+// -------------- Window resize --------------
+let _rafResize = 0;
+window.addEventListener('resize', () => {
+  cancelAnimationFrame(_rafResize);
+  _rafResize = requestAnimationFrame(() => {
+    syncCanvasSize();
+    if (STATE.img) fitToView();
+    render();
+  });
+});
+
+// -------------- Export (canvas -> PNG base64) --------------
+// Rasterize the rotated image (optionally cropped to region), burn lines on
+// top, downscale so max dim <= MAX_SEND so the VLM doesn't choke on big inputs.
+const MAX_SEND = 1024;
+
+function exportAsPng(mode, burnLines) {
+  if (!STATE.img) return null;
+  const R = rotatedSize();
+  let srcX = 0, srcY = 0, srcW = R.w, srcH = R.h;
+  if (mode === 'region' && STATE.region) {
+    const r = STATE.region;
+    srcX = Math.max(0, Math.round(r.x));
+    srcY = Math.max(0, Math.round(r.y));
+    srcW = Math.max(1, Math.round(Math.min(R.w - srcX, r.w)));
+    srcH = Math.max(1, Math.round(Math.min(R.h - srcY, r.h)));
+  }
+  // Target size: downscale so max dim <= MAX_SEND, keep aspect.
+  let outW = srcW, outH = srcH;
+  const longest = Math.max(outW, outH);
+  if (longest > MAX_SEND) {
+    const s = MAX_SEND / longest;
+    outW = Math.max(1, Math.round(outW * s));
+    outH = Math.max(1, Math.round(outH * s));
+  }
+  const off = document.createElement('canvas');
+  off.width = outW; off.height = outH;
+  const c = off.getContext('2d');
+  c.imageSmoothingQuality = 'high';
+  c.fillStyle = '#000';
+  c.fillRect(0, 0, outW, outH);
+
+  // Draw the rotated image into a staging canvas, then crop.
+  const stage = document.createElement('canvas');
+  stage.width = R.w; stage.height = R.h;
+  const sc = stage.getContext('2d');
+  sc.save();
+  sc.translate(R.w / 2, R.h / 2);
+  sc.rotate(STATE.rotation * Math.PI / 180);
+  sc.drawImage(STATE.img, -STATE.imgW / 2, -STATE.imgH / 2);
+  sc.restore();
+
+  if (burnLines) {
+    // Lines drawn in rotated full-image coords so cropping preserves them.
+    sc.lineWidth = Math.max(1.5, Math.round(Math.min(R.w, R.h) / 400));
+    sc.strokeStyle = '#ff2d2f';
+    for (const y of STATE.hlines) {
+      sc.beginPath(); sc.moveTo(0, y); sc.lineTo(R.w, y); sc.stroke();
+    }
+    sc.strokeStyle = '#11c8c8';
+    for (const x of STATE.vlines) {
+      sc.beginPath(); sc.moveTo(x, 0); sc.lineTo(x, R.h); sc.stroke();
+    }
+  }
+
+  c.drawImage(stage, srcX, srcY, srcW, srcH, 0, 0, outW, outH);
+  return { dataUrl: off.toDataURL('image/png'), w: outW, h: outH };
+}
+
+// -------------- Chat --------------
+let HISTORY = [];           // [{role: 'user'|'assistant', text, thumbDataUrl?}]
+let CURRENT = null;         // { controller, assistantEl }
+
+function pushTurnToUI(turn, {running=false, errored=false} = {}) {
+  const hist = $('history');
+  const div = document.createElement('div');
+  div.className = `turn ${turn.role}${running ? ' running' : ''}${errored ? ' errored' : ''}`;
+  const role = document.createElement('div');
+  role.className = 'role';
+  const roleLabel = document.createElement('span');
+  roleLabel.textContent = turn.role === 'user' ? 'You' : 'Qwen3.6-VL';
+  role.appendChild(roleLabel);
+  const statsSpan = document.createElement('span');
+  statsSpan.dataset.stats = '1';
+  statsSpan.style.fontWeight = '600';
+  statsSpan.style.color = '#6a7180';
+  statsSpan.textContent = turn.stats || '';
+  role.appendChild(statsSpan);
+  div.appendChild(role);
+
+  if (turn.thumbDataUrl) {
+    const img = document.createElement('img');
+    img.src = turn.thumbDataUrl;
+    img.className = 'thumb';
+    img.alt = 'sent thumbnail';
+    div.appendChild(img);
+  }
+  const body = document.createElement('div');
+  body.className = 'body';
+  body.textContent = turn.text || (running ? 'thinking…' : '');
+  div.appendChild(body);
+  hist.appendChild(div);
+  hist.scrollTop = hist.scrollHeight;
+  return { root: div, body };
+}
+
+function buildPrompt(userText) {
+  if (!$('include-history').checked || HISTORY.length === 0) return userText;
+  const lines = [];
+  lines.push("Previous turns in this conversation:");
+  for (const t of HISTORY) {
+    if (t.role === 'user')      lines.push("User: " + t.text);
+    else if (t.role === 'assistant') lines.push("Assistant: " + t.text);
+  }
+  lines.push("");
+  lines.push("New question: " + userText);
+  return lines.join("\n");
+}
+
+async function sendMessage(ev) {
+  ev.preventDefault();
+  if (CURRENT) return;
+  if (!ACTIVE.variant || !ACTIVE.backend) { showToast('no variant/backend available'); return; }
+  const text = $('prompt').value.trim();
+  if (!text) { showToast('enter a prompt'); return; }
+  if (!STATE.img) { showToast('open an image first'); return; }
+
+  const mode = document.querySelector('input[name=send-mode]:checked').value;
+  if (mode === 'region' && !STATE.region) { showToast('no region selected — draw one or switch to whole image'); return; }
+  const burnLines = $('burn-lines').checked;
+  const exported = exportAsPng(mode, burnLines);
+  if (!exported) { showToast('export failed'); return; }
+  const b64 = exported.dataUrl.split(',', 2)[1] || '';
+
+  // UI: user turn with thumbnail
+  HISTORY.push({ role: 'user', text, thumbDataUrl: exported.dataUrl });
+  pushTurnToUI(HISTORY[HISTORY.length - 1]);
+  $('prompt').value = '';
+
+  // UI: placeholder assistant turn
+  const asst = { role: 'assistant', text: '', stats: '' };
+  const nodes = pushTurnToUI(asst, { running: true });
+
+  const prompt = buildPrompt(text);
+  const payload = {
+    inputs: { text: prompt, image_base64: b64 },
+    params: {
+      variant: ACTIVE.variant.name,
+      backend: ACTIVE.backend,
+      max_tokens: parseInt($('max-tokens').value, 10) || 192,
+    },
+  };
+
+  const controller = new AbortController();
+  CURRENT = { controller, nodes };
+  $('go').disabled = true;
+  $('cancel').disabled = false;
+  $('status-text').innerHTML = `<span class="pill run">running · ${ACTIVE.backend}</span>`;
+  $('send-hint').textContent = `sent ${exported.w}×${exported.h} PNG`;
+  const t0 = performance.now();
+  try {
+    const r = await fetch(`${ORIGIN}/v1/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const dt = Math.round(performance.now() - t0);
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    const out = (j.outputs && j.outputs[0]) || {};
+    asst.text = (out.text || '').trim();
+    const gen = (j.timings_ms && j.timings_ms.gen) || dt;
+    asst.stats = `${asst.text.length} chars · ${gen} ms gen · ${dt} ms total`;
+    nodes.root.classList.remove('running');
+    nodes.body.textContent = asst.text || '(empty)';
+    const statSpan = nodes.root.querySelector('[data-stats]');
+    if (statSpan) statSpan.textContent = asst.stats;
+    HISTORY.push(asst);
+    $('status-text').innerHTML = `<span class="pill">done · ${gen} ms</span>`;
+  } catch (e) {
+    const dt = Math.round(performance.now() - t0);
+    if (e.name === 'AbortError') {
+      nodes.root.classList.remove('running');
+      nodes.root.classList.add('errored');
+      nodes.body.textContent = '(canceled)';
+      $('status-text').innerHTML = `<span class="pill err">canceled</span>`;
+    } else {
+      nodes.root.classList.remove('running');
+      nodes.root.classList.add('errored');
+      nodes.body.textContent = String(e.message || e);
+      $('status-text').innerHTML = `<span class="pill err">error · ${dt} ms</span>`;
+      showToast(String(e.message || e));
+    }
+  } finally {
+    CURRENT = null;
+    $('go').disabled = false;
+    $('cancel').disabled = true;
+  }
+}
+
+$('ask').addEventListener('submit', sendMessage);
+$('cancel').addEventListener('click', () => {
+  if (CURRENT) CURRENT.controller.abort();
+});
+$('new-chat').addEventListener('click', () => {
+  HISTORY = [];
+  $('history').innerHTML = '';
+  $('status-text').textContent = '';
+  $('prompt').focus();
+});
+
+// -------------- Boot --------------
+(function boot() {
+  syncCanvasSize();
+  render();
+  loadModels();
+})();
+</script>
+</body>
+</html>

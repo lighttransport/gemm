@@ -792,7 +792,8 @@ static int run_generate(const char *dit_path, const char *vae_path,
                          const char *prompt,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
-                         int use_gpu_enc, int device_id, int repeat) {
+                         int use_gpu_enc, int device_id, int repeat,
+                         const char *out_override) {
     fprintf(stderr, "\n=== Flux.2 Klein GPU Pipeline ===\n");
     fprintf(stderr, "Runs: %d\n", repeat);
     if (use_gpu_enc) fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
@@ -838,8 +839,9 @@ static int run_generate(const char *dit_path, const char *vae_path,
 
     int rc = 0;
     for (int i = 0; i < repeat; i++) {
-        char out_path[256];
-        if (repeat == 1) snprintf(out_path, sizeof(out_path), "cuda_flux2_output.ppm");
+        char out_path[512];
+        if (out_override && repeat == 1) snprintf(out_path, sizeof(out_path), "%s", out_override);
+        else if (repeat == 1) snprintf(out_path, sizeof(out_path), "cuda_flux2_output.ppm");
         else snprintf(out_path, sizeof(out_path), "cuda_flux2_output_%02d.ppm", i);
         fprintf(stderr, "\n--- Run %d/%d ---\n", i + 1, repeat);
         rc = run_generate_once(r, prompt, txt_hidden, n_txt, enc_embd, out_h, out_w, n_steps,
@@ -862,6 +864,7 @@ int main(int argc, char **argv) {
 
     int out_h = 256, out_w = 256, n_steps = 4, repeat = 1, n_txt = 8;
     int is_distilled = 1, use_gpu_enc = 0, device_id = 0;
+    const char *out_path = NULL;
     float cfg_scale = 1.0f;
     float img_scale = 0.1f, txt_scale = 0.1f;
     float timestep = 750.0f;
@@ -900,6 +903,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--cfg")    == 0 && i+1<argc) cfg_scale= (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--device") == 0 && i+1<argc) device_id= atoi(argv[++i]);
         else if (strcmp(argv[i], "--verbose")== 0 && i+1<argc) verbose  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--out")    == 0 && i+1<argc) out_path = argv[++i];
     }
 
     if (!mode) {
@@ -925,7 +929,8 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "gen")  == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,
-                            cfg_scale, use_gpu_enc, device_id, repeat);
+                            cfg_scale, use_gpu_enc, device_id, repeat,
+                            out_path);
 
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 1;

@@ -550,6 +550,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--txt-bin") && i+1 < argc) txt_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--prompt")  && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-o")        && i+1 < argc) out_path = argv[++i];
+        else if (!strcmp(argv[i], "--out")     && i+1 < argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "-d")        && i+1 < argc) device_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 2;
         else if (!strcmp(argv[i], "--steps")   && i+1 < argc) n_steps = atoi(argv[++i]);

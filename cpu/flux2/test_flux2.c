@@ -389,7 +389,8 @@ static int run_generate(const char *dit_path, const char *vae_path,
                          const char *hidden_npy_path,
                          const char *prompt, int out_h, int out_w,
                          int n_steps, uint64_t seed,
-                         int is_distilled, float cfg_scale, int n_threads) {
+                         int is_distilled, float cfg_scale, int n_threads,
+                         const char *out_path) {
     fprintf(stderr, "\n=== Flux.2 Klein Full Pipeline ===\n");
     fprintf(stderr, "Prompt: '%s'\n", prompt);
     fprintf(stderr, "Output: %dx%d, %d steps, seed=%llu, distilled=%d\n",
@@ -572,7 +573,7 @@ static int run_generate(const char *dit_path, const char *vae_path,
     fprintf(stderr, "VAE decode: %.1f s\n",
             (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
 
-    save_ppm("flux2_output.ppm", rgb, out_h, out_w);
+    save_ppm(out_path ? out_path : "flux2_output.ppm", rgb, out_h, out_w);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double total = (t1.tv_sec - t_start.tv_sec) + (t1.tv_nsec - t_start.tv_nsec) * 1e-9;
@@ -602,6 +603,7 @@ int main(int argc, char **argv) {
     float cfg_scale = 1.0f;
     uint64_t seed = 42;
     int dump_block = -1;  /* --dump-block N: dump intermediates for block N */
+    const char *out_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--test-sched") == 0) mode = "sched";
@@ -625,6 +627,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--latent-npy") == 0 && i+1 < argc) { latent_npy = argv[++i]; (void)latent_npy; }
         else if (strcmp(argv[i], "--hidden-npy") == 0 && i+1 < argc) hidden_npy = argv[++i];
         else if (strcmp(argv[i], "--dump-block") == 0 && i+1 < argc) dump_block = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--out")   == 0 && i+1 < argc) out_path = argv[++i];
         /* Positional: DIT VAE ENC (legacy compat) */
         else if (argv[i][0] != '-' && !dit_path[0]) dit_path = argv[i];
         else if (argv[i][0] != '-' && !vae_path[0]) vae_path = argv[i];
@@ -650,7 +653,8 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "enc")   == 0) return test_encoder(enc_path, tok_path, prompt);
     if (strcmp(mode, "gen")   == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, hidden_npy,
-                            prompt, out_h, out_w, n_steps, seed, is_distilled, cfg_scale, n_threads);
+                            prompt, out_h, out_w, n_steps, seed, is_distilled, cfg_scale, n_threads,
+                            out_path);
 
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 1;

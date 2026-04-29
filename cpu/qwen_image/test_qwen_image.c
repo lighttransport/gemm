@@ -521,7 +521,8 @@ static int test_text_encoder(const char *enc_path, const char *prompt) {
 
 static int test_full_pipeline(const char *dit_path, const char *vae_path,
                               const char *enc_path, const char *prompt,
-                              int out_h, int out_w, int n_steps, uint64_t seed) {
+                              int out_h, int out_w, int n_steps, uint64_t seed,
+                              const char *out_path) {
     fprintf(stderr, "\n=== Full Pipeline ===\n");
 
     /* Load models */
@@ -675,7 +676,8 @@ static int test_full_pipeline(const char *dit_path, const char *vae_path,
 
     /* Save PPM */
     {
-        FILE *fp = fopen("qwen_image_output.ppm", "wb");
+        const char *png_path = out_path ? out_path : "qwen_image_output.ppm";
+        FILE *fp = fopen(png_path, "wb");
         if (fp) {
             fprintf(fp, "P6\n%d %d\n255\n", out_w, out_h);
             for (int y = 0; y < out_h; y++)
@@ -690,7 +692,7 @@ static int test_full_pipeline(const char *dit_path, const char *vae_path,
                     fwrite(px, 1, 3, fp);
                 }
             fclose(fp);
-            fprintf(stderr, "Saved qwen_image_output.ppm (%dx%d)\n", out_w, out_h);
+            fprintf(stderr, "Saved %s (%dx%d)\n", png_path, out_w, out_h);
         }
     }
 
@@ -721,6 +723,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --steps <n>      Denoising steps (default 20)\n");
     fprintf(stderr, "  --seed <s>       Random seed (default 42)\n");
     fprintf(stderr, "  --prompt <text>  Text prompt (default: 'a red apple')\n");
+    fprintf(stderr, "  --out <path>     Output image path (default: qwen_image_output.ppm)\n");
 }
 
 int main(int argc, char **argv) {
@@ -729,6 +732,7 @@ int main(int argc, char **argv) {
     const char *dit_path = NULL, *vae_path = NULL, *enc_path = NULL;
     const char *prompt = "a red apple on a white table";
     const char *mode = NULL;
+    const char *out_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test-sched") == 0) mode = "sched";
@@ -754,6 +758,8 @@ int main(int argc, char **argv) {
             seed = (uint64_t)atoll(argv[++i]);
         else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc)
             prompt = argv[++i];
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc)
+            out_path = argv[++i];
     }
 
     if (!mode) { usage(argv[0]); return 1; }
@@ -763,6 +769,7 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "dit") == 0) return test_dit(dit_path, out_h / 8, out_w / 8, seed);
     if (strcmp(mode, "enc") == 0) return test_text_encoder(enc_path, prompt);
     if (strcmp(mode, "gen") == 0) return test_full_pipeline(dit_path, vae_path,
-                                      enc_path, prompt, out_h, out_w, n_steps, seed);
+                                      enc_path, prompt, out_h, out_w, n_steps, seed,
+                                      out_path);
     return 1;
 }

@@ -339,6 +339,12 @@ static const char *cuda_kernel_source =
 "    return c;\n"
 "}\n"
 "\n"
+"/* Pack 4 consecutive bytes into an int32 (little-endian, byte 0 = LSB). */\n"
+"/* Works for any alignment; used for Q3_K/Q6_K whose super-blocks have odd size. */\n"
+"__device__ __forceinline__ int load_u8x4(const unsigned char *p) {\n"
+"    return (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);\n"
+"}\n"
+"\n"
 "/* ---- 10. quantize_f32_to_int8: F32 vector -> INT8 + scale ---- */\n"
 "/* Single block, 256 threads. Writes scale_out[0] = absmax/127. */\n"
 "__global__ void quantize_f32_to_int8(signed char *dst, float *scale_out,\n"
@@ -681,6 +687,95 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- 14b. quantize_f32_to_q8_1: per-32 block F32 -> Q8_1 (int8 qs[32] + half2(d,sum)) ---- */\n"
+"/* One warp per Q8_1 block; launch with blockDim=(32, N), grid=(n_blocks/N). */\n"
+"/* Output format: 36 bytes per block = 32 int8 qs + half d + half sum. */\n"
+"__global__ void quantize_f32_to_q8_1(unsigned char *dst, const float *src, int n) {\n"
+"    int block_id = blockIdx.x * blockDim.y + threadIdx.y;\n"
+"    int n_blocks = n / 32;\n"
+"    if (block_id >= n_blocks) return;\n"
+"    int lane = threadIdx.x;\n"
+"    float v = src[block_id * 32 + lane];\n"
+"    float amax = fabsf(v);\n"
+"    float sum = v;\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));\n"
+"        sum  += __shfl_xor_sync(0xFFFFFFFF, sum,  offset);\n"
+"    }\n"
+"    float d = amax / 127.0f;\n"
+"    float id_scale = (amax > 0.0f) ? 127.0f / amax : 0.0f;\n"
+"    int iv = __float2int_rn(v * id_scale);\n"
+"    if (iv >  127) iv =  127;\n"
+"    if (iv < -128) iv = -128;\n"
+"    unsigned char *bp = dst + (size_t)block_id * 36;\n"
+"    ((signed char *)bp)[lane] = (signed char)iv;\n"
+"    if (lane == 0) {\n"
+"        half_raw *ds = (half_raw *)(bp + 32);\n"
+"        ds[0] = float_to_half(d);\n"
+"        ds[1] = float_to_half(sum);\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 14c. matvec_q2_K_q8_1_dp4a: Q2_K weight x Q8_1 activation via dp4a ---- */\n"
+"/* Warp per row, 8 warps per block, grid = ceil(n_rows/8). */\n"
+"/* Each super-block has 256 elements = 8 Q8_1 blocks.                         */\n"
+"/* Per Q8_1 block i: 2 sub-blocks of 16 weights using scales[2*i], scales[2*i+1]. */\n"
+"/* Sub-block maps to n0=i/4 (half of super-block), j=i%4 (shift=j*2).          */\n"
+"__global__ void matvec_q2_K_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 84;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 84;\n"
+"        const unsigned char *scales = bp;\n"
+"        const unsigned char *qs = bp + 16;\n"
+"        float d    = half_to_float(*(const half_raw *)(bp + 80));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 82));\n"
+"        const unsigned char *bq81_base = x_q81 + (size_t)b * 8 * 36;\n"
+"        float sumf_d = 0.0f, sumf_m = 0.0f;\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int n0 = i >> 2;\n"
+"            int jj = i & 3;\n"
+"            int shift = jj * 2;\n"
+"            const int *qs_w = (const int *)(qs + n0 * 32);\n"
+"            const unsigned char *q81 = bq81_base + i * 36;\n"
+"            const int *u_w = (const int *)q81;\n"
+"            float d8 = half_to_float(*(const half_raw *)(q81 + 32));\n"
+"            int sc0 = scales[2*i];\n"
+"            int sc1 = scales[2*i + 1];\n"
+"            int dlow0 = sc0 & 0xF;\n"
+"            int dlow1 = sc1 & 0xF;\n"
+"            int mhi0  = sc0 >> 4;\n"
+"            int mhi1  = sc1 >> 4;\n"
+"            int m0w = mhi0 | (mhi0 << 8); m0w |= m0w << 16;\n"
+"            int m1w = mhi1 | (mhi1 << 8); m1w |= m1w << 16;\n"
+"            int acc_d0 = 0, acc_m0 = 0, acc_d1 = 0, acc_m1 = 0;\n"
+"            #pragma unroll\n"
+"            for (int k = 0; k < 4; k++) {\n"
+"                int vi0 = (qs_w[k]     >> shift) & 0x03030303;\n"
+"                int vi1 = (qs_w[k + 4] >> shift) & 0x03030303;\n"
+"                acc_d0 = dp4a_s8(vi0, u_w[k],     acc_d0);\n"
+"                acc_m0 = dp4a_s8(m0w, u_w[k],     acc_m0);\n"
+"                acc_d1 = dp4a_s8(vi1, u_w[k + 4], acc_d1);\n"
+"                acc_m1 = dp4a_s8(m1w, u_w[k + 4], acc_m1);\n"
+"            }\n"
+"            sumf_d += d8 * ((float)acc_d0 * (float)dlow0 + (float)acc_d1 * (float)dlow1);\n"
+"            sumf_m += d8 * ((float)acc_m0 + (float)acc_m1);\n"
+"        }\n"
+"        sum += d * sumf_d - dmin * sumf_m;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- 15. matvec_q3_K_f32: Q3_K matrix x F32 vector -> F32 ---- */\n"
 "/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q3_K block: 110 bytes = hmask[32] + qs[64] + scales[12] + d(f16), 256 elements */\n"
@@ -738,6 +833,81 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- 15b. matvec_q3_K_q8_1_dp4a: Q3_K weight x Q8_1 activation via dp4a ---- */\n"
+"/* Signed weight = ((qs>>shift)&3) - 4*(~hm_bit) = vil + 4*vih - 4.           */\n"
+"/* Per sub-block, compute: dot = dp4a(vil,u,0) + 4*dp4a(vih,u,0) - 4*sum(u).  */\n"
+"__global__ void matvec_q3_K_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 110;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 110;\n"
+"        const unsigned char *hm = bp;\n"
+"        const unsigned char *qs = bp + 32;\n"
+"        const unsigned char *raw_sc = bp + 96;\n"
+"        float d_all = half_to_float(*(const half_raw *)(bp + 108));\n"
+"        unsigned int a0  = raw_sc[0]|(raw_sc[1]<<8)|(raw_sc[2]<<16)|(raw_sc[3]<<24);\n"
+"        unsigned int a1  = raw_sc[4]|(raw_sc[5]<<8)|(raw_sc[6]<<16)|(raw_sc[7]<<24);\n"
+"        unsigned int tmp = raw_sc[8]|(raw_sc[9]<<8)|(raw_sc[10]<<16)|(raw_sc[11]<<24);\n"
+"        unsigned int km1 = 0x03030303u, km2 = 0x0f0f0f0fu;\n"
+"        unsigned int aux[4];\n"
+"        aux[0] = (a0 & km2)        | (((tmp >> 0) & km1) << 4);\n"
+"        aux[1] = (a1 & km2)        | (((tmp >> 2) & km1) << 4);\n"
+"        aux[2] = ((a0 >> 4) & km2) | (((tmp >> 4) & km1) << 4);\n"
+"        aux[3] = ((a1 >> 4) & km2) | (((tmp >> 6) & km1) << 4);\n"
+"        const signed char *scales = (const signed char *)aux;\n"
+"        const unsigned char *bq81_base = x_q81 + (size_t)b * 8 * 36;\n"
+"        float partial = 0.0f;\n"
+"        int is = 0;\n"
+"        for (int n0 = 0; n0 < 2; n0++) {\n"
+"            const unsigned char *qs_p = qs + n0 * 32;\n"
+"            for (int j = 0; j < 4; j++) {\n"
+"                int shift = j * 2;\n"
+"                int m_bit_idx = n0 * 4 + j;\n"
+"                int i = n0 * 4 + j;\n"
+"                const unsigned char *q81 = bq81_base + i * 36;\n"
+"                const int *u_w = (const int *)q81;\n"
+"                float d8 = half_to_float(*(const half_raw *)(q81 + 32));\n"
+"                int sc0_s = (int)scales[is++] - 32;\n"
+"                int sc1_s = (int)scales[is++] - 32;\n"
+"                int acc_q0 = 0, acc_h0 = 0, acc_u0 = 0;\n"
+"                int acc_q1 = 0, acc_h1 = 0, acc_u1 = 0;\n"
+"                #pragma unroll\n"
+"                for (int k = 0; k < 4; k++) {\n"
+"                    int qs0 = load_u8x4(qs_p + k * 4);\n"
+"                    int qs1 = load_u8x4(qs_p + 16 + k * 4);\n"
+"                    int hm0 = load_u8x4(hm   + k * 4);\n"
+"                    int hm1 = load_u8x4(hm   + 16 + k * 4);\n"
+"                    int vil0 = (qs0 >> shift) & 0x03030303;\n"
+"                    int vih0 = (hm0 >> m_bit_idx) & 0x01010101;\n"
+"                    int vil1 = (qs1 >> shift) & 0x03030303;\n"
+"                    int vih1 = (hm1 >> m_bit_idx) & 0x01010101;\n"
+"                    acc_q0 = dp4a_s8(vil0, u_w[k],     acc_q0);\n"
+"                    acc_h0 = dp4a_s8(vih0, u_w[k],     acc_h0);\n"
+"                    acc_u0 = dp4a_s8(0x01010101, u_w[k],     acc_u0);\n"
+"                    acc_q1 = dp4a_s8(vil1, u_w[k + 4], acc_q1);\n"
+"                    acc_h1 = dp4a_s8(vih1, u_w[k + 4], acc_h1);\n"
+"                    acc_u1 = dp4a_s8(0x01010101, u_w[k + 4], acc_u1);\n"
+"                }\n"
+"                int signed0 = acc_q0 + 4 * acc_h0 - 4 * acc_u0;\n"
+"                int signed1 = acc_q1 + 4 * acc_h1 - 4 * acc_u1;\n"
+"                partial += d8 * ((float)signed0 * (float)sc0_s + (float)signed1 * (float)sc1_s);\n"
+"            }\n"
+"        }\n"
+"        sum += d_all * partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- 16. matvec_q4_K_f32: Q4_K matrix x F32 vector -> F32 ---- */\n"
 "/* Multi-warp: 8 warps per block, each warp handles one row */\n"
 "/* Q4_K block: 144 bytes = d(f16) + dmin(f16) + scales[12] + qs[128], 256 elements */\n"
@@ -783,6 +953,79 @@ static const char *cuda_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"/* ---- 16b. matvec_q4_K_q8_1_dp4a: Q4_K weight x Q8_1 activation via dp4a ---- */\n"
+"/* Warp-per-row (8 warps per block). Per super-block: 8 Q8_1 blocks, 4 groups      */\n"
+"/* of 32 qs bytes carrying sub-block 2j (low nibble) and 2j+1 (high nibble).       */\n"
+"/* sumf_d = d * sum(sc[i] * d8[i] * dp4a(v_i, u_i, 0));                             */\n"
+"/* sumf_m = dmin * sum(mv[i] * sum8[i]),  where sum8[i] = sum of xi in q8_1 block i */\n"
+"__global__ void matvec_q4_K_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 144;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sumf_d_all = 0.0f;\n"
+"    float sumf_m_all = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 144;\n"
+"        float d    = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qs = bp + 16;\n"
+"        unsigned char svs[8], mvs[8];\n"
+"        svs[0] = sc[0] & 0x3F; svs[1] = sc[1] & 0x3F;\n"
+"        svs[2] = sc[2] & 0x3F; svs[3] = sc[3] & 0x3F;\n"
+"        mvs[0] = sc[4] & 0x3F; mvs[1] = sc[5] & 0x3F;\n"
+"        mvs[2] = sc[6] & 0x3F; mvs[3] = sc[7] & 0x3F;\n"
+"        svs[4] = (sc[8]  & 0x0F) | (((sc[0] >> 6) & 0x03) << 4);\n"
+"        svs[5] = (sc[9]  & 0x0F) | (((sc[1] >> 6) & 0x03) << 4);\n"
+"        svs[6] = (sc[10] & 0x0F) | (((sc[2] >> 6) & 0x03) << 4);\n"
+"        svs[7] = (sc[11] & 0x0F) | (((sc[3] >> 6) & 0x03) << 4);\n"
+"        mvs[4] = (sc[8]  >> 4)   | (((sc[4] >> 6) & 0x03) << 4);\n"
+"        mvs[5] = (sc[9]  >> 4)   | (((sc[5] >> 6) & 0x03) << 4);\n"
+"        mvs[6] = (sc[10] >> 4)   | (((sc[6] >> 6) & 0x03) << 4);\n"
+"        mvs[7] = (sc[11] >> 4)   | (((sc[7] >> 6) & 0x03) << 4);\n"
+"        const unsigned char *bq81_base = x_q81 + (size_t)b * 8 * 36;\n"
+"        float sumf_d_blk = 0.0f;\n"
+"        float sumf_m_blk = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            const int *qs_w = (const int *)(qs + j * 32);\n"
+"            const unsigned char *q81_lo = bq81_base + (2 * j)     * 36;\n"
+"            const unsigned char *q81_hi = bq81_base + (2 * j + 1) * 36;\n"
+"            const int *u_lo = (const int *)q81_lo;\n"
+"            const int *u_hi = (const int *)q81_hi;\n"
+"            float d8_lo = half_to_float(*(const half_raw *)(q81_lo + 32));\n"
+"            float s8_lo = half_to_float(*(const half_raw *)(q81_lo + 34));\n"
+"            float d8_hi = half_to_float(*(const half_raw *)(q81_hi + 32));\n"
+"            float s8_hi = half_to_float(*(const half_raw *)(q81_hi + 34));\n"
+"            int acc_lo = 0;\n"
+"            int acc_hi = 0;\n"
+"            #pragma unroll\n"
+"            for (int k = 0; k < 8; k++) {\n"
+"                int qb = qs_w[k];\n"
+"                int v_lo = qb & 0x0F0F0F0F;\n"
+"                int v_hi = (qb >> 4) & 0x0F0F0F0F;\n"
+"                acc_lo = dp4a_s8(v_lo, u_lo[k], acc_lo);\n"
+"                acc_hi = dp4a_s8(v_hi, u_hi[k], acc_hi);\n"
+"            }\n"
+"            sumf_d_blk += d8_lo * (float)acc_lo * (float)svs[2*j]\n"
+"                        + d8_hi * (float)acc_hi * (float)svs[2*j+1];\n"
+"            sumf_m_blk += s8_lo * (float)mvs[2*j] + s8_hi * (float)mvs[2*j+1];\n"
+"        }\n"
+"        sumf_d_all += d    * sumf_d_blk;\n"
+"        sumf_m_all += dmin * sumf_m_blk;\n"
+"    }\n"
+"    float sum = sumf_d_all - sumf_m_all;\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
 "__global__ void matvec_q6_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -819,6 +1062,75 @@ static const char *cuda_kernel_source =
 "            ql += 64; qh += 32; sc += 8;\n"
 "        }\n"
 "        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
+"/* ---- 17a. matvec_q6_K_q8_1_dp4a: Q6_K weight x Q8_1 activation via dp4a ---- */\n"
+"/* Q6_K super-block: 16 sub-sub-blocks of 16 elements, each with int8 scale.     */\n"
+"/* Q6_K block bytes = 210 (not 4-aligned) — use load_u8x4 for all weight reads. */\n"
+"/* Q8_1 blocks are 36 bytes each, cuMemAlloc-aligned, safe for int cast.         */\n"
+"/* Unsigned weight vi = (ql&0xF) | ((qh&3)<<4), range [0..63]; signed = vi - 32. */\n"
+"__global__ void matvec_q6_K_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 210;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 210;\n"
+"        const unsigned char *ql = bp;\n"
+"        const unsigned char *qh = bp + 128;\n"
+"        const signed char *sc = (const signed char *)(bp + 192);\n"
+"        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"        const unsigned char *bq81_base = x_q81 + (size_t)b * 8 * 36;\n"
+"        float sumf_d = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int half = 0; half < 2; half++) {\n"
+"            int ql_half_off = half * 64;\n"
+"            int qh_half_off = half * 32;\n"
+"            int sc_half_off = half * 8;\n"
+"            #pragma unroll\n"
+"            for (int g = 0; g < 4; g++) {\n"
+"                int q81_idx = half * 4 + g;\n"
+"                const unsigned char *q81 = bq81_base + q81_idx * 36;\n"
+"                const int *u_w = (const int *)q81;\n"
+"                float d8 = half_to_float(*(const half_raw *)(q81 + 32));\n"
+"                int sc0 = (int)sc[sc_half_off + g * 2 + 0];\n"
+"                int sc1 = (int)sc[sc_half_off + g * 2 + 1];\n"
+"                int ql_off = ql_half_off + ((g & 1) ? 32 : 0);\n"
+"                int shift_q = 2 * g;\n"
+"                int use_high = (g >= 2);\n"
+"                int acc_r_lo = 0, acc_m_lo = 0;\n"
+"                int acc_r_hi = 0, acc_m_hi = 0;\n"
+"                #pragma unroll\n"
+"                for (int k = 0; k < 8; k++) {\n"
+"                    int ql_int = load_u8x4(ql + ql_off + k * 4);\n"
+"                    int qh_int = load_u8x4(qh + qh_half_off + k * 4);\n"
+"                    int vil = use_high ? ((ql_int >> 4) & 0x0F0F0F0F) : (ql_int & 0x0F0F0F0F);\n"
+"                    int vih = ((qh_int >> shift_q) & 0x03030303) << 4;\n"
+"                    int vi  = vil | vih;\n"
+"                    int u_int = u_w[k];\n"
+"                    if (k < 4) {\n"
+"                        acc_r_lo = dp4a_s8(vi, u_int, acc_r_lo);\n"
+"                        acc_m_lo = dp4a_s8(0x20202020, u_int, acc_m_lo);\n"
+"                    } else {\n"
+"                        acc_r_hi = dp4a_s8(vi, u_int, acc_r_hi);\n"
+"                        acc_m_hi = dp4a_s8(0x20202020, u_int, acc_m_hi);\n"
+"                    }\n"
+"                }\n"
+"                sumf_d += d8 * ((float)sc0 * (float)(acc_r_lo - acc_m_lo)\n"
+"                              + (float)sc1 * (float)(acc_r_hi - acc_m_hi));\n"
+"            }\n"
+"        }\n"
+"        sum += d * sumf_d;\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
@@ -870,6 +1182,82 @@ static const char *cuda_kernel_source =
 "        }\n"
 "        sum += partial;\n"
 "    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
+"/* ---- 17c. matvec_q5_K_q8_1_dp4a: Q5_K weight x Q8_1 activation via dp4a ---- */\n"
+"/* Signed nibble = (qs>>shift)&0x0F, plus high bit from qh; total weight in [0,31]. */\n"
+"/* Per group j (4 groups) we handle sub-blocks 2j (low nibble) and 2j+1 (high nibble). */\n"
+"__global__ void matvec_q5_K_q8_1_dp4a(float *dst, const unsigned char *mat,\n"
+"                                        const unsigned char *x_q81,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 176;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sumf_d_all = 0.0f;\n"
+"    float sumf_m_all = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 176;\n"
+"        float d    = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qh = bp + 16;\n"
+"        const unsigned char *qs = bp + 48;\n"
+"        unsigned char svs[8], mvs[8];\n"
+"        svs[0] = sc[0] & 0x3F; svs[1] = sc[1] & 0x3F;\n"
+"        svs[2] = sc[2] & 0x3F; svs[3] = sc[3] & 0x3F;\n"
+"        mvs[0] = sc[4] & 0x3F; mvs[1] = sc[5] & 0x3F;\n"
+"        mvs[2] = sc[6] & 0x3F; mvs[3] = sc[7] & 0x3F;\n"
+"        svs[4] = (sc[8]  & 0x0F) | (((sc[0] >> 6) & 0x03) << 4);\n"
+"        svs[5] = (sc[9]  & 0x0F) | (((sc[1] >> 6) & 0x03) << 4);\n"
+"        svs[6] = (sc[10] & 0x0F) | (((sc[2] >> 6) & 0x03) << 4);\n"
+"        svs[7] = (sc[11] & 0x0F) | (((sc[3] >> 6) & 0x03) << 4);\n"
+"        mvs[4] = (sc[8]  >> 4)   | (((sc[4] >> 6) & 0x03) << 4);\n"
+"        mvs[5] = (sc[9]  >> 4)   | (((sc[5] >> 6) & 0x03) << 4);\n"
+"        mvs[6] = (sc[10] >> 4)   | (((sc[6] >> 6) & 0x03) << 4);\n"
+"        mvs[7] = (sc[11] >> 4)   | (((sc[7] >> 6) & 0x03) << 4);\n"
+"        const int *qh_w = (const int *)qh;\n"
+"        const unsigned char *bq81_base = x_q81 + (size_t)b * 8 * 36;\n"
+"        float sumf_d_blk = 0.0f;\n"
+"        float sumf_m_blk = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            const int *qs_w = (const int *)(qs + j * 32);\n"
+"            const unsigned char *q81_lo = bq81_base + (2 * j)     * 36;\n"
+"            const unsigned char *q81_hi = bq81_base + (2 * j + 1) * 36;\n"
+"            const int *u_lo = (const int *)q81_lo;\n"
+"            const int *u_hi = (const int *)q81_hi;\n"
+"            float d8_lo = half_to_float(*(const half_raw *)(q81_lo + 32));\n"
+"            float s8_lo = half_to_float(*(const half_raw *)(q81_lo + 34));\n"
+"            float d8_hi = half_to_float(*(const half_raw *)(q81_hi + 32));\n"
+"            float s8_hi = half_to_float(*(const half_raw *)(q81_hi + 34));\n"
+"            int shift_lo = 2 * j;\n"
+"            int shift_hi = 2 * j + 1;\n"
+"            int acc_lo = 0;\n"
+"            int acc_hi = 0;\n"
+"            #pragma unroll\n"
+"            for (int k = 0; k < 8; k++) {\n"
+"                int qb = qs_w[k];\n"
+"                int qhb = qh_w[k];\n"
+"                int v_lo = (qb & 0x0F0F0F0F) | (((qhb >> shift_lo) & 0x01010101) << 4);\n"
+"                int v_hi = ((qb >> 4) & 0x0F0F0F0F) | (((qhb >> shift_hi) & 0x01010101) << 4);\n"
+"                acc_lo = dp4a_s8(v_lo, u_lo[k], acc_lo);\n"
+"                acc_hi = dp4a_s8(v_hi, u_hi[k], acc_hi);\n"
+"            }\n"
+"            sumf_d_blk += d8_lo * (float)acc_lo * (float)svs[2*j]\n"
+"                        + d8_hi * (float)acc_hi * (float)svs[2*j+1];\n"
+"            sumf_m_blk += s8_lo * (float)mvs[2*j] + s8_hi * (float)mvs[2*j+1];\n"
+"        }\n"
+"        sumf_d_all += d    * sumf_d_blk;\n"
+"        sumf_m_all += dmin * sumf_m_blk;\n"
+"    }\n"
+"    float sum = sumf_d_all - sumf_m_all;\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
@@ -3819,10 +4207,16 @@ struct cuda_llm_runner {
     CUfunction fn_matvec_f16_f32_fused2;
     CUfunction fn_embed_q8_0;
     CUfunction fn_matvec_q2_K_f32;
+    CUfunction fn_quantize_f32_to_q8_1;
+    CUfunction fn_matvec_q2_K_q8_1_dp4a;
     CUfunction fn_matvec_q3_K_f32;
+    CUfunction fn_matvec_q3_K_q8_1_dp4a;
     CUfunction fn_matvec_q4_K_f32;
+    CUfunction fn_matvec_q4_K_q8_1_dp4a;
     CUfunction fn_matvec_q5_K_f32;
+    CUfunction fn_matvec_q5_K_q8_1_dp4a;
     CUfunction fn_matvec_q6_K_f32;
+    CUfunction fn_matvec_q6_K_q8_1_dp4a;
     CUfunction fn_embed_q2_K;
     CUfunction fn_embed_q4_K;
     /* SSM kernels */
@@ -3996,6 +4390,9 @@ struct cuda_llm_runner {
     CUdeviceptr d_xb_scale; /* F32 [1] */
     CUdeviceptr d_xb_q2;    /* INT8 [max_dim] second buffer for FFN down / ATT output */
     CUdeviceptr d_xb_scale2;/* F32 [1] */
+    /* Q8_1 quantization scratch (for K-quant dp4a path) */
+    CUdeviceptr d_xb_q81;   /* Q8_1 blocks [ceil(max_dim/32)*36 bytes] */
+    CUdeviceptr d_xb_q81_2; /* Q8_1 blocks [ceil(max_dim/32)*36 bytes] second buffer */
     int use_dp4a;            /* 1 = use dp4a INT8 path for Q8_0 matvecs */
     CUdeviceptr d_hidden_snapshots; /* optional packed [3 * n_embd] snapshot buffer */
 
@@ -4045,7 +4442,7 @@ static int cuda_llm_bind_context(cuda_llm_runner *r) {
 /* NVRTC kernel compilation                                                 */
 /* ======================================================================== */
 
-#define CLLM_PTX_CACHE_VERSION 8
+#define CLLM_PTX_CACHE_VERSION 14
 
 static int cllm_read_file(const char *path, char **out_data, size_t *out_size) {
     FILE *fp = fopen(path, "rb");
@@ -4192,10 +4589,16 @@ lookup_funcs:
     GET_FUNC(matvec_f16_f32_fused2);
     GET_FUNC(embed_q8_0);
     GET_FUNC(matvec_q2_K_f32);
+    GET_FUNC(quantize_f32_to_q8_1);
+    GET_FUNC(matvec_q2_K_q8_1_dp4a);
     GET_FUNC(matvec_q3_K_f32);
+    GET_FUNC(matvec_q3_K_q8_1_dp4a);
     GET_FUNC(matvec_q4_K_f32);
+    GET_FUNC(matvec_q4_K_q8_1_dp4a);
     GET_FUNC(matvec_q5_K_f32);
+    GET_FUNC(matvec_q5_K_q8_1_dp4a);
     GET_FUNC(matvec_q6_K_f32);
+    GET_FUNC(matvec_q6_K_q8_1_dp4a);
     GET_FUNC(embed_q2_K);
     GET_FUNC(embed_q4_K);
     /* SSM kernels */
@@ -4813,6 +5216,11 @@ static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_
     CHECK_CU(cuMemAlloc(&r->d_xb_scale,  sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_xb_q2,     max_dim * sizeof(int8_t)));
     CHECK_CU(cuMemAlloc(&r->d_xb_scale2, sizeof(float)));
+    {
+        size_t q81_bytes = ((size_t)max_dim / 32 + 1) * 36;
+        CHECK_CU(cuMemAlloc(&r->d_xb_q81,   q81_bytes));
+        CHECK_CU(cuMemAlloc(&r->d_xb_q81_2, q81_bytes));
+    }
     CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     CHECK_CU(cuMemAlloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
@@ -5638,6 +6046,11 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     CHECK_CU(cuMemAlloc(&r->d_xb_scale,  sizeof(float)));
     CHECK_CU(cuMemAlloc(&r->d_xb_q2,     max_dim * sizeof(int8_t)));
     CHECK_CU(cuMemAlloc(&r->d_xb_scale2, sizeof(float)));
+    {
+        size_t q81_bytes = ((size_t)max_dim / 32 + 1) * 36;
+        CHECK_CU(cuMemAlloc(&r->d_xb_q81,   q81_bytes));
+        CHECK_CU(cuMemAlloc(&r->d_xb_q81_2, q81_bytes));
+    }
     CHECK_CU(cuMemAlloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)));
 
     /* Logits buffer (GPU + host) */
@@ -6120,6 +6533,32 @@ static inline void launch_matvec_q2_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+/* Quantize F32 -> Q8_1 (per-32 block). Launch n/32 blocks, 32 threads each
+ * (blockDim=(32,1), gridDim=(n/32,1,1)). */
+static inline void launch_quantize_q8_1(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr src, int n) {
+    void *args[] = { &dst, &src, &n };
+    int n_blocks = n / 32;
+    /* Pack 4 Q8_1 blocks per CTA: blockDim=(32,4), grid=ceil(n_blocks/4). */
+    int ctas = (n_blocks + 3) / 4;
+    cuLaunchKernel(r->fn_quantize_f32_to_q8_1,
+                   ctas, 1, 1, 32, 4, 1, 0, r->stream, args, NULL);
+}
+
+/* Q2_K dp4a: assumes Q8_1-quantized x has already been written to x_q81. */
+static inline void launch_matvec_q2_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q2_K_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+static inline void launch_matvec_q3_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q3_K_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_q3_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -6134,6 +6573,13 @@ static inline void launch_matvec_q4_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+static inline void launch_matvec_q4_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q4_K_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -6141,10 +6587,24 @@ static inline void launch_matvec_q5_K(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
+static inline void launch_matvec_q5_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q5_K_q8_1_dp4a,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
 static inline void launch_matvec_q6_K(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
                                         CUdeviceptr x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     cuLaunchKernel(r->fn_matvec_q6_K_f32,
+                   (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+static inline void launch_matvec_q6_K_dp4a(cuda_llm_runner *r, CUdeviceptr dst, CUdeviceptr mat,
+                                            CUdeviceptr x_q81, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x_q81, &n_rows, &n_cols };
+    cuLaunchKernel(r->fn_matvec_q6_K_q8_1_dp4a,
                    (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
 }
 
@@ -6204,11 +6664,46 @@ static inline void launch_matvec_auto(cuda_llm_runner *r, CUdeviceptr dst, CUdev
                                        CUdeviceptr x, int n_rows, int n_cols, int weight_type) {
     switch (weight_type) {
         case GGML_TYPE_Q8_0: launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_Q2_K: launch_matvec_q2_K(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_Q3_K: launch_matvec_q3_K(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_Q4_K: launch_matvec_q4_K(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_Q5_K: launch_matvec_q5_K(r, dst, mat, x, n_rows, n_cols); break;
-        case GGML_TYPE_Q6_K: launch_matvec_q6_K(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_Q2_K:
+            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q2_K_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_q2_K(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
+        case GGML_TYPE_Q3_K:
+            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q3K_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q3_K_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_q3_K(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
+        case GGML_TYPE_Q4_K:
+            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q4K_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q4_K_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_q4_K(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
+        case GGML_TYPE_Q5_K:
+            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q5K_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q5_K_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_q5_K(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
+        case GGML_TYPE_Q6_K:
+            if (r->use_dp4a && (n_cols % 256) == 0 && (n_cols % 32) == 0 && !getenv("CUDA_LLM_NO_Q6K_DP4A")) {
+                launch_quantize_q8_1(r, r->d_xb_q81, x, n_cols);
+                launch_matvec_q6_K_dp4a(r, dst, mat, r->d_xb_q81, n_rows, n_cols);
+            } else {
+                launch_matvec_q6_K(r, dst, mat, x, n_rows, n_cols);
+            }
+            break;
         case GGML_TYPE_IQ2_XXS: launch_matvec_iq2_xxs(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q4_0:    launch_matvec_q4_0(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q4_1:    launch_matvec_q4_1(r, dst, mat, x, n_rows, n_cols); break;
@@ -9042,6 +9537,8 @@ void cuda_llm_free(cuda_llm_runner *r) {
     if (r->d_xb_scale)  cuMemFree(r->d_xb_scale);
     if (r->d_xb_q2)    cuMemFree(r->d_xb_q2);
     if (r->d_xb_scale2) cuMemFree(r->d_xb_scale2);
+    if (r->d_xb_q81)    cuMemFree(r->d_xb_q81);
+    if (r->d_xb_q81_2)  cuMemFree(r->d_xb_q81_2);
 
     /* Free KV cache (skip shared caches for Gemma4) */
     if (r->d_key_cache) {
