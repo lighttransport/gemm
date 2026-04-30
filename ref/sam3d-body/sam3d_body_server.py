@@ -20,7 +20,8 @@ Request shape:
         "backend": "ours-cpu|ours-cuda",
         "auto_bbox": true,               # default true if bbox missing
         "auto_thresh": 0.5,
-        "focal": 0.0                     # optional
+        "focal": 0.0,                    # optional
+        "output_format": "obj|glb"       # optional; C runners only for glb
       }
     }
 
@@ -31,11 +32,13 @@ Response:
       "backend": "ours-cuda",
       "outputs": [{
         "type": "mesh",
-        "mime": "model/obj",
+        "mime": "model/obj|model/gltf-binary",
+        "format": "obj|glb",
         "n_verts": 18439,
         "n_faces": 36874,
         "data_base64": "<OBJ text base64>",
-        "bbox_used": [x0, y0, x1, y1]
+        "bbox_used": [x0, y0, x1, y1],
+        "json": {"cam_t": "...", "keypoints_2d": "..."}
       }],
       "timings_ms": {"infer": 8770, "total": 8800}
     }
@@ -92,6 +95,7 @@ def _read_obj_counts(path):
 
 _BBOX_PAREN_RE = re.compile(
     r"bbox=\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)")
+_MESH_COUNT_RE = re.compile(r"\(V=(\d+)\s+F=(\d+)\)")
 
 
 def _parse_bbox_log(stderr):
@@ -114,6 +118,22 @@ def _parse_bbox_log(stderr):
         if {"x0", "y0", "x1", "y1"}.issubset(d):
             return [d["x0"], d["y0"], d["x1"], d["y1"]]
     return None
+
+
+def _parse_mesh_counts_log(stderr):
+    for line in stderr.splitlines():
+        m = _MESH_COUNT_RE.search(line)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
+def _read_json_if_exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except OSError:
+        return None
 
 
 # ---- Backends ------------------------------------------------------------
@@ -145,11 +165,17 @@ class CRunnerBackend:
         with self.lock, tempfile.TemporaryDirectory() as td:
             ext = (params.get("image_ext") or "jpg").lstrip(".")
             img = os.path.join(td, f"in.{ext}")
-            obj = os.path.join(td, "out.obj")
+            output_format = str(params.get("output_format") or "obj").lower()
+            output_format = output_format.lstrip(".")
+            if output_format not in ("obj", "glb"):
+                raise RuntimeError(
+                    f"unknown output_format {output_format!r} "
+                    "(expected obj|glb)")
+            mesh_path = os.path.join(td, f"out.{output_format}")
             _save_image(image_b64, img)
 
             cmd = [self.bin, self.sft_dir, img,
-                   "--mhr-assets", self.mhr_dir, "-o", obj, "-v"]
+                   "--mhr-assets", self.mhr_dir, "-o", mesh_path, "-v"]
             if bbox is not None:
                 cmd += ["--bbox", f"{bbox[0]:g}", f"{bbox[1]:g}",
                                   f"{bbox[2]:g}", f"{bbox[3]:g}"]
@@ -172,16 +198,24 @@ class CRunnerBackend:
             t0 = time.time()
             proc = subprocess.run(cmd, capture_output=True, text=True)
             dt_ms = int((time.time() - t0) * 1000)
-            if proc.returncode != 0 or not os.path.isfile(obj):
+            if proc.returncode != 0 or not os.path.isfile(mesh_path):
                 raise RuntimeError(
                     f"{self.name} failed (rc={proc.returncode}):\n"
                     f"stderr tail:\n{proc.stderr[-2000:]}")
 
-            nv, nf = _read_obj_counts(obj)
-            with open(obj, "rb") as f:
-                obj_bytes = f.read()
+            if output_format == "obj":
+                nv, nf = _read_obj_counts(mesh_path)
+                mime = "model/obj"
+            else:
+                nv, nf = _parse_mesh_counts_log(proc.stderr)
+                mime = "model/gltf-binary"
+            with open(mesh_path, "rb") as f:
+                mesh_bytes = f.read()
             bbox_used = bbox if bbox is not None else _parse_bbox_log(proc.stderr)
-        return obj_bytes, nv, nf, dt_ms, bbox_used
+            side = _read_json_if_exists(mesh_path + ".json") or {}
+            if bbox_used is None and isinstance(side.get("bbox"), list):
+                bbox_used = side["bbox"]
+        return mesh_bytes, nv, nf, dt_ms, bbox_used, side, mime, output_format
 
 
 class PytorchShellBackend:
@@ -213,6 +247,9 @@ class PytorchShellBackend:
                 and self.python and os.path.isfile(self.python))
 
     def infer(self, image_b64, params, bbox):
+        output_format = str(params.get("output_format") or "obj").lower()
+        if output_format.lstrip(".") != "obj":
+            raise RuntimeError("pytorch-cuda backend only supports output_format=obj")
         if bbox is None:
             raise RuntimeError(
                 "pytorch backend requires a bbox (no detectron2 in venv). "
@@ -252,7 +289,8 @@ class PytorchShellBackend:
             nv, nf = _read_obj_counts(obj)
             with open(obj, "rb") as f:
                 obj_bytes = f.read()
-        return obj_bytes, nv, nf, dt_ms, bbox
+            side = _read_json_if_exists(obj + ".json") or {}
+        return obj_bytes, nv, nf, dt_ms, bbox, side, "model/obj", "obj"
 
 
 # ---- HTTP dispatch -------------------------------------------------------
@@ -332,7 +370,8 @@ def make_handler(backends, web_root):
             if path in ("/models", "/v1/models"):
                 _json(self, 200, {"ok": True, "models": [
                     {"id": "sam3d_body", "tasks": ["image-to-mesh"],
-                     "backends": sorted(backends.keys())}
+                     "backends": sorted(backends.keys()),
+                     "output_formats": ["obj", "glb"]}
                 ]})
                 return
             if path == "/v1/samples":
@@ -375,7 +414,7 @@ def make_handler(backends, web_root):
                     bbox = [float(x) for x in bbox_in]
 
                 be = backends[be_name]
-                obj_bytes, nv, nf, dt_infer, bbox_used = be.infer(
+                mesh_bytes, nv, nf, dt_infer, bbox_used, side, mime, fmt = be.infer(
                     img_b64, params, bbox)
 
                 dt_ms = int((time.time() - t_all) * 1000)
@@ -386,11 +425,13 @@ def make_handler(backends, web_root):
                     "backend": be_name,
                     "outputs": [{
                         "type": "mesh",
-                        "mime": "model/obj",
+                        "mime": mime,
+                        "format": fmt,
                         "n_verts": int(nv),
                         "n_faces": int(nf),
-                        "data_base64": base64.b64encode(obj_bytes).decode("ascii"),
+                        "data_base64": base64.b64encode(mesh_bytes).decode("ascii"),
                         "bbox_used": bbox_used,
+                        "json": side,
                     }],
                     "timings_ms": {"infer": int(dt_infer), "total": dt_ms},
                 })
