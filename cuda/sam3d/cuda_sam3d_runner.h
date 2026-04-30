@@ -18,6 +18,7 @@
  *   sam3d_ss_decoder.safetensors        (3D-conv SS-VAE)
  *   sam3d_slat_dit.safetensors          (SLAT flow, 24 blocks)
  *   sam3d_slat_gs_decoder.safetensors   (Gaussian-splat decoder)
+ *   sam3d_slat_mesh_decoder.safetensors (optional learned mesh decoder)
  */
 
 #ifndef CUDA_SAM3D_RUNNER_H_
@@ -62,7 +63,7 @@ int cuda_sam3d_set_image_rgba(cuda_sam3d_ctx *ctx, const uint8_t *rgba,
                               int width, int height);
 int cuda_sam3d_set_mask(cuda_sam3d_ctx *ctx, const uint8_t *mask,
                         int width, int height);
-/* Pointmap float32 [H, W, 3]. v1: required (MoGe port deferred). */
+/* Pointmap float32 [H, W, 3]. The CLI can generate this via --moge. */
 int cuda_sam3d_set_pointmap(cuda_sam3d_ctx *ctx, const float *pmap,
                             int width, int height);
 
