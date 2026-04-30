@@ -24,6 +24,10 @@
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
 
+#ifdef LLM_HIPBLASLT_ENABLED
+#include "mm_blaslt_bridge.h"
+#endif
+
 /* ======================================================================== */
 /* HIP C kernel source (compiled at runtime via HIPRTC)                     */
 /* ======================================================================== */
@@ -1020,6 +1024,548 @@ static const char *hip_kernel_source =
 "STUB_MATVEC(matvec_tq1_0_f32)\n"
 "STUB_MATVEC(matvec_tq2_0_f32)\n"
 "\n"
+"/* ---- BF16 helpers (used by Phase-2 hipBLASLt prefill GEMMs) ---- */\n"
+"typedef unsigned short bf16_raw;\n"
+"\n"
+"__device__ __forceinline__ bf16_raw f32_to_bf16(float f) {\n"
+"    unsigned int u = __float_as_uint(f);\n"
+"    /* Round-to-nearest-even */\n"
+"    unsigned int rounded = u + ((u >> 16) & 1u) + 0x7FFFu;\n"
+"    return (bf16_raw)(rounded >> 16);\n"
+"}\n"
+"\n"
+"/* Vectorized F32 -> BF16 packer. Each thread packs 4 floats; tail is scalar. */\n"
+"__global__ void pack_bf16_from_f32(bf16_raw *dst, const float *src, int n) {\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int idx4 = gid * 4;\n"
+"    if (idx4 + 3 < n) {\n"
+"        float4 f4 = *((const float4 *)(src + idx4));\n"
+"        unsigned short b0 = f32_to_bf16(f4.x);\n"
+"        unsigned short b1 = f32_to_bf16(f4.y);\n"
+"        unsigned short b2 = f32_to_bf16(f4.z);\n"
+"        unsigned short b3 = f32_to_bf16(f4.w);\n"
+"        unsigned long long packed = ((unsigned long long)b0)\n"
+"            | (((unsigned long long)b1) << 16)\n"
+"            | (((unsigned long long)b2) << 32)\n"
+"            | (((unsigned long long)b3) << 48);\n"
+"        *((unsigned long long *)(dst + idx4)) = packed;\n"
+"    } else {\n"
+"        for (int i = idx4; i < n && i < idx4 + 4; i++) {\n"
+"            dst[i] = f32_to_bf16(src[i]);\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* One-shot weight conversion: F16 [N*K] -> BF16 [N*K]. */\n"
+"__global__ void convert_f16_to_bf16(bf16_raw *dst, const half_raw *src, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) {\n"
+"        dst[i] = f32_to_bf16(half_to_float(src[i]));\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ===== Phase 3: causal WMMA flash-attention helpers ===== */\n"
+"typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));\n"
+"typedef float    float8 __attribute__((ext_vector_type(8)));\n"
+"\n"
+"__device__ __forceinline__ half_raw f32_to_f16_bits(float v) {\n"
+"    __half hv = __float2half(v);\n"
+"    return *((half_raw*)&hv);\n"
+"}\n"
+"\n"
+"/* Vectorized F32 -> F16 packer (4 per thread). */\n"
+"__global__ void pack_f16_from_f32(half_raw *dst, const float *src, int n) {\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int idx = gid * 4;\n"
+"    if (idx + 3 < n) {\n"
+"        float4 f = *(const float4 *)(src + idx);\n"
+"        ushort4 b;\n"
+"        b.x = f32_to_f16_bits(f.x);\n"
+"        b.y = f32_to_f16_bits(f.y);\n"
+"        b.z = f32_to_f16_bits(f.z);\n"
+"        b.w = f32_to_f16_bits(f.w);\n"
+"        *(ushort4 *)(dst + idx) = b;\n"
+"    } else {\n"
+"        for (int i = idx; i < n && i < idx + 4; i++) {\n"
+"            dst[i] = f32_to_f16_bits(src[i]);\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Pack KV cache F32 [kv_len, n_kv_heads, head_dim] -> F16 [n_kv_heads, kv_len, head_dim].\n"
+" * Grid: (kv_len, n_kv_heads), block: head_dim (capped at 256). */\n"
+"__global__ void pack_kv_cache_f16(half_raw *dst, const float *src,\n"
+"                                   int kv_len, int n_kv_heads, int head_dim) {\n"
+"    int t   = blockIdx.x;\n"
+"    int hkv = blockIdx.y;\n"
+"    int tid = threadIdx.x;\n"
+"    int kv_dim = n_kv_heads * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += blockDim.x) {\n"
+"        float v = src[(size_t)t * kv_dim + hkv * head_dim + d];\n"
+"        dst[((size_t)hkv * kv_len + t) * head_dim + d] = f32_to_f16_bits(v);\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Batched RoPE NeoX: applies RoPE to M consecutive rows in a [M, n_heads*head_dim]\n"
+" * buffer. Grid: (n_heads, M), block: half_dim. */\n"
+"__global__ void rope_neox_batch_f32(float *vec_batch, int n_heads, int head_dim,\n"
+"                                     int position_start, float freq_base,\n"
+"                                     int n_rope_pairs, int row_stride) {\n"
+"    int h   = blockIdx.x;\n"
+"    int row = blockIdx.y;\n"
+"    if (h >= n_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    int half_dim = head_dim / 2;\n"
+"    if (j >= half_dim) return;\n"
+"    if (n_rope_pairs > 0 && j >= n_rope_pairs) return;\n"
+"    int pair_off = (n_rope_pairs > 0 && n_rope_pairs < half_dim) ? n_rope_pairs : half_dim;\n"
+"    int rope_dim = (n_rope_pairs > 0) ? 2 * n_rope_pairs : head_dim;\n"
+"    int pos = position_start + row;\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float cos_t = cosf(theta);\n"
+"    float sin_t = sinf(theta);\n"
+"    float *v = vec_batch + (size_t)row * row_stride + h * head_dim;\n"
+"    float v0 = v[j];\n"
+"    float v1 = v[j + pair_off];\n"
+"    v[j]            = v0 * cos_t - v1 * sin_t;\n"
+"    v[j + pair_off] = v0 * sin_t + v1 * cos_t;\n"
+"}\n"
+"\n"
+"/* Batched M-RoPE; same shape as rope_mrope_f32 but with row dim. */\n"
+"__global__ void rope_mrope_batch_f32(float *vec_batch, int n_heads, int head_dim,\n"
+"                                      int position_start, float freq_base,\n"
+"                                      int sect0, int sect1, int sect2, int sect3,\n"
+"                                      int row_stride) {\n"
+"    int h   = blockIdx.x;\n"
+"    int row = blockIdx.y;\n"
+"    if (h >= n_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    int half_dim = head_dim / 2;\n"
+"    if (j >= half_dim) return;\n"
+"    int sect_sum = sect0 + sect1 + sect2 + sect3;\n"
+"    int rope_dim = 2 * sect_sum;\n"
+"    int pos_base = position_start + row;\n"
+"    int pos;\n"
+"    if (j < sect0) pos = pos_base;\n"
+"    else if (j < sect0 + sect1) pos = pos_base;\n"
+"    else if (j < sect0 + sect1 + sect2) pos = pos_base;\n"
+"    else pos = 0;\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float cos_t = cosf(theta);\n"
+"    float sin_t = sinf(theta);\n"
+"    float *v = vec_batch + (size_t)row * row_stride + h * head_dim;\n"
+"    float v0 = v[j];\n"
+"    float v1 = v[j + half_dim];\n"
+"    v[j]            = v0 * cos_t - v1 * sin_t;\n"
+"    v[j + half_dim] = v0 * sin_t + v1 * cos_t;\n"
+"}\n"
+"\n"
+"/* Batched KV cache store: copies M rows from k_batch/v_batch into the cache.\n"
+" * Grid: ceil((kv_dim*M)/256), block: 256. */\n"
+"__global__ void kv_cache_store_batch(float *key_cache, float *value_cache,\n"
+"                                      const float *k_batch, const float *v_batch,\n"
+"                                      int position_start, int M, int kv_dim) {\n"
+"    int total = M * kv_dim;\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (gid >= total) return;\n"
+"    int row = gid / kv_dim;\n"
+"    int i   = gid - row * kv_dim;\n"
+"    size_t cache_idx = (size_t)(position_start + row) * kv_dim + i;\n"
+"    size_t batch_idx = (size_t)row * kv_dim + i;\n"
+"    key_cache[cache_idx]   = k_batch[batch_idx];\n"
+"    value_cache[cache_idx] = v_batch[batch_idx];\n"
+"}\n"
+"\n"
+"/* Causal WMMA flash-attention for prefill. BQ=64, 4 waves, F16, GQA, head_dim<=128.\n"
+" * Q [M, n_heads*head_dim] F16, K_t/V_t [n_kv_heads, kv_len, head_dim] F16,\n"
+" * out [M, n_heads*head_dim] F32.\n"
+" * Grid: (n_heads, ceil(M/64)). Block: 128. Shared mem: see launcher. */\n"
+"#define FA_LLM_BQ 64\n"
+"#define FA_LLM_BKV 16\n"
+"#define FA_LLM_HD_MAX 128\n"
+"#define FA_LLM_K_NB (FA_LLM_HD_MAX / 16)\n"
+"__global__ void flash_attn_wmma_f16_4w_causal(\n"
+"    float *out, const half_raw *Q,\n"
+"    const half_raw *K_t, const half_raw *V_t,\n"
+"    int M, int kv_len, int position_start,\n"
+"    int n_heads, int n_kv_heads, int head_dim, float scale) {\n"
+"    int h  = blockIdx.x;\n"
+"    int qb = blockIdx.y;\n"
+"    int q0 = qb * FA_LLM_BQ;\n"
+"    int gqa_ratio = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa_ratio;\n"
+"    int q_dim = n_heads * head_dim;\n"
+"    int tid = threadIdx.x;\n"
+"    int wid = tid >> 5;\n"
+"    int lid = tid & 31;\n"
+"    int half = lid >> 4;\n"
+"    int idx  = lid & 15;\n"
+"    extern __shared__ _Float16 smem_h[];\n"
+"    _Float16 *smK0 = smem_h;\n"
+"    _Float16 *smK1 = smK0 + 16 * FA_LLM_HD_MAX;\n"
+"    _Float16 *smV0 = smK1 + 16 * FA_LLM_HD_MAX;\n"
+"    _Float16 *smV1 = smV0 + FA_LLM_HD_MAX * 16;\n"
+"    _Float16 *smP  = smV1 + FA_LLM_HD_MAX * 16;\n"
+"    _Float16 *smP_w = smP + wid * 16 * 16;\n"
+"    int q_base = q0 + wid * 16;\n"
+"    /* Load Q tile (per wave: 16 rows, head_dim cols) into registers and apply scale. */\n"
+"    f16x8 q_reg[FA_LLM_K_NB];\n"
+"    for (int kb = 0; kb < FA_LLM_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int d = kb * 16 + half * 8 + i;\n"
+"            int row = q_base + idx;\n"
+"            float v = 0.0f;\n"
+"            if (row < M && d < head_dim) {\n"
+"                half_raw qh = Q[(size_t)row * q_dim + h * head_dim + d];\n"
+"                v = half_to_float(qh);\n"
+"            }\n"
+"            q_reg[kb][i] = (_Float16)(v * scale);\n"
+"        }\n"
+"    }\n"
+"    float8 O_acc[FA_LLM_K_NB];\n"
+"    for (int kb = 0; kb < FA_LLM_K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"    /* Causal upper bound on KV iterations: max needed k = position_start + q0 + BQ - 1. */\n"
+"    int max_q_global = position_start + q0 + FA_LLM_BQ - 1;\n"
+"    int max_kv = max_q_global + 1;\n"
+"    if (max_kv > kv_len) max_kv = kv_len;\n"
+"    int n_kv = (max_kv + FA_LLM_BKV - 1) / FA_LLM_BKV;\n"
+"    /* Each thread loads one (row, col-group) of the K/V tile. 128 threads,\n"
+"     * 16 KV rows × 8 col-groups (16 cols each). */\n"
+"    int ld_row  = tid >> 3;\n"
+"    int ld_col0 = (tid & 7) * 16;\n"
+"    {\n"
+"        int kv = ld_row;\n"
+"        size_t k_base = ((size_t)kv_h * kv_len + kv) * head_dim;\n"
+"        bool kv_ok = (kv < max_kv);\n"
+"        for (int j = 0; j < 16; j++) {\n"
+"            int d = ld_col0 + j;\n"
+"            _Float16 k_v = (_Float16)0.0f, v_v = (_Float16)0.0f;\n"
+"            if (kv_ok && d < head_dim) {\n"
+"                k_v = (_Float16)half_to_float(K_t[k_base + d]);\n"
+"                v_v = (_Float16)half_to_float(V_t[k_base + d]);\n"
+"            }\n"
+"            smK0[ld_row * FA_LLM_HD_MAX + d] = k_v;\n"
+"            smV0[d * 16 + ld_row] = v_v;\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    for (int t = 0; t < n_kv; t++) {\n"
+"        _Float16 *smK_cur = (t & 1) ? smK1 : smK0;\n"
+"        _Float16 *smV_cur = (t & 1) ? smV1 : smV0;\n"
+"        _Float16 *smK_pre = (t & 1) ? smK0 : smK1;\n"
+"        _Float16 *smV_pre = (t & 1) ? smV0 : smV1;\n"
+"        int t_next = t + 1;\n"
+"        bool prefetch = t_next < n_kv;\n"
+"        if (prefetch) {\n"
+"            int kv_pre = t_next * FA_LLM_BKV + ld_row;\n"
+"            size_t k_base_pre = ((size_t)kv_h * kv_len + kv_pre) * head_dim;\n"
+"            bool pre_ok = (kv_pre < max_kv);\n"
+"            for (int j = 0; j < 16; j++) {\n"
+"                int d = ld_col0 + j;\n"
+"                _Float16 k_v = (_Float16)0.0f, v_v = (_Float16)0.0f;\n"
+"                if (pre_ok && d < head_dim) {\n"
+"                    k_v = (_Float16)half_to_float(K_t[k_base_pre + d]);\n"
+"                    v_v = (_Float16)half_to_float(V_t[k_base_pre + d]);\n"
+"                }\n"
+"                smK_pre[ld_row * FA_LLM_HD_MAX + d] = k_v;\n"
+"                smV_pre[d * 16 + ld_row] = v_v;\n"
+"            }\n"
+"        }\n"
+"        int kv0 = t * FA_LLM_BKV;\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < FA_LLM_K_NB; kb++) {\n"
+"            f16x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK_cur[idx * FA_LLM_HD_MAX + dpos];\n"
+"            }\n"
+"            score = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_reg[kb], b_K, score);\n"
+"        }\n"
+"        /* Out-of-range KV columns: -inf. */\n"
+"        bool col_valid = (kv0 + idx) < max_kv;\n"
+"        for (int i = 0; i < 8; i++) score[i] = col_valid ? score[i] : -1e30f;\n"
+"        /* Causal mask: for thread (idx, half*8+i):\n"
+"         *   q_global = position_start + (q_base + half*8 + i)\n"
+"         *   k_global = kv0 + idx\n"
+"         * mask if q_global < k_global. */\n"
+"        int k_global = kv0 + idx;\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int q_row = q_base + half * 8 + i;\n"
+"            int q_global = position_start + q_row;\n"
+"            if (q_global < k_global) score[i] = -1e30f;\n"
+"        }\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < FA_LLM_K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP_w[m_row * 16 + n_col] = (_Float16)score[i];\n"
+"        }\n"
+"        f16x8 ap;\n"
+"        for (int i = 0; i < 8; i++) ap[i] = smP_w[idx * 16 + half * 8 + i];\n"
+"        for (int kb = 0; kb < FA_LLM_K_NB; kb++) {\n"
+"            f16x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV_cur[d_col * 16 + kv_k];\n"
+"            }\n"
+"            O_acc[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ap, bv, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int kb = 0; kb < FA_LLM_K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q_base + m_row;\n"
+"            if (row < M && d < head_dim) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * q_dim + h * head_dim + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"#undef FA_LLM_BQ\n"
+"#undef FA_LLM_BKV\n"
+"#undef FA_LLM_HD_MAX\n"
+"#undef FA_LLM_K_NB\n"
+"\n"
+"/* ===== Phase 4: WMMA F16 matvec for decode (M=1) ===== */\n"
+"/* Computes dst[n_rows] = mat[n_rows, n_cols] * x[n_cols] using 16-row WMMA tiles.\n"
+" * x is staged into LDS as F16 once. 4 waves per WG, each wave handles its own\n"
+" * 16-row tile -> WG covers 64 rows. B operand is x replicated across all 16\n"
+" * N columns; we read column 0 of the result.\n"
+" * Grid: ceil(n_rows / 64). Block: 128 (4 waves). Shared mem: n_cols * 2 bytes. */\n"
+"__global__ void matvec_f16_wmma_f32(float *dst, const half_raw *mat,\n"
+"                                     const float *x, int n_rows, int n_cols) {\n"
+"    int tid = threadIdx.x;\n"
+"    int wave = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int half = lane >> 4;\n"
+"    int idx  = lane & 15;\n"
+"    int row_tile = blockIdx.x * 4 + wave;\n"
+"    int row0 = row_tile * 16;\n"
+"    extern __shared__ _Float16 sm_x_h[];\n"
+"    /* All threads in WG cooperate to load x to LDS as F16. */\n"
+"    int n4 = n_cols & ~3;\n"
+"    for (int i = tid * 4; i < n4; i += blockDim.x * 4) {\n"
+"        float4 f = *(const float4 *)(x + i);\n"
+"        sm_x_h[i + 0] = (_Float16)f.x;\n"
+"        sm_x_h[i + 1] = (_Float16)f.y;\n"
+"        sm_x_h[i + 2] = (_Float16)f.z;\n"
+"        sm_x_h[i + 3] = (_Float16)f.w;\n"
+"    }\n"
+"    for (int i = n4 + tid; i < n_cols; i += blockDim.x) {\n"
+"        sm_x_h[i] = (_Float16)x[i];\n"
+"    }\n"
+"    __syncthreads();\n"
+"    if (row0 >= n_rows) return;\n"
+"    int row = row0 + idx;\n"
+"    int row_in = (row < n_rows) ? row : 0;\n"
+"    const _Float16 *row_h = (const _Float16 *)mat + (size_t)row_in * n_cols;\n"
+"    int n_kt = n_cols / 16;\n"
+"    float8 acc = {0,0,0,0,0,0,0,0};\n"
+"    for (int kt = 0; kt < n_kt; kt++) {\n"
+"        /* Vector load: 8 consecutive F16 from this lane's row at kt*16 + half*8. */\n"
+"        f16x8 a = *(const f16x8 *)(row_h + kt * 16 + half * 8);\n"
+"        f16x8 b = *(const f16x8 *)(sm_x_h + kt * 16 + half * 8);\n"
+"        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, acc);\n"
+"    }\n"
+"    /* Tail: cols not multiple of 16. */\n"
+"    int kt_tail = n_kt * 16;\n"
+"    if (kt_tail < n_cols) {\n"
+"        f16x8 a = {0,0,0,0,0,0,0,0};\n"
+"        f16x8 b = {0,0,0,0,0,0,0,0};\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int col = kt_tail + half * 8 + i;\n"
+"            if (col < n_cols) {\n"
+"                a[i] = row_h[col];\n"
+"                b[i] = sm_x_h[col];\n"
+"            }\n"
+"        }\n"
+"        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, acc);\n"
+"    }\n"
+"    /* acc[i] in lane (idx, half) holds C[M=half*8+i, N=idx]. Take any single N. */\n"
+"    if (idx == 0) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int row = row0 + half * 8 + i;\n"
+"            if (row < n_rows) dst[row] = acc[i];\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ===== Phase 5: device-pointer position kernels for HIP graph capture ===== */\n"
+"/* These mirror rope_neox_f32 / rope_mrope_f32 / kv_cache_store / attn_decode_f32\n"
+" * but read position from a device int so a captured graph can be replayed for\n"
+" * any (token_id, position) by writing those scalars to *_p before launch. */\n"
+"\n"
+"__global__ void rope_neox_f32_devp(float *vec, int n_heads, int head_dim,\n"
+"                                    const int *pos_p,\n"
+"                                    float freq_base, int n_rope_pairs) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    int half_dim = head_dim / 2;\n"
+"    if (j >= half_dim) return;\n"
+"    if (n_rope_pairs > 0 && j >= n_rope_pairs) return;\n"
+"    int pair_off = (n_rope_pairs > 0 && n_rope_pairs < half_dim) ? n_rope_pairs : half_dim;\n"
+"    int rope_dim = (n_rope_pairs > 0) ? 2 * n_rope_pairs : head_dim;\n"
+"    int pos = *pos_p;\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float cos_t = cosf(theta);\n"
+"    float sin_t = sinf(theta);\n"
+"    float *v = vec + h * head_dim;\n"
+"    float v0 = v[j];\n"
+"    float v1 = v[j + pair_off];\n"
+"    v[j]            = v0 * cos_t - v1 * sin_t;\n"
+"    v[j + pair_off] = v0 * sin_t + v1 * cos_t;\n"
+"}\n"
+"\n"
+"/* M-RoPE text-only: all three position axes share the same scalar. */\n"
+"__global__ void rope_mrope_f32_devp(float *vec, int n_heads, int head_dim,\n"
+"                                     const int *pos_p,\n"
+"                                     float freq_base,\n"
+"                                     int sect0, int sect1, int sect2, int sect3) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int j = threadIdx.x;\n"
+"    int half_dim = head_dim / 2;\n"
+"    if (j >= half_dim) return;\n"
+"    int sect_sum = sect0 + sect1 + sect2 + sect3;\n"
+"    int rope_dim = 2 * sect_sum;\n"
+"    int pos_v = *pos_p;\n"
+"    int pos;\n"
+"    if (j < sect0) pos = pos_v;\n"
+"    else if (j < sect0 + sect1) pos = pos_v;\n"
+"    else if (j < sect0 + sect1 + sect2) pos = pos_v;\n"
+"    else pos = 0;\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float cos_t = cosf(theta);\n"
+"    float sin_t = sinf(theta);\n"
+"    float *v = vec + h * head_dim;\n"
+"    float v0 = v[j];\n"
+"    float v1 = v[j + half_dim];\n"
+"    v[j]            = v0 * cos_t - v1 * sin_t;\n"
+"    v[j + half_dim] = v0 * sin_t + v1 * cos_t;\n"
+"}\n"
+"\n"
+"__global__ void kv_cache_store_devp(float *key_cache, float *value_cache,\n"
+"                                     const float *k, const float *v,\n"
+"                                     const int *pos_p, int kv_dim) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < kv_dim) {\n"
+"        int position = *pos_p;\n"
+"        key_cache[(size_t)position * kv_dim + i] = k[i];\n"
+"        value_cache[(size_t)position * kv_dim + i] = v[i];\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Same as attn_decode_f32 but seq_len comes from *pos_p + 1 at runtime. */\n"
+"__global__ void attn_decode_f32_devp(float *out, const float *q,\n"
+"                                      const float *key_cache, const float *value_cache,\n"
+"                                      int n_heads, int n_kv_heads, int head_dim,\n"
+"                                      int kv_dim, const int *pos_p, float scale) {\n"
+"    extern __shared__ float att[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int gqa_ratio = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa_ratio;\n"
+"    int seq_len = *pos_p + 1;\n"
+"    const float *q_h = q + h * head_dim;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        const float *k_t = key_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"        float score = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) score += q_h[d] * k_t[d];\n"
+"        att[t] = score * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float local_max = -1e30f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        if (att[t] > local_max) local_max = att[t];\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        float other = __shfl_down(local_max, offset);\n"
+"        if (other > local_max) local_max = other;\n"
+"    }\n"
+"    __shared__ float warp_max[8];\n"
+"    int warp_id = tid / 32;\n"
+"    int lane = tid % 32;\n"
+"    if (lane == 0) warp_max[warp_id] = local_max;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float m = warp_max[0];\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 1; w < n_warps; w++) if (warp_max[w] > m) m = warp_max[w];\n"
+"        warp_max[0] = m;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float max_val = warp_max[0];\n"
+"    float local_sum = 0.0f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        float e = expf(att[t] - max_val);\n"
+"        att[t] = e;\n"
+"        local_sum += e;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) {\n"
+"        local_sum += __shfl_down(local_sum, offset);\n"
+"    }\n"
+"    __shared__ float warp_sum[8];\n"
+"    if (lane == 0) warp_sum[warp_id] = local_sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float s = 0.0f;\n"
+"        int n_warps = (nthreads + 31) / 32;\n"
+"        for (int w = 0; w < n_warps; w++) s += warp_sum[w];\n"
+"        warp_sum[0] = s;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float inv_sum = 1.0f / warp_sum[0];\n"
+"    for (int t = tid; t < seq_len; t += nthreads) att[t] *= inv_sum;\n"
+"    __syncthreads();\n"
+"    float *out_h = out + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += nthreads) {\n"
+"        float acc = 0.0f;\n"
+"        for (int t = 0; t < seq_len; t++) {\n"
+"            const float *v_t = value_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"            acc += att[t] * v_t[d];\n"
+"        }\n"
+"        out_h[d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern \"C\" */\n"
 ;
 
@@ -1080,6 +1626,15 @@ typedef struct {
     void *ffn_gate_w;     /* F16 */
     void *ffn_up_w;       /* F16 */
     void *ffn_down_w;     /* F16 */
+
+    /* BF16 copies for hipBLASLt prefill GEMMs (Phase 2). NULL if not converted. */
+    void *attn_q_w_bf16;
+    void *attn_k_w_bf16;
+    void *attn_v_w_bf16;
+    void *attn_output_w_bf16;
+    void *ffn_gate_w_bf16;
+    void *ffn_up_w_bf16;
+    void *ffn_down_w_bf16;
 
     /* Dimensions for matvec */
     int attn_q_rows, attn_q_cols;
@@ -1198,6 +1753,21 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_tq1_0_f32;
     hipFunction_t fn_matvec_tq2_0_f32;
 
+    /* Phase 2 BF16 helpers */
+    hipFunction_t fn_pack_bf16_from_f32;
+    hipFunction_t fn_convert_f16_to_bf16;
+
+    /* Phase 3 flash-attention helpers */
+    hipFunction_t fn_pack_f16_from_f32;
+    hipFunction_t fn_pack_kv_cache_f16;
+    hipFunction_t fn_rope_neox_batch_f32;
+    hipFunction_t fn_rope_mrope_batch_f32;
+    hipFunction_t fn_kv_cache_store_batch;
+    hipFunction_t fn_flash_attn_wmma_f16_4w_causal;
+
+    /* Phase 4 WMMA decode matvec */
+    hipFunction_t fn_matvec_f16_wmma_f32;
+
     /* Model params */
     int n_layers;
     int n_embd;
@@ -1281,6 +1851,7 @@ struct hip_llm_runner {
 
     /* Host output buffer */
     float *h_output;
+    int    h_output_pinned;       /* 1 = hipHostMalloc-pinned (graph D2H requires this) */
     void *d_logits;
 
     /* Weight loading state */
@@ -1289,6 +1860,51 @@ struct hip_llm_runner {
     /* Deepstack injection state */
     const float *_ds_embd;
     int _ds_embd_stride;
+
+    /* === Phase 2: batched dense path (hipBLASLt) === */
+    int batch_path_ok;          /* 1 if BF16 weights + buffers are ready */
+    int batch_max;              /* maximum M for prefill batch */
+    int gemm_m_threshold;       /* dispatch to batched path when M >= this */
+    /* Activation buffers sized [batch_max, dim]. F32 unless _bf16 suffix. */
+    void *d_x_batch;            /* [BMAX, n_embd] F32 */
+    void *d_xnorm_batch;        /* [BMAX, n_embd] F32 (post-rmsnorm) */
+    void *d_xnorm_batch_bf16;   /* [BMAX, n_embd] BF16 (packed input) */
+    void *d_q_batch;            /* [BMAX, n_heads*head_dim] F32 */
+    void *d_k_batch;            /* [BMAX, kv_dim] F32 */
+    void *d_v_batch;            /* [BMAX, kv_dim] F32 */
+    void *d_attn_out_batch;     /* [BMAX, n_heads*head_dim] F32 */
+    void *d_attn_out_batch_bf16;
+    void *d_attn_proj_batch;    /* [BMAX, n_embd] F32 */
+    void *d_ffn_norm_batch_bf16;/* [BMAX, n_embd] BF16 */
+    void *d_gate_batch;         /* [BMAX, n_ff] F32 */
+    void *d_up_batch;           /* [BMAX, n_ff] F32 */
+    void *d_silu_batch_bf16;    /* [BMAX, n_ff] BF16 */
+    void *d_down_batch;         /* [BMAX, n_embd] F32 */
+
+    /* === Phase 3: flash-attention scratch === */
+    int   fa_path_ok;           /* 1 if FA prefill path is enabled */
+    void *d_q_batch_f16;        /* [BMAX, n_heads*head_dim] F16 */
+    void *d_kv_pack_K_f16;      /* [n_kv_heads, max_seq_len, head_dim] F16 */
+    void *d_kv_pack_V_f16;      /* [n_kv_heads, max_seq_len, head_dim] F16 */
+
+    /* === Phase 4: WMMA decode matvec === */
+    int decode_wmma;            /* 1 = use WMMA matvec for F16 weights at decode */
+
+    /* === Phase 5: HIP graph capture for decode === */
+    hipFunction_t fn_rope_neox_f32_devp;
+    hipFunction_t fn_rope_mrope_f32_devp;
+    hipFunction_t fn_kv_cache_store_devp;
+    hipFunction_t fn_attn_decode_f32_devp;
+    int        *d_position;       /* device int, written via hipMemcpyAsync per token */
+    hipGraph_t  graph_logits;     /* captured forward+lm_head pipeline */
+    hipGraphExec_t graph_exec_logits;
+    hipGraph_t  graph_hidden;     /* captured forward (no lm_head) pipeline */
+    hipGraphExec_t graph_exec_hidden;
+    int         graph_eligible;   /* 1 if model is graph-capturable (set in load_weights) */
+    int         graph_ready_logits;
+    int         graph_ready_hidden;
+    int         graph_disabled;   /* env LLM_GRAPH_DISABLE=1 */
+    int         graph_verbose;    /* env LLM_GRAPH_VERBOSE=1 */
 };
 
 /* ======================================================================== */
@@ -1318,6 +1934,10 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(rope_mrope_f32);
     GET_FUNC(kv_cache_store);
     GET_FUNC(attn_decode_f32);
+    GET_FUNC(rope_neox_f32_devp);
+    GET_FUNC(rope_mrope_f32_devp);
+    GET_FUNC(kv_cache_store_devp);
+    GET_FUNC(attn_decode_f32_devp);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
     GET_FUNC(quantize_f32_to_int8);
@@ -1358,6 +1978,18 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
+
+    GET_FUNC(pack_bf16_from_f32);
+    GET_FUNC(convert_f16_to_bf16);
+
+    GET_FUNC(pack_f16_from_f32);
+    GET_FUNC(pack_kv_cache_f16);
+    GET_FUNC(rope_neox_batch_f32);
+    GET_FUNC(rope_mrope_batch_f32);
+    GET_FUNC(kv_cache_store_batch);
+    GET_FUNC(flash_attn_wmma_f16_4w_causal);
+
+    GET_FUNC(matvec_f16_wmma_f32);
 
     #undef GET_FUNC
 
@@ -1598,8 +2230,28 @@ static qtensor hllm_load_tensor(const gguf_context *gguf, const char *name, int 
 }
 
 /* ======================================================================== */
+/* Forward-declared minimal launch helpers used during weight load.         */
+/* Full launch helpers are defined later, alongside the rest of the kernel  */
+/* surface; load_weights only needs the BF16 conversion + packer kernels.   */
+/* ======================================================================== */
+#ifdef LLM_HIPBLASLT_ENABLED
+#define LAUNCH_CONV(fn, gx, gy, gz, bx, by, bz, smem, stream, args) \
+    hipModuleLaunchKernel(fn, gx, gy, gz, bx, by, bz, smem, stream, args, NULL)
+
+static void launch_convert_f16_to_bf16_loadtime(hip_llm_runner *r, void *dst,
+                                                void *src, int n) {
+    void *args[] = { &dst, &src, &n };
+    LAUNCH_CONV(r->fn_convert_f16_to_bf16, (n + 255) / 256, 1, 1, 256, 1, 1, 0,
+                r->stream, args);
+}
+#endif
+
+/* ======================================================================== */
 /* Public API: load_weights                                                 */
 /* ======================================================================== */
+
+/* Phase 5 graph capture: defined far below (needs launch helpers + body). */
+static void hip_llm_phase5_capture(hip_llm_runner *r);
 
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
@@ -1994,10 +2646,181 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     CHECK_HIP(hipMalloc(&r->d_logits, (size_t)r->n_vocab * sizeof(float)));
 
     int out_sz = r->n_vocab > r->n_embd ? r->n_vocab : r->n_embd;
-    r->h_output = (float *)malloc((size_t)out_sz * sizeof(float));
-    if (!r->h_output) return -1;
+    /* Pinned host memory required by HIP graph captured D2H memcpy nodes. */
+    if (hipHostMalloc((void **)&r->h_output, (size_t)out_sz * sizeof(float),
+                      hipHostMallocDefault) != hipSuccess) {
+        r->h_output = (float *)malloc((size_t)out_sz * sizeof(float));
+        if (!r->h_output) return -1;
+        r->h_output_pinned = 0;
+    } else {
+        r->h_output_pinned = 1;
+    }
+
+    /* === Phase 5: device int for position, written via hipMemcpyAsync per token === */
+    CHECK_HIP(hipMalloc((void **)&r->d_position, sizeof(int)));
+    CHECK_HIP(hipMemset(r->d_position, 0, sizeof(int)));
+
+#ifdef LLM_HIPBLASLT_ENABLED
+    /* === Phase 2: prepare BF16 weight copies + batched activation buffers
+     * for hipBLASLt prefill GEMMs. Only enabled for non-hybrid, non-MoE,
+     * F16-weight dense Qwen3-style models. =================================== */
+    {
+        int batch_max = 512;
+        const char *env_bm = getenv("LLM_BMAX");
+        if (env_bm) batch_max = atoi(env_bm);
+        if (batch_max < 1) batch_max = 1;
+        if (batch_max > 4096) batch_max = 4096;
+        r->batch_max = batch_max;
+
+        int gemm_thresh = 8;
+        const char *env_th = getenv("LLM_GEMM_M_THRESHOLD");
+        if (env_th) gemm_thresh = atoi(env_th);
+        if (gemm_thresh < 1) gemm_thresh = 1;
+        r->gemm_m_threshold = gemm_thresh;
+
+        const char *env_dis = getenv("LLM_BATCH_DISABLE");
+        int disabled = (env_dis && atoi(env_dis) != 0);
+
+        /* Eligibility: dense Qwen3-style only. Hybrid SSM and MoE keep the
+         * per-token path; they're out of scope for v1 batched GEMM routing. */
+        int eligible = !disabled && !r->is_hybrid && !r->is_moe;
+
+        /* Verify all dense F16 weights are present. */
+        if (eligible) {
+            for (int l = 0; l < r->n_layers; l++) {
+                hip_layer *cl = &r->layers[l];
+                if (cl->is_ssm || cl->is_moe) { eligible = 0; break; }
+                if (cl->attn_q_type   != GGML_TYPE_F16) { eligible = 0; break; }
+                if (cl->attn_k_type   != GGML_TYPE_F16) { eligible = 0; break; }
+                if (cl->attn_v_type   != GGML_TYPE_F16) { eligible = 0; break; }
+                if (cl->attn_output_type != GGML_TYPE_F16) { eligible = 0; break; }
+                if (cl->ffn_gate_type != GGML_TYPE_F16) { eligible = 0; break; }
+                if (cl->ffn_up_type   != GGML_TYPE_F16) { eligible = 0; break; }
+                if (cl->ffn_down_type != GGML_TYPE_F16) { eligible = 0; break; }
+            }
+        }
+
+        if (eligible) {
+            if (mm_blaslt_init() != 0) {
+                fprintf(stderr,
+                    "hip_llm: mm_blaslt_init failed; falling back to per-token GEMV\n");
+                eligible = 0;
+            }
+        }
+
+        if (eligible) {
+            int kv_dim = r->n_kv_heads * r->head_dim;
+            int q_dim  = r->n_heads * r->head_dim;
+
+            /* Allocate BF16 weight copies + populate via on-GPU F16->BF16 kernel. */
+            for (int l = 0; l < r->n_layers; l++) {
+                hip_layer *cl = &r->layers[l];
+                size_t n_q  = (size_t)cl->attn_q_rows * cl->attn_q_cols;
+                size_t n_k  = (size_t)cl->attn_k_rows * cl->attn_k_cols;
+                size_t n_v  = (size_t)cl->attn_v_rows * cl->attn_v_cols;
+                size_t n_o  = (size_t)cl->attn_output_rows * cl->attn_output_cols;
+                size_t n_g  = (size_t)cl->ffn_gate_rows * cl->ffn_gate_cols;
+                size_t n_u  = (size_t)cl->ffn_up_rows   * cl->ffn_up_cols;
+                size_t n_d  = (size_t)cl->ffn_down_rows * cl->ffn_down_cols;
+                CHECK_HIP(hipMalloc(&cl->attn_q_w_bf16,      n_q * 2));
+                CHECK_HIP(hipMalloc(&cl->attn_k_w_bf16,      n_k * 2));
+                CHECK_HIP(hipMalloc(&cl->attn_v_w_bf16,      n_v * 2));
+                CHECK_HIP(hipMalloc(&cl->attn_output_w_bf16, n_o * 2));
+                CHECK_HIP(hipMalloc(&cl->ffn_gate_w_bf16,    n_g * 2));
+                CHECK_HIP(hipMalloc(&cl->ffn_up_w_bf16,      n_u * 2));
+                CHECK_HIP(hipMalloc(&cl->ffn_down_w_bf16,    n_d * 2));
+
+                launch_convert_f16_to_bf16_loadtime(r, cl->attn_q_w_bf16,      cl->attn_q_w,      (int)n_q);
+                launch_convert_f16_to_bf16_loadtime(r, cl->attn_k_w_bf16,      cl->attn_k_w,      (int)n_k);
+                launch_convert_f16_to_bf16_loadtime(r, cl->attn_v_w_bf16,      cl->attn_v_w,      (int)n_v);
+                launch_convert_f16_to_bf16_loadtime(r, cl->attn_output_w_bf16, cl->attn_output_w, (int)n_o);
+                launch_convert_f16_to_bf16_loadtime(r, cl->ffn_gate_w_bf16,    cl->ffn_gate_w,    (int)n_g);
+                launch_convert_f16_to_bf16_loadtime(r, cl->ffn_up_w_bf16,      cl->ffn_up_w,      (int)n_u);
+                launch_convert_f16_to_bf16_loadtime(r, cl->ffn_down_w_bf16,    cl->ffn_down_w,    (int)n_d);
+            }
+            hipDeviceSynchronize();
+
+            /* Allocate batched activation buffers. */
+            size_t bm = (size_t)batch_max;
+            CHECK_HIP(hipMalloc(&r->d_x_batch,            bm * r->n_embd * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_xnorm_batch,        bm * r->n_embd * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_xnorm_batch_bf16,   bm * r->n_embd * 2));
+            CHECK_HIP(hipMalloc(&r->d_q_batch,            bm * q_dim    * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_k_batch,            bm * kv_dim   * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_v_batch,            bm * kv_dim   * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_attn_out_batch,     bm * q_dim    * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_attn_out_batch_bf16,bm * q_dim    * 2));
+            CHECK_HIP(hipMalloc(&r->d_attn_proj_batch,    bm * r->n_embd * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_ffn_norm_batch_bf16,bm * r->n_embd * 2));
+            CHECK_HIP(hipMalloc(&r->d_gate_batch,         bm * r->n_ff  * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_up_batch,           bm * r->n_ff  * sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_silu_batch_bf16,    bm * r->n_ff  * 2));
+            CHECK_HIP(hipMalloc(&r->d_down_batch,         bm * r->n_embd * sizeof(float)));
+
+            r->batch_path_ok = 1;
+            if (r->verbose >= 1) {
+                fprintf(stderr,
+                    "hip_llm: Phase-2 batched path enabled (BMAX=%d, threshold=%d)\n",
+                    batch_max, gemm_thresh);
+            }
+
+            /* Phase 3: flash-attention scratch.
+             * Requires head_dim <= 128 and (n_heads % n_kv_heads) == 0. */
+            int fa_disable = 0;
+            const char *fa_disable_env = getenv("LLM_FA_DISABLE");
+            if (fa_disable_env) fa_disable = atoi(fa_disable_env);
+            int fa_eligible = !fa_disable
+                && r->head_dim > 0 && r->head_dim <= 128
+                && r->n_kv_heads > 0
+                && (r->n_heads % r->n_kv_heads) == 0;
+            if (fa_eligible) {
+                size_t kv_pack_elems = (size_t)r->n_kv_heads
+                                     * (size_t)r->max_seq_len
+                                     * (size_t)r->head_dim;
+                CHECK_HIP(hipMalloc(&r->d_q_batch_f16,   bm * (size_t)q_dim * 2));
+                CHECK_HIP(hipMalloc(&r->d_kv_pack_K_f16, kv_pack_elems * 2));
+                CHECK_HIP(hipMalloc(&r->d_kv_pack_V_f16, kv_pack_elems * 2));
+                r->fa_path_ok = 1;
+                if (r->verbose >= 1) {
+                    fprintf(stderr,
+                        "hip_llm: Phase-3 flash-attention path enabled (head_dim=%d kv_pack=%.1f MB)\n",
+                        r->head_dim,
+                        (double)(kv_pack_elems * 2 * 2) / (1024.0 * 1024.0));
+                }
+            } else {
+                r->fa_path_ok = 0;
+                if (r->verbose >= 1) {
+                    fprintf(stderr,
+                        "hip_llm: Phase-3 flash-attention disabled (head_dim=%d, n_heads=%d, n_kv_heads=%d, fa_disable=%d)\n",
+                        r->head_dim, r->n_heads, r->n_kv_heads, fa_disable);
+                }
+            }
+        } else {
+            r->batch_path_ok = 0;
+            if (r->verbose >= 1) {
+                fprintf(stderr,
+                    "hip_llm: Phase-2 batched path disabled (hybrid/moe/quant or LLM_BATCH_DISABLE)\n");
+            }
+        }
+    }
+#endif /* LLM_HIPBLASLT_ENABLED */
+
+    /* === Phase 4: WMMA F16 matvec for decode (gated). =================== */
+    r->decode_wmma = 0;
+    {
+        const char *env_dwmma = getenv("LLM_DECODE_WMMA");
+        if (env_dwmma) r->decode_wmma = atoi(env_dwmma) != 0;
+        if (r->verbose >= 1 && r->decode_wmma) {
+            fprintf(stderr, "hip_llm: Phase-4 WMMA decode matvec enabled\n");
+        }
+    }
 
     r->weights_loaded = 1;
+
+    /* === Phase 5: HIP graph capture (deferred — defined below all launch helpers
+     * and forward_blocks_body). Captures post-embed pipeline so each decode token
+     * issues one hipGraphLaunch instead of ~580 host launches. ============= */
+    hip_llm_phase5_capture(r);
 
     if (r->verbose >= 1) {
         fprintf(stderr, "hip_llm: weights loaded successfully\n");
@@ -2027,6 +2850,15 @@ static inline void launch_rmsnorm(hip_llm_runner *r, void *dst, void *x,
 
 static inline void launch_matvec(hip_llm_runner *r, void *dst, void *mat,
                                   void *x, int n_rows, int n_cols) {
+    /* Phase 4: WMMA path needs n_rows multiple of 16 and n_cols >= 16. */
+    if (r->decode_wmma && (n_rows & 15) == 0 && n_cols >= 16) {
+        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+        int n_blocks = (n_rows + 63) / 64;  /* 4 waves × 16 rows per WG */
+        int smem = n_cols * (int)sizeof(short); /* sm_x_h is _Float16 */
+        LAUNCH(r->fn_matvec_f16_wmma_f32, n_blocks, 1, 1, 128, 1, 1, smem,
+               r->stream, args);
+        return;
+    }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_f16_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
@@ -2072,6 +2904,43 @@ static inline void launch_attention(hip_llm_runner *r, void *out, void *q,
     void *args[] = { &out, &q, &key_cache, &value_cache,
                      &n_heads, &n_kv_heads, &head_dim, &kv_dim, &seq_len, &scale };
     LAUNCH(r->fn_attn_decode_f32, n_heads, 1, 1, 256, 1, 1, smem, r->stream, args);
+}
+
+/* === Phase 5: device-pointer launchers (read position from r->d_position) === */
+static inline void launch_rope_devp(hip_llm_runner *r, void *vec, int n_heads,
+                                     int head_dim, float freq_base) {
+    int half_dim = head_dim / 2;
+    int *pos_p = r->d_position;
+    if (r->use_mrope) {
+        int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
+        int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
+        void *args[] = { &vec, &n_heads, &head_dim, &pos_p,
+                         &freq_base, &s0, &s1, &s2, &s3 };
+        LAUNCH(r->fn_rope_mrope_f32_devp, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    } else {
+        int n_rope_pairs = r->n_rope_pairs;
+        void *args[] = { &vec, &n_heads, &head_dim, &pos_p, &freq_base, &n_rope_pairs };
+        LAUNCH(r->fn_rope_neox_f32_devp, n_heads, 1, 1, half_dim, 1, 1, 0, r->stream, args);
+    }
+}
+
+static inline void launch_kv_store_devp(hip_llm_runner *r, void *key_cache, void *value_cache,
+                                         void *k, void *v, int kv_dim) {
+    int *pos_p = r->d_position;
+    void *args[] = { &key_cache, &value_cache, &k, &v, &pos_p, &kv_dim };
+    LAUNCH(r->fn_kv_cache_store_devp, (kv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
+/* smem_bytes is the worst-case SMEM size — must be sized at capture time
+ * to the maximum seq_len ever expected (max_seq_len * sizeof(float)). */
+static inline void launch_attention_devp(hip_llm_runner *r, void *out, void *q,
+                                          void *key_cache, void *value_cache,
+                                          int n_heads, int n_kv_heads, int head_dim,
+                                          int kv_dim, float scale, size_t smem_bytes) {
+    int *pos_p = r->d_position;
+    void *args[] = { &out, &q, &key_cache, &value_cache,
+                     &n_heads, &n_kv_heads, &head_dim, &kv_dim, &pos_p, &scale };
+    LAUNCH(r->fn_attn_decode_f32_devp, n_heads, 1, 1, 256, 1, 1, smem_bytes, r->stream, args);
 }
 
 static inline void launch_silu_mul(hip_llm_runner *r, void *gate, void *up, int n) {
@@ -2158,6 +3027,102 @@ static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
         case GGML_TYPE_TQ2_0:   launch_matvec_tq2_0(r, dst, mat, x, n_rows, n_cols); break;
         default:             launch_matvec(r, dst, mat, x, n_rows, n_cols); break;
     }
+}
+
+/* Phase 2: BF16 packers */
+static inline void launch_pack_bf16_from_f32(hip_llm_runner *r, void *dst,
+                                             void *src, int n) {
+    void *args[] = { &dst, &src, &n };
+    int n4 = (n + 3) / 4;
+    LAUNCH(r->fn_pack_bf16_from_f32, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
+static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
+                                              void *src, int n) {
+    void *args[] = { &dst, &src, &n };
+    LAUNCH(r->fn_convert_f16_to_bf16, (n + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
+/* Phase 3: FA helpers */
+static inline void launch_pack_f16_from_f32(hip_llm_runner *r, void *dst,
+                                             void *src, int n) {
+    void *args[] = { &dst, &src, &n };
+    int n4 = (n + 3) / 4;
+    LAUNCH(r->fn_pack_f16_from_f32, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
+static inline void launch_pack_kv_cache_f16(hip_llm_runner *r,
+                                             void *dst_k, void *dst_v,
+                                             void *src_k, void *src_v,
+                                             int kv_len, int n_kv_heads, int head_dim) {
+    int block = head_dim < 256 ? head_dim : 256;
+    {
+        void *args[] = { &dst_k, &src_k, &kv_len, &n_kv_heads, &head_dim };
+        LAUNCH(r->fn_pack_kv_cache_f16, kv_len, n_kv_heads, 1, block, 1, 1, 0,
+               r->stream, args);
+    }
+    {
+        void *args[] = { &dst_v, &src_v, &kv_len, &n_kv_heads, &head_dim };
+        LAUNCH(r->fn_pack_kv_cache_f16, kv_len, n_kv_heads, 1, block, 1, 1, 0,
+               r->stream, args);
+    }
+}
+
+static inline void launch_rope_neox_batch(hip_llm_runner *r, void *vec_batch,
+                                           int n_heads, int head_dim,
+                                           int position_start, float freq_base,
+                                           int n_rope_pairs, int row_stride, int M) {
+    int half_dim = head_dim / 2;
+    int block = half_dim;
+    if (block < 1) block = 1;
+    void *args[] = { &vec_batch, &n_heads, &head_dim, &position_start,
+                     &freq_base, &n_rope_pairs, &row_stride };
+    LAUNCH(r->fn_rope_neox_batch_f32, n_heads, M, 1, block, 1, 1, 0,
+           r->stream, args);
+}
+
+static inline void launch_rope_mrope_batch(hip_llm_runner *r, void *vec_batch,
+                                            int n_heads, int head_dim,
+                                            int position_start, float freq_base,
+                                            int s0, int s1, int s2, int s3,
+                                            int row_stride, int M) {
+    int half_dim = head_dim / 2;
+    int block = half_dim;
+    if (block < 1) block = 1;
+    void *args[] = { &vec_batch, &n_heads, &head_dim, &position_start,
+                     &freq_base, &s0, &s1, &s2, &s3, &row_stride };
+    LAUNCH(r->fn_rope_mrope_batch_f32, n_heads, M, 1, block, 1, 1, 0,
+           r->stream, args);
+}
+
+static inline void launch_kv_store_batch(hip_llm_runner *r,
+                                          void *key_cache, void *value_cache,
+                                          void *k_batch, void *v_batch,
+                                          int position_start, int M, int kv_dim) {
+    int total = M * kv_dim;
+    void *args[] = { &key_cache, &value_cache, &k_batch, &v_batch,
+                     &position_start, &M, &kv_dim };
+    LAUNCH(r->fn_kv_cache_store_batch, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
+static inline void launch_flash_attn_causal(hip_llm_runner *r,
+                                             void *out, void *q_f16,
+                                             void *k_f16, void *v_f16,
+                                             int M, int kv_len, int position_start,
+                                             int n_heads, int n_kv_heads, int head_dim,
+                                             float scale) {
+    void *args[] = { &out, &q_f16, &k_f16, &v_f16,
+                     &M, &kv_len, &position_start,
+                     &n_heads, &n_kv_heads, &head_dim, &scale };
+    int q_blocks = (M + 63) / 64;
+    /* Shared mem: 4*16*128 (smK0+smK1+smV0+smV1) + 4*16*16 (smP) f16 = 9216 elems = 18432 B. */
+    int smem_bytes = (4 * 16 * 128 + 4 * 16 * 16) * 2;
+    LAUNCH(r->fn_flash_attn_wmma_f16_4w_causal, n_heads, q_blocks, 1, 128, 1, 1,
+           smem_bytes, r->stream, args);
 }
 
 /* SSM launch helpers */
@@ -2266,6 +3231,7 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
 /* Public API: forward                                                      */
 /* ======================================================================== */
 
+static void forward_blocks_body(hip_llm_runner *r);
 static float *hip_llm_forward_blocks(hip_llm_runner *r, int position);
 
 float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
@@ -2275,7 +3241,7 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
 
     int n_embd = r->n_embd;
 
-    /* 1. Token embedding lookup -> F32 */
+    /* 1. Token embedding lookup -> F32 (outside captured graph) */
     if (r->token_embd_type == GGML_TYPE_Q8_0) {
         launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
@@ -2287,7 +3253,29 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
     return hip_llm_forward_blocks(r, position);
 }
 
+/* Public hidden-state path: writes d_position, then runs body or graph,
+ * does D2H of d_x → h_output, syncs, returns h_output. */
 static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
+    hipMemcpyAsync(r->d_position, &position, sizeof(int),
+                   hipMemcpyHostToDevice, r->stream);
+
+    if (r->graph_ready_hidden) {
+        hipGraphLaunch(r->graph_exec_hidden, r->stream);
+    } else {
+        forward_blocks_body(r);
+        hipMemcpyAsync(r->h_output, r->d_x, (size_t)r->n_embd * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream);
+    }
+    hipStreamSynchronize(r->stream);
+    return r->h_output;
+}
+
+/* Pure kernel sequence: layer loop + final RMSNorm. No sync, no D2H.
+ * Reads position from r->d_position via the *_devp launchers.
+ * Suitable for HIP stream capture (no host syncs in non-MoE/non-SSM/non-debug
+ * paths). MoE and hybrid SSM paths contain hipDeviceSynchronize and are
+ * NOT graph-capturable; graph_eligible must be 0 for those. */
+static void forward_blocks_body(hip_llm_runner *r) {
     int n_embd = r->n_embd;
     int n_heads = r->n_heads;
     int n_kv_heads = r->n_kv_heads;
@@ -2357,17 +3345,17 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
                 if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
             }
 
-            launch_rope(r, r->d_q, n_heads, head_dim, position, r->rope_freq_base);
-            launch_rope(r, r->d_k, n_kv_heads, head_dim, position, r->rope_freq_base);
+            launch_rope_devp(r, r->d_q, n_heads, head_dim, r->rope_freq_base);
+            launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
 
-            launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                           r->d_k, r->d_v, position, kv_dim);
+            launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
+                                 r->d_k, r->d_v, kv_dim);
 
-            int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
-            launch_attention(r, r->d_xb2, r->d_q,
-                           r->d_key_cache[l], r->d_value_cache[l],
-                           n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
+            launch_attention_devp(r, r->d_xb2, r->d_q,
+                                   r->d_key_cache[l], r->d_value_cache[l],
+                                   n_heads, n_kv_heads, head_dim, kv_dim, scale, smem_attn);
 
             int q_dim_local = n_heads * head_dim;
             launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate, q_dim_local);
@@ -2391,17 +3379,17 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
                 if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
             }
 
-            launch_rope(r, r->d_q, n_heads, head_dim, position, r->rope_freq_base);
-            launch_rope(r, r->d_k, n_kv_heads, head_dim, position, r->rope_freq_base);
+            launch_rope_devp(r, r->d_q, n_heads, head_dim, r->rope_freq_base);
+            launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
 
-            launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
-                           r->d_k, r->d_v, position, kv_dim);
+            launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
+                                 r->d_k, r->d_v, kv_dim);
 
-            int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
-            launch_attention(r, r->d_xb2, r->d_q,
-                           r->d_key_cache[l], r->d_value_cache[l],
-                           n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
+            launch_attention_devp(r, r->d_xb2, r->d_q,
+                                   r->d_key_cache[l], r->d_value_cache[l],
+                                   n_heads, n_kv_heads, head_dim, kv_dim, scale, smem_attn);
 
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
@@ -2507,27 +3495,399 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
 
     /* Final RMSNorm */
     launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, n_embd, eps);
+}
 
-    /* Copy result to host */
-    hipMemcpyAsync(r->h_output, r->d_x, n_embd * sizeof(float),
-                  hipMemcpyDeviceToHost, r->stream);
-    hipStreamSynchronize(r->stream);
+/* === Phase 5 graph capture =============================================== */
+static void hip_llm_phase5_capture(hip_llm_runner *r) {
+    r->graph_disabled = 0;
+    r->graph_verbose  = 0;
+    const char *env_gd = getenv("LLM_GRAPH_DISABLE");
+    const char *env_gv = getenv("LLM_GRAPH_VERBOSE");
+    if (env_gd) r->graph_disabled = atoi(env_gd) != 0;
+    if (env_gv) r->graph_verbose  = atoi(env_gv) != 0;
 
-    return r->h_output;
+    /* DeepStack only fires when r->_ds_embd is set (forward_embd path).
+     * Decode (forward → forward_blocks_body with _ds_embd==NULL) skips it,
+     * so it's safe to capture for n_deepstack>0 models like Qwen3-VL. */
+    r->graph_eligible =
+        !r->is_moe && !r->is_hybrid && !r->debug_layers;
+
+    if (!r->graph_eligible || r->graph_disabled) {
+        if (r->verbose >= 1) {
+            fprintf(stderr,
+                    "hip_llm: Phase-5 graph capture skipped (eligible=%d disabled=%d)\n",
+                    r->graph_eligible, r->graph_disabled);
+        }
+        return;
+    }
+
+    if (!hipStreamBeginCapture || !hipStreamEndCapture ||
+        !hipGraphInstantiate || !hipGraphLaunch) {
+        if (r->verbose >= 1) {
+            fprintf(stderr,
+                    "hip_llm: Phase-5 graph capture skipped (HIP graph symbols unavailable)\n");
+        }
+        return;
+    }
+
+    int warm_pos = 0;
+    hipMemcpy(r->d_position, &warm_pos, sizeof(int), hipMemcpyHostToDevice);
+
+    /* --- logits graph: blocks + final norm + lm_head + D2H of d_logits --- */
+    if (r->has_lm_head) {
+        hipError_t err = hipStreamBeginCapture(r->stream,
+                                               hipStreamCaptureModeThreadLocal);
+        if (err == hipSuccess) {
+            forward_blocks_body(r);
+            launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
+                               r->n_vocab, r->n_embd, r->output_w_type);
+            hipMemcpyAsync(r->h_output, r->d_logits,
+                           (size_t)r->n_vocab * sizeof(float),
+                           hipMemcpyDeviceToHost, r->stream);
+            err = hipStreamEndCapture(r->stream, &r->graph_logits);
+            if (err == hipSuccess && r->graph_logits) {
+                err = hipGraphInstantiate(&r->graph_exec_logits, r->graph_logits,
+                                          NULL, NULL, 0);
+                if (err == hipSuccess) r->graph_ready_logits = 1;
+            }
+        }
+        if (!r->graph_ready_logits && r->verbose >= 1) {
+            fprintf(stderr,
+                    "hip_llm: Phase-5 logits graph capture failed (err=%d)\n",
+                    (int)err);
+        }
+    }
+
+    /* --- hidden graph: blocks + final norm + D2H of d_x ------------------ */
+    {
+        hipError_t err = hipStreamBeginCapture(r->stream,
+                                               hipStreamCaptureModeThreadLocal);
+        if (err == hipSuccess) {
+            forward_blocks_body(r);
+            hipMemcpyAsync(r->h_output, r->d_x,
+                           (size_t)r->n_embd * sizeof(float),
+                           hipMemcpyDeviceToHost, r->stream);
+            err = hipStreamEndCapture(r->stream, &r->graph_hidden);
+            if (err == hipSuccess && r->graph_hidden) {
+                err = hipGraphInstantiate(&r->graph_exec_hidden, r->graph_hidden,
+                                          NULL, NULL, 0);
+                if (err == hipSuccess) r->graph_ready_hidden = 1;
+            }
+        }
+        if (!r->graph_ready_hidden && r->verbose >= 1) {
+            fprintf(stderr,
+                    "hip_llm: Phase-5 hidden graph capture failed (err=%d)\n",
+                    (int)err);
+        }
+    }
+
+    if (r->verbose >= 1 || r->graph_verbose) {
+        fprintf(stderr,
+                "hip_llm: Phase-5 graph capture: logits=%d hidden=%d\n",
+                r->graph_ready_logits, r->graph_ready_hidden);
+    }
 }
 
 float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position) {
-    float *hidden = hip_llm_forward(r, token_id, position);
-    if (!hidden || !r->has_lm_head) return NULL;
+    if (!r || !r->weights_loaded) return NULL;
+    if (token_id < 0 || token_id >= r->n_vocab) return NULL;
+    if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (!r->has_lm_head) return NULL;
 
-    launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
-                       r->n_vocab, r->n_embd, r->output_w_type);
+    int n_embd = r->n_embd;
 
-    hipMemcpyAsync(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float),
-                  hipMemcpyDeviceToHost, r->stream);
+    /* Embed (outside captured graph — token_id varies) */
+    if (r->token_embd_type == GGML_TYPE_Q8_0) {
+        launch_embed_q8_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
+        launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else {
+        launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    }
+
+    /* Position is consumed by *_devp launchers via r->d_position */
+    hipMemcpyAsync(r->d_position, &position, sizeof(int),
+                   hipMemcpyHostToDevice, r->stream);
+
+    if (r->graph_ready_logits) {
+        hipGraphLaunch(r->graph_exec_logits, r->stream);
+    } else {
+        forward_blocks_body(r);
+        launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
+                           r->n_vocab, r->n_embd, r->output_w_type);
+        hipMemcpyAsync(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream);
+    }
     hipStreamSynchronize(r->stream);
-
     return r->h_output;
+}
+
+/* ---- Batched forward (Phase 2: hipBLASLt-routed dense path) ---- */
+
+#ifdef LLM_HIPBLASLT_ENABLED
+/* Run a single dense Qwen3 transformer block over [M, n_embd] activations.
+ * d_x_in is [M, n_embd] F32; output is written into d_x_in (in place).
+ * KV cache stride matches the per-token path.
+ *
+ * Strategy: for the 7 dense GEMMs (Q/K/V/O/gate/up/down) we issue a single
+ * hipBLASLt call per (M, N, K) shape. For lightweight ops (rmsnorm, qknorm,
+ * rope, kv_store, attention, residual) we loop over the M rows using the
+ * existing per-row kernels — these are not the bottleneck.
+ *
+ * Returns 0 on success, -1 on error. */
+static int forward_block_batched_dense(hip_llm_runner *r, int M,
+                                       int position_start) {
+    int n_embd     = r->n_embd;
+    int n_heads    = r->n_heads;
+    int n_kv_heads = r->n_kv_heads;
+    int head_dim   = r->head_dim;
+    int kv_dim     = n_kv_heads * head_dim;
+    int q_dim      = n_heads * head_dim;
+    int n_ff       = r->n_ff;
+    float eps      = r->rms_norm_eps;
+    float scale    = 1.0f / sqrtf((float)head_dim);
+
+    int n_run_layers = r->n_layers;
+    if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
+
+    for (int l = 0; l < n_run_layers; l++) {
+        hip_layer *cl = &r->layers[l];
+
+        /* ---- Pre-attention RMSNorm (M rows) ---- */
+        for (int m = 0; m < M; m++) {
+            float *xrow  = (float *)r->d_x_batch     + (size_t)m * n_embd;
+            float *xnrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
+            launch_rmsnorm(r, xnrow, xrow, cl->attn_norm_w, n_embd, eps);
+        }
+
+        /* Pack BF16 input (single launch over M*n_embd) */
+        launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16,
+                                  r->d_xnorm_batch, M * n_embd);
+
+        /* ---- Q/K/V GEMMs (3 hipBLASLt calls) ---- */
+        if (mm_blaslt_run_bf16(r->d_q_batch, cl->attn_q_w_bf16,
+                               r->d_xnorm_batch_bf16, M, q_dim,  n_embd, r->stream) != 0) return -1;
+        if (mm_blaslt_run_bf16(r->d_k_batch, cl->attn_k_w_bf16,
+                               r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+        if (mm_blaslt_run_bf16(r->d_v_batch, cl->attn_v_w_bf16,
+                               r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+
+        /* ---- Per-row biases / QK-norm (M rows) ---- */
+        for (int m = 0; m < M; m++) {
+            float *qrow = (float *)r->d_q_batch + (size_t)m * q_dim;
+            float *krow = (float *)r->d_k_batch + (size_t)m * kv_dim;
+            float *vrow = (float *)r->d_v_batch + (size_t)m * kv_dim;
+
+            if (cl->attn_q_bias) launch_add(r, qrow, cl->attn_q_bias, q_dim);
+            if (cl->attn_k_bias) launch_add(r, krow, cl->attn_k_bias, kv_dim);
+            if (cl->attn_v_bias) launch_add(r, vrow, cl->attn_v_bias, kv_dim);
+
+            if (cl->has_qk_norm) {
+                if (cl->attn_q_norm_w) launch_qknorm(r, qrow, cl->attn_q_norm_w, n_heads,    head_dim, eps);
+                if (cl->attn_k_norm_w) launch_qknorm(r, krow, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
+            }
+        }
+
+        /* ---- Batched RoPE on Q and K (one launch each, grid=(n_heads, M)) ---- */
+        if (r->use_mrope) {
+            int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
+            int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
+            launch_rope_mrope_batch(r, r->d_q_batch, n_heads,    head_dim,
+                                    position_start, r->rope_freq_base,
+                                    s0, s1, s2, s3, q_dim,  M);
+            launch_rope_mrope_batch(r, r->d_k_batch, n_kv_heads, head_dim,
+                                    position_start, r->rope_freq_base,
+                                    s0, s1, s2, s3, kv_dim, M);
+        } else {
+            launch_rope_neox_batch(r, r->d_q_batch, n_heads,    head_dim,
+                                   position_start, r->rope_freq_base,
+                                   r->n_rope_pairs, q_dim,  M);
+            launch_rope_neox_batch(r, r->d_k_batch, n_kv_heads, head_dim,
+                                   position_start, r->rope_freq_base,
+                                   r->n_rope_pairs, kv_dim, M);
+        }
+
+        /* ---- Batched KV cache store (M rows in one launch) ---- */
+        launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
+                              r->d_k_batch, r->d_v_batch,
+                              position_start, M, kv_dim);
+
+        /* ---- Attention: WMMA flash-attention if eligible, else per-row scalar ---- */
+        if (r->fa_path_ok) {
+            int kv_len = position_start + M;
+            /* Pack K/V cache slice [0..kv_len) into transposed F16 scratch. */
+            launch_pack_kv_cache_f16(r,
+                                     r->d_kv_pack_K_f16, r->d_kv_pack_V_f16,
+                                     r->d_key_cache[l],  r->d_value_cache[l],
+                                     kv_len, n_kv_heads, head_dim);
+            /* Pack Q [M, q_dim] -> F16. */
+            launch_pack_f16_from_f32(r, r->d_q_batch_f16, r->d_q_batch, M * q_dim);
+            /* Single FA grid launch. */
+            launch_flash_attn_causal(r,
+                                     r->d_attn_out_batch, r->d_q_batch_f16,
+                                     r->d_kv_pack_K_f16,  r->d_kv_pack_V_f16,
+                                     M, kv_len, position_start,
+                                     n_heads, n_kv_heads, head_dim, scale);
+        } else {
+            for (int m = 0; m < M; m++) {
+                int pos = position_start + m;
+                float *qrow = (float *)r->d_q_batch + (size_t)m * q_dim;
+                float *orow = (float *)r->d_attn_out_batch + (size_t)m * q_dim;
+                int seq_len = pos + 1;
+                launch_attention(r, orow, qrow,
+                                 r->d_key_cache[l], r->d_value_cache[l],
+                                 n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale);
+            }
+        }
+
+        /* ---- Output projection: [M, q_dim] x W_o^T -> [M, n_embd] ---- */
+        launch_pack_bf16_from_f32(r, r->d_attn_out_batch_bf16,
+                                  r->d_attn_out_batch, M * q_dim);
+        if (mm_blaslt_run_bf16(r->d_attn_proj_batch, cl->attn_output_w_bf16,
+                               r->d_attn_out_batch_bf16, M, n_embd, q_dim, r->stream) != 0) return -1;
+
+        /* Residual: x_batch += attn_proj */
+        launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
+
+        /* ---- Pre-FFN RMSNorm (M rows) ---- */
+        for (int m = 0; m < M; m++) {
+            float *xrow  = (float *)r->d_x_batch     + (size_t)m * n_embd;
+            float *xnrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
+            launch_rmsnorm(r, xnrow, xrow, cl->ffn_norm_w, n_embd, eps);
+        }
+        launch_pack_bf16_from_f32(r, r->d_ffn_norm_batch_bf16,
+                                  r->d_xnorm_batch, M * n_embd);
+
+        /* ---- gate/up GEMMs ---- */
+        if (mm_blaslt_run_bf16(r->d_gate_batch, cl->ffn_gate_w_bf16,
+                               r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+        if (mm_blaslt_run_bf16(r->d_up_batch,   cl->ffn_up_w_bf16,
+                               r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+
+        /* SiLU(gate) * up — elementwise across [M, n_ff] */
+        launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+
+        /* Pack and down projection */
+        launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
+                                  r->d_gate_batch, M * n_ff);
+        if (mm_blaslt_run_bf16(r->d_down_batch, cl->ffn_down_w_bf16,
+                               r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
+
+        /* Residual */
+        launch_add(r, r->d_x_batch, r->d_down_batch, M * n_embd);
+
+        /* DeepStack injection (per-row) — keep parity with per-token path */
+        if (r->_ds_embd && l < r->n_deepstack && r->_ds_embd_stride > n_embd) {
+            for (int m = 0; m < M; m++) {
+                const float *ds_slice = r->_ds_embd
+                    + (size_t)m * r->_ds_embd_stride
+                    + (size_t)(1 + l) * n_embd;
+                float *xrow = (float *)r->d_x_batch + (size_t)m * n_embd;
+                hipMemcpyAsync(r->d_ds_tmp, (const void *)ds_slice, n_embd * sizeof(float),
+                               hipMemcpyHostToDevice, r->stream);
+                launch_add(r, xrow, r->d_ds_tmp, n_embd);
+            }
+        }
+    }
+
+    /* ---- Final RMSNorm (M rows) ---- */
+    for (int m = 0; m < M; m++) {
+        float *xrow = (float *)r->d_x_batch + (size_t)m * n_embd;
+        launch_rmsnorm(r, xrow, xrow, r->d_output_norm, n_embd, eps);
+    }
+
+    /* Copy last row into r->d_x so callers (and lm_head path) see the result. */
+    float *last_row = (float *)r->d_x_batch + (size_t)(M - 1) * n_embd;
+    hipMemcpyAsync(r->d_x, last_row, (size_t)n_embd * sizeof(float),
+                   hipMemcpyDeviceToDevice, r->stream);
+    hipStreamSynchronize(r->stream);
+    return 0;
+}
+
+static int batched_path_eligible(const hip_llm_runner *r, int M) {
+    if (!r->batch_path_ok) return 0;
+    if (M < r->gemm_m_threshold) return 0;
+    if (M > r->batch_max) return 0;
+    if (r->_ds_embd != NULL) return 0;  /* DeepStack handled in embed path only */
+    return 1;
+}
+
+/* Embed M tokens into d_x_batch [M, n_embd] F32 using existing embed kernels.
+ * Each row is one token. Reuses launch_embed* helpers (per-row launches). */
+static int embed_tokens_batch(hip_llm_runner *r,
+                              const int32_t *tokens, int M) {
+    int n_embd = r->n_embd;
+    for (int m = 0; m < M; m++) {
+        int32_t tid = tokens[m];
+        if (tid < 0 || tid >= r->n_vocab) return -1;
+        float *row = (float *)r->d_x_batch + (size_t)m * n_embd;
+        if (r->token_embd_type == GGML_TYPE_Q8_0) {
+            launch_embed_q8_0(r, row, r->d_token_embd, tid, n_embd);
+        } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
+            launch_embed_q2_K(r, row, r->d_token_embd, tid, n_embd);
+        } else {
+            launch_embed(r, row, r->d_token_embd, tid, n_embd);
+        }
+    }
+    return 0;
+}
+#endif /* LLM_HIPBLASLT_ENABLED */
+
+/* ---- Batched forward entry points ---- */
+float *hip_llm_forward_batch(hip_llm_runner *r,
+                             const int32_t *tokens, int n_tokens,
+                             int position_start) {
+    if (!r || !r->weights_loaded || !tokens || n_tokens <= 0) return NULL;
+    if (position_start < 0) return NULL;
+    if (position_start + n_tokens > r->max_seq_len) return NULL;
+
+#ifdef LLM_HIPBLASLT_ENABLED
+    if (batched_path_eligible(r, n_tokens)) {
+        if (embed_tokens_batch(r, tokens, n_tokens) != 0) return NULL;
+        if (forward_block_batched_dense(r, n_tokens, position_start) != 0) return NULL;
+        /* Returning NULL hidden buffer for now — callers needing logits use
+         * forward_batch_logits. Most call sites only ask for the next token. */
+        return (float *)r->d_x;
+    }
+#endif
+
+    /* Fallback: per-token loop using existing kernels. */
+    float *out = NULL;
+    for (int i = 0; i < n_tokens; i++) {
+        out = hip_llm_forward(r, tokens[i], position_start + i);
+        if (!out) return NULL;
+    }
+    return out;
+}
+
+float *hip_llm_forward_batch_logits(hip_llm_runner *r,
+                                    const int32_t *tokens, int n_tokens,
+                                    int position_start) {
+    if (!r || !r->weights_loaded || !tokens || n_tokens <= 0) return NULL;
+    if (position_start < 0) return NULL;
+    if (position_start + n_tokens > r->max_seq_len) return NULL;
+
+#ifdef LLM_HIPBLASLT_ENABLED
+    if (batched_path_eligible(r, n_tokens)) {
+        if (embed_tokens_batch(r, tokens, n_tokens) != 0) return NULL;
+        if (forward_block_batched_dense(r, n_tokens, position_start) != 0) return NULL;
+        if (!r->has_lm_head) return NULL;
+        /* lm_head only on last token — d_x already holds the last hidden row. */
+        launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
+                           r->n_vocab, r->n_embd, r->output_w_type);
+        hipMemcpyAsync(r->h_output, r->d_logits, (size_t)r->n_vocab * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream);
+        hipStreamSynchronize(r->stream);
+        return r->h_output;
+    }
+#endif
+
+    /* Fallback */
+    for (int i = 0; i < n_tokens - 1; i++) {
+        if (!hip_llm_forward(r, tokens[i], position_start + i)) return NULL;
+    }
+    return hip_llm_forward_logits(r, tokens[n_tokens - 1],
+                                  position_start + n_tokens - 1);
 }
 
 float *hip_llm_forward_embd(hip_llm_runner *r, const float *embd, int embd_stride, int position) {
@@ -2577,6 +3937,32 @@ void hip_llm_set_max_layers(hip_llm_runner *r, int max_layers) {
     if (r) r->max_layers = max_layers;
 }
 
+/* Toggle Phase-2 batched path. Setting enable=0 forces hip_llm_forward_batch
+ * to fall through to the per-token loop. Setting enable=1 only takes effect if
+ * the path was eligible at load time (i.e., dense F16 model + LLM_HIPBLASLT_ENABLED). */
+void hip_llm_set_batched_path(hip_llm_runner *r, int enable) {
+    if (!r) return;
+#ifdef LLM_HIPBLASLT_ENABLED
+    /* Only flip on if buffers + BF16 weights are actually present. */
+    if (enable) {
+        r->batch_path_ok = (r->d_x_batch != NULL) ? 1 : 0;
+    } else {
+        r->batch_path_ok = 0;
+    }
+#else
+    (void)enable;
+#endif
+}
+
+int hip_llm_batched_path_available(const hip_llm_runner *r) {
+#ifdef LLM_HIPBLASLT_ENABLED
+    return r ? (r->d_x_batch != NULL) : 0;
+#else
+    (void)r;
+    return 0;
+#endif
+}
+
 /* ======================================================================== */
 /* Public API: free                                                         */
 /* ======================================================================== */
@@ -2595,6 +3981,26 @@ void hip_llm_offload(hip_llm_runner *r) {
     if (r->d_xb_q)    { hipFree(r->d_xb_q);    r->d_xb_q = NULL; }
     if (r->d_xb_scale){ hipFree(r->d_xb_scale); r->d_xb_scale = NULL; }
     if (r->d_logits)  { hipFree(r->d_logits);   r->d_logits = NULL; }
+    /* Phase 2 batched buffers */
+    if (r->d_x_batch)             { hipFree(r->d_x_batch);             r->d_x_batch = NULL; }
+    if (r->d_xnorm_batch)         { hipFree(r->d_xnorm_batch);         r->d_xnorm_batch = NULL; }
+    if (r->d_xnorm_batch_bf16)    { hipFree(r->d_xnorm_batch_bf16);    r->d_xnorm_batch_bf16 = NULL; }
+    if (r->d_q_batch)             { hipFree(r->d_q_batch);             r->d_q_batch = NULL; }
+    if (r->d_k_batch)             { hipFree(r->d_k_batch);             r->d_k_batch = NULL; }
+    if (r->d_v_batch)             { hipFree(r->d_v_batch);             r->d_v_batch = NULL; }
+    if (r->d_attn_out_batch)      { hipFree(r->d_attn_out_batch);      r->d_attn_out_batch = NULL; }
+    if (r->d_attn_out_batch_bf16) { hipFree(r->d_attn_out_batch_bf16); r->d_attn_out_batch_bf16 = NULL; }
+    if (r->d_attn_proj_batch)     { hipFree(r->d_attn_proj_batch);     r->d_attn_proj_batch = NULL; }
+    if (r->d_ffn_norm_batch_bf16) { hipFree(r->d_ffn_norm_batch_bf16); r->d_ffn_norm_batch_bf16 = NULL; }
+    if (r->d_gate_batch)          { hipFree(r->d_gate_batch);          r->d_gate_batch = NULL; }
+    if (r->d_up_batch)            { hipFree(r->d_up_batch);            r->d_up_batch = NULL; }
+    if (r->d_silu_batch_bf16)     { hipFree(r->d_silu_batch_bf16);     r->d_silu_batch_bf16 = NULL; }
+    if (r->d_down_batch)          { hipFree(r->d_down_batch);          r->d_down_batch = NULL; }
+    if (r->d_q_batch_f16)         { hipFree(r->d_q_batch_f16);         r->d_q_batch_f16 = NULL; }
+    if (r->d_kv_pack_K_f16)       { hipFree(r->d_kv_pack_K_f16);       r->d_kv_pack_K_f16 = NULL; }
+    if (r->d_kv_pack_V_f16)       { hipFree(r->d_kv_pack_V_f16);       r->d_kv_pack_V_f16 = NULL; }
+    r->fa_path_ok = 0;
+    r->batch_path_ok = 0;
     if (r->d_token_embd) { hipFree(r->d_token_embd); r->d_token_embd = NULL; }
     if (r->d_output_norm){ hipFree(r->d_output_norm); r->d_output_norm = NULL; }
     if (r->d_output_w && r->d_output_w != r->d_token_embd) { hipFree(r->d_output_w); }
@@ -2650,6 +4056,25 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_xb_q)    hipFree(r->d_xb_q);
     if (r->d_xb_scale) hipFree(r->d_xb_scale);
 
+    /* Phase 2 batched buffers */
+    if (r->d_x_batch)             hipFree(r->d_x_batch);
+    if (r->d_xnorm_batch)         hipFree(r->d_xnorm_batch);
+    if (r->d_xnorm_batch_bf16)    hipFree(r->d_xnorm_batch_bf16);
+    if (r->d_q_batch)             hipFree(r->d_q_batch);
+    if (r->d_k_batch)             hipFree(r->d_k_batch);
+    if (r->d_v_batch)             hipFree(r->d_v_batch);
+    if (r->d_attn_out_batch)      hipFree(r->d_attn_out_batch);
+    if (r->d_attn_out_batch_bf16) hipFree(r->d_attn_out_batch_bf16);
+    if (r->d_attn_proj_batch)     hipFree(r->d_attn_proj_batch);
+    if (r->d_ffn_norm_batch_bf16) hipFree(r->d_ffn_norm_batch_bf16);
+    if (r->d_gate_batch)          hipFree(r->d_gate_batch);
+    if (r->d_up_batch)            hipFree(r->d_up_batch);
+    if (r->d_silu_batch_bf16)     hipFree(r->d_silu_batch_bf16);
+    if (r->d_down_batch)          hipFree(r->d_down_batch);
+    if (r->d_q_batch_f16)         hipFree(r->d_q_batch_f16);
+    if (r->d_kv_pack_K_f16)       hipFree(r->d_kv_pack_K_f16);
+    if (r->d_kv_pack_V_f16)       hipFree(r->d_kv_pack_V_f16);
+
     if (r->d_key_cache) {
         for (int l = 0; l < r->n_layers; l++) {
             if (r->d_key_cache[l]) hipFree(r->d_key_cache[l]);
@@ -2680,6 +4105,13 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->ffn_gate_w)    hipFree(cl->ffn_gate_w);
             if (cl->ffn_up_w)     hipFree(cl->ffn_up_w);
             if (cl->ffn_down_w)   hipFree(cl->ffn_down_w);
+            if (cl->attn_q_w_bf16)      hipFree(cl->attn_q_w_bf16);
+            if (cl->attn_k_w_bf16)      hipFree(cl->attn_k_w_bf16);
+            if (cl->attn_v_w_bf16)      hipFree(cl->attn_v_w_bf16);
+            if (cl->attn_output_w_bf16) hipFree(cl->attn_output_w_bf16);
+            if (cl->ffn_gate_w_bf16)    hipFree(cl->ffn_gate_w_bf16);
+            if (cl->ffn_up_w_bf16)      hipFree(cl->ffn_up_w_bf16);
+            if (cl->ffn_down_w_bf16)    hipFree(cl->ffn_down_w_bf16);
             if (cl->ssm_qkv_w)      hipFree(cl->ssm_qkv_w);
             if (cl->ssm_gate_w)     hipFree(cl->ssm_gate_w);
             if (cl->ssm_alpha_w)    hipFree(cl->ssm_alpha_w);
@@ -2708,9 +4140,21 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_output_w && r->d_output_w != r->d_token_embd) hipFree(r->d_output_w);
     if (r->d_logits) hipFree(r->d_logits);
 
+    /* === Phase 5: graph + device-int cleanup === */
+    if (r->graph_exec_logits) hipGraphExecDestroy(r->graph_exec_logits);
+    if (r->graph_logits)      hipGraphDestroy(r->graph_logits);
+    if (r->graph_exec_hidden) hipGraphExecDestroy(r->graph_exec_hidden);
+    if (r->graph_hidden)      hipGraphDestroy(r->graph_hidden);
+    if (r->d_position)        hipFree(r->d_position);
+
     if (r->module) hipModuleUnload(r->module);
 
-    free(r->h_output);
+#ifdef LLM_HIPBLASLT_ENABLED
+    mm_blaslt_destroy();
+#endif
+
+    if (r->h_output_pinned) hipHostFree(r->h_output);
+    else                    free(r->h_output);
 
     if (r->stream) hipStreamDestroy(r->stream);
 
