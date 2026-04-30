@@ -268,6 +268,11 @@ Two files land next to the image:
 | `dancing.obj`              | OBJ    | 18 439 vertices · 36 874 triangle faces (camera-space metres, post Y/Z flip)            |
 | `dancing.obj.json`         | JSON   | `bbox` (px), `image{w,h}`, `focal_px`, `cam_t[3]`, `mhr_params[519]`, `keypoints_3d[70][3]` (m), `keypoints_2d[70][2]` (px in original image) |
 
+Use `-o dancing.glb` to write the same mesh as binary glTF/GLB. The
+sidecar is still written next to it as `dancing.glb.json`. Body GLB
+export is geometry-only for now; unlike SAM 3D Objects there is no
+decoder RGB or pointmap texture source in the body runner.
+
 `mhr_params` is the raw 519-vector after the regression head (pose +
 shape decoded by `decode_pose_raw`); pair with the published MHR
 kintree if you need joint angles. `cam_t` is the camera translation in
@@ -299,6 +304,9 @@ cd cuda/sam3d_body
 
 Wall time on a recent NVIDIA card: ≈3 s (≈10× CPU). Vertex / keypoint
 agreement with the CPU runner is at ≈1e-6 m (see drift table — "End-to-end (CUDA)").
+The CUDA CLI now mirrors CPU output metadata: `.obj.json` / `.glb.json`
+sidecars include bbox, image size, focal, camera translation, MHR params,
+and 3D/2D keypoints.
 
 ## Web demo (3-pane: input / ours / pytorch, 2026-04-27)
 
@@ -371,6 +379,11 @@ When `bbox` is omitted, the server runs ours first (auto-bbox via
 RT-DETR-S) and feeds the resulting bbox into the pytorch backend so
 both meshes are produced for the same crop. The pytorch backend has no
 person detector bundled and always requires a bbox.
+
+The newer single-backend `ref/sam3d-body/sam3d_body_server.py` accepts
+`params.output_format: "obj"|"glb"` for the C runner backends and returns
+`outputs[0].mime` as `model/obj` or `model/gltf-binary`. PyTorch remains
+OBJ-only.
 
 ### Verified
 
