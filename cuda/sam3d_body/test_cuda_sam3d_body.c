@@ -16,6 +16,10 @@
 #define OBJ_WRITER_IMPLEMENTATION
 #include "../../common/obj_writer.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define TINY_GLTF_IMPLEMENTATION
+#include "../../common/tiny_gltf.h"
+
 /* SAFETENSORS_IMPLEMENTATION is supplied by cuda_sam3d_body_runner.c. */
 #include "../../common/safetensors.h"
 
@@ -48,6 +52,80 @@ static void print_usage(const char *prog)
             "[--precision bf16|fp16] [--device N] [-v]\n"
             "  %s SFT_DIR IMG.jpg ...   (legacy positional)\n",
             prog, prog);
+}
+
+static int has_suffix(const char *s, const char *suffix)
+{
+    if (!s || !suffix) return 0;
+    size_t ns = strlen(s), nx = strlen(suffix);
+    return ns >= nx && strcmp(s + ns - nx, suffix) == 0;
+}
+
+static int write_body_mesh(const char *path,
+                           const float *verts, int nv,
+                           const int32_t *faces, int nf)
+{
+    if (has_suffix(path, ".glb")) {
+        int *tri = (int *)malloc((size_t)nf * 3 * sizeof(int));
+        if (!tri) return 1;
+        for (int i = 0; i < nf * 3; i++) tri[i] = (int)faces[i];
+        int rc = tinygltf_write_glb_mesh(path, verts, nv, tri, nf);
+        free(tri);
+        return rc == 0 ? 0 : 1;
+    }
+    return obj_write(path, verts, nv, faces, nf);
+}
+
+static void write_sidecar_json(cuda_sam3d_body_ctx *ctx,
+                               const char *out_path,
+                               const float bbox[4], int has_bbox,
+                               int iw, int ih)
+{
+    char json_path[1024];
+    snprintf(json_path, sizeof(json_path), "%s.json", out_path);
+    FILE *jf = fopen(json_path, "w");
+    if (!jf) return;
+
+    int np = 0; cuda_sam3d_body_get_mhr_params(ctx, NULL, &np);
+    int nk3 = 0, nk2 = 0;
+    cuda_sam3d_body_get_keypoints_3d(ctx, NULL, &nk3);
+    cuda_sam3d_body_get_keypoints_2d(ctx, NULL, &nk2);
+    float *mp = np  ? (float *)malloc((size_t)np  * sizeof(float)) : NULL;
+    float *k3 = nk3 ? (float *)malloc((size_t)nk3 * 3 * sizeof(float)) : NULL;
+    float *k2 = nk2 ? (float *)malloc((size_t)nk2 * 2 * sizeof(float)) : NULL;
+    float cam_t[3] = {0}, focal_px = 0;
+    if (mp) cuda_sam3d_body_get_mhr_params(ctx, mp, &np);
+    if (k3) cuda_sam3d_body_get_keypoints_3d(ctx, k3, &nk3);
+    if (k2) cuda_sam3d_body_get_keypoints_2d(ctx, k2, &nk2);
+    cuda_sam3d_body_get_cam(ctx, cam_t, &focal_px);
+
+    fprintf(jf, "{\n");
+    if (has_bbox)
+        fprintf(jf, "  \"bbox\": [%.3f, %.3f, %.3f, %.3f],\n",
+                bbox[0], bbox[1], bbox[2], bbox[3]);
+    fprintf(jf, "  \"image\": {\"width\": %d, \"height\": %d},\n", iw, ih);
+    fprintf(jf, "  \"focal_px\": %.6f,\n", focal_px);
+    fprintf(jf, "  \"cam_t\": [%.6f, %.6f, %.6f],\n",
+            cam_t[0], cam_t[1], cam_t[2]);
+    fprintf(jf, "  \"mhr_params\": [");
+    for (int i = 0; i < np; i++)
+        fprintf(jf, "%s%.6g", i ? "," : "", mp[i]);
+    fprintf(jf, "],\n");
+    fprintf(jf, "  \"keypoints_3d\": [");
+    for (int i = 0; i < nk3; i++)
+        fprintf(jf, "%s[%.6f,%.6f,%.6f]", i ? "," : "",
+                k3[i*3+0], k3[i*3+1], k3[i*3+2]);
+    fprintf(jf, "],\n");
+    fprintf(jf, "  \"keypoints_2d\": [");
+    for (int i = 0; i < nk2; i++)
+        fprintf(jf, "%s[%.3f,%.3f]", i ? "," : "",
+                k2[i*2+0], k2[i*2+1]);
+    fprintf(jf, "]\n}\n");
+    fclose(jf);
+    free(mp); free(k3); free(k2);
+    fprintf(stderr, "[test_cuda_sam3d_body] wrote %s "
+                    "(mhr_params=%d kp3d=%d kp2d=%d)\n",
+            json_path, np, nk3, nk2);
 }
 
 int main(int argc, char **argv)
@@ -190,19 +268,22 @@ int main(int argc, char **argv)
         int32_t *faces = (int32_t *)malloc((size_t)nf * 3 * sizeof(int32_t));
         cuda_sam3d_body_get_vertices(ctx, verts, &nv);
         cuda_sam3d_body_get_faces(ctx, faces, &nf);
-        rc = obj_write(out_path, verts, nv, faces, nf);
+        rc = write_body_mesh(out_path, verts, nv, faces, nf);
         free(verts); free(faces);
         if (rc == 0)
             fprintf(stderr, "[test_cuda_sam3d_body] wrote %s (V=%d F=%d)\n",
                     out_path, nv, nf);
         else
-            fprintf(stderr, "[test_cuda_sam3d_body] obj_write %s failed\n",
+            fprintf(stderr, "[test_cuda_sam3d_body] mesh write %s failed\n",
                     out_path);
         t_write_obj_ms = cli_time_ms() - t0;
     } else {
         fprintf(stderr, "[test_cuda_sam3d_body] empty output: V=%d F=%d\n", nv, nf);
         rc = 1;
     }
+
+    if (rc == 0)
+        write_sidecar_json(ctx, out_path, bbox, has_bbox, iw, ih);
 
     if (verbose) {
         fprintf(stderr,

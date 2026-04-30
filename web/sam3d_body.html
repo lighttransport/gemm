@@ -110,7 +110,13 @@
               </label>
             </div>
           </div>
-          <div></div>
+          <div>
+            <label for="output-format">Output</label>
+            <select id="output-format">
+              <option value="obj" selected>OBJ</option>
+              <option value="glb">GLB</option>
+            </select>
+          </div>
         </div>
       </div>
       <div>
@@ -135,6 +141,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { OBJLoader }     from 'three/addons/loaders/OBJLoader.js';
+import { GLTFLoader }    from 'three/addons/loaders/GLTFLoader.js';
 
 const $ = id => document.getElementById(id);
 
@@ -339,7 +346,7 @@ function mkCell(label) {
   return sec;
 }
 
-function attachViewer(wrap, objText) {
+function attachObjectViewer(wrap, obj) {
   const W = wrap.clientWidth, H = wrap.clientHeight;
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
@@ -358,13 +365,12 @@ function attachViewer(wrap, objText) {
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
 
-  const obj = new OBJLoader().parse(objText);
   obj.traverse(child => {
     if (child.isMesh) {
       child.material = new THREE.MeshStandardMaterial({
         color: 0xc7d0d8, roughness: 0.6, metalness: 0.0, flatShading: true,
       });
-      child.geometry.computeVertexNormals();
+      if (child.geometry) child.geometry.computeVertexNormals();
     }
   });
   /* Sam3d-body emits a Y-down camera-space mesh. Flip Y so the
@@ -404,6 +410,26 @@ function attachViewer(wrap, objText) {
   ro.observe(wrap);
 
   return { dispose: () => { alive = false; ro.disconnect(); renderer.dispose(); } };
+}
+
+function attachObjViewer(wrap, objText) {
+  return attachObjectViewer(wrap, new OBJLoader().parse(objText));
+}
+
+function attachGlbViewer(wrap, arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    const loader = new GLTFLoader();
+    loader.parse(arrayBuffer, '', gltf => {
+      resolve(attachObjectViewer(wrap, gltf.scene));
+    }, err => reject(err));
+  });
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
 }
 
 /* ---- Run ---- */
@@ -467,22 +493,24 @@ async function runOne(be, body, grid) {
       `infer=${tm.infer||0}ms total=${tm.total||0}ms` +
       (bb ? `  bbox=[${bb.map(x=>x.toFixed(1)).join(', ')}]` : '');
 
-    /* Decode OBJ text */
-    const objBytes = atob(out.data_base64);
-    let objText = '';
-    /* atob produces a binary string; OBJ is ASCII so this is fine */
-    objText = objBytes;
-
-    const v = attachViewer(wrap, objText);
+    const meshBytes = b64ToBytes(out.data_base64);
+    const isGlb = out.mime === 'model/gltf-binary' || out.format === 'glb';
+    const objText = isGlb ? null : new TextDecoder('utf-8').decode(meshBytes);
+    const v = isGlb
+      ? await attachGlbViewer(wrap, meshBytes.buffer.slice(0))
+      : attachObjViewer(wrap, objText);
     viewers.push(v);
 
     /* Download link */
-    const blob = new Blob([objText], { type: 'text/plain' });
+    const ext = isGlb ? 'glb' : 'obj';
+    const blob = new Blob([meshBytes], {
+      type: isGlb ? 'model/gltf-binary' : 'text/plain',
+    });
     const url = URL.createObjectURL(blob);
     dl.style.display = '';
     const a = document.createElement('a');
-    a.href = url; a.download = `sam3d-body-${be.id}.obj`;
-    a.textContent = 'download .obj';
+    a.href = url; a.download = `sam3d-body-${be.id}.${ext}`;
+    a.textContent = `download .${ext}`;
     dl.innerHTML = ''; dl.appendChild(a);
   } catch (e) {
     clearInterval(ticker);
@@ -500,6 +528,18 @@ $('form').addEventListener('submit', async (ev) => {
   const checked = Array.from(document.querySelectorAll('#backends input[type=checkbox]:checked'))
     .map(cb => BACKENDS[+cb.dataset.idx]);
   if (!checked.length) { showToast('check at least one backend'); return; }
+  const outputFormat = $('output-format').value || 'obj';
+  const runnable = outputFormat === 'glb'
+    ? checked.filter(b => b.id !== 'pytorch-cuda')
+    : checked;
+  if (outputFormat === 'glb' && runnable.length !== checked.length) {
+    showToast('GLB export is available for ours-cpu / ours-cuda only; skipping pytorch-cuda',
+              {kind:'info', title:'Output format'});
+  }
+  if (!runnable.length) {
+    showToast('GLB export needs ours-cpu or ours-cuda selected');
+    return;
+  }
 
   $('go').disabled = true; $('cancel').disabled = false;
   const grid = $('grid');
@@ -525,6 +565,7 @@ $('form').addEventListener('submit', async (ev) => {
   if (Number.isFinite(focal) && focal > 0) params.focal = focal;
   const backbone = (document.querySelector('input[name="backbone"]:checked') || {}).value || 'dinov3';
   if (backbone !== 'dinov3') params.backbone = backbone;
+  params.output_format = outputFormat;
 
   const baseBody = { inputs, params };
 
@@ -532,9 +573,9 @@ $('form').addEventListener('submit', async (ev) => {
    * When auto-detect is on AND pytorch is selected, run a "detector"
    * backend first (preferring ours-cuda for speed, falling back to
    * ours-cpu) to get the bbox, then fan out to everyone with that bbox. */
-  const wantsPy = checked.some(b => b.id === 'pytorch-cuda');
-  const detector = checked.find(b => b.id === 'ours-cuda')
-                || checked.find(b => b.id === 'ours-cpu');
+  const wantsPy = runnable.some(b => b.id === 'pytorch-cuda');
+  const detector = runnable.find(b => b.id === 'ours-cuda')
+                || runnable.find(b => b.id === 'ours-cpu');
 
   if (useAuto && wantsPy && detector) {
     $('status').textContent = `auto-detecting bbox via ${detector.label}…`;
@@ -557,7 +598,7 @@ $('form').addEventListener('submit', async (ev) => {
       baseBody.inputs.bbox = detBbox;
     }
     /* Drop the detector from the remaining fan-out (it already ran). */
-    const remaining = checked.filter(b => b.id !== detector.id);
+    const remaining = runnable.filter(b => b.id !== detector.id);
     if (!remaining.length) {
       running = []; $('cancel').disabled = true; $('go').disabled = false;
       $('status').textContent = 'done.'; return;
@@ -573,8 +614,8 @@ $('form').addEventListener('submit', async (ev) => {
       $('status').textContent = '';
       return;
     }
-    $('status').textContent = `running ${checked.length} backend(s)…`;
-    await Promise.allSettled(checked.map(be => runOne(be, baseBody, grid)));
+    $('status').textContent = `running ${runnable.length} backend(s)…`;
+    await Promise.allSettled(runnable.map(be => runOne(be, baseBody, grid)));
   }
 
   running = [];
