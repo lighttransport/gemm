@@ -157,6 +157,14 @@ thipEventElapsedTime hipEventElapsedTime = NULL;
 thipOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor = NULL;
 thipOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize = NULL;
 
+/* Graph capture */
+thipStreamBeginCapture hipStreamBeginCapture = NULL;
+thipStreamEndCapture   hipStreamEndCapture   = NULL;
+thipGraphInstantiate   hipGraphInstantiate   = NULL;
+thipGraphLaunch        hipGraphLaunch        = NULL;
+thipGraphExecDestroy   hipGraphExecDestroy   = NULL;
+thipGraphDestroy       hipGraphDestroy       = NULL;
+
 /* ============================================================================
  * HIPRTC Function Definitions
  * ============================================================================ */
@@ -337,6 +345,14 @@ static int loadHIP(void)
     /* Occupancy */
     HIP_LIBRARY_FIND(hipOccupancyMaxActiveBlocksPerMultiprocessor);
     HIP_LIBRARY_FIND(hipOccupancyMaxPotentialBlockSize);
+
+    /* Graph capture (optional — older ROCm may not export these) */
+    HIP_LIBRARY_FIND(hipStreamBeginCapture);
+    HIP_LIBRARY_FIND(hipStreamEndCapture);
+    HIP_LIBRARY_FIND(hipGraphInstantiate);
+    HIP_LIBRARY_FIND(hipGraphLaunch);
+    HIP_LIBRARY_FIND(hipGraphExecDestroy);
+    HIP_LIBRARY_FIND(hipGraphDestroy);
 
     hip_available = 1;
     return ROCEW_SUCCESS;
