@@ -426,14 +426,42 @@ static const char *hip_vlm_specific_kernels =
 "    return (unsigned short)((bits + 0x7fffu + lsb) >> 16);\n"
 "}\n"
 "\n"
+"/* Vectorized: each thread converts 4 contiguous f32 elements -> 4 half-prec.\n"
+" * Reads one float4 (b128) and writes one ushort4 (b64). Tail handled scalarly. */\n"
 "__global__ void pack_f16_from_f32(half_raw *dst, const float *src, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) dst[i] = f32_to_f16_bits(src[i]);\n"
+"    int tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int idx = tid * 4;\n"
+"    int n4 = n & ~3;\n"
+"    if (idx + 3 < n4) {\n"
+"        float4 f = *(const float4 *)(src + idx);\n"
+"        ushort4 b;\n"
+"        b.x = f32_to_f16_bits(f.x);\n"
+"        b.y = f32_to_f16_bits(f.y);\n"
+"        b.z = f32_to_f16_bits(f.z);\n"
+"        b.w = f32_to_f16_bits(f.w);\n"
+"        *(ushort4 *)(dst + idx) = b;\n"
+"    } else if (idx < n) {\n"
+"        for (int k = 0; k < 4 && idx + k < n; k++)\n"
+"            dst[idx + k] = f32_to_f16_bits(src[idx + k]);\n"
+"    }\n"
 "}\n"
 "\n"
 "__global__ void pack_bf16_from_f32(bf16_raw *dst, const float *src, int n) {\n"
-"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    if (i < n) dst[i] = f32_to_bf16_bits(src[i]);\n"
+"    int tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int idx = tid * 4;\n"
+"    int n4 = n & ~3;\n"
+"    if (idx + 3 < n4) {\n"
+"        float4 f = *(const float4 *)(src + idx);\n"
+"        ushort4 b;\n"
+"        b.x = f32_to_bf16_bits(f.x);\n"
+"        b.y = f32_to_bf16_bits(f.y);\n"
+"        b.z = f32_to_bf16_bits(f.z);\n"
+"        b.w = f32_to_bf16_bits(f.w);\n"
+"        *(ushort4 *)(dst + idx) = b;\n"
+"    } else if (idx < n) {\n"
+"        for (int k = 0; k < 4 && idx + k < n; k++)\n"
+"            dst[idx + k] = f32_to_bf16_bits(src[idx + k]);\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- gemm_wmma_f16_f32: gfx12 WMMA F16×F16 -> F32, 128x128 CTA ---- */\n"
@@ -2774,7 +2802,8 @@ int hip_vision_load_weights(hip_vision_runner *r, gguf_context *g) {
         if (hipMalloc(&r->d_patch_w0_f16, (size_t)n * sizeof(unsigned short)) == hipSuccess) {
             int n_int = (int)n;
             void *args[] = { &r->d_patch_w0_f16, &r->d_patch_w0, &n_int };
-            int grid = (n + 255) / 256;
+            int n4 = (n + 3) / 4;
+            int grid = (n4 + 255) / 256;
             hipModuleLaunchKernel(r->fn_pack_f16_from_f32,
                            grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
             hipStreamSynchronize(r->stream);
@@ -2957,7 +2986,9 @@ int hip_vision_load_weights(hip_vision_runner *r, gguf_context *g) {
 
 static void *vlm_pack_gemm_input(hip_vision_runner *r, void *d_X, int n_elem) {
     if (!r->d_gemm_pack || n_elem <= 0) return NULL;
-    int grid = (n_elem + 255) / 256;
+    /* Vectorized pack: each thread handles 4 elements; round n up. */
+    int n4 = (n_elem + 3) / 4;
+    int grid = (n4 + 255) / 256;
     if (r->use_f16 == VLM_PREC_F16) {
         void *args[] = { &r->d_gemm_pack, &d_X, &n_elem };
         hipModuleLaunchKernel(r->fn_pack_f16_from_f32,
