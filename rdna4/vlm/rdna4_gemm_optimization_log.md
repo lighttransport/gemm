@@ -1096,6 +1096,15 @@ Each row is the cumulative state with all prior optimizations active.
    (still well under 64 KB/CU). FA: 4.92 → 4.60 ms/call (-7%, larger
    gain at 2048² where n_kv is bigger so prefetch/compute overlap is
    more frequent).
+8. **FA double-buffered KV — F16 path.** Mechanically ported the same
+   double-buffer pattern from the BF16 kernel into
+   `flash_attn_wmma_f16_2w_pre`: dual `smK0/smK1` and `smV0/smV1`
+   slots, prologue load, prefetch-while-compute, single end-of-iter
+   sync. Launcher's smem allocation simplified (both paths share the
+   same ~11 KB/WG layout). F16 path: ~225 → ~216 ms total at 1024²
+   (4742 tok/s; cosine 0.99998776 — F16's larger mantissa gives a
+   hair more precision than BF16's 0.99997133). Now F16 and BF16
+   `_2w_pre` run at parity.
 
 ### Profile after all of the above (1024², BF16, total GPU 174 ms)
 
@@ -1142,9 +1151,7 @@ FA at 4.6 ms/call corresponds to ~13 TFLOP/s vs WMMA peak ~195 — only
    - `rope_vision_f32` is scalar; could be vectorized.
    - `layernorm_f32` could use a wave-cooperative reduction.
    These are <2% each so worth only after FA is sub-3 ms.
-7. **Apply double-buffer to F16 path.** Currently only the BF16
-   `_2w_pre` is double-buffered; the F16 variant still uses the
-   single-buffer body. Mechanical port (a few hundred lines).
+7. ~~Apply double-buffer to F16 path.~~ **Done — see step 8 above.**
 
 ### Files
 
