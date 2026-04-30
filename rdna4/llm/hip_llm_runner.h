@@ -44,6 +44,16 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
 float *hip_llm_forward_embd(hip_llm_runner *r, const float *embd, int embd_stride, int position);
 float *hip_llm_forward_embd_logits(hip_llm_runner *r, const float *embd, int embd_stride, int position);
 
+/* Batched forward over a contiguous run of n_tokens starting at position_start.
+ * Returns the LAST token's hidden state [n_embd] (or logits [n_vocab] for the
+ * _logits variant). Buffer is host-side, valid until the next call. Phase 1 is
+ * a thin wrapper over per-token forward; later phases route to a true batched
+ * (WMMA GEMM + flash-attention) path when n_tokens is large. */
+float *hip_llm_forward_batch(hip_llm_runner *r, const int32_t *tokens,
+                             int n_tokens, int position_start);
+float *hip_llm_forward_batch_logits(hip_llm_runner *r, const int32_t *tokens,
+                                    int n_tokens, int position_start);
+
 /* Free all GPU resources and the runner. */
 void hip_llm_free(hip_llm_runner *r);
 
@@ -62,6 +72,13 @@ void hip_llm_set_debug(hip_llm_runner *r, int debug_layers);
 
 /* Set max layers to process (0 = all). For debugging: run only first N layers. */
 void hip_llm_set_max_layers(hip_llm_runner *r, int max_layers);
+
+/* Phase 2: runtime toggle for the batched dense (hipBLASLt) prefill path. When
+ * 0, hip_llm_forward_batch{,_logits} fall back to per-token loop. When 1 (the
+ * default if eligible at load), they route through the batched path for
+ * n_tokens >= LLM_GEMM_M_THRESHOLD. */
+void hip_llm_set_batched_path(hip_llm_runner *r, int enable);
+int  hip_llm_batched_path_available(const hip_llm_runner *r);
 
 /* Query model dimensions (valid after load_weights). */
 int hip_llm_n_embd(const hip_llm_runner *r);
