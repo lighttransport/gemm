@@ -1118,6 +1118,12 @@ Each row is the cumulative state with all prior optimizations active.
    FA: 4.69 → 3.34 ms/call (-29%). End-to-end at 1024²: 215 → 176 ms
    (5804 tok/s, +22%); at 2048²: 2500 → 1900 ms (2154 tok/s, +31%).
    Cosine bit-identical (0.99997133). Env: `HIP_VLM_FA=wmma_bf16_4w_pre`.
+10. **FA BQ=64 4-wave F16** (`flash_attn_wmma_f16_4w_pre`). Mechanical
+    mirror of step 9 with `_Float16` and the f16 WMMA intrinsic. F16
+    and BF16 4-wave run at parity (~186 vs 190 ms @1024²,
+    5500 vs 5380 tok/s). F16 is slightly more precise (10-bit vs 7-bit
+    mantissa) but both well over the PASS gate (cosine 0.99993 vs the
+    BF16 4-wave reference). Env: `HIP_VLM_FA=wmma_f16_4w_pre`.
 
 ### Profile after step 9 (1024², BF16 4-wave, total GPU ~280 ms across 2 iters)
 
