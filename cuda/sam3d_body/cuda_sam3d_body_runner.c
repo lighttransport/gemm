@@ -2404,7 +2404,7 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     free(ctx->keypoints_2d);
     ctx->keypoints_2d = (float *)malloc((size_t)K * 2 * sizeof(float));
     if (!ctx->keypoints_2d) { rc_total = -1; goto cleanup; }
-    memcpy(ctx->keypoints_2d, kp2d_crop, (size_t)K * 2 * sizeof(float));
+    memcpy(ctx->keypoints_2d, kp2d_full, (size_t)K * 2 * sizeof(float));
     ctx->n_kp_2d = K;
 
     free(ctx->mhr_params);

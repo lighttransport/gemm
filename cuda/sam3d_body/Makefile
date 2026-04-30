@@ -20,7 +20,8 @@ VERIFIES = verify_dinov3 verify_vith verify_ray_cond verify_build_tokens verify_
 COMMON_DEPS = cuda_sam3d_body_runner.h cuda_sam3d_body_kernels.h \
               ../cuew.h ../cuda_kernels_common.h ../cuda_runner_common.h \
               ../cuda_hip_compat.h ../../common/safetensors.h \
-              ../../common/sam3d_body_decoder.h ../../common/sam3d_body_mhr.h
+              ../../common/sam3d_body_decoder.h ../../common/sam3d_body_mhr.h \
+              ../../common/tiny_gltf.h ../../common/stb_image_write.h
 
 CPU_DEPS    = $(CPU_SRC) ../../common/sam3d_body_decoder.h \
               ../../common/sam3d_body_mhr.h
