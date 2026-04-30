@@ -635,3 +635,92 @@ via `cuDevicePrimaryCtxRetain`.
 - [ ] **VAE weight cleanup**: `qimg_vae_free()` doesn't free all weight buffers (memory leak on reload).
 - [x] **Debug output gated by verbose levels**: 0=silent, 1=progress, 2=stats, 3=dump .npy.
 - [ ] **Error handling**: Some CUDA allocation failures are silently ignored (especially in on-demand block loading).
+
+## CUDA Benchmark Snapshot (2026-04-19, RTX 5060 Ti 16GB)
+
+Machine:
+- GPU: NVIDIA GeForce RTX 5060 Ti (16 GB)
+- Driver: 595.58.03
+- CUDA runtime: 13.2 (`nvidia-smi`)
+- Date: 2026-04-19 (JST)
+
+Protocol:
+- Prompt: `"a red apple on a white table"`
+- Seed: `42`
+- Steps: `20`
+- Kernel mode: `QIMG_FP8_PIPE_PERROW=1 QIMG_BF16_ATTN=1`
+- Per size: 1 warm-up run (excluded), then 3 measured runs; table shows median of measured runs.
+- Model paths:
+  - DiT: `/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors`
+  - VAE: `/mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors`
+  - Text encoder GGUF: `/mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf`
+
+Command template:
+
+```bash
+QIMG_FP8_PIPE_PERROW=1 QIMG_BF16_ATTN=1 ./test_cuda_qimg --generate \
+  --height <H> --width <W> --steps 20 --seed 42 \
+  --prompt "a red apple on a white table" \
+  --dit /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors \
+  --vae /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors \
+  --enc /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf
+```
+
+Median timings (3 measured runs):
+
+| Resolution | Text encoding (s) | Denoising total (s) | Denoising (s/step) | VAE decode (s) | End-to-end total (s) |
+|---|---:|---:|---:|---:|---:|
+| 256×256 | 14.1 | 37.6 | 1.88 | 0.3 | 51.9 |
+| 512×512 | 14.0 | 52.3 | 2.62 | 0.4 | 66.7 |
+| 1024×1024 | 13.9 | 130.3 | 6.52 | 1.6 | 145.8 |
+
+Raw run details (same setup; warm-up excluded from medians):
+
+| Resolution | Run | Text encoding (s) | Denoising total (s) | Denoising (s/step) | VAE decode (s) | End-to-end total (s) |
+|---|---|---:|---:|---:|---:|---:|
+| 256×256 | warmup | 14.0 | 39.1 | 1.95 | 0.3 | 53.4 |
+| 256×256 | run1 | 14.1 | 37.6 | 1.88 | 0.3 | 52.0 |
+| 256×256 | run2 | 14.1 | 37.6 | 1.88 | 0.2 | 51.9 |
+| 256×256 | run3 | 13.9 | 37.6 | 1.88 | 0.3 | 51.8 |
+| 512×512 | warmup | 14.0 | 52.4 | 2.62 | 0.4 | 66.8 |
+| 512×512 | run1 | 13.8 | 52.3 | 2.62 | 0.4 | 66.5 |
+| 512×512 | run2 | 14.1 | 52.4 | 2.62 | 0.4 | 66.9 |
+| 512×512 | run3 | 14.0 | 52.3 | 2.61 | 0.4 | 66.7 |
+| 1024×1024 | warmup | 14.2 | 130.0 | 6.50 | 1.6 | 145.8 |
+| 1024×1024 | run1 | 13.9 | 130.3 | 6.51 | 1.6 | 145.8 |
+| 1024×1024 | run2 | 13.9 | 130.3 | 6.52 | 1.6 | 145.8 |
+| 1024×1024 | run3 | 13.9 | 130.4 | 6.52 | 1.6 | 145.9 |
+
+Artifacts (`cuda/qimg/bench_20260419_cuda_perf_gpu/`):
+- Logs:
+  - `perf_256_run{1,2,3}.log`, `perf_512_run{1,2,3}.log`, `perf_1024_run{1,2,3}.log`
+  - warm-up logs: `perf_*_warmup.log`
+- Representative generated apple images:
+  - 256: `cuda_qimg_output_256_run2.ppm`
+  - 512: `cuda_qimg_output_512_run2.ppm`
+  - 1024: `cuda_qimg_output_1024_run2.ppm`
+
+Note:
+- The text-encoder bias safetensors fallback path in this binary points to `/mnt/nvme02/...` and is missing on this machine, so runs print:
+  `WARNING: no biases injected (image quality may suffer)`.
+  This does not materially affect the throughput figures above.
+
+### CUDA text encoder check (`/mnt/disk01/models/qwen-image`)
+
+Validated CUDA text-encoder execution with the GGUF from:
+`/mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf`
+
+Command:
+
+```bash
+cd /home/syoyo/work/gemm/diffusion/cuda/llm
+./test_cuda_llm /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
+  -t "a red apple on a white table" -n 4 -s 256
+```
+
+Result:
+- Status: **PASS**
+- Tokens processed: `4`
+- CPU total: `14681.3 ms` (`3670.3 ms/token`)
+- GPU total: `368.1 ms` (`92.0 ms/token`)
+- Speedup: `39.9x`

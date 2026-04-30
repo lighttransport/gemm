@@ -301,6 +301,52 @@ make test-gen-base    # Base pipeline
 | 64×64, 1-step generation after setup | ~0.3s |
 | VAE decode (64×64 output) | ~0.1s |
 
+### CUDA perf snapshot (2026-04-19, `/mnt/disk01/models/klein2-4b`)
+
+Measured on RTX 5060 Ti 16GB with real Klein2-4B weights under `/mnt/disk01/models/klein2-4b`.
+
+Commands used:
+
+```bash
+cd cuda/flux2
+
+# Distilled (4-step), 4 repeated runs with shared setup
+./test_cuda_flux2 --generate --distilled --gpu-enc \
+  --dit /mnt/disk01/models/klein2-4b/diffusion_models/flux-2-klein-4b-fp8.safetensors \
+  --vae /mnt/disk01/models/klein2-4b/vae/flux2-vae.safetensors \
+  --enc /mnt/disk01/models/klein2-4b/text_encoder \
+  --tok /mnt/disk01/models/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-Q8_0.gguf \
+  --height 256 --width 256 --steps 4 --seed 42 --repeat 4 \
+  --prompt "a red apple on a white table"
+
+# Base (20-step), 4 repeated runs with shared setup
+./test_cuda_flux2 --generate --base --gpu-enc \
+  --dit /mnt/disk01/models/klein2-4b/diffusion_models/flux-2-klein-base-4b-fp8.safetensors \
+  --vae /mnt/disk01/models/klein2-4b/vae/flux2-vae.safetensors \
+  --enc /mnt/disk01/models/klein2-4b/text_encoder \
+  --tok /mnt/disk01/models/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-Q8_0.gguf \
+  --height 256 --width 256 --steps 20 --seed 42 --repeat 4 \
+  --prompt "a red apple on a white table"
+```
+
+Shared setup (once per command):
+
+| Mode | Shared text encode (s) | Shared init+load (s) |
+|---|---:|---:|
+| Distilled 4-step | 18.3 | 51.5 |
+| Base 20-step | 10.9 | 18.9 |
+
+Per-run generation timings (setup excluded):
+
+| Mode | Run 1 total (s) | Run 2 total (s) | Run 3 total (s) | Run 4 total (s) | Median total (s) | Denoising (s) | Denoising (s/step) | VAE (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Distilled 4-step @256² | 11.8 | 11.7 | 11.7 | 11.7 | 11.7 | 11.5 | 2.88 | 0.2 |
+| Base 20-step @256² | 57.8 | 57.9 | 57.9 | 57.9 | 57.9 | 57.6 | 2.88 | 0.2 |
+
+Logs:
+- `cuda/flux2/bench_20260419_flux2_klein_perf/distilled_256_r4.log`
+- `cuda/flux2/bench_20260419_flux2_klein_perf/base_256_r4.log`
+
 > **Note:** The heavy VAE path is on CUDA. The current implementation still bridges the single VAE mid-block attention through CPU, but conv/groupnorm/resblock/upsample work is on GPU.
 
 > **Memory note:** `--generate --gpu-enc` now pre-encodes text once, frees the GPU text encoder, and then loads DiT/VAE. This avoids VRAM exhaustion from keeping both the CUDA LLM runner and Flux2 weights resident at the same time on 16 GB cards.
