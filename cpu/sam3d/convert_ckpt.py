@@ -17,6 +17,7 @@ nested keys. For v1 we only need these slices:
 
   ss_decoder.ckpt        (already flat)                        → sam3d_ss_decoder.safetensors
   slat_decoder_gs.ckpt   (already flat)                        → sam3d_slat_gs_decoder.safetensors
+  slat_decoder_mesh.ckpt (already flat)                        → sam3d_slat_mesh_decoder.safetensors
 
 Usage:
     python convert_ckpt.py <hf-ckpt-dir> -o <outdir>
@@ -52,6 +53,9 @@ EXTRACT_MAP = [
     ]),
     ("slat_decoder_gs.ckpt", [
         ("", "sam3d_slat_gs_decoder.safetensors"),
+    ]),
+    ("slat_decoder_mesh.ckpt", [
+        ("", "sam3d_slat_mesh_decoder.safetensors"),
     ]),
 ]
 
@@ -90,7 +94,8 @@ def main():
     ap.add_argument("-o", "--outdir", default=None)
     ap.add_argument("--only", help="comma-separated module tags to extract "
                                     "(dinov2, point_patch_embed, cond_fuser, "
-                                    "ss_dit, slat_dit, ss_decoder, slat_gs_decoder)")
+                                    "ss_dit, slat_dit, ss_decoder, "
+                                    "slat_gs_decoder, slat_mesh_decoder)")
     args = ap.parse_args()
 
     outdir = args.outdir or os.path.join(os.path.dirname(args.ckpt_dir.rstrip('/')),

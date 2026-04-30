@@ -25,6 +25,10 @@
 #define OBJ_WRITER_IMPLEMENTATION
 #include "obj_writer.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define TINY_GLTF_IMPLEMENTATION
+#include "../../common/tiny_gltf.h"
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../common/stb_image.h"
 
@@ -50,6 +54,28 @@ static int cli_timing_enabled(int verbose)
 {
     const char *env = getenv("SAM3D_BODY_TIMING");
     return verbose || (env && env[0] && strcmp(env, "0") != 0);
+}
+
+static int has_suffix(const char *s, const char *suffix)
+{
+    if (!s || !suffix) return 0;
+    size_t ns = strlen(s), nx = strlen(suffix);
+    return ns >= nx && strcmp(s + ns - nx, suffix) == 0;
+}
+
+static int write_body_mesh(const char *path,
+                           const float *verts, int nv,
+                           const int32_t *faces, int nf)
+{
+    if (has_suffix(path, ".glb")) {
+        int *tri = (int *)malloc((size_t)nf * 3 * sizeof(int));
+        if (!tri) return 1;
+        for (int i = 0; i < nf * 3; i++) tri[i] = (int)faces[i];
+        int rc = tinygltf_write_glb_mesh(path, verts, nv, tri, nf);
+        free(tri);
+        return rc == 0 ? 0 : 1;
+    }
+    return obj_write(path, verts, nv, faces, nf);
 }
 
 static float *load_ref_f32(const char *refdir, const char *name)
@@ -147,12 +173,12 @@ static int run_refdir(const char *sft_dir, const char *mhr_dir,
     sam3d_body_get_vertices(ctx, verts, &nv);
     sam3d_body_get_faces(ctx, faces, &nf);
 
-    rc = obj_write(out_path, verts, nv, faces, nf);
+    rc = write_body_mesh(out_path, verts, nv, faces, nf);
     if (rc == 0)
         fprintf(stderr, "[test_sam3d_body] wrote %s (V=%d F=%d)\n",
                 out_path, nv, nf);
     else
-        fprintf(stderr, "[test_sam3d_body] obj_write %s failed\n", out_path);
+        fprintf(stderr, "[test_sam3d_body] mesh write %s failed\n", out_path);
 
     free(verts); free(faces);
     sam3d_body_destroy(ctx);
@@ -245,12 +271,14 @@ static int run_image(const char *sft_dir, const char *mhr_dir,
         sam3d_body_get_vertices(ctx, verts, &nv);
         sam3d_body_get_faces(ctx, faces, &nf);
         t0 = cli_time_ms();
-        rc = obj_write(out_path, verts, nv, faces, nf);
+        rc = write_body_mesh(out_path, verts, nv, faces, nf);
         t_write_obj_ms = cli_time_ms() - t0;
         free(verts); free(faces);
         if (rc == 0)
             fprintf(stderr, "[test_sam3d_body] wrote %s (V=%d F=%d)\n",
                     out_path, nv, nf);
+        else
+            fprintf(stderr, "[test_sam3d_body] mesh write %s failed\n", out_path);
     }
 
     /* Sidecar JSON: MHR rig params, camera, 3D + 2D keypoints. */

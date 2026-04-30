@@ -176,9 +176,36 @@ Likewise, the weights-only verifiers (`verify_ssdit_block_realw`,
 safetensors directly and skip `/tmp/sam3d_ref/` entirely. Use those
 for a quick numerics gate when you don't have access to a CUDA host.
 
+## MoGe pointmaps
+
+`moge_pointmap.py` runs the installed MoGe package and writes the
+`(H, W, 3)` float32 pointmap consumed by the C/CUDA runners:
+
+```bash
+ref/sam3d/.venv/bin/python ref/sam3d/moge_pointmap.py \
+    --image fujisan.jpg \
+    --out /tmp/sam3d_ref/pointmap.npy
+```
+
+The script defaults to `/mnt/disk01/models/moge-vitl/model.pt` when it
+exists, otherwise to the HF id `Ruicheng/moge-vitl`. The CUDA CLI can
+invoke this helper directly with `--moge`; `--moge-out p.npy` preserves
+the generated pointmap instead of using a temporary file.
+
 ## Deferred
 
-* MoGe depth model — not yet wired. `gen_image_ref.py` accepts
-  `--pointmap pmap.npy` to bypass MoGe; the C runner's `--pointmap`
-  flag picks up the same `.npy`.
-* SLAT Mesh decoder / FlexiCubes / texture bake — out of v1.
+* MoGe depth model — `gen_image_ref.py` accepts `--pointmap pmap.npy`
+  to bypass MoGe; the C runner's `--pointmap` flag picks up the same
+  `.npy`. See `moge_pointmap.py` above for generating one.
+* SLAT mesh decoder: native SDF/deformation/vertex-RGB and
+  FlexiCubes-style beta/alpha/gamma topology extraction are wired in the
+  CUDA CLI via `--mesh-source slat`; upstream ambiguity/check-table
+  parity is implemented. `--mesh-texture-size N` unwraps with vendored
+  xatlas and writes an embedded PNG textured GLB; decoder RGB is the
+  fallback color source, while `--mesh-texture-color image` uses the
+  input image plus finite masked pointmap for deterministic single-view
+  source projection. `--mesh-texture-mode grid` forces the legacy
+  duplicated triangle-grid atlas for comparison; in that mode
+  `--mesh-texture-size` is a minimum and may grow to preserve 4x4 texel
+  tiles per triangle. High-quality multiview source/appearance
+  optimization remains out of v1.
