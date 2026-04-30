@@ -829,6 +829,164 @@ def patch_dscnt_collapse(src: str) -> str:
     return src
 
 
+def patch_pgr2_lite(src: str) -> str:
+    """PGR2-lite: pre-issue the first 2 ds_load_b128 (v[174:177] X0 fragment
+    and v[178:181] W0 fragment) at the END of bb.5 (after barrier_wait, before
+    s_branch) and at the END of the prologue. Remove them from bb.4 head so
+    the only consumer of those VGPRs is the pre-loaded copy.
+
+    Theory: in baseline, WMMA1 in bb.4 stalls ~10 cycles for v[174:181] to
+    complete (s_wait_dscnt 0xe drops as the first 2 of 16 ds_loads finish).
+    Pre-issuing those 2 loads in bb.5 tail gives them ~5+ cycles head start
+    over bb.4 entry, so by the time WMMA1 issues, operands may already be
+    ready. Net expected save: ~5 cycles/iter × 144 iters = ~720 cycles (~3%).
+
+    Address computation in bb.5: s6 has been toggled (points to slot just
+    written), so s8 = s6 * 0x2400 = bb.4-style buffer offset. Read base is
+    v172*16 + s8 (same as bb.4 head's `v_add_lshl_u32 v174, v172, s9, 4`
+    where s9 = s6 * 0x240). We reuse v218 as scratch for the read base
+    since bb.5 has already finished using it as an LDS read address.
+    """
+
+    pre_block_addr = """\
+\ts_mul_i32 s9, s6, 0x240
+\ts_wait_alu 0xfffe
+\tv_add_lshl_u32 v218, v172, s9, 4
+\tv_add_nc_u32_e32 v230, v170, v218
+\tv_add_nc_u32_e32 v218, v173, v218
+"""
+    pre_block_loads = """\
+\tds_load_b128 v[174:177], v218
+\tds_load_b128 v[178:181], v230
+"""
+    # In prologue, where we don't have a separate barrier_signal to insert
+    # addr-setup before, we keep the full bundle together.
+    pre_block = pre_block_addr + pre_block_loads
+
+    # 1. Prologue: insert pre-loads before `s_branch .LBB0_2` at end of prologue.
+    prologue_old = """\
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+                                        ; implicit-def: $vgpr129_vgpr130_vgpr131_vgpr132
+                                        ; implicit-def: $vgpr133_vgpr134_vgpr135_vgpr136
+                                        ; implicit-def: $vgpr145_vgpr146_vgpr147_vgpr148
+                                        ; implicit-def: $vgpr149_vgpr150_vgpr151_vgpr152
+                                        ; implicit-def: $vgpr153_vgpr154_vgpr155_vgpr156
+                                        ; implicit-def: $vgpr157_vgpr158_vgpr159_vgpr160
+                                        ; implicit-def: $vgpr137_vgpr138_vgpr139_vgpr140
+                                        ; implicit-def: $vgpr141_vgpr142_vgpr143_vgpr144
+\ts_branch .LBB0_2
+"""
+    prologue_new = """\
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+                                        ; implicit-def: $vgpr129_vgpr130_vgpr131_vgpr132
+                                        ; implicit-def: $vgpr133_vgpr134_vgpr135_vgpr136
+                                        ; implicit-def: $vgpr145_vgpr146_vgpr147_vgpr148
+                                        ; implicit-def: $vgpr149_vgpr150_vgpr151_vgpr152
+                                        ; implicit-def: $vgpr153_vgpr154_vgpr155_vgpr156
+                                        ; implicit-def: $vgpr157_vgpr158_vgpr159_vgpr160
+                                        ; implicit-def: $vgpr137_vgpr138_vgpr139_vgpr140
+                                        ; implicit-def: $vgpr141_vgpr142_vgpr143_vgpr144
+""" + pre_block + "\ts_branch .LBB0_2\n"
+
+    if prologue_old not in src:
+        raise RuntimeError("could not find prologue end (barrier_wait + implicit-defs + branch)")
+    src = src.replace(prologue_old, prologue_new, 1)
+
+    # 2. bb.5 tail: split the pre_block. addr-setup goes BEFORE barrier_signal
+    #    (so it overlaps with cross-wave sync handshake), ds_loads go AFTER
+    #    barrier_wait (minimum critical-path addition: 2 ds_load issues).
+    #    Two cases: raw bb.5 (signal+wait) or bse-modified (wait only).
+    bb5_raw_old = """\
+\t;;#ASMSTART
+\ts_barrier_signal -1
+\t;;#ASMEND
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+\ts_branch .LBB0_1
+"""
+    bb5_raw_new = pre_block_addr + """\
+\t;;#ASMSTART
+\ts_barrier_signal -1
+\t;;#ASMEND
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+""" + pre_block_loads + "\ts_branch .LBB0_1\n"
+
+    bb5_bse_old = """\
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+\ts_branch .LBB0_1
+"""
+    bb5_bse_new = pre_block_addr + """\
+\t;;#ASMSTART
+\ts_barrier_wait 0xffff
+\t;;#ASMEND
+""" + pre_block_loads + "\ts_branch .LBB0_1\n"
+
+    if bb5_raw_old in src:
+        src = src.replace(bb5_raw_old, bb5_raw_new, 1)
+    elif bb5_bse_old in src:
+        src = src.replace(bb5_bse_old, bb5_bse_new, 1)
+    else:
+        raise RuntimeError("could not find bb.5 tail (raw or bse-modified)")
+
+    # 3a. Rewrite bb.4 head to use v218 as the address scratch instead of v174,
+    # so the pre-loaded v[174:177] data is not clobbered. Original sequence:
+    #   v_add_lshl_u32 v174, v172, s9, 4   ; v174 = scratch addr
+    #   s_mov_b32 s8, -1
+    #   s_delay_alu ...
+    #   v_add_nc_u32_e32 v218, v173, v174  ; v218 = X-row read base
+    #   v_add_nc_u32_e32 v230, v170, v174  ; v230 = W-row read base 0
+    #   v_add_nc_u32_e32 v234, v171, v174  ; v234 = W-row read base 1
+    # New: route through v218 directly so v174 stays untouched.
+    bb4_addr_old = """\
+\tv_add_lshl_u32 v174, v172, s9, 4
+\ts_mov_b32 s8, -1
+\ts_delay_alu instid0(VALU_DEP_1)
+\tv_add_nc_u32_e32 v218, v173, v174
+\tv_add_nc_u32_e32 v230, v170, v174
+\tv_add_nc_u32_e32 v234, v171, v174
+"""
+    bb4_addr_new = """\
+\tv_add_lshl_u32 v218, v172, s9, 4
+\ts_mov_b32 s8, -1
+\ts_delay_alu instid0(VALU_DEP_1)
+\tv_add_nc_u32_e32 v230, v170, v218
+\tv_add_nc_u32_e32 v234, v171, v218
+\tv_add_nc_u32_e32 v218, v173, v218
+"""
+    if bb4_addr_old not in src:
+        raise RuntimeError("could not find bb.4 address-setup block")
+    src = src.replace(bb4_addr_old, bb4_addr_new, 1)
+
+    # 3b. Remove the first 2 ds_loads (v[174:177] and v[178:181]) from bb.4 head.
+    bb4_head_old = """\
+\tds_load_b128 v[174:177], v218
+\tds_load_b128 v[178:181], v230
+\tds_load_b128 v[182:185], v230 offset:256
+"""
+    bb4_head_new = """\
+\tds_load_b128 v[182:185], v230 offset:256
+"""
+    if bb4_head_old not in src:
+        raise RuntimeError("could not find bb.4 first 3 ds_loads")
+    src = src.replace(bb4_head_old, bb4_head_new, 1)
+
+    # Wait counts unchanged: total outstanding ds_loads at bb.4 start is still
+    # 16 (2 pre-loads from bb.5 tail + 14 from bb.4 head). FIFO completion
+    # means `s_wait_dscnt 0xe` still drops when pre-loads (oldest) finish, so
+    # WMMA1 still gates correctly on v[174:181]. If pre-loads completed before
+    # bb.4 entry, the early dscnt waits become no-ops — exactly what we want.
+    return src
+
+
 def patch_storefuse(src: str) -> str:
     """Fuse bb.5 ds_stores+setup into bb.4 tail, leaving bb.5 with only
     barrier_wait + branch.
@@ -937,6 +1095,423 @@ def patch_storefuse(src: str) -> str:
     return src
 
 
+def patch_pgr2_bufload(src: str) -> str:
+    """Replace 16 global_load_b128 (8 prologue + 8 in-loop bb.3) with
+    buffer_load_b128 using bounded SRDs. This is the prerequisite step for
+    PGR2 distributed scheduling — it owns the loads' OOB behavior so the
+    scc-guard around bb.3 can be relaxed and loads can be relocated into
+    the WMMA stream.
+
+    SRD layout (RDNA4, verified from /tmp/hipblaslt_bf16_best_73823.s
+    lines 654, 725):
+        s[20:21] = X base (lo,hi)   -- copied from kernarg s[8:9]
+        s[22]    = X NumRecords     -- M*K*2 = 9437184 (0x00900000)
+        s[23]    = 0x30020000       -- RDNA4 SRD flag word
+        s[24:25] = W base (lo,hi)   -- copied from kernarg s[6:7]
+        s[26]    = W NumRecords     -- N*K*2 = 42467328 (0x02880000)
+        s[27]    = 0x30020000
+
+    Per-lane offset: v161 = v1*0x2400 (X), v163 = v2*0x2400 (W). The
+    existing v[161:162] and v[163:164] held 64-bit absolute addresses
+    via v_mad_co_i64_i32; the buffer_load path needs only the 32-bit
+    per-lane row offset, since the SRD's 64-bit base provides the rest.
+
+    The K-iter byte offset uses the existing s0 SGPR (lower 32 bits of
+    s[0:1] which advances by 64 per iter). Max iter offset = 64*144 =
+    9216 = 0x2400, well within 32-bit soffset range.
+
+    Bumps `.amdhsa_next_free_sgpr` from 12 to 28 to claim s[20:27].
+    """
+
+    # 1. Replace prologue addressing + 8 global_loads (X+W, K=0 fragment).
+    old_prologue = """\
+\tv_mad_co_i64_i32 v[161:162], null, 0x2400, v1, s[8:9]
+\tv_mad_co_i64_i32 v[163:164], null, 0x2400, v2, s[6:7]
+\tv_dual_mov_b32 v125, v121 :: v_dual_mov_b32 v126, v121
+\tv_dual_mov_b32 v127, v121 :: v_dual_mov_b32 v128, v121
+\ts_clause 0x3
+\tglobal_load_b128 v[129:132], v[161:162], off
+\tglobal_load_b128 v[133:136], v[161:162], off offset:16
+\tglobal_load_b128 v[137:140], v[161:162], off offset:32
+\tglobal_load_b128 v[141:144], v[161:162], off offset:48
+\ts_clause 0x3
+\tglobal_load_b128 v[145:148], v[163:164], off
+\tglobal_load_b128 v[149:152], v[163:164], off offset:16
+\tglobal_load_b128 v[153:156], v[163:164], off offset:32
+\tglobal_load_b128 v[157:160], v[163:164], off offset:48
+"""
+    new_prologue = """\
+\tv_mul_lo_u32 v161, 0x2400, v1
+\tv_mul_lo_u32 v163, 0x2400, v2
+\ts_mov_b32 s20, s8
+\ts_mov_b32 s21, s9
+\ts_mov_b32 s22, 0x00900000
+\ts_mov_b32 s23, 0x30020000
+\ts_mov_b32 s24, s6
+\ts_mov_b32 s25, s7
+\ts_mov_b32 s26, 0x02880000
+\ts_mov_b32 s27, 0x30020000
+\tv_dual_mov_b32 v125, v121 :: v_dual_mov_b32 v126, v121
+\tv_dual_mov_b32 v127, v121 :: v_dual_mov_b32 v128, v121
+\ts_clause 0x3
+\tbuffer_load_b128 v[129:132], v161, s[20:23], null offen
+\tbuffer_load_b128 v[133:136], v161, s[20:23], null offen offset:16
+\tbuffer_load_b128 v[137:140], v161, s[20:23], null offen offset:32
+\tbuffer_load_b128 v[141:144], v161, s[20:23], null offen offset:48
+\ts_clause 0x3
+\tbuffer_load_b128 v[145:148], v163, s[24:27], null offen
+\tbuffer_load_b128 v[149:152], v163, s[24:27], null offen offset:16
+\tbuffer_load_b128 v[153:156], v163, s[24:27], null offen offset:32
+\tbuffer_load_b128 v[157:160], v163, s[24:27], null offen offset:48
+"""
+    if old_prologue not in src:
+        raise RuntimeError(
+            "patch_pgr2_bufload: could not find prologue addressing block"
+        )
+    src = src.replace(old_prologue, new_prologue, 1)
+
+    # 2. Replace bb.3 in-loop loads. The original block does 64-bit address
+    #    arithmetic to advance by s[0:1]; under buffer_load we just pass s0
+    #    as the soffset. v[137:138] / v[145:146] are no longer needed as
+    #    address registers, but v137-140 / v145-148 ARE still destination
+    #    registers, so we keep their reuse pattern intact.
+    old_bb3 = """\
+\ts_wait_loadcnt 0x4
+\tv_add_co_u32 v137, vcc_lo, v161, s0
+\ts_wait_alu 0xfffd
+\tv_add_co_ci_u32_e64 v138, null, s1, v162, vcc_lo
+\ts_wait_loadcnt 0x0
+\tv_add_co_u32 v145, vcc_lo, v163, s0
+\ts_wait_alu 0xfffd
+\tv_add_co_ci_u32_e64 v146, null, s1, v164, vcc_lo
+\ts_clause 0x3
+\tglobal_load_b128 v[129:132], v[137:138], off offset:64
+\tglobal_load_b128 v[133:136], v[137:138], off offset:80
+\tglobal_load_b128 v[141:144], v[137:138], off offset:96
+\tglobal_load_b128 v[137:140], v[137:138], off offset:112
+\ts_clause 0x3
+\tglobal_load_b128 v[157:160], v[145:146], off offset:64
+\tglobal_load_b128 v[153:156], v[145:146], off offset:80
+\tglobal_load_b128 v[149:152], v[145:146], off offset:96
+\tglobal_load_b128 v[145:148], v[145:146], off offset:112
+"""
+    new_bb3 = """\
+\ts_wait_loadcnt 0x0
+\ts_clause 0x3
+\tbuffer_load_b128 v[129:132], v161, s[20:23], s0 offen offset:64
+\tbuffer_load_b128 v[133:136], v161, s[20:23], s0 offen offset:80
+\tbuffer_load_b128 v[141:144], v161, s[20:23], s0 offen offset:96
+\tbuffer_load_b128 v[137:140], v161, s[20:23], s0 offen offset:112
+\ts_clause 0x3
+\tbuffer_load_b128 v[157:160], v163, s[24:27], s0 offen offset:64
+\tbuffer_load_b128 v[153:156], v163, s[24:27], s0 offen offset:80
+\tbuffer_load_b128 v[149:152], v163, s[24:27], s0 offen offset:96
+\tbuffer_load_b128 v[145:148], v163, s[24:27], s0 offen offset:112
+"""
+    if old_bb3 not in src:
+        raise RuntimeError(
+            "patch_pgr2_bufload: could not find bb.3 in-loop load block"
+        )
+    src = src.replace(old_bb3, new_bb3, 1)
+
+    # 3. Bump amdhsa_next_free_sgpr from 12 to 28 to claim s[20:27] for SRDs.
+    old_sgpr = "\t\t.amdhsa_next_free_sgpr 12\n"
+    new_sgpr = "\t\t.amdhsa_next_free_sgpr 28\n"
+    if old_sgpr not in src:
+        raise RuntimeError(
+            "patch_pgr2_bufload: could not find .amdhsa_next_free_sgpr 12"
+        )
+    src = src.replace(old_sgpr, new_sgpr, 1)
+
+    return src
+
+
+def patch_pgr2_drop_guard(src: str) -> str:
+    """Drop the s_cbranch_scc1 .LBB0_4 last-iter guard around bb.3.
+
+    Safe ONLY after pgr2-bufload because the buffer_load_b128 SRD has
+    OOB-mask enabled (Srd127_96 = 0x30020000). On the last-iter pass, the
+    bb.3 loads issue with s0 = K-tile-count * 64 = 9216, addressing K=144
+    which is the matrix boundary. Within X (9.4 MB) and W (42 MB) buffer
+    bounds the reads are not strictly OOB but they bleed into the next
+    row's K=0; the resulting wrong data lands in registers, gets stored
+    to LDS in bb.5, but no subsequent iter consumes it (loop exits via
+    .LBB0_6 instead). Net effect: a few wasted load issue cycles on the
+    final iter, removed branch overhead on every iter.
+
+    With this guard removed, bb.3's loads can later be physically merged
+    into bb.4 to enable per-WMMA distributed scheduling.
+    """
+    old = """\
+\ts_cmp_gt_u32 s7, 0x11df
+\ts_cbranch_scc1 .LBB0_4
+"""
+    new = """\
+\ts_cmp_gt_u32 s7, 0x11df
+"""
+    if old not in src:
+        raise RuntimeError(
+            "patch_pgr2_drop_guard: could not find scc-guard before bb.3"
+        )
+    return src.replace(old, new, 1)
+
+
+def patch_pgr2_distribute(src: str) -> str:
+    """Move the 8 in-loop buffer_load_b128 from bb.3 INTO the bb.4 WMMA
+    stream at slots [0,2,4,6,8,10,12,14] — one load every 2 WMMAs across
+    the first 16 WMMAs. This is the actual PGR2 perf lever; pgr2-bufload
+    alone is perf-neutral infrastructure.
+
+    Issue order is preserved (X before W, same intra-group order) so the
+    bb.5 s_wait_loadcnt 0x7→0x0 countdown still matches each load's
+    destination register.
+
+    Requires patch_pgr2_bufload to have run first (bb.3 must contain
+    buffer_load_b128 not global_load_b128). Composes cleanly with
+    patch_pgr2_drop_guard and patch_barriersig_early.
+    """
+
+    # 1. Strip the 8 buffer_loads + 2 s_clauses from bb.3, keeping the
+    #    s_wait_loadcnt 0x0 (it now serves only as a fence between the
+    #    previous iter's WMMA-stream loads completing and this iter's
+    #    issue — harmless; the bb.5 countdown of the prior iter already
+    #    drained loadcnt to 0 before the back-edge).
+    old_bb3 = """\
+\ts_wait_loadcnt 0x0
+\ts_clause 0x3
+\tbuffer_load_b128 v[129:132], v161, s[20:23], s0 offen offset:64
+\tbuffer_load_b128 v[133:136], v161, s[20:23], s0 offen offset:80
+\tbuffer_load_b128 v[141:144], v161, s[20:23], s0 offen offset:96
+\tbuffer_load_b128 v[137:140], v161, s[20:23], s0 offen offset:112
+\ts_clause 0x3
+\tbuffer_load_b128 v[157:160], v163, s[24:27], s0 offen offset:64
+\tbuffer_load_b128 v[153:156], v163, s[24:27], s0 offen offset:80
+\tbuffer_load_b128 v[149:152], v163, s[24:27], s0 offen offset:96
+\tbuffer_load_b128 v[145:148], v163, s[24:27], s0 offen offset:112
+"""
+    new_bb3 = "\ts_wait_loadcnt 0x0\n"
+    if old_bb3 not in src:
+        raise RuntimeError(
+            "patch_pgr2_distribute: could not find bb.3 buffer_load block "
+            "(must run after patch_pgr2_bufload)"
+        )
+    src = src.replace(old_bb3, new_bb3, 1)
+
+    # 2. Inject 8 buffer_load_b128 lines into bb.4 WMMA stream at slots
+    #    [0,2,4,6,8,10,12,14]. We match the entire 16-WMMA first-half
+    #    block as a single contiguous string so insertion points are
+    #    unambiguous and the order of WMMAs vs. loads is fully pinned.
+    old_wmma_first_half = """\
+\ts_wait_dscnt 0xe
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[174:177], v[178:181], v[121:128]
+\ts_wait_dscnt 0xd
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[174:177], v[182:185], v[113:120]
+\ts_wait_dscnt 0xc
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[174:177], v[186:189], v[105:112]
+\ts_wait_dscnt 0xb
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[174:177], v[190:193], v[97:104]
+\ts_wait_dscnt 0xa
+\tv_wmma_f32_16x16x16_bf16 v[89:96], v[194:197], v[178:181], v[89:96]
+\tv_wmma_f32_16x16x16_bf16 v[81:88], v[194:197], v[182:185], v[81:88]
+\tv_wmma_f32_16x16x16_bf16 v[73:80], v[194:197], v[186:189], v[73:80]
+\tv_wmma_f32_16x16x16_bf16 v[65:72], v[194:197], v[190:193], v[65:72]
+\ts_wait_dscnt 0x9
+\tv_wmma_f32_16x16x16_bf16 v[57:64], v[198:201], v[178:181], v[57:64]
+\tv_wmma_f32_16x16x16_bf16 v[49:56], v[198:201], v[182:185], v[49:56]
+\tv_wmma_f32_16x16x16_bf16 v[41:48], v[198:201], v[186:189], v[41:48]
+\tv_wmma_f32_16x16x16_bf16 v[33:40], v[198:201], v[190:193], v[33:40]
+\ts_wait_dscnt 0x8
+\tv_wmma_f32_16x16x16_bf16 v[25:32], v[202:205], v[178:181], v[25:32]
+\tv_wmma_f32_16x16x16_bf16 v[17:24], v[202:205], v[182:185], v[17:24]
+\tv_wmma_f32_16x16x16_bf16 v[9:16], v[202:205], v[186:189], v[9:16]
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[202:205], v[190:193], v[1:8]
+"""
+    new_wmma_first_half = """\
+\ts_wait_dscnt 0xe
+\tbuffer_load_b128 v[129:132], v161, s[20:23], s0 offen offset:64
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[174:177], v[178:181], v[121:128]
+\ts_wait_dscnt 0xd
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[174:177], v[182:185], v[113:120]
+\ts_wait_dscnt 0xc
+\tbuffer_load_b128 v[133:136], v161, s[20:23], s0 offen offset:80
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[174:177], v[186:189], v[105:112]
+\ts_wait_dscnt 0xb
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[174:177], v[190:193], v[97:104]
+\ts_wait_dscnt 0xa
+\tbuffer_load_b128 v[141:144], v161, s[20:23], s0 offen offset:96
+\tv_wmma_f32_16x16x16_bf16 v[89:96], v[194:197], v[178:181], v[89:96]
+\tv_wmma_f32_16x16x16_bf16 v[81:88], v[194:197], v[182:185], v[81:88]
+\tbuffer_load_b128 v[137:140], v161, s[20:23], s0 offen offset:112
+\tv_wmma_f32_16x16x16_bf16 v[73:80], v[194:197], v[186:189], v[73:80]
+\tv_wmma_f32_16x16x16_bf16 v[65:72], v[194:197], v[190:193], v[65:72]
+\ts_wait_dscnt 0x9
+\tbuffer_load_b128 v[157:160], v163, s[24:27], s0 offen offset:64
+\tv_wmma_f32_16x16x16_bf16 v[57:64], v[198:201], v[178:181], v[57:64]
+\tv_wmma_f32_16x16x16_bf16 v[49:56], v[198:201], v[182:185], v[49:56]
+\tbuffer_load_b128 v[153:156], v163, s[24:27], s0 offen offset:80
+\tv_wmma_f32_16x16x16_bf16 v[41:48], v[198:201], v[186:189], v[41:48]
+\tv_wmma_f32_16x16x16_bf16 v[33:40], v[198:201], v[190:193], v[33:40]
+\ts_wait_dscnt 0x8
+\tbuffer_load_b128 v[149:152], v163, s[24:27], s0 offen offset:96
+\tv_wmma_f32_16x16x16_bf16 v[25:32], v[202:205], v[178:181], v[25:32]
+\tv_wmma_f32_16x16x16_bf16 v[17:24], v[202:205], v[182:185], v[17:24]
+\tbuffer_load_b128 v[145:148], v163, s[24:27], s0 offen offset:112
+\tv_wmma_f32_16x16x16_bf16 v[9:16], v[202:205], v[186:189], v[9:16]
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[202:205], v[190:193], v[1:8]
+"""
+    if old_wmma_first_half not in src:
+        raise RuntimeError(
+            "patch_pgr2_distribute: could not find bb.4 first-half WMMA block"
+        )
+    src = src.replace(old_wmma_first_half, new_wmma_first_half, 1)
+
+    return src
+
+
+def patch_dsload_interleave(src: str) -> str:
+    """Interleave second-half ds_loads with first-half WMMAs.
+
+    Baseline bb.4: 16 ds_loads issued back-to-back, then 32 WMMAs with
+    s_wait_dscnt countdown. The second-half loads (regs 206-237, used by
+    WMMAs 17-32) sit idle for ~32 cycles before they're consumed. The
+    first-half loads (regs 174-205) are needed by WMMAs 1-16 and gate
+    the start of computation.
+
+    This patch issues only the FIRST 8 ds_loads upfront (just enough to
+    feed WMMAs 1-16), then fires the second-half 8 ds_loads INTO the
+    WMMA stream after WMMAs 2, 4, 6, 8, 10, 12, 14, 16 (one per even
+    WMMA in the first half). By the time WMMA 17 needs them, they're
+    long since complete — eliminating the s_wait_dscnt 0x3/0x2/0x1/0x0
+    drains at the first→second-half boundary.
+
+    The dscnt counter dance:
+      - Start of bb.4: 8 loads in flight (was 16). dscnt = 8.
+      - After 8 WMMAs + 4 mid-stream loads: dscnt floats around 4-8.
+      - After 16 WMMAs + 8 mid-stream loads: 16 loads issued total,
+        first 8 long done (~30+ cycles ago), last 8 done by issue time
+        + ~30 cycles (which is 8 WMMA pairs ago).
+      - WMMA 17 with NO s_wait_dscnt — all 16 done.
+
+    Wait values are recomputed: the original 0xe→0x8 sequence (waiting
+    for first-half completions among 16 in-flight) becomes 0x6→0x0
+    (waiting for first-half completions among only the first-half 8 in
+    flight, before second-half issue starts). The boundary 0x3→0x0
+    drain is removed entirely.
+    """
+    # Match the entire bb.4 block from the 16 ds_loads through WMMA 20
+    # so the rewrite is unambiguous.
+    old = """\
+\tds_load_b128 v[174:177], v218
+\tds_load_b128 v[178:181], v230
+\tds_load_b128 v[182:185], v230 offset:256
+\tds_load_b128 v[186:189], v230 offset:512
+\tds_load_b128 v[190:193], v234
+\tds_load_b128 v[194:197], v218 offset:256
+\tds_load_b128 v[198:201], v218 offset:512
+\tds_load_b128 v[202:205], v218 offset:768
+\tds_load_b128 v[206:209], v218 offset:4608
+\tds_load_b128 v[210:213], v218 offset:4864
+\tds_load_b128 v[214:217], v218 offset:5120
+\tds_load_b128 v[218:221], v218 offset:5376
+\tds_load_b128 v[222:225], v230 offset:4608
+\tds_load_b128 v[226:229], v230 offset:4864
+\tds_load_b128 v[230:233], v230 offset:5120
+\tds_load_b128 v[234:237], v234 offset:4608
+\ts_wait_dscnt 0xe
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[174:177], v[178:181], v[121:128]
+\ts_wait_dscnt 0xd
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[174:177], v[182:185], v[113:120]
+\ts_wait_dscnt 0xc
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[174:177], v[186:189], v[105:112]
+\ts_wait_dscnt 0xb
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[174:177], v[190:193], v[97:104]
+\ts_wait_dscnt 0xa
+\tv_wmma_f32_16x16x16_bf16 v[89:96], v[194:197], v[178:181], v[89:96]
+\tv_wmma_f32_16x16x16_bf16 v[81:88], v[194:197], v[182:185], v[81:88]
+\tv_wmma_f32_16x16x16_bf16 v[73:80], v[194:197], v[186:189], v[73:80]
+\tv_wmma_f32_16x16x16_bf16 v[65:72], v[194:197], v[190:193], v[65:72]
+\ts_wait_dscnt 0x9
+\tv_wmma_f32_16x16x16_bf16 v[57:64], v[198:201], v[178:181], v[57:64]
+\tv_wmma_f32_16x16x16_bf16 v[49:56], v[198:201], v[182:185], v[49:56]
+\tv_wmma_f32_16x16x16_bf16 v[41:48], v[198:201], v[186:189], v[41:48]
+\tv_wmma_f32_16x16x16_bf16 v[33:40], v[198:201], v[190:193], v[33:40]
+\ts_wait_dscnt 0x8
+\tv_wmma_f32_16x16x16_bf16 v[25:32], v[202:205], v[178:181], v[25:32]
+\tv_wmma_f32_16x16x16_bf16 v[17:24], v[202:205], v[182:185], v[17:24]
+\tv_wmma_f32_16x16x16_bf16 v[9:16], v[202:205], v[186:189], v[9:16]
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[202:205], v[190:193], v[1:8]
+\ts_wait_dscnt 0x3
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[206:209], v[222:225], v[121:128]
+\ts_wait_dscnt 0x2
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[206:209], v[226:229], v[113:120]
+\ts_wait_dscnt 0x1
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[206:209], v[230:233], v[105:112]
+\ts_wait_dscnt 0x0
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[206:209], v[234:237], v[97:104]
+"""
+    # New schedule: 8 first-half ds_loads upfront. WMMAs 1-16 each
+    # interleave one second-half ds_load on the EVEN slots 2,4,6,8,10,12,14,16
+    # (one ds_load per pair of WMMAs). Wait counters now refer to a window
+    # where loads are continuously being issued, so we use saturating waits
+    # (drain-to-N where N = remaining) at the first WMMAs and a final 0x0
+    # drain before WMMA 17. We rely on the LDS pipeline keeping outstanding
+    # ops bounded.
+    new = """\
+\tds_load_b128 v[174:177], v218
+\tds_load_b128 v[178:181], v230
+\tds_load_b128 v[182:185], v230 offset:256
+\tds_load_b128 v[186:189], v230 offset:512
+\tds_load_b128 v[190:193], v234
+\tds_load_b128 v[194:197], v218 offset:256
+\tds_load_b128 v[198:201], v218 offset:512
+\tds_load_b128 v[202:205], v218 offset:768
+\ts_wait_dscnt 0x6
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[174:177], v[178:181], v[121:128]
+\ts_wait_dscnt 0x5
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[174:177], v[182:185], v[113:120]
+\tds_load_b128 v[206:209], v218 offset:4608
+\ts_wait_dscnt 0x5
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[174:177], v[186:189], v[105:112]
+\ts_wait_dscnt 0x4
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[174:177], v[190:193], v[97:104]
+\tds_load_b128 v[210:213], v218 offset:4864
+\ts_wait_dscnt 0x4
+\tv_wmma_f32_16x16x16_bf16 v[89:96], v[194:197], v[178:181], v[89:96]
+\tv_wmma_f32_16x16x16_bf16 v[81:88], v[194:197], v[182:185], v[81:88]
+\tds_load_b128 v[214:217], v218 offset:5120
+\tv_wmma_f32_16x16x16_bf16 v[73:80], v[194:197], v[186:189], v[73:80]
+\tv_wmma_f32_16x16x16_bf16 v[65:72], v[194:197], v[190:193], v[65:72]
+\tds_load_b128 v[218:221], v218 offset:5376
+\ts_wait_dscnt 0x4
+\tv_wmma_f32_16x16x16_bf16 v[57:64], v[198:201], v[178:181], v[57:64]
+\tv_wmma_f32_16x16x16_bf16 v[49:56], v[198:201], v[182:185], v[49:56]
+\tds_load_b128 v[222:225], v230 offset:4608
+\tv_wmma_f32_16x16x16_bf16 v[41:48], v[198:201], v[186:189], v[41:48]
+\tv_wmma_f32_16x16x16_bf16 v[33:40], v[198:201], v[190:193], v[33:40]
+\tds_load_b128 v[226:229], v230 offset:4864
+\ts_wait_dscnt 0x4
+\tv_wmma_f32_16x16x16_bf16 v[25:32], v[202:205], v[178:181], v[25:32]
+\tv_wmma_f32_16x16x16_bf16 v[17:24], v[202:205], v[182:185], v[17:24]
+\tds_load_b128 v[230:233], v230 offset:5120
+\tv_wmma_f32_16x16x16_bf16 v[9:16], v[202:205], v[186:189], v[9:16]
+\tv_wmma_f32_16x16x16_bf16 v[1:8], v[202:205], v[190:193], v[1:8]
+\tds_load_b128 v[234:237], v234 offset:4608
+\ts_wait_dscnt 0x3
+\tv_wmma_f32_16x16x16_bf16 v[121:128], v[206:209], v[222:225], v[121:128]
+\ts_wait_dscnt 0x2
+\tv_wmma_f32_16x16x16_bf16 v[113:120], v[206:209], v[226:229], v[113:120]
+\ts_wait_dscnt 0x1
+\tv_wmma_f32_16x16x16_bf16 v[105:112], v[206:209], v[230:233], v[105:112]
+\ts_wait_dscnt 0x0
+\tv_wmma_f32_16x16x16_bf16 v[97:104], v[206:209], v[234:237], v[97:104]
+"""
+    if old not in src:
+        raise RuntimeError(
+            "patch_dsload_interleave: could not find bb.4 ds_load+WMMA block"
+        )
+    return src.replace(old, new, 1)
+
+
 def patch_storewait0(src: str) -> str:
     """Collapse per-store s_wait_loadcnt 0x7→0x0 countdown in bb.5 into a
     single s_wait_loadcnt 0x0 followed by 8 back-to-back ds_store_b128.
@@ -998,6 +1573,17 @@ def main() -> None:
             "dscnt-collapse",
             "dscnt-collapse-bse",
             "storefuse",
+            "pgr2-lite",
+            "pgr2-lite-bse",
+            "pgr2-bufload",
+            "pgr2-bufload-bse",
+            "pgr2-bufload-noguard",
+            "pgr2-bufload-noguard-bse",
+            "pgr2-distribute",
+            "pgr2-distribute-bse",
+            "dsload-interleave",
+            "dsload-interleave-bse",
+            "dsload-interleave-bufload-bse",
         ],
         default="halfsplit",
     )
@@ -1040,6 +1626,32 @@ def main() -> None:
         out = patch_barriersig_early(patch_dscnt_collapse(src))
     elif args.variant == "storefuse":
         out = patch_storefuse(src)
+    elif args.variant == "pgr2-lite":
+        out = patch_pgr2_lite(src)
+    elif args.variant == "pgr2-lite-bse":
+        out = patch_pgr2_lite(patch_barriersig_early(src))
+    elif args.variant == "pgr2-bufload":
+        out = patch_pgr2_bufload(src)
+    elif args.variant == "pgr2-bufload-bse":
+        out = patch_pgr2_bufload(patch_barriersig_early(src))
+    elif args.variant == "pgr2-bufload-noguard":
+        out = patch_pgr2_drop_guard(patch_pgr2_bufload(src))
+    elif args.variant == "pgr2-bufload-noguard-bse":
+        out = patch_pgr2_drop_guard(patch_pgr2_bufload(patch_barriersig_early(src)))
+    elif args.variant == "pgr2-distribute":
+        out = patch_pgr2_distribute(patch_pgr2_drop_guard(patch_pgr2_bufload(src)))
+    elif args.variant == "pgr2-distribute-bse":
+        out = patch_pgr2_distribute(
+            patch_pgr2_drop_guard(patch_pgr2_bufload(patch_barriersig_early(src)))
+        )
+    elif args.variant == "dsload-interleave":
+        out = patch_dsload_interleave(src)
+    elif args.variant == "dsload-interleave-bse":
+        out = patch_dsload_interleave(patch_barriersig_early(src))
+    elif args.variant == "dsload-interleave-bufload-bse":
+        out = patch_dsload_interleave(
+            patch_pgr2_drop_guard(patch_pgr2_bufload(patch_barriersig_early(src)))
+        )
     else:
         raise AssertionError(args.variant)
     Path(args.output).write_text(out, encoding="utf-8")
