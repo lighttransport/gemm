@@ -6,7 +6,9 @@
 # phases swap CPU calls for GPU kernels stage by stage.
 
 CC      = gcc
+CXX     = g++
 CFLAGS  = -O3 -Wall -Wextra -I. -I.. -march=native
+CXXFLAGS = $(CFLAGS) -std=c++17
 LDFLAGS = -ldl -lm -lpthread
 
 CUEW_SRC   = ../cuew.c
@@ -14,6 +16,9 @@ RUNNER_SRC = cuda_sam3d_runner.c
 CPU_SRC    = sam3d_cpu.c
 TEST_SRC   = test_cuda_sam3d.c
 TARGET     = test_cuda_sam3d
+XATLAS_SRC = ../../common/sam3d_xatlas.cc ../../common/xatlas.cc
+TARGET_OBJS = test_cuda_sam3d.o cuda_sam3d_runner.o sam3d_cpu.o \
+              cuew_sam3d.o sam3d_xatlas.o xatlas.o
 
 VERIFIES = verify_dinov2 verify_cond_fuser verify_ss_dit verify_ss_decoder \
            verify_slat_dit verify_slat_gs verify_ssdit_block_realw \
@@ -52,7 +57,13 @@ COMMON_DEPS = cuda_sam3d_runner.h cuda_sam3d_kernels.h sam3d_cpu.h \
               ../../common/sparse3d.h \
               ../../common/sam3d_gs_decoder.h \
               ../../common/gs_ply_writer.h \
+              ../../common/marching_cubes.h \
+              ../../common/flexicubes_tables.h \
+              ../../common/tiny_gltf.h \
+              ../../common/sam3d_mesh_decoder.h \
+              ../../common/sam3d_xatlas.h \
               ../../common/stb_image.h \
+              ../../common/stb_image_write.h \
               ../../common/npy_io.h
 
 CPU_DEPS    = $(CPU_SRC) sam3d_cpu.h ../../common/dinov2.h \
@@ -68,8 +79,26 @@ CPU_DEPS    = $(CPU_SRC) sam3d_cpu.h ../../common/dinov2.h \
 .PHONY: all clean
 all: $(TARGET) $(VERIFIES) $(KERNEL_TESTS)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
+$(TARGET): $(TARGET_OBJS)
+	$(CXX) -fopenmp -o $@ $(TARGET_OBJS) $(LDFLAGS)
+
+test_cuda_sam3d.o: $(TEST_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -c -o $@ $(TEST_SRC)
+
+cuda_sam3d_runner.o: $(RUNNER_SRC) $(COMMON_DEPS) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -c -o $@ $(RUNNER_SRC)
+
+sam3d_cpu.o: $(CPU_SRC) $(CPU_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -c -o $@ $(CPU_SRC)
+
+cuew_sam3d.o: $(CUEW_SRC) ../cuew.h
+	$(CC) $(CFLAGS) -c -o $@ $(CUEW_SRC)
+
+sam3d_xatlas.o: ../../common/sam3d_xatlas.cc ../../common/sam3d_xatlas.h ../../common/xatlas.h
+	$(CXX) $(CXXFLAGS) -c -o $@ ../../common/sam3d_xatlas.cc
+
+xatlas.o: ../../common/xatlas.cc ../../common/xatlas.h
+	$(CXX) $(CXXFLAGS) -c -o $@ ../../common/xatlas.cc
 
 verify_dinov2: verify_dinov2.c $(RUNNER_SRC) $(CUEW_SRC) $(COMMON_DEPS) $(CPU_DEPS)
 	$(CC) $(CFLAGS) -fopenmp -o $@ verify_dinov2.c $(RUNNER_SRC) $(CPU_SRC) $(CUEW_SRC) $(LDFLAGS)
@@ -336,4 +365,4 @@ verify-slat-gs: verify_slat_gs
 	./verify_slat_gs --safetensors-dir $(SFT) --refdir $(REFDIR)
 
 clean:
-	rm -f $(TARGET) $(VERIFIES) $(KERNEL_TESTS)
+	rm -f $(TARGET) $(VERIFIES) $(KERNEL_TESTS) $(TARGET_OBJS)
