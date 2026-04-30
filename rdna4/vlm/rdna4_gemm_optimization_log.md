@@ -1105,31 +1105,42 @@ Each row is the cumulative state with all prior optimizations active.
    (4742 tok/s; cosine 0.99998776 — F16's larger mantissa gives a
    hair more precision than BF16's 0.99997133). Now F16 and BF16
    `_2w_pre` run at parity.
+9. **FA BQ=64 4-wave** (`flash_attn_wmma_bf16_4w_pre`). Each WG now
+   covers 64 queries with 4 waves (128 threads), all sharing one
+   double-buffered K/V tile. Three independent gains:
+   - DRAM K/V re-reads halve (n_q_blocks halves: 32→16 at n_tok=1024).
+   - The cooperative LDS load is now 8 threads/row × 10 ushorts each
+     (was 4 × 20), better issue-rate utilization.
+   - Per-iter softmax/exp/sync overhead amortizes over 4 waves of
+     compute instead of 2.
+   smP doubles to 4×16×16 ushorts (one per wave) but total LDS still
+   ~12 KB/WG, well under 64 KB. VGPR usage (~168/wave) keeps 2 WGs/SIMD.
+   FA: 4.69 → 3.34 ms/call (-29%). End-to-end at 1024²: 215 → 176 ms
+   (5804 tok/s, +22%); at 2048²: 2500 → 1900 ms (2154 tok/s, +31%).
+   Cosine bit-identical (0.99997133). Env: `HIP_VLM_FA=wmma_bf16_4w_pre`.
 
-### Profile after all of the above (1024², BF16, total GPU 174 ms)
+### Profile after step 9 (1024², BF16 4-wave, total GPU ~280 ms across 2 iters)
 
-- `flash_attn_wmma_bf16_2w_pre`: 71.3% (124 ms over 27 calls = 4.6 ms/call)
-- hipBLASLt ViT GEMMs: 18.4% (32 ms over 110 calls = 0.29 ms/call)
-- `pack_bf16_from_f32` (GEMM input cast): 4.3% (7.5 ms / 110)
-- `layernorm_f32`: 2.0% (3.6 ms)
-- `rope_vision_f32`: 1.8% (3.1 ms)
-- `kv_transpose_bf16`: 1.2% (2.1 ms)
-- everything else: <1%
+- `flash_attn_wmma_bf16_4w_pre`: 64.4% (180 ms / 54 calls = 3.34 ms/call)
+- hipBLASLt ViT GEMMs: 22.9% (64 ms / 220 calls)
+- `pack_bf16_from_f32`: 5.3% (15 ms / 220)
+- `layernorm_f32`: 2.5%
+- `rope_vision_f32`: 2.0%
+- `kv_transpose_bf16`: 1.5%
+- everything else: <2%
 
-FA is decisively the next bottleneck; GEMMs and the cast/norm/rope
-tail are below 4% each.
+FA still dominates but its slice has shrunk from 71% → 64% of the
+trace; the GEMM share grows correspondingly. The next bottleneck-
+candidate is the F32→BF16 input cast (`pack_bf16_from_f32`) which
+runs at ~88 GB/s, far below DRAM peak.
 
 ### Remaining headroom
 
 FA at 4.6 ms/call corresponds to ~13 TFLOP/s vs WMMA peak ~195 — only
 ~7% of peak. Likely attacks, in roughly decreasing expected ROI:
 
-1. **BQ=64 4-wave FA variant.** Halves grid_y (each WG covers 64
-   queries instead of 32) and shares one K/V tile across 4 waves
-   instead of 2. Reduces launch/sync overhead and per-iter K/V DRAM
-   re-reads. VGPRs per wave are stable (~168), so 4 waves × 168 =
-   672 VGPR/SIMD-WG, still leaving 2 WGs/SIMD. Expected: −10 to
-   −20% FA.
+1. ~~BQ=64 4-wave FA variant.~~ **Done — see step 9 above. Measured
+   −29% FA, +22% e2e at 1024² / +31% e2e at 2048².**
 2. **Vectorized b128 LDS loads/stores.** Current K/V loads do 20
    `ds_store_b16` per thread per tile. Switching to a layout where
    each thread writes a contiguous 16-byte chunk (1 `ds_store_b128`)
