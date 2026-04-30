@@ -105,6 +105,13 @@ rdna4/sam3d/test_*
 rdna4/sam3d/verify_*
 !rdna4/sam3d/verify_*.c
 
+# Build artifact binaries — rdna4 sam3d_body
+rdna4/sam3d_body/test_*
+!rdna4/sam3d_body/test_*.c
+rdna4/sam3d_body/verify_*
+!rdna4/sam3d_body/verify_*.c
+rdna4/sam3d_body/*.obj
+
 # Verification output directories
 cpu/sparse3d/ref_output/
 cpu/sparse3d/c_output/
