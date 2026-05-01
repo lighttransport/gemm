@@ -77,6 +77,9 @@ enum ggml_dtype {
     GGML_TYPE_Q4_0_8_8 = 33,
     GGML_TYPE_TQ1_0   = 34,
     GGML_TYPE_TQ2_0   = 35,
+    GGML_TYPE_MXFP4   = 39,
+    GGML_TYPE_NVFP4   = 40,
+    GGML_TYPE_Q1_0    = 41,
     GGML_TYPE_COUNT
 };
 
@@ -205,6 +208,9 @@ static const struct { int block_size; int type_size; } ggml_type_info[] = {
     [GGML_TYPE_Q4_0_8_8] = {32, 18},
     [GGML_TYPE_TQ1_0]   = {256, 54},
     [GGML_TYPE_TQ2_0]   = {256, 66},
+    [GGML_TYPE_MXFP4]   = {32, 17},
+    [GGML_TYPE_NVFP4]   = {64, 36},
+    [GGML_TYPE_Q1_0]    = {128, 18},
 };
 
 const char *gguf_type_name(uint32_t type) {
@@ -217,14 +223,30 @@ const char *gguf_type_name(uint32_t type) {
 }
 
 const char *ggml_type_name(uint32_t type) {
-    static const char *names[] = {
-        "F32","F16","Q4_0","Q4_1","???","???","Q5_0","Q5_1",
-        "Q8_0","Q8_1","Q2_K","Q3_K","Q4_K","Q5_K","Q6_K","Q8_K",
-        "IQ2_XXS","IQ2_XS","IQ3_XXS","IQ1_S","IQ4_NL","IQ3_S","IQ2_S","IQ4_XS",
-        "I8","I16","I32","I64","F64","IQ1_M","BF16",
-        "Q4_0_4_4","Q4_0_4_8","Q4_0_8_8","TQ1_0","TQ2_0"
+    static const char *names[GGML_TYPE_COUNT] = {
+        [GGML_TYPE_F32] = "F32", [GGML_TYPE_F16] = "F16",
+        [GGML_TYPE_Q4_0] = "Q4_0", [GGML_TYPE_Q4_1] = "Q4_1",
+        [GGML_TYPE_Q5_0] = "Q5_0", [GGML_TYPE_Q5_1] = "Q5_1",
+        [GGML_TYPE_Q8_0] = "Q8_0", [GGML_TYPE_Q8_1] = "Q8_1",
+        [GGML_TYPE_Q2_K] = "Q2_K", [GGML_TYPE_Q3_K] = "Q3_K",
+        [GGML_TYPE_Q4_K] = "Q4_K", [GGML_TYPE_Q5_K] = "Q5_K",
+        [GGML_TYPE_Q6_K] = "Q6_K", [GGML_TYPE_Q8_K] = "Q8_K",
+        [GGML_TYPE_IQ2_XXS] = "IQ2_XXS", [GGML_TYPE_IQ2_XS] = "IQ2_XS",
+        [GGML_TYPE_IQ3_XXS] = "IQ3_XXS", [GGML_TYPE_IQ1_S] = "IQ1_S",
+        [GGML_TYPE_IQ4_NL] = "IQ4_NL", [GGML_TYPE_IQ3_S] = "IQ3_S",
+        [GGML_TYPE_IQ2_S] = "IQ2_S", [GGML_TYPE_IQ4_XS] = "IQ4_XS",
+        [GGML_TYPE_I8] = "I8", [GGML_TYPE_I16] = "I16",
+        [GGML_TYPE_I32] = "I32", [GGML_TYPE_I64] = "I64",
+        [GGML_TYPE_F64] = "F64", [GGML_TYPE_IQ1_M] = "IQ1_M",
+        [GGML_TYPE_BF16] = "BF16",
+        [GGML_TYPE_Q4_0_4_4] = "Q4_0_4_4",
+        [GGML_TYPE_Q4_0_4_8] = "Q4_0_4_8",
+        [GGML_TYPE_Q4_0_8_8] = "Q4_0_8_8",
+        [GGML_TYPE_TQ1_0] = "TQ1_0", [GGML_TYPE_TQ2_0] = "TQ2_0",
+        [GGML_TYPE_MXFP4] = "MXFP4", [GGML_TYPE_NVFP4] = "NVFP4",
+        [GGML_TYPE_Q1_0] = "Q1_0",
     };
-    if (type < GGML_TYPE_COUNT) return names[type];
+    if (type < GGML_TYPE_COUNT && names[type]) return names[type];
     return "unknown";
 }
 
