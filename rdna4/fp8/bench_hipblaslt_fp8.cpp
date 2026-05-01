@@ -32,6 +32,9 @@ struct Shape { const char* name; int m, n, k; };
 static const Shape kShapes[] = {
     {"mm0", 1024, 4608, 4608},
     {"mm2", 1024, 5120, 4608},
+    {"big",  8192, 4608, 4608},
+    {"sq4k", 4096, 4096, 4096},
+    {"ffn",  8192, 18432, 4608},
 };
 
 static double timer_ms() {
@@ -137,12 +140,26 @@ int main(int argc, char** argv) {
     HBLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_C_SCALE_POINTER, &dScaleC, sizeof(dScaleC)));
     HBLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_D_SCALE_POINTER, &dScaleD, sizeof(dScaleD)));
 
+    bool use_all = (getenv("HBLT_ALL_ALGOS") != nullptr);
     int returned = 0;
-    std::vector<hipblasLtMatmulHeuristicResult_t> heur(32);
-    auto heur_st = hipblasLtMatmulAlgoGetHeuristic(
-        handle, matmul, layoutA, layoutB, layoutC, layoutC,
-        pref, (int)heur.size(), heur.data(), &returned);
-    printf("  heuristic status=%d candidates=%d\n", (int)heur_st, returned);
+    std::vector<hipblasLtMatmulHeuristicResult_t> heur;
+    if (use_all) {
+        // Enumerate the entire Tensile catalog for FP8 (B8B8) — far more than the
+        // 32 results returned by GetHeuristic. Each algo still needs IsAlgoSupported.
+        auto st = hipblaslt_ext::getAllAlgos(
+            handle, hipblaslt_ext::GemmType::HIPBLASLT_GEMM,
+            HIPBLAS_OP_T, HIPBLAS_OP_N,
+            HIP_R_8F_E4M3, HIP_R_8F_E4M3, HIP_R_32F, HIP_R_32F,
+            HIPBLAS_COMPUTE_32F, heur);
+        printf("  getAllAlgos status=%d candidates=%zu\n", (int)st, heur.size());
+        returned = (int)heur.size();
+    } else {
+        heur.resize(32);
+        auto heur_st = hipblasLtMatmulAlgoGetHeuristic(
+            handle, matmul, layoutA, layoutB, layoutC, layoutC,
+            pref, (int)heur.size(), heur.data(), &returned);
+        printf("  heuristic status=%d candidates=%d\n", (int)heur_st, returned);
+    }
     fflush(stdout);
     if (returned == 0) {
         fprintf(stderr, "hipBLASLt: no FP8 algorithm available for shape %s\n", sh->name);
