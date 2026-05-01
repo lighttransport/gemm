@@ -402,7 +402,7 @@ static int cublas_lt_fp8_gemm_timed(CUstream stream,
 /* PTX kernel module cache                                                 */
 /* ---------------------------------------------------------------------- */
 
-typedef enum { PTX_V1 = 1, PTX_V2 = 2, PTX_V3 = 3, PTX_V4 = 4, PTX_V5 = 5, PTX_V6 = 6, PTX_V7 = 7 } ptx_rev_t;
+typedef enum { PTX_V1 = 1, PTX_V2 = 2, PTX_V3 = 3, PTX_V4 = 4, PTX_V5 = 5, PTX_V6 = 6, PTX_V7 = 7, PTX_V8 = 8 } ptx_rev_t;
 
 typedef struct {
     /* v1 modules + functions */
@@ -433,6 +433,10 @@ typedef struct {
     CUmodule mod_f16_v7, mod_bf16_v7, mod_fp8_v7;
     CUfunction f_f16_v7, f_bf16_v7, f_fp8_v7;
     int built_f16_v7, built_bf16_v7, built_fp8_v7;
+    /* v8 modules + functions (f16/bf16/fp8; split-K via gridDim.z) */
+    CUmodule mod_f16_v8, mod_bf16_v8, mod_fp8_v8;
+    CUfunction f_f16_v8, f_bf16_v8, f_fp8_v8;
+    int built_f16_v8, built_bf16_v8, built_fp8_v8;
 } kernel_cache_t;
 
 static int build_kernel(kernel_cache_t *kc, dtype_t dt, ptx_rev_t rev, CUdevice dev, int verbose) {
@@ -440,7 +444,14 @@ static int build_kernel(kernel_cache_t *kc, dtype_t dt, ptx_rev_t rev, CUdevice 
     CUfunction *fn;
     const char *src, *name;
     int *built;
-    if (rev == PTX_V7) {
+    if (rev == PTX_V8) {
+        switch (dt) {
+            case DT_F16:  mod = &kc->mod_f16_v8;  fn = &kc->f_f16_v8;  src = k_gemm_f16_v8_src;  name = "gemm_f16_v8";  built = &kc->built_f16_v8;  break;
+            case DT_BF16: mod = &kc->mod_bf16_v8; fn = &kc->f_bf16_v8; src = k_gemm_bf16_v8_src; name = "gemm_bf16_v8"; built = &kc->built_bf16_v8; break;
+            case DT_FP8:  mod = &kc->mod_fp8_v8;  fn = &kc->f_fp8_v8;  src = k_gemm_fp8_v8_src;  name = "gemm_fp8_v8";  built = &kc->built_fp8_v8;  break;
+            default: return -1;
+        }
+    } else if (rev == PTX_V7) {
         switch (dt) {
             case DT_F16:  mod = &kc->mod_f16_v7;  fn = &kc->f_f16_v7;  src = k_gemm_f16_v7_src;  name = "gemm_f16_v7";  built = &kc->built_f16_v7;  break;
             case DT_BF16: mod = &kc->mod_bf16_v7; fn = &kc->f_bf16_v7; src = k_gemm_bf16_v7_src; name = "gemm_bf16_v7"; built = &kc->built_bf16_v7; break;
@@ -512,6 +523,7 @@ typedef struct {
     int verify_rows;
     int verbose;
     ptx_rev_t ptx_rev;
+    int split_k;  /* gridDim.z for v8; 1 means no split */
     cublasew_context *blas_ctx;
     kernel_cache_t *kc;
     CUdevice dev;
@@ -526,11 +538,14 @@ typedef struct {
 
 static int run_ptx(bench_ctx_t *b, dtype_t dt, float *avg_ms_out) {
     ptx_rev_t rev = b->ptx_rev;
-    /* fp8 has v1, v5, v7 only — fall back to v1 for other revs */
-    if (dt == DT_FP8 && rev != PTX_V5 && rev != PTX_V7) rev = PTX_V1;
+    /* fp8 has v1, v5, v7, v8 only — fall back to v1 for other revs */
+    if (dt == DT_FP8 && rev != PTX_V5 && rev != PTX_V7 && rev != PTX_V8) rev = PTX_V1;
     if (build_kernel(b->kc, dt, rev, b->dev, b->verbose) != 0) return -1;
     CUfunction fn;
-    if (rev == PTX_V7) {
+    if (rev == PTX_V8) {
+        fn = (dt == DT_F16) ? b->kc->f_f16_v8 :
+             (dt == DT_BF16) ? b->kc->f_bf16_v8 : b->kc->f_fp8_v8;
+    } else if (rev == PTX_V7) {
         fn = (dt == DT_F16) ? b->kc->f_f16_v7 :
              (dt == DT_BF16) ? b->kc->f_bf16_v7 : b->kc->f_fp8_v7;
     } else if (rev == PTX_V6) {
@@ -549,11 +564,32 @@ static int run_ptx(bench_ctx_t *b, dtype_t dt, float *avg_ms_out) {
              (dt == DT_BF16) ? b->kc->f_bf16 : b->kc->f_fp8;
     }
     int M = b->M, N = b->N, K = b->K;
-    int gx, gy, block;
+    int gx, gy, gz = 1, block;
     size_t smem_bytes;
-    if (rev == PTX_V7) {
+    if (rev == PTX_V8) {
         gx = (N + 127) / 128;
         gy = (M + 63) / 64;
+        gz = (b->split_k > 0) ? b->split_k : 1;
+        block = 256;
+        smem_bytes = 2 * (64 * 32 + 128 * 32) * 2;  /* same as v5/v7; 24 KiB */
+        /* split-K alignment check: K must be divisible by gz * (32 for f16/bf16, 64 for fp8) */
+        int kstep = (dt == DT_FP8) ? 64 : 32;
+        if (K % (gz * kstep) != 0) {
+            fprintf(stderr, "  PTX v8: K=%d not divisible by split_k(%d)*kstep(%d); falling back split_k=1\n",
+                    K, gz, kstep);
+            gz = 1;
+        }
+    } else if (rev == PTX_V7) {
+        /* v7's 4x4 CTA panel swizzle requires the launched grid to cover all
+         * panels — pad gx and gy up to multiples of 4 so every panel slot
+         * gets a CTA. The kernel's cta_m>=M and yr<M / yc<N write guards
+         * already handle the padded out-of-bounds tiles safely. Without
+         * padding, shapes where ceil(M/64) or ceil(N/128) is not a multiple
+         * of 4 silently drop entire N strips. */
+        int npx = (N + 127) / 128;
+        int npy = (M + 63) / 64;
+        gx = (npx + 3) & ~3;
+        gy = (npy + 3) & ~3;
         block = 256;
         smem_bytes = 2 * (64 * 32 + 128 * 32) * 2;  /* same SMEM as v5; 24 KiB */
     } else if (rev == PTX_V6) {
@@ -578,10 +614,12 @@ static int run_ptx(bench_ctx_t *b, dtype_t dt, float *avg_ms_out) {
         smem_bytes = (dt == DT_FP8) ? 16 * 32 : 16 * 16 * 2;
     }
     void *args[] = { &b->d_Y, &b->d_X, &b->d_W, &M, &N, &K };
+    int needs_zero_y = (rev == PTX_V8 && gz > 1);
 
     /* Warmup */
     for (int i = 0; i < b->warmup; i++) {
-        if (cuLaunchKernel(fn, gx, gy, 1, block, 1, 1, smem_bytes, b->stream, args, NULL) != CUDA_SUCCESS) {
+        if (needs_zero_y) cuMemsetD8Async(b->d_Y, 0, (size_t)M * N * sizeof(float), b->stream);
+        if (cuLaunchKernel(fn, gx, gy, gz, block, 1, 1, smem_bytes, b->stream, args, NULL) != CUDA_SUCCESS) {
             fprintf(stderr, "  PTX: cuLaunchKernel failed\n"); return -1;
         }
     }
@@ -592,7 +630,8 @@ static int run_ptx(bench_ctx_t *b, dtype_t dt, float *avg_ms_out) {
     cuEventCreate(&stop,  CU_EVENT_DEFAULT);
     cuEventRecord(start, b->stream);
     for (int i = 0; i < b->iters; i++) {
-        cuLaunchKernel(fn, gx, gy, 1, block, 1, 1, smem_bytes, b->stream, args, NULL);
+        if (needs_zero_y) cuMemsetD8Async(b->d_Y, 0, (size_t)M * N * sizeof(float), b->stream);
+        cuLaunchKernel(fn, gx, gy, gz, block, 1, 1, smem_bytes, b->stream, args, NULL);
     }
     cuEventRecord(stop, b->stream);
     cuEventSynchronize(stop);
@@ -748,7 +787,7 @@ static void print_row(dtype_t dt, bmode_t md, const char *shape_name,
 
 static int run_shape(dtype_t dt, bmode_t md, const shape_t *sh,
                      int warmup, int iters, int verify, int verify_rows, int verbose,
-                     ptx_rev_t ptx_rev,
+                     ptx_rev_t ptx_rev, int split_k,
                      cublasew_context *blas_ctx, kernel_cache_t *kc,
                      CUdevice dev, CUstream stream) {
     int M = sh->M, N = sh->N, K = sh->K;
@@ -799,7 +838,7 @@ static int run_shape(dtype_t dt, bmode_t md, const shape_t *sh,
     cuMemsetD8(d_Y, 0, (size_t)M * N * sizeof(float));
 
     bench_ctx_t b = { M, N, K, warmup, iters, verify, verify_rows, verbose,
-                      ptx_rev, blas_ctx, kc, dev, stream,
+                      ptx_rev, split_k, blas_ctx, kc, dev, stream,
                       X_f32, W_f32, Y_ref, d_X, d_W, d_Y, Xq, Wq };
 
     float *Y_host = (float *)malloc((size_t)M * N * sizeof(float));
@@ -860,7 +899,8 @@ static void print_usage(const char *prog) {
     printf("  --verify 0|1               run CPU validation (default 1)\n");
     printf("  --verify-rows N            CPU ref rows (default 64)\n");
     printf("  --verbose N                NVRTC verbosity (default 0)\n");
-    printf("  --ptx-rev v1|v2|v3|v4|v5|v6 PTX kernel revision (default v5)\n");
+    printf("  --ptx-rev v1|v2|v3|v4|v5|v6|v7|v8 PTX kernel revision (default v7)\n");
+    printf("  --split-k N                v8 split-K factor (default 1)\n");
     printf("  --list-shapes              list shape table and exit\n");
     printf("Available shapes:\n");
     for (int i = 0; i < N_SHAPES; i++)
@@ -877,6 +917,7 @@ int main(int argc, char **argv) {
     int verify = 1, verify_rows = 64;
     int verbose = 0;
     ptx_rev_t ptx_rev = PTX_V7;
+    int split_k = 1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dtype") && i+1<argc) {
@@ -910,8 +951,10 @@ int main(int argc, char **argv) {
             else if (!strcmp(s, "v5")) ptx_rev = PTX_V5;
             else if (!strcmp(s, "v6")) ptx_rev = PTX_V6;
             else if (!strcmp(s, "v7")) ptx_rev = PTX_V7;
+            else if (!strcmp(s, "v8")) ptx_rev = PTX_V8;
             else { fprintf(stderr, "unknown ptx-rev %s\n", s); return 1; }
         }
+        else if (!strcmp(argv[i], "--split-k") && i+1<argc) split_k = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--list-shapes")) { print_usage(argv[0]); return 0; }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { print_usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
@@ -961,16 +1004,16 @@ int main(int argc, char **argv) {
 
     if (M > 0 && N > 0 && K > 0) {
         shape_t adhoc = {"adhoc", M, N, K};
-        run_shape(dt, md, &adhoc, warmup, iters, verify, verify_rows, verbose, ptx_rev, blas_ctx, &kc, dev, stream);
+        run_shape(dt, md, &adhoc, warmup, iters, verify, verify_rows, verbose, ptx_rev, split_k, blas_ctx, &kc, dev, stream);
     } else if (!strcmp(shape_name, "all")) {
         for (int i = 0; i < N_SHAPES; i++) {
-            run_shape(dt, md, &g_shapes[i], warmup, iters, verify, verify_rows, verbose, ptx_rev, blas_ctx, &kc, dev, stream);
+            run_shape(dt, md, &g_shapes[i], warmup, iters, verify, verify_rows, verbose, ptx_rev, split_k, blas_ctx, &kc, dev, stream);
         }
     } else {
         const shape_t *sh = NULL;
         for (int i = 0; i < N_SHAPES; i++) if (!strcmp(g_shapes[i].name, shape_name)) { sh = &g_shapes[i]; break; }
         if (!sh) { fprintf(stderr, "unknown shape %s\n", shape_name); return 1; }
-        run_shape(dt, md, sh, warmup, iters, verify, verify_rows, verbose, ptx_rev, blas_ctx, &kc, dev, stream);
+        run_shape(dt, md, sh, warmup, iters, verify, verify_rows, verbose, ptx_rev, split_k, blas_ctx, &kc, dev, stream);
     }
 
     if (blas_ctx) cublasewDestroy(blas_ctx);
@@ -987,6 +1030,12 @@ int main(int argc, char **argv) {
     if (kc.built_bf16_v5) cuModuleUnload(kc.mod_bf16_v5);
     if (kc.built_f16_v6)  cuModuleUnload(kc.mod_f16_v6);
     if (kc.built_bf16_v6) cuModuleUnload(kc.mod_bf16_v6);
+    if (kc.built_f16_v7)  cuModuleUnload(kc.mod_f16_v7);
+    if (kc.built_bf16_v7) cuModuleUnload(kc.mod_bf16_v7);
+    if (kc.built_fp8_v7)  cuModuleUnload(kc.mod_fp8_v7);
+    if (kc.built_f16_v8)  cuModuleUnload(kc.mod_f16_v8);
+    if (kc.built_bf16_v8) cuModuleUnload(kc.mod_bf16_v8);
+    if (kc.built_fp8_v8)  cuModuleUnload(kc.mod_fp8_v8);
     cuStreamDestroy(stream);
     cuCtxDestroy(ctx);
     if (g_lt_lib) dlclose(g_lt_lib);
