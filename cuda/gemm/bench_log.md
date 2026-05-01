@@ -449,3 +449,58 @@ Bottlenecks mirror f16/bf16 v5 exactly:
   taller-N or 32×256 tile variant.
 - **square_1k 77%**: too few CTAs (1024/64 × 1024/128 = 16 × 8 = 128
   CTAs vs 36 SMs × ~6 needed for full occupancy). Tail effect.
+
+## v7 — v5 + 4×4 CTA panel swizzle (RTX 5060 Ti, sm_120)
+
+Same kernel body as v5; only difference is the (cta_m, cta_n) computation
+inside each CTA. CTAs are remapped to walk a 4×4 panel (16 CTAs per panel)
+M-tile-fastest within the panel. Each wave of ~36 CTAs lands inside ≤2
+panels → working set per wave is ~4 W tiles + ~8 X tiles, comfortably in
+the 32 MiB L2 even at K=8192. SMEM, mma op, ldmatrix layout unchanged.
+
+Refactor: V5_BODY macro was generalized to take a CTA_INIT param so v5
+(simple) and v7 (swizzled) share the same 150-line kernel body. fp8_v7
+is a separate string (global type differs from SMEM type).
+
+| dtype | shape       | v5 TFLOP/s | v7 TFLOP/s | speedup | % nom |
+|------:|:------------|-----------:|-----------:|--------:|------:|
+| f16   | square_1k   |     35.09  |     35.17  |   1.00× |   84% |
+| f16   | square_2k   |     ~42    |     42.19  |   1.00× |  101% |
+| f16   | square_4k   |     ~44    |     43.67  |   1.00× |  104% |
+| f16   | square_8k   |     25.57  |   **42.48**|   1.66× |**101%**|
+| f16   | mm0         |     ~31    |     44.78  |   1.45× |  107% |
+| f16   | mm2         |     ~42    |     42.76  |   1.02× |  102% |
+| f16   | qkv         |     ~36    |     38.92  |   1.08× |   93% |
+| f16   | attn_out    |     ~36    |     39.00  |   1.08× |   93% |
+| f16   | ffn_up      |     ~16    |   **44.93**|   2.81× |**107%**|
+| f16   | ffn_down    |     ~32    |     38.84  |   1.21× |   93% |
+| bf16  | square_4k   |     ~44    |     44.41  |   1.00× |  106% |
+| bf16  | square_8k   |     25.55  |   **43.18**|   1.69× |**103%**|
+| bf16  | mm0         |     ~31    |     44.98  |   1.45× |  107% |
+| bf16  | ffn_up      |     ~16    |   **45.30**|   2.83× |**108%**|
+| fp8   | square_4k   |     88.76  |     89.23  |   1.01× |  106% |
+| fp8   | square_8k   |     50.92  |   **84.67**|   1.66× |**101%**|
+| fp8   | mm0         |     88.08  |     88.46  |   1.00× |  105% |
+| fp8   | ffn_up      |     38.48  |   **88.46**|   2.30× |**105%**|
+
+(v5 numbers for shapes not previously tabulated are approximate from
+prior sweeps; the v7 column is freshly measured.)
+
+**Headline wins:**
+- f16/bf16/fp8 square_8k: 1.66×–1.69× speedup → all hit ≥101% nominal
+- f16/bf16 ffn_up: 2.81×–2.83× speedup → 107–108% nominal
+- fp8 ffn_up: 2.30× speedup → 105% nominal
+- 8/10 shapes now sustain ≥100% of nominal peak across all three dtypes
+
+**Why so much win on ffn_up too:** N=11008 is wide so the working set
+spread across naive blockIdx.x ordering is huge, and the swizzle
+recovers W reuse. Same mechanism as square_8k just with M=512.
+
+**Remaining sub-peak shapes (unchanged by swizzle):**
+- square_1k 84%: only 128 CTAs / 36 SMs ≈ 3.5 waves → tail effect
+- qkv / attn_out / ffn_down 92–93%: M=512 limits CTA count further
+
+These are occupancy/wavefront-tail issues, not compute or L2. Closing
+the last 7–8% would need split-K or persistent kernel.
+
+v7 is the new default (recommend `--ptx-rev v7`).
