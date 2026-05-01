@@ -100,8 +100,8 @@ _MESH_COUNT_RE = re.compile(r"\(V=(\d+)\s+F=(\d+)\)")
 
 def _parse_bbox_log(stderr):
     """Parse the runner's auto-bbox log line.
-    CPU  emits: 'auto-bbox: score=0.980 bbox=(0.1,5.9,768.1,1019.4)'
-    CUDA emits: 'auto-bbox score=0.9797 x0=0.1 y0=5.9 x1=768.1 y1=1019.4'
+    CPU/CUDA emit: 'auto-bbox: detector=rt-detr-s score=... bbox=(...)'
+    Older CUDA logs used separate x0=... y0=... tokens; keep parsing both.
     """
     for line in stderr.splitlines():
         if "auto-bbox" not in line:

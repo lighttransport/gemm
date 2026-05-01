@@ -9,9 +9,10 @@
  *   MHR skinning (params → 3D vertices) →
  *   camera unproject → 2D/3D keypoints + vertices in camera frame.
  *
- * v1 scope: DINOv3 backbone variant (facebook/sam-3d-body-dinov3),
- * single-person from user-supplied cropped RGB, no prompts.
- * ViT-H variant deferred (shares decoder + MHR code).
+ * Current scope: DINOv3 and ViT-H backbone variants, single-person
+ * RGB input with an optional image-space bbox. CLI tools can obtain
+ * that bbox from native RT-DETR-S auto-crop; this core runner treats
+ * bbox selection as caller-owned and falls back to the full image.
  *
  * All buffers are row-major, float32 on host. Per-module safetensors
  * slices are produced by cpu/sam3d_body/convert_ckpt.py from the
