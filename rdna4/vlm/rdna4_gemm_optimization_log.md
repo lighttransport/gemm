@@ -1186,3 +1186,190 @@ HIP_VLM_FA=wmma_bf16_2w_pre ./test_hip_vision \
     --warmup 2 --iters 5
 ```
 
+## 2026-05-02 — FP8 e4m3 GEMM on gfx1201
+
+Companion to the BF16 mm0 work above. Same shape (M=1024, N=4608,
+K=4608) but with FP8 e4m3 inputs and FP32 accumulation, exercising the
+`v_wmma_f32_16x16x16_fp8_fp8` opcode that lives only on gfx1201 (not on
+gfx1200/RDNA3).
+
+### Hardware ceiling
+
+| measurement | TFLOP/s | source |
+| --- | ---: | --- |
+| AMD-published FP8 dense peak (RX 9070 XT) | 389 | datasheet |
+| Microbench, 4-wave WG (128 threads, 1 wave/SIMD) | 320.7 | `peak_fp8_4w` |
+| Microbench, 8-wave WG (256 threads, 2 waves/SIMD) | 351.0 | `peak_fp8_8w` |
+
+The 8-wave microbench captures 90% of AMD-documented peak; we treat
+**351 TF/s as the achievable ceiling** for this stack.
+
+### Best results — three paths
+
+| path | mm0 ms | mm0 TFLOP/s | % of 351 ceiling | % of 389 peak | correctness |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **`bench_fp8_extracted` (standalone, no hipBLASLt)** | **0.1994** | **218.1** | **62%** | **56%** | cos vs FP32 ref = 1.000000 |
+| `bench_hipblaslt_fp8` (heur top + getAllAlgos) | 0.1965 | 221.3 | 63% | 57% | (host-only check) |
+| `torch._scaled_mm` (PyTorch 2.11+rocm7.2.2) | ~0.207 | 210.7 | 60% | 54% | cos vs FP32 = 0.9993 |
+| HIPRTC-compiled `gemm_fp8_pipe32` (handwritten) | 0.304 | 143.8 | 41% | 37% | cos = 1.000 |
+
+The standalone path matches hipBLASLt within 1% with **zero runtime
+linkage to libhipblaslt** — only `hipModuleLoad` +
+`hipExtModuleLaunchKernel` over an extracted Tensile binary.
+
+Across shapes (hipBLASLt full 656-algo sweep, top of all candidates):
+
+| shape (M×N×K) | TFLOP/s | % of 351 |
+| --- | ---: | ---: |
+| mm0 (1024×4608×4608) | 226 | 64% |
+| big (8192×4608×4608) | 238 | 68% |
+| sq4k (4096³)         | 253 | 72% ← absolute best |
+
+253 TF/s = 72% of the 8-wave WMMA microbench ceiling. The Tensile
+catalog as shipped on ROCm 7.2.2 has no FP8 kernel that closes that
+remaining 28%; exceeding it would require new tunings, CK kernels, or
+hand-tuned kernels.
+
+### Where the handwritten `pipe32` plateaus at ~44 % peak
+
+`rdna4/fp8/bench_fp8_gemm.c gemm_fp8_pipe32` is the FP8 mirror of the
+BF16 `mm0pipe4w` kernel: K_step=32, MT=128×128, MIWT 4×4,
+double-buffered LDS, `__launch_bounds__(128,1)`. Sustains **143.8 TF/s
+on mm0** (cos=1.0). Four levers tried, all null:
+
+| variant | TFLOP/s | result |
+| --- | ---: | --- |
+| `pipe32` baseline | 143.8 | — |
+| `pipe32_hoist` (hoist common-subexpr) | ~143 | null |
+| `pipe32_occ` (`__launch_bounds__(128,2)`) | ~143 | null |
+| `pipe32_pgr2` (3-LDS-buf, 2-K prefetch) | 143–156 | session-dependent |
+| `pipe32_prio` (`s_setprio 3` + `s_wait_dscnt`) | 143.8 | null |
+| `pipe32_u32` (u32x4 globals + u32x2 LDS) | 120.6 | regression |
+| `pipe32_asm` (whole 32-WMMA block as one inline-asm) | 145.1 | +1% (null) |
+| `pipe32_8w` (8-wave WG, MIWT 4×2) | 145.6 | null |
+
+Three findings collapse the search:
+
+1. **Scheduler is not the bottleneck.** Inline-asm 32-WMMA block (no
+   compiler interleaving) gives only +1%.
+2. **WMMA throughput is not the bottleneck.** 8-wave WG raises the
+   ceiling +9% (320 → 351 TF/s) but the kernel's *capture rate* drops
+   (45% → 41%). If WMMA were saturated we'd see a proportional gain.
+3. **LDS read count is already minimized.** Asm dump shows pipe32
+   issues 8 `ds_load_2addr_b64` per K-step (compiler-merged).
+   `ds_read_b64_tr_b8` would replace 8:1 with 8:1 — zero cycle savings.
+
+The remaining gap to hipBLASLt's 218 TF/s is therefore in operand fetch
+(LDS bank conflicts on SPLIT_LO/HI store layout), global-load BW, or
+VGPR pressure that prevents 2 waves/SIMD scheduling at the 8-wave
+config. None tried in this session.
+
+### How the standalone launcher was extracted
+
+Pivoting from "tune our handwritten kernel" to "ship hipBLASLt's best
+kernel without the runtime dependency" — analogous to the BF16
+`mm0extract` mode but adapted to the FP8 ABI.
+
+1. **Locate the right Tensile library.** PyTorch's `torch._scaled_mm`
+   uses `transA=T, transB=N` for FP8 e4m3 on gfx1201 (kernel name
+   prefix `Cijk_Alik_Bljk_F8SS_...`). Only the `_Alik_Bljk_` Tensile
+   library variant has working FP8 algos; the other three (Ailk_Bjlk,
+   Ailk_Bljk, Alik_Bjlk) hang or return IMA. The lib is
+   `TensileLibrary_F8F8_SF8_HA_Bias_SAB_SCD_SAV_UA_Type_F8S_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_gfx1201.co`.
+2. **Decompress the CCOB+zstd container.** Each Tensile `.co` is
+   `CCOB` magic + 24-byte header + zstd-compressed blob. Skip 32 bytes,
+   feed to `zstd -d`. Decompressed blob has the Tensile YAML
+   (kernel-name registry) followed by an embedded AMD GPU ELF at
+   offset 4096.
+3. **Identify the dispatched algo.** `rocprofv3 --kernel-trace
+   --output-format csv` on `bench_hipblaslt_fp8` exposes the actual
+   F8SS kernel name + LDS/VGPR/grid for every dispatch. Sort by
+   duration to pick the fastest. Best for mm0:
+   `..._MT128x128x64_MI16x16x1_..._MIWT4_4_..._PGR2_..._WG32_4_1`
+   (algo[9], 218 TF/s) or `..._MIWT8_2_..._WG16_8_1` (algo[0], 210
+   TF/s).
+4. **Capture the kernarg.** `dump_kernarg_shim` (vlm) intercepts
+   `hipExtModuleLaunchKernel` and dumps the 172-byte FP8 kernarg
+   buffer per dispatch. Buffer offsets (from the kernel's AMDHSA
+   metadata):
+
+   | offset | field | size | notes |
+   | ---: | --- | ---: | --- |
+   | 0   | gemm_info     | 4 | = 1 |
+   | 4   | internalArg0  | 4 | = 0x02200001 (gsu=1, stagger bits) |
+   | 8   | internalArg1  | 4 | = 0x08010008 (wgmxccg=32, wgm=8) |
+   | 12  | numWG         | 4 | = N / MT_N |
+   | 16  | SizesFree0    | 4 | N |
+   | 20  | SizesFree1    | 4 | M |
+   | 24  | SizesFree2    | 4 | batch |
+   | 28  | SizesSum0     | 4 | K |
+   | 32  | D ptr         | 8 | FP32 output |
+   | 40  | C ptr         | 8 | FP32 input (= D for β=0 GEMM) |
+   | 48  | A ptr         | 8 | **FP8 weights, size N·K** (transA=T flips natural M·K) |
+   | 56  | B ptr         | 8 | **FP8 input, size M·K** |
+   | 64–92 | strides D0/D1, C0/C1, A0/A1, B0/B1 | 4 each | strideA0=strideB0=K, strideD0=N |
+   | 96  | alpha (f32)   | 4 | 1.0 |
+   | 100 | beta (f32)    | 4 | 0.0 |
+   | **104** | **scaleA ptr** | **8** | device fp32; must point to 1.0 |
+   | **112** | **scaleB ptr** | **8** | device fp32; must point to 1.0 |
+   | **120** | **scaleC ptr** | **8** | device fp32 |
+   | **128** | **scaleD ptr** | **8** | device fp32 |
+   | 136 | scaleAlphaVec | 8 | nullptr |
+   | 144 | bias ptr      | 8 | nullptr |
+   | 152 | biasType      | 4 | 0 |
+   | 156 | strideBias    | 4 | 0 |
+   | 160 | actAlpha      | 4 | 0.0 |
+   | 164 | actBeta       | 4 | 0.0 |
+   | 168 | actType       | 4 | 0 |
+
+   The bold rows are FP8-only (BF16 mm0extract has no scaleA/B/C/D
+   pointers; FP8 kernarg is 172 B vs 140 B for BF16). The kernel
+   *reads* scaleA and scaleB even when both are 1.0, so allocating
+   four 4-byte FP32 buffers initialised to 1.0 is mandatory — passing
+   nullptr hangs the GPU.
+5. **Pointer convention gotcha.** hipBLASLt with transA=T,transB=N
+   passes the *N×K* matrix as the A operand and the *M×K* matrix as
+   the B operand. In the launcher, the kernarg `A` field gets the
+   weights buffer (size N·K) and the `B` field gets the input buffer
+   (size M·K). Swapping these is what made the first launcher hang.
+6. **Launch.** grid=(N, M/MT_M, 1), block=(128,1,1), sharedMem=0
+   (LDS is `.group_segment_fixed_size` per the AMDHSA metadata, set
+   automatically by the driver). Use `hipExtModuleLaunchKernel` with
+   the standard `HIP_LAUNCH_PARAM_BUFFER_POINTER/SIZE/END` triple.
+
+### Side-discoveries
+
+- **`torch._scaled_mm` works on gfx1201 / ROCm 7.2.2** at 210–225
+  TF/s across our shapes once you install the Radeon manylinux
+  wheels (`torch-2.11.0+rocm7.2.2.lw...`,
+  `triton-3.6.0+rocm7.2.2.git...`). `bench_torch_fp8.py` reproduces.
+- **Direct hipBLASLt C++ FP8 only works with transA=T, transB=N.**
+  The N/T form selects the broken `Ailk_Bjlk` Tensile variant — 32
+  algos enumerate but every one returns IMA, hangs, or aborts in
+  `unordered_map::at`. After the T/N fix all 32 algos run.
+- **FP8 dense peak ≈ 2× BF16 on gfx1201.** Microbench-confirmed: 351
+  TF/s 8-wave FP8 vs 164 TF/s BF16 K=16. Matches the AMD-stated
+  389/195 ratio.
+
+### Files
+
+- Bench/launcher:
+  - `rdna4/fp8/bench_fp8_gemm.c` — handwritten HIPRTC `pipe32` etc.
+  - `rdna4/fp8/bench_hipblaslt_fp8.cpp` — hipBLASLt API path.
+  - `rdna4/fp8/bench_fp8_extracted.cpp` — standalone launcher.
+  - `rdna4/fp8/bench_torch_fp8.py` — PyTorch path.
+- Extracted kernel: `rdna4/fp8/fp8_kernel_gfx1201.co` (decompressed
+  ELF from Tensile lib; ~38 MB, 100s of FP8 kernels keyed by
+  algo-config).
+- Capture tooling: `rdna4/vlm/dump_kernarg_shim.c` (LD_PRELOAD).
+
+Reproduce:
+
+```sh
+make -C rdna4/fp8 bench_fp8_extracted
+FP8_EXTRACTED_CO=$(pwd)/rdna4/fp8/fp8_kernel_gfx1201.co \
+    rdna4/fp8/bench_fp8_extracted --shape mm0 --iters 100 --check
+# → FP8 extracted: M=1024 N=4608 K=4608  0.1994 ms  218.1 TFLOP/s
+#   cos vs FP32 ref = 1.000000
+```
+

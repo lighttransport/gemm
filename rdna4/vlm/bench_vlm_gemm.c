@@ -10,11 +10,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 
 #include "../rocew.h"
 
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
+
+#ifdef VLM_HIPBLASLT_ENABLED
+extern int mm0_hipblaslt_set_algo_index(int idx);
+extern int mm0_hipblaslt_get_algo_index(void);
+extern int mm0_hipblaslt_init(int M, int N, int K, const void *d_bias);
+extern int mm0_hipblaslt_run(void *d_y, const void *d_w, const void *d_x);
+extern int mm0_hipblaslt_destroy(void);
+#endif
+
+extern int mm0_extracted_init(int M, int N, int K, const void *d_bias);
+extern int mm0_extracted_run(void *d_y, const void *d_w, const void *d_x);
+extern hipStream_t mm0_extracted_get_stream(void);
+extern int mm0_extracted_destroy(void);
 
 typedef struct {
     const char *name;
@@ -1336,6 +1350,49 @@ static float elapsed_kernel_ms(hipFunction_t fn, unsigned gx, unsigned gy, unsig
     return ms / (float)iters;
 }
 
+static float elapsed_extracted_ms(void *d_y, const void *d_w, const void *d_x, int iters) {
+    hipEvent_t start, stop;
+    hipStream_t s = mm0_extracted_get_stream();  // matches the launcher's stream
+    HIP_CHECK(hipEventCreate(&start));
+    HIP_CHECK(hipEventCreate(&stop));
+    HIP_CHECK(hipEventRecord(start, s));
+    for (int i = 0; i < iters; i++) {
+        if (mm0_extracted_run(d_y, d_w, d_x) != 0) {
+            fprintf(stderr, "mm0_extracted_run failed at iter %d\n", i);
+            exit(1);
+        }
+    }
+    HIP_CHECK(hipEventRecord(stop, s));
+    HIP_CHECK(hipEventSynchronize(stop));
+    float ms = 0.0f;
+    HIP_CHECK(hipEventElapsedTime(&ms, start, stop));
+    HIP_CHECK(hipEventDestroy(start));
+    HIP_CHECK(hipEventDestroy(stop));
+    return ms / (float)iters;
+}
+
+#ifdef VLM_HIPBLASLT_ENABLED
+static float elapsed_blaslt_ms(void *d_y, const void *d_w, const void *d_x, int iters) {
+    hipEvent_t start, stop;
+    HIP_CHECK(hipEventCreate(&start));
+    HIP_CHECK(hipEventCreate(&stop));
+    HIP_CHECK(hipEventRecord(start, NULL));
+    for (int i = 0; i < iters; i++) {
+        if (mm0_hipblaslt_run(d_y, d_w, d_x) != 0) {
+            fprintf(stderr, "mm0_hipblaslt_run failed at iter %d\n", i);
+            exit(1);
+        }
+    }
+    HIP_CHECK(hipEventRecord(stop, NULL));
+    HIP_CHECK(hipEventSynchronize(stop));
+    float ms = 0.0f;
+    HIP_CHECK(hipEventElapsedTime(&ms, start, stop));
+    HIP_CHECK(hipEventDestroy(start));
+    HIP_CHECK(hipEventDestroy(stop));
+    return ms / (float)iters;
+}
+#endif
+
 static int matches_shape(const char *want, const char *name) {
     return !want || strcmp(want, "all") == 0 || strcmp(want, name) == 0;
 }
@@ -1412,15 +1469,23 @@ int main(int argc, char **argv) {
     int use_mm0pipe8 = strcmp(mode, "mm0pipe8") == 0;
     int use_mm0pipek64 = strcmp(mode, "mm0pipek64") == 0;
     int use_mm0pipe4n64 = strcmp(mode, "mm0pipe4n64") == 0;
-    if (!use_direct && !use_cta64 && !use_mm0spec && !use_mm0vec && !use_mm0pipe && !use_mm0asm && !use_mm0pipegl && !use_mm0pipemid && !use_mm0pipe8 && !use_mm0pipek64 && !use_mm0pipe4n64 && strcmp(mode, "cta") != 0) {
-        fprintf(stderr, "mode must be cta, cta64, direct, mm0spec, mm0vec, mm0pipe, mm0asm, mm0pipegl, mm0pipemid, mm0pipe8, mm0pipek64, or mm0pipe4n64\n");
+    int use_mm0blaslt = strcmp(mode, "mm0blaslt") == 0;
+    int use_mm0extract = strcmp(mode, "mm0extract") == 0;
+#ifndef VLM_HIPBLASLT_ENABLED
+    if (use_mm0blaslt) {
+        fprintf(stderr, "mm0blaslt mode requires VLM_HIPBLASLT_ENABLED build (use bench_vlm_gemm_blaslt)\n");
         return 1;
     }
-    if ((use_mm0spec || use_mm0pipe || use_mm0asm || use_mm0pipegl || use_mm0pipemid || use_mm0pipe8 || use_mm0pipek64 || use_mm0pipe4n64) && !use_bf16) {
+#endif
+    if (!use_direct && !use_cta64 && !use_mm0spec && !use_mm0vec && !use_mm0pipe && !use_mm0asm && !use_mm0pipegl && !use_mm0pipemid && !use_mm0pipe8 && !use_mm0pipek64 && !use_mm0pipe4n64 && !use_mm0blaslt && !use_mm0extract && strcmp(mode, "cta") != 0) {
+        fprintf(stderr, "mode must be cta, cta64, direct, mm0spec, mm0vec, mm0pipe, mm0asm, mm0pipegl, mm0pipemid, mm0pipe8, mm0pipek64, mm0pipe4n64, mm0blaslt, or mm0extract\n");
+        return 1;
+    }
+    if ((use_mm0spec || use_mm0pipe || use_mm0asm || use_mm0pipegl || use_mm0pipemid || use_mm0pipe8 || use_mm0pipek64 || use_mm0pipe4n64 || use_mm0blaslt || use_mm0extract) && !use_bf16) {
         fprintf(stderr, "%s mode currently supports bf16 only\n", mode);
         return 1;
     }
-    if ((use_mm0vec || use_mm0pipe || use_mm0asm || use_mm0pipegl || use_mm0pipemid || use_mm0pipe8 || use_mm0pipek64 || use_mm0pipe4n64) && strcmp(shape_name, "mm0") != 0) {
+    if ((use_mm0vec || use_mm0pipe || use_mm0asm || use_mm0pipegl || use_mm0pipemid || use_mm0pipe8 || use_mm0pipek64 || use_mm0pipe4n64 || use_mm0blaslt || use_mm0extract) && strcmp(shape_name, "mm0") != 0) {
         fprintf(stderr, "%s mode is specialized for --shape mm0\n", mode);
         return 1;
     }
@@ -1517,10 +1582,48 @@ int main(int argc, char **argv) {
                     : use_direct ? (unsigned)((m + 63) / 64)
                                  : (use_cta64 ? (unsigned)((m + 63) / 64) : (unsigned)((m + 127) / 128));
         unsigned bx = (use_mm0pipe || use_mm0asm || use_mm0pipegl || use_mm0pipemid || use_mm0pipek64 || use_mm0pipe4n64) ? 128u : ((use_mm0spec || use_mm0vec || use_mm0pipe8) ? 256u : (use_direct ? 32u : (use_cta64 ? 128u : 256u)));
-        HIP_CHECK(hipModuleLaunchKernel(fn, gx, gy, 1, bx, 1, 1, 0, NULL, launch_args, NULL));
-        HIP_CHECK(hipDeviceSynchronize());
-
-        float ms = elapsed_kernel_ms(fn, gx, gy, bx, launch_args, iters);
+        float ms = 0.0f;
+#ifdef VLM_HIPBLASLT_ENABLED
+        if (use_mm0blaslt) {
+            const char *algo_env = getenv("VLM_GEMM_BLASLT_ALGO");
+            if (algo_env && algo_env[0]) {
+                mm0_hipblaslt_set_algo_index(atoi(algo_env));
+            }
+            if (mm0_hipblaslt_init(m, n, k, d_bias) != 0) {
+                fprintf(stderr, "mm0_hipblaslt_init failed\n");
+                return 1;
+            }
+            if (mm0_hipblaslt_run(d_y, d_w, d_a) != 0) return 1;
+            HIP_CHECK(hipDeviceSynchronize());
+            ms = elapsed_blaslt_ms(d_y, d_w, d_a, iters);
+        } else
+#endif
+        if (use_mm0extract) {
+            if (mm0_extracted_init(m, n, k, d_bias) != 0) {
+                fprintf(stderr, "mm0_extracted_init failed\n");
+                return 1;
+            }
+            // Warm the GPU clock state. Empirical: 64 iters lifts perf
+            // from ~140 to ~155 TFLOP/s (avx clock ramp). MM0_EXTRACTED_WARMUP
+            // override (default 64). Optional cooldown after — useful
+            // for matching hipblaslt's slow-init signature.
+            const char* wu = getenv("MM0_EXTRACTED_WARMUP");
+            int n_warmup = (wu && wu[0]) ? atoi(wu) : 32;
+            for (int wi = 0; wi < n_warmup; ++wi) {
+                if (mm0_extracted_run(d_y, d_w, d_a) != 0) return 1;
+            }
+            HIP_CHECK(hipDeviceSynchronize());
+            const char* cd = getenv("MM0_EXTRACTED_COOLDOWN_MS");
+            if (cd && cd[0]) {
+                int ms_cd = atoi(cd);
+                if (ms_cd > 0) usleep(ms_cd * 1000);
+            }
+            ms = elapsed_extracted_ms(d_y, d_w, d_a, iters);
+        } else {
+            HIP_CHECK(hipModuleLaunchKernel(fn, gx, gy, 1, bx, 1, 1, 0, NULL, launch_args, NULL));
+            HIP_CHECK(hipDeviceSynchronize());
+            ms = elapsed_kernel_ms(fn, gx, gy, bx, launch_args, iters);
+        }
         double flops = 2.0 * (double)m * (double)n * (double)k;
         double tflops = flops / ((double)ms * 1.0e9);
         double pct = tflops / 195.0 * 100.0;
@@ -1551,6 +1654,10 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipFree(d_w));
         HIP_CHECK(hipFree(d_y));
         if (d_bias) HIP_CHECK(hipFree(d_bias));
+#ifdef VLM_HIPBLASLT_ENABLED
+        if (use_mm0blaslt) mm0_hipblaslt_destroy();
+#endif
+        if (use_mm0extract) mm0_extracted_destroy();
     }
 
     return 0;

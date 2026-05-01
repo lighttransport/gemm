@@ -447,6 +447,24 @@ typedef hipError_t (HIPAPI *thipEventElapsedTime)(float* ms, hipEvent_t start, h
 typedef hipError_t (HIPAPI *thipOccupancyMaxActiveBlocksPerMultiprocessor)(int* numBlocks, const void* func, int blockSize, size_t dynSharedMemPerBlk);
 typedef hipError_t (HIPAPI *thipOccupancyMaxPotentialBlockSize)(int* gridSize, int* blockSize, const void* func, size_t dynSharedMemPerBlk, int blockSizeLimit);
 
+/* Graph capture types */
+typedef struct ihipGraph*     hipGraph_t;
+typedef struct hipGraphExec*  hipGraphExec_t;
+typedef struct hipGraphNode*  hipGraphNode_t;
+
+typedef enum hipStreamCaptureMode {
+    hipStreamCaptureModeGlobal      = 0,
+    hipStreamCaptureModeThreadLocal = 1,
+    hipStreamCaptureModeRelaxed     = 2,
+} hipStreamCaptureMode;
+
+typedef hipError_t (HIPAPI *thipStreamBeginCapture)(hipStream_t stream, hipStreamCaptureMode mode);
+typedef hipError_t (HIPAPI *thipStreamEndCapture)(hipStream_t stream, hipGraph_t* pGraph);
+typedef hipError_t (HIPAPI *thipGraphInstantiate)(hipGraphExec_t* pGraphExec, hipGraph_t graph, hipGraphNode_t* pErrorNode, char* pLogBuffer, size_t bufferSize);
+typedef hipError_t (HIPAPI *thipGraphLaunch)(hipGraphExec_t graphExec, hipStream_t stream);
+typedef hipError_t (HIPAPI *thipGraphExecDestroy)(hipGraphExec_t graphExec);
+typedef hipError_t (HIPAPI *thipGraphDestroy)(hipGraph_t graph);
+
 /* ============================================================================
  * HIPRTC Function Type Definitions
  * ============================================================================ */
@@ -567,6 +585,14 @@ extern thipEventElapsedTime hipEventElapsedTime;
 /* Occupancy */
 extern thipOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor;
 extern thipOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize;
+
+/* Graph capture */
+extern thipStreamBeginCapture hipStreamBeginCapture;
+extern thipStreamEndCapture   hipStreamEndCapture;
+extern thipGraphInstantiate   hipGraphInstantiate;
+extern thipGraphLaunch        hipGraphLaunch;
+extern thipGraphExecDestroy   hipGraphExecDestroy;
+extern thipGraphDestroy       hipGraphDestroy;
 
 /* ============================================================================
  * HIPRTC Function Declarations (extern globals)
