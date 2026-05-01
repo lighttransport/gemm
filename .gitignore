@@ -99,6 +99,19 @@ rdna4/trellis2/test_hip_*
 rdna4/trellis2/verify_*
 !rdna4/trellis2/verify_*.c
 
+# Build artifact binaries — rdna4 sam3d
+rdna4/sam3d/test_*
+!rdna4/sam3d/test_*.c
+rdna4/sam3d/verify_*
+!rdna4/sam3d/verify_*.c
+
+# Build artifact binaries — rdna4 sam3d_body
+rdna4/sam3d_body/test_*
+!rdna4/sam3d_body/test_*.c
+rdna4/sam3d_body/verify_*
+!rdna4/sam3d_body/verify_*.c
+rdna4/sam3d_body/*.obj
+
 # Verification output directories
 cpu/sparse3d/ref_output/
 cpu/sparse3d/c_output/
@@ -124,3 +137,6 @@ result/
 
 # Local (uncommitted) runner scripts — per-box model paths / env
 server/run-*.local.sh
+
+# RDNA4 FP8: extracted hipBLASLt Tensile kernel ELF (regenerate via rdna4/fp8/extract_fp8_kernel.sh)
+rdna4/fp8/fp8_kernel_gfx1201.co
