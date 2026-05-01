@@ -2823,7 +2823,11 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     r->use_fp8_mma = r->use_fp8_gemm && !flux2_env_enabled("FLUX2_FP8_TILED");
     r->use_fp8_attn = flux2_env_enabled("FLUX2_FP8_ATTN");
     r->use_bf16_attn = flux2_env_enabled("FLUX2_BF16_ATTN");
-    r->profile_step = flux2_env_enabled("FLUX2_PROFILE");
+    {
+        const char *pv = getenv("FLUX2_PROFILE");
+        r->profile_step = (pv && pv[0]) ? atoi(pv) : 0;
+        if (pv && (!strcmp(pv,"true") || !strcmp(pv,"TRUE"))) r->profile_step = 1;
+    }
     r->d_q_bf16 = 0; r->d_k_bf16 = 0; r->d_v_bf16 = 0; r->bf16_attn_buf_n = 0;
     /* VAE BF16 conv: default ON; set FLUX2_VAE_F32=1 to fall back. */
     r->use_bf16_vae = !flux2_env_enabled("FLUX2_VAE_F32");
@@ -3517,6 +3521,15 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
 
     if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt2); }
 
+    /* Deep profile accumulators (single-block per-stage) */
+    double _ts_adaln = 0, _ts_lin1 = 0, _ts_norm = 0, _ts_attn = 0,
+           _ts_swiglu = 0, _ts_lin2 = 0, _ts_resid = 0;
+    struct timespec _ti0={0}, _ti1={0};
+    #define _DEEP (r->profile_step >= 2)
+    #define _TS_BEG() do { if (_DEEP) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_ti0); } } while(0)
+    #define _TS_END(acc) do { if (_DEEP) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_ti1); \
+        (acc) += (_ti1.tv_sec-_ti0.tv_sec)+(_ti1.tv_nsec-_ti0.tv_nsec)*1e-9; } } while(0)
+
     /* ---- Single-stream blocks ---- */
     /* Concatenate: joint = [txt, img] (txt first, then img) */
     cuMemcpyDtoD(r->d_joint, r->d_txt, (size_t)n_txt * H * F);
@@ -3530,8 +3543,10 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         flux2_gpu_sblk_t *b = &r->gpu_sblk[bi];
 
         /* adaLN */
+        _TS_BEG();
         op_adaln(r, r->d_scratch1, r->d_joint, ms_shift, ms_scale, n_tot, H);
         BF16(r->d_scratch1, n_tot * H);
+        _TS_END(_ts_adaln);
 
         /* linear1: compute Q, K, V, gate_up as separate GEMMs with weight slices */
         CUdeviceptr q_w = b->linear1_w;
@@ -3539,12 +3554,15 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         CUdeviceptr v_w = b->linear1_w + (size_t)2 * H * H * WE;
         CUdeviceptr gu_w = b->linear1_w + (size_t)3 * H * H * WE;
 
+        _TS_BEG();
         GEMM(r->d_q, q_w, r->d_scratch1, d0, H, H, n_tot, b->linear1_scale);
         GEMM(r->d_k, k_w, r->d_scratch1, d0, H, H, n_tot, b->linear1_scale);
         GEMM(r->d_v, v_w, r->d_scratch1, d0, H, H, n_tot, b->linear1_scale);
         GEMM(r->d_scratch2, gu_w, r->d_scratch1, d0, 2*n_ff, H, n_tot, b->linear1_scale);
+        _TS_END(_ts_lin1);
 
         /* Per-head Q/K norm + RoPE */
+        _TS_BEG();
         op_rmsnorm_ph(r, r->d_q, b->q_norm, n_tot, nH, hd);
         op_rmsnorm_ph(r, r->d_k, b->k_norm, n_tot, nH, hd);
         BF16(r->d_q, n_tot * H);
@@ -3559,26 +3577,35 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         op_rope_img(r, k_img, n_img, nH, hd, lat_w_p, theta);
         BF16(r->d_q, n_tot * H);
         BF16(r->d_k, n_tot * H);
+        _TS_END(_ts_norm);
 
         /* Self-attention */
+        _TS_BEG();
         op_attn(r, r->d_attn_out, r->d_q, r->d_k, r->d_v, n_tot, nH, hd);
         BF16(r->d_attn_out, n_tot * H);
+        _TS_END(_ts_attn);
 
         /* Parallel MLP: SwiGLU on gate_up */
+        _TS_BEG();
         op_swiglu(r, r->d_scratch3, r->d_scratch2, n_tot, n_ff);
         BF16(r->d_scratch3, n_tot * n_ff);
+        _TS_END(_ts_swiglu);
 
         /* linear2: [H, H+n_ff] split into [H, H] (attn) + [H, n_ff] (mlp)
          * out = l2_attn @ attn_out + l2_mlp @ mlp_out */
+        _TS_BEG();
         GEMM(r->d_scratch1, b->l2_attn_w, r->d_attn_out, d0, H, H, n_tot, b->l2_attn_scale);
         GEMM(r->d_scratch2, b->l2_mlp_w, r->d_scratch3, d0, H, n_ff, n_tot, b->l2_mlp_scale);
+        _TS_END(_ts_lin2);
 
         /* Add the two halves: scratch1 += scratch2 */
+        _TS_BEG();
         op_add(r, r->d_scratch1, r->d_scratch2, n_tot * H);
 
         /* Gated residual */
         op_gated_add(r, r->d_joint, r->d_scratch1, ms_gate, n_tot, H);
         BF16(r->d_joint, n_tot * H);
+        _TS_END(_ts_resid);
     }
 
     /* ---- Output ---- */
@@ -3587,6 +3614,9 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
 
     /* Final adaLN: LN(img_out) * (1 + out_scale) + out_shift */
     if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt3); }
+    #undef _DEEP
+    #undef _TS_BEG
+    #undef _TS_END
 
     GEMM(r->d_scratch1, r->d_out_mod_w, r->d_temb, d0, 2*H, H, 1, r->s_out_mod);
     BF16(r->d_scratch1, 2*H);
@@ -3614,6 +3644,12 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         fprintf(stderr,
             "[profile] setup %.3fs  double(%d) %.3fs  single(%d) %.3fs  final %.3fs  total %.3fs\n",
             t_setup, r->n_dbl, t_dbl, r->n_sgl, t_sgl, t_final, t_tot);
+        if (r->profile_step >= 2) {
+            fprintf(stderr,
+                "[profile-deep single] adaln %.3f  lin1 %.3f  norm/rope %.3f  attn %.3f  swiglu %.3f  lin2 %.3f  resid %.3f  (sum %.3fs)\n",
+                _ts_adaln, _ts_lin1, _ts_norm, _ts_attn, _ts_swiglu, _ts_lin2, _ts_resid,
+                _ts_adaln+_ts_lin1+_ts_norm+_ts_attn+_ts_swiglu+_ts_lin2+_ts_resid);
+        }
         #undef _DT
     }
 
