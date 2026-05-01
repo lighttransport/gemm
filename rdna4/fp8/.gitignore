@@ -1,0 +1,4 @@
+bench_fp8_gemm
+bench_fp8_fa
+bench_hipblaslt_fp8
+.rocprofv3/

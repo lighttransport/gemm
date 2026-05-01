@@ -4,6 +4,8 @@
 # Only needs gcc + ROCm runtime libraries (libamdhip64.so, libhiprtc.so) on the system.
 
 CC = gcc
+HIPCC ?= hipcc
+ROCM_PATH ?= /opt/rocm
 CFLAGS = -O3 -Wall -Wextra -I.. -march=native
 LDFLAGS = -ldl -lm -lpthread
 
@@ -12,6 +14,10 @@ ROCEW_SRC = ../rocew.c
 RUNNER_SRC = hip_llm_runner.c
 TEST_SRC = test_hip_llm.c
 
+# hipBLASLt bridge (optional). Build with `make HIPBLASLT=1` to enable WMMA-class
+# prefill GEMMs via hipBLASLt. Without it, the runner falls back to per-token GEMV.
+HIPBLASLT ?= 1
+
 # Target
 TARGET = test_hip_llm
 
@@ -19,14 +25,25 @@ TARGET = test_hip_llm
 
 all: $(TARGET)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+ifeq ($(HIPBLASLT),1)
+CFLAGS += -DLLM_HIPBLASLT_ENABLED
+LDFLAGS += -L$(ROCM_PATH)/lib -lhipblaslt -lstdc++
+BLASLT_OBJ = mm_blaslt_bridge.o
+else
+BLASLT_OBJ =
+endif
+
+mm_blaslt_bridge.o: mm_blaslt_bridge.cpp mm_blaslt_bridge.h
+	$(HIPCC) -O3 -fPIE --offload-arch=gfx1201 -c -o $@ $<
+
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h $(BLASLT_OBJ)
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) mm_blaslt_bridge.o
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"

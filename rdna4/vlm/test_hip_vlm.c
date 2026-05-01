@@ -1,7 +1,7 @@
 /*
  * test_hip_vlm.c - End-to-end VLM inference: HIP vision encoder + HIP LLM
  *
- * Usage: ./test_hip_vlm <model.gguf> <mmproj.gguf> <image.jpg> [-n max_tokens] [--resize dynamic|fit]
+ * Usage: ./test_hip_vlm <model.gguf> <mmproj.gguf> <image.jpg> [-n max_tokens] [--resize dynamic|fit] [--vision-f32|--vision-f16|--vision-bf16]
  *
  * Encodes an image through the HIP vision encoder (mmproj), injects the
  * resulting embeddings into the HIP LLM runner, and generates text.
@@ -115,7 +115,7 @@ static const char *gguf_get_kv_string(const gguf_context *g, const char *key) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> <image.jpg> [-n max_tokens] [--resize dynamic|fit]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> <image.jpg> [-n max_tokens] [--resize dynamic|fit] [--vision-f32|--vision-f16|--vision-bf16]\n", argv[0]);
         return 1;
     }
 
@@ -124,8 +124,12 @@ int main(int argc, char **argv) {
     const char *image_path = argv[3];
     int max_gen = 100;
     int resize_mode = 0;  /* 0 = dynamic (default, matches llama.cpp), 1 = fit (simple) */
+    int vision_precision = -1;  /* -1=auto, 0=F32, 1=F16, 2=BF16 */
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) max_gen = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--vision-f32") == 0) vision_precision = 0;
+        else if (strcmp(argv[i], "--vision-f16") == 0) vision_precision = 1;
+        else if (strcmp(argv[i], "--vision-bf16") == 0) vision_precision = 2;
         else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) {
             i++;
             if (strcmp(argv[i], "fit") == 0) resize_mode = 1;
@@ -154,6 +158,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Loading mmproj: %s\n", mmproj_path);
     gguf_context *gguf_mmproj = gguf_open(mmproj_path, 0);
     if (!gguf_mmproj) { fprintf(stderr, "Failed to open mmproj GGUF\n"); return 1; }
+    if (vision_precision < 0) vision_precision = hip_vision_infer_precision(gguf_mmproj);
+    fprintf(stderr, "Vision mode: %s\n\n", vision_precision == 1 ? "F16" : vision_precision == 2 ? "BF16" : "F32");
 
     /* Load CPU vision model for metadata (mean/std, patch_size, spatial_merge) */
     vision_model *vm = vision_load(gguf_mmproj);
@@ -215,7 +221,7 @@ int main(int argc, char **argv) {
 
     /* ---- 5. HIP vision encode ---- */
     fprintf(stderr, "Initializing HIP vision encoder...\n");
-    hip_vision_runner *hip_vis = hip_vision_init(0, 1, 1);  /* F16 mode */
+    hip_vision_runner *hip_vis = hip_vision_init(0, 1, vision_precision);
     if (!hip_vis) { fprintf(stderr, "HIP vision init failed\n"); return 1; }
     hip_vision_set_max_pixels(hip_vis, dyn_max_pixels);
     if (hip_vision_load_weights(hip_vis, gguf_mmproj) != 0) {
