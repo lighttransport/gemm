@@ -2120,6 +2120,7 @@ struct cuda_flux2_runner {
     int gpu_loaded;
     int use_gpu_dbl_attn;
     int debug_dbl_attn;
+    int profile_step;
 };
 
 /* ---- F32 to F16 conversion ---- */
@@ -2822,6 +2823,7 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     r->use_fp8_mma = r->use_fp8_gemm && !flux2_env_enabled("FLUX2_FP8_TILED");
     r->use_fp8_attn = flux2_env_enabled("FLUX2_FP8_ATTN");
     r->use_bf16_attn = flux2_env_enabled("FLUX2_BF16_ATTN");
+    r->profile_step = flux2_env_enabled("FLUX2_PROFILE");
     r->d_q_bf16 = 0; r->d_k_bf16 = 0; r->d_v_bf16 = 0; r->bf16_attn_buf_n = 0;
     /* VAE BF16 conv: default ON; set FLUX2_VAE_F32=1 to fall back. */
     r->use_bf16_vae = !flux2_env_enabled("FLUX2_VAE_F32");
@@ -3285,6 +3287,9 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
 
     if (flux2_alloc_bufs(r, n_img, n_txt) != 0) return -1;
 
+    struct timespec _pt0={0}, _pt1={0}, _pt2={0}, _pt3={0}, _pt4={0};
+    if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt0); }
+
     /* Upload inputs */
     cuMemcpyHtoD(r->d_img_in_buf, img_tokens, (size_t)n_img * r->pin * F);
     cuMemcpyHtoD(r->d_txt_in_buf, txt_tokens, (size_t)n_txt * r->txt_dim * F);
@@ -3362,6 +3367,8 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         if (lat_w_p * lat_w_p != n_img) lat_w_p = n_img; /* fallback to 1D */
     }
     float theta = FLUX2_ROPE_THETA;
+
+    if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt1); }
 
     /* ---- Double-stream blocks ---- */
     for (int bi = 0; bi < r->n_dbl; bi++) {
@@ -3508,6 +3515,8 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         BF16(r->d_txt, n_txt * H);
     }
 
+    if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt2); }
+
     /* ---- Single-stream blocks ---- */
     /* Concatenate: joint = [txt, img] (txt first, then img) */
     cuMemcpyDtoD(r->d_joint, r->d_txt, (size_t)n_txt * H * F);
@@ -3577,6 +3586,8 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
     CUdeviceptr d_img_out = r->d_joint + (size_t)n_txt * H * F;
 
     /* Final adaLN: LN(img_out) * (1 + out_scale) + out_shift */
+    if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt3); }
+
     GEMM(r->d_scratch1, r->d_out_mod_w, r->d_temb, d0, 2*H, H, 1, r->s_out_mod);
     BF16(r->d_scratch1, 2*H);
     CUdeviceptr out_shift = r->d_scratch1;
@@ -3591,6 +3602,20 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
     /* Download result */
     cuMemcpyDtoH(out, r->d_attn_out, (size_t)n_img * r->pin * F);
     cuCtxSynchronize();
+
+    if (r->profile_step) {
+        clock_gettime(CLOCK_MONOTONIC, &_pt4);
+        #define _DT(a,b) (((b).tv_sec-(a).tv_sec)+((b).tv_nsec-(a).tv_nsec)*1e-9)
+        double t_setup = _DT(_pt0,_pt1);
+        double t_dbl   = _DT(_pt1,_pt2);
+        double t_sgl   = _DT(_pt2,_pt3);
+        double t_final = _DT(_pt3,_pt4);
+        double t_tot   = _DT(_pt0,_pt4);
+        fprintf(stderr,
+            "[profile] setup %.3fs  double(%d) %.3fs  single(%d) %.3fs  final %.3fs  total %.3fs\n",
+            t_setup, r->n_dbl, t_dbl, r->n_sgl, t_sgl, t_final, t_tot);
+        #undef _DT
+    }
 
     #undef GEMM
     #undef BF16
