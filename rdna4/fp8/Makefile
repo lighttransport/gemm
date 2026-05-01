@@ -18,7 +18,17 @@ BENCH_FA = bench_fp8_fa
 
 .PHONY: all clean run bench-mm0 bench-fa help
 
-all: $(BENCH) $(BENCH_FA)
+BENCH_EXTRACTED = bench_fp8_extracted
+
+all: $(BENCH) $(BENCH_FA) $(BENCH_EXTRACTED)
+
+$(BENCH_EXTRACTED): bench_fp8_extracted.cpp fp8_kernel_gfx1201.co
+	$(HIPCC) -O3 --offload-arch=gfx1201 -o $@ bench_fp8_extracted.cpp
+
+# Extract the FP8 kernel ELF from the local ROCm hipBLASLt Tensile library at
+# build time. The artifact (~38 MB) is gitignored — re-derived per checkout.
+fp8_kernel_gfx1201.co: extract_fp8_kernel.sh
+	./extract_fp8_kernel.sh $@
 
 $(BENCH): bench_fp8_gemm.c $(ROCEW_SRC) ../rocew.h ../hip_runner_common.h
 	$(CC) $(CFLAGS) -o $@ bench_fp8_gemm.c $(ROCEW_SRC) $(LDFLAGS) \
@@ -38,7 +48,7 @@ run: $(BENCH)
 	./$(BENCH) --shape all --iters 200
 
 clean:
-	rm -f $(BENCH) $(BENCH_FA)
+	rm -f $(BENCH) $(BENCH_FA) $(BENCH_EXTRACTED) fp8_kernel_gfx1201.co
 
 help:
 	@echo "RDNA4 FP8 WMMA GEMM benchmark"
