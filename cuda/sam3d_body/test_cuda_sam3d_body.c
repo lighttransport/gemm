@@ -4,7 +4,7 @@
  * Usage:
  *   test_cuda_sam3d_body --safetensors-dir <DIR> --image <image.jpg>
  *       --mhr-assets <DIR>
- *       [--bbox x0 y0 x1 y1] [--focal F]
+ *       [--bbox x0 y0 x1 y1 | --auto-bbox] [--focal F]
  *       [-o body.obj] [--precision bf16|fp16] [--device N] [-v]
  *
  *   test_cuda_sam3d_body <safetensors-dir> <image.jpg> ...
@@ -79,6 +79,8 @@ static int write_body_mesh(const char *path,
 static void write_sidecar_json(cuda_sam3d_body_ctx *ctx,
                                const char *out_path,
                                const float bbox[4], int has_bbox,
+                               int auto_bbox_used, float auto_bbox_score,
+                               float auto_bbox_threshold,
                                int iw, int ih)
 {
     char json_path[1024];
@@ -100,9 +102,18 @@ static void write_sidecar_json(cuda_sam3d_body_ctx *ctx,
     cuda_sam3d_body_get_cam(ctx, cam_t, &focal_px);
 
     fprintf(jf, "{\n");
-    if (has_bbox)
+    if (has_bbox) {
         fprintf(jf, "  \"bbox\": [%.3f, %.3f, %.3f, %.3f],\n",
                 bbox[0], bbox[1], bbox[2], bbox[3]);
+        fprintf(jf, "  \"bbox_source\": \"%s\",\n",
+                auto_bbox_used ? "auto" : "manual");
+        if (auto_bbox_used) {
+            fprintf(jf,
+                    "  \"auto_bbox\": {\"detector\": \"rt-detr-s\", "
+                    "\"score\": %.6f, \"threshold\": %.6f},\n",
+                    auto_bbox_score, auto_bbox_threshold);
+        }
+    }
     fprintf(jf, "  \"image\": {\"width\": %d, \"height\": %d},\n", iw, ih);
     fprintf(jf, "  \"focal_px\": %.6f,\n", focal_px);
     fprintf(jf, "  \"cam_t\": [%.6f, %.6f, %.6f],\n",
@@ -144,6 +155,8 @@ int main(int argc, char **argv)
     float focal_hint = 0;
     int device = 0, verbose = 0;
     int auto_bbox = 0;
+    int auto_bbox_used = 0;
+    float auto_bbox_score = 0.0f;
     const char *rt_detr_model = "/mnt/disk01/models/rt_detr_s/model.safetensors";
     float auto_thresh = 0.5f;
     cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
@@ -223,10 +236,13 @@ int main(int argc, char **argv)
         bbox[0] = box.x0; bbox[1] = box.y0;
         bbox[2] = box.x1; bbox[3] = box.y1;
         has_bbox = 1;
-        if (verbose)
-            fprintf(stderr, "[test_cuda_sam3d_body] auto-bbox score=%.4f "
-                    "x0=%.1f y0=%.1f x1=%.1f y1=%.1f\n",
-                    box.score, box.x0, box.y0, box.x1, box.y1);
+        auto_bbox_used = 1;
+        auto_bbox_score = box.score;
+        fprintf(stderr, "[test_cuda_sam3d_body] auto-bbox: "
+                "detector=rt-detr-s score=%.4f threshold=%.3f image=%dx%d "
+                "bbox=(%.1f,%.1f,%.1f,%.1f)\n",
+                box.score, auto_thresh, iw, ih,
+                box.x0, box.y0, box.x1, box.y1);
         t_auto_bbox_ms = cli_time_ms() - t_auto0;
     }
 
@@ -283,7 +299,9 @@ int main(int argc, char **argv)
     }
 
     if (rc == 0)
-        write_sidecar_json(ctx, out_path, bbox, has_bbox, iw, ih);
+        write_sidecar_json(ctx, out_path, bbox, has_bbox,
+                           auto_bbox_used, auto_bbox_score, auto_thresh,
+                           iw, ih);
 
     if (verbose) {
         fprintf(stderr,
