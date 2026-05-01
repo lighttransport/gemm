@@ -2,7 +2,7 @@
  * rt_detr.h — RT-DETR-S (R18-VD backbone) person/object detector.
  *
  * Single-header CPU port matching HF `PekingU/rtdetr_r18vd_coco_o365`.
- * Used by sam3d_body --auto-bbox to crop the largest person before
+ * Used by sam3d_body --auto-bbox to crop the primary person before
  * mesh recovery; standalone API also exposes general detection.
  *
  * Pipeline:
@@ -117,7 +117,9 @@ int rt_detr_postprocess(const float *logits, const float *boxes_norm,
                         int class_id, float score_thresh,
                         rt_detr_box_t *out, int max_out);
 
-/* Convenience: full pipeline image (uint8 RGB HWC) → largest person bbox.
+/* Convenience: full pipeline image (uint8 RGB HWC) → primary person bbox.
+ * The primary person is the highest-confidence valid person detection;
+ * exact score ties are resolved by larger image-space area.
  * Returns 0 if a detection above score_thresh is found, -1 otherwise. */
 int rt_detr_detect_largest_person(rt_detr_t *m,
                                   const uint8_t *rgb, int w, int h,
@@ -673,7 +675,7 @@ static float *rt_detr__basic_block(rt_detr_t *m, const char *stage_base,
                                    const float *in, int ih, int iw,
                                    int *out_co, int *out_oh, int *out_ow)
 {
-    char buf[512];
+    char buf[1024];
     int oh, ow, co, mid_h, mid_w, mid_c;
     /* layer.0: 3×3, optionally stride 2 (when has_avgpool_shortcut: stride 2) */
     int s = has_avgpool_shortcut ? 2 : 1;
@@ -964,7 +966,7 @@ static int rt_detr__rep_vgg_block(rt_detr_t *m, const char *base,
                                   const float *in, int c, int h, int w,
                                   float *out)
 {
-    char buf[512];
+    char buf[1024];
     snprintf(buf, sizeof(buf), "%s.conv1", base);
     const float *W1; const float *b1;
     int co1, ci1, kh1, kw1;
@@ -2397,10 +2399,11 @@ int rt_detr_detect_largest_person(rt_detr_t *m,
     double t_forward = rt_detr__time_ms() - ts;
     free(input);
 
-    /* Largest-person fast path: no need to sort all 300*80 logits. */
+    /* Person-only fast path: no need to sort all 300*80 logits. */
     ts = rt_detr__time_ms();
     rt_detr_box_t best_box;
     int n = 0;
+    float best_score = -1.0f;
     float best_area = -1.0f;
     for (int q = 0; q < RT_DETR_NUM_QUERIES; q++) {
         float s = rt_detr__sigmoidf(logits[(size_t)q * RT_DETR_NUM_CLASSES +
@@ -2415,8 +2418,14 @@ int rt_detr_detect_largest_person(rt_detr_t *m,
         cand.y0 = (cy - bh * 0.5f) * (float)h;
         cand.x1 = (cx + bw * 0.5f) * (float)w;
         cand.y1 = (cy + bh * 0.5f) * (float)h;
+        if (cand.x0 < 0.0f) cand.x0 = 0.0f;
+        if (cand.y0 < 0.0f) cand.y0 = 0.0f;
+        if (cand.x1 > (float)w) cand.x1 = (float)w;
+        if (cand.y1 > (float)h) cand.y1 = (float)h;
         float area = (cand.x1 - cand.x0) * (cand.y1 - cand.y0);
-        if (area > best_area) {
+        if (area <= 0.0f) continue;
+        if (s > best_score || (s == best_score && area > best_area)) {
+            best_score = s;
             best_area = area;
             best_box = cand;
         }

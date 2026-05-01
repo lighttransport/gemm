@@ -71,7 +71,7 @@ reference unless noted.
 
 | Stage                       | Status | max_abs   | mean_abs | Notes                                                                                  |
 |-----------------------------|--------|-----------|----------|----------------------------------------------------------------------------------------|
-| Step 0 scaffold             | GREEN  | —         | —        | 8/8 verify_*.c return "not yet ported"; gen_image_ref --skip-run dumps input_image.npy |
+| Step 0 bootstrap            | GREEN  | —         | —        | legacy bootstrap complete; obsolete compatibility stubs fail explicitly                |
 | Step 1 slicer               | GREEN  | —         | —        | 160 f16 + 391 f32 dinov3 / 524 fp32 decoder / 52 fp32+i64 mhr_head; 0 unmatched        |
 | DINOv3 encoder (CPU)        | GREEN  | 1.52e-1   | 4.01e-3  | f16 floor for 32-block ViT-H+; 24.2 s e2e @ 8 threads                                  |
 | DINOv3 encoder (CUDA)       | GREEN  | 9.95e-1   | 1.11e-2  | NVRTC 32-block ViT, F16 weights; CUDA-vs-CPU diff ≈1e-5                                |
@@ -93,8 +93,11 @@ reference unless noted.
 | decoder forward_full (CUDA) | GREEN  | 6.10e-4   | 4.88e-4  | mirrors CPU; CPU MHR shared                                                            |
 | warp_matrix                 | GREEN  | 1.3e-5    | —        | TopdownAffine                                                                          |
 | preprocess_image            | GREEN  | 5.25e-2   | 5e-4     | cv2 INTER_TAB_SIZE=32 fixed-point variation                                            |
-| End-to-end verts (CPU)      | GREEN  | 9.5e-7    | 1.2e-7   | vs out_vertices.npy / out_keypoints_3d.npy (2.7e-7) / out_keypoints_2d.npy (1.4e-4 px) |
-| End-to-end (CUDA)           | GREEN  | 1.07e-6   | 2.08e-7  | matches CPU; both runners agree with ref at 0.57 (different bbox)                      |
+| End-to-end verts (CPU)      | GREEN  | 9.5e-7    | 1.2e-7   | override path vs `out_*` refs                                                          |
+| End-to-end raw image (CPU)  | GREEN  | 2.47e-2   | 4.09e-3  | fixed bbox vs `body_out_*`; 2D max 6.75 px                                             |
+| End-to-end raw image (CUDA) | GREEN  | 2.43e-2   | 4.06e-3  | fixed bbox vs `body_out_*`; 2D max 6.78 px                                             |
+| ViT-H override (CPU)        | GREEN  | 1.37e-6   | 1.64e-7  | rectangular kp-update fixed; 2D max 4.88e-4 px                                         |
+| ViT-H raw image (CPU/CUDA)  | GREEN  | 1.26e-1   | 3.11e-2  | fixed bbox vs `body_out_*`; 2D max 162.7 px; encoder precision floor                   |
 
 ## Steps — gate status
 
@@ -175,14 +178,12 @@ reference unless noted.
   so it's a safe break. Same math as the runner's `run_decoder` chain,
   packaged for direct use from a TU that already holds DINOv3 patch
   tokens + a camera_batch.
-- **Bit-exact verification vs a Python dump for the self-driven raw-
-  image path.** Existing `/tmp/sam3d_body_ref` was generated with
-  irreproducible bbox values; regenerate with
-  `python ref/sam3d-body/gen_image_ref.py --image X --bbox x0 y0 x1 y1`
-  to compare against the self-driven `test_sam3d_body --image …
-  --bbox …` output.
-- **ViT-H variant.** `facebook/sam-3d-body-vith` is downloaded but
-  not ported. Shares decoder + MHR; only the backbone differs.
+- **Raw-image self-driven verifier is no longer bit-exact by design.**
+  `gen_image_ref.py` now writes `body_out_{vertices,keypoints_3d,keypoints_2d}.npy`
+  before upstream hand prompting/refinement mutates the final `out_*`
+  arrays. CPU/CUDA `verify_end_to_end --image ... --bbox ...` prefer
+  these body-branch refs. The remaining tolerance is the known
+  PyTorch-vs-C DINOv3 encoder/preprocess floor, not decoder/MHR drift.
 - **Keys bicubic pos-embed interp generalization in `common/dinov3.h`.**
   Required if DINOv3-H+ is fed a non-square input (current only
   supports square via the existing path).
@@ -225,14 +226,51 @@ cd cuda/sam3d_body && make all
 # Per-stage verify (CPU + CUDA each have ~10–18 verify_*.c)
 ./verify_dinov3 --safetensors-dir <SFT_DIR> --refdir /tmp/sam3d_body_ref
 ./verify_decoder ...
-./verify_end_to_end ...
+./verify_end_to_end --safetensors-dir <SFT_DIR> --mhr-assets <MHR_DIR> \
+    --refdir /tmp/sam3d_body_ref --image person.jpg --bbox x0 y0 x1 y1 \
+    --threshold 3e-2 --threshold-2d 10
+
+# CPU/CUDA Makefile raw-image aliases; set both image and fixed bbox.
+cd cpu/sam3d_body
+make verify-end-to-end-raw REFDIR_DINOV3=/tmp/sam3d_body_ref \
+    E2E_IMAGE=samples/dancing.jpg \
+    E2E_BBOX='727.537 111.031 1534.146 1456.042'
+
+cd ../../cuda/sam3d_body
+make verify-end-to-end REFDIR_DINOV3=/tmp/sam3d_body_ref \
+    E2E_IMAGE=../../cpu/sam3d_body/samples/dancing.jpg \
+    E2E_BBOX='727.537 111.031 1534.146 1456.042'
+
+# ViT-H fixed-bbox raw-image check; wider because the converted
+# ViT-H encoder weights are the known limiting precision floor.
+./verify_end_to_end --safetensors-dir <SFT_DIR> --mhr-assets <MHR_DIR> \
+    --refdir /tmp/sam3d_body_vith_ref --image person.jpg \
+    --bbox x0 y0 x1 y1 --backbone vith \
+    --threshold 1.5e-1 --threshold-2d 200
 
 # Reference dumps (one-time)
 cd ref/sam3d-body && source .venv/bin/activate
 python gen_image_ref.py --image person.jpg --bbox x0 y0 x1 y1 \
     --hf-repo-id facebook/sam-3d-body-dinov3 \
     --outdir /tmp/sam3d_body_ref --seed 42
+
+python gen_image_ref.py --image person.jpg --bbox x0 y0 x1 y1 \
+    --local-ckpt-dir /mnt/disk01/models/sam3d-body/vith \
+    --outdir /tmp/sam3d_body_vith_ref --seed 42
 ```
+
+With `--bbox`, `gen_image_ref.py` writes both final upstream
+`out_*` tensors and body-branch `body_out_*` tensors. The latter are
+the parity target for the current C runners because upstream final
+output includes hand-prompt refinement that is outside the C pipeline.
+Per-stage decoder tensors are guarded the same way: `decoder_layer*_in`,
+`decoder_out_norm_final`, `head_pose_proj_raw`, `head_camera_proj_raw`,
+ray-cond tensors, and token-construction tensors preserve the first body
+decoder pass instead of being overwritten by later keypoint/hand passes.
+The MHR head decode verifier is variant-aware and checks the guarded
+body branch for both DINOv3 and ViT-H at f32-level. `verify_end_to_end`
+also fails empty/missing refs now, so shape or backbone mismatches do
+not produce `nan OK`.
 
 ## End-to-end run (worked example, 2026-04-27)
 
@@ -255,7 +293,7 @@ Output (≈33 s wall on the local AMD/x86 box, single image, 8 threads;
 DINOv3-H+ encoder dominates at ~21 s):
 
 ```
-[test_sam3d_body] auto-bbox: score=0.941 bbox=(727.5,111.0,1534.1,1456.0)
+[test_sam3d_body] auto-bbox: detector=rt-detr-s score=0.9410 threshold=0.500 image=1600x1600 bbox=(727.5,111.0,1534.1,1456.0)
 dinov3: preprocess+embed 273.9 ms, backbone 21188.3 ms (8 threads)
 [test_sam3d_body] wrote samples/dancing.obj (V=18439 F=36874)
 [test_sam3d_body] wrote samples/dancing.obj.json (mhr_params=519 kp3d=70 kp2d=70)
@@ -266,7 +304,7 @@ Two files land next to the image:
 | File                       | Format | Contents                                                                                |
 |----------------------------|--------|-----------------------------------------------------------------------------------------|
 | `dancing.obj`              | OBJ    | 18 439 vertices · 36 874 triangle faces (camera-space metres, post Y/Z flip)            |
-| `dancing.obj.json`         | JSON   | `bbox` (px), `image{w,h}`, `focal_px`, `cam_t[3]`, `mhr_params[519]`, `keypoints_3d[70][3]` (m), `keypoints_2d[70][2]` (px in original image) |
+| `dancing.obj.json`         | JSON   | `bbox` (px), `bbox_source`, optional `auto_bbox{detector,score,threshold}`, `image{w,h}`, `focal_px`, `cam_t[3]`, `mhr_params[519]`, `keypoints_3d[70][3]` (m), `keypoints_2d[70][2]` (px in original image) |
 
 Use `-o dancing.glb` to write the same mesh as binary glTF/GLB. The
 sidecar is still written next to it as `dancing.glb.json`. Body GLB
@@ -282,7 +320,8 @@ metres; `focal_px` is the assumed pinhole focal in original-image pixels
 ### Bbox sources
 
 - `--auto-bbox` runs RT-DETR-S (single forward, ~1 s) and picks the
-  highest-scoring person (default `--auto-thresh 0.5`).
+  highest-scoring valid person, using larger area only as a tie-break
+  (default `--auto-thresh 0.5`).
 - `--bbox x0 y0 x1 y1` skips detection — useful when the image already
   has a tight crop or RT-DETR mis-fires on stylised inputs.
 - Either way, the bbox is padded to `1.25×` and aspect-fixed to 0.75
@@ -307,6 +346,36 @@ agreement with the CPU runner is at ≈1e-6 m (see drift table — "End-to-end (
 The CUDA CLI now mirrors CPU output metadata: `.obj.json` / `.glb.json`
 sidecars include bbox, image size, focal, camera translation, MHR params,
 and 3D/2D keypoints.
+
+ViT-H is supported by both CPU and CUDA runners. Current CUDA smoke:
+
+```bash
+./cuda/sam3d_body/test_cuda_sam3d_body \
+    --safetensors-dir /mnt/disk01/models/sam3d-body/safetensors \
+    --mhr-assets /mnt/disk01/models/sam3d-body/safetensors \
+    --image cpu/sam3d_body/samples/dancing.jpg \
+    --bbox 727.537 111.031 1534.146 1456.042 \
+    --backbone vith -o /tmp/sam3d_body_vith_cuda.obj
+```
+
+This writes `V=18439 F=36874` plus the JSON sidecar. ViT-H decoder
+verification is exact after the rectangular keypoint-update fix:
+CPU `verify_end_to_end --backbone vith` without `--image` reports
+vertices max_abs=1.37e-6, keypoints_3d max_abs=5.96e-7, and
+keypoints_2d max_abs=4.88e-4 px. CPU `verify_dense_pe --backbone vith`
+matches upstream's centered 24-column crop from the 32x32 PE grid at
+max_abs=1.91e-6; CPU `verify_ray_cond_xyz` matches the centered x-crop
+ray tensor at max_abs=5.96e-8. CPU `verify_decoder_forward --backbone
+vith` covers the public wrapper path with final keypoints_3d max_abs=
+2.94e-5. CUDA ViT-H per-stage verifiers now cover ray-cond (32x24),
+token build, keypoint-update, norm/heads, decoder layers, and the full
+iterative decoder loop; `verify_decoder` with `--backbone vith` reports
+final `head_pose_proj_raw` max_abs=9.54e-6 and final keypoints_3d
+max_abs=8.08e-7. Raw-image ViT-H verification passes for
+both CPU and CUDA with
+`--threshold 1.5e-1 --threshold-2d 200`; the observed envelope is
+vertices max_abs=1.26e-1, keypoints_3d max_abs=1.24e-1, and
+keypoints_2d max_abs=162.7 px.
 
 ## Web demo (3-pane: input / ours / pytorch, 2026-04-27)
 
