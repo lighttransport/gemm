@@ -627,6 +627,330 @@ static const char *kernel_src =
 "    }\n"
 "}\n"
 "\n"
+"\n"
+"\n"
+"/* pipe32_hoist: identical layout to pipe32, but the 8 LDS reads for kk0=0 AND\n"
+" * the 8 LDS reads for kk0=16 are hoisted above the WMMA block. All 16 LDS\n"
+" * issues fire in one batch, then ONE s_wait_dscnt(0), then 32 back-to-back\n"
+" * WMMA. Theory: the original interleaved schedule (2 WMMA → s_wait_dscnt → 2\n"
+" * WMMA) costs LDS issue rate; FP8 K-step compute (~512 cyc) is too short to\n"
+" * tolerate fine-grained waits the way BF16 (~1024 cyc) does. */\n"
+"__global__ __launch_bounds__(128, 1)\n"
+"void gemm_fp8_pipe32_hoist(float *Y, const u8 *W, const u8 *X,\n"
+"                           const float *bias, int N, int K, int M) {\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int half = lane >> 4;\n"
+"    int idx = lane & 15;\n"
+"    int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    int e0 = tid * 2 + 0;\n"
+"    int e1 = tid * 2 + 1;\n"
+"    int r0 = e0 >> 1, r1 = e1 >> 1;\n"
+"    int c0 = (e0 & 1) * 16, c1 = (e1 & 1) * 16;\n"
+"    __shared__ u8x8 smA8[2 * 128 * 4];\n"
+"    __shared__ u8x8 smB8[2 * 128 * 4];\n"
+"    {\n"
+"        u8x16 a0v = *((const u8x16 *)(X + (size_t)(cta_m0 + r0) * K + c0));\n"
+"        u8x16 a1v = *((const u8x16 *)(X + (size_t)(cta_m0 + r1) * K + c1));\n"
+"        u8x16 b0v = *((const u8x16 *)(W + (size_t)(cta_n0 + r0) * K + c0));\n"
+"        u8x16 b1v = *((const u8x16 *)(W + (size_t)(cta_n0 + r1) * K + c1));\n"
+"        smA8[(c0>>3) * 128 + r0]    = SPLIT_LO(a0v);\n"
+"        smA8[((c0>>3)+1)*128 + r0]  = SPLIT_HI(a0v);\n"
+"        smA8[(c1>>3) * 128 + r1]    = SPLIT_LO(a1v);\n"
+"        smA8[((c1>>3)+1)*128 + r1]  = SPLIT_HI(a1v);\n"
+"        smB8[(c0>>3) * 128 + r0]    = SPLIT_LO(b0v);\n"
+"        smB8[((c0>>3)+1)*128 + r0]  = SPLIT_HI(b0v);\n"
+"        smB8[(c1>>3) * 128 + r1]    = SPLIT_LO(b1v);\n"
+"        smB8[((c1>>3)+1)*128 + r1]  = SPLIT_HI(b1v);\n"
+"    }\n"
+"    lds_barrier();\n"
+"    float8 z = {0,0,0,0,0,0,0,0};\n"
+"    float8 cv00=z,cv01=z,cv02=z,cv03=z;\n"
+"    float8 cv10=z,cv11=z,cv12=z,cv13=z;\n"
+"    float8 cv20=z,cv21=z,cv22=z,cv23=z;\n"
+"    float8 cv30=z,cv31=z,cv32=z,cv33=z;\n"
+"    int buf = 0;\n"
+"    for (int k = 0; k < K; k += 32) {\n"
+"        u8x16 na0,na1,nb0,nb1;\n"
+"        int has_next = (k + 32 < K);\n"
+"        if (has_next) {\n"
+"            int nk = k + 32;\n"
+"            na0 = *((const u8x16 *)(X + (size_t)(cta_m0 + r0) * K + nk + c0));\n"
+"            na1 = *((const u8x16 *)(X + (size_t)(cta_m0 + r1) * K + nk + c1));\n"
+"            nb0 = *((const u8x16 *)(W + (size_t)(cta_n0 + r0) * K + nk + c0));\n"
+"            nb1 = *((const u8x16 *)(W + (size_t)(cta_n0 + r1) * K + nk + c1));\n"
+"        }\n"
+"        int base = buf * (128 * 4);\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 64;\n"
+"        /* Hoist all 16 LDS reads (8 a + 8 b across both kk0). */\n"
+"        int ks0 = (0  + k_off) >> 3;\n"
+"        int ks1 = (16 + k_off) >> 3;\n"
+"        u8x8 a00 = smA8[base + ks0 * 128 + (a_base + 0  + idx)];\n"
+"        u8x8 a01 = smA8[base + ks0 * 128 + (a_base + 16 + idx)];\n"
+"        u8x8 a02 = smA8[base + ks0 * 128 + (a_base + 32 + idx)];\n"
+"        u8x8 a03 = smA8[base + ks0 * 128 + (a_base + 48 + idx)];\n"
+"        u8x8 b00 = smB8[base + ks0 * 128 + (b_base + 0  + idx)];\n"
+"        u8x8 b01 = smB8[base + ks0 * 128 + (b_base + 16 + idx)];\n"
+"        u8x8 b02 = smB8[base + ks0 * 128 + (b_base + 32 + idx)];\n"
+"        u8x8 b03 = smB8[base + ks0 * 128 + (b_base + 48 + idx)];\n"
+"        u8x8 a10 = smA8[base + ks1 * 128 + (a_base + 0  + idx)];\n"
+"        u8x8 a11 = smA8[base + ks1 * 128 + (a_base + 16 + idx)];\n"
+"        u8x8 a12 = smA8[base + ks1 * 128 + (a_base + 32 + idx)];\n"
+"        u8x8 a13 = smA8[base + ks1 * 128 + (a_base + 48 + idx)];\n"
+"        u8x8 b10 = smB8[base + ks1 * 128 + (b_base + 0  + idx)];\n"
+"        u8x8 b11 = smB8[base + ks1 * 128 + (b_base + 16 + idx)];\n"
+"        u8x8 b12 = smB8[base + ks1 * 128 + (b_base + 32 + idx)];\n"
+"        u8x8 b13 = smB8[base + ks1 * 128 + (b_base + 48 + idx)];\n"
+"        u32x2 ra00 = pack_a8(a00), ra01 = pack_a8(a01);\n"
+"        u32x2 ra02 = pack_a8(a02), ra03 = pack_a8(a03);\n"
+"        u32x2 rb00 = pack_a8(b00), rb01 = pack_a8(b01);\n"
+"        u32x2 rb02 = pack_a8(b02), rb03 = pack_a8(b03);\n"
+"        u32x2 ra10 = pack_a8(a10), ra11 = pack_a8(a11);\n"
+"        u32x2 ra12 = pack_a8(a12), ra13 = pack_a8(a13);\n"
+"        u32x2 rb10 = pack_a8(b10), rb11 = pack_a8(b11);\n"
+"        u32x2 rb12 = pack_a8(b12), rb13 = pack_a8(b13);\n"
+"        /* 32 WMMA back-to-back. */\n"
+"        WMMA_FP8(ra00, rb00, cv00); WMMA_FP8(ra00, rb01, cv01);\n"
+"        WMMA_FP8(ra00, rb02, cv02); WMMA_FP8(ra00, rb03, cv03);\n"
+"        WMMA_FP8(ra01, rb00, cv10); WMMA_FP8(ra01, rb01, cv11);\n"
+"        WMMA_FP8(ra01, rb02, cv12); WMMA_FP8(ra01, rb03, cv13);\n"
+"        WMMA_FP8(ra02, rb00, cv20); WMMA_FP8(ra02, rb01, cv21);\n"
+"        WMMA_FP8(ra02, rb02, cv22); WMMA_FP8(ra02, rb03, cv23);\n"
+"        WMMA_FP8(ra03, rb00, cv30); WMMA_FP8(ra03, rb01, cv31);\n"
+"        WMMA_FP8(ra03, rb02, cv32); WMMA_FP8(ra03, rb03, cv33);\n"
+"        WMMA_FP8(ra10, rb10, cv00); WMMA_FP8(ra10, rb11, cv01);\n"
+"        WMMA_FP8(ra10, rb12, cv02); WMMA_FP8(ra10, rb13, cv03);\n"
+"        WMMA_FP8(ra11, rb10, cv10); WMMA_FP8(ra11, rb11, cv11);\n"
+"        WMMA_FP8(ra11, rb12, cv12); WMMA_FP8(ra11, rb13, cv13);\n"
+"        WMMA_FP8(ra12, rb10, cv20); WMMA_FP8(ra12, rb11, cv21);\n"
+"        WMMA_FP8(ra12, rb12, cv22); WMMA_FP8(ra12, rb13, cv23);\n"
+"        WMMA_FP8(ra13, rb10, cv30); WMMA_FP8(ra13, rb11, cv31);\n"
+"        WMMA_FP8(ra13, rb12, cv32); WMMA_FP8(ra13, rb13, cv33);\n"
+"        if (has_next) {\n"
+"            int nb = 1 - buf;\n"
+"            int nbase = nb * (128 * 4);\n"
+"            smA8[nbase + (c0>>3)*128 + r0]     = SPLIT_LO(na0);\n"
+"            smA8[nbase + ((c0>>3)+1)*128 + r0] = SPLIT_HI(na0);\n"
+"            smA8[nbase + (c1>>3)*128 + r1]     = SPLIT_LO(na1);\n"
+"            smA8[nbase + ((c1>>3)+1)*128 + r1] = SPLIT_HI(na1);\n"
+"            smB8[nbase + (c0>>3)*128 + r0]     = SPLIT_LO(nb0);\n"
+"            smB8[nbase + ((c0>>3)+1)*128 + r0] = SPLIT_HI(nb0);\n"
+"            smB8[nbase + (c1>>3)*128 + r1]     = SPLIT_LO(nb1);\n"
+"            smB8[nbase + ((c1>>3)+1)*128 + r1] = SPLIT_HI(nb1);\n"
+"            lds_barrier_signal();\n"
+"            buf = nb;\n"
+"            lds_barrier_wait();\n"
+"        }\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 64;\n"
+"    int row = wave_m0 + half * 8;\n"
+"    if (row < M) {\n"
+"        store_acc8_f32(Y, bias, cv00, row +  0, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv01, row +  0, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv02, row +  0, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv03, row +  0, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv10, row + 16, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv11, row + 16, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv12, row + 16, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv13, row + 16, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv20, row + 32, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv21, row + 32, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv22, row + 32, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv23, row + 32, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv30, row + 48, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv31, row + 48, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv32, row + 48, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv33, row + 48, wave_n0 + 48 + idx, N);\n"
+"    }\n"
+"}\n"
+"\n"
+"\n"
+"/* pipe32_pgr2: K_step=32, 3-LDS-buffer pipeline. Issue global loads 2 K-steps\n"
+"ahead so DRAM latency (~200 cyc) hides behind 2x WMMA compute bursts (~1024\n"
+"cyc) instead of one (512 cyc). Other structure mirrors pipe32. */\n"
+"__global__ __launch_bounds__(128, 1)\n"
+"void gemm_fp8_pipe32_pgr2(float *Y, const u8 *W, const u8 *X,\n"
+"                          const float *bias, int N, int K, int M) {\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int half = lane >> 4;\n"
+"    int idx = lane & 15;\n"
+"    int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    int e0 = tid * 2 + 0;\n"
+"    int e1 = tid * 2 + 1;\n"
+"    int r0 = e0 >> 1, r1 = e1 >> 1;\n"
+"    int c0 = (e0 & 1) * 16, c1 = (e1 & 1) * 16;\n"
+"    /* 3-deep LDS pipeline. */\n"
+"    __shared__ u8x8 smA8[3 * 128 * 4];\n"
+"    __shared__ u8x8 smB8[3 * 128 * 4];\n"
+"    /* Helper: load X/W u8x16 from global at K-offset k. */\n"
+"    #define LOAD_GLOBAL(na0,na1,nb0,nb1, kk) do { \\\n"
+"        na0 = *((const u8x16 *)(X + (size_t)(cta_m0 + r0) * K + (kk) + c0)); \\\n"
+"        na1 = *((const u8x16 *)(X + (size_t)(cta_m0 + r1) * K + (kk) + c1)); \\\n"
+"        nb0 = *((const u8x16 *)(W + (size_t)(cta_n0 + r0) * K + (kk) + c0)); \\\n"
+"        nb1 = *((const u8x16 *)(W + (size_t)(cta_n0 + r1) * K + (kk) + c1)); \\\n"
+"    } while(0)\n"
+"    #define WRITE_LDS(buf_idx, na0,na1,nb0,nb1) do { \\\n"
+"        int nbase = (buf_idx) * (128 * 4); \\\n"
+"        smA8[nbase + (c0>>3)*128 + r0]     = SPLIT_LO(na0); \\\n"
+"        smA8[nbase + ((c0>>3)+1)*128 + r0] = SPLIT_HI(na0); \\\n"
+"        smA8[nbase + (c1>>3)*128 + r1]     = SPLIT_LO(na1); \\\n"
+"        smA8[nbase + ((c1>>3)+1)*128 + r1] = SPLIT_HI(na1); \\\n"
+"        smB8[nbase + (c0>>3)*128 + r0]     = SPLIT_LO(nb0); \\\n"
+"        smB8[nbase + ((c0>>3)+1)*128 + r0] = SPLIT_HI(nb0); \\\n"
+"        smB8[nbase + (c1>>3)*128 + r1]     = SPLIT_LO(nb1); \\\n"
+"        smB8[nbase + ((c1>>3)+1)*128 + r1] = SPLIT_HI(nb1); \\\n"
+"    } while(0)\n"
+"\n"
+"    /* Stage 0+1: prefetch first two K-steps into LDS buffers 0 and 1. */\n"
+"    u8x16 g0a0,g0a1,g0b0,g0b1; LOAD_GLOBAL(g0a0,g0a1,g0b0,g0b1, 0);\n"
+"    WRITE_LDS(0, g0a0,g0a1,g0b0,g0b1);\n"
+"    u8x16 g1a0,g1a1,g1b0,g1b1;\n"
+"    int has_k1 = (32 < K);\n"
+"    if (has_k1) { LOAD_GLOBAL(g1a0,g1a1,g1b0,g1b1, 32); WRITE_LDS(1, g1a0,g1a1,g1b0,g1b1); }\n"
+"    lds_barrier();\n"
+"    float8 z = {0,0,0,0,0,0,0,0};\n"
+"    float8 cv00=z,cv01=z,cv02=z,cv03=z;\n"
+"    float8 cv10=z,cv11=z,cv12=z,cv13=z;\n"
+"    float8 cv20=z,cv21=z,cv22=z,cv23=z;\n"
+"    float8 cv30=z,cv31=z,cv32=z,cv33=z;\n"
+"    int rd_buf = 0;            /* buffer index to compute on */\n"
+"    int wr_buf = 2;            /* next buffer to write into */\n"
+"    for (int k = 0; k < K; k += 32) {\n"
+"        /* Issue global load for K-step (k + 64), to be written to wr_buf. */\n"
+"        u8x16 na0,na1,nb0,nb1;\n"
+"        int has_far = (k + 64 < K);\n"
+"        if (has_far) LOAD_GLOBAL(na0,na1,nb0,nb1, k + 64);\n"
+"        /* Compute on rd_buf. */\n"
+"        int base = rd_buf * (128 * 4);\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 64;\n"
+"        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
+"            int kslot = (kk0 + k_off) >> 3;\n"
+"            u8x8 a0 = smA8[base + kslot * 128 + (a_base + 0  + idx)];\n"
+"            u8x8 a1 = smA8[base + kslot * 128 + (a_base + 16 + idx)];\n"
+"            u8x8 a2 = smA8[base + kslot * 128 + (a_base + 32 + idx)];\n"
+"            u8x8 a3 = smA8[base + kslot * 128 + (a_base + 48 + idx)];\n"
+"            u8x8 b0 = smB8[base + kslot * 128 + (b_base + 0  + idx)];\n"
+"            u8x8 b1 = smB8[base + kslot * 128 + (b_base + 16 + idx)];\n"
+"            u8x8 b2 = smB8[base + kslot * 128 + (b_base + 32 + idx)];\n"
+"            u8x8 b3 = smB8[base + kslot * 128 + (b_base + 48 + idx)];\n"
+"            u32x2 ra0 = pack_a8(a0), ra1 = pack_a8(a1);\n"
+"            u32x2 ra2 = pack_a8(a2), ra3 = pack_a8(a3);\n"
+"            u32x2 rb0 = pack_a8(b0), rb1 = pack_a8(b1);\n"
+"            u32x2 rb2 = pack_a8(b2), rb3 = pack_a8(b3);\n"
+"            WMMA_FP8(ra0, rb0, cv00); WMMA_FP8(ra0, rb1, cv01);\n"
+"            WMMA_FP8(ra0, rb2, cv02); WMMA_FP8(ra0, rb3, cv03);\n"
+"            WMMA_FP8(ra1, rb0, cv10); WMMA_FP8(ra1, rb1, cv11);\n"
+"            WMMA_FP8(ra1, rb2, cv12); WMMA_FP8(ra1, rb3, cv13);\n"
+"            WMMA_FP8(ra2, rb0, cv20); WMMA_FP8(ra2, rb1, cv21);\n"
+"            WMMA_FP8(ra2, rb2, cv22); WMMA_FP8(ra2, rb3, cv23);\n"
+"            WMMA_FP8(ra3, rb0, cv30); WMMA_FP8(ra3, rb1, cv31);\n"
+"            WMMA_FP8(ra3, rb2, cv32); WMMA_FP8(ra3, rb3, cv33);\n"
+"        }\n"
+"        if (has_far) {\n"
+"            WRITE_LDS(wr_buf, na0,na1,nb0,nb1);\n"
+"            lds_barrier_signal();\n"
+"            wr_buf = (wr_buf + 1) % 3;\n"
+"            rd_buf = (rd_buf + 1) % 3;\n"
+"            lds_barrier_wait();\n"
+"        } else if (k + 32 < K) {\n"
+"            /* No new load to commit (already in buf 1 or 2 from prior step),\n"
+"             * but advance to next compute buffer. */\n"
+"            lds_barrier_signal();\n"
+"            rd_buf = (rd_buf + 1) % 3;\n"
+"            lds_barrier_wait();\n"
+"        }\n"
+"    }\n"
+"    #undef LOAD_GLOBAL\n"
+"    #undef WRITE_LDS\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 64;\n"
+"    int row = wave_m0 + half * 8;\n"
+"    if (row < M) {\n"
+"        store_acc8_f32(Y, bias, cv00, row +  0, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv01, row +  0, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv02, row +  0, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv03, row +  0, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv10, row + 16, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv11, row + 16, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv12, row + 16, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv13, row + 16, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv20, row + 32, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv21, row + 32, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv22, row + 32, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv23, row + 32, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv30, row + 48, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv31, row + 48, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv32, row + 48, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv33, row + 48, wave_n0 + 48 + idx, N);\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Pure WMMA peak microbench. No LDS, no global memory access in the inner\n"
+" * loop. Each lane holds 16 independent accumulators (mirror of MIWT 4x4\n"
+" * register pressure) and runs a fixed iter count. Used to establish the\n"
+" * hardware's sustainable WMMA throughput on this WG configuration. */\n"
+"__global__ __launch_bounds__(128, 1)\n"
+"void gemm_fp8_peak(float *Y, const u8 *W, const u8 *X,\n"
+"                   const float *bias, int N, int K, int M) {\n"
+"    int tid = threadIdx.x;\n"
+"    int lane = tid & 31;\n"
+"    /* Seed inputs from globals (forced to be loaded once). */\n"
+"    u32x2 a0 = pack_a8(*((const u8x8 *)(X + (lane*8) % 64)));\n"
+"    u32x2 a1 = pack_a8(*((const u8x8 *)(X + (lane*8 + 8) % 64)));\n"
+"    u32x2 a2 = pack_a8(*((const u8x8 *)(X + (lane*8 + 16) % 64)));\n"
+"    u32x2 a3 = pack_a8(*((const u8x8 *)(X + (lane*8 + 24) % 64)));\n"
+"    u32x2 b0 = pack_a8(*((const u8x8 *)(W + (lane*8) % 64)));\n"
+"    u32x2 b1 = pack_a8(*((const u8x8 *)(W + (lane*8 + 8) % 64)));\n"
+"    u32x2 b2 = pack_a8(*((const u8x8 *)(W + (lane*8 + 16) % 64)));\n"
+"    u32x2 b3 = pack_a8(*((const u8x8 *)(W + (lane*8 + 24) % 64)));\n"
+"    float8 z = {0,0,0,0,0,0,0,0};\n"
+"    float8 cv00=z,cv01=z,cv02=z,cv03=z;\n"
+"    float8 cv10=z,cv11=z,cv12=z,cv13=z;\n"
+"    float8 cv20=z,cv21=z,cv22=z,cv23=z;\n"
+"    float8 cv30=z,cv31=z,cv32=z,cv33=z;\n"
+"    /* iters: number of 32-WMMA blocks. M arg reused as iter count. */\n"
+"    int iters = M;\n"
+"    for (int i = 0; i < iters; i++) {\n"
+"        WMMA_FP8(a0, b0, cv00); WMMA_FP8(a0, b1, cv01);\n"
+"        WMMA_FP8(a0, b2, cv02); WMMA_FP8(a0, b3, cv03);\n"
+"        WMMA_FP8(a1, b0, cv10); WMMA_FP8(a1, b1, cv11);\n"
+"        WMMA_FP8(a1, b2, cv12); WMMA_FP8(a1, b3, cv13);\n"
+"        WMMA_FP8(a2, b0, cv20); WMMA_FP8(a2, b1, cv21);\n"
+"        WMMA_FP8(a2, b2, cv22); WMMA_FP8(a2, b3, cv23);\n"
+"        WMMA_FP8(a3, b0, cv30); WMMA_FP8(a3, b1, cv31);\n"
+"        WMMA_FP8(a3, b2, cv32); WMMA_FP8(a3, b3, cv33);\n"
+"        WMMA_FP8(a0, b0, cv00); WMMA_FP8(a0, b1, cv01);\n"
+"        WMMA_FP8(a0, b2, cv02); WMMA_FP8(a0, b3, cv03);\n"
+"        WMMA_FP8(a1, b0, cv10); WMMA_FP8(a1, b1, cv11);\n"
+"        WMMA_FP8(a1, b2, cv12); WMMA_FP8(a1, b3, cv13);\n"
+"        WMMA_FP8(a2, b0, cv20); WMMA_FP8(a2, b1, cv21);\n"
+"        WMMA_FP8(a2, b2, cv22); WMMA_FP8(a2, b3, cv23);\n"
+"        WMMA_FP8(a3, b0, cv30); WMMA_FP8(a3, b1, cv31);\n"
+"        WMMA_FP8(a3, b2, cv32); WMMA_FP8(a3, b3, cv33);\n"
+"    }\n"
+"    /* Sink to prevent DCE: a tid-dependent gate that the compiler can't\n"
+"     * statically prove is false (depends on N arg). */\n"
+"    if (tid == N) {\n"
+"        float s = 0; const float8 *cs[16]={&cv00,&cv01,&cv02,&cv03,&cv10,&cv11,&cv12,&cv13,&cv20,&cv21,&cv22,&cv23,&cv30,&cv31,&cv32,&cv33};\n"
+"        for (int i=0;i<16;i++) for (int j=0;j<8;j++) s += (*cs[i])[j];\n"
+"        Y[blockIdx.x] = s;\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern C */\n";
 
 /* ------------------------------------------------------------------------ */
@@ -683,6 +1007,9 @@ typedef struct {
     hipFunction_t pipe;
     hipFunction_t pipe32;
     hipFunction_t pipe32_occ;
+    hipFunction_t pipe32_hoist;
+    hipFunction_t pipe32_pgr2;
+    hipFunction_t peak;
 } fp8_kernels;
 
 static int load_kernels(int dev, fp8_kernels *out, int verbose) {
@@ -693,6 +1020,9 @@ static int load_kernels(int dev, fp8_kernels *out, int verbose) {
     HIP_CHECK(hipModuleGetFunction(&out->pipe,        mod, "gemm_fp8_pipe"));
     HIP_CHECK(hipModuleGetFunction(&out->pipe32,      mod, "gemm_fp8_pipe32"));
     HIP_CHECK(hipModuleGetFunction(&out->pipe32_occ,  mod, "gemm_fp8_pipe32_occ"));
+    HIP_CHECK(hipModuleGetFunction(&out->pipe32_hoist,mod, "gemm_fp8_pipe32_hoist"));
+    HIP_CHECK(hipModuleGetFunction(&out->pipe32_pgr2, mod, "gemm_fp8_pipe32_pgr2"));
+    HIP_CHECK(hipModuleGetFunction(&out->peak,        mod, "gemm_fp8_peak"));
     return 0;
 }
 
@@ -723,6 +1053,8 @@ static int run_shape(const fp8_kernels *kn, const gemm_shape *s,
     if      (!strcmp(mode, "pipe"))         fn = kn->pipe;
     else if (!strcmp(mode, "pipe32"))       fn = kn->pipe32;
     else if (!strcmp(mode, "pipe32_occ"))   fn = kn->pipe32_occ;
+    else if (!strcmp(mode, "pipe32_hoist")) fn = kn->pipe32_hoist;
+    else if (!strcmp(mode, "pipe32_pgr2"))  fn = kn->pipe32_pgr2;
     else                                    fn = kn->baseline;
 
     size_t bytes_X = (size_t)M * K;
@@ -846,11 +1178,62 @@ int main(int argc, char **argv) {
            iters, abs_max, use_bias ? "on" : "off",
            do_check ? ", check=on" : "");
 
-    const char *modes_all[] = {"baseline", "pipe", "pipe32", "pipe32_occ"};
-    int n_modes = !strcmp(mode, "all") ? 4 : 1;
-    const char *modes[4];
+    const char *modes_all[] = {"baseline", "pipe", "pipe32", "pipe32_occ", "pipe32_hoist", "pipe32_pgr2"};
+    int n_modes = !strcmp(mode, "all") ? 6 : 1;
+    const char *modes[6];
     if (n_modes == 1) modes[0] = mode;
-    else { modes[0] = modes_all[0]; modes[1] = modes_all[1]; modes[2] = modes_all[2]; modes[3] = modes_all[3]; }
+    else for (int i = 0; i < 6; i++) modes[i] = modes_all[i];
+
+    if (!strcmp(want, "peak")) {
+        /* Peak microbench: launch 1 WG per CU (= 64 WGs) with iter count.
+         * Each iter does 32 WMMA per lane = 32 * 8192 = 262144 FLOPs/lane.
+         * 32 lanes/wave * 4 waves/WG * 64 WG = 8192 lanes -> 262144 * 8192 *
+         * iters / (2 outer iters per loop) FLOPs total. */
+        int iters_inner = 4096;          /* outer-loop iterations */
+        size_t bytes_X = 1024;
+        size_t bytes_W = 1024;
+        size_t bytes_Y = 1024;
+        uint8_t *hX = (uint8_t *)calloc(bytes_X, 1);
+        uint8_t *hW = (uint8_t *)calloc(bytes_W, 1);
+        for (size_t i = 0; i < bytes_X; i++) hX[i] = (uint8_t)((i * 7 + 13) & 0x7F);
+        for (size_t i = 0; i < bytes_W; i++) hW[i] = (uint8_t)((i * 11 + 5) & 0x7F);
+        void *dX = hip_upload_raw(hX, bytes_X);
+        void *dW = hip_upload_raw(hW, bytes_W);
+        void *dY = NULL; HIP_CHECK(hipMalloc(&dY, bytes_Y));
+        /* N=200 (>= block size of 128) so the sink branch is dynamically
+         * unreachable but not statically. */
+        int Nv = 200, Kv = 0, Mv = iters_inner;
+        void *args[] = { &dY, &dW, &dX, &dW /*bias placeholder*/, &Nv, &Kv, &Mv };
+        dim3 block = {128, 1, 1};
+        dim3 grid  = {64, 1, 1};
+        HIP_CHECK(hipModuleLaunchKernel(kn.peak,
+                                        grid.x, grid.y, grid.z,
+                                        block.x, block.y, block.z,
+                                        0, NULL, args, NULL));
+        HIP_CHECK(hipDeviceSynchronize());
+        double t0 = timer_ms();
+        for (int i = 0; i < iters; i++) {
+            HIP_CHECK(hipModuleLaunchKernel(kn.peak,
+                                            grid.x, grid.y, grid.z,
+                                            block.x, block.y, block.z,
+                                            0, NULL, args, NULL));
+        }
+        HIP_CHECK(hipDeviceSynchronize());
+        double t1 = timer_ms();
+        double ms = (t1 - t0) / (double)iters;
+        /* FLOPs per launch: 64 WG * 4 waves * 32 lanes ... actually a WMMA
+         * is wave-level: 8192 FLOPs/WMMA per wave. 32 WMMA/iter * 4 waves *
+         * 64 WG * iters_inner = 8192 FLOPs * waves * iters/launch. */
+        double waves = 64.0 * 4.0;
+        double wmma_per_iter = 32.0;
+        double flops_per_launch = 8192.0 * waves * wmma_per_iter * (double)iters_inner;
+        double tflops = flops_per_launch / (ms * 1.0e-3) * 1.0e-12;
+        printf("  [peak    ] microbench   waves=%.0f iter=%d  %7.4f ms  %6.1f TFLOP/s\n",
+               waves, iters_inner, ms, tflops);
+        free(hX); free(hW);
+        hipFree(dX); hipFree(dW); hipFree(dY);
+        return 0;
+    }
 
     int matched = 0;
     for (int i = 0; i < g_num_shapes; i++) {
