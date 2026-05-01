@@ -153,7 +153,8 @@ Steps:
   take top-N above threshold, filter by class_id, convert
   cxcywh-normalized to xyxy in image px.
 - `rt_detr_detect_largest_person(...)` chains preprocess +
-  forward + postprocess(class=person) + arg-max-by-area.
+  forward + person-only postprocess and selects the highest-confidence
+  valid person, using larger area only as a tie-break.
 - verify_rt_detr_postprocess: bit-exact vs `detected_persons.npy`
   (Δscore=0, Δbbox≤1e-2 px).
 - verify_rt_detr_e2e (image → bbox): score 0.9797 vs ref 0.9793,
@@ -166,7 +167,7 @@ Steps:
 ### A2.3 — wire `--auto-bbox` into CPU runner (DONE 2026-04-26)
 
 `test_sam3d_body --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]
---image IMG ...` now runs RT-DETR-S to get the largest-person bbox
+--image IMG ...` now runs RT-DETR-S to get the primary person bbox
 before sam3d_body's encoder. Default detector path is
 `/mnt/disk01/models/rt_detr_s/model.safetensors`, default threshold
 is 0.5. Tested on `web/public/sam3_compare/person.jpg` → score 0.98,
@@ -210,8 +211,8 @@ modeled on `ref/hy3d/hy3d_server.py`). Default port 8088. Routes:
   `inputs.bbox` is absent. Locks per-backend to serialize CUDA / OMP.
 
 Smoke-tested: ours-cuda backend on person.jpg → V=18439 F=36874,
-bbox_used parsed from runner stderr (`auto-bbox score=... x0=...`),
-total wall ~9.4s.
+bbox_used parsed from runner stderr (`auto-bbox: detector=rt-detr-s ...
+bbox=(...)`), total wall ~9.4s.
 
 ### A3.1 — web/sam3d_body.html drag-drop + three.js mesh viewer (DONE 2026-04-26)
 
@@ -228,9 +229,10 @@ conversion). Camera framed from the mesh bbox; mesh is rotated
 `R_x(π)` so the Y-down camera-space output stands upright in
 OrbitControls' default Y-up frame.
 
-Server stderr-bbox parser handles both runner formats:
-- CPU:  `auto-bbox: score=0.980 bbox=(0.1,5.9,768.1,1019.4)`
-- CUDA: `auto-bbox score=0.9797 x0=0.1 y0=5.9 x1=768.1 y1=1019.4`
+Server stderr-bbox parser handles the unified runner format and older
+CUDA logs:
+- current: `auto-bbox: detector=rt-detr-s score=0.9800 threshold=0.500 image=768x1024 bbox=(0.1,5.9,768.1,1019.4)`
+- legacy CUDA: `auto-bbox score=0.9797 x0=0.1 y0=5.9 x1=768.1 y1=1019.4`
 
 Smoke-tested: server returns OBJ as base64, browser-side
 `atob` → `OBJLoader.parse()` flow validated against the runner's
@@ -288,6 +290,107 @@ sample dir to grow the gallery — no server restart needed.
 
 ## A1 — ViT-H backbone
 
+### A1.7 — fixed-bbox self-driven verifier refs (DONE 2026-04-30)
+
+`ref/sam3d-body/gen_image_ref.py` now captures the first body-decoder
+`forward_step` result as `body_out_vertices.npy`,
+`body_out_keypoints_3d.npy`, and `body_out_keypoints_2d.npy`. The
+final upstream `out_*` files are still written, but they include the
+later hand-prompt/refinement pass and are not the parity target for
+the current C runners.
+
+The stage dumps are also guarded to the first body decoder pass:
+`decoder_layer*_in/out`, `decoder_out_norm_final`,
+`head_pose_proj_raw`, `head_camera_proj_raw`, ray-cond tensors, and
+token-construction tensors no longer get overwritten by later prompt
+or hand decoder calls. Regenerated DINOv3 fixed-bbox refs now show
+`prompt_to_token_in=(1,1,1280)` and `decoder_layer0_in__x=(1,145,1024)`
+again, instead of the post-hand-prompt 148-token shape.
+
+CPU and CUDA `verify_end_to_end --image IMG --bbox x0 y0 x1 y1`
+prefer `body_out_*` when present and fall back to legacy `out_*`
+refs. They also accept `--threshold-2d PX`, so meter-space and
+pixel-space gates can be set independently. Current DINOv3 fixed-bbox
+smoke on `samples/dancing.jpg`:
+
+- CPU: vertices max_abs=2.47e-2, kp3d max_abs=2.40e-2, kp2d max_abs=6.75 px
+- CUDA: vertices max_abs=2.43e-2, kp3d max_abs=2.36e-2, kp2d max_abs=6.78 px
+
+Both pass with `--threshold 3e-2 --threshold-2d 10`; the remaining
+drift is the known raw encoder/preprocess floor, not decoder/MHR.
+The same guarded ref gives exact override parity:
+`verify_end_to_end` without `--image` reports vertices max_abs=9.83e-7,
+kp3d max_abs=5.96e-7, and kp2d max_abs=4.88e-4 px. CUDA
+`verify_decoder` against the guarded ref reports `head_pose_proj_raw`
+max_abs=2.86e-6 and final layer outputs below 1e-6 to 2e-6.
+`verify_mhr_head_decode` now resolves variant-specific
+`sam3d_body_{dinov3,vith}_{decoder,mhr_head}.safetensors` and tests
+the guarded body path instead of the stale hand-branch assumption:
+DINOv3 `mhr_model_params` max_abs=1.19e-7, keypoints max_abs=2.38e-7;
+ViT-H `mhr_model_params` max_abs=1.19e-7, keypoints max_abs=3.58e-7.
+
+Verifier hardening: `verify_end_to_end` now treats empty diffs as a
+failure and fails missing/bad refs instead of silently skipping. CPU
+override mode derives `(H,W,Dc)` from `image_embeddings_after_ray` and
+validates the token/context shapes, so a ViT-H ref cannot accidentally
+run through a 32x32 DINOv3 assumption and report `nan OK`.
+
+The ViT-H override gap is closed. Root cause was keypoint-token update:
+upstream scales the grid-sample x coordinate by `H/W` for ViT-style
+rectangular embeddings (`vit_hmr_512_384`: 32x24 grid, scale 32/24) so
+normalized keypoints still refer to the original square crop before
+width cropping. The C and CUDA paths originally sampled the rectangular
+grid with the square coordinate directly.
+After the fix:
+
+- `verify_tokens --backbone vith`: build-token path passes,
+  x/x_pe max_abs=4.77e-7.
+- `verify_mhr_head --backbone vith`: norm/head path passes,
+  head_pose max_abs=1.91e-6.
+- `verify_kp_update --backbone vith`: token and augment updates all
+  below 2e-6.
+- `verify_decoder_full --backbone vith`: per-layer pose/camera and
+  final heads all below 2e-6.
+- `verify_decoder_e2e --backbone vith`: preset decoder chain passes,
+  head_pose max_abs=1.91e-6.
+- `verify_decoder_forward --backbone vith`: public wrapper path passes
+  with cached ray-cond refs, head_pose max_abs=9.25e-5 and final
+  keypoints_3d max_abs=2.94e-5.
+- `verify_end_to_end --backbone vith` override mode: vertices
+  max_abs=1.37e-6, kp3d max_abs=5.96e-7, kp2d max_abs=4.88e-4 px.
+- CPU `verify_dense_pe --backbone vith`: rectangular dense PE passes
+  at max_abs=1.91e-6 after matching upstream's centered 24-column crop
+  from the 32x32 square crop PE grid.
+- CPU `verify_ray_cond --backbone vith`: 32x24 ray-conditioned image
+  embedding passes, max_abs=9.87e-4, mean_abs=1.40e-4.
+- CPU `verify_ray_cond_xyz` on ViT-H refs: centered x-crop ray tensor
+  passes, max_abs=5.96e-8.
+- CUDA `verify_decoder_layer --backbone vith`: all six layers pass,
+  max_abs <= 9.54e-6.
+- CUDA `verify_ray_cond --backbone vith`: 32x24 ray-conditioned image
+  embedding passes, max_abs=9.86e-4, mean_abs=1.40e-4.
+- CUDA `verify_build_tokens --backbone vith`: token build passes,
+  x max_abs=5.72e-6 and x_pe max_abs=3.58e-6.
+- CUDA `verify_kp_update --backbone vith`: token/augment post-update
+  max_abs <= 6.68e-6 across layers.
+- CUDA `verify_mhr_head --backbone vith`: norm/head path passes,
+  head_pose max_abs=1.53e-5.
+- CUDA `verify_decoder --backbone vith`: full iterative decoder loop
+  passes; final `head_pose_proj_raw` max_abs=9.54e-6 and final
+  keypoints_3d max_abs=8.08e-7.
+
+ViT-H fixed-bbox refs generated from
+`/mnt/disk01/models/sam3d-body/vith` also pass through both
+self-driven verifiers. Current raw-image envelope:
+
+- CPU: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
+- CUDA: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
+
+Both pass with `--backbone vith --threshold 1.5e-1 --threshold-2d 200`.
+Because the decoder/MHR override gates are exact, the remaining raw-image
+gap is the converted ViT-H encoder precision floor relative to PyTorch,
+not decoder or CUDA integration drift.
+
 ### A1.6 — VITH decoder + MHR on CUDA (DONE 2026-04-26)
 
 `cuda/sam3d_body/cuda_sam3d_body_runner.c` now runs the full
@@ -312,6 +415,12 @@ Smoke vs CPU --backbone vith on the same `person_portrait.jpg`:
 budget the per-stage verifies use; no other stage tightening
 needed.
 
+Current full-pipeline smoke (2026-04-30):
+`./cuda/sam3d_body/test_cuda_sam3d_body --backbone vith --image
+cpu/sam3d_body/samples/dancing.jpg --bbox 727.537 111.031 1534.146
+1456.042 -o /tmp/sam3d_body_vith_cuda.obj` writes
+`V=18439 F=36874` plus the sidecar JSON.
+
 The user-facing surface caught up:
 - `test_cuda_sam3d_body --backbone vith` no longer prints the
   encoder-only warning or NOTE.
@@ -334,18 +443,18 @@ adjacent to the focal hint input. The selection plumbs through
   `ckpt_dirs` / `hf_repo_ids` so the upstream pipeline loads the
   matching ckpt (`facebook/sam-3d-body-vith` for vith).
 
-`renderBackends()` re-runs on every backbone radio change and
-disables the `ours-cuda` checkbox when `vith` is selected, with a
-tooltip explaining "ViT-H backbone runs encoder-only on CUDA today;
-switch to dinov3 or use ours-cpu / pytorch-cuda." Server-side smoke
-(port 8091, person_portrait.jpg, auto-bbox, sm_120 + 8 cpu threads):
+`renderBackends()` re-runs on every backbone radio change. This
+section predates A1.6; CUDA ViT-H is now enabled end-to-end and no
+longer uses the encoder-only disabled state. Historical server-side
+smoke (port 8091, person_portrait.jpg, auto-bbox, sm_120 + 8 cpu
+threads):
 
 | backend     | backbone | nverts | infer ms | result            |
 |-------------|----------|--------|----------|-------------------|
 | ours-cpu    | dinov3   | 18439  | 116250   | mesh ok           |
 | ours-cpu    | vith     | 18439  | 60425    | mesh ok           |
 | ours-cuda   | dinov3   | 18439  | 11343    | mesh ok           |
-| ours-cuda   | vith     | —      | —        | 500: rc=255 with informative stderr tail (encoder fwd done, decoder rejects VITH ctx) |
+| ours-cuda   | vith     | —      | —        | historical 500 before A1.6 |
 
 The 500 path matches what the UI cell already renders for failed
 backends — the user sees the limitation message inline instead of a
@@ -397,9 +506,9 @@ End-to-end smoke (8 threads, person_portrait.jpg):
   vs −0.017 X), confirming the variant-specific decoder/MHR weights
   actually drive the output.
 
-The CUDA half of A1.4 is split into a follow-up tracked behind A1.3
-(CUDA ViT-H encoder kernels) — flag-wiring without an actual CUDA
-ViT-H kernel would just dispatch to a stub.
+The CUDA half originally landed as encoder-only, then A1.6 wired the
+same decoder/MHR path for ViT-H. Keep this section as the flag/preprocess
+history; current end-to-end status is tracked in A1.6 above.
 
 ### A1.4-cuda — CUDA runner --backbone {dinov3,vith} flag (DONE 2026-04-26)
 
@@ -413,17 +522,15 @@ DINOv3 host preprocess. The verify_vith path still works because
 `debug_set_normalized_input` sets `has_norm_input=1` and the
 preprocess block is skipped.
 
-Encoder forward runs end-to-end via the CLI for both variants.
-Decoder/MHR for VITH on CUDA is **not yet ported** —
-`cuda_sam3d_body_run_decoder` rejects a VITH ctx with `E_INVAL`, so
-`--backbone vith` exits with rc=-1 after the encoder forward. The
-CLI prints a one-line warning to that effect when VITH is selected.
-A follow-up task tracks the VITH-specific decoder/MHR cuda port.
+Encoder forward and decoder/MHR now run end-to-end via the CLI for both
+variants. The historical VITH `E_INVAL` decoder guard was removed when
+A1.6 added the rectangular token/ray/PE handling and variant-specific
+decoder/MHR weights.
 
 Smoke (sm_120):
 - `--backbone dinov3 -o cuda_dinov3.obj` → V=18439 F=36874 (unchanged).
-- `--backbone vith` → encoder forward done (32 blocks, N_TOK=768,
-  D=1280); rc=-1 at decoder stage as expected.
+- `--backbone vith -o cuda_vith.obj` → V=18439 F=36874; encoder +
+  decoder + MHR complete.
 - `make verify-vith` (CUDA) → max_abs=3.53e-1 mean_abs=1.39e-2 (still
   green; runner refactor didn't regress the verify path).
 
@@ -431,10 +538,9 @@ Smoke (sm_120):
 
 `cuda/sam3d_body/cuda_sam3d_body_runner.c::cuda_sam3d_body_run_encoder`
 branches on `cfg.backbone == VITH` and dispatches to a new
-`cuda_sam3d_body_run_encoder_vith` host routine. The encoder side is
-encoder-only on CUDA today — `cuda_sam3d_body_run_decoder` rejects a
-VITH ctx with `E_INVAL` until a VITH-specific decoder/MHR cuda path
-lands. Same bf16 floor applies as on CPU.
+`cuda_sam3d_body_run_encoder_vith` host routine. This section describes
+the encoder landing; the later A1.6 work completes CUDA VITH
+decoder/MHR as well. Same bf16 floor applies as on CPU.
 
 New / modified GPU kernels in `cuda_sam3d_body_kernels.h`:
 

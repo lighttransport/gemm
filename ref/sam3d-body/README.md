@@ -7,8 +7,8 @@ upstream `facebookresearch/sam-3d-body` pipeline.
 ## Python environment
 
 The dump script runs the upstream `sam_3d_body` package (pinned to
-`torch` + `pytorch-lightning` + `detectron2@a1ce2f9` per upstream
-INSTALL.md). A dedicated `uv` venv lives at `ref/sam3d-body/.venv`.
+`torch` + `pytorch-lightning` per upstream INSTALL.md). A dedicated
+`uv` venv lives at `ref/sam3d-body/.venv`.
 
 ```bash
 cd ref/sam3d-body
@@ -30,7 +30,7 @@ VIRTUAL_ENV=$PWD/.venv uv pip install \
     "networkx==3.2.1" roma joblib seaborn appdirs fvcore tensorboard \
     huggingface_hub loguru optree jsonlines pycocotools xtcocotools
 
-# detectron2 (needed only when re-enabling auto-crop; v1 can skip):
+# detectron2 (optional, only for upstream Python auto-crop parity):
 # VIRTUAL_ENV=$PWD/.venv uv pip install \
 #     "git+https://github.com/facebookresearch/detectron2.git@a1ce2f9" \
 #     --no-build-isolation --no-deps
@@ -54,8 +54,17 @@ hf download facebook/sam-3d-body-vith   --local-dir $MODELS/sam3d-body/vith
 ```
 
 Both repos ship `model.ckpt` (encoder+decoder+head weights) and
-`assets/mhr_model.pt` (MHR parametric-body assets). The ViT-H variant
-is downloaded for convenience but not consumed by v1 (DINOv3 path only).
+`assets/mhr_model.pt` (MHR parametric-body assets). The C/CUDA runners
+consume both DINOv3-H+ and ViT-H variants via `--backbone`.
+
+The editable upstream checkout often lives under `/tmp`, so a reboot
+can remove it while leaving `.venv` intact. If `gen_image_ref.py`
+prints `cannot import sam_3d_body`, restore the checkout:
+
+```bash
+test -d /tmp/sam-3d-body || git clone --depth 1 \
+    https://github.com/facebookresearch/sam-3d-body /tmp/sam-3d-body
+```
 
 ## One-shot dump
 
@@ -96,21 +105,24 @@ written to `/tmp/sam3d_body_ref/<stage>.npy` as `f32`.
 
 ## Dump without the model (smoke)
 
-For step-0 scaffolding before the full pipeline installs:
+For bootstrap checks before the full pipeline installs:
 
 ```bash
 python ref/sam3d-body/gen_image_ref.py \
     --image person.jpg --outdir /tmp/sam3d_body_ref --skip-run
 ```
 
-Only `input_image.npy` and `image_processed.npy` are written — enough
-to exercise the NPY reader in the verifiers.
+Only `input_image.npy` is written — enough to exercise the NPY reader
+and confirm the ref script can decode the source image.
+
+## Native auto-crop
+
+The C and CUDA runners implement person auto-crop with native RT-DETR-S:
+use `--auto-bbox [--rt-detr-model PATH] [--auto-thresh F]`. Detectron2
+is kept as optional Python-reference tooling only; it is not a native
+C/CUDA dependency.
 
 ## Deferred
 
-- Detectron2-based person detection / auto-crop — user supplies bbox
-  (or uses the full frame). Add when the encoder chain is green.
 - Optional 2D-keypoint / mask prompts — upstream supports them but v1
   runs RGB-only.
-- ViT-H variant — separate dump pass once DINOv3 variant is end-to-end
-  green.

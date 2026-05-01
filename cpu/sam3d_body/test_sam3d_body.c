@@ -14,10 +14,12 @@
  *
  *   2. Self-driven:
  *      test_sam3d_body --safetensors-dir <dir> --mhr-assets <dir>
- *                      --image <path> [--bbox x0 y0 x1 y1] [--focal F]
- *                      [-o out.obj]
+ *                      --image <path>
+ *                      [--bbox x0 y0 x1 y1 | --auto-bbox]
+ *                      [--focal F] [-o out.obj]
  *      Runs encoder + ray_cond + prompt_encoder + TopdownAffine from raw
- *      RGB end-to-end. If --bbox is omitted the full image is used.
+ *      RGB end-to-end. If --auto-bbox is set, RT-DETR-S selects the
+ *      primary person bbox. If --bbox is omitted the full image is used.
  */
 
 #include "sam3d_body_runner.h"
@@ -198,6 +200,8 @@ static int run_image(const char *sft_dir, const char *mhr_dir,
     double t_decode_ms = 0.0, t_rt_load_ms = 0.0, t_rt_detect_ms = 0.0;
     double t_create_ms = 0.0, t_set_image_ms = 0.0, t_run_all_ms = 0.0;
     double t_write_obj_ms = 0.0, t_write_json_ms = 0.0;
+    int auto_bbox_used = 0;
+    float auto_bbox_score = 0.0f;
     double t0 = cli_time_ms();
     int iw = 0, ih = 0, ichan = 0;
     uint8_t *pixels = stbi_load(image_path, &iw, &ih, &ichan, 3);
@@ -205,7 +209,7 @@ static int run_image(const char *sft_dir, const char *mhr_dir,
     t_decode_ms = cli_time_ms() - t0;
 
     /* If --auto-bbox is set and the user did not supply --bbox, run
-     * RT-DETR-S on the image to detect the largest person. */
+     * RT-DETR-S on the image to detect the primary person. */
     if (auto_bbox && !has_bbox) {
         t0 = cli_time_ms();
         rt_detr_t *det = rt_detr_load(rt_detr_model);
@@ -229,9 +233,13 @@ static int run_image(const char *sft_dir, const char *mhr_dir,
         bbox[0] = box.x0; bbox[1] = box.y0;
         bbox[2] = box.x1; bbox[3] = box.y1;
         has_bbox = 1;
+        auto_bbox_used = 1;
+        auto_bbox_score = box.score;
         fprintf(stderr,
-            "[test_sam3d_body] auto-bbox: score=%.3f bbox=(%.1f,%.1f,%.1f,%.1f)\n",
-            box.score, box.x0, box.y0, box.x1, box.y1);
+            "[test_sam3d_body] auto-bbox: detector=rt-detr-s score=%.4f "
+            "threshold=%.3f image=%dx%d bbox=(%.1f,%.1f,%.1f,%.1f)\n",
+            box.score, auto_score_thresh, iw, ih,
+            box.x0, box.y0, box.x1, box.y1);
     }
 
     sam3d_body_config cfg = {
@@ -302,9 +310,18 @@ static int run_image(const char *sft_dir, const char *mhr_dir,
             sam3d_body_get_cam(ctx, cam_t, &focal_px);
 
             fprintf(jf, "{\n");
-            if (has_bbox)
+            if (has_bbox) {
                 fprintf(jf, "  \"bbox\": [%.3f, %.3f, %.3f, %.3f],\n",
                         bbox[0], bbox[1], bbox[2], bbox[3]);
+                fprintf(jf, "  \"bbox_source\": \"%s\",\n",
+                        auto_bbox_used ? "auto" : "manual");
+                if (auto_bbox_used) {
+                    fprintf(jf,
+                            "  \"auto_bbox\": {\"detector\": \"rt-detr-s\", "
+                            "\"score\": %.6f, \"threshold\": %.6f},\n",
+                            auto_bbox_score, auto_score_thresh);
+                }
+            }
             fprintf(jf, "  \"image\": {\"width\": %d, \"height\": %d},\n", iw, ih);
             fprintf(jf, "  \"focal_px\": %.6f,\n", focal_px);
             fprintf(jf, "  \"cam_t\": [%.6f, %.6f, %.6f],\n",

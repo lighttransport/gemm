@@ -1,4 +1,4 @@
-/* verify_rt_detr_postprocess.c — verify post-process & largest-person filter
+/* verify_rt_detr_postprocess.c — verify post-process & person filter
  *
  * Loads /tmp/rt_detr_ref/dec_logits.npy + dec_boxes.npy, runs
  * rt_detr_postprocess(class=person, thresh=0.5) with image size 768x1024,

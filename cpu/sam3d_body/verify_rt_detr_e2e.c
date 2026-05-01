@@ -1,4 +1,4 @@
-/* verify_rt_detr_e2e.c — full image → largest-person bbox pipeline
+/* verify_rt_detr_e2e.c — full image → primary-person bbox pipeline
  *
  * Loads person.jpg, runs rt_detr_detect_largest_person, compares
  * against /tmp/rt_detr_ref/detected_persons.npy.
