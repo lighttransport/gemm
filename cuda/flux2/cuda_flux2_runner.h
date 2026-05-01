@@ -1703,6 +1703,321 @@ static const char *flux2_kernel_src =
 "    }\n"
 "}\n"
 "#endif\n"
+"__device__ __forceinline__ unsigned short f32_to_bf16_bits(float f) {\n"
+"    unsigned int b; memcpy(&b, &f, 4);\n"
+"    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) return 0x7FC0;\n"
+"    unsigned int r = 0x7FFFu + ((b >> 16) & 1u);\n"
+"    return (unsigned short)((b + r) >> 16);\n"
+"}\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"#define FABF16_BKV    32\n"
+"#define FABF16_M      16\n"
+"#define FABF16_HD    128\n"
+"/* Pad SMEM row stride: (HDP/2) mod 32 = 4 → distinct quad of banks per row,\n"
+" * eliminates 8-way LDS-32 bank conflicts on Q@K^T scalar B-frag and on the\n"
+" * P@V ldmatrix.x4.trans source. Same trick that took cuda/fa v3 → v3.2 1.43x. */\n"
+"#define FABF16_HDP   136\n"
+"#define FABF16_NWARPS 4\n"
+"#define FABF16_NI     (FABF16_BKV / 8)   /* Q.K^T N-tiles per outer iter */\n"
+"#define FABF16_PV_KC  (FABF16_BKV / 16)  /* P.V K-chunks per N-iter */\n"
+"__global__ void flash_attn_bf16(\n"
+"    float *__restrict__ out,\n"
+"    const unsigned short *__restrict__ Qb,\n"
+"    const unsigned short *__restrict__ Kb,\n"
+"    const unsigned short *__restrict__ Vb,\n"
+"    int N, int n_heads, int head_dim) {\n"
+"    int h = blockIdx.x;\n"
+"    int warp = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int gid = lane / 4;\n"
+"    int tid4 = lane & 3;\n"
+"    int q_base = blockIdx.y * (FABF16_M * FABF16_NWARPS) + warp * FABF16_M;\n"
+"    int dim = n_heads * head_dim;\n"
+"\n"
+"    /* ----- Load Q into A-fragment registers. 8 K-chunks of k=16 BF16 each. ----- */\n"
+"    /* Per lane per chunk: 4 u32 = 8 BF16 = 4 (row, col-pair) entries. */\n"
+"    unsigned int q_frag[8][4];\n"
+"#pragma unroll\n"
+"    for (int kc = 0; kc < 8; kc++) {\n"
+"        int k0 = kc * 16;\n"
+"        int row0 = q_base + gid;\n"
+"        int row1 = q_base + gid + 8;\n"
+"        const unsigned short *qbase0 = (row0 < N) ? Qb + (long)row0 * dim + h * head_dim : (const unsigned short *)0;\n"
+"        const unsigned short *qbase1 = (row1 < N) ? Qb + (long)row1 * dim + h * head_dim : (const unsigned short *)0;\n"
+"        unsigned int z = 0;\n"
+"        q_frag[kc][0] = qbase0 ? *(const unsigned int *)(qbase0 + k0 + tid4*2)     : z;\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"        q_frag[kc][1] = qbase1 ? *(const unsigned int *)(qbase1 + k0 + tid4*2)     : z;\n"
+"        q_frag[kc][2] = qbase0 ? *(const unsigned int *)(qbase0 + k0 + tid4*2 + 8) : z;\n"
+"#else\n"
+"        q_frag[kc][1] = qbase0 ? *(const unsigned int *)(qbase0 + k0 + tid4*2 + 8) : z;\n"
+"        q_frag[kc][2] = qbase1 ? *(const unsigned int *)(qbase1 + k0 + tid4*2)     : z;\n"
+"#endif\n"
+"        q_frag[kc][3] = qbase1 ? *(const unsigned int *)(qbase1 + k0 + tid4*2 + 8) : z;\n"
+"    }\n"
+"\n"
+"    /* O accumulator: 16 N-iters (head_dim/8) x 4 floats per thread per N-iter */\n"
+"    float O[16][4];\n"
+"#pragma unroll\n"
+"    for (int i = 0; i < 16; i++) {\n"
+"        O[i][0] = 0.0f; O[i][1] = 0.0f; O[i][2] = 0.0f; O[i][3] = 0.0f;\n"
+"    }\n"
+"    float m_state[2] = {-1e30f, -1e30f};\n"
+"    float l_state[2] = {0.0f, 0.0f};\n"
+"\n"
+"    float qk_scale = rsqrtf((float)head_dim);\n"
+"\n"
+"    extern __shared__ unsigned char fa_bf16_smem[];\n"
+"    /* Double-buffered layout: [sK0][sK1][sV0][sV1] each 32 x HDP bf16 ~ 8.5 KB.\n"
+"     * Total ~34 KB (under sm_120 default 48 KB dynamic SMEM cap). Stride padded\n"
+"     * to 136 for bank-conflict-free LDS. P stays in per-lane registers. */\n"
+"    unsigned short *sK_buf[2];\n"
+"    unsigned short *sV_buf[2];\n"
+"    sK_buf[0] = (unsigned short *)fa_bf16_smem;\n"
+"    sK_buf[1] = sK_buf[0] + FABF16_BKV * FABF16_HDP;\n"
+"    sV_buf[0] = sK_buf[1] + FABF16_BKV * FABF16_HDP;\n"
+"    sV_buf[1] = sV_buf[0] + FABF16_BKV * FABF16_HDP;\n"
+"\n"
+"    int n_kv_tiles = (N + FABF16_BKV - 1) / FABF16_BKV;\n"
+"\n"
+"    /* Prologue: cp.async tile 0 into buffer 0. */\n"
+"    {\n"
+"        unsigned short *_sK = sK_buf[0];\n"
+"        unsigned short *_sV = sV_buf[0];\n"
+"#pragma unroll\n"
+"        for (int _i = 0; _i < 4; _i++) {\n"
+"            int _idx = (int)threadIdx.x + _i * 128;\n"
+"            int _kr  = _idx >> 4;\n"
+"            int _kd  = (_idx & 15) * 8;\n"
+"            int _sr  = (_kr < N) ? _kr : 0;\n"
+"            const unsigned short *_kp = Kb + (long)_sr * dim + h * head_dim + _kd;\n"
+"            const unsigned short *_vp = Vb + (long)_sr * dim + h * head_dim + _kd;\n"
+"            unsigned int _dk = (unsigned int)__cvta_generic_to_shared(_sK + _kr * FABF16_HDP + _kd);\n"
+"            unsigned int _dv = (unsigned int)__cvta_generic_to_shared(_sV + _kr * FABF16_HDP + _kd);\n"
+"            asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dk), \"l\"(_kp));\n"
+"            asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dv), \"l\"(_vp));\n"
+"        }\n"
+"    }\n"
+"    asm volatile(\"cp.async.commit_group;\\n\");\n"
+"\n"
+"    for (int kvt = 0; kvt < n_kv_tiles; kvt++) {\n"
+"        int kv_base = kvt * FABF16_BKV;\n"
+"        int cur = kvt & 1;\n"
+"        int nxt = 1 - cur;\n"
+"        unsigned short *smK = sK_buf[cur];\n"
+"        unsigned short *smV = sV_buf[cur];\n"
+"\n"
+"        /* Issue cp.async for tile (kvt+1) into buffer nxt, then wait on current. */\n"
+"        if (kvt + 1 < n_kv_tiles) {\n"
+"            int kv_next = (kvt + 1) * FABF16_BKV;\n"
+"            unsigned short *_sK = sK_buf[nxt];\n"
+"            unsigned short *_sV = sV_buf[nxt];\n"
+"#pragma unroll\n"
+"            for (int _i = 0; _i < 4; _i++) {\n"
+"                int _idx = (int)threadIdx.x + _i * 128;\n"
+"                int _kr  = _idx >> 4;\n"
+"                int _kd  = (_idx & 15) * 8;\n"
+"                int _raw = kv_next + _kr;\n"
+"                int _sr  = (_raw < N) ? _raw : 0;\n"
+"                const unsigned short *_kp = Kb + (long)_sr * dim + h * head_dim + _kd;\n"
+"                const unsigned short *_vp = Vb + (long)_sr * dim + h * head_dim + _kd;\n"
+"                unsigned int _dk = (unsigned int)__cvta_generic_to_shared(_sK + _kr * FABF16_HDP + _kd);\n"
+"                unsigned int _dv = (unsigned int)__cvta_generic_to_shared(_sV + _kr * FABF16_HDP + _kd);\n"
+"                asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dk), \"l\"(_kp));\n"
+"                asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dv), \"l\"(_vp));\n"
+"            }\n"
+"            asm volatile(\"cp.async.commit_group;\\n\");\n"
+"            asm volatile(\"cp.async.wait_group 1;\\n\");\n"
+"        } else {\n"
+"            asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        /* S = Q . K^T : [16, BKV]. NI N-iters of m16n8k16, 8 K-chunks per. */\n"
+"        float S[FABF16_NI][4];\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"            S[ni][0] = 0.0f; S[ni][1] = 0.0f; S[ni][2] = 0.0f; S[ni][3] = 0.0f;\n"
+"        }\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"            int n_base = ni * 8;\n"
+"            int b_col = n_base + gid;  /* K row index in smK */\n"
+"#pragma unroll\n"
+"            for (int kc = 0; kc < 8; kc++) {\n"
+"                int k_off = kc * 16;\n"
+"                unsigned int b0 = 0, b1 = 0;\n"
+"                if (b_col < FABF16_BKV) {\n"
+"                    const unsigned short *kp = smK + b_col * FABF16_HDP + k_off;\n"
+"                    b0 = *(const unsigned int *)(kp + tid4 * 2);\n"
+"                    b1 = *(const unsigned int *)(kp + tid4 * 2 + 8);\n"
+"                }\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(S[ni][0]), \"=f\"(S[ni][1]), \"=f\"(S[ni][2]), \"=f\"(S[ni][3])\n"
+"                    : \"r\"(q_frag[kc][0]), \"r\"(q_frag[kc][1]), \"r\"(q_frag[kc][2]), \"r\"(q_frag[kc][3]),\n"
+"                      \"r\"(b0), \"r\"(b1),\n"
+"                      \"f\"(S[ni][0]), \"f\"(S[ni][1]), \"f\"(S[ni][2]), \"f\"(S[ni][3])\n"
+"                );\n"
+"            }\n"
+"        }\n"
+"\n"
+"        /* Apply qk_scale and mask out-of-bounds KV cols. */\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"            int col0 = ni * 8 + tid4 * 2;\n"
+"            int col1 = col0 + 1;\n"
+"            int kvr0 = kv_base + col0;\n"
+"            int kvr1 = kv_base + col1;\n"
+"            S[ni][0] = (kvr0 < N) ? S[ni][0] * qk_scale : -1e30f;\n"
+"            S[ni][1] = (kvr1 < N) ? S[ni][1] * qk_scale : -1e30f;\n"
+"            S[ni][2] = (kvr0 < N) ? S[ni][2] * qk_scale : -1e30f;\n"
+"            S[ni][3] = (kvr1 < N) ? S[ni][3] * qk_scale : -1e30f;\n"
+"        }\n"
+"\n"
+"        /* Online softmax: per-row max */\n"
+"        float new_m[2], alpha[2];\n"
+"#pragma unroll\n"
+"        for (int rp = 0; rp < 2; rp++) {\n"
+"            float my = -1e30f;\n"
+"#pragma unroll\n"
+"            for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"                my = fmaxf(my, S[ni][rp*2 + 0]);\n"
+"                my = fmaxf(my, S[ni][rp*2 + 1]);\n"
+"            }\n"
+"            float o1 = __shfl_xor_sync(0xFFFFFFFF, my, 1); my = fmaxf(my, o1);\n"
+"            float o2 = __shfl_xor_sync(0xFFFFFFFF, my, 2); my = fmaxf(my, o2);\n"
+"            new_m[rp] = fmaxf(m_state[rp], my);\n"
+"            alpha[rp] = expf(m_state[rp] - new_m[rp]);\n"
+"        }\n"
+"\n"
+"        /* Rescale O and l */\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < 16; ni++) {\n"
+"            O[ni][0] *= alpha[0]; O[ni][1] *= alpha[0];\n"
+"            O[ni][2] *= alpha[1]; O[ni][3] *= alpha[1];\n"
+"        }\n"
+"        l_state[0] *= alpha[0]; l_state[1] *= alpha[1];\n"
+"\n"
+"        /* P = exp(S - new_m). No 448 scaling -- BF16 has F32 dynamic range. */\n"
+"        float P_data[FABF16_NI][4];\n"
+"        float row_sum[2] = {0.0f, 0.0f};\n"
+"#pragma unroll\n"
+"        for (int rp = 0; rp < 2; rp++) {\n"
+"#pragma unroll\n"
+"            for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"                float p0 = expf(S[ni][rp*2 + 0] - new_m[rp]);\n"
+"                float p1 = expf(S[ni][rp*2 + 1] - new_m[rp]);\n"
+"                P_data[ni][rp*2 + 0] = p0;\n"
+"                P_data[ni][rp*2 + 1] = p1;\n"
+"                row_sum[rp] += p0 + p1;\n"
+"            }\n"
+"        }\n"
+"        float r0a = __shfl_xor_sync(0xFFFFFFFF, row_sum[0], 1); row_sum[0] += r0a;\n"
+"        float r0b = __shfl_xor_sync(0xFFFFFFFF, row_sum[0], 2); row_sum[0] += r0b;\n"
+"        float r1a = __shfl_xor_sync(0xFFFFFFFF, row_sum[1], 1); row_sum[1] += r1a;\n"
+"        float r1b = __shfl_xor_sync(0xFFFFFFFF, row_sum[1], 2); row_sum[1] += r1b;\n"
+"        l_state[0] += row_sum[0]; l_state[1] += row_sum[1];\n"
+"        m_state[0] = new_m[0]; m_state[1] = new_m[1];\n"
+"\n"
+"        /* Pre-pack P (F32 -> BF16 bits) into per-lane u32 registers.\n"
+"         * Each lane already holds all 4 ni's of P_data in registers, so the\n"
+"         * mma A-operand can be built directly without a smP shared-memory\n"
+"         * round-trip. Under sm_120 the a1<->a2 PTX slot swap applies, same as\n"
+"         * the smP-based path we replaced.\n"
+"         * P_pack[kc][slot] holds the 4 a-regs for each PV k-chunk. */\n"
+"        unsigned int P_pack[FABF16_PV_KC][4];\n"
+"#pragma unroll\n"
+"        for (int kc = 0; kc < FABF16_PV_KC; kc++) {\n"
+"            int ni_a = 2*kc;      /* ni for 'first half' of the 16-col span */\n"
+"            int ni_b = 2*kc + 1;  /* ni for 'second half' */\n"
+"            unsigned int q00 = (unsigned int)f32_to_bf16_bits(P_data[ni_a][0])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_a][1]) << 16);\n"
+"            unsigned int q01 = (unsigned int)f32_to_bf16_bits(P_data[ni_a][2])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_a][3]) << 16);\n"
+"            unsigned int q10 = (unsigned int)f32_to_bf16_bits(P_data[ni_b][0])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_b][1]) << 16);\n"
+"            unsigned int q11 = (unsigned int)f32_to_bf16_bits(P_data[ni_b][2])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_b][3]) << 16);\n"
+"            /* Standard PTX layout: a0=(gid,c), a1=(gid,c+8), a2=(gid+8,c), a3=(gid+8,c+8).\n"
+"             * sm_120 swaps a1<->a2. */\n"
+"            P_pack[kc][0] = q00;\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"            P_pack[kc][1] = q01;\n"
+"            P_pack[kc][2] = q10;\n"
+"#else\n"
+"            P_pack[kc][1] = q10;\n"
+"            P_pack[kc][2] = q01;\n"
+"#endif\n"
+"            P_pack[kc][3] = q11;\n"
+"        }\n"
+"\n"
+"        /* O += P . V via mma. 16 N-iters of m16n8 (head_dim/8). Per ni we load a\n"
+"         * 32-kv x 8-n block of V via one ldmatrix.x4.trans from row-major smV.\n"
+"         * The 4 result regs correspond to mat0=kv[0..7], mat1=kv[8..15],\n"
+"         * mat2=kv[16..23], mat3=kv[24..31] (8 cols of the same n-window each).\n"
+"         * After .trans, each reg already has the {k0,k1} packed per-lane that\n"
+"         * m16n8k16's B-operand wants, matching the former smVT col-major layout. */\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < 16; ni++) {\n"
+"            int n_base = ni * 8;\n"
+"            unsigned int v_addr = (unsigned int)__cvta_generic_to_shared(\n"
+"                smV + lane * FABF16_HDP + n_base);\n"
+"            unsigned int vb0, vb1, vb2, vb3;\n"
+"            asm(\"ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"
+"                : \"=r\"(vb0), \"=r\"(vb1), \"=r\"(vb2), \"=r\"(vb3)\n"
+"                : \"r\"(v_addr));\n"
+"#pragma unroll\n"
+"            for (int kc = 0; kc < FABF16_PV_KC; kc++) {\n"
+"                unsigned int p0 = P_pack[kc][0];\n"
+"                unsigned int p1 = P_pack[kc][1];\n"
+"                unsigned int p2 = P_pack[kc][2];\n"
+"                unsigned int p3 = P_pack[kc][3];\n"
+"                unsigned int b0 = (kc == 0) ? vb0 : vb2;\n"
+"                unsigned int b1 = (kc == 0) ? vb1 : vb3;\n"
+"                float d0 = O[ni][0], d1 = O[ni][1], d2 = O[ni][2], d3 = O[ni][3];\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(d0), \"=f\"(d1), \"=f\"(d2), \"=f\"(d3)\n"
+"                    : \"r\"(p0), \"r\"(p1), \"r\"(p2), \"r\"(p3),\n"
+"                      \"r\"(b0), \"r\"(b1),\n"
+"                      \"f\"(d0), \"f\"(d1), \"f\"(d2), \"f\"(d3)\n"
+"                );\n"
+"                O[ni][0] = d0; O[ni][1] = d1; O[ni][2] = d2; O[ni][3] = d3;\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();  /* before next tile overwrites smK/smV */\n"
+"    }\n"
+"\n"
+"    /* Final write: divide by l_state. No descale -- no 448 scaling. */\n"
+"    int row0 = q_base + gid;\n"
+"    int row1 = q_base + gid + 8;\n"
+"    float inv_l0 = (l_state[0] > 0.0f) ? 1.0f / l_state[0] : 0.0f;\n"
+"    float inv_l1 = (l_state[1] > 0.0f) ? 1.0f / l_state[1] : 0.0f;\n"
+"#pragma unroll\n"
+"    for (int ni = 0; ni < 16; ni++) {\n"
+"        int col0 = ni * 8 + tid4 * 2;\n"
+"        int col1 = col0 + 1;\n"
+"        if (row0 < N && col0 < head_dim)\n"
+"            out[(long)row0 * dim + h * head_dim + col0] = O[ni][0] * inv_l0;\n"
+"        if (row0 < N && col1 < head_dim)\n"
+"            out[(long)row0 * dim + h * head_dim + col1] = O[ni][1] * inv_l0;\n"
+"        if (row1 < N && col0 < head_dim)\n"
+"            out[(long)row1 * dim + h * head_dim + col0] = O[ni][2] * inv_l1;\n"
+"        if (row1 < N && col1 < head_dim)\n"
+"            out[(long)row1 * dim + h * head_dim + col1] = O[ni][3] * inv_l1;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Bulk F32 -> BF16 cast kernel for converting Q/K/V before flash_attn_bf16. */\n"
+"__global__ void cast_f32_to_bf16(const float *src, unsigned short *dst, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    dst[i] = f32_to_bf16_bits(src[i]);\n"
+"}\n"
+"#endif\n"
 
 "\n} /* extern \"C\" */\n"
 ;
@@ -1796,6 +2111,11 @@ struct cuda_flux2_runner {
     CUdeviceptr d_qkv_scales;                    /* [3] f32 sQ/sK/sV */
     size_t fp8_attn_buf_n;                       /* allocated count (n_tok*dim) */
     int use_fp8_attn;
+    /* BF16 attention workspace (mma.sync, ported from cuda/fa v4) */
+    CUfunction fn_flash_attn_bf16, fn_cast_f32_to_bf16;
+    CUdeviceptr d_q_bf16, d_k_bf16, d_v_bf16;    /* uint16_t bf16 buffers */
+    size_t bf16_attn_buf_n;                      /* allocated count (n_tok*dim halves) */
+    int use_bf16_attn;
     int max_tok;
     int gpu_loaded;
     int use_gpu_dbl_attn;
@@ -2038,6 +2358,29 @@ static int ensure_fp8_attn_buf(cuda_flux2_runner *r, size_t n) {
     return 0;
 }
 
+/* Lazily allocate BF16 attention workspace: 3 buffers each n_elems * uint16_t. */
+static int ensure_bf16_attn_buf(cuda_flux2_runner *r, size_t n_elems) {
+    size_t need = n_elems * sizeof(unsigned short);
+    if (n_elems <= r->bf16_attn_buf_n) return 0;
+    if (r->d_q_bf16) { cuMemFree(r->d_q_bf16); r->d_q_bf16 = 0; }
+    if (r->d_k_bf16) { cuMemFree(r->d_k_bf16); r->d_k_bf16 = 0; }
+    if (r->d_v_bf16) { cuMemFree(r->d_v_bf16); r->d_v_bf16 = 0; }
+    r->bf16_attn_buf_n = 0;
+    if (cuMemAlloc(&r->d_q_bf16, need) != CUDA_SUCCESS) { r->d_q_bf16 = 0; return -1; }
+    if (cuMemAlloc(&r->d_k_bf16, need) != CUDA_SUCCESS) { r->d_k_bf16 = 0; return -1; }
+    if (cuMemAlloc(&r->d_v_bf16, need) != CUDA_SUCCESS) { r->d_v_bf16 = 0; return -1; }
+    r->bf16_attn_buf_n = n_elems;
+    return 0;
+}
+
+/* Cast n F32 values to BF16 in-place on r->stream. */
+static void cast_buf_f32_to_bf16(cuda_flux2_runner *r, CUdeviceptr dst_bf16,
+                                 CUdeviceptr src_f32, int n) {
+    void *args[] = {&src_f32, &dst_bf16, &n};
+    cuLaunchKernel(r->fn_cast_f32_to_bf16, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
+}
+
 /* Quantize a single F32 buffer to FP8 e4m3 with per-tensor scale.
  * max_slot/scale_slot point at one f32 each within d_qkv_max / d_qkv_scales. */
 static void quantize_buf_fp8(cuda_flux2_runner *r, CUdeviceptr fp8_out,
@@ -2058,6 +2401,30 @@ static void quantize_buf_fp8(cuda_flux2_runner *r, CUdeviceptr fp8_out,
 
 static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
                     CUdeviceptr k, CUdeviceptr v, int n_tok, int n_heads, int head_dim) {
+    /* BF16 MMA flash attention path (mma.sync.m16n8k16.bf16, cp.async double-
+     * buffered, padded SMEM, ldmatrix.x4.trans P@V). Higher precision than FP8
+     * (no per-tensor scale outlier crush) and faster than scalar F32 fallback. */
+    if (r->use_bf16_attn && r->fn_flash_attn_bf16 && r->fn_cast_f32_to_bf16 &&
+        head_dim == 128) {
+        size_t n_elems = (size_t)n_tok * n_heads * head_dim;
+        if (ensure_bf16_attn_buf(r, n_elems) == 0) {
+            int n = (int)n_elems;
+            cast_buf_f32_to_bf16(r, r->d_q_bf16, q, n);
+            cast_buf_f32_to_bf16(r, r->d_k_bf16, k, n);
+            cast_buf_f32_to_bf16(r, r->d_v_bf16, v, n);
+            unsigned gy = (unsigned)((n_tok + 63) / 64);
+            /* smem: 2x double-buffered (sK0+sK1+sV0+sV1) at HDP=136 ~34 KB. */
+            size_t smem = (size_t)(4 * 32 * 136 * 2);
+            void *args[] = {&out, &r->d_q_bf16, &r->d_k_bf16, &r->d_v_bf16,
+                            &n_tok, &n_heads, &head_dim};
+            cuLaunchKernel(r->fn_flash_attn_bf16,
+                           (unsigned)n_heads, gy, 1,
+                           128, 1, 1, smem, r->stream, args, NULL);
+            return;
+        }
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_flux2: WARN ensure_bf16_attn_buf(%zu) failed, falling back\n", n_elems);
+    }
     if (r->use_fp8_attn && r->fn_flash_attn_fp8 && r->fn_quant_fp8 &&
         r->fn_reduce_max_abs && head_dim == 128) {
         size_t n_elems = (size_t)n_tok * n_heads * head_dim;
@@ -2454,6 +2821,8 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     /* Default ON: MMA m16n8k32 path. Set FLUX2_FP8_TILED=1 to fall back to scalar tile. */
     r->use_fp8_mma = r->use_fp8_gemm && !flux2_env_enabled("FLUX2_FP8_TILED");
     r->use_fp8_attn = flux2_env_enabled("FLUX2_FP8_ATTN");
+    r->use_bf16_attn = flux2_env_enabled("FLUX2_BF16_ATTN");
+    r->d_q_bf16 = 0; r->d_k_bf16 = 0; r->d_v_bf16 = 0; r->bf16_attn_buf_n = 0;
     /* VAE BF16 conv: default ON; set FLUX2_VAE_F32=1 to fall back. */
     r->use_bf16_vae = !flux2_env_enabled("FLUX2_VAE_F32");
     /* VAE conv v2 (halo-cached): default ON if available */
@@ -2482,6 +2851,15 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     cuModuleGetFunction(&r->fn_flash_attn,  mod, "flash_attn_f32");
     if (cuModuleGetFunction(&r->fn_flash_attn_fp8, mod, "flash_attn_fp8") != CUDA_SUCCESS)
         r->fn_flash_attn_fp8 = NULL;
+    if (cuModuleGetFunction(&r->fn_flash_attn_bf16, mod, "flash_attn_bf16") != CUDA_SUCCESS)
+        r->fn_flash_attn_bf16 = NULL;
+    if (cuModuleGetFunction(&r->fn_cast_f32_to_bf16, mod, "cast_f32_to_bf16") != CUDA_SUCCESS)
+        r->fn_cast_f32_to_bf16 = NULL;
+    if (r->use_bf16_attn && (!r->fn_flash_attn_bf16 || !r->fn_cast_f32_to_bf16)) {
+        r->use_bf16_attn = 0;
+        if (verbose >= 1)
+            fprintf(stderr, "cuda_flux2: FLUX2_BF16_ATTN disabled (kernel(s) missing)\n");
+    }
     if (cuModuleGetFunction(&r->fn_flash_attn_fp8_ref, mod, "flash_attn_fp8_ref") != CUDA_SUCCESS)
         r->fn_flash_attn_fp8_ref = NULL;
     if (cuModuleGetFunction(&r->fn_quant_fp8, mod, "quantize_to_fp8_e4m3") != CUDA_SUCCESS)
@@ -2522,6 +2900,7 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
         if (r->use_fp8_gemm) fprintf(stderr, r->fp8_bf16_act ? " [fp8-bf16act]" : " [fp8-gemm]");
         if (r->use_fp8_mma) fprintf(stderr, " [fp8-mma]");
         if (r->use_fp8_attn) fprintf(stderr, " [fp8-attn]");
+        if (r->use_bf16_attn) fprintf(stderr, " [bf16-attn]");
         if (r->use_bf16_vae) fprintf(stderr, " [vae-bf16]");
         fprintf(stderr, "\n");
     }
@@ -3282,6 +3661,11 @@ void cuda_flux2_free(cuda_flux2_runner *r) {
     if (r->d_v_fp8)      cuMemFree(r->d_v_fp8);
     if (r->d_qkv_max)    cuMemFree(r->d_qkv_max);
     if (r->d_qkv_scales) cuMemFree(r->d_qkv_scales);
+
+    /* BF16 attention workspace (lazily allocated by ensure_bf16_attn_buf) */
+    if (r->d_q_bf16) cuMemFree(r->d_q_bf16);
+    if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
+    if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
 
     if (r->dit) flux2_dit_free(r->dit);
     if (r->vae) flux2_vae_free(r->vae);
