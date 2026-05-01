@@ -1,0 +1,233 @@
+# hipBLASLt mm0 algo-73624 — DTVB hot loop annotated reference
+#
+# Source: /opt/rocm-7.2.1/lib/hipblaslt/library/TensileLibrary_BB_SB_HA_Bias_SAV_UA_Type_BS_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_gfx1201.co
+# Symbol: Cijk_Alik_Bljk_BSS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI16x16x1_SN_LDSB0_..._DTVB1_..._GRVWA8_GRVWB8_..._LBSPPA128_LBSPPB0_LPA16_LPB0_..._LRVW8_..._MIWT4_4_..._NLCA1_NLCB2_..._PGR1_PLR1_..._SIA3_..._SVW1_..._TLDS2_..._WG32_4_1
+# Address: 0x34d900-0x360000 (75520 bytes; .text)
+# .kd at 0x340dc0: group_segment_fixed_size = 0x6800 = 26624
+# vgpr_count: 256, sgpr_count: 80, wavefront_size: 32, max_flat_workgroup_size: 128
+# Hot loop: file lines 1116..1296 (extracted to /tmp/hipblaslt_mm0_loopbody.s)
+# Loop body covers TWO outer-K iterations (each iter = 32 WMMAs = full MT128x128x32 K-stage)
+#
+# Ground-truth instruction census per outer-K iteration (loop body / 2):
+#   v_wmma_f32_16x16x16_bf16: 32 (MIWT 4×4 × 2 K-halves)
+#   buffer_load_b128:         12 (4 A_next + 8 B_dir; NLCA1 + NLCB2)
+#   ds_load_b128:              8 (A only; B is direct-to-VGPR)
+#   ds_store_b128:             4 (A_next only; halved vs our 8 because B is DTVB)
+#   s_wait_loadcnt:            5 (drain + 4 ds_store gates 0xb→0xa→0x9→0x8)
+#   s_wait_dscnt:              4 (0x0 first-WMMA gate, 0x4 mid-K, 0x1 first-store gate, 0x0 pre-barrier)
+#   s_barrier_signal/wait:     2 (one pair, between 22nd-and-23rd WMMA)
+#   v_add_co_u32 / v_addc_co_u32: 0  (PURE SRD-based addressing — all addr math is SALU)
+#
+# Compared to our 142 TFLOP/s baseline (mm0_bf16_asm_barriersig_early.s) per outer-K iter:
+#   wmma:        32 vs 32             — same
+#   buffer_load: 12 vs 8 (global_load) — they buffer, we global; they 50% more loads (NLCB2)
+#   ds_load:      8 vs 16              — half (DTVB removes B's 8 ds_loads)
+#   ds_store:     4 vs 8               — half (DTVB removes B's 4 ds_stores)
+#   wait insns:   9 vs 21              — they're tighter
+#   v_add_co:     0 vs 7               — major delta; theirs uses SRD+SGPR-offset, ours VGPR addr math
+#
+# REGISTER WINDOWS (decoded from operand fields):
+#   v[0..127]    = C accumulators (16 WMMA × 8 fp32 = 128 VGPRs)
+#   v[128]       = A buffer-load addr offset VGPR (used as `v128` in `buffer_load v[X], v128, s[48:51]`)
+#   v[129]       = B buffer-load addr offset VGPR (used in `buffer_load v[X], v129, s[52:55]`)
+#   v[130]       = A LDS-store base VGPR (XOR-toggled with 0x4000 each iter for double-buffer)
+#   v[131]       = A LDS-load  base VGPR (XOR-toggled with 0x4000 each iter for double-buffer)
+#   v[132..147]  = A LDS-load destination (16 VGPRs = 4 K-fragments × 4 lanes b128)
+#                  - v[132:135] = A_lds[K0,0]; v[136:139] = A_lds[K0,1]; v[140:143] = A_lds[K0,2]; v[144:147] = A_lds[K0,3]
+#   v[148..163]  = A LDS-load destination for K1 (16 VGPRs)
+#                  - v[148:151] = A_lds[K1,0]; v[152:155] = A_lds[K1,1]; v[156:159] = A_lds[K1,2]; v[160:163] = A_lds[K1,3]
+#   v[166..181]  = A_next buffer-load destination (16 VGPRs = 4 b128 loads)
+#                  - load 0 → v[166:169] @ offen (offset=null);  load 1 → v[170:173] @ s66
+#                  - load 2 → v[174:177] @ s67;                  load 3 → v[178:181] @ s68
+#   v[182..213]  = B_dir current (32 VGPRs = 8 × 4-lane = full B tile)
+#                  K-half-0 group:  v[182:185], v[186:189], v[190:193], v[194:197] (4 B rows × 4 lanes each)
+#                  K-half-1 group:  v[198:201], v[202:205], v[206:209], v[210:213]
+#   v[214..245]  = B_dir next (32 VGPRs, mirror of above for K+1)
+#                  loaded per outer iter, then becomes "current" on next iter via reg renaming
+#
+#   s[48:51] = A buffer SRD (256-bit SRD: base, num_records, stride, format)
+#   s[52:55] = B buffer SRD
+#   s[56..59] = A/B residual K counters (s_sub_co_u32 each iter)
+#   s[60..65] = K-step constants (s60/s62 = full K-step; s64/s65 = epilogue K-step)
+#   s[66..68] = A per-load SGPR offsets (3 offsets; load 0 uses null = "0")
+#   s[69..71] = B group-A SGPR offsets (loads 1-3 in group A)
+#   s[72..75] = B group-B SGPR offsets (loads 0-3 in group B; all NLCB2 group B)
+#   s[76:77] = SCC-cselect tmp (full vs epilogue K-step)
+#
+# LDS LAYOUT (only A; B is DTVB):
+#   Total: 26624 bytes
+#   A double-buffer: 2 × (8 b128/store × 4 stores × 4 waves × 16 B/load) ≈ 8192 B per buffer + LPA16 padding
+#   ds_store offsets: 0, 2560, 5120, 7680  → row stride = 2560 B = 160 b128 lanes (LBSPPA128 + LPA16)
+#   ds_load offsets:  K0: 0, 2560, 5120, 7680;  K1: 32, 2592, 5152, 7712  → K1 = K0 + 32 (one column of 32 BF16 elements = 64 B)
+#   Double-buffer toggle: v_xor_b32_e32 v131, 0x4000 (16384 = next buffer offset)
+#
+# ============================================================
+# LOOP BODY — first outer-K iteration (lines 1116..1206)
+# 32 WMMAs, 12 buffer_loads, 8 ds_loads, 4 ds_stores, barrier
+# ============================================================
+#
+# Issue rhythm (canonical SIA3 with DTVB):
+#
+# slot kind                                            tag                 wait              comment
+# ---- ----------------------------------------------- ------------------- ----------------- ----------------------------------------------------
+# pre  s_wait_loadcnt 0x0                              -                   loadcnt=0         drain prior iter's pending B_dir loads
+# pre  buffer_load_b128 v[166:169], v128, s[48:51]     A_next[0]           -                 first A-load (uses null offset)
+# pre  s_wait_dscnt 0x0                                -                   dscnt=0           ensure all 4 A_lds[K0,*] reads are retired
+#  0   v_wmma C[0]  = bf16(B[0]·A[0]) + C[0]            wmma(0,0)           -                 row 0, col 0; B=v[182:185], A=v[132:135]
+#  0a  ds_load_b128 v[148:151], offset:32              A_lds[K1,0]         -                 prefetch K-half-1 A
+#  0b  buffer_load A_next[1] @ s66                     A_next[1]           -                 SGPR-offset addressing; replaces v_add_co
+#  1   v_wmma C[1]                                     wmma(0,1)           -
+#  1a  ds_load A_lds[K1,1] offset:2592                 A_lds[K1,1]         -
+#  1b  buffer_load A_next[2] @ s67                     A_next[2]           -
+#  2   v_wmma C[2]                                     wmma(0,2)           -
+#  2a  ds_load A_lds[K1,2] offset:5152                 A_lds[K1,2]         -
+#  2b  buffer_load A_next[3] @ s68                     A_next[3]           -                 last A_next b128 (4 total)
+#  3   v_wmma C[3]                                     wmma(0,3)           -
+#  3a  ds_load A_lds[K1,3] offset:7712                 A_lds[K1,3]         -                 (4 ds_loads issued; total 4 in flight)
+#  3b  buffer_load v[214:217] @ null, s[52:55]          B_dir_next[0]       -                 first B_dir for NEXT iter (DTVB!)
+#  pre s_wait_dscnt 0x4                                -                   dscnt=4           K0 fragments done (4 in flight = K1 prefetch)
+#  4   v_wmma C[4]  (B=v[186:189], A=v[132:135])       wmma(1,0)           -                 row 1
+#  4a  buffer_load B_dir_next[4] @ s72                 B_dir_next[4]       -                 NLCB2: alternate group-A/B
+#  5   v_wmma C[5]                                     wmma(1,1)           -
+#  5a  buffer_load B_dir_next[1] @ s69                 B_dir_next[1]       -
+#  6   v_wmma C[6]                                     wmma(1,2)           -
+#  6a  buffer_load B_dir_next[5] @ s73                 B_dir_next[5]       -
+#  7   v_wmma C[7]                                     wmma(1,3)           -
+#  7a  buffer_load B_dir_next[2] @ s70                 B_dir_next[2]       -
+#  8   v_wmma C[8]  (B=v[190:193])                     wmma(2,0)           -
+#  8a  buffer_load B_dir_next[6] @ s74                 B_dir_next[6]       -
+#  9   v_wmma C[9]                                     wmma(2,1)           -
+#  9a  buffer_load B_dir_next[3] @ s71                 B_dir_next[3]       -
+# 10   v_wmma C[10]                                    wmma(2,2)           -
+# 10a  buffer_load B_dir_next[7] @ s75                 B_dir_next[7]       -                 last B_dir b128 (8 total NLCB2)
+# 11   v_wmma C[11]                                    wmma(2,3)           -
+# 11a  s_cmp_eq_u32 s12, s47                           salu                -                 loop counter cmp
+# 11b  s_cselect_b32 s76, s60, s64                     salu                -                 next K-step
+# 11c  s_cselect_b32 s77, s61, 0                       salu                -
+# 12   v_wmma C[12] (B=v[194:197])                     wmma(3,0)           -
+# 12a  s_add_co_u32 s48, s48, s76                      salu                -                 inc A SRD base
+# 12b  s_add_co_ci_u32 s49, s49, s77                   salu                -
+# 12c  s_sub_co_u32 s56, s56, s76                      salu                -                 dec residual K
+# 13   v_wmma C[13]                                    wmma(3,1)           -
+# 13a  s_sub_co_ci_u32 s57, s57, s77                   salu                -
+# 13b  s_cmp_eq_u32 s57, 0                             salu                -
+# 13c  s_cselect_b32 s50, s56, -1                      salu                -                 SRD num_records
+# 14   v_wmma C[14]                                    wmma(3,2)           -
+# 14a  s_cmp + s_cselect + s_cselect                   salu                -                 (B SRD next-step calc)
+# 14b  v_xor_b32_e32 v131, 0x4000, v131                valu                -                 toggle A LDS-load buffer (DOUBLE BUFFER)
+# 15   v_wmma C[15]                                    wmma(3,3)           -                 last WMMA of K-half-0 (16 done)
+# 15a  s_add s52,s53,s58 (B SRD)                       salu                -
+# pre  s_wait_loadcnt 0xb                              -                   loadcnt=11        wait for A_next[0] only (12-1=11 still pending)
+# 16a  ds_store_b128 v130, v[166:169]                  A_next[0]→LDS       -                 stage A row 0 to LDS
+# pre  s_wait_dscnt 0x1                                -                   dscnt=1           K-half-1 fragments ready (only ds_store pending)
+# 16   v_wmma C[16] (B=v[198:201], A=v[148:151])       wmma(0,0,K1)        -                 start K-half-1 (use K1 A frags + B_curr K1 group)
+# 16b  s_sub_co_ci_u32 s59, s59, s77                   salu                -                 (B residual K)
+# 16c  s_cmp + s_cselect                                salu                -
+# pre  s_wait_loadcnt 0xa                              -                   loadcnt=10        wait for A_next[1]
+# 17a  ds_store v[170:173] offset:2560                 A_next[1]→LDS       -                 row 1 (LBSPPA128: 2560-byte row stride)
+# 17   v_wmma C[17]                                    wmma(0,1,K1)        -
+# pre  s_wait_loadcnt 0x9                              -                   loadcnt=9         wait for A_next[2]
+# 18a  ds_store v[174:177] offset:5120                 A_next[2]→LDS       -                 row 2
+# 18   v_wmma C[18]                                    wmma(0,2,K1)        -
+# pre  s_wait_loadcnt 0x8                              -                   loadcnt=8         wait for A_next[3]
+# 19a  ds_store v[178:181] offset:7680                 A_next[3]→LDS       -                 row 3 (last A_next store)
+# 19a' v_xor_b32_e32 v130, 0x4000, v130                valu                -                 toggle A LDS-store buffer
+# 19   v_wmma C[19]                                    wmma(0,3,K1)        -
+# 20   v_wmma C[20] (B=v[202:205])                     wmma(1,0,K1)        -
+# 21   v_wmma C[21]                                    wmma(1,1,K1)        -
+# pre  s_wait_dscnt 0x0                                -                   dscnt=0           drain all DS so barrier is correct
+# pre  s_barrier_signal -1                             -                   -                 BARRIER (early-signal pattern)
+# pre  s_barrier_wait 0xffff                           -                   -
+# 22   v_wmma C[22]                                    wmma(1,2,K1)        -                 first WMMA after barrier
+# 22a  ds_load_b128 v[132:135], v131                   A_lds[K0,0]_NEXT    -                 prefetch NEXT iter K0 fragments
+# 23   v_wmma C[23]                                    wmma(1,3,K1)        -
+# 23a  ds_load A_lds[K0,1]_NEXT offset:2560            A_lds[K0,1]_NEXT    -
+# 24   v_wmma C[24]                                    wmma(2,0,K1)        -
+# 24a  ds_load A_lds[K0,2]_NEXT offset:5120            A_lds[K0,2]_NEXT    -
+# 25   v_wmma C[25]                                    wmma(2,1,K1)        -
+# 25a  ds_load A_lds[K0,3]_NEXT offset:7680            A_lds[K0,3]_NEXT    -                 (4 ds_loads issued for next iter)
+# 26   v_wmma C[26]                                    wmma(2,2,K1)        -
+# 27   v_wmma C[27]                                    wmma(2,3,K1)        -
+# 28   v_wmma C[28] (B=v[210:213])                     wmma(3,0,K1)        -
+# 29   v_wmma C[29]                                    wmma(3,1,K1)        -
+# 30   v_wmma C[30]                                    wmma(3,2,K1)        -
+# 31   v_wmma C[31]                                    wmma(3,3,K1)        -                 last WMMA (32 done)
+# end  s_sub_co_u32 s12, s12, 1                                                              decrement loop counter
+# end  s_cmp_eq_i32 s12, 1                                                                   stop check
+# end  s_cbranch_scc1 label_LoopEndL                                                         exit if last iter
+#
+# (second outer-K iteration is structurally identical with reg-renamed B_dir window
+#  v[214..245] becoming "current" and a fresh window written by the buffer_loads;
+#  this implements PGR1+PLR1 software pipelining via reg renaming, not a physical
+#  ping-pong buffer — it's why the 32 VGPR B window doubles up to 64 in the loop body.)
+#
+# ============================================================
+# KEY STRUCTURAL FACTS FOR OUR REGENERATOR
+# ============================================================
+#
+# 1. SIA3 RHYTHM (per K-half, 16 WMMAs):
+#    SLOTS 0-3   : WMMA + (ds_load A_lds[K1,*]) + (buffer_load A_next[0..3])    — interleave 3 ports
+#    SLOT  4     : WMMA + (buffer_load B_dir[0]) — wait_dscnt 0x4 here (K0 frags retired, K1 prefetched)
+#    SLOTS 5-15  : WMMA + (buffer_load B_dir[1..7])  — 7 more B-loads spread across slots 5-10, then SALU spillage in slots 11-15
+#    Then K-half boundary, K-half-1 starts at slot 16:
+#    SLOTS 16-19 : WMMA + (ds_store A_next[0..3]) — wait_loadcnt 0xb..0x8 for each
+#    SLOTS 20-21 : WMMA only
+#    BARRIER between slot 21 and 22
+#    SLOTS 22-25 : WMMA + (ds_load A_lds[K0,*] for NEXT iter)
+#    SLOTS 26-31 : WMMA only (tail)
+#
+# 2. WAITCNT VALUES (computed by reverse-counting pending VMEM ops):
+#    - First wait_loadcnt 0x0 at top: drains all
+#    - 12 buffer_loads issued (4 A_next + 8 B_dir) → loadcnt counts down 12,11,10,...
+#    - Wait for A_next[0]: 11 still pending (ours was issued first; 11 after)
+#    - Wait for A_next[1]: 10 still pending; ...; A_next[3]: 8 pending
+#    - dscnt 0x4 means 4 ds_loads still in flight (the K1 prefetches for next K-half)
+#    - dscnt 0x1 after first ds_store means 1 ds in flight (the just-issued ds_store)
+#    - dscnt 0x0 before barrier means all DS retired
+#
+# 3. SGPR OFFSET PATTERN (replaces v_add_co):
+#    A SRD = s[48:51], offsets {null, s66, s67, s68} for loads 0..3
+#    B SRD = s[52:55], offsets group-A {null, s69, s70, s71} and group-B {s72, s73, s74, s75}
+#    NLCB2 means 2 coalesced groups of 4 — interleaved by alternating groups
+#
+# 4. KERNARG ABI: 144-byte UserArgs (NOT our 32-byte 4-pointer ABI)
+#    First 16 bytes: { Gemm info u32, kernel info0 u32, kernel info1 u32, numWG u32 }
+#    Then 128 bytes of Tensile params (sizes, strides, A/B/C/D pointers, bias ptr...)
+#    Note: hipBLASLt also accepts an HBM-args mode (s_lshr_b32 s21, s20, 30; s_cmp_eq_u32 s21, 0;
+#          s_cbranch_scc0 label_HBMArgs at lines 1086-1095) — falls back to direct kernarg.
+#    Our regenerator should KEEP the 4-pointer ABI to remain bench-compatible (mm0_hipblaslt_bridge.cpp
+#    is just for reference perf; the gen_mm0_dtvb path stays drop-in for bench_vlm_gemm mm0asm mode).
+#
+# 5. WHY "NLCB2" MATTERS FOR SCHEDULER:
+#    The 8 B_dir loads are split into two coalesced groups of 4 (group-A: null,s69,s70,s71;
+#    group-B: s72,s73,s74,s75). Issuing alternates between groups (line order: null, s72, s69, s73,
+#    s70, s74, s71, s75). This straddles the K-half boundary so the scheduler has 2 anchors per
+#    K-half rather than 1 — gives the WMMA stream more freedom for waitcnt overlap.
+#    Our hand-asm baseline has 4 W loads bunched in one group → fewer anchors → less freedom.
+#
+# 6. PGR1+PLR1 + 2× UNROLL via REG RENAMING:
+#    The body emits TWO copies of the K-iter back-to-back. The first uses B_dir window v[182..213];
+#    the second uses v[214..245]. The buffer_loads in iter-1 write into v[214..245] (which becomes
+#    "current" for iter-2), and iter-2's buffer_loads write into v[182..213] (which then becomes
+#    "current" for iter-3, going back to iter-1's pattern). This is software-pipelining through
+#    register renaming — no extra LDS, no extra physical buffer, but doubles the B VGPR window.
+#    Our regenerator must emit the same 2× unrolled body to get the PGR1+PLR1 perf.
+#
+# ============================================================
+# NEXT STEPS (drives Phase 2-5)
+# ============================================================
+#
+# - Scheduler op set per outer-K iter:
+#     4× vmem_load_a  (A_next, with sgpr offsets {null,s66,s67,s68})
+#     8× vmem_load_b  (B_dir, with sgpr offsets {null,s72,s69,s73,s70,s74,s71,s75} — group-interleaved)
+#     8× lds_load_a   (4 K0 + 4 K1, offsets {0,2560,5120,7680} and {32,2592,5152,7712})
+#     4× lds_store_a  (A_next→LDS at offsets {0,2560,5120,7680} into v130 base, XOR-toggled)
+#     32× wmma        (4 B-rows × 4 A-cols × 2 K-halves)
+#     1× barrier_signal + 1× barrier_wait  (between slot 21 and 22)
+#     ~6× salu        (s_cmp/s_cselect/s_add for SRD bases, residual K, double-buffer toggle)
+#
+# - Dry-run gate for the scheduler: feed an LDS-staged op set (16 ds_loads, 8 ds_stores, 8 global_loads)
+#   matching mm0_bf16_asm_barriersig_early.s and produce a byte-equivalent .s.
+#
+# - DTVB switch: replace 8× lds_load_b + 4× lds_store_b + 4× global_load_b with 8× vmem_load_b (B_dir),
+#   reduce LDS to 26624, drop the "B-side" half of the K-half wait sequence.
