@@ -14,7 +14,7 @@ test_cuda_qimg: test_cuda_qimg.c cuda_qimg_runner.h \
 		../../common/bpe_tokenizer.h ../../common/qwen_image_scheduler.h \
 		../../common/qwen_image_dit.h ../../common/qwen_image_vae.h \
 		../../common/qwen_image_text_encoder.h
-	$(CC) $(CFLAGS) -o $@ $< ../llm/cuda_llm_runner.c ../cuew.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $< ../llm/cuda_llm_runner.c ../cuew.c ../cublasew.c $(LDFLAGS)
 
 test-init: test_cuda_qimg
 	./test_cuda_qimg --test-init
