@@ -7,7 +7,7 @@ No `hipcc` needed at build time - kernels are compiled at runtime via HIPRTC, lo
 ## Architecture
 
 - **Target**: AMD RDNA4 (gfx1200/gfx1201), 64 CUs, wave size 32
-- **No tensor cores**: All GEMM uses tiled shared-memory approach (`gemm_tiled_f16_f32`)
+- **WMMA matrix engine**: BF16/FP16 (`v_wmma_f32_16x16x16_bf16/f16`) and FP8 e4m3 (`v_wmma_f32_16x16x16_fp8_fp8`) on gfx1201. Microbench peaks: BF16 195 TF/s, FP8 351 TF/s (8-wave). Tuned BF16 mm0 sustains 174 TF/s (89% peak); standalone FP8 mm0 via extracted hipBLASLt kernel sustains 218 TF/s.
 - **Runtime compilation**: HIPRTC compiles HIP C kernel strings at program startup
 - **Dynamic loading**: `rocew` (ROCm Extension Wrangler) loads `libamdhip64.so` + `libhiprtc.so` via dlopen
 
@@ -96,8 +96,8 @@ rdna4/
 |------|-------------|
 | NVRTC runtime compilation | HIPRTC runtime compilation |
 | cuew dynamic loader | rocew dynamic loader |
-| MMA tensor core GEMM (`gemm_f16_f32`) | Tiled shared-memory GEMM (`gemm_tiled_f16_f32`) |
-| FP8 E4M3 MMA (`gemm_fp8_f32`) | Removed (no FP8 hardware) |
+| MMA tensor core GEMM (`gemm_f16_f32`) | WMMA `v_wmma_f32_16x16x16_bf16/f16` + tiled fallback |
+| FP8 E4M3 MMA (`gemm_fp8_f32`) | WMMA `v_wmma_f32_16x16x16_fp8_fp8` (gfx1201 only) — see `rdna4/fp8/` |
 | MMA prefill attention | Tiled flash attention (`flash_attn_tiled_f32`) |
 | PTX inline ASM (`cvt.f32.f16`) | HIP builtins (`__half2float`) |
 | `__shfl_down_sync(mask, val, off)` | `__shfl_down(val, off)` |
