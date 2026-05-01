@@ -402,7 +402,7 @@ static int cublas_lt_fp8_gemm_timed(CUstream stream,
 /* PTX kernel module cache                                                 */
 /* ---------------------------------------------------------------------- */
 
-typedef enum { PTX_V1 = 1, PTX_V2 = 2, PTX_V3 = 3, PTX_V4 = 4, PTX_V5 = 5, PTX_V6 = 6 } ptx_rev_t;
+typedef enum { PTX_V1 = 1, PTX_V2 = 2, PTX_V3 = 3, PTX_V4 = 4, PTX_V5 = 5, PTX_V6 = 6, PTX_V7 = 7 } ptx_rev_t;
 
 typedef struct {
     /* v1 modules + functions */
@@ -429,6 +429,10 @@ typedef struct {
     CUmodule mod_f16_v6, mod_bf16_v6;
     CUfunction f_f16_v6, f_bf16_v6;
     int built_f16_v6, built_bf16_v6;
+    /* v7 modules + functions (f16/bf16/fp8) */
+    CUmodule mod_f16_v7, mod_bf16_v7, mod_fp8_v7;
+    CUfunction f_f16_v7, f_bf16_v7, f_fp8_v7;
+    int built_f16_v7, built_bf16_v7, built_fp8_v7;
 } kernel_cache_t;
 
 static int build_kernel(kernel_cache_t *kc, dtype_t dt, ptx_rev_t rev, CUdevice dev, int verbose) {
@@ -436,7 +440,14 @@ static int build_kernel(kernel_cache_t *kc, dtype_t dt, ptx_rev_t rev, CUdevice 
     CUfunction *fn;
     const char *src, *name;
     int *built;
-    if (rev == PTX_V6) {
+    if (rev == PTX_V7) {
+        switch (dt) {
+            case DT_F16:  mod = &kc->mod_f16_v7;  fn = &kc->f_f16_v7;  src = k_gemm_f16_v7_src;  name = "gemm_f16_v7";  built = &kc->built_f16_v7;  break;
+            case DT_BF16: mod = &kc->mod_bf16_v7; fn = &kc->f_bf16_v7; src = k_gemm_bf16_v7_src; name = "gemm_bf16_v7"; built = &kc->built_bf16_v7; break;
+            case DT_FP8:  mod = &kc->mod_fp8_v7;  fn = &kc->f_fp8_v7;  src = k_gemm_fp8_v7_src;  name = "gemm_fp8_v7";  built = &kc->built_fp8_v7;  break;
+            default: return -1;
+        }
+    } else if (rev == PTX_V6) {
         switch (dt) {
             case DT_F16:  mod = &kc->mod_f16_v6;  fn = &kc->f_f16_v6;  src = k_gemm_f16_v6_src;  name = "gemm_f16_v6";  built = &kc->built_f16_v6;  break;
             case DT_BF16: mod = &kc->mod_bf16_v6; fn = &kc->f_bf16_v6; src = k_gemm_bf16_v6_src; name = "gemm_bf16_v6"; built = &kc->built_bf16_v6; break;
@@ -515,11 +526,14 @@ typedef struct {
 
 static int run_ptx(bench_ctx_t *b, dtype_t dt, float *avg_ms_out) {
     ptx_rev_t rev = b->ptx_rev;
-    /* fp8 has v1 and v5 only — fall back to v1 for other revs */
-    if (dt == DT_FP8 && rev != PTX_V5) rev = PTX_V1;
+    /* fp8 has v1, v5, v7 only — fall back to v1 for other revs */
+    if (dt == DT_FP8 && rev != PTX_V5 && rev != PTX_V7) rev = PTX_V1;
     if (build_kernel(b->kc, dt, rev, b->dev, b->verbose) != 0) return -1;
     CUfunction fn;
-    if (rev == PTX_V6) {
+    if (rev == PTX_V7) {
+        fn = (dt == DT_F16) ? b->kc->f_f16_v7 :
+             (dt == DT_BF16) ? b->kc->f_bf16_v7 : b->kc->f_fp8_v7;
+    } else if (rev == PTX_V6) {
         fn = (dt == DT_F16) ? b->kc->f_f16_v6 : b->kc->f_bf16_v6;
     } else if (rev == PTX_V5) {
         fn = (dt == DT_F16) ? b->kc->f_f16_v5 :
@@ -537,7 +551,12 @@ static int run_ptx(bench_ctx_t *b, dtype_t dt, float *avg_ms_out) {
     int M = b->M, N = b->N, K = b->K;
     int gx, gy, block;
     size_t smem_bytes;
-    if (rev == PTX_V6) {
+    if (rev == PTX_V7) {
+        gx = (N + 127) / 128;
+        gy = (M + 63) / 64;
+        block = 256;
+        smem_bytes = 2 * (64 * 32 + 128 * 32) * 2;  /* same SMEM as v5; 24 KiB */
+    } else if (rev == PTX_V6) {
         gx = (N + 127) / 128;
         gy = (M + 63) / 64;
         block = 256;
@@ -857,7 +876,7 @@ int main(int argc, char **argv) {
     int iters = 100, warmup = 5;
     int verify = 1, verify_rows = 64;
     int verbose = 0;
-    ptx_rev_t ptx_rev = PTX_V5;
+    ptx_rev_t ptx_rev = PTX_V7;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dtype") && i+1<argc) {
@@ -890,6 +909,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(s, "v4")) ptx_rev = PTX_V4;
             else if (!strcmp(s, "v5")) ptx_rev = PTX_V5;
             else if (!strcmp(s, "v6")) ptx_rev = PTX_V6;
+            else if (!strcmp(s, "v7")) ptx_rev = PTX_V7;
             else { fprintf(stderr, "unknown ptx-rev %s\n", s); return 1; }
         }
         else if (!strcmp(argv[i], "--list-shapes")) { print_usage(argv[0]); return 0; }
