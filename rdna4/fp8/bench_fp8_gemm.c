@@ -507,6 +507,126 @@ static const char *kernel_src =
 "    }\n"
 "}\n"
 "\n"
+"\n"
+"/* Occupancy-2 variant: identical body to pipe32, but __launch_bounds__(128, 2)\n"
+" * lets 2 WGs co-reside on a CU. With ~238 VGPRs/wave and 1024 wave32 VGPRs per\n"
+" * SIMD, 8 waves/CU (2 WGs × 4 waves) fits and gives 4 waves/SIMD vs the prior\n"
+" * 1 wave/SIMD — much more LDS-latency hiding for the FP8 path. */\n"
+"__global__ __launch_bounds__(128, 2)\n"
+"void gemm_fp8_pipe32_occ(float *Y, const u8 *W, const u8 *X,\n"
+"                         const float *bias, int N, int K, int M) {\n"
+"    int tid = threadIdx.x;\n"
+"    int wave_id = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int wM = wave_id & 1;\n"
+"    int wN = wave_id >> 1;\n"
+"    int half = lane >> 4;\n"
+"    int idx = lane & 15;\n"
+"    int k_off = half * 8;\n"
+"    int cta_m0 = blockIdx.y * 128;\n"
+"    int cta_n0 = blockIdx.x * 128;\n"
+"    int e0 = tid * 2 + 0;\n"
+"    int e1 = tid * 2 + 1;\n"
+"    int r0 = e0 >> 1, r1 = e1 >> 1;\n"
+"    int c0 = (e0 & 1) * 16, c1 = (e1 & 1) * 16;\n"
+"    __shared__ u8x8 smA8[2 * 128 * 4];\n"
+"    __shared__ u8x8 smB8[2 * 128 * 4];\n"
+"    {\n"
+"        u8x16 a0v = *((const u8x16 *)(X + (size_t)(cta_m0 + r0) * K + c0));\n"
+"        u8x16 a1v = *((const u8x16 *)(X + (size_t)(cta_m0 + r1) * K + c1));\n"
+"        u8x16 b0v = *((const u8x16 *)(W + (size_t)(cta_n0 + r0) * K + c0));\n"
+"        u8x16 b1v = *((const u8x16 *)(W + (size_t)(cta_n0 + r1) * K + c1));\n"
+"        smA8[(c0>>3) * 128 + r0]    = SPLIT_LO(a0v);\n"
+"        smA8[((c0>>3)+1)*128 + r0]  = SPLIT_HI(a0v);\n"
+"        smA8[(c1>>3) * 128 + r1]    = SPLIT_LO(a1v);\n"
+"        smA8[((c1>>3)+1)*128 + r1]  = SPLIT_HI(a1v);\n"
+"        smB8[(c0>>3) * 128 + r0]    = SPLIT_LO(b0v);\n"
+"        smB8[((c0>>3)+1)*128 + r0]  = SPLIT_HI(b0v);\n"
+"        smB8[(c1>>3) * 128 + r1]    = SPLIT_LO(b1v);\n"
+"        smB8[((c1>>3)+1)*128 + r1]  = SPLIT_HI(b1v);\n"
+"    }\n"
+"    lds_barrier();\n"
+"    float8 z = {0,0,0,0,0,0,0,0};\n"
+"    float8 cv00=z,cv01=z,cv02=z,cv03=z;\n"
+"    float8 cv10=z,cv11=z,cv12=z,cv13=z;\n"
+"    float8 cv20=z,cv21=z,cv22=z,cv23=z;\n"
+"    float8 cv30=z,cv31=z,cv32=z,cv33=z;\n"
+"    int buf = 0;\n"
+"    for (int k = 0; k < K; k += 32) {\n"
+"        u8x16 na0,na1,nb0,nb1;\n"
+"        int has_next = (k + 32 < K);\n"
+"        if (has_next) {\n"
+"            int nk = k + 32;\n"
+"            na0 = *((const u8x16 *)(X + (size_t)(cta_m0 + r0) * K + nk + c0));\n"
+"            na1 = *((const u8x16 *)(X + (size_t)(cta_m0 + r1) * K + nk + c1));\n"
+"            nb0 = *((const u8x16 *)(W + (size_t)(cta_n0 + r0) * K + nk + c0));\n"
+"            nb1 = *((const u8x16 *)(W + (size_t)(cta_n0 + r1) * K + nk + c1));\n"
+"        }\n"
+"        int base = buf * (128 * 4);\n"
+"        int a_base = wM * 64;\n"
+"        int b_base = wN * 64;\n"
+"        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
+"            int kslot = (kk0 + k_off) >> 3;\n"
+"            u8x8 a0 = smA8[base + kslot * 128 + (a_base + 0  + idx)];\n"
+"            u8x8 a1 = smA8[base + kslot * 128 + (a_base + 16 + idx)];\n"
+"            u8x8 a2 = smA8[base + kslot * 128 + (a_base + 32 + idx)];\n"
+"            u8x8 a3 = smA8[base + kslot * 128 + (a_base + 48 + idx)];\n"
+"            u8x8 b0 = smB8[base + kslot * 128 + (b_base + 0  + idx)];\n"
+"            u8x8 b1 = smB8[base + kslot * 128 + (b_base + 16 + idx)];\n"
+"            u8x8 b2 = smB8[base + kslot * 128 + (b_base + 32 + idx)];\n"
+"            u8x8 b3 = smB8[base + kslot * 128 + (b_base + 48 + idx)];\n"
+"            u32x2 ra0 = pack_a8(a0), ra1 = pack_a8(a1);\n"
+"            u32x2 ra2 = pack_a8(a2), ra3 = pack_a8(a3);\n"
+"            u32x2 rb0 = pack_a8(b0), rb1 = pack_a8(b1);\n"
+"            u32x2 rb2 = pack_a8(b2), rb3 = pack_a8(b3);\n"
+"            WMMA_FP8(ra0, rb0, cv00); WMMA_FP8(ra0, rb1, cv01);\n"
+"            WMMA_FP8(ra0, rb2, cv02); WMMA_FP8(ra0, rb3, cv03);\n"
+"            WMMA_FP8(ra1, rb0, cv10); WMMA_FP8(ra1, rb1, cv11);\n"
+"            WMMA_FP8(ra1, rb2, cv12); WMMA_FP8(ra1, rb3, cv13);\n"
+"            WMMA_FP8(ra2, rb0, cv20); WMMA_FP8(ra2, rb1, cv21);\n"
+"            WMMA_FP8(ra2, rb2, cv22); WMMA_FP8(ra2, rb3, cv23);\n"
+"            WMMA_FP8(ra3, rb0, cv30); WMMA_FP8(ra3, rb1, cv31);\n"
+"            WMMA_FP8(ra3, rb2, cv32); WMMA_FP8(ra3, rb3, cv33);\n"
+"        }\n"
+"        if (has_next) {\n"
+"            int nb = 1 - buf;\n"
+"            int nbase = nb * (128 * 4);\n"
+"            smA8[nbase + (c0>>3)*128 + r0]     = SPLIT_LO(na0);\n"
+"            smA8[nbase + ((c0>>3)+1)*128 + r0] = SPLIT_HI(na0);\n"
+"            smA8[nbase + (c1>>3)*128 + r1]     = SPLIT_LO(na1);\n"
+"            smA8[nbase + ((c1>>3)+1)*128 + r1] = SPLIT_HI(na1);\n"
+"            smB8[nbase + (c0>>3)*128 + r0]     = SPLIT_LO(nb0);\n"
+"            smB8[nbase + ((c0>>3)+1)*128 + r0] = SPLIT_HI(nb0);\n"
+"            smB8[nbase + (c1>>3)*128 + r1]     = SPLIT_LO(nb1);\n"
+"            smB8[nbase + ((c1>>3)+1)*128 + r1] = SPLIT_HI(nb1);\n"
+"            lds_barrier_signal();\n"
+"            buf = nb;\n"
+"            lds_barrier_wait();\n"
+"        }\n"
+"    }\n"
+"    int wave_m0 = cta_m0 + wM * 64;\n"
+"    int wave_n0 = cta_n0 + wN * 64;\n"
+"    int row = wave_m0 + half * 8;\n"
+"    if (row < M) {\n"
+"        store_acc8_f32(Y, bias, cv00, row +  0, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv01, row +  0, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv02, row +  0, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv03, row +  0, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv10, row + 16, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv11, row + 16, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv12, row + 16, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv13, row + 16, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv20, row + 32, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv21, row + 32, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv22, row + 32, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv23, row + 32, wave_n0 + 48 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv30, row + 48, wave_n0 +  0 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv31, row + 48, wave_n0 + 16 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv32, row + 48, wave_n0 + 32 + idx, N);\n"
+"        store_acc8_f32(Y, bias, cv33, row + 48, wave_n0 + 48 + idx, N);\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern C */\n";
 
 /* ------------------------------------------------------------------------ */
@@ -562,15 +682,17 @@ typedef struct {
     hipFunction_t baseline;
     hipFunction_t pipe;
     hipFunction_t pipe32;
+    hipFunction_t pipe32_occ;
 } fp8_kernels;
 
 static int load_kernels(int dev, fp8_kernels *out, int verbose) {
     hipModule_t mod;
     if (hip_compile_kernels(&mod, dev, kernel_src, "fp8_gemm", verbose, "fp8") < 0)
         return -1;
-    HIP_CHECK(hipModuleGetFunction(&out->baseline, mod, "gemm_fp8_baseline"));
-    HIP_CHECK(hipModuleGetFunction(&out->pipe,     mod, "gemm_fp8_pipe"));
-    HIP_CHECK(hipModuleGetFunction(&out->pipe32,   mod, "gemm_fp8_pipe32"));
+    HIP_CHECK(hipModuleGetFunction(&out->baseline,    mod, "gemm_fp8_baseline"));
+    HIP_CHECK(hipModuleGetFunction(&out->pipe,        mod, "gemm_fp8_pipe"));
+    HIP_CHECK(hipModuleGetFunction(&out->pipe32,      mod, "gemm_fp8_pipe32"));
+    HIP_CHECK(hipModuleGetFunction(&out->pipe32_occ,  mod, "gemm_fp8_pipe32_occ"));
     return 0;
 }
 
@@ -598,9 +720,10 @@ static int run_shape(const fp8_kernels *kn, const gemm_shape *s,
         return 0;
     }
     hipFunction_t fn;
-    if      (!strcmp(mode, "pipe"))   fn = kn->pipe;
-    else if (!strcmp(mode, "pipe32")) fn = kn->pipe32;
-    else                              fn = kn->baseline;
+    if      (!strcmp(mode, "pipe"))         fn = kn->pipe;
+    else if (!strcmp(mode, "pipe32"))       fn = kn->pipe32;
+    else if (!strcmp(mode, "pipe32_occ"))   fn = kn->pipe32_occ;
+    else                                    fn = kn->baseline;
 
     size_t bytes_X = (size_t)M * K;
     size_t bytes_W = (size_t)N * K;
@@ -723,11 +846,11 @@ int main(int argc, char **argv) {
            iters, abs_max, use_bias ? "on" : "off",
            do_check ? ", check=on" : "");
 
-    const char *modes_all[] = {"baseline", "pipe", "pipe32"};
-    int n_modes = !strcmp(mode, "all") ? 3 : 1;
-    const char *modes[3];
+    const char *modes_all[] = {"baseline", "pipe", "pipe32", "pipe32_occ"};
+    int n_modes = !strcmp(mode, "all") ? 4 : 1;
+    const char *modes[4];
     if (n_modes == 1) modes[0] = mode;
-    else { modes[0] = modes_all[0]; modes[1] = modes_all[1]; modes[2] = modes_all[2]; }
+    else { modes[0] = modes_all[0]; modes[1] = modes_all[1]; modes[2] = modes_all[2]; modes[3] = modes_all[3]; }
 
     int matched = 0;
     for (int i = 0; i < g_num_shapes; i++) {
