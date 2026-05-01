@@ -242,6 +242,186 @@ static const char *kernel_src =
 "    }\n"
 "}\n"
 "\n"
+"__device__ __forceinline__ void lds_barrier_signal_fa() {\n"
+"    __asm__ __volatile__(\"s_barrier_signal -1\" ::: \"memory\");\n"
+"}\n"
+"__device__ __forceinline__ void lds_barrier_wait_fa() {\n"
+"    __asm__ __volatile__(\"s_barrier_wait 0xffff\" ::: \"memory\");\n"
+"}\n"
+"\n"
+"/* Double-buffered FP8 FA. Same layout as flash_attn_fp8_4w but prefetches\n"
+" * tile t+1 while computing on tile t. Uses split-barrier to overlap\n"
+" * global->LDS load with compute. */\n"
+"__global__ __launch_bounds__(128, 1)\n"
+"void flash_attn_fp8_4w_db(float *out, const u8 *Q,\n"
+"                          const u8 *K_t, const u8 *V_t,\n"
+"                          int n_tok, int n_heads, float scale) {\n"
+"    int h    = blockIdx.x;\n"
+"    int qb   = blockIdx.y;\n"
+"    int q0   = qb * BQ;\n"
+"    int tid  = threadIdx.x;\n"
+"    int wid  = tid >> 5;\n"
+"    int lid  = tid & 31;\n"
+"    int half = lid >> 4;\n"
+"    int idx  = lid & 15;\n"
+"    int dim  = n_heads * HD;\n"
+"\n"
+"    /* Double-buffered LDS: 2 K-tiles + 2 V-tiles. */\n"
+"    __shared__ u8 smK[2 * 16 * HD];\n"
+"    __shared__ u8 smV[2 * HD * 16];\n"
+"    __shared__ u8 smP[4 * 16 * 16];\n"
+"    u8 *smP_w = smP + wid * 16 * 16;\n"
+"\n"
+"    int q_row = q0 + wid * 16 + idx;\n"
+"\n"
+"    u32x2 q_reg[K_NB];\n"
+"    {\n"
+"        u8x8 tmp;\n"
+"        for (int kb = 0; kb < K_NB; kb++) {\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d = kb * 16 + half * 8 + i;\n"
+"                u8 qv = 0;\n"
+"                if (q_row < n_tok && d < HD)\n"
+"                    qv = Q[(size_t)q_row * dim + h * HD + d];\n"
+"                tmp[i] = qv;\n"
+"            }\n"
+"            q_reg[kb] = pack_u8x8(tmp);\n"
+"        }\n"
+"    }\n"
+"\n"
+"    float8 O_acc[K_NB];\n"
+"    for (int kb = 0; kb < K_NB; kb++)\n"
+"        for (int i = 0; i < 8; i++) O_acc[kb][i] = 0.0f;\n"
+"    float m_i[8], l_i[8];\n"
+"    for (int i = 0; i < 8; i++) { m_i[i] = -1e30f; l_i[i] = 0.0f; }\n"
+"\n"
+"    int n_kv_tiles = (n_tok + BKV - 1) / BKV;\n"
+"    int ld_row = tid >> 3;\n"
+"    int ld_d0  = (tid & 7) * (HD / 8);\n"
+"\n"
+"    /* Preload tile 0. */\n"
+"    {\n"
+"        int kv = ld_row;\n"
+"        size_t kv_base = ((size_t)h * n_tok + kv) * HD;\n"
+"        bool kv_ok = (kv < n_tok);\n"
+"        for (int j = 0; j < HD / 8; j++) {\n"
+"            int d = ld_d0 + j;\n"
+"            u8 kv_K = 0, kv_V = 0;\n"
+"            if (kv_ok && d < HD) {\n"
+"                kv_K = K_t[kv_base + d];\n"
+"                kv_V = V_t[kv_base + d];\n"
+"            }\n"
+"            smK[ld_row * HD + d] = kv_K;\n"
+"            smV[d * 16 + ld_row] = kv_V;\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"\n"
+"    int buf = 0;\n"
+"    for (int t = 0; t < n_kv_tiles; t++) {\n"
+"        int kv0 = t * BKV;\n"
+"        int kbuf = buf;\n"
+"        int nb = 1 - buf;\n"
+"        size_t k_off_buf = (size_t)kbuf * 16 * HD;\n"
+"        size_t v_off_buf = (size_t)kbuf * HD * 16;\n"
+"        size_t k_off_nb  = (size_t)nb   * 16 * HD;\n"
+"        size_t v_off_nb  = (size_t)nb   * HD * 16;\n"
+"\n"
+"        /* Issue prefetch for tile t+1 into the other buffer (overlaps with compute). */\n"
+"        bool has_next = (t + 1 < n_kv_tiles);\n"
+"        if (has_next) {\n"
+"            int kv = (t + 1) * BKV + ld_row;\n"
+"            size_t kv_base = ((size_t)h * n_tok + kv) * HD;\n"
+"            bool kv_ok = (kv < n_tok);\n"
+"            for (int j = 0; j < HD / 8; j++) {\n"
+"                int d = ld_d0 + j;\n"
+"                u8 kv_K = 0, kv_V = 0;\n"
+"                if (kv_ok && d < HD) {\n"
+"                    kv_K = K_t[kv_base + d];\n"
+"                    kv_V = V_t[kv_base + d];\n"
+"                }\n"
+"                smK[k_off_nb + ld_row * HD + d] = kv_K;\n"
+"                smV[v_off_nb + d * 16 + ld_row] = kv_V;\n"
+"            }\n"
+"        }\n"
+"\n"
+"        /* QK^T using current buffer. */\n"
+"        float8 score = {0,0,0,0,0,0,0,0};\n"
+"        for (int kb = 0; kb < K_NB; kb++) {\n"
+"            u8x8 b_K;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int dpos = kb * 16 + half * 8 + i;\n"
+"                b_K[i] = smK[k_off_buf + idx * HD + dpos];\n"
+"            }\n"
+"            u32x2 b_K_p = pack_u8x8(b_K);\n"
+"            WMMA_FP8(q_reg[kb], b_K_p, score);\n"
+"        }\n"
+"        bool col_valid = (kv0 + idx) < n_tok;\n"
+"        for (int i = 0; i < 8; i++) score[i] = col_valid ? score[i] * scale : -1e30f;\n"
+"\n"
+"        float row_max[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float v = score[i];\n"
+"            v = fmaxf(v, __shfl_xor(v, 1, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 2, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 4, 32));\n"
+"            v = fmaxf(v, __shfl_xor(v, 8, 32));\n"
+"            row_max[i] = v;\n"
+"        }\n"
+"        float alpha[8];\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            float new_max = fmaxf(m_i[i], row_max[i]);\n"
+"            alpha[i] = __expf(m_i[i] - new_max);\n"
+"            float ej = __expf(score[i] - new_max);\n"
+"            float s = ej;\n"
+"            s += __shfl_xor(s, 1, 32);\n"
+"            s += __shfl_xor(s, 2, 32);\n"
+"            s += __shfl_xor(s, 4, 32);\n"
+"            s += __shfl_xor(s, 8, 32);\n"
+"            l_i[i] = l_i[i] * alpha[i] + s;\n"
+"            m_i[i] = new_max;\n"
+"            score[i] = ej;\n"
+"        }\n"
+"        for (int kb = 0; kb < K_NB; kb++)\n"
+"            for (int i = 0; i < 8; i++) O_acc[kb][i] *= alpha[i];\n"
+"\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int n_col = idx;\n"
+"            smP_w[m_row * 16 + n_col] = f32_to_fp8_e4m3(score[i]);\n"
+"        }\n"
+"        u8x8 ap_b;\n"
+"        for (int i = 0; i < 8; i++) ap_b[i] = smP_w[idx * 16 + half * 8 + i];\n"
+"        u32x2 ap = pack_u8x8(ap_b);\n"
+"\n"
+"        for (int kb = 0; kb < K_NB; kb++) {\n"
+"            u8x8 bv;\n"
+"            for (int i = 0; i < 8; i++) {\n"
+"                int d_col = kb * 16 + idx;\n"
+"                int kv_k  = half * 8 + i;\n"
+"                bv[i] = smV[v_off_buf + d_col * 16 + kv_k];\n"
+"            }\n"
+"            u32x2 bv_p = pack_u8x8(bv);\n"
+"            WMMA_FP8(ap, bv_p, O_acc[kb]);\n"
+"        }\n"
+"        __syncthreads();\n"
+"        buf = nb;\n"
+"    }\n"
+"\n"
+"    int q_base = q0 + wid * 16;\n"
+"    for (int kb = 0; kb < K_NB; kb++) {\n"
+"        for (int i = 0; i < 8; i++) {\n"
+"            int m_row = half * 8 + i;\n"
+"            int d = kb * 16 + idx;\n"
+"            int row = q_base + m_row;\n"
+"            if (row < n_tok && d < HD) {\n"
+"                float v = O_acc[kb][i] / (l_i[i] > 0.0f ? l_i[i] : 1.0f);\n"
+"                out[(size_t)row * dim + h * HD + d] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern C */\n";
 
 /* ------------------------------------------------------------------------ */
@@ -335,7 +515,7 @@ static void fill_fp8_random(uint8_t *dst, size_t n, float abs_max, unsigned *rng
 
 /* ------------------------------------------------------------------------ */
 
-static int run_shape(hipFunction_t fn, int n_tok, int n_heads, int head_dim,
+static int run_shape(hipFunction_t fn, const char *mode, int n_tok, int n_heads, int head_dim,
                      int iters, int do_check, float abs_max) {
     if (n_tok % 64) {
         fprintf(stderr, "skip: n_tok must be %%64 (got %d)\n", n_tok);
@@ -397,8 +577,8 @@ static int run_shape(hipFunction_t fn, int n_tok, int n_heads, int head_dim,
     double flops = 4.0 * (double)n_heads * (double)n_tok * (double)n_tok * (double)head_dim;
     double tflops = flops / (ms * 1.0e-3) * 1.0e-12;
 
-    printf("  fp8 4w  n_tok=%5d heads=%2d hd=%3d  %7.4f ms  %6.1f TFLOP/s",
-           n_tok, n_heads, head_dim, ms, tflops);
+    printf("  [%-8s] n_tok=%5d heads=%2d hd=%3d  %7.4f ms  %6.1f TFLOP/s",
+           mode, n_tok, n_heads, head_dim, ms, tflops);
     if (do_check) printf("  cos=%.6f  maxd=%.4f", cos, maxd);
     printf("\n");
 
@@ -412,11 +592,12 @@ static int run_shape(hipFunction_t fn, int n_tok, int n_heads, int head_dim,
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s [--n-tok N] [--heads H] [--head-dim D] [--iters N]\n"
-        "          [--check] [--abs-max V] [--verbose]\n"
+        "          [--mode sb|db|all] [--check] [--abs-max V] [--verbose]\n"
         "  --n-tok    number of query tokens, must be %%64 (default 1024)\n"
         "  --heads    number of attention heads (default 16)\n"
         "  --head-dim head dim (must match HD compile macro; default 64)\n"
         "  --iters    timing iterations (default 100)\n"
+        "  --mode     sb (single-buffered) | db (double-buffered) | all (default)\n"
         "  --check    cosine vs FP32 reference (slow)\n"
         "  --abs-max  clamp random fp32 inputs before fp8 quant (default 1.0)\n",
         prog);
@@ -430,12 +611,14 @@ int main(int argc, char **argv) {
     int do_check = 0;
     float abs_max = 1.0f;
     int verbose = 1;
+    const char *mode = "all";
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--n-tok") && i + 1 < argc)    n_tok = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--heads") && i + 1 < argc) n_heads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--head-dim") && i + 1 < argc) head_dim = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) mode = argv[++i];
         else if (!strcmp(argv[i], "--check")) do_check = 1;
         else if (!strcmp(argv[i], "--abs-max") && i + 1 < argc) abs_max = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--verbose")) verbose = 2;
@@ -456,11 +639,15 @@ int main(int argc, char **argv) {
 
     hipModule_t mod;
     if (hip_compile_kernels(&mod, dev, kernel_src, "fp8_fa", verbose, "fp8_fa") < 0) return 1;
-    hipFunction_t fn;
-    HIP_CHECK(hipModuleGetFunction(&fn, mod, "flash_attn_fp8_4w"));
+    hipFunction_t fn_sb, fn_db;
+    HIP_CHECK(hipModuleGetFunction(&fn_sb, mod, "flash_attn_fp8_4w"));
+    HIP_CHECK(hipModuleGetFunction(&fn_db, mod, "flash_attn_fp8_4w_db"));
 
     printf("rdna4/fp8 WMMA flash-attention bench (iters=%d, abs_max=%.2f%s)\n",
            iters, abs_max, do_check ? ", check=on" : "");
-    run_shape(fn, n_tok, n_heads, head_dim, iters, do_check, abs_max);
+    if (!strcmp(mode, "sb") || !strcmp(mode, "all"))
+        run_shape(fn_sb, "sb", n_tok, n_heads, head_dim, iters, do_check, abs_max);
+    if (!strcmp(mode, "db") || !strcmp(mode, "all"))
+        run_shape(fn_db, "db", n_tok, n_heads, head_dim, iters, do_check, abs_max);
     return 0;
 }
