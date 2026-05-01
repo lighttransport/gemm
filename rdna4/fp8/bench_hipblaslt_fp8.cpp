@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <vector>
 #include <ctime>
+#include <exception>
 
 #define HIP_CHECK(e) do { hipError_t _e=(e); if(_e!=hipSuccess){fprintf(stderr,"HIP %s:%d %s\n",__FILE__,__LINE__,hipGetErrorString(_e));exit(1);} } while(0)
 #define HBLT_CHECK(e) do { auto _e=(e); if(_e!=HIPBLAS_STATUS_SUCCESS){fprintf(stderr,"HBLT %s:%d status=%d\n",__FILE__,__LINE__,(int)_e);exit(1);} } while(0)
@@ -91,8 +92,9 @@ int main(int argc, char** argv) {
     hipblasLtHandle_t handle;
     HBLT_CHECK(hipblasLtCreate(&handle));
 
-    // hipBLASLt op-A=N (col-major view of W as [N,K]), op-B=T (X^T)
-    // Effective: D[N,M] (col-major) = A[N,K] * B[K,M] = W[N,K] * X^T[K,M]
+    // PyTorch's torch._scaled_mm uses transA=T, transB=N for FP8 on gfx1201
+    // (kernel: Cijk_Alik_Bljk_F8SS_... — Tensile library `Alik_Bljk` variant).
+    // Layouts (same dims as transA=N/transB=T case): A is [N,K] view, B is [K,M] view.
     hipblasLtMatrixLayout_t layoutA, layoutB, layoutC;
     HBLT_CHECK(hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_8F_E4M3, N, K, K));
     HBLT_CHECK(hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_8F_E4M3, K, M, K));
@@ -101,8 +103,9 @@ int main(int argc, char** argv) {
     hipblasLtMatmulDesc_t matmul;
     HBLT_CHECK(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
     hipblasOperation_t opN = HIPBLAS_OP_N, opT = HIPBLAS_OP_T;
-    HBLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)));
-    HBLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &opT, sizeof(opT)));
+    HBLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
+    HBLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
+    (void)opN; (void)opT;
 
     // Get heuristic-recommended algorithms.
     hipblasLtMatmulPreference_t pref;
@@ -157,9 +160,20 @@ int main(int argc, char** argv) {
         fflush(stdout);
         // Validate algo is actually supported for this problem.
         size_t ws_needed = 0;
-        auto sup = hipblaslt_ext::matmulIsAlgoSupported(
-            handle, matmul, &alpha, layoutA, layoutB, &beta, layoutC, layoutC,
-            heur[i].algo, ws_needed);
+        hipblasStatus_t sup = HIPBLAS_STATUS_SUCCESS;
+        try {
+            sup = hipblaslt_ext::matmulIsAlgoSupported(
+                handle, matmul, &alpha, layoutA, layoutB, &beta, layoutC, layoutC,
+                heur[i].algo, ws_needed);
+        } catch (const std::exception& e) {
+            printf(" isAlgoSupported_threw=%s (skip)\n", e.what());
+            fflush(stdout);
+            continue;
+        } catch (...) {
+            printf(" isAlgoSupported_threw_unknown (skip)\n");
+            fflush(stdout);
+            continue;
+        }
         if (sup != HIPBLAS_STATUS_SUCCESS) {
             printf(" not_supported=%d (skip)\n", (int)sup);
             fflush(stdout);
@@ -171,10 +185,21 @@ int main(int argc, char** argv) {
             continue;
         }
         // Single launch first, check status.
-        auto st = hipblasLtMatmul(handle, matmul, &alpha, dW, layoutA,
-                                  dX, layoutB, &beta, dY, layoutC,
-                                  dY, layoutC, &heur[i].algo,
-                                  workspace, workspace_size, stream);
+        hipblasStatus_t st;
+        try {
+            st = hipblasLtMatmul(handle, matmul, &alpha, dW, layoutA,
+                                 dX, layoutB, &beta, dY, layoutC,
+                                 dY, layoutC, &heur[i].algo,
+                                 workspace, workspace_size, stream);
+        } catch (const std::exception& e) {
+            printf(" matmul_threw=%s (skip)\n", e.what());
+            fflush(stdout);
+            continue;
+        } catch (...) {
+            printf(" matmul_threw_unknown (skip)\n");
+            fflush(stdout);
+            continue;
+        }
         if (st != HIPBLAS_STATUS_SUCCESS) {
             printf(" status=%d (skip)\n", (int)st);
             fflush(stdout);
