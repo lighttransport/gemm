@@ -2987,25 +2987,46 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
     #undef GW
 
-    /* Preload as many blocks as fit in VRAM */
+    /* Preload as many blocks as fit in VRAM. Scratch slot(s) are reserved
+     * BEFORE preload so we can be aggressive about packing blocks without
+     * leaving the streaming path unable to allocate its slot afterward. */
     {
         size_t free_mem = 0, total_mem = 0;
-        cuMemGetInfo(&free_mem, &total_mem);
-        /* Block size: FP8=1 byte, F32=4 bytes per element */
-        /* Block size: FP8=1B, F16=2B, F32=4B per weight element (~324M params/block) */
         size_t block_bytes;
         if (r->use_fp8_gemm) block_bytes = 324 * 1024 * 1024;       /* FP8: 1 byte */
         else if (r->use_f16_gemm) block_bytes = 648ULL * 1024 * 1024; /* F16: 2 bytes */
         else block_bytes = 1296ULL * 1024 * 1024;                     /* F32: 4 bytes */
-        /* Scratch working set at 512x512 is ~300 MB. Reserve 324 MB for the
-         * one on-demand scratch slot (+324 MB for the optional second slot
-         * when QIMG_PIPELINE=1 — see dit_step block loop comment). */
-        size_t workspace = (500ULL + 324ULL) * 1024 * 1024;
-        if (getenv("QIMG_PIPELINE")) workspace += 324ULL * 1024 * 1024;
+
+        /* Reserve the on-demand scratch slot(s) up front. Each slot is one
+         * "block worth" of FP8 weights plus tiny F32 biases, so reserving =
+         * pre-allocating now gives a tighter and more accurate fit. */
+        if (qimg_alloc_scratch_block(r) == 0) {
+            if (r->verbose)
+                fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
+        } else {
+            fprintf(stderr, "cuda_qimg: scratch slot alloc failed\n");
+        }
+        if (getenv("QIMG_PIPELINE")) {
+            if (qimg_alloc_scratch_block_b(r) == 0) {
+                if (r->verbose)
+                    fprintf(stderr, "cuda_qimg: 2nd scratch slot allocated\n");
+            } else {
+                fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed\n");
+            }
+        }
+
+        cuMemGetInfo(&free_mem, &total_mem);
+
+        /* Activation working set: measured at 512x512 with FP8 + LT it's
+         * ~200 MB. Reserve 250 MB to leave headroom. Override with
+         * QIMG_WORKSPACE_MB=N for higher resolutions. */
+        size_t act_mb = 250;
+        const char *ws_env = getenv("QIMG_WORKSPACE_MB");
+        if (ws_env) act_mb = (size_t)atoi(ws_env);
+        size_t workspace = act_mb * 1024 * 1024;
         int max_preload = (free_mem > workspace)
             ? (int)((free_mem - workspace) / block_bytes) : 0;
         if (max_preload > r->dit_n_blocks) max_preload = r->dit_n_blocks;
-        /* QIMG_MAX_PRELOAD env var to cap preload count (for perf testing). */
         const char *_mp_env = getenv("QIMG_MAX_PRELOAD");
         if (_mp_env) {
             int cap = atoi(_mp_env);
@@ -3016,7 +3037,7 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
                                                   sizeof(qimg_block_gpu));
         r->n_preloaded = max_preload;
         fprintf(stderr, "cuda_qimg: preloading %d/%d blocks to GPU "
-                "(%.1f GB free, %.0f MB/block)\n",
+                "(%.1f GB free post-scratch, %.0f MB/block)\n",
                 max_preload, r->dit_n_blocks,
                 (float)free_mem / (1<<30), (float)block_bytes / (1<<20));
 
@@ -3070,32 +3091,7 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         }
     }
 
-    /* Allocate the on-demand scratch slot(s) once if we didn't preload every
-     * block. Uses ~324 MB per slot on top of the preloaded weights but
-     * eliminates the 30 cuMemAlloc/cuMemFree per on-demand load. A second
-     * slot + copy stream + events enables prefetching block L+1's weights
-     * while block L's kernels are still running. */
-    if (r->n_preloaded < r->dit_n_blocks) {
-        if (qimg_alloc_scratch_block(r) == 0) {
-            if (r->verbose)
-                fprintf(stderr, "cuda_qimg: on-demand scratch slot allocated\n");
-        } else {
-            fprintf(stderr, "cuda_qimg: scratch slot alloc failed — "
-                            "falling back to per-block alloc\n");
-        }
-        /* Only allocate the second scratch slot + copy stream when
-         * QIMG_PIPELINE=1 (see dit_step block loop comment). Saves 324 MB. */
-        if (getenv("QIMG_PIPELINE")) {
-            if (qimg_alloc_scratch_block_b(r) == 0) {
-                if (r->verbose)
-                    fprintf(stderr, "cuda_qimg: double-buffered scratch enabled "
-                            "(copy stream + 2 slots)\n");
-            } else {
-                fprintf(stderr, "cuda_qimg: 2nd scratch slot alloc failed — "
-                                "single-slot mode\n");
-            }
-        }
-    }
+    /* Scratch slots are now allocated up-front in the preload block above. */
 
     fprintf(stderr, "cuda_qimg: loaded %d blocks, dim=%d\n",
             r->dit_n_blocks, r->dit_dim);
