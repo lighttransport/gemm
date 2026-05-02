@@ -82,6 +82,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
 #include <time.h>
 
 #include "../cuew.h"
+#include "../cublasew.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 #include "../cuda_kernels_common.h"
@@ -895,6 +896,128 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 "\n"
+/* ---- cuBLAS-LT FP8 helpers ----
+ * compute_x_scale_from_max: takes a single device float (max(|X|)) and
+ * writes x_scale = max/448 (clamped to >=1e-12) into d_x_scale.
+ * quant_f32_to_fp8_e4m3: F32 X -> FP8 e4m3 X with that scale (X/scale,
+ * round-to-nearest-even, satfinite via cvt.rn.satfinite.e4m3x2.f32). */
+"__global__ void compute_x_scale_from_max(float *d_x_scale,\n"
+"                                          const float *d_max_abs) {\n"
+"    if (threadIdx.x == 0 && blockIdx.x == 0) {\n"
+"        float m = d_max_abs[0];\n"
+"        float s = m * (1.0f / 448.0f);\n"
+"        if (s < 1e-12f) s = 1e-12f;\n"
+"        d_x_scale[0] = s;\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void quant_f32_to_fp8_e4m3(unsigned char *Y, const float *X,\n"
+"                                       const float *d_x_scale, int n) {\n"
+"    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;\n"
+"    if (i >= n) return;\n"
+"    float inv_s = 1.0f / d_x_scale[0];\n"
+"    float a = X[i] * inv_s;\n"
+"    float b = (i + 1 < n) ? X[i + 1] * inv_s : 0.0f;\n"
+"    unsigned short packed;\n"
+"    asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\" : \"=h\"(packed) : \"f\"(b), \"f\"(a));\n"
+"    Y[i] = (unsigned char)(packed & 0xff);\n"
+"    if (i + 1 < n) Y[i + 1] = (unsigned char)((packed >> 8) & 0xff);\n"
+"}\n"
+"\n"
+/* bf16_to_f32_add_bias: read BF16 Y_in, write F32 Y_out + optional bias.
+ * Y_in: row-major [n_tok, n_out] bf16 (2B). bias: F32 [n_out] or NULL. */
+"__global__ void bf16_to_f32_add_bias(float *Y, const unsigned short *Y_bf16,\n"
+"                                      const float *bias, int n_out, int n_tok) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_out * n_tok;\n"
+"    if (i >= total) return;\n"
+"    unsigned int bits = ((unsigned int)Y_bf16[i]) << 16;\n"
+"    float v;\n"
+"    asm(\"mov.b32 %0, %1;\" : \"=f\"(v) : \"r\"(bits));\n"
+"    if (bias) v += bias[i % n_out];\n"
+"    Y[i] = v;\n"
+"}\n"
+"\n"
+/* Fused MLP epilogue: BF16 → F32 + bias + GELU(tanh approx) in a single pass.
+ * Replaces back-to-back bf16_to_f32_add_bias + gelu_f32 (saves one full
+ * read-modify-write over the hidden buffer). */
+"__global__ void bf16_add_bias_gelu_f32(float *Y, const unsigned short *Y_bf16,\n"
+"                                        const float *bias, int n_out, int n_tok) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_out * n_tok;\n"
+"    if (i >= total) return;\n"
+"    unsigned int bits = ((unsigned int)Y_bf16[i]) << 16;\n"
+"    float v;\n"
+"    asm(\"mov.b32 %0, %1;\" : \"=f\"(v) : \"r\"(bits));\n"
+"    if (bias) v += bias[i % n_out];\n"
+"    /* gelu (tanh approx) */\n"
+"    float g = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v*v*v)));\n"
+"    Y[i] = g;\n"
+"}\n"
+"\n"
+/* In-place BF16 fused epilogue: Y_bf16[i] = bf16(gelu(bf16_to_f32(Y_bf16[i]) + bias[i%n_out])).
+ * Also computes per-tensor max(|.|) into d_max_out via warp+atomic reduction.
+ * Used by op_mlp_fp8 to keep MLP hidden state in BF16 instead of F32 — halves
+ * memory traffic for the 4096×12288 hidden tensor. */
+"__global__ void bf16_add_bias_gelu_inplace_max(unsigned short *Y_bf16,\n"
+"                                                const float *bias,\n"
+"                                                float *d_max_out,\n"
+"                                                int n_out, int n_tok) {\n"
+"    int total = n_out * n_tok;\n"
+"    float local_max = 0.0f;\n"
+"    int tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int stride = gridDim.x * blockDim.x;\n"
+"    for (int i = tid; i < total; i += stride) {\n"
+"        unsigned int bits = ((unsigned int)Y_bf16[i]) << 16;\n"
+"        float v;\n"
+"        asm(\"mov.b32 %0, %1;\" : \"=f\"(v) : \"r\"(bits));\n"
+"        if (bias) v += bias[i % n_out];\n"
+"        float g = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v*v*v)));\n"
+"        /* round to bf16 (truncate; matches mma output rounding) */\n"
+"        unsigned int gb;\n"
+"        asm(\"mov.b32 %0, %1;\" : \"=r\"(gb) : \"f\"(g));\n"
+"        Y_bf16[i] = (unsigned short)((gb + 0x8000) >> 16);  /* RNE-ish */\n"
+"        float ag = fabsf(g);\n"
+"        if (ag > local_max) local_max = ag;\n"
+"    }\n"
+"    /* warp reduce */\n"
+"    for (int off = 16; off > 0; off >>= 1) {\n"
+"        float other = __shfl_xor_sync(0xffffffff, local_max, off);\n"
+"        if (other > local_max) local_max = other;\n"
+"    }\n"
+"    if ((threadIdx.x & 31) == 0) {\n"
+"        /* atomic max on float via int trick (positive only) */\n"
+"        unsigned int *p = (unsigned int *)d_max_out;\n"
+"        unsigned int v;\n"
+"        asm(\"mov.b32 %0, %1;\" : \"=r\"(v) : \"f\"(local_max));\n"
+"        atomicMax(p, v);\n"
+"    }\n"
+"}\n"
+"\n"
+/* Quantize BF16 → FP8 e4m3 using a per-tensor scale (1 elem / thread; uses
+ * cvt.rn.satfinite.e4m3x2 like the F32 path but reads BF16 input). */
+"__global__ void quant_bf16_to_fp8_e4m3(unsigned char *Y, const unsigned short *X,\n"
+"                                        const float *d_scale, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int idx = i * 2;\n"
+"    if (idx >= n) return;\n"
+"    float inv = 1.0f / (*d_scale);\n"
+"    unsigned int b0 = ((unsigned int)X[idx]) << 16;\n"
+"    float a;\n"
+"    asm(\"mov.b32 %0, %1;\" : \"=f\"(a) : \"r\"(b0));\n"
+"    a *= inv;\n"
+"    float b = 0.0f;\n"
+"    if (idx + 1 < n) {\n"
+"        unsigned int b1 = ((unsigned int)X[idx+1]) << 16;\n"
+"        asm(\"mov.b32 %0, %1;\" : \"=f\"(b) : \"r\"(b1));\n"
+"        b *= inv;\n"
+"    }\n"
+"    unsigned short packed;\n"
+"    asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\" : \"=h\"(packed) : \"f\"(b), \"f\"(a));\n"
+"    Y[idx] = (unsigned char)(packed & 0xff);\n"
+"    if (idx + 1 < n) Y[idx+1] = (unsigned char)((packed >> 8) & 0xff);\n"
+"}\n"
+"\n"
 "}\n"; /* close extern "C" from cuda_kernels_common_src */
 
 
@@ -959,9 +1082,26 @@ struct cuda_qimg_runner {
     int use_fp8_pipe_perrow;
     CUfunction gemm_fp8_pipe_perrow;
     CUfunction gemm_fp8_pipe_perrow_mt4;  /* MTILE=4 variant for n_tok % 64 == 0 */
+    CUfunction gemm_fp8_pipe_perrow_mt4_concat3;  /* fused QKV: 1 launch + shared row_max */
     CUfunction reduce_max_abs_per_row;
     CUdeviceptr d_row_max_buf;     /* [max_n_tok] f32, lazily allocated */
     size_t      row_max_buf_n;
+    /* cuBLAS-LT FP8 path (env QIMG_CUBLASLT_FP8=1, default 1 if loaded). */
+    int use_cublaslt_fp8;
+    struct cublasew_context *cublaslt_ctx;
+    CUfunction quant_f32_to_fp8_e4m3;
+    CUfunction compute_x_scale_from_max;
+    CUfunction bf16_to_f32_add_bias;
+    CUfunction bf16_add_bias_gelu_f32;  /* fused MLP fc1 epilogue */
+    CUfunction bf16_add_bias_gelu_inplace_max;  /* in-place BF16 MLP epilogue + max */
+    CUfunction quant_bf16_to_fp8_e4m3;          /* BF16 → FP8 quant */
+    int mlp_bf16_hidden;                        /* env QIMG_MLP_BF16_HIDDEN, default ON */
+    CUdeviceptr d_x_fp8_scratch;   /* lazily grown to max_n_tok * max_n_in bytes */
+    size_t      x_fp8_scratch_n;
+    CUdeviceptr d_y_bf16_scratch;  /* lazily grown to max_n_tok * max_n_out * 2 B */
+    size_t      y_bf16_scratch_n;
+    CUdeviceptr d_x_scale_f32;     /* [1] float */
+    CUdeviceptr d_w_scale_one;     /* [1] float, holds 1.0f */
     int use_fp8_attn;  /* 1 to use mma.sync FP8 flash attention (env QIMG_FP8_ATTN=1) */
     /* Lazy FP8 attention workspace (re-used across blocks; sized to max n_tok*dim) */
     CUdeviceptr d_q_fp8, d_k_fp8, d_v_fp8;  /* [n_tok*dim] uint8 e4m3 */
@@ -1005,6 +1145,13 @@ struct cuda_qimg_runner {
 
     /* Safetensors context (mmap'd) */
     void *dit_st;
+    int dit_st_pinned;  /* 1 if cuMemHostRegister succeeded on the mmap region */
+    /* Per-tensor pinned host buffers for streamed blocks.
+     * dit_pinned_data[idx] = pinned ptr (NULL = use mmap source).
+     * Backed by per-block pinned pools owned by dit_pinned_pools[]. */
+    void **dit_pinned_data;
+    int dit_pinned_n_tensors;
+    void **dit_pinned_pools;     /* size = dit_n_blocks; one per streamed block */
     void *vae_st;
 
     /* Preloaded blocks on GPU (NULL if not preloaded, loaded on-demand) */
@@ -1047,6 +1194,19 @@ struct cuda_qimg_runner {
     CUdeviceptr d_t_fc2_w, d_t_fc2_b;
     CUdeviceptr d_norm_out_w, d_norm_out_b;
     CUdeviceptr d_proj_out_w, d_proj_out_b;
+
+    /* Per-stage block profiling (env QIMG_PROFILE_BLOCK=1).
+     * When enabled, qimg_forward_block synchronizes between phases and
+     * accumulates wall-clock time into these buckets; printed at end of
+     * cuda_qimg_dit_step. */
+    int profile_block;
+    double prof_qkv_ms;       /* adaLN1 + QKV gemm (img+txt) */
+    double prof_qknorm_ms;    /* QK rmsnorm + RoPE */
+    double prof_attn_ms;      /* op_attn */
+    double prof_attnout_ms;   /* attn out proj + gated_add */
+    double prof_imgmlp_ms;    /* adaLN2 img + img MLP fc1+gelu+fc2 + gated_add */
+    double prof_txtmlp_ms;    /* adaLN2 txt + txt MLP fc1+gelu+fc2 + gated_add */
+    int prof_block_count;
 };
 
 
@@ -1220,6 +1380,9 @@ static CUdeviceptr qimg_st_upload_fp8_raw(st_context *st, const char *name) {
 /* Async HtoD on r->stream — queues after pending compute kernels, stream
  * ordering serializes scratch-slot writes with prior compute so no explicit
  * cuStreamSynchronize is needed between block loads. */
+/* Forward decl: pinned host source override for streamed block tensors. */
+static const void *qimg_tensor_host_src(struct cuda_qimg_runner *r, st_context *st, int idx);
+
 static int qimg_st_upload_fp8_raw_async(st_context *st, const char *name,
                                          CUdeviceptr dst, size_t dst_nbytes,
                                          CUstream s) {
@@ -1228,6 +1391,20 @@ static int qimg_st_upload_fp8_raw_async(st_context *st, const char *name,
     size_t nbytes = safetensors_nbytes(st, idx);
     if (nbytes != dst_nbytes) return -1;
     cuMemcpyHtoDAsync(dst, safetensors_data(st, idx), nbytes, s);
+    return 0;
+}
+
+/* Pinned-aware variant — used by streaming hot path. Passes runner so the
+ * helper can substitute a pinned host source when one was pre-staged. */
+static int qimg_st_upload_fp8_raw_async_r(struct cuda_qimg_runner *r,
+                                           st_context *st, const char *name,
+                                           CUdeviceptr dst, size_t dst_nbytes,
+                                           CUstream s) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return -1;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    if (nbytes != dst_nbytes) return -1;
+    cuMemcpyHtoDAsync(dst, qimg_tensor_host_src(r, st, idx), nbytes, s);
     return 0;
 }
 
@@ -1267,6 +1444,29 @@ static int qimg_st_upload_f32_async(st_context *st, const char *name,
     cuStreamSynchronize(s);
     free(f32);
     return 0;
+}
+
+/* Pinned-aware variant of qimg_st_upload_f32_async. Only the F32 fast-path
+ * benefits from pinned (the conversion path goes through a temp buffer). */
+static int qimg_st_upload_f32_async_r(struct cuda_qimg_runner *r,
+                                      st_context *st, const char *name,
+                                      CUdeviceptr dst, size_t dst_nelem,
+                                      CUstream s) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return -1;
+    const uint64_t *shape = safetensors_shape(st, idx);
+    int ndims = safetensors_ndims(st, idx);
+    size_t n = 1;
+    for (int d = 0; d < ndims; d++) n *= shape[d];
+    if (n != dst_nelem) return -1;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (strcmp(dtype, "F32") == 0) {
+        cuMemcpyHtoDAsync(dst, qimg_tensor_host_src(r, st, idx),
+                          n * sizeof(float), s);
+        return 0;
+    }
+    /* Fall back to mmap-based path with conversion. */
+    return qimg_st_upload_f32_async(st, name, dst, dst_nelem, s);
 }
 
 /* ---- Load/free one DiT block ---- */
@@ -1511,11 +1711,11 @@ static int qimg_load_block_into_slot_ex(cuda_qimg_runner *r, int block_idx,
     int ok = 1;
 #define UPLOAD_FP8(field, suffix, _bytes) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        if (qimg_st_upload_fp8_raw_async(st, name, b->field, _bytes, s) != 0) ok = 0; \
+        if (qimg_st_upload_fp8_raw_async_r(r, st, name, b->field, _bytes, s) != 0) ok = 0; \
     } } while(0)
 #define UPLOAD_F32(field, suffix, _nelem) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        if (qimg_st_upload_f32_async(st, name, b->field, _nelem, s) != 0) ok = 0; \
+        if (qimg_st_upload_f32_async_r(r, st, name, b->field, _nelem, s) != 0) ok = 0; \
     } } while(0)
     int dim = r->dit_dim, mlp = r->dit_mlp_h;
     size_t sq = (size_t)dim * dim;               /* FP8 bytes */
@@ -1560,6 +1760,70 @@ static int qimg_load_block_into_slot_ex(cuda_qimg_runner *r, int block_idx,
     return ok ? 0 : -1;
 }
 
+/* Returns pinned host source for the tensor if pre-staged, else mmap source. */
+static const void *qimg_tensor_host_src(struct cuda_qimg_runner *r,
+                                         st_context *st, int idx) {
+    if (r && r->dit_pinned_data && idx >= 0 && idx < r->dit_pinned_n_tensors &&
+        r->dit_pinned_data[idx]) {
+        return r->dit_pinned_data[idx];
+    }
+    return safetensors_data(st, idx);
+}
+
+/* Stage one block's tensors into a pinned host pool.
+ * Allocates ~324 MB pinned per call. Returns 0 on success, -1 on alloc fail. */
+static int qimg_stage_block_pinned(cuda_qimg_runner *r, int block_idx) {
+    st_context *st = (st_context *)r->dit_st;
+    /* List of (suffix, expected_dtype_is_fp8) for all 30 tensors per block.
+     * Order matches qimg_load_block_into_slot_ex. */
+    static const char *suffixes[] = {
+        "attn.to_q.weight", "attn.to_q.bias",
+        "attn.to_k.weight", "attn.to_k.bias",
+        "attn.to_v.weight", "attn.to_v.bias",
+        "attn.to_out.0.weight", "attn.to_out.0.bias",
+        "attn.add_q_proj.weight", "attn.add_q_proj.bias",
+        "attn.add_k_proj.weight", "attn.add_k_proj.bias",
+        "attn.add_v_proj.weight", "attn.add_v_proj.bias",
+        "attn.to_add_out.weight", "attn.to_add_out.bias",
+        "attn.norm_q.weight", "attn.norm_k.weight",
+        "attn.norm_added_q.weight", "attn.norm_added_k.weight",
+        "img_mod.1.weight", "img_mod.1.bias",
+        "img_mlp.net.0.proj.weight", "img_mlp.net.0.proj.bias",
+        "img_mlp.net.2.weight", "img_mlp.net.2.bias",
+        "txt_mod.1.weight", "txt_mod.1.bias",
+        "txt_mlp.net.0.proj.weight", "txt_mlp.net.0.proj.bias",
+        "txt_mlp.net.2.weight", "txt_mlp.net.2.bias",
+        NULL
+    };
+    /* First pass: total bytes (round up each to 256 B for cuMemAllocHost
+     * alignment friendliness — minor padding overhead). */
+    size_t total = 0;
+    char name[256];
+    int idxs[64]; size_t sizes[64], offs[64];
+    int n = 0;
+    for (int i = 0; suffixes[i]; i++) {
+        snprintf(name, sizeof(name), "transformer_blocks.%d.%s", block_idx, suffixes[i]);
+        int idx = safetensors_find(st, name);
+        if (idx < 0) continue;
+        idxs[n] = idx;
+        sizes[n] = safetensors_nbytes(st, idx);
+        offs[n] = total;
+        total += (sizes[n] + 255) & ~(size_t)255;
+        n++;
+    }
+    /* Allocate pinned pool. */
+    void *pool = NULL;
+    if (cuMemAllocHost(&pool, total) != CUDA_SUCCESS || !pool) return -1;
+    r->dit_pinned_pools[block_idx] = pool;
+    /* Second pass: memcpy + register pinned ptr in dit_pinned_data[]. */
+    char *base = (char *)pool;
+    for (int j = 0; j < n; j++) {
+        memcpy(base + offs[j], safetensors_data(st, idxs[j]), sizes[j]);
+        r->dit_pinned_data[idxs[j]] = base + offs[j];
+    }
+    return 0;
+}
+
 /* Single-slot compat wrapper: copies into r->scratch_block on r->stream. */
 static int qimg_load_block_into_slot(cuda_qimg_runner *r, int block_idx,
                                      qimg_block_gpu *out_b) {
@@ -1577,6 +1841,66 @@ static void op_bf16_trunc(cuda_qimg_runner *r, CUdeviceptr x, int n);  /* forwar
 static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
+
+    /* cuBLAS-LT FP8 e4m3 path — highest priority. Quantizes X to FP8 with a
+     * per-tensor scale = max(|X|)/448, calls cublasLtMatmul (BF16 output),
+     * then expands BF16 -> F32 with optional bias add. */
+    if (r->use_cublaslt_fp8 && n_tok >= 8 && n_in >= 32 && n_out >= 16 &&
+        !r->use_old_gemm) {
+        size_t need_x = (size_t)n_tok * n_in;
+        size_t need_y = (size_t)n_tok * n_out * sizeof(uint16_t);
+        if (need_x > r->x_fp8_scratch_n) {
+            if (r->d_x_fp8_scratch) cuMemFree(r->d_x_fp8_scratch);
+            r->d_x_fp8_scratch = 0;
+            if (cuMemAlloc(&r->d_x_fp8_scratch, need_x) == CUDA_SUCCESS) {
+                r->x_fp8_scratch_n = need_x;
+            } else { r->x_fp8_scratch_n = 0; }
+        }
+        if (need_y > r->y_bf16_scratch_n) {
+            if (r->d_y_bf16_scratch) cuMemFree(r->d_y_bf16_scratch);
+            r->d_y_bf16_scratch = 0;
+            if (cuMemAlloc(&r->d_y_bf16_scratch, need_y) == CUDA_SUCCESS) {
+                r->y_bf16_scratch_n = need_y;
+            } else { r->y_bf16_scratch_n = 0; }
+        }
+        if (r->d_x_fp8_scratch && r->d_y_bf16_scratch) {
+            /* 1. reduce_max_abs(X) -> d_qkv_max */
+            if (!r->d_qkv_max) cuMemAlloc(&r->d_qkv_max, sizeof(float));
+            cuMemsetD32Async(r->d_qkv_max, 0, 1, r->stream);
+            int n_x = n_tok * n_in;
+            void *r_args[] = {&r->d_qkv_max, &X, &n_x};
+            unsigned rb = (unsigned)((n_x + 255) / 256);
+            cuLaunchKernel(r->reduce_max_abs, rb, 1, 1, 256, 1, 1,
+                           0, r->stream, r_args, NULL);
+            /* 2. compute x_scale = max/448 (1 thread) */
+            void *s_args[] = {&r->d_x_scale_f32, &r->d_qkv_max};
+            cuLaunchKernel(r->compute_x_scale_from_max, 1, 1, 1, 1, 1, 1,
+                           0, r->stream, s_args, NULL);
+            /* 3. quant X -> FP8 using x_scale; 2 elems per thread */
+            void *q_args[] = {&r->d_x_fp8_scratch, &X, &r->d_x_scale_f32, &n_x};
+            unsigned qb = (unsigned)(((n_x + 1) / 2 + 255) / 256);
+            cuLaunchKernel(r->quant_f32_to_fp8_e4m3, qb, 1, 1, 256, 1, 1,
+                           0, r->stream, q_args, NULL);
+            /* 4. cuBLAS-LT FP8 matmul -> Y_bf16 scratch */
+            int rc = cublasew_gemm_fp8_e4m3_bf16out_rowmajor_nt(
+                r->cublaslt_ctx,
+                r->d_y_bf16_scratch,
+                W, r->d_x_fp8_scratch,
+                r->d_w_scale_one, r->d_x_scale_f32,
+                0,  /* no LT bias epilogue; do it in expand */
+                n_tok, n_out, n_in);
+            if (rc == 0) {
+                /* 5. expand BF16 -> F32 (+ optional bias) */
+                void *e_args[] = {&Y, &r->d_y_bf16_scratch, &bias, &n_out, &n_tok};
+                int total = n_out * n_tok;
+                unsigned eb = (unsigned)((total + 255) / 256);
+                cuLaunchKernel(r->bf16_to_f32_add_bias, eb, 1, 1, 256, 1, 1,
+                               0, r->stream, e_args, NULL);
+                return;
+            }
+            /* LT matmul failed at runtime — fall through to perrow path */
+        }
+    }
 
     /* Per-row FP8 MMA pipelined GEMM — top priority when enabled. Same speed
      * as the per-tensor FP8 pipe but drops pixel_mean blur from ~1.81 to ~1.0
@@ -1606,16 +1930,23 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
              * which holds for img stream at >=512 (n_img=1024+) and qkv shapes. */
             if (!getenv("QIMG_DISABLE_MT4") && r->gemm_fp8_pipe_perrow_mt4 && n_tok >= 64 && (n_tok % 64) == 0) {
                 unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+                /* Pad grid to multiples of 4 in both dims for v7-style 4x4
+                 * CTA panel swizzle inside the kernel (excess CTAs early-return). */
+                unsigned gx4 = (gx + 3u) & ~3u;
+                gy4 = (gy4 + 3u) & ~3u;
                 /* smem: 2048 (smX 64x32) + 2*8192 (W) + 512 (64 inv + 64 fwd) = 18944 B */
                 size_t smem_mt4 = 2048 + 8192 * 2 + 512;
-                cuLaunchKernel(r->gemm_fp8_pipe_perrow_mt4, gx, gy4, 1, 128, 1, 1,
+                cuLaunchKernel(r->gemm_fp8_pipe_perrow_mt4, gx4, gy4, 1, 128, 1, 1,
                                smem_mt4, r->stream, args, NULL);
                 return;
             }
             unsigned gy = (unsigned)((n_tok +  31) /  32);
+            /* Pad to multiples of 4 for v7-style 4x4 CTA panel swizzle. */
+            unsigned gx_pr = (gx + 3u) & ~3u;
+            gy = (gy + 3u) & ~3u;
             /* smem: 1024 (smX FP8) + 2*8192 (W stages) + 256 (32 inv + 32 fwd scales) = 17664 B */
             size_t smem_pr = 1024 + 8192 * 2 + 256;
-            cuLaunchKernel(r->gemm_fp8_pipe_perrow, gx, gy, 1, 128, 1, 1,
+            cuLaunchKernel(r->gemm_fp8_pipe_perrow, gx_pr, gy, 1, 128, 1, 1,
                            smem_pr, r->stream, args, NULL);
             return;
         }
@@ -1628,6 +1959,9 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         (n_out % 256) == 0 && (n_in % 32) == 0 && !r->use_old_gemm) {
         unsigned gx = (unsigned)((n_out + 255) / 256);
         unsigned gy = (unsigned)((n_tok +  31) /  32);
+        /* Pad to multiples of 4 for v7-style 4x4 CTA panel swizzle. */
+        gx = (gx + 3u) & ~3u;
+        gy = (gy + 3u) & ~3u;
         /* smem: smX bf16 (2048) + smW_fp8 (8192) x 2 stages = 18432 B */
         size_t smem_bf16 = 2048 + 8192 * 2;
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
@@ -1690,7 +2024,10 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
         if (r->use_fp8_pipe && r->gemm_fp8_mma_pipe && n_tok >= 16 &&
             (n_out % 256) == 0 && (n_in % 32) == 0) {
             size_t smem_pipe = 1024 + 8192 * 2;  /* FP8 X tile + 2 × W tile = 17408 B */
-            cuLaunchKernel(r->gemm_fp8_mma_pipe, gx, gy, 1, 128, 1, 1,
+            /* Pad to multiples of 4 for v7-style 4x4 CTA panel swizzle. */
+            unsigned gx_p = (gx + 3u) & ~3u;
+            unsigned gy_p = (gy + 3u) & ~3u;
+            cuLaunchKernel(r->gemm_fp8_mma_pipe, gx_p, gy_p, 1, 128, 1, 1,
                            smem_pipe, r->stream, args, NULL);
             return;
         }
@@ -1769,6 +2106,186 @@ static void op_gelu(cuda_qimg_runner *r, CUdeviceptr x, int n) {
     void *args[] = {&x, &n};
     cuLaunchKernel(r->gelu_f32, (unsigned)((n+255)/256), 1, 1, 256, 1, 1,
                    0, r->stream, args, NULL);
+}
+
+/* Fused GEMM + bias + GELU. Equivalent to op_gemm(...) followed by op_gelu().
+ * Saves one full read-modify-write pass over Y on the cuBLAS-LT FP8 fast path
+ * by folding the gelu into the BF16→F32+bias expansion kernel. */
+static void op_gemm_gelu(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
+                         CUdeviceptr X, CUdeviceptr bias,
+                         int n_out, int n_in, int n_tok) {
+    /* cuBLAS-LT FP8 path with fused bias+gelu epilogue. */
+    if (r->use_cublaslt_fp8 && r->bf16_add_bias_gelu_f32 &&
+        n_tok >= 8 && n_in >= 32 && n_out >= 16 && !r->use_old_gemm) {
+        size_t need_x = (size_t)n_tok * n_in;
+        size_t need_y = (size_t)n_tok * n_out * 2;
+        if (need_x > r->x_fp8_scratch_n) {
+            if (r->d_x_fp8_scratch) cuMemFree(r->d_x_fp8_scratch);
+            r->d_x_fp8_scratch = 0;
+            if (cuMemAlloc(&r->d_x_fp8_scratch, need_x) == CUDA_SUCCESS)
+                r->x_fp8_scratch_n = need_x;
+            else r->x_fp8_scratch_n = 0;
+        }
+        if (need_y > r->y_bf16_scratch_n) {
+            if (r->d_y_bf16_scratch) cuMemFree(r->d_y_bf16_scratch);
+            r->d_y_bf16_scratch = 0;
+            if (cuMemAlloc(&r->d_y_bf16_scratch, need_y) == CUDA_SUCCESS)
+                r->y_bf16_scratch_n = need_y;
+            else r->y_bf16_scratch_n = 0;
+        }
+        if (r->d_x_fp8_scratch && r->d_y_bf16_scratch) {
+            if (!r->d_qkv_max) cuMemAlloc(&r->d_qkv_max, sizeof(float));
+            cuMemsetD32Async(r->d_qkv_max, 0, 1, r->stream);
+            int n_x = n_tok * n_in;
+            void *r_args[] = {&r->d_qkv_max, &X, &n_x};
+            unsigned rb = (unsigned)((n_x + 255) / 256);
+            cuLaunchKernel(r->reduce_max_abs, rb, 1, 1, 256, 1, 1,
+                           0, r->stream, r_args, NULL);
+            void *s_args[] = {&r->d_x_scale_f32, &r->d_qkv_max};
+            cuLaunchKernel(r->compute_x_scale_from_max, 1, 1, 1, 1, 1, 1,
+                           0, r->stream, s_args, NULL);
+            void *q_args[] = {&r->d_x_fp8_scratch, &X, &r->d_x_scale_f32, &n_x};
+            unsigned qb = (unsigned)(((n_x + 1) / 2 + 255) / 256);
+            cuLaunchKernel(r->quant_f32_to_fp8_e4m3, qb, 1, 1, 256, 1, 1,
+                           0, r->stream, q_args, NULL);
+            int rc = cublasew_gemm_fp8_e4m3_bf16out_rowmajor_nt(
+                r->cublaslt_ctx,
+                r->d_y_bf16_scratch,
+                W, r->d_x_fp8_scratch,
+                r->d_w_scale_one, r->d_x_scale_f32,
+                0, n_tok, n_out, n_in);
+            if (rc == 0) {
+                /* Fused bf16 -> f32 + bias + gelu (single pass). */
+                void *e_args[] = {&Y, &r->d_y_bf16_scratch, &bias, &n_out, &n_tok};
+                int total = n_out * n_tok;
+                unsigned eb = (unsigned)((total + 255) / 256);
+                cuLaunchKernel(r->bf16_add_bias_gelu_f32, eb, 1, 1, 256, 1, 1,
+                               0, r->stream, e_args, NULL);
+                return;
+            }
+        }
+    }
+    /* Fallback: separate GEMM + GELU (matches old behavior bit-exactly). */
+    op_gemm(r, Y, W, X, bias, n_out, n_in, n_tok);
+    op_gelu(r, Y, n_tok * n_out);
+}
+
+/* Fused two-GEMM MLP entirely on FP8/BF16: avoids materializing a F32 hidden.
+ *   Y = fc2_W · gelu(fc1_W · X + fc1_b) + fc2_b
+ * Returns 0 on success (LT path used end-to-end), -1 if any prerequisite is
+ * missing — caller should fall back to op_gemm_gelu + op_gemm.
+ *
+ * Memory savings vs (op_gemm_gelu + op_gemm) for (n_tok=4096, mlp_h=12288):
+ *   - skips writing 192 MB F32 hidden (gelu output)
+ *   - skips reading 192 MB F32 hidden (fc2 X-quant)
+ *   = ~384 MB saved per invocation. */
+static int op_mlp_fp8(cuda_qimg_runner *r,
+                      CUdeviceptr Y, CUdeviceptr X,
+                      CUdeviceptr fc1_W, CUdeviceptr fc1_b,
+                      CUdeviceptr fc2_W, CUdeviceptr fc2_b,
+                      int dim, int mlp_h, int n_tok) {
+    if (!r->mlp_bf16_hidden) return -1;
+    if (!r->use_cublaslt_fp8 || !r->bf16_add_bias_gelu_inplace_max ||
+        !r->quant_bf16_to_fp8_e4m3 || !r->bf16_to_f32_add_bias ||
+        !r->reduce_max_abs || !r->compute_x_scale_from_max ||
+        !r->quant_f32_to_fp8_e4m3 || r->use_old_gemm) return -1;
+    if (n_tok < 8 || dim < 32 || mlp_h < 16) return -1;
+
+    /* Scratch sizing: x_fp8 needs to fit max(n_tok*dim, n_tok*mlp_h);
+     * y_bf16 needs n_tok*max(dim,mlp_h)*2B. Sized for fc1 first, grown for fc2. */
+    size_t need_x = (size_t)n_tok * mlp_h;       /* fc2 input is largest */
+    size_t need_y = (size_t)n_tok * mlp_h * 2;   /* fc1 output (BF16 hidden) */
+    if (need_x > r->x_fp8_scratch_n) {
+        if (r->d_x_fp8_scratch) cuMemFree(r->d_x_fp8_scratch);
+        r->d_x_fp8_scratch = 0;
+        if (cuMemAlloc(&r->d_x_fp8_scratch, need_x) != CUDA_SUCCESS) {
+            r->x_fp8_scratch_n = 0; return -1;
+        }
+        r->x_fp8_scratch_n = need_x;
+    }
+    if (need_y > r->y_bf16_scratch_n) {
+        if (r->d_y_bf16_scratch) cuMemFree(r->d_y_bf16_scratch);
+        r->d_y_bf16_scratch = 0;
+        if (cuMemAlloc(&r->d_y_bf16_scratch, need_y) != CUDA_SUCCESS) {
+            r->y_bf16_scratch_n = 0; return -1;
+        }
+        r->y_bf16_scratch_n = need_y;
+    }
+    if (!r->d_qkv_max) {
+        if (cuMemAlloc(&r->d_qkv_max, sizeof(float)) != CUDA_SUCCESS) return -1;
+    }
+
+    CUstream s = r->stream;
+
+    /* --- Stage A: fc1 = LT FP8(X · fc1_W) → BF16 in d_y_bf16_scratch --- */
+    /* A.1: per-tensor X→FP8 quant */
+    cuMemsetD32Async(r->d_qkv_max, 0, 1, s);
+    int n_x = n_tok * dim;
+    {
+        void *args[] = {&r->d_qkv_max, &X, &n_x};
+        unsigned rb = (unsigned)((n_x + 255) / 256);
+        cuLaunchKernel(r->reduce_max_abs, rb, 1, 1, 256, 1, 1, 0, s, args, NULL);
+    }
+    {
+        void *args[] = {&r->d_x_scale_f32, &r->d_qkv_max};
+        cuLaunchKernel(r->compute_x_scale_from_max, 1, 1, 1, 1, 1, 1, 0, s, args, NULL);
+    }
+    {
+        void *args[] = {&r->d_x_fp8_scratch, &X, &r->d_x_scale_f32, &n_x};
+        unsigned qb = (unsigned)(((n_x + 1) / 2 + 255) / 256);
+        cuLaunchKernel(r->quant_f32_to_fp8_e4m3, qb, 1, 1, 256, 1, 1, 0, s, args, NULL);
+    }
+    /* A.2: LT fc1 — bias=0 (we add it in the in-place epilogue). */
+    if (cublasew_gemm_fp8_e4m3_bf16out_rowmajor_nt(
+            r->cublaslt_ctx, r->d_y_bf16_scratch,
+            fc1_W, r->d_x_fp8_scratch,
+            r->d_w_scale_one, r->d_x_scale_f32,
+            0, n_tok, mlp_h, dim) != 0) {
+        return -1;
+    }
+
+    /* --- Stage B: in-place +bias+gelu on BF16 hidden, accumulate per-tensor max --- */
+    cuMemsetD32Async(r->d_qkv_max, 0, 1, s);
+    {
+        void *args[] = {&r->d_y_bf16_scratch, &fc1_b, &r->d_qkv_max, &mlp_h, &n_tok};
+        /* persistent grid: 256 CTAs × 256 threads cover any size by stride loop */
+        unsigned grid = 256;
+        cuLaunchKernel(r->bf16_add_bias_gelu_inplace_max, grid, 1, 1,
+                       256, 1, 1, 0, s, args, NULL);
+    }
+    /* compute fc2_x_scale = max/448 (reuse d_x_scale_f32) */
+    {
+        void *args[] = {&r->d_x_scale_f32, &r->d_qkv_max};
+        cuLaunchKernel(r->compute_x_scale_from_max, 1, 1, 1, 1, 1, 1, 0, s, args, NULL);
+    }
+
+    /* --- Stage C: quant BF16 hidden → FP8 (fc2 input) --- */
+    int n_h = n_tok * mlp_h;
+    {
+        void *args[] = {&r->d_x_fp8_scratch, &r->d_y_bf16_scratch, &r->d_x_scale_f32, &n_h};
+        unsigned qb = (unsigned)(((n_h + 1) / 2 + 255) / 256);
+        cuLaunchKernel(r->quant_bf16_to_fp8_e4m3, qb, 1, 1, 256, 1, 1, 0, s, args, NULL);
+    }
+
+    /* --- Stage D: LT fc2 — writes BACK to d_y_bf16_scratch (overwrites the
+     *               consumed BF16 hidden, which is OK since stage C already
+     *               read it). --- */
+    if (cublasew_gemm_fp8_e4m3_bf16out_rowmajor_nt(
+            r->cublaslt_ctx, r->d_y_bf16_scratch,
+            fc2_W, r->d_x_fp8_scratch,
+            r->d_w_scale_one, r->d_x_scale_f32,
+            0, n_tok, dim, mlp_h) != 0) {
+        return -1;
+    }
+
+    /* --- Stage E: expand BF16 → F32 + fc2_b → final Y --- */
+    {
+        int total = dim * n_tok;
+        void *args[] = {&Y, &r->d_y_bf16_scratch, &fc2_b, &dim, &n_tok};
+        unsigned eb = (unsigned)((total + 255) / 256);
+        cuLaunchKernel(r->bf16_to_f32_add_bias, eb, 1, 1, 256, 1, 1, 0, s, args, NULL);
+    }
+    return 0;
 }
 
 static void op_adaln(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr x,
@@ -1852,6 +2369,115 @@ static void quantize_buf_fp8(cuda_qimg_runner *r,
     void *a1[] = {&fp8_out, &scale_out, &in, &r->d_qkv_max, &n};
     cuLaunchKernel(r->quantize_fp8, blocks, 1, 1, 256, 1, 1,
                    0, r->stream, a1, NULL);
+}
+
+/* Fused QKV linear: Yq/Yk/Yv = X @ Wq/Wk/Wv^T + bq/bk/bv. Single launch with
+ * shared row_max + L2 X reuse vs three op_gemm calls. Returns 0 on success;
+ * caller falls back to 3x op_gemm on -1. Requires the perrow_mt4_concat3
+ * kernel + n_tok>=64 + (n_tok%64)==0 + (dim%256)==0 + (n_in%32)==0. */
+static int op_gemm_qkv_fused(cuda_qimg_runner *r,
+                              CUdeviceptr Yq, CUdeviceptr Yk, CUdeviceptr Yv,
+                              CUdeviceptr Wq, CUdeviceptr Wk, CUdeviceptr Wv,
+                              CUdeviceptr X,
+                              CUdeviceptr bq, CUdeviceptr bk, CUdeviceptr bv,
+                              int dim, int n_in, int n_tok) {
+    /* cuBLAS-LT FP8 path: 3 LT matmuls with a SHARED X→FP8 quant, vs the
+     * old single perrow_mt4_concat3 launch. LT is fast enough that 3
+     * separate calls beat one fused custom kernel; sharing the X quant
+     * keeps overhead from tripling. */
+    if (r->use_cublaslt_fp8 && n_tok >= 8 && n_in >= 32 && dim >= 16 &&
+        !r->use_old_gemm) {
+        size_t need_x = (size_t)n_tok * n_in;
+        size_t need_y = (size_t)n_tok * dim * sizeof(uint16_t);
+        if (need_x > r->x_fp8_scratch_n) {
+            if (r->d_x_fp8_scratch) cuMemFree(r->d_x_fp8_scratch);
+            r->d_x_fp8_scratch = 0;
+            if (cuMemAlloc(&r->d_x_fp8_scratch, need_x) == CUDA_SUCCESS)
+                r->x_fp8_scratch_n = need_x;
+            else { r->x_fp8_scratch_n = 0; goto qkv_fallback; }
+        }
+        if (need_y > r->y_bf16_scratch_n) {
+            if (r->d_y_bf16_scratch) cuMemFree(r->d_y_bf16_scratch);
+            r->d_y_bf16_scratch = 0;
+            if (cuMemAlloc(&r->d_y_bf16_scratch, need_y) == CUDA_SUCCESS)
+                r->y_bf16_scratch_n = need_y;
+            else { r->y_bf16_scratch_n = 0; goto qkv_fallback; }
+        }
+        if (!r->d_x_fp8_scratch || !r->d_y_bf16_scratch) goto qkv_fallback;
+
+        /* 1. one reduce_max_abs(X) shared across Q/K/V */
+        if (!r->d_qkv_max) cuMemAlloc(&r->d_qkv_max, sizeof(float));
+        cuMemsetD32Async(r->d_qkv_max, 0, 1, r->stream);
+        int n_x = n_tok * n_in;
+        void *r_args[] = {&r->d_qkv_max, &X, &n_x};
+        unsigned rb = (unsigned)((n_x + 255) / 256);
+        cuLaunchKernel(r->reduce_max_abs, rb, 1, 1, 256, 1, 1,
+                       0, r->stream, r_args, NULL);
+        void *s_args[] = {&r->d_x_scale_f32, &r->d_qkv_max};
+        cuLaunchKernel(r->compute_x_scale_from_max, 1, 1, 1, 1, 1, 1,
+                       0, r->stream, s_args, NULL);
+        /* 2. one quant X→FP8 shared across Q/K/V */
+        void *q_args[] = {&r->d_x_fp8_scratch, &X, &r->d_x_scale_f32, &n_x};
+        unsigned qb = (unsigned)(((n_x + 1) / 2 + 255) / 256);
+        cuLaunchKernel(r->quant_f32_to_fp8_e4m3, qb, 1, 1, 256, 1, 1,
+                       0, r->stream, q_args, NULL);
+
+        /* 3. three LT matmuls into BF16 scratch + expand-with-bias.
+         * y_bf16_scratch is reused after each expand. */
+        CUdeviceptr Ws[3] = {Wq, Wk, Wv};
+        CUdeviceptr bs[3] = {bq, bk, bv};
+        CUdeviceptr Ys[3] = {Yq, Yk, Yv};
+        for (int i = 0; i < 3; i++) {
+            int rc = cublasew_gemm_fp8_e4m3_bf16out_rowmajor_nt(
+                r->cublaslt_ctx,
+                r->d_y_bf16_scratch,
+                Ws[i], r->d_x_fp8_scratch,
+                r->d_w_scale_one, r->d_x_scale_f32,
+                0,
+                n_tok, dim, n_in);
+            if (rc != 0) goto qkv_fallback;
+            CUdeviceptr Y_i = Ys[i], b_i = bs[i];
+            void *e_args[] = {&Y_i, &r->d_y_bf16_scratch, &b_i, &dim, &n_tok};
+            int total = dim * n_tok;
+            unsigned eb = (unsigned)((total + 255) / 256);
+            cuLaunchKernel(r->bf16_to_f32_add_bias, eb, 1, 1, 256, 1, 1,
+                           0, r->stream, e_args, NULL);
+        }
+        return 0;
+    }
+qkv_fallback:
+    if (!r->use_fp8_pipe_perrow || !r->gemm_fp8_pipe_perrow_mt4_concat3 ||
+        !r->reduce_max_abs_per_row || r->use_old_gemm) return -1;
+    if (n_tok < 64 || (n_tok % 64) != 0 || (dim % 256) != 0 || (n_in % 32) != 0)
+        return -1;
+
+    /* Grow shared row_max buf if needed (op_gemm uses the same buffer). */
+    size_t need = (size_t)n_tok * sizeof(float);
+    if (need > r->row_max_buf_n) {
+        if (r->d_row_max_buf) { cuMemFree(r->d_row_max_buf); r->d_row_max_buf = 0; }
+        if (cuMemAlloc(&r->d_row_max_buf, need) != CUDA_SUCCESS) {
+            r->d_row_max_buf = 0; r->row_max_buf_n = 0;
+            return -1;
+        }
+        r->row_max_buf_n = need;
+    }
+
+    /* One row_max launch shared across QKV. */
+    void *rargs[] = {&r->d_row_max_buf, &X, &n_tok, &n_in};
+    cuLaunchKernel(r->reduce_max_abs_per_row, (unsigned)n_tok, 1, 1,
+                   256, 1, 1, 0, r->stream, rargs, NULL);
+
+    /* Combined N-axis grid: 3*dim cols, 64 rows/CTA. Pad to mult of 4 for swizzle. */
+    unsigned gx = (unsigned)((3 * dim + 255) / 256);
+    unsigned gy = (unsigned)((n_tok + 63) / 64);
+    gx = (gx + 3u) & ~3u;
+    gy = (gy + 3u) & ~3u;
+    size_t smem_c3 = 2048 + 8192 * 2 + 512;  /* same layout as perrow_mt4 */
+    void *args[] = {&Yq, &Yk, &Yv, &Wq, &Wk, &Wv, &X,
+                    &bq, &bk, &bv, &dim, &n_in, &n_tok, &r->d_row_max_buf};
+    cuLaunchKernel(r->gemm_fp8_pipe_perrow_mt4_concat3, gx, gy, 1, 128, 1, 1,
+                   smem_c3, r->stream, args, NULL);
+    return 0;
 }
 
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
@@ -2007,8 +2633,22 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_fp8_pipe_perrow = NULL;
     if (cuModuleGetFunction(&r->gemm_fp8_pipe_perrow_mt4, module, "gemm_fp8_pipe_perrow_mt4_f32") != CUDA_SUCCESS)
         r->gemm_fp8_pipe_perrow_mt4 = NULL;
+    if (cuModuleGetFunction(&r->gemm_fp8_pipe_perrow_mt4_concat3, module, "gemm_fp8_pipe_perrow_mt4_concat3_f32") != CUDA_SUCCESS)
+        r->gemm_fp8_pipe_perrow_mt4_concat3 = NULL;
     if (cuModuleGetFunction(&r->reduce_max_abs_per_row, module, "reduce_max_abs_per_row_f32") != CUDA_SUCCESS)
         r->reduce_max_abs_per_row = NULL;
+    if (cuModuleGetFunction(&r->quant_f32_to_fp8_e4m3, module, "quant_f32_to_fp8_e4m3") != CUDA_SUCCESS)
+        r->quant_f32_to_fp8_e4m3 = NULL;
+    if (cuModuleGetFunction(&r->compute_x_scale_from_max, module, "compute_x_scale_from_max") != CUDA_SUCCESS)
+        r->compute_x_scale_from_max = NULL;
+    if (cuModuleGetFunction(&r->bf16_to_f32_add_bias, module, "bf16_to_f32_add_bias") != CUDA_SUCCESS)
+        r->bf16_to_f32_add_bias = NULL;
+    if (cuModuleGetFunction(&r->bf16_add_bias_gelu_f32, module, "bf16_add_bias_gelu_f32") != CUDA_SUCCESS)
+        r->bf16_add_bias_gelu_f32 = NULL;
+    if (cuModuleGetFunction(&r->bf16_add_bias_gelu_inplace_max, module, "bf16_add_bias_gelu_inplace_max") != CUDA_SUCCESS)
+        r->bf16_add_bias_gelu_inplace_max = NULL;
+    if (cuModuleGetFunction(&r->quant_bf16_to_fp8_e4m3, module, "quant_bf16_to_fp8_e4m3") != CUDA_SUCCESS)
+        r->quant_bf16_to_fp8_e4m3 = NULL;
     if (cuModuleGetFunction(&r->flash_attn_fp8, module, "flash_attn_fp8") != CUDA_SUCCESS)
         r->flash_attn_fp8 = NULL;
     if (cuModuleGetFunction(&r->flash_attn_bf16, module, "flash_attn_bf16") != CUDA_SUCCESS)
@@ -2102,14 +2742,15 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
                 fprintf(stderr, "cuda_qimg: FP8 MMA flash attention enabled (sm_%d)\n", sm);
         }
     }
-    /* BF16 flash attention: opt-in via QIMG_BF16_ATTN=1. Higher precedence than
-     * FP8 attention — matches ComfyUI's BF16 reference exactly so apple_compare
-     * mean_diff drops from ~5 to <2. Leave default OFF until validated, then
-     * flip default-on (QIMG_BF16_ATTN=0 to opt out). */
+    /* BF16 flash attention: default ON (sm_80+). Higher precedence than FP8
+     * attention — matches ComfyUI's BF16 reference exactly so apple_compare
+     * mean_diff drops from ~5 to <2. Validated 2026-05-03 at 512² (1.95 vs
+     * 2.50 s/step, ~22% faster than F32 attn). Set QIMG_BF16_ATTN=0 to opt out. */
     r->use_bf16_attn = 0;
     {
         const char *env = getenv("QIMG_BF16_ATTN");
-        if (env && env[0] == '1' && r->flash_attn_bf16 && r->cast_f32_to_bf16 && sm >= 80) {
+        int want = (env == NULL) ? 1 : (env[0] != '0');
+        if (want && r->flash_attn_bf16 && r->cast_f32_to_bf16 && sm >= 80) {
             r->use_bf16_attn = 1;
             if (verbose)
                 fprintf(stderr, "cuda_qimg: BF16 MMA flash attention enabled (sm_%d)\n", sm);
@@ -2127,16 +2768,71 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
                 fprintf(stderr, "cuda_qimg: BF16 MMA pipelined GEMM enabled (sm_%d)\n", sm);
         }
     }
-    /* Per-row FP8 MMA pipe: opt-in via QIMG_FP8_PIPE_PERROW=1.
-     * Eliminates per-tensor outlier crush by using one X scale per row. */
+    /* Per-row FP8 MMA pipe: default ON (sm_80+). Eliminates per-tensor outlier
+     * crush by using one X scale per row, and the cp.async + ldmatrix +
+     * panel-swizzle pipeline beats the non-perrow path. Set
+     * QIMG_FP8_PIPE_PERROW=0 to opt out. */
     r->use_fp8_pipe_perrow = 0;
     {
         const char *env = getenv("QIMG_FP8_PIPE_PERROW");
-        if (env && env[0] == '1' && r->gemm_fp8_pipe_perrow && r->reduce_max_abs_per_row && sm >= 80) {
+        int want = (env == NULL) ? 1 : (env[0] != '0');
+        if (want && r->gemm_fp8_pipe_perrow && r->reduce_max_abs_per_row && sm >= 80) {
             r->use_fp8_pipe_perrow = 1;
             if (verbose)
                 fprintf(stderr, "cuda_qimg: FP8 MMA per-row pipelined GEMM enabled (sm_%d)\n", sm);
         }
+    }
+
+    /* cuBLAS-LT FP8 path: highest priority when available. Reaches
+     * 60-145 TFLOP/s on qimg shapes (RTX 5060 Ti) vs ~4-15 TFLOP/s for
+     * the perrow kernel. Set QIMG_CUBLASLT_FP8=0 to opt out. */
+    r->use_cublaslt_fp8 = 0;
+    r->cublaslt_ctx = NULL;
+    r->d_x_fp8_scratch = 0; r->x_fp8_scratch_n = 0;
+    r->d_y_bf16_scratch = 0; r->y_bf16_scratch_n = 0;
+    r->d_x_scale_f32 = 0; r->d_w_scale_one = 0;
+    {
+        const char *env = getenv("QIMG_CUBLASLT_FP8");
+        int want = (env == NULL) ? 1 : (env[0] != '0');
+        if (want && r->quant_f32_to_fp8_e4m3 && r->compute_x_scale_from_max &&
+            r->bf16_to_f32_add_bias && r->reduce_max_abs && sm >= 89) {
+            if (cublasewCreate(&r->cublaslt_ctx, r->stream) == 0 &&
+                cublasew_lt_available(r->cublaslt_ctx) == 0) {
+                if (cuMemAlloc(&r->d_x_scale_f32, sizeof(float)) == CUDA_SUCCESS &&
+                    cuMemAlloc(&r->d_w_scale_one, sizeof(float)) == CUDA_SUCCESS) {
+                    float one = 1.0f;
+                    cuMemcpyHtoD(r->d_w_scale_one, &one, sizeof(float));
+                    r->use_cublaslt_fp8 = 1;
+                    if (verbose)
+                        fprintf(stderr, "cuda_qimg: cuBLAS-LT FP8 e4m3 GEMM enabled (sm_%d)\n", sm);
+                } else {
+                    if (r->cublaslt_ctx) { cublasewDestroy(r->cublaslt_ctx); r->cublaslt_ctx = NULL; }
+                }
+            } else if (r->cublaslt_ctx) {
+                cublasewDestroy(r->cublaslt_ctx);
+                r->cublaslt_ctx = NULL;
+            }
+        }
+    }
+    /* Fused FP8 MLP with BF16 hidden state — default ON when LT-FP8 is active.
+     * Skips materializing the F32 hidden tensor (~192 MB at 512², 4×bigger at
+     * 1024²). Slight precision drift (~1% max, ~10% mean) from extra BF16
+     * round-trip; bit-stable across runs. Set QIMG_MLP_BF16_HIDDEN=0 to opt out. */
+    {
+        const char *env = getenv("QIMG_MLP_BF16_HIDDEN");
+        int want = (env == NULL || env[0] != '0');
+        r->mlp_bf16_hidden = (want && r->use_cublaslt_fp8 &&
+                              r->bf16_add_bias_gelu_inplace_max &&
+                              r->quant_bf16_to_fp8_e4m3) ? 1 : 0;
+        if (r->mlp_bf16_hidden && verbose)
+            fprintf(stderr, "cuda_qimg: fused FP8 MLP with BF16 hidden enabled\n");
+    }
+    /* Per-stage block profiling */
+    {
+        const char *env = getenv("QIMG_PROFILE_BLOCK");
+        r->profile_block = (env && env[0] != '0') ? 1 : 0;
+        if (r->profile_block && verbose)
+            fprintf(stderr, "cuda_qimg: per-stage block profiling enabled (host-sync)\n");
     }
     GET(layernorm_f32, "layernorm_f32");
     GET(gelu_f32, "gelu_f32");
@@ -2237,6 +2933,27 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
     if (!st) return -1;
     r->dit_st = st;
 
+    /* Pin the safetensors mmap region so cuMemcpyHtoDAsync can use the full
+     * PCIe bandwidth and overlap with compute. Without this, the driver stages
+     * pageable mmap pages through internal pinned bounce buffers serially and
+     * QIMG_PIPELINE provides no benefit. Set QIMG_NO_PIN=1 to opt out. */
+    if (!getenv("QIMG_NO_PIN") && cuMemHostRegister) {
+        /* Try READ_ONLY first (lighter; CUDA 11.1+); fall back to default. */
+        CUresult rr = cuMemHostRegister(st->map_base, st->map_size,
+                                        CU_MEMHOSTREGISTER_READ_ONLY);
+        if (rr != CUDA_SUCCESS) {
+            rr = cuMemHostRegister(st->map_base, st->map_size, 0);
+        }
+        if (rr == CUDA_SUCCESS) {
+            r->dit_st_pinned = 1;
+            fprintf(stderr, "cuda_qimg: pinned %.2f GB DiT mmap region for fast H2D\n",
+                    (double)st->map_size / (1ull << 30));
+        } else {
+            fprintf(stderr, "cuda_qimg: cuMemHostRegister failed (%d) — DiT H2D will be slow\n",
+                    (int)rr);
+        }
+    }
+
 
     r->dit_dim = 3072; r->dit_n_heads = 24; r->dit_head_dim = 128;
     r->dit_in_ch = 64; r->dit_txt_dim = 3584; r->dit_mlp_h = 12288;
@@ -2317,6 +3034,42 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
                 (float)free_mem / (1<<30));
     }
 
+    /* Pre-stage streamed blocks into pinned host memory so cuMemcpyHtoDAsync
+     * actually overlaps with compute and runs at full PCIe bandwidth (~13 GB/s
+     * vs ~4 GB/s for pageable mmap). One pool of cuMemAllocHost per streamed
+     * block; ~324 MB each, so 16 streamed blocks ≈ 5 GB pinned RAM. Skip with
+     * QIMG_NO_BOUNCE=1. Falls back gracefully if pinned alloc fails. */
+    if (r->n_preloaded < r->dit_n_blocks && !getenv("QIMG_NO_BOUNCE") &&
+        !r->dit_st_pinned) {
+        r->dit_pinned_n_tensors = st->n_tensors;
+        r->dit_pinned_data = (void **)calloc((size_t)st->n_tensors, sizeof(void *));
+        r->dit_pinned_pools = (void **)calloc((size_t)r->dit_n_blocks, sizeof(void *));
+        if (r->dit_pinned_data && r->dit_pinned_pools) {
+            int staged = 0;
+            size_t pinned_bytes = 0;
+            for (int b = r->n_preloaded; b < r->dit_n_blocks; b++) {
+                if (qimg_stage_block_pinned(r, b) != 0) {
+                    fprintf(stderr, "cuda_qimg: pinned bounce alloc failed at "
+                                    "block %d (staged %d, %.1f GB pinned) — "
+                                    "remaining blocks fall back to mmap\n",
+                            b, staged, (float)pinned_bytes / (1<<30));
+                    break;
+                }
+                staged++;
+                /* Track pool bytes for log only; we don't store the size. */
+                pinned_bytes += 324ull * 1024 * 1024;  /* approximate */
+            }
+            if (staged > 0)
+                fprintf(stderr, "cuda_qimg: pre-staged %d streamed blocks in "
+                        "pinned host memory (~%.1f GB) for fast H2D\n",
+                        staged, (float)pinned_bytes / (1<<30));
+        } else {
+            free(r->dit_pinned_data); r->dit_pinned_data = NULL;
+            free(r->dit_pinned_pools); r->dit_pinned_pools = NULL;
+            r->dit_pinned_n_tensors = 0;
+        }
+    }
+
     /* Allocate the on-demand scratch slot(s) once if we didn't preload every
      * block. Uses ~324 MB per slot on top of the preloaded weights but
      * eliminates the 30 cuMemAlloc/cuMemFree per on-demand load. A second
@@ -2391,13 +3144,35 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->d_v_fp8)      cuMemFree(r->d_v_fp8);
     if (r->d_qkv_scales) cuMemFree(r->d_qkv_scales);
     if (r->d_qkv_max)    cuMemFree(r->d_qkv_max);
+    /* cuBLAS-LT FP8 workspace */
+    if (r->d_x_fp8_scratch) cuMemFree(r->d_x_fp8_scratch);
+    if (r->d_y_bf16_scratch) cuMemFree(r->d_y_bf16_scratch);
+    if (r->d_x_scale_f32) cuMemFree(r->d_x_scale_f32);
+    if (r->d_w_scale_one) cuMemFree(r->d_w_scale_one);
+    if (r->cublaslt_ctx) cublasewDestroy(r->cublaslt_ctx);
     /* BF16 attention workspace */
     if (r->d_q_bf16) cuMemFree(r->d_q_bf16);
     if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
     if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
     /* Per-row FP8 MMA scale buffer */
     if (r->d_row_max_buf) cuMemFree(r->d_row_max_buf);
-    if (r->dit_st) safetensors_close((st_context *)r->dit_st);
+    if (r->dit_pinned_pools) {
+        for (int b = 0; b < r->dit_n_blocks; b++) {
+            if (r->dit_pinned_pools[b]) cuMemFreeHost(r->dit_pinned_pools[b]);
+        }
+        free(r->dit_pinned_pools); r->dit_pinned_pools = NULL;
+    }
+    if (r->dit_pinned_data) {
+        free(r->dit_pinned_data); r->dit_pinned_data = NULL;
+    }
+    r->dit_pinned_n_tensors = 0;
+    if (r->dit_st) {
+        if (r->dit_st_pinned && cuMemHostUnregister) {
+            cuMemHostUnregister(((st_context *)r->dit_st)->map_base);
+            r->dit_st_pinned = 0;
+        }
+        safetensors_close((st_context *)r->dit_st);
+    }
     if (r->vae_st) safetensors_close((st_context *)r->vae_st);
     if (r->stream) cuStreamDestroy(r->stream);
     if (r->ctx) cuDevicePrimaryCtxRelease(r->device);
@@ -2462,6 +3237,13 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUdeviceptr txt_sc2 = d_txt_mod + (size_t)4 * dim * sizeof(float);
     CUdeviceptr txt_g2  = d_txt_mod + (size_t)5 * dim * sizeof(float);
 
+    /* Profiling brackets — host-side sync, only active when profile_block=1.
+     * Adds significant overhead, so opt-in via env QIMG_PROFILE_BLOCK=1. */
+    double _prof_t0 = 0.0;
+    #define PROF_BEGIN() do { if (r->profile_block) { cuStreamSynchronize(s); _prof_t0 = (double)clock()/CLOCKS_PER_SEC; } } while (0)
+    #define PROF_END(bucket) do { if (r->profile_block) { cuStreamSynchronize(s); r->bucket += ((double)clock()/CLOCKS_PER_SEC - _prof_t0) * 1000.0; } } while (0)
+
+    PROF_BEGIN();
     /* adaLN image → d_scratch1 */
     op_adaln(r, d_scratch1, d_img, img_sh1, img_sc1, n_img, dim);
     /* adaLN text → d_scratch2 */
@@ -2471,18 +3253,31 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     CUdeviceptr d_img_q = d_q + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_img_k = d_k + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_img_v = d_v + (size_t)n_txt * dim * sizeof(float);
-    op_gemm(r, d_img_q, blk->attn_q_w, d_scratch1, blk->attn_q_b, dim, dim, n_img);
-    op_gemm(r, d_img_k, blk->attn_k_w, d_scratch1, blk->attn_k_b, dim, dim, n_img);
-    op_gemm(r, d_img_v, blk->attn_v_w, d_scratch1, blk->attn_v_b, dim, dim, n_img);
+    if (op_gemm_qkv_fused(r, d_img_q, d_img_k, d_img_v,
+                          blk->attn_q_w, blk->attn_k_w, blk->attn_v_w, d_scratch1,
+                          blk->attn_q_b, blk->attn_k_b, blk->attn_v_b,
+                          dim, dim, n_img) != 0) {
+        op_gemm(r, d_img_q, blk->attn_q_w, d_scratch1, blk->attn_q_b, dim, dim, n_img);
+        op_gemm(r, d_img_k, blk->attn_k_w, d_scratch1, blk->attn_k_b, dim, dim, n_img);
+        op_gemm(r, d_img_v, blk->attn_v_w, d_scratch1, blk->attn_v_b, dim, dim, n_img);
+    }
 
     /* Text QKV → offset at [0:n_txt] */
     CUdeviceptr d_txt_q = d_q;
     CUdeviceptr d_txt_k = d_k;
     CUdeviceptr d_txt_v = d_v;
-    op_gemm(r, d_txt_q, blk->attn_add_q_w, d_scratch2, blk->attn_add_q_b, dim, dim, n_txt);
-    op_gemm(r, d_txt_k, blk->attn_add_k_w, d_scratch2, blk->attn_add_k_b, dim, dim, n_txt);
-    op_gemm(r, d_txt_v, blk->attn_add_v_w, d_scratch2, blk->attn_add_v_b, dim, dim, n_txt);
+    if (op_gemm_qkv_fused(r, d_txt_q, d_txt_k, d_txt_v,
+                          blk->attn_add_q_w, blk->attn_add_k_w, blk->attn_add_v_w, d_scratch2,
+                          blk->attn_add_q_b, blk->attn_add_k_b, blk->attn_add_v_b,
+                          dim, dim, n_txt) != 0) {
+        op_gemm(r, d_txt_q, blk->attn_add_q_w, d_scratch2, blk->attn_add_q_b, dim, dim, n_txt);
+        op_gemm(r, d_txt_k, blk->attn_add_k_w, d_scratch2, blk->attn_add_k_b, dim, dim, n_txt);
+        op_gemm(r, d_txt_v, blk->attn_add_v_w, d_scratch2, blk->attn_add_v_b, dim, dim, n_txt);
+    }
 
+    PROF_END(prof_qkv_ms);
+
+    PROF_BEGIN();
     /* QK RMSNorm (per-head) */
     op_rmsnorm_ph(r, d_img_q, blk->norm_q_w, n_img, nh, hd);
     op_rmsnorm_ph(r, d_img_k, blk->norm_k_w, n_img, nh, hd);
@@ -2504,9 +3299,14 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
                        (unsigned)nh, 1, 1, 0, s, rope1d_args, NULL);
     }
 
+    PROF_END(prof_qknorm_ms);
+
+    PROF_BEGIN();
     /* Joint attention: Q/K/V concatenated as [txt, img] */
     op_attn(r, d_attn_out, d_q, d_k, d_v, n_total, nh, hd);
+    PROF_END(prof_attn_ms);
 
+    PROF_BEGIN();
     /* Output projections */
     CUdeviceptr d_img_attn = d_attn_out + (size_t)n_txt * dim * sizeof(float);
     CUdeviceptr d_txt_attn = d_attn_out;
@@ -2516,7 +3316,9 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     /* Gated residual */
     op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
     op_gated_add(r, d_txt, d_scratch2, txt_g1, n_txt, dim);
+    PROF_END(prof_attnout_ms);
 
+    PROF_BEGIN();
     /* Image MLP. When `img_mlp_in_external` is set, run adaLN2 into that
      * external buffer and skip the MLP + gated_add — the caller will do a
      * CFG-batched MLP across cond+uncond before running its own gated_add. */
@@ -2524,23 +3326,39 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
         op_adaln(r, img_mlp_in_external, d_img, img_sh2, img_sc2, n_img, dim);
     } else {
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
-        op_gemm(r, d_scratch3, blk->img_mlp_fc1_w, d_scratch1, blk->img_mlp_fc1_b,
-                mlp_h, dim, n_img);
-        op_gelu(r, d_scratch3, n_img * mlp_h);
+        /* Try fused FP8 MLP (BF16 hidden, no F32 intermediate). adaLN output is in
+         * d_scratch1, so write fused MLP into d_scratch3 first, then move (or
+         * use d_scratch3 as the output and pass it to gated_add). */
+        if (op_mlp_fp8(r, d_scratch3, d_scratch1,
+                       blk->img_mlp_fc1_w, blk->img_mlp_fc1_b,
+                       blk->img_mlp_fc2_w, blk->img_mlp_fc2_b,
+                       dim, mlp_h, n_img) == 0) {
+            /* fused path: result already in d_scratch3 — alias for gated_add */
+            op_gated_add(r, d_img, d_scratch3, img_g2, n_img, dim);
+            goto img_mlp_done;
+        }
+        op_gemm_gelu(r, d_scratch3, blk->img_mlp_fc1_w, d_scratch1, blk->img_mlp_fc1_b,
+                     mlp_h, dim, n_img);
         op_gemm(r, d_scratch1, blk->img_mlp_fc2_w, d_scratch3, blk->img_mlp_fc2_b,
                 dim, mlp_h, n_img);
         op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
     }
+    img_mlp_done:;
+    PROF_END(prof_imgmlp_ms);
 
+    PROF_BEGIN();
     /* Text MLP */
     op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
-    op_gemm(r, d_scratch3, blk->txt_mlp_fc1_w, d_scratch2, blk->txt_mlp_fc1_b,
-            mlp_h, dim, n_txt);
-    op_gelu(r, d_scratch3, n_txt * mlp_h);
+    op_gemm_gelu(r, d_scratch3, blk->txt_mlp_fc1_w, d_scratch2, blk->txt_mlp_fc1_b,
+                 mlp_h, dim, n_txt);
     op_gemm(r, d_scratch2, blk->txt_mlp_fc2_w, d_scratch3, blk->txt_mlp_fc2_b,
             dim, mlp_h, n_txt);
     op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
     /* gated_add writes BF16-rounded output — no trailing op_bf16_trunc needed. */
+    PROF_END(prof_txtmlp_ms);
+    if (r->profile_block) r->prof_block_count++;
+    #undef PROF_BEGIN
+    #undef PROF_END
 
     (void)L;  /* unused in refactored body — verbose dumps moved to caller */
     return 0;
@@ -2881,6 +3699,31 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     cuMemFree(d_q); cuMemFree(d_k); cuMemFree(d_v); cuMemFree(d_attn_out);
     cuMemFree(d_t_silu); cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
 
+    if (r->profile_block && r->prof_block_count > 0) {
+        double n = (double)r->prof_block_count;
+        double tot = r->prof_qkv_ms + r->prof_qknorm_ms + r->prof_attn_ms
+                   + r->prof_attnout_ms + r->prof_imgmlp_ms + r->prof_txtmlp_ms;
+        fprintf(stderr,
+            "cuda_qimg: per-block profile (%d block-passes, ms/block)\n"
+            "  adaLN1+QKV    : %7.3f  (%5.1f%%)\n"
+            "  QK-norm+RoPE  : %7.3f  (%5.1f%%)\n"
+            "  attention     : %7.3f  (%5.1f%%)\n"
+            "  attn-out+gate : %7.3f  (%5.1f%%)\n"
+            "  img-MLP       : %7.3f  (%5.1f%%)\n"
+            "  txt-MLP       : %7.3f  (%5.1f%%)\n"
+            "  total/block   : %7.3f  (%5.3f s sum across blocks, includes sync overhead)\n",
+            r->prof_block_count,
+            r->prof_qkv_ms/n,    100.0 * r->prof_qkv_ms    / (tot > 0 ? tot : 1),
+            r->prof_qknorm_ms/n, 100.0 * r->prof_qknorm_ms / (tot > 0 ? tot : 1),
+            r->prof_attn_ms/n,   100.0 * r->prof_attn_ms   / (tot > 0 ? tot : 1),
+            r->prof_attnout_ms/n,100.0 * r->prof_attnout_ms/ (tot > 0 ? tot : 1),
+            r->prof_imgmlp_ms/n, 100.0 * r->prof_imgmlp_ms / (tot > 0 ? tot : 1),
+            r->prof_txtmlp_ms/n, 100.0 * r->prof_txtmlp_ms / (tot > 0 ? tot : 1),
+            tot/n, tot/1000.0);
+        r->prof_qkv_ms = r->prof_qknorm_ms = r->prof_attn_ms = 0;
+        r->prof_attnout_ms = r->prof_imgmlp_ms = r->prof_txtmlp_ms = 0;
+        r->prof_block_count = 0;
+    }
     return 0;
 }
 
@@ -3193,9 +4036,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         /* --- CFG-batched img MLP. W is loaded once for both cond and uncond. --- */
         {
             int two_n_img = 2 * n_img;
-            op_gemm(r, d_img_mlp_h, blk.img_mlp_fc1_w, d_img_mlp_in, blk.img_mlp_fc1_b,
-                    mlp_h, dim, two_n_img);
-            op_gelu(r, d_img_mlp_h, two_n_img * mlp_h);
+            op_gemm_gelu(r, d_img_mlp_h, blk.img_mlp_fc1_w, d_img_mlp_in, blk.img_mlp_fc1_b,
+                         mlp_h, dim, two_n_img);
             op_gemm(r, d_img_mlp_out, blk.img_mlp_fc2_w, d_img_mlp_h, blk.img_mlp_fc2_b,
                     dim, mlp_h, two_n_img);
             CUdeviceptr img_g2 = d_img_mod + (size_t)5 * dim * sizeof(float);
@@ -3264,6 +4106,32 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     cuMemFree(d_q_u); cuMemFree(d_k_u); cuMemFree(d_v_u); cuMemFree(d_attn_out_u);
     cuMemFree(d_img_mlp_in); cuMemFree(d_img_mlp_h); cuMemFree(d_img_mlp_out);
     cuMemFree(d_t_silu); cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
+
+    if (r->profile_block && r->prof_block_count > 0) {
+        double n = (double)r->prof_block_count;
+        double tot = r->prof_qkv_ms + r->prof_qknorm_ms + r->prof_attn_ms
+                   + r->prof_attnout_ms + r->prof_imgmlp_ms + r->prof_txtmlp_ms;
+        fprintf(stderr,
+            "cuda_qimg(cfg): per-block profile (%d block-passes, ms/block)\n"
+            "  adaLN1+QKV    : %7.3f  (%5.1f%%)\n"
+            "  QK-norm+RoPE  : %7.3f  (%5.1f%%)\n"
+            "  attention     : %7.3f  (%5.1f%%)\n"
+            "  attn-out+gate : %7.3f  (%5.1f%%)\n"
+            "  img-MLP       : %7.3f  (%5.1f%%)\n"
+            "  txt-MLP       : %7.3f  (%5.1f%%)\n"
+            "  total/block   : %7.3f  (%5.3f s sum across blocks, includes sync overhead)\n",
+            r->prof_block_count,
+            r->prof_qkv_ms/n,    100.0 * r->prof_qkv_ms    / (tot > 0 ? tot : 1),
+            r->prof_qknorm_ms/n, 100.0 * r->prof_qknorm_ms / (tot > 0 ? tot : 1),
+            r->prof_attn_ms/n,   100.0 * r->prof_attn_ms   / (tot > 0 ? tot : 1),
+            r->prof_attnout_ms/n,100.0 * r->prof_attnout_ms/ (tot > 0 ? tot : 1),
+            r->prof_imgmlp_ms/n, 100.0 * r->prof_imgmlp_ms / (tot > 0 ? tot : 1),
+            r->prof_txtmlp_ms/n, 100.0 * r->prof_txtmlp_ms / (tot > 0 ? tot : 1),
+            tot/n, tot/1000.0);
+        r->prof_qkv_ms = r->prof_qknorm_ms = r->prof_attn_ms = 0;
+        r->prof_attnout_ms = r->prof_imgmlp_ms = r->prof_txtmlp_ms = 0;
+        r->prof_block_count = 0;
+    }
     return 0;
 }
 
