@@ -80,19 +80,46 @@ struct hip_qimg_runner {
     hipModule_t mod;
     hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_opt_fp8;
     hipFunction_t fn_gemm_fp8_wmma;  /* gfx12 BF16 act × FP8 wt matrix-core GEMM */
+    hipFunction_t fn_gemm_fp8_fp8_pgr2;  /* gfx12 FP8 act × FP8 wt WMMA, per-row act scale */
+    hipFunction_t fn_quantize_act_perrow;  /* F32 -> FP8 with per-row max-abs scale */
     hipFunction_t fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
-    hipFunction_t fn_rmsnorm_ph, fn_flash_attn;
+    hipFunction_t fn_rmsnorm_ph, fn_flash_attn, fn_flash_attn_wmma;
+    int use_attn_wmma; /* 1 = use BF16 WMMA flash attention (gfx12, head_dim=128) */
+    hipFunction_t fn_qkv_perhead_maxabs, fn_q_quant_fp8, fn_kv_quant_repack_fp8, fn_flash_attn_fp8;
+    hipFunction_t fn_q_quant_perrow, fn_k_quant_repack_perrow, fn_flash_attn_fp8_perrow;
+    int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
     hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip;
     /* VAE kernels */
     hipFunction_t fn_vae_conv2d, fn_vae_rmsnorm, fn_vae_silu, fn_vae_up2x;
+    hipFunction_t fn_vae_conv2d_3x3_wmma, fn_vae_conv2d_1x1_wmma;
+    hipFunction_t fn_vae_self_attn;
+    hipFunction_t fn_vae_self_attn_qb;
+    int use_vae_wmma; /* 1 = use BF16 WMMA conv2d when shapes align */
 
     /* DiT config */
     int dim, n_heads, head_dim, n_blocks;
     int in_ch, txt_dim, mlp_h;
     int use_fp8;  /* 1 = upload FP8 raw + use LUT GEMM (4x less VRAM) */
     int use_wmma; /* 1 = use BF16 WMMA matrix cores for FP8 GEMMs (gfx12 only) */
+    int use_fp8_fp8w; /* 1 = use FP8xFP8 WMMA + per-row act quant when n_tok % 128 == 0 (gfx12) */
+    int prefer_bf16_wmma; /* 1 = QIMG_FP8_WMMA_BF16=1 forces BF16xFP8 even when FP8xFP8 would qualify */
+
+    /* Persistent scratch for FP8xFP8 path. Sized lazily by op_gemm_fp8 to fit
+     * (M_pad * max_n_in) bytes for d_act_fp8 and (M_pad * 4) for d_act_scales. */
+    void *d_act_fp8;
+    float *d_act_scales;
+    size_t act_fp8_bytes;
+    size_t act_scales_bytes;
+
+    /* Persistent scratch for FP8 flash-attention. Three QKV FP8 buffers sized
+     * to fit (max_n_tok × max_dim) bytes plus three per-head scale vectors. */
+    void *d_fa_qfp8, *d_fa_kfp8, *d_fa_vfp8;
+    float *d_fa_qs, *d_fa_ks, *d_fa_vs;
+    size_t fa_qkv_bytes;
+    size_t fa_scales_bytes;       /* size of d_fa_vs (per-head, small) */
+    size_t fa_perrow_bytes;       /* size of d_fa_qs and d_fa_ks (per-row [n_heads,n_tok]) */
 
     /* Safetensors context (mmap'd) */
     void *dit_st;
@@ -340,14 +367,69 @@ static void op_gemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           0, NULL, args, NULL);
 }
 
+/* Lazily (re)allocate the FP8 activation scratch + per-row scales to fit
+ * (M_pad × n_in) bytes / (M_pad × 4) bytes. Grows but never shrinks. */
+static int qimg_ensure_act_scratch(hip_qimg_runner *r, size_t M_pad, size_t K) {
+    size_t need_fp8 = M_pad * K;
+    size_t need_sc = M_pad * sizeof(float);
+    if (need_fp8 > r->act_fp8_bytes) {
+        if (r->d_act_fp8) hipFree(r->d_act_fp8);
+        if (hipMalloc(&r->d_act_fp8, need_fp8) != hipSuccess) {
+            fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for FP8 act scratch\n",
+                    (float)need_fp8 / (1 << 20));
+            r->d_act_fp8 = NULL; r->act_fp8_bytes = 0;
+            return -1;
+        }
+        r->act_fp8_bytes = need_fp8;
+    }
+    if (need_sc > r->act_scales_bytes) {
+        if (r->d_act_scales) hipFree(r->d_act_scales);
+        if (hipMalloc((void **)&r->d_act_scales, need_sc) != hipSuccess) {
+            fprintf(stderr, "hip_qimg: hipMalloc FAILED for FP8 act scales\n");
+            r->d_act_scales = NULL; r->act_scales_bytes = 0;
+            return -1;
+        }
+        r->act_scales_bytes = need_sc;
+    }
+    return 0;
+}
+
 /* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT.
  * Dispatch order:
- *   1. BF16 WMMA matrix-core (gfx12, n_tok ≥ 16) — fastest, when QIMG_FP8_WMMA=1
- *   2. 128×128 tiled scalar LUT (n_tok ≥ 16) — default fast path
- *   3. 16×16 scalar LUT — fallback for small token batches
+ *   1. FP8×FP8 WMMA + per-row act quant (gfx12, n_tok % 128 == 0,
+ *      n_out % 128 == 0, K % 32 == 0) — when QIMG_FP8_FP8_WMMA=1 and
+ *      QIMG_FP8_WMMA_BF16 not set. Fastest path, ports the rdna4/fp8
+ *      pipe32_pgr2 ~218 TF/s kernel.
+ *   2. BF16 WMMA matrix-core (gfx12, n_tok ≥ 16) — when QIMG_FP8_WMMA=1
+ *   3. 128×128 tiled scalar LUT (n_tok ≥ 16) — default fast path
+ *   4. 16×16 scalar LUT — fallback for small token batches
  */
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                         int n_out, int n_in, int n_tok) {
+    if (r->use_fp8_fp8w && !r->prefer_bf16_wmma && r->fn_gemm_fp8_fp8_pgr2 &&
+        r->fn_quantize_act_perrow && n_tok > 0 &&
+        (n_tok % 128) == 0 && (n_out % 128) == 0 && (n_in % 32) == 0) {
+        int M_pad = n_tok;  /* already 128-aligned per gate */
+        if (qimg_ensure_act_scratch(r, (size_t)M_pad, (size_t)n_in) == 0) {
+            void *d_x_fp8 = r->d_act_fp8;
+            float *d_scales = r->d_act_scales;
+            /* Quantize: F32 X[n_tok, n_in] -> FP8 + per-row scale. */
+            int K = n_in;
+            void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad};
+            hipModuleLaunchKernel(r->fn_quantize_act_perrow,
+                                  (unsigned)M_pad, 1, 1, 256, 1, 1,
+                                  0, NULL, qa, NULL);
+            /* GEMM: FP8 act × FP8 wt -> F32, scaled writeback. */
+            void *ga[] = {&Y, &W, &d_x_fp8, &bias, &d_scales,
+                          &n_out, &n_in, &n_tok, &M_pad};
+            unsigned gx = (unsigned)(n_out / 128);
+            unsigned gy = (unsigned)(M_pad / 128);
+            hipModuleLaunchKernel(r->fn_gemm_fp8_fp8_pgr2, gx, gy, 1, 128, 1, 1,
+                                  0, NULL, ga, NULL);
+            return;
+        }
+        /* Alloc failure: fall through to BF16xFP8 / scalar paths. */
+    }
     if (r->use_wmma && r->fn_gemm_fp8_wmma && n_tok >= 16) {
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
         unsigned gx = (unsigned)((n_out + 127) / 128);
@@ -388,7 +470,10 @@ static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
 /* Weight GEMM + BF16 truncation */
 static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           int n_out, int n_in, int n_tok) {
-    if (r->use_fp8 && (r->fn_gemm_opt_fp8 || (r->use_wmma && r->fn_gemm_fp8_wmma)) && n_tok >= 16) {
+    int fp8_fp8_eligible = (r->use_fp8_fp8w && !r->prefer_bf16_wmma && r->fn_gemm_fp8_fp8_pgr2 &&
+                             r->fn_quantize_act_perrow &&
+                             (n_tok % 128) == 0 && (n_out % 128) == 0 && (n_in % 32) == 0);
+    if (r->use_fp8 && (r->fn_gemm_opt_fp8 || (r->use_wmma && r->fn_gemm_fp8_wmma) || fp8_fp8_eligible) && n_tok >= 16) {
         /* Optimized FP8 paths produce already-effectively-BF16 outputs:
          *  - gemm_opt_fp8 has fused BF16 trunc on writeback
          *  - WMMA path computes BF16×BF16 with F32 accum; downstream code is
@@ -461,6 +546,143 @@ static void op_gated_add(hip_qimg_runner *r, void *x, void *proj,
 static void op_attn(hip_qimg_runner *r, void *d_out, void *d_q,
                     void *d_k, void *d_v,
                     int n_tok, int n_heads, int head_dim) {
+    if (r->use_attn_fp8 && head_dim == 128 && r->fn_flash_attn_fp8_perrow
+        && getenv("QIMG_FP8_ATTN_PERROW")) {
+        size_t qkv_bytes = (size_t)n_tok * n_heads * head_dim;
+        size_t perrow_bytes = (size_t)n_heads * n_tok * sizeof(float);
+        size_t vscales_bytes = (size_t)n_heads * sizeof(float);
+        if (qkv_bytes > r->fa_qkv_bytes) {
+            if (r->d_fa_qfp8) hipFree(r->d_fa_qfp8);
+            if (r->d_fa_kfp8) hipFree(r->d_fa_kfp8);
+            if (r->d_fa_vfp8) hipFree(r->d_fa_vfp8);
+            hipMalloc(&r->d_fa_qfp8, qkv_bytes);
+            hipMalloc(&r->d_fa_kfp8, qkv_bytes);
+            hipMalloc(&r->d_fa_vfp8, qkv_bytes);
+            r->fa_qkv_bytes = qkv_bytes;
+        }
+        if (perrow_bytes > r->fa_perrow_bytes) {
+            if (r->d_fa_qs) hipFree(r->d_fa_qs);
+            if (r->d_fa_ks) hipFree(r->d_fa_ks);
+            hipMalloc((void **)&r->d_fa_qs, perrow_bytes);
+            hipMalloc((void **)&r->d_fa_ks, perrow_bytes);
+            r->fa_perrow_bytes = perrow_bytes;
+        }
+        if (vscales_bytes > r->fa_scales_bytes) {
+            if (r->d_fa_vs) hipFree(r->d_fa_vs);
+            hipMalloc((void **)&r->d_fa_vs, vscales_bytes);
+            r->fa_scales_bytes = vscales_bytes;
+        }
+        void *d_qfp8 = r->d_fa_qfp8, *d_kfp8 = r->d_fa_kfp8, *d_vfp8 = r->d_fa_vfp8;
+        void *d_qs = r->d_fa_qs, *d_ks = r->d_fa_ks, *d_vs = r->d_fa_vs;
+        /* Per-row Q quant: grid (n_tok, n_heads), block 64. */
+        {
+            int n_th = 64;
+            size_t smem = (size_t)n_th * sizeof(float);
+            void *aq[] = {&d_qfp8, &d_qs, &d_q, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_q_quant_perrow,
+                                  (unsigned)n_tok, (unsigned)n_heads, 1,
+                                  (unsigned)n_th, 1, 1, smem, NULL, aq, NULL);
+            void *ak[] = {&d_kfp8, &d_ks, &d_k, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_k_quant_repack_perrow,
+                                  (unsigned)n_tok, (unsigned)n_heads, 1,
+                                  (unsigned)n_th, 1, 1, smem, NULL, ak, NULL);
+        }
+        /* Per-head V max-abs (use 3-output kernel — outputs Q/K/V max but we ignore Q,K). */
+        {
+            int n_th = 256;
+            size_t smem = (size_t)3 * n_th * sizeof(float);
+            /* Reuse d_qs head[0..n_heads-1] is 'per-row'; need a separate small buffer
+             * for the 3-output kernel. Hack: allocate temporary on-the-fly is fine here
+             * since this is a tiny per-step alloc. */
+            void *tmp_q = NULL, *tmp_k = NULL;
+            hipMalloc(&tmp_q, (size_t)n_heads*sizeof(float));
+            hipMalloc(&tmp_k, (size_t)n_heads*sizeof(float));
+            void *args[] = {&tmp_q, &tmp_k, &d_vs, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_qkv_perhead_maxabs, (unsigned)n_heads, 1, 1,
+                                  (unsigned)n_th, 1, 1, smem, NULL, args, NULL);
+            /* Quantize V into FP8 (head-major) using per-head v_scale. */
+            void *av[] = {&d_vfp8, &d_v, &d_vs, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_kv_quant_repack_fp8, (unsigned)n_tok, (unsigned)n_heads, 1,
+                                  64, 1, 1, 0, NULL, av, NULL);
+            hipFree(tmp_q); hipFree(tmp_k);
+        }
+        {
+            float inv_sqrtd = 1.0f / sqrtf((float)head_dim);
+            unsigned gy = (unsigned)((n_tok + 63) / 64);
+            void *afa[] = {&d_out, &d_qfp8, &d_kfp8, &d_vfp8, &d_qs, &d_ks, &d_vs,
+                           &n_tok, &n_heads, &inv_sqrtd};
+            hipModuleLaunchKernel(r->fn_flash_attn_fp8_perrow,
+                                  (unsigned)n_heads, gy, 1, 128, 1, 1, 0, NULL, afa, NULL);
+        }
+        return;
+    }
+    /* Per-head FP8 FA path (default when QIMG_FP8_ATTN=1). Faster than per-row
+     * but lower-quality scale grain. Reuses the persistent FA scratch. */
+    if (r->use_attn_fp8 && head_dim == 128) {
+        size_t qkv_bytes = (size_t)n_tok * n_heads * head_dim;
+        size_t scales_bytes = (size_t)n_heads * sizeof(float);
+        if (qkv_bytes > r->fa_qkv_bytes) {
+            if (r->d_fa_qfp8) hipFree(r->d_fa_qfp8);
+            if (r->d_fa_kfp8) hipFree(r->d_fa_kfp8);
+            if (r->d_fa_vfp8) hipFree(r->d_fa_vfp8);
+            hipMalloc(&r->d_fa_qfp8, qkv_bytes);
+            hipMalloc(&r->d_fa_kfp8, qkv_bytes);
+            hipMalloc(&r->d_fa_vfp8, qkv_bytes);
+            r->fa_qkv_bytes = qkv_bytes;
+        }
+        if (scales_bytes > r->fa_scales_bytes) {
+            if (r->d_fa_vs) hipFree(r->d_fa_vs);
+            hipMalloc((void **)&r->d_fa_vs, scales_bytes);
+            r->fa_scales_bytes = scales_bytes;
+        }
+        /* Reuse d_fa_qs / d_fa_ks (sized for per-row at most n_heads*n_tok floats);
+         * for per-head we only touch first n_heads slots. Allocate small if missing. */
+        if (!r->d_fa_qs) hipMalloc((void **)&r->d_fa_qs, scales_bytes);
+        if (!r->d_fa_ks) hipMalloc((void **)&r->d_fa_ks, scales_bytes);
+        void *d_qfp8 = r->d_fa_qfp8, *d_kfp8 = r->d_fa_kfp8, *d_vfp8 = r->d_fa_vfp8;
+        void *d_qs = r->d_fa_qs, *d_ks = r->d_fa_ks, *d_vs = r->d_fa_vs;
+        {
+            int n_th = 256;
+            size_t smem = (size_t)3 * n_th * sizeof(float);
+            void *args[] = {&d_qs, &d_ks, &d_vs, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_qkv_perhead_maxabs, (unsigned)n_heads, 1, 1,
+                                  (unsigned)n_th, 1, 1, smem, NULL, args, NULL);
+        }
+        {
+            void *aq[] = {&d_qfp8, &d_q, &d_qs, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_q_quant_fp8, (unsigned)n_tok, (unsigned)n_heads, 1,
+                                  64, 1, 1, 0, NULL, aq, NULL);
+            void *ak[] = {&d_kfp8, &d_k, &d_ks, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_kv_quant_repack_fp8, (unsigned)n_tok, (unsigned)n_heads, 1,
+                                  64, 1, 1, 0, NULL, ak, NULL);
+            void *av[] = {&d_vfp8, &d_v, &d_vs, &n_tok, &n_heads, &head_dim};
+            hipModuleLaunchKernel(r->fn_kv_quant_repack_fp8, (unsigned)n_tok, (unsigned)n_heads, 1,
+                                  64, 1, 1, 0, NULL, av, NULL);
+        }
+        {
+            float h_qs_buf[64], h_ks_buf[64];
+            int n_q = n_heads;
+            hipMemcpy(h_qs_buf, d_qs, (size_t)n_q*sizeof(float), hipMemcpyDeviceToHost);
+            hipMemcpy(h_ks_buf, d_ks, (size_t)n_q*sizeof(float), hipMemcpyDeviceToHost);
+            for (int h = 0; h < n_q; h++) h_qs_buf[h] *= h_ks_buf[h];
+            hipMemcpy(d_qs, h_qs_buf, (size_t)n_q*sizeof(float), hipMemcpyHostToDevice);
+            float inv_sqrtd = 1.0f / sqrtf((float)head_dim);
+            unsigned gy = (unsigned)((n_tok + 63) / 64);
+            void *afa[] = {&d_out, &d_qfp8, &d_kfp8, &d_vfp8, &d_qs, &d_vs,
+                           &n_tok, &n_heads, &inv_sqrtd};
+            hipModuleLaunchKernel(r->fn_flash_attn_fp8,
+                                  (unsigned)n_heads, gy, 1, 128, 1, 1, 0, NULL, afa, NULL);
+        }
+        return;
+    }
+    if (r->use_attn_wmma && r->fn_flash_attn_wmma && head_dim == 128) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+        hipModuleLaunchKernel(r->fn_flash_attn_wmma,
+                              (unsigned)n_heads, gy, 1,
+                              128, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
     int fa2_warps = 4, fa2_bkv = 16;
     unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
     unsigned n_threads = (unsigned)(32 * fa2_warps);
@@ -483,6 +705,23 @@ static void op_rmsnorm_weighted(hip_qimg_runner *r, void *x, void *w, int N, int
 static void vae_op_conv2d(hip_qimg_runner *r, void *out, void *inp,
                           void *w, void *b,
                           int ci, int h, int w_s, int co, int kh, int kw, int rep_pad) {
+    int sp = h * w_s;
+    if (r->use_vae_wmma && (ci % 16) == 0 && (co % 16) == 0 && (sp % 16) == 0) {
+        unsigned gx = (unsigned)(co / 16);
+        unsigned gy = (unsigned)(sp / 16);
+        if (kh == 3 && kw == 3) {
+            void *args[] = {&out, &inp, &w, &b, &ci, &h, &w_s, &co, &rep_pad};
+            hipModuleLaunchKernel(r->fn_vae_conv2d_3x3_wmma, gx, gy, 1, 32, 1, 1,
+                                  0, NULL, args, NULL);
+            return;
+        }
+        if (kh == 1 && kw == 1) {
+            void *args[] = {&out, &inp, &w, &b, &ci, &h, &w_s, &co};
+            hipModuleLaunchKernel(r->fn_vae_conv2d_1x1_wmma, gx, gy, 1, 32, 1, 1,
+                                  0, NULL, args, NULL);
+            return;
+        }
+    }
     int total = co * h * w_s;
     void *args[] = {&out, &inp, &w, &b, &ci, &h, &w_s, &co, &kh, &kw, &rep_pad};
     hipModuleLaunchKernel(r->fn_vae_conv2d, (unsigned)((total+255)/256), 1, 1,
@@ -601,6 +840,10 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_gemm_opt_fp8, "gemm_opt_fp8");
     if (hipModuleGetFunction(&r->fn_gemm_fp8_wmma, mod, "gemm_fp8w_bf16a_wmma_t") != hipSuccess)
         r->fn_gemm_fp8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_gemm_fp8_fp8_pgr2, mod, "gemm_fp8_fp8w_perrow_pgr2") != hipSuccess)
+        r->fn_gemm_fp8_fp8_pgr2 = NULL;
+    if (hipModuleGetFunction(&r->fn_quantize_act_perrow, mod, "qimg_quantize_act_perrow_fp8") != hipSuccess)
+        r->fn_quantize_act_perrow = NULL;
     GET(fn_layernorm, "layernorm_f32");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
@@ -608,6 +851,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_gated_add, "gated_add_f32");
     GET(fn_rmsnorm_ph, "rmsnorm_per_head_f32");
     GET(fn_flash_attn, "flash_attn_f32");
+    if (hipModuleGetFunction(&r->fn_flash_attn_wmma, mod, "flash_attn_sa_wmma_f32") != hipSuccess)
+        r->fn_flash_attn_wmma = NULL;
     GET(fn_rope_2d, "rope_2d_f32");
     GET(fn_rope_1d, "rope_1d_f32");
     GET(fn_bf16_trunc, "truncate_bf16_f32");
@@ -618,6 +863,34 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_rmsnorm_weighted, "rmsnorm_weighted_f32");
     GET(fn_fp8_roundtrip, "quantize_fp8_roundtrip_f32");
     GET(fn_vae_conv2d, "vae_conv2d_f32");
+    if (hipModuleGetFunction(&r->fn_vae_conv2d_3x3_wmma, mod, "vae_conv2d_3x3_wmma_f32") != hipSuccess)
+        r->fn_vae_conv2d_3x3_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_vae_conv2d_1x1_wmma, mod, "vae_conv2d_1x1_wmma_f32") != hipSuccess)
+        r->fn_vae_conv2d_1x1_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_vae_self_attn, mod, "vae_self_attn_f32") != hipSuccess)
+        r->fn_vae_self_attn = NULL;
+    if (hipModuleGetFunction(&r->fn_vae_self_attn_qb, mod, "vae_self_attn_qb_f32") != hipSuccess)
+        r->fn_vae_self_attn_qb = NULL;
+    if (hipModuleGetFunction(&r->fn_qkv_perhead_maxabs, mod, "qimg_qkv_perhead_maxabs_f32") != hipSuccess)
+        r->fn_qkv_perhead_maxabs = NULL;
+    if (hipModuleGetFunction(&r->fn_q_quant_fp8, mod, "qimg_q_quant_fp8") != hipSuccess)
+        r->fn_q_quant_fp8 = NULL;
+    if (hipModuleGetFunction(&r->fn_kv_quant_repack_fp8, mod, "qimg_kv_quant_repack_fp8") != hipSuccess)
+        r->fn_kv_quant_repack_fp8 = NULL;
+    if (hipModuleGetFunction(&r->fn_flash_attn_fp8, mod, "qimg_flash_attn_fp8_4w") != hipSuccess)
+        r->fn_flash_attn_fp8 = NULL;
+    if (hipModuleGetFunction(&r->fn_q_quant_perrow, mod, "qimg_q_quant_fp8_perrow") != hipSuccess)
+        r->fn_q_quant_perrow = NULL;
+    if (hipModuleGetFunction(&r->fn_k_quant_repack_perrow, mod, "qimg_k_quant_repack_fp8_perrow") != hipSuccess)
+        r->fn_k_quant_repack_perrow = NULL;
+    if (hipModuleGetFunction(&r->fn_flash_attn_fp8_perrow, mod, "qimg_flash_attn_fp8_4w_perrow") != hipSuccess)
+        r->fn_flash_attn_fp8_perrow = NULL;
+    {
+        const char *e = getenv("QIMG_FP8_ATTN");
+        r->use_attn_fp8 = (e && atoi(e) && r->fn_flash_attn_fp8 && r->fn_qkv_perhead_maxabs
+                          && r->fn_q_quant_fp8 && r->fn_kv_quant_repack_fp8) ? 1 : 0;
+        if (r->use_attn_fp8) fprintf(stderr, "hip_qimg: FP8 WMMA flash-attention enabled\n");
+    }
     GET(fn_vae_rmsnorm, "vae_rmsnorm_f32");
     GET(fn_vae_silu, "vae_silu_f32");
     GET(fn_vae_up2x, "nn_upsample2x_f32");
@@ -652,6 +925,69 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
                 if (verbose)
                     fprintf(stderr, "hip_qimg: BF16xFP8 WMMA (gfx12 matrix cores) enabled\n");
             }
+        }
+    }
+
+    /* FP8xFP8 WMMA path (gfx12). Opt-in via QIMG_FP8_FP8_WMMA=1. Eligible when
+     * n_tok and n_out are both multiples of 128 (img-side GEMMs at 256+ res);
+     * falls back to BF16xFP8 WMMA otherwise. QIMG_FP8_WMMA_BF16=1 forces the
+     * BF16 path even when FP8xFP8 qualifies. */
+    r->use_fp8_fp8w = 0;
+    r->prefer_bf16_wmma = 0;
+    r->d_act_fp8 = NULL;
+    r->d_act_scales = NULL;
+    r->act_fp8_bytes = 0;
+    r->d_fa_qfp8 = r->d_fa_kfp8 = r->d_fa_vfp8 = NULL;
+    r->d_fa_qs = r->d_fa_ks = r->d_fa_vs = NULL;
+    r->fa_qkv_bytes = 0;
+    r->fa_scales_bytes = 0;
+    r->fa_perrow_bytes = 0;
+    r->act_scales_bytes = 0;
+    {
+        const char *v = getenv("QIMG_FP8_FP8_WMMA");
+        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+            if (!r->fn_gemm_fp8_fp8_pgr2 || !r->fn_quantize_act_perrow) {
+                fprintf(stderr, "hip_qimg: FP8xFP8 kernel not present (need gfx12); ignoring QIMG_FP8_FP8_WMMA\n");
+            } else if (!r->use_fp8) {
+                fprintf(stderr, "hip_qimg: QIMG_FP8_FP8_WMMA requires FP8 mode; ignoring\n");
+            } else {
+                r->use_fp8_fp8w = 1;
+                if (verbose)
+                    fprintf(stderr, "hip_qimg: FP8xFP8 WMMA + per-row act quant enabled\n");
+            }
+        }
+        const char *vb = getenv("QIMG_FP8_WMMA_BF16");
+        if (vb && !(strcmp(vb, "0") == 0 || strcmp(vb, "false") == 0)) {
+            r->prefer_bf16_wmma = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA_BF16=1 -- forcing BF16xFP8 path even where FP8xFP8 would qualify\n");
+        }
+    }
+
+    /* BF16 WMMA flash-attention (gfx12, head_dim=128). Opt-in via QIMG_BF16_ATTN=1
+     * (matches CUDA sibling's naming). Default ON when the kernel loaded. */
+    r->use_attn_wmma = 0;
+    if (r->fn_flash_attn_wmma) {
+        const char *v = getenv("QIMG_BF16_ATTN");
+        int enable = 1;
+        if (v) enable = !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0);
+        if (enable) {
+            r->use_attn_wmma = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: BF16 WMMA flash-attention enabled\n");
+        }
+    }
+
+    /* BF16 WMMA VAE conv2d (gfx12). Default ON when kernels loaded; opt out via QIMG_VAE_WMMA=0. */
+    r->use_vae_wmma = 0;
+    if (r->fn_vae_conv2d_3x3_wmma && r->fn_vae_conv2d_1x1_wmma) {
+        const char *v = getenv("QIMG_VAE_WMMA");
+        int enable = 1;
+        if (v) enable = !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0);
+        if (enable) {
+            r->use_vae_wmma = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: BF16 WMMA VAE conv2d enabled\n");
         }
     }
 
@@ -833,6 +1169,14 @@ void hip_qimg_free(hip_qimg_runner *r) {
     for (int i = 0; i < 13; i++) {
         if (*globals[i]) { hipFree(*globals[i]); *globals[i] = NULL; }
     }
+    if (r->d_act_fp8) { hipFree(r->d_act_fp8); r->d_act_fp8 = NULL; }
+    if (r->d_act_scales) { hipFree(r->d_act_scales); r->d_act_scales = NULL; }
+    if (r->d_fa_qfp8) { hipFree(r->d_fa_qfp8); r->d_fa_qfp8 = NULL; }
+    if (r->d_fa_kfp8) { hipFree(r->d_fa_kfp8); r->d_fa_kfp8 = NULL; }
+    if (r->d_fa_vfp8) { hipFree(r->d_fa_vfp8); r->d_fa_vfp8 = NULL; }
+    if (r->d_fa_qs) { hipFree(r->d_fa_qs); r->d_fa_qs = NULL; }
+    if (r->d_fa_ks) { hipFree(r->d_fa_ks); r->d_fa_ks = NULL; }
+    if (r->d_fa_vs) { hipFree(r->d_fa_vs); r->d_fa_vs = NULL; }
     if (r->dit_st) safetensors_close((st_context *)r->dit_st);
     if (r->vae_st) safetensors_close((st_context *)r->vae_st);
     if (r->mod) hipModuleUnload(r->mod);
@@ -1171,6 +1515,8 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
 
     /* Middle attention: CPU fallback for spatial self-attention */
     {
+        hipDeviceSynchronize();
+        struct timespec _t0; clock_gettime(CLOCK_MONOTONIC, &_t0);
         int spatial = h * w;
         void *d_gn_g = qimg_st_upload_f32(st, "decoder.middle.1.norm.gamma");
         void *d_qkv_w = qimg_st_upload_f32(st, "decoder.middle.1.to_qkv.weight");
@@ -1186,59 +1532,56 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         vae_op_conv2d(r, d_qkv, d_normed, d_qkv_w, d_qkv_b, c, h, w, 3*c, 1, 1, 0);
         hipFree(d_normed); hipFree(d_qkv_w); hipFree(d_qkv_b);
 
-        /* CPU attention */
-        float *h_qkv = (float *)malloc((size_t)3 * c * spatial * sizeof(float));
-        hipMemcpy(h_qkv, d_qkv, (size_t)3 * c * spatial * sizeof(float), hipMemcpyDeviceToHost);
-        hipFree(d_qkv);
-
-        float *h_qkv_t = (float *)malloc((size_t)3 * c * spatial * sizeof(float));
-        for (int s_pos = 0; s_pos < spatial; s_pos++)
-            for (int ch = 0; ch < 3 * c; ch++)
-                h_qkv_t[s_pos * 3 * c + ch] = h_qkv[ch * spatial + s_pos];
-        free(h_qkv);
-
-        float *h_q = (float *)malloc((size_t)spatial * c * sizeof(float));
-        float *h_k = (float *)malloc((size_t)spatial * c * sizeof(float));
-        float *h_v = (float *)malloc((size_t)spatial * c * sizeof(float));
-        for (int s_pos = 0; s_pos < spatial; s_pos++) {
-            memcpy(h_q + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c,       (size_t)c * sizeof(float));
-            memcpy(h_k + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c + c,   (size_t)c * sizeof(float));
-            memcpy(h_v + (size_t)s_pos * c, h_qkv_t + (size_t)s_pos * 3 * c + 2*c, (size_t)c * sizeof(float));
-        }
-
-        float *h_attn = (float *)malloc((size_t)spatial * c * sizeof(float));
-        float scale_at = 1.0f / sqrtf((float)c);
-        for (int i = 0; i < spatial; i++) {
-            float mx = -1e30f;
-            for (int j = 0; j < spatial; j++) {
-                float dot = 0;
-                for (int d = 0; d < c; d++) dot += h_q[i*c+d] * h_k[j*c+d];
-                dot *= scale_at;
-                if (dot > mx) mx = dot;
-            }
-            float esum = 0;
-            memset(h_attn + i*c, 0, (size_t)c * sizeof(float));
-            for (int j = 0; j < spatial; j++) {
-                float dot = 0;
-                for (int d = 0; d < c; d++) dot += h_q[i*c+d] * h_k[j*c+d];
-                float w_at = expf(dot * scale_at - mx);
-                esum += w_at;
-                for (int d = 0; d < c; d++) h_attn[i*c+d] += w_at * h_v[j*c+d];
-            }
-            float inv = 1.0f / esum;
-            for (int d = 0; d < c; d++) h_attn[i*c+d] *= inv;
-        }
-        free(h_qkv_t); free(h_q); free(h_k); free(h_v);
-
-        float *h_attn_chw = (float *)malloc((size_t)c * spatial * sizeof(float));
-        for (int s_pos = 0; s_pos < spatial; s_pos++)
-            for (int ch = 0; ch < c; ch++)
-                h_attn_chw[ch * spatial + s_pos] = h_attn[s_pos * c + ch];
-        free(h_attn);
-
+        /* GPU spatial self-attention: vae_self_attn_f32 reads QKV laid out as
+         * [3*c, spatial], writes [c, spatial]. Single head, head_dim=c=384. */
         void *d_attn_chw = NULL; hipMalloc(&d_attn_chw, (size_t)c*spatial*sizeof(float));
-        hipMemcpy(d_attn_chw, h_attn_chw, (size_t)c*spatial*sizeof(float), hipMemcpyHostToDevice);
-        free(h_attn_chw);
+        if (r->fn_vae_self_attn_qb && (c % 32) == 0) {
+            int QB = 8, BKV = 16;
+            size_t smem = (size_t)2 * BKV * c * sizeof(float);
+            unsigned grid = (unsigned)((spatial + QB - 1) / QB);
+            void *args[] = {&d_attn_chw, &d_qkv, &spatial, &c};
+            hipModuleLaunchKernel(r->fn_vae_self_attn_qb,
+                                  grid, 1, 1, (unsigned)(QB*32), 1, 1,
+                                  smem, NULL, args, NULL);
+        } else if (r->fn_vae_self_attn && (c % 32) == 0) {
+            int BKV = 8;
+            size_t smem = (size_t)2 * BKV * c * sizeof(float);
+            void *args[] = {&d_attn_chw, &d_qkv, &spatial, &c};
+            hipModuleLaunchKernel(r->fn_vae_self_attn,
+                                  (unsigned)spatial, 1, 1, 32, 1, 1,
+                                  smem, NULL, args, NULL);
+        } else {
+            /* Fallback: CPU attention (legacy) */
+            float *h_qkv = (float *)malloc((size_t)3 * c * spatial * sizeof(float));
+            hipMemcpy(h_qkv, d_qkv, (size_t)3 * c * spatial * sizeof(float), hipMemcpyDeviceToHost);
+            float *h_attn_chw = (float *)malloc((size_t)c * spatial * sizeof(float));
+            float scale_at = 1.0f / sqrtf((float)c);
+            for (int i = 0; i < spatial; i++) {
+                float mx = -1e30f;
+                for (int j = 0; j < spatial; j++) {
+                    float dot = 0;
+                    for (int d = 0; d < c; d++) dot += h_qkv[d*spatial+i] * h_qkv[(c+d)*spatial+j];
+                    dot *= scale_at;
+                    if (dot > mx) mx = dot;
+                }
+                float esum = 0;
+                float *o_row = (float *)alloca((size_t)c * sizeof(float));
+                memset(o_row, 0, (size_t)c * sizeof(float));
+                for (int j = 0; j < spatial; j++) {
+                    float dot = 0;
+                    for (int d = 0; d < c; d++) dot += h_qkv[d*spatial+i] * h_qkv[(c+d)*spatial+j];
+                    float w_at = expf(dot * scale_at - mx);
+                    esum += w_at;
+                    for (int d = 0; d < c; d++) o_row[d] += w_at * h_qkv[(2*c+d)*spatial+j];
+                }
+                float inv = 1.0f / esum;
+                for (int d = 0; d < c; d++) h_attn_chw[d*spatial+i] = o_row[d] * inv;
+            }
+            free(h_qkv);
+            hipMemcpy(d_attn_chw, h_attn_chw, (size_t)c*spatial*sizeof(float), hipMemcpyHostToDevice);
+            free(h_attn_chw);
+        }
+        hipFree(d_qkv);
 
         void *d_proj_out_v = NULL; hipMalloc(&d_proj_out_v, (size_t)c*spatial*sizeof(float));
         vae_op_conv2d(r, d_proj_out_v, d_attn_chw, d_proj_w, d_proj_b, c, h, w, c, 1, 1, 0);
@@ -1254,6 +1597,9 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         }
         hipFree(d_proj_out_v);
         hipDeviceSynchronize();
+        struct timespec _t1; clock_gettime(CLOCK_MONOTONIC, &_t1);
+        double _ms = (_t1.tv_sec-_t0.tv_sec)*1e3 + (_t1.tv_nsec-_t0.tv_nsec)/1e6;
+        fprintf(stderr, "  vae middle attention: %.0f ms (spatial=%d, c=%d)\n", _ms, h*w, c);
     }
 
     /* mid.2 */
