@@ -43,6 +43,9 @@ struct Config {
     int iters = 200;
     int warmup = 5;
     int check_samples = 4096;
+    uint32_t tile_m = 128;
+    uint32_t tile_n = 128;
+    uint32_t tile_k = 48;
     bool check = true;
     bool list = false;
     bool check_caps = false;
@@ -129,6 +132,9 @@ static void usage(const char* prog) {
         << "  --iters       timed dispatch count (default: 200)\n"
         << "  --warmup      warmup dispatch count (default: 5)\n"
         << "  --samples     verification sample count (default: 4096)\n"
+        << "  --tile-m      shader M tile size (default: 128)\n"
+        << "  --tile-n      shader N tile size (default: 128)\n"
+        << "  --tile-k      shader K tile size (default: 48)\n"
         << "  --device      Vulkan device index (default: 0)\n"
         << "  --shader-dir  build directory containing shaders/wmma (default: .)\n"
         << "  --list        list devices\n"
@@ -168,6 +174,15 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
         } else if (a == "--samples") {
             const char* v = need_value("--samples"); if (!v) return false;
             cfg.check_samples = std::max(1, std::atoi(v));
+        } else if (a == "--tile-m") {
+            const char* v = need_value("--tile-m"); if (!v) return false;
+            cfg.tile_m = std::max(16, std::atoi(v));
+        } else if (a == "--tile-n") {
+            const char* v = need_value("--tile-n"); if (!v) return false;
+            cfg.tile_n = std::max(16, std::atoi(v));
+        } else if (a == "--tile-k") {
+            const char* v = need_value("--tile-k"); if (!v) return false;
+            cfg.tile_k = std::max(16, std::atoi(v));
         } else if (a == "--device") {
             const char* v = need_value("--device"); if (!v) return false;
             cfg.device = std::atoi(v);
@@ -358,7 +373,10 @@ bool Bench::record_dispatches(uint32_t gx, uint32_t gy, int count, const void* p
 }
 
 bool Bench::run_shape(const Shape& s, const Config& cfg) {
-    Dims d{s.m, s.n, s.k, round_up(s.m, 128), round_up(s.n, 64), round_up(s.k, 64)};
+    Dims d{s.m, s.n, s.k,
+           round_up(s.m, cfg.tile_m),
+           round_up(s.n, cfg.tile_n),
+           round_up(s.k, cfg.tile_k)};
     const size_t x_elems = size_t(d.mp) * d.kp;
     const size_t w_elems = size_t(d.np) * d.kp;
     const size_t y_elems = size_t(d.mp) * d.np;
@@ -403,7 +421,9 @@ bool Bench::run_shape(const Shape& s, const Config& cfg) {
         runner_.bindComputePipeline(pipeline_);
         runner_.bindDescriptorSets(pipeline_);
         runner_.pushConstants(pipeline_, &pc, sizeof(pc));
-        for (int i = 0; i < std::max(1, cfg.warmup); i++) runner_.dispatch(d.np / 64, d.mp / 128, 1);
+        for (int i = 0; i < std::max(1, cfg.warmup); i++) {
+            runner_.dispatch(d.np / cfg.tile_n, d.mp / cfg.tile_m, 1);
+        }
         ok = runner_.endRecordingAndSubmit() && runner_.waitForCompletion();
     }
 
@@ -439,7 +459,7 @@ bool Bench::run_shape(const Shape& s, const Config& cfg) {
     double ms = 0.0;
     if (ok) {
         auto t0 = std::chrono::steady_clock::now();
-        ok = record_dispatches(d.np / 64, d.mp / 128, cfg.iters, &pc, sizeof(pc));
+        ok = record_dispatches(d.np / cfg.tile_n, d.mp / cfg.tile_m, cfg.iters, &pc, sizeof(pc));
         auto t1 = std::chrono::steady_clock::now();
         ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / double(cfg.iters);
     }

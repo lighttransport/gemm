@@ -18,10 +18,18 @@
 #define CM_N 16
 #define CM_K 16
 
+#ifndef BM
 #define BM 128
-#define BN 64
-#define BK 64
+#endif
+#ifndef BN
+#define BN 128
+#endif
+#ifndef BK
+#define BK 48
+#endif
+#ifndef BLOCK_SIZE
 #define BLOCK_SIZE 256
+#endif
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -51,9 +59,29 @@ layout(push_constant) uniform PushConstants {
     uint K;
 } pc;
 
+#ifndef TILES_M_MAX
+#define TILES_M_MAX 2
+#endif
+#ifndef TILES_M
+#define TILES_M 2
+#endif
+#ifndef WARP_ROW_STRIDE
+#define WARP_ROW_STRIDE (TILES_M * CM_M)
+#endif
+#ifndef DYNAMIC_SUBGROUP_MAPPING
+#define DYNAMIC_SUBGROUP_MAPPING 0
+#endif
+#ifndef TILES_N
+#define TILES_N (BN / CM_N)
+#endif
+
 // Keep the same padded LDS shape used by the existing Vulkan coopmat shader.
-#define A_STRIDE 88
-#define B_STRIDE 88
+#ifndef A_STRIDE
+#define A_STRIDE (BK + 8)
+#endif
+#ifndef B_STRIDE
+#define B_STRIDE (BN + 8)
+#endif
 
 shared float16_t tileA[BM][A_STRIDE];
 shared float16_t tileB[BK][B_STRIDE];
@@ -61,15 +89,18 @@ shared float16_t tileB[BK][B_STRIDE];
 void main() {
     const uint tid = gl_LocalInvocationIndex;
     const uint subgroup_id = gl_SubgroupID;
+#if DYNAMIC_SUBGROUP_MAPPING
     const uint num_subgroups = gl_NumSubgroups;
+#endif
 
     const uint block_row = gl_WorkGroupID.y * BM;
     const uint block_col = gl_WorkGroupID.x * BN;
 
     uint warp_row;
     uint tiles_m;
-    const uint tiles_n = 4;
+    const uint tiles_n = TILES_N;
 
+#if DYNAMIC_SUBGROUP_MAPPING
     if (num_subgroups <= 4) {
         warp_row = subgroup_id * 32;
         tiles_m = 2;
@@ -77,10 +108,14 @@ void main() {
         warp_row = subgroup_id * 16;
         tiles_m = 1;
     }
+#else
+    warp_row = subgroup_id * WARP_ROW_STRIDE;
+    tiles_m = TILES_M;
+#endif
 
-    coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator> acc[2][4];
-    [[unroll]] for (uint mi = 0; mi < 2; mi++) {
-        [[unroll]] for (uint ni = 0; ni < 4; ni++) {
+    coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator> acc[TILES_M_MAX][TILES_N];
+    [[unroll]] for (uint mi = 0; mi < TILES_M_MAX; mi++) {
+        [[unroll]] for (uint ni = 0; ni < TILES_N; ni++) {
             acc[mi][ni] = coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator>(0.0);
         }
     }
