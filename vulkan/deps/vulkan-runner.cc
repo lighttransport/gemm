@@ -146,6 +146,43 @@ std::string VulkanComputeRunner::getDeviceName(uint32_t deviceIndex) const {
     return std::string(properties.deviceName);
 }
 
+bool VulkanComputeRunner::deviceSupportsExtension(uint32_t deviceIndex, const char* extensionName) const {
+    if (deviceIndex >= physicalDevices_.size()) {
+        return false;
+    }
+    return supportsExtension(physicalDevices_[deviceIndex], extensionName);
+}
+
+bool VulkanComputeRunner::getCooperativeMatrixProperties(
+    std::vector<VkCooperativeMatrixPropertiesKHR>& properties) const {
+    properties.clear();
+    if (physicalDevice_ == VK_NULL_HANDLE || !vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+        return false;
+    }
+    if (!supportsExtension(physicalDevice_, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+        return false;
+    }
+
+    uint32_t count = 0;
+    VkResult res = vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physicalDevice_, &count, nullptr);
+    if (res != VK_SUCCESS || count == 0) {
+        return false;
+    }
+
+    properties.resize(count);
+    for (auto& prop : properties) {
+        prop.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+        prop.pNext = nullptr;
+    }
+    res = vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physicalDevice_, &count, properties.data());
+    if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+        properties.clear();
+        return false;
+    }
+    properties.resize(count);
+    return true;
+}
+
 bool VulkanComputeRunner::createBuffer(size_t size, VkBufferUsageFlags usage,
                                        VkMemoryPropertyFlags properties, BufferInfo& bufferInfo) {
     VkBufferCreateInfo bufferCreateInfo{};
@@ -782,7 +819,7 @@ bool VulkanComputeRunner::createInstance(bool enableValidation) {
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.pEngineName = "VisionLanguageCPP";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.apiVersion = VK_API_VERSION_1_0;
+    appInfo.apiVersion = VK_API_VERSION_1_3;
 
     VkInstanceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -835,6 +872,31 @@ bool VulkanComputeRunner::selectPhysicalDevice(uint32_t deviceIndex) {
     return true;
 }
 
+bool VulkanComputeRunner::supportsExtension(VkPhysicalDevice device, const char* extensionName) const {
+    if (!vkEnumerateDeviceExtensionProperties || device == VK_NULL_HANDLE || !extensionName) {
+        return false;
+    }
+
+    uint32_t count = 0;
+    VkResult res = vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr);
+    if (res != VK_SUCCESS || count == 0) {
+        return false;
+    }
+
+    std::vector<VkExtensionProperties> extensions(count);
+    res = vkEnumerateDeviceExtensionProperties(device, nullptr, &count, extensions.data());
+    if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+        return false;
+    }
+
+    for (const auto& ext : extensions) {
+        if (std::strcmp(ext.extensionName, extensionName) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool VulkanComputeRunner::createLogicalDevice() {
     VkDeviceQueueCreateInfo queueCreateInfo{};
     queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -845,13 +907,85 @@ bool VulkanComputeRunner::createLogicalDevice() {
     queueCreateInfo.pQueuePriorities = &queuePriority;
 
     VkPhysicalDeviceFeatures deviceFeatures{};
+    std::vector<const char*> extensions;
+
+    const bool has16BitStorage = supportsExtension(physicalDevice_, VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+    const bool hasFloat16Int8 = supportsExtension(physicalDevice_, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+    const bool hasCoopMat = supportsExtension(physicalDevice_, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    const bool hasBfloat16 = supportsExtension(physicalDevice_, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+
+    if (has16BitStorage) {
+        extensions.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+    }
+    if (hasFloat16Int8) {
+        extensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+    }
+    if (hasCoopMat) {
+        extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    }
+    if (hasBfloat16) {
+        extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+    }
+
+    VkPhysicalDeviceFeatures2 enabledFeatures2{};
+    VkPhysicalDevice16BitStorageFeatures storage16Features{};
+    VkPhysicalDeviceVulkan12Features vulkan12Features{};
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16Features{};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeatures{};
+    VkPhysicalDeviceFeatures2 availableFeatures2{};
+    VkPhysicalDevice16BitStorageFeatures availableStorage16{};
+    VkPhysicalDeviceVulkan12Features availableVulkan12{};
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR availableBfloat16{};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR availableCoop{};
+
+    enabledFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    storage16Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    bfloat16Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+    coopFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    enabledFeatures2.pNext = &storage16Features;
+    storage16Features.pNext = &vulkan12Features;
+    vulkan12Features.pNext = hasBfloat16 ? static_cast<void*>(&bfloat16Features)
+                                         : (hasCoopMat ? static_cast<void*>(&coopFeatures) : nullptr);
+    bfloat16Features.pNext = hasCoopMat ? &coopFeatures : nullptr;
+
+    bool useFeatures2 = false;
+    if (vkGetPhysicalDeviceFeatures2) {
+        availableFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        availableStorage16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        availableVulkan12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        availableBfloat16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+        availableCoop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        availableFeatures2.pNext = &availableStorage16;
+        availableStorage16.pNext = &availableVulkan12;
+        availableVulkan12.pNext = hasBfloat16 ? static_cast<void*>(&availableBfloat16)
+                                              : (hasCoopMat ? static_cast<void*>(&availableCoop) : nullptr);
+        availableBfloat16.pNext = hasCoopMat ? &availableCoop : nullptr;
+        vkGetPhysicalDeviceFeatures2(physicalDevice_, &availableFeatures2);
+
+        storage16Features.storageBuffer16BitAccess = availableStorage16.storageBuffer16BitAccess;
+        storage16Features.uniformAndStorageBuffer16BitAccess =
+            availableStorage16.uniformAndStorageBuffer16BitAccess;
+        vulkan12Features.shaderFloat16 = availableVulkan12.shaderFloat16;
+        vulkan12Features.shaderInt8 = availableVulkan12.shaderInt8;
+        bfloat16Features.shaderBFloat16Type =
+            hasBfloat16 ? availableBfloat16.shaderBFloat16Type : VK_FALSE;
+        bfloat16Features.shaderBFloat16DotProduct =
+            hasBfloat16 ? availableBfloat16.shaderBFloat16DotProduct : VK_FALSE;
+        bfloat16Features.shaderBFloat16CooperativeMatrix =
+            hasBfloat16 ? availableBfloat16.shaderBFloat16CooperativeMatrix : VK_FALSE;
+        coopFeatures.cooperativeMatrix = hasCoopMat ? availableCoop.cooperativeMatrix : VK_FALSE;
+        useFeatures2 = true;
+    }
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     createInfo.pQueueCreateInfos = &queueCreateInfo;
     createInfo.queueCreateInfoCount = 1;
-    createInfo.pEnabledFeatures = &deviceFeatures;
-    createInfo.enabledExtensionCount = 0;
+    createInfo.pNext = useFeatures2 ? &enabledFeatures2 : nullptr;
+    createInfo.pEnabledFeatures = useFeatures2 ? nullptr : &deviceFeatures;
+    createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+    createInfo.ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
     createInfo.enabledLayerCount = 0;
 
     if (vkCreateDevice(physicalDevice_, &createInfo, nullptr, &device_) != VK_SUCCESS) {

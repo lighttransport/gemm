@@ -205,6 +205,8 @@ public:
   uint32_t getDeviceCount() const;
   bool selectDevice(uint32_t deviceIndex);
   std::string getDeviceName(uint32_t deviceIndex) const;
+  bool deviceSupportsExtension(uint32_t deviceIndex, const char* extensionName) const;
+  bool getCooperativeMatrixProperties(std::vector<VkCooperativeMatrixPropertiesKHR>& properties) const;
   
   // Buffer management
   struct BufferInfo {
@@ -312,6 +314,7 @@ private:
   bool createInstance(bool enableValidation);
   bool selectPhysicalDevice(uint32_t deviceIndex);
   bool createLogicalDevice();
+  bool supportsExtension(VkPhysicalDevice device, const char* extensionName) const;
   bool createCommandPool();
   uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
   uint32_t findComputeQueueFamily(VkPhysicalDevice device);

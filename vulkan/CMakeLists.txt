@@ -588,6 +588,8 @@ if(TARGET coopmat_shaders)
     add_dependencies(${QIMG_TARGET} coopmat_shaders)
 endif()
 
+add_subdirectory(wmma)
+
 message(STATUS "")
 message(STATUS "Vulkan Cooperative Matrix Matmul Benchmark")
 message(STATUS "  Shader source: ${SHADER_SOURCE_DIR}")
