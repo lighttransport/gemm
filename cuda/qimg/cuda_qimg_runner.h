@@ -2189,7 +2189,7 @@ static int op_mlp_fp8(cuda_qimg_runner *r,
         !r->quant_bf16_to_fp8_e4m3 || !r->bf16_to_f32_add_bias ||
         !r->reduce_max_abs || !r->compute_x_scale_from_max ||
         !r->quant_f32_to_fp8_e4m3 || r->use_old_gemm) return -1;
-    if (n_tok < 8 || dim < 32 || mlp_h < 16) return -1;
+    if (n_tok < 1 || dim < 32 || mlp_h < 16) return -1;
 
     /* Scratch sizing: x_fp8 needs to fit max(n_tok*dim, n_tok*mlp_h);
      * y_bf16 needs n_tok*max(dim,mlp_h)*2B. Sized for fc1 first, grown for fc2. */
@@ -2385,7 +2385,7 @@ static int op_gemm_qkv_fused(cuda_qimg_runner *r,
      * old single perrow_mt4_concat3 launch. LT is fast enough that 3
      * separate calls beat one fused custom kernel; sharing the X quant
      * keeps overhead from tripling. */
-    if (r->use_cublaslt_fp8 && n_tok >= 8 && n_in >= 32 && dim >= 16 &&
+    if (r->use_cublaslt_fp8 && n_tok >= 1 && n_in >= 32 && dim >= 16 &&
         !r->use_old_gemm) {
         size_t need_x = (size_t)n_tok * n_in;
         size_t need_y = (size_t)n_tok * dim * sizeof(uint16_t);
@@ -3347,14 +3347,23 @@ static int qimg_forward_block(cuda_qimg_runner *r, qimg_fwd_state_t *st,
     PROF_END(prof_imgmlp_ms);
 
     PROF_BEGIN();
-    /* Text MLP */
+    /* Text MLP — try fused FP8 first (BF16 hidden, no F32 intermediate),
+     * fall back to op_gemm_gelu+op_gemm if not available. */
     op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
+    if (op_mlp_fp8(r, d_scratch3, d_scratch2,
+                   blk->txt_mlp_fc1_w, blk->txt_mlp_fc1_b,
+                   blk->txt_mlp_fc2_w, blk->txt_mlp_fc2_b,
+                   dim, mlp_h, n_txt) == 0) {
+        op_gated_add(r, d_txt, d_scratch3, txt_g2, n_txt, dim);
+        goto txt_mlp_done;
+    }
     op_gemm_gelu(r, d_scratch3, blk->txt_mlp_fc1_w, d_scratch2, blk->txt_mlp_fc1_b,
                  mlp_h, dim, n_txt);
     op_gemm(r, d_scratch2, blk->txt_mlp_fc2_w, d_scratch3, blk->txt_mlp_fc2_b,
             dim, mlp_h, n_txt);
     op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
     /* gated_add writes BF16-rounded output — no trailing op_bf16_trunc needed. */
+    txt_mlp_done:;
     PROF_END(prof_txtmlp_ms);
     if (r->profile_block) r->prof_block_count++;
     #undef PROF_BEGIN
