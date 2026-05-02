@@ -215,7 +215,7 @@ Targets RDNA4 (gfx1200/gfx1201). Kernels compiled at runtime via HIPRTC (no `hip
 | File | Description |
 |---|---|
 | `hip_qimg_runner.{c,h}` | GPU runner: HIPRTC kernel compilation, FP8 LUT GEMM, optional BF16 WMMA matrix-core path, per-block streaming with up to ~40 preloaded blocks on a 16 GB card, GPU VAE decode |
-| `hip_qimg_kernels.h` | HIP kernel strings: `gemm_fp8w_f32` (16×16 scalar LUT), `gemm_opt_fp8` (128×128 tiled LUT with fused BF16 trunc), `gemm_fp8w_bf16a_wmma_t` (BF16×FP8 matrix-core WMMA, 256 threads / 128×128 CTA) |
+| `hip_qimg_kernels.h` | HIP kernel strings: `gemm_fp8w_f32` (16×16 scalar LUT), `gemm_opt_fp8` (128×128 tiled LUT with fused BF16 trunc), `gemm_fp8w_bf16a_wmma_t` (BF16×FP8 matrix-core WMMA, 256 threads / 128×128 CTA), `gemm_fp8_fp8w_perrow_pgr2` + `qimg_quantize_act_perrow_fp8` (FP8×FP8 matrix-core WMMA, 128 threads / 128×128 CTA, 3-deep LDS pipeline, per-row activation scale), `flash_attn_sa_wmma_f32` (BF16 WMMA flash-attention, head_dim=128, Br_cta=64) |
 | `test_hip_qimg.c` | Test harness: `--test-init / --test-dit / --test-vae / --test-enc / --generate`. Supports pinned-input options (`--init-bin`, `--txt-bin`, `--sigmas-bin`, `--dump-final`, `--skip-unstd`) plus PNG output via `stb_image_write.h`. |
 | `verify_qimg_dit.c` | CPU↔HIP single-step DiT comparison (max_diff / mean_diff / corr) |
 | `Makefile` | Builds `test_hip_qimg` and `verify_qimg_dit` |
@@ -229,22 +229,63 @@ Targets RDNA4 (gfx1200/gfx1201). Kernels compiled at runtime via HIPRTC (no `hip
 | HIP 128×128 tiled FP8 LUT (default) | **36.1 s (1.80 s/step)** | **91.2 s (4.56 s/step)** | 1.5 s | 20.5 s |
 | HIP 128×128 BF16×FP8 WMMA (`QIMG_FP8_WMMA=1`) | **29.4 s (1.47 s/step)** | **81.8 s (4.09 s/step)** | 1.5 s | 20.2 s |
 | + 512 MB activation reserve (45/60 preload) | **24.0 s (1.20 s/step)** | **74.5 s (3.73 s/step)** | 1.3 s | 11.2 s |
+| HIP 128×128 **FP8×FP8 WMMA** (`QIMG_FP8_FP8_WMMA=1`) | **22.0 s (1.10 s/step)** | **52.2 s (2.61 s/step)** | 1.5 s | 19.4 s |
+| + **BF16 WMMA flash-attention** (`QIMG_BF16_ATTN=1`, default ON) | **20.3 s (1.02 s/step)** | **29.2 s (1.46 s/step)** | 1.5 s | 19.6 s |
+| + **BF16 WMMA VAE conv2d + GPU spatial attention** (`QIMG_VAE_WMMA=1`, default ON) | **20.3 s (1.01 s/step)** | **29.1 s (1.45 s/step)** | **0.5 s** | **1.3 s** |
+| + **Q-blocked VAE attention (8 queries/CTA, BKV=16)** | — | **29.1 s (1.45 s/step)** | **0.5 s** | **0.9 s** |
+
+**Default-on (no opt-in flags) vs FP8×FP8 opt-in**, current measurements:
+
+| Mode | 256² / 20-step DiT | 512² / 20-step DiT | 1024² / 20-step DiT |
+|---|---|---|---|
+| HIP BF16×FP8 WMMA + BF16 attn + VAE WMMA (default) | 24.1 s (1.20 s/step) | 55.7 s (2.79 s/step) | 214.5 s (10.72 s/step) |
+| + FP8×FP8 (`QIMG_FP8_FP8_WMMA=1`, opt-in, **quality drop**) | 20.3 s (1.02 s/step) | 29.3 s (1.46 s/step) | **89.0 s (4.45 s/step)** |
+| Speedup | 1.18× | 1.91× | **2.41×** |
+
+**1024×1024 / 20-step legend** (after Q-block VAE attention fix):
+
+| Stage | Wall | Notes |
+|---|---:|---|
+| Text encoder (Qwen2.5-VL Q4, GPU) | 10.5 s | one-shot, 46 tokens |
+| DiT load + 45/60 block preload | 2.6 s | 1.1 GB free after preload |
+| Denoise (60 blocks × 20 steps, n_img=4096+128) | 261 s (13.07 s/step) | FP8×FP8 GEMM + BF16 WMMA attn |
+| VAE conv2d (BF16 WMMA) | ~2.2 s | downsample/up chain on GPU |
+| VAE middle self-attention (Q-block) | 3.6 s | spatial=16384, c=384 (was 25.5 s pre Q-block) |
+| **Total** | **~278 s** | output `apple_1024.ppm` |
+
+At 1024² the VAE middle self-attention initially regressed to 25.5 s on GPU because the original `vae_self_attn_f32` was sized for spatial=4096 — one CTA per query, no Q-blocking, every block re-streamed the full K/V from HBM (~16× redundant load at 16k tokens). Added `vae_self_attn_qb_f32` with QB=8 queries per CTA and BKV bumped 8→16, sharing one 48 KB LDS K/V tile across 8 waves. Drops 1024² VAE attn 25.5 → 3.6 s (7.1×); 512² also benefits (~250 → 57 ms). Auto-dispatched when c%32==0; original kernel kept as fallback.
+
+**FP8×FP8 WMMA** (`QIMG_FP8_FP8_WMMA=1`, **opt-in only**): port of `gemm_fp8_pipe32_pgr2` from `rdna4/fp8/bench_fp8_gemm.c` (~218 TF/s on mm0) into the qimg HIPRTC kernel string. 128 threads = 4 waves, 128×128 CTA tile, MIWT 4×4, K_step=32, 3-deep LDS pipeline (PGR=2). Activations are F32→FP8 quantized per output row (`qimg_quantize_act_perrow_fp8`: scale `s_m = max(|X[m,:]|)/448`), GEMM uses `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12`, and writeback fuses the row scale + bias. Mirrors the CUDA sibling's `gemm_fp8_pipe_perrow_f32` pattern. Eligible when `n_tok % 128 == 0`, `n_out % 128 == 0`, and `n_in % 32 == 0`; falls back to BF16×FP8 WMMA otherwise. `QIMG_FP8_WMMA_BF16=1` forces the BF16 path even when FP8×FP8 would qualify.
+
+Speedup grows with spatial: BF16×FP8 → FP8×FP8 = **1.18× at 256² (1.20 → 1.02 s/step)**, **1.91× at 512² (2.79 → 1.46 s/step)**, **2.41× at 1024² (10.72 → 4.45 s/step)**. The 1024² ratio approaches the WMMA hardware peak ratio (~2.0×); residuals come from non-GEMM ops (FA, layernorm, modulation) that don't scale with the FP8 win.
+
+Quality regression (256²/20 steps vs diffusers `final_latent_packed_256.bin`): latent cos drops 0.999971 → 0.956359, latent PSNR 51.70 → 21.32 dB; PNG PSNR vs `apple_ref_256.png` drops 46.63 → 24.60 dB (mean pixel diff 0.82 → 10.65 / 255). The per-row activation scale `max|x|/448` doesn't preserve enough dynamic range for Qwen-Image's MMDiT path — outliers in attention and FFN inputs get crushed to e4m3 mantissa noise. Default kept OFF; ship the env var for users who accept the quality drop in exchange for ~2× denoise at ≥512².
+
+**BF16 WMMA flash-attention** (`QIMG_BF16_ATTN=1`, default ON when kernel loaded): replaces the F32 scalar `flash_attn_f32` with `flash_attn_sa_wmma_f32` ported from `rdna4/trellis2/hip_trellis2_kernels.h`. FA2 online softmax with QK^T and PV computed via 16×16×16 BF16 WMMA tiles (one `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` per intrinsic). 128 threads = 4 waves, each wave owns 16 query rows, Br_cta=64, Bc=16. Q/K/V are F32→BF16 cast at LDS staging, F32 accumulators, F32 output. Constraints: head_dim=128 (Qwen-Image), partial last KV tile masked with -inf so any N is supported (no padding required). Dispatching this kernel collapsed the scalar-attention bottleneck that dominated post-FP8×FP8 step time: at 512², 2.61 → 1.46 s/step = **1.79× speedup on denoise** (the residual ~1.15 s/step that wasn't GEMM was almost entirely the F32 scalar FA). Combined with FP8×FP8 WMMA, end-to-end at 512×512 is **2.93× faster than the BF16×FP8-only baseline** (4.28 → 1.46 s/step).
+
+**VAE BF16 WMMA conv2d + GPU spatial attention** (`QIMG_VAE_WMMA=1`, default ON): three new kernels in `hip_qimg_kernels.h`:
+- `vae_conv2d_3x3_wmma_f32` — implicit-GEMM 3×3 conv via 16×16×16 BF16 WMMA tiles. Treats conv as GEMM with M=Co, N=H·W, K=Ci·9. Each CTA = 1 wave producing a 16×16 output tile; lanes own 8 K elements per WMMA. Replicate or zero pad. Constraint: Co%16==0, Ci%16==0, H·W%16==0 (every Qwen-Image VAE conv satisfies this).
+- `vae_conv2d_1x1_wmma_f32` — same layout for 1×1 (K = Ci instead of Ci·9). Used by `post_quant_conv` and the middle-block attention QKV / proj convs.
+- `vae_self_attn_f32` — GPU FA2 spatial self-attention for the middle-block attention (single head, head_dim=384). One CTA per query row, 1 wave, lane owns ept=12 channels. KV tiled BKV=8 rows into LDS each iteration. Replaces the previous CPU-side O(spatial²·c) loop + 2× D2H/H2D copies — the dominant bottleneck of the entire pipeline.
+
+The VAE attention port is the headline win: at 512² spatial=4096, the CPU loop ran for **17.9 s** (96% of VAE wall time). The GPU FA2 kernel does the same compute in **0.44 s** — a 41× speedup on that op alone. End-to-end VAE decode dropped 19.4 s → 1.3 s at 512² (**15× speedup**), 1.5 s → 0.5 s at 256² (**3× speedup**).
 
 **Activation reserve tuning**: the preload planner used to reserve 2 GB of VRAM for per-step activations, but actual peak usage at 512×512 is ~300 MB (Q/K/V 72 MB, scratch3 48 MB, scratch1/2 18 MB each, d_q/d_k/d_v/d_attn 264 MB total, plus the img/txt buffers). Lowering the reserve to 512 MB frees up room for 5 more preloaded blocks (45/60 instead of 40/60) on a 16 GB card, eliminating ~5 × ~85 ms = ~425 ms/step of PCIe streaming. This is bit-for-bit equivalent to the old path (no math changes — only which blocks live in VRAM vs stream on-demand). For higher resolutions where activation scratch grows past 512 MB, override with `QIMG_WORKSPACE_MB=<n>` (e.g. `QIMG_WORKSPACE_MB=2048` at 1024×1024+).
 
 **Note on the prefetch / copy-stream approach**: the natural next step — running block streaming on a separate `hipStream` concurrently with compute on the default stream (pinned host staging + `hipMemcpyAsync` + slot ring buffer) — was implemented and tested but **regressed ~0.7–1.0 s/step at 512×512** on gfx1201. Tracing showed that (1) sync `hipMemcpy` on the default stream already achieves good implicit overlap with queued compute (the "85 ms/block" really breaks down as ~60 ms compute catchup + ~25 ms DMA), and (2) explicit DMA on a copy stream contends with compute for HBM bandwidth. The current WMMA GEMM is memory-bandwidth-bound, so running DMA in parallel slows compute by more than the DMA saves. The simpler residency win above beats the prefetch approach on this GPU.
 
-**Apples-to-apples vs diffusers reference** (256×256 / 20 steps / cfg=1, both runners loading the same `qwen_image_fp8_e4m3fn.safetensors` and using `init_latent_256.bin / apple_text_256.bin / sigmas_256.bin` from `dump_diffusers_pipeline.py`):
+**Apples-to-apples vs diffusers reference** (256×256 / 20 steps / cfg=1, both runners loading the same `qwen_image_fp8_e4m3fn.safetensors` and using `init_latent_256.bin / apple_text_256.bin / sigmas_256.bin` from `dump_diffusers_pipeline.py`). Default-on HIP today is **BF16×FP8 WMMA + BF16 WMMA attn + VAE WMMA**; FP8×FP8 is opt-in and trades quality for speed:
 
-| | diffusers (FP8, sequential cpu offload) | HIP BF16 WMMA |
-|---|---|---|
-| Wall time | 102 s | **34 s** |
-| Final latent cosine vs ref | 1.0 (self) | **0.999962** |
-| Final latent max \|diff\| | 0 | 0.0273 |
-| PNG PSNR vs ref | ∞ | **49.48 dB** |
-| PNG mean \|diff\| | 0 | 0.54 / 255 |
+| | diffusers (FP8, seq. cpu offload) | HIP BF16×FP8 WMMA + BF16 attn + VAE WMMA (default) | HIP FP8×FP8 + BF16 attn + VAE WMMA (`QIMG_FP8_FP8_WMMA=1`) |
+|---|---|---|---|
+| Wall time @ 256² | 102 s | **~24 s** (denoise 24.1 s + VAE 0.5 s) | **~21 s** (denoise 20.3 s + VAE 0.5 s) |
+| Wall time @ 512² | (unmeasured; ≈400+ s on rocm-7.2 BF16 offload) | **~57 s** (denoise 55.7 s + VAE 1.3 s) | **~30 s** (denoise 29.3 s + VAE 1.3 s) |
+| Wall time @ 1024² | n/a | ~218 s (denoise 214.5 s + VAE ~3 s) | **~94 s** (denoise 89.0 s + VAE ~3 s) |
+| Final latent cosine vs ref @ 256² | 1.0 (self) | 0.999971 | 0.956359 |
+| Final latent PSNR vs ref @ 256² | ∞ | 51.70 dB | 21.32 dB |
+| PNG PSNR vs ref @ 256² | ∞ | 46.63 dB | 24.60 dB |
 
-The HIP runner is **3× faster** than the pytorch-rocm diffusers reference (sequential cpu offload is forced because the BF16 transformer doesn't fit in 16 GB VRAM resident — even with the FP8 transformer loaded via `from_single_file`, the text encoder + VAE + activations push past 16 GB during inference). The BF16 WMMA quantization noise on activations introduces only ~0.5 LSB of pixel error, so the apple is visually indistinguishable from the diffusers reference at PSNR ≈ 49 dB.
+The HIP runner is now **~4× faster** than the pytorch-rocm diffusers reference at 256² (102 s → 24 s) at full BF16×FP8 quality, and **~5× faster** (102 s → 21 s) when opting into FP8×FP8 with the documented quality trade-off. The BF16-WMMA-only baseline was already 3× faster; BF16 WMMA flash-attention (replacing F32 scalar FA) and BF16 WMMA VAE conv2d + GPU spatial-attention port compress the rest. FP8×FP8 stacks on top for users who can absorb the quality drop. PyTorch sequential cpu offload is forced because the BF16 transformer doesn't fit in 16 GB VRAM resident — even with the FP8 transformer loaded via `from_single_file`, the text encoder + VAE + activations push past 16 GB during inference. A live 512² PyTorch comparison wasn't run (no diffusers in the available rocm env, and the offload pattern at 512² historically scales ~4× = 6+ minutes / 20 steps), but the relative gap widens since the BF16-attention/VAE wins matter more at higher spatial counts (4096 vs 1024 tokens for FA, 16× more pixels for VAE).
 
 **Mixed-dtype checkpoint support** (`unsloth/Qwen-Image-2512-FP8`): the December 2025 refresh stores 1093/1933 tensors as BF16 instead of FP8 — biases, norm scales, and 5 of the global GEMM weights (`img_in.weight`, `txt_in.weight`, `time_text_embed.timestep_embedder.linear_1/2.weight`, `norm_out.linear.weight`, `proj_out.weight`). `qimg_upload_weight_auto` detects the dtype per global weight and tags the device pointer; `op_wgemm_bf16_auto` then dispatches the F32 GEMM path (`gemm_f32_f32` + downstream BF16 trunc) for BF16-stored globals while keeping FP8 GEMM for the FP8 ones. Per-block weights are still 100% FP8 in the 2512 file, so they stay on the existing FP8 LUT / WMMA tracks unchanged.
 
