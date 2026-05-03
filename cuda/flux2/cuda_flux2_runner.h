@@ -67,12 +67,14 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
 #include <unistd.h>
 
 #include "../cuew.h"
+#include "../cublasew.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 #include "../cuda_kernels_common.h"
 #include "../../common/safetensors.h"
 #include "../../common/flux2_klein_dit.h"
 #include "../../common/flux2_klein_vae.h"
+#include "../gemm/cuda_gemm_ptx_kernels.h"  /* k_gemm_bf16_v7_src / k_gemm_f16_v7_src */
 
 /* ---- Flux.2 Klein CUDA kernels ---- */
 
@@ -2199,6 +2201,7 @@ static const char *flux2_kernel_src =
 "                                                const float *x_scale_ptr,\n"
 "                                                float w_scale,\n"
 "                                                int has_bias,\n"
+"                                                int accumulate,\n"
 "                                                int M, int N, int K) {\n"
 "    extern __shared__ __align__(16) unsigned short smem_v7fp8f[];\n"
 "    unsigned short *sA0 = smem_v7fp8f;\n"
@@ -2354,6 +2357,203 @@ static const char *flux2_kernel_src =
 "        int yc1 = yc0 + 1;\n"
 "        float b0_v = (has_bias && yc0 < N) ? bias[yc0] : 0.0f;\n"
 "        float b1_v = (has_bias && yc1 < N) ? bias[yc1] : 0.0f;\n"
+"        if (yr0 < M && yc0 < N) { size_t idx = (size_t)yr0 * N + yc0; float v = d0[nt] * ds + b0_v; Y[idx] = accumulate ? Y[idx] + v : v; }\n"
+"        if (yr0 < M && yc1 < N) { size_t idx = (size_t)yr0 * N + yc1; float v = d1[nt] * ds + b1_v; Y[idx] = accumulate ? Y[idx] + v : v; }\n"
+"        if (yr1 < M && yc0 < N) { size_t idx = (size_t)yr1 * N + yc0; float v = d2[nt] * ds + b0_v; Y[idx] = accumulate ? Y[idx] + v : v; }\n"
+"        if (yr1 < M && yc1 < N) { size_t idx = (size_t)yr1 * N + yc1; float v = d3[nt] * ds + b1_v; Y[idx] = accumulate ? Y[idx] + v : v; }\n"
+"    }\n"
+"}\n"
+
+/* gemm_fp8_v7_concat2: fused (X1@W1^T + X2@W2^T + bias) using a single MMA accumulator.
+ * Splits a single Y = (X1 @ W1^T)*s1 + (X2 @ W2^T)*s2 + bias GEMM across two
+ * (X, W) FP8 input pairs sharing the same (M, N) but different K tilings.
+ * K1, K2 must each be multiples of 64. Accumulator stays in s2 frame: after the
+ * num_k1-th K-tile the running d[] is multiplied by ratio = s1/s2 so that the
+ * final descale (* s2) reproduces the correct (s1*part1 + s2*part2). */
+"extern \"C\" __global__ void gemm_fp8_v7_concat2(float *Y,\n"
+"                                                 const fp8_raw *X1,\n"
+"                                                 const fp8_raw *X2,\n"
+"                                                 const fp8_raw *W1,\n"
+"                                                 const fp8_raw *W2,\n"
+"                                                 const float *bias,\n"
+"                                                 const float *x1_scale_ptr,\n"
+"                                                 const float *x2_scale_ptr,\n"
+"                                                 float w1_scale,\n"
+"                                                 float w2_scale,\n"
+"                                                 int has_bias,\n"
+"                                                 int M, int N, int K1, int K2) {\n"
+"    extern __shared__ __align__(16) unsigned short smem_v7c2[];\n"
+"    unsigned short *sA0 = smem_v7c2;\n"
+"    unsigned short *sB0 = smem_v7c2 + 2048;\n"
+"    unsigned short *sA1 = smem_v7c2 + 6144;\n"
+"    unsigned short *sB1 = smem_v7c2 + 8192;\n"
+"    int tid = threadIdx.x;\n"
+"    int wid = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int gid  = lane >> 2;\n"
+"    int tid4 = lane & 3;\n"
+"    int warp_m = wid >> 1;\n"
+"    int warp_n = wid & 1;\n"
+"    int blk_lin = blockIdx.y * gridDim.x + blockIdx.x;\n"
+"    int npx_ = gridDim.x;\n"
+"    int npy_ = gridDim.y;\n"
+"    int panels_m_ = (npy_ + 3) >> 2;\n"
+"    int per_panel_ = 16;\n"
+"    int panel_id_ = blk_lin / per_panel_;\n"
+"    int in_panel_ = blk_lin - panel_id_ * per_panel_;\n"
+"    int panel_m_id_ = panel_id_ - (panel_id_ / panels_m_) * panels_m_;\n"
+"    int panel_n_id_ = panel_id_ / panels_m_;\n"
+"    int m_in_ = in_panel_ & 3;\n"
+"    int n_in_ = in_panel_ >> 2;\n"
+"    int tile_m_ = (panel_m_id_ << 2) + m_in_;\n"
+"    int tile_n_ = (panel_n_id_ << 2) + n_in_;\n"
+"    if (tile_m_ >= npy_ || tile_n_ >= npx_) return;\n"
+"    int cta_m  = tile_m_ * 64;\n"
+"    int cta_n  = tile_n_ * 128;\n"
+"    int wm_row = warp_m * 16;\n"
+"    int wn_col = warp_n * 64;\n"
+"    if (cta_m >= M) return;\n"
+"    float d0[8], d1[8], d2[8], d3[8];\n"
+"    #pragma unroll\n"
+"    for (int i = 0; i < 8; i++) { d0[i]=0; d1[i]=0; d2[i]=0; d3[i]=0; }\n"
+"    int row_a    = tid >> 2;\n"
+"    int col_a_b  = (tid & 3) * 8;\n"
+"    int col_a_g  = (tid & 3) * 16;\n"
+"    int g_row_a  = cta_m + row_a;\n"
+"    int sw_a     = (row_a & 3) * 8;\n"
+"    int swz_a    = row_a * 32 + (col_a_b ^ sw_a);\n"
+"    int row_b0   = tid >> 2;\n"
+"    int col_b0_b = (tid & 3) * 8;\n"
+"    int col_b0_g = (tid & 3) * 16;\n"
+"    int g_row_b0 = cta_n + row_b0;\n"
+"    int sw_b0    = (row_b0 & 3) * 8;\n"
+"    int swz_b0   = row_b0 * 32 + (col_b0_b ^ sw_b0);\n"
+"    int vid_b1   = tid + 256;\n"
+"    int row_b1   = vid_b1 >> 2;\n"
+"    int col_b1_b = (vid_b1 & 3) * 8;\n"
+"    int col_b1_g = (vid_b1 & 3) * 16;\n"
+"    int g_row_b1 = cta_n + row_b1;\n"
+"    int sw_b1    = (row_b1 & 3) * 8;\n"
+"    int swz_b1   = row_b1 * 32 + (col_b1_b ^ sw_b1);\n"
+"    int num_k1 = K1 >> 6;\n"
+"    int num_k2 = K2 >> 6;\n"
+"    int num_k  = num_k1 + num_k2;\n"
+"    {\n"
+"        const fp8_raw *Xp = X1; const fp8_raw *Wp = W1; int K_p = K1; int kbyte = 0;\n"
+"        unsigned int dA = __cvta_generic_to_shared(&sA0[swz_a]);\n"
+"        if (g_row_a < M) {\n"
+"            const fp8_raw *src = &Xp[(size_t)g_row_a * K_p + kbyte + col_a_g];\n"
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dA), \"l\"(src));\n"
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dA)); }\n"
+"        unsigned int dB0 = __cvta_generic_to_shared(&sB0[swz_b0]);\n"
+"        if (g_row_b0 < N) {\n"
+"            const fp8_raw *src = &Wp[(size_t)g_row_b0 * K_p + kbyte + col_b0_g];\n"
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB0), \"l\"(src));\n"
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB0)); }\n"
+"        unsigned int dB1 = __cvta_generic_to_shared(&sB0[swz_b1]);\n"
+"        if (g_row_b1 < N) {\n"
+"            const fp8_raw *src = &Wp[(size_t)g_row_b1 * K_p + kbyte + col_b1_g];\n"
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB1), \"l\"(src));\n"
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB1)); }\n"
+"    }\n"
+"    asm volatile(\"cp.async.commit_group;\\n\");\n"
+"    int la_row     = wm_row + (lane & 15);\n"
+"    int la_col_off = (lane >> 4) * 8;\n"
+"    int la_sw      = (la_row & 3) * 8;\n"
+"    int lb_row     = lane & 15;\n"
+"    int lb_col_off = (lane >> 4) * 8;\n"
+"    float xs1 = x1_scale_ptr[0];\n"
+"    float xs2 = x2_scale_ptr[0];\n"
+"    float s1 = w1_scale * xs1;\n"
+"    float s2 = w2_scale * xs2;\n"
+"    float ratio = (s2 != 0.0f) ? (s1 / s2) : 0.0f;\n"
+"    for (int ki = 0; ki < num_k; ki++) {\n"
+"        int stage = ki & 1;\n"
+"        int next_stage = stage ^ 1;\n"
+"        int next_ki = ki + 1;\n"
+"        if (ki == num_k1) {\n"
+"            #pragma unroll\n"
+"            for (int i = 0; i < 8; i++) { d0[i]*=ratio; d1[i]*=ratio; d2[i]*=ratio; d3[i]*=ratio; }\n"
+"        }\n"
+"        asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"        __syncthreads();\n"
+"        if (next_ki < num_k) {\n"
+"            const fp8_raw *Xp; const fp8_raw *Wp; int K_p; int kbyte;\n"
+"            if (next_ki < num_k1) {\n"
+"                Xp = X1; Wp = W1; K_p = K1; kbyte = next_ki << 6;\n"
+"            } else {\n"
+"                Xp = X2; Wp = W2; K_p = K2; kbyte = (next_ki - num_k1) << 6;\n"
+"            }\n"
+"            unsigned short *sA_next = (next_stage == 0) ? sA0 : sA1;\n"
+"            unsigned short *sB_next = (next_stage == 0) ? sB0 : sB1;\n"
+"            unsigned int dA = __cvta_generic_to_shared(&sA_next[swz_a]);\n"
+"            if (g_row_a < M) {\n"
+"                const fp8_raw *src = &Xp[(size_t)g_row_a * K_p + kbyte + col_a_g];\n"
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dA), \"l\"(src));\n"
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dA)); }\n"
+"            unsigned int dB0 = __cvta_generic_to_shared(&sB_next[swz_b0]);\n"
+"            if (g_row_b0 < N) {\n"
+"                const fp8_raw *src = &Wp[(size_t)g_row_b0 * K_p + kbyte + col_b0_g];\n"
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB0), \"l\"(src));\n"
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB0)); }\n"
+"            unsigned int dB1 = __cvta_generic_to_shared(&sB_next[swz_b1]);\n"
+"            if (g_row_b1 < N) {\n"
+"                const fp8_raw *src = &Wp[(size_t)g_row_b1 * K_p + kbyte + col_b1_g];\n"
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB1), \"l\"(src));\n"
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB1)); }\n"
+"        }\n"
+"        asm volatile(\"cp.async.commit_group;\\n\");\n"
+"        unsigned short *sAp = (stage == 0) ? sA0 : sA1;\n"
+"        unsigned short *sBp = (stage == 0) ? sB0 : sB1;\n"
+"        #pragma unroll\n"
+"        for (int kg = 0; kg < 2; kg++) {\n"
+"            int k_off = kg * 16;\n"
+"            int a_off = la_row * 32 + ((k_off + la_col_off) ^ la_sw);\n"
+"            unsigned int a0,a1,a2,a3;\n"
+"            unsigned int p_a = __cvta_generic_to_shared(&sAp[a_off]);\n"
+"            asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"
+"                : \"=r\"(a0), \"=r\"(a1), \"=r\"(a2), \"=r\"(a3) : \"r\"(p_a));\n"
+"            #pragma unroll\n"
+"            for (int s = 0; s < 4; s++) {\n"
+"                int sn_base = wn_col + s * 16;\n"
+"                int b_brow  = sn_base + lb_row;\n"
+"                int b_sw    = (b_brow & 3) * 8;\n"
+"                int b_off   = b_brow * 32 + ((k_off + lb_col_off) ^ b_sw);\n"
+"                unsigned int b0,b1,b2,b3;\n"
+"                unsigned int p_b = __cvta_generic_to_shared(&sBp[b_off]);\n"
+"                asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"
+"                    : \"=r\"(b0), \"=r\"(b1), \"=r\"(b2), \"=r\"(b3) : \"r\"(p_b));\n"
+"                int nt0 = s * 2 + 0;\n"
+"                int nt1 = s * 2 + 1;\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(d0[nt0]), \"=f\"(d1[nt0]), \"=f\"(d2[nt0]), \"=f\"(d3[nt0])\n"
+"                    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"
+"                      \"r\"(b0), \"r\"(b2),\n"
+"                      \"f\"(d0[nt0]), \"f\"(d1[nt0]), \"f\"(d2[nt0]), \"f\"(d3[nt0])\n"
+"                );\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(d0[nt1]), \"=f\"(d1[nt1]), \"=f\"(d2[nt1]), \"=f\"(d3[nt1])\n"
+"                    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"
+"                      \"r\"(b1), \"r\"(b3),\n"
+"                      \"f\"(d0[nt1]), \"f\"(d1[nt1]), \"f\"(d2[nt1]), \"f\"(d3[nt1])\n"
+"                );\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"    float ds = s2;\n"
+"    int yr0 = cta_m + wm_row + gid;\n"
+"    int yr1 = cta_m + wm_row + gid + 8;\n"
+"    #pragma unroll\n"
+"    for (int nt = 0; nt < 8; nt++) {\n"
+"        int yc0 = cta_n + wn_col + nt*8 + tid4*2;\n"
+"        int yc1 = yc0 + 1;\n"
+"        float b0_v = (has_bias && yc0 < N) ? bias[yc0] : 0.0f;\n"
+"        float b1_v = (has_bias && yc1 < N) ? bias[yc1] : 0.0f;\n"
 "        if (yr0 < M && yc0 < N) Y[(size_t)yr0 * N + yc0] = d0[nt] * ds + b0_v;\n"
 "        if (yr0 < M && yc1 < N) Y[(size_t)yr0 * N + yc1] = d1[nt] * ds + b1_v;\n"
 "        if (yr1 < M && yc0 < N) Y[(size_t)yr1 * N + yc0] = d2[nt] * ds + b0_v;\n"
@@ -2374,6 +2574,50 @@ static const char *flux2_kernel_src =
 "    float v = Y[(size_t)i * cols + j] * (w_scale * xs);\n"
 "    if (has_bias) v += bias[j];\n"
 "    Y[(size_t)i * cols + j] = v;\n"
+"}\n"
+
+/* F32 -> BF16 RNE bulk quant (for v7 BF16 GEMM activation). */
+"extern \"C\" __global__ void quant_bf16(unsigned short *out, const float *in, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    unsigned int u = __float_as_uint(in[i]);\n"
+"    /* round-to-nearest-even */\n"
+"    unsigned int round = ((u >> 16) & 1u) + 0x7fffu;\n"
+"    out[i] = (unsigned short)((u + round) >> 16);\n"
+"}\n"
+
+/* F32 -> F16 bulk quant via cvt.rn.f16.f32 PTX (no cuda_fp16.h dependency). */
+"extern \"C\" __global__ void quant_f16(unsigned short *out, const float *in, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    unsigned short y;\n"
+"    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(y) : \"f\"(in[i]));\n"
+"    out[i] = y;\n"
+"}\n"
+
+/* In-place bias add: Y[i, j] += bias[j].  No-op if has_bias == 0. */
+"extern \"C\" __global__ void add_bias_inplace_f32(\n"
+"    float *Y, const float *bias, int rows, int cols, int has_bias) {\n"
+"    if (!has_bias) return;\n"
+"    int j = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int i = blockIdx.y;\n"
+"    if (j >= cols || i >= rows) return;\n"
+"    Y[(size_t)i * cols + j] += bias[j];\n"
+"}\n"
+
+/* BF16 -> F32 expand with optional bias add. Used as the post-pass for the
+ * cuBLAS-LT FP8 (BF16-out) path. bias may be NULL (skipped). */
+"extern \"C\" __global__ void bf16_to_f32_add_bias_f32(\n"
+"    float *Y, const unsigned short *Y_bf16,\n"
+"    const float *bias, int n_out, int n_tok) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = n_out * n_tok;\n"
+"    if (i >= total) return;\n"
+"    unsigned int bits = ((unsigned int)Y_bf16[i]) << 16;\n"
+"    float v;\n"
+"    asm(\"mov.b32 %0, %1;\" : \"=f\"(v) : \"r\"(bits));\n"
+"    if (bias) v += bias[i % n_out];\n"
+"    Y[i] = v;\n"
 "}\n"
 
 "\n} /* extern \"C\" */\n"
@@ -2476,17 +2720,43 @@ struct cuda_flux2_runner {
     /* FP8 v7 GEMM (ported from cuda/gemm) — quantize X to FP8 and use the
      * cp.async + ldmatrix + 4×4 panel-swizzle kernel. Workspace sized to the
      * largest activation across all GEMMs in the step. */
-    CUfunction fn_gemm_fp8_v7, fn_gemm_fp8_v7_fused, fn_descale_add_bias;
+    CUfunction fn_gemm_fp8_v7, fn_gemm_fp8_v7_fused, fn_gemm_fp8_v7_concat2, fn_descale_add_bias;
     CUdeviceptr d_x_fp8;          /* FP8 quantized activation buffer */
     CUdeviceptr d_x_max;           /* [1] f32 abs-max scratch */
     CUdeviceptr d_x_scale;         /* [1] f32 per-tensor scale */
     size_t x_fp8_buf_n;            /* allocated bytes */
+    /* Second FP8 buffer for concat-K fused GEMMs (e.g. lin2 in single block). */
+    CUdeviceptr d_x_fp8_2;
+    CUdeviceptr d_x_max_2;
+    CUdeviceptr d_x_scale_2;
+    size_t x_fp8_buf_n_2;
     int use_fp8_v7;
+    int use_bf16_gemm;          /* FLUX2_BF16_GEMM=1: route DiT GEMMs through gemm_bf16_f32 */
+    CUfunction fn_gemm_f16_mma; /* MMA m16n8k16 F16 GEMM (gemm_f16_f32, faster than tiled) */
+    /* v7 BF16/F16 GEMM (cp.async + ldmatrix + 4x4 panel swizzle, ported from cuda/gemm). */
+    CUfunction fn_gemm_bf16_v7, fn_gemm_f16_v7;
+    CUfunction fn_quant_bf16, fn_quant_f16, fn_add_bias_inplace;
+    CUdeviceptr d_x_bf16;       /* BF16 quantized activation buffer (uint16) */
+    CUdeviceptr d_x_f16;        /* F16  quantized activation buffer (uint16) */
+    size_t x_bf16_buf_n;        /* allocated element count */
+    size_t x_f16_buf_n;
+    int use_bf16_v7;            /* enabled when bf16 mode + all v7 kernels found */
+    int use_f16_v7;
     int max_tok;
     int gpu_loaded;
     int use_gpu_dbl_attn;
     int debug_dbl_attn;
     int profile_step;
+
+    /* cuBLAS-LT FP8 e4m3 GEMM path (sm_89+; opt-in via FLUX2_CUBLASLT_FP8=1).
+     * On RTX 5060 Ti reaches 60-145 TFLOP/s vs ~30-45 for v7 on flux2 shapes.
+     * Output is BF16; expand+bias is a separate kernel (bf16_to_f32_add_bias_f32). */
+    int use_cublaslt_fp8;
+    struct cublasew_context *cublaslt_ctx;
+    CUdeviceptr d_w_scale_lt;        /* [1] f32 per-call host->device w_scale */
+    CUdeviceptr d_y_bf16_scratch;    /* [n_tok*n_out] bf16 LT output */
+    size_t y_bf16_scratch_n;         /* allocated bytes */
+    CUfunction fn_bf16_to_f32_add_bias;
 };
 
 /* ---- F32 to F16 conversion ---- */
@@ -2523,6 +2793,47 @@ static void f32_to_f16_bulk(uint16_t *out, const float *in, int n) {
     #pragma omp parallel for schedule(static) if(n > 100000)
     for (int i = 0; i < n; i++) out[i] = f2h(in[i]);
 #endif
+}
+
+/* Bulk F32→BF16 conversion (round-to-nearest-even). */
+/* Host-side FP8 E4M3 → F32 (matches device fp8e4m3_to_f32). */
+static float host_fp8_e4m3_to_f32(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp  = (b >> 3) & 0xF;
+    uint32_t mant = b & 0x7;
+    if (exp == 0 && mant == 0) return sign ? -0.0f : 0.0f;
+    float f;
+    if (exp == 0) {
+        f = ldexpf((float)mant / 8.0f, -6);
+    } else if (exp == 15 && mant == 7) {
+        return 0.0f;
+    } else {
+        f = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
+    }
+    return sign ? -f : f;
+}
+
+/* Forward decl: full definition (with AVX2 path) is later in this file. */
+static void f32_to_bf16_bulk(uint16_t *out, const float *in, int n);
+
+/* Upload F32 array as BF16 to GPU, returns device pointer */
+static CUdeviceptr gpu_upload_bf16(const float *data, int n) {
+    uint16_t *tmp = (uint16_t *)malloc((size_t)n * 2);
+    f32_to_bf16_bulk(tmp, data, n);
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, (size_t)n * 2);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_bf16 alloc failed (%zu bytes, err=%d)\n",
+                (size_t)n * 2, (int)err);
+        free(tmp); return 0;
+    }
+    err = cuMemcpyHtoD(d, tmp, (size_t)n * 2);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_bf16 copy failed (%d)\n", (int)err);
+        cuMemFree(d); free(tmp); return 0;
+    }
+    free(tmp);
+    return d;
 }
 
 /* Upload F32 array as F16 to GPU, returns device pointer */
@@ -2598,29 +2909,114 @@ static CUdeviceptr gpu_upload_mat_f16(const flux2_mat *m) {
     return gpu_upload_f16(m->w, m->rows * m->cols);
 }
 
-/* Upload flux2_mat as F16 or F32 depending on flag */
-static CUdeviceptr gpu_upload_mat_auto(const flux2_mat *m, int use_f16) {
-    return use_f16 ? gpu_upload_mat_f16(m) : gpu_upload_mat(m);
+/* Weight upload format codes (passed via single int to keep call sites tidy). */
+#define FLUX2_W_F32  0
+#define FLUX2_W_F16  1
+#define FLUX2_W_BF16 2
+
+/* Upload flux2_mat as F32/F16/BF16 depending on mode */
+static CUdeviceptr gpu_upload_mat_auto(const flux2_mat *m, int mode) {
+    int n = m->rows * m->cols;
+    if (mode == FLUX2_W_F16)  return gpu_upload_f16(m->w, n);
+    if (mode == FLUX2_W_BF16) return gpu_upload_bf16(m->w, n);
+    return gpu_upload_f32(m->w, n);
 }
 
-/* Upload raw F32 array as F16 or F32 depending on flag */
-static CUdeviceptr gpu_upload_f32_auto(const float *data, int n, int use_f16) {
-    return use_f16 ? gpu_upload_f16(data, n) : gpu_upload_f32(data, n);
+/* Upload raw F32 array as F32/F16/BF16 depending on mode */
+static CUdeviceptr gpu_upload_f32_auto(const float *data, int n, int mode) {
+    if (mode == FLUX2_W_F16)  return gpu_upload_f16(data, n);
+    if (mode == FLUX2_W_BF16) return gpu_upload_bf16(data, n);
+    return gpu_upload_f32(data, n);
 }
 
 /* ---- Op functions ---- */
 
+static int ensure_x_bf16_buf(cuda_flux2_runner *r, size_t n_elems);
+static int ensure_x_f16_buf(cuda_flux2_runner *r, size_t n_elems);
+
 static void op_gemm(cuda_flux2_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
+    /* v7 BF16/F16 fast path (cp.async + ldmatrix + 4x4 panel swizzle). */
+    if (r->use_bf16_v7 && (n_in % 32) == 0) {
+        size_t n_elems = (size_t)n_tok * (size_t)n_in;
+        if (ensure_x_bf16_buf(r, n_elems) == 0) {
+            int n = (int)n_elems;
+            void *qargs[] = {&r->d_x_bf16, &X, &n};
+            cuLaunchKernel(r->fn_quant_bf16,
+                           (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                           0, r->stream, qargs, NULL);
+            int M = n_tok, N = n_out, K = n_in;
+            unsigned npx = (unsigned)((N + 127) / 128);
+            unsigned npy = (unsigned)((M + 63) / 64);
+            unsigned gx = (npx + 3u) & ~3u;
+            unsigned gy = (npy + 3u) & ~3u;
+            unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
+            void *gargs[] = {&Y, &r->d_x_bf16, &W, &M, &N, &K};
+            cuLaunchKernel(r->fn_gemm_bf16_v7, gx, gy, 1, 256, 1, 1,
+                           smem_bytes, r->stream, gargs, NULL);
+            int has_bias = (bias != 0) ? 1 : 0;
+            int rows = n_tok, cols = n_out;
+            void *bargs[] = {&Y, &bias, &rows, &cols, &has_bias};
+            unsigned bx = 256;
+            unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+            unsigned gyd = (unsigned)rows;
+            cuLaunchKernel(r->fn_add_bias_inplace, gxd, gyd, 1, bx, 1, 1,
+                           0, r->stream, bargs, NULL);
+            return;
+        }
+    }
+    if (r->use_f16_v7 && (n_in % 32) == 0) {
+        size_t n_elems = (size_t)n_tok * (size_t)n_in;
+        if (ensure_x_f16_buf(r, n_elems) == 0) {
+            int n = (int)n_elems;
+            void *qargs[] = {&r->d_x_f16, &X, &n};
+            cuLaunchKernel(r->fn_quant_f16,
+                           (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                           0, r->stream, qargs, NULL);
+            int M = n_tok, N = n_out, K = n_in;
+            unsigned npx = (unsigned)((N + 127) / 128);
+            unsigned npy = (unsigned)((M + 63) / 64);
+            unsigned gx = (npx + 3u) & ~3u;
+            unsigned gy = (npy + 3u) & ~3u;
+            unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
+            void *gargs[] = {&Y, &r->d_x_f16, &W, &M, &N, &K};
+            cuLaunchKernel(r->fn_gemm_f16_v7, gx, gy, 1, 256, 1, 1,
+                           smem_bytes, r->stream, gargs, NULL);
+            int has_bias = (bias != 0) ? 1 : 0;
+            int rows = n_tok, cols = n_out;
+            void *bargs[] = {&Y, &bias, &rows, &cols, &has_bias};
+            unsigned bx = 256;
+            unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+            unsigned gyd = (unsigned)rows;
+            cuLaunchKernel(r->fn_add_bias_inplace, gxd, gyd, 1, bx, 1, 1,
+                           0, r->stream, bargs, NULL);
+            return;
+        }
+    }
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+    if (r->use_bf16_gemm && r->fn_gemm_bf16) {
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(r->fn_gemm_bf16, gx, gy, 1, 128, 1, 1, 0, r->stream, args, NULL);
+        return;
+    }
+    if (r->use_f16_gemm && r->fn_gemm_f16_mma) {
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(r->fn_gemm_f16_mma, gx, gy, 1, 128, 1, 1,
+                       16 * 16 * sizeof(float), r->stream, args, NULL);
+        return;
+    }
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     CUfunction fn = r->use_f16_gemm ? r->fn_gemm_f16 : r->fn_gemm;
-    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, r->stream, args, NULL);
 }
 
 /* Dispatch GEMM: picks F32/F16/FP8 based on runner mode + per-weight scale */
 static int ensure_x_fp8_buf(cuda_flux2_runner *r, size_t bytes);
+static int ensure_x_bf16_buf(cuda_flux2_runner *r, size_t n_elems);
+static int ensure_x_f16_buf(cuda_flux2_runner *r, size_t n_elems);
 
 /* op_gemm_scaled dispatch: picks FP8 MMA / tiled / F32 path.
  *
@@ -2629,10 +3025,75 @@ static int ensure_x_fp8_buf(cuda_flux2_runner *r, size_t bytes);
  * (typically -1.0f) means the weight was not FP8 (F32/F16 fallback upload) and
  * the plain F32/F16 GEMM path must be used. This avoids the ambiguity of using
  * 1.0f as a sentinel when a genuine FP8 tensor happens to have scale=1.0. */
-static void op_gemm_scaled(cuda_flux2_runner *r, CUdeviceptr Y, CUdeviceptr W,
+static void op_gemm_scaled_ex(cuda_flux2_runner *r, CUdeviceptr Y, CUdeviceptr W,
                            CUdeviceptr X, CUdeviceptr bias,
-                           int n_out, int n_in, int n_tok, float w_scale) {
+                           int n_out, int n_in, int n_tok, float w_scale,
+                           int accumulate) {
+    /* accumulate (Y += result) is only implemented in the FP8 v7 fused path.
+     * Caller is responsible for ensuring v7 will fire — non-v7 paths overwrite Y. */
+    if (accumulate && !(r->use_fp8_gemm && w_scale > 0.0f && r->use_fp8_v7 &&
+                        r->fn_gemm_fp8_v7_fused && (n_in % 64) == 0 && n_tok >= 256)) {
+        fprintf(stderr, "op_gemm_scaled_ex: accumulate=1 requires FP8 v7 fused path "
+                        "(use_fp8_gemm=%d w_scale=%g use_fp8_v7=%d n_in=%d n_tok=%d)\n",
+                r->use_fp8_gemm, (double)w_scale, r->use_fp8_v7, n_in, n_tok);
+        abort();
+    }
     if (r->use_fp8_gemm && w_scale > 0.0f) {
+        /* cuBLAS-LT FP8 e4m3 path — try first when enabled. Reaches 60-145
+         * TFLOP/s on flux2 shapes (RTX 5060 Ti) vs ~30-45 for v7. Skipped for
+         * accumulate=1 (only v7 fused supports inplace add); falls through to
+         * v7 if LT init/runtime fails or shape constraints aren't met. */
+        if (r->use_cublaslt_fp8 && !accumulate &&
+            n_tok >= 8 && n_in >= 32 && n_out >= 16) {
+            size_t need_x = (size_t)n_tok * (size_t)n_in;
+            size_t need_y = (size_t)n_tok * (size_t)n_out * sizeof(uint16_t);
+            int x_ok = (ensure_x_fp8_buf(r, need_x) == 0);
+            if (x_ok && need_y > r->y_bf16_scratch_n) {
+                if (r->d_y_bf16_scratch) cuMemFree(r->d_y_bf16_scratch);
+                r->d_y_bf16_scratch = 0;
+                if (cuMemAlloc(&r->d_y_bf16_scratch, need_y) == CUDA_SUCCESS) {
+                    r->y_bf16_scratch_n = need_y;
+                } else { r->y_bf16_scratch_n = 0; x_ok = 0; }
+            }
+            if (x_ok && r->d_y_bf16_scratch) {
+                /* 1) zero max + reduce_max_abs(X) */
+                cuMemsetD32Async(r->d_x_max, 0, 1, r->stream);
+                int n = (int)need_x;
+                void *rargs[] = {&r->d_x_max, &X, &n};
+                cuLaunchKernel(r->fn_reduce_max_abs,
+                               (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                               0, r->stream, rargs, NULL);
+                /* 2) quant X -> FP8; writes per-tensor x_scale = max/448 */
+                void *qargs[] = {&r->d_x_fp8, &r->d_x_scale, &X, &r->d_x_max, &n};
+                cuLaunchKernel(r->fn_quant_fp8,
+                               (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                               0, r->stream, qargs, NULL);
+                /* 3) upload host w_scale -> device (4 bytes async on stream) */
+                cuMemcpyHtoDAsync(r->d_w_scale_lt, &w_scale, sizeof(float), r->stream);
+                /* 4) cuBLAS-LT FP8 matmul (BF16 out): Y_bf16 = (W @ X^T)*w_scale*x_scale */
+                int rc = cublasew_gemm_fp8_e4m3_bf16out_rowmajor_nt(
+                    r->cublaslt_ctx,
+                    r->d_y_bf16_scratch,
+                    W, r->d_x_fp8,
+                    r->d_w_scale_lt, r->d_x_scale,
+                    0,  /* no LT bias epilogue; do in expand */
+                    n_tok, n_out, n_in);
+                if (rc == 0) {
+                    /* 5) BF16 -> F32 expand (+ optional bias) */
+                    int total = n_out * n_tok;
+                    void *eargs[] = {&Y, &r->d_y_bf16_scratch, &bias, &n_out, &n_tok};
+                    cuLaunchKernel(r->fn_bf16_to_f32_add_bias,
+                                   (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1,
+                                   0, r->stream, eargs, NULL);
+                    return;
+                }
+                /* LT runtime failure — fall through to v7 below. Disable to
+                 * avoid repeated failures hammering the host log. */
+                r->use_cublaslt_fp8 = 0;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "cuda_flux2: cuBLAS-LT matmul failed (rc=%d), disabling LT path\n", rc);
+            }
+        }
         /* FP8 v7 path: quantize X to FP8, run gemm_fp8_v7, then descale+bias.
          * Constraints:
          *   K (= n_in) divisible by 64 (FP8 64-byte K-tile);
@@ -2680,7 +3141,7 @@ static void op_gemm_scaled(cuda_flux2_runner *r, CUdeviceptr Y, CUdeviceptr W,
                         int has_bias = (bias != 0) ? 1 : 0;
                         void *args[] = {&Y, &r->d_x_fp8, &W, &bias,
                                         &r->d_x_scale, &w_scale, &has_bias,
-                                        &M, &N, &K};
+                                        &accumulate, &M, &N, &K};
                         cuLaunchKernel(r->fn_gemm_fp8_v7_fused, gx, gy, 1, 256, 1, 1,
                                        smem_bytes, r->stream, args, NULL);
                     } else {
@@ -2725,13 +3186,93 @@ static void op_gemm_scaled(cuda_flux2_runner *r, CUdeviceptr Y, CUdeviceptr W,
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale};
         cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, r->stream, args, NULL);
     } else {
-        /* F32 or F16 (scale=1.0 means BF16→F32 fallback) */
+        /* F32 / F16 / BF16 fallback (w_scale<0 sentinel: weight buffer is not FP8). */
+        /* v7 BF16 path: K must be a multiple of 32. */
+        if (r->use_bf16_v7 && (n_in % 32) == 0) {
+            size_t n_elems = (size_t)n_tok * (size_t)n_in;
+            if (ensure_x_bf16_buf(r, n_elems) == 0) {
+                /* 1) F32 -> BF16 quant */
+                int n = (int)n_elems;
+                void *qargs[] = {&r->d_x_bf16, &X, &n};
+                cuLaunchKernel(r->fn_quant_bf16,
+                               (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                               0, r->stream, qargs, NULL);
+                /* 2) v7 GEMM: Y[M, N] = X[M, K] @ W[N, K]^T  (M=n_tok, N=n_out, K=n_in). */
+                int M = n_tok, N = n_out, K = n_in;
+                unsigned npx = (unsigned)((N + 127) / 128);
+                unsigned npy = (unsigned)((M + 63) / 64);
+                unsigned gx = (npx + 3u) & ~3u;
+                unsigned gy = (npy + 3u) & ~3u;
+                unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;  /* 24 KiB */
+                void *gargs[] = {&Y, &r->d_x_bf16, &W, &M, &N, &K};
+                cuLaunchKernel(r->fn_gemm_bf16_v7, gx, gy, 1, 256, 1, 1,
+                               smem_bytes, r->stream, gargs, NULL);
+                /* 3) bias post-pass (no-op when bias==NULL). */
+                int has_bias = (bias != 0) ? 1 : 0;
+                int rows = n_tok, cols = n_out;
+                void *bargs[] = {&Y, &bias, &rows, &cols, &has_bias};
+                unsigned bx = 256;
+                unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+                unsigned gyd = (unsigned)rows;
+                cuLaunchKernel(r->fn_add_bias_inplace, gxd, gyd, 1, bx, 1, 1,
+                               0, r->stream, bargs, NULL);
+                return;
+            }
+        }
+        if (r->use_f16_v7 && (n_in % 32) == 0) {
+            size_t n_elems = (size_t)n_tok * (size_t)n_in;
+            if (ensure_x_f16_buf(r, n_elems) == 0) {
+                int n = (int)n_elems;
+                void *qargs[] = {&r->d_x_f16, &X, &n};
+                cuLaunchKernel(r->fn_quant_f16,
+                               (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                               0, r->stream, qargs, NULL);
+                int M = n_tok, N = n_out, K = n_in;
+                unsigned npx = (unsigned)((N + 127) / 128);
+                unsigned npy = (unsigned)((M + 63) / 64);
+                unsigned gx = (npx + 3u) & ~3u;
+                unsigned gy = (npy + 3u) & ~3u;
+                unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
+                void *gargs[] = {&Y, &r->d_x_f16, &W, &M, &N, &K};
+                cuLaunchKernel(r->fn_gemm_f16_v7, gx, gy, 1, 256, 1, 1,
+                               smem_bytes, r->stream, gargs, NULL);
+                int has_bias = (bias != 0) ? 1 : 0;
+                int rows = n_tok, cols = n_out;
+                void *bargs[] = {&Y, &bias, &rows, &cols, &has_bias};
+                unsigned bx = 256;
+                unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+                unsigned gyd = (unsigned)rows;
+                cuLaunchKernel(r->fn_add_bias_inplace, gxd, gyd, 1, bx, 1, 1,
+                               0, r->stream, bargs, NULL);
+                return;
+            }
+        }
+        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
+        if (r->use_bf16_gemm && r->fn_gemm_bf16) {
+            unsigned gx = (unsigned)((n_out + 255) / 256);
+            unsigned gy = (unsigned)((n_tok + 15) / 16);
+            cuLaunchKernel(r->fn_gemm_bf16, gx, gy, 1, 128, 1, 1, 0, r->stream, args, NULL);
+            return;
+        }
+        if (r->use_f16_gemm && r->fn_gemm_f16_mma) {
+            unsigned gx = (unsigned)((n_out + 255) / 256);
+            unsigned gy = (unsigned)((n_tok + 15) / 16);
+            cuLaunchKernel(r->fn_gemm_f16_mma, gx, gy, 1, 128, 1, 1,
+                           16 * 16 * sizeof(float), r->stream, args, NULL);
+            return;
+        }
         unsigned gx = (unsigned)((n_out + 63) / 64);
         unsigned gy = (unsigned)((n_tok + 15) / 16);
         CUfunction fn = r->use_f16_gemm ? r->fn_gemm_f16 : r->fn_gemm;
-        void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
         cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, r->stream, args, NULL);
     }
+}
+
+/* Convenience wrapper: standard GEMM (no accumulation). */
+static void op_gemm_scaled(cuda_flux2_runner *r, CUdeviceptr Y, CUdeviceptr W,
+                           CUdeviceptr X, CUdeviceptr bias,
+                           int n_out, int n_in, int n_tok, float w_scale) {
+    op_gemm_scaled_ex(r, Y, W, X, bias, n_out, n_in, n_tok, w_scale, 0);
 }
 
 /* FP8 GEMM: same grid but with per-tensor weight scale */
@@ -2827,6 +3368,106 @@ static int ensure_x_fp8_buf(cuda_flux2_runner *r, size_t bytes) {
         if (cuMemAlloc(&r->d_x_scale, sizeof(float)) != CUDA_SUCCESS) { r->d_x_scale = 0; return -1; }
     }
     r->x_fp8_buf_n = bytes;
+    return 0;
+}
+
+/* Lazily allocate BF16/F16 X quant buffer for v7 GEMM. `n_elems` is element count. */
+static int ensure_x_bf16_buf(cuda_flux2_runner *r, size_t n_elems) {
+    if (n_elems <= r->x_bf16_buf_n) return 0;
+    if (r->d_x_bf16) { cuMemFree(r->d_x_bf16); r->d_x_bf16 = 0; }
+    r->x_bf16_buf_n = 0;
+    if (cuMemAlloc(&r->d_x_bf16, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS) {
+        r->d_x_bf16 = 0; return -1;
+    }
+    r->x_bf16_buf_n = n_elems;
+    return 0;
+}
+
+static int ensure_x_f16_buf(cuda_flux2_runner *r, size_t n_elems) {
+    if (n_elems <= r->x_f16_buf_n) return 0;
+    if (r->d_x_f16) { cuMemFree(r->d_x_f16); r->d_x_f16 = 0; }
+    r->x_f16_buf_n = 0;
+    if (cuMemAlloc(&r->d_x_f16, n_elems * sizeof(unsigned short)) != CUDA_SUCCESS) {
+        r->d_x_f16 = 0; return -1;
+    }
+    r->x_f16_buf_n = n_elems;
+    return 0;
+}
+
+/* Second FP8 quantize buffer (for concat-K fused GEMM). */
+static int ensure_x_fp8_buf2(cuda_flux2_runner *r, size_t bytes) {
+    if (bytes <= r->x_fp8_buf_n_2) return 0;
+    if (r->d_x_fp8_2) { cuMemFree(r->d_x_fp8_2); r->d_x_fp8_2 = 0; }
+    r->x_fp8_buf_n_2 = 0;
+    if (cuMemAlloc(&r->d_x_fp8_2, bytes) != CUDA_SUCCESS) { r->d_x_fp8_2 = 0; return -1; }
+    if (!r->d_x_max_2) {
+        if (cuMemAlloc(&r->d_x_max_2, sizeof(float)) != CUDA_SUCCESS) { r->d_x_max_2 = 0; return -1; }
+    }
+    if (!r->d_x_scale_2) {
+        if (cuMemAlloc(&r->d_x_scale_2, sizeof(float)) != CUDA_SUCCESS) { r->d_x_scale_2 = 0; return -1; }
+    }
+    r->x_fp8_buf_n_2 = bytes;
+    return 0;
+}
+
+/* Concat-K fused GEMM: Y = (X1 @ W1^T) * s1 + (X2 @ W2^T) * s2 + bias.
+ * Replaces a sequential pair of op_gemm_scaled calls with accumulate=1 by
+ * folding both K-segments into one v7 kernel launch. Returns 0 on dispatch,
+ * -1 if the v7 fast path is unavailable (caller should fall back). */
+static int op_gemm_fp8_concat2(cuda_flux2_runner *r, CUdeviceptr Y,
+                                CUdeviceptr W1, CUdeviceptr X1, float w1_scale, int K1,
+                                CUdeviceptr W2, CUdeviceptr X2, float w2_scale, int K2,
+                                CUdeviceptr bias, int M, int N) {
+    if (!(r->use_fp8_gemm && r->use_fp8_v7 && r->fn_gemm_fp8_v7_concat2 &&
+          w1_scale > 0.0f && w2_scale > 0.0f &&
+          (K1 % 64) == 0 && (K2 % 64) == 0 && M >= 256))
+        return -1;
+    size_t n1 = (size_t)M * (size_t)K1;
+    size_t n2 = (size_t)M * (size_t)K2;
+    if (ensure_x_fp8_buf(r, n1) != 0) return -1;
+    if (ensure_x_fp8_buf2(r, n2) != 0) return -1;
+    /* Quantize X1 -> d_x_fp8 with d_x_scale */
+    cuMemsetD32Async(r->d_x_max, 0, 1, r->stream);
+    {
+        int n = (int)n1;
+        void *args[] = {&r->d_x_max, &X1, &n};
+        cuLaunchKernel(r->fn_reduce_max_abs, (unsigned)((n + 255) / 256), 1, 1,
+                       256, 1, 1, 0, r->stream, args, NULL);
+    }
+    {
+        int n = (int)n1;
+        void *args[] = {&r->d_x_fp8, &r->d_x_scale, &X1, &r->d_x_max, &n};
+        cuLaunchKernel(r->fn_quant_fp8, (unsigned)((n + 255) / 256), 1, 1,
+                       256, 1, 1, 0, r->stream, args, NULL);
+    }
+    /* Quantize X2 -> d_x_fp8_2 with d_x_scale_2 */
+    cuMemsetD32Async(r->d_x_max_2, 0, 1, r->stream);
+    {
+        int n = (int)n2;
+        void *args[] = {&r->d_x_max_2, &X2, &n};
+        cuLaunchKernel(r->fn_reduce_max_abs, (unsigned)((n + 255) / 256), 1, 1,
+                       256, 1, 1, 0, r->stream, args, NULL);
+    }
+    {
+        int n = (int)n2;
+        void *args[] = {&r->d_x_fp8_2, &r->d_x_scale_2, &X2, &r->d_x_max_2, &n};
+        cuLaunchKernel(r->fn_quant_fp8, (unsigned)((n + 255) / 256), 1, 1,
+                       256, 1, 1, 0, r->stream, args, NULL);
+    }
+    /* Launch concat2 kernel */
+    {
+        unsigned npx = (unsigned)((N + 127) / 128);
+        unsigned npy = (unsigned)((M + 63) / 64);
+        unsigned gx = (npx + 3u) & ~3u;
+        unsigned gy = (npy + 3u) & ~3u;
+        unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
+        int has_bias = (bias != 0) ? 1 : 0;
+        void *args[] = {&Y, &r->d_x_fp8, &r->d_x_fp8_2, &W1, &W2, &bias,
+                        &r->d_x_scale, &r->d_x_scale_2,
+                        &w1_scale, &w2_scale, &has_bias, &M, &N, &K1, &K2};
+        cuLaunchKernel(r->fn_gemm_fp8_v7_concat2, gx, gy, 1, 256, 1, 1,
+                       smem_bytes, r->stream, args, NULL);
+    }
     return 0;
 }
 
@@ -3177,6 +3818,12 @@ static void op_vae_latent_bn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr 
  *
  * The F32 fallback branch must NOT return scale=1.0 because a genuine FP8 tensor
  * may legitimately have weight_scale==1.0; see op_gemm_scaled for dispatch. */
+/* Upload-time target weight format. Set at the top of load_dit() based on
+ * the runner's use_fp8_gemm / use_bf16_gemm / use_f16_gemm flags so all
+ * existing gpu_upload_st_fp8 callsites pick up the right conversion without
+ * needing per-callsite plumbing. */
+static int g_flux2_upload_mode = FLUX2_W_F32;
+
 static CUdeviceptr gpu_upload_st_fp8(st_context *st, const char *wname, const char *sname,
                                       float *out_scale) {
     int widx = safetensors_find(st, wname);
@@ -3185,6 +3832,30 @@ static CUdeviceptr gpu_upload_st_fp8(st_context *st, const char *wname, const ch
     const uint64_t *sh = safetensors_shape(st, widx);
     int nd = safetensors_ndims(st, widx);
     size_t n = (nd >= 2) ? (size_t)sh[0] * sh[1] : (size_t)sh[0];
+
+    /* When upload-mode != F32 (i.e. F16 or BF16), dequantize FP8 to F32 with
+     * the per-tensor weight_scale baked in, then convert to F16 or BF16 and
+     * return scale=-1.0 sentinel so GEMM dispatch takes the non-FP8 path. */
+    if (strcmp(dtype, "F8_E4M3") == 0 && g_flux2_upload_mode != FLUX2_W_F32) {
+        /* Dequantize FP8 -> F32 with the per-tensor weight_scale baked in,
+         * then convert to F16 or BF16 per upload mode. */
+        float ws = 1.0f;
+        if (sname) {
+            int sidx = safetensors_find(st, sname);
+            if (sidx >= 0) ws = *(const float *)safetensors_data(st, sidx);
+        }
+        const uint8_t *src = (const uint8_t *)safetensors_data(st, widx);
+        float *f32 = (float *)malloc(n * sizeof(float));
+        for (size_t i = 0; i < n; i++) f32[i] = host_fp8_e4m3_to_f32(src[i]) * ws;
+        *out_scale = -1.0f;
+        CUdeviceptr d = (g_flux2_upload_mode == FLUX2_W_BF16)
+            ? gpu_upload_bf16(f32, (int)n)
+            : (g_flux2_upload_mode == FLUX2_W_F16
+                  ? gpu_upload_f16(f32, (int)n)
+                  : gpu_upload_f32(f32, (int)n));
+        free(f32);
+        return d;
+    }
 
     if (strcmp(dtype, "F8_E4M3") == 0) {
         /* Native FP8: upload raw bytes */
@@ -3208,7 +3879,11 @@ static CUdeviceptr gpu_upload_st_fp8(st_context *st, const char *wname, const ch
         } else {
             memcpy(f32, safetensors_data(st, widx), n * sizeof(float));
         }
-        CUdeviceptr d = gpu_upload_f32(f32, (int)n);
+        CUdeviceptr d = (g_flux2_upload_mode == FLUX2_W_BF16)
+            ? gpu_upload_bf16(f32, (int)n)
+            : (g_flux2_upload_mode == FLUX2_W_F16
+                  ? gpu_upload_f16(f32, (int)n)
+                  : gpu_upload_f32(f32, (int)n));
         free(f32);
         return d;
     }
@@ -3249,11 +3924,19 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     cuDeviceGetName(name, sizeof(name), device);
     if (verbose >= 1) fprintf(stderr, "cuda_flux2: device %d = %s\n", device_id, name);
 
-    /* Compile kernels */
-    size_t len1 = strlen(cuda_kernels_common_src), len2 = strlen(flux2_kernel_src);
-    char *full = (char *)malloc(len1 + len2 + 16);
-    memcpy(full, cuda_kernels_common_src, len1);
-    memcpy(full + len1, flux2_kernel_src, len2 + 1);
+    /* Compile kernels: common + flux2-specific + v7 BF16/F16 (from cuda/gemm). */
+    size_t len1 = strlen(cuda_kernels_common_src);
+    size_t len2 = strlen(flux2_kernel_src);
+    size_t len3 = strlen(k_gemm_bf16_v7_src);
+    size_t len4 = strlen(k_gemm_f16_v7_src);
+    char *full = (char *)malloc(len1 + len2 + len3 + len4 + 64);
+    char *p = full;
+    memcpy(p, cuda_kernels_common_src, len1); p += len1;
+    memcpy(p, flux2_kernel_src,        len2); p += len2;
+    /* The v7 kernel strings declare half_raw/bf16_raw inside; concat at file scope. */
+    memcpy(p, k_gemm_bf16_v7_src,      len3); p += len3;
+    memcpy(p, k_gemm_f16_v7_src,       len4); p += len4;
+    *p = '\0';
 
     CUmodule mod;
     if (cu_compile_kernels(&mod, device, full, "flux2.cu", verbose, "cuda_flux2") < 0) {
@@ -3272,16 +3955,20 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     r->debug_dbl_attn = flux2_env_enabled("FLUX2_DEBUG_DBL_ATTN");
     r->use_f16_gemm = flux2_env_enabled("FLUX2_F16_GEMM");
     r->use_fp8_gemm = flux2_env_enabled("FLUX2_FP8_GEMM");
+    r->use_bf16_gemm = flux2_env_enabled("FLUX2_BF16_GEMM");
     r->fp8_bf16_act = flux2_env_enabled("FLUX2_FP8_BF16");
     if (r->fp8_bf16_act) r->use_fp8_gemm = 1;  /* BF16-act implies FP8 mode */
-    if (r->use_fp8_gemm) r->use_f16_gemm = 0;  /* FP8 takes priority */
+    /* Precedence: FP8 > BF16 > F16 > F32. */
+    if (r->use_fp8_gemm)  { r->use_bf16_gemm = 0; r->use_f16_gemm = 0; }
+    if (r->use_bf16_gemm) { r->use_f16_gemm  = 0; }
     /* Default ON: MMA m16n8k32 path. Set FLUX2_FP8_TILED=1 to fall back to scalar tile. */
     r->use_fp8_mma = r->use_fp8_gemm && !flux2_env_enabled("FLUX2_FP8_TILED");
     r->use_fp8_attn = flux2_env_enabled("FLUX2_FP8_ATTN");
     r->use_bf16_attn = flux2_env_enabled("FLUX2_BF16_ATTN");
     r->use_fp8_v7 = flux2_env_enabled("FLUX2_FP8_V7");
     r->d_x_fp8 = 0; r->d_x_max = 0; r->d_x_scale = 0; r->x_fp8_buf_n = 0;
-    r->fn_gemm_fp8_v7 = NULL; r->fn_gemm_fp8_v7_fused = NULL; r->fn_descale_add_bias = NULL;
+    r->d_x_fp8_2 = 0; r->d_x_max_2 = 0; r->d_x_scale_2 = 0; r->x_fp8_buf_n_2 = 0;
+    r->fn_gemm_fp8_v7 = NULL; r->fn_gemm_fp8_v7_fused = NULL; r->fn_gemm_fp8_v7_concat2 = NULL; r->fn_descale_add_bias = NULL;
     {
         const char *pv = getenv("FLUX2_PROFILE");
         r->profile_step = (pv && pv[0]) ? atoi(pv) : 0;
@@ -3300,6 +3987,8 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     /* Get function handles */
     cuModuleGetFunction(&r->fn_gemm,        mod, "gemm_f32_f32");
     cuModuleGetFunction(&r->fn_gemm_f16,    mod, "gemm_tiled_f16_f32");
+    if (cuModuleGetFunction(&r->fn_gemm_f16_mma, mod, "gemm_f16_f32") != CUDA_SUCCESS)
+        r->fn_gemm_f16_mma = NULL;
     cuModuleGetFunction(&r->fn_gemm_fp8,    mod, "gemm_tiled_fp8_f32");
     cuModuleGetFunction(&r->fn_gemm_fp8_bf16, mod, "gemm_tiled_fp8_bf16");
     /* MMA-based FP8 GEMMs (sm_89+); may fail to load on older arches */
@@ -3335,8 +4024,29 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
         r->fn_zero_f32 = NULL;
     if (cuModuleGetFunction(&r->fn_gemm_fp8_v7, mod, "gemm_fp8_v7") != CUDA_SUCCESS)
         r->fn_gemm_fp8_v7 = NULL;
+    if (cuModuleGetFunction(&r->fn_gemm_bf16_v7, mod, "gemm_bf16_v7") != CUDA_SUCCESS)
+        r->fn_gemm_bf16_v7 = NULL;
+    if (cuModuleGetFunction(&r->fn_gemm_f16_v7, mod, "gemm_f16_v7") != CUDA_SUCCESS)
+        r->fn_gemm_f16_v7 = NULL;
+    if (cuModuleGetFunction(&r->fn_quant_bf16, mod, "quant_bf16") != CUDA_SUCCESS)
+        r->fn_quant_bf16 = NULL;
+    if (cuModuleGetFunction(&r->fn_quant_f16, mod, "quant_f16") != CUDA_SUCCESS)
+        r->fn_quant_f16 = NULL;
+    if (cuModuleGetFunction(&r->fn_add_bias_inplace, mod, "add_bias_inplace_f32") != CUDA_SUCCESS)
+        r->fn_add_bias_inplace = NULL;
+    /* v7 needs 24 KiB dynamic SMEM; opt-in per CUfunc. */
+    if (r->fn_gemm_bf16_v7) cuFuncSetAttribute(r->fn_gemm_bf16_v7,
+        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 24 * 1024);
+    if (r->fn_gemm_f16_v7) cuFuncSetAttribute(r->fn_gemm_f16_v7,
+        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 24 * 1024);
+    r->use_bf16_v7 = r->use_bf16_gemm && r->fn_gemm_bf16_v7 && r->fn_quant_bf16 && r->fn_add_bias_inplace;
+    r->use_f16_v7  = r->use_f16_gemm  && r->fn_gemm_f16_v7  && r->fn_quant_f16  && r->fn_add_bias_inplace;
+    r->d_x_bf16 = 0; r->x_bf16_buf_n = 0;
+    r->d_x_f16  = 0; r->x_f16_buf_n  = 0;
     if (cuModuleGetFunction(&r->fn_gemm_fp8_v7_fused, mod, "gemm_fp8_v7_fused") != CUDA_SUCCESS)
         r->fn_gemm_fp8_v7_fused = NULL;
+    if (cuModuleGetFunction(&r->fn_gemm_fp8_v7_concat2, mod, "gemm_fp8_v7_concat2") != CUDA_SUCCESS)
+        r->fn_gemm_fp8_v7_concat2 = NULL;
     if (cuModuleGetFunction(&r->fn_descale_add_bias, mod, "descale_add_bias_f32") != CUDA_SUCCESS)
         r->fn_descale_add_bias = NULL;
     if (r->use_fp8_v7 && (!r->fn_gemm_fp8_v7 || !r->fn_descale_add_bias ||
@@ -3368,17 +4078,49 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     cuModuleGetFunction(&r->fn_rope_img,    mod, "flux2_rope_img_f32");
     cuModuleGetFunction(&r->fn_rope_txt,    mod, "flux2_rope_txt_f32");
     cuModuleGetFunction(&r->fn_bf16_trunc,  mod, "truncate_bf16_f32");
+    if (cuModuleGetFunction(&r->fn_bf16_to_f32_add_bias, mod, "bf16_to_f32_add_bias_f32") != CUDA_SUCCESS)
+        r->fn_bf16_to_f32_add_bias = NULL;
+
+    /* cuBLAS-LT FP8 e4m3 path — default ON when FLUX2_FP8_GEMM is active.
+     * Reaches 60-145 TFLOP/s on flux2 shapes vs ~30-45 for v7 (RTX 5060 Ti).
+     * Set FLUX2_CUBLASLT_FP8=0 to opt out and stay on the v7 path. */
+    r->use_cublaslt_fp8 = 0;
+    r->cublaslt_ctx = NULL;
+    r->d_w_scale_lt = 0;
+    r->d_y_bf16_scratch = 0; r->y_bf16_scratch_n = 0;
+    {
+        const char *env = getenv("FLUX2_CUBLASLT_FP8");
+        int want = (env == NULL) ? 1 : (env[0] != '0');
+    if (want && r->use_fp8_gemm &&
+        r->fn_quant_fp8 && r->fn_reduce_max_abs && r->fn_bf16_to_f32_add_bias) {
+        if (cublasewCreate(&r->cublaslt_ctx, r->stream) == 0 &&
+            cublasew_lt_available(r->cublaslt_ctx) == 0) {
+            if (cuMemAlloc(&r->d_w_scale_lt, sizeof(float)) == CUDA_SUCCESS) {
+                r->use_cublaslt_fp8 = 1;
+                if (verbose >= 1)
+                    fprintf(stderr, "cuda_flux2: cuBLAS-LT FP8 e4m3 GEMM enabled\n");
+            }
+        }
+        if (!r->use_cublaslt_fp8 && r->cublaslt_ctx) {
+            cublasewDestroy(r->cublaslt_ctx);
+            r->cublaslt_ctx = NULL;
+        }
+    }
+    }
 
     if (verbose >= 1) {
         fprintf(stderr, "cuda_flux2: init OK");
         if (r->use_gpu_dbl_attn) fprintf(stderr, " [gpu-dbl-attn]");
         if (r->debug_dbl_attn) fprintf(stderr, " [debug-dbl-attn]");
-        if (r->use_f16_gemm) fprintf(stderr, " [f16-gemm]");
+        if (r->use_f16_gemm) fprintf(stderr,
+            r->use_f16_v7 ? " [f16-gemm-v7]" : (r->fn_gemm_f16_mma ? " [f16-gemm-mma]" : " [f16-gemm-tiled]"));
+        if (r->use_bf16_gemm) fprintf(stderr, r->use_bf16_v7 ? " [bf16-gemm-v7]" : " [bf16-gemm]");
         if (r->use_fp8_gemm) fprintf(stderr, r->fp8_bf16_act ? " [fp8-bf16act]" : " [fp8-gemm]");
         if (r->use_fp8_mma) fprintf(stderr, " [fp8-mma]");
         if (r->use_fp8_attn) fprintf(stderr, " [fp8-attn]");
         if (r->use_bf16_attn) fprintf(stderr, " [bf16-attn]");
         if (r->use_fp8_v7) fprintf(stderr, " [fp8-v7]");
+        if (r->use_cublaslt_fp8) fprintf(stderr, " [cublaslt-fp8]");
         if (r->use_bf16_vae) fprintf(stderr, " [vae-bf16]");
         fprintf(stderr, "\n");
     }
@@ -3468,8 +4210,22 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
     r->n_sgl = m->n_single_blocks;
 
     int f16 = r->use_f16_gemm;
+    int bf16 = r->use_bf16_gemm;
     int fp8 = r->use_fp8_gemm;
-    const char *wfmt = fp8 ? "FP8" : (f16 ? "F16" : "F32");
+    /* Use FP8 safetensors as source for all GEMM modes (it's the only on-disk
+     * format available). The g_flux2_upload_mode global tells gpu_upload_st_fp8
+     * how to materialize each weight on the GPU:
+     *   FP8 mode  -> raw FP8 bytes (1 B/elem) + per-tensor scale.
+     *   BF16/F16  -> dequant FP8 with weight_scale baked in -> 2 B/elem, scale=-1.
+     *   F32       -> dequant FP8 with weight_scale baked in -> 4 B/elem, scale=-1. */
+    int use_fp8_src = (fp8 || bf16 || f16);
+    if (use_fp8_src) {
+        g_flux2_upload_mode = fp8 ? FLUX2_W_F32 /* raw bytes path */
+                                  : (bf16 ? FLUX2_W_BF16 : FLUX2_W_F16);
+    } else {
+        g_flux2_upload_mode = FLUX2_W_F32;
+    }
+    const char *wfmt = fp8 ? "FP8" : (bf16 ? "BF16" : (f16 ? "F16" : "F32"));
 
     if (r->verbose >= 1)
         fprintf(stderr, "cuda_flux2: uploading weights to GPU (H=%d, %d+%d blocks, %s)...\n",
@@ -3478,9 +4234,9 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    /* For FP8 native mode, re-open safetensors to get raw FP8 bytes */
+    /* Open FP8 safetensors for any FP8/BF16/F16 path (BF16/F16 dequantize FP8 on the fly). */
     st_context *st_fp8 = NULL;
-    if (fp8) {
+    if (use_fp8_src) {
         st_fp8 = safetensors_open(path);
         if (!st_fp8) { fprintf(stderr, "cuda_flux2: failed to reopen %s for FP8\n", path); return -1; }
     }
@@ -3490,8 +4246,8 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
     r->s_mod_img = r->s_mod_txt = r->s_mod_sgl = 1.0f;
     r->s_out_mod = r->s_out_proj = 1.0f;
 
-    if (fp8) {
-        /* Global weights: upload from safetensors as FP8 or BF16 */
+    if (use_fp8_src) {
+        /* Global weights: upload from FP8 safetensors (raw or dequant→F16/BF16). */
         r->d_img_in_w  = gpu_upload_st_fp8(st_fp8, "img_in.weight", NULL, &r->s_img_in);
         r->d_txt_in_w  = gpu_upload_st_fp8(st_fp8, "txt_in.weight", NULL, &r->s_txt_in);
         r->d_t_fc1_w   = gpu_upload_st_fp8(st_fp8, "time_in.in_layer.weight", NULL, &r->s_t_fc1);
@@ -3522,7 +4278,7 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
     /* Double-stream block weights */
     r->gpu_dblk = (flux2_gpu_dblk_t *)calloc((size_t)r->n_dbl, sizeof(flux2_gpu_dblk_t));
     for (int i = 0; i < r->n_dbl; i++) {
-        if (fp8) {
+        if (use_fp8_src) {
             char prefix[128];
             snprintf(prefix, sizeof(prefix), "double_blocks.%d.img_attn", i);
             upload_stream_fp8(&r->gpu_dblk[i].img, st_fp8, prefix, r->hd);
@@ -3556,7 +4312,7 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
     /* Single-stream block weights */
     r->gpu_sblk = (flux2_gpu_sblk_t *)calloc((size_t)r->n_sgl, sizeof(flux2_gpu_sblk_t));
     for (int i = 0; i < r->n_sgl; i++) {
-        if (fp8) {
+        if (use_fp8_src) {
             char wn[256], sn[256];
             snprintf(wn, sizeof(wn), "single_blocks.%d.linear1.weight", i);
             snprintf(sn, sizeof(sn), "single_blocks.%d.linear1.weight_scale", i);
@@ -3573,8 +4329,8 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
                 if (sidx >= 0) l2_scale = *(const float *)safetensors_data(st_fp8, sidx);
                 int Hd = r->H, nf = r->n_ff;
 
-                if (strcmp(dtype, "F8_E4M3") == 0) {
-                    /* FP8: split columns byte-by-byte */
+                if (strcmp(dtype, "F8_E4M3") == 0 && fp8) {
+                    /* FP8 GEMM mode: split columns byte-by-byte, scale stays positive */
                     const uint8_t *raw = (const uint8_t *)safetensors_data(st_fp8, widx);
                     int l2_cols = Hd + nf;
                     uint8_t *attn = (uint8_t *)malloc((size_t)Hd * Hd);
@@ -3586,6 +4342,28 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
                     r->gpu_sblk[i].l2_attn_w = gpu_upload_bytes(attn, (size_t)Hd * Hd);
                     r->gpu_sblk[i].l2_mlp_w  = gpu_upload_bytes(mlp_, (size_t)Hd * nf);
                     free(attn); free(mlp_);
+                } else if (strcmp(dtype, "F8_E4M3") == 0) {
+                    /* BF16/F16 GEMM mode: dequant FP8 with weight_scale baked in,
+                     * split columns, upload in target precision, scale=-1. */
+                    const uint8_t *raw = (const uint8_t *)safetensors_data(st_fp8, widx);
+                    int l2_cols = Hd + nf;
+                    float *a = (float *)malloc((size_t)Hd * Hd * sizeof(float));
+                    float *ml = (float *)malloc((size_t)Hd * nf * sizeof(float));
+                    for (int r2 = 0; r2 < Hd; r2++) {
+                        for (int c = 0; c < Hd; c++)
+                            a[(size_t)r2 * Hd + c] = host_fp8_e4m3_to_f32(raw[(size_t)r2 * l2_cols + c]) * l2_scale;
+                        for (int c = 0; c < nf; c++)
+                            ml[(size_t)r2 * nf + c] = host_fp8_e4m3_to_f32(raw[(size_t)r2 * l2_cols + Hd + c]) * l2_scale;
+                    }
+                    if (bf16) {
+                        r->gpu_sblk[i].l2_attn_w = gpu_upload_bf16(a, Hd * Hd);
+                        r->gpu_sblk[i].l2_mlp_w  = gpu_upload_bf16(ml, Hd * nf);
+                    } else { /* f16 */
+                        r->gpu_sblk[i].l2_attn_w = gpu_upload_f16(a, Hd * Hd);
+                        r->gpu_sblk[i].l2_mlp_w  = gpu_upload_f16(ml, Hd * nf);
+                    }
+                    free(a); free(ml);
+                    l2_scale = -1.0f;
                 } else {
                     /* BF16/F32: dequant + split as F32 */
                     const flux2_mat *l2 = &m->sblk[i].linear2;
@@ -3753,7 +4531,8 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
     int H = r->H, nH = r->nH, hd = r->hd, n_ff = r->n_ff;
     int n_tot = n_img + n_txt;
     size_t F = sizeof(float);
-    size_t WE = r->use_fp8_gemm ? 1 : (r->use_f16_gemm ? 2 : 4);  /* weight element bytes */
+    size_t WE = r->use_fp8_gemm ? 1
+              : ((r->use_bf16_gemm || r->use_f16_gemm) ? 2 : 4);  /* weight element bytes */
 
     /* Macro: dispatch GEMM with per-weight scale (FP8-aware) */
     #define GEMM(Y, W, X, bias, nout, nin, ntok, scale) \
@@ -4064,15 +4843,36 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         _TS_END(_ts_swiglu);
 
         /* linear2: [H, H+n_ff] split into [H, H] (attn) + [H, n_ff] (mlp)
-         * out = l2_attn @ attn_out + l2_mlp @ mlp_out */
+         * out = l2_attn @ attn_out + l2_mlp @ mlp_out
+         * Fuse the second-GEMM's add-into-Y when v7 fused path will fire —
+         * skips a temp write + op_add pass. */
         _TS_BEG();
-        GEMM(r->d_scratch1, b->l2_attn_w, r->d_attn_out, d0, H, H, n_tot, b->l2_attn_scale);
-        GEMM(r->d_scratch2, b->l2_mlp_w, r->d_scratch3, d0, H, n_ff, n_tot, b->l2_mlp_scale);
+        int did_concat2 = 0;
+        if (r->use_fp8_gemm && b->l2_attn_scale > 0.0f && b->l2_mlp_scale > 0.0f &&
+            r->use_fp8_v7 && r->fn_gemm_fp8_v7_concat2 &&
+            (H % 64) == 0 && (n_ff % 64) == 0 && n_tot >= 256) {
+            int rc = op_gemm_fp8_concat2(r, r->d_scratch1,
+                                          b->l2_attn_w, r->d_attn_out, b->l2_attn_scale, H,
+                                          b->l2_mlp_w,  r->d_scratch3,  b->l2_mlp_scale,  n_ff,
+                                          d0, n_tot, H);
+            if (rc == 0) did_concat2 = 1;
+        }
+        int can_addto = 0;
+        if (!did_concat2) {
+            GEMM(r->d_scratch1, b->l2_attn_w, r->d_attn_out, d0, H, H, n_tot, b->l2_attn_scale);
+            can_addto = (r->use_fp8_gemm && b->l2_mlp_scale > 0.0f && r->use_fp8_v7 &&
+                         r->fn_gemm_fp8_v7_fused && (n_ff % 64) == 0 && n_tot >= 256);
+            if (can_addto) {
+                op_gemm_scaled_ex(r, r->d_scratch1, b->l2_mlp_w, r->d_scratch3, d0,
+                                  H, n_ff, n_tot, b->l2_mlp_scale, 1);
+            } else {
+                GEMM(r->d_scratch2, b->l2_mlp_w, r->d_scratch3, d0, H, n_ff, n_tot, b->l2_mlp_scale);
+            }
+        }
         _TS_END(_ts_lin2);
 
-        /* Add the two halves: scratch1 += scratch2 */
         _TS_BEG();
-        op_add(r, r->d_scratch1, r->d_scratch2, n_tot * H);
+        if (!did_concat2 && !can_addto) op_add(r, r->d_scratch1, r->d_scratch2, n_tot * H);
 
         /* Gated residual */
         op_gated_add(r, r->d_joint, r->d_scratch1, ms_gate, n_tot, H);
@@ -4204,6 +5004,18 @@ void cuda_flux2_free(cuda_flux2_runner *r) {
     if (r->d_x_fp8)   cuMemFree(r->d_x_fp8);
     if (r->d_x_max)   cuMemFree(r->d_x_max);
     if (r->d_x_scale) cuMemFree(r->d_x_scale);
+    if (r->d_x_fp8_2)   cuMemFree(r->d_x_fp8_2);
+    if (r->d_x_max_2)   cuMemFree(r->d_x_max_2);
+    if (r->d_x_scale_2) cuMemFree(r->d_x_scale_2);
+
+    /* v7 BF16/F16 GEMM workspace */
+    if (r->d_x_bf16) cuMemFree(r->d_x_bf16);
+    if (r->d_x_f16)  cuMemFree(r->d_x_f16);
+
+    /* cuBLAS-LT FP8 workspace */
+    if (r->d_y_bf16_scratch) cuMemFree(r->d_y_bf16_scratch);
+    if (r->d_w_scale_lt)     cuMemFree(r->d_w_scale_lt);
+    if (r->cublaslt_ctx)     cublasewDestroy(r->cublaslt_ctx);
 
     if (r->dit) flux2_dit_free(r->dit);
     if (r->vae) flux2_vae_free(r->vae);
