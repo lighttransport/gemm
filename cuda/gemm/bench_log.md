@@ -504,3 +504,36 @@ These are occupancy/wavefront-tail issues, not compute or L2. Closing
 the last 7–8% would need split-K or persistent kernel.
 
 v7 is the new default (recommend `--ptx-rev v7`).
+
+## v8 — v7 + split-K (atomicAdd FP32 epilogue, gridDim.z = split_k)
+
+Same kernel body as v7 (4×4 CTA panel swizzle, cp.async, ldmatrix.x4,
+2-stage SMEM pipeline, 64×128 CTA tile). The only change: `gridDim.z`
+splits the K-loop across CTAs and the epilogue uses `atomicAdd` so
+multiple CTAs accumulate into the same Y tile. Bench pre-zeros Y on
+stream before each launch.
+
+Goal: recover the M=512 wavefront tail (qkv/attn_out/ffn_down at 86–88%
+peak) by giving SMs more concurrent work to chew on along K.
+
+Best split-K per shape (RTX 5060 Ti, sm_120; --iters 50):
+
+| shape    | dtype | sk=1 (=v7) | best sk | best TFLOP/s | peak% | Δ vs v7 |
+|----------|-------|-----------:|:-------:|-------------:|------:|--------:|
+| qkv      | f16   | 36.04      | 4       | 39.18        | 93.3% | +7.5pp  |
+| qkv      | bf16  | 36.18      | 4       | 39.24        | 93.4% | +7.2pp  |
+| ffn_down | f16   | 36.83      | 8       | 40.75        | 97.0% | +9.3pp  |
+| ffn_down | bf16  | 37.03      | 8       | 40.85        | 97.3% | +9.2pp  |
+| ffn_down | fp8   | 73.55      | 4       | 79.67        | 94.8% | +7.2pp  |
+| qkv      | fp8   | 73.37      | 2       | 74.03        | 88.1% | +0.8pp  |
+
+square_1k regresses on every dtype: the shape already saturates SMs
+(128 CTAs without split), so adding split-K just costs us atomicAdd
+contention. Use sk=1 there (== v7).
+
+All accuracy checks pass `cos=1.00000` (atomicAdd FP32 reduction is
+exact-up-to-summation-order, and our quantize-then-dequantize golden
+ref tolerates that).
+
+Recommended use: `--ptx-rev v8 --split-k {4|8}` for low-M K-heavy
+shapes; otherwise stay on v7 (default).

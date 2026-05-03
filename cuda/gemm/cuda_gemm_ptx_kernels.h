@@ -1581,4 +1581,384 @@ static const char k_gemm_fp8_v7_src[] =
 "    }\n"
 "}\n";
 
+/* ==================================================================== *
+ * v8 kernels — v7 (panel swizzle) + split-K via gridDim.z + atomicAdd
+ * --------------------------------------------------------------------
+ * gridDim.z = K_split. Each CTA processes K_slice = K/K_split of the K
+ * dimension. Output accumulator atomicAdd's into Y, so caller must pre-
+ * zero Y. Useful for low-M shapes (qkv/attn_out/ffn_down at M=512,
+ * square_1k) where v7 is wave-tail bound.
+ * Constraint: K must be a multiple of K_split * 32 (f16/bf16) or
+ *             K_split * 64 (fp8).
+ * ==================================================================== */
+
+#define CUDA_GEMM_V8_BODY(MMA_OP, ELEM_T)                                    \
+"    extern __shared__ __align__(16) " ELEM_T " smem_v8[];\n"                \
+"    " ELEM_T " *sA0 = smem_v8;\n"                                           \
+"    " ELEM_T " *sB0 = smem_v8 + 2048;\n"                                    \
+"    " ELEM_T " *sA1 = smem_v8 + 6144;\n"                                    \
+"    " ELEM_T " *sB1 = smem_v8 + 8192;\n"                                    \
+"    int tid = threadIdx.x;\n"                                               \
+"    int wid = tid >> 5;\n"                                                  \
+"    int lane = tid & 31;\n"                                                 \
+"    int gid  = lane >> 2;\n"                                                \
+"    int tid4 = lane & 3;\n"                                                 \
+"    int warp_m = wid >> 1;\n"                                               \
+"    int warp_n = wid & 1;\n"                                                \
+"    /* Panel swizzle (same as v7) */\n"                                     \
+"    int blk_lin = blockIdx.y * gridDim.x + blockIdx.x;\n"                   \
+"    int npx_ = gridDim.x;\n"                                                \
+"    int npy_ = gridDim.y;\n"                                                \
+"    int panels_m_ = (npy_ + 3) >> 2;\n"                                     \
+"    int panel_id_ = blk_lin >> 4;\n"                                        \
+"    int in_panel_ = blk_lin & 15;\n"                                        \
+"    int panel_m_id_ = panel_id_ - (panel_id_ / panels_m_) * panels_m_;\n"   \
+"    int panel_n_id_ = panel_id_ / panels_m_;\n"                             \
+"    int m_in_ = in_panel_ & 3;\n"                                           \
+"    int n_in_ = in_panel_ >> 2;\n"                                          \
+"    int tile_m_ = (panel_m_id_ << 2) + m_in_;\n"                            \
+"    int tile_n_ = (panel_n_id_ << 2) + n_in_;\n"                            \
+"    if (tile_m_ >= npy_ || tile_n_ >= npx_) return;\n"                      \
+"    int cta_m  = tile_m_ * 64;\n"                                           \
+"    int cta_n  = tile_n_ * 128;\n"                                          \
+"    /* Split-K range from blockIdx.z */\n"                                  \
+"    int k_split = gridDim.z;\n"                                             \
+"    int K_slice = K / k_split;\n"                                           \
+"    int k_base  = blockIdx.z * K_slice;\n"                                  \
+"    int k_end   = k_base + K_slice;\n"                                      \
+"    int wm_row = warp_m * 16;\n"                                            \
+"    int wn_col = warp_n * 64;\n"                                            \
+"\n"                                                                         \
+"    if (cta_m >= M) return;\n"                                              \
+"\n"                                                                         \
+"    float d0[8], d1[8], d2[8], d3[8];\n"                                    \
+"    #pragma unroll\n"                                                       \
+"    for (int i = 0; i < 8; i++) { d0[i]=0; d1[i]=0; d2[i]=0; d3[i]=0; }\n"  \
+"\n"                                                                         \
+"    int row_a    = tid >> 2;\n"                                             \
+"    int col_a    = (tid & 3) * 8;\n"                                        \
+"    int g_row_a  = cta_m + row_a;\n"                                        \
+"    int sw_a     = (row_a & 3) * 8;\n"                                      \
+"    int swz_a    = row_a * 32 + (col_a ^ sw_a);\n"                          \
+"\n"                                                                         \
+"    int row_b0   = tid >> 2;\n"                                             \
+"    int col_b0   = (tid & 3) * 8;\n"                                        \
+"    int g_row_b0 = cta_n + row_b0;\n"                                       \
+"    int sw_b0    = (row_b0 & 3) * 8;\n"                                     \
+"    int swz_b0   = row_b0 * 32 + (col_b0 ^ sw_b0);\n"                       \
+"\n"                                                                         \
+"    int vid_b1   = tid + 256;\n"                                            \
+"    int row_b1   = vid_b1 >> 2;\n"                                          \
+"    int col_b1   = (vid_b1 & 3) * 8;\n"                                     \
+"    int g_row_b1 = cta_n + row_b1;\n"                                       \
+"    int sw_b1    = (row_b1 & 3) * 8;\n"                                     \
+"    int swz_b1   = row_b1 * 32 + (col_b1 ^ sw_b1);\n"                       \
+"\n"                                                                         \
+"    {\n"                                                                    \
+"        unsigned int dA = __cvta_generic_to_shared(&sA0[swz_a]);\n"         \
+"        if (g_row_a < M) {\n"                                               \
+"            const " ELEM_T " *src = &X[(size_t)g_row_a * K + k_base + col_a];\n"\
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dA), \"l\"(src));\n"\
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dA)); }\n"\
+"        unsigned int dB0 = __cvta_generic_to_shared(&sB0[swz_b0]);\n"       \
+"        if (g_row_b0 < N) {\n"                                              \
+"            const " ELEM_T " *src = &W[(size_t)g_row_b0 * K + k_base + col_b0];\n"\
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB0), \"l\"(src));\n"\
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB0)); }\n"\
+"        unsigned int dB1 = __cvta_generic_to_shared(&sB0[swz_b1]);\n"       \
+"        if (g_row_b1 < N) {\n"                                              \
+"            const " ELEM_T " *src = &W[(size_t)g_row_b1 * K + k_base + col_b1];\n"\
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB1), \"l\"(src));\n"\
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB1)); }\n"\
+"    }\n"                                                                    \
+"    asm volatile(\"cp.async.commit_group;\\n\");\n"                         \
+"\n"                                                                         \
+"    int num_k = K_slice >> 5;\n"                                            \
+"    int la_row     = wm_row + (lane & 15);\n"                               \
+"    int la_col_off = (lane >> 4) * 8;\n"                                    \
+"    int la_sw      = (la_row & 3) * 8;\n"                                   \
+"    int lb_row     = lane & 15;\n"                                          \
+"    int lb_col_off = (lane >> 4) * 8;\n"                                    \
+"\n"                                                                         \
+"    for (int ki = 0; ki < num_k; ki++) {\n"                                 \
+"        int stage = ki & 1;\n"                                              \
+"        int next_stage = stage ^ 1;\n"                                      \
+"        int next_k = k_base + ((ki + 1) << 5);\n"                           \
+"\n"                                                                         \
+"        asm volatile(\"cp.async.wait_group 0;\\n\");\n"                     \
+"        __syncthreads();\n"                                                 \
+"\n"                                                                         \
+"        if (next_k < k_end) {\n"                                            \
+"            " ELEM_T " *sA_next = (next_stage == 0) ? sA0 : sA1;\n"         \
+"            " ELEM_T " *sB_next = (next_stage == 0) ? sB0 : sB1;\n"         \
+"            unsigned int dA = __cvta_generic_to_shared(&sA_next[swz_a]);\n" \
+"            if (g_row_a < M) {\n"                                           \
+"                const " ELEM_T " *src = &X[(size_t)g_row_a * K + next_k + col_a];\n"\
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dA), \"l\"(src));\n"\
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dA)); }\n"\
+"            unsigned int dB0 = __cvta_generic_to_shared(&sB_next[swz_b0]);\n"\
+"            if (g_row_b0 < N) {\n"                                          \
+"                const " ELEM_T " *src = &W[(size_t)g_row_b0 * K + next_k + col_b0];\n"\
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB0), \"l\"(src));\n"\
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB0)); }\n"\
+"            unsigned int dB1 = __cvta_generic_to_shared(&sB_next[swz_b1]);\n"\
+"            if (g_row_b1 < N) {\n"                                          \
+"                const " ELEM_T " *src = &W[(size_t)g_row_b1 * K + next_k + col_b1];\n"\
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB1), \"l\"(src));\n"\
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB1)); }\n"\
+"        }\n"                                                                \
+"        asm volatile(\"cp.async.commit_group;\\n\");\n"                     \
+"\n"                                                                         \
+"        " ELEM_T " *sAp = (stage == 0) ? sA0 : sA1;\n"                      \
+"        " ELEM_T " *sBp = (stage == 0) ? sB0 : sB1;\n"                      \
+"        #pragma unroll\n"                                                   \
+"        for (int kg = 0; kg < 2; kg++) {\n"                                 \
+"            int k_off = kg * 16;\n"                                         \
+"            int a_off = la_row * 32 + ((k_off + la_col_off) ^ la_sw);\n"    \
+"            unsigned int a0,a1,a2,a3;\n"                                    \
+"            unsigned int p_a = __cvta_generic_to_shared(&sAp[a_off]);\n"    \
+"            asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"\
+"                : \"=r\"(a0), \"=r\"(a1), \"=r\"(a2), \"=r\"(a3) : \"r\"(p_a));\n"\
+"            #pragma unroll\n"                                               \
+"            for (int s = 0; s < 4; s++) {\n"                                \
+"                int sn_base = wn_col + s * 16;\n"                           \
+"                int b_brow  = sn_base + lb_row;\n"                          \
+"                int b_sw    = (b_brow & 3) * 8;\n"                          \
+"                int b_off   = b_brow * 32 + ((k_off + lb_col_off) ^ b_sw);\n"\
+"                unsigned int b0,b1,b2,b3;\n"                                \
+"                unsigned int p_b = __cvta_generic_to_shared(&sBp[b_off]);\n"\
+"                asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"\
+"                    : \"=r\"(b0), \"=r\"(b1), \"=r\"(b2), \"=r\"(b3) : \"r\"(p_b));\n"\
+"                int nt0 = s * 2 + 0;\n"                                     \
+"                int nt1 = s * 2 + 1;\n"                                     \
+"                asm volatile(\n"                                            \
+"                    \"" MMA_OP "\\n\\t\"\n"                                 \
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"\
+"                    : \"=f\"(d0[nt0]), \"=f\"(d1[nt0]), \"=f\"(d2[nt0]), \"=f\"(d3[nt0])\n"\
+"                    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"        \
+"                      \"r\"(b0), \"r\"(b2),\n"                              \
+"                      \"f\"(d0[nt0]), \"f\"(d1[nt0]), \"f\"(d2[nt0]), \"f\"(d3[nt0])\n"\
+"                );\n"                                                       \
+"                asm volatile(\n"                                            \
+"                    \"" MMA_OP "\\n\\t\"\n"                                 \
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"\
+"                    : \"=f\"(d0[nt1]), \"=f\"(d1[nt1]), \"=f\"(d2[nt1]), \"=f\"(d3[nt1])\n"\
+"                    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"        \
+"                      \"r\"(b1), \"r\"(b3),\n"                              \
+"                      \"f\"(d0[nt1]), \"f\"(d1[nt1]), \"f\"(d2[nt1]), \"f\"(d3[nt1])\n"\
+"                );\n"                                                       \
+"            }\n"                                                            \
+"        }\n"                                                                \
+"    }\n"                                                                    \
+"    asm volatile(\"cp.async.wait_group 0;\\n\");\n"                         \
+"\n"                                                                         \
+"    int yr0 = cta_m + wm_row + gid;\n"                                      \
+"    int yr1 = cta_m + wm_row + gid + 8;\n"                                  \
+"    #pragma unroll\n"                                                       \
+"    for (int nt = 0; nt < 8; nt++) {\n"                                     \
+"        int yc0 = cta_n + wn_col + nt*8 + tid4*2;\n"                        \
+"        int yc1 = yc0 + 1;\n"                                               \
+"        if (yr0 < M && yc0 < N) atomicAdd(&Y[(size_t)yr0 * N + yc0], d0[nt]);\n"\
+"        if (yr0 < M && yc1 < N) atomicAdd(&Y[(size_t)yr0 * N + yc1], d1[nt]);\n"\
+"        if (yr1 < M && yc0 < N) atomicAdd(&Y[(size_t)yr1 * N + yc0], d2[nt]);\n"\
+"        if (yr1 < M && yc1 < N) atomicAdd(&Y[(size_t)yr1 * N + yc1], d3[nt]);\n"\
+"    }\n"                                                                    \
+"}\n"
+
+static const char k_gemm_f16_v8_src[] =
+"typedef unsigned short half_raw;\n"
+"extern \"C\" __global__ void gemm_f16_v8(float *Y,\n"
+"                                          const half_raw *X,\n"
+"                                          const half_raw *W,\n"
+"                                          int M, int N, int K) {\n"
+CUDA_GEMM_V8_BODY("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32", "half_raw");
+
+static const char k_gemm_bf16_v8_src[] =
+"typedef unsigned short bf16_raw;\n"
+"extern \"C\" __global__ void gemm_bf16_v8(float *Y,\n"
+"                                           const bf16_raw *X,\n"
+"                                           const bf16_raw *W,\n"
+"                                           int M, int N, int K) {\n"
+CUDA_GEMM_V8_BODY("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32", "bf16_raw");
+
+/* fp8 v8 = fp8 v7 + split-K + atomicAdd. K-step is 64 fp8 (= 32 b16). */
+static const char k_gemm_fp8_v8_src[] =
+"typedef unsigned char fp8_raw;\n"
+"extern \"C\" __global__ void gemm_fp8_v8(float *Y,\n"
+"                                          const fp8_raw *X,\n"
+"                                          const fp8_raw *W,\n"
+"                                          int M, int N, int K) {\n"
+"    extern __shared__ __align__(16) unsigned short smem_v8[];\n"
+"    unsigned short *sA0 = smem_v8;\n"
+"    unsigned short *sB0 = smem_v8 + 2048;\n"
+"    unsigned short *sA1 = smem_v8 + 6144;\n"
+"    unsigned short *sB1 = smem_v8 + 8192;\n"
+"    int tid = threadIdx.x;\n"
+"    int wid = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    int gid  = lane >> 2;\n"
+"    int tid4 = lane & 3;\n"
+"    int warp_m = wid >> 1;\n"
+"    int warp_n = wid & 1;\n"
+"    int blk_lin = blockIdx.y * gridDim.x + blockIdx.x;\n"
+"    int npx_ = gridDim.x;\n"
+"    int npy_ = gridDim.y;\n"
+"    int panels_m_ = (npy_ + 3) >> 2;\n"
+"    int panel_id_ = blk_lin >> 4;\n"
+"    int in_panel_ = blk_lin & 15;\n"
+"    int panel_m_id_ = panel_id_ - (panel_id_ / panels_m_) * panels_m_;\n"
+"    int panel_n_id_ = panel_id_ / panels_m_;\n"
+"    int m_in_ = in_panel_ & 3;\n"
+"    int n_in_ = in_panel_ >> 2;\n"
+"    int tile_m_ = (panel_m_id_ << 2) + m_in_;\n"
+"    int tile_n_ = (panel_n_id_ << 2) + n_in_;\n"
+"    if (tile_m_ >= npy_ || tile_n_ >= npx_) return;\n"
+"    int cta_m  = tile_m_ * 64;\n"
+"    int cta_n  = tile_n_ * 128;\n"
+"    int k_split = gridDim.z;\n"
+"    int K_slice = K / k_split;\n"
+"    int k_base  = blockIdx.z * K_slice;\n"
+"    int k_end   = k_base + K_slice;\n"
+"    int wm_row = warp_m * 16;\n"
+"    int wn_col = warp_n * 64;\n"
+"\n"
+"    if (cta_m >= M) return;\n"
+"\n"
+"    float d0[8], d1[8], d2[8], d3[8];\n"
+"    #pragma unroll\n"
+"    for (int i = 0; i < 8; i++) { d0[i]=0; d1[i]=0; d2[i]=0; d3[i]=0; }\n"
+"\n"
+"    int row_a    = tid >> 2;\n"
+"    int col_a_b  = (tid & 3) * 8;\n"
+"    int col_a_g  = (tid & 3) * 16;\n"
+"    int g_row_a  = cta_m + row_a;\n"
+"    int sw_a     = (row_a & 3) * 8;\n"
+"    int swz_a    = row_a * 32 + (col_a_b ^ sw_a);\n"
+"\n"
+"    int row_b0   = tid >> 2;\n"
+"    int col_b0_b = (tid & 3) * 8;\n"
+"    int col_b0_g = (tid & 3) * 16;\n"
+"    int g_row_b0 = cta_n + row_b0;\n"
+"    int sw_b0    = (row_b0 & 3) * 8;\n"
+"    int swz_b0   = row_b0 * 32 + (col_b0_b ^ sw_b0);\n"
+"\n"
+"    int vid_b1   = tid + 256;\n"
+"    int row_b1   = vid_b1 >> 2;\n"
+"    int col_b1_b = (vid_b1 & 3) * 8;\n"
+"    int col_b1_g = (vid_b1 & 3) * 16;\n"
+"    int g_row_b1 = cta_n + row_b1;\n"
+"    int sw_b1    = (row_b1 & 3) * 8;\n"
+"    int swz_b1   = row_b1 * 32 + (col_b1_b ^ sw_b1);\n"
+"\n"
+"    {\n"
+"        unsigned int dA = __cvta_generic_to_shared(&sA0[swz_a]);\n"
+"        if (g_row_a < M) {\n"
+"            const fp8_raw *src = &X[(size_t)g_row_a * K + k_base + col_a_g];\n"
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dA), \"l\"(src));\n"
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dA)); }\n"
+"        unsigned int dB0 = __cvta_generic_to_shared(&sB0[swz_b0]);\n"
+"        if (g_row_b0 < N) {\n"
+"            const fp8_raw *src = &W[(size_t)g_row_b0 * K + k_base + col_b0_g];\n"
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB0), \"l\"(src));\n"
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB0)); }\n"
+"        unsigned int dB1 = __cvta_generic_to_shared(&sB0[swz_b1]);\n"
+"        if (g_row_b1 < N) {\n"
+"            const fp8_raw *src = &W[(size_t)g_row_b1 * K + k_base + col_b1_g];\n"
+"            asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB1), \"l\"(src));\n"
+"        } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB1)); }\n"
+"    }\n"
+"    asm volatile(\"cp.async.commit_group;\\n\");\n"
+"\n"
+"    int num_k = K_slice >> 6;\n"
+"    int la_row     = wm_row + (lane & 15);\n"
+"    int la_col_off = (lane >> 4) * 8;\n"
+"    int la_sw      = (la_row & 3) * 8;\n"
+"    int lb_row     = lane & 15;\n"
+"    int lb_col_off = (lane >> 4) * 8;\n"
+"\n"
+"    for (int ki = 0; ki < num_k; ki++) {\n"
+"        int stage = ki & 1;\n"
+"        int next_stage = stage ^ 1;\n"
+"        int next_k = k_base + ((ki + 1) << 6);\n"
+"\n"
+"        asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"        __syncthreads();\n"
+"\n"
+"        if (next_k < k_end) {\n"
+"            unsigned short *sA_next = (next_stage == 0) ? sA0 : sA1;\n"
+"            unsigned short *sB_next = (next_stage == 0) ? sB0 : sB1;\n"
+"            unsigned int dA = __cvta_generic_to_shared(&sA_next[swz_a]);\n"
+"            if (g_row_a < M) {\n"
+"                const fp8_raw *src = &X[(size_t)g_row_a * K + next_k + col_a_g];\n"
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dA), \"l\"(src));\n"
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dA)); }\n"
+"            unsigned int dB0 = __cvta_generic_to_shared(&sB_next[swz_b0]);\n"
+"            if (g_row_b0 < N) {\n"
+"                const fp8_raw *src = &W[(size_t)g_row_b0 * K + next_k + col_b0_g];\n"
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB0), \"l\"(src));\n"
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB0)); }\n"
+"            unsigned int dB1 = __cvta_generic_to_shared(&sB_next[swz_b1]);\n"
+"            if (g_row_b1 < N) {\n"
+"                const fp8_raw *src = &W[(size_t)g_row_b1 * K + next_k + col_b1_g];\n"
+"                asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\" :: \"r\"(dB1), \"l\"(src));\n"
+"            } else { asm volatile(\"st.shared.v4.b32 [%0], {0,0,0,0};\\n\" :: \"r\"(dB1)); }\n"
+"        }\n"
+"        asm volatile(\"cp.async.commit_group;\\n\");\n"
+"\n"
+"        unsigned short *sAp = (stage == 0) ? sA0 : sA1;\n"
+"        unsigned short *sBp = (stage == 0) ? sB0 : sB1;\n"
+"        #pragma unroll\n"
+"        for (int kg = 0; kg < 2; kg++) {\n"
+"            int k_off = kg * 16;\n"
+"            int a_off = la_row * 32 + ((k_off + la_col_off) ^ la_sw);\n"
+"            unsigned int a0,a1,a2,a3;\n"
+"            unsigned int p_a = __cvta_generic_to_shared(&sAp[a_off]);\n"
+"            asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"
+"                : \"=r\"(a0), \"=r\"(a1), \"=r\"(a2), \"=r\"(a3) : \"r\"(p_a));\n"
+"            #pragma unroll\n"
+"            for (int s = 0; s < 4; s++) {\n"
+"                int sn_base = wn_col + s * 16;\n"
+"                int b_brow  = sn_base + lb_row;\n"
+"                int b_sw    = (b_brow & 3) * 8;\n"
+"                int b_off   = b_brow * 32 + ((k_off + lb_col_off) ^ b_sw);\n"
+"                unsigned int b0,b1,b2,b3;\n"
+"                unsigned int p_b = __cvta_generic_to_shared(&sBp[b_off]);\n"
+"                asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"
+"                    : \"=r\"(b0), \"=r\"(b1), \"=r\"(b2), \"=r\"(b3) : \"r\"(p_b));\n"
+"                int nt0 = s * 2 + 0;\n"
+"                int nt1 = s * 2 + 1;\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(d0[nt0]), \"=f\"(d1[nt0]), \"=f\"(d2[nt0]), \"=f\"(d3[nt0])\n"
+"                    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"
+"                      \"r\"(b0), \"r\"(b2),\n"
+"                      \"f\"(d0[nt0]), \"f\"(d1[nt0]), \"f\"(d2[nt0]), \"f\"(d3[nt0])\n"
+"                );\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(d0[nt1]), \"=f\"(d1[nt1]), \"=f\"(d2[nt1]), \"=f\"(d3[nt1])\n"
+"                    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"
+"                      \"r\"(b1), \"r\"(b3),\n"
+"                      \"f\"(d0[nt1]), \"f\"(d1[nt1]), \"f\"(d2[nt1]), \"f\"(d3[nt1])\n"
+"                );\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"\n"
+"    int yr0 = cta_m + wm_row + gid;\n"
+"    int yr1 = cta_m + wm_row + gid + 8;\n"
+"    #pragma unroll\n"
+"    for (int nt = 0; nt < 8; nt++) {\n"
+"        int yc0 = cta_n + wn_col + nt*8 + tid4*2;\n"
+"        int yc1 = yc0 + 1;\n"
+"        if (yr0 < M && yc0 < N) atomicAdd(&Y[(size_t)yr0 * N + yc0], d0[nt]);\n"
+"        if (yr0 < M && yc1 < N) atomicAdd(&Y[(size_t)yr0 * N + yc1], d1[nt]);\n"
+"        if (yr1 < M && yc0 < N) atomicAdd(&Y[(size_t)yr1 * N + yc0], d2[nt]);\n"
+"        if (yr1 < M && yc1 < N) atomicAdd(&Y[(size_t)yr1 * N + yc1], d3[nt]);\n"
+"    }\n"
+"}\n";
+
 #endif /* CUDA_GEMM_PTX_KERNELS_H */
