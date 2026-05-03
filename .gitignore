@@ -112,6 +112,13 @@ rdna4/sam3d_body/verify_*
 !rdna4/sam3d_body/verify_*.c
 rdna4/sam3d_body/*.obj
 
+# RDNA4 qimg local Python/native-FP8 diagnostics
+rdna4/qimg/.venv/
+rdna4/qimg/.uv-cache/
+rdna4/qimg/__pycache__/
+rdna4/qimg/tools/__pycache__/
+rdna4/qimg/native_fp8_out/
+
 # Verification output directories
 cpu/sparse3d/ref_output/
 cpu/sparse3d/c_output/
