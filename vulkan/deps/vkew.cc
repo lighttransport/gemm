@@ -131,10 +131,13 @@ PFN_vkCreateInstance vkCreateInstance = nullptr;
 // Instance functions
 PFN_vkDestroyInstance vkDestroyInstance = nullptr;
 PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices = nullptr;
+PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties = nullptr;
 PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties = nullptr;
 PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures = nullptr;
+PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2 = nullptr;
 PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties = nullptr;
 PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
+PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR = nullptr;
 PFN_vkCreateDevice vkCreateDevice = nullptr;
 PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = nullptr;
 
@@ -271,10 +274,13 @@ void vkewShutdown(void) {
     vkCreateInstance = nullptr;
     vkDestroyInstance = nullptr;
     vkEnumeratePhysicalDevices = nullptr;
+    vkEnumerateDeviceExtensionProperties = nullptr;
     vkGetPhysicalDeviceProperties = nullptr;
     vkGetPhysicalDeviceFeatures = nullptr;
+    vkGetPhysicalDeviceFeatures2 = nullptr;
     vkGetPhysicalDeviceMemoryProperties = nullptr;
     vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
+    vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR = nullptr;
     vkCreateDevice = nullptr;
     vkGetDeviceProcAddr = nullptr;
     vkDestroyDevice = nullptr;
@@ -343,10 +349,18 @@ bool vkewLoadInstance(VkInstance instance) {
     // Load instance-level functions
     VKEW_LOAD_INSTANCE(vkDestroyInstance);
     VKEW_LOAD_INSTANCE(vkEnumeratePhysicalDevices);
+    VKEW_LOAD_INSTANCE(vkEnumerateDeviceExtensionProperties);
     VKEW_LOAD_INSTANCE(vkGetPhysicalDeviceProperties);
     VKEW_LOAD_INSTANCE(vkGetPhysicalDeviceFeatures);
+    vkGetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2");
+    if (!vkGetPhysicalDeviceFeatures2) {
+        vkGetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2KHR");
+    }
     VKEW_LOAD_INSTANCE(vkGetPhysicalDeviceMemoryProperties);
     VKEW_LOAD_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
+    vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
+        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(
+            instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
     VKEW_LOAD_INSTANCE(vkCreateDevice);
     VKEW_LOAD_INSTANCE(vkGetDeviceProcAddr);
 

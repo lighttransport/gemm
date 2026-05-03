@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: MIT
+//
+// RDNA4 Vulkan cooperative-matrix GEMM experiment.
+//
+// Computes Y[M,N] = X[M,K] * W[N,K]^T.
+// X and W are FP16 storage buffers. Accumulation and output are FP32.
+
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#define CM_M 16
+#define CM_N 16
+#define CM_K 16
+
+#ifndef BM
+#define BM 128
+#endif
+#ifndef BN
+#define BN 128
+#endif
+#ifndef BK
+#define BK 48
+#endif
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuffer {
+    float16_t X[];
+};
+
+layout(std430, binding = 1) readonly buffer WBuffer {
+    float16_t W[];
+};
+
+layout(std430, binding = 2) writeonly buffer YBuffer {
+    float Y[];
+};
+
+layout(std430, binding = 0) readonly buffer XVec4Buffer {
+    f16vec4 X_vec4[];
+};
+
+layout(std430, binding = 1) readonly buffer WVec4Buffer {
+    f16vec4 W_vec4[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+#ifndef TILES_M_MAX
+#define TILES_M_MAX 2
+#endif
+#ifndef TILES_M
+#define TILES_M 2
+#endif
+#ifndef WARP_ROW_STRIDE
+#define WARP_ROW_STRIDE (TILES_M * CM_M)
+#endif
+#ifndef DYNAMIC_SUBGROUP_MAPPING
+#define DYNAMIC_SUBGROUP_MAPPING 0
+#endif
+#ifndef TILES_N
+#define TILES_N (BN / CM_N)
+#endif
+
+// Keep the same padded LDS shape used by the existing Vulkan coopmat shader.
+#ifndef A_STRIDE
+#define A_STRIDE (BK + 8)
+#endif
+#ifndef B_STRIDE
+#define B_STRIDE (BN + 8)
+#endif
+
+shared float16_t tileA[BM][A_STRIDE];
+shared float16_t tileB[BK][B_STRIDE];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint subgroup_id = gl_SubgroupID;
+#if DYNAMIC_SUBGROUP_MAPPING
+    const uint num_subgroups = gl_NumSubgroups;
+#endif
+
+    const uint block_row = gl_WorkGroupID.y * BM;
+    const uint block_col = gl_WorkGroupID.x * BN;
+
+    uint warp_row;
+    uint tiles_m;
+    const uint tiles_n = TILES_N;
+
+#if DYNAMIC_SUBGROUP_MAPPING
+    if (num_subgroups <= 4) {
+        warp_row = subgroup_id * 32;
+        tiles_m = 2;
+    } else {
+        warp_row = subgroup_id * 16;
+        tiles_m = 1;
+    }
+#else
+    warp_row = subgroup_id * WARP_ROW_STRIDE;
+    tiles_m = TILES_M;
+#endif
+
+    coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator> acc[TILES_M_MAX][TILES_N];
+    [[unroll]] for (uint mi = 0; mi < TILES_M_MAX; mi++) {
+        [[unroll]] for (uint ni = 0; ni < TILES_N; ni++) {
+            acc[mi][ni] = coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    const uint a_vec4_per_thread = (BM * BK) / BLOCK_SIZE / 4;
+    const uint b_vec4_per_thread = (BN * BK) / BLOCK_SIZE / 4;
+
+    for (uint k_base = 0; k_base < pc.K; k_base += BK) {
+        [[unroll]] for (uint i = 0; i < a_vec4_per_thread; i++) {
+            uint vec_idx = tid * a_vec4_per_thread + i;
+            uint idx = vec_idx * 4;
+            uint row = idx / BK;
+            uint kk = idx - row * BK;
+            f16vec4 v = X_vec4[((block_row + row) * pc.K + k_base + kk) >> 2];
+            tileA[row][kk + 0] = v.x;
+            tileA[row][kk + 1] = v.y;
+            tileA[row][kk + 2] = v.z;
+            tileA[row][kk + 3] = v.w;
+        }
+
+        // W is stored as [N,K]. Transpose the tile into tileB[K,N].
+        [[unroll]] for (uint i = 0; i < b_vec4_per_thread; i++) {
+            uint vec_idx = tid * b_vec4_per_thread + i;
+            uint idx = vec_idx * 4;
+            uint n = idx / BK;
+            uint kk = idx - n * BK;
+            f16vec4 v = W_vec4[((block_col + n) * pc.K + k_base + kk) >> 2];
+            tileB[kk + 0][n] = v.x;
+            tileB[kk + 1][n] = v.y;
+            tileB[kk + 2][n] = v.z;
+            tileB[kk + 3][n] = v.w;
+        }
+
+        barrier();
+
+        [[unroll]] for (uint kk = 0; kk < BK; kk += CM_K) {
+            coopmat<float16_t, gl_ScopeSubgroup, CM_M, CM_K, gl_MatrixUseA> fragA[2];
+            [[unroll]] for (uint mi = 0; mi < tiles_m; mi++) {
+                coopMatLoad(fragA[mi], tileA[warp_row + mi * CM_M], kk,
+                            A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            [[unroll]] for (uint ni = 0; ni < tiles_n; ni++) {
+                coopmat<float16_t, gl_ScopeSubgroup, CM_K, CM_N, gl_MatrixUseB> fragB;
+                coopMatLoad(fragB, tileB[kk], ni * CM_N,
+                            B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+
+                [[unroll]] for (uint mi = 0; mi < tiles_m; mi++) {
+                    acc[mi][ni] = coopMatMulAdd(fragA[mi], fragB, acc[mi][ni]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    [[unroll]] for (uint mi = 0; mi < tiles_m; mi++) {
+        [[unroll]] for (uint ni = 0; ni < tiles_n; ni++) {
+            uint y_row = block_row + warp_row + mi * CM_M;
+            uint y_col = block_col + ni * CM_N;
+            coopMatStore(acc[mi][ni], Y, y_row * pc.N + y_col,
+                         pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}
