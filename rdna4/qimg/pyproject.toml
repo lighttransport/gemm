@@ -1,0 +1,19 @@
+[project]
+name = "qimg-native-fp8-ref"
+version = "0.1.0"
+description = "Local native-FP8 reference and diagnostics for rdna4/qimg"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "safetensors>=0.4.5",
+    "Pillow>=10",
+]
+
+[project.optional-dependencies]
+torch-rocm722 = [
+    "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.6.0+rocm7.2.2.git4ed88892-cp312-cp312-linux_x86_64.whl",
+    "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl",
+]
+
+[tool.uv]
+package = false
