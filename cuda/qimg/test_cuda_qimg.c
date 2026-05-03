@@ -590,9 +590,14 @@ int main(int argc, char **argv) {
         float *out = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
         for (int i = 0; i < n_img*in_ch; i++) img[i] = randn() * 0.1f;
         for (int i = 0; i < n_txt*txt_dim; i++) txt[i] = randn() * 0.1f;
-        t0 = clock();
+        /* Warm up: 1 iter to populate caches; then timed run */
         cuda_qimg_dit_step(r, img, n_img, txt, n_txt, 500.0f, out);
-        fprintf(stderr, "DiT step: %.2fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+        struct timespec ts0, ts1;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        cuda_qimg_dit_step(r, img, n_img, txt, n_txt, 500.0f, out);
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        double wall = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+        fprintf(stderr, "DiT step: %.3fs (wall, after 1 warm iter)\n", wall);
         { float mn=out[0],mx=out[0],sm=0; int nn=n_img*in_ch, nc=0;
           for(int i=0;i<nn;i++){if(out[i]!=out[i])nc++;else{if(out[i]<mn)mn=out[i];if(out[i]>mx)mx=out[i];sm+=out[i];}}
           fprintf(stderr, "Output: min=%.4f max=%.4f mean=%.4f nan=%d/%d\n",mn,mx,sm/(nn-nc),nc,nn); }
