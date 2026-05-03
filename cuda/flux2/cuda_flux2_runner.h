@@ -2752,6 +2752,7 @@ struct cuda_flux2_runner {
      * On RTX 5060 Ti reaches 60-145 TFLOP/s vs ~30-45 for v7 on flux2 shapes.
      * Output is BF16; expand+bias is a separate kernel (bf16_to_f32_add_bias_f32). */
     int use_cublaslt_fp8;
+    int use_cublaslt_bf16;
     struct cublasew_context *cublaslt_ctx;
     CUdeviceptr d_w_scale_lt;        /* [1] f32 per-call host->device w_scale */
     CUdeviceptr d_y_bf16_scratch;    /* [n_tok*n_out] bf16 LT output */
@@ -3187,6 +3188,39 @@ static void op_gemm_scaled_ex(cuda_flux2_runner *r, CUdeviceptr Y, CUdeviceptr W
         cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, r->stream, args, NULL);
     } else {
         /* F32 / F16 / BF16 fallback (w_scale<0 sentinel: weight buffer is not FP8). */
+        /* cuBLAS-LT BF16 path: F32 output, no expand needed. Same X-quant
+         * as v7. Falls through to v7 if LT runtime fails. */
+        if (r->use_cublaslt_bf16 && r->use_bf16_gemm &&
+            n_tok >= 8 && n_in >= 32 && n_out >= 16) {
+            size_t n_elems = (size_t)n_tok * (size_t)n_in;
+            if (ensure_x_bf16_buf(r, n_elems) == 0) {
+                /* 1) F32 -> BF16 quant */
+                int n = (int)n_elems;
+                void *qargs[] = {&r->d_x_bf16, &X, &n};
+                cuLaunchKernel(r->fn_quant_bf16,
+                               (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                               0, r->stream, qargs, NULL);
+                /* 2) cuBLAS-LT BF16 matmul -> F32 directly */
+                int rc = cublasew_gemm_bf16_bf16_f32_rowmajor_nt(
+                    r->cublaslt_ctx, Y, W, r->d_x_bf16,
+                    n_tok, n_out, n_in);
+                if (rc == 0) {
+                    /* 3) bias post-pass (no-op when bias==NULL) */
+                    int has_bias = (bias != 0) ? 1 : 0;
+                    int rows = n_tok, cols = n_out;
+                    void *bargs[] = {&Y, &bias, &rows, &cols, &has_bias};
+                    unsigned bx = 256;
+                    unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+                    unsigned gyd = (unsigned)rows;
+                    cuLaunchKernel(r->fn_add_bias_inplace, gxd, gyd, 1, bx, 1, 1,
+                                   0, r->stream, bargs, NULL);
+                    return;
+                }
+                r->use_cublaslt_bf16 = 0;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "cuda_flux2: cuBLAS-LT BF16 matmul failed (rc=%d), disabling LT-BF16 path\n", rc);
+            }
+        }
         /* v7 BF16 path: K must be a multiple of 32. */
         if (r->use_bf16_v7 && (n_in % 32) == 0) {
             size_t n_elems = (size_t)n_tok * (size_t)n_in;
@@ -4081,31 +4115,42 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     if (cuModuleGetFunction(&r->fn_bf16_to_f32_add_bias, mod, "bf16_to_f32_add_bias_f32") != CUDA_SUCCESS)
         r->fn_bf16_to_f32_add_bias = NULL;
 
-    /* cuBLAS-LT FP8 e4m3 path — default ON when FLUX2_FP8_GEMM is active.
-     * Reaches 60-145 TFLOP/s on flux2 shapes vs ~30-45 for v7 (RTX 5060 Ti).
-     * Set FLUX2_CUBLASLT_FP8=0 to opt out and stay on the v7 path. */
+    /* cuBLAS-LT path (FP8 or BF16) — default ON when corresponding GEMM mode is
+     * active. FP8: reaches 60-145 TFLOP/s vs ~30-45 for v7 on RTX 5060 Ti.
+     * BF16: F32 output, no expand needed. Set FLUX2_CUBLASLT_FP8=0 or
+     * FLUX2_CUBLASLT_BF16=0 to opt out. */
     r->use_cublaslt_fp8 = 0;
+    r->use_cublaslt_bf16 = 0;
     r->cublaslt_ctx = NULL;
     r->d_w_scale_lt = 0;
     r->d_y_bf16_scratch = 0; r->y_bf16_scratch_n = 0;
     {
-        const char *env = getenv("FLUX2_CUBLASLT_FP8");
-        int want = (env == NULL) ? 1 : (env[0] != '0');
-    if (want && r->use_fp8_gemm &&
-        r->fn_quant_fp8 && r->fn_reduce_max_abs && r->fn_bf16_to_f32_add_bias) {
-        if (cublasewCreate(&r->cublaslt_ctx, r->stream) == 0 &&
-            cublasew_lt_available(r->cublaslt_ctx) == 0) {
-            if (cuMemAlloc(&r->d_w_scale_lt, sizeof(float)) == CUDA_SUCCESS) {
-                r->use_cublaslt_fp8 = 1;
-                if (verbose >= 1)
-                    fprintf(stderr, "cuda_flux2: cuBLAS-LT FP8 e4m3 GEMM enabled\n");
+        const char *env_fp8 = getenv("FLUX2_CUBLASLT_FP8");
+        int want_fp8 = (env_fp8 == NULL) ? 1 : (env_fp8[0] != '0');
+        const char *env_bf = getenv("FLUX2_CUBLASLT_BF16");
+        int want_bf = (env_bf == NULL) ? 1 : (env_bf[0] != '0');
+        int want_fp8_eff = want_fp8 && r->use_fp8_gemm &&
+                           r->fn_quant_fp8 && r->fn_reduce_max_abs && r->fn_bf16_to_f32_add_bias;
+        int want_bf_eff = want_bf && r->use_bf16_gemm && r->fn_quant_bf16 && r->fn_add_bias_inplace;
+        if (want_fp8_eff || want_bf_eff) {
+            if (cublasewCreate(&r->cublaslt_ctx, r->stream) == 0 &&
+                cublasew_lt_available(r->cublaslt_ctx) == 0) {
+                if (cuMemAlloc(&r->d_w_scale_lt, sizeof(float)) == CUDA_SUCCESS) {
+                    if (want_fp8_eff) r->use_cublaslt_fp8 = 1;
+                    if (want_bf_eff)  r->use_cublaslt_bf16 = 1;
+                    if (verbose >= 1) {
+                        if (r->use_cublaslt_fp8)
+                            fprintf(stderr, "cuda_flux2: cuBLAS-LT FP8 e4m3 GEMM enabled\n");
+                        if (r->use_cublaslt_bf16)
+                            fprintf(stderr, "cuda_flux2: cuBLAS-LT BF16 GEMM enabled\n");
+                    }
+                }
+            }
+            if (!r->use_cublaslt_fp8 && !r->use_cublaslt_bf16 && r->cublaslt_ctx) {
+                cublasewDestroy(r->cublaslt_ctx);
+                r->cublaslt_ctx = NULL;
             }
         }
-        if (!r->use_cublaslt_fp8 && r->cublaslt_ctx) {
-            cublasewDestroy(r->cublaslt_ctx);
-            r->cublaslt_ctx = NULL;
-        }
-    }
     }
 
     if (verbose >= 1) {
@@ -4121,6 +4166,7 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
         if (r->use_bf16_attn) fprintf(stderr, " [bf16-attn]");
         if (r->use_fp8_v7) fprintf(stderr, " [fp8-v7]");
         if (r->use_cublaslt_fp8) fprintf(stderr, " [cublaslt-fp8]");
+        if (r->use_cublaslt_bf16) fprintf(stderr, " [cublaslt-bf16]");
         if (r->use_bf16_vae) fprintf(stderr, " [vae-bf16]");
         fprintf(stderr, "\n");
     }
