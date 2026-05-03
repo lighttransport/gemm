@@ -1138,7 +1138,8 @@ static const char hip_qimg_specific_kernels[] =
 
 /* ============================================================
  * FP8×FP8 WMMA path (gfx12). Activations are quantized to E4M3
- * with one scale factor per output row (max-abs / 448), then a
+ * with one scale factor per output row (max-abs / scale_div, default 512),
+ * then a
  * 3-LDS-buffer pipelined 128×128 MMA kernel produces F32 output
  * with `acc * scale[row] + bias[col]` writeback.
  *
@@ -1207,16 +1208,16 @@ static const char hip_qimg_specific_kernels[] =
  * Grid: (M_pad,)  Block: 256.  One row per block.
  * Inputs:  X     [n_tok, K]      F32, row-major
  * Outputs: X_fp8 [M_pad, K]      raw FP8 E4M3 bytes (rows >= n_tok zeroed)
- *          scales[M_pad]          row scale s_m = max|X[m,:]|/448 (>=eps)
+ *          scales[M_pad]          row scale s_m = max|X[m,:]|/scale_div (>=eps)
  *
- * Quantization: s_m = max(|x|) / 448 (clamped to >= 1e-12).
+ * Quantization: s_m = max(|x|) / scale_div (clamped to >= 1e-12).
  *               x_fp8[m,k] = round(x[m,k] / s_m)  (saturates at ±448).
  * Reconstruction at GEMM writeback:
  *               y[m,n] = (sum_k x_fp8[m,k] * w_fp8[n,k]) * s_m + bias[n].
  */
 "__global__ __launch_bounds__(256, 1)\n"
 "void qimg_quantize_act_perrow_fp8(const float *X, qimg_u8 *X_fp8, float *scales,\n"
-"                                   int n_tok, int K, int M_pad) {\n"
+"                                   int n_tok, int K, int M_pad, float scale_div) {\n"
 "    int m = blockIdx.x;\n"
 "    int tid = threadIdx.x;\n"
 "    if (m >= M_pad) return;\n"
@@ -1242,12 +1243,80 @@ static const char hip_qimg_specific_kernels[] =
 "    __syncthreads();\n"
 "    float row_max = 0.f;\n"
 "    for (int i = 0; i < 8; i++) if (wave_max[i] > row_max) row_max = wave_max[i];\n"
-"    float s = row_max * (1.0f / 448.0f);\n"
+"    float s = row_max / scale_div;\n"
 "    if (s < 1e-12f) s = 1e-12f;\n"
 "    float inv_s = 1.0f / s;\n"
 "    if (tid == 0) scales[m] = s;\n"
 "    for (int k = tid; k < K; k += 256) {\n"
 "        float v = X[(size_t)m * K + k] * inv_s;\n"
+"        X_fp8[(size_t)m * K + k] = qimg_f32_to_fp8_e4m3(v);\n"
+"    }\n"
+"}\n"
+
+/* ComfyUI-style scalar activation quantizer.
+ *
+ * Uses tensorwise scale 1.0: x_fp8 = round(clamp(x, -448, 448)).
+ * The per-row scale array is still populated with 1.0 so the existing
+ * FP8xFP8 writeback kernel can be reused unchanged.
+ */
+"__global__ __launch_bounds__(256, 1)\n"
+"void qimg_quantize_act_scalar_fp8(const float *X, qimg_u8 *X_fp8, float *scales,\n"
+"                                  int n_tok, int K, int M_pad) {\n"
+"    int m = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    if (m >= M_pad) return;\n"
+"    if (tid == 0) scales[m] = 1.0f;\n"
+"    if (m >= n_tok) {\n"
+"        for (int k = tid; k < K; k += 256) X_fp8[(size_t)m * K + k] = (qimg_u8)0;\n"
+"        return;\n"
+"    }\n"
+"    for (int k = tid; k < K; k += 256) {\n"
+"        float v = X[(size_t)m * K + k];\n"
+"        if (v > 448.0f) v = 448.0f;\n"
+"        if (v < -448.0f) v = -448.0f;\n"
+"        X_fp8[(size_t)m * K + k] = qimg_f32_to_fp8_e4m3(v);\n"
+"    }\n"
+"}\n"
+
+/* Safe scalar activation quantizer.
+ *
+ * Keeps ComfyUI's scale=1 behavior while the row fits FP8 range, but avoids
+ * catastrophic saturation by downscaling only rows with max|x| > 448.
+ */
+"__global__ __launch_bounds__(256, 1)\n"
+"void qimg_quantize_act_clamp_fp8(const float *X, qimg_u8 *X_fp8, float *scales,\n"
+"                                 int n_tok, int K, int M_pad) {\n"
+"    int m = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    if (m >= M_pad) return;\n"
+"    if (m >= n_tok) {\n"
+"        for (int k = tid; k < K; k += 256) X_fp8[(size_t)m * K + k] = (qimg_u8)0;\n"
+"        if (tid == 0) scales[m] = 1.0f;\n"
+"        return;\n"
+"    }\n"
+"    float local_max = 0.f;\n"
+"    for (int k = tid; k < K; k += 256) {\n"
+"        float v = fabsf(X[(size_t)m * K + k]);\n"
+"        if (v > local_max) local_max = v;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) {\n"
+"        float other = __shfl_xor(local_max, off, 32);\n"
+"        if (other > local_max) local_max = other;\n"
+"    }\n"
+"    __shared__ float wave_max[8];\n"
+"    int wid = tid >> 5;\n"
+"    int lane = tid & 31;\n"
+"    if (lane == 0) wave_max[wid] = local_max;\n"
+"    __syncthreads();\n"
+"    float row_max = 0.f;\n"
+"    for (int i = 0; i < 8; i++) if (wave_max[i] > row_max) row_max = wave_max[i];\n"
+"    float s = row_max > 448.0f ? (row_max / 448.0f) : 1.0f;\n"
+"    float inv_s = 1.0f / s;\n"
+"    if (tid == 0) scales[m] = s;\n"
+"    for (int k = tid; k < K; k += 256) {\n"
+"        float v = X[(size_t)m * K + k] * inv_s;\n"
+"        if (v > 448.0f) v = 448.0f;\n"
+"        if (v < -448.0f) v = -448.0f;\n"
 "        X_fp8[(size_t)m * K + k] = qimg_f32_to_fp8_e4m3(v);\n"
 "    }\n"
 "}\n"
