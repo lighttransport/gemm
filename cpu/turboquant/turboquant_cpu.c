@@ -17,6 +17,20 @@ const float tq3_thresholds[7] = {
      0.0442388038f,  0.0928039686f,  0.1544086412f,
 };
 
+const float tq4_centroids[16] = {
+    -0.2415290092f, -0.1828769682f, -0.1430164169f, -0.1110361778f,
+    -0.0832919158f, -0.0580498424f, -0.0342989423f, -0.0113486234f,
+     0.0113486234f,  0.0342989423f,  0.0580498424f,  0.0832919158f,
+     0.1110361778f,  0.1430164169f,  0.1828769682f,  0.2415290092f,
+};
+
+const float tq4_thresholds[15] = {
+    -0.2122029887f, -0.1629466926f, -0.1270262974f, -0.0971640468f,
+    -0.0706708791f, -0.0461743923f, -0.0228237828f,  0.0000000000f,
+     0.0228237828f,  0.0461743923f,  0.0706708791f,  0.0971640468f,
+     0.1270262974f,  0.1629466926f,  0.2122029887f,
+};
+
 static const float tq3_inv_sqrt_128 = 0.08838834764831845f;
 
 uint64_t tq3_splitmix64(uint64_t *x) {
@@ -77,6 +91,11 @@ size_t tq3_num_blocks(int n) {
 size_t tq3_row_bytes(int n) {
     size_t nb = tq3_num_blocks(n);
     return nb ? nb * sizeof(tq3_block) : 0;
+}
+
+size_t tq4_row_bytes(int n) {
+    size_t nb = tq3_num_blocks(n);
+    return nb ? nb * sizeof(tq4_block) : 0;
 }
 
 static uint8_t sign_bit(uint64_t seed, uint64_t block_index, int plane, int i) {
@@ -148,7 +167,21 @@ void tq3_unpack_indices(uint8_t idx[TQ3_BLOCK_SIZE], const tq3_block *blk) {
     }
 }
 
-static uint8_t nearest_centroid(float v) {
+void tq4_pack_indices(tq4_block *blk, const uint8_t idx[TQ3_BLOCK_SIZE]) {
+    for (int i = 0; i < TQ3_BLOCK_SIZE; i += 2) {
+        blk->qs[i >> 1] = (uint8_t)((idx[i] & 15u) | ((idx[i + 1] & 15u) << 4));
+    }
+}
+
+void tq4_unpack_indices(uint8_t idx[TQ3_BLOCK_SIZE], const tq4_block *blk) {
+    for (int i = 0; i < TQ3_BLOCK_SIZE; i += 2) {
+        uint8_t q = blk->qs[i >> 1];
+        idx[i] = (uint8_t)(q & 15u);
+        idx[i + 1] = (uint8_t)(q >> 4);
+    }
+}
+
+static uint8_t nearest_centroid3(float v) {
     uint8_t idx = 0;
     idx += (uint8_t)(v > tq3_thresholds[0]);
     idx += (uint8_t)(v > tq3_thresholds[1]);
@@ -157,6 +190,12 @@ static uint8_t nearest_centroid(float v) {
     idx += (uint8_t)(v > tq3_thresholds[4]);
     idx += (uint8_t)(v > tq3_thresholds[5]);
     idx += (uint8_t)(v > tq3_thresholds[6]);
+    return idx;
+}
+
+static uint8_t nearest_centroid4(float v) {
+    uint8_t idx = 0;
+    for (int i = 0; i < 15; i++) idx += (uint8_t)(v > tq4_thresholds[i]);
     return idx;
 }
 
@@ -183,7 +222,7 @@ int tq3_quantize_row_f32(tq3_block *dst, const float *src, int n, uint64_t seed)
 
         float recon_norm2 = 0.0f;
         for (int i = 0; i < TQ3_BLOCK_SIZE; i++) {
-            idx[i] = nearest_centroid(rotated[i]);
+            idx[i] = nearest_centroid3(rotated[i]);
             float c = tq3_centroids[idx[i]];
             recon_norm2 += c * c;
         }
@@ -191,6 +230,55 @@ int tq3_quantize_row_f32(tq3_block *dst, const float *src, int n, uint64_t seed)
         dst[b].scale_f16 = tq3_f32_to_f16(scale);
         dst[b].reserved = 0;
         tq3_pack_indices(&dst[b], idx);
+    }
+    return 0;
+}
+
+int tq4_quantize_row_f32(tq4_block *dst, const float *src, int n, uint64_t seed) {
+    size_t nb = tq3_num_blocks(n);
+    if (!dst || !src || nb == 0) return -1;
+    for (size_t b = 0; b < nb; b++) {
+        const float *x = src + b * TQ3_BLOCK_SIZE;
+        float norm2 = 0.0f;
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++) norm2 += x[i] * x[i];
+        if (norm2 <= 0.0f) {
+            dst[b].scale_f16 = 0;
+            dst[b].reserved = 0;
+            memset(dst[b].qs, 0, sizeof(dst[b].qs));
+            continue;
+        }
+
+        float inv_norm = 1.0f / sqrtf(norm2);
+        float normalized[TQ3_BLOCK_SIZE];
+        float rotated[TQ3_BLOCK_SIZE];
+        uint8_t idx[TQ3_BLOCK_SIZE];
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++) normalized[i] = x[i] * inv_norm;
+        tq3_forward_rotate(rotated, normalized, seed, b);
+
+        float recon_norm2 = 0.0f;
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++) {
+            idx[i] = nearest_centroid4(rotated[i]);
+            float c = tq4_centroids[idx[i]];
+            recon_norm2 += c * c;
+        }
+        float scale = sqrtf(norm2) / fmaxf(sqrtf(recon_norm2), 1.0e-20f);
+        dst[b].scale_f16 = tq3_f32_to_f16(scale);
+        dst[b].reserved = 0;
+        tq4_pack_indices(&dst[b], idx);
+    }
+    return 0;
+}
+
+int tq4_dequantize_row_f32(float *dst, const tq4_block *src, int n, uint64_t seed) {
+    size_t nb = tq3_num_blocks(n);
+    if (!dst || !src || nb == 0) return -1;
+    for (size_t b = 0; b < nb; b++) {
+        uint8_t idx[TQ3_BLOCK_SIZE];
+        float rotated[TQ3_BLOCK_SIZE];
+        float scale = tq3_f16_to_f32(src[b].scale_f16);
+        tq4_unpack_indices(idx, &src[b]);
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++) rotated[i] = tq4_centroids[idx[i]] * scale;
+        tq3_inverse_rotate(dst + b * TQ3_BLOCK_SIZE, rotated, seed, b);
     }
     return 0;
 }
@@ -223,6 +311,20 @@ float tq3_dot_block_scalar(const tq3_block *blk, const float *x,
     return acc;
 }
 
+float tq4_dot_block_scalar(const tq4_block *blk, const float *x,
+                           uint64_t seed, uint64_t block_index) {
+    uint8_t idx[TQ3_BLOCK_SIZE];
+    float xrot[TQ3_BLOCK_SIZE];
+    float scale = tq3_f16_to_f32(blk->scale_f16);
+    tq4_unpack_indices(idx, blk);
+    tq3_forward_rotate(xrot, x, seed, block_index);
+    float acc = 0.0f;
+    for (int i = 0; i < TQ3_BLOCK_SIZE; i++) {
+        acc += tq4_centroids[idx[i]] * scale * xrot[i];
+    }
+    return acc;
+}
+
 float tq3_dot_row_f32(const tq3_block *qrow, const float *x, int n, uint64_t seed) {
     size_t nb = tq3_num_blocks(n);
     if (!qrow || !x || nb == 0) return 0.0f;
@@ -238,6 +340,26 @@ float tq3_dot_row_f32(const tq3_block *qrow, const float *x, int n, uint64_t see
     } else {
         for (size_t b = 0; b < nb; b++) {
             acc += tq3_dot_block_scalar(&qrow[b], x + b * TQ3_BLOCK_SIZE, seed, b);
+        }
+    }
+    return acc;
+}
+
+float tq4_dot_row_f32(const tq4_block *qrow, const float *x, int n, uint64_t seed) {
+    size_t nb = tq3_num_blocks(n);
+    if (!qrow || !x || nb == 0) return 0.0f;
+    float acc = 0.0f;
+    if (tq3_x86_has_avx2()) {
+        for (size_t b = 0; b < nb; b++) {
+            acc += tq4_dot_block_avx2(&qrow[b], x + b * TQ3_BLOCK_SIZE, seed, b);
+        }
+    } else if (tq3_x86_has_sse2()) {
+        for (size_t b = 0; b < nb; b++) {
+            acc += tq4_dot_block_sse2(&qrow[b], x + b * TQ3_BLOCK_SIZE, seed, b);
+        }
+    } else {
+        for (size_t b = 0; b < nb; b++) {
+            acc += tq4_dot_block_scalar(&qrow[b], x + b * TQ3_BLOCK_SIZE, seed, b);
         }
     }
     return acc;
