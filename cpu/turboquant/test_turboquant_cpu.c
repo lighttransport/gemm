@@ -36,32 +36,43 @@ int main(int argc, char **argv) {
     int n = 4096;
     int iters = 2000;
     int verify = 1;
+    int bits = 3;
     uint64_t seed = 42;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bits") && i + 1 < argc) bits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--bench-only")) verify = 0;
         else if (!strcmp(argv[i], "--verify")) verify = 1;
     }
 
-    size_t bytes = tq3_row_bytes(n);
+    size_t bytes = bits == 4 ? tq4_row_bytes(n) : tq3_row_bytes(n);
     if (bytes == 0) {
         fprintf(stderr, "n must be a positive multiple of %d\n", TQ3_BLOCK_SIZE);
+        return 2;
+    }
+    if (bits != 3 && bits != 4) {
+        fprintf(stderr, "--bits must be 3 or 4\n");
         return 2;
     }
 
     float *x = (float *)aligned_alloc(64, (size_t)n * sizeof(float));
     float *y = (float *)aligned_alloc(64, (size_t)n * sizeof(float));
     float *dq = (float *)aligned_alloc(64, (size_t)n * sizeof(float));
-    tq3_block *q = (tq3_block *)aligned_alloc(64, bytes);
+    void *q = aligned_alloc(64, bytes);
     if (!x || !y || !dq || !q) return 2;
 
     fill(x, n, seed + 1);
     fill(y, n, seed + 2);
 
-    if (tq3_quantize_row_f32(q, x, n, seed) != 0 ||
-        tq3_dequantize_row_f32(dq, q, n, seed) != 0) {
+    int rc = bits == 4
+        ? tq4_quantize_row_f32((tq4_block *)q, x, n, seed)
+        : tq3_quantize_row_f32((tq3_block *)q, x, n, seed);
+    rc |= bits == 4
+        ? tq4_dequantize_row_f32(dq, (const tq4_block *)q, n, seed)
+        : tq3_dequantize_row_f32(dq, (const tq3_block *)q, n, seed);
+    if (rc != 0) {
         fprintf(stderr, "quant/dequant failed\n");
         return 2;
     }
@@ -75,11 +86,13 @@ int main(int argc, char **argv) {
             norm_e += e * e;
             dot_ref += (double)dq[i] * (double)y[i];
         }
-        float dot_fast = tq3_dot_row_f32(q, y, n, seed);
+        float dot_fast = bits == 4
+            ? tq4_dot_row_f32((const tq4_block *)q, y, n, seed)
+            : tq3_dot_row_f32((const tq3_block *)q, y, n, seed);
         double rel = sqrt(norm_e / fmax(norm_x, 1.0e-30));
         double dot_err = fabs((double)dot_fast - dot_ref);
-        printf("backend=%s n=%d bytes=%zu compression_vs_f16=%.3fx rel_l2=%.6f dot_err=%.6g\n",
-               tq3_cpu_backend(), n, bytes, ((double)n * 2.0) / (double)bytes, rel, dot_err);
+        printf("backend=%s tq%d n=%d bytes=%zu compression_vs_f16=%.3fx rel_l2=%.6f dot_err=%.6g\n",
+               tq3_cpu_backend(), bits, n, bytes, ((double)n * 2.0) / (double)bytes, rel, dot_err);
         if (rel > 0.35 || dot_err > 2.0e-3 * fmax(1.0, fabs(dot_ref))) {
             fprintf(stderr, "verification failed\n");
             return 1;
@@ -87,12 +100,22 @@ int main(int argc, char **argv) {
     }
 
     double t0 = now_sec();
-    for (int i = 0; i < iters; i++) tq3_quantize_row_f32(q, x, n, seed);
+    for (int i = 0; i < iters; i++) {
+        if (bits == 4) tq4_quantize_row_f32((tq4_block *)q, x, n, seed);
+        else tq3_quantize_row_f32((tq3_block *)q, x, n, seed);
+    }
     double t1 = now_sec();
-    for (int i = 0; i < iters; i++) tq3_dequantize_row_f32(dq, q, n, seed);
+    for (int i = 0; i < iters; i++) {
+        if (bits == 4) tq4_dequantize_row_f32(dq, (const tq4_block *)q, n, seed);
+        else tq3_dequantize_row_f32(dq, (const tq3_block *)q, n, seed);
+    }
     double t2 = now_sec();
     volatile float sink = 0.0f;
-    for (int i = 0; i < iters; i++) sink += tq3_dot_row_f32(q, y, n, seed);
+    for (int i = 0; i < iters; i++) {
+        sink += bits == 4
+            ? tq4_dot_row_f32((const tq4_block *)q, y, n, seed)
+            : tq3_dot_row_f32((const tq3_block *)q, y, n, seed);
+    }
     double t3 = now_sec();
 
     double gb = (double)n * sizeof(float) * (double)iters / 1.0e9;
