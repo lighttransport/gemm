@@ -255,11 +255,34 @@ Targets RDNA4 (gfx1200/gfx1201). Kernels compiled at runtime via HIPRTC (no `hip
 
 At 1024² the VAE middle self-attention initially regressed to 25.5 s on GPU because the original `vae_self_attn_f32` was sized for spatial=4096 — one CTA per query, no Q-blocking, every block re-streamed the full K/V from HBM (~16× redundant load at 16k tokens). Added `vae_self_attn_qb_f32` with QB=8 queries per CTA and BKV bumped 8→16, sharing one 48 KB LDS K/V tile across 8 waves. Drops 1024² VAE attn 25.5 → 3.6 s (7.1×); 512² also benefits (~250 → 57 ms). Auto-dispatched when c%32==0; original kernel kept as fallback.
 
-**FP8×FP8 WMMA** (`QIMG_FP8_FP8_WMMA=1`, **opt-in only**): port of `gemm_fp8_pipe32_pgr2` from `rdna4/fp8/bench_fp8_gemm.c` (~218 TF/s on mm0) into the qimg HIPRTC kernel string. 128 threads = 4 waves, 128×128 CTA tile, MIWT 4×4, K_step=32, 3-deep LDS pipeline (PGR=2). Activations are F32→FP8 quantized per output row (`qimg_quantize_act_perrow_fp8`: scale `s_m = max(|X[m,:]|)/448`), GEMM uses `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12`, and writeback fuses the row scale + bias. Mirrors the CUDA sibling's `gemm_fp8_pipe_perrow_f32` pattern. Eligible when `n_tok % 128 == 0`, `n_out % 128 == 0`, and `n_in % 32 == 0`; falls back to BF16×FP8 WMMA otherwise. `QIMG_FP8_WMMA_BF16=1` forces the BF16 path even when FP8×FP8 would qualify.
+**FP8×FP8 WMMA** (`QIMG_FP8_FP8_WMMA=1`, **opt-in only**): port of `gemm_fp8_pipe32_pgr2` from `rdna4/fp8/bench_fp8_gemm.c` (~218 TF/s on mm0) into the qimg HIPRTC kernel string. 128 threads = 4 waves, 128×128 CTA tile, MIWT 4×4, K_step=32, 3-deep LDS pipeline (PGR=2). Activations are F32→FP8 quantized per output row (`qimg_quantize_act_perrow_fp8`: scale `s_m = max(|X[m,:]|)/512` by default), GEMM uses `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12`, and writeback fuses the row scale + bias. Mirrors the CUDA sibling's `gemm_fp8_pipe_perrow_f32` pattern. Eligible when `n_tok % 128 == 0`, `n_out % 128 == 0`, and `n_in % 32 == 0`; falls back to BF16×FP8 WMMA otherwise. `QIMG_FP8_WMMA_BF16=1` forces the BF16 path even when FP8×FP8 would qualify.
 
 Speedup grows with spatial: BF16×FP8 → FP8×FP8 = **1.18× at 256² (1.20 → 1.02 s/step)**, **1.91× at 512² (2.79 → 1.46 s/step)**, **2.41× at 1024² (10.72 → 4.45 s/step)**. The 1024² ratio approaches the WMMA hardware peak ratio (~2.0×); residuals come from non-GEMM ops (FA, layernorm, modulation) that don't scale with the FP8 win.
 
-Quality regression (256²/20 steps vs diffusers `final_latent_packed_256.bin`): latent cos drops 0.999971 → 0.956359, latent PSNR 51.70 → 21.32 dB; PNG PSNR vs `apple_ref_256.png` drops 46.63 → 24.60 dB (mean pixel diff 0.82 → 10.65 / 255). The per-row activation scale `max|x|/448` doesn't preserve enough dynamic range for Qwen-Image's MMDiT path — outliers in attention and FFN inputs get crushed to e4m3 mantissa noise. Default kept OFF; ship the env var for users who accept the quality drop in exchange for ~2× denoise at ≥512².
+Quality regression (256²/20 steps vs diffusers `final_latent_packed_256.bin`): latent cos drops 0.999971 → 0.979988, latent PSNR 51.70 → 24.59 dB, and PNG PSNR 46.63 → 29.06 dB with the tuned default `max|x|/512` activation scale. The previous strict max-abs scale (`max|x|/448`) preserved all outliers but worsened the same run to cos 0.954620 / 21.15 dB and showed visible wobble. Sweep notes: 480 → cos 0.968644, 512 → 0.979988, 576 → 0.969696, 896 → 0.890300. Use `--fp8-act-scale-div <x>` or `QIMG_FP8_ACT_SCALE_DIV=<x>` to resweep; use `--fp8-act-scale-mode perrow|comfy|clamp` to switch activation scaling; use `--fp8-fp8-allow <labels>` / `--fp8-fp8-deny <labels>` plus `--fp8-fp8-block-min/max` to isolate projection families and block ranges. A 50 dB quality target is not compatible with native activation-FP8 GEMMs on this checkpoint without dispatch suppression: `img_in` alone measured 14.61 dB, image QKV 20.19 dB, `img_attn_out` 28.38 dB, `img_mlp_fc1` 35.02 dB, `img_mlp_fc2` 32.06 dB, and even block 59 only reached 31.70 dB. `--fp8-quality-target-db` / `QIMG_FP8_QUALITY_TARGET_DB` is now diagnostic annotation only; it does not suppress FP8×FP8. To hit 50+ dB today use BF16×FP8 WMMA (`QIMG_FP8_WMMA=1` without `QIMG_FP8_FP8_WMMA`, or `QIMG_FP8_WMMA_BF16=1` when testing FP8×FP8 dispatch). Current 256² traffic accounting: BF16×FP8 denoise 24.1 s, GEMM traffic 1723 GB / 73.1 TF, PSNR 51.70 dB; ungated FP8×FP8 denoise 20.3 s, GEMM traffic 984 GB / 73.1 TF, PSNR 24.59 dB, extra persistent activation-FP8 scratch 3.0 MB. BF16×FP8 keeps checkpoint weights resident as raw FP8 bytes and converts FP8→BF16 inside the WMMA kernel while staging LDS; there is no global BF16-expanded weight buffer or host-side conversion on the hot path. Default kept OFF; ship the env var for users who accept the quality drop in exchange for ~2× denoise at ≥512².
+
+**ComfyUI CUDA native FP8 reference behavior** (checked against current upstream `ComfyUI` + `comfy-kitchen` on 2026-05-03): the raw `qwen_image_fp8_e4m3fn.safetensors` fast path is FP8-activation × FP8-weight, not BF16×FP8. `comfy.ops.fp8_linear()` accepts only `torch.float8_e4m3fn` weights, reshapes activations to 2D, sets both activation and weight scales to scalar `1.0`, clamps activations to `[-448, 448]`, casts activations to FP8, wraps both sides as `QuantizedTensor`, then calls `torch.nn.functional.linear`. `comfy-kitchen` intercepts `aten.linear`, transposes the FP8 weight, and calls `scaled_mm_v2()`, which uses `torch.nn.functional.scaled_mm` when available and falls back to `torch._scaled_mm`, with tensorwise scales and `use_fast_accum=False`. Newer `comfy_quant` metadata checkpoints can carry `weight_scale` and optional `input_scale`; absent `input_scale` still defaults to `1.0`, not dynamic max-abs scaling. ComfyUI also disables the optimized comfy-kitchen CUDA backend when `torch.version.cuda` is missing or CUDA < 13. Practical qimg implication: a strict ComfyUI-CUDA-native mirror mode uses activation scale `1.0` + clamp/cast. The current qimg FP8×FP8 mode uses per-row activation scale (`max|x|/512`), so it is not a Comfy mirror and can introduce extra quantization error on dense/modulation vectors even though it preserves row outliers.
+
+**Low-memory PyTorch native FP8×FP8 probes** (ROCm 7.2.2 PyTorch, `rdna4/qimg/.venv`, `run_pytorch_fp8xfp8_selective_probes.sh`): full diffusers/DiT construction is not viable in the sandboxed environment because `QwenImageTransformer2DModel.from_single_file()` was host-OOM-killed at ~60 GB RSS before any DiT step ran. The selective probe script avoids that path entirely: it opens the FP8 safetensors lazily, loads one tensor at a time, uses pinned `init_latent_256.bin` / `apple_text_256.bin`, runs `torch._scaled_mm` on FP8 activation × FP8 weight, and compares against an F32 matmul reference. Memory stayed at ~0.08 GiB allocated / ~15.2 GiB free on RX 9070 XT.
+
+Expanded block-0 single-GEMM results:
+
+| Probe | Comfy scalar scale=1 | qimg-style per-row `/512` |
+|---|---:|---:|
+| `img_in` | 52.88 dB | 47.23 dB |
+| `txt_in` | 70.02 dB | 68.03 dB |
+| `temb_fc1` | 62.22 dB | 50.91 dB |
+| `temb_fc2` | 67.17 dB | 50.21 dB |
+| `blk0_img_mod` | 52.80 dB | 42.63 dB |
+| `blk0_txt_mod` | 50.81 dB | 39.39 dB |
+| `blk0_img_q/k/v` | 66.56 / 70.02 / 59.36 dB | 62.18 / 66.58 / 52.88 dB |
+| `blk0_txt_q/k/v` | 63.27 / 63.52 / 60.02 dB | 52.82 / 53.46 / 50.44 dB |
+| `blk0_img_mlp_fc1/fc2` | 55.35 / 69.43 dB | 49.61 / 68.34 dB |
+| `blk0_txt_mlp_fc1/fc2` | 51.11 / 64.81 dB | 44.46 / 64.96 dB |
+
+Logs: `rdna4/qimg/pytorch_fp8xfp8_probes/probes_comfy_div512.log` and `rdna4/qimg/pytorch_fp8xfp8_probes/probes_perrow_div512.log`. These are single-GEMM probes, not full-block or full-denoise quality, because attention/residual propagation is intentionally skipped to avoid the full-model OOM. Still, the result is important: the Comfy-style scalar-scale native FP8 path can clear 50 dB on early block linears without BF16 fallback, while qimg's current per-row `/512` scaling is the immediate source of several sub-50 dB linears.
+
+Follow-up qimg full-denoise runs added `--fp8-act-scale-mode comfy` and `--fp8-act-scale-mode clamp`. `comfy` is the strict scalar scale=1 mirror and catastrophically saturates later activations: 20-step pinned latent cos 0.301305 / PSNR 4.20 dB. `clamp` keeps scale=1 only while `row_max <= 448`, otherwise uses `row_max/448`; this avoids collapse but still only reaches cos 0.986565 / PSNR 25.93 dB at the same 20.3 s denoise time and 984 GB / 73.1 TF traffic. Best artifact from this pass: `rdna4/qimg/apple_fp8fp8_clamp_256.png`. Conclusion: native FP8×FP8 without BF16 fallback/gating does not reach the 50 dB target; scalar scale fixes isolated early GEMMs but full denoise needs either suppression/fallback or a fundamentally different quantization strategy.
 
 **BF16 WMMA flash-attention** (`QIMG_BF16_ATTN=1`, default ON when kernel loaded): replaces the F32 scalar `flash_attn_f32` with `flash_attn_sa_wmma_f32` ported from `rdna4/trellis2/hip_trellis2_kernels.h`. FA2 online softmax with QK^T and PV computed via 16×16×16 BF16 WMMA tiles (one `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` per intrinsic). 128 threads = 4 waves, each wave owns 16 query rows, Br_cta=64, Bc=16. Q/K/V are F32→BF16 cast at LDS staging, F32 accumulators, F32 output. Constraints: head_dim=128 (Qwen-Image), partial last KV tile masked with -inf so any N is supported (no padding required). Dispatching this kernel collapsed the scalar-attention bottleneck that dominated post-FP8×FP8 step time: at 512², 2.61 → 1.46 s/step = **1.79× speedup on denoise** (the residual ~1.15 s/step that wasn't GEMM was almost entirely the F32 scalar FA). Combined with FP8×FP8 WMMA, end-to-end at 512×512 is **2.93× faster than the BF16×FP8-only baseline** (4.28 → 1.46 s/step).
 
@@ -281,9 +304,9 @@ The VAE attention port is the headline win: at 512² spatial=4096, the CPU loop 
 | Wall time @ 256² | 102 s | **~24 s** (denoise 24.1 s + VAE 0.5 s) | **~21 s** (denoise 20.3 s + VAE 0.5 s) |
 | Wall time @ 512² | (unmeasured; ≈400+ s on rocm-7.2 BF16 offload) | **~57 s** (denoise 55.7 s + VAE 1.3 s) | **~30 s** (denoise 29.3 s + VAE 1.3 s) |
 | Wall time @ 1024² | n/a | ~218 s (denoise 214.5 s + VAE ~3 s) | **~94 s** (denoise 89.0 s + VAE ~3 s) |
-| Final latent cosine vs ref @ 256² | 1.0 (self) | 0.999971 | 0.956359 |
-| Final latent PSNR vs ref @ 256² | ∞ | 51.70 dB | 21.32 dB |
-| PNG PSNR vs ref @ 256² | ∞ | 46.63 dB | 24.60 dB |
+| Final latent cosine vs ref @ 256² | 1.0 (self) | 0.999971 | 0.979988 |
+| Final latent PSNR vs ref @ 256² | ∞ | 51.70 dB | 24.59 dB |
+| PNG PSNR vs ref @ 256² | ∞ | 46.63 dB | 29.06 dB |
 
 The HIP runner is now **~4× faster** than the pytorch-rocm diffusers reference at 256² (102 s → 24 s) at full BF16×FP8 quality, and **~5× faster** (102 s → 21 s) when opting into FP8×FP8 with the documented quality trade-off. The BF16-WMMA-only baseline was already 3× faster; BF16 WMMA flash-attention (replacing F32 scalar FA) and BF16 WMMA VAE conv2d + GPU spatial-attention port compress the rest. FP8×FP8 stacks on top for users who can absorb the quality drop. PyTorch sequential cpu offload is forced because the BF16 transformer doesn't fit in 16 GB VRAM resident — even with the FP8 transformer loaded via `from_single_file`, the text encoder + VAE + activations push past 16 GB during inference. A live 512² PyTorch comparison wasn't run (no diffusers in the available rocm env, and the offload pattern at 512² historically scales ~4× = 6+ minutes / 20 steps), but the relative gap widens since the BF16-attention/VAE wins matter more at higher spatial counts (4096 vs 1024 tokens for FA, 16× more pixels for VAE).
 
@@ -292,10 +315,11 @@ The HIP runner is now **~4× faster** than the pytorch-rocm diffusers reference 
 | | diffusers 2512 (FP8 from_single_file) | HIP 2512 |
 |---|---|---|
 | Wall time at 256×256/20 steps | 186 s | **30 s** |
-| Final latent cosine vs ref | 1.0 (self) | **0.9936** |
+| Final latent cosine vs ref | 1.0 (self) | **0.9981** |
+| Final latent PSNR vs ref | ∞ | **35.7 dB** |
 | PNG PSNR vs ref | ∞ | **30.0 dB** |
 
-PSNR is lower than the original ComfyUI FP8 file (30 dB vs 49 dB) because the 6 BF16-stored global GEMMs run through F32 + downstream BF16 trunc instead of the FP8 LUT/WMMA fused-trunc path. Note: the earlier 30 dB number was measured against a diffusers *reference* generated at **cfg=1** (single forward) with the same 2512 checkpoint, which turned out to be a weak reference — see the next subsection.
+PNG PSNR is lower than the original ComfyUI FP8 file (30 dB vs 49 dB). The pinned latent run is closer than the earlier 0.9936 note after the BF16×FP8 WMMA/default-attention path was rechecked with `--ref-final`: all 6 global weights dispatch through F32 because they are BF16-stored, while per-block weights still use FP8/BF16×FP8. Note: the earlier 30 dB PNG number was measured against a diffusers *reference* generated at **cfg=1** (single forward) with the same 2512 checkpoint, which turned out to be a weak reference — see the next subsection.
 
 **Current 2512 state (2026-04-15) — KNOWN BROKEN at cfg=1.**
 
@@ -309,18 +333,17 @@ Free-running 2512 generations at `true_cfg_scale=1` produce semantically-wrong o
 
 Only the mountain prompt reliably grounds. Both runners drift on object/subject prompts, which strongly hints the **text conditioning is the problem**, not the DiT or VAE: mountain-landscape embeddings sit in a denser part of the Qwen2.5-VL latent space and survive even weak guidance, while object prompts need CFG to break out of the "average scene" mode. Hypotheses to rule out (in order):
 
-1. **cfg=1 was inappropriate.** Qwen-Image-2512 was trained with CFG; the released examples (e.g. unsloth tutorial) use `true_cfg_scale=4.0`. The whole cfg=1 regression test needs to be redone at cfg=4. *(IN PROGRESS — HIP runner is single-forward only, so HIP apples-to-apples at cfg=4 requires adding a CFG combine step.)*
-2. **2512 text encoder preprocessing differs from the original.** The 2512 refresh may require a different chat template / system prompt / attention-mask layout before the Qwen2.5-VL text hidden states are fed into `txt_in`. `dump_diffusers_pipeline.py` currently calls `pipe.encode_prompt(prompt, …, max_sequence_length=512)` which doesn't thread a prompt template — need to compare the raw `prompt_embeds` tensor from the 2512 pipeline against the original FP8 pipeline for the same prompt to see if they agree up to a shape.
-3. **2512's sigma / timestep schedule differs.** The unsloth page advertises "2-step" variants. We've been running the 20-step schedule unchanged from the original checkpoint — if 2512 ships a different `FlowMatchEulerDiscreteScheduler` config (different `shift` / `num_train_timesteps`), running with the old schedule would mis-time every step.
+1. **cfg=1 was inappropriate.** Qwen-Image-2512 was trained with CFG; the released examples (e.g. unsloth tutorial) use `true_cfg_scale=4.0`. Diffusers cfg=4 references now exist for cat / building / mountain / retriever; building, mountain, and retriever ground well, while the cat prompt still drifts into a spotted big-cat-like animal.
+2. **2512 text encoder preprocessing differs from the original.** Existing apple dumps do **not** support this for the current reference path: `apple_text_256.bin` and `apple_text_2512.bin` are bit-identical (`prompt_embeds cos=1.0`, max diff 0) when compared with `compare_prompt_scheduler.py`. Other prompts still need the same check if they regress.
+3. **2512's sigma / timestep schedule differs.** Existing apple dumps do **not** support this for the current 20-step path: `sigmas_256.bin` and `sigmas_2512.bin` are bit-identical (`cos=1.0`, max diff 0). The 2-step advertising may still imply a separate recommended sampling mode, but it is not the reason the current 20-step pinned comparison differs.
 4. **BF16 global GEMMs drift the modulation projections.** The 6 BF16-stored globals include `time_text_embed.timestep_embedder.linear_{1,2}.weight`, which produces the per-block `img_mod / txt_mod` vectors. If our F32 fallback GEMM accumulates differently than diffusers' BF16 matmul, every block's adaLN is off by a few LSBs — which matters most at early timesteps where the signal is smallest.
 
 **TODOs** (in priority order):
 
-- [ ] Re-run `gen_diffusers_reference.py` with `--cfg 4.0` for cat / building / mountain / detailed-retriever prompts; confirm diffusers 2512 at cfg=4 actually produces good images. If yes, (1) is confirmed and the issue is "HIP is single-forward only at the moment".
-- [ ] Add `--cfg <scale>` + `--negative <prompt>` to `test_hip_qimg --generate`: runs two DiT forwards per step (positive + negative) and combines via `vel = uncond + cfg * (cond - uncond)`. This roughly doubles DiT wall time but enables apples-to-apples vs diffusers 2512.
-- [ ] Dump `prompt_embeds` from both diffusers pipelines (original FP8 vs 2512) for the same prompt+seed and diff them. If they already agree, the text encoder path is fine and only CFG matters; if they disagree, hypothesis (2) is live and we need to match preprocessing.
-- [ ] Check `pipe.scheduler.config` on the 2512 pipeline vs original and diff any field that affects sigma generation.
-- [ ] Regenerate the `apple_ref_2512.png` reference at cfg=4 and re-measure HIP PSNR against it (once HIP supports CFG).
+- [x] Re-run `gen_diffusers_reference.py` with `--cfg 4.0` for cat / building / mountain / detailed-retriever prompts; cfg=4 improves most prompts, but cat still drifts.
+- [x] Add `--cfg <scale>` + `--negative <prompt>` / `--neg-txt-bin <bin>` to `test_hip_qimg --generate`: runs two DiT forwards per step and combines `vel = uncond + cfg * (cond - uncond)`.
+- [x] Add `compare_prompt_scheduler.py` and diff existing original-vs-2512 apple dumps: prompt embeds and sigmas are bit-identical.
+- [ ] Run cfg=4 HIP 2512 apples-to-apples with a real negative prompt embedding dump, regenerate the cfg=4 latent/PNG reference, and re-measure PSNR.
 
 **What is NOT broken:** the DiT numerics themselves (`verify_qimg_dit` still passes at max_diff < 1e-3 vs the CPU reference on random inputs), the VAE (mountain output is sharp, and the original ComfyUI FP8 file at cfg=1 still reaches 49 dB PSNR), and the per-block FP8 vs BF16 dispatch for mixed-dtype checkpoints (it loads, runs, and decodes without NaNs). Only the free-running 2512 pipeline at cfg=1 is producing weak outputs.
 
@@ -332,6 +355,7 @@ Only the mountain prompt reliably grounds. Both runners drift on object/subject 
 |---|---|
 | `gen_diffusers_reference.py` | **diffusers-based** reference (`QwenImagePipeline`, pytorch-rocm 7.2, BF16 + cpu offload). Generates `apple_ref_<size>.png`. |
 | `dump_diffusers_pipeline.py` | Same pipeline plus dumps `apple_text*.bin`, `init_latent*.bin`, `final_latent_packed*.bin`, `sigmas*.bin`, `vae_meta*.txt` for layer-by-layer comparison against the HIP runner via `--init-bin`/`--txt-bin`/`--sigmas-bin`. |
+| `compare_prompt_scheduler.py` | Compares dumped prompt embeddings and sigma tables, or optionally runs a cheap live diffusers encode/scheduler probe without image generation. |
 | `make_comparison.py` | Build a 2×2 `apple_benchmark.png` (diffusers vs HIP at 256 / 512). |
 | `generate_reference.py` | (legacy) ComfyUI reference data generator |
 | `verify_pipeline.py` | End-to-end verification against ComfyUI reference |

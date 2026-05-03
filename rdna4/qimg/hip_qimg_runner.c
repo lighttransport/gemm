@@ -57,6 +57,36 @@ static void init_fp8_to_f32_lut(void) {
     hip_fp8_to_f32_lut_init = 1;
 }
 
+static uint8_t f32_to_fp8_e4m3_cpu(float f) {
+    if (f > 448.0f) f = 448.0f;
+    if (f < -448.0f) f = -448.0f;
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    uint32_t sign = bits >> 31;
+    int e = (int)((bits >> 23) & 0xFFu) - 127;
+    uint32_t mant = bits & 0x7FFFFFu;
+    int fp8_exp = e + 7;
+    if (e < -9) return (uint8_t)(sign << 7);
+    if (fp8_exp <= 0) {
+        uint32_t full_mant = mant | 0x800000u;
+        int shift = 1 - fp8_exp + 20;
+        if (shift >= 24) return (uint8_t)(sign << 7);
+        uint32_t fp8_mant = (full_mant + (1u << (shift - 1))) >> shift;
+        if (fp8_mant > 7) fp8_mant = 7;
+        return (uint8_t)((sign << 7) | (fp8_mant & 7u));
+    }
+    if (fp8_exp >= 15) return (uint8_t)((sign << 7) | (15u << 3) | 6u);
+    uint32_t fp8_mant = (mant + (1u << 19)) >> 20;
+    if (fp8_mant > 7) { fp8_mant = 0; fp8_exp++; }
+    if (fp8_exp >= 15) return (uint8_t)((sign << 7) | (15u << 3) | 6u);
+    return (uint8_t)((sign << 7) | ((uint32_t)fp8_exp << 3) | (fp8_mant & 7u));
+}
+
+static int cmp_float_asc(const void *a, const void *b) {
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
 /* ---- Per-block GPU weight struct ---- */
 
 typedef struct {
@@ -80,8 +110,10 @@ struct hip_qimg_runner {
     hipModule_t mod;
     hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_opt_fp8;
     hipFunction_t fn_gemm_fp8_wmma;  /* gfx12 BF16 act × FP8 wt matrix-core GEMM */
-    hipFunction_t fn_gemm_fp8_fp8_pgr2;  /* gfx12 FP8 act × FP8 wt WMMA, per-row act scale */
+    hipFunction_t fn_gemm_fp8_fp8_pgr2;  /* gfx12 FP8 act × FP8 wt WMMA */
     hipFunction_t fn_quantize_act_perrow;  /* F32 -> FP8 with per-row max-abs scale */
+    hipFunction_t fn_quantize_act_scalar;  /* F32 -> FP8 with scalar scale=1, Comfy-style */
+    hipFunction_t fn_quantize_act_clamp;   /* F32 -> FP8 with scale=max(1,maxabs/448) */
     hipFunction_t fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_flash_attn, fn_flash_attn_wmma;
     int use_attn_wmma; /* 1 = use BF16 WMMA flash attention (gfx12, head_dim=128) */
@@ -144,7 +176,252 @@ struct hip_qimg_runner {
     int is_fp8_img_in, is_fp8_txt_in;
     int is_fp8_t_fc1, is_fp8_t_fc2;
     int is_fp8_norm_out, is_fp8_proj_out;
+
+    /* Optional diagnostics, enabled by env or test harness flags:
+     * QIMG_PATH_STATS=1 prints and aggregates GEMM dispatches.
+     * QIMG_FP8_QUANT_STATS=1 samples FP8xFP8 activation quantization error. */
+    int path_stats_enabled;
+    int quant_stats_enabled;
+    int quant_stats_max;
+    int path_prints;
+    int quant_prints;
+    uint64_t gemm_path_counts[6];
+    uint64_t gemm_path_flops[6];
+    uint64_t gemm_path_bytes[6];
+    int mem_stats_enabled;
+    int mem_report_printed;
+    const char *fp8_fp8_allow;
+    const char *fp8_fp8_deny;
+    int fp8_fp8_block_min;
+    int fp8_fp8_block_max;
+    float fp8_quality_target_db;
+    float fp8_act_scale_div;
+    int fp8_act_scale_scalar;
+    int fp8_act_scale_clamp;
+    int current_block;
+    char current_gemm_label[64];
 };
+
+enum {
+    QIMG_GEMM_F32 = 0,
+    QIMG_GEMM_FP8_SCALAR,
+    QIMG_GEMM_FP8_OPT,
+    QIMG_GEMM_BF16_WMMA,
+    QIMG_GEMM_FP8_FP8,
+    QIMG_GEMM_PATH_COUNT
+};
+
+static const char *qimg_gemm_path_name(int path) {
+    switch (path) {
+    case QIMG_GEMM_F32:       return "f32";
+    case QIMG_GEMM_FP8_SCALAR:return "fp8_scalar";
+    case QIMG_GEMM_FP8_OPT:   return "fp8_lut128";
+    case QIMG_GEMM_BF16_WMMA: return "bf16xfp8_wmma";
+    case QIMG_GEMM_FP8_FP8:   return "fp8xfp8_wmma";
+    default:                  return "unknown";
+    }
+}
+
+static uint64_t qimg_ceil_div_u64(uint64_t a, uint64_t b) {
+    return (a + b - 1) / b;
+}
+
+static uint64_t qimg_estimate_gemm_global_bytes(int path, int n_tok, int n_out, int n_in) {
+    uint64_t M = (uint64_t)n_tok, N = (uint64_t)n_out, K = (uint64_t)n_in;
+    if (!M || !N || !K) return 0;
+
+    uint64_t mt = qimg_ceil_div_u64(M, 128);
+    uint64_t nt = qimg_ceil_div_u64(N, 128);
+    uint64_t x_bpe = 4, w_bpe = 4;
+
+    switch (path) {
+    case QIMG_GEMM_FP8_SCALAR:
+    case QIMG_GEMM_FP8_OPT:
+    case QIMG_GEMM_BF16_WMMA:
+        w_bpe = 1;
+        break;
+    case QIMG_GEMM_FP8_FP8:
+        x_bpe = 1;
+        w_bpe = 1;
+        break;
+    default:
+        break;
+    }
+
+    /* GEMM kernel global traffic model:
+     *   X is reread for each N tile, W is reread for each M tile, Y is written
+     *   once. BF16xFP8 converts FP8 weights to BF16 inside the kernel while
+     *   staging LDS, so there is no global BF16 weight copy in this model. */
+    uint64_t bytes = 0;
+    bytes += nt * M * K * x_bpe;
+    bytes += mt * N * K * w_bpe;
+    bytes += M * N * 4;              /* F32 output buffer */
+    bytes += mt * N * 4;             /* bias reads, approximate */
+
+    if (path == QIMG_GEMM_FP8_FP8) {
+        /* Activation quantizer traffic plus per-row scale reloads at writeback. */
+        bytes += M * K * 4;          /* read F32 activation */
+        bytes += M * K;              /* write FP8 activation scratch */
+        bytes += M * 4;              /* write scales */
+        bytes += M * N * 4;          /* read row scale, worst-case uncached */
+    }
+    return bytes;
+}
+
+static void qimg_set_gemm_context(hip_qimg_runner *r, int block, const char *label) {
+    if (!r) return;
+    r->current_block = block;
+    if (!label) label = "unnamed";
+    snprintf(r->current_gemm_label, sizeof(r->current_gemm_label), "%s", label);
+}
+
+static void qimg_record_gemm_path(hip_qimg_runner *r, int path,
+                                  int n_tok, int n_out, int n_in) {
+    if (!r || path < 0 || path >= QIMG_GEMM_PATH_COUNT) return;
+    r->gemm_path_counts[path]++;
+    r->gemm_path_flops[path] += 2ULL * (uint64_t)n_tok * (uint64_t)n_out * (uint64_t)n_in;
+    r->gemm_path_bytes[path] += qimg_estimate_gemm_global_bytes(path, n_tok, n_out, n_in);
+    if (r->path_stats_enabled && r->path_prints < 240) {
+        fprintf(stderr, "  gemm[%03d] block=%d %-18s path=%-15s M=%d N=%d K=%d\n",
+                r->path_prints, r->current_block, r->current_gemm_label,
+                qimg_gemm_path_name(path), n_tok, n_out, n_in);
+        r->path_prints++;
+    }
+}
+
+static int qimg_csv_has_label(const char *csv, const char *label) {
+    if (!csv || !csv[0] || !label || !label[0]) return 0;
+    const char *p = csv;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *s = p;
+        while (*p && *p != ',') p++;
+        const char *e = p;
+        while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+        size_t n = (size_t)(e - s);
+        if ((n == 1 && s[0] == '*') ||
+            (strlen(label) == n && strncmp(s, label, n) == 0))
+            return 1;
+    }
+    return 0;
+}
+
+static int qimg_allow_fp8_fp8_for_current_label(hip_qimg_runner *r) {
+    if (!r) return 0;
+    if (r->current_block >= 0) {
+        if (r->fp8_fp8_block_min >= 0 && r->current_block < r->fp8_fp8_block_min)
+            return 0;
+        if (r->fp8_fp8_block_max >= 0 && r->current_block > r->fp8_fp8_block_max)
+            return 0;
+    } else if (r->fp8_fp8_block_min >= 0 || r->fp8_fp8_block_max >= 0) {
+        return 0;
+    }
+    if (qimg_csv_has_label(r->fp8_fp8_deny, r->current_gemm_label))
+        return 0;
+    if (r->fp8_fp8_allow && r->fp8_fp8_allow[0])
+        return qimg_csv_has_label(r->fp8_fp8_allow, r->current_gemm_label);
+    return 1;
+}
+
+static void qimg_print_gemm_summary(hip_qimg_runner *r) {
+    if (!r || !r->path_stats_enabled) return;
+    fprintf(stderr, "hip_qimg: GEMM path summary:");
+    for (int i = 0; i < QIMG_GEMM_PATH_COUNT; i++)
+        fprintf(stderr, " %s=%llu", qimg_gemm_path_name(i),
+                (unsigned long long)r->gemm_path_counts[i]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "hip_qimg: GEMM traffic summary:");
+    double total_bytes = 0.0, total_flops = 0.0;
+    for (int i = 0; i < QIMG_GEMM_PATH_COUNT; i++) {
+        total_bytes += (double)r->gemm_path_bytes[i];
+        total_flops += (double)r->gemm_path_flops[i];
+        if (r->gemm_path_counts[i]) {
+            fprintf(stderr, " %s=%.2fGB/%.2fTF",
+                    qimg_gemm_path_name(i),
+                    (double)r->gemm_path_bytes[i] / 1.0e9,
+                    (double)r->gemm_path_flops[i] / 1.0e12);
+        }
+    }
+    fprintf(stderr, " total=%.2fGB/%.2fTF\n", total_bytes / 1.0e9, total_flops / 1.0e12);
+    if (r->act_fp8_bytes || r->act_scales_bytes || r->fa_qkv_bytes || r->fa_perrow_bytes || r->fa_scales_bytes) {
+        fprintf(stderr,
+                "hip_qimg: persistent scratch: act_fp8=%.1fMB act_scales=%.1fMB "
+                "fa_qkv=%.1fMB fa_perrow=%.1fMB fa_scales=%.3fMB\n",
+                (double)r->act_fp8_bytes / (1024.0 * 1024.0),
+                (double)r->act_scales_bytes / (1024.0 * 1024.0),
+                (double)(3 * r->fa_qkv_bytes) / (1024.0 * 1024.0),
+                (double)(2 * r->fa_perrow_bytes) / (1024.0 * 1024.0),
+                (double)r->fa_scales_bytes / (1024.0 * 1024.0));
+    }
+}
+
+static void qimg_maybe_quant_stats(hip_qimg_runner *r, void *X,
+                                   int n_tok, int K, int M_pad) {
+    if (!r || !r->quant_stats_enabled || r->quant_prints >= r->quant_stats_max)
+        return;
+    size_t n = (size_t)n_tok * (size_t)K;
+    if (n == 0) return;
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) return;
+    hipMemcpy(h, X, n * sizeof(float), hipMemcpyDeviceToHost);
+    init_fp8_to_f32_lut();
+
+    double sum_row_max = 0.0, sum_mae = 0.0;
+    float global_max = 0.0f, worst_row_max = 0.0f;
+    int sat = 0, zeros = 0;
+    const int nsamp_max = 8192;
+    float *samples = (float *)malloc((size_t)nsamp_max * sizeof(float));
+    int nsamp = 0;
+    size_t stride = n / (size_t)nsamp_max;
+    if (stride < 1) stride = 1;
+
+    for (int m = 0; m < n_tok; m++) {
+        const float *row = h + (size_t)m * K;
+        float row_max = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float a = fabsf(row[k]);
+            if (a > row_max) row_max = a;
+        }
+        if (row_max > global_max) global_max = row_max;
+        if (row_max > worst_row_max) worst_row_max = row_max;
+        sum_row_max += row_max;
+        float s = r->fp8_act_scale_scalar ? 1.0f :
+                  (r->fp8_act_scale_clamp ? (row_max > 448.0f ? row_max / 448.0f : 1.0f)
+                                           : (row_max / r->fp8_act_scale_div));
+        if (s < 1e-12f) s = 1e-12f;
+        float inv_s = 1.0f / s;
+        for (int k = 0; k < K; k++) {
+            float scaled = row[k] * inv_s;
+            if (fabsf(scaled) >= 448.0f) sat++;
+            uint8_t q = f32_to_fp8_e4m3_cpu(scaled);
+            if ((q & 0x7fu) == 0) zeros++;
+            float recon = fp8_e4m3_to_f32(q) * s;
+            float err = fabsf(recon - row[k]);
+            sum_mae += err;
+            size_t flat = (size_t)m * K + (size_t)k;
+            if ((flat % stride) == 0 && nsamp < nsamp_max)
+                samples[nsamp++] = err;
+        }
+    }
+    float p99 = 0.0f;
+    if (samples && nsamp > 0) {
+        qsort(samples, (size_t)nsamp, sizeof(float), cmp_float_asc);
+        int idx = (int)(0.99f * (float)(nsamp - 1));
+        p99 = samples[idx];
+    }
+    fprintf(stderr,
+            "  fp8q[%03d] block=%d %-18s M=%d/%d K=%d row_max_avg=%.5g max=%.5g "
+            "scale_mode=%s scale_div=%.1f mae=%.5g p99=%.5g zeros=%.2f%% sat=%.2f%%\n",
+            r->quant_prints, r->current_block, r->current_gemm_label,
+            n_tok, M_pad, K, sum_row_max / (double)n_tok, global_max,
+            r->fp8_act_scale_scalar ? "comfy" : (r->fp8_act_scale_clamp ? "clamp" : "perrow"),
+            r->fp8_act_scale_div,
+            sum_mae / (double)n, p99, 100.0 * (double)zeros / (double)n,
+            100.0 * (double)sat / (double)n);
+    r->quant_prints++;
+    free(samples);
+    free(h);
+}
 
 
 /* ---- Upload helpers ---- */
@@ -207,23 +484,15 @@ static void *qimg_st_upload_f32(st_context *st, const char *name) {
 }
 
 /* Upload safetensor as raw FP8 bytes to GPU (no conversion, 1 byte/element).
- *
- * Note: this function only accepts F8_E4M3 dtype. Mixed-dtype FP8 files like
- * `unsloth/Qwen-Image-2512-FP8` (which stores 1093 of 1933 tensors as BF16
- * — biases, norm scales, AND some global GEMM weights like img_in.weight,
- * proj_out.weight, time_text_embed.*) require an FP8/F32 dispatch flag on
- * each weight pointer plus a parallel F32 GEMM path for the BF16-stored
- * weights. The current runner assumes "all GW weights are FP8 bytes", so
- * `from_single_file`-style mixed checkpoints don't load correctly yet.
- * TODO: per-weight dtype tagging + dispatch in op_wgemm. */
+ * Mixed-dtype checkpoints call this only for tensors that are actually FP8;
+ * BF16/F16/F32 global weights go through qimg_upload_weight_auto(). */
 static void *qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     int idx = safetensors_find(st, name);
     if (idx < 0) return NULL;
     const char *dtype = safetensors_dtype(st, idx);
     if (strcmp(dtype, "F8_E4M3") != 0 && strcmp(dtype, "F8_E4M3FN") != 0) {
         fprintf(stderr, "hip_qimg: %s has dtype '%s' (expected F8_E4M3) — "
-                "mixed-dtype checkpoints (e.g. Qwen-Image-2512) not yet supported on HIP. "
-                "Use the original ComfyUI qwen_image_fp8_e4m3fn.safetensors.\n",
+                "caller should route non-FP8 tensors through qimg_upload_weight_auto().\n",
                 name, dtype);
         return NULL;
     }
@@ -360,6 +629,7 @@ static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b)
 
 static void op_gemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                     int n_out, int n_in, int n_tok) {
+    qimg_record_gemm_path(r, QIMG_GEMM_F32, n_tok, n_out, n_in);
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
@@ -381,6 +651,9 @@ static int qimg_ensure_act_scratch(hip_qimg_runner *r, size_t M_pad, size_t K) {
             return -1;
         }
         r->act_fp8_bytes = need_fp8;
+        if (r->mem_stats_enabled)
+            fprintf(stderr, "hip_qimg: FP8xFP8 act scratch grew to %.1f MB (M_pad=%zu K=%zu)\n",
+                    (double)need_fp8 / (1024.0 * 1024.0), M_pad, K);
     }
     if (need_sc > r->act_scales_bytes) {
         if (r->d_act_scales) hipFree(r->d_act_scales);
@@ -390,13 +663,16 @@ static int qimg_ensure_act_scratch(hip_qimg_runner *r, size_t M_pad, size_t K) {
             return -1;
         }
         r->act_scales_bytes = need_sc;
+        if (r->mem_stats_enabled)
+            fprintf(stderr, "hip_qimg: FP8xFP8 scale scratch grew to %.3f MB\n",
+                    (double)need_sc / (1024.0 * 1024.0));
     }
     return 0;
 }
 
 /* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT.
  * Dispatch order:
- *   1. FP8×FP8 WMMA + per-row act quant (gfx12, n_tok % 128 == 0,
+ *   1. FP8×FP8 WMMA + activation FP8 quant (gfx12, n_tok % 128 == 0,
  *      n_out % 128 == 0, K % 32 == 0) — when QIMG_FP8_FP8_WMMA=1 and
  *      QIMG_FP8_WMMA_BF16 not set. Fastest path, ports the rdna4/fp8
  *      pipe32_pgr2 ~218 TF/s kernel.
@@ -406,19 +682,32 @@ static int qimg_ensure_act_scratch(hip_qimg_runner *r, size_t M_pad, size_t K) {
  */
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                         int n_out, int n_in, int n_tok) {
+    hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
+                             (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
     if (r->use_fp8_fp8w && !r->prefer_bf16_wmma && r->fn_gemm_fp8_fp8_pgr2 &&
-        r->fn_quantize_act_perrow && n_tok > 0 &&
+        quant_fn && n_tok > 0 &&
+        qimg_allow_fp8_fp8_for_current_label(r) &&
         (n_tok % 128) == 0 && (n_out % 128) == 0 && (n_in % 32) == 0) {
         int M_pad = n_tok;  /* already 128-aligned per gate */
         if (qimg_ensure_act_scratch(r, (size_t)M_pad, (size_t)n_in) == 0) {
             void *d_x_fp8 = r->d_act_fp8;
             float *d_scales = r->d_act_scales;
-            /* Quantize: F32 X[n_tok, n_in] -> FP8 + per-row scale. */
+            qimg_record_gemm_path(r, QIMG_GEMM_FP8_FP8, n_tok, n_out, n_in);
+            qimg_maybe_quant_stats(r, X, n_tok, n_in, M_pad);
+            /* Quantize: F32 X[n_tok, n_in] -> FP8 + row writeback scale. */
             int K = n_in;
-            void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad};
-            hipModuleLaunchKernel(r->fn_quantize_act_perrow,
-                                  (unsigned)M_pad, 1, 1, 256, 1, 1,
-                                  0, NULL, qa, NULL);
+            if (r->fp8_act_scale_scalar || r->fp8_act_scale_clamp) {
+                void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad};
+                hipModuleLaunchKernel(quant_fn,
+                                      (unsigned)M_pad, 1, 1, 256, 1, 1,
+                                      0, NULL, qa, NULL);
+            } else {
+                float scale_div = r->fp8_act_scale_div;
+                void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad, &scale_div};
+                hipModuleLaunchKernel(r->fn_quantize_act_perrow,
+                                      (unsigned)M_pad, 1, 1, 256, 1, 1,
+                                      0, NULL, qa, NULL);
+            }
             /* GEMM: FP8 act × FP8 wt -> F32, scaled writeback. */
             void *ga[] = {&Y, &W, &d_x_fp8, &bias, &d_scales,
                           &n_out, &n_in, &n_tok, &M_pad};
@@ -431,6 +720,7 @@ static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bia
         /* Alloc failure: fall through to BF16xFP8 / scalar paths. */
     }
     if (r->use_wmma && r->fn_gemm_fp8_wmma && n_tok >= 16) {
+        qimg_record_gemm_path(r, QIMG_GEMM_BF16_WMMA, n_tok, n_out, n_in);
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
         unsigned gx = (unsigned)((n_out + 127) / 128);
         unsigned gy = (unsigned)((n_tok + 127) / 128);
@@ -439,6 +729,7 @@ static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bia
         return;
     }
     if (r->fn_gemm_opt_fp8 && n_tok >= 16) {
+        qimg_record_gemm_path(r, QIMG_GEMM_FP8_OPT, n_tok, n_out, n_in);
         /* gemm_opt_fp8: Y[M,N] = X[M,K] × W[N,K]^T  (N=n_out, K=n_in, M=n_tok) */
         void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
         unsigned gx = (unsigned)((n_out + 127) / 128);
@@ -447,6 +738,7 @@ static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bia
                               0, NULL, args, NULL);
         return;  /* BF16 truncation fused into kernel */
     }
+    qimg_record_gemm_path(r, QIMG_GEMM_FP8_SCALAR, n_tok, n_out, n_in);
     void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok};
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
@@ -833,6 +1125,40 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     r->device_id = device_id;
     r->verbose = verbose;
     r->mod = mod;
+    r->current_block = -1;
+    snprintf(r->current_gemm_label, sizeof(r->current_gemm_label), "%s", "init");
+    {
+        const char *e = getenv("QIMG_PATH_STATS");
+        r->path_stats_enabled = (e && !(strcmp(e, "0") == 0 || strcmp(e, "false") == 0));
+        e = getenv("QIMG_FP8_QUANT_STATS");
+        r->quant_stats_enabled = (e && !(strcmp(e, "0") == 0 || strcmp(e, "false") == 0));
+        e = getenv("QIMG_MEM_STATS");
+        r->mem_stats_enabled = (e && !(strcmp(e, "0") == 0 || strcmp(e, "false") == 0));
+        r->quant_stats_max = 80;
+        e = getenv("QIMG_FP8_QUANT_STATS_MAX");
+        if (e && atoi(e) > 0) r->quant_stats_max = atoi(e);
+        r->fp8_fp8_allow = getenv("QIMG_FP8_FP8_ALLOW");
+        r->fp8_fp8_deny = getenv("QIMG_FP8_FP8_DENY");
+        r->fp8_fp8_block_min = -1;
+        r->fp8_fp8_block_max = -1;
+        e = getenv("QIMG_FP8_FP8_BLOCK_MIN");
+        if (e && atoi(e) >= 0) r->fp8_fp8_block_min = atoi(e);
+        e = getenv("QIMG_FP8_FP8_BLOCK_MAX");
+        if (e && atoi(e) >= 0) r->fp8_fp8_block_max = atoi(e);
+        r->fp8_quality_target_db = 0.0f;
+        e = getenv("QIMG_FP8_QUALITY_TARGET_DB");
+        if (e && atof(e) > 0.0) r->fp8_quality_target_db = (float)atof(e);
+        r->fp8_act_scale_div = 512.0f;
+        e = getenv("QIMG_FP8_ACT_SCALE_DIV");
+        if (e && atof(e) > 0.0) r->fp8_act_scale_div = (float)atof(e);
+        r->fp8_act_scale_scalar = 0;
+        r->fp8_act_scale_clamp = 0;
+        e = getenv("QIMG_FP8_ACT_SCALE_MODE");
+        if (e && (!strcmp(e, "comfy") || !strcmp(e, "scalar") || !strcmp(e, "scale1")))
+            r->fp8_act_scale_scalar = 1;
+        if (e && (!strcmp(e, "clamp") || !strcmp(e, "safe") || !strcmp(e, "safe_scalar")))
+            r->fp8_act_scale_clamp = 1;
+    }
 
     #define GET(field, name) hipModuleGetFunction(&r->field, mod, name)
     GET(fn_gemm, "gemm_f32_f32");
@@ -844,6 +1170,10 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         r->fn_gemm_fp8_fp8_pgr2 = NULL;
     if (hipModuleGetFunction(&r->fn_quantize_act_perrow, mod, "qimg_quantize_act_perrow_fp8") != hipSuccess)
         r->fn_quantize_act_perrow = NULL;
+    if (hipModuleGetFunction(&r->fn_quantize_act_scalar, mod, "qimg_quantize_act_scalar_fp8") != hipSuccess)
+        r->fn_quantize_act_scalar = NULL;
+    if (hipModuleGetFunction(&r->fn_quantize_act_clamp, mod, "qimg_quantize_act_clamp_fp8") != hipSuccess)
+        r->fn_quantize_act_clamp = NULL;
     GET(fn_layernorm, "layernorm_f32");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
@@ -946,14 +1276,31 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     {
         const char *v = getenv("QIMG_FP8_FP8_WMMA");
         if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
-            if (!r->fn_gemm_fp8_fp8_pgr2 || !r->fn_quantize_act_perrow) {
+            hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
+                                     (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
+            if (!r->fn_gemm_fp8_fp8_pgr2 || !quant_fn) {
                 fprintf(stderr, "hip_qimg: FP8xFP8 kernel not present (need gfx12); ignoring QIMG_FP8_FP8_WMMA\n");
             } else if (!r->use_fp8) {
                 fprintf(stderr, "hip_qimg: QIMG_FP8_FP8_WMMA requires FP8 mode; ignoring\n");
             } else {
                 r->use_fp8_fp8w = 1;
-                if (verbose)
-                    fprintf(stderr, "hip_qimg: FP8xFP8 WMMA + per-row act quant enabled\n");
+                if (verbose) {
+                    const char *mode = r->fp8_act_scale_scalar ? "scalar scale=1" :
+                                       (r->fp8_act_scale_clamp ? "safe scalar" : "per-row");
+                    fprintf(stderr, "hip_qimg: FP8xFP8 WMMA + %s act quant enabled\n", mode);
+                    if (r->fp8_fp8_allow && r->fp8_fp8_allow[0])
+                        fprintf(stderr, "hip_qimg: FP8xFP8 allow labels: %s\n", r->fp8_fp8_allow);
+                    if (r->fp8_fp8_deny && r->fp8_fp8_deny[0])
+                        fprintf(stderr, "hip_qimg: FP8xFP8 deny labels: %s\n", r->fp8_fp8_deny);
+                    if (r->fp8_fp8_block_min >= 0 || r->fp8_fp8_block_max >= 0)
+                        fprintf(stderr, "hip_qimg: FP8xFP8 block range: %d..%d\n",
+                                r->fp8_fp8_block_min, r->fp8_fp8_block_max);
+                    if (r->fp8_quality_target_db > 0.0f)
+                        fprintf(stderr, "hip_qimg: FP8 quality target: %.1f dB (diagnostic only; no automatic fallback)\n",
+                                r->fp8_quality_target_db);
+                    if (!r->fp8_act_scale_scalar && !r->fp8_act_scale_clamp && r->fp8_act_scale_div != 512.0f)
+                        fprintf(stderr, "hip_qimg: FP8 activation scale divisor: %.1f\n", r->fp8_act_scale_div);
+                }
             }
         }
         const char *vb = getenv("QIMG_FP8_WMMA_BF16");
@@ -1154,6 +1501,7 @@ int hip_qimg_load_vae(hip_qimg_runner *r, const char *path) {
 
 void hip_qimg_free(hip_qimg_runner *r) {
     if (!r) return;
+    qimg_print_gemm_summary(r);
     if (r->gpu_blocks) {
         for (int i = 0; i < r->n_preloaded; i++)
             qimg_free_block(&r->gpu_blocks[i]);
@@ -1225,10 +1573,12 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     hipMalloc(&d_t_sin, 256 * sizeof(float));
     hipMemcpy(d_t_sin, t_sin, 256 * sizeof(float), hipMemcpyHostToDevice);
 
+    qimg_set_gemm_context(r, -1, "time_fc1");
     op_wgemm_bf16_auto(r, r->is_fp8_t_fc1, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
     void *d_t_emb2 = NULL;
     hipMalloc(&d_t_emb2, (size_t)dim * sizeof(float));
+    qimg_set_gemm_context(r, -1, "time_fc2");
     op_wgemm_bf16_auto(r, r->is_fp8_t_fc2, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
     hipFree(d_t_emb); d_t_emb = d_t_emb2;
     hipFree(d_t_sin);
@@ -1237,10 +1587,12 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     if (r->d_txt_norm_w) {
         op_rmsnorm_weighted(r, d_txt_in, r->d_txt_norm_w, n_txt, txt_dim);
     }
+    qimg_set_gemm_context(r, -1, "txt_in");
     op_wgemm_bf16_auto(r, r->is_fp8_txt_in, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
     hipFree(d_txt_in);
 
     /* 3. Image input: GEMM(64→3072) */
+    qimg_set_gemm_context(r, -1, "img_in");
     op_wgemm_bf16_auto(r, r->is_fp8_img_in, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
     hipFree(d_img_in);
 
@@ -1275,6 +1627,31 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     hipMalloc(&d_t_silu, (size_t)dim * sizeof(float));
     hipMalloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
     hipMalloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
+    if (r->mem_stats_enabled && !r->mem_report_printed) {
+        size_t state_bytes = ((size_t)n_img + (size_t)n_txt) * (size_t)dim * sizeof(float)
+                           + (size_t)dim * sizeof(float);
+        size_t scratch_bytes = 2 * max_scratch + ffn_scratch;
+        size_t qkv_bytes = 4 * (size_t)n_total * (size_t)dim * sizeof(float);
+        size_t mod_bytes = ((size_t)1 + (size_t)6 + (size_t)6) * (size_t)dim * sizeof(float);
+        size_t steady_bytes = state_bytes + scratch_bytes + qkv_bytes + mod_bytes;
+        size_t fp8_img_fc1_scratch = (size_t)n_img * (size_t)mlp_h + (size_t)n_img * sizeof(float);
+        size_t free_mem = 0, total_mem = 0;
+        hipMemGetInfo(&free_mem, &total_mem);
+        fprintf(stderr,
+                "hip_qimg: DiT workspace: n_img=%d n_txt=%d n_total=%d steady=%.1fMB "
+                "(state=%.1f scratch=%.1f qkv/attn=%.1f mod=%.1f) fp8xfp8_max_extra=%.1fMB\n",
+                n_img, n_txt, n_total,
+                (double)steady_bytes / (1024.0 * 1024.0),
+                (double)state_bytes / (1024.0 * 1024.0),
+                (double)scratch_bytes / (1024.0 * 1024.0),
+                (double)qkv_bytes / (1024.0 * 1024.0),
+                (double)mod_bytes / (1024.0 * 1024.0),
+                (double)fp8_img_fc1_scratch / (1024.0 * 1024.0));
+        fprintf(stderr, "hip_qimg: device memory after DiT workspace alloc: %.1f/%.1f GB free\n",
+                (double)free_mem / (1024.0 * 1024.0 * 1024.0),
+                (double)total_mem / (1024.0 * 1024.0 * 1024.0));
+        r->mem_report_printed = 1;
+    }
 
     /* 4. Process all blocks */
     for (int L = 0; L < r->n_blocks; L++) {
@@ -1297,7 +1674,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
                        hipMemcpyDeviceToDevice, NULL);
         op_silu(r, d_t_silu, dim);
 
+        qimg_set_gemm_context(r, L, "img_mod");
         op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
+        qimg_set_gemm_context(r, L, "txt_mod");
         op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
 
         /* Modulation offsets */
@@ -1326,16 +1705,22 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         void *d_img_q = (char *)d_q + (size_t)n_txt * dim * sizeof(float);
         void *d_img_k = (char *)d_k + (size_t)n_txt * dim * sizeof(float);
         void *d_img_v = (char *)d_v + (size_t)n_txt * dim * sizeof(float);
+        qimg_set_gemm_context(r, L, "img_q");
         op_wgemm_bf16(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img);
+        qimg_set_gemm_context(r, L, "img_k");
         op_wgemm_bf16(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img);
+        qimg_set_gemm_context(r, L, "img_v");
         op_wgemm_bf16(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img);
 
         /* Text QKV → offset at [0:n_txt] */
         void *d_txt_q = d_q;
         void *d_txt_k = d_k;
         void *d_txt_v = d_v;
+        qimg_set_gemm_context(r, L, "txt_q");
         op_wgemm_bf16(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt);
+        qimg_set_gemm_context(r, L, "txt_k");
         op_wgemm_bf16(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt);
+        qimg_set_gemm_context(r, L, "txt_v");
         op_wgemm_bf16(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt);
 
         /* QK RMSNorm */
@@ -1366,7 +1751,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         /* Output projections */
         void *d_img_attn = (char *)d_attn_out + (size_t)n_txt * dim * sizeof(float);
         void *d_txt_attn = d_attn_out;
+        qimg_set_gemm_context(r, L, "img_attn_out");
         op_wgemm_bf16(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img);
+        qimg_set_gemm_context(r, L, "txt_attn_out");
         op_wgemm_bf16(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt);
 
         /* Gated residual */
@@ -1375,18 +1762,22 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         /* MLP: Image (GELU) */
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
+        qimg_set_gemm_context(r, L, "img_mlp_fc1");
         op_wgemm_bf16(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b,
                      mlp_h, dim, n_img);
         op_gelu(r, d_scratch3, n_img * mlp_h);
+        qimg_set_gemm_context(r, L, "img_mlp_fc2");
         op_wgemm_bf16(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b,
                      dim, mlp_h, n_img);
         op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
 
         /* MLP: Text (GELU) */
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
+        qimg_set_gemm_context(r, L, "txt_mlp_fc1");
         op_wgemm_bf16(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b,
                      mlp_h, dim, n_txt);
         op_gelu(r, d_scratch3, n_txt * mlp_h);
+        qimg_set_gemm_context(r, L, "txt_mlp_fc2");
         op_wgemm_bf16(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
                      dim, mlp_h, n_txt);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
@@ -1415,6 +1806,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         op_silu(r, d_t_silu, dim);
         void *d_final_mod = NULL;
         hipMalloc(&d_final_mod, (size_t)2 * dim * sizeof(float));
+        qimg_set_gemm_context(r, -1, "norm_out_mod");
         op_wgemm_bf16_auto(r, r->is_fp8_norm_out, d_final_mod,
                            r->d_norm_out_w, d_t_silu, r->d_norm_out_b,
                            2 * dim, dim, 1);
@@ -1427,6 +1819,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         void *d_out = NULL;
         hipMalloc(&d_out, (size_t)n_img * in_ch * sizeof(float));
+        qimg_set_gemm_context(r, -1, "proj_out");
         op_wgemm_bf16_auto(r, r->is_fp8_proj_out, d_out,
                            r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
                            in_ch, dim, n_img);
