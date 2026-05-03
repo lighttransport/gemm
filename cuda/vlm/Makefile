@@ -33,8 +33,8 @@ $(COMPARE): compare_vs_llamacpp.c $(RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_v
 $(VLM): test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) cuda_vision_encoder.h ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ test_cuda_vlm.c $(RUNNER_SRC) $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
 
-$(GEMMA4_VLM): test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) ../llm/cuda_llm_runner.h ../cuew.h
-	$(CC) $(CFLAGS) -o $@ test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(LDFLAGS)
+$(GEMMA4_VLM): test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) ../llm/cuda_llm_runner.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -o $@ test_cuda_gemma4_vlm.c $(LLM_RUNNER_SRC) $(CUEW_SRC) $(CBLASW_SRC) $(LDFLAGS)
 
 # dump_clip_embd requires llama.cpp build (link against libmtmd.so)
 # Usage: make dump_clip_embd LLAMA_DIR=/path/to/llama.cpp

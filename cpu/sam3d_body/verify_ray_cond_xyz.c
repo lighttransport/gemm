@@ -32,6 +32,19 @@ static float *load_or_die(const char *refdir, const char *name)
     return d;
 }
 
+static float *load_or_die_dims(const char *refdir, const char *name,
+                               int *out_nd, int out_dims[8])
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.npy", refdir, name);
+    float *d = (float *)npy_load(path, out_nd, out_dims, NULL);
+    if (!d) {
+        fprintf(stderr, "[verify_ray_cond_xyz] missing %s\n", path);
+        return NULL;
+    }
+    return d;
+}
+
 int main(int argc, char **argv)
 {
     const char *refdir = NULL;
@@ -49,8 +62,16 @@ int main(int argc, char **argv)
     float *cam_int      = load_or_die(refdir, "decoder_batch__cam_int");
     float *affine_trans = load_or_die(refdir, "decoder_batch__affine_trans");
     float *img_size     = load_or_die(refdir, "decoder_batch__img_size");
-    float *ref_ds       = load_or_die(refdir, "ray_cond_ds_xyz");
+    int ref_nd = 0, ref_dims[8] = {0};
+    float *ref_ds       = load_or_die_dims(refdir, "ray_cond_ds_xyz",
+                                           &ref_nd, ref_dims);
     if (!cam_int || !affine_trans || !img_size || !ref_ds) {
+        free(cam_int); free(affine_trans); free(img_size); free(ref_ds);
+        return 3;
+    }
+    if (ref_nd != 4 || ref_dims[0] != 1 || ref_dims[1] <= 0 ||
+        ref_dims[2] <= 0 || ref_dims[3] != 3) {
+        fprintf(stderr, "[verify_ray_cond_xyz] invalid ray_cond_ds_xyz shape\n");
         free(cam_int); free(affine_trans); free(img_size); free(ref_ds);
         return 3;
     }
@@ -58,7 +79,7 @@ int main(int argc, char **argv)
     /* img_size is (B, 1, 2) = [H_in, W_in]. */
     const int H_in = (int)img_size[0];
     const int W_in = (int)img_size[1];
-    const int H_out = 32, W_out = 32;
+    const int H_out = ref_dims[1], W_out = ref_dims[2];
     fprintf(stderr, "[verify_ray_cond_xyz] H_in=%d W_in=%d → H_out=%d W_out=%d\n",
             H_in, W_in, H_out, W_out);
 
@@ -82,7 +103,7 @@ int main(int argc, char **argv)
     int fail = (mx >= threshold);
     fprintf(stderr, "[verify_ray_cond_xyz] %-32s max_abs=%.4e (i=%zu) "
                     "mean_abs=%.4e (max=%.1e) %s\n",
-            "ray_cond_xyz (32,32,3)", mx, mxi, mean, threshold,
+            "ray_cond_xyz", mx, mxi, mean, threshold,
             fail ? "FAIL" : "OK");
 
     free(cam_int); free(affine_trans); free(img_size); free(ref_ds); free(ours);

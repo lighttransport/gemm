@@ -26,11 +26,21 @@ int main(int argc, char **argv)
     float mean_threshold = 3e-4f;
     int device = 0, verbose = 0;
     const char *precision = "bf16";
+    cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--mean-threshold") && i+1 < argc) mean_threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            const char *v = argv[++i];
+            if      (!strcmp(v, "dinov3")) backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
+            else if (!strcmp(v, "vith"))   backbone = CUDA_SAM3D_BODY_BACKBONE_VITH;
+            else {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--device") && i+1 < argc) device = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--precision") && i+1 < argc) precision = argv[++i];
         else if (!strcmp(argv[i], "-v")) verbose = 1;
@@ -39,7 +49,8 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] "
-                        "[--device N] [--precision bf16|fp16] [-v]\n",
+                        "[--backbone dinov3|vith] [--device N] "
+                        "[--precision bf16|fp16] [-v]\n",
                 argv[0]);
         return 2;
     }
@@ -47,11 +58,10 @@ int main(int argc, char **argv)
     char path[1024];
     int nd = 0, dims[8] = {0};
 
-    /* (1, 1280, 32, 32) f32 image_emb_pre_ray */
     snprintf(path, sizeof(path), "%s/ray_cond__image_embeddings_pre_ray.npy", refdir);
     float *img_emb = (float *)npy_load(path, &nd, dims, NULL);
     if (!img_emb || nd != 4 || dims[0] != 1 || dims[1] != 1280 ||
-        dims[2] != 32 || dims[3] != 32) {
+        dims[2] <= 0 || dims[3] <= 0) {
         fprintf(stderr, "[cuda verify_ray_cond] missing/invalid %s\n", path);
         free(img_emb); return 3;
     }
@@ -83,6 +93,7 @@ int main(int argc, char **argv)
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,
+        .backbone        = backbone,
     };
     cuda_sam3d_body_ctx *ctx = cuda_sam3d_body_create(&cfg);
     if (!ctx) {
@@ -120,7 +131,7 @@ int main(int argc, char **argv)
                     "max_abs=%.6e (c=%d h=%d w=%d)  mean_abs=%.6e  "
                     "(max_gate=%.1e mean_gate=%.1e)\n",
             C, H, W, mx, mx_c, mx_h, mx_w, mean_abs, threshold, mean_threshold);
-    int rc_out = (mx < threshold && mean_abs < mean_threshold) ? 0 : 1;
+    int rc_out = (n_el > 0 && mx < threshold && mean_abs < mean_threshold) ? 0 : 1;
 
     free(out);
     cuda_sam3d_body_destroy(ctx);

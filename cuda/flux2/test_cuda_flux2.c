@@ -395,7 +395,8 @@ static int test_load(const char *dit_path, const char *vae_path) {
 static int test_dit(const char *dit_path, const char *enc_path, const char *tok_path,
                     const char *prompt, int lat_h, int lat_w, int n_txt,
                     float img_scale, float txt_scale, float timestep,
-                    int use_real_text, int use_real_latent) {
+                    int use_real_text, int use_real_latent,
+                    int repeat, int no_cpu_ref) {
     fprintf(stderr, "=== CUDA DiT Step Test ===\n");
     cuda_flux2_runner *r = cuda_flux2_init(0, 1);
     if (!r) return 1;
@@ -448,29 +449,37 @@ static int test_dit(const char *dit_path, const char *enc_path, const char *tok_
         for (int i = 0; i < n_txt*txt_dim; i++) txt_tok[i] = randn() * txt_scale;
     }
 
+    /* Warmup */
+    cuda_flux2_dit_step(r, img_tok, n_img, txt_tok, n_txt, timestep, 0.0f, vel_out);
+
+    if (repeat < 1) repeat = 1;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    cuda_flux2_dit_step(r, img_tok, n_img, txt_tok, n_txt, timestep, 0.0f, vel_out);
+    for (int rep = 0; rep < repeat; rep++) {
+        cuda_flux2_dit_step(r, img_tok, n_img, txt_tok, n_txt, timestep, 0.0f, vel_out);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dt = (t1.tv_sec-t0.tv_sec) + (t1.tv_nsec-t0.tv_nsec)*1e-9;
-    fprintf(stderr, "DiT step: %.2f s (n_img=%d, n_txt=%d, pin=%d, img_scale=%.3f, txt_scale=%.3f, t=%.3f)\n",
-            dt, n_img, n_txt, pin, img_scale, txt_scale, timestep);
+    fprintf(stderr, "DiT step: %.3f s/step over %d runs (n_img=%d, n_txt=%d, pin=%d, img_scale=%.3f, txt_scale=%.3f, t=%.3f)\n",
+            dt / repeat, repeat, n_img, n_txt, pin, img_scale, txt_scale, timestep);
 
     float mn=vel_out[0], mx=vel_out[0];
     for (int i=0;i<n_img*pin;i++) { if(vel_out[i]<mn) mn=vel_out[i]; if(vel_out[i]>mx) mx=vel_out[i]; }
     fprintf(stderr, "GPU velocity: min=%.4f max=%.4f\n", mn, mx);
 
-    float *cpu_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
-    flux2_dit_forward(cpu_out, img_tok, n_img, txt_tok, n_txt, timestep, r->dit, 1);
-    mn=cpu_out[0]; mx=cpu_out[0];
-    for (int i=0;i<n_img*pin;i++) { if(cpu_out[i]<mn) mn=cpu_out[i]; if(cpu_out[i]>mx) mx=cpu_out[i]; }
-    fprintf(stderr, "CPU velocity: min=%.4f max=%.4f\n", mn, mx);
-    float max_diff = 0, sum_diff = 0;
-    for (int i=0;i<n_img*pin;i++) { float d=fabsf(vel_out[i]-cpu_out[i]); if(d>max_diff) max_diff=d; sum_diff+=d; }
-    fprintf(stderr, "GPU vs CPU: max_diff=%.6f mean_diff=%.6f\n", max_diff, sum_diff/(n_img*pin));
-    for (int i=0;i<5;i++)
-        fprintf(stderr, "  [%d] GPU=%.6f CPU=%.6f\n", i, vel_out[i], cpu_out[i]);
-    free(cpu_out);
+    if (!no_cpu_ref) {
+        float *cpu_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
+        flux2_dit_forward(cpu_out, img_tok, n_img, txt_tok, n_txt, timestep, r->dit, 1);
+        mn=cpu_out[0]; mx=cpu_out[0];
+        for (int i=0;i<n_img*pin;i++) { if(cpu_out[i]<mn) mn=cpu_out[i]; if(cpu_out[i]>mx) mx=cpu_out[i]; }
+        fprintf(stderr, "CPU velocity: min=%.4f max=%.4f\n", mn, mx);
+        float max_diff = 0, sum_diff = 0;
+        for (int i=0;i<n_img*pin;i++) { float d=fabsf(vel_out[i]-cpu_out[i]); if(d>max_diff) max_diff=d; sum_diff+=d; }
+        fprintf(stderr, "GPU vs CPU: max_diff=%.6f mean_diff=%.6f\n", max_diff, sum_diff/(n_img*pin));
+        for (int i=0;i<5;i++)
+            fprintf(stderr, "  [%d] GPU=%.6f CPU=%.6f\n", i, vel_out[i], cpu_out[i]);
+        free(cpu_out);
+    }
 
     free(img_tok); free(txt_tok); free(vel_out);
     cuda_flux2_free(r); return 0;
@@ -868,7 +877,7 @@ int main(int argc, char **argv) {
     float cfg_scale = 1.0f;
     float img_scale = 0.1f, txt_scale = 0.1f;
     float timestep = 750.0f;
-    int use_real_text = 0, use_real_latent = 0;
+    int use_real_text = 0, use_real_latent = 0, no_cpu_ref = 0;
     uint64_t seed = 42;
     int verbose = 1;
     (void)verbose;
@@ -899,6 +908,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--timestep") == 0 && i+1<argc) timestep = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--real-text") == 0) use_real_text = 1;
         else if (strcmp(argv[i], "--real-latent") == 0) use_real_latent = 1;
+        else if (strcmp(argv[i], "--no-cpu-ref") == 0) no_cpu_ref = 1;
         else if (strcmp(argv[i], "--seed")   == 0 && i+1<argc) seed     = (uint64_t)atoll(argv[++i]);
         else if (strcmp(argv[i], "--cfg")    == 0 && i+1<argc) cfg_scale= (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--device") == 0 && i+1<argc) device_id= atoi(argv[++i]);
@@ -923,7 +933,8 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "dit")  == 0) return test_dit(dit_path, enc_path, tok_path, prompt,
                                                    out_h/16, out_w/16, n_txt,
                                                    img_scale, txt_scale, timestep,
-                                                   use_real_text, use_real_latent);
+                                                   use_real_text, use_real_latent,
+                                                   repeat, no_cpu_ref);
     if (strcmp(mode, "vae")  == 0) return test_vae(vae_path, out_h/8, out_w/8);
     if (strcmp(mode, "text") == 0) return test_text_enc(enc_path, tok_path, prompt, device_id);
     if (strcmp(mode, "gen")  == 0)

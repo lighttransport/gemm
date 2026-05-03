@@ -43,7 +43,7 @@
 
 /* ---- F32 → F16 conversion (truncation, no rounding) ---- */
 
-static uint16_t cu_f32_to_f16(float f) {
+static inline uint16_t cu_f32_to_f16(float f) {
     union { float f; uint32_t i; } u;
     u.f = f;
     uint32_t x = u.i;
@@ -62,7 +62,7 @@ static uint16_t cu_f32_to_f16(float f) {
 
 /* ---- F32 → FP8 E4M3 conversion (bias=7, range [-448,448]) ---- */
 
-static uint8_t cu_f32_to_fp8_e4m3(float f) {
+static inline uint8_t cu_f32_to_fp8_e4m3(float f) {
     if (f != f) return 0x7F; /* NaN */
     if (f == 0.0f) return 0x00;
     uint32_t bits; memcpy(&bits, &f, sizeof(bits));

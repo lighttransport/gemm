@@ -1,7 +1,8 @@
-/* sam3d_body_runner.c — v1 CPU runner for SAM 3D Body (DINOv3 variant).
+/* sam3d_body_runner.c — CPU runner for SAM 3D Body.
  *
- * Scaffold: every stage returns SAM3D_BODY_E_NOT_IMPLEMENTED.
- * Milestones populate them one at a time (see PORT.md).
+ * Supports the DINOv3-H+ and ViT-H backbones, raw-image preprocessing,
+ * decoder/MHR execution, and ref-dump override paths used by the stage
+ * verifiers.
  */
 
 #include "sam3d_body_runner.h"
@@ -252,7 +253,7 @@ int sam3d_body_set_focal(sam3d_body_ctx *ctx, float focal_px)
     return SAM3D_BODY_E_OK;
 }
 
-/* ---------------- stages (all stubs) ---------------- */
+/* ---------------- pipeline stages ---------------- */
 
 int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
 {
@@ -627,7 +628,7 @@ int sam3d_body_run_all(sam3d_body_ctx *ctx)
     return rc;
 }
 
-/* ---------------- readbacks (stubs) ---------------- */
+/* ---------------- readbacks ---------------- */
 
 int sam3d_body_get_encoder_tokens(sam3d_body_ctx *ctx, float *out,
                                   int *out_n_tokens, int *out_dim)

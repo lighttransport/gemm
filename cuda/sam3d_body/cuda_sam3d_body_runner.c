@@ -1,8 +1,7 @@
-/* CUDA runner for SAM 3D Body (DINOv3-H+ variant).
+/* CUDA runner for SAM 3D Body.
  *
- * Step 3a: cuew init + NVRTC compile + safetensors upload of the DINOv3-H+
- * encoder weights. Stage entry points (run_encoder/decoder/mhr) still
- * return NOT_IMPLEMENTED — Step 3b wires the forward path.
+ * Supports DINOv3-H+ and ViT-H backbones, CUDA encoder/ray/token/decoder
+ * stages, and CPU MHR-in-the-loop execution for the production path.
  *
  * Upstream layout (from ckpt slice `sam3d_body_dinov3.safetensors`,
  * prefix `backbone.encoder.`):
@@ -304,7 +303,7 @@ struct cuda_sam3d_body_ctx {
     void    *d_proj;                          /* (N_TOK, D) post-proj scratch */
     void    *d_gate, *d_up;                   /* (N_TOK, FFN) SwiGLU */
 
-    /* host-side runtime state (same shape as scaffold). */
+    /* host-side runtime state. */
     uint8_t *image_rgb;  int img_w, img_h;
     float    bbox[4];    int has_bbox;
     float    focal_hint;
@@ -3161,10 +3160,14 @@ int cuda_sam3d_body_debug_run_kp_token_update(cuda_sam3d_body_ctx *ctx,
                        (y01 < 0.0f) || (y01 > 1.0f) ||
                        (kp2d_depth[i] < 1e-5f);
     }
-    /* Pre-multiply gxy by 2 (sample_points = kp2d_cropped * 2 → [-1, 1]). */
+    /* Pre-multiply gxy by 2 (sample_points = kp2d_cropped * 2 → [-1, 1]).
+     * ViT-H samples a 32x24 grid, so upstream scales x by H/W to keep
+     * normalized crop coords tied to the original square crop. */
     float gxy_h[70 * 2];
     for (int i = 0; i < K; i++) {
-        gxy_h[i*2 + 0] = kp2d_cropped[i*2 + 0] * 2.0f;
+        float gx = kp2d_cropped[i*2 + 0] * 2.0f;
+        if (W != H) gx *= (float)H / (float)W;
+        gxy_h[i*2 + 0] = gx;
         gxy_h[i*2 + 1] = kp2d_cropped[i*2 + 1] * 2.0f;
     }
 

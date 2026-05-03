@@ -347,6 +347,22 @@ Logs:
 - `cuda/flux2/bench_20260419_flux2_klein_perf/distilled_256_r4.log`
 - `cuda/flux2/bench_20260419_flux2_klein_perf/base_256_r4.log`
 
+**DiT step time vs ComfyUI/PyTorch reference (RTX 5060 Ti, n_txt=8, `--no-cpu-ref`):**
+
+| Image size | ours-FP8 (LT) | ours-FP8 (v7) | ours-F16 (v7) | ours-BF16 (v7) | ComfyUI bf16 (PyTorch 2.11+cu128 fallback) |
+|---|---|---|---|---|---|
+| 256×256 | **0.021 s** | 0.095 s | 0.048 s | 0.048 s | 0.101 s |
+| 512×512 | **0.040 s** | 0.054 s | 0.076 s | 0.076 s | 0.172 s |
+| 1024×1024 | **0.116 s** | 0.142 s | 0.367 s | 0.368 s | 0.636 s |
+
+Prior MMA-baseline numbers (kept for reference): F16 0.114 / 0.227 / 0.924 s; BF16 0.199 / 0.329 / 1.243 s at 256² / 512² / 1024².
+
+- ours-FP8 (LT) = default fast path (`FLUX2_BF16_ATTN=1 FLUX2_FP8_GEMM=1 FLUX2_FP8_V7=1` with cuBLAS-LT FP8 e4m3 default ON). Dispatch in `op_gemm_scaled_ex` quantizes X→FP8 (per-tensor scale = max/448), uploads `w_scale` to a 4-byte device scratch, runs `cublasLtMatmul` with BF16 output, then `bf16_to_f32_add_bias_f32` expand+bias. Falls through to v7 if LT init fails, runtime-errors, or shape constraints aren't met. **4.8× / 4.3× / 5.5×** vs ComfyUI bf16 at 256/512/1024 — the 256² jump (0.095 → 0.021 s) is large because v7's `n_tok ≥ 256` gate makes it fall back to MMA-tiled at small image sizes; cuBLAS-LT has no such gate.
+- ours-FP8 (v7) = LT path opted out via `FLUX2_CUBLASLT_FP8=0` (cp.async + 4×4 panel-swizzle + ldmatrix). Was the prior fast path before LT integration.
+- ours-F16 = `FLUX2_F16_GEMM=1`, ours-BF16 = `FLUX2_BF16_GEMM=1`. Both now dispatch through the **v7 GEMM** ported from `cuda/gemm/cuda_gemm_ptx_kernels.h` (cp.async double-buffer + 4×4 CTA panel swizzle + ldmatrix.x4 + XOR-swizzled SMEM, 64×128×16 tile, 256 threads, 24 KiB dynamic SMEM). The dispatcher quantizes F32 activations to BF16/F16 once per GEMM call (`quant_bf16` / `quant_f16` kernels via `cvt.rn.f16.f32` PTX), runs `gemm_{bf16,f16}_v7`, then `add_bias_inplace_f32`. Source weights are FP8 safetensors dequantized to BF16/F16 with per-tensor `weight_scale` baked in (so the v7 kernel sees pre-scaled W and skips descale). Both modes now beat ComfyUI bf16 at every size.
+- 512² ours-FP8 < 256² because FP8 v7's 4×4 CTA panel swizzle requires `n_tok ≥ 256` to fire; at 256² (n_img=64) it falls back to MMA-tiled. The new BF16/F16 v7 path always pads grid to 4× so panel swizzle fires for all sizes (kernel's bounds checks safely drop OOB tiles).
+- BF16 ≈ F16 wall time: the kernel cost is dominated by SMEM/MMA throughput, which is identical between the two dtypes; the only difference is the activation quant pass, which is bandwidth-bound and ~1% of total.
+
 > **Note:** The heavy VAE path is on CUDA. The current implementation still bridges the single VAE mid-block attention through CPU, but conv/groupnorm/resblock/upsample work is on GPU.
 
 > **Memory note:** `--generate --gpu-enc` now pre-encodes text once, frees the GPU text encoder, and then loads DiT/VAE. This avoids VRAM exhaustion from keeping both the CUDA LLM runner and Flux2 weights resident at the same time on 16 GB cards.
@@ -416,7 +432,8 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 ### Performance
 
 - [x] **All-GPU VAE attention**: VAE mid-block single-head attention now runs on GPU via a dedicated `vae_attn_f32` flash-attention kernel (FA2 style, BKV=8, EPT=16). GPU vs CPU max_diff≈3e-6 at 64×64, ≈4e-4 at 512×512.
-- [x] **F16 GEMM**: `FLUX2_F16_GEMM=1` enables `gemm_tiled_f16_f32` with F16 weight upload (round-to-nearest via `f2h()`). GPU vs CPU max_diff≈4e-4 at 64×64 DiT step. Halves VRAM for weights. The root cause of the earlier ~27% error was hardcoded `*4` byte offsets for QKV weight slicing (should be `*2` for F16). MMA-based `gemm_f16_f32` still has a known fragment mapping bug on sm_120 — not needed since tiled kernel works.
+- [x] **F16 GEMM (v7)**: `FLUX2_F16_GEMM=1` dispatches to `gemm_f16_v7` (cp.async + ldmatrix + 4×4 CTA panel swizzle, ported from `cuda/gemm/cuda_gemm_ptx_kernels.h`). Activation is quantized F32→F16 once per GEMM via the `quant_f16` kernel (`cvt.rn.f16.f32` PTX); bias added in-place by `add_bias_inplace_f32`. Source weights are FP8 safetensors dequantized to F16 with per-tensor `weight_scale` baked in. **0.367 s/step at 1024²** (was 0.924 with the old MMA-baseline kernel; 1.7× faster than ComfyUI bf16). GPU vs CPU FP32 ref unchanged (`max_diff≈6e-4` at 256²).
+- [x] **BF16 GEMM (v7)**: `FLUX2_BF16_GEMM=1` dispatches to `gemm_bf16_v7` (same v7 infra). **0.368 s/step at 1024²** (was 1.243; 1.7× faster than ComfyUI bf16). GPU output min/max unchanged vs the prior MMA baseline (correctness preserved bit-for-bit on the test inputs).
 - [ ] **Attention kernel scaling**: Single-block-per-head FA2 flash attention works but may not scale to large resolutions. No multi-block flash attention.
 - [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + weight upload. PTX cache and in-process reuse help, but `--generate` currently pre-encodes once and frees the runner rather than keeping text and DiT resident together.
 

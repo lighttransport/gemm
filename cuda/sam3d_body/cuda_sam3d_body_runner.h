@@ -1,13 +1,11 @@
-/* CUDA runner for SAM 3D Body (DINOv3 variant, v1 scaffold).
+/* CUDA runner for SAM 3D Body.
  *
  * Mirrors the CPU runner's stage boundaries so verify_*.c binaries can
- * diff against the same /tmp/sam3d_body_ref/ npy dumps. Actual NVRTC
- * kernels land one module at a time — for now every entry point
- * returns CUDA_SAM3D_BODY_E_NOT_IMPLEMENTED so `make all` stays green.
+ * diff against the same /tmp/sam3d_body_ref/ npy dumps.
  *
- * Kernel organization (once populated): follow cuda/sam3.1/ — NVRTC
- * source strings in cuda_sam3d_body_kernels.h, runtime compile via
- * cuew.h in cuda_sam3d_body_runner.c.
+ * Kernel organization follows cuda/sam3.1/: NVRTC source strings in
+ * cuda_sam3d_body_kernels.h, runtime compile via cuew.h in
+ * cuda_sam3d_body_runner.c.
  */
 
 #ifndef CUDA_SAM3D_BODY_RUNNER_H_
