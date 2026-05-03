@@ -8,13 +8,14 @@ all: test_cuda_qimg
 
 test_cuda_qimg: test_cuda_qimg.c cuda_qimg_runner.h \
 		../cuda_runner_common.h ../cuda_kernels_common.h ../cuew.h \
+		../cublasew.h ../cublasew.c \
 		../llm/cuda_llm_runner.h ../llm/cuda_llm_runner.c \
 		../../common/safetensors.h ../../common/gguf_loader.h \
 		../../common/ggml_dequant.h ../../common/transformer.h \
 		../../common/bpe_tokenizer.h ../../common/qwen_image_scheduler.h \
 		../../common/qwen_image_dit.h ../../common/qwen_image_vae.h \
 		../../common/qwen_image_text_encoder.h
-	$(CC) $(CFLAGS) -o $@ $< ../llm/cuda_llm_runner.c ../cuew.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $< ../llm/cuda_llm_runner.c ../cuew.c ../cublasew.c $(LDFLAGS)
 
 test-init: test_cuda_qimg
 	./test_cuda_qimg --test-init
