@@ -10,7 +10,10 @@ Stages dumped (written only if that stage executed):
     dinov3_tokens.npy       (N, D)      f32  — DINOv3 encoder
     mhr_params.npy          (519,)      f32  — MHR head regressor
     cam_params.npy          (4,)        f32  — [cam_t_x, cam_t_y, cam_t_z, focal]
-    out_vertices.npy        (V, 3)      f32
+    body_out_vertices.npy   (V, 3)      f32  — first body decoder pass
+    body_out_keypoints_3d.npy (K, 3)    f32
+    body_out_keypoints_2d.npy (K, 2)    f32
+    out_vertices.npy        (V, 3)      f32  — final upstream output
     out_keypoints_3d.npy    (K, 3)      f32
     out_keypoints_2d.npy    (K, 2)      f32
     out_faces.npy           (F, 3)      i32
@@ -59,13 +62,12 @@ def main():
     ap.add_argument("--outdir", default="/tmp/sam3d_body_ref")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-run", action="store_true",
-                    help="only dump the preprocessed image; skip the model")
+                    help="only dump the input image; skip the model")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # Preprocess so step-0 scaffold has at least one dump even before
-    # the model installs cleanly.
+    # Always leave a bootstrap dump behind, even if the model import fails.
     from PIL import Image
     img = np.asarray(Image.open(args.image).convert("RGB"), dtype=np.uint8)
     save(args.outdir, "input_image.npy", img)
@@ -97,6 +99,12 @@ def main():
     except Exception as e:
         print(f"[gen_image_ref] cannot import sam_3d_body: {e}",
               file=sys.stderr)
+        print("[gen_image_ref] expected upstream checkout at "
+              "SAM_3D_BODY_DIR or /tmp/sam-3d-body; after reboot, restore "
+              "with: git clone --depth 1 "
+              "https://github.com/facebookresearch/sam-3d-body "
+              "/tmp/sam-3d-body",
+              file=sys.stderr)
         return 1
 
     if args.local_ckpt_dir:
@@ -118,53 +126,92 @@ def main():
     # refactors move things around), so we search by class name /
     # attribute path.
     caps = {}
+    fd_call_counter = {"n": 0}
 
     def _to_np(x):
         if hasattr(x, "detach"):
             return x.detach().float().cpu().numpy()
         return x
 
-    def cap(name, idx=None):
+    def _to_np_clone(x):
+        if hasattr(x, "detach"):
+            return x.detach().clone().float().cpu().numpy()
+        return x
+
+    def _capture_pose_output(prefix, output):
+        mhr = None
+        if isinstance(output, dict):
+            mhr = output.get("mhr", output)
+        if not isinstance(mhr, dict):
+            return
+        for key, tag in [
+            ("pred_vertices",     "vertices"),
+            ("pred_keypoints_3d", "keypoints_3d"),
+            ("pred_keypoints_2d", "keypoints_2d"),
+        ]:
+            v = mhr.get(key)
+            if v is not None and hasattr(v, "shape"):
+                caps[f"{prefix}_{tag}"] = _to_np_clone(v)
+
+    def _capture_allowed(name, first_decoder_only=False, once=False):
+        if first_decoder_only and fd_call_counter["n"] != 0:
+            return False
+        if once and name in caps:
+            return False
+        return True
+
+    def _store(name, value, first_decoder_only=False, once=False):
+        if _capture_allowed(name, first_decoder_only, once):
+            caps[name] = value
+
+    def cap(name, idx=None, first_decoder_only=False, once=False):
         """Capture forward output. If output is tuple/list, `idx` picks an
         element; otherwise the whole thing. Dict outputs are flattened."""
         def _hook(_m, _i, o):
+            if not _capture_allowed(name, first_decoder_only, once):
+                return
             x = o
             if isinstance(o, (tuple, list)):
                 x = o[idx] if idx is not None else o[0]
             if isinstance(x, dict):
                 out = {k: _to_np(v) for k, v in x.items() if hasattr(v, "detach")}
-                caps[name] = out
+                _store(name, out, first_decoder_only, once)
             else:
-                caps[name] = _to_np(x)
+                _store(name, _to_np(x), first_decoder_only, once)
         return _hook
 
-    def cap_tuple(name):
+    def cap_tuple(name, first_decoder_only=False, once=False):
         """Capture both elements of a (tokens, image_embeddings) tuple
         output as `{name}__tokens.npy` and `{name}__context.npy`."""
         def _hook(_m, _i, o):
+            if not _capture_allowed(name, first_decoder_only, once):
+                return
             if isinstance(o, (tuple, list)) and len(o) >= 2:
-                caps[name] = {
+                _store(name, {
                     "tokens":  _to_np(o[0]),
                     "context": _to_np(o[1]),
-                }
+                }, first_decoder_only, once)
             else:
-                caps[name] = _to_np(o)
+                _store(name, _to_np(o), first_decoder_only, once)
         return _hook
 
-    def cap_pre(name, arg_idx=0):
+    def cap_pre(name, arg_idx=0, first_decoder_only=False, once=False):
         def _pre(_m, args, _kwargs=None):
-            if args and arg_idx < len(args):
-                caps[name] = _to_np(args[arg_idx])
+            if (args and arg_idx < len(args)
+                    and _capture_allowed(name, first_decoder_only, once)):
+                _store(name, _to_np(args[arg_idx]), first_decoder_only, once)
         return _pre
 
-    def cap_pre_tuple(name, names):
+    def cap_pre_tuple(name, names, first_decoder_only=False, once=False):
         """Capture several positional args as {name}__{k}.npy for k in `names`."""
         def _pre(_m, args, _kwargs=None):
+            if not _capture_allowed(name, first_decoder_only, once):
+                return
             out = {}
             for i, k in enumerate(names):
                 if i < len(args) and hasattr(args[i], "detach"):
                     out[k] = _to_np(args[i])
-            caps[name] = out
+            _store(name, out, first_decoder_only, once)
         return _pre
 
     registered = []
@@ -194,8 +241,9 @@ def main():
             m.register_forward_pre_hook(cap_pre("vith_input"))
             m.register_forward_hook(cap("vith_tokens"))
             registered.append(("vith_tokens", name, cls))
-        elif cls == "MHRHead":
-            m.register_forward_hook(cap("mhr_params"))
+        elif cls == "MHRHead" and name.endswith("head_pose"):
+            m.register_forward_hook(cap("mhr_params",
+                                        first_decoder_only=True))
             registered.append(("mhr_params", name, cls))
         elif cls in ("CameraHead", "FovHead"):
             m.register_forward_hook(cap("cam_params"))
@@ -210,8 +258,10 @@ def main():
     #     cached intermediate.
     for n, m in mods_by_name("ray_cond_emb"):
         m.register_forward_pre_hook(cap_pre_tuple(
-            "ray_cond", ["image_embeddings_pre_ray", "ray_cond"]))
-        m.register_forward_hook(cap("image_embeddings_after_ray"))
+            "ray_cond", ["image_embeddings_pre_ray", "ray_cond"],
+            first_decoder_only=True))
+        m.register_forward_hook(cap("image_embeddings_after_ray",
+                                    first_decoder_only=True))
 
         _orig_fwd = m.forward
         _ray_mod = m
@@ -225,14 +275,14 @@ def main():
             )
             rays_ds = rays_ds.permute(0, 2, 3, 1).contiguous()
             rays_ds = torch.cat([rays_ds, torch.ones_like(rays_ds[..., :1])], dim=-1)
-            caps["ray_cond_ds_xyz"] = _to_np(rays_ds)  # (B, _h, _w, 3)
+            _store("ray_cond_ds_xyz", _to_np(rays_ds), first_decoder_only=True)
             rays_emb = _mod.camera(pos=rays_ds.reshape(B, -1, 3))  # (B, N, 99)
-            caps["ray_cond_fourier"] = _to_np(rays_emb)
+            _store("ray_cond_fourier", _to_np(rays_emb), first_decoder_only=True)
             rays_emb = _ein.rearrange(rays_emb, "b (h w) c -> b c h w", h=_h, w=_w).contiguous()
             z = torch.cat([img_embeddings, rays_emb], dim=1)
-            caps["ray_cond_preconv"] = _to_np(z)  # (B, D+99, h, w)
+            _store("ray_cond_preconv", _to_np(z), first_decoder_only=True)
             zc = _mod.conv(z)
-            caps["ray_cond_postconv"] = _to_np(zc)
+            _store("ray_cond_postconv", _to_np(zc), first_decoder_only=True)
             return _mod.norm(zc)
         m.forward = _patched
         registered.append(("image_embeddings_after_ray", n, m.__class__.__name__))
@@ -240,26 +290,34 @@ def main():
 
     # --- Token construction linears. ---
     for n, m in mods_by_name("init_to_token_mhr"):
-        m.register_forward_pre_hook(cap_pre("init_to_token_in"))
-        m.register_forward_hook(cap("init_token_raw"))
+        m.register_forward_pre_hook(cap_pre("init_to_token_in",
+                                            first_decoder_only=True))
+        m.register_forward_hook(cap("init_token_raw",
+                                    first_decoder_only=True))
         registered.append(("init_token_raw", n, m.__class__.__name__))
         break
     for n, m in mods_by_name("prev_to_token_mhr"):
-        m.register_forward_pre_hook(cap_pre("prev_to_token_in"))
-        m.register_forward_hook(cap("prev_token_raw"))
+        m.register_forward_pre_hook(cap_pre("prev_to_token_in",
+                                            first_decoder_only=True))
+        m.register_forward_hook(cap("prev_token_raw",
+                                    first_decoder_only=True))
         registered.append(("prev_token_raw", n, m.__class__.__name__))
         break
     for n, m in mods_by_name("prompt_to_token"):
-        m.register_forward_pre_hook(cap_pre("prompt_to_token_in"))
-        m.register_forward_hook(cap("prompt_token_raw"))
+        m.register_forward_pre_hook(cap_pre("prompt_to_token_in",
+                                            first_decoder_only=True))
+        m.register_forward_hook(cap("prompt_token_raw",
+                                    first_decoder_only=True))
         registered.append(("prompt_token_raw", n, m.__class__.__name__))
         break
     for n, m in mods_by_name("keypoint_posemb_linear"):
-        m.register_forward_hook(cap("kp2d_posemb_init"))
+        m.register_forward_hook(cap("kp2d_posemb_init",
+                                    first_decoder_only=True))
         registered.append(("kp2d_posemb_init", n, m.__class__.__name__))
         break
     for n, m in mods_by_name("keypoint3d_posemb_linear"):
-        m.register_forward_hook(cap("kp3d_posemb_init"))
+        m.register_forward_hook(cap("kp3d_posemb_init",
+                                    first_decoder_only=True))
         registered.append(("kp3d_posemb_init", n, m.__class__.__name__))
         break
 
@@ -278,14 +336,18 @@ def main():
             continue
         m.register_forward_pre_hook(cap_pre_tuple(
             f"decoder_layer{i}_in",
-            ["x", "context", "x_pe", "context_pe", "x_mask"]))
-        m.register_forward_hook(cap_tuple(f"decoder_layer{i}_out"))
+            ["x", "context", "x_pe", "context_pe", "x_mask"],
+            first_decoder_only=True))
+        m.register_forward_hook(cap_tuple(f"decoder_layer{i}_out",
+                                          first_decoder_only=True))
         registered.append((f"decoder_layer{i}", n, m.__class__.__name__))
 
     # --- Decoder final norm: pre-hook gives raw tokens, post gives norm'd.
     for n, m in mods_by_name("decoder.norm_final"):
-        m.register_forward_pre_hook(cap_pre("decoder_out_prenorm"))
-        m.register_forward_hook(cap("decoder_out_norm_final"))
+        m.register_forward_pre_hook(cap_pre("decoder_out_prenorm",
+                                            first_decoder_only=True))
+        m.register_forward_hook(cap("decoder_out_norm_final",
+                                    first_decoder_only=True))
         registered.append(("decoder_out_norm_final", n, m.__class__.__name__))
         break
 
@@ -293,13 +355,17 @@ def main():
     #     are useful for isolating head vs init drift. Hook the inner FFN
     #     `proj` which yields the raw 519.
     for n, m in mods_by_name("head_pose.proj"):
-        m.register_forward_pre_hook(cap_pre("head_pose_proj_input"))
-        m.register_forward_hook(cap("head_pose_proj_raw"))
+        m.register_forward_pre_hook(cap_pre("head_pose_proj_input",
+                                            first_decoder_only=True))
+        m.register_forward_hook(cap("head_pose_proj_raw",
+                                    first_decoder_only=True))
         registered.append(("head_pose_proj_raw", n, m.__class__.__name__))
         break
     for n, m in mods_by_name("head_camera.proj"):
-        m.register_forward_pre_hook(cap_pre("head_camera_proj_input"))
-        m.register_forward_hook(cap("head_camera_proj_raw"))
+        m.register_forward_pre_hook(cap_pre("head_camera_proj_input",
+                                            first_decoder_only=True))
+        m.register_forward_hook(cap("head_camera_proj_raw",
+                                    first_decoder_only=True))
         registered.append(("head_camera_proj_raw", n, m.__class__.__name__))
         break
 
@@ -324,8 +390,6 @@ def main():
     # 1-keypoint prompt → 145 tokens). The full inference flow may invoke
     # forward_decoder a second time via run_keypoint_prompt with 4 hand-tip
     # keypoints + prev_estimate (148 tokens); v1 scope is the first pass.
-    fd_call_counter = {"n": 0}
-
     def _cap_batch_pre(_m, _args, kwargs):
         if fd_call_counter["n"] != 0:
             return
@@ -358,6 +422,28 @@ def main():
                            "meta_arch.wrap"))
     except Exception as e:
         print(f"[gen_image_ref] could not wrap forward_decoder: {e}",
+              file=sys.stderr)
+
+    # Capture the first body-only output before full inference mutates it
+    # with hand prompting/refinement. The C runners currently implement this
+    # body branch, so these refs are the end-to-end parity target.
+    try:
+        _orig_forward_step = model.forward_step
+        fs_call_counter = {"body": 0}
+        def _wrapped_forward_step(*args, **kwargs):
+            decoder_type = kwargs.get("decoder_type", None)
+            if decoder_type is None and len(args) >= 2:
+                decoder_type = args[1]
+            r = _orig_forward_step(*args, **kwargs)
+            if decoder_type == "body" and fs_call_counter["body"] == 0:
+                _capture_pose_output("body_out", r)
+                fs_call_counter["body"] += 1
+            return r
+        model.forward_step = _wrapped_forward_step
+        registered.append(("body_out_{vertices,keypoints_*}",
+                           "forward_step", "meta_arch.wrap"))
+    except Exception as e:
+        print(f"[gen_image_ref] could not wrap forward_step: {e}",
               file=sys.stderr)
 
     # --- Per-intermediate-layer pose_output capture. Hook the decoder's

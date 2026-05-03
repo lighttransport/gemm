@@ -22,6 +22,11 @@
 static int diff_report(const char *label, const float *a, const float *b,
                        size_t n, float thresh, float mean_thresh, int tok_dim)
 {
+    if (n == 0) {
+        fprintf(stderr, "[cuda verify_build_tokens] %s  empty diff FAIL\n",
+                label);
+        return 1;
+    }
     double sum = 0.0; float mx = 0.0f; size_t mx_i = 0;
     for (size_t i = 0; i < n; i++) {
         float d = fabsf(a[i] - b[i]);
@@ -45,12 +50,22 @@ int main(int argc, char **argv)
     float mean_threshold = 1e-4f;
     int device = 0, verbose = 0;
     const char *precision = "bf16";
+    cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--mean-threshold") && i+1 < argc) mean_threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            const char *v = argv[++i];
+            if      (!strcmp(v, "dinov3")) backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
+            else if (!strcmp(v, "vith"))   backbone = CUDA_SAM3D_BODY_BACKBONE_VITH;
+            else {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--device") && i+1 < argc) device = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--precision") && i+1 < argc) precision = argv[++i];
         else if (!strcmp(argv[i], "-v")) verbose = 1;
@@ -59,7 +74,8 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] "
-                        "[--device N] [--precision bf16|fp16] [-v]\n",
+                        "[--backbone dinov3|vith] [--device N] "
+                        "[--precision bf16|fp16] [-v]\n",
                 argv[0]);
         return 2;
     }
@@ -105,6 +121,7 @@ int main(int argc, char **argv)
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,
+        .backbone        = backbone,
     };
     cuda_sam3d_body_ctx *ctx = cuda_sam3d_body_create(&cfg);
     if (!ctx) {
