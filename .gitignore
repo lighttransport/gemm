@@ -124,3 +124,4 @@ result/
 
 # Local (uncommitted) runner scripts — per-box model paths / env
 server/run-*.local.sh
+third_party/
