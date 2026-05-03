@@ -163,7 +163,7 @@ account for this.
 
 | Stage             | Status     | max_abs | mean_abs | Notes |
 |-------------------|------------|---------|----------|-------|
-| Step 0 scaffold   | GREEN      | —       | —        | 8/8 verify_*.c exit 0 with "not yet ported"; gen_image_ref --skip-run writes input_image.npy |
+| Step 0 bootstrap  | GREEN      | —       | —        | legacy bootstrap complete; obsolete compatibility stubs now fail explicitly |
 | Step 1 slicer     | GREEN      | —       | —        | convert_ckpt.py: 160 f16 big matmul weights + 391 f32 (biases/norms/embeds) dinov3 / 524 decoder fp32 (93.51M) / 52 mhr_head fp32+i64 (19.04M); 0 unmatched. Mixed precision: big 2D weights→f16 (threaded `cpu_gemm_f16`), small tensors→fp32 (free precision) |
 | DINOv3 encoder    | GREEN      | 1.52e-1 | 4.01e-3  | verify_dinov3 via `dinov3_encode_from_normalized` bypass (skips u8 round-trip). Budget 2e-1 / 1e-2 = realistic f16 floor for 32-block ViT-H+; mean error is 0.02% of typical token magnitude (std≈0.32). 24.2s end-to-end @ 8 threads. |
 | DINOv3 encoder (CUDA) | GREEN  | 9.95e-1 | 1.11e-2  | `cuda/sam3d_body/verify_dinov3` (debug_set_normalized_input → run_encoder → diff (1,1280,32,32) ref). 32-block ViT forward in NVRTC: patch_embed_sam3d + prepend_special_tokens + pos_embed_add + per-block LN/QKV-gemm/rotate-half-RoPE-on-patches/KV-transpose/flash-attn/proj/layerscale-add(LS1)/LN/w1+w2/silu_mul/w3/layerscale-add(LS2) + final layernorm. F16 weights via `sb_upload_f16`. CUDA matches CPU bit-for-bit to 5+ digits (same offending position d=875 py=29 px=12). The CUDA-vs-PyTorch floor (max≈1.0) tracks the CPU-vs-PyTorch floor; CUDA-vs-CPU diff ≈1e-5 well under the Step 3c 1e-2 gate. Verify gate set to 1.5 / 1.5e-2 to track this floor. |
@@ -225,9 +225,8 @@ Rationale:
 - Same pattern as `cpu/sam3` → `cuda/sam3.1` (CPU landed entirely
   first; CUDA followed as an independent port).
 
-CUDA scaffolds at `cuda/sam3d_body/*` remain in place (NOT_IMPLEMENTED
-returns); they'll be populated in CUDA-phase steps 3/5/7/9 after CPU
-steps 4/6/8 are green.
+CUDA runner and verifier coverage has since landed; see `PORT_v2.md`
+for the current DINOv3/ViT-H status and raw-image fixed-bbox gates.
 
 ## Build
 
@@ -237,9 +236,10 @@ make                  # zen2 flags; override with ARCH=native, COMPILER=clang
 make DEBUG=1          # -O0 + asan/ubsan
 ```
 
-Scaffold currently compiles; every stage entrypoint returns
-`SAM3D_BODY_E_NOT_IMPLEMENTED (-2)`; `verify_*.c` binaries print
-"scaffold — … not yet ported" and exit 0.
+The maintained stage verifiers build under `make all`. Historical
+compatibility stubs no longer return success for missing coverage; use
+the explicit `verify-*` aliases or `PORT_v2.md` for the current gate
+matrix.
 
 ## Checkpoint layout (on disk)
 

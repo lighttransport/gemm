@@ -297,6 +297,36 @@ The VAE attention port is the headline win: at 512² spatial=4096, the CPU loop 
 
 **Note on the prefetch / copy-stream approach**: the natural next step — running block streaming on a separate `hipStream` concurrently with compute on the default stream (pinned host staging + `hipMemcpyAsync` + slot ring buffer) — was implemented and tested but **regressed ~0.7–1.0 s/step at 512×512** on gfx1201. Tracing showed that (1) sync `hipMemcpy` on the default stream already achieves good implicit overlap with queued compute (the "85 ms/block" really breaks down as ~60 ms compute catchup + ~25 ms DMA), and (2) explicit DMA on a copy stream contends with compute for HBM bandwidth. The current WMMA GEMM is memory-bandwidth-bound, so running DMA in parallel slows compute by more than the DMA saves. The simpler residency win above beats the prefetch approach on this GPU.
 
+### CUDA perf — RTX 5060 Ti (sm_120, 16 GB)
+
+Single DiT forward, FP8 e4m3 weights, all `cuda_qimg` defaults
+(BF16_ATTN + FP8_PIPE_PERROW + cuBLAS-LT FP8 + fused MLP w/ BF16 hidden
++ pinned bounce H2D for streamed blocks). Synthetic `--test-dit` with
+`n_txt=7`. Measured on PyTorch 2.11+cu128 for the ComfyUI column.
+
+| Resolution | **Ours s/fwd** | ComfyUI s/step (CFG = 2 fwd) | ComfyUI s/fwd | Speedup |
+|------------|---------------|------------------------------|---------------|---------|
+| 256²       | **0.619**     | 1.287                        | 0.643         | 1.04×   |
+| 512²       | **0.751**     | 1.583                        | 0.791         | 1.05×   |
+| 1024²      | **1.680**     | 4.104                        | 2.052         | **1.22×** |
+
+ComfyUI per-step includes CFG (cond + uncond = 2 DiT forwards), so divide
+by 2 for per-forward parity. ComfyUI also pads text to 512 tokens vs
+our `n_txt=7`, so the 256/512 numbers actually *under-count* our
+relative advantage (more attention/MLP work on the ComfyUI side at small
+image-token counts). At 1024² where image tokens dominate (4096), the
+PCIe streaming + cuBLAS-LT FP8 + fused MLP path beats PyTorch by 22%.
+
+**Where the time goes at 512²** (`QIMG_PROFILE_BLOCK=1`): compute totals
+0.24 s/fwd (adaLN1+QKV 0.71, img-MLP 1.45, attn-out 0.59, attention
+0.48, QK-norm+RoPE 0.38, txt-MLP 0.29 — all in ms/block × 60 blocks).
+The remaining ~0.5 s of the 0.75 s wall is PCIe streaming the 15
+evicted blocks (324 MB each at ~13 GB/s pinned). Floor on this 16 GB
+card without true int4 weight quantization.
+
+For ≥1024² use `QIMG_WORKSPACE_MB=1200` (the default 250 MB activation
+reserve OOMs because activations scale with `n_img = (H/16)²`).
+
 **Apples-to-apples vs diffusers reference** (256×256 / 20 steps / cfg=1, both runners loading the same `qwen_image_fp8_e4m3fn.safetensors` and using `init_latent_256.bin / apple_text_256.bin / sigmas_256.bin` from `dump_diffusers_pipeline.py`). Default-on HIP today is **BF16×FP8 WMMA + BF16 WMMA attn + VAE WMMA**; FP8×FP8 is opt-in and trades quality for speed:
 
 | | diffusers (FP8, seq. cpu offload) | HIP BF16×FP8 WMMA + BF16 attn + VAE WMMA (default) | HIP FP8×FP8 + BF16 attn + VAE WMMA (`QIMG_FP8_FP8_WMMA=1`) |

@@ -39,6 +39,19 @@ def _ensure_sam3d_body_on_path():
             sys.path.insert(0, cand)
 
 
+def _import_sam3d_body():
+    try:
+        from sam_3d_body import (load_sam_3d_body, load_sam_3d_body_hf,
+                                 SAM3DBodyEstimator)
+        return load_sam_3d_body, load_sam_3d_body_hf, SAM3DBodyEstimator
+    except Exception as e:
+        raise RuntimeError(
+            "cannot import sam_3d_body. Set SAM_3D_BODY_DIR or restore "
+            "/tmp/sam-3d-body with: git clone --depth 1 "
+            "https://github.com/facebookresearch/sam-3d-body "
+            "/tmp/sam-3d-body") from e
+
+
 def load_model(local_ckpt_dir=None,
                hf_repo_id="facebook/sam-3d-body-dinov3",
                device="cuda"):
@@ -49,8 +62,8 @@ def load_model(local_ckpt_dir=None,
     import torch
     torch.set_float32_matmul_precision("highest")
     _ensure_sam3d_body_on_path()
-    from sam_3d_body import (load_sam_3d_body, load_sam_3d_body_hf,
-                             SAM3DBodyEstimator)
+    load_sam_3d_body, load_sam_3d_body_hf, SAM3DBodyEstimator = (
+        _import_sam3d_body())
 
     if local_ckpt_dir:
         ckpt_path = os.path.join(local_ckpt_dir, "model.ckpt")

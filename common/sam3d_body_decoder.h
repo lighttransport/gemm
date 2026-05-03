@@ -1,5 +1,5 @@
 /*
- * sam3d_body_decoder.h — sam-3d-body DINOv3 promptable decoder + MHR head.
+ * sam3d_body_decoder.h — sam-3d-body promptable decoder + MHR head.
  *
  * Usage:
  *   #define SAM3D_BODY_DECODER_IMPLEMENTATION
@@ -34,11 +34,12 @@
  * Scope v1:
  *   - Body branch only (skip _hand variants)
  *   - Empty prompts (dummy keypoints [0, 0, -2])
+ *   - DINOv3 32x32 and ViT-H 32x24 image-token grids
  *   - Produces 519 MHR params + 3 cam_t values; focal from runner's fov hint.
  *
- * This is a scaffold. SAM3D_BODY_DECODER_IMPLEMENTATION currently returns
- * SAM3D_BODY_DECODER_E_NOT_IMPLEMENTED from forward(). Wiring lands step by
- * step (4a..4g tracked in cpu/sam3d_body/PORT.md).
+ * The implementation covers ray conditioning, token construction, all six
+ * decoder layers, iterative keypoint-token updates, final MHR/camera heads,
+ * and the public wrapper used by the CPU/CUDA runners.
  */
 
 #ifndef SAM3D_BODY_DECODER_H
@@ -222,10 +223,10 @@ int sam3d_body_ray_cond_emb_forward(const sam3d_body_decoder_model *m,
  * decoder cross-attention. Uses the prompt_encoder.pe_layer gaussian
  * matrix (m->prompt_pe_gauss, shape (2, embed_dim/2)).
  *
- * For each grid cell (yi, xi) the (x, y) center is normalized to
- * [(xi+0.5)/W, (yi+0.5)/H], shifted to [-1, 1] via 2x-1, projected
- * through the gaussian matrix, scaled by 2π, and mapped through
- * concat(sin, cos) — yielding embed_dim values.
+ * For each grid cell (yi, xi) the (x, y) center is normalized to the
+ * square crop grid. DINOv3 uses H==W. ViT-H uses a 32x24 embedding grid
+ * sliced from the center of the 32x32 crop, so x is offset by (H-W)/2
+ * and normalized by H, not W.
  *
  *   out: (embed_dim=1280, H, W) f32, contiguous CHW layout.
  *
@@ -254,7 +255,10 @@ int sam3d_body_invalid_prompt_token(const sam3d_body_decoder_model *m,
  *   1. meshgrid_xy = arange(H_in) × arange(W_in)              (H_in, W_in, 2)
  *   2. inverse-affine apply (only diagonal scale + col-2 trans)
  *   3. inverse-camera apply (subtract (cx, cy), divide by (fx, fy))
- *   4. F.interpolate(antialias=True, bilinear, scale=1/patch_size)
+ *   4. If the output grid is rectangular (ViT-H: 32x24), center-crop
+ *      the x ramp to the crop width before downsampling. Upstream crops
+ *      the 512x512 body crop to 512x384 before the ViT-H patch embed.
+ *   5. F.interpolate(antialias=True, bilinear, scale=1/patch_size)
  *      separable triangle kernel along H then W
  *   5. concat z=1 along the last axis
  *
@@ -757,7 +761,9 @@ int sam3d_body_decoder_forward(
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef SAFETENSORS_IMPLEMENTATION
 #define SAFETENSORS_IMPLEMENTATION 1
+#endif
 #include "safetensors.h"
 
 /* MHR API (no impl) — needed by sam3d_body_decoder_forward_full, which
@@ -1192,8 +1198,9 @@ int sam3d_body_get_dense_pe(const sam3d_body_decoder_model *m,
     for (int yi = 0; yi < H; yi++) {
         const float yn = ((float)yi + 0.5f) / (float)H;        /* [0,1] */
         const float ys = 2.0f * yn - 1.0f;                     /* [-1,1] */
+        const float x_offset = (W != H) ? 0.5f * (float)(H - W) : 0.0f;
         for (int xi = 0; xi < W; xi++) {
-            const float xn = ((float)xi + 0.5f) / (float)W;
+            const float xn = ((float)xi + x_offset + 0.5f) / (float)H;
             const float xs = 2.0f * xn - 1.0f;
             const float two_pi = 6.2831853071795864769f;
             for (int k = 0; k < npf; k++) {
@@ -1308,7 +1315,17 @@ int sam3d_body_compute_ray_cond_xyz(const float *cam_int,
         free(x_full); free(y_full); free(x_ds); free(y_ds);
         return SAM3D_BODY_DECODER_E_LOAD;
     }
-    s3db_antialias_downsample_1d(x_full, W_in, x_ds, W_out);
+    const float *x_src = x_full;
+    int x_src_n = W_in;
+    if (W_out != H_out) {
+        int crop_w = (int)lrint((double)W_in * (double)W_out / (double)H_out);
+        if (crop_w > 0 && crop_w <= W_in) {
+            int crop_x0 = (W_in - crop_w) / 2;
+            x_src = x_full + crop_x0;
+            x_src_n = crop_w;
+        }
+    }
+    s3db_antialias_downsample_1d(x_src, x_src_n, x_ds, W_out);
     s3db_antialias_downsample_1d(y_full, H_in, y_ds, H_out);
     free(x_full); free(y_full);
 
@@ -1942,6 +1959,10 @@ int sam3d_body_kp_token_update(const sam3d_body_decoder_model *m,
         if (invalid[i]) continue;  /* zero from calloc */
         float gx = kp2d_cropped[i*2 + 0] * 2.0f;
         float gy = kp2d_cropped[i*2 + 1] * 2.0f;
+        /* ViT-H uses a rectangular image embedding grid (32x24). Upstream
+         * scales x by H/W before grid_sample so normalized crop coords still
+         * refer to the original square crop before width cropping. */
+        if (W != H) gx *= (float)H / (float)W;
         s3db_grid_sample_one(image_emb, C_img, H, W, gx, gy,
                              kp_feats + (size_t)i * C_img);
     }
