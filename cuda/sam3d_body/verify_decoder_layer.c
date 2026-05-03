@@ -48,6 +48,7 @@ int main(int argc, char **argv)
     float mean_threshold = 3e-4f;
     int one_layer = -1, device = 0, verbose = 0;
     const char *precision = "bf16";
+    cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
@@ -55,6 +56,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--mean-threshold") && i+1 < argc) mean_threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--layer") && i+1 < argc) one_layer = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            const char *v = argv[++i];
+            if      (!strcmp(v, "dinov3")) backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
+            else if (!strcmp(v, "vith"))   backbone = CUDA_SAM3D_BODY_BACKBONE_VITH;
+            else {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--device") && i+1 < argc) device = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--precision") && i+1 < argc) precision = argv[++i];
         else if (!strcmp(argv[i], "-v")) verbose = 1;
@@ -63,7 +73,8 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] [--layer N] "
-                        "[--device N] [--precision bf16|fp16] [-v]\n",
+                        "[--backbone dinov3|vith] [--device N] "
+                        "[--precision bf16|fp16] [-v]\n",
                 argv[0]);
         return 2;
     }
@@ -74,11 +85,25 @@ int main(int argc, char **argv)
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,
+        .backbone        = backbone,
     };
     cuda_sam3d_body_ctx *ctx = cuda_sam3d_body_create(&cfg);
     if (!ctx) { fprintf(stderr, "create failed\n"); return 5; }
 
-    const int N_Q = 145, D = 1024, N_C = 1024, DC = 1280;
+    const int N_Q = 145, D = 1024, DC = 1280;
+    int nd0 = 0, dims0[8] = {0};
+    char p0[1024];
+    snprintf(p0, sizeof(p0), "%s/decoder_layer0_in__context.npy", refdir);
+    void *tmp0 = npy_load(p0, &nd0, dims0, NULL);
+    if (!tmp0 || nd0 != 3 || dims0[0] != 1 || dims0[2] != DC) {
+        fprintf(stderr, "[cuda verify_decoder_layer] bad %s\n", p0);
+        free(tmp0);
+        cuda_sam3d_body_destroy(ctx);
+        return 6;
+    }
+    const int N_C = dims0[1];
+    free(tmp0);
+
     float *x_out = (float *)malloc((size_t)N_Q * D * sizeof(float));
     if (!x_out) { cuda_sam3d_body_destroy(ctx); return 6; }
 

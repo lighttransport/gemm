@@ -1,15 +1,25 @@
 /*
  * test_cuda_vlm.c - End-to-end VLM inference: CUDA vision encoder + CUDA LLM
  *
- * Usage: ./test_cuda_vlm <model.gguf> <mmproj.gguf> <image.jpg> [-n max_tokens] [--resize dynamic|fit]
+ * Usage:
+ *   ./test_cuda_vlm <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen]
+ *                   [-n max_tokens] [--resize dynamic|fit] [--budget N]
  *
- * Encodes an image through the CUDA vision encoder (mmproj), injects the
- * resulting embeddings into the CUDA LLM runner, and generates text.
+ * Positional args after model+mmproj are classified by shape (mirrors
+ * cpu/vlm/test_vision so the sidecar's OursQwenVlmBackend can shell-out
+ * to either binary with the same argv):
+ *   - extension .png/.jpg/.jpeg/.bmp/.ppm  -> image path
+ *   - starts with a digit                  -> max_gen token cap
+ *   - anything else                        -> user prompt
+ *
+ * If no image is passed a synthetic checkerboard is used (smoke-test
+ * parity with test_vision).
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <math.h>
 #include <time.h>
 
@@ -43,6 +53,35 @@
 /* CUDA runners */
 #include "cuda_vision_encoder.h"
 #include "../llm/cuda_llm_runner.h"
+
+static int arg_looks_like_image(const char *s) {
+    if (!s) return 0;
+    int n = (int)strlen(s);
+    if (n < 4) return 0;
+    const char *ext = s + n - 4;
+    const char *ext5 = (n >= 5) ? s + n - 5 : NULL;
+    if (strcasecmp(ext, ".png") == 0) return 1;
+    if (strcasecmp(ext, ".jpg") == 0) return 1;
+    if (strcasecmp(ext, ".bmp") == 0) return 1;
+    if (strcasecmp(ext, ".ppm") == 0) return 1;
+    if (ext5 && strcasecmp(ext5, ".jpeg") == 0) return 1;
+    return 0;
+}
+
+static unsigned char *generate_checkerboard(int width, int height, int cell_size) {
+    unsigned char *img = (unsigned char *)malloc((size_t)width * height * 3);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int checker = ((x / cell_size) + (y / cell_size)) & 1;
+            unsigned char val = checker ? 255 : 0;
+            int idx = (y * width + x) * 3;
+            img[idx + 0] = val;
+            img[idx + 1] = val;
+            img[idx + 2] = val;
+        }
+    }
+    return img;
+}
 
 /* Simple bilinear resize */
 static unsigned char *bilinear_resize(const unsigned char *src, int sw, int sh,
@@ -252,18 +291,19 @@ static void emit_visible_token(const bpe_vocab *vocab, qwen_decode_state *st, in
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> <image.jpg> [-n max_tokens] [--resize dynamic|fit]\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <model.gguf> <mmproj.gguf> [image] [prompt] [max_gen] [-n N] [--resize dynamic|fit] [--budget N]\n", argv[0]);
         return 1;
     }
 
     const char *model_path = argv[1];
     const char *mmproj_path = argv[2];
-    const char *image_path = argv[3];
-    int max_gen = 100;
+    const char *image_path = NULL;
+    const char *user_prompt = "Describe the image briefly.";
+    int max_gen = 128;
     int reasoning_budget_tokens = 32;
     int resize_mode = 0;  /* 0 = dynamic (default, matches llama.cpp), 1 = fit (simple) */
-    for (int i = 4; i < argc; i++) {
+    for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) max_gen = atoi(argv[++i]);
         else if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) reasoning_budget_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) {
@@ -272,24 +312,39 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i], "dynamic") == 0) resize_mode = 0;
             else { fprintf(stderr, "Unknown resize mode: %s (use 'dynamic' or 'fit')\n", argv[i]); return 1; }
         }
+        else if (arg_looks_like_image(argv[i])) image_path = argv[i];
+        else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
+            int v = atoi(argv[i]);
+            if (v > 0) max_gen = v;
+        }
+        else user_prompt = argv[i];
     }
 
     fprintf(stderr, "=== CUDA VLM Pipeline ===\n");
     fprintf(stderr, "LLM model:   %s\n", model_path);
     fprintf(stderr, "Vision model: %s\n", mmproj_path);
-    fprintf(stderr, "Image:       %s\n", image_path);
+    fprintf(stderr, "Image:       %s\n", image_path ? image_path : "<synthetic checkerboard>");
+    fprintf(stderr, "Prompt:      %s\n", user_prompt);
     fprintf(stderr, "Max gen:     %d\n", max_gen);
     fprintf(stderr, "Budget:      %d\n\n", reasoning_budget_tokens);
 
     /* ---- 1. Load image ---- */
-    fprintf(stderr, "Loading image...\n");
     int img_w, img_h, img_c;
-    unsigned char *img_data = stbi_load(image_path, &img_w, &img_h, &img_c, 3);
-    if (!img_data) {
-        fprintf(stderr, "Failed to load image: %s\n", image_path);
-        return 1;
+    unsigned char *img_data = NULL;
+    if (image_path) {
+        fprintf(stderr, "Loading image...\n");
+        img_data = stbi_load(image_path, &img_w, &img_h, &img_c, 3);
+        if (!img_data) {
+            fprintf(stderr, "Failed to load image: %s\n", image_path);
+            return 1;
+        }
+        fprintf(stderr, "Image: %dx%d (%d channels)\n", img_w, img_h, img_c);
+    } else {
+        img_w = img_h = 448;
+        img_c = 3;
+        img_data = generate_checkerboard(img_w, img_h, 32);
+        fprintf(stderr, "Using synthetic checkerboard: %dx%d\n", img_w, img_h);
     }
-    fprintf(stderr, "Image: %dx%d (%d channels)\n", img_w, img_h, img_c);
 
     /* ---- 2. Load mmproj GGUF ---- */
     fprintf(stderr, "Loading mmproj: %s\n", mmproj_path);
@@ -437,20 +492,21 @@ int main(int argc, char **argv) {
 
     /* ---- 7. Build multimodal prompt ---- */
     char text_before[256];
-    char text_after[512];
+    char text_after[16384];
     {
         const char *tmpl = gguf_get_kv_string(gguf_llm, "tokenizer.chat_template");
         (void)tmpl;  /* always use chatml+vision format */
         snprintf(text_before, sizeof(text_before), "<|im_start|>user\n<|vision_start|>");
         snprintf(text_after, sizeof(text_after),
-                 "<|vision_end|>Describe the image briefly.<|im_end|>\n"
-                 "<|im_start|>assistant\n"
-                 "<think>\n\n</think>\n\n");
+                 "<|vision_end|>%s<|im_end|>\n"
+                 "<|im_start|>assistant\n",
+                 user_prompt);
     }
 
-    int32_t tokens_before[64], tokens_after[64];
+    int32_t tokens_before[64];
+    int32_t *tokens_after = (int32_t *)malloc(sizeof(int32_t) * 4096);
     int n_before = bpe_tokenize(vocab, text_before, -1, tokens_before, 64);
-    int n_after  = bpe_tokenize(vocab, text_after, -1, tokens_after, 64);
+    int n_after  = bpe_tokenize(vocab, text_after, -1, tokens_after, 4096);
 
     fprintf(stderr, "\nTokens before vision (%d):", n_before);
     for (int i = 0; i < n_before; i++)
@@ -536,6 +592,7 @@ int main(int argc, char **argv) {
     /* ---- 10. Cleanup ---- */
     fprintf(stderr, "\nCleaning up...\n");
     free(vision_embd);
+    free(tokens_after);
     if (cuda_vis) cuda_vision_free(cuda_vis);
     vision_free(vm);
     cuda_llm_free(llm);
