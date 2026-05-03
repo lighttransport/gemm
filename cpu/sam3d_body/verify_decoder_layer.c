@@ -50,9 +50,27 @@ static float *load_or_die(const char *refdir, const char *name, int want_ndim,
     return d;
 }
 
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 const char *tag, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
+    const char *backbone = "dinov3";
     /* Budget for per-layer diff vs fp32 upstream. Self+cross attn +
      * FFN add up — empirical fp32 floor observed around 5e-4 max_abs
      * on layer 5 (deepest accumulation). Set with 4x headroom. */
@@ -63,25 +81,44 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--layer")           && i+1 < argc) one_layer = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            backbone = argv[++i];
+            if (strcmp(backbone, "dinov3") && strcmp(backbone, "vith")) {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n",
+                        backbone);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir <dir> --refdir <dir> "
-                "[--threshold F] [--layer N] [-t N] [-v]\n", argv[0]);
+                "[--threshold F] [--layer N] [--backbone dinov3|vith] "
+                "[-t N] [-v]\n", argv[0]);
         return 2;
     }
     (void)verbose;
 
     char path[1024];
-    snprintf(path, sizeof(path), "%s/sam3d_body_decoder.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, path, sizeof(path));
     char mhr_path[1024];
-    snprintf(mhr_path, sizeof(mhr_path), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "mhr_head", backbone, mhr_path, sizeof(mhr_path));
     sam3d_body_decoder_model *m = sam3d_body_decoder_load(path, mhr_path);
     if (!m) return 5;
 
-    const int N_Q = 145, D = 1024, N_C = 1024, DC = 1280;
+    const int N_Q = 145, D = m->dim, DC = m->kv_dim;
+    int nd0 = 0, dims0[8] = {0};
+    char p0[1024];
+    snprintf(p0, sizeof(p0), "%s/decoder_layer0_in__context.npy", refdir);
+    void *tmp0 = npy_load(p0, &nd0, dims0, NULL);
+    if (!tmp0 || nd0 != 3 || dims0[2] != DC) {
+        fprintf(stderr, "[verify_decoder_layer] bad %s\n", p0);
+        free(tmp0); sam3d_body_decoder_free(m); return 6;
+    }
+    const int N_C = dims0[1];
+    free(tmp0);
     float *x_out = (float *)malloc((size_t)N_Q * D * sizeof(float));
     if (!x_out) { sam3d_body_decoder_free(m); return 6; }
 

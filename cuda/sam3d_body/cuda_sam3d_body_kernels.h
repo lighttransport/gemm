@@ -1,15 +1,8 @@
-/* NVRTC kernel source for SAM 3D Body — scaffolded empty.
+/* NVRTC kernel source for SAM 3D Body.
  *
- * Kernels land one module at a time (see ../../cpu/sam3d_body/PORT.md).
  * Organization mirrors cuda/sam3.1/cuda_sam3_1_kernels.h: concatenate
  * __global__ source strings into a single const char array, compile
  * once via cu_compile_kernels() at create-time, cache the CUmodule.
- *
- * Step 3 (DINOv3 encoder) will add: patch_embed_16, pos_embed_tile_add,
- * ln_affine, qkv_proj_and_split, flash_attn / mma_gemm, mlp_gelu,
- * residual_add. Step 5 adds the decoder kernels (cross-attn with
- * prompt tokens, FFN, keypoint-token update). Step 7 adds MHR
- * skinning (J_regressor matvec, LBS, blend-shape vector-matrix).
  */
 
 #ifndef CUDA_SAM3D_BODY_KERNELS_H_
