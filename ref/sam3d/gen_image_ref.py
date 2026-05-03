@@ -108,6 +108,8 @@ def main():
     conf = OmegaConf.load(args.pipeline_yaml)
     OmegaConf.set_struct(conf, False)
     conf.workspace_dir = yaml_dir
+    if os.environ.get("SAM3D_REF_DEVICE"):
+        conf.device = os.environ["SAM3D_REF_DEVICE"]
 
     if args.pointmap is not None:
         # Drop the MoGe block so missing `moge` doesn't fail hydra

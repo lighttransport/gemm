@@ -42,6 +42,36 @@ static float *load_or_die(const char *refdir, const char *name)
     return d;
 }
 
+static float *load_or_die_dims(const char *refdir, const char *name,
+                               int *out_nd, int out_dims[8])
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.npy", refdir, name);
+    float *d = (float *)npy_load(path, out_nd, out_dims, NULL);
+    if (!d) {
+        fprintf(stderr, "[verify_kp_update] missing %s\n", path);
+        return NULL;
+    }
+    return d;
+}
+
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 const char *tag, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
 {
@@ -62,6 +92,7 @@ static int diff_pair(const char *label, const float *a, const float *b,
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
+    const char *backbone = "dinov3";
     float threshold = 5e-4f;
     int one_layer = -1, n_threads = 1;
     for (int i = 1; i < argc; i++) {
@@ -69,29 +100,44 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--layer")           && i+1 < argc) one_layer = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            backbone = argv[++i];
+            if (strcmp(backbone, "dinov3") && strcmp(backbone, "vith")) {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n",
+                        backbone);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir <dir> --refdir <dir> "
-                "[--threshold F] [--layer N] [-t N]\n", argv[0]);
+                "[--threshold F] [--layer N] [--backbone dinov3|vith] "
+                "[-t N]\n", argv[0]);
         return 2;
     }
 
     char p[1024];
-    snprintf(p, sizeof(p), "%s/sam3d_body_decoder.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, p, sizeof(p));
     char p2[1024];
-    snprintf(p2, sizeof(p2), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "mhr_head", backbone, p2, sizeof(p2));
     sam3d_body_decoder_model *m = sam3d_body_decoder_load(p, p2);
     if (!m) { fprintf(stderr, "load failed\n"); return 3; }
 
     /* Image embeddings (post ray_cond) — same input across layers. */
-    float *img_emb = load_or_die(refdir, "image_embeddings_after_ray");
+    int img_nd = 0, img_dims[8] = {0};
+    float *img_emb = load_or_die_dims(refdir, "image_embeddings_after_ray",
+                                      &img_nd, img_dims);
     if (!img_emb) { sam3d_body_decoder_free(m); return 4; }
-    /* Layout (1, 1280, 32, 32) -- channel-first matches kp_update API. */
+    if (img_nd != 4 || img_dims[1] != m->kv_dim) {
+        fprintf(stderr, "[verify_kp_update] bad image_embeddings_after_ray shape\n");
+        free(img_emb); sam3d_body_decoder_free(m); return 4;
+    }
+    /* Layout (1, C, H, W) -- channel-first matches kp_update API. */
 
     const int N_Q = 145, D = m->dim, K = m->n_keypoints;
-    const int H = 32, W = 32;
+    const int H = img_dims[2], W = img_dims[3];
     int rc_total = 0;
     /* Last layer (n_layers-1) is short-circuited per upstream guard. */
     int lo = (one_layer >= 0) ? one_layer : 0;

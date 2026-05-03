@@ -48,9 +48,27 @@ static int diff_report(const char *label, const float *a, const float *b,
     return fail ? 1 : 0;
 }
 
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 const char *tag, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
+    const char *backbone = "dinov3";
     /* LN + 2 linears accumulate f32 round-off; empirical floor ≲ 1e-5. */
     float threshold = 1e-4f;
     int n_threads = 1, verbose = 0;
@@ -58,13 +76,22 @@ int main(int argc, char **argv)
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            backbone = argv[++i];
+            if (strcmp(backbone, "dinov3") && strcmp(backbone, "vith")) {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n",
+                        backbone);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir <dir> --refdir <dir> "
-                "[--threshold F] [-t N] [-v]\n", argv[0]);
+                "[--threshold F] [--backbone dinov3|vith] [-t N] [-v]\n",
+                argv[0]);
         return 2;
     }
     (void)verbose;
@@ -97,9 +124,10 @@ int main(int argc, char **argv)
         free(tokens_in); free(ref_norm); free(ref_pose); free(ref_cam); return 3;
     }
 
-    snprintf(path, sizeof(path), "%s/sam3d_body_decoder.safetensors", sft_dir);
     char mhr_path[1024];
-    snprintf(mhr_path, sizeof(mhr_path), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, path, sizeof(path));
+    resolve_variant_path(sft_dir, "mhr_head", backbone,
+                         mhr_path, sizeof(mhr_path));
     sam3d_body_decoder_model *m = sam3d_body_decoder_load(path, mhr_path);
     if (!m) {
         free(tokens_in); free(ref_norm); free(ref_pose); free(ref_cam);

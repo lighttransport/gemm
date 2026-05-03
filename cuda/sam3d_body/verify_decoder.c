@@ -49,9 +49,47 @@ static float *load_or_die(const char *refdir, const char *name)
     return d;
 }
 
+static float *load_or_die_dims(const char *refdir, const char *name,
+                               int *out_nd, int out_dims[8])
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.npy", refdir, name);
+    float *d = (float *)npy_load(path, out_nd, out_dims, NULL);
+    if (!d) {
+        fprintf(stderr, "[cuda verify_decoder] missing %s\n", path);
+        return NULL;
+    }
+    return d;
+}
+
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 cuda_sam3d_body_backbone_t backbone,
+                                 char *out, size_t out_sz)
+{
+    const char *tag = (backbone == CUDA_SAM3D_BODY_BACKBONE_VITH) ?
+        "vith" : "dinov3";
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
 {
+    if (n == 0) {
+        fprintf(stderr, "[cuda verify_decoder] %-44s empty diff FAIL\n",
+                label);
+        return 1;
+    }
     double sum = 0.0; float mx = 0.0f; size_t mxi = 0;
     for (size_t i = 0; i < n; i++) {
         float d = fabsf(a[i] - b[i]);
@@ -77,12 +115,22 @@ int main(int argc, char **argv)
     int device = 0, verbose = 0;
     int n_threads = 0;
     const char *precision = "bf16";
+    cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
         else if (!strcmp(argv[i], "--mhr-assets")      && i+1 < argc) mhr_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            const char *v = argv[++i];
+            if      (!strcmp(v, "dinov3")) backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
+            else if (!strcmp(v, "vith"))   backbone = CUDA_SAM3D_BODY_BACKBONE_VITH;
+            else {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--device")          && i+1 < argc) device = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--precision")       && i+1 < argc) precision = argv[++i];
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
@@ -92,14 +140,15 @@ int main(int argc, char **argv)
     if (!sft_dir || !mhr_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --mhr-assets DIR "
                         "--refdir DIR [--threshold F] [--device N] "
-                        "[--precision bf16|fp16] [-t N] [-v]\n", argv[0]);
+                        "[--backbone dinov3|vith] [--precision bf16|fp16] "
+                        "[-t N] [-v]\n", argv[0]);
         return 2;
     }
 
     /* CPU model (for MHR-in-the-loop helpers + init_pose/init_camera). */
     char p[1024], p2[1024];
-    snprintf(p,  sizeof(p),  "%s/sam3d_body_decoder.safetensors", sft_dir);
-    snprintf(p2, sizeof(p2), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, p, sizeof(p));
+    resolve_variant_path(sft_dir, "mhr_head", backbone, p2, sizeof(p2));
     sam3d_body_decoder_model *m = sam3d_body_decoder_load(p, p2);
     if (!m) { fprintf(stderr, "[cuda verify_decoder] decoder_load failed\n"); return 3; }
 
@@ -118,6 +167,7 @@ int main(int argc, char **argv)
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,
+        .backbone        = backbone,
     };
     cuda_sam3d_body_ctx *ctx = cuda_sam3d_body_create(&cfg);
     if (!ctx) {
@@ -125,26 +175,45 @@ int main(int argc, char **argv)
         sam3d_body_mhr_free(mhr); sam3d_body_decoder_free(m); return 5;
     }
 
-    const int H = 32, W = 32;
     const int Dc = m->kv_dim;          /* 1280 */
     const int D  = m->dim;             /* 1024 */
     const int K  = m->n_keypoints;     /* 70 */
     const int N_Q = 1 + 1 + 1 + m->n_hand_tokens + 2 * K; /* 145 */
-    const int N_C = H * W;             /* 1024 */
     const int V  = 18439;
     const int J  = 127;
     const int NL = m->n_layers;        /* 6 */
 
     /* Reference inputs. */
-    float *img_emb     = load_or_die(refdir, "image_embeddings_after_ray");
+    int img_nd = 0, img_dims[8] = {0};
+    int pe_nd = 0, pe_dims[8] = {0};
+    float *img_emb     = load_or_die_dims(refdir, "image_embeddings_after_ray",
+                                          &img_nd, img_dims);
     float *init_x      = load_or_die(refdir, "decoder_layer0_in__x");
     float *init_xpe    = load_or_die(refdir, "decoder_layer0_in__x_pe");
-    float *ctx_pe_tok  = load_or_die(refdir, "decoder_layer0_in__context_pe");
+    float *ctx_pe_tok  = load_or_die_dims(refdir, "decoder_layer0_in__context_pe",
+                                          &pe_nd, pe_dims);
     if (!img_emb || !init_x || !init_xpe || !ctx_pe_tok) {
         free(img_emb); free(init_x); free(init_xpe); free(ctx_pe_tok);
         cuda_sam3d_body_destroy(ctx);
         sam3d_body_mhr_free(mhr); sam3d_body_decoder_free(m); return 6;
     }
+    if (img_nd != 4 || pe_nd != 3 || img_dims[0] != 1 ||
+        img_dims[1] != Dc || pe_dims[0] != 1 ||
+        pe_dims[1] != img_dims[2] * img_dims[3] ||
+        pe_dims[2] != Dc) {
+        fprintf(stderr,
+                "[cuda verify_decoder] bad image/context shape: "
+                "image rank=%d dims=(%d,%d,%d,%d), context_pe rank=%d "
+                "dims=(%d,%d,%d), Dc=%d\n",
+                img_nd, img_dims[0], img_dims[1], img_dims[2], img_dims[3],
+                pe_nd, pe_dims[0], pe_dims[1], pe_dims[2], Dc);
+        free(img_emb); free(init_x); free(init_xpe); free(ctx_pe_tok);
+        cuda_sam3d_body_destroy(ctx);
+        sam3d_body_mhr_free(mhr); sam3d_body_decoder_free(m); return 6;
+    }
+    const int H = img_dims[2];
+    const int W = img_dims[3];
+    const int N_C = H * W;
     /* Flatten image_emb (CHW) → ctx_in (HW × C) for decoder_layer context_in. */
     float *ctx_in = (float *)malloc((size_t)N_C * Dc * sizeof(float));
     /* ctx_pe is dumped in token form (HW, C); permute to CHW for kp_token_update
@@ -351,6 +420,7 @@ int main(int argc, char **argv)
             float *r_camt = load_or_die(refdir, nm);
             if (!r_kp3d || !r_kp2dc || !r_kp2dd || !r_camt) {
                 free(r_kp3d); free(r_kp2dc); free(r_kp2dd); free(r_camt);
+                rc_d = 1;
                 continue;
             }
             snprintf(lbl, sizeof(lbl), "layer%d kp3d (70,3)", li);
@@ -381,6 +451,10 @@ int main(int argc, char **argv)
                               final_kp2dd, r_kp2ddf, K, threshold);
             rc_d |= diff_pair("final pred_cam_t (3,)",
                               final_camt, r_camtf, 3, threshold);
+        } else {
+            fprintf(stderr,
+                    "[cuda verify_decoder] missing one or more final refs FAIL\n");
+            rc_d = 1;
         }
         free(r_pose); free(r_cam); free(r_kp3df);
         free(r_kp2dcf); free(r_kp2ddf); free(r_camtf);

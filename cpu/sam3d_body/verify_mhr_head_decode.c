@@ -18,6 +18,7 @@
  *
  * Usage:
  *   verify_mhr_head_decode --safetensors-dir <dir> --refdir <dir>
+ *                          [--backbone dinov3|vith]
  */
 
 #include <math.h>
@@ -47,22 +48,50 @@ static int diff(const char *label, const float *a, const float *b,
     return fail ? 1 : 0;
 }
 
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 const char *tag, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
+    const char *backbone = "dinov3";
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            backbone = argv[++i];
+            if (strcmp(backbone, "dinov3") && strcmp(backbone, "vith")) {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n",
+                        backbone);
+                return 2;
+            }
+        }
+        else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!sft_dir || !refdir) {
-        fprintf(stderr, "Usage: %s --safetensors-dir <dir> --refdir <dir>\n", argv[0]);
+        fprintf(stderr, "Usage: %s --safetensors-dir <dir> --refdir <dir> "
+                        "[--backbone dinov3|vith]\n", argv[0]);
         return 2;
     }
 
     char p[1024];
-    snprintf(p, sizeof(p), "%s/sam3d_body_decoder.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, p, sizeof(p));
     char p2[1024];
-    snprintf(p2, sizeof(p2), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "mhr_head", backbone, p2, sizeof(p2));
     sam3d_body_decoder_model *m = sam3d_body_decoder_load(p, p2);
     if (!m) { fprintf(stderr, "load failed\n"); return 3; }
 
@@ -96,10 +125,9 @@ int main(int argc, char **argv)
     memcpy(pose_full + 447, t,  72 * sizeof(float)); free(t);
 
     float mp[204], shape[45], face[72];
-    /* Reference dump `mhr_params__*` is captured via forward_hook on every
-     * MHRHead module — the LAST hand-branch call wins (head_pose_hand). So
-     * we test the enable_hand_model=True path here. */
-    int rc = sam3d_body_decode_pose_raw(m, pose_full, /*enable_hand_model*/1,
+    /* Guarded reference dumps capture the first body decoder pass
+     * (head_pose, not head_pose_hand), so test the body decode path. */
+    int rc = sam3d_body_decode_pose_raw(m, pose_full, /*enable_hand_model*/0,
                                         mp, shape, face);
     if (rc) { fprintf(stderr, "decode_pose_raw rc=%d\n", rc); goto fail; }
 
@@ -151,7 +179,7 @@ int main(int argc, char **argv)
 
     float kpts[70 * 3];
     rc = sam3d_body_keypoints_from_mesh(m, verts_unflipped, jc_unflipped,
-                                        /*enable_hand_model*/1, 1, kpts);
+                                        /*enable_hand_model*/0, 1, kpts);
     if (rc) { fprintf(stderr, "keypoints rc=%d\n", rc); goto fail; }
 
     snprintf(p, sizeof(p), "%s/mhr_params__pred_keypoints_3d.npy", refdir);
