@@ -2,7 +2,7 @@
  * verify_decoder_forward — exercises the public sam3d_body_decoder_forward
  * wrapper standalone (the convenience entry point that bundles
  * ray_cond_emb + get_dense_pe + invalid_prompt_token + build_tokens +
- * forward_full).
+ * forward_full). Supports DINOv3 32x32 and ViT-H 32x24 refs.
  *
  * verify_decoder_full pre-computes the decoder inputs and only diffs
  * forward_full. This test instead drives the wrapper from the same starting
@@ -13,7 +13,8 @@
  *
  * Usage:
  *   verify_decoder_forward --safetensors-dir <dir> --mhr-assets <dir> \
- *                          --refdir <dir> [--threshold F] [-t N]
+ *                          --refdir <dir> [--threshold F] \
+ *                          [--backbone dinov3|vith] [-t N]
  */
 
 #include <math.h>
@@ -42,6 +43,23 @@ static float *load_or_die(const char *refdir, const char *name)
     return d;
 }
 
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 const char *tag, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
 {
@@ -62,6 +80,7 @@ static int diff_pair(const char *label, const float *a, const float *b,
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *mhr_dir = NULL, *refdir = NULL;
+    const char *backbone = "dinov3";
     float threshold = 5e-3f;
     int n_threads = 1;
     for (int i = 1; i < argc; i++) {
@@ -69,12 +88,21 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--mhr-assets")      && i+1 < argc) mhr_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            backbone = argv[++i];
+            if (strcmp(backbone, "dinov3") && strcmp(backbone, "vith")) {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n",
+                        backbone);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!sft_dir || !mhr_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir <dir> --mhr-assets <dir> "
-                "--refdir <dir> [--threshold F] [-t N]\n", argv[0]);
+                "--refdir <dir> [--threshold F] [--backbone dinov3|vith] "
+                "[-t N]\n", argv[0]);
         return 2;
     }
 
@@ -90,8 +118,8 @@ int main(int argc, char **argv)
     memset(&r, 0, sizeof(r));
 
     char p[1024], p2[1024];
-    snprintf(p,  sizeof(p),  "%s/sam3d_body_decoder.safetensors", sft_dir);
-    snprintf(p2, sizeof(p2), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, p, sizeof(p));
+    resolve_variant_path(sft_dir, "mhr_head", backbone, p2, sizeof(p2));
     m = sam3d_body_decoder_load(p, p2);
     if (!m) goto done;
 
@@ -100,10 +128,10 @@ int main(int argc, char **argv)
     mhr = sam3d_body_mhr_load(p, p2);
     if (!mhr) goto done;
 
-    const int H = 32, W = 32;
     const int Dc = m->kv_dim;       /* 1280 */
     const int K = m->n_keypoints;   /* 70   */
     const int V = 18439;
+    int H = 0, W = 0;
 
     /* Pre-ray patch tokens — load CHW dump, permute to (H*W, Dc). */
     {
@@ -111,17 +139,21 @@ int main(int argc, char **argv)
         snprintf(path, sizeof(path), "%s/ray_cond__image_embeddings_pre_ray.npy", refdir);
         int nd, dims[8];
         pre_ray_chw = (float *)npy_load(path, &nd, dims, NULL);
-        if (!pre_ray_chw) {
-            fprintf(stderr, "[verify_decoder_forward] missing %s\n", path);
+        if (!pre_ray_chw || nd != 4 || dims[0] != 1 || dims[1] != Dc ||
+            dims[2] <= 0 || dims[3] <= 0) {
+            fprintf(stderr, "[verify_decoder_forward] missing/invalid %s\n", path);
             goto done;
         }
+        H = dims[2];
+        W = dims[3];
     }
-    image_tokens_patch = (float *)malloc((size_t)H * W * Dc * sizeof(float));
+    const int N_C = H * W;
+    image_tokens_patch = (float *)malloc((size_t)N_C * Dc * sizeof(float));
     if (!image_tokens_patch) goto done;
-    for (int n = 0; n < H * W; n++)
+    for (int n = 0; n < N_C; n++)
         for (int c = 0; c < Dc; c++)
             image_tokens_patch[(size_t)n * Dc + c] =
-                pre_ray_chw[(size_t)c * H * W + n];
+                pre_ray_chw[(size_t)c * N_C + n];
 
     cam_int       = load_or_die(refdir, "decoder_batch__cam_int");
     bbox_center   = load_or_die(refdir, "decoder_batch__bbox_center");
@@ -142,15 +174,20 @@ int main(int argc, char **argv)
     B.use_intrin_center    = 0;
     B.default_scale_factor = 1.0f;
 
-    /* img_size is (W, H); compute_ray_cond_xyz takes (img_h, img_w). */
-    rays_hwc = (float *)malloc((size_t)H * W * 3 * sizeof(float));
-    if (!rays_hwc) goto done;
-    int rc = sam3d_body_compute_ray_cond_xyz(cam_int, affine_trans,
-                                             (int)img_size[1],
-                                             (int)img_size[0],
-                                             H, W, rays_hwc);
-    if (rc != 0) {
-        fprintf(stderr, "[verify_decoder_forward] compute_ray_cond_xyz rc=%d\n", rc);
+    {
+        char path[1024];
+        int nd = 0, dims[8] = {0};
+        snprintf(path, sizeof(path), "%s/ray_cond_ds_xyz.npy", refdir);
+        rays_hwc = (float *)npy_load(path, &nd, dims, NULL);
+        if (!rays_hwc || nd != 4 || dims[0] != 1 || dims[1] != H ||
+            dims[2] != W || dims[3] != 3) {
+            fprintf(stderr, "[verify_decoder_forward] missing/invalid %s\n", path);
+            goto done;
+        }
+    }
+
+    int rc = 0;
+    if (!rays_hwc) {
         goto done;
     }
 

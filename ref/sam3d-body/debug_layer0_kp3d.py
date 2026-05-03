@@ -35,8 +35,18 @@ def main() -> int:
     ap.add_argument("--refdir", default="/tmp/sam3d_body_ref")
     args = ap.parse_args()
 
-    sys.path.insert(0, "/tmp/sam-3d-body")
-    from sam_3d_body import load_sam_3d_body  # type: ignore
+    for cand in ("/tmp/sam-3d-body", os.environ.get("SAM_3D_BODY_DIR", "")):
+        if cand and os.path.isdir(cand) and cand not in sys.path:
+            sys.path.insert(0, cand)
+    try:
+        from sam_3d_body import load_sam_3d_body  # type: ignore
+    except Exception as e:
+        print("cannot import sam_3d_body. Set SAM_3D_BODY_DIR or restore "
+              "/tmp/sam-3d-body with: git clone --depth 1 "
+              "https://github.com/facebookresearch/sam-3d-body "
+              "/tmp/sam-3d-body",
+              file=sys.stderr)
+        raise e
 
     ckpt = os.path.join(args.local_ckpt_dir, "model.ckpt")
     mhr_path = os.path.join(args.local_ckpt_dir, "assets", "mhr_model.pt")

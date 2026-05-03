@@ -34,9 +34,27 @@ static float *load_or_die(const char *refdir, const char *name)
     return d;
 }
 
+static float *load_or_die_dims(const char *refdir, const char *name,
+                               int *out_nd, int out_dims[8])
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.npy", refdir, name);
+    float *d = (float *)npy_load(path, out_nd, out_dims, NULL);
+    if (!d) {
+        fprintf(stderr, "[cuda verify_kp_update] missing %s\n", path);
+        return NULL;
+    }
+    return d;
+}
+
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
 {
+    if (n == 0) {
+        fprintf(stderr, "[cuda verify_kp_update] %-40s empty diff FAIL\n",
+                label);
+        return 1;
+    }
     double sum = 0.0; float mx = 0.0f; size_t mxi = 0;
     for (size_t i = 0; i < n; i++) {
         float d = fabsf(a[i] - b[i]);
@@ -60,12 +78,22 @@ int main(int argc, char **argv)
     float threshold = 5e-4f;
     int one_layer = -1, device = 0, verbose = 0;
     const char *precision = "bf16";
+    cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir") && i+1 < argc) refdir = argv[++i];
         else if (!strcmp(argv[i], "--threshold") && i+1 < argc) threshold = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--layer") && i+1 < argc) one_layer = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            const char *v = argv[++i];
+            if      (!strcmp(v, "dinov3")) backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
+            else if (!strcmp(v, "vith"))   backbone = CUDA_SAM3D_BODY_BACKBONE_VITH;
+            else {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--device") && i+1 < argc) device = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--precision") && i+1 < argc) precision = argv[++i];
         else if (!strcmp(argv[i], "-v")) verbose = 1;
@@ -73,7 +101,8 @@ int main(int argc, char **argv)
     }
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
-                        "[--threshold F] [--layer N] [--device N] "
+                        "[--threshold F] [--layer N] "
+                        "[--backbone dinov3|vith] [--device N] "
                         "[--precision bf16|fp16] [-v]\n", argv[0]);
         return 2;
     }
@@ -84,18 +113,29 @@ int main(int argc, char **argv)
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,
+        .backbone        = backbone,
     };
     cuda_sam3d_body_ctx *ctx = cuda_sam3d_body_create(&cfg);
     if (!ctx) { fprintf(stderr, "create failed\n"); return 5; }
 
-    const int N_Q = 145, D = 1024;
-    const int H = 32, W = 32;
+    const int N_Q = 145, D = 1024, C = 1280;
     /* Last layer (5) is short-circuited per upstream guard. */
     int lo = (one_layer >= 0) ? one_layer : 0;
     int hi = (one_layer >= 0) ? one_layer + 1 : 5;
 
-    float *img_emb = load_or_die(refdir, "image_embeddings_after_ray");
+    int img_nd = 0, img_dims[8] = {0};
+    float *img_emb = load_or_die_dims(refdir, "image_embeddings_after_ray",
+                                      &img_nd, img_dims);
     if (!img_emb) { cuda_sam3d_body_destroy(ctx); return 4; }
+    if (img_nd != 4 || img_dims[0] != 1 || img_dims[1] != C ||
+        img_dims[2] <= 0 || img_dims[3] <= 0) {
+        fprintf(stderr,
+                "[cuda verify_kp_update] bad image_embeddings_after_ray "
+                "shape: rank=%d dims=(%d,%d,%d,%d)\n",
+                img_nd, img_dims[0], img_dims[1], img_dims[2], img_dims[3]);
+        free(img_emb); cuda_sam3d_body_destroy(ctx); return 4;
+    }
+    const int H = img_dims[2], W = img_dims[3];
 
     float *tokens  = (float *)malloc((size_t)N_Q * D * sizeof(float));
     float *augment = (float *)malloc((size_t)N_Q * D * sizeof(float));

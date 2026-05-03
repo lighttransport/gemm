@@ -263,7 +263,7 @@ function rotatedSize() {
 function fitToView() {
   if (!STATE.img) return;
   const R = rotatedSize();
-  const cw = canvas.width, ch = canvas.height;
+  const cw = canvas.clientWidth, ch = canvas.clientHeight;
   const pad = 16;
   const s = Math.min((cw - 2*pad) / R.w, (ch - 2*pad) / R.h);
   STATE.zoom = s > 0 ? s : 1;
@@ -280,11 +280,9 @@ function syncCanvasSize() {
   canvas.height = Math.round(ch * dpr);
   canvas.style.width = cw + 'px';
   canvas.style.height = ch + 'px';
-  // work in CSS pixels via transform
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-// Convert screen (canvas CSS) coords to rotated-image coords.
 function screenToImage(sx, sy) {
   const ix = (sx - STATE.tx) / STATE.zoom;
   const iy = (sy - STATE.ty) / STATE.zoom;
@@ -296,54 +294,75 @@ function imageToScreen(ix, iy) {
 }
 
 function drawRotatedImage(c, ox, oy, scale) {
-  // Draws the rotated image so that the top-left of the rotated bounding
-  // box lands at (ox, oy) in `c` coordinates, scaled by `scale`.
+  const R = rotatedSize();
   c.save();
   c.translate(ox, oy);
   c.scale(scale, scale);
-  const R = rotatedSize();
-  // Move to center of rotated box, rotate, draw unrotated image centered at origin.
   c.translate(R.w / 2, R.h / 2);
   c.rotate(STATE.rotation * Math.PI / 180);
   c.drawImage(STATE.img, -STATE.imgW / 2, -STATE.imgH / 2);
   c.restore();
 }
 
+function drawGuides(c, positions, axis, extent, color, widthPx) {
+  if (!positions.length) return;
+  c.strokeStyle = color;
+  c.lineWidth = widthPx;
+  for (const p of positions) {
+    c.beginPath();
+    if (axis === 'h') { c.moveTo(0, p); c.lineTo(extent, p); }
+    else              { c.moveTo(p, 0); c.lineTo(p, extent); }
+    c.stroke();
+  }
+}
+
+let _renderScheduled = false;
 function render() {
+  if (_renderScheduled) return;
+  _renderScheduled = true;
+  requestAnimationFrame(renderNow);
+}
+
+let _lastInfo = '', _lastOverlay = '';
+function setTextIfChanged(el, txt, prev) {
+  if (prev === txt) return prev;
+  el.textContent = txt;
+  return txt;
+}
+function setHtmlIfChanged(el, html, prev) {
+  if (prev === html) return prev;
+  el.innerHTML = html;
+  return html;
+}
+
+function renderNow() {
+  _renderScheduled = false;
   const wcss = canvas.clientWidth, hcss = canvas.clientHeight;
   ctx.clearRect(0, 0, wcss, hcss);
   if (!STATE.img) {
     $('canvas-empty').classList.remove('hide');
-    $('canvas-info').textContent = '';
+    _lastInfo = setTextIfChanged($('canvas-info'), '', _lastInfo);
+    _lastOverlay = setHtmlIfChanged($('overlay-list'), '', _lastOverlay);
     return;
   }
   $('canvas-empty').classList.add('hide');
 
   drawRotatedImage(ctx, STATE.tx, STATE.ty, STATE.zoom);
 
-  // Overlays (in rotated-image coords, so transform to screen).
   ctx.save();
   ctx.translate(STATE.tx, STATE.ty);
   ctx.scale(STATE.zoom, STATE.zoom);
 
   const R = rotatedSize();
-  // Helper lines
-  ctx.lineWidth = 2 / STATE.zoom;
-  ctx.strokeStyle = '#ff4d4f';
-  for (const y of STATE.hlines) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(R.w, y); ctx.stroke();
-  }
-  ctx.strokeStyle = '#13c2c2';
-  for (const x of STATE.vlines) {
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, R.h); ctx.stroke();
-  }
+  const lw = 2 / STATE.zoom;
+  drawGuides(ctx, STATE.hlines, 'h', R.w, '#ff4d4f', lw);
+  drawGuides(ctx, STATE.vlines, 'v', R.h, '#13c2c2', lw);
 
-  // Region
   if (STATE.region) {
     const r = STATE.region;
     ctx.save();
     ctx.strokeStyle = '#ffd666';
-    ctx.lineWidth = 2 / STATE.zoom;
+    ctx.lineWidth = lw;
     ctx.setLineDash([8 / STATE.zoom, 6 / STATE.zoom]);
     ctx.strokeRect(r.x, r.y, r.w, r.h);
     ctx.setLineDash([]);
@@ -353,26 +372,21 @@ function render() {
   }
   ctx.restore();
 
-  // Info strip
-  const info = [];
-  info.push(`${STATE.imgW}×${STATE.imgH}`);
+  const info = [`${STATE.imgW}×${STATE.imgH}`];
   if (STATE.rotation) info.push(`rot ${STATE.rotation}°`);
   info.push(`zoom ${STATE.zoom.toFixed(2)}×`);
   if (STATE.region) {
     const r = STATE.region;
     info.push(`region ${Math.round(r.w)}×${Math.round(r.h)} @(${Math.round(r.x)},${Math.round(r.y)})`);
   }
-  $('canvas-info').textContent = info.join(' · ');
-  renderOverlayList();
-}
+  _lastInfo = setTextIfChanged($('canvas-info'), info.join(' · '), _lastInfo);
 
-function renderOverlayList() {
   const parts = [];
   if (STATE.hlines.length) parts.push(`<b>${STATE.hlines.length}</b> H-line(s)`);
   if (STATE.vlines.length) parts.push(`<b>${STATE.vlines.length}</b> V-line(s)`);
   if (STATE.region)        parts.push(`<b>1</b> region`);
   if (!parts.length)       parts.push('no overlays');
-  $('overlay-list').innerHTML = parts.join(' · ');
+  _lastOverlay = setHtmlIfChanged($('overlay-list'), parts.join(' · '), _lastOverlay);
 }
 
 // -------------- Image load --------------
@@ -413,39 +427,26 @@ $('btn-clear-img').addEventListener('click', () => {
   render();
 });
 
-// -------------- Rotate --------------
+// For 90° rotation of an image (W,H) -> (H,W):
+//   CW:  (x,y) -> (H - y, x)
+//   CCW: (x,y) -> (y, W - x)
 function rotate(dirCW) {
   if (!STATE.img) return;
-  const R = rotatedSize();              // pre-rotation dims
-  // Transform region and lines into new coord system.
-  // CW 90: (x,y) in (W,H) -> (H - y, x) in (H,W) when the content is rotated CW 90.
-  // CCW 90: (x,y) in (W,H) -> (y, W - x) in (H,W).
-  // The "region" rect must also be converted: new top-left and new size.
+  const R = rotatedSize();
+  const oldH = STATE.hlines, oldV = STATE.vlines;
   if (dirCW === +1) {
-    // CW 90
     if (STATE.region) {
       const r = STATE.region;
-      STATE.region = {
-        x: R.h - (r.y + r.h),
-        y: r.x,
-        w: r.h, h: r.w,
-      };
+      STATE.region = { x: R.h - (r.y + r.h), y: r.x, w: r.h, h: r.w };
     }
-    STATE.hlines = STATE.hlines.map(y => R.h - y);  // becomes vertical
-    STATE.vlines = STATE.vlines.map(x => x);        // becomes horizontal
-    const swap = STATE.hlines; STATE.hlines = STATE.vlines; STATE.vlines = swap;
+    STATE.hlines = oldV.map(x => x);
+    STATE.vlines = oldH.map(y => R.h - y);
     STATE.rotation = (STATE.rotation + 90) % 360;
   } else {
-    // CCW 90
     if (STATE.region) {
       const r = STATE.region;
-      STATE.region = {
-        x: r.y,
-        y: R.w - (r.x + r.w),
-        w: r.h, h: r.w,
-      };
+      STATE.region = { x: r.y, y: R.w - (r.x + r.w), w: r.h, h: r.w };
     }
-    const oldH = STATE.hlines, oldV = STATE.vlines;
     STATE.hlines = oldV.map(x => R.w - x);
     STATE.vlines = oldH.map(y => y);
     STATE.rotation = (STATE.rotation + 270) % 360;
@@ -527,7 +528,6 @@ canvas.addEventListener('mousedown', (e) => {
     STATE.dragging = { kind: 'region', x0: ip.x, y0: ip.y };
     return;
   }
-  // pan
   STATE.dragging = { kind: 'pan', sx, sy, tx0: STATE.tx, ty0: STATE.ty };
   canvas.classList.add('panning');
 });
@@ -577,9 +577,7 @@ window.addEventListener('resize', () => {
   });
 });
 
-// -------------- Export (canvas -> PNG base64) --------------
-// Rasterize the rotated image (optionally cropped to region), burn lines on
-// top, downscale so max dim <= MAX_SEND so the VLM doesn't choke on big inputs.
+// -------------- Export --------------
 const MAX_SEND = 1024;
 
 function exportAsPng(mode, burnLines) {
@@ -593,7 +591,6 @@ function exportAsPng(mode, burnLines) {
     srcW = Math.max(1, Math.round(Math.min(R.w - srcX, r.w)));
     srcH = Math.max(1, Math.round(Math.min(R.h - srcY, r.h)));
   }
-  // Target size: downscale so max dim <= MAX_SEND, keep aspect.
   let outW = srcW, outH = srcH;
   const longest = Math.max(outW, outH);
   if (longest > MAX_SEND) {
@@ -601,43 +598,42 @@ function exportAsPng(mode, burnLines) {
     outW = Math.max(1, Math.round(outW * s));
     outH = Math.max(1, Math.round(outH * s));
   }
+
+  const stage = document.createElement('canvas');
+  stage.width = R.w; stage.height = R.h;
+  const sc = stage.getContext('2d');
+  drawRotatedImage(sc, 0, 0, 1);
+  if (burnLines) {
+    const lw = Math.max(1.5, Math.round(Math.min(R.w, R.h) / 400));
+    drawGuides(sc, STATE.hlines, 'h', R.w, '#ff2d2f', lw);
+    drawGuides(sc, STATE.vlines, 'v', R.h, '#11c8c8', lw);
+  }
+
   const off = document.createElement('canvas');
   off.width = outW; off.height = outH;
   const c = off.getContext('2d');
   c.imageSmoothingQuality = 'high';
   c.fillStyle = '#000';
   c.fillRect(0, 0, outW, outH);
-
-  // Draw the rotated image into a staging canvas, then crop.
-  const stage = document.createElement('canvas');
-  stage.width = R.w; stage.height = R.h;
-  const sc = stage.getContext('2d');
-  sc.save();
-  sc.translate(R.w / 2, R.h / 2);
-  sc.rotate(STATE.rotation * Math.PI / 180);
-  sc.drawImage(STATE.img, -STATE.imgW / 2, -STATE.imgH / 2);
-  sc.restore();
-
-  if (burnLines) {
-    // Lines drawn in rotated full-image coords so cropping preserves them.
-    sc.lineWidth = Math.max(1.5, Math.round(Math.min(R.w, R.h) / 400));
-    sc.strokeStyle = '#ff2d2f';
-    for (const y of STATE.hlines) {
-      sc.beginPath(); sc.moveTo(0, y); sc.lineTo(R.w, y); sc.stroke();
-    }
-    sc.strokeStyle = '#11c8c8';
-    for (const x of STATE.vlines) {
-      sc.beginPath(); sc.moveTo(x, 0); sc.lineTo(x, R.h); sc.stroke();
-    }
-  }
-
   c.drawImage(stage, srcX, srcY, srcW, srcH, 0, 0, outW, outH);
-  return { dataUrl: off.toDataURL('image/png'), w: outW, h: outH };
+  return { canvas: off, w: outW, h: outH };
+}
+
+function canvasToPngDataUrl(cv) {
+  return new Promise((resolve, reject) => {
+    cv.toBlob(blob => {
+      if (!blob) { reject(new Error('toBlob failed')); return; }
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = () => reject(new Error('FileReader failed'));
+      fr.readAsDataURL(blob);
+    }, 'image/png');
+  });
 }
 
 // -------------- Chat --------------
-let HISTORY = [];           // [{role: 'user'|'assistant', text, thumbDataUrl?}]
-let CURRENT = null;         // { controller, assistantEl }
+let HISTORY = [];
+let CURRENT = null;
 
 function pushTurnToUI(turn, {running=false, errored=false} = {}) {
   const hist = $('history');
@@ -646,14 +642,14 @@ function pushTurnToUI(turn, {running=false, errored=false} = {}) {
   const role = document.createElement('div');
   role.className = 'role';
   const roleLabel = document.createElement('span');
-  roleLabel.textContent = turn.role === 'user' ? 'You' : 'Qwen3.6-VL';
+  const assistantLabel = (ACTIVE.variant && ACTIVE.variant.name) || 'assistant';
+  roleLabel.textContent = turn.role === 'user' ? 'You' : assistantLabel;
   role.appendChild(roleLabel);
-  const statsSpan = document.createElement('span');
-  statsSpan.dataset.stats = '1';
-  statsSpan.style.fontWeight = '600';
-  statsSpan.style.color = '#6a7180';
-  statsSpan.textContent = turn.stats || '';
-  role.appendChild(statsSpan);
+  const stats = document.createElement('span');
+  stats.style.fontWeight = '600';
+  stats.style.color = '#6a7180';
+  stats.textContent = turn.stats || '';
+  role.appendChild(stats);
   div.appendChild(role);
 
   if (turn.thumbDataUrl) {
@@ -664,12 +660,11 @@ function pushTurnToUI(turn, {running=false, errored=false} = {}) {
     div.appendChild(img);
   }
   const body = document.createElement('div');
-  body.className = 'body';
   body.textContent = turn.text || (running ? 'thinking…' : '');
   div.appendChild(body);
   hist.appendChild(div);
   hist.scrollTop = hist.scrollHeight;
-  return { root: div, body };
+  return { root: div, body, stats };
 }
 
 function buildPrompt(userText) {
@@ -698,14 +693,15 @@ async function sendMessage(ev) {
   const burnLines = $('burn-lines').checked;
   const exported = exportAsPng(mode, burnLines);
   if (!exported) { showToast('export failed'); return; }
-  const b64 = exported.dataUrl.split(',', 2)[1] || '';
+  let dataUrl;
+  try { dataUrl = await canvasToPngDataUrl(exported.canvas); }
+  catch (err) { showToast('png encode failed: ' + err.message); return; }
+  const b64 = dataUrl.split(',', 2)[1] || '';
 
-  // UI: user turn with thumbnail
-  HISTORY.push({ role: 'user', text, thumbDataUrl: exported.dataUrl });
+  HISTORY.push({ role: 'user', text, thumbDataUrl: dataUrl });
   pushTurnToUI(HISTORY[HISTORY.length - 1]);
   $('prompt').value = '';
 
-  // UI: placeholder assistant turn
   const asst = { role: 'assistant', text: '', stats: '' };
   const nodes = pushTurnToUI(asst, { running: true });
 
@@ -742,8 +738,7 @@ async function sendMessage(ev) {
     asst.stats = `${asst.text.length} chars · ${gen} ms gen · ${dt} ms total`;
     nodes.root.classList.remove('running');
     nodes.body.textContent = asst.text || '(empty)';
-    const statSpan = nodes.root.querySelector('[data-stats]');
-    if (statSpan) statSpan.textContent = asst.stats;
+    nodes.stats.textContent = asst.stats;
     HISTORY.push(asst);
     $('status-text').innerHTML = `<span class="pill">done · ${gen} ms</span>`;
   } catch (e) {
