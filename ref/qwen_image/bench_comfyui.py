@@ -85,7 +85,9 @@ def bench(h, w, n_steps, label):
 
 r1 = bench(256, 256, 10, "256-10")
 r2 = bench(512, 512, 4,  "512-4")
+r3 = bench(1024, 1024, 2, "1024-2")
 
 print("\n=== summary ===")
-print(f"256x256 10-step:  {r1[0]:.2f}s total, {r1[1]:.3f}s/step")
-print(f"512x512  4-step:  {r2[0]:.2f}s total, {r2[1]:.3f}s/step")
+print(f"256x256  10-step: {r1[0]:.2f}s total, {r1[1]:.3f}s/step")
+print(f"512x512   4-step: {r2[0]:.2f}s total, {r2[1]:.3f}s/step")
+print(f"1024x1024 2-step: {r3[0]:.2f}s total, {r3[1]:.3f}s/step")

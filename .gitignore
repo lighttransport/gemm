@@ -140,3 +140,4 @@ server/run-*.local.sh
 
 # RDNA4 FP8: extracted hipBLASLt Tensile kernel ELF (regenerate via rdna4/fp8/extract_fp8_kernel.sh)
 rdna4/fp8/fp8_kernel_gfx1201.co
+third_party/
