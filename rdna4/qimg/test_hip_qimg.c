@@ -126,6 +126,46 @@ static float *load_f32_bin(const char *path, size_t n_elems) {
     return buf;
 }
 
+static int write_f32_bin(const char *path, const float *data, size_t n_elems) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "Cannot write %s\n", path);
+        return -1;
+    }
+    size_t n = fwrite(data, sizeof(float), n_elems, fp);
+    fclose(fp);
+    if (n != n_elems) {
+        fprintf(stderr, "Short write to %s (%zu/%zu)\n", path, n, n_elems);
+        return -1;
+    }
+    return 0;
+}
+
+static void compare_f32_arrays(const char *label, const float *ref, const float *ours, size_t n) {
+    double dot = 0.0, nr = 0.0, no = 0.0, mse = 0.0, mae = 0.0;
+    float maxd = 0.0f, peak = 0.0f;
+    size_t max_i = 0;
+    for (size_t i = 0; i < n; i++) {
+        double r = ref[i], o = ours[i];
+        double d = fabs(r - o);
+        if ((float)d > maxd) { maxd = (float)d; max_i = i; }
+        if (fabs(ref[i]) > peak) peak = fabs(ref[i]);
+        dot += r * o;
+        nr += r * r;
+        no += o * o;
+        mse += d * d;
+        mae += d;
+    }
+    mse /= (double)n;
+    mae /= (double)n;
+    double cos = dot / (sqrt(nr) * sqrt(no) + 1e-30);
+    double psnr = 20.0 * log10((double)(peak > 1e-20f ? peak : 1e-20f))
+                - 10.0 * log10(mse > 1e-30 ? mse : 1e-30);
+    fprintf(stderr,
+            "%s: n=%zu cos=%.6f mae=%.6f rmse=%.6f max=%.6f@%zu psnr_peak=%.2f dB\n",
+            label, n, cos, mae, sqrt(mse), maxd, max_i, psnr);
+}
+
 /* Load text hidden states from raw F32 file (any token count, fixed dim). */
 static float *load_txt_bin(const char *path, int *n_tok, int txt_dim) {
     FILE *fp = fopen(path, "rb");
@@ -156,13 +196,29 @@ int main(int argc, char **argv) {
     const char *mode = NULL;
     const char *init_bin_path = NULL;
     const char *txt_bin_path = NULL;
+    const char *neg_txt_bin_path = NULL;
     const char *sigmas_bin_path = NULL;
     const char *dump_final_path = NULL;
+    const char *dump_steps_prefix = NULL;
+    const char *ref_final_path = NULL;
+    const char *negative = " ";
     int skip_unstd = 0;   /* skip latent un-standardization (e.g. when init came pre-normalized) */
+    int path_stats = 0;
+    int mem_stats = 0;
+    int quant_stats = 0;
+    int quant_stats_max = 80;
+    const char *fp8_fp8_allow = NULL;
+    const char *fp8_fp8_deny = NULL;
+    int fp8_fp8_block_min = -1;
+    int fp8_fp8_block_max = -1;
+    float fp8_quality_target_db = 0.0f;
+    float fp8_act_scale_div = 0.0f;
+    const char *fp8_act_scale_mode = NULL;
     int device_id = 0;
     int verbose = 1;
     int out_h = 256, out_w = 256, n_steps = 20;
     uint64_t seed = 42;
+    float cfg_scale = 1.0f;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--test-init")) mode = "init";
@@ -174,6 +230,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vae") && i+1 < argc) vae_path = argv[++i];
         else if (!strcmp(argv[i], "--enc") && i+1 < argc) enc_path = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i+1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--negative") && i+1 < argc) negative = argv[++i];
+        else if (!strcmp(argv[i], "--cfg") && i+1 < argc) cfg_scale = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cfg-scale") && i+1 < argc) cfg_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--height") && i+1 < argc) out_h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--width") && i+1 < argc) out_w = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--steps") && i+1 < argc) n_steps = atoi(argv[++i]);
@@ -183,17 +242,70 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-v")) verbose = 2;
         else if (!strcmp(argv[i], "--init-bin") && i+1 < argc) init_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--txt-bin") && i+1 < argc) txt_bin_path = argv[++i];
+        else if (!strcmp(argv[i], "--neg-txt-bin") && i+1 < argc) neg_txt_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--sigmas-bin") && i+1 < argc) sigmas_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-final") && i+1 < argc) dump_final_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-steps-prefix") && i+1 < argc) dump_steps_prefix = argv[++i];
+        else if (!strcmp(argv[i], "--ref-final") && i+1 < argc) ref_final_path = argv[++i];
+        else if (!strcmp(argv[i], "--verify-final") && i+1 < argc) { mode = "gen"; ref_final_path = argv[++i]; }
         else if (!strcmp(argv[i], "--skip-unstd")) skip_unstd = 1;
+        else if (!strcmp(argv[i], "--path-stats")) path_stats = 1;
+        else if (!strcmp(argv[i], "--mem-stats")) mem_stats = 1;
+        else if (!strcmp(argv[i], "--fp8-quant-stats")) quant_stats = 1;
+        else if (!strcmp(argv[i], "--fp8-quant-stats-max") && i+1 < argc) quant_stats_max = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fp8-fp8-allow") && i+1 < argc) fp8_fp8_allow = argv[++i];
+        else if (!strcmp(argv[i], "--fp8-fp8-deny") && i+1 < argc) fp8_fp8_deny = argv[++i];
+        else if (!strcmp(argv[i], "--fp8-fp8-block-min") && i+1 < argc) fp8_fp8_block_min = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fp8-fp8-block-max") && i+1 < argc) fp8_fp8_block_max = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fp8-quality-target-db") && i+1 < argc) fp8_quality_target_db = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--fp8-act-scale-div") && i+1 < argc) fp8_act_scale_div = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--fp8-act-scale-mode") && i+1 < argc) fp8_act_scale_mode = argv[++i];
         else {
             fprintf(stderr, "Usage: %s --test-init|--test-dit|--test-vae|--generate\n"
                     "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
                     "  --height <h>  --width <w>  --steps <n>  --seed <s>\n"
+                    "  [--cfg <scale> --negative <text>] [--neg-txt-bin <bin>]\n"
+                    "  [--dump-steps-prefix <pfx>] [--ref-final <bin>] [--path-stats] [--mem-stats]\n"
+                    "  [--fp8-quant-stats] [--fp8-fp8-allow <labels>] [--fp8-fp8-deny <labels>]\n"
+                    "  [--fp8-fp8-block-min <i>] [--fp8-fp8-block-max <i>]\n"
+                    "  [--fp8-quality-target-db <db>]\n"
+                    "  [--fp8-act-scale-div <x>] [--fp8-act-scale-mode perrow|comfy|clamp]\n"
                     "  [-o out.ppm] [-d dev] [-v]\n", argv[0]);
             return 1;
         }
     }
+
+    if (path_stats) setenv("QIMG_PATH_STATS", "1", 1);
+    if (mem_stats) setenv("QIMG_MEM_STATS", "1", 1);
+    if (quant_stats) setenv("QIMG_FP8_QUANT_STATS", "1", 1);
+    if (quant_stats && quant_stats_max > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", quant_stats_max);
+        setenv("QIMG_FP8_QUANT_STATS_MAX", buf, 1);
+    }
+    if (fp8_fp8_allow) setenv("QIMG_FP8_FP8_ALLOW", fp8_fp8_allow, 1);
+    if (fp8_fp8_deny) setenv("QIMG_FP8_FP8_DENY", fp8_fp8_deny, 1);
+    if (fp8_fp8_block_min >= 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", fp8_fp8_block_min);
+        setenv("QIMG_FP8_FP8_BLOCK_MIN", buf, 1);
+    }
+    if (fp8_fp8_block_max >= 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", fp8_fp8_block_max);
+        setenv("QIMG_FP8_FP8_BLOCK_MAX", buf, 1);
+    }
+    if (fp8_quality_target_db > 0.0f) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.8g", fp8_quality_target_db);
+        setenv("QIMG_FP8_QUALITY_TARGET_DB", buf, 1);
+    }
+    if (fp8_act_scale_div > 0.0f) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.8g", fp8_act_scale_div);
+        setenv("QIMG_FP8_ACT_SCALE_DIV", buf, 1);
+    }
+    if (fp8_act_scale_mode) setenv("QIMG_FP8_ACT_SCALE_MODE", fp8_act_scale_mode, 1);
 
     if (!mode) {
         fprintf(stderr, "Error: specify a mode (--test-init, --test-dit, --test-vae, --generate)\n");
@@ -210,27 +322,39 @@ int main(int argc, char **argv) {
      * 3. Load DiT weights into already-compiled qimg module
      * This avoids the ROCm bug where hipModuleLoadData fails after
      * another module was loaded then unloaded in the same process. */
-    extern int g_hip_initialized;
     int n_txt_precomputed = 0;
     float *txt_precomputed = NULL;
+    int n_txt_neg_precomputed = 0;
+    float *txt_neg_precomputed = NULL;
+    int use_cfg = fabsf(cfg_scale - 1.0f) > 1e-6f;
 
     /* Init HIP + compile qimg kernels FIRST */
     hip_qimg_runner *r = hip_qimg_init(device_id, verbose);
 
     /* Now run GPU text encoder (LLM module loads as second module — this works) */
-    if (r && !strcmp(mode, "gen") && enc_path) {
+    if (r && !strcmp(mode, "gen") && enc_path &&
+        (!txt_bin_path || (use_cfg && !neg_txt_bin_path))) {
         fprintf(stderr, "\n[1/3] Text conditioning (GPU)...\n");
         clock_t enc_t0 = clock();
         qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, NULL, device_id);
         if (enc) {
-            fprintf(stderr, "  Encoding: \"%s\"\n", prompt);
-            txt_precomputed = qimg_text_enc_encode(enc, prompt, &n_txt_precomputed);
-            if (txt_precomputed)
-                fprintf(stderr, "  Text hidden: [%d, 3584] (%.1fs)\n",
-                        n_txt_precomputed, (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+            if (!txt_bin_path) {
+                fprintf(stderr, "  Encoding: \"%s\"\n", prompt);
+                txt_precomputed = qimg_text_enc_encode(enc, prompt, &n_txt_precomputed);
+                if (txt_precomputed)
+                    fprintf(stderr, "  Text hidden: [%d, 3584] (%.1fs)\n",
+                            n_txt_precomputed, (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+            }
+            if (use_cfg && !neg_txt_bin_path) {
+                fprintf(stderr, "  Encoding negative: \"%s\"\n", negative);
+                txt_neg_precomputed = qimg_text_enc_encode(enc, negative, &n_txt_neg_precomputed);
+                if (txt_neg_precomputed)
+                    fprintf(stderr, "  Negative hidden: [%d, 3584] (%.1fs total)\n",
+                            n_txt_neg_precomputed, (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+            }
             qimg_text_enc_free(enc);
         }
-        if (!txt_precomputed)
+        if (!txt_bin_path && !txt_precomputed)
             fprintf(stderr, "  GPU text encoder failed, will use CPU fallback\n");
     }
     if (!r) { fprintf(stderr, "Init failed\n"); return 1; }
@@ -377,6 +501,8 @@ int main(int argc, char **argv) {
         /* 1. Text encoder — pinned --txt-bin > GPU encoder > CPU fallback > random */
         int n_txt = 0;
         float *txt_tokens = NULL;
+        int n_txt_neg = 0;
+        float *txt_tokens_neg = NULL;
 
         if (txt_bin_path) {
             txt_tokens = load_txt_bin(txt_bin_path, &n_txt, txt_dim);
@@ -397,6 +523,14 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "  Text hidden: [%d, %d] (%.1fs)\n",
                             n_txt, txt_dim,
                             (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+                if (use_cfg && !neg_txt_bin_path) {
+                    fprintf(stderr, "  Encoding negative: \"%s\"\n", negative);
+                    txt_tokens_neg = qimg_text_enc_encode(enc, negative, &n_txt_neg);
+                    if (txt_tokens_neg)
+                        fprintf(stderr, "  Negative hidden: [%d, %d] (%.1fs total)\n",
+                                n_txt_neg, txt_dim,
+                                (double)(clock()-enc_t0)/CLOCKS_PER_SEC);
+                }
                 qimg_text_enc_free(enc);
             }
         }
@@ -406,6 +540,30 @@ int main(int argc, char **argv) {
             rng_state = seed + 1;
             txt_tokens = (float *)calloc((size_t)n_txt * txt_dim, sizeof(float));
             for (int i = 0; i < n_txt * txt_dim; i++) txt_tokens[i] = randn() * 0.1f;
+        }
+        if (use_cfg) {
+            if (neg_txt_bin_path) {
+                txt_tokens_neg = load_txt_bin(neg_txt_bin_path, &n_txt_neg, txt_dim);
+                if (!txt_tokens_neg) { hip_qimg_free(r); return 1; }
+            } else if (txt_neg_precomputed) {
+                txt_tokens_neg = txt_neg_precomputed;
+                n_txt_neg = n_txt_neg_precomputed;
+                txt_neg_precomputed = NULL;
+            } else if (enc_path) {
+                fprintf(stderr, "\n[1/3] Negative text conditioning (CPU fallback)...\n");
+                qimg_text_enc *enc = qimg_text_enc_load(enc_path);
+                if (enc) {
+                    txt_tokens_neg = qimg_text_enc_encode(enc, negative, &n_txt_neg);
+                    qimg_text_enc_free(enc);
+                }
+            }
+            if (!txt_tokens_neg) {
+                fprintf(stderr, "  No negative text encoder output -- using blank random-free conditioning\n");
+                n_txt_neg = 1;
+                txt_tokens_neg = (float *)calloc((size_t)n_txt_neg * txt_dim, sizeof(float));
+            }
+            fprintf(stderr, "  CFG enabled: scale=%.3f cond_tokens=%d uncond_tokens=%d\n",
+                    cfg_scale, n_txt, n_txt_neg);
         }
 
         /* 2. Initial latent: pinned --init-bin (already packed) > random+patchify */
@@ -450,6 +608,7 @@ int main(int argc, char **argv) {
         }
 
         float *vel = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
+        float *vel_uncond = use_cfg ? (float *)malloc((size_t)n_img * in_ch * sizeof(float)) : NULL;
 
         fprintf(stderr, "Generating %dx%d image with %d steps...\n", out_w, out_h, n_steps);
         t0 = clock();
@@ -458,11 +617,26 @@ int main(int argc, char **argv) {
             float t = sched.sigmas[step] * 1000.0f;
             float dt = sched.dt[step];
 
-            hip_qimg_dit_step(r, img_tokens, n_img, txt_tokens, n_txt, t, vel);
+            if (use_cfg) {
+                hip_qimg_dit_step(r, img_tokens, n_img, txt_tokens_neg, n_txt_neg, t, vel_uncond);
+                hip_qimg_dit_step(r, img_tokens, n_img, txt_tokens, n_txt, t, vel);
+                for (int i = 0; i < n_img * in_ch; i++)
+                    vel[i] = vel_uncond[i] + cfg_scale * (vel[i] - vel_uncond[i]);
+            } else {
+                hip_qimg_dit_step(r, img_tokens, n_img, txt_tokens, n_txt, t, vel);
+            }
 
             /* Euler step: img_tokens += dt * vel */
             for (int i = 0; i < n_img * in_ch; i++)
                 img_tokens[i] += dt * vel[i];
+
+            if (dump_steps_prefix) {
+                char step_path[1024];
+                snprintf(step_path, sizeof(step_path), "%s_step%03d.bin",
+                         dump_steps_prefix, step);
+                if (write_f32_bin(step_path, img_tokens, (size_t)n_img * in_ch) == 0)
+                    fprintf(stderr, "  dumped %s\n", step_path);
+            }
 
             fprintf(stderr, "  step %d/%d: t=%.1f dt=%.4f\n", step+1, n_steps, t, dt);
         }
@@ -472,11 +646,15 @@ int main(int argc, char **argv) {
                 (double)(clock()-t0)/CLOCKS_PER_SEC/n_steps);
 
         if (dump_final_path) {
-            FILE *fp = fopen(dump_final_path, "wb");
-            if (fp) {
-                fwrite(img_tokens, sizeof(float), (size_t)n_img * in_ch, fp);
-                fclose(fp);
+            if (write_f32_bin(dump_final_path, img_tokens, (size_t)n_img * in_ch) == 0)
                 fprintf(stderr, "  dumped final packed latent to %s\n", dump_final_path);
+        }
+        if (ref_final_path) {
+            float *ref_final = load_f32_bin(ref_final_path, (size_t)n_img * in_ch);
+            if (ref_final) {
+                compare_f32_arrays("Final packed latent", ref_final, img_tokens,
+                                   (size_t)n_img * in_ch);
+                free(ref_final);
             }
         }
 
@@ -518,7 +696,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "No VAE specified, skipping decode\n");
         }
 
-        free(latent); free(img_tokens); free(txt_tokens); free(vel);
+        free(latent); free(img_tokens); free(txt_tokens); free(txt_tokens_neg);
+        free(vel); free(vel_uncond);
         hip_qimg_free(r); return 0;
     }
 

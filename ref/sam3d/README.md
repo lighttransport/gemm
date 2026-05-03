@@ -194,6 +194,9 @@ for a quick numerics gate when you don't have access to a CUDA host.
 
 ## Deferred
 
+* MoGe depth model — `gen_image_ref.py` accepts `--pointmap pmap.npy`
+  to bypass MoGe; the C runner's `--pointmap` flag picks up the same
+  `.npy`. See `moge_pointmap.py` above for generating one.
 * SLAT mesh decoder: native SDF/deformation/vertex-RGB and
   FlexiCubes-style beta/alpha/gamma topology extraction are wired in the
   CUDA CLI via `--mesh-source slat`; upstream ambiguity/check-table
