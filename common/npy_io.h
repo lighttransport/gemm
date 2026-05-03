@@ -29,7 +29,7 @@
  * 'u1' = 1 byte. Other tags read 1 byte/element (caller's
  * responsibility to verify *is_f32 if they expect float).
  */
-static void *npy_load(const char *path, int *ndim, int *dims, int *is_f32) {
+static inline void *npy_load(const char *path, int *ndim, int *dims, int *is_f32) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 8, SEEK_SET);
@@ -68,8 +68,8 @@ static void *npy_load(const char *path, int *ndim, int *dims, int *is_f32) {
 
 /* Element-wise max/mean abs-diff between two f32 arrays of length n.
  * Returns max_abs; writes mean_abs to *mean_out if non-NULL. */
-static float npy_max_abs_f32(const float *a, const float *b, int n,
-                             double *mean_out)
+static inline float npy_max_abs_f32(const float *a, const float *b, int n,
+                                    double *mean_out)
 {
     double sum = 0.0;
     float mx = 0.0f;

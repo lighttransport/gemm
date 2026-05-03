@@ -14,9 +14,9 @@
  *                   [--threshold F] [-t N] [-v]
  *
  * Expects in $REFDIR:
- *   ray_cond__image_embeddings_pre_ray.npy  (1,1280,32,32) f32
- *   ray_cond_ds_xyz.npy                     (1,32,32,3)    f32
- *   image_embeddings_after_ray.npy          (1,1280,32,32) f32
+ *   ray_cond__image_embeddings_pre_ray.npy  (1,1280,H,W) f32
+ *   ray_cond_ds_xyz.npy                     (1,H,W,3)    f32
+ *   image_embeddings_after_ray.npy          (1,1280,H,W) f32
  */
 
 #include <math.h>
@@ -29,9 +29,27 @@
 #include "sam3d_body_decoder.h"
 #include "npy_io.h"
 
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 const char *tag, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
+    const char *backbone = "dinov3";
     /* 1×1 conv over 1379 channels + LN2d accumulates ~1e-3 max_abs in
      * f32 vs the fp32 reference. mean_abs is ~1.5e-4 (~0.05% of typical
      * feature magnitude). Gates set at the observed f32 floor. */
@@ -41,13 +59,22 @@ int main(int argc, char **argv)
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            backbone = argv[++i];
+            if (strcmp(backbone, "dinov3") && strcmp(backbone, "vith")) {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n",
+                        backbone);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir <dir> --refdir <dir> "
-                "[--threshold F] [-t N] [-v]\n", argv[0]);
+                "[--threshold F] [--backbone dinov3|vith] [-t N] [-v]\n",
+                argv[0]);
         return 2;
     }
     (void)verbose;
@@ -55,11 +82,10 @@ int main(int argc, char **argv)
     char path[1024];
     int nd = 0, dims[8] = {0};
 
-    /* image_embeddings_pre_ray: (1, 1280, 32, 32) */
     snprintf(path, sizeof(path), "%s/ray_cond__image_embeddings_pre_ray.npy", refdir);
     float *img_emb = (float *)npy_load(path, &nd, dims, NULL);
     if (!img_emb || nd != 4 || dims[0] != 1 || dims[1] != 1280 ||
-        dims[2] != 32 || dims[3] != 32) {
+        dims[2] <= 0 || dims[3] <= 0) {
         fprintf(stderr, "[verify_ray_cond] missing/invalid %s\n", path);
         free(img_emb); return 3;
     }
@@ -82,10 +108,10 @@ int main(int argc, char **argv)
         free(img_emb); free(rays); free(ref); return 3;
     }
 
-    /* Load decoder safetensors (which includes ray_cond_emb weights). */
-    snprintf(path, sizeof(path), "%s/sam3d_body_decoder.safetensors", sft_dir);
     char mhr_path[1024];
-    snprintf(mhr_path, sizeof(mhr_path), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, path, sizeof(path));
+    resolve_variant_path(sft_dir, "mhr_head", backbone,
+                         mhr_path, sizeof(mhr_path));
     sam3d_body_decoder_model *m = sam3d_body_decoder_load(path, mhr_path);
     if (!m) { free(img_emb); free(rays); free(ref); return 5; }
 

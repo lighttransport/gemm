@@ -43,6 +43,36 @@ static float *load_or_die(const char *refdir, const char *name)
     return d;
 }
 
+static float *load_or_die_dims(const char *refdir, const char *name,
+                               int *out_nd, int out_dims[8])
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.npy", refdir, name);
+    float *d = (float *)npy_load(path, out_nd, out_dims, NULL);
+    if (!d) {
+        fprintf(stderr, "[verify_decoder_full] missing %s\n", path);
+        return NULL;
+    }
+    return d;
+}
+
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void resolve_variant_path(const char *dir, const char *bucket,
+                                 const char *tag, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "%s/sam3d_body_%s_%s.safetensors",
+             dir, tag, bucket);
+    if (file_exists(out)) return;
+    snprintf(out, out_sz, "%s/sam3d_body_%s.safetensors", dir, bucket);
+}
+
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
 {
@@ -63,6 +93,7 @@ static int diff_pair(const char *label, const float *a, const float *b,
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *mhr_dir = NULL, *refdir = NULL;
+    const char *backbone = "dinov3";
     float threshold = 5e-3f;
     int n_threads = 1;
     for (int i = 1; i < argc; i++) {
@@ -70,12 +101,21 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--mhr-assets")      && i+1 < argc) mhr_dir = argv[++i];
         else if (!strcmp(argv[i], "--refdir")          && i+1 < argc) refdir  = argv[++i];
         else if (!strcmp(argv[i], "--threshold")       && i+1 < argc) threshold = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--backbone") && i+1 < argc) {
+            backbone = argv[++i];
+            if (strcmp(backbone, "dinov3") && strcmp(backbone, "vith")) {
+                fprintf(stderr, "unknown --backbone %s (use dinov3|vith)\n",
+                        backbone);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!sft_dir || !mhr_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir <dir> --mhr-assets <dir> "
-                "--refdir <dir> [--threshold F] [-t N]\n", argv[0]);
+                "--refdir <dir> [--threshold F] [--backbone dinov3|vith] "
+                "[-t N]\n", argv[0]);
         return 2;
     }
 
@@ -92,8 +132,8 @@ int main(int argc, char **argv)
     memset(&r, 0, sizeof(r));
 
     char p[1024], p2[1024];
-    snprintf(p,  sizeof(p),  "%s/sam3d_body_decoder.safetensors", sft_dir);
-    snprintf(p2, sizeof(p2), "%s/sam3d_body_mhr_head.safetensors", sft_dir);
+    resolve_variant_path(sft_dir, "decoder", backbone, p, sizeof(p));
+    resolve_variant_path(sft_dir, "mhr_head", backbone, p2, sizeof(p2));
     m = sam3d_body_decoder_load(p, p2);
     if (!m) goto done;
 
@@ -102,17 +142,27 @@ int main(int argc, char **argv)
     mhr = sam3d_body_mhr_load(p, p2);
     if (!mhr) goto done;
 
-    const int H = 32, W = 32;
     const int Dc = m->kv_dim;
     const int K = m->n_keypoints;
     const int V = 18439;
     const int NL = m->n_layers;  /* 6 */
 
-    img_emb     = load_or_die(refdir, "image_embeddings_after_ray");
-    ctx_pe_tok  = load_or_die(refdir, "decoder_layer0_in__context_pe");
+    int img_nd = 0, img_dims[8] = {0};
+    int pe_nd = 0, pe_dims[8] = {0};
+    img_emb = load_or_die_dims(refdir, "image_embeddings_after_ray",
+                               &img_nd, img_dims);
+    ctx_pe_tok = load_or_die_dims(refdir, "decoder_layer0_in__context_pe",
+                                  &pe_nd, pe_dims);
     init_x      = load_or_die(refdir, "decoder_layer0_in__x");
     init_xpe    = load_or_die(refdir, "decoder_layer0_in__x_pe");
     if (!img_emb || !ctx_pe_tok || !init_x || !init_xpe) goto done;
+    if (img_nd != 4 || pe_nd != 3 || img_dims[1] != Dc ||
+        pe_dims[1] != img_dims[2] * img_dims[3] ||
+        pe_dims[2] != Dc) {
+        fprintf(stderr, "[verify_decoder_full] bad image/context shape\n");
+        goto done;
+    }
+    const int H = img_dims[2], W = img_dims[3];
 
     /* ctx_pe is dumped in token form (1, 1024, 1280) — permute back to CHW. */
     image_pe_chw = (float *)malloc((size_t)Dc * H * W * sizeof(float));
