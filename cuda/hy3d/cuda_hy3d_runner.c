@@ -288,6 +288,8 @@ typedef struct {
     CUdeviceptr moe_expert_fc2_w_scale[DIT_N_EXPERTS];
     CUdeviceptr moe_shared_fc1_w, moe_shared_fc1_b;
     CUdeviceptr moe_shared_fc2_w, moe_shared_fc2_b;
+    CUdeviceptr moe_shared_fc1_w_fp8, moe_shared_fc1_w_scale;
+    CUdeviceptr moe_shared_fc2_w_fp8, moe_shared_fc2_w_scale;
     /* Skip connection (blocks 11-20) */
     int use_skip;
     CUdeviceptr skip_linear_w, skip_linear_b; /* [2048, 4096] */
@@ -1002,6 +1004,20 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
                                              &b->moe_expert_fc2_w_scale[e]) == 0)
                         { n_quant++; bytes += fc2_n; }
                 }
+                /* Shared expert sees all tokens (dense path); same shapes as
+                 * one MoE expert. */
+                if (b->moe_shared_fc1_w &&
+                    hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                         b->moe_shared_fc1_w, fc1_n,
+                                         &b->moe_shared_fc1_w_fp8,
+                                         &b->moe_shared_fc1_w_scale) == 0)
+                    { n_quant++; bytes += fc1_n; }
+                if (b->moe_shared_fc2_w &&
+                    hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                         b->moe_shared_fc2_w, fc2_n,
+                                         &b->moe_shared_fc2_w_fp8,
+                                         &b->moe_shared_fc2_w_scale) == 0)
+                    { n_quant++; bytes += fc2_n; }
             } else {
                 QFP8(mlp_fc1_w, fc1_n);
                 QFP8(mlp_fc2_w, fc2_n);
@@ -1425,12 +1441,16 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
         }
     }
 
-    /* Step 5: Add shared expert output (reuse d_exp_h/d_exp_o buffers) */
-    op_gemm(ops, stream, d_exp_h, blk->moe_shared_fc1_w, d_input,
-            blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    /* Step 5: Add shared expert output (reuse d_exp_h/d_exp_o buffers).
+     * Same shape as a single MoE expert; per-row FP8 wins on N_tok=4097
+     * (BF16-pipe MT4 needs %256 alignment). */
+    op_gemm_qw(ops, stream, d_exp_h, blk->moe_shared_fc1_w,
+               blk->moe_shared_fc1_w_fp8, blk->moe_shared_fc1_w_scale,
+               d_input, blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
     op_gelu(ops, stream, d_exp_h, N_tok * ffn);
-    op_gemm(ops, stream, d_exp_o, blk->moe_shared_fc2_w, d_exp_h,
-            blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
+    op_gemm_qw(ops, stream, d_exp_o, blk->moe_shared_fc2_w,
+               blk->moe_shared_fc2_w_fp8, blk->moe_shared_fc2_w_scale,
+               d_exp_h, blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
     op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
 }
 
