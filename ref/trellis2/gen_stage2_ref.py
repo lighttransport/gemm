@@ -31,8 +31,11 @@ texgen_sw_rast.install_as_nvdiffrast()
 cumesh_xatlas_shim.install_as_cumesh()
 # Patch transformers' package-distribution map so `is_flash_attn_2_available()`
 # doesn't KeyError on our synthetic flash_attn module.
-from transformers.utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING
-PACKAGE_DISTRIBUTION_MAPPING.setdefault('flash_attn', ['flash-attn'])
+try:
+    from transformers.utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING
+    PACKAGE_DISTRIBUTION_MAPPING.setdefault('flash_attn', ['flash-attn'])
+except ImportError:
+    pass  # older transformers (<5) doesn't have this map; flash_attn shim still works
 flash_attn_sdpa_shim.install_as_flash_attn()
 
 import numpy as np
@@ -116,11 +119,13 @@ def _patch_dinov3_extractor(timm_path: str):
 
     def _extract(self, image):
         import torch.nn.functional as F
-        m = self.model  # DINOv3ViTModel: .embeddings, .rope_embeddings, .model.layer
+        m = self.model  # DINOv3ViTModel: .embeddings, .rope_embeddings, .layer (or .model.layer)
         image = image.to(m.embeddings.patch_embeddings.weight.dtype)
         h = m.embeddings(image, bool_masked_pos=None)
         pe = m.rope_embeddings(image)
-        for layer in m.model.layer:
+        # transformers ≥5 wraps layers in .model.layer; older releases expose .layer directly.
+        layers = m.model.layer if hasattr(m, 'model') else m.layer
+        for layer in layers:
             h = layer(h, position_embeddings=pe)
         return F.layer_norm(h, h.shape[-1:])
 
