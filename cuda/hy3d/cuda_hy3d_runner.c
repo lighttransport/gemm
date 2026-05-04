@@ -293,6 +293,7 @@ typedef struct {
     /* Skip connection (blocks 11-20) */
     int use_skip;
     CUdeviceptr skip_linear_w, skip_linear_b; /* [2048, 4096] */
+    CUdeviceptr skip_linear_w_fp8, skip_linear_w_scale;
     CUdeviceptr skip_norm_w, skip_norm_b;
 } dit_block_gpu;
 
@@ -1018,7 +1019,17 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
                                          &b->moe_shared_fc2_w_fp8,
                                          &b->moe_shared_fc2_w_scale) == 0)
                     { n_quant++; bytes += fc2_n; }
-            } else {
+            }
+            /* Skip-linear (blocks 11-20): [H, 2H] dense GEMM, every fwd pass. */
+            if (b->use_skip && b->skip_linear_w) {
+                size_t skip_n = (size_t)DIT_HIDDEN * (2 * DIT_HIDDEN);
+                if (hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                         b->skip_linear_w, skip_n,
+                                         &b->skip_linear_w_fp8,
+                                         &b->skip_linear_w_scale) == 0)
+                    { n_quant++; bytes += skip_n; }
+            }
+            if (!b->use_moe) {
                 QFP8(mlp_fc1_w, fc1_n);
                 QFP8(mlp_fc2_w, fc2_n);
             }
@@ -1626,8 +1637,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             op_concat_last_dim(ops, stream, d_cat_buf, d_skip_entry, d_hidden, N1, H_dim);
 
             /* x = skip_linear(cat)  -> [N1, H_dim] */
-            op_gemm(ops, stream, d_hidden, blk->skip_linear_w, d_cat_buf,
-                    blk->skip_linear_b, H_dim, 2 * H_dim, N1);
+            op_gemm_qw(ops, stream, d_hidden, blk->skip_linear_w,
+                       blk->skip_linear_w_fp8, blk->skip_linear_w_scale,
+                       d_cat_buf, blk->skip_linear_b, H_dim, 2 * H_dim, N1);
 
             /* x = skip_norm(x) */
             op_layernorm(ops, stream, d_hidden, d_hidden,
