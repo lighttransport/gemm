@@ -400,7 +400,43 @@ struct cuda_hy3d_runner {
 
     /* Load status */
     int dino_loaded, dit_loaded, vae_loaded;
+
+    /* Phase 0 profiling (HY3D_PROFILE=1). Per-phase wall-time accumulators
+     * over the full DiT step loop. Each PROF_END synchronizes the stream,
+     * which serializes within a forward but adds <1ms total per mesh. */
+    int prof_enabled;
+    CUevent prof_ev_a, prof_ev_b;
+    double prof_ms[8];
+    long long prof_n[8];
 };
+
+enum {
+    HY3D_PHA_SKIP = 0,    /* concat + skip-linear GEMM + norm */
+    HY3D_PHA_SELF_ATTN,   /* op_self_attn only */
+    HY3D_PHA_CROSS_ATTN,  /* op_cross_attn only */
+    HY3D_PHA_MLP,         /* MLP fc1 + GELU + fc2 + residual */
+    HY3D_PHA_MOE,         /* run_dit_moe + residual */
+    HY3D_PHA_PROJ,        /* QKV/Q/KV/out projections + concat/split */
+    HY3D_PHA_NORM,        /* layernorms + AdaLN-zero modulation + small ops */
+    HY3D_PHA_COUNT
+};
+static const char *hy3d_phase_names[HY3D_PHA_COUNT] = {
+    "skip", "self_attn", "cross_attn", "mlp", "moe", "proj", "norm_misc"
+};
+
+static inline void hy3d_prof_begin(cuda_hy3d_runner *r) {
+    if (r->prof_enabled) cuEventRecord(r->prof_ev_a, r->stream);
+}
+static inline void hy3d_prof_end(cuda_hy3d_runner *r, int phase) {
+    if (r->prof_enabled) {
+        cuEventRecord(r->prof_ev_b, r->stream);
+        cuEventSynchronize(r->prof_ev_b);
+        float ms = 0.0f;
+        cuEventElapsedTime(&ms, r->prof_ev_a, r->prof_ev_b);
+        r->prof_ms[phase] += (double)ms;
+        r->prof_n[phase]++;
+    }
+}
 
 static int hy3d_should_dump_latent(const struct cuda_hy3d_runner *r, int step1) {
     for (int i = 0; i < r->latent_dump_count; i++) {
@@ -460,7 +496,10 @@ static int hy3d_compile_kernels(cuda_hy3d_runner *r) {
         /* Returns BF16-truncated value as float (high 16 bits = BF16 bits, low 16 = 0).
          * Matches qimg's convention so gemm_bf16_pipe_*_f32 writebacks land
          * with the right interpretation in the F32 output buffer. NaN payload
-         * is preserved as the canonical 0x7FC0_0000 quiet NaN. */
+         * is preserved as the canonical 0x7FC0_0000 quiet NaN.
+         * Tested as identity (return f;) — within-noise change to per-block mae
+         * (b0 2.44e-2 vs 2.47e-2; b20 slightly worse). Truncation isn't the
+         * dominant error source; per-tensor FP8 weight quant is. */
         "__device__ __forceinline__ float to_bf16(float f) {\n"
         "    unsigned int b; memcpy(&b, &f, 4);\n"
         "    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) {\n"
@@ -1476,18 +1515,16 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
     }
 
     /* Step 5: Add shared expert output (reuse d_exp_h/d_exp_o buffers).
-     * Same shape as a single MoE expert; per-row FP8 wins on N_tok=4097
-     * (BF16-pipe MT4 needs %256 alignment). */
-    if (!use_premax || op_gemm_qw_premax(ops, stream, d_exp_h,
-            blk->moe_shared_fc1_w_fp8, blk->moe_shared_fc1_w_scale,
-            d_input, blk->moe_shared_fc1_b, ffn, H_dim, N_tok,
-            d_input_row_max) != 0) {
-        op_gemm_qw(ops, stream, d_exp_h, blk->moe_shared_fc1_w,
+     * Same shape as a single MoE expert. Routed via op_gemm_qw_dit (BF16-pipe)
+     * because shared-expert is *dense* (all N_tok=4097 tokens, every block
+     * 15..20). Per-tensor FP8 weight scale drift accumulates ~10× output mae
+     * here vs BF16-pipe (verified per-block: b15 25e-3 → 2.5e-3). Gated MoE
+     * experts stay on op_gemm_qw because each only sees ~25% of tokens. */
+    op_gemm_qw_dit(ops, stream, d_exp_h, blk->moe_shared_fc1_w,
                    blk->moe_shared_fc1_w_fp8, blk->moe_shared_fc1_w_scale,
                    d_input, blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
-    }
     op_gelu(ops, stream, d_exp_h, N_tok * ffn);
-    op_gemm_qw(ops, stream, d_exp_o, blk->moe_shared_fc2_w,
+    op_gemm_qw_dit(ops, stream, d_exp_o, blk->moe_shared_fc2_w,
                blk->moe_shared_fc2_w_fp8, blk->moe_shared_fc2_w_scale,
                d_exp_h, blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
     op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
@@ -1663,17 +1700,24 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             skip_sp--;
             CUdeviceptr d_skip_entry = d_skip_stack + (size_t)skip_sp * skip_entry_sz;
 
+            hy3d_prof_begin(r);
             /* cat = concat([skip_value, x], dim=-1)  -> [N1, 2*H_dim] */
             op_concat_last_dim(ops, stream, d_cat_buf, d_skip_entry, d_hidden, N1, H_dim);
 
-            /* x = skip_linear(cat)  -> [N1, H_dim] */
-            op_gemm_qw(ops, stream, d_hidden, blk->skip_linear_w,
+            /* x = skip_linear(cat)  -> [N1, H_dim]
+             * Route via op_gemm_qw_dit (BF16-pipe) instead of raw FP8 perrow:
+             * skip_linear runs on all 4097 tokens dense across 10 blocks; the
+             * per-tensor weight scale drift in pure FP8 accumulates to ~17×
+             * worse output mae (verified per-block at b11..b20). BF16-pipe
+             * has none of that drift while keeping the TC perf. */
+            op_gemm_qw_dit(ops, stream, d_hidden, blk->skip_linear_w,
                        blk->skip_linear_w_fp8, blk->skip_linear_w_scale,
                        d_cat_buf, blk->skip_linear_b, H_dim, 2 * H_dim, N1);
 
             /* x = skip_norm(x) */
             op_layernorm(ops, stream, d_hidden, d_hidden,
                          blk->skip_norm_w, blk->skip_norm_b, N1, H_dim);
+            hy3d_prof_end(r, HY3D_PHA_SKIP);
         }
 
         /* Save hidden state for skip connection (blocks 0..DIT_HALF_DEPTH) */
@@ -1695,9 +1739,11 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         }
 
         /* Fused QKV GEMM: [N1, dim] @ [3*dim, dim]^T → [N1, 3*dim] */
+        hy3d_prof_begin(r);
         op_gemm_qw_dit(ops, stream, d_qkv, blk->sa_qkv_w,
                    blk->sa_qkv_w_fp8, blk->sa_qkv_w_scale,
                    d_normed, 0, 3 * H_dim, H_dim, N1);
+        hy3d_prof_end(r, HY3D_PHA_PROJ);
 
         /* Split interleaved QKV → per-head Q, K, V each [N1, dim]
          * IMPORTANT: d_qkv and d_mlp alias scratch[1], so split output must NOT
@@ -1760,11 +1806,15 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             free(vc);
         }
 
+        hy3d_prof_begin(r);
         op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N1, H_dim, heads, hd);
+        hy3d_prof_end(r, HY3D_PHA_SELF_ATTN);
 
+        hy3d_prof_begin(r);
         op_gemm_qw_dit(ops, stream, d_normed, blk->sa_out_w,
                    blk->sa_out_w_fp8, blk->sa_out_w_scale,
                    d_attn, blk->sa_out_b, H_dim, H_dim, N1);
+        hy3d_prof_end(r, HY3D_PHA_PROJ);
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_attn1_out", pass_tag);
         }
@@ -1807,9 +1857,11 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         }
 
         /* Q from hidden */
+        hy3d_prof_begin(r);
         op_gemm_qw_dit(ops, stream, d_cross_Q, blk->ca_q_w,
                    blk->ca_q_w_fp8, blk->ca_q_w_scale,
                    d_normed, 0, H_dim, H_dim, N1);
+        hy3d_prof_end(r, HY3D_PHA_PROJ);
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_cross_Q, N1, H_dim,
                                      "cuda_b0_attn2_to_q_raw", pass_tag);
@@ -1868,12 +1920,14 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             free(h_v);
             free(h_ctx);
         } else {
+            hy3d_prof_begin(r);
             op_gemm_qw_dit(ops, stream, d_ca_K, blk->ca_k_w,
                        blk->ca_k_w_fp8, blk->ca_k_w_scale,
                        d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
             op_gemm_qw_dit(ops, stream, d_ca_V, blk->ca_v_w,
                        blk->ca_v_w_fp8, blk->ca_v_w_scale,
                        d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
+            hy3d_prof_end(r, HY3D_PHA_PROJ);
         }
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_ca_K, ctx_len, H_dim,
@@ -1905,12 +1959,16 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
                                      "cuda_b0_attn2_k_norm", pass_tag);
         }
 
+        hy3d_prof_begin(r);
         op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K, d_ca_V,
                       N1, ctx_len, H_dim, heads, hd);
+        hy3d_prof_end(r, HY3D_PHA_CROSS_ATTN);
 
+        hy3d_prof_begin(r);
         op_gemm_qw_dit(ops, stream, d_normed, blk->ca_out_w,
                    blk->ca_out_w_fp8, blk->ca_out_w_scale,
                    d_attn, blk->ca_out_b, H_dim, H_dim, N1);
+        hy3d_prof_end(r, HY3D_PHA_PROJ);
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_attn, N1, H_dim,
                                      "cuda_b0_attn2_out", pass_tag);
@@ -1950,10 +2008,13 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
              * d_moe_out [0..33.5MB] at scratch[1] base, corrupting the
              * accumulator. Use d_attn (scratch[2], free during MLP phase). */
             CUdeviceptr d_moe_out = d_attn;
+            hy3d_prof_begin(r);
             run_dit_moe(r, blk, d_normed, d_moe_out, N1, d_moe_scratch);
             op_add(ops, stream, d_hidden, d_moe_out, N1 * H_dim);
+            hy3d_prof_end(r, HY3D_PHA_MOE);
         } else {
             /* Regular MLP: fc1 -> GELU -> fc2 */
+            hy3d_prof_begin(r);
             op_gemm_qw_dit(ops, stream, d_mlp, blk->mlp_fc1_w,
                        blk->mlp_fc1_w_fp8, blk->mlp_fc1_w_scale,
                        d_normed, blk->mlp_fc1_b, ffn, H_dim, N1);
@@ -1965,6 +2026,7 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
                 hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_mlp_out", pass_tag);
             }
             op_add(ops, stream, d_hidden, d_normed, N1 * H_dim);
+            hy3d_prof_end(r, HY3D_PHA_MLP);
         }
 
         /* Per-block hidden dump (for error localization vs PyTorch) */
@@ -2352,6 +2414,15 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
          * gated dispatch on RTX 5060 Ti, bit-identical output. */
         env = getenv("HY3D_FP8_MT4_TAIL");
         r->ops.use_fp8_mt4_tail = (env && env[0] == '0') ? 0 : 1;
+
+        /* HY3D_PROFILE=1: per-phase wall-time breakdown across DiT loop. */
+        env = getenv("HY3D_PROFILE");
+        r->prof_enabled = (env && env[0] != '0') ? 1 : 0;
+        if (r->prof_enabled) {
+            cuEventCreate(&r->prof_ev_a, 0);
+            cuEventCreate(&r->prof_ev_b, 0);
+            for (int i = 0; i < HY3D_PHA_COUNT; i++) { r->prof_ms[i] = 0; r->prof_n[i] = 0; }
+        }
 
         if (verbose) {
             fprintf(stderr,
@@ -2811,6 +2882,20 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
                 e1, e2, e3, e4);
         fprintf(stderr, "HY3D: done in %.2fs (%d verts, %d tris)\n",
                 elapsed, result.n_verts, result.n_tris);
+        if (r->prof_enabled) {
+            double sum = 0;
+            for (int i = 0; i < HY3D_PHA_COUNT; i++) sum += r->prof_ms[i];
+            fprintf(stderr, "HY3D: DiT phase breakdown (sum=%.1fs of %.1fs DiT):\n", sum * 1e-3, e2);
+            for (int i = 0; i < HY3D_PHA_COUNT; i++) {
+                if (r->prof_n[i] == 0) continue;
+                fprintf(stderr, "  %-12s %7.2fs  %5.1f%%  (%lld calls, %.3fms/call)\n",
+                        hy3d_phase_names[i],
+                        r->prof_ms[i] * 1e-3,
+                        100.0 * r->prof_ms[i] / (e2 * 1e3),
+                        r->prof_n[i],
+                        r->prof_ms[i] / (double)r->prof_n[i]);
+            }
+        }
     }
 
     return result;
