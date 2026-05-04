@@ -17,6 +17,7 @@
 #include "../rocew.h"
 #include "../hip_kernels_common.h"
 #include "hip_trellis2_kernels.h"
+#include "../llm/mm_blaslt_bridge.h"
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
 
@@ -57,10 +58,15 @@
 /* GPU weight structures                                                    */
 /* ======================================================================== */
 
-/* F16 weight tensor + optional F32 bias */
+/* Weight tensor + optional bias.
+ *   scale < 0  -> w is F32 (legacy path, also drives BF16 WMMA via in-flight truncation).
+ *   scale >= 0 -> w is raw FP8 E4M3 bytes (1 byte/elem); reconstruct via lut[byte]*scale.
+ */
 typedef struct {
-    void *w;   /* F16 weight, device pointer */
-    void *b;   /* F32 bias, device pointer (may be NULL) */
+    void *w;          /* F32 weight (NULL if blaslt-only or fp8) */
+    void *w_bf16;     /* BF16 weight (raw bytes, [n_out, n_in]); used by hipBLASLt path */
+    void *b;          /* F32 bias, device pointer (may be NULL) */
+    float scale;      /* -1.0f = F32/BF16 weight; >=0.0f = FP8 per-tensor scale */
 } t2_wt;
 
 typedef struct {
@@ -105,26 +111,45 @@ struct hip_trellis2_runner {
     /* GEMM and common ops (from hip_kernels_common_src) */
     hipFunction_t fn_gemm;           /* gemm_tiled_f32_f32 (scalar F32 fallback) */
     hipFunction_t fn_gemm_wmma;      /* gemm_bf16w_bf16a_wmma_t (gfx12 only) */
-    int use_wmma;                    /* 1 iff WMMA kernel is loaded & enabled */
+    hipFunction_t fn_gemm_fp8_wmma;  /* gemm_fp8w_bf16a_wmma_t (gfx12 only) */
+    hipFunction_t fn_pack_bf16;      /* pack_bf16_from_f32 — F32 -> BF16 for hipBLASLt */
+    int use_wmma;                    /* 1 iff BF16 WMMA kernel is loaded & enabled */
+    int use_fp8;                     /* 1 iff FP8 LUT uploaded and any FP8 weight loaded */
+    int use_blaslt;                  /* 1 iff hipBLASLt path enabled (T2_BLASLT=1, default 1) */
+    void *d_act_bf16;                /* scratch [4096*8192] BF16 (~64 MB) for activation cast */
     hipFunction_t fn_layernorm;      /* layernorm_f32 */
+    hipFunction_t fn_layernorm_pack; /* layernorm_pack_bf16_f32 (fused) */
+    hipFunction_t fn_adaln_pack;     /* adaln_pack_bf16_f32 (fused) */
+    hipFunction_t fn_gated_layernorm_pack; /* gated_add+LN+pack fused */
+    hipFunction_t fn_gated_adaln_pack;     /* gated_add+adaLN+pack fused */
 
     /* TRELLIS.2-specific ops */
     hipFunction_t fn_adaln;
     hipFunction_t fn_gated_add;
+    hipFunction_t fn_gated_add_v4;   /* float4 2D variant (dim%4==0) */
     hipFunction_t fn_residual_add;
     hipFunction_t fn_modulation;
+    hipFunction_t fn_modulation_par;
+    hipFunction_t fn_mod_add_blkbias;
     hipFunction_t fn_t_embed;        /* timestep_embed_cossin_f32 */
     hipFunction_t fn_silu;
     hipFunction_t fn_gelu;
+    hipFunction_t fn_gelu_pack;      /* gelu_pack_bf16_f32: fused GELU + F32->BF16 */
     hipFunction_t fn_split_qkv;
     hipFunction_t fn_split_kv;
     hipFunction_t fn_rms_norm_ph;
+    hipFunction_t fn_rms_norm_ph_wave;  /* wave32 fast path; head_dim % 32 == 0 */
+    hipFunction_t fn_rms_norm_rope_ph_wave;  /* fused RMSNorm + 3D RoPE wave32 */
     hipFunction_t fn_rope_3d;
     hipFunction_t fn_ln_noaffine;
     hipFunction_t fn_flash_sa;       /* flash_attn_sa_f32 (scalar fallback) */
     hipFunction_t fn_flash_sa_wmma;  /* flash_attn_sa_wmma_f32 (gfx12) */
+    hipFunction_t fn_flash_sa_wmma_bc32;  /* flash_attn_sa_wmma_bc32_f32 (gfx12) */
+    hipFunction_t fn_flash_sa_wmma_bc32_db;  /* flash_attn_sa_wmma_bc32_db_f32 (gfx12) */
+    hipFunction_t fn_flash_sa_wmma_b16_db;   /* flash_attn_sa_wmma_b16_db_f32 (gfx12) */
     hipFunction_t fn_cross_attn;     /* cross_attn_tiled_f32 (scalar fallback) */
     hipFunction_t fn_cross_attn_wmma;/* cross_attn_wmma_f32 (gfx12) */
+    hipFunction_t fn_cross_attn_wmma_bc32; /* cross_attn_wmma_bc32_f32 (gfx12) */
     hipFunction_t fn_broadcast_bias;
 
     /* Decoder ops */
@@ -180,6 +205,7 @@ struct hip_trellis2_runner {
     void *d_t_silu;    /* [DIT_DIM] after FC1+SiLU */
     void *d_ada_out;   /* [6*DIT_DIM] shared modulation */
     void *d_mod;       /* [6*DIT_DIM] per-block modulation */
+    void *d_mod_base;  /* [6*DIT_DIM] shared GEMV result (silu(t)*mod_w+mod_b) */
     void *d_noise;     /* [DIT_N_TOK, DIT_IN_CH] input */
     void *d_vel;       /* [DIT_N_TOK, DIT_IN_CH] output velocity */
     void *d_cond;      /* [1029, DIT_COND_DIM] conditioning features */
@@ -319,6 +345,108 @@ static void *st_upload_f32(st_context *st, const char *name, int verbose) {
     return d;
 }
 
+/* ---- FP8 E4M3 -> F32 host LUT (mirrors GPU constant memory `d_fp8_to_f32_lut`) ---- */
+static float t2_fp8_to_f32_lut[256];
+static int   t2_fp8_to_f32_lut_init = 0;
+
+static float t2_fp8_e4m3_to_f32(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp  = (b >> 3) & 0xF;
+    uint32_t mant = b & 0x7;
+    if (exp == 0 && mant == 0) return sign ? -0.0f : 0.0f;
+    float f;
+    if (exp == 0) f = ldexpf((float)mant / 8.0f, -6);
+    else if (exp == 15 && mant == 7) return 0.0f;  /* NaN -> 0 */
+    else f = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
+    return sign ? -f : f;
+}
+
+static void t2_init_fp8_lut(void) {
+    if (t2_fp8_to_f32_lut_init) return;
+    for (int i = 0; i < 256; i++)
+        t2_fp8_to_f32_lut[i] = t2_fp8_e4m3_to_f32((uint8_t)i);
+    t2_fp8_to_f32_lut_init = 1;
+}
+
+/* Upload weight tensor (.weight). On FP8 dtype, returns raw bytes and stores
+ * the per-tensor scale (read from sibling "<base>.weight.scale" tensor) in
+ * *out_scale. Otherwise returns F32 dequant and sets *out_scale = -1.0f.
+ *
+ * Caller knows the field name pattern (e.g. "blocks.N.<sub>.weight"). */
+static void *st_upload_wt_w(st_context *st, const char *weight_name,
+                            float *out_scale, int verbose) {
+    *out_scale = -1.0f;
+    int idx = safetensors_find(st, weight_name);
+    if (idx < 0) {
+        if (verbose >= 2) fprintf(stderr, "  [skip] %s\n", weight_name);
+        return NULL;
+    }
+    const char *dtype = safetensors_dtype(st, idx);
+    if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0) {
+        /* Raw FP8 upload, sibling .scale tensor */
+        size_t nb = safetensors_nbytes(st, idx);
+        void *data = safetensors_data(st, idx);
+        char scale_name[256];
+        snprintf(scale_name, sizeof(scale_name), "%s.scale", weight_name);
+        int sidx = safetensors_find(st, scale_name);
+        float s = 1.0f;
+        if (sidx >= 0) s = *(const float *)safetensors_data(st, sidx);
+        else if (verbose >= 1)
+            fprintf(stderr, "  [warn] %s has FP8 dtype but no sibling .scale; using 1.0\n",
+                    weight_name);
+        *out_scale = s;
+        void *d = hip_upload_raw(data, nb);  /* 1 byte/element */
+        if (verbose >= 2) fprintf(stderr, "  %s: FP8 (%.1f MB) scale=%.6g\n",
+                                  weight_name, nb / 1048576.0f, (double)s);
+        return d;
+    }
+    /* Fall through to F32 dequant */
+    return st_upload_f32(st, weight_name, verbose);
+}
+
+/* Upload weight as BF16-raw if dtype is BF16, else fall back to F32 dequant.
+ * Returns 0 on success. Sets *out_w_bf16 (BF16 path) OR *out_w_f32 (fallback)
+ * exclusively — never both — so the caller knows which path will dispatch and
+ * avoids holding two copies on-GPU. *out_scale is set to -1.0f (not FP8). */
+static int st_upload_wt_bf16_pref(st_context *st, const char *weight_name,
+                                  int prefer_bf16,
+                                  void **out_w_bf16, void **out_w_f32,
+                                  float *out_scale, int verbose) {
+    *out_w_bf16 = NULL;
+    *out_w_f32 = NULL;
+    *out_scale = -1.0f;
+    int idx = safetensors_find(st, weight_name);
+    if (idx < 0) return 0;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (prefer_bf16 &&
+        (strcmp(dtype, "BF16") == 0 || strcmp(dtype, "BFloat16") == 0)) {
+        size_t nb = safetensors_nbytes(st, idx);
+        void *data = safetensors_data(st, idx);
+        *out_w_bf16 = hip_upload_raw(data, nb);
+        if (verbose >= 2) fprintf(stderr, "  %s: BF16 raw (%.1f MB)\n",
+                                  weight_name, nb / 1048576.0f);
+        return 0;
+    }
+    /* Non-BF16 (e.g. F8_E4M3 with sibling .scale, or F32) — defer to wt_w. */
+    *out_w_f32 = st_upload_wt_w(st, weight_name, out_scale, verbose);
+    return 0;
+}
+
+/* Upload raw BF16 bytes for hipBLASLt path. Returns NULL if tensor missing
+ * or dtype is not BF16. Does NOT touch *out_scale. */
+static void *st_upload_bf16_raw(st_context *st, const char *weight_name, int verbose) {
+    int idx = safetensors_find(st, weight_name);
+    if (idx < 0) return NULL;
+    const char *dtype = safetensors_dtype(st, idx);
+    if (strcmp(dtype, "BF16") != 0 && strcmp(dtype, "BFloat16") != 0) return NULL;
+    size_t nb = safetensors_nbytes(st, idx);
+    void *data = safetensors_data(st, idx);
+    void *d = hip_upload_raw(data, nb);
+    if (verbose >= 2) fprintf(stderr, "  %s: BF16 raw (%.1f MB)\n",
+                              weight_name, nb / 1048576.0f);
+    return d;
+}
+
 /* Ensure scratch buffer is large enough, reallocate if needed */
 static void *ensure_buf(void **buf, size_t bytes) {
     if (*buf) hipFree(*buf);
@@ -374,10 +502,69 @@ static void compute_rope_phases(int grid, int n_freqs,
 /* Kernel launch helpers                                                    */
 /* ======================================================================== */
 
-static int gemm(hip_trellis2_runner *r, void *Y, const void *W, const void *X,
+static void run_broadcast_bias(hip_trellis2_runner *r, void *out,
+                                const void *bias, int n_tok, int n_out);
+
+/* GEMM dispatcher.
+ *
+ * Y[n_tok, n_out] = X[n_tok, n_in] @ W[n_out, n_in]^T + (bias ? bias : 0)
+ *
+ * `wt` carries the weight pointer plus an FP8/F32 discriminator:
+ *   wt->scale >= 0  -> w is FP8 raw bytes; dispatch BF16-act × FP8-wt WMMA when eligible
+ *   wt->scale <  0  -> w is F32; dispatch BF16 WMMA when eligible, else scalar F32
+ *
+ * The `bias` argument is kept separate (and is NULL at all current call sites,
+ * since callers add bias via run_broadcast_bias afterward). */
+static int gemm(hip_trellis2_runner *r, void *Y, const t2_wt *wt, const void *X,
                 const void *bias, int n_out, int n_in, int n_tok) {
-    /* BF16 WMMA path: n_tok, n_in, n_out all multiples of 16 (padded rounding ok
-     * because the kernel guards row/col bounds). Requires gfx12 + kernel loaded. */
+    const void *W = wt->w;
+
+    /* hipBLASLt BF16 path: when a BF16 weight is preloaded and bridge is up.
+     * Y is F32 [n_tok, n_out]; X is F32 [n_tok, n_in] — pack to BF16 scratch.
+     * mm_blaslt_run_bf16(M=n_tok, N=n_out, K=n_in). */
+    if (wt->w_bf16 && r->use_blaslt && n_tok >= 8) {
+        int n_act = n_tok * n_in;
+        int n_act4 = (n_act + 3) / 4;
+        void *dst = r->d_act_bf16;
+        void *src = (void *)X;
+        void *args0[] = { &dst, &src, &n_act };
+        if (hipModuleLaunchKernel(r->fn_pack_bf16,
+                (n_act4 + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args0, NULL) != hipSuccess)
+            return -1;
+        if (mm_blaslt_run_bf16_bias(Y, wt->w_bf16, r->d_act_bf16, bias,
+                                    n_tok, n_out, n_in, NULL) != 0) return -1;
+        return 0;
+    }
+
+    /* FP8 (BF16-act × FP8-wt) WMMA path: kernel tile is 128x128 with 16x16x16
+     * WMMA, so we need n_out % 16 == 0 and n_in % 16 == 0. The kernel guards
+     * partial CTAs in n_tok / n_out but not in n_in (k loop is unconditional).
+     * Aligned safetensors weights from quantize_dit_fp8.py satisfy n_out%64==0. */
+    if (wt->scale >= 0.0f && r->use_fp8 && r->fn_gemm_fp8_wmma &&
+        n_tok >= 16 && n_in >= 16 &&
+        (n_out % 16) == 0 && (n_in % 16) == 0) {
+        int gdx = (n_out + 127) / 128;
+        int gdy = (n_tok + 127) / 128;
+        float w_scale = wt->scale;
+        void *args[] = { &Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &w_scale };
+        return hipModuleLaunchKernel(r->fn_gemm_fp8_wmma,
+            gdx, gdy, 1, 256, 1, 1, 0, 0, args, NULL) == hipSuccess ? 0 : -1;
+    }
+
+    /* If we somehow reached here with FP8 weights, that means dimensions are
+     * too small for the WMMA tile (n_in<16 or n_out<16). No FP8 fallback yet
+     * — these tensors weren't quantized in the first place (input_layer,
+     * out_layer have n_out=8). Fail loudly so we catch loader bugs. */
+    if (wt->scale >= 0.0f) {
+        fprintf(stderr,
+                "T2-HIP: gemm() got FP8 weight at unsupported shape "
+                "n_out=%d n_in=%d n_tok=%d (no FP8 fallback)\n",
+                n_out, n_in, n_tok);
+        return -1;
+    }
+
+    /* BF16 WMMA path (F32 weights truncated in flight): n_tok, n_in, n_out
+     * all multiples of 16. */
     if (r->use_wmma && n_tok >= 16 && n_in >= 16 &&
         (n_out % 16) == 0 && (n_in % 16) == 0) {
         int gdx = (n_out + 127) / 128;
@@ -448,16 +635,25 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
 
     LOAD_FN(fn_gemm,         "gemm_tiled_f32_f32");
     LOAD_FN(fn_layernorm,    "layernorm_f32");
+    LOAD_FN(fn_layernorm_pack, "layernorm_pack_bf16_f32");
+    LOAD_FN(fn_gated_layernorm_pack, "gated_layernorm_pack_bf16_f32");
+    LOAD_FN(fn_gated_adaln_pack,     "gated_adaln_pack_bf16_f32");
     LOAD_FN(fn_adaln,        "adaln_f32");
+    LOAD_FN(fn_adaln_pack,   "adaln_pack_bf16_f32");
     LOAD_FN(fn_gated_add,    "gated_add_f32");
+    LOAD_FN(fn_gated_add_v4, "gated_add_v4_f32");
     LOAD_FN(fn_residual_add, "residual_add_f32");
     LOAD_FN(fn_modulation,   "modulation_f32");
+    LOAD_FN(fn_modulation_par, "modulation_par_f32");
+    LOAD_FN(fn_mod_add_blkbias, "mod_add_blkbias_f32");
     LOAD_FN(fn_t_embed,      "timestep_embed_cossin_f32");
     LOAD_FN(fn_silu,         "silu_inplace_f32");
     LOAD_FN(fn_gelu,         "gelu_inplace_f32");
+    LOAD_FN(fn_gelu_pack,    "gelu_pack_bf16_f32");
     LOAD_FN(fn_split_qkv,   "split_qkv_chunk_f32");
     LOAD_FN(fn_split_kv,    "split_kv_chunk_f32");
     LOAD_FN(fn_rms_norm_ph,  "rms_norm_perhead_f32");
+    LOAD_FN(fn_rms_norm_ph_wave, "rms_norm_perhead_wave_f32");
     LOAD_FN(fn_rope_3d,      "rope_3d_f32");
     LOAD_FN(fn_ln_noaffine,  "layernorm_noaffine_f32");
     LOAD_FN(fn_flash_sa,     "flash_attn_sa_f32");
@@ -470,6 +666,7 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
     LOAD_FN(fn_cfg_combine,  "cfg_combine_f32");
     LOAD_FN(fn_compute_x0,   "compute_x0_f32");
     LOAD_FN(fn_cfg_rescale,  "cfg_rescale_f32");
+    LOAD_FN(fn_pack_bf16,    "pack_bf16_from_f32");
 #undef LOAD_FN
 
     /* Optional: BF16 WMMA kernels (gfx1200/gfx1201 only). Missing on other
@@ -492,14 +689,120 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
     } else if (r->use_wmma) {
         fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn enabled\n");
     }
+    r->fn_flash_sa_wmma_bc32 = NULL;
+    r->fn_flash_sa_wmma_bc32_db = NULL;
+    r->fn_flash_sa_wmma_b16_db = NULL;
+    if (r->use_wmma) {
+        const char *bc32 = getenv("T2_FA_BC32");
+        int want = (bc32 == NULL) ? 1 : atoi(bc32);  /* default ON */
+        if (want) {
+            if (hipModuleGetFunction(&r->fn_flash_sa_wmma_bc32, r->mod,
+                                     "flash_attn_sa_wmma_bc32_f32") == hipSuccess) {
+                fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn Bc=32 enabled%s\n",
+                        bc32 ? " (T2_FA_BC32=1)" : " (default)");
+            }
+        }
+        const char *db = getenv("T2_FA_DB");
+        /* Default OFF: in microbench the doubled LDS (55 KB vs 38 KB) cut
+         * CTA-per-WGP from 3 to 2, costing more occupancy than the prefetch
+         * recovers. Kernel is preserved for future tile/occupancy retuning. */
+        int want_db = (db == NULL) ? 0 : atoi(db);
+        const char *b16db = getenv("T2_FA_B16DB");
+        int want_b16db = (b16db == NULL) ? 0 : atoi(b16db);
+        if (want_b16db) {
+            if (hipModuleGetFunction(&r->fn_flash_sa_wmma_b16_db, r->mod,
+                                     "flash_attn_sa_wmma_b16_db_f32") == hipSuccess) {
+                fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn Bc=16 KV double-buffer enabled (T2_FA_B16DB=1)\n");
+            }
+        }
+        if (want_db) {
+            if (hipModuleGetFunction(&r->fn_flash_sa_wmma_bc32_db, r->mod,
+                                     "flash_attn_sa_wmma_bc32_db_f32") == hipSuccess) {
+                fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn Bc=32 KV double-buffer enabled%s\n",
+                        db ? " (T2_FA_DB=1)" : " (default)");
+            }
+        }
+    }
     if (hipModuleGetFunction(&r->fn_cross_attn_wmma, r->mod, "cross_attn_wmma_f32") != hipSuccess) {
         r->fn_cross_attn_wmma = NULL;
         fprintf(stderr, "T2-HIP: BF16 WMMA cross-attn not available; using scalar CA\n");
     } else if (r->use_wmma) {
         fprintf(stderr, "T2-HIP: BF16 WMMA cross-attn enabled\n");
     }
+    r->fn_rms_norm_rope_ph_wave = NULL;
+    {
+        const char *e = getenv("T2_QKNORM_FUSE");
+        int want = (e == NULL) ? 1 : atoi(e);
+        if (want) {
+            if (hipModuleGetFunction(&r->fn_rms_norm_rope_ph_wave, r->mod,
+                                     "rms_norm_rope_perhead_wave_f32") == hipSuccess) {
+                fprintf(stderr, "T2-HIP: fused RMSNorm+RoPE wave32 enabled%s\n",
+                        e ? " (T2_QKNORM_FUSE=1)" : " (default)");
+            }
+        }
+    }
+    r->fn_cross_attn_wmma_bc32 = NULL;
+    if (r->use_wmma && r->fn_cross_attn_wmma) {
+        const char *cabc32 = getenv("T2_CA_BC32");
+        int want_cabc32 = (cabc32 == NULL) ? 1 : atoi(cabc32);
+        if (want_cabc32) {
+            if (hipModuleGetFunction(&r->fn_cross_attn_wmma_bc32, r->mod,
+                                     "cross_attn_wmma_bc32_f32") == hipSuccess) {
+                fprintf(stderr, "T2-HIP: BF16 WMMA cross-attn Bc=32 enabled%s\n",
+                        cabc32 ? " (T2_CA_BC32=1)" : " (default)");
+            }
+        }
+    }
+
+    /* Optional: BF16-act × FP8-wt WMMA (gfx12 only). Becomes active later in
+     * load_dit if any tensor is FP8 dtype. */
+    r->fn_gemm_fp8_wmma = NULL;
+    r->use_fp8 = 0;
+    if (hipModuleGetFunction(&r->fn_gemm_fp8_wmma, r->mod, "gemm_fp8w_bf16a_wmma_t") == hipSuccess) {
+        /* Upload FP8 LUT to constant memory regardless of whether weights are
+         * FP8 — cheap (1 KB) and lets load_dit decide later. */
+        t2_init_fp8_lut();
+        hipDeviceptr_t d_lut = 0;
+        size_t lut_size = 0;
+        if (hipModuleGetGlobal(&d_lut, &lut_size, r->mod, "d_fp8_to_f32_lut") == hipSuccess
+            && lut_size == 256 * sizeof(float)) {
+            hipMemcpyHtoD(d_lut, t2_fp8_to_f32_lut, 256 * sizeof(float));
+            fprintf(stderr, "T2-HIP: FP8 WMMA GEMM kernel available (activates on FP8 weights)\n");
+        } else {
+            fprintf(stderr, "T2-HIP: FP8 LUT symbol missing; FP8 path disabled\n");
+            r->fn_gemm_fp8_wmma = NULL;
+        }
+    }
 
     fprintf(stderr, "T2-HIP: all %d kernels loaded OK\n", 24);
+
+    /* Optional: hipBLASLt BF16 GEMM bridge (default ON; T2_BLASLT=0 disables).
+     * Activates only after load_dit populates wt->w_bf16 for eligible weights. */
+    r->use_blaslt = 0;
+    r->d_act_bf16 = NULL;
+    {
+        const char *env = getenv("T2_BLASLT");
+        int want = (!env || strcmp(env, "0") != 0);
+        if (want) {
+            if (mm_blaslt_init() == 0) {
+                /* Activation scratch: max n_tok * max n_in * sizeof(bf16) =
+                 * 4096 * DIT_FFN(6144) * 2 = 48 MB. Round up to 64 MB. */
+                size_t scratch_bytes = (size_t)4096 * 8192 * 2;
+                if (hipMalloc(&r->d_act_bf16, scratch_bytes) == hipSuccess) {
+                    r->use_blaslt = 1;
+                    fprintf(stderr, "T2-HIP: hipBLASLt BF16 GEMM enabled (scratch %.0f MB)\n",
+                            scratch_bytes / 1048576.0);
+                } else {
+                    fprintf(stderr, "T2-HIP: hipBLASLt scratch alloc failed; disabling\n");
+                    mm_blaslt_destroy();
+                }
+            } else {
+                fprintf(stderr, "T2-HIP: mm_blaslt_init failed; disabling hipBLASLt path\n");
+            }
+        } else {
+            fprintf(stderr, "T2-HIP: hipBLASLt path disabled by T2_BLASLT=0\n");
+        }
+    }
 
     /* Allocate activation buffers */
     hipMalloc(&r->d_h,        DIT_N_TOK * DIT_DIM * sizeof(float));
@@ -515,6 +818,7 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
     hipMalloc(&r->d_t_silu,   DIT_DIM * sizeof(float));
     hipMalloc(&r->d_ada_out,  6 * DIT_DIM * sizeof(float));
     hipMalloc(&r->d_mod,      6 * DIT_DIM * sizeof(float));
+    hipMalloc(&r->d_mod_base, 6 * DIT_DIM * sizeof(float));
     hipMalloc(&r->d_noise,    DIT_N_TOK * DIT_IN_CH * sizeof(float));
     hipMalloc(&r->d_vel,      DIT_N_TOK * DIT_IN_CH * sizeof(float));
     hipMalloc(&r->d_cond,     1029 * DIT_COND_DIM * sizeof(float));
@@ -535,16 +839,16 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
 
     for (int i = 0; i < DIT_DEPTH; i++) {
         t2_block_gpu *b = &r->blocks[i];
-        free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.b);
+        free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.w_bf16); free_hip(&b->sa_qkv.b);
         free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
-        free_hip(&b->sa_out.w); free_hip(&b->sa_out.b);
+        free_hip(&b->sa_out.w); free_hip(&b->sa_out.w_bf16); free_hip(&b->sa_out.b);
         free_hip(&b->norm2_w); free_hip(&b->norm2_b);
-        free_hip(&b->ca_q.w); free_hip(&b->ca_q.b);
+        free_hip(&b->ca_q.w); free_hip(&b->ca_q.w_bf16); free_hip(&b->ca_q.b);
         free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
-        free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.b);
-        free_hip(&b->ca_out.w); free_hip(&b->ca_out.b);
-        free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.b);
-        free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.b);
+        free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.w_bf16); free_hip(&b->ca_kv.b);
+        free_hip(&b->ca_out.w); free_hip(&b->ca_out.w_bf16); free_hip(&b->ca_out.b);
+        free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.w_bf16); free_hip(&b->mlp_fc1.b);
+        free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.w_bf16); free_hip(&b->mlp_fc2.b);
         free_hip(&b->mod_bias);
         free_hip(&r->ca_K_cache[i]);
         free_hip(&r->ca_V_cache[i]);
@@ -555,11 +859,15 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
     free_hip(&r->d_Q); free_hip(&r->d_K); free_hip(&r->d_V);
     free_hip(&r->d_ca_Q); free_hip(&r->d_attn_out); free_hip(&r->d_mlp_mid);
     free_hip(&r->d_t_emb); free_hip(&r->d_t_silu);
-    free_hip(&r->d_ada_out); free_hip(&r->d_mod);
+    free_hip(&r->d_ada_out); free_hip(&r->d_mod); free_hip(&r->d_mod_base);
     free_hip(&r->d_noise); free_hip(&r->d_vel); free_hip(&r->d_cond);
 
     /* Decoder */
     for (int i = 0; i < 4; i++) free_hip(&r->d_dec[i]);
+
+    /* hipBLASLt cleanup */
+    if (r->d_act_bf16) { hipFree(r->d_act_bf16); r->d_act_bf16 = NULL; }
+    if (r->use_blaslt) { mm_blaslt_destroy(); r->use_blaslt = 0; }
 
     if (r->mod) hipModuleUnload(r->mod);
     free(r);
@@ -581,17 +889,30 @@ int hip_trellis2_load_dit(hip_trellis2_runner *r, const char *path) {
 
     int v = r->verbose;
 
-    /* Global weights */
-    r->dit_input.w  = st_upload_f32(st, "input_layer.weight", v);
+    /* Global weights. FP8-eligible 2D weights consumed by gemm() use
+     * st_upload_wt_w (auto-detects F8_E4M3 dtype + sibling .scale tensor).
+     * Other paths (small dims, modulation custom kernel) stay F32. */
+    r->dit_input.w  = st_upload_f32(st, "input_layer.weight", v);  /* [1536,8] - too small */
+    r->dit_input.scale = -1.0f;
     r->dit_input.b  = st_upload_f32(st, "input_layer.bias",   v);
-    r->dit_t_fc1.w  = st_upload_f32(st, "t_embedder.mlp.0.weight", v);
+    r->dit_t_fc1.w  = st_upload_wt_w(st, "t_embedder.mlp.0.weight", &r->dit_t_fc1.scale, v);
     r->dit_t_fc1.b  = st_upload_f32(st, "t_embedder.mlp.0.bias",   v);
-    r->dit_t_fc2.w  = st_upload_f32(st, "t_embedder.mlp.2.weight", v);
+    r->dit_t_fc2.w  = st_upload_wt_w(st, "t_embedder.mlp.2.weight", &r->dit_t_fc2.scale, v);
     r->dit_t_fc2.b  = st_upload_f32(st, "t_embedder.mlp.2.bias",   v);
-    r->dit_ada_mod.w = st_upload_f32(st, "adaLN_modulation.1.weight", v);
+    r->dit_ada_mod.w = st_upload_f32(st, "adaLN_modulation.1.weight", v);  /* fn_modulation custom kernel */
+    r->dit_ada_mod.scale = -1.0f;
     r->dit_ada_mod.b = st_upload_f32(st, "adaLN_modulation.1.bias",   v);
-    r->dit_out.w    = st_upload_f32(st, "out_layer.weight", v);
+    r->dit_out.w    = st_upload_f32(st, "out_layer.weight", v);  /* [8,1536] - too small */
+    r->dit_out.scale = -1.0f;
     r->dit_out.b    = st_upload_f32(st, "out_layer.bias",   v);
+
+    if (r->dit_t_fc1.scale >= 0.0f || r->dit_t_fc2.scale >= 0.0f) r->use_fp8 = 1;
+
+    /* For hipBLASLt path, also upload raw BF16 weights for the large 2D
+     * matmuls (skip t_embedder — n_tok=1 doesn't satisfy n_tok>=8 gate; skip
+     * adaLN_modulation — consumed by fn_modulation custom kernel; skip
+     * input_layer/out_layer — n_in/n_out=8 too small for tile). Per-block
+     * weights are uploaded below. Only valid for native-BF16 safetensors. */
 
     /* Per-block weights */
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
@@ -599,29 +920,40 @@ int hip_trellis2_load_dit(hip_trellis2_runner *r, const char *path) {
         t2_block_gpu *b = &r->blocks[bi];
         #define BN(n) (snprintf(name,sizeof(name),"blocks.%d.%s",bi,n), name)
 
-        /* Correct tensor names from common/trellis2_dit.h */
-        b->sa_qkv.w  = st_upload_f32(st, BN("self_attn.to_qkv.weight"), v);
+        /* Per-block large GEMM weights: prefer BF16-raw upload (hipBLASLt path).
+         * Falls back to F32 only when dtype is FP8 or non-BF16. Avoids holding
+         * both F32 and BF16 copies — saves ~5 GB VRAM and ~3× PCIe at load. */
+        st_upload_wt_bf16_pref(st, BN("self_attn.to_qkv.weight"), r->use_blaslt,
+                               &b->sa_qkv.w_bf16, &b->sa_qkv.w, &b->sa_qkv.scale, v);
         b->sa_qkv.b  = st_upload_f32(st, BN("self_attn.to_qkv.bias"),   v);
         b->sa_q_norm = st_upload_f32(st, BN("self_attn.q_rms_norm.gamma"), v);
         b->sa_k_norm = st_upload_f32(st, BN("self_attn.k_rms_norm.gamma"), v);
-        b->sa_out.w  = st_upload_f32(st, BN("self_attn.to_out.weight"), v);
+        st_upload_wt_bf16_pref(st, BN("self_attn.to_out.weight"), r->use_blaslt,
+                               &b->sa_out.w_bf16, &b->sa_out.w, &b->sa_out.scale, v);
         b->sa_out.b  = st_upload_f32(st, BN("self_attn.to_out.bias"),   v);
 
         b->norm2_w   = st_upload_f32(st, BN("norm2.weight"), v);
         b->norm2_b   = st_upload_f32(st, BN("norm2.bias"),   v);
-        b->ca_q.w    = st_upload_f32(st, BN("cross_attn.to_q.weight"), v);
+        st_upload_wt_bf16_pref(st, BN("cross_attn.to_q.weight"), r->use_blaslt,
+                               &b->ca_q.w_bf16, &b->ca_q.w, &b->ca_q.scale, v);
         b->ca_q.b    = st_upload_f32(st, BN("cross_attn.to_q.bias"),   v);
         b->ca_q_norm = st_upload_f32(st, BN("cross_attn.q_rms_norm.gamma"), v);
         b->ca_k_norm = st_upload_f32(st, BN("cross_attn.k_rms_norm.gamma"), v);
-        b->ca_kv.w   = st_upload_f32(st, BN("cross_attn.to_kv.weight"), v);
+        st_upload_wt_bf16_pref(st, BN("cross_attn.to_kv.weight"), r->use_blaslt,
+                               &b->ca_kv.w_bf16, &b->ca_kv.w, &b->ca_kv.scale, v);
         b->ca_kv.b   = st_upload_f32(st, BN("cross_attn.to_kv.bias"),   v);
-        b->ca_out.w  = st_upload_f32(st, BN("cross_attn.to_out.weight"), v);
+        st_upload_wt_bf16_pref(st, BN("cross_attn.to_out.weight"), r->use_blaslt,
+                               &b->ca_out.w_bf16, &b->ca_out.w, &b->ca_out.scale, v);
         b->ca_out.b  = st_upload_f32(st, BN("cross_attn.to_out.bias"),   v);
 
-        b->mlp_fc1.w = st_upload_f32(st, BN("mlp.mlp.0.weight"), v);
+        st_upload_wt_bf16_pref(st, BN("mlp.mlp.0.weight"), r->use_blaslt,
+                               &b->mlp_fc1.w_bf16, &b->mlp_fc1.w, &b->mlp_fc1.scale, v);
         b->mlp_fc1.b = st_upload_f32(st, BN("mlp.mlp.0.bias"),   v);
-        b->mlp_fc2.w = st_upload_f32(st, BN("mlp.mlp.2.weight"), v);
+        st_upload_wt_bf16_pref(st, BN("mlp.mlp.2.weight"), r->use_blaslt,
+                               &b->mlp_fc2.w_bf16, &b->mlp_fc2.w, &b->mlp_fc2.scale, v);
         b->mlp_fc2.b = st_upload_f32(st, BN("mlp.mlp.2.bias"),   v);
+
+        if (b->sa_qkv.scale >= 0.0f) r->use_fp8 = 1;
 
         b->mod_bias  = st_upload_f32(st, BN("modulation"),            v);
 
@@ -732,9 +1064,67 @@ static void run_adaln(hip_trellis2_runner *r, void *dst, const void *src,
                           256 * 2 * sizeof(float), 0, args, NULL);
 }
 
+/* Fused layernorm + F32->BF16 pack: writes F32 dst AND BF16 dst_bf16. */
+static void run_layernorm_pack(hip_trellis2_runner *r, void *dst, void *dst_bf16,
+                                 const void *src, const void *w, const void *b,
+                                 int N, int dim) {
+    float eps = 1e-6f;
+    void *args[] = {&dst, &dst_bf16, &src, &w, &b, &dim, &eps};
+    hipModuleLaunchKernel(r->fn_layernorm_pack, N, 1, 1, 256, 1, 1,
+                          256 * 2 * sizeof(float), 0, args, NULL);
+}
+
+/* Fused adaln + F32->BF16 pack: writes F32 dst AND BF16 dst_bf16. */
+static void run_adaln_pack(hip_trellis2_runner *r, void *dst, void *dst_bf16,
+                            const void *src, const void *shift, const void *scale,
+                            int N, int dim) {
+    float eps = 1e-6f;
+    void *args[] = {&dst, &dst_bf16, &src, &shift, &scale, &dim, &eps};
+    hipModuleLaunchKernel(r->fn_adaln_pack, N, 1, 1, 256, 1, 1,
+                          256 * 2 * sizeof(float), 0, args, NULL);
+}
+
+/* Fused gated_add + layernorm + BF16 pack: x_io = x_io + gate*r; LN(x_io) -> dst, dst_bf16 */
+static int run_gated_layernorm_pack(hip_trellis2_runner *r, void *x_io, void *dst,
+                                     void *dst_bf16, const void *resid,
+                                     const void *gate, const void *w, const void *b,
+                                     int N, int dim) {
+    if (!r->fn_gated_layernorm_pack) return -1;
+    float eps = 1e-6f;
+    void *args[] = {&x_io, &dst, &dst_bf16, (void *)&resid, (void *)&gate,
+                    (void *)&w, (void *)&b, &dim, &eps};
+    return hipModuleLaunchKernel(r->fn_gated_layernorm_pack, N, 1, 1, 256, 1, 1,
+                                  256 * sizeof(float), 0, args, NULL) == hipSuccess
+           ? 0 : -1;
+}
+
+/* Fused gated_add + adaLN + BF16 pack. */
+static int run_gated_adaln_pack(hip_trellis2_runner *r, void *x_io, void *dst,
+                                  void *dst_bf16, const void *resid,
+                                  const void *gate, const void *shift,
+                                  const void *scale, int N, int dim) {
+    if (!r->fn_gated_adaln_pack) return -1;
+    float eps = 1e-6f;
+    void *args[] = {&x_io, &dst, &dst_bf16, (void *)&resid, (void *)&gate,
+                    (void *)&shift, (void *)&scale, &dim, &eps};
+    return hipModuleLaunchKernel(r->fn_gated_adaln_pack, N, 1, 1, 256, 1, 1,
+                                  256 * 2 * sizeof(float), 0, args, NULL) == hipSuccess
+           ? 0 : -1;
+}
+
 /* gated_add: dst[N*dim] += gate[dim] * src[N*dim] */
 static void run_gated_add(hip_trellis2_runner *r, void *dst, const void *src,
                             const void *gate, int N, int dim) {
+    /* Prefer the float4 2D variant when dim is a multiple of 4 — avoids the
+     * `i % dim` modulo and issues 16-byte vector loads/stores. */
+    if (r->fn_gated_add_v4 && (dim & 3) == 0) {
+        void *args[] = {&dst, (void *)&src, (void *)&gate, &N, &dim};
+        int dim4 = dim >> 2;
+        int gx = (dim4 + 255) / 256;
+        hipModuleLaunchKernel(r->fn_gated_add_v4, gx, N, 1, 256, 1, 1,
+                              0, 0, args, NULL);
+        return;
+    }
     int n = N * dim;
     void *args[] = {&dst, &src, &gate, &n, &dim};
     hipModuleLaunchKernel(r->fn_gated_add, (n+255)/256, 1, 1, 256, 1, 1,
@@ -755,6 +1145,55 @@ static void run_silu(hip_trellis2_runner *r, void *x, int n) {
                           0, 0, args, NULL);
 }
 
+/* gelu_pack_bf16_f32: fused GELU + F32->BF16 pack into r->d_act_bf16 scratch.
+ * Used before the next BF16 GEMM (mlp_fc2) to skip the standalone pack_bf16
+ * launch and halve memory traffic on the activation. */
+static void run_gelu_pack(hip_trellis2_runner *r, void *dst_bf16,
+                           const void *src_f32, int n) {
+    int n4 = (n + 3) / 4;
+    void *args[] = { &dst_bf16, (void *)&src_f32, &n };
+    hipModuleLaunchKernel(r->fn_gelu_pack, (n4 + 255) / 256, 1, 1, 256, 1, 1,
+                          0, 0, args, NULL);
+}
+
+/* BF16 GEMM with X already packed into r->d_act_bf16 (skip pack_bf16). */
+static int gemm_bf16x_prepacked(hip_trellis2_runner *r, void *Y,
+                                  const t2_wt *wt, const void *bias,
+                                  int n_out, int n_in, int n_tok) {
+    if (!(wt->w_bf16 && r->use_blaslt && n_tok >= 8)) {
+        fprintf(stderr, "T2-HIP: gemm_bf16x_prepacked called without BF16 weight or hipBLASLt\n");
+        return -1;
+    }
+    return mm_blaslt_run_bf16_bias(Y, wt->w_bf16, r->d_act_bf16, bias,
+                                   n_tok, n_out, n_in, NULL);
+}
+
+/* BF16 GEMM with fused GELU + bias + BF16 D-output: D[bf16] = GELU(X*W^T + bias).
+ * X is r->d_act_bf16, D is written to dst_bf16 directly. Replaces the
+ * fc1(F32-out) + gelu_pack(F32→BF16) two-pass with a single kernel. */
+static int gemm_bf16x_prepacked_gelu_bf16d(hip_trellis2_runner *r, void *dst_bf16,
+                                             const t2_wt *wt, const void *bias,
+                                             int n_out, int n_in, int n_tok) {
+    if (!(wt->w_bf16 && r->use_blaslt && n_tok >= 8 && bias)) {
+        fprintf(stderr, "T2-HIP: gemm_bf16x_prepacked_gelu_bf16d preconds failed\n");
+        return -1;
+    }
+    return mm_blaslt_run_bf16_bias_gelu_bf16d(dst_bf16, wt->w_bf16, r->d_act_bf16,
+                                                bias, n_tok, n_out, n_in, NULL);
+}
+
+/* Same as gemm_bf16x_prepacked but with fused residual: Y = X*W^T + bias + Y. */
+static int gemm_bf16x_prepacked_residual(hip_trellis2_runner *r, void *Y,
+                                          const t2_wt *wt, const void *bias,
+                                          int n_out, int n_in, int n_tok) {
+    if (!(wt->w_bf16 && r->use_blaslt && n_tok >= 8)) {
+        fprintf(stderr, "T2-HIP: gemm_bf16x_prepacked_residual called without BF16 weight or hipBLASLt\n");
+        return -1;
+    }
+    return mm_blaslt_run_bf16_bias_residual(Y, Y, wt->w_bf16, r->d_act_bf16,
+                                             bias, n_tok, n_out, n_in, NULL);
+}
+
 /* gelu_inplace_f32 */
 static void run_gelu(hip_trellis2_runner *r, void *x, int n) {
     void *args[] = {&x, &n};
@@ -768,6 +1207,11 @@ static void run_rms_norm_ph(hip_trellis2_runner *r, void *data, const void *gamm
     float eps = 1e-6f;
     int total = n_tok * n_heads;
     void *args[] = {&data, &gamma, &n_tok, &n_heads, &head_dim, &stride, &eps};
+    if (r->fn_rms_norm_ph_wave && (head_dim & 31) == 0 && head_dim <= 256) {
+        hipModuleLaunchKernel(r->fn_rms_norm_ph_wave, total, 1, 1, 32, 1, 1,
+                              0, 0, args, NULL);
+        return;
+    }
     hipModuleLaunchKernel(r->fn_rms_norm_ph, (total+255)/256, 1, 1, 256, 1, 1,
                           0, 0, args, NULL);
 }
@@ -784,12 +1228,53 @@ static void run_rope_3d(hip_trellis2_runner *r, void *data, int N) {
     hipModuleLaunchKernel(r->fn_rope_3d, N, 1, 1, 256, 1, 1, 0, 0, args, NULL);
 }
 
-/* Self-attention dispatch: prefers gfx12 BF16 WMMA kernel when eligible. */
-static void run_flash_sa(hip_trellis2_runner *r, void *out,
-                          const void *Q, const void *K, const void *V, int N) {
+/* Fused RMSNorm + 3D RoPE: replaces run_rms_norm_ph + run_rope_3d for Q/K when
+ * head_dim % 32 == 0. Single R+W pass over the [n_tok, n_heads, head_dim]
+ * tensor; RoPE rotation done in-register via ds_swizzle on the wave32 layout. */
+static int run_rms_norm_rope_ph(hip_trellis2_runner *r, void *data,
+                                 const void *gamma, int n_tok, int n_heads,
+                                 int head_dim, int stride) {
+    if (!r->fn_rms_norm_rope_ph_wave || (head_dim & 31) != 0 || head_dim > 256) {
+        return -1;
+    }
+    float eps = 1e-6f;
+    int total = n_tok * n_heads;
+    int n_freqs = r->n_rope_freqs;
+    void *args[] = {&data, &gamma, &r->d_rope_cos, &r->d_rope_sin,
+                    &n_tok, &n_heads, &head_dim, &stride, &n_freqs, &eps};
+    return hipModuleLaunchKernel(r->fn_rms_norm_rope_ph_wave, total, 1, 1,
+                                 32, 1, 1, 0, 0, args, NULL) == hipSuccess ? 0 : -1;
+}
+
+/* Self-attention dispatch: prefers gfx12 BF16 WMMA kernel when eligible.
+ * `out_bf16` is an optional BF16 output co-write target (NULL to skip).
+ * `qkv_stride` is the row stride of the Q/K/V tensors in elements; pass 0 for
+ * the default contiguous layout (n_heads * head_dim). Use a non-zero stride
+ * (e.g. 3*n_heads*head_dim) to read Q/K/V from a shared interleaved buffer.
+ * Only the bc32 winner currently honors out_bf16/qkv_stride. */
+static void run_flash_sa(hip_trellis2_runner *r, void *out, void *out_bf16,
+                          const void *Q, const void *K, const void *V, int N,
+                          int qkv_stride) {
     int n_heads  = DIT_HEADS;
     int head_dim = DIT_HEAD_DIM;
     void *args[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim};
+    void *args_bc32[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim, &out_bf16,
+                         &qkv_stride};
+    if (r->use_wmma && r->fn_flash_sa_wmma_b16_db && head_dim == 128 && (N % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_b16_db, n_heads, N / 64, 1, 128, 1, 1,
+                              0, 0, args, NULL);
+        return;
+    }
+    if (r->use_wmma && r->fn_flash_sa_wmma_bc32_db && head_dim == 128 && (N % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32_db, n_heads, N / 64, 1, 128, 1, 1,
+                              0, 0, args, NULL);
+        return;
+    }
+    if (r->use_wmma && r->fn_flash_sa_wmma_bc32 && head_dim == 128 && (N % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32, n_heads, N / 64, 1, 128, 1, 1,
+                              0, 0, args_bc32, NULL);
+        return;
+    }
     if (r->use_wmma && r->fn_flash_sa_wmma && head_dim == 128 && (N % 64) == 0) {
         hipModuleLaunchKernel(r->fn_flash_sa_wmma, n_heads, N / 64, 1, 128, 1, 1,
                               0, 0, args, NULL);
@@ -801,8 +1286,9 @@ static void run_flash_sa(hip_trellis2_runner *r, void *out,
                           smem, 0, args, NULL);
 }
 
-/* Cross-attention dispatch: WMMA path when eligible. */
-static void run_cross_attn(hip_trellis2_runner *r, void *out,
+/* Cross-attention dispatch: WMMA path when eligible. `out_bf16` is an optional
+ * BF16 co-write target (only honored by the bc32 variant; NULL to skip). */
+static void run_cross_attn(hip_trellis2_runner *r, void *out, void *out_bf16,
                              const void *Q, const void *K, const void *V,
                              int q_len, int kv_len) {
     float scale  = 1.0f / sqrtf((float)DIT_HEAD_DIM);
@@ -810,6 +1296,12 @@ static void run_cross_attn(hip_trellis2_runner *r, void *out,
     int n_heads  = DIT_HEADS;
     int head_dim = DIT_HEAD_DIM;
     void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale};
+    void *args_bc32[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale, &out_bf16};
+    if (r->use_wmma && r->fn_cross_attn_wmma_bc32 && head_dim == 128 && (q_len % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_cross_attn_wmma_bc32, n_heads, q_len / 64, 1, 128, 1, 1,
+                              0, 0, args_bc32, NULL);
+        return;
+    }
     if (r->use_wmma && r->fn_cross_attn_wmma && head_dim == 128 && (q_len % 64) == 0) {
         hipModuleLaunchKernel(r->fn_cross_attn_wmma, n_heads, q_len / 64, 1, 128, 1, 1,
                               0, 0, args, NULL);
@@ -966,20 +1458,20 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
     if (!r->dit_loaded) { fprintf(stderr, "T2-HIP: DiT not loaded\n"); return -1; }
 
     /* ---- Input embedding: [n_tok, IN_CH] × [DIT_DIM, IN_CH]^T -> [n_tok, DIT_DIM] ---- */
-    gemm(r, r->d_h, r->dit_input.w, r->d_noise,
+    gemm(r, r->d_h, &r->dit_input, r->d_noise,
          r->dit_input.b, DIT_DIM, DIT_IN_CH, n_tok);
     if (r->b0_dbg) dbg_dl(r->b0_dbg->input_embed, r->d_h, (size_t)n_tok * DIT_DIM);
 
     /* ---- Timestep embedding (already uploaded to d_t_emb) ---- */
     /* FC1: [DIT_DIM, 256] -> [DIT_DIM], SiLU */
-    gemm(r, r->d_t_silu, r->dit_t_fc1.w, r->d_t_emb,
+    gemm(r, r->d_t_silu, &r->dit_t_fc1, r->d_t_emb,
          r->dit_t_fc1.b, DIT_DIM, DIT_T_HALF*2, 1);
     run_silu(r, r->d_t_silu, DIT_DIM);
     /* FC2: [DIT_DIM, DIT_DIM] -> [DIT_DIM]
      * Store FC2 output in d_ada_out (unused otherwise). Must not alias with
      * d_mod since per-block modulation writes to d_mod while reading d_t_out. */
     void *d_t_out = r->d_ada_out;
-    gemm(r, d_t_out, r->dit_t_fc2.w, r->d_t_silu,
+    gemm(r, d_t_out, &r->dit_t_fc2, r->d_t_silu,
          r->dit_t_fc2.b, DIT_DIM, DIT_DIM, 1);
 
     /* ---- Precompute cross-attention KV cache if not valid ---- */
@@ -989,9 +1481,8 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
             t2_block_gpu *b = &r->blocks[bi];
             /* ca_kv_w: [2*DIT_DIM, DIT_COND_DIM] × cond [cond_len, DIT_COND_DIM]^T
              * -> [cond_len, 2*DIT_DIM] */
-            gemm(r, r->d_V, b->ca_kv.w, r->d_cond,
-                 NULL, 2*DIT_DIM, DIT_COND_DIM, cond_len);
-            run_broadcast_bias(r, r->d_V, b->ca_kv.b, cond_len, 2*DIT_DIM);
+            gemm(r, r->d_V, &b->ca_kv, r->d_cond,
+                 b->ca_kv.b, 2*DIT_DIM, DIT_COND_DIM, cond_len);
             /* Split into K, V each [cond_len, DIT_DIM] */
             {
                 void *K = r->ca_K_cache[bi], *V = r->ca_V_cache[bi];
@@ -1016,17 +1507,45 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
      * layout: [shift_sa|scale_sa|gate_sa|shift_mlp|scale_mlp|gate_mlp] each DIT_DIM */
     (void)r->d_ada_out; /* precomputed shared mod; per-block uses d_mod with blk_bias */
 
+    /* Precompute shared GEMV once: d_mod_base = silu(t_emb)*mod_w + mod_b.
+     * Per-block then adds the block-specific bias via a cheap pointwise kernel,
+     * avoiding 30 redundant 12288×2048 GEMVs. */
+    int mod_precomputed = 0;
+    if (r->fn_mod_add_blkbias) {
+        void *out = r->d_mod_base;
+        const void *t_emb = d_t_out, *mod_w = r->dit_ada_mod.w, *mod_b = r->dit_ada_mod.b;
+        const void *blk_bias_null = NULL;
+        int dim = DIT_DIM, out_dim = 6*DIT_DIM;
+        void *args[] = { &out, &t_emb, &mod_w, &mod_b, &blk_bias_null, &dim, &out_dim };
+        int gx = (out_dim + 255) / 256;
+        if (hipModuleLaunchKernel(r->fn_modulation_par, gx, 1, 1, 256, 1, 1,
+                                   DIT_DIM * sizeof(float), 0, args, NULL) == hipSuccess) {
+            mod_precomputed = 1;
+        }
+    }
+
     for (int bi = 0; bi < DIT_DEPTH; bi++) {
         t2_block_gpu *b = &r->blocks[bi];
 
-        /* Per-block modulation: d_mod = d_ada_out + block.mod_bias */
-        {
+        /* Per-block modulation: d_mod = d_mod_base + block.mod_bias.
+         * Falls back to the full per-block GEMV when the cheap add isn't loaded. */
+        if (mod_precomputed) {
+            void *out = r->d_mod;
+            const void *base = r->d_mod_base;
+            const void *blk_bias = b->mod_bias;
+            int n = 6 * DIT_DIM;
+            void *args[] = { &out, (void *)&base, (void *)&blk_bias, &n };
+            int gx = (n + 255) / 256;
+            hipModuleLaunchKernel(r->fn_mod_add_blkbias, gx, 1, 1, 256, 1, 1,
+                                  0, 0, args, NULL);
+        } else {
             void *out = r->d_mod;
             const void *t_emb = d_t_out, *mod_w = r->dit_ada_mod.w, *mod_b = r->dit_ada_mod.b;
             const void *blk_bias = b->mod_bias;
             int dim = DIT_DIM, out_dim = 6*DIT_DIM;
             void *args[] = { &out, &t_emb, &mod_w, &mod_b, &blk_bias, &dim, &out_dim };
-            hipModuleLaunchKernel(r->fn_modulation, 1, 1, 1, 256, 1, 1,
+            int gx = (out_dim + 255) / 256;
+            hipModuleLaunchKernel(r->fn_modulation_par, gx, 1, 1, 256, 1, 1,
                                   DIT_DIM * sizeof(float), 0, args, NULL);
         }
         float *mod = (float *)r->d_mod;
@@ -1039,74 +1558,187 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         void *scale_mlp = mod + 4*DIT_DIM;
         void *gate_mlp  = mod + 5*DIT_DIM;
 
+        /* Norm-fusion gate: when the BF16 hipBLASLt path is active, run a fused
+         * (adaln|layernorm) + F32->BF16 pack kernel that also populates
+         * r->d_act_bf16 in-place, letting the next GEMM skip pack_bf16. */
+        static int norm_fuse_gate = -1;
+        if (norm_fuse_gate < 0) {
+            const char *e = getenv("T2_NORM_FUSE");
+            norm_fuse_gate = (e && atoi(e) == 0) ? 0 : 1;
+        }
+
         /* ---- Self-attention ---- */
-        /* adaLN -> d_ln_h */
-        run_adaln(r, r->d_ln_h, r->d_h, shift_sa, scale_sa, n_tok, DIT_DIM);
-        if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->ln_h_sa, r->d_ln_h, (size_t)n_tok * DIT_DIM);
-        /* QKV projection: [n_tok, DIT_DIM] × [3*DIT_DIM, DIT_DIM]^T -> [n_tok, 3*DIT_DIM] */
-        gemm(r, r->d_qkv, b->sa_qkv.w, r->d_ln_h, NULL, 3*DIT_DIM, DIT_DIM, n_tok);
-        run_broadcast_bias(r, r->d_qkv, b->sa_qkv.b, n_tok, 3*DIT_DIM);
+        /* adaLN -> d_ln_h (and BF16 copy to scratch when fusion eligible) */
+        if (norm_fuse_gate && r->use_blaslt && b->sa_qkv.w_bf16 && n_tok >= 8) {
+            run_adaln_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
+                            shift_sa, scale_sa, n_tok, DIT_DIM);
+            if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->ln_h_sa, r->d_ln_h, (size_t)n_tok * DIT_DIM);
+            gemm_bf16x_prepacked(r, r->d_qkv, &b->sa_qkv, b->sa_qkv.b,
+                                 3*DIT_DIM, DIT_DIM, n_tok);
+        } else {
+            run_adaln(r, r->d_ln_h, r->d_h, shift_sa, scale_sa, n_tok, DIT_DIM);
+            if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->ln_h_sa, r->d_ln_h, (size_t)n_tok * DIT_DIM);
+            gemm(r, r->d_qkv, &b->sa_qkv, r->d_ln_h, b->sa_qkv.b, 3*DIT_DIM, DIT_DIM, n_tok);
+        }
         /* Split QKV */
-        {
+        /* Skip the standalone split_qkv kernel when the bc32 FA + wave RMSNorm
+         * paths are active: they accept a stride argument so Q/K/V can be read
+         * directly from the [n_tok, 3*DIT_DIM] qkv buffer (offsets 0, DIT_DIM,
+         * 2*DIT_DIM and stride=3*DIT_DIM). */
+        static int qkv_unsplit_gate = -1;
+        if (qkv_unsplit_gate < 0) {
+            const char *e = getenv("T2_QKV_UNSPLIT");
+            qkv_unsplit_gate = (e && atoi(e) == 0) ? 0 : 1;
+        }
+        int qkv_unsplit = (qkv_unsplit_gate
+                           && r->fn_rms_norm_rope_ph_wave
+                           && r->use_wmma && r->fn_flash_sa_wmma_bc32
+                           && (n_tok % 64) == 0
+                           && !r->fn_flash_sa_wmma_b16_db
+                           && !r->fn_flash_sa_wmma_bc32_db);
+        void *Q_ptr, *K_ptr, *V_ptr;
+        int qkv_stride;
+        if (qkv_unsplit) {
+            Q_ptr = (char *)r->d_qkv + 0 * DIT_DIM * sizeof(float);
+            K_ptr = (char *)r->d_qkv + 1 * DIT_DIM * sizeof(float);
+            V_ptr = (char *)r->d_qkv + 2 * DIT_DIM * sizeof(float);
+            qkv_stride = 3 * DIT_DIM;
+        } else {
             void *Q = r->d_Q, *K = r->d_K, *V = r->d_V;
             const void *qkv = r->d_qkv;
             int N = n_tok, W = DIT_DIM;
             void *args[] = { &Q, &K, &V, &qkv, &N, &W };
             hipModuleLaunchKernel(r->fn_split_qkv,
                 (n_tok * DIT_DIM + 255)/256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+            Q_ptr = r->d_Q; K_ptr = r->d_K; V_ptr = r->d_V;
+            qkv_stride = 0;  /* default = n_heads*head_dim */
         }
-        /* QK RMSNorm */
-        run_rms_norm_ph(r, r->d_Q, b->sa_q_norm, n_tok, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
-        run_rms_norm_ph(r, r->d_K, b->sa_k_norm, n_tok, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
-        /* 3D RoPE on Q and K */
-        run_rope_3d(r, r->d_Q, n_tok);
-        run_rope_3d(r, r->d_K, n_tok);
+        /* QK RMSNorm + 3D RoPE (fused when available, falls back to two-pass) */
+        if (run_rms_norm_rope_ph(r, Q_ptr, b->sa_q_norm, n_tok, DIT_HEADS,
+                                  DIT_HEAD_DIM,
+                                  qkv_unsplit ? qkv_stride : DIT_DIM) != 0) {
+            /* Fallback path: two-pass requires non-strided buffer (no stride
+             * arg in run_rope_3d), so split must be active in fallback. */
+            run_rms_norm_ph(r, Q_ptr, b->sa_q_norm, n_tok, DIT_HEADS,
+                            DIT_HEAD_DIM, DIT_DIM);
+            run_rope_3d(r, Q_ptr, n_tok);
+        }
+        if (run_rms_norm_rope_ph(r, K_ptr, b->sa_k_norm, n_tok, DIT_HEADS,
+                                  DIT_HEAD_DIM,
+                                  qkv_unsplit ? qkv_stride : DIT_DIM) != 0) {
+            run_rms_norm_ph(r, K_ptr, b->sa_k_norm, n_tok, DIT_HEADS,
+                            DIT_HEAD_DIM, DIT_DIM);
+            run_rope_3d(r, K_ptr, n_tok);
+        }
         if (bi == 0 && r->b0_dbg) {
-            dbg_dl(r->b0_dbg->q_post, r->d_Q, (size_t)n_tok * DIT_DIM);
-            dbg_dl(r->b0_dbg->k_post, r->d_K, (size_t)n_tok * DIT_DIM);
-            dbg_dl(r->b0_dbg->v,      r->d_V, (size_t)n_tok * DIT_DIM);
+            /* Debug dumps assume contiguous Q/K/V — disabled in unsplit mode */
+            if (!qkv_unsplit) {
+                dbg_dl(r->b0_dbg->q_post, Q_ptr, (size_t)n_tok * DIT_DIM);
+                dbg_dl(r->b0_dbg->k_post, K_ptr, (size_t)n_tok * DIT_DIM);
+                dbg_dl(r->b0_dbg->v,      V_ptr, (size_t)n_tok * DIT_DIM);
+            }
         }
-        /* Flash attention -> attn_out */
-        run_flash_sa(r, r->d_attn_out, r->d_Q, r->d_K, r->d_V, n_tok);
+        /* Flash attention -> attn_out (with optional fused BF16 co-write to scratch).
+         * The bc32 winner kernel writes both F32 (for dbg) and BF16 (consumed by
+         * the next sa_out GEMM, skipping pack_bf16). */
+        int fa_fuse = (norm_fuse_gate && r->use_blaslt && b->sa_out.w_bf16
+                       && n_tok >= 8 && r->use_wmma && r->fn_flash_sa_wmma_bc32
+                       && (n_tok % 64) == 0
+                       && !r->fn_flash_sa_wmma_b16_db && !r->fn_flash_sa_wmma_bc32_db);
+        /* When fa_fuse is on and not in dbg mode, the F32 d_attn_out write is
+         * unused (sa_out reads BF16 d_act_bf16). Pass NULL to skip the F32
+         * store inside the kernel — saves ~32MB write per block. */
+        int fa_skip_f32 = fa_fuse && !(bi == 0 && r->b0_dbg);
+        run_flash_sa(r, fa_skip_f32 ? NULL : r->d_attn_out,
+                      fa_fuse ? r->d_act_bf16 : NULL,
+                      Q_ptr, K_ptr, V_ptr, n_tok, qkv_stride);
         /* Output projection: [n_tok, DIT_DIM] × [DIT_DIM, DIT_DIM]^T */
-        gemm(r, r->d_ln_h, b->sa_out.w, r->d_attn_out, NULL, DIT_DIM, DIT_DIM, n_tok);
-        run_broadcast_bias(r, r->d_ln_h, b->sa_out.b, n_tok, DIT_DIM);
+        if (fa_fuse) {
+            gemm_bf16x_prepacked(r, r->d_ln_h, &b->sa_out, b->sa_out.b,
+                                 DIT_DIM, DIT_DIM, n_tok);
+        } else {
+            gemm(r, r->d_ln_h, &b->sa_out, r->d_attn_out, b->sa_out.b, DIT_DIM, DIT_DIM, n_tok);
+        }
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->sa_proj, r->d_ln_h, (size_t)n_tok * DIT_DIM);
         /* Gated residual: d_h += gate_sa * d_ln_h */
         run_gated_add(r, r->d_h, r->d_ln_h, gate_sa, n_tok, DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_sa, r->d_h, (size_t)n_tok * DIT_DIM);
 
         /* ---- Cross-attention ---- */
-        /* norm2 -> d_ln_h */
-        run_layernorm(r, r->d_ln_h, r->d_h, b->norm2_w, b->norm2_b, n_tok, DIT_DIM);
-        /* Q projection: [n_tok, DIT_DIM] × [DIT_DIM, DIT_DIM]^T -> d_ca_Q */
-        gemm(r, r->d_ca_Q, b->ca_q.w, r->d_ln_h, NULL, DIT_DIM, DIT_DIM, n_tok);
-        run_broadcast_bias(r, r->d_ca_Q, b->ca_q.b, n_tok, DIT_DIM);
+        /* norm2 -> d_ln_h (with optional fused BF16 pack into scratch) */
+        if (norm_fuse_gate && r->use_blaslt && b->ca_q.w_bf16 && n_tok >= 8) {
+            run_layernorm_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
+                                b->norm2_w, b->norm2_b, n_tok, DIT_DIM);
+            gemm_bf16x_prepacked(r, r->d_ca_Q, &b->ca_q, b->ca_q.b,
+                                 DIT_DIM, DIT_DIM, n_tok);
+        } else {
+            run_layernorm(r, r->d_ln_h, r->d_h, b->norm2_w, b->norm2_b, n_tok, DIT_DIM);
+            gemm(r, r->d_ca_Q, &b->ca_q, r->d_ln_h, b->ca_q.b, DIT_DIM, DIT_DIM, n_tok);
+        }
         /* Q RMSNorm */
         run_rms_norm_ph(r, r->d_ca_Q, b->ca_q_norm, n_tok, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
-        /* Cross-attention using cached K,V */
-        run_cross_attn(r, r->d_attn_out, r->d_ca_Q,
-                        r->ca_K_cache[bi], r->ca_V_cache[bi],
+        /* Cross-attention using cached K,V (with optional BF16 co-write). */
+        int ca_fuse = (norm_fuse_gate && r->use_blaslt && b->ca_out.w_bf16
+                       && n_tok >= 8 && r->use_wmma && r->fn_cross_attn_wmma_bc32
+                       && (n_tok % 64) == 0);
+        /* Skip F32 write when CA-fused and not dbg (ca_out reads BF16). */
+        int ca_skip_f32 = ca_fuse && !(bi == 0 && r->b0_dbg);
+        run_cross_attn(r, ca_skip_f32 ? NULL : r->d_attn_out,
+                        ca_fuse ? r->d_act_bf16 : NULL,
+                        r->d_ca_Q, r->ca_K_cache[bi], r->ca_V_cache[bi],
                         n_tok, r->ca_kv_len);
-        /* Output projection */
-        gemm(r, r->d_ln_h, b->ca_out.w, r->d_attn_out, NULL, DIT_DIM, DIT_DIM, n_tok);
-        run_broadcast_bias(r, r->d_ln_h, b->ca_out.b, n_tok, DIT_DIM);
+        /* Output projection + residual (fused via hipBLASLt beta=1 when active).
+         * Cross-attn has no gate, so D = X*W^T + bias + d_h written into d_h. */
+        static int ca_res_fuse_gate = -1;
+        if (ca_res_fuse_gate < 0) {
+            const char *e = getenv("T2_CA_RES_FUSE");
+            ca_res_fuse_gate = (e && atoi(e) == 0) ? 0 : 1;
+        }
+        int ca_res_fuse = (ca_fuse && ca_res_fuse_gate && !(bi == 0 && r->b0_dbg));
+        if (ca_res_fuse) {
+            gemm_bf16x_prepacked_residual(r, r->d_h, &b->ca_out, b->ca_out.b,
+                                           DIT_DIM, DIT_DIM, n_tok);
+        } else if (ca_fuse) {
+            gemm_bf16x_prepacked(r, r->d_ln_h, &b->ca_out, b->ca_out.b,
+                                 DIT_DIM, DIT_DIM, n_tok);
+        } else {
+            gemm(r, r->d_ln_h, &b->ca_out, r->d_attn_out, b->ca_out.b, DIT_DIM, DIT_DIM, n_tok);
+        }
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->ca_proj, r->d_ln_h, (size_t)n_tok * DIT_DIM);
-        /* Direct residual (no gate in cross-attn) */
-        run_residual_add(r, r->d_h, r->d_ln_h, n_tok * DIT_DIM);
+        /* Direct residual (no gate in cross-attn) — folded into GEMM when fused */
+        if (!ca_res_fuse) run_residual_add(r, r->d_h, r->d_ln_h, n_tok * DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_ca, r->d_h, (size_t)n_tok * DIT_DIM);
 
         /* ---- MLP ---- */
-        /* adaLN (scale2/shift2) -> d_ln_h */
-        run_adaln(r, r->d_ln_h, r->d_h, shift_mlp, scale_mlp, n_tok, DIT_DIM);
-        if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->ln_h_mlp, r->d_ln_h, (size_t)n_tok * DIT_DIM);
-        /* FC1: [n_tok, DIT_DIM] × [DIT_FFN, DIT_DIM]^T -> [n_tok, DIT_FFN] */
-        gemm(r, r->d_mlp_mid, b->mlp_fc1.w, r->d_ln_h, NULL, DIT_FFN, DIT_DIM, n_tok);
-        run_broadcast_bias(r, r->d_mlp_mid, b->mlp_fc1.b, n_tok, DIT_FFN);
-        run_gelu(r, r->d_mlp_mid, n_tok * DIT_FFN);
-        /* FC2: [n_tok, DIT_FFN] × [DIT_DIM, DIT_FFN]^T -> [n_tok, DIT_DIM] */
-        gemm(r, r->d_ln_h, b->mlp_fc2.w, r->d_mlp_mid, NULL, DIT_DIM, DIT_FFN, n_tok);
-        run_broadcast_bias(r, r->d_ln_h, b->mlp_fc2.b, n_tok, DIT_DIM);
+        /* adaLN (scale2/shift2) -> d_ln_h (with optional fused BF16 pack) */
+        if (norm_fuse_gate && r->use_blaslt && b->mlp_fc1.w_bf16 && n_tok >= 8) {
+            run_adaln_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
+                            shift_mlp, scale_mlp, n_tok, DIT_DIM);
+            if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->ln_h_mlp, r->d_ln_h, (size_t)n_tok * DIT_DIM);
+            gemm_bf16x_prepacked(r, r->d_mlp_mid, &b->mlp_fc1, b->mlp_fc1.b,
+                                 DIT_FFN, DIT_DIM, n_tok);
+        } else {
+            run_adaln(r, r->d_ln_h, r->d_h, shift_mlp, scale_mlp, n_tok, DIT_DIM);
+            if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->ln_h_mlp, r->d_ln_h, (size_t)n_tok * DIT_DIM);
+            gemm(r, r->d_mlp_mid, &b->mlp_fc1, r->d_ln_h, b->mlp_fc1.b, DIT_FFN, DIT_DIM, n_tok);
+        }
+        /* FC2: [n_tok, DIT_FFN] × [DIT_DIM, DIT_FFN]^T -> [n_tok, DIT_DIM]
+         * When the BF16 hipBLASLt path is active, fuse GELU + F32->BF16 pack
+         * into a single kernel that writes directly to the activation scratch,
+         * then call hipBLASLt without a separate pack_bf16 launch. */
+        static int gelu_fuse_gate = -1;
+        if (gelu_fuse_gate < 0) {
+            const char *e = getenv("T2_GELU_FUSE");
+            gelu_fuse_gate = (e && atoi(e) == 0) ? 0 : 1;
+        }
+        if (gelu_fuse_gate && r->use_blaslt && b->mlp_fc2.w_bf16 && n_tok >= 8) {
+            run_gelu_pack(r, r->d_act_bf16, r->d_mlp_mid, n_tok * DIT_FFN);
+            gemm_bf16x_prepacked(r, r->d_ln_h, &b->mlp_fc2, b->mlp_fc2.b,
+                                 DIT_DIM, DIT_FFN, n_tok);
+        } else {
+            run_gelu(r, r->d_mlp_mid, n_tok * DIT_FFN);
+            gemm(r, r->d_ln_h, &b->mlp_fc2, r->d_mlp_mid, b->mlp_fc2.b, DIT_DIM, DIT_FFN, n_tok);
+        }
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->mlp_proj, r->d_ln_h, (size_t)n_tok * DIT_DIM);
         /* Gated residual: d_h += gate_mlp * d_ln_h */
         run_gated_add(r, r->d_h, r->d_ln_h, gate_mlp, n_tok, DIT_DIM);
@@ -1123,8 +1755,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
     run_ln_noaffine(r, r->d_ln_h, r->d_h, n_tok, DIT_DIM);
 
     /* ---- Output projection: [n_tok, DIT_DIM] × [DIT_IN_CH, DIT_DIM]^T ---- */
-    gemm(r, r->d_vel, r->dit_out.w, r->d_ln_h, NULL, DIT_IN_CH, DIT_DIM, n_tok);
-    run_broadcast_bias(r, r->d_vel, r->dit_out.b, n_tok, DIT_IN_CH);
+    gemm(r, r->d_vel, &r->dit_out, r->d_ln_h, r->dit_out.b, DIT_IN_CH, DIT_DIM, n_tok);
 
     hipDeviceSynchronize();
     return DIT_DEPTH;  /* completed all blocks */

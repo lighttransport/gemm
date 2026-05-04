@@ -29,6 +29,35 @@ int  mm_blaslt_run_bf16(void *d_y_f32, const void *d_w_bf16,
                        const void *d_x_bf16,
                        int M, int N, int K, void *stream);
 
+/* Same as mm_blaslt_run_bf16 but with fused F32 bias epilogue: Y = X*W^T + bias[N].
+ * bias may be NULL — in that case behavior matches mm_blaslt_run_bf16. */
+int  mm_blaslt_run_bf16_bias(void *d_y_f32, const void *d_w_bf16,
+                             const void *d_x_bf16, const void *d_bias_f32,
+                             int M, int N, int K, void *stream);
+
+/* Fused bias + residual: D = X*W^T + bias + C, where C is F32 [M,N] (row-major).
+ * beta=1.0 internally; pass d_c=d_y to do an in-place "Y += X*W^T + bias".
+ * Equivalent to mm_blaslt_run_bf16_bias followed by a residual add. */
+int  mm_blaslt_run_bf16_bias_residual(void *d_y_f32, const void *d_c_f32,
+                                      const void *d_w_bf16,
+                                      const void *d_x_bf16,
+                                      const void *d_bias_f32,
+                                      int M, int N, int K, void *stream);
+
+/* Fused bias + GELU with BF16 D output: D[bf16] = GELU(X*W^T + bias).
+ * Writes BF16 directly into d_y_bf16 (no F32 D buffer). Useful before the
+ * next BF16 GEMM (e.g. mlp_fc2) — eliminates the standalone gelu_pack pass. */
+int  mm_blaslt_run_bf16_bias_gelu_bf16d(void *d_y_bf16, const void *d_w_bf16,
+                                         const void *d_x_bf16,
+                                         const void *d_bias_f32,
+                                         int M, int N, int K, void *stream);
+
+/* Bias-only with BF16 D output: D[bf16] = X*W^T + bias.  Bias is required. */
+int  mm_blaslt_run_bf16_bias_bf16d(void *d_y_bf16, const void *d_w_bf16,
+                                    const void *d_x_bf16,
+                                    const void *d_bias_f32,
+                                    int M, int N, int K, void *stream);
+
 /* Tear down all cached plans + handle. Safe to call multiple times. */
 void mm_blaslt_destroy(void);
 
