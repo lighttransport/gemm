@@ -1130,18 +1130,30 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
             }
             if (b->use_moe) {
                 for (int e = 0; e < DIT_N_EXPERTS; e++) {
-                    if (b->moe_expert_fc1_w[e] &&
-                        hy3d_quantize_w_fp8(&r->ops, r->stream,
-                                             b->moe_expert_fc1_w[e], fc1_n,
-                                             &b->moe_expert_fc1_w_fp8[e],
-                                             &b->moe_expert_fc1_w_scale[e]) == 0)
-                        { n_quant++; bytes += fc1_n; }
-                    if (b->moe_expert_fc2_w[e] &&
-                        hy3d_quantize_w_fp8(&r->ops, r->stream,
-                                             b->moe_expert_fc2_w[e], fc2_n,
-                                             &b->moe_expert_fc2_w_fp8[e],
-                                             &b->moe_expert_fc2_w_scale[e]) == 0)
-                        { n_quant++; bytes += fc2_n; }
+                    if (b->moe_expert_fc1_w[e]) {
+                        int ok = wpr
+                            ? (hy3d_quantize_w_fp8_perrow(&r->ops, r->stream,
+                                    b->moe_expert_fc1_w[e], DIT_FFN, DIT_HIDDEN,
+                                    &b->moe_expert_fc1_w_fp8[e],
+                                    &b->moe_expert_fc1_w_scale[e]) == 0)
+                            : (hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                    b->moe_expert_fc1_w[e], fc1_n,
+                                    &b->moe_expert_fc1_w_fp8[e],
+                                    &b->moe_expert_fc1_w_scale[e]) == 0);
+                        if (ok) { n_quant++; bytes += fc1_n; }
+                    }
+                    if (b->moe_expert_fc2_w[e]) {
+                        int ok = wpr
+                            ? (hy3d_quantize_w_fp8_perrow(&r->ops, r->stream,
+                                    b->moe_expert_fc2_w[e], DIT_HIDDEN, DIT_FFN,
+                                    &b->moe_expert_fc2_w_fp8[e],
+                                    &b->moe_expert_fc2_w_scale[e]) == 0)
+                            : (hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                    b->moe_expert_fc2_w[e], fc2_n,
+                                    &b->moe_expert_fc2_w_fp8[e],
+                                    &b->moe_expert_fc2_w_scale[e]) == 0);
+                        if (ok) { n_quant++; bytes += fc2_n; }
+                    }
                 }
                 /* Shared expert / dense path — also routed through op_gemm_qw_dit,
                  * so must use the same scale layout as the ATTN/MLP weights. */
