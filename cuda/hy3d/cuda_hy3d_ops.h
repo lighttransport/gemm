@@ -327,6 +327,28 @@ static inline void op_gemm_qw(hy3d_ops *ops, CUstream stream,
         op_gemm(ops, stream, Y, w_f16, X, bias, n_out, n_in, n_tok);
         return;
     }
+    /* Per-row-W path: w_scale is a [n_out] device buffer, not a single float.
+     * Same MT4 gating as the per-tensor path below. */
+    if (ops->use_fp8_w_perrow && ops->gemm_fp8_perrow_mt4_wpr &&
+        n_tok >= 64 && (n_out % 256) == 0 &&
+        ((n_tok % 64) == 0 || ops->use_fp8_mt4_tail) &&
+        hy3d_ops_ensure_row_max(ops, n_tok) == 0) {
+        {
+            void *rargs[] = {&ops->d_row_max, &X, &n_tok, &n_in};
+            cuLaunchKernel(ops->reduce_max_abs_per_row, (unsigned)n_tok, 1, 1,
+                           256, 1, 1, 0, stream, rargs, NULL);
+        }
+        void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok,
+                        &w_scale, &ops->d_row_max};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+        unsigned gx4 = (gx + 3u) & ~3u;
+        gy4 = (gy4 + 3u) & ~3u;
+        size_t smem_wpr = 2048 + 8192 * 2 + 512 + 1024;
+        cuLaunchKernel(ops->gemm_fp8_perrow_mt4_wpr, gx4, gy4, 1, 128, 1, 1,
+                       smem_wpr, stream, args, NULL);
+        return;
+    }
     if (hy3d_ops_ensure_row_max(ops, n_tok) != 0) {
         op_gemm(ops, stream, Y, w_f16, X, bias, n_out, n_in, n_tok);
         return;
@@ -379,6 +401,21 @@ static inline int op_gemm_qw_premax(hy3d_ops *ops, CUstream stream,
         !ops->gemm_fp8_perrow ||
         n_tok < 16 || (n_in % 32) != 0 || (n_out % 64) != 0) {
         return -1;
+    }
+    /* Per-row-W path: w_scale is [n_out] not scalar. */
+    if (ops->use_fp8_w_perrow && ops->gemm_fp8_perrow_mt4_wpr &&
+        n_tok >= 64 && (n_out % 256) == 0 &&
+        ((n_tok % 64) == 0 || ops->use_fp8_mt4_tail)) {
+        void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok,
+                        &w_scale, &d_row_max};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+        unsigned gx4 = (gx + 3u) & ~3u;
+        gy4 = (gy4 + 3u) & ~3u;
+        size_t smem_wpr = 2048 + 8192 * 2 + 512 + 1024;
+        cuLaunchKernel(ops->gemm_fp8_perrow_mt4_wpr, gx4, gy4, 1, 128, 1, 1,
+                       smem_wpr, stream, args, NULL);
+        return 0;
     }
     float w_scale_h = hy3d_ops_scale_get(ops, w_scale);
     void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok,
