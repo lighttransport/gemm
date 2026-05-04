@@ -105,6 +105,7 @@ typedef struct {
     int use_bf16_gemm;           /* HY3D_BF16_GEMM, default OFF (precision fallback) */
     int use_bf16_pipe3;          /* HY3D_BF16_PIPE3, default OFF — opt-in 3-stage cp.async W pipeline */
     int use_bf16_mt4;            /* HY3D_BF16_MT4, default OFF — opt-in MTILE=4 BF16 pipe (64 rows/CTA) */
+    int use_fp8_mt4_tail;        /* HY3D_FP8_MT4_TAIL: relax MT4 n_tok %64==0 gate — bounds checks already in kernel */
     int disable_mt4;             /* HY3D_DISABLE_MT4, default OFF */
 
     /* Lazy scratch buffers for tensor-core attention. Owned by the ops struct,
@@ -334,7 +335,7 @@ static inline void op_gemm_qw(hy3d_ops *ops, CUstream stream,
                     &w_scale_h, &ops->d_row_max};
     unsigned gx = (unsigned)((n_out + 255) / 256);
     if (!ops->disable_mt4 && ops->gemm_fp8_perrow_mt4 &&
-        n_tok >= 64 && (n_tok % 64) == 0) {
+        n_tok >= 64 && ((n_tok % 64) == 0 || ops->use_fp8_mt4_tail)) {
         unsigned gy4 = (unsigned)((n_tok + 63) / 64);
         unsigned gx4 = (gx + 3u) & ~3u;
         gy4 = (gy4 + 3u) & ~3u;
@@ -373,7 +374,7 @@ static inline int op_gemm_qw_premax(hy3d_ops *ops, CUstream stream,
                     &w_scale_h, &d_row_max};
     unsigned gx = (unsigned)((n_out + 255) / 256);
     if (!ops->disable_mt4 && ops->gemm_fp8_perrow_mt4 &&
-        n_tok >= 64 && (n_tok % 64) == 0) {
+        n_tok >= 64 && ((n_tok % 64) == 0 || ops->use_fp8_mt4_tail)) {
         unsigned gy4 = (unsigned)((n_tok + 63) / 64);
         unsigned gx4 = (gx + 3u) & ~3u;
         gy4 = (gy4 + 3u) & ~3u;
