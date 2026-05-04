@@ -2335,12 +2335,21 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
         r->ops.use_bf16_pipe3 = (env && env[0] != '0' &&
                                  r->ops.gemm_bf16_pipe3_scaled) ? 1 : 0;
 
+        /* MTILE=4 (64 rows/CTA) BF16 pipe. Doubles MMAs per CTA, halves CTA
+         * count along M. Verified -38% DiT wall-clock vs MTILE=2 on RTX 5060
+         * Ti, bit-identical output. Default ON when sm>=80 and FP8 prequant
+         * is wired (same gate as bf16_gemm). */
+        env = getenv("HY3D_BF16_MT4");
+        r->ops.use_bf16_mt4 = (r->ops.gemm_bf16_pipe_mt4_scaled &&
+                               r->ops.use_bf16_gemm)
+                              ? ((env && env[0] == '0') ? 0 : 1) : 0;
+
         if (verbose) {
             fprintf(stderr,
-                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d bf16_gemm=%d pipe3=%d mt4=%s (sm_%d)\n",
+                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d bf16_gemm=%d pipe3=%d bf16_mt4=%d mt4=%s (sm_%d)\n",
                 r->ops.use_bf16_attn, r->ops.use_fp8_attn, r->ops.use_fp8_gemm,
                 r->ops.use_fp8_gemm_attn_mlp,
-                r->ops.use_bf16_gemm, r->ops.use_bf16_pipe3,
+                r->ops.use_bf16_gemm, r->ops.use_bf16_pipe3, r->ops.use_bf16_mt4,
                 r->ops.disable_mt4 ? "off" : "on", sm);
         }
     }
