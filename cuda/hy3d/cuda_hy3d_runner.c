@@ -2584,10 +2584,10 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
          * scale, eliminating the per-tensor outlier crush that broke
          * use_fp8_gemm_attn_mlp. Implies HY3D_FP8_GEMM_ATTN_MLP=1. */
         env = getenv("HY3D_FP8_W_PERROW");
-        r->ops.use_fp8_w_perrow = (env && env[0] != '0' &&
-                                   r->ops.use_fp8_gemm &&
+        r->ops.use_fp8_w_perrow = (r->ops.use_fp8_gemm &&
                                    r->ops.gemm_fp8_perrow_mt4_wpr &&
-                                   r->ops.quantize_fp8_per_row) ? 1 : 0;
+                                   r->ops.quantize_fp8_per_row)
+                                  ? ((env && env[0] == '0') ? 0 : 1) : 0;
         if (r->ops.use_fp8_w_perrow) r->ops.use_fp8_gemm_attn_mlp = 1;
 
         /* BF16-pipe-scaled is the safe-and-fast path for DiT attn/MLP:
