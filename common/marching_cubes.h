@@ -491,6 +491,61 @@ mc_mesh mc_marching_cubes(const float *grid, int nx, int ny, int nz,
     result.n_verts = verts.count / 3;
     result.triangles = faces.data;
     result.n_tris = faces.count / 3;
+
+    /* Vertex dedup: edges shared between adjacent cubes produce bit-identical
+     * verts (deterministic linear interp on the same two corner values), so
+     * exact float32-bit hash dedup recovers a fully indexed manifold mesh.
+     * Hy3d shape-gen typically goes ~3 verts/tri → ~1 vert/tri after this. */
+    if (result.n_verts > 0) {
+        int nv = result.n_verts;
+        size_t cap = 1;
+        while (cap < (size_t)nv * 2) cap <<= 1;
+        int *bucket = (int *)malloc(cap * sizeof(int));
+        int *remap  = (int *)malloc((size_t)nv * sizeof(int));
+        if (bucket && remap) {
+            for (size_t i = 0; i < cap; i++) bucket[i] = -1;
+            float *vout = (float *)malloc((size_t)nv * 3 * sizeof(float));
+            int n_unique = 0;
+            for (int i = 0; i < nv; i++) {
+                const float *v = &result.vertices[i*3];
+                uint32_t b0, b1, b2;
+                memcpy(&b0, &v[0], 4); memcpy(&b1, &v[1], 4); memcpy(&b2, &v[2], 4);
+                /* MurmurHash3-style mix */
+                uint32_t h = b0 * 0xcc9e2d51u;
+                h = (h << 15) | (h >> 17); h *= 0x1b873593u;
+                h ^= b1 * 0xcc9e2d51u;
+                h = (h << 13) | (h >> 19); h = h * 5 + 0xe6546b64u;
+                h ^= b2;
+                h ^= h >> 16; h *= 0x85ebca6bu;
+                h ^= h >> 13; h *= 0xc2b2ae35u;
+                h ^= h >> 16;
+                size_t mask = cap - 1;
+                size_t s = h & mask;
+                int idx;
+                while ((idx = bucket[s]) != -1) {
+                    const float *u = &vout[idx*3];
+                    if (u[0] == v[0] && u[1] == v[1] && u[2] == v[2]) break;
+                    s = (s + 1) & mask;
+                }
+                if (idx == -1) {
+                    idx = n_unique++;
+                    vout[idx*3+0] = v[0]; vout[idx*3+1] = v[1]; vout[idx*3+2] = v[2];
+                    bucket[s] = idx;
+                }
+                remap[i] = idx;
+            }
+            for (int i = 0; i < result.n_tris * 3; i++) {
+                result.triangles[i] = remap[result.triangles[i]];
+            }
+            free(result.vertices);
+            result.vertices = (float *)realloc(vout, (size_t)n_unique * 3 * sizeof(float));
+            if (!result.vertices) result.vertices = vout;
+            result.n_verts = n_unique;
+        }
+        free(bucket);
+        free(remap);
+    }
+
     return result;
 }
 
