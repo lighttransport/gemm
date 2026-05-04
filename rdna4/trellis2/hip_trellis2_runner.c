@@ -7,6 +7,24 @@
  *
  * Cross-attention KV cache: precomputed once per image, reused across 12 steps.
  *
+ * Performance gates (env vars; all "1" or unset = on, "0" = off):
+ *   T2_WMMA           BF16 WMMA GEMM (RDNA4 matrix cores).            default ON
+ *   T2_BLASLT         hipBLASLt path for large GEMMs.                 default ON
+ *   T2_FA_BC32        BF16 WMMA flash-attn Bc=32 tile.                default ON
+ *   T2_FA_V2          FA softmax deferred-sum variant (-7 ms/step).   default ON
+ *   T2_CA_BC32        BF16 WMMA cross-attn Bc=32 tile.                default ON
+ *   T2_CA_V2          CA softmax deferred-sum variant (-3 ms/step).   default ON
+ *   T2_QKNORM_FUSE    Fused per-head RMSNorm+RoPE wave32.             default ON
+ *   T2_NORM_FUSE      Fused adaLN + F32->BF16 pack into hipBLASLt.    default ON
+ *   T2_QKV_UNSPLIT    Unified QKV path skipping split-rms-rope.       default ON
+ *   T2_CA_RES_FUSE    Cross-attn output projection + residual fuse.   default ON
+ *   T2_GELU_FUSE      Fused GELU + BF16 pack between MLP halves.      default ON
+ *   T2_FA_DB          Double-buffered KV FA (Bc=32). occupancy loss.  default OFF
+ *   T2_FA_B16DB       Double-buffered KV FA (Bc=16). occupancy loss.  default OFF
+ *
+ * Warm-step floor: ~336 ms on RX 9070 XT (gfx1201) vs PyTorch BF16 ROCm 292 ms
+ * baseline. See memory/project_trellis2_floor.md for the optimization log.
+ *
  * SPDX-License-Identifier: MIT
  * Copyright 2025 - Present, Light Transport Entertainment Inc.
  */
