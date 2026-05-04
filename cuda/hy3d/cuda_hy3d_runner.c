@@ -393,10 +393,21 @@ struct cuda_hy3d_runner {
     float *init_ctx_uncond;   /* host-side [1370,1024] override (optional) */
     int init_ctx_n;
 
-    /* Pre-computed cross-attention K,V for DiT (constant across diffusion steps) */
-    CUdeviceptr dit_ca_K[DIT_DEPTH];   /* [DINO_SEQ_LEN, DIT_HIDDEN] */
-    CUdeviceptr dit_ca_V[DIT_DEPTH];   /* [DINO_SEQ_LEN, DIT_HIDDEN] */
-    int ca_kv_precomputed;
+    /* Cross-attention K,V cache.
+     * Context (DINOv2 features) is constant across the 30 diffusion steps within
+     * one CFG pass. With CFG enabled there are at most 2 distinct contexts
+     * (cond + uncond). Cache post-rmsnorm K and post-split V per (slot, block);
+     * skip K/V GEMM + concat + split + RMSNorm on cache hit.
+     * Saves 21 blocks × 2 GEMMs × 59 reuses ≈ 2.5k GEMM dispatches per mesh. */
+#define HY3D_CAKV_SLOTS 2
+    struct {
+        CUdeviceptr ctx;            /* cache key (d_context pointer) */
+        CUdeviceptr K[DIT_DEPTH];   /* [ctx_len, H_dim] post-rmsnorm K */
+        CUdeviceptr V[DIT_DEPTH];   /* [ctx_len, H_dim] post-split V */
+        int populated;              /* 0 = needs compute, 1 = cached */
+    } cakv_cache[HY3D_CAKV_SLOTS];
+    int cakv_lru_next;
+    int use_cakv_cache;
 
     /* Load status */
     int dino_loaded, dit_loaded, vae_loaded;
@@ -1763,8 +1774,10 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     CUdeviceptr d_tmlp    = d_temb + (size_t)H_dim * sizeof(float);
     CUdeviceptr d_cross_Q = d_tmlp + (size_t)ffn * sizeof(float);
     CUdeviceptr d_cat_buf = d_cross_Q + (size_t)N1 * H_dim * sizeof(float);
-    CUdeviceptr d_ca_K    = d_cat_buf + cat_buf_sz;
-    CUdeviceptr d_ca_V    = d_ca_K + ca_kv_sz;
+    const CUdeviceptr d_ca_K_scratch = d_cat_buf + cat_buf_sz;
+    const CUdeviceptr d_ca_V_scratch = d_ca_K_scratch + ca_kv_sz;
+    CUdeviceptr d_ca_K = d_ca_K_scratch;
+    CUdeviceptr d_ca_V = d_ca_V_scratch;
     CUdeviceptr d_moe_scratch = r->scratch[1]; /* shared with d_qkv/d_mlp */
 
     /* Skip stack: GPU-resident (was CPU RAM with sync DtoH/HtoD per push/pop;
@@ -1875,6 +1888,43 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         hy3d_dbg_dump_tagged_npy(stream, d_context, ctx_len, DIT_CONTEXT_DIM,
                                  "cuda_dit_context", pass_tag);
 
+    /* Cross-attention K/V cache: pick a slot for this d_context.
+     * Hit -> reuse cached per-block K/V. Miss -> evict via round-robin LRU,
+     * (re)allocate buffers if needed, mark unpopulated and fill during the
+     * block loop. */
+    int cakv_slot = -1;
+    if (r->use_cakv_cache) {
+        for (int s = 0; s < HY3D_CAKV_SLOTS; s++) {
+            if (r->cakv_cache[s].populated && r->cakv_cache[s].ctx == d_context) {
+                cakv_slot = s;
+                break;
+            }
+        }
+        if (cakv_slot < 0) {
+            cakv_slot = r->cakv_lru_next;
+            r->cakv_lru_next = (r->cakv_lru_next + 1) % HY3D_CAKV_SLOTS;
+            r->cakv_cache[cakv_slot].ctx = d_context;
+            r->cakv_cache[cakv_slot].populated = 0;
+            for (int i = 0; i < DIT_DEPTH; i++) {
+                if (!r->cakv_cache[cakv_slot].K[i]) {
+                    if (cuMemAlloc(&r->cakv_cache[cakv_slot].K[i], ca_kv_sz) != CUDA_SUCCESS) {
+                        r->cakv_cache[cakv_slot].K[i] = 0;
+                        cakv_slot = -1; /* fall back to recompute every step */
+                        break;
+                    }
+                }
+                if (!r->cakv_cache[cakv_slot].V[i]) {
+                    if (cuMemAlloc(&r->cakv_cache[cakv_slot].V[i], ca_kv_sz) != CUDA_SUCCESS) {
+                        r->cakv_cache[cakv_slot].V[i] = 0;
+                        cakv_slot = -1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    int cakv_hit = (cakv_slot >= 0 && r->cakv_cache[cakv_slot].populated);
+
     /* Skip value stack pointer: blocks 0..DIT_HALF_DEPTH save hidden states */
     int skip_sp = 0;
 
@@ -1942,7 +1992,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
          *   V → end of scratch[3] (d_temb buffer has 123MB, V needs 33.5MB at offset ~90MB) */
         CUdeviceptr d_Q = d_attn;    /* scratch[2] */
         CUdeviceptr d_K = d_normed;  /* scratch[4] */
-        CUdeviceptr d_V = d_ca_V + ca_kv_sz; /* after ca_V in scratch[3], ~100MB offset */
+        CUdeviceptr d_V = d_ca_V_scratch + ca_kv_sz; /* after ca_V in scratch[3], ~100MB offset.
+                                                     * Anchor to scratch (not d_ca_V), since the
+                                                     * KV cache rebinds d_ca_V to a cache buffer. */
         op_split_qkv(ops, stream, d_Q, d_K, d_V, d_qkv, N1, heads, hd);
 
         /* Debug: compare Q/K/V after interleave */
@@ -2040,6 +2092,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         }
 
         /* === Cross-attention === */
+        /* Reset KV pointers — prior block may have rebound them to a cache slot. */
+        d_ca_K = d_ca_K_scratch;
+        d_ca_V = d_ca_V_scratch;
         op_layernorm(ops, stream, d_normed, d_hidden, blk->norm2_w, blk->norm2_b, N1, H_dim);
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_norm2", pass_tag);
@@ -2108,6 +2163,11 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             free(h_k);
             free(h_v);
             free(h_ctx);
+        } else if (cakv_hit) {
+            /* Cache hit: rebind K/V to cached buffers (no copy needed —
+             * downstream ops only read these pointers). */
+            d_ca_K = r->cakv_cache[cakv_slot].K[bi];
+            d_ca_V = r->cakv_cache[cakv_slot].V[bi];
         } else {
             hy3d_prof_begin(r);
             op_gemm_qw_dit(ops, stream, d_ca_K, blk->ca_k_w,
@@ -2132,17 +2192,30 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
          *   kv = kv.view(B, S, heads, 2*hd)
          *   k, v = split(kv, hd, dim=-1)
          * before k_norm / SDPA. Rebuild that interleaved per-head KV layout so
-         * our K/V grouping matches the reference path. */
-        op_concat_last_dim(ops, stream, d_qkv, d_ca_K, d_ca_V, ctx_len, H_dim);
-        if (r->verbose > 1 && bi == 0) {
-            hy3d_dbg_dump_tagged_npy(stream, d_qkv, ctx_len, 2 * H_dim,
-                                     "cuda_b0_attn2_kv_gemm", pass_tag);
-        }
-        op_split_kv(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, heads, hd);
+         * our K/V grouping matches the reference path.
+         *
+         * Skip concat/split/rmsnorm on cache hit — d_ca_K/V already hold the
+         * post-rmsnorm/post-split values. */
+        if (!cakv_hit) {
+            op_concat_last_dim(ops, stream, d_qkv, d_ca_K, d_ca_V, ctx_len, H_dim);
+            if (r->verbose > 1 && bi == 0) {
+                hy3d_dbg_dump_tagged_npy(stream, d_qkv, ctx_len, 2 * H_dim,
+                                         "cuda_b0_attn2_kv_gemm", pass_tag);
+            }
+            op_split_kv(ops, stream, d_ca_K, d_ca_V, d_qkv, ctx_len, heads, hd);
 
-        if (blk->ca_k_norm_w)
-            op_rms_norm(ops, stream, d_ca_K, blk->ca_k_norm_w,
-                        ctx_len, heads, hd, H_dim);
+            if (blk->ca_k_norm_w)
+                op_rms_norm(ops, stream, d_ca_K, blk->ca_k_norm_w,
+                            ctx_len, heads, hd, H_dim);
+
+            /* Capture into cache slot if one was reserved for this context. */
+            if (cakv_slot >= 0) {
+                cuMemcpyDtoDAsync(r->cakv_cache[cakv_slot].K[bi], d_ca_K,
+                                  (size_t)ctx_len * H_dim * sizeof(float), stream);
+                cuMemcpyDtoDAsync(r->cakv_cache[cakv_slot].V[bi], d_ca_V,
+                                  (size_t)ctx_len * H_dim * sizeof(float), stream);
+            }
+        }
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_ca_K, ctx_len, H_dim,
                                      "cuda_b0_attn2_k_norm", pass_tag);
@@ -2250,6 +2323,11 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
                     blk->use_moe ? " [MoE]" : "", blk->use_skip ? " [skip]" : "");
             free(hcpu);
         }
+    }
+
+    /* Mark KV-cache slot populated after a successful miss-fill pass. */
+    if (cakv_slot >= 0 && !cakv_hit) {
+        r->cakv_cache[cakv_slot].populated = 1;
     }
 
     /* 5. Final layer: strip timestep token, LN, Linear -> output [N, C]
@@ -2660,13 +2738,28 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
         r->dit_skip_stack_bytes = 0;
         r->dit_graph_warm = 0;
 
+        /* Cross-attention K/V cache: default ON; disable with HY3D_KV_CACHE=0.
+         * Disabled when graphs are on — graph capture pins kernel params, and
+         * the cache hit/miss branch makes the call sequence non-deterministic. */
+        env = getenv("HY3D_KV_CACHE");
+        r->use_cakv_cache = (env && env[0] == '0') ? 0 : (r->use_graph ? 0 : 1);
+        for (int s = 0; s < HY3D_CAKV_SLOTS; s++) {
+            r->cakv_cache[s].ctx = 0;
+            r->cakv_cache[s].populated = 0;
+            for (int i = 0; i < DIT_DEPTH; i++) {
+                r->cakv_cache[s].K[i] = 0;
+                r->cakv_cache[s].V[i] = 0;
+            }
+        }
+        r->cakv_lru_next = 0;
+
         if (verbose) {
             fprintf(stderr,
-                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d fp8_w_perrow=%d bf16_gemm=%d pipe3=%d bf16_mt4=%d mt4=%s (sm_%d)\n",
+                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d fp8_w_perrow=%d bf16_gemm=%d pipe3=%d bf16_mt4=%d mt4=%s kv_cache=%d (sm_%d)\n",
                 r->ops.use_bf16_attn, r->ops.use_fp8_attn, r->ops.use_fp8_gemm,
                 r->ops.use_fp8_gemm_attn_mlp, r->ops.use_fp8_w_perrow,
                 r->ops.use_bf16_gemm, r->ops.use_bf16_pipe3, r->ops.use_bf16_mt4,
-                r->ops.disable_mt4 ? "off" : "on", sm);
+                r->ops.disable_mt4 ? "off" : "on", r->use_cakv_cache, sm);
         }
     }
 
@@ -2931,7 +3024,14 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     /* ---- Stage 2: DiT diffusion with flow matching ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 2 - DiT diffusion (%d steps)...\n", n_steps);
 
-    /* K,V computed per-block inside run_dit_forward (saves GPU memory) */
+    /* Invalidate cross-attn KV cache: ctx pointers from any prior mesh are
+     * stale (their backing allocations were freed and may have been recycled
+     * to unrelated buffers — pointer-equality matches would produce garbage). */
+    for (int s = 0; s < HY3D_CAKV_SLOTS; s++) {
+        r->cakv_cache[s].ctx = 0;
+        r->cakv_cache[s].populated = 0;
+    }
+    r->cakv_lru_next = 0;
 
     /* Create initial noise */
     int latent_size = DIT_INPUT_SIZE * DIT_IN_CHANNELS;
@@ -3229,10 +3329,12 @@ void cuda_hy3d_free(cuda_hy3d_runner *r) {
     /* Free tensor-core dispatch scratch (BF16/FP8 attn buffers) */
     hy3d_ops_destroy(&r->ops);
 
-    /* Free pre-computed K,V */
-    for (int i = 0; i < DIT_DEPTH; i++) {
-        if (r->dit_ca_K[i]) cuMemFree(r->dit_ca_K[i]);
-        if (r->dit_ca_V[i]) cuMemFree(r->dit_ca_V[i]);
+    /* Free cross-attention K,V cache */
+    for (int s = 0; s < HY3D_CAKV_SLOTS; s++) {
+        for (int i = 0; i < DIT_DEPTH; i++) {
+            if (r->cakv_cache[s].K[i]) cuMemFree(r->cakv_cache[s].K[i]);
+            if (r->cakv_cache[s].V[i]) cuMemFree(r->cakv_cache[s].V[i]);
+        }
     }
 
     /* Free Fourier frequencies */
