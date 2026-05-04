@@ -1395,7 +1395,11 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
     CUdeviceptr d_exp_h  = d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
     CUdeviceptr d_exp_o  = d_moe_scratch + off; off += (size_t)N_tok * H_dim * sizeof(float);
     CUdeviceptr d_moe_idx = d_moe_scratch + off; off += (size_t)N_tok * DIT_MOE_TOP_K * sizeof(int);
-    CUdeviceptr d_moe_w   = d_moe_scratch + off; /* [N_tok * top_k] */
+    CUdeviceptr d_moe_w   = d_moe_scratch + off; off += (size_t)N_tok * DIT_MOE_TOP_K * sizeof(float);
+    /* Sparse routing buffers (only used if ops->moe_build_perm available). */
+    CUdeviceptr d_counts  = d_moe_scratch + off; off += (size_t)DIT_N_EXPERTS * sizeof(int);
+    CUdeviceptr d_perm    = d_moe_scratch + off; off += (size_t)DIT_N_EXPERTS * N_tok * sizeof(int);
+    CUdeviceptr d_tw      = d_moe_scratch + off; /* [E * N_tok] */
 
     /* Step 1: Compute gate logits: [N_tok, H_dim] @ [8, H_dim]^T -> [N_tok, 8] */
     op_gemm(ops, stream, d_gate, blk->moe_gate_w, d_input, 0,
@@ -1437,80 +1441,108 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
         free(gate_cpu); free(idx_cpu); free(w_cpu);
     }
 
-    /* Step 3: Zero out accumulator (d_output) */
+    /* Step 3: Zero accumulator (d_output). */
     cuMemsetD8Async(d_output, 0, (size_t)N_tok * H_dim * sizeof(float), stream);
 
-    /* Step 4: For each expert, compute output and weighted-add ON GPU
-     * (eliminates the per-expert ~33.5MB host roundtrip). */
     int H_dim_arg = H_dim;  /* drop const for kernel arg pointer */
-    int total_acc = N_tok * H_dim;
-    unsigned acc_grid = (unsigned)((total_acc + 255) / 256);
 
-    /* Pre-reduce d_input row_max once for all 9 fc1 calls (8 experts + 1 shared).
-     * Saves 8 reductions per MoE block × 6 blocks × 60 fwds = 2880 redundant
-     * 33MB reductions per mesh (~0.2s). The internal ops->d_row_max gets
-     * clobbered by fc2's op_gemm_qw on each expert iteration, so we keep a
-     * separate buffer. */
-    CUdeviceptr d_input_row_max = 0;
-    int use_premax = 0;
-    if (ops->use_fp8_gemm && ops->reduce_max_abs_per_row && ops->gemm_fp8_perrow) {
-        if (cuMemAlloc(&d_input_row_max, (size_t)N_tok * sizeof(float)) == CUDA_SUCCESS) {
-            int n_in = H_dim;
-            void *rargs[] = {&d_input_row_max, &d_input, &N_tok, &n_in};
-            cuLaunchKernel(ops->reduce_max_abs_per_row, (unsigned)N_tok, 1, 1,
-                           256, 1, 1, 0, stream, rargs, NULL);
-            use_premax = 1;
+    /* Step 4: Sparse per-expert routing (when kernels available).
+     *
+     * PyTorch runs each expert only on the tokens routed to it (~25% of N_tok
+     * for 8 experts × top-2). Old path ran every expert on ALL N_tok tokens
+     * then masked the output → ~4× wasted GEMM work.
+     *
+     * New path:
+     *   1. Build per-expert perm[e]/tw[e] from idx/w (one kernel + one sync to
+     *      read counts[E]).
+     *   2. For each expert with count>0: gather rows → fc1+GELU+fc2 on n_e
+     *      rows → scatter weighted-add back to d_output.
+     */
+    int use_sparse = (ops->moe_build_perm && ops->moe_gather_rows
+                      && ops->moe_scatter_weighted_add);
+    if (use_sparse) {
+        cuMemsetD8Async(d_counts, 0, (size_t)DIT_N_EXPERTS * sizeof(int), stream);
+        int E_arg = DIT_N_EXPERTS;
+        int stride_arg = N_tok;
+        void *bargs[] = {&d_counts, &d_perm, &d_tw, &d_moe_idx, &d_moe_w,
+                         &N_tok, &E_arg, &top_k, &stride_arg};
+        unsigned bgrid = (unsigned)((N_tok + 255) / 256);
+        cuLaunchKernel(ops->moe_build_perm, bgrid, 1, 1, 256, 1, 1, 0, stream,
+                       bargs, NULL);
+
+        /* One sync per MoE call to read 8 counts (~10us, negligible). */
+        int counts_h[DIT_N_EXPERTS];
+        cuStreamSynchronize(stream);
+        cuMemcpyDtoH(counts_h, d_counts, (size_t)DIT_N_EXPERTS * sizeof(int));
+
+        for (int e = 0; e < DIT_N_EXPERTS; e++) {
+            int n_e = counts_h[e];
+            if (n_e <= 0) continue;
+            CUdeviceptr d_perm_e = d_perm + (size_t)e * N_tok * sizeof(int);
+            CUdeviceptr d_tw_e   = d_tw   + (size_t)e * N_tok * sizeof(float);
+
+            /* Gather d_input rows -> compact buffer at d_exp_o (reused as
+             * gather staging; safe since fc1 reads it before writing d_exp_h).
+             * Wait — d_exp_o is written by fc2. We need a separate gather buf.
+             * Reuse d_output's tail? No, it's the accumulator. Use the back
+             * of d_exp_h: fc1 writes [n_e, ffn] starting at d_exp_h base, so
+             * we need gather buf elsewhere. d_gate is [N_tok*8] = ~131KB and
+             * unused after step 1; too small. Allocate a small temp for the
+             * gathered input: n_e <= N_tok, so [N_tok, H_dim] = 33.5MB.
+             *
+             * Trick: fc1 output d_exp_h holds [n_e, ffn]. We can stash the
+             * gathered input at d_exp_h + (n_e * ffn * 4) but that races with
+             * GELU. Cleanest: use d_exp_o as the gather staging since fc1
+             * doesn't touch it; fc2 then reads d_exp_h and writes d_exp_o.
+             * But scatter reads d_exp_o after fc2. Order:
+             *   gather(d_exp_o)  // staging
+             *   fc1(d_exp_h, d_exp_o)
+             *   gelu(d_exp_h)
+             *   fc2(d_exp_o, d_exp_h)   // overwrites staging — fine, fc1 done
+             *   scatter(d_output, d_exp_o)
+             */
+            unsigned ggrid = (unsigned)(((long)n_e * H_dim + 255) / 256);
+            void *gargs[] = {&d_exp_o, &d_input, &d_perm_e, &n_e, &H_dim_arg};
+            cuLaunchKernel(ops->moe_gather_rows, ggrid, 1, 1, 256, 1, 1, 0,
+                           stream, gargs, NULL);
+
+            /* fc1: [n_e, H_dim] -> [n_e, ffn]. Use op_gemm_qw (no premax — n_e
+             * is small, internal row-max reduction is cheap). */
+            op_gemm_qw(ops, stream, d_exp_h,
+                       blk->moe_expert_fc1_w[e],
+                       blk->moe_expert_fc1_w_fp8[e], blk->moe_expert_fc1_w_scale[e],
+                       d_exp_o, blk->moe_expert_fc1_b[e], ffn, H_dim, n_e);
+            op_gelu(ops, stream, d_exp_h, n_e * ffn);
+            op_gemm_qw(ops, stream, d_exp_o,
+                       blk->moe_expert_fc2_w[e],
+                       blk->moe_expert_fc2_w_fp8[e], blk->moe_expert_fc2_w_scale[e],
+                       d_exp_h, blk->moe_expert_fc2_b[e], H_dim, ffn, n_e);
+
+            unsigned sgrid = (unsigned)(((long)n_e * H_dim + 255) / 256);
+            void *sargs[] = {&d_output, &d_exp_o, &d_perm_e, &d_tw_e,
+                             &n_e, &H_dim_arg};
+            cuLaunchKernel(ops->moe_scatter_weighted_add, sgrid, 1, 1,
+                           256, 1, 1, 0, stream, sargs, NULL);
         }
-    }
-
-    for (int e = 0; e < DIT_N_EXPERTS; e++) {
-        /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e
-         * FP8 path used when w_fp8/scale were prequantized in load_dit_weights;
-         * otherwise falls through to the F16 tiled path inside op_gemm_qw. */
-        if (!use_premax || op_gemm_qw_premax(ops, stream, d_exp_h,
-                blk->moe_expert_fc1_w_fp8[e], blk->moe_expert_fc1_w_scale[e],
-                d_input, blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok,
-                d_input_row_max) != 0) {
+    } else {
+        /* Legacy dense path: every expert runs on all N_tok tokens, masked. */
+        int total_acc = N_tok * H_dim;
+        unsigned acc_grid = (unsigned)((total_acc + 255) / 256);
+        for (int e = 0; e < DIT_N_EXPERTS; e++) {
             op_gemm_qw(ops, stream, d_exp_h,
                        blk->moe_expert_fc1_w[e],
                        blk->moe_expert_fc1_w_fp8[e], blk->moe_expert_fc1_w_scale[e],
                        d_input, blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
-        }
-        op_gelu(ops, stream, d_exp_h, N_tok * ffn);
-        op_gemm_qw(ops, stream, d_exp_o,
-                   blk->moe_expert_fc2_w[e],
-                   blk->moe_expert_fc2_w_fp8[e], blk->moe_expert_fc2_w_scale[e],
-                   d_exp_h, blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
-
-        if (ops->moe_scaled_accumulate) {
+            op_gelu(ops, stream, d_exp_h, N_tok * ffn);
+            op_gemm_qw(ops, stream, d_exp_o,
+                       blk->moe_expert_fc2_w[e],
+                       blk->moe_expert_fc2_w_fp8[e], blk->moe_expert_fc2_w_scale[e],
+                       d_exp_h, blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
             int target = e;
             void *args[] = {&d_output, &d_exp_o, &d_moe_idx, &d_moe_w,
                             &target, &N_tok, &H_dim_arg, &top_k};
             cuLaunchKernel(ops->moe_scaled_accumulate, acc_grid, 1, 1,
                            256, 1, 1, 0, stream, args, NULL);
-        } else {
-            /* CPU fallback */
-            cuStreamSynchronize(stream);
-            size_t bytes = (size_t)N_tok * H_dim * sizeof(float);
-            float *out = (float *)malloc(bytes);
-            float *acc = (float *)malloc(bytes);
-            int *idx = (int *)malloc((size_t)N_tok * top_k * sizeof(int));
-            float *w  = (float *)malloc((size_t)N_tok * top_k * sizeof(float));
-            cuMemcpyDtoH(out, d_exp_o, bytes);
-            cuMemcpyDtoH(acc, d_output, bytes);
-            cuMemcpyDtoH(idx, d_moe_idx, (size_t)N_tok*top_k*sizeof(int));
-            cuMemcpyDtoH(w,   d_moe_w,   (size_t)N_tok*top_k*sizeof(float));
-            for (int t = 0; t < N_tok; t++) {
-                float ww = 0.0f;
-                for (int k = 0; k < top_k; k++)
-                    if (idx[t*top_k+k] == e) { ww = w[t*top_k+k]; break; }
-                if (ww == 0.0f) continue;
-                for (int j = 0; j < H_dim; j++)
-                    acc[t*H_dim+j] += ww * out[t*H_dim+j];
-            }
-            cuMemcpyHtoDAsync(d_output, acc, bytes, stream);
-            cuStreamSynchronize(stream);
-            free(out); free(acc); free(idx); free(w);
         }
     }
 
@@ -1528,8 +1560,6 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
                blk->moe_shared_fc2_w_fp8, blk->moe_shared_fc2_w_scale,
                d_exp_h, blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
     op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
-
-    if (d_input_row_max) cuMemFree(d_input_row_max);
 }
 
 /* Stage 2: Single DiT forward pass
@@ -1570,8 +1600,12 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
      * MoE needs: gate[N1*8] + expert_h[N1*ffn] + accum[N1*H_dim]  (168MB)
      *   (process one expert at a time, reuse expert_h for shared expert) */
     size_t mlp_sz = (size_t)N1 * ffn * sizeof(float);
-    /* +(top_k * 2) for moe_idx[N1, top_k] (int) + moe_w[N1, top_k] (float) */
-    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim + DIT_MOE_TOP_K * 2) * sizeof(float);
+    /* +(top_k * 2) for moe_idx[N1, top_k] (int) + moe_w[N1, top_k] (float)
+     * + sparse routing: counts[E] + perm[E*N1] (int) + tw[E*N1] (float) */
+    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim + DIT_MOE_TOP_K * 2) * sizeof(float)
+                          + (size_t)DIT_N_EXPERTS * sizeof(int)
+                          + (size_t)DIT_N_EXPERTS * N1 * sizeof(int)
+                          + (size_t)DIT_N_EXPERTS * N1 * sizeof(float);
     size_t mlp_moe_sz = mlp_sz > moe_scratch_sz ? mlp_sz : moe_scratch_sz;
     /* For concat: [N1 * 2*H_dim] */
     size_t cat_buf_sz = (size_t)N1 * 2 * H_dim * sizeof(float);
