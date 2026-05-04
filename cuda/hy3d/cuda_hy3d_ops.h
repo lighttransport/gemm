@@ -65,6 +65,8 @@ typedef struct {
     CUfunction gemm_fp8_perrow;          /* MTILE=2 (32 rows / CTA) */
     CUfunction gemm_fp8_perrow_mt4;      /* MTILE=4 (64 rows / CTA), n_tok % 64 == 0 */
     CUfunction gemm_fp8_perrow_concat3;  /* fused QKV: 3 weight banks, shared row_max */
+    CUfunction gemm_fp8_perrow_mt4_wpr;  /* MTILE=4 + per-row W scale (length n_out) */
+    CUfunction quantize_fp8_per_row;     /* F32 -> e4m3 with per-row scale writeback */
     /* BF16 X / FP8 W MMA pipeline (m16n8k16, sm_80+). Inline FP8->BF16 dequant. */
     CUfunction gemm_bf16_pipe;
     /* Same as above + per-tensor weight scale multiplied at writeback.
@@ -105,6 +107,7 @@ typedef struct {
     int use_fp8_attn;            /* HY3D_FP8_ATTN, default OFF (head_dim=128 only) */
     int use_fp8_gemm;            /* HY3D_FP8_GEMM, default ON if sm>=89 — MoE only */
     int use_fp8_gemm_attn_mlp;   /* HY3D_FP8_GEMM_ATTN_MLP, default OFF — extends FP8 to DiT attention QKV/out + MLP fc1/fc2; quality regression at all step counts (verified 30s) */
+    int use_fp8_w_perrow;        /* HY3D_FP8_W_PERROW, default OFF — per-row weight FP8 scaling (paired with use_fp8_gemm_attn_mlp); avoids per-tensor outlier crush */
     int use_bf16_gemm;           /* HY3D_BF16_GEMM, default OFF (precision fallback) */
     int use_bf16_pipe3;          /* HY3D_BF16_PIPE3, default OFF — opt-in 3-stage cp.async W pipeline */
     int use_bf16_mt4;            /* HY3D_BF16_MT4, default OFF — opt-in MTILE=4 BF16 pipe (64 rows/CTA) */
@@ -246,6 +249,8 @@ static int hy3d_ops_load(hy3d_ops *ops, CUmodule module, int sm_version) {
     GET_OPT("gemm_fp8_pipe_perrow_f32",              gemm_fp8_perrow);
     GET_OPT("gemm_fp8_pipe_perrow_mt4_f32",          gemm_fp8_perrow_mt4);
     GET_OPT("gemm_fp8_pipe_perrow_mt4_concat3_f32",  gemm_fp8_perrow_concat3);
+    GET_OPT("gemm_fp8_pipe_perrow_mt4_wpr_f32",      gemm_fp8_perrow_mt4_wpr);
+    GET_OPT("quantize_to_fp8_e4m3_per_row",          quantize_fp8_per_row);
     GET_OPT("gemm_bf16_pipe_f32",                    gemm_bf16_pipe);
     GET_OPT("gemm_bf16_pipe_scaled_f32",             gemm_bf16_pipe_scaled);
     GET_OPT("gemm_bf16_pipe3_scaled_f32",            gemm_bf16_pipe3_scaled);
@@ -414,7 +419,10 @@ static inline void op_gemm_qw_dit(hy3d_ops *ops, CUstream stream,
                                   CUdeviceptr w_fp8, CUdeviceptr w_scale,
                                   CUdeviceptr X, CUdeviceptr bias,
                                   int n_out, int n_in, int n_tok) {
-    if (!ops->use_f32_gemm && ops->use_bf16_gemm && w_fp8 && w_scale &&
+    /* bf16-pipe-scaled reads w_scale as a single per-tensor float; skip when
+     * the caller has supplied a per-row buffer (length n_out). */
+    if (!ops->use_f32_gemm && !ops->use_fp8_w_perrow && ops->use_bf16_gemm &&
+        w_fp8 && w_scale &&
         ops->gemm_bf16_pipe_scaled &&
         n_tok >= 16 && (n_in % 32) == 0 && (n_out % 256) == 0) {
         void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok, &w_scale};
@@ -439,7 +447,36 @@ static inline void op_gemm_qw_dit(hy3d_ops *ops, CUstream stream,
         }
         return;
     }
-    if (!ops->use_fp8_gemm_attn_mlp) { w_fp8 = 0; w_scale = 0; }
+    /* Per-row-W FP8 path: same gating as op_gemm_qw, plus the wpr kernel and
+     * a per-row scale buffer. Eliminates per-tensor outlier crush. */
+    if (ops->use_fp8_gemm_attn_mlp && ops->use_fp8_w_perrow &&
+        !ops->use_f32_gemm && ops->use_fp8_gemm && w_fp8 && w_scale &&
+        ops->gemm_fp8_perrow_mt4_wpr && ops->reduce_max_abs_per_row &&
+        n_tok >= 64 && (n_in % 32) == 0 && (n_out % 256) == 0 &&
+        ((n_tok % 64) == 0 || ops->use_fp8_mt4_tail) &&
+        hy3d_ops_ensure_row_max(ops, n_tok) == 0) {
+        {
+            void *rargs[] = {&ops->d_row_max, &X, &n_tok, &n_in};
+            cuLaunchKernel(ops->reduce_max_abs_per_row, (unsigned)n_tok, 1, 1,
+                           256, 1, 1, 0, stream, rargs, NULL);
+        }
+        void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok,
+                        &w_scale, &ops->d_row_max};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+        unsigned gx4 = (gx + 3u) & ~3u;
+        gy4 = (gy4 + 3u) & ~3u;
+        size_t smem_wpr = 2048 + 8192 * 2 + 512 + 1024;
+        cuLaunchKernel(ops->gemm_fp8_perrow_mt4_wpr, gx4, gy4, 1, 128, 1, 1,
+                       smem_wpr, stream, args, NULL);
+        return;
+    }
+    /* Per-row-W scale buffer is incompatible with op_gemm_qw (which treats it
+     * as a per-tensor float). When wpr is on but the kernel/shape gate above
+     * didn't fire, fall through to F16. */
+    if (!ops->use_fp8_gemm_attn_mlp || ops->use_fp8_w_perrow) {
+        w_fp8 = 0; w_scale = 0;
+    }
     op_gemm_qw(ops, stream, Y, w_f16, w_fp8, w_scale, X, bias,
                n_out, n_in, n_tok);
 }

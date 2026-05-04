@@ -766,6 +766,62 @@ fail:
     return -1;
 }
 
+/* Per-row weight FP8 quantizer.
+ *   d_w_f16:        input [n_out, n_in] uint16
+ *   *out_d_w_fp8:   allocated here as [n_out * n_in] uint8
+ *   *out_d_w_scale: allocated here as [n_out] float (one scale per output row)
+ * Caller frees both on shutdown. Eliminates per-tensor outlier crush by giving
+ * each output row its own quantization scale.
+ *
+ * Pipeline: f16->f32 cast -> reduce_max_abs_per_row -> quantize_to_fp8_e4m3_per_row. */
+static int hy3d_quantize_w_fp8_perrow(hy3d_ops *ops, CUstream stream,
+                                       CUdeviceptr d_w_f16, int n_out, int n_in,
+                                       CUdeviceptr *out_d_w_fp8,
+                                       CUdeviceptr *out_d_w_scale) {
+    *out_d_w_fp8 = 0;
+    *out_d_w_scale = 0;
+    if (!ops || !d_w_f16 || n_out <= 0 || n_in <= 0 ||
+        !ops->f16_to_f32_buf || !ops->reduce_max_abs_per_row ||
+        !ops->quantize_fp8_per_row) {
+        return -1;
+    }
+    size_t n_elem = (size_t)n_out * (size_t)n_in;
+    CUdeviceptr d_f32 = 0, d_max = 0, d_fp8 = 0, d_scale = 0;
+    if (cuMemAlloc(&d_f32,   n_elem * sizeof(float))    != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_max,   (size_t)n_out * sizeof(float)) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_fp8,   n_elem)                    != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_scale, (size_t)n_out * sizeof(float)) != CUDA_SUCCESS) goto fail;
+
+    int n = (int)n_elem;
+    {
+        unsigned grid = (unsigned)((n + 255) / 256);
+        void *args[] = {&d_f32, &d_w_f16, &n};
+        cuLaunchKernel(ops->f16_to_f32_buf, grid, 1, 1, 256, 1, 1, 0, stream, args, NULL);
+    }
+    {
+        void *args[] = {&d_max, &d_f32, &n_out, &n_in};
+        cuLaunchKernel(ops->reduce_max_abs_per_row, (unsigned)n_out, 1, 1,
+                       256, 1, 1, 0, stream, args, NULL);
+    }
+    {
+        void *args[] = {&d_fp8, &d_scale, &d_f32, &d_max, &n_out, &n_in};
+        cuLaunchKernel(ops->quantize_fp8_per_row, (unsigned)n_out, 1, 1,
+                       256, 1, 1, 0, stream, args, NULL);
+    }
+    cuStreamSynchronize(stream);
+    cuMemFree(d_f32);
+    cuMemFree(d_max);
+    *out_d_w_fp8 = d_fp8;
+    *out_d_w_scale = d_scale;
+    return 0;
+fail:
+    if (d_f32)   cuMemFree(d_f32);
+    if (d_max)   cuMemFree(d_max);
+    if (d_fp8)   cuMemFree(d_fp8);
+    if (d_scale) cuMemFree(d_scale);
+    return -1;
+}
+
 /* Upload GEMM weight: F16 or F32 based on runner mode */
 static CUdeviceptr st_upload_gemm_w(st_context *st, const char *name,
                                      int use_f32, int verbose) {
@@ -1045,14 +1101,33 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
                 n_quant++; bytes += (n_elem); \
             } \
         } while (0)
+        /* Per-row variant: takes (n_out, n_in) and gives every output row its
+         * own FP8 scale. Used for ATTN/MLP weights when HY3D_FP8_W_PERROW=1. */
+        #define QFP8_PR(field, n_out_v, n_in_v) do { \
+            if (b->field && hy3d_quantize_w_fp8_perrow(&r->ops, r->stream, \
+                    b->field, (n_out_v), (n_in_v), \
+                    &b->field##_fp8, &b->field##_scale) == 0) { \
+                n_quant++; bytes += (size_t)(n_out_v) * (n_in_v); \
+            } \
+        } while (0)
+        int wpr = r->ops.use_fp8_w_perrow;
         for (int i = 0; i < DIT_DEPTH; i++) {
             dit_block_gpu *b = &r->dit_blocks[i];
-            QFP8(sa_qkv_w, qkv_n);
-            QFP8(sa_out_w, out_n);
-            QFP8(ca_q_w,   caq_n);
-            QFP8(ca_k_w,   cakv_n);
-            QFP8(ca_v_w,   cakv_n);
-            QFP8(ca_out_w, out_n);
+            if (wpr) {
+                QFP8_PR(sa_qkv_w, 3 * DIT_HIDDEN, DIT_HIDDEN);
+                QFP8_PR(sa_out_w, DIT_HIDDEN, DIT_HIDDEN);
+                QFP8_PR(ca_q_w,   DIT_HIDDEN, DIT_HIDDEN);
+                QFP8_PR(ca_k_w,   DIT_HIDDEN, DINO_HIDDEN);
+                QFP8_PR(ca_v_w,   DIT_HIDDEN, DINO_HIDDEN);
+                QFP8_PR(ca_out_w, DIT_HIDDEN, DIT_HIDDEN);
+            } else {
+                QFP8(sa_qkv_w, qkv_n);
+                QFP8(sa_out_w, out_n);
+                QFP8(ca_q_w,   caq_n);
+                QFP8(ca_k_w,   cakv_n);
+                QFP8(ca_v_w,   cakv_n);
+                QFP8(ca_out_w, out_n);
+            }
             if (b->use_moe) {
                 for (int e = 0; e < DIT_N_EXPERTS; e++) {
                     if (b->moe_expert_fc1_w[e] &&
@@ -1068,33 +1143,55 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
                                              &b->moe_expert_fc2_w_scale[e]) == 0)
                         { n_quant++; bytes += fc2_n; }
                 }
-                /* Shared expert sees all tokens (dense path); same shapes as
-                 * one MoE expert. */
-                if (b->moe_shared_fc1_w &&
-                    hy3d_quantize_w_fp8(&r->ops, r->stream,
-                                         b->moe_shared_fc1_w, fc1_n,
-                                         &b->moe_shared_fc1_w_fp8,
-                                         &b->moe_shared_fc1_w_scale) == 0)
-                    { n_quant++; bytes += fc1_n; }
-                if (b->moe_shared_fc2_w &&
-                    hy3d_quantize_w_fp8(&r->ops, r->stream,
-                                         b->moe_shared_fc2_w, fc2_n,
-                                         &b->moe_shared_fc2_w_fp8,
-                                         &b->moe_shared_fc2_w_scale) == 0)
-                    { n_quant++; bytes += fc2_n; }
+                /* Shared expert / dense path — also routed through op_gemm_qw_dit,
+                 * so must use the same scale layout as the ATTN/MLP weights. */
+                if (b->moe_shared_fc1_w) {
+                    int ok = wpr
+                        ? (hy3d_quantize_w_fp8_perrow(&r->ops, r->stream,
+                                b->moe_shared_fc1_w, DIT_FFN, DIT_HIDDEN,
+                                &b->moe_shared_fc1_w_fp8,
+                                &b->moe_shared_fc1_w_scale) == 0)
+                        : (hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                b->moe_shared_fc1_w, fc1_n,
+                                &b->moe_shared_fc1_w_fp8,
+                                &b->moe_shared_fc1_w_scale) == 0);
+                    if (ok) { n_quant++; bytes += fc1_n; }
+                }
+                if (b->moe_shared_fc2_w) {
+                    int ok = wpr
+                        ? (hy3d_quantize_w_fp8_perrow(&r->ops, r->stream,
+                                b->moe_shared_fc2_w, DIT_HIDDEN, DIT_FFN,
+                                &b->moe_shared_fc2_w_fp8,
+                                &b->moe_shared_fc2_w_scale) == 0)
+                        : (hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                b->moe_shared_fc2_w, fc2_n,
+                                &b->moe_shared_fc2_w_fp8,
+                                &b->moe_shared_fc2_w_scale) == 0);
+                    if (ok) { n_quant++; bytes += fc2_n; }
+                }
             }
             /* Skip-linear (blocks 11-20): [H, 2H] dense GEMM, every fwd pass. */
             if (b->use_skip && b->skip_linear_w) {
                 size_t skip_n = (size_t)DIT_HIDDEN * (2 * DIT_HIDDEN);
-                if (hy3d_quantize_w_fp8(&r->ops, r->stream,
-                                         b->skip_linear_w, skip_n,
-                                         &b->skip_linear_w_fp8,
-                                         &b->skip_linear_w_scale) == 0)
-                    { n_quant++; bytes += skip_n; }
+                int ok = wpr
+                    ? (hy3d_quantize_w_fp8_perrow(&r->ops, r->stream,
+                            b->skip_linear_w, DIT_HIDDEN, 2 * DIT_HIDDEN,
+                            &b->skip_linear_w_fp8,
+                            &b->skip_linear_w_scale) == 0)
+                    : (hy3d_quantize_w_fp8(&r->ops, r->stream,
+                            b->skip_linear_w, skip_n,
+                            &b->skip_linear_w_fp8,
+                            &b->skip_linear_w_scale) == 0);
+                if (ok) { n_quant++; bytes += skip_n; }
             }
             if (!b->use_moe) {
-                QFP8(mlp_fc1_w, fc1_n);
-                QFP8(mlp_fc2_w, fc2_n);
+                if (wpr) {
+                    QFP8_PR(mlp_fc1_w, DIT_FFN, DIT_HIDDEN);
+                    QFP8_PR(mlp_fc2_w, DIT_HIDDEN, DIT_FFN);
+                } else {
+                    QFP8(mlp_fc1_w, fc1_n);
+                    QFP8(mlp_fc2_w, fc2_n);
+                }
             }
         }
         #undef QFP8
@@ -1212,56 +1309,42 @@ static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
         size_t n_fc   = 4 * W * W;
         size_t total_bytes = 0;
         int n_buf = 0;
+        int wpr = r->ops.use_fp8_w_perrow;
+        /* Macro: per-tensor or per-row depending on wpr; both populate the same
+         * (_fp8, _scale) device pointers but the latter writes [n_out] floats. */
+        #define VAE_QFP8(field, n_out_v, n_in_v) do { \
+            size_t _n_elem = (size_t)(n_out_v) * (size_t)(n_in_v); \
+            int _ok = wpr \
+                ? (hy3d_quantize_w_fp8_perrow(&r->ops, r->stream, b->field, \
+                        (n_out_v), (n_in_v), &b->field##_fp8, &b->field##_scale) == 0) \
+                : (hy3d_quantize_w_fp8(&r->ops, r->stream, b->field, _n_elem, \
+                        &b->field##_fp8, &b->field##_scale) == 0); \
+            if (_ok) { total_bytes += _n_elem; n_buf++; } \
+        } while (0)
+        #define GEO_QFP8(field, n_out_v, n_in_v) do { \
+            size_t _n_elem = (size_t)(n_out_v) * (size_t)(n_in_v); \
+            int _ok = wpr \
+                ? (hy3d_quantize_w_fp8_perrow(&r->ops, r->stream, g->field, \
+                        (n_out_v), (n_in_v), &g->field##_fp8, &g->field##_scale) == 0) \
+                : (hy3d_quantize_w_fp8(&r->ops, r->stream, g->field, _n_elem, \
+                        &g->field##_fp8, &g->field##_scale) == 0); \
+            if (_ok) { total_bytes += _n_elem; n_buf++; } \
+        } while (0)
         for (int i = 0; i < VAE_DEC_LAYERS; i++) {
             vae_block_gpu *b = &r->vae_blocks[i];
-            if (b->qkv_w &&
-                hy3d_quantize_w_fp8(&r->ops, r->stream, b->qkv_w, n_qkv,
-                                    &b->qkv_w_fp8, &b->qkv_w_scale) == 0) {
-                total_bytes += n_qkv; n_buf++;
-            }
-            if (b->proj_w &&
-                hy3d_quantize_w_fp8(&r->ops, r->stream, b->proj_w, n_proj,
-                                    &b->proj_w_fp8, &b->proj_w_scale) == 0) {
-                total_bytes += n_proj; n_buf++;
-            }
-            if (b->mlp_fc_w &&
-                hy3d_quantize_w_fp8(&r->ops, r->stream, b->mlp_fc_w, n_fc,
-                                    &b->mlp_fc_w_fp8, &b->mlp_fc_w_scale) == 0) {
-                total_bytes += n_fc; n_buf++;
-            }
-            if (b->mlp_proj_w &&
-                hy3d_quantize_w_fp8(&r->ops, r->stream, b->mlp_proj_w, n_fc,
-                                    &b->mlp_proj_w_fp8, &b->mlp_proj_w_scale) == 0) {
-                total_bytes += n_fc; n_buf++;
-            }
+            if (b->qkv_w)     VAE_QFP8(qkv_w,     3 * W, W);
+            if (b->proj_w)    VAE_QFP8(proj_w,    W,     W);
+            if (b->mlp_fc_w)  VAE_QFP8(mlp_fc_w,  4 * W, W);
+            if (b->mlp_proj_w)VAE_QFP8(mlp_proj_w,W,     4 * W);
         }
         vae_geo_decoder_gpu *g = &r->vae_geo;
-        size_t n_kv = 2 * W * W;
-        if (g->c_q_w &&
-            hy3d_quantize_w_fp8(&r->ops, r->stream, g->c_q_w, n_proj,
-                                &g->c_q_w_fp8, &g->c_q_w_scale) == 0) {
-            total_bytes += n_proj; n_buf++;
-        }
-        if (g->c_kv_w &&
-            hy3d_quantize_w_fp8(&r->ops, r->stream, g->c_kv_w, n_kv,
-                                &g->c_kv_w_fp8, &g->c_kv_w_scale) == 0) {
-            total_bytes += n_kv; n_buf++;
-        }
-        if (g->c_proj_w &&
-            hy3d_quantize_w_fp8(&r->ops, r->stream, g->c_proj_w, n_proj,
-                                &g->c_proj_w_fp8, &g->c_proj_w_scale) == 0) {
-            total_bytes += n_proj; n_buf++;
-        }
-        if (g->mlp_fc_w &&
-            hy3d_quantize_w_fp8(&r->ops, r->stream, g->mlp_fc_w, n_fc,
-                                &g->mlp_fc_w_fp8, &g->mlp_fc_w_scale) == 0) {
-            total_bytes += n_fc; n_buf++;
-        }
-        if (g->mlp_proj_w &&
-            hy3d_quantize_w_fp8(&r->ops, r->stream, g->mlp_proj_w, n_fc,
-                                &g->mlp_proj_w_fp8, &g->mlp_proj_w_scale) == 0) {
-            total_bytes += n_fc; n_buf++;
-        }
+        if (g->c_q_w)    GEO_QFP8(c_q_w,    W,     W);
+        if (g->c_kv_w)   GEO_QFP8(c_kv_w,   2 * W, W);
+        if (g->c_proj_w) GEO_QFP8(c_proj_w, W,     W);
+        if (g->mlp_fc_w) GEO_QFP8(mlp_fc_w, 4 * W, W);
+        if (g->mlp_proj_w) GEO_QFP8(mlp_proj_w, W, 4 * W);
+        #undef VAE_QFP8
+        #undef GEO_QFP8
         if (r->verbose && n_buf > 0) {
             fprintf(stderr, "HY3D: VAE FP8 prequant — %d weight buffers (%.1f MB FP8)\n",
                     n_buf, (double)total_bytes / (1024.0 * 1024.0));
@@ -2497,6 +2580,16 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
         r->ops.use_fp8_gemm_attn_mlp = (env && env[0] != '0' &&
                                         r->ops.use_fp8_gemm) ? 1 : 0;
 
+        /* Per-row weight FP8 scale: gives every output row its own quantization
+         * scale, eliminating the per-tensor outlier crush that broke
+         * use_fp8_gemm_attn_mlp. Implies HY3D_FP8_GEMM_ATTN_MLP=1. */
+        env = getenv("HY3D_FP8_W_PERROW");
+        r->ops.use_fp8_w_perrow = (env && env[0] != '0' &&
+                                   r->ops.use_fp8_gemm &&
+                                   r->ops.gemm_fp8_perrow_mt4_wpr &&
+                                   r->ops.quantize_fp8_per_row) ? 1 : 0;
+        if (r->ops.use_fp8_w_perrow) r->ops.use_fp8_gemm_attn_mlp = 1;
+
         /* BF16-pipe-scaled is the safe-and-fast path for DiT attn/MLP:
          * BF16 acts × FP8 weights with inline LUT dequant + per-tensor scale
          * applied at writeback. Avoids the per-tensor scale drift that breaks
@@ -2557,9 +2650,9 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
 
         if (verbose) {
             fprintf(stderr,
-                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d bf16_gemm=%d pipe3=%d bf16_mt4=%d mt4=%s (sm_%d)\n",
+                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d fp8_w_perrow=%d bf16_gemm=%d pipe3=%d bf16_mt4=%d mt4=%s (sm_%d)\n",
                 r->ops.use_bf16_attn, r->ops.use_fp8_attn, r->ops.use_fp8_gemm,
-                r->ops.use_fp8_gemm_attn_mlp,
+                r->ops.use_fp8_gemm_attn_mlp, r->ops.use_fp8_w_perrow,
                 r->ops.use_bf16_gemm, r->ops.use_bf16_pipe3, r->ops.use_bf16_mt4,
                 r->ops.disable_mt4 ? "off" : "on", sm);
         }
