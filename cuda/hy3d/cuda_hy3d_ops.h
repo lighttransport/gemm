@@ -78,6 +78,8 @@ typedef struct {
     /* Flash attention */
     CUfunction flash_attn_bf16;          /* head_dim=128 BF16 acts */
     CUfunction flash_attn_bf16_xq;       /* head_dim=128 BF16 acts, ragged Q (q_len != kv_len) */
+    CUfunction flash_attn_bf16_hd64;     /* head_dim=64 BF16 acts (DINOv2 / ShapeVAE) */
+    CUfunction flash_attn_bf16_hd64_xq;  /* head_dim=64 BF16 acts, ragged Q */
     CUfunction flash_attn_fp8;           /* head_dim=128 FP8 acts (sm_89+) */
     /* MoE on-device kernels (added by hy3d) */
     CUfunction moe_topk_softmax;         /* gate logits -> top-k indices + weights */
@@ -238,6 +240,8 @@ static int hy3d_ops_load(hy3d_ops *ops, CUmodule module, int sm_version) {
     GET_OPT("cast_f32_to_bf16",                      cast_f32_to_bf16);
     GET_OPT("flash_attn_bf16",                       flash_attn_bf16);
     GET_OPT("flash_attn_bf16_xq",                    flash_attn_bf16_xq);
+    GET_OPT("flash_attn_bf16_hd64",                  flash_attn_bf16_hd64);
+    GET_OPT("flash_attn_bf16_hd64_xq",               flash_attn_bf16_hd64_xq);
     GET_OPT("flash_attn_fp8",                        flash_attn_fp8);
     GET_OPT("moe_topk_softmax_f32",                  moe_topk_softmax);
     GET_OPT("moe_scaled_accumulate_f32",             moe_scaled_accumulate);
@@ -442,9 +446,19 @@ static inline void op_cross_attn(hy3d_ops *ops, CUstream stream,
                                  CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V,
                                  int q_len, int kv_len, int dim,
                                  int n_heads, int head_dim) {
-    /* BF16 ragged-Q flash fast path: head_dim==128, sm>=80, kernels present. */
-    if (ops->use_bf16_attn && ops->flash_attn_bf16_xq && ops->cast_f32_to_bf16 &&
-        head_dim == 128 && q_len > 0 && kv_len > 0) {
+    /* BF16 ragged-Q flash fast path: head_dim==128 or head_dim==64, sm>=80. */
+    CUfunction xq_fn = 0;
+    size_t xq_smem = 0;
+    if (ops->use_bf16_attn && ops->cast_f32_to_bf16 && q_len > 0 && kv_len > 0) {
+        if (head_dim == 128 && ops->flash_attn_bf16_xq) {
+            xq_fn = ops->flash_attn_bf16_xq;
+            xq_smem = (size_t)(4 * 32 * 136 * 2);
+        } else if (head_dim == 64 && ops->flash_attn_bf16_hd64_xq) {
+            xq_fn = ops->flash_attn_bf16_hd64_xq;
+            xq_smem = (size_t)(4 * 32 * 72 * 2);
+        }
+    }
+    if (xq_fn) {
         int n_q_elem  = q_len  * dim;
         int n_kv_elem = kv_len * dim;
         size_t need = (size_t)(n_q_elem + 2 * n_kv_elem) * sizeof(unsigned short);
@@ -456,11 +470,10 @@ static inline void op_cross_attn(hy3d_ops *ops, CUstream stream,
             op_cast_f32_to_bf16(ops, stream, d_k, K, n_kv_elem);
             op_cast_f32_to_bf16(ops, stream, d_v, V, n_kv_elem);
             unsigned gy = (unsigned)((q_len + 63) / 64);
-            size_t smem = (size_t)(4 * 32 * 136 * 2);
             void *args[] = {&out, &d_q, &d_k, &d_v, &q_len, &kv_len, &n_heads, &head_dim};
-            cuLaunchKernel(ops->flash_attn_bf16_xq,
+            cuLaunchKernel(xq_fn,
                            (unsigned)n_heads, gy, 1,
-                           128, 1, 1, smem, stream, args, NULL);
+                           128, 1, 1, xq_smem, stream, args, NULL);
             return;
         }
     }
@@ -493,9 +506,19 @@ static inline void op_self_attn(hy3d_ops *ops, CUstream stream,
                                 CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V,
                                 int n_tok, int dim,
                                 int n_heads, int head_dim) {
-    /* BF16 fast path: head_dim==128, sm>=80, kernels present, scratch OK. */
-    if (ops->use_bf16_attn && ops->flash_attn_bf16 && ops->cast_f32_to_bf16 &&
-        head_dim == 128 && n_tok > 0) {
+    /* BF16 fast path: head_dim==128 or head_dim==64, sm>=80. */
+    CUfunction sa_fn = 0;
+    size_t sa_smem = 0;
+    if (ops->use_bf16_attn && ops->cast_f32_to_bf16 && n_tok > 0) {
+        if (head_dim == 128 && ops->flash_attn_bf16) {
+            sa_fn = ops->flash_attn_bf16;
+            sa_smem = (size_t)(4 * 32 * 136 * 2);
+        } else if (head_dim == 64 && ops->flash_attn_bf16_hd64) {
+            sa_fn = ops->flash_attn_bf16_hd64;
+            sa_smem = (size_t)(4 * 32 * 72 * 2);
+        }
+    }
+    if (sa_fn) {
         int n_elem = n_tok * dim;
         size_t need = (size_t)3 * n_elem * sizeof(unsigned short);
         if (hy3d_ops_ensure_qkv_bf16(ops, need) == 0) {
@@ -505,14 +528,11 @@ static inline void op_self_attn(hy3d_ops *ops, CUstream stream,
             op_cast_f32_to_bf16(ops, stream, d_q, Q, n_elem);
             op_cast_f32_to_bf16(ops, stream, d_k, K, n_elem);
             op_cast_f32_to_bf16(ops, stream, d_v, V, n_elem);
-            /* flash_attn_bf16: grid=(n_heads, ceil(n_tok/64)), block=128 (4 warps).
-             * smem: 4*32*136*2 = 34816 B (double-buffered K/V tiles). */
             unsigned gy = (unsigned)((n_tok + 63) / 64);
-            size_t smem = (size_t)(4 * 32 * 136 * 2);
             void *args[] = {&out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
-            cuLaunchKernel(ops->flash_attn_bf16,
+            cuLaunchKernel(sa_fn,
                            (unsigned)n_heads, gy, 1,
-                           128, 1, 1, smem, stream, args, NULL);
+                           128, 1, 1, sa_smem, stream, args, NULL);
             return;
         }
         /* OOM -> fall through */
