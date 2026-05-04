@@ -68,6 +68,18 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
  *   1 = F32 weights, F32 compute (matches PyTorch reference exactly) */
 void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable);
 
+/* Tensor-core dispatch overrides. Each mirrors a HY3D_* env var; calling
+ * after cuda_hy3d_create() takes precedence over the env-var defaults.
+ *   bf16_attn : 1 = use flash_attn_bf16 for DiT self-attn (head_dim=128); 0 = F32 fallback
+ *   fp8_attn  : 1 = opt-in flash_attn_fp8 (DiT only, head_dim=128); 0 = off
+ *   fp8_gemm  : 1 = enable per-row FP8 MMA for aligned GEMMs (default ON sm>=89)
+ *   bf16_gemm : 1 = force BF16 pipe path even when FP8 is available */
+void cuda_hy3d_set_bf16_attn(cuda_hy3d_runner *r, int enable);
+void cuda_hy3d_set_fp8_attn(cuda_hy3d_runner *r, int enable);
+void cuda_hy3d_set_fp8_gemm(cuda_hy3d_runner *r, int enable);
+void cuda_hy3d_set_fp8_gemm_attn_mlp(cuda_hy3d_runner *r, int enable);
+void cuda_hy3d_set_bf16_gemm(cuda_hy3d_runner *r, int enable);
+
 /* Per-step mesh dumping for diagnosing diffusion trajectory.
  *   every  : decode + dump every N diffusion steps (0 to disable)
  *   grid   : marching-cubes grid resolution for the per-step dumps
