@@ -106,6 +106,12 @@ typedef struct {
     /* Per-row max(|X|) buffer for FP8 perrow GEMM. Grown on first use. */
     CUdeviceptr d_row_max;
     size_t      row_max_n;
+    /* Per-tensor weight-scale cache: each prequantized weight has a 1-float
+     * scale on device; the FP8 dispatcher used to DtoH it on every GEMM call
+     * (~10k syncs/mesh). Cache it host-side at first use. */
+    CUdeviceptr scale_cache_d[512];
+    float       scale_cache_h[512];
+    int         scale_cache_n;
 } hy3d_ops;
 
 /* Free scratch buffers attached to the ops context. */
@@ -127,6 +133,24 @@ static inline int hy3d_ops_ensure_row_max(hy3d_ops *ops, int n_tok) {
     }
     ops->row_max_n = need;
     return 0;
+}
+
+/* Look up the host-side float for a per-tensor scale device pointer, doing a
+ * one-time DtoH on cache miss. The set of scale pointers is fixed at load
+ * (252 DiT GEMMs + 96 MoE buffers); 512 entries is safely above. */
+static inline float hy3d_ops_scale_get(hy3d_ops *ops, CUdeviceptr d_scale) {
+    for (int i = 0; i < ops->scale_cache_n; i++) {
+        if (ops->scale_cache_d[i] == d_scale) return ops->scale_cache_h[i];
+    }
+    float h = 1.0f;
+    cuMemcpyDtoH(&h, d_scale, sizeof(float));
+    if (ops->scale_cache_n < (int)(sizeof(ops->scale_cache_d) /
+                                   sizeof(ops->scale_cache_d[0]))) {
+        int i = ops->scale_cache_n++;
+        ops->scale_cache_d[i] = d_scale;
+        ops->scale_cache_h[i] = h;
+    }
+    return h;
 }
 
 /* Ensure ops->d_qkv_bf16 is at least `bytes` large. Returns 0 on success, -1 on OOM. */
@@ -285,12 +309,11 @@ static inline void op_gemm_qw(hy3d_ops *ops, CUstream stream,
         cuLaunchKernel(ops->reduce_max_abs_per_row, (unsigned)n_tok, 1, 1,
                        256, 1, 1, 0, stream, rargs, NULL);
     }
-    /* w_scale is a 1-float device pointer; the kernel takes float-by-value
-     * and the qimg path passes 1.0f because qimg pre-bakes scale into W.
-     * We pre-quantized at load time and stored the scale device-side, so
-     * download it once per call. (One float; <1µs.) */
-    float w_scale_h = 1.0f;
-    cuMemcpyDtoH(&w_scale_h, w_scale, sizeof(float));
+    /* w_scale is a 1-float device pointer; kernel takes float-by-value and
+     * qimg passes 1.0f (pre-baked weights). We prequantized at load time and
+     * stored scale device-side; cache the host value to avoid sync DtoH
+     * per call (5760 syncs/mesh on MoE alone). */
+    float w_scale_h = hy3d_ops_scale_get(ops, w_scale);
     void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok,
                     &w_scale_h, &ops->d_row_max};
     unsigned gx = (unsigned)((n_out + 255) / 256);

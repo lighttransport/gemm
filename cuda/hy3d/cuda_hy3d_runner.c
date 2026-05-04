@@ -298,29 +298,39 @@ typedef struct {
 typedef struct {
     CUdeviceptr ln1_w, ln1_b;
     CUdeviceptr qkv_w;             /* Fused QKV [3*W, W] */
+    CUdeviceptr qkv_w_fp8, qkv_w_scale;
     CUdeviceptr proj_w, proj_b;
+    CUdeviceptr proj_w_fp8, proj_w_scale;
     CUdeviceptr q_norm_w, q_norm_b;
     CUdeviceptr k_norm_w, k_norm_b;
     int use_qk_norm;
     CUdeviceptr ln2_w, ln2_b;
     CUdeviceptr mlp_fc_w, mlp_fc_b;
+    CUdeviceptr mlp_fc_w_fp8, mlp_fc_w_scale;
     CUdeviceptr mlp_proj_w, mlp_proj_b;
+    CUdeviceptr mlp_proj_w_fp8, mlp_proj_w_scale;
 } vae_block_gpu;
 
 /* ShapeVAE geometry decoder weights */
 typedef struct {
     CUdeviceptr query_proj_w, query_proj_b;
+    CUdeviceptr query_proj_w_fp8, query_proj_w_scale;
     CUdeviceptr ln1_w, ln1_b;     /* Query LN */
     CUdeviceptr ln2_w, ln2_b;     /* Key/Value LN */
     CUdeviceptr c_q_w;            /* Cross-attn Q proj */
+    CUdeviceptr c_q_w_fp8, c_q_w_scale;
     CUdeviceptr c_kv_w;           /* Cross-attn KV proj [2*W, W] */
+    CUdeviceptr c_kv_w_fp8, c_kv_w_scale;
     CUdeviceptr c_proj_w, c_proj_b;
+    CUdeviceptr c_proj_w_fp8, c_proj_w_scale;
     CUdeviceptr q_norm_w, q_norm_b;
     CUdeviceptr k_norm_w, k_norm_b;
     int use_qk_norm;
     CUdeviceptr ln3_w, ln3_b;
     CUdeviceptr mlp_fc_w, mlp_fc_b;
+    CUdeviceptr mlp_fc_w_fp8, mlp_fc_w_scale;
     CUdeviceptr mlp_proj_w, mlp_proj_b;
+    CUdeviceptr mlp_proj_w_fp8, mlp_proj_w_scale;
     CUdeviceptr ln_post_w, ln_post_b;
     CUdeviceptr output_w, output_b;
 } vae_geo_decoder_gpu;
@@ -1100,6 +1110,74 @@ static int load_vae_weights(cuda_hy3d_runner *r, const char *path) {
     r->vae_fourier_freqs = cu_upload_raw(freqs, sizeof(freqs));
 
     safetensors_close(st);
+
+    /* Online FP8 prequant of VAE GEMM weights, mirrors load_dit_weights.
+     * Eligible: n_in % 32 == 0 && n_out % 64 == 0. Skipped silently when
+     * the runner is not on FP8 TC path. ~250 MB FP8. */
+    if (r->ops.use_fp8_gemm && r->ops.f16_to_f32_buf && r->ops.reduce_max_abs &&
+        r->ops.quantize_fp8) {
+        const size_t W   = VAE_WIDTH;          /* 1024 */
+        size_t n_qkv  = 3 * W * W;
+        size_t n_proj = W * W;
+        size_t n_fc   = 4 * W * W;
+        size_t total_bytes = 0;
+        int n_buf = 0;
+        for (int i = 0; i < VAE_DEC_LAYERS; i++) {
+            vae_block_gpu *b = &r->vae_blocks[i];
+            if (b->qkv_w &&
+                hy3d_quantize_w_fp8(&r->ops, r->stream, b->qkv_w, n_qkv,
+                                    &b->qkv_w_fp8, &b->qkv_w_scale) == 0) {
+                total_bytes += n_qkv; n_buf++;
+            }
+            if (b->proj_w &&
+                hy3d_quantize_w_fp8(&r->ops, r->stream, b->proj_w, n_proj,
+                                    &b->proj_w_fp8, &b->proj_w_scale) == 0) {
+                total_bytes += n_proj; n_buf++;
+            }
+            if (b->mlp_fc_w &&
+                hy3d_quantize_w_fp8(&r->ops, r->stream, b->mlp_fc_w, n_fc,
+                                    &b->mlp_fc_w_fp8, &b->mlp_fc_w_scale) == 0) {
+                total_bytes += n_fc; n_buf++;
+            }
+            if (b->mlp_proj_w &&
+                hy3d_quantize_w_fp8(&r->ops, r->stream, b->mlp_proj_w, n_fc,
+                                    &b->mlp_proj_w_fp8, &b->mlp_proj_w_scale) == 0) {
+                total_bytes += n_fc; n_buf++;
+            }
+        }
+        vae_geo_decoder_gpu *g = &r->vae_geo;
+        size_t n_kv = 2 * W * W;
+        if (g->c_q_w &&
+            hy3d_quantize_w_fp8(&r->ops, r->stream, g->c_q_w, n_proj,
+                                &g->c_q_w_fp8, &g->c_q_w_scale) == 0) {
+            total_bytes += n_proj; n_buf++;
+        }
+        if (g->c_kv_w &&
+            hy3d_quantize_w_fp8(&r->ops, r->stream, g->c_kv_w, n_kv,
+                                &g->c_kv_w_fp8, &g->c_kv_w_scale) == 0) {
+            total_bytes += n_kv; n_buf++;
+        }
+        if (g->c_proj_w &&
+            hy3d_quantize_w_fp8(&r->ops, r->stream, g->c_proj_w, n_proj,
+                                &g->c_proj_w_fp8, &g->c_proj_w_scale) == 0) {
+            total_bytes += n_proj; n_buf++;
+        }
+        if (g->mlp_fc_w &&
+            hy3d_quantize_w_fp8(&r->ops, r->stream, g->mlp_fc_w, n_fc,
+                                &g->mlp_fc_w_fp8, &g->mlp_fc_w_scale) == 0) {
+            total_bytes += n_fc; n_buf++;
+        }
+        if (g->mlp_proj_w &&
+            hy3d_quantize_w_fp8(&r->ops, r->stream, g->mlp_proj_w, n_fc,
+                                &g->mlp_proj_w_fp8, &g->mlp_proj_w_scale) == 0) {
+            total_bytes += n_fc; n_buf++;
+        }
+        if (r->verbose && n_buf > 0) {
+            fprintf(stderr, "HY3D: VAE FP8 prequant — %d weight buffers (%.1f MB FP8)\n",
+                    n_buf, (double)total_bytes / (1024.0 * 1024.0));
+        }
+    }
+
     r->vae_loaded = 1;
     if (r->verbose) fprintf(stderr, "HY3D: ShapeVAE weights loaded\n");
     return 0;
@@ -1437,11 +1515,16 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     CUdeviceptr d_ca_V    = d_ca_K + ca_kv_sz;
     CUdeviceptr d_moe_scratch = r->scratch[1]; /* shared with d_qkv/d_mlp */
 
-    /* Skip stack: stored in CPU RAM (saves ~370MB GPU, trades bandwidth) */
+    /* Skip stack: GPU-resident (was CPU RAM with sync DtoH/HtoD per push/pop;
+     * ~370MB on GPU — trivially affordable, kills 1260 syncs + 40GB PCIe). */
     size_t skip_entry_sz = (size_t)N1 * H_dim * sizeof(float);
-    float *skip_stack_cpu = (float *)malloc((size_t)(DIT_HALF_DEPTH + 1) * skip_entry_sz);
-    /* GPU staging buffer for skip load/store (reuses d_attn temporarily) */
-    CUdeviceptr d_skip_tmp = d_attn; /* reuse attn buffer since skip happens before attention */
+    int skip_stack_depth = DIT_HALF_DEPTH + 1;
+    CUdeviceptr d_skip_stack = 0;
+    if (cuMemAlloc(&d_skip_stack, (size_t)skip_stack_depth * skip_entry_sz) != CUDA_SUCCESS) {
+        fprintf(stderr, "HY3D: failed to allocate %.1f MB GPU skip stack\n",
+                (double)(skip_stack_depth * skip_entry_sz) / (1024.0 * 1024.0));
+        return -1;
+    }
 
     /* 1. Embed latents: [N, C] -> [N, H_dim] (into a temp buffer, not d_hidden yet) */
     /* We put the embedded result into d_normed temporarily */
@@ -1517,14 +1600,10 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
          * Skip values stored in CPU RAM to save GPU memory */
         if (blk->use_skip && skip_sp > 0) {
             skip_sp--;
-            float *skip_cpu = skip_stack_cpu + (size_t)skip_sp * N1 * H_dim;
-
-            /* Upload skip value from CPU to GPU staging buffer */
-            cuMemcpyHtoDAsync(d_skip_tmp, skip_cpu, skip_entry_sz, stream);
-            cuStreamSynchronize(stream);
+            CUdeviceptr d_skip_entry = d_skip_stack + (size_t)skip_sp * skip_entry_sz;
 
             /* cat = concat([skip_value, x], dim=-1)  -> [N1, 2*H_dim] */
-            op_concat_last_dim(ops, stream, d_cat_buf, d_skip_tmp, d_hidden, N1, H_dim);
+            op_concat_last_dim(ops, stream, d_cat_buf, d_skip_entry, d_hidden, N1, H_dim);
 
             /* x = skip_linear(cat)  -> [N1, H_dim] */
             op_gemm(ops, stream, d_hidden, blk->skip_linear_w, d_cat_buf,
@@ -1537,9 +1616,8 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
 
         /* Save hidden state for skip connection (blocks 0..DIT_HALF_DEPTH) */
         if (bi <= DIT_HALF_DEPTH) {
-            float *skip_cpu = skip_stack_cpu + (size_t)skip_sp * N1 * H_dim;
-            cuStreamSynchronize(stream);
-            cuMemcpyDtoH(skip_cpu, d_hidden, skip_entry_sz);
+            CUdeviceptr d_skip_entry = d_skip_stack + (size_t)skip_sp * skip_entry_sz;
+            cuMemcpyDtoDAsync(d_skip_entry, d_hidden, skip_entry_sz, stream);
             skip_sp++;
         }
 
@@ -1875,7 +1953,7 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     op_gemm(ops, stream, d_output, r->dit_final_linear_w, d_ln_out,
             r->dit_final_linear_b, C, H_dim, N);
 
-    free(skip_stack_cpu);
+    cuMemFree(d_skip_stack);
 }
 
 /* Stage 3: ShapeVAE single transformer block */
@@ -1911,7 +1989,8 @@ static void run_vae_block(cuda_hy3d_runner *r, vae_block_gpu *b,
     op_layernorm(ops, stream, d_ln1, d_in, b->ln1_w, b->ln1_b, N, W);
 
     /* Fused QKV projection */
-    op_gemm(ops, stream, d_qkv, b->qkv_w, d_ln1, 0, 3 * W, W, N);
+    op_gemm_qw_dit(ops, stream, d_qkv, b->qkv_w, b->qkv_w_fp8, b->qkv_w_scale,
+                   d_ln1, 0, 3 * W, W, N);
 
     /* Split interleaved QKV */
     op_split_qkv(ops, stream, d_Q, d_K, d_V, d_qkv, N, H, HD);
@@ -1926,7 +2005,8 @@ static void run_vae_block(cuda_hy3d_runner *r, vae_block_gpu *b,
     op_self_attn(ops, stream, d_aout, d_Q, d_K, d_V, N, W, H, HD);
 
     /* Output projection */
-    op_gemm(ops, stream, d_proj, b->proj_w, d_aout, b->proj_b, W, W, N);
+    op_gemm_qw_dit(ops, stream, d_proj, b->proj_w, b->proj_w_fp8, b->proj_w_scale,
+                   d_aout, b->proj_b, W, W, N);
 
     /* Residual 1: res1 = input + proj */
     cuMemcpyDtoDAsync(d_res1, d_in, (size_t)N * W * sizeof(float), stream);
@@ -1934,9 +2014,11 @@ static void run_vae_block(cuda_hy3d_runner *r, vae_block_gpu *b,
 
     /* LN2 -> MLP -> Residual 2 */
     op_layernorm(ops, stream, d_ln2, d_res1, b->ln2_w, b->ln2_b, N, W);
-    op_gemm(ops, stream, d_mlph, b->mlp_fc_w, d_ln2, b->mlp_fc_b, MLP, W, N);
+    op_gemm_qw_dit(ops, stream, d_mlph, b->mlp_fc_w, b->mlp_fc_w_fp8, b->mlp_fc_w_scale,
+                   d_ln2, b->mlp_fc_b, MLP, W, N);
     op_gelu(ops, stream, d_mlph, N * MLP);
-    op_gemm(ops, stream, d_mlpo, b->mlp_proj_w, d_mlph, b->mlp_proj_b, W, MLP, N);
+    op_gemm_qw_dit(ops, stream, d_mlpo, b->mlp_proj_w, b->mlp_proj_w_fp8, b->mlp_proj_w_scale,
+                   d_mlph, b->mlp_proj_b, W, MLP, N);
 
     /* Output = res1 + mlp_out */
     cuMemcpyDtoDAsync(d_out, d_res1, (size_t)N * W * sizeof(float), stream);
@@ -2043,8 +2125,10 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         op_layernorm(ops, stream, d_g_ln2, d_cur, g->ln2_w, g->ln2_b, N, W);
 
         /* Q from queries, KV from latents */
-        op_gemm(ops, stream, d_g_Q, g->c_q_w, d_g_ln1, 0, W, W, count);
-        op_gemm(ops, stream, d_g_KV, g->c_kv_w, d_g_ln2, 0, 2 * W, W, N);
+        op_gemm_qw_dit(ops, stream, d_g_Q, g->c_q_w, g->c_q_w_fp8, g->c_q_w_scale,
+                       d_g_ln1, 0, W, W, count);
+        op_gemm_qw_dit(ops, stream, d_g_KV, g->c_kv_w, g->c_kv_w_fp8, g->c_kv_w_scale,
+                       d_g_ln2, 0, 2 * W, W, N);
 
         /* Split KV */
         op_split_kv(ops, stream, d_g_K, d_g_V, d_g_KV, N, VAE_HEADS, VAE_HEAD_DIM);
@@ -2062,15 +2146,18 @@ static void run_shapevae(cuda_hy3d_runner *r, CUdeviceptr d_latents,
                       count, N, W, VAE_HEADS, VAE_HEAD_DIM);
 
         /* Output projection + residual */
-        op_gemm(ops, stream, d_g_proj, g->c_proj_w, d_g_aout, g->c_proj_b, W, W, count);
+        op_gemm_qw_dit(ops, stream, d_g_proj, g->c_proj_w, g->c_proj_w_fp8, g->c_proj_w_scale,
+                       d_g_aout, g->c_proj_b, W, W, count);
         cuMemcpyDtoDAsync(d_g_res, d_query_proj, (size_t)count * W * sizeof(float), stream);
         op_add(ops, stream, d_g_res, d_g_proj, count * W);
 
         /* MLP block */
         op_layernorm(ops, stream, d_g_ln3, d_g_res, g->ln3_w, g->ln3_b, count, W);
-        op_gemm(ops, stream, d_g_mlph, g->mlp_fc_w, d_g_ln3, g->mlp_fc_b, 4 * W, W, count);
+        op_gemm_qw_dit(ops, stream, d_g_mlph, g->mlp_fc_w, g->mlp_fc_w_fp8, g->mlp_fc_w_scale,
+                       d_g_ln3, g->mlp_fc_b, 4 * W, W, count);
         op_gelu(ops, stream, d_g_mlph, count * 4 * W);
-        op_gemm(ops, stream, d_g_mlpo, g->mlp_proj_w, d_g_mlph, g->mlp_proj_b, W, 4 * W, count);
+        op_gemm_qw_dit(ops, stream, d_g_mlpo, g->mlp_proj_w, g->mlp_proj_w_fp8, g->mlp_proj_w_scale,
+                       d_g_mlph, g->mlp_proj_b, W, 4 * W, count);
         cuMemcpyDtoDAsync(d_g_post, d_g_res, (size_t)count * W * sizeof(float), stream);
         op_add(ops, stream, d_g_post, d_g_mlpo, count * W);
 
