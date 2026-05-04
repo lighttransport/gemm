@@ -2329,12 +2329,19 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
         env = getenv("HY3D_DISABLE_MT4");
         r->ops.disable_mt4 = (env && env[0] != '0') ? 1 : 0;
 
+        /* Opt-in 3-stage cp.async W pipeline. Wins when memory-pipeline-bound;
+         * neutral or slight loss when compute-bound (occupancy 3 vs 5 CTAs/SM). */
+        env = getenv("HY3D_BF16_PIPE3");
+        r->ops.use_bf16_pipe3 = (env && env[0] != '0' &&
+                                 r->ops.gemm_bf16_pipe3_scaled) ? 1 : 0;
+
         if (verbose) {
             fprintf(stderr,
-                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d bf16_gemm=%d mt4=%s (sm_%d)\n",
+                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d bf16_gemm=%d pipe3=%d mt4=%s (sm_%d)\n",
                 r->ops.use_bf16_attn, r->ops.use_fp8_attn, r->ops.use_fp8_gemm,
                 r->ops.use_fp8_gemm_attn_mlp,
-                r->ops.use_bf16_gemm, r->ops.disable_mt4 ? "off" : "on", sm);
+                r->ops.use_bf16_gemm, r->ops.use_bf16_pipe3,
+                r->ops.disable_mt4 ? "off" : "on", sm);
         }
     }
 
