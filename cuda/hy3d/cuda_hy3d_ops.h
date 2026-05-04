@@ -70,6 +70,10 @@ typedef struct {
     /* Same as above + per-tensor weight scale multiplied at writeback.
      * Used when FP8 weights store round(w/scale) (hy3d online prequant). */
     CUfunction gemm_bf16_pipe_scaled;
+    /* 3-stage cp.async W pipeline variant of gemm_bf16_pipe_scaled. Same
+     * compute and writeback; one extra outstanding cp.async group. SMEM 26KB
+     * vs 18KB -> occupancy 3 vs 5 CTAs/SM. Wins when memory-pipeline-bound. */
+    CUfunction gemm_bf16_pipe3_scaled;
     /* FP8 quantizer + reductions */
     CUfunction reduce_max_abs;           /* per-tensor max|x| -> single F32 */
     CUfunction reduce_max_abs_per_row;   /* per-row max|x|   -> [n_rows] F32 */
@@ -95,6 +99,7 @@ typedef struct {
     int use_fp8_gemm;            /* HY3D_FP8_GEMM, default ON if sm>=89 — MoE only */
     int use_fp8_gemm_attn_mlp;   /* HY3D_FP8_GEMM_ATTN_MLP, default OFF — extends FP8 to DiT attention QKV/out + MLP fc1/fc2; quality regression at all step counts (verified 30s) */
     int use_bf16_gemm;           /* HY3D_BF16_GEMM, default OFF (precision fallback) */
+    int use_bf16_pipe3;          /* HY3D_BF16_PIPE3, default OFF — opt-in 3-stage cp.async W pipeline */
     int disable_mt4;             /* HY3D_DISABLE_MT4, default OFF */
 
     /* Lazy scratch buffers for tensor-core attention. Owned by the ops struct,
@@ -234,6 +239,7 @@ static int hy3d_ops_load(hy3d_ops *ops, CUmodule module, int sm_version) {
     GET_OPT("gemm_fp8_pipe_perrow_mt4_concat3_f32",  gemm_fp8_perrow_concat3);
     GET_OPT("gemm_bf16_pipe_f32",                    gemm_bf16_pipe);
     GET_OPT("gemm_bf16_pipe_scaled_f32",             gemm_bf16_pipe_scaled);
+    GET_OPT("gemm_bf16_pipe3_scaled_f32",            gemm_bf16_pipe3_scaled);
     GET_OPT("reduce_max_abs_f32",                    reduce_max_abs);
     GET_OPT("reduce_max_abs_per_row_f32",            reduce_max_abs_per_row);
     GET_OPT("quantize_to_fp8_e4m3",                  quantize_fp8);
@@ -403,9 +409,15 @@ static inline void op_gemm_qw_dit(hy3d_ops *ops, CUstream stream,
         unsigned gy = (unsigned)((n_tok +  31) /  32);
         gx = (gx + 3u) & ~3u;
         gy = (gy + 3u) & ~3u;
-        size_t smem_bf16 = 2048 + 8192 * 2;
-        cuLaunchKernel(ops->gemm_bf16_pipe_scaled, gx, gy, 1, 128, 1, 1,
-                       smem_bf16, stream, args, NULL);
+        if (ops->use_bf16_pipe3 && ops->gemm_bf16_pipe3_scaled) {
+            size_t smem_bf16_p3 = 2048 + 8192 * 3;
+            cuLaunchKernel(ops->gemm_bf16_pipe3_scaled, gx, gy, 1, 128, 1, 1,
+                           smem_bf16_p3, stream, args, NULL);
+        } else {
+            size_t smem_bf16 = 2048 + 8192 * 2;
+            cuLaunchKernel(ops->gemm_bf16_pipe_scaled, gx, gy, 1, 128, 1, 1,
+                           smem_bf16, stream, args, NULL);
+        }
         return;
     }
     if (!ops->use_fp8_gemm_attn_mlp) { w_fp8 = 0; w_scale = 0; }
