@@ -92,6 +92,9 @@ typedef struct {
     /* MoE on-device kernels (added by hy3d) */
     CUfunction moe_topk_softmax;         /* gate logits -> top-k indices + weights */
     CUfunction moe_scaled_accumulate;    /* acc[t,h] += w[t] * out[t,h] when idx[t,*] == eid */
+    CUfunction moe_build_perm;           /* sparse routing: bin tokens by routed expert */
+    CUfunction moe_gather_rows;          /* gather input rows by permutation */
+    CUfunction moe_scatter_weighted_add; /* scatter expert output back to acc with weight */
     /* F16 -> F32 buffer cast (used for online FP8 weight quant at load) */
     CUfunction f16_to_f32_buf;
 
@@ -258,6 +261,9 @@ static int hy3d_ops_load(hy3d_ops *ops, CUmodule module, int sm_version) {
     GET_OPT("flash_attn_fp8",                        flash_attn_fp8);
     GET_OPT("moe_topk_softmax_f32",                  moe_topk_softmax);
     GET_OPT("moe_scaled_accumulate_f32",             moe_scaled_accumulate);
+    GET_OPT("moe_build_perm_f32",                    moe_build_perm);
+    GET_OPT("moe_gather_rows_f32",                   moe_gather_rows);
+    GET_OPT("moe_scatter_weighted_add_f32",          moe_scatter_weighted_add);
     GET_OPT("f16_to_f32_buf",                        f16_to_f32_buf);
 
     #undef GET_OPT
