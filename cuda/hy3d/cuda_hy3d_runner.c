@@ -2344,6 +2344,15 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
                                r->ops.use_bf16_gemm)
                               ? ((env && env[0] == '0') ? 0 : 1) : 0;
 
+        /* Allow MT4 FP8 perrow on tiles with partial last row (n_tok % 64 != 0).
+         * Kernel already has per-row bounds checks (X load, scale load,
+         * writeback all gate on `r < n_tok`); only cost is wasted compute on
+         * padding rows in the tail tile. For DiT MoE n_tok=4097 that's
+         * 63/64 wasted MMAs in 1 of 65 tiles. Verified -3.5% DiT vs the
+         * gated dispatch on RTX 5060 Ti, bit-identical output. */
+        env = getenv("HY3D_FP8_MT4_TAIL");
+        r->ops.use_fp8_mt4_tail = (env && env[0] == '0') ? 0 : 1;
+
         if (verbose) {
             fprintf(stderr,
                 "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d bf16_gemm=%d pipe3=%d bf16_mt4=%d mt4=%s (sm_%d)\n",
