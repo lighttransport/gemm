@@ -107,7 +107,7 @@ typedef struct {
     int use_fp8_attn;            /* HY3D_FP8_ATTN, default OFF (head_dim=128 only) */
     int use_fp8_gemm;            /* HY3D_FP8_GEMM, default ON if sm>=89 — MoE only */
     int use_fp8_gemm_attn_mlp;   /* HY3D_FP8_GEMM_ATTN_MLP, default OFF — extends FP8 to DiT attention QKV/out + MLP fc1/fc2; quality regression at all step counts (verified 30s) */
-    int use_fp8_w_perrow;        /* HY3D_FP8_W_PERROW, default OFF — per-row weight FP8 scaling (paired with use_fp8_gemm_attn_mlp); avoids per-tensor outlier crush */
+    int use_fp8_w_perrow;        /* HY3D_FP8_W_PERROW, default ON when fp8_gemm capable — per-row weight FP8 scaling (paired with use_fp8_gemm_attn_mlp); avoids per-tensor outlier crush; 3.56× DiT speedup at 30 steps */
     int use_bf16_gemm;           /* HY3D_BF16_GEMM, default OFF (precision fallback) */
     int use_bf16_pipe3;          /* HY3D_BF16_PIPE3, default OFF — opt-in 3-stage cp.async W pipeline */
     int use_bf16_mt4;            /* HY3D_BF16_MT4, default OFF — opt-in MTILE=4 BF16 pipe (64 rows/CTA) */
