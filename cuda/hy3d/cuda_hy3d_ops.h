@@ -339,6 +339,46 @@ static inline void op_gemm_qw(hy3d_ops *ops, CUstream stream,
                    smem_pr, stream, args, NULL);
 }
 
+/* Variant of op_gemm_qw that reuses a caller-supplied row_max buffer (skips
+ * the per-row max reduction). Returns 0 on success, -1 if FP8 path is not
+ * usable (caller falls back to op_gemm_qw which will compute row_max itself).
+ *
+ * Use case: MoE block has 9 fc1 calls (8 experts + 1 shared) all reading the
+ * same d_input — only one reduction is needed for all 9. */
+static inline int op_gemm_qw_premax(hy3d_ops *ops, CUstream stream,
+                                    CUdeviceptr Y,
+                                    CUdeviceptr w_fp8, CUdeviceptr w_scale,
+                                    CUdeviceptr X, CUdeviceptr bias,
+                                    int n_out, int n_in, int n_tok,
+                                    CUdeviceptr d_row_max) {
+    if (ops->use_f32_gemm || !ops->use_fp8_gemm || !w_fp8 || !w_scale ||
+        !ops->gemm_fp8_perrow ||
+        n_tok < 16 || (n_in % 32) != 0 || (n_out % 64) != 0) {
+        return -1;
+    }
+    float w_scale_h = hy3d_ops_scale_get(ops, w_scale);
+    void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok,
+                    &w_scale_h, &d_row_max};
+    unsigned gx = (unsigned)((n_out + 255) / 256);
+    if (!ops->disable_mt4 && ops->gemm_fp8_perrow_mt4 &&
+        n_tok >= 64 && (n_tok % 64) == 0) {
+        unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+        unsigned gx4 = (gx + 3u) & ~3u;
+        gy4 = (gy4 + 3u) & ~3u;
+        size_t smem_mt4 = 2048 + 8192 * 2 + 512;
+        cuLaunchKernel(ops->gemm_fp8_perrow_mt4, gx4, gy4, 1, 128, 1, 1,
+                       smem_mt4, stream, args, NULL);
+        return 0;
+    }
+    unsigned gy = (unsigned)((n_tok + 31) / 32);
+    unsigned gx_pr = (gx + 3u) & ~3u;
+    gy = (gy + 3u) & ~3u;
+    size_t smem_pr = 1024 + 8192 * 2 + 256;
+    cuLaunchKernel(ops->gemm_fp8_perrow, gx_pr, gy, 1, 128, 1, 1,
+                   smem_pr, stream, args, NULL);
+    return 0;
+}
+
 /* DiT attention/MLP scope dispatcher.
  *   Priority:
  *     1. F32 escape (use_f32_gemm)                          -> op_gemm
