@@ -4,11 +4,16 @@
 # Only needs gcc + ROCm runtime (libamdhip64.so, libhiprtc.so) on PATH.
 
 CC     = gcc
+CXX    = g++
+ROCM_PATH ?= /opt/rocm
 CFLAGS = -O3 -Wall -Wextra -I.. -march=native
-LDFLAGS = -ldl -lm -lpthread
+CXXFLAGS = -O3 -Wall -Wextra -I.. -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__
+LDFLAGS = -ldl -lm -lpthread -L$(ROCM_PATH)/lib -lhipblaslt -lamdhip64 -lstdc++
 
 ROCEW_SRC   = ../rocew.c
 RUNNER_SRC  = hip_trellis2_runner.c
+BLASLT_SRC  = ../llm/mm_blaslt_bridge.cpp
+BLASLT_OBJ  = mm_blaslt_bridge.o
 TEST_SRC    = test_hip_trellis2.c
 
 TARGET       = test_hip_trellis2
@@ -62,14 +67,17 @@ $(TEX_NMAP_CONV): test_hip_nmap_conv.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
                   ../rocew.h ../hip_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_hip_nmap_conv.c $(ROCEW_SRC) $(LDFLAGS)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+$(BLASLT_OBJ): $(BLASLT_SRC) ../llm/mm_blaslt_bridge.h
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-$(VERIFY_DIT): verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
-$(VERIFY_DEC): verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+$(VERIFY_DIT): verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+
+$(VERIFY_DEC): verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
 # Default weight paths — override on the command line
 DIT     ?= /path/to/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors
