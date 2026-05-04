@@ -145,6 +145,7 @@ struct hip_trellis2_runner {
     hipFunction_t fn_flash_sa;       /* flash_attn_sa_f32 (scalar fallback) */
     hipFunction_t fn_flash_sa_wmma;  /* flash_attn_sa_wmma_f32 (gfx12) */
     hipFunction_t fn_flash_sa_wmma_bc32;  /* flash_attn_sa_wmma_bc32_f32 (gfx12) */
+    hipFunction_t fn_flash_sa_wmma_bc32_v2;  /* flash_attn_sa_wmma_bc32_v2_f32 (gfx12, deferred-sum softmax) */
     hipFunction_t fn_flash_sa_wmma_bc32_db;  /* flash_attn_sa_wmma_bc32_db_f32 (gfx12) */
     hipFunction_t fn_flash_sa_wmma_b16_db;   /* flash_attn_sa_wmma_b16_db_f32 (gfx12) */
     hipFunction_t fn_cross_attn;     /* cross_attn_tiled_f32 (scalar fallback) */
@@ -690,6 +691,7 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
         fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn enabled\n");
     }
     r->fn_flash_sa_wmma_bc32 = NULL;
+    r->fn_flash_sa_wmma_bc32_v2 = NULL;
     r->fn_flash_sa_wmma_bc32_db = NULL;
     r->fn_flash_sa_wmma_b16_db = NULL;
     if (r->use_wmma) {
@@ -700,6 +702,21 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
                                      "flash_attn_sa_wmma_bc32_f32") == hipSuccess) {
                 fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn Bc=32 enabled%s\n",
                         bc32 ? " (T2_FA_BC32=1)" : " (default)");
+            }
+        }
+        /* T2_FA_V2: deferred-sum softmax variant (default ON, -2% per step).
+         * Same Bc=32 tile, but skips the per-tile sum-reduction across the 16
+         * idx-lanes; each lane keeps a partial l_i and we reduce once at the
+         * end. Numerically equivalent up to FP-add reorder
+         * (max_abs ~2e-4/step, corr=1.0). When enabled, takes precedence
+         * over the v1 bc32 kernel in run_flash_sa. */
+        const char *v2 = getenv("T2_FA_V2");
+        int want_v2 = (v2 == NULL) ? 1 : atoi(v2);
+        if (want_v2) {
+            if (hipModuleGetFunction(&r->fn_flash_sa_wmma_bc32_v2, r->mod,
+                                     "flash_attn_sa_wmma_bc32_v2_f32") == hipSuccess) {
+                fprintf(stderr, "T2-HIP: BF16 WMMA flash-attn Bc=32 deferred-sum v2 enabled%s\n",
+                        v2 ? " (T2_FA_V2=1)" : " (default)");
             }
         }
         const char *db = getenv("T2_FA_DB");
@@ -1268,6 +1285,11 @@ static void run_flash_sa(hip_trellis2_runner *r, void *out, void *out_bf16,
     if (r->use_wmma && r->fn_flash_sa_wmma_bc32_db && head_dim == 128 && (N % 64) == 0) {
         hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32_db, n_heads, N / 64, 1, 128, 1, 1,
                               0, 0, args, NULL);
+        return;
+    }
+    if (r->use_wmma && r->fn_flash_sa_wmma_bc32_v2 && head_dim == 128 && (N % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32_v2, n_heads, N / 64, 1, 128, 1, 1,
+                              0, 0, args_bc32, NULL);
         return;
     }
     if (r->use_wmma && r->fn_flash_sa_wmma_bc32 && head_dim == 128 && (N % 64) == 0) {
