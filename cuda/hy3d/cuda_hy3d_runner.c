@@ -408,6 +408,30 @@ struct cuda_hy3d_runner {
     CUevent prof_ev_a, prof_ev_b;
     double prof_ms[8];
     long long prof_n[8];
+
+    /* CUDA-graph capture state (HY3D_GRAPH=1).
+     *
+     * The DiT block-loop body is shape-and-call-deterministic per pass. We
+     * capture once per (d_context, d_output) tuple (typically 2 — cond/uncond),
+     * then replay across the remaining 28 steps × 2 passes to amortize
+     * 1050 kernel launches per forward into a single graph submit.
+     *
+     * - dit_skip_stack: persistent (was per-call cuMemAlloc, which fails
+     *   inside stream capture).
+     * - dit_graph_cache: small fixed-size LRU keyed on (ctx, out) ptrs.
+     * - HY3D_GRAPH disables HY3D_PROFILE (per-phase events do host syncs)
+     *   and forces dense-MoE path (sparse path has a host sync on counts).
+     */
+    int use_graph;
+    CUdeviceptr dit_skip_stack;
+    size_t dit_skip_stack_bytes;
+    struct {
+        CUdeviceptr ctx;
+        CUdeviceptr out;
+        CUgraphExec exec;
+        int valid;
+    } dit_graph_cache[4];
+    int dit_graph_warm;        /* set to 1 after first forward (caches scales) */
 };
 
 enum {
@@ -1459,7 +1483,8 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
      *      rows → scatter weighted-add back to d_output.
      */
     int use_sparse = (ops->moe_build_perm && ops->moe_gather_rows
-                      && ops->moe_scatter_weighted_add);
+                      && ops->moe_scatter_weighted_add)
+                     && !r->use_graph;  /* sparse path syncs counts to host */
     if (use_sparse) {
         cuMemsetD8Async(d_counts, 0, (size_t)DIT_N_EXPERTS * sizeof(int), stream);
         int E_arg = DIT_N_EXPERTS;
@@ -1648,15 +1673,25 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     CUdeviceptr d_moe_scratch = r->scratch[1]; /* shared with d_qkv/d_mlp */
 
     /* Skip stack: GPU-resident (was CPU RAM with sync DtoH/HtoD per push/pop;
-     * ~370MB on GPU — trivially affordable, kills 1260 syncs + 40GB PCIe). */
+     * ~370MB on GPU — trivially affordable, kills 1260 syncs + 40GB PCIe).
+     *
+     * Persistent (was per-call cuMemAlloc): cuMemAlloc fails inside CUDA-graph
+     * stream capture, and the buffer is small enough to keep around. */
     size_t skip_entry_sz = (size_t)N1 * H_dim * sizeof(float);
     int skip_stack_depth = DIT_HALF_DEPTH + 1;
-    CUdeviceptr d_skip_stack = 0;
-    if (cuMemAlloc(&d_skip_stack, (size_t)skip_stack_depth * skip_entry_sz) != CUDA_SUCCESS) {
-        fprintf(stderr, "HY3D: failed to allocate %.1f MB GPU skip stack\n",
-                (double)(skip_stack_depth * skip_entry_sz) / (1024.0 * 1024.0));
-        return -1;
+    size_t skip_stack_bytes = (size_t)skip_stack_depth * skip_entry_sz;
+    if (r->dit_skip_stack_bytes < skip_stack_bytes) {
+        if (r->dit_skip_stack) cuMemFree(r->dit_skip_stack);
+        if (cuMemAlloc(&r->dit_skip_stack, skip_stack_bytes) != CUDA_SUCCESS) {
+            fprintf(stderr, "HY3D: failed to allocate %.1f MB GPU skip stack\n",
+                    (double)skip_stack_bytes / (1024.0 * 1024.0));
+            r->dit_skip_stack = 0;
+            r->dit_skip_stack_bytes = 0;
+            return;
+        }
+        r->dit_skip_stack_bytes = skip_stack_bytes;
     }
+    CUdeviceptr d_skip_stack = r->dit_skip_stack;
 
     /* 1. Embed latents: [N, C] -> [N, H_dim] (into a temp buffer, not d_hidden yet) */
     /* We put the embedded result into d_normed temporarily */
@@ -1676,6 +1711,31 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
      * c = t_emb [1, H_dim]
      * x = d_normed [N, H_dim]   (embedded latents)
      * d_hidden = cat([c, x], dim=0)  -> [N+1, H_dim] */
+
+    /* CUDA-graph fast path. Replays the captured (concat -> blocks -> final)
+     * body when we have a graph cached for this (d_context, d_output) tuple.
+     * The eager prelude above (embed + timestep_embed + temb projections)
+     * always runs because op_timestep_embed bakes the host-scalar timestep
+     * into kernel args, which would freeze the captured graph at one t. */
+    if (r->use_graph) {
+        for (int i = 0; i < 4; i++) {
+            if (r->dit_graph_cache[i].valid &&
+                r->dit_graph_cache[i].ctx == d_context &&
+                r->dit_graph_cache[i].out == d_output) {
+                cuGraphLaunch(r->dit_graph_cache[i].exec, stream);
+                return;
+            }
+        }
+    }
+    int do_capture = (r->use_graph && r->dit_graph_warm);
+    if (do_capture) {
+        if (cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_RELAXED)
+            != CUDA_SUCCESS) {
+            fprintf(stderr, "HY3D: cuStreamBeginCapture failed; falling back to eager\n");
+            do_capture = 0;
+        }
+    }
+
     op_concat_first(ops, stream, d_hidden, d_temb, d_normed, N, H_dim);
 
     /* Now d_hidden has shape [N1, H_dim] = [4097, 2048] */
@@ -2111,7 +2171,33 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
     op_gemm(ops, stream, d_output, r->dit_final_linear_w, d_ln_out,
             r->dit_final_linear_b, C, H_dim, N);
 
-    cuMemFree(d_skip_stack);
+    if (do_capture) {
+        CUgraph g = 0;
+        if (cuStreamEndCapture(stream, &g) == CUDA_SUCCESS && g) {
+            CUgraphExec exec = 0;
+            if (cuGraphInstantiate(&exec, g, 0) == CUDA_SUCCESS && exec) {
+                int slot = -1;
+                for (int i = 0; i < 4; i++)
+                    if (!r->dit_graph_cache[i].valid) { slot = i; break; }
+                if (slot < 0) {
+                    if (r->dit_graph_cache[0].exec)
+                        cuGraphExecDestroy(r->dit_graph_cache[0].exec);
+                    slot = 0;
+                }
+                r->dit_graph_cache[slot].ctx = d_context;
+                r->dit_graph_cache[slot].out = d_output;
+                r->dit_graph_cache[slot].exec = exec;
+                r->dit_graph_cache[slot].valid = 1;
+                cuGraphLaunch(exec, stream);
+            } else {
+                fprintf(stderr, "HY3D: cuGraphInstantiate failed\n");
+            }
+            cuGraphDestroy(g);
+        } else {
+            fprintf(stderr, "HY3D: cuStreamEndCapture failed\n");
+        }
+    }
+    r->dit_graph_warm = 1;
 }
 
 /* Stage 3: ShapeVAE single transformer block */
@@ -2457,6 +2543,17 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
             cuEventCreate(&r->prof_ev_b, 0);
             for (int i = 0; i < HY3D_PHA_COUNT; i++) { r->prof_ms[i] = 0; r->prof_n[i] = 0; }
         }
+
+        env = getenv("HY3D_GRAPH");
+        r->use_graph = (env && env[0] != '0') ? 1 : 0;
+        if (r->use_graph && r->prof_enabled) {
+            fprintf(stderr, "HY3D: HY3D_PROFILE disabled — incompatible with HY3D_GRAPH\n");
+            r->prof_enabled = 0;
+        }
+        for (int i = 0; i < 4; i++) r->dit_graph_cache[i].valid = 0;
+        r->dit_skip_stack = 0;
+        r->dit_skip_stack_bytes = 0;
+        r->dit_graph_warm = 0;
 
         if (verbose) {
             fprintf(stderr,
@@ -3035,6 +3132,13 @@ void cuda_hy3d_free(cuda_hy3d_runner *r) {
 
     /* Free Fourier frequencies */
     if (r->vae_fourier_freqs) cuMemFree(r->vae_fourier_freqs);
+
+    /* Free CUDA-graph state */
+    for (int i = 0; i < 4; i++) {
+        if (r->dit_graph_cache[i].valid && r->dit_graph_cache[i].exec)
+            cuGraphExecDestroy(r->dit_graph_cache[i].exec);
+    }
+    if (r->dit_skip_stack) cuMemFree(r->dit_skip_stack);
 
     /* Note: individual weight buffers are GPU allocations that should also be freed.
      * For a full cleanup, iterate all CUdeviceptr fields. For now, destroying
