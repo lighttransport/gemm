@@ -363,6 +363,79 @@ static const char cuda_hy3d_specific_kernels[] =
 "\n"
 
 /* -------------------------------------------------------------------- */
+/* moe_topk_softmax_f32: per-token softmax + top-k for full MoE batch    */
+/* logits  [N_tok, n_experts] (n_experts <= 32)                          */
+/* indices [N_tok, top_k]    int   (selected expert ids per token)       */
+/* weights [N_tok, top_k]    float (softmax probs, NOT renormalized —    */
+/*           matches torch.topk(softmax(...)) with norm_topk_prob=False) */
+/* Launch: grid=(N_tok), block=(32) — single warp per token              */
+/* -------------------------------------------------------------------- */
+"__global__ void moe_topk_softmax_f32(int *indices, float *weights,\n"
+"                                       const float *logits,\n"
+"                                       int N_tok, int n_experts, int top_k) {\n"
+"    int tok = blockIdx.x;\n"
+"    if (tok >= N_tok) return;\n"
+"    if (threadIdx.x != 0) return;\n"
+"    const float *row = logits + (long)tok * n_experts;\n"
+"    /* full softmax over all experts */\n"
+"    float sm[32];\n"
+"    float mx = row[0];\n"
+"    for (int e = 1; e < n_experts; e++) if (row[e] > mx) mx = row[e];\n"
+"    float sum = 0.0f;\n"
+"    for (int e = 0; e < n_experts; e++) {\n"
+"        float v = expf(row[e] - mx);\n"
+"        sm[e] = v; sum += v;\n"
+"    }\n"
+"    float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;\n"
+"    for (int e = 0; e < n_experts; e++) sm[e] *= inv;\n"
+"    /* top-k selection by repeated argmax with masking (k is small: 2) */\n"
+"    int *idx_out = indices + (long)tok * top_k;\n"
+"    float *w_out = weights + (long)tok * top_k;\n"
+"    for (int k = 0; k < top_k; k++) {\n"
+"        int best = -1; float bv = -1.0f;\n"
+"        for (int e = 0; e < n_experts; e++) {\n"
+"            if (sm[e] > bv) { bv = sm[e]; best = e; }\n"
+"        }\n"
+"        idx_out[k] = best;\n"
+"        w_out[k]   = bv;\n"
+"        if (best >= 0) sm[best] = -1.0f;\n"
+"    }\n"
+"}\n"
+"\n"
+
+/* -------------------------------------------------------------------- */
+/* moe_scaled_accumulate_f32: accum[t,h] += w[t,k]*exp_out[t,h] iff      */
+/* indices[t,k] == target_expert for some k in [0, top_k).               */
+/* accum    [N_tok, H_dim]  float                                        */
+/* exp_out  [N_tok, H_dim]  float                                        */
+/* indices  [N_tok, top_k]  int                                          */
+/* weights  [N_tok, top_k]  float                                        */
+/* Launch: grid=(ceil((N_tok*H_dim)/256)), block=(256)                   */
+/* -------------------------------------------------------------------- */
+"__global__ void moe_scaled_accumulate_f32(float *accum,\n"
+"                                           const float *exp_out,\n"
+"                                           const int *indices,\n"
+"                                           const float *weights,\n"
+"                                           int target_expert,\n"
+"                                           int N_tok, int H_dim, int top_k) {\n"
+"    int gi = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = N_tok * H_dim;\n"
+"    if (gi >= total) return;\n"
+"    int t = gi / H_dim;\n"
+"    int h = gi - t * H_dim;\n"
+"    float w = 0.0f;\n"
+"    const int *ir = indices + (long)t * top_k;\n"
+"    const float *wr = weights + (long)t * top_k;\n"
+"    for (int k = 0; k < top_k; k++) {\n"
+"        if (ir[k] == target_expert) { w = wr[k]; break; }\n"
+"    }\n"
+"    if (w != 0.0f) {\n"
+"        accum[gi] += w * exp_out[gi];\n"
+"    }\n"
+"}\n"
+"\n"
+
+/* -------------------------------------------------------------------- */
 /* concat_f32: concatenate two [N, dim] tensors along last dimension     */
 /* Given a [N, dim] and b [N, dim], output c [N, 2*dim]                  */
 /* Used for skip-connection concat before linear projection.             */
@@ -451,6 +524,36 @@ static const char cuda_hy3d_specific_kernels[] =
 "        if (out_base+32+tx < n_out) Y[row*n_out+out_base+32+tx] = acc2 + (bias?bias[out_base+32+tx]:0.f);\n"
 "        if (out_base+48+tx < n_out) Y[row*n_out+out_base+48+tx] = acc3 + (bias?bias[out_base+48+tx]:0.f);\n"
 "    }\n"
+"}\n"
+"\n"
+
+/* -------------------------------------------------------------------- */
+/* f16_to_f32_buf: bulk F16 -> F32 conversion (used for online FP8       */
+/* weight quantization). NVRTC inlines __half2float; this is a one-line  */
+/* kernel that vectorizes across n elements.                             */
+/* -------------------------------------------------------------------- */
+"__global__ void f16_to_f32_buf(float *out, const unsigned short *in, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    unsigned short h = in[i];\n"
+"    unsigned int s = (h >> 15) & 1u;\n"
+"    unsigned int e = (h >> 10) & 0x1fu;\n"
+"    unsigned int m = h & 0x3ffu;\n"
+"    unsigned int f;\n"
+"    if (e == 0) {\n"
+"        if (m == 0) { f = s << 31; }\n"
+"        else { /* subnormal */\n"
+"            int sh = 0;\n"
+"            while (!(m & 0x400u)) { m <<= 1; sh++; }\n"
+"            m &= 0x3ffu;\n"
+"            f = (s << 31) | ((127u - 14u - sh) << 23) | (m << 13);\n"
+"        }\n"
+"    } else if (e == 31u) {\n"
+"        f = (s << 31) | 0x7f800000u | (m << 13);\n"
+"    } else {\n"
+"        f = (s << 31) | ((e + 127u - 15u) << 23) | (m << 13);\n"
+"    }\n"
+"    out[i] = __int_as_float(f);\n"
 "}\n"
 "\n"
 

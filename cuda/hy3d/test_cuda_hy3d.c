@@ -236,6 +236,12 @@ int main(int argc, char **argv) {
     const char *init_latents_path = NULL;
     const char *init_context_path = NULL;
     const char *init_trace_dir = NULL;
+    /* Tensor-core overrides: -1 = leave default (env var), 0/1 = force */
+    int opt_bf16_attn = -1;
+    int opt_fp8_attn  = -1;
+    int opt_fp8_gemm  = -1;
+    int opt_fp8_gemm_attn_mlp = -1;
+    int opt_bf16_gemm = -1;
 
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i+1 < argc) img_path = argv[++i];
@@ -257,6 +263,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--init-latents") == 0 && i+1 < argc) init_latents_path = argv[++i];
         else if (strcmp(argv[i], "--init-context") == 0 && i+1 < argc) init_context_path = argv[++i];
         else if (strcmp(argv[i], "--init-trace-dir") == 0 && i+1 < argc) init_trace_dir = argv[++i];
+        else if (strcmp(argv[i], "--bf16-attn") == 0 && i+1 < argc) opt_bf16_attn = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fp8-attn")  == 0 && i+1 < argc) opt_fp8_attn  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fp8-gemm")  == 0 && i+1 < argc) opt_fp8_gemm  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fp8-gemm-attn-mlp") == 0 && i+1 < argc) opt_fp8_gemm_attn_mlp = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bf16-gemm") == 0 && i+1 < argc) opt_bf16_gemm = atoi(argv[++i]);
     }
 
     char trace_latents_path[1024];
@@ -283,6 +294,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Initializing CUDA Hunyuan3D runner...\n");
     cuda_hy3d_runner *r = cuda_hy3d_init(device_id, verbose);
     if (!r) { fprintf(stderr, "Failed to init CUDA\n"); return 1; }
+
+    if (opt_bf16_attn >= 0) cuda_hy3d_set_bf16_attn(r, opt_bf16_attn);
+    if (opt_fp8_attn  >= 0) cuda_hy3d_set_fp8_attn(r, opt_fp8_attn);
+    if (opt_fp8_gemm  >= 0) cuda_hy3d_set_fp8_gemm(r, opt_fp8_gemm);
+    if (opt_fp8_gemm_attn_mlp >= 0) cuda_hy3d_set_fp8_gemm_attn_mlp(r, opt_fp8_gemm_attn_mlp);
+    if (opt_bf16_gemm >= 0) cuda_hy3d_set_bf16_gemm(r, opt_bf16_gemm);
 
     if (dump_every > 0) {
         const char *pfx = dump_prefix ? dump_prefix : "hy3d_step";

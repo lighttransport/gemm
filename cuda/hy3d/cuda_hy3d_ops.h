@@ -59,9 +59,85 @@ typedef struct {
     CUfunction concat_last_dim;  /* concat along last dim */
     CUfunction gemm_f32;         /* pure F32 GEMM (no F16 conversion) */
 
+    /* ---- Tensor-core GEMM + flash attention (shared with qimg/flux2) ---- */
+    /* Per-row FP8 MMA GEMMs (m16n8k32, sm_89+). Row-max scaling is computed
+     * online from F32 X via reduce_max_abs_per_row. */
+    CUfunction gemm_fp8_perrow;          /* MTILE=2 (32 rows / CTA) */
+    CUfunction gemm_fp8_perrow_mt4;      /* MTILE=4 (64 rows / CTA), n_tok % 64 == 0 */
+    CUfunction gemm_fp8_perrow_concat3;  /* fused QKV: 3 weight banks, shared row_max */
+    /* BF16 X / FP8 W MMA pipeline (m16n8k16, sm_80+). Inline FP8->BF16 dequant. */
+    CUfunction gemm_bf16_pipe;
+    /* Same as above + per-tensor weight scale multiplied at writeback.
+     * Used when FP8 weights store round(w/scale) (hy3d online prequant). */
+    CUfunction gemm_bf16_pipe_scaled;
+    /* FP8 quantizer + reductions */
+    CUfunction reduce_max_abs;           /* per-tensor max|x| -> single F32 */
+    CUfunction reduce_max_abs_per_row;   /* per-row max|x|   -> [n_rows] F32 */
+    CUfunction quantize_fp8;             /* F32 -> e4m3 with scale writeback */
+    CUfunction cast_f32_to_bf16;         /* F32 -> BF16 (uint16) cast */
+    /* Flash attention */
+    CUfunction flash_attn_bf16;          /* head_dim=128 BF16 acts */
+    CUfunction flash_attn_bf16_xq;       /* head_dim=128 BF16 acts, ragged Q (q_len != kv_len) */
+    CUfunction flash_attn_fp8;           /* head_dim=128 FP8 acts (sm_89+) */
+    /* MoE on-device kernels (added by hy3d) */
+    CUfunction moe_topk_softmax;         /* gate logits -> top-k indices + weights */
+    CUfunction moe_scaled_accumulate;    /* acc[t,h] += w[t] * out[t,h] when idx[t,*] == eid */
+    /* F16 -> F32 buffer cast (used for online FP8 weight quant at load) */
+    CUfunction f16_to_f32_buf;
+
     int sm_version;
     int use_f32_gemm;            /* 0=F16 weights (default), 1=F32 weights */
+    /* Tensor-core dispatch flags. Defaults set by cuda_hy3d_create() from env. */
+    int use_bf16_attn;           /* HY3D_BF16_ATTN, default ON if sm>=80 */
+    int use_fp8_attn;            /* HY3D_FP8_ATTN, default OFF (head_dim=128 only) */
+    int use_fp8_gemm;            /* HY3D_FP8_GEMM, default ON if sm>=89 — MoE only */
+    int use_fp8_gemm_attn_mlp;   /* HY3D_FP8_GEMM_ATTN_MLP, default OFF — extends FP8 to DiT attention QKV/out + MLP fc1/fc2; quality regression at all step counts (verified 30s) */
+    int use_bf16_gemm;           /* HY3D_BF16_GEMM, default OFF (precision fallback) */
+    int disable_mt4;             /* HY3D_DISABLE_MT4, default OFF */
+
+    /* Lazy scratch buffers for tensor-core attention. Owned by the ops struct,
+     * grown on first use, freed by hy3d_ops_destroy(). One contiguous BF16
+     * buffer holds Q,K,V back-to-back (each n_tok*dim halfs). */
+    CUdeviceptr d_qkv_bf16;
+    size_t      qkv_bf16_n;      /* total bytes allocated */
+    CUdeviceptr d_qkv_fp8;
+    size_t      qkv_fp8_n;
+    CUdeviceptr d_qkv_scales;    /* 3 floats: sQ, sK, sV (FP8 attn) */
+    /* Per-row max(|X|) buffer for FP8 perrow GEMM. Grown on first use. */
+    CUdeviceptr d_row_max;
+    size_t      row_max_n;
 } hy3d_ops;
+
+/* Free scratch buffers attached to the ops context. */
+static inline void hy3d_ops_destroy(hy3d_ops *ops) {
+    if (ops->d_qkv_bf16)   { cuMemFree(ops->d_qkv_bf16);   ops->d_qkv_bf16 = 0;   ops->qkv_bf16_n = 0; }
+    if (ops->d_qkv_fp8)    { cuMemFree(ops->d_qkv_fp8);    ops->d_qkv_fp8 = 0;    ops->qkv_fp8_n = 0; }
+    if (ops->d_qkv_scales) { cuMemFree(ops->d_qkv_scales); ops->d_qkv_scales = 0; }
+    if (ops->d_row_max)    { cuMemFree(ops->d_row_max);    ops->d_row_max = 0;    ops->row_max_n = 0; }
+}
+
+/* Ensure ops->d_row_max is at least n_tok floats. */
+static inline int hy3d_ops_ensure_row_max(hy3d_ops *ops, int n_tok) {
+    size_t need = (size_t)n_tok * sizeof(float);
+    if (ops->row_max_n >= need) return 0;
+    if (ops->d_row_max) { cuMemFree(ops->d_row_max); ops->d_row_max = 0; ops->row_max_n = 0; }
+    if (cuMemAlloc(&ops->d_row_max, need) != CUDA_SUCCESS) {
+        ops->d_row_max = 0; ops->row_max_n = 0;
+        return -1;
+    }
+    ops->row_max_n = need;
+    return 0;
+}
+
+/* Ensure ops->d_qkv_bf16 is at least `bytes` large. Returns 0 on success, -1 on OOM. */
+static inline int hy3d_ops_ensure_qkv_bf16(hy3d_ops *ops, size_t bytes) {
+    if (bytes <= ops->qkv_bf16_n) return 0;
+    if (ops->d_qkv_bf16) cuMemFree(ops->d_qkv_bf16);
+    ops->d_qkv_bf16 = 0; ops->qkv_bf16_n = 0;
+    if (cuMemAlloc(&ops->d_qkv_bf16, bytes) != CUDA_SUCCESS) return -1;
+    ops->qkv_bf16_n = bytes;
+    return 0;
+}
 
 /* ======================================================================== */
 /* Load all kernel functions from a compiled module                         */
@@ -118,6 +194,32 @@ static int hy3d_ops_load(hy3d_ops *ops, CUmodule module, int sm_version) {
     GET_FN("gemm_f32_f32",               gemm_f32);
 
     #undef GET_FN
+
+    /* ---- Optional tensor-core kernels: failure to find is non-fatal ---- */
+    /* All of these come from cuda/cuda_fp8_mma_kernels.h (shared with qimg/flux2)
+     * plus moe_* added by hy3d-specific kernels. If a symbol is missing the
+     * runtime falls back to the existing scalar/tiled path. */
+    #define GET_OPT(name, field) \
+        if (cuModuleGetFunction(&ops->field, module, name) != CUDA_SUCCESS) \
+            ops->field = NULL;
+
+    GET_OPT("gemm_fp8_pipe_perrow_f32",              gemm_fp8_perrow);
+    GET_OPT("gemm_fp8_pipe_perrow_mt4_f32",          gemm_fp8_perrow_mt4);
+    GET_OPT("gemm_fp8_pipe_perrow_mt4_concat3_f32",  gemm_fp8_perrow_concat3);
+    GET_OPT("gemm_bf16_pipe_f32",                    gemm_bf16_pipe);
+    GET_OPT("gemm_bf16_pipe_scaled_f32",             gemm_bf16_pipe_scaled);
+    GET_OPT("reduce_max_abs_f32",                    reduce_max_abs);
+    GET_OPT("reduce_max_abs_per_row_f32",            reduce_max_abs_per_row);
+    GET_OPT("quantize_to_fp8_e4m3",                  quantize_fp8);
+    GET_OPT("cast_f32_to_bf16",                      cast_f32_to_bf16);
+    GET_OPT("flash_attn_bf16",                       flash_attn_bf16);
+    GET_OPT("flash_attn_bf16_xq",                    flash_attn_bf16_xq);
+    GET_OPT("flash_attn_fp8",                        flash_attn_fp8);
+    GET_OPT("moe_topk_softmax_f32",                  moe_topk_softmax);
+    GET_OPT("moe_scaled_accumulate_f32",             moe_scaled_accumulate);
+    GET_OPT("f16_to_f32_buf",                        f16_to_f32_buf);
+
+    #undef GET_OPT
     return 0;
 }
 
@@ -149,6 +251,99 @@ static inline void op_gemm(hy3d_ops *ops, CUstream stream,
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     CUfunction fn = ops->use_f32_gemm ? ops->gemm_f32 : ops->gemm_tiled;
     cuLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0, stream, args, NULL);
+}
+
+/* GEMM with optional FP8 weight bundle. Dispatches:
+ *   1. F32 escape hatch (use_f32_gemm) — calls op_gemm.
+ *   2. Per-row FP8 MMA when:
+ *        use_fp8_gemm AND w_fp8 != 0 AND w_scale != 0 AND
+ *        n_in % 32 == 0 AND n_out % 64 == 0 AND n_tok >= 16
+ *      Uses MTILE=4 variant when n_tok % 64 == 0 and !disable_mt4.
+ *   3. Otherwise: falls back to op_gemm (existing F16 tiled path).
+ *
+ * Caller passes both the F16 weight pointer (for fallback) and the FP8/scale
+ * mirror pair (NULL/0 if not pre-quantized). */
+static inline void op_gemm_qw(hy3d_ops *ops, CUstream stream,
+                              CUdeviceptr Y,
+                              CUdeviceptr w_f16,
+                              CUdeviceptr w_fp8, CUdeviceptr w_scale,
+                              CUdeviceptr X, CUdeviceptr bias,
+                              int n_out, int n_in, int n_tok) {
+    if (ops->use_f32_gemm || !ops->use_fp8_gemm || !w_fp8 || !w_scale ||
+        !ops->gemm_fp8_perrow || !ops->reduce_max_abs_per_row ||
+        n_tok < 16 || (n_in % 32) != 0 || (n_out % 64) != 0) {
+        op_gemm(ops, stream, Y, w_f16, X, bias, n_out, n_in, n_tok);
+        return;
+    }
+    if (hy3d_ops_ensure_row_max(ops, n_tok) != 0) {
+        op_gemm(ops, stream, Y, w_f16, X, bias, n_out, n_in, n_tok);
+        return;
+    }
+    /* Per-row reduce: one CTA per row, 256 threads. */
+    {
+        void *rargs[] = {&ops->d_row_max, &X, &n_tok, &n_in};
+        cuLaunchKernel(ops->reduce_max_abs_per_row, (unsigned)n_tok, 1, 1,
+                       256, 1, 1, 0, stream, rargs, NULL);
+    }
+    /* w_scale is a 1-float device pointer; the kernel takes float-by-value
+     * and the qimg path passes 1.0f because qimg pre-bakes scale into W.
+     * We pre-quantized at load time and stored the scale device-side, so
+     * download it once per call. (One float; <1µs.) */
+    float w_scale_h = 1.0f;
+    cuMemcpyDtoH(&w_scale_h, w_scale, sizeof(float));
+    void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok,
+                    &w_scale_h, &ops->d_row_max};
+    unsigned gx = (unsigned)((n_out + 255) / 256);
+    if (!ops->disable_mt4 && ops->gemm_fp8_perrow_mt4 &&
+        n_tok >= 64 && (n_tok % 64) == 0) {
+        unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+        unsigned gx4 = (gx + 3u) & ~3u;
+        gy4 = (gy4 + 3u) & ~3u;
+        size_t smem_mt4 = 2048 + 8192 * 2 + 512;
+        cuLaunchKernel(ops->gemm_fp8_perrow_mt4, gx4, gy4, 1, 128, 1, 1,
+                       smem_mt4, stream, args, NULL);
+        return;
+    }
+    unsigned gy = (unsigned)((n_tok + 31) / 32);
+    unsigned gx_pr = (gx + 3u) & ~3u;
+    gy = (gy + 3u) & ~3u;
+    size_t smem_pr = 1024 + 8192 * 2 + 256;
+    cuLaunchKernel(ops->gemm_fp8_perrow, gx_pr, gy, 1, 128, 1, 1,
+                   smem_pr, stream, args, NULL);
+}
+
+/* DiT attention/MLP scope dispatcher.
+ *   Priority:
+ *     1. F32 escape (use_f32_gemm)                          -> op_gemm
+ *     2. BF16 X * FP8 W pipe (use_bf16_gemm)                -> gemm_bf16_pipe_scaled
+ *        (BF16 accumulate avoids per-tensor weight scale drift seen in pure FP8)
+ *     3. Per-row FP8 MMA (use_fp8_gemm_attn_mlp, opt-in)    -> op_gemm_qw
+ *     4. F16 tiled fallback                                  -> op_gemm
+ *
+ * MoE call sites use op_gemm_qw directly and stay on FP8 (where the trajectory
+ * is robust). The gating differs only here. */
+static inline void op_gemm_qw_dit(hy3d_ops *ops, CUstream stream,
+                                  CUdeviceptr Y,
+                                  CUdeviceptr w_f16,
+                                  CUdeviceptr w_fp8, CUdeviceptr w_scale,
+                                  CUdeviceptr X, CUdeviceptr bias,
+                                  int n_out, int n_in, int n_tok) {
+    if (!ops->use_f32_gemm && ops->use_bf16_gemm && w_fp8 && w_scale &&
+        ops->gemm_bf16_pipe_scaled &&
+        n_tok >= 16 && (n_in % 32) == 0 && (n_out % 256) == 0) {
+        void *args[] = {&Y, &w_fp8, &X, &bias, &n_out, &n_in, &n_tok, &w_scale};
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok +  31) /  32);
+        gx = (gx + 3u) & ~3u;
+        gy = (gy + 3u) & ~3u;
+        size_t smem_bf16 = 2048 + 8192 * 2;
+        cuLaunchKernel(ops->gemm_bf16_pipe_scaled, gx, gy, 1, 128, 1, 1,
+                       smem_bf16, stream, args, NULL);
+        return;
+    }
+    if (!ops->use_fp8_gemm_attn_mlp) { w_fp8 = 0; w_scale = 0; }
+    op_gemm_qw(ops, stream, Y, w_f16, w_fp8, w_scale, X, bias,
+               n_out, n_in, n_tok);
 }
 
 /* Force the pure F32 GEMM backend for a single call. */
@@ -215,11 +410,38 @@ static inline void op_qk_layernorm(hy3d_ops *ops, CUstream stream,
 /* ---- Cross-attention: Q/K/V may have different sequence lengths ---- */
 /* Q: [q_len, dim], K: [kv_len, dim], V: [kv_len, dim], out: [q_len, dim] */
 /* dim = n_heads * head_dim */
+static inline void op_cast_f32_to_bf16(hy3d_ops *ops, CUstream stream,
+                                       CUdeviceptr dst_u16, CUdeviceptr src_f32,
+                                       int n);
+
 static inline void op_cross_attn(hy3d_ops *ops, CUstream stream,
                                  CUdeviceptr out,
                                  CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V,
                                  int q_len, int kv_len, int dim,
                                  int n_heads, int head_dim) {
+    /* BF16 ragged-Q flash fast path: head_dim==128, sm>=80, kernels present. */
+    if (ops->use_bf16_attn && ops->flash_attn_bf16_xq && ops->cast_f32_to_bf16 &&
+        head_dim == 128 && q_len > 0 && kv_len > 0) {
+        int n_q_elem  = q_len  * dim;
+        int n_kv_elem = kv_len * dim;
+        size_t need = (size_t)(n_q_elem + 2 * n_kv_elem) * sizeof(unsigned short);
+        if (hy3d_ops_ensure_qkv_bf16(ops, need) == 0) {
+            CUdeviceptr d_q = ops->d_qkv_bf16;
+            CUdeviceptr d_k = ops->d_qkv_bf16 + (CUdeviceptr)(n_q_elem * sizeof(unsigned short));
+            CUdeviceptr d_v = ops->d_qkv_bf16 + (CUdeviceptr)((n_q_elem + n_kv_elem) * sizeof(unsigned short));
+            op_cast_f32_to_bf16(ops, stream, d_q, Q, n_q_elem);
+            op_cast_f32_to_bf16(ops, stream, d_k, K, n_kv_elem);
+            op_cast_f32_to_bf16(ops, stream, d_v, V, n_kv_elem);
+            unsigned gy = (unsigned)((q_len + 63) / 64);
+            size_t smem = (size_t)(4 * 32 * 136 * 2);
+            void *args[] = {&out, &d_q, &d_k, &d_v, &q_len, &kv_len, &n_heads, &head_dim};
+            cuLaunchKernel(ops->flash_attn_bf16_xq,
+                           (unsigned)n_heads, gy, 1,
+                           128, 1, 1, smem, stream, args, NULL);
+            return;
+        }
+    }
+
     float scale = 1.0f / sqrtf((float)head_dim);
     int nt = 128;  /* threads per block */
     size_t smem = (size_t)(kv_len + nt) * sizeof(float);
@@ -229,12 +451,50 @@ static inline void op_cross_attn(hy3d_ops *ops, CUstream stream,
                    (unsigned)nt, 1, 1, smem, stream, args, NULL);
 }
 
-/* ---- Self-attention: wrapper over cross_attn with q_len == kv_len ---- */
+/* Internal: launch cast_f32_to_bf16 over n contiguous F32 elements. */
+static inline void op_cast_f32_to_bf16(hy3d_ops *ops, CUstream stream,
+                                       CUdeviceptr dst_u16, CUdeviceptr src_f32,
+                                       int n) {
+    void *args[] = {&src_f32, &dst_u16, &n};
+    cuLaunchKernel(ops->cast_f32_to_bf16,
+                   (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, stream, args, NULL);
+}
+
+/* ---- Self-attention: BF16 flash attn fast path, F32 fallback ---- */
+/* Only the BF16 flash kernel from cuda_fp8_mma_kernels.h is wired here today.
+ * It is head_dim=128 only, so DINOv2-L/ShapeVAE (head_dim=64) automatically
+ * fall through to the existing cross_attn_f32 kernel. */
 static inline void op_self_attn(hy3d_ops *ops, CUstream stream,
                                 CUdeviceptr out,
                                 CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V,
                                 int n_tok, int dim,
                                 int n_heads, int head_dim) {
+    /* BF16 fast path: head_dim==128, sm>=80, kernels present, scratch OK. */
+    if (ops->use_bf16_attn && ops->flash_attn_bf16 && ops->cast_f32_to_bf16 &&
+        head_dim == 128 && n_tok > 0) {
+        int n_elem = n_tok * dim;
+        size_t need = (size_t)3 * n_elem * sizeof(unsigned short);
+        if (hy3d_ops_ensure_qkv_bf16(ops, need) == 0) {
+            CUdeviceptr d_q = ops->d_qkv_bf16;
+            CUdeviceptr d_k = ops->d_qkv_bf16 + (CUdeviceptr)(n_elem * sizeof(unsigned short));
+            CUdeviceptr d_v = ops->d_qkv_bf16 + (CUdeviceptr)(2 * n_elem * sizeof(unsigned short));
+            op_cast_f32_to_bf16(ops, stream, d_q, Q, n_elem);
+            op_cast_f32_to_bf16(ops, stream, d_k, K, n_elem);
+            op_cast_f32_to_bf16(ops, stream, d_v, V, n_elem);
+            /* flash_attn_bf16: grid=(n_heads, ceil(n_tok/64)), block=128 (4 warps).
+             * smem: 4*32*136*2 = 34816 B (double-buffered K/V tiles). */
+            unsigned gy = (unsigned)((n_tok + 63) / 64);
+            size_t smem = (size_t)(4 * 32 * 136 * 2);
+            void *args[] = {&out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+            cuLaunchKernel(ops->flash_attn_bf16,
+                           (unsigned)n_heads, gy, 1,
+                           128, 1, 1, smem, stream, args, NULL);
+            return;
+        }
+        /* OOM -> fall through */
+    }
+
     op_cross_attn(ops, stream, out, Q, K, V,
                   n_tok, n_tok, dim, n_heads, head_dim);
 }

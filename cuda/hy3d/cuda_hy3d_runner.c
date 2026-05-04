@@ -31,6 +31,10 @@
 
 /* Modular ops: kernel source strings + launch wrappers */
 #include "cuda_hy3d_kernels.h"
+/* Shared FP8/BF16 MMA kernel source (used by qimg/flux2). Appended in its
+ * own extern "C" block below; provides per-row FP8 GEMM, BF16-pipe GEMM,
+ * flash_attn_bf16/fp8, quantize_to_fp8_e4m3, reduce_max_abs_*. */
+#include "../cuda_fp8_mma_kernels.h"
 #include "cuda_hy3d_ops.h"
 
 #include <stdio.h>
@@ -245,21 +249,29 @@ typedef struct {
     /* Self-attention — fused QKV weight [3*dim, dim] for correct head interleaving */
     CUdeviceptr norm1_w, norm1_b;
     CUdeviceptr sa_qkv_w;              /* [3*2048, 2048] = concat(to_q.w, to_k.w, to_v.w) */
+    CUdeviceptr sa_qkv_w_fp8, sa_qkv_w_scale;
     CUdeviceptr sa_out_w, sa_out_b;
+    CUdeviceptr sa_out_w_fp8, sa_out_w_scale;
     CUdeviceptr sa_q_norm_w, sa_k_norm_w;  /* RMSNorm weight only */
     /* Cross-attention — Q/K/V separate to mirror the PyTorch reference
      * exactly before any view/split reshaping. */
     CUdeviceptr norm2_w, norm2_b;
     CUdeviceptr ca_q_w;                /* [2048, 2048] */
+    CUdeviceptr ca_q_w_fp8, ca_q_w_scale;
     CUdeviceptr ca_k_w;                /* [2048, 1024] */
+    CUdeviceptr ca_k_w_fp8, ca_k_w_scale;
     CUdeviceptr ca_v_w;                /* [2048, 1024] */
+    CUdeviceptr ca_v_w_fp8, ca_v_w_scale;
     CUdeviceptr ca_out_w, ca_out_b;
+    CUdeviceptr ca_out_w_fp8, ca_out_w_scale;
     CUdeviceptr ca_q_norm_w, ca_k_norm_w;
     /* Norm3 + MLP/MoE */
     CUdeviceptr norm3_w, norm3_b;
     /* Regular MLP (blocks 0-14) */
     CUdeviceptr mlp_fc1_w, mlp_fc1_b;
+    CUdeviceptr mlp_fc1_w_fp8, mlp_fc1_w_scale;
     CUdeviceptr mlp_fc2_w, mlp_fc2_b;
+    CUdeviceptr mlp_fc2_w_fp8, mlp_fc2_w_scale;
     /* MoE (blocks 15-20) */
     int use_moe;
     CUdeviceptr moe_gate_w;                                   /* [8, 2048] */
@@ -267,6 +279,13 @@ typedef struct {
     CUdeviceptr moe_expert_fc1_b[DIT_N_EXPERTS];              /* [8192] each */
     CUdeviceptr moe_expert_fc2_w[DIT_N_EXPERTS];              /* [2048, 8192] each */
     CUdeviceptr moe_expert_fc2_b[DIT_N_EXPERTS];              /* [2048] each */
+    /* Online-quantized FP8 mirrors of the expert weights + per-tensor scales.
+     * Populated by quantize_dit_moe_to_fp8() at load time when ops.use_fp8_gemm
+     * is enabled. NULL otherwise — dispatch falls through to the F16 path. */
+    CUdeviceptr moe_expert_fc1_w_fp8[DIT_N_EXPERTS];
+    CUdeviceptr moe_expert_fc1_w_scale[DIT_N_EXPERTS];
+    CUdeviceptr moe_expert_fc2_w_fp8[DIT_N_EXPERTS];
+    CUdeviceptr moe_expert_fc2_w_scale[DIT_N_EXPERTS];
     CUdeviceptr moe_shared_fc1_w, moe_shared_fc1_b;
     CUdeviceptr moe_shared_fc2_w, moe_shared_fc2_b;
     /* Skip connection (blocks 11-20) */
@@ -388,14 +407,70 @@ static int hy3d_should_dump_velocity(const struct cuda_hy3d_runner *r, int step1
 /* Kernel compilation                                                       */
 /* ======================================================================== */
 
+/* Build the FP8e4m3 -> BF16 LUT used by gemm_bf16_pipe_f32. */
+static void hy3d_init_fp8_to_bf16_lut(uint16_t out[256]) {
+    for (int i = 0; i < 256; i++) {
+        int sign = (i >> 7) & 1;
+        int exp  = (i >> 3) & 0xF;
+        int mant = i & 0x7;
+        float v;
+        if (exp == 0 && mant == 0) v = 0.f;
+        else if (exp == 15 && mant == 7) v = 0.f; /* NaN */
+        else if (exp == 0) v = ((float)mant / 8.f) * (1.f / 64.f);
+        else v = (1.f + (float)mant / 8.f) * exp2f((float)(exp - 7));
+        if (sign) v = -v;
+        uint32_t b; memcpy(&b, &v, 4);
+        uint32_t r = 0x7FFFu + ((b >> 16) & 1u);
+        out[i] = (uint16_t)((b + r) >> 16);
+    }
+}
+
 static int hy3d_compile_kernels(cuda_hy3d_runner *r) {
-    /* Concatenate common + HY3D-specific kernel source */
+    /* Concat order (mirrors qimg / flux2):
+     *   cuda_kernels_common_src   (opens extern "C")
+     *   + cuda_hy3d_specific      (closes extern "C")
+     *   + extern "C" {            (open second block)
+     *   + fp8_mma_kernels_src     (FP8/BF16 MMA + flash attn, shared with qimg)
+     *   + }                       (close second block)
+     *
+     * The second extern "C" block is required so NVRTC can find the FP8
+     * kernel symbols by name. Failures to locate any of these later in
+     * hy3d_ops_load() are non-fatal: the runtime falls back to the
+     * existing scalar / tiled path. */
+    /* fp8_mma_kernels_src expects a `to_bf16(float)` device fn to be in scope
+     * (used by the *_bf16 output variants we don't dispatch but must compile).
+     * Declare it inline at the top of our extern "C" block. */
+    const char *mma_open  =
+        "\nextern \"C\" {\n"
+        "/* FP8 e4m3 -> BF16 LUT (uploaded after module load via cuModuleGetGlobal). */\n"
+        "__device__ __constant__ unsigned short d_fp8_to_bf16_lut[256];\n"
+        /* Returns BF16-truncated value as float (high 16 bits = BF16 bits, low 16 = 0).
+         * Matches qimg's convention so gemm_bf16_pipe_*_f32 writebacks land
+         * with the right interpretation in the F32 output buffer. NaN payload
+         * is preserved as the canonical 0x7FC0_0000 quiet NaN. */
+        "__device__ __forceinline__ float to_bf16(float f) {\n"
+        "    unsigned int b; memcpy(&b, &f, 4);\n"
+        "    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) {\n"
+        "        unsigned int qn = 0x7FC00000u; float r; memcpy(&r, &qn, 4); return r;\n"
+        "    }\n"
+        "    unsigned int rnd = 0x7FFFu + ((b >> 16) & 1u);\n"
+        "    b = (b + rnd) & 0xFFFF0000u;\n"
+        "    float out; memcpy(&out, &b, 4); return out;\n"
+        "}\n";
+    const char *mma_close = "\n} /* extern C (fp8_mma_kernels) */\n";
     size_t len1 = strlen(cuda_kernels_common_src);
     size_t len2 = strlen(cuda_hy3d_specific_kernels);
-    char *full_src = (char *)malloc(len1 + len2 + 1);
-    memcpy(full_src, cuda_kernels_common_src, len1);
-    memcpy(full_src + len1, cuda_hy3d_specific_kernels, len2);
-    full_src[len1 + len2] = '\0';
+    size_t len3 = strlen(fp8_mma_kernels_src);
+    size_t lo = strlen(mma_open);
+    size_t lc = strlen(mma_close);
+    char *full_src = (char *)malloc(len1 + len2 + lo + len3 + lc + 1);
+    char *p = full_src;
+    memcpy(p, cuda_kernels_common_src, len1);    p += len1;
+    memcpy(p, cuda_hy3d_specific_kernels, len2); p += len2;
+    memcpy(p, mma_open, lo);                     p += lo;
+    memcpy(p, fp8_mma_kernels_src, len3);        p += len3;
+    memcpy(p, mma_close, lc);                    p += lc;
+    *p = '\0';
 
     r->sm_version = cu_compile_kernels(&r->module, r->device, full_src,
                                         "hy3d_kernels", r->verbose, "HY3D");
@@ -406,6 +481,18 @@ static int hy3d_compile_kernels(cuda_hy3d_runner *r) {
     if (hy3d_ops_load(&r->ops, r->module, r->sm_version) != 0) {
         fprintf(stderr, "HY3D: ops_load failed\n");
         return -1;
+    }
+
+    /* Upload FP8 e4m3 -> BF16 constant LUT consumed by gemm_bf16_pipe_f32. */
+    {
+        CUdeviceptr d_lut;
+        size_t lut_sz;
+        if (cuModuleGetGlobal(&d_lut, &lut_sz, r->module, "d_fp8_to_bf16_lut") == CUDA_SUCCESS &&
+            lut_sz == 256 * sizeof(uint16_t)) {
+            uint16_t lut[256];
+            hy3d_init_fp8_to_bf16_lut(lut);
+            cuMemcpyHtoD(d_lut, lut, sizeof(lut));
+        }
     }
 
     return 0;
@@ -541,6 +628,66 @@ static CUdeviceptr gpu_alloc(size_t bytes) {
         return 0;
     }
     return d;
+}
+
+/* Online FP8 quantizer for an F16 GPU weight buffer.
+ *   d_w_f16: input  [n_elem] uint16
+ *   *out_d_w_fp8:   allocated here as [n_elem] uint8 (caller frees on shutdown)
+ *   *out_d_w_scale: allocated here as [1]      float (caller frees on shutdown)
+ * Returns 0 on success, -1 if any required kernel/alloc is missing — in which
+ * case both out pointers are set to 0 and the caller falls back to F16.
+ *
+ * Pipeline: f16->f32 cast -> reduce_max_abs -> quantize_to_fp8_e4m3.
+ * All scratch is freed before return. Stream-synchronizes once at the end so
+ * the caller can immediately read scales / use FP8 buffers. */
+static int hy3d_quantize_w_fp8(hy3d_ops *ops, CUstream stream,
+                                CUdeviceptr d_w_f16, size_t n_elem,
+                                CUdeviceptr *out_d_w_fp8,
+                                CUdeviceptr *out_d_w_scale) {
+    *out_d_w_fp8 = 0;
+    *out_d_w_scale = 0;
+    if (!ops || !d_w_f16 || n_elem == 0 ||
+        !ops->f16_to_f32_buf || !ops->reduce_max_abs || !ops->quantize_fp8) {
+        return -1;
+    }
+    CUdeviceptr d_f32 = 0, d_max = 0, d_fp8 = 0, d_scale = 0;
+    if (cuMemAlloc(&d_f32, n_elem * sizeof(float)) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_max, sizeof(float)) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_fp8, n_elem) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_scale, sizeof(float)) != CUDA_SUCCESS) goto fail;
+
+    int n = (int)n_elem;
+    /* 1. f16 -> f32 */
+    {
+        unsigned grid = (unsigned)((n + 255) / 256);
+        void *args[] = {&d_f32, &d_w_f16, &n};
+        cuLaunchKernel(ops->f16_to_f32_buf, grid, 1, 1, 256, 1, 1, 0, stream, args, NULL);
+    }
+    /* 2. zero max + reduce */
+    cuMemsetD8Async(d_max, 0, sizeof(float), stream);
+    {
+        unsigned grid = (unsigned)((n + 255) / 256);
+        void *args[] = {&d_max, &d_f32, &n};
+        cuLaunchKernel(ops->reduce_max_abs, grid, 1, 1, 256, 1, 1, 0, stream, args, NULL);
+    }
+    /* 3. quantize */
+    {
+        unsigned grid = (unsigned)((n + 255) / 256);
+        void *args[] = {&d_fp8, &d_scale, &d_f32, &d_max, &n};
+        cuLaunchKernel(ops->quantize_fp8, grid, 1, 1, 256, 1, 1, 0, stream, args, NULL);
+    }
+    cuStreamSynchronize(stream);
+    cuMemFree(d_f32);
+    cuMemFree(d_max);
+    *out_d_w_fp8 = d_fp8;
+    *out_d_w_scale = d_scale;
+    return 0;
+fail:
+    if (d_f32)   cuMemFree(d_f32);
+    if (d_max)   cuMemFree(d_max);
+    if (d_fp8)   cuMemFree(d_fp8);
+    if (d_scale) cuMemFree(d_scale);
+    return -1;
 }
 
 /* Upload GEMM weight: F16 or F32 based on runner mode */
@@ -803,6 +950,60 @@ static int load_dit_weights(cuda_hy3d_runner *r, const char *path) {
     r->dit_final_linear_b = st_upload_f32(st, "final_layer.linear.bias", r->verbose);
 
     safetensors_close(st);
+
+    /* Online FP8 prequant of all hot DiT GEMM weights. Skipped silently when
+     * use_fp8_gemm is off or when sm<89 / kernels are missing — caller falls
+     * back to F16. */
+    if (!f32g && r->ops.use_fp8_gemm && r->ops.gemm_fp8_perrow) {
+        const size_t fc1_n   = (size_t)DIT_FFN * DIT_HIDDEN;        /* [8192, 2048] */
+        const size_t fc2_n   = (size_t)DIT_HIDDEN * DIT_FFN;        /* [2048, 8192] */
+        const size_t qkv_n   = (size_t)(3 * DIT_HIDDEN) * DIT_HIDDEN; /* [6144, 2048] */
+        const size_t out_n   = (size_t)DIT_HIDDEN * DIT_HIDDEN;      /* [2048, 2048] */
+        const size_t caq_n   = out_n;                                /* [2048, 2048] */
+        const size_t cakv_n  = (size_t)DIT_HIDDEN * DINO_HIDDEN;     /* [2048, 1024] */
+        int n_quant = 0;
+        size_t bytes = 0;
+        #define QFP8(field, n_elem) do { \
+            if (b->field && hy3d_quantize_w_fp8(&r->ops, r->stream, \
+                    b->field, (n_elem), &b->field##_fp8, &b->field##_scale) == 0) { \
+                n_quant++; bytes += (n_elem); \
+            } \
+        } while (0)
+        for (int i = 0; i < DIT_DEPTH; i++) {
+            dit_block_gpu *b = &r->dit_blocks[i];
+            QFP8(sa_qkv_w, qkv_n);
+            QFP8(sa_out_w, out_n);
+            QFP8(ca_q_w,   caq_n);
+            QFP8(ca_k_w,   cakv_n);
+            QFP8(ca_v_w,   cakv_n);
+            QFP8(ca_out_w, out_n);
+            if (b->use_moe) {
+                for (int e = 0; e < DIT_N_EXPERTS; e++) {
+                    if (b->moe_expert_fc1_w[e] &&
+                        hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                             b->moe_expert_fc1_w[e], fc1_n,
+                                             &b->moe_expert_fc1_w_fp8[e],
+                                             &b->moe_expert_fc1_w_scale[e]) == 0)
+                        { n_quant++; bytes += fc1_n; }
+                    if (b->moe_expert_fc2_w[e] &&
+                        hy3d_quantize_w_fp8(&r->ops, r->stream,
+                                             b->moe_expert_fc2_w[e], fc2_n,
+                                             &b->moe_expert_fc2_w_fp8[e],
+                                             &b->moe_expert_fc2_w_scale[e]) == 0)
+                        { n_quant++; bytes += fc2_n; }
+                }
+            } else {
+                QFP8(mlp_fc1_w, fc1_n);
+                QFP8(mlp_fc2_w, fc2_n);
+            }
+        }
+        #undef QFP8
+        if (r->verbose)
+            fprintf(stderr, "HY3D: online FP8 quant — %d weight buffers "
+                            "(%.1f MB FP8)\n",
+                    n_quant, (double)bytes / (1024.0*1024.0));
+    }
+
     r->dit_loaded = 1;
     if (r->verbose) fprintf(stderr, "HY3D: DiT weights loaded\n");
     return 0;
@@ -1038,117 +1239,113 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
     const int H_dim = DIT_HIDDEN;
     const int ffn = DIT_FFN;
 
-    /* Scratch layout within d_moe_scratch (reduced — reuse buffers):
+    /* Scratch layout within d_moe_scratch:
      * gate_logits  [N_tok * DIT_N_EXPERTS]    (~131KB)
-     * expert_h     [N_tok * ffn]              (~134MB, reused for each expert + shared)
-     * accum        [N_tok * H_dim]            (~33.5MB, output accumulator)
+     * expert_h     [N_tok * ffn]              (~134MB, reused per expert + shared)
+     * expert_o     [N_tok * H_dim]            (~33.5MB, reused per expert + shared)
+     * moe_idx      [N_tok * top_k]  int       (~32KB)
+     * moe_w        [N_tok * top_k]  float     (~32KB)
      */
     size_t off = 0;
     CUdeviceptr d_gate   = d_moe_scratch + off; off += (size_t)N_tok * DIT_N_EXPERTS * sizeof(float);
     CUdeviceptr d_exp_h  = d_moe_scratch + off; off += (size_t)N_tok * ffn * sizeof(float);
-    CUdeviceptr d_exp_o  = d_moe_scratch + off; /* [N_tok * H_dim] reused */
+    CUdeviceptr d_exp_o  = d_moe_scratch + off; off += (size_t)N_tok * H_dim * sizeof(float);
+    CUdeviceptr d_moe_idx = d_moe_scratch + off; off += (size_t)N_tok * DIT_MOE_TOP_K * sizeof(int);
+    CUdeviceptr d_moe_w   = d_moe_scratch + off; /* [N_tok * top_k] */
 
     /* Step 1: Compute gate logits: [N_tok, H_dim] @ [8, H_dim]^T -> [N_tok, 8] */
     op_gemm(ops, stream, d_gate, blk->moe_gate_w, d_input, 0,
             DIT_N_EXPERTS, H_dim, N_tok);
 
-    /* Step 2: Download gate logits, compute softmax + top-2 on CPU */
-    float *gate_cpu = (float *)malloc((size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
-    cuStreamSynchronize(stream);
-    cuMemcpyDtoH(gate_cpu, d_gate, (size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
-
-    /* Softmax over experts per token, then top-2 masking */
-    /* gate_weights[tok][expert]: non-zero only for top-2 */
-    float *gate_weights = (float *)calloc((size_t)N_tok * DIT_N_EXPERTS, sizeof(float));
-    for (int t = 0; t < N_tok; t++) {
-        float *row = gate_cpu + t * DIT_N_EXPERTS;
-        /* Softmax */
-        float mx = row[0];
-        for (int e = 1; e < DIT_N_EXPERTS; e++)
-            if (row[e] > mx) mx = row[e];
-        float sum = 0.0f;
-        float softmax_vals[DIT_N_EXPERTS];
-        for (int e = 0; e < DIT_N_EXPERTS; e++) {
-            softmax_vals[e] = expf(row[e] - mx);
-            sum += softmax_vals[e];
-        }
-        float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-        for (int e = 0; e < DIT_N_EXPERTS; e++)
-            softmax_vals[e] *= inv;
-
-        /* Top-2 selection */
-        int top_idx[DIT_MOE_TOP_K];
-        float top_val[DIT_MOE_TOP_K];
-        for (int k = 0; k < DIT_MOE_TOP_K; k++) {
-            int best = -1;
-            float best_v = -1e30f;
-            for (int e = 0; e < DIT_N_EXPERTS; e++) {
-                int used = 0;
-                for (int kk = 0; kk < k; kk++)
-                    if (top_idx[kk] == e) { used = 1; break; }
-                if (!used && softmax_vals[e] > best_v) {
-                    best_v = softmax_vals[e];
-                    best = e;
-                }
+    /* Step 2: GPU-side softmax + top-k (was CPU bounce of [N_tok*8]). */
+    int n_experts = DIT_N_EXPERTS;
+    int top_k = DIT_MOE_TOP_K;
+    if (ops->moe_topk_softmax) {
+        void *args[] = {&d_moe_idx, &d_moe_w, &d_gate, &N_tok, &n_experts, &top_k};
+        cuLaunchKernel(ops->moe_topk_softmax, (unsigned)N_tok, 1, 1,
+                       32, 1, 1, 0, stream, args, NULL);
+    } else {
+        /* Fallback: CPU top-k path (matches former behaviour). */
+        float *gate_cpu = (float *)malloc((size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
+        cuStreamSynchronize(stream);
+        cuMemcpyDtoH(gate_cpu, d_gate, (size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
+        int *idx_cpu = (int *)malloc((size_t)N_tok * top_k * sizeof(int));
+        float *w_cpu = (float *)malloc((size_t)N_tok * top_k * sizeof(float));
+        for (int t = 0; t < N_tok; t++) {
+            float *row = gate_cpu + t * DIT_N_EXPERTS;
+            float mx = row[0];
+            for (int e = 1; e < DIT_N_EXPERTS; e++) if (row[e] > mx) mx = row[e];
+            float sum = 0.0f, sm[DIT_N_EXPERTS];
+            for (int e = 0; e < DIT_N_EXPERTS; e++) { sm[e] = expf(row[e] - mx); sum += sm[e]; }
+            float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+            for (int e = 0; e < DIT_N_EXPERTS; e++) sm[e] *= inv;
+            for (int k = 0; k < top_k; k++) {
+                int best = -1; float bv = -1.0f;
+                for (int e = 0; e < DIT_N_EXPERTS; e++) if (sm[e] > bv) { bv = sm[e]; best = e; }
+                idx_cpu[t*top_k+k] = best;
+                w_cpu[t*top_k+k] = bv;
+                if (best >= 0) sm[best] = -1.0f;
             }
-            top_idx[k] = best;
-            top_val[k] = best_v;
         }
-
-        /* Store top-2 weights (no renormalization — norm_topk_prob=False in PyTorch) */
-        for (int k = 0; k < DIT_MOE_TOP_K; k++) {
-            gate_weights[t * DIT_N_EXPERTS + top_idx[k]] = top_val[k];
-        }
+        cuMemcpyHtoDAsync(d_moe_idx, idx_cpu, (size_t)N_tok*top_k*sizeof(int), stream);
+        cuMemcpyHtoDAsync(d_moe_w,   w_cpu,   (size_t)N_tok*top_k*sizeof(float), stream);
+        cuStreamSynchronize(stream);
+        free(gate_cpu); free(idx_cpu); free(w_cpu);
     }
-    free(gate_cpu);
 
     /* Step 3: Zero out accumulator (d_output) */
     cuMemsetD8Async(d_output, 0, (size_t)N_tok * H_dim * sizeof(float), stream);
 
-    /* Step 4: For each expert, compute output and weighted-add */
-    float *expert_scale_cpu = (float *)malloc((size_t)N_tok * sizeof(float));
+    /* Step 4: For each expert, compute output and weighted-add ON GPU
+     * (eliminates the per-expert ~33.5MB host roundtrip). */
+    int H_dim_arg = H_dim;  /* drop const for kernel arg pointer */
+    int total_acc = N_tok * H_dim;
+    unsigned acc_grid = (unsigned)((total_acc + 255) / 256);
     for (int e = 0; e < DIT_N_EXPERTS; e++) {
-        /* Check if any token uses this expert */
-        int any_nonzero = 0;
-        for (int t = 0; t < N_tok; t++) {
-            expert_scale_cpu[t] = gate_weights[t * DIT_N_EXPERTS + e];
-            if (expert_scale_cpu[t] > 0.0f) any_nonzero = 1;
-        }
-        if (!any_nonzero) continue;
-
-        /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e */
-        op_gemm(ops, stream, d_exp_h, blk->moe_expert_fc1_w[e], d_input,
-                blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
+        /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e
+         * FP8 path used when w_fp8/scale were prequantized in load_dit_weights;
+         * otherwise falls through to the F16 tiled path inside op_gemm_qw. */
+        op_gemm_qw(ops, stream, d_exp_h,
+                   blk->moe_expert_fc1_w[e],
+                   blk->moe_expert_fc1_w_fp8[e], blk->moe_expert_fc1_w_scale[e],
+                   d_input, blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
         op_gelu(ops, stream, d_exp_h, N_tok * ffn);
-        op_gemm(ops, stream, d_exp_o, blk->moe_expert_fc2_w[e], d_exp_h,
-                blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
+        op_gemm_qw(ops, stream, d_exp_o,
+                   blk->moe_expert_fc2_w[e],
+                   blk->moe_expert_fc2_w_fp8[e], blk->moe_expert_fc2_w_scale[e],
+                   d_exp_h, blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
 
-        /* Scale-add: d_output[t,:] += scale[t] * d_exp_o[t,:]  (on CPU) */
-        cuStreamSynchronize(stream);
-        size_t bytes = (size_t)N_tok * H_dim * sizeof(float);
-        float *exp_out_cpu = (float *)malloc(bytes);
-        float *accum_cpu = (float *)malloc(bytes);
-        cuMemcpyDtoH(exp_out_cpu, d_exp_o, bytes);
-        cuMemcpyDtoH(accum_cpu, d_output, bytes);
-
-        for (int t = 0; t < N_tok; t++) {
-            float w = expert_scale_cpu[t];
-            if (w == 0.0f) continue;
-            for (int j = 0; j < H_dim; j++)
-                accum_cpu[t * H_dim + j] += w * exp_out_cpu[t * H_dim + j];
+        if (ops->moe_scaled_accumulate) {
+            int target = e;
+            void *args[] = {&d_output, &d_exp_o, &d_moe_idx, &d_moe_w,
+                            &target, &N_tok, &H_dim_arg, &top_k};
+            cuLaunchKernel(ops->moe_scaled_accumulate, acc_grid, 1, 1,
+                           256, 1, 1, 0, stream, args, NULL);
+        } else {
+            /* CPU fallback */
+            cuStreamSynchronize(stream);
+            size_t bytes = (size_t)N_tok * H_dim * sizeof(float);
+            float *out = (float *)malloc(bytes);
+            float *acc = (float *)malloc(bytes);
+            int *idx = (int *)malloc((size_t)N_tok * top_k * sizeof(int));
+            float *w  = (float *)malloc((size_t)N_tok * top_k * sizeof(float));
+            cuMemcpyDtoH(out, d_exp_o, bytes);
+            cuMemcpyDtoH(acc, d_output, bytes);
+            cuMemcpyDtoH(idx, d_moe_idx, (size_t)N_tok*top_k*sizeof(int));
+            cuMemcpyDtoH(w,   d_moe_w,   (size_t)N_tok*top_k*sizeof(float));
+            for (int t = 0; t < N_tok; t++) {
+                float ww = 0.0f;
+                for (int k = 0; k < top_k; k++)
+                    if (idx[t*top_k+k] == e) { ww = w[t*top_k+k]; break; }
+                if (ww == 0.0f) continue;
+                for (int j = 0; j < H_dim; j++)
+                    acc[t*H_dim+j] += ww * out[t*H_dim+j];
+            }
+            cuMemcpyHtoDAsync(d_output, acc, bytes, stream);
+            cuStreamSynchronize(stream);
+            free(out); free(acc); free(idx); free(w);
         }
-
-        cuMemcpyHtoDAsync(d_output, accum_cpu,
-                          (size_t)N_tok * H_dim * sizeof(float), stream);
-        /* Must sync before freeing accum_cpu — HtoDAsync reads from host
-         * memory, and freeing before the copy drains causes UAF/heap
-         * corruption over the 360+ MoE calls in a 30-step predict loop. */
-        cuStreamSynchronize(stream);
-        free(exp_out_cpu);
-        free(accum_cpu);
     }
-    free(expert_scale_cpu);
-    free(gate_weights);
 
     /* Step 5: Add shared expert output (reuse d_exp_h/d_exp_o buffers) */
     op_gemm(ops, stream, d_exp_h, blk->moe_shared_fc1_w, d_input,
@@ -1197,7 +1394,8 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
      * MoE needs: gate[N1*8] + expert_h[N1*ffn] + accum[N1*H_dim]  (168MB)
      *   (process one expert at a time, reuse expert_h for shared expert) */
     size_t mlp_sz = (size_t)N1 * ffn * sizeof(float);
-    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim) * sizeof(float);
+    /* +(top_k * 2) for moe_idx[N1, top_k] (int) + moe_w[N1, top_k] (float) */
+    size_t moe_scratch_sz = (size_t)N1 * (DIT_N_EXPERTS + ffn + H_dim + DIT_MOE_TOP_K * 2) * sizeof(float);
     size_t mlp_moe_sz = mlp_sz > moe_scratch_sz ? mlp_sz : moe_scratch_sz;
     /* For concat: [N1 * 2*H_dim] */
     size_t cat_buf_sz = (size_t)N1 * 2 * H_dim * sizeof(float);
@@ -1357,7 +1555,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         }
 
         /* Fused QKV GEMM: [N1, dim] @ [3*dim, dim]^T → [N1, 3*dim] */
-        op_gemm(ops, stream, d_qkv, blk->sa_qkv_w, d_normed, 0, 3 * H_dim, H_dim, N1);
+        op_gemm_qw_dit(ops, stream, d_qkv, blk->sa_qkv_w,
+                   blk->sa_qkv_w_fp8, blk->sa_qkv_w_scale,
+                   d_normed, 0, 3 * H_dim, H_dim, N1);
 
         /* Split interleaved QKV → per-head Q, K, V each [N1, dim]
          * IMPORTANT: d_qkv and d_mlp alias scratch[1], so split output must NOT
@@ -1422,7 +1622,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
 
         op_self_attn(ops, stream, d_attn, d_Q, d_K, d_V, N1, H_dim, heads, hd);
 
-        op_gemm(ops, stream, d_normed, blk->sa_out_w, d_attn, blk->sa_out_b, H_dim, H_dim, N1);
+        op_gemm_qw_dit(ops, stream, d_normed, blk->sa_out_w,
+                   blk->sa_out_w_fp8, blk->sa_out_w_scale,
+                   d_attn, blk->sa_out_b, H_dim, H_dim, N1);
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_attn1_out", pass_tag);
         }
@@ -1465,7 +1667,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         }
 
         /* Q from hidden */
-        op_gemm(ops, stream, d_cross_Q, blk->ca_q_w, d_normed, 0, H_dim, H_dim, N1);
+        op_gemm_qw_dit(ops, stream, d_cross_Q, blk->ca_q_w,
+                   blk->ca_q_w_fp8, blk->ca_q_w_scale,
+                   d_normed, 0, H_dim, H_dim, N1);
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_cross_Q, N1, H_dim,
                                      "cuda_b0_attn2_to_q_raw", pass_tag);
@@ -1524,8 +1728,12 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             free(h_v);
             free(h_ctx);
         } else {
-            op_gemm(ops, stream, d_ca_K, blk->ca_k_w, d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
-            op_gemm(ops, stream, d_ca_V, blk->ca_v_w, d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
+            op_gemm_qw_dit(ops, stream, d_ca_K, blk->ca_k_w,
+                       blk->ca_k_w_fp8, blk->ca_k_w_scale,
+                       d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
+            op_gemm_qw_dit(ops, stream, d_ca_V, blk->ca_v_w,
+                       blk->ca_v_w_fp8, blk->ca_v_w_scale,
+                       d_context, 0, H_dim, DIT_CONTEXT_DIM, ctx_len);
         }
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_ca_K, ctx_len, H_dim,
@@ -1560,7 +1768,9 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
         op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K, d_ca_V,
                       N1, ctx_len, H_dim, heads, hd);
 
-        op_gemm(ops, stream, d_normed, blk->ca_out_w, d_attn, blk->ca_out_b, H_dim, H_dim, N1);
+        op_gemm_qw_dit(ops, stream, d_normed, blk->ca_out_w,
+                   blk->ca_out_w_fp8, blk->ca_out_w_scale,
+                   d_attn, blk->ca_out_b, H_dim, H_dim, N1);
         if (r->verbose > 1 && bi == 0) {
             hy3d_dbg_dump_tagged_npy(stream, d_attn, N1, H_dim,
                                      "cuda_b0_attn2_out", pass_tag);
@@ -1604,9 +1814,13 @@ static void run_dit_forward(cuda_hy3d_runner *r, CUdeviceptr d_latents,
             op_add(ops, stream, d_hidden, d_moe_out, N1 * H_dim);
         } else {
             /* Regular MLP: fc1 -> GELU -> fc2 */
-            op_gemm(ops, stream, d_mlp, blk->mlp_fc1_w, d_normed, blk->mlp_fc1_b, ffn, H_dim, N1);
+            op_gemm_qw_dit(ops, stream, d_mlp, blk->mlp_fc1_w,
+                       blk->mlp_fc1_w_fp8, blk->mlp_fc1_w_scale,
+                       d_normed, blk->mlp_fc1_b, ffn, H_dim, N1);
             op_gelu(ops, stream, d_mlp, N1 * ffn);
-            op_gemm(ops, stream, d_normed, blk->mlp_fc2_w, d_mlp, blk->mlp_fc2_b, H_dim, ffn, N1);
+            op_gemm_qw_dit(ops, stream, d_normed, blk->mlp_fc2_w,
+                       blk->mlp_fc2_w_fp8, blk->mlp_fc2_w_scale,
+                       d_mlp, blk->mlp_fc2_b, H_dim, ffn, N1);
             if (r->verbose > 1 && bi == 0) {
                 hy3d_dbg_dump_tagged_npy(stream, d_normed, N1, H_dim, "cuda_b0_mlp_out", pass_tag);
             }
@@ -1921,6 +2135,60 @@ cuda_hy3d_runner *cuda_hy3d_init(int device_id, int verbose) {
         return NULL;
     }
 
+    /* Tensor-core dispatch policy (mirrors qimg's QIMG_* env vars).
+     * Defaults are chosen to match qimg's recommended high-performance path:
+     *   HY3D_BF16_ATTN=1 (sm>=80, head_dim=128 only — DiT)
+     *   HY3D_FP8_GEMM=1  (sm>=89, GEMMs aligned to 16/32/64)
+     * Verification escape hatches stay opt-in. */
+    {
+        int sm = r->sm_version;
+        const char *env;
+
+        env = getenv("HY3D_BF16_ATTN");
+        r->ops.use_bf16_attn = (sm >= 80 && r->ops.flash_attn_bf16 && r->ops.cast_f32_to_bf16)
+                               ? ((env && env[0] == '0') ? 0 : 1) : 0;
+
+        env = getenv("HY3D_FP8_ATTN");
+        r->ops.use_fp8_attn = (env && env[0] != '0' && sm >= 89 &&
+                               r->ops.flash_attn_fp8 && r->ops.quantize_fp8 &&
+                               r->ops.reduce_max_abs) ? 1 : 0;
+
+        env = getenv("HY3D_FP8_GEMM");
+        r->ops.use_fp8_gemm = (sm >= 89 && r->ops.gemm_fp8_perrow &&
+                               r->ops.reduce_max_abs_per_row && r->ops.quantize_fp8)
+                              ? ((env && env[0] == '0') ? 0 : 1) : 0;
+
+        /* Default OFF: extending FP8 to DiT attention QKV/out + MLP fc1/fc2
+         * causes per-tensor weight scale drift to accumulate across blocks
+         * to the point of producing an all-negative SDF (verified at 5 and
+         * 30 steps). MoE FP8 stays on the use_fp8_gemm flag and is safe. */
+        env = getenv("HY3D_FP8_GEMM_ATTN_MLP");
+        r->ops.use_fp8_gemm_attn_mlp = (env && env[0] != '0' &&
+                                        r->ops.use_fp8_gemm) ? 1 : 0;
+
+        /* BF16-pipe-scaled is the safe-and-fast path for DiT attn/MLP:
+         * BF16 acts × FP8 weights with inline LUT dequant + per-tensor scale
+         * applied at writeback. Avoids the per-tensor scale drift that breaks
+         * the pure FP8 path on attn/MLP, while still cutting wall-clock vs
+         * the F16-tiled fallback. Default ON for sm>=80 when prequant is
+         * available. */
+        env = getenv("HY3D_BF16_GEMM");
+        r->ops.use_bf16_gemm = (sm >= 80 && r->ops.gemm_bf16_pipe_scaled &&
+                                r->ops.use_fp8_gemm)
+                               ? ((env && env[0] == '0') ? 0 : 1) : 0;
+
+        env = getenv("HY3D_DISABLE_MT4");
+        r->ops.disable_mt4 = (env && env[0] != '0') ? 1 : 0;
+
+        if (verbose) {
+            fprintf(stderr,
+                "HY3D: tc dispatch — bf16_attn=%d fp8_attn=%d fp8_gemm=%d fp8_gemm_attn_mlp=%d bf16_gemm=%d mt4=%s (sm_%d)\n",
+                r->ops.use_bf16_attn, r->ops.use_fp8_attn, r->ops.use_fp8_gemm,
+                r->ops.use_fp8_gemm_attn_mlp,
+                r->ops.use_bf16_gemm, r->ops.disable_mt4 ? "off" : "on", sm);
+        }
+    }
+
     return r;
 }
 
@@ -2057,6 +2325,58 @@ void cuda_hy3d_set_f32_gemm(cuda_hy3d_runner *r, int enable) {
                 enable ? "F32 (PyTorch-compatible)" : "F16 (default)");
 }
 
+void cuda_hy3d_set_bf16_attn(cuda_hy3d_runner *r, int enable) {
+    if (!r) return;
+    /* Only honour ON when the kernels were actually loaded. */
+    if (enable) {
+        r->ops.use_bf16_attn = (r->ops.flash_attn_bf16 && r->ops.cast_f32_to_bf16) ? 1 : 0;
+    } else {
+        r->ops.use_bf16_attn = 0;
+    }
+    if (r->verbose)
+        fprintf(stderr, "HY3D: bf16_attn = %d\n", r->ops.use_bf16_attn);
+}
+
+void cuda_hy3d_set_fp8_attn(cuda_hy3d_runner *r, int enable) {
+    if (!r) return;
+    if (enable) {
+        r->ops.use_fp8_attn = (r->ops.flash_attn_fp8 && r->ops.quantize_fp8 && r->ops.reduce_max_abs) ? 1 : 0;
+    } else {
+        r->ops.use_fp8_attn = 0;
+    }
+    if (r->verbose)
+        fprintf(stderr, "HY3D: fp8_attn = %d\n", r->ops.use_fp8_attn);
+}
+
+void cuda_hy3d_set_fp8_gemm(cuda_hy3d_runner *r, int enable) {
+    if (!r) return;
+    if (enable) {
+        r->ops.use_fp8_gemm = (r->ops.gemm_fp8_perrow && r->ops.reduce_max_abs_per_row) ? 1 : 0;
+    } else {
+        r->ops.use_fp8_gemm = 0;
+    }
+    if (r->verbose)
+        fprintf(stderr, "HY3D: fp8_gemm = %d\n", r->ops.use_fp8_gemm);
+}
+
+void cuda_hy3d_set_fp8_gemm_attn_mlp(cuda_hy3d_runner *r, int enable) {
+    if (!r) return;
+    r->ops.use_fp8_gemm_attn_mlp = (enable && r->ops.use_fp8_gemm) ? 1 : 0;
+    if (r->verbose)
+        fprintf(stderr, "HY3D: fp8_gemm_attn_mlp = %d\n", r->ops.use_fp8_gemm_attn_mlp);
+}
+
+void cuda_hy3d_set_bf16_gemm(cuda_hy3d_runner *r, int enable) {
+    if (!r) return;
+    if (enable) {
+        r->ops.use_bf16_gemm = (r->ops.gemm_bf16_pipe_scaled && r->ops.use_fp8_gemm) ? 1 : 0;
+    } else {
+        r->ops.use_bf16_gemm = 0;
+    }
+    if (r->verbose)
+        fprintf(stderr, "HY3D: bf16_gemm = %d\n", r->ops.use_bf16_gemm);
+}
+
 int cuda_hy3d_load_weights(cuda_hy3d_runner *r,
                            const char *conditioner_path,
                            const char *model_path,
@@ -2089,7 +2409,7 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     if (guidance_scale <= 0.0f) guidance_scale = 7.5f;
     if (grid_res <= 0) grid_res = 256;
 
-    struct timespec t0, t1;
+    struct timespec t0, t1, ts1, ts2, ts3, ts4;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     /* ---- Stage 1: DINOv2 image encoding ---- */
@@ -2124,6 +2444,8 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     }
     cuMemFree(d_rgb);
     cuMemFree(d_image);
+    cuStreamSynchronize(stream);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
 
     /* ---- Stage 2: DiT diffusion with flow matching ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 2 - DiT diffusion (%d steps)...\n", n_steps);
@@ -2267,6 +2589,8 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     cuMemFree(d_pred_combined);
     cuMemFree(d_uncond_ctx);
     cuMemFree(d_dino_out);
+    cuStreamSynchronize(stream);
+    clock_gettime(CLOCK_MONOTONIC, &ts2);
 
     /* ---- Stage 3: ShapeVAE decode + SDF query ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 3 - ShapeVAE decode (grid %d^3)...\n", grid_res);
@@ -2287,6 +2611,9 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
                 mn, mx, sm / total_pts, pos, neg);
     }
 
+    cuStreamSynchronize(stream);
+    clock_gettime(CLOCK_MONOTONIC, &ts3);
+
     /* ---- Stage 4: Marching cubes ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 4 - Marching cubes...\n");
 
@@ -2299,10 +2626,18 @@ hy3d_mesh cuda_hy3d_predict(cuda_hy3d_runner *r,
     result.n_tris = mc.n_tris;
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
+    clock_gettime(CLOCK_MONOTONIC, &ts4);
     double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
-    if (r->verbose)
+    if (r->verbose) {
+        double e1 = (ts1.tv_sec - t0.tv_sec)  + (ts1.tv_nsec - t0.tv_nsec) * 1e-9;
+        double e2 = (ts2.tv_sec - ts1.tv_sec) + (ts2.tv_nsec - ts1.tv_nsec) * 1e-9;
+        double e3 = (ts3.tv_sec - ts2.tv_sec) + (ts3.tv_nsec - ts2.tv_nsec) * 1e-9;
+        double e4 = (ts4.tv_sec - ts3.tv_sec) + (ts4.tv_nsec - ts3.tv_nsec) * 1e-9;
+        fprintf(stderr, "HY3D: stage timings — DINOv2=%.2fs DiT=%.2fs VAE=%.2fs MC=%.2fs\n",
+                e1, e2, e3, e4);
         fprintf(stderr, "HY3D: done in %.2fs (%d verts, %d tris)\n",
                 elapsed, result.n_verts, result.n_tris);
+    }
 
     return result;
 }
@@ -2395,6 +2730,9 @@ void cuda_hy3d_free(cuda_hy3d_runner *r) {
     for (int i = 0; i < 8; i++) {
         if (r->scratch[i]) cuMemFree(r->scratch[i]);
     }
+
+    /* Free tensor-core dispatch scratch (BF16/FP8 attn buffers) */
+    hy3d_ops_destroy(&r->ops);
 
     /* Free pre-computed K,V */
     for (int i = 0; i < DIT_DEPTH; i++) {
