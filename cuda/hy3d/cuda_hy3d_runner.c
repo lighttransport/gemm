@@ -1406,14 +1406,37 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
     int H_dim_arg = H_dim;  /* drop const for kernel arg pointer */
     int total_acc = N_tok * H_dim;
     unsigned acc_grid = (unsigned)((total_acc + 255) / 256);
+
+    /* Pre-reduce d_input row_max once for all 9 fc1 calls (8 experts + 1 shared).
+     * Saves 8 reductions per MoE block × 6 blocks × 60 fwds = 2880 redundant
+     * 33MB reductions per mesh (~0.2s). The internal ops->d_row_max gets
+     * clobbered by fc2's op_gemm_qw on each expert iteration, so we keep a
+     * separate buffer. */
+    CUdeviceptr d_input_row_max = 0;
+    int use_premax = 0;
+    if (ops->use_fp8_gemm && ops->reduce_max_abs_per_row && ops->gemm_fp8_perrow) {
+        if (cuMemAlloc(&d_input_row_max, (size_t)N_tok * sizeof(float)) == CUDA_SUCCESS) {
+            int n_in = H_dim;
+            void *rargs[] = {&d_input_row_max, &d_input, &N_tok, &n_in};
+            cuLaunchKernel(ops->reduce_max_abs_per_row, (unsigned)N_tok, 1, 1,
+                           256, 1, 1, 0, stream, rargs, NULL);
+            use_premax = 1;
+        }
+    }
+
     for (int e = 0; e < DIT_N_EXPERTS; e++) {
         /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e
          * FP8 path used when w_fp8/scale were prequantized in load_dit_weights;
          * otherwise falls through to the F16 tiled path inside op_gemm_qw. */
-        op_gemm_qw(ops, stream, d_exp_h,
-                   blk->moe_expert_fc1_w[e],
-                   blk->moe_expert_fc1_w_fp8[e], blk->moe_expert_fc1_w_scale[e],
-                   d_input, blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
+        if (!use_premax || op_gemm_qw_premax(ops, stream, d_exp_h,
+                blk->moe_expert_fc1_w_fp8[e], blk->moe_expert_fc1_w_scale[e],
+                d_input, blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok,
+                d_input_row_max) != 0) {
+            op_gemm_qw(ops, stream, d_exp_h,
+                       blk->moe_expert_fc1_w[e],
+                       blk->moe_expert_fc1_w_fp8[e], blk->moe_expert_fc1_w_scale[e],
+                       d_input, blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
+        }
         op_gelu(ops, stream, d_exp_h, N_tok * ffn);
         op_gemm_qw(ops, stream, d_exp_o,
                    blk->moe_expert_fc2_w[e],
@@ -1455,14 +1478,21 @@ static void run_dit_moe(cuda_hy3d_runner *r, dit_block_gpu *blk,
     /* Step 5: Add shared expert output (reuse d_exp_h/d_exp_o buffers).
      * Same shape as a single MoE expert; per-row FP8 wins on N_tok=4097
      * (BF16-pipe MT4 needs %256 alignment). */
-    op_gemm_qw(ops, stream, d_exp_h, blk->moe_shared_fc1_w,
-               blk->moe_shared_fc1_w_fp8, blk->moe_shared_fc1_w_scale,
-               d_input, blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    if (!use_premax || op_gemm_qw_premax(ops, stream, d_exp_h,
+            blk->moe_shared_fc1_w_fp8, blk->moe_shared_fc1_w_scale,
+            d_input, blk->moe_shared_fc1_b, ffn, H_dim, N_tok,
+            d_input_row_max) != 0) {
+        op_gemm_qw(ops, stream, d_exp_h, blk->moe_shared_fc1_w,
+                   blk->moe_shared_fc1_w_fp8, blk->moe_shared_fc1_w_scale,
+                   d_input, blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    }
     op_gelu(ops, stream, d_exp_h, N_tok * ffn);
     op_gemm_qw(ops, stream, d_exp_o, blk->moe_shared_fc2_w,
                blk->moe_shared_fc2_w_fp8, blk->moe_shared_fc2_w_scale,
                d_exp_h, blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
     op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
+
+    if (d_input_row_max) cuMemFree(d_input_row_max);
 }
 
 /* Stage 2: Single DiT forward pass
