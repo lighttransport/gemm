@@ -151,6 +151,7 @@ struct hip_trellis2_runner {
     hipFunction_t fn_cross_attn;     /* cross_attn_tiled_f32 (scalar fallback) */
     hipFunction_t fn_cross_attn_wmma;/* cross_attn_wmma_f32 (gfx12) */
     hipFunction_t fn_cross_attn_wmma_bc32; /* cross_attn_wmma_bc32_f32 (gfx12) */
+    hipFunction_t fn_cross_attn_wmma_bc32_v2; /* deferred-sum softmax (gfx12) */
     hipFunction_t fn_broadcast_bias;
 
     /* Decoder ops */
@@ -759,6 +760,7 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
         }
     }
     r->fn_cross_attn_wmma_bc32 = NULL;
+    r->fn_cross_attn_wmma_bc32_v2 = NULL;
     if (r->use_wmma && r->fn_cross_attn_wmma) {
         const char *cabc32 = getenv("T2_CA_BC32");
         int want_cabc32 = (cabc32 == NULL) ? 1 : atoi(cabc32);
@@ -767,6 +769,15 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
                                      "cross_attn_wmma_bc32_f32") == hipSuccess) {
                 fprintf(stderr, "T2-HIP: BF16 WMMA cross-attn Bc=32 enabled%s\n",
                         cabc32 ? " (T2_CA_BC32=1)" : " (default)");
+            }
+        }
+        const char *cav2 = getenv("T2_CA_V2");
+        int want_cav2 = (cav2 == NULL) ? 1 : atoi(cav2);
+        if (want_cav2) {
+            if (hipModuleGetFunction(&r->fn_cross_attn_wmma_bc32_v2, r->mod,
+                                     "cross_attn_wmma_bc32_v2_f32") == hipSuccess) {
+                fprintf(stderr, "T2-HIP: BF16 WMMA cross-attn Bc=32 deferred-sum v2 enabled%s\n",
+                        cav2 ? " (T2_CA_V2=1)" : " (default)");
             }
         }
     }
@@ -1319,6 +1330,11 @@ static void run_cross_attn(hip_trellis2_runner *r, void *out, void *out_bf16,
     int head_dim = DIT_HEAD_DIM;
     void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale};
     void *args_bc32[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale, &out_bf16};
+    if (r->use_wmma && r->fn_cross_attn_wmma_bc32_v2 && head_dim == 128 && (q_len % 64) == 0) {
+        hipModuleLaunchKernel(r->fn_cross_attn_wmma_bc32_v2, n_heads, q_len / 64, 1, 128, 1, 1,
+                              0, 0, args_bc32, NULL);
+        return;
+    }
     if (r->use_wmma && r->fn_cross_attn_wmma_bc32 && head_dim == 128 && (q_len % 64) == 0) {
         hipModuleLaunchKernel(r->fn_cross_attn_wmma_bc32, n_heads, q_len / 64, 1, 128, 1, 1,
                               0, 0, args_bc32, NULL);
