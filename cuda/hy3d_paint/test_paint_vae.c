@@ -611,26 +611,33 @@ int main(int argc, char **argv) {
     float *in_buf = read_npy_f32(in_path, &nd, shape, &total);
     if (!in_buf) return 1;
 
-    int IC, IH, IW;     /* input shape */
-    int OC, OH, OW;     /* output shape */
+    int IC, IH, IW;     /* input shape (single sample) */
+    int OC, OH, OW;     /* output shape (single sample) */
+    int B = 1;
     if (do_encode) {
-        if (nd != 3 || shape[0] != 3) {
-            fprintf(stderr, "ERROR: expected input shape [3,H,W], got nd=%d\n", nd);
+        if (nd == 3 && shape[0] == 3) {
+            IC = 3; IH = (int)shape[1]; IW = (int)shape[2];
+        } else if (nd == 4 && shape[1] == 3) {
+            B = (int)shape[0]; IC = 3; IH = (int)shape[2]; IW = (int)shape[3];
+        } else {
+            fprintf(stderr, "ERROR: expected input shape [3,H,W] or [B,3,H,W], got nd=%d\n", nd);
             return 1;
         }
-        IC = (int)shape[0]; IH = (int)shape[1]; IW = (int)shape[2];
         OC = 4; OH = IH / 8; OW = IW / 8;
-        fprintf(stderr, "input   [%d, %d, %d]   latent [%d, %d, %d]\n",
-                IC, IH, IW, OC, OH, OW);
+        fprintf(stderr, "input   [%d, %d, %d, %d]   latent [%d, %d, %d, %d]\n",
+                B, IC, IH, IW, B, OC, OH, OW);
     } else {
-        if (nd != 3 || shape[0] != 4) {
-            fprintf(stderr, "ERROR: expected latent shape [4,H,W], got nd=%d\n", nd);
+        if (nd == 3 && shape[0] == 4) {
+            IC = 4; IH = (int)shape[1]; IW = (int)shape[2];
+        } else if (nd == 4 && shape[1] == 4) {
+            B = (int)shape[0]; IC = 4; IH = (int)shape[2]; IW = (int)shape[3];
+        } else {
+            fprintf(stderr, "ERROR: expected latent shape [4,H,W] or [B,4,H,W], got nd=%d\n", nd);
             return 1;
         }
-        IC = (int)shape[0]; IH = (int)shape[1]; IW = (int)shape[2];
         OC = 3; OH = IH * 8; OW = IW * 8;
-        fprintf(stderr, "latent  [%d, %d, %d]   recon  [%d, %d, %d]\n",
-                IC, IH, IW, OC, OH, OW);
+        fprintf(stderr, "latent  [%d, %d, %d, %d]   recon  [%d, %d, %d, %d]\n",
+                B, IC, IH, IW, B, OC, OH, OW);
     }
 
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) {
@@ -708,23 +715,30 @@ int main(int argc, char **argv) {
     cuMemAlloc(&d_knc, attn_n * sizeof(float));
     cuMemAlloc(&d_vnc, attn_n * sizeof(float));
     cuMemAlloc(&d_ync, attn_n * sizeof(float));
-    cuMemcpyHtoD(d_in_dev, in_buf, IC * (size_t)IH * IW * sizeof(float));
-
-    if (do_encode) {
-        encode(&kk, &E, d_in_dev, IH, IW, d_out_dev,
-                d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
-    } else {
-        decode(&kk, &D, d_in_dev, IH, IW, d_out_dev,
-                d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+    size_t in_per  = (size_t)IC * IH * IW;
+    size_t out_per = (size_t)OC * OH * OW;
+    float *out_buf = (float *)malloc((size_t)B * out_per * sizeof(float));
+    for (int bi = 0; bi < B; bi++) {
+        cuMemcpyHtoD(d_in_dev, in_buf + (size_t)bi * in_per, in_per * sizeof(float));
+        if (do_encode) {
+            encode(&kk, &E, d_in_dev, IH, IW, d_out_dev,
+                    d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+        } else {
+            decode(&kk, &D, d_in_dev, IH, IW, d_out_dev,
+                    d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+        }
+        cuCtxSynchronize();
+        cuMemcpyDtoH(out_buf + (size_t)bi * out_per, d_out_dev, out_per * sizeof(float));
     }
-    cuCtxSynchronize();
 
-    size_t out_n = (size_t)OC * OH * OW;
-    float *out_buf = (float *)malloc(out_n * sizeof(float));
-    cuMemcpyDtoH(out_buf, d_out_dev, out_n * sizeof(float));
-
-    int sh3[3] = { OC, OH, OW };
-    write_npy_f32(out_path, out_buf, sh3, 3);
+    size_t out_n = (size_t)B * out_per;
+    if (B == 1) {
+        int sh3[3] = { OC, OH, OW };
+        write_npy_f32(out_path, out_buf, sh3, 3);
+    } else {
+        int sh4[4] = { B, OC, OH, OW };
+        write_npy_f32(out_path, out_buf, sh4, 4);
+    }
     float mn = out_buf[0], mx = out_buf[0];
     for (size_t i = 1; i < out_n; i++) {
         if (out_buf[i] < mn) mn = out_buf[i];
