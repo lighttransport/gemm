@@ -206,11 +206,14 @@ static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap
     void *d_w_bf16 = get_bf16_weight(host_w, (size_t)outC * 27 * inC);
     if (!d_w_bf16) return;
     int K_total = 27 * inC;
-    /* Chunk M to fit BF16 act scratch (g_act_bf16_floats elems * 2 B).
-     * Also cap at 16384 to stay under gfx1201 hipBLASLt's tested range. */
+    /* Equal-sized chunks so every call hits the same hipBLASLt plan.
+     * Cap by the BF16 act scratch (g_act_bf16_floats elems * 2 B) and 16384
+     * (gfx1201 Tensile range). nchunks = ceil(N/cap); M_chunk = ceil(N/nchunks). */
     long long max_chunk = (long long)g_act_bf16_floats / K_total;
-    int M_CHUNK = (max_chunk > 16384) ? 16384 : (int)max_chunk;
-    if (M_CHUNK < 1) M_CHUNK = 1;
+    int CAP = (max_chunk > 16384) ? 16384 : (int)max_chunk;
+    if (CAP < 1) CAP = 1;
+    int nchunks = (N + CAP - 1) / CAP;
+    int M_CHUNK = (N + nchunks - 1) / nchunks;
     for (int m0 = 0; m0 < N; m0 += M_CHUNK) {
         int M = (N - m0 < M_CHUNK) ? (N - m0) : M_CHUNK;
         void *act = g_d_act_bf16;
@@ -291,10 +294,11 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
         klin(k, o_f32, x_f32, dev_w_f32_fallback, bias_f32, N, inC, outC);
         return;
     }
-    /* Chunk M to stay within hipBLASLt's well-supported range on gfx1201.
-     * Tensile lookups throw std::out_of_range on huge M; 4096 is safe.
-     * No per-chunk SYNC: pack and matmul are stream-ordered on the default stream. */
-    const int M_CHUNK = 16384;
+    /* Equal-sized chunks so every call hits the same hipBLASLt plan.
+     * Cap at 16384 (gfx1201 Tensile range). */
+    const int CAP_KL = 16384;
+    int nchunks_kl = (N + CAP_KL - 1) / CAP_KL;
+    int M_CHUNK = (N + nchunks_kl - 1) / nchunks_kl;
     for (int m0 = 0; m0 < N; m0 += M_CHUNK) {
         int M = (N - m0 < M_CHUNK) ? (N - m0) : M_CHUNK;
         int n_act = M * inC;
@@ -536,9 +540,11 @@ int main(int argc, char **argv) {
         int want = (!env || strcmp(env, "0") != 0);
         if (want) {
             if (mm_blaslt_init() == 0) {
-                /* Activation BF16 scratch: max N*4C across stages.
-                 * Stage3 N=178651, 4C=512 -> 91.5M floats; output_layer N=822874*64 (no blaslt).
-                 * Use 128 MB to be safe (64M floats). */
+                /* Activation BF16 scratch (128 MB).
+                 * Bigger scratch lets gather-then-GEMM use larger M chunks
+                 * but on gfx1201 hipBLASLt the algo for M=8452 is slightly
+                 * less F32-faithful than the M=4226 algo, so 128 MB is the
+                 * sweet spot for both perf and correctness. */
                 size_t scratch_floats = 64ULL * 1024 * 1024;
                 if (hipMalloc(&g_d_act_bf16, scratch_floats * 2) == hipSuccess) {
                     g_use_blaslt = 1;
