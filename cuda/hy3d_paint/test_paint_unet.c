@@ -1336,7 +1336,8 @@ int main(int argc, char **argv) {
                           || !strcmp(stage, "out_ma_rope")
                           || !strcmp(stage, "out_mda")
                           || !strcmp(stage, "out_ra")
-                          || !strcmp(stage, "out_all"));
+                          || !strcmp(stage, "out_all")
+                          || !strcmp(stage, "out_all_rope"));
     if (!wrapper_stage) {
         snprintf(path, sizeof(path), "%s/ref_timestep.npy", ref_dir);
         ts = (int64_t *)read_npy(path, &nd, shape, &n, dt);
@@ -2368,9 +2369,12 @@ int main(int argc, char **argv) {
         free(cu); free(packed_main); free(packed_dual); free(text_tiled_main);
         free(sample); free(en); free(ep); free(text_in); free(ref_latents); free(ts_in);
         g_ra_mode = 0;
-    } else if (!strcmp(stage, "out_all")) {
-        /* Phase 4.6: all 4 attention paths on (DINO + MA + MDA + RA) +
-         * dual-stream. PoseRoPE OFF (matches dump_paint_unet_wrapper.py). */
+    } else if (!strcmp(stage, "out_all") || !strcmp(stage, "out_all_rope")) {
+        /* Phase 4.6/4.7: all 4 attention paths on (DINO + MA + MDA + RA) +
+         * dual-stream. PoseRoPE on for out_all_rope. */
+        const int with_rope = !strcmp(stage, "out_all_rope");
+        const char *out_npy = with_rope ? "out_all_rope.npy" : "out_all.npy";
+        const int HEAD_DIM = 64;
         const int N_PBR = 2, N_GEN = 2, N_REF = 1;
         const int B_outer = 1;
         const int Beff_main = B_outer * N_PBR * N_GEN;       /* 4 */
@@ -2384,6 +2388,25 @@ int main(int argc, char **argv) {
         g_ra_cache.n_slots = N_BLOCKS;
         g_ra_cache.idx = 0;
         g_ra_n_ref = N_REF;
+
+        if (with_rope) {
+            /* Per-level voxel res from the dump: [512,256,128,64] for
+             * grid [H,H/2,H/4,H/8] with H=64. voxel_indices_<key>.npy
+             * key = n_gen * (H*W). */
+            int Nps[4]   = { N_GEN * 64*64, N_GEN * 32*32, N_GEN * 16*16, N_GEN * 8*8 };
+            int vres[4]  = { 512, 256, 128, 64 };
+            for (int i = 0; i < 4; i++) {
+                char vp[512]; snprintf(vp, sizeof(vp), "%s/voxel_indices_%d.npy", ref_dir, Nps[i]);
+                int nd2; uint64_t sh2[8]; size_t n2; char dt2[8];
+                int64_t *vox = (int64_t *)read_npy(vp, &nd2, sh2, &n2, dt2);
+                if (!vox) { fprintf(stderr, "ERROR: missing %s\n", vp); return 1; }
+                if (build_rope_level_from_voxels(vox, Nps[i], N_PBR, N_GEN,
+                                                  HEAD_DIM, vres[i]) < 0) return 1;
+                fprintf(stderr, "  rope L Np=%d res=%d N=%d\n",
+                         Nps[i], vres[i], Nps[i] / N_GEN);
+                free(vox);
+            }
+        }
 
         /* --- shared inputs --- */
         snprintf(path, sizeof(path), "%s/in_sample.npy", ref_dir);
@@ -2403,8 +2426,8 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof(path), "%s/in_timestep.npy", ref_dir);
         int64_t *ts_in = (int64_t *)read_npy(path, &nd, shape, &n, dt);  if (!ts_in) return 1;
         long long ts_val = ts_in[0];
-        fprintf(stderr, "out_all: Beff_main=%d Beff_dual=%d ts=%lld M_text=%d cross=%d T_dino=%d\n",
-                Beff_main, Beff_dual, ts_val, M_text, cross_dim, T_dino);
+        fprintf(stderr, "%s: Beff_main=%d Beff_dual=%d ts=%lld M_text=%d cross=%d T_dino=%d rope=%d\n",
+                stage, Beff_main, Beff_dual, ts_val, M_text, cross_dim, T_dino, with_rope);
 
         size_t per_view = (size_t)4 * H0 * W0;
         size_t per_in_main = (size_t)IC_main * H0 * W0;
@@ -2618,12 +2641,13 @@ int main(int argc, char **argv) {
         size_t out_n = (size_t)Beff_main * 4 * H * W;
         float *cu = (float *)malloc(out_n * sizeof(float));
         cuMemcpyDtoH(cu, ws.d_a, out_n * sizeof(float));
-        snprintf(path, sizeof(path), "%s/out_all.npy", ref_dir);
+        snprintf(path, sizeof(path), "%s/%s", ref_dir, out_npy);
         diff_against(cu, path, out_n, 5e-3f);
         free(cu); free(packed_main); free(packed_dual); free(text_tiled_main);
         free(sample); free(en); free(ep); free(text_in); free(ref_latents);
         free(dino_in); free(ts_in);
         g_ra_mode = 0;
+        g_rope_n_levels = 0;
     } else if (!strcmp(stage, "dino_proj")) {
         /* image_proj_model_dino: Linear(1536 -> 4*1024) + LayerNorm(1024)
          * applied per (token, slot). Input [1, 257, 1536] -> [1, 1028, 1024]
