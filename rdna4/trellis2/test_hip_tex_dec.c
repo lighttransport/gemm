@@ -107,7 +107,7 @@ static int64_t *read_npy_i64(const char *p, int *nd, int *dd) {
     fclose(f); free(h); return d;
 }
 
-typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, gather27, gather27_v2, ln, silu, gelu, add, lin, gather, resrep, pack_bf16; } K;
+typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, conv_nmap_bf16_x8_db, gather27, gather27_v2, ln, silu, gelu, add, lin, gather, resrep, pack_bf16; } K;
 
 static void hash_build(K *k, void *keys, void *vals, int cap_mask, void *coords, int N) {
     void *a[] = {&keys, &vals, &cap_mask, &coords, &N};
@@ -158,7 +158,10 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
             (inC % 16 == 0) && (outC % 64 == 0) && (N >= 32)) {
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 31) / 32, gy = (outC + 63) / 64;
-            hipModuleLaunchKernel(k->conv_nmap_bf16_x8, gx, gy, 1, 256, 1, 1, 0, 0, a, NULL);
+            hipFunction_t f = k->conv_nmap_bf16_x8;
+            const char *e = getenv("T2_TEX_WMMA_DB");
+            if (k->conv_nmap_bf16_x8_db && (e == NULL || atoi(e))) f = k->conv_nmap_bf16_x8_db;
+            hipModuleLaunchKernel(f, gx, gy, 1, 256, 1, 1, 0, 0, a, NULL);
             return;
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x4 &&
@@ -576,6 +579,7 @@ int main(int argc, char **argv) {
     hipModuleGetFunction(&k.conv_nmap_bf16_x2, mod, "sparse_conv3d_nmap_tiled_bf16_x2");
     hipModuleGetFunction(&k.conv_nmap_bf16_x4, mod, "sparse_conv3d_nmap_tiled_bf16_x4");
     hipModuleGetFunction(&k.conv_nmap_bf16_x8, mod, "sparse_conv3d_nmap_tiled_bf16_x8");
+    hipModuleGetFunction(&k.conv_nmap_bf16_x8_db, mod, "sparse_conv3d_nmap_tiled_bf16_x8_db");
     hipModuleGetFunction(&k.gather27, mod, "t2_gather27_pack_bf16");
     hipModuleGetFunction(&k.gather27_v2, mod, "t2_gather27_pack_bf16_v2");
     hipModuleGetFunction(&k.ln, mod, "t2_layernorm_f32");
