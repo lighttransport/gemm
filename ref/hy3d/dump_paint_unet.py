@@ -103,6 +103,23 @@ def main():
     timestep = torch.tensor([500] * B, dtype=torch.int64, device=device)
     text = torch.randn(B, 77, 1024, dtype=dtype, device=device)
 
+    # Hook intermediates for piece-wise CUDA validation.
+    intermediates = {}
+    def grab(name):
+        def hook(_mod, _inp, output):
+            t = output
+            if isinstance(t, tuple):
+                t = t[0]
+            if hasattr(t, "sample"):
+                t = t.sample
+            intermediates[name] = t.detach()
+        return hook
+    unet.conv_in.register_forward_hook(grab("conv_in"))
+    unet.time_embedding.register_forward_hook(grab("time_emb"))
+    # First down-block ResNet output and first attentions block output too.
+    unet.down_blocks[0].resnets[0].register_forward_hook(grab("db0_res0"))
+    unet.down_blocks[0].attentions[0].register_forward_hook(grab("db0_attn0"))
+
     with torch.no_grad():
         out = unet(sample, timestep, encoder_hidden_states=text).sample
 
@@ -110,14 +127,19 @@ def main():
     print(f"out    {tuple(out.shape)}  range=[{out.min():+.3f},{out.max():+.3f}]")
 
     os.makedirs(args.outdir, exist_ok=True)
-    def save(name, t):
+    def save(name, t, keep_int=False):
         path = os.path.join(args.outdir, f"{args.prefix}_{name}.npy")
-        np.save(path, t.detach().cpu().float().numpy())
+        arr = t.detach().cpu().numpy()
+        if not keep_int:
+            arr = arr.astype(np.float32)
+        np.save(path, arr)
     save("sample", sample)
-    save("timestep", timestep)
+    save("timestep", timestep, keep_int=True)
     save("encoder_hidden", text)
     save("out", out)
-    print(f"wrote 4 .npy files to {args.outdir}")
+    for name, t in intermediates.items():
+        save(name, t)
+    print(f"wrote {4 + len(intermediates)} .npy files to {args.outdir}")
 
 
 if __name__ == "__main__":
