@@ -69,10 +69,43 @@ static void *npy_read(const char *path, size_t *out_numel, size_t *out_esz) {
     return data;
 }
 
-int main(int argc, char **argv) {
-    const char *refdir = (argc > 1) ? argv[1] : "/tmp/hy3d_paint_bp_ref";
-    char path[1024];
+/* Per-view back_project: launches `back_project_sample_f32` once for view
+ * `vi`. Caller has uploaded per-view inputs to d_image[vi]/d_depth[vi]/etc
+ * and a per-view d_w2c. Output is written into d_out_tex[vi] / d_out_cos[vi].
+ */
+static void launch_back_project(CUfunction f_bp, CUstream s,
+        CUdeviceptr d_tex_pos, CUdeviceptr d_tex_cov,
+        CUdeviceptr d_image, CUdeviceptr d_depth,
+        CUdeviceptr d_vis, CUdeviceptr d_cos, CUdeviceptr d_w2c,
+        float proj00, float proj11, float depth_thres,
+        int Htex, int Wtex, int Himg, int Wimg, int C,
+        CUdeviceptr d_out_tex, CUdeviceptr d_out_cos) {
+    void *args[] = {
+        &d_tex_pos, &d_tex_cov, &d_image, &d_depth, &d_vis, &d_cos, &d_w2c,
+        &proj00, &proj11, &depth_thres,
+        &Htex, &Wtex, &Himg, &Wimg, &C,
+        &d_out_tex, &d_out_cos
+    };
+    unsigned grid = (unsigned)((Htex * Wtex + 255) / 256);
+    cuLaunchKernel(f_bp, grid, 1, 1, 256, 1, 1, 0, s, args, NULL);
+}
 
+static int run_single_view(const char *refdir);
+static int run_multi_view (const char *refdir);
+
+int main(int argc, char **argv) {
+    int multiview = 0;
+    const char *refdir = "/tmp/hy3d_paint_bp_ref";
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--multiview")) multiview = 1;
+        else refdir = argv[i];
+    }
+    if (multiview) return run_multi_view(refdir);
+    return run_single_view(refdir);
+}
+
+static int run_single_view(const char *refdir) {
+    char path[1024];
     /* Load the dump. We re-derive shapes from each file's element count and
      * the meta we know from the dumper (--htex / --himg / C=3). */
     void *p_tex_pos = NULL, *p_tex_cov = NULL, *p_image = NULL,
@@ -156,15 +189,10 @@ int main(int argc, char **argv) {
     cuMemcpyHtoD(d_out_cos, zc, tex_n     * sizeof(float)); free(zc);
 
     float depth_thres = 3e-3f;
-    int Htex_i = Htex, Wtex_i = Wtex, Himg_i = Himg, Wimg_i = Wimg, C_i = C;
-    void *args[] = {
-        &d_tex_pos, &d_tex_cov, &d_image, &d_depth, &d_vis, &d_cos, &d_w2c,
-        &proj00, &proj11, &depth_thres,
-        &Htex_i, &Wtex_i, &Himg_i, &Wimg_i, &C_i,
-        &d_out_tex, &d_out_cos
-    };
-    unsigned grid = (unsigned)((tex_n + 255) / 256);
-    cuLaunchKernel(f_bp, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+    launch_back_project(f_bp, 0,
+        d_tex_pos, d_tex_cov, d_image, d_depth, d_vis, d_cos, d_w2c,
+        proj00, proj11, depth_thres,
+        Htex, Wtex, Himg, Wimg, C, d_out_tex, d_out_cos);
     cuCtxSynchronize();
 
     /* Download */
@@ -219,3 +247,174 @@ int main(int argc, char **argv) {
     free(p_ref_tex); free(p_ref_cos); free(out_tex); free(out_cos);
     return ok ? 0 : 1;
 }
+
+static int run_multi_view(const char *refdir) {
+    char path[1024];
+    void *p_tex_pos = NULL, *p_tex_cov = NULL, *p_proj = NULL,
+         *p_bake_tex = NULL, *p_bake_trust = NULL;
+    size_t n_tp, n_tc, n_pr, n_bt, n_btr, esz;
+#define LOAD(var, nvar, name) do { \
+    snprintf(path, sizeof(path), "%s/%s", refdir, name); \
+    var = npy_read(path, &nvar, &esz); \
+    if (!var) return 1; \
+} while (0)
+    LOAD(p_tex_pos, n_tp, "tex_pos.npy");
+    LOAD(p_tex_cov, n_tc, "tex_cov.npy");
+    LOAD(p_proj,    n_pr, "proj.npy");
+    LOAD(p_bake_tex,   n_bt,  "bake_tex.npy");
+    LOAD(p_bake_trust, n_btr, "bake_trust.npy");
+    int Htex = (int)sqrt((double)n_tc), Wtex = Htex, C = 3;
+    float proj00 = ((float*)p_proj)[0], proj11 = ((float*)p_proj)[1];
+    /* Detect view count from existing files (1..32). */
+    int N = 0;
+    while (N < 32) {
+        snprintf(path, sizeof(path), "%s/view_%d_image.npy", refdir, N);
+        FILE *fp = fopen(path, "rb"); if (!fp) break; fclose(fp); N++;
+    }
+    if (N == 0) { fprintf(stderr, "no view_*_image.npy in %s\n", refdir); return 1; }
+
+    /* Inputs per view: (image, depth, visible, cos, w2c). Loaded once into
+     * device memory to mirror what the integrated runner will do. */
+    float **h_image = malloc(N * sizeof(*h_image));
+    float **h_depth = malloc(N * sizeof(*h_depth));
+    float **h_vis   = malloc(N * sizeof(*h_vis));
+    float **h_cos   = malloc(N * sizeof(*h_cos));
+    float **h_w2c   = malloc(N * sizeof(*h_w2c));
+    int Himg = 0, Wimg = 0;
+    for (int v = 0; v < N; v++) {
+        size_t n;
+        snprintf(path, sizeof(path), "%s/view_%d_image.npy", refdir, v);
+        h_image[v] = npy_read(path, &n, &esz); if (!h_image[v]) return 1;
+        if (Himg == 0) { Himg = (int)sqrt((double)n / C); Wimg = Himg; }
+        snprintf(path, sizeof(path), "%s/view_%d_depth.npy", refdir, v);
+        h_depth[v] = npy_read(path, &n, &esz);
+        snprintf(path, sizeof(path), "%s/view_%d_visible.npy", refdir, v);
+        h_vis[v]   = npy_read(path, &n, &esz);
+        snprintf(path, sizeof(path), "%s/view_%d_cos.npy", refdir, v);
+        h_cos[v]   = npy_read(path, &n, &esz);
+        snprintf(path, sizeof(path), "%s/view_%d_w2c.npy", refdir, v);
+        h_w2c[v]   = npy_read(path, &n, &esz);
+    }
+    fprintf(stderr, "tex %dx%d  img %dx%d  C=%d  N_views=%d  proj=(%.4f,%.4f)\n",
+            Htex, Wtex, Himg, Wimg, C, N, proj00, proj11);
+
+    if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) return 1;
+    cuInit(0); CUdevice dev; cuDeviceGet(&dev, 0);
+    CUcontext ctx; cuCtxCreate(&ctx, 0, dev);
+    CUmodule mod;
+    if (cu_compile_kernels(&mod, dev, cuda_paint_raster_kernels_src,
+                           "hy3d_paint_raster", 1, "HY3D-PAINT") < 0) return 1;
+    CUfunction f_bp; cuModuleGetFunction(&f_bp, mod, "back_project_sample_f32");
+
+    size_t tex_n = (size_t)Htex * Wtex;
+    size_t img_n = (size_t)Himg * Wimg;
+    /* Per-view device buffers */
+    CUdeviceptr d_tex_pos, d_tex_cov;
+    cuMemAlloc(&d_tex_pos, tex_n * 3 * sizeof(float));
+    cuMemAlloc(&d_tex_cov, tex_n     * sizeof(int));
+    cuMemcpyHtoD(d_tex_pos, p_tex_pos, tex_n * 3 * sizeof(float));
+    cuMemcpyHtoD(d_tex_cov, p_tex_cov, tex_n     * sizeof(int));
+    CUdeviceptr d_image, d_depth, d_vis, d_cos, d_w2c, d_out_tex, d_out_cos;
+    cuMemAlloc(&d_image,   img_n * C * sizeof(float));
+    cuMemAlloc(&d_depth,   img_n     * sizeof(float));
+    cuMemAlloc(&d_vis,     img_n     * sizeof(float));
+    cuMemAlloc(&d_cos,     img_n     * sizeof(float));
+    cuMemAlloc(&d_w2c,     16        * sizeof(float));
+    cuMemAlloc(&d_out_tex, tex_n * C * sizeof(float));
+    cuMemAlloc(&d_out_cos, tex_n     * sizeof(float));
+
+    /* Per-view CUDA back_project, results downloaded for host-side bake. */
+    float **out_tex = malloc(N * sizeof(*out_tex));
+    float **out_cos = malloc(N * sizeof(*out_cos));
+    void *zt = calloc(tex_n * C, sizeof(float));
+    void *zc = calloc(tex_n,     sizeof(float));
+    for (int v = 0; v < N; v++) {
+        cuMemcpyHtoD(d_image, h_image[v], img_n * C * sizeof(float));
+        cuMemcpyHtoD(d_depth, h_depth[v], img_n     * sizeof(float));
+        cuMemcpyHtoD(d_vis,   h_vis[v],   img_n     * sizeof(float));
+        cuMemcpyHtoD(d_cos,   h_cos[v],   img_n     * sizeof(float));
+        cuMemcpyHtoD(d_w2c,   h_w2c[v],   16        * sizeof(float));
+        cuMemcpyHtoD(d_out_tex, zt, tex_n * C * sizeof(float));
+        cuMemcpyHtoD(d_out_cos, zc, tex_n     * sizeof(float));
+        launch_back_project(f_bp, 0,
+            d_tex_pos, d_tex_cov, d_image, d_depth, d_vis, d_cos, d_w2c,
+            proj00, proj11, 3e-3f, Htex, Wtex, Himg, Wimg, C,
+            d_out_tex, d_out_cos);
+        cuCtxSynchronize();
+        out_tex[v] = malloc(tex_n * C * sizeof(float));
+        out_cos[v] = malloc(tex_n     * sizeof(float));
+        cuMemcpyDtoH(out_tex[v], d_out_tex, tex_n * C * sizeof(float));
+        cuMemcpyDtoH(out_cos[v], d_out_cos, tex_n     * sizeof(float));
+    }
+    free(zt); free(zc);
+
+    /* Bake-blend on host: weight = cos^exp; tex_merge = sum(tex*w)/sum(w);
+     * trust = (sum(w) > 1e-8). Mirror MeshRender.fast_bake_texture's "skip
+     * view if 99% already painted" optimization (matters for order-dependent
+     * test reproducibility). */
+    const float exp_w = 6.0f;
+    float *tex_merge = calloc(tex_n * C, sizeof(float));
+    float *trust     = calloc(tex_n,     sizeof(float));
+    for (int v = 0; v < N; v++) {
+        size_t view_sum = 0, painted_sum = 0;
+        for (size_t i = 0; i < tex_n; i++) {
+            int rvr = out_cos[v][i] > 0.f;
+            if (rvr) view_sum++;
+            if (rvr && trust[i] > 0.f) painted_sum++;
+        }
+        if (view_sum > 0 && (double)painted_sum / view_sum > 0.99) {
+            fprintf(stderr, "  view %d: skipped (99%% painted)\n", v);
+            continue;
+        }
+        for (size_t i = 0; i < tex_n; i++) {
+            float w = powf(out_cos[v][i], exp_w);
+            for (int k = 0; k < C; k++) tex_merge[i*C+k] += out_tex[v][i*C+k] * w;
+            trust[i] += w;
+        }
+    }
+    float *bake = malloc(tex_n * C * sizeof(float));
+    float *bake_mask = malloc(tex_n * sizeof(float));
+    for (size_t i = 0; i < tex_n; i++) {
+        float t = trust[i] > 1e-8f ? trust[i] : 1e-8f;
+        for (int k = 0; k < C; k++) bake[i*C+k] = tex_merge[i*C+k] / t;
+        bake_mask[i] = trust[i] > 1e-8f ? 1.f : 0.f;
+    }
+
+    /* Diff vs pyref bake. */
+    const float *ref_bake  = (const float*)p_bake_tex;
+    const float *ref_trust = (const float*)p_bake_trust;
+    int mask_mismatch = 0;
+    double tex_max = 0, tex_sum = 0; size_t tex_n_diff = 0;
+    for (size_t i = 0; i < tex_n; i++) {
+        if ((bake_mask[i] > 0) != (ref_trust[i] > 0)) mask_mismatch++;
+        if (bake_mask[i] > 0 || ref_trust[i] > 0) {
+            for (int k = 0; k < C; k++) {
+                double d = fabs((double)bake[i*C+k] - (double)ref_bake[i*C+k]);
+                if (d > tex_max) tex_max = d;
+                tex_sum += d; tex_n_diff++;
+            }
+        }
+    }
+    fprintf(stderr,
+        "bake_mask mismatch=%d   bake_tex mae=%.3e max=%.3e (over %zu)\n",
+        mask_mismatch, tex_sum / (double)tex_n_diff, tex_max, tex_n_diff);
+    int ok = (mask_mismatch == 0) && (tex_max < 1e-4);
+    fprintf(stderr, "result: %s\n", ok ? "PASS" : "FAIL");
+
+    for (int v = 0; v < N; v++) {
+        free(h_image[v]); free(h_depth[v]); free(h_vis[v]);
+        free(h_cos[v]); free(h_w2c[v]);
+        free(out_tex[v]); free(out_cos[v]);
+    }
+    free(h_image); free(h_depth); free(h_vis); free(h_cos); free(h_w2c);
+    free(out_tex); free(out_cos);
+    free(tex_merge); free(trust); free(bake); free(bake_mask);
+    free(p_tex_pos); free(p_tex_cov); free(p_proj);
+    free(p_bake_tex); free(p_bake_trust);
+    cuMemFree(d_tex_pos); cuMemFree(d_tex_cov); cuMemFree(d_image);
+    cuMemFree(d_depth); cuMemFree(d_vis); cuMemFree(d_cos); cuMemFree(d_w2c);
+    cuMemFree(d_out_tex); cuMemFree(d_out_cos);
+    cuModuleUnload(mod); cuCtxDestroy(ctx);
+    return ok ? 0 : 1;
+}
+#undef LOAD
