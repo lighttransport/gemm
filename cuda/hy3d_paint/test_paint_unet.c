@@ -1335,7 +1335,8 @@ int main(int argc, char **argv) {
                           || !strcmp(stage, "out_ma")
                           || !strcmp(stage, "out_ma_rope")
                           || !strcmp(stage, "out_mda")
-                          || !strcmp(stage, "out_ra"));
+                          || !strcmp(stage, "out_ra")
+                          || !strcmp(stage, "out_all"));
     if (!wrapper_stage) {
         snprintf(path, sizeof(path), "%s/ref_timestep.npy", ref_dir);
         ts = (int64_t *)read_npy(path, &nd, shape, &n, dt);
@@ -2366,6 +2367,262 @@ int main(int argc, char **argv) {
         diff_against(cu, path, out_n, 5e-3f);
         free(cu); free(packed_main); free(packed_dual); free(text_tiled_main);
         free(sample); free(en); free(ep); free(text_in); free(ref_latents); free(ts_in);
+        g_ra_mode = 0;
+    } else if (!strcmp(stage, "out_all")) {
+        /* Phase 4.6: all 4 attention paths on (DINO + MA + MDA + RA) +
+         * dual-stream. PoseRoPE OFF (matches dump_paint_unet_wrapper.py). */
+        const int N_PBR = 2, N_GEN = 2, N_REF = 1;
+        const int B_outer = 1;
+        const int Beff_main = B_outer * N_PBR * N_GEN;       /* 4 */
+        const int Beff_dual = B_outer * N_REF;               /* 1 */
+        const int H0 = 64, W0 = 64;
+        const int IC_main = 12, IC_dual = 4;
+        const int N_BLOCKS = 16;
+        const int M_DINO = 1028;       /* 257 * 4 */
+
+        g_ra_cache.slots = (pu_ra_slot *)calloc(N_BLOCKS, sizeof(pu_ra_slot));
+        g_ra_cache.n_slots = N_BLOCKS;
+        g_ra_cache.idx = 0;
+        g_ra_n_ref = N_REF;
+
+        /* --- shared inputs --- */
+        snprintf(path, sizeof(path), "%s/in_sample.npy", ref_dir);
+        float *sample = (float *)read_npy(path, &nd, shape, &n, dt);  if (!sample) return 1;
+        snprintf(path, sizeof(path), "%s/in_embeds_normal.npy", ref_dir);
+        float *en = (float *)read_npy(path, &nd, shape, &n, dt);  if (!en) return 1;
+        snprintf(path, sizeof(path), "%s/in_embeds_position.npy", ref_dir);
+        float *ep = (float *)read_npy(path, &nd, shape, &n, dt);  if (!ep) return 1;
+        snprintf(path, sizeof(path), "%s/in_encoder_hidden_states.npy", ref_dir);
+        float *text_in = (float *)read_npy(path, &nd, shape, &n, dt);  if (!text_in) return 1;
+        int M_text = (int)shape[2], cross_dim = (int)shape[3];
+        snprintf(path, sizeof(path), "%s/in_ref_latents.npy", ref_dir);
+        float *ref_latents = (float *)read_npy(path, &nd, shape, &n, dt);  if (!ref_latents) return 1;
+        snprintf(path, sizeof(path), "%s/in_dino_hidden_states.npy", ref_dir);
+        float *dino_in = (float *)read_npy(path, &nd, shape, &n, dt);  if (!dino_in) return 1;
+        int T_dino = (int)shape[1], C_dino_in = (int)shape[2];
+        snprintf(path, sizeof(path), "%s/in_timestep.npy", ref_dir);
+        int64_t *ts_in = (int64_t *)read_npy(path, &nd, shape, &n, dt);  if (!ts_in) return 1;
+        long long ts_val = ts_in[0];
+        fprintf(stderr, "out_all: Beff_main=%d Beff_dual=%d ts=%lld M_text=%d cross=%d T_dino=%d\n",
+                Beff_main, Beff_dual, ts_val, M_text, cross_dim, T_dino);
+
+        size_t per_view = (size_t)4 * H0 * W0;
+        size_t per_in_main = (size_t)IC_main * H0 * W0;
+        float *packed_main = (float *)malloc((size_t)Beff_main * per_in_main * sizeof(float));
+        for (int p = 0; p < N_PBR; p++)
+            for (int g = 0; g < N_GEN; g++) {
+                int b = p * N_GEN + g;
+                float *dst = packed_main + (size_t)b * per_in_main;
+                memcpy(dst,                sample + ((size_t)p * N_GEN + g) * per_view, per_view * sizeof(float));
+                memcpy(dst + per_view,     en + (size_t)g * per_view, per_view * sizeof(float));
+                memcpy(dst + 2 * per_view, ep + (size_t)g * per_view, per_view * sizeof(float));
+            }
+        float *packed_dual = (float *)malloc((size_t)Beff_dual * per_view * sizeof(float));
+        memcpy(packed_dual, ref_latents, (size_t)Beff_dual * per_view * sizeof(float));
+
+        size_t txt_per = (size_t)M_text * cross_dim;
+        float *text_tiled_main = (float *)malloc((size_t)Beff_main * txt_per * sizeof(float));
+        for (int p = 0; p < N_PBR; p++)
+            for (int g = 0; g < N_GEN; g++) {
+                int b = p * N_GEN + g;
+                memcpy(text_tiled_main + (size_t)b * txt_per,
+                       text_in + (size_t)p * txt_per, txt_per * sizeof(float));
+            }
+        CUdeviceptr d_text_clip_ref = upload_st(st, "learned_text_clip_ref");
+        size_t ltcr_n = (size_t)1 * M_text * cross_dim;
+        CUdeviceptr d_text_dual; cuMemAlloc(&d_text_dual, (size_t)Beff_dual * txt_per * sizeof(float));
+        for (int b = 0; b < Beff_dual; b++)
+            cuMemcpyDtoD(d_text_dual + (CUdeviceptr)b * txt_per * sizeof(float),
+                          d_text_clip_ref, ltcr_n * sizeof(float));
+
+        int64_t ts_main_arr[16], ts_dual_arr[16];
+        for (int b = 0; b < Beff_main; b++) ts_main_arr[b] = ts_val;
+        for (int b = 0; b < Beff_dual; b++) ts_dual_arr[b] = 0;
+        CUdeviceptr d_ts_main, d_ts_dual;
+        cuMemAlloc(&d_ts_main, Beff_main * sizeof(int64_t));
+        cuMemAlloc(&d_ts_dual, Beff_dual * sizeof(int64_t));
+        cuMemcpyHtoD(d_ts_main, ts_main_arr, Beff_main * sizeof(int64_t));
+        cuMemcpyHtoD(d_ts_dual, ts_dual_arr, Beff_dual * sizeof(int64_t));
+
+        CUdeviceptr l1_w  = upload_st(st, "time_embedding.linear_1.weight");
+        CUdeviceptr l1_b  = upload_st(st, "time_embedding.linear_1.bias");
+        CUdeviceptr l2_w  = upload_st(st, "time_embedding.linear_2.weight");
+        CUdeviceptr l2_b  = upload_st(st, "time_embedding.linear_2.bias");
+        CUdeviceptr l1_wd = upload_st(st, "unet_dual.time_embedding.linear_1.weight");
+        CUdeviceptr l1_bd = upload_st(st, "unet_dual.time_embedding.linear_1.bias");
+        CUdeviceptr l2_wd = upload_st(st, "unet_dual.time_embedding.linear_2.weight");
+        CUdeviceptr l2_bd = upload_st(st, "unet_dual.time_embedding.linear_2.bias");
+
+        /* DINO proj: [1, 257, 1536] -> [1, 1028, 1024] -> tile to Beff_main */
+        const int CTX = 1024, EXTRA = 4;
+        int rows_out = T_dino * EXTRA;
+        if (rows_out != M_DINO) { fprintf(stderr, "ERROR: M_DINO mismatch\n"); return 1; }
+        CUdeviceptr d_dino_in;  cuMemAlloc(&d_dino_in,  (size_t)T_dino * C_dino_in * sizeof(float));
+        CUdeviceptr d_dino_lin; cuMemAlloc(&d_dino_lin, (size_t)T_dino * EXTRA * CTX * sizeof(float));
+        CUdeviceptr d_dino_one; cuMemAlloc(&d_dino_one, (size_t)rows_out * CTX * sizeof(float));
+        cuMemcpyHtoD(d_dino_in, dino_in, (size_t)T_dino * C_dino_in * sizeof(float));
+        CUdeviceptr pw  = upload_st(st, "image_proj_model_dino.proj.weight");
+        CUdeviceptr pb  = upload_st(st, "image_proj_model_dino.proj.bias");
+        CUdeviceptr png = upload_st(st, "image_proj_model_dino.norm.weight");
+        CUdeviceptr pnb = upload_st(st, "image_proj_model_dino.norm.bias");
+        k_linear(&kk, d_dino_lin, d_dino_in, pw, pb, T_dino, C_dino_in, EXTRA * CTX);
+        k_layernorm(&kk, d_dino_one, d_dino_lin, png, pnb, rows_out, CTX);
+        CUdeviceptr d_dino; cuMemAlloc(&d_dino, (size_t)Beff_main * rows_out * CTX * sizeof(float));
+        size_t dino_per = (size_t)rows_out * CTX * sizeof(float);
+        for (int b = 0; b < Beff_main; b++)
+            cuMemcpyDtoD(d_dino + (CUdeviceptr)b * dino_per, d_dino_one, dino_per);
+
+        /* Workspace sized for the larger main pass; matches out_dino sizing */
+        size_t MAX_ACT  = (size_t)Beff_main * 1280 * H0 * W0;
+        size_t MAX_CCAT = (size_t)Beff_main * 960  * H0 * W0;
+        size_t MAX_FF_GH= (size_t)Beff_main * 320  * H0 * W0 * 2 * 4;
+        size_t MAX_FF_H = (size_t)Beff_main * 320  * H0 * W0 * 4;
+        size_t MAX_BNC  = (size_t)Beff_main * 320  * H0 * W0;
+        if ((size_t)Beff_main * 1280 * 16 * 16 > MAX_BNC) MAX_BNC = (size_t)Beff_main * 1280 * 16 * 16;
+        if ((size_t)Beff_main *  640 * 32 * 32 > MAX_BNC) MAX_BNC = (size_t)Beff_main *  640 * 32 * 32;
+        size_t MAX_BMC = MAX_BNC;
+        if ((size_t)Beff_main * 1280 * M_text > MAX_BMC) MAX_BMC = (size_t)Beff_main * 1280 * M_text;
+        if ((size_t)Beff_main * 1280 * M_DINO > MAX_BMC) MAX_BMC = (size_t)Beff_main * 1280 * M_DINO;
+
+        pu_workspace ws;
+        cuMemAlloc(&ws.d_a, MAX_ACT * sizeof(float));
+        cuMemAlloc(&ws.d_b, MAX_ACT * sizeof(float));
+        cuMemAlloc(&ws.d_t1, MAX_CCAT * sizeof(float));
+        cuMemAlloc(&ws.d_t2, MAX_CCAT * sizeof(float));
+        cuMemAlloc(&ws.d_temb_act,  Beff_main * 1280 * sizeof(float));
+        cuMemAlloc(&ws.d_temb_proj, Beff_main * 1280 * sizeof(float));
+        cuMemAlloc(&ws.X.d_resid, MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_nc,    MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_nc_b,  MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_norm,  MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_q,     MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_k,     MAX_BMC * sizeof(float));
+        cuMemAlloc(&ws.X.d_v,     MAX_BMC * sizeof(float));
+        cuMemAlloc(&ws.X.d_attn,  MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_ff_gh, MAX_FF_GH * sizeof(float));
+        cuMemAlloc(&ws.X.d_ff_h,  MAX_FF_H * sizeof(float));
+        CUdeviceptr d_concat; cuMemAlloc(&d_concat, MAX_CCAT * sizeof(float));
+
+        /* ===== Pass 1: dual-stream, ra_mode='w' (vanilla, no custom paths) ===== */
+        g_ra_mode = 1; g_ra_cache.idx = 0;
+        g_load_wp = "unet_dual.";
+        CUdeviceptr cw_d = upload_st(st, "unet_dual.conv_in.weight");
+        CUdeviceptr cb_d = upload_st(st, "unet_dual.conv_in.bias");
+        pu_down_block dbd[4]; pu_mid_block midd; pu_up_block ubd[4];
+        load_down_block(st, &dbd[0], 0,  320,  320,  5, 1, 1, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_down_block(st, &dbd[1], 1,  320,  640, 10, 1, 1, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_down_block(st, &dbd[2], 2,  640, 1280, 20, 1, 1, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_down_block(st, &dbd[3], 3, 1280, 1280, 20, 0, 0, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_mid_block(st, &midd, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_up_block(st, &ubd[0], 0, 1280, 1280, 1280,  0, 0, 1, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_up_block(st, &ubd[1], 1,  640, 1280, 1280, 20, 1, 1, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_up_block(st, &ubd[2], 2,  320,  640, 1280, 10, 1, 1, cross_dim, 0, 0, 0, 0, 0, 0);
+        load_up_block(st, &ubd[3], 3,  320,  320,  640,  5, 1, 0, cross_dim, 0, 0, 0, 0, 0, 0);
+
+        CUdeviceptr d_temb_in_d, d_temb_h1_d, d_temb_d;
+        cuMemAlloc(&d_temb_in_d, Beff_dual * 320 * sizeof(float));
+        cuMemAlloc(&d_temb_h1_d, Beff_dual * 1280 * sizeof(float));
+        cuMemAlloc(&d_temb_d,    Beff_dual * 1280 * sizeof(float));
+        k_timestep_embed(&kk, d_temb_in_d, d_ts_dual, Beff_dual, 320);
+        k_linear(&kk, d_temb_h1_d, d_temb_in_d, l1_wd, l1_bd, Beff_dual, 320, 1280);
+        k_silu(&kk, d_temb_h1_d, Beff_dual * 1280);
+        k_linear(&kk, d_temb_d, d_temb_h1_d, l2_wd, l2_bd, Beff_dual, 1280, 1280);
+
+        size_t in_n_d = (size_t)Beff_dual * IC_dual * H0 * W0;
+        CUdeviceptr d_in_raw_d; cuMemAlloc(&d_in_raw_d, in_n_d * sizeof(float));
+        cuMemcpyHtoD(d_in_raw_d, packed_dual, in_n_d * sizeof(float));
+        for (int b = 0; b < Beff_dual; b++) {
+            CUdeviceptr ib = d_in_raw_d + (CUdeviceptr)b * IC_dual * H0 * W0 * sizeof(float);
+            CUdeviceptr ob = ws.d_a     + (CUdeviceptr)b * 320 * H0 * W0 * sizeof(float);
+            k_conv(&kk, ob, ib, cw_d, cb_d, IC_dual, H0, W0, 320, 3, 3, 1);
+        }
+        pu_skip_stack ssd = {.top = 0, .B = Beff_dual};
+        skip_push_copy(&ssd, ws.d_a, 320, H0, W0);
+        int H = H0, W = W0;
+        run_down_block(&kk, &dbd[0], ws.d_a, ws.d_b, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        run_down_block(&kk, &dbd[1], ws.d_a, ws.d_b, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        run_down_block(&kk, &dbd[2], ws.d_a, ws.d_b, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        run_down_block(&kk, &dbd[3], ws.d_a, ws.d_b, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        run_mid_block(&kk, &midd, ws.d_a, ws.d_b, d_temb_d, d_text_dual, 0, 0, Beff_dual, H, W, M_text, &ws);
+        run_up_block(&kk, &ubd[0], ws.d_a, ws.d_b, d_concat, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        run_up_block(&kk, &ubd[1], ws.d_a, ws.d_b, d_concat, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        run_up_block(&kk, &ubd[2], ws.d_a, ws.d_b, d_concat, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        run_up_block(&kk, &ubd[3], ws.d_a, ws.d_b, d_concat, d_temb_d, d_text_dual, 0, 0, Beff_dual, &H, &W, M_text, &ws, &ssd);
+        cuCtxSynchronize();
+        fprintf(stderr, "  RA write pass: cached %d transformer-block slots\n", g_ra_cache.idx);
+
+        /* ===== Pass 2: main forward, ra_mode='r', all paths on (no rope) ===== */
+        g_ra_mode = 2; g_ra_cache.idx = 0;
+        g_load_wp = "";
+        CUdeviceptr cw = upload_st(st, "conv_in.weight");
+        CUdeviceptr cb = upload_st(st, "conv_in.bias");
+        pu_down_block db[4]; pu_mid_block mid; pu_up_block ub[4];
+        /* has_dino=1, has_ma=1, has_mda=1, has_ra=1 */
+        load_down_block(st, &db[0], 0,  320,  320,  5, 1, 1, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_down_block(st, &db[1], 1,  320,  640, 10, 1, 1, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_down_block(st, &db[2], 2,  640, 1280, 20, 1, 1, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_down_block(st, &db[3], 3, 1280, 1280, 20, 0, 0, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_mid_block(st, &mid, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_up_block(st, &ub[0], 0, 1280, 1280, 1280,  0, 0, 1, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_up_block(st, &ub[1], 1,  640, 1280, 1280, 20, 1, 1, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_up_block(st, &ub[2], 2,  320,  640, 1280, 10, 1, 1, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+        load_up_block(st, &ub[3], 3,  320,  320,  640,  5, 1, 0, cross_dim, 1, 1, 1, 1, N_PBR, N_GEN);
+
+        CUdeviceptr d_temb_in_m, d_temb_h1_m, d_temb_m;
+        cuMemAlloc(&d_temb_in_m, Beff_main * 320 * sizeof(float));
+        cuMemAlloc(&d_temb_h1_m, Beff_main * 1280 * sizeof(float));
+        cuMemAlloc(&d_temb_m,    Beff_main * 1280 * sizeof(float));
+        k_timestep_embed(&kk, d_temb_in_m, d_ts_main, Beff_main, 320);
+        k_linear(&kk, d_temb_h1_m, d_temb_in_m, l1_w, l1_b, Beff_main, 320, 1280);
+        k_silu(&kk, d_temb_h1_m, Beff_main * 1280);
+        k_linear(&kk, d_temb_m, d_temb_h1_m, l2_w, l2_b, Beff_main, 1280, 1280);
+
+        size_t in_n_m = (size_t)Beff_main * IC_main * H0 * W0;
+        CUdeviceptr d_in_raw_m; cuMemAlloc(&d_in_raw_m, in_n_m * sizeof(float));
+        cuMemcpyHtoD(d_in_raw_m, packed_main, in_n_m * sizeof(float));
+        CUdeviceptr d_text_m; cuMemAlloc(&d_text_m, (size_t)Beff_main * txt_per * sizeof(float));
+        cuMemcpyHtoD(d_text_m, text_tiled_main, (size_t)Beff_main * txt_per * sizeof(float));
+        for (int b = 0; b < Beff_main; b++) {
+            CUdeviceptr ib = d_in_raw_m + (CUdeviceptr)b * IC_main * H0 * W0 * sizeof(float);
+            CUdeviceptr ob = ws.d_a     + (CUdeviceptr)b * 320 * H0 * W0 * sizeof(float);
+            k_conv(&kk, ob, ib, cw, cb, IC_main, H0, W0, 320, 3, 3, 1);
+        }
+        pu_skip_stack ss = {.top = 0, .B = Beff_main};
+        skip_push_copy(&ss, ws.d_a, 320, H0, W0);
+        H = H0; W = W0;
+        run_down_block(&kk, &db[0], ws.d_a, ws.d_b, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+        run_down_block(&kk, &db[1], ws.d_a, ws.d_b, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+        run_down_block(&kk, &db[2], ws.d_a, ws.d_b, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+        run_down_block(&kk, &db[3], ws.d_a, ws.d_b, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+        run_mid_block(&kk, &mid, ws.d_a, ws.d_b, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, H, W, M_text, &ws);
+        run_up_block(&kk, &ub[0], ws.d_a, ws.d_b, d_concat, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+        run_up_block(&kk, &ub[1], ws.d_a, ws.d_b, d_concat, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+        run_up_block(&kk, &ub[2], ws.d_a, ws.d_b, d_concat, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+        run_up_block(&kk, &ub[3], ws.d_a, ws.d_b, d_concat, d_temb_m, d_text_m, d_dino, M_DINO, Beff_main, &H, &W, M_text, &ws, &ss);
+
+        CUdeviceptr ng = upload_st(st, "conv_norm_out.weight");
+        CUdeviceptr nb_w = upload_st(st, "conv_norm_out.bias");
+        CUdeviceptr ow = upload_st(st, "conv_out.weight");
+        CUdeviceptr ob_w = upload_st(st, "conv_out.bias");
+        for (int b = 0; b < Beff_main; b++) {
+            CUdeviceptr xb = ws.d_a + (CUdeviceptr)b * 320 * H * W * sizeof(float);
+            CUdeviceptr yb = ws.d_b + (CUdeviceptr)b * 320 * H * W * sizeof(float);
+            k_groupnorm(&kk, yb, xb, ng, nb_w, 320, H * W, 32, 1);
+        }
+        for (int b = 0; b < Beff_main; b++) {
+            CUdeviceptr yb = ws.d_b + (CUdeviceptr)b * 320 * H * W * sizeof(float);
+            CUdeviceptr ob = ws.d_a + (CUdeviceptr)b * 4   * H * W * sizeof(float);
+            k_conv(&kk, ob, yb, ow, ob_w, 320, H, W, 4, 3, 3, 1);
+        }
+        cuCtxSynchronize();
+        size_t out_n = (size_t)Beff_main * 4 * H * W;
+        float *cu = (float *)malloc(out_n * sizeof(float));
+        cuMemcpyDtoH(cu, ws.d_a, out_n * sizeof(float));
+        snprintf(path, sizeof(path), "%s/out_all.npy", ref_dir);
+        diff_against(cu, path, out_n, 5e-3f);
+        free(cu); free(packed_main); free(packed_dual); free(text_tiled_main);
+        free(sample); free(en); free(ep); free(text_in); free(ref_latents);
+        free(dino_in); free(ts_in);
         g_ra_mode = 0;
     } else if (!strcmp(stage, "dino_proj")) {
         /* image_proj_model_dino: Linear(1536 -> 4*1024) + LayerNorm(1024)
