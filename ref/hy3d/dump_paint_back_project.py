@@ -306,6 +306,12 @@ def main():
     ap.add_argument("--dist", type=float, default=1.45)
     ap.add_argument("--ortho", type=float, default=1.2,
                     help="ortho half-extent (matches paint pipeline default)")
+    ap.add_argument("--multiview", action="store_true",
+                    help="Dump 4 views (azims 0/90/180/270 at elev 0) and the "
+                         "weighted bake-blend reference. Adds bake_tex.npy / "
+                         "bake_trust.npy + per-view view_<i>_*.npy.")
+    ap.add_argument("--bake-exp", type=float, default=6.0,
+                    help="cos exponent for bake blending (matches MeshRender)")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -341,61 +347,120 @@ def main():
     print(f"  covered texels: {int(tex_cov.sum())} / {args.htex*args.htex}",
           file=sys.stderr)
 
-    print(f"render view elev={args.elev} azim={args.azim} dist={args.dist}",
-          file=sys.stderr)
-    w2c = get_mv_matrix(args.elev, args.azim, args.dist)
     proj = get_ortho_proj(args.ortho)
-    visible, depth, normal = render_view(
-        vtx_pos_n, faces, w2c, proj, args.himg, args.himg)
-    print(f"  visible pixels: {int(visible.sum())}", file=sys.stderr)
-    # cos: cam-space normal of a front-facing surface points toward camera.
-    # With our LookAt (cam at +Z, looking at origin), that direction is +Z in
-    # cam coords, so cos = +normal.z. (Note: MeshRender uses lookat=(0,0,-1)
-    # and gets the same positive front-facing values because its view
-    # convention places the normal pointing in the opposite cam-space dir.)
-    cos_img = normal[..., 2]
-    cos_thres = float(np.cos(np.deg2rad(75.0)))
-    cos_img[cos_img < cos_thres] = 0.0
-    cos_img[visible <= 0] = 0.0
-
-    # Synthetic "rendered" image: smooth RGB gradient so back-project drift
-    # stays meaningful (not a flat color).
-    yy, xx = np.meshgrid(np.arange(args.himg), np.arange(args.himg), indexing="ij")
-    image = np.stack([
-        (xx / args.himg).astype(np.float32),
-        (yy / args.himg).astype(np.float32),
-        (1.0 - (xx + yy).astype(np.float32) / (2 * args.himg)),
-    ], -1)
-    image *= visible[..., None]  # background black
-
-    print("back_project (numpy)", file=sys.stderr)
     proj00 = float(proj[0, 0]); proj11 = float(proj[1, 1])
-    ref_tex, ref_cos = back_project_numpy(
-        tex_pos, tex_cov, image, depth, visible, cos_img,
-        w2c, proj00, proj11, depth_thres=3e-3)
-    print(f"  written texels: {int((ref_cos > 0).sum())}", file=sys.stderr)
+    cos_thres = float(np.cos(np.deg2rad(75.0)))
 
-    # Dump all
-    np.save(os.path.join(args.outdir, "tex_pos.npy"), tex_pos)
-    np.save(os.path.join(args.outdir, "tex_cov.npy"), tex_cov)
-    np.save(os.path.join(args.outdir, "image.npy"),   image)
-    np.save(os.path.join(args.outdir, "depth.npy"),   depth)
-    np.save(os.path.join(args.outdir, "visible.npy"), visible)
-    np.save(os.path.join(args.outdir, "cos.npy"),     cos_img)
-    # w2c: kernel reads as column-major; numpy is row-major so write transposed.
-    np.save(os.path.join(args.outdir, "w2c.npy"),     w2c.T.reshape(-1))
-    np.save(os.path.join(args.outdir, "proj.npy"),    np.array([proj00, proj11], dtype=np.float32))
-    np.save(os.path.join(args.outdir, "ref_tex.npy"), ref_tex)
-    np.save(os.path.join(args.outdir, "ref_cos.npy"), ref_cos)
-    with open(os.path.join(args.outdir, "meta.json"), "w") as f:
-        json.dump({
-            "Htex": args.htex, "Wtex": args.htex,
-            "Himg": args.himg, "Wimg": args.himg,
-            "C": 3, "depth_thres": 3e-3,
-            "elev": args.elev, "azim": args.azim, "dist": args.dist,
-            "ortho": args.ortho,
-        }, f, indent=2)
-    print(f"wrote {args.outdir}", file=sys.stderr)
+    def render_and_back_project(elev, azim, image_seed):
+        w2c = get_mv_matrix(elev, azim, args.dist)
+        visible, depth, normal = render_view(
+            vtx_pos_n, faces, w2c, proj, args.himg, args.himg)
+        cos_img = normal[..., 2].copy()
+        cos_img[cos_img < cos_thres] = 0.0
+        cos_img[visible <= 0] = 0.0
+        # Per-view synthetic image: shift the RGB gradient so each view dumps
+        # different colors (bake test would be trivial if all views had the
+        # same image at the same world location).
+        rng = np.random.default_rng(image_seed)
+        tint = rng.uniform(0.2, 0.8, size=3).astype(np.float32)
+        yy, xx = np.meshgrid(np.arange(args.himg), np.arange(args.himg),
+                             indexing="ij")
+        image = np.stack([
+            (xx / args.himg).astype(np.float32) * tint[0],
+            (yy / args.himg).astype(np.float32) * tint[1],
+            (1.0 - (xx + yy).astype(np.float32) / (2 * args.himg)) * tint[2],
+        ], -1)
+        image *= visible[..., None]
+        ref_tex, ref_cos = back_project_numpy(
+            tex_pos, tex_cov, image, depth, visible, cos_img,
+            w2c, proj00, proj11, depth_thres=3e-3)
+        return w2c, image, depth, visible, cos_img, ref_tex, ref_cos
+
+    if args.multiview:
+        elevs = [0.0, 0.0, 0.0, 0.0]
+        azims = [0.0, 90.0, 180.0, 270.0]
+        per_view = []
+        for vi, (e, a) in enumerate(zip(elevs, azims)):
+            print(f"view {vi}: elev={e} azim={a}", file=sys.stderr)
+            w2c, image, depth, visible, cos_img, ref_tex, ref_cos = \
+                render_and_back_project(e, a, image_seed=1000 + vi)
+            print(f"  visible={int(visible.sum())} written={int((ref_cos>0).sum())}",
+                  file=sys.stderr)
+            per_view.append((w2c, image, depth, visible, cos_img, ref_tex, ref_cos))
+
+        # MeshRender.bake_texture / fast_bake_texture: weighted blend with
+        # weight = cos^exp. Default weights[i] = 1.0, exp=6.
+        Htex = args.htex; Wtex = args.htex
+        tex_merge = np.zeros((Htex, Wtex, 3), dtype=np.float32)
+        trust = np.zeros((Htex, Wtex), dtype=np.float32)
+        for vi, (_, _, _, _, _, ref_tex, ref_cos) in enumerate(per_view):
+            w_view = ref_cos ** args.bake_exp
+            # The ref_cos>0 skip optimization in fast_bake_texture: skip if
+            # >99% of view's painted texels are already painted. Reproducing
+            # exactly so C-side can match.
+            view_sum = (ref_cos > 0).sum()
+            painted_sum = ((ref_cos > 0) & (trust > 0)).sum()
+            if view_sum > 0 and painted_sum / view_sum > 0.99:
+                print(f"  view {vi}: skipped (already 99% painted)",
+                      file=sys.stderr)
+                continue
+            tex_merge += ref_tex * w_view[..., None]
+            trust += w_view
+        bake_tex = tex_merge / np.clip(trust, 1e-8, None)[..., None]
+        bake_trust_mask = (trust > 1e-8).astype(np.float32)
+        print(f"baked texels (trust>1e-8): {int(bake_trust_mask.sum())}",
+              file=sys.stderr)
+
+        np.save(os.path.join(args.outdir, "tex_pos.npy"), tex_pos)
+        np.save(os.path.join(args.outdir, "tex_cov.npy"), tex_cov)
+        for vi, (w2c, image, depth, visible, cos_img, ref_tex, ref_cos) in enumerate(per_view):
+            np.save(os.path.join(args.outdir, f"view_{vi}_image.npy"), image)
+            np.save(os.path.join(args.outdir, f"view_{vi}_depth.npy"), depth)
+            np.save(os.path.join(args.outdir, f"view_{vi}_visible.npy"), visible)
+            np.save(os.path.join(args.outdir, f"view_{vi}_cos.npy"), cos_img)
+            np.save(os.path.join(args.outdir, f"view_{vi}_w2c.npy"), w2c.T.reshape(-1))
+            np.save(os.path.join(args.outdir, f"view_{vi}_ref_tex.npy"), ref_tex)
+            np.save(os.path.join(args.outdir, f"view_{vi}_ref_cos.npy"), ref_cos)
+        np.save(os.path.join(args.outdir, "proj.npy"),
+                np.array([proj00, proj11], dtype=np.float32))
+        np.save(os.path.join(args.outdir, "bake_tex.npy"), bake_tex)
+        np.save(os.path.join(args.outdir, "bake_trust.npy"), bake_trust_mask)
+        with open(os.path.join(args.outdir, "meta.json"), "w") as f:
+            json.dump({
+                "Htex": Htex, "Wtex": Wtex,
+                "Himg": args.himg, "Wimg": args.himg,
+                "C": 3, "depth_thres": 3e-3,
+                "n_views": len(per_view), "elevs": elevs, "azims": azims,
+                "dist": args.dist, "ortho": args.ortho,
+                "bake_exp": args.bake_exp,
+            }, f, indent=2)
+        print(f"wrote {args.outdir} (multi-view)", file=sys.stderr)
+    else:
+        print(f"render view elev={args.elev} azim={args.azim} dist={args.dist}",
+              file=sys.stderr)
+        w2c, image, depth, visible, cos_img, ref_tex, ref_cos = \
+            render_and_back_project(args.elev, args.azim, image_seed=999)
+        print(f"  written texels: {int((ref_cos > 0).sum())}", file=sys.stderr)
+        np.save(os.path.join(args.outdir, "tex_pos.npy"), tex_pos)
+        np.save(os.path.join(args.outdir, "tex_cov.npy"), tex_cov)
+        np.save(os.path.join(args.outdir, "image.npy"),   image)
+        np.save(os.path.join(args.outdir, "depth.npy"),   depth)
+        np.save(os.path.join(args.outdir, "visible.npy"), visible)
+        np.save(os.path.join(args.outdir, "cos.npy"),     cos_img)
+        np.save(os.path.join(args.outdir, "w2c.npy"),     w2c.T.reshape(-1))
+        np.save(os.path.join(args.outdir, "proj.npy"),
+                np.array([proj00, proj11], dtype=np.float32))
+        np.save(os.path.join(args.outdir, "ref_tex.npy"), ref_tex)
+        np.save(os.path.join(args.outdir, "ref_cos.npy"), ref_cos)
+        with open(os.path.join(args.outdir, "meta.json"), "w") as f:
+            json.dump({
+                "Htex": args.htex, "Wtex": args.htex,
+                "Himg": args.himg, "Wimg": args.himg,
+                "C": 3, "depth_thres": 3e-3,
+                "elev": args.elev, "azim": args.azim, "dist": args.dist,
+                "ortho": args.ortho,
+            }, f, indent=2)
+        print(f"wrote {args.outdir}", file=sys.stderr)
 
 
 if __name__ == "__main__":
