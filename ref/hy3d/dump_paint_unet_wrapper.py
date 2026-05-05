@@ -62,6 +62,7 @@ _mod = _ilu.module_from_spec(_spec)
 sys.modules["hpb_stub.unet.modules"] = _mod
 _spec.loader.exec_module(_mod)
 UNet2p5DConditionModel = _mod.UNet2p5DConditionModel
+calc_multires_voxel_idxs = _mod.calc_multires_voxel_idxs
 
 
 def main():
@@ -74,6 +75,10 @@ def main():
     # by SelfAttnProcessor2_0 at init (it requires 5D input). Per-path
     # validation in Phase 4.2-4.5 uses dedicated module-level dumpers.
     ap.add_argument("--paths", default="all")
+    ap.add_argument("--rope", type=int, default=0, choices=[0, 1],
+                    help="If 1, enable PoseRoPE on the MA path; dumps "
+                         "in_position_maps.npy + voxel_indices_<Np>.npy and "
+                         "writes out_<combo>_rope.npy.")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -85,8 +90,7 @@ def main():
     device = next(model.parameters()).device
     print(f"device={device}", file=sys.stderr)
 
-    # PoseRoPE off for this dump (separate variant covers it).
-    model.use_position_rope = False
+    model.use_position_rope = bool(args.rope)
 
     torch.manual_seed(args.seed)
     B, N_pbr, N_gen, N_ref = 1, 2, 2, 1
@@ -116,6 +120,19 @@ def main():
     save("ref_latents", ref_latents)
     save("dino_hidden_states", dino_hidden_states)
     save("timestep", timestep, dtype=np.int64)
+
+    position_maps = None
+    if args.rope:
+        position_maps = torch.rand(B, N_gen, 3, H, W, device=device)
+        save("position_maps", position_maps)
+        v = calc_multires_voxel_idxs(
+            position_maps,
+            grid_resolutions=[H, H // 2, H // 4, H // 8],
+            voxel_resolutions=[H * 8, H * 4, H * 2, H])
+        for L_key, info in v.items():
+            np.save(os.path.join(args.outdir, f"voxel_indices_{L_key}.npy"),
+                    info["voxel_indices"].detach().cpu().numpy().astype(np.int64))
+            print(f"  voxel L={L_key} res={info['voxel_resolution']}", file=sys.stderr)
 
     print(f"shapes: sample={tuple(sample.shape)} text={tuple(encoder_hidden_states.shape)} "
           f"ref={tuple(ref_latents.shape)} dino={tuple(dino_hidden_states.shape)}",
@@ -162,6 +179,8 @@ def main():
             kwargs["ref_latents"] = ref_latents
         if flags["use_dino"]:
             kwargs["dino_hidden_states"] = dino_hidden_states
+        if args.rope and position_maps is not None:
+            kwargs["position_maps"] = position_maps
 
         with torch.no_grad():
             out = model(sample, timestep, encoder_hidden_states, **kwargs)
@@ -169,7 +188,8 @@ def main():
             out = out[0]
         if hasattr(out, "sample"):
             out = out.sample
-        path = os.path.join(args.outdir, f"out_{combo_name}.npy")
+        out_name = f"{combo_name}_rope" if args.rope else combo_name
+        path = os.path.join(args.outdir, f"out_{out_name}.npy")
         np.save(path, out.detach().cpu().numpy().astype(np.float32))
         print(f"  {combo_name:6s} -> {tuple(out.shape)}  range=[{out.min():+.3f},{out.max():+.3f}]",
               file=sys.stderr)
