@@ -317,10 +317,12 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
             return;
         }
     }
-    /* hipBLASLt may run on a private stream; sync to ensure following kernels
-     * (which use the default stream) observe the writes. */
-    SYNC();
+    /* No SYNC: bridge submits to caller-supplied stream (NULL == default),
+     * matching pack_bf16's default-stream launch above. Stream-ordered writes
+     * are visible to subsequent default-stream kernels. (Verified: extrema
+     * variance from hipBLASLt algo non-determinism, not stream race.) */
 }
+
 static void kgather(K *k, void *hf, void *xf, void *hc, void *xc,
                     void *idx, void *si, int Nf, int Co, int Ci8) {
     int mx = Co > Ci8 ? Co : Ci8; int gy = (mx+255)/256;
