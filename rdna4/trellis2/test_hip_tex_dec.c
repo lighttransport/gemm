@@ -107,7 +107,7 @@ static int64_t *read_npy_i64(const char *p, int *nd, int *dd) {
     fclose(f); free(h); return d;
 }
 
-typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, gather27, ln, silu, gelu, add, lin, gather, resrep, pack_bf16; } K;
+typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, gather27, gather27_v2, ln, silu, gelu, add, lin, gather, resrep, pack_bf16; } K;
 
 static void hash_build(K *k, void *keys, void *vals, int cap_mask, void *coords, int N) {
     void *a[] = {&keys, &vals, &cap_mask, &coords, &N};
@@ -133,6 +133,10 @@ static void *get_bf16_weight(const float *host_w_f32, size_t n_elems);
 static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap,
                                 const float *host_w, void *bias_f32,
                                 int N, int inC, int outC);
+static int g_prof_cn = -1;
+static double g_prof_ms[8] = {0};
+static long long g_prof_n[8] = {0};
+static hipEvent_t g_prof_sp[3] = {0};
 
 /* host_w may be NULL (some call sites don't have host pointer). When non-NULL and
  * blaslt is enabled, gather-then-GEMM is preferred over the WMMA tiled paths. */
@@ -218,10 +222,25 @@ static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap
         int M = (N - m0 < M_CHUNK) ? (N - m0) : M_CHUNK;
         void *act = g_d_act_bf16;
         void *args[] = {&act, &feats_f32, &nmap, &m0, &M, &inC};
-        hipModuleLaunchKernel(k->gather27, M, 27, 1, 256, 1, 1, 0, 0, args, NULL);
+        if (g_prof_cn) hipEventRecord(g_prof_sp[0], 0);
+        if (k->gather27_v2 && (inC % 2 == 0)) {
+            int MB = 4;
+            int gx = (M + MB - 1) / MB;
+            hipModuleLaunchKernel(k->gather27_v2, gx, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        } else {
+            hipModuleLaunchKernel(k->gather27, M, 27, 1, 256, 1, 1, 0, 0, args, NULL);
+        }
+        if (g_prof_cn) hipEventRecord(g_prof_sp[1], 0);
         float *out_chunk = (float *)out_f32 + (size_t)m0 * outC;
         mm_blaslt_run_bf16_bias(out_chunk, d_w_bf16, act, bias_f32,
                                  M, outC, K_total, 0);
+        if (g_prof_cn) {
+            hipEventRecord(g_prof_sp[2], 0);
+            hipEventSynchronize(g_prof_sp[2]);
+            float ms=0;
+            hipEventElapsedTime(&ms, g_prof_sp[0], g_prof_sp[1]); g_prof_ms[6]+=ms; g_prof_n[6]++;
+            hipEventElapsedTime(&ms, g_prof_sp[1], g_prof_sp[2]); g_prof_ms[7]+=ms; g_prof_n[7]++;
+        }
     }
 }
 
@@ -334,6 +353,29 @@ static void kresrep(K *k, void *h, void *x, int N, int Co, int Ci8) {
     hipModuleLaunchKernel(k->resrep, N, 1, 1, 256, 1, 1, 0, 0, a, NULL);
 }
 
+/* Per-op profiling for ConvNeXt block (env T2_PROF_CN=1).
+ * Accumulates per-op ms across all blocks of all stages, prints at end. */
+static const char *g_prof_name[8] = {"spconv","ln","klin_up","silu","klin_dn","add","sp_gather","sp_gemm"};
+static hipEvent_t g_prof_ev[7] = {0};
+static void prof_init(void) {
+    if (g_prof_cn != -1) return;
+    g_prof_cn = (getenv("T2_PROF_CN") && atoi(getenv("T2_PROF_CN"))) ? 1 : 0;
+    if (g_prof_cn) {
+        for (int i=0;i<7;i++) hipEventCreate(&g_prof_ev[i]);
+        for (int i=0;i<3;i++) hipEventCreate(&g_prof_sp[i]);
+    }
+}
+static void prof_dump(void) {
+    if (!g_prof_cn) return;
+    fprintf(stderr, "[CN-PROF] per-op totals across all blocks:\n");
+    double tot = 0; for (int i=0;i<6;i++) tot += g_prof_ms[i];
+    for (int i=0;i<8;i++) {
+        fprintf(stderr, "  %-8s  %7.2f ms  (%4.1f%%)  %lld calls\n",
+                g_prof_name[i], g_prof_ms[i], 100.0*g_prof_ms[i]/tot, g_prof_n[i]);
+    }
+    fprintf(stderr, "  TOTAL    %7.2f ms\n", tot);
+}
+
 static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *d_feats, void *d_coords, void *d_keys, void *d_vals, int cap_mask,
     void *d_tmp, void *d_mlp, void *d_nmap) {
@@ -345,13 +387,28 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *dm0b= get_f32_dev(blk->mlp0_b, (size_t)4*C*sizeof(float));
     void *dm2 = get_f32_dev(blk->mlp2_w, (size_t)C*4*C*sizeof(float));
     void *dm2b= get_f32_dev(blk->mlp2_b, (size_t)C*sizeof(float));
+    prof_init();
+    if (g_prof_cn) hipEventRecord(g_prof_ev[0], 0);
     kspconv_nmap_h(k, d_tmp, d_feats, d_nmap, blk->conv_w, dwc, dwb, d_coords, d_keys, d_vals, cap_mask, N, C, C);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[1], 0);
     kln(k, d_tmp, d_tmp, dnw, dnb, N, C, 1, 1);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[2], 0);
     klin_bl(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[3], 0);
     /* SparseConvNeXtBlock3d uses nn.SiLU (sparse_unet_vae.py:280), not GELU. */
     ksilu(k, d_mlp, d_mlp, N * 4 * C);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[4], 0);
     klin_bl(k, d_tmp, d_mlp, blk->mlp2_w, dm2, dm2b, N, 4*C, C);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[5], 0);
     kadd(k, d_feats, d_tmp, N * C);
+    if (g_prof_cn) {
+        hipEventRecord(g_prof_ev[6], 0);
+        hipEventSynchronize(g_prof_ev[6]);
+        for (int i=0;i<6;i++) {
+            float ms=0; hipEventElapsedTime(&ms, g_prof_ev[i], g_prof_ev[i+1]);
+            g_prof_ms[i] += ms; g_prof_n[i]++;
+        }
+    }
 }
 
 typedef struct { void *feats, *coords, *keys, *vals; int N, C, cap_mask; } DevSparse;
@@ -520,6 +577,7 @@ int main(int argc, char **argv) {
     hipModuleGetFunction(&k.conv_nmap_bf16_x4, mod, "sparse_conv3d_nmap_tiled_bf16_x4");
     hipModuleGetFunction(&k.conv_nmap_bf16_x8, mod, "sparse_conv3d_nmap_tiled_bf16_x8");
     hipModuleGetFunction(&k.gather27, mod, "t2_gather27_pack_bf16");
+    hipModuleGetFunction(&k.gather27_v2, mod, "t2_gather27_pack_bf16_v2");
     hipModuleGetFunction(&k.ln, mod, "t2_layernorm_f32");
     hipModuleGetFunction(&k.silu, mod, "t2_silu_f32");
     hipModuleGetFunction(&k.gelu, mod, "t2_gelu_f32");
@@ -696,7 +754,7 @@ done_stages:;
     hipEventRecord(e1, 0);
     hipEventSynchronize(e1);
     float t = 0; hipEventElapsedTime(&t, e0, e1);
-    fprintf(stderr, "HIP tex_dec: %.1f s, N=%d\n", t/1000.0f, cur_N);
+    fprintf(stderr, "HIP tex_dec: %.1f ms, N=%d\n", t, cur_N);
 
     int post_c2s_ch = (after_c2s && stop_stage >= 0 && stop_stage < dec->n_stages)
                       ? dec->c2s[stop_stage].C_out : 0;
@@ -757,5 +815,6 @@ done_stages:;
         free(ref);
     }
     free(h_out);
+    prof_dump();
     return 0;
 }
