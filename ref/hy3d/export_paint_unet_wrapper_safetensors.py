@@ -33,13 +33,37 @@ def main():
     print(f"loading {bin_path} ...", file=sys.stderr)
     ckpt = torch.load(bin_path, map_location="cpu", weights_only=True)
 
+    # Match the C runner key layout: strip `unet.` / `unet_dual.unet.`
+    # prefix, collapse `.transformer.` levels, drop irrelevant per-path
+    # weights inside unet_dual (it runs vanilla — no attn_refview/multiview/
+    # dino, no learned_text_clip_*, no `_mr` siblings, no MDA processor).
     state = {}
     n_skipped_dual = 0
+    DUAL_SKIP = ("attn_dino", "attn_multiview", "attn_refview",
+                 "image_proj_model_dino")
     for k, v in ckpt.items():
-        if args.skip_dual and k.startswith("unet_dual."):
-            n_skipped_dual += 1
+        if k.startswith("unet_dual."):
+            if args.skip_dual:
+                n_skipped_dual += 1
+                continue
+            kk = k[len("unet_dual."):]
+            if any(t in kk for t in DUAL_SKIP):
+                continue
+            if "attn1.processor." in kk:
+                continue
+            if kk.startswith("learned_text_clip"):
+                continue
+            kk = kk.replace(".transformer.", ".")
+            state["unet_dual." + kk] = v.contiguous().to(torch.float32)
             continue
-        state[k] = v.contiguous().to(torch.float32)
+        if not k.startswith("unet."):
+            # Wrapper-level: learned_text_clip_*, image_proj_model_dino, etc.
+            kk = k.replace(".transformer.", ".")
+            state[kk] = v.contiguous().to(torch.float32)
+            continue
+        kk = k[len("unet."):]
+        kk = kk.replace(".transformer.", ".")
+        state[kk] = v.contiguous().to(torch.float32)
 
     save_file(state, out)
     sz = os.path.getsize(out)
