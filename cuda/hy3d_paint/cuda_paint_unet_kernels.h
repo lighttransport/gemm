@@ -1,0 +1,80 @@
+/*
+ * cuda_paint_unet_kernels.h - F32 NVRTC kernels for SD-2.1 paint UNet
+ * (Hunyuan3D-2.1 hy3dpaint stock UNet2DConditionModel skeleton).
+ *
+ * Phase 3: stock attention only (no MDA / RA / MA / DINO custom processors).
+ * Self-contained header so the paint UNet runner needs no external kernel
+ * file beyond the common cuew/runner helpers.
+ */
+#ifndef CUDA_PAINT_UNET_KERNELS_H
+#define CUDA_PAINT_UNET_KERNELS_H
+
+static const char cuda_paint_unet_kernels_src[] =
+"extern \"C\" {\n"
+"\n"
+"/* Diffusers get_timestep_embedding: dim=320, flip_sin_to_cos=True,\n"
+" * downscale_freq_shift=0, max_period=10000. Output [B, dim].\n"
+" * One block per batch element, one thread per output channel. */\n"
+"__global__ void unet_timestep_embed_f32(float *__restrict__ out,\n"
+"    const long long *__restrict__ timesteps, int B, int dim) {\n"
+"    int b = blockIdx.x;\n"
+"    int c = threadIdx.x + blockIdx.y * blockDim.x;\n"
+"    if (b >= B || c >= dim) return;\n"
+"    int half = dim >> 1;\n"
+"    float t = (float)timesteps[b];\n"
+"    /* Output is [cos(ang_0..half-1), sin(ang_0..half-1)] (flip_sin_to_cos). */\n"
+"    int idx = c < half ? c : c - half;\n"
+"    float exponent = -logf(10000.f) * (float)idx / (float)half;\n"
+"    float ang = t * expf(exponent);\n"
+"    out[b * dim + c] = (c < half) ? cosf(ang) : sinf(ang);\n"
+"}\n"
+"\n"
+"/* y = x @ Wt + b. x:[M,K] W:[N,K] b:[N] y:[M,N]. One thread per (m,n). */\n"
+"__global__ void unet_linear_f32(float *__restrict__ y,\n"
+"    const float *__restrict__ x, const float *__restrict__ W,\n"
+"    const float *__restrict__ b, int M, int K, int N) {\n"
+"    int m = blockIdx.y * blockDim.y + threadIdx.y;\n"
+"    int n = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (m >= M || n >= N) return;\n"
+"    float s = b ? b[n] : 0.f;\n"
+"    for (int k = 0; k < K; k++) s += x[m*K + k] * W[n*K + k];\n"
+"    y[m*N + n] = s;\n"
+"}\n"
+"\n"
+"/* SiLU in-place. */\n"
+"__global__ void unet_silu_f32(float *x, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) { float v = x[i]; x[i] = v / (1.f + expf(-v)); }\n"
+"}\n"
+"\n"
+"/* Generic conv2d on CHW with same-padding (3x3 pad=1 typical). */\n"
+"__global__ void unet_conv2d_f32(float *__restrict__ out,\n"
+"    const float *__restrict__ inp, const float *__restrict__ weight,\n"
+"    const float *__restrict__ bias,\n"
+"    int ci, int h, int w, int co, int kh, int kw, int pad) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = co * h * w;\n"
+"    if (idx >= total) return;\n"
+"    int oc = idx / (h * w);\n"
+"    int rem = idx - oc * (h * w);\n"
+"    int oy = rem / w, ox = rem - oy * w;\n"
+"    float sum = bias ? bias[oc] : 0.f;\n"
+"    for (int ic = 0; ic < ci; ic++) {\n"
+"        for (int fy = 0; fy < kh; fy++) {\n"
+"            int iy = oy + fy - pad;\n"
+"            if (iy < 0 || iy >= h) continue;\n"
+"            for (int fx = 0; fx < kw; fx++) {\n"
+"                int ix = ox + fx - pad;\n"
+"                if (ix < 0 || ix >= w) continue;\n"
+"                sum += inp[(long)ic * h * w + iy * w + ix] *\n"
+"                       weight[(((long)oc * ci + ic) * kh + fy) * kw + fx];\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    out[idx] = sum;\n"
+"}\n"
+"\n"
+"} /* extern C */\n"
+;
+
+#endif /* CUDA_PAINT_UNET_KERNELS_H */
