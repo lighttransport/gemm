@@ -31,6 +31,9 @@ test_vertex_inpaint: test_vertex_inpaint.cc mesh_vertex_inpaint.h
 test_back_project: test_back_project.c cuda_paint_raster_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_back_project.c $(CUEW_SRC) $(CULDFLAGS)
 
+test_paint_back_project_e2e: test_paint_back_project_e2e.c cuda_paint_raster_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_paint_back_project_e2e.c $(CUEW_SRC) $(CULDFLAGS)
+
 test_swiglu: test_swiglu.c cuda_paint_nn_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_swiglu.c $(CUEW_SRC) $(CULDFLAGS)
 
