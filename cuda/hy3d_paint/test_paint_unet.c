@@ -147,6 +147,9 @@ typedef struct {
     CUfunction f_nc_chw;  /* unet_nc_to_chw_f32 */
     CUfunction f_mha;     /* unet_mha_f32 */
     CUfunction f_geglu;   /* unet_geglu_f32 */
+    CUfunction f_conv_s2; /* unet_conv2d_stride2_f32 */
+    CUfunction f_up2x;    /* unet_upsample2x_f32 */
+    CUfunction f_concat;  /* unet_concat_chan_f32 */
 } pu_kernels;
 
 static void k_timestep_embed(const pu_kernels *kk, CUdeviceptr out,
@@ -242,6 +245,31 @@ static void k_geglu(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr gh,
     void *args[] = { &out, &gh, &N, &H };
     int total = N * H;
     cuLaunchKernel(kk->f_geglu, (unsigned)((total + 255) / 256), 1, 1,
+                    256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_conv_stride2(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                            CUdeviceptr W, CUdeviceptr b,
+                            int ci, int h, int w, int co) {
+    void *args[] = { &out, &in, &W, &b, &ci, &h, &w, &co };
+    int total = co * (h / 2) * (w / 2);
+    cuLaunchKernel(kk->f_conv_s2, (unsigned)((total + 255) / 256), 1, 1,
+                    256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_upsample2x(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                          int C, int H, int W) {
+    void *args[] = { &out, &in, &C, &H, &W };
+    int total = C * (H * 2) * (W * 2);
+    cuLaunchKernel(kk->f_up2x, (unsigned)((total + 255) / 256), 1, 1,
+                    256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_concat_chan(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr a,
+                           CUdeviceptr b, int Ca, int Cb, int spatial) {
+    void *args[] = { &out, &a, &b, &Ca, &Cb, &spatial };
+    int total = (Ca + Cb) * spatial;
+    cuLaunchKernel(kk->f_concat, (unsigned)((total + 255) / 256), 1, 1,
                     256, 1, 1, 0, 0, args, NULL);
 }
 
@@ -541,6 +569,264 @@ static void run_transformer(const pu_kernels *kk, const pu_transformer *T,
     k_add(kk, d_x, d_x, S->d_resid, B * C * sp);
 }
 
+/* ===== Down/Mid/Up blocks =================================================
+ *
+ * SD-2.1 paint UNet topology (block_out=[320,640,1280,1280], layers/block=2):
+ *   conv_in 12->320                                            push 320@64
+ *   db0 CrossAttnDownBlock2D (320, heads=5):
+ *      res 320->320 + xfm                                      push 320@64
+ *      res 320->320 + xfm                                      push 320@64
+ *      down 320 stride2                                        push 320@32
+ *   db1 CrossAttnDownBlock2D (640, heads=10):
+ *      res 320->640 + xfm                                      push 640@32
+ *      res 640->640 + xfm                                      push 640@32
+ *      down 640 stride2                                        push 640@16
+ *   db2 CrossAttnDownBlock2D (1280, heads=20):
+ *      res 640->1280 + xfm                                     push 1280@16
+ *      res 1280->1280 + xfm                                    push 1280@16
+ *      down 1280 stride2                                       push 1280@8
+ *   db3 DownBlock2D (1280, no attn, no down):
+ *      res 1280->1280                                          push 1280@8
+ *      res 1280->1280                                          push 1280@8
+ *   mid: res 1280 + xfm 1280(20h) + res 1280
+ *   up0 UpBlock2D (out=1280, in=1280, prev=1280, +up):
+ *      pop[1280@8] cat -> res(2560->1280) (3x)  -> upsample 16
+ *   up1 CrossAttnUpBlock2D (out=1280, in=640, prev=1280, +up):
+ *      pop[1280@16] cat -> res(2560->1280) + xfm   x2
+ *      pop[640@16]  cat -> res(1920->1280) + xfm
+ *      upsample 32
+ *   up2 CrossAttnUpBlock2D (out=640, in=320, prev=1280, +up):
+ *      pop[640@32] cat -> res(1920->640) + xfm
+ *      pop[640@32] cat -> res(1280->640) + xfm
+ *      pop[320@32] cat -> res(960->640)  + xfm
+ *      upsample 64
+ *   up3 CrossAttnUpBlock2D (out=320, in=320, prev=640, no up):
+ *      pop[320@64] cat -> res(960->320) + xfm
+ *      pop[320@64] cat -> res(640->320) + xfm
+ *      pop[320@64] cat -> res(640->320) + xfm
+ *   conv_norm_out (32 grp, +silu) -> conv_out 320->4 (3x3, pad 1)
+ */
+
+typedef struct {
+    pu_resblock res[2];
+    pu_transformer xfm[2];
+    int has_xfm;
+    CUdeviceptr down_w, down_b;   /* 0 if no downsampler */
+    int c_in, c_out;
+    int num_heads;                /* unused if !has_xfm */
+} pu_down_block;
+
+typedef struct {
+    pu_resblock res[3];
+    pu_transformer xfm[3];
+    int has_xfm;
+    CUdeviceptr up_w, up_b;       /* 0 if no upsampler */
+    int c_out;
+    int num_heads;
+    /* Per-resnet input channel counts vary, computed at load time. */
+    int res_in[3];
+    /* Per-resnet skip channel counts (popped from down stack). */
+    int skip_ch[3];
+} pu_up_block;
+
+static void load_down_block(st_context *st, pu_down_block *db, int idx,
+                              int c_in, int c_out, int num_heads,
+                              int has_xfm, int has_down, int cross_dim) {
+    char buf[256];
+    db->c_in = c_in; db->c_out = c_out; db->has_xfm = has_xfm;
+    db->num_heads = num_heads;
+    snprintf(buf, sizeof(buf), "down_blocks.%d.resnets.0", idx);
+    load_resblock(st, &db->res[0], buf, c_in, c_out);
+    snprintf(buf, sizeof(buf), "down_blocks.%d.resnets.1", idx);
+    load_resblock(st, &db->res[1], buf, c_out, c_out);
+    if (has_xfm) {
+        snprintf(buf, sizeof(buf), "down_blocks.%d.attentions.0", idx);
+        load_transformer(st, &db->xfm[0], buf, c_out, num_heads, cross_dim, 1);
+        snprintf(buf, sizeof(buf), "down_blocks.%d.attentions.1", idx);
+        load_transformer(st, &db->xfm[1], buf, c_out, num_heads, cross_dim, 1);
+    }
+    if (has_down) {
+        snprintf(buf, sizeof(buf), "down_blocks.%d.downsamplers.0.conv.weight", idx);
+        db->down_w = upload_st(st, buf);
+        snprintf(buf, sizeof(buf), "down_blocks.%d.downsamplers.0.conv.bias", idx);
+        db->down_b = upload_st(st, buf);
+    } else { db->down_w = 0; db->down_b = 0; }
+}
+
+typedef struct {
+    pu_resblock mid_res0, mid_res1;
+    pu_transformer mid_xfm;
+} pu_mid_block;
+
+static void load_mid_block(st_context *st, pu_mid_block *m, int cross_dim) {
+    load_resblock(st, &m->mid_res0, "mid_block.resnets.0", 1280, 1280);
+    load_transformer(st, &m->mid_xfm, "mid_block.attentions.0",
+                      1280, /*heads*/ 20, cross_dim, 1);
+    load_resblock(st, &m->mid_res1, "mid_block.resnets.1", 1280, 1280);
+}
+
+static void load_up_block(st_context *st, pu_up_block *ub, int idx,
+                           int c_in, int c_out, int prev_out,
+                           int num_heads, int has_xfm, int has_up,
+                           int cross_dim) {
+    char buf[256];
+    ub->c_out = c_out; ub->has_xfm = has_xfm;
+    ub->num_heads = num_heads;
+    /* res_in_channels and skip_channels per diffusers CrossAttnUpBlock2D ctor */
+    for (int i = 0; i < 3; i++) {
+        ub->skip_ch[i] = (i == 2) ? c_in : c_out;
+        ub->res_in[i]  = (i == 0) ? prev_out : c_out;
+    }
+    for (int i = 0; i < 3; i++) {
+        int rin = ub->res_in[i] + ub->skip_ch[i];
+        snprintf(buf, sizeof(buf), "up_blocks.%d.resnets.%d", idx, i);
+        load_resblock(st, &ub->res[i], buf, rin, c_out);
+    }
+    if (has_xfm) {
+        for (int i = 0; i < 3; i++) {
+            snprintf(buf, sizeof(buf), "up_blocks.%d.attentions.%d", idx, i);
+            load_transformer(st, &ub->xfm[i], buf, c_out, num_heads, cross_dim, 1);
+        }
+    }
+    if (has_up) {
+        snprintf(buf, sizeof(buf), "up_blocks.%d.upsamplers.0.conv.weight", idx);
+        ub->up_w = upload_st(st, buf);
+        snprintf(buf, sizeof(buf), "up_blocks.%d.upsamplers.0.conv.bias", idx);
+        ub->up_b = upload_st(st, buf);
+    } else { ub->up_w = 0; ub->up_b = 0; }
+}
+
+/* ===== Skip stack ========================================================= */
+typedef struct {
+    CUdeviceptr buf;
+    int channels;
+    int H, W;
+} pu_skip;
+
+typedef struct {
+    pu_skip s[16];
+    int top;
+} pu_skip_stack;
+
+static void skip_push_copy(pu_skip_stack *ss, CUdeviceptr src, int C, int H, int W) {
+    size_t sz = (size_t)C * H * W * sizeof(float);
+    CUdeviceptr d; cuMemAlloc(&d, sz);
+    cuMemcpyDtoD(d, src, sz);
+    ss->s[ss->top++] = (pu_skip){ d, C, H, W };
+}
+static pu_skip skip_pop(pu_skip_stack *ss) {
+    return ss->s[--ss->top];
+}
+
+/* ===== Run helpers (B=1 only) ============================================= */
+
+typedef struct {
+    /* Activation ping-pong */
+    CUdeviceptr d_a, d_b;            /* big enough for max C*H*W in flow */
+    /* ResBlock scratch */
+    CUdeviceptr d_t1, d_t2;
+    CUdeviceptr d_temb_act;          /* [B*1280] */
+    CUdeviceptr d_temb_proj;         /* [B*1280] (oversized) */
+    /* Transformer scratch (sized for largest level: 320 ch @ 64x64). */
+    pu_xfm_scratch X;
+} pu_workspace;
+
+static void run_xfm_inplace(const pu_kernels *kk, const pu_transformer *T,
+                              CUdeviceptr d_x, CUdeviceptr d_text,
+                              int B, int H, int W, int M_text,
+                              const pu_xfm_scratch *S) {
+    run_transformer(kk, T, d_x, d_text, B, H, W, M_text, S);
+}
+
+/* d_in -> d_out via the down_block. push 2-3 skips. Returns new H/W in *pH/*pW. */
+static void run_down_block(const pu_kernels *kk, const pu_down_block *db,
+                             CUdeviceptr d_in, CUdeviceptr d_out,
+                             CUdeviceptr d_temb, CUdeviceptr d_text,
+                             int B, int *pH, int *pW, int M_text,
+                             pu_workspace *ws, pu_skip_stack *ss) {
+    int H = *pH, W = *pW;
+    int Cout = db->c_out;
+    /* res[0]: c_in -> c_out */
+    run_resblock(kk, &db->res[0], d_in, d_out,
+                  ws->d_t1, ws->d_t2, d_temb, ws->d_temb_act, ws->d_temb_proj,
+                  B, H, W, 32);
+    if (db->has_xfm) run_xfm_inplace(kk, &db->xfm[0], d_out, d_text, B, H, W, M_text, &ws->X);
+    skip_push_copy(ss, d_out, Cout, H, W);
+
+    /* res[1]: c_out -> c_out, in=d_out -> out=d_in (reuse) */
+    run_resblock(kk, &db->res[1], d_out, d_in,
+                  ws->d_t1, ws->d_t2, d_temb, ws->d_temb_act, ws->d_temb_proj,
+                  B, H, W, 32);
+    if (db->has_xfm) run_xfm_inplace(kk, &db->xfm[1], d_in, d_text, B, H, W, M_text, &ws->X);
+    skip_push_copy(ss, d_in, Cout, H, W);
+
+    /* downsampler if any: writes into d_out at H/2, W/2 */
+    if (db->down_w) {
+        k_conv_stride2(kk, d_out, d_in, db->down_w, db->down_b, Cout, H, W, Cout);
+        H >>= 1; W >>= 1;
+        skip_push_copy(ss, d_out, Cout, H, W);
+        /* Make d_in the "current" buffer for next block */
+        cuMemcpyDtoD(d_in, d_out, (size_t)Cout * H * W * sizeof(float));
+    }
+    /* After this fn, the "current" tensor lives in d_in. */
+    *pH = H; *pW = W;
+}
+
+static void run_mid_block(const pu_kernels *kk, const pu_mid_block *m,
+                            CUdeviceptr d_x, CUdeviceptr d_tmp,
+                            CUdeviceptr d_temb, CUdeviceptr d_text,
+                            int B, int H, int W, int M_text,
+                            pu_workspace *ws) {
+    /* res0 in d_x -> d_tmp */
+    run_resblock(kk, &m->mid_res0, d_x, d_tmp,
+                  ws->d_t1, ws->d_t2, d_temb, ws->d_temb_act, ws->d_temb_proj,
+                  B, H, W, 32);
+    /* xfm in d_tmp (in-place) */
+    run_xfm_inplace(kk, &m->mid_xfm, d_tmp, d_text, B, H, W, M_text, &ws->X);
+    /* res1 d_tmp -> d_x */
+    run_resblock(kk, &m->mid_res1, d_tmp, d_x,
+                  ws->d_t1, ws->d_t2, d_temb, ws->d_temb_act, ws->d_temb_proj,
+                  B, H, W, 32);
+}
+
+/* d_in/d_out alternate. Activation enters in d_in (Cin@H,W), exits in d_in
+ * after upsample (or d_in after last resnet if no upsample). */
+static void run_up_block(const pu_kernels *kk, const pu_up_block *ub,
+                           CUdeviceptr d_in, CUdeviceptr d_out,
+                           CUdeviceptr d_concat,
+                           CUdeviceptr d_temb, CUdeviceptr d_text,
+                           int B, int *pH, int *pW, int M_text,
+                           pu_workspace *ws, pu_skip_stack *ss) {
+    int H = *pH, W = *pW;
+    int Cout = ub->c_out;
+    int sp = H * W;
+    for (int i = 0; i < 3; i++) {
+        /* current tensor in d_in [res_in, H, W]; pop skip [skip_ch, H, W] */
+        pu_skip sk = skip_pop(ss);
+        /* concat: [res_in + skip_ch, H, W] -> d_concat */
+        k_concat_chan(kk, d_concat, d_in, sk.buf,
+                       ub->res_in[i], ub->skip_ch[i], sp);
+        cuMemFree(sk.buf);
+        /* resnet (res_in+skip_ch -> Cout): d_concat -> d_out */
+        run_resblock(kk, &ub->res[i], d_concat, d_out,
+                      ws->d_t1, ws->d_t2, d_temb, ws->d_temb_act, ws->d_temb_proj,
+                      B, H, W, 32);
+        /* xfm in d_out (in-place) */
+        if (ub->has_xfm)
+            run_xfm_inplace(kk, &ub->xfm[i], d_out, d_text, B, H, W, M_text, &ws->X);
+        /* swap: next iter's "current" is in d_in */
+        cuMemcpyDtoD(d_in, d_out, (size_t)Cout * sp * sizeof(float));
+    }
+    /* upsample if any: nearest 2x then 3x3 conv. d_in -> d_out -> d_in */
+    if (ub->up_w) {
+        k_upsample2x(kk, d_out, d_in, Cout, H, W);
+        H <<= 1; W <<= 1; sp = H * W;
+        k_conv(kk, d_in, d_out, ub->up_w, ub->up_b,
+                Cout, H, W, Cout, 3, 3, 1);
+    }
+    *pH = H; *pW = W;
+}
+
 /* ===== main =============================================================== */
 
 int main(int argc, char **argv) {
@@ -551,7 +837,7 @@ int main(int argc, char **argv) {
     }
     if (argc - argi < 2) {
         fprintf(stderr,
-            "Usage: %s [--stage time_emb|conv_in] <unet.safetensors> <ref_dir>\n",
+            "Usage: %s [--stage time_emb|conv_in|db0_res0|db0_attn0|out] <unet.safetensors> <ref_dir>\n",
             argv[0]);
         return 1;
     }
@@ -580,6 +866,9 @@ int main(int argc, char **argv) {
     cuModuleGetFunction(&kk.f_nc_chw, kk.mod, "unet_nc_to_chw_f32");
     cuModuleGetFunction(&kk.f_mha,    kk.mod, "unet_mha_f32");
     cuModuleGetFunction(&kk.f_geglu,  kk.mod, "unet_geglu_f32");
+    cuModuleGetFunction(&kk.f_conv_s2, kk.mod, "unet_conv2d_stride2_f32");
+    cuModuleGetFunction(&kk.f_up2x,    kk.mod, "unet_upsample2x_f32");
+    cuModuleGetFunction(&kk.f_concat,  kk.mod, "unet_concat_chan_f32");
 
     st_context *st = safetensors_open(st_path);
     if (!st) { fprintf(stderr, "ERROR: cannot open %s\n", st_path); return 1; }
@@ -797,6 +1086,147 @@ int main(int argc, char **argv) {
         cuMemcpyDtoH(cu, d_res, hw_n * sizeof(float));
         snprintf(path, sizeof(path), "%s/ref_db0_attn0.npy", ref_dir);
         diff_against(cu, path, hw_n, 1e-3f);
+        free(cu); free(sample); free(text);
+    } else if (!strcmp(stage, "out")) {
+        /* Full UNet forward -> [B, 4, 64, 64] vs ref_out.npy */
+        snprintf(path, sizeof(path), "%s/ref_sample.npy", ref_dir);
+        float *sample = (float *)read_npy(path, &nd, shape, &n, dt);
+        if (!sample) return 1;
+        int IC = (int)shape[1], H0 = (int)shape[2], W0 = (int)shape[3];
+        if (IC != 12) { fprintf(stderr, "ERROR: IC!=12\n"); return 1; }
+        snprintf(path, sizeof(path), "%s/ref_encoder_hidden.npy", ref_dir);
+        float *text = (float *)read_npy(path, &nd, shape, &n, dt);
+        if (!text) return 1;
+        int M_text = (int)shape[1], cross_dim = (int)shape[2];
+        fprintf(stderr, "input [%d, %d, %d, %d]  text [%d, %d, %d]\n",
+                B, IC, H0, W0, B, M_text, cross_dim);
+        if (B != 1) { fprintf(stderr, "ERROR: out stage assumes B=1\n"); return 1; }
+
+        /* time embedding */
+        CUdeviceptr d_ts; cuMemAlloc(&d_ts, B * sizeof(int64_t));
+        cuMemcpyHtoD(d_ts, ts, B * sizeof(int64_t));
+        CUdeviceptr d_temb_in, d_temb_h1, d_temb;
+        cuMemAlloc(&d_temb_in, B * 320 * sizeof(float));
+        cuMemAlloc(&d_temb_h1, B * 1280 * sizeof(float));
+        cuMemAlloc(&d_temb,    B * 1280 * sizeof(float));
+        CUdeviceptr l1_w = upload_st(st, "time_embedding.linear_1.weight");
+        CUdeviceptr l1_b = upload_st(st, "time_embedding.linear_1.bias");
+        CUdeviceptr l2_w = upload_st(st, "time_embedding.linear_2.weight");
+        CUdeviceptr l2_b = upload_st(st, "time_embedding.linear_2.bias");
+        k_timestep_embed(&kk, d_temb_in, d_ts, B, 320);
+        k_linear(&kk, d_temb_h1, d_temb_in, l1_w, l1_b, B, 320, 1280);
+        k_silu(&kk, d_temb_h1, B * 1280);
+        k_linear(&kk, d_temb, d_temb_h1, l2_w, l2_b, B, 1280, 1280);
+
+        /* Activation buffers - pick max sizes for any tensor in the flow.
+         * Largest single tensor = 320@64 = 1.31M; concat output max = 640@64
+         * = 2.62M; res_in_concat max = 2560@8 = 164K; ff_gh max = 4096*2560
+         * = 10.5M. Round generously. */
+        size_t MAX_ACT  = (size_t)1280 * 64 * 64;          /* 5.24M */
+        /* MAX_CCAT covers worst-case concat C_in (up3 first iter: 960@64 = 3.93M)
+         * AND worst-case resnet scratch max(c_in,c_out)*HW (also up3.res0: 960@64). */
+        size_t MAX_CCAT = (size_t)960 * 64 * 64;           /* 3.93M */
+        size_t MAX_FF_GH = (size_t)320 * 64 * 64 * 2 * 4;  /* 10.5M */
+        size_t MAX_FF_H  = (size_t)320 * 64 * 64 * 4;      /* 5.24M */
+        size_t MAX_BNC   = (size_t)320 * 64 * 64;          /* 1.31M (token buffers, max channel*N) */
+        if ((size_t)1280 * 16 * 16 > MAX_BNC) MAX_BNC = (size_t)1280 * 16 * 16;
+        if ((size_t)640 * 32 * 32 > MAX_BNC)  MAX_BNC = (size_t)640 * 32 * 32;
+        size_t MAX_BMC = MAX_BNC;
+        if ((size_t)1280 * M_text > MAX_BMC) MAX_BMC = (size_t)1280 * M_text;
+
+        pu_workspace ws;
+        cuMemAlloc(&ws.d_a, MAX_ACT * sizeof(float));
+        cuMemAlloc(&ws.d_b, MAX_ACT * sizeof(float));
+        cuMemAlloc(&ws.d_t1, MAX_CCAT * sizeof(float));
+        cuMemAlloc(&ws.d_t2, MAX_CCAT * sizeof(float));
+        cuMemAlloc(&ws.d_temb_act,  B * 1280 * sizeof(float));
+        cuMemAlloc(&ws.d_temb_proj, B * 1280 * sizeof(float));
+        cuMemAlloc(&ws.X.d_resid, MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_nc,    MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_nc_b,  MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_norm,  MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_q,     MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_k,     MAX_BMC * sizeof(float));
+        cuMemAlloc(&ws.X.d_v,     MAX_BMC * sizeof(float));
+        cuMemAlloc(&ws.X.d_attn,  MAX_BNC * sizeof(float));
+        cuMemAlloc(&ws.X.d_ff_gh, MAX_FF_GH * sizeof(float));
+        cuMemAlloc(&ws.X.d_ff_h,  MAX_FF_H * sizeof(float));
+
+        /* d_concat is sized for the largest concat (up3 first iter: 640@64). */
+        CUdeviceptr d_concat;
+        cuMemAlloc(&d_concat, MAX_CCAT * sizeof(float));
+
+        /* conv_in 12->320 into d_a */
+        CUdeviceptr cw = upload_st(st, "conv_in.weight");
+        CUdeviceptr cb = upload_st(st, "conv_in.bias");
+        size_t in_n = (size_t)B * IC * H0 * W0;
+        CUdeviceptr d_in_raw; cuMemAlloc(&d_in_raw, in_n * sizeof(float));
+        cuMemcpyHtoD(d_in_raw, sample, in_n * sizeof(float));
+        k_conv(&kk, ws.d_a, d_in_raw, cw, cb, IC, H0, W0, 320, 3, 3, 1);
+        cuMemFree(d_in_raw);
+
+        /* text */
+        CUdeviceptr d_text; cuMemAlloc(&d_text, (size_t)B * M_text * cross_dim * sizeof(float));
+        cuMemcpyHtoD(d_text, text, (size_t)B * M_text * cross_dim * sizeof(float));
+
+        /* Skip stack: push initial (post conv_in) */
+        pu_skip_stack ss = {.top = 0};
+        skip_push_copy(&ss, ws.d_a, 320, H0, W0);
+
+        /* Load all blocks */
+        pu_down_block db[4];
+        load_down_block(st, &db[0], 0,  320,  320,  5, 1, 1, cross_dim);
+        load_down_block(st, &db[1], 1,  320,  640, 10, 1, 1, cross_dim);
+        load_down_block(st, &db[2], 2,  640, 1280, 20, 1, 1, cross_dim);
+        load_down_block(st, &db[3], 3, 1280, 1280, 20, 0, 0, cross_dim);
+        pu_mid_block mid;
+        load_mid_block(st, &mid, cross_dim);
+        pu_up_block ub[4];
+        /* up_blocks per diffusers: prev_out tracks the previous up's c_out (init=last block_out=1280). */
+        load_up_block(st, &ub[0], 0, /*in*/1280, /*out*/1280, /*prev*/1280,  0, 0, 1, cross_dim); /* UpBlock2D */
+        load_up_block(st, &ub[1], 1, /*in*/ 640, /*out*/1280, /*prev*/1280, 20, 1, 1, cross_dim);
+        load_up_block(st, &ub[2], 2, /*in*/ 320, /*out*/ 640, /*prev*/1280, 10, 1, 1, cross_dim);
+        load_up_block(st, &ub[3], 3, /*in*/ 320, /*out*/ 320, /*prev*/ 640,  5, 1, 0, cross_dim);
+
+        /* Down path. Current activation lives in ws.d_a. */
+        int H = H0, W = W0;
+        run_down_block(&kk, &db[0], ws.d_a, ws.d_b, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+        run_down_block(&kk, &db[1], ws.d_a, ws.d_b, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+        run_down_block(&kk, &db[2], ws.d_a, ws.d_b, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+        run_down_block(&kk, &db[3], ws.d_a, ws.d_b, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+        /* Sanity: H=W=8 here, top of stack = db3.r1[1280@8], 12 entries total */
+        if (ss.top != 12) {
+            fprintf(stderr, "ERROR: skip stack top=%d, expected 12\n", ss.top);
+            return 1;
+        }
+
+        /* Mid: in d_a, out also d_a (using d_b as scratch) */
+        run_mid_block(&kk, &mid, ws.d_a, ws.d_b, d_temb, d_text, B, H, W, M_text, &ws);
+
+        /* Up path */
+        run_up_block(&kk, &ub[0], ws.d_a, ws.d_b, d_concat, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+        run_up_block(&kk, &ub[1], ws.d_a, ws.d_b, d_concat, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+        run_up_block(&kk, &ub[2], ws.d_a, ws.d_b, d_concat, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+        run_up_block(&kk, &ub[3], ws.d_a, ws.d_b, d_concat, d_temb, d_text, B, &H, &W, M_text, &ws, &ss);
+
+        if (ss.top != 0) {
+            fprintf(stderr, "WARN: skip stack not drained, top=%d\n", ss.top);
+        }
+
+        /* conv_norm_out (32 grp, +silu) -> d_b ; conv_out 320->4 -> d_a */
+        CUdeviceptr ng = upload_st(st, "conv_norm_out.weight");
+        CUdeviceptr nb = upload_st(st, "conv_norm_out.bias");
+        CUdeviceptr ow = upload_st(st, "conv_out.weight");
+        CUdeviceptr ob = upload_st(st, "conv_out.bias");
+        k_groupnorm(&kk, ws.d_b, ws.d_a, ng, nb, 320, H * W, 32, 1);
+        k_conv(&kk, ws.d_a, ws.d_b, ow, ob, 320, H, W, 4, 3, 3, 1);
+        cuCtxSynchronize();
+
+        size_t out_n = (size_t)B * 4 * H * W;
+        float *cu = (float *)malloc(out_n * sizeof(float));
+        cuMemcpyDtoH(cu, ws.d_a, out_n * sizeof(float));
+        snprintf(path, sizeof(path), "%s/ref_out.npy", ref_dir);
+        diff_against(cu, path, out_n, 1e-2f);
         free(cu); free(sample); free(text);
     } else {
         fprintf(stderr, "unknown stage: %s\n", stage); return 1;
