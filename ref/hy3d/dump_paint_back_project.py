@@ -312,7 +312,16 @@ def main():
                          "bake_trust.npy + per-view view_<i>_*.npy.")
     ap.add_argument("--bake-exp", type=float, default=6.0,
                     help="cos exponent for bake blending (matches MeshRender)")
+    ap.add_argument("--inpaint", action="store_true",
+                    help="Run mesh-aware vertex inpaint on bake_tex/bake_trust "
+                         "(via upstream meshVerticeInpaint) and dump "
+                         "inpaint_tex.npy / inpaint_mask.npy + the mesh "
+                         "tensors (vtx_pos_n.npy, faces.npy, vtx_uv.npy, "
+                         "uv_idx.npy) needed by the C runner to chain inpaint "
+                         "and write OBJ+PNG. Implies --multiview.")
     args = ap.parse_args()
+    if args.inpaint:
+        args.multiview = True
     os.makedirs(args.outdir, exist_ok=True)
 
     print(f"icosphere subdivisions={args.subdiv}", file=sys.stderr)
@@ -425,6 +434,45 @@ def main():
                 np.array([proj00, proj11], dtype=np.float32))
         np.save(os.path.join(args.outdir, "bake_tex.npy"), bake_tex)
         np.save(os.path.join(args.outdir, "bake_trust.npy"), bake_trust_mask)
+
+        if args.inpaint:
+            # mesh_inpaint_processor isn't on PYTHONPATH by default; the .so
+            # ships in the upstream repo's hy3dpaint/DifferentiableRenderer/.
+            sys.path.insert(0, "/mnt/disk01/models/Hunyuan3D-2.1-repo/"
+                               "hy3dpaint/DifferentiableRenderer")
+            from mesh_inpaint_processor import meshVerticeInpaint
+            bake_mask_u8 = (bake_trust_mask * 255).astype(np.uint8)
+            print("vertex inpaint (smooth)...", file=sys.stderr)
+            inpaint_tex, inpaint_mask = meshVerticeInpaint(
+                bake_tex.astype(np.float32),
+                bake_mask_u8,
+                vtx_pos_n.astype(np.float32),
+                uvs_flip.astype(np.float32),
+                faces.astype(np.int32),
+                uv_idx.astype(np.int32),
+                "smooth")
+            new_pix = int(((inpaint_mask > 0) & (bake_mask_u8 == 0)).sum())
+            print(f"  inpaint filled {new_pix} additional texels",
+                  file=sys.stderr)
+            np.save(os.path.join(args.outdir, "inpaint_tex.npy"), inpaint_tex)
+            np.save(os.path.join(args.outdir, "inpaint_mask.npy"), inpaint_mask)
+            # Mesh tensors for the C runner: vtx_pos uses vtx_pos_n (the
+            # MeshRender-normalized full vertex set, V × 3); pos_idx = faces.
+            # vtx_uv uses uvs_flip (matches what was used to rasterize the
+            # atlas); uv_idx = xatlas's UV face indices. The C runner passes
+            # these straight to mesh_vertex_inpaint().
+            np.save(os.path.join(args.outdir, "vtx_pos_n.npy"),
+                    vtx_pos_n.astype(np.float32))
+            np.save(os.path.join(args.outdir, "faces.npy"),
+                    faces.astype(np.int32))
+            np.save(os.path.join(args.outdir, "vtx_uv.npy"),
+                    uvs_flip.astype(np.float32))
+            np.save(os.path.join(args.outdir, "uv_idx.npy"),
+                    uv_idx.astype(np.int32))
+            np.save(os.path.join(args.outdir, "vmap.npy"),
+                    vmap.astype(np.int32))
+            np.save(os.path.join(args.outdir, "uvs_orig.npy"),
+                    uvs.astype(np.float32))
         with open(os.path.join(args.outdir, "meta.json"), "w") as f:
             json.dump({
                 "Htex": Htex, "Wtex": Wtex,
@@ -433,6 +481,10 @@ def main():
                 "n_views": len(per_view), "elevs": elevs, "azims": azims,
                 "dist": args.dist, "ortho": args.ortho,
                 "bake_exp": args.bake_exp,
+                "inpaint": args.inpaint,
+                "n_verts": int(vtx_pos_n.shape[0]),
+                "n_faces": int(faces.shape[0]),
+                "n_uv_verts": int(uvs_flip.shape[0]),
             }, f, indent=2)
         print(f"wrote {args.outdir} (multi-view)", file=sys.stderr)
     else:
