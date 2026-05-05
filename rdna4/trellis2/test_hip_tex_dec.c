@@ -107,7 +107,7 @@ static int64_t *read_npy_i64(const char *p, int *nd, int *dd) {
     fclose(f); free(h); return d;
 }
 
-typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, ln, silu, gelu, add, lin, gather, resrep, pack_bf16; } K;
+typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, gather27, ln, silu, gelu, add, lin, gather, resrep, pack_bf16; } K;
 
 static void hash_build(K *k, void *keys, void *vals, int cap_mask, void *coords, int N) {
     void *a[] = {&keys, &vals, &cap_mask, &coords, &N};
@@ -126,9 +126,29 @@ static void kspconv(K *k, void *out, void *in, void *co, void *w, void *b,
  * Required for full checkpoint compatibility — weights trained against flex_gemm's
  * opaque neighbor enumeration. Fall back to tiled-hash path if nmap is NULL. */
 static int g_use_wmma_spconv = 1;
-static void kspconv_nmap(K *k, void *out, void *in, void *nmap, void *w, void *b,
-                         void *co, void *keys, void *vals, int cap_mask,
-                         int N, int inC, int outC) {
+static int g_use_blaslt_spconv = 1;
+static void *get_bf16_weight(const float *host_w_f32, size_t n_elems);
+
+/* Forward decl: gather-then-GEMM spconv via hipBLASLt. host_w is required (cache key). */
+static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap,
+                                const float *host_w, void *bias_f32,
+                                int N, int inC, int outC);
+
+/* host_w may be NULL (some call sites don't have host pointer). When non-NULL and
+ * blaslt is enabled, gather-then-GEMM is preferred over the WMMA tiled paths. */
+static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *host_w,
+                           void *w, void *b,
+                           void *co, void *keys, void *vals, int cap_mask,
+                           int N, int inC, int outC) {
+    /* Gate: gather-then-GEMM wins on stages with smaller in_C (smaller K).
+     * Stage 0 (in_C=1024 -> K=27648) hits a hipBLASLt plan-compile cliff and
+     * regresses ~80%. Empirically restrict to in_C <= 512 (Stages 1-3, plus
+     * Stage 0's C2S conv2). N>=512 keeps small-batch shapes on WMMA. */
+    if (nmap && g_use_blaslt_spconv && g_use_blaslt && host_w && k->gather27 &&
+        (inC % 16 == 0) && (outC % 16 == 0) && inC <= 512 && N >= 512) {
+        kspconv_nmap_blaslt(k, out, in, nmap, host_w, b, N, inC, outC);
+        return;
+    }
     if (nmap) {
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x8 &&
             (inC % 16 == 0) && (outC % 64 == 0) && (N >= 32)) {
@@ -168,6 +188,40 @@ static void kspconv_nmap(K *k, void *out, void *in, void *nmap, void *w, void *b
         kspconv(k, out, in, co, w, b, keys, vals, cap_mask, N, inC, outC);
     }
 }
+
+/* Backward-compat shim: callers without a host weight pointer fall through
+ * to WMMA/F32 paths. */
+static void kspconv_nmap(K *k, void *out, void *in, void *nmap, void *w, void *b,
+                         void *co, void *keys, void *vals, int cap_mask,
+                         int N, int inC, int outC) {
+    kspconv_nmap_h(k, out, in, nmap, NULL, w, b, co, keys, vals, cap_mask, N, inC, outC);
+}
+
+/* Gather-then-GEMM via hipBLASLt. Mirrors flex_gemm's approach.
+ * Pack acts [M, 27, in_C] BF16 in chunks; weight [out_C, 27*in_C] cached BF16.
+ * Y = act × W^T + bias (one big GEMM, K=27*in_C). */
+static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap,
+                                const float *host_w, void *bias_f32,
+                                int N, int inC, int outC) {
+    void *d_w_bf16 = get_bf16_weight(host_w, (size_t)outC * 27 * inC);
+    if (!d_w_bf16) return;
+    int K_total = 27 * inC;
+    /* Chunk M to fit BF16 act scratch (g_act_bf16_floats elems * 2 B).
+     * Also cap at 16384 to stay under gfx1201 hipBLASLt's tested range. */
+    long long max_chunk = (long long)g_act_bf16_floats / K_total;
+    int M_CHUNK = (max_chunk > 16384) ? 16384 : (int)max_chunk;
+    if (M_CHUNK < 1) M_CHUNK = 1;
+    for (int m0 = 0; m0 < N; m0 += M_CHUNK) {
+        int M = (N - m0 < M_CHUNK) ? (N - m0) : M_CHUNK;
+        void *act = g_d_act_bf16;
+        void *args[] = {&act, &feats_f32, &nmap, &m0, &M, &inC};
+        hipModuleLaunchKernel(k->gather27, M, 27, 1, 256, 1, 1, 0, 0, args, NULL);
+        float *out_chunk = (float *)out_f32 + (size_t)m0 * outC;
+        mm_blaslt_run_bf16_bias(out_chunk, d_w_bf16, act, bias_f32,
+                                 M, outC, K_total, 0);
+    }
+}
+
 static void kln(K *k, void *o, void *i, void *w, void *b, int N, int C, int hw, int hb) {
     float eps = 1e-6f;
     void *a[] = {&o, &i, &w, &b, &C, &eps, &hw, &hb};
@@ -285,7 +339,7 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *dm0b= get_f32_dev(blk->mlp0_b, (size_t)4*C*sizeof(float));
     void *dm2 = get_f32_dev(blk->mlp2_w, (size_t)C*4*C*sizeof(float));
     void *dm2b= get_f32_dev(blk->mlp2_b, (size_t)C*sizeof(float));
-    kspconv_nmap(k, d_tmp, d_feats, d_nmap, dwc, dwb, d_coords, d_keys, d_vals, cap_mask, N, C, C);
+    kspconv_nmap_h(k, d_tmp, d_feats, d_nmap, blk->conv_w, dwc, dwb, d_coords, d_keys, d_vals, cap_mask, N, C, C);
     kln(k, d_tmp, d_tmp, dnw, dnb, N, C, 1, 1);
     klin_bl(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
     /* SparseConvNeXtBlock3d uses nn.SiLU (sparse_unet_vae.py:280), not GELU. */
@@ -330,7 +384,7 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     kln(k, dn, d_feats, dn1w, dn1b, Nc, Ci, 1, 1);
     ksilu(k, dn, dn, Nc*Ci);
     if (getenv("HIP_C2S_DUMP")) dump_dev_f32("/tmp/hip_c2s_pre_conv1.npy", dn, Nc, Ci);
-    kspconv_nmap(k, de, dn, d_nmap_coarse, dc1w, dc1b, d_coords, d_keys, d_vals, cap_mask, Nc, Ci, Cexp);
+    kspconv_nmap_h(k, de, dn, d_nmap_coarse, blk->conv1_w, dc1w, dc1b, d_coords, d_keys, d_vals, cap_mask, Nc, Ci, Cexp);
     if (getenv("HIP_C2S_DUMP")) dump_dev_f32("/tmp/hip_c2s_post_conv1.npy", de, Nc, Cexp);
     void *didx = hip_upload_raw(idx, (size_t)Nf*sizeof(int64_t));
     void *dsi  = hip_upload_raw(si,  (size_t)Nf*sizeof(int64_t));
@@ -353,7 +407,7 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     hipMemset(fk, 0, (size_t)cap*sizeof(uint64_t));
     hipMemset(fv, 0xff, (size_t)cap*sizeof(int32_t));
     hash_build(k, fk, fv, cm, dxc, Nf);
-    kspconv_nmap(k, dout, dhn, d_nmap_fine, dc2w, dc2b, dxc, fk, fv, cm, Nf, Co, Co);
+    kspconv_nmap_h(k, dout, dhn, d_nmap_fine, blk->conv2_w, dc2w, dc2b, dxc, fk, fv, cm, Nf, Co, Co);
     if (getenv("HIP_C2S_DUMP")) dump_dev_f32("/tmp/hip_c2s_post_conv2.npy", dout, Nf, Co);
     hipFree(dhn);
     kresrep(k, dout, dxf, Nf, Co, Ci8);
@@ -459,6 +513,7 @@ int main(int argc, char **argv) {
     hipModuleGetFunction(&k.conv_nmap_bf16_x2, mod, "sparse_conv3d_nmap_tiled_bf16_x2");
     hipModuleGetFunction(&k.conv_nmap_bf16_x4, mod, "sparse_conv3d_nmap_tiled_bf16_x4");
     hipModuleGetFunction(&k.conv_nmap_bf16_x8, mod, "sparse_conv3d_nmap_tiled_bf16_x8");
+    hipModuleGetFunction(&k.gather27, mod, "t2_gather27_pack_bf16");
     hipModuleGetFunction(&k.ln, mod, "t2_layernorm_f32");
     hipModuleGetFunction(&k.silu, mod, "t2_silu_f32");
     hipModuleGetFunction(&k.gelu, mod, "t2_gelu_f32");
