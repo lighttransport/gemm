@@ -60,6 +60,7 @@ cpu/sam3d_body/samples/*.obj.json
 # Build artifact binaries — CUDA runners
 cuda/llm/test_cuda_llm
 cuda/vlm/test_cuda_vlm
+cuda/da3/test_cuda_da3
 cuda/fp8/fp8_gemm
 cuda/sam3d/test_*
 !cuda/sam3d/test_*.c

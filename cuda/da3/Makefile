@@ -11,6 +11,7 @@ LDFLAGS = -ldl -lm -lpthread -lstdc++
 
 # Sources
 CUEW_SRC = ../cuew.c
+CUBLASEW_SRC = ../cublasew.c
 RUNNER_SRC = cuda_da3_runner.c
 TEST_SRC = test_cuda_da3.c
 TINYEXR_SRC = ../../common/tinyexr_impl.cc
@@ -25,12 +26,12 @@ all: $(TARGET)
 tinyexr_impl.o: $(TINYEXR_SRC) ../../common/tinyexr.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $(TINYEXR_SRC)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) tinyexr_impl.o cuda_da3_runner.h ../cuew.h \
-           ../cuda_kernels_common.h ../cuda_runner_common.h \
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) tinyexr_impl.o cuda_da3_runner.h ../cuew.h \
+           ../cublasew.h ../cuda_kernels_common.h ../cuda_runner_common.h \
            ../../common/gguf_loader.h ../../common/ggml_dequant.h ../../common/depth_anything3.h \
            ../../common/cpu_compute.h ../../common/safetensors.h \
            ../../common/tinyexr.h ../../common/exr_writer.h
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) tinyexr_impl.o $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) tinyexr_impl.o $(LDFLAGS)
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <da3.gguf> [-i input.ppm] [-o output.pgm|output.exr] [-d device_id]"

@@ -11,6 +11,7 @@ We implemented a PyTorch reference inference framework (`ref/da3/`) that loads t
 | Model | Backbone | Params | Outputs |
 |---|---|---|---|
 | DA3-Small | ViT-S (384d, 12 blocks) | 25M | Depth, Confidence |
+| DA3-Large-1.1 | ViT-L (1024d, 24 blocks) | ~300M | Depth, Confidence |
 | DA3-Giant | ViT-G (1536d, 40 blocks, SwiGLU) | 1.2B | Depth, Pose, Rays, Gaussians |
 | DA3Nested-Giant-Large-1.1 | ViT-G + ViT-L (1024d, 24 blocks) | 1.6B | All 7 modalities |
 
@@ -19,6 +20,47 @@ We implemented a PyTorch reference inference framework (`ref/da3/`) that loads t
 - Brooklyn Bridge (2100x1400) -- used for DA3-Small verification
 - Urban street scene (1200x738) -- used for Giant and Nested models
 - Room interior (1200x893) -- secondary Giant test
+
+---
+
+## Performance Status (2026-05-06)
+
+Default CUDA inference now prioritizes lower numeric drift over peak speed:
+
+- Backbone linear layers use FP16 tensor-core GEMM by default.
+- DPT Conv2d layers use FP16 tensor-core implicit-GEMM where shape-aligned.
+- Attention defaults to scalar tiled FlashAttention because the MMA attention path has small but measurable drift.
+- FP8 backbone GEMM remains opt-in only.
+
+### Accuracy-First Defaults
+
+Measured sequentially on RTX 5060 Ti, synthetic 518x518 gradient input, depth-only output, `--repeat 3`.
+
+| Model | PyTorch reference | CUDA default | Ratio vs PyTorch | CUDA phase split |
+|---|---:|---:|---:|---|
+| DA3-Small | 19.7 ms FP32 | 20.4 ms | 1.04x | backbone 14.2 ms, DPT 6.4 ms |
+| DA3-Large-1.1 | 145.1 ms FP32 | 130.8 ms | 0.90x | backbone 92.5 ms, DPT 37.5 ms |
+| DA3-Giant-1.1 | 210.9 ms BF16 | 325.0 ms | 1.54x | backbone 285.0 ms, DPT 38.4 ms |
+
+The Small default is intentionally slower than the earlier 18.2 ms speed mode because default attention now favors lower drift.
+
+### Speed Modes
+
+These are opt-in because they trade accuracy for speed.
+
+| Mode | How to enable | Small | Large-1.1 | Giant-1.1 | Drift notes |
+|---|---|---:|---:|---:|---|
+| MMA attention | `DA3_MMA_ATTN=1` | 18.2 ms | 117.8 ms | 291.6 ms | Giant depth vs default: MAE 3.24e-4, max AE 0.00223, Pearson 0.999976 |
+| Scaled FP8 backbone + MMA attention | `DA3_FP8_BACKBONE=1 DA3_MMA_ATTN=1` | disabled for Small shapes | 85.7 ms | 185.1 ms | Large drift: MAE 0.046, Pearson 0.970. Giant drift: MAE ~0.0088, Pearson ~0.978 |
+| Per-row-W FP8 experiment | `DA3_FP8_BACKBONE=1 DA3_FP8_W_PERROW=1 DA3_MMA_ATTN=1` | disabled for Small shapes | not kept | 170.8 ms | Giant drift was worse than per-tensor W scale: MAE 0.018, Pearson 0.897 |
+
+### Optimization TODOs
+
+1. Implement a lower-drift fast attention path before enabling MMA attention by default. The current MMA attention speedup is useful, but the default should stay scalar tiled until we compare against PyTorch layer dumps on Small, Large, and Giant.
+2. Improve FP8 backbone quantization before considering it as a default. Per-tensor W scaling is faster and more accurate than the raw FP8 path, but Large and Giant still show visible depth drift. Candidate work: per-channel calibration, selective FP16 fallback for sensitive layers, or BF16 activation storage.
+3. Profile Giant backbone GEMM after accuracy-first defaults. The remaining default gap is backbone-bound, with Giant spending about 285 ms in the backbone and only about 38 ms in DPT.
+4. Keep `DA3_FP8_BACKBONE=1` and `DA3_FP8_W_PERROW=1` documented as experimental speed modes only. Do not enable either by default until drift is validated against the PyTorch reference on real images, not only the synthetic gradient.
+5. Re-run full modality verification for Giant and Nested after any precision default change, especially pose/rays/gaussians where accumulated backbone drift may affect heads differently from depth.
 
 ---
 

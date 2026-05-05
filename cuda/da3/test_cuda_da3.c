@@ -182,7 +182,7 @@ static void print_stats(const char *name, const float *data, int n) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <da3.gguf|model.safetensors> [-i input.ppm] [-o output.pgm|output.exr]\n"
-                        "       [--npy path.npy] [--full] [--pose] [--rays] [--gaussians] [-d device_id] [-v verbosity]\n"
+                        "       [--npy path.npy] [--full] [--pose] [--rays] [--gaussians] [--repeat N] [-d device_id] [-v verbosity]\n"
                         "  .exr output: writes raw float channels (depth, confidence, rays, gaussians)\n"
                         "  .pgm output: writes normalized 16-bit depth only\n"
                         "  --npy:       writes raw float32 depth as NumPy .npy file\n",
@@ -199,6 +199,7 @@ int main(int argc, char **argv) {
     int device_id = 0;
     int verbose = 1;
     int output_flags = DA3_OUTPUT_DEPTH;
+    int repeat = 1;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_path = argv[++i];
@@ -208,6 +209,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
         else if (strcmp(argv[i], "--npy-dir") == 0 && i + 1 < argc) npy_dir = argv[++i];
         else if (strcmp(argv[i], "--resize") == 0 && i + 1 < argc) resize_mode = argv[++i];
+        else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (strcmp(argv[i], "--full") == 0) output_flags = DA3_OUTPUT_ALL;
         else if (strcmp(argv[i], "--pose") == 0) output_flags |= DA3_OUTPUT_POSE;
         else if (strcmp(argv[i], "--rays") == 0) output_flags |= DA3_OUTPUT_RAYS;
@@ -283,12 +285,19 @@ int main(int argc, char **argv) {
     }
 
     /* Run inference */
-    fprintf(stderr, "\n=== Running CUDA DA3 inference (flags=0x%02x) ===\n", output_flags);
-    double t0 = get_time_ms();
+    if (repeat < 1) repeat = 1;
+    fprintf(stderr, "\n=== Running CUDA DA3 inference (flags=0x%02x, repeat=%d) ===\n",
+            output_flags, repeat);
+    da3_full_result result = {0};
+    double elapsed = 0.0;
+    for (int ri = 0; ri < repeat; ri++) {
+        if (ri > 0) da3_full_result_free(&result);
+        double t0 = get_time_ms();
+        result = cuda_da3_predict_full(gpu, img, img_w, img_h, output_flags, NULL);
+        elapsed = get_time_ms() - t0;
+        fprintf(stderr, "Inference %d/%d: %.1f ms\n", ri + 1, repeat, elapsed);
+    }
 
-    da3_full_result result = cuda_da3_predict_full(gpu, img, img_w, img_h, output_flags, NULL);
-
-    double elapsed = get_time_ms() - t0;
     fprintf(stderr, "\nTotal inference time: %.1f ms\n", elapsed);
 
     /* Print statistics */
