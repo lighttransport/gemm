@@ -1,24 +1,17 @@
 /*
- * test_paint_vae.c - Native CUDA SD-2.1 paint VAE decoder.
+ * test_paint_vae.c - Native CUDA SD-2.1 paint VAE encoder + decoder.
  *
  * Phase 2 of the Hunyuan3D-2.1 texgen port. Loads weights from
  * paint_vae.safetensors (run ref/hy3d/export_vae_safetensors.py to convert
- * the upstream .bin), decodes a latent .npy, and writes the resulting RGB
- * back as a .npy for diffing against the diffusers reference produced by
- * ref/hy3d/dump_paint_vae.py.
+ * the upstream .bin), encodes an RGB image .npy → latent .npy or decodes a
+ * latent .npy → RGB .npy, for diffing against the diffusers reference
+ * produced by ref/hy3d/dump_paint_vae.py.
  *
  * Usage:
- *   ./test_paint_vae <vae.safetensors> <latent.npy> <out_recon.npy>
+ *   ./test_paint_vae decode <vae.safetensors> <latent.npy> <out_recon.npy>
+ *   ./test_paint_vae encode <vae.safetensors> <input.npy> <out_latent.npy>
  *
- * Reference flow:
- *   uv run --with torch --with diffusers --with safetensors --with pillow \
- *       ref/hy3d/dump_paint_vae.py --image fujisan.jpg
- *   ./test_paint_vae \
- *       /mnt/disk01/models/Hunyuan3D-2.1/hunyuan3d-paintpbr-v2-1/vae/paint_vae.safetensors \
- *       /tmp/hy3d_paint_vae_ref/ref_latent.npy \
- *       /tmp/hy3d_paint_vae_ref/cuda_recon.npy
- *
- * Architecture (stock diffusers AutoencoderKL):
+ * Decoder architecture (stock diffusers AutoencoderKL):
  *   post_quant_conv 1x1 (4->4)
  *   conv_in 3x3 (4->512)
  *   mid: ResBlock(512) → Attn(512) → ResBlock(512)
@@ -27,6 +20,16 @@
  *   up_blocks[2]: 3 ResBlocks(512->256), upsample(256)
  *   up_blocks[3]: 3 ResBlocks(256->128), no upsample
  *   conv_norm_out 32grp -> SiLU -> conv_out 3x3 (128->3)
+ *
+ * Encoder architecture (mirror):
+ *   conv_in 3x3 (3->128)
+ *   down_blocks[0]: 2 ResBlocks(128->128), down(128) (asymmetric pad+stride2)
+ *   down_blocks[1]: ResBlock(128->256)+shortcut, ResBlock(256->256), down(256)
+ *   down_blocks[2]: ResBlock(256->512)+shortcut, ResBlock(512->512), down(512)
+ *   down_blocks[3]: 2 ResBlocks(512->512), no downsample
+ *   mid: ResBlock(512) → Attn(512) → ResBlock(512)
+ *   conv_norm_out 32grp -> SiLU -> conv_out 3x3 (512->8)
+ *   quant_conv 1x1 (8->8); take first 4 channels as mean (deterministic z).
  */
 
 #include "../cuew.h"
@@ -142,6 +145,7 @@ typedef struct {
     CUmodule mod;
     CUfunction f_gn;       /* vae_groupnorm_f32 */
     CUfunction f_conv;     /* vae_conv2d_f32 */
+    CUfunction f_conv_down;/* vae_conv2d_down_f32 */
     CUfunction f_up2x;     /* vae_upsample2x_f32 */
     CUfunction f_add;      /* vae_add_f32 */
     CUfunction f_attn;     /* vae_attn_f32 */
@@ -168,6 +172,16 @@ static void k_conv(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
     int total = co * h * wd;
     unsigned grid = (unsigned)((total + 255) / 256);
     cuLaunchKernel(kk->f_conv, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_conv_down(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                          CUdeviceptr w, CUdeviceptr b,
+                          int ci, int h, int wd, int co) {
+    void *args[] = { &out, &in, &w, &b, &ci, &h, &wd, &co };
+    int oh = h >> 1, ow = wd >> 1;
+    int total = co * oh * ow;
+    unsigned grid = (unsigned)((total + 255) / 256);
+    cuLaunchKernel(kk->f_conv_down, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
 }
 
 static void k_up2x(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
@@ -391,6 +405,71 @@ static void load_decoder(st_context *st, pvae_decoder *d) {
     d->conv_out_b = upload_st(st, "decoder.conv_out.bias", NULL);
 }
 
+/* ===== Encoder weight container =========================================== */
+
+typedef struct {
+    CUdeviceptr conv_in_w, conv_in_b;
+    pvae_resblock down_res[4][2];
+    CUdeviceptr   down_conv_w[4], down_conv_b[4];
+    int           down_has_sampler[4];
+    pvae_resblock mid_r0, mid_r1;
+    pvae_attn_layer mid_attn;
+    CUdeviceptr conv_norm_out_g, conv_norm_out_b;
+    CUdeviceptr conv_out_w, conv_out_b;
+    CUdeviceptr qc_w, qc_b;   /* quant_conv 8->8, 1x1 */
+} pvae_encoder;
+
+static const int DOWN_CH_IN[4]  = { 128, 128, 256, 512 };
+static const int DOWN_CH_OUT[4] = { 128, 256, 512, 512 };
+
+static void load_encoder(st_context *st, pvae_encoder *e) {
+    e->conv_in_w = upload_st(st, "encoder.conv_in.weight", NULL);
+    e->conv_in_b = upload_st(st, "encoder.conv_in.bias", NULL);
+
+    for (int b = 0; b < 4; b++) {
+        for (int i = 0; i < 2; i++) {
+            char prefix[128];
+            snprintf(prefix, sizeof(prefix), "encoder.down_blocks.%d.resnets.%d", b, i);
+            int c_in  = (i == 0) ? DOWN_CH_IN[b] : DOWN_CH_OUT[b];
+            int c_out = DOWN_CH_OUT[b];
+            load_resblock(st, &e->down_res[b][i], prefix, c_in, c_out);
+        }
+        char buf[160];
+        snprintf(buf, sizeof(buf), "encoder.down_blocks.%d.downsamplers.0.conv.weight", b);
+        if (safetensors_find(st, buf) >= 0) {
+            e->down_has_sampler[b] = 1;
+            e->down_conv_w[b] = upload_st(st, buf, NULL);
+            snprintf(buf, sizeof(buf), "encoder.down_blocks.%d.downsamplers.0.conv.bias", b);
+            e->down_conv_b[b] = upload_st(st, buf, NULL);
+        } else {
+            e->down_has_sampler[b] = 0;
+            e->down_conv_w[b] = 0; e->down_conv_b[b] = 0;
+        }
+    }
+
+    load_resblock(st, &e->mid_r0, "encoder.mid_block.resnets.0", 512, 512);
+    load_resblock(st, &e->mid_r1, "encoder.mid_block.resnets.1", 512, 512);
+
+    e->mid_attn.dim = 512;
+    e->mid_attn.norm_g = upload_st(st, "encoder.mid_block.attentions.0.group_norm.weight", NULL);
+    e->mid_attn.norm_b = upload_st(st, "encoder.mid_block.attentions.0.group_norm.bias", NULL);
+    e->mid_attn.q_w = upload_st(st, "encoder.mid_block.attentions.0.query.weight", NULL);
+    e->mid_attn.q_b = upload_st(st, "encoder.mid_block.attentions.0.query.bias", NULL);
+    e->mid_attn.k_w = upload_st(st, "encoder.mid_block.attentions.0.key.weight", NULL);
+    e->mid_attn.k_b = upload_st(st, "encoder.mid_block.attentions.0.key.bias", NULL);
+    e->mid_attn.v_w = upload_st(st, "encoder.mid_block.attentions.0.value.weight", NULL);
+    e->mid_attn.v_b = upload_st(st, "encoder.mid_block.attentions.0.value.bias", NULL);
+    e->mid_attn.p_w = upload_st(st, "encoder.mid_block.attentions.0.proj_attn.weight", NULL);
+    e->mid_attn.p_b = upload_st(st, "encoder.mid_block.attentions.0.proj_attn.bias", NULL);
+
+    e->conv_norm_out_g = upload_st(st, "encoder.conv_norm_out.weight", NULL);
+    e->conv_norm_out_b = upload_st(st, "encoder.conv_norm_out.bias", NULL);
+    e->conv_out_w      = upload_st(st, "encoder.conv_out.weight", NULL);
+    e->conv_out_b      = upload_st(st, "encoder.conv_out.bias", NULL);
+    e->qc_w            = upload_st(st, "quant_conv.weight", NULL);
+    e->qc_b            = upload_st(st, "quant_conv.bias", NULL);
+}
+
 /* ===== Decode pipeline ==================================================== */
 
 static void decode(const pvae_kernels *kk, const pvae_decoder *D,
@@ -455,30 +534,104 @@ static void decode(const pvae_kernels *kk, const pvae_decoder *D,
             cur_C, cur_H, cur_W, 3, 3, 3, 1);
 }
 
+/* ===== Encode pipeline ====================================================
+ * Input  d_img : [3, H, W] in [-1, 1]
+ * Output d_lat : [4, H/8, W/8] (mean of posterior)
+ *
+ * Workspace buffers d_a/d_b/d_t1/d_t2 each sized for the worst-case stage. */
+static void encode(const pvae_kernels *kk, const pvae_encoder *E,
+                    CUdeviceptr d_img, int H, int W,
+                    CUdeviceptr d_lat,
+                    CUdeviceptr d_a, CUdeviceptr d_b,
+                    CUdeviceptr d_t1, CUdeviceptr d_t2,
+                    CUdeviceptr d_qnc, CUdeviceptr d_knc,
+                    CUdeviceptr d_vnc, CUdeviceptr d_ync) {
+    int NG = 32;
+    int cur_H = H, cur_W = W;
+    /* conv_in [3 -> 128, 3x3] */
+    k_conv(kk, d_a, d_img, E->conv_in_w, E->conv_in_b,
+            3, cur_H, cur_W, 128, 3, 3, 1);
+    int cur_C = 128;
+    /* down_blocks: ping-pong d_a (input) -> d_b (output). After loop d_a holds last output. */
+    CUdeviceptr d_in = d_a, d_outbuf = d_b;
+    for (int blk = 0; blk < 4; blk++) {
+        for (int i = 0; i < 2; i++) {
+            run_resblock(kk, &E->down_res[blk][i], d_in, d_outbuf,
+                          d_t1, d_t2, cur_H, cur_W, NG);
+            cur_C = DOWN_CH_OUT[blk];
+            CUdeviceptr tmp = d_in; d_in = d_outbuf; d_outbuf = tmp;
+        }
+        if (E->down_has_sampler[blk]) {
+            /* asymmetric pad+stride2 3x3 conv: cur_C ch, H/2, W/2, same out_C. */
+            k_conv_down(kk, d_outbuf, d_in, E->down_conv_w[blk],
+                         E->down_conv_b[blk], cur_C, cur_H, cur_W, cur_C);
+            cur_H >>= 1; cur_W >>= 1;
+            CUdeviceptr tmp = d_in; d_in = d_outbuf; d_outbuf = tmp;
+        }
+    }
+
+    /* mid: ResBlock(512) → Attn → ResBlock(512). d_in holds [512, H/8, W/8]. */
+    run_resblock(kk, &E->mid_r0, d_in, d_outbuf, d_t1, d_t2, cur_H, cur_W, NG);
+    run_attn(kk, &E->mid_attn,
+              /*in*/ d_outbuf, /*out*/ d_in,
+              /*h*/  d_t1, /*chw*/ d_t2,
+              d_qnc, d_knc, d_vnc, d_ync,
+              cur_H, cur_W, NG);
+    run_resblock(kk, &E->mid_r1, d_in, d_outbuf, d_t1, d_t2, cur_H, cur_W, NG);
+    /* d_outbuf holds [512, H/8, W/8]. */
+
+    /* conv_norm_out + silu, conv_out [512->8, 3x3], quant_conv [8->8, 1x1] */
+    k_groupnorm(kk, d_in, d_outbuf, E->conv_norm_out_g, E->conv_norm_out_b,
+                 512, cur_H * cur_W, NG, 1);
+    k_conv(kk, d_outbuf, d_in, E->conv_out_w, E->conv_out_b,
+            512, cur_H, cur_W, 8, 3, 3, 1);
+    k_conv(kk, d_in, d_outbuf, E->qc_w, E->qc_b,
+            8, cur_H, cur_W, 8, 1, 1, 0);
+    /* mean = first 4 channels. Copy [4, H/8, W/8] block out of d_in. */
+    cuMemcpyDtoD(d_lat, d_in, 4 * (size_t)cur_H * cur_W * sizeof(float));
+}
+
 /* ===== main =============================================================== */
 
 int main(int argc, char **argv) {
-    if (argc < 4) {
+    if (argc < 5 ||
+        (strcmp(argv[1], "encode") && strcmp(argv[1], "decode"))) {
         fprintf(stderr,
-            "Usage: %s <vae.safetensors> <latent.npy> <out_recon.npy>\n",
-            argv[0]);
+            "Usage: %s decode <vae.safetensors> <latent.npy> <out_recon.npy>\n"
+            "       %s encode <vae.safetensors> <input.npy>  <out_latent.npy>\n",
+            argv[0], argv[0]);
         return 1;
     }
-    const char *st_path  = argv[1];
-    const char *lat_path = argv[2];
-    const char *out_path = argv[3];
+    int do_encode = !strcmp(argv[1], "encode");
+    const char *st_path  = argv[2];
+    const char *in_path  = argv[3];
+    const char *out_path = argv[4];
 
     int nd; uint64_t shape[8]; size_t total;
-    float *lat = read_npy_f32(lat_path, &nd, shape, &total);
-    if (!lat) return 1;
-    if (nd != 3 || shape[0] != 4) {
-        fprintf(stderr, "ERROR: expected latent shape [4,H,W], got nd=%d\n", nd);
-        return 1;
+    float *in_buf = read_npy_f32(in_path, &nd, shape, &total);
+    if (!in_buf) return 1;
+
+    int IC, IH, IW;     /* input shape */
+    int OC, OH, OW;     /* output shape */
+    if (do_encode) {
+        if (nd != 3 || shape[0] != 3) {
+            fprintf(stderr, "ERROR: expected input shape [3,H,W], got nd=%d\n", nd);
+            return 1;
+        }
+        IC = (int)shape[0]; IH = (int)shape[1]; IW = (int)shape[2];
+        OC = 4; OH = IH / 8; OW = IW / 8;
+        fprintf(stderr, "input   [%d, %d, %d]   latent [%d, %d, %d]\n",
+                IC, IH, IW, OC, OH, OW);
+    } else {
+        if (nd != 3 || shape[0] != 4) {
+            fprintf(stderr, "ERROR: expected latent shape [4,H,W], got nd=%d\n", nd);
+            return 1;
+        }
+        IC = (int)shape[0]; IH = (int)shape[1]; IW = (int)shape[2];
+        OC = 3; OH = IH * 8; OW = IW * 8;
+        fprintf(stderr, "latent  [%d, %d, %d]   recon  [%d, %d, %d]\n",
+                IC, IH, IW, OC, OH, OW);
     }
-    int LC = (int)shape[0], LH = (int)shape[1], LW = (int)shape[2];
-    int OH = LH * 8, OW = LW * 8;
-    fprintf(stderr, "latent  [%d, %d, %d]   recon [3, %d, %d]\n",
-            LC, LH, LW, OH, OW);
 
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) {
         fprintf(stderr, "cuewInit failed\n"); return 1;
@@ -491,44 +644,62 @@ int main(int argc, char **argv) {
                                 cuda_paint_vae_kernels_src,
                                 "hy3d_paint_vae", 1, "HY3D-PAINT-VAE");
     if (sm < 0) return 1;
-    cuModuleGetFunction(&kk.f_gn,     kk.mod, "vae_groupnorm_f32");
-    cuModuleGetFunction(&kk.f_conv,   kk.mod, "vae_conv2d_f32");
-    cuModuleGetFunction(&kk.f_up2x,   kk.mod, "vae_upsample2x_f32");
-    cuModuleGetFunction(&kk.f_add,    kk.mod, "vae_add_f32");
-    cuModuleGetFunction(&kk.f_attn,   kk.mod, "vae_attn_f32");
-    cuModuleGetFunction(&kk.f_chw_nc, kk.mod, "vae_chw_to_nc_f32");
-    cuModuleGetFunction(&kk.f_nc_chw, kk.mod, "vae_nc_to_chw_f32");
+    cuModuleGetFunction(&kk.f_gn,        kk.mod, "vae_groupnorm_f32");
+    cuModuleGetFunction(&kk.f_conv,      kk.mod, "vae_conv2d_f32");
+    cuModuleGetFunction(&kk.f_conv_down, kk.mod, "vae_conv2d_down_f32");
+    cuModuleGetFunction(&kk.f_up2x,      kk.mod, "vae_upsample2x_f32");
+    cuModuleGetFunction(&kk.f_add,       kk.mod, "vae_add_f32");
+    cuModuleGetFunction(&kk.f_attn,      kk.mod, "vae_attn_f32");
+    cuModuleGetFunction(&kk.f_chw_nc,    kk.mod, "vae_chw_to_nc_f32");
+    cuModuleGetFunction(&kk.f_nc_chw,    kk.mod, "vae_nc_to_chw_f32");
 
     st_context *st = safetensors_open(st_path);
     if (!st) { fprintf(stderr, "ERROR: cannot open %s\n", st_path); return 1; }
     pvae_decoder D = {0};
-    load_decoder(st, &D);
-    fprintf(stderr, "loaded decoder weights from %s\n", st_path);
+    pvae_encoder E = {0};
+    if (do_encode) load_encoder(st, &E);
+    else           load_decoder(st, &D);
+    fprintf(stderr, "loaded %s weights from %s\n",
+            do_encode ? "encoder" : "decoder", st_path);
 
-    /* Allocate working buffers. Worst case [512, OH/2, OW/2] (after up_blocks[0]
-     * upsample). Actually after each up_block channels drop and spatial doubles;
-     * worst-case bytes = max over stages of c*spatial. Compute and use that. */
+    /* Worst-case workspace per buffer.
+     *   encoder stages (image-res H_full): 128@H, 256@H/2, 512@H/4, 512@H/8
+     *   decoder stages (image-res H_full = 8*LH):
+     *     512@LH, 512@2LH, 512@4LH, 256@4LH, 256@8LH, 128@8LH
+     *   So 256 * H_full² is the dominant decoder term. */
+    int H_full = do_encode ? IH : OH;
+    int W_full = do_encode ? IW : OW;
     size_t max_n = 0;
-    /* mid + up_blocks[0] before upsample: 512 * LH*LW = 512 * 64*64 = 2.0M */
-    max_n = 512 * (size_t)LH * LW;
-    /* up_blocks[0] after upsample: 512 * (2H)*(2W) */
-    if (512 * (size_t)(LH*2) * (LW*2) > max_n) max_n = 512 * (size_t)(LH*2) * (LW*2);
-    /* up_blocks[1] after upsample: 512 * 4H*4W */
-    if (512 * (size_t)(LH*4) * (LW*4) > max_n) max_n = 512 * (size_t)(LH*4) * (LW*4);
-    /* up_blocks[2] after upsample: 256 * 8H*8W */
-    if (256 * (size_t)(LH*8) * (LW*8) > max_n) max_n = 256 * (size_t)(LH*8) * (LW*8);
-    /* up_blocks[3] (no upsample): 128 * 8H*8W */
-    if (128 * (size_t)(LH*8) * (LW*8) > max_n) max_n = 128 * (size_t)(LH*8) * (LW*8);
+    if (do_encode) {
+        int CH[4] = { 128, 256, 512, 512 };
+        for (int k = 0; k < 4; k++) {
+            size_t n = (size_t)CH[k] * (H_full >> k) * (W_full >> k);
+            if (n > max_n) max_n = n;
+        }
+    } else {
+        /* decoder: enumerate the actual spatial/channel pairs */
+        int LH = H_full / 8, LW = W_full / 8;
+        size_t cands[] = {
+            (size_t)512 * LH * LW,
+            (size_t)512 * (LH*2) * (LW*2),
+            (size_t)512 * (LH*4) * (LW*4),
+            (size_t)256 * (LH*4) * (LW*4),
+            (size_t)256 * (LH*8) * (LW*8),
+            (size_t)128 * (LH*8) * (LW*8),
+        };
+        for (size_t i = 0; i < sizeof(cands)/sizeof(cands[0]); i++)
+            if (cands[i] > max_n) max_n = cands[i];
+    }
     fprintf(stderr, "workspace = %.1f MB / buffer\n",
             max_n * 4 / 1024.0 / 1024.0);
 
-    /* For attention scratch in NC layout: 512 * 4096 = 2M floats per Q/K/V/Y. */
-    size_t attn_n = 512 * (size_t)LH * LW;
+    /* Attention always at lowest resolution: 512 * (H_full/8)^2 floats. */
+    size_t attn_n = (size_t)512 * (H_full / 8) * (W_full / 8);
 
-    CUdeviceptr d_lat, d_rgb, d_a, d_b, d_t1, d_t2;
+    CUdeviceptr d_in_dev, d_out_dev, d_a, d_b, d_t1, d_t2;
     CUdeviceptr d_qnc, d_knc, d_vnc, d_ync;
-    cuMemAlloc(&d_lat, LC * (size_t)LH * LW * sizeof(float));
-    cuMemAlloc(&d_rgb, 3  * (size_t)OH * OW * sizeof(float));
+    cuMemAlloc(&d_in_dev,  IC * (size_t)IH * IW * sizeof(float));
+    cuMemAlloc(&d_out_dev, OC * (size_t)OH * OW * sizeof(float));
     cuMemAlloc(&d_a,   max_n * sizeof(float));
     cuMemAlloc(&d_b,   max_n * sizeof(float));
     cuMemAlloc(&d_t1,  max_n * sizeof(float));
@@ -537,23 +708,31 @@ int main(int argc, char **argv) {
     cuMemAlloc(&d_knc, attn_n * sizeof(float));
     cuMemAlloc(&d_vnc, attn_n * sizeof(float));
     cuMemAlloc(&d_ync, attn_n * sizeof(float));
-    cuMemcpyHtoD(d_lat, lat, LC * (size_t)LH * LW * sizeof(float));
+    cuMemcpyHtoD(d_in_dev, in_buf, IC * (size_t)IH * IW * sizeof(float));
 
-    decode(&kk, &D, d_lat, LH, LW, d_rgb,
-            d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+    if (do_encode) {
+        encode(&kk, &E, d_in_dev, IH, IW, d_out_dev,
+                d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+    } else {
+        decode(&kk, &D, d_in_dev, IH, IW, d_out_dev,
+                d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+    }
     cuCtxSynchronize();
 
-    float *rgb = (float *)malloc(3 * (size_t)OH * OW * sizeof(float));
-    cuMemcpyDtoH(rgb, d_rgb, 3 * (size_t)OH * OW * sizeof(float));
+    size_t out_n = (size_t)OC * OH * OW;
+    float *out_buf = (float *)malloc(out_n * sizeof(float));
+    cuMemcpyDtoH(out_buf, d_out_dev, out_n * sizeof(float));
 
-    int sh3[3] = { 3, OH, OW };
-    write_npy_f32(out_path, rgb, sh3, 3);
-    fprintf(stderr, "wrote %s  range=[%.3f, %.3f]\n",
-            out_path,
-            (float)({float mn=rgb[0]; for (int i=1;i<3*OH*OW;i++) if(rgb[i]<mn)mn=rgb[i]; mn;}),
-            (float)({float mx=rgb[0]; for (int i=1;i<3*OH*OW;i++) if(rgb[i]>mx)mx=rgb[i]; mx;}));
+    int sh3[3] = { OC, OH, OW };
+    write_npy_f32(out_path, out_buf, sh3, 3);
+    float mn = out_buf[0], mx = out_buf[0];
+    for (size_t i = 1; i < out_n; i++) {
+        if (out_buf[i] < mn) mn = out_buf[i];
+        if (out_buf[i] > mx) mx = out_buf[i];
+    }
+    fprintf(stderr, "wrote %s  range=[%.3f, %.3f]\n", out_path, mn, mx);
 
-    free(rgb); free(lat);
+    free(out_buf); free(in_buf);
     safetensors_close(st);
     cuModuleUnload(kk.mod);
     cuCtxDestroy(ctx);
