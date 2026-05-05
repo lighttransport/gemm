@@ -22,6 +22,13 @@
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
 #include "cuda_paint_raster_kernels.h"
+#include "mesh_vertex_inpaint.h"
+
+/* Provided by paint_e2e_helpers.cc (image_utils.h impl, extern "C"). */
+extern int img_write_png(const char *path, const uint8_t *rgb, int w, int h);
+
+/* Optional: also compares baked vs inpainted texture and writes
+ * <out>/textured.{obj,mtl,png} when --inpaint is in effect. */
 
 /* Minimal .npy reader (f32 / i32, contiguous, little-endian). Returns
  * malloc'd buffer; *out_numel = element count, *out_esz = element size. */
@@ -47,6 +54,7 @@ static void *npy_read(const char *path, size_t *out_numel, size_t *out_esz) {
     size_t esz = 0;
     if (strstr(hdr, "'<f4'") || strstr(hdr, "'f4'")) esz = 4;
     else if (strstr(hdr, "'<i4'") || strstr(hdr, "'i4'")) esz = 4;
+    else if (strstr(hdr, "'|u1'") || strstr(hdr, "'u1'")) esz = 1;
     else { fprintf(stderr, "%s: unsupported dtype: %s\n", path, hdr); free(hdr); fclose(f); return NULL; }
     char *sh = strstr(hdr, "'shape':"); if (!sh) sh = strstr(hdr, "\"shape\":");
     sh = strchr(sh, '(') + 1;
@@ -93,15 +101,51 @@ static void launch_back_project(CUfunction f_bp, CUstream s,
 static int run_single_view(const char *refdir);
 static int run_multi_view (const char *refdir);
 
+static int g_inpaint = 0;
+static const char *g_outdir = NULL;
+
 int main(int argc, char **argv) {
     int multiview = 0;
     const char *refdir = "/tmp/hy3d_paint_bp_ref";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--multiview")) multiview = 1;
+        else if (!strcmp(argv[i], "--inpaint")) { multiview = 1; g_inpaint = 1; }
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc) g_outdir = argv[++i];
         else refdir = argv[i];
     }
     if (multiview) return run_multi_view(refdir);
     return run_single_view(refdir);
+}
+
+/* Tiny textured-OBJ + MTL writer. Vertices are written 1-based per .obj
+ * spec; faces use `v/vt` since UV faces share indexing with the position
+ * vertices we emit (we re-gather original positions through xatlas's
+ * vmap so v_idx == vt_idx == uv_idx). */
+static int write_textured_obj(const char *obj_path, const char *mtl_path,
+                              const char *png_basename,
+                              const float *verts, int nv,
+                              const float *uvs,   int nu,
+                              const int32_t *faces, int nf)
+{
+    FILE *fp = fopen(obj_path, "w"); if (!fp) return 1;
+    const char *mtl_base = strrchr(mtl_path, '/');
+    mtl_base = mtl_base ? mtl_base + 1 : mtl_path;
+    fprintf(fp, "mtllib %s\nusemtl paint\n", mtl_base);
+    for (int i = 0; i < nv; i++)
+        fprintf(fp, "v %.6f %.6f %.6f\n",
+                verts[i*3+0], verts[i*3+1], verts[i*3+2]);
+    for (int i = 0; i < nu; i++)
+        fprintf(fp, "vt %.6f %.6f\n", uvs[i*2+0], uvs[i*2+1]);
+    for (int i = 0; i < nf; i++) {
+        int a = faces[i*3+0]+1, b = faces[i*3+1]+1, c = faces[i*3+2]+1;
+        fprintf(fp, "f %d/%d %d/%d %d/%d\n", a,a, b,b, c,c);
+    }
+    fclose(fp);
+    fp = fopen(mtl_path, "w"); if (!fp) return 1;
+    fprintf(fp, "newmtl paint\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd %s\n",
+            png_basename);
+    fclose(fp);
+    return 0;
 }
 
 static int run_single_view(const char *refdir) {
@@ -399,6 +443,113 @@ static int run_multi_view(const char *refdir) {
         "bake_mask mismatch=%d   bake_tex mae=%.3e max=%.3e (over %zu)\n",
         mask_mismatch, tex_sum / (double)tex_n_diff, tex_max, tex_n_diff);
     int ok = (mask_mismatch == 0) && (tex_max < 1e-4);
+
+    /* Inpaint chain: bake -> mesh_vertex_inpaint -> diff vs pyref + write
+     * textured OBJ + PNG. Activated by --inpaint (and presence of mesh
+     * tensors in the dump). */
+    int inpaint_ok = 1;
+    if (g_inpaint) {
+        size_t n_vp, n_fa, n_uv, n_ui, n_it, n_im;
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/vtx_pos_n.npy", refdir);
+        float   *h_vp = (float*)  npy_read(p, &n_vp, &esz);
+        snprintf(p, sizeof(p), "%s/faces.npy",     refdir);
+        int32_t *h_fa = (int32_t*)npy_read(p, &n_fa, &esz);
+        snprintf(p, sizeof(p), "%s/vtx_uv.npy",    refdir);
+        float   *h_uv = (float*)  npy_read(p, &n_uv, &esz);
+        snprintf(p, sizeof(p), "%s/uv_idx.npy",    refdir);
+        int32_t *h_ui = (int32_t*)npy_read(p, &n_ui, &esz);
+        snprintf(p, sizeof(p), "%s/inpaint_tex.npy", refdir);
+        float   *r_it = (float*)  npy_read(p, &n_it, &esz);
+        snprintf(p, sizeof(p), "%s/inpaint_mask.npy",refdir);
+        uint8_t *r_im = (uint8_t*)npy_read(p, &n_im, &esz);
+        if (!h_vp || !h_fa || !h_uv || !h_ui || !r_it || !r_im) {
+            fprintf(stderr, "inpaint: missing dump files in %s\n", refdir);
+            return 1;
+        }
+        int V = (int)(n_vp / 3), F = (int)(n_fa / 3), U = (int)(n_uv / 2);
+        fprintf(stderr, "inpaint: V=%d  U=%d  F=%d\n", V, U, F);
+
+        /* Build uint8 mask from bake_mask (1.0 -> 255). */
+        uint8_t *bake_mask_u8 = (uint8_t*)malloc(tex_n);
+        for (size_t i = 0; i < tex_n; i++)
+            bake_mask_u8[i] = bake_mask[i] > 0.f ? 255 : 0;
+
+        float   *out_tex = (float*)malloc(tex_n * C * sizeof(float));
+        uint8_t *out_msk = (uint8_t*)malloc(tex_n);
+        mesh_vertex_inpaint(bake, bake_mask_u8,
+                            h_vp, h_uv, h_fa, h_ui,
+                            V, U, F, Htex, Wtex, C, MVI_SMOOTH,
+                            out_tex, out_msk);
+
+        /* Diff inpaint texture + mask vs pyref. Compare on union of
+         * either mask>0. */
+        size_t in_filled = 0, in_mismatch = 0;
+        double in_tex_max = 0, in_tex_sum = 0; size_t in_tex_n = 0;
+        for (size_t i = 0; i < tex_n; i++) {
+            int dvr = out_msk[i] > 0, rvr = r_im[i] > 0;
+            if (dvr) in_filled++;
+            if (dvr != rvr) in_mismatch++;
+            if (dvr || rvr) {
+                for (int k = 0; k < C; k++) {
+                    double d = fabs((double)out_tex[i*C+k]
+                                  - (double)r_it[i*C+k]);
+                    if (d > in_tex_max) in_tex_max = d;
+                    in_tex_sum += d; in_tex_n++;
+                }
+            }
+        }
+        fprintf(stderr,
+            "inpaint  filled=%zu  mask_mismatch=%zu  tex mae=%.3e max=%.3e (over %zu)\n",
+            in_filled, in_mismatch,
+            in_tex_n ? in_tex_sum / in_tex_n : 0.0, in_tex_max, in_tex_n);
+        inpaint_ok = (in_mismatch == 0) && (in_tex_max < 1e-4);
+
+        /* Write atlas PNG + textured OBJ. */
+        const char *out = g_outdir ? g_outdir : refdir;
+        char png_path[1024], obj_path[1024], mtl_path[1024];
+        snprintf(png_path, sizeof(png_path), "%s/textured.png", out);
+        snprintf(obj_path, sizeof(obj_path), "%s/textured.obj", out);
+        snprintf(mtl_path, sizeof(mtl_path), "%s/textured.mtl", out);
+        uint8_t *tex8 = (uint8_t*)malloc(tex_n * C);
+        for (size_t i = 0; i < tex_n * C; i++) {
+            float v = out_tex[i] * 255.f;
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            tex8[i] = (uint8_t)(v + 0.5f);
+        }
+        if (img_write_png(png_path, tex8, Wtex, Htex) != 0)
+            fprintf(stderr, "warning: PNG write failed: %s\n", png_path);
+        else fprintf(stderr, "wrote %s\n", png_path);
+
+        /* OBJ: emit per-UV-vertex positions by gathering through vmap.
+         * vmap maps uv_vert_idx -> original_vert_idx; pyref stored it. */
+        size_t n_vmap;
+        snprintf(p, sizeof(p), "%s/vmap.npy", refdir);
+        int32_t *h_vmap = (int32_t*)npy_read(p, &n_vmap, &esz);
+        size_t n_uvs_orig;
+        snprintf(p, sizeof(p), "%s/uvs_orig.npy", refdir);
+        float *h_uvs_orig = (float*)npy_read(p, &n_uvs_orig, &esz);
+        if (h_vmap && h_uvs_orig && (int)n_vmap == U) {
+            float *uv_verts = (float*)malloc(U * 3 * sizeof(float));
+            for (int i = 0; i < U; i++) {
+                int src = h_vmap[i];
+                uv_verts[i*3+0] = h_vp[src*3+0];
+                uv_verts[i*3+1] = h_vp[src*3+1];
+                uv_verts[i*3+2] = h_vp[src*3+2];
+            }
+            if (write_textured_obj(obj_path, mtl_path, "textured.png",
+                                   uv_verts, U, h_uvs_orig, U, h_ui, F) == 0)
+                fprintf(stderr, "wrote %s + %s\n", obj_path, mtl_path);
+            free(uv_verts);
+        }
+        free(h_vmap); free(h_uvs_orig);
+
+        free(tex8); free(out_tex); free(out_msk); free(bake_mask_u8);
+        free(h_vp); free(h_fa); free(h_uv); free(h_ui);
+        free(r_it); free(r_im);
+    }
+    ok = ok && inpaint_ok;
     fprintf(stderr, "result: %s\n", ok ? "PASS" : "FAIL");
 
     for (int v = 0; v < N; v++) {
