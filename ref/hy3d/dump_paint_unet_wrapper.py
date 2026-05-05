@@ -79,6 +79,12 @@ def main():
                     help="If 1, enable PoseRoPE on the MA path; dumps "
                          "in_position_maps.npy + voxel_indices_<Np>.npy and "
                          "writes out_<combo>_rope.npy.")
+    ap.add_argument("--steps", type=int, default=0,
+                    help="If >0, also drive a UniPC denoising loop with the "
+                         "all-paths-on wrapper UNet (single-batch, no CFG, "
+                         "same conditioning each step). Dumps loop_x0.npy, "
+                         "loop_timesteps.npy, loop_model_out_<i>.npy, "
+                         "loop_x_after_<i>.npy.")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -193,6 +199,77 @@ def main():
         np.save(path, out.detach().cpu().numpy().astype(np.float32))
         print(f"  {combo_name:6s} -> {tuple(out.shape)}  range=[{out.min():+.3f},{out.max():+.3f}]",
               file=sys.stderr)
+
+    # Optional Phase 4.11b: scheduler↔UNet integration loop.
+    if args.steps > 0:
+        from diffusers import UniPCMultistepScheduler
+        sch_cfg = dict(
+            num_train_timesteps=1000,
+            beta_start=0.00085, beta_end=0.012,
+            beta_schedule="scaled_linear",
+            prediction_type="v_prediction",
+            timestep_spacing="trailing",
+            rescale_betas_zero_snr=True,
+            solver_order=2, solver_type="bh2",
+            predict_x0=True, lower_order_final=True,
+            final_sigmas_type="zero", steps_offset=1,
+        )
+        sch = UniPCMultistepScheduler(**sch_cfg)
+        sch.set_timesteps(args.steps)
+        ts = sch.timesteps  # on cpu
+
+        # all-paths-on
+        flags = combos["all"]
+        for k, v in flags.items():
+            setattr(model, k, v)
+        propagate_flags(model.unet, flags)
+
+        # Initial latent: shape [B, N_pbr, N_gen, 4, H, W] in "sample" form.
+        # We reuse the same conditioning each step.
+        torch.manual_seed(args.seed + 7)
+        x = torch.randn(B, N_pbr, N_gen, 4, H, W, device=device)
+        # Save Beff-flat initial latent for the C side: [Beff, 4, H, W]
+        x_flat0 = x.reshape(B * N_pbr * N_gen, 4, H, W).detach().cpu().numpy().astype(np.float32)
+        np.save(os.path.join(args.outdir, "loop_x0.npy"), x_flat0)
+        np.save(os.path.join(args.outdir, "loop_timesteps.npy"),
+                ts.cpu().numpy().astype(np.int64))
+
+        for i, t in enumerate(ts):
+            t_dev = t.to(device).reshape(1)
+            kwargs_loop = {
+                "embeds_normal": embeds_normal,
+                "embeds_position": embeds_position,
+                "cache": {},
+                "ref_latents": ref_latents,
+                "dino_hidden_states": dino_hidden_states,
+            }
+            with torch.no_grad():
+                out = model(x, t_dev, encoder_hidden_states, **kwargs_loop)
+            if isinstance(out, tuple):
+                out = out[0]
+            if hasattr(out, "sample"):
+                out = out.sample
+            mo = out.detach().cpu()  # [Beff, 4, H, W]
+            np.save(os.path.join(args.outdir, f"loop_model_out_{i}.npy"),
+                    mo.numpy().astype(np.float32))
+
+            # Step in sample-shape: scheduler is per-element so layout is fine.
+            x_flat = x.reshape(B * N_pbr * N_gen, 4, H, W).cpu()
+            stp = sch.step(mo, t, x_flat, return_dict=True)
+            x_flat_new = stp.prev_sample
+            np.save(os.path.join(args.outdir, f"loop_x_after_{i}.npy"),
+                    x_flat_new.numpy().astype(np.float32))
+            x = x_flat_new.reshape(B, N_pbr, N_gen, 4, H, W).to(device)
+            print(f"  loop step {i:2d}: t={int(t):4d}  mo range=[{float(mo.min()):+.3f},{float(mo.max()):+.3f}]  "
+                  f"x range=[{float(x.min()):+.3f},{float(x.max()):+.3f}]",
+                  file=sys.stderr)
+
+        import json
+        with open(os.path.join(args.outdir, "loop_meta.json"), "w") as f:
+            json.dump(dict(steps=args.steps, cfg=sch_cfg,
+                           B=B, N_pbr=N_pbr, N_gen=N_gen, H=H, W=W,
+                           Beff=B*N_pbr*N_gen), f, indent=2)
+        print(f"wrote {args.steps}-step loop -> {args.outdir}", file=sys.stderr)
 
 
 if __name__ == "__main__":
