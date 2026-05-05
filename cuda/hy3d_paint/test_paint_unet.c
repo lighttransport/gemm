@@ -139,6 +139,9 @@ typedef struct {
     CUfunction f_lin;     /* unet_linear_f32 */
     CUfunction f_silu;    /* unet_silu_f32 */
     CUfunction f_conv;    /* unet_conv2d_f32 */
+    CUfunction f_gn;      /* unet_groupnorm_f32 */
+    CUfunction f_addc;    /* unet_add_chan_f32 */
+    CUfunction f_add;     /* unet_add_f32 */
 } pu_kernels;
 
 static void k_timestep_embed(const pu_kernels *kk, CUdeviceptr out,
@@ -162,6 +165,30 @@ static void k_silu(const pu_kernels *kk, CUdeviceptr x, int n) {
                     256, 1, 1, 0, 0, args, NULL);
 }
 
+static void k_groupnorm(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                          CUdeviceptr g, CUdeviceptr b, int C, int spatial,
+                          int num_groups, int do_silu) {
+    float eps = 1e-5f;
+    void *args[] = { &out, &in, &g, &b, &C, &spatial, &num_groups, &do_silu, &eps };
+    cuLaunchKernel(kk->f_gn, (unsigned)num_groups, 1, 1, 128, 1, 1,
+                    128 * sizeof(float), 0, args, NULL);
+}
+
+static void k_add_chan(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr a,
+                         CUdeviceptr temb, int C, int spatial) {
+    void *args[] = { &out, &a, &temb, &C, &spatial };
+    int total = C * spatial;
+    cuLaunchKernel(kk->f_addc, (unsigned)((total + 255) / 256), 1, 1,
+                    256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_add(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr a,
+                   CUdeviceptr b, int n) {
+    void *args[] = { &out, &a, &b, &n };
+    cuLaunchKernel(kk->f_add, (unsigned)((n + 255) / 256), 1, 1,
+                    256, 1, 1, 0, 0, args, NULL);
+}
+
 static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                     CUdeviceptr W, CUdeviceptr b,
                     int ci, int h, int w, int co, int kh, int kw, int pad) {
@@ -169,6 +196,93 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
     int total = co * h * w;
     cuLaunchKernel(kk->f_conv, (unsigned)((total + 255) / 256), 1, 1,
                     256, 1, 1, 0, 0, args, NULL);
+}
+
+/* ===== ResBlock ============================================================
+ * Diffusers ResnetBlock2D ("default" mode) forward:
+ *   h = norm1(x); silu; conv1
+ *   t = silu(temb); time_emb_proj(t)         [B, c_out]
+ *   h = h + t[:, :, None, None]
+ *   h = norm2(h); silu; (dropout=identity); conv2
+ *   skip = conv_shortcut(x) if c_in != c_out else x
+ *   out = h + skip
+ *
+ * Buffers: d_x in [c_in, H, W], d_out [c_out, H, W], d_t1 / d_t2 each
+ * sized max(c_in, c_out)*H*W, d_temb_proj scratch [c_out].
+ */
+typedef struct {
+    CUdeviceptr norm1_g, norm1_b;
+    CUdeviceptr conv1_w, conv1_b;
+    CUdeviceptr temb_w,  temb_b;     /* time_emb_proj: 1280 -> c_out */
+    CUdeviceptr norm2_g, norm2_b;
+    CUdeviceptr conv2_w, conv2_b;
+    CUdeviceptr skip_w,  skip_b;     /* may be 0 if c_in == c_out */
+    int c_in, c_out;
+} pu_resblock;
+
+static void load_resblock(st_context *st, pu_resblock *r, const char *prefix,
+                            int c_in, int c_out) {
+    char buf[256];
+    r->c_in = c_in; r->c_out = c_out;
+    snprintf(buf, sizeof(buf), "%s.norm1.weight", prefix); r->norm1_g = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.norm1.bias",   prefix); r->norm1_b = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.conv1.weight", prefix); r->conv1_w = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.conv1.bias",   prefix); r->conv1_b = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.time_emb_proj.weight", prefix); r->temb_w = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.time_emb_proj.bias",   prefix); r->temb_b = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.norm2.weight", prefix); r->norm2_g = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.norm2.bias",   prefix); r->norm2_b = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.conv2.weight", prefix); r->conv2_w = upload_st(st, buf);
+    snprintf(buf, sizeof(buf), "%s.conv2.bias",   prefix); r->conv2_b = upload_st(st, buf);
+    if (c_in != c_out) {
+        snprintf(buf, sizeof(buf), "%s.conv_shortcut.weight", prefix);
+        r->skip_w = upload_st(st, buf);
+        snprintf(buf, sizeof(buf), "%s.conv_shortcut.bias", prefix);
+        r->skip_b = upload_st(st, buf);
+    } else { r->skip_w = 0; r->skip_b = 0; }
+}
+
+/* d_temb : [B, 1280] (the upstream time MLP output, NOT yet silu'd).
+ * Resblock applies silu(d_temb) then linear -> [B, c_out] internally.
+ * d_temb_act, d_temb_proj are scratch [B*1280] and [B*c_out]. */
+static void run_resblock(const pu_kernels *kk, const pu_resblock *r,
+                          CUdeviceptr d_x, CUdeviceptr d_out,
+                          CUdeviceptr d_t1, CUdeviceptr d_t2,
+                          CUdeviceptr d_temb, CUdeviceptr d_temb_act,
+                          CUdeviceptr d_temb_proj,
+                          int B, int H, int W, int num_groups) {
+    int sp = H * W;
+    /* h = silu(norm1(x))  [c_in, H, W] -> d_t1 */
+    k_groupnorm(kk, d_t1, d_x, r->norm1_g, r->norm1_b,
+                 r->c_in, sp, num_groups, 1);
+    /* h = conv1(h)  -> d_t2 [c_out, H, W] */
+    k_conv(kk, d_t2, d_t1, r->conv1_w, r->conv1_b,
+            r->c_in, H, W, r->c_out, 3, 3, 1);
+    /* time embedding: silu(d_temb) -> linear(1280, c_out) */
+    cuMemcpyDtoD(d_temb_act, d_temb, B * 1280 * sizeof(float));
+    k_silu(kk, d_temb_act, B * 1280);
+    k_linear(kk, d_temb_proj, d_temb_act, r->temb_w, r->temb_b, B, 1280, r->c_out);
+    /* h = h + t.broadcast over spatial */
+    /* Single-batch shortcut: kernel handles one [c_out, H, W] map at a time. */
+    for (int b = 0; b < B; b++) {
+        CUdeviceptr h_b = d_t2        + (CUdeviceptr)b * r->c_out * sp * sizeof(float);
+        CUdeviceptr t_b = d_temb_proj + (CUdeviceptr)b * r->c_out      * sizeof(float);
+        k_add_chan(kk, h_b, h_b, t_b, r->c_out, sp);
+    }
+    /* h = silu(norm2(h)) -> d_t1 */
+    k_groupnorm(kk, d_t1, d_t2, r->norm2_g, r->norm2_b,
+                 r->c_out, sp, num_groups, 1);
+    /* h = conv2(h) -> d_t2 [c_out, H, W] */
+    k_conv(kk, d_t2, d_t1, r->conv2_w, r->conv2_b,
+            r->c_out, H, W, r->c_out, 3, 3, 1);
+    /* skip path */
+    if (r->skip_w) {
+        k_conv(kk, d_t1, d_x, r->skip_w, r->skip_b,
+                r->c_in, H, W, r->c_out, 1, 1, 0);
+        k_add(kk, d_out, d_t2, d_t1, r->c_out * sp * B);
+    } else {
+        k_add(kk, d_out, d_t2, d_x, r->c_out * sp * B);
+    }
 }
 
 /* ===== main =============================================================== */
@@ -202,6 +316,9 @@ int main(int argc, char **argv) {
     cuModuleGetFunction(&kk.f_lin,  kk.mod, "unet_linear_f32");
     cuModuleGetFunction(&kk.f_silu, kk.mod, "unet_silu_f32");
     cuModuleGetFunction(&kk.f_conv, kk.mod, "unet_conv2d_f32");
+    cuModuleGetFunction(&kk.f_gn,   kk.mod, "unet_groupnorm_f32");
+    cuModuleGetFunction(&kk.f_addc, kk.mod, "unet_add_chan_f32");
+    cuModuleGetFunction(&kk.f_add,  kk.mod, "unet_add_f32");
 
     st_context *st = safetensors_open(st_path);
     if (!st) { fprintf(stderr, "ERROR: cannot open %s\n", st_path); return 1; }
@@ -270,6 +387,65 @@ int main(int argc, char **argv) {
         cuMemcpyDtoH(cu, d_out, out_n * sizeof(float));
         snprintf(path, sizeof(path), "%s/ref_conv_in.npy", ref_dir);
         diff_against(cu, path, out_n, 1e-3f);
+        free(cu); free(sample);
+    } else if (!strcmp(stage, "db0_res0")) {
+        /* Pipeline up to and including down_blocks[0].resnets[0]:
+         *   time_emb      [B, 1280]
+         *   conv_in(x)    [B, 320, 64, 64]
+         *   resblock(.,t) [B, 320, 64, 64]   vs ref_db0_res0.npy
+         */
+        snprintf(path, sizeof(path), "%s/ref_sample.npy", ref_dir);
+        float *sample = (float *)read_npy(path, &nd, shape, &n, dt);
+        if (!sample) return 1;
+        int IC = (int)shape[1], H = (int)shape[2], W = (int)shape[3];
+        if (IC != 12) { fprintf(stderr, "ERROR: IC!=12\n"); return 1; }
+
+        /* --- time embedding --- */
+        CUdeviceptr d_ts;   cuMemAlloc(&d_ts, B * sizeof(int64_t));
+        cuMemcpyHtoD(d_ts, ts, B * sizeof(int64_t));
+        CUdeviceptr d_temb_in; cuMemAlloc(&d_temb_in, B * 320 * sizeof(float));
+        CUdeviceptr d_temb_h1; cuMemAlloc(&d_temb_h1, B * 1280 * sizeof(float));
+        CUdeviceptr d_temb;    cuMemAlloc(&d_temb,    B * 1280 * sizeof(float));
+        CUdeviceptr l1_w = upload_st(st, "time_embedding.linear_1.weight");
+        CUdeviceptr l1_b = upload_st(st, "time_embedding.linear_1.bias");
+        CUdeviceptr l2_w = upload_st(st, "time_embedding.linear_2.weight");
+        CUdeviceptr l2_b = upload_st(st, "time_embedding.linear_2.bias");
+        k_timestep_embed(&kk, d_temb_in, d_ts, B, 320);
+        k_linear(&kk, d_temb_h1, d_temb_in, l1_w, l1_b, B, 320, 1280);
+        k_silu(&kk, d_temb_h1, B * 1280);
+        k_linear(&kk, d_temb, d_temb_h1, l2_w, l2_b, B, 1280, 1280);
+
+        /* --- conv_in --- */
+        CUdeviceptr cw = upload_st(st, "conv_in.weight");
+        CUdeviceptr cb = upload_st(st, "conv_in.bias");
+        size_t in_n  = (size_t)B * IC * H * W;
+        size_t hw_n  = (size_t)B * 320 * H * W;
+        CUdeviceptr d_in;  cuMemAlloc(&d_in,  in_n * sizeof(float));
+        CUdeviceptr d_x;   cuMemAlloc(&d_x,   hw_n * sizeof(float));
+        cuMemcpyHtoD(d_in, sample, in_n * sizeof(float));
+        for (int b = 0; b < B; b++) {
+            CUdeviceptr in_b = d_in + (CUdeviceptr)b * IC  * H * W * sizeof(float);
+            CUdeviceptr x_b  = d_x  + (CUdeviceptr)b * 320 * H * W * sizeof(float);
+            k_conv(&kk, x_b, in_b, cw, cb, IC, H, W, 320, 3, 3, 1);
+        }
+
+        /* --- resblock --- */
+        pu_resblock r;
+        load_resblock(st, &r, "down_blocks.0.resnets.0", 320, 320);
+        CUdeviceptr d_out, d_t1, d_t2, d_temb_act, d_temb_proj;
+        cuMemAlloc(&d_out, hw_n * sizeof(float));
+        cuMemAlloc(&d_t1,  hw_n * sizeof(float));
+        cuMemAlloc(&d_t2,  hw_n * sizeof(float));
+        cuMemAlloc(&d_temb_act,  B * 1280 * sizeof(float));
+        cuMemAlloc(&d_temb_proj, B * 320  * sizeof(float));
+        run_resblock(&kk, &r, d_x, d_out, d_t1, d_t2,
+                      d_temb, d_temb_act, d_temb_proj, B, H, W, 32);
+        cuCtxSynchronize();
+
+        float *cu = (float *)malloc(hw_n * sizeof(float));
+        cuMemcpyDtoH(cu, d_out, hw_n * sizeof(float));
+        snprintf(path, sizeof(path), "%s/ref_db0_res0.npy", ref_dir);
+        diff_against(cu, path, hw_n, 1e-3f);
         free(cu); free(sample);
     } else {
         fprintf(stderr, "unknown stage: %s\n", stage); return 1;
