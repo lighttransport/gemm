@@ -33,11 +33,11 @@ COMMON_DEPS = hip_trellis2_runner.h hip_trellis2_kernels.h \
 
 all: $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC) $(TEX_SPCONV) $(TEX_CNEXT) $(TEX_C2S) $(TEX_DEC_FULL)
 
-$(TEX_DEC_FULL): test_hip_tex_dec.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
-                 ../rocew.h ../hip_runner_common.h \
+$(TEX_DEC_FULL): test_hip_tex_dec.c hip_tex_dec_kernels.h $(ROCEW_SRC) $(BLASLT_OBJ) \
+                 ../rocew.h ../hip_runner_common.h ../llm/mm_blaslt_bridge.h \
                  ../../common/safetensors.h ../../common/ggml_dequant.h \
                  ../../common/sparse3d.h ../../common/trellis2_shape_decoder.h
-	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_tex_dec.c $(ROCEW_SRC) $(LDFLAGS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_tex_dec.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
 $(TEX_C2S): test_hip_c2s.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
             ../rocew.h ../hip_runner_common.h \
