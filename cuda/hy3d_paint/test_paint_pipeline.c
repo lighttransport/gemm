@@ -509,18 +509,19 @@ static int cmd_chain(int argc, char **argv) {
     free(dg_in);
     paint_stage_dinov2g_destroy(dg);
 
-    /* 3. unet (uses unet_refdir for text/normal/position conditioning, our
-     * dino_h for the image conditioning). */
+    /* 3. unet — text/normal/position conditioning still come from unet_refdir
+     * (those are produced by upstream tokenizer + render passes not yet
+     * ported). The initial latent x0 and timesteps are now generated locally:
+     * x0 = N(0,1) seeded by CHAIN_SEED (default 42); timesteps from pu_unipc
+     * (matches diffusers UniPC trailing schedule). */
     char path[512];
-    float *en, *ep, *text_in, *ref_lat, *x0; int64_t *ts;
+    float *en, *ep, *text_in, *ref_lat;
 #define LD(var, name) do { snprintf(path,sizeof(path),"%s/%s",unet_ref,name); var = npy_read(path,&nd,sh,&nn,dt); if (!var){fprintf(stderr,"missing %s\n",path); return 1;} } while(0)
     LD(en,"in_embeds_normal.npy");
     LD(ep,"in_embeds_position.npy");
     LD(text_in,"in_encoder_hidden_states.npy");
     int M_text=(int)sh[2], cross_dim=(int)sh[3];
     LD(ref_lat,"in_ref_latents.npy");
-    LD(x0,"loop_x0.npy");
-    LD(ts,"loop_timesteps.npy"); int N_steps=(int)nn;
 #undef LD
     paint_unet_config cfg = { .B_outer=1, .N_pbr=2, .N_gen=2, .N_ref=1, .H0=64, .W0=64,
                               .M_text=M_text, .cross_dim=cross_dim, .T_dino=257, .C_dino_in=1536 };
@@ -531,11 +532,41 @@ static int cmd_chain(int argc, char **argv) {
     paint_stage_unet_set_conditioning(u, (float*)en, (float*)ep, (float*)text_in,
                                        (float*)ref_lat, dino_h);
     paint_stage_unet_run_dual(u);
+
+    int N_steps = 3;
+    {
+        const char *e = getenv("CHAIN_STEPS");
+        if (e && atoi(e) > 0) N_steps = atoi(e);
+    }
+    unsigned long long seed = 42;
+    {
+        const char *e = getenv("CHAIN_SEED");
+        if (e) seed = strtoull(e, NULL, 10);
+    }
     float *x = malloc(x_n*sizeof(float)), *np_buf = malloc(x_n*sizeof(float));
-    memcpy(x, x0, x_n*sizeof(float));
+    /* Box-Muller N(0,1) seeded with splitmix64 → xoshiro for determinism. */
+    {
+        unsigned long long s = seed ? seed : 1ULL;
+        size_t i = 0;
+        while (i < x_n) {
+            s ^= s >> 12; s ^= s << 25; s ^= s >> 27; s *= 2685821657736338717ULL;
+            unsigned long long u1 = s;
+            s ^= s >> 12; s ^= s << 25; s ^= s >> 27; s *= 2685821657736338717ULL;
+            unsigned long long u2 = s;
+            double r1 = ((u1 >> 11) + 1) * (1.0 / 9007199254740993.0);
+            double r2 = ((u2 >> 11) + 1) * (1.0 / 9007199254740993.0);
+            double mag = sqrt(-2.0 * log(r1));
+            double a = 2.0 * 3.14159265358979323846 * r2;
+            x[i++] = (float)(mag * cos(a));
+            if (i < x_n) x[i++] = (float)(mag * sin(a));
+        }
+    }
     pu_unipc sch; pu_unipc_init(&sch, N_steps, x_n);
+    fprintf(stderr, "[chain] unet: %d steps, seed=%llu, ts=[", N_steps, seed);
+    for (int i = 0; i < N_steps; i++)
+        fprintf(stderr, "%lld%s", sch.timesteps[i], i+1<N_steps?",":"]\n");
     for (int i = 0; i < N_steps; i++) {
-        paint_stage_unet_run_step(u, (long long)ts[i], x, np_buf);
+        paint_stage_unet_run_step(u, sch.timesteps[i], x, np_buf);
         pu_unipc_step(&sch, np_buf, x);
     }
     const float inv = 1.0f/0.18215f; for (size_t k=0;k<x_n;k++) x[k]*=inv;
@@ -543,7 +574,7 @@ static int cmd_chain(int argc, char **argv) {
     snprintf(path, sizeof(path), "%s/chain_latents.npy", outdir);
     int s4[4]={Beff,4,cfg.H0,cfg.W0}; npy_write_f32(path, x, s4, 4);
     pu_unipc_free(&sch);
-    free(en); free(ep); free(text_in); free(ref_lat); free(x0); free(ts);
+    free(en); free(ep); free(text_in); free(ref_lat);
     paint_stage_unet_destroy(u);
     free(np_buf); free(dino_h);
 
