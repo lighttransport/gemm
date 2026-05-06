@@ -61,11 +61,18 @@ test_paint_cfg_loop: test_paint_cfg_loop.c cuda_paint_unipc.h
 paint_inpaint_helper.o: paint_inpaint_helper.cc mesh_vertex_inpaint.h
 	$(CXX) $(CXXFLAGS) -c -o $@ paint_inpaint_helper.cc
 
+paint_xatlas_helper.o: paint_xatlas_helper.cc ../../common/xatlas.h
+	$(CXX) $(CXXFLAGS) -c -o $@ paint_xatlas_helper.cc
+
+xatlas_lib.o: ../../common/xatlas.cc ../../common/xatlas.h
+	$(CXX) $(CXXFLAGS) -c -o $@ ../../common/xatlas.cc
+
 test_paint_pipeline: test_paint_pipeline.c paint_runtime.c \
                      paint_stage_vae.c paint_stage_unet.c \
                      paint_stage_view_maps.c paint_stage_dinov2g.c \
                      paint_stage_back_project.c paint_stages.h \
                      paint_inpaint_helper.o mesh_vertex_inpaint.h \
+                     paint_xatlas_helper.o xatlas_lib.o \
                      cuda_paint_vae_runner.h cuda_paint_vae_kernels.h \
                      cuda_paint_unet_runner.h cuda_paint_unet_kernels.h \
                      cuda_paint_nn_kernels.h cuda_paint_raster_kernels.h \
@@ -77,7 +84,7 @@ test_paint_pipeline: test_paint_pipeline.c paint_runtime.c \
 	$(CC) $(CFLAGS) -I../hy3d -o $@ test_paint_pipeline.c paint_runtime.c \
 	    paint_stage_vae.c paint_stage_unet.c paint_stage_view_maps.c \
 	    paint_stage_dinov2g.c paint_stage_back_project.c \
-	    paint_inpaint_helper.o \
+	    paint_inpaint_helper.o paint_xatlas_helper.o xatlas_lib.o \
 	    $(CUEW_SRC) $(CULDFLAGS) -lm -lstdc++
 
 test_paint_view_maps_stage: test_paint_view_maps_stage.c \

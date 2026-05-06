@@ -44,6 +44,67 @@
 
 #include "mesh_vertex_inpaint.h"
 
+extern int paint_xatlas_unwrap(
+    const float *vtx_pos, int n_verts,
+    const int   *tri_idx, int n_tris,
+    int   **out_vmap, float **out_uvs, int **out_uv_idx,
+    int    *out_n_uv_verts, int *out_atlas_w, int *out_atlas_h);
+
+/* CPU UV-space triangle rasterizer.
+ *
+ * Mirrors dump_paint_back_project.extract_tex_position_dense: uv ([0,1] with
+ * v already flipped) → ndc * 2 - 1, then for each triangle write per-texel
+ * barycentric-interpolated vtx_pos_uv into tex_pos and a 0/1 cov mask.
+ * uv_idx already indexes vtx_pos_uv (per-UV-vert) so no vmap gather here. */
+static void uv_rasterize_atlas(const float *vtx_pos_uv, /* [U,3] */
+                                const float *uvs_flipped, /* [U,2] */
+                                const int   *uv_idx,   /* [F,3] */
+                                int U, int F, int Htex, int Wtex,
+                                float *tex_pos, /* [Htex,Wtex,3] */
+                                int   *tex_cov  /* [Htex,Wtex]   */)
+{
+    (void)U;
+    memset(tex_pos, 0, (size_t)Htex*Wtex*3*sizeof(float));
+    memset(tex_cov, 0, (size_t)Htex*Wtex*sizeof(int));
+    for (int t = 0; t < F; t++) {
+        int ia = uv_idx[t*3+0], ib = uv_idx[t*3+1], ic = uv_idx[t*3+2];
+        float ax = uvs_flipped[ia*2+0]*2.f-1.f, ay = uvs_flipped[ia*2+1]*2.f-1.f;
+        float bx = uvs_flipped[ib*2+0]*2.f-1.f, by = uvs_flipped[ib*2+1]*2.f-1.f;
+        float cx = uvs_flipped[ic*2+0]*2.f-1.f, cy = uvs_flipped[ic*2+1]*2.f-1.f;
+        /* ndc → pixel: x = (ndc+1)/2 * W - 0.5, same for y. */
+        float pax = (ax+1.f)*0.5f*Wtex - 0.5f, pay = (ay+1.f)*0.5f*Htex - 0.5f;
+        float pbx = (bx+1.f)*0.5f*Wtex - 0.5f, pby = (by+1.f)*0.5f*Htex - 0.5f;
+        float pcx = (cx+1.f)*0.5f*Wtex - 0.5f, pcy = (cy+1.f)*0.5f*Htex - 0.5f;
+        float min_x = pax<pbx?pax:pbx; if (pcx<min_x) min_x=pcx;
+        float max_x = pax>pbx?pax:pbx; if (pcx>max_x) max_x=pcx;
+        float min_y = pay<pby?pay:pby; if (pcy<min_y) min_y=pcy;
+        float max_y = pay>pby?pay:pby; if (pcy>max_y) max_y=pcy;
+        int x0 = (int)floorf(min_x), x1 = (int)ceilf(max_x);
+        int y0 = (int)floorf(min_y), y1 = (int)ceilf(max_y);
+        if (x0<0) x0=0; if (y0<0) y0=0;
+        if (x1>=Wtex) x1=Wtex-1; if (y1>=Htex) y1=Htex-1;
+        float denom = (pby-pcy)*(pax-pcx) + (pcx-pbx)*(pay-pcy);
+        if (fabsf(denom) < 1e-12f) continue;
+        float inv = 1.f/denom;
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                float fx = (float)x, fy = (float)y;
+                float w0 = ((pby-pcy)*(fx-pcx) + (pcx-pbx)*(fy-pcy)) * inv;
+                float w1 = ((pcy-pay)*(fx-pcx) + (pax-pcx)*(fy-pcy)) * inv;
+                float w2 = 1.f - w0 - w1;
+                if (w0 < 0.f || w1 < 0.f || w2 < 0.f) continue;
+                int idx = y*Wtex + x;
+                if (tex_cov[idx]) continue; /* first writer wins */
+                tex_cov[idx] = 1;
+                for (int k = 0; k < 3; k++)
+                    tex_pos[idx*3+k] = w0*vtx_pos_uv[ia*3+k]
+                                     + w1*vtx_pos_uv[ib*3+k]
+                                     + w2*vtx_pos_uv[ic*3+k];
+            }
+        }
+    }
+}
+
 static int write_textured_obj(const char *obj_path, const char *mtl_path,
                               const char *png_basename,
                               const float *verts, int nv,
@@ -433,8 +494,8 @@ static int cmd_chain(int argc, char **argv) {
                 proj_diag[0],proj_diag[1]);
     }
     cuMemFree(d_n); cuMemFree(d_p); cuMemFree(d_de); cuMemFree(d_vi); cuMemFree(d_co);
-    free(m.pos); free(m.tri);
-    /* vm stays alive — needed below to transform tex_pos. */
+    /* vm + m stay alive — needed below for xatlas unwrap, atlas raster,
+     * and OBJ writeout. */
 
     /* 2. dinov2g */
     int nd; uint64_t sh[8]; size_t nn; char dt[8];
@@ -527,26 +588,55 @@ static int cmd_chain(int argc, char **argv) {
     cuMemFree(d_qnc); cuMemFree(d_knc); cuMemFree(d_vnc); cuMemFree(d_ync);
     paint_stage_vae_destroy(vae);
 
-    /* 5. back_project — atlas (tex_pos/tex_cov) + bake oracles still come from
-     * bp_refdir (UV unwrap is upstream of this stage). Per-view depth/visible/
-     * cos/w2c are now produced by view_maps (above), and per-view RGB images
-     * are the vae-decoded views. proj diagonal is reported by view_maps. */
-    float *tex_pos, *bake_ref, *trust_ref; int *tex_cov;
-#define LD2(var, name) do { snprintf(path,sizeof(path),"%s/%s",bp_ref,name); var = npy_read(path,&nd,sh,&nn,dt); if (!var){fprintf(stderr,"missing %s\n",path); return 1;} } while(0)
-    LD2(tex_pos,"tex_pos.npy"); LD2(tex_cov,"tex_cov.npy");
-    LD2(bake_ref,"bake_tex.npy"); LD2(trust_ref,"bake_trust.npy");
-#undef LD2
-    int Htex=(int)sqrt((double)nn), Wtex=Htex;
-    int Nv = Beff < N ? Beff : N;  /* min(rendered views, decoded views) */
-    /* Lift pyref tex_pos (raw mesh world frame) into our rendered coord frame
-     * so view_maps' w2c is consistent with the texel positions. */
-    int n_texels = (int)nn;
-    float *tex_pos_xform = (float *)malloc((size_t)n_texels * 3 * sizeof(float));
-    paint_stage_view_maps_apply_mesh_transform(vm, tex_pos, tex_pos_xform, n_texels);
+    /* 5. xatlas UV unwrap → tex_pos/tex_cov. Bake oracles (bake_tex/bake_trust)
+     * are loaded from bp_refdir for diff stats only. Per-view depth/visible/
+     * cos/w2c come from view_maps; per-view RGB are the vae-decoded views. */
+    int Htex = 128, Wtex = 128;
+    int *vmap = NULL, *uv_idx = NULL;
+    float *uvs = NULL;
+    int U = 0, atlas_w = 0, atlas_h = 0;
+    if (paint_xatlas_unwrap(m.pos, m.n_verts, m.tri, m.n_tris,
+                             &vmap, &uvs, &uv_idx, &U,
+                             &atlas_w, &atlas_h) != 0) {
+        fprintf(stderr, "[chain] xatlas unwrap failed\n"); return 1;
+    }
+    fprintf(stderr, "[chain] xatlas: %d uv_verts, atlas %dx%d (rasterizing to %dx%d)\n",
+            U, atlas_w, atlas_h, Htex, Wtex);
+    /* Per-UV-vert raw position via vmap, then apply set_mesh transform so the
+     * atlas lives in the same coord frame as view_maps' rendered geometry. */
+    float *vtx_pos_uv = malloc((size_t)U * 3 * sizeof(float));
+    for (int i = 0; i < U; i++) {
+        int src = vmap[i];
+        vtx_pos_uv[i*3+0] = m.pos[src*3+0];
+        vtx_pos_uv[i*3+1] = m.pos[src*3+1];
+        vtx_pos_uv[i*3+2] = m.pos[src*3+2];
+    }
+    float *vtx_pos_uv_n = malloc((size_t)U * 3 * sizeof(float));
+    paint_stage_view_maps_apply_mesh_transform(vm, vtx_pos_uv, vtx_pos_uv_n, U);
+    /* Flip UV v for raster (matches MeshRender.set_mesh's vtx_uv[:,1]=1-v). */
+    float *uvs_flip = malloc((size_t)U * 2 * sizeof(float));
+    for (int i = 0; i < U; i++) {
+        uvs_flip[i*2+0] = uvs[i*2+0];
+        uvs_flip[i*2+1] = 1.f - uvs[i*2+1];
+    }
+    size_t tex_nn = (size_t)Htex*Wtex;
+    float *tex_pos = malloc(tex_nn * 3 * sizeof(float));
+    int   *tex_cov = malloc(tex_nn * sizeof(int));
+    uv_rasterize_atlas(vtx_pos_uv_n, uvs_flip, uv_idx, U, m.n_tris,
+                        Htex, Wtex, tex_pos, tex_cov);
+    int n_cov = 0; for (size_t i = 0; i < tex_nn; i++) n_cov += tex_cov[i];
+    fprintf(stderr, "[chain] uv-raster: %d / %zu texels covered\n", n_cov, tex_nn);
+    free(uvs_flip); free(vtx_pos_uv);
+    /* Oracle bake for diff (optional). */
+    float *bake_ref = NULL, *trust_ref = NULL;
+    snprintf(path,sizeof(path),"%s/bake_tex.npy",bp_ref);
+    bake_ref = npy_read(path,&nd,sh,&nn,dt);
+    snprintf(path,sizeof(path),"%s/bake_trust.npy",bp_ref);
+    trust_ref = npy_read(path,&nd,sh,&nn,dt);
+    int Nv = Beff < N ? Beff : N;
     paint_stage_view_maps_destroy(vm);
     paint_stage_back_project *bp = paint_stage_back_project_create(dev, Htex, Wtex, 3);
-    paint_stage_back_project_set_atlas(bp, tex_pos_xform, tex_cov);
-    free(tex_pos_xform);
+    paint_stage_back_project_set_atlas(bp, tex_pos, tex_cov);
     paint_stage_back_project_begin(bp);
     int Himg = OH, Wimg = OW;  /* vae output */
     if (Himg != 512 || Wimg != 512) {
@@ -581,69 +671,49 @@ static int cmd_chain(int argc, char **argv) {
     fprintf(stderr, "[chain] back-project: N=%d Htex=%d mask_mismatch=%d max_diff=%.3e\n",
             Nv, Htex, mm, mx);
 
-    /* 6. inpaint + write textured.{obj,mtl,png}. UV/vertex tensors come from
-     * bp_refdir (xatlas unwrap is upstream of paint and not yet ported into
-     * this orchestrator). */
+    /* 6. inpaint + write textured.{obj,mtl,png} using our xatlas atlas. */
     {
-        size_t n_vp, n_fa, n_uv, n_ui, n_vmap, n_uvs_orig;
-#define LD3(var, name) do { snprintf(path,sizeof(path),"%s/%s",bp_ref,name); var = npy_read(path,&nd,sh,&n_##var,dt); } while(0)
-        float *vp_ = NULL; float *uv_ = NULL; int *fa_ = NULL; int *ui_ = NULL;
-        int *vmap_ = NULL; float *uvs_orig_ = NULL;
-        snprintf(path,sizeof(path),"%s/vtx_pos_n.npy",bp_ref);
-        vp_ = npy_read(path,&nd,sh,&n_vp,dt);
-        snprintf(path,sizeof(path),"%s/faces.npy",bp_ref);
-        fa_ = npy_read(path,&nd,sh,&n_fa,dt);
-        snprintf(path,sizeof(path),"%s/vtx_uv.npy",bp_ref);
-        uv_ = npy_read(path,&nd,sh,&n_uv,dt);
-        snprintf(path,sizeof(path),"%s/uv_idx.npy",bp_ref);
-        ui_ = npy_read(path,&nd,sh,&n_ui,dt);
-        snprintf(path,sizeof(path),"%s/vmap.npy",bp_ref);
-        vmap_ = npy_read(path,&nd,sh,&n_vmap,dt);
-        snprintf(path,sizeof(path),"%s/uvs_orig.npy",bp_ref);
-        uvs_orig_ = npy_read(path,&nd,sh,&n_uvs_orig,dt);
-#undef LD3
-        if (vp_ && fa_ && uv_ && ui_) {
-            int V=(int)(n_vp/3), F=(int)(n_fa/3), U=(int)(n_uv/2);
-            uint8_t *m_u8 = malloc(tex_n);
-            for (size_t i=0;i<tex_n;i++) m_u8[i] = mask[i]>0.f ? 255 : 0;
-            float *out_tex = malloc(tex_n*3*sizeof(float));
-            uint8_t *out_msk = malloc(tex_n);
-            mesh_vertex_inpaint(bake, m_u8, vp_, uv_, fa_, ui_,
-                                V, U, F, Htex, Wtex, 3, MVI_SMOOTH,
-                                out_tex, out_msk);
-            uint8_t *tex8 = malloc(tex_n*3);
-            for (size_t i=0;i<tex_n*3;i++) {
-                float v = out_tex[i]*255.f;
-                if (v<0) v=0; if (v>255) v=255;
-                tex8[i] = (uint8_t)(v+0.5f);
-            }
-            char p2[1024];
-            snprintf(p2,sizeof(p2),"%s/textured.png",outdir);
-            stbi_write_png(p2, Wtex, Htex, 3, tex8, Wtex*3);
-            fprintf(stderr, "[chain] wrote %s\n", p2);
-
-            if (vmap_ && uvs_orig_ && (int)n_vmap==U) {
-                float *uv_verts = malloc((size_t)U*3*sizeof(float));
-                for (int i=0;i<U;i++) {
-                    int src = vmap_[i];
-                    uv_verts[i*3+0] = vp_[src*3+0];
-                    uv_verts[i*3+1] = vp_[src*3+1];
-                    uv_verts[i*3+2] = vp_[src*3+2];
-                }
-                char po[1024], pm[1024];
-                snprintf(po,sizeof(po),"%s/textured.obj",outdir);
-                snprintf(pm,sizeof(pm),"%s/textured.mtl",outdir);
-                if (write_textured_obj(po, pm, "textured.png",
-                                       uv_verts, U, uvs_orig_, U, ui_, F) == 0)
-                    fprintf(stderr, "[chain] wrote %s + %s\n", po, pm);
-                free(uv_verts);
-            }
-            free(tex8); free(out_tex); free(out_msk); free(m_u8);
-        } else {
-            fprintf(stderr, "[chain] inpaint skipped (missing UV tensors in %s)\n", bp_ref);
+        /* mesh_vertex_inpaint expects vtx_pos[V,3] indexed by faces[F,3] for
+         * the position graph, and vtx_uv[U,2] indexed by uv_idx[F,3] for the
+         * UV→pixel mapping. Use original (raw) per-vertex positions and
+         * unflipped UVs (the inpaint helper does its own row=1-v flip). */
+        uint8_t *m_u8 = malloc(tex_n);
+        for (size_t i=0;i<tex_n;i++) m_u8[i] = mask[i]>0.f ? 255 : 0;
+        float *out_tex = malloc(tex_n*3*sizeof(float));
+        uint8_t *out_msk = malloc(tex_n);
+        mesh_vertex_inpaint(bake, m_u8, m.pos, uvs, m.tri, uv_idx,
+                            m.n_verts, U, m.n_tris, Htex, Wtex, 3, MVI_SMOOTH,
+                            out_tex, out_msk);
+        uint8_t *tex8 = malloc(tex_n*3);
+        for (size_t i=0;i<tex_n*3;i++) {
+            float v = out_tex[i]*255.f;
+            if (v<0) v=0; if (v>255) v=255;
+            tex8[i] = (uint8_t)(v+0.5f);
         }
-        free(vp_); free(fa_); free(uv_); free(ui_); free(vmap_); free(uvs_orig_);
+        char p2[1024];
+        snprintf(p2,sizeof(p2),"%s/textured.png",outdir);
+        stbi_write_png(p2, Wtex, Htex, 3, tex8, Wtex*3);
+        fprintf(stderr, "[chain] wrote %s\n", p2);
+
+        /* OBJ: emit per-UV-vertex raw positions via vmap, unflipped UVs. */
+        float *uv_verts = malloc((size_t)U*3*sizeof(float));
+        for (int i=0;i<U;i++) {
+            int src = vmap[i];
+            uv_verts[i*3+0] = m.pos[src*3+0];
+            uv_verts[i*3+1] = m.pos[src*3+1];
+            uv_verts[i*3+2] = m.pos[src*3+2];
+        }
+        char po[1024], pm[1024];
+        snprintf(po,sizeof(po),"%s/textured.obj",outdir);
+        snprintf(pm,sizeof(pm),"%s/textured.mtl",outdir);
+        if (write_textured_obj(po, pm, "textured.png",
+                               uv_verts, U, uvs, U, uv_idx, m.n_tris) == 0)
+            fprintf(stderr, "[chain] wrote %s + %s\n", po, pm);
+        free(uv_verts);
+        free(tex8); free(out_tex); free(out_msk); free(m_u8);
     }
+    free(vmap); free(uvs); free(uv_idx); free(vtx_pos_uv_n);
+    free(m.pos); free(m.tri);
 
     free(bake); free(mask); free(tex_pos); free(tex_cov); free(bake_ref); free(trust_ref);
     free(views);
