@@ -100,13 +100,85 @@ void paint_stage_view_maps_set_mesh(paint_stage_view_maps *s,
                                      const float *vtx_pos, int n_verts,
                                      const int *tri_idx, int n_tris);
 
-/* Render all 6 views. Output device buffers must each hold N_views*H*W*3
- * floats (typically 6 * res * res * 3). Either may be NULL to skip. */
+/* Render all 6 views. Output device buffers must each hold N_views*H*W*C
+ * floats: normal/position are [N,H,W,3] (C=3); depth/visible/cos are
+ * [N,H,W] (C=1). Any device buffer may be 0 to skip. out_w2c (if non-NULL)
+ * receives [N,16] per-view world->camera matrices (column-major, applied as
+ * row-vector by back_project_sample_f32). out_proj (if non-NULL) receives
+ * [proj00, proj11] for the orthographic projection (same value for both).
+ *
+ * depth is camera-space z (un-normalized), matching back_project_sample_f32's
+ * `cz = w2c * world_pos`. cos is dot(face_normal_cam, +z_camera_forward) i.e.
+ * -face_normal_cam.z (lookat = (0,0,-1) in camera space), with the standard
+ * paint pipeline 75° angle threshold (cos < cos(75°) → 0). visible is 1.f
+ * for any pixel covered by a triangle, 0.f otherwise. */
 void paint_stage_view_maps_render(paint_stage_view_maps *s,
                                    CUdeviceptr d_normal_out,
-                                   CUdeviceptr d_position_out);
+                                   CUdeviceptr d_position_out,
+                                   CUdeviceptr d_depth_out,
+                                   CUdeviceptr d_visible_out,
+                                   CUdeviceptr d_cos_out,
+                                   float *out_w2c,
+                                   float *out_proj);
 
 void paint_stage_view_maps_destroy(paint_stage_view_maps *s);
+
+/* Apply the same set_mesh pre-render transform (axis swap + auto-center +
+ * scale_factor) to an arbitrary [n,3] world-space xyz buffer. Used to lift a
+ * pyref-generated tex_pos into the rendered coord frame so back_project's
+ * w2c (produced by view_maps) lines up with the texel positions. */
+void paint_stage_view_maps_apply_mesh_transform(paint_stage_view_maps *s,
+                                                  const float *in_xyz,
+                                                  float *out_xyz, int n);
+
+/* ===== DINOv2-giant encoder stage ========================================
+ * Wraps the 40-layer DINOv2-G-40 encoder used by the paint pipeline as image
+ * conditioning. Input: [1,3,224,224] f32 host buffer (BitImageProcessor
+ * preprocessed). Output: [1, 257, 1536] f32 host buffer (final LN hidden
+ * state) suitable as `dino_hidden_states` for paint_stage_unet. */
+typedef struct paint_stage_dinov2g paint_stage_dinov2g;
+
+paint_stage_dinov2g *paint_stage_dinov2g_create(CUdevice dev,
+                                                 const char *weights_path);
+void paint_stage_dinov2g_run(paint_stage_dinov2g *s,
+                              const float *image_f32, float *out_f32);
+void paint_stage_dinov2g_destroy(paint_stage_dinov2g *s);
+
+/* ===== Back-project + bake-blend stage ===================================
+ * Wraps the per-view back_project + GPU bake-blend chain (back_project_sample_f32
+ * -> bake_blend_count_f32 -> bake_blend_accum_f32 -> bake_blend_finalize_f32),
+ * matching MeshRender.fast_bake_texture incl. the "skip view if 99% painted"
+ * behavior. Atlas tensors are uploaded once via set_atlas; per-view inputs
+ * are passed host-side to add_view (the stage uploads them onto its scratch
+ * device buffers). finalize downloads the merged bake_tex + bake_mask. */
+typedef struct paint_stage_back_project paint_stage_back_project;
+
+paint_stage_back_project *paint_stage_back_project_create(CUdevice dev,
+                                                           int Htex, int Wtex,
+                                                           int C);
+
+void paint_stage_back_project_set_atlas(paint_stage_back_project *s,
+                                         const float *tex_pos,
+                                         const int *tex_cov);
+
+void paint_stage_back_project_begin(paint_stage_back_project *s);
+
+/* Run one view: returns 0 if accumulated, 1 if the view was skipped because
+ * it was already ≥99% painted by previous views. */
+int paint_stage_back_project_add_view(paint_stage_back_project *s,
+                                       const float *image,
+                                       const float *depth,
+                                       const float *visible,
+                                       const float *cos_img,
+                                       const float *w2c_4x4,
+                                       int Himg, int Wimg,
+                                       float proj00, float proj11);
+
+void paint_stage_back_project_finalize(paint_stage_back_project *s,
+                                        float *out_bake,
+                                        float *out_mask);
+
+void paint_stage_back_project_destroy(paint_stage_back_project *s);
 
 #ifdef __cplusplus
 }
