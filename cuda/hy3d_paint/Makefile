@@ -59,12 +59,13 @@ test_paint_cfg_loop: test_paint_cfg_loop.c cuda_paint_unipc.h
 	$(CC) $(CFLAGS) -o $@ test_paint_cfg_loop.c -lm
 
 test_paint_pipeline: test_paint_pipeline.c paint_runtime.c \
-                     paint_stage_vae.c paint_stages.h \
+                     paint_stage_vae.c paint_stage_unet.c paint_stages.h \
                      cuda_paint_vae_runner.h cuda_paint_vae_kernels.h \
+                     cuda_paint_unet_runner.h cuda_paint_unet_kernels.h \
                      $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h \
                      ../../common/safetensors.h
 	$(CC) $(CFLAGS) -o $@ test_paint_pipeline.c paint_runtime.c \
-	    paint_stage_vae.c $(CUEW_SRC) $(CULDFLAGS)
+	    paint_stage_vae.c paint_stage_unet.c $(CUEW_SRC) $(CULDFLAGS)
 
 test_dinov2_giant: test_dinov2_giant.c cuda_paint_nn_kernels.h $(CUEW_SRC) \
                    ../cuew.h ../cuda_runner_common.h ../cuda_kernels_common.h \
