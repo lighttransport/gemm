@@ -589,8 +589,44 @@ static int cmd_chain(int argc, char **argv) {
                 dst[gi*lat_per + k] *= 0.18215f;
         }
     }
-    free(img_chw); free(all_nrm); free(all_pos);
+    free(all_nrm); free(all_pos);
     fprintf(stderr, "[chain] vae-encode: 2 normal + 2 position views -> embeds\n");
+
+    /* ref_lat: VAE-encode the input ref image at 512² (matches production
+     * encode_images: (x-0.5)*2 then VAE encode then *0.18215). Source comes
+     * from CHAIN_REF_IMAGE env var (NPY [3,512,512] or [512,512,3], in [0,1]).
+     * If absent, fall back to oracle in_ref_latents.npy. */
+    {
+        const char *ref_img_path = getenv("CHAIN_REF_IMAGE");
+        if (ref_img_path) {
+            int rnd = 0; size_t rsh[8] = {0}, rnn = 0; int rdt = 0;
+            float *rimg = (float *)npy_read(ref_img_path, &rnd, rsh, &rnn, &rdt);
+            if (!rimg || rnn != (size_t)3*OH*OW) {
+                fprintf(stderr, "[chain] CHAIN_REF_IMAGE: bad shape (need 3*%d*%d, got %zu)\n",
+                        OH, OW, rnn);
+                return 1;
+            }
+            int is_hwc = (rnd == 3 && (int)rsh[2] == 3);
+            for (int y = 0; y < OH; y++)
+                for (int xx = 0; xx < OW; xx++)
+                    for (int c = 0; c < 3; c++) {
+                        float v = is_hwc ? rimg[(y*OW + xx)*3 + c]
+                                          : rimg[c*OH*OW + y*OW + xx];
+                        img_chw[c*OH*OW + y*OW + xx] = v * 2.f - 1.f;
+                    }
+            free(rimg);
+            cuMemcpyHtoD(d_img, img_chw, img_per * sizeof(float));
+            paint_stage_vae_encode(vae, d_img, OH, OW, d_lat,
+                                    d_a, d_b, d_t1, d_t2,
+                                    d_qnc, d_knc, d_vnc, d_ync);
+            cuCtxSynchronize();
+            ref_lat = (float *)malloc(lat_per * sizeof(float));
+            cuMemcpyDtoH(ref_lat, d_lat, lat_per * sizeof(float));
+            for (size_t k = 0; k < lat_per; k++) ref_lat[k] *= 0.18215f;
+            fprintf(stderr, "[chain] vae-encode: ref image %s -> ref_lat\n", ref_img_path);
+        }
+    }
+    free(img_chw);
 
     paint_stage_unet *u = paint_stage_unet_create(dev, unet_path, &cfg);
     if (!u) return 1;
