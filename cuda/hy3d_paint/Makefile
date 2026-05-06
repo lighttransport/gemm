@@ -44,7 +44,7 @@ test_paint_back_project_e2e: test_paint_back_project_e2e.c cuda_paint_raster_ker
 test_swiglu: test_swiglu.c cuda_paint_nn_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_swiglu.c $(CUEW_SRC) $(CULDFLAGS)
 
-test_paint_vae: test_paint_vae.c cuda_paint_vae_kernels.h $(CUEW_SRC) \
+test_paint_vae: test_paint_vae.c cuda_paint_vae_kernels.h cuda_paint_vae_runner.h $(CUEW_SRC) \
                 ../cuew.h ../cuda_runner_common.h ../../common/safetensors.h
 	$(CC) $(CFLAGS) -o $@ test_paint_vae.c $(CUEW_SRC) $(CULDFLAGS)
 
