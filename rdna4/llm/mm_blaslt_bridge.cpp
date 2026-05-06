@@ -128,19 +128,22 @@ int build_plan(int M, int N, int K, int flags, Plan &p) {
     std::fprintf(stderr, "[mm_blaslt] no algos for M=%d N=%d K=%d\n", M, N, K);
     return -1;
   }
-  /* Pick first valid result. */
+  /* Pick first valid algo. NOTE: heuristic order is not perf-ranked on
+   * gfx1201 (klin_dn picks a 2× slower algo than klin_up despite same FLOPs).
+   * Both naive sweep (dummy buffers) and deferred sweep (real buffers, after
+   * user's setattr) segfault inside hipBLASLt's matmul setup — driver bug
+   * triggered by back-to-back matmul calls without intermediate work. The
+   * remaining klin gap requires a non-hipBLASLt path (Triton AOT or WMMA). */
   int best = -1;
   for (int i = 0; i < returned; ++i) {
-    if (results[i].state == HIPBLAS_STATUS_SUCCESS) {
-      best = i;
-      break;
-    }
+    if (results[i].state == HIPBLAS_STATUS_SUCCESS) { best = i; break; }
   }
   if (best < 0) {
     std::fprintf(stderr, "[mm_blaslt] no successful algo for M=%d N=%d K=%d\n",
                  M, N, K);
     return -1;
   }
+
   p.algo = results[best].algo;
   p.workspace_size = results[best].workspaceSize;
   if (p.workspace_size > 0) {
