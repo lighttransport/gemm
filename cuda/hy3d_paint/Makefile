@@ -58,10 +58,14 @@ test_paint_unipc: test_paint_unipc.c cuda_paint_unipc.h
 test_paint_cfg_loop: test_paint_cfg_loop.c cuda_paint_unipc.h
 	$(CC) $(CFLAGS) -o $@ test_paint_cfg_loop.c -lm
 
+paint_inpaint_helper.o: paint_inpaint_helper.cc mesh_vertex_inpaint.h
+	$(CXX) $(CXXFLAGS) -c -o $@ paint_inpaint_helper.cc
+
 test_paint_pipeline: test_paint_pipeline.c paint_runtime.c \
                      paint_stage_vae.c paint_stage_unet.c \
                      paint_stage_view_maps.c paint_stage_dinov2g.c \
                      paint_stage_back_project.c paint_stages.h \
+                     paint_inpaint_helper.o mesh_vertex_inpaint.h \
                      cuda_paint_vae_runner.h cuda_paint_vae_kernels.h \
                      cuda_paint_unet_runner.h cuda_paint_unet_kernels.h \
                      cuda_paint_nn_kernels.h cuda_paint_raster_kernels.h \
@@ -73,7 +77,8 @@ test_paint_pipeline: test_paint_pipeline.c paint_runtime.c \
 	$(CC) $(CFLAGS) -I../hy3d -o $@ test_paint_pipeline.c paint_runtime.c \
 	    paint_stage_vae.c paint_stage_unet.c paint_stage_view_maps.c \
 	    paint_stage_dinov2g.c paint_stage_back_project.c \
-	    $(CUEW_SRC) $(CULDFLAGS) -lm
+	    paint_inpaint_helper.o \
+	    $(CUEW_SRC) $(CULDFLAGS) -lm -lstdc++
 
 test_paint_view_maps_stage: test_paint_view_maps_stage.c \
                             paint_stage_view_maps.c paint_stages.h \
