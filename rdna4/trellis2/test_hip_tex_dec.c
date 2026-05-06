@@ -1005,6 +1005,13 @@ int main(int argc, char **argv) {
         const char *env = getenv("T2_TEX_BLASLT");
         int want = (!env || strcmp(env, "0") != 0);
         if (want) {
+            /* Force eager Tensile kernel preload at handle creation. Without this,
+             * hipBLASLt JIT-loads kernels lazily on first call; the K=27648 spconv
+             * plan compile alone is ~1.1 s and lands inside the first user call.
+             * Preload moves that cost into mm_blaslt_init() and cuts wall ~2.2×.
+             * User can opt out via HIPBLASLT_PRELOAD_KERNELS=0. */
+            if (!getenv("HIPBLASLT_PRELOAD_KERNELS"))
+                setenv("HIPBLASLT_PRELOAD_KERNELS", "1", 0);
             if (mm_blaslt_init() == 0) {
                 /* Activation BF16 scratch (128 MB).
                  * Bigger scratch lets gather-then-GEMM use larger M chunks
