@@ -557,7 +557,15 @@ static int cmd_chain(int argc, char **argv) {
 #define LD(var, name) do { snprintf(path,sizeof(path),"%s/%s",unet_ref,name); var = npy_read(path,&nd,sh,&nn,dt); if (!var){fprintf(stderr,"missing %s\n",path); return 1;} } while(0)
     LD(ref_lat,"in_ref_latents.npy");
 #undef LD
-    paint_unet_config cfg = { .B_outer=1, .N_pbr=2, .N_gen=2, .N_ref=1, .H0=64, .W0=64,
+    int N_gen_cfg = 6;
+    {
+        const char *e = getenv("CHAIN_N_GEN");
+        if (e && atoi(e) > 0) N_gen_cfg = atoi(e);
+        if (N_gen_cfg != 2 && N_gen_cfg != 6) {
+            fprintf(stderr, "CHAIN_N_GEN must be 2 or 6 (got %d)\n", N_gen_cfg); return 1;
+        }
+    }
+    paint_unet_config cfg = { .B_outer=1, .N_pbr=2, .N_gen=N_gen_cfg, .N_ref=1, .H0=64, .W0=64,
                               .M_text=M_text, .cross_dim=cross_dim, .T_dino=257, .C_dino_in=1536 };
     int Beff = cfg.B_outer*cfg.N_pbr*cfg.N_gen;
     size_t x_n = (size_t)Beff*4*cfg.H0*cfg.W0;
@@ -592,7 +600,11 @@ static int cmd_chain(int argc, char **argv) {
     /* HWC[H,W,3]∈[0,1] → CHW[3,H,W]∈[-1,1] then VAE-encode → [4,64,64]
      * scaled by 0.18215 (diffusers scaling_factor). */
     int N_gen = cfg.N_gen;
-    int sel_views[2] = {0, 2}; /* front, back */
+    /* N_gen=2 picks front+back; N_gen=6 picks all 6 candidate views (matching
+     * view_maps order: azim {0,90,180,270,0,180} elev {0,0,0,0,+90,-90}). */
+    int sel_views_all[6] = {0, 1, 2, 3, 4, 5};
+    int sel_views_2 [2] = {0, 2};
+    const int *sel_views = (N_gen == 6) ? sel_views_all : sel_views_2;
     size_t img_per = 3*(size_t)OH*OW, lat_per = 4*(size_t)IH*IW;
     float *embeds_normal   = malloc((size_t)N_gen * lat_per * sizeof(float));
     float *embeds_position = malloc((size_t)N_gen * lat_per * sizeof(float));
@@ -618,7 +630,7 @@ static int cmd_chain(int argc, char **argv) {
         }
     }
     free(all_nrm); free(all_pos);
-    fprintf(stderr, "[chain] vae-encode: 2 normal + 2 position views -> embeds\n");
+    fprintf(stderr, "[chain] vae-encode: %d normal + %d position views -> embeds\n", N_gen, N_gen);
 
     /* ref_lat: VAE-encode the input ref image at 512² (matches production
      * encode_images: (x-0.5)*2 then VAE encode then *0.18215). Source comes
@@ -685,9 +697,18 @@ static int cmd_chain(int argc, char **argv) {
         if (g) cfg_scale = (float)atof(g);
     }
     int do_cfg = (cfg_mode != 0);
-    /* view_scale per row: cam_mapping(azim) where sel_views {0,2} → azim {0,180}.
-     * cam_mapping(0)=1.0, cam_mapping(180)=2.0. Tiled across N_pbr=2. */
-    float vs_per_row[4] = {1.0f, 2.0f, 1.0f, 2.0f};
+    /* view_scale per row: cam_mapping(azim) where azim per view comes from
+     * the 6-view candidate set {0,90,180,270,0,180}. cam_mapping: azim<90 →
+     * azim/90+1; 90<=azim<330 → 2.0; else → -azim/90+5.0. For N_gen=2
+     * sel_views={0,2}: vs={1.0, 2.0}. For N_gen=6: vs={1.0,2.0,2.0,2.0,1.0,2.0}.
+     * Tiled across N_pbr=2 → length Beff. */
+    float vs_per_row[12];
+    {
+        float per_view_vs[6] = {1.0f, 2.0f, 2.0f, 2.0f, 1.0f, 2.0f};
+        for (int p = 0; p < cfg.N_pbr; p++)
+            for (int g = 0; g < N_gen; g++)
+                vs_per_row[p * N_gen + g] = per_view_vs[sel_views[g]];
+    }
 
     /* Zero conditioning buffers for the uncond pass. Shapes match real ones. */
     float *zero_en = NULL, *zero_ep = NULL, *zero_text = NULL,
