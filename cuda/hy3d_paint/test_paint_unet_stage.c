@@ -42,8 +42,11 @@ static void *read_npy(const char *path, int *out_nd, uint64_t *out_shape,
     uint16_t hlen; if (fread(&hlen, 2, 1, f) != 1) { fclose(f); return NULL; }
     char hdr[1024]; if (hlen >= sizeof(hdr) || fread(hdr, 1, hlen, f) != hlen) { fclose(f); return NULL; }
     hdr[hlen] = 0;
-    const char *dp = strstr(hdr, "'descr':"); strncpy(out_dt, dp ? dp + 11 : "<f4", 4);
-    out_dt[4] = 0;
+    const char *dp = strstr(hdr, "'descr':");
+    /* hdr layout: `'descr': '<f4'` — value char at dp+11 is the byte-order
+     * mark, dp+12 is the type code, dp+13 is the size. */
+    if (dp) { out_dt[0] = dp[11]; out_dt[1] = dp[12]; out_dt[2] = dp[13]; out_dt[3] = 0; }
+    else    { out_dt[0] = '<'; out_dt[1] = 'f'; out_dt[2] = '4'; out_dt[3] = 0; }
     const char *p = strstr(hdr, "'shape': ("); if (!p) { fclose(f); return NULL; }
     p += strlen("'shape': (");
     int nd = 0; uint64_t shape[8]; size_t total = 1;
@@ -56,7 +59,7 @@ static void *read_npy(const char *path, int *out_nd, uint64_t *out_shape,
     *out_nd = nd;
     for (int i = 0; i < nd; i++) out_shape[i] = shape[i];
     *out_n = total;
-    int elsz = (out_dt[1] == 'i' && out_dt[2] == '8') ? 8 : 4;
+    int elsz = (out_dt[0] == 'i' && out_dt[1] == '8') ? 8 : 4;  /* int64 vs f32 */
     void *buf = malloc(total * elsz);
     if (fread(buf, elsz, total, f) != total) { free(buf); fclose(f); return NULL; }
     fclose(f); return buf;
