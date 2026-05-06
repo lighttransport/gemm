@@ -43,6 +43,7 @@
 #include "../../common/stb_image_write.h"
 
 #include "mesh_vertex_inpaint.h"
+#include "../../common/safetensors.h"
 
 extern int paint_xatlas_unwrap(
     const float *vtx_pos, int n_verts,
@@ -523,10 +524,37 @@ static int cmd_chain(int argc, char **argv) {
      * View selection: front (azim 0, idx 0) and back (azim 180, idx 2) of
      * the 6-view candidate set. */
     char path[512];
-    float *text_in, *ref_lat;
+    float *text_in = NULL, *ref_lat = NULL;
+    int M_text = 77, cross_dim = 1024;
+    /* Load learned_text_clip_{albedo,mr} from the unet safetensors and stack
+     * as [B=1, N_pbr=2, M_text=77, cross_dim=1024]. Production path:
+     * pipeline.py:268-275 (use_learned_text_clip=True bypasses CLIP entirely;
+     * encoder_hidden_states is just two learned [77,1024] params concatenated
+     * along the N_pbr axis, repeated for batch_size=1). */
+    {
+        st_context *st = safetensors_open(unet_path);
+        if (!st) { fprintf(stderr, "[chain] cannot open %s for text\n", unet_path); return 1; }
+        const char *names[2] = {"learned_text_clip_albedo", "learned_text_clip_mr"};
+        text_in = (float *)malloc((size_t)2 * 77 * 1024 * sizeof(float));
+        for (int i = 0; i < 2; i++) {
+            int idx = safetensors_find(st, names[i]);
+            if (idx < 0) {
+                fprintf(stderr, "[chain] %s missing in unet weights\n", names[i]);
+                safetensors_close(st); return 1;
+            }
+            const char *dts = safetensors_dtype(st, idx);
+            if (strcmp(dts, "F32") != 0) {
+                fprintf(stderr, "[chain] %s dtype=%s (need F32)\n", names[i], dts);
+                safetensors_close(st); return 1;
+            }
+            memcpy(text_in + (size_t)i * 77 * 1024,
+                   safetensors_data(st, idx),
+                   (size_t)77 * 1024 * sizeof(float));
+        }
+        safetensors_close(st);
+        fprintf(stderr, "[chain] text: loaded learned_text_clip_{albedo,mr} -> [1,2,77,1024]\n");
+    }
 #define LD(var, name) do { snprintf(path,sizeof(path),"%s/%s",unet_ref,name); var = npy_read(path,&nd,sh,&nn,dt); if (!var){fprintf(stderr,"missing %s\n",path); return 1;} } while(0)
-    LD(text_in,"in_encoder_hidden_states.npy");
-    int M_text=(int)sh[2], cross_dim=(int)sh[3];
     LD(ref_lat,"in_ref_latents.npy");
 #undef LD
     paint_unet_config cfg = { .B_outer=1, .N_pbr=2, .N_gen=2, .N_ref=1, .H0=64, .W0=64,
