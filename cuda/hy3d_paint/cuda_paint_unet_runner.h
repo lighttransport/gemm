@@ -18,9 +18,9 @@
 #define CUDA_PAINT_UNET_RUNNER_H_
 
 #include "../cuew.h"
-#ifdef CUDA_PAINT_UNET_RUNNER_IMPLEMENTATION
+/* cuda_runner_common helpers are file-local `static`, so every including TU
+ * needs the impls (no link conflict). Define unconditionally. */
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
-#endif
 #include "../cuda_runner_common.h"
 #include "cuda_paint_unet_kernels.h"
 
