@@ -493,6 +493,13 @@ static int cmd_chain(int argc, char **argv) {
         fprintf(stderr,"[chain] dumped depth/visible/cos/w2c (proj=%.4f,%.4f)\n",
                 proj_diag[0],proj_diag[1]);
     }
+    /* Snapshot normal/position RGB views to host so we can VAE-encode them
+     * for unet conditioning (replaces the random in_embeds_{normal,position}
+     * the wrapper dump previously supplied). [N,H,W,3] f32 in [0,1]. */
+    float *all_nrm = malloc(N*per*sizeof(float));
+    float *all_pos = malloc(N*per*sizeof(float));
+    cuMemcpyDtoH(all_nrm, d_n, N*per*sizeof(float));
+    cuMemcpyDtoH(all_pos, d_p, N*per*sizeof(float));
     cuMemFree(d_n); cuMemFree(d_p); cuMemFree(d_de); cuMemFree(d_vi); cuMemFree(d_co);
     /* vm + m stay alive — needed below for xatlas unwrap, atlas raster,
      * and OBJ writeout. */
@@ -509,16 +516,15 @@ static int cmd_chain(int argc, char **argv) {
     free(dg_in);
     paint_stage_dinov2g_destroy(dg);
 
-    /* 3. unet — text/normal/position conditioning still come from unet_refdir
-     * (those are produced by upstream tokenizer + render passes not yet
-     * ported). The initial latent x0 and timesteps are now generated locally:
-     * x0 = N(0,1) seeded by CHAIN_SEED (default 42); timesteps from pu_unipc
-     * (matches diffusers UniPC trailing schedule). */
+    /* 3. VAE-encode 2 selected views of normal/position into unet conditioning
+     * latents [B=1,N_gen=2,4,64,64] (replaces synthetic random embeds the
+     * wrapper dump previously supplied). text + ref_lat still come from
+     * unet_refdir (CLIP text encoder + ref image VAE-encode not yet ported).
+     * View selection: front (azim 0, idx 0) and back (azim 180, idx 2) of
+     * the 6-view candidate set. */
     char path[512];
-    float *en, *ep, *text_in, *ref_lat;
+    float *text_in, *ref_lat;
 #define LD(var, name) do { snprintf(path,sizeof(path),"%s/%s",unet_ref,name); var = npy_read(path,&nd,sh,&nn,dt); if (!var){fprintf(stderr,"missing %s\n",path); return 1;} } while(0)
-    LD(en,"in_embeds_normal.npy");
-    LD(ep,"in_embeds_position.npy");
     LD(text_in,"in_encoder_hidden_states.npy");
     int M_text=(int)sh[2], cross_dim=(int)sh[3];
     LD(ref_lat,"in_ref_latents.npy");
@@ -527,10 +533,69 @@ static int cmd_chain(int argc, char **argv) {
                               .M_text=M_text, .cross_dim=cross_dim, .T_dino=257, .C_dino_in=1536 };
     int Beff = cfg.B_outer*cfg.N_pbr*cfg.N_gen;
     size_t x_n = (size_t)Beff*4*cfg.H0*cfg.W0;
+
+    /* Spin up VAE early so we can encode normal/position views right now.
+     * Workspace buffers are sized for the larger of encode (512²×128 ch) and
+     * decode (same): both peak at 128×512×512 floats. */
+    paint_stage_vae *vae = paint_stage_vae_create(dev, vae_path);
+    if (!vae) return 1;
+    int IH=cfg.H0, IW=cfg.W0, OH=IH*8, OW=IW*8;
+    size_t vae_cands[] = {
+        (size_t)512*IH*IW, (size_t)512*(IH*2)*(IW*2), (size_t)512*(IH*4)*(IW*4),
+        (size_t)256*(IH*4)*(IW*4), (size_t)256*(IH*8)*(IW*8),
+        (size_t)128*(IH*8)*(IW*8)
+    };
+    size_t vae_max_n = 0;
+    for (size_t i = 0; i < sizeof(vae_cands)/sizeof(*vae_cands); i++)
+        if (vae_cands[i] > vae_max_n) vae_max_n = vae_cands[i];
+    size_t vae_attn_n = (size_t)512*IH*IW;
+    CUdeviceptr d_img, d_lat, d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync;
+    cuMemAlloc(&d_img, 3*(size_t)OH*OW*sizeof(float));
+    cuMemAlloc(&d_lat, 4*(size_t)IH*IW*sizeof(float));
+    cuMemAlloc(&d_a, vae_max_n*sizeof(float));
+    cuMemAlloc(&d_b, vae_max_n*sizeof(float));
+    cuMemAlloc(&d_t1, vae_max_n*sizeof(float));
+    cuMemAlloc(&d_t2, vae_max_n*sizeof(float));
+    cuMemAlloc(&d_qnc, vae_attn_n*sizeof(float));
+    cuMemAlloc(&d_knc, vae_attn_n*sizeof(float));
+    cuMemAlloc(&d_vnc, vae_attn_n*sizeof(float));
+    cuMemAlloc(&d_ync, vae_attn_n*sizeof(float));
+
+    /* HWC[H,W,3]∈[0,1] → CHW[3,H,W]∈[-1,1] then VAE-encode → [4,64,64]
+     * scaled by 0.18215 (diffusers scaling_factor). */
+    int N_gen = cfg.N_gen;
+    int sel_views[2] = {0, 2}; /* front, back */
+    size_t img_per = 3*(size_t)OH*OW, lat_per = 4*(size_t)IH*IW;
+    float *embeds_normal   = malloc((size_t)N_gen * lat_per * sizeof(float));
+    float *embeds_position = malloc((size_t)N_gen * lat_per * sizeof(float));
+    float *img_chw = malloc(img_per * sizeof(float));
+    for (int kind = 0; kind < 2; kind++) {  /* 0=normal, 1=position */
+        const float *src = kind ? all_pos : all_nrm;
+        float *dst = kind ? embeds_position : embeds_normal;
+        for (int gi = 0; gi < N_gen; gi++) {
+            const float *vh = src + (size_t)sel_views[gi] * per;
+            for (int y = 0; y < OH; y++)
+                for (int xx = 0; xx < OW; xx++)
+                    for (int c = 0; c < 3; c++)
+                        img_chw[c*OH*OW + y*OW + xx] =
+                            vh[(y*OW + xx)*3 + c] * 2.f - 1.f;
+            cuMemcpyHtoD(d_img, img_chw, img_per * sizeof(float));
+            paint_stage_vae_encode(vae, d_img, OH, OW, d_lat,
+                                    d_a, d_b, d_t1, d_t2,
+                                    d_qnc, d_knc, d_vnc, d_ync);
+            cuCtxSynchronize();
+            cuMemcpyDtoH(dst + (size_t)gi*lat_per, d_lat, lat_per*sizeof(float));
+            for (size_t k = 0; k < lat_per; k++)
+                dst[gi*lat_per + k] *= 0.18215f;
+        }
+    }
+    free(img_chw); free(all_nrm); free(all_pos);
+    fprintf(stderr, "[chain] vae-encode: 2 normal + 2 position views -> embeds\n");
+
     paint_stage_unet *u = paint_stage_unet_create(dev, unet_path, &cfg);
     if (!u) return 1;
-    paint_stage_unet_set_conditioning(u, (float*)en, (float*)ep, (float*)text_in,
-                                       (float*)ref_lat, dino_h);
+    paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
+                                       (float*)text_in, (float*)ref_lat, dino_h);
     paint_stage_unet_run_dual(u);
 
     int N_steps = 3;
@@ -574,32 +639,19 @@ static int cmd_chain(int argc, char **argv) {
     snprintf(path, sizeof(path), "%s/chain_latents.npy", outdir);
     int s4[4]={Beff,4,cfg.H0,cfg.W0}; npy_write_f32(path, x, s4, 4);
     pu_unipc_free(&sch);
-    free(en); free(ep); free(text_in); free(ref_lat);
+    free(text_in); free(ref_lat);
+    free(embeds_normal); free(embeds_position);
     paint_stage_unet_destroy(u);
     free(np_buf); free(dino_h);
 
-    /* 4. vae decode each latent */
-    paint_stage_vae *vae = paint_stage_vae_create(dev, vae_path);
-    if (!vae) return 1;
-    int IH=cfg.H0, IW=cfg.W0, OH=IH*8, OW=IW*8;
-    size_t cands[]={(size_t)512*IH*IW,(size_t)512*(IH*2)*(IW*2),(size_t)512*(IH*4)*(IW*4),
-                    (size_t)256*(IH*4)*(IW*4),(size_t)256*(IH*8)*(IW*8),(size_t)128*(IH*8)*(IW*8)};
-    size_t max_n=0; for(size_t i=0;i<sizeof(cands)/sizeof(*cands);i++) if(cands[i]>max_n) max_n=cands[i];
-    size_t attn_n=(size_t)512*IH*IW;
-    CUdeviceptr d_in,d_out,d_a,d_b,d_t1,d_t2,d_qnc,d_knc,d_vnc,d_ync;
-    cuMemAlloc(&d_in,4*(size_t)IH*IW*sizeof(float));
-    cuMemAlloc(&d_out,3*(size_t)OH*OW*sizeof(float));
-    cuMemAlloc(&d_a,max_n*sizeof(float)); cuMemAlloc(&d_b,max_n*sizeof(float));
-    cuMemAlloc(&d_t1,max_n*sizeof(float)); cuMemAlloc(&d_t2,max_n*sizeof(float));
-    cuMemAlloc(&d_qnc,attn_n*sizeof(float)); cuMemAlloc(&d_knc,attn_n*sizeof(float));
-    cuMemAlloc(&d_vnc,attn_n*sizeof(float)); cuMemAlloc(&d_ync,attn_n*sizeof(float));
+    /* 4. vae decode each latent — reuse the VAE workspace allocated above. */
     size_t in_per=(size_t)4*IH*IW, out_per=(size_t)3*OH*OW;
     float *views = malloc((size_t)Beff * out_per * sizeof(float));
     for (int bi = 0; bi < Beff; bi++) {
-        cuMemcpyHtoD(d_in, x + bi*in_per, in_per*sizeof(float));
-        paint_stage_vae_decode(vae, d_in, IH, IW, d_out, d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+        cuMemcpyHtoD(d_lat, x + bi*in_per, in_per*sizeof(float));
+        paint_stage_vae_decode(vae, d_lat, IH, IW, d_img, d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
         cuCtxSynchronize();
-        cuMemcpyDtoH(views + bi*out_per, d_out, out_per*sizeof(float));
+        cuMemcpyDtoH(views + bi*out_per, d_img, out_per*sizeof(float));
     }
     /* VAE outputs in [-1,1]; shift to [0,1] for back_project (matches
      * StableDiffusionPipeline.decode_latents: image = (image / 2 + 0.5).clamp(0,1)). */
@@ -614,7 +666,7 @@ static int cmd_chain(int argc, char **argv) {
     fprintf(stderr, "[chain] vae: %d latents -> %d RGB views @ %d²\n", Beff, Beff, OH);
     snprintf(path, sizeof(path), "%s/chain_views.npy", outdir);
     int sv[4]={Beff,3,OH,OW}; npy_write_f32(path, views, sv, 4);
-    free(x); cuMemFree(d_in); cuMemFree(d_out);
+    free(x); cuMemFree(d_img); cuMemFree(d_lat);
     cuMemFree(d_a); cuMemFree(d_b); cuMemFree(d_t1); cuMemFree(d_t2);
     cuMemFree(d_qnc); cuMemFree(d_knc); cuMemFree(d_vnc); cuMemFree(d_ync);
     paint_stage_vae_destroy(vae);
