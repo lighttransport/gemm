@@ -669,18 +669,22 @@ static int cmd_chain(int argc, char **argv) {
         const char *e = getenv("CHAIN_SEED");
         if (e) seed = strtoull(e, NULL, 10);
     }
-    /* 2-chunk classifier-free guidance: noise = uncond + g*vs*(full - uncond).
-     * (Production uses 3-chunk uncond/ref/full; 2-chunk is a tractable
-     * approximation that calls the unet stage 2x per UniPC step.) Disable
-     * with CHAIN_CFG=0; CHAIN_CFG_SCALE=<f> sets guidance (default 3.0). */
-    int do_cfg = 1;
+    /* Classifier-free guidance. CHAIN_CFG: 0=off, 2=2-chunk uncond/full,
+     * 3=3-chunk uncond/ref/full (default; matches production pipeline.py:660-688).
+     * 3-chunk: noise = uncond + g*vs*(ref-uncond) + g*vs*(full-ref). 2-chunk:
+     * noise = uncond + g*vs*(full-uncond). CHAIN_CFG_SCALE=<f> sets g (default 3.0). */
+    int cfg_mode = 3; /* 0=off, 2=2-chunk, 3=3-chunk */
     float cfg_scale = 3.0f;
     {
         const char *e = getenv("CHAIN_CFG");
-        if (e && atoi(e) == 0) do_cfg = 0;
+        if (e) {
+            int v = atoi(e);
+            cfg_mode = (v == 0) ? 0 : (v == 2 ? 2 : 3);
+        }
         const char *g = getenv("CHAIN_CFG_SCALE");
         if (g) cfg_scale = (float)atof(g);
     }
+    int do_cfg = (cfg_mode != 0);
     /* view_scale per row: cam_mapping(azim) where sel_views {0,2} → azim {0,180}.
      * cam_mapping(0)=1.0, cam_mapping(180)=2.0. Tiled across N_pbr=2. */
     float vs_per_row[4] = {1.0f, 2.0f, 1.0f, 2.0f};
@@ -703,6 +707,7 @@ static int cmd_chain(int argc, char **argv) {
     }
     float *x = malloc(x_n*sizeof(float)), *np_buf = malloc(x_n*sizeof(float));
     float *np_uncond = do_cfg ? malloc(x_n*sizeof(float)) : NULL;
+    float *np_ref    = (cfg_mode == 3) ? malloc(x_n*sizeof(float)) : NULL;
     /* Box-Muller N(0,1) seeded with splitmix64 → xoshiro for determinism. */
     {
         unsigned long long s = seed ? seed : 1ULL;
@@ -721,24 +726,46 @@ static int cmd_chain(int argc, char **argv) {
         }
     }
     pu_unipc sch; pu_unipc_init(&sch, N_steps, x_n);
-    fprintf(stderr, "[chain] unet: %d steps, seed=%llu, cfg=%s scale=%.2f, ts=[",
-            N_steps, seed, do_cfg ? "on" : "off", cfg_scale);
+    fprintf(stderr, "[chain] unet: %d steps, seed=%llu, cfg=%dchunk scale=%.2f, ts=[",
+            N_steps, seed, cfg_mode, cfg_scale);
     for (int i = 0; i < N_steps; i++)
         fprintf(stderr, "%lld%s", sch.timesteps[i], i+1<N_steps?",":"]\n");
     size_t spc = 4 * (size_t)cfg.H0 * cfg.W0;
     for (int i = 0; i < N_steps; i++) {
-        if (do_cfg) {
-            /* uncond */
+        if (cfg_mode == 3) {
+            /* uncond: zero everything */
             paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text,
                                                zero_ref, zero_dino);
             paint_stage_unet_run_dual(u);
             paint_stage_unet_run_step(u, sch.timesteps[i], x, np_uncond);
-            /* full */
+            /* ref: real ref_lat only; embeds/text/dino zero */
+            paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text,
+                                               (float*)ref_lat, zero_dino);
+            paint_stage_unet_run_dual(u);
+            paint_stage_unet_run_step(u, sch.timesteps[i], x, np_ref);
+            /* full: all real */
             paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
                                                (float*)text_in, (float*)ref_lat, dino_h);
             paint_stage_unet_run_dual(u);
             paint_stage_unet_run_step(u, sch.timesteps[i], x, np_buf);
-            /* combine: np = uncond + scale*vs*(full - uncond) per row */
+            /* combine: np = u + g*vs*(r - u) + g*vs*(f - r) */
+            for (int b = 0; b < Beff; b++) {
+                float gv = cfg_scale * vs_per_row[b];
+                float *uc = np_uncond + (size_t)b * spc;
+                float *re = np_ref    + (size_t)b * spc;
+                float *fl = np_buf    + (size_t)b * spc;
+                for (size_t k = 0; k < spc; k++)
+                    fl[k] = uc[k] + gv * (re[k] - uc[k]) + gv * (fl[k] - re[k]);
+            }
+        } else if (cfg_mode == 2) {
+            paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text,
+                                               zero_ref, zero_dino);
+            paint_stage_unet_run_dual(u);
+            paint_stage_unet_run_step(u, sch.timesteps[i], x, np_uncond);
+            paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
+                                               (float*)text_in, (float*)ref_lat, dino_h);
+            paint_stage_unet_run_dual(u);
+            paint_stage_unet_run_step(u, sch.timesteps[i], x, np_buf);
             for (int b = 0; b < Beff; b++) {
                 float gv = cfg_scale * vs_per_row[b];
                 float *uc = np_uncond + (size_t)b * spc;
@@ -759,7 +786,7 @@ static int cmd_chain(int argc, char **argv) {
     free(text_in); free(ref_lat);
     free(embeds_normal); free(embeds_position);
     paint_stage_unet_destroy(u);
-    free(np_buf); free(np_uncond); free(dino_h);
+    free(np_buf); free(np_uncond); free(np_ref); free(dino_h);
     free(zero_en); free(zero_ep); free(zero_text); free(zero_ref); free(zero_dino);
 
     /* 4. vae decode each latent — reuse the VAE workspace allocated above. */
