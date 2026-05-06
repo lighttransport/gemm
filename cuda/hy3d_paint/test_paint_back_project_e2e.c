@@ -102,6 +102,7 @@ static int run_single_view(const char *refdir);
 static int run_multi_view (const char *refdir);
 
 static int g_inpaint = 0;
+static int g_gpu_bake = 0;
 static const char *g_outdir = NULL;
 
 int main(int argc, char **argv) {
@@ -110,6 +111,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--multiview")) multiview = 1;
         else if (!strcmp(argv[i], "--inpaint")) { multiview = 1; g_inpaint = 1; }
+        else if (!strcmp(argv[i], "--gpu-bake")) { multiview = 1; g_gpu_bake = 1; }
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) g_outdir = argv[++i];
         else refdir = argv[i];
     }
@@ -349,6 +351,12 @@ static int run_multi_view(const char *refdir) {
     if (cu_compile_kernels(&mod, dev, cuda_paint_raster_kernels_src,
                            "hy3d_paint_raster", 1, "HY3D-PAINT") < 0) return 1;
     CUfunction f_bp; cuModuleGetFunction(&f_bp, mod, "back_project_sample_f32");
+    CUfunction f_bk_count = NULL, f_bk_accum = NULL, f_bk_finalize = NULL;
+    if (g_gpu_bake) {
+        cuModuleGetFunction(&f_bk_count,    mod, "bake_blend_count_f32");
+        cuModuleGetFunction(&f_bk_accum,    mod, "bake_blend_accum_f32");
+        cuModuleGetFunction(&f_bk_finalize, mod, "bake_blend_finalize_f32");
+    }
 
     size_t tex_n = (size_t)Htex * Wtex;
     size_t img_n = (size_t)Himg * Wimg;
@@ -367,11 +375,36 @@ static int run_multi_view(const char *refdir) {
     cuMemAlloc(&d_out_tex, tex_n * C * sizeof(float));
     cuMemAlloc(&d_out_cos, tex_n     * sizeof(float));
 
-    /* Per-view CUDA back_project, results downloaded for host-side bake. */
-    float **out_tex = malloc(N * sizeof(*out_tex));
-    float **out_cos = malloc(N * sizeof(*out_cos));
+    /* Per-view CUDA back_project. In --gpu-bake mode the bake accumulator
+     * stays on-device and only 8 bytes (view_sum, painted_sum) DtoH per view
+     * to drive the "99% painted" skip decision. Otherwise the original
+     * host-side bake path runs (per-view full DtoH). */
+    const float exp_w = 6.0f;
+    const float bake_eps = 1e-8f;
+
+    float **out_tex = NULL, **out_cos = NULL;
+    float *bake = NULL, *bake_mask = NULL;
+    float *tex_merge = NULL, *trust = NULL;
+
     void *zt = calloc(tex_n * C, sizeof(float));
     void *zc = calloc(tex_n,     sizeof(float));
+
+    CUdeviceptr d_tex_merge = 0, d_trust = 0, d_bake = 0, d_bake_mask = 0,
+                d_view_sum = 0, d_painted_sum = 0;
+    if (g_gpu_bake) {
+        cuMemAlloc(&d_tex_merge,   tex_n * C * sizeof(float));
+        cuMemAlloc(&d_trust,       tex_n     * sizeof(float));
+        cuMemAlloc(&d_bake,        tex_n * C * sizeof(float));
+        cuMemAlloc(&d_bake_mask,   tex_n     * sizeof(float));
+        cuMemAlloc(&d_view_sum,    sizeof(int));
+        cuMemAlloc(&d_painted_sum, sizeof(int));
+        cuMemcpyHtoD(d_tex_merge, zt, tex_n * C * sizeof(float));
+        cuMemcpyHtoD(d_trust,     zc, tex_n     * sizeof(float));
+    } else {
+        out_tex = malloc(N * sizeof(*out_tex));
+        out_cos = malloc(N * sizeof(*out_cos));
+    }
+
     for (int v = 0; v < N; v++) {
         cuMemcpyHtoD(d_image, h_image[v], img_n * C * sizeof(float));
         cuMemcpyHtoD(d_depth, h_depth[v], img_n     * sizeof(float));
@@ -384,44 +417,79 @@ static int run_multi_view(const char *refdir) {
             d_tex_pos, d_tex_cov, d_image, d_depth, d_vis, d_cos, d_w2c,
             proj00, proj11, 3e-3f, Htex, Wtex, Himg, Wimg, C,
             d_out_tex, d_out_cos);
-        cuCtxSynchronize();
-        out_tex[v] = malloc(tex_n * C * sizeof(float));
-        out_cos[v] = malloc(tex_n     * sizeof(float));
-        cuMemcpyDtoH(out_tex[v], d_out_tex, tex_n * C * sizeof(float));
-        cuMemcpyDtoH(out_cos[v], d_out_cos, tex_n     * sizeof(float));
+
+        if (g_gpu_bake) {
+            int N_tex = (int)tex_n, zero = 0;
+            cuMemcpyHtoD(d_view_sum,    &zero, sizeof(int));
+            cuMemcpyHtoD(d_painted_sum, &zero, sizeof(int));
+            void *cargs[] = { &d_out_cos, &d_trust, &d_view_sum,
+                              &d_painted_sum, &N_tex };
+            unsigned grid = (unsigned)((N_tex + 255) / 256);
+            cuLaunchKernel(f_bk_count, grid, 1, 1, 256, 1, 1, 0, 0, cargs, NULL);
+            cuCtxSynchronize();
+            int view_sum = 0, painted_sum = 0;
+            cuMemcpyDtoH(&view_sum,    d_view_sum,    sizeof(int));
+            cuMemcpyDtoH(&painted_sum, d_painted_sum, sizeof(int));
+            if (view_sum > 0 && (double)painted_sum / view_sum > 0.99) {
+                fprintf(stderr, "  view %d: skipped (99%% painted) [gpu]\n", v);
+                continue;
+            }
+            float exp_w_local = exp_w;
+            void *aargs[] = { &d_out_tex, &d_out_cos, &exp_w_local,
+                              &d_tex_merge, &d_trust, &N_tex, &C };
+            cuLaunchKernel(f_bk_accum, grid, 1, 1, 256, 1, 1, 0, 0, aargs, NULL);
+        } else {
+            cuCtxSynchronize();
+            out_tex[v] = malloc(tex_n * C * sizeof(float));
+            out_cos[v] = malloc(tex_n     * sizeof(float));
+            cuMemcpyDtoH(out_tex[v], d_out_tex, tex_n * C * sizeof(float));
+            cuMemcpyDtoH(out_cos[v], d_out_cos, tex_n     * sizeof(float));
+        }
     }
     free(zt); free(zc);
 
-    /* Bake-blend on host: weight = cos^exp; tex_merge = sum(tex*w)/sum(w);
-     * trust = (sum(w) > 1e-8). Mirror MeshRender.fast_bake_texture's "skip
-     * view if 99% already painted" optimization (matters for order-dependent
-     * test reproducibility). */
-    const float exp_w = 6.0f;
-    float *tex_merge = calloc(tex_n * C, sizeof(float));
-    float *trust     = calloc(tex_n,     sizeof(float));
-    for (int v = 0; v < N; v++) {
-        size_t view_sum = 0, painted_sum = 0;
+    if (g_gpu_bake) {
+        int N_tex = (int)tex_n;
+        float eps_local = bake_eps;
+        void *fargs[] = { &d_tex_merge, &d_trust, &eps_local,
+                          &d_bake, &d_bake_mask, &N_tex, &C };
+        unsigned grid = (unsigned)((N_tex + 255) / 256);
+        cuLaunchKernel(f_bk_finalize, grid, 1, 1, 256, 1, 1, 0, 0, fargs, NULL);
+        cuCtxSynchronize();
+        bake      = malloc(tex_n * C * sizeof(float));
+        bake_mask = malloc(tex_n     * sizeof(float));
+        cuMemcpyDtoH(bake,      d_bake,      tex_n * C * sizeof(float));
+        cuMemcpyDtoH(bake_mask, d_bake_mask, tex_n     * sizeof(float));
+    } else {
+        /* Host-side bake-blend (kept as the validation oracle for the GPU
+         * path; matches MeshRender.fast_bake_texture incl. 99%-skip). */
+        tex_merge = calloc(tex_n * C, sizeof(float));
+        trust     = calloc(tex_n,     sizeof(float));
+        for (int v = 0; v < N; v++) {
+            size_t view_sum = 0, painted_sum = 0;
+            for (size_t i = 0; i < tex_n; i++) {
+                int rvr = out_cos[v][i] > 0.f;
+                if (rvr) view_sum++;
+                if (rvr && trust[i] > 0.f) painted_sum++;
+            }
+            if (view_sum > 0 && (double)painted_sum / view_sum > 0.99) {
+                fprintf(stderr, "  view %d: skipped (99%% painted)\n", v);
+                continue;
+            }
+            for (size_t i = 0; i < tex_n; i++) {
+                float w = powf(out_cos[v][i], exp_w);
+                for (int k = 0; k < C; k++)
+                    tex_merge[i*C+k] += out_tex[v][i*C+k] * w;
+                trust[i] += w;
+            }
+        }
+        bake      = malloc(tex_n * C * sizeof(float));
+        bake_mask = malloc(tex_n     * sizeof(float));
         for (size_t i = 0; i < tex_n; i++) {
-            int rvr = out_cos[v][i] > 0.f;
-            if (rvr) view_sum++;
-            if (rvr && trust[i] > 0.f) painted_sum++;
+            float t = trust[i] > bake_eps ? trust[i] : bake_eps;
+            for (int k = 0; k < C; k++) bake[i*C+k] = tex_merge[i*C+k] / t;
+            bake_mask[i] = trust[i] > bake_eps ? 1.f : 0.f;
         }
-        if (view_sum > 0 && (double)painted_sum / view_sum > 0.99) {
-            fprintf(stderr, "  view %d: skipped (99%% painted)\n", v);
-            continue;
-        }
-        for (size_t i = 0; i < tex_n; i++) {
-            float w = powf(out_cos[v][i], exp_w);
-            for (int k = 0; k < C; k++) tex_merge[i*C+k] += out_tex[v][i*C+k] * w;
-            trust[i] += w;
-        }
-    }
-    float *bake = malloc(tex_n * C * sizeof(float));
-    float *bake_mask = malloc(tex_n * sizeof(float));
-    for (size_t i = 0; i < tex_n; i++) {
-        float t = trust[i] > 1e-8f ? trust[i] : 1e-8f;
-        for (int k = 0; k < C; k++) bake[i*C+k] = tex_merge[i*C+k] / t;
-        bake_mask[i] = trust[i] > 1e-8f ? 1.f : 0.f;
     }
 
     /* Diff vs pyref bake. */
@@ -555,7 +623,8 @@ static int run_multi_view(const char *refdir) {
     for (int v = 0; v < N; v++) {
         free(h_image[v]); free(h_depth[v]); free(h_vis[v]);
         free(h_cos[v]); free(h_w2c[v]);
-        free(out_tex[v]); free(out_cos[v]);
+        if (out_tex) free(out_tex[v]);
+        if (out_cos) free(out_cos[v]);
     }
     free(h_image); free(h_depth); free(h_vis); free(h_cos); free(h_w2c);
     free(out_tex); free(out_cos);
@@ -565,6 +634,11 @@ static int run_multi_view(const char *refdir) {
     cuMemFree(d_tex_pos); cuMemFree(d_tex_cov); cuMemFree(d_image);
     cuMemFree(d_depth); cuMemFree(d_vis); cuMemFree(d_cos); cuMemFree(d_w2c);
     cuMemFree(d_out_tex); cuMemFree(d_out_cos);
+    if (g_gpu_bake) {
+        cuMemFree(d_tex_merge); cuMemFree(d_trust);
+        cuMemFree(d_bake); cuMemFree(d_bake_mask);
+        cuMemFree(d_view_sum); cuMemFree(d_painted_sum);
+    }
     cuModuleUnload(mod); cuCtxDestroy(ctx);
     return ok ? 0 : 1;
 }
