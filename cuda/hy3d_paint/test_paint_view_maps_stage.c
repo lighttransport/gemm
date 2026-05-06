@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     CUdeviceptr d_nrm, d_pos;
     cuMemAlloc(&d_nrm, N_VIEWS * per_view * sizeof(float));
     cuMemAlloc(&d_pos, N_VIEWS * per_view * sizeof(float));
-    paint_stage_view_maps_render(vm, d_nrm, d_pos);
+    paint_stage_view_maps_render(vm, d_nrm, d_pos, 0, 0, 0, NULL, NULL);
 
     float *h_nrm = (float *)malloc(N_VIEWS * per_view * sizeof(float));
     float *h_pos = (float *)malloc(N_VIEWS * per_view * sizeof(float));
