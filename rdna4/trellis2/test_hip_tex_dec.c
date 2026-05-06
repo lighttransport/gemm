@@ -276,7 +276,8 @@ static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap
 static void kln(K *k, void *o, void *i, void *w, void *b, int N, int C, int hw, int hb) {
     float eps = 1e-6f;
     void *a[] = {&o, &i, &w, &b, &C, &eps, &hw, &hb};
-    hipModuleLaunchKernel(k->ln, N, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+    int bs = C >= 256 ? 256 : (C >= 128 ? 128 : 64);
+    hipModuleLaunchKernel(k->ln, N, 1, 1, bs, 1, 1, 0, 0, a, NULL);
 }
 static void ksilu(K *k, void *o, void *i, int n) {
     void *a[] = {&o, &i, &n};
