@@ -80,6 +80,34 @@ void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
 
 void paint_stage_unet_destroy(paint_stage_unet *s);
 
+/* ===== View-maps stage ====================================================
+ * Renders per-view (normal_rgb, position_rgb) maps from a mesh, mirroring
+ * hy3dpaint MeshRender.render_normal_multiview / render_position_multiview
+ * with shader_type=face, camera_type=orth, camera_distance=1.45,
+ * ortho_scale=1.2, scale_factor=1.15, auto_center=True. 6 views fixed:
+ * azim {0,90,180,270,0,180} × elev {0,0,0,0,+90,-90}.
+ *
+ * Output buffers are device-resident, contiguous [N_views, H, W, 3] f32 in
+ * [0,1] range with white background, ready to feed VAE-encode.
+ */
+typedef struct paint_stage_view_maps paint_stage_view_maps;
+
+paint_stage_view_maps *paint_stage_view_maps_create(CUdevice dev, int res);
+
+/* Set the source mesh (overwrites any prior mesh; coords are mutated by the
+ * stage's set_mesh transform: negate XY, swap YZ, auto-center, scale_factor). */
+void paint_stage_view_maps_set_mesh(paint_stage_view_maps *s,
+                                     const float *vtx_pos, int n_verts,
+                                     const int *tri_idx, int n_tris);
+
+/* Render all 6 views. Output device buffers must each hold N_views*H*W*3
+ * floats (typically 6 * res * res * 3). Either may be NULL to skip. */
+void paint_stage_view_maps_render(paint_stage_view_maps *s,
+                                   CUdeviceptr d_normal_out,
+                                   CUdeviceptr d_position_out);
+
+void paint_stage_view_maps_destroy(paint_stage_view_maps *s);
+
 #ifdef __cplusplus
 }
 #endif
