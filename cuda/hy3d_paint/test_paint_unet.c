@@ -17,14 +17,20 @@
  *       /tmp/hy3d_paint_unet_ref/
  */
 
+#define CUDA_PAINT_UNET_RUNNER_IMPLEMENTATION
 #include "cuda_paint_unet_runner.h"
 #include "cuda_paint_unipc.h"
 
 int main(int argc, char **argv) {
     const char *stage = "conv_in";
+    const char *save_final_latent = NULL;
     int argi = 1;
-    if (argi < argc && !strcmp(argv[argi], "--stage")) {
-        stage = argv[argi+1]; argi += 2;
+    while (argi < argc && argv[argi][0] == '-') {
+        if (!strcmp(argv[argi], "--stage")) {
+            stage = argv[argi+1]; argi += 2;
+        } else if (!strcmp(argv[argi], "--save-final-latent")) {
+            save_final_latent = argv[argi+1]; argi += 2;
+        } else break;
     }
     if (argc - argi < 2) {
         fprintf(stderr,
@@ -1713,6 +1719,34 @@ int main(int argc, char **argv) {
             free(xa_ref);
         }
 
+        if (save_final_latent) {
+            /* Pre-divide by SD scaling factor 0.18215 so the consumer (e.g.
+             * test_paint_vae decode) doesn't need pipeline-aware scaling. */
+            const float vae_inv_scale = 1.0f / 0.18215f;
+            for (size_t k = 0; k < x_n; k++) x_host[k] *= vae_inv_scale;
+            FILE *fp = fopen(save_final_latent, "wb");
+            if (!fp) { fprintf(stderr, "ERROR: cannot open %s for write\n", save_final_latent); return 1; }
+            /* minimal .npy v1.0 writer: f32, shape [Beff, 4, H, W] */
+            uint8_t magic[6] = {0x93,'N','U','M','P','Y'};
+            uint8_t ver[2] = {1, 0};
+            char hdr[256];
+            int hdrlen = snprintf(hdr, sizeof(hdr),
+                "{'descr': '<f4', 'fortran_order': False, "
+                "'shape': (%d, 4, %d, %d), }", Beff_main, H0, W0);
+            int total = 10 + hdrlen;
+            int pad = 64 - (total % 64);
+            for (int i = 0; i < pad - 1; i++) hdr[hdrlen + i] = ' ';
+            hdr[hdrlen + pad - 1] = '\n';
+            uint16_t hl = (uint16_t)(hdrlen + pad);
+            fwrite(magic, 1, 6, fp);
+            fwrite(ver, 1, 2, fp);
+            fwrite(&hl, 2, 1, fp);
+            fwrite(hdr, 1, hl, fp);
+            fwrite(x_host, sizeof(float), x_n, fp);
+            fclose(fp);
+            fprintf(stderr, "wrote final latent -> %s [%d,4,%d,%d]\n",
+                    save_final_latent, Beff_main, H0, W0);
+        }
         pu_unipc_free(&sch);
         free(x_host); free(noise_pred);
         free(packed_main); free(packed_dual); free(text_tiled_main);
