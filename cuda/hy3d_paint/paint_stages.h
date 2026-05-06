@@ -28,6 +28,17 @@ void paint_stage_vae_decode(paint_stage_vae *s,
                              CUdeviceptr d_t1, CUdeviceptr d_t2,
                              CUdeviceptr d_qnc, CUdeviceptr d_knc,
                              CUdeviceptr d_vnc, CUdeviceptr d_ync);
+/* VAE encode: rgb [3,H,W] in [-1,1] -> latent mean [4,H/8,W/8].
+ * Caller pre-shifts [0,1] images to [-1,1] (matches diffusers convention).
+ * Latent is *not* scaled by 0.18215 here; caller multiplies if needed. */
+void paint_stage_vae_encode(paint_stage_vae *s,
+                             CUdeviceptr d_img, int img_h, int img_w,
+                             CUdeviceptr d_lat,
+                             CUdeviceptr d_a, CUdeviceptr d_b,
+                             CUdeviceptr d_t1, CUdeviceptr d_t2,
+                             CUdeviceptr d_qnc, CUdeviceptr d_knc,
+                             CUdeviceptr d_vnc, CUdeviceptr d_ync);
+
 void paint_stage_vae_destroy(paint_stage_vae *s);
 
 /* ===== UNet stage =========================================================

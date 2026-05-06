@@ -12,6 +12,8 @@
 struct paint_stage_vae {
     pvae_kernels kk;
     pvae_decoder dec;
+    pvae_encoder enc;
+    int enc_loaded;
 };
 
 paint_stage_vae *paint_stage_vae_create(CUdevice dev, const char *vae_path) {
@@ -36,6 +38,8 @@ paint_stage_vae *paint_stage_vae_create(CUdevice dev, const char *vae_path) {
         cuModuleUnload(s->kk.mod); free(s); return NULL;
     }
     load_decoder(st, &s->dec);
+    load_encoder(st, &s->enc);
+    s->enc_loaded = 1;
     safetensors_close(st);
     return s;
 }
@@ -48,6 +52,17 @@ void paint_stage_vae_decode(paint_stage_vae *s,
                              CUdeviceptr d_qnc, CUdeviceptr d_knc,
                              CUdeviceptr d_vnc, CUdeviceptr d_ync) {
     decode(&s->kk, &s->dec, d_lat, lat_h, lat_w, d_rgb,
+           d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+}
+
+void paint_stage_vae_encode(paint_stage_vae *s,
+                             CUdeviceptr d_img, int img_h, int img_w,
+                             CUdeviceptr d_lat,
+                             CUdeviceptr d_a, CUdeviceptr d_b,
+                             CUdeviceptr d_t1, CUdeviceptr d_t2,
+                             CUdeviceptr d_qnc, CUdeviceptr d_knc,
+                             CUdeviceptr d_vnc, CUdeviceptr d_ync) {
+    encode(&s->kk, &s->enc, d_img, img_h, img_w, d_lat,
            d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
 }
 
