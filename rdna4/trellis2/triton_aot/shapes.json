@@ -1,0 +1,83 @@
+[
+  {
+    "N": 1905,
+    "Ci": 1024,
+    "Co": 1024,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 4
+  },
+  {
+    "N": 1905,
+    "Ci": 1024,
+    "Co": 4096,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 1
+  },
+  {
+    "N": 8452,
+    "Ci": 512,
+    "Co": 512,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 17
+  },
+  {
+    "N": 8452,
+    "Ci": 512,
+    "Co": 2048,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 1
+  },
+  {
+    "N": 38321,
+    "Ci": 256,
+    "Co": 256,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 9
+  },
+  {
+    "N": 38321,
+    "Ci": 256,
+    "Co": 1024,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 1
+  },
+  {
+    "N": 178651,
+    "Ci": 128,
+    "Co": 128,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 5
+  },
+  {
+    "N": 178651,
+    "Ci": 128,
+    "Co": 512,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 1
+  },
+  {
+    "N": 822874,
+    "Ci": 64,
+    "Co": 64,
+    "V": 27,
+    "bias": true,
+    "splitk": true,
+    "count": 1
+  }
+]
