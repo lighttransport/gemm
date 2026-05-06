@@ -39,15 +39,21 @@ struct paint_stage_view_maps {
 
     /* Per-mesh resident buffers */
     int n_verts, n_tris;
+    float mesh_ctr[3]; float mesh_k;  /* set_mesh transform: after axis swap, p'=(p-ctr)*k */
     float *h_pos;          /* transformed mesh */
+    float *h_FN;           /* host copy of world-space face normals */
     CUdeviceptr d_F;       /* triangles */
     CUdeviceptr d_Vw;      /* world-space verts (for face-normal calc) */
     CUdeviceptr d_FN;      /* face normals */
     CUdeviceptr d_P;       /* per-vertex position attribute */
     CUdeviceptr d_bg;      /* white bg */
+    CUdeviceptr d_bg1;     /* zero bg, C=1 */
+    CUdeviceptr d_attr1;   /* [n_verts, 1] scratch for cam-z per vertex */
+    CUdeviceptr d_face_cos;/* [n_tris]   scratch for per-face cos */
 
     /* Per-view transient device buffers */
     CUdeviceptr d_V, d_zbuf, d_fidx, d_bary, d_nrm_img, d_pos_img;
+    CUdeviceptr d_depth_img, d_vis_img, d_cos_img;  /* [pix] */
 
     /* Per-view scratch */
     uint64_t *zbuf_init;
@@ -55,6 +61,9 @@ struct paint_stage_view_maps {
     int   *h_fidx;
     float *h_nrm;
     float *h_pos_img;
+    float *h_attr1;        /* per-vertex cam-z */
+    float *h_face_cos;     /* per-face cos */
+    float *h_visible;      /* per-pixel float visibility */
 };
 
 static void mat4_zero(float *m) { memset(m, 0, 16 * sizeof(float)); }
@@ -147,6 +156,12 @@ paint_stage_view_maps *paint_stage_view_maps_create(CUdevice dev, int res) {
     cuMemAlloc(&s->d_bg,      3 * sizeof(float));
     float bg_white[3] = { 1.f, 1.f, 1.f };
     cuMemcpyHtoD(s->d_bg, bg_white, 3 * sizeof(float));
+    cuMemAlloc(&s->d_bg1,     sizeof(float));
+    float zero1 = 0.f;
+    cuMemcpyHtoD(s->d_bg1, &zero1, sizeof(float));
+    cuMemAlloc(&s->d_depth_img, pix * sizeof(float));
+    cuMemAlloc(&s->d_vis_img,   pix * sizeof(float));
+    cuMemAlloc(&s->d_cos_img,   pix * sizeof(float));
 
     s->zbuf_init = (uint64_t *)malloc(pix * sizeof(uint64_t));
     uint64_t sentinel = (uint64_t)2147483647ULL * 2147483647ULL + 2147483646ULL;
@@ -155,6 +170,7 @@ paint_stage_view_maps *paint_stage_view_maps_create(CUdevice dev, int res) {
     s->h_fidx   = (int *)  malloc(pix * sizeof(int));
     s->h_nrm    = (float *)malloc(pix * 3 * sizeof(float));
     s->h_pos_img= (float *)malloc(pix * 3 * sizeof(float));
+    s->h_visible= (float *)malloc(pix * sizeof(float));
     return s;
 }
 
@@ -168,6 +184,11 @@ void paint_stage_view_maps_set_mesh(paint_stage_view_maps *s,
     if (s->d_FN) { cuMemFree(s->d_FN); s->d_FN = 0; }
     if (s->d_P)  { cuMemFree(s->d_P);  s->d_P  = 0; }
     if (s->d_V)  { cuMemFree(s->d_V);  s->d_V  = 0; }
+    if (s->d_attr1)    { cuMemFree(s->d_attr1);    s->d_attr1 = 0; }
+    if (s->d_face_cos) { cuMemFree(s->d_face_cos); s->d_face_cos = 0; }
+    if (s->h_FN)       { free(s->h_FN); s->h_FN = NULL; }
+    if (s->h_attr1)    { free(s->h_attr1); s->h_attr1 = NULL; }
+    if (s->h_face_cos) { free(s->h_face_cos); s->h_face_cos = NULL; }
 
     s->n_verts = n_verts;
     s->n_tris  = n_tris;
@@ -206,6 +227,8 @@ void paint_stage_view_maps_set_mesh(paint_stage_view_maps *s,
         s->h_pos[i*3+1] = (s->h_pos[i*3+1] - ctr[1]) * k;
         s->h_pos[i*3+2] = (s->h_pos[i*3+2] - ctr[2]) * k;
     }
+    s->mesh_ctr[0] = ctr[0]; s->mesh_ctr[1] = ctr[1]; s->mesh_ctr[2] = ctr[2];
+    s->mesh_k = k;
 
     /* Per-vertex position attribute (linear in vtx coords) */
     float *pos_attr = (float *)malloc((size_t)n_verts * 3 * sizeof(float));
@@ -234,16 +257,35 @@ void paint_stage_view_maps_set_mesh(paint_stage_view_maps *s,
     void *args[] = { &s->d_Vw, &s->d_F, &s->d_FN, &nf };
     unsigned grid = (unsigned)((nf + 255) / 256);
     cuLaunchKernel(s->f_facenrm, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+    cuCtxSynchronize();
+    s->h_FN = (float *)malloc((size_t)nf * 3 * sizeof(float));
+    cuMemcpyDtoH(s->h_FN, s->d_FN, (size_t)nf * 3 * sizeof(float));
+
+    cuMemAlloc(&s->d_attr1,    (size_t)n_verts * sizeof(float));
+    cuMemAlloc(&s->d_face_cos, (size_t)n_tris  * sizeof(float));
+    s->h_attr1    = (float *)malloc((size_t)n_verts * sizeof(float));
+    s->h_face_cos = (float *)malloc((size_t)n_tris  * sizeof(float));
 
     s->clip = (float *)realloc(s->clip, v4_bytes);
 }
 
 void paint_stage_view_maps_render(paint_stage_view_maps *s,
                                    CUdeviceptr d_normal_out,
-                                   CUdeviceptr d_position_out) {
+                                   CUdeviceptr d_position_out,
+                                   CUdeviceptr d_depth_out,
+                                   CUdeviceptr d_visible_out,
+                                   CUdeviceptr d_cos_out,
+                                   float *out_w2c,
+                                   float *out_proj) {
     const int res = s->res;
     const size_t pix = (size_t)res * res;
     const size_t per_view_bytes = pix * 3 * sizeof(float);
+    const size_t per_view_bytes1 = pix * sizeof(float);
+    const float cos_thres = 0.25881904510252074f;  /* cos(75°) */
+    if (out_proj) {
+        out_proj[0] = 2.f / HY3D_ORTHO_SCALE;
+        out_proj[1] = 2.f / HY3D_ORTHO_SCALE;
+    }
 
     for (int v = 0; v < HY3D_N_VIEWS; v++) {
         float proj[16], view[16], mvp[16];
@@ -299,6 +341,73 @@ void paint_stage_view_maps_render(paint_stage_view_maps *s,
         if (d_position_out)
             cuMemcpyDtoD(d_position_out + (CUdeviceptr)v * per_view_bytes,
                          s->d_pos_img, per_view_bytes);
+
+        if (out_w2c) memcpy(out_w2c + v * 16, view, 16 * sizeof(float));
+
+        /* visible: 1.f where findices > 0 */
+        if (d_visible_out) {
+            for (size_t i = 0; i < pix; i++)
+                s->h_visible[i] = (s->h_fidx[i] > 0) ? 1.f : 0.f;
+            cuMemcpyHtoD(d_visible_out + (CUdeviceptr)v * per_view_bytes1,
+                         s->h_visible, per_view_bytes1);
+        }
+
+        /* depth: per-vertex camera-z, then interpolate_attr_f32 with C=1 */
+        if (d_depth_out) {
+            for (int i = 0; i < s->n_verts; i++) {
+                float x = s->h_pos[i*3+0], y = s->h_pos[i*3+1], z = s->h_pos[i*3+2];
+                /* row-of-mat(M)*v with M[row,col]=view[col*4+row] */
+                s->h_attr1[i] = view[2]*x + view[6]*y + view[10]*z + view[14];
+            }
+            cuMemcpyHtoD(s->d_attr1, s->h_attr1, (size_t)s->n_verts * sizeof(float));
+            int W = res, H = res, C1 = 1;
+            CUdeviceptr d_dst = d_depth_out + (CUdeviceptr)v * per_view_bytes1;
+            void *args[] = { &s->d_attr1, &s->d_F, &s->d_fidx, &s->d_bary,
+                             &s->d_bg1, &d_dst, &W, &H, &C1 };
+            unsigned grid = (unsigned)((pix + 255) / 256);
+            cuLaunchKernel(s->f_interp, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        }
+
+        /* cos: per-face dot(face_normal_cam, +z_cam) = -face_normal_cam.z,
+         * threshold at 75°, then lookup_face_attr_f32 with C=1 bg=0. */
+        if (d_cos_out) {
+            for (int f = 0; f < s->n_tris; f++) {
+                float nx = s->h_FN[f*3+0], ny = s->h_FN[f*3+1], nz = s->h_FN[f*3+2];
+                /* cos = +nz_cam: front-facing faces have normal pointing back
+                 * toward camera (+z in cam space when cam looks -z). Matches
+                 * dump_paint_back_project.py:render_view's cos_img convention. */
+                float ncz = view[2]*nx + view[6]*ny + view[10]*nz;
+                float c = ncz;
+                if (c < cos_thres) c = 0.f;
+                s->h_face_cos[f] = c;
+            }
+            cuMemcpyHtoD(s->d_face_cos, s->h_face_cos,
+                         (size_t)s->n_tris * sizeof(float));
+            int W = res, H = res, C1 = 1;
+            CUdeviceptr d_dst = d_cos_out + (CUdeviceptr)v * per_view_bytes1;
+            void *args[] = { &s->d_face_cos, &s->d_fidx, &s->d_bg1, &d_dst,
+                             &W, &H, &C1 };
+            unsigned grid = (unsigned)((pix + 255) / 256);
+            cuLaunchKernel(s->f_lookup, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        }
+        cuCtxSynchronize();
+    }
+}
+
+void paint_stage_view_maps_apply_mesh_transform(paint_stage_view_maps *s,
+                                                  const float *in_xyz,
+                                                  float *out_xyz, int n) {
+    /* Same as set_mesh's pre-render transform: axis swap (x'=-x, y'=z, z'=-y)
+     * then translate by -mesh_ctr, then scale by mesh_k. Must be applied to
+     * any world-space point that needs to live in the rendered coord frame
+     * (e.g. back-project tex_pos generated against the raw mesh). */
+    const float *c = s->mesh_ctr; float k = s->mesh_k;
+    for (int i = 0; i < n; i++) {
+        float x = in_xyz[i*3+0], y = in_xyz[i*3+1], z = in_xyz[i*3+2];
+        float xp = -x, yp = z, zp = -y;
+        out_xyz[i*3+0] = (xp - c[0]) * k;
+        out_xyz[i*3+1] = (yp - c[1]) * k;
+        out_xyz[i*3+2] = (zp - c[2]) * k;
     }
 }
 
@@ -310,13 +419,20 @@ void paint_stage_view_maps_destroy(paint_stage_view_maps *s) {
     if (s->d_P)  cuMemFree(s->d_P);
     if (s->d_V)  cuMemFree(s->d_V);
     if (s->d_bg) cuMemFree(s->d_bg);
+    if (s->d_bg1) cuMemFree(s->d_bg1);
     if (s->d_zbuf)    cuMemFree(s->d_zbuf);
     if (s->d_fidx)    cuMemFree(s->d_fidx);
     if (s->d_bary)    cuMemFree(s->d_bary);
     if (s->d_nrm_img) cuMemFree(s->d_nrm_img);
     if (s->d_pos_img) cuMemFree(s->d_pos_img);
+    if (s->d_depth_img) cuMemFree(s->d_depth_img);
+    if (s->d_vis_img)   cuMemFree(s->d_vis_img);
+    if (s->d_cos_img)   cuMemFree(s->d_cos_img);
+    if (s->d_attr1)    cuMemFree(s->d_attr1);
+    if (s->d_face_cos) cuMemFree(s->d_face_cos);
     free(s->h_pos); free(s->clip); free(s->zbuf_init);
     free(s->h_fidx); free(s->h_nrm); free(s->h_pos_img);
+    free(s->h_FN); free(s->h_attr1); free(s->h_face_cos); free(s->h_visible);
     if (s->mod) cuModuleUnload(s->mod);
     free(s);
 }
