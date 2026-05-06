@@ -14,7 +14,7 @@ CUEW_SRC = ../cuew.c
 
 .PHONY: all clean help
 
-all: test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project test_swiglu test_dinov2_giant test_paint_vae test_paint_unet test_paint_unipc test_paint_cfg_loop test_paint_pipeline test_paint_unet_stage
+all: test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project test_swiglu test_dinov2_giant test_paint_vae test_paint_unet test_paint_unipc test_paint_cfg_loop test_paint_pipeline test_paint_unet_stage test_paint_view_maps_stage
 
 test_uv_unwrap: test_uv_unwrap.cc ../../common/xatlas.cc ../../common/xatlas.h
 	$(CXX) $(CXXFLAGS) -o $@ test_uv_unwrap.cc ../../common/xatlas.cc $(LDFLAGS)
@@ -66,6 +66,13 @@ test_paint_pipeline: test_paint_pipeline.c paint_runtime.c \
                      ../../common/safetensors.h
 	$(CC) $(CFLAGS) -o $@ test_paint_pipeline.c paint_runtime.c \
 	    paint_stage_vae.c paint_stage_unet.c $(CUEW_SRC) $(CULDFLAGS)
+
+test_paint_view_maps_stage: test_paint_view_maps_stage.c \
+                            paint_stage_view_maps.c paint_stages.h \
+                            cuda_paint_raster_kernels.h \
+                            $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_paint_view_maps_stage.c \
+	    paint_stage_view_maps.c $(CUEW_SRC) $(CULDFLAGS) -lm
 
 test_paint_unet_stage: test_paint_unet_stage.c paint_runtime.c \
                        paint_stage_unet.c paint_stages.h \
