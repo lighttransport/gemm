@@ -18,11 +18,15 @@
 #define CUDA_PAINT_UNET_RUNNER_H_
 
 #include "../cuew.h"
+#ifdef CUDA_PAINT_UNET_RUNNER_IMPLEMENTATION
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
+#endif
 #include "../cuda_runner_common.h"
 #include "cuda_paint_unet_kernels.h"
 
+#ifdef CUDA_PAINT_UNET_RUNNER_IMPLEMENTATION
 #define SAFETENSORS_IMPLEMENTATION
+#endif
 #include "safetensors.h"
 
 #include <math.h>
