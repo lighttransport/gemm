@@ -301,6 +301,10 @@ def main():
     ap.add_argument("--himg", type=int, default=128)
     ap.add_argument("--subdiv", type=int, default=2,
                     help="icosphere subdivision (320 faces at 2)")
+    ap.add_argument("--mesh", default=None,
+                    help="Load mesh from this OBJ/PLY/etc. instead of the "
+                         "built-in icosphere. Useful for smoke-testing the "
+                         "back-project chain on real paint-pipeline meshes.")
     ap.add_argument("--elev", type=float, default=0.0)
     ap.add_argument("--azim", type=float, default=0.0)
     ap.add_argument("--dist", type=float, default=1.45)
@@ -324,10 +328,14 @@ def main():
         args.multiview = True
     os.makedirs(args.outdir, exist_ok=True)
 
-    print(f"icosphere subdivisions={args.subdiv}", file=sys.stderr)
-    m = trimesh.creation.icosphere(subdivisions=args.subdiv)
-    vtx_pos = m.vertices.astype(np.float32)
-    faces = m.faces.astype(np.int32)
+    if args.mesh:
+        print(f"loading mesh: {args.mesh}", file=sys.stderr)
+        m = trimesh.load(args.mesh, force="mesh", process=False)
+    else:
+        print(f"icosphere subdivisions={args.subdiv}", file=sys.stderr)
+        m = trimesh.creation.icosphere(subdivisions=args.subdiv)
+    vtx_pos = np.asarray(m.vertices, dtype=np.float32)
+    faces = np.asarray(m.faces, dtype=np.int32)
     print(f"  verts={vtx_pos.shape[0]} faces={faces.shape[0]}", file=sys.stderr)
 
     print("xatlas UV unwrap...", file=sys.stderr)
