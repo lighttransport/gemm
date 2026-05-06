@@ -124,7 +124,7 @@ static int64_t *read_npy_i64(const char *p, int *nd, int *dd) {
     fclose(f); free(h); return d;
 }
 
-typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, conv_nmap_bf16_x8_db, gather27, gather27_v2, ln, silu, silu_bf16, gelu, add, lin, gather, resrep, pack_bf16, pack_f16, unpack_f16, splitk_reduce, dense_x8_db; } K;
+typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, conv_nmap_bf16_x8_db, gather27, gather27_v2, ln, silu, silu_bf16, gelu, add, lin, gather, resrep, pack_bf16, pack_f16, unpack_f16, splitk_reduce, dense_x8_db, dense_bf16in_x8_db; } K;
 
 static void hash_build(K *k, void *keys, void *vals, int cap_mask, void *coords, int N) {
     void *a[] = {&keys, &vals, &cap_mask, &coords, &N};
@@ -261,8 +261,22 @@ static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap
         }
         if (g_prof_cn) hipEventRecord(g_prof_sp[1], 0);
         float *out_chunk = (float *)out_f32 + (size_t)m0 * outC;
-        mm_blaslt_run_bf16_bias(out_chunk, d_w_bf16, act, bias_f32,
-                                 M, outC, K_total, 0);
+        static int s_use_bf16in = -1;
+        if (s_use_bf16in < 0) {
+            const char *e = getenv("T2_TEX_BF16IN_GEMM");
+            s_use_bf16in = (e && atoi(e)) ? 1 : 0;
+        }
+        if (s_use_bf16in && k->dense_bf16in_x8_db &&
+            (outC % 16 == 0) && (K_total % 16 == 0)) {
+            void *gemm_args[] = {&out_chunk, &act, &d_w_bf16, &bias_f32,
+                                 &M, &K_total, &outC};
+            int gx = (M + 31) / 32, gy = (outC + 63) / 64;
+            hipModuleLaunchKernel(k->dense_bf16in_x8_db, gx, gy, 1,
+                                  256, 1, 1, 0, 0, gemm_args, NULL);
+        } else {
+            mm_blaslt_run_bf16_bias(out_chunk, d_w_bf16, act, bias_f32,
+                                     M, outC, K_total, 0);
+        }
         if (g_prof_cn) {
             hipEventRecord(g_prof_sp[2], 0);
             hipEventSynchronize(g_prof_sp[2]);
@@ -994,6 +1008,7 @@ int main(int argc, char **argv) {
     hipModuleGetFunction(&k.silu, mod, "t2_silu_f32");
     hipModuleGetFunction(&k.silu_bf16, mod, "t2_silu_bf16");
     hipModuleGetFunction(&k.dense_x8_db, mod, "t2_dense_gemm_bf16_x8_db");
+    hipModuleGetFunction(&k.dense_bf16in_x8_db, mod, "t2_dense_gemm_bf16in_x8_db");
     hipModuleGetFunction(&k.gelu, mod, "t2_gelu_f32");
     hipModuleGetFunction(&k.add, mod, "t2_add_f32");
     hipModuleGetFunction(&k.lin, mod, "t2_linear_f32");
