@@ -24,6 +24,9 @@
 #define TRITON_BRIDGE_USE_ROCEW
 #define TRITON_SPCONV_BRIDGE_IMPL
 #include "triton_aot/triton_spconv_bridge.h"
+#define TRITON_KLIN_BRIDGE_IMPL
+#include "triton_aot/klin/triton_klin_bridge.h"
+static int g_use_triton_klin = 0;
 
 /* hipBLASLt BF16 path globals.
  * - g_use_blaslt: 1 iff bridge initialized successfully
@@ -520,6 +523,29 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
         klin(k, o_f32, x_f32, dev_w_f32_fallback, bias_f32, N, inC, outC);
         return;
     }
+    /* Triton AOT klin path. Same chunking as blaslt (M_max ≤ 16384) — kernel
+     * masks handle smaller M at the tail. Each chunk: pack F32→BF16 then launch. */
+    if (g_use_triton_klin && t2_klin_has_shape(inC, outC)) {
+        const int CAP_KL_T = 16384;
+        int nchunks_t = (N + CAP_KL_T - 1) / CAP_KL_T;
+        int M_CHUNK_T = (N + nchunks_t - 1) / nchunks_t;
+        int ok = 1;
+        for (int m0 = 0; m0 < N && ok; m0 += M_CHUNK_T) {
+            int M = (N - m0 < M_CHUNK_T) ? (N - m0) : M_CHUNK_T;
+            int n_act = M * inC;
+            void *dst = g_d_act_bf16;
+            float *src_chunk = (float *)x_f32 + (size_t)m0 * inC;
+            void *src = src_chunk;
+            void *args0[] = { &dst, &src, &n_act };
+            int n4 = (n_act + 3) / 4;
+            hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args0, NULL);
+            float *dst_chunk = (float *)o_f32 + (size_t)m0 * outC;
+            int rc = t2_klin_run(M, inC, outC, g_d_act_bf16, d_w_bf16, bias_f32, dst_chunk, 0);
+            if (rc != 0) { ok = 0; break; }
+        }
+        if (ok) return;
+        /* Fall through to blaslt path on any launch failure. */
+    }
     klin_prof_init();
     /* Equal-sized chunks so every call hits the same hipBLASLt plan.
      * Cap at 16384 (gfx1201 Tensile range). T2_TEX_KLIN_CAP override for sweeps. */
@@ -989,6 +1015,21 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "T2-TEX: Triton AOT spconv bridge enabled (kernels=%s)\n", kd);
             } else {
                 fprintf(stderr, "T2-TEX: t2_triton_init failed; bridge disabled\n");
+            }
+        }
+    }
+
+    /* Triton AOT klin bridge (T2_TEX_KLIN_TRITON=1). Off by default. */
+    {
+        const char *e = getenv("T2_TEX_KLIN_TRITON");
+        if (e && atoi(e)) {
+            const char *kd = getenv("T2_TEX_KLIN_TRITON_KERNELS");
+            if (!kd) kd = "triton_aot/klin/kernels";
+            if (t2_klin_init(kd) == 0) {
+                g_use_triton_klin = 1;
+                fprintf(stderr, "T2-TEX: Triton AOT klin bridge enabled (kernels=%s)\n", kd);
+            } else {
+                fprintf(stderr, "T2-TEX: t2_klin_init failed; bridge disabled\n");
             }
         }
     }
