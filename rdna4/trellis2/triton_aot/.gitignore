@@ -1,0 +1,11 @@
+# compiled test/bench binaries
+bench_all
+bench_bridge
+test_bridge
+test_launch
+test_load_hsaco
+test_pp
+test_pp_dbg
+
+# large captured tensors used only for local correctness tests
+test_data/
