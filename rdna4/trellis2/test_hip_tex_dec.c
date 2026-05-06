@@ -1003,12 +1003,12 @@ int main(int argc, char **argv) {
     hipModuleGetFunction(&k.unpack_f16, mod, "t2_unpack_f32_from_f16");
     hipModuleGetFunction(&k.splitk_reduce, mod, "t2_splitk_reduce_to_f16");
 
-    /* Triton AOT spconv bridge (T2_TEX_TRITON=1). Off by default. */
+    /* Triton AOT spconv bridge (default ON; T2_TEX_TRITON=0 to disable). */
     {
         const char *e = getenv("T2_TEX_TRITON");
-        if (e && atoi(e)) {
+        if (!e || atoi(e)) {
             const char *kd = getenv("T2_TEX_TRITON_KERNELS");
-            if (!kd) kd = "rdna4/trellis2/triton_aot/kernels";
+            if (!kd) kd = "triton_aot/kernels";
             if (t2_triton_init(kd) == 0) {
                 g_use_triton = 1;
                 t2_triton_set_reduce_kernel(k.splitk_reduce);
@@ -1019,10 +1019,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Triton AOT klin bridge (T2_TEX_KLIN_TRITON=1). Off by default. */
+    /* Triton AOT klin bridge (default ON; T2_TEX_KLIN_TRITON=0 to disable). */
     {
         const char *e = getenv("T2_TEX_KLIN_TRITON");
-        if (e && atoi(e)) {
+        if (!e || atoi(e)) {
             const char *kd = getenv("T2_TEX_KLIN_TRITON_KERNELS");
             if (!kd) kd = "triton_aot/klin/kernels";
             if (t2_klin_init(kd) == 0) {
