@@ -771,6 +771,7 @@ struct cuda_ppd_runner {
     CUfunction fn_scalar_gemm_f16_f32;
     CUfunction fn_scalar_attn_f32;
     int use_fp8;
+    int use_mma_gemm;
 
     /* ---- DA2 semantic encoder params ---- */
     int sem_n_blocks;       /* 24 */
@@ -1432,6 +1433,8 @@ cuda_ppd_runner *cuda_ppd_init(int device_id, int verbose) {
 
     cuda_ppd_runner *r = (cuda_ppd_runner *)calloc(1, sizeof(cuda_ppd_runner));
     r->verbose = verbose;
+    const char *env_mma = getenv("PPD_MMA_GEMM");
+    r->use_mma_gemm = !(env_mma && env_mma[0] == '0');
 
     CHECK_CU_NULL(cuDeviceGet(&r->device, device_id));
     CHECK_CU_NULL(cuCtxCreate(&r->context, 0, r->device));
@@ -1477,7 +1480,15 @@ static void kl_layernorm(cuda_ppd_runner *r, CUdeviceptr dst, CUdeviceptr src,
 static void kl_gemm(cuda_ppd_runner *r, CUdeviceptr Y, CUdeviceptr W_f16,
                      CUdeviceptr X, CUdeviceptr bias, int n_out, int n_in, int n_tok) {
     void *args[] = {&Y, &W_f16, &X, &bias, &n_out, &n_in, &n_tok};
-    /* Tiled shared-memory GEMM: grid=(ceil(n_out/64), ceil(n_tok/16)), blockDim=(16,16) */
+    if (r->use_mma_gemm && (n_in % 16) == 0) {
+        unsigned gx = (unsigned)((n_out + 255) / 256);
+        unsigned gy = (unsigned)((n_tok + 15) / 16);
+        cuLaunchKernel(r->fn_gemm_f16_f32, gx, gy, 1, 128, 1, 1,
+                       16 * 16 * (unsigned)sizeof(float), r->stream, args, NULL);
+        return;
+    }
+
+    /* Tiled shared-memory GEMM fallback handles arbitrary K, including patch embed K=588. */
     unsigned gx = (unsigned)((n_out + 63) / 64);
     unsigned gy = (unsigned)((n_tok + 15) / 16);
     cuLaunchKernel(r->fn_gemm_tiled_f16_f32, gx, gy, 1, 16, 16, 1,
