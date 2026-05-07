@@ -83,6 +83,9 @@ def main():
     parser.add_argument("--trace-dir", default=None,
                         help="dump per-stage .npy tensors for layer-by-layer "
                              "comparison vs the CUDA runner")
+    parser.add_argument("--per-stage-timing", default=None,
+                        help="emit per-stage GPU timing JSON to this path "
+                             "(uses torch.cuda.Event around DINOv2 / DiT-step / VAE)")
     args = parser.parse_args()
 
     _setup_sys_path()
@@ -128,6 +131,65 @@ def main():
     # With accelerate.cpu_offload each sub-module still reports execution_device
     # as cuda, so the pipeline's latents/prepare_latents path stays on cuda.
     generator = torch.Generator(device=args.device).manual_seed(args.seed)
+
+    # ---- Per-stage GPU timing (torch.cuda.Event) ----
+    timing_handles = []
+    timing_state = {
+        "enabled": args.per_stage_timing is not None,
+        "device": args.device,
+        "dino_start": None, "dino_end": None,
+        "vae_start": None,  "vae_end": None,
+        "dit_step_events": [],   # list of (start, end) per step
+        "_pending_dit_start": None,
+    }
+    if timing_state["enabled"]:
+        def _ev():
+            return torch.cuda.Event(enable_timing=True)
+
+        # DINOv2 wall: pre-hook records start, post-hook records end
+        dino_mod = pipe.conditioner.main_image_encoder.model
+
+        def _dino_t_pre(module, args_):
+            timing_state["dino_start"] = _ev()
+            timing_state["dino_start"].record()
+
+        def _dino_t_post(module, args_, output):
+            timing_state["dino_end"] = _ev()
+            timing_state["dino_end"].record()
+
+        timing_handles.append(dino_mod.register_forward_pre_hook(_dino_t_pre))
+        timing_handles.append(dino_mod.register_forward_hook(_dino_t_post))
+
+        # DiT step: each model() call brackets one cond-or-uncond pass; we
+        # bracket every call individually and collect them all. To match the
+        # HIP "step" definition (cond+uncond+cfg+euler), we collapse pairs
+        # later in the JSON writer.
+        def _dit_t_pre(module, args_):
+            ev_s = _ev(); ev_s.record()
+            timing_state["_pending_dit_start"] = ev_s
+
+        def _dit_t_post(module, args_, output):
+            ev_e = _ev(); ev_e.record()
+            timing_state["dit_step_events"].append(
+                (timing_state["_pending_dit_start"], ev_e))
+            timing_state["_pending_dit_start"] = None
+
+        timing_handles.append(pipe.model.register_forward_pre_hook(_dit_t_pre))
+        timing_handles.append(pipe.model.register_forward_hook(_dit_t_post))
+
+        # VAE wall (post-KL + decoder)
+        def _vae_t_pre(module, args_):
+            timing_state["vae_start"] = _ev()
+            timing_state["vae_start"].record()
+
+        def _vae_t_post(module, args_, output):
+            timing_state["vae_end"] = _ev()
+            timing_state["vae_end"].record()
+
+        timing_handles.append(pipe.vae.register_forward_pre_hook(_vae_t_pre))
+        timing_handles.append(pipe.vae.register_forward_hook(_vae_t_post))
+
+        print(f"Per-stage timing enabled (output: {args.per_stage_timing})")
 
     # ---- Tracing hooks (layer-by-layer debug vs CUDA runner) ----
     hook_handles = []
@@ -217,6 +279,50 @@ def main():
 
     for h in hook_handles:
         h.remove()
+    for h in timing_handles:
+        h.remove()
+
+    if timing_state["enabled"]:
+        torch.cuda.synchronize()
+        import json
+
+        def _ms(s, e):
+            return s.elapsed_time(e) if (s is not None and e is not None) else 0.0
+
+        dino_ms = _ms(timing_state["dino_start"], timing_state["dino_end"])
+        vae_ms  = _ms(timing_state["vae_start"],  timing_state["vae_end"])
+        per_call_ms = [_ms(s, e) for (s, e) in timing_state["dit_step_events"]]
+        # CFG: pipeline calls model twice per step (cond + uncond). Collapse.
+        if len(per_call_ms) >= 2 * args.steps:
+            steps_ms = [per_call_ms[2 * i] + per_call_ms[2 * i + 1]
+                        for i in range(args.steps)]
+        else:
+            steps_ms = per_call_ms
+        dit_total_ms = sum(steps_ms)
+        dit_step_mean = (dit_total_ms / len(steps_ms)) if steps_ms else 0.0
+
+        out = {
+            "backend": "pytorch",
+            "device": args.device,
+            "dtype": args.dtype,
+            "steps": args.steps,
+            "guidance": args.guidance,
+            "octree": args.octree,
+            "dino_ms": dino_ms,
+            "dit_total_ms": dit_total_ms,
+            "vae_ms": vae_ms,
+            "e2e_ms": elapsed * 1000.0,
+            "dit_step_ms_mean": dit_step_mean,
+            "dit_step_ms": steps_ms,
+            "dit_calls_ms_raw": per_call_ms,
+        }
+        os.makedirs(os.path.dirname(args.per_stage_timing) or ".", exist_ok=True)
+        with open(args.per_stage_timing, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Wrote per-stage timing JSON to {args.per_stage_timing}")
+        print(f"  dino={dino_ms:.1f} ms  dit={dit_total_ms:.1f} ms "
+              f"({len(steps_ms)} steps, mean={dit_step_mean:.1f} ms)  "
+              f"vae={vae_ms:.1f} ms  e2e={elapsed * 1000.0:.1f} ms")
 
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
