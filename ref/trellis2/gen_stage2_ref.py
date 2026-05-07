@@ -89,8 +89,9 @@ def _patch_dinov3_extractor(timm_path: str):
             'embeddings.patch_embeddings.weight': timm_sd['patch_embed.proj.weight'],
             'embeddings.patch_embeddings.bias': timm_sd['patch_embed.proj.bias'],
         }
+        layer_prefix = 'model.layer' if hasattr(model, 'model') else 'layer'
         for i in range(24):
-            tp, hp = f'blocks.{i}.', f'model.layer.{i}.'
+            tp, hp = f'blocks.{i}.', f'{layer_prefix}.{i}.'
             new_sd[f'{hp}norm1.weight'] = timm_sd[f'{tp}norm1.weight']
             new_sd[f'{hp}norm1.bias']   = timm_sd[f'{tp}norm1.bias']
             new_sd[f'{hp}norm2.weight'] = timm_sd[f'{tp}norm2.weight']
