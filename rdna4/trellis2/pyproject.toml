@@ -1,0 +1,47 @@
+[project]
+name = "trellis2-tex-dec-bench"
+version = "0.1.0"
+description = "PyTorch ROCm reference bench for tex_dec on rdna4 (RX 9070 XT, gfx1201)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "safetensors>=0.4.5",
+    "packaging",
+    "Pillow>=10",
+    "tqdm",
+    "trimesh",
+    "plyfile",
+    "zstandard",
+    "easydict",
+    "scipy",
+    "einops",
+    "opencv-python-headless",
+]
+
+# Setup (one-time):
+#   uv venv --python 3.12 .venv
+#   uv pip install -e ".[torch-rocm722]"
+#   BUILD_TARGET=rocm GPU_ARCHS=gfx1201 uv pip install -e \
+#       /mnt/disk1/work/gemm/trellis2/cpu/trellis2/trellis2_repo/o-voxel \
+#       --no-build-isolation
+#   BUILD_TARGET=rocm GPU_ARCHS=gfx1201 uv pip install -e \
+#       /mnt/disk1/work/gemm/trellis2/rdna4/trellis2/deps/FlexGEMM \
+#       --no-build-isolation
+#
+# Note: o-voxel/pyproject.toml has its `cumesh` and `flex_gemm` git deps removed
+# locally so the build doesn't need network/git checkouts; FlexGEMM is installed
+# from the local deps/ tree, and cumesh is shimmed (rdna4/trellis2/cumesh_xatlas_shim.py).
+#
+# Cold/warm bench: .venv/bin/python rdna4/trellis2/bench_tex_dec_coldwarm.py --reps 4
+
+[project.optional-dependencies]
+torch-rocm722 = [
+    "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.6.0+rocm7.2.2.git4ed88892-cp312-cp312-linux_x86_64.whl",
+    "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl",
+]
+
+[tool.uv]
+package = false
+
+[tool.setuptools]
+py-modules = []
