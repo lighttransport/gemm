@@ -14,7 +14,7 @@ CUEW_SRC = ../cuew.c
 
 .PHONY: all clean help
 
-all: test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project test_swiglu test_dinov2_giant
+all: test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project test_swiglu test_dinov2_giant test_paint_vae test_paint_unet test_paint_unipc test_paint_cfg_loop test_paint_pipeline test_paint_unet_stage test_paint_view_maps_stage test_paint_dinov2g_stage test_paint_back_project_stage
 
 test_uv_unwrap: test_uv_unwrap.cc ../../common/xatlas.cc ../../common/xatlas.h
 	$(CXX) $(CXXFLAGS) -o $@ test_uv_unwrap.cc ../../common/xatlas.cc $(LDFLAGS)
@@ -31,13 +31,99 @@ test_vertex_inpaint: test_vertex_inpaint.cc mesh_vertex_inpaint.h
 test_back_project: test_back_project.c cuda_paint_raster_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_back_project.c $(CUEW_SRC) $(CULDFLAGS)
 
+paint_e2e_helpers.o: paint_e2e_helpers.cc mesh_vertex_inpaint.h \
+                    ../../common/image_utils.h
+	$(CXX) $(CXXFLAGS) -c -o $@ paint_e2e_helpers.cc
+
+test_paint_back_project_e2e: test_paint_back_project_e2e.c cuda_paint_raster_kernels.h \
+                              paint_e2e_helpers.o \
+                              $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_paint_back_project_e2e.c paint_e2e_helpers.o \
+	    $(CUEW_SRC) $(CULDFLAGS) -lstdc++
+
 test_swiglu: test_swiglu.c cuda_paint_nn_kernels.h $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_swiglu.c $(CUEW_SRC) $(CULDFLAGS)
+
+test_paint_vae: test_paint_vae.c cuda_paint_vae_kernels.h cuda_paint_vae_runner.h $(CUEW_SRC) \
+                ../cuew.h ../cuda_runner_common.h ../../common/safetensors.h
+	$(CC) $(CFLAGS) -o $@ test_paint_vae.c $(CUEW_SRC) $(CULDFLAGS)
+
+test_paint_unet: test_paint_unet.c cuda_paint_unet_kernels.h $(CUEW_SRC) \
+                 ../cuew.h ../cuda_runner_common.h ../../common/safetensors.h
+	$(CC) $(CFLAGS) -o $@ test_paint_unet.c $(CUEW_SRC) $(CULDFLAGS)
+
+test_paint_unipc: test_paint_unipc.c cuda_paint_unipc.h
+	$(CC) $(CFLAGS) -o $@ test_paint_unipc.c -lm
+
+test_paint_cfg_loop: test_paint_cfg_loop.c cuda_paint_unipc.h
+	$(CC) $(CFLAGS) -o $@ test_paint_cfg_loop.c -lm
+
+paint_inpaint_helper.o: paint_inpaint_helper.cc mesh_vertex_inpaint.h
+	$(CXX) $(CXXFLAGS) -c -o $@ paint_inpaint_helper.cc
+
+paint_xatlas_helper.o: paint_xatlas_helper.cc ../../common/xatlas.h
+	$(CXX) $(CXXFLAGS) -c -o $@ paint_xatlas_helper.cc
+
+xatlas_lib.o: ../../common/xatlas.cc ../../common/xatlas.h
+	$(CXX) $(CXXFLAGS) -c -o $@ ../../common/xatlas.cc
+
+test_paint_pipeline: test_paint_pipeline.c paint_runtime.c \
+                     paint_stage_vae.c paint_stage_unet.c \
+                     paint_stage_view_maps.c paint_stage_dinov2g.c \
+                     paint_stage_back_project.c paint_stages.h \
+                     paint_inpaint_helper.o mesh_vertex_inpaint.h \
+                     paint_xatlas_helper.o xatlas_lib.o \
+                     cuda_paint_vae_runner.h cuda_paint_vae_kernels.h \
+                     cuda_paint_unet_runner.h cuda_paint_unet_kernels.h \
+                     cuda_paint_nn_kernels.h cuda_paint_raster_kernels.h \
+                     cuda_paint_unipc.h \
+                     $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h \
+                     ../cuda_kernels_common.h \
+                     ../hy3d/cuda_hy3d_kernels.h \
+                     ../../common/safetensors.h
+	$(CC) $(CFLAGS) -I../hy3d -o $@ test_paint_pipeline.c paint_runtime.c \
+	    paint_stage_vae.c paint_stage_unet.c paint_stage_view_maps.c \
+	    paint_stage_dinov2g.c paint_stage_back_project.c \
+	    paint_inpaint_helper.o paint_xatlas_helper.o xatlas_lib.o \
+	    $(CUEW_SRC) $(CULDFLAGS) -lm -lstdc++
+
+test_paint_view_maps_stage: test_paint_view_maps_stage.c \
+                            paint_stage_view_maps.c paint_stages.h \
+                            cuda_paint_raster_kernels.h \
+                            $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h
+	$(CC) $(CFLAGS) -o $@ test_paint_view_maps_stage.c \
+	    paint_stage_view_maps.c $(CUEW_SRC) $(CULDFLAGS) -lm
+
+test_paint_unet_stage: test_paint_unet_stage.c paint_runtime.c \
+                       paint_stage_unet.c paint_stages.h \
+                       cuda_paint_unet_runner.h cuda_paint_unet_kernels.h \
+                       cuda_paint_unipc.h \
+                       $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h \
+                       ../../common/safetensors.h
+	$(CC) $(CFLAGS) -o $@ test_paint_unet_stage.c paint_runtime.c \
+	    paint_stage_unet.c $(CUEW_SRC) $(CULDFLAGS) -lm
 
 test_dinov2_giant: test_dinov2_giant.c cuda_paint_nn_kernels.h $(CUEW_SRC) \
                    ../cuew.h ../cuda_runner_common.h ../cuda_kernels_common.h \
                    ../hy3d/cuda_hy3d_kernels.h ../../common/safetensors.h
 	$(CC) $(CFLAGS) -I../hy3d -o $@ test_dinov2_giant.c $(CUEW_SRC) $(CULDFLAGS)
+
+test_paint_back_project_stage: test_paint_back_project_stage.c \
+                                paint_stage_back_project.c paint_stages.h \
+                                cuda_paint_raster_kernels.h \
+                                ../cuew.h ../cuda_runner_common.h $(CUEW_SRC)
+	$(CC) $(CFLAGS) -o $@ test_paint_back_project_stage.c \
+	    paint_stage_back_project.c $(CUEW_SRC) $(CULDFLAGS)
+
+test_paint_dinov2g_stage: test_paint_dinov2g_stage.c paint_stage_dinov2g.c \
+                          paint_runtime.c paint_stages.h \
+                          cuda_paint_nn_kernels.h \
+                          ../cuew.h ../cuda_runner_common.h \
+                          ../cuda_kernels_common.h \
+                          ../hy3d/cuda_hy3d_kernels.h \
+                          ../../common/safetensors.h $(CUEW_SRC)
+	$(CC) $(CFLAGS) -I../hy3d -o $@ test_paint_dinov2g_stage.c \
+	    paint_stage_dinov2g.c paint_runtime.c $(CUEW_SRC) $(CULDFLAGS)
 
 clean:
 	rm -f test_uv_unwrap test_raster test_view_maps test_vertex_inpaint test_back_project test_swiglu test_dinov2_giant
