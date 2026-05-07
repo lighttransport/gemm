@@ -18,6 +18,9 @@
 #include "cuda_paint_unet_runner.h"
 #include "paint_stages.h"
 
+#include "../cuda_kernels_common.h"
+#include "../cuda_fp8_mma_kernels.h"
+
 #include <stdint.h>
 
 #define MAX_N_BLOCKS 16
@@ -78,12 +81,14 @@ struct paint_stage_unet {
     CUdeviceptr d_concat;
     pu_workspace ws;
 
-    /* RA cache backing storage (g_ra_cache slots) */
-    pu_ra_slot ra_slots[MAX_N_BLOCKS];
+    /* RA cache backing storage (g_ra_cache slots) — per CFG chunk so we can
+     * cache run_dual results across all timesteps for each chunk. */
+    pu_ra_slot ra_slots[PAINT_UNET_MAX_CHUNKS][MAX_N_BLOCKS];
+    int chunk_dual_done[PAINT_UNET_MAX_CHUNKS];
+    int active_chunk;
 
-    /* Whether conditioning has been set + dual pass run */
+    /* Whether conditioning has been set */
     int cond_set;
-    int dual_done;
 };
 
 paint_stage_unet *paint_stage_unet_create(CUdevice dev,
@@ -100,10 +105,44 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
     s->txt_per     = (size_t)cfg->M_text * cfg->cross_dim;
     s->x_n         = (size_t)s->Beff_main * s->per_view;
 
-    /* Module compile + kernel handles */
-    int sm = cu_compile_kernels(&s->kk.mod, dev,
-                                 cuda_paint_unet_kernels_src,
+    /* Module compile + kernel handles. Concatenate the BF16/FP8 MMA kernel
+     * source so flash_attn_bf16_hd64_xq + cast_f32_to_bf16 are reachable from
+     * the same module — same trick as paint_stage_dinov2g.c. */
+    /* cuda_kernels_common_src opens an extern "C" block that the runner is
+     * supposed to close. The two paint kernel strings (fp8_mma and unet) each
+     * open their own extern "C" wrappers, so close common's first. */
+    const char *common_close = "\n} /* close cuda_kernels_common_src extern C */\n";
+    const char *mma_open  =
+        "\nextern \"C\" {\n"
+        "__device__ __constant__ unsigned short d_fp8_to_bf16_lut[256];\n"
+        "__device__ __forceinline__ float to_bf16(float f) {\n"
+        "    unsigned int b; memcpy(&b, &f, 4);\n"
+        "    if (((b >> 23) & 0xFF) == 0xFF && (b & 0x7FFFFF)) {\n"
+        "        unsigned int qn = 0x7FC00000u; float r; memcpy(&r, &qn, 4); return r;\n"
+        "    }\n"
+        "    unsigned int rnd = 0x7FFFu + ((b >> 16) & 1u);\n"
+        "    b = (b + rnd) & 0xFFFF0000u;\n"
+        "    float out; memcpy(&out, &b, 4); return out;\n"
+        "}\n";
+    const char *mma_close = "\n} /* extern C (fp8_mma_kernels) */\n";
+    size_t l_common = strlen(cuda_kernels_common_src);
+    size_t l_cc     = strlen(common_close);
+    size_t l_open   = strlen(mma_open);
+    size_t l_mma    = strlen(fp8_mma_kernels_src);
+    size_t l_close  = strlen(mma_close);
+    size_t l_unet   = strlen(cuda_paint_unet_kernels_src);
+    char *src = (char *)malloc(l_common + l_cc + l_open + l_mma + l_close + l_unet + 1);
+    char *p = src;
+    memcpy(p, cuda_kernels_common_src, l_common);  p += l_common;
+    memcpy(p, common_close, l_cc);                 p += l_cc;
+    memcpy(p, mma_open, l_open);                   p += l_open;
+    memcpy(p, fp8_mma_kernels_src, l_mma);         p += l_mma;
+    memcpy(p, mma_close, l_close);                 p += l_close;
+    memcpy(p, cuda_paint_unet_kernels_src, l_unet);p += l_unet;
+    *p = '\0';
+    int sm = cu_compile_kernels(&s->kk.mod, dev, src,
                                  "hy3d_paint_unet", 1, "HY3D-PAINT-UNET");
+    free(src);
     if (sm < 0) { free(s); return NULL; }
     /* Resolve kernel handles (mirrors test_paint_unet main()). */
     cuModuleGetFunction(&s->kk.f_tse,     s->kk.mod, "unet_timestep_embed_f32");
@@ -123,6 +162,40 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
     cuModuleGetFunction(&s->kk.f_concat,  s->kk.mod, "unet_concat_chan_f32");
     cuModuleGetFunction(&s->kk.f_rope,    s->kk.mod, "unet_rope_apply_f32");
     cuModuleGetFunction(&s->kk.f_ra_split_v, s->kk.mod, "unet_ra_split_v_f32");
+
+    /* FP8 GEMM dispatch (Phase 4.9.2) — optional. */
+    if (cuModuleGetFunction(&s->kk.f_gemm_fp8_mt4,   s->kk.mod, "gemm_bf16_pipe_mt4_scaled_f32") != CUDA_SUCCESS) s->kk.f_gemm_fp8_mt4   = NULL;
+    if (cuModuleGetFunction(&s->kk.f_gemm_fp8,       s->kk.mod, "gemm_bf16_pipe_scaled_f32")     != CUDA_SUCCESS) s->kk.f_gemm_fp8       = NULL;
+    if (cuModuleGetFunction(&s->kk.f_reduce_max_abs, s->kk.mod, "reduce_max_abs_f32")            != CUDA_SUCCESS) s->kk.f_reduce_max_abs = NULL;
+    if (cuModuleGetFunction(&s->kk.f_quantize_fp8,   s->kk.mod, "quantize_to_fp8_e4m3")          != CUDA_SUCCESS) s->kk.f_quantize_fp8   = NULL;
+    /* BF16 TC kernels (optional; missing → fall back to f_mha automatically). */
+    if (cuModuleGetFunction(&s->kk.f_cast_bf16,         s->kk.mod, "cast_f32_to_bf16")        != CUDA_SUCCESS) s->kk.f_cast_bf16 = NULL;
+    if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64,    s->kk.mod, "flash_attn_bf16_hd64")    != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64 = NULL;
+    if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64_xq, s->kk.mod, "flash_attn_bf16_hd64_xq") != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64_xq = NULL;
+    /* Initialize the FP8→BF16 LUT used by other MMA kernels (the attn path
+     * doesn't read it, but the module global must exist when present). */
+    {
+        CUdeviceptr d_lut; size_t lut_sz;
+        if (cuModuleGetGlobal(&d_lut, &lut_sz, s->kk.mod, "d_fp8_to_bf16_lut") == CUDA_SUCCESS &&
+            lut_sz == 256 * sizeof(uint16_t)) {
+            uint16_t lut[256];
+            for (int i = 0; i < 256; i++) {
+                int sign = (i >> 7) & 1;
+                int exp  = (i >> 3) & 0xF;
+                int mant = i & 0x7;
+                float v;
+                if (exp == 0 && mant == 0) v = 0.f;
+                else if (exp == 15 && mant == 7) v = 0.f;
+                else if (exp == 0) v = ((float)mant / 8.f) * (1.f / 64.f);
+                else v = (1.f + (float)mant / 8.f) * exp2f((float)(exp - 7));
+                if (sign) v = -v;
+                uint32_t b; memcpy(&b, &v, 4);
+                uint32_t rb = 0x7FFFu + ((b >> 16) & 1u);
+                lut[i] = (uint16_t)((b + rb) >> 16);
+            }
+            cuMemcpyHtoD(d_lut, lut, sizeof(lut));
+        }
+    }
 
     /* Open weights */
     st_context *st = safetensors_open(unet_safetensors_path);
@@ -234,7 +307,9 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
 
     /* RA cache: backed by a fixed 16-slot array; runner header reads from
      * the global g_ra_cache. */
-    g_ra_cache.slots = s->ra_slots;
+    s->active_chunk = 0;
+    for (int c = 0; c < PAINT_UNET_MAX_CHUNKS; c++) s->chunk_dual_done[c] = 0;
+    g_ra_cache.slots = s->ra_slots[0];
     g_ra_cache.n_slots = MAX_N_BLOCKS;
     g_ra_cache.idx = 0;
     g_ra_n_ref = cfg->N_ref;
@@ -243,6 +318,61 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
     s->packed_main     = (float *)malloc(s->Beff_main * s->per_in_main * sizeof(float));
     s->packed_dual     = (float *)malloc(s->Beff_dual * s->per_view    * sizeof(float));
     s->text_tiled_main = (float *)malloc(s->Beff_main * s->txt_per     * sizeof(float));
+
+    /* BF16 attention scratch + dispatch flag. Sized for the largest Q/K/V
+     * tensor across all attention call sites: self-attn at the shallowest
+     * level (B*N*dim with N=H0*W0=4096, dim=320) and cross-attn with DINO
+     * tokens (B*M*dim with M=T_dino*4=1028, dim up to 1280). The .max here
+     * conservatively covers both. */
+    {
+        const char *e = getenv("PAINT_BF16_ATTN");
+        int want = (e == NULL) || (e[0] != '0');
+        int have = (s->kk.f_cast_bf16 && s->kk.f_attn_bf16_hd64_xq);
+        g_paint_use_bf16_attn = (want && have) ? 1 : 0;
+        if (g_paint_use_bf16_attn) {
+            size_t self_q = (size_t)s->Beff_main * (size_t)H0 * W0 * 320; /* deepest self N=4096*ch=320 */
+            size_t cross_q = (size_t)s->Beff_main * (size_t)H0 * W0 * 320;
+            size_t cross_kv_dino = (size_t)s->Beff_main * (size_t)s->M_dino * 1280;
+            size_t cross_kv_text = (size_t)s->Beff_main * (size_t)M_text * 1280;
+            size_t self_q_deep = (size_t)s->Beff_main * (size_t)16 * 16 * 1280;
+            size_t mx = self_q;
+            if (cross_q > mx) mx = cross_q;
+            if (cross_kv_dino > mx) mx = cross_kv_dino;
+            if (cross_kv_text > mx) mx = cross_kv_text;
+            if (self_q_deep > mx) mx = self_q_deep;
+            g_paint_qkv_bf16_max_elem = mx;
+            cuMemAlloc(&g_paint_d_qbf, mx * sizeof(unsigned short));
+            cuMemAlloc(&g_paint_d_kbf, mx * sizeof(unsigned short));
+            cuMemAlloc(&g_paint_d_vbf, mx * sizeof(unsigned short));
+            fprintf(stderr, "[paint_stage_unet] BF16_ATTN=1 (scratch %.1f MB / Q,K,V)\n",
+                    (double)mx * 2.0 / (1024.0*1024.0));
+        } else {
+            fprintf(stderr, "[paint_stage_unet] BF16_ATTN=0 (env=%s have=%d)\n",
+                    e ? e : "(unset)", have);
+        }
+    }
+
+    /* FP8 GEMM dispatch (Phase 4.9.2): MT4 BF16-pipe with per-tensor FP8 weights.
+     * Requires the three NVRTC kernels and the BF16 cast kernel; lazily prequant
+     * weights on first k_linear call. Activation scratch sized to the largest
+     * X tensor that flows into a linear (FF input = 4C at top resolution). */
+    {
+        /* Phase 4.9.2: dispatch is plumbed but kernel triggers a sticky
+         * ILLEGAL_ADDRESS after ~535 successful FP8 GEMM dispatches; root
+         * cause not isolated (suspected non-FP8 kernel between calls).
+         * Default OFF until follow-up. PAINT_FP8_GEMM=1 enables. */
+        const char *e = getenv("PAINT_FP8_GEMM");
+        int want = (e != NULL) && (e[0] != '0');
+        int have = (s->kk.f_gemm_fp8_mt4 && s->kk.f_reduce_max_abs &&
+                    s->kk.f_quantize_fp8);
+        g_paint_use_fp8_gemm = (want && have) ? 1 : 0;
+        if (g_paint_use_fp8_gemm) {
+            fprintf(stderr, "[paint_stage_unet] FP8_GEMM=1 (per-tensor BF16-pipe MT1)\n");
+        } else {
+            fprintf(stderr, "[paint_stage_unet] FP8_GEMM=0 (env=%s have=%d)\n",
+                    e ? e : "(unset)", have);
+        }
+    }
 
     return s;
 }
@@ -314,7 +444,20 @@ void paint_stage_unet_set_conditioning(paint_stage_unet *s,
     }
 
     s->cond_set = 1;
-    s->dual_done = 0;
+    /* Note: do NOT reset chunk_dual_done here — set_conditioning may be called
+     * once per step (cheap rebuild of conditioning device buffers) while the
+     * RA cache from a prior run_dual stays valid for the active chunk. The
+     * chunk's dual_done is invalidated only by set_chunk on a fresh chunk. */
+}
+
+void paint_stage_unet_set_chunk(paint_stage_unet *s, int chunk_id) {
+    if (chunk_id < 0 || chunk_id >= PAINT_UNET_MAX_CHUNKS) {
+        fprintf(stderr, "[paint_stage_unet] ERROR: chunk_id %d out of range\n", chunk_id);
+        return;
+    }
+    s->active_chunk = chunk_id;
+    g_ra_cache.slots = s->ra_slots[chunk_id];
+    g_ra_cache.idx = 0;
 }
 
 void paint_stage_unet_run_dual(paint_stage_unet *s) {
@@ -326,7 +469,9 @@ void paint_stage_unet_run_dual(paint_stage_unet *s) {
     const int H0 = cfg->H0, W0 = cfg->W0, M_text = cfg->M_text;
     const int IC_dual = 4;
 
-    g_ra_mode = 1; g_ra_cache.idx = 0;
+    g_ra_mode = 1;
+    g_ra_cache.slots = s->ra_slots[s->active_chunk];
+    g_ra_cache.idx = 0;
 
     int64_t ts_dual_arr[16];
     for (int b = 0; b < s->Beff_dual; b++) ts_dual_arr[b] = 0;
@@ -356,16 +501,20 @@ void paint_stage_unet_run_dual(paint_stage_unet *s) {
     run_up_block(&s->kk, &s->ubd[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
     run_up_block(&s->kk, &s->ubd[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
     cuCtxSynchronize();
-    s->dual_done = 1;
-    fprintf(stderr, "[paint_stage_unet] dual-stream RA cache populated (%d slots)\n", g_ra_cache.idx);
+    s->chunk_dual_done[s->active_chunk] = 1;
+    fprintf(stderr, "[paint_stage_unet] dual-stream RA cache populated for chunk %d (%d slots)\n",
+            s->active_chunk, g_ra_cache.idx);
 }
 
 void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
                                 const float *x_host, float *noise_pred_host) {
-    if (!s->dual_done) {
-        fprintf(stderr, "[paint_stage_unet] ERROR: run_dual first\n");
+    if (!s->chunk_dual_done[s->active_chunk]) {
+        fprintf(stderr, "[paint_stage_unet] ERROR: run_dual first for chunk %d\n",
+                s->active_chunk);
         return;
     }
+    /* Point the read-side cache at the active chunk's slots. */
+    g_ra_cache.slots = s->ra_slots[s->active_chunk];
     const paint_unet_config *cfg = &s->cfg;
     const int H0 = cfg->H0, W0 = cfg->W0, M_text = cfg->M_text;
     const int N_PBR = cfg->N_pbr, N_GEN = cfg->N_gen;

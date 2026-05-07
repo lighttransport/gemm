@@ -327,3 +327,84 @@ cd ../../cuda/hy3d
   explain why the controlled override path improved while the ordinary 30-step
   pipeline still starts from mismatched noise and `verify_dit` output still
   diverges.
+
+---
+
+## Resume prompt (Phase 4.9.2 — paint UNet FP8 GEMM dispatch)
+
+Continue Phase 4.9.2 of `cuda/hy3d_paint`: route paint UNet linears through TC GEMM
+to close the ~22× gap vs PyTorch (currently 22.21 s/forward on RTX 5060 Ti / sm120).
+
+### State as of save
+
+- BF16 flash attention (Phase 4.9.1) shipped and on by default (`PAINT_BF16_ATTN`).
+- FP8-GEMM **plumbing** landed in `cuda/hy3d_paint/cuda_paint_unet_runner.h` and
+  `cuda/hy3d_paint/paint_stage_unet.c`:
+    - `pu_fp8_entry` registry + `paint_fp8_lookup` / `paint_fp8_register` /
+      `paint_quantize_w_fp8` (per-tensor scale; uses `reduce_max_abs_f32` +
+      `quantize_to_fp8_e4m3` from `cuda/cuda_fp8_mma_kernels.h`).
+    - `k_linear` dispatches `gemm_bf16_pipe_scaled_f32` (MT1) when
+      `n_in%32==0 && n_out%256==0 && M>=16`. Falls back to scalar `f_lin` for
+      shapes that don't fit (n_out=320/640 paths).
+    - `f_gemm_fp8_mt4`, `f_gemm_fp8`, `f_reduce_max_abs`, `f_quantize_fp8`
+      module-loaded silently (no error if missing).
+    - Lazy registration on first call — no explicit walker needed.
+- Default OFF: `PAINT_FP8_GEMM=1` to enable. Baseline (default-OFF) confirmed
+  intact: 1-step chain produces `mask_mismatch=4558`, `uv-raster 9713/16384`,
+  `max_diff=4.284e-01`, pipeline DONE.
+
+### Open bug — root cause this first
+
+With `PAINT_FP8_GEMM=1`:
+- After exactly **~535 successful FP8 dispatches**, a sticky
+  `CUDA_ERROR_ILLEGAL_ADDRESS (700)` appears between two FP8 launches.
+- Bracket-syncs prove: post-sync at FP8 call idx 534 = SUCCESS; pre-sync at
+  idx 535 = FAIL. So the corruption is introduced by a **non-FP8 kernel** that
+  runs between those two calls. The shape at idx 535 is consistently
+  `M=3072 K=1280 N=1280` (deepest level, B=12 × 16×16 tokens, C=1280).
+- Both `gemm_bf16_pipe_mt4_scaled_f32` (MT4 / 64-row tiles) and
+  `gemm_bf16_pipe_scaled_f32` (MT1 / 32-row tiles) exhibit identical failure,
+  ruling out the FP8 GEMM kernel itself.
+- Steady-state perf observation (with the bug): 4-step UNet 19.74 s vs 266.49 s
+  baseline (~13× faster) — but outputs are corrupt because context dies mid-step.
+  This tells us the speedup is real once the OOB is fixed.
+
+### How to resume
+
+1. Reproduce: `make test_paint_pipeline` then
+   ```
+   CHAIN_STEPS=1 PAINT_FP8_GEMM=1 PAINT_BF16_ATTN=1 \
+     ./test_paint_pipeline chain \
+       /tmp/hy3d_paint_bp_ref/textured.obj \
+       /mnt/disk01/models/dinov2-giant/model.safetensors \
+       /tmp/fujisan_dinov2_224.npy \
+       /mnt/disk01/models/Hunyuan3D-2.1/hunyuan3d-paintpbr-v2-1/unet/paint_unet_wrapper.safetensors \
+       /tmp/hy3d_paint_unet_dino_ref \
+       /mnt/disk01/models/Hunyuan3D-2.1/hunyuan3d-paintpbr-v2-1/vae/paint_vae.safetensors \
+       /tmp/hy3d_paint_bp_ref /tmp/chain_fp8_out
+   ```
+2. Bisect the OOB by syncing **every** kernel launch (not just FP8) — wrap
+   each `cuLaunchKernel` site in `paint_stage_unet.c` and the helpers in
+   `cuda_paint_unet_runner.h` with a sync + sticky-error print, gated on a
+   `PAINT_FP8_DEBUG=1` env. The first launch that flips status from
+   SUCCESS → ILLEGAL_ADDRESS is the culprit.
+3. Likely suspects (in order):
+    - A `unet_*_f32` kernel that consumes the FP8 GEMM's writeback buffer
+      (Y is "BF16-truncated F32": high 16 bits = BF16 value, low 16 = 0). If a
+      downstream kernel (group-norm, layer-norm, residual add, etc.) interprets
+      it as native F32 it will produce garbage but not OOB — keep narrowing.
+    - Activation buffer over-read in a BF16 attn or RA-cache kernel after FP8
+      Y wraps to a smaller-magnitude tile.
+    - A scalar fallback `unet_linear_f32` reading a weight that was freed when
+      the FP8 path replaced it — but we keep F32 weights live, so unlikely.
+4. Once green, drop the diagnostic syncs, flip default to ON
+   (`want = (e == NULL) || (e[0] != '0')`), and verify:
+    - 30-step CFG-3 chain finishes well under 5 minutes (was ~33 min).
+    - `mask_mismatch` within ±5 of 4558; `uv-raster` 9713/16384 unchanged.
+    - `PAINT_FP8_GEMM=0` still produces today's bit-for-bit baseline.
+
+### Out of scope this round
+
+- Per-row FP8 weight scales (`PAINT_FP8_W_PERROW`) — Phase 3 follow-up.
+- `unet_conv2d_f32` rewrite — only if profile shows conv ≥10 % of remaining time.
+- CUDA-graph capture / sync removal in `paint_stage_unet.c` — Phase 2.
