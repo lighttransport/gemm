@@ -177,6 +177,15 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
      * Stage 0's C2S conv2). N>=512 keeps small-batch shapes on WMMA. */
     /* Bridge wins mid-N (8K..180K). For very large N (Stage 3 C2S, N=822K)
      * the cold per-call F32<->F16 conversion + nmap-derive dominates. Cap. */
+    /* NEXT ROUND HOOK — extend Triton AOT to N>100k shapes:
+     *   1. Add (N=178651, Ci=128, Co=128) and (N=822874, Ci=64, Co=64) entries
+     *      to triton_aot/build_*.py shape lists.
+     *   2. Re-run extraction; bridge picks them up via manifest.
+     *   3. Lift this `N <= 100000` gate.
+     * Per memory: existing WMMA spconv at large-N gives 7-8 TF/s vs hipBLASLt's
+     * ~scaling on these shapes; Triton autotune at N=178651 should land 60+ TF/s.
+     * Critical to re-amortize the per-call F32->F16 conversion: persistent
+     * BF16 activation buffers across stage 3 instead of pack/unpack per call. */
     if (nmap && g_use_triton && host_w && k->pack_f16 && N <= 100000 &&
         t2_triton_has_shape(N, inC, outC)) {
         if (kspconv_nmap_triton(k, out, in, nmap, host_w, b, N, inC, outC) == 0) return;
@@ -309,10 +318,6 @@ static void ksilu_bf16(K *k, void *o, void *i, int n) {
     int blocks = ((n + 3) / 4 + 255) / 256;
     hipModuleLaunchKernel(k->silu_bf16, blocks, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
-static void kgelu(K *k, void *x, int n) {
-    void *a[] = {&x, &n};
-    hipModuleLaunchKernel(k->gelu, (n+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
-}
 static void kadd(K *k, void *x, void *y, int n) {
     void *a[] = {&x, &y, &n};
     hipModuleLaunchKernel(k->add, (n+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
@@ -414,10 +419,6 @@ static void *get_f16_weight_k(K *k, const float *host_w_f32, size_t n_elems) {
     g_f16_devs[slot] = d_f16;
     return d_f16;
 }
-static void *get_f16_weight(const float *host_w_f32, size_t n_elems) {
-    return get_f16_weight_k(NULL, host_w_f32, n_elems);
-}
-
 /* Triton AOT spconv bridge dispatch. Pack F32 in/bias->F16 scratch,
  * call bridge, unpack F16 out -> F32 result. Returns 0 on success, -1
  * if shape not registered (caller falls back). */
@@ -527,7 +528,17 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
      * slowdown" turned out to be a measurement error — confirmed via rocprofv3
      * hip-trace, no real side-effect. The big cliff that obscured it is the
      * one-time ~1230 ms hipBLASLt JIT compile for the K=27648 spconv1 plan
-     * (Stage 0 C2S, or Stage 1 klin_up when Triton AOT covers Stage 0). */
+     * (Stage 0 C2S, or Stage 1 klin_up when Triton AOT covers Stage 0).
+     *
+     * NEXT ROUND HOOK — extending dense-WMMA to win at large M:
+     *   Currently gated N <= 4096; M=8452/38321 use hipBLASLt MT64x64x32.
+     *   Per memory: hipBLASLt picks suboptimal algos (klin_up: 30 ms vs klin_dn:
+     *   60 ms for identical-FLOP shapes), and hipBLASLt sweep harness segfaults
+     *   inside the driver. Path forward: extend `t2_dense_gemm_bf16in_x8_db`
+     *   (defined behind T2_TEX_BF16IN_GEMM in hip_tex_dec_kernels.h) with a
+     *   wider M-tile (64 or 128 vox vs current 32) and split-K to amortize
+     *   small-N output-tile sizes for klin_dn (N=512). Match Triton's autotune
+     *   cache structure used for spconv (4 hsacos / 9 shapes -> autotune wins). */
     {
         static int s_dense_wmma = -1;
         if (s_dense_wmma < 0) {
@@ -814,14 +825,20 @@ static void dump_dev_f32(const char *path, void *d, int N, int C) {
  * in the original code; this batch costs ~33 ms of sync hipMalloc/hipFree per
  * tex_dec run. With monotonically-growing N across stages 0->3 the realloc
  * fires at most once per buffer per run, then sticks. */
-static void *g_c2s_dn = NULL, *g_c2s_de = NULL, *g_c2s_dhf = NULL;
-static void *g_c2s_dxf = NULL, *g_c2s_dhn = NULL;
-static void *g_c2s_didx = NULL, *g_c2s_dsi = NULL;
-static void *g_c2s_dout = NULL, *g_c2s_fk = NULL, *g_c2s_fv = NULL;
-static size_t g_c2s_dn_b = 0, g_c2s_de_b = 0, g_c2s_dhf_b = 0;
-static size_t g_c2s_dxf_b = 0, g_c2s_dhn_b = 0;
-static size_t g_c2s_didx_b = 0, g_c2s_dsi_b = 0;
-static size_t g_c2s_dout_b = 0, g_c2s_fk_b = 0, g_c2s_fv_b = 0;
+/* C2S transient device scratch, grow-on-demand. Pre-sized to worst-case
+ * across stages by the caller before the decode loop, so c2s_grow inside
+ * run_c2s never reallocates (would use-after-free the prior stage's
+ * d_feats == prior g_c2s.dout). */
+typedef struct {
+    void *dn, *de, *dhf, *dxf, *dhn;     /* per-stage compute scratch */
+    void *didx, *dsi;                    /* gather indices (pre-uploaded) */
+    void *dout;                          /* output sparse feats */
+    void *fk, *fv;                       /* hash table for fine coords */
+    size_t dn_b, de_b, dhf_b, dxf_b, dhn_b;
+    size_t didx_b, dsi_b;
+    size_t dout_b, fk_b, fv_b;
+} C2SScratch;
+static C2SScratch g_c2s = {0};
 static void c2s_grow(void **p, size_t *cap, size_t need) {
     if (need <= *cap) return;
     if (*p) hipFree(*p);
@@ -843,14 +860,14 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     void *dout=NULL;
     c2s_prof_init();
     double a0 = g_prof_c2s ? now_ms() : 0;
-    c2s_grow(&g_c2s_dn,  &g_c2s_dn_b,  (size_t)Nc*Ci*sizeof(float));
-    c2s_grow(&g_c2s_de,  &g_c2s_de_b,  (size_t)Nc*Cexp*sizeof(float));
-    c2s_grow(&g_c2s_dhf, &g_c2s_dhf_b, (size_t)Nf*Co*sizeof(float));
-    c2s_grow(&g_c2s_dxf, &g_c2s_dxf_b, (size_t)Nf*Ci8*sizeof(float));
-    c2s_grow(&g_c2s_dhn, &g_c2s_dhn_b, (size_t)Nf*Co*sizeof(float));
-    void *dn=g_c2s_dn, *de=g_c2s_de, *dhf=g_c2s_dhf, *dxf=g_c2s_dxf, *dhn=g_c2s_dhn;
-    c2s_grow(&g_c2s_dout, &g_c2s_dout_b, (size_t)Nf*Co*sizeof(float));
-    dout = g_c2s_dout;
+    c2s_grow(&g_c2s.dn,  &g_c2s.dn_b,  (size_t)Nc*Ci*sizeof(float));
+    c2s_grow(&g_c2s.de,  &g_c2s.de_b,  (size_t)Nc*Cexp*sizeof(float));
+    c2s_grow(&g_c2s.dhf, &g_c2s.dhf_b, (size_t)Nf*Co*sizeof(float));
+    c2s_grow(&g_c2s.dxf, &g_c2s.dxf_b, (size_t)Nf*Ci8*sizeof(float));
+    c2s_grow(&g_c2s.dhn, &g_c2s.dhn_b, (size_t)Nf*Co*sizeof(float));
+    void *dn=g_c2s.dn, *de=g_c2s.de, *dhf=g_c2s.dhf, *dxf=g_c2s.dxf, *dhn=g_c2s.dhn;
+    c2s_grow(&g_c2s.dout, &g_c2s.dout_b, (size_t)Nf*Co*sizeof(float));
+    dout = g_c2s.dout;
     if (g_prof_c2s) { g_c2s_alloc_ms += now_ms()-a0; g_c2s_alloc_calls++; }
     if (g_prof_c2s) hipEventRecord(g_c2s_ev[0], g_stream);
     kln(k, dn, d_feats, dn1w, dn1b, Nc, Ci, 1, 1);
@@ -878,9 +895,9 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     /* persistent: dhf retained */
     int cap = 1; while (cap < Nf*2) cap <<= 1; int cm = cap - 1;
     double a3 = g_prof_c2s ? now_ms() : 0;
-    c2s_grow(&g_c2s_fk, &g_c2s_fk_b, (size_t)cap*sizeof(uint64_t));
-    c2s_grow(&g_c2s_fv, &g_c2s_fv_b, (size_t)cap*sizeof(int32_t));
-    void *fk = g_c2s_fk, *fv = g_c2s_fv;
+    c2s_grow(&g_c2s.fk, &g_c2s.fk_b, (size_t)cap*sizeof(uint64_t));
+    c2s_grow(&g_c2s.fv, &g_c2s.fv_b, (size_t)cap*sizeof(int32_t));
+    void *fk = g_c2s.fk, *fv = g_c2s.fv;
     if (g_prof_c2s) g_c2s_alloc_ms += now_ms()-a3;
     hipMemsetAsync(fk, 0,    (size_t)cap*sizeof(uint64_t), g_stream);
     hipMemsetAsync(fv, 0xff, (size_t)cap*sizeof(int32_t),  g_stream);
@@ -1161,7 +1178,7 @@ int main(int argc, char **argv) {
 
     /* Pre-size all C2S persistent scratch to the worst-case sizes across
      * stages, so c2s_grow inside run_c2s never reallocates (which would
-     * use-after-free the previous stage's d_feats == prior g_c2s_dout). */
+     * use-after-free the previous stage's d_feats == prior g_c2s.dout). */
     {
         size_t max_dn = 0, max_de = 0, max_dhf = 0, max_dxf = 0, max_dhn = 0;
         size_t max_dout = 0, max_didx = 0, max_dsi = 0;
@@ -1184,16 +1201,16 @@ int main(int argc, char **argv) {
             b = (size_t)cap * sizeof(uint64_t);    if (b > max_fk)   max_fk = b;
             b = (size_t)cap * sizeof(int32_t);     if (b > max_fv)   max_fv = b;
         }
-        c2s_grow(&g_c2s_dn,   &g_c2s_dn_b,   max_dn);
-        c2s_grow(&g_c2s_de,   &g_c2s_de_b,   max_de);
-        c2s_grow(&g_c2s_dhf,  &g_c2s_dhf_b,  max_dhf);
-        c2s_grow(&g_c2s_dxf,  &g_c2s_dxf_b,  max_dxf);
-        c2s_grow(&g_c2s_dhn,  &g_c2s_dhn_b,  max_dhn);
-        c2s_grow(&g_c2s_dout, &g_c2s_dout_b, max_dout);
-        c2s_grow(&g_c2s_didx, &g_c2s_didx_b, max_didx);
-        c2s_grow(&g_c2s_dsi,  &g_c2s_dsi_b,  max_dsi);
-        c2s_grow(&g_c2s_fk,   &g_c2s_fk_b,   max_fk);
-        c2s_grow(&g_c2s_fv,   &g_c2s_fv_b,   max_fv);
+        c2s_grow(&g_c2s.dn,   &g_c2s.dn_b,   max_dn);
+        c2s_grow(&g_c2s.de,   &g_c2s.de_b,   max_de);
+        c2s_grow(&g_c2s.dhf,  &g_c2s.dhf_b,  max_dhf);
+        c2s_grow(&g_c2s.dxf,  &g_c2s.dxf_b,  max_dxf);
+        c2s_grow(&g_c2s.dhn,  &g_c2s.dhn_b,  max_dhn);
+        c2s_grow(&g_c2s.dout, &g_c2s.dout_b, max_dout);
+        c2s_grow(&g_c2s.didx, &g_c2s.didx_b, max_didx);
+        c2s_grow(&g_c2s.dsi,  &g_c2s.dsi_b,  max_dsi);
+        c2s_grow(&g_c2s.fk,   &g_c2s.fk_b,   max_fk);
+        c2s_grow(&g_c2s.fv,   &g_c2s.fv_b,   max_fv);
     }
 
     /* Persistent output buffer for the final klin (output_layer). Sized to
@@ -1302,7 +1319,7 @@ int main(int argc, char **argv) {
                 d_gi[s], d_gs[s], d_gxc[s], gN[s],
                 d_nmap_cn[s], d_fine);
             /* Stage 0's d_feats/d_coords/d_keys/d_vals were freshly malloc'd;
-             * subsequent stages return persistent globals (g_c2s_dout/fk/fv +
+             * subsequent stages return persistent globals (g_c2s.dout/fk/fv +
              * pre-uploaded d_gxc[s]). Don't free across stages — the persistent
              * buffers must survive into the next stage; the original fresh
              * stage-0 allocations are leaked at end of run (acceptable). */
