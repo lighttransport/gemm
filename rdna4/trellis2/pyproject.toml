@@ -50,6 +50,7 @@ ref-pipeline = [
     "regex",
     "rembg",
     "onnxruntime",
+    "xatlas",
 ]
 
 [tool.uv]
