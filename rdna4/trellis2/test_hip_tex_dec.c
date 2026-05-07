@@ -528,27 +528,32 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
      * Standalone 27% faster than hipBLASLt at Stage 0 klin shapes (M=1905:
      * 99→72 ms). The previously suspected "+1170 ms post-WMMA hipBLASLt
      * slowdown" turned out to be a measurement error — confirmed via rocprofv3
-     * hip-trace, no real side-effect. The big cliff that obscured it is the
-     * one-time ~1230 ms hipBLASLt JIT compile for the K=27648 spconv1 plan
-     * (Stage 0 C2S, or Stage 1 klin_up when Triton AOT covers Stage 0).
+     * hip-trace, no real side-effect.
      *
-     * NEXT ROUND HOOK — extending dense-WMMA to win at large M:
-     *   Currently gated N <= 4096; M=8452/38321 use hipBLASLt MT64x64x32.
-     *   Per memory: hipBLASLt picks suboptimal algos (klin_up: 30 ms vs klin_dn:
-     *   60 ms for identical-FLOP shapes), and hipBLASLt sweep harness segfaults
-     *   inside the driver. Path forward: extend `t2_dense_gemm_bf16in_x8_db`
-     *   (defined behind T2_TEX_BF16IN_GEMM in hip_tex_dec_kernels.h) with a
-     *   wider M-tile (64 or 128 vox vs current 32) and split-K to amortize
-     *   small-N output-tile sizes for klin_dn (N=512). Match Triton's autotune
-     *   cache structure used for spconv (4 hsacos / 9 shapes -> autotune wins). */
+     * Empirical M-cap sweep (T2_TEX_DENSE_WMMA_NMAX, knight_r512 warm wall):
+     *   4096   (Stage 0 only)             189 ms  (+14 vs blaslt-only 175)
+     *   16384  (+ Stage 1)                237 ms
+     *   65536  (+ Stage 2)                264 ms
+     *   262144 (+ Stage 3)                275 ms
+     *   0      (unlimited)                278 ms
+     * Current 32-vox x 64-oc tile loses to hipBLASLt MT64x64x32 at M>4096.
+     * Beating blaslt at large M needs a wider-M variant of the kernel
+     * (64 or 128 vox) + split-K — substantial kernel work, not a one-line
+     * gate flip. T2_TEX_DENSE_WMMA_NMAX makes the cap tunable for that work. */
     {
         static int s_dense_wmma = -1;
         if (s_dense_wmma < 0) {
             const char *e = getenv("T2_TEX_DENSE_WMMA");
             s_dense_wmma = (e && atoi(e)) ? 1 : 0;
         }
+        static int s_dense_cap = -1;
+        if (s_dense_cap < 0) {
+            const char *e = getenv("T2_TEX_DENSE_WMMA_NMAX");
+            s_dense_cap = e ? atoi(e) : 4096;
+        }
         if (s_dense_wmma && dev_w_f32_fallback && bias_f32 &&
-            (inC % 16) == 0 && (outC % 16) == 0 && N > 0 && N <= 4096) {
+            (inC % 16) == 0 && (outC % 16) == 0 && N > 0 &&
+            (s_dense_cap == 0 || N <= s_dense_cap)) {
             if (klin_dense_wmma(k, o_f32, x_f32, dev_w_f32_fallback, bias_f32, N, inC, outC) == 0)
                 return;
         }
