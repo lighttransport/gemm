@@ -281,6 +281,11 @@ struct hip_hy3d_runner {
 
     /* Load status */
     int dino_loaded, dit_loaded, vae_loaded;
+
+    /* Per-stage GPU timing */
+    int timing_enabled;
+    int timing_valid;
+    hy3d_stage_times timings;
 };
 
 static int hy3d_should_dump_latent(const struct hip_hy3d_runner *r, int step1) {
@@ -1774,6 +1779,27 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
+    /* Per-stage GPU timing events */
+    hipEvent_t ev_e2e_start = NULL, ev_e2e_end = NULL;
+    hipEvent_t ev_dino_start = NULL, ev_dino_end = NULL;
+    hipEvent_t ev_dit_start = NULL, ev_dit_end = NULL;
+    hipEvent_t ev_vae_start = NULL, ev_vae_end = NULL;
+    hipEvent_t ev_step_start[HY3D_MAX_DIT_STEPS] = {0};
+    hipEvent_t ev_step_end[HY3D_MAX_DIT_STEPS] = {0};
+    int n_steps_for_timing = (n_steps < HY3D_MAX_DIT_STEPS) ? n_steps : HY3D_MAX_DIT_STEPS;
+    if (r->timing_enabled) {
+        hipEventCreate(&ev_e2e_start);  hipEventCreate(&ev_e2e_end);
+        hipEventCreate(&ev_dino_start); hipEventCreate(&ev_dino_end);
+        hipEventCreate(&ev_dit_start);  hipEventCreate(&ev_dit_end);
+        hipEventCreate(&ev_vae_start);  hipEventCreate(&ev_vae_end);
+        for (int i = 0; i < n_steps_for_timing; i++) {
+            hipEventCreate(&ev_step_start[i]);
+            hipEventCreate(&ev_step_end[i]);
+        }
+        hipEventRecord(ev_e2e_start, r->stream);
+        hipEventRecord(ev_dino_start, r->stream);
+    }
+
     /* ---- Stage 1: DINOv2 image encoding ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 1 - DINOv2 encoding...\n");
 
@@ -1827,6 +1853,11 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
                 dmin, dmax, dsum / (DINO_SEQ_LEN * DINO_HIDDEN), nan_cnt,
                 has_nan ? " *** NaN DETECTED ***" : "");
         free(dino_full);
+    }
+
+    if (r->timing_enabled) {
+        hipEventRecord(ev_dino_end, r->stream);
+        hipEventRecord(ev_dit_start, r->stream);
     }
 
     /* ---- Stage 2: DiT diffusion with flow matching ---- */
@@ -1894,6 +1925,9 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
             fprintf(stderr, "  step %d/%d (t=%.4f)\n", step + 1, n_steps, model_t);
 
+        if (r->timing_enabled && step < n_steps_for_timing)
+            hipEventRecord(ev_step_start[step], r->stream);
+
         if (r->latent_dump_count > 0 && hy3d_should_dump_latent(r, step + 1)) {
             hy3d_dump_latent(stream, d_latents, DIT_INPUT_SIZE, DIT_IN_CHANNELS,
                              r->latent_dump_prefix, step + 1);
@@ -1917,6 +1951,9 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         }
 
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
+
+        if (r->timing_enabled && step < n_steps_for_timing)
+            hipEventRecord(ev_step_end[step], r->stream);
 
         /* NaN check after each step */
         if (r->verbose && step == 0) {
@@ -1958,12 +1995,21 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         free(lcpu);
     }
 
+    if (r->timing_enabled) {
+        hipEventRecord(ev_dit_end, r->stream);
+        hipEventRecord(ev_vae_start, r->stream);
+    }
+
     /* ---- Stage 3: ShapeVAE decode + SDF query ---- */
     if (r->verbose) fprintf(stderr, "HY3D: Stage 3 - ShapeVAE decode (grid %d^3)...\n", grid_res);
 
     int total_pts = grid_res * grid_res * grid_res;
     float *sdf_grid = (float *)malloc((size_t)total_pts * sizeof(float));
     run_shapevae(r, d_latents, grid_res, sdf_grid);
+    if (r->timing_enabled) {
+        hipEventRecord(ev_vae_end, r->stream);
+        hipEventRecord(ev_e2e_end, r->stream);
+    }
     hipFree(d_latents);
 
     /* SDF grid stats */
@@ -1998,7 +2044,44 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         fprintf(stderr, "HY3D: done in %.2fs (%d verts, %d tris)\n",
                 elapsed, result.n_verts, result.n_tris);
 
+    if (r->timing_enabled) {
+        hipEventSynchronize(ev_e2e_end);
+        memset(&r->timings, 0, sizeof(r->timings));
+        hipEventElapsedTime(&r->timings.dino_ms,      ev_dino_start, ev_dino_end);
+        hipEventElapsedTime(&r->timings.dit_total_ms, ev_dit_start,  ev_dit_end);
+        hipEventElapsedTime(&r->timings.vae_ms,       ev_vae_start,  ev_vae_end);
+        hipEventElapsedTime(&r->timings.e2e_ms,       ev_e2e_start,  ev_e2e_end);
+        r->timings.dit_steps = n_steps_for_timing;
+        for (int i = 0; i < n_steps_for_timing; i++) {
+            hipEventElapsedTime(&r->timings.dit_step_ms[i],
+                                ev_step_start[i], ev_step_end[i]);
+        }
+        r->timing_valid = 1;
+
+        hipEventDestroy(ev_e2e_start);  hipEventDestroy(ev_e2e_end);
+        hipEventDestroy(ev_dino_start); hipEventDestroy(ev_dino_end);
+        hipEventDestroy(ev_dit_start);  hipEventDestroy(ev_dit_end);
+        hipEventDestroy(ev_vae_start);  hipEventDestroy(ev_vae_end);
+        for (int i = 0; i < n_steps_for_timing; i++) {
+            hipEventDestroy(ev_step_start[i]);
+            hipEventDestroy(ev_step_end[i]);
+        }
+    }
+
     return result;
+}
+
+void hip_hy3d_set_per_stage_timing(hip_hy3d_runner *r, int enable) {
+    if (!r) return;
+    r->timing_enabled = enable ? 1 : 0;
+    if (!enable) r->timing_valid = 0;
+}
+
+int hip_hy3d_get_stage_times(const hip_hy3d_runner *r, hy3d_stage_times *out) {
+    if (!r || !out) return -1;
+    if (!r->timing_valid) return -1;
+    *out = r->timings;
+    return 0;
 }
 
 /* ======================================================================== */
