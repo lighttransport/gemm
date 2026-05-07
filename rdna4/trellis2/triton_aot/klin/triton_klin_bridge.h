@@ -12,12 +12,9 @@
  * API:
  *   int  t2_klin_init(const char *kernels_dir);   // scans dir for tagged shapes
  *   int  t2_klin_has_shape(int K, int N);
- *   int  t2_klin_run(int M, int K, int N,
- *                    const void *d_x_bf16,  // [M, K] bf16, row-major
- *                    const void *d_w_bf16,  // [N, K] bf16, row-major
- *                    const void *d_bias_f32,// [N] f32 (may be NULL → zero bias)
- *                    void       *d_y_f32,   // [M, N] f32, row-major
- *                    hipStream_t stream);
+ *   int  t2_klin_has_shape_silu(int K, int N);    // 1 iff fused bias+silu variant present
+ *   int  t2_klin_run(int M, int K, int N, ... );  // bias-only
+ *   int  t2_klin_run_silu(int M, int K, int N, ...); // bias+silu fused
  *        Returns 0 on launch success; -1 if (K,N) not registered.
  *   void t2_klin_release(void);
  */
@@ -32,10 +29,15 @@
 
 int  t2_klin_init(const char *kernels_dir);
 int  t2_klin_has_shape(int K, int N);
+int  t2_klin_has_shape_silu(int K, int N);
 int  t2_klin_run(int M, int K, int N,
                  const void *d_x_bf16, const void *d_w_bf16,
                  const void *d_bias_f32, void *d_y_f32,
                  hipStream_t stream);
+int  t2_klin_run_silu(int M, int K, int N,
+                      const void *d_x_bf16, const void *d_w_bf16,
+                      const void *d_bias_f32, void *d_y_f32,
+                      hipStream_t stream);
 void t2_klin_release(void);
 
 #ifdef TRITON_KLIN_BRIDGE_IMPL
@@ -51,6 +53,7 @@ typedef struct {
     int BM, BN, BK;
     int num_warps;
     int shared;
+    int silu;           /* 0 = bias-only, 1 = bias+silu fused epilogue */
     hipModule_t mod;
     hipFunction_t kfn;
     void *d_zero_bias;  /* allocated lazily if caller passes NULL bias */
@@ -75,7 +78,7 @@ static const char *_kl_err_str(hipError_t e) {
 static int _kl_load_one(const char *kernels_dir, const char *tag,
                         int M_max, int K, int N,
                         int BM, int BN, int BK, int num_warps, int shared,
-                        t2_klin_shape *out)
+                        int silu, t2_klin_shape *out)
 {
     char p[1024];
     snprintf(p, sizeof p, "%s/%s/kernel.hsaco", kernels_dir, tag);
@@ -88,14 +91,17 @@ static int _kl_load_one(const char *kernels_dir, const char *tag,
         fprintf(stderr, "t2_klin: hipModuleLoadData(%s) %s\n", tag, _kl_err_str(e));
         return -1;
     }
-    e = hipModuleGetFunction(&out->kfn, out->mod, "klin_bf16_kernel");
+    const char *fname = silu ? "klin_bf16_silu_kernel" : "klin_bf16_kernel";
+    e = hipModuleGetFunction(&out->kfn, out->mod, fname);
     if (e != hipSuccess) {
-        fprintf(stderr, "t2_klin: hipModuleGetFunction(%s) %s\n", tag, _kl_err_str(e));
+        fprintf(stderr, "t2_klin: hipModuleGetFunction(%s, %s) %s\n",
+                tag, fname, _kl_err_str(e));
         return -1;
     }
     out->K = K; out->N = N; out->M_max = M_max;
     out->BM = BM; out->BN = BN; out->BK = BK;
     out->num_warps = num_warps; out->shared = shared;
+    out->silu = silu;
     out->d_zero_bias = NULL;
     return 0;
 }
@@ -148,11 +154,13 @@ int t2_klin_init(const char *kernels_dir)
             int BK = _kl_json_int(blk, "BK");
             int nw = _kl_json_int(blk, "num_warps");
             int sh = _kl_json_int(blk, "shared");
+            int silu = _kl_json_int(blk, "silu");
+            if (silu < 0) silu = 0;
             if (K > 0 && N > 0 && BM > 0 && BN > 0 && BK > 0 && nw > 0) {
                 if (_kl_load_one(kernels_dir, tag, Mm, K, N, BM, BN, BK, nw, sh,
-                                 &g_kshapes[g_n_kshapes]) == 0) {
-                    fprintf(stderr, "t2_klin: %-22s  K=%d N=%d  tile=%dx%dx%d nw=%d shared=%d\n",
-                            tag, K, N, BM, BN, BK, nw, sh);
+                                 silu, &g_kshapes[g_n_kshapes]) == 0) {
+                    fprintf(stderr, "t2_klin: %-22s  K=%d N=%d  tile=%dx%dx%d nw=%d shared=%d silu=%d\n",
+                            tag, K, N, BM, BN, BK, nw, sh, silu);
                     g_n_kshapes++;
                 }
             }
@@ -165,22 +173,47 @@ int t2_klin_init(const char *kernels_dir)
     return g_n_kshapes > 0 ? 0 : -1;
 }
 
-static t2_klin_shape *_kl_find(int K, int N) {
+static t2_klin_shape *_kl_find2(int K, int N, int silu) {
     for (int i = 0; i < g_n_kshapes; i++) {
-        if (g_kshapes[i].K == K && g_kshapes[i].N == N) return &g_kshapes[i];
+        if (g_kshapes[i].K == K && g_kshapes[i].N == N
+            && g_kshapes[i].silu == silu) return &g_kshapes[i];
     }
     return NULL;
 }
 
-int t2_klin_has_shape(int K, int N) { return _kl_find(K, N) != NULL; }
+int t2_klin_has_shape(int K, int N) { return _kl_find2(K, N, 0) != NULL; }
+int t2_klin_has_shape_silu(int K, int N) { return _kl_find2(K, N, 1) != NULL; }
+
+static int _t2_klin_run_impl(t2_klin_shape *s, int M, int K, int N,
+                             const void *d_x_bf16, const void *d_w_bf16,
+                             const void *d_bias_f32, void *d_y_f32,
+                             hipStream_t stream);
 
 int t2_klin_run(int M, int K, int N,
                 const void *d_x_bf16, const void *d_w_bf16,
                 const void *d_bias_f32, void *d_y_f32,
                 hipStream_t stream)
 {
-    t2_klin_shape *s = _kl_find(K, N);
+    t2_klin_shape *s = _kl_find2(K, N, 0);
     if (!s) return -1;
+    return _t2_klin_run_impl(s, M, K, N, d_x_bf16, d_w_bf16, d_bias_f32, d_y_f32, stream);
+}
+
+int t2_klin_run_silu(int M, int K, int N,
+                     const void *d_x_bf16, const void *d_w_bf16,
+                     const void *d_bias_f32, void *d_y_f32,
+                     hipStream_t stream)
+{
+    t2_klin_shape *s = _kl_find2(K, N, 1);
+    if (!s) return -1;
+    return _t2_klin_run_impl(s, M, K, N, d_x_bf16, d_w_bf16, d_bias_f32, d_y_f32, stream);
+}
+
+static int _t2_klin_run_impl(t2_klin_shape *s, int M, int K, int N,
+                             const void *d_x_bf16, const void *d_w_bf16,
+                             const void *d_bias_f32, void *d_y_f32,
+                             hipStream_t stream)
+{
 
     /* Caller may chunk M arbitrarily; kernel masks handle M < BM at the tail. */
     if (!d_bias_f32) {

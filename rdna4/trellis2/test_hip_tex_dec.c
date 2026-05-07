@@ -639,6 +639,43 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
      * variance from hipBLASLt algo non-determinism, not stream race.) */
 }
 
+/* klin_bl variant with fused bias+silu epilogue. Used for ConvNeXt mlp0
+ * (Linear -> SiLU). Tries the silu-fused Triton AOT klin kernel first; falls
+ * back to klin_bl + standalone ksilu on shape miss / launch failure. */
+static void klin_bl_silu(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
+                         void *dev_w_f32_fallback, void *bias_f32,
+                         int N, int inC, int outC) {
+    int eligible = (g_use_blaslt && N >= 8 && (inC % 16) == 0 && (outC % 16) == 0
+                    && host_w_f32 && bias_f32);
+    if (eligible && g_use_triton_klin && t2_klin_has_shape_silu(inC, outC)) {
+        void *d_w_bf16 = get_bf16_weight(host_w_f32, (size_t)outC * inC);
+        if (d_w_bf16) {
+            const int CAP_KL_T = 16384;
+            int nchunks_t = (N + CAP_KL_T - 1) / CAP_KL_T;
+            int M_CHUNK_T = (N + nchunks_t - 1) / nchunks_t;
+            int ok = 1;
+            for (int m0 = 0; m0 < N && ok; m0 += M_CHUNK_T) {
+                int M = (N - m0 < M_CHUNK_T) ? (N - m0) : M_CHUNK_T;
+                int n_act = M * inC;
+                void *dst = g_d_act_bf16;
+                float *src_chunk = (float *)x_f32 + (size_t)m0 * inC;
+                void *src = src_chunk;
+                void *args0[] = { &dst, &src, &n_act };
+                int n4 = (n_act + 3) / 4;
+                hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, g_stream, args0, NULL);
+                float *dst_chunk = (float *)o_f32 + (size_t)m0 * outC;
+                if (t2_klin_run_silu(M, inC, outC, g_d_act_bf16, d_w_bf16, bias_f32, dst_chunk, g_stream) != 0) {
+                    ok = 0; break;
+                }
+            }
+            if (ok) return;
+        }
+    }
+    /* Fallback: separate klin + silu. */
+    klin_bl(k, o_f32, x_f32, host_w_f32, dev_w_f32_fallback, bias_f32, N, inC, outC);
+    ksilu(k, o_f32, o_f32, N * outC);
+}
+
 /* klin_bl variant: F32 in, BF16 out (fused bias epilogue, BF16 D). Pack is
  * still required for the F32->BF16 input conversion. Used for klin_up to
  * eliminate the standalone pack between klin_up output and klin_dn input. */
@@ -802,10 +839,11 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
         }
     }
     if (!used_bf16) {
-        klin_bl(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
+        /* Fused mlp0 + SiLU via Triton AOT silu-epilogue kernel (falls back
+         * to klin_bl + ksilu internally if the silu shape isn't registered).
+         * SparseConvNeXtBlock3d uses nn.SiLU (sparse_unet_vae.py:280). */
+        klin_bl_silu(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
         if (g_prof_cn) hipEventRecord(g_prof_ev[3], g_stream);
-        /* SparseConvNeXtBlock3d uses nn.SiLU (sparse_unet_vae.py:280), not GELU. */
-        ksilu(k, d_mlp, d_mlp, N * 4 * C);
         if (g_prof_cn) hipEventRecord(g_prof_ev[4], g_stream);
         klin_bl(k, d_tmp, d_mlp, blk->mlp2_w, dm2, dm2b, N, 4*C, C);
     } else { (void)0; }
