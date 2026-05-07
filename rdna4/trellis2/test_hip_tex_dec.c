@@ -175,18 +175,20 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
      * Stage 0 (in_C=1024 -> K=27648) hits a hipBLASLt plan-compile cliff and
      * regresses ~80%. Empirically restrict to in_C <= 512 (Stages 1-3, plus
      * Stage 0's C2S conv2). N>=512 keeps small-batch shapes on WMMA. */
-    /* Bridge wins mid-N (8K..180K). For very large N (Stage 3 C2S, N=822K)
-     * the cold per-call F32<->F16 conversion + nmap-derive dominates. Cap. */
-    /* NEXT ROUND HOOK — extend Triton AOT to N>100k shapes:
-     *   1. Add (N=178651, Ci=128, Co=128) and (N=822874, Ci=64, Co=64) entries
-     *      to triton_aot/build_*.py shape lists.
-     *   2. Re-run extraction; bridge picks them up via manifest.
-     *   3. Lift this `N <= 100000` gate.
-     * Per memory: existing WMMA spconv at large-N gives 7-8 TF/s vs hipBLASLt's
-     * ~scaling on these shapes; Triton autotune at N=178651 should land 60+ TF/s.
-     * Critical to re-amortize the per-call F32->F16 conversion: persistent
-     * BF16 activation buffers across stage 3 instead of pack/unpack per call. */
-    if (nmap && g_use_triton && host_w && k->pack_f16 && N <= 100000 &&
+    /* Triton AOT manifest now covers all tex_dec spconv shapes including
+     * N=178651 (Stage 3 ConvNeXt) and N=822874 (final layer). Empirically
+     * (warm-state, knight_r512): cap=100k, cap=200k, no-cap all land within
+     * 175-177 ms — Triton at large N is at parity with the WMMA fallback,
+     * not the 60+ TF/s win earlier estimated. The per-call F32<->F16 pack
+     * cost on giant tiles eats the autotuned-kernel gain.
+     * T2_TRITON_NMAX caps which shapes route through Triton (0 = unlimited). */
+    int triton_nmax = 0;
+    {
+        const char *e = getenv("T2_TRITON_NMAX");
+        if (e) triton_nmax = atoi(e);
+    }
+    if (nmap && g_use_triton && host_w && k->pack_f16 &&
+        (triton_nmax <= 0 || N <= triton_nmax) &&
         t2_triton_has_shape(N, inC, outC)) {
         if (kspconv_nmap_triton(k, out, in, nmap, host_w, b, N, inC, outC) == 0) return;
     }
