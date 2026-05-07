@@ -33,6 +33,12 @@
 
 int  t2_triton_init(const char *kernels_dir);
 int  t2_triton_has_shape(int N, int Ci, int Co); /* 1 if registered, 0 otherwise */
+/* Optional: set a directory used to persist (sorted, vk, vkseg) prep tensors
+ * across processes. When set, _ts_prep_cache reads from
+ *   <dir>/triton_prep_N{N}_B{B1}.bin
+ * if present (skipping D2H + argsort + H2D), and writes the file on miss.
+ * Pass NULL to disable. The caller owns dir lifetime. */
+void t2_triton_set_prep_cache_dir(const char *dir);
 /* Register a device-side reduction kernel for SPLITK>1: out_f16[total] =
  * sum_k partial_f32[k*total + i] -> f16. Bridge launches it after the
  * SPLITK kernel. Must be set before the first SPLITK call. */
@@ -185,26 +191,80 @@ static t2_tspconv_shape *_ts_find(int N, int Ci, int Co)
     return NULL;
 }
 
-/* NEXT ROUND HOOK — disk-cache prep to attack the ~150 ms cold-start cost.
- * The (sorted, vk, vkseg) tensors derived below are a pure function of the
- * nmap content. They could be:
- *   1. Computed once per (N, V) shape and dumped alongside the .npy cache
- *      (rdna4/trellis2/test_hip_tex_dec.c reads from --cache <dir>); then
- *      this function would mmap and H2D-copy directly, skipping the D2H +
- *      CPU argsort + H2D round-trip.
- *   2. Or persisted in a shared on-disk cache keyed by hash(nmap_content) so
- *      different processes (and different runs of the same model) reuse them.
- * Biggest single hipMemcpy in rocprof was 27 ms for the largest N=822874
- * nmap D2H (89 MB at ~3 GB/s); 9 shapes total around 150 ms.
- *
- * Suggested API addition for the next round:
- *   int t2_triton_prep_set(int N, int Ci, int Co,
- *                          const int64_t *sorted, const int32_t *vk,
- *                          const int32_t *vkseg, int vk_len);
- * which side-loads the precomputed tensors and skips _ts_prep_cache(). */
+/* Disk-cache for (sorted, vk, vkseg). These are a pure function of nmap
+ * content and B1 — see _ts_prep_cache. Format (little-endian, host-native):
+ *   magic[8] = "T2PRP01\0"
+ *   int32: N, B1, vk_len, num_blocks
+ *   int64[N]: sorted
+ *   int32[vk_len]: vk
+ *   int32[num_blocks+1]: vkseg
+ * Caller invalidates by clearing the cache_dir (same lifetime as the .npy
+ * nmap cache that drives derivation). */
+static const char *g_prep_cache_dir = NULL;
+void t2_triton_set_prep_cache_dir(const char *dir) { g_prep_cache_dir = dir; }
+
+static int _ts_prep_disk_load(t2_tspconv_shape *s)
+{
+    if (!g_prep_cache_dir) return 0;
+    char p[1024];
+    snprintf(p, sizeof p, "%s/triton_prep_N%d_B%d.bin", g_prep_cache_dir, s->N, s->B1);
+    FILE *f = fopen(p, "rb"); if (!f) return 0;
+    char magic[8]; int32_t hdr[4];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "T2PRP01\0", 8) != 0) { fclose(f); return 0; }
+    if (fread(hdr, 4, 4, f) != 4) { fclose(f); return 0; }
+    int N = hdr[0], B1 = hdr[1], vk_len = hdr[2], num_blocks = hdr[3];
+    if (N != s->N || B1 != s->B1) { fclose(f); return 0; }
+    size_t N_pad = (size_t)((N + B1 - 1) / B1) * B1;
+    size_t vk_pad = (size_t)vk_len + B1;
+    int64_t *sorted = (int64_t *)malloc((size_t)N * 8);
+    int32_t *vk     = (int32_t *)malloc((size_t)vk_len * 4);
+    int32_t *seg    = (int32_t *)malloc((size_t)(num_blocks + 1) * 4);
+    int ok = (fread(sorted, 8, N, f) == (size_t)N
+           && fread(vk,     4, vk_len, f) == (size_t)vk_len
+           && fread(seg,    4, num_blocks + 1, f) == (size_t)(num_blocks + 1));
+    fclose(f);
+    if (!ok) { free(sorted); free(vk); free(seg); return 0; }
+    if (s->d_sorted) hipFree(s->d_sorted);
+    if (s->d_vk)     hipFree(s->d_vk);
+    if (s->d_vkseg)  hipFree(s->d_vkseg);
+    hipMalloc(&s->d_sorted, N_pad * 8); hipMemset(s->d_sorted, 0, N_pad * 8);
+    hipMalloc(&s->d_vk,     vk_pad * 4); hipMemset(s->d_vk, 0, vk_pad * 4);
+    hipMalloc(&s->d_vkseg,  (size_t)(num_blocks + 1) * 4);
+    hipMemcpy(s->d_sorted, sorted, (size_t)N * 8, hipMemcpyHostToDevice);
+    hipMemcpy(s->d_vk,     vk,     (size_t)vk_len * 4, hipMemcpyHostToDevice);
+    hipMemcpy(s->d_vkseg,  seg,    (size_t)(num_blocks + 1) * 4, hipMemcpyHostToDevice);
+    s->vk_len = vk_len; s->num_blocks = num_blocks;
+    free(sorted); free(vk); free(seg);
+    return 1;
+}
+
+static void _ts_prep_disk_store(t2_tspconv_shape *s,
+                                const int64_t *sorted, const int32_t *vk, const int32_t *seg)
+{
+    if (!g_prep_cache_dir) return;
+    char p[1024];
+    snprintf(p, sizeof p, "%s/triton_prep_N%d_B%d.bin.tmp", g_prep_cache_dir, s->N, s->B1);
+    FILE *f = fopen(p, "wb"); if (!f) return;
+    int32_t hdr[4] = { s->N, s->B1, s->vk_len, s->num_blocks };
+    int ok = (fwrite("T2PRP01\0", 1, 8, f) == 8
+           && fwrite(hdr, 4, 4, f) == 4
+           && fwrite(sorted, 8, s->N, f) == (size_t)s->N
+           && fwrite(vk,     4, s->vk_len, f) == (size_t)s->vk_len
+           && fwrite(seg,    4, s->num_blocks + 1, f) == (size_t)(s->num_blocks + 1));
+    fclose(f);
+    if (ok) {
+        char p2[1024];
+        snprintf(p2, sizeof p2, "%s/triton_prep_N%d_B%d.bin", g_prep_cache_dir, s->N, s->B1);
+        rename(p, p2);
+    } else {
+        remove(p);
+    }
+}
+
 static void _ts_prep_cache(t2_tspconv_shape *s, const void *d_nmap)
 {
     if (s->cached_nmap == d_nmap && s->d_sorted) return;
+    if (_ts_prep_disk_load(s)) { s->cached_nmap = d_nmap; return; }
     /* Pull nmap host-side, derive, push back. */
     int N = s->N;
     int32_t *h_nmap = (int32_t *)malloc((size_t)N * T2_V * 4);
@@ -237,6 +297,7 @@ static void _ts_prep_cache(t2_tspconv_shape *s, const void *d_nmap)
     s->vk_len = vk_len;
     s->num_blocks = num_blocks;
     s->cached_nmap = d_nmap;
+    _ts_prep_disk_store(s, sorted, vk, seg);
     free(h_nmap); free(gray); free(bin); free(sorted); free(vk); free(seg);
 }
 
