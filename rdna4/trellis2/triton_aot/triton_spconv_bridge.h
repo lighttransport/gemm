@@ -209,7 +209,7 @@ static t2_tspconv_shape *_ts_find(int N, int Ci, int Co)
 static const char *g_prep_cache_dir = NULL;
 void t2_triton_set_prep_cache_dir(const char *dir) { g_prep_cache_dir = dir; }
 
-static int _ts_prep_disk_load(t2_tspconv_shape *s)
+static int _ts_prep_disk_load(t2_tspconv_shape *s, hipStream_t stream)
 {
     if (!g_prep_cache_dir) return 0;
     char p[1024];
@@ -233,12 +233,14 @@ static int _ts_prep_disk_load(t2_tspconv_shape *s)
     if (s->d_sorted) hipFree(s->d_sorted);
     if (s->d_vk)     hipFree(s->d_vk);
     if (s->d_vkseg)  hipFree(s->d_vkseg);
-    hipMalloc(&s->d_sorted, N_pad * 8); hipMemset(s->d_sorted, 0, N_pad * 8);
-    hipMalloc(&s->d_vk,     vk_pad * 4); hipMemset(s->d_vk, 0, vk_pad * 4);
+    hipMalloc(&s->d_sorted, N_pad * 8); hipMemsetAsync(s->d_sorted, 0, N_pad * 8, stream);
+    hipMalloc(&s->d_vk,     vk_pad * 4); hipMemsetAsync(s->d_vk, 0, vk_pad * 4, stream);
     hipMalloc(&s->d_vkseg,  (size_t)(num_blocks + 1) * 4);
-    hipMemcpy(s->d_sorted, sorted, (size_t)N * 8, hipMemcpyHostToDevice);
-    hipMemcpy(s->d_vk,     vk,     (size_t)vk_len * 4, hipMemcpyHostToDevice);
-    hipMemcpy(s->d_vkseg,  seg,    (size_t)(num_blocks + 1) * 4, hipMemcpyHostToDevice);
+    hipMemcpyAsync(s->d_sorted, sorted, (size_t)N * 8, hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(s->d_vk,     vk,     (size_t)vk_len * 4, hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(s->d_vkseg,  seg,    (size_t)(num_blocks + 1) * 4, hipMemcpyHostToDevice, stream);
+    /* Synchronize so the host-side `sorted/vk/seg` buffers can be freed safely. */
+    hipStreamSynchronize(stream);
     s->vk_len = vk_len; s->num_blocks = num_blocks;
     free(sorted); free(vk); free(seg);
     return 1;
@@ -267,14 +269,15 @@ static void _ts_prep_disk_store(t2_tspconv_shape *s,
     }
 }
 
-static void _ts_prep_cache(t2_tspconv_shape *s, const void *d_nmap)
+static void _ts_prep_cache(t2_tspconv_shape *s, const void *d_nmap, hipStream_t stream)
 {
     if (s->cached_nmap == d_nmap && s->d_sorted) return;
-    if (_ts_prep_disk_load(s)) { s->cached_nmap = d_nmap; return; }
+    if (_ts_prep_disk_load(s, stream)) { s->cached_nmap = d_nmap; return; }
     /* Pull nmap host-side, derive, push back. */
     int N = s->N;
     int32_t *h_nmap = (int32_t *)malloc((size_t)N * T2_V * 4);
-    hipMemcpy(h_nmap, d_nmap, (size_t)N * T2_V * 4, hipMemcpyDeviceToHost);
+    hipMemcpyAsync(h_nmap, d_nmap, (size_t)N * T2_V * 4, hipMemcpyDeviceToHost, stream);
+    hipStreamSynchronize(stream);
     uint32_t *gray = (uint32_t *)malloc(N * 4);
     uint32_t *bin  = (uint32_t *)malloc(N * 4);
     int64_t *sorted = (int64_t *)malloc(N * 8);
@@ -291,15 +294,16 @@ static void _ts_prep_cache(t2_tspconv_shape *s, const void *d_nmap)
      * cross page boundary -> memory fault. Pad allocs to next B1 multiple. */
     size_t N_pad = (size_t)((N + s->B1 - 1) / s->B1) * s->B1;
     hipMalloc(&s->d_sorted, N_pad * 8);
-    hipMemset(s->d_sorted, 0, N_pad * 8);
+    hipMemsetAsync(s->d_sorted, 0, N_pad * 8, stream);
     /* vk_len is bounded by num_blocks * V; pad by B1 entries for the same reason. */
     size_t vk_pad = (size_t)vk_len + s->B1;
     hipMalloc(&s->d_vk, vk_pad * 4);
-    hipMemset(s->d_vk, 0, vk_pad * 4);
+    hipMemsetAsync(s->d_vk, 0, vk_pad * 4, stream);
     hipMalloc(&s->d_vkseg,  (size_t)(num_blocks + 1) * 4);
-    hipMemcpy(s->d_sorted, sorted, (size_t)N * 8, hipMemcpyHostToDevice);
-    hipMemcpy(s->d_vk,     vk,     (size_t)vk_len * 4, hipMemcpyHostToDevice);
-    hipMemcpy(s->d_vkseg,  seg,    (size_t)(num_blocks + 1) * 4, hipMemcpyHostToDevice);
+    hipMemcpyAsync(s->d_sorted, sorted, (size_t)N * 8, hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(s->d_vk,     vk,     (size_t)vk_len * 4, hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(s->d_vkseg,  seg,    (size_t)(num_blocks + 1) * 4, hipMemcpyHostToDevice, stream);
+    hipStreamSynchronize(stream);
     s->vk_len = vk_len;
     s->num_blocks = num_blocks;
     s->cached_nmap = d_nmap;
@@ -324,7 +328,7 @@ int t2_triton_spconv(int N, int Ci, int Co,
         s->cached_nmap = NULL;
         s->N = N;
     }
-    _ts_prep_cache(s, d_nmap);
+    _ts_prep_cache(s, d_nmap, stream);
     int LOGN = (int)log2((double)N);
     void *null_ptr = NULL;
     int total = N * Co;
