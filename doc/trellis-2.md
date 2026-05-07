@@ -276,6 +276,41 @@ HIP DiT now uses BF16 WMMA GEMM + BF16 WMMA flash-attn (commit 4d59a1e).
 on non-gfx12 archs (or with `T2_WMMA=0`), 143.7 s/step there. Next-tier
 optimization: BF16-act × FP8-weight WMMA (qimg/Flux.2 pattern, ~2× more).
 
+### tex_dec (Stage 3 texture decoder) cold/warm — RX 9070 XT, knight r512 dump
+
+Bench harness: `rdna4/trellis2/bench_tex_dec_coldwarm.py` (PyTorch ROCm 7.2.2 ref;
+`T2_TEX_REPS=N` env on `test_hip_tex_dec` for HIP). Cold = rep 0 of a fresh process,
+warm = median of rep 1+ (steady state). Both ship-AOT/cache-warmed: PyTorch's
+`~/.flex_gemm/autotune_cache.json` + `~/.triton/cache/` populated; HIP's Triton AOT
+hsacos baked at build time and `<cache_dir>/triton_prep_*.bin` pre-populated.
+
+| Path | Cold rep 0 | Warm steady |
+|---|---|---|
+| **PyTorch ROCm 7.2.2 (Triton spconv via FlexGEMM)** | **~2000 ms** (1.9–3.7 s) | **125 ms** |
+| **HIP (`test_hip_tex_dec`, T2_TEX_REPS=2)** | **329 ms** | **144 ms** |
+
+- **Cold**: HIP wins by **6–11×**. PyTorch's 2 sec cold is Triton kernel JIT-from-cached-AST
+  + first-call hipBLASLt plan compile, even with both caches warm. We ship Triton AOT
+  hsacos and disk-persist spconv prep tensors (sorted/vk/vkseg) so neither cost lands.
+- **Warm**: PyTorch wins by **~19 ms** (~13%). Their autotuned wide-tile Triton spconv at
+  large N (178k, 822k voxels) outperforms our hipBLASLt MT64x64x32 fallback at stage 3;
+  per-call host overhead is also slightly lower.
+- Implication: for one-shot mesh texturing the HIP path is sub-second to first decoded
+  voxel; for batched decode (>1 mesh per process) PyTorch warm 125 ms beats HIP 144 ms.
+
+Bench setup (one-time, see `rdna4/trellis2/pyproject.toml` for full recipe):
+
+```bash
+cd /mnt/disk1/work/gemm/trellis2/rdna4/trellis2
+uv venv --python 3.12 .venv
+uv pip install -e ".[torch-rocm722]"
+BUILD_TARGET=rocm GPU_ARCHS=gfx1201 uv pip install --no-build-isolation -e \
+    /mnt/disk1/work/gemm/trellis2/cpu/trellis2/trellis2_repo/o-voxel
+BUILD_TARGET=rocm GPU_ARCHS=gfx1201 uv pip install --no-build-isolation -e \
+    /mnt/disk1/work/gemm/trellis2/rdna4/trellis2/deps/FlexGEMM
+.venv/bin/python bench_tex_dec_coldwarm.py --reps 4
+```
+
 ## Weight Files
 
 | Component | Path | Size | Format |
