@@ -1063,7 +1063,15 @@ int main(int argc, char **argv) {
             if (t2_triton_init(kd) == 0) {
                 g_use_triton = 1;
                 t2_triton_set_reduce_kernel(k.splitk_reduce);
-                fprintf(stderr, "T2-TEX: Triton AOT spconv bridge enabled (kernels=%s)\n", kd);
+                /* Persist the (sorted, vk, vkseg) prep tensors alongside the
+                 * .npy nmap cache. Same invalidation contract as the existing
+                 * --cache <dir>: clear the dir to regenerate. Override via
+                 * T2_TEX_PREP_CACHE_DIR; set empty string to disable. */
+                const char *pd = getenv("T2_TEX_PREP_CACHE_DIR");
+                if (!pd) pd = cache_dir;
+                if (pd && pd[0]) t2_triton_set_prep_cache_dir(pd);
+                fprintf(stderr, "T2-TEX: Triton AOT spconv bridge enabled (kernels=%s, prep_cache=%s)\n",
+                        kd, (pd && pd[0]) ? pd : "off");
             } else {
                 fprintf(stderr, "T2-TEX: t2_triton_init failed; bridge disabled\n");
             }
