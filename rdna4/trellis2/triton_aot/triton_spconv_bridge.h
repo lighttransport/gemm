@@ -175,18 +175,24 @@ int t2_triton_init(const char *kernels_dir)
     return g_n_shapes > 0 ? 0 : -1;
 }
 
+/* Matching is by (Ci, Co) only — kernel tile heuristic depends on Ci/Co, the
+ * kernel itself takes runtime N. The N field in the manifest is the extraction
+ * sample size; runtime N can differ (e.g. 822874 in manifest vs 822875 at run
+ * time, off-by-one between the AOT-extraction graph and the live graph). */
 int t2_triton_has_shape(int N, int Ci, int Co)
 {
+    (void)N;
     for (int i = 0; i < g_n_shapes; i++) {
-        if (g_shapes[i].N == N && g_shapes[i].Ci == Ci && g_shapes[i].Co == Co) return 1;
+        if (g_shapes[i].Ci == Ci && g_shapes[i].Co == Co) return 1;
     }
     return 0;
 }
 
 static t2_tspconv_shape *_ts_find(int N, int Ci, int Co)
 {
+    (void)N;
     for (int i = 0; i < g_n_shapes; i++) {
-        if (g_shapes[i].N == N && g_shapes[i].Ci == Ci && g_shapes[i].Co == Co) return &g_shapes[i];
+        if (g_shapes[i].Ci == Ci && g_shapes[i].Co == Co) return &g_shapes[i];
     }
     return NULL;
 }
@@ -308,6 +314,16 @@ int t2_triton_spconv(int N, int Ci, int Co,
     t2_tspconv_shape *s = _ts_find(N, Ci, Co);
     if (!s) return -1;
     if (s->SPLITK > 1 && !g_reduce_kfn) return -1;  /* reduction kfn not registered */
+    /* Adopt runtime N so prep-cache + partial buffer sizing are correct even
+     * when the AOT manifest's sample N differs (e.g. 822874 vs 822875). */
+    if (s->N != N) {
+        if (s->d_sorted) { hipFree(s->d_sorted); s->d_sorted = NULL; }
+        if (s->d_vk)     { hipFree(s->d_vk);     s->d_vk     = NULL; }
+        if (s->d_vkseg)  { hipFree(s->d_vkseg);  s->d_vkseg  = NULL; }
+        if (s->d_partial_f32) { hipFree(s->d_partial_f32); s->d_partial_f32 = NULL; }
+        s->cached_nmap = NULL;
+        s->N = N;
+    }
     _ts_prep_cache(s, d_nmap);
     int LOGN = (int)log2((double)N);
     void *null_ptr = NULL;
