@@ -185,6 +185,23 @@ static t2_tspconv_shape *_ts_find(int N, int Ci, int Co)
     return NULL;
 }
 
+/* NEXT ROUND HOOK — disk-cache prep to attack the ~150 ms cold-start cost.
+ * The (sorted, vk, vkseg) tensors derived below are a pure function of the
+ * nmap content. They could be:
+ *   1. Computed once per (N, V) shape and dumped alongside the .npy cache
+ *      (rdna4/trellis2/test_hip_tex_dec.c reads from --cache <dir>); then
+ *      this function would mmap and H2D-copy directly, skipping the D2H +
+ *      CPU argsort + H2D round-trip.
+ *   2. Or persisted in a shared on-disk cache keyed by hash(nmap_content) so
+ *      different processes (and different runs of the same model) reuse them.
+ * Biggest single hipMemcpy in rocprof was 27 ms for the largest N=822874
+ * nmap D2H (89 MB at ~3 GB/s); 9 shapes total around 150 ms.
+ *
+ * Suggested API addition for the next round:
+ *   int t2_triton_prep_set(int N, int Ci, int Co,
+ *                          const int64_t *sorted, const int32_t *vk,
+ *                          const int32_t *vkseg, int vk_len);
+ * which side-loads the precomputed tensors and skips _ts_prep_cache(). */
 static void _ts_prep_cache(t2_tspconv_shape *s, const void *d_nmap)
 {
     if (s->cached_nmap == d_nmap && s->d_sorted) return;
