@@ -38,6 +38,18 @@ dependencies = [
 torch-rocm722 = [
     "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.6.0+rocm7.2.2.git4ed88892-cp312-cp312-linux_x86_64.whl",
     "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl",
+    "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchvision-0.26.0+rocm7.2.2.git336d36e8-cp312-cp312-linux_x86_64.whl",
+]
+
+# For running ref/trellis2/gen_stage1_ref.py / gen_stage2_ref.py:
+#   uv pip install -e ".[ref-pipeline]"
+ref-pipeline = [
+    "transformers<5",
+    "tokenizers==0.22.1",
+    "huggingface_hub<1.0",
+    "regex",
+    "rembg",
+    "onnxruntime",
 ]
 
 [tool.uv]
