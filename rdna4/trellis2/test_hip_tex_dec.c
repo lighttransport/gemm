@@ -28,6 +28,13 @@
 #include "triton_aot/klin/triton_klin_bridge.h"
 static int g_use_triton_klin = 0;
 
+/* Non-blocking stream threaded through every kernel launch + bridge call.
+ * Replaces stream 0 (legacy null stream) so:
+ *   - launches don't implicitly synchronize against other streams,
+ *   - the decode loop is capturable into a hipGraph (legacy null stream is
+ *     not capturable in hipStreamCaptureModeGlobal). */
+static hipStream_t g_stream = NULL;
+
 /* hipBLASLt BF16 path globals.
  * - g_use_blaslt: 1 iff bridge initialized successfully
  * - g_d_act_bf16: persistent BF16 activation scratch (sized to max(N*max(C,4C)) * 2 B)
@@ -128,15 +135,15 @@ typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled
 
 static void hash_build(K *k, void *keys, void *vals, int cap_mask, void *coords, int N) {
     void *a[] = {&keys, &vals, &cap_mask, &coords, &N};
-    hipModuleLaunchKernel(k->ins, (N+255)/256, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->ins, (N+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
 static void kspconv(K *k, void *out, void *in, void *co, void *w, void *b,
                     void *keys, void *vals, int cap_mask, int N, int inC, int outC) {
     void *a[] = {&out, &in, &co, &w, &b, &keys, &vals, &cap_mask, &inC, &outC};
     if ((outC % 64 == 0) && (inC % 32 == 0)) {
-        hipModuleLaunchKernel(k->conv_tiled, N, outC / 64, 1, 64, 1, 1, 0, 0, a, NULL);
+        hipModuleLaunchKernel(k->conv_tiled, N, outC / 64, 1, 64, 1, 1, 0, g_stream, a, NULL);
     } else {
-        hipModuleLaunchKernel(k->conv, N, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+        hipModuleLaunchKernel(k->conv, N, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
     }
 }
 /* Nmap-driven variant: uses flex_gemm's precomputed neighbor_map (not coord hash).
@@ -187,35 +194,35 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
             hipFunction_t f = k->conv_nmap_bf16_x8;
             const char *e = getenv("T2_TEX_WMMA_DB");
             if (k->conv_nmap_bf16_x8_db && (e == NULL || atoi(e))) f = k->conv_nmap_bf16_x8_db;
-            hipModuleLaunchKernel(f, gx, gy, 1, 256, 1, 1, 0, 0, a, NULL);
+            hipModuleLaunchKernel(f, gx, gy, 1, 256, 1, 1, 0, g_stream, a, NULL);
             return;
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x4 &&
             (inC % 16 == 0) && (outC % 32 == 0) && (N >= 32)) {
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 31) / 32, gy = (outC + 31) / 32;
-            hipModuleLaunchKernel(k->conv_nmap_bf16_x4, gx, gy, 1, 128, 1, 1, 0, 0, a, NULL);
+            hipModuleLaunchKernel(k->conv_nmap_bf16_x4, gx, gy, 1, 128, 1, 1, 0, g_stream, a, NULL);
             return;
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x2 &&
             (inC % 16 == 0) && (outC % 32 == 0)) {
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 15) / 16, gy = (outC + 31) / 32;
-            hipModuleLaunchKernel(k->conv_nmap_bf16_x2, gx, gy, 1, 64, 1, 1, 0, 0, a, NULL);
+            hipModuleLaunchKernel(k->conv_nmap_bf16_x2, gx, gy, 1, 64, 1, 1, 0, g_stream, a, NULL);
             return;
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16 &&
             (inC % 16 == 0) && (outC % 16 == 0)) {
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 15) / 16, gy = (outC + 15) / 16;
-            hipModuleLaunchKernel(k->conv_nmap_bf16, gx, gy, 1, 32, 1, 1, 0, 0, a, NULL);
+            hipModuleLaunchKernel(k->conv_nmap_bf16, gx, gy, 1, 32, 1, 1, 0, g_stream, a, NULL);
             return;
         }
         void *a[] = {&out, &in, &nmap, &w, &b, &inC, &outC};
         if ((outC % 64 == 0) && (inC % 32 == 0)) {
-            hipModuleLaunchKernel(k->conv_nmap_tiled, N, outC / 64, 1, 64, 1, 1, 0, 0, a, NULL);
+            hipModuleLaunchKernel(k->conv_nmap_tiled, N, outC / 64, 1, 64, 1, 1, 0, g_stream, a, NULL);
         } else {
-            hipModuleLaunchKernel(k->conv_nmap, N, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+            hipModuleLaunchKernel(k->conv_nmap, N, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
         }
         } else {
         kspconv(k, out, in, co, w, b, keys, vals, cap_mask, N, inC, outC);
@@ -251,15 +258,15 @@ static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap
         int M = (N - m0 < M_CHUNK) ? (N - m0) : M_CHUNK;
         void *act = g_d_act_bf16;
         void *args[] = {&act, &feats_f32, &nmap, &m0, &M, &inC};
-        if (g_prof_cn) hipEventRecord(g_prof_sp[0], 0);
+        if (g_prof_cn) hipEventRecord(g_prof_sp[0], g_stream);
         if (k->gather27_v2 && (inC % 2 == 0)) {
             int MB = 4;
             int gx = (M + MB - 1) / MB;
-            hipModuleLaunchKernel(k->gather27_v2, gx, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+            hipModuleLaunchKernel(k->gather27_v2, gx, 1, 1, 256, 1, 1, 0, g_stream, args, NULL);
         } else {
-            hipModuleLaunchKernel(k->gather27, M, 27, 1, 256, 1, 1, 0, 0, args, NULL);
+            hipModuleLaunchKernel(k->gather27, M, 27, 1, 256, 1, 1, 0, g_stream, args, NULL);
         }
-        if (g_prof_cn) hipEventRecord(g_prof_sp[1], 0);
+        if (g_prof_cn) hipEventRecord(g_prof_sp[1], g_stream);
         float *out_chunk = (float *)out_f32 + (size_t)m0 * outC;
         static int s_use_bf16in = -1;
         if (s_use_bf16in < 0) {
@@ -272,13 +279,13 @@ static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap
                                  &M, &K_total, &outC};
             int gx = (M + 31) / 32, gy = (outC + 63) / 64;
             hipModuleLaunchKernel(k->dense_bf16in_x8_db, gx, gy, 1,
-                                  256, 1, 1, 0, 0, gemm_args, NULL);
+                                  256, 1, 1, 0, g_stream, gemm_args, NULL);
         } else {
             mm_blaslt_run_bf16_bias(out_chunk, d_w_bf16, act, bias_f32,
-                                     M, outC, K_total, 0);
+                                     M, outC, K_total, g_stream);
         }
         if (g_prof_cn) {
-            hipEventRecord(g_prof_sp[2], 0);
+            hipEventRecord(g_prof_sp[2], g_stream);
             hipEventSynchronize(g_prof_sp[2]);
             float ms=0;
             hipEventElapsedTime(&ms, g_prof_sp[0], g_prof_sp[1]); g_prof_ms[6]+=ms; g_prof_n[6]++;
@@ -291,29 +298,29 @@ static void kln(K *k, void *o, void *i, void *w, void *b, int N, int C, int hw, 
     float eps = 1e-6f;
     void *a[] = {&o, &i, &w, &b, &C, &eps, &hw, &hb};
     int bs = C >= 256 ? 256 : (C >= 128 ? 128 : 64);
-    hipModuleLaunchKernel(k->ln, N, 1, 1, bs, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->ln, N, 1, 1, bs, 1, 1, 0, g_stream, a, NULL);
 }
 static void ksilu(K *k, void *o, void *i, int n) {
     void *a[] = {&o, &i, &n};
-    hipModuleLaunchKernel(k->silu, (n+255)/256, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->silu, (n+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
 static void ksilu_bf16(K *k, void *o, void *i, int n) {
     void *a[] = {&o, &i, &n};
     int blocks = ((n + 3) / 4 + 255) / 256;
-    hipModuleLaunchKernel(k->silu_bf16, blocks, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->silu_bf16, blocks, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
 static void kgelu(K *k, void *x, int n) {
     void *a[] = {&x, &n};
-    hipModuleLaunchKernel(k->gelu, (n+255)/256, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->gelu, (n+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
 static void kadd(K *k, void *x, void *y, int n) {
     void *a[] = {&x, &y, &n};
-    hipModuleLaunchKernel(k->add, (n+255)/256, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->add, (n+255)/256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
 static void klin(K *k, void *o, void *i, void *w, void *b, int N, int inC, int outC) {
     int gx = (outC+15)/16, gy = (N+15)/16;
     void *a[] = {&o, &i, &w, &b, &N, &inC, &outC};
-    hipModuleLaunchKernel(k->lin, gx, gy, 1, 16, 16, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->lin, gx, gy, 1, 16, 16, 1, 0, g_stream, a, NULL);
 }
 
 /* Get/create BF16 device weight, cached by host F32 pointer. n_elems is total
@@ -394,7 +401,7 @@ static void *get_f16_weight_k(K *k, const float *host_w_f32, size_t n_elems) {
         if (!d_f32) { hipFree(d_f16); return NULL; }
         int n = (int)n_elems;
         void *args[] = { &d_f16, &d_f32, &n };
-        hipModuleLaunchKernel(k->pack_f16, (n + 255)/256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        hipModuleLaunchKernel(k->pack_f16, (n + 255)/256, 1, 1, 256, 1, 1, 0, g_stream, args, NULL);
     } else {
         unsigned short *h = (unsigned short *)malloc(n_elems * 2);
         for (size_t i = 0; i < n_elems; i++) h[i] = f32_to_f16_rne(host_w_f32[i]);
@@ -447,7 +454,7 @@ static int kspconv_nmap_triton(K *k, void *out_f32, void *in_f32, void *nmap,
             if (g_f16_count >= F16_CACHE_N) return -1;
             if (hipMalloc(&d_b_f16, (size_t)outC * 2) != hipSuccess) return -1;
             void *args[] = { &d_b_f16, &bias_f32, &outC };
-            hipModuleLaunchKernel(k->pack_f16, (outC + 255)/256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+            hipModuleLaunchKernel(k->pack_f16, (outC + 255)/256, 1, 1, 256, 1, 1, 0, g_stream, args, NULL);
             int slot = g_f16_count++;
             g_f16_keys[slot] = key;
             g_f16_lens[slot] = (size_t)outC;
@@ -458,17 +465,17 @@ static int kspconv_nmap_triton(K *k, void *out_f32, void *in_f32, void *nmap,
     int n_in = N * inC;
     {
         void *args[] = { &g_d_in_f16, &in_f32, &n_in };
-        hipModuleLaunchKernel(k->pack_f16, (n_in + 255)/256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        hipModuleLaunchKernel(k->pack_f16, (n_in + 255)/256, 1, 1, 256, 1, 1, 0, g_stream, args, NULL);
     }
     /* Call bridge. */
     int rc = t2_triton_spconv(N, inC, outC, g_d_in_f16, d_w_f16, d_b_f16,
-                              nmap, g_d_out_f16, 0);
+                              nmap, g_d_out_f16, g_stream);
     if (rc != 0) return -1;
     /* Unpack output F16->F32. */
     int n_out = N * outC;
     {
         void *args[] = { &out_f32, &g_d_out_f16, &n_out };
-        hipModuleLaunchKernel(k->unpack_f16, (n_out + 255)/256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        hipModuleLaunchKernel(k->unpack_f16, (n_out + 255)/256, 1, 1, 256, 1, 1, 0, g_stream, args, NULL);
     }
     return 0;
 }
@@ -485,7 +492,7 @@ static int klin_dense_wmma(K *k, void *o_f32, void *x_f32, void *d_w_f32,
     int gx = (N + 31) / 32;
     int gy = (outC + 63) / 64;
     void *args[] = { &o_f32, &x_f32, &d_w_f32, &bias_f32, &N, &inC, &outC };
-    if (hipModuleLaunchKernel(k->dense_x8_db, gx, gy, 1, 256, 1, 1, 0, 0, args, NULL) != hipSuccess)
+    if (hipModuleLaunchKernel(k->dense_x8_db, gx, gy, 1, 256, 1, 1, 0, g_stream, args, NULL) != hipSuccess)
         return -1;
     return 0;
 }
@@ -553,9 +560,9 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
             void *src = src_chunk;
             void *args0[] = { &dst, &src, &n_act };
             int n4 = (n_act + 3) / 4;
-            hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args0, NULL);
+            hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, g_stream, args0, NULL);
             float *dst_chunk = (float *)o_f32 + (size_t)m0 * outC;
-            int rc = t2_klin_run(M, inC, outC, g_d_act_bf16, d_w_bf16, bias_f32, dst_chunk, 0);
+            int rc = t2_klin_run(M, inC, outC, g_d_act_bf16, d_w_bf16, bias_f32, dst_chunk, g_stream);
             if (rc != 0) { ok = 0; break; }
         }
         if (ok) return;
@@ -580,19 +587,19 @@ static void klin_bl(K *k, void *o_f32, void *x_f32, const float *host_w_f32,
         void *src = src_chunk;
         void *args0[] = { &dst, &src, &n_act };
         int n4 = (n_act + 3) / 4;
-        if (g_prof_klin) hipEventRecord(g_klin_ev[0], 0);
-        hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args0, NULL);
-        if (g_prof_klin) hipEventRecord(g_klin_ev[1], 0);
+        if (g_prof_klin) hipEventRecord(g_klin_ev[0], g_stream);
+        hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, g_stream, args0, NULL);
+        if (g_prof_klin) hipEventRecord(g_klin_ev[1], g_stream);
         float *dst_chunk = (float *)o_f32 + (size_t)m0 * outC;
         if (mm_blaslt_run_bf16_bias(dst_chunk, d_w_bf16, g_d_act_bf16, bias_f32,
-                                    M, outC, inC, NULL) != 0) {
+                                    M, outC, inC, g_stream) != 0) {
             fprintf(stderr, "T2-TEX: blaslt failed (M=%d N=%d K=%d), falling back to F32\n",
                     M, outC, inC);
             klin(k, o_f32, x_f32, dev_w_f32_fallback, bias_f32, N, inC, outC);
             return;
         }
         if (g_prof_klin) {
-            hipEventRecord(g_klin_ev[2], 0);
+            hipEventRecord(g_klin_ev[2], g_stream);
             hipEventSynchronize(g_klin_ev[2]);
             float ms;
             hipEventElapsedTime(&ms, g_klin_ev[0], g_klin_ev[1]); g_klin_pack_ms += ms; g_klin_pack_n++;
@@ -625,10 +632,10 @@ static int klin_bl_bf16d(K *k, void *o_bf16, void *x_f32, const float *host_w_f3
         void *src = src_chunk;
         void *args0[] = { &dst, &src, &n_act };
         int n4 = (n_act + 3) / 4;
-        hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args0, NULL);
+        hipModuleLaunchKernel(k->pack_bf16, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0, g_stream, args0, NULL);
         unsigned short *dst_chunk = (unsigned short *)o_bf16 + (size_t)m0 * outC;
         if (mm_blaslt_run_bf16_bias_bf16d(dst_chunk, d_w_bf16, g_d_act_bf16, bias_f32,
-                                          M, outC, inC, NULL) != 0) {
+                                          M, outC, inC, g_stream) != 0) {
             return -1;
         }
     }
@@ -652,7 +659,7 @@ static int klin_bl_bf16in(K *k, void *o_f32, void *x_bf16, const float *host_w_f
         unsigned short *src_chunk = (unsigned short *)x_bf16 + (size_t)m0 * inC;
         float *dst_chunk = (float *)o_f32 + (size_t)m0 * outC;
         if (mm_blaslt_run_bf16_bias(dst_chunk, d_w_bf16, src_chunk, bias_f32,
-                                    M, outC, inC, NULL) != 0) {
+                                    M, outC, inC, g_stream) != 0) {
             return -1;
         }
     }
@@ -663,11 +670,11 @@ static void kgather(K *k, void *hf, void *xf, void *hc, void *xc,
                     void *idx, void *si, int Nf, int Co, int Ci8) {
     int mx = Co > Ci8 ? Co : Ci8; int gy = (mx+255)/256;
     void *a[] = {&hf, &xf, &hc, &xc, &idx, &si, &Co, &Ci8};
-    hipModuleLaunchKernel(k->gather, Nf, gy, 1, 256, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->gather, Nf, gy, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
 static void kresrep(K *k, void *h, void *x, int N, int Co, int Ci8) {
     void *a[] = {&h, &x, &N, &Co, &Ci8};
-    hipModuleLaunchKernel(k->resrep, N, 1, 1, 256, 1, 1, 0, 0, a, NULL);
+    hipModuleLaunchKernel(k->resrep, N, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
 }
 
 /* Per-op profiling for ConvNeXt block (env T2_PROF_CN=1).
@@ -736,11 +743,11 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *dm2 = get_f32_dev(blk->mlp2_w, (size_t)C*4*C*sizeof(float));
     void *dm2b= get_f32_dev(blk->mlp2_b, (size_t)C*sizeof(float));
     prof_init();
-    if (g_prof_cn) hipEventRecord(g_prof_ev[0], 0);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[0], g_stream);
     kspconv_nmap_h(k, d_tmp, d_feats, d_nmap, blk->conv_w, dwc, dwb, d_coords, d_keys, d_vals, cap_mask, N, C, C);
-    if (g_prof_cn) hipEventRecord(g_prof_ev[1], 0);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[1], g_stream);
     kln(k, d_tmp, d_tmp, dnw, dnb, N, C, 1, 1);
-    if (g_prof_cn) hipEventRecord(g_prof_ev[2], 0);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[2], g_stream);
     /* BF16-end-to-end MLP: klin_up writes BF16 directly, silu runs on BF16,
      * klin_dn reads BF16 input — eliminates the F32->BF16 pack between them.
      * Falls back to F32 path if any prerequisite fails. Gate with T2_TEX_KLIN_BF16=0
@@ -759,9 +766,9 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     if (s_klin_bf16 && N >= 20000) {
         /* d_mlp is sized for F32 [N, 4C]; we use the same backing as BF16 [N, 4C]. */
         if (klin_bl_bf16d(k, d_mlp, d_tmp, blk->mlp0_w, dm0b, N, C, 4*C) == 0) {
-            if (g_prof_cn) hipEventRecord(g_prof_ev[3], 0);
+            if (g_prof_cn) hipEventRecord(g_prof_ev[3], g_stream);
             ksilu_bf16(k, d_mlp, d_mlp, N * 4 * C);
-            if (g_prof_cn) hipEventRecord(g_prof_ev[4], 0);
+            if (g_prof_cn) hipEventRecord(g_prof_ev[4], g_stream);
             if (klin_bl_bf16in(k, d_tmp, d_mlp, blk->mlp2_w, dm2b, N, 4*C, C) == 0) {
                 used_bf16 = 1;
             }
@@ -769,16 +776,16 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     }
     if (!used_bf16) {
         klin_bl(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
-        if (g_prof_cn) hipEventRecord(g_prof_ev[3], 0);
+        if (g_prof_cn) hipEventRecord(g_prof_ev[3], g_stream);
         /* SparseConvNeXtBlock3d uses nn.SiLU (sparse_unet_vae.py:280), not GELU. */
         ksilu(k, d_mlp, d_mlp, N * 4 * C);
-        if (g_prof_cn) hipEventRecord(g_prof_ev[4], 0);
+        if (g_prof_cn) hipEventRecord(g_prof_ev[4], g_stream);
         klin_bl(k, d_tmp, d_mlp, blk->mlp2_w, dm2, dm2b, N, 4*C, C);
     } else { (void)0; }
-    if (g_prof_cn) hipEventRecord(g_prof_ev[5], 0);
+    if (g_prof_cn) hipEventRecord(g_prof_ev[5], g_stream);
     kadd(k, d_feats, d_tmp, N * C);
     if (g_prof_cn) {
-        hipEventRecord(g_prof_ev[6], 0);
+        hipEventRecord(g_prof_ev[6], g_stream);
         hipEventSynchronize(g_prof_ev[6]);
         for (int i=0;i<6;i++) {
             float ms=0; hipEventElapsedTime(&ms, g_prof_ev[i], g_prof_ev[i+1]);
@@ -810,9 +817,11 @@ static void dump_dev_f32(const char *path, void *d, int N, int C) {
 static void *g_c2s_dn = NULL, *g_c2s_de = NULL, *g_c2s_dhf = NULL;
 static void *g_c2s_dxf = NULL, *g_c2s_dhn = NULL;
 static void *g_c2s_didx = NULL, *g_c2s_dsi = NULL;
+static void *g_c2s_dout = NULL, *g_c2s_fk = NULL, *g_c2s_fv = NULL;
 static size_t g_c2s_dn_b = 0, g_c2s_de_b = 0, g_c2s_dhf_b = 0;
 static size_t g_c2s_dxf_b = 0, g_c2s_dhn_b = 0;
 static size_t g_c2s_didx_b = 0, g_c2s_dsi_b = 0;
+static size_t g_c2s_dout_b = 0, g_c2s_fk_b = 0, g_c2s_fv_b = 0;
 static void c2s_grow(void **p, size_t *cap, size_t need) {
     if (need <= *cap) return;
     if (*p) hipFree(*p);
@@ -822,7 +831,7 @@ static void c2s_grow(void **p, size_t *cap, size_t need) {
 
 static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     void *d_feats, void *d_coords, void *d_keys, void *d_vals, int cap_mask,
-    const int64_t *idx, const int64_t *si, const int32_t *xcoords, int Nf,
+    void *d_idx_pre, void *d_si_pre, void *d_xc_pre, int Nf,
     void *d_nmap_coarse, void *d_nmap_fine) {
     int Ci = blk->C_in, Co = blk->C_out, Ci8 = Ci/8, Cexp = Co*8;
     void *dn1w = get_f32_dev(blk->norm1_w, (size_t)Ci*sizeof(float));
@@ -840,53 +849,50 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     c2s_grow(&g_c2s_dxf, &g_c2s_dxf_b, (size_t)Nf*Ci8*sizeof(float));
     c2s_grow(&g_c2s_dhn, &g_c2s_dhn_b, (size_t)Nf*Co*sizeof(float));
     void *dn=g_c2s_dn, *de=g_c2s_de, *dhf=g_c2s_dhf, *dxf=g_c2s_dxf, *dhn=g_c2s_dhn;
-    hipMalloc(&dout,(size_t)Nf*Co*sizeof(float));
+    c2s_grow(&g_c2s_dout, &g_c2s_dout_b, (size_t)Nf*Co*sizeof(float));
+    dout = g_c2s_dout;
     if (g_prof_c2s) { g_c2s_alloc_ms += now_ms()-a0; g_c2s_alloc_calls++; }
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[0], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[0], g_stream);
     kln(k, dn, d_feats, dn1w, dn1b, Nc, Ci, 1, 1);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[1], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[1], g_stream);
     ksilu(k, dn, dn, Nc*Ci);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[2], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[2], g_stream);
     if (getenv("HIP_C2S_DUMP")) dump_dev_f32("/tmp/hip_c2s_pre_conv1.npy", dn, Nc, Ci);
     kspconv_nmap_h(k, de, dn, d_nmap_coarse, blk->conv1_w, dc1w, dc1b, d_coords, d_keys, d_vals, cap_mask, Nc, Ci, Cexp);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[3], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[3], g_stream);
     if (getenv("HIP_C2S_DUMP")) dump_dev_f32("/tmp/hip_c2s_post_conv1.npy", de, Nc, Cexp);
-    c2s_grow(&g_c2s_didx, &g_c2s_didx_b, (size_t)Nf*sizeof(int64_t));
-    c2s_grow(&g_c2s_dsi,  &g_c2s_dsi_b,  (size_t)Nf*sizeof(int64_t));
-    void *didx = g_c2s_didx; void *dsi = g_c2s_dsi;
-    hipMemcpy(didx, idx, (size_t)Nf*sizeof(int64_t), hipMemcpyHostToDevice);
-    hipMemcpy(dsi,  si,  (size_t)Nf*sizeof(int64_t), hipMemcpyHostToDevice);
-    void *dxc  = hip_upload_raw(xcoords, (size_t)Nf*4*sizeof(int32_t));
+    void *didx = d_idx_pre; void *dsi = d_si_pre;
+    void *dxc  = d_xc_pre;
     kgather(k, dhf, dxf, de, d_feats, didx, dsi, Nf, Co, Ci8);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[4], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[4], g_stream);
     if (getenv("HIP_C2S_DUMP")) {
         dump_dev_f32("/tmp/hip_c2s_post_updown_h.npy", dhf, Nf, Co);
         dump_dev_f32("/tmp/hip_c2s_post_updown_x.npy", dxf, Nf, Ci8);
     }
     /* persistent: dn, de, didx, dsi retained */
     kln(k, dhn, dhf, NULL, NULL, Nf, Co, 0, 0);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[5], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[5], g_stream);
     ksilu(k, dhn, dhn, Nf*Co);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[6], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[6], g_stream);
     if (getenv("HIP_C2S_DUMP")) dump_dev_f32("/tmp/hip_c2s_pre_conv2.npy", dhn, Nf, Co);
     /* persistent: dhf retained */
     int cap = 1; while (cap < Nf*2) cap <<= 1; int cm = cap - 1;
-    void *fk=NULL, *fv=NULL;
     double a3 = g_prof_c2s ? now_ms() : 0;
-    hipMalloc(&fk, (size_t)cap*sizeof(uint64_t));
-    hipMalloc(&fv, (size_t)cap*sizeof(int32_t));
+    c2s_grow(&g_c2s_fk, &g_c2s_fk_b, (size_t)cap*sizeof(uint64_t));
+    c2s_grow(&g_c2s_fv, &g_c2s_fv_b, (size_t)cap*sizeof(int32_t));
+    void *fk = g_c2s_fk, *fv = g_c2s_fv;
     if (g_prof_c2s) g_c2s_alloc_ms += now_ms()-a3;
-    hipMemset(fk, 0, (size_t)cap*sizeof(uint64_t));
-    hipMemset(fv, 0xff, (size_t)cap*sizeof(int32_t));
+    hipMemsetAsync(fk, 0,    (size_t)cap*sizeof(uint64_t), g_stream);
+    hipMemsetAsync(fv, 0xff, (size_t)cap*sizeof(int32_t),  g_stream);
     hash_build(k, fk, fv, cm, dxc, Nf);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[7], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[7], g_stream);
     kspconv_nmap_h(k, dout, dhn, d_nmap_fine, blk->conv2_w, dc2w, dc2b, dxc, fk, fv, cm, Nf, Co, Co);
-    if (g_prof_c2s) hipEventRecord(g_c2s_ev[8], 0);
+    if (g_prof_c2s) hipEventRecord(g_c2s_ev[8], g_stream);
     if (getenv("HIP_C2S_DUMP")) dump_dev_f32("/tmp/hip_c2s_post_conv2.npy", dout, Nf, Co);
     /* persistent: dhn retained */
     kresrep(k, dout, dxf, Nf, Co, Ci8);
     if (g_prof_c2s) {
-        hipEventRecord(g_c2s_ev[9], 0);
+        hipEventRecord(g_c2s_ev[9], g_stream);
         hipEventSynchronize(g_c2s_ev[9]);
         float ms;
         hipEventElapsedTime(&ms, g_c2s_ev[0], g_c2s_ev[1]); g_c2s_ms[0]+=ms; g_c2s_n[0]++;
@@ -989,6 +995,11 @@ int main(int argc, char **argv) {
 
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != 0) return 1;
     hipSetDevice(0);
+    /* Non-blocking stream threaded through every kernel + bridge launch. */
+    if (hipStreamCreateWithFlags(&g_stream, hipStreamNonBlocking) != hipSuccess) {
+        fprintf(stderr, "T2-TEX: hipStreamCreateWithFlags failed; using default stream\n");
+        g_stream = NULL;
+    }
     hipModule_t mod;
     if (hip_compile_kernels(&mod, 0, hip_tex_dec_kernels_src, "tex_dec", 1, "HIP") <= 0) return 1;
     K k = {0};
@@ -1138,15 +1149,80 @@ int main(int argc, char **argv) {
         if (nmap_pc[s]) d_nmap_pc[s] = hip_upload_raw(nmap_pc[s], (size_t)nmap_pc_N[s]*27*sizeof(uint32_t));
     }
 
+    /* Pre-upload per-stage C2S inputs once (idx, sub-idx, x_coords). Done
+     * outside the timed loop so the loop has no host->device copies left and
+     * is hipGraph-capturable. */
+    void *d_gi[4] = {0}, *d_gs[4] = {0}, *d_gxc[4] = {0};
+    for (int s = 0; s < dec->n_stages && s < 4; s++) {
+        if (gi[s])  d_gi[s]  = hip_upload_raw(gi[s],  (size_t)gN[s] * sizeof(int64_t));
+        if (gs[s])  d_gs[s]  = hip_upload_raw(gs[s],  (size_t)gN[s] * sizeof(int64_t));
+        if (gxc[s]) d_gxc[s] = hip_upload_raw(gxc[s], (size_t)gN[s] * 4 * sizeof(int32_t));
+    }
+
+    /* Pre-size all C2S persistent scratch to the worst-case sizes across
+     * stages, so c2s_grow inside run_c2s never reallocates (which would
+     * use-after-free the previous stage's d_feats == prior g_c2s_dout). */
+    {
+        size_t max_dn = 0, max_de = 0, max_dhf = 0, max_dxf = 0, max_dhn = 0;
+        size_t max_dout = 0, max_didx = 0, max_dsi = 0;
+        size_t max_fk = 0, max_fv = 0;
+        for (int s = 0; s < dec->n_stages; s++) {
+            int Nc = (s == 0) ? N : gN[s - 1];
+            int Nf = gN[s];
+            int Ci = dec->c2s[s].C_in, Co = dec->c2s[s].C_out;
+            int Ci8 = Ci/8, Cexp = Co*8;
+            size_t b;
+            b = (size_t)Nc * Ci   * sizeof(float); if (b > max_dn)   max_dn = b;
+            b = (size_t)Nc * Cexp * sizeof(float); if (b > max_de)   max_de = b;
+            b = (size_t)Nf * Co   * sizeof(float); if (b > max_dhf)  max_dhf = b;
+            b = (size_t)Nf * Ci8  * sizeof(float); if (b > max_dxf)  max_dxf = b;
+            b = (size_t)Nf * Co   * sizeof(float); if (b > max_dhn)  max_dhn = b;
+            b = (size_t)Nf * Co   * sizeof(float); if (b > max_dout) max_dout = b;
+            b = (size_t)Nf * sizeof(int64_t);      if (b > max_didx) max_didx = b;
+            if (b > max_dsi) max_dsi = b;
+            int cap = 1; while (cap < Nf*2) cap <<= 1;
+            b = (size_t)cap * sizeof(uint64_t);    if (b > max_fk)   max_fk = b;
+            b = (size_t)cap * sizeof(int32_t);     if (b > max_fv)   max_fv = b;
+        }
+        c2s_grow(&g_c2s_dn,   &g_c2s_dn_b,   max_dn);
+        c2s_grow(&g_c2s_de,   &g_c2s_de_b,   max_de);
+        c2s_grow(&g_c2s_dhf,  &g_c2s_dhf_b,  max_dhf);
+        c2s_grow(&g_c2s_dxf,  &g_c2s_dxf_b,  max_dxf);
+        c2s_grow(&g_c2s_dhn,  &g_c2s_dhn_b,  max_dhn);
+        c2s_grow(&g_c2s_dout, &g_c2s_dout_b, max_dout);
+        c2s_grow(&g_c2s_didx, &g_c2s_didx_b, max_didx);
+        c2s_grow(&g_c2s_dsi,  &g_c2s_dsi_b,  max_dsi);
+        c2s_grow(&g_c2s_fk,   &g_c2s_fk_b,   max_fk);
+        c2s_grow(&g_c2s_fv,   &g_c2s_fv_b,   max_fv);
+    }
+
+    /* Persistent output buffer for the final klin (output_layer). Sized to
+     * gN[last] * out_channels. Replaces the per-run hipMalloc(&d_out, ...)
+     * inside the timed region. */
+    void *d_out_persist = NULL;
+    if (dec->n_stages > 0 && dec->out_channels > 0) {
+        size_t fin_n = (size_t)gN[dec->n_stages - 1];
+        hipMalloc(&d_out_persist, fin_n * dec->out_channels * sizeof(float));
+    }
+
+    /* Per-stage event recording costs cycles inside the timed region. Gate
+     * behind T2_PROF_STAGE=1 (default OFF) so production timing reflects
+     * pure work. The outer e0/e1 event pair is always recorded. */
+    int g_prof_stage = 0;
+    {
+        const char *e = getenv("T2_PROF_STAGE");
+        g_prof_stage = (e && atoi(e)) ? 1 : 0;
+    }
+
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
-    hipEventRecord(e0, 0);
+    hipEventRecord(e0, g_stream);
 
     int cur_N = N;
     /* stop_stage == -1 short-circuits right after from_latent for bisection. */
     for (int s = 0; s < dec->n_stages && stop_stage >= 0; s++) {
         int nc = dec->n_convnext[s]; int ch = dec->channels[s];
-        hipEvent_t es0, es1; hipEventCreate(&es0); hipEventCreate(&es1);
-        hipEventRecord(es0, 0);
+        hipEvent_t es0=0, es1=0;
+        if (g_prof_stage) { hipEventCreate(&es0); hipEventCreate(&es1); hipEventRecord(es0, g_stream); }
         fprintf(stderr, "stage %d: %d ConvNeXt(C=%d), N=%d\n", s, nc, ch, cur_N);
         for (int b = 0; b < nc; b++) {
             if (s == 0 && b == 0 && stop_op >= 0) {
@@ -1180,10 +1256,12 @@ int main(int argc, char **argv) {
                 d_feats, d_coords, d_keys, d_vals, cap_mask, d_tmp, d_mlp, d_nmap_cn[s]);
             if (s == stop_stage && stop_block >= 0 && b == stop_block) goto done_stages;
         }
-        hipEventRecord(es1, 0); hipEventSynchronize(es1);
-        float ms_cn = 0; hipEventElapsedTime(&ms_cn, es0, es1);
-        fprintf(stderr, "  stage %d ConvNeXt: %.1f ms\n", s, ms_cn);
-        hipEventRecord(es0, 0);
+        if (g_prof_stage) {
+            hipEventRecord(es1, g_stream); hipEventSynchronize(es1);
+            float ms_cn = 0; hipEventElapsedTime(&ms_cn, es0, es1);
+            fprintf(stderr, "  stage %d ConvNeXt: %.1f ms\n", s, ms_cn);
+            hipEventRecord(es0, g_stream);
+        }
         if (s == stop_stage && !after_c2s) break;
         if (dec->c2s[s].conv1_w) {
             fprintf(stderr, "  c2s %d->%d, N_fine=%d\n",
@@ -1194,34 +1272,39 @@ int main(int argc, char **argv) {
                                         : (s+1 < 4 ? d_nmap_cn[s+1] : NULL);
             DevSparse ds = run_c2s(&k, &dec->c2s[s], cur_N,
                 d_feats, d_coords, d_keys, d_vals, cap_mask,
-                gi[s], gs[s], gxc[s], gN[s],
+                d_gi[s], d_gs[s], d_gxc[s], gN[s],
                 d_nmap_cn[s], d_fine);
-            hipFree(d_feats); hipFree(d_coords); hipFree(d_keys); hipFree(d_vals);
+            /* Stage 0's d_feats/d_coords/d_keys/d_vals were freshly malloc'd;
+             * subsequent stages return persistent globals (g_c2s_dout/fk/fv +
+             * pre-uploaded d_gxc[s]). Don't free across stages — the persistent
+             * buffers must survive into the next stage; the original fresh
+             * stage-0 allocations are leaked at end of run (acceptable). */
             d_feats = ds.feats; d_coords = ds.coords;
             d_keys = ds.keys; d_vals = ds.vals; cap_mask = ds.cap_mask; cur_N = ds.N;
-            hipEventRecord(es1, 0); hipEventSynchronize(es1);
-            float ms_c2s = 0; hipEventElapsedTime(&ms_c2s, es0, es1);
-            fprintf(stderr, "  stage %d C2S:      %.1f ms\n", s, ms_c2s);
+            if (g_prof_stage) {
+                hipEventRecord(es1, g_stream); hipEventSynchronize(es1);
+                float ms_c2s = 0; hipEventElapsedTime(&ms_c2s, es0, es1);
+                fprintf(stderr, "  stage %d C2S:      %.1f ms\n", s, ms_c2s);
+            }
             if (s == stop_stage && after_c2s) goto done_stages;
         }
-        hipEventDestroy(es0); hipEventDestroy(es1);
+        if (g_prof_stage) { hipEventDestroy(es0); hipEventDestroy(es1); }
     }
 done_stages:;
 
     int Cf = dec->c2s[dec->n_stages-1].C_out;
     int out_ch = dec->out_channels;
-    void *d_out = NULL;
+    void *d_out = d_out_persist;
     int have_out = 0;
     if (stop_stage >= dec->n_stages - 1 && !after_c2s) {
         kln(&k, d_feats, d_feats, NULL, NULL, cur_N, Cf, 0, 0);
         void *d_ow = get_f32_dev(dec->output_w, (size_t)out_ch*Cf*sizeof(float));
         void *d_ob = get_f32_dev(dec->output_b, (size_t)out_ch*sizeof(float));
-        hipMalloc(&d_out, (size_t)cur_N*out_ch*sizeof(float));
         klin(&k, d_out, d_feats, d_ow, d_ob, cur_N, Cf, out_ch);
         have_out = 1;
     }
 
-    hipEventRecord(e1, 0);
+    hipEventRecord(e1, g_stream);
     hipEventSynchronize(e1);
     float t = 0; hipEventElapsedTime(&t, e0, e1);
     fprintf(stderr, "HIP tex_dec: %.1f ms, N=%d\n", t, cur_N);
