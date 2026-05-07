@@ -24,18 +24,24 @@ TRITON_CACHE = _TMP_CACHE
 
 import torch, triton, triton.language as tl
 
-# (M, K, N, BM, BN, BK, num_warps, num_stages)
+# (tag, M, K, N, BM, BN, BK, num_warps, num_stages, silu)
 # M is upper-bound (chunks may be smaller; kernel handles via masks).
 # Same K and N per shape — only the per-call M changes.
+# silu=1 emits the fused silu epilogue variant (used for ConvNeXt mlp0 path).
 SHAPES = [
-    ("stage0_klin_up", 1905,  1024, 4096, 128, 128, 32, 4, 2),
-    ("stage0_klin_dn", 1905,  4096, 1024,  64, 128, 64, 4, 2),
-    ("stage1_klin_up", 8452,   512, 2048,  64, 128, 64, 4, 2),
-    ("stage1_klin_dn", 8452,  2048,  512,  64, 128, 64, 4, 2),
-    ("stage2_klin_up", 16384,  256, 1024,  64, 256, 32, 8, 2),
-    ("stage2_klin_dn", 16384, 1024,  256,  64, 128, 64, 4, 2),
-    ("stage3_klin_up", 16384,  128,  512,  64, 256, 32, 8, 2),
-    ("stage3_klin_dn", 16384,  512,  128,  64, 128, 64, 4, 2),
+    ("stage0_klin_up", 1905,  1024, 4096, 128, 128, 32, 4, 2, 0),
+    ("stage0_klin_dn", 1905,  4096, 1024,  64, 128, 64, 4, 2, 0),
+    ("stage1_klin_up", 8452,   512, 2048,  64, 128, 64, 4, 2, 0),
+    ("stage1_klin_dn", 8452,  2048,  512,  64, 128, 64, 4, 2, 0),
+    ("stage2_klin_up", 16384,  256, 1024,  64, 256, 32, 8, 2, 0),
+    ("stage2_klin_dn", 16384, 1024,  256,  64, 128, 64, 4, 2, 0),
+    ("stage3_klin_up", 16384,  128,  512,  64, 256, 32, 8, 2, 0),
+    ("stage3_klin_dn", 16384,  512,  128,  64, 128, 64, 4, 2, 0),
+    # Fused bias+silu variants for the mlp0 path (klin_up only).
+    ("stage0_klin_up_silu", 1905,   1024, 4096,  64, 128, 64, 4, 3, 1),
+    ("stage1_klin_up_silu", 8452,    512, 2048, 128, 256, 32, 8, 2, 1),
+    ("stage2_klin_up_silu", 16384,   256, 1024,  64, 256, 32, 8, 2, 1),
+    ("stage3_klin_up_silu", 16384,   128,  512,  64, 256, 32, 8, 3, 1),
 ]
 
 
@@ -74,15 +80,53 @@ def klin_bf16_kernel(
     tl.store(Y, acc, mask=mask_m[:, None] & mask_n[None, :])
 
 
-def compile_one(M, K, N, BM, BN, BK, nw, ns):
+@triton.jit
+def klin_bf16_silu_kernel(
+    X_ptr, W_ptr, B_ptr, Y_ptr,
+    M, N, K,
+    sxm: tl.constexpr, sxk: tl.constexpr,
+    swn: tl.constexpr, swk: tl.constexpr,
+    sym: tl.constexpr, syn: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+
+    X_block = X_ptr + rm[:, None] * sxm + rk[None, :] * sxk
+    W_block = W_ptr + rn[:, None] * swn + rk[None, :] * swk
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    mask_m = rm < M
+    mask_n = rn < N
+    for k0 in range(0, K, BK):
+        mask_k = (k0 + rk) < K
+        x = tl.load(X_block, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        w = tl.load(W_block, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        acc += tl.dot(x, tl.trans(w))
+        X_block += BK * sxk
+        W_block += BK * swk
+
+    bias = tl.load(B_ptr + rn, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+    acc = acc * tl.sigmoid(acc)
+    Y = Y_ptr + rm[:, None] * sym + rn[None, :] * syn
+    tl.store(Y, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def compile_one(M, K, N, BM, BN, BK, nw, ns, silu=0):
     """Run the kernel once and return the cache directory it wrote to.
 
     Snapshots cache dirs containing the kernel's hsaco before+after; the new
     dir is this shape's compile.
     """
+    kname = "klin_bf16_silu_kernel" if silu else "klin_bf16_kernel"
+    kfn = klin_bf16_silu_kernel if silu else klin_bf16_kernel
     def _hsaco_dirs():
         return {p.name for p in TRITON_CACHE.iterdir()
-                if p.is_dir() and (p / f"{KERNEL_NAME}.hsaco").is_file()}
+                if p.is_dir() and (p / f"{kname}.hsaco").is_file()}
 
     dev = "cuda"
     X = torch.zeros(M, K, device=dev, dtype=torch.bfloat16)
@@ -91,7 +135,7 @@ def compile_one(M, K, N, BM, BN, BK, nw, ns):
     Y = torch.zeros(M, N, device=dev, dtype=torch.float32)
     grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
     before = _hsaco_dirs()
-    klin_bf16_kernel[grid](
+    kfn[grid](
         X, W, B, Y, M, N, K,
         X.stride(0), X.stride(1),
         W.stride(0), W.stride(1),
@@ -143,20 +187,23 @@ def main():
     KERNELS_DIR.mkdir(exist_ok=True)
     print(f"[1/2] Compiling + extracting {len(SHAPES)} klin shapes...")
     shapes_out = []
-    for tag, M, K, N, BM, BN, BK, nw, ns in SHAPES:
-        src = compile_one(M, K, N, BM, BN, BK, nw, ns)
+    for tag, M, K, N, BM, BN, BK, nw, ns, silu in SHAPES:
+        kname = "klin_bf16_silu_kernel" if silu else "klin_bf16_kernel"
+        src = compile_one(M, K, N, BM, BN, BK, nw, ns, silu)
         if src is None:
             sys.exit(f"  {tag}: cache dir not found")
-        meta = json.loads((src / f"{KERNEL_NAME}.json").read_text())
+        meta = json.loads((src / f"{kname}.json").read_text())
         dst = KERNELS_DIR / tag
         dst.mkdir(exist_ok=True)
-        shutil.copy2(src / f"{KERNEL_NAME}.hsaco", dst / "kernel.hsaco")
-        shutil.copy2(src / f"{KERNEL_NAME}.json",  dst / "kernel.json")
+        shutil.copy2(src / f"{kname}.hsaco", dst / "kernel.hsaco")
+        shutil.copy2(src / f"{kname}.json",  dst / "kernel.json")
         shapes_out.append({
             "tag": tag, "M_max": M, "K": K, "N": N,
             "BM": BM, "BN": BN, "BK": BK,
             "num_warps": nw, "num_stages": ns,
             "shared": meta.get("shared", 0),
+            "silu": silu,
+            "kernel_name": kname,
         })
         print(f"  {tag:20s} <- {src.name[:8]}/  (shared={meta.get('shared')}, "
               f"vgprs={meta.get('vgpr_spill_count', '?')})")

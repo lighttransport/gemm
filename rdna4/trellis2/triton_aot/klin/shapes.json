@@ -9,7 +9,9 @@
     "BK": 32,
     "num_warps": 4,
     "num_stages": 2,
-    "shared": 16384
+    "shared": 16384,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
   },
   {
     "tag": "stage0_klin_dn",
@@ -21,7 +23,9 @@
     "BK": 64,
     "num_warps": 4,
     "num_stages": 2,
-    "shared": 8192
+    "shared": 8192,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
   },
   {
     "tag": "stage1_klin_up",
@@ -33,7 +37,9 @@
     "BK": 64,
     "num_warps": 4,
     "num_stages": 2,
-    "shared": 8192
+    "shared": 8192,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
   },
   {
     "tag": "stage1_klin_dn",
@@ -45,7 +51,9 @@
     "BK": 64,
     "num_warps": 4,
     "num_stages": 2,
-    "shared": 8192
+    "shared": 8192,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
   },
   {
     "tag": "stage2_klin_up",
@@ -57,7 +65,9 @@
     "BK": 32,
     "num_warps": 8,
     "num_stages": 2,
-    "shared": 4096
+    "shared": 4096,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
   },
   {
     "tag": "stage2_klin_dn",
@@ -69,7 +79,9 @@
     "BK": 64,
     "num_warps": 4,
     "num_stages": 2,
-    "shared": 8192
+    "shared": 8192,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
   },
   {
     "tag": "stage3_klin_up",
@@ -81,7 +93,9 @@
     "BK": 32,
     "num_warps": 8,
     "num_stages": 2,
-    "shared": 4096
+    "shared": 4096,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
   },
   {
     "tag": "stage3_klin_dn",
@@ -93,6 +107,64 @@
     "BK": 64,
     "num_warps": 4,
     "num_stages": 2,
-    "shared": 8192
+    "shared": 8192,
+    "silu": 0,
+    "kernel_name": "klin_bf16_kernel"
+  },
+  {
+    "tag": "stage0_klin_up_silu",
+    "M_max": 1905,
+    "K": 1024,
+    "N": 4096,
+    "BM": 64,
+    "BN": 128,
+    "BK": 64,
+    "num_warps": 4,
+    "num_stages": 3,
+    "shared": 16384,
+    "silu": 1,
+    "kernel_name": "klin_bf16_silu_kernel"
+  },
+  {
+    "tag": "stage1_klin_up_silu",
+    "M_max": 8452,
+    "K": 512,
+    "N": 2048,
+    "BM": 128,
+    "BN": 256,
+    "BK": 32,
+    "num_warps": 8,
+    "num_stages": 2,
+    "shared": 24576,
+    "silu": 1,
+    "kernel_name": "klin_bf16_silu_kernel"
+  },
+  {
+    "tag": "stage2_klin_up_silu",
+    "M_max": 16384,
+    "K": 256,
+    "N": 1024,
+    "BM": 64,
+    "BN": 256,
+    "BK": 32,
+    "num_warps": 8,
+    "num_stages": 2,
+    "shared": 4096,
+    "silu": 1,
+    "kernel_name": "klin_bf16_silu_kernel"
+  },
+  {
+    "tag": "stage3_klin_up_silu",
+    "M_max": 16384,
+    "K": 128,
+    "N": 512,
+    "BM": 64,
+    "BN": 256,
+    "BK": 32,
+    "num_warps": 8,
+    "num_stages": 3,
+    "shared": 8192,
+    "silu": 1,
+    "kernel_name": "klin_bf16_silu_kernel"
   }
 ]
