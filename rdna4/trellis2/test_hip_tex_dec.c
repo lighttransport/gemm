@@ -1108,7 +1108,7 @@ int main(int argc, char **argv) {
     void *d_flb = get_f32_dev(dec->from_latent_b, (size_t)C0*sizeof(float));
     void *d_feats = NULL; hipMalloc(&d_feats, (size_t)N*C0*sizeof(float));
     klin_bl(&k, d_feats, d_slat, dec->from_latent_w, d_flw, d_flb, N, slat_C, C0);
-    hipFree(d_slat);
+    /* Keep d_slat alive so warmup repeats (T2_TEX_REPS>1) can re-run from_latent. */
 
     void *d_coords = hip_upload_raw(coords, (size_t)N*4*sizeof(int32_t));
     int cap = 1; while (cap < N*2) cap <<= 1; int cap_mask = cap - 1;
@@ -1215,9 +1215,36 @@ int main(int argc, char **argv) {
     }
 
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+
+    /* Warm-up repeats: T2_TEX_REPS=N runs decode N times, reports last wall.
+     * First-call paths (Triton _ts_prep_cache hipMemcpys, hipBLASLt plan
+     * builds, BF16 weight packs) cost ~150 ms once per process; warm decode
+     * is much faster. */
+    int n_reps = 1;
+    { const char *e = getenv("T2_TEX_REPS"); if (e) n_reps = atoi(e); if (n_reps < 1) n_reps = 1; }
+    void *d_feats_orig = d_feats;
+    void *d_coords_orig = d_coords;
+    void *d_keys_orig = d_keys;
+    void *d_vals_orig = d_vals;
+    int   cap_mask_orig = cap_mask;
+    float t = 0;
+    int cur_N = N;
+    int have_out = 0;
+    void *d_out = d_out_persist;
+    int Cf = dec->c2s[dec->n_stages-1].C_out;
+    int out_ch = dec->out_channels;
+  for (int rep = 0; rep < n_reps; rep++) {
+    /* Reset state at start of each rep (loop reassigns these to persistent
+     * C2S buffers — restore to fresh stage-0 buffers). Re-run from_latent
+     * to refill d_feats_orig with the input projection. */
+    d_feats = d_feats_orig; d_coords = d_coords_orig;
+    d_keys = d_keys_orig; d_vals = d_vals_orig; cap_mask = cap_mask_orig;
+    if (rep > 0) {
+        klin_bl(&k, d_feats, d_slat, dec->from_latent_w, d_flw, d_flb, N, slat_C, C0);
+    }
     hipEventRecord(e0, g_stream);
 
-    int cur_N = N;
+    cur_N = N;
     /* stop_stage == -1 short-circuits right after from_latent for bisection. */
     for (int s = 0; s < dec->n_stages && stop_stage >= 0; s++) {
         int nc = dec->n_convnext[s]; int ch = dec->channels[s];
@@ -1292,10 +1319,10 @@ int main(int argc, char **argv) {
     }
 done_stages:;
 
-    int Cf = dec->c2s[dec->n_stages-1].C_out;
-    int out_ch = dec->out_channels;
-    void *d_out = d_out_persist;
-    int have_out = 0;
+    Cf = dec->c2s[dec->n_stages-1].C_out;
+    out_ch = dec->out_channels;
+    d_out = d_out_persist;
+    have_out = 0;
     if (stop_stage >= dec->n_stages - 1 && !after_c2s) {
         kln(&k, d_feats, d_feats, NULL, NULL, cur_N, Cf, 0, 0);
         void *d_ow = get_f32_dev(dec->output_w, (size_t)out_ch*Cf*sizeof(float));
@@ -1306,8 +1333,9 @@ done_stages:;
 
     hipEventRecord(e1, g_stream);
     hipEventSynchronize(e1);
-    float t = 0; hipEventElapsedTime(&t, e0, e1);
-    fprintf(stderr, "HIP tex_dec: %.1f ms, N=%d\n", t, cur_N);
+    hipEventElapsedTime(&t, e0, e1);
+    fprintf(stderr, "HIP tex_dec[rep %d/%d]: %.1f ms, N=%d\n", rep+1, n_reps, t, cur_N);
+  }  /* end repeat loop */
 
     int post_c2s_ch = (after_c2s && stop_stage >= 0 && stop_stage < dec->n_stages)
                       ? dec->c2s[stop_stage].C_out : 0;
