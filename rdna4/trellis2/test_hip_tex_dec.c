@@ -187,7 +187,16 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         const char *e = getenv("T2_TRITON_NMAX");
         if (e) triton_nmax = atoi(e);
     }
-    if (nmap && g_use_triton && host_w && k->pack_f16 &&
+    /* (Ci=64, Co=64) — final tex_dec spconv — has a nondeterministic Triton
+     * AOT kernel: bulk-identical output but ±1..±7 extreme tail varies across
+     * runs. WMMA fallback is deterministic at this shape. Default to gating
+     * it off; T2_TRITON_C64=1 reverts. */
+    int triton_skip = 0;
+    if (inC == 64 && outC == 64) {
+        const char *e = getenv("T2_TRITON_C64");
+        if (!e || !atoi(e)) triton_skip = 1;
+    }
+    if (!triton_skip && nmap && g_use_triton && host_w && k->pack_f16 &&
         (triton_nmax <= 0 || N <= triton_nmax) &&
         t2_triton_has_shape(N, inC, outC)) {
         if (kspconv_nmap_triton(k, out, in, nmap, host_w, b, N, inC, outC) == 0) return;
