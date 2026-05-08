@@ -167,6 +167,7 @@ typedef struct {
     CUfunction f_quantize_fp8;     /* quantize_to_fp8_e4m3 */
     /* Conv2d FP8 path (Phase 4.9.3): im2col + GEMM + transpose. */
     CUfunction f_im2col_3x3_p1;    /* unet_im2col_3x3_p1_f32 */
+    CUfunction f_im2col_3x3_p1_s2; /* unet_im2col_3x3_p1_s2_f32 */
     CUfunction f_t_hwc_chw;        /* unet_t_hwc_to_chw_f32 */
 } pu_kernels;
 
@@ -675,6 +676,51 @@ static void k_geglu(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr gh,
 static void k_conv_stride2(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                             CUdeviceptr W, CUdeviceptr b,
                             int ci, int h, int w, int co) {
+    /* FP8 path: 3x3 stride=2 pad=1, ci%32==0. Same as the stride=1 path with
+     * a stride-2 im2col producing [oh*ow, ci*9]. */
+    if (g_paint_use_fp8_conv && g_paint_use_fp8_gemm && kk->f_gemm_fp8 &&
+        kk->f_im2col_3x3_p1_s2 && kk->f_t_hwc_chw && (ci % 32) == 0 && W) {
+        int K = ci * 9;
+        int oh = h / 2, ow = w / 2;
+        int ohw = oh * ow;
+        size_t xcol_bytes = (size_t)ohw * K * sizeof(float);
+        size_t yt_bytes   = (size_t)ohw * co * sizeof(float);
+        if (paint_conv_scratch_ensure(xcol_bytes, yt_bytes) == 0) {
+            const pu_fp8_entry *e = paint_fp8_lookup(W);
+            if (!e) { paint_fp8_register(kk, 0, W, co, K); e = paint_fp8_lookup(W); }
+            if (e && e->n_out == co && e->n_in == K) {
+                int ci_arg = ci, h_arg = h, w_arg = w;
+                void *im_args[] = { &g_paint_d_xcol, &in, &ci_arg, &h_arg, &w_arg };
+                unsigned imx = (unsigned)((K   + 31) / 32);
+                unsigned imy = (unsigned)((ohw + 7)  / 8);
+                cuLaunchKernel(kk->f_im2col_3x3_p1_s2, imx, imy, 1, 32, 8, 1,
+                                0, 0, im_args, NULL);
+                int n_out = co, n_in = K, n_tok = ohw;
+                CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
+                void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
+                                  &n_out, &n_in, &n_tok, &w_scale };
+                unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
+                if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && ohw >= 64) {
+                    unsigned gy = (unsigned)((ohw + 63) / 64); gy = (gy + 3u) & ~3u;
+                    size_t smem = 4096 + 8192 * 2;
+                    cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                                    smem, 0, gargs, NULL);
+                } else {
+                    unsigned gy = (unsigned)((ohw + 31) / 32); gy = (gy + 3u) & ~3u;
+                    size_t smem = 2048 + 8192 * 2;
+                    cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
+                                    smem, 0, gargs, NULL);
+                }
+                int co_arg = co, hw_arg = ohw;
+                void *targs[] = { &out, &g_paint_d_yt, &co_arg, &hw_arg };
+                unsigned tx = (unsigned)((co  + 31) / 32);
+                unsigned ty = (unsigned)((ohw + 7)  / 8);
+                cuLaunchKernel(kk->f_t_hwc_chw, tx, ty, 1, 32, 8, 1,
+                                0, 0, targs, NULL);
+                return;
+            }
+        }
+    }
     void *args[] = { &out, &in, &W, &b, &ci, &h, &w, &co };
     int total = co * (h / 2) * (w / 2);
     cuLaunchKernel(kk->f_conv_s2, (unsigned)((total + 255) / 256), 1, 1,
