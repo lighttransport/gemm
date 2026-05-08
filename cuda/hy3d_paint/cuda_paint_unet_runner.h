@@ -169,6 +169,10 @@ typedef struct {
     CUfunction f_im2col_3x3_p1;    /* unet_im2col_3x3_p1_f32 */
     CUfunction f_im2col_3x3_p1_s2; /* unet_im2col_3x3_p1_s2_f32 */
     CUfunction f_t_hwc_chw;        /* unet_t_hwc_to_chw_f32 */
+    /* Pure BF16 path (Phase 4.9.4): F32->BF16 quant + v7 BF16 GEMM + bias. */
+    CUfunction f_quant_bf16;       /* quant_bf16 */
+    CUfunction f_add_bias_f32;     /* add_bias_inplace_f32 */
+    CUfunction f_gemm_bf16_v7;     /* gemm_bf16_v7 */
 } pu_kernels;
 
 /* BF16-attn dispatch state. paint_stage_unet_create() flips on use_bf16_attn
@@ -194,6 +198,7 @@ typedef struct {
     CUdeviceptr w_f32;     /* key: original F32 weight ptr */
     CUdeviceptr w_fp8;     /* uint8 [n_out * n_in] */
     CUdeviceptr w_scale;   /* float [1] (per-tensor) */
+    CUdeviceptr w_bf16;    /* uint16 [n_out * n_in] (Phase 4.9.4 BF16 path) */
     int n_out, n_in;
 } pu_fp8_entry;
 
@@ -211,6 +216,22 @@ static CUdeviceptr g_paint_d_xcol = 0; /* [hw * ci*9] f32 */
 static size_t g_paint_xcol_max_bytes = 0;
 static CUdeviceptr g_paint_d_yt = 0;   /* [hw * co] f32 */
 static size_t g_paint_yt_max_bytes = 0;
+/* Pure BF16 path scratch (lazy-grown). */
+static int g_paint_use_bf16_gemm = 0;
+static CUdeviceptr g_paint_d_xbf = 0;  /* uint16 [n_tok * n_in] */
+static size_t g_paint_xbf_max_elem = 0;
+
+static int paint_xbf_ensure(size_t n_elem) {
+    size_t need = n_elem * sizeof(unsigned short);
+    size_t cur  = g_paint_xbf_max_elem * sizeof(unsigned short);
+    if (need <= cur) return 0;
+    if (g_paint_d_xbf) { cuMemFree(g_paint_d_xbf); g_paint_d_xbf = 0; }
+    if (cuMemAlloc(&g_paint_d_xbf, need) != CUDA_SUCCESS) {
+        g_paint_d_xbf = 0; g_paint_xbf_max_elem = 0; return -1;
+    }
+    g_paint_xbf_max_elem = n_elem;
+    return 0;
+}
 
 static const pu_fp8_entry *paint_fp8_lookup(CUdeviceptr w_f32) {
     /* Hot path: linear scan, ~1500 entries max. Tested fast enough vs
@@ -280,9 +301,23 @@ static void paint_fp8_register(const pu_kernels *kk, CUstream stream,
     size_t n_elem = (size_t)n_out * (size_t)n_in;
     if (paint_quantize_w_fp8(kk, stream, w_f32, n_out, n_in, &fp8, &sc) != 0) return;
     pu_fp8_entry *e = &g_paint_fp8_reg[g_paint_n_fp8_reg++];
-    e->w_f32 = w_f32; e->w_fp8 = fp8; e->w_scale = sc;
+    e->w_f32 = w_f32; e->w_fp8 = fp8; e->w_scale = sc; e->w_bf16 = 0;
     e->n_out = n_out; e->n_in = n_in;
     g_paint_fp8_total_bytes += n_elem;
+    /* Optional BF16 mirror (Phase 4.9.4). Allocated only when the BF16 path
+     * is enabled at create time; cast_f32_to_bf16 must be available. */
+    if (g_paint_use_bf16_gemm && kk->f_cast_bf16) {
+        size_t bytes = n_elem * sizeof(unsigned short);
+        CUdeviceptr w_bf = 0;
+        if (cuMemAlloc(&w_bf, bytes) == CUDA_SUCCESS) {
+            int n = (int)n_elem;
+            void *args[] = {&w_f32, &w_bf, &n};
+            cuLaunchKernel(kk->f_cast_bf16, (unsigned)((n + 255) / 256),
+                            1, 1, 256, 1, 1, 0, stream, args, NULL);
+            cuStreamSynchronize(stream);
+            e->w_bf16 = w_bf;
+        }
+    }
     /* Reclaim the F32 weight: the FP8 kernel handles any M (small-tok
      * tiles short-circuit on the `tok_base >= n_tok` guard), so dispatch
      * is unconditional once registered + shape-matches. */
@@ -395,6 +430,47 @@ static void k_timestep_embed(const pu_kernels *kk, CUdeviceptr out,
 
 static void k_linear(const pu_kernels *kk, CUdeviceptr y, CUdeviceptr x,
                       CUdeviceptr W, CUdeviceptr b, int M, int K, int N) {
+    /* Pure BF16 path (Phase 4.9.4, PAINT_BF16_GEMM=1): F32 X -> BF16 quant,
+     * gemm_bf16_v7 (BF16xBF16 m16n8k16 mma, F32 accum), bias post-pass.
+     * Uses the same FP8 weight registry to also store a BF16 mirror; falls
+     * through to the FP8 path when the BF16 mirror isn't available. */
+    if (g_paint_use_bf16_gemm && kk->f_gemm_bf16_v7 && kk->f_quant_bf16 &&
+        kk->f_add_bias_f32 && W && M >= 1 && (K % 32) == 0) {
+        const pu_fp8_entry *e = paint_fp8_lookup(W);
+        if (!e) {
+            paint_fp8_register(kk, 0, W, N, K);
+            e = paint_fp8_lookup(W);
+        }
+        if (e && e->n_out == N && e->n_in == K && e->w_bf16) {
+            size_t n_elem = (size_t)M * (size_t)K;
+            if (paint_xbf_ensure(n_elem) == 0) {
+                int n = (int)n_elem;
+                void *qargs[] = {&g_paint_d_xbf, &x, &n};
+                cuLaunchKernel(kk->f_quant_bf16,
+                                (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                                0, 0, qargs, NULL);
+                int Mv = M, Nv = N, Kv = K;
+                CUdeviceptr w_bf = e->w_bf16;
+                unsigned npx = (unsigned)((Nv + 127) / 128);
+                unsigned npy = (unsigned)((Mv + 63) / 64);
+                unsigned gx  = (npx + 3u) & ~3u;
+                unsigned gy  = (npy + 3u) & ~3u;
+                unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
+                void *gargs[] = {&y, &g_paint_d_xbf, &w_bf, &Mv, &Nv, &Kv};
+                cuLaunchKernel(kk->f_gemm_bf16_v7, gx, gy, 1, 256, 1, 1,
+                                smem_bytes, 0, gargs, NULL);
+                int has_bias = (b != 0) ? 1 : 0;
+                int rows = M, cols = N;
+                void *bargs[] = {&y, &b, &rows, &cols, &has_bias};
+                unsigned bx = 256;
+                unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+                unsigned gyd = (unsigned)rows;
+                cuLaunchKernel(kk->f_add_bias_f32, gxd, gyd, 1, bx, 1, 1,
+                                0, 0, bargs, NULL);
+                return;
+            }
+        }
+    }
     /* FP8 GEMM dispatch (Phase 4.9.2): per-tensor BF16-pipe MT4 scaled.
      * Constraints: n_in%32==0, n_out%256==0, n_tok>=16. Registry lookup
      * confirms the weight was prequantized at load with matching dims. */
