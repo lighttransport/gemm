@@ -20,6 +20,7 @@
 
 #include "../cuda_kernels_common.h"
 #include "../cuda_fp8_mma_kernels.h"
+#include "../gemm/cuda_gemm_ptx_kernels.h"  /* k_gemm_bf16_v7_src */
 
 #include <stdint.h>
 
@@ -125,19 +126,50 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
         "    float out; memcpy(&out, &b, 4); return out;\n"
         "}\n";
     const char *mma_close = "\n} /* extern C (fp8_mma_kernels) */\n";
+    /* Pure BF16 path siblings: F32->BF16 quant, in-place bias add, v7 GEMM.
+     * Wrapped in their own extern "C" block so v7's `typedef bf16_raw` and
+     * extern signatures don't collide with the other kernel sources. */
+    const char *bf16_open  = "\nextern \"C\" {\n";
+    const char *bf16_quant =
+        "__global__ void quant_bf16(unsigned short *out, const float *in, int n) {\n"
+        "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    if (i >= n) return;\n"
+        "    unsigned int u = __float_as_uint(in[i]);\n"
+        "    unsigned int round = ((u >> 16) & 1u) + 0x7fffu;\n"
+        "    out[i] = (unsigned short)((u + round) >> 16);\n"
+        "}\n"
+        "__global__ void add_bias_inplace_f32(\n"
+        "    float *Y, const float *bias, int rows, int cols, int has_bias) {\n"
+        "    if (!has_bias) return;\n"
+        "    int j = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    int i = blockIdx.y;\n"
+        "    if (j >= cols || i >= rows) return;\n"
+        "    Y[(size_t)i * cols + j] += bias[j];\n"
+        "}\n";
+    const char *bf16_close = "\n} /* extern C (bf16 v7 + helpers) */\n";
     size_t l_common = strlen(cuda_kernels_common_src);
     size_t l_cc     = strlen(common_close);
     size_t l_open   = strlen(mma_open);
     size_t l_mma    = strlen(fp8_mma_kernels_src);
     size_t l_close  = strlen(mma_close);
+    size_t l_bopen  = strlen(bf16_open);
+    size_t l_bq     = strlen(bf16_quant);
+    size_t l_bv7    = strlen(k_gemm_bf16_v7_src);
+    size_t l_bclose = strlen(bf16_close);
     size_t l_unet   = strlen(cuda_paint_unet_kernels_src);
-    char *src = (char *)malloc(l_common + l_cc + l_open + l_mma + l_close + l_unet + 1);
+    char *src = (char *)malloc(l_common + l_cc + l_open + l_mma + l_close +
+                                l_bopen + l_bq + l_bv7 + l_bclose +
+                                l_unet + 1);
     char *p = src;
     memcpy(p, cuda_kernels_common_src, l_common);  p += l_common;
     memcpy(p, common_close, l_cc);                 p += l_cc;
     memcpy(p, mma_open, l_open);                   p += l_open;
     memcpy(p, fp8_mma_kernels_src, l_mma);         p += l_mma;
     memcpy(p, mma_close, l_close);                 p += l_close;
+    memcpy(p, bf16_open, l_bopen);                 p += l_bopen;
+    memcpy(p, bf16_quant, l_bq);                   p += l_bq;
+    memcpy(p, k_gemm_bf16_v7_src, l_bv7);          p += l_bv7;
+    memcpy(p, bf16_close, l_bclose);               p += l_bclose;
     memcpy(p, cuda_paint_unet_kernels_src, l_unet);p += l_unet;
     *p = '\0';
     int sm = cu_compile_kernels(&s->kk.mod, dev, src,
@@ -171,6 +203,16 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
     if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1,  s->kk.mod, "unet_im2col_3x3_p1_f32")        != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1  = NULL;
     if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1_s2,s->kk.mod, "unet_im2col_3x3_p1_s2_f32")     != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1_s2 = NULL;
     if (cuModuleGetFunction(&s->kk.f_t_hwc_chw,      s->kk.mod, "unet_t_hwc_to_chw_f32")         != CUDA_SUCCESS) s->kk.f_t_hwc_chw      = NULL;
+    /* Pure BF16 path (Phase 4.9.4). */
+    if (cuModuleGetFunction(&s->kk.f_quant_bf16,     s->kk.mod, "quant_bf16")                    != CUDA_SUCCESS) s->kk.f_quant_bf16     = NULL;
+    if (cuModuleGetFunction(&s->kk.f_add_bias_f32,   s->kk.mod, "add_bias_inplace_f32")          != CUDA_SUCCESS) s->kk.f_add_bias_f32   = NULL;
+    if (cuModuleGetFunction(&s->kk.f_gemm_bf16_v7,   s->kk.mod, "gemm_bf16_v7")                  != CUDA_SUCCESS) s->kk.f_gemm_bf16_v7   = NULL;
+    if (s->kk.f_gemm_bf16_v7) {
+        /* v7 needs ~24 KiB of dynamic shared memory; opt-in via cuFuncSetAttribute. */
+        cuFuncSetAttribute(s->kk.f_gemm_bf16_v7,
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           24 * 1024);
+    }
     /* BF16 TC kernels (optional; missing → fall back to f_mha automatically). */
     if (cuModuleGetFunction(&s->kk.f_cast_bf16,         s->kk.mod, "cast_f32_to_bf16")        != CUDA_SUCCESS) s->kk.f_cast_bf16 = NULL;
     if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64,    s->kk.mod, "flash_attn_bf16_hd64")    != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64 = NULL;
@@ -392,6 +434,23 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
         else
             fprintf(stderr, "[paint_stage_unet] FP8_CONV=0 (env=%s have=%d)\n",
                     e ? e : "(unset)", have);
+    }
+    {
+        /* Phase 4.9.4: pure BF16 path for k_linear (linears only). When ON,
+         * weights get an extra BF16 mirror at FP8-prequant time and k_linear
+         * dispatches via quant_bf16 + gemm_bf16_v7 + add_bias_inplace_f32.
+         * Default OFF — keeps the FP8 path hot and bit-identical. Set
+         * PAINT_BF16_GEMM=1 to A/B against FP8. */
+        const char *e = getenv("PAINT_BF16_GEMM");
+        int want = (e != NULL) && (e[0] != '0');
+        int have = (s->kk.f_gemm_bf16_v7 && s->kk.f_quant_bf16 &&
+                    s->kk.f_add_bias_f32 && s->kk.f_cast_bf16);
+        g_paint_use_bf16_gemm = (want && have) ? 1 : 0;
+        if (g_paint_use_bf16_gemm)
+            fprintf(stderr, "[paint_stage_unet] BF16_GEMM=1 (v7 BF16xBF16 m16n8k16, F32 accum)\n");
+        else if (want)
+            fprintf(stderr, "[paint_stage_unet] BF16_GEMM=0 (env=%s have=%d)\n",
+                    e, have);
     }
     {
         const char *de = getenv("PAINT_FP8_DEBUG");
