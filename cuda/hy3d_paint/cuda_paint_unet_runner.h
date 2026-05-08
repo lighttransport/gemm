@@ -251,9 +251,10 @@ static void paint_fp8_register(const pu_kernels *kk, CUstream stream,
                                  CUdeviceptr w_f32, int n_out, int n_in) {
     if (!w_f32) return;
     if (g_paint_n_fp8_reg >= PAINT_FP8_REG_MAX) return;
-    /* Skip shapes the kernel can't handle. We still leave the F32 fallback. */
-    if (n_in <= 0 || n_out <= 0 || (n_in % 32) != 0) return;
-    /* Don't re-register the same weight (some _mr aliases may share base). */
+    /* Only register shapes the FP8 kernel will actually handle, so the
+     * scalar F32 fallback is never taken for registered weights — that
+     * lets us free the F32 buffer below and reclaim ~hundreds of MB. */
+    if (n_in <= 0 || n_out <= 0 || (n_in % 32) != 0 || (n_out % 256) != 0) return;
     if (paint_fp8_lookup(w_f32)) return;
     CUdeviceptr fp8 = 0, sc = 0;
     size_t n_elem = (size_t)n_out * (size_t)n_in;
@@ -262,7 +263,48 @@ static void paint_fp8_register(const pu_kernels *kk, CUstream stream,
     e->w_f32 = w_f32; e->w_fp8 = fp8; e->w_scale = sc;
     e->n_out = n_out; e->n_in = n_in;
     g_paint_fp8_total_bytes += n_elem;
+    /* Reclaim the F32 weight: the FP8 kernel handles any M (small-tok
+     * tiles short-circuit on the `tok_base >= n_tok` guard), so dispatch
+     * is unconditional once registered + shape-matches. */
+    cuMemFree(w_f32);
 }
+
+/* ===== Per-launch debug wrapper (PAINT_FP8_DEBUG=1) =====================
+ * Wraps every cuLaunchKernel below with a post-launch cuCtxSynchronize and
+ * prints the first launch that flips status to non-success. Use to bisect
+ * the FP8 OOB at idx ~535. Default off; zero overhead when off. */
+static unsigned long g_paint_launch_idx = 0;
+static int g_paint_fp8_debug = 0;
+static const char *g_paint_last_kernel = "(none)";
+
+static inline CUresult paint_dbg_launch(const char *name, CUfunction f,
+        unsigned gx, unsigned gy, unsigned gz,
+        unsigned bx, unsigned by, unsigned bz,
+        unsigned smem, CUstream stream, void **args, void **extra) {
+    g_paint_launch_idx++;
+    unsigned long idx = g_paint_launch_idx;
+    CUresult r = cuLaunchKernel(f, gx, gy, gz, bx, by, bz, smem, stream, args, extra);
+    if (g_paint_fp8_debug) {
+        if (r != CUDA_SUCCESS) {
+            const char *es = "?"; cuGetErrorString(r, &es);
+            fprintf(stderr, "[paint_dbg] LAUNCH-FAIL idx=%lu name=%s err=%d (%s) prev=%s\n",
+                    idx, name, r, es, g_paint_last_kernel);
+            fflush(stderr); abort();
+        }
+        CUresult sr = cuCtxSynchronize();
+        if (sr != CUDA_SUCCESS) {
+            const char *es = "?"; cuGetErrorString(sr, &es);
+            fprintf(stderr, "[paint_dbg] SYNC-FAIL idx=%lu name=%s err=%d (%s) prev=%s\n",
+                    idx, name, sr, es, g_paint_last_kernel);
+            fflush(stderr); abort();
+        }
+        g_paint_last_kernel = name;
+    }
+    return r;
+}
+
+#define cuLaunchKernel(f, gx, gy, gz, bx, by, bz, smem, stream, args, extra) \
+    paint_dbg_launch(#f, (f), (gx), (gy), (gz), (bx), (by), (bz), (smem), (stream), (args), (extra))
 
 static void k_timestep_embed(const pu_kernels *kk, CUdeviceptr out,
                               CUdeviceptr ts, int B, int dim) {
@@ -278,7 +320,7 @@ static void k_linear(const pu_kernels *kk, CUdeviceptr y, CUdeviceptr x,
      * Constraints: n_in%32==0, n_out%256==0, n_tok>=16. Registry lookup
      * confirms the weight was prequantized at load with matching dims. */
     if (g_paint_use_fp8_gemm && (kk->f_gemm_fp8_mt4 || kk->f_gemm_fp8) && W &&
-        M >= 16 && (K % 32) == 0 && (N % 256) == 0) {
+        M >= 1 && (K % 32) == 0 && (N % 256) == 0) {
         const pu_fp8_entry *e = paint_fp8_lookup(W);
         if (!e) {
             paint_fp8_register(kk, 0, W, N, K);

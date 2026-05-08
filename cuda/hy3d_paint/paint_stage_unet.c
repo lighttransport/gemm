@@ -357,13 +357,12 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
      * weights on first k_linear call. Activation scratch sized to the largest
      * X tensor that flows into a linear (FF input = 4C at top resolution). */
     {
-        /* Phase 4.9.2: dispatch is plumbed but kernel triggers a sticky
-         * ILLEGAL_ADDRESS after ~535 successful FP8 GEMM dispatches; root
-         * cause not isolated (suspected non-FP8 kernel between calls).
-         * Default OFF until follow-up. PAINT_FP8_GEMM=1 enables. */
+        /* Phase 4.9.2: per-tensor FP8 BF16-pipe GEMM (MT1) for all linears
+         * with n_in%32==0, n_out%256==0. Default ON; PAINT_FP8_GEMM=0 falls
+         * back to scalar f_lin (matches today's BF16-attn baseline bit-for-bit). */
         const char *e = getenv("PAINT_FP8_GEMM");
-        int want = (e != NULL) && (e[0] != '0');
-        int have = (s->kk.f_gemm_fp8_mt4 && s->kk.f_reduce_max_abs &&
+        int want = (e == NULL) || (e[0] != '0');
+        int have = (s->kk.f_gemm_fp8 && s->kk.f_reduce_max_abs &&
                     s->kk.f_quantize_fp8);
         g_paint_use_fp8_gemm = (want && have) ? 1 : 0;
         if (g_paint_use_fp8_gemm) {
@@ -372,6 +371,12 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
             fprintf(stderr, "[paint_stage_unet] FP8_GEMM=0 (env=%s have=%d)\n",
                     e ? e : "(unset)", have);
         }
+    }
+    {
+        const char *de = getenv("PAINT_FP8_DEBUG");
+        g_paint_fp8_debug = (de && de[0] != '0') ? 1 : 0;
+        if (g_paint_fp8_debug)
+            fprintf(stderr, "[paint_stage_unet] FP8_DEBUG=1 (per-launch sync)\n");
     }
 
     return s;
