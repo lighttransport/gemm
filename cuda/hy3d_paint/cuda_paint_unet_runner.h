@@ -220,6 +220,12 @@ static size_t g_paint_yt_max_bytes = 0;
 static int g_paint_use_bf16_gemm = 0;
 static CUdeviceptr g_paint_d_xbf = 0;  /* uint16 [n_tok * n_in] */
 static size_t g_paint_xbf_max_elem = 0;
+/* X-quant memo: skip quant_bf16 when consecutive linears feed the same X.
+ * Reset on any buffer realloc and on call sites that overwrite g_paint_d_xbf
+ * (currently only k_linear; conv paths source from g_paint_d_xcol which is
+ * itself transient — those reset the memo). */
+static CUdeviceptr g_paint_xbf_last_x = 0;
+static int         g_paint_xbf_last_n = 0;
 
 static int paint_xbf_ensure(size_t n_elem) {
     size_t need = n_elem * sizeof(unsigned short);
@@ -227,9 +233,12 @@ static int paint_xbf_ensure(size_t n_elem) {
     if (need <= cur) return 0;
     if (g_paint_d_xbf) { cuMemFree(g_paint_d_xbf); g_paint_d_xbf = 0; }
     if (cuMemAlloc(&g_paint_d_xbf, need) != CUDA_SUCCESS) {
-        g_paint_d_xbf = 0; g_paint_xbf_max_elem = 0; return -1;
+        g_paint_d_xbf = 0; g_paint_xbf_max_elem = 0;
+        g_paint_xbf_last_x = 0; g_paint_xbf_last_n = 0;
+        return -1;
     }
     g_paint_xbf_max_elem = n_elem;
+    g_paint_xbf_last_x = 0; g_paint_xbf_last_n = 0;
     return 0;
 }
 
@@ -445,10 +454,13 @@ static void k_linear(const pu_kernels *kk, CUdeviceptr y, CUdeviceptr x,
             size_t n_elem = (size_t)M * (size_t)K;
             if (paint_xbf_ensure(n_elem) == 0) {
                 int n = (int)n_elem;
-                void *qargs[] = {&g_paint_d_xbf, &x, &n};
-                cuLaunchKernel(kk->f_quant_bf16,
-                                (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
-                                0, 0, qargs, NULL);
+                if (!(g_paint_xbf_last_x == x && g_paint_xbf_last_n == n)) {
+                    void *qargs[] = {&g_paint_d_xbf, &x, &n};
+                    cuLaunchKernel(kk->f_quant_bf16,
+                                    (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                                    0, 0, qargs, NULL);
+                    g_paint_xbf_last_x = x; g_paint_xbf_last_n = n;
+                }
                 int Mv = M, Nv = N, Kv = K;
                 CUdeviceptr w_bf = e->w_bf16;
                 unsigned npx = (unsigned)((Nv + 127) / 128);
@@ -603,6 +615,7 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                         cuLaunchKernel(kk->f_quant_bf16,
                                         (unsigned)((n + 255) / 256), 1, 1,
                                         256, 1, 1, 0, 0, qargs, NULL);
+                        g_paint_xbf_last_x = 0;
                         int Mv = hw, Nv = co, Kv = ci;
                         CUdeviceptr w_bf = e->w_bf16;
                         unsigned npx = (unsigned)((Nv + 127) / 128);
@@ -690,6 +703,7 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                         cuLaunchKernel(kk->f_quant_bf16,
                                         (unsigned)((n + 255) / 256), 1, 1,
                                         256, 1, 1, 0, 0, qargs, NULL);
+                        g_paint_xbf_last_x = 0;
                         int Mv = hw, Nv = co, Kv = K;
                         CUdeviceptr w_bf = e->w_bf16;
                         unsigned npx = (unsigned)((Nv + 127) / 128);
@@ -860,6 +874,7 @@ static void k_conv_stride2(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in
                         cuLaunchKernel(kk->f_quant_bf16,
                                         (unsigned)((n + 255) / 256), 1, 1,
                                         256, 1, 1, 0, 0, qargs, NULL);
+                        g_paint_xbf_last_x = 0;
                         int Mv = ohw, Nv = co, Kv = K;
                         CUdeviceptr w_bf = e->w_bf16;
                         unsigned npx = (unsigned)((Nv + 127) / 128);
