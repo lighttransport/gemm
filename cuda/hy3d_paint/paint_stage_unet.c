@@ -168,6 +168,8 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
     if (cuModuleGetFunction(&s->kk.f_gemm_fp8,       s->kk.mod, "gemm_bf16_pipe_scaled_f32")     != CUDA_SUCCESS) s->kk.f_gemm_fp8       = NULL;
     if (cuModuleGetFunction(&s->kk.f_reduce_max_abs, s->kk.mod, "reduce_max_abs_f32")            != CUDA_SUCCESS) s->kk.f_reduce_max_abs = NULL;
     if (cuModuleGetFunction(&s->kk.f_quantize_fp8,   s->kk.mod, "quantize_to_fp8_e4m3")          != CUDA_SUCCESS) s->kk.f_quantize_fp8   = NULL;
+    if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1,  s->kk.mod, "unet_im2col_3x3_p1_f32")        != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1  = NULL;
+    if (cuModuleGetFunction(&s->kk.f_t_hwc_chw,      s->kk.mod, "unet_t_hwc_to_chw_f32")         != CUDA_SUCCESS) s->kk.f_t_hwc_chw      = NULL;
     /* BF16 TC kernels (optional; missing → fall back to f_mha automatically). */
     if (cuModuleGetFunction(&s->kk.f_cast_bf16,         s->kk.mod, "cast_f32_to_bf16")        != CUDA_SUCCESS) s->kk.f_cast_bf16 = NULL;
     if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64,    s->kk.mod, "flash_attn_bf16_hd64")    != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64 = NULL;
@@ -371,6 +373,20 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
             fprintf(stderr, "[paint_stage_unet] FP8_GEMM=0 (env=%s have=%d)\n",
                     e ? e : "(unset)", have);
         }
+    }
+    {
+        /* Phase 4.9.3: conv2d → im2col + FP8 GEMM. Default ON when GEMM ON
+         * and the two helper kernels resolved. PAINT_FP8_CONV=0 disables. */
+        const char *e = getenv("PAINT_FP8_CONV");
+        int want = (e == NULL) || (e[0] != '0');
+        int have = (g_paint_use_fp8_gemm && s->kk.f_im2col_3x3_p1 &&
+                    s->kk.f_t_hwc_chw);
+        g_paint_use_fp8_conv = (want && have) ? 1 : 0;
+        if (g_paint_use_fp8_conv)
+            fprintf(stderr, "[paint_stage_unet] FP8_CONV=1 (3x3-pad1 im2col+FP8-GEMM)\n");
+        else
+            fprintf(stderr, "[paint_stage_unet] FP8_CONV=0 (env=%s have=%d)\n",
+                    e ? e : "(unset)", have);
     }
     {
         const char *de = getenv("PAINT_FP8_DEBUG");
