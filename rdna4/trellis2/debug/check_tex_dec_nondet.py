@@ -6,28 +6,16 @@ Without any patch: trials produce {NaN, std=0.45 CLEAN, std=∞, NaN} — the
 Root cause = ROCm hipBLASLt mishandling SparseLinear(64->6) at M~1.5M rows.
 """
 import os, sys, gc
-os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-os.environ.setdefault('ATTN_BACKEND', 'sdpa')
-_REPO_ROOT = '/mnt/disk1/work/gemm/trellis2'
-sys.path.insert(0, f'{_REPO_ROOT}/rdna4/trellis2')
-sys.path.insert(0, f'{_REPO_ROOT}/cpu/trellis2/trellis2_repo')
-sys.path.insert(0, f'{_REPO_ROOT}/ref/trellis2')
-import texgen_sw_rast, cumesh_xatlas_shim, flash_attn_sdpa_shim
-texgen_sw_rast.install_as_nvdiffrast(); cumesh_xatlas_shim.install_as_cumesh()
-try:
-    from transformers.utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING
-    PACKAGE_DISTRIBUTION_MAPPING.setdefault('flash_attn', ['flash-attn'])
-except ImportError: pass
-flash_attn_sdpa_shim.install_as_flash_attn()
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'runner')))
+from shim_bootstrap import install_all  # noqa: E402
+install_all()
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 import numpy as np, torch
 from PIL import Image
 from gen_stage2_ref import _patch_dinov3_extractor, _patch_birefnet_noop
-import spconv_rdna4_ext
 if os.environ.get('USE_RDNA4_SPCONV', '0') == '1':
+    from kernels import spconv_rdna4_ext
     spconv_rdna4_ext.install()
-if os.environ.get('USE_RDNA4_LINEAR_CHUNK', '1') == '1':
-    spconv_rdna4_ext.install_sparse_linear_chunking()
 
 @torch.no_grad()
 def main():
