@@ -173,6 +173,9 @@ typedef struct {
     CUfunction f_quant_bf16;       /* quant_bf16 */
     CUfunction f_add_bias_f32;     /* add_bias_inplace_f32 */
     CUfunction f_gemm_bf16_v7;     /* gemm_bf16_v7 */
+    /* Native FP8 v7 (Phase 4.9.5, PAINT_FP8_V7=1). reuses existing
+     * f_quantize_fp8 + f_reduce_max_abs and the FP8 weight registry. */
+    CUfunction f_gemm_fp8_v7_fused;
 } pu_kernels;
 
 /* BF16-attn dispatch state. paint_stage_unet_create() flips on use_bf16_attn
@@ -200,6 +203,7 @@ typedef struct {
     CUdeviceptr w_scale;   /* float [1] (per-tensor) */
     CUdeviceptr w_bf16;    /* uint16 [n_out * n_in] (Phase 4.9.4 BF16 path) */
     int n_out, n_in;
+    float w_scale_host;    /* host mirror of w_scale[0] (Phase 4.9.5 FP8 v7) */
 } pu_fp8_entry;
 
 #define PAINT_FP8_REG_MAX 4096
@@ -218,8 +222,33 @@ static CUdeviceptr g_paint_d_yt = 0;   /* [hw * co] f32 */
 static size_t g_paint_yt_max_bytes = 0;
 /* Pure BF16 path scratch (lazy-grown). */
 static int g_paint_use_bf16_gemm = 0;
+static int g_paint_use_fp8_v7 = 0;
 static CUdeviceptr g_paint_d_xbf = 0;  /* uint16 [n_tok * n_in] */
 static size_t g_paint_xbf_max_elem = 0;
+/* Native FP8 v7 scratches (PAINT_FP8_V7=1): X_fp8 (uint8) + per-tensor
+ * x_scale (1 float) + x_max scratch (1 float, atomic-max target). */
+static CUdeviceptr g_paint_d_xfp8 = 0;
+static size_t g_paint_xfp8_max_elem = 0;
+static CUdeviceptr g_paint_d_xscale = 0;
+static CUdeviceptr g_paint_d_xmax = 0;
+static CUdeviceptr g_paint_fp8v7_last_x = 0;
+static int         g_paint_fp8v7_last_n = 0;
+static int paint_xfp8_ensure(size_t n_elem) {
+    size_t need = n_elem * sizeof(unsigned char);
+    size_t cur  = g_paint_xfp8_max_elem * sizeof(unsigned char);
+    if (need <= cur && g_paint_d_xfp8) return 0;
+    if (g_paint_d_xfp8) { cuMemFree(g_paint_d_xfp8); g_paint_d_xfp8 = 0; }
+    if (cuMemAlloc(&g_paint_d_xfp8, need) != CUDA_SUCCESS) {
+        g_paint_d_xfp8 = 0; g_paint_xfp8_max_elem = 0;
+        g_paint_fp8v7_last_x = 0; g_paint_fp8v7_last_n = 0;
+        return -1;
+    }
+    g_paint_xfp8_max_elem = n_elem;
+    g_paint_fp8v7_last_x = 0; g_paint_fp8v7_last_n = 0;
+    if (!g_paint_d_xscale) cuMemAlloc(&g_paint_d_xscale, sizeof(float));
+    if (!g_paint_d_xmax)   cuMemAlloc(&g_paint_d_xmax,   sizeof(float));
+    return 0;
+}
 /* X-quant memo: skip quant_bf16 when consecutive linears feed the same X.
  * Reset on any buffer realloc and on call sites that overwrite g_paint_d_xbf
  * (currently only k_linear; conv paths source from g_paint_d_xcol which is
@@ -312,6 +341,11 @@ static void paint_fp8_register(const pu_kernels *kk, CUstream stream,
     pu_fp8_entry *e = &g_paint_fp8_reg[g_paint_n_fp8_reg++];
     e->w_f32 = w_f32; e->w_fp8 = fp8; e->w_scale = sc; e->w_bf16 = 0;
     e->n_out = n_out; e->n_in = n_in;
+    /* Cache w_scale on host so the FP8 v7 fused kernel (which takes scale
+     * by value) doesn't trigger a DtoH stall per call. */
+    e->w_scale_host = 1.0f;
+    cuStreamSynchronize(stream);
+    cuMemcpyDtoH(&e->w_scale_host, sc, sizeof(float));
     g_paint_fp8_total_bytes += n_elem;
     /* Optional BF16 mirror (Phase 4.9.4). Allocated only when the BF16 path
      * is enabled at create time; cast_f32_to_bf16 must be available. */
@@ -429,6 +463,60 @@ static inline CUresult paint_dbg_launch(const char *name, CUfunction f,
 #define cuLaunchKernel(f, gx, gy, gz, bx, by, bz, smem, stream, args, extra) \
     paint_dbg_launch(#f, (f), (gx), (gy), (gz), (bx), (by), (bz), (smem), (stream), (args), (extra))
 
+/* Native FP8 v7 fused dispatch: quantize X to FP8 (with per-tensor scale),
+ * launch gemm_fp8_v7_fused (24 KiB smem) which folds descale+bias into the
+ * writeback. Returns 1 on dispatch, 0 if constraints fail (caller falls
+ * through). Constraints: K%64==0, M>=256 (4x4 panel swizzle), prequant
+ * weight + scale present. X-quant memoized across consecutive calls. */
+static int paint_try_fp8_v7(const pu_kernels *kk,
+                             CUdeviceptr y, CUdeviceptr x,
+                             const pu_fp8_entry *e, CUdeviceptr b,
+                             int M, int K, int N) {
+    if (!g_paint_use_fp8_v7) return 0;
+    if (!kk->f_gemm_fp8_v7_fused || !kk->f_quantize_fp8 || !kk->f_reduce_max_abs)
+        return 0;
+    if (!e || !e->w_fp8 || !e->w_scale) return 0;
+    if ((K % 64) != 0 || M < 256) return 0;
+    size_t n_elem = (size_t)M * (size_t)K;
+    if (paint_xfp8_ensure(n_elem) != 0) return 0;
+    int n = (int)n_elem;
+    if (!(g_paint_fp8v7_last_x == x && g_paint_fp8v7_last_n == n)) {
+        cuMemsetD32(g_paint_d_xmax, 0, 1);
+        {
+            void *args[] = {&g_paint_d_xmax, &x, &n};
+            cuLaunchKernel(kk->f_reduce_max_abs,
+                            (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                            0, 0, args, NULL);
+        }
+        {
+            void *args[] = {&g_paint_d_xfp8, &g_paint_d_xscale, &x,
+                             &g_paint_d_xmax, &n};
+            cuLaunchKernel(kk->f_quantize_fp8,
+                            (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                            0, 0, args, NULL);
+        }
+        g_paint_fp8v7_last_x = x; g_paint_fp8v7_last_n = n;
+    }
+    /* gemm_fp8_v7_fused(Y, X_fp8, W_fp8, bias, x_scale, w_scale_val,
+     *                   has_bias, accumulate, M, N, K). */
+    CUdeviceptr w_fp8 = e->w_fp8;
+    float w_scale_val = e->w_scale_host;
+    int has_bias = (b != 0) ? 1 : 0;
+    int accumulate = 0;
+    int Mv = M, Nv = N, Kv = K;
+    void *gargs[] = {&y, &g_paint_d_xfp8, &w_fp8, &b,
+                     &g_paint_d_xscale, &w_scale_val, &has_bias,
+                     &accumulate, &Mv, &Nv, &Kv};
+    unsigned npx = (unsigned)((N + 127) / 128);
+    unsigned npy = (unsigned)((M + 63) / 64);
+    unsigned gx  = (npx + 3u) & ~3u;
+    unsigned gy  = (npy + 3u) & ~3u;
+    unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
+    cuLaunchKernel(kk->f_gemm_fp8_v7_fused, gx, gy, 1, 256, 1, 1,
+                    smem_bytes, 0, gargs, NULL);
+    return 1;
+}
+
 static void k_timestep_embed(const pu_kernels *kk, CUdeviceptr out,
                               CUdeviceptr ts, int B, int dim) {
     void *args[] = { &out, &ts, &B, &dim };
@@ -439,6 +527,14 @@ static void k_timestep_embed(const pu_kernels *kk, CUdeviceptr out,
 
 static void k_linear(const pu_kernels *kk, CUdeviceptr y, CUdeviceptr x,
                       CUdeviceptr W, CUdeviceptr b, int M, int K, int N) {
+    /* Native FP8 v7 fused (Phase 4.9.5, PAINT_FP8_V7=1). Tried first because
+     * it's ~2x BF16 ceiling on sm120; non-conforming cases fall through. */
+    if (g_paint_use_fp8_v7 && W && M >= 1 && (K % 32) == 0) {
+        const pu_fp8_entry *e = paint_fp8_lookup(W);
+        if (!e) { paint_fp8_register(kk, 0, W, N, K); e = paint_fp8_lookup(W); }
+        if (e && e->n_out == N && e->n_in == K &&
+            paint_try_fp8_v7(kk, y, x, e, b, M, K, N)) return;
+    }
     /* Pure BF16 path (Phase 4.9.4, PAINT_BF16_GEMM=1): F32 X -> BF16 quant,
      * gemm_bf16_v7 (BF16xBF16 m16n8k16 mma, F32 accum), bias post-pass.
      * Uses the same FP8 weight registry to also store a BF16 mirror; falls
@@ -606,7 +702,14 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                                     (unsigned)ci, 1, 256, 1, 1, 0, 0, cargs, NULL);
                 }
                 int gemm_done = 0;
-                if (g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
+                if (g_paint_use_fp8_v7 &&
+                    paint_try_fp8_v7(kk, g_paint_d_yt, g_paint_d_xcol,
+                                      e, b, hw, ci, co)) {
+                    g_paint_xbf_last_x = 0;
+                    gemm_done = 1;
+                }
+                if (!gemm_done &&
+                    g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
                     kk->f_quant_bf16 && kk->f_add_bias_f32 && (ci % 32) == 0) {
                     size_t n_elem = (size_t)hw * (size_t)ci;
                     if (paint_xbf_ensure(n_elem) == 0) {
@@ -694,7 +797,14 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                  * FP8 path's bias is folded into the GEMM, so for v7 we
                  * pass bias=NULL to v7 then add_bias_inplace. */
                 int gemm_done = 0;
-                if (g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
+                if (g_paint_use_fp8_v7 &&
+                    paint_try_fp8_v7(kk, g_paint_d_yt, g_paint_d_xcol,
+                                      e, b, hw, K, co)) {
+                    g_paint_xbf_last_x = 0;
+                    gemm_done = 1;
+                }
+                if (!gemm_done &&
+                    g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
                     kk->f_quant_bf16 && kk->f_add_bias_f32) {
                     size_t n_elem = (size_t)hw * (size_t)K;
                     if (paint_xbf_ensure(n_elem) == 0) {
@@ -865,7 +975,14 @@ static void k_conv_stride2(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in
                 cuLaunchKernel(kk->f_im2col_3x3_p1_s2, imx, imy, 1, 32, 8, 1,
                                 0, 0, im_args, NULL);
                 int gemm_done = 0;
-                if (g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
+                if (g_paint_use_fp8_v7 &&
+                    paint_try_fp8_v7(kk, g_paint_d_yt, g_paint_d_xcol,
+                                      e, b, ohw, K, co)) {
+                    g_paint_xbf_last_x = 0;
+                    gemm_done = 1;
+                }
+                if (!gemm_done &&
+                    g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
                     kk->f_quant_bf16 && kk->f_add_bias_f32) {
                     size_t n_elem = (size_t)ohw * (size_t)K;
                     if (paint_xbf_ensure(n_elem) == 0) {
