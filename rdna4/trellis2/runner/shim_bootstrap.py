@@ -43,6 +43,12 @@ def install_all() -> None:
     os.environ.setdefault('ATTN_BACKEND', 'sdpa')
 
     from shims import texgen_sw_rast, cumesh_xatlas, flash_attn_sdpa
+    # Back-compat: ref/trellis2/gen_stage2_ref.py imports `texgen_sw_rast`
+    # at the top level. Alias the package modules so legacy `import X` still
+    # resolves after the shims/ rename.
+    sys.modules.setdefault('texgen_sw_rast', texgen_sw_rast)
+    sys.modules.setdefault('cumesh_xatlas_shim', cumesh_xatlas)
+    sys.modules.setdefault('flash_attn_sdpa_shim', flash_attn_sdpa)
     texgen_sw_rast.install_as_nvdiffrast()
     cumesh_xatlas.install_as_cumesh()
     try:
