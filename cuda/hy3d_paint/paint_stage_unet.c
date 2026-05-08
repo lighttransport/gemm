@@ -368,7 +368,11 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
                     s->kk.f_quantize_fp8);
         g_paint_use_fp8_gemm = (want && have) ? 1 : 0;
         if (g_paint_use_fp8_gemm) {
-            fprintf(stderr, "[paint_stage_unet] FP8_GEMM=1 (per-tensor BF16-pipe MT1)\n");
+            const char *m4 = getenv("PAINT_FP8_GEMM_MT4");
+            int want_mt4 = (m4 == NULL) || (m4[0] != '0');
+            g_paint_use_fp8_gemm_mt4 = (want_mt4 && s->kk.f_gemm_fp8_mt4) ? 1 : 0;
+            fprintf(stderr, "[paint_stage_unet] FP8_GEMM=1 (BF16-pipe %s)\n",
+                    g_paint_use_fp8_gemm_mt4 ? "MT4+MT1" : "MT1");
         } else {
             fprintf(stderr, "[paint_stage_unet] FP8_GEMM=0 (env=%s have=%d)\n",
                     e ? e : "(unset)", have);
@@ -527,7 +531,6 @@ void paint_stage_unet_run_dual(paint_stage_unet *s) {
     run_up_block(&s->kk, &s->ubd[1], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
     run_up_block(&s->kk, &s->ubd[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
     run_up_block(&s->kk, &s->ubd[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
-    cuCtxSynchronize();
     s->chunk_dual_done[s->active_chunk] = 1;
     fprintf(stderr, "[paint_stage_unet] dual-stream RA cache populated for chunk %d (%d slots)\n",
             s->active_chunk, g_ra_cache.idx);
@@ -597,7 +600,7 @@ void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
         CUdeviceptr ob = s->ws.d_a + (CUdeviceptr)b * 4   * H * W * sizeof(float);
         k_conv(&s->kk, ob, yb, s->ow, s->ob_w, 320, H, W, 4, 3, 3, 1);
     }
-    cuCtxSynchronize();
+    /* DtoH on default stream is implicitly synchronous — no explicit sync needed. */
     cuMemcpyDtoH(noise_pred_host, s->ws.d_a, s->x_n * sizeof(float));
 }
 
