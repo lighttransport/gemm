@@ -593,21 +593,55 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                                     (unsigned)((hw + 255) / 256),
                                     (unsigned)ci, 1, 256, 1, 1, 0, 0, cargs, NULL);
                 }
-                int n_out = co, n_in = ci, n_tok = hw;
-                CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
-                void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
-                                  &n_out, &n_in, &n_tok, &w_scale };
-                unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
-                if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && hw >= 64) {
-                    unsigned gy = (unsigned)((hw + 63) / 64); gy = (gy + 3u) & ~3u;
-                    size_t smem = 4096 + 8192 * 2;
-                    cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
-                                    smem, 0, gargs, NULL);
-                } else {
-                    unsigned gy = (unsigned)((hw + 31) / 32); gy = (gy + 3u) & ~3u;
-                    size_t smem = 2048 + 8192 * 2;
-                    cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
-                                    smem, 0, gargs, NULL);
+                int gemm_done = 0;
+                if (g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
+                    kk->f_quant_bf16 && kk->f_add_bias_f32 && (ci % 32) == 0) {
+                    size_t n_elem = (size_t)hw * (size_t)ci;
+                    if (paint_xbf_ensure(n_elem) == 0) {
+                        int n = (int)n_elem;
+                        void *qargs[] = {&g_paint_d_xbf, &g_paint_d_xcol, &n};
+                        cuLaunchKernel(kk->f_quant_bf16,
+                                        (unsigned)((n + 255) / 256), 1, 1,
+                                        256, 1, 1, 0, 0, qargs, NULL);
+                        int Mv = hw, Nv = co, Kv = ci;
+                        CUdeviceptr w_bf = e->w_bf16;
+                        unsigned npx = (unsigned)((Nv + 127) / 128);
+                        unsigned npy = (unsigned)((Mv + 63) / 64);
+                        unsigned gxv = (npx + 3u) & ~3u;
+                        unsigned gyv = (npy + 3u) & ~3u;
+                        unsigned smemv = 2u * (64u * 32u + 128u * 32u) * 2u;
+                        void *gargs[] = {&g_paint_d_yt, &g_paint_d_xbf, &w_bf,
+                                          &Mv, &Nv, &Kv};
+                        cuLaunchKernel(kk->f_gemm_bf16_v7, gxv, gyv, 1, 256, 1, 1,
+                                        smemv, 0, gargs, NULL);
+                        int has_bias = (b != 0) ? 1 : 0;
+                        int rows = hw, cols = co;
+                        void *bargs[] = {&g_paint_d_yt, &b, &rows, &cols, &has_bias};
+                        unsigned bx = 256;
+                        unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+                        unsigned gyd = (unsigned)rows;
+                        cuLaunchKernel(kk->f_add_bias_f32, gxd, gyd, 1, bx, 1, 1,
+                                        0, 0, bargs, NULL);
+                        gemm_done = 1;
+                    }
+                }
+                if (!gemm_done) {
+                    int n_out = co, n_in = ci, n_tok = hw;
+                    CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
+                    void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
+                                      &n_out, &n_in, &n_tok, &w_scale };
+                    unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
+                    if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && hw >= 64) {
+                        unsigned gy = (unsigned)((hw + 63) / 64); gy = (gy + 3u) & ~3u;
+                        size_t smem = 4096 + 8192 * 2;
+                        cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                                        smem, 0, gargs, NULL);
+                    } else {
+                        unsigned gy = (unsigned)((hw + 31) / 32); gy = (gy + 3u) & ~3u;
+                        size_t smem = 2048 + 8192 * 2;
+                        cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
+                                        smem, 0, gargs, NULL);
+                    }
                 }
                 int co_arg = co, hw_arg = hw;
                 void *targs[] = { &out, &g_paint_d_yt, &co_arg, &hw_arg };
@@ -642,22 +676,60 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                 unsigned imy = (unsigned)((hw + 7)  / 8);
                 cuLaunchKernel(kk->f_im2col_3x3_p1, imx, imy, 1, 32, 8, 1,
                                 0, 0, im_args, NULL);
-                /* GEMM: y[hw, co] = xcol[hw, K] @ W_fp8[co, K] + b */
-                int n_out = co, n_in = K, n_tok = hw;
-                CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
-                void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
-                                  &n_out, &n_in, &n_tok, &w_scale };
-                unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
-                if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && hw >= 64) {
-                    unsigned gy = (unsigned)((hw + 63) / 64); gy = (gy + 3u) & ~3u;
-                    size_t smem = 4096 + 8192 * 2;
-                    cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
-                                    smem, 0, gargs, NULL);
-                } else {
-                    unsigned gy = (unsigned)((hw + 31) / 32); gy = (gy + 3u) & ~3u;
-                    size_t smem = 2048 + 8192 * 2;
-                    cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
-                                    smem, 0, gargs, NULL);
+                /* BF16 v7 path: quant_bf16(xcol) -> v7 GEMM -> add_bias.
+                 * Output goes directly into the post-im2col HWC buffer; the
+                 * FP8 path's bias is folded into the GEMM, so for v7 we
+                 * pass bias=NULL to v7 then add_bias_inplace. */
+                int gemm_done = 0;
+                if (g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
+                    kk->f_quant_bf16 && kk->f_add_bias_f32) {
+                    size_t n_elem = (size_t)hw * (size_t)K;
+                    if (paint_xbf_ensure(n_elem) == 0) {
+                        int n = (int)n_elem;
+                        void *qargs[] = {&g_paint_d_xbf, &g_paint_d_xcol, &n};
+                        cuLaunchKernel(kk->f_quant_bf16,
+                                        (unsigned)((n + 255) / 256), 1, 1,
+                                        256, 1, 1, 0, 0, qargs, NULL);
+                        int Mv = hw, Nv = co, Kv = K;
+                        CUdeviceptr w_bf = e->w_bf16;
+                        unsigned npx = (unsigned)((Nv + 127) / 128);
+                        unsigned npy = (unsigned)((Mv + 63) / 64);
+                        unsigned gxv = (npx + 3u) & ~3u;
+                        unsigned gyv = (npy + 3u) & ~3u;
+                        unsigned smemv = 2u * (64u * 32u + 128u * 32u) * 2u;
+                        void *gargs[] = {&g_paint_d_yt, &g_paint_d_xbf, &w_bf,
+                                          &Mv, &Nv, &Kv};
+                        cuLaunchKernel(kk->f_gemm_bf16_v7, gxv, gyv, 1, 256, 1, 1,
+                                        smemv, 0, gargs, NULL);
+                        int has_bias = (b != 0) ? 1 : 0;
+                        int rows = hw, cols = co;
+                        void *bargs[] = {&g_paint_d_yt, &b, &rows, &cols, &has_bias};
+                        unsigned bx = 256;
+                        unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+                        unsigned gyd = (unsigned)rows;
+                        cuLaunchKernel(kk->f_add_bias_f32, gxd, gyd, 1, bx, 1, 1,
+                                        0, 0, bargs, NULL);
+                        gemm_done = 1;
+                    }
+                }
+                if (!gemm_done) {
+                    /* GEMM: y[hw, co] = xcol[hw, K] @ W_fp8[co, K] + b */
+                    int n_out = co, n_in = K, n_tok = hw;
+                    CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
+                    void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
+                                      &n_out, &n_in, &n_tok, &w_scale };
+                    unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
+                    if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && hw >= 64) {
+                        unsigned gy = (unsigned)((hw + 63) / 64); gy = (gy + 3u) & ~3u;
+                        size_t smem = 4096 + 8192 * 2;
+                        cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                                        smem, 0, gargs, NULL);
+                    } else {
+                        unsigned gy = (unsigned)((hw + 31) / 32); gy = (gy + 3u) & ~3u;
+                        size_t smem = 2048 + 8192 * 2;
+                        cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
+                                        smem, 0, gargs, NULL);
+                    }
                 }
                 /* transpose [hw, co] -> [co, h, w] */
                 int co_arg = co, hw_arg = hw;
@@ -778,21 +850,55 @@ static void k_conv_stride2(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in
                 unsigned imy = (unsigned)((ohw + 7)  / 8);
                 cuLaunchKernel(kk->f_im2col_3x3_p1_s2, imx, imy, 1, 32, 8, 1,
                                 0, 0, im_args, NULL);
-                int n_out = co, n_in = K, n_tok = ohw;
-                CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
-                void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
-                                  &n_out, &n_in, &n_tok, &w_scale };
-                unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
-                if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && ohw >= 64) {
-                    unsigned gy = (unsigned)((ohw + 63) / 64); gy = (gy + 3u) & ~3u;
-                    size_t smem = 4096 + 8192 * 2;
-                    cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
-                                    smem, 0, gargs, NULL);
-                } else {
-                    unsigned gy = (unsigned)((ohw + 31) / 32); gy = (gy + 3u) & ~3u;
-                    size_t smem = 2048 + 8192 * 2;
-                    cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
-                                    smem, 0, gargs, NULL);
+                int gemm_done = 0;
+                if (g_paint_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
+                    kk->f_quant_bf16 && kk->f_add_bias_f32) {
+                    size_t n_elem = (size_t)ohw * (size_t)K;
+                    if (paint_xbf_ensure(n_elem) == 0) {
+                        int n = (int)n_elem;
+                        void *qargs[] = {&g_paint_d_xbf, &g_paint_d_xcol, &n};
+                        cuLaunchKernel(kk->f_quant_bf16,
+                                        (unsigned)((n + 255) / 256), 1, 1,
+                                        256, 1, 1, 0, 0, qargs, NULL);
+                        int Mv = ohw, Nv = co, Kv = K;
+                        CUdeviceptr w_bf = e->w_bf16;
+                        unsigned npx = (unsigned)((Nv + 127) / 128);
+                        unsigned npy = (unsigned)((Mv + 63) / 64);
+                        unsigned gxv = (npx + 3u) & ~3u;
+                        unsigned gyv = (npy + 3u) & ~3u;
+                        unsigned smemv = 2u * (64u * 32u + 128u * 32u) * 2u;
+                        void *gargs[] = {&g_paint_d_yt, &g_paint_d_xbf, &w_bf,
+                                          &Mv, &Nv, &Kv};
+                        cuLaunchKernel(kk->f_gemm_bf16_v7, gxv, gyv, 1, 256, 1, 1,
+                                        smemv, 0, gargs, NULL);
+                        int has_bias = (b != 0) ? 1 : 0;
+                        int rows = ohw, cols = co;
+                        void *bargs[] = {&g_paint_d_yt, &b, &rows, &cols, &has_bias};
+                        unsigned bx = 256;
+                        unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+                        unsigned gyd = (unsigned)rows;
+                        cuLaunchKernel(kk->f_add_bias_f32, gxd, gyd, 1, bx, 1, 1,
+                                        0, 0, bargs, NULL);
+                        gemm_done = 1;
+                    }
+                }
+                if (!gemm_done) {
+                    int n_out = co, n_in = K, n_tok = ohw;
+                    CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
+                    void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
+                                      &n_out, &n_in, &n_tok, &w_scale };
+                    unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
+                    if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && ohw >= 64) {
+                        unsigned gy = (unsigned)((ohw + 63) / 64); gy = (gy + 3u) & ~3u;
+                        size_t smem = 4096 + 8192 * 2;
+                        cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                                        smem, 0, gargs, NULL);
+                    } else {
+                        unsigned gy = (unsigned)((ohw + 31) / 32); gy = (gy + 3u) & ~3u;
+                        size_t smem = 2048 + 8192 * 2;
+                        cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
+                                        smem, 0, gargs, NULL);
+                    }
                 }
                 int co_arg = co, hw_arg = ohw;
                 void *targs[] = { &out, &g_paint_d_yt, &co_arg, &hw_arg };
