@@ -377,6 +377,12 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
         g_paint_fp8_debug = (de && de[0] != '0') ? 1 : 0;
         if (g_paint_fp8_debug)
             fprintf(stderr, "[paint_stage_unet] FP8_DEBUG=1 (per-launch sync)\n");
+        const char *pe = getenv("PAINT_PROFILE");
+        g_paint_profile = (pe && pe[0] != '0') ? 1 : 0;
+        if (g_paint_profile) {
+            fprintf(stderr, "[paint_stage_unet] PROFILE=1 (per-kernel cuEvent timing)\n");
+            atexit(paint_prof_dump);
+        }
     }
 
     return s;
