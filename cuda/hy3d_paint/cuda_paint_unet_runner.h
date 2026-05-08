@@ -211,17 +211,27 @@ static const pu_fp8_entry *paint_fp8_lookup(CUdeviceptr w_f32) {
 }
 
 /* F32 weight -> FP8 + per-tensor scale. Mirrors hy3d_quantize_w_fp8 but
- * skips the f16->f32 step (paint UNet weights are loaded as F32). */
+ * skips the f16->f32 step (paint UNet weights are loaded as F32).
+ * Pads the FP8 row count up to a 256-multiple so the BF16-pipe MT1 kernel
+ * can be dispatched for any n_out (its W tile loader reads 256 contiguous
+ * rows per CTA without bounds-checking; writes are already guarded by
+ * `yc < n_out`). Padded rows are zero, contributing nothing to the dot
+ * product on out-of-range output channels (which are also write-guarded). */
 static int paint_quantize_w_fp8(const pu_kernels *kk, CUstream stream,
-                                  CUdeviceptr d_w_f32, size_t n_elem,
+                                  CUdeviceptr d_w_f32, int n_out, int n_in,
                                   CUdeviceptr *out_fp8, CUdeviceptr *out_scale) {
     *out_fp8 = 0; *out_scale = 0;
-    if (!kk->f_reduce_max_abs || !kk->f_quantize_fp8 || !d_w_f32 || n_elem == 0)
+    if (!kk->f_reduce_max_abs || !kk->f_quantize_fp8 || !d_w_f32 ||
+        n_out <= 0 || n_in <= 0)
         return -1;
+    size_t n_elem     = (size_t)n_out * (size_t)n_in;
+    int    n_out_pad  = ((n_out + 255) / 256) * 256;
+    size_t n_elem_pad = (size_t)n_out_pad * (size_t)n_in;
     CUdeviceptr d_max = 0, d_fp8 = 0, d_scale = 0;
     if (cuMemAlloc(&d_max, sizeof(float)) != CUDA_SUCCESS) goto fail;
-    if (cuMemAlloc(&d_fp8, n_elem)        != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_fp8, n_elem_pad)    != CUDA_SUCCESS) goto fail;
     if (cuMemAlloc(&d_scale, sizeof(float)) != CUDA_SUCCESS) goto fail;
+    cuMemsetD8Async(d_fp8, 0, n_elem_pad, stream);
     int n = (int)n_elem;
     cuMemsetD8Async(d_max, 0, sizeof(float), stream);
     {
@@ -251,14 +261,13 @@ static void paint_fp8_register(const pu_kernels *kk, CUstream stream,
                                  CUdeviceptr w_f32, int n_out, int n_in) {
     if (!w_f32) return;
     if (g_paint_n_fp8_reg >= PAINT_FP8_REG_MAX) return;
-    /* Only register shapes the FP8 kernel will actually handle, so the
-     * scalar F32 fallback is never taken for registered weights — that
-     * lets us free the F32 buffer below and reclaim ~hundreds of MB. */
-    if (n_in <= 0 || n_out <= 0 || (n_in % 32) != 0 || (n_out % 256) != 0) return;
+    /* The BF16-pipe MT1 kernel handles any n_out via FP8-row padding
+     * (see paint_quantize_w_fp8); it still requires n_in % 32 == 0. */
+    if (n_in <= 0 || n_out <= 0 || (n_in % 32) != 0) return;
     if (paint_fp8_lookup(w_f32)) return;
     CUdeviceptr fp8 = 0, sc = 0;
     size_t n_elem = (size_t)n_out * (size_t)n_in;
-    if (paint_quantize_w_fp8(kk, stream, w_f32, n_elem, &fp8, &sc) != 0) return;
+    if (paint_quantize_w_fp8(kk, stream, w_f32, n_out, n_in, &fp8, &sc) != 0) return;
     pu_fp8_entry *e = &g_paint_fp8_reg[g_paint_n_fp8_reg++];
     e->w_f32 = w_f32; e->w_fp8 = fp8; e->w_scale = sc;
     e->n_out = n_out; e->n_in = n_in;
@@ -275,7 +284,50 @@ static void paint_fp8_register(const pu_kernels *kk, CUstream stream,
  * the FP8 OOB at idx ~535. Default off; zero overhead when off. */
 static unsigned long g_paint_launch_idx = 0;
 static int g_paint_fp8_debug = 0;
+static int g_paint_profile = 0;
 static const char *g_paint_last_kernel = "(none)";
+
+#define PAINT_PROF_MAX 64
+static const char *g_paint_prof_name[PAINT_PROF_MAX];
+static double      g_paint_prof_ms  [PAINT_PROF_MAX];
+static unsigned long g_paint_prof_n [PAINT_PROF_MAX];
+static int g_paint_prof_count = 0;
+
+static int paint_prof_slot(const char *name) {
+    for (int i = 0; i < g_paint_prof_count; i++)
+        if (g_paint_prof_name[i] == name) return i;
+    if (g_paint_prof_count >= PAINT_PROF_MAX) return -1;
+    int s = g_paint_prof_count++;
+    g_paint_prof_name[s] = name;
+    g_paint_prof_ms[s]   = 0.0;
+    g_paint_prof_n[s]    = 0;
+    return s;
+}
+
+static void paint_prof_dump(void) {
+    if (g_paint_prof_count == 0) return;
+    /* selection-sort by ms desc, top all */
+    int idx[PAINT_PROF_MAX];
+    for (int i = 0; i < g_paint_prof_count; i++) idx[i] = i;
+    for (int i = 0; i < g_paint_prof_count; i++)
+        for (int j = i+1; j < g_paint_prof_count; j++)
+            if (g_paint_prof_ms[idx[j]] > g_paint_prof_ms[idx[i]]) {
+                int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+            }
+    double total = 0;
+    for (int i = 0; i < g_paint_prof_count; i++) total += g_paint_prof_ms[i];
+    fprintf(stderr, "\n[paint_prof] ===== per-kernel time (PAINT_PROFILE=1) =====\n");
+    fprintf(stderr, "[paint_prof] %-40s %10s %10s %10s\n",
+            "kernel", "total_ms", "calls", "avg_us");
+    for (int i = 0; i < g_paint_prof_count; i++) {
+        int k = idx[i];
+        fprintf(stderr, "[paint_prof] %-40s %10.2f %10lu %10.2f\n",
+                g_paint_prof_name[k], g_paint_prof_ms[k], g_paint_prof_n[k],
+                g_paint_prof_n[k] ? (g_paint_prof_ms[k] * 1000.0 / g_paint_prof_n[k]) : 0.0);
+    }
+    fprintf(stderr, "[paint_prof] %-40s %10.2f %10lu\n", "TOTAL", total, g_paint_launch_idx);
+    fflush(stderr);
+}
 
 static inline CUresult paint_dbg_launch(const char *name, CUfunction f,
         unsigned gx, unsigned gy, unsigned gz,
@@ -283,6 +335,22 @@ static inline CUresult paint_dbg_launch(const char *name, CUfunction f,
         unsigned smem, CUstream stream, void **args, void **extra) {
     g_paint_launch_idx++;
     unsigned long idx = g_paint_launch_idx;
+    if (g_paint_profile) {
+        /* sync before to flush prior async work, then time the launch+sync */
+        cuCtxSynchronize();
+        CUevent e0, e1;
+        cuEventCreate(&e0, 0); cuEventCreate(&e1, 0);
+        cuEventRecord(e0, stream);
+        CUresult r = cuLaunchKernel(f, gx, gy, gz, bx, by, bz, smem, stream, args, extra);
+        cuEventRecord(e1, stream);
+        cuEventSynchronize(e1);
+        float ms = 0.f;
+        cuEventElapsedTime(&ms, e0, e1);
+        cuEventDestroy(e0); cuEventDestroy(e1);
+        int s = paint_prof_slot(name);
+        if (s >= 0) { g_paint_prof_ms[s] += ms; g_paint_prof_n[s]++; }
+        return r;
+    }
     CUresult r = cuLaunchKernel(f, gx, gy, gz, bx, by, bz, smem, stream, args, extra);
     if (g_paint_fp8_debug) {
         if (r != CUDA_SUCCESS) {
@@ -320,7 +388,7 @@ static void k_linear(const pu_kernels *kk, CUdeviceptr y, CUdeviceptr x,
      * Constraints: n_in%32==0, n_out%256==0, n_tok>=16. Registry lookup
      * confirms the weight was prequantized at load with matching dims. */
     if (g_paint_use_fp8_gemm && (kk->f_gemm_fp8_mt4 || kk->f_gemm_fp8) && W &&
-        M >= 1 && (K % 32) == 0 && (N % 256) == 0) {
+        M >= 1 && (K % 32) == 0) {
         const pu_fp8_entry *e = paint_fp8_lookup(W);
         if (!e) {
             paint_fp8_register(kk, 0, W, N, K);
