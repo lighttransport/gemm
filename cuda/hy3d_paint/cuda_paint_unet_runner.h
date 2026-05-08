@@ -481,7 +481,7 @@ static int paint_try_fp8_v7(const pu_kernels *kk,
     if (paint_xfp8_ensure(n_elem) != 0) return 0;
     int n = (int)n_elem;
     if (!(g_paint_fp8v7_last_x == x && g_paint_fp8v7_last_n == n)) {
-        cuMemsetD32(g_paint_d_xmax, 0, 1);
+        cuMemsetD32Async(g_paint_d_xmax, 0, 1, 0);
         {
             void *args[] = {&g_paint_d_xmax, &x, &n};
             cuLaunchKernel(kk->f_reduce_max_abs,
