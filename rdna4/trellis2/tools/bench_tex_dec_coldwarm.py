@@ -3,18 +3,10 @@
 import os, sys, time, argparse
 os.environ.setdefault('ATTN_BACKEND', 'sdpa')
 
-REPO = '/mnt/disk1/work/gemm/trellis2'
-sys.path.insert(0, f'{REPO}/cpu/trellis2/trellis2_repo')
-sys.path.insert(0, f'{REPO}/ref/trellis2')
-
-import importlib.util as _u
-def _load(p, name):
-    spec = _u.spec_from_file_location(name, p); m = _u.module_from_spec(spec)
-    spec.loader.exec_module(m); return m
-_R = f'{REPO}/rdna4/trellis2'
-_load(f'{_R}/texgen_sw_rast.py', 'texgen_sw_rast').install_as_nvdiffrast()
-_load(f'{_R}/cumesh_xatlas_shim.py', 'cumesh_xatlas_shim').install_as_cumesh()
-_load(f'{_R}/flash_attn_sdpa_shim.py', 'flash_attn_sdpa_shim').install_as_flash_attn()
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'runner')))
+from shim_bootstrap import install_all  # noqa: E402
+install_all()
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
 import numpy as np, torch
 from safetensors.torch import load_file
