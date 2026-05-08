@@ -198,6 +198,7 @@ typedef struct {
 
 #define PAINT_FP8_REG_MAX 4096
 static int g_paint_use_fp8_gemm = 0;
+static int g_paint_use_fp8_gemm_mt4 = 0;
 static CUdeviceptr g_paint_d_xbf16 = 0;
 static size_t g_paint_xbf16_max_elem = 0;
 static pu_fp8_entry g_paint_fp8_reg[PAINT_FP8_REG_MAX];
@@ -408,13 +409,20 @@ static void k_linear(const pu_kernels *kk, CUdeviceptr y, CUdeviceptr x,
             CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
             void *gargs[] = { &y, &w_fp8, &x, &b,
                               &n_out, &n_in, &n_tok, &w_scale };
-            /* Prefer MT1 (32-row tiles): more permissive on shape and matches
-             * the validated hy3d/qimg/flux2 dispatch path. MT4 was crashing on
-             * paint UNet — leave its registration in place but don't dispatch
-             * until the OOB is root-caused. */
+            /* MT4 (64-row tiles) when n_tok large; falls back to MT1 (32-row).
+             * The earlier MT4 OOB was a downstream OOM caused by holding both
+             * FP8 + F32 weights — fixed by freeing F32 in paint_fp8_register. */
+            unsigned gx = (unsigned)((N + 255) / 256);
+            gx = (gx + 3u) & ~3u;
+            if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && M >= 64) {
+                unsigned gy = (unsigned)((M + 63) / 64);
+                gy = (gy + 3u) & ~3u;
+                size_t smem = 4096 + 8192 * 2;
+                cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                                smem, 0, gargs, NULL);
+                return;
+            }
             if (kk->f_gemm_fp8) {
-                unsigned gx = (unsigned)((N + 255) / 256);
-                gx = (gx + 3u) & ~3u;
                 unsigned gy = (unsigned)((M + 31) / 32);
                 gy = (gy + 3u) & ~3u;
                 size_t smem = 2048 + 8192 * 2;
