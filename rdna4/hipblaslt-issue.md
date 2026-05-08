@@ -157,3 +157,10 @@ this same bug and need the same chunked wrapping.
   dtype-keyed (`2**19` fp32, `2**20` fp16/bf16), not K/N specific.
 - Upstream report not yet filed.
 - Repro is self-contained and ready to attach to a hipBLASLt issue.
+- E2E verified: full TRELLIS-2 stage-1+2 pipeline run (`dump_rocm.py`)
+  produces stage-15 `tex_voxels.feats` of shape `(1500482, 6)` fp32 in
+  the expected PBR range `[-0.11, 1.08]` (mean 0.49, std 0.38), no
+  NaN/inf, no `±1e18`. CUDA reference range is `[-0.09, 1.09]` (mean
+  0.47, std 0.40). The remaining mean|d|≈0.07 across the 562k coord
+  overlap is the documented BF16 attention spread in stage-1 SS DiT
+  (cos=0.998 on `ss_latent`), unrelated to the hipBLASLt workaround.
