@@ -572,10 +572,17 @@ static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                 void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
                                   &n_out, &n_in, &n_tok, &w_scale };
                 unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
-                unsigned gy = (unsigned)((hw + 31)  / 32);   gy = (gy + 3u) & ~3u;
-                size_t smem = 2048 + 8192 * 2;
-                cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
-                                smem, 0, gargs, NULL);
+                if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && hw >= 64) {
+                    unsigned gy = (unsigned)((hw + 63) / 64); gy = (gy + 3u) & ~3u;
+                    size_t smem = 4096 + 8192 * 2;
+                    cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                                    smem, 0, gargs, NULL);
+                } else {
+                    unsigned gy = (unsigned)((hw + 31) / 32); gy = (gy + 3u) & ~3u;
+                    size_t smem = 2048 + 8192 * 2;
+                    cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
+                                    smem, 0, gargs, NULL);
+                }
                 /* transpose [hw, co] -> [co, h, w] */
                 int co_arg = co, hw_arg = hw;
                 void *targs[] = { &out, &g_paint_d_yt, &co_arg, &hw_arg };
