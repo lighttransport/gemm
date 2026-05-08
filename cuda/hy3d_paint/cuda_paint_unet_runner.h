@@ -492,6 +492,56 @@ static int paint_conv_scratch_ensure(size_t xcol_bytes, size_t yt_bytes) {
 static void k_conv(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
                     CUdeviceptr W, CUdeviceptr b,
                     int ci, int h, int w, int co, int kh, int kw, int pad) {
+    /* 1x1 pad=0 FP8 path: pure GEMM, no im2col.
+     *   y[hw, co] = x[hw, ci] @ Wt[co, ci]
+     * Input is [ci,h,w] CHW = [ci, hw] row-major; the GEMM wants x[hw, ci],
+     * so we need a CHW->HWC transpose first. Use t_hwc_chw inverse via the
+     * existing chw_to_nc kernel (treats spatial as N). */
+    if (g_paint_use_fp8_conv && g_paint_use_fp8_gemm && kk->f_gemm_fp8 &&
+        kk->f_t_hwc_chw && kk->f_chw_nc &&
+        kh == 1 && kw == 1 && pad == 0 && (ci % 32) == 0 && W) {
+        int hw = h * w;
+        size_t xcol_bytes = (size_t)hw * ci * sizeof(float);
+        size_t yt_bytes   = (size_t)hw * co * sizeof(float);
+        if (paint_conv_scratch_ensure(xcol_bytes, yt_bytes) == 0) {
+            const pu_fp8_entry *e = paint_fp8_lookup(W);
+            if (!e) { paint_fp8_register(kk, 0, W, co, ci); e = paint_fp8_lookup(W); }
+            if (e && e->n_out == co && e->n_in == ci) {
+                /* CHW [ci,hw] -> HWC [hw,ci] using chw_to_nc(C=ci, N=hw).
+                 * Inline launch (k_chw_to_nc is defined later in the file). */
+                {
+                    int C_arg = ci, N_arg = hw;
+                    void *cargs[] = { &g_paint_d_xcol, &in, &C_arg, &N_arg };
+                    cuLaunchKernel(kk->f_chw_nc,
+                                    (unsigned)((hw + 255) / 256),
+                                    (unsigned)ci, 1, 256, 1, 1, 0, 0, cargs, NULL);
+                }
+                int n_out = co, n_in = ci, n_tok = hw;
+                CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
+                void *gargs[] = { &g_paint_d_yt, &w_fp8, &g_paint_d_xcol, &b,
+                                  &n_out, &n_in, &n_tok, &w_scale };
+                unsigned gx = (unsigned)((co + 255) / 256);  gx = (gx + 3u) & ~3u;
+                if (g_paint_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && hw >= 64) {
+                    unsigned gy = (unsigned)((hw + 63) / 64); gy = (gy + 3u) & ~3u;
+                    size_t smem = 4096 + 8192 * 2;
+                    cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                                    smem, 0, gargs, NULL);
+                } else {
+                    unsigned gy = (unsigned)((hw + 31) / 32); gy = (gy + 3u) & ~3u;
+                    size_t smem = 2048 + 8192 * 2;
+                    cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
+                                    smem, 0, gargs, NULL);
+                }
+                int co_arg = co, hw_arg = hw;
+                void *targs[] = { &out, &g_paint_d_yt, &co_arg, &hw_arg };
+                unsigned tx = (unsigned)((co + 31) / 32);
+                unsigned ty = (unsigned)((hw + 7)  / 8);
+                cuLaunchKernel(kk->f_t_hwc_chw, tx, ty, 1, 32, 8, 1,
+                                0, 0, targs, NULL);
+                return;
+            }
+        }
+    }
     /* FP8 path: 3x3, pad=1, stride=1, ci%32==0. Reshape conv as
      *   y[hw, co] = im2col(in)[hw, ci*9] @ Wt[co, ci*9]
      * then transpose to CHW. The conv weight tensor is laid out
