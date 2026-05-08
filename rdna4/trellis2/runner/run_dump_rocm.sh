@@ -28,6 +28,17 @@ mkdir -p "$OUTDIR"
 export ATTN_BACKEND="${ATTN_BACKEND:-sdpa}"
 export OPENCV_IO_ENABLE_OPENEXR=1
 
+# Activate vendored hipBLASLt subset if present (run vendor/setup_vendor.sh
+# to populate). Falls through to the system /opt/rocm path if unset.
+VENDOR_HBL="$RDNA4_T2_DIR/vendor/hipblaslt"
+if [[ -d "$VENDOR_HBL/library" ]]; then
+    export LD_LIBRARY_PATH="$VENDOR_HBL:${LD_LIBRARY_PATH:-}"
+    export HIPBLASLT_TENSILE_LIBPATH="$VENDOR_HBL/library"
+    echo "[run] using vendored hipBLASLt: $VENDOR_HBL"
+else
+    echo "[run] vendor/hipblaslt missing; run vendor/setup_vendor.sh to bundle (using system /opt/rocm)" >&2
+fi
+
 DINOV3_WEIGHTS="$DINOV3" RDNA4_DIR="$RDNA4_T2_DIR" REPO_DIR="$REPO_ROOT/cpu/trellis2/trellis2_repo" \
     "$VENV_PY" "$SCRIPT_DIR/dump_rocm.py" \
         --image "$IMAGE" \
