@@ -169,6 +169,7 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
     if (cuModuleGetFunction(&s->kk.f_reduce_max_abs, s->kk.mod, "reduce_max_abs_f32")            != CUDA_SUCCESS) s->kk.f_reduce_max_abs = NULL;
     if (cuModuleGetFunction(&s->kk.f_quantize_fp8,   s->kk.mod, "quantize_to_fp8_e4m3")          != CUDA_SUCCESS) s->kk.f_quantize_fp8   = NULL;
     if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1,  s->kk.mod, "unet_im2col_3x3_p1_f32")        != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1  = NULL;
+    if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1_s2,s->kk.mod, "unet_im2col_3x3_p1_s2_f32")     != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1_s2 = NULL;
     if (cuModuleGetFunction(&s->kk.f_t_hwc_chw,      s->kk.mod, "unet_t_hwc_to_chw_f32")         != CUDA_SUCCESS) s->kk.f_t_hwc_chw      = NULL;
     /* BF16 TC kernels (optional; missing → fall back to f_mha automatically). */
     if (cuModuleGetFunction(&s->kk.f_cast_bf16,         s->kk.mod, "cast_f32_to_bf16")        != CUDA_SUCCESS) s->kk.f_cast_bf16 = NULL;
