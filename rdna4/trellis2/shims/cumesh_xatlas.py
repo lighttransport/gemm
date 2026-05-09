@@ -273,14 +273,22 @@ class CuMesh:
         self._vnormals = None
 
     def simplify(self, target, verbose=False, options=None):
-        import fast_simplification
+        # Open3D quadric-error decimation — matches upstream cumesh behavior
+        # (which is what o_voxel.postprocess.to_glb expects).
+        import open3d as o3d
         if self.num_faces <= int(target):
             return
-        v = self._read_v().astype(np.float32, copy=False)
-        f = self._read_f().astype(np.uint32, copy=False)
-        v2, f2 = fast_simplification.simplify(v, f, target_count=int(target))
-        v2 = np.ascontiguousarray(v2, dtype=np.float32)
-        f2 = np.ascontiguousarray(f2.astype(np.int32, copy=False))
+        v = self._read_v().astype(np.float64, copy=False)
+        f = self._read_f().astype(np.int32, copy=False)
+        tm = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(v),
+            o3d.utility.Vector3iVector(f),
+        )
+        tm = tm.simplify_quadric_decimation(target_number_of_triangles=int(target))
+        v2 = np.asarray(tm.vertices, dtype=np.float32)
+        f2 = np.asarray(tm.triangles, dtype=np.int32)
+        v2 = np.ascontiguousarray(v2)
+        f2 = np.ascontiguousarray(f2)
         self._lib.tr2_mesh_set(self._handle,
                                v2.ctypes.data, int(v2.shape[0]),
                                f2.ctypes.data, int(f2.shape[0]))
