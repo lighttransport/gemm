@@ -97,6 +97,21 @@ struct paint_stage_unet {
      * path; required for CUDA graph capture). */
     pu_skip_stack ss_main;
     pu_skip_stack ss_dual;
+
+    /* CUDA graph capture state (PAINT_UNET_GRAPH=1).
+     * Per CFG chunk: cold (0) -> warmed (1) -> captured (2). On the first
+     * run_step in a chunk we run normally so all lazy allocations (FP8/BF16
+     * scratch, im2col, transformer caches, skip-stack growth) saturate. On
+     * the second call we capture; subsequent calls replay via cuGraphLaunch
+     * with input/output staged through pinned host buffers. */
+    int           use_graph;
+    CUstream      stream;                 /* dedicated non-blocking stream */
+    CUgraphExec   graph_exec[PAINT_UNET_MAX_CHUNKS];
+    int           capture_state[PAINT_UNET_MAX_CHUNKS];
+    /* Pinned host staging (allocated once; addresses baked into capture). */
+    float        *pin_packed_main;        /* [Beff_main, IC_main, H0, W0] */
+    int64_t      *pin_ts_main;            /* [Beff_main] */
+    float        *pin_noise_pred;         /* [x_n] */
 };
 
 paint_stage_unet *paint_stage_unet_create(CUdevice dev,
@@ -494,6 +509,39 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
             fprintf(stderr, "[paint_stage_unet] FP8_V7=0 (env=%s have=%d)\n", e, have);
     }
     {
+        /* CUDA graph capture (PAINT_UNET_GRAPH=1). Default OFF — opt in to
+         * exercise. Allocates a dedicated non-blocking stream + pinned host
+         * staging buffers; routes all UNet work through that stream via
+         * g_paint_stream so the per-chunk forward can be captured & replayed. */
+        const char *e = getenv("PAINT_UNET_GRAPH");
+        s->use_graph = (e && e[0] != '0') ? 1 : 0;
+        for (int c = 0; c < PAINT_UNET_MAX_CHUNKS; c++) {
+            s->capture_state[c] = 0;
+            s->graph_exec[c] = NULL;
+        }
+        if (s->use_graph) {
+            if (cuStreamCreate(&s->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) {
+                fprintf(stderr, "[paint_stage_unet] GRAPH=1 cuStreamCreate failed; disabling\n");
+                s->use_graph = 0; s->stream = 0;
+            } else {
+                size_t pmb = (size_t)s->Beff_main * s->per_in_main * sizeof(float);
+                size_t tsb = (size_t)s->Beff_main * sizeof(int64_t);
+                size_t npb = s->x_n * sizeof(float);
+                if (cuMemAllocHost((void**)&s->pin_packed_main, pmb) != CUDA_SUCCESS ||
+                    cuMemAllocHost((void**)&s->pin_ts_main,     tsb) != CUDA_SUCCESS ||
+                    cuMemAllocHost((void**)&s->pin_noise_pred,  npb) != CUDA_SUCCESS) {
+                    fprintf(stderr, "[paint_stage_unet] GRAPH=1 pinned alloc failed; disabling\n");
+                    s->use_graph = 0;
+                } else {
+                    /* Route all UNet GPU work through this stream. */
+                    g_paint_stream = s->stream;
+                    fprintf(stderr, "[paint_stage_unet] GRAPH=1 (stream + pinned %.1f MB)\n",
+                            (double)(pmb + tsb + npb) / (1024.0 * 1024.0));
+                }
+            }
+        }
+    }
+    {
         const char *de = getenv("PAINT_FP8_DEBUG");
         g_paint_fp8_debug = (de && de[0] != '0') ? 1 : 0;
         if (g_paint_fp8_debug)
@@ -638,42 +686,29 @@ void paint_stage_unet_run_dual(paint_stage_unet *s) {
             s->active_chunk, g_ra_cache.idx);
 }
 
-void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
-                                const float *x_host, float *noise_pred_host) {
-    if (!s->chunk_dual_done[s->active_chunk]) {
-        fprintf(stderr, "[paint_stage_unet] ERROR: run_dual first for chunk %d\n",
-                s->active_chunk);
-        return;
-    }
-    /* Point the read-side cache at the active chunk's slots. */
-    g_ra_cache.slots = s->ra_slots[s->active_chunk];
+/* Emit the captureable per-step UNet body: H2D inputs (from pinned), all
+ * kernel launches, and D2H of noise_pred (to pinned). Everything goes through
+ * g_paint_stream so cuStreamBeginCapture picks it up. The function reads
+ * conditioning from device buffers populated by set_conditioning. */
+static void unet_run_step_body(paint_stage_unet *s) {
     const paint_unet_config *cfg = &s->cfg;
     const int H0 = cfg->H0, W0 = cfg->W0, M_text = cfg->M_text;
-    const int N_PBR = cfg->N_pbr, N_GEN = cfg->N_gen;
     const int IC_main = 12;
-    const size_t per_view = s->per_view, per_in_main = s->per_in_main;
     int H = H0, W = W0;
 
-    /* Pack current x into the sample slot of packed_main */
-    for (int p = 0; p < N_PBR; p++)
-        for (int g = 0; g < N_GEN; g++) {
-            int b = p * N_GEN + g;
-            float *dst = s->packed_main + (size_t)b * per_in_main;
-            memcpy(dst, x_host + (size_t)b * per_view, per_view * sizeof(float));
-        }
-    size_t in_n_m = (size_t)s->Beff_main * IC_main * H0 * W0;
-    cuMemcpyHtoD(s->d_in_raw_m, s->packed_main, in_n_m * sizeof(float));
+    /* Point the read-side cache at the active chunk's slots. */
+    g_ra_cache.slots = s->ra_slots[s->active_chunk];
 
-    /* Timestep embed for current t */
-    int64_t ts_main_arr[16];
-    for (int b = 0; b < s->Beff_main; b++) ts_main_arr[b] = (int64_t)timestep;
-    cuMemcpyHtoD(s->d_ts_main, ts_main_arr, s->Beff_main * sizeof(int64_t));
+    size_t in_n_m = (size_t)s->Beff_main * IC_main * H0 * W0;
+    cuMemcpyHtoDAsync(s->d_in_raw_m, s->pin_packed_main,
+                       in_n_m * sizeof(float), g_paint_stream);
+    cuMemcpyHtoDAsync(s->d_ts_main, s->pin_ts_main,
+                       (size_t)s->Beff_main * sizeof(int64_t), g_paint_stream);
     k_timestep_embed(&s->kk, s->d_temb_in_m, s->d_ts_main, s->Beff_main, 320);
     k_linear(&s->kk, s->d_temb_h1_m, s->d_temb_in_m, s->l1_w, s->l1_b, s->Beff_main, 320, 1280);
     k_silu(&s->kk, s->d_temb_h1_m, s->Beff_main * 1280);
     k_linear(&s->kk, s->d_temb_m, s->d_temb_h1_m, s->l2_w, s->l2_b, s->Beff_main, 1280, 1280);
 
-    /* Main forward (RA mode='r', read in-order from cache) */
     g_ra_mode = 2; g_ra_cache.idx = 0;
     for (int b = 0; b < s->Beff_main; b++) {
         CUdeviceptr ib = s->d_in_raw_m + (CUdeviceptr)b * IC_main * H0 * W0 * sizeof(float);
@@ -703,14 +738,157 @@ void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
         CUdeviceptr ob = s->ws.d_a + (CUdeviceptr)b * 4   * H * W * sizeof(float);
         k_conv(&s->kk, ob, yb, s->ow, s->ob_w, 320, H, W, 4, 3, 3, 1);
     }
-    /* DtoH on default stream is implicitly synchronous — no explicit sync needed. */
-    cuMemcpyDtoH(noise_pred_host, s->ws.d_a, s->x_n * sizeof(float));
+    cuMemcpyDtoHAsync(s->pin_noise_pred, s->ws.d_a,
+                       s->x_n * sizeof(float), g_paint_stream);
+}
+
+void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
+                                const float *x_host, float *noise_pred_host) {
+    if (!s->chunk_dual_done[s->active_chunk]) {
+        fprintf(stderr, "[paint_stage_unet] ERROR: run_dual first for chunk %d\n",
+                s->active_chunk);
+        return;
+    }
+    const paint_unet_config *cfg = &s->cfg;
+    const int N_PBR = cfg->N_pbr, N_GEN = cfg->N_gen;
+    const size_t per_view = s->per_view, per_in_main = s->per_in_main;
+
+    /* Legacy path: no graph capture — synchronous via default stream. */
+    if (!s->use_graph) {
+        g_ra_cache.slots = s->ra_slots[s->active_chunk];
+        const int H0 = cfg->H0, W0 = cfg->W0, M_text = cfg->M_text;
+        const int IC_main = 12;
+        int H = H0, W = W0;
+        for (int p = 0; p < N_PBR; p++)
+            for (int g = 0; g < N_GEN; g++) {
+                int b = p * N_GEN + g;
+                float *dst = s->packed_main + (size_t)b * per_in_main;
+                memcpy(dst, x_host + (size_t)b * per_view, per_view * sizeof(float));
+            }
+        size_t in_n_m = (size_t)s->Beff_main * IC_main * H0 * W0;
+        cuMemcpyHtoD(s->d_in_raw_m, s->packed_main, in_n_m * sizeof(float));
+        int64_t ts_main_arr[16];
+        for (int b = 0; b < s->Beff_main; b++) ts_main_arr[b] = (int64_t)timestep;
+        cuMemcpyHtoD(s->d_ts_main, ts_main_arr, s->Beff_main * sizeof(int64_t));
+        k_timestep_embed(&s->kk, s->d_temb_in_m, s->d_ts_main, s->Beff_main, 320);
+        k_linear(&s->kk, s->d_temb_h1_m, s->d_temb_in_m, s->l1_w, s->l1_b, s->Beff_main, 320, 1280);
+        k_silu(&s->kk, s->d_temb_h1_m, s->Beff_main * 1280);
+        k_linear(&s->kk, s->d_temb_m, s->d_temb_h1_m, s->l2_w, s->l2_b, s->Beff_main, 1280, 1280);
+        g_ra_mode = 2; g_ra_cache.idx = 0;
+        for (int b = 0; b < s->Beff_main; b++) {
+            CUdeviceptr ib = s->d_in_raw_m + (CUdeviceptr)b * IC_main * H0 * W0 * sizeof(float);
+            CUdeviceptr ob = s->ws.d_a     + (CUdeviceptr)b * 320     * H0 * W0 * sizeof(float);
+            k_conv(&s->kk, ob, ib, s->cw, s->cb, IC_main, H0, W0, 320, 3, 3, 1);
+        }
+        pu_skip_stack *ss = &s->ss_main;
+        ss->top = 0; ss->B = s->Beff_main;
+        skip_push_copy(ss, s->ws.d_a, 320, H0, W0);
+        run_down_block(&s->kk, &s->db[0], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        run_down_block(&s->kk, &s->db[1], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        run_down_block(&s->kk, &s->db[2], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        run_down_block(&s->kk, &s->db[3], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        run_mid_block(&s->kk, &s->mid, s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, H, W, M_text, &s->ws);
+        run_up_block(&s->kk, &s->ub[0], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        run_up_block(&s->kk, &s->ub[1], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        run_up_block(&s->kk, &s->ub[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        run_up_block(&s->kk, &s->ub[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+        for (int b = 0; b < s->Beff_main; b++) {
+            CUdeviceptr xb = s->ws.d_a + (CUdeviceptr)b * 320 * H * W * sizeof(float);
+            CUdeviceptr yb = s->ws.d_b + (CUdeviceptr)b * 320 * H * W * sizeof(float);
+            k_groupnorm(&s->kk, yb, xb, s->ng, s->nb_w, 320, H * W, 32, 1);
+        }
+        for (int b = 0; b < s->Beff_main; b++) {
+            CUdeviceptr yb = s->ws.d_b + (CUdeviceptr)b * 320 * H * W * sizeof(float);
+            CUdeviceptr ob = s->ws.d_a + (CUdeviceptr)b * 4   * H * W * sizeof(float);
+            k_conv(&s->kk, ob, yb, s->ow, s->ob_w, 320, H, W, 4, 3, 3, 1);
+        }
+        cuMemcpyDtoH(noise_pred_host, s->ws.d_a, s->x_n * sizeof(float));
+        return;
+    }
+
+    /* Graph path. Pack inputs into pinned buffers. */
+    for (int p = 0; p < N_PBR; p++)
+        for (int g = 0; g < N_GEN; g++) {
+            int b = p * N_GEN + g;
+            float *dst = s->pin_packed_main + (size_t)b * per_in_main;
+            memcpy(dst, x_host + (size_t)b * per_view, per_view * sizeof(float));
+        }
+    for (int b = 0; b < s->Beff_main; b++)
+        s->pin_ts_main[b] = (int64_t)timestep;
+
+    int c = s->active_chunk;
+    /* Make sure all conditioning kernels (set_conditioning ran on
+     * g_paint_stream too) are visible before we start capturing/launching. */
+    cuStreamSynchronize(g_paint_stream);
+
+    if (s->capture_state[c] == 0) {
+        /* Warm-up: run normally on g_paint_stream so all lazy allocations
+         * (FP8/BF16 scratch, im2col, transformer caches, skip stack growth)
+         * saturate before capture. */
+        unet_run_step_body(s);
+        cuStreamSynchronize(g_paint_stream);
+        memcpy(noise_pred_host, s->pin_noise_pred, s->x_n * sizeof(float));
+        s->capture_state[c] = 1;
+        return;
+    }
+    if (s->capture_state[c] == 1) {
+        /* Capture: bracket the same kernel sequence in BeginCapture/EndCapture. */
+        CUresult r = cuStreamBeginCapture(g_paint_stream,
+                                           CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+        if (r != CUDA_SUCCESS) {
+            fprintf(stderr, "[paint_stage_unet] BeginCapture failed (%d); falling back\n", r);
+            s->use_graph = 0;
+            paint_stage_unet_run_step(s, timestep, x_host, noise_pred_host);
+            return;
+        }
+        unet_run_step_body(s);
+        CUgraph g = NULL;
+        cuStreamEndCapture(g_paint_stream, &g);
+        if (!g) {
+            fprintf(stderr, "[paint_stage_unet] EndCapture returned NULL; disabling\n");
+            s->use_graph = 0;
+            cuStreamSynchronize(g_paint_stream);
+            memcpy(noise_pred_host, s->pin_noise_pred, s->x_n * sizeof(float));
+            return;
+        }
+        r = cuGraphInstantiate(&s->graph_exec[c], g, 0);
+        cuGraphDestroy(g);
+        if (r != CUDA_SUCCESS) {
+            fprintf(stderr, "[paint_stage_unet] cuGraphInstantiate failed (%d); disabling graph for chunk %d\n", r, c);
+            s->graph_exec[c] = NULL;
+            s->use_graph = 0;
+            cuStreamSynchronize(g_paint_stream);
+            memcpy(noise_pred_host, s->pin_noise_pred, s->x_n * sizeof(float));
+            return;
+        }
+        /* The capture itself executed the kernels (the in-flight stream still
+         * has them queued via the graph builder), so synchronize and read out
+         * the result for this step. */
+        cuStreamSynchronize(g_paint_stream);
+        memcpy(noise_pred_host, s->pin_noise_pred, s->x_n * sizeof(float));
+        s->capture_state[c] = 2;
+        fprintf(stderr, "[paint_stage_unet] graph captured for chunk %d\n", c);
+        return;
+    }
+    /* Replay. */
+    cuGraphLaunch(s->graph_exec[c], g_paint_stream);
+    cuStreamSynchronize(g_paint_stream);
+    memcpy(noise_pred_host, s->pin_noise_pred, s->x_n * sizeof(float));
 }
 
 void paint_stage_unet_destroy(paint_stage_unet *s) {
     if (!s) return;
     skip_stack_free(&s->ss_main);
     skip_stack_free(&s->ss_dual);
+    if (s->use_graph) {
+        for (int c = 0; c < PAINT_UNET_MAX_CHUNKS; c++)
+            if (s->graph_exec[c]) cuGraphExecDestroy(s->graph_exec[c]);
+        if (s->pin_packed_main) cuMemFreeHost(s->pin_packed_main);
+        if (s->pin_ts_main)     cuMemFreeHost(s->pin_ts_main);
+        if (s->pin_noise_pred)  cuMemFreeHost(s->pin_noise_pred);
+        if (s->stream) cuStreamDestroy(s->stream);
+        if (g_paint_stream == s->stream) g_paint_stream = 0;
+    }
     free(s->packed_main); free(s->packed_dual); free(s->text_tiled_main);
     if (s->kk.mod) cuModuleUnload(s->kk.mod);
     g_ra_mode = 0;
