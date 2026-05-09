@@ -222,6 +222,232 @@ static void k_attn(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr Q,
     cuLaunchKernel(kk->f_attn, grid, 1, 1, 128, 1, 1, smem, 0, args, NULL);
 }
 
+/* ===== TC dispatch state (Phase 4.13) =====================================
+ *
+ * Mirror of cuda_paint_unet_runner.h's FP8/BF16 dispatch infra, prefixed
+ * `pvae_` and `g_pvae_` so VAE TU and UNet TU don't collide on file-local
+ * statics. Call pvae_init_runtime(kk) once after kernel resolution to read
+ * env vars and decide which paths are eligible. Each k_conv/k_conv_down call
+ * then dispatches through the same gemm_fp8_v7_fused / gemm_bf16_v7 /
+ * gemm_*_pipe_*_scaled_f32 kernels the UNet uses.
+ */
+typedef struct {
+    CUdeviceptr w_f32;
+    CUdeviceptr w_fp8;
+    CUdeviceptr w_scale;
+    CUdeviceptr w_bf16;
+    int n_out, n_in;
+    float w_scale_host;
+} pvae_fp8_entry;
+
+#define PVAE_FP8_REG_MAX 1024
+static int g_pvae_use_fp8_gemm     = 0;
+static int g_pvae_use_fp8_gemm_mt4 = 0;
+static int g_pvae_use_bf16_gemm    = 0;
+static int g_pvae_use_fp8_v7       = 0;
+static int g_pvae_use_fp8_conv     = 0;
+static pvae_fp8_entry g_pvae_fp8_reg[PVAE_FP8_REG_MAX];
+static int    g_pvae_n_fp8_reg = 0;
+/* Conv scratch (xcol / yt). Lazy-grown. */
+static CUdeviceptr g_pvae_d_xcol = 0; static size_t g_pvae_xcol_max_bytes = 0;
+static CUdeviceptr g_pvae_d_yt   = 0; static size_t g_pvae_yt_max_bytes   = 0;
+/* BF16-quant activation scratch (gemm_bf16_v7 path). */
+static CUdeviceptr g_pvae_d_xbf = 0; static size_t g_pvae_xbf_max_elem = 0;
+/* FP8 v7 activation scratches: X_fp8 + per-tensor x_scale + x_max. */
+static CUdeviceptr g_pvae_d_xfp8 = 0; static size_t g_pvae_xfp8_max_elem = 0;
+static CUdeviceptr g_pvae_d_xscale = 0;
+static CUdeviceptr g_pvae_d_xmax   = 0;
+static CUdeviceptr g_pvae_v7_last_x = 0;
+static int         g_pvae_v7_last_n = 0;
+
+static int pvae_xfp8_ensure(size_t n_elem) {
+    size_t need = n_elem; /* uint8 */
+    if (need <= g_pvae_xfp8_max_elem && g_pvae_d_xfp8) return 0;
+    if (g_pvae_d_xfp8) { cuMemFree(g_pvae_d_xfp8); g_pvae_d_xfp8 = 0; }
+    if (cuMemAlloc(&g_pvae_d_xfp8, need) != CUDA_SUCCESS) {
+        g_pvae_d_xfp8 = 0; g_pvae_xfp8_max_elem = 0;
+        g_pvae_v7_last_x = 0; g_pvae_v7_last_n = 0;
+        return -1;
+    }
+    g_pvae_xfp8_max_elem = n_elem;
+    g_pvae_v7_last_x = 0; g_pvae_v7_last_n = 0;
+    if (!g_pvae_d_xscale) cuMemAlloc(&g_pvae_d_xscale, sizeof(float));
+    if (!g_pvae_d_xmax)   cuMemAlloc(&g_pvae_d_xmax,   sizeof(float));
+    return 0;
+}
+
+static int pvae_xbf_ensure(size_t n_elem) {
+    size_t need = n_elem * sizeof(unsigned short);
+    size_t cur  = g_pvae_xbf_max_elem * sizeof(unsigned short);
+    if (need <= cur) return 0;
+    if (g_pvae_d_xbf) { cuMemFree(g_pvae_d_xbf); g_pvae_d_xbf = 0; }
+    if (cuMemAlloc(&g_pvae_d_xbf, need) != CUDA_SUCCESS) {
+        g_pvae_d_xbf = 0; g_pvae_xbf_max_elem = 0; return -1;
+    }
+    g_pvae_xbf_max_elem = n_elem;
+    return 0;
+}
+
+static int pvae_conv_scratch_ensure(size_t xcol_bytes, size_t yt_bytes) {
+    if (xcol_bytes > g_pvae_xcol_max_bytes) {
+        if (g_pvae_d_xcol) cuMemFree(g_pvae_d_xcol);
+        g_pvae_d_xcol = 0;
+        if (cuMemAlloc(&g_pvae_d_xcol, xcol_bytes) != CUDA_SUCCESS) {
+            g_pvae_xcol_max_bytes = 0; g_pvae_d_xcol = 0; return -1;
+        }
+        g_pvae_xcol_max_bytes = xcol_bytes;
+    }
+    if (yt_bytes > g_pvae_yt_max_bytes) {
+        if (g_pvae_d_yt) cuMemFree(g_pvae_d_yt);
+        g_pvae_d_yt = 0;
+        if (cuMemAlloc(&g_pvae_d_yt, yt_bytes) != CUDA_SUCCESS) {
+            g_pvae_yt_max_bytes = 0; g_pvae_d_yt = 0; return -1;
+        }
+        g_pvae_yt_max_bytes = yt_bytes;
+    }
+    return 0;
+}
+
+static const pvae_fp8_entry *pvae_fp8_lookup(CUdeviceptr w_f32) {
+    for (int i = 0; i < g_pvae_n_fp8_reg; i++)
+        if (g_pvae_fp8_reg[i].w_f32 == w_f32) return &g_pvae_fp8_reg[i];
+    return NULL;
+}
+
+static int pvae_quantize_w_fp8(const pvae_kernels *kk, CUdeviceptr d_w_f32,
+                                int n_out, int n_in,
+                                CUdeviceptr *out_fp8, CUdeviceptr *out_scale) {
+    *out_fp8 = 0; *out_scale = 0;
+    if (!kk->f_reduce_max_abs || !kk->f_quantize_fp8 || !d_w_f32 ||
+        n_out <= 0 || n_in <= 0) return -1;
+    size_t n_elem     = (size_t)n_out * (size_t)n_in;
+    int    n_out_pad  = ((n_out + 255) / 256) * 256;
+    size_t n_elem_pad = (size_t)n_out_pad * (size_t)n_in;
+    CUdeviceptr d_max = 0, d_fp8 = 0, d_scale = 0;
+    if (cuMemAlloc(&d_max,   sizeof(float)) != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_fp8,   n_elem_pad)    != CUDA_SUCCESS) goto fail;
+    if (cuMemAlloc(&d_scale, sizeof(float)) != CUDA_SUCCESS) goto fail;
+    cuMemsetD8Async(d_fp8, 0, n_elem_pad, 0);
+    cuMemsetD8Async(d_max, 0, sizeof(float), 0);
+    int n = (int)n_elem;
+    {
+        void *args[] = {&d_max, &d_w_f32, &n};
+        cuLaunchKernel(kk->f_reduce_max_abs, (unsigned)((n + 255) / 256), 1, 1,
+                        256, 1, 1, 0, 0, args, NULL);
+    }
+    {
+        void *args[] = {&d_fp8, &d_scale, &d_w_f32, &d_max, &n};
+        cuLaunchKernel(kk->f_quantize_fp8, (unsigned)((n + 255) / 256), 1, 1,
+                        256, 1, 1, 0, 0, args, NULL);
+    }
+    cuCtxSynchronize();
+    cuMemFree(d_max);
+    *out_fp8 = d_fp8; *out_scale = d_scale;
+    return 0;
+fail:
+    if (d_max)   cuMemFree(d_max);
+    if (d_fp8)   cuMemFree(d_fp8);
+    if (d_scale) cuMemFree(d_scale);
+    return -1;
+}
+
+static void pvae_fp8_register(const pvae_kernels *kk, CUdeviceptr w_f32,
+                                int n_out, int n_in) {
+    if (!w_f32 || g_pvae_n_fp8_reg >= PVAE_FP8_REG_MAX) return;
+    if (n_in <= 0 || n_out <= 0 || (n_in % 32) != 0) return;
+    if (pvae_fp8_lookup(w_f32)) return;
+    CUdeviceptr fp8 = 0, sc = 0;
+    if (pvae_quantize_w_fp8(kk, w_f32, n_out, n_in, &fp8, &sc) != 0) return;
+    pvae_fp8_entry *e = &g_pvae_fp8_reg[g_pvae_n_fp8_reg++];
+    e->w_f32 = w_f32; e->w_fp8 = fp8; e->w_scale = sc; e->w_bf16 = 0;
+    e->n_out = n_out; e->n_in = n_in;
+    e->w_scale_host = 1.0f;
+    cuCtxSynchronize();
+    cuMemcpyDtoH(&e->w_scale_host, sc, sizeof(float));
+    /* Note: we keep w_f32 alive (unlike UNet which frees it). VAE weights are
+     * loaded by load_decoder/load_encoder via upload_st as raw F32; freeing
+     * here would invalidate caller-held pointers in pvae_decoder/encoder. The
+     * extra ~80MB is acceptable (encoder+decoder is small). */
+}
+
+static int pvae_try_fp8_v7(const pvae_kernels *kk,
+                            CUdeviceptr y, CUdeviceptr x,
+                            const pvae_fp8_entry *e, CUdeviceptr b,
+                            int M, int K, int N) {
+    if (!g_pvae_use_fp8_v7) return 0;
+    if (!kk->f_gemm_fp8_v7_fused || !kk->f_quantize_fp8 || !kk->f_reduce_max_abs)
+        return 0;
+    if (!e || !e->w_fp8 || !e->w_scale) return 0;
+    if ((K % 64) != 0 || M < 1) return 0;
+    size_t n_elem = (size_t)M * (size_t)K;
+    if (pvae_xfp8_ensure(n_elem) != 0) return 0;
+    int n = (int)n_elem;
+    if (!(g_pvae_v7_last_x == x && g_pvae_v7_last_n == n)) {
+        cuMemsetD32Async(g_pvae_d_xmax, 0, 1, 0);
+        {
+            void *args[] = {&g_pvae_d_xmax, &x, &n};
+            cuLaunchKernel(kk->f_reduce_max_abs,
+                            (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                            0, 0, args, NULL);
+        }
+        {
+            void *args[] = {&g_pvae_d_xfp8, &g_pvae_d_xscale, &x,
+                             &g_pvae_d_xmax, &n};
+            cuLaunchKernel(kk->f_quantize_fp8,
+                            (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                            0, 0, args, NULL);
+        }
+        g_pvae_v7_last_x = x; g_pvae_v7_last_n = n;
+    }
+    CUdeviceptr w_fp8 = e->w_fp8;
+    float w_scale_val = e->w_scale_host;
+    int has_bias = (b != 0) ? 1 : 0;
+    int accumulate = 0;
+    int Mv = M, Nv = N, Kv = K;
+    void *gargs[] = {&y, &g_pvae_d_xfp8, &w_fp8, &b,
+                     &g_pvae_d_xscale, &w_scale_val, &has_bias,
+                     &accumulate, &Mv, &Nv, &Kv};
+    unsigned npx = (unsigned)((N + 127) / 128);
+    unsigned npy = (unsigned)((M + 63) / 64);
+    unsigned gx  = (npx + 3u) & ~3u;
+    unsigned gy  = (npy + 3u) & ~3u;
+    unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
+    cuLaunchKernel(kk->f_gemm_fp8_v7_fused, gx, gy, 1, 256, 1, 1,
+                    smem_bytes, 0, gargs, NULL);
+    return 1;
+}
+
+/* Read env gates and decide which TC paths are live. Defaults ON when the
+ * required kernels are present (mirrors UNet). Disable individually with
+ *   PAINT_VAE_FP8_GEMM=0  PAINT_VAE_BF16_GEMM=0
+ *   PAINT_VAE_FP8_V7=0    PAINT_VAE_FP8_CONV=0
+ */
+static void pvae_init_runtime(const pvae_kernels *kk) {
+    int env_fp8   = 1, env_bf16 = 1, env_v7 = 1, env_conv = 1, env_mt4 = 1;
+    const char *e;
+    if ((e = getenv("PAINT_VAE_FP8_GEMM")) && atoi(e) == 0) env_fp8 = 0;
+    if ((e = getenv("PAINT_VAE_BF16_GEMM"))&& atoi(e) == 0) env_bf16 = 0;
+    if ((e = getenv("PAINT_VAE_FP8_V7"))   && atoi(e) == 0) env_v7  = 0;
+    if ((e = getenv("PAINT_VAE_FP8_CONV")) && atoi(e) == 0) env_conv = 0;
+    if ((e = getenv("PAINT_VAE_FP8_MT4"))  && atoi(e) == 0) env_mt4  = 0;
+    g_pvae_use_fp8_gemm     = env_fp8  && (kk->f_gemm_fp8 || kk->f_gemm_fp8_mt4) &&
+                              kk->f_reduce_max_abs && kk->f_quantize_fp8;
+    g_pvae_use_fp8_gemm_mt4 = env_mt4 && g_pvae_use_fp8_gemm && kk->f_gemm_fp8_mt4;
+    g_pvae_use_bf16_gemm    = env_bf16 && kk->f_gemm_bf16_v7 && kk->f_quant_bf16 &&
+                              kk->f_add_bias_f32 && kk->f_reduce_max_abs &&
+                              kk->f_quantize_fp8;
+    g_pvae_use_fp8_v7       = env_v7  && kk->f_gemm_fp8_v7_fused &&
+                              kk->f_reduce_max_abs && kk->f_quantize_fp8;
+    g_pvae_use_fp8_conv     = env_conv && kk->f_im2col_3x3_p1 &&
+                              kk->f_im2col_3x3_p1_s2 && kk->f_t_hwc_chw &&
+                              kk->f_chw_nc &&
+                              (g_pvae_use_fp8_gemm || g_pvae_use_bf16_gemm ||
+                               g_pvae_use_fp8_v7);
+    fprintf(stderr, "[pvae] TC dispatch: fp8=%d bf16=%d v7=%d conv=%d mt4=%d\n",
+            g_pvae_use_fp8_gemm, g_pvae_use_bf16_gemm,
+            g_pvae_use_fp8_v7, g_pvae_use_fp8_conv, g_pvae_use_fp8_gemm_mt4);
+}
+
 /* ===== ResBlock ============================================================
  * h = norm1(x) ; silu ; conv1(h)
  * h = norm2(h) ; silu ; conv2(h)
