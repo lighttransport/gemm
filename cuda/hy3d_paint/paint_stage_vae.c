@@ -123,6 +123,7 @@ paint_stage_vae *paint_stage_vae_create(CUdevice dev, const char *vae_path) {
     }
     if (cuModuleGetFunction(&s->kk.f_gemm_fp8_v7_fused, s->kk.mod, "gemm_fp8_v7_fused") != CUDA_SUCCESS)
         s->kk.f_gemm_fp8_v7_fused = NULL;
+    pvae_init_runtime(&s->kk);
 
     st_context *st = safetensors_open(vae_path);
     if (!st) {
