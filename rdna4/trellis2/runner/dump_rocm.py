@@ -96,6 +96,15 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--pipeline-type', default='512', choices=['512'])
     ap.add_argument('--dump-per-step', action='store_true')
+    ap.add_argument('--export-glb', action='store_true',
+                    help='After stage 15, run postprocess_mesh and write textured.glb '
+                         'to --output-dir.')
+    ap.add_argument('--texture-size', type=int, default=1024)
+    ap.add_argument('--decimation-target', type=int, default=100000,
+                    help='Target face count for o_voxel.postprocess.to_glb '
+                         '(matches the official example.py knob). The shape '
+                         'decoder produces ~3M faces at res=512; the official '
+                         'pipeline always decimates before texgen.')
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -273,6 +282,39 @@ def main():
     }
     with open(os.path.join(args.output_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2, default=str)
+
+    if args.export_glb:
+        # Wrap raw mesh + tex_voxels into MeshWithVoxel (mirrors what
+        # Trellis2ImageTo3DPipeline.decode_latent does), then call the
+        # official o_voxel.postprocess.to_glb path (Branch 1 — non-remesh):
+        # decimation + cleanup + UV unwrap + texture baking via the
+        # cumesh_xatlas shim. Branch 2 (remesh_narrow_band_dc) is not ported.
+        import o_voxel
+        from trellis2.representations.mesh import MeshWithVoxel
+        m = MeshWithVoxel(
+            mesh.vertices, mesh.faces,
+            origin=[-0.5, -0.5, -0.5], voxel_size=1 / res,
+            coords=tex_voxels.coords[:, 1:],
+            attrs=tex_voxels.feats,
+            voxel_shape=torch.Size([*tex_voxels.shape, *tex_voxels.spatial_shape]),
+            layout=pipeline.pbr_attr_layout,
+        )
+        decim = args.decimation_target if args.decimation_target > 0 else 100000
+        print(f'[glb] o_voxel.postprocess.to_glb decim={decim} '
+              f'tex={args.texture_size}', flush=True)
+        glb = o_voxel.postprocess.to_glb(
+            vertices=m.vertices, faces=m.faces,
+            attr_volume=m.attrs, coords=m.coords,
+            attr_layout=m.layout, voxel_size=m.voxel_size,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=decim,
+            texture_size=args.texture_size,
+            remesh=False,
+            verbose=True,
+        )
+        out_glb = os.path.join(args.output_dir, 'textured.glb')
+        glb.export(out_glb)
+        print(f'[glb] wrote {out_glb}', flush=True)
 
     print(f'[done] {len(MANIFEST)} dumps -> {args.output_dir}', flush=True)
     if torch.cuda.is_available():
