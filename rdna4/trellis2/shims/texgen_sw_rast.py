@@ -9,7 +9,14 @@ Input pos is 2D UV in clip space ([-1,1], z=0, w=1), so this is 2D triangle rast
 UV unwrap produces non-overlapping charts, so no depth test is needed.
 """
 
+import numpy as np
 import torch
+
+try:
+    from numba import njit, prange
+    _HAVE_NUMBA = True
+except ImportError:
+    _HAVE_NUMBA = False
 
 
 class RasterizeCudaContext:
@@ -19,6 +26,67 @@ class RasterizeCudaContext:
 
 def _edge(ax, ay, bx, by, px, py):
     return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+
+
+if _HAVE_NUMBA:
+    @njit(cache=True, parallel=True, fastmath=True)
+    def _rasterize_numba(tri_c, px_c, py_c, zow_c, H, W, rast_np):
+        F = tri_c.shape[0]
+        for f in prange(F):
+            i0 = tri_c[f, 0]
+            i1 = tri_c[f, 1]
+            i2 = tri_c[f, 2]
+            ax = px_c[i0]; ay = py_c[i0]
+            bx = px_c[i1]; by = py_c[i1]
+            cx = px_c[i2]; cy = py_c[i2]
+            z0 = zow_c[i0]; z1 = zow_c[i1]; z2 = zow_c[i2]
+
+            area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+            if area == 0.0:
+                continue
+            inv_area = 1.0 / area
+
+            xmin_f = ax if ax < bx else bx
+            if cx < xmin_f:
+                xmin_f = cx
+            xmax_f = ax if ax > bx else bx
+            if cx > xmax_f:
+                xmax_f = cx
+            ymin_f = ay if ay < by else by
+            if cy < ymin_f:
+                ymin_f = cy
+            ymax_f = ay if ay > by else by
+            if cy > ymax_f:
+                ymax_f = cy
+
+            xmin = int(np.floor(xmin_f))
+            if xmin < 0:
+                xmin = 0
+            xmax = int(np.ceil(xmax_f))
+            if xmax > W - 1:
+                xmax = W - 1
+            ymin = int(np.floor(ymin_f))
+            if ymin < 0:
+                ymin = 0
+            ymax = int(np.ceil(ymax_f))
+            if ymax > H - 1:
+                ymax = H - 1
+            if xmax < xmin or ymax < ymin:
+                continue
+
+            tid = np.float32(f + 1)
+            for y in range(ymin, ymax + 1):
+                py = np.float32(y) + np.float32(0.5)
+                for x in range(xmin, xmax + 1):
+                    px = np.float32(x) + np.float32(0.5)
+                    w0 = ((bx - px) * (cy - py) - (by - py) * (cx - px)) * inv_area
+                    w1 = ((cx - px) * (ay - py) - (cy - py) * (ax - px)) * inv_area
+                    w2 = 1.0 - w0 - w1
+                    if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                        rast_np[y, x, 0] = w1
+                        rast_np[y, x, 1] = w2
+                        rast_np[y, x, 2] = w0 * z0 + w1 * z1 + w2 * z2
+                        rast_np[y, x, 3] = tid
 
 
 def rasterize(ctx, pos, tri, resolution):
@@ -44,14 +112,17 @@ def rasterize(ctx, pos, tri, resolution):
 
     rast = torch.zeros((1, H, W, 4), dtype=torch.float32, device=device)
 
-    px_c = px.cpu().numpy()
-    py_c = py.cpu().numpy()
-    zow_c = zow.cpu().numpy()
-    tri_c = tri_i.cpu().numpy()
+    px_c = px.cpu().numpy().astype(np.float32)
+    py_c = py.cpu().numpy().astype(np.float32)
+    zow_c = zow.cpu().numpy().astype(np.float32)
+    tri_c = tri_i.cpu().numpy().astype(np.int64)
 
-    # allocate on CPU then copy; triangles are small and sparse in image.
-    import numpy as np
     rast_np = np.zeros((H, W, 4), dtype=np.float32)
+
+    if _HAVE_NUMBA:
+        _rasterize_numba(tri_c, px_c, py_c, zow_c, H, W, rast_np)
+        rast[0] = torch.from_numpy(rast_np).to(device)
+        return rast, None
 
     for f in range(F):
         i0, i1, i2 = tri_c[f]
