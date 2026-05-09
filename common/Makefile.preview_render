@@ -1,0 +1,35 @@
+# Build preview_render CLI: renders a trellis2 mesh.safetensors with
+# analytic sun+sky lighting using the lightrt SBVH backend.
+#
+#   make -f Makefile.preview_render
+#
+# Output:
+#   preview_render
+
+CXX      ?= g++
+CXXFLAGS ?= -std=c++17 -O3 \
+            -Wall -Wextra -fopenmp \
+            -msse2 -mavx -mavx2 -mfma -mf16c
+
+TARGET = preview_render
+SRCS   = preview_render_main.cc lightrt.cc tinyexr_impl.cc
+HDRS   = preview_render.h lightrt.hh mesh_io.h safetensors.h \
+         stb_image.h stb_image_write.h tinyexr.h
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS) $(HDRS) stb_image_write_impl.o
+	$(CXX) $(CXXFLAGS) -I. $(SRCS) stb_image_write_impl.o -o $@ -fopenmp -lpthread
+
+# stb_image_write needs its own translation unit to define the implementation
+# without duplicating it across files.
+stb_image_write_impl.o: stb_image_write.h
+	echo '#define STB_IMAGE_WRITE_IMPLEMENTATION' > _stbiw.cc
+	echo '#include "stb_image_write.h"' >> _stbiw.cc
+	$(CXX) $(CXXFLAGS) -I. -c _stbiw.cc -o $@
+	rm -f _stbiw.cc
+
+clean:
+	rm -f $(TARGET) stb_image_write_impl.o _stbiw.cc
