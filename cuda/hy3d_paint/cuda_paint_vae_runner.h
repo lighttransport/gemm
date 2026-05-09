@@ -140,9 +140,11 @@ typedef struct {
     CUfunction f_chw_nc;   /* vae_chw_to_nc_f32 */
     CUfunction f_nc_chw;   /* vae_nc_to_chw_f32 */
     /* TC dispatch (Phase 4.13): may be NULL if compile/lookup failed. */
-    CUfunction f_im2col_3x3_p1;     /* pvae_im2col_3x3_p1_f32 */
-    CUfunction f_im2col_3x3_p1_s2;  /* pvae_im2col_3x3_p1_s2_f32 */
-    CUfunction f_t_hwc_chw;         /* pvae_t_hwc_to_chw_f32 */
+    CUfunction f_im2col_3x3_p1;        /* pvae_im2col_3x3_p1_f32 */
+    CUfunction f_im2col_3x3_p1_s2;     /* pvae_im2col_3x3_p1_s2_f32 */
+    CUfunction f_im2col_3x3_p1_tiled;  /* pvae_im2col_3x3_p1_tiled_f32 */
+    CUfunction f_t_hwc_chw;            /* pvae_t_hwc_to_chw_f32 */
+    CUfunction f_t_hwc_chw_tiled;      /* pvae_t_hwc_to_chw_tiled_f32 */
     CUfunction f_gemm_fp8;          /* gemm_bf16_pipe_scaled_f32 */
     CUfunction f_gemm_fp8_mt4;      /* gemm_bf16_pipe_mt4_scaled_f32 */
     CUfunction f_gemm_fp8_v7_fused; /* gemm_fp8_v7_fused */
@@ -163,63 +165,6 @@ static void k_groupnorm(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
     /* PVAE_GN_THREADS=128, smem = threads*4 bytes */
     cuLaunchKernel(kk->f_gn, (unsigned)num_groups, 1, 1, 128, 1, 1,
                     128 * sizeof(float), 0, args, NULL);
-}
-
-static void k_conv(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
-                    CUdeviceptr w, CUdeviceptr b,
-                    int ci, int h, int wd, int co, int kh, int kw, int pad) {
-    void *args[] = { &out, &in, &w, &b, &ci, &h, &wd, &co, &kh, &kw, &pad };
-    int total = co * h * wd;
-    unsigned grid = (unsigned)((total + 255) / 256);
-    cuLaunchKernel(kk->f_conv, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
-}
-
-static void k_conv_down(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
-                          CUdeviceptr w, CUdeviceptr b,
-                          int ci, int h, int wd, int co) {
-    void *args[] = { &out, &in, &w, &b, &ci, &h, &wd, &co };
-    int oh = h >> 1, ow = wd >> 1;
-    int total = co * oh * ow;
-    unsigned grid = (unsigned)((total + 255) / 256);
-    cuLaunchKernel(kk->f_conv_down, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
-}
-
-static void k_up2x(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
-                    int C, int H, int W) {
-    void *args[] = { &out, &in, &C, &H, &W };
-    int total = C * (H*2) * (W*2);
-    unsigned grid = (unsigned)((total + 255) / 256);
-    cuLaunchKernel(kk->f_up2x, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
-}
-
-static void k_add(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr a,
-                   CUdeviceptr b, int n) {
-    void *args[] = { &out, &a, &b, &n };
-    unsigned grid = (unsigned)((n + 255) / 256);
-    cuLaunchKernel(kk->f_add, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
-}
-
-static void k_chw_to_nc(const pvae_kernels *kk, CUdeviceptr out,
-                          CUdeviceptr in, int C, int N) {
-    void *args[] = { &out, &in, &C, &N };
-    unsigned gx = (unsigned)((N + 255) / 256);
-    cuLaunchKernel(kk->f_chw_nc, gx, (unsigned)C, 1, 256, 1, 1, 0, 0, args, NULL);
-}
-
-static void k_nc_to_chw(const pvae_kernels *kk, CUdeviceptr out,
-                          CUdeviceptr in, int C, int N) {
-    void *args[] = { &out, &in, &C, &N };
-    unsigned gx = (unsigned)((N + 255) / 256);
-    cuLaunchKernel(kk->f_nc_chw, gx, (unsigned)C, 1, 256, 1, 1, 0, 0, args, NULL);
-}
-
-static void k_attn(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr Q,
-                    CUdeviceptr K, CUdeviceptr V, int N, int dim, float scale) {
-    void *args[] = { &out, &Q, &K, &V, &N, &dim, &scale };
-    /* WARPS=4 -> 4 query rows per CTA, 128 threads. smem = 2*BKV(8)*dim*4. */
-    unsigned grid = (unsigned)((N + 4 - 1) / 4);
-    size_t smem = 2 * 8 * dim * sizeof(float);
-    cuLaunchKernel(kk->f_attn, grid, 1, 1, 128, 1, 1, smem, 0, args, NULL);
 }
 
 /* ===== TC dispatch state (Phase 4.13) =====================================
@@ -306,6 +251,19 @@ static int pvae_conv_scratch_ensure(size_t xcol_bytes, size_t yt_bytes) {
         g_pvae_yt_max_bytes = yt_bytes;
     }
     return 0;
+}
+
+/* Release transient TC scratch (xcol/yt/xbf). Safe to call between encode and
+ * decode phases — buffers are lazily reallocated via pvae_conv_scratch_ensure
+ * on the next k_conv* dispatch. Use to give VRAM back before downstream stages
+ * (e.g., UNet weights load) on memory-tight GPUs. */
+static void pvae_free_scratch(void) {
+    if (g_pvae_d_xcol) { cuMemFree(g_pvae_d_xcol); g_pvae_d_xcol = 0; }
+    g_pvae_xcol_max_bytes = 0;
+    if (g_pvae_d_yt)   { cuMemFree(g_pvae_d_yt);   g_pvae_d_yt   = 0; }
+    g_pvae_yt_max_bytes = 0;
+    if (g_pvae_d_xbf)  { cuMemFree(g_pvae_d_xbf);  g_pvae_d_xbf  = 0; }
+    g_pvae_xbf_max_elem = 0;
 }
 
 static const pvae_fp8_entry *pvae_fp8_lookup(CUdeviceptr w_f32) {
@@ -446,6 +404,256 @@ static void pvae_init_runtime(const pvae_kernels *kk) {
     fprintf(stderr, "[pvae] TC dispatch: fp8=%d bf16=%d v7=%d conv=%d mt4=%d\n",
             g_pvae_use_fp8_gemm, g_pvae_use_bf16_gemm,
             g_pvae_use_fp8_v7, g_pvae_use_fp8_conv, g_pvae_use_fp8_gemm_mt4);
+    (void)pvae_conv_scratch_ensure;
+}
+
+/* TC GEMM helper used by k_conv / k_conv_down: dispatches the GEMM half of
+ *   y[hw, co] = xcol[hw, K] @ Wt[co, K] (+ bias)
+ * into FP8 v7 / BF16 v7 / FP8-pipe-MT4 / FP8-pipe in priority order.
+ * Returns 1 on dispatch (caller still does the t_hwc_chw transpose).
+ * `xcol_in_pvae_d_xcol`: input (M=hw rows, K cols) lives in g_pvae_d_xcol.
+ * `out_in_pvae_d_yt`: output (M rows, N=co cols) goes to g_pvae_d_yt. */
+__attribute__((unused))
+static int pvae_dispatch_conv_gemm(const pvae_kernels *kk, CUdeviceptr w_f32,
+                                    CUdeviceptr b, int M, int K, int N) {
+    if (!w_f32) return 0;
+    const pvae_fp8_entry *e = pvae_fp8_lookup(w_f32);
+    if (!e) { pvae_fp8_register(kk, w_f32, N, K); e = pvae_fp8_lookup(w_f32); }
+    if (!e || e->n_out != N || e->n_in != K) return 0;
+    /* FP8 v7 fused (folds bias + descale into writeback). */
+    if (g_pvae_use_fp8_v7 &&
+        pvae_try_fp8_v7(kk, g_pvae_d_yt, g_pvae_d_xcol, e, b, M, K, N)) {
+        return 1;
+    }
+    /* BF16 v7: quant_bf16(xcol) -> gemm_bf16_v7 -> add_bias_inplace_f32. */
+    if (g_pvae_use_bf16_gemm && e->w_bf16 == 0) {
+        /* register didn't allocate BF16 mirror because UNet's path isn't
+         * using cast_bf16; skip here -- pvae_fp8_register already populates
+         * w_bf16 only when use_bf16 is set, but VAE has no f_cast_bf16
+         * (the bf16-prelude doesn't add it). Fall through to FP8 pipe. */
+    }
+    if (g_pvae_use_bf16_gemm && e->w_bf16 && kk->f_gemm_bf16_v7 &&
+        kk->f_quant_bf16 && kk->f_add_bias_f32) {
+        size_t n_elem = (size_t)M * (size_t)K;
+        if (pvae_xbf_ensure(n_elem) == 0) {
+            int n = (int)n_elem;
+            void *qargs[] = {&g_pvae_d_xbf, &g_pvae_d_xcol, &n};
+            cuLaunchKernel(kk->f_quant_bf16,
+                            (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1,
+                            0, 0, qargs, NULL);
+            int Mv = M, Nv = N, Kv = K;
+            CUdeviceptr w_bf = e->w_bf16;
+            unsigned npx = (unsigned)((Nv + 127) / 128);
+            unsigned npy = (unsigned)((Mv + 63) / 64);
+            unsigned gxv = (npx + 3u) & ~3u;
+            unsigned gyv = (npy + 3u) & ~3u;
+            unsigned smemv = 2u * (64u * 32u + 128u * 32u) * 2u;
+            void *gargs[] = {&g_pvae_d_yt, &g_pvae_d_xbf, &w_bf, &Mv, &Nv, &Kv};
+            cuLaunchKernel(kk->f_gemm_bf16_v7, gxv, gyv, 1, 256, 1, 1,
+                            smemv, 0, gargs, NULL);
+            int has_bias = (b != 0) ? 1 : 0;
+            int rows = M, cols = N;
+            void *bargs[] = {&g_pvae_d_yt, &b, &rows, &cols, &has_bias};
+            unsigned bx = 256;
+            unsigned gxd = (unsigned)((cols + bx - 1) / bx);
+            unsigned gyd = (unsigned)rows;
+            cuLaunchKernel(kk->f_add_bias_f32, gxd, gyd, 1, bx, 1, 1,
+                            0, 0, bargs, NULL);
+            return 1;
+        }
+    }
+    /* FP8-pipe scaled (BF16 weight x F32 act, scaled). */
+    if (g_pvae_use_fp8_gemm) {
+        int n_out = N, n_in = K, n_tok = M;
+        CUdeviceptr w_fp8 = e->w_fp8, w_scale = e->w_scale;
+        void *gargs[] = { &g_pvae_d_yt, &w_fp8, &g_pvae_d_xcol, &b,
+                          &n_out, &n_in, &n_tok, &w_scale };
+        unsigned gx = (unsigned)((N + 255) / 256); gx = (gx + 3u) & ~3u;
+        if (g_pvae_use_fp8_gemm_mt4 && kk->f_gemm_fp8_mt4 && M >= 64) {
+            unsigned gy = (unsigned)((M + 63) / 64); gy = (gy + 3u) & ~3u;
+            size_t smem = 4096 + 8192 * 2;
+            cuLaunchKernel(kk->f_gemm_fp8_mt4, gx, gy, 1, 128, 1, 1,
+                            smem, 0, gargs, NULL);
+            return 1;
+        }
+        if (kk->f_gemm_fp8) {
+            unsigned gy = (unsigned)((M + 31) / 32); gy = (gy + 3u) & ~3u;
+            size_t smem = 2048 + 8192 * 2;
+            cuLaunchKernel(kk->f_gemm_fp8, gx, gy, 1, 128, 1, 1,
+                            smem, 0, gargs, NULL);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void k_conv(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                    CUdeviceptr w, CUdeviceptr b,
+                    int ci, int h, int wd, int co, int kh, int kw, int pad) {
+    /* Budget cap: skip TC if im2col scratch would exceed 512MB. Large convs
+     * (e.g., decoder up_res ci=256 at 512x512 needs xcol=2.4GB) blow VRAM
+     * and cause downstream cuMemAlloc OOM in UNet stage. */
+    const size_t XCOL_BUDGET = (size_t)1024 * 1024 * 1024;
+    if (g_pvae_use_fp8_conv && kh == 1 && kw == 1 && pad == 0 &&
+        (ci % 32) == 0 && co >= 32 && w) {
+        int hw = h * wd;
+        size_t xcol_bytes = (size_t)hw * ci * sizeof(float);
+        size_t yt_bytes   = (size_t)hw * co * sizeof(float);
+        if (xcol_bytes <= XCOL_BUDGET &&
+            pvae_conv_scratch_ensure(xcol_bytes, yt_bytes) == 0) {
+            int C_arg = ci, N_arg = hw;
+            void *cargs[] = { &g_pvae_d_xcol, &in, &C_arg, &N_arg };
+            cuLaunchKernel(kk->f_chw_nc, (unsigned)((hw + 255) / 256),
+                            (unsigned)ci, 1, 256, 1, 1, 0, 0, cargs, NULL);
+            if (pvae_dispatch_conv_gemm(kk, w, b, hw, ci, co)) {
+                int co_arg = co, hw_arg = hw;
+                void *targs[] = { &out, &g_pvae_d_yt, &co_arg, &hw_arg };
+                cuLaunchKernel(kk->f_t_hwc_chw,
+                                (unsigned)((co + 31) / 32), (unsigned)((hw + 7) / 8),
+                                1, 32, 8, 1, 0, 0, targs, NULL);
+                return;
+            }
+        }
+    }
+    if (g_pvae_use_fp8_conv && kh == 3 && kw == 3 && pad == 1 &&
+        (ci % 32) == 0 && co >= 32 && w) {
+        int K = ci * 9;
+        int hw = h * wd;
+        size_t xcol_bytes = (size_t)hw * K * sizeof(float);
+        size_t yt_bytes   = (size_t)hw * co * sizeof(float);
+        if (xcol_bytes <= XCOL_BUDGET &&
+            pvae_conv_scratch_ensure(xcol_bytes, yt_bytes) == 0) {
+            int ci_arg = ci, h_arg = h, w_arg = wd;
+            void *im_args[] = { &g_pvae_d_xcol, &in, &ci_arg, &h_arg, &w_arg };
+            cuLaunchKernel(kk->f_im2col_3x3_p1,
+                            (unsigned)((K + 31) / 32), (unsigned)((hw + 7) / 8),
+                            1, 32, 8, 1, 0, 0, im_args, NULL);
+            if (pvae_dispatch_conv_gemm(kk, w, b, hw, K, co)) {
+                int co_arg = co, hw_arg = hw;
+                void *targs[] = { &out, &g_pvae_d_yt, &co_arg, &hw_arg };
+                cuLaunchKernel(kk->f_t_hwc_chw,
+                                (unsigned)((co + 31) / 32), (unsigned)((hw + 7) / 8),
+                                1, 32, 8, 1, 0, 0, targs, NULL);
+                return;
+            }
+        }
+        /* Tiled fallback: xcol exceeds budget, chunk along output rows.
+         * Requires tiled im2col + tiled transpose kernels. */
+        if (xcol_bytes > XCOL_BUDGET &&
+            kk->f_im2col_3x3_p1_tiled && kk->f_t_hwc_chw_tiled) {
+            size_t row_bytes = (size_t)K * sizeof(float) +
+                               (size_t)co * sizeof(float);
+            int chunk_rows = (int)(XCOL_BUDGET / row_bytes);
+            if (chunk_rows > hw) chunk_rows = hw;
+            if (chunk_rows >= 8) {
+                size_t cx_bytes = (size_t)chunk_rows * K * sizeof(float);
+                size_t cy_bytes = (size_t)chunk_rows * co * sizeof(float);
+                if (pvae_conv_scratch_ensure(cx_bytes, cy_bytes) == 0) {
+                    int dispatched_all = 1;
+                    for (int row_off = 0; row_off < hw; row_off += chunk_rows) {
+                        int rows = chunk_rows;
+                        if (row_off + rows > hw) rows = hw - row_off;
+                        int ci_arg = ci, h_arg = h, w_arg = wd;
+                        int roff = row_off, nrows = rows;
+                        void *im_args[] = { &g_pvae_d_xcol, &in, &ci_arg,
+                                            &h_arg, &w_arg, &roff, &nrows };
+                        cuLaunchKernel(kk->f_im2col_3x3_p1_tiled,
+                                        (unsigned)((K + 31) / 32),
+                                        (unsigned)((rows + 7) / 8), 1,
+                                        32, 8, 1, 0, 0, im_args, NULL);
+                        if (!pvae_dispatch_conv_gemm(kk, w, b, rows, K, co)) {
+                            dispatched_all = 0; break;
+                        }
+                        int co_arg = co, hw_arg2 = h * wd;
+                        (void)hw_arg2;
+                        void *targs[] = { &out, &g_pvae_d_yt, &co_arg,
+                                          &hw_arg2, &roff, &nrows };
+                        cuLaunchKernel(kk->f_t_hwc_chw_tiled,
+                                        (unsigned)((co + 31) / 32),
+                                        (unsigned)((rows + 7) / 8), 1,
+                                        32, 8, 1, 0, 0, targs, NULL);
+                    }
+                    if (dispatched_all) return;
+                }
+            }
+        }
+    }
+    void *args[] = { &out, &in, &w, &b, &ci, &h, &wd, &co, &kh, &kw, &pad };
+    int total = co * h * wd;
+    unsigned grid = (unsigned)((total + 255) / 256);
+    cuLaunchKernel(kk->f_conv, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_conv_down(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                          CUdeviceptr w, CUdeviceptr b,
+                          int ci, int h, int wd, int co) {
+    if (g_pvae_use_fp8_conv && (ci % 32) == 0 && co >= 32 && w) {
+        int K = ci * 9;
+        int oh = h >> 1, ow = wd >> 1;
+        int ohw = oh * ow;
+        size_t xcol_bytes = (size_t)ohw * K * sizeof(float);
+        size_t yt_bytes   = (size_t)ohw * co * sizeof(float);
+        const size_t XCOL_BUDGET = (size_t)1024 * 1024 * 1024;
+        if (xcol_bytes <= XCOL_BUDGET &&
+            pvae_conv_scratch_ensure(xcol_bytes, yt_bytes) == 0) {
+            int ci_arg = ci, h_arg = h, w_arg = wd;
+            void *im_args[] = { &g_pvae_d_xcol, &in, &ci_arg, &h_arg, &w_arg };
+            cuLaunchKernel(kk->f_im2col_3x3_p1_s2,
+                            (unsigned)((K + 31) / 32), (unsigned)((ohw + 7) / 8),
+                            1, 32, 8, 1, 0, 0, im_args, NULL);
+            if (pvae_dispatch_conv_gemm(kk, w, b, ohw, K, co)) {
+                int co_arg = co, ohw_arg = ohw;
+                void *targs[] = { &out, &g_pvae_d_yt, &co_arg, &ohw_arg };
+                cuLaunchKernel(kk->f_t_hwc_chw,
+                                (unsigned)((co + 31) / 32), (unsigned)((ohw + 7) / 8),
+                                1, 32, 8, 1, 0, 0, targs, NULL);
+                return;
+            }
+        }
+    }
+    void *args[] = { &out, &in, &w, &b, &ci, &h, &wd, &co };
+    int oh = h >> 1, ow = wd >> 1;
+    int total = co * oh * ow;
+    unsigned grid = (unsigned)((total + 255) / 256);
+    cuLaunchKernel(kk->f_conv_down, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_up2x(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                    int C, int H, int W) {
+    void *args[] = { &out, &in, &C, &H, &W };
+    int total = C * (H*2) * (W*2);
+    unsigned grid = (unsigned)((total + 255) / 256);
+    cuLaunchKernel(kk->f_up2x, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_add(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr a,
+                   CUdeviceptr b, int n) {
+    void *args[] = { &out, &a, &b, &n };
+    unsigned grid = (unsigned)((n + 255) / 256);
+    cuLaunchKernel(kk->f_add, grid, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_chw_to_nc(const pvae_kernels *kk, CUdeviceptr out,
+                          CUdeviceptr in, int C, int N) {
+    void *args[] = { &out, &in, &C, &N };
+    unsigned gx = (unsigned)((N + 255) / 256);
+    cuLaunchKernel(kk->f_chw_nc, gx, (unsigned)C, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_nc_to_chw(const pvae_kernels *kk, CUdeviceptr out,
+                          CUdeviceptr in, int C, int N) {
+    void *args[] = { &out, &in, &C, &N };
+    unsigned gx = (unsigned)((N + 255) / 256);
+    cuLaunchKernel(kk->f_nc_chw, gx, (unsigned)C, 1, 256, 1, 1, 0, 0, args, NULL);
+}
+
+static void k_attn(const pvae_kernels *kk, CUdeviceptr out, CUdeviceptr Q,
+                    CUdeviceptr K, CUdeviceptr V, int N, int dim, float scale) {
+    void *args[] = { &out, &Q, &K, &V, &N, &dim, &scale };
+    /* WARPS=4 -> 4 query rows per CTA, 128 threads. smem = 2*BKV(8)*dim*4. */
+    unsigned grid = (unsigned)((N + 4 - 1) / 4);
+    size_t smem = 2 * 8 * dim * sizeof(float);
+    cuLaunchKernel(kk->f_attn, grid, 1, 1, 128, 1, 1, smem, 0, args, NULL);
 }
 
 /* ===== ResBlock ============================================================
