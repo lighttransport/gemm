@@ -108,7 +108,9 @@ paint_stage_vae *paint_stage_vae_create(CUdevice dev, const char *vae_path) {
     /* TC dispatch (optional; nullified if not present). */
     if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1,    s->kk.mod, "pvae_im2col_3x3_p1_f32")    != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1    = NULL;
     if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1_s2, s->kk.mod, "pvae_im2col_3x3_p1_s2_f32") != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1_s2 = NULL;
+    if (cuModuleGetFunction(&s->kk.f_im2col_3x3_p1_tiled, s->kk.mod, "pvae_im2col_3x3_p1_tiled_f32") != CUDA_SUCCESS) s->kk.f_im2col_3x3_p1_tiled = NULL;
     if (cuModuleGetFunction(&s->kk.f_t_hwc_chw,        s->kk.mod, "pvae_t_hwc_to_chw_f32")     != CUDA_SUCCESS) s->kk.f_t_hwc_chw        = NULL;
+    if (cuModuleGetFunction(&s->kk.f_t_hwc_chw_tiled,  s->kk.mod, "pvae_t_hwc_to_chw_tiled_f32") != CUDA_SUCCESS) s->kk.f_t_hwc_chw_tiled  = NULL;
     if (cuModuleGetFunction(&s->kk.f_gemm_fp8_mt4,     s->kk.mod, "gemm_bf16_pipe_mt4_scaled_f32") != CUDA_SUCCESS) s->kk.f_gemm_fp8_mt4   = NULL;
     if (cuModuleGetFunction(&s->kk.f_gemm_fp8,         s->kk.mod, "gemm_bf16_pipe_scaled_f32")     != CUDA_SUCCESS) s->kk.f_gemm_fp8       = NULL;
     if (cuModuleGetFunction(&s->kk.f_reduce_max_abs,   s->kk.mod, "reduce_max_abs_f32")            != CUDA_SUCCESS) s->kk.f_reduce_max_abs = NULL;
@@ -123,6 +125,11 @@ paint_stage_vae *paint_stage_vae_create(CUdevice dev, const char *vae_path) {
     }
     if (cuModuleGetFunction(&s->kk.f_gemm_fp8_v7_fused, s->kk.mod, "gemm_fp8_v7_fused") != CUDA_SUCCESS)
         s->kk.f_gemm_fp8_v7_fused = NULL;
+    if (s->kk.f_gemm_fp8_v7_fused) {
+        cuFuncSetAttribute(s->kk.f_gemm_fp8_v7_fused,
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           24 * 1024);
+    }
     pvae_init_runtime(&s->kk);
 
     st_context *st = safetensors_open(vae_path);
@@ -157,6 +164,11 @@ void paint_stage_vae_encode(paint_stage_vae *s,
                              CUdeviceptr d_vnc, CUdeviceptr d_ync) {
     encode(&s->kk, &s->enc, d_img, img_h, img_w, d_lat,
            d_a, d_b, d_t1, d_t2, d_qnc, d_knc, d_vnc, d_ync);
+}
+
+void paint_stage_vae_free_scratch(paint_stage_vae *s) {
+    (void)s;
+    pvae_free_scratch();
 }
 
 void paint_stage_vae_destroy(paint_stage_vae *s) {

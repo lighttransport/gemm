@@ -690,6 +690,9 @@ static int cmd_chain(int argc, char **argv) {
     free(img_chw);
     cuCtxSynchronize();
     fprintf(stderr, "[chain-time] vae_encode: %.3fs\n", mono_s() - _t_stage);
+    /* Free VAE TC scratch (xcol/yt/xbf, can be ~1GB) before loading UNet
+     * weights — VAE decode reallocates lazily on first call. */
+    paint_stage_vae_free_scratch(vae);
     _t_stage = mono_s();
 
     paint_stage_unet *u = paint_stage_unet_create(dev, unet_path, &cfg);

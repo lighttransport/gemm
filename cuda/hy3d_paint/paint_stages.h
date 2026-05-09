@@ -40,6 +40,9 @@ void paint_stage_vae_encode(paint_stage_vae *s,
                              CUdeviceptr d_vnc, CUdeviceptr d_ync);
 
 void paint_stage_vae_destroy(paint_stage_vae *s);
+/* Release transient TC scratch (xcol/yt/xbf) without unloading the module —
+ * call between encode and UNet load to give VRAM back. */
+void paint_stage_vae_free_scratch(paint_stage_vae *s);
 
 /* ===== UNet stage =========================================================
  * Wraps the dual-stream UNet2p5DConditionModel + per-step scheduler-driven
