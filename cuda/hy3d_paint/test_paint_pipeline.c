@@ -442,6 +442,11 @@ static int cmd_back_project(int argc, char **argv) {
 
 /* ===== subcommand: chain (full pipeline demo) =========================== */
 
+static inline double mono_s(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static int cmd_chain(int argc, char **argv) {
     if (argc < 10) {
         fprintf(stderr,
@@ -462,6 +467,9 @@ static int cmd_chain(int argc, char **argv) {
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) return 1;
     cuInit(0); CUdevice dev; cuDeviceGet(&dev, 0);
     CUcontext ctx; cuCtxCreate(&ctx, 0, dev);
+
+    double _t_start = mono_s();
+    double _t_stage = _t_start;
 
     /* 1. view_maps */
     obj_mesh m = {0};
@@ -511,6 +519,9 @@ static int cmd_chain(int argc, char **argv) {
     cuMemFree(d_n); cuMemFree(d_p); cuMemFree(d_de); cuMemFree(d_vi); cuMemFree(d_co);
     /* vm + m stay alive — needed below for xatlas unwrap, atlas raster,
      * and OBJ writeout. */
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] view_maps: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
 
     /* 2. dinov2g */
     int nd; uint64_t sh[8]; size_t nn; char dt[8];
@@ -523,6 +534,9 @@ static int cmd_chain(int argc, char **argv) {
     fprintf(stderr, "[chain] dinov2g: encoded ref image -> [1,257,1536]\n");
     free(dg_in);
     paint_stage_dinov2g_destroy(dg);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] dinov2g: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
 
     /* 3. VAE-encode 2 selected views of normal/position into unet conditioning
      * latents [B=1,N_gen=2,4,64,64] (replaces synthetic random embeds the
@@ -674,6 +688,9 @@ static int cmd_chain(int argc, char **argv) {
         }
     }
     free(img_chw);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] vae_encode: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
 
     paint_stage_unet *u = paint_stage_unet_create(dev, unet_path, &cfg);
     if (!u) return 1;
@@ -845,6 +862,9 @@ static int cmd_chain(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &_ts1);
     fprintf(stderr, "[chain] unet total: %.2fs (%d steps cfg=%d)\n",
             (_ts1.tv_sec-_ts0.tv_sec)+(_ts1.tv_nsec-_ts0.tv_nsec)*1e-9, N_steps, cfg_mode);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] unet: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
     const float inv = 1.0f/0.18215f; for (size_t k=0;k<x_n;k++) x[k]*=inv;
     fprintf(stderr, "[chain] unet: %d UniPC steps -> %d latents\n", N_steps, Beff);
     snprintf(path, sizeof(path), "%s/chain_latents.npy", outdir);
@@ -876,6 +896,9 @@ static int cmd_chain(int argc, char **argv) {
         }
     }
     fprintf(stderr, "[chain] vae: %d latents -> %d RGB views @ %d²\n", Beff, Beff, OH);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] vae_decode: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
     snprintf(path, sizeof(path), "%s/chain_views.npy", outdir);
     int sv[4]={Beff,3,OH,OW}; npy_write_f32(path, views, sv, 4);
     free(x); cuMemFree(d_img); cuMemFree(d_lat);
@@ -921,6 +944,9 @@ static int cmd_chain(int argc, char **argv) {
                         Htex, Wtex, tex_pos, tex_cov);
     int n_cov = 0; for (size_t i = 0; i < tex_nn; i++) n_cov += tex_cov[i];
     fprintf(stderr, "[chain] uv-raster: %d / %zu texels covered\n", n_cov, tex_nn);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] xatlas_uv_raster: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
     { int sp[3]={Htex,Wtex,3}, sc[2]={Htex,Wtex};
       char p2[1024];
       snprintf(p2,sizeof(p2),"%s/chain_tex_pos.npy",outdir); npy_write_f32(p2,tex_pos,sp,3);
@@ -978,6 +1004,9 @@ static int cmd_chain(int argc, char **argv) {
         if ((mask[i]>0)!=(trust_ref[i]>0)) mm++;
         if (mask[i]>0||trust_ref[i]>0) for (int k=0;k<3;k++){double d=fabs(bake[i*3+k]-bake_ref[i*3+k]); if(d>mx)mx=d;}
     }
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] back_project: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
     fprintf(stderr, "[chain] back-project: N=%d Htex=%d mask_mismatch=%d max_diff=%.3e\n",
             Nv, Htex, mm, mx);
 
@@ -1028,6 +1057,8 @@ static int cmd_chain(int argc, char **argv) {
     free(bake); free(mask); free(tex_pos); free(tex_cov); free(bake_ref); free(trust_ref);
     free(views);
     paint_stage_back_project_destroy(bp);
+    fprintf(stderr, "[chain-time] inpaint_write: %.3fs\n", mono_s() - _t_stage);
+    fprintf(stderr, "[chain-time] TOTAL: %.3fs\n", mono_s() - _t_start);
     cuCtxDestroy(ctx);
     fprintf(stderr, "[chain] DONE — outputs in %s\n", outdir);
     return 0;
