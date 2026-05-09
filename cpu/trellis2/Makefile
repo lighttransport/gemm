@@ -54,7 +54,7 @@ HEADERS = $(wildcard $(COMMON)/*.h)
 
 .PHONY: all clean
 
-all: test_trellis2 test_tex_dec test_shape_dec
+all: test_trellis2 test_tex_dec test_shape_dec test_shape_dec_dump
 
 test_trellis2: test_trellis2.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
@@ -65,5 +65,8 @@ test_tex_dec: test_tex_dec.c $(HEADERS)
 test_shape_dec: test_shape_dec.c $(HEADERS)
 	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
 
+test_shape_dec_dump: test_shape_dec_dump.c $(HEADERS)
+	$(CC) $(CFLAGS) -I$(COMMON) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f test_trellis2 test_tex_dec test_shape_dec
+	rm -f test_trellis2 test_tex_dec test_shape_dec test_shape_dec_dump
