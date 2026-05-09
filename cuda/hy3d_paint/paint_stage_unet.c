@@ -728,11 +728,9 @@ static void unet_run_step_body(paint_stage_unet *s) {
     run_up_block(&s->kk, &s->ub[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
     run_up_block(&s->kk, &s->ub[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
 
-    for (int b = 0; b < s->Beff_main; b++) {
-        CUdeviceptr xb = s->ws.d_a + (CUdeviceptr)b * 320 * H * W * sizeof(float);
-        CUdeviceptr yb = s->ws.d_b + (CUdeviceptr)b * 320 * H * W * sizeof(float);
-        k_groupnorm(&s->kk, yb, xb, s->ng, s->nb_w, 320, H * W, 32, 1);
-    }
+    /* Output GN batched in one launch over all Beff_main samples. */
+    k_groupnorm_batched(&s->kk, s->ws.d_b, s->ws.d_a, s->ng, s->nb_w,
+                         320, H * W, 32, 1, s->Beff_main);
     for (int b = 0; b < s->Beff_main; b++) {
         CUdeviceptr yb = s->ws.d_b + (CUdeviceptr)b * 320 * H * W * sizeof(float);
         CUdeviceptr ob = s->ws.d_a + (CUdeviceptr)b * 4   * H * W * sizeof(float);
