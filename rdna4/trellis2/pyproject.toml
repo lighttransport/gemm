@@ -10,7 +10,7 @@ dependencies = [
     "Pillow>=10",
     "tqdm",
     "trimesh",
-    "fast_simplification",
+    "open3d",
     "plyfile",
     "zstandard",
     "easydict",
