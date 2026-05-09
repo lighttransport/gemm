@@ -21,6 +21,14 @@ DUMP_PER_STEP_FLAG=""
 if [[ "${DUMP_PER_STEP:-0}" == "1" ]]; then
     DUMP_PER_STEP_FLAG="--dump-per-step"
 fi
+EXPORT_GLB_FLAG=""
+if [[ "${EXPORT_GLB:-0}" == "1" ]]; then
+    EXPORT_GLB_FLAG="--export-glb"
+fi
+DECIM_FLAG=""
+if [[ -n "${DECIMATION_TARGET:-}" ]]; then
+    DECIM_FLAG="--decimation-target ${DECIMATION_TARGET}"
+fi
 
 mkdir -p "$OUTDIR"
 
@@ -47,6 +55,8 @@ DINOV3_WEIGHTS="$DINOV3" RDNA4_DIR="$RDNA4_T2_DIR" REPO_DIR="$REPO_ROOT/cpu/trel
         --output-dir "$OUTDIR" \
         --pipeline-type 512 \
         --seed "$SEED" \
-        $DUMP_PER_STEP_FLAG
+        $DUMP_PER_STEP_FLAG \
+        $EXPORT_GLB_FLAG \
+        $DECIM_FLAG
 
 echo "ROCm dumps -> $OUTDIR"
