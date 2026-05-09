@@ -51,12 +51,24 @@ struct paint_stage_unet {
     CUdeviceptr l1_w, l1_b, l2_w, l2_b;          /* main */
     CUdeviceptr l1_wd, l1_bd, l2_wd, l2_bd;      /* dual */
 
-    /* Pre-tiled text inputs */
+    /* Pre-tiled text inputs (active pointers; swapped by set_chunk to point
+     * into per-chunk cache below). */
     CUdeviceptr d_text_dual, d_text_m;
 
-    /* Pre-tiled DINO conditioning (set_conditioning fills d_dino) */
+    /* Pre-tiled DINO conditioning (active pointer; per-chunk cache below). */
     CUdeviceptr d_dino;
     int M_dino;                                  /* T_dino * EXTRA = T_dino * 4 */
+
+    /* Per-chunk conditioning cache: conditioning per CFG chunk is invariant
+     * across timesteps (uncond/ref/full), so we tile + project once per chunk
+     * instead of every step. set_chunk() repoints d_text_m/d_text_dual/d_dino
+     * at the right cache slot; set_conditioning() fills the slot only if
+     * empty (cond_cached[chunk]==0). Preserves bit-identity (same input ->
+     * same cached tensor) and saves ~80ms × 3*N_steps per chain. */
+    CUdeviceptr d_text_m_chunk[PAINT_UNET_MAX_CHUNKS];
+    CUdeviceptr d_text_dual_chunk[PAINT_UNET_MAX_CHUNKS];
+    CUdeviceptr d_dino_chunk[PAINT_UNET_MAX_CHUNKS];
+    int cond_cached[PAINT_UNET_MAX_CHUNKS];
 
     /* DINO projection weights (resident; reused per set_conditioning) */
     CUdeviceptr dino_pw, dino_pb, dino_png, dino_pnb;
@@ -257,6 +269,7 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
     if (cuModuleGetFunction(&s->kk.f_cast_bf16,         s->kk.mod, "cast_f32_to_bf16")        != CUDA_SUCCESS) s->kk.f_cast_bf16 = NULL;
     if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64,    s->kk.mod, "flash_attn_bf16_hd64")    != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64 = NULL;
     if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64_xq, s->kk.mod, "flash_attn_bf16_hd64_xq") != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64_xq = NULL;
+    if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64_xq_b64, s->kk.mod, "flash_attn_bf16_hd64_xq_b64") != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64_xq_b64 = NULL;
     /* Initialize the FP8→BF16 LUT used by other MMA kernels (the attn path
      * doesn't read it, but the module global must exist when present). */
     {
@@ -568,6 +581,7 @@ void paint_stage_unet_set_conditioning(paint_stage_unet *s,
     const int N_PBR = cfg->N_pbr, N_GEN = cfg->N_gen;
     const size_t per_view = s->per_view, per_in_main = s->per_in_main;
     const size_t txt_per = s->txt_per;
+    const int chunk = s->active_chunk;
 
     /* Pack en/ep into the conditioning slots of packed_main.
      * Layout: per-batch dst[12,H,W] with channel slots [sample | normal | position]. */
@@ -582,6 +596,19 @@ void paint_stage_unet_set_conditioning(paint_stage_unet *s,
     /* Dual ref latents */
     memcpy(s->packed_dual, ref_latents, (size_t)s->Beff_dual * per_view * sizeof(float));
 
+    /* Per-chunk cache fast path: conditioning is invariant across timesteps
+     * for a given chunk, so we only build text/dual/dino tensors once. The
+     * caller still passes (en/ep, ref_latents) every step because those feed
+     * the input pack above; the cache only short-circuits the device tensors
+     * downstream of set_conditioning. */
+    if (s->cond_cached[chunk]) {
+        s->d_text_m    = s->d_text_m_chunk[chunk];
+        s->d_text_dual = s->d_text_dual_chunk[chunk];
+        s->d_dino      = s->d_dino_chunk[chunk];
+        s->cond_set = 1;
+        return;
+    }
+
     /* Tile text per material */
     for (int p = 0; p < N_PBR; p++)
         for (int g = 0; g < N_GEN; g++) {
@@ -590,14 +617,16 @@ void paint_stage_unet_set_conditioning(paint_stage_unet *s,
                    encoder_hidden_states + (size_t)p * txt_per,
                    txt_per * sizeof(float));
         }
-    if (!s->d_text_m)
-        cuMemAlloc(&s->d_text_m, (size_t)s->Beff_main * txt_per * sizeof(float));
+    if (!s->d_text_m_chunk[chunk])
+        cuMemAlloc(&s->d_text_m_chunk[chunk], (size_t)s->Beff_main * txt_per * sizeof(float));
+    s->d_text_m = s->d_text_m_chunk[chunk];
     cuMemcpyHtoD(s->d_text_m, s->text_tiled_main, (size_t)s->Beff_main * txt_per * sizeof(float));
 
     /* Dual text: broadcast learned_text_clip_ref [1, M_text, cross_dim] to
      * Beff_dual rows. */
-    if (!s->d_text_dual)
-        cuMemAlloc(&s->d_text_dual, (size_t)s->Beff_dual * txt_per * sizeof(float));
+    if (!s->d_text_dual_chunk[chunk])
+        cuMemAlloc(&s->d_text_dual_chunk[chunk], (size_t)s->Beff_dual * txt_per * sizeof(float));
+    s->d_text_dual = s->d_text_dual_chunk[chunk];
     for (int b = 0; b < s->Beff_dual; b++)
         cuMemcpyDtoD(s->d_text_dual + (CUdeviceptr)b * txt_per * sizeof(float),
                      s->d_text_clip_ref, txt_per * sizeof(float));
@@ -616,13 +645,15 @@ void paint_stage_unet_set_conditioning(paint_stage_unet *s,
         cuMemcpyHtoD(d_din, dino_hidden_states, (size_t)T * Cin * sizeof(float));
         k_linear(&s->kk, d_dlin, d_din, s->dino_pw, s->dino_pb, T, Cin, EXTRA * CTX);
         k_layernorm(&s->kk, d_done, d_dlin, s->dino_png, s->dino_pnb, rows_out, CTX);
-        if (!s->d_dino)
-            cuMemAlloc(&s->d_dino, (size_t)s->Beff_main * dino_per);
+        if (!s->d_dino_chunk[chunk])
+            cuMemAlloc(&s->d_dino_chunk[chunk], (size_t)s->Beff_main * dino_per);
+        s->d_dino = s->d_dino_chunk[chunk];
         for (int b = 0; b < s->Beff_main; b++)
             cuMemcpyDtoD(s->d_dino + (CUdeviceptr)b * dino_per, d_done, dino_per);
         cuMemFree(d_din); cuMemFree(d_dlin); cuMemFree(d_done);
     }
 
+    s->cond_cached[chunk] = 1;
     s->cond_set = 1;
     /* Note: do NOT reset chunk_dual_done here — set_conditioning may be called
      * once per step (cheap rebuild of conditioning device buffers) while the
@@ -638,6 +669,13 @@ void paint_stage_unet_set_chunk(paint_stage_unet *s, int chunk_id) {
     s->active_chunk = chunk_id;
     g_ra_cache.slots = s->ra_slots[chunk_id];
     g_ra_cache.idx = 0;
+    /* Repoint conditioning pointers at the chunk's cache slot. May be 0 the
+     * first time; set_conditioning will allocate + fill on next call. */
+    if (s->cond_cached[chunk_id]) {
+        s->d_text_m    = s->d_text_m_chunk[chunk_id];
+        s->d_text_dual = s->d_text_dual_chunk[chunk_id];
+        s->d_dino      = s->d_dino_chunk[chunk_id];
+    }
 }
 
 void paint_stage_unet_run_dual(paint_stage_unet *s) {
@@ -886,6 +924,11 @@ void paint_stage_unet_destroy(paint_stage_unet *s) {
         if (s->pin_noise_pred)  cuMemFreeHost(s->pin_noise_pred);
         if (s->stream) cuStreamDestroy(s->stream);
         if (g_paint_stream == s->stream) g_paint_stream = 0;
+    }
+    for (int c = 0; c < PAINT_UNET_MAX_CHUNKS; c++) {
+        if (s->d_text_m_chunk[c])    cuMemFree(s->d_text_m_chunk[c]);
+        if (s->d_text_dual_chunk[c]) cuMemFree(s->d_text_dual_chunk[c]);
+        if (s->d_dino_chunk[c])      cuMemFree(s->d_dino_chunk[c]);
     }
     free(s->packed_main); free(s->packed_dual); free(s->text_tiled_main);
     if (s->kk.mod) cuModuleUnload(s->kk.mod);
