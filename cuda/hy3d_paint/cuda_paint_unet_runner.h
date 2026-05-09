@@ -376,6 +376,12 @@ static int g_paint_fp8_debug = 0;
 static int g_paint_profile = 0;
 static const char *g_paint_last_kernel = "(none)";
 
+/* Active stream for all UNet GPU work. Defaults to the legacy default stream
+ * (NULL); set to a non-default stream by paint_stage_unet_set_stream() to
+ * enable CUDA graph capture. The launch wrapper substitutes this in for any
+ * `stream=0` argument so callers don't need to thread the stream explicitly. */
+static CUstream g_paint_stream = 0;
+
 #define PAINT_PROF_MAX 64
 static const char *g_paint_prof_name[PAINT_PROF_MAX];
 static double      g_paint_prof_ms  [PAINT_PROF_MAX];
@@ -422,6 +428,8 @@ static inline CUresult paint_dbg_launch(const char *name, CUfunction f,
         unsigned gx, unsigned gy, unsigned gz,
         unsigned bx, unsigned by, unsigned bz,
         unsigned smem, CUstream stream, void **args, void **extra) {
+    /* Substitute the active capture stream when caller passed stream=0. */
+    if (stream == 0) stream = g_paint_stream;
     g_paint_launch_idx++;
     unsigned long idx = g_paint_launch_idx;
     if (g_paint_profile) {
@@ -481,7 +489,7 @@ static int paint_try_fp8_v7(const pu_kernels *kk,
     if (paint_xfp8_ensure(n_elem) != 0) return 0;
     int n = (int)n_elem;
     if (!(g_paint_fp8v7_last_x == x && g_paint_fp8v7_last_n == n)) {
-        cuMemsetD32Async(g_paint_d_xmax, 0, 1, 0);
+        cuMemsetD32Async(g_paint_d_xmax, 0, 1, g_paint_stream);
         {
             void *args[] = {&g_paint_d_xmax, &x, &n};
             cuLaunchKernel(kk->f_reduce_max_abs,
@@ -1146,7 +1154,7 @@ static void run_resblock(const pu_kernels *kk, const pu_resblock *r,
     int c_max = r->c_in > r->c_out ? r->c_in : r->c_out;
     size_t scratch_stride = (size_t)c_max * sp * sizeof(float);
     /* time embedding: silu(d_temb) -> linear(1280, c_out). Once for all B. */
-    cuMemcpyDtoD(d_temb_act, d_temb, (size_t)B * 1280 * sizeof(float));
+    cuMemcpyDtoDAsync(d_temb_act, d_temb, (size_t)B * 1280 * sizeof(float), g_paint_stream);
     k_silu(kk, d_temb_act, B * 1280);
     k_linear(kk, d_temb_proj, d_temb_act, r->temb_w, r->temb_b, B, 1280, r->c_out);
     /* Per-batch CHW path (groupnorm/conv kernels are single-sample). */
@@ -1468,7 +1476,7 @@ static void run_transformer(const pu_kernels *kk, const pu_transformer *T,
     int N = H * W;
     int sp = N;
     /* residual = x */
-    cuMemcpyDtoD(S->d_resid, d_x, (size_t)B * C * sp * sizeof(float));
+    cuMemcpyDtoDAsync(S->d_resid, d_x, (size_t)B * C * sp * sizeof(float), g_paint_stream);
     /* GroupNorm in CHW (no fused silu) */
     /* The kernel expects single-batch CHW; loop over B */
     for (int b = 0; b < B; b++) {
@@ -1509,7 +1517,7 @@ static void run_transformer(const pu_kernels *kk, const pu_transformer *T,
                 cuMemAlloc(&sl->d, bytes);
                 sl->B = B; sl->NL = N; sl->C = C;
             }
-            cuMemcpyDtoD(sl->d, S->d_norm, bytes);
+            cuMemcpyDtoDAsync(sl->d, S->d_norm, bytes, g_paint_stream);
         }
         if (T->has_mda && T->n_pbr > 0 && T->n_gen > 0) {
             int n_pbr = T->n_pbr, n_gen = T->n_gen;
@@ -1844,7 +1852,7 @@ static void skip_push_copy(pu_skip_stack *ss, CUdeviceptr src, int C, int H, int
         cuMemAlloc(&ss->s[idx].buf, sz);
         ss->cap[idx] = sz;
     }
-    cuMemcpyDtoD(ss->s[idx].buf, src, sz);
+    cuMemcpyDtoDAsync(ss->s[idx].buf, src, sz, g_paint_stream);
     ss->s[idx].channels = C; ss->s[idx].H = H; ss->s[idx].W = W;
     ss->top++;
 }
@@ -1914,7 +1922,7 @@ static void run_down_block(const pu_kernels *kk, const pu_down_block *db,
         H >>= 1; W >>= 1;
         skip_push_copy(ss, d_out, Cout, H, W);
         /* Make d_in the "current" buffer for next block */
-        cuMemcpyDtoD(d_in, d_out, (size_t)B * Cout * H * W * sizeof(float));
+        cuMemcpyDtoDAsync(d_in, d_out, (size_t)B * Cout * H * W * sizeof(float), g_paint_stream);
     }
     /* After this fn, the "current" tensor lives in d_in. */
     *pH = H; *pW = W;
@@ -1974,7 +1982,7 @@ static void run_up_block(const pu_kernels *kk, const pu_up_block *ub,
         if (ub->has_xfm)
             run_xfm_inplace(kk, &ub->xfm[i], d_out, d_text, d_dino, M_dino, B, H, W, M_text, &ws->X);
         /* swap: next iter's "current" is in d_in */
-        cuMemcpyDtoD(d_in, d_out, (size_t)B * out_str);
+        cuMemcpyDtoDAsync(d_in, d_out, (size_t)B * out_str, g_paint_stream);
     }
     /* upsample if any: nearest 2x then 3x3 conv. d_in -> d_out -> d_in */
     if (ub->up_w) {
