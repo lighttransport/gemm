@@ -677,11 +677,18 @@ t2_shape_dec_result t2_shape_dec_forward_guided(t2_shape_dec *d,
     for (int stage = 0; stage < d->n_stages; stage++) {
         if (d->c2s[stage].conv1_w) required_guide_stages++;
     }
+    /* Allow fewer guide stages than required if T2SD_STOP_AFTER_STAGE env is
+     * set — caller is requesting an early exit before reaching the unguided
+     * stages. Otherwise demand exact match. */
     if (guide && guide->n_stages != required_guide_stages) {
-        fprintf(stderr, "shape_dec: guide stage mismatch: got %d, expected %d\n",
-                guide->n_stages, required_guide_stages);
-        sp3d_free(t);
-        return result;
+        const char *stop_env = getenv("T2SD_STOP_AFTER_STAGE");
+        int allow_partial = stop_env && atoi(stop_env) < guide->n_stages;
+        if (!allow_partial) {
+            fprintf(stderr, "shape_dec: guide stage mismatch: got %d, expected %d\n",
+                    guide->n_stages, required_guide_stages);
+            sp3d_free(t);
+            return result;
+        }
     }
 
     int guide_stage = 0;
@@ -713,6 +720,39 @@ t2_shape_dec_result t2_shape_dec_forward_guided(t2_shape_dec *d,
             t = t_new;
             fprintf(stderr, "  c2s: -> N=%d, C=%d (%.1f s)\n",
                     t->N, t->C, (t2sd_time_ms() - ts1) / 1000.0);
+        }
+        /* Optional early exit for HIP cross-validation: dump t->feats after
+         * stage `T2SD_STOP_AFTER_STAGE`'s C2S to `T2SD_DUMP_PATH` (.npy [N,C]).
+         * Returns a result with feats=raw stage features (no output_layer). */
+        {
+            const char *stop_env = getenv("T2SD_STOP_AFTER_STAGE");
+            if (stop_env && atoi(stop_env) == stage) {
+                const char *p = getenv("T2SD_DUMP_PATH");
+                if (p && p[0]) {
+                    FILE *f = fopen(p, "wb");
+                    if (f) {
+                        char hdr[256]; int hl = snprintf(hdr, sizeof hdr,
+                            "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                            t->N, t->C);
+                        while ((hl + 10) % 16 != 0) hdr[hl++] = ' ';
+                        hdr[hl++] = '\n'; hdr[hl] = 0;
+                        fwrite("\x93NUMPY\x01\x00", 1, 8, f);
+                        uint16_t hl16 = (uint16_t)hl; fwrite(&hl16, 2, 1, f);
+                        fwrite(hdr, 1, hl, f);
+                        fwrite(t->feats, sizeof(float), (size_t)t->N * t->C, f);
+                        fclose(f);
+                        fprintf(stderr, "shape_dec: dumped post-stage-%d to %s [%d,%d]\n",
+                                stage, p, t->N, t->C);
+                    }
+                }
+                result.feats = (float *)malloc((size_t)t->N * t->C * sizeof(float));
+                memcpy(result.feats, t->feats, (size_t)t->N * t->C * sizeof(float));
+                result.coords = (int32_t *)malloc((size_t)t->N * 4 * sizeof(int32_t));
+                memcpy(result.coords, t->coords, (size_t)t->N * 4 * sizeof(int32_t));
+                result.N = t->N; result.C = t->C;
+                sp3d_free(t);
+                return result;
+            }
         }
     }
 
