@@ -635,7 +635,7 @@ static void k_groupnorm(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
     float eps = 1e-5f;
     void *args[] = { &out, &in, &g, &b, &C, &spatial, &num_groups, &do_silu, &eps };
     cuLaunchKernel(kk->f_gn, (unsigned)num_groups, 1, 1, 128, 1, 1,
-                    128 * sizeof(float), 0, args, NULL);
+                    2 * 128 * sizeof(float), 0, args, NULL);
 }
 
 static void k_add_chan(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr a,
