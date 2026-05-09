@@ -91,6 +91,12 @@ struct paint_stage_unet {
 
     /* Whether conditioning has been set */
     int cond_set;
+
+    /* Persistent skip-connection pools — buffers grow on first use and are
+     * reused across all subsequent steps (avoids cuMemAlloc/Free in the hot
+     * path; required for CUDA graph capture). */
+    pu_skip_stack ss_main;
+    pu_skip_stack ss_dual;
 };
 
 paint_stage_unet *paint_stage_unet_create(CUdevice dev,
@@ -614,18 +620,19 @@ void paint_stage_unet_run_dual(paint_stage_unet *s) {
         CUdeviceptr ob = s->ws.d_a     + (CUdeviceptr)b * 320     * H0 * W0 * sizeof(float);
         k_conv(&s->kk, ob, ib, s->cw_d, s->cb_d, IC_dual, H0, W0, 320, 3, 3, 1);
     }
-    pu_skip_stack ssd = {.top = 0, .B = s->Beff_dual};
-    skip_push_copy(&ssd, s->ws.d_a, 320, H0, W0);
+    pu_skip_stack *ssd = &s->ss_dual;
+    ssd->top = 0; ssd->B = s->Beff_dual;
+    skip_push_copy(ssd, s->ws.d_a, 320, H0, W0);
     int H = H0, W = W0;
-    run_down_block(&s->kk, &s->dbd[0], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
-    run_down_block(&s->kk, &s->dbd[1], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
-    run_down_block(&s->kk, &s->dbd[2], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
-    run_down_block(&s->kk, &s->dbd[3], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
+    run_down_block(&s->kk, &s->dbd[0], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
+    run_down_block(&s->kk, &s->dbd[1], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
+    run_down_block(&s->kk, &s->dbd[2], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
+    run_down_block(&s->kk, &s->dbd[3], s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
     run_mid_block(&s->kk, &s->midd, s->ws.d_a, s->ws.d_b, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, H, W, M_text, &s->ws);
-    run_up_block(&s->kk, &s->ubd[0], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
-    run_up_block(&s->kk, &s->ubd[1], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
-    run_up_block(&s->kk, &s->ubd[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
-    run_up_block(&s->kk, &s->ubd[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, &ssd);
+    run_up_block(&s->kk, &s->ubd[0], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
+    run_up_block(&s->kk, &s->ubd[1], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
+    run_up_block(&s->kk, &s->ubd[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
+    run_up_block(&s->kk, &s->ubd[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_d, s->d_text_dual, 0, 0, s->Beff_dual, &H, &W, M_text, &s->ws, ssd);
     s->chunk_dual_done[s->active_chunk] = 1;
     fprintf(stderr, "[paint_stage_unet] dual-stream RA cache populated for chunk %d (%d slots)\n",
             s->active_chunk, g_ra_cache.idx);
@@ -673,17 +680,18 @@ void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
         CUdeviceptr ob = s->ws.d_a     + (CUdeviceptr)b * 320     * H0 * W0 * sizeof(float);
         k_conv(&s->kk, ob, ib, s->cw, s->cb, IC_main, H0, W0, 320, 3, 3, 1);
     }
-    pu_skip_stack ss = {.top = 0, .B = s->Beff_main};
-    skip_push_copy(&ss, s->ws.d_a, 320, H0, W0);
-    run_down_block(&s->kk, &s->db[0], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
-    run_down_block(&s->kk, &s->db[1], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
-    run_down_block(&s->kk, &s->db[2], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
-    run_down_block(&s->kk, &s->db[3], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
+    pu_skip_stack *ss = &s->ss_main;
+    ss->top = 0; ss->B = s->Beff_main;
+    skip_push_copy(ss, s->ws.d_a, 320, H0, W0);
+    run_down_block(&s->kk, &s->db[0], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+    run_down_block(&s->kk, &s->db[1], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+    run_down_block(&s->kk, &s->db[2], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+    run_down_block(&s->kk, &s->db[3], s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
     run_mid_block(&s->kk, &s->mid, s->ws.d_a, s->ws.d_b, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, H, W, M_text, &s->ws);
-    run_up_block(&s->kk, &s->ub[0], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
-    run_up_block(&s->kk, &s->ub[1], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
-    run_up_block(&s->kk, &s->ub[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
-    run_up_block(&s->kk, &s->ub[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, &ss);
+    run_up_block(&s->kk, &s->ub[0], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+    run_up_block(&s->kk, &s->ub[1], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+    run_up_block(&s->kk, &s->ub[2], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
+    run_up_block(&s->kk, &s->ub[3], s->ws.d_a, s->ws.d_b, s->d_concat, s->d_temb_m, s->d_text_m, s->d_dino, s->M_dino, s->Beff_main, &H, &W, M_text, &s->ws, ss);
 
     for (int b = 0; b < s->Beff_main; b++) {
         CUdeviceptr xb = s->ws.d_a + (CUdeviceptr)b * 320 * H * W * sizeof(float);
@@ -701,6 +709,8 @@ void paint_stage_unet_run_step(paint_stage_unet *s, long long timestep,
 
 void paint_stage_unet_destroy(paint_stage_unet *s) {
     if (!s) return;
+    skip_stack_free(&s->ss_main);
+    skip_stack_free(&s->ss_dual);
     free(s->packed_main); free(s->packed_dual); free(s->text_tiled_main);
     if (s->kk.mod) cuModuleUnload(s->kk.mod);
     g_ra_mode = 0;

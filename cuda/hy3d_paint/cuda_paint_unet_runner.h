@@ -1824,20 +1824,38 @@ typedef struct {
     int H, W;
 } pu_skip;
 
+/* Skip-stack as a slot pool: each slot keeps its allocated size and is reused
+ * across steps. Eliminates cuMemAlloc/cuMemFree from the per-step hot path
+ * (matters for CUDA graph capture, which forbids stream-unordered allocs) and
+ * shaves the alloc/free overhead from the steady state. */
 typedef struct {
     pu_skip s[16];
-    int top;
-    int B;   /* batch shared across all entries (set per stack) */
+    size_t  cap[16];         /* allocated bytes per slot (0 if not yet allocated) */
+    int     top;
+    int     B;               /* batch shared across all entries (set per stack) */
 } pu_skip_stack;
 
 static void skip_push_copy(pu_skip_stack *ss, CUdeviceptr src, int C, int H, int W) {
     size_t sz = (size_t)ss->B * C * H * W * sizeof(float);
-    CUdeviceptr d; cuMemAlloc(&d, sz);
-    cuMemcpyDtoD(d, src, sz);
-    ss->s[ss->top++] = (pu_skip){ d, C, H, W };
+    int idx = ss->top;
+    if (sz > ss->cap[idx]) {
+        if (ss->s[idx].buf) cuMemFree(ss->s[idx].buf);
+        ss->s[idx].buf = 0;
+        cuMemAlloc(&ss->s[idx].buf, sz);
+        ss->cap[idx] = sz;
+    }
+    cuMemcpyDtoD(ss->s[idx].buf, src, sz);
+    ss->s[idx].channels = C; ss->s[idx].H = H; ss->s[idx].W = W;
+    ss->top++;
 }
 static pu_skip skip_pop(pu_skip_stack *ss) {
-    return ss->s[--ss->top];
+    return ss->s[--ss->top];   /* buffer stays owned by the stack — do not free */
+}
+static void skip_stack_free(pu_skip_stack *ss) {
+    for (int i = 0; i < 16; i++) {
+        if (ss->s[i].buf) { cuMemFree(ss->s[i].buf); ss->s[i].buf = 0; }
+        ss->cap[i] = 0;
+    }
 }
 
 /* ===== Run helpers (B=1 only) ============================================= */
@@ -1947,7 +1965,7 @@ static void run_up_block(const pu_kernels *kk, const pu_up_block *ub,
             k_concat_chan(kk, cb, ib, sb,
                            ub->res_in[i], ub->skip_ch[i], sp);
         }
-        cuMemFree(sk.buf);
+        /* sk.buf is owned by the skip stack pool — do not free here. */
         /* resnet (res_in+skip_ch -> Cout): d_concat -> d_out */
         run_resblock(kk, &ub->res[i], d_concat, d_out,
                       ws->d_t1, ws->d_t2, d_temb, ws->d_temb_act, ws->d_temb_proj,
