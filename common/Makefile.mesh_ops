@@ -1,0 +1,31 @@
+# Build mesh-ops shared library + mesh_proc CLI.
+#
+#   make -f Makefile.mesh_ops
+#
+# Outputs:
+#   libmesh_ops.so   (loaded by shims/cumesh_xatlas.py via ctypes)
+#   mesh_proc       (standalone CLI: safetensors-in -> safetensors-out)
+
+CXX      ?= g++
+CXXFLAGS ?= -std=c++17 -O3 -fPIC \
+            -Wall -Wextra -fopenmp \
+            -msse2 -mavx -mavx2 -mfma -mf16c
+
+LIB_SRCS  = mesh_ops.cc mesh_ops_capi.cc xatlas.cc
+LIB_HDRS  = mesh_ops.h xatlas.h
+
+CLI_SRCS  = mesh_proc_main.cc mesh_ops.cc xatlas.cc
+CLI_HDRS  = mesh_io.h mesh_ops.h xatlas.h safetensors.h safetensors_writer.h
+
+.PHONY: all clean
+
+all: libmesh_ops.so mesh_proc
+
+libmesh_ops.so: $(LIB_SRCS) $(LIB_HDRS)
+	$(CXX) $(CXXFLAGS) -shared -I. $(LIB_SRCS) -o $@ -fopenmp -lpthread
+
+mesh_proc: $(CLI_SRCS) $(CLI_HDRS)
+	$(CXX) $(CXXFLAGS) -I. $(CLI_SRCS) -o $@ -fopenmp -lpthread
+
+clean:
+	rm -f libmesh_ops.so mesh_proc
