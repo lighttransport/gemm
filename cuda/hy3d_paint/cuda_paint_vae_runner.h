@@ -139,6 +139,18 @@ typedef struct {
     CUfunction f_attn;     /* vae_attn_f32 */
     CUfunction f_chw_nc;   /* vae_chw_to_nc_f32 */
     CUfunction f_nc_chw;   /* vae_nc_to_chw_f32 */
+    /* TC dispatch (Phase 4.13): may be NULL if compile/lookup failed. */
+    CUfunction f_im2col_3x3_p1;     /* pvae_im2col_3x3_p1_f32 */
+    CUfunction f_im2col_3x3_p1_s2;  /* pvae_im2col_3x3_p1_s2_f32 */
+    CUfunction f_t_hwc_chw;         /* pvae_t_hwc_to_chw_f32 */
+    CUfunction f_gemm_fp8;          /* gemm_bf16_pipe_scaled_f32 */
+    CUfunction f_gemm_fp8_mt4;      /* gemm_bf16_pipe_mt4_scaled_f32 */
+    CUfunction f_gemm_fp8_v7_fused; /* gemm_fp8_v7_fused */
+    CUfunction f_gemm_bf16_v7;      /* gemm_bf16_v7 */
+    CUfunction f_quant_bf16;        /* quant_bf16 */
+    CUfunction f_add_bias_f32;      /* add_bias_inplace_f32 */
+    CUfunction f_reduce_max_abs;    /* reduce_max_abs_f32 */
+    CUfunction f_quantize_fp8;      /* quantize_to_fp8_e4m3 */
 } pvae_kernels;
 
 /* ===== Kernel launchers =================================================== */
