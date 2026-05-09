@@ -83,8 +83,8 @@ if _HAVE_NUMBA:
                     w1 = ((cx - px) * (ay - py) - (cy - py) * (ax - px)) * inv_area
                     w2 = 1.0 - w0 - w1
                     if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
-                        rast_np[y, x, 0] = w1
-                        rast_np[y, x, 1] = w2
+                        rast_np[y, x, 0] = w0
+                        rast_np[y, x, 1] = w1
                         rast_np[y, x, 2] = w0 * z0 + w1 * z1 + w2 * z2
                         rast_np[y, x, 3] = tid
 
@@ -92,7 +92,7 @@ if _HAVE_NUMBA:
 def rasterize(ctx, pos, tri, resolution):
     """Return (rast[B,H,W,4], rast_db) matching nvdiffrast contract.
 
-    rast[...,0:2] = barycentric (u, v) wrt verts 1,2 (v0 has w0 = 1-u-v).
+    rast[...,0:2] = barycentric (u, v) wrt verts 0,1 (v2 has w = 1-u-v).
     rast[...,2]   = z/w.
     rast[...,3]   = triangle_id + 1 (0 = empty pixel).
     """
@@ -105,7 +105,7 @@ def rasterize(ctx, pos, tri, resolution):
     zow = (p[:, 2] / p[:, 3].clamp_min(1e-20))
     # map NDC [-1,1] to pixel centre coords [0, W] / [0, H]. nvdiffrast: x right, y up.
     px = (ndc[:, 0] + 1.0) * 0.5 * W
-    py = (1.0 - ndc[:, 1]) * 0.5 * H  # flip y to image coords
+    py = (ndc[:, 1] + 1.0) * 0.5 * H  # nvdiffrast keeps NDC y orientation
 
     tri_i = tri.to(torch.long)
     F = tri_i.shape[0]
@@ -156,8 +156,8 @@ def rasterize(ctx, pos, tri, resolution):
         if not mask.any():
             continue
 
-        u = w1  # bary wrt v1
-        v = w2  # bary wrt v2
+        u = w0  # bary wrt v0
+        v = w1  # bary wrt v1
         z = w0 * z0 + w1 * z1 + w2 * z2
 
         tile = rast_np[ymin:ymax + 1, xmin:xmax + 1]
@@ -190,7 +190,8 @@ def interpolate(attrs, rast, tri):
     a0 = attrs[0][verts[..., 0]]
     a1 = attrs[0][verts[..., 1]]
     a2 = attrs[0][verts[..., 2]]
-    out = w.unsqueeze(-1) * a0 + u.unsqueeze(-1) * a1 + v.unsqueeze(-1) * a2
+    # rast layout matches CUDA dump: pos = u*v0 + v*v1 + (1-u-v)*v2
+    out = u.unsqueeze(-1) * a0 + v.unsqueeze(-1) * a1 + w.unsqueeze(-1) * a2
     out = out * valid.unsqueeze(-1).to(out.dtype)
     return out.reshape(B, H, W, C), None
 
