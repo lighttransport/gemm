@@ -18,6 +18,7 @@
 #define SAFETENSORS_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
 
+#include "image_stats.h"
 #include "mesh_io.h"
 #include "preview_render.h"
 #include "stb_image.h"
@@ -36,6 +37,7 @@ namespace {
 void usage(const char* argv0) {
   fprintf(stderr,
     "usage: %s --in mesh.safetensors [--texture base.png] [--out beauty.png] [--exr aov.exr]\n"
+    "         [--stats stats.json]\n"
     "         [-w 800] [-h 600] [--yaw 35] [--pitch 20]\n"
     "         [--sun-yaw 45] [--sun-elev 50] [--turbidity 2.5] [--exposure 0.0]\n",
     argv0);
@@ -101,6 +103,10 @@ int writeAOVEXR(const char* path, const trellis2::AOVImage& img) {
   chans.push_back({"P.Y",      sliceChan(img.position, N, 1, 3)});
   chans.push_back({"P.Z",      sliceChan(img.position, N, 2, 3)});
   chans.push_back({"Z",        img.depth});
+  // face_id as float (-1 on miss). Lets image_diff reconstruct regions.
+  std::vector<float> fid_f((size_t)img.width * img.height);
+  for (size_t i = 0; i < fid_f.size(); ++i) fid_f[i] = (float)img.face_id[i];
+  chans.push_back({"face_id",  fid_f});
 
   EXRHeader header; InitEXRHeader(&header);
   EXRImage  image;  InitEXRImage(&image);
@@ -143,6 +149,7 @@ int main(int argc, char** argv) {
   const char* tex_path = nullptr;
   const char* png_path = nullptr;
   const char* exr_path = nullptr;
+  const char* stats_path = nullptr;
   uint32_t W = 800, H = 600;
   float yaw = 35.0f, pitch = 20.0f;
   float sun_yaw = 45.0f, sun_elev = 50.0f;
@@ -159,6 +166,7 @@ int main(int argc, char** argv) {
     else if (a == "--texture")   tex_path = need("--texture");
     else if (a == "--out")       png_path = need("--out");
     else if (a == "--exr")       exr_path = need("--exr");
+    else if (a == "--stats")     stats_path = need("--stats");
     else if (a == "-w")          W = (uint32_t)std::atoi(need("-w"));
     else if (a == "-h")          H = (uint32_t)std::atoi(need("-h"));
     else if (a == "--yaw")       yaw = (float)std::atof(need("--yaw"));
@@ -192,6 +200,12 @@ int main(int argc, char** argv) {
       size_t nb = safetensors_nbytes(ctx, in_uv);
       const float* p = (const float*)safetensors_data(ctx, in_uv);
       scene.uvs.assign(p, p + nb / sizeof(float));
+    }
+    int in_mid = safetensors_find(ctx, "face_material_id");
+    if (in_mid >= 0 && std::strcmp(safetensors_dtype(ctx, in_mid), "I32") == 0) {
+      size_t nb = safetensors_nbytes(ctx, in_mid);
+      const int32_t* p = (const int32_t*)safetensors_data(ctx, in_mid);
+      scene.face_material_id.assign(p, p + nb / sizeof(int32_t));
     }
     safetensors_close(ctx);
   }
@@ -250,5 +264,12 @@ int main(int argc, char** argv) {
   int rc = 0;
   if (png_path) rc |= writeBeautyPNG(png_path, img, exposure);
   if (exr_path) rc |= writeAOVEXR(exr_path, img);
+  if (stats_path) {
+    trellis2::StatsOpts opts;
+    trellis2::StatsReport rep = trellis2::summarize(img, scene.face_material_id, opts);
+    if (!trellis2::writeStatsJSON(rep, stats_path)) rc |= 1;
+    else fprintf(stderr, "wrote %s (hit_fraction=%.3f, regions=%zu)\n",
+                 stats_path, rep.hit_fraction, rep.regions.size());
+  }
   return rc;
 }

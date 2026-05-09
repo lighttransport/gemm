@@ -129,6 +129,7 @@ struct PreviewScene {
   std::vector<int32_t> faces;          // 3*F
   std::vector<float>   vertex_normals; // 3*V (optional; computed if empty)
   std::vector<float>   uvs;            // 2*V (optional)
+  std::vector<int32_t> face_material_id;  // F (optional; per-face material/region id)
   Material material;
   SunSky sky;
 
@@ -263,6 +264,7 @@ struct AOVImage {
   std::vector<float> position;  // RGB (world-space)
   std::vector<float> depth;     // R   (linear, 0 if miss)
   std::vector<float> mask;      // R   (1 hit, 0 miss)
+  std::vector<int32_t> face_id; // R   (-1 on miss, else triangle index)
 
   void allocate(uint32_t w, uint32_t h) {
     width = w; height = h;
@@ -274,6 +276,7 @@ struct AOVImage {
     position.assign(n3, 0.0f);
     depth.assign(n1, 0.0f);
     mask.assign(n1, 0.0f);
+    face_id.assign(n1, -1);
   }
 };
 
@@ -333,6 +336,7 @@ inline void render(const PreviewScene& scene, const Camera& cam, AOVImage& out) 
       out.position[3*pi+0] = p.x; out.position[3*pi+1] = p.y; out.position[3*pi+2] = p.z;
       out.depth[pi] = t;
       out.mask[pi] = 1.0f;
+      out.face_id[pi] = (int32_t)fid;
     }
   }
 }
