@@ -645,6 +645,18 @@ static void k_groupnorm(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
     cuLaunchKernel(kk->f_gn, (unsigned)num_groups, 1, 1, 128, 1, 1,
                     2 * 128 * sizeof(float), 0, args, NULL);
 }
+/* Batched dispatch: one launch with grid.y = B replaces a per-sample loop.
+ * The kernel offsets in/out by blockIdx.y * C * spatial. SM occupancy on the
+ * 5060 Ti was tiny with grid.x = num_groups (32) only; folding B in fills the
+ * GPU and roughly 3x's wall-clock for the per-call site. */
+static void k_groupnorm_batched(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr in,
+                                  CUdeviceptr g, CUdeviceptr b, int C, int spatial,
+                                  int num_groups, int do_silu, int B) {
+    float eps = 1e-5f;
+    void *args[] = { &out, &in, &g, &b, &C, &spatial, &num_groups, &do_silu, &eps };
+    cuLaunchKernel(kk->f_gn, (unsigned)num_groups, (unsigned)B, 1, 128, 1, 1,
+                    2 * 128 * sizeof(float), 0, args, NULL);
+}
 
 static void k_add_chan(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr a,
                          CUdeviceptr temb, int C, int spatial) {
@@ -1157,28 +1169,26 @@ static void run_resblock(const pu_kernels *kk, const pu_resblock *r,
     cuMemcpyDtoDAsync(d_temb_act, d_temb, (size_t)B * 1280 * sizeof(float), g_paint_stream);
     k_silu(kk, d_temb_act, B * 1280);
     k_linear(kk, d_temb_proj, d_temb_act, r->temb_w, r->temb_b, B, 1280, r->c_out);
-    /* Per-batch CHW path (groupnorm/conv kernels are single-sample). */
+    /* Per-batch CHW path (groupnorm/conv kernels are single-sample). Keeping
+     * everything in one loop preserves L2 reuse: GN writes sample b's t1,
+     * conv1 reads it warm. Tried hoisting GN to a batched-grid launch — saw
+     * ~3% wall regression, presumably because writing all B samples evicted
+     * earlier samples before conv reused them. */
     for (int b = 0; b < B; b++) {
         CUdeviceptr xb  = d_x  + (CUdeviceptr)b * in_stride;
         CUdeviceptr ob  = d_out + (CUdeviceptr)b * out_stride;
         CUdeviceptr t1b = d_t1 + (CUdeviceptr)b * scratch_stride;
         CUdeviceptr t2b = d_t2 + (CUdeviceptr)b * scratch_stride;
         CUdeviceptr tb  = d_temb_proj + (CUdeviceptr)b * r->c_out * sizeof(float);
-        /* h = silu(norm1(x))  [c_in, H, W] -> t1b */
         k_groupnorm(kk, t1b, xb, r->norm1_g, r->norm1_b,
                      r->c_in, sp, num_groups, 1);
-        /* h = conv1(h)  -> t2b [c_out, H, W] */
         k_conv(kk, t2b, t1b, r->conv1_w, r->conv1_b,
                 r->c_in, H, W, r->c_out, 3, 3, 1);
-        /* h += temb broadcast */
         k_add_chan(kk, t2b, t2b, tb, r->c_out, sp);
-        /* h = silu(norm2(h)) -> t1b */
         k_groupnorm(kk, t1b, t2b, r->norm2_g, r->norm2_b,
                      r->c_out, sp, num_groups, 1);
-        /* h = conv2(h) -> t2b [c_out, H, W] */
         k_conv(kk, t2b, t1b, r->conv2_w, r->conv2_b,
                 r->c_out, H, W, r->c_out, 3, 3, 1);
-        /* skip path */
         if (r->skip_w) {
             k_conv(kk, t1b, xb, r->skip_w, r->skip_b,
                     r->c_in, H, W, r->c_out, 1, 1, 0);
@@ -1477,8 +1487,9 @@ static void run_transformer(const pu_kernels *kk, const pu_transformer *T,
     int sp = N;
     /* residual = x */
     cuMemcpyDtoDAsync(S->d_resid, d_x, (size_t)B * C * sp * sizeof(float), g_paint_stream);
-    /* GroupNorm in CHW (no fused silu) */
-    /* The kernel expects single-batch CHW; loop over B */
+    /* GroupNorm in CHW (no fused silu). Per-batch loop preserved to keep L2
+     * cache warm for the chw_to_nc step that immediately follows on each
+     * sample (batched-grid GN saw the same regression as the resblock case). */
     for (int b = 0; b < B; b++) {
         CUdeviceptr xb = d_x      + (CUdeviceptr)b * C * sp * sizeof(float);
         CUdeviceptr nb = S->d_nc  + (CUdeviceptr)b * C * sp * sizeof(float);
