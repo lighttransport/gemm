@@ -160,6 +160,7 @@ typedef struct {
     CUfunction f_cast_bf16;        /* cast_f32_to_bf16 */
     CUfunction f_attn_bf16_hd64;   /* flash_attn_bf16_hd64 */
     CUfunction f_attn_bf16_hd64_xq;/* flash_attn_bf16_hd64_xq */
+    CUfunction f_attn_bf16_hd64_xq_b64;/* flash_attn_bf16_hd64_xq_b64 (BKV=64) */
     /* FP8 GEMM dispatch (Phase 4.9.2). */
     CUfunction f_gemm_fp8_mt4;     /* gemm_bf16_pipe_mt4_scaled_f32 */
     CUfunction f_gemm_fp8;         /* gemm_bf16_pipe_scaled_f32 (mt1) */
@@ -942,7 +943,15 @@ static void k_mha(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr Q,
             size_t per_kv = (size_t)M * dim * sizeof(unsigned short);
             size_t per_o  = (size_t)N * dim * sizeof(float);
             unsigned gy = (unsigned)((N + 63) / 64);
-            size_t smem = (size_t)(4 * 32 * 72 * 2);
+            /* BKV=64 variant available via PAINT_FA_BKV64=1 (opt-in). Default
+             * stays on BKV=32 — measured ~5% kernel slowdown at BKV=64 on
+             * sm_120 (likely register spill from 2x S/P_pack arrays). Kept
+             * for future warp-specialized FA2 work. */
+            int use_b64 = 0;
+            const char *env_b64 = getenv("PAINT_FA_BKV64");
+            if (env_b64 && env_b64[0] == '1' && kk->f_attn_bf16_hd64_xq_b64) use_b64 = 1;
+            CUfunction fn  = use_b64 ? kk->f_attn_bf16_hd64_xq_b64 : kk->f_attn_bf16_hd64_xq;
+            size_t   smem  = use_b64 ? (size_t)(4 * 64 * 72 * 2) : (size_t)(4 * 32 * 72 * 2);
             for (int b = 0; b < B; b++) {
                 CUdeviceptr qb = g_paint_d_qbf + (CUdeviceptr)((size_t)b * per_q);
                 CUdeviceptr kb = g_paint_d_kbf + (CUdeviceptr)((size_t)b * per_kv);
@@ -950,7 +959,7 @@ static void k_mha(const pu_kernels *kk, CUdeviceptr out, CUdeviceptr Q,
                 CUdeviceptr ob = out          + (CUdeviceptr)((size_t)b * per_o);
                 int n_q = N, n_kv = M, nh = heads, hd = head_dim;
                 void *args[] = { &ob, &qb, &kb, &vb, &n_q, &n_kv, &nh, &hd };
-                cuLaunchKernel(kk->f_attn_bf16_hd64_xq, (unsigned)heads, gy, 1,
+                cuLaunchKernel(fn, (unsigned)heads, gy, 1,
                                 128, 1, 1, smem, 0, args, NULL);
             }
             return;
