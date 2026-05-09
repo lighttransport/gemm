@@ -476,7 +476,7 @@ static int paint_try_fp8_v7(const pu_kernels *kk,
     if (!kk->f_gemm_fp8_v7_fused || !kk->f_quantize_fp8 || !kk->f_reduce_max_abs)
         return 0;
     if (!e || !e->w_fp8 || !e->w_scale) return 0;
-    if ((K % 64) != 0 || M < 256) return 0;
+    if ((K % 64) != 0 || M < 1) return 0;
     size_t n_elem = (size_t)M * (size_t)K;
     if (paint_xfp8_ensure(n_elem) != 0) return 0;
     int n = (int)n_elem;
