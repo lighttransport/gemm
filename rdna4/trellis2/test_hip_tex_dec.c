@@ -993,6 +993,7 @@ int main(int argc, char **argv) {
     }
     const char *cache_dir = "/tmp/tex_knight_r512";
     const char *ref_path = NULL;
+    const char *save_out_path = NULL;
     int stop_stage = -1;
     int stop_block = -1;  /* stop after N blocks of stage 0 (requires stop_stage==0) */
     int stop_op = -1;     /* within block 0: 0=post-conv, 1=post-ln, 2=post-mlp */
@@ -1006,6 +1007,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--stop-op") && i+1<argc) stop_op = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--after-c2s")) after_c2s = 1;
         else if (!strcmp(argv[i], "--full")) run_full = 1;
+        else if (!strcmp(argv[i], "--save-out") && i+1<argc) save_out_path = argv[++i];
     }
     if (run_full) stop_stage = 99;  /* past n_stages so loop finishes all stages+C2S */
 
@@ -1022,6 +1024,12 @@ int main(int argc, char **argv) {
     for (int s = 0; s < dec->n_stages && s < 4; s++) {
         char p[512]; int dn, d2[8];
         snprintf(p, sizeof p, "%s/cache_scale%d_c2s_idx.npy", cache_dir, scales[s]);
+        FILE *probe = fopen(p, "rb");
+        if (!probe) {
+            fprintf(stderr, "missing cache: %s (stage %d will be skipped)\n", p, s);
+            continue;
+        }
+        fclose(probe);
         gi[s] = read_npy_i64(p, &dn, d2); gN[s] = d2[0];
         snprintf(p, sizeof p, "%s/cache_scale%d_c2s_subidx.npy", cache_dir, scales[s]);
         /* subidx is saved as int32 in flex_gemm cache (sub.nonzero()[:, -1]).
@@ -1473,6 +1481,23 @@ done_stages:;
             fprintf(stderr, "ref shape [%d,%d] vs ours [%d,%d]\n", rd[0], rd[1], cur_N, out_C_report);
         }
         free(ref);
+    }
+    if (save_out_path) {
+        FILE *f = fopen(save_out_path, "wb");
+        if (f) {
+            char hdr[256]; int hl = snprintf(hdr, sizeof hdr,
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                cur_N, out_C_report);
+            while ((hl + 10) % 16 != 0) { hdr[hl++] = ' '; } hdr[hl++] = '\n'; hdr[hl] = 0;
+            fwrite("\x93NUMPY\x01\x00", 1, 8, f);
+            uint16_t hl16 = (uint16_t)hl; fwrite(&hl16, 2, 1, f);
+            fwrite(hdr, 1, hl, f);
+            fwrite(h_out, sizeof(float), (size_t)cur_N*out_C_report, f);
+            fclose(f);
+            fprintf(stderr, "saved HIP output to %s [%d,%d]\n", save_out_path, cur_N, out_C_report);
+        } else {
+            fprintf(stderr, "failed to open %s\n", save_out_path);
+        }
     }
     free(h_out);
     prof_dump();
