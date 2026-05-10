@@ -72,6 +72,25 @@ def shape_tag(s):
     return f"N{s['N']}_Ci{s['Ci']}_Co{s['Co']}_SPLITK{4 if is_splitk(s) else 1}"
 
 
+def scrub_meta_paths(meta):
+    """Drop host-local absolute paths from Triton's generated metadata."""
+    meta = dict(meta)
+    libs = meta.get("extern_libs")
+    if isinstance(libs, list):
+        scrubbed = []
+        for item in libs:
+            if not (isinstance(item, list) and len(item) == 2 and isinstance(item[1], str)):
+                scrubbed.append(item)
+                continue
+            lib, path = item
+            marker = "site-packages/"
+            if marker in path:
+                path = path.split(marker, 1)[1]
+            scrubbed.append([lib, path])
+        meta["extern_libs"] = scrubbed
+    return meta
+
+
 def autotune_for(s):
     """Per-shape autotune choice baked at sweep-time; mirrors the table in
     triton_spconv_bridge.h's AUTOTUNE.  Update both if you re-tune."""
@@ -105,7 +124,8 @@ def main():
         dst = KERNELS_DIR / tag
         dst.mkdir(exist_ok=True)
         shutil.copy2(src / f"{kname}.hsaco", dst / "kernel.hsaco")
-        shutil.copy2(src / f"{kname}.json",  dst / "kernel.json")
+        meta = scrub_meta_paths(json.loads((src / f"{kname}.json").read_text()))
+        (dst / "kernel.json").write_text(json.dumps(meta, separators=(",", ": ")) + "\n")
         print(f"  {tag:42s}  <- {src.name}/")
 
     if miss:
