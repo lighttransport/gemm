@@ -527,8 +527,10 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
             fprintf(stderr, "[paint_stage_unet] FP8_V7=1 (native e4m3 m16n8k32, fused descale+bias)\n");
         else if (want)
             fprintf(stderr, "[paint_stage_unet] FP8_V7=0 (env=%s have=%d)\n", e, have);
+        /* p2 (2x2 panel) is bit-identical and ~3% faster on UNet at 30 steps;
+         * default ON when FP8_V7 is on. Set PAINT_FP8_V7_P2=0 to disable. */
         const char *e2 = getenv("PAINT_FP8_V7_P2");
-        int want2 = (e2 != NULL) && (e2[0] != '0');
+        int want2 = (e2 == NULL) ? 1 : (e2[0] != '0');
         int have2 = (s->kk.f_gemm_fp8_v7_fused_p2 != NULL);
         g_paint_use_fp8_v7_p2 = (want2 && have2 && g_paint_use_fp8_v7) ? 1 : 0;
         if (g_paint_use_fp8_v7_p2)
