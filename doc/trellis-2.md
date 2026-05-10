@@ -189,10 +189,13 @@ ResBlock3d: `GN(32) → SiLU → Conv3d → GN(32) → SiLU → Conv3d + skip`
 | Component | Status | Correlation | Notes |
 |-----------|--------|-------------|-------|
 | DINOv3 ViT-L/16 encoder | CPU only | — | Uses `common/dinov3.h` (210s @ 16 threads) |
-| Stage 1 DiT (single step) | ✓ CORRECT | **0.99999754** | F16 GEMM (BF16→F16 weights), corr target 0.9999 exceeded |
+| Stage 1 DiT (single step) | ✓ CORRECT | **0.99999754** | BF16 WMMA GEMM + BF16 WMMA flash-attn (gfx12 matrix cores) |
+| Stage 1 DiT (single step, FP8) | ✓ CORRECT | **0.999358** vs BF16 | BF16-act × FP8-wt WMMA; offline-quantized E4M3 weights, 1.27 GB on disk |
 | Stage 1 Decoder (zero input) | ✓ CORRECT | **1.00000000** | GroupNorm kernel, 866x speedup vs CPU |
 | Full pipeline (12-step CFG + decode) | ⚠ RUNS | — | Pipeline completes; occupancy too high (~70% vs expected ~2-10%). DiT+decoder individually verified, CFG sampling loop under investigation |
-| DiT per-step time | — | — | 144s/step (F16 tiled GEMM, not yet optimized) |
+| DiT per-step time (BF16 WMMA, T2_WMMA=1) | — | — | **1.66 s/step** (2026-05 measured, gfx1201) |
+| DiT per-step time (BF16-act × FP8-wt WMMA) | — | — | **1.46 s/step** (~12% over BF16; weight bw not the bottleneck) |
+| DiT per-step time (scalar F32 fallback) | — | — | 143.7 s/step (T2_WMMA=0) — 83× WMMA speedup |
 | Decoder time | — | — | 0.4s |
 | DINOv3 features (C vs PyTorch) | ✓ MATCH | **0.99999326** | max_diff=0.116, C encoder features essentially correct |
 | PyTorch reference (ROCm 7.2) | ✓ WORKS | — | `gen_stage1_ref.py` runs on ROCm GPU (~110s for 12 steps + decode) |
@@ -264,13 +267,49 @@ All results below use **matched initial noise** (same tensor loaded from .npy).
 | Stage | CPU (Zen4, 16T) | CUDA (RTX 5060 Ti) | HIP (RX 9070 XT) | PyTorch (RX 9070 XT) |
 |-------|----------------|---------------------|-------------------|----------------------|
 | DINOv3 encode | ~3.5 min | — (CPU features) | — (CPU features) | ~10 sec |
-| Stage 1 DiT (12 steps, CFG) | ~9 hours | **~8 min** | **~53 min** | ~110 sec |
+| Stage 1 DiT (12 steps, CFG) | ~9 hours | **~8 min** | **~42 sec** (BF16 WMMA) | ~110 sec |
 | Decoder | ~6.3 min | ~0.5 sec | ~0.4 sec | ~0.2 sec |
-| **Total** | **~9.5 hours** | **~8 min** | **~53 min** | **~2 min** |
+| **Total (DiT + decode only)** | **~9.5 hours** | **~8 min** | **~42 sec** | **~2 min** |
 
-HIP DiT at 144s/step uses F16 tiled GEMM (not WMMA). Main bottleneck is the
-tiled GEMM kernel; WMMA cooperative matrix GEMM would give ~10x speedup.
-PyTorch ROCm uses rocBLAS which is ~26x faster than our tiled GEMM.
+HIP DiT now uses BF16 WMMA GEMM + BF16 WMMA flash-attn (commit 4d59a1e).
+1.73 s/step × 12 steps × 2 (CFG fwds) ≈ 42 s. Falls back to scalar F32 GEMM
+on non-gfx12 archs (or with `T2_WMMA=0`), 143.7 s/step there. Next-tier
+optimization: BF16-act × FP8-weight WMMA (qimg/Flux.2 pattern, ~2× more).
+
+### tex_dec (Stage 3 texture decoder) cold/warm — RX 9070 XT, knight r512 dump
+
+Bench harness: `rdna4/trellis2/bench_tex_dec_coldwarm.py` (PyTorch ROCm 7.2.2 ref;
+`T2_TEX_REPS=N` env on `test_hip_tex_dec` for HIP). Cold = rep 0 of a fresh process,
+warm = median of rep 1+ (steady state). Both ship-AOT/cache-warmed: PyTorch's
+`~/.flex_gemm/autotune_cache.json` + `~/.triton/cache/` populated; HIP's Triton AOT
+hsacos baked at build time and `<cache_dir>/triton_prep_*.bin` pre-populated.
+
+| Path | Cold rep 0 | Warm steady |
+|---|---|---|
+| **PyTorch ROCm 7.2.2 (Triton spconv via FlexGEMM)** | **~2000 ms** (1.9–3.7 s) | **125 ms** |
+| **HIP (`test_hip_tex_dec`, T2_TEX_REPS=2)** | **329 ms** | **144 ms** |
+
+- **Cold**: HIP wins by **6–11×**. PyTorch's 2 sec cold is Triton kernel JIT-from-cached-AST
+  + first-call hipBLASLt plan compile, even with both caches warm. We ship Triton AOT
+  hsacos and disk-persist spconv prep tensors (sorted/vk/vkseg) so neither cost lands.
+- **Warm**: PyTorch wins by **~19 ms** (~13%). Their autotuned wide-tile Triton spconv at
+  large N (178k, 822k voxels) outperforms our hipBLASLt MT64x64x32 fallback at stage 3;
+  per-call host overhead is also slightly lower.
+- Implication: for one-shot mesh texturing the HIP path is sub-second to first decoded
+  voxel; for batched decode (>1 mesh per process) PyTorch warm 125 ms beats HIP 144 ms.
+
+Bench setup (one-time, see `rdna4/trellis2/pyproject.toml` for full recipe):
+
+```bash
+cd /mnt/disk1/work/gemm/trellis2/rdna4/trellis2
+uv venv --python 3.12 .venv
+uv pip install -e ".[torch-rocm722]"
+BUILD_TARGET=rocm GPU_ARCHS=gfx1201 uv pip install --no-build-isolation -e \
+    /mnt/disk1/work/gemm/trellis2/cpu/trellis2/trellis2_repo/o-voxel
+BUILD_TARGET=rocm GPU_ARCHS=gfx1201 uv pip install --no-build-isolation -e \
+    /mnt/disk1/work/gemm/trellis2/rdna4/trellis2/deps/FlexGEMM
+.venv/bin/python bench_tex_dec_coldwarm.py --reps 4
+```
 
 ## Weight Files
 
@@ -408,8 +447,11 @@ TRELLIS.2 model code: `cpu/trellis2/trellis2_repo/` (cloned from github.com/micr
    Single-step DiT (corr=0.99999754) and decoder (corr=1.0) individually verified.
    Per-step latent comparison with PyTorch ref needed to isolate the CFG/sampling bug.
    PyTorch reference outputs saved at `/tmp/chair_ref/ref_latent_step{0-11}.npy`.
-2. **WMMA GEMM**: Replace F16 tiled GEMM with RDNA4 WMMA cooperative matrix GEMM
-   for ~10x speedup (144s/step → ~15s/step target).
+2.5. **FP8 weights** (DONE, 2026-05): BF16-act × FP8-wt WMMA path lands gated by FP8 dtype detection in safetensors. Offline quantizer at `cpu/trellis2/quantize_dit_fp8.py` (E4M3, per-tensor scale, excludes `adaLN_modulation` and `t_embedder`). 12% per-step speedup, 50% weight memory savings, corr=0.999358 vs BF16. Bottleneck has shifted to flash-attn / non-GEMM ops. Optional next step: FP8 flash-attn (rdna4/fp8/bench_fp8_fa.c, 18.7 TF/s).
+2. ~~**WMMA GEMM**: Replace F16 tiled GEMM with RDNA4 WMMA cooperative matrix GEMM
+   for ~10x speedup (144s/step → ~15s/step target).~~ **DONE** (commit 4d59a1e):
+   83× over scalar fallback; 1.73 s/step. Next: **BF16-act × FP8-weight WMMA**
+   (qimg/Flux.2 pattern) — halves weight memory, ~2× over BF16 expected.
 3. **DINOv3 on GPU**: Port DINOv3 encoder to HIP (currently CPU-only, 210s).
 
 ### Vulkan
