@@ -148,6 +148,7 @@ typedef struct {
     CUfunction f_gemm_fp8;          /* gemm_bf16_pipe_scaled_f32 */
     CUfunction f_gemm_fp8_mt4;      /* gemm_bf16_pipe_mt4_scaled_f32 */
     CUfunction f_gemm_fp8_v7_fused; /* gemm_fp8_v7_fused */
+    CUfunction f_gemm_fp8_v7_fused_p2; /* gemm_fp8_v7_fused_p2 (2x2 panel) */
     CUfunction f_gemm_bf16_v7;      /* gemm_bf16_v7 */
     CUfunction f_quant_bf16;        /* quant_bf16 */
     CUfunction f_add_bias_f32;      /* add_bias_inplace_f32 */
@@ -190,6 +191,7 @@ static int g_pvae_use_fp8_gemm     = 0;
 static int g_pvae_use_fp8_gemm_mt4 = 0;
 static int g_pvae_use_bf16_gemm    = 0;
 static int g_pvae_use_fp8_v7       = 0;
+static int g_pvae_use_fp8_v7_p2    = 0;
 static int g_pvae_use_fp8_conv     = 0;
 static pvae_fp8_entry g_pvae_fp8_reg[PVAE_FP8_REG_MAX];
 static int    g_pvae_n_fp8_reg = 0;
@@ -367,10 +369,13 @@ static int pvae_try_fp8_v7(const pvae_kernels *kk,
                      &accumulate, &Mv, &Nv, &Kv};
     unsigned npx = (unsigned)((N + 127) / 128);
     unsigned npy = (unsigned)((M + 63) / 64);
-    unsigned gx  = (npx + 3u) & ~3u;
-    unsigned gy  = (npy + 3u) & ~3u;
+    int use_p2 = (g_pvae_use_fp8_v7_p2 && kk->f_gemm_fp8_v7_fused_p2);
+    unsigned pad = use_p2 ? 1u : 3u;
+    unsigned gx  = (npx + pad) & ~pad;
+    unsigned gy  = (npy + pad) & ~pad;
     unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
-    cuLaunchKernel(kk->f_gemm_fp8_v7_fused, gx, gy, 1, 256, 1, 1,
+    CUfunction f = use_p2 ? kk->f_gemm_fp8_v7_fused_p2 : kk->f_gemm_fp8_v7_fused;
+    cuLaunchKernel(f, gx, gy, 1, 256, 1, 1,
                     smem_bytes, 0, gargs, NULL);
     return 1;
 }
@@ -382,10 +387,12 @@ static int pvae_try_fp8_v7(const pvae_kernels *kk,
  */
 static void pvae_init_runtime(const pvae_kernels *kk) {
     int env_fp8   = 1, env_bf16 = 1, env_v7 = 1, env_conv = 1, env_mt4 = 1;
+    int env_v7_p2 = 1;
     const char *e;
     if ((e = getenv("PAINT_VAE_FP8_GEMM")) && atoi(e) == 0) env_fp8 = 0;
     if ((e = getenv("PAINT_VAE_BF16_GEMM"))&& atoi(e) == 0) env_bf16 = 0;
     if ((e = getenv("PAINT_VAE_FP8_V7"))   && atoi(e) == 0) env_v7  = 0;
+    if ((e = getenv("PAINT_VAE_FP8_V7_P2"))&& atoi(e) == 0) env_v7_p2 = 0;
     if ((e = getenv("PAINT_VAE_FP8_CONV")) && atoi(e) == 0) env_conv = 0;
     if ((e = getenv("PAINT_VAE_FP8_MT4"))  && atoi(e) == 0) env_mt4  = 0;
     g_pvae_use_fp8_gemm     = env_fp8  && (kk->f_gemm_fp8 || kk->f_gemm_fp8_mt4) &&
@@ -396,14 +403,16 @@ static void pvae_init_runtime(const pvae_kernels *kk) {
                               kk->f_quantize_fp8;
     g_pvae_use_fp8_v7       = env_v7  && kk->f_gemm_fp8_v7_fused &&
                               kk->f_reduce_max_abs && kk->f_quantize_fp8;
+    g_pvae_use_fp8_v7_p2    = env_v7_p2 && g_pvae_use_fp8_v7 && kk->f_gemm_fp8_v7_fused_p2;
     g_pvae_use_fp8_conv     = env_conv && kk->f_im2col_3x3_p1 &&
                               kk->f_im2col_3x3_p1_s2 && kk->f_t_hwc_chw &&
                               kk->f_chw_nc &&
                               (g_pvae_use_fp8_gemm || g_pvae_use_bf16_gemm ||
                                g_pvae_use_fp8_v7);
-    fprintf(stderr, "[pvae] TC dispatch: fp8=%d bf16=%d v7=%d conv=%d mt4=%d\n",
+    fprintf(stderr, "[pvae] TC dispatch: fp8=%d bf16=%d v7=%d v7_p2=%d conv=%d mt4=%d\n",
             g_pvae_use_fp8_gemm, g_pvae_use_bf16_gemm,
-            g_pvae_use_fp8_v7, g_pvae_use_fp8_conv, g_pvae_use_fp8_gemm_mt4);
+            g_pvae_use_fp8_v7, g_pvae_use_fp8_v7_p2,
+            g_pvae_use_fp8_conv, g_pvae_use_fp8_gemm_mt4);
     (void)pvae_conv_scratch_ensure;
 }
 
