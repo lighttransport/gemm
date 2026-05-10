@@ -1,13 +1,14 @@
-"""TRELLIS.2 ROCm-path dumper — mirror of cuda/trellis2/dump_ground_truth.py.
+"""TRELLIS.2 ground-truth dumper (CUDA reference path).
 
-Replicates Trellis2ImageTo3DPipeline.run() for pipeline_type='512' on the ROCm
-device (RX 9070 XT, gfx1201) and writes intermediate tensors at every stage
-boundary as .npy files. Names + dtypes match the CUDA dumper byte-for-byte so
-manifest.json comparison is straightforward.
+Replicates Trellis2ImageTo3DPipeline.run() for pipeline_type='512' and writes
+intermediate tensors at each stage boundary as .npy files for diffing against
+the ROCm/HIP path.
 
-Run via run_dump_rocm.sh (uses rdna4/trellis2/.venv).
+All dumps land in --output-dir (default cuda/trellis2/verify-dumps/) along with
+a manifest.json describing shape, dtype, sha256, and provenance for each entry.
 
-Diff against cuda/trellis2/verify-dumps/ to localise the broken-texture bug.
+Determinism: seed is fixed (default 42) and torch.use_deterministic_algorithms
+is requested where possible. Sparse-attention backend = flash_attn (sm_120).
 """
 import argparse
 import gc
@@ -17,15 +18,22 @@ import os
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shim_bootstrap import install_all  # noqa: E402
-install_all()
+os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+os.environ.setdefault('ATTN_BACKEND', 'sdpa')
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+TRELLIS2_REPO = os.path.join(_REPO_ROOT, 'cpu', 'trellis2', 'trellis2_repo')
+RDNA4_DIR = os.path.join(_REPO_ROOT, 'rdna4', 'trellis2')
+sys.path.insert(0, TRELLIS2_REPO)
+sys.path.insert(0, RDNA4_DIR)
 
 import numpy as np
 import torch
 from PIL import Image
 
-from gen_stage2_ref import _patch_dinov3_extractor, _patch_birefnet_noop
+# Reuse DINOv3 / BiRefNet patches from the e2e driver.
+from gen_image_to_3d import _patch_dinov3_extractor, _patch_birefnet_noop
 
 
 MANIFEST: list[dict] = []
@@ -50,6 +58,7 @@ def _stat(arr: np.ndarray) -> dict:
 
 
 def dump(out_dir: str, name: str, tensor, *, note: str = '') -> None:
+    """Save a torch / numpy tensor as .npy and append a manifest entry."""
     if isinstance(tensor, torch.Tensor):
         arr = tensor.detach().cpu().numpy()
     else:
@@ -72,15 +81,17 @@ def dump(out_dir: str, name: str, tensor, *, note: str = '') -> None:
 
 
 def dump_sparse(out_dir: str, prefix: str, st, *, note: str = '') -> None:
+    """Save SparseTensor coords + feats."""
     dump(out_dir, f'{prefix}.coords', st.coords, note=note + ' (coords [B,x,y,z] int)')
     dump(out_dir, f'{prefix}.feats', st.feats, note=note + ' (feats [N,C] float)')
 
 
 def dump_step_list(out_dir: str, prefix: str, items, *, max_steps: int | None = None) -> None:
+    """Save per-diffusion-step tensors (pred_x_t / pred_x_0)."""
     n = len(items) if max_steps is None else min(len(items), max_steps)
     for i in range(n):
         x = items[i]
-        if hasattr(x, 'feats'):
+        if hasattr(x, 'feats'):  # SparseTensor
             dump(out_dir, f'{prefix}.step{i:03d}.feats', x.feats)
         else:
             dump(out_dir, f'{prefix}.step{i:03d}', x)
@@ -90,21 +101,14 @@ def dump_step_list(out_dir: str, prefix: str, items, *, max_steps: int | None = 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--image', required=True)
-    ap.add_argument('--model-id', default='microsoft/TRELLIS.2-4B')
+    ap.add_argument('--model-root', required=True)
     ap.add_argument('--dinov3', required=True)
     ap.add_argument('--output-dir', required=True)
     ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--pipeline-type', default='512', choices=['512'])
-    ap.add_argument('--dump-per-step', action='store_true')
-    ap.add_argument('--export-glb', action='store_true',
-                    help='After stage 15, run postprocess_mesh and write textured.glb '
-                         'to --output-dir.')
-    ap.add_argument('--texture-size', type=int, default=1024)
-    ap.add_argument('--decimation-target', type=int, default=100000,
-                    help='Target face count for o_voxel.postprocess.to_glb '
-                         '(matches the official example.py knob). The shape '
-                         'decoder produces ~3M faces at res=512; the official '
-                         'pipeline always decimates before texgen.')
+    ap.add_argument('--pipeline-type', default='512', choices=['512'],
+                    help='Only 512 supported in dump driver (16 GB VRAM target).')
+    ap.add_argument('--dump-per-step', action='store_true',
+                    help='Also dump per-diffusion-step latents (pred_x_t).')
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -115,10 +119,11 @@ def main():
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
     from trellis2.modules.sparse import SparseTensor
 
-    print(f'[load] {args.model_id}', flush=True)
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
-    pipeline.cuda()  # PyTorch ROCm aliases cuda → hip
+    print(f'[load] {args.model_root}', flush=True)
+    pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_root)
+    pipeline.cuda()
 
+    # ---- 0. Image preprocessing (alpha-synthesized, no rembg) ----
     img = Image.open(args.image)
     if img.mode != 'RGBA':
         rgb = np.array(img.convert('RGB'))
@@ -130,13 +135,15 @@ def main():
 
     torch.manual_seed(args.seed)
 
+    # ---- 1. DINOv3 conditioning (512) ----
     cond_512 = pipeline.get_cond([img_pp], 512)
     dump(args.output_dir, '01_dinov3_cond_512', cond_512['cond'],
          note='DINOv3 ViT-L/16 features at image_size=512, [1,N,1024] bf16')
     dump(args.output_dir, '01_dinov3_neg_cond_512', cond_512['neg_cond'],
          note='Zero negative cond, same shape as cond')
 
-    torch.manual_seed(args.seed)
+    # ---- 2. Sparse structure: latent + coords ----
+    torch.manual_seed(args.seed)  # match pipeline.run() ordering
     flow_ss = pipeline.models['sparse_structure_flow_model']
     reso, in_ch = flow_ss.resolution, flow_ss.in_channels
     noise_ss = torch.randn(1, in_ch, reso, reso, reso).to(pipeline.device)
@@ -173,8 +180,9 @@ def main():
     if pipeline.low_vram:
         decoder.cpu()
 
+    # ---- 3. Shape SLat ----
     flow_shape = pipeline.models['shape_slat_flow_model_512']
-    torch.manual_seed(args.seed + 1)
+    torch.manual_seed(args.seed + 1)  # match implicit ordering in pipeline.run
     noise_shape_feats = torch.randn(coords.shape[0], flow_shape.in_channels).to(pipeline.device)
     dump(args.output_dir, '06_shape_slat_noise_feats', noise_shape_feats,
          note=f'Initial noise feats for shape SLat, [N,{flow_shape.in_channels}]')
@@ -184,11 +192,11 @@ def main():
 
     # ---- 3a. Single-step SLAT DiT dump (for verify_slat_dit) ----
     # One forward pass on the noise input at t=0.5 with positive cond,
-    # so a CPU/HIP port can verify a single 30-block forward without re-running
+    # so a CPU/HIP port can verify a single block-30 forward without re-running
     # the full sampler. Captures (x_t, t, cond, velocity).
     with torch.no_grad():
         t_step = torch.tensor([0.5], device=pipeline.device, dtype=torch.float32)
-        cond_pos = cond_512['cond']
+        cond_pos = cond_512['cond']  # [1, N_cond, 1024]
         v_step = flow_shape(noise_shape, t_step, cond_pos)
     dump(args.output_dir, '06b_slat_dit_step_x_t', noise_shape_feats,
          note='SLAT-DiT single-step input feats x_t = noise_shape_feats')
@@ -220,8 +228,9 @@ def main():
     dump(args.output_dir, '08_shape_slat_denorm_feats', shape_slat.feats,
          note='Shape SLat feats after denormalization (= raw*std+mean)')
 
+    # ---- 4. Texture SLat ----
     flow_tex = pipeline.models['tex_slat_flow_model_512']
-    shape_for_tex_feats = (shape_slat.feats - mean) / std
+    shape_for_tex_feats = (shape_slat.feats - mean) / std  # match sample_tex_slat
     in_ch_tex = flow_tex.in_channels
     cat_dim = in_ch_tex - shape_for_tex_feats.shape[1]
     torch.manual_seed(args.seed + 2)
@@ -257,6 +266,7 @@ def main():
     torch.cuda.empty_cache()
     gc.collect()
 
+    # ---- 5. Decode shape SLat -> mesh + substructures ----
     res = 512
     pipeline.models['shape_slat_decoder'].set_resolution(res)
     if pipeline.low_vram:
@@ -275,6 +285,7 @@ def main():
         dump_sparse(args.output_dir, f'14_shape_sub{i}', s,
                     note=f'Shape decoder substructure {i}')
 
+    # ---- 6. Decode tex SLat -> voxel attrs ----
     if pipeline.low_vram:
         pipeline.models['tex_slat_decoder'].to(pipeline.device)
     tex_voxels = pipeline.models['tex_slat_decoder'](tex_slat, guide_subs=subs) * 0.5 + 0.5
@@ -284,18 +295,19 @@ def main():
                 note='Decoded texture voxels (PBR attrs); '
                      'feats[:, :3]=basecolor, [3]=metallic, [4]=roughness, [5]=alpha')
 
+    # ---- write manifest ----
     manifest = {
         'created': datetime.now(timezone.utc).isoformat(),
         'image': os.path.abspath(args.image),
-        'model_id': args.model_id,
+        'model_root': os.path.abspath(args.model_root),
         'dinov3': os.path.abspath(args.dinov3),
         'pipeline_type': args.pipeline_type,
         'seed': args.seed,
         'torch': torch.__version__,
-        'hip': getattr(torch.version, 'hip', None),
         'cuda': torch.version.cuda,
         'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu',
-        'sparse_attn_backend': os.environ.get('SPARSE_ATTN_BACKEND', os.environ.get('ATTN_BACKEND', 'sdpa')),
+        'compute_capability': torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None,
+        'sparse_attn_backend': os.environ.get('SPARSE_ATTN_BACKEND', 'flash_attn'),
         'shape_slat_normalization': pipeline.shape_slat_normalization,
         'tex_slat_normalization': pipeline.tex_slat_normalization,
         'entries': MANIFEST,
@@ -303,42 +315,8 @@ def main():
     with open(os.path.join(args.output_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2, default=str)
 
-    if args.export_glb:
-        # Wrap raw mesh + tex_voxels into MeshWithVoxel (mirrors what
-        # Trellis2ImageTo3DPipeline.decode_latent does), then call the
-        # official o_voxel.postprocess.to_glb path (Branch 1 — non-remesh):
-        # decimation + cleanup + UV unwrap + texture baking via the
-        # cumesh_xatlas shim. Branch 2 (remesh_narrow_band_dc) is not ported.
-        import o_voxel
-        from trellis2.representations.mesh import MeshWithVoxel
-        m = MeshWithVoxel(
-            mesh.vertices, mesh.faces,
-            origin=[-0.5, -0.5, -0.5], voxel_size=1 / res,
-            coords=tex_voxels.coords[:, 1:],
-            attrs=tex_voxels.feats,
-            voxel_shape=torch.Size([*tex_voxels.shape, *tex_voxels.spatial_shape]),
-            layout=pipeline.pbr_attr_layout,
-        )
-        decim = args.decimation_target if args.decimation_target > 0 else 100000
-        print(f'[glb] o_voxel.postprocess.to_glb decim={decim} '
-              f'tex={args.texture_size}', flush=True)
-        glb = o_voxel.postprocess.to_glb(
-            vertices=m.vertices, faces=m.faces,
-            attr_volume=m.attrs, coords=m.coords,
-            attr_layout=m.layout, voxel_size=m.voxel_size,
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target=decim,
-            texture_size=args.texture_size,
-            remesh=False,
-            verbose=True,
-        )
-        out_glb = os.path.join(args.output_dir, 'textured.glb')
-        glb.export(out_glb)
-        print(f'[glb] wrote {out_glb}', flush=True)
-
     print(f'[done] {len(MANIFEST)} dumps -> {args.output_dir}', flush=True)
-    if torch.cuda.is_available():
-        print(f'[vram peak] {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB', flush=True)
+    print(f'[vram peak] {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB', flush=True)
 
 
 if __name__ == '__main__':
