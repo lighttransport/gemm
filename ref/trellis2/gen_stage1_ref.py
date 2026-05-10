@@ -44,9 +44,11 @@ def load_dinov3_from_timm(timm_path, device):
     new_sd['embeddings.patch_embeddings.weight'] = timm_sd['patch_embed.proj.weight']
     new_sd['embeddings.patch_embeddings.bias'] = timm_sd['patch_embed.proj.bias']
 
+    # transformers >=4.57 drops the `model.` prefix on DINOv3 layers.
+    layer_prefix = 'model.layer' if hasattr(model, 'model') else 'layer'
     for i in range(24):
         tp = f'blocks.{i}.'
-        hp = f'model.layer.{i}.'
+        hp = f'{layer_prefix}.{i}.'
         new_sd[f'{hp}norm1.weight'] = timm_sd[f'{tp}norm1.weight']
         new_sd[f'{hp}norm1.bias']   = timm_sd[f'{tp}norm1.bias']
         new_sd[f'{hp}norm2.weight'] = timm_sd[f'{tp}norm2.weight']
@@ -118,7 +120,7 @@ def extract_dinov3_features(model, image_path, image_size=512):
     with torch.no_grad():
         hidden = model.embeddings(x, bool_masked_pos=None)
         pos_emb = model.rope_embeddings(x)
-        for layer in model.model.layer:
+        for layer in (model.model.layer if hasattr(model, 'model') else model.layer):
             hidden = layer(hidden, position_embeddings=pos_emb)
     return F.layer_norm(hidden, hidden.shape[-1:])
 
