@@ -43,6 +43,43 @@ typedef struct {
 
 typedef struct t2_shape_dec t2_shape_dec;
 
+/* ---- Public struct definitions (visible to consumers without IMPL) ---- */
+/* ConvNeXtBlock weights */
+typedef struct {
+    float *conv_w, *conv_b;   /* [C, 27, C], [C] */
+    float *norm_w, *norm_b;   /* [C] */
+    float *mlp0_w, *mlp0_b;  /* [4C, C] */
+    float *mlp2_w, *mlp2_b;  /* [C, 4C] */
+    int C;
+} t2sd_convnext;
+
+/* Channel-to-Spatial block weights */
+typedef struct {
+    float *norm1_w, *norm1_b;       /* [C_in] */
+    float *conv1_w, *conv1_b;       /* [C_out*8, 27, C_in] */
+    float *conv2_w, *conv2_b;       /* [C_out, 27, C_out] */
+    float *to_subdiv_w, *to_subdiv_b; /* [8, C_in] */
+    int C_in, C_out;
+} t2sd_c2s;
+
+#define T2SD_MAX_BLOCKS 20
+#define T2SD_MAX_STAGES 5
+
+struct t2_shape_dec {
+    float *from_latent_w, *from_latent_b;  /* [1024, 32] */
+    float *output_w, *output_b;             /* [out_channels, 64] */
+    int out_channels;                       /* 7 for shape, 6 for texture */
+
+    /* Stages: each has N convnext blocks + 1 C2S block */
+    int n_stages;
+    int n_convnext[T2SD_MAX_STAGES];
+    int channels[T2SD_MAX_STAGES];  /* [1024, 512, 256, 128, 64] */
+    t2sd_convnext convnext[T2SD_MAX_STAGES][T2SD_MAX_BLOCKS];
+    t2sd_c2s c2s[T2SD_MAX_STAGES];
+
+    void *st_ctx;
+};
+
 /* Per-stage subdivision guide (from shape encoder's _spatial_cache
  * 'channel2spatial_2'). Each stage's (idx, subidx) tells the C2S block
  * which of the 8 children to emit from each coarse voxel: for fine voxel k
@@ -77,6 +114,23 @@ t2_shape_dec_result t2_shape_dec_forward(t2_shape_dec *d,
     const sp3d_tensor *slat, int n_threads);
 void t2_shape_dec_result_free(t2_shape_dec_result *r);
 
+/* Host-side synthesis of an unguided c2s subdivision guide.
+ *
+ * Given the pre-c2s sparse features `feats [Nc, C_in]` and coords
+ * `coords [Nc, 4]` (b, z, y, x) for stage `stage_idx`, run the model's
+ * to_subdiv linear head on host and produce idx/subidx/x_coords arrays in
+ * the same parent-major / s=0..7-ascending order that t2sd_c2s_forward's
+ * unguided path emits. Used by HIP and other accelerated paths to feed the
+ * existing guided c2s kernel pipeline when no PyT cache is available
+ * (e.g. final-stage shape decoder).
+ *
+ * Caller frees *out_idx, *out_si, *out_xc with free().
+ * Returns 0 on success; non-zero if the stage has no to_subdiv head.
+ */
+int t2_shape_dec_unguided_synth_host(const t2_shape_dec *d, int stage_idx,
+    const float *feats, const int32_t *coords, int Nc,
+    int64_t **out_idx, int64_t **out_si, int32_t **out_xc, int *out_Nf);
+
 #ifdef __cplusplus
 }
 #endif
@@ -98,42 +152,7 @@ void t2_shape_dec_result_free(t2_shape_dec_result *r);
 #define T2SD_AVX2 0
 #endif
 
-/* ---- ConvNeXtBlock weights ---- */
-typedef struct {
-    float *conv_w, *conv_b;   /* [C, 27, C], [C] */
-    float *norm_w, *norm_b;   /* [C] */
-    float *mlp0_w, *mlp0_b;  /* [4C, C] */
-    float *mlp2_w, *mlp2_b;  /* [C, 4C] */
-    int C;
-} t2sd_convnext;
-
-/* ---- Channel-to-Spatial block weights ---- */
-typedef struct {
-    float *norm1_w, *norm1_b;       /* [C_in] */
-    float *conv1_w, *conv1_b;       /* [C_out*8, 27, C_in] */
-    float *conv2_w, *conv2_b;       /* [C_out, 27, C_out] */
-    float *to_subdiv_w, *to_subdiv_b; /* [8, C_in] */
-    int C_in, C_out;
-} t2sd_c2s;
-
-/* ---- Decoder model ---- */
-#define T2SD_MAX_BLOCKS 20
-#define T2SD_MAX_STAGES 5
-
-struct t2_shape_dec {
-    float *from_latent_w, *from_latent_b;  /* [1024, 32] */
-    float *output_w, *output_b;             /* [out_channels, 64] */
-    int out_channels;                       /* 7 for shape, 6 for texture */
-
-    /* Stages: each has N convnext blocks + 1 C2S block */
-    int n_stages;
-    int n_convnext[T2SD_MAX_STAGES];
-    int channels[T2SD_MAX_STAGES];  /* [1024, 512, 256, 128, 64] */
-    t2sd_convnext convnext[T2SD_MAX_STAGES][T2SD_MAX_BLOCKS];
-    t2sd_c2s c2s[T2SD_MAX_STAGES];
-
-    void *st_ctx;
-};
+/* (struct/typedef definitions moved to public header section above) */
 
 static double t2sd_time_ms(void) {
     struct timespec ts;
@@ -244,6 +263,13 @@ static void t2sd_gelu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float v = x[i];
         x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+    }
+}
+
+static void t2sd_silu(float *x, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = x[i];
+        x[i] = v / (1.0f + expf(-v));
     }
 }
 
@@ -462,22 +488,63 @@ static void t2sd_sparse_conv(float *dst, const sp3d_tensor *t,
 
 /* ---- Forward helpers ---- */
 
-static void t2sd_convnext_forward(float *feats, int N, const t2sd_convnext *blk,
-                                    sp3d_tensor *t, int n_threads) {
+static void t2sd_dump_npy(const char *path, const float *data, int N, int C) {
+    FILE *f = fopen(path, "wb"); if (!f) return;
+    char hdr[256]; int hl = snprintf(hdr, sizeof hdr,
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", N, C);
+    while ((hl + 10) % 16 != 0) hdr[hl++] = ' '; hdr[hl++] = '\n'; hdr[hl] = 0;
+    fwrite("\x93NUMPY\x01\x00", 1, 8, f);
+    uint16_t hl16 = (uint16_t)hl; fwrite(&hl16, 2, 1, f);
+    fwrite(hdr, 1, hl, f);
+    fwrite(data, sizeof(float), (size_t)N*C, f);
+    fclose(f);
+}
+
+static int g_t2sd_op_stage = -1, g_t2sd_op_block = -1, g_t2sd_op_op = -1;
+static const char *g_t2sd_op_path = NULL;
+static int g_t2sd_op_init = 0;
+static void t2sd_op_init(void) {
+    if (g_t2sd_op_init) return; g_t2sd_op_init = 1;
+    const char *e = getenv("T2SD_STOP_AFTER_OP");  /* "<S>:<B>:<OP>" */
+    if (e && e[0]) sscanf(e, "%d:%d:%d", &g_t2sd_op_stage, &g_t2sd_op_block, &g_t2sd_op_op);
+    g_t2sd_op_path = getenv("T2SD_DUMP_PATH");
+}
+
+static void t2sd_convnext_forward_indexed(float *feats, int N, const t2sd_convnext *blk,
+                                    sp3d_tensor *t, int n_threads, int stage, int block) {
     int C = blk->C;
     float *tmp = (float *)malloc((size_t)N * C * sizeof(float));
     float *mlp_buf = (float *)malloc((size_t)N * 4 * C * sizeof(float));
 
+    t2sd_op_init();
+    int do_dump = (g_t2sd_op_path && stage == g_t2sd_op_stage && block == g_t2sd_op_block);
+
     /* conv(feats) -> tmp */
     t2sd_sparse_conv(tmp, t, blk->conv_w, blk->conv_b, C, C, n_threads);
+    if (do_dump && g_t2sd_op_op == 0) {
+        t2sd_dump_npy(g_t2sd_op_path, tmp, N, C);
+        fprintf(stderr, "shape_dec: dumped s%d-b%d-op0 (post-conv) [%d,%d]\n", stage, block, N, C);
+        free(tmp); free(mlp_buf); exit(0);
+    }
 
     /* layernorm(tmp) */
     t2sd_layernorm_mt(tmp, tmp, blk->norm_w, blk->norm_b, N, C, 1e-6f, n_threads);
+    if (do_dump && g_t2sd_op_op == 1) {
+        t2sd_dump_npy(g_t2sd_op_path, tmp, N, C);
+        fprintf(stderr, "shape_dec: dumped s%d-b%d-op1 (post-ln) [%d,%d]\n", stage, block, N, C);
+        free(tmp); free(mlp_buf); exit(0);
+    }
 
-    /* mlp: Linear(C, 4C) -> GELU -> Linear(4C, C) */
+    /* mlp: Linear(C, 4C) -> SiLU -> Linear(4C, C)
+     * SparseConvNeXtBlock3d uses nn.SiLU (sparse_unet_vae.py:280). */
     t2sd_linear_mt(mlp_buf, tmp, N, blk->mlp0_w, blk->mlp0_b, 4 * C, C, n_threads);
-    t2sd_gelu(mlp_buf, N * 4 * C);
+    t2sd_silu(mlp_buf, N * 4 * C);
     t2sd_linear_mt(tmp, mlp_buf, N, blk->mlp2_w, blk->mlp2_b, C, 4 * C, n_threads);
+    if (do_dump && g_t2sd_op_op == 2) {
+        t2sd_dump_npy(g_t2sd_op_path, tmp, N, C);
+        fprintf(stderr, "shape_dec: dumped s%d-b%d-op2 (post-mlp) [%d,%d]\n", stage, block, N, C);
+        free(tmp); free(mlp_buf); exit(0);
+    }
 
     /* residual: feats += tmp */
 #if T2SD_AVX2
@@ -496,8 +563,22 @@ static void t2sd_convnext_forward(float *feats, int N, const t2sd_convnext *blk,
     free(mlp_buf);
 }
 
+static void t2sd_convnext_forward(float *feats, int N, const t2sd_convnext *blk,
+                                    sp3d_tensor *t, int n_threads) {
+    t2sd_convnext_forward_indexed(feats, N, blk, t, n_threads, -1, -1);
+}
+
+/* Counter incremented at each c2s call (one per stage). Allows env-gated
+ * intermediate dumps for a specific stage: T2SD_C2S_DUMP_STAGE=<S>. */
+static int g_t2sd_c2s_call_idx = 0;
 static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
     const t2_shape_dec_subdiv_stage *guide, int n_threads) {
+    int g_c2s_dump_stage = -1;
+    {
+        const char *e = getenv("T2SD_C2S_DUMP_STAGE");
+        if (e) g_c2s_dump_stage = atoi(e);
+    }
+    int g_c2s_this_stage = g_t2sd_c2s_call_idx++;
     /* Upstream SparseResBlockC2S3d._forward (sparse_unet_vae.py:240):
      *   h = silu(norm1_affine(x.feats))
      *   h = conv1(h)                        # C_in -> C_out*8
@@ -549,10 +630,14 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
         float v = normed[i];
         normed[i] = v / (1.0f + expf(-v));  /* SiLU */
     }
+    if (g_c2s_this_stage == g_c2s_dump_stage)
+        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_pre_conv1.npy", normed, N, C_in);
     float *expanded = (float *)malloc((size_t)N * C_out * 8 * sizeof(float));
     sp3d_tensor *t_normed = sp3d_replace_feats(t, normed, C_in);
     t2sd_sparse_conv(expanded, t_normed, blk->conv1_w, blk->conv1_b,
                          C_in, C_out * 8, n_threads);
+    if (g_c2s_this_stage == g_c2s_dump_stage)
+        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_conv1.npy", expanded, N, C_out * 8);
     sp3d_free(t_normed);
     free(normed);
 
@@ -619,6 +704,10 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
     if (sub_logits) free(sub_logits);
     free(expanded);
 
+    if (g_c2s_this_stage == g_c2s_dump_stage) {
+        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_updown_h.npy", h_fine, total_sub, C_out);
+        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_updown_x.npy", x_fine, total_sub, C_in8);
+    }
     /* 4. Build fine sparse tensor from h_fine for conv2. */
     sp3d_tensor *t_sub = sp3d_create(sub_coords, h_fine, total_sub, C_out, 1);
     free(sub_coords);
@@ -630,10 +719,14 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
         float v = h_normed[i];
         h_normed[i] = v / (1.0f + expf(-v));
     }
+    if (g_c2s_this_stage == g_c2s_dump_stage)
+        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_pre_conv2.npy", h_normed, total_sub, C_out);
     sp3d_tensor *t_sub_normed = sp3d_replace_feats(t_sub, h_normed, C_out);
     float *conv2_out = (float *)malloc((size_t)total_sub * C_out * sizeof(float));
     t2sd_sparse_conv(conv2_out, t_sub_normed, blk->conv2_w, blk->conv2_b,
                          C_out, C_out, n_threads);
+    if (g_c2s_this_stage == g_c2s_dump_stage)
+        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_conv2.npy", conv2_out, total_sub, C_out);
     sp3d_free(t_sub_normed);
     free(h_normed);
     free(h_fine);
@@ -673,6 +766,37 @@ t2_shape_dec_result t2_shape_dec_forward_guided(t2_shape_dec *d,
     sp3d_tensor *t = sp3d_create(slat->coords, feats, N, C, 1);
     free(feats);
 
+    /* Optional dump after from_latent for HIP cross-validation. */
+    {
+        const char *flag = getenv("T2SD_STOP_AFTER_LATENT");
+        if (flag && atoi(flag)) {
+            const char *p = getenv("T2SD_DUMP_PATH");
+            if (p && p[0]) {
+                FILE *f = fopen(p, "wb");
+                if (f) {
+                    char hdr[256]; int hl = snprintf(hdr, sizeof hdr,
+                        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                        t->N, t->C);
+                    while ((hl + 10) % 16 != 0) hdr[hl++] = ' ';
+                    hdr[hl++] = '\n'; hdr[hl] = 0;
+                    fwrite("\x93NUMPY\x01\x00", 1, 8, f);
+                    uint16_t hl16 = (uint16_t)hl; fwrite(&hl16, 2, 1, f);
+                    fwrite(hdr, 1, hl, f);
+                    fwrite(t->feats, sizeof(float), (size_t)t->N * t->C, f);
+                    fclose(f);
+                    fprintf(stderr, "shape_dec: dumped post-latent to %s [%d,%d]\n", p, t->N, t->C);
+                }
+            }
+            result.feats = (float *)malloc((size_t)t->N * t->C * sizeof(float));
+            memcpy(result.feats, t->feats, (size_t)t->N * t->C * sizeof(float));
+            result.coords = (int32_t *)malloc((size_t)t->N * 4 * sizeof(int32_t));
+            memcpy(result.coords, t->coords, (size_t)t->N * 4 * sizeof(int32_t));
+            result.N = t->N; result.C = t->C;
+            sp3d_free(t);
+            return result;
+        }
+    }
+
     int required_guide_stages = 0;
     for (int stage = 0; stage < d->n_stages; stage++) {
         if (d->c2s[stage].conv1_w) required_guide_stages++;
@@ -701,7 +825,41 @@ t2_shape_dec_result t2_shape_dec_forward_guided(t2_shape_dec *d,
         double ts0 = t2sd_time_ms();
 
         for (int b = 0; b < nc; b++) {
-            t2sd_convnext_forward(t->feats, t->N, &d->convnext[stage][b], t, n_threads);
+            t2sd_convnext_forward_indexed(t->feats, t->N, &d->convnext[stage][b], t, n_threads, stage, b);
+            /* Optional intra-stage dump: T2SD_STOP_AFTER_STAGE_BLOCK="<S>:<B>". */
+            const char *sb = getenv("T2SD_STOP_AFTER_STAGE_BLOCK");
+            if (sb && sb[0]) {
+                int ws=-1, wb=-1; sscanf(sb, "%d:%d", &ws, &wb);
+                if (ws == stage && wb == b) {
+                    const char *p = getenv("T2SD_DUMP_PATH");
+                    if (p && p[0]) {
+                        FILE *f = fopen(p, "wb");
+                        if (f) {
+                            char hdr[256]; int hl = snprintf(hdr, sizeof hdr,
+                                "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                                t->N, t->C);
+                            while ((hl + 10) % 16 != 0) hdr[hl++] = ' ';
+                            hdr[hl++] = '\n'; hdr[hl] = 0;
+                            fwrite("\x93NUMPY\x01\x00", 1, 8, f);
+                            uint16_t hl16 = (uint16_t)hl; fwrite(&hl16, 2, 1, f);
+                            fwrite(hdr, 1, hl, f);
+                            fwrite(t->feats, sizeof(float), (size_t)t->N*t->C, f);
+                            fclose(f);
+                            fprintf(stderr, "shape_dec: dumped post-stage%d-block%d to %s [%d,%d]\n",
+                                    stage, b, p, t->N, t->C);
+                        }
+                    }
+                    sp3d_tensor *out = sp3d_create(t->coords, t->feats, t->N, t->C, 1);
+                    sp3d_free(t);
+                    result.N = out->N; result.C = out->C;
+                    result.coords = (int32_t *)malloc((size_t)out->N*4*sizeof(int32_t));
+                    memcpy(result.coords, out->coords, (size_t)out->N*4*sizeof(int32_t));
+                    result.feats = (float *)malloc((size_t)out->N*out->C*sizeof(float));
+                    memcpy(result.feats, out->feats, (size_t)out->N*out->C*sizeof(float));
+                    sp3d_free(out);
+                    return result;
+                }
+            }
         }
 
         double ts1 = t2sd_time_ms();
@@ -911,6 +1069,53 @@ t2_shape_dec *t2_shape_dec_load(const char *st_path) {
 }
 
 #endif /* SAFETENSORS_H */
+
+int t2_shape_dec_unguided_synth_host(const t2_shape_dec *d, int stage_idx,
+    const float *feats, const int32_t *coords, int Nc,
+    int64_t **out_idx, int64_t **out_si, int32_t **out_xc, int *out_Nf)
+{
+    if (!d || stage_idx < 0 || stage_idx >= d->n_stages) return -1;
+    const t2sd_c2s *blk = &d->c2s[stage_idx];
+    if (!blk->to_subdiv_w) return -2;
+    int Ci = blk->C_in;
+    /* logits = feats @ to_subdiv_w.T + b ; to_subdiv_w is [8, Ci]. */
+    float *logits = (float *)malloc((size_t)Nc * 8 * sizeof(float));
+    for (int i = 0; i < Nc; i++) {
+        const float *f = feats + (size_t)i * Ci;
+        for (int j = 0; j < 8; j++) {
+            const float *w = blk->to_subdiv_w + (size_t)j * Ci;
+            float s = blk->to_subdiv_b ? blk->to_subdiv_b[j] : 0.0f;
+            for (int c = 0; c < Ci; c++) s += w[c] * f[c];
+            logits[i * 8 + j] = s;
+        }
+    }
+    int Nf = 0;
+    for (int i = 0; i < Nc * 8; i++) if (logits[i] > 0) Nf++;
+    int64_t *idx = (int64_t *)malloc((size_t)Nf * sizeof(int64_t));
+    int64_t *si  = (int64_t *)malloc((size_t)Nf * sizeof(int64_t));
+    int32_t *xc  = (int32_t *)malloc((size_t)Nf * 4 * sizeof(int32_t));
+    int kw = 0;
+    for (int i = 0; i < Nc; i++) {
+        int32_t bz = coords[i * 4 + 0];
+        int32_t cz = coords[i * 4 + 1];
+        int32_t cy = coords[i * 4 + 2];
+        int32_t cx = coords[i * 4 + 3];
+        for (int s = 0; s < 8; s++) {
+            if (logits[i * 8 + s] <= 0) continue;
+            int dz = (s >> 2) & 1, dy = (s >> 1) & 1, dx = s & 1;
+            idx[kw] = i;
+            si[kw]  = s;
+            xc[kw * 4 + 0] = bz;
+            xc[kw * 4 + 1] = cz * 2 + dz;
+            xc[kw * 4 + 2] = cy * 2 + dy;
+            xc[kw * 4 + 3] = cx * 2 + dx;
+            kw++;
+        }
+    }
+    free(logits);
+    *out_idx = idx; *out_si = si; *out_xc = xc; *out_Nf = Nf;
+    return 0;
+}
 
 void t2_shape_dec_free(t2_shape_dec *d) {
     if (!d) return;
