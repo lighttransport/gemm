@@ -25,7 +25,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N1905_Ci1024_Co1024_SPLITK4/kernel.hsaco",
+    "hsaco": "kernels/N1905_Ci1024_Co1024_SPLITK4/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_splitk_kernel",
     "shared": 12288
   },
@@ -55,7 +55,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N1905_Ci1024_Co4096_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N1905_Ci1024_Co4096_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 16384
   },
@@ -85,7 +85,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N8452_Ci512_Co512_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N8452_Ci512_Co512_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 12288
   },
@@ -115,7 +115,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N8452_Ci512_Co2048_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N8452_Ci512_Co2048_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 12288
   },
@@ -145,7 +145,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N38321_Ci256_Co256_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N38321_Ci256_Co256_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 12288
   },
@@ -175,7 +175,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N38321_Ci256_Co1024_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N38321_Ci256_Co1024_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 12288
   },
@@ -205,7 +205,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N178651_Ci128_Co128_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N178651_Ci128_Co128_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 12288
   },
@@ -235,7 +235,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N178651_Ci128_Co512_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N178651_Ci128_Co512_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 12288
   },
@@ -265,7 +265,7 @@
       "pre_hook": null,
       "ir_override": null
     },
-    "hsaco": "/mnt/disk1/work/gemm/trellis2/rdna4/trellis2/triton_aot/kernels/N822874_Ci64_Co64_SPLITK1/kernel.hsaco",
+    "hsaco": "kernels/N822874_Ci64_Co64_SPLITK1/kernel.hsaco",
     "kernel_symbol": "sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel",
     "shared": 8192
   }
