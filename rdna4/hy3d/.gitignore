@@ -9,6 +9,11 @@ wmma_selftest
 traces/
 ref_env/.venv/
 bench/perf_results.md
+bench/layer_results.md
+
+# rocprof outputs
+rocp_*.csv
+rocp_*.json
 
 # uv lockfile + egg-info from ref_env
 ref_env/uv.lock
