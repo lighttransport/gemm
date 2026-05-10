@@ -574,11 +574,16 @@ static int g_t2sd_c2s_call_idx = 0;
 static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
     const t2_shape_dec_subdiv_stage *guide, int n_threads) {
     int g_c2s_dump_stage = -1;
+    const char *g_c2s_dump_dir = getenv("T2SD_C2S_DUMP_DIR");
     {
         const char *e = getenv("T2SD_C2S_DUMP_STAGE");
         if (e) g_c2s_dump_stage = atoi(e);
     }
+    if (!g_c2s_dump_dir || !*g_c2s_dump_dir) g_c2s_dump_stage = -1;
     int g_c2s_this_stage = g_t2sd_c2s_call_idx++;
+    char g_c2s_dump_path[1024];
+#define T2SD_DUMP_PATH(name) \
+    (snprintf(g_c2s_dump_path, sizeof(g_c2s_dump_path), "%s/%s", g_c2s_dump_dir, (name)), g_c2s_dump_path)
     /* Upstream SparseResBlockC2S3d._forward (sparse_unet_vae.py:240):
      *   h = silu(norm1_affine(x.feats))
      *   h = conv1(h)                        # C_in -> C_out*8
@@ -631,13 +636,13 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
         normed[i] = v / (1.0f + expf(-v));  /* SiLU */
     }
     if (g_c2s_this_stage == g_c2s_dump_stage)
-        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_pre_conv1.npy", normed, N, C_in);
+        t2sd_dump_npy(T2SD_DUMP_PATH("cpu_c2s_pre_conv1.npy"), normed, N, C_in);
     float *expanded = (float *)malloc((size_t)N * C_out * 8 * sizeof(float));
     sp3d_tensor *t_normed = sp3d_replace_feats(t, normed, C_in);
     t2sd_sparse_conv(expanded, t_normed, blk->conv1_w, blk->conv1_b,
                          C_in, C_out * 8, n_threads);
     if (g_c2s_this_stage == g_c2s_dump_stage)
-        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_conv1.npy", expanded, N, C_out * 8);
+        t2sd_dump_npy(T2SD_DUMP_PATH("cpu_c2s_post_conv1.npy"), expanded, N, C_out * 8);
     sp3d_free(t_normed);
     free(normed);
 
@@ -705,8 +710,8 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
     free(expanded);
 
     if (g_c2s_this_stage == g_c2s_dump_stage) {
-        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_updown_h.npy", h_fine, total_sub, C_out);
-        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_updown_x.npy", x_fine, total_sub, C_in8);
+        t2sd_dump_npy(T2SD_DUMP_PATH("cpu_c2s_post_updown_h.npy"), h_fine, total_sub, C_out);
+        t2sd_dump_npy(T2SD_DUMP_PATH("cpu_c2s_post_updown_x.npy"), x_fine, total_sub, C_in8);
     }
     /* 4. Build fine sparse tensor from h_fine for conv2. */
     sp3d_tensor *t_sub = sp3d_create(sub_coords, h_fine, total_sub, C_out, 1);
@@ -720,13 +725,13 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
         h_normed[i] = v / (1.0f + expf(-v));
     }
     if (g_c2s_this_stage == g_c2s_dump_stage)
-        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_pre_conv2.npy", h_normed, total_sub, C_out);
+        t2sd_dump_npy(T2SD_DUMP_PATH("cpu_c2s_pre_conv2.npy"), h_normed, total_sub, C_out);
     sp3d_tensor *t_sub_normed = sp3d_replace_feats(t_sub, h_normed, C_out);
     float *conv2_out = (float *)malloc((size_t)total_sub * C_out * sizeof(float));
     t2sd_sparse_conv(conv2_out, t_sub_normed, blk->conv2_w, blk->conv2_b,
                          C_out, C_out, n_threads);
     if (g_c2s_this_stage == g_c2s_dump_stage)
-        t2sd_dump_npy("/mnt/disk1/tmp/c2s_dump/cpu_c2s_post_conv2.npy", conv2_out, total_sub, C_out);
+        t2sd_dump_npy(T2SD_DUMP_PATH("cpu_c2s_post_conv2.npy"), conv2_out, total_sub, C_out);
     sp3d_free(t_sub_normed);
     free(h_normed);
     free(h_fine);
@@ -745,6 +750,7 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
     free(conv2_out);
 
     return t_sub;
+#undef T2SD_DUMP_PATH
 }
 
 /* ---- Full forward ---- */
