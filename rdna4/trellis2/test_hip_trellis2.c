@@ -239,11 +239,19 @@ static void print_usage(const char *prog) {
         "  --decode-only    Decoder only (requires --latent)\n"
         "  --dump-blocks    Dump all 30 block hidden states for verification\n"
         "  --verify-step N  Run N steps, save hip_latent_stepN.npy per step\n"
+        "  --mesh           After --full, run SLAT DiT + shape_dec -> OBJ mesh\n"
         "\n"
         "Required:\n"
         "  --dit    <path>   Stage 1 DiT safetensors\n"
         "  --decoder <path>  Decoder safetensors\n"
         "  --features <npy>  DINOv3 features [1029, 1024] (required for dit modes)\n"
+        "\n"
+        "--mesh extras:\n"
+        "  --slat-dit <path>   Shape SLAT DiT safetensors\n"
+        "  --shape-dec <path>  shape_dec safetensors\n"
+        "  --manifest <json>   manifest.json with shape_slat_normalization\n"
+        "  --save-mesh <obj>   Output mesh path\n"
+        "  --slat-steps N      SLAT Euler steps (default 12)\n"
         "\n"
         "Optional:\n"
         "  --noise <npy>     Initial noise [4096, 8] (default: random)\n"
@@ -256,10 +264,92 @@ static void print_usage(const char *prog) {
         prog);
 }
 
+/* ======================================================================== */
+/* End-to-end mesh path                                                     */
+/* ======================================================================== */
+
+/* Parse 32-element float array under JSON key 'shape_slat_normalization'.
+ * Returns 0 on success, fills mean[32] and std[32]. */
+static int parse_shape_norm(const char *manifest_path, float *mean, float *std) {
+    FILE *f = fopen(manifest_path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return -1; }
+    buf[sz] = '\0'; fclose(f);
+
+    char *root = strstr(buf, "\"shape_slat_normalization\"");
+    if (!root) { free(buf); return -2; }
+    for (int pass = 0; pass < 2; pass++) {
+        const char *key = pass ? "\"std\"" : "\"mean\"";
+        char *k = strstr(root, key);
+        if (!k) { free(buf); return -3; }
+        char *lb = strchr(k, '['); if (!lb) { free(buf); return -3; }
+        char *p = lb + 1;
+        for (int i = 0; i < 32; i++) {
+            while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+            char *end;
+            float v = strtof(p, &end);
+            if (end == p) { free(buf); return -4; }
+            (pass ? std : mean)[i] = v;
+            p = end;
+        }
+    }
+    free(buf);
+    return 0;
+}
+
+/* Tiny .npy reader for int32 (no fortran_order support — used for coords). */
+static int32_t *read_npy_i32(const char *path, int *ndim, int *dims) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Cannot read %s\n", path); return NULL; }
+    fseek(f, 8, SEEK_SET);
+    uint16_t hl; if (fread(&hl, 2, 1, f) != 1) { fclose(f); return NULL; }
+    char *h = (char *)malloc(hl + 1);
+    if (fread(h, 1, hl, f) != (size_t)hl) { free(h); fclose(f); return NULL; }
+    h[hl] = '\0';
+    *ndim = 0;
+    char *sp = strstr(h, "shape");
+    if (sp) { sp = strchr(sp, '('); if (sp) { sp++;
+        while (*sp && *sp != ')') {
+            while (*sp == ' ' || *sp == ',') sp++;
+            if (*sp == ')') break;
+            dims[*ndim] = (int)strtol(sp, &sp, 10);
+            (*ndim)++;
+            if (*ndim >= 8) break;
+        } } }
+    size_t ne = 1; for (int i = 0; i < *ndim; i++) ne *= (size_t)dims[i];
+    int32_t *data = (int32_t *)malloc(ne * sizeof(int32_t));
+    size_t got = fread(data, sizeof(int32_t), ne, f);
+    fclose(f); free(h);
+    if (got != ne) fprintf(stderr, "Warning: i32 read %zu of %zu\n", got, ne);
+    return data;
+}
+
+/* Static OBJ writer (vertices + triangles, 1-based indexing). */
+static int write_obj(const char *path, const float *verts, int n_verts,
+                     const int *tris, int n_tris) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return -1; }
+    for (int i = 0; i < n_verts; i++)
+        fprintf(f, "v %.6f %.6f %.6f\n", verts[i*3+0], verts[i*3+1], verts[i*3+2]);
+    for (int i = 0; i < n_tris; i++)
+        fprintf(f, "f %d %d %d\n", tris[i*3+0]+1, tris[i*3+1]+1, tris[i*3+2]+1);
+    fclose(f);
+    return 0;
+}
+
+/* ======================================================================== */
+
 int main(int argc, char **argv) {
     /* --- Parse args --- */
     const char *dit_path     = NULL;
     const char *dec_path     = NULL;
+    const char *slat_path    = NULL;
+    const char *shape_dec_path = NULL;
+    const char *manifest_path = NULL;
+    const char *save_mesh_path = NULL;
     const char *feat_path    = NULL;
     const char *noise_path   = NULL;
     const char *latent_path  = NULL;
@@ -267,6 +357,7 @@ int main(int argc, char **argv) {
     int device_id   = 0;
     int verbose     = 0;
     int n_steps     = 12;
+    int slat_steps  = 12;
     uint64_t seed   = 42;
     int verify_n    = -1;
     int no_cfg      = 0;
@@ -279,6 +370,10 @@ int main(int argc, char **argv) {
     int mode_dump_blocks = 0;
     int mode_verify_step = 0;
     int mode_dump_b0     = 0;
+    int mode_mesh        = 0;
+    int mode_shape_only  = 0;
+    const char *shape_feats_npy = NULL;
+    const char *shape_coords_npy = NULL;
 
     if (argc < 2) { print_usage(argv[0]); return 1; }
 
@@ -304,6 +399,15 @@ int main(int argc, char **argv) {
             mode_verify_step = 1;
             verify_n = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--slat-dit") && i+1 < argc) slat_path = argv[++i];
+        else if (!strcmp(argv[i], "--shape-dec") && i+1 < argc) shape_dec_path = argv[++i];
+        else if (!strcmp(argv[i], "--manifest") && i+1 < argc) manifest_path = argv[++i];
+        else if (!strcmp(argv[i], "--save-mesh") && i+1 < argc) save_mesh_path = argv[++i];
+        else if (!strcmp(argv[i], "--mesh"))           mode_mesh = 1;
+        else if (!strcmp(argv[i], "--slat-steps") && i+1 < argc) slat_steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--shape-only"))    mode_shape_only = 1;
+        else if (!strcmp(argv[i], "--shape-feats-npy") && i+1 < argc) shape_feats_npy = argv[++i];
+        else if (!strcmp(argv[i], "--shape-coords-npy") && i+1 < argc) shape_coords_npy = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]); return 0;
         }
@@ -311,8 +415,46 @@ int main(int argc, char **argv) {
 
     /* Default mode: full */
     if (!mode_full && !mode_dit_only && !mode_decode_only &&
-        !mode_dump_blocks && !mode_verify_step && !mode_dump_b0) {
+        !mode_dump_blocks && !mode_verify_step && !mode_dump_b0 && !mode_shape_only) {
         mode_full = 1;
+    }
+
+    /* Shape-only fast path: load shape_dec, run on user-provided feats+coords,
+     * write OBJ, exit. Bypasses DiT / decoder / SLAT entirely. */
+    if (mode_shape_only) {
+        if (!shape_dec_path || !shape_feats_npy || !shape_coords_npy || !save_mesh_path) {
+            fprintf(stderr, "Error: --shape-only requires --shape-dec, --shape-feats-npy, "
+                            "--shape-coords-npy, --save-mesh\n"); return 1;
+        }
+        hip_trellis2_runner *r = hip_trellis2_init(device_id, verbose);
+        if (!r) { fprintf(stderr, "init failed\n"); return 1; }
+        if (hip_trellis2_load_shape_dec(r, shape_dec_path) != 0) {
+            fprintf(stderr, "load_shape_dec failed\n"); hip_trellis2_free(r); return 1;
+        }
+        int fnd = 0, fdims[8] = {0};
+        float *feats = read_npy_f32(shape_feats_npy, &fnd, fdims);
+        int cnd = 0, cdims[8] = {0};
+        int32_t *coords = read_npy_i32(shape_coords_npy, &cnd, cdims);
+        if (!feats || !coords) { fprintf(stderr, "bad feats/coords\n"); return 1; }
+        int N = fdims[0], C = fdims[1];
+        if (cnd != 2 || cdims[0] != N || cdims[1] != 4) {
+            fprintf(stderr, "coords shape mismatch: expect [N=%d,4]\n", N); return 1;
+        }
+        fprintf(stderr, "shape-only: N=%d C=%d -> shape_dec\n", N, C);
+        hip_trellis2_mesh mesh = {0};
+        double t0 = now_ms();
+        if (hip_trellis2_run_shape_dec(r, feats, coords, N, C, &mesh) != 0) {
+            fprintf(stderr, "run_shape_dec failed\n"); return 1;
+        }
+        fprintf(stderr, "shape_dec: %.1f ms, mesh: %d verts, %d tris\n",
+                now_ms() - t0, mesh.n_verts, mesh.n_tris);
+        if (write_obj(save_mesh_path, mesh.vertices, mesh.n_verts,
+                      mesh.triangles, mesh.n_tris) == 0)
+            fprintf(stderr, "Wrote %s\n", save_mesh_path);
+        hip_trellis2_shape_dec_mesh_free(&mesh);
+        free(feats); free(coords);
+        hip_trellis2_free(r);
+        return 0;
     }
 
     /* Validate */
@@ -330,6 +472,15 @@ int main(int argc, char **argv) {
     }
     if (mode_decode_only && !latent_path) {
         fprintf(stderr, "Error: --latent required for --decode-only\n"); return 1;
+    }
+    if (mode_mesh) {
+        if (!mode_full) {
+            fprintf(stderr, "Error: --mesh requires --full\n"); return 1;
+        }
+        if (!slat_path || !shape_dec_path || !manifest_path || !save_mesh_path) {
+            fprintf(stderr, "Error: --mesh requires --slat-dit, --shape-dec, "
+                            "--manifest, --save-mesh\n"); return 1;
+        }
     }
 
     /* Shapes */
@@ -684,7 +835,178 @@ int main(int argc, char **argv) {
                 output_dir);
 
         free(lat_cf);
-        free(x); free(vel); free(occupancy);
+        free(x); free(vel);
+
+        /* ============================================================== */
+        /* End-to-end: occupancy -> SLAT sampler -> shape_dec -> mesh.obj */
+        /* ============================================================== */
+        if (mode_mesh) {
+            fprintf(stderr, "\n=== Stage 2: SLAT DiT + shape_dec -> mesh ===\n");
+
+            /* Pipeline post-process: occ_64 = (logits > 0); occ_32 = max_pool3d(2,2)
+             * > 0.5; coords = argwhere(occ_32) at resolution 32. SLAT DiT was
+             * trained on coords in [0,32). */
+            uint8_t *occ32 = (uint8_t *)calloc(32*32*32, 1);
+            for (int z = 0; z < 64; z++)
+                for (int y = 0; y < 64; y++)
+                    for (int xi = 0; xi < 64; xi++)
+                        if (occupancy[z*64*64 + y*64 + xi] > 0.0f) {
+                            occ32[(z>>1)*32*32 + (y>>1)*32 + (xi>>1)] = 1;
+                        }
+            int N_sparse = 0;
+            for (int i = 0; i < 32*32*32; i++) if (occ32[i]) N_sparse++;
+            if (N_sparse <= 0) {
+                fprintf(stderr, "  No occupied voxels — aborting mesh path\n");
+                free(occ32); free(occupancy); goto cleanup;
+            }
+            int32_t *sparse_coords = (int32_t *)malloc((size_t)N_sparse * 4 * sizeof(int32_t));
+            int idx = 0;
+            /* dump_rocm uses argwhere() which iterates in (b,c,z,y,x) C order.
+             * After the [:, [0,2,3,4]] selection that becomes (b,z,y,x). Match. */
+            for (int z = 0; z < 32; z++)
+                for (int y = 0; y < 32; y++)
+                    for (int xi = 0; xi < 32; xi++) {
+                        if (occ32[z*32*32 + y*32 + xi]) {
+                            sparse_coords[idx*4+0] = 0;
+                            sparse_coords[idx*4+1] = z;
+                            sparse_coords[idx*4+2] = y;
+                            sparse_coords[idx*4+3] = xi;
+                            idx++;
+                        }
+                    }
+            fprintf(stderr, "  Sparse voxels (32^3 max-pool): %d\n", N_sparse);
+            free(occ32); free(occupancy);
+
+            /* Load SLAT DiT + shape_dec. */
+            fprintf(stderr, "  Loading SLAT DiT: %s\n", slat_path);
+            if (hip_trellis2_load_slat_dit(r, slat_path) != 0) {
+                fprintf(stderr, "  SLAT DiT load failed\n");
+                free(sparse_coords); goto cleanup;
+            }
+            fprintf(stderr, "  Loading shape_dec: %s\n", shape_dec_path);
+            if (hip_trellis2_load_shape_dec(r, shape_dec_path) != 0) {
+                fprintf(stderr, "  shape_dec load failed\n");
+                free(sparse_coords); goto cleanup;
+            }
+
+            /* Parse normalization constants. */
+            float slat_mean[32], slat_std[32];
+            if (parse_shape_norm(manifest_path, slat_mean, slat_std) != 0) {
+                fprintf(stderr, "  Failed to parse shape_slat_normalization "
+                                "from %s\n", manifest_path);
+                free(sparse_coords); goto cleanup;
+            }
+            fprintf(stderr, "  slat_norm: mean[0..3]=[%.4f %.4f %.4f] std[0..3]=[%.4f %.4f %.4f]\n",
+                    slat_mean[0], slat_mean[1], slat_mean[2],
+                    slat_std[0], slat_std[1], slat_std[2]);
+
+            /* Initial sparse noise [N, 32], seed+1 to match cuda convention. */
+            const int SLAT_CH = 32;
+            float *s2_x = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
+            rng_seed(seed + 1);
+            for (int i = 0; i < N_sparse * SLAT_CH; i++) s2_x[i] = randn();
+
+            /* CFG zero-cond buffer. */
+            float *neg_cond = (float *)calloc((size_t)N_COND * COND_DIM, sizeof(float));
+            float *v_cond   = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
+            float *v_uncond = (float *)malloc((size_t)N_sparse * SLAT_CH * sizeof(float));
+
+            const float s2_rescale_t = 3.0f;
+            const float s2_cfg       = 7.5f;
+            const float s2_rescale   = 0.7f;
+            const float s2_sigma_min = 1e-5f;
+
+            double t_total = 0;
+            for (int step = 0; step < slat_steps; step++) {
+                float t_lin_a = 1.0f - (float)step       / (float)slat_steps;
+                float t_lin_b = 1.0f - (float)(step + 1) / (float)slat_steps;
+                float t_cur  = s2_rescale_t * t_lin_a / (1.0f + (s2_rescale_t-1.0f)*t_lin_a);
+                float t_next = s2_rescale_t * t_lin_b / (1.0f + (s2_rescale_t-1.0f)*t_lin_b);
+                float dt     = t_cur - t_next;
+                int use_cfg  = (!no_cfg) && (t_cur >= 0.6f && t_cur <= 1.0f);
+
+                double t0 = now_ms();
+                hip_trellis2_invalidate_slat_kv(r);
+                if (hip_trellis2_slat_dit_step(r, s2_x, sparse_coords, N_sparse,
+                                               t_cur, features, N_COND, v_cond) != 0) {
+                    fprintf(stderr, "  SLAT step %d cond failed\n", step);
+                    free(s2_x); free(neg_cond); free(v_cond); free(v_uncond);
+                    free(sparse_coords); goto cleanup;
+                }
+                if (use_cfg) {
+                    hip_trellis2_invalidate_slat_kv(r);
+                    if (hip_trellis2_slat_dit_step(r, s2_x, sparse_coords, N_sparse,
+                                                   t_cur, neg_cond, N_COND, v_uncond) != 0) {
+                        fprintf(stderr, "  SLAT step %d uncond failed\n", step);
+                        free(s2_x); free(neg_cond); free(v_cond); free(v_uncond);
+                        free(sparse_coords); goto cleanup;
+                    }
+                }
+                double step_ms = now_ms() - t0;
+                t_total += step_ms;
+
+                int n = N_sparse * SLAT_CH;
+                if (use_cfg) {
+                    /* CFG combine + rescale (mirrors cuda/test_cuda_trellis2). */
+                    float coeff = s2_sigma_min + (1.0f - s2_sigma_min) * t_cur;
+                    float one_m_sm = 1.0f - s2_sigma_min;
+                    double sum_pos = 0, sum2_pos = 0, sum_cfg = 0, sum2_cfg = 0;
+                    for (int i = 0; i < n; i++) {
+                        float v_cfg = s2_cfg * v_cond[i] + (1.0f - s2_cfg) * v_uncond[i];
+                        v_uncond[i] = v_cfg; /* repurpose as pred_v */
+                        float x0p = one_m_sm * s2_x[i] - coeff * v_cond[i];
+                        float x0c = one_m_sm * s2_x[i] - coeff * v_cfg;
+                        sum_pos += x0p; sum2_pos += (double)x0p * x0p;
+                        sum_cfg += x0c; sum2_cfg += (double)x0c * x0c;
+                    }
+                    double n_d = (double)n;
+                    double std_pos = sqrt((sum2_pos - sum_pos*sum_pos/n_d) / (n_d - 1.0));
+                    double std_cfg_v = sqrt((sum2_cfg - sum_cfg*sum_cfg/n_d) / (n_d - 1.0));
+                    float ratio = (std_cfg_v > 1e-8) ? (float)(std_pos / std_cfg_v) : 1.0f;
+                    float sc = s2_rescale * ratio + (1.0f - s2_rescale);
+                    for (int i = 0; i < n; i++) {
+                        float x0c = one_m_sm * s2_x[i] - coeff * v_uncond[i];
+                        float pred = (one_m_sm * s2_x[i] - sc * x0c) / coeff;
+                        s2_x[i] -= dt * pred;
+                    }
+                } else {
+                    for (int i = 0; i < n; i++) s2_x[i] -= dt * v_cond[i];
+                }
+                fprintf(stderr, "  step %02d/%02d t=%.4f->%.4f %s %.1f ms\n",
+                        step+1, slat_steps, t_cur, t_next,
+                        use_cfg ? "CFG" : "noG", step_ms);
+            }
+            fprintf(stderr, "  SLAT total: %.1f ms (%.1f ms/step)\n",
+                    t_total, t_total / slat_steps);
+            free(neg_cond); free(v_cond); free(v_uncond);
+
+            /* Denormalize: x = x * std + mean. */
+            for (int i = 0; i < N_sparse; i++)
+                for (int c = 0; c < SLAT_CH; c++)
+                    s2_x[i*SLAT_CH + c] = s2_x[i*SLAT_CH + c] * slat_std[c] + slat_mean[c];
+            print_stats("denorm slat", s2_x, N_sparse * SLAT_CH);
+
+            /* Run shape_dec -> mesh. */
+            fprintf(stderr, "  Running shape_dec...\n");
+            double t_dec = now_ms();
+            hip_trellis2_mesh mesh = {0};
+            if (hip_trellis2_run_shape_dec(r, s2_x, sparse_coords,
+                                            N_sparse, SLAT_CH, &mesh) != 0) {
+                fprintf(stderr, "  shape_dec failed\n");
+                free(s2_x); free(sparse_coords); goto cleanup;
+            }
+            fprintf(stderr, "  shape_dec: %.1f ms, mesh: %d verts, %d tris\n",
+                    now_ms() - t_dec, mesh.n_verts, mesh.n_tris);
+
+            if (write_obj(save_mesh_path, mesh.vertices, mesh.n_verts,
+                          mesh.triangles, mesh.n_tris) == 0) {
+                fprintf(stderr, "  Wrote mesh -> %s\n", save_mesh_path);
+            }
+            hip_trellis2_shape_dec_mesh_free(&mesh);
+            free(s2_x); free(sparse_coords);
+        } else {
+            free(occupancy);
+        }
     }
 
 cleanup:
