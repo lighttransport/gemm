@@ -1,0 +1,11 @@
+trellis2_tex_dec_bench.egg-info/
+verify-dumps-rocm/
+verify-dumps-rocm-fp32/
+verify-dumps-rocm*/
+.venv/
+__pycache__/
+*.pyc
+kernels/triton_aot/klin/__pycache__/
+kernels/triton_aot/klin/test_klin_bridge
+*.npy
+*.o

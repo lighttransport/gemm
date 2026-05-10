@@ -1,0 +1,43 @@
+# Build preview_render + image_diff CLIs.
+#
+#   make -f Makefile.preview_render
+#
+# Outputs:
+#   preview_render   render mesh.safetensors with analytic sun+sky -> png/exr/json
+#   image_diff       compare two AOV EXRs from preview_render -> json
+
+CXX      ?= g++
+CXXFLAGS ?= -std=c++17 -O3 \
+            -Wall -Wextra -fopenmp \
+            -msse2 -mavx -mavx2 -mfma -mf16c
+
+PR_TARGET = preview_render
+PR_SRCS   = preview_render_main.cc lightrt.cc tinyexr_impl.cc
+PR_HDRS   = preview_render.h lightrt.hh mesh_io.h safetensors.h \
+            stb_image.h stb_image_write.h tinyexr.h image_stats.h
+
+DIFF_TARGET = image_diff
+DIFF_SRCS   = image_diff_main.cc lightrt.cc tinyexr_impl.cc
+DIFF_HDRS   = preview_render.h lightrt.hh image_stats.h \
+              tinyexr.h safetensors.h
+
+.PHONY: all clean
+
+all: $(PR_TARGET) $(DIFF_TARGET)
+
+$(PR_TARGET): $(PR_SRCS) $(PR_HDRS) stb_image_write_impl.o
+	$(CXX) $(CXXFLAGS) -I. $(PR_SRCS) stb_image_write_impl.o -o $@ -fopenmp -lpthread
+
+$(DIFF_TARGET): $(DIFF_SRCS) $(DIFF_HDRS)
+	$(CXX) $(CXXFLAGS) -I. $(DIFF_SRCS) -o $@ -fopenmp -lpthread
+
+# stb_image_write needs its own translation unit to define the implementation
+# without duplicating it across files.
+stb_image_write_impl.o: stb_image_write.h
+	echo '#define STB_IMAGE_WRITE_IMPLEMENTATION' > _stbiw.cc
+	echo '#include "stb_image_write.h"' >> _stbiw.cc
+	$(CXX) $(CXXFLAGS) -I. -c _stbiw.cc -o $@
+	rm -f _stbiw.cc
+
+clean:
+	rm -f $(PR_TARGET) $(DIFF_TARGET) stb_image_write_impl.o _stbiw.cc
