@@ -38,6 +38,9 @@
 #include "../llm/mm_blaslt_bridge.h"
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
+#include "hip_tex_dec_kernels.h"
+#include "hip_shape_dec_pipeline.h"
+#include "../../common/trellis2_fdg_mesh.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -237,6 +240,49 @@ struct hip_trellis2_runner {
 
     /* Block 0 debug sink (set by hip_trellis2_dump_b0_detail; zero otherwise) */
     hip_trellis2_b0_dbg *b0_dbg;
+
+    /* ---- Shape decoder (independent module + ctx) ---- */
+    hipModule_t        shape_dec_mod;
+    hipStream_t        shape_dec_stream;
+    t2_shape_dec      *shape_dec;
+    hip_shape_dec_ctx *shape_dec_ctx;
+
+    /* ---- SLAT DiT (sparse-latent flow DiT) ---- */
+    int slat_loaded;
+    /* Top-level weights — same layout as SS DiT, but in_channels=32 */
+    t2_wt slat_input;     /* [DIT_DIM, 32] F32 */
+    t2_wt slat_t_fc1;     /* [DIT_DIM, DIT_T_HALF*2] */
+    t2_wt slat_t_fc2;     /* [DIT_DIM, DIT_DIM] */
+    t2_wt slat_ada_mod;   /* [6*DIT_DIM, DIT_DIM] */
+    t2_wt slat_out;       /* [32, DIT_DIM] */
+    /* 30 per-block weights, identical struct to SS DiT */
+    t2_block_gpu slat_blocks[DIT_DEPTH];
+    /* Per-call RoPE tables (sized for N_cap tokens) */
+    void *d_slat_rope_cos;
+    void *d_slat_rope_sin;
+    int   slat_n_freqs;
+    int   slat_rope_cap;     /* allocated N tokens for rope buffers */
+    /* Cross-attn KV cache (separate from SS) */
+    void *slat_ca_K_cache[DIT_DEPTH];
+    void *slat_ca_V_cache[DIT_DEPTH];
+    int   slat_ca_kv_valid;
+    int   slat_ca_kv_len;
+    int   slat_ca_kv_cap;        /* allocated n_cond capacity */
+    const float *slat_ca_kv_cond_ptr;  /* identity of last cached cond */
+    /* Per-step scratch buffers (sized lazily up to N_cap) */
+    void *d_slat_h, *d_slat_ln_h, *d_slat_qkv;
+    void *d_slat_Q, *d_slat_K, *d_slat_V;
+    void *d_slat_ca_Q, *d_slat_attn_out, *d_slat_mlp_mid;
+    void *d_slat_x_in;     /* [N, 32] */
+    void *d_slat_vel_out;  /* [N, 32] */
+    void *d_slat_cond;     /* [n_cond, 1024] */
+    int   slat_n_cap;      /* allocated N capacity for scratch */
+    int   slat_cond_cap;   /* allocated n_cond capacity for d_slat_cond */
+    /* Shared per-step constants */
+    void *d_slat_t_emb;    /* [DIT_T_HALF*2] */
+    void *d_slat_t_silu;   /* [DIT_DIM] */
+    void *d_slat_mod_base; /* [6*DIT_DIM] */
+    void *d_slat_mod;      /* [6*DIT_DIM] */
 };
 
 /* helper: hipMemcpy device buffer [n floats] to host if dst non-null */
@@ -916,6 +962,45 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
     if (r->use_blaslt) { mm_blaslt_destroy(); r->use_blaslt = 0; }
 
     if (r->mod) hipModuleUnload(r->mod);
+
+    /* Shape decoder cleanup (Milestone C). */
+    if (r->shape_dec_ctx) { hip_shape_dec_ctx_free(r->shape_dec_ctx); r->shape_dec_ctx = NULL; }
+    if (r->shape_dec)     { t2_shape_dec_free(r->shape_dec); r->shape_dec = NULL; }
+    if (r->shape_dec_mod) { hipModuleUnload(r->shape_dec_mod); r->shape_dec_mod = NULL; }
+    if (r->shape_dec_stream) { hipStreamDestroy(r->shape_dec_stream); r->shape_dec_stream = NULL; }
+
+    /* SLAT DiT cleanup */
+    if (r->slat_loaded) {
+        free_hip(&r->slat_input.w); free_hip(&r->slat_input.b);
+        free_hip(&r->slat_t_fc1.w); free_hip(&r->slat_t_fc1.b);
+        free_hip(&r->slat_t_fc2.w); free_hip(&r->slat_t_fc2.b);
+        free_hip(&r->slat_ada_mod.w); free_hip(&r->slat_ada_mod.b);
+        free_hip(&r->slat_out.w); free_hip(&r->slat_out.b);
+        for (int i = 0; i < DIT_DEPTH; i++) {
+            t2_block_gpu *b = &r->slat_blocks[i];
+            free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.b);
+            free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
+            free_hip(&b->sa_out.w); free_hip(&b->sa_out.b);
+            free_hip(&b->norm2_w); free_hip(&b->norm2_b);
+            free_hip(&b->ca_q.w); free_hip(&b->ca_q.b);
+            free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
+            free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.b);
+            free_hip(&b->ca_out.w); free_hip(&b->ca_out.b);
+            free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.b);
+            free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.b);
+            free_hip(&b->mod_bias);
+            free_hip(&r->slat_ca_K_cache[i]);
+            free_hip(&r->slat_ca_V_cache[i]);
+        }
+        free_hip(&r->d_slat_rope_cos); free_hip(&r->d_slat_rope_sin);
+        free_hip(&r->d_slat_h); free_hip(&r->d_slat_ln_h); free_hip(&r->d_slat_qkv);
+        free_hip(&r->d_slat_Q); free_hip(&r->d_slat_K); free_hip(&r->d_slat_V);
+        free_hip(&r->d_slat_ca_Q); free_hip(&r->d_slat_attn_out); free_hip(&r->d_slat_mlp_mid);
+        free_hip(&r->d_slat_x_in); free_hip(&r->d_slat_vel_out); free_hip(&r->d_slat_cond);
+        free_hip(&r->d_slat_t_emb); free_hip(&r->d_slat_t_silu);
+        free_hip(&r->d_slat_mod_base); free_hip(&r->d_slat_mod);
+    }
+
     free(r);
 }
 
@@ -1922,4 +2007,539 @@ int hip_trellis2_dump_b0_detail(hip_trellis2_runner *r,
     int res = dit_forward(r, n_tok, cond_len, 0 /* stop at block 0 */);
     r->b0_dbg = NULL;
     return (res < 0) ? -1 : 0;
+}
+
+/* ============================================================================
+ * Shape decoder integration (Milestone C)
+ * ============================================================================ */
+
+int hip_trellis2_load_shape_dec(hip_trellis2_runner *r, const char *safetensors_path) {
+    if (!r) return -1;
+    if (r->shape_dec_ctx) {
+        fprintf(stderr, "T2-HIP: shape_dec already loaded\n");
+        return 0;
+    }
+    fprintf(stderr, "T2-HIP: loading shape_dec weights: %s\n", safetensors_path);
+    r->shape_dec = t2_shape_dec_load(safetensors_path);
+    if (!r->shape_dec) {
+        fprintf(stderr, "T2-HIP: t2_shape_dec_load failed\n");
+        return -1;
+    }
+    /* Compile shape_dec kernels into a separate hipModule (separate kernel
+     * source from SS DiT/decoder). */
+    if (hip_compile_kernels(&r->shape_dec_mod, r->device_id,
+                            hip_tex_dec_kernels_src, "shape_dec",
+                            r->verbose, "T2-HIP-SHAPE") <= 0) {
+        fprintf(stderr, "T2-HIP: shape_dec kernel compile failed\n");
+        t2_shape_dec_free(r->shape_dec); r->shape_dec = NULL;
+        return -1;
+    }
+    /* Non-blocking stream so launches don't serialize against SS streams. */
+    if (hipStreamCreateWithFlags(&r->shape_dec_stream, hipStreamNonBlocking) != hipSuccess) {
+        r->shape_dec_stream = NULL;
+    }
+    r->shape_dec_ctx = hip_shape_dec_ctx_create(r->shape_dec_mod, r->shape_dec_stream,
+                                                 r->shape_dec, r->verbose);
+    if (!r->shape_dec_ctx) {
+        fprintf(stderr, "T2-HIP: hip_shape_dec_ctx_create failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+int hip_trellis2_run_shape_dec(hip_trellis2_runner *r,
+                               const float *slat_feats,
+                               const int32_t *coords,
+                               int N, int slat_C,
+                               hip_trellis2_mesh *out)
+{
+    if (!r || !r->shape_dec_ctx || !out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    float *d_feats = NULL; int32_t *d_coords = NULL; int Nf = 0;
+    int rc = hip_shape_dec_forward(r->shape_dec_ctx, slat_feats, coords, N, slat_C,
+                                    &d_feats, &d_coords, &Nf);
+    if (rc != 0 || Nf <= 0) return -1;
+
+    if (r->shape_dec_stream) hipStreamSynchronize(r->shape_dec_stream);
+    int out_ch = r->shape_dec->out_channels;
+    float *h_out = (float *)malloc((size_t)Nf * out_ch * sizeof(float));
+    int32_t *h_coords4 = (int32_t *)malloc((size_t)Nf * 4 * sizeof(int32_t));
+    hipMemcpy(h_out, d_feats, (size_t)Nf * out_ch * sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(h_coords4, d_coords, (size_t)Nf * 4 * sizeof(int32_t), hipMemcpyDeviceToHost);
+    hipFree(d_feats); hipFree(d_coords);
+
+    /* Post-process raw 7-channel output -> FDG mesh extraction (mirrors test
+     * harness behaviour). */
+    if (out_ch != 7) {
+        fprintf(stderr, "T2-HIP: shape_dec out_ch=%d (expected 7); skipping mesh\n", out_ch);
+        free(h_out); free(h_coords4); return -1;
+    }
+    float voxel_margin = 0.5f;
+    for (int i = 0; i < Nf; i++) {
+        float *f = h_out + (size_t)i * 7;
+        for (int j = 0; j < 3; j++)
+            f[j] = (1.0f + 2.0f*voxel_margin) / (1.0f + expf(-f[j])) - voxel_margin;
+        f[6] = logf(1.0f + expf(f[6]));
+    }
+    int32_t *coords3 = (int32_t *)malloc((size_t)Nf * 3 * sizeof(int32_t));
+    for (int i = 0; i < Nf; i++) {
+        coords3[i*3+0] = h_coords4[i*4+1];
+        coords3[i*3+1] = h_coords4[i*4+2];
+        coords3[i*3+2] = h_coords4[i*4+3];
+    }
+    int max_coord = 0;
+    for (size_t i = 0; i < (size_t)Nf*3; i++)
+        if (coords3[i] > max_coord) max_coord = coords3[i];
+    float aabb[6] = {-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f};
+    float vs = (aabb[3] - aabb[0]) / (float)(max_coord + 1);
+    t2_fdg_mesh mesh = t2_fdg_to_mesh(coords3, h_out, Nf, vs, aabb);
+    /* CPU-axis convention: swap world-X / world-Z. */
+    for (int i = 0; i < mesh.n_verts; i++) {
+        float t = mesh.vertices[i*3+0];
+        mesh.vertices[i*3+0] = mesh.vertices[i*3+2];
+        mesh.vertices[i*3+2] = t;
+    }
+    for (int i = 0; i < mesh.n_tris; i++) {
+        int t = mesh.triangles[i*3+1];
+        mesh.triangles[i*3+1] = mesh.triangles[i*3+2];
+        mesh.triangles[i*3+2] = t;
+    }
+
+    /* Hand mesh ownership to caller: t2_fdg_mesh stores its own malloc'd arrays
+     * (vertices/triangles), so we transfer those pointers and zero the mesh
+     * struct (skipping t2_fdg_mesh_free which would free them). */
+    out->vertices  = mesh.vertices;
+    out->triangles = mesh.triangles;
+    out->n_verts   = mesh.n_verts;
+    out->n_tris    = mesh.n_tris;
+
+    free(coords3); free(h_out); free(h_coords4);
+    return 0;
+}
+
+void hip_trellis2_shape_dec_mesh_free(hip_trellis2_mesh *m) {
+    if (!m) return;
+    if (m->vertices)  free(m->vertices);
+    if (m->triangles) free(m->triangles);
+    m->vertices = NULL; m->triangles = NULL; m->n_verts = 0; m->n_tris = 0;
+}
+
+/* ============================================================================
+ * SLAT (Sparse-Latent) DiT — Phase 2 of #12
+ *
+ * Architecturally the same 30-block ModulatedTransformerCrossBlock as SS DiT,
+ * but with sparse variable-N tokens, in_channels=32, and per-call 3D RoPE
+ * computed from coords. Independent weights and scratch from SS DiT — both
+ * pipelines can coexist on the same runner.
+ *
+ * v1 wiring uses F32 weights + scalar attention paths (fn_flash_sa,
+ * fn_cross_attn) which support arbitrary N. BF16/WMMA paths require
+ * (N % 64) == 0 and are deferred to a follow-up; the bulk of GEMM time
+ * still rides hipBLASLt because the F32 weights flow through the
+ * BF16-pack path when the sa_qkv.w pointer is set without w_bf16.
+ * ============================================================================ */
+
+#define SLAT_IN_CH       32
+#define SLAT_RES         32
+#define SLAT_MAX_TOK     8192
+#define SLAT_MAX_COND    1029
+
+/* CPU-side RoPE table compute matching t2slatdit_compute_rope:
+ *   freq_dim = head_dim / 6 = 21; per-token shape [3, n_freqs]; trailing
+ *   pairs in the rope-applying kernel are identity (cos=1,sin=0). */
+static void slat_compute_rope_host(const int32_t *coords, int N,
+                                    int n_freqs, float theta,
+                                    float *cos_out, float *sin_out) {
+    float freqs[64];
+    for (int j = 0; j < n_freqs; j++)
+        freqs[j] = 1.0f / powf(theta, (float)j / (float)n_freqs);
+    for (int i = 0; i < N; i++) {
+        int z = coords[i*4 + 1];
+        int y = coords[i*4 + 2];
+        int x = coords[i*4 + 3];
+        int axes[3] = {z, y, x};
+        for (int axis = 0; axis < 3; axis++) {
+            float c = (float)axes[axis];
+            for (int j = 0; j < n_freqs; j++) {
+                float arg = c * freqs[j];
+                cos_out[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = cosf(arg);
+                sin_out[(size_t)i * 3 * n_freqs + axis * n_freqs + j] = sinf(arg);
+            }
+        }
+    }
+}
+
+/* Reuse st_upload_f32 for F32 weights; this is the v1 simple path. */
+
+int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
+    if (!r) return -1;
+    fprintf(stderr, "T2-HIP: loading SLAT DiT weights: %s\n", path);
+    st_context *st = safetensors_open(path);
+    if (!st) { fprintf(stderr, "T2-HIP: failed to open %s\n", path); return -1; }
+    int v = r->verbose;
+
+    /* Top-level — F32 path. SLAT in_channels=32. */
+    r->slat_input.w   = st_upload_f32(st, "input_layer.weight", v);
+    r->slat_input.b   = st_upload_f32(st, "input_layer.bias",   v);
+    r->slat_input.scale = -1.0f;
+    r->slat_t_fc1.w   = st_upload_f32(st, "t_embedder.mlp.0.weight", v);
+    r->slat_t_fc1.b   = st_upload_f32(st, "t_embedder.mlp.0.bias",   v);
+    r->slat_t_fc1.scale = -1.0f;
+    r->slat_t_fc2.w   = st_upload_f32(st, "t_embedder.mlp.2.weight", v);
+    r->slat_t_fc2.b   = st_upload_f32(st, "t_embedder.mlp.2.bias",   v);
+    r->slat_t_fc2.scale = -1.0f;
+    r->slat_ada_mod.w = st_upload_f32(st, "adaLN_modulation.1.weight", v);
+    r->slat_ada_mod.b = st_upload_f32(st, "adaLN_modulation.1.bias",   v);
+    r->slat_ada_mod.scale = -1.0f;
+    r->slat_out.w     = st_upload_f32(st, "out_layer.weight", v);
+    r->slat_out.b     = st_upload_f32(st, "out_layer.bias",   v);
+    r->slat_out.scale = -1.0f;
+
+    if (!r->slat_input.w || !r->slat_t_fc1.w || !r->slat_t_fc2.w ||
+        !r->slat_ada_mod.w || !r->slat_out.w) {
+        fprintf(stderr, "T2-HIP: SLAT DiT top-level weight missing\n");
+        safetensors_close(st);
+        return -1;
+    }
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        char name[128];
+        t2_block_gpu *b = &r->slat_blocks[bi];
+        memset(b, 0, sizeof(*b));
+        #define SBN(n) (snprintf(name,sizeof(name),"blocks.%d.%s",bi,n), name)
+
+        b->sa_qkv.w  = st_upload_f32(st, SBN("self_attn.to_qkv.weight"), v);
+        b->sa_qkv.b  = st_upload_f32(st, SBN("self_attn.to_qkv.bias"),   v);
+        b->sa_qkv.scale = -1.0f;
+        b->sa_q_norm = st_upload_f32(st, SBN("self_attn.q_rms_norm.gamma"), v);
+        b->sa_k_norm = st_upload_f32(st, SBN("self_attn.k_rms_norm.gamma"), v);
+        b->sa_out.w  = st_upload_f32(st, SBN("self_attn.to_out.weight"), v);
+        b->sa_out.b  = st_upload_f32(st, SBN("self_attn.to_out.bias"),   v);
+        b->sa_out.scale = -1.0f;
+
+        b->norm2_w   = st_upload_f32(st, SBN("norm2.weight"), v);
+        b->norm2_b   = st_upload_f32(st, SBN("norm2.bias"),   v);
+        b->ca_q.w    = st_upload_f32(st, SBN("cross_attn.to_q.weight"), v);
+        b->ca_q.b    = st_upload_f32(st, SBN("cross_attn.to_q.bias"),   v);
+        b->ca_q.scale = -1.0f;
+        b->ca_q_norm = st_upload_f32(st, SBN("cross_attn.q_rms_norm.gamma"), v);
+        b->ca_k_norm = st_upload_f32(st, SBN("cross_attn.k_rms_norm.gamma"), v);
+        b->ca_kv.w   = st_upload_f32(st, SBN("cross_attn.to_kv.weight"), v);
+        b->ca_kv.b   = st_upload_f32(st, SBN("cross_attn.to_kv.bias"),   v);
+        b->ca_kv.scale = -1.0f;
+        b->ca_out.w  = st_upload_f32(st, SBN("cross_attn.to_out.weight"), v);
+        b->ca_out.b  = st_upload_f32(st, SBN("cross_attn.to_out.bias"),   v);
+        b->ca_out.scale = -1.0f;
+
+        b->mlp_fc1.w = st_upload_f32(st, SBN("mlp.mlp.0.weight"), v);
+        b->mlp_fc1.b = st_upload_f32(st, SBN("mlp.mlp.0.bias"),   v);
+        b->mlp_fc1.scale = -1.0f;
+        b->mlp_fc2.w = st_upload_f32(st, SBN("mlp.mlp.2.weight"), v);
+        b->mlp_fc2.b = st_upload_f32(st, SBN("mlp.mlp.2.bias"),   v);
+        b->mlp_fc2.scale = -1.0f;
+
+        b->mod_bias  = st_upload_f32(st, SBN("modulation"), v);
+        #undef SBN
+    }
+    safetensors_close(st);
+
+    r->slat_n_freqs = DIT_HEAD_DIM / 6;  /* 21 for hd=128 */
+    r->slat_loaded = 1;
+    r->slat_ca_kv_valid = 0;
+    r->slat_ca_kv_cond_ptr = NULL;
+
+    /* Allocate per-step shared scalars (constant-size) */
+    hipMalloc(&r->d_slat_t_emb,    DIT_T_HALF * 2 * sizeof(float));
+    hipMalloc(&r->d_slat_t_silu,   DIT_DIM * sizeof(float));
+    hipMalloc(&r->d_slat_mod_base, 6 * DIT_DIM * sizeof(float));
+    hipMalloc(&r->d_slat_mod,      6 * DIT_DIM * sizeof(float));
+
+    fprintf(stderr, "T2-HIP: SLAT DiT loaded (%d blocks, RoPE %d freqs/axis, F32)\n",
+            DIT_DEPTH, r->slat_n_freqs);
+    return 0;
+}
+
+void hip_trellis2_invalidate_slat_kv(hip_trellis2_runner *r) {
+    if (r) { r->slat_ca_kv_valid = 0; r->slat_ca_kv_cond_ptr = NULL; }
+}
+
+/* Grow per-N scratch up to N_cap */
+static int slat_ensure_n_scratch(hip_trellis2_runner *r, int N) {
+    if (N <= r->slat_n_cap) return 0;
+    /* Free + reallocate (rare). */
+    free_hip(&r->d_slat_h);
+    free_hip(&r->d_slat_ln_h);
+    free_hip(&r->d_slat_qkv);
+    free_hip(&r->d_slat_Q);
+    free_hip(&r->d_slat_K);
+    free_hip(&r->d_slat_V);
+    free_hip(&r->d_slat_ca_Q);
+    free_hip(&r->d_slat_attn_out);
+    free_hip(&r->d_slat_mlp_mid);
+    free_hip(&r->d_slat_x_in);
+    free_hip(&r->d_slat_vel_out);
+    free_hip(&r->d_slat_rope_cos);
+    free_hip(&r->d_slat_rope_sin);
+
+    int cap = N;
+    if (cap < 4096) cap = 4096;
+    if (cap > SLAT_MAX_TOK) cap = SLAT_MAX_TOK;
+    if (cap < N) {
+        fprintf(stderr, "T2-HIP: SLAT N=%d exceeds max %d\n", N, SLAT_MAX_TOK);
+        return -1;
+    }
+    size_t fdim = (size_t)cap * DIT_DIM * sizeof(float);
+    if (hipMalloc(&r->d_slat_h,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_ln_h,     fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_qkv,      3 * fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_Q,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_K,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_V,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_ca_Q,     fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_attn_out, fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_mlp_mid,  (size_t)cap * DIT_FFN * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_x_in,     (size_t)cap * SLAT_IN_CH * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_vel_out,  (size_t)cap * SLAT_IN_CH * sizeof(float)) != hipSuccess) return -1;
+    size_t rope_bytes = (size_t)cap * 3 * r->slat_n_freqs * sizeof(float);
+    if (hipMalloc(&r->d_slat_rope_cos, rope_bytes) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_slat_rope_sin, rope_bytes) != hipSuccess) return -1;
+
+    r->slat_n_cap = cap;
+    r->slat_rope_cap = cap;
+    return 0;
+}
+
+static int slat_ensure_cond_scratch(hip_trellis2_runner *r, int n_cond) {
+    if (n_cond <= r->slat_cond_cap) return 0;
+    free_hip(&r->d_slat_cond);
+    int cap = n_cond > SLAT_MAX_COND ? n_cond : SLAT_MAX_COND;
+    if (hipMalloc(&r->d_slat_cond, (size_t)cap * DIT_COND_DIM * sizeof(float)) != hipSuccess)
+        return -1;
+    r->slat_cond_cap = cap;
+    /* Block-side KV caches */
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        free_hip(&r->slat_ca_K_cache[bi]);
+        free_hip(&r->slat_ca_V_cache[bi]);
+        if (hipMalloc(&r->slat_ca_K_cache[bi], (size_t)cap * DIT_DIM * sizeof(float)) != hipSuccess) return -1;
+        if (hipMalloc(&r->slat_ca_V_cache[bi], (size_t)cap * DIT_DIM * sizeof(float)) != hipSuccess) return -1;
+    }
+    r->slat_ca_kv_cap = cap;
+    r->slat_ca_kv_valid = 0;
+    return 0;
+}
+
+/* SLAT DiT forward — variable N, separate scratch from SS DiT. F32 path
+ * everywhere; scalar attention so any N works. */
+static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
+    if (!r->slat_loaded) { fprintf(stderr, "T2-HIP: SLAT DiT not loaded\n"); return -1; }
+
+    /* Input embedding: x_t [N, 32] -> [N, DIT_DIM] */
+    gemm(r, r->d_slat_h, &r->slat_input, r->d_slat_x_in,
+         r->slat_input.b, DIT_DIM, SLAT_IN_CH, N);
+
+    /* Timestep embedding (caller already populated d_slat_t_emb) */
+    gemm(r, r->d_slat_t_silu, &r->slat_t_fc1, r->d_slat_t_emb,
+         r->slat_t_fc1.b, DIT_DIM, DIT_T_HALF * 2, 1);
+    run_silu(r, r->d_slat_t_silu, DIT_DIM);
+    void *d_t_out = r->d_slat_attn_out; /* repurpose scratch for FC2 output */
+    gemm(r, d_t_out, &r->slat_t_fc2, r->d_slat_t_silu,
+         r->slat_t_fc2.b, DIT_DIM, DIT_DIM, 1);
+
+    /* Rebuild cross-attn KV cache if needed */
+    if (!r->slat_ca_kv_valid) {
+        for (int bi = 0; bi < DIT_DEPTH; bi++) {
+            t2_block_gpu *b = &r->slat_blocks[bi];
+            /* ca_kv [n_cond, 2*DIT_DIM] using d_slat_qkv as temp (room for 3*DIT*N). */
+            void *kv_tmp = r->d_slat_qkv;
+            gemm(r, kv_tmp, &b->ca_kv, r->d_slat_cond,
+                 b->ca_kv.b, 2 * DIT_DIM, DIT_COND_DIM, n_cond);
+            void *K = r->slat_ca_K_cache[bi], *V = r->slat_ca_V_cache[bi];
+            int M = n_cond, W = DIT_DIM;
+            void *args[] = { &K, &V, &kv_tmp, &M, &W };
+            hipModuleLaunchKernel(r->fn_split_kv,
+                (n_cond * DIT_DIM + 255) / 256, 1, 1, 256, 1, 1,
+                0, 0, args, NULL);
+            run_rms_norm_ph(r, r->slat_ca_K_cache[bi], b->ca_k_norm,
+                             n_cond, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        }
+        r->slat_ca_kv_valid = 1;
+        r->slat_ca_kv_len   = n_cond;
+    }
+
+    /* Shared modulation: d_mod_base = silu(t_emb)*mod_w + mod_b */
+    {
+        void *out = r->d_slat_mod_base;
+        const void *t_emb = d_t_out;
+        const void *mod_w = r->slat_ada_mod.w, *mod_b = r->slat_ada_mod.b;
+        const void *blk_bias_null = NULL;
+        int dim = DIT_DIM, out_dim = 6 * DIT_DIM;
+        void *args[] = { &out, &t_emb, &mod_w, &mod_b, &blk_bias_null, &dim, &out_dim };
+        int gx = (out_dim + 255) / 256;
+        hipModuleLaunchKernel(r->fn_modulation_par, gx, 1, 1, 256, 1, 1,
+                              DIT_DIM * sizeof(float), 0, args, NULL);
+    }
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        t2_block_gpu *b = &r->slat_blocks[bi];
+
+        /* Per-block modulation */
+        {
+            void *out = r->d_slat_mod;
+            const void *base = r->d_slat_mod_base;
+            const void *blk_bias = b->mod_bias;
+            int n = 6 * DIT_DIM;
+            void *args[] = { &out, (void *)&base, (void *)&blk_bias, &n };
+            int gx = (n + 255) / 256;
+            hipModuleLaunchKernel(r->fn_mod_add_blkbias, gx, 1, 1, 256, 1, 1,
+                                  0, 0, args, NULL);
+        }
+        float *mod = (float *)r->d_slat_mod;
+        void *shift_sa  = mod + 0 * DIT_DIM;
+        void *scale_sa  = mod + 1 * DIT_DIM;
+        void *gate_sa   = mod + 2 * DIT_DIM;
+        void *shift_mlp = mod + 3 * DIT_DIM;
+        void *scale_mlp = mod + 4 * DIT_DIM;
+        void *gate_mlp  = mod + 5 * DIT_DIM;
+
+        /* ---- Self-attention ---- */
+        run_adaln(r, r->d_slat_ln_h, r->d_slat_h, shift_sa, scale_sa, N, DIT_DIM);
+        gemm(r, r->d_slat_qkv, &b->sa_qkv, r->d_slat_ln_h, b->sa_qkv.b,
+             3 * DIT_DIM, DIT_DIM, N);
+
+        /* Split QKV */
+        {
+            void *Q = r->d_slat_Q, *K = r->d_slat_K, *V = r->d_slat_V;
+            const void *qkv = r->d_slat_qkv;
+            int Nl = N, W = DIT_DIM;
+            void *args[] = { &Q, &K, &V, &qkv, &Nl, &W };
+            hipModuleLaunchKernel(r->fn_split_qkv,
+                (N * DIT_DIM + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        }
+        /* Q/K RMSNorm */
+        run_rms_norm_ph(r, r->d_slat_Q, b->sa_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        run_rms_norm_ph(r, r->d_slat_K, b->sa_k_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        /* Apply 3D RoPE — uses per-call rope tables already uploaded.
+         * Temporarily swap r->d_rope_cos/sin so run_rope_3d picks up SLAT tables. */
+        {
+            void *saved_cos = r->d_rope_cos, *saved_sin = r->d_rope_sin;
+            int saved_freqs = r->n_rope_freqs;
+            r->d_rope_cos = r->d_slat_rope_cos;
+            r->d_rope_sin = r->d_slat_rope_sin;
+            r->n_rope_freqs = r->slat_n_freqs;
+            run_rope_3d(r, r->d_slat_Q, N);
+            run_rope_3d(r, r->d_slat_K, N);
+            r->d_rope_cos = saved_cos; r->d_rope_sin = saved_sin;
+            r->n_rope_freqs = saved_freqs;
+        }
+        /* Scalar flash self-attn (any N). */
+        {
+            int n_heads = DIT_HEADS, head_dim = DIT_HEAD_DIM;
+            void *out = r->d_slat_attn_out;
+            void *Q = r->d_slat_Q, *K = r->d_slat_K, *V = r->d_slat_V;
+            int Nl = N;
+            void *args[] = { &out, &Q, &K, &V, &Nl, &n_heads, &head_dim };
+            int gY = (N + 3) / 4;
+            size_t smem = 2 * 16 * 128 * sizeof(float);
+            hipModuleLaunchKernel(r->fn_flash_sa, DIT_HEADS, gY, 1, 128, 1, 1,
+                                  smem, 0, args, NULL);
+        }
+        gemm(r, r->d_slat_ln_h, &b->sa_out, r->d_slat_attn_out, b->sa_out.b,
+             DIT_DIM, DIT_DIM, N);
+        run_gated_add(r, r->d_slat_h, r->d_slat_ln_h, gate_sa, N, DIT_DIM);
+
+        /* ---- Cross-attention ---- */
+        run_layernorm(r, r->d_slat_ln_h, r->d_slat_h, b->norm2_w, b->norm2_b, N, DIT_DIM);
+        gemm(r, r->d_slat_ca_Q, &b->ca_q, r->d_slat_ln_h, b->ca_q.b,
+             DIT_DIM, DIT_DIM, N);
+        run_rms_norm_ph(r, r->d_slat_ca_Q, b->ca_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        /* Scalar cross-attn over cached K,V. */
+        {
+            float scale = 1.0f / sqrtf((float)DIT_HEAD_DIM);
+            int dim = DIT_DIM, n_heads = DIT_HEADS, head_dim = DIT_HEAD_DIM;
+            void *out = r->d_slat_attn_out;
+            void *Q = r->d_slat_ca_Q;
+            void *K = r->slat_ca_K_cache[bi], *V = r->slat_ca_V_cache[bi];
+            int q_len = N, kv_len = r->slat_ca_kv_len;
+            void *args[] = { &out, &Q, &K, &V, &q_len, &kv_len, &dim,
+                             &n_heads, &head_dim, &scale };
+            hipModuleLaunchKernel(r->fn_cross_attn, DIT_HEADS, q_len, 1, 128, 1, 1,
+                                  0, 0, args, NULL);
+        }
+        gemm(r, r->d_slat_ln_h, &b->ca_out, r->d_slat_attn_out, b->ca_out.b,
+             DIT_DIM, DIT_DIM, N);
+        /* No gate on cross-attn — direct residual */
+        run_residual_add(r, r->d_slat_h, r->d_slat_ln_h, N * DIT_DIM);
+
+        /* ---- MLP ---- */
+        run_adaln(r, r->d_slat_ln_h, r->d_slat_h, shift_mlp, scale_mlp, N, DIT_DIM);
+        gemm(r, r->d_slat_mlp_mid, &b->mlp_fc1, r->d_slat_ln_h, b->mlp_fc1.b,
+             DIT_FFN, DIT_DIM, N);
+        run_gelu(r, r->d_slat_mlp_mid, N * DIT_FFN);
+        gemm(r, r->d_slat_ln_h, &b->mlp_fc2, r->d_slat_mlp_mid, b->mlp_fc2.b,
+             DIT_DIM, DIT_FFN, N);
+        run_gated_add(r, r->d_slat_h, r->d_slat_ln_h, gate_mlp, N, DIT_DIM);
+    }
+
+    /* Final LN (no affine) + out_layer */
+    run_ln_noaffine(r, r->d_slat_ln_h, r->d_slat_h, N, DIT_DIM);
+    gemm(r, r->d_slat_vel_out, &r->slat_out, r->d_slat_ln_h, r->slat_out.b,
+         SLAT_IN_CH, DIT_DIM, N);
+    hipDeviceSynchronize();
+    return 0;
+}
+
+int hip_trellis2_slat_dit_step(hip_trellis2_runner *r,
+                                const float *x_t,
+                                const int32_t *coords, int N,
+                                float t_value,
+                                const float *cond, int n_cond,
+                                float *out_vel) {
+    if (!r || !r->slat_loaded) { fprintf(stderr, "T2-HIP: SLAT DiT not loaded\n"); return -1; }
+    if (N <= 0 || N > SLAT_MAX_TOK)        { fprintf(stderr, "T2-HIP: bad N=%d\n", N); return -1; }
+    if (n_cond <= 0 || n_cond > SLAT_MAX_COND) { fprintf(stderr, "T2-HIP: bad n_cond=%d\n", n_cond); return -1; }
+    if (slat_ensure_n_scratch(r, N) != 0)         return -1;
+    if (slat_ensure_cond_scratch(r, n_cond) != 0) return -1;
+
+    /* Upload x_t */
+    hipMemcpy(r->d_slat_x_in, x_t, (size_t)N * SLAT_IN_CH * sizeof(float),
+              hipMemcpyHostToDevice);
+
+    /* Cond cache invalidation if cond ptr or length changed */
+    if (cond != r->slat_ca_kv_cond_ptr || n_cond != r->slat_ca_kv_len) {
+        r->slat_ca_kv_valid = 0;
+    }
+    if (!r->slat_ca_kv_valid) {
+        hipMemcpy(r->d_slat_cond, cond, (size_t)n_cond * DIT_COND_DIM * sizeof(float),
+                  hipMemcpyHostToDevice);
+        r->slat_ca_kv_cond_ptr = cond;
+    }
+
+    /* Compute and upload per-call RoPE tables */
+    {
+        size_t rb = (size_t)N * 3 * r->slat_n_freqs;
+        float *cs = (float *)malloc(rb * sizeof(float));
+        float *sn = (float *)malloc(rb * sizeof(float));
+        slat_compute_rope_host(coords, N, r->slat_n_freqs, 10000.0f, cs, sn);
+        hipMemcpy(r->d_slat_rope_cos, cs, rb * sizeof(float), hipMemcpyHostToDevice);
+        hipMemcpy(r->d_slat_rope_sin, sn, rb * sizeof(float), hipMemcpyHostToDevice);
+        free(cs); free(sn);
+    }
+
+    /* Timestep sinusoidal embed. SLAT runner takes raw t (sampler already
+     * scaled by 1000). */
+    {
+        void *out = r->d_slat_t_emb;
+        float t_val = t_value;
+        int dim = DIT_T_HALF * 2;
+        void *args[] = { &out, &t_val, &dim };
+        hipModuleLaunchKernel(r->fn_t_embed, (DIT_T_HALF + 255) / 256, 1, 1, 256, 1, 1,
+                              0, 0, args, NULL);
+    }
+
+    if (slat_dit_forward(r, N, n_cond) != 0) return -1;
+
+    hipMemcpy(out_vel, r->d_slat_vel_out, (size_t)N * SLAT_IN_CH * sizeof(float),
+              hipMemcpyDeviceToHost);
+    return 0;
 }

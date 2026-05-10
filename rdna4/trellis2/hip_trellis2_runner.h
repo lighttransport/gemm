@@ -124,6 +124,85 @@ int hip_trellis2_dump_b0_detail(hip_trellis2_runner *r,
                                  float t,
                                  hip_trellis2_b0_dbg *dbg);
 
+/* ---- Stage-2 shape decoder (sparse FlexiDualGrid VAE decoder) -------------
+ *
+ * Takes a structured latent (post-DiT, denormalized) and produces a triangle
+ * mesh. Internally runs the 4-stage hierarchical sparse decoder
+ * (SparseConvNeXt + Channel-to-Spatial) followed by FDG mesh extraction.
+ *
+ * The shape decoder owns a separate HIP module, hipBLASLt + Triton bridges,
+ * and persistent scratch — independent of the SS DiT/decoder above. It is
+ * legal to load it without loading the SS DiT (and vice versa).
+ */
+
+/* Load shape_dec safetensors weights (host-side). Returns 0 on success. */
+int hip_trellis2_load_shape_dec(hip_trellis2_runner *r,
+                                const char *safetensors_path);
+
+typedef struct {
+    float *vertices;   /* heap-allocated [n_verts*3]; caller frees with
+                        * hip_trellis2_shape_dec_mesh_free */
+    int   *triangles;  /* heap-allocated [n_tris*3] */
+    int    n_verts;
+    int    n_tris;
+} hip_trellis2_mesh;
+
+/* Run shape_dec end-to-end on a sparse structured latent.
+ *   slat_feats: [N, slat_C] F32 (CPU)
+ *   coords:     [N, 4]      I32 (CPU) — (b, z, y, x)
+ *   N:          number of voxels
+ *   slat_C:     latent channel count (matches checkpoint's from_latent input)
+ *   out:        pre-zeroed mesh struct; populated on success.
+ * Returns 0 on success. */
+int hip_trellis2_run_shape_dec(hip_trellis2_runner *r,
+                               const float *slat_feats,
+                               const int32_t *coords,
+                               int N,
+                               int slat_C,
+                               hip_trellis2_mesh *out);
+
+void hip_trellis2_shape_dec_mesh_free(hip_trellis2_mesh *m);
+
+/* ---- Stage-2 SLAT (Sparse-Latent) DiT ------------------------------------
+ *
+ * Sister of the SS DiT above. Same 30-block ModulatedTransformerCrossBlock
+ * architecture (dim=1536, heads=12, head_dim=128, ffn=8192, cond_dim=1024),
+ * but tokens are sparse (variable N per call indexed by [N,4] coords) and
+ * in_channels=32. RoPE is computed per-call from coords (axis-major,
+ * 21 freqs/axis, trailing identity to fill head_dim/2 = 64 pairs).
+ *
+ * Independent weight set + scratch from the SS DiT — both can coexist on
+ * the same runner. F32 weights on GPU for the v1 wiring (BF16/FP8 follow-up).
+ */
+
+/* Load SLAT DiT safetensors weights to GPU (F32). Returns 0 on success. */
+int  hip_trellis2_load_slat_dit(hip_trellis2_runner *r,
+                                const char *safetensors_path);
+
+/* Single SLAT denoising step.
+ *   x_t      [N, 32]        F32 host
+ *   coords   [N, 4]         I32 host (b, z, y, x); z/y/x in [0, 32)
+ *   N        number of sparse tokens (1..8192 supported)
+ *   t_value  raw timestep (caller multiplies by 1000 if mimicking sampler;
+ *            this fn does NOT scale t internally — matches _inference_model)
+ *   cond     [n_cond, 1024] F32 host (drop the leading batch=1 dim)
+ *   n_cond   length of conditioning sequence (typically 1029)
+ *   out_vel  [N, 32]        F32 host (pre-allocated)
+ *
+ * Internally rebuilds RoPE tables from coords every call; rebuilds the
+ * cross-attn KV cache when (cond pointer, n_cond) differs from the previous
+ * call or after hip_trellis2_invalidate_slat_kv.
+ */
+int  hip_trellis2_slat_dit_step(hip_trellis2_runner *r,
+                                const float *x_t,
+                                const int32_t *coords, int N,
+                                float t_value,
+                                const float *cond, int n_cond,
+                                float *out_vel);
+
+/* Force a rebuild of the SLAT cross-attn KV cache on the next step. */
+void hip_trellis2_invalidate_slat_kv(hip_trellis2_runner *r);
+
 #ifdef __cplusplus
 }
 #endif
