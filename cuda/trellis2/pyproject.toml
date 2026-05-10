@@ -1,0 +1,70 @@
+[project]
+name = "trellis2-cuda-ref"
+version = "0.1.0"
+description = "CUDA PyTorch reference texgen for TRELLIS.2 (ground-truth comparison vs ROCm path)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "safetensors>=0.4.5",
+    "packaging",
+    "Pillow>=10",
+    "tqdm",
+    "trimesh",
+    "plyfile",
+    "zstandard",
+    "easydict",
+    "scipy",
+    "einops",
+    "opencv-python-headless",
+]
+
+# Setup (one-time):
+#   cd cuda/trellis2
+#   uv venv --python 3.12 .venv
+#   uv pip install -e ".[torch-cu124,ref-pipeline]"
+#   BUILD_TARGET=cuda uv pip install -e \
+#       /mnt/disk1/work/gemm/trellis2/cpu/trellis2/trellis2_repo/o-voxel \
+#       --no-build-isolation
+#   BUILD_TARGET=cuda uv pip install -e \
+#       /mnt/disk1/work/gemm/trellis2/rdna4/trellis2/deps/FlexGEMM \
+#       --no-build-isolation
+#
+# Then run reference texgen:
+#   ./run_stage2_ref.sh
+#
+# CUDA wheel index pin: cu124 (works on NVIDIA driver >= 525). Bump
+# `cu124` to `cu126`/`cu128` if your driver supports it.
+
+[project.optional-dependencies]
+torch-cu124 = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "triton==3.1.0",
+]
+
+# For ref/trellis2/gen_stage1_ref.py + gen_stage2_ref.py.
+ref-pipeline = [
+    "transformers<5",
+    "tokenizers==0.22.1",
+    "huggingface_hub<1.0",
+    "regex",
+    "rembg",
+    "onnxruntime",
+    "xatlas",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+triton = { index = "pytorch-cu124" }
+
+[tool.uv]
+package = false
+
+[tool.setuptools]
+py-modules = []

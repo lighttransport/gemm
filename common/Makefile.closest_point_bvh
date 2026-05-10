@@ -1,0 +1,24 @@
+# Build closest-point BVH shared library used by trellis2 texgen.
+#
+#   make -f Makefile.closest_point_bvh
+#
+# Output: libclosest_point_bvh.so (loaded by shims/cumesh_xatlas.py via ctypes).
+
+CXX      ?= g++
+CXXFLAGS ?= -std=c++17 -O3 -fPIC -fno-rtti -fno-exceptions \
+            -Wall -Wextra -fopenmp \
+            -msse2 -mavx -mavx2 -mfma -mf16c
+
+TARGET = libclosest_point_bvh.so
+SRCS   = closest_point_bvh_capi.cc lightrt.cc
+HDRS   = closest_point_bvh.h lightrt.hh
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS) $(HDRS)
+	$(CXX) $(CXXFLAGS) -shared -I. $(SRCS) -o $@ -fopenmp -lpthread
+
+clean:
+	rm -f $(TARGET)
