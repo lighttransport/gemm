@@ -177,6 +177,7 @@ typedef struct {
     /* Native FP8 v7 (Phase 4.9.5, PAINT_FP8_V7=1). reuses existing
      * f_quantize_fp8 + f_reduce_max_abs and the FP8 weight registry. */
     CUfunction f_gemm_fp8_v7_fused;
+    CUfunction f_gemm_fp8_v7_fused_p2;  /* 2x2 panel variant (PAINT_FP8_V7_P2=1) */
 } pu_kernels;
 
 /* BF16-attn dispatch state. paint_stage_unet_create() flips on use_bf16_attn
@@ -224,6 +225,7 @@ static size_t g_paint_yt_max_bytes = 0;
 /* Pure BF16 path scratch (lazy-grown). */
 static int g_paint_use_bf16_gemm = 0;
 static int g_paint_use_fp8_v7 = 0;
+static int g_paint_use_fp8_v7_p2 = 0;  /* PAINT_FP8_V7_P2=1: 2x2 panel kernel */
 static CUdeviceptr g_paint_d_xbf = 0;  /* uint16 [n_tok * n_in] */
 static size_t g_paint_xbf_max_elem = 0;
 /* Native FP8 v7 scratches (PAINT_FP8_V7=1): X_fp8 (uint8) + per-tensor
@@ -518,10 +520,13 @@ static int paint_try_fp8_v7(const pu_kernels *kk,
                      &accumulate, &Mv, &Nv, &Kv};
     unsigned npx = (unsigned)((N + 127) / 128);
     unsigned npy = (unsigned)((M + 63) / 64);
-    unsigned gx  = (npx + 3u) & ~3u;
-    unsigned gy  = (npy + 3u) & ~3u;
+    int use_p2 = (g_paint_use_fp8_v7_p2 && kk->f_gemm_fp8_v7_fused_p2);
+    unsigned pad = use_p2 ? 1u : 3u;
+    unsigned gx  = (npx + pad) & ~pad;
+    unsigned gy  = (npy + pad) & ~pad;
     unsigned smem_bytes = 2u * (64u * 32u + 128u * 32u) * 2u;
-    cuLaunchKernel(kk->f_gemm_fp8_v7_fused, gx, gy, 1, 256, 1, 1,
+    CUfunction f = use_p2 ? kk->f_gemm_fp8_v7_fused_p2 : kk->f_gemm_fp8_v7_fused;
+    cuLaunchKernel(f, gx, gy, 1, 256, 1, 1,
                     smem_bytes, 0, gargs, NULL);
     return 1;
 }
