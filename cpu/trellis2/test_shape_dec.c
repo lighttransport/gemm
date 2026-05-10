@@ -73,8 +73,9 @@ int main(int argc, char **argv) {
             result.feats[0], result.feats[1], result.feats[2],
             result.feats[3], result.feats[4], result.feats[5], result.feats[6]);
 
-    /* Post-process: apply sigmoid to vertex offsets, threshold for intersected */
-    float voxel_margin = 0.0f;  /* from official code default */
+    /* Post-process: apply sigmoid to vertex offsets, threshold for intersected.
+     * voxel_margin matches official FlexiDualGridVaeDecoder default (0.5). */
+    float voxel_margin = 0.5f;
     for (int i = 0; i < result.N; i++) {
         float *f = result.feats + i * 7;
         /* vertex offsets: (1 + 2*margin) * sigmoid(x) - margin */
@@ -85,12 +86,19 @@ int main(int argc, char **argv) {
         f[6] = logf(1.0f + expf(f[6]));
     }
 
-    /* Extract coords without batch dim: [N, 3] from result.coords [N, 4] */
+    /* Extract coords without batch dim: [N, 3] from result.coords [N, 4].
+     * Keep the model's per-axis intersected-logit ordering aligned with FDG
+     * by passing coords in the same order the model trained on (axis-0,1,2).
+     * The PyT pipeline stores coords as (b, x, y, z); t2_fdg_to_mesh treats
+     * coords3 as (z, y, x) internally, but since the model is isotropic the
+     * mesh is geometrically correct, just labelled with the X and Z axes
+     * swapped relative to PyT world frame. We fix that in a final pass on
+     * vertices below. */
     int32_t *coords3 = (int32_t *)malloc((size_t)result.N * 3 * sizeof(int32_t));
     for (int i = 0; i < result.N; i++) {
-        coords3[i*3+0] = result.coords[i*4+1];  /* z */
-        coords3[i*3+1] = result.coords[i*4+2];  /* y */
-        coords3[i*3+2] = result.coords[i*4+3];  /* x */
+        coords3[i*3+0] = result.coords[i*4+1];
+        coords3[i*3+1] = result.coords[i*4+2];
+        coords3[i*3+2] = result.coords[i*4+3];
     }
 
     /* Mesh extraction */
@@ -104,6 +112,21 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\nExtracting mesh (voxel_size=%.4f, max_coord=%d)...\n", vs, max_coord);
     t2_fdg_mesh mesh = t2_fdg_to_mesh(coords3, result.feats, result.N, vs, aabb);
     free(coords3);
+
+    /* PyT stores coords as (b,x,y,z); FDG (and sparse3d) treat the second
+     * column as z. Conv kernels are isotropic so features are correct, but
+     * the output mesh ends up with world-X and world-Z swapped vs PyT. Fix
+     * post-hoc and flip triangle winding to keep outward normals. */
+    for (int i = 0; i < mesh.n_verts; i++) {
+        float t = mesh.vertices[i*3+0];
+        mesh.vertices[i*3+0] = mesh.vertices[i*3+2];
+        mesh.vertices[i*3+2] = t;
+    }
+    for (int i = 0; i < mesh.n_tris; i++) {
+        int t = mesh.triangles[i*3+1];
+        mesh.triangles[i*3+1] = mesh.triangles[i*3+2];
+        mesh.triangles[i*3+2] = t;
+    }
 
     if (mesh.n_tris > 0) {
         const char *obj_path = "shape_output.obj";

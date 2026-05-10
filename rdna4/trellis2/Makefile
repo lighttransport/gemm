@@ -4,11 +4,16 @@
 # Only needs gcc + ROCm runtime (libamdhip64.so, libhiprtc.so) on PATH.
 
 CC     = gcc
+CXX    = g++
+ROCM_PATH ?= /opt/rocm
 CFLAGS = -O3 -Wall -Wextra -I.. -march=native
-LDFLAGS = -ldl -lm -lpthread
+CXXFLAGS = -O3 -Wall -Wextra -I.. -I$(ROCM_PATH)/include -D__HIP_PLATFORM_AMD__
+LDFLAGS = -ldl -lm -lpthread -L$(ROCM_PATH)/lib -lhipblaslt -lamdhip64 -lstdc++
 
 ROCEW_SRC   = ../rocew.c
 RUNNER_SRC  = hip_trellis2_runner.c
+BLASLT_SRC  = ../llm/mm_blaslt_bridge.cpp
+BLASLT_OBJ  = mm_blaslt_bridge.o
 TEST_SRC    = test_hip_trellis2.c
 
 TARGET       = test_hip_trellis2
@@ -18,6 +23,7 @@ TEX_SPCONV   = test_hip_sparse_conv
 TEX_CNEXT    = test_hip_convnext
 TEX_C2S      = test_hip_c2s
 TEX_DEC_FULL = test_hip_tex_dec
+SLAT_DIT     = test_hip_slat_dit
 
 COMMON_DEPS = hip_trellis2_runner.h hip_trellis2_kernels.h \
               ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
@@ -26,13 +32,17 @@ COMMON_DEPS = hip_trellis2_runner.h hip_trellis2_kernels.h \
 
 .PHONY: all clean run help verify-dit verify-dec
 
-all: $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC) $(TEX_SPCONV) $(TEX_CNEXT) $(TEX_C2S) $(TEX_DEC_FULL)
+all: $(TARGET) $(VERIFY_DIT) $(VERIFY_DEC) $(TEX_SPCONV) $(TEX_CNEXT) $(TEX_C2S) $(TEX_DEC_FULL) $(SLAT_DIT)
 
-$(TEX_DEC_FULL): test_hip_tex_dec.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
-                 ../rocew.h ../hip_runner_common.h \
+PIPELINE_SRC = hip_shape_dec_pipeline.c
+PIPELINE_HDR = hip_shape_dec_pipeline.h
+
+$(TEX_DEC_FULL): test_hip_tex_dec.c $(PIPELINE_SRC) $(PIPELINE_HDR) hip_tex_dec_kernels.h $(ROCEW_SRC) $(BLASLT_OBJ) \
+                 ../rocew.h ../hip_runner_common.h ../llm/mm_blaslt_bridge.h \
                  ../../common/safetensors.h ../../common/ggml_dequant.h \
-                 ../../common/sparse3d.h ../../common/trellis2_shape_decoder.h
-	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_tex_dec.c $(ROCEW_SRC) $(LDFLAGS)
+                 ../../common/sparse3d.h ../../common/trellis2_shape_decoder.h \
+                 ../../common/trellis2_fdg_mesh.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_tex_dec.c $(PIPELINE_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
 $(TEX_C2S): test_hip_c2s.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
             ../rocew.h ../hip_runner_common.h \
@@ -62,14 +72,20 @@ $(TEX_NMAP_CONV): test_hip_nmap_conv.c hip_tex_dec_kernels.h $(ROCEW_SRC) \
                   ../rocew.h ../hip_runner_common.h
 	$(CC) $(CFLAGS) -o $@ test_hip_nmap_conv.c $(ROCEW_SRC) $(LDFLAGS)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+$(BLASLT_OBJ): $(BLASLT_SRC) ../llm/mm_blaslt_bridge.h
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-$(VERIFY_DIT): verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_dit.c $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
-$(VERIFY_DEC): verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ verify_decoder.c $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+$(VERIFY_DIT): verify_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+
+$(VERIFY_DEC): verify_decoder.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fopenmp -o $@ verify_decoder.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+
+$(SLAT_DIT): test_hip_slat_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS) ../../common/npy_io.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_slat_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
 # Default weight paths — override on the command line
 DIT     ?= /path/to/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors
