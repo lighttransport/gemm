@@ -2,6 +2,14 @@
  * Source extracted verbatim from cuda/flux2/cuda_flux2_runner.h:2197-2365.
  * Concatenated into the NVRTC build of paint_stage_unet.c.
  *
+ * Two variants:
+ *   gemm_fp8_v7_fused      -- 4x4 panel swizzle (per_panel_=16). Original.
+ *   gemm_fp8_v7_fused_p2   -- 2x2 panel swizzle (per_panel_=4). Halves the
+ *                             grid pad-to-multiple from 4 to 2, reducing
+ *                             wave-quantization waste on N=640/1280 paint
+ *                             UNet shapes. Bit-identical to v7. Default ON
+ *                             (PAINT_FP8_V7_P2=0 to disable).
+ *
  * Helper kernels (quantize_to_fp8_e4m3, reduce_max_abs_f32) come from the
  * existing cuda_fp8_mma_kernels.h source already in the build. */
 #ifndef PAINT_FP8_V7_KERNELS_H_
