@@ -265,6 +265,13 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                            24 * 1024);
     }
+    if (cuModuleGetFunction(&s->kk.f_gemm_fp8_v7_fused_p2, s->kk.mod, "gemm_fp8_v7_fused_p2") != CUDA_SUCCESS)
+        s->kk.f_gemm_fp8_v7_fused_p2 = NULL;
+    if (s->kk.f_gemm_fp8_v7_fused_p2) {
+        cuFuncSetAttribute(s->kk.f_gemm_fp8_v7_fused_p2,
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           24 * 1024);
+    }
     /* BF16 TC kernels (optional; missing → fall back to f_mha automatically). */
     if (cuModuleGetFunction(&s->kk.f_cast_bf16,         s->kk.mod, "cast_f32_to_bf16")        != CUDA_SUCCESS) s->kk.f_cast_bf16 = NULL;
     if (cuModuleGetFunction(&s->kk.f_attn_bf16_hd64,    s->kk.mod, "flash_attn_bf16_hd64")    != CUDA_SUCCESS) s->kk.f_attn_bf16_hd64 = NULL;
@@ -520,6 +527,14 @@ paint_stage_unet *paint_stage_unet_create(CUdevice dev,
             fprintf(stderr, "[paint_stage_unet] FP8_V7=1 (native e4m3 m16n8k32, fused descale+bias)\n");
         else if (want)
             fprintf(stderr, "[paint_stage_unet] FP8_V7=0 (env=%s have=%d)\n", e, have);
+        const char *e2 = getenv("PAINT_FP8_V7_P2");
+        int want2 = (e2 != NULL) && (e2[0] != '0');
+        int have2 = (s->kk.f_gemm_fp8_v7_fused_p2 != NULL);
+        g_paint_use_fp8_v7_p2 = (want2 && have2 && g_paint_use_fp8_v7) ? 1 : 0;
+        if (g_paint_use_fp8_v7_p2)
+            fprintf(stderr, "[paint_stage_unet] FP8_V7_P2=1 (2x2 panel swizzle)\n");
+        else if (want2)
+            fprintf(stderr, "[paint_stage_unet] FP8_V7_P2=0 (env=%s have=%d v7=%d)\n", e2, have2, g_paint_use_fp8_v7);
     }
     {
         /* CUDA graph capture (PAINT_UNET_GRAPH=1). Default OFF — opt in to
