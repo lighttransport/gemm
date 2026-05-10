@@ -130,6 +130,13 @@ paint_stage_vae *paint_stage_vae_create(CUdevice dev, const char *vae_path) {
                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                            24 * 1024);
     }
+    if (cuModuleGetFunction(&s->kk.f_gemm_fp8_v7_fused_p2, s->kk.mod, "gemm_fp8_v7_fused_p2") != CUDA_SUCCESS)
+        s->kk.f_gemm_fp8_v7_fused_p2 = NULL;
+    if (s->kk.f_gemm_fp8_v7_fused_p2) {
+        cuFuncSetAttribute(s->kk.f_gemm_fp8_v7_fused_p2,
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           24 * 1024);
+    }
     pvae_init_runtime(&s->kk);
 
     st_context *st = safetensors_open(vae_path);
