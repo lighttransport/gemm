@@ -45,6 +45,14 @@ int hip_trellis2_load_decoder(hip_trellis2_runner *r, const char *safetensors_pa
 /* Free all resources. */
 void hip_trellis2_free(hip_trellis2_runner *r);
 
+/* Free SS DiT weights/scratch/KV. Reclaims ~5 GB on a 1.3B-param F32 DiT.
+ * Safe to call after SS sampling completes. Subsequent dit_step calls will
+ * fail; reload with hip_trellis2_load_dit. */
+void hip_trellis2_unload_dit(hip_trellis2_runner *r);
+
+/* Free SS decoder weights + 4× scratch volumes. Safe to call after decode. */
+void hip_trellis2_unload_decoder(hip_trellis2_runner *r);
+
 /* Run a single DiT denoising step on GPU.
  *   noise_flat:  [4096, 8] F32 (CPU) — noise token sequence [NCDHW reshaped]
  *   features:    [1029, 1024] F32 (CPU) — DINOv3 conditioning features
