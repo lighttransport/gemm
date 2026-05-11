@@ -536,7 +536,35 @@ int main(int argc, char **argv) {
             int ndim, dims[8];
             float *loaded = read_npy_f32(noise_path, &ndim, dims);
             if (!loaded) { free(noise); free(features); hip_trellis2_free(r); return 1; }
-            memcpy(noise, loaded, (size_t)N_TOK * IN_CH * sizeof(float));
+            /* Reference noise dump is [1,8,16,16,16] CDHW; the runner expects
+             * [N_TOK=4096, IN_CH=8] DHWC tok-major. Transpose if needed.
+             * Accept either [1,C,D,H,W] (5D, batch=1), [C,D,H,W] (4D) — both CDHW —
+             * or the already-flat [N_TOK,IN_CH] / [4096,8] tok-major shape. */
+            int is_cdhw = (ndim == 5 && dims[0] == 1 && dims[1] == IN_CH &&
+                           dims[2] * dims[3] * dims[4] == N_TOK) ||
+                          (ndim == 4 && dims[0] == IN_CH &&
+                           dims[1] * dims[2] * dims[3] == N_TOK);
+            int is_flat = (ndim == 2 && dims[0] == N_TOK && dims[1] == IN_CH);
+            if (is_cdhw) {
+                int D, H, W;
+                if (ndim == 5) { D = dims[2]; H = dims[3]; W = dims[4]; }
+                else           { D = dims[1]; H = dims[2]; W = dims[3]; }
+                for (int d = 0; d < D; d++)
+                    for (int h = 0; h < H; h++)
+                        for (int w = 0; w < W; w++)
+                            for (int c = 0; c < IN_CH; c++)
+                                noise[((d*H + h)*W + w)*IN_CH + c] =
+                                    loaded[((c*D + d)*H + h)*W + w];
+                fprintf(stderr, "noise: CDHW [%d,%d,%d,%d] -> DHWC tok-major [%d,%d]\n",
+                        IN_CH, D, H, W, N_TOK, IN_CH);
+            } else if (is_flat) {
+                memcpy(noise, loaded, (size_t)N_TOK * IN_CH * sizeof(float));
+            } else {
+                fprintf(stderr, "noise: unexpected shape ndim=%d dims=[%d,%d,%d,%d,%d]\n",
+                        ndim, dims[0], dims[1], dims[2], dims[3], dims[4]);
+                free(loaded); free(noise); free(features);
+                hip_trellis2_free(r); return 1;
+            }
             free(loaded);
         } else {
             rng_seed(seed);
@@ -877,6 +905,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  Sparse voxels (32^3 max-pool): %d\n", N_sparse);
             free(occ32); free(occupancy);
 
+            /* Free SS DiT + SS decoder before loading SLAT — SLAT's 1.3B F32
+             * weights (~5 GB) on top of SS DiT (~5 GB) + decoder pushes a
+             * 16 GB GPU into HMM page-fault thrashing. Unloading drops peak
+             * VRAM from ~17 GB to ~11 GB, eliminating the swap that made
+             * SLAT scalar attention ~600× slower than its compute bound. */
+            fprintf(stderr, "  Freeing SS DiT + decoder to free VRAM for SLAT...\n");
+            hip_trellis2_unload_dit(r);
+            hip_trellis2_unload_decoder(r);
+
             /* Load SLAT DiT + shape_dec. */
             fprintf(stderr, "  Loading SLAT DiT: %s\n", slat_path);
             if (hip_trellis2_load_slat_dit(r, slat_path) != 0) {
@@ -985,6 +1022,34 @@ int main(int argc, char **argv) {
                 for (int c = 0; c < SLAT_CH; c++)
                     s2_x[i*SLAT_CH + c] = s2_x[i*SLAT_CH + c] * slat_std[c] + slat_mean[c];
             print_stats("denorm slat", s2_x, N_sparse * SLAT_CH);
+
+            /* Dump denorm feats + coords so shape_dec can be bisected via
+             * --shape-only on these exact inputs. */
+            {
+                char outpath[1024]; int d2[2] = { N_sparse, SLAT_CH };
+                snprintf(outpath, sizeof(outpath), "%s/hip_shape_denorm_feats.npy", output_dir);
+                write_npy_f32(outpath, s2_x, d2, 2);
+                fprintf(stderr, "  Wrote denorm feats -> %s\n", outpath);
+                /* coords are int32 [N,4] — write npy manually */
+                snprintf(outpath, sizeof(outpath), "%s/hip_shape_coords.npy", output_dir);
+                FILE *f = fopen(outpath, "wb");
+                if (f) {
+                    fwrite("\x93NUMPY", 1, 6, f);
+                    uint8_t ver[2] = {1, 0}; fwrite(ver, 1, 2, f);
+                    char body[256]; int n = snprintf(body, sizeof(body),
+                        "{'descr': '<i4', 'fortran_order': False, 'shape': (%d, 4), }", N_sparse);
+                    int total = 10 + n + 1;
+                    int pad = ((total + 63) / 64) * 64 - total;
+                    uint16_t hl = (uint16_t)(n + pad + 1);
+                    fwrite(&hl, 2, 1, f);
+                    fwrite(body, 1, (size_t)n, f);
+                    for (int p = 0; p < pad; p++) fputc(' ', f);
+                    fputc('\n', f);
+                    fwrite(sparse_coords, sizeof(int32_t), (size_t)N_sparse * 4, f);
+                    fclose(f);
+                    fprintf(stderr, "  Wrote coords -> %s\n", outpath);
+                }
+            }
 
             /* Run shape_dec -> mesh. */
             fprintf(stderr, "  Running shape_dec...\n");

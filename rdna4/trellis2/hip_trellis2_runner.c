@@ -918,10 +918,8 @@ hip_trellis2_runner *hip_trellis2_init(int device_id, int verbose) {
     return r;
 }
 
-void hip_trellis2_free(hip_trellis2_runner *r) {
+void hip_trellis2_unload_dit(hip_trellis2_runner *r) {
     if (!r) return;
-
-    /* DiT weights */
     free_hip(&r->dit_input.w); free_hip(&r->dit_input.b);
     free_hip(&r->dit_t_fc1.w); free_hip(&r->dit_t_fc1.b);
     free_hip(&r->dit_t_fc2.w); free_hip(&r->dit_t_fc2.b);
@@ -946,16 +944,48 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
         free_hip(&r->ca_V_cache[i]);
     }
 
-    /* Activation buffers */
     free_hip(&r->d_h); free_hip(&r->d_ln_h); free_hip(&r->d_qkv);
     free_hip(&r->d_Q); free_hip(&r->d_K); free_hip(&r->d_V);
     free_hip(&r->d_ca_Q); free_hip(&r->d_attn_out); free_hip(&r->d_mlp_mid);
     free_hip(&r->d_t_emb); free_hip(&r->d_t_silu);
     free_hip(&r->d_ada_out); free_hip(&r->d_mod); free_hip(&r->d_mod_base);
     free_hip(&r->d_noise); free_hip(&r->d_vel); free_hip(&r->d_cond);
+    r->ca_kv_valid = 0;
+}
 
-    /* Decoder */
+void hip_trellis2_unload_decoder(hip_trellis2_runner *r) {
+    if (!r) return;
+    free_hip(&r->dec_input.conv_w); free_hip(&r->dec_input.conv_b);
+    for (int i = 0; i < 2; i++) {
+        t2_dec_layer *L = &r->dec_mid[i];
+        free_hip(&L->conv_w); free_hip(&L->conv_b);
+        free_hip(&L->rb_ln1_w); free_hip(&L->rb_ln1_b);
+        free_hip(&L->rb_c1_w); free_hip(&L->rb_c1_b);
+        free_hip(&L->rb_ln2_w); free_hip(&L->rb_ln2_b);
+        free_hip(&L->rb_c2_w); free_hip(&L->rb_c2_b);
+    }
+    t2_dec_layer *groups[3] = { r->dec_res16, r->dec_res32, r->dec_res64 };
+    for (int g = 0; g < 3; g++) for (int i = 0; i < 2; i++) {
+        t2_dec_layer *L = &groups[g][i];
+        free_hip(&L->conv_w); free_hip(&L->conv_b);
+        free_hip(&L->rb_ln1_w); free_hip(&L->rb_ln1_b);
+        free_hip(&L->rb_c1_w); free_hip(&L->rb_c1_b);
+        free_hip(&L->rb_ln2_w); free_hip(&L->rb_ln2_b);
+        free_hip(&L->rb_c2_w); free_hip(&L->rb_c2_b);
+    }
+    free_hip(&r->dec_up1_w); free_hip(&r->dec_up1_b);
+    free_hip(&r->dec_up2_w); free_hip(&r->dec_up2_b);
+    free_hip(&r->dec_out_ln_w); free_hip(&r->dec_out_ln_b);
+    free_hip(&r->dec_out_w); free_hip(&r->dec_out_b);
     for (int i = 0; i < 4; i++) free_hip(&r->d_dec[i]);
+    r->dec_loaded = 0;
+}
+
+void hip_trellis2_free(hip_trellis2_runner *r) {
+    if (!r) return;
+
+    hip_trellis2_unload_dit(r);
+    hip_trellis2_unload_decoder(r);
 
     /* hipBLASLt cleanup */
     if (r->d_act_bf16) { hipFree(r->d_act_bf16); r->d_act_bf16 = NULL; }
@@ -978,16 +1008,16 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
         free_hip(&r->slat_out.w); free_hip(&r->slat_out.b);
         for (int i = 0; i < DIT_DEPTH; i++) {
             t2_block_gpu *b = &r->slat_blocks[i];
-            free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.b);
+            free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.w_bf16); free_hip(&b->sa_qkv.b);
             free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
-            free_hip(&b->sa_out.w); free_hip(&b->sa_out.b);
+            free_hip(&b->sa_out.w); free_hip(&b->sa_out.w_bf16); free_hip(&b->sa_out.b);
             free_hip(&b->norm2_w); free_hip(&b->norm2_b);
-            free_hip(&b->ca_q.w); free_hip(&b->ca_q.b);
+            free_hip(&b->ca_q.w); free_hip(&b->ca_q.w_bf16); free_hip(&b->ca_q.b);
             free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
-            free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.b);
-            free_hip(&b->ca_out.w); free_hip(&b->ca_out.b);
-            free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.b);
-            free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.b);
+            free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.w_bf16); free_hip(&b->ca_kv.b);
+            free_hip(&b->ca_out.w); free_hip(&b->ca_out.w_bf16); free_hip(&b->ca_out.b);
+            free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.w_bf16); free_hip(&b->mlp_fc1.b);
+            free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.w_bf16); free_hip(&b->mlp_fc2.b);
             free_hip(&b->mod_bias);
             free_hip(&r->slat_ca_K_cache[i]);
             free_hip(&r->slat_ca_V_cache[i]);
@@ -1391,8 +1421,12 @@ static void run_flash_sa(hip_trellis2_runner *r, void *out, void *out_bf16,
     void *args[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim};
     void *args_bc32[] = {&out, &Q, &K, &V, &N, &n_heads, &head_dim, &out_bf16,
                          &qkv_stride};
-    if (r->use_wmma && r->fn_flash_sa_wmma_b16_db && head_dim == 128 && (N % 64) == 0) {
-        hipModuleLaunchKernel(r->fn_flash_sa_wmma_b16_db, n_heads, N / 64, 1, 128, 1, 1,
+    /* WMMA SA kernels: b16_db and bc32_v2 mask both Q-load (qi<N), K/V-load
+     * (kvi<N), softmax logits (kvi_col>=N → -inf), and output write (qi<N), so
+     * they accept any N. Round grid up to ceil(N/64); pad rows are no-ops. */
+    int gY64 = (N + 63) / 64;
+    if (r->use_wmma && r->fn_flash_sa_wmma_b16_db && head_dim == 128) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_b16_db, n_heads, gY64, 1, 128, 1, 1,
                               0, 0, args, NULL);
         return;
     }
@@ -1401,8 +1435,8 @@ static void run_flash_sa(hip_trellis2_runner *r, void *out, void *out_bf16,
                               0, 0, args, NULL);
         return;
     }
-    if (r->use_wmma && r->fn_flash_sa_wmma_bc32_v2 && head_dim == 128 && (N % 64) == 0) {
-        hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32_v2, n_heads, N / 64, 1, 128, 1, 1,
+    if (r->use_wmma && r->fn_flash_sa_wmma_bc32_v2 && head_dim == 128) {
+        hipModuleLaunchKernel(r->fn_flash_sa_wmma_bc32_v2, n_heads, gY64, 1, 128, 1, 1,
                               0, 0, args_bc32, NULL);
         return;
     }
@@ -1433,8 +1467,12 @@ static void run_cross_attn(hip_trellis2_runner *r, void *out, void *out_bf16,
     int head_dim = DIT_HEAD_DIM;
     void *args[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale};
     void *args_bc32[] = {&out, &Q, &K, &V, &q_len, &kv_len, &dim, &n_heads, &head_dim, &scale, &out_bf16};
-    if (r->use_wmma && r->fn_cross_attn_wmma_bc32_v2 && head_dim == 128 && (q_len % 64) == 0) {
-        hipModuleLaunchKernel(r->fn_cross_attn_wmma_bc32_v2, n_heads, q_len / 64, 1, 128, 1, 1,
+    /* cross_attn_wmma_bc32_v2 masks Q-load (qi<q_len) and output write
+     * (qi<q_len); KV-tile masking via (kvi<kv_len) handles arbitrary kv_len.
+     * Round grid up to ceil(q_len/64); pad rows are no-ops. */
+    int gY64 = (q_len + 63) / 64;
+    if (r->use_wmma && r->fn_cross_attn_wmma_bc32_v2 && head_dim == 128) {
+        hipModuleLaunchKernel(r->fn_cross_attn_wmma_bc32_v2, n_heads, gY64, 1, 128, 1, 1,
                               0, 0, args_bc32, NULL);
         return;
     }
@@ -2209,35 +2247,38 @@ int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
         memset(b, 0, sizeof(*b));
         #define SBN(n) (snprintf(name,sizeof(name),"blocks.%d.%s",bi,n), name)
 
-        b->sa_qkv.w  = st_upload_f32(st, SBN("self_attn.to_qkv.weight"), v);
+        /* Per-block large GEMM weights: prefer BF16-raw upload so the gemm()
+         * hipBLASLt path activates. SLAT N is variable but hipBLASLt doesn't
+         * require N%64; the SS-DiT WMMA bc32 fast-paths do, hipBLASLt does not. */
+        st_upload_wt_bf16_pref(st, SBN("self_attn.to_qkv.weight"), r->use_blaslt,
+                               &b->sa_qkv.w_bf16, &b->sa_qkv.w, &b->sa_qkv.scale, v);
         b->sa_qkv.b  = st_upload_f32(st, SBN("self_attn.to_qkv.bias"),   v);
-        b->sa_qkv.scale = -1.0f;
         b->sa_q_norm = st_upload_f32(st, SBN("self_attn.q_rms_norm.gamma"), v);
         b->sa_k_norm = st_upload_f32(st, SBN("self_attn.k_rms_norm.gamma"), v);
-        b->sa_out.w  = st_upload_f32(st, SBN("self_attn.to_out.weight"), v);
+        st_upload_wt_bf16_pref(st, SBN("self_attn.to_out.weight"), r->use_blaslt,
+                               &b->sa_out.w_bf16, &b->sa_out.w, &b->sa_out.scale, v);
         b->sa_out.b  = st_upload_f32(st, SBN("self_attn.to_out.bias"),   v);
-        b->sa_out.scale = -1.0f;
 
         b->norm2_w   = st_upload_f32(st, SBN("norm2.weight"), v);
         b->norm2_b   = st_upload_f32(st, SBN("norm2.bias"),   v);
-        b->ca_q.w    = st_upload_f32(st, SBN("cross_attn.to_q.weight"), v);
+        st_upload_wt_bf16_pref(st, SBN("cross_attn.to_q.weight"), r->use_blaslt,
+                               &b->ca_q.w_bf16, &b->ca_q.w, &b->ca_q.scale, v);
         b->ca_q.b    = st_upload_f32(st, SBN("cross_attn.to_q.bias"),   v);
-        b->ca_q.scale = -1.0f;
         b->ca_q_norm = st_upload_f32(st, SBN("cross_attn.q_rms_norm.gamma"), v);
         b->ca_k_norm = st_upload_f32(st, SBN("cross_attn.k_rms_norm.gamma"), v);
-        b->ca_kv.w   = st_upload_f32(st, SBN("cross_attn.to_kv.weight"), v);
+        st_upload_wt_bf16_pref(st, SBN("cross_attn.to_kv.weight"), r->use_blaslt,
+                               &b->ca_kv.w_bf16, &b->ca_kv.w, &b->ca_kv.scale, v);
         b->ca_kv.b   = st_upload_f32(st, SBN("cross_attn.to_kv.bias"),   v);
-        b->ca_kv.scale = -1.0f;
-        b->ca_out.w  = st_upload_f32(st, SBN("cross_attn.to_out.weight"), v);
+        st_upload_wt_bf16_pref(st, SBN("cross_attn.to_out.weight"), r->use_blaslt,
+                               &b->ca_out.w_bf16, &b->ca_out.w, &b->ca_out.scale, v);
         b->ca_out.b  = st_upload_f32(st, SBN("cross_attn.to_out.bias"),   v);
-        b->ca_out.scale = -1.0f;
 
-        b->mlp_fc1.w = st_upload_f32(st, SBN("mlp.mlp.0.weight"), v);
+        st_upload_wt_bf16_pref(st, SBN("mlp.mlp.0.weight"), r->use_blaslt,
+                               &b->mlp_fc1.w_bf16, &b->mlp_fc1.w, &b->mlp_fc1.scale, v);
         b->mlp_fc1.b = st_upload_f32(st, SBN("mlp.mlp.0.bias"),   v);
-        b->mlp_fc1.scale = -1.0f;
-        b->mlp_fc2.w = st_upload_f32(st, SBN("mlp.mlp.2.weight"), v);
+        st_upload_wt_bf16_pref(st, SBN("mlp.mlp.2.weight"), r->use_blaslt,
+                               &b->mlp_fc2.w_bf16, &b->mlp_fc2.w, &b->mlp_fc2.scale, v);
         b->mlp_fc2.b = st_upload_f32(st, SBN("mlp.mlp.2.bias"),   v);
-        b->mlp_fc2.scale = -1.0f;
 
         b->mod_bias  = st_upload_f32(st, SBN("modulation"), v);
         #undef SBN
@@ -2255,8 +2296,9 @@ int hip_trellis2_load_slat_dit(hip_trellis2_runner *r, const char *path) {
     hipMalloc(&r->d_slat_mod_base, 6 * DIT_DIM * sizeof(float));
     hipMalloc(&r->d_slat_mod,      6 * DIT_DIM * sizeof(float));
 
-    fprintf(stderr, "T2-HIP: SLAT DiT loaded (%d blocks, RoPE %d freqs/axis, F32)\n",
-            DIT_DEPTH, r->slat_n_freqs);
+    fprintf(stderr, "T2-HIP: SLAT DiT loaded (%d blocks, RoPE %d freqs/axis, %s)\n",
+            DIT_DEPTH, r->slat_n_freqs,
+            r->use_blaslt ? "BF16+hipBLASLt" : "F32");
     return 0;
 }
 
@@ -2432,18 +2474,10 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
             r->d_rope_cos = saved_cos; r->d_rope_sin = saved_sin;
             r->n_rope_freqs = saved_freqs;
         }
-        /* Scalar flash self-attn (any N). */
-        {
-            int n_heads = DIT_HEADS, head_dim = DIT_HEAD_DIM;
-            void *out = r->d_slat_attn_out;
-            void *Q = r->d_slat_Q, *K = r->d_slat_K, *V = r->d_slat_V;
-            int Nl = N;
-            void *args[] = { &out, &Q, &K, &V, &Nl, &n_heads, &head_dim };
-            int gY = (N + 3) / 4;
-            size_t smem = 2 * 16 * 128 * sizeof(float);
-            hipModuleLaunchKernel(r->fn_flash_sa, DIT_HEADS, gY, 1, 128, 1, 1,
-                                  smem, 0, args, NULL);
-        }
+        /* WMMA flash self-attn — kernels (b16_db, bc32_v2) mask N internally
+         * so SLAT's variable N works without padding. Scalar fallback otherwise. */
+        run_flash_sa(r, r->d_slat_attn_out, NULL,
+                     r->d_slat_Q, r->d_slat_K, r->d_slat_V, N, /*qkv_stride*/0);
         gemm(r, r->d_slat_ln_h, &b->sa_out, r->d_slat_attn_out, b->sa_out.b,
              DIT_DIM, DIT_DIM, N);
         run_gated_add(r, r->d_slat_h, r->d_slat_ln_h, gate_sa, N, DIT_DIM);
@@ -2453,19 +2487,10 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
         gemm(r, r->d_slat_ca_Q, &b->ca_q, r->d_slat_ln_h, b->ca_q.b,
              DIT_DIM, DIT_DIM, N);
         run_rms_norm_ph(r, r->d_slat_ca_Q, b->ca_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
-        /* Scalar cross-attn over cached K,V. */
-        {
-            float scale = 1.0f / sqrtf((float)DIT_HEAD_DIM);
-            int dim = DIT_DIM, n_heads = DIT_HEADS, head_dim = DIT_HEAD_DIM;
-            void *out = r->d_slat_attn_out;
-            void *Q = r->d_slat_ca_Q;
-            void *K = r->slat_ca_K_cache[bi], *V = r->slat_ca_V_cache[bi];
-            int q_len = N, kv_len = r->slat_ca_kv_len;
-            void *args[] = { &out, &Q, &K, &V, &q_len, &kv_len, &dim,
-                             &n_heads, &head_dim, &scale };
-            hipModuleLaunchKernel(r->fn_cross_attn, DIT_HEADS, q_len, 1, 128, 1, 1,
-                                  0, 0, args, NULL);
-        }
+        /* WMMA cross-attn — bc32_v2 masks q_len internally. */
+        run_cross_attn(r, r->d_slat_attn_out, NULL,
+                       r->d_slat_ca_Q, r->slat_ca_K_cache[bi], r->slat_ca_V_cache[bi],
+                       N, r->slat_ca_kv_len);
         gemm(r, r->d_slat_ln_h, &b->ca_out, r->d_slat_attn_out, b->ca_out.b,
              DIT_DIM, DIT_DIM, N);
         /* No gate on cross-attn — direct residual */
@@ -2526,11 +2551,14 @@ int hip_trellis2_slat_dit_step(hip_trellis2_runner *r,
         free(cs); free(sn);
     }
 
-    /* Timestep sinusoidal embed. SLAT runner takes raw t (sampler already
-     * scaled by 1000). */
+    /* Timestep sinusoidal embed. Match PyT flow_euler._inference_model which
+     * passes t*1000 to the model. Mirrors SS DiT runner convention so callers
+     * always pass raw t in [0,1]. Phase-2 dump (dump_rocm.py) bypasses the
+     * sampler with a raw-t direct model call; its verify test must pass
+     * t/1000 to compensate. */
     {
         void *out = r->d_slat_t_emb;
-        float t_val = t_value;
+        float t_val = t_value * 1000.0f;
         int dim = DIT_T_HALF * 2;
         void *args[] = { &out, &t_val, &dim };
         hipModuleLaunchKernel(r->fn_t_embed, (DIT_T_HALF + 255) / 256, 1, 1, 256, 1, 1,
