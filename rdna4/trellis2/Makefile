@@ -87,6 +87,9 @@ $(VERIFY_DEC): verify_decoder.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape
 $(SLAT_DIT): test_hip_slat_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS) ../../common/npy_io.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_slat_dit.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
+test_hip_slat_traj: test_hip_slat_traj.c $(RUNNER_SRC) hip_shape_dec_pipeline.c hip_shape_dec_pipeline.h $(ROCEW_SRC) $(BLASLT_OBJ) $(COMMON_DEPS) ../../common/npy_io.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ test_hip_slat_traj.c $(RUNNER_SRC) hip_shape_dec_pipeline.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+
 # Default weight paths — override on the command line
 DIT     ?= /path/to/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors
 DECODER ?= /path/to/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors

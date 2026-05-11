@@ -113,7 +113,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[test_hip_slat_dit] N=%d n_cond=%d t=%.6f\n", N, n_cond, t_val);
 
     float *out = (float *)malloc((size_t)N * 32 * sizeof(float));
-    if (hip_trellis2_slat_dit_step(r, x_t, coords, N, t_val,
+    /* PyT dump bypasses sampler and passes raw t=0.5 to the model directly.
+     * Our runner now ×1000 internally (matches SS DiT and PyT sampler path),
+     * so divide by 1000 here to reproduce the dump's effective t. */
+    if (hip_trellis2_slat_dit_step(r, x_t, coords, N, t_val / 1000.0f,
                                     cond, n_cond, out) != 0) {
         fprintf(stderr, "[test_hip_slat_dit] step failed\n");
         return 5;
