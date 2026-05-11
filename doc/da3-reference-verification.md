@@ -88,7 +88,7 @@ All comparisons PASS with very high correlation. The small GPU-vs-CPU difference
 | Pose (FOV) | Max abs diff | 0.094 | Acceptable |
 | Gaussians (38ch) | Overall Pearson r | **0.998** | Excellent |
 | Gaussians per-channel | Pearson r range | 0.997--0.999 | Excellent |
-| Rays | GPU output | All zeros | Known issue (see below) |
+| Rays | GPU output | Previously all zeros | Re-run Giant after camera-token fix |
 
 ## Results: DA3Nested-Giant-Large-1.1
 
@@ -113,15 +113,19 @@ All comparisons PASS with very high correlation. The small GPU-vs-CPU difference
 
 ## Results: PPD (Pixel-Perfect-Depth)
 
-**Comparison**: PyTorch FP16 reference vs CUDA F16 GPU. Test image: Brooklyn Bridge resized to 512x336 (16-aligned).
+**Comparison**: PyTorch FP16 reference vs CUDA F16 GPU. Test image: street.ppm 640x480.
 
 | Comparison | Pearson r | MAE | Max AE | Assessment |
 |---|---|---|---|---|
-| GPU vs Reference | **0.949** | 0.080 | 1.212 | Expected (different RNG seeds) |
+| GPU vs Reference | **0.999991** | 0.000816 | 0.065451 | PASS |
 
-**Note**: The PPD pipeline uses a 4-step Euler diffusion process starting from random noise. The reference uses `torch.manual_seed(42)` while the C/CUDA code uses `srand(42)`, producing different noise sequences. Given the sensitivity of diffusion trajectories to initial noise, r=0.949 demonstrates correct implementation of the DA2 encoder, DiT transformer, and Euler solver.
+**Note**: The PPD reference now uses a libc `rand()` Box-Muller noise
+generator to match the C/CUDA initial latent sequence. The CUDA runner
+pads to 16-aligned processing dimensions internally and resizes the final
+depth back to the original image size.
 
-**Known issue**: CUDA PPD produces all-zero output when the input dimensions are not divisible by 16 (requires padding/cropping). Works correctly for 16-aligned inputs (512x336, etc.).
+See `doc/ppd.md` for the current performance profile and open PPD
+optimization tasks.
 
 ---
 
