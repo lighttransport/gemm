@@ -116,6 +116,9 @@ sam3d_body_ctx *sam3d_body_create(const sam3d_body_config *cfg)
     sam3d_body_ctx *c = (sam3d_body_ctx *)calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->cfg = *cfg;
+    if (c->cfg.image_size <= 0) c->cfg.image_size = SAM3D_BODY_ENCODER_SIZE;
+    if (c->cfg.image_height <= 0) c->cfg.image_height = c->cfg.image_size;
+    if (c->cfg.image_width  <= 0) c->cfg.image_width  = c->cfg.image_size;
     if (c->cfg.n_threads <= 0) {
         const char *env = getenv("OMP_NUM_THREADS");
         c->cfg.n_threads = env ? atoi(env) : 1;
@@ -265,9 +268,11 @@ int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
 
     const int is_vith = (ctx->cfg.backbone == SAM3D_BODY_BACKBONE_VITH);
 
-    /* Both variants run TopdownAffine to a 512×512 working canvas; vith
-     * then crops 64 columns on each side to (512, 384). */
-    const int S = 512;
+    /* ViT-H runs TopdownAffine to a 512x512 working canvas, then crops
+     * 64 columns on each side. DINOv3 uses the configured patch-aligned HxW. */
+    const int S = SAM3D_BODY_ENCODER_SIZE;
+    const int IMG_H = is_vith ? S : ctx->cfg.image_height;
+    const int IMG_W = is_vith ? S : ctx->cfg.image_width;
 
     /* TopdownAffine: GetBBoxCenterScale + 2× fix_aspect_ratio + get_warp_matrix.
      * If no bbox supplied, use the full image as the bbox. */
@@ -278,8 +283,11 @@ int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
         bbox_xyxy[0] = 0; bbox_xyxy[1] = 0;
         bbox_xyxy[2] = (float)ctx->img_w; bbox_xyxy[3] = (float)ctx->img_h;
     }
+    float aspect_ratio_pre = 0.75f;
+    if (!is_vith && IMG_H != IMG_W)
+        aspect_ratio_pre = (float)IMG_W / (float)IMG_H;
     sam3d_body_compute_bbox_affine(bbox_xyxy, /*padding=*/1.25f,
-                                   /*aspect_ratio_pre=*/0.75f, S, S,
+                                   aspect_ratio_pre, IMG_W, IMG_H,
                                    ctx->self_center, ctx->self_scale,
                                    ctx->self_warp);
 
@@ -291,11 +299,11 @@ int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
     }
     ctx->self_pp_set = 1;
 
-    /* cv2.warpAffine + ImageNet norm + HWC→CHW into the (3, 512, 512) canvas. */
-    float *chw = (float *)malloc((size_t)3 * S * S * sizeof(float));
+    /* cv2.warpAffine + ImageNet norm + HWC->CHW into the backbone canvas. */
+    float *chw = (float *)malloc((size_t)3 * IMG_H * IMG_W * sizeof(float));
     if (!chw) return SAM3D_BODY_E_INVAL;
     int rc_pp = sam3d_body_preprocess_image(ctx->image_rgb, ctx->img_w, ctx->img_h,
-                                            ctx->self_warp, S, S, chw);
+                                            ctx->self_warp, IMG_W, IMG_H, chw);
     if (rc_pp != 0) { free(chw); return SAM3D_BODY_E_INVAL; }
 
     if (!is_vith) {
@@ -315,7 +323,8 @@ int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
             ctx->encoder_model->use_learned_final_norm = 1;
         }
         dinov3_result r = dinov3_encode_from_normalized(ctx->encoder_model, chw,
-                                                        S, S, ctx->cfg.n_threads);
+                                                        IMG_W, IMG_H,
+                                                        ctx->cfg.n_threads);
         free(chw);
         if (!r.features) return SAM3D_BODY_E_LOAD_FAILED;
 
@@ -327,8 +336,8 @@ int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
         ctx->enc_grid_h    = ctx->encoder_model->grid_h;
         ctx->enc_grid_w    = ctx->encoder_model->grid_w;
         ctx->enc_n_prefix  = 1 + ctx->encoder_model->n_storage;
-        ctx->enc_image_h   = S;
-        ctx->enc_image_w   = S;
+        ctx->enc_image_h   = IMG_H;
+        ctx->enc_image_w   = IMG_W;
         return SAM3D_BODY_E_OK;
     }
 
@@ -414,10 +423,12 @@ static int self_drive_decoder_inputs(sam3d_body_ctx *ctx)
     float *img_emb_pre = (float *)malloc((size_t)Dc * gh * gw * sizeof(float));
     if (!img_emb_pre) return SAM3D_BODY_E_INVAL;
     const float *patch_tokens = ctx->encoder_tokens.data + (size_t)n_prefix * Dc;
+    const float *no_mask = (const float *)dm->no_mask_embed.data;
+    if (!no_mask) { free(img_emb_pre); return SAM3D_BODY_E_LOAD_FAILED; }
     for (int n = 0; n < n_patches; n++) {
         for (int c = 0; c < Dc; c++) {
             img_emb_pre[(size_t)c * n_patches + n] =
-                patch_tokens[(size_t)n * Dc + c];
+                patch_tokens[(size_t)n * Dc + c] + no_mask[c];
         }
     }
 
@@ -431,14 +442,21 @@ static int self_drive_decoder_inputs(sam3d_body_ctx *ctx)
     const int img_w_for_rays = ctx->enc_image_w;
     float warp_for_rays[6];
     memcpy(warp_for_rays, ctx->self_warp, sizeof(warp_for_rays));
+    int ray_img_h = img_h_for_rays;
+    int ray_img_w = img_w_for_rays;
+    int ray_rect_reinterpret =
+        (ctx->cfg.backbone == SAM3D_BODY_BACKBONE_DINOV3 &&
+         img_h_for_rays != img_w_for_rays);
     if (ctx->cfg.backbone == SAM3D_BODY_BACKBONE_VITH) {
-        warp_for_rays[2] = ctx->self_warp[2] - 64.0f * ctx->self_warp[0];
+        ray_img_h = SAM3D_BODY_ENCODER_SIZE;
+        ray_img_w = SAM3D_BODY_ENCODER_SIZE;
     }
     float *rays_xyz = (float *)malloc((size_t)gh * gw * 3 * sizeof(float));
     if (!rays_xyz) { free(img_emb_pre); return SAM3D_BODY_E_INVAL; }
-    rc = sam3d_body_compute_ray_cond_xyz(ctx->self_cam_int, warp_for_rays,
-                                         img_h_for_rays, img_w_for_rays,
-                                         gh, gw, rays_xyz);
+    rc = sam3d_body_compute_ray_cond_xyz_ex(ctx->self_cam_int, warp_for_rays,
+                                            ray_img_h, ray_img_w,
+                                            gh, gw, ray_rect_reinterpret,
+                                            rays_xyz);
     if (rc != 0) { free(img_emb_pre); free(rays_xyz); return rc; }
 
     /* image_emb POST ray_cond. */
@@ -510,6 +528,9 @@ static int self_drive_decoder_inputs(sam3d_body_ctx *ctx)
     memcpy(ctx->dec_cam_batch.img_size,     img_size,     2 * sizeof(float));
     /* For vith, the decoder sees the (384, 512) cropped canvas, so the
      * affine must include the same -64 X-shift used for ray_cond_xyz. */
+    if (ctx->cfg.backbone == SAM3D_BODY_BACKBONE_VITH) {
+        warp_for_rays[2] = ctx->self_warp[2] - 64.0f * ctx->self_warp[0];
+    }
     memcpy(ctx->dec_cam_batch.affine_trans, warp_for_rays, 6 * sizeof(float));
     ctx->dec_cam_batch.use_intrin_center    = 0;
     ctx->dec_cam_batch.default_scale_factor = 1.0f;
@@ -793,5 +814,52 @@ int sam3d_body_debug_override_decoder_inputs(
     ctx->dec_cam_batch.use_intrin_center    = use_intrin_center;
     ctx->dec_cam_batch.default_scale_factor = default_scale_factor;
     ctx->dec_in_set = 1;
+    return SAM3D_BODY_E_OK;
+}
+
+int sam3d_body_debug_get_decoder_inputs(
+    sam3d_body_ctx *ctx,
+    const float **image_emb_chw,
+    const float **image_pe_chw,
+    const float **init_x,
+    const float **init_xpe,
+    int *H,
+    int *W,
+    int *Dc,
+    int *Nq,
+    int *D,
+    const float **cam_int,
+    const float **bbox_center,
+    float *bbox_scale,
+    const float **ori_img_size,
+    const float **img_size,
+    const float **affine_trans,
+    int *use_intrin_center,
+    float *default_scale_factor)
+{
+    if (!ctx || !ctx->dec_in_set || !ctx->decoder_model ||
+        !ctx->dec_image_emb_chw || !ctx->dec_image_pe_chw ||
+        !ctx->dec_init_x || !ctx->dec_init_xpe)
+        return SAM3D_BODY_E_INVAL;
+
+    if (image_emb_chw) *image_emb_chw = ctx->dec_image_emb_chw;
+    if (image_pe_chw)  *image_pe_chw  = ctx->dec_image_pe_chw;
+    if (init_x)        *init_x        = ctx->dec_init_x;
+    if (init_xpe)      *init_xpe      = ctx->dec_init_xpe;
+    if (H)             *H             = ctx->dec_H;
+    if (W)             *W             = ctx->dec_W;
+    if (Dc)            *Dc            = ctx->decoder_model->kv_dim;
+    if (Nq)            *Nq            = 145;
+    if (D)             *D             = ctx->decoder_model->dim;
+    if (cam_int)       *cam_int       = ctx->dec_cam_batch.cam_int;
+    if (bbox_center)   *bbox_center   = ctx->dec_cam_batch.bbox_center;
+    if (bbox_scale)    *bbox_scale    = ctx->dec_cam_batch.bbox_scale;
+    if (ori_img_size)  *ori_img_size  = ctx->dec_cam_batch.ori_img_size;
+    if (img_size)      *img_size      = ctx->dec_cam_batch.img_size;
+    if (affine_trans)  *affine_trans  = ctx->dec_cam_batch.affine_trans;
+    if (use_intrin_center)
+        *use_intrin_center = ctx->dec_cam_batch.use_intrin_center;
+    if (default_scale_factor)
+        *default_scale_factor = ctx->dec_cam_batch.default_scale_factor;
     return SAM3D_BODY_E_OK;
 }

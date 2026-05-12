@@ -49,7 +49,7 @@ int main(int argc, char **argv)
     /* CPU floor ~1e-5; CUDA matches f32 LN+GEMM precision, set 1e-4 budget. */
     float threshold = 1e-4f;
     int device = 0, verbose = 0;
-    const char *precision = "bf16";
+    const char *precision = "fp16";
     cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
@@ -73,7 +73,7 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--backbone dinov3|vith] [--device N] "
-                        "[--precision bf16|fp16] [-v]\n", argv[0]);
+                        "[--precision fp16|bf16] [-v]\n", argv[0]);
         return 2;
     }
 
