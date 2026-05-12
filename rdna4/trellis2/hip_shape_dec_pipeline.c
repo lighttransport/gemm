@@ -931,6 +931,16 @@ hip_shape_dec_ctx *hip_shape_dec_ctx_create(hipModule_t module,
             if (e && strcmp(e, "0") == 0) g_use_wmma_spconv = 0;
             fprintf(stderr, "T2-TEX: WMMA spconv %s\n", g_use_wmma_spconv ? "enabled" : "disabled");
         }
+        {
+            /* Disabling JUST the blaslt-gather27 spconv path (keeps the
+             * BF16 GEMM bridge alive for everything else). Useful for
+             * isolating whether the blaslt or WMMA x8 path is faster
+             * per-stage; stage 1 ConvNeXt at C=512 currently routes to
+             * blaslt and dominates tex_dec wall (~1.1 s of 3.3 s). */
+            const char *e = getenv("T2_TEX_BLASLT_SPCONV");
+            if (e && strcmp(e, "0") == 0) g_use_blaslt_spconv = 0;
+            fprintf(stderr, "T2-TEX: blaslt spconv %s\n", g_use_blaslt_spconv ? "enabled" : "disabled");
+        }
 
         /* hipBLASLt init (default ON; T2_TEX_BLASLT=0 to disable). */
         {

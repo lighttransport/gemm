@@ -1066,6 +1066,13 @@ void hip_trellis2_unload_slat_dit(hip_trellis2_runner *r) {
 void hip_trellis2_free(hip_trellis2_runner *r) {
     if (!r) return;
 
+    /* Drain any pending GPU work — the PBR sample / colored-OBJ path leaves
+     * kernels on auxiliary streams, and tearing down hipBLASLt while they
+     * complete surfaces as an "illegal memory access" inside hipblaslt.cpp
+     * (catch site is internal, not ours). Sync first to keep the error
+     * surface at the call site that actually faulted, not at teardown. */
+    hipDeviceSynchronize();
+
     hip_trellis2_unload_dit(r);
     hip_trellis2_unload_decoder(r);
 
