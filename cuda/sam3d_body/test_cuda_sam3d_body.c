@@ -5,7 +5,7 @@
  *   test_cuda_sam3d_body --safetensors-dir <DIR> --image <image.jpg>
  *       --mhr-assets <DIR>
  *       [--bbox x0 y0 x1 y1 | --auto-bbox] [--focal F]
- *       [-o body.obj] [--precision bf16|fp16] [--device N] [-v]
+ *       [-o body.obj] [--precision fp16|bf16] [--device N] [-v]
  *
  *   test_cuda_sam3d_body <safetensors-dir> <image.jpg> ...
  */
@@ -33,6 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 static double cli_time_ms(void)
 {
@@ -49,7 +52,7 @@ static void print_usage(const char *prog)
             "[--bbox x0 y0 x1 y1 | --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]] "
             "[--focal F] [-o body.obj] "
             "[--backbone dinov3|vith] "
-            "[--precision bf16|fp16] [--device N] [-v]\n"
+            "[--precision fp16|bf16] [--device N] [-t N] [-v]\n"
             "  %s SFT_DIR IMG.jpg ...   (legacy positional)\n",
             prog, prog);
 }
@@ -150,10 +153,11 @@ int main(int argc, char **argv)
     const char *image_path = NULL;
     const char *mhr_assets = NULL;
     const char *out_path   = "body.obj";
-    const char *precision  = "bf16";
+    const char *precision  = "fp16";
     float bbox[4] = {0}; int has_bbox = 0;
     float focal_hint = 0;
     int device = 0, verbose = 0;
+    int n_threads = 0;
     int auto_bbox = 0;
     int auto_bbox_used = 0;
     float auto_bbox_score = 0.0f;
@@ -178,6 +182,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--mhr-assets") && i+1 < argc) mhr_assets = argv[++i];
         else if (!strcmp(a, "--precision")  && i+1 < argc) precision  = argv[++i];
         else if (!strcmp(a, "--device")     && i+1 < argc) device     = atoi(argv[++i]);
+        else if (!strcmp(a, "-t")           && i+1 < argc) n_threads  = atoi(argv[++i]);
         else if (!strcmp(a, "--focal")      && i+1 < argc) focal_hint = strtof(argv[++i], NULL);
         else if (!strcmp(a, "-o")           && i+1 < argc) out_path   = argv[++i];
         else if (!strcmp(a, "-v"))                         verbose    = 1;
@@ -203,6 +208,9 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         return 2;
     }
+#if defined(_OPENMP)
+    if (n_threads > 0) omp_set_num_threads(n_threads);
+#endif
 
     double t0 = cli_time_ms();
     int iw = 0, ih = 0, ichan = 0;
