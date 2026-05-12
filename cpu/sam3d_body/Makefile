@@ -134,8 +134,8 @@ REFDIR_VITH ?= /tmp/sam3d_body_vith_ref
 REFDIR ?= $(if $(filter vith,$(BACKBONE)),$(REFDIR_VITH),$(REFDIR_DINOV3))
 E2E_IMAGE ?=
 E2E_BBOX ?=
-E2E_THRESHOLD ?= $(if $(filter vith,$(BACKBONE)),1.5e-1,2e-2)
-E2E_THRESHOLD_2D ?= $(if $(filter vith,$(BACKBONE)),200,0.5)
+E2E_THRESHOLD ?= 2e-2
+E2E_THRESHOLD_2D ?= 0.5
 
 check-backbone:
 	@if [ "$(BACKBONE)" != "dinov3" ] && [ "$(BACKBONE)" != "vith" ]; then \
