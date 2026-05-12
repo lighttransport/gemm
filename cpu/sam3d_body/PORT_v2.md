@@ -391,17 +391,20 @@ After the fix:
   keypoints_3d max_abs=8.08e-7.
 
 ViT-H fixed-bbox refs generated from
-`/mnt/disk01/models/sam3d-body/vith` also pass through both
-self-driven verifiers. Current raw-image envelope:
+`/mnt/disk01/models/sam3d-body/vith` should be regenerated with
+`--backbone-dtype float32`; older BF16 or stale guarded dumps have a much
+larger apparent raw drift. Current float32 raw-image envelope:
 
-- CPU: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
-- CUDA: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
+- CPU: vertices max_abs=3.07e-5, kp3d max_abs=2.84e-5, kp2d max_abs=2.09e-2 px
+- CUDA: vertices max_abs=3.05e-5, kp3d max_abs=2.86e-5, kp2d max_abs=2.08e-2 px
 
-Both now pass with just `--backbone vith`; raw-image ViT-H verifier
-defaults are 0.15 for vertices/keypoints_3d and 200 px for keypoints_2d.
-Because the decoder/MHR override gates are exact, the remaining raw-image
-gap is the converted ViT-H encoder precision floor relative to PyTorch,
-not decoder or CUDA integration drift.
+Both now pass with the same raw-image defaults as DINOv3
+(`--threshold 2e-2 --threshold-2d 0.5`). If a legacy BF16 ref is used,
+the verifiers auto-select a looser internal default when thresholds are
+not supplied. The key fixes were preserving ViT-H's upstream 0.75-aspect
+512x512 transform for bbox/rays while keeping decoder `img_size` and
+`affine_trans` in the square 512x512 frame, and using the no-mask prompt
+embedding before ray conditioning.
 
 ### A1.6 — VITH decoder + MHR on CUDA (DONE 2026-04-26)
 
@@ -543,8 +546,9 @@ Smoke (sm_120):
 - `--backbone dinov3 -o cuda_dinov3.obj` → V=18439 F=36874 (unchanged).
 - `--backbone vith -o cuda_vith.obj` → V=18439 F=36874; encoder +
   decoder + MHR complete.
-- `make verify-vith` (CUDA) → max_abs=3.53e-1 mean_abs=1.39e-2 (still
-  green; runner refactor didn't regress the verify path).
+- `make verify-vith` (CUDA, canonical float32 ref) →
+  max_abs=1.92e-4 mean_abs=2.70e-6; runner refactor didn't regress the
+  verify path.
 
 ### A1.3 — CUDA ViT-H encoder + verify_vith green (DONE 2026-04-26)
 
@@ -582,10 +586,11 @@ qkv_split → sdpa_f32 → proj → +residual → LN2 → fc1 → GELU → fc2 �
 (1, 1280, 32, 24) f32 from `/tmp/sam3d_body_vith_ref/`, calls
 `cuda_sam3d_body_debug_set_normalized_input` (relaxed to accept
 512×384 when ctx is VITH), `cuda_sam3d_body_run_encoder`, and diffs
-flat against ref. Result: **max_abs=3.53e-1 mean_abs=1.39e-2** —
-identical to CPU at the bf16 forward floor. DINOv3 verify still
-green at max=9.95e-1 mean=1.11e-2 (untouched). Gate set to
-5e-1 max / 2e-2 mean — same A1.2 budget.
+flat against ref. With canonical float32 refs, CUDA reports
+max_abs=1.92e-4 mean_abs=2.70e-6; CPU reports max_abs=2.43e-4
+mean_abs=2.74e-6. The verifiers detect `backbone_dtype.txt` and use
+tight float32 gates for canonical refs, while retaining the old loose
+BF16 diagnostic budget for config-dtype legacy refs.
 
 `Makefile` gained `verify_vith` build + `verify-vith` run target with
 `VITH_REFDIR=/tmp/sam3d_body_vith_ref`.
@@ -623,22 +628,18 @@ header rather than a retrofit:
 `/tmp/sam3d_body_vith_ref/` (produced by gen_image_ref.py with the
 ViT class hook), runs `sam3d_body_vit_encode_from_normalized` on the
 ImageNet-norm + W-axis-cropped tensor, diffs at the (py, px, d)
-level. Result: **max_abs=3.53e-1 mean_abs=1.39e-2** at 8 threads,
-13.6s wall.
+level. With the canonical float32 fixed-bbox ref, result is
+**max_abs=2.43e-4 mean_abs=2.74e-6** at 8 threads, 14.4s wall.
 
-CRITICAL pitfall logged: the **bf16 forward floor**. Upstream runs
-the backbone in bf16 (`FP16_TYPE: bfloat16` in
-`vith/model_config.yaml`), so the dumped tokens are bf16-rounded
-compounded over 32 blocks. Our fp32 forward drifts max≈3.5e-1
-mean≈1.4e-2 from that — verified IDENTICAL with fp32 weights
-(0% mantissa quant) AND with f16 weights (sliced default). The drift
-is purely the bf16-vs-fp32 forward mismatch, not a quant or kernel
-bug. Gate set to 5e-1 max / 2e-2 mean to track this floor; mean is
-the tight catch (a real port bug typically blows up mean before max).
-DINOv3 variant hits 1.5e-1 max on the same comparison because the
-SwiGLU·LayerScale·RoPE pattern compounds bf16 drift differently from
-GELU MLP — same regime, ViT-H just sits 2.3× hotter. Do not tighten
-the ViT-H gate without first switching to a bf16 forward path.
+BF16 pitfall logged: refs generated with upstream config dtype
+(`FP16_TYPE: bfloat16` in `vith/model_config.yaml`) are bf16-rounded
+through all 32 ViT-H blocks, so a fp32 C forward can show max≈3.5e-1
+mean≈1.4e-2 against those legacy/config dumps. That drift is the
+bf16-vs-fp32 forward mismatch, not a quant or kernel bug. Canonical
+refs should now be generated with `--backbone-dtype float32`; the
+standalone `verify_vith` tools detect `backbone_dtype.txt` and use
+tight f32 gates for those refs, while keeping the older loose gate only
+for BF16 diagnostic refs.
 
 ### A1.1 — convert_ckpt.py per-variant slices (DONE 2026-04-26)
 
