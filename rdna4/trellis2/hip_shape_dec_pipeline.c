@@ -148,6 +148,12 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
                            void *w, void *b,
                            void *co, void *keys, void *vals, int cap_mask,
                            int N, int inC, int outC) {
+    static int s_path_dbg = -1;
+    if (s_path_dbg < 0) {
+        const char *e = getenv("T2_TEX_PATH_DBG");
+        s_path_dbg = (e && atoi(e)) ? 1 : 0;
+    }
+    #define PATH(tag) do { if (s_path_dbg) fprintf(stderr, "    spc N=%d inC=%d outC=%d path=%s nmap=%p\n", N, inC, outC, tag, nmap); } while (0)
     int triton_nmax = 0;
     {
         const char *e = getenv("T2_TRITON_NMAX");
@@ -161,16 +167,18 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
     if (!triton_skip && nmap && g_use_triton && host_w && k->pack_f16 &&
         (triton_nmax <= 0 || N <= triton_nmax) &&
         t2_triton_has_shape(N, inC, outC)) {
-        if (kspconv_nmap_triton(k, out, in, nmap, host_w, b, N, inC, outC) == 0) return;
+        if (kspconv_nmap_triton(k, out, in, nmap, host_w, b, N, inC, outC) == 0) { PATH("triton"); return; }
     }
     if (nmap && g_use_blaslt_spconv && g_use_blaslt && host_w && k->gather27 &&
         (inC % 16 == 0) && (outC % 16 == 0) && inC <= 512 && N >= 512) {
+        PATH("blaslt");
         kspconv_nmap_blaslt(k, out, in, nmap, host_w, b, N, inC, outC);
         return;
     }
     if (nmap) {
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x8 &&
             (inC % 16 == 0) && (outC % 64 == 0) && (N >= 32)) {
+            PATH("wmma_x8");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 31) / 32, gy = (outC + 63) / 64;
             hipFunction_t f = k->conv_nmap_bf16_x8;
@@ -181,6 +189,7 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x4 &&
             (inC % 16 == 0) && (outC % 32 == 0) && (N >= 32)) {
+            PATH("wmma_x4");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 31) / 32, gy = (outC + 31) / 32;
             hipModuleLaunchKernel(k->conv_nmap_bf16_x4, gx, gy, 1, 128, 1, 1, 0, g_stream, a, NULL);
@@ -188,6 +197,7 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16_x2 &&
             (inC % 16 == 0) && (outC % 32 == 0)) {
+            PATH("wmma_x2");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 15) / 16, gy = (outC + 31) / 32;
             hipModuleLaunchKernel(k->conv_nmap_bf16_x2, gx, gy, 1, 64, 1, 1, 0, g_stream, a, NULL);
@@ -195,6 +205,7 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         if (g_use_wmma_spconv && k->conv_nmap_bf16 &&
             (inC % 16 == 0) && (outC % 16 == 0)) {
+            PATH("wmma_x1");
             void *a[] = {&out, &in, &nmap, &w, &b, &N, &inC, &outC};
             int gx = (N + 15) / 16, gy = (outC + 15) / 16;
             hipModuleLaunchKernel(k->conv_nmap_bf16, gx, gy, 1, 32, 1, 1, 0, g_stream, a, NULL);
@@ -202,13 +213,17 @@ static void kspconv_nmap_h(K *k, void *out, void *in, void *nmap, const float *h
         }
         void *a[] = {&out, &in, &nmap, &w, &b, &inC, &outC};
         if ((outC % 64 == 0) && (inC % 32 == 0)) {
+            PATH("nmap_tiled_f32");
             hipModuleLaunchKernel(k->conv_nmap_tiled, N, outC / 64, 1, 64, 1, 1, 0, g_stream, a, NULL);
         } else {
+            PATH("nmap_scalar_f32");
             hipModuleLaunchKernel(k->conv_nmap, N, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
         }
         } else {
+        PATH("hash_kspconv");
         kspconv(k, out, in, co, w, b, keys, vals, cap_mask, N, inC, outC);
     }
+    #undef PATH
 }
 
 static void kspconv_nmap_blaslt(K *k, void *out_f32, void *feats_f32, void *nmap,
@@ -656,6 +671,12 @@ static double now_ms(void) {
 static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *d_feats, void *d_coords, void *d_keys, void *d_vals, int cap_mask,
     void *d_tmp, void *d_mlp, void *d_nmap) {
+    static int s_block_time = -1;
+    if (s_block_time < 0) {
+        const char *e = getenv("T2_TEX_BLOCK_TIME");
+        s_block_time = (e && atoi(e)) ? 1 : 0;
+    }
+    double t_get0 = s_block_time ? now_ms() : 0;
     void *dwc = get_f32_dev(blk->conv_w, (size_t)C * 27 * C * sizeof(float));
     void *dwb = get_f32_dev(blk->conv_b, (size_t)C * sizeof(float));
     void *dnw = get_f32_dev(blk->norm_w, (size_t)C * sizeof(float));
@@ -664,9 +685,15 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
     void *dm0b= get_f32_dev(blk->mlp0_b, (size_t)4*C*sizeof(float));
     void *dm2 = get_f32_dev(blk->mlp2_w, (size_t)C*4*C*sizeof(float));
     void *dm2b= get_f32_dev(blk->mlp2_b, (size_t)C*sizeof(float));
+    double t_get1 = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_get1 = now_ms(); }
     prof_init();
     kspconv_nmap_h(k, d_tmp, d_feats, d_nmap, blk->conv_w, dwc, dwb, d_coords, d_keys, d_vals, cap_mask, N, C, C);
+    double t_spc = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_spc = now_ms(); }
     kln(k, d_tmp, d_tmp, dnw, dnb, N, C, 1, 1);
+    double t_ln = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_ln = now_ms(); }
     static int s_klin_bf16 = -1;
     if (s_klin_bf16 < 0) {
         const char *e = getenv("T2_TEX_KLIN_BF16");
@@ -691,7 +718,15 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
         klin_bl_silu(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
         klin_bl(k, d_tmp, d_mlp, blk->mlp2_w, dm2, dm2b, N, 4*C, C);
     }
+    double t_mlp = 0;
+    if (s_block_time) { if (g_stream) hipStreamSynchronize(g_stream); t_mlp = now_ms(); }
     kadd(k, d_feats, d_tmp, N * C);
+    if (s_block_time) {
+        if (g_stream) hipStreamSynchronize(g_stream);
+        double t_end = now_ms();
+        fprintf(stderr, "    cn N=%d C=%d: get=%.1f spc=%.1f ln=%.1f mlp=%.1f(bf16=%d) add=%.1f tot=%.1f\n",
+                N, C, t_get1 - t_get0, t_spc - t_get1, t_ln - t_spc, t_mlp - t_ln, used_bf16, t_end - t_mlp, t_end - t_get0);
+    }
 }
 
 typedef struct { void *feats, *coords, *keys, *vals; int N, C, cap_mask; } DevSparse;
@@ -1116,15 +1151,27 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
         }
     }
 
+    static int s_stage_time = -1;
+    if (s_stage_time < 0) {
+        const char *e = getenv("T2_TEX_STAGE_TIME");
+        s_stage_time = (e && atoi(e)) ? 1 : 0;
+    }
     int cur_N = N;
     /* Forward through all stages. */
     for (int s = 0; s < dec->n_stages; s++) {
         int nc = dec->n_convnext[s]; int ch = dec->channels[s];
         if (ctx->verbose)
             fprintf(stderr, "stage %d: %d ConvNeXt(C=%d), N=%d\n", s, nc, ch, cur_N);
+        if (s_stage_time && g_stream) hipStreamSynchronize(g_stream);
+        double cn_t0 = s_stage_time ? now_ms() : 0;
         for (int b = 0; b < nc; b++) {
             run_convnext(k, &dec->convnext[s][b], ch, cur_N,
                 d_feats, d_coords, d_keys, d_vals, cap_mask, d_tmp, d_mlp, d_nmap_cn[s]);
+        }
+        if (s_stage_time) {
+            if (g_stream) hipStreamSynchronize(g_stream);
+            fprintf(stderr, "  stage %d ConvNeXt(%d blks, C=%d, N=%d): %.1f ms\n",
+                    s, nc, ch, cur_N, now_ms() - cn_t0);
         }
         if (dec->c2s[s].conv1_w) {
             void *d_idx_use = d_gi[s];
@@ -1178,10 +1225,18 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
                     dec->c2s[s].C_in, dec->c2s[s].C_out, Nf_use);
             void *d_fine = d_nmap_pc[s] ? d_nmap_pc[s]
                                         : (s+1 < T2SD_MAX_STAGES ? d_nmap_cn[s+1] : NULL);
+            if (s_stage_time && g_stream) hipStreamSynchronize(g_stream);
+            double c2s_t0 = s_stage_time ? now_ms() : 0;
             DevSparse ds = run_c2s(k, &dec->c2s[s], cur_N,
                 d_feats, d_coords, d_keys, d_vals, cap_mask,
                 d_idx_use, d_si_use, d_xc_use, Nf_use,
                 d_nmap_cn[s], d_fine);
+            if (s_stage_time) {
+                if (g_stream) hipStreamSynchronize(g_stream);
+                fprintf(stderr, "  stage %d C2S(%d->%d, Nc=%d->Nf=%d): %.1f ms\n",
+                        s, dec->c2s[s].C_in, dec->c2s[s].C_out, cur_N, Nf_use,
+                        now_ms() - c2s_t0);
+            }
             if (d_idx_owned) hipFree(d_idx_owned);
             if (d_si_owned)  hipFree(d_si_owned);
             if (d_feats_owned) hipFree(d_feats_owned);
