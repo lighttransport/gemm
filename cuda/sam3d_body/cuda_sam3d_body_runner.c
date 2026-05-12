@@ -24,8 +24,8 @@
  *     mlp.w3.weight           F16 (1280, 5120)        — SwiGLU down-proj
  *     mlp.w3.bias             F32 (1280,)
  *
- * Dims: D=1280, H=20, Dh=64, N=32 blocks, ffn=5120, patch=16, image=512
- *       → grid 32×32 = 1024 patch tokens + 1 CLS + 4 register = 1029.
+ * Dims: D=1280, H=20, Dh=64, N=32 blocks, ffn=5120, patch=16, default
+ *       image=512x512 → grid 32×32 = 1024 patch tokens + 1 CLS + 4 register.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -194,6 +194,7 @@ typedef struct {
     void *kp3d_posemb_l1_w, *kp3d_posemb_l1_b;       /* (1024, 1024) */
     void *prompt_pe_gauss;       /* (2, 640) — for get_dense_pe */
     void *invalid_point_embed;   /* (1, 1280) */
+    const float *no_mask_embed_h; /* (1, 1280) host view, st_context-owned */
 
     sb_dec_layer_w layers[SB_DEC_LAYERS];
 
@@ -294,7 +295,7 @@ struct cuda_sam3d_body_ctx {
 
     /* device runtime buffers. */
     void    *d_img_u8;  size_t img_u8_cap;   /* (Hin, Win, 3) u8, host-resized */
-    void    *d_img_f32;                       /* (3, IMG, IMG) f32 normalized */
+    void    *d_img_f32;                       /* (3, IMG_H, IMG_W) f32 normalized */
     void    *d_tok;                           /* (N_TOK, D) f32 residual stream */
     void    *d_ln;                            /* (N_TOK, D) f32 LN scratch */
     void    *d_qkv;                           /* (N_TOK, 3D) f32 fused QKV */
@@ -736,6 +737,9 @@ static int sb_load_decoder(cuda_sam3d_body_ctx *c) {
     D->invalid_point_embed = sb_upload_st_f32(dec,
         "prompt_encoder.invalid_point_embed.weight",
         (size_t)SB_DEC_KV_DIM);
+    D->no_mask_embed_h = sb_host_st_f32(dec,
+        "prompt_encoder.no_mask_embed.weight",
+        (size_t)SB_DEC_KV_DIM);
 
     /* Keypoint-token update path. */
     D->kp_feat_linear_w = sb_upload_st_f32(dec, "keypoint_feat_linear.weight",
@@ -766,6 +770,7 @@ static int sb_load_decoder(cuda_sam3d_body_ctx *c) {
         !D->keypoint_embedding || !D->keypoint3d_embedding ||
         !D->hand_box_embedding ||
         !D->prompt_pe_gauss || !D->invalid_point_embed ||
+        !D->no_mask_embed_h ||
         !D->kp_feat_linear_w || !D->kp_feat_linear_b ||
         !D->kp_posemb_l0_w || !D->kp_posemb_l0_b ||
         !D->kp_posemb_l1_w || !D->kp_posemb_l1_b ||
@@ -963,7 +968,7 @@ static int sb_launch(hipFunction_t fn, unsigned gx, unsigned gy, unsigned gz,
 static int sb_precision_is_bf16(const cuda_sam3d_body_ctx *ctx)
 {
     const char *p = ctx && ctx->cfg.precision ? ctx->cfg.precision : NULL;
-    return !p || !p[0] || !strcmp(p, "bf16");
+    return p && p[0] && !strcmp(p, "bf16");
 }
 
 static int sb_precision_is_supported(const char *p)
@@ -987,7 +992,7 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
 {
     if (!cfg || !cfg->safetensors_dir) return NULL;
     if (!sb_precision_is_supported(cfg->precision)) {
-        fprintf(stderr, "sam3d_body: unsupported precision '%s' (expected bf16 or fp16)\n",
+        fprintf(stderr, "sam3d_body: unsupported precision '%s' (expected fp16 or bf16)\n",
                 cfg->precision);
         return NULL;
     }
@@ -998,13 +1003,31 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
     c->device_id = cfg->device_ordinal;
     c->verbose = cfg->verbose;
     if (c->cfg.image_size <= 0) c->cfg.image_size = SB_IMG;
+    if (c->cfg.image_height <= 0) c->cfg.image_height = c->cfg.image_size;
+    if (c->cfg.image_width  <= 0) c->cfg.image_width  = c->cfg.image_size;
+    if (c->cfg.backbone != CUDA_SAM3D_BODY_BACKBONE_VITH) {
+        if (c->cfg.image_height <= 0 || c->cfg.image_width <= 0 ||
+            (c->cfg.image_height % SB_PATCH) != 0 ||
+            (c->cfg.image_width  % SB_PATCH) != 0) {
+            fprintf(stderr,
+                    "sam3d_body: DINOv3 image shape must be positive and "
+                    "divisible by patch size %d, got %dx%d\n",
+                    SB_PATCH, c->cfg.image_height, c->cfg.image_width);
+            free(c); return NULL;
+        }
+    }
 
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
         fprintf(stderr, "sam3d_body: cuew init failed\n");
         free(c); return NULL;
     }
-    if (hipSetDevice(c->device_id) != hipSuccess) {
-        fprintf(stderr, "sam3d_body: hipSetDevice(%d) failed\n", c->device_id);
+    hipError_t set_device_err = hipSetDevice(c->device_id);
+    if (set_device_err != hipSuccess) {
+        const char *err_s = NULL;
+        hipGetErrorString(set_device_err, &err_s);
+        fprintf(stderr, "sam3d_body: hipSetDevice(%d) failed: %s (%d)\n",
+                c->device_id, err_s ? err_s : "unknown",
+                (int)set_device_err);
         free(c); return NULL;
     }
     if (sb_compile(c) < 0) {
@@ -1087,13 +1110,14 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
 
     /* Build 2D RoPE cos/sin tables host-side from rope_embed.periods.
      * Layout matches common/dinov3.h: [sin_y(rope_dim4), sin_x(rope_dim4),
-     * sin_y, sin_x] tiled across head_dim, computed for each of N_PATCH
-     * positions on a square grid. */
+     * sin_y, sin_x] tiled across head_dim, computed for each position on
+     * the configured DINOv3 patch grid. */
     {
-        const int gw = SB_GRID, gh = SB_GRID;
+        const int gh = c->cfg.image_height / SB_PATCH;
+        const int gw = c->cfg.image_width / SB_PATCH;
         const int hd = SB_HEAD_DIM;
         const int rope_dim4 = hd / 4;       /* 16 */
-        const int np = SB_N_PATCH;
+        const int np = gh * gw;
         int p_idx = sb_find(c->st_enc, "rope_embed.periods");
         if (p_idx < 0) { cuda_sam3d_body_destroy(c); return NULL; }
         const float *periods = (const float *)
@@ -1132,7 +1156,8 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
             cuda_sam3d_body_destroy(c); return NULL;
         }
         if (c->verbose >= 1)
-            fprintf(stderr, "sam3d_body: built 2D RoPE tables (%d, %d)\n", np, hd);
+            fprintf(stderr, "sam3d_body: built 2D RoPE tables (%dx%d, %d)\n",
+                    gh, gw, hd);
     }
 
     /* 32 blocks. */
@@ -1662,9 +1687,11 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         return cuda_sam3d_body_run_encoder_vith(ctx);
     }
 
-    const int IMG = ctx->cfg.image_size;
-    const int GW  = IMG / SB_PATCH;
-    const int N_PATCH = GW * GW;
+    const int IMG_H = ctx->cfg.image_height;
+    const int IMG_W = ctx->cfg.image_width;
+    const int GH  = IMG_H / SB_PATCH;
+    const int GW  = IMG_W / SB_PATCH;
+    const int N_PATCH = GH * GW;
     const int N_TOK   = 1 + SB_N_STORAGE + N_PATCH;
     double t_preprocess_ms = 0.0;
     double t_embed_ms = 0.0;
@@ -1682,9 +1709,9 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         /* Match the CPU runner's preprocess: TopdownAffine (bbox + 0.75
          * aspect ratio + 1.25 padding) → cv2.warpAffine → ImageNet norm
          * → HWC→CHW. We do this on the host (sam3d_body_preprocess_image)
-         * and upload the (3, IMG, IMG) f32 result; on-device naive
+         * and upload the (3, IMG_H, IMG_W) f32 result; on-device naive
          * bilinear resize would feed DINOv3 a stretched image when the
-     * input aspect ratio differs from 0.75. */
+         * input aspect ratio differs from the crop aspect. */
         const double t0 = sb_time_ms();
         float bbox_xyxy[4];
         if (ctx->has_bbox) {
@@ -1693,8 +1720,11 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
             bbox_xyxy[0] = 0; bbox_xyxy[1] = 0;
             bbox_xyxy[2] = (float)ctx->img_w; bbox_xyxy[3] = (float)ctx->img_h;
         }
+        float aspect_ratio_pre = 0.75f;
+        if (IMG_H != IMG_W)
+            aspect_ratio_pre = (float)IMG_W / (float)IMG_H;
         sam3d_body_compute_bbox_affine(bbox_xyxy, /*padding=*/1.25f,
-                                       /*aspect_ratio_pre=*/0.75f, IMG, IMG,
+                                       aspect_ratio_pre, IMG_W, IMG_H,
                                        ctx->self_center, ctx->self_scale,
                                        ctx->self_warp);
         sam3d_body_default_cam_int(ctx->img_w, ctx->img_h, ctx->self_cam_int);
@@ -1704,23 +1734,23 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
         ctx->self_pp_set = 1;
 
-        float *chw = (float *)malloc((size_t)3 * IMG * IMG * sizeof(float));
+        float *chw = (float *)malloc((size_t)3 * IMG_H * IMG_W * sizeof(float));
         if (!chw) return CUDA_SAM3D_BODY_E_LOAD;
         if (sam3d_body_preprocess_image(ctx->image_rgb, ctx->img_w, ctx->img_h,
-                                        ctx->self_warp, IMG, IMG, chw) != 0) {
+                                        ctx->self_warp, IMG_W, IMG_H, chw) != 0) {
             free(chw);
             return CUDA_SAM3D_BODY_E_LOAD;
         }
 
         if (!ctx->d_img_f32) {
             if (hipMalloc(&ctx->d_img_f32,
-                          (size_t)3 * IMG * IMG * sizeof(float)) != hipSuccess) {
+                          (size_t)3 * IMG_H * IMG_W * sizeof(float)) != hipSuccess) {
                 free(chw);
                 return CUDA_SAM3D_BODY_E_LOAD;
             }
         }
         if (hipMemcpy(ctx->d_img_f32, chw,
-                      (size_t)3 * IMG * IMG * sizeof(float),
+                      (size_t)3 * IMG_H * IMG_W * sizeof(float),
                       hipMemcpyHostToDevice) != hipSuccess) {
             free(chw);
             return CUDA_SAM3D_BODY_E_LOAD;
@@ -1747,9 +1777,9 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
     {
         struct __attribute__((packed)) {
             void *out; const void *img; const void *w; const void *bias;
-            int gw, dim, ps, img_w, base_tok;
+            int gw, dim, ps, img_h, img_w, base_tok;
         } p = { ctx->d_tok, ctx->d_img_f32, ctx->w_patch_w, ctx->w_patch_b,
-                GW, SB_DIM, SB_PATCH, IMG, 1 + SB_N_STORAGE };
+                GW, SB_DIM, SB_PATCH, IMG_H, IMG_W, 1 + SB_N_STORAGE };
         if (sb_launch(ctx->fn_patch, (unsigned)N_PATCH, 1, 1, 256, 1, 1,
                       0, &p, sizeof(p)) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
@@ -2057,13 +2087,13 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     const int V   = 18439;
     const int J   = 127;
     /* Encoder-grid + image-size geometry depends on backbone:
-     *   dinov3-h+:  IMG_H=IMG_W=512, gh=gw=32, N_C=1024, n_prefix=5 (CLS + 4 reg)
+     *   dinov3-h+:  configurable patch-aligned HxW, n_prefix=5 (CLS + 4 reg)
      *   vit-h:      IMG_H=512, IMG_W=384, gh=32, gw=24, N_C=768, n_prefix=0 */
     const int is_vith = (ctx->cfg.backbone == CUDA_SAM3D_BODY_BACKBONE_VITH);
-    const int IMG_H = is_vith ? SB_VITH_IMG_H : ctx->cfg.image_size;
-    const int IMG_W = is_vith ? SB_VITH_IMG_W : ctx->cfg.image_size;
-    const int gh    = is_vith ? SB_VITH_GRID_H : (ctx->cfg.image_size / SB_PATCH);
-    const int gw    = is_vith ? SB_VITH_GRID_W : (ctx->cfg.image_size / SB_PATCH);
+    const int IMG_H = is_vith ? SB_VITH_IMG_H : ctx->cfg.image_height;
+    const int IMG_W = is_vith ? SB_VITH_IMG_W : ctx->cfg.image_width;
+    const int gh    = is_vith ? SB_VITH_GRID_H : (ctx->cfg.image_height / SB_PATCH);
+    const int gw    = is_vith ? SB_VITH_GRID_W : (ctx->cfg.image_width / SB_PATCH);
     const int N_C   = gh * gw;
     const int n_prefix = is_vith ? 0 : (1 + SB_N_STORAGE);
 
@@ -2094,12 +2124,19 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
             bbox_xyxy[0] = 0; bbox_xyxy[1] = 0;
             bbox_xyxy[2] = (float)ctx->img_w; bbox_xyxy[3] = (float)ctx->img_h;
         }
-        /* Both backbones run TopdownAffine to a 512×512 working canvas; the
-         * vith W-axis crop happens *after* the affine, so the affine target
-         * size stays 512×512 here regardless of variant. */
+        /* Recompute the same affine shape that run_encoder would have cached.
+         * ViT-H still uses the upstream 512x512 canvas before W-axis crop. */
+        int affine_w = IMG_W, affine_h = IMG_H;
+        float aspect_ratio_pre = 0.75f;
+        if (is_vith) {
+            affine_w = SB_VITH_IMG_H;
+            affine_h = SB_VITH_IMG_H;
+        } else if (IMG_H != IMG_W) {
+            aspect_ratio_pre = (float)IMG_W / (float)IMG_H;
+        }
         sam3d_body_compute_bbox_affine(bbox_xyxy, /*padding=*/1.25f,
-                                       /*aspect_ratio_pre=*/0.75f,
-                                       SB_VITH_IMG_H, SB_VITH_IMG_H,
+                                       aspect_ratio_pre,
+                                       affine_w, affine_h,
                                        center, scale, warp);
         sam3d_body_default_cam_int(ctx->img_w, ctx->img_h, cam_int);
         if (ctx->focal_hint > 0) {
@@ -2110,14 +2147,15 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     (void)bbox_xyxy;
     t_geom_ms = sb_time_ms() - t_geom0;
 
-    /* For vith the decoder consumes the (384, 512) cropped canvas; shift the
-     * affine X-translation by -64·a00 so j=0 in the cropped grid maps back to
-     * the correct source pixel, equivalent to evaluating the original 512×512
-     * affine at x' = x + 64. */
     float warp_for_rays[6];
     memcpy(warp_for_rays, warp, sizeof(warp_for_rays));
-    if (is_vith)
-        warp_for_rays[2] = warp[2] - 64.0f * warp[0];
+    int ray_img_h = IMG_H;
+    int ray_img_w = IMG_W;
+    int ray_rect_reinterpret = (!is_vith && IMG_H != IMG_W);
+    if (is_vith) {
+        ray_img_h = SB_VITH_IMG_H;
+        ray_img_w = SB_VITH_IMG_H;
+    }
 
     /* ---- Permute encoder tokens (drop CLS+regs) → image_emb_pre (Dc, H, W). ---- */
     const double t_perm0 = sb_time_ms();
@@ -2125,9 +2163,12 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     if (!img_emb_pre) return CUDA_SAM3D_BODY_E_LOAD;
     {
         const float *patch = ctx->encoder_tokens.data + (size_t)n_prefix * Dc;
+        const float *no_mask = ctx->dec.no_mask_embed_h;
+        if (!no_mask) { free(img_emb_pre); return CUDA_SAM3D_BODY_E_LOAD; }
         for (int n = 0; n < N_C; n++)
             for (int c = 0; c < Dc; c++)
-                img_emb_pre[(size_t)c * N_C + n] = patch[(size_t)n * Dc + c];
+                img_emb_pre[(size_t)c * N_C + n] =
+                    patch[(size_t)n * Dc + c] + no_mask[c];
     }
     t_encoder_permute_ms = sb_time_ms() - t_perm0;
 
@@ -2135,8 +2176,10 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     const double t_rays0 = sb_time_ms();
     float *rays_xyz = (float *)malloc((size_t)N_C * 3 * sizeof(float));
     if (!rays_xyz) { free(img_emb_pre); return CUDA_SAM3D_BODY_E_LOAD; }
-    if (sam3d_body_compute_ray_cond_xyz(cam_int, warp_for_rays, IMG_H, IMG_W,
-                                        gh, gw, rays_xyz) != 0) {
+    if (sam3d_body_compute_ray_cond_xyz_ex(cam_int, warp_for_rays,
+                                           ray_img_h, ray_img_w,
+                                           gh, gw, ray_rect_reinterpret,
+                                           rays_xyz) != 0) {
         free(img_emb_pre); free(rays_xyz);
         return CUDA_SAM3D_BODY_E_INVAL;
     }
@@ -2226,6 +2269,8 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
 
     /* ---- camera_batch ---- */
     sam3d_body_camera_batch B;
+    if (is_vith)
+        warp_for_rays[2] = warp[2] - 64.0f * warp[0];
     memcpy(B.cam_int,      cam_int, 9 * sizeof(float));
     memcpy(B.bbox_center,  center,  2 * sizeof(float));
     B.bbox_scale = scale[0];
@@ -2621,13 +2666,12 @@ int cuda_sam3d_body_debug_set_normalized_input(cuda_sam3d_body_ctx *ctx,
                                                const float *chw, int H, int W)
 {
     if (!ctx || !chw || H <= 0 || W <= 0) return CUDA_SAM3D_BODY_E_INVAL;
-    /* DINOv3 path uses square IMG×IMG; ViT-H uses rectangular 512×384 with
-     * cfg.image_size carrying the height. Accept either. */
+    /* DINOv3 accepts the configured HxW; ViT-H remains fixed 512x384. */
     int exp_h, exp_w;
     if (ctx->cfg.backbone == CUDA_SAM3D_BODY_BACKBONE_VITH) {
         exp_h = SB_VITH_IMG_H; exp_w = SB_VITH_IMG_W;
     } else {
-        exp_h = ctx->cfg.image_size; exp_w = ctx->cfg.image_size;
+        exp_h = ctx->cfg.image_height; exp_w = ctx->cfg.image_width;
     }
     if (H != exp_h || W != exp_w) {
         fprintf(stderr,
@@ -3160,13 +3204,14 @@ int cuda_sam3d_body_debug_run_kp_token_update(cuda_sam3d_body_ctx *ctx,
                        (y01 < 0.0f) || (y01 > 1.0f) ||
                        (kp2d_depth[i] < 1e-5f);
     }
-    /* Pre-multiply gxy by 2 (sample_points = kp2d_cropped * 2 → [-1, 1]).
-     * ViT-H samples a 32x24 grid, so upstream scales x by H/W to keep
-     * normalized crop coords tied to the original square crop. */
+    /* Pre-multiply gxy by 2 (sample_points = kp2d_cropped * 2 -> [-1, 1]).
+     * ViT-H width-crops a square crop before the backbone, so upstream scales
+     * x by H/W for that backbone only. Rectangular DINOv3 does not. */
     float gxy_h[70 * 2];
+    const int scale_x = (ctx->cfg.backbone == CUDA_SAM3D_BODY_BACKBONE_VITH);
     for (int i = 0; i < K; i++) {
         float gx = kp2d_cropped[i*2 + 0] * 2.0f;
-        if (W != H) gx *= (float)H / (float)W;
+        if (scale_x && W != H) gx *= (float)H / (float)W;
         gxy_h[i*2 + 0] = gx;
         gxy_h[i*2 + 1] = kp2d_cropped[i*2 + 1] * 2.0f;
     }
