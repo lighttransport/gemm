@@ -64,7 +64,7 @@ static hipStream_t g_stream = NULL;
 static int g_use_blaslt = 0;
 static void *g_d_act_bf16 = NULL;
 static size_t g_act_bf16_floats = 0;
-#define BF16_CACHE_N 256
+#define BF16_CACHE_N 1024
 static const float *g_bf16_keys[BF16_CACHE_N];
 static size_t g_bf16_lens[BF16_CACHE_N];
 static void *g_bf16_devs[BF16_CACHE_N];
@@ -74,13 +74,13 @@ static int g_use_triton = 0;
 static void *g_d_in_f16  = NULL;
 static void *g_d_out_f16 = NULL;
 static size_t g_in_f16_bytes = 0, g_out_f16_bytes = 0;
-#define F16_CACHE_N 256
+#define F16_CACHE_N 1024
 static const float *g_f16_keys[F16_CACHE_N];
 static size_t g_f16_lens[F16_CACHE_N];
 static void *g_f16_devs[F16_CACHE_N];
 static int g_f16_count = 0;
 
-#define F32_CACHE_N 512
+#define F32_CACHE_N 2048
 static const void *g_f32_keys[F32_CACHE_N];
 static size_t g_f32_lens[F32_CACHE_N];
 static void *g_f32_devs[F32_CACHE_N];
@@ -682,6 +682,12 @@ static void run_convnext(K *k, const t2sd_convnext *blk, int C, int N,
         }
     }
     if (!used_bf16) {
+        static int s_dbg_cn = -1;
+        if (s_dbg_cn < 0) { const char *e=getenv("T2_TEX_DBG_CN"); s_dbg_cn = (e && atoi(e)) ? 1 : 0; }
+        if (s_dbg_cn) {
+            fprintf(stderr, "  cn mlp: N=%d C=%d d_tmp=%p d_mlp=%p mlp0_w=%p dm0=%p dm0b=%p mlp2_w=%p dm2=%p dm2b=%p\n",
+                    N, C, d_tmp, d_mlp, (void*)blk->mlp0_w, dm0, dm0b, (void*)blk->mlp2_w, dm2, dm2b);
+        }
         klin_bl_silu(k, d_mlp, d_tmp, blk->mlp0_w, dm0, dm0b, N, C, 4*C);
         klin_bl(k, d_tmp, d_mlp, blk->mlp2_w, dm2, dm2b, N, 4*C, C);
     }
@@ -751,9 +757,12 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     return ds;
 }
 
+/* When capture_h_* are non-NULL, retain host copies (ownership transferred
+ * to caller); otherwise host arrays are freed after upload. */
 static void synthesize_unguided_subdiv(
     const t2_shape_dec *dec, int stage_idx, void *d_feats, void *d_coords, int Nc,
-    void **out_d_idx, void **out_d_si, void **out_d_xc, int *out_Nf)
+    void **out_d_idx, void **out_d_si, void **out_d_xc, int *out_Nf,
+    int64_t **capture_h_idx, int64_t **capture_h_si, int32_t **capture_h_xc)
 {
     int Ci = dec->c2s[stage_idx].C_in;
     float *h_feats = (float *)malloc((size_t)Nc * Ci * sizeof(float));
@@ -769,6 +778,9 @@ static void synthesize_unguided_subdiv(
     if (rc != 0) {
         fprintf(stderr, "synthesize_unguided_subdiv: host helper failed rc=%d\n", rc);
         *out_d_idx = NULL; *out_d_si = NULL; *out_d_xc = NULL; *out_Nf = 0;
+        if (capture_h_idx) *capture_h_idx = NULL;
+        if (capture_h_si)  *capture_h_si  = NULL;
+        if (capture_h_xc)  *capture_h_xc  = NULL;
         return;
     }
 
@@ -776,7 +788,9 @@ static void synthesize_unguided_subdiv(
     *out_d_si  = hip_upload_raw(si,  (size_t)Nf * sizeof(int64_t));
     *out_d_xc  = hip_upload_raw(xc,  (size_t)Nf * 4 * sizeof(int32_t));
     *out_Nf = Nf;
-    free(idx); free(si); free(xc);
+    if (capture_h_idx) { *capture_h_idx = idx; } else { free(idx); }
+    if (capture_h_si)  { *capture_h_si  = si;  } else { free(si);  }
+    if (capture_h_xc)  { *capture_h_xc  = xc;  } else { free(xc);  }
 }
 
 /* ======================================================================== *
@@ -789,6 +803,10 @@ struct hip_shape_dec_ctx {
     const t2_shape_dec *dec;
     int verbose;
     int initialized;
+    /* Optional capture of per-stage subdiv arrays (host copies) so a
+     * downstream decoder (e.g. tex_dec) can be guided by this run. */
+    int capture_enabled;
+    hip_shape_dec_cache pending_cache;
 };
 
 static int g_ctx_init_done = 0;  /* file-scope globals init guard */
@@ -914,7 +932,49 @@ void hip_shape_dec_ctx_free(hip_shape_dec_ctx *ctx) {
     /* File-scope state (kernel handles, weight caches, scratch) is intentionally
      * leaked at process end — matches the original test's behaviour. The ctx
      * struct itself is what we own. */
-    if (ctx) free(ctx);
+    if (!ctx) return;
+    /* Drop any unclaimed captured cache. */
+    hip_shape_dec_cache_free(&ctx->pending_cache);
+    free(ctx);
+}
+
+void hip_shape_dec_set_capture(hip_shape_dec_ctx *ctx, int enable) {
+    if (!ctx) return;
+    ctx->capture_enabled = enable ? 1 : 0;
+    if (!enable) hip_shape_dec_cache_free(&ctx->pending_cache);
+}
+
+int hip_shape_dec_take_cache(hip_shape_dec_ctx *ctx, hip_shape_dec_cache *out) {
+    if (!ctx || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    int any = 0;
+    out->n_stages = ctx->pending_cache.n_stages;
+    for (int s = 0; s < 8; s++) {
+        out->gi[s]  = ctx->pending_cache.gi[s];
+        out->gs[s]  = ctx->pending_cache.gs[s];
+        out->gxc[s] = ctx->pending_cache.gxc[s];
+        out->gN[s]  = ctx->pending_cache.gN[s];
+        if (out->gN[s] > 0) any = 1;
+        ctx->pending_cache.gi[s]  = NULL;
+        ctx->pending_cache.gs[s]  = NULL;
+        ctx->pending_cache.gxc[s] = NULL;
+        ctx->pending_cache.gN[s]  = 0;
+    }
+    ctx->pending_cache.n_stages = 0;
+    return any ? 0 : -1;
+}
+
+void hip_shape_dec_cache_free(hip_shape_dec_cache *c) {
+    if (!c) return;
+    for (int s = 0; s < 8; s++) {
+        if (c->gi[s])  { free(c->gi[s]);  c->gi[s]  = NULL; }
+        if (c->gs[s])  { free(c->gs[s]);  c->gs[s]  = NULL; }
+        if (c->gxc[s]) { free(c->gxc[s]); c->gxc[s] = NULL; }
+        if (c->nmap_cn[s]) { free(c->nmap_cn[s]); c->nmap_cn[s] = NULL; }
+        if (c->nmap_pc[s]) { free(c->nmap_pc[s]); c->nmap_pc[s] = NULL; }
+        c->gN[s] = 0; c->nmap_cn_N[s] = 0; c->nmap_pc_N[s] = 0;
+    }
+    c->n_stages = 0;
 }
 
 int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
@@ -935,14 +995,27 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     void *d_slat = hip_upload_raw(slat_feats, (size_t)N*slat_C*sizeof(float));
     void *d_flw = get_f32_dev(dec->from_latent_w, (size_t)C0*slat_C*sizeof(float));
     void *d_flb = get_f32_dev(dec->from_latent_b, (size_t)C0*sizeof(float));
-    void *d_feats = NULL; hipMalloc(&d_feats, (size_t)N*C0*sizeof(float));
+    void *d_feats = NULL;
+    hipError_t _e_df = hipMalloc(&d_feats, (size_t)N*C0*sizeof(float));
+    if (_e_df != hipSuccess || !d_feats) {
+        fprintf(stderr, "T2-TEX: hipMalloc d_feats(%zu) failed: %d\n",
+                (size_t)N*C0*sizeof(float), (int)_e_df);
+        return -1;
+    }
+    if (ctx->verbose)
+        fprintf(stderr, "T2-TEX: forward N=%d C0=%d d_slat=%p d_flw=%p d_flb=%p d_feats=%p\n",
+                N, C0, d_slat, d_flw, d_flb, d_feats);
     klin_bl(k, d_feats, d_slat, dec->from_latent_w, d_flw, d_flb, N, slat_C, C0);
 
     void *d_coords = hip_upload_raw(coords, (size_t)N*4*sizeof(int32_t));
     int cap = 1; while (cap < N*2) cap <<= 1; int cap_mask = cap - 1;
     void *d_keys=NULL, *d_vals=NULL;
-    hipMalloc(&d_keys, (size_t)cap*sizeof(uint64_t));
-    hipMalloc(&d_vals, (size_t)cap*sizeof(int32_t));
+    if (hipMalloc(&d_keys, (size_t)cap*sizeof(uint64_t)) != hipSuccess) {
+        fprintf(stderr, "T2-TEX: hipMalloc d_keys failed\n"); return -1;
+    }
+    if (hipMalloc(&d_vals, (size_t)cap*sizeof(int32_t)) != hipSuccess) {
+        fprintf(stderr, "T2-TEX: hipMalloc d_vals failed\n"); return -1;
+    }
     hipMemset(d_keys, 0, (size_t)cap*sizeof(uint64_t));
     hipMemset(d_vals, 0xff, (size_t)cap*sizeof(int32_t));
     hash_build(k, d_keys, d_vals, cap_mask, d_coords, N);
@@ -971,8 +1044,18 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
         if (mlp_f > max_mlp_floats) max_mlp_floats = mlp_f;
     }
     void *d_tmp=NULL, *d_mlp=NULL;
-    hipMalloc(&d_tmp, max_tmp_floats * sizeof(float));
-    hipMalloc(&d_mlp, max_mlp_floats * sizeof(float));
+    hipError_t _e_tmp = hipMalloc(&d_tmp, max_tmp_floats * sizeof(float));
+    hipError_t _e_mlp = hipMalloc(&d_mlp, max_mlp_floats * sizeof(float));
+    if (_e_tmp != hipSuccess || !d_tmp || _e_mlp != hipSuccess || !d_mlp) {
+        fprintf(stderr, "T2-TEX: hipMalloc scratch failed (tmp=%zuMB rc=%d, mlp=%zuMB rc=%d)\n",
+                max_tmp_floats * sizeof(float) / (1024*1024), (int)_e_tmp,
+                max_mlp_floats * sizeof(float) / (1024*1024), (int)_e_mlp);
+        return -1;
+    }
+    if (ctx->verbose)
+        fprintf(stderr, "T2-TEX: scratch d_tmp=%p (%zuMB) d_mlp=%p (%zuMB)\n",
+                d_tmp, max_tmp_floats * sizeof(float) / (1024*1024),
+                d_mlp, max_mlp_floats * sizeof(float) / (1024*1024));
 
     /* Optional cache uploads. */
     void *d_gi[T2SD_MAX_STAGES]={0}, *d_gs[T2SD_MAX_STAGES]={0}, *d_gxc[T2SD_MAX_STAGES]={0};
@@ -1051,8 +1134,26 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
             void *d_idx_owned = NULL, *d_si_owned = NULL, *d_xc_owned = NULL;
             void *d_feats_owned = NULL;
             if (Nf_use == 0 && dec->c2s[s].to_subdiv_w) {
+                int64_t **cap_idx = NULL, **cap_si = NULL;
+                int32_t **cap_xc = NULL;
+                if (ctx->capture_enabled && s < 8) {
+                    /* Drop any prior captured stage (re-running forward). */
+                    if (ctx->pending_cache.gi[s])  { free(ctx->pending_cache.gi[s]);  ctx->pending_cache.gi[s]  = NULL; }
+                    if (ctx->pending_cache.gs[s])  { free(ctx->pending_cache.gs[s]);  ctx->pending_cache.gs[s]  = NULL; }
+                    if (ctx->pending_cache.gxc[s]) { free(ctx->pending_cache.gxc[s]); ctx->pending_cache.gxc[s] = NULL; }
+                    ctx->pending_cache.gN[s] = 0;
+                    cap_idx = &ctx->pending_cache.gi[s];
+                    cap_si  = &ctx->pending_cache.gs[s];
+                    cap_xc  = &ctx->pending_cache.gxc[s];
+                }
                 synthesize_unguided_subdiv(dec, s, d_feats, d_coords, cur_N,
-                    &d_idx_owned, &d_si_owned, &d_xc_owned, &Nf_use);
+                    &d_idx_owned, &d_si_owned, &d_xc_owned, &Nf_use,
+                    cap_idx, cap_si, cap_xc);
+                if (ctx->capture_enabled && s < 8) {
+                    ctx->pending_cache.gN[s] = Nf_use;
+                    if (s + 1 > ctx->pending_cache.n_stages)
+                        ctx->pending_cache.n_stages = s + 1;
+                }
                 d_idx_use = d_idx_owned;
                 d_si_use  = d_si_owned;
                 d_xc_use  = d_xc_owned;
