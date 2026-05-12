@@ -37,6 +37,7 @@
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
+#include <unistd.h>
 
 /* ======================================================================== */
 /* NumPy .npy I/O                                                           */
@@ -445,6 +446,25 @@ int main(int argc, char **argv) {
     if (!mode_full && !mode_dit_only && !mode_decode_only &&
         !mode_dump_blocks && !mode_verify_step && !mode_dump_b0 && !mode_shape_only) {
         mode_full = 1;
+    }
+
+    /* On RDNA4 (gfx1201, ROCm 7.2.2) the power manager keeps mclk pinned at
+     * level 0 (96 MHz) during tex_dec's sparse_conv3d kernels — the HIP async
+     * queue never registers as compute-busy. AMD_SERIALIZE_KERNEL=3 forces a
+     * sync after each launch (mclk ramps to level 5 = 1258 MHz). For the e2e
+     * pipeline, the gap between shape_dec and tex_dec (tex DiT inference +
+     * load) lets mclk drop again; HSA_ENABLE_SDMA=0 prevents that drop. Both
+     * are needed for tex_dec to stay at 38× speedup through the full run.
+     * The HIP runtime caches both env vars at init, so setenv() from main()
+     * is too late — re-exec with them set in the environment instead. */
+    if (mode_tex &&
+        (!getenv("AMD_SERIALIZE_KERNEL") || !getenv("HSA_ENABLE_SDMA"))) {
+        fprintf(stderr, "T2-HIP: re-exec with AMD_SERIALIZE_KERNEL=3 HSA_ENABLE_SDMA=0 "
+                        "for tex_dec mclk ramp\n");
+        if (!getenv("AMD_SERIALIZE_KERNEL")) setenv("AMD_SERIALIZE_KERNEL", "3", 1);
+        if (!getenv("HSA_ENABLE_SDMA"))      setenv("HSA_ENABLE_SDMA",      "0", 1);
+        execv(argv[0], argv);
+        perror("execv");  /* falls through if execv fails — log + continue */
     }
 
     /* Shape-only fast path: load shape_dec, run on user-provided feats+coords,
