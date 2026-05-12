@@ -28,6 +28,13 @@ Usage:
       --hf-repo-id facebook/sam-3d-body-dinov3 \\
       --outdir /tmp/sam3d_body_ref --seed 42
 
+  # Optional rectangular DINOv3 dump, e.g. input (1,3,512,384)
+  # and output patch grid (1,1280,32,24):
+  python ref/sam3d-body/gen_image_ref.py \\
+      --image person.jpg --local-ckpt-dir /mnt/disk01/models/sam3d-body/dinov3 \\
+      --image-width 384 --image-height 512 \\
+      --outdir /tmp/sam3d_body_ref_512x384
+
 Requires the `sam_3d_body` package installed into ref/sam3d-body/.venv
 (see README.md) and HF-authenticated access to the gated weights.
 """
@@ -60,6 +67,15 @@ def main():
     ap.add_argument("--device", default="cuda",
                     help='"cuda" or "cpu"')
     ap.add_argument("--outdir", default="/tmp/sam3d_body_ref")
+    ap.add_argument("--image-width", type=int, default=None,
+                    help="override MODEL.IMAGE_SIZE width for rectangular refs")
+    ap.add_argument("--image-height", type=int, default=None,
+                    help="override MODEL.IMAGE_SIZE height for rectangular refs")
+    ap.add_argument("--backbone-dtype", default="float32",
+                    choices=("float32", "bfloat16", "float16", "config"),
+                    help="dtype used for the DINOv3 backbone reference. "
+                         "float32 matches the C runner; config preserves "
+                         "the upstream checkpoint setting.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-run", action="store_true",
                     help="only dump the input image; skip the model")
@@ -117,6 +133,44 @@ def main():
     else:
         model, model_cfg = load_sam_3d_body_hf(args.hf_repo_id,
                                                device=args.device)
+    if args.image_width is not None or args.image_height is not None:
+        cur_w, cur_h = [int(v) for v in model_cfg.MODEL.IMAGE_SIZE]
+        out_w = args.image_width if args.image_width is not None else cur_w
+        out_h = args.image_height if args.image_height is not None else cur_h
+        if out_w <= 0 or out_h <= 0 or (out_w % 16) != 0 or (out_h % 16) != 0:
+            print("[gen_image_ref] --image-width/--image-height must be "
+                  "positive and divisible by 16", file=sys.stderr)
+            return 2
+        for cfg in (model_cfg, getattr(model, "cfg", None)):
+            if cfg is None:
+                continue
+            was_frozen = bool(getattr(cfg, "is_frozen", lambda: False)())
+            if hasattr(cfg, "defrost"):
+                cfg.defrost()
+            cfg.MODEL.IMAGE_SIZE = [int(out_w), int(out_h)]
+            if was_frozen and hasattr(cfg, "freeze"):
+                cfg.freeze()
+        print(f"[gen_image_ref] override MODEL.IMAGE_SIZE=[{out_w}, {out_h}]",
+              file=sys.stderr)
+    if args.backbone_dtype != "config":
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        backbone_dtype = dtype_map[args.backbone_dtype]
+        if hasattr(model, "backbone_dtype"):
+            model.backbone_dtype = backbone_dtype
+        enc = getattr(getattr(model, "backbone", None), "encoder", None)
+        if enc is not None and hasattr(enc, "to"):
+            enc.to(dtype=backbone_dtype)
+        print(f"[gen_image_ref] override backbone dtype={args.backbone_dtype}",
+              file=sys.stderr)
+    else:
+        print(f"[gen_image_ref] backbone dtype from config="
+              f"{getattr(model, 'backbone_dtype', None)}", file=sys.stderr)
+    with open(os.path.join(args.outdir, "backbone_dtype.txt"), "w") as f:
+        f.write(str(getattr(model, "backbone_dtype", "unknown")) + "\n")
     estimator = SAM3DBodyEstimator(sam_3d_body_model=model, model_cfg=model_cfg,
                                    human_detector=None, human_segmentor=None,
                                    fov_estimator=None)
@@ -232,14 +286,14 @@ def main():
     for name, m in model.named_modules():
         cls = m.__class__.__name__
         if cls == "Dinov3Backbone":
-            m.register_forward_pre_hook(cap_pre("dinov3_input"))
-            m.register_forward_hook(cap("dinov3_tokens"))
+            m.register_forward_pre_hook(cap_pre("dinov3_input", once=True))
+            m.register_forward_hook(cap("dinov3_tokens", once=True))
             registered.append(("dinov3_tokens", name, cls))
         elif cls == "ViT":
             # ViT-H/16 (vit_hmr_512_384) variant — outputs (B, 1280, 32, 24).
             # Input is the post-W-axis-crop (1, 3, 512, 384) tensor.
-            m.register_forward_pre_hook(cap_pre("vith_input"))
-            m.register_forward_hook(cap("vith_tokens"))
+            m.register_forward_pre_hook(cap_pre("vith_input", once=True))
+            m.register_forward_hook(cap("vith_tokens", once=True))
             registered.append(("vith_tokens", name, cls))
         elif cls == "MHRHead" and name.endswith("head_pose"):
             m.register_forward_hook(cap("mhr_params",
@@ -275,8 +329,11 @@ def main():
             )
             rays_ds = rays_ds.permute(0, 2, 3, 1).contiguous()
             rays_ds = torch.cat([rays_ds, torch.ones_like(rays_ds[..., :1])], dim=-1)
-            _store("ray_cond_ds_xyz", _to_np(rays_ds), first_decoder_only=True)
-            rays_emb = _mod.camera(pos=rays_ds.reshape(B, -1, 3))  # (B, N, 99)
+            rays_flat = rays_ds.reshape(B, -1, 3)
+            _store("ray_cond_ds_xyz",
+                   _to_np(rays_flat.reshape(B, _h, _w, 3)),
+                   first_decoder_only=True)
+            rays_emb = _mod.camera(pos=rays_flat)  # (B, N, 99)
             _store("ray_cond_fourier", _to_np(rays_emb), first_decoder_only=True)
             rays_emb = _ein.rearrange(rays_emb, "b (h w) c -> b c h w", h=_h, w=_w).contiguous()
             z = torch.cat([img_embeddings, rays_emb], dim=1)
@@ -521,17 +578,17 @@ def main():
         print(f"[gen_image_ref] hook: name='{r[1]}' cls={r[2]} -> {r[0]}",
               file=sys.stderr)
 
-    # Run the pipeline. Upstream estimator accepts either a path or an
-    # ndarray; pass the ndarray in BGR (cv2 convention) to match
-    # process_one_image.
-    import cv2
-    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    # Run the pipeline. Upstream `process_one_image` treats ndarray inputs as
+    # RGB and only converts path-loaded BGR images internally.
     bboxes = None
     if args.bbox is not None:
         bboxes = np.asarray([args.bbox], dtype=np.float32)
+    bbox_dump = bboxes[0] if bboxes is not None else np.asarray(
+        [0.0, 0.0, float(img.shape[1]), float(img.shape[0])], dtype=np.float32)
+    save(args.outdir, "bbox_xyxy.npy", bbox_dump)
 
     with torch.inference_mode():
-        outputs = estimator.process_one_image(img_bgr, bboxes=bboxes)
+        outputs = estimator.process_one_image(img, bboxes=bboxes)
 
     # Re-invoke MHR sub-modules directly to harvest per-stage
     # intermediates (ScriptModules don't accept forward hooks).

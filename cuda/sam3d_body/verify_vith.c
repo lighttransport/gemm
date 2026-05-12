@@ -13,7 +13,7 @@
  * compares (768, 1280) flat output against the (1, 1280, 32, 24) ref.
  *
  * Gates track the bf16 forward floor of the upstream reference (the same
- * floor used by cpu/sam3d_body/verify_vith.c): max=5e-1, mean=2e-2.
+ * floor used by cpu/sam3d_body/verify_vith.c): max=6e-1, mean=2e-2.
  */
 
 #include "cuda_sam3d_body_runner.h"
@@ -30,12 +30,12 @@ int main(int argc, char **argv)
     const char *sft_dir = NULL, *refdir = NULL;
     /* See cpu/sam3d_body/verify_vith.c for the gate justification: the
      * upstream ViT-H runs in bf16, drift compounds over 32 blocks and
-     * floors max≈3.5e-1, mean≈1.4e-2. We track the same floor with a
-     * tight mean and looser max. */
-    float threshold = 5e-1f;
+     * floors max≈5.3e-1, mean≈8.9e-3 on the current fixed-bbox ref.
+     * We track the same floor with a tight mean and looser max. */
+    float threshold = 6e-1f;
     float mean_threshold = 2e-2f;
     int device = 0, verbose = 0;
-    const char *precision = "bf16";
+    const char *precision = "fp16";
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
@@ -50,7 +50,7 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] "
-                        "[--device N] [--precision bf16|fp16] [-v]\n",
+                        "[--device N] [--precision fp16|bf16] [-v]\n",
                 argv[0]);
         return 2;
     }

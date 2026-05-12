@@ -82,13 +82,34 @@ The script registers `forward_hook`s on the encoder, decoder, MHR
 head, camera head, and MHR skinning step; each captured tensor is
 written to `/tmp/sam3d_body_ref/<stage>.npy` as `f32`.
 
+For a rectangular DINOv3 encoder reference, override the crop size:
+
+```bash
+python ref/sam3d-body/gen_image_ref.py \
+    --image cpu/sam3d_body/samples/dancing.jpg \
+    --local-ckpt-dir $MODELS/sam3d-body/dinov3 \
+    --image-width 384 --image-height 512 \
+    --outdir /tmp/sam3d_body_ref_dinov3_512x384 --seed 42
+```
+
+By default the script overrides the DINOv3 backbone to `float32`,
+which matches the C/CUDA encoder implementation. Use
+`--backbone-dtype config` when you specifically need the upstream
+SAM3D-body BF16 inference behavior.
+
+The backbone input/token dumps are captured from the first body-branch
+backbone call. Full inference may run later hand crops, but those no longer
+overwrite `dinov3_input.npy` / `dinov3_tokens.npy`.
+
 ## Files produced
 
 | File                       | Shape              | Dtype | Source stage                       |
 |----------------------------|--------------------|-------|------------------------------------|
 | `input_image.npy`          | (H, W, 3)          | u8    | raw RGB (always written)           |
+| `bbox_xyxy.npy`            | (4,)               | f32   | bbox used for the crop             |
 | `image_processed.npy`      | (Hc, Wc, 3)        | f32   | crop+resize+normalize              |
-| `dinov3_tokens.npy`        | (N, D)             | f32   | DINOv3 encoder output              |
+| `dinov3_input.npy`         | (1, 3, Hc, Wc)     | f32   | DINOv3 normalized input            |
+| `dinov3_tokens.npy`        | (1, D, Hc/16, Wc/16) | f32 | DINOv3 encoder output              |
 | `mhr_params.npy`           | (519,)             | f32   | MHR head regressor output          |
 | `cam_params.npy`           | (4,)               | f32   | [cam_t_x, cam_t_y, cam_t_z, focal] |
 | `out_vertices.npy`         | (V, 3)             | f32   | MHR-skinned vertices in cam frame  |
@@ -100,8 +121,10 @@ written to `/tmp/sam3d_body_ref/<stage>.npy` as `f32`.
 
 - `torch.manual_seed(args.seed) + np.random.seed(args.seed)`
 - `torch.set_float32_matmul_precision("highest")` to avoid TF32 drift
-- Encoder forced fp32 for ref dumps (the production path uses bf16
-  on CUDA; our diff tolerances account for the bf16 floor ≈ 1e-2)
+- DINOv3 refs default to a float32 backbone. The older BF16-config refs
+  differ from the C/CUDA FP32-activation encoder by the expected PyTorch
+  BF16 runtime floor; `verify_dinov3` keeps looser gates for those dumps
+  and tightens automatically when `backbone_dtype.txt` says float32.
 
 ## Dump without the model (smoke)
 

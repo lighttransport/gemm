@@ -69,7 +69,9 @@ final bbox in pixel space (x0, y0, x1, y1)
   ImageNet norm — `do_normalize=false` per HF preprocessor_config.json).
   Diff vs `/tmp/rt_detr_ref/input.npy`: max_abs=0.094 mean_abs=0.0037
   (PIL antialiased bilinear differs at edges; mean is small enough
-  that detection is robust).
+  that detection is robust). The resize loop is now OpenMP-parallel over
+  output rows; in an 8-thread smoke, preprocess measured 1.872 ms while
+  forward remained the dominant 4.793 s cost.
 - R18-VD backbone forward (`rt_detr_forward_backbone`):
   stem 3-conv → maxpool 3×3/2 → 4 stages × 2 BasicBlocks. Stage-0
   uses a plain 1×1 shortcut (`shortcut.convolution.*`), stages 1-3
@@ -172,11 +174,16 @@ before sam3d_body's encoder. Default detector path is
 `/mnt/disk01/models/rt_detr_s/model.safetensors`, default threshold
 is 0.5. Tested on `web/public/sam3_compare/person.jpg` → score 0.98,
 bbox (0.1, 5.9, 768.1, 1019.4), final OBJ V=18439 F=36874.
+`-t N` also calls `omp_set_num_threads(N)` before auto-bbox, so the
+existing CPU thread flag now controls RT-DETR preprocess/forward as
+well as the SAM3D-body MHR path.
 
 ### A2.4 — wire `--auto-bbox` into CUDA runner (DONE 2026-04-26)
 
 `test_cuda_sam3d_body --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]`
-runs RT-DETR-S host-side before the CUDA encoder. Detection on the
+runs RT-DETR-S host-side before the CUDA encoder. It now accepts `-t N`
+and applies it before auto-bbox, giving the CUDA CLI the same control
+over host-side RT-DETR/MHR OpenMP work as the CPU CLI. Detection on the
 person.jpg sample produces score=0.9797 bbox=(0.1, 5.9, 768.1, 1019.4)
 — matches the CPU runner exactly — and the CUDA pipeline emits
 V=18439 F=36874 OBJ. Wall time 8.77s (RT-DETR ~6.9s on 16 threads
@@ -310,14 +317,18 @@ again, instead of the post-hand-prompt 148-token shape.
 CPU and CUDA `verify_end_to_end --image IMG --bbox x0 y0 x1 y1`
 prefer `body_out_*` when present and fall back to legacy `out_*`
 refs. They also accept `--threshold-2d PX`, so meter-space and
-pixel-space gates can be set independently. Current DINOv3 fixed-bbox
+pixel-space gates can be set independently. Current DINOv3 512x384
 smoke on `samples/dancing.jpg`:
 
-- CPU: vertices max_abs=2.47e-2, kp3d max_abs=2.40e-2, kp2d max_abs=6.75 px
-- CUDA: vertices max_abs=2.43e-2, kp3d max_abs=2.36e-2, kp2d max_abs=6.78 px
+- CPU: vertices max_abs=3.17e-5, kp3d max_abs=3.15e-5, kp2d max_abs=9.95e-3 px
+- CUDA: vertices max_abs=3.20e-5, kp3d max_abs=3.15e-5, kp2d max_abs=9.46e-3 px
 
-Both pass with `--threshold 3e-2 --threshold-2d 10`; the remaining
-drift is the known raw encoder/preprocess floor, not decoder/MHR.
+Both pass with the default raw DINOv3 gates (`--threshold 2e-2
+--threshold-2d 0.5`). The previous 0.12 / 10 px drift was fixed by
+making `sam3d_body_preprocess_image` OpenCV-INTER_LINEAR exact and by
+matching upstream rectangular-DINOv3 ray geometry. The remaining 1.3 px
+raw drift was fixed by adding upstream's no-mask prompt embedding to the
+pre-ray image embeddings before `ray_cond_emb`.
 The same guarded ref gives exact override parity:
 `verify_end_to_end` without `--image` reports vertices max_abs=9.83e-7,
 kp3d max_abs=5.96e-7, and kp2d max_abs=4.88e-4 px. CUDA
@@ -386,7 +397,8 @@ self-driven verifiers. Current raw-image envelope:
 - CPU: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
 - CUDA: vertices max_abs=1.26e-1, kp3d max_abs=1.24e-1, kp2d max_abs=162.7 px
 
-Both pass with `--backbone vith --threshold 1.5e-1 --threshold-2d 200`.
+Both now pass with just `--backbone vith`; raw-image ViT-H verifier
+defaults are 0.15 for vertices/keypoints_3d and 200 px for keypoints_2d.
 Because the decoder/MHR override gates are exact, the remaining raw-image
 gap is the converted ViT-H encoder precision floor relative to PyTorch,
 not decoder or CUDA integration drift.
@@ -480,12 +492,12 @@ the variant:
 Encoder geometry is cached on the ctx (`enc_grid_h, enc_grid_w,
 enc_n_prefix, enc_image_h, enc_image_w`) so `self_drive_decoder_inputs`
 no longer dereferences the variant-specific encoder model and works
-for both backbones unchanged. For vith, the ray_cond_xyz call subtracts
-64·a00 from the affine X-translation (`warp_for_rays[2] -= 64 * warp[0]`)
-so the rays at the (32, 24) grid map to the correct source pixels —
-equivalent to evaluating the original (512×512) affine at `x' = x + 64`.
-The same shifted warp is plumbed into `dec_cam_batch.affine_trans` and
-`img_size = (384, 512)`.
+for both backbones unchanged. ViT-H ray conditioning keeps the original
+512x512 ray image and center-crops the x ramp during downsampling, while
+the decoder camera batch still receives the shifted crop affine. Rectangular
+DINOv3 uses an explicit compatibility mode for upstream's transposed
+`meshgrid(indexing="xy")` + flatten/reinterpret behavior; `verify_ray_cond_xyz`
+on the 512x384 dump is at max_abs=1.79e-7.
 
 `ensure_decoder_loaded` now picks the variant-tagged decoder + mhr_head
 slices first (`sam3d_body_{dinov3,vith}_decoder.safetensors` etc.) and

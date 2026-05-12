@@ -29,7 +29,7 @@ static const char cuda_sam3d_body_kernels_src[] =
      */
     "__global__ void patch_embed_sam3d(float *out, const float *img, const float *w,\n"
     "                                  const float *bias, int gw, int dim, int ps,\n"
-    "                                  int img_w, int base_tok) {\n"
+    "                                  int img_h, int img_w, int base_tok) {\n"
     "    int patch = blockIdx.x;\n"
     "    int tid = threadIdx.x;\n"
     "    int py = patch / gw, px = patch % gw;\n"
@@ -40,7 +40,7 @@ static const char cuda_sam3d_body_kernels_src[] =
     "            for (int kh = 0; kh < ps; kh++)\n"
     "                for (int kw = 0; kw < ps; kw++)\n"
     "                    sum += w[((co*3+ci)*ps+kh)*ps+kw]\n"
-    "                         * img[ci * img_w * img_w + (py*ps+kh) * img_w + (px*ps+kw)];\n"
+    "                         * img[ci * img_h * img_w + (py*ps+kh) * img_w + (px*ps+kw)];\n"
     "        out[tok * dim + co] = sum;\n"
     "    }\n"
     "}\n"
@@ -68,7 +68,7 @@ static const char cuda_sam3d_body_kernels_src[] =
     /* bf16_round_inplace_f32
      *
      * Round a float buffer through bf16 precision, keeping f32 storage.
-     * This is used for the default bf16 reference path.
+     * This is used for the explicit bf16 diagnostic path.
      */
     "__global__ void bf16_round_inplace_f32(float *x, int n) {\n"
     "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"

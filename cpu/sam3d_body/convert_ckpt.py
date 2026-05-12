@@ -104,6 +104,12 @@ def main():
                          "Decoder + MHR head slices are bit-identical "
                          "across variants so they overwrite each other "
                          "when both runs target the same outdir.")
+    ap.add_argument("--dinov3-large-dtype", default="f16",
+                    choices=("bf16", "f16", "f32"),
+                    help="dtype for large BF16 DINOv3 encoder matrices. "
+                         "f16 is the fast default and matches the C FP32 "
+                         "activation reference; bf16 preserves upstream "
+                         "storage for diagnosis; f32 expands storage.")
     args = ap.parse_args()
 
     import torch
@@ -140,19 +146,23 @@ def main():
         # refuses shared storage.
         t = v.detach().cpu().contiguous().clone()
 
-        # The encoder ships bf16. Our CPU matmul path has a threaded
-        # fp16 kernel but only a scalar bf16 fallback. To make inference
-        # fast while keeping precision tight, selectively cast:
-        #   - Weight matrices (2-D; the big matmul kernels) → fp16
-        #   - Biases, gains, norms, embeddings (small; precision-sensitive) → fp32
-        # Rationale: small tensors contribute <0.1% of memory but every
-        # layer consumes their full precision twice; keeping them fp32
-        # is free. Large matmul weights dominate bandwidth and benefit
-        # from the threaded fp16 gemm; f16 mantissa (10b) >> bf16 (7b)
-        # so no precision is lost vs the upstream bf16 compute.
+        # The DINOv3 encoder ships BF16. Large 2-D matrices use the fast
+        # F16 slice by default; C inference keeps activations in FP32 and
+        # validates against a FP32 PyTorch backbone reference, where F16
+        # storage is already within ~2e-4 max_abs. Small tensors stay F32
+        # because they are cheap and precision-sensitive. BF16/F32 large
+        # matrix modes are kept for diagnosis.
         if t.dtype == torch.bfloat16:
             is_big_matrix = (t.dim() == 2 and min(t.shape) >= 64)
-            t = t.to(torch.float16 if is_big_matrix else torch.float32)
+            if args.backbone_name == "dinov3" and is_big_matrix:
+                if args.dinov3_large_dtype == "f16":
+                    t = t.to(torch.float16)
+                elif args.dinov3_large_dtype == "f32":
+                    t = t.to(torch.float32)
+                else:
+                    t = t.contiguous()
+            else:
+                t = t.to(torch.float32)
         placed = False
         for bucket, prefixes in routes:
             if any(kk.startswith(p) for p in prefixes):

@@ -43,6 +43,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 #include "npy_io.h"
 
 static double cli_time_ms(void)
@@ -434,6 +437,9 @@ int main(int argc, char **argv)
             argv[0], argv[0], argv[0]);
         return 2;
     }
+#if defined(_OPENMP)
+    if (n_threads > 0) omp_set_num_threads(n_threads);
+#endif
     if (refdir)
         return run_refdir(sft_dir, mhr_assets, refdir, out_path,
                           backbone, n_threads, verbose);
