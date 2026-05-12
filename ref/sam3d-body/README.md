@@ -92,14 +92,25 @@ python ref/sam3d-body/gen_image_ref.py \
     --outdir /tmp/sam3d_body_ref_dinov3_512x384 --seed 42
 ```
 
-By default the script overrides the DINOv3 backbone to `float32`,
-which matches the C/CUDA encoder implementation. Use
-`--backbone-dtype config` when you specifically need the upstream
-SAM3D-body BF16 inference behavior.
+By default the script overrides the backbone to `float32`, which matches
+the C/CUDA encoder implementations. Use `--backbone-dtype config` when
+you specifically need the upstream SAM3D-body BF16 inference behavior.
+
+For a canonical ViT-H fixed-bbox raw-image reference, keep the upstream
+512x512 transform geometry and let the model crop to 512x384 internally:
+
+```bash
+python ref/sam3d-body/gen_image_ref.py \
+    --image /tmp/sam3d_body_ref_input.png \
+    --local-ckpt-dir $MODELS/sam3d-body/vith \
+    --bbox 458.336 111.031 1803.347 1456.042 \
+    --outdir /tmp/sam3d_body_vith_ref_fixed_bbox_f32
+```
 
 The backbone input/token dumps are captured from the first body-branch
 backbone call. Full inference may run later hand crops, but those no longer
-overwrite `dinov3_input.npy` / `dinov3_tokens.npy`.
+overwrite `dinov3_input.npy` / `dinov3_tokens.npy` or
+`vith_input.npy` / `vith_tokens.npy`.
 
 ## Files produced
 

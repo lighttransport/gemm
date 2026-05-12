@@ -161,9 +161,12 @@ def main():
         backbone_dtype = dtype_map[args.backbone_dtype]
         if hasattr(model, "backbone_dtype"):
             model.backbone_dtype = backbone_dtype
+        bb = getattr(model, "backbone", None)
         enc = getattr(getattr(model, "backbone", None), "encoder", None)
         if enc is not None and hasattr(enc, "to"):
             enc.to(dtype=backbone_dtype)
+        elif bb is not None and hasattr(bb, "to"):
+            bb.to(dtype=backbone_dtype)
         print(f"[gen_image_ref] override backbone dtype={args.backbone_dtype}",
               file=sys.stderr)
     else:

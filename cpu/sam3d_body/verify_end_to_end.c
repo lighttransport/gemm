@@ -98,6 +98,20 @@ static void infer_dinov3_input_shape(const char *refdir, int *out_h, int *out_w)
     }
 }
 
+static int ref_backbone_is_float32(const char *refdir)
+{
+    if (!refdir) return 0;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/backbone_dtype.txt", refdir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[128];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, "float32") != NULL;
+}
+
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
 {
@@ -195,18 +209,20 @@ int main(int argc, char **argv)
         return 2;
     }
     if (threshold < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
         if (image_path && backbone == SAM3D_BODY_BACKBONE_DINOV3)
             threshold = 2e-2f;
         else if (image_path && backbone == SAM3D_BODY_BACKBONE_VITH)
-            threshold = 1.5e-1f;
+            threshold = f32_ref ? 2e-2f : 8e-2f;
         else
             threshold = 5e-3f;
     }
     if (threshold_2d < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
         if (image_path && backbone == SAM3D_BODY_BACKBONE_DINOV3)
             threshold_2d = 0.5f;
         else if (image_path && backbone == SAM3D_BODY_BACKBONE_VITH)
-            threshold_2d = 200.0f;
+            threshold_2d = f32_ref ? 0.5f : 30.0f;
         else
             threshold_2d = (threshold < 1e-2f) ? 1e-2f : threshold;
     }
@@ -402,8 +418,11 @@ int main(int argc, char **argv)
                 float *enc = (float *)malloc((size_t)enc_n * enc_dim * sizeof(float));
                 if (enc) {
                     sam3d_body_get_encoder_tokens(ctx, enc, &enc_n, &enc_dim);
+                    const char *tok_name =
+                        (backbone == SAM3D_BODY_BACKBONE_VITH)
+                            ? "vith_tokens" : "dinov3_tokens";
                     nd = 0; memset(dims, 0, sizeof(dims));
-                    float *ref_tok = load_or_die_dims(refdir, "dinov3_tokens",
+                    float *ref_tok = load_or_die_dims(refdir, tok_name,
                                                       &nd, dims);
                     size_t ref_tok_n = 0;
                     if (ref_tok && nd == 3 && dims[0] == 1 &&
@@ -413,7 +432,7 @@ int main(int argc, char **argv)
                              dims[0] == enc_n && dims[1] == enc_dim)
                         ref_tok_n = (size_t)enc_n * enc_dim;
                     if (ref_tok_n) {
-                        report_pair("self dinov3_tokens", enc, ref_tok, ref_tok_n);
+                        report_pair(tok_name, enc, ref_tok, ref_tok_n);
                     } else if (ref_tok && nd == 4 && dims[1] == Dc &&
                                dims[2] == H && dims[3] == W &&
                                enc_n >= H * W) {
@@ -425,7 +444,7 @@ int main(int argc, char **argv)
                                 for (int c = 0; c < Dc; c++)
                                     patch_chw[(size_t)c * H * W + n] =
                                         patch[(size_t)n * Dc + c];
-                            report_pair("self dinov3_tokens", patch_chw, ref_tok,
+                            report_pair(tok_name, patch_chw, ref_tok,
                                         (size_t)Dc * H * W);
                             free(patch_chw);
                         }
