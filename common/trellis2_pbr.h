@@ -492,11 +492,11 @@ int t2_pbr_write_textured_obj(const char *base_path,
 
     /* Write texture images */
     char path_buf[512];
-    snprintf(path_buf, sizeof(path_buf), "%s_basecolor.png", base_path);
+    snprintf(path_buf, sizeof(path_buf), "%s_basecolor.ppm", base_path);
     t2pbr_write_image(path_buf, tex_bc, tex_size, tex_size);
     fprintf(stderr, "Wrote %s\n", path_buf);
 
-    snprintf(path_buf, sizeof(path_buf), "%s_metallic_roughness.png", base_path);
+    snprintf(path_buf, sizeof(path_buf), "%s_metallic_roughness.ppm", base_path);
     t2pbr_write_image(path_buf, tex_mr, tex_size, tex_size);
     fprintf(stderr, "Wrote %s\n", path_buf);
 
@@ -512,10 +512,10 @@ int t2_pbr_write_textured_obj(const char *base_path,
         fprintf(f, "# TRELLIS.2 PBR material\n");
         fprintf(f, "newmtl trellis2_pbr\n");
         fprintf(f, "Kd 1.0 1.0 1.0\n");
-        fprintf(f, "map_Kd %s_basecolor.png\n", bn);
+        fprintf(f, "map_Kd %s_basecolor.ppm\n", bn);
         fprintf(f, "# PBR extensions\n");
-        fprintf(f, "map_Pr %s_metallic_roughness.png\n", bn);  /* roughness map */
-        fprintf(f, "map_Pm %s_metallic_roughness.png\n", bn);  /* metallic map */
+        fprintf(f, "map_Pr %s_metallic_roughness.ppm\n", bn);  /* roughness map */
+        fprintf(f, "map_Pm %s_metallic_roughness.ppm\n", bn);  /* metallic map */
         fclose(f);
         fprintf(stderr, "Wrote %s\n", path_buf);
     }

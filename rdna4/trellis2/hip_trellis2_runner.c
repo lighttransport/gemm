@@ -247,6 +247,20 @@ struct hip_trellis2_runner {
     t2_shape_dec      *shape_dec;
     hip_shape_dec_ctx *shape_dec_ctx;
 
+    /* ---- Tex decoder (independent slot; reuses same hierarchical 4-stage
+     * shape_dec architecture but with PBR out_channels). May coexist with the
+     * shape decoder on the same runner. */
+    hipModule_t        tex_dec_mod;
+    hipStream_t        tex_dec_stream;
+    t2_shape_dec      *tex_dec;
+    hip_shape_dec_ctx *tex_dec_ctx;
+
+    /* Per-stage subdiv arrays captured from the most recent shape_dec run;
+     * fed into tex_dec as its c2s guide (tex_dec has no to_subdiv head).
+     * Empty by default; populated after hip_trellis2_run_shape_dec. */
+    hip_shape_dec_cache subdiv_cache;
+    int                 subdiv_cache_valid;
+
     /* ---- SLAT DiT (sparse-latent flow DiT) ---- */
     int slat_loaded;
     /* Top-level weights — same layout as SS DiT, but in_channels=32 */
@@ -283,6 +297,40 @@ struct hip_trellis2_runner {
     void *d_slat_t_silu;   /* [DIT_DIM] */
     void *d_slat_mod_base; /* [6*DIT_DIM] */
     void *d_slat_mod;      /* [6*DIT_DIM] */
+
+    /* ---- Tex DiT (Stage 3, texture flow — sister of SLAT DiT) ----
+     * Identical 30-block architecture but in_channels=64 (noise_32 +
+     * shape_norm_32 concat) and out_channels=32. Independent weights, KV
+     * cache, scratch; runs after shape SLAT during e2e texgen. */
+    int tex_loaded;
+    t2_wt tex_input;     /* [DIT_DIM, 64] */
+    t2_wt tex_t_fc1;
+    t2_wt tex_t_fc2;
+    t2_wt tex_ada_mod;
+    t2_wt tex_out;       /* [32, DIT_DIM] */
+    t2_block_gpu tex_blocks[DIT_DEPTH];
+    void *d_tex_rope_cos;
+    void *d_tex_rope_sin;
+    int   tex_n_freqs;
+    int   tex_rope_cap;
+    void *tex_ca_K_cache[DIT_DEPTH];
+    void *tex_ca_V_cache[DIT_DEPTH];
+    int   tex_ca_kv_valid;
+    int   tex_ca_kv_len;
+    int   tex_ca_kv_cap;
+    const float *tex_ca_kv_cond_ptr;
+    void *d_tex_h, *d_tex_ln_h, *d_tex_qkv;
+    void *d_tex_Q, *d_tex_K, *d_tex_V;
+    void *d_tex_ca_Q, *d_tex_attn_out, *d_tex_mlp_mid;
+    void *d_tex_x_in;     /* [N, 64] */
+    void *d_tex_vel_out;  /* [N, 32] */
+    void *d_tex_cond;     /* [n_cond, 1024] */
+    int   tex_n_cap;
+    int   tex_cond_cap;
+    void *d_tex_t_emb;
+    void *d_tex_t_silu;
+    void *d_tex_mod_base;
+    void *d_tex_mod;
 };
 
 /* helper: hipMemcpy device buffer [n floats] to host if dst non-null */
@@ -981,6 +1029,40 @@ void hip_trellis2_unload_decoder(hip_trellis2_runner *r) {
     r->dec_loaded = 0;
 }
 
+void hip_trellis2_unload_slat_dit(hip_trellis2_runner *r) {
+    if (!r || !r->slat_loaded) return;
+    free_hip(&r->slat_input.w); free_hip(&r->slat_input.b);
+    free_hip(&r->slat_t_fc1.w); free_hip(&r->slat_t_fc1.b);
+    free_hip(&r->slat_t_fc2.w); free_hip(&r->slat_t_fc2.b);
+    free_hip(&r->slat_ada_mod.w); free_hip(&r->slat_ada_mod.b);
+    free_hip(&r->slat_out.w); free_hip(&r->slat_out.b);
+    for (int i = 0; i < DIT_DEPTH; i++) {
+        t2_block_gpu *b = &r->slat_blocks[i];
+        free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.w_bf16); free_hip(&b->sa_qkv.b);
+        free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
+        free_hip(&b->sa_out.w); free_hip(&b->sa_out.w_bf16); free_hip(&b->sa_out.b);
+        free_hip(&b->norm2_w); free_hip(&b->norm2_b);
+        free_hip(&b->ca_q.w); free_hip(&b->ca_q.w_bf16); free_hip(&b->ca_q.b);
+        free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
+        free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.w_bf16); free_hip(&b->ca_kv.b);
+        free_hip(&b->ca_out.w); free_hip(&b->ca_out.w_bf16); free_hip(&b->ca_out.b);
+        free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.w_bf16); free_hip(&b->mlp_fc1.b);
+        free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.w_bf16); free_hip(&b->mlp_fc2.b);
+        free_hip(&b->mod_bias);
+        free_hip(&r->slat_ca_K_cache[i]);
+        free_hip(&r->slat_ca_V_cache[i]);
+    }
+    free_hip(&r->d_slat_rope_cos); free_hip(&r->d_slat_rope_sin);
+    free_hip(&r->d_slat_h); free_hip(&r->d_slat_ln_h); free_hip(&r->d_slat_qkv);
+    free_hip(&r->d_slat_Q); free_hip(&r->d_slat_K); free_hip(&r->d_slat_V);
+    free_hip(&r->d_slat_ca_Q); free_hip(&r->d_slat_attn_out); free_hip(&r->d_slat_mlp_mid);
+    free_hip(&r->d_slat_x_in); free_hip(&r->d_slat_vel_out); free_hip(&r->d_slat_cond);
+    free_hip(&r->d_slat_t_emb); free_hip(&r->d_slat_t_silu);
+    free_hip(&r->d_slat_mod_base); free_hip(&r->d_slat_mod);
+    r->slat_loaded = 0;
+    r->slat_ca_kv_valid = 0;
+}
+
 void hip_trellis2_free(hip_trellis2_runner *r) {
     if (!r) return;
 
@@ -998,6 +1080,18 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
     if (r->shape_dec)     { t2_shape_dec_free(r->shape_dec); r->shape_dec = NULL; }
     if (r->shape_dec_mod) { hipModuleUnload(r->shape_dec_mod); r->shape_dec_mod = NULL; }
     if (r->shape_dec_stream) { hipStreamDestroy(r->shape_dec_stream); r->shape_dec_stream = NULL; }
+
+    /* Tex decoder cleanup. */
+    if (r->tex_dec_ctx) { hip_shape_dec_ctx_free(r->tex_dec_ctx); r->tex_dec_ctx = NULL; }
+    if (r->tex_dec)     { t2_shape_dec_free(r->tex_dec); r->tex_dec = NULL; }
+    if (r->tex_dec_mod) { hipModuleUnload(r->tex_dec_mod); r->tex_dec_mod = NULL; }
+    if (r->tex_dec_stream) { hipStreamDestroy(r->tex_dec_stream); r->tex_dec_stream = NULL; }
+
+    /* Per-stage subdiv arrays shared between shape_dec and tex_dec. */
+    if (r->subdiv_cache_valid) {
+        hip_shape_dec_cache_free(&r->subdiv_cache);
+        r->subdiv_cache_valid = 0;
+    }
 
     /* SLAT DiT cleanup */
     if (r->slat_loaded) {
@@ -1029,6 +1123,38 @@ void hip_trellis2_free(hip_trellis2_runner *r) {
         free_hip(&r->d_slat_x_in); free_hip(&r->d_slat_vel_out); free_hip(&r->d_slat_cond);
         free_hip(&r->d_slat_t_emb); free_hip(&r->d_slat_t_silu);
         free_hip(&r->d_slat_mod_base); free_hip(&r->d_slat_mod);
+    }
+
+    /* Tex DiT cleanup */
+    if (r->tex_loaded) {
+        free_hip(&r->tex_input.w); free_hip(&r->tex_input.b);
+        free_hip(&r->tex_t_fc1.w); free_hip(&r->tex_t_fc1.b);
+        free_hip(&r->tex_t_fc2.w); free_hip(&r->tex_t_fc2.b);
+        free_hip(&r->tex_ada_mod.w); free_hip(&r->tex_ada_mod.b);
+        free_hip(&r->tex_out.w); free_hip(&r->tex_out.b);
+        for (int i = 0; i < DIT_DEPTH; i++) {
+            t2_block_gpu *b = &r->tex_blocks[i];
+            free_hip(&b->sa_qkv.w); free_hip(&b->sa_qkv.w_bf16); free_hip(&b->sa_qkv.b);
+            free_hip(&b->sa_q_norm); free_hip(&b->sa_k_norm);
+            free_hip(&b->sa_out.w); free_hip(&b->sa_out.w_bf16); free_hip(&b->sa_out.b);
+            free_hip(&b->norm2_w); free_hip(&b->norm2_b);
+            free_hip(&b->ca_q.w); free_hip(&b->ca_q.w_bf16); free_hip(&b->ca_q.b);
+            free_hip(&b->ca_q_norm); free_hip(&b->ca_k_norm);
+            free_hip(&b->ca_kv.w); free_hip(&b->ca_kv.w_bf16); free_hip(&b->ca_kv.b);
+            free_hip(&b->ca_out.w); free_hip(&b->ca_out.w_bf16); free_hip(&b->ca_out.b);
+            free_hip(&b->mlp_fc1.w); free_hip(&b->mlp_fc1.w_bf16); free_hip(&b->mlp_fc1.b);
+            free_hip(&b->mlp_fc2.w); free_hip(&b->mlp_fc2.w_bf16); free_hip(&b->mlp_fc2.b);
+            free_hip(&b->mod_bias);
+            free_hip(&r->tex_ca_K_cache[i]);
+            free_hip(&r->tex_ca_V_cache[i]);
+        }
+        free_hip(&r->d_tex_rope_cos); free_hip(&r->d_tex_rope_sin);
+        free_hip(&r->d_tex_h); free_hip(&r->d_tex_ln_h); free_hip(&r->d_tex_qkv);
+        free_hip(&r->d_tex_Q); free_hip(&r->d_tex_K); free_hip(&r->d_tex_V);
+        free_hip(&r->d_tex_ca_Q); free_hip(&r->d_tex_attn_out); free_hip(&r->d_tex_mlp_mid);
+        free_hip(&r->d_tex_x_in); free_hip(&r->d_tex_vel_out); free_hip(&r->d_tex_cond);
+        free_hip(&r->d_tex_t_emb); free_hip(&r->d_tex_t_silu);
+        free_hip(&r->d_tex_mod_base); free_hip(&r->d_tex_mod);
     }
 
     free(r);
@@ -2082,6 +2208,9 @@ int hip_trellis2_load_shape_dec(hip_trellis2_runner *r, const char *safetensors_
         fprintf(stderr, "T2-HIP: hip_shape_dec_ctx_create failed\n");
         return -1;
     }
+    /* Always capture per-stage subdiv arrays — tex_dec needs them as a guide
+     * (it has no to_subdiv head of its own). Small host buffers, ~MBs total. */
+    hip_shape_dec_set_capture(r->shape_dec_ctx, 1);
     return 0;
 }
 
@@ -2098,6 +2227,21 @@ int hip_trellis2_run_shape_dec(hip_trellis2_runner *r,
     int rc = hip_shape_dec_forward(r->shape_dec_ctx, slat_feats, coords, N, slat_C,
                                     &d_feats, &d_coords, &Nf);
     if (rc != 0 || Nf <= 0) return -1;
+
+    /* Pull per-stage subdiv arrays for the downstream tex_dec guide. */
+    if (r->subdiv_cache_valid) {
+        hip_shape_dec_cache_free(&r->subdiv_cache);
+        r->subdiv_cache_valid = 0;
+    }
+    if (hip_shape_dec_take_cache(r->shape_dec_ctx, &r->subdiv_cache) == 0) {
+        r->subdiv_cache_valid = 1;
+        if (r->verbose) {
+            fprintf(stderr, "T2-HIP: captured shape_dec subdiv cache:");
+            for (int s = 0; s < r->subdiv_cache.n_stages; s++)
+                fprintf(stderr, " s%d=%d", s, r->subdiv_cache.gN[s]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     if (r->shape_dec_stream) hipStreamSynchronize(r->shape_dec_stream);
     int out_ch = r->shape_dec->out_channels;
@@ -2161,6 +2305,94 @@ void hip_trellis2_shape_dec_mesh_free(hip_trellis2_mesh *m) {
     if (m->vertices)  free(m->vertices);
     if (m->triangles) free(m->triangles);
     m->vertices = NULL; m->triangles = NULL; m->n_verts = 0; m->n_tris = 0;
+}
+
+/* ---- Tex decoder ---------------------------------------------------------
+ * Same 4-stage hierarchical sparse architecture as shape_dec, but trained for
+ * texture / PBR output (out_channels typically 6: albedo RGB + metallic +
+ * roughness + AO, or similar — final per-voxel channel count is taken from
+ * the checkpoint). Loaded into a separate runner slot so both decoders can
+ * coexist if the caller needs them at the same time. */
+
+int hip_trellis2_load_tex_dec(hip_trellis2_runner *r, const char *safetensors_path) {
+    if (!r) return -1;
+    if (r->tex_dec_ctx) {
+        fprintf(stderr, "T2-HIP: tex_dec already loaded\n");
+        return 0;
+    }
+    fprintf(stderr, "T2-HIP: loading tex_dec weights: %s\n", safetensors_path);
+    r->tex_dec = t2_shape_dec_load(safetensors_path);
+    if (!r->tex_dec) {
+        fprintf(stderr, "T2-HIP: t2_shape_dec_load (tex_dec) failed\n");
+        return -1;
+    }
+    if (hip_compile_kernels(&r->tex_dec_mod, r->device_id,
+                            hip_tex_dec_kernels_src, "tex_dec",
+                            r->verbose, "T2-HIP-TEX") <= 0) {
+        fprintf(stderr, "T2-HIP: tex_dec kernel compile failed\n");
+        t2_shape_dec_free(r->tex_dec); r->tex_dec = NULL;
+        return -1;
+    }
+    if (hipStreamCreateWithFlags(&r->tex_dec_stream, hipStreamNonBlocking) != hipSuccess) {
+        r->tex_dec_stream = NULL;
+    }
+    r->tex_dec_ctx = hip_shape_dec_ctx_create(r->tex_dec_mod, r->tex_dec_stream,
+                                               r->tex_dec, r->verbose);
+    if (!r->tex_dec_ctx) {
+        fprintf(stderr, "T2-HIP: hip_shape_dec_ctx_create (tex_dec) failed\n");
+        return -1;
+    }
+    fprintf(stderr, "T2-HIP: tex_dec loaded (out_channels=%d)\n",
+            r->tex_dec->out_channels);
+    return 0;
+}
+
+void hip_trellis2_unload_tex_dec(hip_trellis2_runner *r) {
+    if (!r) return;
+    if (r->tex_dec_ctx) { hip_shape_dec_ctx_free(r->tex_dec_ctx); r->tex_dec_ctx = NULL; }
+    if (r->tex_dec)     { t2_shape_dec_free(r->tex_dec); r->tex_dec = NULL; }
+    if (r->tex_dec_mod) { hipModuleUnload(r->tex_dec_mod); r->tex_dec_mod = NULL; }
+    if (r->tex_dec_stream) { hipStreamDestroy(r->tex_dec_stream); r->tex_dec_stream = NULL; }
+}
+
+int hip_trellis2_run_tex_dec(hip_trellis2_runner *r,
+                             const float *slat_feats,
+                             const int32_t *coords,
+                             int N, int slat_C,
+                             float **out_feats,
+                             int32_t **out_coords,
+                             int *out_N)
+{
+    if (!r || !r->tex_dec_ctx || !out_feats || !out_coords || !out_N) return -1;
+    *out_feats = NULL; *out_coords = NULL; *out_N = 0;
+
+    float *d_feats = NULL; int32_t *d_coords = NULL; int Nf = 0;
+    /* tex_dec has no to_subdiv head — drive its c2s with the per-stage
+     * subdivision arrays captured from the most recent shape_dec run. */
+    const hip_shape_dec_cache *cache =
+        r->subdiv_cache_valid ? &r->subdiv_cache : NULL;
+    if (!cache) {
+        fprintf(stderr, "T2-HIP: tex_dec needs shape_dec subdiv cache but none "
+                        "is available — run shape_dec first\n");
+        return -1;
+    }
+    int rc = hip_shape_dec_forward_ex(r->tex_dec_ctx, slat_feats, coords,
+                                       N, slat_C, cache,
+                                       &d_feats, &d_coords, &Nf);
+    if (rc != 0 || Nf <= 0) return -1;
+
+    if (r->tex_dec_stream) hipStreamSynchronize(r->tex_dec_stream);
+    int out_ch = r->tex_dec->out_channels;
+    float   *h_feats  = (float *)  malloc((size_t)Nf * out_ch * sizeof(float));
+    int32_t *h_coords = (int32_t *)malloc((size_t)Nf * 4      * sizeof(int32_t));
+    hipMemcpy(h_feats,  d_feats,  (size_t)Nf * out_ch * sizeof(float),   hipMemcpyDeviceToHost);
+    hipMemcpy(h_coords, d_coords, (size_t)Nf * 4      * sizeof(int32_t), hipMemcpyDeviceToHost);
+    hipFree(d_feats); hipFree(d_coords);
+
+    *out_feats  = h_feats;
+    *out_coords = h_coords;
+    *out_N      = Nf;
+    return 0;
 }
 
 /* ============================================================================
@@ -2568,6 +2800,353 @@ int hip_trellis2_slat_dit_step(hip_trellis2_runner *r,
     if (slat_dit_forward(r, N, n_cond) != 0) return -1;
 
     hipMemcpy(out_vel, r->d_slat_vel_out, (size_t)N * SLAT_IN_CH * sizeof(float),
+              hipMemcpyDeviceToHost);
+    return 0;
+}
+
+/* ============================================================================
+ * Tex DiT (Stage 3, texture flow) — sister of SLAT DiT.
+ *
+ * Identical 30-block ModulatedTransformerCrossBlock to shape SLAT, but with
+ *   in_channels  = 64  (noise_32 + shape_norm_32 concatenated per voxel)
+ *   out_channels = 32  (texture-latent velocity)
+ * Independent weight set, KV cache, and scratch buffers. Same RoPE-3D
+ * computed from coords. Runs after shape SLAT during e2e texgen.
+ * ============================================================================ */
+
+#define TEX_IN_CH    64
+#define TEX_OUT_CH   32
+
+int hip_trellis2_load_tex_dit(hip_trellis2_runner *r, const char *path) {
+    if (!r) return -1;
+    fprintf(stderr, "T2-HIP: loading tex DiT weights: %s\n", path);
+    st_context *st = safetensors_open(path);
+    if (!st) { fprintf(stderr, "T2-HIP: failed to open %s\n", path); return -1; }
+    int v = r->verbose;
+
+    r->tex_input.w   = st_upload_f32(st, "input_layer.weight", v);
+    r->tex_input.b   = st_upload_f32(st, "input_layer.bias",   v);
+    r->tex_input.scale = -1.0f;
+    r->tex_t_fc1.w   = st_upload_f32(st, "t_embedder.mlp.0.weight", v);
+    r->tex_t_fc1.b   = st_upload_f32(st, "t_embedder.mlp.0.bias",   v);
+    r->tex_t_fc1.scale = -1.0f;
+    r->tex_t_fc2.w   = st_upload_f32(st, "t_embedder.mlp.2.weight", v);
+    r->tex_t_fc2.b   = st_upload_f32(st, "t_embedder.mlp.2.bias",   v);
+    r->tex_t_fc2.scale = -1.0f;
+    r->tex_ada_mod.w = st_upload_f32(st, "adaLN_modulation.1.weight", v);
+    r->tex_ada_mod.b = st_upload_f32(st, "adaLN_modulation.1.bias",   v);
+    r->tex_ada_mod.scale = -1.0f;
+    r->tex_out.w     = st_upload_f32(st, "out_layer.weight", v);
+    r->tex_out.b     = st_upload_f32(st, "out_layer.bias",   v);
+    r->tex_out.scale = -1.0f;
+
+    if (!r->tex_input.w || !r->tex_t_fc1.w || !r->tex_t_fc2.w ||
+        !r->tex_ada_mod.w || !r->tex_out.w) {
+        fprintf(stderr, "T2-HIP: tex DiT top-level weight missing\n");
+        safetensors_close(st);
+        return -1;
+    }
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        char name[128];
+        t2_block_gpu *b = &r->tex_blocks[bi];
+        memset(b, 0, sizeof(*b));
+        #define TBN(n) (snprintf(name,sizeof(name),"blocks.%d.%s",bi,n), name)
+
+        st_upload_wt_bf16_pref(st, TBN("self_attn.to_qkv.weight"), r->use_blaslt,
+                               &b->sa_qkv.w_bf16, &b->sa_qkv.w, &b->sa_qkv.scale, v);
+        b->sa_qkv.b  = st_upload_f32(st, TBN("self_attn.to_qkv.bias"),   v);
+        b->sa_q_norm = st_upload_f32(st, TBN("self_attn.q_rms_norm.gamma"), v);
+        b->sa_k_norm = st_upload_f32(st, TBN("self_attn.k_rms_norm.gamma"), v);
+        st_upload_wt_bf16_pref(st, TBN("self_attn.to_out.weight"), r->use_blaslt,
+                               &b->sa_out.w_bf16, &b->sa_out.w, &b->sa_out.scale, v);
+        b->sa_out.b  = st_upload_f32(st, TBN("self_attn.to_out.bias"),   v);
+
+        b->norm2_w   = st_upload_f32(st, TBN("norm2.weight"), v);
+        b->norm2_b   = st_upload_f32(st, TBN("norm2.bias"),   v);
+        st_upload_wt_bf16_pref(st, TBN("cross_attn.to_q.weight"), r->use_blaslt,
+                               &b->ca_q.w_bf16, &b->ca_q.w, &b->ca_q.scale, v);
+        b->ca_q.b    = st_upload_f32(st, TBN("cross_attn.to_q.bias"),   v);
+        b->ca_q_norm = st_upload_f32(st, TBN("cross_attn.q_rms_norm.gamma"), v);
+        b->ca_k_norm = st_upload_f32(st, TBN("cross_attn.k_rms_norm.gamma"), v);
+        st_upload_wt_bf16_pref(st, TBN("cross_attn.to_kv.weight"), r->use_blaslt,
+                               &b->ca_kv.w_bf16, &b->ca_kv.w, &b->ca_kv.scale, v);
+        b->ca_kv.b   = st_upload_f32(st, TBN("cross_attn.to_kv.bias"),   v);
+        st_upload_wt_bf16_pref(st, TBN("cross_attn.to_out.weight"), r->use_blaslt,
+                               &b->ca_out.w_bf16, &b->ca_out.w, &b->ca_out.scale, v);
+        b->ca_out.b  = st_upload_f32(st, TBN("cross_attn.to_out.bias"),   v);
+
+        st_upload_wt_bf16_pref(st, TBN("mlp.mlp.0.weight"), r->use_blaslt,
+                               &b->mlp_fc1.w_bf16, &b->mlp_fc1.w, &b->mlp_fc1.scale, v);
+        b->mlp_fc1.b = st_upload_f32(st, TBN("mlp.mlp.0.bias"),   v);
+        st_upload_wt_bf16_pref(st, TBN("mlp.mlp.2.weight"), r->use_blaslt,
+                               &b->mlp_fc2.w_bf16, &b->mlp_fc2.w, &b->mlp_fc2.scale, v);
+        b->mlp_fc2.b = st_upload_f32(st, TBN("mlp.mlp.2.bias"),   v);
+
+        b->mod_bias  = st_upload_f32(st, TBN("modulation"), v);
+        #undef TBN
+    }
+    safetensors_close(st);
+
+    r->tex_n_freqs = DIT_HEAD_DIM / 6;
+    r->tex_loaded = 1;
+    r->tex_ca_kv_valid = 0;
+    r->tex_ca_kv_cond_ptr = NULL;
+
+    hipMalloc(&r->d_tex_t_emb,    DIT_T_HALF * 2 * sizeof(float));
+    hipMalloc(&r->d_tex_t_silu,   DIT_DIM * sizeof(float));
+    hipMalloc(&r->d_tex_mod_base, 6 * DIT_DIM * sizeof(float));
+    hipMalloc(&r->d_tex_mod,      6 * DIT_DIM * sizeof(float));
+
+    fprintf(stderr, "T2-HIP: tex DiT loaded (%d blocks, RoPE %d freqs/axis, %s)\n",
+            DIT_DEPTH, r->tex_n_freqs,
+            r->use_blaslt ? "BF16+hipBLASLt" : "F32");
+    return 0;
+}
+
+void hip_trellis2_invalidate_tex_kv(hip_trellis2_runner *r) {
+    if (r) { r->tex_ca_kv_valid = 0; r->tex_ca_kv_cond_ptr = NULL; }
+}
+
+static int tex_ensure_n_scratch(hip_trellis2_runner *r, int N) {
+    if (N <= r->tex_n_cap) return 0;
+    free_hip(&r->d_tex_h);
+    free_hip(&r->d_tex_ln_h);
+    free_hip(&r->d_tex_qkv);
+    free_hip(&r->d_tex_Q);
+    free_hip(&r->d_tex_K);
+    free_hip(&r->d_tex_V);
+    free_hip(&r->d_tex_ca_Q);
+    free_hip(&r->d_tex_attn_out);
+    free_hip(&r->d_tex_mlp_mid);
+    free_hip(&r->d_tex_x_in);
+    free_hip(&r->d_tex_vel_out);
+    free_hip(&r->d_tex_rope_cos);
+    free_hip(&r->d_tex_rope_sin);
+
+    int cap = N;
+    if (cap < 4096) cap = 4096;
+    if (cap > SLAT_MAX_TOK) cap = SLAT_MAX_TOK;
+    if (cap < N) {
+        fprintf(stderr, "T2-HIP: tex N=%d exceeds max %d\n", N, SLAT_MAX_TOK);
+        return -1;
+    }
+    size_t fdim = (size_t)cap * DIT_DIM * sizeof(float);
+    if (hipMalloc(&r->d_tex_h,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_ln_h,     fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_qkv,      3 * fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_Q,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_K,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_V,        fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_ca_Q,     fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_attn_out, fdim) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_mlp_mid,  (size_t)cap * DIT_FFN * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_x_in,     (size_t)cap * TEX_IN_CH  * sizeof(float)) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_vel_out,  (size_t)cap * TEX_OUT_CH * sizeof(float)) != hipSuccess) return -1;
+    size_t rope_bytes = (size_t)cap * 3 * r->tex_n_freqs * sizeof(float);
+    if (hipMalloc(&r->d_tex_rope_cos, rope_bytes) != hipSuccess) return -1;
+    if (hipMalloc(&r->d_tex_rope_sin, rope_bytes) != hipSuccess) return -1;
+
+    r->tex_n_cap = cap;
+    r->tex_rope_cap = cap;
+    return 0;
+}
+
+static int tex_ensure_cond_scratch(hip_trellis2_runner *r, int n_cond) {
+    if (n_cond <= r->tex_cond_cap) return 0;
+    free_hip(&r->d_tex_cond);
+    int cap = n_cond > SLAT_MAX_COND ? n_cond : SLAT_MAX_COND;
+    if (hipMalloc(&r->d_tex_cond, (size_t)cap * DIT_COND_DIM * sizeof(float)) != hipSuccess)
+        return -1;
+    r->tex_cond_cap = cap;
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        free_hip(&r->tex_ca_K_cache[bi]);
+        free_hip(&r->tex_ca_V_cache[bi]);
+        if (hipMalloc(&r->tex_ca_K_cache[bi], (size_t)cap * DIT_DIM * sizeof(float)) != hipSuccess) return -1;
+        if (hipMalloc(&r->tex_ca_V_cache[bi], (size_t)cap * DIT_DIM * sizeof(float)) != hipSuccess) return -1;
+    }
+    r->tex_ca_kv_cap = cap;
+    r->tex_ca_kv_valid = 0;
+    return 0;
+}
+
+static int tex_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
+    if (!r->tex_loaded) { fprintf(stderr, "T2-HIP: tex DiT not loaded\n"); return -1; }
+
+    /* Input embedding: x_t [N, 64] -> [N, DIT_DIM] */
+    gemm(r, r->d_tex_h, &r->tex_input, r->d_tex_x_in,
+         r->tex_input.b, DIT_DIM, TEX_IN_CH, N);
+
+    /* Timestep MLP */
+    gemm(r, r->d_tex_t_silu, &r->tex_t_fc1, r->d_tex_t_emb,
+         r->tex_t_fc1.b, DIT_DIM, DIT_T_HALF * 2, 1);
+    run_silu(r, r->d_tex_t_silu, DIT_DIM);
+    void *d_t_out = r->d_tex_attn_out;
+    gemm(r, d_t_out, &r->tex_t_fc2, r->d_tex_t_silu,
+         r->tex_t_fc2.b, DIT_DIM, DIT_DIM, 1);
+
+    /* Rebuild cross-attn KV cache if needed */
+    if (!r->tex_ca_kv_valid) {
+        for (int bi = 0; bi < DIT_DEPTH; bi++) {
+            t2_block_gpu *b = &r->tex_blocks[bi];
+            void *kv_tmp = r->d_tex_qkv;
+            gemm(r, kv_tmp, &b->ca_kv, r->d_tex_cond,
+                 b->ca_kv.b, 2 * DIT_DIM, DIT_COND_DIM, n_cond);
+            void *K = r->tex_ca_K_cache[bi], *V = r->tex_ca_V_cache[bi];
+            int M = n_cond, W = DIT_DIM;
+            void *args[] = { &K, &V, &kv_tmp, &M, &W };
+            hipModuleLaunchKernel(r->fn_split_kv,
+                (n_cond * DIT_DIM + 255) / 256, 1, 1, 256, 1, 1,
+                0, 0, args, NULL);
+            run_rms_norm_ph(r, r->tex_ca_K_cache[bi], b->ca_k_norm,
+                             n_cond, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        }
+        r->tex_ca_kv_valid = 1;
+        r->tex_ca_kv_len   = n_cond;
+    }
+
+    /* Shared modulation */
+    {
+        void *out = r->d_tex_mod_base;
+        const void *t_emb = d_t_out;
+        const void *mod_w = r->tex_ada_mod.w, *mod_b = r->tex_ada_mod.b;
+        const void *blk_bias_null = NULL;
+        int dim = DIT_DIM, out_dim = 6 * DIT_DIM;
+        void *args[] = { &out, &t_emb, &mod_w, &mod_b, &blk_bias_null, &dim, &out_dim };
+        int gx = (out_dim + 255) / 256;
+        hipModuleLaunchKernel(r->fn_modulation_par, gx, 1, 1, 256, 1, 1,
+                              DIT_DIM * sizeof(float), 0, args, NULL);
+    }
+
+    for (int bi = 0; bi < DIT_DEPTH; bi++) {
+        t2_block_gpu *b = &r->tex_blocks[bi];
+
+        /* Per-block modulation */
+        {
+            void *out = r->d_tex_mod;
+            const void *base = r->d_tex_mod_base;
+            const void *blk_bias = b->mod_bias;
+            int n = 6 * DIT_DIM;
+            void *args[] = { &out, (void *)&base, (void *)&blk_bias, &n };
+            int gx = (n + 255) / 256;
+            hipModuleLaunchKernel(r->fn_mod_add_blkbias, gx, 1, 1, 256, 1, 1,
+                                  0, 0, args, NULL);
+        }
+        float *mod = (float *)r->d_tex_mod;
+        void *shift_sa  = mod + 0 * DIT_DIM;
+        void *scale_sa  = mod + 1 * DIT_DIM;
+        void *gate_sa   = mod + 2 * DIT_DIM;
+        void *shift_mlp = mod + 3 * DIT_DIM;
+        void *scale_mlp = mod + 4 * DIT_DIM;
+        void *gate_mlp  = mod + 5 * DIT_DIM;
+
+        /* Self-attention */
+        run_adaln(r, r->d_tex_ln_h, r->d_tex_h, shift_sa, scale_sa, N, DIT_DIM);
+        gemm(r, r->d_tex_qkv, &b->sa_qkv, r->d_tex_ln_h, b->sa_qkv.b,
+             3 * DIT_DIM, DIT_DIM, N);
+        {
+            void *Q = r->d_tex_Q, *K = r->d_tex_K, *V = r->d_tex_V;
+            const void *qkv = r->d_tex_qkv;
+            int Nl = N, W = DIT_DIM;
+            void *args[] = { &Q, &K, &V, &qkv, &Nl, &W };
+            hipModuleLaunchKernel(r->fn_split_qkv,
+                (N * DIT_DIM + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args, NULL);
+        }
+        run_rms_norm_ph(r, r->d_tex_Q, b->sa_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        run_rms_norm_ph(r, r->d_tex_K, b->sa_k_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        {
+            void *saved_cos = r->d_rope_cos, *saved_sin = r->d_rope_sin;
+            int saved_freqs = r->n_rope_freqs;
+            r->d_rope_cos = r->d_tex_rope_cos;
+            r->d_rope_sin = r->d_tex_rope_sin;
+            r->n_rope_freqs = r->tex_n_freqs;
+            run_rope_3d(r, r->d_tex_Q, N);
+            run_rope_3d(r, r->d_tex_K, N);
+            r->d_rope_cos = saved_cos; r->d_rope_sin = saved_sin;
+            r->n_rope_freqs = saved_freqs;
+        }
+        run_flash_sa(r, r->d_tex_attn_out, NULL,
+                     r->d_tex_Q, r->d_tex_K, r->d_tex_V, N, 0);
+        gemm(r, r->d_tex_ln_h, &b->sa_out, r->d_tex_attn_out, b->sa_out.b,
+             DIT_DIM, DIT_DIM, N);
+        run_gated_add(r, r->d_tex_h, r->d_tex_ln_h, gate_sa, N, DIT_DIM);
+
+        /* Cross-attention */
+        run_layernorm(r, r->d_tex_ln_h, r->d_tex_h, b->norm2_w, b->norm2_b, N, DIT_DIM);
+        gemm(r, r->d_tex_ca_Q, &b->ca_q, r->d_tex_ln_h, b->ca_q.b,
+             DIT_DIM, DIT_DIM, N);
+        run_rms_norm_ph(r, r->d_tex_ca_Q, b->ca_q_norm, N, DIT_HEADS, DIT_HEAD_DIM, DIT_DIM);
+        run_cross_attn(r, r->d_tex_attn_out, NULL,
+                       r->d_tex_ca_Q, r->tex_ca_K_cache[bi], r->tex_ca_V_cache[bi],
+                       N, r->tex_ca_kv_len);
+        gemm(r, r->d_tex_ln_h, &b->ca_out, r->d_tex_attn_out, b->ca_out.b,
+             DIT_DIM, DIT_DIM, N);
+        run_residual_add(r, r->d_tex_h, r->d_tex_ln_h, N * DIT_DIM);
+
+        /* MLP */
+        run_adaln(r, r->d_tex_ln_h, r->d_tex_h, shift_mlp, scale_mlp, N, DIT_DIM);
+        gemm(r, r->d_tex_mlp_mid, &b->mlp_fc1, r->d_tex_ln_h, b->mlp_fc1.b,
+             DIT_FFN, DIT_DIM, N);
+        run_gelu(r, r->d_tex_mlp_mid, N * DIT_FFN);
+        gemm(r, r->d_tex_ln_h, &b->mlp_fc2, r->d_tex_mlp_mid, b->mlp_fc2.b,
+             DIT_DIM, DIT_FFN, N);
+        run_gated_add(r, r->d_tex_h, r->d_tex_ln_h, gate_mlp, N, DIT_DIM);
+    }
+
+    run_ln_noaffine(r, r->d_tex_ln_h, r->d_tex_h, N, DIT_DIM);
+    gemm(r, r->d_tex_vel_out, &r->tex_out, r->d_tex_ln_h, r->tex_out.b,
+         TEX_OUT_CH, DIT_DIM, N);
+    hipDeviceSynchronize();
+    return 0;
+}
+
+int hip_trellis2_tex_dit_step(hip_trellis2_runner *r,
+                               const float *x_t,
+                               const int32_t *coords, int N,
+                               float t_value,
+                               const float *cond, int n_cond,
+                               float *out_vel) {
+    if (!r || !r->tex_loaded) { fprintf(stderr, "T2-HIP: tex DiT not loaded\n"); return -1; }
+    if (N <= 0 || N > SLAT_MAX_TOK)        { fprintf(stderr, "T2-HIP: bad N=%d\n", N); return -1; }
+    if (n_cond <= 0 || n_cond > SLAT_MAX_COND) { fprintf(stderr, "T2-HIP: bad n_cond=%d\n", n_cond); return -1; }
+    if (tex_ensure_n_scratch(r, N) != 0)         return -1;
+    if (tex_ensure_cond_scratch(r, n_cond) != 0) return -1;
+
+    hipMemcpy(r->d_tex_x_in, x_t, (size_t)N * TEX_IN_CH * sizeof(float),
+              hipMemcpyHostToDevice);
+
+    if (cond != r->tex_ca_kv_cond_ptr || n_cond != r->tex_ca_kv_len) {
+        r->tex_ca_kv_valid = 0;
+    }
+    if (!r->tex_ca_kv_valid) {
+        hipMemcpy(r->d_tex_cond, cond, (size_t)n_cond * DIT_COND_DIM * sizeof(float),
+                  hipMemcpyHostToDevice);
+        r->tex_ca_kv_cond_ptr = cond;
+    }
+
+    {
+        size_t rb = (size_t)N * 3 * r->tex_n_freqs;
+        float *cs = (float *)malloc(rb * sizeof(float));
+        float *sn = (float *)malloc(rb * sizeof(float));
+        slat_compute_rope_host(coords, N, r->tex_n_freqs, 10000.0f, cs, sn);
+        hipMemcpy(r->d_tex_rope_cos, cs, rb * sizeof(float), hipMemcpyHostToDevice);
+        hipMemcpy(r->d_tex_rope_sin, sn, rb * sizeof(float), hipMemcpyHostToDevice);
+        free(cs); free(sn);
+    }
+
+    /* Same t×1000 convention as SLAT */
+    {
+        void *out = r->d_tex_t_emb;
+        float t_val = t_value * 1000.0f;
+        int dim = DIT_T_HALF * 2;
+        void *args[] = { &out, &t_val, &dim };
+        hipModuleLaunchKernel(r->fn_t_embed, (DIT_T_HALF + 255) / 256, 1, 1, 256, 1, 1,
+                              0, 0, args, NULL);
+    }
+
+    if (tex_dit_forward(r, N, n_cond) != 0) return -1;
+
+    hipMemcpy(out_vel, r->d_tex_vel_out, (size_t)N * TEX_OUT_CH * sizeof(float),
               hipMemcpyDeviceToHost);
     return 0;
 }
