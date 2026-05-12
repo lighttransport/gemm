@@ -283,7 +283,7 @@ int sam3d_body_run_encoder(sam3d_body_ctx *ctx)
         bbox_xyxy[0] = 0; bbox_xyxy[1] = 0;
         bbox_xyxy[2] = (float)ctx->img_w; bbox_xyxy[3] = (float)ctx->img_h;
     }
-    float aspect_ratio_pre = 0.75f;
+    float aspect_ratio_pre = is_vith ? 0.75f : 1.0f;
     if (!is_vith && IMG_H != IMG_W)
         aspect_ratio_pre = (float)IMG_W / (float)IMG_H;
     sam3d_body_compute_bbox_affine(bbox_xyxy, /*padding=*/1.25f,
@@ -440,6 +440,12 @@ static int self_drive_decoder_inputs(sam3d_body_ctx *ctx)
      * affine at x' = x + 64. */
     const int img_h_for_rays = ctx->enc_image_h;
     const int img_w_for_rays = ctx->enc_image_w;
+    const int img_h_for_decoder =
+        (ctx->cfg.backbone == SAM3D_BODY_BACKBONE_VITH)
+            ? SAM3D_BODY_ENCODER_SIZE : img_h_for_rays;
+    const int img_w_for_decoder =
+        (ctx->cfg.backbone == SAM3D_BODY_BACKBONE_VITH)
+            ? SAM3D_BODY_ENCODER_SIZE : img_w_for_rays;
     float warp_for_rays[6];
     memcpy(warp_for_rays, ctx->self_warp, sizeof(warp_for_rays));
     int ray_img_h = img_h_for_rays;
@@ -482,7 +488,8 @@ static int self_drive_decoder_inputs(sam3d_body_ctx *ctx)
 
     /* condition_info (CLIFF). */
     float ori_img_size[2] = { (float)ctx->img_w, (float)ctx->img_h };
-    float img_size[2]     = { (float)img_w_for_rays, (float)img_h_for_rays };
+    float img_size[2]     = { (float)img_w_for_decoder,
+                              (float)img_h_for_decoder };
     float bbox_scale1[1]  = { ctx->self_scale[0] };  /* (1,) — only sw is used */
     float condition_info[3];
     sam3d_body_compute_condition_info(ctx->self_center, bbox_scale1,
@@ -526,11 +533,6 @@ static int self_drive_decoder_inputs(sam3d_body_ctx *ctx)
     ctx->dec_cam_batch.bbox_scale = ctx->self_scale[0];
     memcpy(ctx->dec_cam_batch.ori_img_size, ori_img_size, 2 * sizeof(float));
     memcpy(ctx->dec_cam_batch.img_size,     img_size,     2 * sizeof(float));
-    /* For vith, the decoder sees the (384, 512) cropped canvas, so the
-     * affine must include the same -64 X-shift used for ray_cond_xyz. */
-    if (ctx->cfg.backbone == SAM3D_BODY_BACKBONE_VITH) {
-        warp_for_rays[2] = ctx->self_warp[2] - 64.0f * ctx->self_warp[0];
-    }
     memcpy(ctx->dec_cam_batch.affine_trans, warp_for_rays, 6 * sizeof(float));
     ctx->dec_cam_batch.use_intrin_center    = 0;
     ctx->dec_cam_batch.default_scale_factor = 1.0f;

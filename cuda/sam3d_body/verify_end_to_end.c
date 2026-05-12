@@ -93,6 +93,20 @@ static void infer_dinov3_input_shape(const char *refdir, int *out_h, int *out_w)
     }
 }
 
+static int ref_backbone_is_float32(const char *refdir)
+{
+    if (!refdir) return 0;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/backbone_dtype.txt", refdir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[128];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, "float32") != NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL;
@@ -149,18 +163,20 @@ int main(int argc, char **argv)
         return 2;
     }
     if (threshold < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
         if (backbone == CUDA_SAM3D_BODY_BACKBONE_DINOV3)
             threshold = 2e-2f;
         else if (backbone == CUDA_SAM3D_BODY_BACKBONE_VITH)
-            threshold = 1.5e-1f;
+            threshold = f32_ref ? 2e-2f : 8e-2f;
         else
             threshold = 5e-3f;
     }
     if (threshold_2d < 0.0f) {
+        int f32_ref = ref_backbone_is_float32(refdir);
         if (backbone == CUDA_SAM3D_BODY_BACKBONE_DINOV3)
             threshold_2d = 0.5f;
         else if (backbone == CUDA_SAM3D_BODY_BACKBONE_VITH)
-            threshold_2d = 200.0f;
+            threshold_2d = f32_ref ? 0.5f : 30.0f;
         else
             threshold_2d = (threshold < 1e-2f) ? 1e-2f : threshold;
     }

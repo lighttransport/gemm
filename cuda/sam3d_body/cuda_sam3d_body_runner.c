@@ -2127,7 +2127,7 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
         /* Recompute the same affine shape that run_encoder would have cached.
          * ViT-H still uses the upstream 512x512 canvas before W-axis crop. */
         int affine_w = IMG_W, affine_h = IMG_H;
-        float aspect_ratio_pre = 0.75f;
+        float aspect_ratio_pre = is_vith ? 0.75f : 1.0f;
         if (is_vith) {
             affine_w = SB_VITH_IMG_H;
             affine_h = SB_VITH_IMG_H;
@@ -2229,7 +2229,10 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     /* ---- condition_info, init_input, prev_input, prompt_in ---- */
     const double t_cond0 = sb_time_ms();
     float ori_img_size[2] = { (float)ctx->img_w, (float)ctx->img_h };
-    float img_size[2]     = { (float)IMG_W,      (float)IMG_H        };
+    float img_size[2]     = {
+        (float)(is_vith ? SB_VITH_IMG_H : IMG_W),
+        (float)(is_vith ? SB_VITH_IMG_H : IMG_H),
+    };
     float bbox_scale1[1]  = { scale[0] };
     float condition_info[3];
     sam3d_body_compute_condition_info(center, bbox_scale1, ori_img_size,
@@ -2269,8 +2272,6 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
 
     /* ---- camera_batch ---- */
     sam3d_body_camera_batch B;
-    if (is_vith)
-        warp_for_rays[2] = warp[2] - 64.0f * warp[0];
     memcpy(B.cam_int,      cam_int, 9 * sizeof(float));
     memcpy(B.bbox_center,  center,  2 * sizeof(float));
     B.bbox_scale = scale[0];
