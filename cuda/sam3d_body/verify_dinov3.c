@@ -16,18 +16,31 @@
 #include <string.h>
 #include "../../common/npy_io.h"
 
+static int ref_backbone_is_float32(const char *refdir)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/backbone_dtype.txt", refdir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[64] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, "float32") != NULL ||
+           strstr(buf, "torch.float32") != NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
-    /* Default gate is set to the observed floor of the CPU port (which
-     * the CUDA forward bit-matches). The CPU vs PyTorch fp32 max-abs
-     * for sam-3d-body's DINOv3-H+ encoder is currently ≈1.0 at a
-     * single token (and ≈1.1e-2 mean). The CUDA kernels reproduce this
-     * to ~5 digits; the remaining floor is upstream of the CUDA port. */
-    float threshold = 1.5f;
-    float mean_threshold = 1.5e-2f;
+    /* Pick the default gate after reading the ref geometry and precision.
+     * The default fp16 path bit-matches the CPU fast path: square refs sit
+     * around 1.4e-1 max_abs, rectangular 512x384 refs around 3.7e-1. The
+     * explicit bf16 diagnostic mode keeps the older looser gate. */
+    float threshold = -1.0f;
+    float mean_threshold = -1.0f;
     int device = 0, verbose = 0;
-    const char *precision = "bf16";
+    const char *precision = "fp16";
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
@@ -42,7 +55,7 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] "
-                        "[--device N] [--precision bf16|fp16] [-v]\n",
+                        "[--device N] [--precision fp16|bf16] [-v]\n",
                 argv[0]);
         return 2;
     }
@@ -70,10 +83,20 @@ int main(int argc, char **argv)
     int D = ref_dims[1], Ph = ref_dims[2], Pw = ref_dims[3];
     fprintf(stderr, "[cuda verify_dinov3] ref: input=(1,3,%d,%d) tokens=(1,%d,%d,%d)\n",
             H, W, D, Ph, Pw);
+    int precision_bf16 = precision && precision[0] && !strcmp(precision, "bf16");
+    int ref_is_f32 = ref_backbone_is_float32(refdir);
+    if (threshold < 0.0f)
+        threshold = precision_bf16 ? 1.5f :
+                    (ref_is_f32 ? 1e-3f : ((H == W) ? 2e-1f : 5e-1f));
+    if (mean_threshold < 0.0f)
+        mean_threshold = precision_bf16 ? 1.5e-2f :
+                         (ref_is_f32 ? 1e-5f : 1e-2f);
 
     cuda_sam3d_body_config cfg = {
         .safetensors_dir = sft_dir,
         .image_size      = W,
+        .image_height    = H,
+        .image_width     = W,
         .device_ordinal  = device,
         .verbose         = verbose,
         .precision       = precision,

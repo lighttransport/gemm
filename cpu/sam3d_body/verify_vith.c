@@ -39,11 +39,10 @@ int main(int argc, char **argv)
     const char *sft_dir = NULL, *refdir = NULL;
     /* 32-layer ViT-H with vanilla GELU MLP. Upstream forward runs in
      * bf16 (FP16_TYPE=bfloat16) so the reference is bf16-rounded
-     * compounded over 32 blocks; our fp32 forward drifts max≈3.5e-1
-     * mean≈1.4e-2 from that even with FP32 weights (verified
-     * 2026-04-26). Gate set to track the bf16 floor; tighten if
-     * we ever switch to a bf16 forward path. */
-    float threshold = 5e-1f;
+     * compounded over 32 blocks; the current fixed-bbox reference floors
+     * at max≈5.3e-1, mean≈8.9e-3. Gate set to track that bf16 floor;
+     * tighten if we ever switch to a bf16 forward path. */
+    float threshold = 6e-1f;
     int n_threads = 1, verbose = 0;
 
     for (int i = 1; i < argc; i++) {

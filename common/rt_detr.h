@@ -326,6 +326,9 @@ float *rt_detr_preprocess_image(const uint8_t *rgb, int w, int h) {
      * RGB is HWC uint8; output is CHW float32 in [0,1]. */
     const float sh = (float)h / (float)S;
     const float sw = (float)w / (float)S;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
     for (int oy = 0; oy < S; oy++) {
         float fy = (oy + 0.5f) * sh - 0.5f;
         int   y0 = (int)floorf(fy);

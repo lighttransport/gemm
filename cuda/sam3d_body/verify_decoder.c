@@ -114,7 +114,7 @@ int main(int argc, char **argv)
     float threshold = 5e-3f;
     int device = 0, verbose = 0;
     int n_threads = 0;
-    const char *precision = "bf16";
+    const char *precision = "fp16";
     cuda_sam3d_body_backbone_t backbone = CUDA_SAM3D_BODY_BACKBONE_DINOV3;
 
     for (int i = 1; i < argc; i++) {
@@ -140,7 +140,7 @@ int main(int argc, char **argv)
     if (!sft_dir || !mhr_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --mhr-assets DIR "
                         "--refdir DIR [--threshold F] [--device N] "
-                        "[--backbone dinov3|vith] [--precision bf16|fp16] "
+                        "[--backbone dinov3|vith] [--precision fp16|bf16] "
                         "[-t N] [-v]\n", argv[0]);
         return 2;
     }
