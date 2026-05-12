@@ -104,12 +104,18 @@ t2_pbr_field t2_pbr_from_decoder(const float *feats, const int32_t *coords,
         f.feats[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 
-    /* Strip batch dimension from coords: [N, 4] -> [N, 3] */
+    /* Strip batch dimension from coords: [N, 4] -> [N, 3].
+     * Reference tex_dec emits cols (batch, X, Y, Z) — verified against
+     * cuda/trellis2/verify-dumps/15_tex_voxels.coords.npy where col1
+     * matches mesh.vertices[0] across all rows. The hash key packs as
+     * (axis0 << 40) | (axis1 << 20) | axis2 and the sampler reads
+     * vertices[0]→x→hash-axis2, vertices[2]→z→hash-axis0; to keep
+     * storage and lookup consistent we put Z at axis0, X at axis2. */
     f.coords = (int32_t *)malloc((size_t)N * 3 * sizeof(int32_t));
     for (int i = 0; i < N; i++) {
-        f.coords[i * 3 + 0] = coords[i * 4 + 1];  /* z */
-        f.coords[i * 3 + 1] = coords[i * 4 + 2];  /* y */
-        f.coords[i * 3 + 2] = coords[i * 4 + 3];  /* x */
+        f.coords[i * 3 + 0] = coords[i * 4 + 3];  /* Z (col3) -> hash axis0 */
+        f.coords[i * 3 + 1] = coords[i * 4 + 2];  /* Y (col2) -> hash axis1 */
+        f.coords[i * 3 + 2] = coords[i * 4 + 1];  /* X (col1) -> hash axis2 */
     }
 
     /* Build hash table */

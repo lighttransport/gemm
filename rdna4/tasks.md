@@ -45,13 +45,21 @@ Snapshot: 2026-05-12. Branch: `trellis2`, ahead of `origin/trellis2` by 1.
       next benchmark. Investigate amdgpu driver state that xmrig leaves
       behind (likely some HSA queue or DMA mapping not cleaned up).
 
-### Output divergence at slow tex_dec (2026-05-13)
-- [ ] v27/v28 report `pbr_res=512, colors=(0,0,0)`; v25 reported
-      `pbr_res=1, colors=(0.541,0.499,0.491)`. tex_slat denorm first8
-      bit-identical → divergence is inside tex_dec. Likely the
-      known Ci=64,Co=64 sparse_conv3d nondeterminism on the final stage
-      — see `project_trellis2_triton_spconv_nondeterminism.md`. Bisect
-      after reboot when tex_dec is reliably fast again.
+### PBR hash axis fix landed — v29 produces real per-vertex texturing
+- [x] Root cause: `t2_pbr_from_decoder` stored col1 (X) at hash axis0
+      while sampler hashed `(vz, vy, vx)` → axis0 is Z. X/Z swapped
+      between storage and lookup. Fix in `common/trellis2_pbr.h`:
+      assign col3→axis0, col1→axis2.
+- [x] v29 validated: 26,698 unique RGBs vs v25's 1. EXIT=0.
+
+### Sparse coverage gap (next)
+- [ ] v29 only colors 6.1% of vertices (31,402 / 513,716). Reference
+      tex_dec produces 1.47M voxels for the same scene; HIP produces
+      513k (3× under-fill). With pbr_res=512, sparse density at 0.4%
+      → most 8-corner lookups find nothing. Fix is to get tex_dec
+      voxel count closer to reference — likely related to the
+      Ci=64,Co=64 sparse_conv nondeterminism in the final stage
+      (see `project_trellis2_triton_spconv_nondeterminism.md`).
 
 ### Stage 1 ConvNeXt A/B test — code ready, blocked on stable fast GPU
 - [ ] `T2_TEX_BLOCK_TIME=1 T2_TEX_BLASLT_SPCONV=0` vs default to compare
