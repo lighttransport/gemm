@@ -1235,6 +1235,14 @@ int main(int argc, char **argv) {
                             now_ms() - t_tdec, N_tex);
                     free(tex_slat);
 
+                    /* DBG: minimal tex_coords zero-count check */
+                    {
+                        int zeroes = 0;
+                        for (int i = 0; i < N_tex; i++) if (tex_coords[i*4+1]==0 && tex_coords[i*4+2]==0 && tex_coords[i*4+3]==0) zeroes++;
+                        if (zeroes > N_tex/2)
+                            fprintf(stderr, "  WARN: %d/%d voxels have coord=(0,0,0) — fast-path corruption\n", zeroes, N_tex);
+                    }
+
                     /* PBR baking. */
                     int max_c = 0;
                     for (int i = 0; i < N_tex; i++)
