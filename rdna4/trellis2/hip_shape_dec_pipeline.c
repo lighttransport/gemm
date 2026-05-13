@@ -1284,6 +1284,14 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     *out_d_coords = (int32_t *)d_coords_out;
     *out_Nf = cur_N;
 
+    /* Drain g_stream BEFORE freeing transient buffers: the d_coords_out
+     * memcpy above is async on g_stream and its source is d_gxc[final],
+     * which we hipFree below. Without this sync, hipFree can unmap the
+     * source pages while the memcpy is still pending → caller reads zeros.
+     * This was the root cause of nondeterministic tex_coord collapse to
+     * (0,0,0) observed across e2e --tex runs. */
+    if (g_stream) hipStreamSynchronize(g_stream);
+
     /* Free transient buffers we own here. The persistent C2S scratch + cached
      * weights are intentionally kept across calls (file-scope state). */
     if (d_slat) hipFree(d_slat);
@@ -1304,7 +1312,6 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
      * the persistent buffer on next call — leak the stage-0 fresh allocation
      * as before. d_coords stage-0 was a fresh upload; same story. */
 
-    if (g_stream) hipStreamSynchronize(g_stream);
     return 0;
 }
 
