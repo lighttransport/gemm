@@ -168,27 +168,31 @@ Steps:
 
 ### A2.3 — wire `--auto-bbox` into CPU runner (DONE 2026-04-26)
 
-`test_sam3d_body --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]
---image IMG ...` now runs RT-DETR-S to get the primary person bbox
-before sam3d_body's encoder. Default detector path is
+`test_sam3d_body --auto-bbox [--auto-bbox-fast] [--rt-detr-model PATH]
+[--auto-thresh F] --image IMG ...` now runs RT-DETR-S to get the
+primary person bbox before sam3d_body's encoder. Default detector path is
 `/mnt/disk01/models/rt_detr_s/model.safetensors`, default threshold
 is 0.5. Tested on `web/public/sam3_compare/person.jpg` → score 0.98,
 bbox (0.1, 5.9, 768.1, 1019.4), final OBJ V=18439 F=36874.
 `-t N` also calls `omp_set_num_threads(N)` before auto-bbox, so the
 existing CPU thread flag now controls RT-DETR preprocess/forward as
-well as the SAM3D-body MHR path.
+well as the SAM3D-body MHR path. `--auto-bbox-fast` skips RT-DETR's
+3-layer decoder and uses encoder proposals; it is faster but can return
+a slightly looser crop, so the full decoder remains the default parity
+path.
 
 ### A2.4 — wire `--auto-bbox` into CUDA runner (DONE 2026-04-26)
 
-`test_cuda_sam3d_body --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]`
-runs RT-DETR-S host-side before the CUDA encoder. It now accepts `-t N`
-and applies it before auto-bbox, giving the CUDA CLI the same control
-over host-side RT-DETR/MHR OpenMP work as the CPU CLI. Detection on the
-person.jpg sample produces score=0.9797 bbox=(0.1, 5.9, 768.1, 1019.4)
-— matches the CPU runner exactly — and the CUDA pipeline emits
-V=18439 F=36874 OBJ. Wall time 8.77s (RT-DETR ~6.9s on 16 threads
-+ CUDA pipeline ~1.9s). RT-DETR stays on CPU; the CUDA TU only
-consumes the resulting bbox.
+`test_cuda_sam3d_body --auto-bbox [--auto-bbox-fast] [--rt-detr-model PATH]
+[--auto-thresh F]` runs RT-DETR-S host-side before the CUDA encoder. It
+now accepts `-t N` and applies it before auto-bbox, giving the CUDA CLI
+the same control over host-side RT-DETR/MHR OpenMP work as the CPU CLI.
+Detection on the person.jpg sample produces score=0.9797 bbox=(0.1,
+5.9, 768.0, 1019.4) and the CUDA pipeline emits V=18439 F=36874 OBJ.
+On sm_120 / 16 CPU threads, full RT-DETR detection measures ~1.94 s;
+`--auto-bbox-fast` uses encoder proposals (`detector=rt-detr-s-encoder`)
+and measures ~1.41 s with bbox=(0.0,0.6,764.2,1021.8). RT-DETR stays on
+CPU; the CUDA TU only consumes the resulting bbox.
 
 Implementation notes: `cuda/sam3d_body/test_cuda_sam3d_body.c`
 includes `common/rt_detr.h` with `RT_DETR_IMPLEMENTATION` defined,
@@ -435,6 +439,33 @@ Current full-pipeline smoke (2026-04-30):
 cpu/sam3d_body/samples/dancing.jpg --bbox 727.537 111.031 1534.146
 1456.042 -o /tmp/sam3d_body_vith_cuda.obj` writes
 `V=18439 F=36874` plus the sidecar JSON.
+
+2026-05-13 update: `SAM3D_BODY_GPU_MHR=1` enables an opt-in hybrid
+GPU MHR path for the CUDA runner. The large MHR/cache tensors are now
+lazy-initialized on the first decoder run instead of during
+`cuda_sam3d_body_create`; warm fixed-bbox CLI `create/load` is back
+under a second, while the first `run_all` reports the one-time
+`mhr_cache` bucket explicitly. Shape/face blends, pose-correctives
+GEMV, rest combine, LBS, keypoint regression, and camera projection run
+on GPU; parameter transform and skeleton walk stay on CPU as a small
+tail after the GPU pose-corrective matvec optimization. The
+production decoder loop now keeps tokens/context/augment on device,
+uses persistent scratch for decoder layers and keypoint-token update,
+and runs row-0 norm/heads on GPU, reading back only pose/camera raw
+vectors for the CPU pose-decode/skeleton stages. `kp_token_update`
+reuses a cached device copy of image embeddings and persistent scratch,
+avoiding repeated per-layer image uploads and alloc/free churn. Dense
+PE now uses a device kernel that writes token-order PE directly from
+the cached Gaussian matrix; first-run `dense_pe` in the DINOv3 GPU-MHR
+path dropped from ~29 ms to ~0.2 ms. The GPU-MHR path also consumes
+encoder `d_proj` directly for ray conditioning and device token-order
+context, so the fixed-bbox timing sample now reports encoder `readback`
+0 ms, `encoder_permute` 0 ms, `ray_cond` ≈4.1 ms, `ctx_permute` ≈0.1
+ms. The production MHR pose-correctives projection now uses a
+row-parallel matvec kernel instead of generic one-thread-per-row GEMM,
+dropping total MHR time from ~34 ms to ~13 ms and the current fixed-bbox
+`run_all` sample to ≈1.29 s. Current DINOv3 and ViT-H raw-image gates
+stay green with kp2d max_abs≈9.9e-3 px and ≈2.1e-2 px.
 
 The user-facing surface caught up:
 - `test_cuda_sam3d_body --backbone vith` no longer prints the

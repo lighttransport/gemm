@@ -17,10 +17,9 @@ x0 y0 x1 y1] [--mhr-assets DIR] [-o body.obj]`. Per-stage
 `/tmp/sam3d_body_ref/*.npy` dumps from `ref/sam3d-body/gen_image_ref.py`.
 
 **User-confirmed (2026-04-25):** DINOv3 backbone first (reuses
-existing `common/dinov3.h`); ViT-H variant deferred. Skip
-detectron2 — user supplies cropped RGB (or full image + bbox).
-CPU first, CUDA follows each stage. Dedicated
-`ref/sam3d-body/.venv`; checkpoints at
+existing `common/dinov3.h`), then ViT-H. Skip detectron2 — user
+supplies cropped RGB (or full image + bbox). CPU first, CUDA follows
+each stage. Dedicated `ref/sam3d-body/.venv`; checkpoints at
 `/mnt/disk01/models/sam3d-body/{dinov3,vith}/`.
 
 ## Concrete architecture (from upstream `sam_3d_body/` package)
@@ -202,7 +201,7 @@ not the C math gate.
 | 4    | CPU promptable decoder + MHR head (verify_decoder green) | shape_params + body_pose + cam diffs ≤ 1e-3 |
 | 5    | CUDA decoder + MHR head                        | **GREEN (2026-04-25)** — all 5a–5g done. `cuda/sam3d_body/verify_decoder` drives full forward (6 GPU decoder layers + per-layer pose-output on CPU MHR + final norm+heads+MHR) and matches PyTorch ref within 5e-3 at every per-layer (kp3d, kp2d_crop, kp2d_depth, cam_t for layers 0..4) and final (pose_raw, cam_raw, kp3d, kp2d_crop, kp2d_depth, cam_t). Final pose_raw max=3.3e-6, head_camera_raw max=5.2e-6 (f32 floor); kp2d_depth/pred_cam_t max ≤ 6.1e-4 (CPU MHR round-off baseline). |
 | 6    | CPU MHR skinning (verify_mhr green)            | vertices max_abs ≤ 1e-3 vs ref |
-| 7    | CUDA MHR skinning                              | **CLOSED 2026-04-25 via CPU parallelization, not GPU port.** Profiling showed `pose_correctives` (55317×3000 dense matvec, 166M FMA) was 99.3% of MHR runtime at 181 ms / 183 ms total. Adding `#pragma omp parallel for` over the row loop (drop `(void)n_threads`) gave 5.9× at 16 threads → MHR drops 183 ms → 31 ms / call → end-to-end CUDA wall 3.47 s → 2.84 s (~18% saved, ~630 ms). CUDA runner now passes `omp_get_max_threads()` to MHR. Numerics match (verify_mhr_stages green: pose_correctives max_abs 5.96e-8; CPU vs CUDA OBJ vertices match to 7e-6). Full GPU port (~1500 NVRTC lines) deferred — cost/benefit no longer favors it. |
+| 7    | CUDA MHR skinning                              | **HYBRID GPU PATH (2026-05-13)**. CPU OpenMP remains the default and now passes `omp_get_max_threads()` to every MHR call, including the final post-loop call (fixed final MHR from ~180 ms serial to ~29 ms at 16 threads). Opt-in `SAM3D_BODY_GPU_MHR=1` lazily caches MHR shape/face/pose/LBS tensors plus `keypoint_mapping` on the first decoder run. Parameter transform + skeleton walk stay on CPU because they are now a small tail; shape/face blends, pose-correctives, rest-vertex combine, LBS skinning, 70-keypoint regression, and camera projection run on GPU. The production decoder loop keeps tokens/context/augment on device, reuses decoder-layer and kp-token-update scratch, runs row-0 norm/heads on GPU with only pose/camera readback, builds dense PE directly on GPU in token order, consumes encoder `d_proj` directly for ray conditioning + token-order context (`readback` 0 ms, `encoder_permute` 0 ms, `ray_cond` ≈4.7 ms, `ctx_permute` ≈0.1 ms), and uses a row-parallel MHR pose-corrective matvec (`mhr` ≈34 ms → ≈13 ms total). On sm_120 / 16 CPU threads, fixed-bbox CUDA CLI startup no longer pays the MHR cache (`create/load` warm ≈866 ms); first `run_all` reports `mhr_cache` ≈159 ms, decoder layers ≈92 ms, norm/heads ≈1.3 ms, MHR ≈13.1 ms, keypoints+projection ≈1 ms, `kp_update` ≈0.22 ms, and total `run_all` ≈1.29 s. DINOv3 and ViT-H raw-image gates pass (`kp2d` max_abs≈9.9e-3 px and ≈2.1e-2 px), and `cuda/sam3d_body/verify_mhr` covers blend_shape, face_expressions, pose_correctives, and LBS helper kernels. |
 | 8    | End-to-end CPU → .obj (verify_end_to_end green)| **GREEN (ref-driven + self-driven)**: ref-driven (8c-i + 8d) vs `body_out_vertices.npy` max_abs=8.9e-7 / `body_out_keypoints_3d.npy` max_abs=3.6e-7 / `body_out_keypoints_2d.npy` max_abs=3.1e-4 px. Self-driven DINOv3 and float32-ref ViT-H raw-image modes default to 0.02 / 0.5 px gates and pass their fixed-bbox dumps without manual threshold flags. Legacy BF16 ViT-H refs auto-select looser verifier defaults when thresholds are omitted. |
 | 9    | End-to-end CUDA → .obj                         | **GREEN (2026-05-12)**: `test_cuda_sam3d_body` produces V=18439/F=36874 OBJ matching CPU port to float noise on the same input. `cuda/sam3d_body/verify_end_to_end` now uses the same raw-image default gates as CPU for float32 refs: DINOv3/ViT-H 0.02 / 0.5 px. Both pass their matching fixed-bbox dumps without manual threshold flags. Cross-port pitfalls fixed: host OpenCV-exact `sam3d_body_preprocess_image`, final `pred_vertices` Y/Z negation, rectangular DINOv3 ray-cond reinterpret, ViT-H square decoder-camera geometry, and the no-mask prompt embedding before ray conditioning. |
 | 10   | Shared infra: promote `common/npy_io.h` + `common/qtensor_utils.h` | **GREEN (2026-04-25)** for `npy_io.h` — single canonical reader at `common/npy_io.h`; 18 cpu/sam3d_body + 8 cuda/sam3d_body verify_*.c sources + `test_sam3d_body.c` now `#include` it instead of inlining. `cpu/sam3d/verify_npy.h` reduced to a back-compat shim. `qtensor_utils.h` deferred (no second consumer yet). |
@@ -313,8 +312,10 @@ decoder/MHR code isn't wired in the C runner).
   preprocess interpolation and rectangular DINOv3 ray-cond geometry; the
   final sub-pixel drift was the missing no-mask prompt embedding added
   before `ray_cond_emb`.
-- **RT-DETR auto-bbox threading.** `rt_detr_preprocess_image` is
-  OpenMP-parallel over output rows, and both CPU/CUDA SAM3D-body CLIs
-  call `omp_set_num_threads()` from `-t N` before auto-bbox. A local
-  8-thread smoke measured RT-DETR preprocess at 1.872 ms; forward still
-  dominates at 4.793 s.
+- **RT-DETR auto-bbox threading and fast proposals.**
+  `rt_detr_preprocess_image` is OpenMP-parallel over output rows, and
+  both CPU/CUDA SAM3D-body CLIs call `omp_set_num_threads()` from `-t N`
+  before auto-bbox. `--auto-bbox-fast` skips RT-DETR's 3-layer decoder
+  and returns encoder proposals (`detector=rt-detr-s-encoder`); on the
+  person_portrait smoke at 16 CPU threads this reduces detector time
+  from ~1.94 s to ~1.41 s, with a slightly looser full-person bbox.
