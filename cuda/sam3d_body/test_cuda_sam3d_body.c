@@ -49,7 +49,8 @@ static void print_usage(const char *prog)
     fprintf(stderr,
             "Usage:\n"
             "  %s --safetensors-dir DIR --image IMG.jpg --mhr-assets DIR "
-            "[--bbox x0 y0 x1 y1 | --auto-bbox [--rt-detr-model PATH] [--auto-thresh F]] "
+            "[--bbox x0 y0 x1 y1 | --auto-bbox [--auto-bbox-fast] "
+            "[--rt-detr-model PATH] [--auto-thresh F]] "
             "[--focal F] [-o body.obj] "
             "[--backbone dinov3|vith] "
             "[--precision fp16|bf16] [--device N] [-t N] [-v]\n"
@@ -159,6 +160,7 @@ int main(int argc, char **argv)
     int device = 0, verbose = 0;
     int n_threads = 0;
     int auto_bbox = 0;
+    int auto_bbox_fast = 0;
     int auto_bbox_used = 0;
     float auto_bbox_score = 0.0f;
     const char *rt_detr_model = "/mnt/disk01/models/rt_detr_s/model.safetensors";
@@ -187,6 +189,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-o")           && i+1 < argc) out_path   = argv[++i];
         else if (!strcmp(a, "-v"))                         verbose    = 1;
         else if (!strcmp(a, "--auto-bbox"))                auto_bbox  = 1;
+        else if (!strcmp(a, "--auto-bbox-fast")) { auto_bbox = 1; auto_bbox_fast = 1; }
         else if (!strcmp(a, "--rt-detr-model") && i+1 < argc) rt_detr_model = argv[++i];
         else if (!strcmp(a, "--auto-thresh")   && i+1 < argc) auto_thresh   = strtof(argv[++i], NULL);
         else if (!strcmp(a, "--backbone") && i+1 < argc) {
@@ -219,6 +222,8 @@ int main(int argc, char **argv)
     t_decode_image_ms = cli_time_ms() - t0;
 
     if (auto_bbox && !has_bbox) {
+        if (auto_bbox_fast)
+            setenv("RT_DETR_ENCODER_ONLY", "1", 1);
         const double t_auto0 = cli_time_ms();
         t0 = cli_time_ms();
         rt_detr_t *det = rt_detr_load(rt_detr_model);
@@ -247,8 +252,9 @@ int main(int argc, char **argv)
         auto_bbox_used = 1;
         auto_bbox_score = box.score;
         fprintf(stderr, "[test_cuda_sam3d_body] auto-bbox: "
-                "detector=rt-detr-s score=%.4f threshold=%.3f image=%dx%d "
+                "detector=rt-detr-s%s score=%.4f threshold=%.3f image=%dx%d "
                 "bbox=(%.1f,%.1f,%.1f,%.1f)\n",
+                auto_bbox_fast ? "-encoder" : "",
                 box.score, auto_thresh, iw, ih,
                 box.x0, box.y0, box.x1, box.y1);
         t_auto_bbox_ms = cli_time_ms() - t_auto0;
