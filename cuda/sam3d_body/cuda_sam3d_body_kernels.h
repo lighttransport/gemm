@@ -194,6 +194,36 @@ static const char cuda_sam3d_body_kernels_src[] =
     "    }\n"
     "}\n"
 
+    /* encoder_tokens_to_preconv_nomask_f32
+     *
+     * Builds the image-token rows of ray_cond_emb's preconv buffer directly
+     * from final encoder tokens: out[c, n] = tokens[n_prefix + n, c] + no_mask[c].
+     */
+    "__global__ void encoder_tokens_to_preconv_nomask_f32(float *out_chw,\n"
+    "                                                     const float *tokens,\n"
+    "                                                     const float *no_mask,\n"
+    "                                                     int n_prefix,\n"
+    "                                                     int N, int D) {\n"
+    "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    int total = N * D;\n"
+    "    if (idx >= total) return;\n"
+    "    int n = idx / D;\n"
+    "    int c = idx - n * D;\n"
+    "    out_chw[(size_t)c * N + n] = tokens[(size_t)(n_prefix + n) * D + c] + no_mask[c];\n"
+    "}\n"
+
+    /* chw_to_tok_f32: out[n, c] = in[c, n]. */
+    "__global__ void chw_to_tok_f32(float *out_tok,\n"
+    "                               const float *in_chw,\n"
+    "                               int N, int D) {\n"
+    "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    int total = N * D;\n"
+    "    if (idx >= total) return;\n"
+    "    int n = idx / D;\n"
+    "    int c = idx - n * D;\n"
+    "    out_tok[(size_t)n * D + c] = in_chw[(size_t)c * N + n];\n"
+    "}\n"
+
     /* conv1x1_chw_f32
      *
      * 1×1 conv with F32 weights. Y(C_out, N) = W(C_out, C_in) @ X(C_in, N).
@@ -521,7 +551,7 @@ static const char cuda_sam3d_body_kernels_src[] =
     "    V[idx] = qkv[row3 + (size_t)(2 * dim) + (size_t)d];\n"
     "}\n"
 
-    /* mhr_blend_combine_f32 — speculative MHR-on-GPU (Step 7).
+    /* mhr_blend_combine_f32 — MHR-on-GPU helper.
      *
      * Computes  out[i] = (base ? base[i] : 0) + sum_n coeffs[n] * vectors[n*V_d + i]
      * where i ∈ [0, V_d). Used by:
@@ -545,7 +575,7 @@ static const char cuda_sam3d_body_kernels_src[] =
     "    out[i] = acc;\n"
     "}\n"
 
-    /* mhr_lbs_skin_f32 — speculative MHR-on-GPU (LBS / Stage 11).
+    /* mhr_lbs_skin_f32 — MHR-on-GPU LBS / Stage 11 helper.
      *
      * Per-skin-entry scatter-add: out[v] += w * skel_transform_point(jstate[j], rv[v]).
      *   skel_state layout (8 floats): [tx, ty, tz,  qx, qy, qz, qw,  scale].
@@ -603,6 +633,147 @@ static const char cuda_sam3d_body_kernels_src[] =
     "    atomicAdd(out_verts + (size_t)v * 3 + 0, w * tx);\n"
     "    atomicAdd(out_verts + (size_t)v * 3 + 1, w * ty);\n"
     "    atomicAdd(out_verts + (size_t)v * 3 + 2, w * tz);\n"
+    "}\n"
+
+    /* mhr_matvec_f32 — row-parallel Y = W @ X for production pose-correctives.
+     *
+     * The generic gemm_f32_bias path assigns one thread to each output row,
+     * which serializes all 3000 FMAs for the 55317-row MHR projection. This
+     * kernel uses one block per row and reduces across D_in in shared memory.
+     */
+    "__global__ void mhr_matvec_f32(float *Y,\n"
+    "                               const float *W,\n"
+    "                               const float *X,\n"
+    "                               int D_in, int D_out) {\n"
+    "    int row = blockIdx.x;\n"
+    "    if (row >= D_out) return;\n"
+    "    int tid = threadIdx.x;\n"
+    "    float acc = 0.0f;\n"
+    "    const float *wr = W + (size_t)row * D_in;\n"
+    "    for (int k = tid; k < D_in; k += blockDim.x) acc += wr[k] * X[k];\n"
+    "    __shared__ float red[256];\n"
+    "    red[tid] = acc;\n"
+    "    __syncthreads();\n"
+    "    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {\n"
+    "        if (tid < stride) red[tid] += red[tid + stride];\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    if (tid == 0) Y[row] = red[0];\n"
+    "}\n"
+
+    /* mhr_keypoints_from_mesh_f32 — Stage 12 keypoint regression.
+     *
+     * Computes the body path of sam3d_body_keypoints_from_mesh for the first
+     * 70 rows of keypoint_mapping. Inputs are still in MHR centimeters; the
+     * kernel scales to meters and applies the camera-frame y/z flip on output.
+     */
+    "__global__ void mhr_keypoints_from_mesh_f32(float *out_kp3d,\n"
+    "                                           const float *verts_cm,\n"
+    "                                           const float *global_skel_cm,\n"
+    "                                           const float *keypoint_mapping,\n"
+    "                                           int V, int J, int K) {\n"
+    "    int idx = blockIdx.x;\n"
+    "    if (idx >= K * 3) return;\n"
+    "    int k = idx / 3;\n"
+    "    int c = idx - k * 3;\n"
+    "    int VJ = V + J;\n"
+    "    const float *Wk = keypoint_mapping + (size_t)k * VJ;\n"
+    "    double acc = 0.0;\n"
+    "    for (int i = threadIdx.x; i < V; i += blockDim.x)\n"
+    "        acc += (double)Wk[i] * (double)(verts_cm[(size_t)i * 3 + c] * 0.01f);\n"
+    "    for (int j = threadIdx.x; j < J; j += blockDim.x)\n"
+    "        acc += (double)Wk[V + j] * (double)(global_skel_cm[(size_t)j * 8 + c] * 0.01f);\n"
+    "    __shared__ double red[256];\n"
+    "    int tid = threadIdx.x;\n"
+    "    red[tid] = acc;\n"
+    "    __syncthreads();\n"
+    "    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {\n"
+    "        if (tid < stride) red[tid] += red[tid + stride];\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    if (tid != 0) return;\n"
+    "    float v = (float)red[0];\n"
+    "    out_kp3d[idx] = (c == 0) ? v : -v;\n"
+    "}\n"
+
+    /* mhr_camera_project_f32 — camera_project + full_to_crop for K keypoints. */
+    "__global__ void mhr_camera_project_f32(const float *kp3d,\n"
+    "                                      float *kp2d_full,\n"
+    "                                      float *kp2d_crop,\n"
+    "                                      float *kp2d_depth,\n"
+    "                                      float *pred_cam_t,\n"
+    "                                      float pred0, float pred1, float pred2,\n"
+    "                                      float bbox_scale, float bbox_cx, float bbox_cy,\n"
+    "                                      float ori_w, float ori_h,\n"
+    "                                      float img_w, float img_h,\n"
+    "                                      float k00, float k01, float k02,\n"
+    "                                      float k10, float k11, float k12,\n"
+    "                                      float k02_center, float k12_center,\n"
+    "                                      float a00, float a01, float a02,\n"
+    "                                      float a10, float a11, float a12,\n"
+    "                                      int use_intrin_center, int K) {\n"
+    "    int k = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    float s = -pred0;\n"
+    "    float tx = pred1;\n"
+    "    float ty = -pred2;\n"
+    "    float bs = bbox_scale * s + 1.0e-8f;\n"
+    "    float tz = 2.0f * k00 / bs;\n"
+    "    float cx, cy;\n"
+    "    if (!use_intrin_center) {\n"
+    "        cx = 2.0f * (bbox_cx - ori_w * 0.5f) / bs;\n"
+    "        cy = 2.0f * (bbox_cy - ori_h * 0.5f) / bs;\n"
+    "    } else {\n"
+    "        cx = 2.0f * (bbox_cx - k02_center) / bs;\n"
+    "        cy = 2.0f * (bbox_cy - k12_center) / bs;\n"
+    "    }\n"
+    "    float ct0 = tx + cx, ct1 = ty + cy, ct2 = tz;\n"
+    "    if (k == 0 && pred_cam_t) { pred_cam_t[0] = ct0; pred_cam_t[1] = ct1; pred_cam_t[2] = ct2; }\n"
+    "    if (k >= K) return;\n"
+    "    float p0 = kp3d[(size_t)k * 3 + 0] + ct0;\n"
+    "    float p1 = kp3d[(size_t)k * 3 + 1] + ct1;\n"
+    "    float p2 = kp3d[(size_t)k * 3 + 2] + ct2;\n"
+    "    if (kp2d_depth) kp2d_depth[k] = p2;\n"
+    "    float invz = 1.0f / p2;\n"
+    "    float xn = p0 * invz, yn = p1 * invz;\n"
+    "    float u = k00 * xn + k01 * yn + k02;\n"
+    "    float v = k10 * xn + k11 * yn + k12;\n"
+    "    if (kp2d_full) { kp2d_full[(size_t)k * 2 + 0] = u; kp2d_full[(size_t)k * 2 + 1] = v; }\n"
+    "    if (kp2d_crop) {\n"
+    "        float ax = a00 * u + a01 * v + a02;\n"
+    "        float ay = a10 * u + a11 * v + a12;\n"
+    "        kp2d_crop[(size_t)k * 2 + 0] = ax / img_w - 0.5f;\n"
+    "        kp2d_crop[(size_t)k * 2 + 1] = ay / img_h - 0.5f;\n"
+    "    }\n"
+    "}\n"
+
+    /* dense_pe_tok_f32 — SAM random Fourier dense PE in token order (HW, C).
+     *
+     * Mirrors sam3d_body_get_dense_pe, but writes the layout consumed by the
+     * decoder cross-attention directly so the GPU decoder path avoids a host
+     * CHW build + transpose + upload.
+     */
+    "__global__ void dense_pe_tok_f32(float *out,\n"
+    "                                 const float *G,\n"
+    "                                 int H, int W, int npf,\n"
+    "                                 int use_square_x) {\n"
+    "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    int total = H * W * npf;\n"
+    "    if (idx >= total) return;\n"
+    "    int k = idx % npf;\n"
+    "    int p = idx / npf;\n"
+    "    int yi = p / W;\n"
+    "    int xi = p - yi * W;\n"
+    "    float yn = ((float)yi + 0.5f) / (float)H;\n"
+    "    float ys = 2.0f * yn - 1.0f;\n"
+    "    float x_offset = (use_square_x && W != H) ? (0.5f * (float)(H - W)) : 0.0f;\n"
+    "    float xn = (use_square_x && W != H)\n"
+    "        ? (((float)xi + x_offset + 0.5f) / (float)H)\n"
+    "        : (((float)xi + 0.5f) / (float)W);\n"
+    "    float xs = 2.0f * xn - 1.0f;\n"
+    "    float v = (xs * G[k] + ys * G[npf + k]) * 6.2831853071795864769f;\n"
+    "    size_t base = (size_t)p * (size_t)(npf * 2);\n"
+    "    out[base + (size_t)k] = sinf(v);\n"
+    "    out[base + (size_t)(npf + k)] = cosf(v);\n"
     "}\n"
 
     "}  /* close extern \"C\" from cuda_kernels_common_src */\n";
