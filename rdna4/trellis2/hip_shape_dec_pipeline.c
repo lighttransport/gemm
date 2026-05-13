@@ -1168,25 +1168,11 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     }
     int cur_N = N;
     /* Forward through all stages. */
-    /* On RDNA4/ROCm 7.2.2, e2e --tex on the fast path produces all-zero
-     * final coords while slow path produces correct output. The slow path
-     * effectively serializes kernels; the fast path races somewhere. Force
-     * per-stage stream-sync inside tex_dec (cache != NULL) to mimic slow-
-     * path serialization without paying the full mclk penalty.
-     * Opt-out: T2_TEX_PER_STAGE_SYNC=0. */
-    static int s_per_stage_sync = -1;
-    if (s_per_stage_sync < 0) {
-        const char *e = getenv("T2_TEX_PER_STAGE_SYNC");
-        s_per_stage_sync = (e && atoi(e) == 0) ? 0 : 1;
-    }
-    int do_per_stage_sync = (cache != NULL) && s_per_stage_sync;
-
     for (int s = 0; s < dec->n_stages; s++) {
         int nc = dec->n_convnext[s]; int ch = dec->channels[s];
         if (ctx->verbose)
             fprintf(stderr, "stage %d: %d ConvNeXt(C=%d), N=%d\n", s, nc, ch, cur_N);
         if (s_stage_time && g_stream) hipStreamSynchronize(g_stream);
-        if (do_per_stage_sync && g_stream) hipStreamSynchronize(g_stream);
         double cn_t0 = s_stage_time ? now_ms() : 0;
         for (int b = 0; b < nc; b++) {
             run_convnext(k, &dec->convnext[s][b], ch, cur_N,
@@ -1267,7 +1253,6 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
             d_feats = ds.feats; d_coords = ds.coords;
             d_keys = ds.keys; d_vals = ds.vals; cap_mask = ds.cap_mask; cur_N = ds.N;
         }
-        if (do_per_stage_sync && g_stream) hipStreamSynchronize(g_stream);
     }
 
     /* output_layer (LN + linear). */
