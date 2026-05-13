@@ -2383,13 +2383,6 @@ int hip_trellis2_run_tex_dec(hip_trellis2_runner *r,
                         "is available — run shape_dec first\n");
         return -1;
     }
-    /* Drain ALL outstanding GPU work before tex_dec starts. Prior tex DiT
-     * runs on a different stream (r->stream); without a device-wide sync
-     * those writes can race with tex_dec's cache uploads. Slow tex_dec
-     * (mclk 96 MHz) produces correct output; fast tex_dec collapses coords
-     * to (0,0,0) — symptom of a cross-stream race that slow execution
-     * masks. Force a hard barrier here. */
-    hipDeviceSynchronize();
     int rc = hip_shape_dec_forward_ex(r->tex_dec_ctx, slat_feats, coords,
                                        N, slat_C, cache,
                                        &d_feats, &d_coords, &Nf);
