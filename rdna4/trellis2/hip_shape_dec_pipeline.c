@@ -1275,8 +1275,13 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
      * scratch chain. We need a fresh buffer the caller can hipFree. */
     void *d_coords_out = NULL;
     hipMalloc(&d_coords_out, (size_t)cur_N * 4 * sizeof(int32_t));
-    hipMemcpyAsync(d_coords_out, d_coords, (size_t)cur_N * 4 * sizeof(int32_t),
-                   hipMemcpyDeviceToDevice, g_stream);
+    /* Sync the stream first then do a SYNC D2D copy on the default stream
+     * (which serializes with everything by default). hipMemcpyAsync on
+     * g_stream + hipStreamSync was not reliable on RDNA4/ROCm 7.2.2 for
+     * D2D over multi-MB buffers — saw all-zero coords on readback. */
+    if (g_stream) hipStreamSynchronize(g_stream);
+    hipMemcpy(d_coords_out, d_coords, (size_t)cur_N * 4 * sizeof(int32_t),
+              hipMemcpyDeviceToDevice);
 
     /* Ditto for d_out: callers expect to own this; transfer ownership of
      * d_out_persist directly. */
