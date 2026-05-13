@@ -45,6 +45,28 @@ Snapshot: 2026-05-12. Branch: `trellis2`, ahead of `origin/trellis2` by 1.
       next benchmark. Investigate amdgpu driver state that xmrig leaves
       behind (likely some HSA queue or DMA mapping not cleaned up).
 
+### tex_dec post-first-run degradation is NOT just mclk (2026-05-13)
+- [ ] Even with `power_dpm_force_performance_level=high` (mclk pinned at
+      level 4 = 1124 MHz, sclk 2391 MHz, GPU 100%), tex_dec stage 3 c2s
+      stalls for 5+ min on v42, v43, v44 — including baseline binary with
+      no recent code changes. Only the FIRST tex_dec invocation per boot
+      is fast (~3 s); subsequent runs degrade dramatically regardless of
+      mclk state. Hypothesis: HSA queue, kernel module cache, or some
+      driver-internal counter gets into a degraded state on first
+      tex_dec dispatch. Investigate amdgpu kfd queue state via `dmesg`,
+      `rocm-smi --showevents`, or kernel module reload between runs.
+
+### Correctness-vs-speed correlation (2026-05-13, v37 vs v39)
+- [ ] v37 fast tex_dec (3.1 s, mclk 1258): voxel_res=1, 1 unique color
+      (CORRUPTED). v39 slow tex_dec (1115 s, mclk 96): voxel_res=512,
+      26,698 unique colors (CORRECT). Same code, same inputs — only
+      execution speed differs. Slow path effectively serializes
+      operations and avoids whatever race the fast path hits. Cache
+      uploads are correct in both cases (probed). Cross-stream
+      serialization attempt (`b1e4747`) was reverted in `289bde9` —
+      the added syncs didn't visibly help correctness and couldn't be
+      validated due to the degradation issue above.
+
 ### PBR hash axis fix landed — v29 produces real per-vertex texturing
 - [x] Root cause: `t2_pbr_from_decoder` stored col1 (X) at hash axis0
       while sampler hashed `(vz, vy, vx)` → axis0 is Z. X/Z swapped
@@ -52,14 +74,31 @@ Snapshot: 2026-05-12. Branch: `trellis2`, ahead of `origin/trellis2` by 1.
       assign col3→axis0, col1→axis2.
 - [x] v29 validated: 26,698 unique RGBs vs v25's 1. EXIT=0.
 
-### Sparse coverage gap (next)
-- [ ] v29 only colors 6.1% of vertices (31,402 / 513,716). Reference
-      tex_dec produces 1.47M voxels for the same scene; HIP produces
-      513k (3× under-fill). With pbr_res=512, sparse density at 0.4%
-      → most 8-corner lookups find nothing. Fix is to get tex_dec
-      voxel count closer to reference — likely related to the
-      Ci=64,Co=64 sparse_conv nondeterminism in the final stage
-      (see `project_trellis2_triton_spconv_nondeterminism.md`).
+### Subdiv coord free-before-sync race fixed (commit 9817f66)
+- [x] `hip_shape_dec_forward_ex` queued an async D2D memcpy of the
+      final coords on g_stream then `hipFree(d_gxc[s])` synchronously
+      before draining → caller read zeros → tex_coords collapse to
+      (0,0,0) → PBR flat color. Fix: hoist `hipStreamSynchronize` to
+      before the hipFree loop. v25 and v30 both hit it; v29 won the
+      race by luck.
+
+### Sparse coverage gap — bisected to stage-0 to_subdiv
+- [ ] HIP shape_dec stage-0 keeps only 53% of children reference keeps
+      (×2.52 vs ref ×4.78). Stage 2 also under (×3.04 vs ×4.47). Stages
+      1, 3 within ±10%. Hypothesis: `to_subdiv` logits at C=1024 are
+      damped → fewer pass the `logits > 0` threshold. Likely an
+      upstream feature-magnitude clamp in the ConvNeXt path (matches
+      tex_dec outlier memo: HIP bounded to ±1, ref ±700). Next:
+      capture stage-0 host logits, compare distributions vs reference.
+
+### MCLK lever even less reliable than documented
+- [ ] Post-reboot, v30 (first run) tex_dec ran fast end-to-end; v31
+      one minute later stalled stage-3 c2s with mclk pinned 96 MHz,
+      sclk 2195 MHz, GPU 100%. Previous "long uptime / post-xmrig"
+      theory was too narrow; even back-to-back runs from clean reboot
+      can lose the lever. Investigate HSA queue state across
+      `hip_trellis2_runner` re-creation; the runner is destroyed +
+      rebuilt between SS DiT, shape_dec, tex DiT, tex_dec phases.
 
 ### Stage 1 ConvNeXt A/B test — code ready, blocked on stable fast GPU
 - [ ] `T2_TEX_BLOCK_TIME=1 T2_TEX_BLASLT_SPCONV=0` vs default to compare
