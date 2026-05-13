@@ -162,13 +162,12 @@ int cuda_sam3d_body_debug_run_norm_and_heads(cuda_sam3d_body_ctx *ctx,
                                              float *pose_raw,
                                              float *cam_raw);
 
-/* Speculative MHR-on-GPU helpers (exploratory — off the production path).
+/* MHR-on-GPU helper coverage.
  *
- * Step 7 was officially closed via CPU OpenMP parallelization (see PORT.md).
- * These helpers exist to validate the GPU implementation of MHR's largest
- * GEMVs and are not weight-cached (each call uploads weights). All require
- * mhr_assets_dir to be passed to cuda_sam3d_body_create. Outputs match
- * the CPU counterparts:
+ * Production run_decoder can use a lazy cached hybrid GPU MHR/keypoint path
+ * when SAM3D_BODY_GPU_MHR=1. These debug helpers remain isolated verifier
+ * APIs; they upload weights per call and require mhr_assets_dir at create time.
+ * Outputs match the CPU counterparts:
  *   sam3d_body_mhr_blend_shape       — (B=1, V*3=55317) f32
  *   sam3d_body_mhr_face_expressions  — (B=1, V*3=55317) f32
  *   sam3d_body_mhr_pose_correctives  — (B=1, V*3=55317) f32

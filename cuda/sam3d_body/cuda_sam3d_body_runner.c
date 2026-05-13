@@ -194,6 +194,7 @@ typedef struct {
     void *kp3d_posemb_l1_w, *kp3d_posemb_l1_b;       /* (1024, 1024) */
     void *prompt_pe_gauss;       /* (2, 640) — for get_dense_pe */
     void *invalid_point_embed;   /* (1, 1280) */
+    void *no_mask_embed;         /* (1, 1280) */
     const float *no_mask_embed_h; /* (1, 1280) host view, st_context-owned */
 
     sb_dec_layer_w layers[SB_DEC_LAYERS];
@@ -242,6 +243,26 @@ typedef struct {
     int    n, c;
 } f32_2d;
 
+typedef struct {
+    void *xpe_n, *cpe_n, *x_ln, *qk;
+    void *Q, *K, *V, *attn, *proj;
+    void *x1, *q_in, *k_in, *ctx_ln;
+    void *x2, *x_ln3, *ffn_h, *ffn_o;
+} sb_dec_layer_scratch_dev;
+
+typedef struct {
+    void *gxy, *invalid;
+    void *p_h, *p_o;
+    void *kp_feats, *kp_proj;
+    void *kp3d_norm, *p3_h, *p3_o;
+} sb_kpu_scratch_dev;
+
+typedef struct {
+    void *norm_row;
+    void *pose_h, *pose_raw;
+    void *cam_h, *cam_raw;
+} sb_head_scratch_dev;
+
 struct cuda_sam3d_body_ctx {
     cuda_sam3d_body_config cfg;
     int device_id;
@@ -254,16 +275,20 @@ struct cuda_sam3d_body_ctx {
     hipFunction_t fn_ln, fn_gemm_tiled;
     hipFunction_t fn_rope_qk, fn_kv_tx, fn_fa;
     hipFunction_t fn_silu_mul, fn_layerscale_add;
-    hipFunction_t fn_ray_cond_fourier, fn_conv1x1_chw, fn_ln_chw;
+    hipFunction_t fn_ray_cond_fourier, fn_encoder_to_preconv, fn_chw_to_tok;
+    hipFunction_t fn_conv1x1_chw, fn_ln_chw;
     hipFunction_t fn_linear_bias;
     hipFunction_t fn_gemm_f32, fn_add_two, fn_add_inplace, fn_gelu_inplace, fn_sdpa;
     hipFunction_t fn_relu_inplace, fn_grid_sample, fn_kp_pelvis_norm,
-                  fn_augment_overwrite_mask;
+                  fn_augment_overwrite_mask, fn_dense_pe_tok;
     /* ViT-H specific kernels. */
     hipFunction_t fn_patch_pad2, fn_pos_embed_vith, fn_qkv_split;
-    /* MHR-on-GPU (Step 7 — speculative). */
+    /* MHR-on-GPU helper kernels. */
     hipFunction_t fn_mhr_blend;
     hipFunction_t fn_mhr_lbs;
+    hipFunction_t fn_mhr_matvec;
+    hipFunction_t fn_mhr_keypoints;
+    hipFunction_t fn_mhr_project;
     st_context *st_enc;
     int weights_ready;
 
@@ -287,11 +312,46 @@ struct cuda_sam3d_body_ctx {
     sb_dec_w    dec;
 
     /* CPU model + MHR assets — used in the per-layer decoder loop for
-     * decode_pose_raw / mhr_forward / keypoints_from_mesh /
-     * camera_project (Step 9). MHR skinning on GPU lives in Step 7
-     * (deferred). cpu_mhr is NULL until cfg.mhr_assets_dir is set. */
+     * decode_pose_raw, hybrid/CPU mhr_forward, keypoints_from_mesh, and
+     * camera_project. cpu_mhr is NULL until cfg.mhr_assets_dir is set. */
     sam3d_body_decoder_model *cpu_dec;
     sam3d_body_mhr_assets    *cpu_mhr;
+
+    /* Optional production hybrid GPU MHR path, requested with
+     * SAM3D_BODY_GPU_MHR=1. Static shape/face/pose/LBS/keypoint tensors are
+     * uploaded lazily on first decoder use; small parameter/skeleton stages
+     * remain on host. */
+    int      mhr_gpu_requested;
+    int      mhr_gpu_enabled;
+    void    *d_mhr_pc_linear_weight;    /* (55317, 3000) f32 */
+    void    *d_mhr_pc_h;                /* (3000,) f32 scratch */
+    void    *d_mhr_pc_out;              /* (55317,) f32 scratch */
+    void    *d_mhr_shape_coeffs;        /* (45,) f32 scratch */
+    void    *d_mhr_face_coeffs;         /* (72,) f32 scratch */
+    void    *d_mhr_jstate;              /* (127, 8) f32 scratch */
+    void    *d_mhr_blend_vectors;       /* (45, 55317) f32 */
+    void    *d_mhr_blend_base;          /* (55317,) f32 */
+    void    *d_mhr_face_vectors;        /* (72, 55317) f32 */
+    void    *d_mhr_skin_indices;        /* (51337,) i32 */
+    void    *d_mhr_skin_weights;        /* (51337,) f32 */
+    void    *d_mhr_vert_indices;        /* (51337,) i64 */
+    void    *d_mhr_rest;                /* (55317,) f32 scratch */
+    void    *d_mhr_face;                /* (55317,) f32 scratch */
+    void    *d_mhr_skinned;             /* (55317,) f32 scratch */
+    void    *d_mhr_gskel;               /* (127, 8) f32 scratch */
+    void    *d_mhr_keypoint_mapping;    /* (308, 18566) f32 */
+    void    *d_mhr_kp3d;                /* (70, 3) f32 scratch */
+    void    *d_mhr_kp2d_full;           /* (70, 2) f32 scratch */
+    void    *d_mhr_kp2d_crop;           /* (70, 2) f32 scratch */
+    void    *d_mhr_kp2d_depth;          /* (70,) f32 scratch */
+    void    *d_mhr_pred_cam_t;          /* (3,) f32 scratch */
+    void    *d_kpu_img;                 /* cached img_emb for kp_token_update */
+    size_t   d_kpu_img_cap;
+    int      kpu_use_cached_img;
+    float   *dense_pe_tok_h;            /* cached dense PE in token form */
+    int      dense_pe_gh, dense_pe_gw, dense_pe_dc;
+    void    *d_dense_pe_tok;            /* cached dense PE in token form */
+    size_t   d_dense_pe_tok_bytes;
 
     /* device runtime buffers. */
     void    *d_img_u8;  size_t img_u8_cap;   /* (Hin, Win, 3) u8, host-resized */
@@ -321,6 +381,7 @@ struct cuda_sam3d_body_ctx {
     float    self_cam_int[9];
 
     f32_2d   encoder_tokens;
+    int      encoder_tokens_dev_valid;
     float   *mhr_params;   int mhr_params_n;
     float    cam_t[3];
     float    focal_px;
@@ -329,6 +390,44 @@ struct cuda_sam3d_body_ctx {
     float   *keypoints_3d; int n_kp_3d;
     float   *keypoints_2d; int n_kp_2d;
 };
+
+static int cuda_sam3d_body_mhr_forward_hybrid(
+        cuda_sam3d_body_ctx *ctx,
+        const float *model_params, const float *shape, const float *face,
+        int apply_correctives, int n_threads, float *scratch,
+        float *out_skinned_verts, float *out_global_skel);
+static int cuda_sam3d_body_keypoints_project_cached(
+        cuda_sam3d_body_ctx *ctx,
+        const float *global_skel_cm,
+        const float *pred_cam,
+        const sam3d_body_camera_batch *batch,
+        float *kp3d_host,
+        float *kp2d_full_host,
+        float *kp2d_crop_host,
+        float *kp2d_depth_host,
+        float *pred_cam_t_host);
+static int cuda_sam3d_body_ensure_mhr_gpu_cache(cuda_sam3d_body_ctx *ctx);
+static int cuda_sam3d_body_run_decoder_layer_dev(
+        cuda_sam3d_body_ctx *ctx, int layer_idx,
+        void *d_x, const void *d_ctx, void *d_xpe, const void *d_cpe,
+        int N_q, int N_c, void *d_out,
+        sb_dec_layer_scratch_dev *S);
+static int cuda_sam3d_body_kp_token_update_dev(
+        cuda_sam3d_body_ctx *ctx, int layer_idx, int H, int W, int N_q,
+        const float *kp2d_cropped_host, const float *kp2d_depth_host,
+        const void *d_img_chw, void *d_tokens, void *d_aug,
+        sb_kpu_scratch_dev *S);
+static int cuda_sam3d_body_norm_heads_dev(
+        cuda_sam3d_body_ctx *ctx, const void *d_tokens,
+        float *pose_raw_host, float *cam_raw_host,
+        sb_head_scratch_dev *S);
+static int cuda_sam3d_body_ray_cond_from_encoder_dev(
+        cuda_sam3d_body_ctx *ctx, const void *d_encoder_tokens,
+        int n_prefix, const float *rays_hwc, int H, int W,
+        void *d_out_chw);
+static int cuda_sam3d_body_chw_to_tok_dev(
+        cuda_sam3d_body_ctx *ctx, void *d_out_tok,
+        const void *d_in_chw, int N, int D);
 
 /* ===================== safetensors helpers ===================== */
 
@@ -571,6 +670,136 @@ static void *sb_upload_st_i64(const st_context *st, const char *name,
     return hip_upload_raw(safetensors_data((st_context *)st, i), nb);
 }
 
+static void *sb_upload_qtensor_raw(const qtensor *q, size_t expect_n,
+                                   size_t elem_size, const char *name)
+{
+    if (!q || !q->data) {
+        fprintf(stderr, "sam3d_body: missing MHR tensor %s\n", name);
+        return NULL;
+    }
+    if (expect_n == 0) {
+        fprintf(stderr, "sam3d_body: MHR tensor %s needs explicit size\n", name);
+        return NULL;
+    }
+    size_t nb = expect_n * elem_size;
+    return hip_upload_raw(q->data, nb);
+}
+
+static void cuda_sam3d_body_free_mhr_gpu_cache(cuda_sam3d_body_ctx *c)
+{
+    if (!c) return;
+    if (c->d_mhr_pc_linear_weight) hipFree(c->d_mhr_pc_linear_weight);
+    if (c->d_mhr_pc_h) hipFree(c->d_mhr_pc_h);
+    if (c->d_mhr_pc_out) hipFree(c->d_mhr_pc_out);
+    if (c->d_mhr_shape_coeffs) hipFree(c->d_mhr_shape_coeffs);
+    if (c->d_mhr_face_coeffs) hipFree(c->d_mhr_face_coeffs);
+    if (c->d_mhr_jstate) hipFree(c->d_mhr_jstate);
+    if (c->d_mhr_blend_vectors) hipFree(c->d_mhr_blend_vectors);
+    if (c->d_mhr_blend_base) hipFree(c->d_mhr_blend_base);
+    if (c->d_mhr_face_vectors) hipFree(c->d_mhr_face_vectors);
+    if (c->d_mhr_skin_indices) hipFree(c->d_mhr_skin_indices);
+    if (c->d_mhr_skin_weights) hipFree(c->d_mhr_skin_weights);
+    if (c->d_mhr_vert_indices) hipFree(c->d_mhr_vert_indices);
+    if (c->d_mhr_rest) hipFree(c->d_mhr_rest);
+    if (c->d_mhr_face) hipFree(c->d_mhr_face);
+    if (c->d_mhr_skinned) hipFree(c->d_mhr_skinned);
+    if (c->d_mhr_gskel) hipFree(c->d_mhr_gskel);
+    if (c->d_mhr_keypoint_mapping) hipFree(c->d_mhr_keypoint_mapping);
+    if (c->d_mhr_kp3d) hipFree(c->d_mhr_kp3d);
+    if (c->d_mhr_kp2d_full) hipFree(c->d_mhr_kp2d_full);
+    if (c->d_mhr_kp2d_crop) hipFree(c->d_mhr_kp2d_crop);
+    if (c->d_mhr_kp2d_depth) hipFree(c->d_mhr_kp2d_depth);
+    if (c->d_mhr_pred_cam_t) hipFree(c->d_mhr_pred_cam_t);
+    c->d_mhr_pc_linear_weight = NULL;
+    c->d_mhr_pc_h = NULL;
+    c->d_mhr_pc_out = NULL;
+    c->d_mhr_shape_coeffs = NULL;
+    c->d_mhr_face_coeffs = NULL;
+    c->d_mhr_jstate = NULL;
+    c->d_mhr_blend_vectors = NULL;
+    c->d_mhr_blend_base = NULL;
+    c->d_mhr_face_vectors = NULL;
+    c->d_mhr_skin_indices = NULL;
+    c->d_mhr_skin_weights = NULL;
+    c->d_mhr_vert_indices = NULL;
+    c->d_mhr_rest = NULL;
+    c->d_mhr_face = NULL;
+    c->d_mhr_skinned = NULL;
+    c->d_mhr_gskel = NULL;
+    c->d_mhr_keypoint_mapping = NULL;
+    c->d_mhr_kp3d = NULL;
+    c->d_mhr_kp2d_full = NULL;
+    c->d_mhr_kp2d_crop = NULL;
+    c->d_mhr_kp2d_depth = NULL;
+    c->d_mhr_pred_cam_t = NULL;
+    c->mhr_gpu_enabled = 0;
+}
+
+static int cuda_sam3d_body_ensure_mhr_gpu_cache(cuda_sam3d_body_ctx *c)
+{
+    if (!c || !c->mhr_gpu_requested) return CUDA_SAM3D_BODY_E_INVAL;
+    if (c->mhr_gpu_enabled) return CUDA_SAM3D_BODY_E_OK;
+    if (!c->cpu_mhr || !c->cpu_dec) return CUDA_SAM3D_BODY_E_INVAL;
+
+    const sam3d_body_mhr_assets *a = c->cpu_mhr;
+    const size_t Vd = (size_t)S3DM_N_VERTS * 3;
+    const int K = c->cpu_dec->n_keypoints;
+    c->d_mhr_pc_linear_weight = sb_upload_qtensor_raw(
+        &a->pc_linear_weight, Vd * S3DM_N_PC_H,
+        sizeof(float), "pose_correctives.linear_weight");
+    c->d_mhr_blend_vectors = sb_upload_qtensor_raw(
+        &a->blend_shape_vectors, (size_t)S3DM_N_SHAPE * Vd,
+        sizeof(float), "blend_shape.shape_vectors");
+    c->d_mhr_blend_base = sb_upload_qtensor_raw(
+        &a->blend_base_shape, Vd, sizeof(float), "blend_shape.base_shape");
+    c->d_mhr_face_vectors = sb_upload_qtensor_raw(
+        &a->face_shape_vectors, (size_t)S3DM_N_FACE * Vd,
+        sizeof(float), "face_shape_vectors");
+    c->d_mhr_skin_indices = sb_upload_qtensor_raw(
+        &a->skin_indices_flat, S3DM_N_SKIN, sizeof(int32_t), "skin_indices_flat");
+    c->d_mhr_skin_weights = sb_upload_qtensor_raw(
+        &a->skin_weights_flat, S3DM_N_SKIN, sizeof(float), "skin_weights_flat");
+    c->d_mhr_vert_indices = sb_upload_qtensor_raw(
+        &a->vert_indices_flat, S3DM_N_SKIN, sizeof(int64_t), "vert_indices_flat");
+    c->d_mhr_keypoint_mapping = sb_upload_qtensor_raw(
+        &c->cpu_dec->keypoint_mapping,
+        (size_t)c->cpu_dec->keypoint_mapping.dims[0] *
+        (size_t)c->cpu_dec->keypoint_mapping.dims[1],
+        sizeof(float), "keypoint_mapping");
+
+    if (c->d_mhr_pc_linear_weight &&
+        c->d_mhr_blend_vectors && c->d_mhr_blend_base &&
+        c->d_mhr_face_vectors && c->d_mhr_skin_indices &&
+        c->d_mhr_skin_weights && c->d_mhr_vert_indices &&
+        c->d_mhr_keypoint_mapping &&
+        hipMalloc(&c->d_mhr_pc_h, (size_t)S3DM_N_PC_H * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_pc_out, Vd * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_shape_coeffs, (size_t)S3DM_N_SHAPE * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_face_coeffs, (size_t)S3DM_N_FACE * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_jstate, (size_t)S3DM_N_JOINTS * 8 * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_rest, Vd * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_face, Vd * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_skinned, Vd * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_gskel, (size_t)S3DM_N_JOINTS * 8 * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_kp3d, (size_t)K * 3 * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_kp2d_full, (size_t)K * 2 * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_kp2d_crop, (size_t)K * 2 * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_kp2d_depth, (size_t)K * sizeof(float)) == hipSuccess &&
+        hipMalloc(&c->d_mhr_pred_cam_t, 3 * sizeof(float)) == hipSuccess) {
+        c->mhr_gpu_enabled = 1;
+        if (c->verbose >= 1)
+            fprintf(stderr, "sam3d_body: hybrid GPU MHR enabled "
+                            "(cached MHR weights + keypoints)\n");
+        return CUDA_SAM3D_BODY_E_OK;
+    }
+
+    fprintf(stderr, "sam3d_body: hybrid GPU MHR cache failed; "
+                    "falling back to CPU MHR\n");
+    cuda_sam3d_body_free_mhr_gpu_cache(c);
+    c->mhr_gpu_requested = 0;
+    return CUDA_SAM3D_BODY_E_LOAD;
+}
+
 /* Per-layer load. Returns 0 on success, -1 on failure. */
 static int sb_load_dec_layer(cuda_sam3d_body_ctx *c, int li) {
     sb_dec_layer_w *L = &c->dec.layers[li];
@@ -737,6 +966,9 @@ static int sb_load_decoder(cuda_sam3d_body_ctx *c) {
     D->invalid_point_embed = sb_upload_st_f32(dec,
         "prompt_encoder.invalid_point_embed.weight",
         (size_t)SB_DEC_KV_DIM);
+    D->no_mask_embed = sb_upload_st_f32(dec,
+        "prompt_encoder.no_mask_embed.weight",
+        (size_t)SB_DEC_KV_DIM);
     D->no_mask_embed_h = sb_host_st_f32(dec,
         "prompt_encoder.no_mask_embed.weight",
         (size_t)SB_DEC_KV_DIM);
@@ -770,6 +1002,7 @@ static int sb_load_decoder(cuda_sam3d_body_ctx *c) {
         !D->keypoint_embedding || !D->keypoint3d_embedding ||
         !D->hand_box_embedding ||
         !D->prompt_pe_gauss || !D->invalid_point_embed ||
+        !D->no_mask_embed ||
         !D->no_mask_embed_h ||
         !D->kp_feat_linear_w || !D->kp_feat_linear_b ||
         !D->kp_posemb_l0_w || !D->kp_posemb_l0_b ||
@@ -929,6 +1162,8 @@ static int sb_compile(cuda_sam3d_body_ctx *c) {
     BIND(fn_silu_mul,       "silu_mul_f32");
     BIND(fn_layerscale_add, "layerscale_add_f32");
     BIND(fn_ray_cond_fourier, "ray_cond_fourier_chw_f32");
+    BIND(fn_encoder_to_preconv, "encoder_tokens_to_preconv_nomask_f32");
+    BIND(fn_chw_to_tok,        "chw_to_tok_f32");
     BIND(fn_conv1x1_chw,      "conv1x1_chw_f32");
     BIND(fn_ln_chw,           "layernorm_chw_f32");
     BIND(fn_linear_bias,      "linear_f32_bias");
@@ -941,11 +1176,15 @@ static int sb_compile(cuda_sam3d_body_ctx *c) {
     BIND(fn_grid_sample,      "grid_sample_chw_f32");
     BIND(fn_kp_pelvis_norm,   "kp_pelvis_norm_f32");
     BIND(fn_augment_overwrite_mask, "augment_overwrite_with_mask_f32");
+    BIND(fn_dense_pe_tok,     "dense_pe_tok_f32");
     BIND(fn_patch_pad2,     "patch_embed_pad2_f32");
     BIND(fn_pos_embed_vith, "pos_embed_add_vith_f32");
     BIND(fn_qkv_split,      "qkv_split_f32");
     BIND(fn_mhr_blend,      "mhr_blend_combine_f32");
     BIND(fn_mhr_lbs,        "mhr_lbs_skin_f32");
+    BIND(fn_mhr_matvec,     "mhr_matvec_f32");
+    BIND(fn_mhr_keypoints,  "mhr_keypoints_from_mesh_f32");
+    BIND(fn_mhr_project,    "mhr_camera_project_f32");
     #undef BIND
     return 0;
 }
@@ -1213,6 +1452,13 @@ load_decoder_and_mhr:
                         p1, p2);
                 cuda_sam3d_body_destroy(c); return NULL;
             }
+            const char *gpu_mhr = getenv("SAM3D_BODY_GPU_MHR");
+            if (gpu_mhr && gpu_mhr[0] && strcmp(gpu_mhr, "0") != 0) {
+                c->mhr_gpu_requested = 1;
+                if (c->verbose >= 1)
+                    fprintf(stderr, "sam3d_body: hybrid GPU MHR requested "
+                                    "(lazy cache)\n");
+            }
         }
     }
 
@@ -1278,6 +1524,7 @@ void cuda_sam3d_body_destroy(cuda_sam3d_body_ctx *ctx)
     sb_free_dev(D->kp3d_posemb_l1_w); sb_free_dev(D->kp3d_posemb_l1_b);
     sb_free_dev(D->prompt_pe_gauss);
     sb_free_dev(D->invalid_point_embed);
+    sb_free_dev(D->no_mask_embed);
     for (int li = 0; li < SB_DEC_LAYERS; li++) {
         sb_dec_layer_w *L = &D->layers[li];
         sb_free_dev(L->ln1_w); sb_free_dev(L->ln1_b);
@@ -1311,6 +1558,31 @@ void cuda_sam3d_body_destroy(cuda_sam3d_body_ctx *ctx)
     sb_free_dev(D->right_wrist_coords);
     sb_free_dev(D->root_coords);
     sb_free_dev(D->nonhand_param_idxs);
+    sb_free_dev(ctx->d_mhr_pc_linear_weight);
+    sb_free_dev(ctx->d_mhr_pc_h);
+    sb_free_dev(ctx->d_mhr_pc_out);
+    sb_free_dev(ctx->d_mhr_shape_coeffs);
+    sb_free_dev(ctx->d_mhr_face_coeffs);
+    sb_free_dev(ctx->d_mhr_jstate);
+    sb_free_dev(ctx->d_mhr_blend_vectors);
+    sb_free_dev(ctx->d_mhr_blend_base);
+    sb_free_dev(ctx->d_mhr_face_vectors);
+    sb_free_dev(ctx->d_mhr_skin_indices);
+    sb_free_dev(ctx->d_mhr_skin_weights);
+    sb_free_dev(ctx->d_mhr_vert_indices);
+    sb_free_dev(ctx->d_mhr_rest);
+    sb_free_dev(ctx->d_mhr_face);
+    sb_free_dev(ctx->d_mhr_skinned);
+    sb_free_dev(ctx->d_mhr_gskel);
+    sb_free_dev(ctx->d_mhr_keypoint_mapping);
+    sb_free_dev(ctx->d_mhr_kp3d);
+    sb_free_dev(ctx->d_mhr_kp2d_full);
+    sb_free_dev(ctx->d_mhr_kp2d_crop);
+    sb_free_dev(ctx->d_mhr_kp2d_depth);
+    sb_free_dev(ctx->d_mhr_pred_cam_t);
+    sb_free_dev(ctx->d_kpu_img);
+    sb_free_dev(ctx->d_dense_pe_tok);
+    free(ctx->dense_pe_tok_h);
     free(D->host_faces_i64);
     if (ctx->mod) hipModuleUnload(ctx->mod);
     if (ctx->st_enc) safetensors_close(ctx->st_enc);
@@ -1347,6 +1619,97 @@ int cuda_sam3d_body_set_focal(cuda_sam3d_body_ctx *ctx, float f)
 {
     if (!ctx) return CUDA_SAM3D_BODY_E_INVAL;
     ctx->focal_hint = f;
+    return CUDA_SAM3D_BODY_E_OK;
+}
+
+static int cuda_sam3d_body_ensure_dense_pe_tok_host(
+        cuda_sam3d_body_ctx *ctx, int gh, int gw, int Dc, float **out)
+{
+    if (!ctx || !ctx->cpu_dec || gh <= 0 || gw <= 0 || Dc <= 0 || !out)
+        return CUDA_SAM3D_BODY_E_INVAL;
+    const int N_C = gh * gw;
+    if (ctx->dense_pe_tok_h &&
+        ctx->dense_pe_gh == gh &&
+        ctx->dense_pe_gw == gw &&
+        ctx->dense_pe_dc == Dc) {
+        *out = ctx->dense_pe_tok_h;
+        return CUDA_SAM3D_BODY_E_OK;
+    }
+
+    float *image_pe_chw = (float *)malloc((size_t)Dc * N_C * sizeof(float));
+    float *tok = (float *)malloc((size_t)N_C * Dc * sizeof(float));
+    if (!image_pe_chw || !tok) {
+        free(image_pe_chw);
+        free(tok);
+        return CUDA_SAM3D_BODY_E_LOAD;
+    }
+    if (sam3d_body_get_dense_pe(ctx->cpu_dec, gh, gw, /*n_threads=*/0,
+                                image_pe_chw) != 0) {
+        free(image_pe_chw);
+        free(tok);
+        return CUDA_SAM3D_BODY_E_INVAL;
+    }
+    for (int n = 0; n < N_C; n++)
+        for (int c = 0; c < Dc; c++)
+            tok[(size_t)n * Dc + c] = image_pe_chw[(size_t)c * N_C + n];
+    free(image_pe_chw);
+
+    free(ctx->dense_pe_tok_h);
+    ctx->dense_pe_tok_h = tok;
+    ctx->dense_pe_gh = gh;
+    ctx->dense_pe_gw = gw;
+    ctx->dense_pe_dc = Dc;
+    sb_free_dev(ctx->d_dense_pe_tok);
+    ctx->d_dense_pe_tok = NULL;
+    ctx->d_dense_pe_tok_bytes = 0;
+
+    *out = ctx->dense_pe_tok_h;
+    return CUDA_SAM3D_BODY_E_OK;
+}
+
+static int cuda_sam3d_body_ensure_dense_pe_tok_dev(
+        cuda_sam3d_body_ctx *ctx, int gh, int gw, int Dc, void **out)
+{
+    if (!ctx || !out) return CUDA_SAM3D_BODY_E_INVAL;
+    if (!ctx->cpu_dec || !ctx->dec.prompt_pe_gauss)
+        return CUDA_SAM3D_BODY_E_INVAL;
+    const int npf = (int)ctx->cpu_dec->prompt_pe_gauss.dims[1];
+    if (Dc != npf * 2) return CUDA_SAM3D_BODY_E_INVAL;
+    const size_t bytes = (size_t)gh * (size_t)gw * (size_t)Dc *
+                         sizeof(float);
+    if (ctx->d_dense_pe_tok &&
+        ctx->d_dense_pe_tok_bytes == bytes &&
+        ctx->dense_pe_gh == gh &&
+        ctx->dense_pe_gw == gw &&
+        ctx->dense_pe_dc == Dc) {
+        *out = ctx->d_dense_pe_tok;
+        return CUDA_SAM3D_BODY_E_OK;
+    }
+    sb_free_dev(ctx->d_dense_pe_tok);
+    ctx->d_dense_pe_tok = NULL;
+    ctx->d_dense_pe_tok_bytes = 0;
+    if (hipMalloc(&ctx->d_dense_pe_tok, bytes) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    struct __attribute__((packed)) {
+        void *out; const void *G; int H; int W; int npf; int use_square_x;
+    } p = {
+        ctx->d_dense_pe_tok, ctx->dec.prompt_pe_gauss,
+        gh, gw, npf, ctx->cpu_dec->kp_sample_scale_x ? 1 : 0
+    };
+    unsigned bx = 256;
+    unsigned gx = (unsigned)(((size_t)gh * (size_t)gw * (size_t)npf +
+                              bx - 1) / bx);
+    if (sb_launch(ctx->fn_dense_pe_tok, gx, 1, 1, bx, 1, 1, 0,
+                  &p, sizeof(p)) < 0) {
+        sb_free_dev(ctx->d_dense_pe_tok);
+        ctx->d_dense_pe_tok = NULL;
+        return CUDA_SAM3D_BODY_E_LOAD;
+    }
+    ctx->d_dense_pe_tok_bytes = bytes;
+    ctx->dense_pe_gh = gh;
+    ctx->dense_pe_gw = gw;
+    ctx->dense_pe_dc = Dc;
+    *out = ctx->d_dense_pe_tok;
     return CUDA_SAM3D_BODY_E_OK;
 }
 
@@ -1596,15 +1959,20 @@ static int cuda_sam3d_body_run_encoder_vith(cuda_sam3d_body_ctx *ctx)
 
     if (hipDeviceSynchronize() != hipSuccess) return CUDA_SAM3D_BODY_E_LOAD;
 
-    /* Copy final encoder tokens to host as (N_TOK, D) row-major. */
+    /* Copy final encoder tokens to host as (N_TOK, D) row-major unless the
+     * production GPU-MHR decoder can consume ctx->d_proj directly. */
     free(ctx->encoder_tokens.data);
-    ctx->encoder_tokens.data =
-        (float *)malloc((size_t)N_TOK * D * sizeof(float));
-    if (!ctx->encoder_tokens.data) return CUDA_SAM3D_BODY_E_LOAD;
-    if (hipMemcpy(ctx->encoder_tokens.data, ctx->d_proj,
-                  (size_t)N_TOK * D * sizeof(float),
-                  hipMemcpyDeviceToHost) != hipSuccess)
-        return CUDA_SAM3D_BODY_E_LOAD;
+    ctx->encoder_tokens.data = NULL;
+    ctx->encoder_tokens_dev_valid = 1;
+    if (!ctx->mhr_gpu_requested) {
+        ctx->encoder_tokens.data =
+            (float *)malloc((size_t)N_TOK * D * sizeof(float));
+        if (!ctx->encoder_tokens.data) return CUDA_SAM3D_BODY_E_LOAD;
+        if (hipMemcpy(ctx->encoder_tokens.data, ctx->d_proj,
+                      (size_t)N_TOK * D * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            return CUDA_SAM3D_BODY_E_LOAD;
+    }
     ctx->encoder_tokens.n = N_TOK;
     ctx->encoder_tokens.c = D;
 
@@ -2016,13 +2384,17 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
     /* Copy final encoder tokens (post-LN) to host. */
     const double t_read0 = sb_time_ms();
     free(ctx->encoder_tokens.data);
-    ctx->encoder_tokens.data =
-        (float *)malloc((size_t)N_TOK * SB_DIM * sizeof(float));
-    if (!ctx->encoder_tokens.data) return CUDA_SAM3D_BODY_E_LOAD;
-    if (hipMemcpy(ctx->encoder_tokens.data, ctx->d_proj,
-                  (size_t)N_TOK * SB_DIM * sizeof(float),
-                  hipMemcpyDeviceToHost) != hipSuccess)
-        return CUDA_SAM3D_BODY_E_LOAD;
+    ctx->encoder_tokens.data = NULL;
+    ctx->encoder_tokens_dev_valid = 1;
+    if (!ctx->mhr_gpu_requested) {
+        ctx->encoder_tokens.data =
+            (float *)malloc((size_t)N_TOK * SB_DIM * sizeof(float));
+        if (!ctx->encoder_tokens.data) return CUDA_SAM3D_BODY_E_LOAD;
+        if (hipMemcpy(ctx->encoder_tokens.data, ctx->d_proj,
+                      (size_t)N_TOK * SB_DIM * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            return CUDA_SAM3D_BODY_E_LOAD;
+    }
     ctx->encoder_tokens.n = N_TOK;
     ctx->encoder_tokens.c = SB_DIM;
     t_readback_ms = sb_time_ms() - t_read0;
@@ -2048,12 +2420,15 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
  * norm_final + heads, kp_token_update) run on the GPU via the
  * cuda_sam3d_body_debug_run_* entry points used by verify_decoder.c.
  *
- * MHR skinning + keypoints_from_mesh + camera_project still run on the
- * CPU (Step 7 — CUDA MHR — is deferred per the original plan). */
+ * By default MHR skinning + keypoints_from_mesh + camera_project still run
+ * on CPU. With SAM3D_BODY_GPU_MHR=1, a lazy cached hybrid path keeps small
+ * parameter/skeleton stages on CPU, while shape/face blends, the heavy
+ * pose-correctives dense GEMV, rest-vertex combine, LBS, keypoint
+ * regression, and projection run on cached GPU tensors. */
 int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
 {
     if (!ctx) return CUDA_SAM3D_BODY_E_INVAL;
-    if (!ctx->encoder_tokens.data) {
+    if (!ctx->encoder_tokens.data && !ctx->encoder_tokens_dev_valid) {
         fprintf(stderr, "[cuda_sam3d_body] run_decoder: encoder tokens "
                         "not populated — call run_encoder first\n");
         return CUDA_SAM3D_BODY_E_INVAL;
@@ -2064,8 +2439,15 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
                         "loaded — set cfg.mhr_assets_dir at create time\n");
         return CUDA_SAM3D_BODY_E_INVAL;
     }
-
     const double t_decoder0 = sb_time_ms();
+    double t_mhr_cache_ms = 0.0;
+    if (ctx->mhr_gpu_requested && !ctx->mhr_gpu_enabled) {
+        const double t_cache0 = sb_time_ms();
+        int cache_rc = cuda_sam3d_body_ensure_mhr_gpu_cache(ctx);
+        t_mhr_cache_ms = sb_time_ms() - t_cache0;
+        if (cache_rc != CUDA_SAM3D_BODY_E_OK)
+            return cache_rc;
+    }
     double t_geom_ms = 0.0, t_encoder_permute_ms = 0.0, t_rays_ms = 0.0;
     double t_ray_cond_ms = 0.0, t_dense_pe_ms = 0.0, t_ctx_permute_ms = 0.0;
     double t_condition_ms = 0.0, t_build_tokens_ms = 0.0, t_workspace_ms = 0.0;
@@ -2105,6 +2487,7 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
                 n_prefix + N_C, Dc);
         return CUDA_SAM3D_BODY_E_INVAL;
     }
+    const int dev_decoder = ctx->mhr_gpu_enabled && ctx->encoder_tokens_dev_valid;
 
     /* TopdownAffine + cam_int are cached by run_encoder so the warp
      * matrix used to produce the DINOv3 input matches the rays_xyz /
@@ -2157,18 +2540,23 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
         ray_img_w = SB_VITH_IMG_H;
     }
 
-    /* ---- Permute encoder tokens (drop CLS+regs) → image_emb_pre (Dc, H, W). ---- */
+    /* ---- Permute encoder tokens for the host-backed decoder path. ---- */
     const double t_perm0 = sb_time_ms();
-    float *img_emb_pre = (float *)malloc((size_t)Dc * N_C * sizeof(float));
-    if (!img_emb_pre) return CUDA_SAM3D_BODY_E_LOAD;
-    {
+    float *img_emb_pre = NULL;
+    void *d_img_emb_chw = NULL;
+    int d_img_emb_chw_owned = 0;
+    if (!dev_decoder) {
+        img_emb_pre = (float *)malloc((size_t)Dc * N_C * sizeof(float));
+        if (!img_emb_pre) return CUDA_SAM3D_BODY_E_LOAD;
         const float *patch = ctx->encoder_tokens.data + (size_t)n_prefix * Dc;
         const float *no_mask = ctx->dec.no_mask_embed_h;
         if (!no_mask) { free(img_emb_pre); return CUDA_SAM3D_BODY_E_LOAD; }
-        for (int n = 0; n < N_C; n++)
-            for (int c = 0; c < Dc; c++)
-                img_emb_pre[(size_t)c * N_C + n] =
-                    patch[(size_t)n * Dc + c] + no_mask[c];
+        {
+            for (int n = 0; n < N_C; n++)
+                for (int c = 0; c < Dc; c++)
+                    img_emb_pre[(size_t)c * N_C + n] =
+                        patch[(size_t)n * Dc + c] + no_mask[c];
+        }
     }
     t_encoder_permute_ms = sb_time_ms() - t_perm0;
 
@@ -2187,43 +2575,66 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
 
     /* ---- ray_cond_emb on GPU → img_emb_post (Dc, H, W) ---- */
     const double t_raycond0 = sb_time_ms();
-    float *img_emb = (float *)malloc((size_t)Dc * N_C * sizeof(float));
-    if (!img_emb) { free(img_emb_pre); free(rays_xyz); return CUDA_SAM3D_BODY_E_LOAD; }
-    if (cuda_sam3d_body_debug_run_ray_cond(ctx, img_emb_pre, rays_xyz,
-                                           gh, gw, img_emb) != 0) {
-        free(img_emb_pre); free(rays_xyz); free(img_emb);
-        return CUDA_SAM3D_BODY_E_LOAD;
+    float *img_emb = NULL;
+    if (dev_decoder) {
+        const size_t b_img = (size_t)Dc * N_C * sizeof(float);
+        if (hipMalloc(&d_img_emb_chw, b_img) != hipSuccess) {
+            free(rays_xyz);
+            return CUDA_SAM3D_BODY_E_LOAD;
+        }
+        d_img_emb_chw_owned = 1;
+        if (cuda_sam3d_body_ray_cond_from_encoder_dev(
+                ctx, ctx->d_proj, n_prefix, rays_xyz, gh, gw,
+                d_img_emb_chw) != CUDA_SAM3D_BODY_E_OK) {
+            free(rays_xyz);
+            sb_free_dev(d_img_emb_chw);
+            return CUDA_SAM3D_BODY_E_LOAD;
+        }
+    } else {
+        img_emb = (float *)malloc((size_t)Dc * N_C * sizeof(float));
+        if (!img_emb) { free(img_emb_pre); free(rays_xyz); return CUDA_SAM3D_BODY_E_LOAD; }
+        if (cuda_sam3d_body_debug_run_ray_cond(ctx, img_emb_pre, rays_xyz,
+                                               gh, gw, img_emb) != 0) {
+            free(img_emb_pre); free(rays_xyz); free(img_emb);
+            return CUDA_SAM3D_BODY_E_LOAD;
+        }
     }
     t_ray_cond_ms = sb_time_ms() - t_raycond0;
     free(img_emb_pre);
     free(rays_xyz);
 
-    /* ---- dense_pe (CPU; small enough to stay there). ---- */
+    /* ---- dense_pe in token form. Cached because it only depends on grid. ---- */
     const double t_dense0 = sb_time_ms();
-    float *image_pe_chw = (float *)malloc((size_t)Dc * N_C * sizeof(float));
-    if (!image_pe_chw) { free(img_emb); return CUDA_SAM3D_BODY_E_LOAD; }
-    if (sam3d_body_get_dense_pe(m, gh, gw, /*n_threads=*/0,
-                                image_pe_chw) != 0) {
-        free(img_emb); free(image_pe_chw);
-        return CUDA_SAM3D_BODY_E_INVAL;
+    float *ctx_pe_tok = NULL;
+    void *d_ctx_pe_tok_cached = NULL;
+    int ctx_pe_tok_owned = 0;
+    int pe_rc = dev_decoder
+        ? cuda_sam3d_body_ensure_dense_pe_tok_dev(
+              ctx, gh, gw, Dc, &d_ctx_pe_tok_cached)
+        : cuda_sam3d_body_ensure_dense_pe_tok_host(
+              ctx, gh, gw, Dc, &ctx_pe_tok);
+    if (pe_rc != CUDA_SAM3D_BODY_E_OK) {
+        free(img_emb);
+        if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
+        return pe_rc;
     }
-    /* ctx_pe in token form (HW, Dc) for the decoder layer's context_pe. */
-    float *ctx_pe_tok = (float *)malloc((size_t)N_C * Dc * sizeof(float));
-    if (!ctx_pe_tok) { free(img_emb); free(image_pe_chw); return CUDA_SAM3D_BODY_E_LOAD; }
-    for (int n = 0; n < N_C; n++)
-        for (int c = 0; c < Dc; c++)
-            ctx_pe_tok[(size_t)n * Dc + c] =
-                image_pe_chw[(size_t)c * N_C + n];
-    free(image_pe_chw);
     t_dense_pe_ms = sb_time_ms() - t_dense0;
 
     /* image_emb in token form (HW, Dc) for the decoder layer's context_in. */
     const double t_ctx0 = sb_time_ms();
-    float *ctx_in = (float *)malloc((size_t)N_C * Dc * sizeof(float));
-    if (!ctx_in) { free(img_emb); free(ctx_pe_tok); return CUDA_SAM3D_BODY_E_LOAD; }
-    for (int n = 0; n < N_C; n++)
-        for (int c = 0; c < Dc; c++)
-            ctx_in[(size_t)n * Dc + c] = img_emb[(size_t)c * N_C + n];
+    float *ctx_in = NULL;
+    if (!dev_decoder) {
+        ctx_in = (float *)malloc((size_t)N_C * Dc * sizeof(float));
+        if (!ctx_in) {
+            free(img_emb);
+            if (ctx_pe_tok_owned) free(ctx_pe_tok);
+            if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
+            return CUDA_SAM3D_BODY_E_LOAD;
+        }
+        for (int n = 0; n < N_C; n++)
+            for (int c = 0; c < Dc; c++)
+                ctx_in[(size_t)n * Dc + c] = img_emb[(size_t)c * N_C + n];
+    }
     t_ctx_permute_ms = sb_time_ms() - t_ctx0;
 
     /* ---- condition_info, init_input, prev_input, prompt_in ---- */
@@ -2248,7 +2659,8 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     memcpy(prev_input,         ip, 519 * sizeof(float));
     memcpy(prev_input + 519,   ic,   3 * sizeof(float));
     if (sam3d_body_invalid_prompt_token(m, prompt_in) != 0) {
-        free(img_emb); free(ctx_pe_tok); free(ctx_in);
+        free(img_emb); if (ctx_pe_tok_owned) free(ctx_pe_tok); free(ctx_in);
+        if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
         return CUDA_SAM3D_BODY_E_INVAL;
     }
     t_condition_ms = sb_time_ms() - t_cond0;
@@ -2258,13 +2670,15 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     float *init_x   = (float *)malloc((size_t)N_Q * D * sizeof(float));
     float *init_xpe = (float *)malloc((size_t)N_Q * D * sizeof(float));
     if (!init_x || !init_xpe) {
-        free(img_emb); free(ctx_pe_tok); free(ctx_in);
+        free(img_emb); if (ctx_pe_tok_owned) free(ctx_pe_tok); free(ctx_in);
+        if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
         free(init_x); free(init_xpe);
         return CUDA_SAM3D_BODY_E_LOAD;
     }
     if (cuda_sam3d_body_debug_run_build_tokens(ctx, init_input, prev_input,
                                                prompt_in, init_x, init_xpe) != 0) {
-        free(img_emb); free(ctx_pe_tok); free(ctx_in);
+        free(img_emb); if (ctx_pe_tok_owned) free(ctx_pe_tok); free(ctx_in);
+        if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
         free(init_x); free(init_xpe);
         return CUDA_SAM3D_BODY_E_LOAD;
     }
@@ -2280,9 +2694,36 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     memcpy(B.affine_trans, warp_for_rays, 6 * sizeof(float));
     B.use_intrin_center    = 0;
     B.default_scale_factor = 1.0f;
+    int rc_total = 0, rc = 0;
 
     /* ---- Per-layer working buffers + MHR scratch ---- */
     const double t_workspace0 = sb_time_ms();
+    const void *d_kpu_img_run = NULL;
+    if (ctx->mhr_gpu_enabled) {
+        size_t b_img = (size_t)Dc * (size_t)gh * (size_t)gw * sizeof(float);
+        if (d_img_emb_chw) {
+            d_kpu_img_run = d_img_emb_chw;
+        } else if (ctx->d_kpu_img_cap < b_img) {
+            sb_free_dev(ctx->d_kpu_img);
+            ctx->d_kpu_img = NULL;
+            ctx->d_kpu_img_cap = 0;
+            if (hipMalloc(&ctx->d_kpu_img, b_img) != hipSuccess) {
+                free(img_emb); if (ctx_pe_tok_owned) free(ctx_pe_tok); free(ctx_in);
+                if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
+                return CUDA_SAM3D_BODY_E_LOAD;
+            }
+            ctx->d_kpu_img_cap = b_img;
+        }
+        if (!d_kpu_img_run &&
+            hipMemcpy(ctx->d_kpu_img, img_emb, b_img,
+                      hipMemcpyHostToDevice) != hipSuccess) {
+            free(img_emb); if (ctx_pe_tok_owned) free(ctx_pe_tok); free(ctx_in);
+            if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
+            return CUDA_SAM3D_BODY_E_LOAD;
+        }
+        if (!d_kpu_img_run) d_kpu_img_run = ctx->d_kpu_img;
+        ctx->kpu_use_cached_img = 1;
+    }
     float *tokens   = (float *)malloc((size_t)N_Q * D * sizeof(float));
     float *tokens_b = (float *)malloc((size_t)N_Q * D * sizeof(float));
     float *augment  = (float *)malloc((size_t)N_Q * D * sizeof(float));
@@ -2294,9 +2735,19 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     float *gskel_cm = (float *)malloc((size_t)J * 8 * sizeof(float));
     float *verts_m  = (float *)malloc((size_t)V * 3 * sizeof(float));
     float *jc_m     = (float *)malloc((size_t)J * 3 * sizeof(float));
+    void *d_dec_tokens = NULL, *d_dec_tokens_b = NULL, *d_dec_aug = NULL;
+    void *d_dec_ctx = NULL, *d_dec_cpe = NULL;
+    int d_dec_cpe_owned = 0;
+    sb_dec_layer_scratch_dev DS;
+    memset(&DS, 0, sizeof(DS));
+    sb_kpu_scratch_dev KS;
+    memset(&KS, 0, sizeof(KS));
+    sb_head_scratch_dev HS;
+    memset(&HS, 0, sizeof(HS));
     if (!tokens || !tokens_b || !augment || !tokens_n ||
         !mhr_scratch || !verts_cm || !gskel_cm || !verts_m || !jc_m) {
-        free(img_emb); free(ctx_pe_tok); free(ctx_in);
+        free(img_emb); if (ctx_pe_tok_owned) free(ctx_pe_tok); free(ctx_in);
+        if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
         free(init_x); free(init_xpe);
         free(tokens); free(tokens_b); free(augment); free(tokens_n);
         free(mhr_scratch); free(verts_cm); free(gskel_cm); free(verts_m); free(jc_m);
@@ -2304,6 +2755,83 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     }
     memcpy(tokens,  init_x,   (size_t)N_Q * D * sizeof(float));
     memcpy(augment, init_xpe, (size_t)N_Q * D * sizeof(float));
+    if (dev_decoder) {
+        const size_t bx_q = (size_t)N_Q * D * sizeof(float);
+        const size_t bx_c = (size_t)N_C * Dc * sizeof(float);
+        const size_t b_qE = (size_t)N_Q * SB_DEC_HEADS * SB_DEC_HEAD_DIM * sizeof(float);
+        const size_t b_kvE = (size_t)((N_Q > N_C ? N_Q : N_C)) *
+                             SB_DEC_HEADS * SB_DEC_HEAD_DIM * sizeof(float);
+        const size_t b_qF = (size_t)N_Q * SB_DEC_FFN * sizeof(float);
+        #define DEV_ALLOC(ptr, bytes) do { \
+            if (hipMalloc(&(ptr), (bytes)) != hipSuccess) { \
+                rc_total = -1; goto cleanup; \
+            } \
+        } while (0)
+        DEV_ALLOC(d_dec_tokens, bx_q);
+        DEV_ALLOC(d_dec_tokens_b, bx_q);
+        DEV_ALLOC(d_dec_aug, bx_q);
+        DEV_ALLOC(d_dec_ctx, bx_c);
+        d_dec_cpe = d_ctx_pe_tok_cached;
+        d_dec_cpe_owned = 0;
+        if (!d_dec_cpe) {
+            DEV_ALLOC(d_dec_cpe, bx_c);
+            d_dec_cpe_owned = 1;
+        }
+        DEV_ALLOC(DS.xpe_n, bx_q);
+        DEV_ALLOC(DS.cpe_n, bx_c);
+        DEV_ALLOC(DS.x_ln, bx_q);
+        DEV_ALLOC(DS.qk, bx_q);
+        DEV_ALLOC(DS.Q, b_qE);
+        DEV_ALLOC(DS.K, b_kvE);
+        DEV_ALLOC(DS.V, b_kvE);
+        DEV_ALLOC(DS.attn, b_qE);
+        DEV_ALLOC(DS.proj, bx_q);
+        DEV_ALLOC(DS.x1, bx_q);
+        DEV_ALLOC(DS.q_in, bx_q);
+        DEV_ALLOC(DS.k_in, bx_c);
+        DEV_ALLOC(DS.ctx_ln, bx_c);
+        DEV_ALLOC(DS.x2, bx_q);
+        DEV_ALLOC(DS.x_ln3, bx_q);
+        DEV_ALLOC(DS.ffn_h, b_qF);
+        DEV_ALLOC(DS.ffn_o, bx_q);
+        DEV_ALLOC(KS.gxy, (size_t)K * 2 * sizeof(float));
+        DEV_ALLOC(KS.invalid, (size_t)K * sizeof(int));
+        DEV_ALLOC(KS.p_h, (size_t)K * D * sizeof(float));
+        DEV_ALLOC(KS.p_o, (size_t)K * D * sizeof(float));
+        DEV_ALLOC(KS.kp_feats, (size_t)K * Dc * sizeof(float));
+        DEV_ALLOC(KS.kp_proj, (size_t)K * D * sizeof(float));
+        DEV_ALLOC(KS.kp3d_norm, (size_t)K * 3 * sizeof(float));
+        DEV_ALLOC(KS.p3_h, (size_t)K * D * sizeof(float));
+        DEV_ALLOC(KS.p3_o, (size_t)K * D * sizeof(float));
+        DEV_ALLOC(HS.norm_row, (size_t)D * sizeof(float));
+        DEV_ALLOC(HS.pose_h, (size_t)D * sizeof(float));
+        DEV_ALLOC(HS.pose_raw, (size_t)SB_DEC_NPOSE * sizeof(float));
+        DEV_ALLOC(HS.cam_h, (size_t)D * sizeof(float));
+        DEV_ALLOC(HS.cam_raw, (size_t)SB_DEC_NCAM * sizeof(float));
+        #undef DEV_ALLOC
+        if (hipMemcpy(d_dec_tokens, tokens, bx_q, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(d_dec_aug, augment, bx_q, hipMemcpyHostToDevice) != hipSuccess) {
+            rc_total = -1; goto cleanup;
+        }
+        if (d_img_emb_chw) {
+            const double t_ctx_dev0 = sb_time_ms();
+            if (cuda_sam3d_body_chw_to_tok_dev(
+                    ctx, d_dec_ctx, d_img_emb_chw, N_C, Dc) !=
+                CUDA_SAM3D_BODY_E_OK ||
+                hipDeviceSynchronize() != hipSuccess) {
+                rc_total = -1; goto cleanup;
+            }
+            t_ctx_permute_ms += sb_time_ms() - t_ctx_dev0;
+        } else if (hipMemcpy(d_dec_ctx, ctx_in, bx_c,
+                             hipMemcpyHostToDevice) != hipSuccess) {
+            rc_total = -1; goto cleanup;
+        }
+        if (d_dec_cpe_owned &&
+            hipMemcpy(d_dec_cpe, ctx_pe_tok, bx_c,
+                      hipMemcpyHostToDevice) != hipSuccess) {
+            rc_total = -1; goto cleanup;
+        }
+    }
     free(init_x); free(init_xpe);
     t_workspace_ms = sb_time_ms() - t_workspace0;
 
@@ -2314,21 +2842,38 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     float kp2d_full[70 * 2], kp2d_crop[70 * 2], kp2d_dep[70];
     float pred_cam_t_world[3];
 
-    int rc_total = 0, rc;
     for (int li = 0; li < NL; li++) {
         double t0 = sb_time_ms();
-        rc = cuda_sam3d_body_debug_run_decoder_layer(
-                ctx, li, tokens, ctx_in, augment, ctx_pe_tok,
-                N_Q, N_C, tokens_b);
+        if (dev_decoder) {
+            rc = cuda_sam3d_body_run_decoder_layer_dev(
+                    ctx, li, d_dec_tokens, d_dec_ctx, d_dec_aug, d_dec_cpe,
+                    N_Q, N_C, d_dec_tokens_b, &DS);
+        } else {
+            rc = cuda_sam3d_body_debug_run_decoder_layer(
+                    ctx, li, tokens, ctx_in, augment, ctx_pe_tok,
+                    N_Q, N_C, tokens_b);
+        }
         if (rc != 0) { rc_total = rc; goto cleanup; }
+        if (dev_decoder) {
+            void *td = d_dec_tokens; d_dec_tokens = d_dec_tokens_b; d_dec_tokens_b = td;
+            if (hipDeviceSynchronize() != hipSuccess) {
+                rc_total = -1; goto cleanup;
+            }
+        } else {
+            float *t = tokens; tokens = tokens_b; tokens_b = t;
+        }
         t_layer_ms[li] += sb_time_ms() - t0;
-        { float *t = tokens; tokens = tokens_b; tokens_b = t; }
 
         if (li >= NL - 1) break;
 
         t0 = sb_time_ms();
-        rc = cuda_sam3d_body_debug_run_norm_and_heads(
-                ctx, tokens, N_Q, tokens_n, pose_raw, cam_raw);
+        if (dev_decoder) {
+            rc = cuda_sam3d_body_norm_heads_dev(
+                    ctx, d_dec_tokens, pose_raw, cam_raw, &HS);
+        } else {
+            rc = cuda_sam3d_body_debug_run_norm_and_heads(
+                    ctx, tokens, N_Q, NULL, pose_raw, cam_raw);
+        }
         if (rc != 0) { rc_total = rc; goto cleanup; }
         t_norm_heads_ms[li] += sb_time_ms() - t0;
         for (int i = 0; i < 519; i++) pose519[i] = pose_raw[i] + ip[i];
@@ -2341,39 +2886,61 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
         }
         t_decode_pose_ms[li] += sb_time_ms() - t0;
         t0 = sb_time_ms();
-        if (sam3d_body_mhr_forward((const sam3d_body_mhr_assets *)ctx->cpu_mhr,
-                                   mp_buf, shape_buf, face_buf,
-                                   1, 1, /*n_threads=*/SAM3DB_MHR_THREADS(), mhr_scratch,
-                                   verts_cm, gskel_cm) != 0) {
+        int mhr_rc = ctx->mhr_gpu_enabled
+            ? cuda_sam3d_body_mhr_forward_hybrid(
+                  ctx, mp_buf, shape_buf, face_buf,
+                  1, SAM3DB_MHR_THREADS(), mhr_scratch, NULL, gskel_cm)
+            : sam3d_body_mhr_forward((const sam3d_body_mhr_assets *)ctx->cpu_mhr,
+                                      mp_buf, shape_buf, face_buf,
+                                      1, 1, SAM3DB_MHR_THREADS(), mhr_scratch,
+                                      verts_cm, gskel_cm);
+        if (mhr_rc != 0) {
             rc_total = -1; goto cleanup;
         }
         t_mhr_ms[li] += sb_time_ms() - t0;
-        for (int i = 0; i < V * 3; i++) verts_m[i] = verts_cm[i] * 0.01f;
-        for (int j = 0; j < J; j++) {
-            jc_m[j*3 + 0] = gskel_cm[(size_t)j*8 + 0] * 0.01f;
-            jc_m[j*3 + 1] = gskel_cm[(size_t)j*8 + 1] * 0.01f;
-            jc_m[j*3 + 2] = gskel_cm[(size_t)j*8 + 2] * 0.01f;
-        }
         t0 = sb_time_ms();
-        if (sam3d_body_keypoints_from_mesh(m, verts_m, jc_m,
-                                           /*enable_hand_model=*/0,
-                                           /*n_threads=*/0, kp3d_post) != 0) {
-            rc_total = -1; goto cleanup;
+        if (ctx->mhr_gpu_enabled) {
+            if (cuda_sam3d_body_keypoints_project_cached(
+                    ctx, gskel_cm, cam3, &B,
+                    kp3d_post, kp2d_full, kp2d_crop, kp2d_dep,
+                    pred_cam_t_world) != CUDA_SAM3D_BODY_E_OK) {
+                rc_total = -1; goto cleanup;
+            }
+        } else {
+            for (int i = 0; i < V * 3; i++) verts_m[i] = verts_cm[i] * 0.01f;
+            for (int j = 0; j < J; j++) {
+                jc_m[j*3 + 0] = gskel_cm[(size_t)j*8 + 0] * 0.01f;
+                jc_m[j*3 + 1] = gskel_cm[(size_t)j*8 + 1] * 0.01f;
+                jc_m[j*3 + 2] = gskel_cm[(size_t)j*8 + 2] * 0.01f;
+            }
+            if (sam3d_body_keypoints_from_mesh(m, verts_m, jc_m,
+                                               /*enable_hand_model=*/0,
+                                               /*n_threads=*/0, kp3d_post) != 0) {
+                rc_total = -1; goto cleanup;
+            }
         }
         t_keypoints_ms[li] += sb_time_ms() - t0;
-        t0 = sb_time_ms();
-        if (sam3d_body_camera_project(kp3d_post, cam3, &B, K,
-                                      kp2d_full, kp2d_crop, kp2d_dep,
-                                      pred_cam_t_world) != 0) {
-            rc_total = -1; goto cleanup;
+        if (!ctx->mhr_gpu_enabled) {
+            t0 = sb_time_ms();
+            if (sam3d_body_camera_project(kp3d_post, cam3, &B, K,
+                                          kp2d_full, kp2d_crop, kp2d_dep,
+                                          pred_cam_t_world) != 0) {
+                rc_total = -1; goto cleanup;
+            }
+            t_project_ms[li] += sb_time_ms() - t0;
         }
-        t_project_ms[li] += sb_time_ms() - t0;
 
         t0 = sb_time_ms();
-        rc = cuda_sam3d_body_debug_run_kp_token_update(
-                ctx, li, img_emb, gh, gw,
-                kp2d_crop, kp2d_dep, kp3d_post,
-                N_Q, tokens, augment);
+        if (dev_decoder) {
+            rc = cuda_sam3d_body_kp_token_update_dev(
+                    ctx, li, gh, gw, N_Q, kp2d_crop, kp2d_dep,
+                    d_kpu_img_run, d_dec_tokens, d_dec_aug, &KS);
+        } else {
+            rc = cuda_sam3d_body_debug_run_kp_token_update(
+                    ctx, li, img_emb, gh, gw,
+                    kp2d_crop, kp2d_dep, kp3d_post,
+                    N_Q, tokens, augment);
+        }
         if (rc != 0) { rc_total = rc; goto cleanup; }
         t_kp_update_ms[li] += sb_time_ms() - t0;
     }
@@ -2382,8 +2949,13 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     {
     const int ti = NL;
     double t0 = sb_time_ms();
-    rc = cuda_sam3d_body_debug_run_norm_and_heads(
-            ctx, tokens, N_Q, tokens_n, pose_raw, cam_raw);
+    if (dev_decoder) {
+        rc = cuda_sam3d_body_norm_heads_dev(
+                ctx, d_dec_tokens, pose_raw, cam_raw, &HS);
+    } else {
+        rc = cuda_sam3d_body_debug_run_norm_and_heads(
+                ctx, tokens, N_Q, NULL, pose_raw, cam_raw);
+    }
     if (rc != 0) { rc_total = rc; goto cleanup; }
     t_norm_heads_ms[ti] += sb_time_ms() - t0;
     for (int i = 0; i < 519; i++) pose519[i] = pose_raw[i] + ip[i];
@@ -2396,33 +2968,49 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     }
     t_decode_pose_ms[ti] += sb_time_ms() - t0;
     t0 = sb_time_ms();
-    if (sam3d_body_mhr_forward((const sam3d_body_mhr_assets *)ctx->cpu_mhr,
-                               mp_buf, shape_buf, face_buf,
-                               1, 1, /*n_threads=*/0, mhr_scratch,
-                               verts_cm, gskel_cm) != 0) {
+    int mhr_rc = ctx->mhr_gpu_enabled
+        ? cuda_sam3d_body_mhr_forward_hybrid(
+              ctx, mp_buf, shape_buf, face_buf,
+              1, SAM3DB_MHR_THREADS(), mhr_scratch, verts_cm, gskel_cm)
+        : sam3d_body_mhr_forward((const sam3d_body_mhr_assets *)ctx->cpu_mhr,
+                                  mp_buf, shape_buf, face_buf,
+                                  1, 1, SAM3DB_MHR_THREADS(), mhr_scratch,
+                                  verts_cm, gskel_cm);
+    if (mhr_rc != 0) {
         rc_total = -1; goto cleanup;
     }
     t_mhr_ms[ti] += sb_time_ms() - t0;
-    for (int i = 0; i < V * 3; i++) verts_m[i] = verts_cm[i] * 0.01f;
-    for (int j = 0; j < J; j++) {
-        jc_m[j*3 + 0] = gskel_cm[(size_t)j*8 + 0] * 0.01f;
-        jc_m[j*3 + 1] = gskel_cm[(size_t)j*8 + 1] * 0.01f;
-        jc_m[j*3 + 2] = gskel_cm[(size_t)j*8 + 2] * 0.01f;
-    }
     t0 = sb_time_ms();
-    if (sam3d_body_keypoints_from_mesh(m, verts_m, jc_m,
-                                       /*enable_hand_model=*/0,
-                                       /*n_threads=*/0, kp3d_post) != 0) {
-        rc_total = -1; goto cleanup;
+    for (int i = 0; i < V * 3; i++) verts_m[i] = verts_cm[i] * 0.01f;
+    if (ctx->mhr_gpu_enabled) {
+        if (cuda_sam3d_body_keypoints_project_cached(
+                ctx, gskel_cm, cam3, &B,
+                kp3d_post, kp2d_full, kp2d_crop, kp2d_dep,
+                pred_cam_t_world) != CUDA_SAM3D_BODY_E_OK) {
+            rc_total = -1; goto cleanup;
+        }
+    } else {
+        for (int j = 0; j < J; j++) {
+            jc_m[j*3 + 0] = gskel_cm[(size_t)j*8 + 0] * 0.01f;
+            jc_m[j*3 + 1] = gskel_cm[(size_t)j*8 + 1] * 0.01f;
+            jc_m[j*3 + 2] = gskel_cm[(size_t)j*8 + 2] * 0.01f;
+        }
+        if (sam3d_body_keypoints_from_mesh(m, verts_m, jc_m,
+                                           /*enable_hand_model=*/0,
+                                           /*n_threads=*/0, kp3d_post) != 0) {
+            rc_total = -1; goto cleanup;
+        }
     }
     t_keypoints_ms[ti] += sb_time_ms() - t0;
-    t0 = sb_time_ms();
-    if (sam3d_body_camera_project(kp3d_post, cam3, &B, K,
-                                  kp2d_full, kp2d_crop, kp2d_dep,
-                                  pred_cam_t_world) != 0) {
-        rc_total = -1; goto cleanup;
+    if (!ctx->mhr_gpu_enabled) {
+        t0 = sb_time_ms();
+        if (sam3d_body_camera_project(kp3d_post, cam3, &B, K,
+                                      kp2d_full, kp2d_crop, kp2d_dep,
+                                      pred_cam_t_world) != 0) {
+            rc_total = -1; goto cleanup;
+        }
+        t_project_ms[ti] += sb_time_ms() - t0;
     }
-    t_project_ms[ti] += sb_time_ms() - t0;
     }
 
     /* ---- Populate ctx outputs (vertices in meters, kp arrays, mhr_params,
@@ -2475,6 +3063,7 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     }
 
 cleanup:
+    ctx->kpu_use_cached_img = 0;
     if (ctx->verbose >= 1) {
         double sum_layer = 0.0, sum_norm = 0.0, sum_decode = 0.0;
         double sum_mhr = 0.0, sum_kp = 0.0, sum_proj = 0.0, sum_kpu = 0.0;
@@ -2491,14 +3080,14 @@ cleanup:
         }
         fprintf(stderr,
                 "[sam3d_body][timing] decoder total %.3f ms "
-                "(geom %.3f, encoder_permute %.3f, rays %.3f, "
+                "(mhr_cache %.3f, geom %.3f, encoder_permute %.3f, rays %.3f, "
                 "ray_cond %.3f, dense_pe %.3f, ctx_permute %.3f, "
                 "condition %.3f, build_tokens %.3f, workspace %.3f, "
                 "layers %.3f, norm_heads %.3f, decode_pose %.3f, "
                 "mhr %.3f, keypoints %.3f, camera_project %.3f, "
                 "kp_update %.3f, output %.3f)\n",
                 sb_time_ms() - t_decoder0,
-                t_geom_ms, t_encoder_permute_ms, t_rays_ms,
+                t_mhr_cache_ms, t_geom_ms, t_encoder_permute_ms, t_rays_ms,
                 t_ray_cond_ms, t_dense_pe_ms, t_ctx_permute_ms,
                 t_condition_ms, t_build_tokens_ms, t_workspace_ms,
                 sum_layer, sum_norm, sum_decode, sum_mhr, sum_kp,
@@ -2524,17 +3113,52 @@ cleanup:
                 t_norm_heads_ms[NL], t_decode_pose_ms[NL], t_mhr_ms[NL],
                 t_keypoints_ms[NL], t_project_ms[NL]);
     }
-    free(img_emb); free(ctx_pe_tok); free(ctx_in);
+    free(img_emb); if (ctx_pe_tok_owned) free(ctx_pe_tok); free(ctx_in);
+    if (d_img_emb_chw_owned) sb_free_dev(d_img_emb_chw);
     free(tokens); free(tokens_b); free(augment); free(tokens_n);
     free(mhr_scratch); free(verts_cm); free(gskel_cm); free(verts_m); free(jc_m);
+    sb_free_dev(d_dec_tokens);
+    sb_free_dev(d_dec_tokens_b);
+    sb_free_dev(d_dec_aug);
+    sb_free_dev(d_dec_ctx);
+    if (d_dec_cpe_owned) sb_free_dev(d_dec_cpe);
+    sb_free_dev(DS.xpe_n);
+    sb_free_dev(DS.cpe_n);
+    sb_free_dev(DS.x_ln);
+    sb_free_dev(DS.qk);
+    sb_free_dev(DS.Q);
+    sb_free_dev(DS.K);
+    sb_free_dev(DS.V);
+    sb_free_dev(DS.attn);
+    sb_free_dev(DS.proj);
+    sb_free_dev(DS.x1);
+    sb_free_dev(DS.q_in);
+    sb_free_dev(DS.k_in);
+    sb_free_dev(DS.ctx_ln);
+    sb_free_dev(DS.x2);
+    sb_free_dev(DS.x_ln3);
+    sb_free_dev(DS.ffn_h);
+    sb_free_dev(DS.ffn_o);
+    sb_free_dev(KS.gxy);
+    sb_free_dev(KS.invalid);
+    sb_free_dev(KS.p_h);
+    sb_free_dev(KS.p_o);
+    sb_free_dev(KS.kp_feats);
+    sb_free_dev(KS.kp_proj);
+    sb_free_dev(KS.kp3d_norm);
+    sb_free_dev(KS.p3_h);
+    sb_free_dev(KS.p3_o);
+    sb_free_dev(HS.norm_row);
+    sb_free_dev(HS.pose_h);
+    sb_free_dev(HS.pose_raw);
+    sb_free_dev(HS.cam_h);
+    sb_free_dev(HS.cam_raw);
     return (rc_total == 0) ? CUDA_SAM3D_BODY_E_OK
                            : CUDA_SAM3D_BODY_E_LOAD;
 }
 
-/* Step 9: MHR skinning is folded into run_decoder (the per-layer
- * MHR-in-the-loop runs CPU mhr_forward; CUDA MHR skinning is Step 7
- * which stays deferred per the original plan). Keep the entry point
- * as a shim for API symmetry. */
+/* MHR skinning is folded into run_decoder; keep this entry point as a shim
+ * for API symmetry. */
 int cuda_sam3d_body_run_mhr(cuda_sam3d_body_ctx *ctx)
 {
     if (!ctx) return CUDA_SAM3D_BODY_E_INVAL;
@@ -2572,12 +3196,22 @@ int cuda_sam3d_body_get_encoder_tokens(cuda_sam3d_body_ctx *ctx,
     if (!ctx || !out_n || !out_dim) return CUDA_SAM3D_BODY_E_INVAL;
     *out_n = ctx->encoder_tokens.n;
     *out_dim = ctx->encoder_tokens.c;
-    if (out && ctx->encoder_tokens.data)
+    if (out && ctx->encoder_tokens.data) {
         memcpy(out, ctx->encoder_tokens.data,
                (size_t)ctx->encoder_tokens.n *
                (size_t)ctx->encoder_tokens.c * sizeof(float));
-    return ctx->encoder_tokens.data ? CUDA_SAM3D_BODY_E_OK
-                                    : CUDA_SAM3D_BODY_E_NOT_IMPLEMENTED;
+        return CUDA_SAM3D_BODY_E_OK;
+    }
+    if (ctx->encoder_tokens_dev_valid) {
+        if (out &&
+            hipMemcpy(out, ctx->d_proj,
+                      (size_t)ctx->encoder_tokens.n *
+                      (size_t)ctx->encoder_tokens.c * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            return CUDA_SAM3D_BODY_E_LOAD;
+        return CUDA_SAM3D_BODY_E_OK;
+    }
+    return CUDA_SAM3D_BODY_E_NOT_IMPLEMENTED;
 }
 
 int cuda_sam3d_body_get_mhr_params(cuda_sam3d_body_ctx *ctx, float *out, int *out_n)
@@ -2648,6 +3282,7 @@ int cuda_sam3d_body_debug_override_encoder(cuda_sam3d_body_ctx *ctx,
     if (!ctx->encoder_tokens.data) return CUDA_SAM3D_BODY_E_INVAL;
     memcpy(ctx->encoder_tokens.data, tokens, (size_t)n * dim * sizeof(float));
     ctx->encoder_tokens.n = n; ctx->encoder_tokens.c = dim;
+    ctx->encoder_tokens_dev_valid = 0;
     return CUDA_SAM3D_BODY_E_OK;
 }
 
@@ -2777,6 +3412,106 @@ fail:
     if (d_rays) hipFree(d_rays);
     if (d_out)  hipFree(d_out);
     return CUDA_SAM3D_BODY_E_LOAD;
+}
+
+static int cuda_sam3d_body_ray_cond_from_encoder_dev(
+        cuda_sam3d_body_ctx *ctx, const void *d_encoder_tokens,
+        int n_prefix, const float *rays_hwc, int H, int W,
+        void *d_out_chw)
+{
+    if (!ctx || !d_encoder_tokens || !rays_hwc || !d_out_chw ||
+        H <= 0 || W <= 0 || !ctx->dec.loaded || !ctx->dec.no_mask_embed)
+        return CUDA_SAM3D_BODY_E_INVAL;
+
+    const int C_img = SB_DEC_KV_DIM;
+    const int num_bands = 16;
+    const int C_fp = 3 + 6 * num_bands;
+    const int C_pre = C_img + C_fp;
+    const int N = H * W;
+    void *d_pre = NULL, *d_post = NULL, *d_rays = NULL;
+    size_t pre_bytes = (size_t)C_pre * N * sizeof(float);
+    size_t post_bytes = (size_t)C_img * N * sizeof(float);
+    size_t rays_bytes = (size_t)N * 3 * sizeof(float);
+
+    if (hipMalloc(&d_pre, pre_bytes) != hipSuccess) goto fail;
+    if (hipMalloc(&d_post, post_bytes) != hipSuccess) goto fail;
+    if (hipMalloc(&d_rays, rays_bytes) != hipSuccess) goto fail;
+    if (hipMemcpy(d_rays, rays_hwc, rays_bytes,
+                  hipMemcpyHostToDevice) != hipSuccess) goto fail;
+
+    {
+        struct __attribute__((packed)) {
+            void *out; const void *tokens; const void *no_mask;
+            int n_prefix; int N; int D;
+        } p = {
+            d_pre, d_encoder_tokens, ctx->dec.no_mask_embed,
+            n_prefix, N, C_img
+        };
+        unsigned bx = 256;
+        unsigned gx = (unsigned)(((size_t)N * C_img + bx - 1) / bx);
+        if (sb_launch(ctx->fn_encoder_to_preconv, gx, 1, 1, bx, 1, 1, 0,
+                      &p, sizeof(p)) < 0) goto fail;
+    }
+    {
+        float *fp_chw = (float *)d_pre + (size_t)C_img * N;
+        struct __attribute__((packed)) {
+            void *fp_chw; void *rays; int N; int nb;
+        } p = { fp_chw, d_rays, N, num_bands };
+        unsigned bx = 256;
+        unsigned gx = (unsigned)((N + bx - 1) / bx);
+        if (sb_launch(ctx->fn_ray_cond_fourier, gx, 1, 1, bx, 1, 1, 0,
+                      &p, sizeof(p)) < 0) goto fail;
+    }
+    {
+        struct __attribute__((packed)) {
+            void *out; void *W; void *src; int Co; int Ci; int N;
+        } p = { d_post, ctx->dec.ray_cond_conv_w, d_pre,
+                C_img, C_pre, N };
+        unsigned bx = 256;
+        unsigned gx = (unsigned)((N + bx - 1) / bx);
+        unsigned gy = (unsigned)C_img;
+        if (sb_launch(ctx->fn_conv1x1_chw, gx, gy, 1, bx, 1, 1, 0,
+                      &p, sizeof(p)) < 0) goto fail;
+    }
+    {
+        struct __attribute__((packed)) {
+            void *dst; void *src; void *g; void *b;
+            int C; int N; float eps;
+        } p = { d_out_chw, d_post,
+                ctx->dec.ray_cond_norm_w, ctx->dec.ray_cond_norm_b,
+                C_img, N, SB_DEC_LN_EPS };
+        unsigned bx = 256;
+        unsigned gx = (unsigned)((N + bx - 1) / bx);
+        if (sb_launch(ctx->fn_ln_chw, gx, 1, 1, bx, 1, 1, 0,
+                      &p, sizeof(p)) < 0) goto fail;
+    }
+    hipFree(d_pre);
+    hipFree(d_post);
+    hipFree(d_rays);
+    return CUDA_SAM3D_BODY_E_OK;
+
+fail:
+    if (d_pre) hipFree(d_pre);
+    if (d_post) hipFree(d_post);
+    if (d_rays) hipFree(d_rays);
+    return CUDA_SAM3D_BODY_E_LOAD;
+}
+
+static int cuda_sam3d_body_chw_to_tok_dev(
+        cuda_sam3d_body_ctx *ctx, void *d_out_tok,
+        const void *d_in_chw, int N, int D)
+{
+    if (!ctx || !d_out_tok || !d_in_chw || N <= 0 || D <= 0)
+        return CUDA_SAM3D_BODY_E_INVAL;
+    struct __attribute__((packed)) {
+        void *out; const void *in; int N; int D;
+    } p = { d_out_tok, d_in_chw, N, D };
+    unsigned bx = 256;
+    unsigned gx = (unsigned)(((size_t)N * D + bx - 1) / bx);
+    return (sb_launch(ctx->fn_chw_to_tok, gx, 1, 1, bx, 1, 1, 0,
+                      &p, sizeof(p)) < 0)
+        ? CUDA_SAM3D_BODY_E_LOAD
+        : CUDA_SAM3D_BODY_E_OK;
 }
 
 int cuda_sam3d_body_debug_run_build_tokens(cuda_sam3d_body_ctx *ctx,
@@ -2953,6 +3688,90 @@ static int sb_dec_sdpa(cuda_sam3d_body_ctx *c, void *out, const void *q,
     unsigned shmem = (256 + (unsigned)N_k) * 4u;
     return sb_launch(c->fn_sdpa, (unsigned)N_q, (unsigned)H, 1, 256, 1, 1,
                      shmem, &p, sizeof(p));
+}
+
+static int cuda_sam3d_body_run_decoder_layer_dev(
+        cuda_sam3d_body_ctx *ctx, int layer_idx,
+        void *d_x, const void *d_ctx, void *d_xpe, const void *d_cpe,
+        int N_q, int N_c, void *d_out,
+        sb_dec_layer_scratch_dev *S)
+{
+    if (!ctx || !d_x || !d_ctx || !d_xpe || !d_cpe || !d_out || !S)
+        return CUDA_SAM3D_BODY_E_INVAL;
+    if (!ctx->dec.loaded || layer_idx < 0 || layer_idx >= SB_DEC_LAYERS)
+        return CUDA_SAM3D_BODY_E_INVAL;
+
+    const int D    = SB_DEC_DIM;
+    const int Dc   = SB_DEC_KV_DIM;
+    const int H    = SB_DEC_HEADS;
+    const int Dh   = SB_DEC_HEAD_DIM;
+    const int E    = H * Dh;
+    const int F    = SB_DEC_FFN;
+    const float eps = SB_DEC_LN_EPS;
+    const int skip_first_pe = (layer_idx == 0);
+    sb_dec_layer_w *L = &ctx->dec.layers[layer_idx];
+
+    if (sb_dec_ln(ctx, S->xpe_n, d_xpe, L->ln_pe_1_w, L->ln_pe_1_b,
+                  N_q, D, eps) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_ln(ctx, S->cpe_n, d_cpe, L->ln_pe_2_w, L->ln_pe_2_b,
+                  N_c, Dc, eps) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+
+    if (sb_dec_ln(ctx, S->x_ln, d_x, L->ln1_w, L->ln1_b,
+                  N_q, D, eps) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (skip_first_pe) {
+        if (hipMemcpy(S->qk, S->x_ln, (size_t)N_q * D * sizeof(float),
+                      hipMemcpyDeviceToDevice) != hipSuccess)
+            return CUDA_SAM3D_BODY_E_LOAD;
+    } else {
+        if (sb_dec_add_two(ctx, S->qk, S->x_ln, S->xpe_n, N_q * D) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
+    }
+    if (sb_dec_gemm(ctx, S->Q, S->qk, L->sa_q_w, L->sa_q_b,
+                    N_q, D, E) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->K, S->qk, L->sa_k_w, L->sa_k_b,
+                    N_q, D, E) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->V, S->x_ln, L->sa_v_w, L->sa_v_b,
+                    N_q, D, E) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_sdpa(ctx, S->attn, S->Q, S->K, S->V,
+                    N_q, N_q, H, Dh) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->proj, S->attn, L->sa_proj_w, L->sa_proj_b,
+                    N_q, E, D) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_add_two(ctx, S->x1, d_x, S->proj, N_q * D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    if (sb_dec_ln(ctx, S->q_in, S->x1, L->ln2_1_w, L->ln2_1_b,
+                  N_q, D, eps) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_add_inplace(ctx, S->q_in, S->xpe_n, N_q * D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_ln(ctx, S->ctx_ln, d_ctx, L->ln2_2_w, L->ln2_2_b,
+                  N_c, Dc, eps) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_add_two(ctx, S->k_in, S->ctx_ln, S->cpe_n, N_c * Dc) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->Q, S->q_in, L->ca_q_w, L->ca_q_b,
+                    N_q, D, E) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->K, S->k_in, L->ca_k_w, L->ca_k_b,
+                    N_c, Dc, E) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->V, S->ctx_ln, L->ca_v_w, L->ca_v_b,
+                    N_c, Dc, E) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_sdpa(ctx, S->attn, S->Q, S->K, S->V,
+                    N_q, N_c, H, Dh) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->proj, S->attn, L->ca_proj_w, L->ca_proj_b,
+                    N_q, E, D) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_add_two(ctx, S->x2, S->x1, S->proj, N_q * D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    if (sb_dec_ln(ctx, S->x_ln3, S->x2, L->ln3_w, L->ln3_b,
+                  N_q, D, eps) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->ffn_h, S->x_ln3, L->ffn0_w, L->ffn0_b,
+                    N_q, D, F) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gelu(ctx, S->ffn_h, N_q * F) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->ffn_o, S->ffn_h, L->ffn1_w, L->ffn1_b,
+                    N_q, F, D) < 0) return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_add_two(ctx, d_out, S->x2, S->ffn_o, N_q * D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    return CUDA_SAM3D_BODY_E_OK;
 }
 
 int cuda_sam3d_body_debug_run_decoder_layer(cuda_sam3d_body_ctx *ctx,
@@ -3169,6 +3988,133 @@ static int sb_dec_aug_overwrite(cuda_sam3d_body_ctx *c, void *augment,
                      0, &p, sizeof(p));
 }
 
+static int cuda_sam3d_body_kp_token_update_dev(
+        cuda_sam3d_body_ctx *ctx, int layer_idx, int H, int W, int N_q,
+        const float *kp2d_cropped_host, const float *kp2d_depth_host,
+        const void *d_img_chw, void *d_tokens, void *d_aug,
+        sb_kpu_scratch_dev *S)
+{
+    if (!ctx || !kp2d_cropped_host || !kp2d_depth_host ||
+        !d_img_chw || !d_tokens || !d_aug || !S ||
+        !ctx->d_mhr_kp2d_crop || !ctx->d_mhr_kp2d_depth || !ctx->d_mhr_kp3d)
+        return CUDA_SAM3D_BODY_E_INVAL;
+    if (!ctx->dec.loaded || layer_idx < 0 || layer_idx >= SB_DEC_LAYERS)
+        return CUDA_SAM3D_BODY_E_INVAL;
+    if (layer_idx == SB_DEC_LAYERS - 1) return CUDA_SAM3D_BODY_E_OK;
+
+    const int D = SB_DEC_DIM;
+    const int C = SB_DEC_KV_DIM;
+    const int K = SB_DEC_KP;
+    const int kp2d_start = 1 + 1 + 1 + SB_DEC_HAND_TOK;
+    const int kp3d_start = kp2d_start + K;
+    if (kp3d_start + K > N_q) return CUDA_SAM3D_BODY_E_INVAL;
+
+    int invalid_h[70];
+    float gxy_h[70 * 2];
+    const int scale_x = (ctx->cfg.backbone == CUDA_SAM3D_BODY_BACKBONE_VITH);
+    for (int i = 0; i < K; i++) {
+        float x01 = kp2d_cropped_host[i*2 + 0] + 0.5f;
+        float y01 = kp2d_cropped_host[i*2 + 1] + 0.5f;
+        invalid_h[i] = (x01 < 0.0f) || (x01 > 1.0f) ||
+                       (y01 < 0.0f) || (y01 > 1.0f) ||
+                       (kp2d_depth_host[i] < 1e-5f);
+        float gx = kp2d_cropped_host[i*2 + 0] * 2.0f;
+        if (scale_x && W != H) gx *= (float)H / (float)W;
+        gxy_h[i*2 + 0] = gx;
+        gxy_h[i*2 + 1] = kp2d_cropped_host[i*2 + 1] * 2.0f;
+    }
+
+    size_t b_kp2 = (size_t)K * 2 * sizeof(float);
+    size_t b_inv = (size_t)K * sizeof(int);
+
+    if (hipMemcpy(S->gxy, gxy_h, b_kp2, hipMemcpyHostToDevice) != hipSuccess) goto fail;
+    if (hipMemcpy(S->invalid, invalid_h, b_inv, hipMemcpyHostToDevice) != hipSuccess) goto fail;
+
+    if (sb_dec_gemm(ctx, S->p_h, ctx->d_mhr_kp2d_crop,
+                    ctx->dec.kp_posemb_l0_w, ctx->dec.kp_posemb_l0_b,
+                    K, 2, D) < 0) goto fail;
+    if (sb_dec_relu(ctx, S->p_h, K * D) < 0) goto fail;
+    if (sb_dec_gemm(ctx, S->p_o, S->p_h,
+                    ctx->dec.kp_posemb_l1_w, ctx->dec.kp_posemb_l1_b,
+                    K, D, D) < 0) goto fail;
+    if (sb_dec_aug_overwrite(ctx, d_aug, kp2d_start, S->p_o, S->invalid,
+                             K, D) < 0) goto fail;
+    if (sb_dec_grid_sample(ctx, S->kp_feats, d_img_chw, S->gxy, S->invalid,
+                           K, C, H, W) < 0) goto fail;
+    if (sb_dec_gemm(ctx, S->kp_proj, S->kp_feats,
+                    ctx->dec.kp_feat_linear_w, ctx->dec.kp_feat_linear_b,
+                    K, C, D) < 0) goto fail;
+    {
+        float *d_tokens_kp = (float *)d_tokens + (size_t)kp2d_start * D;
+        if (sb_dec_add_inplace(ctx, d_tokens_kp, S->kp_proj, K * D) < 0) goto fail;
+    }
+
+    if (sb_dec_pelvis_norm(ctx, S->kp3d_norm, ctx->d_mhr_kp3d, K) < 0) goto fail;
+    if (sb_dec_gemm(ctx, S->p3_h, S->kp3d_norm,
+                    ctx->dec.kp3d_posemb_l0_w, ctx->dec.kp3d_posemb_l0_b,
+                    K, 3, D) < 0) goto fail;
+    if (sb_dec_relu(ctx, S->p3_h, K * D) < 0) goto fail;
+    if (sb_dec_gemm(ctx, S->p3_o, S->p3_h,
+                    ctx->dec.kp3d_posemb_l1_w, ctx->dec.kp3d_posemb_l1_b,
+                    K, D, D) < 0) goto fail;
+    if (sb_dec_aug_overwrite(ctx, d_aug, kp3d_start, S->p3_o, NULL,
+                             K, D) < 0) goto fail;
+    return CUDA_SAM3D_BODY_E_OK;
+
+fail:
+    return CUDA_SAM3D_BODY_E_LOAD;
+}
+
+static int cuda_sam3d_body_norm_heads_dev(
+        cuda_sam3d_body_ctx *ctx, const void *d_tokens,
+        float *pose_raw_host, float *cam_raw_host,
+        sb_head_scratch_dev *S)
+{
+    if (!ctx || !d_tokens || !pose_raw_host || !cam_raw_host || !S ||
+        !S->norm_row || !S->pose_h || !S->pose_raw || !S->cam_h || !S->cam_raw)
+        return CUDA_SAM3D_BODY_E_INVAL;
+    if (!ctx->dec.loaded) return CUDA_SAM3D_BODY_E_INVAL;
+
+    const int D = SB_DEC_DIM;
+    const int Np = SB_DEC_NPOSE;
+    const int Nc = SB_DEC_NCAM;
+    if (sb_dec_ln(ctx, S->norm_row, d_tokens,
+                  ctx->dec.norm_final_w, ctx->dec.norm_final_b,
+                  1, D, 1e-6f) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->pose_h, S->norm_row,
+                    ctx->dec.head_pose_l0_w, ctx->dec.head_pose_l0_b,
+                    1, D, D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_relu(ctx, S->pose_h, D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->pose_raw, S->pose_h,
+                    ctx->dec.head_pose_l1_w, ctx->dec.head_pose_l1_b,
+                    1, D, Np) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    if (sb_dec_gemm(ctx, S->cam_h, S->norm_row,
+                    ctx->dec.head_camera_l0_w, ctx->dec.head_camera_l0_b,
+                    1, D, D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_relu(ctx, S->cam_h, D) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (sb_dec_gemm(ctx, S->cam_raw, S->cam_h,
+                    ctx->dec.head_camera_l1_w, ctx->dec.head_camera_l1_b,
+                    1, D, Nc) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    if (hipMemcpy(pose_raw_host, S->pose_raw,
+                  (size_t)Np * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (hipMemcpy(cam_raw_host, S->cam_raw,
+                  (size_t)Nc * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    return CUDA_SAM3D_BODY_E_OK;
+}
+
 int cuda_sam3d_body_debug_run_kp_token_update(cuda_sam3d_body_ctx *ctx,
                                               int layer_idx,
                                               const float *image_emb_chw,
@@ -3233,9 +4179,15 @@ int cuda_sam3d_body_debug_run_kp_token_update(cuda_sam3d_body_ctx *ctx,
     size_t b_kp3 = (size_t)K * 3 * sizeof(float);
     size_t b_inv = (size_t)K * sizeof(int);
 
+    int use_cached_img = ctx->kpu_use_cached_img &&
+                         ctx->d_kpu_img &&
+                         ctx->d_kpu_img_cap >= b_img;
+
     if (hipMalloc(&d_tokens,    bx_q) != hipSuccess) goto fail;
     if (hipMalloc(&d_aug,       bx_q) != hipSuccess) goto fail;
-    if (hipMalloc(&d_img,       b_img) != hipSuccess) goto fail;
+    if (use_cached_img) {
+        d_img = ctx->d_kpu_img;
+    } else if (hipMalloc(&d_img, b_img) != hipSuccess) goto fail;
     if (hipMalloc(&d_gxy,       b_kp2) != hipSuccess) goto fail;
     if (hipMalloc(&d_invalid,   b_inv) != hipSuccess) goto fail;
     if (hipMalloc(&d_kp2d_in,   b_kp2) != hipSuccess) goto fail;
@@ -3250,7 +4202,8 @@ int cuda_sam3d_body_debug_run_kp_token_update(cuda_sam3d_body_ctx *ctx,
 
     if (hipMemcpy(d_tokens, tokens,        bx_q, hipMemcpyHostToDevice) != hipSuccess) goto fail;
     if (hipMemcpy(d_aug,    token_augment, bx_q, hipMemcpyHostToDevice) != hipSuccess) goto fail;
-    if (hipMemcpy(d_img,    image_emb_chw, b_img, hipMemcpyHostToDevice) != hipSuccess) goto fail;
+    if (!use_cached_img &&
+        hipMemcpy(d_img, image_emb_chw, b_img, hipMemcpyHostToDevice) != hipSuccess) goto fail;
     if (hipMemcpy(d_gxy,    gxy_h,         b_kp2, hipMemcpyHostToDevice) != hipSuccess) goto fail;
     if (hipMemcpy(d_invalid, invalid_h,    b_inv, hipMemcpyHostToDevice) != hipSuccess) goto fail;
     if (hipMemcpy(d_kp2d_in, kp2d_cropped, b_kp2, hipMemcpyHostToDevice) != hipSuccess) goto fail;
@@ -3300,7 +4253,8 @@ int cuda_sam3d_body_debug_run_kp_token_update(cuda_sam3d_body_ctx *ctx,
     if (hipMemcpy(tokens,        d_tokens, bx_q, hipMemcpyDeviceToHost) != hipSuccess) goto fail;
     if (hipMemcpy(token_augment, d_aug,    bx_q, hipMemcpyDeviceToHost) != hipSuccess) goto fail;
 
-    hipFree(d_tokens); hipFree(d_aug); hipFree(d_img);
+    hipFree(d_tokens); hipFree(d_aug);
+    if (!use_cached_img) hipFree(d_img);
     hipFree(d_gxy); hipFree(d_invalid); hipFree(d_kp2d_in);
     hipFree(d_p_h); hipFree(d_p_o);
     hipFree(d_kp_feats); hipFree(d_kp_proj);
@@ -3311,7 +4265,7 @@ int cuda_sam3d_body_debug_run_kp_token_update(cuda_sam3d_body_ctx *ctx,
 fail:
     if (d_tokens) hipFree(d_tokens);
     if (d_aug) hipFree(d_aug);
-    if (d_img) hipFree(d_img);
+    if (d_img && !use_cached_img) hipFree(d_img);
     if (d_gxy) hipFree(d_gxy);
     if (d_invalid) hipFree(d_invalid);
     if (d_kp2d_in) hipFree(d_kp2d_in);
@@ -3356,7 +4310,7 @@ int cuda_sam3d_body_debug_run_norm_and_heads(cuda_sam3d_body_ctx *ctx,
      * (the pose token) for the head MLPs. */
     float row0_scratch[SB_DEC_DIM];
     const int n_rows = tokens_norm ? N_q : 1;
-    int n_threads = SAM3DB_MHR_THREADS();
+    int n_threads = tokens_norm ? SAM3DB_MHR_THREADS() : 1;
 #if defined(_OPENMP)
     #pragma omp parallel for schedule(static) num_threads(n_threads)
 #else
@@ -3406,27 +4360,371 @@ int cuda_sam3d_body_debug_run_norm_and_heads(cuda_sam3d_body_ctx *ctx,
     return 0;
 }
 
+static void sb_mhr_batch6d_from_xyz(const float *e, float *out6)
+{
+    float cx = cosf(e[0]), sx = sinf(e[0]);
+    float cy = cosf(e[1]), sy = sinf(e[1]);
+    float cz = cosf(e[2]), sz = sinf(e[2]);
+    out6[0] = cy * cz;
+    out6[1] = cy * sz;
+    out6[2] = -sy;
+    out6[3] = -cx * sz + sx * sy * cz;
+    out6[4] = cx * cz + sx * sy * sz;
+    out6[5] = sx * cy;
+}
+
+static int cuda_sam3d_body_mhr_pose_correctives_cached(
+        cuda_sam3d_body_ctx *ctx, const float *joint_params, float *out_verts)
+{
+    if (!ctx || !ctx->mhr_gpu_enabled || !ctx->cpu_mhr ||
+        !joint_params)
+        return CUDA_SAM3D_BODY_E_INVAL;
+
+    const sam3d_body_mhr_assets *a = ctx->cpu_mhr;
+    const int V_d = S3DM_N_VERTS * 3;
+    const int HID = S3DM_N_PC_H;
+    const int NNZ = S3DM_N_PC_NNZ;
+    const int64_t *spi_row = (const int64_t *)a->pc_sparse_indices.data;
+    const int64_t *spi_col = spi_row + NNZ;
+    const float   *spw     = (const float *)a->pc_sparse_weight.data;
+
+    float feat[S3DM_N_PC_IN];
+    float h[S3DM_N_PC_H];
+
+    for (int jj = 0; jj < 125; jj++) {
+        const float *e = joint_params + (size_t)(jj + 2) * 7 + 3;
+        sb_mhr_batch6d_from_xyz(e, feat + (size_t)jj * 6);
+    }
+    for (int jj = 0; jj < 125; jj++) {
+        feat[(size_t)jj * 6 + 0] -= 1.0f;
+        feat[(size_t)jj * 6 + 4] -= 1.0f;
+    }
+
+    memset(h, 0, (size_t)HID * sizeof(float));
+    for (int k = 0; k < NNZ; k++) {
+        int row = (int)spi_row[k];
+        int col = (int)spi_col[k];
+        h[row] += spw[k] * feat[col];
+    }
+    for (int i = 0; i < HID; i++) {
+        if (h[i] < 0.0f) h[i] = 0.0f;
+    }
+
+    if (hipMemcpy(ctx->d_mhr_pc_h, h, (size_t)HID * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    struct __attribute__((packed)) {
+        void *Y; const void *W; const void *X; int D_in; int D_out;
+    } p = { ctx->d_mhr_pc_out, ctx->d_mhr_pc_linear_weight,
+            ctx->d_mhr_pc_h, HID, V_d };
+    unsigned bx = 256;
+    unsigned gx = (unsigned)V_d;
+    if (sb_launch(ctx->fn_mhr_matvec, gx, 1, 1, bx, 1, 1, 0,
+                  &p, sizeof(p)) < 0)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    if (out_verts) {
+        if (hipMemcpy(out_verts, ctx->d_mhr_pc_out,
+                      (size_t)V_d * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            return CUDA_SAM3D_BODY_E_LOAD;
+    }
+    return CUDA_SAM3D_BODY_E_OK;
+}
+
+static int cuda_sam3d_body_mhr_blend_cached(
+        cuda_sam3d_body_ctx *ctx,
+        const float *coeffs,
+        void *d_coeffs,
+        const void *d_vectors,
+        const void *d_base,
+        int N_basis,
+        void *d_out)
+{
+    const int V_d = S3DM_N_VERTS * 3;
+    if (hipMemcpy(d_coeffs, coeffs, (size_t)N_basis * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    struct __attribute__((packed)) {
+        void *out; const void *coeffs; const void *vec; const void *base;
+        int N_basis; int V_d;
+    } p = { d_out, d_coeffs, d_vectors, d_base, N_basis, V_d };
+    unsigned bx = 256;
+    unsigned gx = (unsigned)((V_d + bx - 1) / bx);
+    return sb_launch(ctx->fn_mhr_blend, gx, 1, 1, bx, 1, 1, 0,
+                     &p, sizeof(p));
+}
+
+static int cuda_sam3d_body_mhr_lbs_cached(
+        cuda_sam3d_body_ctx *ctx,
+        const float *global_skel_host,
+        const void *d_rest_verts,
+        float *out_verts_host)
+{
+    const sam3d_body_mhr_assets *a = ctx->cpu_mhr;
+    const int J = S3DM_N_JOINTS;
+    const int V = S3DM_N_VERTS;
+    const int K = S3DM_N_SKIN;
+    const float *IBP = (const float *)a->inverse_bind_pose.data;
+    float jstate_host[S3DM_N_JOINTS * 8];
+
+    for (int j = 0; j < J; j++) {
+        const float *s1 = global_skel_host + (size_t)j * 8;
+        const float *s2 = IBP + (size_t)j * 8;
+        float *o        = jstate_host + (size_t)j * 8;
+        float sc1 = s1[7], sc2 = s2[7];
+        float vx = sc1 * s2[0], vy = sc1 * s2[1], vz = sc1 * s2[2];
+        float qx = s1[3], qy = s1[4], qz = s1[5], qw = s1[6];
+        float avx = qy*vz - qz*vy;
+        float avy = qz*vx - qx*vz;
+        float avz = qx*vy - qy*vx;
+        float aavx = qy*avz - qz*avy;
+        float aavy = qz*avx - qx*avz;
+        float aavz = qx*avy - qy*avx;
+        o[0] = s1[0] + vx + 2.0f * (avx * qw + aavx);
+        o[1] = s1[1] + vy + 2.0f * (avy * qw + aavy);
+        o[2] = s1[2] + vz + 2.0f * (avz * qw + aavz);
+        float ax = s1[3], ay = s1[4], az = s1[5], aw = s1[6];
+        float bx = s2[3], by = s2[4], bz = s2[5], bw = s2[6];
+        o[3] = aw*bx + ax*bw + ay*bz - az*by;
+        o[4] = aw*by - ax*bz + ay*bw + az*bx;
+        o[5] = aw*bz + ax*by - ay*bx + az*bw;
+        o[6] = aw*bw - ax*bx - ay*by - az*bz;
+        o[7] = sc1 * sc2;
+    }
+
+    int rc = CUDA_SAM3D_BODY_E_LOAD;
+    if (hipMemcpy(ctx->d_mhr_jstate, jstate_host,
+                  (size_t)J * 8 * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess)
+        goto done;
+    if (hipMemset(ctx->d_mhr_skinned, 0,
+                  (size_t)V * 3 * sizeof(float)) != hipSuccess)
+        goto done;
+
+    struct __attribute__((packed)) {
+        void *out;
+        const void *jstate; const void *rv;
+        const void *si; const void *vi; const void *sw;
+        int K;
+    } p = {
+        ctx->d_mhr_skinned, ctx->d_mhr_jstate, d_rest_verts,
+        ctx->d_mhr_skin_indices, ctx->d_mhr_vert_indices,
+        ctx->d_mhr_skin_weights, K
+    };
+    unsigned bx = 256;
+    unsigned gx = (unsigned)((K + bx - 1) / bx);
+    if (sb_launch(ctx->fn_mhr_lbs, gx, 1, 1, bx, 1, 1, 0,
+                  &p, sizeof(p)) < 0)
+        goto done;
+    if (out_verts_host) {
+        if (hipMemcpy(out_verts_host, ctx->d_mhr_skinned,
+                      (size_t)V * 3 * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            goto done;
+    }
+    rc = CUDA_SAM3D_BODY_E_OK;
+
+done:
+    return rc;
+}
+
+static int cuda_sam3d_body_keypoints_project_cached(
+        cuda_sam3d_body_ctx *ctx,
+        const float *global_skel_cm,
+        const float *pred_cam,
+        const sam3d_body_camera_batch *batch,
+        float *kp3d_host,
+        float *kp2d_full_host,
+        float *kp2d_crop_host,
+        float *kp2d_depth_host,
+        float *pred_cam_t_host)
+{
+    if (!ctx || !ctx->mhr_gpu_enabled || !global_skel_cm || !pred_cam ||
+        !batch || !ctx->d_mhr_skinned || !ctx->d_mhr_keypoint_mapping)
+        return CUDA_SAM3D_BODY_E_INVAL;
+
+    const int V = S3DM_N_VERTS;
+    const int J = S3DM_N_JOINTS;
+    const int K = ctx->cpu_dec ? ctx->cpu_dec->n_keypoints : SB_DEC_KP;
+    if (K <= 0) return CUDA_SAM3D_BODY_E_INVAL;
+
+    if (hipMemcpy(ctx->d_mhr_gskel, global_skel_cm,
+                  (size_t)J * 8 * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+
+    {
+        struct __attribute__((packed)) {
+            void *out; const void *verts; const void *gskel; const void *km;
+            int V; int J; int K;
+        } p = {
+            ctx->d_mhr_kp3d, ctx->d_mhr_skinned, ctx->d_mhr_gskel,
+            ctx->d_mhr_keypoint_mapping, V, J, K
+        };
+        unsigned bx = 256;
+        unsigned gx = (unsigned)(K * 3);
+        if (sb_launch(ctx->fn_mhr_keypoints, gx, 1, 1, bx, 1, 1, 0,
+                      &p, sizeof(p)) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
+    }
+
+    {
+        const float *KM = batch->cam_int;
+        const float *AT = batch->affine_trans;
+        struct __attribute__((packed)) {
+            const void *kp3d;
+            void *kp2d_full; void *kp2d_crop; void *kp2d_depth; void *pred_cam_t;
+            float pred0; float pred1; float pred2;
+            float bbox_scale; float bbox_cx; float bbox_cy;
+            float ori_w; float ori_h;
+            float img_w; float img_h;
+            float k00; float k01; float k02;
+            float k10; float k11; float k12;
+            float k02_center; float k12_center;
+            float a00; float a01; float a02;
+            float a10; float a11; float a12;
+            int use_intrin_center; int K;
+        } p = {
+            ctx->d_mhr_kp3d,
+            ctx->d_mhr_kp2d_full, ctx->d_mhr_kp2d_crop,
+            ctx->d_mhr_kp2d_depth, ctx->d_mhr_pred_cam_t,
+            pred_cam[0], pred_cam[1], pred_cam[2],
+            batch->bbox_scale, batch->bbox_center[0], batch->bbox_center[1],
+            batch->ori_img_size[0], batch->ori_img_size[1],
+            batch->img_size[0], batch->img_size[1],
+            KM[0], KM[1], KM[2],
+            KM[3], KM[4], KM[5],
+            KM[2], KM[5],
+            AT[0], AT[1], AT[2],
+            AT[3], AT[4], AT[5],
+            batch->use_intrin_center, K
+        };
+        unsigned bx = 128;
+        unsigned gx = (unsigned)((K + (int)bx - 1) / (int)bx);
+        if (sb_launch(ctx->fn_mhr_project, gx, 1, 1, bx, 1, 1, 0,
+                      &p, sizeof(p)) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
+    }
+
+    if (kp3d_host &&
+        hipMemcpy(kp3d_host, ctx->d_mhr_kp3d,
+                  (size_t)K * 3 * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (kp2d_full_host &&
+        hipMemcpy(kp2d_full_host, ctx->d_mhr_kp2d_full,
+                  (size_t)K * 2 * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (kp2d_crop_host &&
+        hipMemcpy(kp2d_crop_host, ctx->d_mhr_kp2d_crop,
+                  (size_t)K * 2 * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (kp2d_depth_host &&
+        hipMemcpy(kp2d_depth_host, ctx->d_mhr_kp2d_depth,
+                  (size_t)K * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    if (pred_cam_t_host &&
+        hipMemcpy(pred_cam_t_host, ctx->d_mhr_pred_cam_t,
+                  3 * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return CUDA_SAM3D_BODY_E_LOAD;
+    return CUDA_SAM3D_BODY_E_OK;
+}
+
+static int cuda_sam3d_body_mhr_forward_hybrid(
+        cuda_sam3d_body_ctx *ctx,
+        const float *model_params, const float *shape, const float *face,
+        int apply_correctives, int n_threads, float *scratch,
+        float *out_skinned_verts, float *out_global_skel)
+{
+    if (!ctx || !ctx->mhr_gpu_enabled || !ctx->cpu_mhr ||
+        !model_params || !shape || !out_global_skel)
+        return CUDA_SAM3D_BODY_E_INVAL;
+
+    const sam3d_body_mhr_assets *a = ctx->cpu_mhr;
+    const int B = 1;
+    const int V = S3DM_N_VERTS;
+    const int J = S3DM_N_JOINTS;
+    size_t need = (size_t)B * (S3DM_N_PTRANS_OUT + J * 8 + V * 3 * 3);
+    float *buf = scratch;
+    int owned = 0;
+    if (!buf) {
+        buf = (float *)malloc(need * sizeof(float));
+        if (!buf) return CUDA_SAM3D_BODY_E_LOAD;
+        owned = 1;
+    }
+    float *jp      = buf;
+    float *lskel   = jp + (size_t)B * S3DM_N_PTRANS_OUT;
+
+    int r = CUDA_SAM3D_BODY_E_OK;
+    if (sam3d_body_mhr_parameter_transform(a, model_params, B, n_threads, jp) != 0 ||
+        sam3d_body_mhr_joint_params_to_local_skel(a, jp, B, lskel) != 0 ||
+        sam3d_body_mhr_local_to_global_skel(a, lskel, B, out_global_skel) != 0) {
+        r = CUDA_SAM3D_BODY_E_LOAD;
+        goto done;
+    }
+    if (face) {
+        r = cuda_sam3d_body_mhr_blend_cached(
+                ctx, face, ctx->d_mhr_face_coeffs,
+                ctx->d_mhr_face_vectors, NULL, S3DM_N_FACE, ctx->d_mhr_face);
+        if (r != CUDA_SAM3D_BODY_E_OK) {
+            r = CUDA_SAM3D_BODY_E_LOAD;
+            goto done;
+        }
+    } else {
+        if (hipMemset(ctx->d_mhr_face, 0,
+                      (size_t)V * 3 * sizeof(float)) != hipSuccess) {
+            r = CUDA_SAM3D_BODY_E_LOAD;
+            goto done;
+        }
+    }
+    r = cuda_sam3d_body_mhr_blend_cached(
+            ctx, shape, ctx->d_mhr_shape_coeffs,
+            ctx->d_mhr_blend_vectors, ctx->d_mhr_blend_base,
+            S3DM_N_SHAPE, ctx->d_mhr_rest);
+    if (r != CUDA_SAM3D_BODY_E_OK) goto done;
+    if (apply_correctives) {
+        r = cuda_sam3d_body_mhr_pose_correctives_cached(ctx, jp, NULL);
+        if (r != CUDA_SAM3D_BODY_E_OK) goto done;
+    } else {
+        if (hipMemset(ctx->d_mhr_pc_out, 0,
+                      (size_t)V * 3 * sizeof(float)) != hipSuccess) {
+            r = CUDA_SAM3D_BODY_E_LOAD;
+            goto done;
+        }
+    }
+    if (sb_dec_add_inplace(ctx, ctx->d_mhr_rest, ctx->d_mhr_face, V * 3) < 0 ||
+        sb_dec_add_inplace(ctx, ctx->d_mhr_rest, ctx->d_mhr_pc_out, V * 3) < 0) {
+        r = CUDA_SAM3D_BODY_E_LOAD;
+        goto done;
+    }
+    r = cuda_sam3d_body_mhr_lbs_cached(ctx, out_global_skel,
+                                       ctx->d_mhr_rest, out_skinned_verts);
+
+done:
+    if (owned) free(buf);
+    return r;
+}
+
 /* =====================================================================
- * Speculative MHR-on-GPU debug helpers (exploratory; off the production
- * path).
+ * MHR-on-GPU debug helpers.
  *
- * Step 7 was officially CLOSED on 2026-04-25 via CPU OpenMP parallelization
- * of the pose_correctives 55317×3000 GEMV — see PORT.md. The full GPU
- * port (~1500 NVRTC lines, including weight caching for the 663 MB
- * pc_linear_weight) was deemed not worth the cost given the 5.9× CPU
- * speedup at 16 threads (MHR 183 ms → 31 ms / call).
- *
- * What lives here is a smaller exploration:
+ * The production opt-in path above caches the MHR shape/face/pose/LBS
+ * tensors and uses them inside run_decoder when SAM3D_BODY_GPU_MHR=1.
+ * The helpers below are still useful for isolated verifier coverage:
  *   - blend_shape       (45 → V*3)   — uses mhr_blend_combine_f32
  *   - face_expressions  (72 → V*3)   — uses mhr_blend_combine_f32
  *   - pose_correctives  (jp 127×7 → V*3) — host 6D+sparse+ReLU,
  *                                          GPU dense GEMV via gemm_f32_bias
  *
- * Weights are uploaded ephemerally on each call (no caching), so these
- * are NOT performance-tuned — they exist to validate the kernels and to
- * keep the option open if a future inference pattern ever wants only
- * blend_shape on GPU. verify_mhr.c diffs each helper against the CPU
- * reference and the diffs are bit-exact / 1-ULP.
+ * The helper entry points upload weights ephemerally on each call, so they
+ * remain verifier/debug APIs rather than the production fast path.
+ * verify_mhr.c diffs each helper against the CPU reference.
  * ===================================================================== */
 
 static int cuda_sam3d_body_run_blend_combine(cuda_sam3d_body_ctx *ctx,
@@ -3622,7 +4920,7 @@ pc_fail:
     return CUDA_SAM3D_BODY_E_LOAD;
 }
 
-/* LBS skin_points — speculative MHR-on-GPU.
+/* LBS skin_points — debug MHR-on-GPU helper.
  *
  * Mirrors sam3d_body_mhr_skin_points (B=1): caller supplies the
  * global_skel (J=127, 8) and we compute jstate = skel_multiply(global,

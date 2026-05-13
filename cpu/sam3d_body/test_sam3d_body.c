@@ -193,7 +193,7 @@ static int run_refdir(const char *sft_dir, const char *mhr_dir,
 static int run_image(const char *sft_dir, const char *mhr_dir,
                      const char *image_path, float *bbox, int has_bbox,
                      int auto_bbox, const char *rt_detr_model,
-                     float auto_score_thresh,
+                     float auto_score_thresh, int auto_bbox_fast,
                      float focal_hint, uint64_t seed, const char *out_path,
                      sam3d_body_backbone_t backbone,
                      int n_threads, int verbose)
@@ -214,6 +214,8 @@ static int run_image(const char *sft_dir, const char *mhr_dir,
     /* If --auto-bbox is set and the user did not supply --bbox, run
      * RT-DETR-S on the image to detect the primary person. */
     if (auto_bbox && !has_bbox) {
+        if (auto_bbox_fast)
+            setenv("RT_DETR_ENCODER_ONLY", "1", 1);
         t0 = cli_time_ms();
         rt_detr_t *det = rt_detr_load(rt_detr_model);
         t_rt_load_ms = cli_time_ms() - t0;
@@ -239,8 +241,9 @@ static int run_image(const char *sft_dir, const char *mhr_dir,
         auto_bbox_used = 1;
         auto_bbox_score = box.score;
         fprintf(stderr,
-            "[test_sam3d_body] auto-bbox: detector=rt-detr-s score=%.4f "
+            "[test_sam3d_body] auto-bbox: detector=rt-detr-s%s score=%.4f "
             "threshold=%.3f image=%dx%d bbox=(%.1f,%.1f,%.1f,%.1f)\n",
+            auto_bbox_fast ? "-encoder" : "",
             box.score, auto_score_thresh, iw, ih,
             box.x0, box.y0, box.x1, box.y1);
     }
@@ -380,6 +383,7 @@ int main(int argc, char **argv)
     float       bbox[4]     = {0};
     int         has_bbox    = 0;
     int         auto_bbox   = 0;
+    int         auto_bbox_fast = 0;
     float       auto_thresh = 0.5f;
     float       focal_hint  = 0;
     uint64_t    seed        = 42;
@@ -402,6 +406,10 @@ int main(int argc, char **argv)
             has_bbox = 1;
         }
         else if (!strcmp(a, "--auto-bbox"))                     auto_bbox  = 1;
+        else if (!strcmp(a, "--auto-bbox-fast")) {
+            auto_bbox = 1;
+            auto_bbox_fast = 1;
+        }
         else if (!strcmp(a, "--backbone") && i+1 < argc) {
             const char *v = argv[++i];
             if      (!strcmp(v, "dinov3")) backbone = SAM3D_BODY_BACKBONE_DINOV3;
@@ -431,7 +439,7 @@ int main(int argc, char **argv)
             "  %s --safetensors-dir DIR --mhr-assets DIR --refdir REFDIR "
             "[-o body.obj] [-t N] [-v]\n"
             "  %s --safetensors-dir DIR --mhr-assets DIR --image IMG.jpg "
-            "[--bbox x0 y0 x1 y1 | --auto-bbox [--rt-detr-model PATH] "
+            "[--bbox x0 y0 x1 y1 | --auto-bbox [--auto-bbox-fast] [--rt-detr-model PATH] "
             "[--auto-thresh F]] [--focal F] [-o body.obj] [-t N] [-v]\n"
             "  %s SFT_DIR IMG.jpg ...   (legacy positional)\n",
             argv[0], argv[0], argv[0]);
@@ -445,6 +453,7 @@ int main(int argc, char **argv)
                           backbone, n_threads, verbose);
     return run_image(sft_dir, mhr_assets, image_path,
                      bbox, has_bbox, auto_bbox, rt_detr_model, auto_thresh,
+                     auto_bbox_fast,
                      focal_hint, seed, out_path,
                      backbone, n_threads, verbose);
 }
