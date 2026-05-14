@@ -7,14 +7,15 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
 ### TRELLIS.2 — texgen pipeline WORKS end-to-end on RX 9070 XT (fast path)
 - `./test_hip_trellis2 --full --mesh --tex …` produces a per-vertex-colored
   OBJ (**826,884 verts, 77,441 unique RGB triples** after nmap fast-path).
-- shape_dec: ~3.8 s, SLAT DiT 12 steps: ~9.1 s, tex_dec: **0.95 s**
-  (after 5ee328e + 58541f6 — was 3.1 s after just the correctness fix).
+- shape_dec: ~3.8 s, SLAT DiT 12 steps: ~9.1 s, tex_dec: **0.43 s**
+  (was 3.1 s after the correctness fix alone — 7.3× cumulative).
 - Fast-path coord-corruption root cause: persistent `g_c2s` scratch with
   stale hash entries across calls. Fixed by per-call `c2s_free_all` at
   end of `hip_shape_dec_forward_ex` (commit `5ee328e`).
 - Perf: build nmap on the fly via `t2_build_nmap_f32` so Triton/WMMA
-  spconv paths fire instead of hash_kspconv (commit `58541f6`).
-  Gap to PyT reference: 23× → 7× (PyT tex_dec ~134 ms).
+  spconv paths fire instead of hash_kspconv. Both convnext coarse
+  (commit `58541f6`) and c2s conv2 fine (commit `329765e`).
+  Gap to PyT reference: 23× → **3.2×** (PyT tex_dec ~134 ms).
 - Mesh axis (X/Z) and weight-cache size landmines documented in memory.
 
 ### TRELLIS.2 — MCLK power-state fix (committed 658bd69)
