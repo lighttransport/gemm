@@ -801,11 +801,14 @@ static int run_generate(const char *dit_path, const char *vae_path,
                          const char *prompt,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
-                         int use_gpu_enc, int device_id, int repeat,
+                         int use_gpu_enc, int keep_gpu_enc, int device_id, int repeat,
                          const char *out_override) {
     fprintf(stderr, "\n=== Flux.2 Klein GPU Pipeline ===\n");
     fprintf(stderr, "Runs: %d\n", repeat);
     if (use_gpu_enc) fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
+    if (use_gpu_enc && keep_gpu_enc) {
+        fprintf(stderr, "GPU text encoder residency: keep alive through DiT/VAE generation\n");
+    }
 
     fprintf(stderr, "\n[setup] Text encoder (%s)...\n", use_gpu_enc ? "GPU" : "CPU");
     struct timespec t0, t1;
@@ -818,8 +821,16 @@ static int run_generate(const char *dit_path, const char *vae_path,
     int n_txt = 0;
     int enc_embd = enc->n_embd;
     float *txt_hidden_raw = flux2_text_enc_encode(enc, prompt, &n_txt);
-    flux2_text_enc_free(enc);
-    if (!txt_hidden_raw) return 1;
+    flux2_text_enc *enc_hold = NULL;
+    if (!txt_hidden_raw) {
+        flux2_text_enc_free(enc);
+        return 1;
+    }
+    if (use_gpu_enc && keep_gpu_enc) {
+        enc_hold = enc;
+    } else {
+        flux2_text_enc_free(enc);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "Shared text enc: %.1f s (%d real tokens × %d)\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_txt, enc_embd);
@@ -827,6 +838,11 @@ static int run_generate(const char *dit_path, const char *vae_path,
     /* Front-pad text to 512 tokens with zeros (matches ComfyUI Flux2.extra_conds) */
     const int FLUX2_KLEIN_TXT_LEN = 512;
     float *txt_hidden = (float *)calloc((size_t)FLUX2_KLEIN_TXT_LEN * enc_embd, sizeof(float));
+    if (!txt_hidden) {
+        free(txt_hidden_raw);
+        flux2_text_enc_free(enc_hold);
+        return 1;
+    }
     int pad_front = FLUX2_KLEIN_TXT_LEN - n_txt;
     if (pad_front < 0) pad_front = 0;
     int real_txt = (n_txt < FLUX2_KLEIN_TXT_LEN) ? n_txt : FLUX2_KLEIN_TXT_LEN;
@@ -839,9 +855,25 @@ static int run_generate(const char *dit_path, const char *vae_path,
     fprintf(stderr, "\n[setup] Init CUDA + load DiT + VAE...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
     cuda_flux2_runner *r = cuda_flux2_init(device_id, 1);
-    if (!r) { free(txt_hidden); return 1; }
-    if (cuda_flux2_load_dit(r, dit_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
-    if (cuda_flux2_load_vae(r, vae_path) != 0) { free(txt_hidden); cuda_flux2_free(r); return 1; }
+    if (!r) {
+        free(txt_hidden);
+        flux2_text_enc_free(enc_hold);
+        return 1;
+    }
+    if (cuda_flux2_load_dit(r, dit_path) != 0) {
+        if (enc_hold) fprintf(stderr, "DiT load failed with GPU text encoder resident; retry without --keep-gpu-enc on lower-VRAM cards.\n");
+        free(txt_hidden);
+        flux2_text_enc_free(enc_hold);
+        cuda_flux2_free(r);
+        return 1;
+    }
+    if (cuda_flux2_load_vae(r, vae_path) != 0) {
+        if (enc_hold) fprintf(stderr, "VAE load failed with GPU text encoder resident; retry without --keep-gpu-enc on lower-VRAM cards.\n");
+        free(txt_hidden);
+        flux2_text_enc_free(enc_hold);
+        cuda_flux2_free(r);
+        return 1;
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "Shared init+load: %.1f s\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
@@ -859,6 +891,7 @@ static int run_generate(const char *dit_path, const char *vae_path,
     }
 
     free(txt_hidden);
+    flux2_text_enc_free(enc_hold);
     cuda_flux2_free(r);
     return rc;
 }
@@ -872,7 +905,7 @@ int main(int argc, char **argv) {
     const char *mode = NULL;
 
     int out_h = 256, out_w = 256, n_steps = 4, repeat = 1, n_txt = 8;
-    int is_distilled = 1, use_gpu_enc = 0, device_id = 0;
+    int is_distilled = 1, use_gpu_enc = 0, keep_gpu_enc = 0, device_id = 0;
     const char *out_path = NULL;
     float cfg_scale = 1.0f;
     float img_scale = 0.1f, txt_scale = 0.1f;
@@ -893,6 +926,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--base")       == 0) { is_distilled = 0; n_steps = 20; }
         else if (strcmp(argv[i], "--distilled")  == 0) { is_distilled = 1; n_steps = 4; }
         else if (strcmp(argv[i], "--gpu-enc")    == 0) use_gpu_enc = 1;
+        else if (strcmp(argv[i], "--keep-gpu-enc") == 0) { use_gpu_enc = 1; keep_gpu_enc = 1; }
         else if (strcmp(argv[i], "--dit")    == 0 && i+1<argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae")    == 0 && i+1<argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc")    == 0 && i+1<argc) enc_path = argv[++i];
@@ -915,6 +949,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--verbose")== 0 && i+1<argc) verbose  = atoi(argv[++i]);
         else if (strcmp(argv[i], "--out")    == 0 && i+1<argc) out_path = argv[++i];
     }
+    if (flux2_env_enabled("FLUX2_KEEP_GPU_ENC")) {
+        use_gpu_enc = 1;
+        keep_gpu_enc = 1;
+    }
 
     if (!mode) {
         fprintf(stderr,
@@ -922,7 +960,7 @@ int main(int argc, char **argv) {
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
-            "          [--base|--distilled] [--gpu-enc] [--device N]\n",
+            "          [--base|--distilled] [--gpu-enc] [--keep-gpu-enc] [--device N]\n",
             argv[0]);
         return 1;
     }
@@ -940,7 +978,7 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "gen")  == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,
-                            cfg_scale, use_gpu_enc, device_id, repeat,
+                            cfg_scale, use_gpu_enc, keep_gpu_enc, device_id, repeat,
                             out_path);
 
     fprintf(stderr, "Unknown mode: %s\n", mode);
