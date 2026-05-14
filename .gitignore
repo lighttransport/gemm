@@ -129,6 +129,7 @@ ref/sam3d/.venv/
 ref/sam3d/__pycache__/
 ref/sam3d-body/.venv/
 ref/sam3d-body/__pycache__/
+ref/sam3.1/__pycache__/
 ref/ppd/__pycache__/
 server/sam3d/__pycache__/
 
@@ -137,6 +138,9 @@ ref/*
 !ref/hy3d/
 !ref/trellis2/
 !ref/llm/
+!ref/sam3.1/
+ref/sam3.1/*
+!ref/sam3.1/gen_image_ref.py
 !ref/sam3d/
 !ref/sam3d/*.py
 !ref/sam3d/README.md
