@@ -1,37 +1,57 @@
 # rdna4 task board
 
-Snapshot: 2026-05-14. Branch: `trellis2`.
+Snapshot: 2026-05-15. Branch: `trellis2`.
 
 ## Current state
 
-### TRELLIS.2 — texgen pipeline WORKS end-to-end on RX 9070 XT (fast path)
+### TRELLIS.2 — texgen pipeline: correct + fast end-to-end on RX 9070 XT
 - `./test_hip_trellis2 --full --mesh --tex …` produces a per-vertex-colored
-  OBJ (**826,884 verts, 77,441 unique RGB triples** after nmap fast-path).
-- shape_dec: **~0.96 s** (was 3.8 s — nmap fast path applies here too),
-  SLAT DiT 12 steps: ~6.6 s, SS DiT 12 steps: ~8.2 s, tex DiT: ~4.0 s,
-  tex_dec: **0.43 s** (was 3.1 s after the correctness fix alone).
-- Fast-path coord-corruption root cause: persistent `g_c2s` scratch with
-  stale hash entries across calls. Fixed by per-call `c2s_free_all` at
-  end of `hip_shape_dec_forward_ex` (commit `5ee328e`).
-- Perf: build nmap on the fly via `t2_build_nmap_f32` so Triton/WMMA
-  spconv paths fire instead of hash_kspconv. Both convnext coarse
-  (commit `58541f6`) and c2s conv2 fine (commit `329765e`).
-  Gap to PyT reference: 23× → **3.2×** (PyT tex_dec ~134 ms).
+  OBJ (**~826k verts, ~77k unique RGB triples**); fully reproducible
+  back-to-back (3 consecutive runs identical, no reboots needed).
+- Pipeline budget: SS DiT 12 steps ~8.2 s, SLAT DiT 12 steps ~6.6 s,
+  shape_dec **~0.96 s**, tex DiT ~4.0 s, tex_dec **0.43 s**. E2E ~20 s.
+- **Correctness**: fast-path coord-corruption root cause was persistent
+  `g_c2s` scratch with stale hash entries across calls; fixed by per-call
+  `c2s_free_all` (commit `5ee328e`). This ALSO resolved the long-standing
+  "back-to-back runs go slow" / "post-xmrig MCLK regression" symptoms —
+  same stale-state bug, never a driver issue. No more reboots needed.
+- **Perf**: on-the-fly `t2_build_nmap_f32` unlocks Triton/WMMA spconv
+  (commits `58541f6` coarse + `329765e` fine) — tex_dec 3.1 s → 0.43 s
+  (7.3×), shape_dec 3.8 s → 0.96 s (4×) as a side effect. Gap to PyT
+  tex_dec reference: 23× → 3.2×.
+- **Mesh quality**: geometry correct (coarse IoU 0.92, bbox matches
+  reference to 3 decimals), ~56% tessellation density. Root-caused as
+  distributed numerical drift in the diffusion sampler — see below;
+  closed as "understood, not a bug".
 - Mesh axis (X/Z) and weight-cache size landmines documented in memory.
+
+### SS/SLAT DiT numerical drift — fully bisected, closed as "not a bug"
+- 4-level bisect (pipeline → SS DiT → per-block → per-op, all 2026-05-14):
+  HIP-F32 SS-DiT latent vs PyTorch-ROCm = rel_l2 0.141 (cross-hw floor
+  only 0.059). Per-block: no single broken block, cosine ≥0.9998, ~2%
+  accumulates over 30 blocks/forward. Per-op: attention/MLP GEMM
+  divergence is pure BF16 noise (F32 fixes it ~5×); only LayerNorm ops
+  + input GEMM have a tiny F32-persistent FMA/reduction-order residual,
+  and those are algorithmically identical to PyTorch (verified eps,
+  variance estimator). The 12-14% final divergence is the 24-forward
+  sampler compounding irreducible implementation-level numerical noise.
+  Not fixable without bit-exact PyTorch op-order replication. See
+  `project_trellis2_ss_dit_profile` memo.
+- SS DiT profile (`T2_DIT_PROF=1`, commit `5692aa3`): self-attn 51% /
+  MLP 32% / cross-attn 16% per forward; SA at the ~346 ms WMMA-compute-
+  bound floor. CFG batching + FA softmax rewrite both scoped, not worth
+  it (same memo).
 
 ### TRELLIS.2 — MCLK power-state fix (committed 658bd69)
 - `AMD_SERIALIZE_KERNEL=3` + `HSA_ENABLE_SDMA=0` installed via `execv()`
   self-re-exec when `--tex` is set and either var is missing. HIP runtime
   caches these at `hipInit`, so `setenv()` from `main()` is too late.
+  Still useful for perf (mclk ramp); no longer needed for correctness.
 - Env-gated instrumentation: `T2_TEX_PATH_DBG`, `T2_TEX_BLOCK_TIME`,
-  `T2_TEX_STAGE_TIME` (no-ops when unset).
-- **Validation regression (2026-05-12, 10-day uptime):** mclk-ramp lever
-  became unreliable; v20–v24 all hang post-init with mclk pinned at 96 MHz
-  regardless of env-var install path. v19 reached the 235 ms fast baseline
-  on stage 3 ConvNeXt before stalling — best evidence we have that the fix
-  code is correct. Reboot needed to re-confirm 38× wall-time.
+  `T2_TEX_STAGE_TIME`, `T2_DIT_PROF`, `T2_DUMP_SUBDIV_LOGITS` (no-ops
+  when unset).
 
-### Other landed work this session
+### Other landed work
 - `common/image_stats.h` + `common/image_diff_main.cc` (commit `8496022`):
   JSON stats / diff tool for `preview_render` AOV EXRs. LLM-readable
   comparison without VLM cost.
