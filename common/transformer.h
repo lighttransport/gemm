@@ -2754,6 +2754,124 @@ static void *tf_ssm_recurrence_worker(void *arg) {
                 o_h[r] = _mm_cvtss_f32(s4);
             }
         }
+#elif defined(__ARM_FEATURE_SVE)
+        /* SVE branch — A64FX vl=16 FP32 lanes.
+         * ds is typically 128, so 8 SVE iterations per ds-stride loop. */
+        {
+            svbool_t pg = svptrue_b32();
+            int vl = (int)svcntw();
+
+            /* Scale Q */
+            {
+                svfloat32_t vscale = svdup_f32(t->scale);
+                int i = 0;
+                for (; i + vl - 1 < ds; i += vl) {
+                    svst1(pg, q_h + i, svmul_x(pg, svld1(pg, q_h + i), vscale));
+                }
+                for (; i < ds; i++) q_h[i] *= t->scale;
+            }
+
+            /* Decay: state *= exp(alpha_h) */
+            {
+                float decay = expf(t->alpha[h]);
+                svfloat32_t vdecay = svdup_f32(decay);
+                int i = 0;
+                for (; i + vl - 1 < d2; i += vl) {
+                    svst1(pg, state + i, svmul_x(pg, svld1(pg, state + i), vdecay));
+                }
+                for (; i < d2; i++) state[i] *= decay;
+            }
+
+            /* Read: sk = state @ k (2-row at a time to share k loads) */
+            float sk[128];
+            {
+                int r = 0;
+                for (; r + 1 < ds; r += 2) {
+                    float *row0 = state + r * ds;
+                    float *row1 = state + (r + 1) * ds;
+                    svfloat32_t a0 = svdup_f32(0.0f);
+                    svfloat32_t a1 = svdup_f32(0.0f);
+                    int c = 0;
+                    for (; c + vl - 1 < ds; c += vl) {
+                        svfloat32_t kv = svld1(pg, k_h + c);
+                        a0 = svmla_x(pg, a0, svld1(pg, row0 + c), kv);
+                        a1 = svmla_x(pg, a1, svld1(pg, row1 + c), kv);
+                    }
+                    float sum0 = svaddv(pg, a0);
+                    float sum1 = svaddv(pg, a1);
+                    for (; c < ds; c++) { sum0 += row0[c] * k_h[c]; sum1 += row1[c] * k_h[c]; }
+                    sk[r] = sum0;
+                    sk[r + 1] = sum1;
+                }
+                for (; r < ds; r++) {
+                    float *row = state + r * ds;
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    int c = 0;
+                    for (; c + vl - 1 < ds; c += vl)
+                        acc = svmla_x(pg, acc, svld1(pg, row + c), svld1(pg, k_h + c));
+                    float sum = svaddv(pg, acc);
+                    for (; c < ds; c++) sum += row[c] * k_h[c];
+                    sk[r] = sum;
+                }
+            }
+
+            /* Delta: d = (v - sk) * beta */
+            float delta[128];
+            {
+                float beta_h = t->beta_arr[h];
+                svfloat32_t vbeta = svdup_f32(beta_h);
+                int i = 0;
+                for (; i + vl - 1 < ds; i += vl) {
+                    svfloat32_t dv = svsub_x(pg, svld1(pg, v_h + i), svld1(pg, sk + i));
+                    svst1(pg, delta + i, svmul_x(pg, dv, vbeta));
+                }
+                for (; i < ds; i++) delta[i] = (v_h[i] - sk[i]) * beta_h;
+            }
+
+            /* Update: state[r][c] += delta[r] * k[c] (outer product) */
+            for (int r = 0; r < ds; r++) {
+                float *row = state + r * ds;
+                svfloat32_t vdr = svdup_f32(delta[r]);
+                int c = 0;
+                for (; c + vl - 1 < ds; c += vl) {
+                    svfloat32_t acc = svmla_x(pg, svld1(pg, row + c), vdr, svld1(pg, k_h + c));
+                    svst1(pg, row + c, acc);
+                }
+                for (; c < ds; c++) row[c] += delta[r] * k_h[c];
+            }
+
+            /* Output: o = state @ q (2-row to share q loads) */
+            {
+                int r = 0;
+                for (; r + 1 < ds; r += 2) {
+                    float *row0 = state + r * ds;
+                    float *row1 = state + (r + 1) * ds;
+                    svfloat32_t a0 = svdup_f32(0.0f);
+                    svfloat32_t a1 = svdup_f32(0.0f);
+                    int c = 0;
+                    for (; c + vl - 1 < ds; c += vl) {
+                        svfloat32_t qv = svld1(pg, q_h + c);
+                        a0 = svmla_x(pg, a0, svld1(pg, row0 + c), qv);
+                        a1 = svmla_x(pg, a1, svld1(pg, row1 + c), qv);
+                    }
+                    float sum0 = svaddv(pg, a0);
+                    float sum1 = svaddv(pg, a1);
+                    for (; c < ds; c++) { sum0 += row0[c] * q_h[c]; sum1 += row1[c] * q_h[c]; }
+                    o_h[r] = sum0;
+                    o_h[r + 1] = sum1;
+                }
+                for (; r < ds; r++) {
+                    float *row = state + r * ds;
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    int c = 0;
+                    for (; c + vl - 1 < ds; c += vl)
+                        acc = svmla_x(pg, acc, svld1(pg, row + c), svld1(pg, q_h + c));
+                    float sum = svaddv(pg, acc);
+                    for (; c < ds; c++) sum += row[c] * q_h[c];
+                    o_h[r] = sum;
+                }
+            }
+        }
 #else
         /* Scalar fallback */
         for (int i = 0; i < ds; i++) q_h[i] *= t->scale;
