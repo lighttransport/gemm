@@ -88,6 +88,41 @@ def parse_variants_arg(s):
     return out
 
 
+# ---- Backend probing -----------------------------------------------------
+
+_PROBE_CACHE = {}
+
+def _probe_torch(python_exe):
+    """Run a tiny script in `python_exe` to see if torch + a GPU are present.
+
+    Returns {"ok": bool, "device": "cuda"|"rocm"|"cpu", "name": str, "error": str}.
+    Cached per interpreter path.
+    """
+    if python_exe in _PROBE_CACHE:
+        return _PROBE_CACHE[python_exe]
+    snippet = (
+        "import json\n"
+        "out={'ok':False,'device':'cpu','name':'','error':''}\n"
+        "try:\n"
+        "    import torch\n"
+        "    out['ok']=True\n"
+        "    if torch.cuda.is_available():\n"
+        "        out['device']='rocm' if (getattr(torch.version,'hip',None)) else 'cuda'\n"
+        "        out['name']=torch.cuda.get_device_name(0)\n"
+        "except Exception as e:\n"
+        "    out['error']=str(e)\n"
+        "print(json.dumps(out))\n"
+    )
+    try:
+        proc = subprocess.run([python_exe, "-c", snippet],
+                              capture_output=True, text=True, timeout=60)
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        info = {"ok": False, "device": "cpu", "name": "", "error": str(e)}
+    _PROBE_CACHE[python_exe] = info
+    return info
+
+
 # ---- Mesh helpers --------------------------------------------------------
 
 def _decode_image(b64):
@@ -205,6 +240,77 @@ class OursCudaBackend:
         return glb, mime, nv, nf, dt_ms
 
 
+class OursHipBackend:
+    """rdna4/trellis2/test_hip_trellis2 --full ...
+
+    The HIP runner has no DINOv3 stage, so DINOv3 features are extracted first
+    via gen_stage1_ref.py --features-only (PyTorch/ROCm), then fed in as a .npy.
+    The runner writes hip_occupancy.npy; marching cubes runs in-process.
+    """
+    def __init__(self, hip_bin, feat_script, feat_python):
+        self.bin = os.path.abspath(hip_bin)
+        self.feat_script = os.path.abspath(feat_script)
+        self.feat_python = feat_python
+        self.lock = threading.Lock()
+        self._probe = None
+
+    def bin_ok(self):
+        return os.path.isfile(self.bin) and os.access(self.bin, os.X_OK)
+
+    def available(self):
+        # Needs the HIP binary AND a torch+GPU ref python for DINOv3 features.
+        if not (self.bin_ok() and os.path.isfile(self.feat_script)):
+            return False
+        if self._probe is None:
+            self._probe = _probe_torch(self.feat_python)
+        return self._probe.get("ok", False) and self._probe.get("device") != "cpu"
+
+    def infer(self, variant, image, params):
+        steps = int(params.get("steps") or variant.default_steps)
+        seed  = int(params.get("seed") or 42)
+        threshold = float(params.get("threshold") or 0.0)
+        with self.lock, tempfile.TemporaryDirectory() as td:
+            png = os.path.join(td, "in.png")
+            image.save(png, format="PNG")
+            t0 = time.time()
+            # 1) DINOv3 features (PyTorch) -> ref_features.npy
+            proc = subprocess.run(
+                [self.feat_python, self.feat_script,
+                 "--features-only",
+                 "--image", png,
+                 "--dinov3", variant.dinov3,
+                 "--stage1", variant.stage1,
+                 "--decoder", variant.decoder,
+                 "--seed", str(seed),
+                 "--output-dir", td],
+                capture_output=True, text=True)
+            feat_npy = os.path.join(td, "ref_features.npy")
+            if proc.returncode != 0 or not os.path.isfile(feat_npy):
+                raise RuntimeError(
+                    f"ours-hip (DINOv3 feature extraction) failed "
+                    f"(rc={proc.returncode}):\nstderr tail:\n{proc.stderr[-2000:]}")
+            # 2) HIP full pipeline -> hip_occupancy.npy
+            proc = subprocess.run(
+                [self.bin, "--full",
+                 "--dit", variant.stage1,
+                 "--decoder", variant.decoder,
+                 "--features", feat_npy,
+                 "--seed", str(seed),
+                 "--steps", str(steps),
+                 "--output-dir", td],
+                capture_output=True, text=True)
+            occ_path = os.path.join(td, "hip_occupancy.npy")
+            if proc.returncode != 0 or not os.path.isfile(occ_path):
+                raise RuntimeError(
+                    f"ours-hip failed (rc={proc.returncode}):\n"
+                    f"stderr tail:\n{proc.stderr[-2000:]}")
+            obj_path = os.path.join(td, "out.obj")
+            _occupancy_to_obj(occ_path, obj_path, threshold=threshold)
+            dt_ms = int((time.time() - t0) * 1000)
+            glb, mime, nv, nf = _mesh_to_glb(obj_path)
+        return glb, mime, nv, nf, dt_ms
+
+
 class PytorchShellBackend:
     """ref/trellis2/gen_stage1_ref.py --image ... --dinov3 ... --stage1 ...
         --decoder ... --seed N --steps N --output-dir <dir>
@@ -213,9 +319,15 @@ class PytorchShellBackend:
         self.script = os.path.abspath(script_path)
         self.python = python_exe
         self.lock = threading.Lock()
+        self._probe = None
 
     def available(self):
-        return os.path.isfile(self.script)
+        """Script must exist AND the ref python must have torch with a GPU."""
+        if not os.path.isfile(self.script):
+            return False
+        if self._probe is None:
+            self._probe = _probe_torch(self.python)
+        return self._probe.get("ok", False) and self._probe.get("device") != "cpu"
 
     def infer(self, variant, image, params):
         steps = int(params.get("steps") or variant.default_steps)
@@ -369,6 +481,8 @@ def main():
                     default=os.path.join(repo_root, "cpu", "trellis2", "test_trellis2"))
     ap.add_argument("--cuda-bin",
                     default=os.path.join(repo_root, "cuda", "trellis2", "test_cuda_trellis2"))
+    ap.add_argument("--hip-bin",
+                    default=os.path.join(repo_root, "rdna4", "trellis2", "test_hip_trellis2"))
     ap.add_argument("--ref-script",
                     default=os.path.join(here, "gen_stage1_ref.py"))
     ap.add_argument("--ref-python", default=sys.executable)
@@ -404,15 +518,46 @@ def main():
         if be.available():
             backends["ours-cuda"] = be
         else:
-            print(f"[trellis2] ours-cuda binary not present at {args.cuda_bin}",
+            print(f"[trellis2] ours-cuda: binary not present at {args.cuda_bin}",
                   file=sys.stderr)
-    if "pytorch" not in disabled:
+    if "ours-hip" not in disabled:
+        be = OursHipBackend(args.hip_bin, args.ref_script, args.ref_python)
+        if be.available():
+            backends["ours-hip"] = be
+        elif not be.bin_ok():
+            print(f"[trellis2] ours-hip: binary not present at {args.hip_bin}",
+                  file=sys.stderr)
+        else:
+            print(f"[trellis2] ours-hip: binary present but ref python "
+                  f"{args.ref_python!r} lacks torch+GPU for DINOv3 features",
+                  file=sys.stderr)
+    if "pytorch" not in disabled and "pytorch-cuda" not in disabled:
         be = PytorchShellBackend(args.ref_script, args.ref_python)
         if be.available():
             backends["pytorch-cuda"] = be
-        else:
-            print(f"[trellis2] pytorch ref script missing at {args.ref_script}",
+        elif not os.path.isfile(args.ref_script):
+            print(f"[trellis2] pytorch: ref script missing at {args.ref_script}",
                   file=sys.stderr)
+        else:
+            info = _probe_torch(args.ref_python)
+            print(f"[trellis2] pytorch: ref python {args.ref_python!r} has no usable "
+                  f"GPU torch (device={info.get('device')}, "
+                  f"error={info.get('error') or 'none'})", file=sys.stderr)
+
+    # ---- Backend detection summary ----
+    probe = _probe_torch(args.ref_python)
+    print("[trellis2] backend detection:", file=sys.stderr)
+    print(f"    cuda  binary : {args.cuda_bin} "
+          f"[{'ok' if os.path.isfile(args.cuda_bin) else 'missing'}]", file=sys.stderr)
+    print(f"    hip   binary : {args.hip_bin} "
+          f"[{'ok' if os.path.isfile(args.hip_bin) else 'missing'}]", file=sys.stderr)
+    print(f"    cpu   binary : {args.cpu_bin} "
+          f"[{'ok' if os.path.isfile(args.cpu_bin) else 'missing'}]", file=sys.stderr)
+    print(f"    torch (ref)  : {'ok' if probe.get('ok') else 'missing'}, "
+          f"device={probe.get('device')}, gpu={probe.get('name') or 'n/a'}",
+          file=sys.stderr)
+    print(f"[trellis2] enabled backends: {sorted(backends.keys()) or 'NONE'}",
+          file=sys.stderr)
 
     if not backends:
         sys.exit("no backends enabled")
