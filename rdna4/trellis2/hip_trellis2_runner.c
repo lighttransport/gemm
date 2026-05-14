@@ -2383,38 +2383,17 @@ int hip_trellis2_run_tex_dec(hip_trellis2_runner *r,
                         "is available — run shape_dec first\n");
         return -1;
     }
-    /* Drain ALL outstanding GPU work before tex_dec starts. Prior tex DiT
-     * runs on r->stream; without device-wide sync those writes can race
-     * with tex_dec's cache uploads. Slow tex_dec produces correct coords
-     * (v48); fast tex_dec collapses them to (0,0,0) (v37/v45) — symptom
-     * of a race that slow execution masks. */
-    hipDeviceSynchronize();
     int rc = hip_shape_dec_forward_ex(r->tex_dec_ctx, slat_feats, coords,
                                        N, slat_C, cache,
                                        &d_feats, &d_coords, &Nf);
     if (rc != 0 || Nf <= 0) return -1;
 
     if (r->tex_dec_stream) hipStreamSynchronize(r->tex_dec_stream);
-    /* Fix candidate C: hard device sync between forward_ex and caller D2H. */
-    hipDeviceSynchronize();
     int out_ch = r->tex_dec->out_channels;
     float   *h_feats  = (float *)  malloc((size_t)Nf * out_ch * sizeof(float));
     int32_t *h_coords = (int32_t *)malloc((size_t)Nf * 4      * sizeof(int32_t));
     hipMemcpy(h_feats,  d_feats,  (size_t)Nf * out_ch * sizeof(float),   hipMemcpyDeviceToHost);
     hipMemcpy(h_coords, d_coords, (size_t)Nf * 4      * sizeof(int32_t), hipMemcpyDeviceToHost);
-    /* Post-D2H integrity probe — was h_coords zeroed during readback? */
-    if (h_coords[1] == 0 && h_coords[2] == 0 && h_coords[3] == 0) {
-        fprintf(stderr, "T2-WARN: run_tex_dec post-D2H h_coords[0]=(%d,%d,%d,%d) — caller read zeros\n",
-            h_coords[0], h_coords[1], h_coords[2], h_coords[3]);
-        /* Last-ditch retry: re-read with a second hipDeviceSync. */
-        hipDeviceSynchronize();
-        hipMemcpy(h_coords, d_coords, (size_t)Nf * 4 * sizeof(int32_t), hipMemcpyDeviceToHost);
-        fprintf(stderr, "T2-RETRY: h_coords[0]=(%d,%d,%d,%d)\n",
-            h_coords[0], h_coords[1], h_coords[2], h_coords[3]);
-    } else {
-        fprintf(stderr, "T2-OK: run_tex_dec h_coords[0]=(%d,%d,%d,%d)\n",
-            h_coords[0], h_coords[1], h_coords[2], h_coords[3]);
-    }
     hipFree(d_feats); hipFree(d_coords);
 
     *out_feats  = h_feats;
