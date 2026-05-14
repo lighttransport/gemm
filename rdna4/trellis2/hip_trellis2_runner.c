@@ -1766,8 +1766,25 @@ int hip_trellis2_decode(hip_trellis2_runner *r, const float *latent, float *occu
 /* DiT forward                                                            */
 /* ======================================================================== */
 
+/* Coarse SS-DiT profiler: T2_DIT_PROF=1 prints per-section wall time
+ * (sync'd) accumulated across the 30 blocks. */
+static double t2_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+static int g_dit_prof = -1;
+static double g_dit_t_sa, g_dit_t_ca, g_dit_t_mlp, g_dit_t_kv, g_dit_t_io;
+#define DITPROF_SYNC() do { if (g_dit_prof) hipDeviceSynchronize(); } while (0)
+#define DITPROF_T()    (g_dit_prof ? t2_now_ms() : 0.0)
+
 static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump_block) {
     if (!r->dit_loaded) { fprintf(stderr, "T2-HIP: DiT not loaded\n"); return -1; }
+    if (g_dit_prof < 0) {
+        const char *e = getenv("T2_DIT_PROF");
+        g_dit_prof = (e && atoi(e)) ? 1 : 0;
+    }
+    if (g_dit_prof) { g_dit_t_sa = g_dit_t_ca = g_dit_t_mlp = g_dit_t_kv = g_dit_t_io = 0; }
+    double _t0;
 
     /* ---- Input embedding: [n_tok, IN_CH] × [DIT_DIM, IN_CH]^T -> [n_tok, DIT_DIM] ---- */
     gemm(r, r->d_h, &r->dit_input, r->d_noise,
@@ -1787,6 +1804,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
          r->dit_t_fc2.b, DIT_DIM, DIT_DIM, 1);
 
     /* ---- Precompute cross-attention KV cache if not valid ---- */
+    DITPROF_SYNC(); _t0 = DITPROF_T();
     if (!r->ca_kv_valid) {
         if (r->verbose) fprintf(stderr, "T2-HIP: building CA KV cache (%d tokens)...\n", cond_len);
         for (int bi = 0; bi < DIT_DEPTH; bi++) {
@@ -1813,6 +1831,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         r->ca_kv_len = cond_len;
         if (r->verbose) fprintf(stderr, "T2-HIP: CA KV cache built\n");
     }
+    DITPROF_SYNC(); g_dit_t_kv += DITPROF_T() - _t0;
 
     /* ---- Per-block forward ---- */
     /* Pointer arithmetic helpers into d_ada_out/d_mod:
@@ -1880,6 +1899,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         }
 
         /* ---- Self-attention ---- */
+        DITPROF_SYNC(); _t0 = DITPROF_T();
         /* adaLN -> d_ln_h (and BF16 copy to scratch when fusion eligible) */
         if (norm_fuse_gate && r->use_blaslt && b->sa_qkv.w_bf16 && n_tok >= 8) {
             run_adaln_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
@@ -1975,8 +1995,10 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         /* Gated residual: d_h += gate_sa * d_ln_h */
         run_gated_add(r, r->d_h, r->d_ln_h, gate_sa, n_tok, DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_sa, r->d_h, (size_t)n_tok * DIT_DIM);
+        DITPROF_SYNC(); g_dit_t_sa += DITPROF_T() - _t0;
 
         /* ---- Cross-attention ---- */
+        DITPROF_SYNC(); _t0 = DITPROF_T();
         /* norm2 -> d_ln_h (with optional fused BF16 pack into scratch) */
         if (norm_fuse_gate && r->use_blaslt && b->ca_q.w_bf16 && n_tok >= 8) {
             run_layernorm_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
@@ -2020,8 +2042,10 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         /* Direct residual (no gate in cross-attn) — folded into GEMM when fused */
         if (!ca_res_fuse) run_residual_add(r, r->d_h, r->d_ln_h, n_tok * DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_ca, r->d_h, (size_t)n_tok * DIT_DIM);
+        DITPROF_SYNC(); g_dit_t_ca += DITPROF_T() - _t0;
 
         /* ---- MLP ---- */
+        DITPROF_SYNC(); _t0 = DITPROF_T();
         /* adaLN (scale2/shift2) -> d_ln_h (with optional fused BF16 pack) */
         if (norm_fuse_gate && r->use_blaslt && b->mlp_fc1.w_bf16 && n_tok >= 8) {
             run_adaln_pack(r, r->d_ln_h, r->d_act_bf16, r->d_h,
@@ -2055,6 +2079,7 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
         /* Gated residual: d_h += gate_mlp * d_ln_h */
         run_gated_add(r, r->d_h, r->d_ln_h, gate_mlp, n_tok, DIT_DIM);
         if (bi == 0 && r->b0_dbg) dbg_dl(r->b0_dbg->h_post_mlp, r->d_h, (size_t)n_tok * DIT_DIM);
+        DITPROF_SYNC(); g_dit_t_mlp += DITPROF_T() - _t0;
 
         /* Optional block dump */
         if (dump_block == bi) {
@@ -2064,12 +2089,21 @@ static int dit_forward(hip_trellis2_runner *r, int n_tok, int cond_len, int dump
     }
 
     /* ---- Final LayerNorm (no affine) ---- */
+    DITPROF_SYNC(); _t0 = DITPROF_T();
     run_ln_noaffine(r, r->d_ln_h, r->d_h, n_tok, DIT_DIM);
 
     /* ---- Output projection: [n_tok, DIT_DIM] × [DIT_IN_CH, DIT_DIM]^T ---- */
     gemm(r, r->d_vel, &r->dit_out, r->d_ln_h, r->dit_out.b, DIT_IN_CH, DIT_DIM, n_tok);
 
     hipDeviceSynchronize();
+    if (g_dit_prof) {
+        g_dit_t_io += t2_now_ms() - _t0;
+        double tot = g_dit_t_kv + g_dit_t_sa + g_dit_t_ca + g_dit_t_mlp + g_dit_t_io;
+        fprintf(stderr, "T2-DIT-PROF: kv=%.1f sa=%.1f ca=%.1f mlp=%.1f io=%.1f total=%.1f ms "
+                "(%d blocks, n_tok=%d)\n",
+                g_dit_t_kv, g_dit_t_sa, g_dit_t_ca, g_dit_t_mlp, g_dit_t_io, tot,
+                DIT_DEPTH, n_tok);
+    }
     return DIT_DEPTH;  /* completed all blocks */
 }
 
