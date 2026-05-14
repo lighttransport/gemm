@@ -1,14 +1,16 @@
 # rdna4 task board
 
-Snapshot: 2026-05-12. Branch: `trellis2`, ahead of `origin/trellis2` by 1.
+Snapshot: 2026-05-14. Branch: `trellis2`.
 
 ## Current state
 
-### TRELLIS.2 — texgen pipeline lands end-to-end on RX 9070 XT
+### TRELLIS.2 — texgen pipeline WORKS end-to-end on RX 9070 XT (fast path)
 - `./test_hip_trellis2 --full --mesh --tex …` produces a per-vertex-colored
-  OBJ (328k verts, 397k tris, 98.5% non-trivial colors).
-- shape_dec: ~3.8 s, SLAT DiT 12 steps: ~9.1 s, tex_dec (warm): 3.3 s
-  (down from 124 s — 38× via MCLK fix).
+  OBJ (513,716 verts, 572,608 tris, **30,296 unique RGB triples**).
+- shape_dec: ~3.8 s, SLAT DiT 12 steps: ~9.1 s, tex_dec: **3.1 s**.
+- Fast-path coord-corruption root cause: persistent `g_c2s` scratch with
+  stale hash entries across calls. Fixed by per-call `c2s_free_all` at
+  end of `hip_shape_dec_forward_ex` (commit `5ee328e`).
 - Mesh axis (X/Z) and weight-cache size landmines documented in memory.
 
 ### TRELLIS.2 — MCLK power-state fix (committed 658bd69)
@@ -45,27 +47,28 @@ Snapshot: 2026-05-12. Branch: `trellis2`, ahead of `origin/trellis2` by 1.
       next benchmark. Investigate amdgpu driver state that xmrig leaves
       behind (likely some HSA queue or DMA mapping not cleaned up).
 
-### tex_dec post-first-run degradation is NOT just mclk (2026-05-13)
-- [ ] Even with `power_dpm_force_performance_level=high` (mclk pinned at
-      level 4 = 1124 MHz, sclk 2391 MHz, GPU 100%), tex_dec stage 3 c2s
-      stalls for 5+ min on v42, v43, v44 — including baseline binary with
-      no recent code changes. Only the FIRST tex_dec invocation per boot
-      is fast (~3 s); subsequent runs degrade dramatically regardless of
-      mclk state. Hypothesis: HSA queue, kernel module cache, or some
-      driver-internal counter gets into a degraded state on first
-      tex_dec dispatch. Investigate amdgpu kfd queue state via `dmesg`,
-      `rocm-smi --showevents`, or kernel module reload between runs.
+### Fast-path tex_dec corruption FIXED (commit 5ee328e, 2026-05-14)
+- [x] Root cause: `g_c2s` (C2S persistent scratch with dn/de/dhf/dxf/
+      dhn/didx/dsi/dout/fk/fv) was file-scope and never freed. Its hash
+      table (fk/fv) carried entries from a prior shape_dec invocation.
+      On fast-path tex_dec, stale entries caused t2_hash_lookup to
+      return voxel indices larger than current Nf → kspconv OOB reads,
+      visible in dmesg as TCP-client write faults at user-virtual
+      addresses (`0x7ae6_xxxxx`). Slow path was incidentally correct
+      because hipMemsetAsync(fk,0) had time to settle before
+      hash_build ran.
+- [x] Fix: `c2s_free_all(&g_c2s)` at end of every
+      `hip_shape_dec_forward_ex`. Pre-size block at function entry
+      re-allocates fresh.
+- [x] v55 validated: fast path 3.1 s tex_dec, voxel_res=512,
+      **30,296 unique RGB triples** across 513,716 vertices.
+      EXIT=0, no GPU page faults.
 
-### Correctness-vs-speed correlation (2026-05-13, v37 vs v39)
-- [ ] v37 fast tex_dec (3.1 s, mclk 1258): voxel_res=1, 1 unique color
-      (CORRUPTED). v39 slow tex_dec (1115 s, mclk 96): voxel_res=512,
-      26,698 unique colors (CORRECT). Same code, same inputs — only
-      execution speed differs. Slow path effectively serializes
-      operations and avoids whatever race the fast path hits. Cache
-      uploads are correct in both cases (probed). Cross-stream
-      serialization attempt (`b1e4747`) was reverted in `289bde9` —
-      the added syncs didn't visibly help correctness and couldn't be
-      validated due to the degradation issue above.
+### tex_dec post-first-run degradation — RESOLVED by fix above
+- [x] The "first run fast, subsequent runs slow" pattern was caused by
+      the same stale g_c2s state. With per-call scratch, subsequent
+      runs should also stay fast. (Re-verify across multiple back-to-
+      back e2e --tex runs to confirm.)
 
 ### PBR hash axis fix landed — v29 produces real per-vertex texturing
 - [x] Root cause: `t2_pbr_from_decoder` stored col1 (X) at hash axis0
@@ -91,14 +94,12 @@ Snapshot: 2026-05-12. Branch: `trellis2`, ahead of `origin/trellis2` by 1.
       tex_dec outlier memo: HIP bounded to ±1, ref ±700). Next:
       capture stage-0 host logits, compare distributions vs reference.
 
-### MCLK lever even less reliable than documented
-- [ ] Post-reboot, v30 (first run) tex_dec ran fast end-to-end; v31
-      one minute later stalled stage-3 c2s with mclk pinned 96 MHz,
-      sclk 2195 MHz, GPU 100%. Previous "long uptime / post-xmrig"
-      theory was too narrow; even back-to-back runs from clean reboot
-      can lose the lever. Investigate HSA queue state across
-      `hip_trellis2_runner` re-creation; the runner is destroyed +
-      rebuilt between SS DiT, shape_dec, tex DiT, tex_dec phases.
+### MCLK lever — likely also resolved by per-call scratch fix
+- [ ] Re-verify whether the "back-to-back runs go slow" symptom was
+      caused by stale g_c2s state (the fix above), or whether the
+      mclk lever itself is still unreliable. Test: run e2e --tex 3×
+      back-to-back in one session with commit 5ee328e and check
+      whether all three stay at 3.1 s tex_dec.
 
 ### Stage 1 ConvNeXt A/B test — code ready, blocked on stable fast GPU
 - [ ] `T2_TEX_BLOCK_TIME=1 T2_TEX_BLASLT_SPCONV=0` vs default to compare
