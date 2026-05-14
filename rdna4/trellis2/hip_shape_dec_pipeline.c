@@ -740,12 +740,29 @@ typedef struct {
     size_t didx_b, dsi_b;
     size_t dout_b, fk_b, fv_b;
 } C2SScratch;
+/* File-scope but freed at end of every forward_ex call (see c2s_free_all
+ * at the bottom of forward_ex). Previously persistent across calls, which
+ * carried stale hash entries in fk/fv from prior shape_dec invocations —
+ * the suspected cause of fast-path tex_dec GPU page faults and all-zero
+ * coord output. */
 static C2SScratch g_c2s = {0};
 static void c2s_grow(void **p, size_t *cap, size_t need) {
     if (need <= *cap) return;
     if (*p) hipFree(*p);
     hipMalloc(p, need);
     *cap = need;
+}
+static void c2s_free_all(C2SScratch *s) {
+    if (s->dn)   { hipFree(s->dn);   s->dn = NULL;   s->dn_b = 0; }
+    if (s->de)   { hipFree(s->de);   s->de = NULL;   s->de_b = 0; }
+    if (s->dhf)  { hipFree(s->dhf);  s->dhf = NULL;  s->dhf_b = 0; }
+    if (s->dxf)  { hipFree(s->dxf);  s->dxf = NULL;  s->dxf_b = 0; }
+    if (s->dhn)  { hipFree(s->dhn);  s->dhn = NULL;  s->dhn_b = 0; }
+    if (s->didx) { hipFree(s->didx); s->didx = NULL; s->didx_b = 0; }
+    if (s->dsi)  { hipFree(s->dsi);  s->dsi = NULL;  s->dsi_b = 0; }
+    if (s->dout) { hipFree(s->dout); s->dout = NULL; s->dout_b = 0; }
+    if (s->fk)   { hipFree(s->fk);   s->fk = NULL;   s->fk_b = 0; }
+    if (s->fv)   { hipFree(s->fv);   s->fv = NULL;   s->fv_b = 0; }
 }
 
 static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
@@ -1316,6 +1333,12 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
      * persistent C2S scratch. We can't safely free that without double-freeing
      * the persistent buffer on next call — leak the stage-0 fresh allocation
      * as before. d_coords stage-0 was a fresh upload; same story. */
+
+    /* Free C2S scratch — was previously persistent across calls, but that
+     * leaves stale hash entries (g_c2s.fk/fv) which appear to trigger
+     * fast-path OOB reads in kspconv hash lookups. */
+    if (g_stream) hipStreamSynchronize(g_stream);
+    c2s_free_all(&g_c2s);
 
     return 0;
 }
