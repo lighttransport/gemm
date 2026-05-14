@@ -803,7 +803,20 @@ static DevSparse run_c2s(K *k, const t2sd_c2s *blk, int Nc,
     hipMemsetAsync(fk, 0,    (size_t)cap*sizeof(uint64_t), g_stream);
     hipMemsetAsync(fv, 0xff, (size_t)cap*sizeof(int32_t),  g_stream);
     hash_build(k, fk, fv, cm, dxc, Nf);
-    kspconv_nmap_h(k, dout, dhn, d_nmap_fine, blk->conv2_w, dc2w, dc2b, dxc, fk, fv, cm, Nf, Co, Co);
+    /* Build fine nmap if caller didn't provide one, so conv2 takes the
+     * WMMA / Triton path instead of hash_kspconv. */
+    void *d_nmap_fine_local = NULL;
+    void *d_nmap_fine_use = d_nmap_fine;
+    if (!d_nmap_fine_use && k->build_nmap && Nf > 0) {
+        if (hipMalloc(&d_nmap_fine_local, (size_t)Nf * 27 * sizeof(uint32_t)) == hipSuccess) {
+            void *a[] = {&d_nmap_fine_local, &dxc, &fk, &fv, &cm, &Nf};
+            int gx = (Nf + 7) / 8;
+            hipModuleLaunchKernel(k->build_nmap, gx, 1, 1, 27, 8, 1, 0, g_stream, a, NULL);
+            d_nmap_fine_use = d_nmap_fine_local;
+        }
+    }
+    kspconv_nmap_h(k, dout, dhn, d_nmap_fine_use, blk->conv2_w, dc2w, dc2b, dxc, fk, fv, cm, Nf, Co, Co);
+    if (d_nmap_fine_local) hipFree(d_nmap_fine_local);
     kresrep(k, dout, dxf, Nf, Co, Ci8);
     DevSparse ds = { dout, dxc, fk, fv, Nf, Co, cm };
     return ds;
