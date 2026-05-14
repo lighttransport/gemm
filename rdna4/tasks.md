@@ -7,8 +7,9 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
 ### TRELLIS.2 — texgen pipeline WORKS end-to-end on RX 9070 XT (fast path)
 - `./test_hip_trellis2 --full --mesh --tex …` produces a per-vertex-colored
   OBJ (**826,884 verts, 77,441 unique RGB triples** after nmap fast-path).
-- shape_dec: ~3.8 s, SLAT DiT 12 steps: ~9.1 s, tex_dec: **0.43 s**
-  (was 3.1 s after the correctness fix alone — 7.3× cumulative).
+- shape_dec: **~0.96 s** (was 3.8 s — nmap fast path applies here too),
+  SLAT DiT 12 steps: ~6.6 s, SS DiT 12 steps: ~8.2 s, tex DiT: ~4.0 s,
+  tex_dec: **0.43 s** (was 3.1 s after the correctness fix alone).
 - Fast-path coord-corruption root cause: persistent `g_c2s` scratch with
   stale hash entries across calls. Fixed by per-call `c2s_free_all` at
   end of `hip_shape_dec_forward_ex` (commit `5ee328e`).
@@ -140,22 +141,21 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       back-to-back in one session with commit 5ee328e and check
       whether all three stay at 3.1 s tex_dec.
 
-### Stage 1 ConvNeXt A/B test — code ready, blocked on stable fast GPU
-- [ ] `T2_TEX_BLOCK_TIME=1 T2_TEX_BLASLT_SPCONV=0` vs default to compare
-      WMMA x8 path against blaslt-gather27 path for stage 1 (1103 ms
-      baseline). New toggle landed in `hip_shape_dec_pipeline.c`.
+### tex_dec perf — DONE (commits 58541f6, 329765e)
+- [x] On-the-fly nmap unlocked Triton/WMMA spconv: tex_dec 3.1 s → 0.43 s.
+      Per-stage ConvNeXt 4-12× faster; C2S 1.8-3× faster. Stage 1
+      ConvNeXt 1103 ms → 119 ms, Stage 2 697 ms → 55 ms. Gap to PyT
+      reference 23× → 3.2×. The old "Stage 1/2 ConvNeXt profile" and
+      "Stage 1 A/B test" tasks are obsolete — superseded by the nmap
+      fast path which made the hash_kspconv path moot.
+- [ ] (low priority) remaining 3.2× gap to PyT — would need FA-class
+      kernel work on the spconv inner loop; diminishing returns.
 
-### Performance follow-ups (TRELLIS.2 tex_dec)
-Per-stage timings vs PyTorch reference (134 ms total for tex_dec) — we're
-at 3.3 s with the MCLK fix, so ~25× gap to PyTorch remains:
-- [ ] Stage 1 ConvNeXt at 1103 ms is the largest single bucket — profile
-      where the time goes (likely sparse_conv3d_tiled_f32 + hash_kspconv
-      dispatch overhead per block).
-- [ ] Stage 2 ConvNeXt at 714 ms: similar — second-largest bucket.
-- [ ] Investigate whether the Triton AOT spconv path
-      (`rdna4/trellis2/triton_aot/`) can supplant the F32 LDS-tiled kernel
-      for Ci=64,Co=64. Known nondeterminism (±1..±7 extremes on bulk
-      ~0 values) is documented; gate under `T2_TRITON_NMAX` if it ships.
+### SS DiT perf — at the floor (commit 5692aa3, profile in memory)
+- [x] Profiled: self-attn 51% / MLP 32% / cross-attn 16% per forward.
+      SA is WMMA-compute-bound at the documented ~346 ms floor. CFG
+      batching + FA softmax rewrite both scoped and judged not worth
+      it (see project_trellis2_ss_dit_profile memo). No quick wins.
 
 ### Pipeline correctness gaps
 - [ ] `stbi_zlib_compress` crash in `t2_pbr_write_textured_obj` (UV atlas +
