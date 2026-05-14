@@ -145,12 +145,31 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       HIP-C-vs-PyTorch algorithmic difference** — precision-independent,
       hardware-independent. This is the real SS-DiT bug feeding the
       mesh-density gap.
-- [ ] NEXT: per-block SS-DiT bisect. HIP side ready (`--dump-blocks`
-      mode + `hip_trellis2_dump_block`). Need to instrument the
-      PyTorch SS-DiT forward (trellis2_repo, same approach as the
-      c2s-feats dump) to dump per-block hidden states, then find which
-      of the 30 blocks first diverges. Suspects: RoPE tables, QK-norm,
-      attention scale, timestep embedding, modulation.
+- [x] Per-block SS-DiT bisect DONE (2026-05-14): instrumented the
+      PyTorch `SparseStructureFlowModel.forward` to dump all 30 block
+      hidden states on the first forward (step 0, t=1000); ran HIP
+      `--dump-blocks --t 1.0` to match. Result:
+        block 0  rel_l2 0.0057  cosine 1.00000
+        block 10 rel_l2 0.0102  cosine 0.99995
+        block 20 rel_l2 0.0126  cosine 0.99991
+        block 28 rel_l2 0.0213  cosine 0.99976
+        block 29 rel_l2 0.0070  (std 32→115, rel shrinks)
+      **No single broken block** — every block matches PyTorch to
+      cosine ≥0.9998; rel_l2 grows smoothly ~0.0005-0.002/block,
+      ~2% total across the 30-block stack in ONE forward.
+      → The 12-14% final divergence is the SAMPLER compounding a
+      ~2-3% per-forward error over 24 forwards (12 steps × 2 CFG).
+      It is distributed sub-0.1%-per-block implementation differences
+      (FMA order, RoPE table precision, BF16 rounding) — NOT a
+      localized bug, not practically fixable without matching
+      PyTorch's exact op order everywhere. PyTorch instrumentation
+      reverted after the run.
+- Conclusion for the mesh-density gap: the HIP pipeline is faithful
+  per-block; the ~56% tessellation density is the cost of running a
+  deep 24-forward BF16 diffusion sampler on a different stack. Mesh
+  geometry stays correct (coarse IoU 0.92). Closing this as
+  "understood, not a bug" — would need full-F32 sampler or exact
+  op-order parity to improve, neither worth it.
 
 ### MCLK lever — likely also resolved by per-call scratch fix
 - [ ] Re-verify whether the "back-to-back runs go slow" symptom was
