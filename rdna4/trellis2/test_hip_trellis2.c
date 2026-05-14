@@ -1233,6 +1233,21 @@ int main(int argc, char **argv) {
                     }
                     fprintf(stderr, "  tex_dec: %.1f ms, N_tex=%d\n",
                             now_ms() - t_tdec, N_tex);
+                    /* Per-channel tex_feats stats (raw decoder output, 6-ch PBR). */
+                    {
+                        int out_ch = 6;
+                        for (int c = 0; c < out_ch; c++) {
+                            double s = 0, s2 = 0; float mn = tex_feats[c], mx = tex_feats[c];
+                            for (int i = 0; i < N_tex; i++) {
+                                float v = tex_feats[(size_t)i*out_ch + c];
+                                s += v; s2 += (double)v*v;
+                                if (v < mn) mn = v; if (v > mx) mx = v;
+                            }
+                            double m = s / N_tex, var = s2/N_tex - m*m;
+                            fprintf(stderr, "  tex_feats ch%d: mean=%.3f std=%.3f range[%.3f,%.3f]\n",
+                                    c, m, var > 0 ? sqrt(var) : 0.0, mn, mx);
+                        }
+                    }
                     free(tex_slat);
 
                     /* PBR baking. */
