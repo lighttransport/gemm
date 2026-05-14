@@ -1280,39 +1280,8 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
      * g_stream + hipStreamSync was not reliable on RDNA4/ROCm 7.2.2 for
      * D2D over multi-MB buffers — saw all-zero coords on readback. */
     if (g_stream) hipStreamSynchronize(g_stream);
-    hipDeviceSynchronize();
-    /* Fix candidate A: D2D roundtrip through host memory forces a full
-     * cache flush across the GPU memory hierarchy. Default ON; disable
-     * via T2_TEX_FIX_ROUNDTRIP=0. */
-    static int s_fix_roundtrip = -1;
-    if (s_fix_roundtrip < 0) {
-        const char *e = getenv("T2_TEX_FIX_ROUNDTRIP");
-        s_fix_roundtrip = (e && atoi(e) == 0) ? 0 : 1;
-    }
-    if (s_fix_roundtrip) {
-        size_t nb = (size_t)cur_N * 4 * sizeof(int32_t);
-        int32_t *h_tmp = (int32_t *)malloc(nb);
-        hipMemcpy(h_tmp, d_coords, nb, hipMemcpyDeviceToHost);
-        hipMemcpy(d_coords_out, h_tmp, nb, hipMemcpyHostToDevice);
-        free(h_tmp);
-    } else {
-        hipMemcpy(d_coords_out, d_coords, (size_t)cur_N * 4 * sizeof(int32_t),
-                  hipMemcpyDeviceToDevice);
-    }
-    hipDeviceSynchronize();
-
-    /* Verify d_coords_out integrity (first 4 ints != all zero unless N=0). */
-    if (cache) {
-        int32_t probe[4];
-        hipMemcpy(probe, d_coords_out, sizeof(probe), hipMemcpyDeviceToHost);
-        if (probe[1] == 0 && probe[2] == 0 && probe[3] == 0) {
-            fprintf(stderr, "T2-WARN: forward_ex d_coords_out probe is all-zero (%d,%d,%d,%d) — corruption!\n",
-                probe[0],probe[1],probe[2],probe[3]);
-        } else {
-            fprintf(stderr, "T2-OK: forward_ex d_coords_out probe (%d,%d,%d,%d)\n",
-                probe[0],probe[1],probe[2],probe[3]);
-        }
-    }
+    hipMemcpy(d_coords_out, d_coords, (size_t)cur_N * 4 * sizeof(int32_t),
+              hipMemcpyDeviceToDevice);
 
     /* Ditto for d_out: callers expect to own this; transfer ownership of
      * d_out_persist directly. */
@@ -1320,32 +1289,28 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
     *out_d_coords = (int32_t *)d_coords_out;
     *out_Nf = cur_N;
 
+    /* Drain g_stream BEFORE freeing transient buffers: the d_coords_out
+     * memcpy above is async on g_stream and its source is d_gxc[final],
+     * which we hipFree below. Without this sync, hipFree can unmap the
+     * source pages while the memcpy is still pending → caller reads zeros.
+     * This was the root cause of nondeterministic tex_coord collapse to
+     * (0,0,0) observed across e2e --tex runs. */
     if (g_stream) hipStreamSynchronize(g_stream);
 
-    /* Fix candidate B: defer hipFree of cache buffers. The cache pages get
-     * unmapped which may invalidate adjacent d_coords_out mappings on
-     * fast path. Default ON; disable via T2_TEX_FIX_DEFER_FREE=0. */
-    static int s_fix_defer_free = -1;
-    if (s_fix_defer_free < 0) {
-        const char *e = getenv("T2_TEX_FIX_DEFER_FREE");
-        s_fix_defer_free = (e && atoi(e) == 0) ? 0 : 1;
-    }
-    /* Always free big scratch — they're hundreds of MB each. */
+    /* Free transient buffers we own here. The persistent C2S scratch + cached
+     * weights are intentionally kept across calls (file-scope state). */
     if (d_slat) hipFree(d_slat);
     if (d_tmp) hipFree(d_tmp);
     if (d_mlp) hipFree(d_mlp);
     if (d_keys) hipFree(d_keys);
     if (d_vals) hipFree(d_vals);
-    /* Cache buffers (d_gxc[s]): hipFree may unmap pages adjacent to
-     * d_coords_out. Defer when fix is enabled (leaks ~10MB per call). */
-    if (!s_fix_defer_free) {
-        for (int s = 0; s < T2SD_MAX_STAGES; s++) {
-            if (d_gi[s]) hipFree(d_gi[s]);
-            if (d_gs[s]) hipFree(d_gs[s]);
-            if (d_gxc[s]) hipFree(d_gxc[s]);
-            if (d_nmap_cn[s]) hipFree(d_nmap_cn[s]);
-            if (d_nmap_pc[s]) hipFree(d_nmap_pc[s]);
-        }
+    /* Cache uploads. */
+    for (int s = 0; s < T2SD_MAX_STAGES; s++) {
+        if (d_gi[s]) hipFree(d_gi[s]);
+        if (d_gs[s]) hipFree(d_gs[s]);
+        if (d_gxc[s]) hipFree(d_gxc[s]);
+        if (d_nmap_cn[s]) hipFree(d_nmap_cn[s]);
+        if (d_nmap_pc[s]) hipFree(d_nmap_pc[s]);
     }
     /* d_feats from stage 0 was a fresh hipMalloc; later stages reassign to
      * persistent C2S scratch. We can't safely free that without double-freeing
