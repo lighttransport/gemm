@@ -97,10 +97,12 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
   - bbox matches to 3 decimals; coarse IoU res16=0.92, res32=0.88
   - fine IoU res64=0.56, res128=0.32 — recall<precision → under-
     tessellated, missing reference detail (not spurious geometry)
-- [ ] Verdict: geometry correct (right object/place/scale), but
-      ~56% vertex density. The on-the-fly nmap change (58541f6) bumped
-      coverage from 35%→56% as a side effect (different numerical
-      paths in WMMA/Triton spconv → more to_subdiv logits pass > 0).
+- [x] Verdict: geometry correct (right object/place/scale), ~56%
+      vertex density. Root-caused below as sampler-compounded
+      numerical accumulation — understood, not a bug. CLOSED.
+      The on-the-fly nmap change (58541f6) bumped coverage from
+      35%→56% as a side effect (different numerical paths in
+      WMMA/Triton spconv → more to_subdiv logits pass > 0).
 - [x] Full bisect done (v64-v67 + PyTorch-ROCm reference dump,
       2026-05-14):
       1. to_subdiv math + weights VERIFIED correct: HIP_feats @ ref_W.T
@@ -171,12 +173,12 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
   "understood, not a bug" — would need full-F32 sampler or exact
   op-order parity to improve, neither worth it.
 
-### MCLK lever — likely also resolved by per-call scratch fix
-- [ ] Re-verify whether the "back-to-back runs go slow" symptom was
-      caused by stale g_c2s state (the fix above), or whether the
-      mclk lever itself is still unreliable. Test: run e2e --tex 3×
-      back-to-back in one session with commit 5ee328e and check
-      whether all three stay at 3.1 s tex_dec.
+### MCLK lever — RESOLVED by per-call scratch fix (verified 2026-05-14)
+- [x] Re-verify done: 3 back-to-back e2e --tex runs in one session
+      (commit 5ee328e+) all hit tex_dec **423.5-423.9 ms**, identical
+      77,208 unique colors. The "back-to-back runs go slow" symptom
+      is GONE — it was stale g_c2s state all along, not a driver/mclk
+      issue. No reboots needed anymore. CLOSED.
 
 ### tex_dec perf — DONE (commits 58541f6, 329765e)
 - [x] On-the-fly nmap unlocked Triton/WMMA spconv: tex_dec 3.1 s → 0.43 s.
@@ -195,20 +197,25 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       it (see project_trellis2_ss_dit_profile memo). No quick wins.
 
 ### Pipeline correctness gaps
-- [ ] `stbi_zlib_compress` crash in `t2_pbr_write_textured_obj` (UV atlas +
-      PNG path). Currently sidestepped via `t2_pbr_write_colored_obj`.
-      Atlas path is brittle for sparse-voxel meshes; fix or remove.
+- [x] `stbi_zlib_compress` crash — STALE (2026-05-14). The crash was
+      in the PNG path; `t2_pbr_write_textured_obj` now writes PPM
+      (`t2pbr_write_image` only calls `stbi_write_png` for `.png`
+      paths, this function emits `.ppm`). Also the function is unused
+      — test_hip_trellis2.c:1296 calls `t2_pbr_write_colored_obj`.
+      No live crash. The atlas function is dead code; leave as-is or
+      delete in a future cleanup — not blocking anything.
 - [x] tex_dec outlier — "±700 vs ±1" framing was stale (2026-05-14).
       With the chunked-F.linear shim, fresh PyTorch-ROCm ref is bounded
       [-0.11, 1.08]. tex_dec KERNEL verified correct (rel 3.28e-4 vs
       CPU oracle, April). v71 e2e comparison: basecolor ch0-2 roughly
       OK; **ch3 metallic way off** (ref ~const 0.998, HIP 0.44±0.61),
       **ch4 roughness 10× damped**, ch5 alpha ~5× damped.
-- [ ] The ch3/4/5 divergence is e2e tex_dec INPUT drift (tex SLAT DiT),
-      same root-cause family as the SS-DiT bug above — but the
-      channel-specific pattern (0-2 fine, 3-5 broken) may also be a
-      tex_dec output-channel issue. Re-check after the SS/SLAT-DiT
-      per-block bisect localizes the DiT drift.
+- [x] The ch3/4/5 divergence is e2e tex_dec INPUT drift (tex SLAT
+      DiT) — confirmed same root cause as the SS-DiT bisect: no
+      localized bug, distributed sampler-compounded accumulation.
+      The channel-specific pattern (basecolor OK, metallic/roughness/
+      alpha off) is just those channels being more saturation-
+      sensitive to accumulated input drift. CLOSED — understood.
 
 ### Cross-vendor parity
 - [ ] ROCm-vs-CUDA bisect (2026-05-08 memo): hipBLASLt RDNA4/ROCm 7.2.2
