@@ -268,6 +268,12 @@ make test_cuda_flux2
     --height 256 --width 256 --steps 4 --seed 42 \
     --prompt "a red apple on a white table"
 
+# Same GPU pipeline, but keep the CUDA text encoder resident through DiT/VAE.
+# This needs more VRAM than the default path.
+./test_cuda_flux2 --generate --gpu-enc --keep-gpu-enc \
+    --height 256 --width 256 --steps 4 --seed 42 \
+    --prompt "a red apple on a white table"
+
 # Base model (20 steps)
 ./test_cuda_flux2 --generate --base \
     --enc /mnt/disk01/models/klein2-4b/text_encoder \
@@ -365,7 +371,7 @@ Prior MMA-baseline numbers (kept for reference): F16 0.114 / 0.227 / 0.924 s; BF
 
 > **Note:** The heavy VAE path is on CUDA. The current implementation still bridges the single VAE mid-block attention through CPU, but conv/groupnorm/resblock/upsample work is on GPU.
 
-> **Memory note:** `--generate --gpu-enc` now pre-encodes text once, frees the GPU text encoder, and then loads DiT/VAE. This avoids VRAM exhaustion from keeping both the CUDA LLM runner and Flux2 weights resident at the same time on 16 GB cards.
+> **Memory note:** `--generate --gpu-enc` pre-encodes text once, frees the GPU text encoder, and then loads DiT/VAE by default. This avoids VRAM exhaustion from keeping both the CUDA LLM runner and Flux2 weights resident at the same time on 16 GB cards. Use `--keep-gpu-enc` or `FLUX2_KEEP_GPU_ENC=1` to opt into the resident text+DiT/VAE path on higher-VRAM devices.
 
 ## Implementation Status
 
@@ -377,7 +383,7 @@ Prior MMA-baseline numbers (kept for reference): F16 0.114 / 0.227 / 0.924 s; BF
 | **Text encoder (CPU)** | Verified | hidden states match transformer.h reference |
 | **Text encoder (GPU)** | Working | CUDA LLM runner, Klein safetensors weights, layer snapshots 8/17/26 |
 | **VAE decoder** | Verified | GPU vs CPU `max_diff≈1e-5`; vs diffusers `corr=0.999999` `max_diff≈1e-3` on 64×64; pixel-identical at 256×256 (max pixel diff=1, PSNR=51dB) |
-| **Full `--generate --gpu-enc` path** | Working | Prompt is encoded once, encoder is freed, then DiT/VAE load |
+| **Full `--generate --gpu-enc` path** | Working | Prompt is encoded once; default frees the encoder before DiT/VAE load, `--keep-gpu-enc` keeps it resident |
 | **DiT CPU** | Visual PASS | 64×64 correct red apple (4 steps) |
 | **DiT CUDA** | Visual PASS | 256×256 clear red apple (4 steps), max_diff vs CPU < 1e-5 |
 | **DiT HIP (RX 9070 XT, gfx1201)** | Numerical PASS | `verify_dit --lat 8`: max_diff 3e-4, corr=1.0 vs CPU (both FP8-LUT and F32) |
@@ -435,7 +441,8 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 - [x] **F16 GEMM (v7)**: `FLUX2_F16_GEMM=1` dispatches to `gemm_f16_v7` (cp.async + ldmatrix + 4×4 CTA panel swizzle, ported from `cuda/gemm/cuda_gemm_ptx_kernels.h`). Activation is quantized F32→F16 once per GEMM via the `quant_f16` kernel (`cvt.rn.f16.f32` PTX); bias added in-place by `add_bias_inplace_f32`. Source weights are FP8 safetensors dequantized to F16 with per-tensor `weight_scale` baked in. **0.367 s/step at 1024²** (was 0.924 with the old MMA-baseline kernel; 1.7× faster than ComfyUI bf16). GPU vs CPU FP32 ref unchanged (`max_diff≈6e-4` at 256²).
 - [x] **BF16 GEMM (v7)**: `FLUX2_BF16_GEMM=1` dispatches to `gemm_bf16_v7` (same v7 infra). **0.368 s/step at 1024²** (was 1.243; 1.7× faster than ComfyUI bf16). GPU output min/max unchanged vs the prior MMA baseline (correctness preserved bit-for-bit on the test inputs).
 - [ ] **Attention kernel scaling**: Single-block-per-head FA2 flash attention works but may not scale to large resolutions. No multi-block flash attention.
-- [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + weight upload. PTX cache and in-process reuse help, but `--generate` currently pre-encodes once and frees the runner rather than keeping text and DiT resident together.
+- [x] **Opt-in resident GPU text encoder**: `--keep-gpu-enc` / `FLUX2_KEEP_GPU_ENC=1` keeps the CUDA text encoder cache alive through DiT/VAE generation. The default path still frees it before DiT/VAE load to fit 16 GB cards.
+- [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + weight upload. PTX cache and in-process reuse help; remaining work is reducing first-load weight upload/initialization time.
 
 ### Quality
 
@@ -445,4 +452,4 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 ### Features
 
 - [x] **512×512**: VAE decode verified at 512×512 (GPU vs CPU max_diff≈4e-4), DiT step runs at 512×512 (1.02s for 256 img tokens on RTX 5060 Ti). Larger resolutions untested.
-- [ ] **Single-session GPU pipeline**: text encoding and DiT both run on GPU, but generation currently frees the text encoder before DiT/VAE load to stay within VRAM budget on 16 GB cards.
+- [x] **Single-session GPU pipeline**: text encoding and DiT both run on GPU. The default generation path frees the text encoder before DiT/VAE load for 16 GB cards; `--keep-gpu-enc` keeps text and DiT/VAE resident together when VRAM allows.
