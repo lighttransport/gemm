@@ -179,9 +179,17 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
 - [ ] `stbi_zlib_compress` crash in `t2_pbr_write_textured_obj` (UV atlas +
       PNG path). Currently sidestepped via `t2_pbr_write_colored_obj`.
       Atlas path is brittle for sparse-voxel meshes; fix or remove.
-- [ ] tex_dec outlier mismatch: HIP pipeline damps extremes (PyT ref has
-      ±700, HIP bounded to ±1). Needs per-stage bisection with correct
-      tex_dec weights. See `project_trellis2_tex_dec_outlier.md`.
+- [x] tex_dec outlier — "±700 vs ±1" framing was stale (2026-05-14).
+      With the chunked-F.linear shim, fresh PyTorch-ROCm ref is bounded
+      [-0.11, 1.08]. tex_dec KERNEL verified correct (rel 3.28e-4 vs
+      CPU oracle, April). v71 e2e comparison: basecolor ch0-2 roughly
+      OK; **ch3 metallic way off** (ref ~const 0.998, HIP 0.44±0.61),
+      **ch4 roughness 10× damped**, ch5 alpha ~5× damped.
+- [ ] The ch3/4/5 divergence is e2e tex_dec INPUT drift (tex SLAT DiT),
+      same root-cause family as the SS-DiT bug above — but the
+      channel-specific pattern (0-2 fine, 3-5 broken) may also be a
+      tex_dec output-channel issue. Re-check after the SS/SLAT-DiT
+      per-block bisect localizes the DiT drift.
 
 ### Cross-vendor parity
 - [ ] ROCm-vs-CUDA bisect (2026-05-08 memo): hipBLASLt RDNA4/ROCm 7.2.2
