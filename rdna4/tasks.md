@@ -100,21 +100,28 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       ~56% vertex density. The on-the-fly nmap change (58541f6) bumped
       coverage from 35%→56% as a side effect (different numerical
       paths in WMMA/Triton spconv → more to_subdiv logits pass > 0).
-- [ ] Logit-distribution bisect (v64/v65, 2026-05-14): HIP to_subdiv
-      logit std vs reference (`14_shape_sub*.feats.npy`):
-        stage 0: 111.7 / 129.6 = 86%
-        stage 1:  70.3 /  99.1 = 71%
-        stage 2:  10.8 /  33.4 = 32%
-        stage 3:   6.1 /  22.4 = 27%
-      Progressive damping, compounds through stages, biggest drop
-      stage1→stage2. **F32 spconv path (T2_TEX_WMMA_SPCONV=0
-      T2_TEX_TRITON=0) reproduces it exactly** — std 10.82 vs 10.80 —
-      so it is NOT kernel/BF16 precision loss. The bug is architectural:
-      a normalization, activation, or weight-handling difference in the
-      shape_dec ConvNeXt/c2s path.
-      Next: needs intermediate C-dim feature dumps from the PyTorch
-      reference (current verify-dumps only has 8-ch logits, not the
-      ConvNeXt feature tensors) to do a layer-by-layer numerical bisect.
+- [x] Full bisect done (v64-v67 + PyTorch-ROCm reference dump,
+      2026-05-14):
+      1. to_subdiv math + weights VERIFIED correct: HIP_feats @ ref_W.T
+         + b reproduces HIP's damped logits exactly; ref_feats @ ref_W.T
+         + b reproduces ref logits (128.5≈129.6 etc). Projection is fine.
+      2. c2s SparseChannel2Spatial gather (t2_c2s_gather_f32) matches
+         reference rearrange. ConvNeXt block structure matches
+         (conv→norm→mlp→+x). No architectural bug found.
+      3. HIP c2s-input feats have ~right per-channel std (stage-2 median
+         ratio 1.01 vs ref) BUT the to_subdiv amplification
+         (logit_std/feat_std) is way off: ref 39.7/8.2 at stage 0/2 vs
+         HIP 26.7/3.4. Feats are decorrelated from the trained
+         to_subdiv weight directions.
+      4. Divergence is distributed/upstream, not a single bug:
+         SS path gives 3468 coords vs ref 3548; HIP shape-SLAT denorm
+         std 5.55 vs ref 6.00 (92%). Accumulated BF16/numerical drift
+         through DiT+decoder rotates feature vectors away from the
+         trained to_subdiv directions → progressively damped logits
+         → fewer subdiv children → 56% mesh density.
+      Conclusion: needs precision improvements across the DiT+decoder
+      stack (not a quick patch). Mesh geometry is correct; this only
+      affects fine tessellation density.
 
 ### MCLK lever — likely also resolved by per-call scratch fix
 - [ ] Re-verify whether the "back-to-back runs go slow" symptom was
