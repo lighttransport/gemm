@@ -98,8 +98,8 @@ Useful deeper checks:
 - Precision variants: real bf16/fp8 kernels are still placeholders.
 - Coverage: expand prompt/image regressions beyond mountain, snow, and
   sky.
-- Product wiring: the standalone CUDA runner is current; server/web
-  SAM3.1 routing remains a separate integration task.
+- Product wiring: server/web CUDA routing is current when
+  `DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA=ON`; CPU remains unsupported.
 - Scope: tracker/video and prompt-driven `interactive_convs.*` /
   `propagation_convs.*` paths are still out of scope for this image-only
   text-prompt runner.
