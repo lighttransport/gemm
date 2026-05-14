@@ -32,6 +32,11 @@ typedef struct {
     int      n_cols;     /* number of elements per row */
     int      n_dims;     /* up to 4 for GGUF tensors */
     uint64_t dims[4];
+    /* A64FX panel layout (M10): for F16 weights, an optional repack into
+     * panel[blk][k][lane] = data[blk*32+lane][k] so the SVE matvec needs no
+     * horizontal reduction. NULL when unused. panel_blk = ceil(n_rows/32). */
+    uint16_t *panel;
+    int       panel_blk;
 } qtensor;
 
 typedef struct {
@@ -851,10 +856,21 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
     return NULL;
 }
 
+static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat, const float *x, int n_rows);
+
 static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qtensor *mat1,
                                     float *dst2, const qtensor *mat2,
                                     const float *x, int n_rows) {
     int nt = m->n_threads;
+#if defined(__ARM_FEATURE_SVE)
+    /* Panel-laid-out weights are already single-stream; the fused2 path only
+     * existed to share x across two row-major streams. Route each separately. */
+    if (mat1->panel || mat2->panel) {
+        tf_qmatvec_pool(m, dst1, mat1, x, n_rows);
+        tf_qmatvec_pool(m, dst2, mat2, x, n_rows);
+        return;
+    }
+#endif
     if (nt <= 1 || !m->pool_alive) {
         tf_qmatvec(dst1, mat1, x, n_rows, m->thread_tmp[0]);
         tf_qmatvec(dst2, mat2, x, n_rows, m->thread_tmp[0]);
@@ -1071,8 +1087,116 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
 }
 
 /* Pool-based multi-threaded matvec (avoids pthread_create per call) */
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+
+/* M10 (A64FX): repack an F16 weight [n_rows][n_cols] row-major into panel
+ * layout panel[blk][k][lane] = W[blk*32+lane][k]. Each SVE fp16 lane then
+ * accumulates a distinct output row, so the matvec needs no horizontal
+ * reduction and reads the weight as one sequential stream. The last block is
+ * zero-padded when n_rows is not a multiple of 32. Sets t->panel / t->panel_blk;
+ * no-op for non-F16 tensors. The original t->data is kept (other code paths
+ * and dequant still use it); this roughly doubles F16 weight memory. */
+static void tf_qtensor_build_panel(qtensor *t) {
+    if (!t->data || t->type != GGML_TYPE_F16) return;
+    int K = t->n_cols;
+    int nblk = (t->n_rows + 31) / 32;
+    if (nblk == 0) return;
+    size_t nelem = (size_t)nblk * K * 32;
+    uint16_t *p = (uint16_t *)calloc(nelem, sizeof(uint16_t)); /* zero-pads tail */
+    if (!p) return;
+    const uint16_t *W = (const uint16_t *)t->data;
+    for (int row = 0; row < t->n_rows; row++) {
+        int blk = row / 32, lane = row % 32;
+        const uint16_t *src = W + (size_t)row * K;
+        uint16_t *dst = p + (size_t)blk * K * 32 + lane;
+        for (int k = 0; k < K; k++) dst[(size_t)k * 32] = src[k];
+    }
+    t->panel = p;
+    t->panel_blk = nblk;
+}
+
+typedef struct {
+    float *dst;
+    const uint16_t *panel;
+    const float *x;
+    int blk_start, blk_end;
+    int n_cols;
+    int n_rows;          /* for predicated store of the last partial block */
+} tf_panel_task;
+
+/* Panel matvec: single sequential stream over panel, 8 k-accumulators to hide
+ * the ~9-cycle svmla_f16 latency, result store is a plain widen + svst1. */
+static void *tf_panel_matvec_worker(void *arg) {
+    tf_panel_task *t = (tf_panel_task *)arg;
+    int K = t->n_cols, n_rows = t->n_rows;
+    const float *x = t->x;
+    svbool_t ph = svptrue_b16(), pg = svptrue_b32();
+    for (int blk = t->blk_start; blk < t->blk_end; blk++) {
+        const float16_t *wp = (const float16_t *)t->panel + (size_t)blk * K * 32;
+        svfloat16_t a0=svdup_f16(0),a1=svdup_f16(0),a2=svdup_f16(0),a3=svdup_f16(0);
+        svfloat16_t a4=svdup_f16(0),a5=svdup_f16(0),a6=svdup_f16(0),a7=svdup_f16(0);
+        int k = 0;
+        for (; k + 7 < K; k += 8) {
+            a0 = svmla_x(ph,a0, svld1_f16(ph,wp+(size_t)(k+0)*32), svdup_f16((float16_t)x[k+0]));
+            a1 = svmla_x(ph,a1, svld1_f16(ph,wp+(size_t)(k+1)*32), svdup_f16((float16_t)x[k+1]));
+            a2 = svmla_x(ph,a2, svld1_f16(ph,wp+(size_t)(k+2)*32), svdup_f16((float16_t)x[k+2]));
+            a3 = svmla_x(ph,a3, svld1_f16(ph,wp+(size_t)(k+3)*32), svdup_f16((float16_t)x[k+3]));
+            a4 = svmla_x(ph,a4, svld1_f16(ph,wp+(size_t)(k+4)*32), svdup_f16((float16_t)x[k+4]));
+            a5 = svmla_x(ph,a5, svld1_f16(ph,wp+(size_t)(k+5)*32), svdup_f16((float16_t)x[k+5]));
+            a6 = svmla_x(ph,a6, svld1_f16(ph,wp+(size_t)(k+6)*32), svdup_f16((float16_t)x[k+6]));
+            a7 = svmla_x(ph,a7, svld1_f16(ph,wp+(size_t)(k+7)*32), svdup_f16((float16_t)x[k+7]));
+        }
+        for (; k < K; k++)
+            a0 = svmla_x(ph,a0, svld1_f16(ph,wp+(size_t)k*32), svdup_f16((float16_t)x[k]));
+        svfloat16_t s = svadd_x(ph, svadd_x(ph,svadd_x(ph,a0,a1),svadd_x(ph,a2,a3)),
+                                    svadd_x(ph,svadd_x(ph,a4,a5),svadd_x(ph,a6,a7)));
+        svuint16_t u = svreinterpret_u16(s);
+        int row0 = blk * 32;
+        float *d = t->dst + row0;
+        svfloat32_t lo = svcvt_f32_f16_x(pg, svreinterpret_f16(svunpklo_u32(u)));
+        svfloat32_t hi = svcvt_f32_f16_x(pg, svreinterpret_f16(svunpkhi_u32(u)));
+        if (row0 + 32 <= n_rows) {
+            svst1_f32(pg, d,      lo);
+            svst1_f32(pg, d + 16, hi);
+        } else {
+            /* last partial block: predicated store, drop zero-padded rows */
+            svst1_f32(svwhilelt_b32(row0,      n_rows), d,      lo);
+            svst1_f32(svwhilelt_b32(row0 + 16, n_rows), d + 16, hi);
+        }
+    }
+    return NULL;
+}
+
+static void tf_panel_matvec_pool(transformer_model *m, float *dst,
+                                 const qtensor *mat, const float *x) {
+    int nblk = mat->panel_blk;
+    int K = mat->n_cols, n_rows = mat->n_rows;
+    int n_threads = m->n_threads;
+    if (n_threads <= 1 || nblk < n_threads || !m->pool_alive) {
+        tf_panel_task t = {dst, mat->panel, x, 0, nblk, K, n_rows};
+        tf_panel_matvec_worker(&t);
+        return;
+    }
+    tf_panel_task *tasks = (tf_panel_task *)alloca(n_threads * sizeof(tf_panel_task));
+    int per = nblk / n_threads, extra = nblk % n_threads, off = 0;
+    for (int i = 0; i < n_threads; i++) {
+        int c = per + (i < extra ? 1 : 0);
+        tasks[i] = (tf_panel_task){dst, mat->panel, x, off, off + c, K, n_rows};
+        off += c;
+    }
+    tf_pool_dispatch(m, tf_panel_matvec_worker, tasks, sizeof(tf_panel_task));
+}
+#endif /* __ARM_FEATURE_SVE */
+
 static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat, const float *x, int n_rows) {
     int n_threads = m->n_threads;
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->panel) {
+        tf_panel_matvec_pool(m, dst, mat, x);
+        return;
+    }
+#endif
     if (n_threads <= 1 || n_rows < n_threads * 4 || !m->pool_alive) {
         tf_qmatvec(dst, mat, x, n_rows, m->thread_tmp[0]);
         return;
@@ -1974,6 +2098,29 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         return NULL;
     }
 
+#if defined(__ARM_FEATURE_SVE)
+    /* M10: repack all dense F16 matvec weights into panel layout for the
+     * A64FX kernel (no horizontal reduction, single sequential stream).
+     * Non-F16 tensors are skipped; MoE expert tensors stay row-major. */
+    if (!getenv("TF_NO_PANEL")) {
+        int n_panels = 0;
+        for (int l = 0; l < m->n_layers; l++) {
+            transformer_layer *L = &m->layers[l];
+            qtensor *dense[] = { &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+                                 &L->ffn_gate, &L->ffn_up, &L->ffn_down };
+            for (int i = 0; i < 7; i++) {
+                if (!dense[i]->panel) tf_qtensor_build_panel(dense[i]);
+                if (dense[i]->panel) n_panels++;
+            }
+        }
+        if (m->has_lm_head && !m->output.panel) tf_qtensor_build_panel(&m->output);
+        if (m->output.panel) n_panels++;
+        if (n_panels)
+            fprintf(stderr, "transformer: panel layout built for %d F16 matvec weights\n",
+                    n_panels);
+    }
+#endif
+
     /* Allocate KV cache */
     int kv_dim = m->n_kv_heads * m->head_dim;
     m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
@@ -2124,6 +2271,19 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
 void transformer_free(transformer_model *model) {
     if (!model) return;
+#if defined(__ARM_FEATURE_SVE)
+    /* M10: free panel-layout weight copies */
+    if (model->layers) {
+        for (int l = 0; l < model->n_layers; l++) {
+            transformer_layer *L = &model->layers[l];
+            free(L->attn_q.panel);   free(L->attn_k.panel);
+            free(L->attn_v.panel);   free(L->attn_output.panel);
+            free(L->ffn_gate.panel); free(L->ffn_up.panel);
+            free(L->ffn_down.panel);
+        }
+    }
+    free(model->output.panel);
+#endif
     free(model->layers);
     if (model->key_cache) {
         for (int l = 0; l < model->n_layers; l++) {
