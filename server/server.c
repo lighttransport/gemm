@@ -818,7 +818,9 @@ static char *build_qwen_infer_body_from_mcp_args(json_val *args) {
 
 /* Build a sam3 segmentation infer-body from MCP tool arguments. */
 static char *build_sam3_infer_body_from_mcp_args(json_val *args, const char *model_id) {
-    const char *backend = args ? json_str(args, "backend", "cpu") : "cpu";
+    const int is_sam31 = (model_id && strcmp(model_id, "sam3.1") == 0);
+    const char *default_backend = is_sam31 ? "cuda" : "cpu";
+    const char *backend = args ? json_str(args, "backend", default_backend) : default_backend;
     const char *text = args ? json_str(args, "text", "") : "";
     const char *image_b64 = args ? json_str(args, "image_base64", "") : "";
     char *be = json_escape_dup(backend);
@@ -839,8 +841,14 @@ static char *build_sam3_infer_body_from_mcp_args(json_val *args, const char *mod
         double st = args ? json_f64(args, "score_threshold", 0.3) : 0.3;
         double mt = args ? json_f64(args, "mask_threshold",  0.5) : 0.5;
         int mm    = args ? json_int(args, "max_masks",       16)  : 16;
-        sbuf_printf(&b, "{\"score_threshold\":%.3f,\"mask_threshold\":%.3f,\"max_masks\":%d}",
-                    st, mt, mm);
+        int device = args ? json_int(args, "device", 0) : 0;
+        const char *precision = args ? json_str(args, "precision", "fp16") : "fp16";
+        char *pr = json_escape_dup(precision);
+        sbuf_printf(&b,
+                    "{\"score_threshold\":%.3f,\"mask_threshold\":%.3f,"
+                    "\"max_masks\":%d,\"device\":%d,\"precision\":\"%s\"}",
+                    st, mt, mm, device, pr);
+        free(pr);
     }
     sbuf_append(&b, "}");
     free(be); free(tx); free(ib);
@@ -1407,8 +1415,17 @@ static char *models_json(const server_config *cfg) {
 #endif
         "\"},");
     sbuf_append(&out,
-        "{\"id\":\"sam3.1\",\"tasks\":[\"segmentation\"],\"backends\":[\"cpu\",\"cuda\"],"
-        "\"status\":\"pending_runner\",\"note\":\"see cuda/sam3.1/PORT.md\"}"
+        "{\"id\":\"sam3.1\",\"tasks\":[\"segmentation\"],\"backends\":["
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
+        "\"cuda\""
+#endif
+        "],\"status\":\""
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
+        "ready"
+#else
+        "stub"
+#endif
+        "\",\"note\":\"cuda backend only\"}"
         "]}");
     return out.ptr;
 }
@@ -1418,7 +1435,8 @@ static char *health_json(void) {
     sbuf_init(&b);
     sbuf_printf(&b,
         "{\"ok\":true,\"server\":\"diffusion-server\",\"compiled\":{\"qwen_image\":%s,"
-        "\"qwen_image_cpu\":%s,\"qwen_image_hip\":%s,\"sam3\":%s,\"mcp\":%s}}",
+        "\"qwen_image_cpu\":%s,\"qwen_image_hip\":%s,\"sam3\":%s,"
+        "\"sam3_1_cuda\":%s,\"mcp\":%s}}",
 #if defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE)
         "true",
 #else
@@ -1435,6 +1453,11 @@ static char *health_json(void) {
         "false",
 #endif
 #if defined(DIFFUSION_SERVER_ENABLE_SAM3)
+        "true",
+#else
+        "false",
+#endif
+#if defined(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA)
         "true",
 #else
         "false",
@@ -1919,9 +1942,17 @@ static int run_mcp_stdio(const server_config *cfg) {
                    "\"weights\":{\"type\":\"object\",\"additionalProperties\":false,"
                    "\"properties\":{\"ckpt\":{\"type\":\"string\"},\"vocab\":{\"type\":\"string\"},"
                    "\"merges\":{\"type\":\"string\"}}}},\"required\":[\"text\",\"image_base64\"]}},"
-                   "{\"name\":\"sam3_1_segment\",\"description\":\"Segment with SAM 3.1 (runner port in progress; currently 501)\","
+                   "{\"name\":\"sam3_1_segment\",\"description\":\"Segment an image by text phrase with SAM 3.1 (CUDA backend)\","
                    "\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false,"
-                   "\"properties\":{\"text\":{\"type\":\"string\"},\"image_base64\":{\"type\":\"string\"}}}}"
+                   "\"properties\":{\"backend\":{\"type\":\"string\",\"enum\":[\"cuda\"]},"
+                   "\"text\":{\"type\":\"string\"},\"image_base64\":{\"type\":\"string\"},"
+                   "\"score_threshold\":{\"type\":\"number\"},\"mask_threshold\":{\"type\":\"number\"},"
+                   "\"max_masks\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64},"
+                   "\"device\":{\"type\":\"integer\",\"minimum\":0},"
+                   "\"precision\":{\"type\":\"string\",\"enum\":[\"fp16\",\"fp32\",\"bf16\",\"fp8\"]},"
+                   "\"weights\":{\"type\":\"object\",\"additionalProperties\":false,"
+                   "\"properties\":{\"ckpt\":{\"type\":\"string\"},\"vocab\":{\"type\":\"string\"},"
+                   "\"merges\":{\"type\":\"string\"}}}},\"required\":[\"text\",\"image_base64\"]}}"
                    "]}}\n", idbuf);
             fflush(stdout);
         } else if (strcmp(method, "tools/call") == 0) {
