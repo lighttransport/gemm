@@ -46,12 +46,11 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       `hipDeviceSynchronize()` at start of `hip_trellis2_free` drains
       pending kernels before hipBLASLt teardown. v27 exited 0.
 
-### MCLK regression returns post-xmrig (2026-05-13)
-- [ ] After xmrig ran 4h then was killed, MCLK lever stopped ramping again
-      even though CPU is now free. Same binary, no edits — v28 reproduced
-      v27's slow path (tex_dec 19 min, mclk pinned 96 MHz). Reboot before
-      next benchmark. Investigate amdgpu driver state that xmrig leaves
-      behind (likely some HSA queue or DMA mapping not cleaned up).
+### MCLK regression returns post-xmrig (2026-05-13) — RESOLVED
+- [x] The "tex_dec slow / mclk pinned 96 MHz on subsequent runs"
+      symptom was the same stale-g_c2s bug, not driver/xmrig state.
+      Fixed by per-call c2s_free_all (5ee328e), verified 2026-05-14
+      with 3 back-to-back fast runs. Was never an amdgpu/HSA issue.
 
 ### Fast-path tex_dec corruption FIXED (commit 5ee328e, 2026-05-14)
 - [x] Root cause: `g_c2s` (C2S persistent scratch with dn/de/dhf/dxf/
