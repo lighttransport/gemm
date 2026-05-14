@@ -133,6 +133,24 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       SS DiT / SS decoder / SLAT DiT (HIP shape-SLAT denorm std 5.55 vs
       ref 6.00, coords 3468 vs 3548). Any further mesh-density work
       must target the DiT path, not the decoder.
+- [x] SS DiT bisect (v70 + PyTorch-ROCm full dump, 2026-05-14):
+      HIP SS-DiT latent vs reference (12-step CFG):
+        HIP-BF16 vs CUDA-ref      rel_l2 0.190
+        HIP-F32  vs CUDA-ref      rel_l2 0.142
+        HIP-F32  vs PyTorch-ROCm  rel_l2 0.141
+        CUDA-ref vs PyTorch-ROCm  rel_l2 0.059  (cross-hw floor)
+      Inputs verified bit-identical (ss_noise) / 2.6e-5 (dinov3_cond).
+      Decomposition: ~0.13 rel_l2 is BF16 precision (F32 removes it),
+      ~0.06 is cross-hardware noise, and **~0.12 rel_l2 is a genuine
+      HIP-C-vs-PyTorch algorithmic difference** — precision-independent,
+      hardware-independent. This is the real SS-DiT bug feeding the
+      mesh-density gap.
+- [ ] NEXT: per-block SS-DiT bisect. HIP side ready (`--dump-blocks`
+      mode + `hip_trellis2_dump_block`). Need to instrument the
+      PyTorch SS-DiT forward (trellis2_repo, same approach as the
+      c2s-feats dump) to dump per-block hidden states, then find which
+      of the 30 blocks first diverges. Suspects: RoPE tables, QK-norm,
+      attention scale, timestep embedding, modulation.
 
 ### MCLK lever — likely also resolved by per-call scratch fix
 - [ ] Re-verify whether the "back-to-back runs go slow" symptom was
