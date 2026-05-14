@@ -90,14 +90,20 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       before the hipFree loop. v25 and v30 both hit it; v29 won the
       race by luck.
 
-### Sparse coverage gap — bisected to stage-0 to_subdiv
-- [ ] HIP shape_dec stage-0 keeps only 53% of children reference keeps
-      (×2.52 vs ref ×4.78). Stage 2 also under (×3.04 vs ×4.47). Stages
-      1, 3 within ±10%. Hypothesis: `to_subdiv` logits at C=1024 are
-      damped → fewer pass the `logits > 0` threshold. Likely an
-      upstream feature-magnitude clamp in the ConvNeXt path (matches
-      tex_dec outlier memo: HIP bounded to ±1, ref ±700). Next:
-      capture stage-0 host logits, compare distributions vs reference.
+### Sparse coverage gap — improved by nmap fast path, still ~56%
+- Mesh quality vs reference (v63, 2026-05-14):
+  - verts 826,915 / ref 1,468,404 = 56%; faces 951,334 / 3,140,890 = 30%
+  - bbox matches to 3 decimals; coarse IoU res16=0.92, res32=0.88
+  - fine IoU res64=0.56, res128=0.32 — recall<precision → under-
+    tessellated, missing reference detail (not spurious geometry)
+- [ ] Verdict: geometry correct (right object/place/scale), but
+      ~56% vertex density. The on-the-fly nmap change (58541f6) bumped
+      coverage from 35%→56% as a side effect (different numerical
+      paths in WMMA/Triton spconv → more to_subdiv logits pass > 0).
+- [ ] Remaining gap: `to_subdiv` logits at C=1024 still damped vs
+      reference. Next: capture stage-0 host logits, compare
+      distributions; check for feature-magnitude clamp in ConvNeXt
+      (matches tex_dec outlier memo: HIP bounded to ±1, ref ±700).
 
 ### MCLK lever — likely also resolved by per-call scratch fix
 - [ ] Re-verify whether the "back-to-back runs go slow" symptom was
