@@ -165,6 +165,28 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       localized bug, not practically fixable without matching
       PyTorch's exact op order everywhere. PyTorch instrumentation
       reverted after the run.
+- [x] Per-OP block-0 bisect DONE (2026-05-14): instrumented PyTorch
+      `ModulatedTransformerCrossBlock._forward` to dump 9 intermediate
+      tensors; ran HIP `--dump-b0 --t 1.0` (BF16) and again with
+      `T2_WMMA=0 T2_BLASLT=0` (F32). Per-op rel_l2 vs PyTorch-ROCm:
+        op            BF16     F32
+        input_embed   0.0017   0.0017  (F32 GEMM FMA-order, tiny)
+        ln_h_sa       0.0041   0.0041  (LayerNorm, F32-persistent)
+        sa_proj       0.0067   0.0020  (BF16 noise — F32 fixes)
+        ca_proj       0.0152   0.0027  (BF16 noise — F32 fixes)
+        ln_h_mlp      0.0140   0.0124  (LayerNorm, F32-persistent)
+        mlp_proj      0.0072   0.0030  (BF16 noise — F32 fixes)
+        h_post_mlp    0.0057   0.0031  (block-0 output, F32)
+      Attention/MLP GEMMs are pure BF16 noise (F32 collapses them
+      ~0.015→0.003). The F32-persistent residual is only on the
+      LayerNorm+modulation ops + input GEMM — and those are
+      algorithmically identical to PyTorch (verified: same eps=1e-6,
+      same biased `/dim` variance, LayerNorm32 is just nn.LayerNorm
+      +fp32 cast). The residual is irreducible FMA/reduction-order
+      difference. **No bug at any of the 4 bisect levels.** Drift
+      investigation CLOSED — fully characterized, not fixable without
+      bit-exact PyTorch op-order replication. Both PyTorch
+      instrumentation patches reverted.
 - Conclusion for the mesh-density gap: the HIP pipeline is faithful
   per-block; the ~56% tessellation density is the cost of running a
   deep 24-forward BF16 diffusion sampler on a different stack. Mesh
