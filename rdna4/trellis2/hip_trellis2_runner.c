@@ -2749,7 +2749,9 @@ static int slat_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
     run_ln_noaffine(r, r->d_slat_ln_h, r->d_slat_h, N, DIT_DIM);
     gemm(r, r->d_slat_vel_out, &r->slat_out, r->d_slat_ln_h, r->slat_out.b,
          SLAT_IN_CH, DIT_DIM, N);
-    hipDeviceSynchronize();
+    /* No final sync — caller hipMemcpy D2H of d_slat_vel_out (line ~2809)
+     * already synchronizes on default stream. Saves ~one hipDeviceSync per
+     * step (negligible per-step but cleaner). */
     return 0;
 }
 
@@ -3103,7 +3105,7 @@ static int tex_dit_forward(hip_trellis2_runner *r, int N, int n_cond) {
     run_ln_noaffine(r, r->d_tex_ln_h, r->d_tex_h, N, DIT_DIM);
     gemm(r, r->d_tex_vel_out, &r->tex_out, r->d_tex_ln_h, r->tex_out.b,
          TEX_OUT_CH, DIT_DIM, N);
-    hipDeviceSynchronize();
+    /* No final sync — caller hipMemcpy D2H syncs default stream. */
     return 0;
 }
 
