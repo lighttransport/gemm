@@ -1101,6 +1101,17 @@ int t2_shape_dec_unguided_synth_host(const t2_shape_dec *d, int stage_idx,
     {
         const char *e = getenv("T2_DUMP_SUBDIV_LOGITS");
         if (e && atoi(e)) {
+            /* Also dump the c2s-input feats stats (the ConvNeXt output). */
+            double fs = 0, fs2 = 0; float fmn = feats[0], fmx = feats[0];
+            size_t fn = (size_t)Nc * Ci;
+            for (size_t i = 0; i < fn; i++) {
+                float v = feats[i];
+                fs += v; fs2 += (double)v * v;
+                if (v < fmn) fmn = v; if (v > fmx) fmx = v;
+            }
+            double fmean = fs / fn, fvar = fs2 / fn - fmean * fmean;
+            fprintf(stderr, "T2-FEATS stage %d: (%d,%d) mean=%.4f std=%.4f range[%.3f,%.3f]\n",
+                    stage_idx, Nc, Ci, fmean, fvar > 0 ? sqrt(fvar) : 0.0, fmn, fmx);
             double s = 0, s2 = 0; float mn = logits[0], mx = logits[0];
             int npos = 0;
             for (int i = 0; i < Nc * 8; i++) {
