@@ -38,6 +38,12 @@ typedef struct {
     int      n_cols;     /* product of all dims past the 0th */
     int      n_dims;     /* clamped to 4 for storage in dims[] */
     uint64_t dims[4];
+    /* Must stay byte-identical to the qtensor in common/transformer.h:
+     * vision_model and other structs are shared across TUs that include
+     * either header, so any layout drift corrupts struct offsets.
+     * A64FX panel layout (M10) — see transformer.h for semantics. */
+    uint16_t *panel;
+    int       panel_blk;
 } qtensor;
 #endif
 #endif
