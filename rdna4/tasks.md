@@ -100,10 +100,21 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       ~56% vertex density. The on-the-fly nmap change (58541f6) bumped
       coverage from 35%→56% as a side effect (different numerical
       paths in WMMA/Triton spconv → more to_subdiv logits pass > 0).
-- [ ] Remaining gap: `to_subdiv` logits at C=1024 still damped vs
-      reference. Next: capture stage-0 host logits, compare
-      distributions; check for feature-magnitude clamp in ConvNeXt
-      (matches tex_dec outlier memo: HIP bounded to ±1, ref ±700).
+- [ ] Logit-distribution bisect (v64/v65, 2026-05-14): HIP to_subdiv
+      logit std vs reference (`14_shape_sub*.feats.npy`):
+        stage 0: 111.7 / 129.6 = 86%
+        stage 1:  70.3 /  99.1 = 71%
+        stage 2:  10.8 /  33.4 = 32%
+        stage 3:   6.1 /  22.4 = 27%
+      Progressive damping, compounds through stages, biggest drop
+      stage1→stage2. **F32 spconv path (T2_TEX_WMMA_SPCONV=0
+      T2_TEX_TRITON=0) reproduces it exactly** — std 10.82 vs 10.80 —
+      so it is NOT kernel/BF16 precision loss. The bug is architectural:
+      a normalization, activation, or weight-handling difference in the
+      shape_dec ConvNeXt/c2s path.
+      Next: needs intermediate C-dim feature dumps from the PyTorch
+      reference (current verify-dumps only has 8-ch logits, not the
+      ConvNeXt feature tensors) to do a layer-by-layer numerical bisect.
 
 ### MCLK lever — likely also resolved by per-call scratch fix
 - [ ] Re-verify whether the "back-to-back runs go slow" symptom was

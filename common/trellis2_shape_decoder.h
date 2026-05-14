@@ -1097,6 +1097,26 @@ int t2_shape_dec_unguided_synth_host(const t2_shape_dec *d, int stage_idx,
     }
     int Nf = 0;
     for (int i = 0; i < Nc * 8; i++) if (logits[i] > 0) Nf++;
+    /* Optional logit-distribution dump for reference comparison. */
+    {
+        const char *e = getenv("T2_DUMP_SUBDIV_LOGITS");
+        if (e && atoi(e)) {
+            double s = 0, s2 = 0; float mn = logits[0], mx = logits[0];
+            int npos = 0;
+            for (int i = 0; i < Nc * 8; i++) {
+                float v = logits[i];
+                s += v; s2 += (double)v * v;
+                if (v < mn) mn = v; if (v > mx) mx = v;
+                if (v > 0) npos++;
+            }
+            double n = (double)Nc * 8;
+            double mean = s / n, var = s2 / n - mean * mean;
+            fprintf(stderr, "T2-LOGITS stage %d: Nc=%d range[%.3f,%.3f] "
+                    "mean=%.4f std=%.4f pos=%d/%d (%.1f%%)\n",
+                    stage_idx, Nc, mn, mx, mean, var > 0 ? sqrt(var) : 0.0,
+                    npos, (int)n, 100.0 * npos / n);
+        }
+    }
     int64_t *idx = (int64_t *)malloc((size_t)Nf * sizeof(int64_t));
     int64_t *si  = (int64_t *)malloc((size_t)Nf * sizeof(int64_t));
     int32_t *xc  = (int32_t *)malloc((size_t)Nf * 4 * sizeof(int32_t));
