@@ -122,6 +122,16 @@ Snapshot: 2026-05-14. Branch: `trellis2`.
       Conclusion: needs precision improvements across the DiT+decoder
       stack (not a quick patch). Mesh geometry is correct; this only
       affects fine tessellation density.
+- [x] FP32-shape_dec test (v68, 2026-05-14): ran shape_dec with
+      T2_TEX_BLASLT=0 T2_TEX_WMMA_SPCONV=0 T2_TEX_TRITON=0 (full F32
+      scalar — no BF16 GEMM, no WMMA/Triton spconv anywhere in the
+      decoder). to_subdiv logit std came out **identical** to the BF16
+      path (111.67/70.33/10.81/6.09 vs 111.79/70.40/10.80/6.08).
+      → shape_dec GEMM/conv precision is NOT the cause. The decoder is
+      numerically faithful. The divergence is entirely upstream in the
+      SS DiT / SS decoder / SLAT DiT (HIP shape-SLAT denorm std 5.55 vs
+      ref 6.00, coords 3468 vs 3548). Any further mesh-density work
+      must target the DiT path, not the decoder.
 
 ### MCLK lever — likely also resolved by per-call scratch fix
 - [ ] Re-verify whether the "back-to-back runs go slow" symptom was
