@@ -111,7 +111,7 @@ static void *get_f32_dev(const void *host_ptr, size_t n_bytes) {
  * Kernel function table
  * ======================================================================== */
 
-typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, conv_nmap_bf16_x8_db, gather27, gather27_v2, ln, silu, silu_bf16, gelu, add, lin, lin_naive, gather, resrep, pack_bf16, pack_f16, unpack_f16, splitk_reduce, dense_x8_db, dense_bf16in_x8_db; } K;
+typedef struct { hipFunction_t ins, conv, conv_tiled, conv_nmap, conv_nmap_tiled, conv_nmap_bf16, conv_nmap_bf16_x2, conv_nmap_bf16_x4, conv_nmap_bf16_x8, conv_nmap_bf16_x8_db, gather27, gather27_v2, ln, silu, silu_bf16, gelu, add, lin, lin_naive, gather, resrep, pack_bf16, pack_f16, unpack_f16, splitk_reduce, dense_x8_db, dense_bf16in_x8_db, build_nmap; } K;
 
 static K g_K = {0};
 
@@ -907,6 +907,7 @@ hip_shape_dec_ctx *hip_shape_dec_ctx_create(hipModule_t module,
         hipModuleGetFunction(&k->resrep, module, "t2_residual_repeat_f32");
         hipModuleGetFunction(&k->pack_bf16, module, "t2_pack_bf16_from_f32");
         hipModuleGetFunction(&k->pack_f16, module, "t2_pack_f16_from_f32");
+        hipModuleGetFunction(&k->build_nmap, module, "t2_build_nmap_f32");
         hipModuleGetFunction(&k->unpack_f16, module, "t2_unpack_f32_from_f16");
         hipModuleGetFunction(&k->splitk_reduce, module, "t2_splitk_reduce_to_f16");
 
@@ -1184,16 +1185,29 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
         s_stage_time = (e && atoi(e)) ? 1 : 0;
     }
     int cur_N = N;
+    void *d_nmap_built[T2SD_MAX_STAGES] = {0};
     /* Forward through all stages. */
     for (int s = 0; s < dec->n_stages; s++) {
         int nc = dec->n_convnext[s]; int ch = dec->channels[s];
         if (ctx->verbose)
             fprintf(stderr, "stage %d: %d ConvNeXt(C=%d), N=%d\n", s, nc, ch, cur_N);
+        /* If cache didn't provide nmap_cn for this stage, build it on the
+         * fly so kspconv_nmap_h can pick the WMMA / blaslt / Triton paths
+         * instead of falling to hash_kspconv (10× slower). */
+        void *d_nmap_use = d_nmap_cn[s];
+        if (!d_nmap_use && k->build_nmap && cur_N > 0) {
+            if (hipMalloc(&d_nmap_built[s], (size_t)cur_N * 27 * sizeof(uint32_t)) == hipSuccess) {
+                void *a[] = {&d_nmap_built[s], &d_coords, &d_keys, &d_vals, &cap_mask, &cur_N};
+                int gx = (cur_N + 7) / 8;
+                hipModuleLaunchKernel(k->build_nmap, gx, 1, 1, 27, 8, 1, 0, g_stream, a, NULL);
+                d_nmap_use = d_nmap_built[s];
+            }
+        }
         if (s_stage_time && g_stream) hipStreamSynchronize(g_stream);
         double cn_t0 = s_stage_time ? now_ms() : 0;
         for (int b = 0; b < nc; b++) {
             run_convnext(k, &dec->convnext[s][b], ch, cur_N,
-                d_feats, d_coords, d_keys, d_vals, cap_mask, d_tmp, d_mlp, d_nmap_cn[s]);
+                d_feats, d_coords, d_keys, d_vals, cap_mask, d_tmp, d_mlp, d_nmap_use);
         }
         if (s_stage_time) {
             if (g_stream) hipStreamSynchronize(g_stream);
@@ -1257,7 +1271,7 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
             DevSparse ds = run_c2s(k, &dec->c2s[s], cur_N,
                 d_feats, d_coords, d_keys, d_vals, cap_mask,
                 d_idx_use, d_si_use, d_xc_use, Nf_use,
-                d_nmap_cn[s], d_fine);
+                d_nmap_use ? d_nmap_use : d_nmap_cn[s], d_fine);
             if (s_stage_time) {
                 if (g_stream) hipStreamSynchronize(g_stream);
                 fprintf(stderr, "  stage %d C2S(%d->%d, Nc=%d->Nf=%d): %.1f ms\n",
@@ -1328,6 +1342,7 @@ int hip_shape_dec_forward_ex(hip_shape_dec_ctx *ctx,
         if (d_gxc[s]) hipFree(d_gxc[s]);
         if (d_nmap_cn[s]) hipFree(d_nmap_cn[s]);
         if (d_nmap_pc[s]) hipFree(d_nmap_pc[s]);
+        if (d_nmap_built[s]) hipFree(d_nmap_built[s]);
     }
     /* d_feats from stage 0 was a fresh hipMalloc; later stages reassign to
      * persistent C2S scratch. We can't safely free that without double-freeing
