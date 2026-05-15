@@ -61,7 +61,7 @@ endif
 
 # ── Sources ────────────────────────────────────────────────────────────
 # M2: norm_sve.c is wired in; vit_a64fx calls layernorm_batch_fwd_f32.
-KERNEL_C := $(KERNELS)/fused_gemm.c $(KERNELS)/pack_matrices.c $(KERNELS)/norm_sve.c $(KERNELS)/bf16_gemm.c $(KERNELS)/fp16_gemm.c
+KERNEL_C := $(KERNELS)/fused_gemm.c $(KERNELS)/pack_matrices.c $(KERNELS)/norm_sve.c $(KERNELS)/bf16_gemm.c $(KERNELS)/fp16_gemm.c $(KERNELS)/fp32_gemm.c
 KERNEL_S := $(KERNELS)/micro_kernel_fp32_8x3.S $(KERNELS)/micro_kernel_fp16B_8x3.S $(KERNELS)/micro_kernel_bf16B_8x3.S
 RUNTIME  := $(SRC)/vlm_parallel.c $(SRC)/tensor_dump.c $(SRC)/vit_a64fx.c $(SRC)/cmg_pool.c
 MAIN_SRC := $(SRC)/vlm_runner.c
