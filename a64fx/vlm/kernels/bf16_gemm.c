@@ -248,7 +248,7 @@ void gemm_bf16_BTP(int M, int K, int N,
     const int N_blocks  = (N + NR - 1) / NR;
 
     size_t A_packed_bytes = packed_A_size(M, K);
-    float *A_packed = (float *)aligned_alloc(64, A_packed_bytes);
+    float *A_packed = pack_A_get_scratch(A_packed_bytes);
     if (!A_packed) {
         fprintf(stderr, "gemm_bf16_BTP: failed to alloc A_packed (%zu bytes)\n",
                 A_packed_bytes);
@@ -307,7 +307,7 @@ void gemm_bf16_BTP(int M, int K, int N,
         }
     } /* omp parallel */
 
-    free(A_packed);
+    /* A_packed is a persistent grow-only scratch — do not free here. */
 }
 
 /* CMG-aware twin of gemm_bf16_BTP (see gemm_fp16_BTP_cmg comment). */
@@ -327,7 +327,7 @@ void gemm_bf16_BTP_cmg(int M, int K, int N,
     const int N_blocks  = (N + NR - 1) / NR;
 
     size_t A_packed_bytes = packed_A_size(M, K);
-    float *A_packed = (float *)aligned_alloc(64, A_packed_bytes);
+    float *A_packed = pack_A_get_scratch(A_packed_bytes);
     if (!A_packed) {
         fprintf(stderr, "gemm_bf16_BTP_cmg: failed to alloc A_packed (%zu bytes)\n",
                 A_packed_bytes);
@@ -395,5 +395,5 @@ void gemm_bf16_BTP_cmg(int M, int K, int N,
         }
     }
 
-    free(A_packed);
+    /* A_packed is a persistent grow-only scratch — do not free here. */
 }
