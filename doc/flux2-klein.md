@@ -292,6 +292,7 @@ make test_cuda_flux2
 ./test_cuda_flux2 --test-dit --height 64 --width 64    # Single DiT step
 ./test_cuda_flux2 --test-vae --height 64 --width 64    # VAE decode
 ./test_cuda_flux2 --test-text-enc --prompt "a red apple on a white table"
+./test_cuda_flux2 --test-text-gpu --prompt "a red apple on a white table"  # GPU repeat determinism
 
 # Using Makefile shortcuts
 make test-init
@@ -311,6 +312,13 @@ make test-gen-base    # Base pipeline
 | Shared DiT+VAE load | ~16.4–16.6s |
 | 64×64, 1-step generation after setup | ~0.3s |
 | VAE decode (64×64 output) | ~0.1s |
+
+The GPU text encoder now requests a 512-token KV cache, matching Flux2's text
+truncation length, instead of allocating the generic 2048-token LLM cache.
+The shared CUDA LLM reset path also clears F16 KV caches with the correct byte
+size and stream ordering. BF16 safetensors still use the deterministic CPU
+BF16→F16 conversion; an attempted GPU conversion path was left out because
+repeat-load testing exposed nondeterministic hidden states.
 
 ### CUDA perf snapshot (2026-04-19, `/mnt/disk01/models/klein2-4b`)
 
@@ -449,7 +457,8 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 - [x] **VAE decode allocation checks**: VAE upload, resblock, middle-attention, upsample, and head decode paths now check temporary allocations and fail cleanly instead of launching kernels with null device pointers.
 - [ ] **Attention kernel scaling**: Single-block-per-head FA2 flash attention works but may not scale to large resolutions. No multi-block flash attention.
 - [x] **Opt-in resident GPU text encoder**: `--keep-gpu-enc` / `FLUX2_KEEP_GPU_ENC=1` keeps the CUDA text encoder cache alive through DiT/VAE generation. The default path still frees it before DiT/VAE load to fit 16 GB cards.
-- [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + weight upload. PTX cache and in-process reuse help; remaining work is reducing first-load weight upload/initialization time.
+- [x] **GPU text encoder KV sizing/reset**: Flux2 GPU text encoder loads now allocate the 512-token KV cache that the wrapper actually uses. CUDA LLM reset now clears F16 KV caches with the correct byte size on the runner stream, including Gemma4 variable-size caches.
+- [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + BF16→F16 CPU conversion and weight transfer. PTX cache, in-process reuse, and smaller KV cache help; remaining work is a deterministic GPU-ready first-load path or persistent serialized F16 weights.
 
 ### Quality
 

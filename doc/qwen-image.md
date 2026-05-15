@@ -655,6 +655,13 @@ via `cuDevicePrimaryCtxRetain`.
   at 256×256 and ~20 ms at 512×512. The 256×256 win is larger because n_img
   = 1024 was below the MMA kernel's preferred M tile count; doubling to 2048
   fills the CTAs more evenly.
+- [x] **CFG activation cache / multi-resolution growth**. The main CFG DiT
+  path now keeps activation buffers in a runner-owned cache and grows them
+  only when a later call needs a larger resolution or text shape. This removes
+  the per-step `cuMemAlloc/cuMemFree` churn for paired cond/uncond buffers,
+  QKV/attention scratch, CFG-batched image MLP scratch, and final projection
+  buffers. The cache is released before VAE decode so image decode still gets
+  the VRAM back.
 - [ ] **Attention kernel for n_tok > 1536**: `flash_attn_bf16` handles our sizes, but won't scale beyond 2K tokens without tiling.
 - [x] **VAE middle attention on GPU**. Replaced the CPU DtoH/HtoD round-trip
   and O(N²D) Python-like loop with two F32 transpose kernels (`[c, spatial]
@@ -723,7 +730,9 @@ via `cuDevicePrimaryCtxRetain`.
 - [ ] **ControlNet / Reference latents**: `timestep_zero_index` path in `_apply_gate` not implemented.
 - [ ] **Image-to-image**: No img2img / inpainting support.
 - [x] **Quantized text encoder on GPU**: CUDA LLM runner with GGUF Q4_K weights (12.8s vs 710s CPU).
-- [ ] **Multiple resolutions in one session**: DiT weight preloading is resolution-independent, but activation buffers are allocated per-call.
+- [x] **Multiple resolutions in one session**: The main CFG path reuses and
+  grows activation buffers per runner; the legacy non-CFG test path still
+  allocates per call.
 
 ### Code Quality
 
