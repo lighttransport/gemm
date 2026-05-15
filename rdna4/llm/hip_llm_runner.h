@@ -44,6 +44,16 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
 float *hip_llm_forward_embd(hip_llm_runner *r, const float *embd, int embd_stride, int position);
 float *hip_llm_forward_embd_logits(hip_llm_runner *r, const float *embd, int embd_stride, int position);
 
+/* Batched embedding forward: feed M pre-computed embeddings through the
+ * batched prefill path in one shot (positions [position_start, +M)). Same
+ * row layout as hip_llm_forward_embd — first n_embd floats per row are the
+ * main embedding, remainder (when embd_stride > n_embd) are deepstack slices.
+ * Falls back to per-token loop if M doesn't fit the batched path. Returns
+ * the last row's hidden state [n_embd] (host-side buffer, valid until next
+ * call). */
+float *hip_llm_forward_batch_embd(hip_llm_runner *r, const float *embds,
+                                    int M, int embd_stride, int position_start);
+
 /* Batched forward over a contiguous run of n_tokens starting at position_start.
  * Returns the LAST token's hidden state [n_embd] (or logits [n_vocab] for the
  * _logits variant). Buffer is host-side, valid until the next call. Phase 1 is
