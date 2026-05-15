@@ -5146,7 +5146,7 @@ static void cllm_close_safetensors_shards(st_context **shards, int n_shards) {
 
 static int cuda_llm_alloc_runtime_buffers(cuda_llm_runner *r, int q_dim, int kv_dim,
                                           int max_seq_len) {
-    size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
+    size_t kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(uint16_t);
     int n_attn_layers = 0;
     r->d_key_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
     r->d_value_cache = (CUdeviceptr *)calloc(r->n_layers, sizeof(CUdeviceptr));
@@ -9657,34 +9657,58 @@ void cuda_llm_reset_state(cuda_llm_runner *r) {
     if (!r) return;
     if (cuda_llm_bind_context(r) != 0) return;
 
+    #define CLLM_RESET_ZERO(ptr_, bytes_) do { \
+        if ((ptr_) && (bytes_) > 0) { \
+            CUresult _zerr = cuMemsetD8Async((ptr_), 0, (bytes_), r->stream); \
+            if (_zerr != CUDA_SUCCESS && r->verbose >= 1) { \
+                fprintf(stderr, "cuda_llm: reset memset failed (err=%d)\n", (int)_zerr); \
+            } \
+        } \
+    } while(0)
+
     int kv_dim = r->n_kv_heads * r->head_dim;
-    if (kv_dim > 0 && r->max_seq_len > 0) {
-        size_t kv_cache_bytes = (size_t)r->max_seq_len * kv_dim * sizeof(float);
-        if (r->d_key_cache && r->d_value_cache) {
+    if (r->d_key_cache && r->d_value_cache && r->max_seq_len > 0) {
+        if (r->is_gemma4) {
             for (int l = 0; l < r->n_layers; l++) {
-                if (r->d_key_cache[l]) cuMemsetD8(r->d_key_cache[l], 0, kv_cache_bytes);
-                if (r->d_value_cache[l]) cuMemsetD8(r->d_value_cache[l], 0, kv_cache_bytes);
+                if (r->layers && r->layers[l].shared_kv_source >= 0) continue;
+                int layer_kv_heads = r->layers ? r->layers[l].n_kv_heads : r->n_kv_heads;
+                int hd = r->layers && r->layers[l].is_swa ? r->head_dim_swa : r->head_dim_full;
+                int layer_kv_dim = layer_kv_heads * hd;
+                int cache_len = (r->layers && r->layers[l].is_swa) ? r->swa_window_size : r->max_seq_len;
+                size_t kv_cache_bytes = (size_t)cache_len * layer_kv_dim * sizeof(uint16_t);
+                CLLM_RESET_ZERO(r->d_key_cache[l], kv_cache_bytes);
+                CLLM_RESET_ZERO(r->d_value_cache[l], kv_cache_bytes);
+            }
+        } else if (kv_dim > 0) {
+            size_t kv_cache_bytes = (size_t)r->max_seq_len * kv_dim * sizeof(uint16_t);
+            for (int l = 0; l < r->n_layers; l++) {
+                CLLM_RESET_ZERO(r->d_key_cache[l], kv_cache_bytes);
+                CLLM_RESET_ZERO(r->d_value_cache[l], kv_cache_bytes);
             }
         }
     }
     if (r->d_hidden_snapshots && r->n_hidden_snapshots > 0 && r->n_embd > 0) {
         size_t snap_bytes = (size_t)r->n_hidden_snapshots * r->n_embd * sizeof(float);
-        cuMemsetD8(r->d_hidden_snapshots, 0, snap_bytes);
+        CLLM_RESET_ZERO(r->d_hidden_snapshots, snap_bytes);
     }
 
-    if (!r->is_hybrid) return;
-    for (int l = 0; l < r->n_layers; l++) {
-        cuda_layer *cl = &r->layers[l];
-        if (!cl->is_ssm) continue;
-        if (cl->d_conv_state) {
-            size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
-            cuMemsetD8(cl->d_conv_state, 0, conv_bytes);
-        }
-        if (cl->d_recurrent_state) {
-            size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
-            cuMemsetD8(cl->d_recurrent_state, 0, rec_bytes);
+    if (r->is_hybrid) {
+        for (int l = 0; l < r->n_layers; l++) {
+            cuda_layer *cl = &r->layers[l];
+            if (!cl->is_ssm) continue;
+            if (cl->d_conv_state) {
+                size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
+                CLLM_RESET_ZERO(cl->d_conv_state, conv_bytes);
+            }
+            if (cl->d_recurrent_state) {
+                size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
+                CLLM_RESET_ZERO(cl->d_recurrent_state, rec_bytes);
+            }
         }
     }
+    cuStreamSynchronize(r->stream);
+
+    #undef CLLM_RESET_ZERO
 }
 
 int cuda_llm_inject_biases(cuda_llm_runner *r, const char *safetensors_path) {
