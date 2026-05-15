@@ -37,6 +37,12 @@ typedef struct {
      * horizontal reduction. NULL when unused. panel_blk = ceil(n_rows/32). */
     uint16_t *panel;
     int       panel_blk;
+    /* A64FX BF16 p_odd-pair layout: for BF16 weights, an optional repack
+     * into pair-interleaved storage that lets matvec_bf16_8row_pv extract
+     * two rows as FP32 via a single ld1h.h with p_odd, eliminating the LSL
+     * the lsl variant needs. NULL when unused. bf16_pv_groups = n_rows/8. */
+    uint16_t *bf16_pv;
+    int       bf16_pv_groups;
 } qtensor;
 
 typedef struct {
@@ -739,22 +745,41 @@ static void tf_matvec_q8_rows(float *dst, const uint8_t *base, size_t row_bytes,
     }
 }
 
-static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_bytes,
-                                  const float *x, int n_cols, int row_start, int row_end) {
+/* If pv != NULL use matvec_bf16_8row_pv for 8-row blocks. pv is the
+ * pair-packed buffer from tf_bf16_pv_alloc/fill (n_rows * n_cols bf16 = same
+ * byte count as row-major). row_start / row_end must be 8-aligned when pv is
+ * used; otherwise pv is silently ignored for the misaligned region. */
+static void tf_matvec_bf16_rows_pv(float *dst, const uint8_t *base,
+                                    size_t row_bytes, const uint16_t *pv,
+                                    const float *x, int n_cols,
+                                    int row_start, int row_end) {
     int i = row_start;
 #if defined(__ARM_FEATURE_SVE)
     /* 8-row blocks: 8 FMAs per activation load, doubles compute/memory ratio */
-    for (; i + 7 < row_end; i += 8) {
-        matvec_bf16_8row(dst + i,
-            (const uint16_t *)(base + (size_t)(i)   * row_bytes),
-            (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
-            (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
-            (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
-            (const uint16_t *)(base + (size_t)(i+4) * row_bytes),
-            (const uint16_t *)(base + (size_t)(i+5) * row_bytes),
-            (const uint16_t *)(base + (size_t)(i+6) * row_bytes),
-            (const uint16_t *)(base + (size_t)(i+7) * row_bytes),
-            x, n_cols);
+    if (pv && (row_start & 7) == 0) {
+        for (; i + 7 < row_end; i += 8) {
+            int g = i >> 3;
+            const uint16_t *gbase = pv + (size_t)g * 8 * n_cols;
+            matvec_bf16_8row_pv(dst + i,
+                gbase + (size_t)0 * 2 * n_cols,
+                gbase + (size_t)1 * 2 * n_cols,
+                gbase + (size_t)2 * 2 * n_cols,
+                gbase + (size_t)3 * 2 * n_cols,
+                x, n_cols);
+        }
+    } else {
+        for (; i + 7 < row_end; i += 8) {
+            matvec_bf16_8row(dst + i,
+                (const uint16_t *)(base + (size_t)(i)   * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+4) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+5) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+6) * row_bytes),
+                (const uint16_t *)(base + (size_t)(i+7) * row_bytes),
+                x, n_cols);
+        }
     }
 #endif
     for (; i + 3 < row_end; i += 4) {
@@ -769,6 +794,11 @@ static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_byte
         const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
         dst[i] = vec_dot_bf16_f32(row, x, n_cols);
     }
+}
+
+static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                  const float *x, int n_cols, int row_start, int row_end) {
+    tf_matvec_bf16_rows_pv(dst, base, row_bytes, NULL, x, n_cols, row_start, row_end);
 }
 
 static void tf_matvec_f16_rows(float *dst, const uint8_t *base, size_t row_bytes,
@@ -801,10 +831,12 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                             t->x, n_cols, t->row_start, t->row_end);
     } else if (t->mat1->type == GGML_TYPE_BF16) {
         size_t row_bytes = (size_t)n_cols * 2;
-        tf_matvec_bf16_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
-                             t->x, n_cols, t->row_start, t->row_end);
-        tf_matvec_bf16_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
-                             t->x, n_cols, t->row_start, t->row_end);
+        tf_matvec_bf16_rows_pv(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                                t->mat1->bf16_pv,
+                                t->x, n_cols, t->row_start, t->row_end);
+        tf_matvec_bf16_rows_pv(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                                t->mat2->bf16_pv,
+                                t->x, n_cols, t->row_start, t->row_end);
     } else if (t->mat1->type == GGML_TYPE_Q8_0) {
         int nb = n_cols / 32;
         size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
@@ -979,7 +1011,8 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else if (mat->type == GGML_TYPE_BF16) {
         size_t rb = (size_t)n_cols * 2;
-        tf_matvec_bf16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+        tf_matvec_bf16_rows_pv(dst, (const uint8_t *)mat->data, rb,
+                                mat->bf16_pv, x, n_cols, row_start, row_end);
     } else if (mat->type == GGML_TYPE_Q8_0) {
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q8_0);
         tf_matvec_q8_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
@@ -1062,7 +1095,8 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
     if (mat->type == GGML_TYPE_BF16) {
         const uint8_t *base = (const uint8_t *)mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
-        tf_matvec_bf16_rows(dst, base, row_bytes, x, n_cols, 0, n_rows);
+        tf_matvec_bf16_rows_pv(dst, base, row_bytes, mat->bf16_pv,
+                                x, n_cols, 0, n_rows);
         return;
     }
     if (mat->type == GGML_TYPE_Q8_0) {
@@ -1175,6 +1209,68 @@ static void tf_qtensor_build_panel(qtensor *t) {
     tf_panel_fill_range(t, 0, t->panel_blk);
 }
 
+/* BF16 p_odd-pair repack: layout pairs of adjacent rows so matvec_bf16_8row_pv
+ * can extract both rows as FP32 with one ld1h.h+p_odd. Per "group" of 8 rows,
+ * 4 pair buffers each of 2*K bf16. Within a pair, 16-element chunks of K are
+ * stored as 32 halfwords: HW 0,2,...,30 = rA, HW 1,3,...,31 = rB.
+ *
+ * Total bytes = n_rows * K * 2 (same as row-major). bf16_pv_groups = n_rows/8.
+ * Caller must guarantee n_rows % 8 == 0 and n_cols % 16 == 0. */
+static size_t tf_bf16_pv_bytes(int groups, int K) {
+    return (size_t)groups * 8 * (size_t)K * sizeof(uint16_t);
+}
+
+static void tf_bf16_pv_fill_range(qtensor *t, int g_start, int g_end) {
+    int K = t->n_cols;
+    int vl = 16;  /* fp32 lanes on A64FX SVE */
+    const uint16_t *W = (const uint16_t *)t->data;
+    uint16_t *pv = t->bf16_pv;
+    int chunks_per_K = K / vl;
+    for (int g = g_start; g < g_end; g++) {
+        uint16_t *gbuf = pv + (size_t)g * 8 * K;
+        for (int p = 0; p < 4; p++) {
+            int rowA = g * 8 + 2 * p;
+            int rowB = g * 8 + 2 * p + 1;
+            const uint16_t *srcA = W + (size_t)rowA * K;
+            const uint16_t *srcB = W + (size_t)rowB * K;
+            uint16_t *pair = gbuf + (size_t)p * 2 * K;
+            for (int c = 0; c < chunks_per_K; c++) {
+                uint16_t *chunk = pair + (size_t)c * 32;
+                for (int lane = 0; lane < vl; lane++) {
+                    chunk[2 * lane + 0] = srcA[c * vl + lane]; /* even HW */
+                    chunk[2 * lane + 1] = srcB[c * vl + lane]; /* odd HW  */
+                }
+            }
+        }
+    }
+}
+
+static int tf_bf16_pv_alloc(qtensor *t) {
+    if (!t->data || t->type != GGML_TYPE_BF16) return 0;
+    if (t->n_rows < 8 || (t->n_rows & 7) != 0) return 0;
+    if (t->n_cols <= 0 || (t->n_cols & 15) != 0) return 0;
+    int groups = t->n_rows / 8;
+    size_t bytes = tf_bf16_pv_bytes(groups, t->n_cols);
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 0;
+#ifdef MADV_NOHUGEPAGE
+    madvise(p, bytes, MADV_NOHUGEPAGE);
+#endif
+    t->bf16_pv = (uint16_t *)p;
+    t->bf16_pv_groups = groups;
+    return 1;
+}
+
+static void tf_bf16_pv_free(qtensor *t) {
+    if (t->bf16_pv) {
+        munmap(t->bf16_pv,
+               tf_bf16_pv_bytes(t->bf16_pv_groups, t->n_cols));
+        t->bf16_pv = NULL;
+        t->bf16_pv_groups = 0;
+    }
+}
+
 typedef struct {
     float *dst;
     const uint16_t *panel;
@@ -1269,6 +1365,11 @@ typedef struct { qtensor *t; int blk_start, blk_end; } tf_panel_build_task;
 static void *tf_panel_build_worker(void *arg) {
     tf_panel_build_task *b = (tf_panel_build_task *)arg;
     tf_panel_fill_range(b->t, b->blk_start, b->blk_end);
+    return NULL;
+}
+static void *tf_bf16_pv_build_worker(void *arg) {
+    tf_panel_build_task *b = (tf_panel_build_task *)arg;
+    tf_bf16_pv_fill_range(b->t, b->blk_start, b->blk_end);
     return NULL;
 }
 #endif /* __ARM_FEATURE_SVE */
@@ -2717,7 +2818,6 @@ void transformer_build_panels(transformer_model *m) {
     if (m->has_lm_head && m->output.data && m->output.type == GGML_TYPE_F16 &&
         !m->output.panel)
         list[n++] = &m->output;
-    if (n == 0) return;
 
     int nt = m->n_threads;
     int built = 0;
@@ -2743,8 +2843,60 @@ void transformer_build_panels(transformer_model *m) {
         }
         built++;
     }
-    fprintf(stderr, "transformer: panel layout built for %d F16 matvec weights%s\n",
-            built, m->cmg_pin ? " (first-touched per CMG)" : "");
+    if (built > 0)
+        fprintf(stderr, "transformer: panel layout built for %d F16 matvec weights%s\n",
+                built, m->cmg_pin ? " (first-touched per CMG)" : "");
+
+    /* BF16 p_odd-pair packing for dense matvec weights (same set + ssm_*). */
+    if (getenv("TF_NO_BF16_PV")) return;
+    qtensor *bf16_list[16 * 256 + 1];
+    int bn = 0;
+    for (int l = 0; l < m->n_layers && bn + 16 <= (int)(sizeof(bf16_list)/sizeof(bf16_list[0])) - 1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *cand[] = {
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta,
+            &L->ssm_out,
+        };
+        for (size_t i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
+            qtensor *t = cand[i];
+            if (t->data && t->type == GGML_TYPE_BF16 && !t->bf16_pv
+                && t->n_rows >= 8 && (t->n_rows & 7) == 0
+                && (t->n_cols & 15) == 0)
+                bf16_list[bn++] = t;
+        }
+    }
+    if (m->has_lm_head && m->output.data && m->output.type == GGML_TYPE_BF16 &&
+        !m->output.panel && !m->output.bf16_pv
+        && m->output.n_rows >= 8 && (m->output.n_rows & 7) == 0
+        && (m->output.n_cols & 15) == 0)
+        bf16_list[bn++] = &m->output;
+
+    int bbuilt = 0;
+    for (int i = 0; i < bn; i++) {
+        qtensor *t = bf16_list[i];
+        if (!tf_bf16_pv_alloc(t)) continue;
+        int groups = t->bf16_pv_groups;
+        if (nt > 1 && m->pool_alive && groups >= nt) {
+            tf_panel_build_task *tasks =
+                (tf_panel_build_task *)alloca(nt * sizeof(tf_panel_build_task));
+            int per = groups / nt, extra = groups % nt, off = 0;
+            for (int w = 0; w < nt; w++) {
+                int c = per + (w < extra ? 1 : 0);
+                tasks[w] = (tf_panel_build_task){ t, off, off + c };
+                off += c;
+            }
+            tf_pool_dispatch(m, tf_bf16_pv_build_worker, tasks,
+                             sizeof(tf_panel_build_task));
+        } else {
+            tf_bf16_pv_fill_range(t, 0, groups);
+        }
+        bbuilt++;
+    }
+    if (bbuilt > 0)
+        fprintf(stderr, "transformer: BF16 p_odd-pair layout built for %d matvec weights%s\n",
+                bbuilt, m->cmg_pin ? " (first-touched per CMG)" : "");
 #else
     (void)m;
 #endif
@@ -3770,8 +3922,9 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
     int n_cols = mat->n_cols;
 
     if (mat->type == GGML_TYPE_BF16) {
-        tf_matvec_bf16_rows(dst, (const uint8_t *)mat->data,
-                             (size_t)n_cols * 2, x, n_cols, rs, rs + rc);
+        tf_matvec_bf16_rows_pv(dst, (const uint8_t *)mat->data,
+                                (size_t)n_cols * 2, mat->bf16_pv,
+                                x, n_cols, rs, rs + rc);
     } else if (mat->type == GGML_TYPE_F16) {
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data,
                             (size_t)n_cols * 2, x, n_cols, rs, rs + rc);
