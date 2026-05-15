@@ -162,6 +162,13 @@ static void usage(const char *p) {
 /* ── main ─────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    /* NOTE: do NOT setenv OMP_WAIT_POLICY=active here. This runner mixes the
+     * OMP-parallel VIT encoder with transformer.h's own pthread pool for the
+     * LLM. With active wait + OMP_NUM_THREADS=48, the 48 OMP workers spin
+     * forever after the encode finishes and starve the LLM pthread pool
+     * (measured: LLM gen 55 → 0.66 tok/s). vlm_runner (VIT only) sets it
+     * safely; here we leave the OMP wait policy at the env default. */
+
     if (argc < 2) { usage(argv[0]); return 1; }
 
     const char *model_path  = NULL;
