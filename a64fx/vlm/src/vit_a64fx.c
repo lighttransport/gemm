@@ -1331,6 +1331,57 @@ static inline void attn_av_1q(const float *att, const float *V_h, int np,
         sve_axpy_hd(out, V_h + (size_t)vi * hd, att[vi], hd);
 }
 
+/* 4-query batched AV — sweeps V_h once and accumulates 4 query outputs in
+ * parallel. Cuts V_h read bandwidth 4× vs four attn_av_1q calls (V_h is
+ * 96 KB per head for hd=64,np=384 — well over L1, so the savings are real).
+ *
+ * 16 SVE accumulators (4q × 4 hd-vecs) + 4 V loads + 4 scalar broadcasts per
+ * V row. 16 FMAs / 2 pipes = 8 cycles; 4 loads / 2 pipes = 2 cycles. FMA-
+ * pipe limited at ~16 FLOPs/cycle/core (full peak).
+ *
+ * Callers must guarantee hd == 4*VL (Qwen3-VL: hd=64, VL=16). Falls back to
+ * per-query for other hd. */
+static inline void attn_av_4q(const float *att, int att_qstride,
+                              const float *V_h, int np, int hd,
+                              float *out, int out_qstride) {
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    if (hd != 4 * VL) {
+        for (int qq = 0; qq < 4; qq++)
+            attn_av_1q(att + (size_t)qq * att_qstride, V_h, np, hd,
+                       out + (size_t)qq * out_qstride);
+        return;
+    }
+    svfloat32_t a00=svdup_f32(0.0f), a01=svdup_f32(0.0f), a02=svdup_f32(0.0f), a03=svdup_f32(0.0f);
+    svfloat32_t a10=svdup_f32(0.0f), a11=svdup_f32(0.0f), a12=svdup_f32(0.0f), a13=svdup_f32(0.0f);
+    svfloat32_t a20=svdup_f32(0.0f), a21=svdup_f32(0.0f), a22=svdup_f32(0.0f), a23=svdup_f32(0.0f);
+    svfloat32_t a30=svdup_f32(0.0f), a31=svdup_f32(0.0f), a32=svdup_f32(0.0f), a33=svdup_f32(0.0f);
+    const float *att0 = att + 0 * att_qstride;
+    const float *att1 = att + 1 * att_qstride;
+    const float *att2 = att + 2 * att_qstride;
+    const float *att3 = att + 3 * att_qstride;
+    for (int vi = 0; vi < np; vi++) {
+        const float *vh = V_h + (size_t)vi * hd;
+        svfloat32_t v0 = svld1_f32(pg, vh);
+        svfloat32_t v1 = svld1_f32(pg, vh + VL);
+        svfloat32_t v2 = svld1_f32(pg, vh + 2 * VL);
+        svfloat32_t v3 = svld1_f32(pg, vh + 3 * VL);
+        float w0 = att0[vi], w1 = att1[vi], w2 = att2[vi], w3 = att3[vi];
+        a00 = svmla_n_f32_x(pg, a00, v0, w0); a01 = svmla_n_f32_x(pg, a01, v1, w0); a02 = svmla_n_f32_x(pg, a02, v2, w0); a03 = svmla_n_f32_x(pg, a03, v3, w0);
+        a10 = svmla_n_f32_x(pg, a10, v0, w1); a11 = svmla_n_f32_x(pg, a11, v1, w1); a12 = svmla_n_f32_x(pg, a12, v2, w1); a13 = svmla_n_f32_x(pg, a13, v3, w1);
+        a20 = svmla_n_f32_x(pg, a20, v0, w2); a21 = svmla_n_f32_x(pg, a21, v1, w2); a22 = svmla_n_f32_x(pg, a22, v2, w2); a23 = svmla_n_f32_x(pg, a23, v3, w2);
+        a30 = svmla_n_f32_x(pg, a30, v0, w3); a31 = svmla_n_f32_x(pg, a31, v1, w3); a32 = svmla_n_f32_x(pg, a32, v2, w3); a33 = svmla_n_f32_x(pg, a33, v3, w3);
+    }
+    float *o0 = out + 0 * out_qstride;
+    float *o1 = out + 1 * out_qstride;
+    float *o2 = out + 2 * out_qstride;
+    float *o3 = out + 3 * out_qstride;
+    svst1_f32(pg, o0,            a00); svst1_f32(pg, o0 + VL, a01); svst1_f32(pg, o0 + 2*VL, a02); svst1_f32(pg, o0 + 3*VL, a03);
+    svst1_f32(pg, o1,            a10); svst1_f32(pg, o1 + VL, a11); svst1_f32(pg, o1 + 2*VL, a12); svst1_f32(pg, o1 + 3*VL, a13);
+    svst1_f32(pg, o2,            a20); svst1_f32(pg, o2 + VL, a21); svst1_f32(pg, o2 + 2*VL, a22); svst1_f32(pg, o2 + 3*VL, a23);
+    svst1_f32(pg, o3,            a30); svst1_f32(pg, o3 + VL, a31); svst1_f32(pg, o3 + 2*VL, a32); svst1_f32(pg, o3 + 3*VL, a33);
+}
+
 /* Head-major Q/K/V extraction work unit = one head. Converts the
  * interleaved qkv layout [np, 3, n_heads, hd] into three contiguous
  * head-major buffers, one head per worker iteration:
@@ -1441,8 +1492,16 @@ static void attn_body(int tid, int w0, int w1, void *arg) {
         /* softmax per row (SVE FEXPA) */
         for (int qi2 = q0; qi2 < q1; qi2++)
             softmax_row(att + (size_t)(qi2 - q0) * np, np);
-        /* attn · V (registers-held output, 4 split accumulators across hd) */
-        for (int qi2 = q0; qi2 < q1; qi2++) {
+        /* attn · V — batch 4 queries per V_h sweep to amortise the 96 KB
+         * V_h read (out-of-L1 per head). 16 SVE accumulators keep FMA
+         * pipes saturated; V_h is loaded q_tile/4 times instead of q_tile. */
+        int qi2 = q0;
+        for (; qi2 + 4 <= q1; qi2 += 4) {
+            float *out = a->attn_out + (size_t)qi2 * dim + h * hd;
+            const float *att_rows = att + (size_t)(qi2 - q0) * np;
+            attn_av_4q(att_rows, np, V_h, np, hd, out, dim);
+        }
+        for (; qi2 < q1; qi2++) {
             float *out = a->attn_out + (size_t)qi2 * dim + h * hd;
             const float *att_row = att + (size_t)(qi2 - q0) * np;
             attn_av_1q(att_row, V_h, np, hd, out);
