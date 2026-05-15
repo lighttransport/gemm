@@ -114,6 +114,17 @@ static void usage(const char *p) {
 }
 
 int main(int argc, char **argv) {
+    /* The encoder issues ~250 fork/join OMP regions per encode. With the
+     * default passive wait policy, idle workers sleep between regions and
+     * pay a cross-CMG futex wakeup each time — this was the "24→48T wall"
+     * (Task #15): 48T barely beat 24T. Spinning workers (active) fixes it
+     * (~150→~220 tok/s at 48T). setenv with overwrite=0 so an explicit
+     * OMP_WAIT_POLICY in the environment still wins. Must run before the
+     * OMP runtime initialises (first parallel region). */
+    setenv("OMP_WAIT_POLICY", "active", 0);
+    setenv("OMP_PROC_BIND",   "close",  0);
+    setenv("OMP_PLACES",      "cores",  0);
+
     if (argc < 3) { usage(argv[0]); return 1; }
 
     const char *model_path = argv[1];   /* required, unused */
