@@ -80,6 +80,33 @@ per-token. To move that needle we need:
 2. A per-layer hybrid dispatcher: SSM layers stay per-token (state recurrence),
    attention + FFN layers use the batched path.
 
+## Update (2026-05-15) — IQ3_XXS dequant kernel landed (scaffolding)
+
+Added `dequant_iq3_xxs_to_bf16` to the per-call-dequant family. It reuses the
+already-emitted `iq3xxs_grid_dev` codebook + `ksigns_iq2xs_dev` sign table
+(same tables as `matvec_iq3_xxs_f32`). One thread per output element, 256
+threads/block, grid `(n_rows, n_blocks_per_row, 1)`. Wired into
+`get_bf16_weight()` and the `BATCH_QTYPE_OK` macro.
+
+**The kernel is ready but currently dead code for the 27B model** — the
+hybrid-SSM gate (`!r->is_hybrid`) at `hip_llm_runner.c:~4671` still routes the
+27B's entire forward to per-token, so no GEMM call in that model reaches the
+batched-prefill code. Removing the hybrid gate requires a per-layer dispatcher
+that:
+
+- For SSM layers (qwen35 every 1-of-non-`full_attn_interval`): keep
+  per-token compute (the DeltaNet state recurrence is inherently sequential).
+- For **gated**-attention layers (qwen35-specific: `deinterleave_qgate` +
+  `sigmoid_mul` around the existing attn path): batched path needs to
+  handle these two extra ops over M rows.
+- For standard attention + FFN: existing batched path (now extended to
+  Q4_K/Q5_K/Q6_K and IQ3_XXS via `get_bf16_weight`).
+
+That's a meaningful refactor. The IQ3_XXS dequant kernel landed here so it
+isn't blocking on that refactor. Regression-tested: Qwen3-VL-Embedding-8B
+Q4_K_M still produces identical `--compare-paths` argmax (id 286 for
+"The capital of France is", rel_L2 = 4.2e-3).
+
 ---
 
 ## Part A (historical, pre-Track-A) — Qwen3-VL-2B (F16) vs PyTorch ROCm
