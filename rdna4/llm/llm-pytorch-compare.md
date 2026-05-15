@@ -1,0 +1,155 @@
+# RDNA4 LLM Runner — HIP vs PyTorch/ROCm, plus 27B hybrid-SSM profile
+
+Performance comparison of the `rdna4/llm` HIP runner against a PyTorch/ROCm
+reference, on **identical model weights and GPU**, plus a kernel-level
+breakdown of the Qwen3.6-27B hybrid-SSM workload (the actual e2e VLM dominator,
+which has no public PyTorch reference path because transformers 5.x lacks the
+hybrid-SSM inference kernel).
+
+Date: 2026-05-15 · GPU: AMD Radeon RX 9070 XT (gfx1201) · ROCm 7.2
+
+## Part A — Qwen3-VL-2B (F16) vs PyTorch ROCm
+
+Standard transformer (no SSM, no MoE); F16 weights both sides.
+
+- **HIP**: `./test_hip_llm Qwen3VL-2B-Instruct-F16.gguf --bench --gpu-only-bench`
+  (file at `/mnt/disk1/models/Qwen3-VL-2B-Instruct-GGUF/`)
+- **PyTorch**: `bench_pytorch_llm.py` loads `Qwen/Qwen3-VL-2B-Instruct` from
+  `/mnt/disk1/models/hf_cache`; visual tower dropped; LM body = 1.72 B params;
+  `attn_implementation="sdpa"`, dtype F16.
+
+Both use synthetic random `input_ids`, warm/back-to-back submission, single
+sync per phase. Decode is 64 tokens with KV cache.
+
+| prefill_len | HIP prefill ms | HIP prefill tok/s | PyT prefill ms | PyT prefill tok/s | prefill gap | HIP decode ms/tok | HIP decode tok/s | PyT decode ms/tok | PyT decode tok/s | decode gap |
+|------------:|---------------:|------------------:|---------------:|------------------:|------------:|------------------:|-----------------:|------------------:|-----------------:|-----------:|
+|        64   |        1161    |         55.1      |        33.8    |        1894       |   **34×**   |        11.27      |       88.8       |        30.45      |       32.8       | **2.7× faster** |
+|       256   |        1334    |        192.0      |        35.2    |        7278       |   **38×**   |        11.79      |       84.8       |        28.78      |       34.7       | **2.4× faster** |
+|      1024   |       10857    |         94.3      |        56.8    |       18021       |  **191×**   |        13.38      |       74.7       |        27.57      |       36.3       | **2.1× faster** |
+
+Two opposite stories:
+
+1. **Decode: HIP is 2.1–2.7× faster than PyTorch.** Single-token decode is
+   fully optimized — F16 matvec, Phase-3 flash-attention, Phase-5 graph capture.
+   The 2B is a happy case for the runner.
+
+2. **Prefill: HIP is 34–191× slower than PyTorch, and gets worse with length.**
+   Prefill ms/tok at length 1024 (10.6 ms) is essentially equal to decode
+   ms/tok (13.4 ms) — meaning HIP prefill is effectively running M=1 matvecs in
+   a loop rather than a real batched M-wide GEMM. PyTorch prefill scales sublinearly
+   in `prefill_len` (256 vs 64: 35→35 ms; 1024: 57 ms), exactly the cuBLAS/hipBLASLt
+   GEMM signature. HIP shows linear-in-tokens scaling, the matvec signature.
+
+The HIP runner does ship a "Phase-2 batched" path (`BMAX=512, threshold=8`)
+for prefill on dense-quant models, but the throughput says it isn't engaging
+efficiently above ~256 tokens, and it's gated off entirely for hybrid-SSM and
+MoE/IQ-quant models (see Part B).
+
+## Part B — Qwen3.6-27B IQ3_XXS hybrid-SSM kernel breakdown
+
+The Qwen3.5/3.6 hybrid-SSM architecture is what we actually care about for the
+e2e VLM workload, but transformers 5.x has no inference kernel for it, so we
+can't pair it with PyTorch. Instead: profile `test_hip_llm` directly with
+`rocprofv3 --kernel-trace`.
+
+Config: arch=qwen35, 64 layers, n_embd=5120, n_heads=24, n_kv_heads=4,
+head_dim=256, ssm d_state=128 / n_group=16 / d_inner=6144, full_attention_interval=4
+(so 1 in 4 layers is full attention; the other 3 are SSM). Quant = IQ3_XXS
+(model embedding + output likely Q4_K/Q6_K — UD = "unsloth dynamic" mixed).
+
+```
+./test_hip_llm Qwen3.6-27B-UD-IQ3_XXS.gguf --bench --gpu-only-bench \
+    --prefill-len 64 --decode 16 -n 64 -s 1024 -t "Hello"
+```
+Result: **prefill 67 ms/tok (15 tok/s), decode 76 ms/tok (13 tok/s)**.
+The two are within ~15% of each other — confirming prefill is effectively
+running per-token, not batched.
+
+Top kernels by GPU time (rocprofv3, total 4.80 s for 80 tokens):
+
+| pct | time | count | avg µs | kernel |
+|----:|----:|-----:|------:|--------|
+| **49.7%** | 2387 ms | 20,320 | 117.5 | `matvec_iq3_xxs_f32` |
+| 17.8% | 853 ms | 3,840 | 222.1 | `matvec_q6_K_f32` |
+| 13.1% | 629 ms | 3,840 | 163.7 | `matvec_q4_K_f32` |
+| 5.9% | 285 ms | 3,840 | 74.2 | `deltanet_step_f32` (SSM core) |
+| 2.5% | 121 ms | 17 | 7132 | `matvec_q5_K_f32` (lm_head?) |
+| 2.3% | 108 ms | 10,320 | 10.5 | `rmsnorm_f32` |
+| 2.0% | 95 ms | 1,920 | 49.3 | `matvec_iq2_s_f32` |
+| 1.5% | 74 ms | 1,520 | 48.9 | `matvec_iq3_s_f32` |
+| 1.3% | 61 ms | 400 | 152.3 | `matvec_iq4_xs_f32` |
+| 1.0% | 50 ms | 7,680 | 6.5 | `matvec_f16_f32` |
+| 0.4% | 20 ms | 1,280 | 15.4 | `attn_decode_f32_devp` |
+| 0.2% | 12 ms | 3,840 | 3.0 | `conv1d_depthwise_silu_f32` |
+| ... |
+
+**Headline: ~85% of GPU time is in dequant-matvec kernels.** The SSM core
+ops (deltanet_step + conv1d) total ~7%. Attention is 0.4%. The IQ kernels we
+just landed run correctly (the IQ3_XXS one is the dominant single contributor
+at 49.7%), and their per-call time (117 µs) is actually *better* than the
+K-quant ones (Q6_K 222 µs, Q4_K 164 µs).
+
+The runner reports `Phase-2 batched path disabled (hybrid/moe/quant or
+LLM_BATCH_DISABLE)` — for any hybrid-SSM or quantized model, prefill falls
+through to per-token matvec. That's the gating that turns prefill into
+80 × 64-layer × ~4-matvec/layer = ~20 k single-row matvec launches.
+
+## Combined diagnosis
+
+Both Part A and Part B converge on the same conclusion:
+
+> **The single highest-leverage LLM perf gap on RDNA4 is the absence of a
+> batched (M>1) GEMM path for prefill that survives at large M and works on
+> quantized weights.**
+
+- Part A shows it for the dense F16 case: ms/tok flattens to ~10 ms/tok at
+  any prefill length, with up to 191× gap vs PyTorch at L=1024.
+- Part B shows it for the quant+hybrid case: prefill ≈ decode in ms/tok, and
+  the 27B model that dominates the e2e VLM workload runs entirely on
+  per-token dequant-matvec kernels.
+
+Decode is in good shape — HIP already beats PyTorch on the 2B by 2–3×.
+
+## Recommended next task
+
+**Implement a batched-prefill quantized-WMMA GEMM kernel set** that
+dequantizes block-quantized weights (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/K-quants;
+IQ/TQ later) on-the-fly into LDS BF16 fragments, then accumulates a tile-wide
+WMMA against a batched (M) activation matrix. Then:
+
+1. Hook it into prefill for both the dense (qwen3/qwen3vl/qwen3moe) and hybrid
+   (qwen35/qwen35moe) arch paths — for hybrid, the attention and FFN layers
+   benefit; the SSM core stays per-token (it's sequential in nature).
+2. Remove the `Phase-2 batched path disabled (hybrid/moe/quant)` gate.
+3. Investigate why the existing Phase-2 batched path stops being effective above
+   ~256 tokens for the dense F16 case (BMAX=512 — does it chunk into M=512 GEMMs
+   only, and is the chunking re-launch overhead dominant?).
+
+Expected impact: prefill 10-100× speedup, closing most of the Part-A gap and
+turning the 27B IQ3_XXS prefill from 67 ms/tok into something on the order of
+5–10 ms/tok (since the IQ3_XXS kernel itself is 117 µs/call and we have ~4
+matvecs/layer × 64 layers = 256 matvec/token; a batched GEMM would amortize
+the weight loads across M tokens).
+
+## Reproduce
+
+```sh
+cd rdna4/llm
+
+# HIP — same flags for any model
+for L in 64 256 1024; do
+  ./test_hip_llm <gguf> --bench --gpu-only-bench \
+      --prefill-len $L --decode 64 -n $L -s 1280
+done
+
+# PyTorch ROCm reference (Qwen3-VL-2B; F16)
+VENV=/mnt/disk1/work/gemm/main/rdna4/trellis2/.venv
+MD=/mnt/disk1/models/hf_cache/models--Qwen--Qwen3-VL-2B-Instruct/snapshots/*
+$VENV/bin/python bench_pytorch_llm.py --model-dir $MD \
+    --prefill-lens 64,256,1024 --decode 64 --dtype f16
+
+# 27B hybrid-SSM kernel-trace profile
+rocprofv3 --kernel-trace -d /tmp/rocprof_llm27b -f csv -- \
+    ./test_hip_llm /mnt/disk1/models/qwen36/27b/Qwen3.6-27B-UD-IQ3_XXS.gguf \
+    --bench --gpu-only-bench --prefill-len 64 --decode 16 -n 64 -s 1024
+```
