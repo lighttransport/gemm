@@ -3380,6 +3380,22 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     int in_ch = r->dit_in_ch, txt_dim = r->dit_txt_dim, mlp_h = r->dit_mlp_h;
     int n_total = n_img + n_txt;
     CUstream s = r->stream;
+    int rc = -1;
+    CUdeviceptr d_img = 0, d_txt = 0, d_t_emb = 0;
+    CUdeviceptr d_img_in = 0, d_txt_in = 0;
+    CUdeviceptr d_t_sin = 0, d_t_emb2 = 0;
+    CUdeviceptr d_scratch1 = 0, d_scratch2 = 0, d_scratch3 = 0;
+    CUdeviceptr d_mod = 0;
+    CUdeviceptr d_q = 0, d_k = 0, d_v = 0, d_attn_out = 0;
+    CUdeviceptr d_t_silu = 0, d_img_mod = 0, d_txt_mod = 0;
+    CUdeviceptr d_final_t_silu = 0, d_final_mod = 0, d_final_out = 0;
+#define QIMG_ALLOC_OR_CLEANUP(ptr, nbytes, label) do { \
+        (ptr) = checked_cuMemAlloc((nbytes)); \
+        if (!(ptr)) { \
+            fprintf(stderr, "cuda_qimg: allocation failed for %s\n", (label)); \
+            goto cleanup; \
+        } \
+    } while (0)
 
     /* Check GPU memory before allocations */
     {
@@ -3397,14 +3413,12 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     }
 
     /* Allocate GPU activation buffers */
-    CUdeviceptr d_img, d_txt, d_t_emb;
-    cuMemAlloc(&d_img, (size_t)n_img * dim * sizeof(float));
-    cuMemAlloc(&d_txt, (size_t)n_txt * dim * sizeof(float));
-    cuMemAlloc(&d_t_emb, (size_t)dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_img, (size_t)n_img * dim * sizeof(float), "d_img");
+    QIMG_ALLOC_OR_CLEANUP(d_txt, (size_t)n_txt * dim * sizeof(float), "d_txt");
+    QIMG_ALLOC_OR_CLEANUP(d_t_emb, (size_t)dim * sizeof(float), "d_t_emb");
 
     /* Upload inputs */
-    CUdeviceptr d_img_in, d_txt_in;
-    cuMemAlloc(&d_img_in, (size_t)n_img * in_ch * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in");
     cuMemcpyHtoD(d_img_in, img_tokens, (size_t)n_img * in_ch * sizeof(float));
     /* Save raw patchified input for comparison */
     if (r->verbose >= 3) {
@@ -3425,7 +3439,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             fprintf(stderr, "    Saved cuda_dit_img_input.npy [%d,%d]\n", n_img, in_ch);
         }
     }
-    cuMemAlloc(&d_txt_in, (size_t)n_txt * txt_dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_txt_in, (size_t)n_txt * txt_dim * sizeof(float), "d_txt_in");
     cuMemcpyHtoD(d_txt_in, txt_tokens, (size_t)n_txt * txt_dim * sizeof(float));
 
     /* Match ComfyUI: apply_model casts input to BF16 (inference dtype).
@@ -3449,17 +3463,15 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         t_sin[i]        = cosf(angle);  /* cos first (flip_sin_to_cos=True) */
         t_sin[half + i] = sinf(angle);
     }
-    CUdeviceptr d_t_sin;
-    cuMemAlloc(&d_t_sin, 256 * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_t_sin, 256 * sizeof(float), "d_t_sin");
     cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float));
 
     op_gemm(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
-    CUdeviceptr d_t_emb2;
-    cuMemAlloc(&d_t_emb2, (size_t)dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_t_emb2, (size_t)dim * sizeof(float), "d_t_emb2");
     op_gemm(r, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
-    cuMemFree(d_t_emb); d_t_emb = d_t_emb2;
-    cuMemFree(d_t_sin);
+    cuMemFree(d_t_emb); d_t_emb = d_t_emb2; d_t_emb2 = 0;
+    cuMemFree(d_t_sin); d_t_sin = 0;
 
     /* Save temb for comparison */
     if (r->verbose >= 3) {
@@ -3485,11 +3497,11 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
                        256, 1, 1, 256 * sizeof(float), s, rn_args, NULL);
     }
     op_gemm(r, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
-    cuMemFree(d_txt_in);
+    cuMemFree(d_txt_in); d_txt_in = 0;
 
     /* 3. Image input: GEMM(64→3072) */
     op_gemm(r, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
-    cuMemFree(d_img_in);
+    cuMemFree(d_img_in); d_img_in = 0;
 
     /* Helper: save GPU tensor as .npy [rows, cols] */
     #define DIT_SAVE_NPY(fname, ptr, rows, cols) do { \
@@ -3527,12 +3539,11 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     DIT_SAVE_NPY("cuda_dit_txt_projected.npy", d_txt, n_txt, dim);
 
     /* Scratch buffers */
-    CUdeviceptr d_scratch1, d_scratch2, d_scratch3;
     size_t max_scratch = (size_t)n_total * dim * sizeof(float);
-    cuMemAlloc(&d_scratch1, max_scratch);
-    cuMemAlloc(&d_scratch2, max_scratch);
+    QIMG_ALLOC_OR_CLEANUP(d_scratch1, max_scratch, "d_scratch1");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch2, max_scratch, "d_scratch2");
     size_t ffn_scratch = (size_t)(n_img > n_txt ? n_img : n_txt) * mlp_h * sizeof(float);
-    cuMemAlloc(&d_scratch3, ffn_scratch);
+    QIMG_ALLOC_OR_CLEANUP(d_scratch3, ffn_scratch, "d_scratch3");
 
     /* Debug: dump max value of a GPU buffer */
     #define DUMP_MAX(name, ptr, count) do { if (r->verbose >= 2) { \
@@ -3544,23 +3555,20 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         free(_tmp); } } while(0)
 
     /* Modulation scratch */
-    CUdeviceptr d_mod;
-    cuMemAlloc(&d_mod, (size_t)6 * dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_mod, (size_t)6 * dim * sizeof(float), "d_mod");
 
     /* Joint Q/K/V buffers */
-    CUdeviceptr d_q, d_k, d_v, d_attn_out;
-    cuMemAlloc(&d_q, (size_t)n_total * dim * sizeof(float));
-    cuMemAlloc(&d_k, (size_t)n_total * dim * sizeof(float));
-    cuMemAlloc(&d_v, (size_t)n_total * dim * sizeof(float));
-    cuMemAlloc(&d_attn_out, (size_t)n_total * dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_q, (size_t)n_total * dim * sizeof(float), "d_q");
+    QIMG_ALLOC_OR_CLEANUP(d_k, (size_t)n_total * dim * sizeof(float), "d_k");
+    QIMG_ALLOC_OR_CLEANUP(d_v, (size_t)n_total * dim * sizeof(float), "d_v");
+    QIMG_ALLOC_OR_CLEANUP(d_attn_out, (size_t)n_total * dim * sizeof(float), "d_attn_out");
 
     /* Per-block scratch buffers hoisted out of the loop — cuMemAlloc/cuMemFree
      * are synchronous driver calls, each costs ~0.5-1 ms. Allocating these
      * per-block adds ~90 ms/block of overhead on a 60-block, 2-CFG pipeline. */
-    CUdeviceptr d_t_silu, d_img_mod, d_txt_mod;
-    cuMemAlloc(&d_t_silu,  (size_t)dim * sizeof(float));
-    cuMemAlloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
-    cuMemAlloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_t_silu,  (size_t)dim * sizeof(float), "d_t_silu");
+    QIMG_ALLOC_OR_CLEANUP(d_img_mod, (size_t)6 * dim * sizeof(float), "d_img_mod");
+    QIMG_ALLOC_OR_CLEANUP(d_txt_mod, (size_t)6 * dim * sizeof(float), "d_txt_mod");
 
     /* Compute image patch grid for RoPE */
     int hp_rope = (int)sqrtf((float)n_img);
@@ -3597,7 +3605,10 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             int L0 = r->n_preloaded + i;
             if (L0 >= r->dit_n_blocks) break;
             qimg_block_gpu tmp;
-            qimg_load_block_into_slot_ex(r, L0, slot_ptrs[i], &tmp, r->copy_stream);
+            if (qimg_load_block_into_slot_ex(r, L0, slot_ptrs[i], &tmp, r->copy_stream) != 0) {
+                fprintf(stderr, "cuda_qimg: block %d async slot load failed\n", L0);
+                goto cleanup;
+            }
             cuEventRecord(r->slot_ready[i], r->copy_stream);
         }
     }
@@ -3620,7 +3631,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             /* Single-slot fallback: synchronous copy on r->stream. */
             if (qimg_load_block_into_slot(r, L, &blk) != 0) {
                 fprintf(stderr, "cuda_qimg: block %d slot load failed\n", L);
-                return -1;
+                goto cleanup;
             }
         }
 
@@ -3655,8 +3666,11 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             if (next_L < r->dit_n_blocks && next_L >= r->n_preloaded) {
                 cuStreamWaitEvent(r->copy_stream, r->slot_free[slot_used], 0);
                 qimg_block_gpu tmp;
-                qimg_load_block_into_slot_ex(r, next_L, slot_ptrs[slot_used], &tmp,
-                                             r->copy_stream);
+                if (qimg_load_block_into_slot_ex(r, next_L, slot_ptrs[slot_used], &tmp,
+                                                 r->copy_stream) != 0) {
+                    fprintf(stderr, "cuda_qimg: block %d async slot load failed\n", next_L);
+                    goto cleanup;
+                }
                 cuEventRecord(r->slot_ready[slot_used], r->copy_stream);
             }
         }
@@ -3665,46 +3679,61 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
 
     /* 5. Final output: adaLN → proj_out */
     {
-        CUdeviceptr d_t_silu;
-        cuMemAlloc(&d_t_silu, (size_t)dim * sizeof(float));
-        cuMemcpyDtoDAsync(d_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
-        op_silu(r, d_t_silu, dim);
-        CUdeviceptr d_final_mod;
-        cuMemAlloc(&d_final_mod, (size_t)2 * dim * sizeof(float));
-        op_gemm(r, d_final_mod, r->d_norm_out_w, d_t_silu, r->d_norm_out_b,
+        QIMG_ALLOC_OR_CLEANUP(d_final_t_silu, (size_t)dim * sizeof(float), "d_final_t_silu");
+        cuMemcpyDtoDAsync(d_final_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
+        op_silu(r, d_final_t_silu, dim);
+        QIMG_ALLOC_OR_CLEANUP(d_final_mod, (size_t)2 * dim * sizeof(float), "d_final_mod");
+        op_gemm(r, d_final_mod, r->d_norm_out_w, d_final_t_silu, r->d_norm_out_b,
                 2 * dim, dim, 1);
-        cuMemFree(d_t_silu);
+        cuMemFree(d_final_t_silu); d_final_t_silu = 0;
 
         /* LastLayer: scale, shift = chunk(emb, 2) — scale is FIRST half */
         CUdeviceptr f_scale = d_final_mod;
         CUdeviceptr f_shift = d_final_mod + (size_t)dim * sizeof(float);
         op_adaln(r, d_scratch1, d_img, f_shift, f_scale, n_img, dim);
-        cuMemFree(d_final_mod);
+        cuMemFree(d_final_mod); d_final_mod = 0;
 
         DIT_SAVE_NPY("cuda_dit_norm_out.npy", d_scratch1, n_img, dim);
 
         /* proj_out: [n_img, dim] → [n_img, in_ch] */
-        CUdeviceptr d_out;
-        cuMemAlloc(&d_out, (size_t)n_img * in_ch * sizeof(float));
-        op_gemm(r, d_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
+        QIMG_ALLOC_OR_CLEANUP(d_final_out, (size_t)n_img * in_ch * sizeof(float), "d_final_out");
+        op_gemm(r, d_final_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
                 in_ch, dim, n_img);
 
-        DIT_SAVE_NPY("cuda_dit_proj_out.npy", d_out, n_img, in_ch);
+        DIT_SAVE_NPY("cuda_dit_proj_out.npy", d_final_out, n_img, in_ch);
 
         /* Download result (sync stream first to ensure computation is complete) */
         cuStreamSynchronize(s);
-        cuMemcpyDtoH(out, d_out, (size_t)n_img * in_ch * sizeof(float));
-        cuMemFree(d_out);
+        cuMemcpyDtoH(out, d_final_out, (size_t)n_img * in_ch * sizeof(float));
+        cuMemFree(d_final_out); d_final_out = 0;
     }
+    rc = 0;
 
     /* Cleanup */
-    cuMemFree(d_img); cuMemFree(d_txt); cuMemFree(d_t_emb);
-    cuMemFree(d_scratch1); cuMemFree(d_scratch2); cuMemFree(d_scratch3);
-    cuMemFree(d_mod);
-    cuMemFree(d_q); cuMemFree(d_k); cuMemFree(d_v); cuMemFree(d_attn_out);
-    cuMemFree(d_t_silu); cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
+cleanup:
+    if (d_t_sin) cuMemFree(d_t_sin);
+    if (d_t_emb2) cuMemFree(d_t_emb2);
+    if (d_final_t_silu) cuMemFree(d_final_t_silu);
+    if (d_final_mod) cuMemFree(d_final_mod);
+    if (d_final_out) cuMemFree(d_final_out);
+    if (d_img_in) cuMemFree(d_img_in);
+    if (d_txt_in) cuMemFree(d_txt_in);
+    if (d_img) cuMemFree(d_img);
+    if (d_txt) cuMemFree(d_txt);
+    if (d_t_emb) cuMemFree(d_t_emb);
+    if (d_scratch1) cuMemFree(d_scratch1);
+    if (d_scratch2) cuMemFree(d_scratch2);
+    if (d_scratch3) cuMemFree(d_scratch3);
+    if (d_mod) cuMemFree(d_mod);
+    if (d_q) cuMemFree(d_q);
+    if (d_k) cuMemFree(d_k);
+    if (d_v) cuMemFree(d_v);
+    if (d_attn_out) cuMemFree(d_attn_out);
+    if (d_t_silu) cuMemFree(d_t_silu);
+    if (d_img_mod) cuMemFree(d_img_mod);
+    if (d_txt_mod) cuMemFree(d_txt_mod);
 
-    if (r->profile_block && r->prof_block_count > 0) {
+    if (rc == 0 && r->profile_block && r->prof_block_count > 0) {
         double n = (double)r->prof_block_count;
         double tot = r->prof_qkv_ms + r->prof_qknorm_ms + r->prof_attn_ms
                    + r->prof_attnout_ms + r->prof_imgmlp_ms + r->prof_txtmlp_ms;
@@ -3729,7 +3758,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         r->prof_attnout_ms = r->prof_imgmlp_ms = r->prof_txtmlp_ms = 0;
         r->prof_block_count = 0;
     }
-    return 0;
+#undef QIMG_ALLOC_OR_CLEANUP
+    return rc;
 }
 
 /* Evict preloaded DiT blocks from the end until `need_bytes` of VRAM is
@@ -3824,30 +3854,45 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     int alloc_timing = (getenv("QIMG_ALLOC_TIMING") != NULL);
     double alloc_t0 = 0;
     if (alloc_timing) { cuStreamSynchronize(s); alloc_t0 = (double)clock()/CLOCKS_PER_SEC; }
+    int rc = -1;
+    CUdeviceptr d_img_c = 0, d_img_u = 0;
+    CUdeviceptr d_txt_c = 0, d_txt_u = 0;
+    CUdeviceptr d_img_in = 0;
+    CUdeviceptr d_txt_in_c = 0, d_txt_in_u = 0;
+    CUdeviceptr d_t_emb = 0, d_t_sin = 0, d_t_emb2 = 0;
+    CUdeviceptr d_scratch1_c = 0, d_scratch2_c = 0, d_scratch3_c = 0;
+    CUdeviceptr d_scratch1_u = 0, d_scratch2_u = 0, d_scratch3_u = 0;
+    CUdeviceptr d_q_c = 0, d_k_c = 0, d_v_c = 0, d_attn_out_c = 0;
+    CUdeviceptr d_q_u = 0, d_k_u = 0, d_v_u = 0, d_attn_out_u = 0;
+    CUdeviceptr d_img_mlp_in = 0, d_img_mlp_h = 0, d_img_mlp_out = 0;
+    CUdeviceptr d_t_silu = 0, d_img_mod = 0, d_txt_mod = 0;
+    CUdeviceptr d_final_t_silu = 0, d_final_mod = 0, d_final_out = 0;
+#define QIMG_ALLOC_OR_CLEANUP(ptr, nbytes, label) do { \
+        (ptr) = checked_cuMemAlloc((nbytes)); \
+        if (!(ptr)) { \
+            fprintf(stderr, "cuda_qimg(cfg): allocation failed for %s\n", (label)); \
+            goto cleanup; \
+        } \
+    } while (0)
 
     /* Allocate paired img/txt buffers. Both passes share the same img_tokens
      * at input (same noise) but the hidden states diverge after block 0 so
      * we need two independent d_img buffers. */
-    CUdeviceptr d_img_c, d_img_u;
-    CUdeviceptr d_txt_c, d_txt_u;
-    cuMemAlloc(&d_img_c, (size_t)n_img * dim * sizeof(float));
-    cuMemAlloc(&d_img_u, (size_t)n_img * dim * sizeof(float));
-    cuMemAlloc(&d_txt_c, (size_t)n_txt_cond   * dim * sizeof(float));
-    cuMemAlloc(&d_txt_u, (size_t)n_txt_uncond * dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_img_c, (size_t)n_img * dim * sizeof(float), "d_img_c");
+    QIMG_ALLOC_OR_CLEANUP(d_img_u, (size_t)n_img * dim * sizeof(float), "d_img_u");
+    QIMG_ALLOC_OR_CLEANUP(d_txt_c, (size_t)n_txt_cond   * dim * sizeof(float), "d_txt_c");
+    QIMG_ALLOC_OR_CLEANUP(d_txt_u, (size_t)n_txt_uncond * dim * sizeof(float), "d_txt_u");
 
     /* Upload img (used twice) + both txt conditionings. */
-    CUdeviceptr d_img_in;
-    cuMemAlloc(&d_img_in, (size_t)n_img * in_ch * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in");
     cuMemcpyHtoD(d_img_in, img_tokens, (size_t)n_img * in_ch * sizeof(float));
-    CUdeviceptr d_txt_in_c, d_txt_in_u;
-    cuMemAlloc(&d_txt_in_c, (size_t)n_txt_cond   * txt_dim * sizeof(float));
-    cuMemAlloc(&d_txt_in_u, (size_t)n_txt_uncond * txt_dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_txt_in_c, (size_t)n_txt_cond   * txt_dim * sizeof(float), "d_txt_in_c");
+    QIMG_ALLOC_OR_CLEANUP(d_txt_in_u, (size_t)n_txt_uncond * txt_dim * sizeof(float), "d_txt_in_u");
     cuMemcpyHtoD(d_txt_in_c, txt_cond,   (size_t)n_txt_cond   * txt_dim * sizeof(float));
     cuMemcpyHtoD(d_txt_in_u, txt_uncond, (size_t)n_txt_uncond * txt_dim * sizeof(float));
 
     /* Timestep embedding — same for cond/uncond */
-    CUdeviceptr d_t_emb;
-    cuMemAlloc(&d_t_emb, (size_t)dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_t_emb, (size_t)dim * sizeof(float), "d_t_emb");
 
     /* Scratch buffers. scratch1 only ever holds n_img rows (img adaLN output
      * / attn_out). scratch2 only ever holds n_txt rows (text adaLN output /
@@ -3858,47 +3903,41 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     size_t img_scratch = (size_t)n_img     * dim   * sizeof(float);
     size_t txt_scratch = (size_t)n_txt_max * dim   * sizeof(float);
     size_t txt_ffn     = (size_t)n_txt_max * mlp_h * sizeof(float);
-    CUdeviceptr d_scratch1_c, d_scratch2_c, d_scratch3_c;
-    CUdeviceptr d_scratch1_u, d_scratch2_u, d_scratch3_u;
-    cuMemAlloc(&d_scratch1_c, img_scratch);
-    cuMemAlloc(&d_scratch2_c, txt_scratch);
-    cuMemAlloc(&d_scratch3_c, txt_ffn);
-    cuMemAlloc(&d_scratch1_u, img_scratch);
-    cuMemAlloc(&d_scratch2_u, txt_scratch);
-    cuMemAlloc(&d_scratch3_u, txt_ffn);
+    QIMG_ALLOC_OR_CLEANUP(d_scratch1_c, img_scratch, "d_scratch1_c");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch2_c, txt_scratch, "d_scratch2_c");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch3_c, txt_ffn, "d_scratch3_c");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch1_u, img_scratch, "d_scratch1_u");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch2_u, txt_scratch, "d_scratch2_u");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch3_u, txt_ffn, "d_scratch3_u");
     (void)n_total_max;
 
     /* Joint QKV + attention scratch, sized per-pass since n_total differs. */
-    CUdeviceptr d_q_c, d_k_c, d_v_c, d_attn_out_c;
-    CUdeviceptr d_q_u, d_k_u, d_v_u, d_attn_out_u;
-    cuMemAlloc(&d_q_c,        (size_t)n_total_cond   * dim * sizeof(float));
-    cuMemAlloc(&d_k_c,        (size_t)n_total_cond   * dim * sizeof(float));
-    cuMemAlloc(&d_v_c,        (size_t)n_total_cond   * dim * sizeof(float));
-    cuMemAlloc(&d_attn_out_c, (size_t)n_total_cond   * dim * sizeof(float));
-    cuMemAlloc(&d_q_u,        (size_t)n_total_uncond * dim * sizeof(float));
-    cuMemAlloc(&d_k_u,        (size_t)n_total_uncond * dim * sizeof(float));
-    cuMemAlloc(&d_v_u,        (size_t)n_total_uncond * dim * sizeof(float));
-    cuMemAlloc(&d_attn_out_u, (size_t)n_total_uncond * dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_q_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_q_c");
+    QIMG_ALLOC_OR_CLEANUP(d_k_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_k_c");
+    QIMG_ALLOC_OR_CLEANUP(d_v_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_v_c");
+    QIMG_ALLOC_OR_CLEANUP(d_attn_out_c, (size_t)n_total_cond   * dim * sizeof(float), "d_attn_out_c");
+    QIMG_ALLOC_OR_CLEANUP(d_q_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_q_u");
+    QIMG_ALLOC_OR_CLEANUP(d_k_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_k_u");
+    QIMG_ALLOC_OR_CLEANUP(d_v_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_v_u");
+    QIMG_ALLOC_OR_CLEANUP(d_attn_out_u, (size_t)n_total_uncond * dim * sizeof(float), "d_attn_out_u");
 
     /* CFG-batched img-MLP buffers: cond/uncond adaLN2 output is packed into
      * the first / second half of d_img_mlp_in, then one batched fc1+gelu+fc2
      * runs on 2*n_img rows, halving W traffic for the two heaviest GEMMs in
      * the block (mlp_h=14336 x dim=3072 each direction). Post-MLP gated_add
      * is then dispatched per-pass by reading from d_img_mlp_out halves. */
-    CUdeviceptr d_img_mlp_in, d_img_mlp_h, d_img_mlp_out;
-    cuMemAlloc(&d_img_mlp_in,  (size_t)2 * n_img * dim   * sizeof(float));
-    cuMemAlloc(&d_img_mlp_h,   (size_t)2 * n_img * mlp_h * sizeof(float));
-    cuMemAlloc(&d_img_mlp_out, (size_t)2 * n_img * dim   * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_img_mlp_in,  (size_t)2 * n_img * dim   * sizeof(float), "d_img_mlp_in");
+    QIMG_ALLOC_OR_CLEANUP(d_img_mlp_h,   (size_t)2 * n_img * mlp_h * sizeof(float), "d_img_mlp_h");
+    QIMG_ALLOC_OR_CLEANUP(d_img_mlp_out, (size_t)2 * n_img * dim   * sizeof(float), "d_img_mlp_out");
     CUdeviceptr d_img_mlp_in_c  = d_img_mlp_in;
     CUdeviceptr d_img_mlp_in_u  = d_img_mlp_in  + (size_t)n_img * dim * sizeof(float);
     CUdeviceptr d_img_mlp_out_c = d_img_mlp_out;
     CUdeviceptr d_img_mlp_out_u = d_img_mlp_out + (size_t)n_img * dim * sizeof(float);
 
     /* Modulation buffers — same for cond and uncond since t_emb is shared */
-    CUdeviceptr d_t_silu, d_img_mod, d_txt_mod;
-    cuMemAlloc(&d_t_silu,  (size_t)dim * sizeof(float));
-    cuMemAlloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
-    cuMemAlloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_t_silu,  (size_t)dim * sizeof(float), "d_t_silu");
+    QIMG_ALLOC_OR_CLEANUP(d_img_mod, (size_t)6 * dim * sizeof(float), "d_img_mod");
+    QIMG_ALLOC_OR_CLEANUP(d_txt_mod, (size_t)6 * dim * sizeof(float), "d_txt_mod");
 
     /* ---- 1. Timestep embedding: sinusoidal(256) → SiLU(GEMM) → GEMM ---- */
     float t_sin[256];
@@ -3909,16 +3948,14 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         t_sin[i]        = cosf(angle);
         t_sin[half + i] = sinf(angle);
     }
-    CUdeviceptr d_t_sin;
-    cuMemAlloc(&d_t_sin, 256 * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_t_sin, 256 * sizeof(float), "d_t_sin");
     cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float));
     op_gemm(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
-    CUdeviceptr d_t_emb2;
-    cuMemAlloc(&d_t_emb2, (size_t)dim * sizeof(float));
+    QIMG_ALLOC_OR_CLEANUP(d_t_emb2, (size_t)dim * sizeof(float), "d_t_emb2");
     op_gemm(r, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
-    cuMemFree(d_t_emb); d_t_emb = d_t_emb2;
-    cuMemFree(d_t_sin);
+    cuMemFree(d_t_emb); d_t_emb = d_t_emb2; d_t_emb2 = 0;
+    cuMemFree(d_t_sin); d_t_sin = 0;
 
     /* ---- 2. Text input: RMSNorm → Linear (both passes) ---- */
     if (r->d_txt_norm_w) {
@@ -3931,13 +3968,14 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     }
     op_gemm(r, d_txt_c, r->d_txt_in_w, d_txt_in_c, r->d_txt_in_b, dim, txt_dim, n_txt_cond);
     op_gemm(r, d_txt_u, r->d_txt_in_w, d_txt_in_u, r->d_txt_in_b, dim, txt_dim, n_txt_uncond);
-    cuMemFree(d_txt_in_c); cuMemFree(d_txt_in_u);
+    cuMemFree(d_txt_in_c); d_txt_in_c = 0;
+    cuMemFree(d_txt_in_u); d_txt_in_u = 0;
 
     /* ---- 3. Image input (same for cond/uncond) ---- */
     op_gemm(r, d_img_c, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
     /* Copy to uncond buffer so both start identical */
     cuMemcpyDtoDAsync(d_img_u, d_img_c, (size_t)n_img * dim * sizeof(float), s);
-    cuMemFree(d_img_in);
+    cuMemFree(d_img_in); d_img_in = 0;
 
     /* Rope params (same for cond and uncond) */
     int hp_rope = (int)sqrtf((float)n_img);
@@ -3989,7 +4027,7 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         } else {
             if (qimg_load_block_into_slot(r, L, &blk) != 0) {
                 fprintf(stderr, "cuda_qimg: block %d slot load failed\n", L);
-                return -1;
+                goto cleanup;
             }
         }
 
@@ -4057,8 +4095,11 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
             if (next_L < r->dit_n_blocks && next_L >= r->n_preloaded) {
                 cuStreamWaitEvent(r->copy_stream, r->slot_free[slot_used], 0);
                 qimg_block_gpu tmp;
-                qimg_load_block_into_slot_ex(r, next_L, slot_ptrs[slot_used], &tmp,
-                                             r->copy_stream);
+                if (qimg_load_block_into_slot_ex(r, next_L, slot_ptrs[slot_used], &tmp,
+                                                 r->copy_stream) != 0) {
+                    fprintf(stderr, "cuda_qimg: block %d async slot load failed\n", next_L);
+                    goto cleanup;
+                }
                 cuEventRecord(r->slot_ready[slot_used], r->copy_stream);
             }
         }
@@ -4077,42 +4118,65 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         CUdeviceptr d_scratch1_p = pass ? d_scratch1_u : d_scratch1_c;
         float *out_p = pass ? out_uncond : out_cond;
 
-        CUdeviceptr d_t_silu2;
-        cuMemAlloc(&d_t_silu2, (size_t)dim * sizeof(float));
-        cuMemcpyDtoDAsync(d_t_silu2, d_t_emb, (size_t)dim * sizeof(float), s);
-        op_silu(r, d_t_silu2, dim);
-        CUdeviceptr d_final_mod;
-        cuMemAlloc(&d_final_mod, (size_t)2 * dim * sizeof(float));
-        op_gemm(r, d_final_mod, r->d_norm_out_w, d_t_silu2, r->d_norm_out_b,
+        QIMG_ALLOC_OR_CLEANUP(d_final_t_silu, (size_t)dim * sizeof(float), "d_final_t_silu");
+        cuMemcpyDtoDAsync(d_final_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
+        op_silu(r, d_final_t_silu, dim);
+        QIMG_ALLOC_OR_CLEANUP(d_final_mod, (size_t)2 * dim * sizeof(float), "d_final_mod");
+        op_gemm(r, d_final_mod, r->d_norm_out_w, d_final_t_silu, r->d_norm_out_b,
                 2 * dim, dim, 1);
-        cuMemFree(d_t_silu2);
+        cuMemFree(d_final_t_silu); d_final_t_silu = 0;
 
         CUdeviceptr f_scale = d_final_mod;
         CUdeviceptr f_shift = d_final_mod + (size_t)dim * sizeof(float);
         op_adaln(r, d_scratch1_p, d_img_p, f_shift, f_scale, n_img, dim);
-        cuMemFree(d_final_mod);
+        cuMemFree(d_final_mod); d_final_mod = 0;
 
-        CUdeviceptr d_out;
-        cuMemAlloc(&d_out, (size_t)n_img * in_ch * sizeof(float));
-        op_gemm(r, d_out, r->d_proj_out_w, d_scratch1_p, r->d_proj_out_b,
+        QIMG_ALLOC_OR_CLEANUP(d_final_out, (size_t)n_img * in_ch * sizeof(float), "d_final_out");
+        op_gemm(r, d_final_out, r->d_proj_out_w, d_scratch1_p, r->d_proj_out_b,
                 in_ch, dim, n_img);
         cuStreamSynchronize(s);
-        cuMemcpyDtoH(out_p, d_out, (size_t)n_img * in_ch * sizeof(float));
-        cuMemFree(d_out);
+        cuMemcpyDtoH(out_p, d_final_out, (size_t)n_img * in_ch * sizeof(float));
+        cuMemFree(d_final_out); d_final_out = 0;
     }
+    rc = 0;
 
     /* Cleanup */
-    cuMemFree(d_img_c); cuMemFree(d_img_u);
-    cuMemFree(d_txt_c); cuMemFree(d_txt_u);
-    cuMemFree(d_t_emb);
-    cuMemFree(d_scratch1_c); cuMemFree(d_scratch2_c); cuMemFree(d_scratch3_c);
-    cuMemFree(d_scratch1_u); cuMemFree(d_scratch2_u); cuMemFree(d_scratch3_u);
-    cuMemFree(d_q_c); cuMemFree(d_k_c); cuMemFree(d_v_c); cuMemFree(d_attn_out_c);
-    cuMemFree(d_q_u); cuMemFree(d_k_u); cuMemFree(d_v_u); cuMemFree(d_attn_out_u);
-    cuMemFree(d_img_mlp_in); cuMemFree(d_img_mlp_h); cuMemFree(d_img_mlp_out);
-    cuMemFree(d_t_silu); cuMemFree(d_img_mod); cuMemFree(d_txt_mod);
+cleanup:
+    if (d_t_sin) cuMemFree(d_t_sin);
+    if (d_t_emb2) cuMemFree(d_t_emb2);
+    if (d_final_t_silu) cuMemFree(d_final_t_silu);
+    if (d_final_mod) cuMemFree(d_final_mod);
+    if (d_final_out) cuMemFree(d_final_out);
+    if (d_img_in) cuMemFree(d_img_in);
+    if (d_txt_in_c) cuMemFree(d_txt_in_c);
+    if (d_txt_in_u) cuMemFree(d_txt_in_u);
+    if (d_img_c) cuMemFree(d_img_c);
+    if (d_img_u) cuMemFree(d_img_u);
+    if (d_txt_c) cuMemFree(d_txt_c);
+    if (d_txt_u) cuMemFree(d_txt_u);
+    if (d_t_emb) cuMemFree(d_t_emb);
+    if (d_scratch1_c) cuMemFree(d_scratch1_c);
+    if (d_scratch2_c) cuMemFree(d_scratch2_c);
+    if (d_scratch3_c) cuMemFree(d_scratch3_c);
+    if (d_scratch1_u) cuMemFree(d_scratch1_u);
+    if (d_scratch2_u) cuMemFree(d_scratch2_u);
+    if (d_scratch3_u) cuMemFree(d_scratch3_u);
+    if (d_q_c) cuMemFree(d_q_c);
+    if (d_k_c) cuMemFree(d_k_c);
+    if (d_v_c) cuMemFree(d_v_c);
+    if (d_attn_out_c) cuMemFree(d_attn_out_c);
+    if (d_q_u) cuMemFree(d_q_u);
+    if (d_k_u) cuMemFree(d_k_u);
+    if (d_v_u) cuMemFree(d_v_u);
+    if (d_attn_out_u) cuMemFree(d_attn_out_u);
+    if (d_img_mlp_in) cuMemFree(d_img_mlp_in);
+    if (d_img_mlp_h) cuMemFree(d_img_mlp_h);
+    if (d_img_mlp_out) cuMemFree(d_img_mlp_out);
+    if (d_t_silu) cuMemFree(d_t_silu);
+    if (d_img_mod) cuMemFree(d_img_mod);
+    if (d_txt_mod) cuMemFree(d_txt_mod);
 
-    if (r->profile_block && r->prof_block_count > 0) {
+    if (rc == 0 && r->profile_block && r->prof_block_count > 0) {
         double n = (double)r->prof_block_count;
         double tot = r->prof_qkv_ms + r->prof_qknorm_ms + r->prof_attn_ms
                    + r->prof_attnout_ms + r->prof_imgmlp_ms + r->prof_txtmlp_ms;
@@ -4137,7 +4201,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         r->prof_attnout_ms = r->prof_imgmlp_ms = r->prof_txtmlp_ms = 0;
         r->prof_block_count = 0;
     }
-    return 0;
+#undef QIMG_ALLOC_OR_CLEANUP
+    return rc;
 }
 
 /* ---- CUDA VAE decode ---- */
@@ -4153,6 +4218,7 @@ static CUdeviceptr vae_upload_f32(st_context *st, const char *name, CUstream s) 
     const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
     const char *dtype = safetensors_dtype(st, idx);
     float *f32 = (float *)malloc(n * sizeof(float));
+    if (!f32) return 0;
     if (strcmp(dtype, "BF16") == 0) {
         const uint16_t *bf = (const uint16_t *)src;
         for (size_t i = 0; i < n; i++) {
@@ -4161,8 +4227,13 @@ static CUdeviceptr vae_upload_f32(st_context *st, const char *name, CUstream s) 
         }
     } else if (strcmp(dtype, "F32") == 0) {
         memcpy(f32, src, n * 4);
+    } else {
+        fprintf(stderr, "cuda_qimg_vae: unsupported dtype %s for %s\n", dtype, name);
+        free(f32);
+        return 0;
     }
-    CUdeviceptr d; cuMemAlloc(&d, n * sizeof(float));
+    CUdeviceptr d = checked_cuMemAlloc(n * sizeof(float));
+    if (!d) { free(f32); return 0; }
     cuMemcpyHtoD(d, f32, n * sizeof(float));
     free(f32);
     (void)s;
@@ -4184,6 +4255,7 @@ static CUdeviceptr vae_upload_conv3d(st_context *st, const char *name,
     /* BF16 → F32: take LAST temporal slice only (causal_zero for T=1 input) */
     size_t n2d = (size_t)co * ci * kh * kw;
     float *w2d = (float *)malloc(n2d * sizeof(float));
+    if (!w2d) return 0;
     int d_last = kd - 1;  /* causal: use last temporal position only */
     for (int o = 0; o < co; o++)
         for (int i = 0; i < ci; i++)
@@ -4194,7 +4266,8 @@ static CUdeviceptr vae_upload_conv3d(st_context *st, const char *name,
                     float f; memcpy(&f, &bits, 4);
                     w2d[(((size_t)o*ci+i)*kh+h)*kw+w] = f;
                 }
-    CUdeviceptr dp; cuMemAlloc(&dp, n2d * sizeof(float));
+    CUdeviceptr dp = checked_cuMemAlloc(n2d * sizeof(float));
+    if (!dp) { free(w2d); return 0; }
     cuMemcpyHtoD(dp, w2d, n2d * sizeof(float));
     free(w2d);
     (void)s; (void)n3d;
@@ -4207,7 +4280,7 @@ static CUdeviceptr vae_upload_conv3d(st_context *st, const char *name,
  * per-output-thread kernel. */
 static void vae_op_conv2d_mma(cuda_qimg_runner *r,
                               CUdeviceptr out, CUdeviceptr inp,
-                              CUdeviceptr w_fp8, CUdeviceptr bias,
+                              CUdeviceptr w_fp8, CUdeviceptr w_f32, CUdeviceptr bias,
                               int ci, int h, int w_s, int co, int kh, int kw,
                               int rep_pad, int pad_co, int n_in_pad);
 static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
@@ -4229,7 +4302,7 @@ static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
             void *args[] = {&d_w_fp8, &w, &co, &n_in, &pad_co, &n_in_pad};
             cuLaunchKernel(r->vae_f32_to_fp8_padded, gx, gy, 1, bx, by, 1,
                            0, r->stream, args, NULL);
-            vae_op_conv2d_mma(r, out, inp, d_w_fp8, b, ci, h, w_s, co,
+            vae_op_conv2d_mma(r, out, inp, d_w_fp8, w, b, ci, h, w_s, co,
                               kh, kw, rep_pad, pad_co, n_in_pad);
             cuMemFree(d_w_fp8);
             return;
@@ -4248,7 +4321,7 @@ static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
  * 16 GB (and usually 8 GB) budget. */
 static void vae_op_conv2d_mma(cuda_qimg_runner *r,
                               CUdeviceptr out, CUdeviceptr inp,
-                              CUdeviceptr w_fp8, CUdeviceptr bias,
+                              CUdeviceptr w_fp8, CUdeviceptr w_f32, CUdeviceptr bias,
                               int ci, int h, int w_s, int co, int kh, int kw,
                               int rep_pad, int pad_co, int n_in_pad) {
     int n_tok = h * w_s;
@@ -4272,14 +4345,16 @@ static void vae_op_conv2d_mma(cuda_qimg_runner *r,
     size_t unfold_bytes = (size_t)chunk_n_tok * n_in_pad * sizeof(float);
     size_t gemm_out_bytes = (size_t)chunk_n_tok * pad_co   * sizeof(float);
 
-    CUdeviceptr d_unfold, d_gemm_out;
+    CUdeviceptr d_unfold = 0, d_gemm_out = 0;
     if (cuMemAlloc(&d_unfold,   unfold_bytes)   != CUDA_SUCCESS ||
         cuMemAlloc(&d_gemm_out, gemm_out_bytes) != CUDA_SUCCESS) {
         /* Fall back to naive conv2d on OOM. */
         fprintf(stderr, "cuda_qimg_vae: mma conv OOM (chunk=%d, n_in_pad=%d), "
                         "falling back to naive\n", chunk_n_tok, n_in_pad);
+        if (d_unfold) cuMemFree(d_unfold);
+        if (d_gemm_out) cuMemFree(d_gemm_out);
         int total = co * n_tok;
-        void *args[] = {&out, &inp, &w_fp8, &bias, &ci, &h, &w_s, &co, &kh, &kw, &rep_pad};
+        void *args[] = {&out, &inp, &w_f32, &bias, &ci, &h, &w_s, &co, &kh, &kw, &rep_pad};
         cuLaunchKernel(r->vae_conv2d, (unsigned)((total + 255) / 256), 1, 1,
                        256, 1, 1, 0, s, args, NULL);
         return;
@@ -4338,7 +4413,8 @@ static void vae_op_silu(cuda_qimg_runner *r, CUdeviceptr x, int n) {
 static CUdeviceptr vae_op_upsample(cuda_qimg_runner *r, CUdeviceptr inp,
                                     int c, int h, int w) {
     int oh = h*2, ow = w*2;
-    CUdeviceptr out; cuMemAlloc(&out, (size_t)c*oh*ow*sizeof(float));
+    CUdeviceptr out = checked_cuMemAlloc((size_t)c * oh * ow * sizeof(float));
+    if (!out) return 0;
     int total = c*oh*ow;
     void *args[] = {&out, &inp, &c, &h, &w};
     cuLaunchKernel(r->nn_upsample2x, (unsigned)((total+255)/256), 1, 1,
@@ -4357,29 +4433,37 @@ static CUdeviceptr vae_resblock_gpu(cuda_qimg_runner *r, CUdeviceptr x,
                                      CUdeviceptr n2_g, CUdeviceptr c2_w, CUdeviceptr c2_b,
                                      CUdeviceptr sc_w, CUdeviceptr sc_b,
                                      int ci, int co, int h, int w) {
+    if (!x || !n1_g || !c1_w || !c1_b || !n2_g || !c2_w || !c2_b) return 0;
     int sp = h * w;
-    CUdeviceptr tmp; cuMemAlloc(&tmp, (size_t)ci*sp*sizeof(float));
+    CUdeviceptr tmp = 0, c1_out = 0, c2_out = 0, out = 0;
+    tmp = checked_cuMemAlloc((size_t)ci * sp * sizeof(float));
+    if (!tmp) goto fail;
     vae_op_gn(r, tmp, x, n1_g, ci, sp);
     vae_bf16(r, tmp, ci*sp);
     vae_op_silu(r, tmp, ci*sp);
     vae_bf16(r, tmp, ci*sp);
-    CUdeviceptr c1_out; cuMemAlloc(&c1_out, (size_t)co*sp*sizeof(float));
+    c1_out = checked_cuMemAlloc((size_t)co * sp * sizeof(float));
+    if (!c1_out) goto fail;
     vae_op_conv2d(r, c1_out, tmp, c1_w, c1_b, ci, h, w, co, 3, 3, 0);
     vae_bf16(r, c1_out, co*sp);
-    cuMemFree(tmp);
+    cuMemFree(tmp); tmp = 0;
 
-    tmp = (CUdeviceptr)0; cuMemAlloc(&tmp, (size_t)co*sp*sizeof(float));
+    tmp = checked_cuMemAlloc((size_t)co * sp * sizeof(float));
+    if (!tmp) goto fail;
     vae_op_gn(r, tmp, c1_out, n2_g, co, sp);
     vae_bf16(r, tmp, co*sp);
     vae_op_silu(r, tmp, co*sp);
     vae_bf16(r, tmp, co*sp);
-    CUdeviceptr c2_out; cuMemAlloc(&c2_out, (size_t)co*sp*sizeof(float));
+    c2_out = checked_cuMemAlloc((size_t)co * sp * sizeof(float));
+    if (!c2_out) goto fail;
     vae_op_conv2d(r, c2_out, tmp, c2_w, c2_b, co, h, w, co, 3, 3, 0);
     vae_bf16(r, c2_out, co*sp);
-    cuMemFree(tmp); cuMemFree(c1_out);
+    cuMemFree(tmp); tmp = 0;
+    cuMemFree(c1_out); c1_out = 0;
 
     /* Shortcut + residual */
-    CUdeviceptr out; cuMemAlloc(&out, (size_t)co*sp*sizeof(float));
+    out = checked_cuMemAlloc((size_t)co * sp * sizeof(float));
+    if (!out) goto fail;
     if (sc_w) {
         /* 1x1 conv shortcut + residual: out = shortcut(x) + c2_out */
         vae_op_conv2d(r, out, x, sc_w, sc_b, ci, h, w, co, 1, 1, 0);
@@ -4401,6 +4485,13 @@ static CUdeviceptr vae_resblock_gpu(cuda_qimg_runner *r, CUdeviceptr x,
     }
     cuMemFree(c2_out);
     return out;
+
+fail:
+    if (tmp) cuMemFree(tmp);
+    if (c1_out) cuMemFree(c1_out);
+    if (c2_out) cuMemFree(c2_out);
+    if (out) cuMemFree(out);
+    return 0;
 }
 
 int cuda_qimg_vae_decode(cuda_qimg_runner *r,
@@ -4471,9 +4562,11 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         } \
     } while(0)
 
+    #define VAE_FREE(ptr) do { if (ptr) { cuMemFree(ptr); (ptr) = 0; } } while(0)
+
     /* Upload latent */
-    CUdeviceptr d_x;
-    cuMemAlloc(&d_x, (size_t)c * h * w * sizeof(float));
+    CUdeviceptr d_x = checked_cuMemAlloc((size_t)c * h * w * sizeof(float));
+    if (!d_x) return -1;
     cuMemcpyHtoD(d_x, latent, (size_t)c * h * w * sizeof(float));
     VAE_DUMP("latent_input", d_x, c*h*w);
 
@@ -4489,7 +4582,12 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     CUdeviceptr d_pqc_w = vae_upload_f32(st, "conv2.weight", s);
     CUdeviceptr d_pqc_b = vae_upload_f32(st, "conv2.bias", s);
     if (d_pqc_w) {
-        CUdeviceptr d_tmp; cuMemAlloc(&d_tmp, (size_t)c*h*w*sizeof(float));
+        CUdeviceptr d_tmp = checked_cuMemAlloc((size_t)c * h * w * sizeof(float));
+        if (!d_tmp) {
+            cuMemFree(d_x);
+            cuMemFree(d_pqc_w); if (d_pqc_b) cuMemFree(d_pqc_b);
+            return -1;
+        }
         vae_op_conv2d(r, d_tmp, d_x, d_pqc_w, d_pqc_b, c, h, w, c, 1, 1, 0);
         vae_bf16(r, d_tmp, c*h*w);
         cuMemFree(d_x); d_x = d_tmp;
@@ -4502,10 +4600,21 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     int co_c1, ci_c1;
     CUdeviceptr d_c1_w = vae_upload_conv3d(st, "decoder.conv1.weight", &co_c1, &ci_c1, s);
     CUdeviceptr d_c1_b = vae_upload_f32(st, "decoder.conv1.bias", s);
+    if (!d_c1_w || !d_c1_b) {
+        cuMemFree(d_x);
+        if (d_c1_w) cuMemFree(d_c1_w);
+        if (d_c1_b) cuMemFree(d_c1_b);
+        return -1;
+    }
     c = co_c1;
     VAE_PHASE_BEGIN();
     {
-        CUdeviceptr d_tmp; cuMemAlloc(&d_tmp, (size_t)c*h*w*sizeof(float));
+        CUdeviceptr d_tmp = checked_cuMemAlloc((size_t)c * h * w * sizeof(float));
+        if (!d_tmp) {
+            cuMemFree(d_x);
+            cuMemFree(d_c1_w); cuMemFree(d_c1_b);
+            return -1;
+        }
         vae_op_conv2d(r, d_tmp, d_x, d_c1_w, d_c1_b, ci_c1, h, w, c, 3, 3, 0);
         vae_bf16(r, d_tmp, c*h*w);
         cuMemFree(d_x); d_x = d_tmp;
@@ -4535,6 +4644,12 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     VAE_PHASE_BEGIN();
     { LOAD_RB_NAMED("decoder.middle.0", n1, c1w, c1b, n2, c2w, c2b, scw, scb);
       CUdeviceptr d_tmp = vae_resblock_gpu(r, d_x, n1, c1w, c1b, n2, c2w, c2b, scw, scb, c, c, h, w);
+      if (!d_tmp) {
+        cuMemFree(d_x);
+        cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
+        if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); }
+        return -1;
+      }
       cuMemFree(d_x); d_x = d_tmp;
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
       if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); } }
@@ -4552,22 +4667,41 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         CUdeviceptr d_qkv_b = vae_upload_f32(st, "decoder.middle.1.to_qkv.bias", s);
         CUdeviceptr d_proj_w = vae_upload_f32(st, "decoder.middle.1.proj.weight", s);
         CUdeviceptr d_proj_b = vae_upload_f32(st, "decoder.middle.1.proj.bias", s);
+        CUdeviceptr d_normed = 0, d_qkv = 0;
+        CUdeviceptr d_Q_sc = 0, d_K_sc = 0, d_V_sc = 0;
+        CUdeviceptr d_attn_sc = 0, d_attn_chw = 0, d_proj_out = 0;
+
+        #define VAE_MID_ATTN_FAIL() do { \
+            VAE_FREE(d_normed); VAE_FREE(d_qkv); \
+            VAE_FREE(d_Q_sc); VAE_FREE(d_K_sc); VAE_FREE(d_V_sc); \
+            VAE_FREE(d_attn_sc); VAE_FREE(d_attn_chw); VAE_FREE(d_proj_out); \
+            VAE_FREE(d_gn_g); VAE_FREE(d_qkv_w); VAE_FREE(d_qkv_b); \
+            VAE_FREE(d_proj_w); VAE_FREE(d_proj_b); VAE_FREE(d_x); \
+            return -1; \
+        } while(0)
+
+        if (!d_gn_g || !d_qkv_w || !d_qkv_b || !d_proj_w || !d_proj_b) {
+            fprintf(stderr, "cuda_qimg_vae: failed to load middle attention weights\n");
+            VAE_MID_ATTN_FAIL();
+        }
 
         /* GroupNorm */
-        CUdeviceptr d_normed; cuMemAlloc(&d_normed, (size_t)c*spatial*sizeof(float));
+        d_normed = checked_cuMemAlloc((size_t)c * spatial * sizeof(float));
+        if (!d_normed) VAE_MID_ATTN_FAIL();
         vae_op_gn(r, d_normed, d_x, d_gn_g, c, spatial);
-        cuMemFree(d_gn_g);
+        VAE_FREE(d_gn_g);
 
         /* QKV 1x1 conv: [3c, c] W times [c, spatial] x -> [3c, spatial] out (CHW). */
-        CUdeviceptr d_qkv; cuMemAlloc(&d_qkv, (size_t)3*c*spatial*sizeof(float));
+        d_qkv = checked_cuMemAlloc((size_t)3 * c * spatial * sizeof(float));
+        if (!d_qkv) VAE_MID_ATTN_FAIL();
         vae_op_conv2d(r, d_qkv, d_normed, d_qkv_w, d_qkv_b, c, h, w, 3*c, 1, 1, 0);
-        cuMemFree(d_normed); cuMemFree(d_qkv_w); cuMemFree(d_qkv_b);
+        VAE_FREE(d_normed); VAE_FREE(d_qkv_w); VAE_FREE(d_qkv_b);
 
         /* Transpose each [c, spatial] slice -> [spatial, c] (row-major). */
-        CUdeviceptr d_Q_sc, d_K_sc, d_V_sc;
-        cuMemAlloc(&d_Q_sc, (size_t)spatial*c*sizeof(float));
-        cuMemAlloc(&d_K_sc, (size_t)spatial*c*sizeof(float));
-        cuMemAlloc(&d_V_sc, (size_t)spatial*c*sizeof(float));
+        d_Q_sc = checked_cuMemAlloc((size_t)spatial * c * sizeof(float));
+        d_K_sc = checked_cuMemAlloc((size_t)spatial * c * sizeof(float));
+        d_V_sc = checked_cuMemAlloc((size_t)spatial * c * sizeof(float));
+        if (!d_Q_sc || !d_K_sc || !d_V_sc) VAE_MID_ATTN_FAIL();
         {
             CUdeviceptr d_Q_chw = d_qkv;
             CUdeviceptr d_K_chw = d_qkv + (size_t)c * spatial * sizeof(float);
@@ -4583,10 +4717,11 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             cuLaunchKernel(r->vae_transpose_chw_to_sc, gx, gy, 1, bx, by, 1, 0, s, tk, NULL);
             cuLaunchKernel(r->vae_transpose_chw_to_sc, gx, gy, 1, bx, by, 1, 0, s, tv, NULL);
         }
-        cuMemFree(d_qkv);
+        VAE_FREE(d_qkv);
 
         /* Self-attention: one CTA per query, 1 warp, online softmax. */
-        CUdeviceptr d_attn_sc; cuMemAlloc(&d_attn_sc, (size_t)spatial*c*sizeof(float));
+        d_attn_sc = checked_cuMemAlloc((size_t)spatial * c * sizeof(float));
+        if (!d_attn_sc) VAE_MID_ATTN_FAIL();
         {
             float scale_at = 1.0f / sqrtf((float)c);
             int sp = spatial;
@@ -4595,10 +4730,11 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             cuLaunchKernel(r->vae_attn_sc, (unsigned)spatial, 1, 1,
                            32, 1, 1, smem_bytes, s, args, NULL);
         }
-        cuMemFree(d_Q_sc); cuMemFree(d_K_sc); cuMemFree(d_V_sc);
+        VAE_FREE(d_Q_sc); VAE_FREE(d_K_sc); VAE_FREE(d_V_sc);
 
         /* Transpose attn output [spatial, c] -> [c, spatial] for the 1x1 proj. */
-        CUdeviceptr d_attn_chw; cuMemAlloc(&d_attn_chw, (size_t)c*spatial*sizeof(float));
+        d_attn_chw = checked_cuMemAlloc((size_t)c * spatial * sizeof(float));
+        if (!d_attn_chw) VAE_MID_ATTN_FAIL();
         {
             unsigned bx = 16, by = 16;
             unsigned gx = (unsigned)((spatial + 15) / 16);
@@ -4607,12 +4743,13 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             void *args[] = {&d_attn_chw, &d_attn_sc, &c, &sp};
             cuLaunchKernel(r->vae_transpose_sc_to_chw, gx, gy, 1, bx, by, 1, 0, s, args, NULL);
         }
-        cuMemFree(d_attn_sc);
+        VAE_FREE(d_attn_sc);
 
         /* proj 1x1 conv + residual add. */
-        CUdeviceptr d_proj_out; cuMemAlloc(&d_proj_out, (size_t)c*spatial*sizeof(float));
+        d_proj_out = checked_cuMemAlloc((size_t)c * spatial * sizeof(float));
+        if (!d_proj_out) VAE_MID_ATTN_FAIL();
         vae_op_conv2d(r, d_proj_out, d_attn_chw, d_proj_w, d_proj_b, c, h, w, c, 1, 1, 0);
-        cuMemFree(d_attn_chw); cuMemFree(d_proj_w); cuMemFree(d_proj_b);
+        VAE_FREE(d_attn_chw); VAE_FREE(d_proj_w); VAE_FREE(d_proj_b);
 
         {
             int n = c * spatial;
@@ -4621,8 +4758,9 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             cuLaunchKernel(r->euler_step, (unsigned)((n+255)/256), 1, 1,
                            256, 1, 1, 0, s, add_args, NULL);
         }
-        cuMemFree(d_proj_out);
+        VAE_FREE(d_proj_out);
         vae_bf16(r, d_x, c * spatial);
+        #undef VAE_MID_ATTN_FAIL
     }
     VAE_PHASE_END("mid.1 attention(GPU)");
     { int _d[] = {c, h, w}; VAE_SAVE_NPY("cuda_vae_middle_1.npy", d_x, 3, _d); }
@@ -4631,6 +4769,12 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
     VAE_PHASE_BEGIN();
     { LOAD_RB_NAMED("decoder.middle.2", n1, c1w, c1b, n2, c2w, c2b, scw, scb);
       CUdeviceptr d_tmp = vae_resblock_gpu(r, d_x, n1, c1w, c1b, n2, c2w, c2b, scw, scb, c, c, h, w);
+      if (!d_tmp) {
+        cuMemFree(d_x);
+        cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
+        if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); }
+        return -1;
+      }
       cuMemFree(d_x); d_x = d_tmp;
       cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b); cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
       if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); } }
@@ -4657,6 +4801,13 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             int old_ci = c;
             CUdeviceptr d_tmp = vae_resblock_gpu(r, d_x, n1, c1w, c1b, n2, c2w, c2b,
                                                   scw, scb, old_ci, new_co, h, w);
+            if (!d_tmp) {
+                cuMemFree(d_x);
+                cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b);
+                cuMemFree(n2); cuMemFree(c2w); cuMemFree(c2b);
+                if (scw) { cuMemFree(scw); } if (scb) { cuMemFree(scb); }
+                return -1;
+            }
             cuMemFree(d_x); d_x = d_tmp;
             c = new_co;
             cuMemFree(n1); cuMemFree(c1w); cuMemFree(c1b);
@@ -4670,15 +4821,29 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             CUdeviceptr rs_w = vae_upload_f32(st, pfx, s);
             snprintf(pfx, sizeof(pfx), "decoder.upsamples.%d.resample.1.bias", i);
             CUdeviceptr rs_b = vae_upload_f32(st, pfx, s);
-            int rs_idx = safetensors_find(st, pfx);
+            if (!rs_w || !rs_b) {
+                VAE_FREE(d_x);
+                VAE_FREE(rs_w); VAE_FREE(rs_b);
+                return -1;
+            }
             /* NN upsample 2x */
             CUdeviceptr d_up = vae_op_upsample(r, d_x, c, h, w);
+            if (!d_up) {
+                cuMemFree(d_x);
+                cuMemFree(rs_w); cuMemFree(rs_b);
+                return -1;
+            }
             h *= 2; w *= 2;
             /* Conv2d (zero padding) */
             snprintf(pfx, sizeof(pfx), "decoder.upsamples.%d.resample.1.weight", i);
-            rs_idx = safetensors_find(st, pfx);
+            int rs_idx = safetensors_find(st, pfx);
             int new_c = (int)safetensors_shape(st, rs_idx)[0];
-            CUdeviceptr d_tmp; cuMemAlloc(&d_tmp, (size_t)new_c*h*w*sizeof(float));
+            CUdeviceptr d_tmp = checked_cuMemAlloc((size_t)new_c * h * w * sizeof(float));
+            if (!d_tmp) {
+                cuMemFree(d_up); cuMemFree(d_x);
+                cuMemFree(rs_w); cuMemFree(rs_b);
+                return -1;
+            }
             vae_op_conv2d(r, d_tmp, d_up, rs_w, rs_b, c, h, w, new_c, 3, 3, 0);
             cuMemFree(d_up); cuMemFree(d_x);
             cuMemFree(rs_w); cuMemFree(rs_b);
@@ -4715,24 +4880,38 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
         VAE_DUMP("pre_head", d_x, c*h*w);
         CUdeviceptr d_gn = vae_upload_f32(st, "decoder.head.0.gamma", s);
         int spatial = h * w;
-        CUdeviceptr d_tmp; cuMemAlloc(&d_tmp, (size_t)c*spatial*sizeof(float));
+        CUdeviceptr d_tmp = 0, d_hw = 0, d_hb = 0, d_rgb = 0;
+
+        #define VAE_HEAD_FAIL() do { \
+            VAE_FREE(d_gn); VAE_FREE(d_tmp); VAE_FREE(d_hw); VAE_FREE(d_hb); \
+            VAE_FREE(d_rgb); VAE_FREE(d_x); \
+            return -1; \
+        } while(0)
+
+        if (!d_gn) VAE_HEAD_FAIL();
+        d_tmp = checked_cuMemAlloc((size_t)c * spatial * sizeof(float));
+        if (!d_tmp) VAE_HEAD_FAIL();
         vae_op_gn(r, d_tmp, d_x, d_gn, c, spatial);
         vae_bf16(r, d_tmp, c*spatial);
         VAE_DUMP("head_gn", d_tmp, c*spatial);
         vae_op_silu(r, d_tmp, c * spatial);
         vae_bf16(r, d_tmp, c*spatial);
         VAE_DUMP("head_silu", d_tmp, c*spatial);
-        cuMemFree(d_gn);
+        VAE_FREE(d_gn);
 
         int head_co, head_ci;
-        CUdeviceptr d_hw = vae_upload_conv3d(st, "decoder.head.2.weight", &head_co, &head_ci, s);
-        CUdeviceptr d_hb = vae_upload_f32(st, "decoder.head.2.bias", s);
-        CUdeviceptr d_rgb; cuMemAlloc(&d_rgb, (size_t)3*spatial*sizeof(float));
+        d_hw = vae_upload_conv3d(st, "decoder.head.2.weight", &head_co, &head_ci, s);
+        d_hb = vae_upload_f32(st, "decoder.head.2.bias", s);
+        if (!d_hw || !d_hb) VAE_HEAD_FAIL();
+        d_rgb = checked_cuMemAlloc((size_t)3 * spatial * sizeof(float));
+        if (!d_rgb) VAE_HEAD_FAIL();
         vae_op_conv2d(r, d_rgb, d_tmp, d_hw, d_hb, c, h, w, 3, 3, 3, 0);  /* zero spatial pad */
         VAE_DUMP("head_conv", d_rgb, 3*spatial);
-        cuMemFree(d_tmp); cuMemFree(d_x); cuMemFree(d_hw); cuMemFree(d_hb);
+        VAE_FREE(d_tmp); VAE_FREE(d_x); VAE_FREE(d_hw); VAE_FREE(d_hb);
         d_x = d_rgb;
+        d_rgb = 0;
         c = 3;
+        #undef VAE_HEAD_FAIL
     }
 
     VAE_PHASE_END("head");
@@ -4744,6 +4923,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
 
     fprintf(stderr, "cuda_qimg_vae: decode complete [%d, %d, %d]\n", c, h, w);
     return 0;
+    #undef VAE_FREE
     #undef VAE_PHASE_BEGIN
     #undef VAE_PHASE_END
 }
