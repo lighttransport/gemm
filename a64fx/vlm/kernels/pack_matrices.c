@@ -3,6 +3,7 @@
 // Optimized for A64FX SVE 512-bit vectors
 
 #include "fused_gemm.h"
+#include <stdlib.h>
 #include <string.h>
 
 // Pack A matrix for broadcast access
@@ -192,4 +193,25 @@ size_t packed_B_size(int K, int N) {
     int N_blocks = (N + NR - 1) / NR;
     int K_rounded = ((K + 3) / 4) * 4;
     return (size_t)N_blocks * K_rounded * NR * sizeof(float);
+}
+
+/* Process-wide persistent A-scratch. The ffn_down GEMM allocates ~6 MB of
+ * A_packed every call, which on glibc-fugaku crosses the mmap threshold —
+ * each encode then pays for mmap/munmap + page-fault-in of fresh anonymous
+ * memory on all 24 layers. Holding one grow-only buffer here drops the cost
+ * to a single fault sequence on the first call. Single-buffer is safe
+ * because encode runs each GEMM serially. */
+float *pack_A_get_scratch(size_t bytes) {
+    static float *cache_ptr      = NULL;
+    static size_t cache_capacity = 0;
+    if (bytes > cache_capacity) {
+        free(cache_ptr);
+        cache_ptr = (float *)aligned_alloc(64, bytes);
+        if (!cache_ptr) {
+            cache_capacity = 0;
+            return NULL;
+        }
+        cache_capacity = bytes;
+    }
+    return cache_ptr;
 }

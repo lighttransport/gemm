@@ -53,4 +53,10 @@ void pack_A_fp32_block(int mb, int M, int K, int K_rounded,
 // Workspace size calculations
 size_t fused_gemm_workspace_size(int M, int K1, int K2, int N);
 
+// Persistent grow-only A_packed scratch. Holds at least `bytes` of 64-byte-
+// aligned storage and reuses the same allocation across calls. Returns NULL
+// on allocation failure. Encode is serial across GEMM stages, so a single
+// shared buffer is safe across the fp32/bf16/fp16 paths.
+float *pack_A_get_scratch(size_t bytes);
+
 #endif // FUSED_GEMM_H
