@@ -80,6 +80,53 @@ per-token. To move that needle we need:
 2. A per-layer hybrid dispatcher: SSM layers stay per-token (state recurrence),
    attention + FFN layers use the batched path.
 
+## Update (2026-05-16) — B2 Phase 3: batched SSM projections
+
+Phase 3 lands the actually-meaningful speedup for hybrid-SSM models: the 5 SSM
+projections (`ssm_qkv_w`, `ssm_gate_w`, `ssm_alpha_w`, `ssm_beta_w`, `ssm_out_w`)
+now go through hipBLASLt batched GEMMs instead of per-token matvec. Sequential
+ops (`conv1d` + state, `deltanet_step` + recurrent state) still run per-row
+inside one host loop per layer, but they're not the bottleneck.
+
+New batched buffers (allocated when `r->is_hybrid`):
+`d_ssm_qkv_batch`, `d_ssm_z_batch`, `d_ssm_alpha_batch`, `d_ssm_beta_batch`,
+`d_ssm_conv_out_batch`, `d_ssm_Q_exp_batch`, `d_ssm_K_exp_batch`,
+`d_ssm_out_batch`. New batched kernel: `softplus_mul_batch_f32` (broadcasts
+the dt_rank-wide bias/`a` constants over M rows). `get_bf16_weight()` extended
+to handle F16 SSM weights (on-the-fly F16→BF16 into the shared staging buffer
+since SSM F16 weights are not pre-converted at load — only attn+FFN F16 are).
+`ssm_layer_is_batched_eligible(cl)` predicate gates SSM layers into the
+batched path; unsupported quant types still fall back to per-row.
+
+VRAM: SSM batch buffers scale with `BMAX × qkv_dim` (~200 MB for 27B at
+BMAX=4096). Default BMAX for hybrid models lowered to **1024** so 27B fits
+in 16 GB VRAM (Qwen3-VL-class non-hybrid models keep BMAX=4096). `LLM_BMAX`
+env still overrides.
+
+Measured (RX 9070 XT, --bench --gpu-only-bench, warm, prefill_len + decode 4):
+
+| model              | L=64 before | L=64 after  | L=256 after | speedup |
+|--------------------|------------:|------------:|------------:|--------:|
+| Qwen3.5-9B  Q4_K_XL hybrid | 43.7 ms/tok | **29.3** | **29.1** | **1.49×** |
+| Qwen3.6-27B IQ3_XXS hybrid | 62.1 ms/tok | **22.2** | **20.1** | **2.79× / 3.24×** |
+
+27B dispatch (LLM_DEBUG_DISPATCH=1): **46 SSM layers batched** / 2 SSM per-row
+(unsupported FFN-down quant on lm_head-class layers) / 16 attn layers per-row
+(unsupported IQ2_S / IQ3_S / IQ2_XS / IQ4_XS in attn weights). Adding the four
+missing IQ dequant kernels would let the remaining 16 attn layers batch too —
+expected to push 27B from 20 to ~12-15 ms/tok at L=256.
+
+Correctness: `--compare-paths` on both 9B and 27B — per-token vs batched argmax
+identical (token 369 for "The capital of France is "). rel_L2 ~0.6 (similar to
+Phase 1 — large but argmax-stable, dominated by F32-vs-BF16 path differences
+in the SSM matvecs, not a logic bug).
+
+Limitation: VLM e2e (`test_hip_vlm`) feeds vision tokens via per-token
+`hip_llm_forward_embd` in a loop, bypassing the batched path. Phase 3 does
+NOT speed up the VLM e2e workload directly — that requires adding a
+`hip_llm_forward_batch_embd` that takes M pre-computed embeddings and runs
+them through the batched prefill. Separate task.
+
 ## Update (2026-05-16) — B2 Phase 1+2: hybrid-SSM dispatcher
 
 Two pieces of the hybrid SSM unblock work landed.
