@@ -1468,6 +1468,7 @@ typedef struct {
     int          dim;
     int          head_dim;
     int          n_heads;
+    int          np_chunks;   /* >=1; total work units = n_heads * np_chunks */
 } qkv_extract_args;
 
 static void qkv_extract_body(int tid, int w0, int w1, void *arg) {
@@ -1476,12 +1477,17 @@ static void qkv_extract_body(int tid, int w0, int w1, void *arg) {
     int np = a->n_patches;
     int dim = a->dim;
     int hd = a->head_dim;
+    int nc = a->np_chunks;
     size_t hd_bytes = (size_t)hd * sizeof(float);
-    for (int h = w0; h < w1; h++) {
+    for (int w = w0; w < w1; w++) {
+        int h  = w / nc;
+        int ci = w - h * nc;
+        int p0 = (int)(((size_t)ci * np) / nc);
+        int p1 = (int)(((size_t)(ci + 1) * np) / nc);
         float *Q_h  = a->Q_hm  + (size_t)h * np * hd;
         float *KT_h = a->KT_hm + (size_t)h * hd * np;
         float *V_h  = a->V_hm  + (size_t)h * np * hd;
-        for (int p = 0; p < np; p++) {
+        for (int p = p0; p < p1; p++) {
             const float *src = a->qkv + (size_t)p * 3 * dim + h * hd;
             memcpy(Q_h + (size_t)p * hd, src,             hd_bytes);
             memcpy(V_h + (size_t)p * hd, src + 2 * dim,   hd_bytes);
@@ -1581,11 +1587,18 @@ static void attention_mt(vlm_pool *pool,
                          int n_patches, int dim, int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    /* 1) Extract head-major Q/V (np-major) and KT (hd-major, transposed) —
-     *    one head per worker, fully parallel, no cross-thread sharing. */
+    /* 1) Extract head-major Q/V (np-major) and KT (hd-major, transposed).
+     *    Tile within each head so n_heads * np_chunks >= nthr — with 16
+     *    heads and 48 cores the old head-only partition left 32 threads
+     *    idle here, costing ~3 ms per encode. */
+    int nthr_ex = vlm_pool_size(pool);
+    int np_chunks = (n_heads >= nthr_ex)
+        ? 1
+        : (nthr_ex + n_heads - 1) / n_heads;
+    if (np_chunks > n_patches) np_chunks = n_patches;
     qkv_extract_args ex = { qkv, Q_hm, KT_hm, V_hm,
-                            n_patches, dim, head_dim, n_heads };
-    vlm_parallel_for(pool, n_heads, 1, qkv_extract_body, &ex);
+                            n_patches, dim, head_dim, n_heads, np_chunks };
+    vlm_parallel_for(pool, n_heads * np_chunks, 1, qkv_extract_body, &ex);
 
     /* 2) Per-(head, q-tile) attention.
      *
