@@ -3847,49 +3847,187 @@ static void *tf_persistent_worker(void *arg) {
             tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
             PW_MARK(barrier);
 
-            /* Thread 0: de-interleave (gated), QK-norm, RoPE, KV cache */
-            if (tid == 0) {
-                if (m->is_hybrid) {
-                    for (int h = 0; h < n_heads; h++) {
-                        memcpy(m->q + h * head_dim, m->xb2 + h * 2 * head_dim, head_dim * sizeof(float));
-                        memcpy(m->ffn_buf1 + h * head_dim, m->xb2 + h * 2 * head_dim + head_dim, head_dim * sizeof(float));
+            /* Parallel: de-interleave (gated), QK-norm, F32-bias, RoPE, KV cache.
+             * Heads are partitioned across threads (n_heads for Q, n_kv_heads for K/V).
+             * Dequant-bias path is rare; if present, only tid 0 handles it (with a
+             * pre-norm/pre-rope barrier so RoPE sees biased values). */
+            int has_dq_bias =
+                (layer->attn_q_bias.data && layer->attn_q_bias.type != GGML_TYPE_F32) ||
+                (layer->attn_k_bias.data && layer->attn_k_bias.type != GGML_TYPE_F32) ||
+                (layer->attn_v_bias.data && layer->attn_v_bias.type != GGML_TYPE_F32);
+
+            if (has_dq_bias) {
+                /* Fallback: original tid==0 sequential path (preserves correctness
+                 * for dequant biases; rare for current Qwen3-VL models). */
+                if (tid == 0) {
+                    if (m->is_hybrid) {
+                        for (int h = 0; h < n_heads; h++) {
+                            memcpy(m->q + h * head_dim, m->xb2 + h * 2 * head_dim, head_dim * sizeof(float));
+                            memcpy(m->ffn_buf1 + h * head_dim, m->xb2 + h * 2 * head_dim + head_dim, head_dim * sizeof(float));
+                        }
                     }
+                    if (layer->attn_q_norm.data)
+                        tf_qk_norm(m->q, n_heads, head_dim, &layer->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
+                    if (layer->attn_k_norm.data)
+                        tf_qk_norm(m->k, n_kv_heads, head_dim, &layer->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
+                    if (layer->attn_q_bias.data) {
+                        if (layer->attn_q_bias.type == GGML_TYPE_F32) {
+                            float *qb = (float *)layer->attn_q_bias.data;
+                            for (int i = 0; i < q_dim; i++) m->q[i] += qb[i];
+                        } else {
+                            tf_dequant_row(&layer->attn_q_bias, 0, m->matvec_tmp);
+                            for (int i = 0; i < q_dim; i++) m->q[i] += m->matvec_tmp[i];
+                        }
+                    }
+                    if (layer->attn_k_bias.data) {
+                        if (layer->attn_k_bias.type == GGML_TYPE_F32) {
+                            float *kb = (float *)layer->attn_k_bias.data;
+                            for (int i = 0; i < kv_dim; i++) m->k[i] += kb[i];
+                        } else {
+                            tf_dequant_row(&layer->attn_k_bias, 0, m->matvec_tmp);
+                            for (int i = 0; i < kv_dim; i++) m->k[i] += m->matvec_tmp[i];
+                        }
+                    }
+                    if (layer->attn_v_bias.data) {
+                        if (layer->attn_v_bias.type == GGML_TYPE_F32) {
+                            float *vb = (float *)layer->attn_v_bias.data;
+                            for (int i = 0; i < kv_dim; i++) m->v[i] += vb[i];
+                        } else {
+                            tf_dequant_row(&layer->attn_v_bias, 0, m->matvec_tmp);
+                            for (int i = 0; i < kv_dim; i++) m->v[i] += m->matvec_tmp[i];
+                        }
+                    }
+                    tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
+                    memcpy(m->key_cache[l] + position * kv_dim, m->k, kv_dim * sizeof(float));
+                    memcpy(m->value_cache[l] + position * kv_dim, m->v, kv_dim * sizeof(float));
                 }
-                if (layer->attn_q_norm.data)
-                    tf_qk_norm(m->q, n_heads, head_dim, &layer->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
-                if (layer->attn_k_norm.data)
-                    tf_qk_norm(m->k, n_kv_heads, head_dim, &layer->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
-                /* Bias additions */
-                if (layer->attn_q_bias.data) {
-                    if (layer->attn_q_bias.type == GGML_TYPE_F32) {
-                        float *qb = (float *)layer->attn_q_bias.data;
-                        for (int i = 0; i < q_dim; i++) m->q[i] += qb[i];
+            } else {
+                /* Per-head partition: assign Q heads to tids [0, n_heads) and
+                 * K/V heads to tids [n_heads, n_heads+n_kv_heads).  When
+                 * nt >= n_heads + n_kv_heads (e.g. 48 >= 16+8) every working
+                 * thread gets exactly one head — load-balanced.  Otherwise we
+                 * fall back to wrapped contiguous partitions. */
+                int qhs, qhc, kvhs, kvhc;
+                if (nt >= n_heads + n_kv_heads) {
+                    qhs = (tid < n_heads) ? tid : 0;
+                    qhc = (tid < n_heads) ? 1 : 0;
+                    int kvtid = tid - n_heads;
+                    kvhs = (kvtid >= 0 && kvtid < n_kv_heads) ? kvtid : 0;
+                    kvhc = (kvtid >= 0 && kvtid < n_kv_heads) ? 1 : 0;
+                } else {
+                    int qhp = n_heads / nt, qhe = n_heads % nt;
+                    qhs = tid * qhp + (tid < qhe ? tid : qhe);
+                    qhc = qhp + (tid < qhe ? 1 : 0);
+                    int kvhp = n_kv_heads / nt, kvhe = n_kv_heads % nt;
+                    kvhs = tid * kvhp + (tid < kvhe ? tid : kvhe);
+                    kvhc = kvhp + (tid < kvhe ? 1 : 0);
+                }
+
+                /* Per-thread scratch (head_dim<=256 typical: Qwen3-VL=128). */
+                float qnw_buf[256] __attribute__((aligned(32)));
+                float knw_buf[256] __attribute__((aligned(32)));
+                float cos_tab[512] __attribute__((aligned(32)));
+                float sin_tab[512] __attribute__((aligned(32)));
+
+                int do_qnorm = (layer->attn_q_norm.data != NULL);
+                int do_knorm = (layer->attn_k_norm.data != NULL);
+                if (do_qnorm && qhc > 0) tf_dequant_row(&layer->attn_q_norm, 0, qnw_buf);
+                if (do_knorm && kvhc > 0) tf_dequant_row(&layer->attn_k_norm, 0, knw_buf);
+
+                /* Build RoPE cos/sin table once per thread (cheap; reused for Q+K). */
+                int rope_pairs = 0;
+                int pair_off = head_dim / 2;
+                if (qhc > 0 || kvhc > 0) {
+                    if (m->use_mrope) {
+                        int sect_dims = m->mrope_sections[0] + m->mrope_sections[1] +
+                                        m->mrope_sections[2] + m->mrope_sections[3];
+                        if (sect_dims <= 0) sect_dims = head_dim / 2;
+                        rope_pairs = sect_dims;
+                        pair_off = sect_dims;
+                        int rope_dim = 2 * sect_dims;
+                        for (int j = 0; j < sect_dims; j++) {
+                            int pos;
+                            if (j % 3 == 1 && j < 3 * m->mrope_sections[1])      pos = pos_h;
+                            else if (j % 3 == 2 && j < 3 * m->mrope_sections[2]) pos = pos_w;
+                            else if (j % 3 == 0 && j < 3 * m->mrope_sections[0]) pos = pos_t;
+                            else                                                  pos = pos_t;
+                            float freq = m->rope_mrope_inv_freq ?
+                                m->rope_mrope_inv_freq[j] :
+                                (1.0f / powf(m->rope_freq_base, (float)(2 * j) / rope_dim));
+                            float theta = pos * freq;
+                            cos_tab[j] = cosf(theta);
+                            sin_tab[j] = sinf(theta);
+                        }
                     } else {
-                        tf_dequant_row(&layer->attn_q_bias, 0, m->matvec_tmp);
-                        for (int i = 0; i < q_dim; i++) m->q[i] += m->matvec_tmp[i];
+                        int half = head_dim / 2;
+                        rope_pairs = half;
+                        pair_off = half;
+                        for (int j = 0; j < half; j++) {
+                            float freq = m->rope_inv_freq ?
+                                m->rope_inv_freq[j] :
+                                (1.0f / powf(m->rope_freq_base, (float)(2 * j) / head_dim));
+                            float theta = pos_t * freq;
+                            cos_tab[j] = cosf(theta);
+                            sin_tab[j] = sinf(theta);
+                        }
                     }
                 }
-                if (layer->attn_k_bias.data) {
-                    if (layer->attn_k_bias.type == GGML_TYPE_F32) {
-                        float *kb = (float *)layer->attn_k_bias.data;
-                        for (int i = 0; i < kv_dim; i++) m->k[i] += kb[i];
-                    } else {
-                        tf_dequant_row(&layer->attn_k_bias, 0, m->matvec_tmp);
-                        for (int i = 0; i < kv_dim; i++) m->k[i] += m->matvec_tmp[i];
+
+                /* Q-side: de-interleave -> qknorm -> bias -> RoPE */
+                for (int hi = 0; hi < qhc; hi++) {
+                    int h = qhs + hi;
+                    float *vq = m->q + h * head_dim;
+                    if (m->is_hybrid) {
+                        memcpy(vq, m->xb2 + h * 2 * head_dim, head_dim * sizeof(float));
+                        memcpy(m->ffn_buf1 + h * head_dim, m->xb2 + h * 2 * head_dim + head_dim,
+                               head_dim * sizeof(float));
+                    }
+                    if (do_qnorm) {
+                        float ss = 0.0f;
+                        for (int i = 0; i < head_dim; i++) ss += vq[i] * vq[i];
+                        ss = 1.0f / sqrtf(ss / head_dim + m->rms_norm_eps);
+                        for (int i = 0; i < head_dim; i++) vq[i] = vq[i] * ss * qnw_buf[i];
+                    }
+                    if (layer->attn_q_bias.data) {
+                        float *qb = (float *)layer->attn_q_bias.data + h * head_dim;
+                        for (int i = 0; i < head_dim; i++) vq[i] += qb[i];
+                    }
+                    for (int j = 0; j < rope_pairs; j++) {
+                        float v0 = vq[j], v1 = vq[j + pair_off];
+                        vq[j]            = v0 * cos_tab[j] - v1 * sin_tab[j];
+                        vq[j + pair_off] = v0 * sin_tab[j] + v1 * cos_tab[j];
                     }
                 }
-                if (layer->attn_v_bias.data) {
-                    if (layer->attn_v_bias.type == GGML_TYPE_F32) {
-                        float *vb = (float *)layer->attn_v_bias.data;
-                        for (int i = 0; i < kv_dim; i++) m->v[i] += vb[i];
-                    } else {
-                        tf_dequant_row(&layer->attn_v_bias, 0, m->matvec_tmp);
-                        for (int i = 0; i < kv_dim; i++) m->v[i] += m->matvec_tmp[i];
+
+                /* K/V-side: qknorm(K) -> bias(K) -> bias(V) -> RoPE(K) -> KV cache */
+                for (int hi = 0; hi < kvhc; hi++) {
+                    int h = kvhs + hi;
+                    float *vk = m->k + h * head_dim;
+                    float *vv = m->v + h * head_dim;
+                    if (do_knorm) {
+                        float ss = 0.0f;
+                        for (int i = 0; i < head_dim; i++) ss += vk[i] * vk[i];
+                        ss = 1.0f / sqrtf(ss / head_dim + m->rms_norm_eps);
+                        for (int i = 0; i < head_dim; i++) vk[i] = vk[i] * ss * knw_buf[i];
                     }
+                    if (layer->attn_k_bias.data) {
+                        float *kb = (float *)layer->attn_k_bias.data + h * head_dim;
+                        for (int i = 0; i < head_dim; i++) vk[i] += kb[i];
+                    }
+                    if (layer->attn_v_bias.data) {
+                        float *vb = (float *)layer->attn_v_bias.data + h * head_dim;
+                        for (int i = 0; i < head_dim; i++) vv[i] += vb[i];
+                    }
+                    for (int j = 0; j < rope_pairs; j++) {
+                        float v0 = vk[j], v1 = vk[j + pair_off];
+                        vk[j]            = v0 * cos_tab[j] - v1 * sin_tab[j];
+                        vk[j + pair_off] = v0 * sin_tab[j] + v1 * cos_tab[j];
+                    }
+                    memcpy(m->key_cache[l]   + position * kv_dim + h * head_dim, vk,
+                           head_dim * sizeof(float));
+                    memcpy(m->value_cache[l] + position * kv_dim + h * head_dim, vv,
+                           head_dim * sizeof(float));
                 }
-                tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
-                memcpy(m->key_cache[l] + position * kv_dim, m->k, kv_dim * sizeof(float));
-                memcpy(m->value_cache[l] + position * kv_dim, m->v, kv_dim * sizeof(float));
             }
             PW_MARK(serial);
             tf_spin_barrier(m, &local_sense, nt);  /* B3: Q/K ready for attention */
