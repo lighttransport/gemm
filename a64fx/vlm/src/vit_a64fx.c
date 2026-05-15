@@ -719,6 +719,30 @@ static void add_bias_mt(vlm_pool *pool, float *Y, const float *bias,
     vlm_parallel_for(pool, n_tokens, 1, bias_body, &a);
 }
 
+/* Parallel residual: dst[i] += src[i] over the full n elements. Each layer
+ * runs this twice (post-attn-out and post-ffn-down) on n_patches*dim. The
+ * serial version was hidden in the LN stage timing but at ~0.3 ms each ×
+ * 48 invocations it amounts to ~14 ms per encode on 48T fp32. */
+typedef struct {
+    float       *dst;
+    const float *src;
+} resadd_args;
+
+static void resadd_body(int tid, int i0, int i1, void *arg) {
+    (void)tid;
+    resadd_args *a = (resadd_args *)arg;
+    float *d = a->dst;
+    const float *s = a->src;
+    /* compiler vectorises the inner; chunks of 1024 keep cache lines hot. */
+    for (size_t i = (size_t)i0; i < (size_t)i1; i++) d[i] += s[i];
+}
+
+static void resadd_mt(vlm_pool *pool, float *dst, const float *src, size_t n) {
+    if (n == 0) return;
+    resadd_args a = { dst, src };
+    vlm_parallel_for(pool, (int)n, 1024, resadd_body, &a);
+}
+
 /* GEMM driver:  Y[n_tokens, n_out] = X[n_tokens, n_in] @ W^T[n_in, n_out] + bias[n_out]
  *
  * Inputs:
@@ -2038,8 +2062,8 @@ float *vit_a64fx_encode(struct vision_model *vm,
         st_tick(&st, ST_AOUT);
         dump2(dump, "attn_out", l, n_patches, dim, hidden2);
 
-        /* Residual */
-        for (size_t i = 0; i < (size_t)n_patches * dim; i++) hidden[i] += hidden2[i];
+        /* Residual (parallel — streams 6 MB R+W across 48 cores) */
+        resadd_mt(pool, hidden, hidden2, (size_t)n_patches * dim);
 
         /* LN2 */
         if (bc) {
@@ -2087,8 +2111,8 @@ float *vit_a64fx_encode(struct vision_model *vm,
         st_tick(&st, ST_FFN_DN);
         dump2(dump, "ffn_down", l, n_patches, dim, hidden2);
 
-        /* Residual */
-        for (size_t i = 0; i < (size_t)n_patches * dim; i++) hidden[i] += hidden2[i];
+        /* Residual (parallel) */
+        resadd_mt(pool, hidden, hidden2, (size_t)n_patches * dim);
         dump2(dump, "block_out", l, n_patches, dim, hidden);
 
         /* DeepStack (if this layer is a deepstack source) */
