@@ -743,6 +743,47 @@ static void resadd_mt(vlm_pool *pool, float *dst, const float *src, size_t n) {
     vlm_parallel_for(pool, (int)n, 1024, resadd_body, &a);
 }
 
+/* Parallel spatial-merge for deepstack: concatenates sm*sm patch rows from
+ * hidden[gh*gw, dim] into merge_buf[mgh*mgw, sm*sm*dim] tokens. The serial
+ * version did 96 * 4 = 384 memcpys of 4 KB on one thread (~0.6 ms per ds
+ * × 3 ds = 1.8 ms wasted). */
+typedef struct {
+    float       *merge_buf;
+    const float *hidden;
+    int          mgw, mgh, sm, gw, dim;
+} smerge_args;
+
+static void smerge_body(int tid, int i0, int i1, void *arg) {
+    (void)tid;
+    smerge_args *a = (smerge_args *)arg;
+    int mgw = a->mgw, sm = a->sm, gw = a->gw, dim = a->dim;
+    size_t merged_dim = (size_t)sm * sm * dim;
+    for (int idx = i0; idx < i1; idx++) {
+        int my = idx / mgw;
+        int mx = idx - my * mgw;
+        float *dst = a->merge_buf + (size_t)idx * merged_dim;
+        int di = 0;
+        for (int sy = 0; sy < sm; sy++) {
+            for (int sx = 0; sx < sm; sx++) {
+                int py = my * sm + sy;
+                int px = mx * sm + sx;
+                const float *src = a->hidden + (size_t)(py * gw + px) * dim;
+                memcpy(dst + di, src, (size_t)dim * sizeof(float));
+                di += dim;
+            }
+        }
+    }
+}
+
+static void spatial_merge_mt(vlm_pool *pool, float *merge_buf,
+                             const float *hidden,
+                             int mgw, int mgh, int sm, int gw, int dim) {
+    int n_merged = mgw * mgh;
+    if (n_merged <= 0) return;
+    smerge_args a = { merge_buf, hidden, mgw, mgh, sm, gw, dim };
+    vlm_parallel_for(pool, n_merged, 1, smerge_body, &a);
+}
+
 /* GEMM driver:  Y[n_tokens, n_out] = X[n_tokens, n_in] @ W^T[n_in, n_out] + bias[n_out]
  *
  * Inputs:
@@ -2122,22 +2163,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
             deepstack_cache *dc = cache ? &cache->deepstack[ds] : NULL;
 
             int mgw = gw / sm, mgh = gh / sm;
-            /* spatial merge into merge_buf */
-            for (int my = 0; my < mgh; my++) {
-                for (int mx = 0; mx < mgw; mx++) {
-                    float *dst = merge_buf + (size_t)(my * mgw + mx) * merged_dim;
-                    int di = 0;
-                    for (int sy = 0; sy < sm; sy++) {
-                        for (int sx = 0; sx < sm; sx++) {
-                            int py2 = my * sm + sy;
-                            int px2 = mx * sm + sx;
-                            const float *src = hidden + (size_t)(py2 * gw + px2) * dim;
-                            memcpy(dst + di, src, dim * sizeof(float));
-                            di += dim;
-                        }
-                    }
-                }
-            }
+            spatial_merge_mt(pool, merge_buf, hidden, mgw, mgh, sm, gw, dim);
 
             /* DS norm (in-place) */
             if (dc) {
@@ -2209,21 +2235,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
     /* ── 5. spatial merge ── */
     {
         int mgw = gw / sm, mgh = gh / sm;
-        for (int my = 0; my < mgh; my++) {
-            for (int mx = 0; mx < mgw; mx++) {
-                float *dst = merge_buf + (size_t)(my * mgw + mx) * merged_dim;
-                int di = 0;
-                for (int sy = 0; sy < sm; sy++) {
-                    for (int sx = 0; sx < sm; sx++) {
-                        int py2 = my * sm + sy;
-                        int px2 = mx * sm + sx;
-                        const float *src = hidden + (size_t)(py2 * gw + px2) * dim;
-                        memcpy(dst + di, src, dim * sizeof(float));
-                        di += dim;
-                    }
-                }
-            }
-        }
+        spatial_merge_mt(pool, merge_buf, hidden, mgw, mgh, sm, gw, dim);
     }
     dump2(dump, "merge", -1, n_merged, merged_dim, merge_buf);
 
