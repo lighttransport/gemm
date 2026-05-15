@@ -80,6 +80,68 @@ per-token. To move that needle we need:
 2. A per-layer hybrid dispatcher: SSM layers stay per-token (state recurrence),
    attention + FFN layers use the batched path.
 
+## Update (2026-05-16) — B2 Phase 1+2: hybrid-SSM dispatcher
+
+Two pieces of the hybrid SSM unblock work landed.
+
+**Phase 1 — per-row fallback dispatcher**. The per-token layer body in
+`hip_llm_forward_blocks` was factored into a `forward_one_layer(r, l)` helper
+that operates on whatever `r->d_x` points at. The batched prefill dispatcher
+now allows hybrid models in (drops the `!r->is_hybrid` gate) and, for any
+layer whose weight types lack a batched dequant kernel or whose `is_ssm`
+flag is set, runs:
+
+```c
+for (int m = 0; m < M; m++) {
+    r->d_x = (char *)r->d_x_batch + m * n_embd * sizeof(float);
+    /* set r->d_position to position_start + m */
+    forward_one_layer(r, l);
+}
+```
+
+This is functionally equivalent to the old per-token fallback, just scoped
+to a layer instead of an entire forward pass. Verified: 27B IQ3_XXS argmax
+identical between full-per-token and per-row-via-batched-dispatcher.
+
+**Phase 2 — gated-attention batched path**. New kernel
+`deinterleave_qgate_batch_f32` (one launch over M rows, replaces the per-token
+deinterleave). New buffers `d_qfull_batch` (holds the 2×q_dim Q output before
+deinterleave) and `d_attn_gate_batch` (holds the gate after split, fed into
+`sigmoid_mul` over the M×q_dim attn output). Gated-attn layers in the layer
+loop detect themselves via `attn_q_rows == 2 * q_dim` and route Q output to
+`d_qfull_batch`, deinterleave, run standard K/V/RoPE/attn, then sigmoid-mul
+before the output projection.
+
+**Per-layer dispatch helper** `layer_is_batched_eligible(cl)` checks all 7
+attn+FFN weight types against `batch_qtype_ok` (F16 / Q4_K / Q5_K / Q6_K /
+IQ3_XXS today). Layers with unsupported quants get per-row fallback.
+
+Measured:
+
+| model | shape | dispatch | prefill | observation |
+|-------|-------|----------|---------|-------------|
+| Qwen3-VL-2B F16 | 28 std-attn | 28 batched / 0 SSM / 0 per-row | 27.3 ms / 256 = 0.107 ms/tok | unchanged from Track A |
+| Qwen3-VL-Embedding-8B Q4_K_M | 36 std-attn | 36 batched / 0 SSM / 0 per-row | 133 ms / 128 = 1.04 ms/tok | unchanged from B1 |
+| Qwen3.5-9B Q4_K_XL hybrid | 8 gated-attn + 24 SSM | 8 batched-gated / 24 SSM / 0 per-row | 2798 ms / 64 = 43.7 ms/tok | gated-attn batching engages; SSM per-row dominates |
+| Qwen3.6-27B IQ3_XXS hybrid | 16 gated-attn + 48 SSM | 0 batched / 48 SSM / 16 per-row (unsupported quant) | 3979 ms / 64 = 62.1 ms/tok | unchanged — attn layers use IQ2_S/IQ3_S/IQ2_XS/IQ4_XS which lack dequant kernels |
+
+**Honest framing of the result**: on the Qwen3.5-9B-Q4_K_XL model where the
+gated-attn batched path actually engages, per-token cost is essentially
+unchanged (~44 ms/tok prefill vs ~44 ms/tok decode), because the SSM layers
+running per-row dominate the per-token cost. **Phase 2 alone does not deliver
+a useful speedup on hybrid models** — Phase 3 (batched SSM projections) is
+the actually-meaningful unblock for hybrid-SSM perf.
+
+For 27B specifically, no layer batches yet because every gated-attn layer
+contains at least one IQ2_S / IQ3_S / IQ2_XS / IQ4_XS weight (the "UD"
+unsloth-dynamic mixed-quant model uses many IQ types). Adding those four
+dequant kernels would let 27B reach the 9B's "framework works but SSM
+dominates" state — still no big win without Phase 3.
+
+Environment variables (new): `LLM_DEBUG_DISPATCH=1` prints a one-shot
+per-layer dispatch summary (batched / SSM / per-row-quant counts + each
+layer's 7 weight type IDs) for debugging.
+
 ## Update (2026-05-15) — IQ3_XXS dequant kernel landed (scaffolding)
 
 Added `dequant_iq3_xxs_to_bf16` to the per-call-dequant family. It reuses the
