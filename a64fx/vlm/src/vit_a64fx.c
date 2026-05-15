@@ -1463,18 +1463,25 @@ static void attention_mt(vlm_pool *pool,
                             n_patches, dim, head_dim, n_heads };
     vlm_parallel_for(pool, n_heads, 1, qkv_extract_body, &ex);
 
-    /* 2) Per-(head, q-tile) attention. */
+    /* 2) Per-(head, q-tile) attention.
+     *
+     * Aim for n_heads × n_qtiles ≈ 8 × nthr work units so static schedule
+     * load-balances across threads (with 16 heads + 12 threads and the old
+     * "tile only if n_heads<nthr" rule, work units were 16 — 4 threads got
+     * 2 units and 8 got 1, a 2× imbalance per layer × 24 layers showed up
+     * as ~40% of total runtime in __kmp_fork_barrier waits).
+     *
+     * q_tile is capped at 32 so the per-thread att scratch (q_tile*np*4)
+     * stays inside the 64 KB L1, and rounded to a multiple of 8 for the
+     * 8q vertical kernel. */
     int nthr = vlm_pool_size(pool);
-    int q_tile = n_patches;
-    if (n_heads < nthr) {
-        int want = (nthr + n_heads - 1) / n_heads;          /* tiles needed */
-        q_tile = (n_patches + want - 1) / want;
-        if (q_tile > 64) q_tile = 64;
-        if (q_tile < 1)  q_tile = 1;
-    }
-    /* Round q_tile up to a multiple of 8 so the inner 8q kernel covers it
-     * cleanly (Q-tail loop only runs at the very end of np). */
+    int target_units = 8 * nthr;
+    int min_qtiles = (target_units + n_heads - 1) / n_heads;
+    if (min_qtiles < 1) min_qtiles = 1;
+    int q_tile = (n_patches + min_qtiles - 1) / min_qtiles;
+    if (q_tile > 32) q_tile = 32;
     if (q_tile > 8) q_tile = (q_tile / 8) * 8;
+    if (q_tile < 8) q_tile = 8;
     int n_qtiles = (n_patches + q_tile - 1) / q_tile;
     attn_args a = { Q_hm, KT_hm, V_hm, attn_out, n_patches, dim, head_dim,
                     n_heads, scale, q_tile, n_qtiles, pool };
@@ -1592,6 +1599,75 @@ static void patch_embed_gemm_mt(vlm_pool *pool,
 }
 
 /* ───────────────────────── M-RoPE ───────────────────────── */
+
+typedef struct {
+    float       *qkv;
+    int          n_patches;
+    int          n_heads;
+    int          head_dim;
+    int          dim;
+    const float *rope_cos;
+    const float *rope_sin;
+} mrope_args;
+
+/* SVE-vectorised M-RoPE: rotates each (q,k) pair within a head_dim using
+ * cos/sin pulled from the even lanes of rope_cos/rope_sin. The original
+ * scalar version was a serial bottleneck — at 48T with OMP_WAIT_POLICY=
+ * active it ballooned to ~30 ms because the 47 spinning threads contended
+ * on the memory subsystem during the serial section. We now parallelise
+ * over (patch, head) pairs and use SVE for the half-of-head_dim inner. */
+static void mrope_body(int tid, int w0, int w1, void *arg) {
+    (void)tid;
+    mrope_args *a = (mrope_args *)arg;
+    int n_heads = a->n_heads;
+    int half = a->head_dim / 2;
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    for (int w = w0; w < w1; w++) {
+        int p = w / n_heads;
+        int h = w % n_heads;
+        const float *rc_base = a->rope_cos + (size_t)p * a->head_dim;
+        const float *rs_base = a->rope_sin + (size_t)p * a->head_dim;
+        float *qh = a->qkv + (size_t)p * 3 * a->dim + h * a->head_dim;
+        float *kh = qh + a->dim;
+        int i = 0;
+        int iv = half - (half % VL);
+        for (; i < iv; i += VL) {
+            /* cos/sin live at even indices 2*i .. 2*(i+VL-1) of rope_*[p];
+             * gather them via LD2W which deinterleaves consecutive pairs. */
+            svfloat32x2_t cs_c = svld2_f32(pg, rc_base + 2 * i);
+            svfloat32x2_t cs_s = svld2_f32(pg, rs_base + 2 * i);
+            svfloat32_t ct = svget2_f32(cs_c, 0);
+            svfloat32_t st = svget2_f32(cs_s, 0);
+            svfloat32_t q0 = svld1_f32(pg, qh + i);
+            svfloat32_t q1 = svld1_f32(pg, qh + i + half);
+            svfloat32_t k0 = svld1_f32(pg, kh + i);
+            svfloat32_t k1 = svld1_f32(pg, kh + i + half);
+            svst1_f32(pg, qh + i,        svmls_f32_x(pg, svmul_f32_x(pg, q0, ct), q1, st));
+            svst1_f32(pg, qh + i + half, svmla_f32_x(pg, svmul_f32_x(pg, q0, st), q1, ct));
+            svst1_f32(pg, kh + i,        svmls_f32_x(pg, svmul_f32_x(pg, k0, ct), k1, st));
+            svst1_f32(pg, kh + i + half, svmla_f32_x(pg, svmul_f32_x(pg, k0, st), k1, ct));
+        }
+        for (; i < half; i++) {
+            float ct = rc_base[2 * i];
+            float st = rs_base[2 * i];
+            float q0 = qh[i], q1 = qh[i + half];
+            qh[i]        = q0 * ct - q1 * st;
+            qh[i + half] = q0 * st + q1 * ct;
+            float k0 = kh[i], k1 = kh[i + half];
+            kh[i]        = k0 * ct - k1 * st;
+            kh[i + half] = k0 * st + k1 * ct;
+        }
+    }
+}
+
+static void mrope_apply_mt(vlm_pool *pool,
+                           float *qkv, int n_patches, int n_heads, int head_dim,
+                           int dim, const float *rope_cos, const float *rope_sin)
+{
+    mrope_args a = { qkv, n_patches, n_heads, head_dim, dim, rope_cos, rope_sin };
+    vlm_parallel_for(pool, n_patches * n_heads, 1, mrope_body, &a);
+}
 
 static void mrope_apply(float *qkv, int n_patches, int n_heads, int head_dim,
                         int dim, const float *rope_cos, const float *rope_sin)
@@ -1879,7 +1955,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
         dump2(dump, "qkv", l, n_patches, 3 * dim, qkv);
 
         /* M-RoPE on Q, K (not V) */
-        mrope_apply(qkv, n_patches, n_heads, head_dim, dim, rope_cos, rope_sin);
+        mrope_apply_mt(pool, qkv, n_patches, n_heads, head_dim, dim, rope_cos, rope_sin);
         st_tick(&st, ST_ROPE);
         dump2(dump, "mrope", l, n_patches, 3 * dim, qkv);
 
