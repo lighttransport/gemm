@@ -637,6 +637,68 @@ static int test_text_enc(const char *enc_path, const char *tok_path,
     return 0;
 }
 
+static int test_text_enc_gpu_repeat(const char *enc_path, const char *tok_path,
+                                    const char *prompt, int device_id) {
+    fprintf(stderr, "=== Flux.2 Klein GPU Text Encoder Repeat Test ===\n");
+    fprintf(stderr, "Prompt: '%s'\n", prompt);
+
+    int n_tok_a = 0, n_tok_b = 0, n_embd = 0;
+    struct timespec t0, t1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    flux2_text_enc *a = flux2_text_enc_load_gpu(enc_path, tok_path, device_id);
+    if (!a) return 1;
+    n_embd = a->n_embd;
+    float *hidden_a = flux2_text_enc_encode(a, prompt, &n_tok_a);
+    flux2_text_enc_free(a);
+    if (!hidden_a) return 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "GPU text enc A: %.2f s (%d tokens x %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_a, n_embd);
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    flux2_text_enc *b = flux2_text_enc_load_gpu(enc_path, tok_path, device_id);
+    if (!b) { free(hidden_a); return 1; }
+    if (b->n_embd != n_embd) {
+        fprintf(stderr, "Embedding dim mismatch: A=%d B=%d\n", n_embd, b->n_embd);
+        flux2_text_enc_free(b);
+        free(hidden_a);
+        return 1;
+    }
+    float *hidden_b = flux2_text_enc_encode(b, prompt, &n_tok_b);
+    flux2_text_enc_free(b);
+    if (!hidden_b) { free(hidden_a); return 1; }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "GPU text enc B: %.2f s (%d tokens x %d)\n",
+            (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9, n_tok_b, n_embd);
+
+    if (n_tok_a != n_tok_b) {
+        fprintf(stderr, "Token count mismatch: A=%d B=%d\n", n_tok_a, n_tok_b);
+        free(hidden_a);
+        free(hidden_b);
+        return 1;
+    }
+
+    size_t total = (size_t)n_tok_a * n_embd;
+    float max_diff = 0.0f;
+    size_t max_idx = 0;
+    for (size_t i = 0; i < total; i++) {
+        float d = fabsf(hidden_a[i] - hidden_b[i]);
+        if (d > max_diff) {
+            max_diff = d;
+            max_idx = i;
+        }
+    }
+    fprintf(stderr, "GPU repeat max_diff=%.9f at idx=%zu\n", max_diff, max_idx);
+    for (int i = 0; i < 6 && i < n_embd; i++) {
+        fprintf(stderr, "  tok0[%d] A=%.6f B=%.6f\n", i, hidden_a[i], hidden_b[i]);
+    }
+
+    free(hidden_a);
+    free(hidden_b);
+    return (max_diff <= 1.0e-6f) ? 0 : 1;
+}
+
 static int run_generate_once(cuda_flux2_runner *r,
                          const char *prompt,
                          const float *txt_hidden, int n_txt, int enc_embd,
@@ -949,6 +1011,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-dit")  == 0) mode = "dit";
         else if (strcmp(argv[i], "--test-vae")  == 0) mode = "vae";
         else if (strcmp(argv[i], "--test-text-enc") == 0) mode = "text";
+        else if (strcmp(argv[i], "--test-text-gpu") == 0) mode = "text_gpu";
         else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
         else if (strcmp(argv[i], "--generate")  == 0) mode = "gen";
         else if (strcmp(argv[i], "--base")       == 0) { is_distilled = 0; n_steps = 20; }
@@ -986,7 +1049,7 @@ int main(int argc, char **argv) {
 
     if (!mode) {
         fprintf(stderr,
-            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--test-kernels|--generate]\n"
+            "Usage: %s [--test-init|--test-load|--test-dit|--test-vae|--test-text-enc|--test-text-gpu|--test-kernels|--generate]\n"
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
@@ -1005,6 +1068,7 @@ int main(int argc, char **argv) {
                                                    repeat, no_cpu_ref);
     if (strcmp(mode, "vae")  == 0) return test_vae(vae_path, out_h/8, out_w/8);
     if (strcmp(mode, "text") == 0) return test_text_enc(enc_path, tok_path, prompt, device_id);
+    if (strcmp(mode, "text_gpu") == 0) return test_text_enc_gpu_repeat(enc_path, tok_path, prompt, device_id);
     if (strcmp(mode, "gen")  == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,

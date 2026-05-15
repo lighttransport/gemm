@@ -1035,6 +1035,48 @@ typedef struct {
     CUdeviceptr txt_mlp_fc1_w, txt_mlp_fc1_b, txt_mlp_fc2_w, txt_mlp_fc2_b;
 } qimg_block_gpu;
 
+typedef enum {
+    QIMG_CFG_BUF_IMG_C = 0,
+    QIMG_CFG_BUF_IMG_U,
+    QIMG_CFG_BUF_TXT_C,
+    QIMG_CFG_BUF_TXT_U,
+    QIMG_CFG_BUF_IMG_IN,
+    QIMG_CFG_BUF_TXT_IN_C,
+    QIMG_CFG_BUF_TXT_IN_U,
+    QIMG_CFG_BUF_T_EMB,
+    QIMG_CFG_BUF_T_SIN,
+    QIMG_CFG_BUF_T_EMB2,
+    QIMG_CFG_BUF_SCRATCH1_C,
+    QIMG_CFG_BUF_SCRATCH2_C,
+    QIMG_CFG_BUF_SCRATCH3_C,
+    QIMG_CFG_BUF_SCRATCH1_U,
+    QIMG_CFG_BUF_SCRATCH2_U,
+    QIMG_CFG_BUF_SCRATCH3_U,
+    QIMG_CFG_BUF_Q_C,
+    QIMG_CFG_BUF_K_C,
+    QIMG_CFG_BUF_V_C,
+    QIMG_CFG_BUF_ATTN_OUT_C,
+    QIMG_CFG_BUF_Q_U,
+    QIMG_CFG_BUF_K_U,
+    QIMG_CFG_BUF_V_U,
+    QIMG_CFG_BUF_ATTN_OUT_U,
+    QIMG_CFG_BUF_IMG_MLP_IN,
+    QIMG_CFG_BUF_IMG_MLP_H,
+    QIMG_CFG_BUF_IMG_MLP_OUT,
+    QIMG_CFG_BUF_T_SILU,
+    QIMG_CFG_BUF_IMG_MOD,
+    QIMG_CFG_BUF_TXT_MOD,
+    QIMG_CFG_BUF_FINAL_T_SILU,
+    QIMG_CFG_BUF_FINAL_MOD,
+    QIMG_CFG_BUF_FINAL_OUT,
+    QIMG_CFG_BUF_COUNT
+} qimg_cfg_buf_id;
+
+typedef struct {
+    CUdeviceptr ptr[QIMG_CFG_BUF_COUNT];
+    size_t cap[QIMG_CFG_BUF_COUNT];
+} qimg_cfg_cache;
+
 
 /* ---- Runner struct ---- */
 
@@ -1186,6 +1228,10 @@ struct cuda_qimg_runner {
     CUevent     block_barrier_unc;   /* uncond-done barrier */
     CUevent     mod_ready;           /* modulation computed (both streams wait on this) */
 
+    /* Main CFG DiT activation cache. These buffers are reused across denoise
+     * steps and grown on demand for larger resolutions/text lengths. */
+    qimg_cfg_cache cfg_cache;
+
     /* Persistent GPU: global weights (~50MB) */
     CUdeviceptr d_img_in_w, d_img_in_b;
     CUdeviceptr d_txt_in_w, d_txt_in_b;
@@ -1314,6 +1360,39 @@ static CUdeviceptr checked_cuMemAlloc(size_t nbytes) {
         return 0;
     }
     return d;
+}
+
+static void qimg_cfg_cache_free(cuda_qimg_runner *r) {
+    if (!r) return;
+    for (int i = 0; i < QIMG_CFG_BUF_COUNT; i++) {
+        if (r->cfg_cache.ptr[i]) {
+            cuMemFree(r->cfg_cache.ptr[i]);
+            r->cfg_cache.ptr[i] = 0;
+        }
+        r->cfg_cache.cap[i] = 0;
+    }
+}
+
+static size_t qimg_cfg_cache_growth(cuda_qimg_runner *r, qimg_cfg_buf_id id, size_t bytes) {
+    return bytes > r->cfg_cache.cap[id] ? bytes - r->cfg_cache.cap[id] : 0;
+}
+
+static int qimg_cfg_cache_ensure(cuda_qimg_runner *r, qimg_cfg_buf_id id,
+                                 size_t bytes, const char *label) {
+    if (bytes == 0) return 0;
+    if (r->cfg_cache.ptr[id] && r->cfg_cache.cap[id] >= bytes) return 0;
+    if (r->cfg_cache.ptr[id]) {
+        cuMemFree(r->cfg_cache.ptr[id]);
+        r->cfg_cache.ptr[id] = 0;
+        r->cfg_cache.cap[id] = 0;
+    }
+    r->cfg_cache.ptr[id] = checked_cuMemAlloc(bytes);
+    if (!r->cfg_cache.ptr[id]) {
+        fprintf(stderr, "cuda_qimg(cfg): cached allocation failed for %s\n", label);
+        return -1;
+    }
+    r->cfg_cache.cap[id] = bytes;
+    return 0;
 }
 
 /* Upload safetensor as F32 (for biases, norms) */
@@ -3152,6 +3231,7 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
     /* Per-row FP8 MMA scale buffer */
     if (r->d_row_max_buf) cuMemFree(r->d_row_max_buf);
+    qimg_cfg_cache_free(r);
     if (r->dit_pinned_pools) {
         for (int b = 0; b < r->dit_n_blocks; b++) {
             if (r->dit_pinned_pools[b]) cuMemFreeHost(r->dit_pinned_pools[b]);
@@ -3817,6 +3897,7 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     int n_total_cond   = n_img + n_txt_cond;
     int n_total_uncond = n_img + n_txt_uncond;
     int n_total_max = n_total_cond > n_total_uncond ? n_total_cond : n_total_uncond;
+    int n_txt_max = n_txt_cond > n_txt_uncond ? n_txt_cond : n_txt_uncond;
     CUstream s = r->stream;
 
     /* Evict preloaded DiT blocks if the transient activation working set
@@ -3828,22 +3909,41 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         size_t dim_b  = (size_t)dim   * sizeof(float);
         size_t mlp_b  = (size_t)mlp_h * sizeof(float);
         size_t need = 0;
-        need += (size_t)n_img          * dim_b * 2;                          /* d_img_c,u */
-        need += (size_t)(n_txt_cond + n_txt_uncond) * dim_b;                 /* d_txt_c,u */
-        need += (size_t)n_img          * in_ch * sizeof(float);              /* d_img_in */
-        need += (size_t)(n_txt_cond + n_txt_uncond) * txt_dim * sizeof(float);
-        need += (size_t)n_img          * dim_b;                              /* d_scratch1_c */
-        need += (size_t)n_txt_cond     * dim_b;                              /* d_scratch2_c */
-        need += (size_t)n_txt_cond     * mlp_b;                              /* d_scratch3_c */
-        need += (size_t)n_img          * dim_b;                              /* d_scratch1_u */
-        need += (size_t)n_txt_uncond   * dim_b;                              /* d_scratch2_u */
-        need += (size_t)n_txt_uncond   * mlp_b;                              /* d_scratch3_u */
-        need += (size_t)n_total_cond   * dim_b * 4;                          /* d_q/k/v/attn_out cond */
-        need += (size_t)n_total_uncond * dim_b * 4;                          /* d_q/k/v/attn_out uncond */
-        need += (size_t)2 * n_img * dim_b;                                   /* d_img_mlp_in */
-        need += (size_t)2 * n_img * mlp_b;                                   /* d_img_mlp_h */
-        need += (size_t)2 * n_img * dim_b;                                   /* d_img_mlp_out */
-        need += 32 * sizeof(float) * 6;  /* modulation buffers, misc */
+        #define CFG_GROW(id, bytes) qimg_cfg_cache_growth(r, (id), (bytes))
+        need += CFG_GROW(QIMG_CFG_BUF_IMG_C,       (size_t)n_img * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_IMG_U,       (size_t)n_img * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_TXT_C,       (size_t)n_txt_cond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_TXT_U,       (size_t)n_txt_uncond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_IMG_IN,      (size_t)n_img * in_ch * sizeof(float));
+        need += CFG_GROW(QIMG_CFG_BUF_TXT_IN_C,    (size_t)n_txt_cond * txt_dim * sizeof(float));
+        need += CFG_GROW(QIMG_CFG_BUF_TXT_IN_U,    (size_t)n_txt_uncond * txt_dim * sizeof(float));
+        need += CFG_GROW(QIMG_CFG_BUF_T_EMB,       dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_T_SIN,       256 * sizeof(float));
+        need += CFG_GROW(QIMG_CFG_BUF_T_EMB2,      dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_SCRATCH1_C,  (size_t)n_img * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_SCRATCH2_C,  (size_t)n_txt_max * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_SCRATCH3_C,  (size_t)n_txt_max * mlp_b);
+        need += CFG_GROW(QIMG_CFG_BUF_SCRATCH1_U,  (size_t)n_img * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_SCRATCH2_U,  (size_t)n_txt_max * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_SCRATCH3_U,  (size_t)n_txt_max * mlp_b);
+        need += CFG_GROW(QIMG_CFG_BUF_Q_C,         (size_t)n_total_cond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_K_C,         (size_t)n_total_cond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_V_C,         (size_t)n_total_cond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_ATTN_OUT_C,  (size_t)n_total_cond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_Q_U,         (size_t)n_total_uncond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_K_U,         (size_t)n_total_uncond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_V_U,         (size_t)n_total_uncond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_ATTN_OUT_U,  (size_t)n_total_uncond * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_IMG_MLP_IN,  (size_t)2 * n_img * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_IMG_MLP_H,   (size_t)2 * n_img * mlp_b);
+        need += CFG_GROW(QIMG_CFG_BUF_IMG_MLP_OUT, (size_t)2 * n_img * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_T_SILU,      dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_IMG_MOD,     (size_t)6 * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_TXT_MOD,     (size_t)6 * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_FINAL_T_SILU, dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_FINAL_MOD,   (size_t)2 * dim_b);
+        need += CFG_GROW(QIMG_CFG_BUF_FINAL_OUT,   (size_t)n_img * in_ch * sizeof(float));
+        #undef CFG_GROW
         /* Safety margin of 256 MB. Empirically, when free VRAM after the
          * working-set alloc drops below ~100 MB the CUDA driver starts
          * doing heavy per-launch bookkeeping (~7x per-kernel slowdown on
@@ -3867,77 +3967,73 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     CUdeviceptr d_img_mlp_in = 0, d_img_mlp_h = 0, d_img_mlp_out = 0;
     CUdeviceptr d_t_silu = 0, d_img_mod = 0, d_txt_mod = 0;
     CUdeviceptr d_final_t_silu = 0, d_final_mod = 0, d_final_out = 0;
-#define QIMG_ALLOC_OR_CLEANUP(ptr, nbytes, label) do { \
-        (ptr) = checked_cuMemAlloc((nbytes)); \
-        if (!(ptr)) { \
-            fprintf(stderr, "cuda_qimg(cfg): allocation failed for %s\n", (label)); \
-            goto cleanup; \
-        } \
+#define QIMG_CFG_CACHE_OR_CLEANUP(id, dst, nbytes, label) do { \
+        if (qimg_cfg_cache_ensure(r, (id), (nbytes), (label)) != 0) goto cleanup; \
+        (dst) = r->cfg_cache.ptr[(id)]; \
     } while (0)
 
     /* Allocate paired img/txt buffers. Both passes share the same img_tokens
      * at input (same noise) but the hidden states diverge after block 0 so
      * we need two independent d_img buffers. */
-    QIMG_ALLOC_OR_CLEANUP(d_img_c, (size_t)n_img * dim * sizeof(float), "d_img_c");
-    QIMG_ALLOC_OR_CLEANUP(d_img_u, (size_t)n_img * dim * sizeof(float), "d_img_u");
-    QIMG_ALLOC_OR_CLEANUP(d_txt_c, (size_t)n_txt_cond   * dim * sizeof(float), "d_txt_c");
-    QIMG_ALLOC_OR_CLEANUP(d_txt_u, (size_t)n_txt_uncond * dim * sizeof(float), "d_txt_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_C, d_img_c, (size_t)n_img * dim * sizeof(float), "d_img_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_U, d_img_u, (size_t)n_img * dim * sizeof(float), "d_img_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_TXT_C, d_txt_c, (size_t)n_txt_cond   * dim * sizeof(float), "d_txt_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_TXT_U, d_txt_u, (size_t)n_txt_uncond * dim * sizeof(float), "d_txt_u");
 
     /* Upload img (used twice) + both txt conditionings. */
-    QIMG_ALLOC_OR_CLEANUP(d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_IN, d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in");
     cuMemcpyHtoD(d_img_in, img_tokens, (size_t)n_img * in_ch * sizeof(float));
-    QIMG_ALLOC_OR_CLEANUP(d_txt_in_c, (size_t)n_txt_cond   * txt_dim * sizeof(float), "d_txt_in_c");
-    QIMG_ALLOC_OR_CLEANUP(d_txt_in_u, (size_t)n_txt_uncond * txt_dim * sizeof(float), "d_txt_in_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_TXT_IN_C, d_txt_in_c, (size_t)n_txt_cond   * txt_dim * sizeof(float), "d_txt_in_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_TXT_IN_U, d_txt_in_u, (size_t)n_txt_uncond * txt_dim * sizeof(float), "d_txt_in_u");
     cuMemcpyHtoD(d_txt_in_c, txt_cond,   (size_t)n_txt_cond   * txt_dim * sizeof(float));
     cuMemcpyHtoD(d_txt_in_u, txt_uncond, (size_t)n_txt_uncond * txt_dim * sizeof(float));
 
     /* Timestep embedding — same for cond/uncond */
-    QIMG_ALLOC_OR_CLEANUP(d_t_emb, (size_t)dim * sizeof(float), "d_t_emb");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_T_EMB, d_t_emb, (size_t)dim * sizeof(float), "d_t_emb");
 
     /* Scratch buffers. scratch1 only ever holds n_img rows (img adaLN output
      * / attn_out). scratch2 only ever holds n_txt rows (text adaLN output /
      * attn_out / MLP output). scratch3 only holds the text MLP intermediate
      * of size (n_txt * mlp_h) — the img MLP now runs CFG-batched outside
      * forward_block so it no longer needs scratch3. */
-    int n_txt_max = n_txt_cond > n_txt_uncond ? n_txt_cond : n_txt_uncond;
     size_t img_scratch = (size_t)n_img     * dim   * sizeof(float);
     size_t txt_scratch = (size_t)n_txt_max * dim   * sizeof(float);
     size_t txt_ffn     = (size_t)n_txt_max * mlp_h * sizeof(float);
-    QIMG_ALLOC_OR_CLEANUP(d_scratch1_c, img_scratch, "d_scratch1_c");
-    QIMG_ALLOC_OR_CLEANUP(d_scratch2_c, txt_scratch, "d_scratch2_c");
-    QIMG_ALLOC_OR_CLEANUP(d_scratch3_c, txt_ffn, "d_scratch3_c");
-    QIMG_ALLOC_OR_CLEANUP(d_scratch1_u, img_scratch, "d_scratch1_u");
-    QIMG_ALLOC_OR_CLEANUP(d_scratch2_u, txt_scratch, "d_scratch2_u");
-    QIMG_ALLOC_OR_CLEANUP(d_scratch3_u, txt_ffn, "d_scratch3_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_SCRATCH1_C, d_scratch1_c, img_scratch, "d_scratch1_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_SCRATCH2_C, d_scratch2_c, txt_scratch, "d_scratch2_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_SCRATCH3_C, d_scratch3_c, txt_ffn, "d_scratch3_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_SCRATCH1_U, d_scratch1_u, img_scratch, "d_scratch1_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_SCRATCH2_U, d_scratch2_u, txt_scratch, "d_scratch2_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_SCRATCH3_U, d_scratch3_u, txt_ffn, "d_scratch3_u");
     (void)n_total_max;
 
     /* Joint QKV + attention scratch, sized per-pass since n_total differs. */
-    QIMG_ALLOC_OR_CLEANUP(d_q_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_q_c");
-    QIMG_ALLOC_OR_CLEANUP(d_k_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_k_c");
-    QIMG_ALLOC_OR_CLEANUP(d_v_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_v_c");
-    QIMG_ALLOC_OR_CLEANUP(d_attn_out_c, (size_t)n_total_cond   * dim * sizeof(float), "d_attn_out_c");
-    QIMG_ALLOC_OR_CLEANUP(d_q_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_q_u");
-    QIMG_ALLOC_OR_CLEANUP(d_k_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_k_u");
-    QIMG_ALLOC_OR_CLEANUP(d_v_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_v_u");
-    QIMG_ALLOC_OR_CLEANUP(d_attn_out_u, (size_t)n_total_uncond * dim * sizeof(float), "d_attn_out_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_Q_C,        d_q_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_q_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_K_C,        d_k_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_k_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_V_C,        d_v_c,        (size_t)n_total_cond   * dim * sizeof(float), "d_v_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_ATTN_OUT_C, d_attn_out_c, (size_t)n_total_cond   * dim * sizeof(float), "d_attn_out_c");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_Q_U,        d_q_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_q_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_K_U,        d_k_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_k_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_V_U,        d_v_u,        (size_t)n_total_uncond * dim * sizeof(float), "d_v_u");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_ATTN_OUT_U, d_attn_out_u, (size_t)n_total_uncond * dim * sizeof(float), "d_attn_out_u");
 
     /* CFG-batched img-MLP buffers: cond/uncond adaLN2 output is packed into
      * the first / second half of d_img_mlp_in, then one batched fc1+gelu+fc2
      * runs on 2*n_img rows, halving W traffic for the two heaviest GEMMs in
      * the block (mlp_h=14336 x dim=3072 each direction). Post-MLP gated_add
      * is then dispatched per-pass by reading from d_img_mlp_out halves. */
-    QIMG_ALLOC_OR_CLEANUP(d_img_mlp_in,  (size_t)2 * n_img * dim   * sizeof(float), "d_img_mlp_in");
-    QIMG_ALLOC_OR_CLEANUP(d_img_mlp_h,   (size_t)2 * n_img * mlp_h * sizeof(float), "d_img_mlp_h");
-    QIMG_ALLOC_OR_CLEANUP(d_img_mlp_out, (size_t)2 * n_img * dim   * sizeof(float), "d_img_mlp_out");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_MLP_IN,  d_img_mlp_in,  (size_t)2 * n_img * dim   * sizeof(float), "d_img_mlp_in");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_MLP_H,   d_img_mlp_h,   (size_t)2 * n_img * mlp_h * sizeof(float), "d_img_mlp_h");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_MLP_OUT, d_img_mlp_out, (size_t)2 * n_img * dim   * sizeof(float), "d_img_mlp_out");
     CUdeviceptr d_img_mlp_in_c  = d_img_mlp_in;
     CUdeviceptr d_img_mlp_in_u  = d_img_mlp_in  + (size_t)n_img * dim * sizeof(float);
     CUdeviceptr d_img_mlp_out_c = d_img_mlp_out;
     CUdeviceptr d_img_mlp_out_u = d_img_mlp_out + (size_t)n_img * dim * sizeof(float);
 
     /* Modulation buffers — same for cond and uncond since t_emb is shared */
-    QIMG_ALLOC_OR_CLEANUP(d_t_silu,  (size_t)dim * sizeof(float), "d_t_silu");
-    QIMG_ALLOC_OR_CLEANUP(d_img_mod, (size_t)6 * dim * sizeof(float), "d_img_mod");
-    QIMG_ALLOC_OR_CLEANUP(d_txt_mod, (size_t)6 * dim * sizeof(float), "d_txt_mod");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_T_SILU,  d_t_silu,  (size_t)dim * sizeof(float), "d_t_silu");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_MOD, d_img_mod, (size_t)6 * dim * sizeof(float), "d_img_mod");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_TXT_MOD, d_txt_mod, (size_t)6 * dim * sizeof(float), "d_txt_mod");
 
     /* ---- 1. Timestep embedding: sinusoidal(256) → SiLU(GEMM) → GEMM ---- */
     float t_sin[256];
@@ -3948,14 +4044,13 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         t_sin[i]        = cosf(angle);
         t_sin[half + i] = sinf(angle);
     }
-    QIMG_ALLOC_OR_CLEANUP(d_t_sin, 256 * sizeof(float), "d_t_sin");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_T_SIN, d_t_sin, 256 * sizeof(float), "d_t_sin");
     cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float));
     op_gemm(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
-    QIMG_ALLOC_OR_CLEANUP(d_t_emb2, (size_t)dim * sizeof(float), "d_t_emb2");
+    QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_T_EMB2, d_t_emb2, (size_t)dim * sizeof(float), "d_t_emb2");
     op_gemm(r, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
-    cuMemFree(d_t_emb); d_t_emb = d_t_emb2; d_t_emb2 = 0;
-    cuMemFree(d_t_sin); d_t_sin = 0;
+    d_t_emb = d_t_emb2;
 
     /* ---- 2. Text input: RMSNorm → Linear (both passes) ---- */
     if (r->d_txt_norm_w) {
@@ -3968,14 +4063,11 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     }
     op_gemm(r, d_txt_c, r->d_txt_in_w, d_txt_in_c, r->d_txt_in_b, dim, txt_dim, n_txt_cond);
     op_gemm(r, d_txt_u, r->d_txt_in_w, d_txt_in_u, r->d_txt_in_b, dim, txt_dim, n_txt_uncond);
-    cuMemFree(d_txt_in_c); d_txt_in_c = 0;
-    cuMemFree(d_txt_in_u); d_txt_in_u = 0;
 
     /* ---- 3. Image input (same for cond/uncond) ---- */
     op_gemm(r, d_img_c, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
     /* Copy to uncond buffer so both start identical */
     cuMemcpyDtoDAsync(d_img_u, d_img_c, (size_t)n_img * dim * sizeof(float), s);
-    cuMemFree(d_img_in); d_img_in = 0;
 
     /* Rope params (same for cond and uncond) */
     int hp_rope = (int)sqrtf((float)n_img);
@@ -4118,64 +4210,27 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         CUdeviceptr d_scratch1_p = pass ? d_scratch1_u : d_scratch1_c;
         float *out_p = pass ? out_uncond : out_cond;
 
-        QIMG_ALLOC_OR_CLEANUP(d_final_t_silu, (size_t)dim * sizeof(float), "d_final_t_silu");
+        QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_FINAL_T_SILU, d_final_t_silu, (size_t)dim * sizeof(float), "d_final_t_silu");
         cuMemcpyDtoDAsync(d_final_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_final_t_silu, dim);
-        QIMG_ALLOC_OR_CLEANUP(d_final_mod, (size_t)2 * dim * sizeof(float), "d_final_mod");
+        QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_FINAL_MOD, d_final_mod, (size_t)2 * dim * sizeof(float), "d_final_mod");
         op_gemm(r, d_final_mod, r->d_norm_out_w, d_final_t_silu, r->d_norm_out_b,
                 2 * dim, dim, 1);
-        cuMemFree(d_final_t_silu); d_final_t_silu = 0;
 
         CUdeviceptr f_scale = d_final_mod;
         CUdeviceptr f_shift = d_final_mod + (size_t)dim * sizeof(float);
         op_adaln(r, d_scratch1_p, d_img_p, f_shift, f_scale, n_img, dim);
-        cuMemFree(d_final_mod); d_final_mod = 0;
 
-        QIMG_ALLOC_OR_CLEANUP(d_final_out, (size_t)n_img * in_ch * sizeof(float), "d_final_out");
+        QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_FINAL_OUT, d_final_out, (size_t)n_img * in_ch * sizeof(float), "d_final_out");
         op_gemm(r, d_final_out, r->d_proj_out_w, d_scratch1_p, r->d_proj_out_b,
                 in_ch, dim, n_img);
         cuStreamSynchronize(s);
         cuMemcpyDtoH(out_p, d_final_out, (size_t)n_img * in_ch * sizeof(float));
-        cuMemFree(d_final_out); d_final_out = 0;
     }
     rc = 0;
 
     /* Cleanup */
 cleanup:
-    if (d_t_sin) cuMemFree(d_t_sin);
-    if (d_t_emb2) cuMemFree(d_t_emb2);
-    if (d_final_t_silu) cuMemFree(d_final_t_silu);
-    if (d_final_mod) cuMemFree(d_final_mod);
-    if (d_final_out) cuMemFree(d_final_out);
-    if (d_img_in) cuMemFree(d_img_in);
-    if (d_txt_in_c) cuMemFree(d_txt_in_c);
-    if (d_txt_in_u) cuMemFree(d_txt_in_u);
-    if (d_img_c) cuMemFree(d_img_c);
-    if (d_img_u) cuMemFree(d_img_u);
-    if (d_txt_c) cuMemFree(d_txt_c);
-    if (d_txt_u) cuMemFree(d_txt_u);
-    if (d_t_emb) cuMemFree(d_t_emb);
-    if (d_scratch1_c) cuMemFree(d_scratch1_c);
-    if (d_scratch2_c) cuMemFree(d_scratch2_c);
-    if (d_scratch3_c) cuMemFree(d_scratch3_c);
-    if (d_scratch1_u) cuMemFree(d_scratch1_u);
-    if (d_scratch2_u) cuMemFree(d_scratch2_u);
-    if (d_scratch3_u) cuMemFree(d_scratch3_u);
-    if (d_q_c) cuMemFree(d_q_c);
-    if (d_k_c) cuMemFree(d_k_c);
-    if (d_v_c) cuMemFree(d_v_c);
-    if (d_attn_out_c) cuMemFree(d_attn_out_c);
-    if (d_q_u) cuMemFree(d_q_u);
-    if (d_k_u) cuMemFree(d_k_u);
-    if (d_v_u) cuMemFree(d_v_u);
-    if (d_attn_out_u) cuMemFree(d_attn_out_u);
-    if (d_img_mlp_in) cuMemFree(d_img_mlp_in);
-    if (d_img_mlp_h) cuMemFree(d_img_mlp_h);
-    if (d_img_mlp_out) cuMemFree(d_img_mlp_out);
-    if (d_t_silu) cuMemFree(d_t_silu);
-    if (d_img_mod) cuMemFree(d_img_mod);
-    if (d_txt_mod) cuMemFree(d_txt_mod);
-
     if (rc == 0 && r->profile_block && r->prof_block_count > 0) {
         double n = (double)r->prof_block_count;
         double tot = r->prof_qkv_ms + r->prof_qknorm_ms + r->prof_attn_ms
@@ -4201,7 +4256,7 @@ cleanup:
         r->prof_attnout_ms = r->prof_imgmlp_ms = r->prof_txtmlp_ms = 0;
         r->prof_block_count = 0;
     }
-#undef QIMG_ALLOC_OR_CLEANUP
+#undef QIMG_CFG_CACHE_OR_CLEANUP
     return rc;
 }
 
@@ -4507,6 +4562,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             qimg_free_block(&r->gpu_blocks[i]);
         r->n_preloaded = 0;
     }
+    qimg_cfg_cache_free(r);
     cuStreamSynchronize(s);
 
     int h = lat_h, w = lat_w, c = 16;
