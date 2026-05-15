@@ -1551,6 +1551,67 @@ static inline void matvec_bf16_8row(float *dst,
     dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
 }
 
+/* 8-row BF16 matvec, p_odd predicated-load variant.
+ * Inputs are 4 pair buffers, each holding 2 adjacent rows interleaved at
+ * bf16 granularity per 16-element chunk. Two ld1h.h with p_odd at offsets
+ * -2 / 0 bytes extract both rows as FP32 (bf16 lands in upper half of .s
+ * lanes), eliminating the LSL the lsl variant needs.
+ *
+ * Pair buf layout (per 16-element chunk = 64 bytes = 32 halfwords):
+ *   HW 0  = rA[c*16+0]   HW 1  = rB[c*16+0]
+ *   HW 2  = rA[c*16+1]   HW 3  = rB[c*16+1]
+ *   ... up to HW 30/31
+ *
+ * Constraints: n_cols % vl (= 16 on A64FX) == 0, n_rows % 8 == 0.
+ * Caller must have packed weights via pack_bf16_rows_to_pv first. */
+static inline void matvec_bf16_8row_pv(float *dst,
+                                        const uint16_t *pAB, const uint16_t *pCD,
+                                        const uint16_t *pEF, const uint16_t *pGH,
+                                        const float *x, int n) {
+    svbool_t pg = svptrue_b32();
+    svbool_t p_all_h = svptrue_b16();
+    svuint16_t idx_h = svindex_u16(0, 1);
+    svbool_t p_odd = svcmpne_n_u16(p_all_h,
+                                    svand_n_u16_x(p_all_h, idx_h, 1), 0);
+
+    int vl = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
+    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    int i = 0;
+    for (; i + vl - 1 < n; i += vl) {
+        /* pair[hw_base = 2*i] points at chunk c = i/vl */
+        const uint16_t *ab = pAB + 2 * i;
+        const uint16_t *cd = pCD + 2 * i;
+        const uint16_t *ef = pEF + 2 * i;
+        const uint16_t *gh = pGH + 2 * i;
+        svuint16_t vA = svld1_u16(p_odd, ab - 1);
+        svuint16_t vB = svld1_u16(p_odd, ab);
+        svuint16_t vC = svld1_u16(p_odd, cd - 1);
+        svuint16_t vD = svld1_u16(p_odd, cd);
+        svuint16_t vE = svld1_u16(p_odd, ef - 1);
+        svuint16_t vF = svld1_u16(p_odd, ef);
+        svuint16_t vG = svld1_u16(p_odd, gh - 1);
+        svuint16_t vH = svld1_u16(p_odd, gh);
+        svfloat32_t vx = svld1(pg, &x[i]);
+        a0 = svmla_x(pg, a0, svreinterpret_f32(vA), vx);
+        a1 = svmla_x(pg, a1, svreinterpret_f32(vB), vx);
+        a2 = svmla_x(pg, a2, svreinterpret_f32(vC), vx);
+        a3 = svmla_x(pg, a3, svreinterpret_f32(vD), vx);
+        a4 = svmla_x(pg, a4, svreinterpret_f32(vE), vx);
+        a5 = svmla_x(pg, a5, svreinterpret_f32(vF), vx);
+        a6 = svmla_x(pg, a6, svreinterpret_f32(vG), vx);
+        a7 = svmla_x(pg, a7, svreinterpret_f32(vH), vx);
+    }
+    /* n is required to be a multiple of vl by the panel build constraint;
+     * no tail handling needed in the kernel. */
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
 /* Tiled BF16 GEMM: Y[tok, row] = W[row, K] · X[tok, K]^T
  * Token-major output: Y[t * Y_stride + r].
  * Processes 4 rows × N tokens with column-tiled inner loop for L1 reuse. */
