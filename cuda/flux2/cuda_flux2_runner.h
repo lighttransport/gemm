@@ -1329,8 +1329,8 @@ static const char *flux2_kernel_src =
 "        for (int idx = threadIdx.x; idx < FA2_BKV * FA2_HD; idx += n_threads) {\n"
 "            int kj = idx / FA2_HD, d = idx % FA2_HD;\n"
 "            int kv_tok = kv_base + kj;\n"
-"            smK[idx] = (kv_tok < N) ? K[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
-"            smV[idx] = (kv_tok < N) ? V[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"            smK[idx] = (kv_tok < N && d < head_dim) ? K[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"            smV[idx] = (kv_tok < N && d < head_dim) ? V[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
 "        }\n"
 "        __syncthreads();\n"
 "        for (int kj = 0; kj < FA2_BKV; kj++) {\n"
@@ -3760,11 +3760,25 @@ static void f32_to_bf16_bulk(uint16_t *out, const float *in, int n) {
 
 /* Upload F32 weights as BF16 (half size). Used for VAE 3x3 convs. */
 static CUdeviceptr gpu_upload_f32_as_bf16(const float *data, int n) {
+    if (!data || n <= 0) return 0;
     uint16_t *bf = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
+    if (!bf) return 0;
     f32_to_bf16_bulk(bf, data, n);
-    CUdeviceptr d;
-    cuMemAlloc(&d, (size_t)n * sizeof(uint16_t));
-    cuMemcpyHtoD(d, bf, (size_t)n * sizeof(uint16_t));
+    CUdeviceptr d = 0;
+    CUresult err = cuMemAlloc(&d, (size_t)n * sizeof(uint16_t));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_f32_as_bf16 alloc failed (%zu bytes, err=%d)\n",
+                (size_t)n * sizeof(uint16_t), (int)err);
+        free(bf);
+        return 0;
+    }
+    err = cuMemcpyHtoD(d, bf, (size_t)n * sizeof(uint16_t));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: gpu_upload_f32_as_bf16 copy failed (%d)\n", (int)err);
+        cuMemFree(d);
+        free(bf);
+        return 0;
+    }
     free(bf);
     return d;
 }
@@ -3824,8 +3838,13 @@ static void vae_conv_3x3(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr in,
 
 static CUdeviceptr op_vae_upsample2x(cuda_flux2_runner *r, CUdeviceptr in, int c, int h, int w) {
     int oh = h * 2, ow = w * 2;
-    CUdeviceptr out;
-    cuMemAlloc(&out, (size_t)c * oh * ow * sizeof(float));
+    CUdeviceptr out = 0;
+    CUresult err = cuMemAlloc(&out, (size_t)c * oh * ow * sizeof(float));
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: VAE upsample alloc failed (%zu bytes, err=%d)\n",
+                (size_t)c * oh * ow * sizeof(float), (int)err);
+        return 0;
+    }
     int total = c * oh * ow;
     void *args[] = {&out, &in, &c, &h, &w};
     cuLaunchKernel(r->fn_vae_upsample2x, (unsigned)((total + 255) / 256), 1, 1,
@@ -5089,44 +5108,61 @@ static CUdeviceptr flux2_vae_resblock_gpu(cuda_flux2_runner *r, CUdeviceptr x,
     CUdeviceptr d_sc_w = rb->skip_w ? gpu_upload_f32(rb->skip_w, co * ci) : 0;
     CUdeviceptr d_sc_b = gpu_upload_f32_or0(rb->skip_b, co);
 
-    CUdeviceptr d_tmp1, d_tmp2, d_out;
-    cuMemAlloc(&d_tmp1, (size_t)ci * spatial * sizeof(float));
+    CUdeviceptr d_tmp1 = 0, d_tmp2 = 0, d_out = 0;
+    #define FLUX2_RB_FREE(ptr) do { if (ptr) { cuMemFree(ptr); (ptr) = 0; } } while(0)
+    #define FLUX2_RB_FAIL() do { \
+        FLUX2_RB_FREE(d_tmp1); FLUX2_RB_FREE(d_tmp2); FLUX2_RB_FREE(d_out); \
+        FLUX2_RB_FREE(d_n1_w); FLUX2_RB_FREE(d_n1_b); FLUX2_RB_FREE(d_c1_w); FLUX2_RB_FREE(d_c1_b); \
+        FLUX2_RB_FREE(d_n2_w); FLUX2_RB_FREE(d_n2_b); FLUX2_RB_FREE(d_c2_w); FLUX2_RB_FREE(d_c2_b); \
+        FLUX2_RB_FREE(d_sc_w); FLUX2_RB_FREE(d_sc_b); \
+        return 0; \
+    } while(0)
+
+    if (!x || !d_n1_w || !d_n1_b || !d_c1_w || !d_c1_b ||
+        !d_n2_w || !d_n2_b || !d_c2_w || !d_c2_b) {
+        fprintf(stderr, "cuda_flux2: VAE resblock weight upload failed\n");
+        FLUX2_RB_FAIL();
+    }
+
+    if (cuMemAlloc(&d_tmp1, (size_t)ci * spatial * sizeof(float)) != CUDA_SUCCESS) FLUX2_RB_FAIL();
     op_vae_groupnorm(r, d_tmp1, x, d_n1_w, d_n1_b, ci, spatial, num_groups);
     op_silu(r, d_tmp1, ci * spatial);
 
-    cuMemAlloc(&d_tmp2, (size_t)co * spatial * sizeof(float));
+    if (cuMemAlloc(&d_tmp2, (size_t)co * spatial * sizeof(float)) != CUDA_SUCCESS) FLUX2_RB_FAIL();
     vae_conv_3x3(r, d_tmp2, d_tmp1, d_c1_w, d_c1_b, ci, h, w, co);
-    cuMemFree(d_tmp1);
+    FLUX2_RB_FREE(d_tmp1);
 
-    cuMemAlloc(&d_tmp1, (size_t)co * spatial * sizeof(float));
+    if (cuMemAlloc(&d_tmp1, (size_t)co * spatial * sizeof(float)) != CUDA_SUCCESS) FLUX2_RB_FAIL();
     op_vae_groupnorm(r, d_tmp1, d_tmp2, d_n2_w, d_n2_b, co, spatial, num_groups);
     op_silu(r, d_tmp1, co * spatial);
-    cuMemFree(d_tmp2);
+    FLUX2_RB_FREE(d_tmp2);
 
-    cuMemAlloc(&d_tmp2, (size_t)co * spatial * sizeof(float));
+    if (cuMemAlloc(&d_tmp2, (size_t)co * spatial * sizeof(float)) != CUDA_SUCCESS) FLUX2_RB_FAIL();
     vae_conv_3x3(r, d_tmp2, d_tmp1, d_c2_w, d_c2_b, co, h, w, co);
-    cuMemFree(d_tmp1);
+    FLUX2_RB_FREE(d_tmp1);
 
-    cuMemAlloc(&d_out, (size_t)co * spatial * sizeof(float));
+    if (cuMemAlloc(&d_out, (size_t)co * spatial * sizeof(float)) != CUDA_SUCCESS) FLUX2_RB_FAIL();
     if (d_sc_w) {
         op_vae_conv2d(r, d_out, x, d_sc_w, d_sc_b, ci, h, w, co, 1, 1, 0);
     } else {
         cuMemcpyDtoD(d_out, x, (size_t)co * spatial * sizeof(float));
     }
     op_add(r, d_out, d_tmp2, co * spatial);
-    cuMemFree(d_tmp2);
+    FLUX2_RB_FREE(d_tmp2);
 
-    if (d_n1_w) cuMemFree(d_n1_w);
-    if (d_n1_b) cuMemFree(d_n1_b);
-    if (d_c1_w) cuMemFree(d_c1_w);
-    if (d_c1_b) cuMemFree(d_c1_b);
-    if (d_n2_w) cuMemFree(d_n2_w);
-    if (d_n2_b) cuMemFree(d_n2_b);
-    if (d_c2_w) cuMemFree(d_c2_w);
-    if (d_c2_b) cuMemFree(d_c2_b);
-    if (d_sc_w) cuMemFree(d_sc_w);
-    if (d_sc_b) cuMemFree(d_sc_b);
+    FLUX2_RB_FREE(d_n1_w);
+    FLUX2_RB_FREE(d_n1_b);
+    FLUX2_RB_FREE(d_c1_w);
+    FLUX2_RB_FREE(d_c1_b);
+    FLUX2_RB_FREE(d_n2_w);
+    FLUX2_RB_FREE(d_n2_b);
+    FLUX2_RB_FREE(d_c2_w);
+    FLUX2_RB_FREE(d_c2_b);
+    FLUX2_RB_FREE(d_sc_w);
+    FLUX2_RB_FREE(d_sc_b);
 
+    #undef FLUX2_RB_FREE
+    #undef FLUX2_RB_FAIL
     return d_out;
 }
 
@@ -5137,6 +5173,11 @@ static CUdeviceptr flux2_vae_mid_attn_bridge(cuda_flux2_runner *r, CUdeviceptr x
     size_t n = (size_t)c * h * w;
     float *cpu_in = (float *)malloc(n * sizeof(float));
     float *cpu_out = (float *)malloc(n * sizeof(float));
+    if (!cpu_in || !cpu_out) {
+        free(cpu_in);
+        free(cpu_out);
+        return 0;
+    }
     cuCtxSynchronize();
     cuMemcpyDtoH(cpu_in, x, n * sizeof(float));
     flux2_vae_mid_attn_forward(cpu_out, cpu_in, attn, h, w, num_groups);
@@ -5174,24 +5215,43 @@ static CUdeviceptr flux2_vae_mid_attn_gpu(cuda_flux2_runner *r, CUdeviceptr x,
     CUdeviceptr d_k_b = gpu_upload_f32_or0(attn->k_b, c);
     CUdeviceptr d_v_b = gpu_upload_f32_or0(attn->v_b, c);
     CUdeviceptr d_out_b = gpu_upload_f32_or0(attn->out_b, c);
+    CUdeviceptr d_normed = 0, d_normed_t = 0;
+    CUdeviceptr d_q = 0, d_k = 0, d_v = 0, d_attn_out = 0;
+    CUdeviceptr d_K_bf = 0, d_VT_bf = 0, d_S = 0;
+    CUdeviceptr d_proj = 0, d_out = 0;
+
+    #define FLUX2_ATTN_FREE(ptr) do { if (ptr) { cuMemFree(ptr); (ptr) = 0; } } while(0)
+    #define FLUX2_ATTN_FAIL() do { \
+        FLUX2_ATTN_FREE(d_norm_w); FLUX2_ATTN_FREE(d_norm_b); \
+        FLUX2_ATTN_FREE(d_q_w); FLUX2_ATTN_FREE(d_k_w); FLUX2_ATTN_FREE(d_v_w); FLUX2_ATTN_FREE(d_out_w); \
+        FLUX2_ATTN_FREE(d_q_b); FLUX2_ATTN_FREE(d_k_b); FLUX2_ATTN_FREE(d_v_b); FLUX2_ATTN_FREE(d_out_b); \
+        FLUX2_ATTN_FREE(d_normed); FLUX2_ATTN_FREE(d_normed_t); \
+        FLUX2_ATTN_FREE(d_q); FLUX2_ATTN_FREE(d_k); FLUX2_ATTN_FREE(d_v); FLUX2_ATTN_FREE(d_attn_out); \
+        FLUX2_ATTN_FREE(d_K_bf); FLUX2_ATTN_FREE(d_VT_bf); FLUX2_ATTN_FREE(d_S); \
+        FLUX2_ATTN_FREE(d_proj); FLUX2_ATTN_FREE(d_out); \
+        return 0; \
+    } while(0)
+
+    if (!x || !d_norm_w || !d_norm_b || !d_q_w || !d_k_w || !d_v_w || !d_out_w) {
+        fprintf(stderr, "cuda_flux2: VAE middle attention weight upload failed\n");
+        FLUX2_ATTN_FAIL();
+    }
 
     /* 1. GroupNorm: x [c, spatial] → normed [c, spatial] */
-    CUdeviceptr d_normed;
-    cuMemAlloc(&d_normed, feat_sz * sizeof(float));
+    if (cuMemAlloc(&d_normed, feat_sz * sizeof(float)) != CUDA_SUCCESS) FLUX2_ATTN_FAIL();
     op_vae_groupnorm(r, d_normed, x, d_norm_w, d_norm_b, c, spatial, num_groups);
-    cuMemFree(d_norm_w); cuMemFree(d_norm_b);
+    FLUX2_ATTN_FREE(d_norm_w);
+    FLUX2_ATTN_FREE(d_norm_b);
 
     /* 2. Transpose [c, spatial] → [spatial, c] */
-    CUdeviceptr d_normed_t;
-    cuMemAlloc(&d_normed_t, feat_sz * sizeof(float));
+    if (cuMemAlloc(&d_normed_t, feat_sz * sizeof(float)) != CUDA_SUCCESS) FLUX2_ATTN_FAIL();
     op_transpose_2d(r, d_normed_t, d_normed, c, spatial);
-    cuMemFree(d_normed);
+    FLUX2_ATTN_FREE(d_normed);
 
     /* 3. Q, K, V projections: [spatial, c] × [c, c]^T → [spatial, c] */
-    CUdeviceptr d_q, d_k, d_v;
-    cuMemAlloc(&d_q, (size_t)spatial * c * sizeof(float));
-    cuMemAlloc(&d_k, (size_t)spatial * c * sizeof(float));
-    cuMemAlloc(&d_v, (size_t)spatial * c * sizeof(float));
+    if (cuMemAlloc(&d_q, (size_t)spatial * c * sizeof(float)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_k, (size_t)spatial * c * sizeof(float)) != CUDA_SUCCESS ||
+        cuMemAlloc(&d_v, (size_t)spatial * c * sizeof(float)) != CUDA_SUCCESS) FLUX2_ATTN_FAIL();
     if (use_bf16) {
         op_gemm_bf16(r, d_q, d_q_w, d_normed_t, d_q_b, c, c, spatial);
         op_gemm_bf16(r, d_k, d_k_w, d_normed_t, d_k_b, c, c, spatial);
@@ -5201,57 +5261,62 @@ static CUdeviceptr flux2_vae_mid_attn_gpu(cuda_flux2_runner *r, CUdeviceptr x,
         op_gemm_f32(r, d_k, d_k_w, d_normed_t, d_k_b, c, c, spatial);
         op_gemm_f32(r, d_v, d_v_w, d_normed_t, d_v_b, c, c, spatial);
     }
-    cuMemFree(d_normed_t);
-    cuMemFree(d_q_w); cuMemFree(d_k_w); cuMemFree(d_v_w);
-    if (d_q_b) cuMemFree(d_q_b);
-    if (d_k_b) cuMemFree(d_k_b);
-    if (d_v_b) cuMemFree(d_v_b);
+    FLUX2_ATTN_FREE(d_normed_t);
+    FLUX2_ATTN_FREE(d_q_w);
+    FLUX2_ATTN_FREE(d_k_w);
+    FLUX2_ATTN_FREE(d_v_w);
+    FLUX2_ATTN_FREE(d_q_b);
+    FLUX2_ATTN_FREE(d_k_b);
+    FLUX2_ATTN_FREE(d_v_b);
 
     /* 4. Single-head attention via BF16 MMA 3-step: S = Q·K^T / sqrt(c), softmax, O = P·V */
-    CUdeviceptr d_attn_out;
-    cuMemAlloc(&d_attn_out, (size_t)spatial * c * sizeof(float));
+    if (cuMemAlloc(&d_attn_out, (size_t)spatial * c * sizeof(float)) != CUDA_SUCCESS) FLUX2_ATTN_FAIL();
     if (use_bf16) {
         /* gemm_bf16_f32 takes X as F32 and W as BF16. So only K and V need BF16 conversion. */
-        CUdeviceptr d_K_bf, d_VT_bf, d_S;
-        cuMemAlloc(&d_K_bf, (size_t)spatial * c * sizeof(uint16_t));
-        cuMemAlloc(&d_VT_bf, (size_t)spatial * c * sizeof(uint16_t));
-        cuMemAlloc(&d_S, (size_t)spatial * spatial * sizeof(float));
+        if (cuMemAlloc(&d_K_bf, (size_t)spatial * c * sizeof(uint16_t)) != CUDA_SUCCESS ||
+            cuMemAlloc(&d_VT_bf, (size_t)spatial * c * sizeof(uint16_t)) != CUDA_SUCCESS ||
+            cuMemAlloc(&d_S, (size_t)spatial * spatial * sizeof(float)) != CUDA_SUCCESS) FLUX2_ATTN_FAIL();
         /* K BF16 (as "weight" [spatial, c]) */
         op_f32_to_bf16(r, d_K_bf, d_k, spatial * c);
         /* V^T BF16 [c, spatial] (needed because gemm W layout is [n_out, n_in]) */
         op_transpose_f32_to_bf16(r, d_VT_bf, d_v, spatial, c);
-        cuMemFree(d_k); cuMemFree(d_v);
+        FLUX2_ATTN_FREE(d_k);
+        FLUX2_ATTN_FREE(d_v);
         /* S = Q @ K^T:  Y[i,j] = Σ_k X[i,k] * W[j,k] = Σ_k Q[i,k] * K[j,k] */
         op_gemm_bf16(r, d_S, d_K_bf, d_q, 0, spatial, c, spatial);
-        cuMemFree(d_q);
+        FLUX2_ATTN_FREE(d_q);
         /* Row-wise softmax with scale = 1/sqrt(c), in-place on F32 S */
         float attn_scale = 1.0f / sqrtf((float)c);
         op_softmax_row(r, d_S, spatial, spatial, attn_scale);
         /* O = P @ V:  Y[i,d] = Σ_k X[i,k] * W[d,k] = Σ_k P[i,k] * V_T[d,k] = Σ_k P[i,k] * V[k,d] */
         op_gemm_bf16(r, d_attn_out, d_VT_bf, d_S, 0, c, spatial, spatial);
-        cuMemFree(d_K_bf); cuMemFree(d_VT_bf); cuMemFree(d_S);
+        FLUX2_ATTN_FREE(d_K_bf);
+        FLUX2_ATTN_FREE(d_VT_bf);
+        FLUX2_ATTN_FREE(d_S);
     } else {
         op_vae_attn(r, d_attn_out, d_q, d_k, d_v, spatial, c);
-        cuMemFree(d_q); cuMemFree(d_k); cuMemFree(d_v);
+        FLUX2_ATTN_FREE(d_q);
+        FLUX2_ATTN_FREE(d_k);
+        FLUX2_ATTN_FREE(d_v);
     }
 
     /* 5. Output projection: [spatial, c] × [c, c]^T → [spatial, c] */
-    CUdeviceptr d_proj;
-    cuMemAlloc(&d_proj, (size_t)spatial * c * sizeof(float));
+    if (cuMemAlloc(&d_proj, (size_t)spatial * c * sizeof(float)) != CUDA_SUCCESS) FLUX2_ATTN_FAIL();
     if (use_bf16)
         op_gemm_bf16(r, d_proj, d_out_w, d_attn_out, d_out_b, c, c, spatial);
     else
         op_gemm_f32(r, d_proj, d_out_w, d_attn_out, d_out_b, c, c, spatial);
-    cuMemFree(d_attn_out);
-    cuMemFree(d_out_w);
-    if (d_out_b) cuMemFree(d_out_b);
+    FLUX2_ATTN_FREE(d_attn_out);
+    FLUX2_ATTN_FREE(d_out_w);
+    FLUX2_ATTN_FREE(d_out_b);
 
     /* 6. Transpose [spatial, c] → [c, spatial] and add residual */
-    CUdeviceptr d_out;
-    cuMemAlloc(&d_out, feat_sz * sizeof(float));
+    if (cuMemAlloc(&d_out, feat_sz * sizeof(float)) != CUDA_SUCCESS) FLUX2_ATTN_FAIL();
     op_transpose_add(r, d_out, x, d_proj, c, spatial);
-    cuMemFree(d_proj);
+    FLUX2_ATTN_FREE(d_proj);
 
+    #undef FLUX2_ATTN_FREE
+    #undef FLUX2_ATTN_FAIL
     return d_out;
 }
 
@@ -5285,7 +5350,25 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
         cuEventRecord(ev_start, r->stream);
     }
 
+    #define FLUX2_VAE_DESTROY_EVENTS() do { \
+        if (vae_dbg) { \
+            if (ev_start) cuEventDestroy(ev_start); \
+            if (ev_pqc) cuEventDestroy(ev_pqc); \
+            if (ev_cin) cuEventDestroy(ev_cin); \
+            if (ev_mid) cuEventDestroy(ev_mid); \
+            for (int _ei = 0; _ei < 4; _ei++) if (ev_up[_ei]) cuEventDestroy(ev_up[_ei]); \
+            if (ev_tail) cuEventDestroy(ev_tail); \
+        } \
+    } while(0)
+
     CUdeviceptr d_x = gpu_upload_f32(latent, lc * h * w);
+    #define FLUX2_VAE_FAIL() do { \
+        if (d_x) { cuMemFree(d_x); d_x = 0; } \
+        FLUX2_VAE_DESTROY_EVENTS(); \
+        return -1; \
+    } while(0)
+
+    if (!d_x) FLUX2_VAE_FAIL();
 
     /* NOTE: BN stats (bn.running_mean/var) are training artifacts — do NOT apply.
      * The DiT outputs latents in the correct space for the VAE decoder.
@@ -5294,8 +5377,13 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     if (m->pqc_w) {
         CUdeviceptr d_pqc_w = gpu_upload_f32(m->pqc_w, lc * lc);
         CUdeviceptr d_pqc_b = gpu_upload_f32_or0(m->pqc_b, lc);
-        CUdeviceptr d_tmp;
-        cuMemAlloc(&d_tmp, (size_t)lc * h * w * sizeof(float));
+        CUdeviceptr d_tmp = 0;
+        if (!d_pqc_w || !d_pqc_b ||
+            cuMemAlloc(&d_tmp, (size_t)lc * h * w * sizeof(float)) != CUDA_SUCCESS) {
+            if (d_pqc_w) cuMemFree(d_pqc_w);
+            if (d_pqc_b) cuMemFree(d_pqc_b);
+            FLUX2_VAE_FAIL();
+        }
         op_vae_conv2d(r, d_tmp, d_x, d_pqc_w, d_pqc_b, lc, h, w, lc, 1, 1, 0);
         cuMemFree(d_x);
         cuMemFree(d_pqc_w);
@@ -5308,8 +5396,13 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
         int co = m->conv_in_out_ch;
         CUdeviceptr d_w = vae_upload_w_3x3(r, m->conv_in_w, co * lc * 3 * 3);
         CUdeviceptr d_b = gpu_upload_f32_or0(m->conv_in_b, co);
-        CUdeviceptr d_tmp;
-        cuMemAlloc(&d_tmp, (size_t)co * h * w * sizeof(float));
+        CUdeviceptr d_tmp = 0;
+        if (!d_w || !d_b ||
+            cuMemAlloc(&d_tmp, (size_t)co * h * w * sizeof(float)) != CUDA_SUCCESS) {
+            if (d_w) cuMemFree(d_w);
+            if (d_b) cuMemFree(d_b);
+            FLUX2_VAE_FAIL();
+        }
         vae_conv_3x3(r, d_tmp, d_x, d_w, d_b, lc, h, w, co);
         cuMemFree(d_x);
         cuMemFree(d_w);
@@ -5321,16 +5414,19 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
 
     {
         CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->mid_res0, h, w, ng);
+        if (!d_tmp) FLUX2_VAE_FAIL();
         cuMemFree(d_x);
         d_x = d_tmp;
     }
     {
         CUdeviceptr d_tmp = flux2_vae_mid_attn_gpu(r, d_x, &m->mid_attn, h, w, ng);
+        if (!d_tmp) FLUX2_VAE_FAIL();
         cuMemFree(d_x);
         d_x = d_tmp;
     }
     {
         CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->mid_res1, h, w, ng);
+        if (!d_tmp) FLUX2_VAE_FAIL();
         cuMemFree(d_x);
         d_x = d_tmp;
     }
@@ -5339,18 +5435,21 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     for (int bi = 0; bi < 4; bi++) {
         {
             CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][0], h, w, ng);
+            if (!d_tmp) FLUX2_VAE_FAIL();
             cuMemFree(d_x);
             d_x = d_tmp;
             c = m->up_res[bi][0].c_out;
         }
         {
             CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][1], h, w, ng);
+            if (!d_tmp) FLUX2_VAE_FAIL();
             cuMemFree(d_x);
             d_x = d_tmp;
             c = m->up_res[bi][1].c_out;
         }
         {
             CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][2], h, w, ng);
+            if (!d_tmp) FLUX2_VAE_FAIL();
             cuMemFree(d_x);
             d_x = d_tmp;
             c = m->up_res[bi][2].c_out;
@@ -5362,7 +5461,14 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
             CUdeviceptr d_tmp;
             h *= 2;
             w *= 2;
-            cuMemAlloc(&d_tmp, (size_t)c * h * w * sizeof(float));
+            d_tmp = 0;
+            if (!d_up || !d_w || !d_b ||
+                cuMemAlloc(&d_tmp, (size_t)c * h * w * sizeof(float)) != CUDA_SUCCESS) {
+                if (d_up) cuMemFree(d_up);
+                if (d_w) cuMemFree(d_w);
+                if (d_b) cuMemFree(d_b);
+                FLUX2_VAE_FAIL();
+            }
             vae_conv_3x3(r, d_tmp, d_up, d_w, d_b, c, h, w, c);
             cuMemFree(d_x);
             cuMemFree(d_up);
@@ -5377,8 +5483,13 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     {
         CUdeviceptr d_g = gpu_upload_f32_or0(m->norm_out_w, c);
         CUdeviceptr d_b = gpu_upload_f32_or0(m->norm_out_b, c);
-        CUdeviceptr d_tmp;
-        cuMemAlloc(&d_tmp, (size_t)c * spatial * sizeof(float));
+        CUdeviceptr d_tmp = 0;
+        if (!d_g || !d_b ||
+            cuMemAlloc(&d_tmp, (size_t)c * spatial * sizeof(float)) != CUDA_SUCCESS) {
+            if (d_g) cuMemFree(d_g);
+            if (d_b) cuMemFree(d_b);
+            FLUX2_VAE_FAIL();
+        }
         op_vae_groupnorm(r, d_tmp, d_x, d_g, d_b, c, spatial, ng);
         op_silu(r, d_tmp, c * spatial);
         cuMemFree(d_x);
@@ -5389,8 +5500,13 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     {
         CUdeviceptr d_w = vae_upload_w_3x3(r, m->conv_out_w, 3 * c * 3 * 3);
         CUdeviceptr d_b = gpu_upload_f32_or0(m->conv_out_b, 3);
-        CUdeviceptr d_rgb;
-        cuMemAlloc(&d_rgb, (size_t)3 * spatial * sizeof(float));
+        CUdeviceptr d_rgb = 0;
+        if (!d_w || !d_b ||
+            cuMemAlloc(&d_rgb, (size_t)3 * spatial * sizeof(float)) != CUDA_SUCCESS) {
+            if (d_w) cuMemFree(d_w);
+            if (d_b) cuMemFree(d_b);
+            FLUX2_VAE_FAIL();
+        }
         vae_conv_3x3(r, d_rgb, d_x, d_w, d_b, c, h, w, 3);
         cuMemFree(d_x);
         cuMemFree(d_w);
@@ -5413,11 +5529,10 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
         cuEventElapsedTime(&t_tail, ev_up[3], ev_tail);
         fprintf(stderr, "VAE timing: pqc=%.1fms cin=%.1fms mid=%.1fms up0=%.1fms up1=%.1fms up2=%.1fms up3=%.1fms tail=%.1fms\n",
                 t_pqc, t_cin, t_mid, t_up[0], t_up[1], t_up[2], t_up[3], t_tail);
-        cuEventDestroy(ev_start); cuEventDestroy(ev_pqc); cuEventDestroy(ev_cin);
-        cuEventDestroy(ev_mid);
-        for (int i = 0; i < 4; i++) cuEventDestroy(ev_up[i]);
-        cuEventDestroy(ev_tail);
     }
+    FLUX2_VAE_DESTROY_EVENTS();
+    #undef FLUX2_VAE_FAIL
+    #undef FLUX2_VAE_DESTROY_EVENTS
     return 0;
 }
 

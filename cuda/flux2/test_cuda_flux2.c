@@ -642,7 +642,7 @@ static int run_generate_once(cuda_flux2_runner *r,
                          const float *txt_hidden, int n_txt, int enc_embd,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
-                         const char *out_path) {
+                         const char *out_path, int dump_intermediates) {
     struct timespec t_start, t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -659,6 +659,11 @@ static int run_generate_once(cuda_flux2_runner *r,
     int ps = (r->pin == lc * 4) ? 2 : 1;
     int n_img = (lat_h / ps) * (lat_w / ps);
     int pin = r->pin;
+    if (lat_h <= 0 || lat_w <= 0 || (lat_h % ps) != 0 || (lat_w % ps) != 0) {
+        fprintf(stderr, "generate: output size %dx%d is incompatible with latent patch size ps=%d\n",
+                out_w, out_h, ps);
+        return 1;
+    }
 
     fprintf(stderr, "Latent: [%d, %d, %d], ps=%d, n_img=%d, pin=%d, n_txt=%d, txt_dim=%d\n",
             lc, lat_h, lat_w, ps, n_img, pin, n_txt, r->txt_dim);
@@ -666,10 +671,27 @@ static int run_generate_once(cuda_flux2_runner *r,
     rng_state = seed;
     size_t lat_sz = (size_t)lc * lat_h * lat_w;
     float *latent = (float *)malloc(lat_sz * sizeof(float));
+    if (!latent) return 1;
     for (size_t i = 0; i < lat_sz; i++) latent[i] = randn();
 
     float *img_tok = (float *)malloc((size_t)n_img * pin * sizeof(float));
     float *vel_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
+    float *vel_lat = (float *)calloc(lat_sz, sizeof(float));
+    float *txt_uncond = NULL;
+    float *vel_uncond = NULL;
+    if (!img_tok || !vel_out || !vel_lat) {
+        free(img_tok); free(vel_out); free(vel_lat); free(latent);
+        return 1;
+    }
+    if (!is_distilled && cfg_scale > 1.0f) {
+        txt_uncond = (float *)calloc((size_t)n_txt * r->txt_dim, sizeof(float));
+        vel_uncond = (float *)malloc((size_t)n_img * pin * sizeof(float));
+        if (!txt_uncond || !vel_uncond) {
+            free(txt_uncond); free(vel_uncond);
+            free(img_tok); free(vel_out); free(vel_lat); free(latent);
+            return 1;
+        }
+    }
 
     qimg_scheduler sched;
     if (is_distilled) flux2_sched_distilled(&sched, n_steps);
@@ -689,7 +711,8 @@ static int run_generate_once(cuda_flux2_runner *r,
         if (is_distilled || cfg_scale <= 1.0f) {
             if (cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
                                     t_sigma, 0.0f, vel_out) != 0) {
-                free(img_tok); free(vel_out); free(latent);
+                free(txt_uncond); free(vel_uncond);
+                free(img_tok); free(vel_out); free(vel_lat); free(latent);
                 return 1;
             }
             /* Velocity stats */
@@ -697,19 +720,16 @@ static int run_generate_once(cuda_flux2_runner *r,
             for(int i=0;i<n_img*pin;i++){if(vel_out[i]<vmn)vmn=vel_out[i];if(vel_out[i]>vmx)vmx=vel_out[i];vsum+=vel_out[i];}
             fprintf(stderr, "    vel: min=%.4f max=%.4f mean=%.6f\n", vmn, vmx, vsum/(n_img*pin));
         } else {
-            float *txt_uncond = (float *)calloc((size_t)n_txt * r->txt_dim, sizeof(float));
-            float *vel_uncond = (float *)malloc((size_t)n_img * pin * sizeof(float));
             if (cuda_flux2_dit_step(r, img_tok, n_img, txt_uncond, n_txt,
                                     t_sigma, 0.0f, vel_uncond) != 0 ||
                 cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
                                     t_sigma, 0.0f, vel_out) != 0) {
                 free(txt_uncond); free(vel_uncond);
-                free(img_tok); free(vel_out); free(latent);
+                free(img_tok); free(vel_out); free(vel_lat); free(latent);
                 return 1;
             }
             for (int i = 0; i < n_img * pin; i++)
                 vel_out[i] = vel_uncond[i] + cfg_scale * (vel_out[i] - vel_uncond[i]);
-            free(txt_uncond); free(vel_uncond);
         }
 
         {
@@ -717,16 +737,17 @@ static int run_generate_once(cuda_flux2_runner *r,
             if (err != CUDA_SUCCESS) {
                 fprintf(stderr, "generate: cuCtxSynchronize failed after DiT step %d/%d (%d)\n",
                         step + 1, n_steps, (int)err);
-                free(img_tok); free(vel_out); free(latent);
+                free(txt_uncond); free(vel_uncond);
+                free(img_tok); free(vel_out); free(vel_lat); free(latent);
                 return 1;
             }
         }
 
-        float *vel_lat = (float *)calloc(lat_sz, sizeof(float));
+        memset(vel_lat, 0, lat_sz * sizeof(float));
         flux2_unpatchify(vel_lat, vel_out, lc, lat_h, lat_w, ps);
 
         /* Save raw velocity for comparison */
-        {
+        if (dump_intermediates) {
             char path[64];
             snprintf(path, sizeof(path), "cuda_flux2_vel%d.npy", step);
             int sh3[] = {(int)lc, lat_h, lat_w};
@@ -734,10 +755,9 @@ static int run_generate_once(cuda_flux2_runner *r,
         }
 
         qimg_sched_step(latent, vel_lat, (int)lat_sz, step, &sched);
-        free(vel_lat);
 
         /* Save per-step latent for comparison */
-        {
+        if (dump_intermediates) {
             char path[64];
             snprintf(path, sizeof(path), "cuda_flux2_step%d.npy", step);
             int sh3[] = {(int)lc, lat_h, lat_w};
@@ -752,14 +772,15 @@ static int run_generate_once(cuda_flux2_runner *r,
     fprintf(stderr, "Denoising: %.1f s\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
-    free(img_tok); free(vel_out);
+    free(txt_uncond); free(vel_uncond);
+    free(img_tok); free(vel_out); free(vel_lat);
 
     /* Save final latent and text hidden states for comparison */
-    {
+    if (dump_intermediates) {
         int sh3[] = {(int)lc, lat_h, lat_w};
         save_npy_f32("cuda_flux2_latent_final.npy", latent, 3, sh3);
     }
-    if (txt_hidden) {
+    if (dump_intermediates && txt_hidden) {
         int sh2[] = {n_txt, (int)r->txt_dim};
         save_npy_f32("cuda_flux2_text_hidden.npy", txt_hidden, 2, sh2);
     }
@@ -769,6 +790,10 @@ static int run_generate_once(cuda_flux2_runner *r,
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
+    if (!rgb) {
+        free(latent);
+        return 1;
+    }
     if (cuda_flux2_vae_decode(r, latent, lat_h, lat_w, rgb) != 0) {
         free(rgb); free(latent);
         return 1;
@@ -802,9 +827,10 @@ static int run_generate(const char *dit_path, const char *vae_path,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
                          int use_gpu_enc, int keep_gpu_enc, int device_id, int repeat,
-                         const char *out_override) {
+                         const char *out_override, int dump_intermediates) {
     fprintf(stderr, "\n=== Flux.2 Klein GPU Pipeline ===\n");
     fprintf(stderr, "Runs: %d\n", repeat);
+    fprintf(stderr, "Intermediate dumps: %s\n", dump_intermediates ? "on" : "off");
     if (use_gpu_enc) fprintf(stderr, "GPU text encoder weights: %s\n", enc_path);
     if (use_gpu_enc && keep_gpu_enc) {
         fprintf(stderr, "GPU text encoder residency: keep alive through DiT/VAE generation\n");
@@ -886,7 +912,8 @@ static int run_generate(const char *dit_path, const char *vae_path,
         else snprintf(out_path, sizeof(out_path), "cuda_flux2_output_%02d.ppm", i);
         fprintf(stderr, "\n--- Run %d/%d ---\n", i + 1, repeat);
         rc = run_generate_once(r, prompt, txt_hidden, n_txt, enc_embd, out_h, out_w, n_steps,
-                               seed + (uint64_t)i, is_distilled, cfg_scale, out_path);
+                               seed + (uint64_t)i, is_distilled, cfg_scale, out_path,
+                               dump_intermediates);
         if (rc != 0) break;
     }
 
@@ -906,6 +933,7 @@ int main(int argc, char **argv) {
 
     int out_h = 256, out_w = 256, n_steps = 4, repeat = 1, n_txt = 8;
     int is_distilled = 1, use_gpu_enc = 0, keep_gpu_enc = 0, device_id = 0;
+    int dump_intermediates = 1;
     const char *out_path = NULL;
     float cfg_scale = 1.0f;
     float img_scale = 0.1f, txt_scale = 0.1f;
@@ -927,6 +955,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--distilled")  == 0) { is_distilled = 1; n_steps = 4; }
         else if (strcmp(argv[i], "--gpu-enc")    == 0) use_gpu_enc = 1;
         else if (strcmp(argv[i], "--keep-gpu-enc") == 0) { use_gpu_enc = 1; keep_gpu_enc = 1; }
+        else if (strcmp(argv[i], "--no-dumps") == 0) dump_intermediates = 0;
         else if (strcmp(argv[i], "--dit")    == 0 && i+1<argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae")    == 0 && i+1<argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc")    == 0 && i+1<argc) enc_path = argv[++i];
@@ -953,6 +982,7 @@ int main(int argc, char **argv) {
         use_gpu_enc = 1;
         keep_gpu_enc = 1;
     }
+    if (flux2_env_enabled("FLUX2_NO_DUMPS")) dump_intermediates = 0;
 
     if (!mode) {
         fprintf(stderr,
@@ -960,7 +990,7 @@ int main(int argc, char **argv) {
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
-            "          [--base|--distilled] [--gpu-enc] [--keep-gpu-enc] [--device N]\n",
+            "          [--base|--distilled] [--gpu-enc] [--keep-gpu-enc] [--no-dumps] [--device N]\n",
             argv[0]);
         return 1;
     }
@@ -979,7 +1009,7 @@ int main(int argc, char **argv) {
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,
                             cfg_scale, use_gpu_enc, keep_gpu_enc, device_id, repeat,
-                            out_path);
+                            out_path, dump_intermediates);
 
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 1;
