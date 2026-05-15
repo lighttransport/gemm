@@ -2961,6 +2961,38 @@ static const char *hip_kernel_source =
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
 "\n"
+"/* Per-call dequant of IQ3_XXS (98 B/block, 256 elems) to BF16. Uses the\n"
+" * iq3xxs_grid_dev codebook + ksigns_iq2xs_dev sign table that were emitted\n"
+" * alongside matvec_iq3_xxs_f32. One thread per output element. */\n"
+"__global__ void dequant_iq3_xxs_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                         int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 98;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 98;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs = bp + 2;\n"
+"    const unsigned char *scales_and_signs = bp + 66;\n"
+"    int tid = threadIdx.x;\n"
+"    int ib32 = tid >> 5;          /* 0..7 (which sub-block) */\n"
+"    int elem_in_sub = tid & 31;   /* 0..31 */\n"
+"    int pair_idx = elem_in_sub >> 3;     /* 0..3 (4 pair-iters per sub) */\n"
+"    int elem_in_pair = elem_in_sub & 7;  /* 0..7 (8 elems per pair) */\n"
+"    unsigned int aux32;\n"
+"    memcpy(&aux32, scales_and_signs + 4 * ib32, 4);\n"
+"    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n"
+"    unsigned char signs = ksigns_iq2xs_dev[(aux32 >> (7 * pair_idx)) & 127];\n"
+"    int use_grid2 = (elem_in_pair >= 4);\n"
+"    int j = elem_in_pair & 3;\n"
+"    unsigned char qs_idx = qs[ib32 * 8 + pair_idx * 2 + use_grid2];\n"
+"    const unsigned char *grid = (const unsigned char *)&iq3xxs_grid_dev[qs_idx];\n"
+"    int sign_bit = use_grid2 ? (j + 4) : j;\n"
+"    float val = db * (float)grid[j] * ((signs & (1 << sign_bit)) ? -1.0f : 1.0f);\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
 "/* ===== Phase 3: causal WMMA flash-attention helpers ===== */\n"
 "typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));\n"
 "typedef float    float8 __attribute__((ext_vector_type(8)));\n"
@@ -3659,6 +3691,7 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_q4_K_to_bf16;
     hipFunction_t fn_dequant_q5_K_to_bf16;
     hipFunction_t fn_dequant_q6_K_to_bf16;
+    hipFunction_t fn_dequant_iq3_xxs_to_bf16;
 
     /* Phase 3 flash-attention helpers */
     hipFunction_t fn_pack_f16_from_f32;
@@ -3895,6 +3928,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_q4_K_to_bf16);
     GET_FUNC(dequant_q5_K_to_bf16);
     GET_FUNC(dequant_q6_K_to_bf16);
+    GET_FUNC(dequant_iq3_xxs_to_bf16);
 
     GET_FUNC(pack_f16_from_f32);
     GET_FUNC(pack_kv_cache_f16);
@@ -4632,7 +4666,7 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
          * the whole model falls back to the per-token path. */
         #define BATCH_QTYPE_OK(t) ((t) == GGML_TYPE_F16 ||                           \
                                    (t) == GGML_TYPE_Q4_K || (t) == GGML_TYPE_Q5_K || \
-                                   (t) == GGML_TYPE_Q6_K)
+                                   (t) == GGML_TYPE_Q6_K || (t) == GGML_TYPE_IQ3_XXS)
         if (eligible) {
             for (int l = 0; l < r->n_layers; l++) {
                 hip_layer *cl = &r->layers[l];
@@ -5113,6 +5147,7 @@ static inline void launch_dequant_##qname##_to_bf16(hip_llm_runner *r,          
 DEFINE_LAUNCH_KQ_DEQUANT(q4_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q5_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q6_K)
+DEFINE_LAUNCH_KQ_DEQUANT(iq3_xxs)
 #undef DEFINE_LAUNCH_KQ_DEQUANT
 
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
@@ -5133,6 +5168,9 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q6_K:
             launch_dequant_q6_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ3_XXS:
+            launch_dequant_iq3_xxs_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
             return r->d_wbuf_bf16;
         default:
             return NULL;  /* not batchable */
