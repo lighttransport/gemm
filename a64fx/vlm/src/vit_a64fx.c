@@ -1094,8 +1094,8 @@ static void softmax_row(float *x, int n) {
 
 typedef struct {
     const float *Q_hm;      /* [n_heads, n_patches, head_dim] */
-    const float *K_hm;
-    const float *V_hm;
+    const float *KT_hm;     /* [n_heads, head_dim, n_patches] — TRANSPOSED */
+    const float *V_hm;      /* [n_heads, n_patches, head_dim] */
     float       *attn_out;  /* [n_patches, dim] */
     int          n_patches;
     int          dim;
@@ -1107,8 +1107,8 @@ typedef struct {
     vlm_pool    *pool;
 } attn_args;
 
-/* SVE inner product over head_dim elements. With SVE VL=16 (A64FX) and
- * head_dim=64 this is exactly 4 vector loads each. */
+/* SVE inner product over head_dim elements (legacy horizontal form, kept for
+ * the rare in-place dot used outside attention). */
 static inline float sve_dot_hd(const float *a, const float *b, int hd) {
     const svbool_t pg = svptrue_b32();
     const int VL = (int)svcntw();
@@ -1129,92 +1129,148 @@ static inline float sve_dot_hd(const float *a, const float *b, int hd) {
     return svaddv_f32(pg, acc);
 }
 
-/* 8-row × 1-shared dot product, hd specialised to a power of VL (4*VL=64 for
- * Qwen3-VL). Uses 8 independent FMLA accumulators sharing a single broadcast
- * operand per d-step — 8 svmla in 4 cycles on the two A64FX FLA pipes versus
- * 9 cycles latency for any single chain, so this is FMA-throughput-bound. */
-static inline void sve_dot_hd_8r(const float *r0, const float *r1,
-                                 const float *r2, const float *r3,
-                                 const float *r4, const float *r5,
-                                 const float *r6, const float *r7,
-                                 const float *s, int hd, float out[8]) {
+/* Vertical QK^T kernel: 8 Q rows × 48 K positions (3 SVE VL-tiles of 16) per
+ * call. K is laid out transposed as KT[d, p], so for each d we load 3 vector
+ * chunks of consecutive K positions and FMA-broadcast 8 Q[q,d] scalars into
+ * 24 independent accumulators. There is NO horizontal reduction (svaddv) at
+ * the end — accumulators store directly to the score row.
+ *
+ * Throughput model (hd=64, VL=16):
+ *   per d-iter: 3 vec loads + 24 FMA  →  max(3/2, 24/2) = 12 cycles on 2 LD
+ *               and 2 FMA pipes. 24 chains × 1 cycle/chain ≥ 9-cycle FMA
+ *               latency, so all chains hide latency cleanly.
+ *   per call:   64 × 12 = 768 cycles  for 8×48 = 384 scores
+ *               = 0.5 scores/cycle/core  (vs. ~0.33 with the old 8-row
+ *               horizontal dot once svaddv overhead is counted).
+ */
+static inline void qk_vert_8q_48k(const float *qh_base,   /* [8*hd] = 8 consecutive Q rows */
+                                  const float *KT_h_col,  /* [hd, np_stride], base at K tile col */
+                                  int hd, int np_stride,
+                                  float scale,
+                                  float *att_dst,         /* [8 * att_qstride] */
+                                  int att_qstride) {
     const svbool_t pg = svptrue_b32();
     const int VL = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
-    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
-    int d = 0;
-    int hv = hd - (hd % VL);
-    for (; d < hv; d += VL) {
-        svfloat32_t vs = svld1_f32(pg, s + d);
-        a0 = svmla_f32_x(pg, a0, svld1_f32(pg, r0 + d), vs);
-        a1 = svmla_f32_x(pg, a1, svld1_f32(pg, r1 + d), vs);
-        a2 = svmla_f32_x(pg, a2, svld1_f32(pg, r2 + d), vs);
-        a3 = svmla_f32_x(pg, a3, svld1_f32(pg, r3 + d), vs);
-        a4 = svmla_f32_x(pg, a4, svld1_f32(pg, r4 + d), vs);
-        a5 = svmla_f32_x(pg, a5, svld1_f32(pg, r5 + d), vs);
-        a6 = svmla_f32_x(pg, a6, svld1_f32(pg, r6 + d), vs);
-        a7 = svmla_f32_x(pg, a7, svld1_f32(pg, r7 + d), vs);
+    svfloat32_t a00=svdup_f32(0.0f), a01=svdup_f32(0.0f), a02=svdup_f32(0.0f);
+    svfloat32_t a10=svdup_f32(0.0f), a11=svdup_f32(0.0f), a12=svdup_f32(0.0f);
+    svfloat32_t a20=svdup_f32(0.0f), a21=svdup_f32(0.0f), a22=svdup_f32(0.0f);
+    svfloat32_t a30=svdup_f32(0.0f), a31=svdup_f32(0.0f), a32=svdup_f32(0.0f);
+    svfloat32_t a40=svdup_f32(0.0f), a41=svdup_f32(0.0f), a42=svdup_f32(0.0f);
+    svfloat32_t a50=svdup_f32(0.0f), a51=svdup_f32(0.0f), a52=svdup_f32(0.0f);
+    svfloat32_t a60=svdup_f32(0.0f), a61=svdup_f32(0.0f), a62=svdup_f32(0.0f);
+    svfloat32_t a70=svdup_f32(0.0f), a71=svdup_f32(0.0f), a72=svdup_f32(0.0f);
+    for (int d = 0; d < hd; d++) {
+        const float *kp = KT_h_col + (size_t)d * np_stride;
+        svfloat32_t vk0 = svld1_f32(pg, kp);
+        svfloat32_t vk1 = svld1_f32(pg, kp + VL);
+        svfloat32_t vk2 = svld1_f32(pg, kp + 2*VL);
+        float q0 = qh_base[0*hd + d];
+        float q1 = qh_base[1*hd + d];
+        float q2 = qh_base[2*hd + d];
+        float q3 = qh_base[3*hd + d];
+        float q4 = qh_base[4*hd + d];
+        float q5 = qh_base[5*hd + d];
+        float q6 = qh_base[6*hd + d];
+        float q7 = qh_base[7*hd + d];
+        a00 = svmla_n_f32_x(pg, a00, vk0, q0); a01 = svmla_n_f32_x(pg, a01, vk1, q0); a02 = svmla_n_f32_x(pg, a02, vk2, q0);
+        a10 = svmla_n_f32_x(pg, a10, vk0, q1); a11 = svmla_n_f32_x(pg, a11, vk1, q1); a12 = svmla_n_f32_x(pg, a12, vk2, q1);
+        a20 = svmla_n_f32_x(pg, a20, vk0, q2); a21 = svmla_n_f32_x(pg, a21, vk1, q2); a22 = svmla_n_f32_x(pg, a22, vk2, q2);
+        a30 = svmla_n_f32_x(pg, a30, vk0, q3); a31 = svmla_n_f32_x(pg, a31, vk1, q3); a32 = svmla_n_f32_x(pg, a32, vk2, q3);
+        a40 = svmla_n_f32_x(pg, a40, vk0, q4); a41 = svmla_n_f32_x(pg, a41, vk1, q4); a42 = svmla_n_f32_x(pg, a42, vk2, q4);
+        a50 = svmla_n_f32_x(pg, a50, vk0, q5); a51 = svmla_n_f32_x(pg, a51, vk1, q5); a52 = svmla_n_f32_x(pg, a52, vk2, q5);
+        a60 = svmla_n_f32_x(pg, a60, vk0, q6); a61 = svmla_n_f32_x(pg, a61, vk1, q6); a62 = svmla_n_f32_x(pg, a62, vk2, q6);
+        a70 = svmla_n_f32_x(pg, a70, vk0, q7); a71 = svmla_n_f32_x(pg, a71, vk1, q7); a72 = svmla_n_f32_x(pg, a72, vk2, q7);
     }
-    if (d < hd) {
-        svbool_t pgt = svwhilelt_b32_s32(d, hd);
-        svfloat32_t vs = svld1_f32(pgt, s + d);
-        a0 = svmla_f32_m(pgt, a0, svld1_f32(pgt, r0 + d), vs);
-        a1 = svmla_f32_m(pgt, a1, svld1_f32(pgt, r1 + d), vs);
-        a2 = svmla_f32_m(pgt, a2, svld1_f32(pgt, r2 + d), vs);
-        a3 = svmla_f32_m(pgt, a3, svld1_f32(pgt, r3 + d), vs);
-        a4 = svmla_f32_m(pgt, a4, svld1_f32(pgt, r4 + d), vs);
-        a5 = svmla_f32_m(pgt, a5, svld1_f32(pgt, r5 + d), vs);
-        a6 = svmla_f32_m(pgt, a6, svld1_f32(pgt, r6 + d), vs);
-        a7 = svmla_f32_m(pgt, a7, svld1_f32(pgt, r7 + d), vs);
-    }
-    out[0] = svaddv_f32(pg, a0); out[1] = svaddv_f32(pg, a1);
-    out[2] = svaddv_f32(pg, a2); out[3] = svaddv_f32(pg, a3);
-    out[4] = svaddv_f32(pg, a4); out[5] = svaddv_f32(pg, a5);
-    out[6] = svaddv_f32(pg, a6); out[7] = svaddv_f32(pg, a7);
+    svfloat32_t vsc = svdup_f32(scale);
+    svst1_f32(pg, att_dst + 0*att_qstride + 0*VL, svmul_f32_x(pg, a00, vsc));
+    svst1_f32(pg, att_dst + 0*att_qstride + 1*VL, svmul_f32_x(pg, a01, vsc));
+    svst1_f32(pg, att_dst + 0*att_qstride + 2*VL, svmul_f32_x(pg, a02, vsc));
+    svst1_f32(pg, att_dst + 1*att_qstride + 0*VL, svmul_f32_x(pg, a10, vsc));
+    svst1_f32(pg, att_dst + 1*att_qstride + 1*VL, svmul_f32_x(pg, a11, vsc));
+    svst1_f32(pg, att_dst + 1*att_qstride + 2*VL, svmul_f32_x(pg, a12, vsc));
+    svst1_f32(pg, att_dst + 2*att_qstride + 0*VL, svmul_f32_x(pg, a20, vsc));
+    svst1_f32(pg, att_dst + 2*att_qstride + 1*VL, svmul_f32_x(pg, a21, vsc));
+    svst1_f32(pg, att_dst + 2*att_qstride + 2*VL, svmul_f32_x(pg, a22, vsc));
+    svst1_f32(pg, att_dst + 3*att_qstride + 0*VL, svmul_f32_x(pg, a30, vsc));
+    svst1_f32(pg, att_dst + 3*att_qstride + 1*VL, svmul_f32_x(pg, a31, vsc));
+    svst1_f32(pg, att_dst + 3*att_qstride + 2*VL, svmul_f32_x(pg, a32, vsc));
+    svst1_f32(pg, att_dst + 4*att_qstride + 0*VL, svmul_f32_x(pg, a40, vsc));
+    svst1_f32(pg, att_dst + 4*att_qstride + 1*VL, svmul_f32_x(pg, a41, vsc));
+    svst1_f32(pg, att_dst + 4*att_qstride + 2*VL, svmul_f32_x(pg, a42, vsc));
+    svst1_f32(pg, att_dst + 5*att_qstride + 0*VL, svmul_f32_x(pg, a50, vsc));
+    svst1_f32(pg, att_dst + 5*att_qstride + 1*VL, svmul_f32_x(pg, a51, vsc));
+    svst1_f32(pg, att_dst + 5*att_qstride + 2*VL, svmul_f32_x(pg, a52, vsc));
+    svst1_f32(pg, att_dst + 6*att_qstride + 0*VL, svmul_f32_x(pg, a60, vsc));
+    svst1_f32(pg, att_dst + 6*att_qstride + 1*VL, svmul_f32_x(pg, a61, vsc));
+    svst1_f32(pg, att_dst + 6*att_qstride + 2*VL, svmul_f32_x(pg, a62, vsc));
+    svst1_f32(pg, att_dst + 7*att_qstride + 0*VL, svmul_f32_x(pg, a70, vsc));
+    svst1_f32(pg, att_dst + 7*att_qstride + 1*VL, svmul_f32_x(pg, a71, vsc));
+    svst1_f32(pg, att_dst + 7*att_qstride + 2*VL, svmul_f32_x(pg, a72, vsc));
 }
 
-/* 4-row × 1-shared dot product (used as a tail step when np is not a
- * multiple of 8). */
-static inline void sve_dot_hd_4q(const float *q0, const float *q1,
-                                 const float *q2, const float *q3,
-                                 const float *k, int hd, float out[4]) {
+/* Vertical 1-query QK^T tail: handles the remaining 0..7 queries from a
+ * partial 8-batch, and/or the 0..(3*VL-1) K positions left after the 48-wide
+ * tile loop. Uses up to 8 SVE accumulators across 8 K sub-tiles to keep FMA
+ * pipes busy even with a single broadcast operand. */
+static inline void qk_vert_1q(const float *qh, /* [hd] */
+                              const float *KT_h, /* [hd, np_stride] */
+                              int hd, int np, int np_stride, float scale,
+                              float *att_row /* [np] */) {
     const svbool_t pg = svptrue_b32();
     const int VL = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f);
-    svfloat32_t a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f);
-    svfloat32_t a3 = svdup_f32(0.0f);
-    int d = 0;
-    int hv = hd - (hd % VL);
-    for (; d < hv; d += VL) {
-        svfloat32_t vk = svld1_f32(pg, k + d);
-        svfloat32_t v0 = svld1_f32(pg, q0 + d);
-        svfloat32_t v1 = svld1_f32(pg, q1 + d);
-        svfloat32_t v2 = svld1_f32(pg, q2 + d);
-        svfloat32_t v3 = svld1_f32(pg, q3 + d);
-        a0 = svmla_f32_x(pg, a0, v0, vk);
-        a1 = svmla_f32_x(pg, a1, v1, vk);
-        a2 = svmla_f32_x(pg, a2, v2, vk);
-        a3 = svmla_f32_x(pg, a3, v3, vk);
+    int ki = 0;
+    for (; ki + 8*VL <= np; ki += 8*VL) {
+        svfloat32_t a0=svdup_f32(0.0f), a1=svdup_f32(0.0f), a2=svdup_f32(0.0f), a3=svdup_f32(0.0f);
+        svfloat32_t a4=svdup_f32(0.0f), a5=svdup_f32(0.0f), a6=svdup_f32(0.0f), a7=svdup_f32(0.0f);
+        for (int d = 0; d < hd; d++) {
+            const float *kp = KT_h + (size_t)d * np_stride + ki;
+            float q = qh[d];
+            a0 = svmla_n_f32_x(pg, a0, svld1_f32(pg, kp + 0*VL), q);
+            a1 = svmla_n_f32_x(pg, a1, svld1_f32(pg, kp + 1*VL), q);
+            a2 = svmla_n_f32_x(pg, a2, svld1_f32(pg, kp + 2*VL), q);
+            a3 = svmla_n_f32_x(pg, a3, svld1_f32(pg, kp + 3*VL), q);
+            a4 = svmla_n_f32_x(pg, a4, svld1_f32(pg, kp + 4*VL), q);
+            a5 = svmla_n_f32_x(pg, a5, svld1_f32(pg, kp + 5*VL), q);
+            a6 = svmla_n_f32_x(pg, a6, svld1_f32(pg, kp + 6*VL), q);
+            a7 = svmla_n_f32_x(pg, a7, svld1_f32(pg, kp + 7*VL), q);
+        }
+        svfloat32_t vsc = svdup_f32(scale);
+        svst1_f32(pg, att_row + ki + 0*VL, svmul_f32_x(pg, a0, vsc));
+        svst1_f32(pg, att_row + ki + 1*VL, svmul_f32_x(pg, a1, vsc));
+        svst1_f32(pg, att_row + ki + 2*VL, svmul_f32_x(pg, a2, vsc));
+        svst1_f32(pg, att_row + ki + 3*VL, svmul_f32_x(pg, a3, vsc));
+        svst1_f32(pg, att_row + ki + 4*VL, svmul_f32_x(pg, a4, vsc));
+        svst1_f32(pg, att_row + ki + 5*VL, svmul_f32_x(pg, a5, vsc));
+        svst1_f32(pg, att_row + ki + 6*VL, svmul_f32_x(pg, a6, vsc));
+        svst1_f32(pg, att_row + ki + 7*VL, svmul_f32_x(pg, a7, vsc));
     }
-    if (d < hd) {
-        svbool_t pgt = svwhilelt_b32_s32(d, hd);
-        svfloat32_t vk = svld1_f32(pgt, k + d);
-        svfloat32_t v0 = svld1_f32(pgt, q0 + d);
-        svfloat32_t v1 = svld1_f32(pgt, q1 + d);
-        svfloat32_t v2 = svld1_f32(pgt, q2 + d);
-        svfloat32_t v3 = svld1_f32(pgt, q3 + d);
-        a0 = svmla_f32_m(pgt, a0, v0, vk);
-        a1 = svmla_f32_m(pgt, a1, v1, vk);
-        a2 = svmla_f32_m(pgt, a2, v2, vk);
-        a3 = svmla_f32_m(pgt, a3, v3, vk);
+    for (; ki + 3*VL <= np; ki += 3*VL) {
+        svfloat32_t a0=svdup_f32(0.0f), a1=svdup_f32(0.0f), a2=svdup_f32(0.0f);
+        for (int d = 0; d < hd; d++) {
+            const float *kp = KT_h + (size_t)d * np_stride + ki;
+            float q = qh[d];
+            a0 = svmla_n_f32_x(pg, a0, svld1_f32(pg, kp + 0*VL), q);
+            a1 = svmla_n_f32_x(pg, a1, svld1_f32(pg, kp + 1*VL), q);
+            a2 = svmla_n_f32_x(pg, a2, svld1_f32(pg, kp + 2*VL), q);
+        }
+        svfloat32_t vsc = svdup_f32(scale);
+        svst1_f32(pg, att_row + ki + 0*VL, svmul_f32_x(pg, a0, vsc));
+        svst1_f32(pg, att_row + ki + 1*VL, svmul_f32_x(pg, a1, vsc));
+        svst1_f32(pg, att_row + ki + 2*VL, svmul_f32_x(pg, a2, vsc));
     }
-    out[0] = svaddv_f32(pg, a0);
-    out[1] = svaddv_f32(pg, a1);
-    out[2] = svaddv_f32(pg, a2);
-    out[3] = svaddv_f32(pg, a3);
+    for (; ki + VL <= np; ki += VL) {
+        svfloat32_t a0 = svdup_f32(0.0f);
+        for (int d = 0; d < hd; d++)
+            a0 = svmla_n_f32_x(pg, a0, svld1_f32(pg, KT_h + (size_t)d * np_stride + ki), qh[d]);
+        svst1_f32(pg, att_row + ki, svmul_n_f32_x(pg, a0, scale));
+    }
+    if (ki < np) {
+        svbool_t pgt = svwhilelt_b32_s32(ki, np);
+        svfloat32_t a0 = svdup_f32(0.0f);
+        for (int d = 0; d < hd; d++)
+            a0 = svmla_n_f32_x(pg, a0, svld1_f32(pgt, KT_h + (size_t)d * np_stride + ki), qh[d]);
+        svst1_f32(pgt, att_row + ki, svmul_n_f32_x(pg, a0, scale));
+    }
 }
 
 /* SVE AXPY over head_dim:  out[d] += w * vh[d]. */
@@ -1277,13 +1333,20 @@ static inline void attn_av_1q(const float *att, const float *V_h, int np,
 
 /* Head-major Q/K/V extraction work unit = one head. Converts the
  * interleaved qkv layout [np, 3, n_heads, hd] into three contiguous
- * head-major buffers [n_heads, np, hd], one head per worker iteration.
+ * head-major buffers, one head per worker iteration:
+ *   Q_hm : [n_heads, np, hd]          row-major (np outer, hd inner)
+ *   KT_hm: [n_heads, hd, np]          TRANSPOSED — hd outer, np inner.
+ *                                     Required by the vertical QK^T kernel
+ *                                     so that K[d, ki..ki+VL-1] is one SVE
+ *                                     vector load.
+ *   V_hm : [n_heads, np, hd]          row-major
  * Removes the 3*dim stride that thrashed the L1 prefetcher inside the
- * dot/AXPY inner loops. */
+ * dot/AXPY inner loops, and pre-transposes K so QK^T no longer needs a
+ * horizontal svaddv reduction. */
 typedef struct {
     const float *qkv;
     float       *Q_hm;
-    float       *K_hm;
+    float       *KT_hm;
     float       *V_hm;
     int          n_patches;
     int          dim;
@@ -1299,14 +1362,17 @@ static void qkv_extract_body(int tid, int w0, int w1, void *arg) {
     int hd = a->head_dim;
     size_t hd_bytes = (size_t)hd * sizeof(float);
     for (int h = w0; h < w1; h++) {
-        float *Q_h = a->Q_hm + (size_t)h * np * hd;
-        float *K_h = a->K_hm + (size_t)h * np * hd;
-        float *V_h = a->V_hm + (size_t)h * np * hd;
+        float *Q_h  = a->Q_hm  + (size_t)h * np * hd;
+        float *KT_h = a->KT_hm + (size_t)h * hd * np;
+        float *V_h  = a->V_hm  + (size_t)h * np * hd;
         for (int p = 0; p < np; p++) {
             const float *src = a->qkv + (size_t)p * 3 * dim + h * hd;
             memcpy(Q_h + (size_t)p * hd, src,             hd_bytes);
-            memcpy(K_h + (size_t)p * hd, src + dim,       hd_bytes);
             memcpy(V_h + (size_t)p * hd, src + 2 * dim,   hd_bytes);
+            /* K is transposed: KT_h[d, p] = qkv[p, dim + h*hd + d] */
+            const float *ks = src + dim;
+            for (int d = 0; d < hd; d++)
+                KT_h[(size_t)d * np + p] = ks[d];
         }
     }
 }
@@ -1314,7 +1380,13 @@ static void qkv_extract_body(int tid, int w0, int w1, void *arg) {
 /* Work unit = one (head, query-tile) pair, flattened as
  * w = h * n_qtiles + qt. Tiling the query dimension lets attention scale
  * past n_heads threads (16) up to n_heads * n_qtiles — needed for 48-core
- * multi-CMG runs where head-only partition leaves 2/3 of cores idle. */
+ * multi-CMG runs where head-only partition leaves 2/3 of cores idle.
+ *
+ * QK^T uses the vertical 8q×48k kernel (qk_vert_8q_48k) operating on the
+ * transposed KT_hm layout — no svaddv in the inner. Q tail (queries not
+ * divisible by 8) and K tail (positions not divisible by 48) drop through
+ * to qk_vert_1q, which keeps 8 K-tile accumulators per single query.
+ */
 static void attn_body(int tid, int w0, int w1, void *arg) {
     attn_args *a = (attn_args *)arg;
     int np = a->n_patches;
@@ -1328,66 +1400,51 @@ static void attn_body(int tid, int w0, int w1, void *arg) {
     float *att = (float *)vlm_pool_scratch(a->pool, tid,
                                             (size_t)qt * np * sizeof(float));
 
+    const int K_TILE = 48; /* 3 * VL on A64FX */
+
     for (int w = w0; w < w1; w++) {
         int h  = w / nqt;
         int q0 = (w % nqt) * qt;
         int q1 = q0 + qt; if (q1 > np) q1 = np;
 
-        const float *Q_h = a->Q_hm + (size_t)h * np * hd;
-        const float *K_h = a->K_hm + (size_t)h * np * hd;
-        const float *V_h = a->V_hm + (size_t)h * np * hd;
+        const float *Q_h  = a->Q_hm  + (size_t)h * np * hd;
+        const float *KT_h = a->KT_hm + (size_t)h * hd * np;
+        const float *V_h  = a->V_hm  + (size_t)h * np * hd;
 
-        /* Q · Kᵀ — batch 4 K rows per inner step to share K loads across
-         * 4 independent FMA accumulators and hide A64FX FMA latency. */
-        for (int qi = q0; qi < q1; qi++) {
-            const float *qh = Q_h + (size_t)qi * hd;
-            float *att_row = att + (size_t)(qi - q0) * np;
+        /* Q · Kᵀ — process 8 queries × 48 K positions per inner call. */
+        int qi = q0;
+        for (; qi + 8 <= q1; qi += 8) {
+            const float *qh_base = Q_h + (size_t)qi * hd;
+            float *att_base = att + (size_t)(qi - q0) * np;
             int ki = 0;
-            /* 8 K rows share each Q broadcast — 8 independent FMA chains
-             * fully cover the 9-cycle A64FX FMA latency on both pipes. */
-            for (; ki + 8 <= np; ki += 8) {
-                float r[8];
-                sve_dot_hd_8r(K_h + (size_t)(ki + 0) * hd,
-                              K_h + (size_t)(ki + 1) * hd,
-                              K_h + (size_t)(ki + 2) * hd,
-                              K_h + (size_t)(ki + 3) * hd,
-                              K_h + (size_t)(ki + 4) * hd,
-                              K_h + (size_t)(ki + 5) * hd,
-                              K_h + (size_t)(ki + 6) * hd,
-                              K_h + (size_t)(ki + 7) * hd,
-                              qh, hd, r);
-                att_row[ki + 0] = r[0] * scale;
-                att_row[ki + 1] = r[1] * scale;
-                att_row[ki + 2] = r[2] * scale;
-                att_row[ki + 3] = r[3] * scale;
-                att_row[ki + 4] = r[4] * scale;
-                att_row[ki + 5] = r[5] * scale;
-                att_row[ki + 6] = r[6] * scale;
-                att_row[ki + 7] = r[7] * scale;
+            for (; ki + K_TILE <= np; ki += K_TILE) {
+                qk_vert_8q_48k(qh_base, KT_h + ki, hd, np, scale,
+                               att_base + ki, np /*att_qstride*/);
             }
-            for (; ki + 4 <= np; ki += 4) {
-                float r[4];
-                sve_dot_hd_4q(K_h + (size_t)(ki + 0) * hd,
-                              K_h + (size_t)(ki + 1) * hd,
-                              K_h + (size_t)(ki + 2) * hd,
-                              K_h + (size_t)(ki + 3) * hd,
-                              qh, hd, r);
-                att_row[ki + 0] = r[0] * scale;
-                att_row[ki + 1] = r[1] * scale;
-                att_row[ki + 2] = r[2] * scale;
-                att_row[ki + 3] = r[3] * scale;
-            }
-            for (; ki < np; ki++) {
-                att_row[ki] = sve_dot_hd(qh, K_h + (size_t)ki * hd, hd) * scale;
+            if (ki < np) {
+                /* K tail: handle remaining np-ki < 48 positions for each of
+                 * the 8 queries via qk_vert_1q. */
+                for (int qq = 0; qq < 8; qq++) {
+                    qk_vert_1q(qh_base + (size_t)qq * hd,
+                               KT_h + ki, hd, np - ki, np, scale,
+                               att_base + (size_t)qq * np + ki);
+                }
             }
         }
+        /* Q tail: <8 queries remaining */
+        for (; qi < q1; qi++) {
+            const float *qh = Q_h + (size_t)qi * hd;
+            float *att_row = att + (size_t)(qi - q0) * np;
+            qk_vert_1q(qh, KT_h, hd, np, np, scale, att_row);
+        }
+
         /* softmax per row (SVE FEXPA) */
-        for (int qi = q0; qi < q1; qi++)
-            softmax_row(att + (size_t)(qi - q0) * np, np);
+        for (int qi2 = q0; qi2 < q1; qi2++)
+            softmax_row(att + (size_t)(qi2 - q0) * np, np);
         /* attn · V (registers-held output, 4 split accumulators across hd) */
-        for (int qi = q0; qi < q1; qi++) {
-            float *out = a->attn_out + (size_t)qi * dim + h * hd;
-            const float *att_row = att + (size_t)(qi - q0) * np;
+        for (int qi2 = q0; qi2 < q1; qi2++) {
+            float *out = a->attn_out + (size_t)qi2 * dim + h * hd;
+            const float *att_row = att + (size_t)(qi2 - q0) * np;
             attn_av_1q(att_row, V_h, np, hd, out);
         }
     }
@@ -1395,14 +1452,14 @@ static void attn_body(int tid, int w0, int w1, void *arg) {
 
 static void attention_mt(vlm_pool *pool,
                          const float *qkv,
-                         float *Q_hm, float *K_hm, float *V_hm,
+                         float *Q_hm, float *KT_hm, float *V_hm,
                          float *attn_out,
                          int n_patches, int dim, int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    /* 1) Extract head-major Q/K/V (one head per worker — fully parallel,
-     *    no cross-thread sharing). */
-    qkv_extract_args ex = { qkv, Q_hm, K_hm, V_hm,
+    /* 1) Extract head-major Q/V (np-major) and KT (hd-major, transposed) —
+     *    one head per worker, fully parallel, no cross-thread sharing. */
+    qkv_extract_args ex = { qkv, Q_hm, KT_hm, V_hm,
                             n_patches, dim, head_dim, n_heads };
     vlm_parallel_for(pool, n_heads, 1, qkv_extract_body, &ex);
 
@@ -1415,8 +1472,11 @@ static void attention_mt(vlm_pool *pool,
         if (q_tile > 64) q_tile = 64;
         if (q_tile < 1)  q_tile = 1;
     }
+    /* Round q_tile up to a multiple of 8 so the inner 8q kernel covers it
+     * cleanly (Q-tail loop only runs at the very end of np). */
+    if (q_tile > 8) q_tile = (q_tile / 8) * 8;
     int n_qtiles = (n_patches + q_tile - 1) / q_tile;
-    attn_args a = { Q_hm, K_hm, V_hm, attn_out, n_patches, dim, head_dim,
+    attn_args a = { Q_hm, KT_hm, V_hm, attn_out, n_patches, dim, head_dim,
                     n_heads, scale, q_tile, n_qtiles, pool };
     vlm_parallel_for(pool, n_heads * n_qtiles, 1, attn_body, &a);
 }
@@ -1704,12 +1764,14 @@ float *vit_a64fx_encode(struct vision_model *vm,
     float *hidden2   = xcalloc_f((size_t)n_patches * dim);
     float *qkv       = xcalloc_f((size_t)n_patches * 3 * dim);
     float *attn_out  = xcalloc_f((size_t)n_patches * dim);
-    /* Head-major Q/K/V scratch for the attn stage. Same total bytes as qkv
-     * (3 * n_heads * n_patches * head_dim == n_patches * 3 * dim) but laid
-     * out [n_heads, n_patches, head_dim] so the inner Q·K^T and AV kernels
-     * stride contiguously and the L1 prefetcher tracks correctly. */
+    /* Head-major Q/V scratch and TRANSPOSED head-major K scratch for the
+     * attn stage. Same total bytes as qkv (3 * n_heads * n_patches *
+     * head_dim == n_patches * 3 * dim). Q/V are laid out [n_heads, np, hd]
+     * for the AV stage; KT is laid out [n_heads, hd, np] so the vertical
+     * QK^T kernel can SVE-load contiguous K positions per d-step (no
+     * svaddv reductions). */
     float *Q_hm      = xmalloc_f((size_t)n_heads * n_patches * head_dim);
-    float *K_hm      = xmalloc_f((size_t)n_heads * n_patches * head_dim);
+    float *KT_hm     = xmalloc_f((size_t)n_heads * head_dim * n_patches);
     float *V_hm      = xmalloc_f((size_t)n_heads * n_patches * head_dim);
     float *ffn_buf   = xcalloc_f((size_t)n_patches * ffn_dim);
     float *ln_buf    = xcalloc_f((size_t)n_patches * dim);
@@ -1822,7 +1884,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
         dump2(dump, "mrope", l, n_patches, 3 * dim, qkv);
 
         /* Attention */
-        attention_mt(pool, qkv, Q_hm, K_hm, V_hm, attn_out,
+        attention_mt(pool, qkv, Q_hm, KT_hm, V_hm, attn_out,
                      n_patches, dim, n_heads, head_dim);
         st_tick(&st, ST_ATTN);
         dump2(dump, "attn", l, n_patches, dim, attn_out);
@@ -2056,7 +2118,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
 
     /* Cleanup */
     free(hidden); free(hidden2); free(qkv); free(attn_out);
-    free(Q_hm); free(K_hm); free(V_hm);
+    free(Q_hm); free(KT_hm); free(V_hm);
     free(ffn_buf); free(ln_buf); free(merge_buf); free(deepstack_feats);
     free(mm_buf); free(mm_out);
 
