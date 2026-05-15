@@ -254,6 +254,14 @@ int main(int argc, char **argv) {
             free(buf_p);
         }
 
+        /* Warm-up prefill (first call builds hipBLASLt plans; not counted). */
+        const char *warmup_env = getenv("LLM_PREFILL_WARMUP");
+        int n_warmup = warmup_env ? atoi(warmup_env) : 0;
+        for (int w = 0; w < n_warmup; w++) {
+            float *lg = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            if (!lg) { fprintf(stderr, "GPU prefill warmup %d failed\n", w); pass = 0; goto bench_done; }
+        }
+
         /* Prefill: a single forward_batch_logits call. Phase 1 implementation is a
          * per-token loop; Phase 2 will swap in a true batched WMMA path. */
         double t_pf0 = get_time_ms();

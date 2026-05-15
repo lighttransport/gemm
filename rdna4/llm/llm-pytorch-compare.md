@@ -8,7 +8,42 @@ hybrid-SSM inference kernel).
 
 Date: 2026-05-15 · GPU: AMD Radeon RX 9070 XT (gfx1201) · ROCm 7.2
 
-## Part A — Qwen3-VL-2B (F16) vs PyTorch ROCm
+## Update (2026-05-15) — Track A landed
+
+The dense F16 prefill gap was three problems, all fixed:
+
+1. **Plan-build cold-start**: first call to `mm_blaslt_run_bf16` built a hipBLASLt
+   plan for every shape (~1 s for the 7 LLM GEMMs). Fixed by **plan pre-warm at
+   init** (env `LLM_PLAN_PREWARM=1` default ON; fires the 7 shapes at M=64/256/BMAX).
+2. **BMAX=512 cliff**: prefill_len > 512 fell back to the per-token loop entirely.
+   Fixed by **raising default BMAX to 4096** (env `LLM_BMAX` still overrides).
+3. **Per-row launch overhead**: `rmsnorm_f32` and `qknorm_f32` were launched M
+   times per layer (~30k launches for L=256 prefill). Fixed by adding batched
+   variants **`rmsnorm_batch_f32`** and **`qknorm_batch_f32`** that take a row
+   stride and run grid `(M,1,1)` or `(n_heads, M, 1)` — one launch per layer
+   per norm.
+
+Updated numbers (Qwen3-VL-2B F16, `test_hip_vision`-style warm, no warmup needed):
+
+| L     | HIP before | HIP after | PyTorch ROCm | HIP-after vs PyTorch | speedup over before |
+|------:|-----------:|----------:|-------------:|---------------------:|--------------------:|
+|   64  | 1161 ms    | **20.7 ms** | 33.8 ms    | **1.64× faster**     | **56×** |
+|  256  | 1334 ms    | **29.3 ms** | 35.2 ms    | **1.20× faster**     | **46×** |
+| 1024  | 10857 ms   | **51.3 ms** | 56.8 ms    | **1.11× faster**     | **211×** |
+
+HIP now beats the PyTorch ROCm reference on dense F16 at every prefill length.
+Decode unchanged (still 2-3× ahead of PyTorch). Correctness checked via
+`test_hip_llm --compare-paths`: per-token vs batched argmax matches; rel_L2
+~1% (expected BF16/F16 noise).
+
+**The Part-B 27B hybrid-SSM characterization below is unchanged** — Phase-2
+is still gated off for hybrid/quant models; that's Track B (in-progress).
+The original Part A numbers from before Track A landed are kept below for
+historical record.
+
+---
+
+## Part A (historical, pre-Track-A) — Qwen3-VL-2B (F16) vs PyTorch ROCm
 
 Standard transformer (no SSM, no MoE); F16 weights both sides.
 

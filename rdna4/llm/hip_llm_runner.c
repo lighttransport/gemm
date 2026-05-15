@@ -116,6 +116,32 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 2b. rmsnorm_batch_f32: RMSNorm over n_rows rows, one block per row ---- */\n"
+"__global__ void rmsnorm_batch_f32(float *dst, const float *x, const float *w,\n"
+"                                    int n, int row_stride, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int row = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    const float *xrow = x   + (size_t)row * row_stride;\n"
+"    float       *drow = dst + (size_t)row * row_stride;\n"
+"    float sum = 0.0f;\n"
+"    for (int i = tid; i < n; i += nthreads) {\n"
+"        float v = xrow[i];\n"
+"        sum += v * v;\n"
+"    }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = nthreads / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)n + eps);\n"
+"    for (int i = tid; i < n; i += nthreads) {\n"
+"        drow[i] = xrow[i] * scale * w[i];\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- 4. qknorm_f32: Per-head RMSNorm for Q/K ---- */\n"
 "/* Grid: n_heads blocks, blockDim = head_dim threads (must be power of 2, <= 1024) */\n"
 "__global__ void qknorm_f32(float *vec, const float *w, int n_heads, int head_dim, float eps) {\n"
@@ -140,6 +166,27 @@ static const char *hip_kernel_source =
 "    if (tid < head_dim) {\n"
 "        v[tid] = val * scale * w[tid];\n"
 "    }\n"
+"}\n"
+"\n"
+"/* ---- 4b. qknorm_batch_f32: per-row, per-head RMSNorm; grid=(n_heads, M) ---- */\n"
+"__global__ void qknorm_batch_f32(float *vec, const float *w,\n"
+"                                   int n_heads, int head_dim, int row_stride,\n"
+"                                   float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h   = blockIdx.x;\n"
+"    int row = blockIdx.y;\n"
+"    if (h >= n_heads) return;\n"
+"    int tid = threadIdx.x;\n"
+"    float *v = vec + (size_t)row * row_stride + h * head_dim;\n"
+"    float val = (tid < head_dim) ? v[tid] : 0.0f;\n"
+"    sdata[tid] = val * val;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    if (tid < head_dim) v[tid] = val * scale * w[tid];\n"
 "}\n"
 "\n"
 "/* ---- 5. rope_neox_f32: NeoX-style RoPE, pairs (j, j+pair_offset) ---- */\n"
@@ -3456,8 +3503,10 @@ struct hip_llm_runner {
     hipModule_t module;
     hipFunction_t fn_embed_f16;
     hipFunction_t fn_rmsnorm_f32;
+    hipFunction_t fn_rmsnorm_batch_f32;
     hipFunction_t fn_matvec_f16_f32;
     hipFunction_t fn_qknorm_f32;
+    hipFunction_t fn_qknorm_batch_f32;
     hipFunction_t fn_rope_neox_f32;
     hipFunction_t fn_rope_mrope_f32;
     hipFunction_t fn_kv_cache_store;
@@ -3678,8 +3727,10 @@ static int compile_kernels(hip_llm_runner *r) {
 
     GET_FUNC(embed_f16);
     GET_FUNC(rmsnorm_f32);
+    GET_FUNC(rmsnorm_batch_f32);
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(qknorm_f32);
+    GET_FUNC(qknorm_batch_f32);
     GET_FUNC(rope_neox_f32);
     GET_FUNC(rope_mrope_f32);
     GET_FUNC(kv_cache_store);
@@ -4439,11 +4490,11 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
      * for hipBLASLt prefill GEMMs. Only enabled for non-hybrid, non-MoE,
      * F16-weight dense Qwen3-style models. =================================== */
     {
-        int batch_max = 512;
+        int batch_max = 4096;  /* default raised from 512 to cover prefill_len=1024+ */
         const char *env_bm = getenv("LLM_BMAX");
         if (env_bm) batch_max = atoi(env_bm);
         if (batch_max < 1) batch_max = 1;
-        if (batch_max > 4096) batch_max = 4096;
+        if (batch_max > 8192) batch_max = 8192;
         r->batch_max = batch_max;
 
         int gemm_thresh = 8;
@@ -4538,6 +4589,46 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
                     batch_max, gemm_thresh);
             }
 
+            /* Plan pre-warm: fire the 7 hipBLASLt prefill GEMM shapes once at
+             * representative M values so the per-(M,N,K) plan cache is hot on
+             * the first user call. Set LLM_PLAN_PREWARM=0 to skip. */
+            const char *prewarm_env = getenv("LLM_PLAN_PREWARM");
+            int do_prewarm = (prewarm_env == NULL) ? 1 : atoi(prewarm_env);
+            if (do_prewarm && r->n_layers > 0) {
+                hip_layer *cl0 = &r->layers[0];
+                /* Representative Ms — covers small prompts, medium, and BMAX. */
+                int warm_Ms[3];
+                int n_warm_Ms = 0;
+                warm_Ms[n_warm_Ms++] = 64;
+                if (batch_max > 64)  warm_Ms[n_warm_Ms++] = (batch_max < 256 ? batch_max : 256);
+                if (batch_max > 256) warm_Ms[n_warm_Ms++] = batch_max;
+                double pw0 = (r->verbose >= 1) ? 0.0 : 0.0;
+                for (int wi = 0; wi < n_warm_Ms; wi++) {
+                    int M = warm_Ms[wi];
+                    /* Q/K/V/O + gate/up/down */
+                    mm_blaslt_run_bf16(r->d_q_batch,    cl0->attn_q_w_bf16,
+                                       r->d_xnorm_batch_bf16, M, q_dim,    r->n_embd, r->stream);
+                    mm_blaslt_run_bf16(r->d_k_batch,    cl0->attn_k_w_bf16,
+                                       r->d_xnorm_batch_bf16, M, kv_dim,   r->n_embd, r->stream);
+                    mm_blaslt_run_bf16(r->d_v_batch,    cl0->attn_v_w_bf16,
+                                       r->d_xnorm_batch_bf16, M, kv_dim,   r->n_embd, r->stream);
+                    mm_blaslt_run_bf16(r->d_attn_proj_batch, cl0->attn_output_w_bf16,
+                                       r->d_attn_out_batch_bf16, M, r->n_embd, q_dim, r->stream);
+                    mm_blaslt_run_bf16(r->d_gate_batch, cl0->ffn_gate_w_bf16,
+                                       r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
+                    mm_blaslt_run_bf16(r->d_up_batch,   cl0->ffn_up_w_bf16,
+                                       r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
+                    mm_blaslt_run_bf16(r->d_down_batch, cl0->ffn_down_w_bf16,
+                                       r->d_silu_batch_bf16,    M, r->n_embd, r->n_ff, r->stream);
+                }
+                hipStreamSynchronize(r->stream);
+                (void)pw0;
+                if (r->verbose >= 1) {
+                    fprintf(stderr, "hip_llm: Phase-2 plan pre-warm: %d shapes × %d Ms\n",
+                            7, n_warm_Ms);
+                }
+            }
+
             /* Phase 3: flash-attention scratch.
              * Requires head_dim <= 128 and (n_heads % n_kv_heads) == 0. */
             int fa_disable = 0;
@@ -4622,6 +4713,15 @@ static inline void launch_rmsnorm(hip_llm_runner *r, void *dst, void *x,
     LAUNCH(r->fn_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, args);
 }
 
+/* Batched RMSNorm: one block per row, n_rows blocks. row_stride = n unless padded. */
+static inline void launch_rmsnorm_batch(hip_llm_runner *r, void *dst, void *x,
+                                          void *w, int n, int n_rows, int row_stride,
+                                          float eps) {
+    void *args[] = { &dst, &x, &w, &n, &row_stride, &eps };
+    LAUNCH(r->fn_rmsnorm_batch_f32, n_rows, 1, 1, 256, 1, 1, 256 * sizeof(float),
+           r->stream, args);
+}
+
 static inline void launch_matvec(hip_llm_runner *r, void *dst, void *mat,
                                   void *x, int n_rows, int n_cols) {
     /* Phase 4: WMMA path needs n_rows multiple of 16 and n_cols >= 16. */
@@ -4644,6 +4744,18 @@ static inline void launch_qknorm(hip_llm_runner *r, void *vec, void *w,
     if (bdim > 256) bdim = 256;
     void *args[] = { &vec, &w, &n_heads, &head_dim, &eps };
     LAUNCH(r->fn_qknorm_f32, n_heads, 1, 1, bdim, 1, 1, bdim * sizeof(float), r->stream, args);
+}
+
+/* Batched QK-norm: grid = (n_heads, n_rows). row_stride = n_heads*head_dim. */
+static inline void launch_qknorm_batch(hip_llm_runner *r, void *vec, void *w,
+                                         int n_heads, int head_dim,
+                                         int n_rows, int row_stride, float eps) {
+    int bdim = 1;
+    while (bdim < head_dim) bdim <<= 1;
+    if (bdim > 256) bdim = 256;
+    void *args[] = { &vec, &w, &n_heads, &head_dim, &row_stride, &eps };
+    LAUNCH(r->fn_qknorm_batch_f32, n_heads, n_rows, 1, bdim, 1, 1,
+           bdim * sizeof(float), r->stream, args);
 }
 
 static inline void launch_rope(hip_llm_runner *r, void *vec, int n_heads,
@@ -5437,12 +5549,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
     for (int l = 0; l < n_run_layers; l++) {
         hip_layer *cl = &r->layers[l];
 
-        /* ---- Pre-attention RMSNorm (M rows) ---- */
-        for (int m = 0; m < M; m++) {
-            float *xrow  = (float *)r->d_x_batch     + (size_t)m * n_embd;
-            float *xnrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
-            launch_rmsnorm(r, xnrow, xrow, cl->attn_norm_w, n_embd, eps);
-        }
+        /* ---- Pre-attention RMSNorm: one batched launch over M rows ---- */
+        launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
+                             cl->attn_norm_w, n_embd, M, n_embd, eps);
 
         /* Pack BF16 input (single launch over M*n_embd) */
         launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16,
@@ -5456,20 +5565,27 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         if (mm_blaslt_run_bf16(r->d_v_batch, cl->attn_v_w_bf16,
                                r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
 
-        /* ---- Per-row biases / QK-norm (M rows) ---- */
-        for (int m = 0; m < M; m++) {
-            float *qrow = (float *)r->d_q_batch + (size_t)m * q_dim;
-            float *krow = (float *)r->d_k_batch + (size_t)m * kv_dim;
-            float *vrow = (float *)r->d_v_batch + (size_t)m * kv_dim;
-
-            if (cl->attn_q_bias) launch_add(r, qrow, cl->attn_q_bias, q_dim);
-            if (cl->attn_k_bias) launch_add(r, krow, cl->attn_k_bias, kv_dim);
-            if (cl->attn_v_bias) launch_add(r, vrow, cl->attn_v_bias, kv_dim);
-
-            if (cl->has_qk_norm) {
-                if (cl->attn_q_norm_w) launch_qknorm(r, qrow, cl->attn_q_norm_w, n_heads,    head_dim, eps);
-                if (cl->attn_k_norm_w) launch_qknorm(r, krow, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
+        /* ---- Biases (per-row loop kept; one launch per row is cheap, only 3 × M
+         *      ~ several thousand launches at L=1024 — defer to a batched bias kernel
+         *      if it shows up in profile. QK-norm is the heavy one and is batched.) ---- */
+        if (cl->attn_q_bias || cl->attn_k_bias || cl->attn_v_bias) {
+            for (int m = 0; m < M; m++) {
+                float *qrow = (float *)r->d_q_batch + (size_t)m * q_dim;
+                float *krow = (float *)r->d_k_batch + (size_t)m * kv_dim;
+                float *vrow = (float *)r->d_v_batch + (size_t)m * kv_dim;
+                if (cl->attn_q_bias) launch_add(r, qrow, cl->attn_q_bias, q_dim);
+                if (cl->attn_k_bias) launch_add(r, krow, cl->attn_k_bias, kv_dim);
+                if (cl->attn_v_bias) launch_add(r, vrow, cl->attn_v_bias, kv_dim);
             }
+        }
+        /* ---- QK-norm: batched over M rows ---- */
+        if (cl->has_qk_norm) {
+            if (cl->attn_q_norm_w)
+                launch_qknorm_batch(r, r->d_q_batch, cl->attn_q_norm_w,
+                                    n_heads,    head_dim, M, q_dim,  eps);
+            if (cl->attn_k_norm_w)
+                launch_qknorm_batch(r, r->d_k_batch, cl->attn_k_norm_w,
+                                    n_kv_heads, head_dim, M, kv_dim, eps);
         }
 
         /* ---- Batched RoPE on Q and K (one launch each, grid=(n_heads, M)) ---- */
@@ -5533,12 +5649,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* Residual: x_batch += attn_proj */
         launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
 
-        /* ---- Pre-FFN RMSNorm (M rows) ---- */
-        for (int m = 0; m < M; m++) {
-            float *xrow  = (float *)r->d_x_batch     + (size_t)m * n_embd;
-            float *xnrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
-            launch_rmsnorm(r, xnrow, xrow, cl->ffn_norm_w, n_embd, eps);
-        }
+        /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
+        launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
+                             cl->ffn_norm_w, n_embd, M, n_embd, eps);
         launch_pack_bf16_from_f32(r, r->d_ffn_norm_batch_bf16,
                                   r->d_xnorm_batch, M * n_embd);
 
@@ -5574,11 +5687,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         }
     }
 
-    /* ---- Final RMSNorm (M rows) ---- */
-    for (int m = 0; m < M; m++) {
-        float *xrow = (float *)r->d_x_batch + (size_t)m * n_embd;
-        launch_rmsnorm(r, xrow, xrow, r->d_output_norm, n_embd, eps);
-    }
+    /* ---- Final RMSNorm: one batched launch over M rows ---- */
+    launch_rmsnorm_batch(r, r->d_x_batch, r->d_x_batch,
+                         r->d_output_norm, n_embd, M, n_embd, eps);
 
     /* Copy last row into r->d_x so callers (and lm_head path) see the result. */
     float *last_row = (float *)r->d_x_batch + (size_t)(M - 1) * n_embd;
