@@ -729,7 +729,10 @@ via `cuDevicePrimaryCtxRetain`.
 
 - [ ] **VAE weight cleanup**: `qimg_vae_free()` doesn't free all weight buffers (memory leak on reload).
 - [x] **Debug output gated by verbose levels**: 0=silent, 1=progress, 2=stats, 3=dump .npy.
-- [ ] **Error handling**: Some CUDA allocation failures are silently ignored (especially in on-demand block loading).
+- [x] **DiT activation allocation checks**: `cuda_qimg_dit_step` and `cuda_qimg_dit_step_cfg` now check transient activation/scratch/final-output allocations and route failures through cleanup paths instead of continuing with null device pointers.
+- [x] **VAE upload and MMA-conv fallback checks**: VAE weight upload helpers now check host/device allocations, and the tensor-core conv OOM fallback uses the original F32 weight buffer instead of the temporary FP8 buffer.
+- [x] **VAE decode allocation checks**: Middle attention, resblock, upsample, resample-conv, and head buffers now use checked allocations and cleanup paths instead of continuing after null device pointers.
+- [ ] **Error handling**: Some CUDA allocation failures are still silently ignored outside the main DiT/VAE decode paths, especially in lazily grown shared setup buffers and test-only paths.
 
 ## CUDA Benchmark Snapshot (2026-04-19, RTX 5060 Ti 16GB)
 
