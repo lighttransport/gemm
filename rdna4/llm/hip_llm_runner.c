@@ -917,6 +917,20 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 19b. softplus_mul_batch_f32: same op over M rows of dt_rank ---- */\n"
+"/* bias and a are dt_rank-wide constants; broadcast across the M rows. */\n"
+"__global__ void softplus_mul_batch_f32(float *out, const float *in,\n"
+"                                         const float *bias, const float *a,\n"
+"                                         int dt_rank, int M) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = M * dt_rank;\n"
+"    if (i >= total) return;\n"
+"    int hi = i % dt_rank;\n"
+"    float x = in[i] + bias[hi];\n"
+"    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));\n"
+"    out[i] = sp * a[hi];\n"
+"}\n"
+"\n"
 "/* ---- 20. sigmoid_inplace_f32: data[i] = 1/(1+exp(-data[i])) ---- */\n"
 "__global__ void sigmoid_inplace_f32(float *data, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -3674,6 +3688,7 @@ struct hip_llm_runner {
     hipFunction_t fn_embed_q2_K;
     /* SSM kernels */
     hipFunction_t fn_softplus_mul_f32;
+    hipFunction_t fn_softplus_mul_batch_f32;
     hipFunction_t fn_sigmoid_inplace_f32;
     hipFunction_t fn_conv1d_depthwise_silu_f32;
     hipFunction_t fn_l2_norm_heads_f32;
@@ -3847,6 +3862,18 @@ struct hip_llm_runner {
     void *d_qfull_batch;        /* [BMAX, 2*q_dim_max] F32 */
     void *d_attn_gate_batch;    /* [BMAX, q_dim] F32 */
 
+    /* SSM batched intermediate buffers (B2 Phase 3). Allocated when r->is_hybrid.
+     * The 5 SSM projections fan out from d_xnorm_batch_bf16 to these via
+     * hipBLASLt; sequential ops (conv1d, deltanet_step) consume them per-row. */
+    void *d_ssm_qkv_batch;      /* [BMAX, qkv_dim] F32 */
+    void *d_ssm_z_batch;        /* [BMAX, d_inner]  F32 (=dt_rank*d_state) */
+    void *d_ssm_alpha_batch;    /* [BMAX, dt_rank]  F32 */
+    void *d_ssm_beta_batch;     /* [BMAX, dt_rank]  F32 */
+    void *d_ssm_conv_out_batch; /* [BMAX, qkv_dim]  F32 (post-conv1d) */
+    void *d_ssm_Q_exp_batch;    /* [BMAX, dt_rank*d_state] F32 */
+    void *d_ssm_K_exp_batch;    /* [BMAX, dt_rank*d_state] F32 */
+    void *d_ssm_out_batch;      /* [BMAX, d_inner]  F32 */
+
     /* === Phase 3: flash-attention scratch === */
     int   fa_path_ok;           /* 1 if FA prefill path is enabled */
     void *d_q_batch_f16;        /* [BMAX, n_heads*head_dim] F16 */
@@ -3920,6 +3947,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(embed_q2_K);
     /* SSM kernels */
     GET_FUNC(softplus_mul_f32);
+    GET_FUNC(softplus_mul_batch_f32);
     GET_FUNC(sigmoid_inplace_f32);
     GET_FUNC(conv1d_depthwise_silu_f32);
     GET_FUNC(l2_norm_heads_f32);
@@ -4662,7 +4690,12 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
      * for hipBLASLt prefill GEMMs. Only enabled for non-hybrid, non-MoE,
      * F16-weight dense Qwen3-style models. =================================== */
     {
-        int batch_max = 4096;  /* default raised from 512 to cover prefill_len=1024+ */
+        /* Default BMAX:
+         *   dense models: 4096 (covers prefill_len up to 4096 in one batch)
+         *   hybrid SSM models: 1024 — SSM buffers scale with BMAX × qkv_dim
+         *     (160-200 MB each), so default 4096 risks OOM on 27B-class models.
+         * LLM_BMAX env still overrides. */
+        int batch_max = r->is_hybrid ? 1024 : 4096;
         const char *env_bm = getenv("LLM_BMAX");
         if (env_bm) batch_max = atoi(env_bm);
         if (batch_max < 1) batch_max = 1;
@@ -4791,6 +4824,14 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             /* Hybrid gated-attn extra buffers: Q projection emits 2*q_dim per row. */
             r->d_qfull_batch     = NULL;
             r->d_attn_gate_batch = NULL;
+            r->d_ssm_qkv_batch     = NULL;
+            r->d_ssm_z_batch       = NULL;
+            r->d_ssm_alpha_batch   = NULL;
+            r->d_ssm_beta_batch    = NULL;
+            r->d_ssm_conv_out_batch= NULL;
+            r->d_ssm_Q_exp_batch   = NULL;
+            r->d_ssm_K_exp_batch   = NULL;
+            r->d_ssm_out_batch     = NULL;
             if (r->is_hybrid) {
                 /* Scan layers for the widest attn_q output. For pure-SSM layers
                  * attn_q_rows is 0; for gated-attn layers it's typically 2*q_dim. */
@@ -4801,10 +4842,28 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
                 }
                 CHECK_HIP(hipMalloc(&r->d_qfull_batch,     bm * (size_t)max_q_rows * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_attn_gate_batch, bm * (size_t)q_dim      * sizeof(float)));
+
+                /* SSM Phase-3 buffers */
+                int qkv_dim  = r->ssm_qkv_dim;
+                int d_inner  = r->ssm_d_inner;
+                int dt_rank  = r->ssm_dt_rank;
+                int d_state  = r->ssm_d_state;
+                CHECK_HIP(hipMalloc(&r->d_ssm_qkv_batch,      bm * (size_t)qkv_dim          * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_ssm_z_batch,        bm * (size_t)d_inner          * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_ssm_alpha_batch,    bm * (size_t)dt_rank          * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_ssm_beta_batch,     bm * (size_t)dt_rank          * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_ssm_conv_out_batch, bm * (size_t)qkv_dim          * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_ssm_Q_exp_batch,    bm * (size_t)dt_rank * d_state* sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_ssm_K_exp_batch,    bm * (size_t)dt_rank * d_state* sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_ssm_out_batch,      bm * (size_t)d_inner          * sizeof(float)));
+
                 if (r->verbose >= 1) {
-                    fprintf(stderr, "hip_llm: hybrid gated-attn batched buffers: d_qfull=%.1f MB, d_attn_gate=%.1f MB\n",
+                    double ssm_total = (double)(bm * (2*(size_t)qkv_dim + 4*(size_t)d_inner
+                                              + 2*(size_t)dt_rank + 2*(size_t)dt_rank*d_state) * sizeof(float));
+                    fprintf(stderr, "hip_llm: hybrid batched buffers: d_qfull=%.1f MB, d_attn_gate=%.1f MB, SSM=%.1f MB\n",
                             (double)(bm * max_q_rows * sizeof(float)) / (1024.0*1024.0),
-                            (double)(bm * q_dim      * sizeof(float)) / (1024.0*1024.0));
+                            (double)(bm * q_dim      * sizeof(float)) / (1024.0*1024.0),
+                            ssm_total / (1024.0*1024.0));
                 }
             }
 
@@ -5193,6 +5252,10 @@ DEFINE_LAUNCH_KQ_DEQUANT(iq3_xxs)
  * pointer before any subsequent get_bf16_weight call that would overwrite the
  * staging buffer. The current prefill code does this naturally — each GEMM is
  * called inline and the staging buffer's lifetime is exactly one mm_blaslt call. */
+/* Forward decls used by get_bf16_weight (defined later in this file). */
+static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
+                                              void *src, int n);
+
 /* True if `type` has a per-call dequant kernel suitable for the batched path. */
 static inline int batch_qtype_ok(int type) {
     return type == GGML_TYPE_F16     ||
@@ -5211,10 +5274,30 @@ static inline int layer_is_batched_eligible(const hip_layer *cl) {
            batch_qtype_ok(cl->ffn_down_type);
 }
 
+/* True if every SSM projection weight has a batched path. */
+static inline int ssm_layer_is_batched_eligible(const hip_layer *cl) {
+    return batch_qtype_ok(cl->ssm_qkv_type)   &&
+           batch_qtype_ok(cl->ssm_gate_type)  &&
+           batch_qtype_ok(cl->ssm_alpha_type) &&
+           batch_qtype_ok(cl->ssm_beta_type)  &&
+           batch_qtype_ok(cl->ssm_out_type)   &&
+           batch_qtype_ok(cl->ffn_gate_type)  &&
+           batch_qtype_ok(cl->ffn_up_type)    &&
+           batch_qtype_ok(cl->ffn_down_type);
+}
+
 static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w,
                                       int type, int n_rows, int n_cols) {
     if (bf16_w) return bf16_w;
     switch (type) {
+        case GGML_TYPE_F16: {
+            /* SSM weights are typically F16 and aren't pre-converted at load
+             * (only attn+FFN F16 weights get cl->*_w_bf16). Convert into the
+             * shared staging buffer on the fly. */
+            size_t n = (size_t)n_rows * n_cols;
+            launch_convert_f16_to_bf16(r, r->d_wbuf_bf16, raw_w, (int)n);
+            return r->d_wbuf_bf16;
+        }
         case GGML_TYPE_Q4_K:
             launch_dequant_q4_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
             return r->d_wbuf_bf16;
@@ -5324,6 +5407,15 @@ static inline void launch_softplus_mul(hip_llm_runner *r, void *out,
     void *in, void *bias, void *a, int n) {
     void *args[] = { &out, &in, &bias, &a, &n };
     LAUNCH(r->fn_softplus_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
+/* Batched softplus_mul: bias/a are dt_rank-wide layer constants, broadcast over M rows. */
+static inline void launch_softplus_mul_batch(hip_llm_runner *r, void *out,
+    void *in, void *bias, void *a, int dt_rank, int M) {
+    void *args[] = { &out, &in, &bias, &a, &dt_rank, &M };
+    int total = M * dt_rank;
+    LAUNCH(r->fn_softplus_mul_batch_f32, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
 }
 
 static inline void launch_sigmoid_inplace(hip_llm_runner *r, void *data, int n) {
@@ -5886,26 +5978,37 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
         if (dump_dispatch) {
             const char *kind;
-            if (cl->is_ssm) { kind = "SSM"; n_ssm++; }
-            else if (!layer_is_batched_eligible(cl)) {
+            if (cl->is_ssm) {
+                if (ssm_layer_is_batched_eligible(cl)) { kind = "BATCH-SSM"; n_batched++; }
+                else { kind = "SSM per-row";   n_ssm++; }
+            } else if (!layer_is_batched_eligible(cl)) {
                 kind = "per-row(quant)"; n_per_row_quant++;
             } else if (cl->attn_q_rows == 2 * (r->n_heads * r->head_dim)) {
                 kind = "BATCH-gated";  n_batched++; n_gated++;
             } else {
                 kind = "BATCH-std";    n_batched++;
             }
-            fprintf(stderr, "  L%02d %-14s  q=%d k=%d v=%d o=%d g=%d u=%d d=%d\n",
-                    l, kind, cl->attn_q_type, cl->attn_k_type, cl->attn_v_type,
-                    cl->attn_output_type, cl->ffn_gate_type, cl->ffn_up_type, cl->ffn_down_type);
+            if (cl->is_ssm) {
+                fprintf(stderr, "  L%02d %-14s  ssm:qkv=%d gate=%d a=%d b=%d out=%d  ffn:g=%d u=%d d=%d\n",
+                        l, kind, cl->ssm_qkv_type, cl->ssm_gate_type,
+                        cl->ssm_alpha_type, cl->ssm_beta_type, cl->ssm_out_type,
+                        cl->ffn_gate_type, cl->ffn_up_type, cl->ffn_down_type);
+            } else {
+                fprintf(stderr, "  L%02d %-14s  q=%d k=%d v=%d o=%d g=%d u=%d d=%d\n",
+                        l, kind, cl->attn_q_type, cl->attn_k_type, cl->attn_v_type,
+                        cl->attn_output_type, cl->ffn_gate_type, cl->ffn_up_type, cl->ffn_down_type);
+            }
         }
 
-        /* B2 Phase 1: SSM layers AND any layer with an unsupported weight
-         * quant fall back to per-row execution. The per-token layer body
-         * operates on r->d_x; we swap r->d_x to each row of d_x_batch and
-         * call forward_one_layer. (Phase 3 will batch SSM projections; this
-         * also catches IQ2/IQ4/etc. quants for which no batched dequant
-         * kernel exists yet.) */
-        if (cl->is_ssm || !layer_is_batched_eligible(cl)) {
+        /* Per-layer dispatch:
+         *   - SSM layer + all 5 SSM weights batchable  -> batched SSM (B2 P3)
+         *   - SSM layer + any SSM weight not batchable -> per-row fallback
+         *   - non-SSM + all 7 attn/FFN weights batchable -> existing batched
+         *   - non-SSM + any weight not batchable         -> per-row fallback
+         */
+        int can_batch_ssm  =  cl->is_ssm && ssm_layer_is_batched_eligible(cl);
+        int can_batch_attn = !cl->is_ssm && layer_is_batched_eligible(cl);
+        if (!can_batch_ssm && !can_batch_attn) {
             void *saved_d_x = r->d_x;
             for (int m = 0; m < M; m++) {
                 int pos = position_start + m;
@@ -5930,6 +6033,93 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* Pack BF16 input (single launch over M*n_embd) */
         launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16,
                                   r->d_xnorm_batch, M * n_embd);
+
+        if (can_batch_ssm) {
+            /* === B2 Phase 3: SSM batched compute ===
+             * 5 SSM projections (qkv/gate/alpha/beta/out) go through hipBLASLt;
+             * elementwise softplus_mul and sigmoid_inplace are batched; the
+             * stateful conv1d + deltanet_step + their per-token aux ops run
+             * in a per-row host loop (the conv state and DeltaNet recurrent
+             * state are intrinsically sequential). */
+            int qkv_dim = r->ssm_qkv_dim;
+            int d_state = r->ssm_d_state;
+            int n_group = r->ssm_n_group;
+            int dt_rank = r->ssm_dt_rank;
+            int d_inner = r->ssm_d_inner;
+            int conv_k  = r->ssm_conv_kernel;
+
+            /* 4 input projections (qkv, gate, alpha, beta) batched */
+            #define SSM_GEMM(dst, w_field, type_field, rows_field, cols_field) do {       \
+                void *_w = get_bf16_weight(r, cl->w_field, NULL,                          \
+                                cl->type_field, cl->rows_field, cl->cols_field);          \
+                if (!_w) return -1;                                                       \
+                if (mm_blaslt_run_bf16(dst, _w, r->d_xnorm_batch_bf16, M,                 \
+                                       cl->rows_field, n_embd, r->stream) != 0) return -1;\
+            } while(0)
+            SSM_GEMM(r->d_ssm_qkv_batch,   ssm_qkv_w,   ssm_qkv_type,   ssm_qkv_rows,   ssm_qkv_cols);
+            SSM_GEMM(r->d_ssm_z_batch,     ssm_gate_w,  ssm_gate_type,  ssm_gate_rows,  ssm_gate_cols);
+            SSM_GEMM(r->d_ssm_alpha_batch, ssm_alpha_w, ssm_alpha_type, ssm_alpha_rows, ssm_alpha_cols);
+            SSM_GEMM(r->d_ssm_beta_batch,  ssm_beta_w,  ssm_beta_type,  ssm_beta_rows,  ssm_beta_cols);
+            #undef SSM_GEMM
+
+            /* softplus_mul broadcasts dt_rank-wide bias/a over M rows; sigmoid
+             * is a flat elementwise op so the per-token kernel works as-is. */
+            launch_softplus_mul_batch(r, r->d_ssm_alpha_batch, r->d_ssm_alpha_batch,
+                                      cl->ssm_dt_bias, cl->ssm_a, dt_rank, M);
+            launch_sigmoid_inplace(r, r->d_ssm_beta_batch, M * dt_rank);
+
+            /* Sequential per-row aux ops: conv1d + l2_norm + repeat_tile +
+             * deltanet_step + gated_rmsnorm_silu. Each call advances the
+             * conv1d state and DeltaNet recurrent state by exactly one token. */
+            for (int m = 0; m < M; m++) {
+                size_t qkv_off    = (size_t)m * qkv_dim;
+                size_t dt_off     = (size_t)m * dt_rank;
+                size_t dinner_off = (size_t)m * d_inner;
+                size_t exp_off    = (size_t)m * dt_rank * d_state;
+
+                float *qkv_row     = (float *)r->d_ssm_qkv_batch      + qkv_off;
+                float *conv_out_row= (float *)r->d_ssm_conv_out_batch + qkv_off;
+                float *Qexp_row    = (float *)r->d_ssm_Q_exp_batch    + exp_off;
+                float *Kexp_row    = (float *)r->d_ssm_K_exp_batch    + exp_off;
+                float *out_row     = (float *)r->d_ssm_out_batch      + dinner_off;
+                float *z_row       = (float *)r->d_ssm_z_batch        + dinner_off;
+                float *alpha_row   = (float *)r->d_ssm_alpha_batch    + dt_off;
+                float *beta_row    = (float *)r->d_ssm_beta_batch     + dt_off;
+
+                launch_conv1d(r, conv_out_row, cl->d_conv_state, qkv_row,
+                              cl->ssm_conv1d_w, qkv_dim, conv_k);
+                launch_l2_norm_heads(r, conv_out_row, n_group, d_state, eps); /* Q */
+                float *K_raw_row = conv_out_row + (size_t)n_group * d_state;
+                launch_l2_norm_heads(r, K_raw_row, n_group, d_state, eps);    /* K */
+                launch_repeat_tile(r, Qexp_row, conv_out_row, dt_rank, d_state, n_group);
+                launch_repeat_tile(r, Kexp_row, K_raw_row,    dt_rank, d_state, n_group);
+                float *V_row = conv_out_row + (size_t)2 * n_group * d_state;
+                launch_deltanet_step(r, cl->d_recurrent_state, out_row,
+                                     Qexp_row, Kexp_row, V_row,
+                                     alpha_row, beta_row, dt_rank, d_state);
+                launch_gated_rmsnorm_silu(r, out_row, z_row, cl->ssm_norm_w,
+                                          dt_rank, d_state, eps);
+            }
+
+            /* ssm_out projection: d_inner -> n_embd, batched. Reuse d_silu_batch_bf16
+             * as packing scratch (sized for n_ff >= d_inner). */
+            launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
+                                      r->d_ssm_out_batch, M * d_inner);
+            {
+                void *ow = get_bf16_weight(r, cl->ssm_out_w, NULL,
+                                cl->ssm_out_type, cl->ssm_out_rows, cl->ssm_out_cols);
+                if (!ow) return -1;
+                if (mm_blaslt_run_bf16(r->d_attn_proj_batch, ow,
+                                       r->d_silu_batch_bf16, M,
+                                       n_embd, d_inner, r->stream) != 0) return -1;
+            }
+
+            /* Residual: x_batch += ssm_proj */
+            launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
+
+            /* Jump past the attn block to the FFN section. */
+            goto ffn_section;
+        }
 
         /* ---- Q/K/V GEMMs (3 hipBLASLt calls; per-call dequant for K-quant rows).
          * Gated attn: Q projection produces [M, 2*q_dim] into d_qfull_batch,
@@ -6058,6 +6248,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* Residual: x_batch += attn_proj */
         launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
 
+ffn_section:
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
         launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
                              cl->ffn_norm_w, n_embd, M, n_embd, eps);
@@ -6323,6 +6514,14 @@ void hip_llm_offload(hip_llm_runner *r) {
     if (r->d_wbuf_bf16)           { hipFree(r->d_wbuf_bf16);           r->d_wbuf_bf16 = NULL; }
     if (r->d_qfull_batch)         { hipFree(r->d_qfull_batch);         r->d_qfull_batch = NULL; }
     if (r->d_attn_gate_batch)     { hipFree(r->d_attn_gate_batch);     r->d_attn_gate_batch = NULL; }
+    if (r->d_ssm_qkv_batch)       { hipFree(r->d_ssm_qkv_batch);       r->d_ssm_qkv_batch = NULL; }
+    if (r->d_ssm_z_batch)         { hipFree(r->d_ssm_z_batch);         r->d_ssm_z_batch = NULL; }
+    if (r->d_ssm_alpha_batch)     { hipFree(r->d_ssm_alpha_batch);     r->d_ssm_alpha_batch = NULL; }
+    if (r->d_ssm_beta_batch)      { hipFree(r->d_ssm_beta_batch);      r->d_ssm_beta_batch = NULL; }
+    if (r->d_ssm_conv_out_batch)  { hipFree(r->d_ssm_conv_out_batch);  r->d_ssm_conv_out_batch = NULL; }
+    if (r->d_ssm_Q_exp_batch)     { hipFree(r->d_ssm_Q_exp_batch);     r->d_ssm_Q_exp_batch = NULL; }
+    if (r->d_ssm_K_exp_batch)     { hipFree(r->d_ssm_K_exp_batch);     r->d_ssm_K_exp_batch = NULL; }
+    if (r->d_ssm_out_batch)       { hipFree(r->d_ssm_out_batch);       r->d_ssm_out_batch = NULL; }
     if (r->d_q_batch_f16)         { hipFree(r->d_q_batch_f16);         r->d_q_batch_f16 = NULL; }
     if (r->d_kv_pack_K_f16)       { hipFree(r->d_kv_pack_K_f16);       r->d_kv_pack_K_f16 = NULL; }
     if (r->d_kv_pack_V_f16)       { hipFree(r->d_kv_pack_V_f16);       r->d_kv_pack_V_f16 = NULL; }
@@ -6401,6 +6600,14 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_wbuf_bf16)           hipFree(r->d_wbuf_bf16);
     if (r->d_qfull_batch)         hipFree(r->d_qfull_batch);
     if (r->d_attn_gate_batch)     hipFree(r->d_attn_gate_batch);
+    if (r->d_ssm_qkv_batch)       hipFree(r->d_ssm_qkv_batch);
+    if (r->d_ssm_z_batch)         hipFree(r->d_ssm_z_batch);
+    if (r->d_ssm_alpha_batch)     hipFree(r->d_ssm_alpha_batch);
+    if (r->d_ssm_beta_batch)      hipFree(r->d_ssm_beta_batch);
+    if (r->d_ssm_conv_out_batch)  hipFree(r->d_ssm_conv_out_batch);
+    if (r->d_ssm_Q_exp_batch)     hipFree(r->d_ssm_Q_exp_batch);
+    if (r->d_ssm_K_exp_batch)     hipFree(r->d_ssm_K_exp_batch);
+    if (r->d_ssm_out_batch)       hipFree(r->d_ssm_out_batch);
     if (r->d_q_batch_f16)         hipFree(r->d_q_batch_f16);
     if (r->d_kv_pack_K_f16)       hipFree(r->d_kv_pack_K_f16);
     if (r->d_kv_pack_V_f16)       hipFree(r->d_kv_pack_V_f16);
