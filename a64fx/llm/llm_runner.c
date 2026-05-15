@@ -250,6 +250,9 @@ int main(int argc, char **argv) {
     transformer_model *model = transformer_load(gguf_main, max_seq_len);
     if (!model) { fprintf(stderr, "transformer_load failed\n"); return 1; }
     if (llm_threads > 1) transformer_set_threads(model, llm_threads);
+    /* Build A64FX panel layout after the (pinned) thread pool exists so each
+     * panel's row blocks are first-touched onto the consuming core's CMG. */
+    transformer_build_panels(model);
     fprintf(stderr, "      n_embd=%d n_layers=%d n_heads=%d n_vocab=%d (%.3f s)\n",
             model->n_embd, model->n_layers, model->n_heads, model->n_vocab,
             mono_sec() - t);

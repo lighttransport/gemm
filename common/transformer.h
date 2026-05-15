@@ -192,12 +192,22 @@ typedef struct {
     void *pool_args;           /* array of per-thread task structs */
     size_t pool_arg_stride;    /* sizeof(task struct) */
     volatile int pool_phase;   /* incremented to signal work */
-    volatile int pool_done;    /* number of workers done */
+    volatile int *pool_done_flags; /* [n_threads*TF_POOL_FLAG_STRIDE]: each
+                                    * worker writes its slot = phase when done;
+                                    * 256B-padded to avoid false sharing / a
+                                    * cross-CMG-contended shared counter */
+    volatile int pool_sleepers;/* workers currently parked on pool_cond */
     int pool_alive;            /* 1 if pool is running */
     pthread_mutex_t pool_mutex;/* protects pool_phase signaling */
     pthread_cond_t pool_cond;  /* workers sleep here between dispatches */
     volatile int bar_count;    /* barrier arrival counter */
     volatile int bar_sense;    /* barrier sense flag (alternates 0/1) */
+
+    /* A64FX CMG affinity: pool threads pinned to CMG-local cores so that
+     * panel buffers first-touched per-thread land on the right HBM stack.
+     * cmg_pin=1 enables; cmg_pin_ncmgs = how many CMGs the pool spreads over. */
+    int cmg_pin;
+    int cmg_pin_ncmgs;
 
     /* Tensor parallelism */
     int tp_rank;               /* this rank's position in the TP group (0 if no TP) */
@@ -227,6 +237,13 @@ void transformer_set_trace_hidden_norms(transformer_model *model, int enable);
  * Env vars: NUMA_DISTRIBUTE=1 (enable), NUMA_N_CMGS (default 4),
  *           NUMA_CMG_BUDGET_GB (default 6), NUMA_ALIGNMENT (default 2MB). */
 void transformer_numa_setup(transformer_model *m, const gguf_context *gguf);
+
+/* A64FX (SVE) only: repack all dense F16 matvec weights into panel layout for
+ * the horizontal-reduction-free matvec kernel, and first-touch each panel's
+ * row blocks from the pool thread that will consume them — so with CMG pinning
+ * the panel memory is spread across the 4 HBM stacks. Call after
+ * transformer_set_threads. No-op on non-SVE builds or if TF_NO_PANEL is set. */
+void transformer_build_panels(transformer_model *m);
 
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
  * For embedding models (no output projection), this is the final hidden state. */
@@ -331,6 +348,7 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 /* Profiling macros: active only if profiler.h was included before this file */
 #ifdef PROFILER_H
@@ -1097,40 +1115,94 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
  * zero-padded when n_rows is not a multiple of 32. Sets t->panel / t->panel_blk;
  * no-op for non-F16 tensors. The original t->data is kept (other code paths
  * and dequant still use it); this roughly doubles F16 weight memory. */
-static void tf_qtensor_build_panel(qtensor *t) {
-    if (!t->data || t->type != GGML_TYPE_F16) return;
-    int K = t->n_cols;
-    int nblk = (t->n_rows + 31) / 32;
-    if (nblk == 0) return;
-    size_t nelem = (size_t)nblk * K * 32;
-    uint16_t *p = (uint16_t *)calloc(nelem, sizeof(uint16_t)); /* zero-pads tail */
-    if (!p) return;
+static size_t tf_panel_bytes(int nblk, int K) {
+    return (size_t)nblk * (size_t)K * 32 * sizeof(uint16_t);
+}
+
+/* Fill panel blocks [blk_start, blk_end) from the row-major F16 weight.
+ * Iterates block-major so a worker writes one contiguous panel region —
+ * with CMG pinning that region is first-touched onto the worker's HBM.
+ * Tail rows past n_rows are left at their mmap-zeroed value. */
+static void tf_panel_fill_range(qtensor *t, int blk_start, int blk_end) {
+    int K = t->n_cols, n_rows = t->n_rows;
     const uint16_t *W = (const uint16_t *)t->data;
-    for (int row = 0; row < t->n_rows; row++) {
-        int blk = row / 32, lane = row % 32;
-        const uint16_t *src = W + (size_t)row * K;
-        uint16_t *dst = p + (size_t)blk * K * 32 + lane;
-        for (int k = 0; k < K; k++) dst[(size_t)k * 32] = src[k];
+    uint16_t *p = t->panel;
+    for (int blk = blk_start; blk < blk_end; blk++) {
+        uint16_t *pb = p + (size_t)blk * K * 32;
+        for (int lane = 0; lane < 32; lane++) {
+            int row = blk * 32 + lane;
+            if (row >= n_rows) break;
+            const uint16_t *src = W + (size_t)row * K;
+            for (int k = 0; k < K; k++) pb[(size_t)k * 32 + lane] = src[k];
+        }
     }
-    t->panel = p;
+}
+
+/* Allocate t->panel as untouched anonymous pages (mmap, zero-filled lazily) so
+ * first-touch placement works. Sets t->panel_blk. Returns 1 on success. */
+static int tf_panel_alloc(qtensor *t) {
+    if (!t->data || t->type != GGML_TYPE_F16) return 0;
+    int nblk = (t->n_rows + 31) / 32;
+    if (nblk == 0) return 0;
+    size_t bytes = tf_panel_bytes(nblk, t->n_cols);
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    /* Disable transparent hugepages: THP coalesces the panel into 2 MB pages
+     * faulted as a unit, which collapses our per-thread first-touch back onto
+     * a single CMG (observed: all panels on node 4). With 4 KB pages each
+     * thread's contiguous block range first-touches onto its own CMG's HBM,
+     * and the matvec streams sequentially so the TLB cost is negligible. */
+#ifdef MADV_NOHUGEPAGE
+    madvise(p, bytes, MADV_NOHUGEPAGE);
+#endif
+    t->panel = (uint16_t *)p;
     t->panel_blk = nblk;
+    return 1;
+}
+
+static void tf_panel_free(qtensor *t) {
+    if (t->panel) {
+        munmap(t->panel, tf_panel_bytes(t->panel_blk, t->n_cols));
+        t->panel = NULL;
+        t->panel_blk = 0;
+    }
+}
+
+/* Single-threaded build (no pool): alloc + fill the whole panel. */
+static void tf_qtensor_build_panel(qtensor *t) {
+    if (!tf_panel_alloc(t)) return;
+    tf_panel_fill_range(t, 0, t->panel_blk);
 }
 
 typedef struct {
     float *dst;
     const uint16_t *panel;
-    const float *x;
+    const float16_t *x;  /* input vector, pre-converted to f16 once per matvec */
     int blk_start, blk_end;
     int n_cols;
     int n_rows;          /* for predicated store of the last partial block */
 } tf_panel_task;
+
+/* Convert an f32 input vector to f16 once, so the matvec inner loop can svdup
+ * straight from f16 with no per-element fcvt. The panel kernel re-reads x for
+ * every block it owns, so this hoists nblk/nt fcvts down to one pass. */
+static inline void tf_x_to_f16(float16_t *dst, const float *src, int n) {
+    int i = 0;
+    svbool_t pg = svptrue_b32();
+    for (; i + 16 <= n; i += 16)
+        svst1_f16(svptrue_b16(), dst + i,
+                  svuzp1_f16(svcvt_f16_f32_x(pg, svld1_f32(pg, src + i)),
+                             svcvt_f16_f32_x(pg, svld1_f32(pg, src + i + 8))));
+    for (; i < n; i++) dst[i] = (float16_t)src[i];
+}
 
 /* Panel matvec: single sequential stream over panel, 8 k-accumulators to hide
  * the ~9-cycle svmla_f16 latency, result store is a plain widen + svst1. */
 static void *tf_panel_matvec_worker(void *arg) {
     tf_panel_task *t = (tf_panel_task *)arg;
     int K = t->n_cols, n_rows = t->n_rows;
-    const float *x = t->x;
+    const float16_t *x = t->x;
     svbool_t ph = svptrue_b16(), pg = svptrue_b32();
     for (int blk = t->blk_start; blk < t->blk_end; blk++) {
         const float16_t *wp = (const float16_t *)t->panel + (size_t)blk * K * 32;
@@ -1138,17 +1210,17 @@ static void *tf_panel_matvec_worker(void *arg) {
         svfloat16_t a4=svdup_f16(0),a5=svdup_f16(0),a6=svdup_f16(0),a7=svdup_f16(0);
         int k = 0;
         for (; k + 7 < K; k += 8) {
-            a0 = svmla_x(ph,a0, svld1_f16(ph,wp+(size_t)(k+0)*32), svdup_f16((float16_t)x[k+0]));
-            a1 = svmla_x(ph,a1, svld1_f16(ph,wp+(size_t)(k+1)*32), svdup_f16((float16_t)x[k+1]));
-            a2 = svmla_x(ph,a2, svld1_f16(ph,wp+(size_t)(k+2)*32), svdup_f16((float16_t)x[k+2]));
-            a3 = svmla_x(ph,a3, svld1_f16(ph,wp+(size_t)(k+3)*32), svdup_f16((float16_t)x[k+3]));
-            a4 = svmla_x(ph,a4, svld1_f16(ph,wp+(size_t)(k+4)*32), svdup_f16((float16_t)x[k+4]));
-            a5 = svmla_x(ph,a5, svld1_f16(ph,wp+(size_t)(k+5)*32), svdup_f16((float16_t)x[k+5]));
-            a6 = svmla_x(ph,a6, svld1_f16(ph,wp+(size_t)(k+6)*32), svdup_f16((float16_t)x[k+6]));
-            a7 = svmla_x(ph,a7, svld1_f16(ph,wp+(size_t)(k+7)*32), svdup_f16((float16_t)x[k+7]));
+            a0 = svmla_x(ph,a0, svld1_f16(ph,wp+(size_t)(k+0)*32), svdup_f16(x[k+0]));
+            a1 = svmla_x(ph,a1, svld1_f16(ph,wp+(size_t)(k+1)*32), svdup_f16(x[k+1]));
+            a2 = svmla_x(ph,a2, svld1_f16(ph,wp+(size_t)(k+2)*32), svdup_f16(x[k+2]));
+            a3 = svmla_x(ph,a3, svld1_f16(ph,wp+(size_t)(k+3)*32), svdup_f16(x[k+3]));
+            a4 = svmla_x(ph,a4, svld1_f16(ph,wp+(size_t)(k+4)*32), svdup_f16(x[k+4]));
+            a5 = svmla_x(ph,a5, svld1_f16(ph,wp+(size_t)(k+5)*32), svdup_f16(x[k+5]));
+            a6 = svmla_x(ph,a6, svld1_f16(ph,wp+(size_t)(k+6)*32), svdup_f16(x[k+6]));
+            a7 = svmla_x(ph,a7, svld1_f16(ph,wp+(size_t)(k+7)*32), svdup_f16(x[k+7]));
         }
         for (; k < K; k++)
-            a0 = svmla_x(ph,a0, svld1_f16(ph,wp+(size_t)k*32), svdup_f16((float16_t)x[k]));
+            a0 = svmla_x(ph,a0, svld1_f16(ph,wp+(size_t)k*32), svdup_f16(x[k]));
         svfloat16_t s = svadd_x(ph, svadd_x(ph,svadd_x(ph,a0,a1),svadd_x(ph,a2,a3)),
                                     svadd_x(ph,svadd_x(ph,a4,a5),svadd_x(ph,a6,a7)));
         svuint16_t u = svreinterpret_u16(s);
@@ -1173,8 +1245,10 @@ static void tf_panel_matvec_pool(transformer_model *m, float *dst,
     int nblk = mat->panel_blk;
     int K = mat->n_cols, n_rows = mat->n_rows;
     int n_threads = m->n_threads;
+    float16_t *xh = (float16_t *)alloca((size_t)K * sizeof(float16_t));
+    tf_x_to_f16(xh, x, K);
     if (n_threads <= 1 || nblk < n_threads || !m->pool_alive) {
-        tf_panel_task t = {dst, mat->panel, x, 0, nblk, K, n_rows};
+        tf_panel_task t = {dst, mat->panel, xh, 0, nblk, K, n_rows};
         tf_panel_matvec_worker(&t);
         return;
     }
@@ -1182,10 +1256,20 @@ static void tf_panel_matvec_pool(transformer_model *m, float *dst,
     int per = nblk / n_threads, extra = nblk % n_threads, off = 0;
     for (int i = 0; i < n_threads; i++) {
         int c = per + (i < extra ? 1 : 0);
-        tasks[i] = (tf_panel_task){dst, mat->panel, x, off, off + c, K, n_rows};
+        tasks[i] = (tf_panel_task){dst, mat->panel, xh, off, off + c, K, n_rows};
         off += c;
     }
     tf_pool_dispatch(m, tf_panel_matvec_worker, tasks, sizeof(tf_panel_task));
+}
+
+/* Parallel panel fill: each worker fills the same contiguous block range it
+ * will later consume in tf_panel_matvec_pool, so the panel memory is
+ * first-touched onto that worker's CMG. */
+typedef struct { qtensor *t; int blk_start, blk_end; } tf_panel_build_task;
+static void *tf_panel_build_worker(void *arg) {
+    tf_panel_build_task *b = (tf_panel_build_task *)arg;
+    tf_panel_fill_range(b->t, b->blk_start, b->blk_end);
+    return NULL;
 }
 #endif /* __ARM_FEATURE_SVE */
 
@@ -2098,28 +2182,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         return NULL;
     }
 
-#if defined(__ARM_FEATURE_SVE)
-    /* M10: repack all dense F16 matvec weights into panel layout for the
-     * A64FX kernel (no horizontal reduction, single sequential stream).
-     * Non-F16 tensors are skipped; MoE expert tensors stay row-major. */
-    if (!getenv("TF_NO_PANEL")) {
-        int n_panels = 0;
-        for (int l = 0; l < m->n_layers; l++) {
-            transformer_layer *L = &m->layers[l];
-            qtensor *dense[] = { &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
-                                 &L->ffn_gate, &L->ffn_up, &L->ffn_down };
-            for (int i = 0; i < 7; i++) {
-                if (!dense[i]->panel) tf_qtensor_build_panel(dense[i]);
-                if (dense[i]->panel) n_panels++;
-            }
-        }
-        if (m->has_lm_head && !m->output.panel) tf_qtensor_build_panel(&m->output);
-        if (m->output.panel) n_panels++;
-        if (n_panels)
-            fprintf(stderr, "transformer: panel layout built for %d F16 matvec weights\n",
-                    n_panels);
-    }
-#endif
+    /* M10 panel layout for the A64FX F16 matvec kernel is built lazily by
+     * transformer_build_panels(), which the caller invokes after
+     * transformer_set_threads() so the panels can be first-touched per-CMG. */
 
     /* Allocate KV cache */
     int kv_dim = m->n_kv_heads * m->head_dim;
@@ -2272,17 +2337,17 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 void transformer_free(transformer_model *model) {
     if (!model) return;
 #if defined(__ARM_FEATURE_SVE)
-    /* M10: free panel-layout weight copies */
+    /* M10: free panel-layout weight copies (mmap'd, see tf_panel_alloc) */
     if (model->layers) {
         for (int l = 0; l < model->n_layers; l++) {
             transformer_layer *L = &model->layers[l];
-            free(L->attn_q.panel);   free(L->attn_k.panel);
-            free(L->attn_v.panel);   free(L->attn_output.panel);
-            free(L->ffn_gate.panel); free(L->ffn_up.panel);
-            free(L->ffn_down.panel);
+            tf_panel_free(&L->attn_q);   tf_panel_free(&L->attn_k);
+            tf_panel_free(&L->attn_v);   tf_panel_free(&L->attn_output);
+            tf_panel_free(&L->ffn_gate); tf_panel_free(&L->ffn_up);
+            tf_panel_free(&L->ffn_down);
         }
     }
-    free(model->output.panel);
+    tf_panel_free(&model->output);
 #endif
     free(model->layers);
     if (model->key_cache) {
@@ -2345,6 +2410,69 @@ void transformer_free(transformer_model *model) {
 #define tf_cpu_pause() ((void)0)
 #endif
 
+/* Pool workers spin this many `yield` iterations waiting for a dispatch
+ * before parking on the cond var. Sized to comfortably cover the
+ * main-thread serial gap between the ~200 matvec dispatches in one
+ * decode step (~100us on A64FX), so a hot pool never hits a syscall. */
+#ifndef TF_POOL_SPIN_LIMIT
+#define TF_POOL_SPIN_LIMIT 200000L
+#endif
+
+/* Per-worker done-flag stride, in ints. A64FX cache line is 256 B = 64
+ * ints; one slot per worker, line-padded, so completion signalling never
+ * contends a shared cache line across CMGs. */
+#define TF_POOL_FLAG_STRIDE 64
+
+#ifdef TF_POOL_PROFILE
+static long   tf_prof_calls = 0;
+static double tf_prof_dispatch = 0, tf_prof_work0 = 0, tf_prof_wait = 0, tf_prof_woke = 0;
+#define TF_PROF_NSITE 16
+static void  *tf_prof_fn[TF_PROF_NSITE];
+static long   tf_prof_fn_calls[TF_PROF_NSITE];
+static double tf_prof_fn_work[TF_PROF_NSITE], tf_prof_fn_wait[TF_PROF_NSITE];
+/* Per-section timing for the persistent worker: [0]=tid0, [1]=tid1. */
+static double tf_pw_matvec[2], tf_pw_barrier[2], tf_pw_serial[2], tf_pw_attn[2];
+static double tf_now_s(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static int tf_prof_site(void *fn) {
+    for (int i = 0; i < TF_PROF_NSITE; i++) {
+        if (tf_prof_fn[i] == fn) return i;
+        if (tf_prof_fn[i] == NULL) { tf_prof_fn[i] = fn; return i; }
+    }
+    return TF_PROF_NSITE - 1;
+}
+#endif
+
+/* ---- A64FX CMG core pinning ----
+ * Pin pool thread `tid` (of n_threads) to a CMG-local core. Threads are
+ * grouped contiguously across n_cmgs CMGs, matching the contiguous block
+ * partition used by the panel matvec/build, so each panel row block is
+ * first-touched and later read by the same core — keeping it on that CMG's
+ * HBM. A64FX compute cores are 12-59, 12 per CMG (CMG c = 12+12c .. 23+12c). */
+#if defined(__aarch64__) && defined(__linux__)
+static int tf_cmg_pin_thread(int tid, int n_threads, int n_cmgs) {
+    if (n_threads < 1) n_threads = 1;
+    if (n_cmgs < 1) n_cmgs = 1;
+    if (n_cmgs > 4) n_cmgs = 4;
+    int cmg       = (int)((long)tid * n_cmgs / n_threads);
+    int cmg_first = (int)(((long)cmg * n_threads + n_cmgs - 1) / n_cmgs);
+    int local     = tid - cmg_first;
+    if (local < 0)  local = 0;
+    if (local > 11) local = 11;
+    int core = 12 + cmg * 12 + local;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+#else
+static int tf_cmg_pin_thread(int tid, int n_threads, int n_cmgs) {
+    (void)tid; (void)n_threads; (void)n_cmgs; return -1;
+}
+#endif
+
 typedef struct {
     transformer_model *model;
     int tid;
@@ -2356,14 +2484,30 @@ static void *tf_pool_worker_main(void *arg) {
     int tid = ctx->tid;
     free(ctx);
 
+    if (m->cmg_pin)
+        tf_cmg_pin_thread(tid, m->n_threads, m->cmg_pin_ncmgs);
+
     int last_phase = 0;
     while (1) {
-        /* Sleep until dispatcher signals new work via cond_broadcast.
-         * Workers consume ZERO bandwidth while sleeping (futex-based). */
-        pthread_mutex_lock(&m->pool_mutex);
-        while (m->pool_phase == last_phase && m->pool_alive)
-            pthread_cond_wait(&m->pool_cond, &m->pool_mutex);
-        pthread_mutex_unlock(&m->pool_mutex);
+        /* Hybrid wait: spin first (no syscall — critical for per-token
+         * decode, which fires ~200 tiny dispatches/token; a futex wake
+         * per dispatch was the multi-CMG scaling killer). Only after a
+         * long spin do we park on the cond var so a truly idle pool
+         * burns no power. */
+        long spins = 0;
+        while (m->pool_phase == last_phase && m->pool_alive) {
+            if (++spins < TF_POOL_SPIN_LIMIT) {
+                tf_cpu_pause();
+                continue;
+            }
+            pthread_mutex_lock(&m->pool_mutex);
+            m->pool_sleepers++;
+            while (m->pool_phase == last_phase && m->pool_alive)
+                pthread_cond_wait(&m->pool_cond, &m->pool_mutex);
+            m->pool_sleepers--;
+            pthread_mutex_unlock(&m->pool_mutex);
+            break;
+        }
 
         last_phase = m->pool_phase;
         if (!m->pool_alive) return NULL;
@@ -2372,14 +2516,37 @@ static void *tf_pool_worker_main(void *arg) {
         void *task = (char *)m->pool_args + (size_t)tid * m->pool_arg_stride;
         m->pool_fn(task);
 
-        /* Signal done */
-        __sync_add_and_fetch(&m->pool_done, 1);
+        /* Signal done: write our own 256B-padded slot (no shared atomic —
+         * a single cross-CMG-contended counter was throttling >2 CMGs). */
+        m->pool_done_flags[(size_t)tid * TF_POOL_FLAG_STRIDE] = last_phase;
     }
     return NULL;
 }
 
 static void tf_pool_shutdown(transformer_model *model) {
     if (!model->pool_alive) return;
+#ifdef TF_POOL_PROFILE
+    fprintf(stderr,
+        "tf_pool: %ld dispatches  woke=%.0f  dispatch=%.1fms  work0=%.1fms  wait=%.1fms"
+        "  (per-call: disp=%.2fus work0=%.2fus wait=%.2fus)\n",
+        tf_prof_calls, tf_prof_woke,
+        tf_prof_dispatch*1e3, tf_prof_work0*1e3, tf_prof_wait*1e3,
+        tf_prof_calls ? tf_prof_dispatch/tf_prof_calls*1e6 : 0,
+        tf_prof_calls ? tf_prof_work0/tf_prof_calls*1e6 : 0,
+        tf_prof_calls ? tf_prof_wait/tf_prof_calls*1e6 : 0);
+    for (int i = 0; i < TF_PROF_NSITE && tf_prof_fn[i]; i++)
+        fprintf(stderr,
+            "tf_pool:   site %p  calls=%ld  work0=%.1fms (%.1fus/call)  wait=%.1fms\n",
+            tf_prof_fn[i], tf_prof_fn_calls[i], tf_prof_fn_work[i]*1e3,
+            tf_prof_fn_calls[i] ? tf_prof_fn_work[i]/tf_prof_fn_calls[i]*1e6 : 0,
+            tf_prof_fn_wait[i]*1e3);
+    for (int t = 0; t < 2; t++)
+        fprintf(stderr,
+            "tf_pool:   persistent tid%d  matvec=%.1fms  barrier=%.1fms  "
+            "serial=%.1fms  attn=%.1fms\n", t,
+            tf_pw_matvec[t]*1e3, tf_pw_barrier[t]*1e3,
+            tf_pw_serial[t]*1e3, tf_pw_attn[t]*1e3);
+#endif
     /* Signal workers to exit */
     pthread_mutex_lock(&model->pool_mutex);
     model->pool_alive = 0;
@@ -2390,15 +2557,26 @@ static void tf_pool_shutdown(transformer_model *model) {
         pthread_join(model->pool_threads[t], NULL);
     free(model->pool_threads);
     model->pool_threads = NULL;
+    free((void *)model->pool_done_flags);
+    model->pool_done_flags = NULL;
     pthread_mutex_destroy(&model->pool_mutex);
     pthread_cond_destroy(&model->pool_cond);
 }
 
 static void tf_pool_start(transformer_model *model) {
     int nt = model->n_threads;
+    if (model->cmg_pin) {
+        /* Main thread runs worker 0's task in tf_pool_dispatch — pin it too. */
+        if (tf_cmg_pin_thread(0, nt, model->cmg_pin_ncmgs) != 0) {
+            fprintf(stderr, "transformer: CMG pin failed (not A64FX?), disabling\n");
+            model->cmg_pin = 0;
+        }
+    }
     model->pool_threads = (pthread_t *)calloc(nt, sizeof(pthread_t));
+    model->pool_done_flags = (volatile int *)calloc(
+        (size_t)nt * TF_POOL_FLAG_STRIDE, sizeof(int));
     model->pool_phase = 0;
-    model->pool_done = 0;
+    model->pool_sleepers = 0;
     model->pool_alive = 1;
     pthread_mutex_init(&model->pool_mutex, NULL);
     pthread_cond_init(&model->pool_cond, NULL);
@@ -2419,22 +2597,49 @@ static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
     model->pool_fn = fn;
     model->pool_args = args;
     model->pool_arg_stride = arg_stride;
-    model->pool_done = 0;
     __sync_synchronize();
+#ifdef TF_POOL_PROFILE
+    double t0 = tf_now_s();
+#endif
 
-    /* Wake workers via cond_broadcast */
-    pthread_mutex_lock(&model->pool_mutex);
-    model->pool_phase++;
-    pthread_cond_broadcast(&model->pool_cond);
-    pthread_mutex_unlock(&model->pool_mutex);
+    /* Bump the phase: spinning workers pick it up immediately, no syscall.
+     * Only pay the mutex + cond_broadcast if a worker actually parked. */
+    int phase = ++model->pool_phase;
+    if (model->pool_sleepers > 0) {
+        pthread_mutex_lock(&model->pool_mutex);
+        pthread_cond_broadcast(&model->pool_cond);
+        pthread_mutex_unlock(&model->pool_mutex);
+#ifdef TF_POOL_PROFILE
+        tf_prof_woke++;
+#endif
+    }
 
     /* Main thread executes worker 0's task directly */
     void *task0 = (char *)args;
+#ifdef TF_POOL_PROFILE
+    double t1 = tf_now_s();
+#endif
     fn(task0);
+#ifdef TF_POOL_PROFILE
+    double t2 = tf_now_s();
+#endif
 
-    /* Wait for remaining workers (brief spin — workers are doing useful work) */
-    while (model->pool_done < nt - 1)
-        tf_cpu_pause();
+    /* Wait for remaining workers: poll each worker's own padded slot, so the
+     * completion check never bounces a shared line across CMGs. */
+    for (int t = 1; t < nt; t++)
+        while (model->pool_done_flags[(size_t)t * TF_POOL_FLAG_STRIDE] != phase)
+            tf_cpu_pause();
+#ifdef TF_POOL_PROFILE
+    double t3 = tf_now_s();
+    tf_prof_calls++;
+    tf_prof_dispatch += t1 - t0;
+    tf_prof_work0    += t2 - t1;
+    tf_prof_wait     += t3 - t2;
+    int si = tf_prof_site((void *)fn);
+    tf_prof_fn_calls[si]++;
+    tf_prof_fn_work[si] += t2 - t1;
+    tf_prof_fn_wait[si] += t3 - t2;
+#endif
 }
 
 void transformer_set_threads(transformer_model *model, int n_threads) {
@@ -2461,9 +2666,88 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
                                     (size_t)max_dim * sizeof(float));
     }
 
+    /* CMG affinity config: on A64FX, pin pool threads to CMG-local cores so
+     * panel buffers first-touched per-thread stay on the owning HBM stack.
+     * Default on for aarch64 multi-thread; TF_CMG_PIN=0 disables. TF_N_CMGS
+     * sets how many CMGs the pool spreads across (default 4, capped). */
+#if defined(__aarch64__) && defined(__linux__)
+    model->cmg_pin = (n_threads > 1);
+    {
+        const char *e = getenv("TF_CMG_PIN");
+        if (e) model->cmg_pin = atoi(e) != 0;
+    }
+    model->cmg_pin_ncmgs = 4;
+    {
+        const char *e = getenv("TF_N_CMGS");
+        if (e) model->cmg_pin_ncmgs = atoi(e);
+    }
+    if (model->cmg_pin_ncmgs < 1) model->cmg_pin_ncmgs = 1;
+    if (model->cmg_pin_ncmgs > 4) model->cmg_pin_ncmgs = 4;
+    if (model->cmg_pin_ncmgs > n_threads) model->cmg_pin_ncmgs = n_threads;
+#else
+    model->cmg_pin = 0;
+    model->cmg_pin_ncmgs = 1;
+#endif
+
     /* Start new pool */
     if (n_threads > 1) tf_pool_start(model);
-    fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
+    if (model->cmg_pin)
+        fprintf(stderr, "transformer: using %d threads (thread pool, "
+                "pinned across %d CMGs)\n", n_threads, model->cmg_pin_ncmgs);
+    else
+        fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
+}
+
+void transformer_build_panels(transformer_model *m) {
+#if defined(__ARM_FEATURE_SVE)
+    if (!m || getenv("TF_NO_PANEL")) return;
+
+    /* Gather every dense F16 matvec weight (attn q/k/v/o, ffn gate/up/down,
+     * plus the output projection). MoE expert tensors stay row-major. */
+    qtensor *list[7 * 256 + 1];
+    int n = 0;
+    for (int l = 0; l < m->n_layers && n + 7 <= (int)(sizeof(list)/sizeof(list[0])) - 1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *dense[] = { &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+                             &L->ffn_gate, &L->ffn_up, &L->ffn_down };
+        for (int i = 0; i < 7; i++)
+            if (dense[i]->data && dense[i]->type == GGML_TYPE_F16 && !dense[i]->panel)
+                list[n++] = dense[i];
+    }
+    if (m->has_lm_head && m->output.data && m->output.type == GGML_TYPE_F16 &&
+        !m->output.panel)
+        list[n++] = &m->output;
+    if (n == 0) return;
+
+    int nt = m->n_threads;
+    int built = 0;
+    for (int i = 0; i < n; i++) {
+        qtensor *t = list[i];
+        if (!tf_panel_alloc(t)) continue;
+        int nblk = t->panel_blk;
+        if (nt > 1 && m->pool_alive && nblk >= nt) {
+            /* Same contiguous partition as tf_panel_matvec_pool: worker w
+             * fills (and first-touches) exactly the blocks it will read. */
+            tf_panel_build_task *tasks =
+                (tf_panel_build_task *)alloca(nt * sizeof(tf_panel_build_task));
+            int per = nblk / nt, extra = nblk % nt, off = 0;
+            for (int w = 0; w < nt; w++) {
+                int c = per + (w < extra ? 1 : 0);
+                tasks[w] = (tf_panel_build_task){ t, off, off + c };
+                off += c;
+            }
+            tf_pool_dispatch(m, tf_panel_build_worker, tasks,
+                             sizeof(tf_panel_build_task));
+        } else {
+            tf_panel_fill_range(t, 0, nblk);
+        }
+        built++;
+    }
+    fprintf(stderr, "transformer: panel layout built for %d F16 matvec weights%s\n",
+            built, m->cmg_pin ? " (first-touched per CMG)" : "");
+#else
+    (void)m;
+#endif
 }
 
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable) {
@@ -3454,9 +3738,31 @@ static inline void tf_barrier(transformer_model *m, int tid, int *local_sense, i
 #endif
 }
 
-/* Per-thread matvec: thread tid computes its static row partition */
+/* Per-thread matvec: thread tid computes its static partition.
+ *
+ * When the F16 weight has an A64FX panel layout, partition by 32-row panel
+ * BLOCKS using exactly the same split as transformer_build_panels(), so the
+ * block range a thread streams here is the one it first-touched at build
+ * time — i.e. resident in its own CMG's HBM. This is what makes the
+ * persistent forward path scale across CMGs; the row-major fallback below
+ * reads mat->data, which lives on whichever single CMG loaded it. */
 static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
                               int n_rows, int tid, int nt) {
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_F16 && mat->panel) {
+        int nblk = mat->panel_blk;
+        int bp = nblk / nt, be = nblk % nt;
+        int bs = tid * bp + (tid < be ? tid : be);
+        int bc = bp + (tid < be ? 1 : 0);
+        if (bc <= 0) return;
+        int K = mat->n_cols;
+        float16_t *xh = (float16_t *)alloca((size_t)K * sizeof(float16_t));
+        tf_x_to_f16(xh, x, K);
+        tf_panel_task t = { dst, mat->panel, xh, bs, bs + bc, K, n_rows };
+        tf_panel_matvec_worker(&t);
+        return;
+    }
+#endif
     int rp = n_rows / nt, re = n_rows % nt;
     int rs = tid * rp + (tid < re ? tid : re);
     int rc = rp + (tid < re ? 1 : 0);
@@ -3479,6 +3785,13 @@ static void *tf_persistent_worker(void *arg) {
     transformer_model *m = ctx->m;
     int tid = ctx->tid;
     int nt = m->n_threads;
+#ifdef TF_POOL_PROFILE
+    double _ts = tf_now_s();
+#define PW_MARK(BUCKET) do { if (tid < 2) { double _n = tf_now_s(); \
+    tf_pw_##BUCKET[tid] += _n - _ts; _ts = _n; } } while (0)
+#else
+#define PW_MARK(BUCKET) ((void)0)
+#endif
     int position = ctx->position;
     int pos_t = ctx->pos_t, pos_h = ctx->pos_h, pos_w = ctx->pos_w;
     int local_sense = 0;
@@ -3502,7 +3815,9 @@ static void *tf_persistent_worker(void *arg) {
         /* Thread 0: RMSNorm (sequential, cheap) */
         if (tid == 0)
             tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        PW_MARK(serial);
         tf_spin_barrier(m, &local_sense, nt);  /* B1: xb ready */
+        PW_MARK(barrier);
 
         if (m->is_hybrid && layer->is_ssm) {
             /* SSM: thread 0 runs with pool disabled. Other threads wait. */
@@ -3528,7 +3843,9 @@ static void *tf_persistent_worker(void *arg) {
                 tf_thread_matvec(m->k, &layer->attn_k, m->xb, kv_dim, tid, nt);
                 tf_thread_matvec(m->v, &layer->attn_v, m->xb, kv_dim, tid, nt);
             }
+            PW_MARK(matvec);
             tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
+            PW_MARK(barrier);
 
             /* Thread 0: de-interleave (gated), QK-norm, RoPE, KV cache */
             if (tid == 0) {
@@ -3574,7 +3891,9 @@ static void *tf_persistent_worker(void *arg) {
                 memcpy(m->key_cache[l] + position * kv_dim, m->k, kv_dim * sizeof(float));
                 memcpy(m->value_cache[l] + position * kv_dim, m->v, kv_dim * sizeof(float));
             }
+            PW_MARK(serial);
             tf_spin_barrier(m, &local_sense, nt);  /* B3: Q/K ready for attention */
+            PW_MARK(barrier);
 
             /* Attention: each thread handles its head partition */
             {
@@ -3596,11 +3915,15 @@ static void *tf_persistent_worker(void *arg) {
                     m->xb2[i] *= 1.0f / (1.0f + expf(-g));
                 }
             }
+            PW_MARK(attn);
             tf_spin_barrier(m, &local_sense, nt);  /* B4: xb2 ready */
+            PW_MARK(barrier);
 
             /* Output projection: all threads compute their row partition */
             tf_thread_matvec(m->xb, &layer->attn_output, m->xb2, n_embd, tid, nt);
+            PW_MARK(matvec);
             tf_spin_barrier(m, &local_sense, nt);  /* B5: xb ready */
+            PW_MARK(barrier);
         }
 
         /* Thread 0: residual + FFN norm (merged B5+B6: saves 1 barrier) */
@@ -3608,7 +3931,9 @@ static void *tf_persistent_worker(void *arg) {
             tf_vadd(m->x, m->xb, n_embd);
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         }
+        PW_MARK(serial);
         tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN (merged) */
+        PW_MARK(barrier);
 
         if (!m->use_moe || !layer->ffn_gate_inp.data) {
             /* Dense SwiGLU FFN: gate+up matvec (parallel) */
@@ -3625,11 +3950,15 @@ static void *tf_persistent_worker(void *arg) {
                     m->ffn_buf3[i] = g / (1.0f + expf(-g)) * m->ffn_buf2[i];
                 }
             }
+            PW_MARK(matvec);
             tf_spin_barrier(m, &local_sense, nt);  /* B7: ffn_buf3 ready for down */
+            PW_MARK(barrier);
 
             /* Down projection */
             tf_thread_matvec(m->xb, &layer->ffn_down, m->ffn_buf3, n_embd, tid, nt);
+            PW_MARK(matvec);
             tf_spin_barrier(m, &local_sense, nt);  /* B8: xb ready */
+            PW_MARK(barrier);
 
             /* Thread 0: residual */
             if (tid == 0) tf_vadd(m->x, m->xb, n_embd);
