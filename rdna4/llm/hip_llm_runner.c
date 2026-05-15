@@ -6579,6 +6579,73 @@ float *hip_llm_forward_embd(hip_llm_runner *r, const float *embd, int embd_strid
     return result;
 }
 
+/* Batched embedding forward: feeds M pre-computed embeddings through the
+ * batched prefill path in one shot (positions [position_start, +M)). The
+ * input layout is M rows of `embd_stride` floats each — the first n_embd
+ * floats are the main embedding, the rest (if embd_stride > n_embd) are
+ * DeepStack slices for layers 0..n_deepstack-1 (same convention as the
+ * per-token hip_llm_forward_embd).
+ *
+ * Falls back to a per-token loop if the batched path isn't eligible (e.g.
+ * M > BMAX, or LLM_BATCH_DISABLE). Returns r->h_output (hidden state of
+ * the last fed token) on success, NULL on failure.
+ *
+ * Limits: M must satisfy position_start + M <= max_seq_len. If M exceeds
+ * BMAX the caller should chunk; this implementation does NOT split. */
+float *hip_llm_forward_batch_embd(hip_llm_runner *r, const float *embds,
+                                    int M, int embd_stride, int position_start) {
+    if (!r || !r->weights_loaded || !embds || M <= 0) return NULL;
+    if (position_start < 0 || position_start + M > r->max_seq_len) return NULL;
+
+    int n_embd = r->n_embd;
+
+#ifdef LLM_HIPBLASLT_ENABLED
+    if (r->batch_path_ok && M >= r->gemm_m_threshold && M <= r->batch_max) {
+        /* Copy the M main embeddings (first n_embd floats of each row) into
+         * d_x_batch. Rows are non-contiguous in source when embd_stride > n_embd
+         * (deepstack layout), so issue one memcpy per row — M is small (a few
+         * hundred at most). */
+        for (int m = 0; m < M; m++) {
+            const float *src = embds + (size_t)m * embd_stride;
+            float *dst = (float *)r->d_x_batch + (size_t)m * n_embd;
+            hipMemcpyAsync(dst, src, (size_t)n_embd * sizeof(float),
+                           hipMemcpyHostToDevice, r->stream);
+        }
+
+        /* DeepStack: the layer loop reads slices on the fly from the host
+         * pointer via hipMemcpyAsync per (layer, row). For VLM workloads
+         * with n_deepstack=3 and M ~ 260, that's ~780 small uploads — a
+         * known overhead but still vastly less than the per-token forward. */
+        r->_ds_embd        = embds;
+        r->_ds_embd_stride = embd_stride;
+
+        int rc = forward_block_batched_dense(r, M, position_start);
+
+        r->_ds_embd        = NULL;
+        r->_ds_embd_stride = 0;
+
+        if (rc != 0) return NULL;
+
+        /* Hand back the last row's hidden state in r->h_output (same contract
+         * as hip_llm_forward_embd). r->d_x already holds it after
+         * forward_block_batched_dense. */
+        hipMemcpyAsync(r->h_output, r->d_x, (size_t)n_embd * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream);
+        hipStreamSynchronize(r->stream);
+        return r->h_output;
+    }
+#endif
+
+    /* Fallback: per-token loop using the existing forward_embd path. */
+    float *last = NULL;
+    for (int m = 0; m < M; m++) {
+        last = hip_llm_forward_embd(r, embds + (size_t)m * embd_stride,
+                                    embd_stride, position_start + m);
+        if (!last) return NULL;
+    }
+    return last;
+}
+
 float *hip_llm_forward_embd_logits(hip_llm_runner *r, const float *embd, int embd_stride, int position) {
     float *hidden = hip_llm_forward_embd(r, embd, embd_stride, position);
     if (!hidden || !r->has_lm_head) return NULL;

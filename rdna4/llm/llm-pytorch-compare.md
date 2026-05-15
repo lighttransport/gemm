@@ -80,6 +80,36 @@ per-token. To move that needle we need:
 2. A per-layer hybrid dispatcher: SSM layers stay per-token (state recurrence),
    attention + FFN layers use the batched path.
 
+## Update (2026-05-16) — VLM e2e wired to batched embed
+
+`test_hip_vlm` previously fed each vision-encoder output through
+`hip_llm_forward_embd` in a per-token loop, completely bypassing the
+batched prefill path. Wired it through a new public API
+`hip_llm_forward_batch_embd(r, embds, M, embd_stride, position_start)` that
+copies M pre-computed embeddings into `d_x_batch` and dispatches through
+`forward_block_batched_dense` (same path the token-based batched prefill
+uses, with DeepStack injection support intact).
+
+The `test_hip_vlm` Makefile rule also needed
+`-DLLM_HIPBLASLT_ENABLED` and the `mm_blaslt_bridge.o` link — without those,
+the entire Phase-2/3 code in `hip_llm_runner.c` was compiled out and the
+VLM binary was running the pre-Track-A per-token path regardless.
+
+Measured (Qwen3.6-27B IQ3_XXS hybrid, RX 9070 XT, M=1024 chunks):
+
+| image            | vision tokens | before | after        | speedup |
+|------------------|--------------:|-------:|-------------:|--------:|
+| fujisan          |   260         | 16110 ms (62 ms/tok) | **2721 ms (10.5 ms/tok)** | **6.0×** |
+| Brooklyn Bridge  |  2904         | 187623 ms (65 ms/tok) | **24081 ms (8.3 ms/tok)** | **7.8×** |
+
+End-to-end generation still produces correct output ("The image features
+the Brooklyn Bridge in New York City..."). Env `LLM_VLM_BATCH_EMBD=0`
+restores the legacy per-token loop for A/B comparison.
+
+The Brooklyn Bridge gain is higher than the standalone bench (9.2×) because
+vision-token prefill is purely batched compute, no decode interleave — the
+per-token overhead amortizes well across M=1024 chunks.
+
 ## Update (2026-05-16) — IQ2_XS / IQ2_S / IQ3_S / IQ4_XS dequant kernels
 
 Ported the four IQ dequant-to-BF16 kernels that were blocking the 27B's
