@@ -2861,6 +2861,106 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Per-call dequant of a Q4_K weight matrix [N,K] (raw 144-byte blocks per 256\n"
+" * elements) to a contiguous BF16 buffer dst[N,K]. Used by the batched prefill\n"
+" * path to stage quantized weights into hipBLASLt-callable BF16 once per GEMM.\n"
+" * Grid: (n_rows, n_blocks_per_row). Block: 256 threads, one per element. */\n"
+"__global__ void dequant_q4_K_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 144;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 144;\n"
+"    float d    = half_to_float(*(const half_raw *)(bp));\n"
+"    float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"    const unsigned char *sc = bp + 4;\n"
+"    const unsigned char *qs = bp + 16;\n"
+"    int tid = threadIdx.x;\n"
+"    int sub = tid >> 5;            /* 0..7 sub-block index */\n"
+"    int idx = tid & 31;            /* 0..31 element within sub-block */\n"
+"    int j   = sub >> 1;            /* 0..3 paired-block index */\n"
+"    int is  = sub;\n"
+"    unsigned char sv, mv;\n"
+"    if (is < 4) { sv = sc[is] & 63; mv = sc[is+4] & 63; }\n"
+"    else { sv = (sc[is+4] & 0xF) | ((sc[is-4] >> 6) << 4);\n"
+"           mv = (sc[is+4] >> 4)  | ((sc[is]     >> 6) << 4); }\n"
+"    float dval = d * (float)sv;\n"
+"    float mval = dmin * (float)mv;\n"
+"    unsigned char q = qs[j * 32 + idx];\n"
+"    int nibble = (sub & 1) ? (q >> 4) : (q & 0xF);\n"
+"    float val = dval * (float)nibble - mval;\n"
+"    int out_pos = j * 64 + ((sub & 1) ? 32 : 0) + idx;\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + out_pos;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
+"/* Per-call dequant of Q5_K (176 B/block) to BF16. Layout: same paired-sub-block\n"
+" * scheme as Q4_K plus one extra bit per element from qh[32]. */\n"
+"__global__ void dequant_q5_K_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 176;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 176;\n"
+"    float d    = half_to_float(*(const half_raw *)(bp));\n"
+"    float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"    const unsigned char *sc = bp + 4;\n"
+"    const unsigned char *qh = bp + 16;\n"
+"    const unsigned char *qs = bp + 48;\n"
+"    int tid = threadIdx.x;\n"
+"    int sub = tid >> 5;            /* 0..7 */\n"
+"    int idx = tid & 31;            /* 0..31 */\n"
+"    int j   = sub >> 1;            /* 0..3 */\n"
+"    int is  = sub;\n"
+"    unsigned char sv, mv;\n"
+"    if (is < 4) { sv = sc[is] & 63; mv = sc[is+4] & 63; }\n"
+"    else { sv = (sc[is+4] & 0xF) | ((sc[is-4] >> 6) << 4);\n"
+"           mv = (sc[is+4] >> 4)  | ((sc[is]     >> 6) << 4); }\n"
+"    float dval = d * (float)sv;\n"
+"    float mval = dmin * (float)mv;\n"
+"    int shift = (sub & 1) ? (2 * j + 1) : (2 * j);\n"
+"    int qhbit = (qh[idx] >> shift) & 1;\n"
+"    unsigned char q = qs[j * 32 + idx];\n"
+"    int nibble = (sub & 1) ? (q >> 4) : (q & 0xF);\n"
+"    int weight = nibble | (qhbit << 4);\n"
+"    float val = dval * (float)weight - mval;\n"
+"    int out_pos = j * 64 + ((sub & 1) ? 32 : 0) + idx;\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + out_pos;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
+"/* Per-call dequant of Q6_K (210 B/block) to BF16. Layout: 256 elements in two\n"
+" * halves of 128. Each thread handles one output element. */\n"
+"__global__ void dequant_q6_K_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 210;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 210;\n"
+"    float d = half_to_float(*(const half_raw *)(bp + 208));\n"
+"    int tid   = threadIdx.x;\n"
+"    int half  = tid >> 7;          /* 0 or 1 */\n"
+"    int pos   = tid & 127;          /* 0..127 */\n"
+"    int q_idx = pos >> 5;           /* 0..3 (q1/q2/q3/q4) */\n"
+"    int l     = pos & 31;           /* 0..31 */\n"
+"    int is    = l >> 4;             /* 0 or 1 */\n"
+"    int use_low_nibble = (q_idx < 2);\n"
+"    int ql_off = (q_idx & 1) ? (l + 32) : l;\n"
+"    int ql_idx = half * 64 + ql_off;\n"
+"    int qh_idx = 128 + half * 32 + l;\n"
+"    int sc_idx = 192 + half * 8 + (is + q_idx * 2);\n"
+"    int qh_bits = (bp[qh_idx] >> (q_idx * 2)) & 3;\n"
+"    int ql_nibble = use_low_nibble ? (bp[ql_idx] & 0xF) : (bp[ql_idx] >> 4);\n"
+"    int q = (int)(ql_nibble | (qh_bits << 4)) - 32;\n"
+"    int scale = (int)((signed char)bp[sc_idx]);\n"
+"    float val = d * (float)scale * (float)q;\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
 "/* ===== Phase 3: causal WMMA flash-attention helpers ===== */\n"
 "typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));\n"
 "typedef float    float8 __attribute__((ext_vector_type(8)));\n"
@@ -3555,6 +3655,10 @@ struct hip_llm_runner {
     /* Phase 2 BF16 helpers */
     hipFunction_t fn_pack_bf16_from_f32;
     hipFunction_t fn_convert_f16_to_bf16;
+    /* K-quant batched-prefill dequant kernels (write BF16 to a staging buffer) */
+    hipFunction_t fn_dequant_q4_K_to_bf16;
+    hipFunction_t fn_dequant_q5_K_to_bf16;
+    hipFunction_t fn_dequant_q6_K_to_bf16;
 
     /* Phase 3 flash-attention helpers */
     hipFunction_t fn_pack_f16_from_f32;
@@ -3680,6 +3784,12 @@ struct hip_llm_runner {
     void *d_silu_batch_bf16;    /* [BMAX, n_ff] BF16 */
     void *d_down_batch;         /* [BMAX, n_embd] F32 */
 
+    /* Shared staging buffer for per-call dequant of K-quant weights to BF16
+     * inside the batched prefill path. Sized to the largest single weight
+     * tensor (typically ffn_down: n_embd × n_ff). */
+    void *d_wbuf_bf16;
+    size_t d_wbuf_bf16_bytes;
+
     /* === Phase 3: flash-attention scratch === */
     int   fa_path_ok;           /* 1 if FA prefill path is enabled */
     void *d_q_batch_f16;        /* [BMAX, n_heads*head_dim] F16 */
@@ -3782,6 +3892,9 @@ static int compile_kernels(hip_llm_runner *r) {
 
     GET_FUNC(pack_bf16_from_f32);
     GET_FUNC(convert_f16_to_bf16);
+    GET_FUNC(dequant_q4_K_to_bf16);
+    GET_FUNC(dequant_q5_K_to_bf16);
+    GET_FUNC(dequant_q6_K_to_bf16);
 
     GET_FUNC(pack_f16_from_f32);
     GET_FUNC(pack_kv_cache_f16);
@@ -4507,23 +4620,33 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         int disabled = (env_dis && atoi(env_dis) != 0);
 
         /* Eligibility: dense Qwen3-style only. Hybrid SSM and MoE keep the
-         * per-token path; they're out of scope for v1 batched GEMM routing. */
+         * per-token path; they're out of scope for v1 batched GEMM routing.
+         * (B1 plan: extend to hybrid/MoE later by splitting per-layer dispatch.) */
         int eligible = !disabled && !r->is_hybrid && !r->is_moe;
 
-        /* Verify all dense F16 weights are present. */
+        /* Per-layer weight type check. Each layer's 7 projection weights must
+         * be a type for which we have a batched path:
+         *   - F16: pre-converted to BF16 at load (existing).
+         *   - Q4_K: per-call streamed dequant to BF16 staging buffer (B1).
+         * Other quant types are not yet batchable; if any layer needs one,
+         * the whole model falls back to the per-token path. */
+        #define BATCH_QTYPE_OK(t) ((t) == GGML_TYPE_F16 ||                           \
+                                   (t) == GGML_TYPE_Q4_K || (t) == GGML_TYPE_Q5_K || \
+                                   (t) == GGML_TYPE_Q6_K)
         if (eligible) {
             for (int l = 0; l < r->n_layers; l++) {
                 hip_layer *cl = &r->layers[l];
                 if (cl->is_ssm || cl->is_moe) { eligible = 0; break; }
-                if (cl->attn_q_type   != GGML_TYPE_F16) { eligible = 0; break; }
-                if (cl->attn_k_type   != GGML_TYPE_F16) { eligible = 0; break; }
-                if (cl->attn_v_type   != GGML_TYPE_F16) { eligible = 0; break; }
-                if (cl->attn_output_type != GGML_TYPE_F16) { eligible = 0; break; }
-                if (cl->ffn_gate_type != GGML_TYPE_F16) { eligible = 0; break; }
-                if (cl->ffn_up_type   != GGML_TYPE_F16) { eligible = 0; break; }
-                if (cl->ffn_down_type != GGML_TYPE_F16) { eligible = 0; break; }
+                if (!BATCH_QTYPE_OK(cl->attn_q_type))      { eligible = 0; break; }
+                if (!BATCH_QTYPE_OK(cl->attn_k_type))      { eligible = 0; break; }
+                if (!BATCH_QTYPE_OK(cl->attn_v_type))      { eligible = 0; break; }
+                if (!BATCH_QTYPE_OK(cl->attn_output_type)) { eligible = 0; break; }
+                if (!BATCH_QTYPE_OK(cl->ffn_gate_type))    { eligible = 0; break; }
+                if (!BATCH_QTYPE_OK(cl->ffn_up_type))      { eligible = 0; break; }
+                if (!BATCH_QTYPE_OK(cl->ffn_down_type))    { eligible = 0; break; }
             }
         }
+        #undef BATCH_QTYPE_OK
 
         if (eligible) {
             if (mm_blaslt_init() != 0) {
@@ -4537,7 +4660,24 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             int kv_dim = r->n_kv_heads * r->head_dim;
             int q_dim  = r->n_heads * r->head_dim;
 
-            /* Allocate BF16 weight copies + populate via on-GPU F16->BF16 kernel. */
+            /* Allocate BF16 weight copies + populate via on-GPU F16->BF16 kernel.
+             * Only for F16-typed weights; Q4_K weights are dequantized per-call
+             * into r->d_wbuf_bf16 staging buffer (allocated below). */
+            size_t max_w_elems = 0;
+            #define CONV_IF_F16(field, type, rows, cols)                                 \
+                do {                                                                     \
+                    size_t _n = (size_t)cl->rows * cl->cols;                             \
+                    if (_n > max_w_elems) max_w_elems = _n;                              \
+                    if (cl->type == GGML_TYPE_F16) {                                     \
+                        CHECK_HIP(hipMalloc(&cl->field, _n * 2));                        \
+                        launch_convert_f16_to_bf16_loadtime(r, cl->field,                \
+                            cl->field##_src, (int)_n);                                   \
+                    } else {                                                             \
+                        cl->field = NULL;                                                \
+                    }                                                                    \
+                } while (0)
+            /* The macro above wants a "src" tied to the bf16 field name; expand
+             * the 7 cases by hand to keep things explicit. */
             for (int l = 0; l < r->n_layers; l++) {
                 hip_layer *cl = &r->layers[l];
                 size_t n_q  = (size_t)cl->attn_q_rows * cl->attn_q_cols;
@@ -4547,23 +4687,38 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
                 size_t n_g  = (size_t)cl->ffn_gate_rows * cl->ffn_gate_cols;
                 size_t n_u  = (size_t)cl->ffn_up_rows   * cl->ffn_up_cols;
                 size_t n_d  = (size_t)cl->ffn_down_rows * cl->ffn_down_cols;
-                CHECK_HIP(hipMalloc(&cl->attn_q_w_bf16,      n_q * 2));
-                CHECK_HIP(hipMalloc(&cl->attn_k_w_bf16,      n_k * 2));
-                CHECK_HIP(hipMalloc(&cl->attn_v_w_bf16,      n_v * 2));
-                CHECK_HIP(hipMalloc(&cl->attn_output_w_bf16, n_o * 2));
-                CHECK_HIP(hipMalloc(&cl->ffn_gate_w_bf16,    n_g * 2));
-                CHECK_HIP(hipMalloc(&cl->ffn_up_w_bf16,      n_u * 2));
-                CHECK_HIP(hipMalloc(&cl->ffn_down_w_bf16,    n_d * 2));
-
-                launch_convert_f16_to_bf16_loadtime(r, cl->attn_q_w_bf16,      cl->attn_q_w,      (int)n_q);
-                launch_convert_f16_to_bf16_loadtime(r, cl->attn_k_w_bf16,      cl->attn_k_w,      (int)n_k);
-                launch_convert_f16_to_bf16_loadtime(r, cl->attn_v_w_bf16,      cl->attn_v_w,      (int)n_v);
-                launch_convert_f16_to_bf16_loadtime(r, cl->attn_output_w_bf16, cl->attn_output_w, (int)n_o);
-                launch_convert_f16_to_bf16_loadtime(r, cl->ffn_gate_w_bf16,    cl->ffn_gate_w,    (int)n_g);
-                launch_convert_f16_to_bf16_loadtime(r, cl->ffn_up_w_bf16,      cl->ffn_up_w,      (int)n_u);
-                launch_convert_f16_to_bf16_loadtime(r, cl->ffn_down_w_bf16,    cl->ffn_down_w,    (int)n_d);
+                if (n_q > max_w_elems) max_w_elems = n_q;
+                if (n_k > max_w_elems) max_w_elems = n_k;
+                if (n_v > max_w_elems) max_w_elems = n_v;
+                if (n_o > max_w_elems) max_w_elems = n_o;
+                if (n_g > max_w_elems) max_w_elems = n_g;
+                if (n_u > max_w_elems) max_w_elems = n_u;
+                if (n_d > max_w_elems) max_w_elems = n_d;
+                #define DO_W(field, src, type, n) do {                                   \
+                    if (cl->type == GGML_TYPE_F16) {                                     \
+                        CHECK_HIP(hipMalloc(&cl->field, (n) * 2));                       \
+                        launch_convert_f16_to_bf16_loadtime(r, cl->field, cl->src, (int)(n)); \
+                    } else { cl->field = NULL; }                                         \
+                } while (0)
+                DO_W(attn_q_w_bf16,      attn_q_w,      attn_q_type,      n_q);
+                DO_W(attn_k_w_bf16,      attn_k_w,      attn_k_type,      n_k);
+                DO_W(attn_v_w_bf16,      attn_v_w,      attn_v_type,      n_v);
+                DO_W(attn_output_w_bf16, attn_output_w, attn_output_type, n_o);
+                DO_W(ffn_gate_w_bf16,    ffn_gate_w,    ffn_gate_type,    n_g);
+                DO_W(ffn_up_w_bf16,      ffn_up_w,      ffn_up_type,      n_u);
+                DO_W(ffn_down_w_bf16,    ffn_down_w,    ffn_down_type,    n_d);
+                #undef DO_W
             }
+            #undef CONV_IF_F16
             hipDeviceSynchronize();
+
+            /* Per-call dequant staging buffer (sized to the largest weight). */
+            r->d_wbuf_bf16_bytes = max_w_elems * 2;
+            CHECK_HIP(hipMalloc(&r->d_wbuf_bf16, r->d_wbuf_bf16_bytes));
+            if (r->verbose >= 1) {
+                fprintf(stderr, "hip_llm: K-quant dequant staging buffer = %.1f MB\n",
+                        (double)r->d_wbuf_bf16_bytes / (1024.0 * 1024.0));
+            }
 
             /* Allocate batched activation buffers. */
             size_t bm = (size_t)batch_max;
@@ -4603,23 +4758,31 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
                 if (batch_max > 64)  warm_Ms[n_warm_Ms++] = (batch_max < 256 ? batch_max : 256);
                 if (batch_max > 256) warm_Ms[n_warm_Ms++] = batch_max;
                 double pw0 = (r->verbose >= 1) ? 0.0 : 0.0;
+                /* Pre-warm only the F16-pre-converted layers. K-quant layers
+                 * skip pre-warm (one-time first-call cost is small). */
                 for (int wi = 0; wi < n_warm_Ms; wi++) {
                     int M = warm_Ms[wi];
-                    /* Q/K/V/O + gate/up/down */
-                    mm_blaslt_run_bf16(r->d_q_batch,    cl0->attn_q_w_bf16,
-                                       r->d_xnorm_batch_bf16, M, q_dim,    r->n_embd, r->stream);
-                    mm_blaslt_run_bf16(r->d_k_batch,    cl0->attn_k_w_bf16,
-                                       r->d_xnorm_batch_bf16, M, kv_dim,   r->n_embd, r->stream);
-                    mm_blaslt_run_bf16(r->d_v_batch,    cl0->attn_v_w_bf16,
-                                       r->d_xnorm_batch_bf16, M, kv_dim,   r->n_embd, r->stream);
-                    mm_blaslt_run_bf16(r->d_attn_proj_batch, cl0->attn_output_w_bf16,
-                                       r->d_attn_out_batch_bf16, M, r->n_embd, q_dim, r->stream);
-                    mm_blaslt_run_bf16(r->d_gate_batch, cl0->ffn_gate_w_bf16,
-                                       r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
-                    mm_blaslt_run_bf16(r->d_up_batch,   cl0->ffn_up_w_bf16,
-                                       r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
-                    mm_blaslt_run_bf16(r->d_down_batch, cl0->ffn_down_w_bf16,
-                                       r->d_silu_batch_bf16,    M, r->n_embd, r->n_ff, r->stream);
+                    if (cl0->attn_q_w_bf16)
+                        mm_blaslt_run_bf16(r->d_q_batch, cl0->attn_q_w_bf16,
+                            r->d_xnorm_batch_bf16, M, q_dim, r->n_embd, r->stream);
+                    if (cl0->attn_k_w_bf16)
+                        mm_blaslt_run_bf16(r->d_k_batch, cl0->attn_k_w_bf16,
+                            r->d_xnorm_batch_bf16, M, kv_dim, r->n_embd, r->stream);
+                    if (cl0->attn_v_w_bf16)
+                        mm_blaslt_run_bf16(r->d_v_batch, cl0->attn_v_w_bf16,
+                            r->d_xnorm_batch_bf16, M, kv_dim, r->n_embd, r->stream);
+                    if (cl0->attn_output_w_bf16)
+                        mm_blaslt_run_bf16(r->d_attn_proj_batch, cl0->attn_output_w_bf16,
+                            r->d_attn_out_batch_bf16, M, r->n_embd, q_dim, r->stream);
+                    if (cl0->ffn_gate_w_bf16)
+                        mm_blaslt_run_bf16(r->d_gate_batch, cl0->ffn_gate_w_bf16,
+                            r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
+                    if (cl0->ffn_up_w_bf16)
+                        mm_blaslt_run_bf16(r->d_up_batch, cl0->ffn_up_w_bf16,
+                            r->d_ffn_norm_batch_bf16, M, r->n_ff, r->n_embd, r->stream);
+                    if (cl0->ffn_down_w_bf16)
+                        mm_blaslt_run_bf16(r->d_down_batch, cl0->ffn_down_w_bf16,
+                            r->d_silu_batch_bf16, M, r->n_embd, r->n_ff, r->stream);
                 }
                 hipStreamSynchronize(r->stream);
                 (void)pw0;
@@ -4932,6 +5095,48 @@ static inline void launch_pack_bf16_from_f32(hip_llm_runner *r, void *dst,
     int n4 = (n + 3) / 4;
     LAUNCH(r->fn_pack_bf16_from_f32, (n4 + 255) / 256, 1, 1, 256, 1, 1, 0,
            r->stream, args);
+}
+
+/* Per-call dequant a K-quant weight matrix to a contiguous BF16 buffer.
+ * dst:  [n_rows, n_cols] BF16 row-major (typically r->d_wbuf_bf16).
+ * mat:  raw block-quant data, native stride per quant type.
+ * Launch grid (n_rows, n_blocks_per_row), 256 threads/block (one per element). */
+#define DEFINE_LAUNCH_KQ_DEQUANT(qname)                                          \
+static inline void launch_dequant_##qname##_to_bf16(hip_llm_runner *r,           \
+                                                      void *dst, void *mat,      \
+                                                      int n_rows, int n_cols) {  \
+    void *args[] = { &dst, &mat, &n_rows, &n_cols };                             \
+    int n_blocks_per_row = n_cols / 256;                                         \
+    LAUNCH(r->fn_dequant_##qname##_to_bf16, n_rows, n_blocks_per_row, 1,         \
+           256, 1, 1, 0, r->stream, args);                                       \
+}
+DEFINE_LAUNCH_KQ_DEQUANT(q4_K)
+DEFINE_LAUNCH_KQ_DEQUANT(q5_K)
+DEFINE_LAUNCH_KQ_DEQUANT(q6_K)
+#undef DEFINE_LAUNCH_KQ_DEQUANT
+
+/* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
+ * dequant into r->d_wbuf_bf16 if the weight is not F16-pre-converted.
+ * NOTE: returns r->d_wbuf_bf16 for non-F16 paths; the caller must consume the
+ * pointer before any subsequent get_bf16_weight call that would overwrite the
+ * staging buffer. The current prefill code does this naturally — each GEMM is
+ * called inline and the staging buffer's lifetime is exactly one mm_blaslt call. */
+static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w,
+                                      int type, int n_rows, int n_cols) {
+    if (bf16_w) return bf16_w;
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+            launch_dequant_q4_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q5_K:
+            launch_dequant_q5_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q6_K:
+            launch_dequant_q6_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        default:
+            return NULL;  /* not batchable */
+    }
 }
 
 static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
@@ -5557,13 +5762,28 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16,
                                   r->d_xnorm_batch, M * n_embd);
 
-        /* ---- Q/K/V GEMMs (3 hipBLASLt calls) ---- */
-        if (mm_blaslt_run_bf16(r->d_q_batch, cl->attn_q_w_bf16,
-                               r->d_xnorm_batch_bf16, M, q_dim,  n_embd, r->stream) != 0) return -1;
-        if (mm_blaslt_run_bf16(r->d_k_batch, cl->attn_k_w_bf16,
-                               r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
-        if (mm_blaslt_run_bf16(r->d_v_batch, cl->attn_v_w_bf16,
-                               r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+        /* ---- Q/K/V GEMMs (3 hipBLASLt calls; per-call dequant for K-quant rows) ---- */
+        {
+            void *qw = get_bf16_weight(r, cl->attn_q_w, cl->attn_q_w_bf16,
+                                       cl->attn_q_type, cl->attn_q_rows, cl->attn_q_cols);
+            if (!qw) return -1;
+            if (mm_blaslt_run_bf16(r->d_q_batch, qw,
+                                   r->d_xnorm_batch_bf16, M, q_dim, n_embd, r->stream) != 0) return -1;
+        }
+        {
+            void *kw = get_bf16_weight(r, cl->attn_k_w, cl->attn_k_w_bf16,
+                                       cl->attn_k_type, cl->attn_k_rows, cl->attn_k_cols);
+            if (!kw) return -1;
+            if (mm_blaslt_run_bf16(r->d_k_batch, kw,
+                                   r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+        }
+        {
+            void *vw = get_bf16_weight(r, cl->attn_v_w, cl->attn_v_w_bf16,
+                                       cl->attn_v_type, cl->attn_v_rows, cl->attn_v_cols);
+            if (!vw) return -1;
+            if (mm_blaslt_run_bf16(r->d_v_batch, vw,
+                                   r->d_xnorm_batch_bf16, M, kv_dim, n_embd, r->stream) != 0) return -1;
+        }
 
         /* ---- Biases (per-row loop kept; one launch per row is cheap, only 3 × M
          *      ~ several thousand launches at L=1024 — defer to a batched bias kernel
@@ -5643,8 +5863,13 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* ---- Output projection: [M, q_dim] x W_o^T -> [M, n_embd] ---- */
         launch_pack_bf16_from_f32(r, r->d_attn_out_batch_bf16,
                                   r->d_attn_out_batch, M * q_dim);
-        if (mm_blaslt_run_bf16(r->d_attn_proj_batch, cl->attn_output_w_bf16,
-                               r->d_attn_out_batch_bf16, M, n_embd, q_dim, r->stream) != 0) return -1;
+        {
+            void *ow = get_bf16_weight(r, cl->attn_output_w, cl->attn_output_w_bf16,
+                                       cl->attn_output_type, cl->attn_output_rows, cl->attn_output_cols);
+            if (!ow) return -1;
+            if (mm_blaslt_run_bf16(r->d_attn_proj_batch, ow,
+                                   r->d_attn_out_batch_bf16, M, n_embd, q_dim, r->stream) != 0) return -1;
+        }
 
         /* Residual: x_batch += attn_proj */
         launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
@@ -5656,10 +5881,20 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                   r->d_xnorm_batch, M * n_embd);
 
         /* ---- gate/up GEMMs ---- */
-        if (mm_blaslt_run_bf16(r->d_gate_batch, cl->ffn_gate_w_bf16,
-                               r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
-        if (mm_blaslt_run_bf16(r->d_up_batch,   cl->ffn_up_w_bf16,
-                               r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+        {
+            void *gw = get_bf16_weight(r, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
+                                       cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols);
+            if (!gw) return -1;
+            if (mm_blaslt_run_bf16(r->d_gate_batch, gw,
+                                   r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+        }
+        {
+            void *uw = get_bf16_weight(r, cl->ffn_up_w, cl->ffn_up_w_bf16,
+                                       cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols);
+            if (!uw) return -1;
+            if (mm_blaslt_run_bf16(r->d_up_batch, uw,
+                                   r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+        }
 
         /* SiLU(gate) * up — elementwise across [M, n_ff] */
         launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
@@ -5667,8 +5902,13 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* Pack and down projection */
         launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
                                   r->d_gate_batch, M * n_ff);
-        if (mm_blaslt_run_bf16(r->d_down_batch, cl->ffn_down_w_bf16,
-                               r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
+        {
+            void *dw = get_bf16_weight(r, cl->ffn_down_w, cl->ffn_down_w_bf16,
+                                       cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols);
+            if (!dw) return -1;
+            if (mm_blaslt_run_bf16(r->d_down_batch, dw,
+                                   r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
+        }
 
         /* Residual */
         launch_add(r, r->d_x_batch, r->d_down_batch, M * n_embd);
@@ -5891,6 +6131,7 @@ void hip_llm_offload(hip_llm_runner *r) {
     if (r->d_up_batch)            { hipFree(r->d_up_batch);            r->d_up_batch = NULL; }
     if (r->d_silu_batch_bf16)     { hipFree(r->d_silu_batch_bf16);     r->d_silu_batch_bf16 = NULL; }
     if (r->d_down_batch)          { hipFree(r->d_down_batch);          r->d_down_batch = NULL; }
+    if (r->d_wbuf_bf16)           { hipFree(r->d_wbuf_bf16);           r->d_wbuf_bf16 = NULL; }
     if (r->d_q_batch_f16)         { hipFree(r->d_q_batch_f16);         r->d_q_batch_f16 = NULL; }
     if (r->d_kv_pack_K_f16)       { hipFree(r->d_kv_pack_K_f16);       r->d_kv_pack_K_f16 = NULL; }
     if (r->d_kv_pack_V_f16)       { hipFree(r->d_kv_pack_V_f16);       r->d_kv_pack_V_f16 = NULL; }
@@ -5966,6 +6207,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_up_batch)            hipFree(r->d_up_batch);
     if (r->d_silu_batch_bf16)     hipFree(r->d_silu_batch_bf16);
     if (r->d_down_batch)          hipFree(r->d_down_batch);
+    if (r->d_wbuf_bf16)           hipFree(r->d_wbuf_bf16);
     if (r->d_q_batch_f16)         hipFree(r->d_q_batch_f16);
     if (r->d_kv_pack_K_f16)       hipFree(r->d_kv_pack_K_f16);
     if (r->d_kv_pack_V_f16)       hipFree(r->d_kv_pack_V_f16);
