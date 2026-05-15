@@ -1072,7 +1072,9 @@ static void softmax_row(float *x, int n) {
 /* ───────────────────────── attention (head-parallel) ───────────────────────── */
 
 typedef struct {
-    const float *qkv;       /* [n_patches, 3*dim] */
+    const float *Q_hm;      /* [n_heads, n_patches, head_dim] */
+    const float *K_hm;
+    const float *V_hm;
     float       *attn_out;  /* [n_patches, dim] */
     int          n_patches;
     int          dim;
@@ -1106,6 +1108,94 @@ static inline float sve_dot_hd(const float *a, const float *b, int hd) {
     return svaddv_f32(pg, acc);
 }
 
+/* 8-row × 1-shared dot product, hd specialised to a power of VL (4*VL=64 for
+ * Qwen3-VL). Uses 8 independent FMLA accumulators sharing a single broadcast
+ * operand per d-step — 8 svmla in 4 cycles on the two A64FX FLA pipes versus
+ * 9 cycles latency for any single chain, so this is FMA-throughput-bound. */
+static inline void sve_dot_hd_8r(const float *r0, const float *r1,
+                                 const float *r2, const float *r3,
+                                 const float *r4, const float *r5,
+                                 const float *r6, const float *r7,
+                                 const float *s, int hd, float out[8]) {
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
+    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    int d = 0;
+    int hv = hd - (hd % VL);
+    for (; d < hv; d += VL) {
+        svfloat32_t vs = svld1_f32(pg, s + d);
+        a0 = svmla_f32_x(pg, a0, svld1_f32(pg, r0 + d), vs);
+        a1 = svmla_f32_x(pg, a1, svld1_f32(pg, r1 + d), vs);
+        a2 = svmla_f32_x(pg, a2, svld1_f32(pg, r2 + d), vs);
+        a3 = svmla_f32_x(pg, a3, svld1_f32(pg, r3 + d), vs);
+        a4 = svmla_f32_x(pg, a4, svld1_f32(pg, r4 + d), vs);
+        a5 = svmla_f32_x(pg, a5, svld1_f32(pg, r5 + d), vs);
+        a6 = svmla_f32_x(pg, a6, svld1_f32(pg, r6 + d), vs);
+        a7 = svmla_f32_x(pg, a7, svld1_f32(pg, r7 + d), vs);
+    }
+    if (d < hd) {
+        svbool_t pgt = svwhilelt_b32_s32(d, hd);
+        svfloat32_t vs = svld1_f32(pgt, s + d);
+        a0 = svmla_f32_m(pgt, a0, svld1_f32(pgt, r0 + d), vs);
+        a1 = svmla_f32_m(pgt, a1, svld1_f32(pgt, r1 + d), vs);
+        a2 = svmla_f32_m(pgt, a2, svld1_f32(pgt, r2 + d), vs);
+        a3 = svmla_f32_m(pgt, a3, svld1_f32(pgt, r3 + d), vs);
+        a4 = svmla_f32_m(pgt, a4, svld1_f32(pgt, r4 + d), vs);
+        a5 = svmla_f32_m(pgt, a5, svld1_f32(pgt, r5 + d), vs);
+        a6 = svmla_f32_m(pgt, a6, svld1_f32(pgt, r6 + d), vs);
+        a7 = svmla_f32_m(pgt, a7, svld1_f32(pgt, r7 + d), vs);
+    }
+    out[0] = svaddv_f32(pg, a0); out[1] = svaddv_f32(pg, a1);
+    out[2] = svaddv_f32(pg, a2); out[3] = svaddv_f32(pg, a3);
+    out[4] = svaddv_f32(pg, a4); out[5] = svaddv_f32(pg, a5);
+    out[6] = svaddv_f32(pg, a6); out[7] = svaddv_f32(pg, a7);
+}
+
+/* 4-row × 1-shared dot product (used as a tail step when np is not a
+ * multiple of 8). */
+static inline void sve_dot_hd_4q(const float *q0, const float *q1,
+                                 const float *q2, const float *q3,
+                                 const float *k, int hd, float out[4]) {
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0.0f);
+    svfloat32_t a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f);
+    svfloat32_t a3 = svdup_f32(0.0f);
+    int d = 0;
+    int hv = hd - (hd % VL);
+    for (; d < hv; d += VL) {
+        svfloat32_t vk = svld1_f32(pg, k + d);
+        svfloat32_t v0 = svld1_f32(pg, q0 + d);
+        svfloat32_t v1 = svld1_f32(pg, q1 + d);
+        svfloat32_t v2 = svld1_f32(pg, q2 + d);
+        svfloat32_t v3 = svld1_f32(pg, q3 + d);
+        a0 = svmla_f32_x(pg, a0, v0, vk);
+        a1 = svmla_f32_x(pg, a1, v1, vk);
+        a2 = svmla_f32_x(pg, a2, v2, vk);
+        a3 = svmla_f32_x(pg, a3, v3, vk);
+    }
+    if (d < hd) {
+        svbool_t pgt = svwhilelt_b32_s32(d, hd);
+        svfloat32_t vk = svld1_f32(pgt, k + d);
+        svfloat32_t v0 = svld1_f32(pgt, q0 + d);
+        svfloat32_t v1 = svld1_f32(pgt, q1 + d);
+        svfloat32_t v2 = svld1_f32(pgt, q2 + d);
+        svfloat32_t v3 = svld1_f32(pgt, q3 + d);
+        a0 = svmla_f32_m(pgt, a0, v0, vk);
+        a1 = svmla_f32_m(pgt, a1, v1, vk);
+        a2 = svmla_f32_m(pgt, a2, v2, vk);
+        a3 = svmla_f32_m(pgt, a3, v3, vk);
+    }
+    out[0] = svaddv_f32(pg, a0);
+    out[1] = svaddv_f32(pg, a1);
+    out[2] = svaddv_f32(pg, a2);
+    out[3] = svaddv_f32(pg, a3);
+}
+
 /* SVE AXPY over head_dim:  out[d] += w * vh[d]. */
 static inline void sve_axpy_hd(float *out, const float *vh, float w, int hd) {
     const svbool_t pg = svptrue_b32();
@@ -1125,6 +1215,78 @@ static inline void sve_axpy_hd(float *out, const float *vh, float w, int hd) {
         svfloat32_t vv = svld1_f32(pgt, vh + d);
         vo = svmla_f32_m(pgt, vo, vw, vv);
         svst1_f32(pgt, out + d, vo);
+    }
+}
+
+/* 1-query AV with hd held entirely in registers across the np-sum.
+ * Eliminates the load-modify-store on `out` per V row that bottlenecked the
+ * old sve_axpy_hd chain. For hd==4*VL (the Qwen3-VL case, hd=64) we keep 4
+ * independent SVE accumulators; otherwise fall back to AXPY. */
+static inline void attn_av_1q(const float *att, const float *V_h, int np,
+                              int hd, float *out) {
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    if (hd == 4 * VL) {
+        svfloat32_t a0 = svdup_f32(0.0f);
+        svfloat32_t a1 = svdup_f32(0.0f);
+        svfloat32_t a2 = svdup_f32(0.0f);
+        svfloat32_t a3 = svdup_f32(0.0f);
+        for (int vi = 0; vi < np; vi++) {
+            float w = att[vi];
+            const float *vh = V_h + (size_t)vi * hd;
+            svfloat32_t v0 = svld1_f32(pg, vh);
+            svfloat32_t v1 = svld1_f32(pg, vh + VL);
+            svfloat32_t v2 = svld1_f32(pg, vh + 2 * VL);
+            svfloat32_t v3 = svld1_f32(pg, vh + 3 * VL);
+            a0 = svmla_n_f32_x(pg, a0, v0, w);
+            a1 = svmla_n_f32_x(pg, a1, v1, w);
+            a2 = svmla_n_f32_x(pg, a2, v2, w);
+            a3 = svmla_n_f32_x(pg, a3, v3, w);
+        }
+        svst1_f32(pg, out,            a0);
+        svst1_f32(pg, out + VL,       a1);
+        svst1_f32(pg, out + 2 * VL,   a2);
+        svst1_f32(pg, out + 3 * VL,   a3);
+        return;
+    }
+    memset(out, 0, hd * sizeof(float));
+    for (int vi = 0; vi < np; vi++)
+        sve_axpy_hd(out, V_h + (size_t)vi * hd, att[vi], hd);
+}
+
+/* Head-major Q/K/V extraction work unit = one head. Converts the
+ * interleaved qkv layout [np, 3, n_heads, hd] into three contiguous
+ * head-major buffers [n_heads, np, hd], one head per worker iteration.
+ * Removes the 3*dim stride that thrashed the L1 prefetcher inside the
+ * dot/AXPY inner loops. */
+typedef struct {
+    const float *qkv;
+    float       *Q_hm;
+    float       *K_hm;
+    float       *V_hm;
+    int          n_patches;
+    int          dim;
+    int          head_dim;
+    int          n_heads;
+} qkv_extract_args;
+
+static void qkv_extract_body(int tid, int w0, int w1, void *arg) {
+    (void)tid;
+    qkv_extract_args *a = (qkv_extract_args *)arg;
+    int np = a->n_patches;
+    int dim = a->dim;
+    int hd = a->head_dim;
+    size_t hd_bytes = (size_t)hd * sizeof(float);
+    for (int h = w0; h < w1; h++) {
+        float *Q_h = a->Q_hm + (size_t)h * np * hd;
+        float *K_h = a->K_hm + (size_t)h * np * hd;
+        float *V_h = a->V_hm + (size_t)h * np * hd;
+        for (int p = 0; p < np; p++) {
+            const float *src = a->qkv + (size_t)p * 3 * dim + h * hd;
+            memcpy(Q_h + (size_t)p * hd, src,             hd_bytes);
+            memcpy(K_h + (size_t)p * hd, src + dim,       hd_bytes);
+            memcpy(V_h + (size_t)p * hd, src + 2 * dim,   hd_bytes);
+        }
     }
 }
 
@@ -1150,38 +1312,80 @@ static void attn_body(int tid, int w0, int w1, void *arg) {
         int q0 = (w % nqt) * qt;
         int q1 = q0 + qt; if (q1 > np) q1 = np;
 
-        /* Q · Kᵀ (SVE inner product over head_dim, scaled). */
+        const float *Q_h = a->Q_hm + (size_t)h * np * hd;
+        const float *K_h = a->K_hm + (size_t)h * np * hd;
+        const float *V_h = a->V_hm + (size_t)h * np * hd;
+
+        /* Q · Kᵀ — batch 4 K rows per inner step to share K loads across
+         * 4 independent FMA accumulators and hide A64FX FMA latency. */
         for (int qi = q0; qi < q1; qi++) {
-            const float *qh = a->qkv + (size_t)qi * 3 * dim + h * hd;
+            const float *qh = Q_h + (size_t)qi * hd;
             float *att_row = att + (size_t)(qi - q0) * np;
-            for (int ki = 0; ki < np; ki++) {
-                const float *kh = a->qkv + (size_t)ki * 3 * dim + dim + h * hd;
-                att_row[ki] = sve_dot_hd(qh, kh, hd) * scale;
+            int ki = 0;
+            /* 8 K rows share each Q broadcast — 8 independent FMA chains
+             * fully cover the 9-cycle A64FX FMA latency on both pipes. */
+            for (; ki + 8 <= np; ki += 8) {
+                float r[8];
+                sve_dot_hd_8r(K_h + (size_t)(ki + 0) * hd,
+                              K_h + (size_t)(ki + 1) * hd,
+                              K_h + (size_t)(ki + 2) * hd,
+                              K_h + (size_t)(ki + 3) * hd,
+                              K_h + (size_t)(ki + 4) * hd,
+                              K_h + (size_t)(ki + 5) * hd,
+                              K_h + (size_t)(ki + 6) * hd,
+                              K_h + (size_t)(ki + 7) * hd,
+                              qh, hd, r);
+                att_row[ki + 0] = r[0] * scale;
+                att_row[ki + 1] = r[1] * scale;
+                att_row[ki + 2] = r[2] * scale;
+                att_row[ki + 3] = r[3] * scale;
+                att_row[ki + 4] = r[4] * scale;
+                att_row[ki + 5] = r[5] * scale;
+                att_row[ki + 6] = r[6] * scale;
+                att_row[ki + 7] = r[7] * scale;
+            }
+            for (; ki + 4 <= np; ki += 4) {
+                float r[4];
+                sve_dot_hd_4q(K_h + (size_t)(ki + 0) * hd,
+                              K_h + (size_t)(ki + 1) * hd,
+                              K_h + (size_t)(ki + 2) * hd,
+                              K_h + (size_t)(ki + 3) * hd,
+                              qh, hd, r);
+                att_row[ki + 0] = r[0] * scale;
+                att_row[ki + 1] = r[1] * scale;
+                att_row[ki + 2] = r[2] * scale;
+                att_row[ki + 3] = r[3] * scale;
+            }
+            for (; ki < np; ki++) {
+                att_row[ki] = sve_dot_hd(qh, K_h + (size_t)ki * hd, hd) * scale;
             }
         }
         /* softmax per row (SVE FEXPA) */
         for (int qi = q0; qi < q1; qi++)
             softmax_row(att + (size_t)(qi - q0) * np, np);
-        /* attn · V (SVE AXPY over head_dim per V row) */
+        /* attn · V (registers-held output, 4 split accumulators across hd) */
         for (int qi = q0; qi < q1; qi++) {
             float *out = a->attn_out + (size_t)qi * dim + h * hd;
-            memset(out, 0, hd * sizeof(float));
             const float *att_row = att + (size_t)(qi - q0) * np;
-            for (int vi = 0; vi < np; vi++) {
-                const float *vh = a->qkv + (size_t)vi * 3 * dim + 2 * dim + h * hd;
-                sve_axpy_hd(out, vh, att_row[vi], hd);
-            }
+            attn_av_1q(att_row, V_h, np, hd, out);
         }
     }
 }
 
 static void attention_mt(vlm_pool *pool,
-                         const float *qkv, float *attn_out,
+                         const float *qkv,
+                         float *Q_hm, float *K_hm, float *V_hm,
+                         float *attn_out,
                          int n_patches, int dim, int n_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
-    memset(attn_out, 0, (size_t)n_patches * dim * sizeof(float));
-    /* Pick a query tile so n_heads * n_qtiles comfortably exceeds the pool
-     * size; cap the tile at 64 rows to bound per-thread scratch. */
+
+    /* 1) Extract head-major Q/K/V (one head per worker — fully parallel,
+     *    no cross-thread sharing). */
+    qkv_extract_args ex = { qkv, Q_hm, K_hm, V_hm,
+                            n_patches, dim, head_dim, n_heads };
+    vlm_parallel_for(pool, n_heads, 1, qkv_extract_body, &ex);
+
+    /* 2) Per-(head, q-tile) attention. */
     int nthr = vlm_pool_size(pool);
     int q_tile = n_patches;
     if (n_heads < nthr) {
@@ -1191,8 +1395,8 @@ static void attention_mt(vlm_pool *pool,
         if (q_tile < 1)  q_tile = 1;
     }
     int n_qtiles = (n_patches + q_tile - 1) / q_tile;
-    attn_args a = { qkv, attn_out, n_patches, dim, head_dim, n_heads, scale,
-                    q_tile, n_qtiles, pool };
+    attn_args a = { Q_hm, K_hm, V_hm, attn_out, n_patches, dim, head_dim,
+                    n_heads, scale, q_tile, n_qtiles, pool };
     vlm_parallel_for(pool, n_heads * n_qtiles, 1, attn_body, &a);
 }
 
@@ -1430,6 +1634,13 @@ float *vit_a64fx_encode(struct vision_model *vm,
     float *hidden2   = xcalloc_f((size_t)n_patches * dim);
     float *qkv       = xcalloc_f((size_t)n_patches * 3 * dim);
     float *attn_out  = xcalloc_f((size_t)n_patches * dim);
+    /* Head-major Q/K/V scratch for the attn stage. Same total bytes as qkv
+     * (3 * n_heads * n_patches * head_dim == n_patches * 3 * dim) but laid
+     * out [n_heads, n_patches, head_dim] so the inner Q·K^T and AV kernels
+     * stride contiguously and the L1 prefetcher tracks correctly. */
+    float *Q_hm      = xmalloc_f((size_t)n_heads * n_patches * head_dim);
+    float *K_hm      = xmalloc_f((size_t)n_heads * n_patches * head_dim);
+    float *V_hm      = xmalloc_f((size_t)n_heads * n_patches * head_dim);
     float *ffn_buf   = xcalloc_f((size_t)n_patches * ffn_dim);
     float *ln_buf    = xcalloc_f((size_t)n_patches * dim);
     float *merge_buf = xcalloc_f((size_t)n_merged * merged_dim);
@@ -1535,7 +1746,8 @@ float *vit_a64fx_encode(struct vision_model *vm,
         dump2(dump, "mrope", l, n_patches, 3 * dim, qkv);
 
         /* Attention */
-        attention_mt(pool, qkv, attn_out, n_patches, dim, n_heads, head_dim);
+        attention_mt(pool, qkv, Q_hm, K_hm, V_hm, attn_out,
+                     n_patches, dim, n_heads, head_dim);
         st_tick(&st, ST_ATTN);
         dump2(dump, "attn", l, n_patches, dim, attn_out);
 
@@ -1768,6 +1980,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
 
     /* Cleanup */
     free(hidden); free(hidden2); free(qkv); free(attn_out);
+    free(Q_hm); free(K_hm); free(V_hm);
     free(ffn_buf); free(ln_buf); free(merge_buf); free(deepstack_feats);
     free(mm_buf); free(mm_out);
 
