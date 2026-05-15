@@ -33,6 +33,7 @@
 #include "../kernels/sve_math.h"
 #include "../kernels/bf16_gemm.h"
 #include "../kernels/fp16_gemm.h"
+#include "../kernels/fp32_gemm.h"
 
 #include <arm_sve.h>
 #include <float.h>
@@ -237,6 +238,34 @@ static uint16_t *take_fp16_packed(float **pbt, int K, int N) {
             f32_to_fp16_buf(bt + (size_t)k * N + n_start,
                             dst + (size_t)k * NR_,
                             (size_t)n_count);
+        }
+    }
+    free(*pbt);
+    *pbt = NULL;
+    return btp;
+}
+
+/* Pack FP32 BT [K,N] row-major into BTP fp32 form (packed for asm kernel).
+ * Returns a buffer of packed_B_fp32_size(K,N) bytes; frees the FP32 source.
+ * Layout matches what pack_B_fp32 produces, ready for gemm_fp32_BTP. */
+static float *take_fp32_packed(float **pbt, int K, int N) {
+    if (!pbt || !*pbt) return NULL;
+    const int NR_ = NR;
+    const int N_blocks  = (N + NR_ - 1) / NR_;
+    const int K_rounded = ((K + 3) / 4) * 4;
+    size_t bytes = (size_t)N_blocks * K_rounded * NR_ * sizeof(float);
+    float *btp = (float *)aligned_alloc(64, bytes);
+    if (!btp) { fprintf(stderr, "vit_a64fx: OOM packed fp32 alloc (%zu)\n", bytes); exit(1); }
+    memset(btp, 0, bytes); /* zero-pad NR-tail and K-tail */
+    const float *bt = *pbt;
+    for (int nb = 0; nb < N_blocks; nb++) {
+        int n_start = nb * NR_;
+        int n_count = (n_start + NR_ <= N) ? NR_ : N - n_start;
+        float *dst = btp + (size_t)nb * K_rounded * NR_;
+        for (int k = 0; k < K; k++) {
+            memcpy(dst + (size_t)k * NR_,
+                   bt  + (size_t)k * N + n_start,
+                   (size_t)n_count * sizeof(float));
         }
     }
     free(*pbt);
@@ -452,6 +481,38 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
         }
         c->BT_mm0_fp = take_fp16_packed(&c->BT_mm0, merged, merged);
         c->BT_mm2_fp = take_fp16_packed(&c->BT_mm2, merged, vm->proj_dim);
+    } else { /* VIT_DTYPE_FP32 */
+        /* Pre-pack each transposed weight into [N_blocks][K_rounded][NR] FP32
+         * BTP form once. This collapses the per-call pack_B_fp32 + serial
+         * memset(C) overhead that made the fp32 path 5-13× slower than fp16
+         * (despite both using the same micro_kernel_fp32_8x3 asm kernel). */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 1)
+#endif
+        for (int l = 0; l < vm->n_blocks; l++) {
+            block_cache *bc = &c->blocks[l];
+            float *p;
+            p = take_fp32_packed(&bc->BT_qkv, dim,     3 * dim); bc->BT_qkv = p;
+            p = take_fp32_packed(&bc->BT_o,   dim,     dim);     bc->BT_o   = p;
+            p = take_fp32_packed(&bc->BT_u,   dim,     ffn_dim); bc->BT_u   = p;
+            p = take_fp32_packed(&bc->BT_d,   ffn_dim, dim);     bc->BT_d   = p;
+        }
+        if (c->deepstack) {
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(dynamic, 1)
+#endif
+            for (int d = 0; d < vm->n_deepstack; d++) {
+                deepstack_cache *dc = &c->deepstack[d];
+                float *p;
+                p = take_fp32_packed(&dc->BT_fc1, merged, merged);        dc->BT_fc1 = p;
+                p = take_fp32_packed(&dc->BT_fc2, merged, vm->proj_dim);  dc->BT_fc2 = p;
+            }
+        }
+        {
+            float *p;
+            p = take_fp32_packed(&c->BT_mm0, merged, merged);        c->BT_mm0 = p;
+            p = take_fp32_packed(&c->BT_mm2, merged, vm->proj_dim);  c->BT_mm2 = p;
+        }
     }
 
     return c;
@@ -690,19 +751,21 @@ static void vit_gemm_bias_mt(vlm_pool *pool,
     add_bias_mt(pool, Y, bias, n_tokens, n_out);
 }
 
-/* Pre-transposed B variant: caller supplies BT[n_in, n_out] directly,
- * so we skip dequant+transpose entirely (M2 weight-cache fast path). */
+/* Pre-packed B variant: caller supplies BTP fp32 already in
+ * [N_blocks][K_rounded][NR] layout (produced by take_fp32_packed at cache
+ * build). Skips the per-call pack_B_fp32 + serial C-zero that the legacy
+ * gemm_fp32 path did before the inner parallel region. */
 static void vit_gemm_bias_BT_mt(vlm_pool *pool,
                                 float *Y,
-                                const float *BT,   /* [n_in, n_out] row-major */
+                                const float *BTP,  /* packed FP32 BTP */
                                 const float *bias,
                                 const float *X,
                                 int n_tokens, int n_out, int n_in)
 {
-    gemm_fp32(n_tokens, n_in, n_out,
-              X,  n_in,
-              BT, n_out,
-              Y,  n_out);
+    gemm_fp32_BTP(n_tokens, n_in, n_out,
+                  X, n_in,
+                  BTP,
+                  Y, n_out);
     add_bias_mt(pool, Y, bias, n_tokens, n_out);
 }
 
