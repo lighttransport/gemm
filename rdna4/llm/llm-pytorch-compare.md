@@ -41,6 +41,45 @@ is still gated off for hybrid/quant models; that's Track B (in-progress).
 The original Part A numbers from before Track A landed are kept below for
 historical record.
 
+## Update (2026-05-15) — Track B1 landed: K-quant batched prefill
+
+Extended the Phase-2 path to also accept Q4_K / Q5_K / Q6_K weights (no longer
+F16-only). Mechanism: per-call streamed dequant of block-quant weights to
+**BF16 in a shared staging buffer** (`r->d_wbuf_bf16`, sized to the largest
+weight tensor — 96 MB for an 8 B Q4_K_M, ~178 MB for 27 B), then the existing
+hipBLASLt path. This is the **per-call dequant** approach; a streaming-WMMA
+kernel would avoid the staging buffer round-trip but is multiplicative
+engineering effort.
+
+New kernels in `hip_llm_runner.c`: `dequant_q4_K_to_bf16`, `dequant_q5_K_to_bf16`,
+`dequant_q6_K_to_bf16` (each 256 threads/block, one thread per output element,
+grid `(n_rows, n_blocks_per_row, 1)` — i.e. exactly one dequant op per Q-block).
+New helper `get_bf16_weight()` returns either the pre-converted BF16 pointer
+(F16 layers) or kicks the dequant into the staging buffer (K-quant layers)
+and returns that.
+
+Measured on **Qwen3-VL-Embedding-8B Q4_K_M** (RX 9070 XT, warm, mixed
+Q4_K/Q6_K weights):
+
+| L     | HIP before     | HIP after    | speedup |
+|------:|---------------:|-------------:|--------:|
+|   64  | 1161 ms        | **116.1 ms** | 10.0×  |
+|  256  | (extrap. ~3000 ms) | **126.1 ms** | ~24×   |
+| 1024  | (extrap. ~10800 ms) | **230.3 ms** | ~47×   |
+
+Steady-state throughput: 551 / 2031 / **4447 tok/s** at L=64/256/1024.
+
+Correctness (`--compare-paths`, prefill_len=128): per-token vs batched argmax
+matches (id 286 = " the"), rel_L2 = 4.2e-3 (tighter than the F16 1e-2 case
+since K-quant noise dominates the BF16/F16 delta).
+
+**27B IQ3_XXS hybrid-SSM still unchanged** — IQ3_XXS isn't in the supported
+quant list yet, and the hybrid SSM dispatcher still routes the whole forward
+per-token. To move that needle we need:
+1. `dequant_iq3_xxs_to_bf16` (and ideally IQ2_XS, IQ2_S, IQ4_XS etc.).
+2. A per-layer hybrid dispatcher: SSM layers stay per-token (state recurrence),
+   attention + FFN layers use the batched path.
+
 ---
 
 ## Part A (historical, pre-Track-A) — Qwen3-VL-2B (F16) vs PyTorch ROCm
