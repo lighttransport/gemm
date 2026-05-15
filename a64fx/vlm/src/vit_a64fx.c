@@ -166,6 +166,9 @@ struct vit_a64fx_cache {
     /* patch embed (kept row-major; not used by gemm) */
     float *patch_k0, *patch_k1, *patch_b;
     int    patch_ks;
+    /* Merged dual-conv kernel (k0+k1) pre-packed in BTP layout for the
+     * GEMM-based patch_embed fast path. Built once at cache time. */
+    float *patch_BTP_fp;
 
     /* position embedding (FP32, [orig_n_patches × dim]) */
     float *pos;
@@ -381,6 +384,23 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
                     c->patch_k1, dim * ks);
     }
     c->patch_b = deq_vec_xalloc(&vm->patch_embd_b, dim);
+
+    /* Pre-merge dual-conv kernels into one transposed [ks, dim] weight and
+     * pre-pack as BTP. patch_embed then becomes a single GEMM rather than
+     * 384 × 1024 scalar dot products — that stage was at <1% of FMA peak. */
+    {
+        float *BT_patch = xmalloc_f((size_t)ks * dim);
+        for (int dd = 0; dd < dim; dd++) {
+            const float *s0 = c->patch_k0 + (size_t)dd * ks;
+            const float *s1 = c->patch_k1 ? c->patch_k1 + (size_t)dd * ks : NULL;
+            for (int kk = 0; kk < ks; kk++) {
+                float v = s0[kk];
+                if (s1) v += s1[kk];
+                BT_patch[(size_t)kk * dim + dd] = v;
+            }
+        }
+        c->patch_BTP_fp = take_fp32_packed(&BT_patch, ks, dim);
+    }
 
     /* position embed (full original grid) */
     c->pos_n = vm->n_patches;
@@ -618,7 +638,8 @@ static void btp_repl_free(btp_repl *r) {
 void vit_a64fx_cache_free(struct vit_a64fx_cache *c) {
     if (!c) return;
     int replicated = (c->n_cmgs > 0);
-    free(c->patch_k0); free(c->patch_k1); free(c->patch_b); free(c->pos);
+    free(c->patch_k0); free(c->patch_k1); free(c->patch_b);
+    free(c->patch_BTP_fp); free(c->pos);
     if (c->blocks) {
         for (int l = 0; l < c->n_blocks; l++) {
             block_cache *b = &c->blocks[l];
@@ -1461,6 +1482,55 @@ static void patch_embed_mt(vlm_pool *pool,
     vlm_parallel_for(pool, n_patches, 1, patch_body, &a);
 }
 
+/* GEMM-based patch_embed fast path. Step 1 (parallel gather) reshapes the
+ * conv2d input window into a contiguous [n_patches, ks] matrix; step 2
+ * folds the (possibly dual-conv) kernel + bias into one BTP GEMM. */
+typedef struct {
+    const float *rgb_norm;
+    int          width;
+    int          ps;
+    int          gw;
+    int          ks;
+    float       *patches;   /* [n_patches, ks], CHW-per-patch order */
+} patch_gather_args;
+
+static void patch_gather_body(int tid, int t0, int t1, void *arg) {
+    (void)tid;
+    patch_gather_args *a = (patch_gather_args *)arg;
+    int ps = a->ps, gw = a->gw, W = a->width, ks = a->ks;
+    for (int p = t0; p < t1; p++) {
+        int py = p / gw;
+        int px = p % gw;
+        float *dst = a->patches + (size_t)p * ks;
+        for (int c = 0; c < 3; c++) {
+            for (int dy = 0; dy < ps; dy++) {
+                for (int dx = 0; dx < ps; dx++) {
+                    int iy = py * ps + dy;
+                    int ix = px * ps + dx;
+                    dst[c * ps * ps + dy * ps + dx] =
+                        a->rgb_norm[(iy * W + ix) * 3 + c];
+                }
+            }
+        }
+    }
+}
+
+static void patch_embed_gemm_mt(vlm_pool *pool,
+                                const float *rgb_norm, int width,
+                                int gw, int gh, int ps, int dim,
+                                const float *patch_BTP_fp,
+                                const float *bias,
+                                float *out) {
+    int n_patches = gw * gh;
+    int ks = ps * ps * 3;
+    float *patches = xmalloc_f((size_t)n_patches * ks);
+    patch_gather_args ga = { rgb_norm, width, ps, gw, ks, patches };
+    vlm_parallel_for(pool, n_patches, 1, patch_gather_body, &ga);
+    vit_gemm_bias_BT_mt(pool, out, patch_BTP_fp, bias, patches,
+                        n_patches, dim, ks);
+    free(patches);
+}
+
 /* ───────────────────────── M-RoPE ───────────────────────── */
 
 static void mrope_apply(float *qkv, int n_patches, int n_heads, int head_dim,
@@ -1670,7 +1740,13 @@ float *vit_a64fx_encode(struct vision_model *vm,
             patch_bias = patch_bias_tmp;
         }
     }
-    patch_embed_mt(pool, rgb_norm, width, gw, gh, ps, dim, kernel0, kernel1, patch_bias, hidden);
+    if (cache && cache->patch_BTP_fp) {
+        patch_embed_gemm_mt(pool, rgb_norm, width, gw, gh, ps, dim,
+                            cache->patch_BTP_fp, patch_bias, hidden);
+    } else {
+        patch_embed_mt(pool, rgb_norm, width, gw, gh, ps, dim,
+                       kernel0, kernel1, patch_bias, hidden);
+    }
     free(kernel0_tmp); free(kernel1_tmp); free(patch_bias_tmp);
     st_tick(&st, ST_PATCH);
     dump2(dump, "patch_embed", -1, n_patches, dim, hidden);
