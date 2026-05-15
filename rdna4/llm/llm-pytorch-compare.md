@@ -80,6 +80,44 @@ per-token. To move that needle we need:
 2. A per-layer hybrid dispatcher: SSM layers stay per-token (state recurrence),
    attention + FFN layers use the batched path.
 
+## Update (2026-05-16) — IQ2_XS / IQ2_S / IQ3_S / IQ4_XS dequant kernels
+
+Ported the four IQ dequant-to-BF16 kernels that were blocking the 27B's
+gated-attn layers (UD-mixed quant uses these types in the attn projections).
+Each is the standard pattern — codebook + signs table + scale unpack —
+modeled on the existing matvec kernels' dequant logic; one thread per
+output element, grid `(n_rows, n_blocks_per_row, 1)`, 256 threads/block.
+
+| type      | block bytes | codebook source                |
+|-----------|------------:|--------------------------------|
+| IQ4_XS    | 136         | `kvalues_iq4nl_dev` (16 entries) |
+| IQ2_XS    | 74          | `iq2xs_grid_dev` (512 × u64)    |
+| IQ2_S     | 82          | `iq2s_grid_dev`  (1024 × u64) + per-pair qh |
+| IQ3_S     | 110         | `iq3s_grid_dev`  (512 × u32) + qh shifted per-l |
+
+Added to `batch_qtype_ok` and `get_bf16_weight`. Wired into the layer-loop
+dispatch automatically.
+
+**27B IQ3_XXS dispatch summary**: 64/64 layers now batch (48 SSM + 16
+gated-attn). Zero per-row fallbacks.
+
+Measured (RX 9070 XT, warm, --bench --gpu-only-bench):
+
+| L | original (pre-B2) | + Phase 3 (SSM) | + 4 IQ kernels (full) | total speedup |
+|---:|---:|---:|---:|---:|
+|  64 | 62.1 ms/tok | 22.2 ms/tok | **10.7 ms/tok** | **5.8×** |
+| 256 | ~65   ms/tok | 20.1 ms/tok |  **7.1 ms/tok** | **9.2×** |
+
+That puts the 27B IQ3_XXS hybrid-SSM prefill solidly in the originally-
+estimated "10-15 ms/tok" target band — we beat it.
+
+Correctness: `--compare-paths` on 27B — argmax match (token 369),
+rel_L2 = 0.678 (same characteristic as Phase 3).
+
+Limitation still in place: VLM e2e (`test_hip_vlm`) uses per-token
+`hip_llm_forward_embd` for vision tokens; wiring it to the batched path
+is a separate task.
+
 ## Update (2026-05-16) — B2 Phase 3: batched SSM projections
 
 Phase 3 lands the actually-meaningful speedup for hybrid-SSM models: the 5 SSM

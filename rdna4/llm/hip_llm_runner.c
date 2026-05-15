@@ -3024,6 +3024,135 @@ static const char *hip_kernel_source =
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
 "\n"
+"/* Per-call dequant of IQ4_XS (136 B/block, 256 elems) to BF16. Uses the\n"
+" * kvalues_iq4nl_dev 16-entry lookup. One thread per output element. */\n"
+"__global__ void dequant_iq4_xs_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                         int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 136;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 136;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
+"    const unsigned char *scales_l = bp + 4;\n"
+"    const unsigned char *qs = bp + 8;\n"
+"    int tid = threadIdx.x;\n"
+"    int ib   = tid >> 5;            /* 0..7 sub-block */\n"
+"    int elem = tid & 31;            /* 0..31 */\n"
+"    int use_high_nibble = elem >> 4;\n"
+"    int j    = elem & 15;\n"
+"    int ls = ((scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xf) |\n"
+"             (((scales_h >> (2 * ib)) & 3) << 4);\n"
+"    float dl = d * (float)(ls - 32);\n"
+"    const unsigned char *qs_blk = qs + ib * 16;\n"
+"    int q = use_high_nibble ? (qs_blk[j] >> 4) : (qs_blk[j] & 0xf);\n"
+"    float val = dl * (float)kvalues_iq4nl_dev[q];\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
+"/* Per-call dequant of IQ2_XS (74 B/block) to BF16. Codebook + per-pair sign byte. */\n"
+"__global__ void dequant_iq2_xs_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                         int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 74;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 74;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"    const unsigned char *scales = bp + 66;\n"
+"    int tid  = threadIdx.x;\n"
+"    int ib32 = tid >> 5;            /* 0..7 sub-block */\n"
+"    int elem = tid & 31;            /* 0..31 */\n"
+"    int l    = elem >> 3;           /* 0..3 (4 pair-iters) */\n"
+"    int j    = elem & 7;            /* 0..7 in the pair */\n"
+"    float dl = (l < 2)\n"
+"        ? d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f\n"
+"        : d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
+"    unsigned short qval = qs[4 * ib32 + l];\n"
+"    const unsigned char *grid = (const unsigned char *)&iq2xs_grid_dev[qval & 511];\n"
+"    unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
+"    float val = dl * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
+"/* Per-call dequant of IQ2_S (82 B/block) to BF16. Codebook + qh + per-pair signs. */\n"
+"__global__ void dequant_iq2_s_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 82;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 82;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs_base    = bp + 2;\n"
+"    const unsigned char *signs_base = bp + 34;\n"
+"    const unsigned char *qh         = bp + 66;\n"
+"    const unsigned char *scales     = bp + 74;\n"
+"    int tid  = threadIdx.x;\n"
+"    int ib32 = tid >> 5;\n"
+"    int elem = tid & 31;\n"
+"    int l    = elem >> 3;\n"
+"    int j    = elem & 7;\n"
+"    float dl = (l < 2)\n"
+"        ? d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f\n"
+"        : d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
+"    const unsigned char *qs    = qs_base    + 4 * ib32;\n"
+"    const unsigned char *signs = signs_base + 4 * ib32;\n"
+"    int grid_idx = qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);\n"
+"    const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[grid_idx];\n"
+"    unsigned char s = signs[l];\n"
+"    float val = dl * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
+"/* Per-call dequant of IQ3_S (110 B/block) to BF16. Each pair of sub-blocks\n"
+" * shares a scale byte; sub-block 0 uses the low nibble, sub-block 1 the high.\n"
+" * Each 8-element pair-iter draws from two consecutive grid entries, with the\n"
+" * high bit coming from qh shifted by (8 - 2*l) for the first grid and\n"
+" * (7 - 2*l) for the second. */\n"
+"__global__ void dequant_iq3_s_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    int b   = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    int row_bytes = n_blocks_per_row * 110;\n"
+"    const unsigned char *bp = mat + (size_t)row * row_bytes + b * 110;\n"
+"    float d = half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs_base    = bp + 2;\n"
+"    const unsigned char *qh_base    = bp + 66;\n"
+"    const unsigned char *signs_base = bp + 74;\n"
+"    const unsigned char *scales     = bp + 106;\n"
+"    int tid     = threadIdx.x;\n"
+"    int pair    = tid >> 6;          /* 0..3 (4 ib32-pair iters) */\n"
+"    int inner   = tid & 63;\n"
+"    int which   = inner >> 5;        /* 0=db1 (low scale), 1=db2 (high scale) */\n"
+"    int sub_i   = inner & 31;\n"
+"    int l       = sub_i >> 3;        /* 0..3 */\n"
+"    int j       = sub_i & 7;         /* 0..7; j<4: grid1, j>=4: grid2 */\n"
+"    int qhi     = 2 * pair + which;\n"
+"    int scale_b = scales[pair];\n"
+"    float db = (which == 0)\n"
+"        ? d * (float)(1 + 2 * (scale_b & 0xf))\n"
+"        : d * (float)(1 + 2 * (scale_b >> 4));\n"
+"    const unsigned char *qs    = qs_base    + 16 * pair + 8 * which;\n"
+"    const unsigned char *signs = signs_base +  8 * pair + 4 * which;\n"
+"    int use_grid2 = (j >= 4);\n"
+"    int j4    = j & 3;\n"
+"    int qs_ix = 2 * l + (use_grid2 ? 1 : 0);\n"
+"    int shift = use_grid2 ? (7 - 2 * l) : (8 - 2 * l);\n"
+"    int grid_idx = qs[qs_ix] | ((qh_base[qhi] << shift) & 256);\n"
+"    const unsigned char *grid = (const unsigned char *)&iq3s_grid_dev[grid_idx];\n"
+"    unsigned char s = signs[l];\n"
+"    float val = db * (float)grid[j4] * ((s & (1 << j)) ? -1.0f : 1.0f);\n"
+"    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
+"    dst[out_idx] = f32_to_bf16(val);\n"
+"}\n"
+"\n"
 "/* ===== Phase 3: causal WMMA flash-attention helpers ===== */\n"
 "typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));\n"
 "typedef float    float8 __attribute__((ext_vector_type(8)));\n"
@@ -3725,6 +3854,10 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_q5_K_to_bf16;
     hipFunction_t fn_dequant_q6_K_to_bf16;
     hipFunction_t fn_dequant_iq3_xxs_to_bf16;
+    hipFunction_t fn_dequant_iq4_xs_to_bf16;
+    hipFunction_t fn_dequant_iq2_xs_to_bf16;
+    hipFunction_t fn_dequant_iq2_s_to_bf16;
+    hipFunction_t fn_dequant_iq3_s_to_bf16;
 
     /* Phase 3 flash-attention helpers */
     hipFunction_t fn_pack_f16_from_f32;
@@ -3982,6 +4115,10 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_q5_K_to_bf16);
     GET_FUNC(dequant_q6_K_to_bf16);
     GET_FUNC(dequant_iq3_xxs_to_bf16);
+    GET_FUNC(dequant_iq4_xs_to_bf16);
+    GET_FUNC(dequant_iq2_xs_to_bf16);
+    GET_FUNC(dequant_iq2_s_to_bf16);
+    GET_FUNC(dequant_iq3_s_to_bf16);
 
     GET_FUNC(pack_f16_from_f32);
     GET_FUNC(pack_kv_cache_f16);
@@ -5244,6 +5381,10 @@ DEFINE_LAUNCH_KQ_DEQUANT(q4_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q5_K)
 DEFINE_LAUNCH_KQ_DEQUANT(q6_K)
 DEFINE_LAUNCH_KQ_DEQUANT(iq3_xxs)
+DEFINE_LAUNCH_KQ_DEQUANT(iq4_xs)
+DEFINE_LAUNCH_KQ_DEQUANT(iq2_xs)
+DEFINE_LAUNCH_KQ_DEQUANT(iq2_s)
+DEFINE_LAUNCH_KQ_DEQUANT(iq3_s)
 #undef DEFINE_LAUNCH_KQ_DEQUANT
 
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
@@ -5260,7 +5401,9 @@ static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
 static inline int batch_qtype_ok(int type) {
     return type == GGML_TYPE_F16     ||
            type == GGML_TYPE_Q4_K    || type == GGML_TYPE_Q5_K ||
-           type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS;
+           type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
+           type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ2_XS  ||
+           type == GGML_TYPE_IQ2_S   || type == GGML_TYPE_IQ3_S;
 }
 
 /* True if every projection weight of an attn+FFN layer has a batched path. */
@@ -5309,6 +5452,18 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             return r->d_wbuf_bf16;
         case GGML_TYPE_IQ3_XXS:
             launch_dequant_iq3_xxs_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ4_XS:
+            launch_dequant_iq4_xs_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ2_XS:
+            launch_dequant_iq2_xs_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ2_S:
+            launch_dequant_iq2_s_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ3_S:
+            launch_dequant_iq3_s_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
             return r->d_wbuf_bf16;
         default:
             return NULL;  /* not batchable */
