@@ -906,13 +906,18 @@ static int run_generate(const char *dit_path, const char *vae_path,
         : flux2_text_enc_load_safetensors(enc_path, tok_path);
     if (!enc) return 1;
 
+    int rc = 1;
+    flux2_text_enc *enc_hold = NULL;
+    float *txt_hidden_raw = NULL;
+    float *txt_hidden = NULL;
+    cuda_flux2_runner *r = NULL;
     int n_txt = 0;
     int enc_embd = enc->n_embd;
-    float *txt_hidden_raw = flux2_text_enc_encode(enc, prompt, &n_txt);
-    flux2_text_enc *enc_hold = NULL;
+
+    txt_hidden_raw = flux2_text_enc_encode(enc, prompt, &n_txt);
     if (!txt_hidden_raw) {
         flux2_text_enc_free(enc);
-        return 1;
+        goto cleanup;
     }
     if (use_gpu_enc && keep_gpu_enc) {
         enc_hold = enc;
@@ -925,48 +930,34 @@ static int run_generate(const char *dit_path, const char *vae_path,
 
     /* Front-pad text to 512 tokens with zeros (matches ComfyUI Flux2.extra_conds) */
     const int FLUX2_KLEIN_TXT_LEN = 512;
-    float *txt_hidden = (float *)calloc((size_t)FLUX2_KLEIN_TXT_LEN * enc_embd, sizeof(float));
-    if (!txt_hidden) {
-        free(txt_hidden_raw);
-        flux2_text_enc_free(enc_hold);
-        return 1;
-    }
+    txt_hidden = (float *)calloc((size_t)FLUX2_KLEIN_TXT_LEN * enc_embd, sizeof(float));
+    if (!txt_hidden) goto cleanup;
     int pad_front = FLUX2_KLEIN_TXT_LEN - n_txt;
     if (pad_front < 0) pad_front = 0;
     int real_txt = (n_txt < FLUX2_KLEIN_TXT_LEN) ? n_txt : FLUX2_KLEIN_TXT_LEN;
     memcpy(txt_hidden + (size_t)pad_front * enc_embd, txt_hidden_raw,
            (size_t)real_txt * enc_embd * sizeof(float));
-    free(txt_hidden_raw);
+    free(txt_hidden_raw); txt_hidden_raw = NULL;
     n_txt = FLUX2_KLEIN_TXT_LEN;
     fprintf(stderr, "Padded text to %d tokens (front-pad zeros)\n", n_txt);
 
     fprintf(stderr, "\n[setup] Init CUDA + load DiT + VAE...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    cuda_flux2_runner *r = cuda_flux2_init(device_id, 1);
-    if (!r) {
-        free(txt_hidden);
-        flux2_text_enc_free(enc_hold);
-        return 1;
-    }
+    r = cuda_flux2_init(device_id, 1);
+    if (!r) goto cleanup;
     if (cuda_flux2_load_dit(r, dit_path) != 0) {
         if (enc_hold) fprintf(stderr, "DiT load failed with GPU text encoder resident; retry without --keep-gpu-enc on lower-VRAM cards.\n");
-        free(txt_hidden);
-        flux2_text_enc_free(enc_hold);
-        cuda_flux2_free(r);
-        return 1;
+        goto cleanup;
     }
     if (cuda_flux2_load_vae(r, vae_path) != 0) {
         if (enc_hold) fprintf(stderr, "VAE load failed with GPU text encoder resident; retry without --keep-gpu-enc on lower-VRAM cards.\n");
-        free(txt_hidden);
-        flux2_text_enc_free(enc_hold);
-        cuda_flux2_free(r);
-        return 1;
+        goto cleanup;
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "Shared init+load: %.1f s\n",
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
-    int rc = 0;
+    rc = 0;
     for (int i = 0; i < repeat; i++) {
         char out_path[512];
         if (out_override && repeat == 1) snprintf(out_path, sizeof(out_path), "%s", out_override);
@@ -979,9 +970,11 @@ static int run_generate(const char *dit_path, const char *vae_path,
         if (rc != 0) break;
     }
 
+cleanup:
     free(txt_hidden);
-    flux2_text_enc_free(enc_hold);
-    cuda_flux2_free(r);
+    free(txt_hidden_raw);
+    if (enc_hold) flux2_text_enc_free(enc_hold);
+    if (r) cuda_flux2_free(r);
     return rc;
 }
 
