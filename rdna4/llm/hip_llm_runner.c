@@ -1134,6 +1134,111 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ===== Batched SSM aux ops (one launch over M rows) ===== */\n"
+"\n"
+"/* ---- 22b. l2_norm_heads_batch_f32: per-(m,h) RMSNorm over head_dim ----\n"
+"   Grid (n_heads, M, 1); each block normalizes one head of one row. */\n"
+"__global__ void l2_norm_heads_batch_f32(float *data, int n_heads, int head_dim,\n"
+"                                          int row_stride, int M, float eps) {\n"
+"    int h = blockIdx.x;\n"
+"    int m = blockIdx.y;\n"
+"    if (h >= n_heads || m >= M) return;\n"
+"    extern __shared__ float sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    float *v = data + (size_t)m * row_stride + (size_t)h * head_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int i = tid; i < head_dim; i += blockDim.x) {\n"
+"        float x = v[i]; sum += x * x;\n"
+"    }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float inv = rsqrtf(sdata[0] + eps);\n"
+"    for (int i = tid; i < head_dim; i += blockDim.x) v[i] *= inv;\n"
+"}\n"
+"\n"
+"/* ---- 23b. repeat_tile_batch_f32: broadcast n_group heads to dt_rank, M rows ---- */\n"
+"__global__ void repeat_tile_batch_f32(float *dst, const float *src,\n"
+"                                        int dt_rank, int d_state, int n_group,\n"
+"                                        int src_row_stride, int dst_row_stride,\n"
+"                                        int M) {\n"
+"    int gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int per_row = dt_rank * d_state;\n"
+"    int total = M * per_row;\n"
+"    if (gid >= total) return;\n"
+"    int m    = gid / per_row;\n"
+"    int rest = gid - m * per_row;\n"
+"    int h    = rest / d_state;\n"
+"    int i    = rest - h * d_state;\n"
+"    size_t dst_idx = (size_t)m * dst_row_stride + (size_t)h * d_state + i;\n"
+"    size_t src_idx = (size_t)m * src_row_stride + (size_t)(h % n_group) * d_state + i;\n"
+"    dst[dst_idx] = src[src_idx];\n"
+"}\n"
+"\n"
+"/* ---- 25b. gated_rmsnorm_silu_batch_f32: per-(m,h) ----\n"
+"   Grid (dt_rank, M, 1); each block does one row of [dt_rank, d_state]. */\n"
+"__global__ void gated_rmsnorm_silu_batch_f32(\n"
+"    float *out, const float *z, const float *norm_w,\n"
+"    int dt_rank, int d_state, int row_stride, int M, float eps) {\n"
+"    int h = blockIdx.x;\n"
+"    int m = blockIdx.y;\n"
+"    if (h >= dt_rank || m >= M) return;\n"
+"    extern __shared__ float sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    float       *o  = out + (size_t)m * row_stride + (size_t)h * d_state;\n"
+"    const float *zh = z   + (size_t)m * row_stride + (size_t)h * d_state;\n"
+"    float sum = 0.0f;\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"        float v = o[i]; sum += v * v;\n"
+"    }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)d_state + eps);\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"        float normed = o[i] * scale * norm_w[i];\n"
+"        float zv = zh[i];\n"
+"        o[i] = normed * (zv / (1.0f + expf(-zv)));\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- 21b. conv1d_depthwise_silu_batch_f32 ----\n"
+"   Processes M sequential token steps for ONE column j per thread. Each thread\n"
+"   keeps the conv_k weights + (conv_k-1)-element state in registers across\n"
+"   the M iterations, eliminating the per-token global state R/W amplification\n"
+"   (parallel to deltanet_step_batch). conv_k assumed <= 8. */\n"
+"#define CONV1D_BATCH_MAX_K 8\n"
+"__global__ void conv1d_depthwise_silu_batch_f32(\n"
+"    float *conv_out_batch, float *conv_state,\n"
+"    const float *input_batch, const float *weight,\n"
+"    int qkv_dim, int conv_k, int row_stride, int M) {\n"
+"    int j = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (j >= qkv_dim) return;\n"
+"    /* Load this column's weights once. */\n"
+"    float w[CONV1D_BATCH_MAX_K];\n"
+"    for (int f = 0; f < conv_k; f++) w[f] = weight[j * conv_k + f];\n"
+"    /* Load this column's persistent state row (conv_k-1 floats). */\n"
+"    float st[CONV1D_BATCH_MAX_K];\n"
+"    for (int f = 0; f < conv_k - 1; f++) st[f] = conv_state[f * qkv_dim + j];\n"
+"    for (int m = 0; m < M; m++) {\n"
+"        float in_val = input_batch[(size_t)m * row_stride + j];\n"
+"        float sum = w[conv_k - 1] * in_val;\n"
+"        for (int f = 0; f < conv_k - 1; f++) sum += w[f] * st[f];\n"
+"        conv_out_batch[(size_t)m * row_stride + j] = sum / (1.0f + __expf(-sum));\n"
+"        /* Shift state: drop oldest, append current input. */\n"
+"        for (int f = 0; f < conv_k - 2; f++) st[f] = st[f + 1];\n"
+"        st[conv_k - 2] = in_val;\n"
+"    }\n"
+"    /* Store final state back to global. */\n"
+"    for (int f = 0; f < conv_k - 1; f++) conv_state[f * qkv_dim + j] = st[f];\n"
+"}\n"
+"\n"
 "/* ---- 26. sigmoid_mul_f32 ---- */\n"
 "__global__ void sigmoid_mul_f32(float *data, const float *gate, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -4098,6 +4203,10 @@ struct hip_llm_runner {
     hipFunction_t fn_repeat_tile_f32;
     hipFunction_t fn_deltanet_step_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
+    hipFunction_t fn_l2_norm_heads_batch_f32;
+    hipFunction_t fn_repeat_tile_batch_f32;
+    hipFunction_t fn_gated_rmsnorm_silu_batch_f32;
+    hipFunction_t fn_conv1d_depthwise_silu_batch_f32;
     hipFunction_t fn_gated_rmsnorm_silu_f32;
     hipFunction_t fn_sigmoid_mul_f32;
     hipFunction_t fn_deinterleave_qgate_f32;
@@ -4363,6 +4472,10 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(repeat_tile_f32);
     GET_FUNC(deltanet_step_f32);
     GET_FUNC(deltanet_step_batch_f32);
+    GET_FUNC(l2_norm_heads_batch_f32);
+    GET_FUNC(repeat_tile_batch_f32);
+    GET_FUNC(gated_rmsnorm_silu_batch_f32);
+    GET_FUNC(conv1d_depthwise_silu_batch_f32);
     GET_FUNC(gated_rmsnorm_silu_f32);
     GET_FUNC(sigmoid_mul_f32);
     GET_FUNC(deinterleave_qgate_f32);
@@ -5917,6 +6030,44 @@ static inline void launch_gated_rmsnorm_silu(hip_llm_runner *r, void *out,
     LAUNCH(r->fn_gated_rmsnorm_silu_f32, dt_rank, 1, 1, threads, 1, 1, threads * sizeof(float), r->stream, args);
 }
 
+/* ---- Batched SSM aux op launchers (one launch over M rows) ---- */
+
+static inline void launch_l2_norm_heads_batch(hip_llm_runner *r, void *data,
+    int n_heads, int head_dim, int row_stride, int M, float eps) {
+    int threads = (head_dim <= 128) ? 128 : 256;
+    void *args[] = { &data, &n_heads, &head_dim, &row_stride, &M, &eps };
+    LAUNCH(r->fn_l2_norm_heads_batch_f32, n_heads, M, 1, threads, 1, 1,
+           threads * sizeof(float), r->stream, args);
+}
+
+static inline void launch_repeat_tile_batch(hip_llm_runner *r, void *dst, void *src,
+    int dt_rank, int d_state, int n_group,
+    int src_row_stride, int dst_row_stride, int M) {
+    int total = M * dt_rank * d_state;
+    void *args[] = { &dst, &src, &dt_rank, &d_state, &n_group,
+                     &src_row_stride, &dst_row_stride, &M };
+    LAUNCH(r->fn_repeat_tile_batch_f32, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
+static inline void launch_gated_rmsnorm_silu_batch(hip_llm_runner *r, void *out,
+    void *z, void *norm_w, int dt_rank, int d_state, int row_stride, int M,
+    float eps) {
+    int threads = (d_state <= 128) ? 128 : 256;
+    void *args[] = { &out, &z, &norm_w, &dt_rank, &d_state, &row_stride, &M, &eps };
+    LAUNCH(r->fn_gated_rmsnorm_silu_batch_f32, dt_rank, M, 1, threads, 1, 1,
+           threads * sizeof(float), r->stream, args);
+}
+
+static inline void launch_conv1d_batch(hip_llm_runner *r, void *conv_out_batch,
+    void *conv_state, void *input_batch, void *weight,
+    int qkv_dim, int conv_k, int row_stride, int M) {
+    void *args[] = { &conv_out_batch, &conv_state, &input_batch, &weight,
+                     &qkv_dim, &conv_k, &row_stride, &M };
+    LAUNCH(r->fn_conv1d_depthwise_silu_batch_f32, (qkv_dim + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
 static inline void launch_sigmoid_mul(hip_llm_runner *r, void *data, void *gate, int n) {
     void *args[] = { &data, &gate, &n };
     LAUNCH(r->fn_sigmoid_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
@@ -6528,33 +6679,31 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                       cl->ssm_dt_bias, cl->ssm_a, dt_rank, M);
             launch_sigmoid_inplace(r, r->d_ssm_beta_batch, M * dt_rank);
 
-            /* Sequential aux ops split into two phases:
-             *   Phase A: per-row prep (conv1d, l2_norm, repeat_tile) — still
-             *            per-row because conv1d state is recurrent. Writes
-             *            into the M-row d_ssm_conv_out / Q_exp / K_exp buffers.
-             *   Phase B: one fused launch_deltanet_step_batch over all M
-             *            tokens, keeping the recurrent state in registers
-             *            across the M iterations.
-             *   Phase C: per-row gated_rmsnorm_silu (independent per token;
-             *            kept as a row-loop since the existing kernel is
-             *            single-row and the data is small). */
-            for (int m = 0; m < M; m++) {
-                size_t qkv_off = (size_t)m * qkv_dim;
-                size_t exp_off = (size_t)m * dt_rank * d_state;
+            /* All aux ops now batched over M rows:
+             *   conv1d:           one launch, M sequential steps fused
+             *                     inside the kernel (state in registers)
+             *   l2_norm_heads:    one launch covering n_group × M heads,
+             *                     once for the Q slice and once for the K slice
+             *   repeat_tile:      one launch each for Q→Q_exp and K→K_exp
+             *   deltanet_step:    one fused launch over all M rows (Opp A+A2)
+             *   gated_rmsnorm:    one launch covering dt_rank × M rows
+             * Replaces ~6*M per-row launches per layer with ~6 launches. */
+            launch_conv1d_batch(r, r->d_ssm_conv_out_batch, cl->d_conv_state,
+                                r->d_ssm_qkv_batch, cl->ssm_conv1d_w,
+                                qkv_dim, conv_k, qkv_dim, M);
 
-                float *qkv_row     = (float *)r->d_ssm_qkv_batch      + qkv_off;
-                float *conv_out_row= (float *)r->d_ssm_conv_out_batch + qkv_off;
-                float *Qexp_row    = (float *)r->d_ssm_Q_exp_batch    + exp_off;
-                float *Kexp_row    = (float *)r->d_ssm_K_exp_batch    + exp_off;
-
-                launch_conv1d(r, conv_out_row, cl->d_conv_state, qkv_row,
-                              cl->ssm_conv1d_w, qkv_dim, conv_k);
-                launch_l2_norm_heads(r, conv_out_row, n_group, d_state, eps); /* Q */
-                float *K_raw_row = conv_out_row + (size_t)n_group * d_state;
-                launch_l2_norm_heads(r, K_raw_row, n_group, d_state, eps);    /* K */
-                launch_repeat_tile(r, Qexp_row, conv_out_row, dt_rank, d_state, n_group);
-                launch_repeat_tile(r, Kexp_row, K_raw_row,    dt_rank, d_state, n_group);
-            }
+            float *conv_out_base = (float *)r->d_ssm_conv_out_batch;
+            float *K_raw_base    = conv_out_base + (size_t)n_group * d_state;
+            launch_l2_norm_heads_batch(r, conv_out_base, n_group, d_state,
+                                       qkv_dim, M, eps);                 /* Q */
+            launch_l2_norm_heads_batch(r, K_raw_base,    n_group, d_state,
+                                       qkv_dim, M, eps);                 /* K */
+            launch_repeat_tile_batch(r, r->d_ssm_Q_exp_batch, conv_out_base,
+                                     dt_rank, d_state, n_group,
+                                     qkv_dim, dt_rank * d_state, M);
+            launch_repeat_tile_batch(r, r->d_ssm_K_exp_batch, K_raw_base,
+                                     dt_rank, d_state, n_group,
+                                     qkv_dim, dt_rank * d_state, M);
 
             /* Phase B: fused multi-token deltanet step. V lives inside conv_out
              * at offset 2*n_group*d_state with stride qkv_dim per row. */
@@ -6586,14 +6735,10 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 }
             }
 
-            /* Phase C: per-row gated_rmsnorm_silu. */
-            for (int m = 0; m < M; m++) {
-                size_t dinner_off = (size_t)m * d_inner;
-                float *out_row = (float *)r->d_ssm_out_batch + dinner_off;
-                float *z_row   = (float *)r->d_ssm_z_batch   + dinner_off;
-                launch_gated_rmsnorm_silu(r, out_row, z_row, cl->ssm_norm_w,
-                                          dt_rank, d_state, eps);
-            }
+            /* Batched gated_rmsnorm_silu: one launch over dt_rank × M heads. */
+            launch_gated_rmsnorm_silu_batch(r, r->d_ssm_out_batch, r->d_ssm_z_batch,
+                                            cl->ssm_norm_w, dt_rank, d_state,
+                                            dt_rank * d_state, M, eps);
 
             /* ssm_out projection: d_inner -> n_embd, batched. Reuse d_silu_batch_bf16
              * as packing scratch (sized for n_ff >= d_inner). */
