@@ -76,7 +76,8 @@ VLM_OBJS := \
     $(VLM_BUILD)/kernels_fp32_gemm.o \
     $(VLM_BUILD)/kernels_micro_kernel_fp32_8x3.o \
     $(VLM_BUILD)/kernels_micro_kernel_fp16B_8x3.o \
-    $(VLM_BUILD)/kernels_micro_kernel_bf16B_8x3.o
+    $(VLM_BUILD)/kernels_micro_kernel_bf16B_8x3.o \
+    $(VLM_BUILD)/kernels_micro_kernel_bf16B_8x3_pv.o
 
 MAIN_SRC := $(LLM_DIR)llm_runner.c
 
