@@ -748,7 +748,7 @@ static const char *qimg_kernel_src =
 "}\n"
 "\n"
 "#define FA2_WARPS   4\n"  /* queries per block (warps per block) */
-"#define FA2_BKV    16\n"  /* KV tile size */
+"#define FA2_BKV    32\n"  /* KV tile size (bumped from 16: halves tile iters/syncs) */
 "#define FA2_HD    128\n"  /* head_dim */
 "#define FA2_EPT     4\n"  /* elements per thread (128/32) */
 "\n"
@@ -1072,9 +1072,11 @@ typedef enum {
     QIMG_CFG_BUF_COUNT
 } qimg_cfg_buf_id;
 
+/* Per-slot device buffer pool, indexed by qimg_cfg_buf_id. Uses
+ * cu_buf_slot from cuda_runner_common.h so the same pattern can be
+ * shared with flux2 / hy3d_paint. */
 typedef struct {
-    CUdeviceptr ptr[QIMG_CFG_BUF_COUNT];
-    size_t cap[QIMG_CFG_BUF_COUNT];
+    cu_buf_slot slot[QIMG_CFG_BUF_COUNT];
 } qimg_cfg_cache;
 
 
@@ -1364,35 +1366,20 @@ static CUdeviceptr checked_cuMemAlloc(size_t nbytes) {
 
 static void qimg_cfg_cache_free(cuda_qimg_runner *r) {
     if (!r) return;
-    for (int i = 0; i < QIMG_CFG_BUF_COUNT; i++) {
-        if (r->cfg_cache.ptr[i]) {
-            cuMemFree(r->cfg_cache.ptr[i]);
-            r->cfg_cache.ptr[i] = 0;
-        }
-        r->cfg_cache.cap[i] = 0;
-    }
+    cu_buf_slots_free(r->cfg_cache.slot, QIMG_CFG_BUF_COUNT);
 }
 
 static size_t qimg_cfg_cache_growth(cuda_qimg_runner *r, qimg_cfg_buf_id id, size_t bytes) {
-    return bytes > r->cfg_cache.cap[id] ? bytes - r->cfg_cache.cap[id] : 0;
+    return cu_buf_slot_growth(&r->cfg_cache.slot[id], bytes);
 }
 
 static int qimg_cfg_cache_ensure(cuda_qimg_runner *r, qimg_cfg_buf_id id,
                                  size_t bytes, const char *label) {
-    if (bytes == 0) return 0;
-    if (r->cfg_cache.ptr[id] && r->cfg_cache.cap[id] >= bytes) return 0;
-    if (r->cfg_cache.ptr[id]) {
-        cuMemFree(r->cfg_cache.ptr[id]);
-        r->cfg_cache.ptr[id] = 0;
-        r->cfg_cache.cap[id] = 0;
-    }
-    r->cfg_cache.ptr[id] = checked_cuMemAlloc(bytes);
-    if (!r->cfg_cache.ptr[id]) {
-        fprintf(stderr, "cuda_qimg(cfg): cached allocation failed for %s\n", label);
-        return -1;
-    }
-    r->cfg_cache.cap[id] = bytes;
-    return 0;
+    return cu_buf_slot_ensure(&r->cfg_cache.slot[id], bytes, label);
+}
+
+static inline CUdeviceptr qimg_cfg_cache_ptr(cuda_qimg_runner *r, qimg_cfg_buf_id id) {
+    return r->cfg_cache.slot[id].ptr;
 }
 
 /* Upload safetensor as F32 (for biases, norms) */
@@ -2619,7 +2606,7 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
      * Each warp handles one query, 32 threads × 4 elems = 128 head_dim.
      * Grid: (n_heads, ceil(n_tok/FA2_WARPS)), Block: (32*FA2_WARPS) */
     int fa2_warps = 4;  /* must match FA2_WARPS in kernel */
-    int fa2_bkv = 16;   /* must match FA2_BKV in kernel */
+    int fa2_bkv = 32;   /* must match FA2_BKV in kernel */
     unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
     unsigned n_threads = (unsigned)(32 * fa2_warps);
     /* Shared mem: 2 × BKV × 128 floats for K+V tiles */
@@ -3465,16 +3452,16 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     CUdeviceptr d_img_in = 0, d_txt_in = 0;
     CUdeviceptr d_t_sin = 0, d_t_emb2 = 0;
     CUdeviceptr d_scratch1 = 0, d_scratch2 = 0, d_scratch3 = 0;
-    CUdeviceptr d_mod = 0;
     CUdeviceptr d_q = 0, d_k = 0, d_v = 0, d_attn_out = 0;
     CUdeviceptr d_t_silu = 0, d_img_mod = 0, d_txt_mod = 0;
     CUdeviceptr d_final_t_silu = 0, d_final_mod = 0, d_final_out = 0;
-#define QIMG_ALLOC_OR_CLEANUP(ptr, nbytes, label) do { \
-        (ptr) = checked_cuMemAlloc((nbytes)); \
-        if (!(ptr)) { \
-            fprintf(stderr, "cuda_qimg: allocation failed for %s\n", (label)); \
-            goto cleanup; \
-        } \
+    /* All per-call activation buffers route through r->cfg_cache (cond slots
+     * only — uncond slots stay at cap=0 when this path runs). Same growth
+     * semantics as cuda_qimg_dit_step_cfg: bytes accumulate across resolution
+     * changes, no per-call cuMemAlloc/cuMemFree churn. */
+#define QIMG_ALLOC_OR_CLEANUP(ptr, nbytes, label, id) do { \
+        if (qimg_cfg_cache_ensure(r, (id), (nbytes), (label)) != 0) goto cleanup; \
+        (ptr) = qimg_cfg_cache_ptr(r, (id)); \
     } while (0)
 
     /* Check GPU memory before allocations */
@@ -3493,12 +3480,12 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     }
 
     /* Allocate GPU activation buffers */
-    QIMG_ALLOC_OR_CLEANUP(d_img, (size_t)n_img * dim * sizeof(float), "d_img");
-    QIMG_ALLOC_OR_CLEANUP(d_txt, (size_t)n_txt * dim * sizeof(float), "d_txt");
-    QIMG_ALLOC_OR_CLEANUP(d_t_emb, (size_t)dim * sizeof(float), "d_t_emb");
+    QIMG_ALLOC_OR_CLEANUP(d_img, (size_t)n_img * dim * sizeof(float), "d_img", QIMG_CFG_BUF_IMG_C);
+    QIMG_ALLOC_OR_CLEANUP(d_txt, (size_t)n_txt * dim * sizeof(float), "d_txt", QIMG_CFG_BUF_TXT_C);
+    QIMG_ALLOC_OR_CLEANUP(d_t_emb, (size_t)dim * sizeof(float), "d_t_emb", QIMG_CFG_BUF_T_EMB);
 
     /* Upload inputs */
-    QIMG_ALLOC_OR_CLEANUP(d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in");
+    QIMG_ALLOC_OR_CLEANUP(d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in", QIMG_CFG_BUF_IMG_IN);
     cuMemcpyHtoD(d_img_in, img_tokens, (size_t)n_img * in_ch * sizeof(float));
     /* Save raw patchified input for comparison */
     if (r->verbose >= 3) {
@@ -3519,7 +3506,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
             fprintf(stderr, "    Saved cuda_dit_img_input.npy [%d,%d]\n", n_img, in_ch);
         }
     }
-    QIMG_ALLOC_OR_CLEANUP(d_txt_in, (size_t)n_txt * txt_dim * sizeof(float), "d_txt_in");
+    QIMG_ALLOC_OR_CLEANUP(d_txt_in, (size_t)n_txt * txt_dim * sizeof(float), "d_txt_in", QIMG_CFG_BUF_TXT_IN_C);
     cuMemcpyHtoD(d_txt_in, txt_tokens, (size_t)n_txt * txt_dim * sizeof(float));
 
     /* Match ComfyUI: apply_model casts input to BF16 (inference dtype).
@@ -3543,15 +3530,14 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         t_sin[i]        = cosf(angle);  /* cos first (flip_sin_to_cos=True) */
         t_sin[half + i] = sinf(angle);
     }
-    QIMG_ALLOC_OR_CLEANUP(d_t_sin, 256 * sizeof(float), "d_t_sin");
+    QIMG_ALLOC_OR_CLEANUP(d_t_sin, 256 * sizeof(float), "d_t_sin", QIMG_CFG_BUF_T_SIN);
     cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float));
 
     op_gemm(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
-    QIMG_ALLOC_OR_CLEANUP(d_t_emb2, (size_t)dim * sizeof(float), "d_t_emb2");
+    QIMG_ALLOC_OR_CLEANUP(d_t_emb2, (size_t)dim * sizeof(float), "d_t_emb2", QIMG_CFG_BUF_T_EMB2);
     op_gemm(r, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
-    cuMemFree(d_t_emb); d_t_emb = d_t_emb2; d_t_emb2 = 0;
-    cuMemFree(d_t_sin); d_t_sin = 0;
+    d_t_emb = d_t_emb2;
 
     /* Save temb for comparison */
     if (r->verbose >= 3) {
@@ -3577,11 +3563,9 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
                        256, 1, 1, 256 * sizeof(float), s, rn_args, NULL);
     }
     op_gemm(r, d_txt, r->d_txt_in_w, d_txt_in, r->d_txt_in_b, dim, txt_dim, n_txt);
-    cuMemFree(d_txt_in); d_txt_in = 0;
 
     /* 3. Image input: GEMM(64→3072) */
     op_gemm(r, d_img, r->d_img_in_w, d_img_in, r->d_img_in_b, dim, in_ch, n_img);
-    cuMemFree(d_img_in); d_img_in = 0;
 
     /* Helper: save GPU tensor as .npy [rows, cols] */
     #define DIT_SAVE_NPY(fname, ptr, rows, cols) do { \
@@ -3620,10 +3604,10 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
 
     /* Scratch buffers */
     size_t max_scratch = (size_t)n_total * dim * sizeof(float);
-    QIMG_ALLOC_OR_CLEANUP(d_scratch1, max_scratch, "d_scratch1");
-    QIMG_ALLOC_OR_CLEANUP(d_scratch2, max_scratch, "d_scratch2");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch1, max_scratch, "d_scratch1", QIMG_CFG_BUF_SCRATCH1_C);
+    QIMG_ALLOC_OR_CLEANUP(d_scratch2, max_scratch, "d_scratch2", QIMG_CFG_BUF_SCRATCH2_C);
     size_t ffn_scratch = (size_t)(n_img > n_txt ? n_img : n_txt) * mlp_h * sizeof(float);
-    QIMG_ALLOC_OR_CLEANUP(d_scratch3, ffn_scratch, "d_scratch3");
+    QIMG_ALLOC_OR_CLEANUP(d_scratch3, ffn_scratch, "d_scratch3", QIMG_CFG_BUF_SCRATCH3_C);
 
     /* Debug: dump max value of a GPU buffer */
     #define DUMP_MAX(name, ptr, count) do { if (r->verbose >= 2) { \
@@ -3634,21 +3618,18 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         fprintf(stderr, "    %s: max=%.4f nan=%d\n", name, _mx, _nc); \
         free(_tmp); } } while(0)
 
-    /* Modulation scratch */
-    QIMG_ALLOC_OR_CLEANUP(d_mod, (size_t)6 * dim * sizeof(float), "d_mod");
-
     /* Joint Q/K/V buffers */
-    QIMG_ALLOC_OR_CLEANUP(d_q, (size_t)n_total * dim * sizeof(float), "d_q");
-    QIMG_ALLOC_OR_CLEANUP(d_k, (size_t)n_total * dim * sizeof(float), "d_k");
-    QIMG_ALLOC_OR_CLEANUP(d_v, (size_t)n_total * dim * sizeof(float), "d_v");
-    QIMG_ALLOC_OR_CLEANUP(d_attn_out, (size_t)n_total * dim * sizeof(float), "d_attn_out");
+    QIMG_ALLOC_OR_CLEANUP(d_q, (size_t)n_total * dim * sizeof(float), "d_q", QIMG_CFG_BUF_Q_C);
+    QIMG_ALLOC_OR_CLEANUP(d_k, (size_t)n_total * dim * sizeof(float), "d_k", QIMG_CFG_BUF_K_C);
+    QIMG_ALLOC_OR_CLEANUP(d_v, (size_t)n_total * dim * sizeof(float), "d_v", QIMG_CFG_BUF_V_C);
+    QIMG_ALLOC_OR_CLEANUP(d_attn_out, (size_t)n_total * dim * sizeof(float), "d_attn_out", QIMG_CFG_BUF_ATTN_OUT_C);
 
     /* Per-block scratch buffers hoisted out of the loop — cuMemAlloc/cuMemFree
      * are synchronous driver calls, each costs ~0.5-1 ms. Allocating these
      * per-block adds ~90 ms/block of overhead on a 60-block, 2-CFG pipeline. */
-    QIMG_ALLOC_OR_CLEANUP(d_t_silu,  (size_t)dim * sizeof(float), "d_t_silu");
-    QIMG_ALLOC_OR_CLEANUP(d_img_mod, (size_t)6 * dim * sizeof(float), "d_img_mod");
-    QIMG_ALLOC_OR_CLEANUP(d_txt_mod, (size_t)6 * dim * sizeof(float), "d_txt_mod");
+    QIMG_ALLOC_OR_CLEANUP(d_t_silu,  (size_t)dim * sizeof(float), "d_t_silu", QIMG_CFG_BUF_T_SILU);
+    QIMG_ALLOC_OR_CLEANUP(d_img_mod, (size_t)6 * dim * sizeof(float), "d_img_mod", QIMG_CFG_BUF_IMG_MOD);
+    QIMG_ALLOC_OR_CLEANUP(d_txt_mod, (size_t)6 * dim * sizeof(float), "d_txt_mod", QIMG_CFG_BUF_TXT_MOD);
 
     /* Compute image patch grid for RoPE */
     int hp_rope = (int)sqrtf((float)n_img);
@@ -3759,24 +3740,22 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
 
     /* 5. Final output: adaLN → proj_out */
     {
-        QIMG_ALLOC_OR_CLEANUP(d_final_t_silu, (size_t)dim * sizeof(float), "d_final_t_silu");
+        QIMG_ALLOC_OR_CLEANUP(d_final_t_silu, (size_t)dim * sizeof(float), "d_final_t_silu", QIMG_CFG_BUF_FINAL_T_SILU);
         cuMemcpyDtoDAsync(d_final_t_silu, d_t_emb, (size_t)dim * sizeof(float), s);
         op_silu(r, d_final_t_silu, dim);
-        QIMG_ALLOC_OR_CLEANUP(d_final_mod, (size_t)2 * dim * sizeof(float), "d_final_mod");
+        QIMG_ALLOC_OR_CLEANUP(d_final_mod, (size_t)2 * dim * sizeof(float), "d_final_mod", QIMG_CFG_BUF_FINAL_MOD);
         op_gemm(r, d_final_mod, r->d_norm_out_w, d_final_t_silu, r->d_norm_out_b,
                 2 * dim, dim, 1);
-        cuMemFree(d_final_t_silu); d_final_t_silu = 0;
 
         /* LastLayer: scale, shift = chunk(emb, 2) — scale is FIRST half */
         CUdeviceptr f_scale = d_final_mod;
         CUdeviceptr f_shift = d_final_mod + (size_t)dim * sizeof(float);
         op_adaln(r, d_scratch1, d_img, f_shift, f_scale, n_img, dim);
-        cuMemFree(d_final_mod); d_final_mod = 0;
 
         DIT_SAVE_NPY("cuda_dit_norm_out.npy", d_scratch1, n_img, dim);
 
         /* proj_out: [n_img, dim] → [n_img, in_ch] */
-        QIMG_ALLOC_OR_CLEANUP(d_final_out, (size_t)n_img * in_ch * sizeof(float), "d_final_out");
+        QIMG_ALLOC_OR_CLEANUP(d_final_out, (size_t)n_img * in_ch * sizeof(float), "d_final_out", QIMG_CFG_BUF_FINAL_OUT);
         op_gemm(r, d_final_out, r->d_proj_out_w, d_scratch1, r->d_proj_out_b,
                 in_ch, dim, n_img);
 
@@ -3785,33 +3764,18 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         /* Download result (sync stream first to ensure computation is complete) */
         cuStreamSynchronize(s);
         cuMemcpyDtoH(out, d_final_out, (size_t)n_img * in_ch * sizeof(float));
-        cuMemFree(d_final_out); d_final_out = 0;
     }
     rc = 0;
 
-    /* Cleanup */
+    /* Cleanup — cfg_cache slots are runner-owned, freed via qimg_cfg_cache_free
+     * in cuda_qimg_free. Nothing to release here. */
 cleanup:
-    if (d_t_sin) cuMemFree(d_t_sin);
-    if (d_t_emb2) cuMemFree(d_t_emb2);
-    if (d_final_t_silu) cuMemFree(d_final_t_silu);
-    if (d_final_mod) cuMemFree(d_final_mod);
-    if (d_final_out) cuMemFree(d_final_out);
-    if (d_img_in) cuMemFree(d_img_in);
-    if (d_txt_in) cuMemFree(d_txt_in);
-    if (d_img) cuMemFree(d_img);
-    if (d_txt) cuMemFree(d_txt);
-    if (d_t_emb) cuMemFree(d_t_emb);
-    if (d_scratch1) cuMemFree(d_scratch1);
-    if (d_scratch2) cuMemFree(d_scratch2);
-    if (d_scratch3) cuMemFree(d_scratch3);
-    if (d_mod) cuMemFree(d_mod);
-    if (d_q) cuMemFree(d_q);
-    if (d_k) cuMemFree(d_k);
-    if (d_v) cuMemFree(d_v);
-    if (d_attn_out) cuMemFree(d_attn_out);
-    if (d_t_silu) cuMemFree(d_t_silu);
-    if (d_img_mod) cuMemFree(d_img_mod);
-    if (d_txt_mod) cuMemFree(d_txt_mod);
+    (void)d_img; (void)d_txt; (void)d_t_emb; (void)d_t_emb2;
+    (void)d_img_in; (void)d_txt_in; (void)d_t_sin;
+    (void)d_scratch1; (void)d_scratch2; (void)d_scratch3;
+    (void)d_q; (void)d_k; (void)d_v; (void)d_attn_out;
+    (void)d_t_silu; (void)d_img_mod; (void)d_txt_mod;
+    (void)d_final_t_silu; (void)d_final_mod; (void)d_final_out;
 
     if (rc == 0 && r->profile_block && r->prof_block_count > 0) {
         double n = (double)r->prof_block_count;
@@ -3969,7 +3933,7 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     CUdeviceptr d_final_t_silu = 0, d_final_mod = 0, d_final_out = 0;
 #define QIMG_CFG_CACHE_OR_CLEANUP(id, dst, nbytes, label) do { \
         if (qimg_cfg_cache_ensure(r, (id), (nbytes), (label)) != 0) goto cleanup; \
-        (dst) = r->cfg_cache.ptr[(id)]; \
+        (dst) = qimg_cfg_cache_ptr(r, (id)); \
     } while (0)
 
     /* Allocate paired img/txt buffers. Both passes share the same img_tokens
