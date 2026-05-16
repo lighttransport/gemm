@@ -171,13 +171,41 @@ Theoretical headroom: <2% of GPU time today, but it's free at runtime once paid 
 
 **Effort**: ~half a day.
 
-**SSM aux op batching — currently ~13% of 27B GPU time**
+**SSM aux op batching (✅ LANDED — 2.00× at L=1024)**
 
 `l2_norm_heads`, `repeat_tile`, `conv1d_depthwise_silu`, `gated_rmsnorm_silu` all run in a per-row host loop (M × 48 layers × 4 ops = ~200 k launches per L=1024 forward). Each launch is ~2 µs, the work is microscopic. A batched form of each kernel would collapse those into ~48 launches per layer.
 
 Theoretical headroom: 13% × ~50% removable (the kernels themselves are fast, just launch-bound) ≈ **6% prefill saved**.
 
 **Effort**: ~1 day.
+
+**Landed (2026-05-16)**: 4 new batched kernels:
+- `l2_norm_heads_batch_f32` — grid (n_heads, M, 1); one block per (m, h)
+- `repeat_tile_batch_f32` — flat thread per (m, h, i)
+- `gated_rmsnorm_silu_batch_f32` — grid (dt_rank, M, 1)
+- `conv1d_depthwise_silu_batch_f32` — one thread per column j, M sequential
+  steps fused inside the kernel (state in registers, same pattern as
+  deltanet_batch)
+
+Per SSM layer: **~6×M per-row launches → 6 batched launches** (~170× launch-count
+reduction for L=1024).
+
+Measured (27B IQ3_XXS hybrid, RX 9070 XT, warm):
+
+| L | post-A2 | post-aux | aux speedup | session total |
+|---:|---:|---:|---:|---:|
+| 64  | 6.25 ms/tok | **5.37 ms/tok** | 1.16× | **11.5×** |
+| 256 | 2.60 ms/tok | **1.69 ms/tok** | 1.54× | ~38× |
+| 1024| 1.90 ms/tok | **0.95 ms/tok** | **2.00×** | **~68×** |
+
+**Sub-millisecond per token on 27B IQ3_XXS hybrid (1051 tok/s prefill).**
+
+E2e VLM Brooklyn Bridge: 6520 → **3768 ms** = **1.73× from aux batching**.
+Cumulative session arc: **187.6 s → 3.77 s = 49.8×**.
+
+rocprofv3 confirms: aux ops collectively dropped from ~40% → ~3% of GPU time.
+hipBLASLt GEMMs (the real matmul) are now the dominant single contributor at
+37.5%. % of WMMA peak: **29.5%** (up from 14.7%).
 
 ### Tier 3 — small (<3%)
 
