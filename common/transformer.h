@@ -4576,12 +4576,17 @@ static void *tf_persistent_worker(void *arg) {
             tf_thread_matvec(m->ffn_buf1, &layer->ffn_gate, m->xb, n_ff, tid, nt);
             tf_thread_matvec(m->ffn_buf2, &layer->ffn_up, m->xb, n_ff, tid, nt);
 
-            /* SiLU×mul on this thread's row partition (no barrier needed) */
+            /* SiLU×mul on this thread's row partition. We use the SAME partition
+             * as the gate matvec (via tf_matvec_row_range) so each thread reads
+             * ffn_buf1/ffn_buf2 entries it just wrote — no barrier needed and
+             * no cross-thread cache-line bounce. (Pre-2026-05-16 this used a
+             * naive n_ff/nt split which was a latent race when matvec switched
+             * to tf_row_split8.) Assumes ffn_gate and ffn_up share dtype/type
+             * so their matvec partitions coincide. */
             {
-                int rp = n_ff / nt, re = n_ff % nt;
-                int rs = tid * rp + (tid < re ? tid : re);
-                int rc = rp + (tid < re ? 1 : 0);
-                for (int i = rs; i < rs + rc; i++) {
+                int rs, re_end;
+                tf_matvec_row_range(&layer->ffn_gate, n_ff, nt, tid, &rs, &re_end);
+                for (int i = rs; i < re_end; i++) {
                     float g = m->ffn_buf1[i];
                     m->ffn_buf3[i] = g / (1.0f + expf(-g)) * m->ffn_buf2[i];
                 }
