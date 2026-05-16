@@ -3906,6 +3906,35 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
 static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
                               int n_rows, int tid, int nt);
 
+/* Mirrors the row-split decision inside tf_thread_matvec so other code can
+ * compute the exact [rs,re) range that thread `tid` will write into `dst`.
+ * Used to align downstream consumers with the producer's partition and avoid
+ * an intervening barrier. Keep in sync with tf_thread_matvec! */
+static inline void tf_matvec_row_range(const qtensor *mat, int n_rows,
+                                        int nt, int tid, int *rs, int *re) {
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_F16 && mat->panel) {
+        /* Panel path splits by panel_blk; each block covers a contiguous row
+         * stripe of size (n_rows / panel_blk). */
+        int nblk = mat->panel_blk;
+        int bp = nblk / nt, be = nblk % nt;
+        int bs = tid * bp + (tid < be ? tid : be);
+        int bc = bp + (tid < be ? 1 : 0);
+        int rows_per_blk = n_rows / nblk;
+        *rs = bs * rows_per_blk;
+        *re = (bs + bc) * rows_per_blk;
+        return;
+    }
+#endif
+    if (mat->type == GGML_TYPE_BF16 || mat->type == GGML_TYPE_F16) {
+        tf_row_split8(n_rows, nt, tid, rs, re);
+    } else {
+        int rp = n_rows / nt, rem = n_rows % nt;
+        *rs = tid * rp + (tid < rem ? tid : rem);
+        *re = *rs + rp + (tid < rem ? 1 : 0);
+    }
+}
+
 /* Parallel SSM Delta-Net forward, called by ALL persistent worker threads.
  * Uses 4 internal spin barriers (B_a..B_d) to coordinate sections:
  *   S1: parallel qkv+gate matvecs (rows); tid 0 also does alpha+beta matvec + postproc
@@ -3955,9 +3984,12 @@ static void tf_ssm_deltanet_forward_parallel(transformer_model *m, int layer_idx
         for (int i = 0; i < dt_rank; i++)
             beta_arr[i] = 1.0f / (1.0f + expf(-beta_arr[i]));
     }
-    tf_spin_barrier(m, local_sense, nt);  /* B_a */
+    /* B_a removed: S2 uses the SAME partition as S1's qkv matvec
+     * (tf_matvec_row_range), so every thread reads qkv_buf[j] it just
+     * wrote in S1. tid 0's alpha/beta writes are consumed in S4, after
+     * B_b — still safe. */
 
-    /* === S2: parallel conv1d by channel === */
+    /* === S2: parallel conv1d by channel, aligned with S1's qkv matvec === */
     {
         float *conv_st = m->conv_state[layer_idx];
         int wr = m->conv_state_pos[layer_idx];
@@ -3969,11 +4001,9 @@ static void tf_ssm_deltanet_forward_parallel(transformer_model *m, int layer_idx
         for (int f = 0; f < n_hist; f++)
             row_off[f] = ((wr + f) % n_hist) * qkv_dim;
 
-        /* Channel partition (qkv_dim = 10240) */
-        int cp = qkv_dim / nt, ce = qkv_dim % nt;
-        int cs = tid * cp + (tid < ce ? tid : ce);
-        int cc = cp + (tid < ce ? 1 : 0);
-        int cend = cs + cc;
+        int cs, cend;
+        tf_matvec_row_range(&layer->ssm_qkv, qkv_dim, nt, tid, &cs, &cend);
+        int cc = cend - cs;
 
         /* MAC + SiLU into conv_out (= K_exp scratch). Per-channel: no contention. */
         for (int j = cs; j < cend; j++) {
@@ -4025,7 +4055,8 @@ static void tf_ssm_deltanet_forward_parallel(transformer_model *m, int layer_idx
             }
         }
     }
-    tf_spin_barrier(m, local_sense, nt);  /* B_c */
+    /* B_c removed: S4 reads Q_exp[h*ds]/K_exp[h*ds] for the same head range
+     * [hs,he) that S3 just wrote (identical tf_ssm_head_range call). */
 
     /* === S4: Delta-Net recurrence + fused RMSNorm+SiLU(z) per head === */
     {
