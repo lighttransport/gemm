@@ -41,9 +41,12 @@ typedef struct {
     /* Must stay byte-identical to the qtensor in common/transformer.h:
      * vision_model and other structs are shared across TUs that include
      * either header, so any layout drift corrupts struct offsets.
-     * A64FX panel layout (M10) — see transformer.h for semantics. */
+     * A64FX panel layout (M10) — see transformer.h for semantics.
+     * A64FX BF16 p_odd-pair layout — see transformer.h for semantics. */
     uint16_t *panel;
     int       panel_blk;
+    uint16_t *bf16_pv;
+    int       bf16_pv_groups;
 } qtensor;
 #endif
 #endif
