@@ -95,13 +95,34 @@ The 27B prefill is at **5.8% of compute peak**; the 2B at 37% of compute peak. W
 
 ### Tier 1 — substantial (>10% prefill)
 
-**B. WMMA flash-attention kernel for `head_dim=256` — currently 17% of 27B GPU time**
+**B. WMMA flash-attention kernel for `head_dim=256` (✅ LANDED)**
 
 The 16 gated-attn layers fall back to `attn_decode_f32` per-row because the existing WMMA-FA caps at head_dim=128. A head_dim=256 variant would batch all M tokens into a single WMMA-FA launch per layer.
 
 Theoretical headroom on 27B: `attn_decode` is 17% of GPU time at L=1024; a WMMA-FA kernel for the same workload would run in ~5% of that (similar to the VLM head_dim=72 case). **Expected: ~16% of total prefill saved → 27B prefill 4.8 → ~4.0 ms/tok.**
 
 **Effort**: ~1 day. Mechanical port of `flash_attn_wmma_f16_4w_causal` doubling per-thread accumulator capacity.
+
+**Landed (2026-05-16)**: new `flash_attn_wmma_f16_4w_causal_hd256` kernel
+(HD_MAX=256, K_NB=16; cooperative load partitioned 16 rows × 8 col-blocks
+of 32 cols/thread). Phase-3 FA eligibility check extended from
+`head_dim <= 128` to `head_dim <= 256`. Launcher picks the right variant
+by `head_dim`.
+
+Measured (27B IQ3_XXS hybrid, RX 9070 XT, warm):
+
+| L | before B | after B | speedup |
+|---:|---:|---:|---:|
+| 64 | 8.68 | **8.43 ms/tok** | 1.03× |
+| 256 | 5.00 | **4.71 ms/tok** | 1.06× |
+| 1024 | 4.79 | **4.03 ms/tok** | **1.19×** |
+
+E2e VLM Brooklyn Bridge: 18.4 s → **12.7 s** = **1.44× from Opp B alone**
+(amortization across M=1024 chunks gives bigger gains than standalone
+bench). Cumulative session-arc on Brooklyn Bridge: 187.6 s → 12.7 s = **14.8×**.
+
+2B F16 unchanged (head_dim=128 keeps original kernel). Correctness:
+`--compare-paths` argmax match on 27B (token 369).
 
 **A2. Vectorize the deltanet inner loop (float4 / SIMD) — currently 54% of 27B GPU time**
 
