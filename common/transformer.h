@@ -642,6 +642,11 @@ typedef struct {
     float *tmp; /* per-thread scratch */
 } tf_matvec_task;
 
+static inline void tf_matvec_bf16_rows_pv(float *dst, const uint8_t *base,
+                                            size_t row_bytes, const uint16_t *pv,
+                                            const float *x, int n_cols,
+                                            int row_start, int row_end);
+
 static void *tf_qmatvec_worker(void *arg) {
     tf_matvec_task *t = (tf_matvec_task *)arg;
     int n_cols = t->mat->n_cols;
@@ -666,21 +671,13 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
     if (t->mat->type == GGML_TYPE_BF16) {
+        /* Route through the pv-aware path so matvec_bf16_8row_pv fires when
+         * mat->bf16_pv is built and the worker's row_start is 8-aligned
+         * (guaranteed by tf_row_split8 in the pool dispatcher). */
         const uint8_t *base = (const uint8_t *)t->mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
-        int i = t->row_start;
-        for (; i + 3 < t->row_end; i += 4) {
-            matvec_bf16_4row(t->dst + i,
-                (const uint16_t *)(base + (size_t)i * row_bytes),
-                (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
-                (const uint16_t *)(base + (size_t)(i+2) * row_bytes),
-                (const uint16_t *)(base + (size_t)(i+3) * row_bytes),
-                t->x, n_cols);
-        }
-        for (; i < t->row_end; i++) {
-            const uint16_t *row = (const uint16_t *)(base + (size_t)i * row_bytes);
-            t->dst[i] = vec_dot_bf16_f32(row, t->x, n_cols);
-        }
+        tf_matvec_bf16_rows_pv(t->dst, base, row_bytes, t->mat->bf16_pv,
+                                t->x, n_cols, t->row_start, t->row_end);
         return NULL;
     }
     if (t->mat->type == GGML_TYPE_Q8_0) {
@@ -745,14 +742,66 @@ static void tf_matvec_q8_rows(float *dst, const uint8_t *base, size_t row_bytes,
     }
 }
 
+/* Compute head range [h_start, h_end) for thread tid when distributing
+ * dt_rank SSM heads across n_cmgs CMGs. Each CMG gets a contiguous block
+ * of heads, and within that block the first min(threads_per_cmg, cmg_heads)
+ * threads share the heads. Threads that get nothing return h_end == h_start.
+ *
+ * Goal: state[h] for h in CMG c's block is first-touched by a thread pinned
+ * to CMG c, so the 64 KB / head state column lives in c's HBM and stays
+ * L2-resident across decode steps. Without this, all 16-48 heads of state
+ * sit on whatever CMG main first-touched (typically CMG0), and threads on
+ * CMG1-3 must reach across the X-bar each recurrence pass. */
+static inline void tf_ssm_head_range(int dt_rank, int n_threads, int n_cmgs,
+                                       int tid, int *h_start, int *h_end) {
+    if (n_cmgs < 1) n_cmgs = 1;
+    int per_cmg_thr = n_threads / n_cmgs;
+    if (per_cmg_thr < 1) per_cmg_thr = 1;
+    int cmg = tid / per_cmg_thr;
+    int pos = tid - cmg * per_cmg_thr;
+    if (cmg >= n_cmgs) { *h_start = *h_end = 0; return; }
+    int h_base = dt_rank / n_cmgs, h_extra = dt_rank % n_cmgs;
+    int cmg_h  = h_base + (cmg < h_extra ? 1 : 0);
+    int cmg_off = h_base * cmg + (cmg < h_extra ? cmg : h_extra);
+    int use = cmg_h < per_cmg_thr ? cmg_h : per_cmg_thr;
+    if (pos >= use) { *h_start = *h_end = 0; return; }
+    int t_base = cmg_h / use, t_extra = cmg_h % use;
+    int my  = t_base + (pos < t_extra ? 1 : 0);
+    int off = t_base * pos + (pos < t_extra ? pos : t_extra);
+    *h_start = cmg_off + off;
+    *h_end   = *h_start + my;
+}
+
+/* Compute row_start/row_end for worker t out of n_threads, splitting n_rows
+ * in 8-row units when n_rows is 8-aligned. Preserves row_start & 7 == 0 so
+ * the bf16_pv fast path in tf_matvec_bf16_rows_pv is taken on every worker,
+ * not just whichever happens to land 8-aligned by chance. */
+static inline void tf_row_split8(int n_rows, int n_threads, int t,
+                                  int *row_start, int *row_end) {
+    if ((n_rows & 7) == 0) {
+        int nb = n_rows >> 3;
+        int per = nb / n_threads, extra = nb % n_threads;
+        int off = per * t + (t < extra ? t : extra);
+        int cnt = per + (t < extra ? 1 : 0);
+        *row_start = off << 3;
+        *row_end   = (off + cnt) << 3;
+    } else {
+        int per = n_rows / n_threads, extra = n_rows % n_threads;
+        int off = per * t + (t < extra ? t : extra);
+        int cnt = per + (t < extra ? 1 : 0);
+        *row_start = off;
+        *row_end   = off + cnt;
+    }
+}
+
 /* If pv != NULL use matvec_bf16_8row_pv for 8-row blocks. pv is the
  * pair-packed buffer from tf_bf16_pv_alloc/fill (n_rows * n_cols bf16 = same
  * byte count as row-major). row_start / row_end must be 8-aligned when pv is
  * used; otherwise pv is silently ignored for the misaligned region. */
-static void tf_matvec_bf16_rows_pv(float *dst, const uint8_t *base,
-                                    size_t row_bytes, const uint16_t *pv,
-                                    const float *x, int n_cols,
-                                    int row_start, int row_end) {
+static inline void tf_matvec_bf16_rows_pv(float *dst, const uint8_t *base,
+                                            size_t row_bytes, const uint16_t *pv,
+                                            const float *x, int n_cols,
+                                            int row_start, int row_end) {
     int i = row_start;
 #if defined(__ARM_FEATURE_SVE)
     /* 8-row blocks: 8 FMAs per activation load, doubles compute/memory ratio */
@@ -927,11 +976,10 @@ static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qten
         return;
     }
     tf_matvec_fused2_task *tasks = (tf_matvec_fused2_task *)alloca(nt * sizeof(tf_matvec_fused2_task));
-    int rows_per = n_rows / nt, extra = n_rows % nt, offset = 0;
     for (int t = 0; t < nt; t++) {
-        int count = rows_per + (t < extra ? 1 : 0);
-        tasks[t] = (tf_matvec_fused2_task){dst1, dst2, mat1, mat2, x, offset, offset + count};
-        offset += count;
+        int rs, re;
+        tf_row_split8(n_rows, nt, t, &rs, &re);
+        tasks[t] = (tf_matvec_fused2_task){dst1, dst2, mat1, mat2, x, rs, re};
     }
     tf_pool_dispatch(m, tf_qmatvec_fused2_worker, tasks, sizeof(tf_matvec_fused2_task));
 }
@@ -983,11 +1031,10 @@ static void tf_qmatvec_fused2_silu_pool(transformer_model *m, float *dst,
         return;
     }
     tf_fused_ffn_silu_task *tasks = (tf_fused_ffn_silu_task *)alloca(nt * sizeof(tf_fused_ffn_silu_task));
-    int rp = n_rows / nt, re = n_rows % nt, ro = 0;
     for (int t = 0; t < nt; t++) {
-        int rc = rp + (t < re ? 1 : 0);
-        tasks[t] = (tf_fused_ffn_silu_task){dst, gate_mat, up_mat, x, ro, ro + rc};
-        ro += rc;
+        int rs, re;
+        tf_row_split8(n_rows, nt, t, &rs, &re);
+        tasks[t] = (tf_fused_ffn_silu_task){dst, gate_mat, up_mat, x, rs, re};
     }
     tf_pool_dispatch(m, tf_fused_ffn_silu_worker, tasks, sizeof(tf_fused_ffn_silu_task));
 }
@@ -1055,19 +1102,71 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
     }
     /* Distribute rows across threads: n_q Q rows and n_kv K+V rows each. */
     tf_matvec_fused3_task *tasks = (tf_matvec_fused3_task *)alloca(nt * sizeof(tf_matvec_fused3_task));
-    int q_per = n_q / nt, q_extra = n_q % nt, q_off = 0;
-    int kv_per = n_kv / nt, kv_extra = n_kv % nt, kv_off = 0;
     for (int t = 0; t < nt; t++) {
-        int qc = q_per + (t < q_extra ? 1 : 0);
-        int kvc = kv_per + (t < kv_extra ? 1 : 0);
+        int qs, qe, ks, ke;
+        tf_row_split8(n_q,  nt, t, &qs, &qe);
+        tf_row_split8(n_kv, nt, t, &ks, &ke);
         tasks[t] = (tf_matvec_fused3_task){
             q, k, v, mat_q, mat_k, mat_v, m->xb,
-            q_off, q_off + qc, kv_off, kv_off + kvc
+            qs, qe, ks, ke
         };
-        q_off += qc;
-        kv_off += kvc;
     }
     tf_pool_dispatch(m, tf_qmatvec_fused3_worker, tasks, sizeof(tf_matvec_fused3_task));
+}
+
+/* Fused pair of independent matvecs sharing the same input x, with potentially
+ * different row counts and matrix types. Used in the SSM block to merge
+ * ssm_qkv (qkv_dim rows) and ssm_gate (d_inner rows), eliminating one
+ * pool barrier per SSM layer. */
+typedef struct {
+    float *dst1;
+    const qtensor *mat1;
+    float *dst2;
+    const qtensor *mat2;
+    const float *x;
+    int row_start1, row_end1;
+    int row_start2, row_end2;
+} tf_matvec_fused2_diff_task;
+
+static void *tf_qmatvec_fused2_diff_worker(void *arg) {
+    tf_matvec_fused2_diff_task *t = (tf_matvec_fused2_diff_task *)arg;
+    if (t->row_end1 > t->row_start1)
+        tf_matvec_qtensor_rows(t->dst1, t->mat1, t->x, t->row_start1, t->row_end1);
+    if (t->row_end2 > t->row_start2)
+        tf_matvec_qtensor_rows(t->dst2, t->mat2, t->x, t->row_start2, t->row_end2);
+    return NULL;
+}
+
+static void tf_qmatvec_fused2_diff_pool(transformer_model *m,
+                                          float *dst1, const qtensor *mat1, int n_rows1,
+                                          float *dst2, const qtensor *mat2, int n_rows2,
+                                          const float *x) {
+    int nt = m->n_threads;
+#if defined(__ARM_FEATURE_SVE)
+    /* Panel-laid-out weights are single-stream; fall back to two pool calls. */
+    if (mat1->panel || mat2->panel) {
+        tf_qmatvec_pool(m, dst1, mat1, x, n_rows1);
+        tf_qmatvec_pool(m, dst2, mat2, x, n_rows2);
+        return;
+    }
+#endif
+    if (nt <= 1 || !m->pool_alive) {
+        tf_qmatvec(dst1, mat1, x, n_rows1, m->thread_tmp[0]);
+        tf_qmatvec(dst2, mat2, x, n_rows2, m->thread_tmp[0]);
+        return;
+    }
+    tf_matvec_fused2_diff_task *tasks = (tf_matvec_fused2_diff_task *)alloca(
+        nt * sizeof(tf_matvec_fused2_diff_task));
+    for (int t = 0; t < nt; t++) {
+        int rs1, re1, rs2, re2;
+        tf_row_split8(n_rows1, nt, t, &rs1, &re1);
+        tf_row_split8(n_rows2, nt, t, &rs2, &re2);
+        tasks[t] = (tf_matvec_fused2_diff_task){
+            dst1, mat1, dst2, mat2, x, rs1, re1, rs2, re2
+        };
+    }
+    tf_pool_dispatch(m, tf_qmatvec_fused2_diff_worker, tasks,
+                      sizeof(tf_matvec_fused2_diff_task));
 }
 
 static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_rows, float *tmp) {
@@ -1387,13 +1486,10 @@ static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat
         return;
     }
     tf_matvec_task *tasks = (tf_matvec_task *)alloca(n_threads * sizeof(tf_matvec_task));
-    int rows_per = n_rows / n_threads;
-    int extra = n_rows % n_threads;
-    int offset = 0;
     for (int t = 0; t < n_threads; t++) {
-        int count = rows_per + (t < extra ? 1 : 0);
-        tasks[t] = (tf_matvec_task){dst, mat, x, offset, offset + count, m->thread_tmp[t]};
-        offset += count;
+        int rs, re;
+        tf_row_split8(n_rows, n_threads, t, &rs, &re);
+        tasks[t] = (tf_matvec_task){dst, mat, x, rs, re, m->thread_tmp[t]};
     }
     tf_pool_dispatch(m, tf_qmatvec_worker, tasks, sizeof(tf_matvec_task));
 }
@@ -2340,7 +2436,24 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             int conv_state_size = (m->ssm_conv_kernel - 1) * m->ssm_qkv_dim;
             m->conv_state[l] = (float *)calloc(conv_state_size, sizeof(float));
             int rec_state_size = m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state;
-            m->recurrent_state[l] = (float *)calloc(rec_state_size, sizeof(float));
+            /* mmap-anon (instead of calloc) so the state pages stay
+             * uncommitted until the recurrence worker touches them. With
+             * cmg_pin + tf_ssm_head_range, the first thread to read each
+             * head's 64 KB column is pinned to that head's owner CMG, so
+             * the page lands in that CMG's HBM (lazy first-touch). 4 KB
+             * pages — MADV_NOHUGEPAGE keeps THP from coalescing several
+             * heads' pages back onto a single CMG. */
+            size_t rec_state_bytes = (size_t)rec_state_size * sizeof(float);
+            void *rs = mmap(NULL, rec_state_bytes, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (rs == MAP_FAILED) {
+                m->recurrent_state[l] = (float *)calloc(rec_state_size, sizeof(float));
+            } else {
+#ifdef MADV_NOHUGEPAGE
+                madvise(rs, rec_state_bytes, MADV_NOHUGEPAGE);
+#endif
+                m->recurrent_state[l] = (float *)rs;
+            }
             n_ssm++;
         }
         fprintf(stderr, "transformer: SSM state: %d layers, conv=[%d×%d], recurrent=[%d×%d×%d]\n",
@@ -2475,7 +2588,13 @@ void transformer_free(transformer_model *model) {
     free(model->conv_state_pos);
     free(model->conv_w_trans);
     if (model->recurrent_state) {
-        for (int l = 0; l < model->n_layers; l++) free(model->recurrent_state[l]);
+        size_t rec_state_bytes = (size_t)model->ssm_dt_rank *
+                                 model->ssm_d_state * model->ssm_d_state *
+                                 sizeof(float);
+        for (int l = 0; l < model->n_layers; l++) {
+            if (model->recurrent_state[l])
+                munmap(model->recurrent_state[l], rec_state_bytes);
+        }
         free(model->recurrent_state);
     }
     free(model->x);
@@ -3518,9 +3637,11 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     float *out_buf = m->ffn_buf3;  /* [d_inner] */
     float *Q_exp   = m->q;         /* [dt_rank * d_state] */
 
-    /* 1. Linear projections from xb (pool-based for large projections) */
-    tf_qmatvec_pool(m, qkv_buf, &layer->ssm_qkv, m->xb, qkv_dim);
-    tf_qmatvec_pool(m, z_buf, &layer->ssm_gate, m->xb, d_inner);
+    /* 1. Linear projections from xb (fused: qkv + gate share input xb) */
+    tf_qmatvec_fused2_diff_pool(m,
+        qkv_buf, &layer->ssm_qkv,  qkv_dim,
+        z_buf,   &layer->ssm_gate, d_inner,
+        m->xb);
 
     float alpha[64], beta_arr[64]; /* dt_rank <= 64 (48 for Qwen3.5-27B) */
     tf_qmatvec(alpha, &layer->ssm_alpha, m->xb, dt_rank, m->matvec_tmp);
@@ -3671,18 +3792,18 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     float scale = 1.0f / sqrtf((float)d_state);
     float *rec_state = m->recurrent_state[layer_idx]; /* [dt_rank * d_state * d_state] */
 
-    if (m->n_threads > 1 && dt_rank >= m->n_threads && m->pool_alive) {
+    if (m->n_threads > 1 && m->pool_alive) {
         int nt = m->n_threads;
+        int ncmgs = m->cmg_pin ? m->cmg_pin_ncmgs : 1;
         tf_ssm_recurrence_task *rtasks = (tf_ssm_recurrence_task *)alloca(
             nt * sizeof(tf_ssm_recurrence_task));
-        int heads_per = dt_rank / nt, heads_extra = dt_rank % nt, hoff = 0;
         for (int t = 0; t < nt; t++) {
-            int hcount = heads_per + (t < heads_extra ? 1 : 0);
+            int hs, he;
+            tf_ssm_head_range(dt_rank, nt, ncmgs, t, &hs, &he);
             rtasks[t] = (tf_ssm_recurrence_task){
                 rec_state, Q_exp, K_exp, V_raw, out_buf,
-                alpha, beta_arr, hoff, hoff + hcount, d_state, scale
+                alpha, beta_arr, hs, he, d_state, scale
             };
-            hoff += hcount;
         }
         tf_pool_dispatch(m, tf_ssm_recurrence_worker, rtasks, sizeof(tf_ssm_recurrence_task));
     } else {
