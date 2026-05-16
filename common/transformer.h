@@ -126,7 +126,9 @@ typedef struct {
     float **conv_state;      /* [n_layers] -> [conv_kernel-1, qkv_dim] per SSM layer */
     int *conv_state_pos;     /* [n_layers] circular buffer write position per SSM layer */
     float **recurrent_state; /* [n_layers] -> [n_v_heads, d_state, d_state] per SSM layer */
-    float *conv_w_trans;     /* pre-allocated [conv_k * qkv_dim] for batch-dequant conv weights */
+    float **conv_w_trans;    /* [n_layers] -> [conv_k * qkv_dim] pre-dequantised + transposed
+                              * conv weights, built once at load. Weights are constant; the
+                              * old per-token batch-dequant cost ~184K iters/token on 0.8B. */
     int n_deepstack;       /* number of deepstack layers (Qwen3-VL) */
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
     int ds_embd_stride;    /* total embedding dim = proj_dim * (1 + n_deepstack) */
@@ -2430,11 +2432,33 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         m->conv_state = (float **)calloc(nl, sizeof(float *));
         m->conv_state_pos = (int *)calloc(nl, sizeof(int));
         m->recurrent_state = (float **)calloc(nl, sizeof(float *));
+        m->conv_w_trans = (float **)calloc(nl, sizeof(float *));
+        int conv_k = m->ssm_conv_kernel;
+        int qkv_dim = m->ssm_qkv_dim;
+        size_t conv_w_bytes = (size_t)conv_k * qkv_dim * sizeof(float);
         int n_ssm = 0;
         for (int l = 0; l < m->n_layers; l++) {
             if (!m->layers[l].is_ssm) continue;
             int conv_state_size = (m->ssm_conv_kernel - 1) * m->ssm_qkv_dim;
             m->conv_state[l] = (float *)calloc(conv_state_size, sizeof(float));
+
+            /* Pre-dequant + transpose the conv1d weights into [conv_k][qkv_dim]
+             * layout the inner conv loop wants. Weights are constant, so the
+             * old per-token path (~184K dequant_row calls/token on 0.8B) was
+             * pure waste. ~720 KB/layer × n_ssm_layers — fits cache for 0.8B. */
+            float *cw = (float *)aligned_alloc(64, conv_w_bytes);
+            if (cw) {
+                qtensor *cmat = &m->layers[l].ssm_conv1d;
+                size_t crb = tf_row_bytes(cmat->type, cmat->n_cols);
+                const uint8_t *cbase = (const uint8_t *)cmat->data;
+                float wb[8]; /* conv_k <= 8 */
+                for (int j = 0; j < qkv_dim; j++) {
+                    dequant_row(cmat->type, cbase + j * crb, wb, conv_k);
+                    for (int f = 0; f < conv_k; f++)
+                        cw[f * qkv_dim + j] = wb[f];
+                }
+            }
+            m->conv_w_trans[l] = cw;
             int rec_state_size = m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state;
             /* mmap-anon (instead of calloc) so the state pages stay
              * uncommitted until the recurrence worker touches them. With
@@ -2459,7 +2483,6 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         fprintf(stderr, "transformer: SSM state: %d layers, conv=[%d×%d], recurrent=[%d×%d×%d]\n",
                 n_ssm, m->ssm_conv_kernel - 1, m->ssm_qkv_dim,
                 m->ssm_dt_rank, m->ssm_d_state, m->ssm_d_state);
-        m->conv_w_trans = (float *)malloc((size_t)m->ssm_conv_kernel * m->ssm_qkv_dim * sizeof(float));
     } else {
         m->conv_w_trans = NULL;
     }
@@ -2586,7 +2609,10 @@ void transformer_free(transformer_model *model) {
         free(model->conv_state);
     }
     free(model->conv_state_pos);
-    free(model->conv_w_trans);
+    if (model->conv_w_trans) {
+        for (int l = 0; l < model->n_layers; l++) free(model->conv_w_trans[l]);
+        free(model->conv_w_trans);
+    }
     if (model->recurrent_state) {
         size_t rec_state_bytes = (size_t)model->ssm_dt_rank *
                                  model->ssm_d_state * model->ssm_d_state *
@@ -3687,18 +3713,9 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         /* Use K_exp temporarily for conv output (17408 >= 10240) */
         float *conv_out = K_exp;
 
-        /* Batch-dequant all conv weights into transposed layout [conv_k][qkv_dim] */
-        float *w_trans = m->conv_w_trans;
-        {
-            size_t crb = tf_row_bytes(layer->ssm_conv1d.type, layer->ssm_conv1d.n_cols);
-            const uint8_t *cbase = (const uint8_t *)layer->ssm_conv1d.data;
-            for (int j = 0; j < qkv_dim; j++) {
-                float wb[8];
-                dequant_row(layer->ssm_conv1d.type, cbase + j * crb, wb, conv_k);
-                for (int f = 0; f < conv_k; f++)
-                    w_trans[f * qkv_dim + j] = wb[f];
-            }
-        }
+        /* Conv weights are pre-dequantised + transposed once at load time
+         * into m->conv_w_trans[layer_idx] (see transformer_load). */
+        float *w_trans = m->conv_w_trans[layer_idx];
 
         /* Precompute circular buffer row offsets to avoid modulo in inner loop */
         int row_off[8]; /* conv_k <= 8, n_hist = conv_k-1 */
