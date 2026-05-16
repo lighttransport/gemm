@@ -209,7 +209,35 @@ hipBLASLt GEMMs (the real matmul) are now the dominant single contributor at
 
 ### Tier 3 — small (<3%)
 
-**D. hipBLASLt algo pinning** — GEMM already at 72% of WMMA peak; algo pinning might extract another 5–10% on each shape → **0.5–1% prefill saved.**
+**D. hipBLASLt algo pinning (❌ TRIED — blocked by gfx1201 driver bug)** — GEMM already at 72% of WMMA peak; algo pinning might extract another 5–10% on each shape → **0.5–1% prefill saved.**
+
+Attempted 2026-05-17: implemented a per-plan top-N algo sweep in
+`mm_blaslt_bridge.cpp` (timed each candidate algo on dummy buffers with
+`hipDeviceSynchronize` between, picked the fastest), gated by an
+`mm_blaslt_set_sweep()` API and scoped to fire only around the init-time
+pre-warm (so user-facing forwards never trigger sweep-driven plan builds).
+While debugging, also fixed two real pre-warm bugs (used `layers[0]`
+which is SSM with NULL attn weights on hybrid models; only handled
+pre-converted F16 weights). With those fixes the pre-warm fired real-shape
+GEMMs through the sweep — and **crashed mid-pre-warm** on the 27B with
+the exact failure mode the bridge author had warned about in the existing
+code comment: "back-to-back matmul calls without intermediate work
+segfault inside hipBLASLt's matmul setup". Full `hipDeviceSynchronize`
+between candidates did not help.
+
+All sweep-related changes reverted (`hip_llm_runner.c`,
+`mm_blaslt_bridge.cpp`, `mm_blaslt_bridge.h`) to the post-aux-batch
+commit. Verified 27B regression: L=256 prefill = 1.69 ms/tok (matches
+pre-attempt). The 5% gain isn't currently reachable without:
+- an offline sweep tool that runs each shape in a fresh process and
+  hardcodes the best algo_index per (M, N, K) into the bridge, or
+- a patched hipBLASLt build, or
+- a non-hipBLASLt GEMM path (custom WMMA tiles like `rdna4/vlm/mm0_*`).
+
+None of those are worth the engineering effort at this point — hipBLASLt
+heuristic already gets us to 72% of WMMA peak, and the model's
+intrinsic sequentiality (DeltaNet recurrence + dequant + per-row attn
+fallback for head_dim=256) bounds further total-time gains.
 
 **Faster IQ3_XXS dequant** (currently 25% of DRAM peak due to LUT indexing) — close to L1 cache hit if the grid/sign tables stay hot. **1–2% prefill saved.**
 
