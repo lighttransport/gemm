@@ -210,6 +210,14 @@ extern void micro_kernel_bf16B_8x3_unroll4(
     int64_t unused,
     int64_t ldc_bytes);
 
+extern void micro_kernel_bf16B_8x3_unroll4_pv(
+    const float    *A_packed,
+    const uint16_t *B_packed_pv,
+    float          *C,
+    int64_t K,
+    int64_t unused,
+    int64_t ldc_bytes);
+
 size_t packed_B_bf16_size(int K, int N) {
     int N_blocks  = (N + NR - 1) / NR;
     int K_rounded = ((K + 3) / 4) * 4;
@@ -308,6 +316,221 @@ void gemm_bf16_BTP(int M, int K, int N,
     } /* omp parallel */
 
     /* A_packed is a persistent grow-only scratch — do not free here. */
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Pair-interleaved variant (uses micro_kernel_bf16B_8x3_unroll4_pv).
+ *
+ * Same MR×NR microtile; B repacked so two consecutive K-rows are
+ * interleaved at halfword granularity within each 16-col chunk. The
+ * asm kernel reads BF16 directly into the upper 16 bits of FP32 lanes
+ * via ld1h{.h} + p_odd — no LSL on the FLA pipe.
+ *
+ * The pv allocation reserves a 64-byte prefix so the asm kernel's
+ * "base - 2 bytes" k_even load on the first chunk of every N-block
+ * dereferences valid memory. The caller passes the allocation base;
+ * we add PV_PREFIX_BYTES internally.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+#define PV_PREFIX_BYTES 64
+
+size_t packed_B_bf16_pv_size(int K, int N) {
+    return packed_B_bf16_size(K, N) + PV_PREFIX_BYTES;
+}
+
+/* Pair-interleaved BTP. Per N-block, K processed in pairs of 2.
+ * Per K-pair: 3 chunks × 32 HW. Within chunk c (cols 16c..16c+15):
+ *   HW[2i + 0] = BT[k_even][16c + i]
+ *   HW[2i + 1] = BT[k_odd ][16c + i]
+ * BTP_alloc is the allocation base; the layout starts at
+ * BTP_alloc + PV_PREFIX_BYTES. Bytes 0..PV_PREFIX_BYTES-1 are zeroed. */
+void pack_B_bf16_pv(int K, int N,
+                    const uint16_t *BT, int ldb,
+                    uint16_t *BTP_alloc)
+{
+    memset(BTP_alloc, 0, PV_PREFIX_BYTES);
+    uint16_t *BTP = (uint16_t *)((uint8_t *)BTP_alloc + PV_PREFIX_BYTES);
+
+    const int N_blocks  = (N + NR - 1) / NR;
+    const int K_rounded = ((K + 3) / 4) * 4;
+    for (int nb = 0; nb < N_blocks; nb++) {
+        int n_start = nb * NR;
+        int n_count = (n_start + NR <= N) ? NR : N - n_start;
+        uint16_t *dst = BTP + (size_t)nb * K_rounded * NR;
+        for (int kp = 0; kp < K_rounded; kp += 2) {
+            int k0 = kp, k1 = kp + 1;
+            for (int c = 0; c < 3; c++) {
+                uint16_t *chunk = dst + (size_t)(kp / 2) * (NR * 2) + c * 32;
+                for (int i = 0; i < 16; i++) {
+                    int col = c * 16 + i;
+                    uint16_t v0 = 0, v1 = 0;
+                    if (k0 < K && col < n_count)
+                        v0 = BT[(size_t)k0 * ldb + n_start + col];
+                    if (k1 < K && col < n_count)
+                        v1 = BT[(size_t)k1 * ldb + n_start + col];
+                    chunk[2 * i + 0] = v0;
+                    chunk[2 * i + 1] = v1;
+                }
+            }
+        }
+    }
+}
+
+void gemm_bf16_BTP_pv(int M, int K, int N,
+                      const float    *A,    int lda,
+                      const uint16_t *BTP_alloc,
+                      float          *C,    int ldc)
+{
+    const uint16_t *BTP =
+        (const uint16_t *)((const uint8_t *)BTP_alloc + PV_PREFIX_BYTES);
+
+    const int K_rounded = ((K + 3) / 4) * 4;
+    const int M_blocks  = (M + MR - 1) / MR;
+    const int N_blocks  = (N + NR - 1) / NR;
+
+    size_t A_packed_bytes = packed_A_size(M, K);
+    float *A_packed = pack_A_get_scratch(A_packed_bytes);
+    if (!A_packed) {
+        fprintf(stderr, "gemm_bf16_BTP_pv: failed to alloc A_packed (%zu bytes)\n",
+                A_packed_bytes);
+        return;
+    }
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+#ifdef _OPENMP
+        #pragma omp for schedule(static) nowait
+#endif
+        for (int mb = 0; mb < M_blocks; mb++)
+            pack_A_fp32_block(mb, M, K, K_rounded, A, lda, A_packed);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int m = 0; m < M; m++) memset(C + (size_t)m * ldc, 0, N * sizeof(float));
+
+#ifdef _OPENMP
+        #pragma omp for collapse(2) schedule(static)
+#endif
+        for (int mb = 0; mb < M_blocks; mb++) {
+            for (int nb = 0; nb < N_blocks; nb++) {
+                int m_start = mb * MR;
+                int n_start = nb * NR;
+                int m_count = (m_start + MR <= M) ? MR : M - m_start;
+                int n_count = (n_start + NR <= N) ? NR : N - n_start;
+
+                const float    *A_tile = A_packed + (size_t)mb * K_rounded * MR;
+                const uint16_t *B_tile = BTP      + (size_t)nb * K_rounded * NR;
+
+                if (m_count == MR && n_count == NR) {
+                    float *C_tile = C + (size_t)m_start * ldc + n_start;
+                    micro_kernel_bf16B_8x3_unroll4_pv(
+                        A_tile, B_tile, C_tile,
+                        (int64_t)K_rounded, 0,
+                        (int64_t)ldc * sizeof(float));
+                } else {
+                    float local_buf[MR * NR] __attribute__((aligned(64)));
+                    micro_kernel_bf16B_8x3_unroll4_pv(
+                        A_tile, B_tile, local_buf,
+                        (int64_t)K_rounded, 0,
+                        (int64_t)NR * sizeof(float));
+                    for (int m = 0; m < m_count; m++) {
+                        for (int n = 0; n < n_count; n++) {
+                            C[(size_t)(m_start + m) * ldc + n_start + n] =
+                                local_buf[m * NR + n];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void gemm_bf16_BTP_cmg_pv(int M, int K, int N,
+                          const float    *A, int lda,
+                          const uint16_t * const BTP_alloc_repl[],
+                          int n_cmgs,
+                          float          *C, int ldc)
+{
+    if (n_cmgs <= 0 || !BTP_alloc_repl || !BTP_alloc_repl[0]) {
+        gemm_bf16_BTP_pv(M, K, N, A, lda,
+                         BTP_alloc_repl ? BTP_alloc_repl[0] : NULL, C, ldc);
+        return;
+    }
+
+    const int K_rounded = ((K + 3) / 4) * 4;
+    const int M_blocks  = (M + MR - 1) / MR;
+    const int N_blocks  = (N + NR - 1) / NR;
+
+    size_t A_packed_bytes = packed_A_size(M, K);
+    float *A_packed = pack_A_get_scratch(A_packed_bytes);
+    if (!A_packed) {
+        fprintf(stderr, "gemm_bf16_BTP_cmg_pv: failed to alloc A_packed (%zu bytes)\n",
+                A_packed_bytes);
+        return;
+    }
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+#ifdef _OPENMP
+        int tid  = omp_get_thread_num();
+        int nthr = omp_get_num_threads();
+#else
+        int tid = 0, nthr = 1;
+#endif
+        int my_cmg = (nthr > 0) ? (tid * n_cmgs / nthr) : 0;
+        if (my_cmg >= n_cmgs) my_cmg = n_cmgs - 1;
+        const uint16_t *alloc_local = BTP_alloc_repl[my_cmg];
+        if (!alloc_local) alloc_local = BTP_alloc_repl[0];
+        const uint16_t *BTP_local =
+            (const uint16_t *)((const uint8_t *)alloc_local + PV_PREFIX_BYTES);
+
+#ifdef _OPENMP
+        #pragma omp for schedule(static) nowait
+#endif
+        for (int mb = 0; mb < M_blocks; mb++)
+            pack_A_fp32_block(mb, M, K, K_rounded, A, lda, A_packed);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int m = 0; m < M; m++) memset(C + (size_t)m * ldc, 0, N * sizeof(float));
+
+#ifdef _OPENMP
+        #pragma omp for collapse(2) schedule(static)
+#endif
+        for (int mb = 0; mb < M_blocks; mb++) {
+            for (int nb = 0; nb < N_blocks; nb++) {
+                int m_start = mb * MR;
+                int n_start = nb * NR;
+                int m_count = (m_start + MR <= M) ? MR : M - m_start;
+                int n_count = (n_start + NR <= N) ? NR : N - n_start;
+
+                const float    *A_tile = A_packed + (size_t)mb * K_rounded * MR;
+                const uint16_t *B_tile = BTP_local + (size_t)nb * K_rounded * NR;
+
+                if (m_count == MR && n_count == NR) {
+                    float *C_tile = C + (size_t)m_start * ldc + n_start;
+                    micro_kernel_bf16B_8x3_unroll4_pv(
+                        A_tile, B_tile, C_tile,
+                        (int64_t)K_rounded, 0,
+                        (int64_t)ldc * sizeof(float));
+                } else {
+                    float local_buf[MR * NR] __attribute__((aligned(64)));
+                    micro_kernel_bf16B_8x3_unroll4_pv(
+                        A_tile, B_tile, local_buf,
+                        (int64_t)K_rounded, 0,
+                        (int64_t)NR * sizeof(float));
+                    for (int m = 0; m < m_count; m++) {
+                        for (int n = 0; n < n_count; n++) {
+                            C[(size_t)(m_start + m) * ldc + n_start + n] =
+                                local_buf[m * NR + n];
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /* CMG-aware twin of gemm_bf16_BTP (see gemm_fp16_BTP_cmg comment). */

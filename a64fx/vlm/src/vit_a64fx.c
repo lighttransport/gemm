@@ -194,26 +194,51 @@ struct vit_a64fx_cache {
     int n_cmgs;
 };
 
+/* PV (pair-interleaved) packing toggle. Default ON (huge win in asm
+ * microkernel; bit-identical output). Set VIT_BF16_NO_PV=1 to fall back. */
+static int vit_bf16_pv_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VIT_BF16_NO_PV");
+        cached = (e && e[0] && e[0] != '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 /* Pre-pack FP32 BT [K,N] row-major into BTP bf16 form (packed for asm kernel).
- * Returns a buffer of packed_B_bf16_size(K,N) bytes; frees the FP32 source. */
+ * Returns a buffer of packed_B_bf16_size(K,N) or packed_B_bf16_pv_size(K,N)
+ * bytes depending on the PV toggle; frees the FP32 source. */
 static uint16_t *take_bf16_packed(float **pbt, int K, int N) {
     if (!pbt || !*pbt) return NULL;
     const int NR_ = NR;
     const int N_blocks  = (N + NR_ - 1) / NR_;
     const int K_rounded = ((K + 3) / 4) * 4;
-    size_t bytes = (size_t)N_blocks * K_rounded * NR_ * sizeof(uint16_t);
+    const int pv = vit_bf16_pv_enabled();
+    size_t bytes = pv ? packed_B_bf16_pv_size(K, N)
+                      : (size_t)N_blocks * K_rounded * NR_ * sizeof(uint16_t);
     uint16_t *btp = (uint16_t *)aligned_alloc(64, bytes);
     if (!btp) { fprintf(stderr, "vit_a64fx: OOM packed bf16 alloc (%zu)\n", bytes); exit(1); }
-    memset(btp, 0, bytes); /* zero-pad NR-tail and K-tail */
+    memset(btp, 0, bytes); /* zero-pad NR-tail, K-tail, and pv prefix */
     const float *bt = *pbt;
-    for (int nb = 0; nb < N_blocks; nb++) {
-        int n_start = nb * NR_;
-        int n_count = (n_start + NR_ <= N) ? NR_ : N - n_start;
-        uint16_t *dst = btp + (size_t)nb * K_rounded * NR_;
-        for (int k = 0; k < K; k++) {
-            f32_to_bf16_buf(bt + (size_t)k * N + n_start,
-                            dst + (size_t)k * NR_,
-                            (size_t)n_count);
+
+    if (pv) {
+        /* Convert source FP32 → BF16 row-major, then call pack_B_bf16_pv. */
+        size_t kn = (size_t)K * N;
+        uint16_t *bt_bf = (uint16_t *)aligned_alloc(64, kn * sizeof(uint16_t));
+        if (!bt_bf) { fprintf(stderr, "vit_a64fx: OOM bf16 temp\n"); exit(1); }
+        f32_to_bf16_buf(bt, bt_bf, kn);
+        pack_B_bf16_pv(K, N, bt_bf, N, btp);
+        free(bt_bf);
+    } else {
+        for (int nb = 0; nb < N_blocks; nb++) {
+            int n_start = nb * NR_;
+            int n_count = (n_start + NR_ <= N) ? NR_ : N - n_start;
+            uint16_t *dst = btp + (size_t)nb * K_rounded * NR_;
+            for (int k = 0; k < K; k++) {
+                f32_to_bf16_buf(bt + (size_t)k * N + n_start,
+                                dst + (size_t)k * NR_,
+                                (size_t)n_count);
+            }
         }
     }
     free(*pbt);
@@ -569,12 +594,15 @@ int vit_a64fx_cache_replicate(struct vit_a64fx_cache *c, int n_cmgs) {
         mm0_bytes = fc1_bytes;
         mm2_bytes = fc2_bytes;
     } else {
-        qkv_bytes = packed_B_bf16_size(dim,     3 * dim);
-        o_bytes   = packed_B_bf16_size(dim,     dim);
-        u_bytes   = packed_B_bf16_size(dim,     ffn_dim);
-        d_bytes   = packed_B_bf16_size(ffn_dim, dim);
-        fc1_bytes = packed_B_bf16_size(merged,  merged);
-        fc2_bytes = packed_B_bf16_size(merged,  proj);
+        size_t (*sz)(int,int) = vit_bf16_pv_enabled()
+                                 ? packed_B_bf16_pv_size
+                                 : packed_B_bf16_size;
+        qkv_bytes = sz(dim,     3 * dim);
+        o_bytes   = sz(dim,     dim);
+        u_bytes   = sz(dim,     ffn_dim);
+        d_bytes   = sz(ffn_dim, dim);
+        fc1_bytes = sz(merged,  merged);
+        fc2_bytes = sz(merged,  proj);
         mm0_bytes = fc1_bytes;
         mm2_bytes = fc2_bytes;
     }
@@ -865,10 +893,17 @@ static void vit_gemm_bias_BT_bf16_mt(vlm_pool *pool,
                                      const float    *X,
                                      int n_tokens, int n_out, int n_in)
 {
-    gemm_bf16_BTP(n_tokens, n_in, n_out,
-                  X, n_in,
-                  BTP_bf16,
-                  Y, n_out);
+    if (vit_bf16_pv_enabled()) {
+        gemm_bf16_BTP_pv(n_tokens, n_in, n_out,
+                         X, n_in,
+                         BTP_bf16,
+                         Y, n_out);
+    } else {
+        gemm_bf16_BTP(n_tokens, n_in, n_out,
+                      X, n_in,
+                      BTP_bf16,
+                      Y, n_out);
+    }
     add_bias_mt(pool, Y, bias, n_tokens, n_out);
 }
 
@@ -883,10 +918,17 @@ static void vit_gemm_bias_BT_bf16_cmg_mt(vlm_pool *pool,
                                          int n_tokens, int n_out, int n_in)
 {
     /* btp_repl::p has type uint16_t *p[CMG_MAX]; pass as const-pointer array. */
-    gemm_bf16_BTP_cmg(n_tokens, n_in, n_out,
-                      X, n_in,
-                      (const uint16_t * const *)r->p, n_cmgs,
-                      Y, n_out);
+    if (vit_bf16_pv_enabled()) {
+        gemm_bf16_BTP_cmg_pv(n_tokens, n_in, n_out,
+                             X, n_in,
+                             (const uint16_t * const *)r->p, n_cmgs,
+                             Y, n_out);
+    } else {
+        gemm_bf16_BTP_cmg(n_tokens, n_in, n_out,
+                          X, n_in,
+                          (const uint16_t * const *)r->p, n_cmgs,
+                          Y, n_out);
+    }
     add_bias_mt(pool, Y, bias, n_tokens, n_out);
 }
 
