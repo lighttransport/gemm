@@ -50,4 +50,32 @@ void gemm_bf16_BTP_cmg(int M, int K, int N,
                        int n_cmgs,
                        float          *C, int ldc);
 
+/* ── Pair-interleaved BF16 (PV) path ──────────────────────────────────────
+ * Two consecutive K-rows interleaved at halfword granularity so a
+ * predicated ld1h{.h} places BF16 directly into the upper 16 bits of FP32
+ * lanes — no LSL on the FLA pipe. Empirically +80–270% over the LSL asm
+ * kernel on representative VIT shapes (1T..48T), bit-identical output.
+ *
+ * Allocation MUST be packed_B_bf16_pv_size(K,N) bytes; this includes a
+ * 64-byte prefix that the asm kernel's "base - 2 bytes" k_even load
+ * dereferences for chunk 0 of every N-block. pack_B_bf16_pv writes the
+ * full allocation (prefix is zero); gemm_bf16_BTP_pv accepts the same
+ * allocation base.
+ */
+size_t packed_B_bf16_pv_size(int K, int N);
+void   pack_B_bf16_pv(int K, int N,
+                      const uint16_t *BT_bf16, int ldb,
+                      uint16_t *BTP_alloc);
+
+void gemm_bf16_BTP_pv(int M, int K, int N,
+                      const float    *A,         int lda,
+                      const uint16_t *BTP_alloc,            /* prepacked */
+                      float          *C,         int ldc);
+
+void gemm_bf16_BTP_cmg_pv(int M, int K, int N,
+                          const float    *A, int lda,
+                          const uint16_t * const BTP_alloc_repl[/*n_cmgs*/],
+                          int n_cmgs,
+                          float          *C, int ldc);
+
 #endif /* BF16_GEMM_H */
