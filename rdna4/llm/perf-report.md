@@ -80,7 +80,7 @@ hipBLASLt math itself is only ~10% — the matmuls are no longer the bottleneck.
 Ranked by potential impact on 27B Qwen3.6 prefill (the model that dominates
 the e2e VLM workload), with my honest estimate of upside and effort.
 
-### A. Faster / batched `deltanet_step` (biggest win available)
+### A. Faster / batched `deltanet_step` (✅ LANDED)
 **Current**: 63% of GPU time, 92 µs/call × 37056 calls. The kernel uses one
 thread per row of a d_state × d_state state matrix, doing 3 sequential dot
 products of d_state f32 elements. On compute it's nowhere near the hardware
@@ -100,6 +100,32 @@ Three angles:
    numerics.
 
 **Effort**: 1–2 days for #1. Highest payoff.
+
+**Landed (2026-05-16)**: new `deltanet_step_batch_f32` kernel fuses M
+sequential token steps in one launch. Each thread loads its row of the
+state matrix into registers ONCE at start, mutates it through M iterations,
+writes it back ONCE at end. K and Q broadcast through LDS per step (small).
+Wired into the SSM batched layer body as a single launch replacing the
+per-row deltanet loop (conv1d / l2_norm / repeat_tile still per-row;
+gated_rmsnorm_silu still per-row — those don't have the same state R/W
+amplification because their state is small).
+
+Measured (27B IQ3_XXS, RX 9070 XT, warm):
+
+| L | before Opp A | after Opp A | Opp-A speedup |
+|---:|---:|---:|---:|
+| 64 | 10.7 ms/tok | **8.6 ms/tok** | 1.24× |
+| 256 | 7.1 ms/tok | **5.0 ms/tok** | 1.42× |
+| 1024 | 6.9 ms/tok | **4.8 ms/tok** | 1.44× |
+
+E2e VLM Brooklyn Bridge: 24.1 s → **18.4 s (1.31×)**.
+
+rocprofv3 confirms: total GPU time 5402 ms → 3556 ms (34% reduction).
+`deltanet_step_batch_f32` is still the top contributor at 52% (1846 ms /
+144 calls = 12.8 ms/call vs old 92 µs × 48 calls/forward × ...), but with
+46% less time spent in deltanet overall. Further compression would need the
+per-thread loop vectorization (point #2 above) or LDS-resident state matrix
+sharing across threads.
 
 ### B. WMMA flash-attention kernel for `head_dim=256`
 **Current**: 16 gated-attn layers at head_dim=256 fall back to per-row
