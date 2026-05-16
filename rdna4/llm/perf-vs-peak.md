@@ -124,13 +124,42 @@ bench). Cumulative session-arc on Brooklyn Bridge: 187.6 s → 12.7 s = **14.8×
 2B F16 unchanged (head_dim=128 keeps original kernel). Correctness:
 `--compare-paths` argmax match on 27B (token 369).
 
-**A2. Vectorize the deltanet inner loop (float4 / SIMD) — currently 54% of 27B GPU time**
+**A2. Vectorize the deltanet inner loop (✅ LANDED — 2.12× on its own)**
 
 The fused deltanet kernel (Opp A) is now compute-bound by 4 × d_state = 512 sequential f32 ops per thread per token. Loading 4 f32 at a time via `float4` (or pairing with HIP's vectorized intrinsics) would let SIMD lanes do 4 ops per cycle instead of 1 for the state row scans (decay multiply, sk dot, update, o dot).
 
 Theoretical headroom: ideal 4× speedup on the inner loops → deltanet drops from 53.7% → ~13% → **~40% of total prefill saved**. In practice will be 2–3× (register pressure / occupancy will limit) → **20–30% of prefill saved** → 27B prefill **4.8 → ~3.4–3.8 ms/tok**.
 
 **Effort**: 1–2 days; some risk in getting the float4 load/store layout right; need to keep the per-step LDS K/Q broadcast vectorized too.
+
+**Landed (2026-05-16)**: in-place rewrite of `deltanet_step_batch_f32`.
+Two changes: (1) collapse the four serial loops (decay → sk-dot → update →
+o-dot) into two passes — pass 1 computes `sk = decay * sum(S * sK)` (decay
+factored out of the sum so pass 1 doesn't touch S_row); pass 2 fuses
+`S_new = S*decay + delta*sK` with the o-dot in one read+write per element.
+(2) Each dot product uses **4 unrolled accumulators** so the SIMD lane can
+issue 4 FMAs back-to-back instead of being bottlenecked by the ~4-cycle FMA
+latency on a single accumulator. Inner loops unrolled 8× via `#pragma`.
+
+Measured (27B IQ3_XXS hybrid, RX 9070 XT, warm):
+
+| L | post-B | post-A2 | A2 speedup |
+|---:|---:|---:|---:|
+| 64  | 8.43 ms/tok | **6.25 ms/tok** | 1.35× |
+| 256 | 4.71 ms/tok | **2.60 ms/tok** | 1.81× |
+| 1024| 4.03 ms/tok | **1.90 ms/tok** | **2.12×** |
+
+E2e VLM Brooklyn Bridge: 12.7 s → **6.5 s** = **1.95×** from A2. Cumulative
+session arc: **187.6 s → 6.5 s = 28.8×**.
+
+rocprofv3 (L=1024, GPU 5220 ms total):
+- deltanet_step_batch: 7630 ms → **791 ms** (**9.6× on the kernel itself**,
+  53.7% → 15.2% of GPU time)
+- hipBLASLt GEMMs are now the top contributor at 22.5% (the real matmul work)
+- Per-row SSM aux ops collectively ~40% (l2_norm 13.9%, repeat_tile 10.4%,
+  conv1d 8.5%, gated_rmsnorm 7.7%) — the **new** bottleneck class
+
+% of WMMA peak: 0.28/1.90 = **14.7%** (up from 5.8% before A2).
 
 ### Tier 2 — modest (3–10%)
 
