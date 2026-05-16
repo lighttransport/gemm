@@ -38,6 +38,99 @@
     } \
 } while(0)
 
+/* ---- Allocation helpers (rollback-friendly) ----
+ *
+ * CU_FREE / CU_CHECKED_ALLOC are for functions that allocate several
+ * temporaries and need to roll back on any failure. Pair with a `fail:`
+ * label that frees every locally-owned pointer (each pointer should be
+ * initialized to 0 at declaration so unconditional `CU_FREE` is safe).
+ *
+ *   CUdeviceptr a = 0, b = 0;
+ *   CU_CHECKED_ALLOC(a, n_bytes, "scratch_a", fail);
+ *   CU_CHECKED_ALLOC(b, n_bytes, "scratch_b", fail);
+ *   ...
+ *   return success;
+ *   fail:
+ *       CU_FREE(a); CU_FREE(b);
+ *       return error;
+ */
+
+#define CU_FREE(ptr) do { \
+    if ((ptr)) { cuMemFree((ptr)); (ptr) = 0; } \
+} while(0)
+
+#define CU_CHECKED_ALLOC(dst, bytes, label, fail_label) do { \
+    CUresult _ce = cuMemAlloc(&(dst), (size_t)(bytes)); \
+    if (_ce != CUDA_SUCCESS) { \
+        fprintf(stderr, "cuda: alloc failed for %s (%zu bytes, err=%d)\n", \
+                (label), (size_t)(bytes), (int)_ce); \
+        (dst) = 0; \
+        goto fail_label; \
+    } \
+} while(0)
+
+/* ---- Resizable device buffer slot ----
+ *
+ * Drop-in primitive for per-runner activation caches: keep an array of
+ * cu_buf_slot indexed by a runner-local enum, then call ensure() on each
+ * slot before use. Slots that need a larger capacity get freed and
+ * re-allocated; smaller requests hit the cached buffer.
+ *
+ * Zero-init is valid (`cu_buf_slot s = {0};`), so a runner allocated with
+ * calloc() needs no explicit init step.
+ */
+
+typedef struct {
+    CUdeviceptr ptr;
+    size_t      cap;
+} cu_buf_slot;
+
+/* Bytes that would be added if `bytes` is ensured. Useful for VRAM
+ * accounting before committing to a working-set allocation. */
+static inline size_t cu_buf_slot_growth(const cu_buf_slot *s, size_t bytes) {
+    return (s && bytes > s->cap) ? bytes - s->cap : 0;
+}
+
+/* Ensure slot holds at least `bytes`. Returns 0 on success, -1 on alloc
+ * failure (slot is cleared in that case). `bytes == 0` is a no-op. */
+static inline int cu_buf_slot_ensure(cu_buf_slot *s, size_t bytes, const char *label) {
+    if (!s || bytes == 0) return 0;
+    if (s->ptr && s->cap >= bytes) return 0;
+    if (s->ptr) { cuMemFree(s->ptr); s->ptr = 0; s->cap = 0; }
+    CUresult err = cuMemAlloc(&s->ptr, bytes);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda: cache alloc failed for %s (%zu bytes, err=%d)\n",
+                label ? label : "?", bytes, (int)err);
+        s->ptr = 0; s->cap = 0;
+        return -1;
+    }
+    s->cap = bytes;
+    return 0;
+}
+
+static inline void cu_buf_slot_free(cu_buf_slot *s) {
+    if (!s) return;
+    if (s->ptr) { cuMemFree(s->ptr); s->ptr = 0; }
+    s->cap = 0;
+}
+
+static inline void cu_buf_slots_free(cu_buf_slot *slots, int n) {
+    if (!slots) return;
+    for (int i = 0; i < n; i++) cu_buf_slot_free(&slots[i]);
+}
+
+/* Async zero of a device range on `stream`. Soft-failure: logs to stderr
+ * but does not return an error (matches the cuda_llm reset helper). */
+static inline void cu_async_zero(CUdeviceptr ptr, size_t bytes, CUstream stream,
+                                 const char *label) {
+    if (!ptr || bytes == 0) return;
+    CUresult err = cuMemsetD8Async(ptr, 0, bytes, stream);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda: async zero failed for %s (err=%d)\n",
+                label ? label : "?", (int)err);
+    }
+}
+
 /* ======================================================================== */
 #ifdef CUDA_RUNNER_COMMON_IMPLEMENTATION
 

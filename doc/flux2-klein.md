@@ -409,7 +409,7 @@ Prior MMA-baseline numbers (kept for reference): F16 0.114 / 0.227 / 0.924 s; BF
 | **Full pipeline (CUDA)** | Working | 256×256 "a red apple" correct |
 | **Full pipeline (HIP)** | Working | 256×256 end-to-end runs clean (DiT 1.86 s/step, VAE 0.32 s); visual parity pending real text-encoder weights on the test box |
 
-Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-stream blocks and the 20 single-stream blocks, and the VAE decode is fully GPU-accelerated including the mid-block attention. For A/B checks, the old double-stream CPU fallback can still be forced with `FLUX2_CPU_DBL_ATTN=1`. The old CPU-bridge VAE attention path is still available in the source (`flux2_vae_mid_attn_bridge`).
+Current CUDA scope: the full DiT path now runs on GPU across both the 5 double-stream blocks and the 20 single-stream blocks, and the VAE decode is fully GPU-accelerated including the mid-block attention. For A/B checks, the old double-stream CPU fallback can still be forced with `FLUX2_CPU_DBL_ATTN=1`, and the legacy DtoH/CPU/HtoD VAE mid-block attention bridge can be forced with `FLUX2_DEBUG_VAE_ATTN_BRIDGE=1` (`flux2_vae_mid_attn_bridge`).
 
 The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on RTX 5060 Ti was not a DiT math bug. It was VRAM exhaustion during DiT/VAE load while the GPU text encoder session was still resident. Allocation checks in `cuda_flux2_runner.h` now fail explicitly, and the generation path frees the GPU text encoder before loading DiT/VAE.
 
