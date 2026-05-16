@@ -4223,21 +4223,28 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
         return;
     }
 #endif
-    int rp = n_rows / nt, re = n_rows % nt;
-    int rs = tid * rp + (tid < re ? tid : re);
-    int rc = rp + (tid < re ? 1 : 0);
-    if (rc <= 0) return;
+    int rs, re_end;
+    /* BF16/F16 want 8-aligned row boundaries so every thread stays on the
+     * pv / 8-row fast path. q-types are agnostic — fall back to naive split. */
+    if (mat->type == GGML_TYPE_BF16 || mat->type == GGML_TYPE_F16) {
+        tf_row_split8(n_rows, nt, tid, &rs, &re_end);
+    } else {
+        int rp = n_rows / nt, re = n_rows % nt;
+        rs = tid * rp + (tid < re ? tid : re);
+        re_end = rs + rp + (tid < re ? 1 : 0);
+    }
+    if (re_end <= rs) return;
     int n_cols = mat->n_cols;
 
     if (mat->type == GGML_TYPE_BF16) {
         tf_matvec_bf16_rows_pv(dst, (const uint8_t *)mat->data,
                                 (size_t)n_cols * 2, mat->bf16_pv,
-                                x, n_cols, rs, rs + rc);
+                                x, n_cols, rs, re_end);
     } else if (mat->type == GGML_TYPE_F16) {
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data,
-                            (size_t)n_cols * 2, x, n_cols, rs, rs + rc);
+                            (size_t)n_cols * 2, x, n_cols, rs, re_end);
     } else {
-        tf_matvec_qtensor_rows(dst, mat, x, rs, rs + rc);
+        tf_matvec_qtensor_rows(dst, mat, x, rs, re_end);
     }
 }
 
