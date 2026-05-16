@@ -182,6 +182,7 @@ int main(int argc, char **argv) {
     int vit_threads = 0;
     int llm_threads = 1;
     int use_deepstack = 1;
+    int use_mmap_main = 0;
     unsigned seed   = (unsigned)time(NULL);
 
     /* Positionals: first .gguf = model, second .gguf = mmproj, first image = image */
@@ -205,6 +206,8 @@ int main(int argc, char **argv) {
             llm_threads = atoi(argv[++i]);
         } else if (!strcmp(a, "--no-deepstack")) {
             use_deepstack = 0;
+        } else if (!strcmp(a, "--mmap")) {
+            use_mmap_main = 1;
         } else if (!strcmp(a, "--seed") && i + 1 < argc) {
             seed = (unsigned)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
@@ -247,7 +250,11 @@ int main(int argc, char **argv) {
      * no thread scaling. See a64fx/doc / M9 investigation. */
     double t = mono_sec();
     fprintf(stderr, "[1/6] load main GGUF: %s\n", model_path);
-    gguf_context *gguf_main = gguf_open(model_path, 0);
+    /* --mmap forces use_mmap=1 (file-backed pages). Slower per matvec
+     * (4KB pages → dTLB thrashing on A64FX) but the only option when
+     * the weights exceed available anonymous RAM (e.g. 17GB BF16 9B
+     * model on 31GB node). */
+    gguf_context *gguf_main = gguf_open(model_path, use_mmap_main ? 1 : 0);
     if (!gguf_main) { fprintf(stderr, "failed to open main GGUF\n"); return 1; }
 
     bpe_vocab *vocab = bpe_vocab_load(gguf_main);
