@@ -129,6 +129,8 @@ typedef struct {
     float **conv_w_trans;    /* [n_layers] -> [conv_k * qkv_dim] pre-dequantised + transposed
                               * conv weights, built once at load. Weights are constant; the
                               * old per-token batch-dequant cost ~184K iters/token on 0.8B. */
+    float *ssm_alpha_buf;    /* [dt_rank] shared scratch for parallel SSM forward */
+    float *ssm_beta_buf;     /* [dt_rank] shared scratch for parallel SSM forward */
     int n_deepstack;       /* number of deepstack layers (Qwen3-VL) */
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
     int ds_embd_stride;    /* total embedding dim = proj_dim * (1 + n_deepstack) */
@@ -2483,8 +2485,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         fprintf(stderr, "transformer: SSM state: %d layers, conv=[%d×%d], recurrent=[%d×%d×%d]\n",
                 n_ssm, m->ssm_conv_kernel - 1, m->ssm_qkv_dim,
                 m->ssm_dt_rank, m->ssm_d_state, m->ssm_d_state);
+        m->ssm_alpha_buf = (float *)aligned_alloc(64, ((size_t)m->ssm_dt_rank * sizeof(float) + 63) & ~(size_t)63);
+        m->ssm_beta_buf  = (float *)aligned_alloc(64, ((size_t)m->ssm_dt_rank * sizeof(float) + 63) & ~(size_t)63);
     } else {
         m->conv_w_trans = NULL;
+        m->ssm_alpha_buf = NULL;
+        m->ssm_beta_buf  = NULL;
     }
 
     /* Allocate scratch buffers */
@@ -2613,6 +2619,8 @@ void transformer_free(transformer_model *model) {
         for (int l = 0; l < model->n_layers; l++) free(model->conv_w_trans[l]);
         free(model->conv_w_trans);
     }
+    free(model->ssm_alpha_buf);
+    free(model->ssm_beta_buf);
     if (model->recurrent_state) {
         size_t rec_state_bytes = (size_t)model->ssm_dt_rank *
                                  model->ssm_d_state * model->ssm_d_state *
@@ -3893,6 +3901,168 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
 }
 
+/* Forward decls (definitions live in the persistent-worker block below). */
+static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt);
+static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
+                              int n_rows, int tid, int nt);
+
+/* Parallel SSM Delta-Net forward, called by ALL persistent worker threads.
+ * Uses 4 internal spin barriers (B_a..B_d) to coordinate sections:
+ *   S1: parallel qkv+gate matvecs (rows); tid 0 also does alpha+beta matvec + postproc
+ *   B_a
+ *   S2: parallel conv1d (channels) — overlap with conv_state write-back
+ *   B_b
+ *   S3: parallel L2-norm + tile-repeat (heads) — no write to qkv_buf
+ *   B_c
+ *   S4: parallel Delta-Net recurrence + fused RMSNorm+SiLU(z) (heads)
+ *   B_d
+ *   S5: parallel output projection (rows) */
+static void tf_ssm_deltanet_forward_parallel(transformer_model *m, int layer_idx,
+                                              int tid, int nt, int *local_sense) {
+    transformer_layer *layer = &m->layers[layer_idx];
+    int n_embd  = m->n_embd;
+    int qkv_dim = m->ssm_qkv_dim;
+    int d_inner = m->ssm_d_inner;
+    int d_state = m->ssm_d_state;
+    int n_group = m->ssm_n_group;
+    int dt_rank = m->ssm_dt_rank;
+    int conv_k  = m->ssm_conv_kernel;
+    float eps   = m->rms_norm_eps;
+    int ncmgs = m->cmg_pin ? m->cmg_pin_ncmgs : 1;
+
+    float *qkv_buf  = m->xb2;
+    float *z_buf    = m->ffn_buf1;
+    float *K_exp    = m->ffn_buf2;        /* also conv_out scratch (size >= qkv_dim) */
+    float *out_buf  = m->ffn_buf3;
+    float *Q_exp    = m->q;
+    float *alpha    = m->ssm_alpha_buf;   /* [dt_rank] shared */
+    float *beta_arr = m->ssm_beta_buf;    /* [dt_rank] shared */
+
+    /* === S1: qkv+gate matvecs; tid 0 does alpha/beta matvec + postproc === */
+    tf_thread_matvec(qkv_buf, &layer->ssm_qkv,  m->xb, qkv_dim, tid, nt);
+    tf_thread_matvec(z_buf,   &layer->ssm_gate, m->xb, d_inner, tid, nt);
+    if (tid == 0) {
+        tf_qmatvec(alpha,    &layer->ssm_alpha, m->xb, dt_rank, m->matvec_tmp);
+        tf_qmatvec(beta_arr, &layer->ssm_beta,  m->xb, dt_rank, m->matvec_tmp);
+        float a_buf[64], dt_bias_buf[64];
+        tf_dequant_row(&layer->ssm_a, 0, a_buf);
+        tf_dequant_row(&layer->ssm_dt_bias, 0, dt_bias_buf);
+        for (int i = 0; i < dt_rank; i++) {
+            float val = alpha[i] + dt_bias_buf[i];
+            float sp = (val > 20.0f) ? val : logf(1.0f + expf(val));
+            alpha[i] = sp * a_buf[i];
+        }
+        for (int i = 0; i < dt_rank; i++)
+            beta_arr[i] = 1.0f / (1.0f + expf(-beta_arr[i]));
+    }
+    tf_spin_barrier(m, local_sense, nt);  /* B_a */
+
+    /* === S2: parallel conv1d by channel === */
+    {
+        float *conv_st = m->conv_state[layer_idx];
+        int wr = m->conv_state_pos[layer_idx];
+        int n_hist = conv_k - 1;
+        float *conv_out = K_exp;
+        float *w_trans = m->conv_w_trans[layer_idx];
+
+        int row_off[8];
+        for (int f = 0; f < n_hist; f++)
+            row_off[f] = ((wr + f) % n_hist) * qkv_dim;
+
+        /* Channel partition (qkv_dim = 10240) */
+        int cp = qkv_dim / nt, ce = qkv_dim % nt;
+        int cs = tid * cp + (tid < ce ? tid : ce);
+        int cc = cp + (tid < ce ? 1 : 0);
+        int cend = cs + cc;
+
+        /* MAC + SiLU into conv_out (= K_exp scratch). Per-channel: no contention. */
+        for (int j = cs; j < cend; j++) {
+            float sum = 0.0f;
+            for (int f = 0; f < n_hist; f++)
+                sum += w_trans[f * qkv_dim + j] * conv_st[row_off[f] + j];
+            sum += w_trans[n_hist * qkv_dim + j] * qkv_buf[j];
+            conv_out[j] = sum / (1.0f + expf(-sum));
+        }
+        /* Save current input into circular slot wr (per-channel slice). */
+        if (cc > 0)
+            memcpy(conv_st + wr * qkv_dim + cs, qkv_buf + cs, (size_t)cc * sizeof(float));
+        /* Copy conv output back into qkv_buf (per-channel slice). */
+        if (cc > 0)
+            memcpy(qkv_buf + cs, conv_out + cs, (size_t)cc * sizeof(float));
+
+        if (tid == 0)
+            m->conv_state_pos[layer_idx] = (wr + 1) % n_hist;
+    }
+    tf_spin_barrier(m, local_sense, nt);  /* B_b */
+
+    /* === S3: L2-norm Q/K per head + tile-repeat from n_group → dt_rank ===
+     * Each thread owns a head range [hs..he) of the dt_rank target heads;
+     * it locally normalises the source group head h%n_group and writes
+     * directly into Q_exp[h*ds] / K_exp[h*ds]. No write to qkv_buf, so
+     * sources are read-only and shared safely. */
+    {
+        int hs, he;
+        tf_ssm_head_range(dt_rank, nt, ncmgs, tid, &hs, &he);
+        float *Q_raw = qkv_buf;
+        float *K_raw = qkv_buf + n_group * d_state;
+        for (int h = hs; h < he; h++) {
+            int g = h % n_group;
+            const float *q_src = Q_raw + g * d_state;
+            const float *k_src = K_raw + g * d_state;
+            float qss = 0.0f, kss = 0.0f;
+            for (int i = 0; i < d_state; i++) {
+                qss += q_src[i] * q_src[i];
+                kss += k_src[i] * k_src[i];
+            }
+            /* tf_l2_norm formula: inv = 1 / sqrt(ss + eps), no /n divisor */
+            float qs = 1.0f / sqrtf(qss + eps);
+            float ks = 1.0f / sqrtf(kss + eps);
+            float *q_dst = Q_exp + h * d_state;
+            float *k_dst = K_exp + h * d_state;
+            for (int i = 0; i < d_state; i++) {
+                q_dst[i] = q_src[i] * qs;
+                k_dst[i] = k_src[i] * ks;
+            }
+        }
+    }
+    tf_spin_barrier(m, local_sense, nt);  /* B_c */
+
+    /* === S4: Delta-Net recurrence + fused RMSNorm+SiLU(z) per head === */
+    {
+        float scale = 1.0f / sqrtf((float)d_state);
+        float *rec_state = m->recurrent_state[layer_idx];
+        float *V_raw = qkv_buf + 2 * n_group * d_state;
+        int hs, he;
+        tf_ssm_head_range(dt_rank, nt, ncmgs, tid, &hs, &he);
+        if (he > hs) {
+            tf_ssm_recurrence_task rtask = {
+                rec_state, Q_exp, K_exp, V_raw, out_buf,
+                alpha, beta_arr, hs, he, d_state, scale
+            };
+            tf_ssm_recurrence_worker(&rtask);
+
+            float norm_w[128];
+            tf_dequant_row(&layer->ssm_norm, 0, norm_w);
+            for (int h = hs; h < he; h++) {
+                float *o_h = out_buf + h * d_state;
+                float *z_h = z_buf   + h * d_state;
+                float ss = 0.0f;
+                for (int i = 0; i < d_state; i++) ss += o_h[i] * o_h[i];
+                float scl = 1.0f / sqrtf(ss / d_state + eps);
+                for (int i = 0; i < d_state; i++) {
+                    float normed = o_h[i] * scl * norm_w[i];
+                    float zv = z_h[i];
+                    o_h[i] = normed * (zv / (1.0f + expf(-zv)));
+                }
+            }
+        }
+    }
+    tf_spin_barrier(m, local_sense, nt);  /* B_d */
+
+    /* === S5: output projection (parallel rows). Caller's B2 barrier follows. === */
+    tf_thread_matvec(m->xb, &layer->ssm_out, out_buf, n_embd, tid, nt);
+}
+
 /* Vectorized GELU(gate) × up: out[i] = gelu(gate[i]) * up[i]
  * Uses exact GELU: x * 0.5 * (1 + erf(x / sqrt(2))) */
 static void tf_gelu_mul(float *out, const float *gate, const float *up, int n) {
@@ -4111,14 +4281,13 @@ static void *tf_persistent_worker(void *arg) {
         PW_MARK(barrier);
 
         if (m->is_hybrid && layer->is_ssm) {
-            /* SSM: thread 0 runs with pool disabled. Other threads wait. */
-            if (tid == 0) {
-                int saved_alive = m->pool_alive;
-                m->pool_alive = 0;
-                tf_ssm_deltanet_forward(m, l);
-                m->pool_alive = saved_alive;
-            }
+            /* Parallel SSM forward — all threads participate via internal
+             * spin barriers (B_a..B_d). xb (post-norm) ready from B1, xb
+             * (ssm_out projection) ready when this returns. */
+            tf_ssm_deltanet_forward_parallel(m, l, tid, nt, &local_sense);
+            PW_MARK(matvec);
             tf_spin_barrier(m, &local_sense, nt);  /* B2: SSM done */
+            PW_MARK(barrier);
         } else {
             /* --- Attention layer --- */
 
