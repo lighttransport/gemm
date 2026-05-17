@@ -167,9 +167,15 @@ typedef struct {
     /* Per-layer weights */
     transformer_layer *layers;
 
-    /* KV cache: [n_layers][max_seq_len * n_kv_heads * head_dim] */
-    float **key_cache;
-    float **value_cache;
+    /* KV cache: [n_layers][seq_cap * n_kv_heads * head_dim].
+     * Element size depends on kv_dtype: 4B (F32), 2B (F16) or 1B (Q8).
+     * For Q8, key_scales/value_scales hold one float per (pos, kv_head). */
+    void **key_cache;
+    void **value_cache;
+    float **key_scales;
+    float **value_scales;
+    int kv_dtype;            /* 0=F32 (default), 1=F16, 2=Q8 with per-head per-pos scale */
+    size_t kv_elem_bytes;    /* bytes per K/V element (4/2/1) */
 
     /* Scratch buffers */
     float *x;        /* [n_embd] current hidden state */
@@ -237,6 +243,14 @@ typedef struct {
 
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len);
 void transformer_free(transformer_model *model);
+
+/* KV cache element formats. F16 stores K/V as IEEE half (2B), Q8 as int8
+ * with a per-(pos, kv_head) scale (1B + scale). Set via TF_KV_DTYPE env
+ * (f32|f16|q8) before transformer_load. Halves/quarters KV memory and the
+ * per-token attention read bandwidth which dominates at long contexts. */
+#define TF_KV_DTYPE_F32 0
+#define TF_KV_DTYPE_F16 1
+#define TF_KV_DTYPE_Q8  2
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
@@ -1684,15 +1698,123 @@ static void tf_qk_norm(float *vec, int n_heads, int head_dim, const qtensor *nor
 static void tf_softmax(float *x, int n);
 static void tf_silu_mul_avx2(float *out, const float *gate, const float *up, int n);
 
-/* Multi-head attention worker for threading */
+/* IEEE-754 binary16 -> binary32 scalar conversion (slow fallback only). */
+static inline float tf_f16_to_f32(uint16_t h) {
+    uint32_t s = (uint32_t)(h & 0x8000) << 16;
+    uint32_t e = (h >> 10) & 0x1F;
+    uint32_t m = h & 0x3FF;
+    union { uint32_t u; float f; } o;
+    if (e == 0) {
+        if (m == 0) { o.u = s; return o.f; }
+        while ((m & 0x400) == 0) { m <<= 1; e--; }
+        e++; m &= 0x3FF;
+    } else if (e == 0x1F) {
+        o.u = s | 0x7F800000u | (m << 13);
+        return o.f;
+    }
+    o.u = s | ((e + 112) << 23) | (m << 13);
+    return o.f;
+}
+
+/* IEEE-754 binary32 -> binary16, round-to-nearest-even, with overflow → inf. */
+static inline uint16_t tf_f32_to_f16(float x) {
+    union { float f; uint32_t u; } in = { x };
+    uint32_t u = in.u;
+    uint32_t s = (u >> 16) & 0x8000;
+    int32_t  e = (int32_t)((u >> 23) & 0xFF) - 127 + 15;
+    uint32_t m = u & 0x7FFFFF;
+    if (e <= 0) {
+        if (e < -10) return (uint16_t)s;
+        m |= 0x800000;
+        uint32_t shift = (uint32_t)(14 - e);
+        uint32_t r = m & ((1u << shift) - 1);
+        uint16_t h = (uint16_t)(s | (m >> shift));
+        if (r > (1u << (shift - 1)) || (r == (1u << (shift - 1)) && (h & 1))) h++;
+        return h;
+    } else if (e >= 31) {
+        return (uint16_t)(s | 0x7C00);
+    }
+    uint16_t h = (uint16_t)(s | ((uint32_t)e << 10) | (m >> 13));
+    uint32_t r = m & 0x1FFF;
+    if (r > 0x1000 || (r == 0x1000 && (h & 1))) h++;
+    return h;
+}
+
+/* Quantize a row of N floats to int8 using a single shared scale s = max_abs/127.
+ * Writes int8 values to out and returns the scale (0 if max_abs == 0). */
+static inline float tf_quantize_row_q8(int8_t *out, const float *in, int n) {
+    float ma = 0.0f;
+    for (int i = 0; i < n; i++) { float a = in[i]; if (a < 0) a = -a; if (a > ma) ma = a; }
+    if (ma == 0.0f) { for (int i = 0; i < n; i++) out[i] = 0; return 0.0f; }
+    float s = ma / 127.0f;
+    float inv = 127.0f / ma;
+    for (int i = 0; i < n; i++) {
+        float v = in[i] * inv;
+        int q = (int)(v < 0 ? v - 0.5f : v + 0.5f);
+        if (q > 127) q = 127; else if (q < -127) q = -127;
+        out[i] = (int8_t)q;
+    }
+    return s;
+}
+
+/* Write one full position-row of [n_kv_heads * head_dim] floats into the
+ * layer's KV cache at position p, converting per kv_dtype. Q8 emits one
+ * scale per kv-head into scales[p*n_kv_heads .. p*n_kv_heads+n_kv_heads). */
+static inline void tf_kv_write_all_heads(void *cache_ptr, float *scales,
+                                         const float *src,
+                                         int p, int n_kv_heads,
+                                         int head_dim, int kv_dtype) {
+    int kv_dim = n_kv_heads * head_dim;
+    if (kv_dtype == TF_KV_DTYPE_F32) {
+        memcpy((float *)cache_ptr + (size_t)p * kv_dim, src, (size_t)kv_dim * sizeof(float));
+    } else if (kv_dtype == TF_KV_DTYPE_F16) {
+        uint16_t *dst = (uint16_t *)cache_ptr + (size_t)p * kv_dim;
+        for (int i = 0; i < kv_dim; i++) dst[i] = tf_f32_to_f16(src[i]);
+    } else {
+        int8_t *dst = (int8_t *)cache_ptr + (size_t)p * kv_dim;
+        for (int h = 0; h < n_kv_heads; h++) {
+            float s = tf_quantize_row_q8(dst + h * head_dim, src + h * head_dim, head_dim);
+            scales[(size_t)p * n_kv_heads + h] = s;
+        }
+    }
+}
+
+/* Write one K (or V) head-row of head_dim floats into the layer-l KV cache at
+ * position p, kv_head kvh. Quantises/converts according to kv_dtype. The Q8
+ * scale lands in scales[p * n_kv_heads + kvh]. */
+static inline void tf_kv_write_row(void *cache_ptr, float *scales,
+                                   const float *src,
+                                   int p, int kvh, int n_kv_heads,
+                                   int head_dim, int kv_dim, int kv_dtype) {
+    size_t off = (size_t)p * kv_dim + (size_t)kvh * head_dim;
+    if (kv_dtype == TF_KV_DTYPE_F32) {
+        memcpy((float *)cache_ptr + off, src, (size_t)head_dim * sizeof(float));
+    } else if (kv_dtype == TF_KV_DTYPE_F16) {
+        uint16_t *dst = (uint16_t *)cache_ptr + off;
+        for (int i = 0; i < head_dim; i++) dst[i] = tf_f32_to_f16(src[i]);
+    } else {
+        int8_t *dst = (int8_t *)cache_ptr + off;
+        float s = tf_quantize_row_q8(dst, src, head_dim);
+        scales[(size_t)p * n_kv_heads + kvh] = s;
+    }
+}
+
+/* Multi-head attention worker for threading.
+ * key_cache/value_cache stride is kv_dim * elem_bytes; element type matches
+ * kv_dtype (4B F32, 2B F16, 1B int8 with per-(pos, kv_head) scale). For Q8,
+ * key_scales/value_scales point at the layer's [seq_len * n_kv_heads] scales. */
 typedef struct {
     const float *q;          /* full Q buffer */
     float *att;              /* full attention scores buffer */
     float *xb2;              /* full output buffer (each head writes its own slice) */
-    const float *key_cache;  /* layer key cache */
-    const float *value_cache;/* layer value cache */
+    const void *key_cache;
+    const void *value_cache;
+    const float *key_scales;   /* NULL unless kv_dtype==Q8 */
+    const float *value_scales; /* NULL unless kv_dtype==Q8 */
     int head_start, head_end;
     int head_dim, kv_dim, gqa_ratio, seq_len, max_seq_len;
+    int n_kv_heads;          /* needed to index per-(pos, kv_h) scales */
+    int kv_dtype;            /* TF_KV_DTYPE_F32 / F16 / Q8 */
     float scale;
 } tf_attn_task;
 
@@ -1706,6 +1828,9 @@ static void *tf_attn_worker(void *arg) {
         int seq_len = t->seq_len;
 
 #if defined(__AVX2__) && defined(__FMA__)
+        /* AVX2 path is F32-only; the F16/Q8 KV variants are SVE-only paths. */
+        const float *_kc_f32 = (const float *)t->key_cache;
+        const float *_vc_f32 = (const float *)t->value_cache;
         if (hd == 64) {
             __m256 q0=_mm256_loadu_ps(q_h),    q1=_mm256_loadu_ps(q_h+8);
             __m256 q2=_mm256_loadu_ps(q_h+16), q3=_mm256_loadu_ps(q_h+24);
@@ -1715,10 +1840,10 @@ static void *tf_attn_worker(void *arg) {
             /* QK scores: 4 positions at a time */
             int p = 0;
             for (; p + 3 < seq_len; p += 4) {
-                const float *k0 = t->key_cache + (size_t)(p+0)*t->kv_dim + kv_h*hd;
-                const float *k1 = t->key_cache + (size_t)(p+1)*t->kv_dim + kv_h*hd;
-                const float *k2 = t->key_cache + (size_t)(p+2)*t->kv_dim + kv_h*hd;
-                const float *k3 = t->key_cache + (size_t)(p+3)*t->kv_dim + kv_h*hd;
+                const float *k0 = _kc_f32 + (size_t)(p+0)*t->kv_dim + kv_h*hd;
+                const float *k1 = _kc_f32 + (size_t)(p+1)*t->kv_dim + kv_h*hd;
+                const float *k2 = _kc_f32 + (size_t)(p+2)*t->kv_dim + kv_h*hd;
+                const float *k3 = _kc_f32 + (size_t)(p+3)*t->kv_dim + kv_h*hd;
                 __m256 s0=_mm256_mul_ps(q0,_mm256_loadu_ps(k0));
                 __m256 s1=_mm256_mul_ps(q0,_mm256_loadu_ps(k1));
                 __m256 s2=_mm256_mul_ps(q0,_mm256_loadu_ps(k2));
@@ -1759,7 +1884,7 @@ static void *tf_attn_worker(void *arg) {
                 _mm_storeu_ps(att_h+p, _mm_mul_ps(_mm_add_ps(lo,hi),_mm_set1_ps(t->scale)));
             }
             for (; p < seq_len; p++) {
-                const float *kp = t->key_cache + (size_t)p*t->kv_dim + kv_h*hd;
+                const float *kp = _kc_f32 + (size_t)p*t->kv_dim + kv_h*hd;
                 __m256 s=_mm256_mul_ps(q0,_mm256_loadu_ps(kp));
                 s=_mm256_fmadd_ps(q1,_mm256_loadu_ps(kp+8),s);
                 s=_mm256_fmadd_ps(q2,_mm256_loadu_ps(kp+16),s);
@@ -1786,7 +1911,7 @@ static void *tf_attn_worker(void *arg) {
             __m256 o4=_mm256_setzero_ps(), o5=_mm256_setzero_ps();
             __m256 o6=_mm256_setzero_ps(), o7=_mm256_setzero_ps();
             for (p = 0; p < seq_len; p++) {
-                const float *vp = t->value_cache + (size_t)p*t->kv_dim + kv_h*hd;
+                const float *vp = _vc_f32 + (size_t)p*t->kv_dim + kv_h*hd;
                 __m256 a = _mm256_set1_ps(att_h[p]);
                 o0=_mm256_fmadd_ps(a,_mm256_loadu_ps(vp),   o0);
                 o1=_mm256_fmadd_ps(a,_mm256_loadu_ps(vp+8), o1);
@@ -1804,9 +1929,9 @@ static void *tf_attn_worker(void *arg) {
         } else {
             /* Generic AVX2 attention for any head_dim (with prefetch) */
             for (int p = 0; p < seq_len; p++) {
-                const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
+                const float *k_p = _kc_f32 + (size_t)p * t->kv_dim + kv_h * hd;
                 if (p + 2 < seq_len)
-                    _mm_prefetch((const char *)(t->key_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(_kc_f32 + (size_t)(p+2) * t->kv_dim + kv_h * hd), _MM_HINT_T0);
                 __m256 acc = _mm256_setzero_ps();
                 int d = 0;
                 for (; d + 7 < hd; d += 8)
@@ -1825,9 +1950,9 @@ static void *tf_attn_worker(void *arg) {
             /* Zero output with AVX2 */
             for (int d = 0; d < hd; d += 8) _mm256_storeu_ps(out_h + d, _mm256_setzero_ps());
             for (int p = 0; p < seq_len; p++) {
-                const float *v_p = t->value_cache + (size_t)p * t->kv_dim + kv_h * hd;
+                const float *v_p = _vc_f32 + (size_t)p * t->kv_dim + kv_h * hd;
                 if (p + 2 < seq_len)
-                    _mm_prefetch((const char *)(t->value_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(_vc_f32 + (size_t)(p+2) * t->kv_dim + kv_h * hd), _MM_HINT_T0);
                 __m256 a = _mm256_set1_ps(att_h[p]);
                 for (int d = 0; d < hd; d += 8)
                     _mm256_storeu_ps(out_h + d, _mm256_fmadd_ps(a, _mm256_loadu_ps(v_p + d),
@@ -1836,57 +1961,179 @@ static void *tf_attn_worker(void *arg) {
         }
 #elif defined(__ARM_FEATURE_SVE)
         {
-            /* SVE attention with prefetch */
+            /* SVE attention. Branch once per head on kv_dtype; inner loops are
+             * dtype-specialised so the hot path has no per-(p, d) dispatch. */
             svbool_t pg = svptrue_b32();
-            for (int p = 0; p < seq_len; p++) {
-                const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
-                if (p + 2 < seq_len)
-                    __builtin_prefetch(t->key_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd, 0, 1);
-                svfloat32_t acc = svdup_f32(0.0f);
-                int d = 0;
-                for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw())
-                    acc = svmla_x(pg, acc, svld1(pg, q_h + d), svld1(pg, k_p + d));
-                if (d < hd) {
-                    svbool_t ptail = svwhilelt_b32(d, hd);
-                    acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), svld1(ptail, k_p + d));
+            size_t kv_eb = (t->kv_dtype == TF_KV_DTYPE_F32) ? 4 :
+                           (t->kv_dtype == TF_KV_DTYPE_F16) ? 2 : 1;
+            const uint8_t *kc8 = (const uint8_t *)t->key_cache;
+            const uint8_t *vc8 = (const uint8_t *)t->value_cache;
+            size_t row_stride = (size_t)t->kv_dim * kv_eb;
+            size_t head_off   = (size_t)kv_h * t->head_dim * kv_eb;
+            int nkv = t->n_kv_heads;
+
+            /* ===== QK scores ===== */
+            if (t->kv_dtype == TF_KV_DTYPE_F32) {
+                for (int p = 0; p < seq_len; p++) {
+                    const float *k_p = (const float *)(kc8 + (size_t)p * row_stride + head_off);
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(kc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    int d = 0;
+                    for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw())
+                        acc = svmla_x(pg, acc, svld1(pg, q_h + d), svld1(pg, k_p + d));
+                    if (d < hd) {
+                        svbool_t ptail = svwhilelt_b32(d, hd);
+                        acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), svld1(ptail, k_p + d));
+                    }
+                    att_h[p] = svaddv(pg, acc) * t->scale;
                 }
-                att_h[p] = svaddv(pg, acc) * t->scale;
+            } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+                for (int p = 0; p < seq_len; p++) {
+                    const uint16_t *k_p = (const uint16_t *)(kc8 + (size_t)p * row_stride + head_off);
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(kc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    int d = 0;
+                    for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw()) {
+                        svuint32_t ku32 = svld1uh_u32(pg, k_p + d);
+                        svfloat32_t kf  = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(ku32));
+                        acc = svmla_x(pg, acc, svld1(pg, q_h + d), kf);
+                    }
+                    if (d < hd) {
+                        svbool_t ptail = svwhilelt_b32(d, hd);
+                        svuint32_t ku32 = svld1uh_u32(ptail, k_p + d);
+                        svfloat32_t kf  = svcvt_f32_f16_x(ptail, svreinterpret_f16_u32(ku32));
+                        acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), kf);
+                    }
+                    att_h[p] = svaddv(pg, acc) * t->scale;
+                }
+            } else {  /* Q8 */
+                const float *ks = t->key_scales;
+                for (int p = 0; p < seq_len; p++) {
+                    const int8_t *k_p = (const int8_t *)(kc8 + (size_t)p * row_stride + head_off);
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(kc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+                    float s = ks[(size_t)p * nkv + kv_h];
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    int d = 0;
+                    for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw()) {
+                        svint32_t ki = svld1sb_s32(pg, k_p + d);
+                        svfloat32_t kf = svcvt_f32_s32_x(pg, ki);
+                        acc = svmla_x(pg, acc, svld1(pg, q_h + d), kf);
+                    }
+                    if (d < hd) {
+                        svbool_t ptail = svwhilelt_b32(d, hd);
+                        svint32_t ki = svld1sb_s32(ptail, k_p + d);
+                        svfloat32_t kf = svcvt_f32_s32_x(ptail, ki);
+                        acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), kf);
+                    }
+                    att_h[p] = svaddv(pg, acc) * t->scale * s;
+                }
             }
+
             tf_softmax(att_h, seq_len);
             float *out_h = t->xb2 + h * hd;
-            /* Zero output with SVE */
             for (int d = 0; d < hd; d += (int)svcntw())
                 svst1(svwhilelt_b32(d, hd), out_h + d, svdup_f32(0.0f));
-            /* V accumulation with prefetch */
-            for (int p = 0; p < seq_len; p++) {
-                const float *v_p = t->value_cache + (size_t)p * t->kv_dim + kv_h * hd;
-                if (p + 2 < seq_len)
-                    __builtin_prefetch(t->value_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd, 0, 1);
-                svfloat32_t va = svdup_f32(att_h[p]);
-                int d = 0;
-                for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw())
-                    svst1(pg, out_h + d, svmla_x(pg, svld1(pg, out_h + d), va, svld1(pg, v_p + d)));
-                if (d < hd) {
-                    svbool_t ptail = svwhilelt_b32(d, hd);
-                    svst1(ptail, out_h + d, svmla_m(ptail, svld1(ptail, out_h + d), va, svld1(ptail, v_p + d)));
+
+            /* ===== V accumulation ===== */
+            if (t->kv_dtype == TF_KV_DTYPE_F32) {
+                for (int p = 0; p < seq_len; p++) {
+                    const float *v_p = (const float *)(vc8 + (size_t)p * row_stride + head_off);
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(vc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+                    svfloat32_t va = svdup_f32(att_h[p]);
+                    int d = 0;
+                    for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw())
+                        svst1(pg, out_h + d, svmla_x(pg, svld1(pg, out_h + d), va, svld1(pg, v_p + d)));
+                    if (d < hd) {
+                        svbool_t ptail = svwhilelt_b32(d, hd);
+                        svst1(ptail, out_h + d, svmla_m(ptail, svld1(ptail, out_h + d), va, svld1(ptail, v_p + d)));
+                    }
+                }
+            } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+                for (int p = 0; p < seq_len; p++) {
+                    const uint16_t *v_p = (const uint16_t *)(vc8 + (size_t)p * row_stride + head_off);
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(vc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+                    svfloat32_t va = svdup_f32(att_h[p]);
+                    int d = 0;
+                    for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw()) {
+                        svuint32_t vu32 = svld1uh_u32(pg, v_p + d);
+                        svfloat32_t vf  = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(vu32));
+                        svst1(pg, out_h + d, svmla_x(pg, svld1(pg, out_h + d), va, vf));
+                    }
+                    if (d < hd) {
+                        svbool_t ptail = svwhilelt_b32(d, hd);
+                        svuint32_t vu32 = svld1uh_u32(ptail, v_p + d);
+                        svfloat32_t vf  = svcvt_f32_f16_x(ptail, svreinterpret_f16_u32(vu32));
+                        svst1(ptail, out_h + d, svmla_m(ptail, svld1(ptail, out_h + d), va, vf));
+                    }
+                }
+            } else {  /* Q8 */
+                const float *vs = t->value_scales;
+                for (int p = 0; p < seq_len; p++) {
+                    const int8_t *v_p = (const int8_t *)(vc8 + (size_t)p * row_stride + head_off);
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(vc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+                    float s = vs[(size_t)p * nkv + kv_h];
+                    svfloat32_t va = svdup_f32(att_h[p] * s);
+                    int d = 0;
+                    for (; d + (int)svcntw() - 1 < hd; d += (int)svcntw()) {
+                        svint32_t vi = svld1sb_s32(pg, v_p + d);
+                        svfloat32_t vf = svcvt_f32_s32_x(pg, vi);
+                        svst1(pg, out_h + d, svmla_x(pg, svld1(pg, out_h + d), va, vf));
+                    }
+                    if (d < hd) {
+                        svbool_t ptail = svwhilelt_b32(d, hd);
+                        svint32_t vi = svld1sb_s32(ptail, v_p + d);
+                        svfloat32_t vf = svcvt_f32_s32_x(ptail, vi);
+                        svst1(ptail, out_h + d, svmla_m(ptail, svld1(ptail, out_h + d), va, vf));
+                    }
                 }
             }
         }
 #else
         {
+            size_t kv_eb = (t->kv_dtype == TF_KV_DTYPE_F32) ? 4 :
+                           (t->kv_dtype == TF_KV_DTYPE_F16) ? 2 : 1;
+            const uint8_t *kc8 = (const uint8_t *)t->key_cache;
+            const uint8_t *vc8 = (const uint8_t *)t->value_cache;
+            size_t row_stride = (size_t)t->kv_dim * kv_eb;
+            size_t head_off   = (size_t)kv_h * t->head_dim * kv_eb;
+            int nkv = t->n_kv_heads;
             for (int p = 0; p < seq_len; p++) {
-                const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
                 float score = 0.0f;
-                for (int d = 0; d < hd; d++) score += q_h[d] * k_p[d];
+                if (t->kv_dtype == TF_KV_DTYPE_F32) {
+                    const float *k_p = (const float *)(kc8 + (size_t)p * row_stride + head_off);
+                    for (int d = 0; d < hd; d++) score += q_h[d] * k_p[d];
+                } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+                    const uint16_t *k_p = (const uint16_t *)(kc8 + (size_t)p * row_stride + head_off);
+                    for (int d = 0; d < hd; d++) score += q_h[d] * tf_f16_to_f32(k_p[d]);
+                } else {
+                    const int8_t *k_p = (const int8_t *)(kc8 + (size_t)p * row_stride + head_off);
+                    float s = t->key_scales[(size_t)p * nkv + kv_h];
+                    for (int d = 0; d < hd; d++) score += q_h[d] * (float)k_p[d] * s;
+                }
                 att_h[p] = score * t->scale;
             }
             tf_softmax(att_h, seq_len);
             float *out_h = t->xb2 + h * hd;
             memset(out_h, 0, hd * sizeof(float));
             for (int p = 0; p < seq_len; p++) {
-                const float *v_p = t->value_cache + (size_t)p * t->kv_dim + kv_h * hd;
                 float a = att_h[p];
-                for (int d = 0; d < hd; d++) out_h[d] += a * v_p[d];
+                if (t->kv_dtype == TF_KV_DTYPE_F32) {
+                    const float *v_p = (const float *)(vc8 + (size_t)p * row_stride + head_off);
+                    for (int d = 0; d < hd; d++) out_h[d] += a * v_p[d];
+                } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+                    const uint16_t *v_p = (const uint16_t *)(vc8 + (size_t)p * row_stride + head_off);
+                    for (int d = 0; d < hd; d++) out_h[d] += a * tf_f16_to_f32(v_p[d]);
+                } else {
+                    const int8_t *v_p = (const int8_t *)(vc8 + (size_t)p * row_stride + head_off);
+                    float s = t->value_scales[(size_t)p * nkv + kv_h];
+                    for (int d = 0; d < hd; d++) out_h[d] += a * (float)v_p[d] * s;
+                }
             }
         }
 #endif
@@ -2387,42 +2634,77 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
      * transformer_build_panels(), which the caller invokes after
      * transformer_set_threads() so the panels can be first-touched per-CMG. */
 
-    /* Allocate KV cache */
+    /* Allocate KV cache. Element format is selected by TF_KV_DTYPE env var:
+     *   f32 (default) — 4 B/element, fastest read path
+     *   f16           — 2 B/element, SVE FCVT on the fly
+     *   q8            — 1 B/element + 4 B scale per (pos, kv_head)
+     * Halves/quarters the per-token attention KV read bandwidth. */
+    m->kv_dtype = TF_KV_DTYPE_F32;
+    m->kv_elem_bytes = sizeof(float);
+    {
+        const char *e = getenv("TF_KV_DTYPE");
+        if (e) {
+            if      (!strcmp(e, "f16") || !strcmp(e, "fp16")) { m->kv_dtype = TF_KV_DTYPE_F16; m->kv_elem_bytes = 2; }
+            else if (!strcmp(e, "q8")  || !strcmp(e, "int8")) { m->kv_dtype = TF_KV_DTYPE_Q8;  m->kv_elem_bytes = 1; }
+            else if (!strcmp(e, "f32") || !strcmp(e, "fp32")) { m->kv_dtype = TF_KV_DTYPE_F32; m->kv_elem_bytes = 4; }
+            else fprintf(stderr, "transformer: ignoring unknown TF_KV_DTYPE=%s\n", e);
+        }
+        /* Gemma4 attention path reads K/V as float* directly (SWA + shared KV)
+         * and the F16/Q8 codecs aren't wired in there yet. Force F32. */
+        if (m->is_gemma4 && m->kv_dtype != TF_KV_DTYPE_F32) {
+            fprintf(stderr, "transformer: TF_KV_DTYPE=%s ignored on Gemma4 (forcing f32)\n", e ? e : "");
+            m->kv_dtype = TF_KV_DTYPE_F32;
+            m->kv_elem_bytes = 4;
+        }
+    }
     int kv_dim = m->n_kv_heads * m->head_dim;
-    m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
-    m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
+    m->key_cache    = (void  **)calloc(m->n_layers, sizeof(void  *));
+    m->value_cache  = (void  **)calloc(m->n_layers, sizeof(void  *));
+    m->key_scales   = (m->kv_dtype == TF_KV_DTYPE_Q8) ? (float **)calloc(m->n_layers, sizeof(float *)) : NULL;
+    m->value_scales = (m->kv_dtype == TF_KV_DTYPE_Q8) ? (float **)calloc(m->n_layers, sizeof(float *)) : NULL;
     if (m->is_gemma4) {
         int kv_dim_full = m->n_kv_heads * m->head_dim_full;
         int kv_dim_swa  = m->n_kv_heads * m->head_dim_swa;
         int n_own = 0, n_shared = 0;
         for (int l = 0; l < m->n_layers; l++) {
             if (m->layers[l].shared_kv_source >= 0) { n_shared++; continue; }
-            if (m->layers[l].is_swa) {
-                int cache_len = m->swa_window_size;
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, cache_len * kv_dim_swa, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, cache_len * kv_dim_swa, sizeof(float));
-            } else {
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim_full, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim_full, sizeof(float));
+            int cache_len  = m->layers[l].is_swa ? m->swa_window_size : max_seq_len;
+            int local_kvd  = m->layers[l].is_swa ? kv_dim_swa : kv_dim_full;
+            m->key_cache[l]   = tf_aligned_calloc(256, (size_t)cache_len * local_kvd, m->kv_elem_bytes);
+            m->value_cache[l] = tf_aligned_calloc(256, (size_t)cache_len * local_kvd, m->kv_elem_bytes);
+            if (m->kv_dtype == TF_KV_DTYPE_Q8) {
+                m->key_scales[l]   = (float *)tf_aligned_calloc(256, (size_t)cache_len * m->n_kv_heads, sizeof(float));
+                m->value_scales[l] = (float *)tf_aligned_calloc(256, (size_t)cache_len * m->n_kv_heads, sizeof(float));
             }
             n_own++;
         }
-        /* Point shared layers to their source */
         for (int l = 0; l < m->n_layers; l++) {
             int src = m->layers[l].shared_kv_source;
             if (src >= 0) {
                 m->key_cache[l]   = m->key_cache[src];
                 m->value_cache[l] = m->value_cache[src];
+                if (m->kv_dtype == TF_KV_DTYPE_Q8) {
+                    m->key_scales[l]   = m->key_scales[src];
+                    m->value_scales[l] = m->value_scales[src];
+                }
             }
         }
         fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers\n", n_own, n_shared);
-        kv_dim = kv_dim_full > kv_dim_swa ? kv_dim_full : kv_dim_swa; /* for scratch sizing */
+        kv_dim = kv_dim_full > kv_dim_swa ? kv_dim_full : kv_dim_swa;
     } else {
         for (int l = 0; l < m->n_layers; l++) {
             if (m->is_hybrid && m->layers[l].is_ssm) continue;
-            m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
-            m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
+            m->key_cache[l]   = tf_aligned_calloc(256, (size_t)max_seq_len * kv_dim, m->kv_elem_bytes);
+            m->value_cache[l] = tf_aligned_calloc(256, (size_t)max_seq_len * kv_dim, m->kv_elem_bytes);
+            if (m->kv_dtype == TF_KV_DTYPE_Q8) {
+                m->key_scales[l]   = (float *)tf_aligned_calloc(256, (size_t)max_seq_len * m->n_kv_heads, sizeof(float));
+                m->value_scales[l] = (float *)tf_aligned_calloc(256, (size_t)max_seq_len * m->n_kv_heads, sizeof(float));
+            }
         }
+    }
+    if (m->kv_dtype != TF_KV_DTYPE_F32) {
+        const char *dn = (m->kv_dtype == TF_KV_DTYPE_F16) ? "f16" : "q8";
+        fprintf(stderr, "transformer: KV cache dtype=%s (%zu B/elem)\n", dn, m->kv_elem_bytes);
     }
 
     /* Allocate SSM state for hybrid models */
@@ -2600,9 +2882,13 @@ void transformer_free(transformer_model *model) {
                 model->layers && model->layers[l].shared_kv_source >= 0) continue;
             free(model->key_cache[l]);
             free(model->value_cache[l]);
+            if (model->key_scales)   free(model->key_scales[l]);
+            if (model->value_scales) free(model->value_scales[l]);
         }
         free(model->key_cache);
         free(model->value_cache);
+        free(model->key_scales);
+        free(model->value_scales);
     }
     /* Gemma4 resources */
     free(model->swa_pattern);
@@ -4424,8 +4710,12 @@ static void *tf_persistent_worker(void *arg) {
                         }
                     }
                     tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
-                    memcpy(m->key_cache[l] + position * kv_dim, m->k, kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + position * kv_dim, m->v, kv_dim * sizeof(float));
+                    tf_kv_write_all_heads(m->key_cache[l],
+                                          m->key_scales   ? m->key_scales[l]   : NULL,
+                                          m->k, position, n_kv_heads, head_dim, m->kv_dtype);
+                    tf_kv_write_all_heads(m->value_cache[l],
+                                          m->value_scales ? m->value_scales[l] : NULL,
+                                          m->v, position, n_kv_heads, head_dim, m->kv_dtype);
                 }
             } else {
                 /* Per-head partition: assign Q heads to tids [0, n_heads) and
@@ -4549,10 +4839,12 @@ static void *tf_persistent_worker(void *arg) {
                         vk[j]            = v0 * cos_tab[j] - v1 * sin_tab[j];
                         vk[j + pair_off] = v0 * sin_tab[j] + v1 * cos_tab[j];
                     }
-                    memcpy(m->key_cache[l]   + position * kv_dim + h * head_dim, vk,
-                           head_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + position * kv_dim + h * head_dim, vv,
-                           head_dim * sizeof(float));
+                    tf_kv_write_row(m->key_cache[l],
+                                    m->key_scales   ? m->key_scales[l]   : NULL,
+                                    vk, position, h, n_kv_heads, head_dim, kv_dim, m->kv_dtype);
+                    tf_kv_write_row(m->value_cache[l],
+                                    m->value_scales ? m->value_scales[l] : NULL,
+                                    vv, position, h, n_kv_heads, head_dim, kv_dim, m->kv_dtype);
                 }
             }
             PW_MARK(serial);
@@ -4564,9 +4856,18 @@ static void *tf_persistent_worker(void *arg) {
                 int seq_len = position + 1;
                 float scale = 1.0f / sqrtf((float)head_dim);
                 if (h_count > 0) {
-                    tf_attn_task at = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
-                                       h_start, h_start + h_count, head_dim, kv_dim, gqa_ratio,
-                                       seq_len, m->max_seq_len, scale};
+                    tf_attn_task at = {
+                        .q = m->q, .att = m->att, .xb2 = m->xb2,
+                        .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
+                        .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
+                        .value_scales = m->value_scales ? m->value_scales[l] : NULL,
+                        .head_start = h_start, .head_end = h_start + h_count,
+                        .head_dim = head_dim, .kv_dim = kv_dim,
+                        .gqa_ratio = gqa_ratio,
+                        .seq_len = seq_len, .max_seq_len = m->max_seq_len,
+                        .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                        .scale = scale,
+                    };
                     memset(m->xb2 + h_start * head_dim, 0, (size_t)h_count * head_dim * sizeof(float));
                     tf_attn_worker(&at);
                 }
@@ -4887,15 +5188,18 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 }
             }
 
-            /* KV cache store */
+            /* KV cache store (Gemma4 path is F32-only; transformer_load forces
+             * kv_dtype back to F32 for Gemma4). */
             if (layer->shared_kv_source < 0) {
+                float *kc_l = (float *)m->key_cache[l];
+                float *vc_l = (float *)m->value_cache[l];
                 if (layer->is_swa) {
                     int slot = position % m->swa_window_size;
-                    memcpy(m->key_cache[l]   + slot * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + slot * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                    memcpy(kc_l + slot * local_kv_dim, m->k, local_kv_dim * sizeof(float));
+                    memcpy(vc_l + slot * local_kv_dim, m->v, local_kv_dim * sizeof(float));
                 } else {
-                    memcpy(m->key_cache[l]   + position * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + position * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                    memcpy(kc_l + position * local_kv_dim, m->k, local_kv_dim * sizeof(float));
+                    memcpy(vc_l + position * local_kv_dim, m->v, local_kv_dim * sizeof(float));
                 }
             }
 
@@ -4903,8 +5207,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             {
                 float attn_scale = 1.0f;
                 int seq_len;
-                float *kc = m->key_cache[kv_src];
-                float *vc = m->value_cache[kv_src];
+                float *kc = (float *)m->key_cache[kv_src];
+                float *vc = (float *)m->value_cache[kv_src];
 
                 if (layer->is_swa) {
                     /* SWA: attend to window [max(0, pos-window+1), pos] via circular buffer */
@@ -5073,10 +5377,12 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             TF_PROF_END("rope", 8.0 * (n_heads + n_kv_heads) * head_dim / 2, 0);
 
             /* KV cache */
-            float *kc = m->key_cache[l] + position * kv_dim;
-            float *vc = m->value_cache[l] + position * kv_dim;
-            memcpy(kc, m->k, kv_dim * sizeof(float));
-            memcpy(vc, m->v, kv_dim * sizeof(float));
+            tf_kv_write_all_heads(m->key_cache[l],
+                                  m->key_scales   ? m->key_scales[l]   : NULL,
+                                  m->k, position, n_kv_heads, head_dim, m->kv_dtype);
+            tf_kv_write_all_heads(m->value_cache[l],
+                                  m->value_scales ? m->value_scales[l] : NULL,
+                                  m->v, position, n_kv_heads, head_dim, m->kv_dtype);
 
             /* GQA attention (threaded if pool available) */
             TF_PROF_BEGIN("attention", l, "attention", "FP32");
@@ -5089,17 +5395,33 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 int heads_per = n_heads / nt, heads_extra = n_heads % nt, hoff = 0;
                 for (int t = 0; t < nt; t++) {
                     int hcount = heads_per + (t < heads_extra ? 1 : 0);
-                    atasks[t] = (tf_attn_task){m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
-                                               hoff, hoff + hcount, head_dim, kv_dim, gqa_ratio, seq_len,
-                                               m->max_seq_len, scale};
+                    atasks[t] = (tf_attn_task){
+                        .q = m->q, .att = m->att, .xb2 = m->xb2,
+                        .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
+                        .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
+                        .value_scales = m->value_scales ? m->value_scales[l] : NULL,
+                        .head_start = hoff, .head_end = hoff + hcount,
+                        .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                        .seq_len = seq_len, .max_seq_len = m->max_seq_len,
+                        .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                        .scale = scale,
+                    };
                     hoff += hcount;
                 }
                 tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
             } else {
                 /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
-                tf_attn_task st = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
-                                   0, n_heads, head_dim, kv_dim, gqa_ratio, seq_len,
-                                   m->max_seq_len, scale};
+                tf_attn_task st = {
+                    .q = m->q, .att = m->att, .xb2 = m->xb2,
+                    .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
+                    .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
+                    .value_scales = m->value_scales ? m->value_scales[l] : NULL,
+                    .head_start = 0, .head_end = n_heads,
+                    .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                    .seq_len = seq_len, .max_seq_len = m->max_seq_len,
+                    .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                    .scale = scale,
+                };
                 memset(m->xb2, 0, q_dim * sizeof(float));
                 tf_attn_worker(&st);
             }
@@ -5182,10 +5504,12 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             TF_PROF_END("rope", 8.0 * (n_heads + n_kv_heads) * head_dim / 2, 0);
 
             /* Store K/V into cache at position */
-            float *kc = m->key_cache[l]   + position * kv_dim;
-            float *vc = m->value_cache[l] + position * kv_dim;
-            memcpy(kc, m->k, kv_dim * sizeof(float));
-            memcpy(vc, m->v, kv_dim * sizeof(float));
+            tf_kv_write_all_heads(m->key_cache[l],
+                                  m->key_scales   ? m->key_scales[l]   : NULL,
+                                  m->k, position, n_kv_heads, head_dim, m->kv_dtype);
+            tf_kv_write_all_heads(m->value_cache[l],
+                                  m->value_scales ? m->value_scales[l] : NULL,
+                                  m->v, position, n_kv_heads, head_dim, m->kv_dtype);
 
             /* Multi-head attention with GQA */
             TF_PROF_BEGIN("attention", l, "attention", "FP32");
@@ -5201,17 +5525,33 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 int hoff = 0;
                 for (int t = 0; t < nt; t++) {
                     int hcount = heads_per + (t < heads_extra ? 1 : 0);
-                    atasks[t] = (tf_attn_task){m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
-                                               hoff, hoff + hcount, head_dim, kv_dim, gqa_ratio, seq_len,
-                                               m->max_seq_len, scale};
+                    atasks[t] = (tf_attn_task){
+                        .q = m->q, .att = m->att, .xb2 = m->xb2,
+                        .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
+                        .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
+                        .value_scales = m->value_scales ? m->value_scales[l] : NULL,
+                        .head_start = hoff, .head_end = hoff + hcount,
+                        .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                        .seq_len = seq_len, .max_seq_len = m->max_seq_len,
+                        .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                        .scale = scale,
+                    };
                     hoff += hcount;
                 }
                 tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
             } else {
                 /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
-                tf_attn_task st = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
-                                   0, n_heads, head_dim, kv_dim, gqa_ratio, seq_len,
-                                   m->max_seq_len, scale};
+                tf_attn_task st = {
+                    .q = m->q, .att = m->att, .xb2 = m->xb2,
+                    .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
+                    .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
+                    .value_scales = m->value_scales ? m->value_scales[l] : NULL,
+                    .head_start = 0, .head_end = n_heads,
+                    .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                    .seq_len = seq_len, .max_seq_len = m->max_seq_len,
+                    .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                    .scale = scale,
+                };
                 memset(m->xb2, 0, q_dim * sizeof(float));
                 tf_attn_worker(&st);
             }
@@ -5405,8 +5745,16 @@ void transformer_resize_kv_for_tp(transformer_model *model,
         if (!model->key_cache[l]) continue;  /* SSM layer, no KV cache */
         free(model->key_cache[l]);
         free(model->value_cache[l]);
-        model->key_cache[l]   = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
-        model->value_cache[l] = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
+        model->key_cache[l]   = calloc((size_t)model->max_seq_len * tp_kv_dim, model->kv_elem_bytes);
+        model->value_cache[l] = calloc((size_t)model->max_seq_len * tp_kv_dim, model->kv_elem_bytes);
+        if (model->key_scales) {
+            free(model->key_scales[l]);
+            model->key_scales[l]   = (float *)calloc((size_t)model->max_seq_len * model->n_kv_heads, sizeof(float));
+        }
+        if (model->value_scales) {
+            free(model->value_scales[l]);
+            model->value_scales[l] = (float *)calloc((size_t)model->max_seq_len * model->n_kv_heads, sizeof(float));
+        }
     }
 }
 
@@ -6466,12 +6814,14 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
                             m->rope_freq_base, m->mrope_sections);
         t_rope += tf_time_ms() - t0p;
 
-        /* 5. Store all K/V into cache first (before attention) */
+        /* 5. Store all K/V into cache first (before attention).
+         * The batched path is F32-only — runner must use TF_KV_DTYPE=f32 when
+         * exercising it (asserted at runner level via kv_dtype check). */
         t0p = tf_time_ms();
         for (int t = 0; t < N; t++) {
             int cp = b->cache_pos[t];
-            memcpy(m->key_cache[l]   + (size_t)cp * kv_dim, bk + (size_t)t * kv_dim, kv_dim * sizeof(float));
-            memcpy(m->value_cache[l] + (size_t)cp * kv_dim, bv + (size_t)t * kv_dim, kv_dim * sizeof(float));
+            memcpy((float *)m->key_cache[l]   + (size_t)cp * kv_dim, bk + (size_t)t * kv_dim, kv_dim * sizeof(float));
+            memcpy((float *)m->value_cache[l] + (size_t)cp * kv_dim, bv + (size_t)t * kv_dim, kv_dim * sizeof(float));
         }
         t_kv_store += tf_time_ms() - t0p;
 
@@ -6495,7 +6845,7 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
             for (int ti = 0; ti < nt; ti++) {
                 int hcount = heads_per + (ti < heads_extra ? 1 : 0);
                 atasks[ti] = (tf_attn_gemm_task){
-                    bq, bxb2, m->key_cache[l], m->value_cache[l],
+                    bq, bxb2, (const float *)m->key_cache[l], (const float *)m->value_cache[l],
                     b->cache_pos, batch_att_scratch + (size_t)ti * m->max_seq_len,
                     hoff, hoff + hcount, N, S, head_dim, kv_dim, q_dim, gqa_ratio, scale
                 };
