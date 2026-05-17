@@ -243,9 +243,18 @@ fallback for head_dim=256) bounds further total-time gains.
 
 ### Tier 4 — decode-side
 
-**E. Phase-5 graph capture for hybrid decode** — currently disabled because of SSM state. Per-token decode at 69 ms/tok is ~23% of memory peak; with graph capture removing ~5–10% launch overhead → **decode 69 → 62–65 ms/tok.**
+**E. Phase-5 graph capture for hybrid decode (✅ LANDED 2026-05-17 — correctness improvement, perf-null)** — was disabled because of SSM state. Audited per-token kernels (`decode-graph-capture-audit.md`); all SSM aux ops mutate state in-place via fixed device pointers, gated-attn already uses `*_devp` launchers. Relaxed the `!r->is_hybrid` gate in `hip_llm_phase5_capture` and added a `hip_llm_reset_state` call after capture to scrub the warm-pass state contamination. MoE stays gated (host-side router top-K read can't be captured).
 
-**Effort**: 1–2 days investigation + impl; some correctness risk.
+Measured on RX 9070 XT:
+
+| model | graph ON | graph OFF | delta |
+|---|---:|---:|---:|
+| Qwen3.5-9B Q4_K_XL hybrid | 45.10 ms/tok | 44.54 ms/tok | +1.3% (slower) |
+| Qwen3.6-27B IQ3_XXS hybrid | 69.54 ms/tok | 69.41 ms/tok | +0.2% (slower) |
+
+Both bit-identical first/last decoded token ids → correctness PASS. **Perf-null** because hybrid decode is kernel-execution-bound, not launch-bound. Theoretical launch-overhead ceiling was ~1 ms/tok (200 kernels × 5 µs) ≈ 1.4% of 70 ms/tok, and the driver's existing stream-queue scheduling already amortizes most of that — leaving the captured-graph path effectively a wash. Kept landed because it removes a stale exclusion and brings hybrid to parity with non-hybrid graph eligibility.
+
+**Decode fusion path (rmsnorm+matvec, matvec+residual, qknorm+RoPE+KV) — abandoned 2026-05-17.** Original Phase-2 plan was ~10–15% combined; after the Phase-1 null re-derivation showed the real ceiling at ~3% (launches + input-side VRAM round-trips are negligible vs the ~12 GB/tok weight-read budget). Real decode headroom is **inside the matvec kernels themselves** — per-matvec is at ~60% of memory peak per call, so ~40% × (matvec-fraction-of-time ≈ 50%) ≈ **~20% potential** from kernel internals (wider vectorized quant-weight reads, LDS pipelining, possibly WMMA-decode for quant types). That's a different project — kernel rewrite, not fusion — and is uncertain enough to be scoped separately when next picked up.
 
 ## 5. Realistic stacked-improvement ceiling
 
