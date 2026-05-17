@@ -1359,6 +1359,101 @@ static const char *flux2_kernel_src =
 "        }\n"
 "    }\n"
 "}\n"
+"\n"
+"__global__ void flash_attn_f32_split_partials(float *__restrict__ part_o,\n"
+"    float *__restrict__ part_m, float *__restrict__ part_l,\n"
+"    const float *__restrict__ Q, const float *__restrict__ K,\n"
+"    const float *__restrict__ V,\n"
+"    int N, int n_heads, int head_dim, int split_kv) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int split = blockIdx.z;\n"
+"    int kv_start = split * split_kv;\n"
+"    int kv_end = kv_start + split_kv;\n"
+"    if (kv_end > N) kv_end = N;\n"
+"    int dim = n_heads * head_dim;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane    = threadIdx.x % 32;\n"
+"    int qi = blockIdx.y * FA2_WARPS + warp_id;\n"
+"    float scale = rsqrtf((float)head_dim);\n"
+"    float q_r[FA2_EPT];\n"
+"    for (int e = 0; e < FA2_EPT; e++) {\n"
+"        int d = lane * FA2_EPT + e;\n"
+"        q_r[e] = (qi < N && d < head_dim) ? Q[(long)qi * dim + h * head_dim + d] : 0.0f;\n"
+"    }\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O_r[FA2_EPT];\n"
+"    for (int e = 0; e < FA2_EPT; e++) O_r[e] = 0.0f;\n"
+"    extern __shared__ float smem[];\n"
+"    float *smK = smem, *smV = smem + FA2_BKV * FA2_HD;\n"
+"    int n_threads = FA2_WARPS * 32;\n"
+"    for (int kv_base = kv_start; kv_base < kv_end; kv_base += FA2_BKV) {\n"
+"        int tile_n = kv_end - kv_base;\n"
+"        if (tile_n > FA2_BKV) tile_n = FA2_BKV;\n"
+"        for (int idx = threadIdx.x; idx < FA2_BKV * FA2_HD; idx += n_threads) {\n"
+"            int kj = idx / FA2_HD, d = idx % FA2_HD;\n"
+"            int kv_tok = kv_base + kj;\n"
+"            smK[idx] = (kj < tile_n && d < head_dim) ? K[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"            smV[idx] = (kj < tile_n && d < head_dim) ? V[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int kj = 0; kj < FA2_BKV; kj++) {\n"
+"            float dot = 0.0f;\n"
+"            for (int e = 0; e < FA2_EPT; e++)\n"
+"                dot += q_r[e] * smK[kj * FA2_HD + lane * FA2_EPT + e];\n"
+"            for (int off = 16; off > 0; off >>= 1)\n"
+"                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);\n"
+"            float score = (kj < tile_n) ? dot * scale : -1e30f;\n"
+"            float new_max = fmaxf(m_i, score);\n"
+"            float alpha = expf(m_i - new_max);\n"
+"            float p = expf(score - new_max);\n"
+"            l_i = l_i * alpha + p;\n"
+"            for (int e = 0; e < FA2_EPT; e++)\n"
+"                O_r[e] = O_r[e] * alpha + p * smV[kj * FA2_HD + lane * FA2_EPT + e];\n"
+"            m_i = new_max;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (qi < N) {\n"
+"        long state_idx = ((long)split * N + qi) * n_heads + h;\n"
+"        if (lane == 0) { part_m[state_idx] = m_i; part_l[state_idx] = l_i; }\n"
+"        long base = ((long)split * N + qi) * dim + h * head_dim;\n"
+"        for (int e = 0; e < FA2_EPT; e++) {\n"
+"            int d = lane * FA2_EPT + e;\n"
+"            if (d < head_dim) part_o[base + d] = O_r[e];\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void flash_attn_f32_split_merge(float *__restrict__ out,\n"
+"    const float *__restrict__ part_o,\n"
+"    const float *__restrict__ part_m,\n"
+"    const float *__restrict__ part_l,\n"
+"    int N, int n_heads, int head_dim, int n_splits) {\n"
+"    int h = blockIdx.x;\n"
+"    int qi = blockIdx.y;\n"
+"    int dim = n_heads * head_dim;\n"
+"    float m = -1e30f;\n"
+"    for (int s = 0; s < n_splits; s++) {\n"
+"        long si = ((long)s * N + qi) * n_heads + h;\n"
+"        m = fmaxf(m, part_m[si]);\n"
+"    }\n"
+"    float denom = 0.0f;\n"
+"    for (int s = 0; s < n_splits; s++) {\n"
+"        long si = ((long)s * N + qi) * n_heads + h;\n"
+"        denom += part_l[si] * expf(part_m[si] - m);\n"
+"    }\n"
+"    float inv = (denom > 0.0f) ? 1.0f / denom : 0.0f;\n"
+"    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {\n"
+"        float acc = 0.0f;\n"
+"        for (int s = 0; s < n_splits; s++) {\n"
+"            long si = ((long)s * N + qi) * n_heads + h;\n"
+"            long oi = ((long)s * N + qi) * dim + h * head_dim + d;\n"
+"            acc += part_o[oi] * expf(part_m[si] - m);\n"
+"        }\n"
+"        out[(long)qi * dim + h * head_dim + d] = acc * inv;\n"
+"    }\n"
+"}\n"
 
 /* ============================================================================
  * FP8 Flash Attention helper: F32 -> e4m3 quantization with shared per-tensor
@@ -2688,7 +2783,7 @@ struct cuda_flux2_runner {
     /* MMA m16n8k32 FP8 GEMM with per-tensor scale (sm_89+) */
     CUfunction fn_gemm_fp8_mma, fn_gemm_fp8_mma_bf16;
     int use_fp8_mma;     /* 1 = use MMA path; 0 = use tiled path */
-    CUfunction fn_rmsnorm_ph, fn_swiglu, fn_flash_attn, fn_add;
+    CUfunction fn_rmsnorm_ph, fn_swiglu, fn_flash_attn, fn_flash_attn_split_partials, fn_flash_attn_split_merge, fn_add;
     CUfunction fn_flash_attn_fp8, fn_flash_attn_fp8_ref, fn_quant_fp8, fn_reduce_max_abs, fn_zero_f32;
     CUfunction fn_vae_groupnorm, fn_vae_conv2d, fn_vae_upsample2x, fn_vae_latent_bn;
     CUfunction fn_vae_conv2d_bf16, fn_vae_conv2d_bf16_v2;
@@ -2755,6 +2850,12 @@ struct cuda_flux2_runner {
     CUdeviceptr d_q_bf16, d_k_bf16, d_v_bf16;    /* uint16_t bf16 buffers */
     size_t bf16_attn_buf_n;                      /* allocated count (n_tok*dim halves) */
     int use_bf16_attn;
+    /* Optional split-key F32 attention workspace (FLUX2_FA2_SPLIT_F32). */
+    CUdeviceptr d_attn_part_o;                   /* [n_splits, n_tok, dim] f32 */
+    CUdeviceptr d_attn_part_m;                   /* [n_splits, n_tok, n_heads] f32 */
+    CUdeviceptr d_attn_part_l;                   /* [n_splits, n_tok, n_heads] f32 */
+    size_t attn_part_o_bytes;
+    size_t attn_part_state_bytes;
     /* FP8 v7 GEMM (ported from cuda/gemm) — quantize X to FP8 and use the
      * cp.async + ldmatrix + 4×4 panel-swizzle kernel. Workspace sized to the
      * largest activation across all GEMMs in the step. */
@@ -3426,6 +3527,39 @@ static int ensure_bf16_attn_buf(cuda_flux2_runner *r, size_t n_elems) {
     return 0;
 }
 
+static int ensure_split_attn_buf(cuda_flux2_runner *r, int n_tok, int n_heads,
+                                 int head_dim, int n_splits) {
+    size_t dim = (size_t)n_heads * (size_t)head_dim;
+    size_t o_bytes = (size_t)n_splits * (size_t)n_tok * dim * sizeof(float);
+    size_t state_bytes = (size_t)n_splits * (size_t)n_tok * (size_t)n_heads * sizeof(float);
+    if (o_bytes > r->attn_part_o_bytes) {
+        if (r->d_attn_part_o) { cuMemFree(r->d_attn_part_o); r->d_attn_part_o = 0; }
+        r->attn_part_o_bytes = 0;
+        if (cuMemAlloc(&r->d_attn_part_o, o_bytes) != CUDA_SUCCESS) {
+            r->d_attn_part_o = 0;
+            return -1;
+        }
+        r->attn_part_o_bytes = o_bytes;
+    }
+    if (state_bytes > r->attn_part_state_bytes) {
+        if (r->d_attn_part_m) { cuMemFree(r->d_attn_part_m); r->d_attn_part_m = 0; }
+        if (r->d_attn_part_l) { cuMemFree(r->d_attn_part_l); r->d_attn_part_l = 0; }
+        r->attn_part_state_bytes = 0;
+        if (cuMemAlloc(&r->d_attn_part_m, state_bytes) != CUDA_SUCCESS) {
+            r->d_attn_part_m = 0;
+            return -1;
+        }
+        if (cuMemAlloc(&r->d_attn_part_l, state_bytes) != CUDA_SUCCESS) {
+            cuMemFree(r->d_attn_part_m);
+            r->d_attn_part_m = 0;
+            r->d_attn_part_l = 0;
+            return -1;
+        }
+        r->attn_part_state_bytes = state_bytes;
+    }
+    return 0;
+}
+
 /* Lazily allocate FP8 v7 GEMM workspace (X quant buffer + max + scale).
  * `bytes` is the maximum activation tile size (n_tok * n_in) in FP8 bytes. */
 static int ensure_x_fp8_buf(cuda_flux2_runner *r, size_t bytes) {
@@ -3575,8 +3709,47 @@ static void quantize_buf_fp8(cuda_flux2_runner *r, CUdeviceptr fp8_out,
                    256, 1, 1, 0, r->stream, qargs, NULL);
 }
 
+static int flux2_f32_split_kv_from_env(const char *env, int n_tok) {
+    (void)n_tok;
+    if (!env || env[0] == '0') return 0;
+    if (strcmp(env, "auto") == 0) {
+        /* 2048-token microbench regressed on the test host even at the best
+         * candidate split size, so auto stays off until real-shape tuning says
+         * otherwise. Numeric env values still force the experimental path. */
+        return 0;
+    }
+    int split_kv = atoi(env);
+    return (split_kv <= 1) ? 1024 : split_kv;
+}
+
 static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
                     CUdeviceptr k, CUdeviceptr v, int n_tok, int n_heads, int head_dim) {
+    const char *split_env = getenv("FLUX2_FA2_SPLIT_F32");
+    int split_kv = flux2_f32_split_kv_from_env(split_env, n_tok);
+    if (split_kv > 0 &&
+        r->fn_flash_attn_split_partials && r->fn_flash_attn_split_merge &&
+        head_dim <= 128) {
+        int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (n_splits > 1 &&
+            ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) == 0) {
+            int fa2_warps = 4, fa2_bkv = 32;
+            unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
+            unsigned nt = (unsigned)(32 * fa2_warps);
+            size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
+            void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+                              &q, &k, &v, &n_tok, &n_heads, &head_dim, &split_kv};
+            cuLaunchKernel(r->fn_flash_attn_split_partials,
+                           (unsigned)n_heads, gy, (unsigned)n_splits,
+                           nt, 1, 1, smem, r->stream, p_args, NULL);
+            void *m_args[] = {&out, &r->d_attn_part_o, &r->d_attn_part_m,
+                              &r->d_attn_part_l, &n_tok, &n_heads, &head_dim, &n_splits};
+            cuLaunchKernel(r->fn_flash_attn_split_merge,
+                           (unsigned)n_heads, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, m_args, NULL);
+            return;
+        }
+    }
+
     /* BF16 MMA flash attention path (mma.sync.m16n8k16.bf16, cp.async double-
      * buffered, padded SMEM, ldmatrix.x4.trans P@V). Higher precision than FP8
      * (no per-tensor scale outlier crush) and faster than scalar F32 fallback. */
@@ -4100,6 +4273,10 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
     cuModuleGetFunction(&r->fn_rmsnorm_ph,  mod, "rmsnorm_per_head_f32");
     cuModuleGetFunction(&r->fn_swiglu,      mod, "flux2_swiglu");
     cuModuleGetFunction(&r->fn_flash_attn,  mod, "flash_attn_f32");
+    if (cuModuleGetFunction(&r->fn_flash_attn_split_partials, mod, "flash_attn_f32_split_partials") != CUDA_SUCCESS)
+        r->fn_flash_attn_split_partials = NULL;
+    if (cuModuleGetFunction(&r->fn_flash_attn_split_merge, mod, "flash_attn_f32_split_merge") != CUDA_SUCCESS)
+        r->fn_flash_attn_split_merge = NULL;
     if (cuModuleGetFunction(&r->fn_flash_attn_fp8, mod, "flash_attn_fp8") != CUDA_SUCCESS)
         r->fn_flash_attn_fp8 = NULL;
     if (cuModuleGetFunction(&r->fn_flash_attn_bf16, mod, "flash_attn_bf16") != CUDA_SUCCESS)
@@ -5111,6 +5288,11 @@ void cuda_flux2_free(cuda_flux2_runner *r) {
     if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
     if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
 
+    /* Split-key F32 attention partials */
+    if (r->d_attn_part_o) cuMemFree(r->d_attn_part_o);
+    if (r->d_attn_part_m) cuMemFree(r->d_attn_part_m);
+    if (r->d_attn_part_l) cuMemFree(r->d_attn_part_l);
+
     /* FP8 v7 GEMM workspace (lazily allocated by ensure_x_fp8_buf) */
     if (r->d_x_fp8)   cuMemFree(r->d_x_fp8);
     if (r->d_x_max)   cuMemFree(r->d_x_max);
@@ -5491,13 +5673,10 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     } while(0)
 
     CUdeviceptr d_x = gpu_upload_f32(latent, lc * h * w);
-    #define FLUX2_VAE_FAIL() do { \
-        if (d_x) { cuMemFree(d_x); d_x = 0; } \
-        FLUX2_VAE_DESTROY_EVENTS(); \
-        return -1; \
-    } while(0)
+    CUdeviceptr d_up_pending = 0;
+    int rc = -1;
 
-    if (!d_x) FLUX2_VAE_FAIL();
+    if (!d_x) goto done;
 
     /* NOTE: BN stats (bn.running_mean/var) are training artifacts — do NOT apply.
      * The DiT outputs latents in the correct space for the VAE decoder.
@@ -5505,11 +5684,9 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
 
     if (m->pqc_w) {
         CUdeviceptr d_tmp = 0;
-        if (cuMemAlloc(&d_tmp, (size_t)lc * h * w * sizeof(float)) != CUDA_SUCCESS) {
-            FLUX2_VAE_FAIL();
-        }
+        CU_CHECKED_ALLOC(d_tmp, (size_t)lc * h * w * sizeof(float), "flux2_vae_decode pqc", done);
         op_vae_conv2d(r, d_tmp, d_x, r->d_vae_pqc_w, r->d_vae_pqc_b, lc, h, w, lc, 1, 1, 0);
-        cuMemFree(d_x);
+        CU_FREE(d_x);
         d_x = d_tmp;
     }
     if (vae_dbg) cuEventRecord(ev_pqc, r->stream);
@@ -5517,11 +5694,9 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     {
         int co = m->conv_in_out_ch;
         CUdeviceptr d_tmp = 0;
-        if (cuMemAlloc(&d_tmp, (size_t)co * h * w * sizeof(float)) != CUDA_SUCCESS) {
-            FLUX2_VAE_FAIL();
-        }
+        CU_CHECKED_ALLOC(d_tmp, (size_t)co * h * w * sizeof(float), "flux2_vae_decode conv_in", done);
         vae_conv_3x3(r, d_tmp, d_x, r->d_vae_conv_in_w, r->d_vae_conv_in_b, lc, h, w, co);
-        cuMemFree(d_x);
+        CU_FREE(d_x);
         d_x = d_tmp;
         c = co;
     }
@@ -5529,8 +5704,8 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
 
     {
         CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->mid_res0, &r->vae_mid_res0, h, w, ng);
-        if (!d_tmp) FLUX2_VAE_FAIL();
-        cuMemFree(d_x);
+        if (!d_tmp) goto done;
+        CU_FREE(d_x);
         d_x = d_tmp;
     }
     {
@@ -5539,14 +5714,14 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
         CUdeviceptr d_tmp = flux2_env_enabled("FLUX2_DEBUG_VAE_ATTN_BRIDGE")
             ? flux2_vae_mid_attn_bridge(r, d_x, &m->mid_attn, h, w, ng)
             : flux2_vae_mid_attn_gpu(r, d_x, &m->mid_attn, &r->vae_mid_attn, h, w, ng);
-        if (!d_tmp) FLUX2_VAE_FAIL();
-        cuMemFree(d_x);
+        if (!d_tmp) goto done;
+        CU_FREE(d_x);
         d_x = d_tmp;
     }
     {
         CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->mid_res1, &r->vae_mid_res1, h, w, ng);
-        if (!d_tmp) FLUX2_VAE_FAIL();
-        cuMemFree(d_x);
+        if (!d_tmp) goto done;
+        CU_FREE(d_x);
         d_x = d_tmp;
     }
     if (vae_dbg) cuEventRecord(ev_mid, r->stream);
@@ -5554,41 +5729,37 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     for (int bi = 0; bi < 4; bi++) {
         {
             CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][0], &r->vae_up_res[bi][0], h, w, ng);
-            if (!d_tmp) FLUX2_VAE_FAIL();
-            cuMemFree(d_x);
+            if (!d_tmp) goto done;
+            CU_FREE(d_x);
             d_x = d_tmp;
             c = m->up_res[bi][0].c_out;
         }
         {
             CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][1], &r->vae_up_res[bi][1], h, w, ng);
-            if (!d_tmp) FLUX2_VAE_FAIL();
-            cuMemFree(d_x);
+            if (!d_tmp) goto done;
+            CU_FREE(d_x);
             d_x = d_tmp;
             c = m->up_res[bi][1].c_out;
         }
         {
             CUdeviceptr d_tmp = flux2_vae_resblock_gpu(r, d_x, &m->up_res[bi][2], &r->vae_up_res[bi][2], h, w, ng);
-            if (!d_tmp) FLUX2_VAE_FAIL();
-            cuMemFree(d_x);
+            if (!d_tmp) goto done;
+            CU_FREE(d_x);
             d_x = d_tmp;
             c = m->up_res[bi][2].c_out;
         }
         if (m->up_has_sample[bi]) {
-            CUdeviceptr d_up = op_vae_upsample2x(r, d_x, c, h, w);
-            CUdeviceptr d_tmp;
+            CUdeviceptr d_tmp = 0;
+            d_up_pending = op_vae_upsample2x(r, d_x, c, h, w);
             h *= 2;
             w *= 2;
-            d_tmp = 0;
-            if (!d_up ||
-                cuMemAlloc(&d_tmp, (size_t)c * h * w * sizeof(float)) != CUDA_SUCCESS) {
-                if (d_up) cuMemFree(d_up);
-                FLUX2_VAE_FAIL();
-            }
-            vae_conv_3x3(r, d_tmp, d_up,
+            if (!d_up_pending) goto done;
+            CU_CHECKED_ALLOC(d_tmp, (size_t)c * h * w * sizeof(float), "flux2_vae_decode upsample_conv", done);
+            vae_conv_3x3(r, d_tmp, d_up_pending,
                          r->vae_up_sample[bi].conv_w, r->vae_up_sample[bi].conv_b,
                          c, h, w, c);
-            cuMemFree(d_x);
-            cuMemFree(d_up);
+            CU_FREE(d_x);
+            CU_FREE(d_up_pending);
             d_x = d_tmp;
         }
         if (vae_dbg) cuEventRecord(ev_up[bi], r->stream);
@@ -5597,28 +5768,23 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
     spatial = h * w;
     {
         CUdeviceptr d_tmp = 0;
-        if (cuMemAlloc(&d_tmp, (size_t)c * spatial * sizeof(float)) != CUDA_SUCCESS) {
-            FLUX2_VAE_FAIL();
-        }
+        CU_CHECKED_ALLOC(d_tmp, (size_t)c * spatial * sizeof(float), "flux2_vae_decode norm_out", done);
         op_vae_groupnorm(r, d_tmp, d_x, r->d_vae_norm_out_w, r->d_vae_norm_out_b, c, spatial, ng);
         op_silu(r, d_tmp, c * spatial);
-        cuMemFree(d_x);
+        CU_FREE(d_x);
         d_x = d_tmp;
     }
     {
         CUdeviceptr d_rgb = 0;
-        if (cuMemAlloc(&d_rgb, (size_t)3 * spatial * sizeof(float)) != CUDA_SUCCESS) {
-            FLUX2_VAE_FAIL();
-        }
+        CU_CHECKED_ALLOC(d_rgb, (size_t)3 * spatial * sizeof(float), "flux2_vae_decode conv_out", done);
         vae_conv_3x3(r, d_rgb, d_x, r->d_vae_conv_out_w, r->d_vae_conv_out_b, c, h, w, 3);
-        cuMemFree(d_x);
+        CU_FREE(d_x);
         d_x = d_rgb;
     }
 
     if (vae_dbg) cuEventRecord(ev_tail, r->stream);
     cuCtxSynchronize();
     cuMemcpyDtoH(out_rgb, d_x, (size_t)3 * h * w * sizeof(float));
-    cuMemFree(d_x);
 
     if (vae_dbg) {
         float t_pqc, t_cin, t_mid, t_tail, t_up[4];
@@ -5631,10 +5797,14 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
         fprintf(stderr, "VAE timing: pqc=%.1fms cin=%.1fms mid=%.1fms up0=%.1fms up1=%.1fms up2=%.1fms up3=%.1fms tail=%.1fms\n",
                 t_pqc, t_cin, t_mid, t_up[0], t_up[1], t_up[2], t_up[3], t_tail);
     }
+    rc = 0;
+
+done:
+    CU_FREE(d_x);
+    CU_FREE(d_up_pending);
     FLUX2_VAE_DESTROY_EVENTS();
-    #undef FLUX2_VAE_FAIL
     #undef FLUX2_VAE_DESTROY_EVENTS
-    return 0;
+    return rc;
 }
 
 #endif /* CUDA_FLUX2_RUNNER_IMPLEMENTATION */

@@ -70,8 +70,9 @@ float *cuda_llm_prefill_logits(cuda_llm_runner *r, const int32_t *token_ids,
 /* Free all GPU resources and the runner. */
 void cuda_llm_free(cuda_llm_runner *r);
 
-/* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
-void cuda_llm_reset_state(cuda_llm_runner *r);
+/* Reset KV cache, hidden snapshots, and SSM state. Call between conversations.
+ * Returns 0 on success, -1 if reset could not be completed. */
+int cuda_llm_reset_state(cuda_llm_runner *r);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */
 int cuda_llm_read_hidden(const cuda_llm_runner *r, float *dst, int n);
