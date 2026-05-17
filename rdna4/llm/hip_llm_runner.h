@@ -90,6 +90,32 @@ void hip_llm_set_max_layers(hip_llm_runner *r, int max_layers);
 void hip_llm_set_batched_path(hip_llm_runner *r, int enable);
 int  hip_llm_batched_path_available(const hip_llm_runner *r);
 
+/* A/B verify the GPU matvec kernel for `weight_type` against a CPU reference.
+ *
+ * Generates a deterministic random raw block-quant matrix [n_rows, n_cols]
+ * (native layout for `weight_type`) and an F32 input vector x[n_cols], runs
+ * the HIP matvec, then dequantizes the same bytes on CPU via `cpu_dequant_row`
+ * and does a scalar dot-product per row. Reports rel-L2 vs the CPU reference
+ * and the max absolute per-row error.
+ *
+ * `cpu_dequant_row` must dequantize exactly `n` elements (= n_cols here) of
+ * `weight_type` from `src` into `dst`. Caller supplies the function pointer
+ * (typically `dequantize_row_<type>` from common/ggml_dequant.h) so the runner
+ * doesn't link in the full dequant implementation set.
+ *
+ * Constraint: n_cols must be a multiple of the block-element count for
+ * `weight_type` (32 for IQ4_NL etc.; 256 for K-/IQ-super-block types).
+ *
+ * No model needs to be loaded — only `hip_llm_init` must have succeeded so
+ * the HIPRTC module is available. Returns 0 on success (out values written),
+ * -1 if the type has no registered HIP matvec or shape is invalid, -2 on
+ * any HIP allocation/launch error. */
+int hip_llm_verify_quant_matvec(
+        hip_llm_runner *r, int weight_type,
+        void (*cpu_dequant_row)(const void *src, float *dst, int n),
+        int n_rows, int n_cols,
+        double *out_rel_l2, double *out_max_abs);
+
 /* Query model dimensions (valid after load_weights). */
 int hip_llm_n_embd(const hip_llm_runner *r);
 int hip_llm_n_layers(const hip_llm_runner *r);

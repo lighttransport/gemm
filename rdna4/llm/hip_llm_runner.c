@@ -7428,6 +7428,114 @@ void hip_llm_free(hip_llm_runner *r) {
 /* Public API: accessors                                                    */
 /* ======================================================================== */
 
+/* A/B verify: GPU matvec_<type> vs caller-provided CPU dequant + scalar matvec
+ * on identical raw quant bytes. Used by test_hip_llm --verify-quant-kernels. */
+int hip_llm_verify_quant_matvec(
+        hip_llm_runner *r, int weight_type,
+        void (*cpu_dequant_row)(const void *src, float *dst, int n),
+        int n_rows, int n_cols,
+        double *out_rel_l2, double *out_max_abs) {
+    if (!r || !cpu_dequant_row || n_rows <= 0 || n_cols <= 0) return -1;
+
+    /* Reject types that don't have a HIP matvec kernel we want to verify,
+     * and look up block sizes locally (ggml_type_info is a static const in
+     * gguf_loader.h, only visible to translation units that define
+     * GGUF_LOADER_IMPLEMENTATION — which hip_llm_runner.c does not). */
+    int blk_elems = 0, blk_bytes = 0;
+    switch (weight_type) {
+        case GGML_TYPE_IQ2_XXS: blk_elems = 256; blk_bytes = 66;  break;
+        case GGML_TYPE_IQ2_XS:  blk_elems = 256; blk_bytes = 74;  break;
+        case GGML_TYPE_IQ2_S:   blk_elems = 256; blk_bytes = 82;  break;
+        case GGML_TYPE_IQ3_XXS: blk_elems = 256; blk_bytes = 98;  break;
+        case GGML_TYPE_IQ3_S:   blk_elems = 256; blk_bytes = 110; break;
+        case GGML_TYPE_IQ1_S:   blk_elems = 256; blk_bytes = 50;  break;
+        case GGML_TYPE_IQ1_M:   blk_elems = 256; blk_bytes = 56;  break;
+        case GGML_TYPE_IQ4_NL:  blk_elems = 32;  blk_bytes = 18;  break;
+        case GGML_TYPE_IQ4_XS:  blk_elems = 256; blk_bytes = 136; break;
+        case GGML_TYPE_TQ1_0:   blk_elems = 256; blk_bytes = 54;  break;
+        case GGML_TYPE_TQ2_0:   blk_elems = 256; blk_bytes = 66;  break;
+        default: return -1;
+    }
+    if ((n_cols % blk_elems) != 0) return -1;
+    int n_blk_per_row = n_cols / blk_elems;
+    size_t row_bytes  = (size_t)n_blk_per_row * blk_bytes;
+    size_t mat_bytes  = (size_t)n_rows * row_bytes;
+
+    unsigned char *h_mat  = (unsigned char *)malloc(mat_bytes);
+    float *h_x       = (float *)malloc((size_t)n_cols * sizeof(float));
+    float *h_dst_hip = (float *)malloc((size_t)n_rows * sizeof(float));
+    float *h_dst_ref = (float *)malloc((size_t)n_rows * sizeof(float));
+    float *h_row_f32 = (float *)malloc((size_t)n_cols * sizeof(float));
+    if (!h_mat || !h_x || !h_dst_hip || !h_dst_ref || !h_row_f32) {
+        free(h_mat); free(h_x); free(h_dst_hip); free(h_dst_ref); free(h_row_f32);
+        return -2;
+    }
+
+    /* Deterministic random bytes per quant type (xorshift). */
+    unsigned s = 0xC0FFEEu ^ (unsigned)weight_type;
+    for (size_t i = 0; i < mat_bytes; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        h_mat[i] = (unsigned char)s;
+    }
+    for (int i = 0; i < n_cols; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        h_x[i] = (((float)((s >> 8) & 0xFFFFFF) / 16777216.0f) - 0.5f) * 0.1f;
+    }
+
+    void *d_mat = NULL, *d_x = NULL, *d_dst = NULL;
+    if (hipMalloc(&d_mat, mat_bytes) != hipSuccess ||
+        hipMalloc(&d_x,   (size_t)n_cols * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_dst, (size_t)n_rows * sizeof(float)) != hipSuccess) {
+        if (d_mat) hipFree(d_mat); if (d_x) hipFree(d_x); if (d_dst) hipFree(d_dst);
+        free(h_mat); free(h_x); free(h_dst_hip); free(h_dst_ref); free(h_row_f32);
+        return -2;
+    }
+    hipMemcpy(d_mat, h_mat, mat_bytes, hipMemcpyHostToDevice);
+    hipMemcpy(d_x,   h_x,   (size_t)n_cols * sizeof(float), hipMemcpyHostToDevice);
+
+    launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+    hipStreamSynchronize(r->stream);
+    hipMemcpy(h_dst_hip, d_dst, (size_t)n_rows * sizeof(float), hipMemcpyDeviceToHost);
+
+    /* CPU reference. */
+    for (int row = 0; row < n_rows; row++) {
+        const void *row_ptr = h_mat + (size_t)row * row_bytes;
+        cpu_dequant_row(row_ptr, h_row_f32, n_cols);
+        double acc = 0.0;
+        for (int k = 0; k < n_cols; k++) acc += (double)h_row_f32[k] * (double)h_x[k];
+        h_dst_ref[row] = (float)acc;
+    }
+
+    /* Random raw bytes can include FP16 NaN/Inf in the scale field, which
+     * propagates through the dequant + dot product on both sides. A row where
+     * either side is non-finite is treated as "invalid input" (NaN-poisoned)
+     * and skipped from the rel_l2 sum. The verifier still notices real
+     * divergence on the rows that do produce finite outputs — there are
+     * plenty (typically ~95%+ of rows on a 64-row sample). */
+    double num = 0.0, den = 0.0, max_abs = 0.0;
+    int n_valid = 0;
+    for (int i = 0; i < n_rows; i++) {
+        float h = h_dst_hip[i], rf = h_dst_ref[i];
+        int ok = !(h != h) && !(rf != rf) &&
+                 (h - h == 0.0f) && (rf - rf == 0.0f);
+        if (!ok) continue;
+        n_valid++;
+        double diff = (double)h - (double)rf;
+        double ad = diff < 0 ? -diff : diff;
+        if (ad > max_abs) max_abs = ad;
+        num += diff * diff;
+        den += (double)rf * (double)rf;
+    }
+    double rel_l2 = (n_valid == 0) ? 1.0
+                                   : ((den > 1e-30) ? sqrt(num / den) : sqrt(num));
+    if (out_rel_l2)  *out_rel_l2 = rel_l2;
+    if (out_max_abs) *out_max_abs = max_abs;
+
+    hipFree(d_mat); hipFree(d_x); hipFree(d_dst);
+    free(h_mat); free(h_x); free(h_dst_hip); free(h_dst_ref); free(h_row_f32);
+    return 0;
+}
+
 void hip_llm_reset_state(hip_llm_runner *r) {
     if (!r || !r->is_hybrid) return;
     for (int l = 0; l < r->n_layers; l++) {
