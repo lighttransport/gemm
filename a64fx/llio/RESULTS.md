@@ -110,6 +110,49 @@ Per `llio_transfer(1)`: do **not** open / cp / stat the file in the
 same job before `--sync` — pre-existing first-layer cache data
 conflicts and `--sync` returns "Not enough disk space" or similar.
 
+## 5. `llio_transfer` size limit per sharedtmp allocation
+
+Synthetic-file probe with `--llio sharedtmp-size=40Gi`. Each test uses
+a fresh `dd if=/dev/urandom` file with a 120–150 s pause before
+`--sync` (the LLIO cn-cache holds recent writes; without the pause the
+command returns `LLIO 6452 File was already cached`).
+
+| file size | result | --sync time | bw |
+|---:|---|---:|---:|
+| 5.6 GiB (Q4 gguf) | OK       | 105.2 s | 56.7 MB/s |
+| 7 GiB (synth)     | **OK**   | 96.3 s  | 78 MB/s |
+| 8 GiB (synth)     | NO_SPACE | 0.08 s  | — |
+| 9 GiB (synth)     | NO_SPACE | 0.09 s  | — |
+| 12 GiB (Q8 gguf)  | NO_SPACE | 0.08 s  | — |
+| 17 GiB (BF16 gguf)| NO_SPACE | 0.09 s  | — |
+
+**Usable common-file size ≈ 7 GiB on a 40 GiB sharedtmp allocation**,
+i.e. roughly **18 %** of the requested sharedtmp.
+
+Rule of thumb: request **~6× the largest file** you intend to
+`llio_transfer`. To stage the 17 GiB `Qwen3.5-9B-BF16.gguf`, that
+means `--llio sharedtmp-size>=96Gi` (round up to the per-node cap).
+For the 12 GiB Q8, `sharedtmp-size>=72Gi`.
+
+A few quirks worth knowing:
+
+- **Sparse files don't work.** `truncate -s 1G` then `--sync` returns
+  `LLIO 2452 System error(to be no longer common file)`. The transfer
+  apparently needs real extents.
+- **`--purge` is asynchronous.** After purge, the freed space isn't
+  immediately available; in two back-to-back tests we saw 60–150 s
+  delays before the next `--sync` could allocate. Build a sleep into
+  any script that sequences multiple `--sync`/`--purge` rounds.
+- **dd just-written files trip "already cached".** The cn-cache
+  (`PJM_LLIO_CN_CACHE_SIZE=128 MiB` here) holds dirty/recent pages
+  even after `sync`. A 120–150 s wait clears it in practice.
+- **The `--sync` "not enough space" error is instant** (~80 ms) —
+  it's a cheap pre-flight check, so probing larger sizes is fast.
+
+Probe script: `probe_sharedtmp_limit.sh [WORKDIR] [SIZES_GIB...]`.
+Run it in a fresh job to redo this measurement at a different
+sharedtmp size.
+
 ## Reproducing
 
 ```bash
