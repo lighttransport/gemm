@@ -335,6 +335,27 @@ token ids unchanged. Tried the analogous default Q4_K unroll in the same
 pass, but it regressed `Q4_K 5120x5120` from ~0.099 ms to ~0.200 ms/launch,
 so it was not landed.
 
+**Q4_K decode matvec 64-thread launch (✅ LANDED 2026-05-18)** — changed the
+default Q4_K one-row-per-block launch from 256 to 64 threads/block. Decode
+rows have ~16-68 K-blocks, so the old 256-thread block left most lanes idle
+and paid an 8-warp reduction for little benefit. The 64-thread launch keeps
+the same kernel math and reduces reduction overhead.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q4_K 5120x5120` | 0.099 ms | **0.053 ms** | 1.87x |
+| microbench `Q4_K 17408x5120` | 0.306 ms | **0.157 ms** | 1.95x |
+| profile `matvec_q4_K_f32` total | 70.7 ms | **37.1 ms** | 1.91x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 53.94-53.99 ms/tok | **50.85-51.02 ms/tok** | 1.06x |
+| Qwen3.5-9B Q4_K_XL decode L=256, 16 tok | 36.37 ms/tok | **25.57-25.62 ms/tok** | 1.42x |
+
+Correctness: `--verify-quant-kernels` passes 18/18; 27B and 9B decoded
+first/last token ids unchanged. Tried two alternatives that were not landed:
+packed 8-row Q4_K MW launch (`Q4_K 5120x5120` worsened to 0.154 ms) and a
+paired low/high-nibble accumulator rewrite (0.102 ms).
+
 **Q6_K one-warp-per-row decode matvec (❌ TRIED 2026-05-18 — not landed)** —
 implemented the analogous MW launch shape behind `LLM_Q6_K_MW=1`. It passed
 `--verify-quant-kernels` and improved isolated Q6_K microbenches:

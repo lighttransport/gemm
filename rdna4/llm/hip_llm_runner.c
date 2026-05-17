@@ -5814,7 +5814,7 @@ static inline void launch_matvec_q4_K(hip_llm_runner *r, void *dst, void *mat,
         LAUNCH(r->fn_matvec_q4_K_mw_f32, n_rows, 1, 1, 32, 1, 1, 0,
                r->stream, args);
     } else {
-        LAUNCH(r->fn_matvec_q4_K_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+        LAUNCH(r->fn_matvec_q4_K_f32, n_rows, 1, 1, 64, 1, 1, 0, r->stream, args);
     }
 }
 static inline void launch_matvec_q5_K(hip_llm_runner *r, void *dst, void *mat,
