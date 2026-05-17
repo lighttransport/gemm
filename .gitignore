@@ -71,6 +71,23 @@ cuda/sam3d_body/test_cuda_sam3d_body
 cuda/sam3d_body/verify_*
 !cuda/sam3d_body/verify_*.c
 
+# Generated CUDA runner binaries and outputs
+cuda/*/test_cuda_*
+!cuda/*/test_cuda_*.c
+cuda/*/test_*
+!cuda/*/test_*.c
+cuda/*/test_paint_*
+!cuda/*/test_paint_*.c
+cuda/*/verify_*
+!cuda/*/verify_*.c
+!cuda/*/verify_*.h
+cuda/*/cuda_*.ppm
+cuda/*/cuda_*.npy
+cuda/*/cuda_*.bin
+cuda/*/*.ppm
+cuda/*/cuda_output/
+cuda/*/output_*/
+
 # Build artifact binaries — unit tests
 tests/test_bpe_tokenizer
 tests/test_gguf_loader
@@ -89,6 +106,9 @@ zen2/bench_*
 *.err
 
 # Build artifact binaries — sparse3d
+cpu/*/test_*
+!cpu/*/test_*.c
+cpu/*/logs/
 cpu/sparse3d/test_sparse3d
 cpu/dinov3/test_dinov3
 
@@ -153,6 +173,10 @@ result/
 
 # Local (uncommitted) runner scripts — per-box model paths / env
 server/run-*.local.sh
+server/build/
+server/logs/
+logs/
+trellis2_repo/
 
 # RDNA4 FP8: extracted hipBLASLt Tensile kernel ELF (regenerate via rdna4/fp8/extract_fp8_kernel.sh)
 rdna4/fp8/fp8_kernel_gfx1201.co
