@@ -27,6 +27,22 @@ about staging weights before inference.
 | `run_bench.sh`  | runs all four read benches against a single file |
 | `pjsub_run.sh`  | pjsub wrapper that requests 87 GiB LLIO and runs everything |
 | `llio_transfer_bench.sh` | times `llio_transfer --sync` (L2 common-file cache) and reads from the *original* Lustre path |
+| `probe_sharedtmp_limit.sh` | sweeps synthetic file sizes to find the largest one `llio_transfer --sync` accepts for the current `sharedtmp-size` |
+
+## Summary — pick a staging mechanism
+
+| | `cp → $PJM_LOCALTMP` | `llio_transfer --sync` |
+|---|---|---|
+| max single-file size | up to `localtmp-size` (87 GiB cap) | ~`sharedtmp-size` / 6 (measured: 7 GiB in 40 GiB) |
+| extra alloc per file | none | ~6× the file size |
+| app-visible path | changes to `/local/...` | unchanged (`$HOME/...`) |
+| read bandwidth | ~0.4–0.5 GB/s | ~0.4–0.5 GB/s (equivalent) |
+
+With the default 40 GiB sharedtmp, `cp` works for every gguf in the
+9B set; `llio_transfer` only handles files ≤ ~7 GiB. To stage larger
+files via `llio_transfer`, request `--llio sharedtmp-size=<~6×>`
+(e.g. ≥96 GiB for the 17 GiB BF16 weight). See `RESULTS.md` for the
+full numbers.
 
 ## Quick start (already inside a job with LLIO localtmp)
 

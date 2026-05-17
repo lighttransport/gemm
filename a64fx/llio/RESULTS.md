@@ -134,6 +134,35 @@ Rule of thumb: request **~6× the largest file** you intend to
 means `--llio sharedtmp-size>=96Gi` (round up to the per-node cap).
 For the 12 GiB Q8, `sharedtmp-size>=72Gi`.
 
+| largest file to stage | recommended `sharedtmp-size` |
+|---:|---:|
+| 5 GiB              | ≥30 GiB |
+| 8 GiB              | ≥48 GiB |
+| 12 GiB (Q8 gguf)   | ≥72 GiB |
+| 17 GiB (BF16 gguf) | ≥96 GiB (near per-node cap) |
+
+By contrast, **`cp → $PJM_LOCALTMP` has no per-file overhead** —
+the only limit is the raw `localtmp-size` (87 GiB cap per node), and
+in the prior 87 GiB session the full 40 GiB 9B set fit comfortably.
+Concretely with the current 40 GiB sharedtmp + 40 GiB localtmp
+allocation, `cp` works for every file we have; `llio_transfer` works
+only up to ~7 GiB.
+
+### Choosing between the two
+
+|                                | `cp → $PJM_LOCALTMP`            | `llio_transfer --sync`            |
+|---|---|---|
+| max single-file size            | up to `localtmp-size` (87 GiB cap) | ~`sharedtmp-size` / 6  |
+| extra allocation per file       | none beyond file size           | ~6× the file size                  |
+| path the app sees               | changes to `/local/...`         | unchanged (original `$HOME/...`)   |
+| read bandwidth (steady state)   | ~0.4–0.5 GB/s                   | ~0.4–0.5 GB/s (equivalent)         |
+| populate time (Lustre-bound)    | ~45–60 MB/s                     | ~55–75 MB/s                        |
+| restrictions on the source file | none                            | must not be opened earlier in job; sparse files rejected |
+
+Pick `llio_transfer` when the loader can't be modified to take a
+`/local/...` path; pick `cp` when files are big or you don't want
+to oversize sharedtmp.
+
 A few quirks worth knowing:
 
 - **Sparse files don't work.** `truncate -s 1G` then `--sync` returns
