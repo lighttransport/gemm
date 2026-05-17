@@ -155,6 +155,8 @@ static void usage(const char *p) {
         "  --vit-threads N           (vision encoder threads)\n"
         "  --llm-threads N           (LLM forward threads; default 1)\n"
         "  --no-deepstack            (disable deepstack injection)\n"
+        "  --mmap                    (file-backed weights; slower per matvec)\n"
+        "  --kv-dtype f32|f16|q8     (KV cache element format; default f32)\n"
         "  --seed N                  (rng seed; default time-based)\n",
         p);
 }
@@ -208,6 +210,15 @@ int main(int argc, char **argv) {
             use_deepstack = 0;
         } else if (!strcmp(a, "--mmap")) {
             use_mmap_main = 1;
+        } else if (!strcmp(a, "--kv-dtype") && i + 1 < argc) {
+            const char *kv = argv[++i];
+            if (strcmp(kv, "f32") && strcmp(kv, "fp32") &&
+                strcmp(kv, "f16") && strcmp(kv, "fp16") &&
+                strcmp(kv, "q8")  && strcmp(kv, "int8")) {
+                fprintf(stderr, "unknown kv-dtype '%s' (expected f32|f16|q8)\n", kv);
+                return 1;
+            }
+            setenv("TF_KV_DTYPE", kv, 1);
         } else if (!strcmp(a, "--seed") && i + 1 < argc) {
             seed = (unsigned)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
@@ -393,10 +404,16 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n=== Prefill ===\n");
     int pos = 0;
     double t_pre = mono_sec();
+    int trace_per_tok = getenv("LLM_TRACE_PER_TOK") ? 1 : 0;
 
     /* text before */
     for (int i = 0; i < n_before; i++) {
+        double tt0 = trace_per_tok ? mono_sec() : 0.0;
         transformer_forward(model, tokens_before[i], pos);
+        if (trace_per_tok) {
+            double tt1 = mono_sec();
+            fprintf(stderr, "  pre[%d] tok=%d  %.3f s\n", pos, tokens_before[i], tt1 - tt0);
+        }
         pos++;
     }
 
@@ -421,10 +438,16 @@ int main(int argc, char **argv) {
     /* text after (last token returns logits) */
     float *logits = NULL;
     for (int i = 0; i < n_after; i++) {
+        double tt0 = trace_per_tok ? mono_sec() : 0.0;
         if (i == n_after - 1) {
             logits = transformer_forward_logits(model, tokens_after[i], pos);
         } else {
             transformer_forward(model, tokens_after[i], pos);
+        }
+        if (trace_per_tok) {
+            double tt1 = mono_sec();
+            fprintf(stderr, "  pre[%d] tok=%d  %.3f s%s\n", pos, tokens_after[i], tt1 - tt0,
+                    (i == n_after - 1) ? " (logits)" : "");
         }
         pos++;
     }
