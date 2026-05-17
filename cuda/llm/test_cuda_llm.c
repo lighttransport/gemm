@@ -244,7 +244,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 
     /* Get logits from sequential forward_logits */
-    cuda_llm_reset_state(gpu);
+    if (cuda_llm_reset_state(gpu) != 0) {
+        fprintf(stderr, "cuda_llm_reset_state failed before sequential logits\n");
+        pass = 0;
+        goto cleanup;
+    }
     {
         /* Run all tokens except last to build up state */
         for (int t = 0; t + 1 < max_tokens; t++) {
@@ -277,7 +281,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    cuda_llm_reset_state(gpu);
+    if (cuda_llm_reset_state(gpu) != 0) {
+        fprintf(stderr, "cuda_llm_reset_state failed before prefill hidden\n");
+        pass = 0;
+        goto cleanup;
+    }
     double t0 = get_time_ms();
     float *prefill_hidden = cuda_llm_prefill(gpu, tokens, NULL, 0, max_tokens, 0);
     double prefill_ms = get_time_ms() - t0;
@@ -293,7 +301,11 @@ int main(int argc, char **argv) {
         pass = 0;
     }
 
-    cuda_llm_reset_state(gpu);
+    if (cuda_llm_reset_state(gpu) != 0) {
+        fprintf(stderr, "cuda_llm_reset_state failed before prefill logits\n");
+        pass = 0;
+        goto cleanup;
+    }
     t0 = get_time_ms();
     float *prefill_logits = cuda_llm_prefill_logits(gpu, tokens, NULL, 0, max_tokens, 0);
     double prefill_logits_ms = get_time_ms() - t0;
@@ -328,6 +340,7 @@ int main(int argc, char **argv) {
         pass = 0;
     }
 
+cleanup:
     /* Cleanup */
     free(last_gpu_hidden);
     cuda_llm_free(gpu);

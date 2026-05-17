@@ -21,6 +21,9 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#if defined(__SSE4_2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+#include <nmmintrin.h>
+#endif
 
 static double get_time_ms(void) {
     struct timeval tv;
@@ -3428,6 +3431,27 @@ static const char *cuda_kernel_source =
 "    out[i] = float_to_half(in[i]);\n"
 "}\n"
 "\n"
+"__device__ __forceinline__ unsigned short bf16_to_f16_trunc(unsigned short v) {\n"
+"    unsigned int bits = ((unsigned int)v) << 16;\n"
+"    unsigned short sign = (unsigned short)((bits >> 16) & 0x8000u);\n"
+"    int exp = (int)((bits >> 23) & 0xffu) - 127;\n"
+"    unsigned int mant = bits & 0x7fffffu;\n"
+"    if (exp > 15) return (unsigned short)(sign | 0x7c00u);\n"
+"    if (exp < -14) {\n"
+"        if (exp < -24) return sign;\n"
+"        mant |= 0x800000u;\n"
+"        mant >>= (-1 - exp);\n"
+"        return (unsigned short)(sign | (unsigned short)(mant >> 13));\n"
+"    }\n"
+"    return (unsigned short)(sign | (unsigned short)((exp + 15) << 10) | (unsigned short)(mant >> 13));\n"
+"}\n"
+"\n"
+"__global__ void bf16_to_f16_inplace(unsigned short *data, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    data[i] = bf16_to_f16_trunc(data[i]);\n"
+"}\n"
+"\n"
 "/* Batched F16 embedding lookup: output[token, i] = embd[token_ids[token], i] */\n"
 "__global__ void batch_embed_f16(float *output, const half_raw *embd_table, const int *token_ids,\n"
 "                                 int n_embd, int n_tokens) {\n"
@@ -4241,6 +4265,7 @@ struct cuda_llm_runner {
 
     /* Batched prefill kernels */
     CUfunction fn_convert_f32_to_f16;
+    CUfunction fn_bf16_to_f16_inplace;
     CUfunction fn_batch_embed_f16;
     CUfunction fn_batch_matvec_q8_0_f32;
     CUfunction fn_batch_matvec_q2_K;
@@ -4433,7 +4458,16 @@ static int cuda_llm_bind_context(cuda_llm_runner *r) {
 /* NVRTC kernel compilation                                                 */
 /* ======================================================================== */
 
-#define CLLM_PTX_CACHE_VERSION 14
+#define CLLM_PTX_CACHE_VERSION 18
+
+static uint64_t cllm_kernel_source_hash(const char *s) {
+    uint64_t h = 1469598103934665603ull;
+    while (*s) {
+        h ^= (uint8_t)*s++;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
 
 static int cllm_read_file(const char *path, char **out_data, size_t *out_size) {
     FILE *fp = fopen(path, "rb");
@@ -4468,8 +4502,9 @@ static int compile_kernels(cuda_llm_runner *r) {
     cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, r->device);
     int sm = major * 10 + minor;
     char cache_path[128];
-    snprintf(cache_path, sizeof(cache_path), "/tmp/cuda_llm_sm_%d_v%d.ptx",
-             sm, CLLM_PTX_CACHE_VERSION);
+    uint64_t source_hash = cllm_kernel_source_hash(cuda_kernel_source);
+    snprintf(cache_path, sizeof(cache_path), "/tmp/cuda_llm_sm_%d_v%d_%016llx.ptx",
+             sm, CLLM_PTX_CACHE_VERSION, (unsigned long long)source_hash);
 
     char *ptx = NULL;
     size_t ptx_size = 0;
@@ -4630,6 +4665,7 @@ lookup_funcs:
     GET_FUNC(rope_with_factors_f32);
     /* Batched prefill kernels */
     GET_FUNC(convert_f32_to_f16);
+    GET_FUNC(bf16_to_f16_inplace);
     GET_FUNC(batch_embed_f16);
     GET_FUNC(batch_matvec_q8_0_f32);
     GET_FUNC(batch_matvec_q2_K);
@@ -4730,6 +4766,10 @@ cuda_llm_runner *cuda_llm_init(int device_id, int verbose) {
 /* ======================================================================== */
 /* Weight upload helpers                                                    */
 /* ======================================================================== */
+
+/* Local safetensors-only FP8 type. Uploaded weights are expanded to F16, so
+ * runtime dispatch still sees GGML_TYPE_F16. */
+#define CLLM_TYPE_F8_E4M3 200
 
 /* Upload a qtensor as F16 to GPU (for F16 weights, direct copy; others dequant to F32 then... */
 /* For this model (Qwen3-Embedding-0.6B-f16), all weight matrices are F16. */
@@ -4889,6 +4929,92 @@ static uint16_t cllm_bf16_to_f16(uint16_t v) {
     return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
 }
 
+static float cllm_fp8_e4m3_to_f32(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1u;
+    uint32_t exp  = (b >> 3) & 0xFu;
+    uint32_t mant = b & 0x7u;
+    if (exp == 0 && mant == 0) return sign ? -0.0f : 0.0f;
+    float f;
+    if (exp == 0) {
+        f = ldexpf((float)mant / 8.0f, -6);
+    } else if (exp == 15 && mant == 7) {
+        return 0.0f;
+    } else {
+        f = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
+    }
+    return sign ? -f : f;
+}
+
+static int upload_bf16_matrix_gpu_as_f16(cuda_llm_runner *r, CUdeviceptr *d_ptr,
+                                         const qtensor *t, const char *name) {
+    if (!r || !r->fn_bf16_to_f16_inplace || !t->data) return -1;
+    int n_elements = t->n_rows * t->n_cols;
+    size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
+    CUresult err = cuMemAlloc(d_ptr, nbytes);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_llm: GPU BF16->F16 alloc failed (%zu bytes, err=%d)\n",
+                nbytes, (int)err);
+        *d_ptr = 0;
+        return -1;
+    }
+    err = cuMemcpyHtoDAsync(*d_ptr, t->data, nbytes, r->stream);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_llm: GPU BF16->F16 upload failed (err=%d)\n", (int)err);
+        cuMemFree(*d_ptr);
+        *d_ptr = 0;
+        return -1;
+    }
+    CUdeviceptr data = *d_ptr;
+    void *args[] = { &data, &n_elements };
+    err = cuLaunchKernel(r->fn_bf16_to_f16_inplace,
+                         (unsigned)((n_elements + 255) / 256), 1, 1,
+                         256, 1, 1, 0, r->stream, args, NULL);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_llm: GPU BF16->F16 kernel launch failed (err=%d)\n", (int)err);
+        cuMemFree(*d_ptr);
+        *d_ptr = 0;
+        return -1;
+    }
+    err = cuStreamSynchronize(r->stream);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_llm: GPU BF16->F16 sync failed (err=%d)\n", (int)err);
+        cuMemFree(*d_ptr);
+        *d_ptr = 0;
+        return -1;
+    }
+    if (getenv("CUDA_LLM_GPU_BF16_VERIFY")) {
+        uint16_t *got = (uint16_t *)malloc(nbytes);
+        if (!got) {
+            cuMemFree(*d_ptr);
+            *d_ptr = 0;
+            return -1;
+        }
+        err = cuMemcpyDtoH(got, *d_ptr, nbytes);
+        if (err != CUDA_SUCCESS) {
+            fprintf(stderr, "cuda_llm: GPU BF16->F16 verify copy failed (err=%d)\n", (int)err);
+            free(got);
+            cuMemFree(*d_ptr);
+            *d_ptr = 0;
+            return -1;
+        }
+        const uint16_t *src = (const uint16_t *)t->data;
+        for (int i = 0; i < n_elements; i++) {
+            uint16_t want = cllm_bf16_to_f16(src[i]);
+            if (got[i] != want) {
+                fprintf(stderr,
+                        "cuda_llm: GPU BF16->F16 mismatch at %s[%d]: bf16=%04x got=%04x want=%04x\n",
+                        name ? name : "?", i, src[i], got[i], want);
+                free(got);
+                cuMemFree(*d_ptr);
+                *d_ptr = 0;
+                return -1;
+            }
+        }
+        free(got);
+    }
+    return 0;
+}
+
 /* ---- F16 weight cache (persistent BF16→F16 sidecar) -----------------------
  *
  * On the cold path the runner converts every BF16 safetensors weight to F16
@@ -4918,7 +5044,83 @@ typedef struct {
 static cllm_f16cache_t g_f16cache = {0};
 
 #define CLLM_F16CACHE_MAGIC 0x43464C4331u  /* "1CLFC" */
-#define CLLM_F16CACHE_VERSION 1u
+#define CLLM_F16CACHE_VERSION 3u
+
+static uint64_t cllm_f16cache_hash64(const void *data, size_t n, uint64_t h) {
+    const uint8_t *p = (const uint8_t *)data;
+    if (!h) h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64_t cllm_f16cache_record_sig(const char *name, const qtensor *t, size_t n_bytes) {
+    uint64_t h = cllm_f16cache_hash64(name ? name : "?", strlen(name ? name : "?"), 0);
+    uint64_t v[7] = {
+        (uint64_t)t->type,
+        (uint64_t)t->n_dims,
+        (uint64_t)t->n_rows,
+        (uint64_t)t->n_cols,
+        (uint64_t)t->dims[0],
+        (uint64_t)t->dims[1],
+        (uint64_t)n_bytes
+    };
+    return cllm_f16cache_hash64(v, sizeof(v), h);
+}
+
+static uint32_t cllm_f16cache_crc32(const void *data, size_t n) {
+#if defined(__SSE4_2__) && (defined(__x86_64__) || defined(_M_X64))
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t c = 0xFFFFFFFFu;
+    while (n >= 8) {
+        uint64_t v;
+        memcpy(&v, p, sizeof(v));
+        c = _mm_crc32_u64(c, v);
+        p += 8;
+        n -= 8;
+    }
+    uint32_t c32 = (uint32_t)c;
+    while (n > 0) {
+        c32 = _mm_crc32_u8(c32, *p++);
+        n--;
+    }
+    return c32 ^ 0xFFFFFFFFu;
+#elif defined(__SSE4_2__) && (defined(__i386__) || defined(_M_IX86))
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t c = 0xFFFFFFFFu;
+    while (n >= 4) {
+        uint32_t v;
+        memcpy(&v, p, sizeof(v));
+        c = _mm_crc32_u32(c, v);
+        p += 4;
+        n -= 4;
+    }
+    while (n > 0) {
+        c = _mm_crc32_u8(c, *p++);
+        n--;
+    }
+    return c ^ 0xFFFFFFFFu;
+#else
+    static uint32_t table[256];
+    static int table_ready = 0;
+    if (!table_ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; j++)
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        table_ready = 1;
+    }
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++)
+        c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+#endif
+}
 
 static uint64_t cllm_f16cache_compute_key(const char *model_path) {
     struct stat sb;
@@ -4954,6 +5156,7 @@ static void cllm_f16cache_sidecar_path(const char *model_path, char *out, size_t
 static void cllm_f16cache_begin(const char *model_path, int verbose) {
     memset(&g_f16cache, 0, sizeof(g_f16cache));
     if (getenv("FLUX2_F16CACHE_DISABLE")) return;
+    if (getenv("CUDA_LLM_GPU_BF16_TO_F16")) return;
     if (!model_path) return;
 
     g_f16cache.key = cllm_f16cache_compute_key(model_path);
@@ -5005,23 +5208,61 @@ static void cllm_f16cache_begin(const char *model_path, int verbose) {
 }
 
 /* Reader: returns pointer to n_bytes of cached F16 data (consumed from cursor),
- * or NULL if cache is in write mode / aborted / underflow. */
-static const void *cllm_f16cache_read_consume(size_t n_bytes) {
+ * or NULL if cache is in write mode / aborted / underflow / signature mismatch. */
+static const void *cllm_f16cache_read_consume(const char *name, const qtensor *t, size_t n_bytes) {
     if (!g_f16cache.active_read || g_f16cache.aborted) return NULL;
-    if (g_f16cache.read_pos + n_bytes > g_f16cache.map_size) {
-        fprintf(stderr, "cuda_llm: f16 cache underflow (need %zu, have %zu)\n",
-                n_bytes, g_f16cache.map_size - g_f16cache.read_pos);
+    if (g_f16cache.read_pos + 3 * sizeof(uint64_t) > g_f16cache.map_size) {
+        fprintf(stderr, "cuda_llm: f16 cache record header underflow at %s\n",
+                name ? name : "?");
+        g_f16cache.aborted = 1;
+        return NULL;
+    }
+    const uint64_t *rec = (const uint64_t *)(g_f16cache.map_base + g_f16cache.read_pos);
+    uint64_t sig = cllm_f16cache_record_sig(name, t, n_bytes);
+    uint64_t rec_sig = rec[0];
+    uint64_t rec_bytes = rec[1];
+    uint32_t rec_crc = (uint32_t)rec[2];
+    g_f16cache.read_pos += 3 * sizeof(uint64_t);
+    if (rec_sig != sig || rec_bytes != (uint64_t)n_bytes ||
+        g_f16cache.read_pos + n_bytes > g_f16cache.map_size) {
+        fprintf(stderr,
+                "cuda_llm: f16 cache record mismatch at %s "
+                "(sig %llx/%llx, bytes %llu/%zu); invalidating\n",
+                name ? name : "?",
+                (unsigned long long)rec_sig, (unsigned long long)sig,
+                (unsigned long long)rec_bytes, n_bytes);
         g_f16cache.aborted = 1;
         return NULL;
     }
     const void *p = g_f16cache.map_base + g_f16cache.read_pos;
+    uint32_t crc = cllm_f16cache_crc32(p, n_bytes);
+    if (crc != rec_crc) {
+        fprintf(stderr,
+                "cuda_llm: f16 cache CRC mismatch at %s (%08x/%08x); invalidating\n",
+                name ? name : "?", rec_crc, crc);
+        g_f16cache.aborted = 1;
+        return NULL;
+    }
     g_f16cache.read_pos += n_bytes;
     return p;
 }
 
 /* Writer: append n_bytes of converted F16 to the sidecar. */
-static void cllm_f16cache_write_append(const void *data, size_t n_bytes) {
+static void cllm_f16cache_write_append(const char *name, const qtensor *t,
+                                       const void *data, size_t n_bytes) {
     if (!g_f16cache.active_write || g_f16cache.aborted) return;
+    uint64_t rec[3] = {
+        cllm_f16cache_record_sig(name, t, n_bytes),
+        (uint64_t)n_bytes,
+        (uint64_t)cllm_f16cache_crc32(data, n_bytes)
+    };
+    if (fwrite(rec, sizeof(rec), 1, g_f16cache.write_fp) != 1) {
+        fprintf(stderr, "cuda_llm: f16 cache record write failed; aborting\n");
+        g_f16cache.aborted = 1;
+        fclose(g_f16cache.write_fp); g_f16cache.write_fp = NULL;
+        unlink(g_f16cache.path_tmp);
+        return;
+    }
     if (fwrite(data, 1, n_bytes, g_f16cache.write_fp) != n_bytes) {
         fprintf(stderr, "cuda_llm: f16 cache write failed; aborting\n");
         g_f16cache.aborted = 1;
@@ -5033,6 +5274,11 @@ static void cllm_f16cache_write_append(const void *data, size_t n_bytes) {
 static void cllm_f16cache_end(int success, int verbose) {
     if (g_f16cache.active_read) {
         if (g_f16cache.map_base) munmap((void *)g_f16cache.map_base, g_f16cache.map_size);
+        if (g_f16cache.aborted) {
+            unlink(g_f16cache.path_final);
+            if (verbose >= 1)
+                fprintf(stderr, "cuda_llm: f16 cache invalidated %s\n", g_f16cache.path_final);
+        }
     } else if (g_f16cache.active_write && g_f16cache.write_fp) {
         if (success && !g_f16cache.aborted) {
             long payload_end = ftell(g_f16cache.write_fp);
@@ -5092,7 +5338,8 @@ static int upload_weight_f32(CUdeviceptr *d_ptr, const qtensor *t) {
     return 0;
 }
 
-static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t, int *out_type) {
+static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t,
+                                int *out_type, const char *cache_name) {
     *out_type = t->type;
     if (t->type == GGML_TYPE_Q8_0) {
         return upload_q8_0_raw(r, d_ptr, t);
@@ -5124,7 +5371,7 @@ static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qt
         int n_elements = t->n_rows * t->n_cols;
         size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
         CUresult err;
-        const void *cached = cllm_f16cache_read_consume(nbytes);
+        const void *cached = cllm_f16cache_read_consume(cache_name, t, nbytes);
         if (cached) {
             err = cuMemAlloc(d_ptr, nbytes);
             if (err != CUDA_SUCCESS) return -1;
@@ -5132,12 +5379,30 @@ static int upload_weight_matrix(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qt
             if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
             return 0;
         }
+        if (getenv("CUDA_LLM_GPU_BF16_TO_F16")) {
+            return upload_bf16_matrix_gpu_as_f16(r, d_ptr, t, cache_name);
+        }
         uint16_t *f16_buf = (uint16_t *)cllm_stage_buf(r, nbytes);
         if (!f16_buf) return -1;
         const uint16_t *src = (const uint16_t *)t->data;
         for (int i = 0; i < n_elements; i++) f16_buf[i] = cllm_bf16_to_f16(src[i]);
-        cllm_f16cache_write_append(f16_buf, nbytes);
+        cllm_f16cache_write_append(cache_name, t, f16_buf, nbytes);
         err = cuMemAlloc(d_ptr, nbytes);
+        if (err != CUDA_SUCCESS) { return -1; }
+        err = cuMemcpyHtoD(*d_ptr, f16_buf, nbytes);
+        if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
+        return 0;
+    } else if (t->type == CLLM_TYPE_F8_E4M3) {
+        *out_type = GGML_TYPE_F16;
+        int n_elements = t->n_rows * t->n_cols;
+        size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
+        uint16_t *f16_buf = (uint16_t *)cllm_stage_buf(r, nbytes);
+        if (!f16_buf) return -1;
+        const uint8_t *src = (const uint8_t *)t->data;
+        float scale = t->has_scale ? t->scale : 1.0f;
+        for (int i = 0; i < n_elements; i++)
+            f16_buf[i] = cllm_f32_to_f16(cllm_fp8_e4m3_to_f32(src[i]) * scale);
+        CUresult err = cuMemAlloc(d_ptr, nbytes);
         if (err != CUDA_SUCCESS) { return -1; }
         err = cuMemcpyHtoD(*d_ptr, f16_buf, nbytes);
         if (err != CUDA_SUCCESS) { cuMemFree(*d_ptr); *d_ptr = 0; return -1; }
@@ -5229,6 +5494,22 @@ static int cllm_st_dtype_to_ggml(const char *dtype) {
     if (strcmp(dtype, "F32") == 0) return GGML_TYPE_F32;
     if (strcmp(dtype, "F16") == 0) return GGML_TYPE_F16;
     if (strcmp(dtype, "BF16") == 0) return GGML_TYPE_BF16;
+    if (strcmp(dtype, "F8_E4M3") == 0) return CLLM_TYPE_F8_E4M3;
+    return -1;
+}
+
+static int cllm_st_read_scalar_f32_multi(st_context **shards, int n_shards,
+                                         const char *name, float *out) {
+    for (int s = 0; s < n_shards; s++) {
+        int idx = safetensors_find(shards[s], name);
+        if (idx < 0) continue;
+        if (strcmp(safetensors_dtype(shards[s], idx), "F32") != 0 ||
+            safetensors_nbytes(shards[s], idx) != sizeof(float)) {
+            return -1;
+        }
+        memcpy(out, safetensors_data(shards[s], idx), sizeof(float));
+        return 0;
+    }
     return -1;
 }
 
@@ -5258,8 +5539,23 @@ static qtensor cllm_st_load_tensor_multi(st_context **shards, int n_shards,
     t.data = safetensors_data(st, idx);
     t.type = ggml_type;
     t.n_dims = nd > 4 ? 4 : nd;
+    if (ggml_type == CLLM_TYPE_F8_E4M3) {
+        size_t name_len = strlen(name);
+        if (name_len > 7 && strcmp(name + name_len - 7, ".weight") == 0) {
+            char scale_name[512];
+            if (name_len - 7 + strlen(".scale_weight") < sizeof(scale_name)) {
+                memcpy(scale_name, name, name_len - 7);
+                strcpy(scale_name + name_len - 7, ".scale_weight");
+                float scale = 1.0f;
+                if (cllm_st_read_scalar_f32_multi(shards, n_shards, scale_name, &scale) == 0) {
+                    t.scale = scale;
+                    t.has_scale = 1;
+                }
+            }
+        }
+    }
     if (nd <= 1) {
-        int n = (int)sh[0];
+        int n = (nd == 0) ? 1 : (int)sh[0];
         t.n_rows = 1;
         t.n_cols = n;
         t.dims[0] = (uint64_t)n;
@@ -5729,7 +6025,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
     {
         qtensor output = cllm_load_tensor(gguf, "output.weight", 0);
         if (output.data) {
-            if (upload_weight_matrix(r, &r->d_output_w, &output, &r->output_w_type) != 0) { fprintf(stderr, "cuda_llm: output.weight upload failed!\n"); return -1; }
+            if (upload_weight_matrix(r, &r->d_output_w, &output, &r->output_w_type, "output.weight") != 0) { fprintf(stderr, "cuda_llm: output.weight upload failed!\n"); return -1; }
             r->has_lm_head = 1;
             if (r->verbose) fprintf(stderr, "cuda_llm: output.weight loaded (type=%d)\n", r->output_w_type);
         } else {
@@ -5777,7 +6073,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                 snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
                 t = cllm_load_tensor(gguf, name, 1); \
                 cl->rows_f = t.n_rows; cl->cols_f = t.n_cols; \
-                if (upload_weight_matrix(r, &cl->field, &t, &cl->type_f) != 0) return -1; \
+                if (upload_weight_matrix(r, &cl->field, &t, &cl->type_f, name) != 0) return -1; \
             } while(0)
             LOAD_SSM_W(ssm_qkv_w,   "attn_qkv",  ssm_qkv_rows,   ssm_qkv_cols,   ssm_qkv_type);
             if (upload_q8_0_shadow_f16(r, &cl->ssm_qkv_w_f16, &t) != 0) return -1;
@@ -5828,13 +6124,13 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->attn_q_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->attn_k_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
@@ -5842,7 +6138,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             cl->has_v_proj = (t.data != NULL);
             if (cl->has_v_proj) {
                 cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
-                if (upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type) != 0) return -1;
+                if (upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type, name) != 0) return -1;
                 if (upload_q8_0_shadow_f16(r, &cl->attn_v_w_f16, &t) != 0) return -1;
             } else {
                 /* V = K for this layer (Gemma4 pattern) */
@@ -5857,7 +6153,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->attn_output_w_f16, &t) != 0) return -1;
 
             /* QK norms (F32, optional) */
@@ -5965,17 +6261,17 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_gate_rows = t.n_rows; cl->moe_shared_gate_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->moe_shared_ffn_gate_w, &t, &cl->moe_shared_gate_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_gate_w, &t, &cl->moe_shared_gate_type, name) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_up_rows = t.n_rows; cl->moe_shared_up_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->moe_shared_ffn_up_w, &t, &cl->moe_shared_up_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_up_w, &t, &cl->moe_shared_up_type, name) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->moe_shared_down_rows = t.n_rows; cl->moe_shared_down_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->moe_shared_ffn_down_w, &t, &cl->moe_shared_down_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->moe_shared_ffn_down_w, &t, &cl->moe_shared_down_type, name) != 0) return -1;
 
             if (r->verbose >= 2) {
                 fprintf(stderr, "  layer %d [MoE]: router[%d×%d] exp_gu[%d×%d] exp_d[%d×%d] stride_gu=%zu stride_d=%zu\n",
@@ -5993,19 +6289,19 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
             snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->ffn_gate_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->ffn_up_w_f16, &t) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
             t = cllm_load_tensor(gguf, name, 1);
             cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
-            if (upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
+            if (upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type, name) != 0) return -1;
             if (upload_q8_0_shadow_f16(r, &cl->ffn_down_w_f16, &t) != 0) return -1;
         }
 
@@ -6040,7 +6336,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                     cl->ple_inp_gate_type = GGML_TYPE_F32;
                     if (upload_weight_f32(&cl->ple_inp_gate_w, &t) != 0) return -1;
                 } else {
-                    if (upload_weight_matrix(r, &cl->ple_inp_gate_w, &t, &cl->ple_inp_gate_type) != 0) return -1;
+                    if (upload_weight_matrix(r, &cl->ple_inp_gate_w, &t, &cl->ple_inp_gate_type, name) != 0) return -1;
                 }
 
                 snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
@@ -6050,7 +6346,7 @@ int cuda_llm_load_weights(cuda_llm_runner *r, gguf_context *gguf, int max_seq_le
                     cl->ple_proj_type = GGML_TYPE_F32;
                     if (upload_weight_f32(&cl->ple_proj_w, &t) != 0) return -1;
                 } else {
-                    if (upload_weight_matrix(r, &cl->ple_proj_w, &t, &cl->ple_proj_type) != 0) return -1;
+                    if (upload_weight_matrix(r, &cl->ple_proj_w, &t, &cl->ple_proj_type, name) != 0) return -1;
                 }
 
                 /* PLE post-norm (F32) */
@@ -6327,7 +6623,7 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
     if (!embd.data) { cllm_close_safetensors_shards(shards, n_shards); cllm_f16cache_end(0, r->verbose); return -1; }
     qtensor q0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.q_proj.weight", 1);
     qtensor k0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.k_proj.weight", 1);
-    qtensor qn0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.q_norm.weight", 1);
+    qtensor qn0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.self_attn.q_norm.weight", 0);
     qtensor ff0 = cllm_st_load_tensor_multi(shards, n_shards, "model.layers.0.mlp.gate_proj.weight", 1);
     (void)r0; (void)c0;
 
@@ -6352,7 +6648,8 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
                 r->n_embd, r->n_heads, r->n_kv_heads, r->n_layers, r->n_ff, r->head_dim);
     }
 
-    if (upload_weight_matrix(r, &r->d_token_embd, &embd, &r->token_embd_type) != 0) {
+    if (upload_weight_matrix(r, &r->d_token_embd, &embd, &r->token_embd_type,
+                             "model.embed_tokens.weight") != 0) {
         cllm_close_safetensors_shards(shards, n_shards);
         cllm_f16cache_end(0, r->verbose);
         return -1;
@@ -6392,7 +6689,7 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
         t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
         cl->attn_q_rows = t.n_rows; cl->attn_q_cols = t.n_cols;
-        if (!t.data || upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type) != 0) {
+        if (!t.data || upload_weight_matrix(r, &cl->attn_q_w, &t, &cl->attn_q_type, name) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
@@ -6401,7 +6698,7 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
         t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
         cl->attn_k_rows = t.n_rows; cl->attn_k_cols = t.n_cols;
-        if (!t.data || upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type) != 0) {
+        if (!t.data || upload_weight_matrix(r, &cl->attn_k_w, &t, &cl->attn_k_type, name) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
@@ -6410,7 +6707,7 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
         t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
         cl->attn_v_rows = t.n_rows; cl->attn_v_cols = t.n_cols;
-        if (!t.data || upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type) != 0) {
+        if (!t.data || upload_weight_matrix(r, &cl->attn_v_w, &t, &cl->attn_v_type, name) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
@@ -6419,24 +6716,25 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
         t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
         cl->attn_output_rows = t.n_rows; cl->attn_output_cols = t.n_cols;
-        if (!t.data || upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type) != 0) {
+        if (!t.data || upload_weight_matrix(r, &cl->attn_output_w, &t, &cl->attn_output_type, name) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
         }
 
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
-        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
-        cl->has_qk_norm = 1;
-        if (!t.data || upload_norm_f32(r, &cl->attn_q_norm_w, &t, r->head_dim) != 0) {
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 0);
+        cl->has_qk_norm = (t.data != NULL);
+        if (t.data && upload_norm_f32(r, &cl->attn_q_norm_w, &t, r->head_dim) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
         }
 
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", l);
-        t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
-        if (!t.data || upload_norm_f32(r, &cl->attn_k_norm_w, &t, r->head_dim) != 0) {
+        t = cllm_st_load_tensor_multi(shards, n_shards, name, 0);
+        if (t.data) cl->has_qk_norm = 1;
+        if (t.data && upload_norm_f32(r, &cl->attn_k_norm_w, &t, r->head_dim) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
@@ -6453,7 +6751,7 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", l);
         t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
         cl->ffn_gate_rows = t.n_rows; cl->ffn_gate_cols = t.n_cols;
-        if (!t.data || upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type) != 0) {
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_gate_w, &t, &cl->ffn_gate_type, name) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
@@ -6462,7 +6760,7 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
         snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", l);
         t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
         cl->ffn_up_rows = t.n_rows; cl->ffn_up_cols = t.n_cols;
-        if (!t.data || upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type) != 0) {
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_up_w, &t, &cl->ffn_up_type, name) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
@@ -6471,7 +6769,7 @@ int cuda_llm_load_weights_qwen3_safetensors(cuda_llm_runner *r,
         snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
         t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
         cl->ffn_down_rows = t.n_rows; cl->ffn_down_cols = t.n_cols;
-        if (!t.data || upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) {
+        if (!t.data || upload_weight_matrix(r, &cl->ffn_down_w, &t, &cl->ffn_down_type, name) != 0) {
             cllm_close_safetensors_shards(shards, n_shards);
             cllm_f16cache_end(0, r->verbose);
             return -1;
@@ -9395,6 +9693,11 @@ float *cuda_llm_vision_encode(cuda_llm_runner *r, gguf_context *mmproj_gguf,
     int ph = image_size / patch_size, pw = ph;
     int n_patches = ph * pw;
     int n_merged = (ph / spatial_merge) * (pw / spatial_merge);
+    if (image_w < image_size || image_h < image_size) {
+        fprintf(stderr, "cuda_vision: image %dx%d smaller than model input %dx%d\n",
+                image_w, image_h, image_size, image_size);
+        return NULL;
+    }
 
     if (r->verbose >= 1)
         fprintf(stderr, "cuda_vision: dim=%d heads=%d blocks=%d patches=%d merged=%d proj=%d\n",
@@ -9839,9 +10142,9 @@ void cuda_llm_free(cuda_llm_runner *r) {
 /* Public API: accessors                                                    */
 /* ======================================================================== */
 
-void cuda_llm_reset_state(cuda_llm_runner *r) {
-    if (!r) return;
-    if (cuda_llm_bind_context(r) != 0) return;
+int cuda_llm_reset_state(cuda_llm_runner *r) {
+    if (!r) return -1;
+    if (cuda_llm_bind_context(r) != 0) return -1;
 
     int kv_dim = r->n_kv_heads * r->head_dim;
     if (r->d_key_cache && r->d_value_cache && r->max_seq_len > 0) {
@@ -9865,7 +10168,7 @@ void cuda_llm_reset_state(cuda_llm_runner *r) {
                                 (unsigned long long)(src >= 0 && src < r->n_layers ? r->d_key_cache[src] : 0),
                                 (unsigned long long)r->d_value_cache[l],
                                 (unsigned long long)(src >= 0 && src < r->n_layers ? r->d_value_cache[src] : 0));
-                        return;
+                        return -1;
                     }
                 }
             }
@@ -9906,7 +10209,17 @@ void cuda_llm_reset_state(cuda_llm_runner *r) {
             }
         }
     }
-    cuStreamSynchronize(r->stream);
+    {
+        CUresult err = cuStreamSynchronize(r->stream);
+        if (err != CUDA_SUCCESS) {
+            const char *es = "?";
+            cuGetErrorString(err, &es);
+            fprintf(stderr, "cuda_llm: reset synchronize failed: %s (%d)\n",
+                    es, (int)err);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int cuda_llm_inject_biases(cuda_llm_runner *r, const char *safetensors_path) {
