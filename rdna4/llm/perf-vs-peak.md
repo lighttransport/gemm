@@ -297,6 +297,24 @@ and measured 5.854/6.004 ms/tok on two L=256 prefill runs. A related
 correctness but regressed the same 27B prefill bench from 6.083 to
 6.176 ms/tok.
 
+**IQ3_XXS decode matvec loop unroll (✅ LANDED 2026-05-18)** — added explicit
+unroll hints to the fixed 8 x 4 x 4 IQ3_XXS decode-matvec block loops. The
+compiler had not fully flattened the loop nest, and the hint materially
+reduced the hottest decode kernel without changing the arithmetic.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `IQ3_XXS 5120x5120` | 0.0531 ms | **0.0465 ms** | 1.14x |
+| microbench `IQ3_XXS 17408x5120` | 0.1528 ms | **0.1372 ms** | 1.11x |
+| microbench `IQ3_XXS 5120x17408` | 0.1586 ms | **0.1345 ms** | 1.18x |
+| profile `matvec_iq3_xxs_f32` total | 253.3 ms | **226.0 ms** | 1.12x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 62.8-62.9 ms/tok | **57.78 ms/tok** | 1.09x |
+
+Correctness: `--verify-quant-kernels` passes 18/18; 27B decoded first/last
+token ids unchanged.
+
 **Q6_K one-warp-per-row decode matvec (❌ TRIED 2026-05-18 — not landed)** —
 implemented the analogous MW launch shape behind `LLM_Q6_K_MW=1`. It passed
 `--verify-quant-kernels` and improved isolated Q6_K microbenches:
