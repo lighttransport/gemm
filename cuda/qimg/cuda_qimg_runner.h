@@ -831,6 +831,102 @@ static const char *qimg_kernel_src =
 "        }\n"
 "    }\n"
 "}\n"
+"\n"
+"__global__ void flash_attn_f32_split_partials(float *__restrict__ part_o,\n"
+"    float *__restrict__ part_m, float *__restrict__ part_l,\n"
+"    const float *__restrict__ Q, const float *__restrict__ K,\n"
+"    const float *__restrict__ V,\n"
+"    int N, int n_heads, int head_dim, int split_kv) {\n"
+"    int h  = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int split = blockIdx.z;\n"
+"    int kv_start = split * split_kv;\n"
+"    int kv_end = kv_start + split_kv;\n"
+"    if (kv_end > N) kv_end = N;\n"
+"    int dim = n_heads * head_dim;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane    = threadIdx.x % 32;\n"
+"    int qi = blockIdx.y * FA2_WARPS + warp_id;\n"
+"    float scale = rsqrtf((float)head_dim);\n"
+"    float q_r[FA2_EPT];\n"
+"    for (int e = 0; e < FA2_EPT; e++) {\n"
+"        int d = lane * FA2_EPT + e;\n"
+"        q_r[e] = (qi < N && d < head_dim) ? Q[(long)qi * dim + h * head_dim + d] : 0.0f;\n"
+"    }\n"
+"    float m_i = -1e30f, l_i = 0.0f;\n"
+"    float O_r[FA2_EPT];\n"
+"    for (int e = 0; e < FA2_EPT; e++) O_r[e] = 0.0f;\n"
+"    extern __shared__ float smem[];\n"
+"    float *smK = smem;\n"
+"    float *smV = smem + FA2_BKV * FA2_HD;\n"
+"    int n_threads = FA2_WARPS * 32;\n"
+"    for (int kv_base = kv_start; kv_base < kv_end; kv_base += FA2_BKV) {\n"
+"        int tile_n = kv_end - kv_base;\n"
+"        if (tile_n > FA2_BKV) tile_n = FA2_BKV;\n"
+"        for (int idx = threadIdx.x; idx < FA2_BKV * FA2_HD; idx += n_threads) {\n"
+"            int kj = idx / FA2_HD, d = idx % FA2_HD;\n"
+"            int kv_tok = kv_base + kj;\n"
+"            smK[idx] = (kj < tile_n && d < head_dim) ? K[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"            smV[idx] = (kj < tile_n && d < head_dim) ? V[(long)kv_tok * dim + h * head_dim + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int kj = 0; kj < FA2_BKV; kj++) {\n"
+"            float dot = 0.0f;\n"
+"            for (int e = 0; e < FA2_EPT; e++)\n"
+"                dot += q_r[e] * smK[kj * FA2_HD + lane * FA2_EPT + e];\n"
+"            for (int off = 16; off > 0; off >>= 1)\n"
+"                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);\n"
+"            float score = (kj < tile_n) ? dot * scale : -1e30f;\n"
+"            float new_max = fmaxf(m_i, score);\n"
+"            float alpha = expf(m_i - new_max);\n"
+"            float p = expf(score - new_max);\n"
+"            l_i = l_i * alpha + p;\n"
+"            for (int e = 0; e < FA2_EPT; e++)\n"
+"                O_r[e] = O_r[e] * alpha + p * smV[kj * FA2_HD + lane * FA2_EPT + e];\n"
+"            m_i = new_max;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (qi < N) {\n"
+"        long state_idx = ((long)split * N + qi) * n_heads + h;\n"
+"        if (lane == 0) { part_m[state_idx] = m_i; part_l[state_idx] = l_i; }\n"
+"        long base = ((long)split * N + qi) * dim + h * head_dim;\n"
+"        for (int e = 0; e < FA2_EPT; e++) {\n"
+"            int d = lane * FA2_EPT + e;\n"
+"            if (d < head_dim) part_o[base + d] = O_r[e];\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void flash_attn_f32_split_merge(float *__restrict__ out,\n"
+"    const float *__restrict__ part_o,\n"
+"    const float *__restrict__ part_m,\n"
+"    const float *__restrict__ part_l,\n"
+"    int N, int n_heads, int head_dim, int n_splits) {\n"
+"    int h = blockIdx.x;\n"
+"    int qi = blockIdx.y;\n"
+"    int dim = n_heads * head_dim;\n"
+"    float m = -1e30f;\n"
+"    for (int s = 0; s < n_splits; s++) {\n"
+"        long si = ((long)s * N + qi) * n_heads + h;\n"
+"        m = fmaxf(m, part_m[si]);\n"
+"    }\n"
+"    float denom = 0.0f;\n"
+"    for (int s = 0; s < n_splits; s++) {\n"
+"        long si = ((long)s * N + qi) * n_heads + h;\n"
+"        denom += part_l[si] * expf(part_m[si] - m);\n"
+"    }\n"
+"    float inv = (denom > 0.0f) ? 1.0f / denom : 0.0f;\n"
+"    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {\n"
+"        float acc = 0.0f;\n"
+"        for (int s = 0; s < n_splits; s++) {\n"
+"            long si = ((long)s * N + qi) * n_heads + h;\n"
+"            long oi = ((long)s * N + qi) * dim + h * head_dim + d;\n"
+"            acc += part_o[oi] * expf(part_m[si] - m);\n"
+"        }\n"
+"        out[(long)qi * dim + h * head_dim + d] = acc * inv;\n"
+"    }\n"
+"}\n"
 
 /* Optimized GEMM: FP8 weights with LUT dequant, 128×128 tiles */
 "__global__ void gemm_opt_fp8(float *Y, const unsigned char *W, const float *X,\n"
@@ -1072,14 +1168,6 @@ typedef enum {
     QIMG_CFG_BUF_COUNT
 } qimg_cfg_buf_id;
 
-/* Per-slot device buffer pool, indexed by qimg_cfg_buf_id. Uses
- * cu_buf_slot from cuda_runner_common.h so the same pattern can be
- * shared with flux2 / hy3d_paint. */
-typedef struct {
-    cu_buf_slot slot[QIMG_CFG_BUF_COUNT];
-} qimg_cfg_cache;
-
-
 /* ---- Runner struct ---- */
 
 struct cuda_qimg_runner {
@@ -1109,6 +1197,8 @@ struct cuda_qimg_runner {
     CUfunction gelu_f32;
     CUfunction silu_f32;
     CUfunction attn_prefill_f32;
+    CUfunction attn_split_partials_f32;
+    CUfunction attn_split_merge_f32;
     CUfunction add_bias_f32;
     CUfunction rmsnorm_per_head;
     CUfunction adaln_modulate;
@@ -1159,6 +1249,12 @@ struct cuda_qimg_runner {
     CUfunction cast_f32_to_bf16;  /* bulk F32→BF16 cast */
     CUdeviceptr d_q_bf16, d_k_bf16, d_v_bf16; /* [n_tok*dim] uint16 bf16 */
     size_t      bf16_attn_buf_n;
+    /* Optional split-key F32 attention workspace (QIMG_FA2_SPLIT_F32). */
+    CUdeviceptr d_attn_part_o;   /* [n_splits, n_tok, dim] f32 */
+    CUdeviceptr d_attn_part_m;   /* [n_splits, n_tok, n_heads] f32 */
+    CUdeviceptr d_attn_part_l;   /* [n_splits, n_tok, n_heads] f32 */
+    size_t      attn_part_o_bytes;
+    size_t      attn_part_state_bytes;
     int use_f16_gemm;  /* 1 to use F16 weights + gemm_f16_f32 (better precision) */
     CUfunction truncate_bf16;
     CUfunction quantize_fp8_rt;  /* FP8 roundtrip quantization */
@@ -1230,9 +1326,9 @@ struct cuda_qimg_runner {
     CUevent     block_barrier_unc;   /* uncond-done barrier */
     CUevent     mod_ready;           /* modulation computed (both streams wait on this) */
 
-    /* Main CFG DiT activation cache. These buffers are reused across denoise
+    /* Main CFG DiT activation slots. These buffers are reused across denoise
      * steps and grown on demand for larger resolutions/text lengths. */
-    qimg_cfg_cache cfg_cache;
+    cu_buf_slot cfg_slots[QIMG_CFG_BUF_COUNT];
 
     /* Persistent GPU: global weights (~50MB) */
     CUdeviceptr d_img_in_w, d_img_in_b;
@@ -1362,24 +1458,6 @@ static CUdeviceptr checked_cuMemAlloc(size_t nbytes) {
         return 0;
     }
     return d;
-}
-
-static void qimg_cfg_cache_free(cuda_qimg_runner *r) {
-    if (!r) return;
-    cu_buf_slots_free(r->cfg_cache.slot, QIMG_CFG_BUF_COUNT);
-}
-
-static size_t qimg_cfg_cache_growth(cuda_qimg_runner *r, qimg_cfg_buf_id id, size_t bytes) {
-    return cu_buf_slot_growth(&r->cfg_cache.slot[id], bytes);
-}
-
-static int qimg_cfg_cache_ensure(cuda_qimg_runner *r, qimg_cfg_buf_id id,
-                                 size_t bytes, const char *label) {
-    return cu_buf_slot_ensure(&r->cfg_cache.slot[id], bytes, label);
-}
-
-static inline CUdeviceptr qimg_cfg_cache_ptr(cuda_qimg_runner *r, qimg_cfg_buf_id id) {
-    return r->cfg_cache.slot[id].ptr;
 }
 
 /* Upload safetensor as F32 (for biases, norms) */
@@ -2413,6 +2491,39 @@ static int ensure_bf16_attn_buf(cuda_qimg_runner *r, size_t n_bytes) {
     return 0;
 }
 
+static int ensure_split_attn_buf(cuda_qimg_runner *r, int n_tok, int n_heads,
+                                 int head_dim, int n_splits) {
+    size_t dim = (size_t)n_heads * (size_t)head_dim;
+    size_t o_bytes = (size_t)n_splits * (size_t)n_tok * dim * sizeof(float);
+    size_t state_bytes = (size_t)n_splits * (size_t)n_tok * (size_t)n_heads * sizeof(float);
+    if (o_bytes > r->attn_part_o_bytes) {
+        if (r->d_attn_part_o) { cuMemFree(r->d_attn_part_o); r->d_attn_part_o = 0; }
+        r->attn_part_o_bytes = 0;
+        if (cuMemAlloc(&r->d_attn_part_o, o_bytes) != CUDA_SUCCESS) {
+            r->d_attn_part_o = 0;
+            return -1;
+        }
+        r->attn_part_o_bytes = o_bytes;
+    }
+    if (state_bytes > r->attn_part_state_bytes) {
+        if (r->d_attn_part_m) { cuMemFree(r->d_attn_part_m); r->d_attn_part_m = 0; }
+        if (r->d_attn_part_l) { cuMemFree(r->d_attn_part_l); r->d_attn_part_l = 0; }
+        r->attn_part_state_bytes = 0;
+        if (cuMemAlloc(&r->d_attn_part_m, state_bytes) != CUDA_SUCCESS) {
+            r->d_attn_part_m = 0;
+            return -1;
+        }
+        if (cuMemAlloc(&r->d_attn_part_l, state_bytes) != CUDA_SUCCESS) {
+            cuMemFree(r->d_attn_part_m);
+            r->d_attn_part_m = 0;
+            r->d_attn_part_l = 0;
+            return -1;
+        }
+        r->attn_part_state_bytes = state_bytes;
+    }
+    return 0;
+}
+
 /* Bulk F32 → BF16 cast launcher. n is the element count (not bytes). */
 static void cast_buf_f32_to_bf16(cuda_qimg_runner *r, CUdeviceptr dst, CUdeviceptr src, int n) {
     void *args[] = {&src, &dst, &n};
@@ -2546,9 +2657,47 @@ qkv_fallback:
     return 0;
 }
 
+static int qimg_f32_split_kv_from_env(const char *env, int n_tok) {
+    if (!env || env[0] == '0') return 0;
+    if (strcmp(env, "auto") == 0) {
+        /* 2048-token microbench: split_kv=256 was best on the test host.
+         * Keep smaller shapes on the default path to avoid merge overhead. */
+        return (n_tok >= 2048) ? 256 : 0;
+    }
+    int split_kv = atoi(env);
+    return (split_kv <= 1) ? 1024 : split_kv;
+}
+
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
                     CUdeviceptr d_k, CUdeviceptr d_v,
                     int n_tok, int n_heads, int head_dim) {
+    const char *split_env = getenv("QIMG_FA2_SPLIT_F32");
+    int split_kv = qimg_f32_split_kv_from_env(split_env, n_tok);
+    if (split_kv > 0 &&
+        r->attn_split_partials_f32 && r->attn_split_merge_f32 &&
+        head_dim <= 128) {
+        int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (n_splits > 1 &&
+            ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) == 0) {
+            int fa2_warps = 4;
+            int fa2_bkv = 32;
+            unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
+            unsigned n_threads = (unsigned)(32 * fa2_warps);
+            size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
+            void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+                              &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim, &split_kv};
+            cuLaunchKernel(r->attn_split_partials_f32,
+                           (unsigned)n_heads, gy, (unsigned)n_splits,
+                           n_threads, 1, 1, smem, r->stream, p_args, NULL);
+            void *m_args[] = {&d_out, &r->d_attn_part_o, &r->d_attn_part_m,
+                              &r->d_attn_part_l, &n_tok, &n_heads, &head_dim, &n_splits};
+            cuLaunchKernel(r->attn_split_merge_f32,
+                           (unsigned)n_heads, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, m_args, NULL);
+            return;
+        }
+    }
+
     /* BF16 MMA flash attention path — bulk F32→BF16 cast Q/K/V, then mma.sync.
      * Has priority over the FP8 path because it matches ComfyUI's BF16 reference
      * exactly (no per-tensor scale outlier crush). */
@@ -2904,6 +3053,10 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     GET(gelu_f32, "gelu_f32");
     GET(silu_f32, "silu_f32");
     GET(attn_prefill_f32, "flash_attn_f32");
+    if (cuModuleGetFunction(&r->attn_split_partials_f32, module, "flash_attn_f32_split_partials") != CUDA_SUCCESS)
+        r->attn_split_partials_f32 = NULL;
+    if (cuModuleGetFunction(&r->attn_split_merge_f32, module, "flash_attn_f32_split_merge") != CUDA_SUCCESS)
+        r->attn_split_merge_f32 = NULL;
     GET(add_bias_f32, "add_bias_f32");
     GET(rmsnorm_per_head, "rmsnorm_per_head_f32");
     GET(adaln_modulate, "adaln_modulate_f32");
@@ -3216,9 +3369,13 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->d_q_bf16) cuMemFree(r->d_q_bf16);
     if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
     if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
+    /* Split-key F32 attention partials */
+    if (r->d_attn_part_o) cuMemFree(r->d_attn_part_o);
+    if (r->d_attn_part_m) cuMemFree(r->d_attn_part_m);
+    if (r->d_attn_part_l) cuMemFree(r->d_attn_part_l);
     /* Per-row FP8 MMA scale buffer */
     if (r->d_row_max_buf) cuMemFree(r->d_row_max_buf);
-    qimg_cfg_cache_free(r);
+    cu_buf_slots_free(r->cfg_slots, QIMG_CFG_BUF_COUNT);
     if (r->dit_pinned_pools) {
         for (int b = 0; b < r->dit_n_blocks; b++) {
             if (r->dit_pinned_pools[b]) cuMemFreeHost(r->dit_pinned_pools[b]);
@@ -3443,7 +3600,6 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
                        const float *txt_tokens, int n_txt,
                        float timestep, float *out) {
     int dim = r->dit_dim;
-    int nh = r->dit_n_heads, hd = r->dit_head_dim;
     int in_ch = r->dit_in_ch, txt_dim = r->dit_txt_dim, mlp_h = r->dit_mlp_h;
     int n_total = n_img + n_txt;
     CUstream s = r->stream;
@@ -3455,13 +3611,13 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     CUdeviceptr d_q = 0, d_k = 0, d_v = 0, d_attn_out = 0;
     CUdeviceptr d_t_silu = 0, d_img_mod = 0, d_txt_mod = 0;
     CUdeviceptr d_final_t_silu = 0, d_final_mod = 0, d_final_out = 0;
-    /* All per-call activation buffers route through r->cfg_cache (cond slots
+    /* All per-call activation buffers route through r->cfg_slots (cond slots
      * only — uncond slots stay at cap=0 when this path runs). Same growth
      * semantics as cuda_qimg_dit_step_cfg: bytes accumulate across resolution
      * changes, no per-call cuMemAlloc/cuMemFree churn. */
-#define QIMG_ALLOC_OR_CLEANUP(ptr, nbytes, label, id) do { \
-        if (qimg_cfg_cache_ensure(r, (id), (nbytes), (label)) != 0) goto cleanup; \
-        (ptr) = qimg_cfg_cache_ptr(r, (id)); \
+#define QIMG_ALLOC_OR_CLEANUP(dst, nbytes, label, id) do { \
+        if (cu_buf_slot_ensure(&r->cfg_slots[(id)], (nbytes), (label)) != 0) goto cleanup; \
+        (dst) = r->cfg_slots[(id)].ptr; \
     } while (0)
 
     /* Check GPU memory before allocations */
@@ -3767,7 +3923,7 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
     }
     rc = 0;
 
-    /* Cleanup — cfg_cache slots are runner-owned, freed via qimg_cfg_cache_free
+    /* Cleanup — cfg_slots are runner-owned, freed via cuda_qimg_free
      * in cuda_qimg_free. Nothing to release here. */
 cleanup:
     (void)d_img; (void)d_txt; (void)d_t_emb; (void)d_t_emb2;
@@ -3856,7 +4012,6 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
                            float *out_cond, float *out_uncond)
 {
     int dim = r->dit_dim;
-    int nh = r->dit_n_heads, hd = r->dit_head_dim;
     int in_ch = r->dit_in_ch, txt_dim = r->dit_txt_dim, mlp_h = r->dit_mlp_h;
     int n_total_cond   = n_img + n_txt_cond;
     int n_total_uncond = n_img + n_txt_uncond;
@@ -3873,7 +4028,7 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         size_t dim_b  = (size_t)dim   * sizeof(float);
         size_t mlp_b  = (size_t)mlp_h * sizeof(float);
         size_t need = 0;
-        #define CFG_GROW(id, bytes) qimg_cfg_cache_growth(r, (id), (bytes))
+        #define CFG_GROW(id, bytes) cu_buf_slot_growth(&r->cfg_slots[(id)], (bytes))
         need += CFG_GROW(QIMG_CFG_BUF_IMG_C,       (size_t)n_img * dim_b);
         need += CFG_GROW(QIMG_CFG_BUF_IMG_U,       (size_t)n_img * dim_b);
         need += CFG_GROW(QIMG_CFG_BUF_TXT_C,       (size_t)n_txt_cond * dim_b);
@@ -3932,8 +4087,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
     CUdeviceptr d_t_silu = 0, d_img_mod = 0, d_txt_mod = 0;
     CUdeviceptr d_final_t_silu = 0, d_final_mod = 0, d_final_out = 0;
 #define QIMG_CFG_CACHE_OR_CLEANUP(id, dst, nbytes, label) do { \
-        if (qimg_cfg_cache_ensure(r, (id), (nbytes), (label)) != 0) goto cleanup; \
-        (dst) = qimg_cfg_cache_ptr(r, (id)); \
+        if (cu_buf_slot_ensure(&r->cfg_slots[(id)], (nbytes), (label)) != 0) goto cleanup; \
+        (dst) = r->cfg_slots[(id)].ptr; \
     } while (0)
 
     /* Allocate paired img/txt buffers. Both passes share the same img_tokens
@@ -4526,7 +4681,7 @@ int cuda_qimg_vae_decode(cuda_qimg_runner *r,
             qimg_free_block(&r->gpu_blocks[i]);
         r->n_preloaded = 0;
     }
-    qimg_cfg_cache_free(r);
+    cu_buf_slots_free(r->cfg_slots, QIMG_CFG_BUF_COUNT);
     cuStreamSynchronize(s);
 
     int h = lat_h, w = lat_w, c = 16;

@@ -642,7 +642,11 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
         /* GPU path: capture the same intermediate hidden states as the CPU
          * reference after layers 8, 17, and 26. */
         cuda_llm_runner *gpu = (cuda_llm_runner *)enc->model;
-        cuda_llm_reset_state(gpu);
+        if (cuda_llm_reset_state(gpu) != 0) {
+            fprintf(stderr, "flux2_text_enc: cuda_llm_reset_state failed\n");
+            free(hidden);
+            return NULL;
+        }
         for (int i = 0; i < n_tok; i++) {
             float *dst = hidden + (size_t)i * n_out;
             if (!cuda_llm_forward(gpu, toks[i], i)) {
