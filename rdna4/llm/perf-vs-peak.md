@@ -277,7 +277,8 @@ the 9B/27B A/B decode runs preserved first/last token ids.
 **IQ3_XXS decode matvec scale/sign load (✅ LANDED 2026-05-18)** — replaced
 the hot-kernel `memcpy` load of each IQ3_XXS scale/sign word with an explicit
 32-bit load. This is a narrow decode-kernel-internals cleanup, but it hits the
-largest remaining matvec family on the 27B path.
+largest remaining matvec family on the 27B path. Applied the same direct-load
+cleanup to `dequant_iq3_xxs_to_bf16` after validating it independently.
 
 Measured on RX 9070 XT:
 
@@ -286,12 +287,15 @@ Measured on RX 9070 XT:
 | microbench `IQ3_XXS 5120x5120` | 0.0538 ms | **0.0531 ms** | 1.01x |
 | microbench `IQ3_XXS 17408x5120` | 0.1557 ms | **0.1528 ms** | 1.02x |
 | microbench `IQ3_XXS 5120x17408` | 0.1617 ms | **0.1586 ms** | 1.02x |
+| profile `dequant_iq3_xxs_to_bf16` total | 137.4 ms | **135.9 ms** | 1.01x |
 | Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 63.3-63.6 ms/tok | **62.8-62.9 ms/tok** | ~1.01x |
 
 Correctness: `--verify-quant-kernels` passes 18/18; 27B decoded first/last
-token ids unchanged. A related `dequant_iq3_xxs_to_bf16` warp-broadcast trial
-was not landed: it passed correctness but regressed the same 27B prefill bench
-from 6.083 to 6.176 ms/tok.
+token ids unchanged. The dequant direct-load cleanup kept the same token ids
+and measured 5.854/6.004 ms/tok on two L=256 prefill runs. A related
+`dequant_iq3_xxs_to_bf16` warp-broadcast trial was not landed: it passed
+correctness but regressed the same 27B prefill bench from 6.083 to
+6.176 ms/tok.
 
 **Q6_K one-warp-per-row decode matvec (❌ TRIED 2026-05-18 — not landed)** —
 implemented the analogous MW launch shape behind `LLM_Q6_K_MW=1`. It passed
