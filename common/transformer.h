@@ -3026,7 +3026,16 @@ void transformer_build_panels(transformer_model *m) {
         && (m->output.n_cols & 15) == 0)
         bf16_list[bn++] = &m->output;
 
+    /* Stream-reclaim source bytes after each pv build so peak memory is
+     * weight_size + one tensor instead of 2× weight_size — required to fit
+     * 9B BF16 (~17 GiB) on a 31 GiB / 4-CMG node. The matvec hot path
+     * reads bf16_pv, and the 8-row-aligned partition leaves the tail loops
+     * that touch mat->data unreachable. TF_KEEP_BF16_SRC=1 disables. */
     int bbuilt = 0;
+    size_t reclaimed = 0;
+    long page_sz = sysconf(_SC_PAGESIZE);
+    if (page_sz <= 0) page_sz = 4096;
+    int reclaim = !getenv("TF_KEEP_BF16_SRC");
     for (int i = 0; i < bn; i++) {
         qtensor *t = bf16_list[i];
         if (!tf_bf16_pv_alloc(t)) continue;
@@ -3045,11 +3054,30 @@ void transformer_build_panels(transformer_model *m) {
         } else {
             tf_bf16_pv_fill_range(t, 0, groups);
         }
+        if (reclaim && t->data) {
+            /* Round start up, length down to page boundaries — madvise needs
+             * page-aligned ranges and partial pages at the edges would either
+             * be rejected (page_sz on aarch64 = 4 KiB or 64 KiB) or release
+             * memory we don't own. */
+            uintptr_t start = (uintptr_t)t->data;
+            size_t bytes = (size_t)t->n_rows * (size_t)t->n_cols * 2;
+            uintptr_t aligned_start = (start + page_sz - 1) & ~((uintptr_t)page_sz - 1);
+            uintptr_t aligned_end   = (start + bytes) & ~((uintptr_t)page_sz - 1);
+            if (aligned_end > aligned_start) {
+                size_t dn_bytes = (size_t)(aligned_end - aligned_start);
+                if (madvise((void *)aligned_start, dn_bytes, MADV_DONTNEED) == 0)
+                    reclaimed += dn_bytes;
+            }
+        }
         bbuilt++;
     }
-    if (bbuilt > 0)
-        fprintf(stderr, "transformer: BF16 p_odd-pair layout built for %d matvec weights%s\n",
+    if (bbuilt > 0) {
+        fprintf(stderr, "transformer: BF16 p_odd-pair layout built for %d matvec weights%s",
                 bbuilt, m->cmg_pin ? " (first-touched per CMG)" : "");
+        if (reclaim && reclaimed > 0)
+            fprintf(stderr, ", reclaimed %.2f GiB source", reclaimed / (1024.0 * 1024.0 * 1024.0));
+        fprintf(stderr, "\n");
+    }
 #else
     (void)m;
 #endif
