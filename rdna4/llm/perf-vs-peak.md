@@ -315,6 +315,26 @@ Measured on RX 9070 XT:
 Correctness: `--verify-quant-kernels` passes 18/18; 27B decoded first/last
 token ids unchanged.
 
+**Q6_K decode matvec loop unroll (✅ LANDED 2026-05-18)** — added explicit
+unroll hints to the fixed Q6_K half/32-element decode-matvec loops. This kept
+the existing one-block-per-row launch shape, avoiding the earlier MW variant
+that won microbench but regressed full decode.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q6_K 5120x5120` | 0.208 ms | **0.143 ms** | 1.46x |
+| microbench `Q6_K 17408x5120` | 0.635 ms | **0.426 ms** | 1.49x |
+| microbench `Q6_K 5120x17408` | 1.059 ms | **0.558 ms** | 1.90x |
+| profile `matvec_q6_K_f32` total | 93.2 ms | **62.0 ms** | 1.50x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 57.78 ms/tok | **53.94-53.99 ms/tok** | 1.07x |
+
+Correctness: `--verify-quant-kernels` passes 18/18; 27B decoded first/last
+token ids unchanged. Tried the analogous default Q4_K unroll in the same
+pass, but it regressed `Q4_K 5120x5120` from ~0.099 ms to ~0.200 ms/launch,
+so it was not landed.
+
 **Q6_K one-warp-per-row decode matvec (❌ TRIED 2026-05-18 — not landed)** —
 implemented the analogous MW launch shape behind `LLM_Q6_K_MW=1`. It passed
 `--verify-quant-kernels` and improved isolated Q6_K microbenches:
