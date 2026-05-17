@@ -1,6 +1,6 @@
 # Quant Matvec Kernels — A/B Verification Status
 
-**Date:** 2026-05-17; updated 2026-05-17 for K-quant/legacy coverage
+**Date:** 2026-05-17; updated 2026-05-18 for Q5_K MW decode path
 **Tool:** `./test_hip_llm --verify-quant-kernels`
 **Method:** Identical raw quant bytes fed to the HIP `matvec_<type>_f32`
 kernel and to the CPU `dequantize_row_<type>` + scalar dot product. Random
@@ -63,6 +63,7 @@ make test_hip_llm
 
 # Isolated kernel timing; no model needed
 ./test_hip_llm --bench-quant-matvec Q4_K 4096 4096 500 5
+./test_hip_llm --bench-quant-matvec Q5_K 248320 5120 20 3
 ```
 
 No model needed. Standalone runs in well under a second per type.
@@ -82,3 +83,13 @@ Q4_K path. It is left off by default because microbench and 9B decode timing
 showed it was not a net win. On RX 9070 XT with `Q4_K 4096x4096`, serial
 median timing was 0.0755 ms for the default kernel versus 0.0799 ms for the
 one-warp path (`--bench-quant-matvec Q4_K 4096 4096 500 5`).
+
+`matvec_q5_K_mw_f32` is the default Q5_K path as of 2026-05-18. It maps one
+warp to each row and packs 8 rows per block, which is a much better launch
+shape for the full-vocab logits projection. `LLM_Q5_K_MW=0` disables it for
+A/B and rollback. On RX 9070 XT with `Q5_K 248320x5120`, median timing
+improved from 7.096 ms/launch (`LLM_Q5_K_MW=0`) to 1.787 ms/launch with the
+default path (`--bench-quant-matvec Q5_K 248320 5120 20 3`). End-to-end
+decode improved from 67.785 to 63.404 ms/tok on Qwen3.6-27B IQ3_XXS and
+from 45.179 to 36.372 ms/tok on Qwen3.5-9B Q4_K_XL, with identical A/B
+first/last decoded token ids.
