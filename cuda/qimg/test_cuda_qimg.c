@@ -83,6 +83,23 @@ static void save_ppm(const char *path, const float *rgb, int h, int w) {
 
 /* ---------------- Kernel unit tests (QIMG_FP8 paths) ---------------- */
 
+static int test_kernel_split_selector(void) {
+    fprintf(stderr, "  [kernel] QIMG_FA2_SPLIT_F32 selector... ");
+    int fail = 0;
+    fail |= (qimg_f32_split_kv_from_env(NULL, 2048) != 0);
+    fail |= (qimg_f32_split_kv_from_env("0", 2048) != 0);
+    fail |= (qimg_f32_split_kv_from_env("1", 2048) != 1024);
+    fail |= (qimg_f32_split_kv_from_env("512", 2048) != 512);
+    fail |= (qimg_f32_split_kv_from_env("auto", 1024) != 0);
+    fail |= (qimg_f32_split_kv_from_env("auto", 2048) != 256);
+    if (fail) {
+        fprintf(stderr, "FAIL\n");
+        return 1;
+    }
+    fprintf(stderr, "OK\n");
+    return 0;
+}
+
 /* Local FP8 e4m3 decode (matches cuda_qimg_runner.h). */
 static float test_fp8_e4m3_to_f32(uint8_t b) {
     uint32_t sign = (b >> 7) & 1;
@@ -281,6 +298,274 @@ static int test_kernel_fp8_attn(cuda_qimg_runner *r) {
     return 0;
 }
 
+/* Test 3: split-key F32 flash attention partial+merge path vs baseline F32.
+ * This validates the explicit (m,l,O) workspace merge needed for true KV-split
+ * grid parallelism without changing the default BF16/FP8 fast paths. */
+static int test_kernel_split_attn_f32(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_f32 split-key vs baseline... ");
+    if (!r->attn_prefill_f32 || !r->attn_split_partials_f32 || !r->attn_split_merge_f32) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 128;
+    const int n_heads = 2;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_kv = 32;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    float *out_op = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split || !out_op) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+
+    rng_state = 20240517;
+    rng_has_cached = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.35f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.35f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_ref = 0, d_split = 0, d_op = 0;
+    cuMemAlloc(&d_ref, n_elems * sizeof(float));
+    cuMemAlloc(&d_split, n_elems * sizeof(float));
+    cuMemAlloc(&d_op, n_elems * sizeof(float));
+
+    int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    {
+        void *args[] = {&d_ref, &d_Q, &d_K, &d_V, &nt, &nh, &hd};
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        cuLaunchKernel(r->attn_prefill_f32, (unsigned)nh, gy, 1,
+                       128, 1, 1, smem, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float));
+    }
+
+    if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+        cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+        cuMemFree(d_ref); cuMemFree(d_split); cuMemFree(d_op);
+        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op);
+        fprintf(stderr, "FAIL (device OOM)\n");
+        return 1;
+    }
+    {
+        void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+                          &d_Q, &d_K, &d_V, &nt, &nh, &hd, &sk};
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        cuLaunchKernel(r->attn_split_partials_f32, (unsigned)nh, gy, (unsigned)n_splits,
+                       128, 1, 1, smem, r->stream, p_args, NULL);
+        void *m_args[] = {&d_split, &r->d_attn_part_o, &r->d_attn_part_m,
+                          &r->d_attn_part_l, &nt, &nh, &hd, &ns};
+        cuLaunchKernel(r->attn_split_merge_f32, (unsigned)nh, (unsigned)n_tok, 1,
+                       128, 1, 1, 0, r->stream, m_args, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float));
+    }
+
+    {
+        const char *old_env = getenv("QIMG_FA2_SPLIT_F32");
+        char *old_env_copy = old_env ? (char *)malloc(strlen(old_env) + 1) : NULL;
+        if (old_env_copy) strcpy(old_env_copy, old_env);
+        setenv("QIMG_FA2_SPLIT_F32", "32", 1);
+        op_attn(r, d_op, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(out_op, d_op, n_elems * sizeof(float));
+        if (old_env_copy) {
+            setenv("QIMG_FA2_SPLIT_F32", old_env_copy, 1);
+            free(old_env_copy);
+        } else {
+            unsetenv("QIMG_FA2_SPLIT_F32");
+        }
+    }
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_ref); cuMemFree(d_split); cuMemFree(d_op);
+
+    float max_diff = 0.0f, mean_diff = 0.0f, op_max_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float d = fabsf(out_split[i] - out_ref[i]);
+        if (d > max_diff) max_diff = d;
+        mean_diff += d;
+        float od = fabsf(out_op[i] - out_ref[i]);
+        if (od > op_max_diff) op_max_diff = od;
+    }
+    mean_diff /= (float)n_elems;
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op);
+    if (max_diff > 1e-4f || mean_diff > 1e-5f || op_max_diff > 1e-4f) {
+        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g splits=%d)\n",
+                max_diff, mean_diff, op_max_diff, n_splits);
+        return 1;
+    }
+    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g splits=%d)\n",
+            max_diff, mean_diff, op_max_diff, n_splits);
+    return 0;
+}
+
+static float time_qimg_f32_attn(cuda_qimg_runner *r, CUfunction fn,
+                                CUdeviceptr out, CUdeviceptr q,
+                                CUdeviceptr k, CUdeviceptr v,
+                                int n_tok, int n_heads, int head_dim,
+                                int repeats) {
+    CUevent start = NULL, stop = NULL;
+    cuEventCreate(&start, CU_EVENT_DEFAULT);
+    cuEventCreate(&stop, CU_EVENT_DEFAULT);
+    int nt = n_tok, nh = n_heads, hd = head_dim;
+    unsigned gy = (unsigned)((n_tok + 3) / 4);
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    void *args[] = {&out, &q, &k, &v, &nt, &nh, &hd};
+    cuLaunchKernel(fn, (unsigned)n_heads, gy, 1, 128, 1, 1, smem, r->stream, args, NULL);
+    cuStreamSynchronize(r->stream);
+    cuEventRecord(start, r->stream);
+    for (int i = 0; i < repeats; i++) {
+        cuLaunchKernel(fn, (unsigned)n_heads, gy, 1, 128, 1, 1, smem, r->stream, args, NULL);
+    }
+    cuEventRecord(stop, r->stream);
+    cuEventSynchronize(stop);
+    float ms = 0.0f;
+    cuEventElapsedTime(&ms, start, stop);
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+}
+
+static float time_qimg_split_attn(cuda_qimg_runner *r,
+                                  CUdeviceptr out, CUdeviceptr q,
+                                  CUdeviceptr k, CUdeviceptr v,
+                                  int n_tok, int n_heads, int head_dim,
+                                  int split_kv, int n_splits, int repeats) {
+    CUevent start = NULL, stop = NULL;
+    cuEventCreate(&start, CU_EVENT_DEFAULT);
+    cuEventCreate(&stop, CU_EVENT_DEFAULT);
+    int nt = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
+    unsigned gy = (unsigned)((n_tok + 3) / 4);
+    size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+    void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+                      &q, &k, &v, &nt, &nh, &hd, &sk};
+    void *m_args[] = {&out, &r->d_attn_part_o, &r->d_attn_part_m,
+                      &r->d_attn_part_l, &nt, &nh, &hd, &ns};
+    cuLaunchKernel(r->attn_split_partials_f32, (unsigned)n_heads, gy, (unsigned)n_splits,
+                   128, 1, 1, smem, r->stream, p_args, NULL);
+    cuLaunchKernel(r->attn_split_merge_f32, (unsigned)n_heads, (unsigned)n_tok, 1,
+                   128, 1, 1, 0, r->stream, m_args, NULL);
+    cuStreamSynchronize(r->stream);
+    cuEventRecord(start, r->stream);
+    for (int i = 0; i < repeats; i++) {
+        cuLaunchKernel(r->attn_split_partials_f32, (unsigned)n_heads, gy, (unsigned)n_splits,
+                       128, 1, 1, smem, r->stream, p_args, NULL);
+        cuLaunchKernel(r->attn_split_merge_f32, (unsigned)n_heads, (unsigned)n_tok, 1,
+                       128, 1, 1, 0, r->stream, m_args, NULL);
+    }
+    cuEventRecord(stop, r->stream);
+    cuEventSynchronize(stop);
+    float ms = 0.0f;
+    cuEventElapsedTime(&ms, start, stop);
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return ms / (float)repeats;
+}
+
+static int test_kernel_split_attn_f32_2048(cuda_qimg_runner *r) {
+    fprintf(stderr, "  [kernel] flash_attn_f32 split-key 2048-token bench... ");
+    if (!r->attn_prefill_f32 || !r->attn_split_partials_f32 || !r->attn_split_merge_f32) {
+        fprintf(stderr, "SKIP (kernels not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 2048;
+    const int n_heads = 1;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_candidates[] = {256, 512, 1024};
+    const int repeats = 3;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_ref = (float *)malloc(n_elems * sizeof(float));
+    float *out_split = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+    rng_state = 20260518;
+    rng_has_cached = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.25f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.25f;
+
+    CUdeviceptr d_Q = upload_f32(Q, n_elems);
+    CUdeviceptr d_K = upload_f32(K, n_elems);
+    CUdeviceptr d_V = upload_f32(V, n_elems);
+    CUdeviceptr d_ref = 0, d_split = 0;
+    cuMemAlloc(&d_ref, n_elems * sizeof(float));
+    cuMemAlloc(&d_split, n_elems * sizeof(float));
+
+    float base_ms = time_qimg_f32_attn(r, r->attn_prefill_f32, d_ref, d_Q, d_K, d_V,
+                                       n_tok, n_heads, head_dim, repeats);
+    cuMemcpyDtoH(out_ref, d_ref, n_elems * sizeof(float));
+
+    float best_ms = 1e30f, best_max_diff = 0.0f, best_mean_diff = 0.0f;
+    int best_split_kv = 0, best_n_splits = 0;
+    for (int ci = 0; ci < (int)(sizeof(split_candidates) / sizeof(split_candidates[0])); ci++) {
+        int split_kv = split_candidates[ci];
+        int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (device OOM split_kv=%d)\n", split_kv);
+            return 1;
+        }
+        float split_ms = time_qimg_split_attn(r, d_split, d_Q, d_K, d_V,
+                                              n_tok, n_heads, head_dim,
+                                              split_kv, n_splits, repeats);
+        cuMemcpyDtoH(out_split, d_split, n_elems * sizeof(float));
+        float max_diff = 0.0f, mean_diff = 0.0f;
+        for (size_t i = 0; i < n_elems; i++) {
+            float d = fabsf(out_split[i] - out_ref[i]);
+            if (d > max_diff) max_diff = d;
+            mean_diff += d;
+        }
+        mean_diff /= (float)n_elems;
+        if (max_diff > 2e-4f || mean_diff > 2e-5f) {
+            cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+            cuMemFree(d_ref); cuMemFree(d_split);
+            free(Q); free(K); free(V); free(out_ref); free(out_split);
+            fprintf(stderr, "FAIL (split_kv=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms)\n",
+                    split_kv, max_diff, mean_diff, base_ms, split_ms);
+            return 1;
+        }
+        if (split_ms < best_ms) {
+            best_ms = split_ms;
+            best_max_diff = max_diff;
+            best_mean_diff = mean_diff;
+            best_split_kv = split_kv;
+            best_n_splits = n_splits;
+        }
+    }
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_ref); cuMemFree(d_split);
+    free(Q); free(K); free(V); free(out_ref); free(out_split);
+    fprintf(stderr, "OK (best_split_kv=%d splits=%d max_diff=%.6g mean_diff=%.6g base=%.3fms split=%.3fms speedup=%.2fx)\n",
+            best_split_kv, best_n_splits, best_max_diff, best_mean_diff,
+            base_ms, best_ms, base_ms / (best_ms + 1e-9f));
+    return 0;
+}
+
 /* Test 3: img_in linear projection against PyTorch reference.
  * Loads dit_img_input.npy (16,64) F32 reference input, runs our FP8 GEMM
  * against the img_in.weight + bias from the safetensors, and compares
@@ -308,8 +593,17 @@ static int test_kernel_fp8_proj_vs_ref(cuda_qimg_runner *r, const char *dit_path
     uint8_t hdr[10];
     if (fread(hdr, 1, 10, f_in) != 10 || fread(hdr, 1, 10, f_pj) != 10) { fclose(f_in); fclose(f_pj); fprintf(stderr, "FAIL (npy header)\n"); return 1; }
     fseek(f_in, 0, SEEK_SET); fseek(f_pj, 0, SEEK_SET);
-    fread(hdr, 1, 8, f_in); uint16_t hl_in; fread(&hl_in, 2, 1, f_in); fseek(f_in, 10 + hl_in, SEEK_SET);
-    fread(hdr, 1, 8, f_pj); uint16_t hl_pj; fread(&hl_pj, 2, 1, f_pj); fseek(f_pj, 10 + hl_pj, SEEK_SET);
+    uint16_t hl_in, hl_pj;
+    if (fread(hdr, 1, 8, f_in) != 8 ||
+        fread(&hl_in, 2, 1, f_in) != 1 ||
+        fseek(f_in, 10 + hl_in, SEEK_SET) != 0 ||
+        fread(hdr, 1, 8, f_pj) != 8 ||
+        fread(&hl_pj, 2, 1, f_pj) != 1 ||
+        fseek(f_pj, 10 + hl_pj, SEEK_SET) != 0) {
+        fclose(f_in); fclose(f_pj);
+        fprintf(stderr, "FAIL (npy header)\n");
+        return 1;
+    }
 
     const int n_tok = 16, n_in = 64, n_out = 3072;
     size_t n_inp = (size_t)n_tok * n_in;
@@ -443,8 +737,11 @@ static int test_kernels(void) {
     cuda_qimg_runner *r = cuda_qimg_init(0, 0);
     if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
     int fail = 0;
+    fail += test_kernel_split_selector();
     fail += test_kernel_fp8_gemm(r);
     fail += test_kernel_fp8_attn(r);
+    fail += test_kernel_split_attn_f32(r);
+    fail += test_kernel_split_attn_f32_2048(r);
     /* The DiT-weight-vs-reference test needs a safetensors path; allow override */
     const char *ref_dit = getenv("QIMG_TEST_DIT");
     if (!ref_dit) ref_dit = "/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
