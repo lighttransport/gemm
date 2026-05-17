@@ -2690,7 +2690,7 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
     /* Output convolutions — matching official DA3 DualDPT:
      * 1. neck (output_conv1): Conv3x3(feat→feat/2) — NO ReLU
      * 2. Bilinear upsample fused_res → model_res (296→518)
-     * 3. TODO: sinusoidal UV pos_embed (ratio=0.1)
+     * 3. sinusoidal UV pos_embed (ratio=0.1) — implemented just below
      * 4. out_0 (output_conv2[0]): Conv3x3(feat/2→out_mid) + ReLU
      * 5. out_2 (output_conv2[2]): Conv1x1(out_mid→2) */
     int feat_half = feat / 2; if (feat_half < 1) feat_half = 1;
@@ -2864,8 +2864,10 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
                           sp_h[fi], sp_w[fi], oc_val, feat, 3, 3, 1, 1);
         }
 
-        /* TODO: Inject merger features at level 0 (add to d_dpt_adapted[0]) */
-        /* For now, skip merger injection — just run standard DPT pipeline */
+        /* Merger features are injected later, after refinenet + neck conv
+         * (lines further down). Matches official gsdpt.py:109 which adds
+         * images_merger(images) to the upsampled neck output, not to the
+         * pre-refinenet adapter. */
 
         /* Bottom-up RefineNet fusion with GSDPT weights */
         gpu_refinenet_w(r, r->d_dpt_adapted[3], sp_h[3], sp_w[3],
@@ -2928,6 +2930,24 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
             kl_bilinear(r, r->d_dpt_tmp2, r->d_gs_merged,
                          gs_feat_half, r->gs_merger_h, r->gs_merger_w, gs_fh, gs_fw);
             kl_add_inplace(r, r->d_dpt_tmp, r->d_dpt_tmp2, gs_feat_half * gs_fh * gs_fw);
+        }
+
+        /* Sinusoidal UV positional embedding (matches gsdpt.py:111-112,
+         * _add_pos_embed at ratio=0.1, omega_0=100 — same formula the main
+         * DPT head applies just before output_conv2). Per-stage and aux pos_embed
+         * sites in the official model remain unported (see pos-embed-status.md). */
+        {
+            float aspect_gs = (float)gs_fw / (float)gs_fh;
+            float diag_gs   = sqrtf(aspect_gs * aspect_gs + 1.0f);
+            float span_x_gs = aspect_gs / diag_gs;
+            float span_y_gs = 1.0f / diag_gs;
+            float ratio_gs  = 0.1f;
+            int   total_uv  = gs_feat_half * gs_fh * gs_fw;
+            int   grid_uv   = (total_uv + 255) / 256;
+            void *uv_args[] = {&r->d_dpt_tmp, &gs_feat_half, &gs_fh, &gs_fw,
+                               &span_x_gs, &span_y_gs, &ratio_gs};
+            KL(r->fn_sinusoidal_uv_posembed, (unsigned)grid_uv, 1, 1, 256, 1, 1, 0,
+               r->stream, uv_args);
         }
 
         /* output_conv2: Conv2d(128, 32, 3, pad=1) + ReLU + Conv2d(32, gs_oc, 1) */
