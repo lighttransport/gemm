@@ -1,0 +1,64 @@
+# Quant Matvec Kernels — A/B Verification Status
+
+**Date:** 2026-05-17
+**Tool:** `./test_hip_llm --verify-quant-kernels`
+**Method:** Identical raw quant bytes fed to the HIP `matvec_<type>_f32`
+kernel and to the CPU `dequantize_row_<type>` + scalar dot product. Random
+bytes generated deterministically (xorshift seeded by ggml_type). Rows where
+either side produces NaN/Inf (from random bytes accidentally encoding FP16
+NaN scales) are filtered before computing rel-L2 — typically ≥95% of rows
+remain valid. Threshold: rel_l2 < 1e-4 (FP reduction-order noise floor).
+
+## Results (RX 9070 XT, n_rows=64, n_cols=512)
+
+| type     | rel_l2     | max_abs   | result |
+|----------|-----------:|----------:|:------:|
+| IQ2_XXS  | 4.44e-08   | 9.4e-02   |  PASS  |
+| IQ2_XS   | 1.33e-07   | 9.4e-02   |  PASS  |
+| IQ2_S    | 1.34e-07   | 5.0e-01   |  PASS  |
+| IQ3_XXS  | 1.23e-07   | 5.0e-01   |  PASS  |
+| IQ3_S    | 2.21e-07   | 1.0e+00   |  PASS  |
+| IQ1_S    | 3.89e-07   | 6.3e-02   |  PASS  |
+| IQ1_M    | 5.19e-07   | 1.3e-01   |  PASS  |
+| IQ4_NL   | 1.13e-07   | 1.3e-01   |  PASS  |
+| IQ4_XS   | 2.08e-07   | 6.0e+00   |  PASS  |
+| TQ1_0    | 2.14e-07   | 3.9e-03   |  PASS  |
+| TQ2_0    | 2.53e-07   | 1.1e-02   |  PASS  |
+
+**11 PASS, 0 FAIL, 0 SKIP.**
+
+## What this closes
+
+The 11 quant types above were ported into the HIP runner via the
+`rdna4/llm: port IQ2_XS / IQ2_S / IQ3_S / IQ4_XS dequant kernels` family of
+commits (foundation + 27B 9.2x), but were only exercised through end-to-end
+generation. E2E covers correctness *coarsely* — a small per-type bug can
+hide as long as overall generation quality stays "reasonable" (sampling
+hides per-logit drift; rmsnorm + softmax + temperature mask small
+divergences). This standalone A/B closes that window: byte-identical
+inputs, both paths must agree to FP reduction noise.
+
+The `max_abs` column reflects absolute dot-product deltas on rows where the
+FP16 scale field of a random block happens to land at a large finite
+magnitude (e.g. IQ4_XS hits ~6.0). Per-row *relative* error stays at FP
+rounding noise — confirmed by the rel_l2 column.
+
+## Reproducibility
+
+```sh
+cd rdna4/llm
+make test_hip_llm
+./test_hip_llm --verify-quant-kernels
+```
+
+No model needed. Standalone runs in well under a second per type.
+
+## Notes for future kernel work
+
+If a new quant matvec kernel is added (or an existing one rewritten for
+perf — e.g. the kernel-internals attack discussed in
+`decode-graph-capture-audit.md` / `perf-vs-peak.md` Tier-4), add a row to
+the `cases[]` table in `run_verify_quant_kernels` (test_hip_llm.c). The
+runner-side `hip_llm_verify_quant_matvec` already accepts a function-pointer
+callback for the CPU reference dequantizer — no runner change needed unless
+a new GGML type is added to the matvec dispatcher.
