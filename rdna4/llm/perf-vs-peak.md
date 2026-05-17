@@ -274,6 +274,15 @@ Measured on RX 9070 XT:
 Correctness: `--verify-quant-kernels` passes 18/18 with the new default, and
 the 9B/27B A/B decode runs preserved first/last token ids.
 
+**Q6_K one-warp-per-row decode matvec (❌ TRIED 2026-05-18 — not landed)** —
+implemented the analogous MW launch shape behind `LLM_Q6_K_MW=1`. It passed
+`--verify-quant-kernels` and improved isolated Q6_K microbenches:
+5120x5120 0.208 → 0.192 ms/launch, 17408x5120 0.635 → 0.517 ms/launch,
+5120x17408 1.059 → 0.964 ms/launch. End-to-end 27B decode still regressed:
+63.615 ms/tok default vs 64.850 ms/tok with Q6_K MW at L=256, 16 decode
+tokens, same first/last token ids. Removed the experiment instead of keeping
+an opt-in path with misleading microbench results.
+
 **Decode fusion path (rmsnorm+matvec, matvec+residual, qknorm+RoPE+KV) — abandoned 2026-05-17.** Original Phase-2 plan was ~10–15% combined; after the Phase-1 null re-derivation showed the real ceiling at ~3% (launches + input-side VRAM round-trips are negligible vs the ~12 GB/tok weight-read budget). Real decode headroom is **inside the matvec kernels themselves** — per-matvec is at ~60% of memory peak per call, so ~40% × (matvec-fraction-of-time ≈ 50%) ≈ **~20% potential** from kernel internals (wider vectorized quant-weight reads, LDS pipelining, possibly WMMA-decode for quant types). That's a different project — kernel rewrite, not fusion — and is uncertain enough to be scoped separately when next picked up.
 
 ## 5. Realistic stacked-improvement ceiling
