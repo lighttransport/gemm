@@ -6428,9 +6428,20 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
 
     /* DeepStack only fires when r->_ds_embd is set (forward_embd path).
      * Decode (forward → forward_blocks_body with _ds_embd==NULL) skips it,
-     * so it's safe to capture for n_deepstack>0 models like Qwen3-VL. */
+     * so it's safe to capture for n_deepstack>0 models like Qwen3-VL.
+     *
+     * Hybrid (dense+SSM) is also capturable: SSM kernels mutate
+     * cl->d_conv_state / cl->d_recurrent_state in place through fixed device
+     * pointers, so replay re-executes the recurrence correctly. Gated-attn
+     * uses the same *_devp launchers as standard attn (position via
+     * r->d_position). NOTE: the capture warm-pass at warm_pos=0 advances SSM
+     * state by one bogus step, so hip_llm_reset_state() is called after
+     * capture to zero it back out (see decode-graph-capture-audit.md).
+     *
+     * MoE stays gated: cl->is_moe branch synchronizes the stream and reads
+     * router logits to host for top-K selection — incompatible with capture. */
     r->graph_eligible =
-        !r->is_moe && !r->is_hybrid && !r->debug_layers;
+        !r->is_moe && !r->debug_layers;
 
     if (!r->graph_eligible || r->graph_disabled) {
         if (r->verbose >= 1) {
@@ -6499,6 +6510,15 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
                     "hip_llm: Phase-5 hidden graph capture failed (err=%d)\n",
                     (int)err);
         }
+    }
+
+    /* The capture's warm-pass at position 0 advances SSM state by one bogus
+     * step (conv_state / recurrent_state are mutated in-place by SSM kernels).
+     * For non-hybrid this is harmless (KV slot 0 gets overwritten on the first
+     * real call). For hybrid we must zero the state back out — otherwise the
+     * first real decode token sees a primed state from the warm pass. */
+    if (r->is_hybrid && (r->graph_ready_logits || r->graph_ready_hidden)) {
+        hip_llm_reset_state(r);
     }
 
     if (r->verbose >= 1 || r->graph_verbose) {
