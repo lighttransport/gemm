@@ -320,6 +320,28 @@ size and stream ordering. BF16 safetensors still use the deterministic CPU
 BF16→F16 conversion; an attempted GPU conversion path was left out because
 repeat-load testing exposed nondeterministic hidden states.
 
+**Persistent F16 sidecar cache (2026-05-16):** the BF16→F16 conversion result
+is now serialized to `<encoder_dir>/cache.f16cache` on the first GPU load and
+mmap'd on subsequent loads, eliminating the per-load conversion cost. Stream-
+style format: 4×u64 header (magic, version, key=path+size+mtime, payload_bytes)
++ raw F16 payload concatenated in `upload_weight_matrix` BF16-callsite order.
+Disable with `FLUX2_F16CACHE_DISABLE=1`. Measured on RTX 5060 Ti with the
+Klein2-4B text encoder (`/mnt/disk01/models/klein2-4b/text_encoder`, sharded
+safetensors, 7.6 GB F16 payload):
+
+| Run | Cache | `flux2_text_enc_load_gpu` + encode |
+|---|---|---|
+| Cold (write) | MISS | **27.0 s** |
+| Warm (read)  | HIT  | **3.0 s**  |
+
+~9× speedup, ~24 s shaved. Bit-exact: `max_diff=0.0` between cold-run and
+warm-run hidden states (`--test-text-gpu` repeat check). Caveat: the cache is
+keyed only on path+size+mtime and the format is sequential without per-tensor
+naming, so a future change to BF16 upload order in
+`cuda_llm_load_weights_qwen3_safetensors` would silently invalidate existing
+caches without bumping the key — delete the sidecar by hand after such
+patches.
+
 ### CUDA perf snapshot (2026-04-19, `/mnt/disk01/models/klein2-4b`)
 
 Measured on RTX 5060 Ti 16GB with real Klein2-4B weights under `/mnt/disk01/models/klein2-4b`.
@@ -458,7 +480,7 @@ The recent `CUDA_ERROR_ILLEGAL_ADDRESS (700)` seen in `--generate --gpu-enc` on 
 - [ ] **Attention kernel scaling**: Single-block-per-head FA2 flash attention works but may not scale to large resolutions. No multi-block flash attention.
 - [x] **Opt-in resident GPU text encoder**: `--keep-gpu-enc` / `FLUX2_KEEP_GPU_ENC=1` keeps the CUDA text encoder cache alive through DiT/VAE generation. The default path still frees it before DiT/VAE load to fit 16 GB cards.
 - [x] **GPU text encoder KV sizing/reset**: Flux2 GPU text encoder loads now allocate the 512-token KV cache that the wrapper actually uses. CUDA LLM reset now clears F16 KV caches with the correct byte size on the runner stream, including Gemma4 variable-size caches.
-- [ ] **GPU text encoder startup cost**: cold start is still dominated by CUDA LLM init + BF16→F16 CPU conversion and weight transfer. PTX cache, in-process reuse, and smaller KV cache help; remaining work is a deterministic GPU-ready first-load path or persistent serialized F16 weights.
+- [x] **GPU text encoder startup cost (warm)**: persistent F16 sidecar (`<dir>/cache.f16cache`) added 2026-05-16. Cold load (writes cache) 27.0 s → warm load (mmap) 3.0 s on Klein2-4B text encoder (~9×, ~24 s shaved). See "Persistent F16 sidecar cache" above. Cold-start remains dominated by the one-time conversion + initial weight upload; further work could pre-stage the sidecar during model install.
 
 ### Quality
 
