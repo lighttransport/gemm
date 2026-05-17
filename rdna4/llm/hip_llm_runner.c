@@ -766,6 +766,55 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Same math as matvec_q4_K_f32, but one warp owns one output row.\n"
+" * The decode shapes have nb ~= 16-20 blocks/row, so the old one-block-per-row\n"
+" * kernel left most of its threads idle. This packs blockDim.x/32 rows/block. */\n"
+"__global__ void matvec_q4_K_mw_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int rows_per_block = blockDim.x / 32;\n"
+"    int row = blockIdx.x * rows_per_block + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 144;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 144;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qs = bp + 16;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        int is = 0;\n"
+"        #pragma unroll\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0;\n"
+"            float d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            #pragma unroll 4\n"
+"            for (int l = 0; l < 32; l++)\n"
+"                partial += (d1 * (q[l] & 0xF) - m1) * xb[yi++];\n"
+"            #pragma unroll 4\n"
+"            for (int l = 0; l < 32; l++)\n"
+"                partial += (d2 * (q[l] >> 4) - m2) * xb[yi++];\n"
+"            is += 2;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
 "__global__ void matvec_q6_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -4191,6 +4240,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q2_K_f32;
     hipFunction_t fn_matvec_q3_K_f32;
     hipFunction_t fn_matvec_q4_K_f32;
+    hipFunction_t fn_matvec_q4_K_mw_f32;
     hipFunction_t fn_matvec_q5_K_f32;
     hipFunction_t fn_matvec_q6_K_f32;
     hipFunction_t fn_embed_q2_K;
@@ -4400,6 +4450,7 @@ struct hip_llm_runner {
 
     /* === Phase 4: WMMA decode matvec === */
     int decode_wmma;            /* 1 = use WMMA matvec for F16 weights at decode */
+    int quant_matvec_opt;       /* 1 = route selected quant decode matvecs to optimized variants */
 
     /* === Phase 5: HIP graph capture for decode === */
     hipFunction_t fn_rope_neox_f32_devp;
@@ -4460,6 +4511,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q3_K_f32);
     GET_FUNC(matvec_q4_K_f32);
+    GET_FUNC(matvec_q4_K_mw_f32);
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
@@ -4549,6 +4601,11 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     if (!r) return NULL;
     r->verbose = verbose;
     r->device = device_id;
+    r->quant_matvec_opt = 0;
+    {
+        const char *env_qmv = getenv("LLM_QUANT_MATVEC_OPT");
+        if (env_qmv) r->quant_matvec_opt = atoi(env_qmv) != 0;
+    }
 
     CHECK_HIP_NULL(hipSetDevice(device_id));
     r->context = NULL;  /* use default context (no hipCtxCreate) */
@@ -5692,7 +5749,16 @@ static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat,
 
 DEFINE_LAUNCH_MATVEC(q2_K, fn_matvec_q2_K_f32)
 DEFINE_LAUNCH_MATVEC(q3_K, fn_matvec_q3_K_f32)
-DEFINE_LAUNCH_MATVEC(q4_K, fn_matvec_q4_K_f32)
+static inline void launch_matvec_q4_K(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    if (r->quant_matvec_opt && n_rows <= 4096 && n_cols <= 4096) {
+        LAUNCH(r->fn_matvec_q4_K_mw_f32, n_rows, 1, 1, 32, 1, 1, 0,
+               r->stream, args);
+    } else {
+        LAUNCH(r->fn_matvec_q4_K_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+    }
+}
 DEFINE_LAUNCH_MATVEC(q5_K, fn_matvec_q5_K_f32)
 DEFINE_LAUNCH_MATVEC(q6_K, fn_matvec_q6_K_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq2_xxs, fn_matvec_iq2_xxs_f32)
@@ -7428,6 +7494,50 @@ void hip_llm_free(hip_llm_runner *r) {
 /* Public API: accessors                                                    */
 /* ======================================================================== */
 
+/* Local block metadata for quant matvec kernels. ggml_type_info is a static
+ * const in gguf_loader.h, only visible to translation units that define
+ * GGUF_LOADER_IMPLEMENTATION, so the runner keeps the small table it needs. */
+static int quant_matvec_block_info(int weight_type, int *blk_elems, int *blk_bytes) {
+    if (!blk_elems || !blk_bytes) return -1;
+    *blk_elems = 0;
+    *blk_bytes = 0;
+    switch (weight_type) {
+        case GGML_TYPE_Q4_K:    *blk_elems = 256; *blk_bytes = 144; break;
+        case GGML_TYPE_Q5_K:    *blk_elems = 256; *blk_bytes = 176; break;
+        case GGML_TYPE_Q6_K:    *blk_elems = 256; *blk_bytes = 210; break;
+        case GGML_TYPE_Q4_0:    *blk_elems = 32;  *blk_bytes = 18;  break;
+        case GGML_TYPE_Q4_1:    *blk_elems = 32;  *blk_bytes = 20;  break;
+        case GGML_TYPE_Q5_0:    *blk_elems = 32;  *blk_bytes = 22;  break;
+        case GGML_TYPE_Q5_1:    *blk_elems = 32;  *blk_bytes = 24;  break;
+        case GGML_TYPE_IQ2_XXS: *blk_elems = 256; *blk_bytes = 66;  break;
+        case GGML_TYPE_IQ2_XS:  *blk_elems = 256; *blk_bytes = 74;  break;
+        case GGML_TYPE_IQ2_S:   *blk_elems = 256; *blk_bytes = 82;  break;
+        case GGML_TYPE_IQ3_XXS: *blk_elems = 256; *blk_bytes = 98;  break;
+        case GGML_TYPE_IQ3_S:   *blk_elems = 256; *blk_bytes = 110; break;
+        case GGML_TYPE_IQ1_S:   *blk_elems = 256; *blk_bytes = 50;  break;
+        case GGML_TYPE_IQ1_M:   *blk_elems = 256; *blk_bytes = 56;  break;
+        case GGML_TYPE_IQ4_NL:  *blk_elems = 32;  *blk_bytes = 18;  break;
+        case GGML_TYPE_IQ4_XS:  *blk_elems = 256; *blk_bytes = 136; break;
+        case GGML_TYPE_TQ1_0:   *blk_elems = 256; *blk_bytes = 54;  break;
+        case GGML_TYPE_TQ2_0:   *blk_elems = 256; *blk_bytes = 66;  break;
+        default: return -1;
+    }
+    return 0;
+}
+
+static void fill_quant_matvec_inputs(unsigned char *h_mat, size_t mat_bytes,
+                                     float *h_x, int n_cols, int weight_type) {
+    unsigned s = 0xC0FFEEu ^ (unsigned)weight_type;
+    for (size_t i = 0; i < mat_bytes; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        h_mat[i] = (unsigned char)s;
+    }
+    for (int i = 0; i < n_cols; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        h_x[i] = (((float)((s >> 8) & 0xFFFFFF) / 16777216.0f) - 0.5f) * 0.1f;
+    }
+}
+
 /* A/B verify: GPU matvec_<type> vs caller-provided CPU dequant + scalar matvec
  * on identical raw quant bytes. Used by test_hip_llm --verify-quant-kernels. */
 int hip_llm_verify_quant_matvec(
@@ -7437,25 +7547,8 @@ int hip_llm_verify_quant_matvec(
         double *out_rel_l2, double *out_max_abs) {
     if (!r || !cpu_dequant_row || n_rows <= 0 || n_cols <= 0) return -1;
 
-    /* Reject types that don't have a HIP matvec kernel we want to verify,
-     * and look up block sizes locally (ggml_type_info is a static const in
-     * gguf_loader.h, only visible to translation units that define
-     * GGUF_LOADER_IMPLEMENTATION — which hip_llm_runner.c does not). */
     int blk_elems = 0, blk_bytes = 0;
-    switch (weight_type) {
-        case GGML_TYPE_IQ2_XXS: blk_elems = 256; blk_bytes = 66;  break;
-        case GGML_TYPE_IQ2_XS:  blk_elems = 256; blk_bytes = 74;  break;
-        case GGML_TYPE_IQ2_S:   blk_elems = 256; blk_bytes = 82;  break;
-        case GGML_TYPE_IQ3_XXS: blk_elems = 256; blk_bytes = 98;  break;
-        case GGML_TYPE_IQ3_S:   blk_elems = 256; blk_bytes = 110; break;
-        case GGML_TYPE_IQ1_S:   blk_elems = 256; blk_bytes = 50;  break;
-        case GGML_TYPE_IQ1_M:   blk_elems = 256; blk_bytes = 56;  break;
-        case GGML_TYPE_IQ4_NL:  blk_elems = 32;  blk_bytes = 18;  break;
-        case GGML_TYPE_IQ4_XS:  blk_elems = 256; blk_bytes = 136; break;
-        case GGML_TYPE_TQ1_0:   blk_elems = 256; blk_bytes = 54;  break;
-        case GGML_TYPE_TQ2_0:   blk_elems = 256; blk_bytes = 66;  break;
-        default: return -1;
-    }
+    if (quant_matvec_block_info(weight_type, &blk_elems, &blk_bytes) != 0) return -1;
     if ((n_cols % blk_elems) != 0) return -1;
     int n_blk_per_row = n_cols / blk_elems;
     size_t row_bytes  = (size_t)n_blk_per_row * blk_bytes;
@@ -7471,22 +7564,15 @@ int hip_llm_verify_quant_matvec(
         return -2;
     }
 
-    /* Deterministic random bytes per quant type (xorshift). */
-    unsigned s = 0xC0FFEEu ^ (unsigned)weight_type;
-    for (size_t i = 0; i < mat_bytes; i++) {
-        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        h_mat[i] = (unsigned char)s;
-    }
-    for (int i = 0; i < n_cols; i++) {
-        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        h_x[i] = (((float)((s >> 8) & 0xFFFFFF) / 16777216.0f) - 0.5f) * 0.1f;
-    }
+    fill_quant_matvec_inputs(h_mat, mat_bytes, h_x, n_cols, weight_type);
 
     void *d_mat = NULL, *d_x = NULL, *d_dst = NULL;
     if (hipMalloc(&d_mat, mat_bytes) != hipSuccess ||
         hipMalloc(&d_x,   (size_t)n_cols * sizeof(float)) != hipSuccess ||
         hipMalloc(&d_dst, (size_t)n_rows * sizeof(float)) != hipSuccess) {
-        if (d_mat) hipFree(d_mat); if (d_x) hipFree(d_x); if (d_dst) hipFree(d_dst);
+        if (d_mat) hipFree(d_mat);
+        if (d_x) hipFree(d_x);
+        if (d_dst) hipFree(d_dst);
         free(h_mat); free(h_x); free(h_dst_hip); free(h_dst_ref); free(h_row_f32);
         return -2;
     }
@@ -7534,6 +7620,75 @@ int hip_llm_verify_quant_matvec(
     hipFree(d_mat); hipFree(d_x); hipFree(d_dst);
     free(h_mat); free(h_x); free(h_dst_hip); free(h_dst_ref); free(h_row_f32);
     return 0;
+}
+
+int hip_llm_bench_quant_matvec(
+        hip_llm_runner *r, int weight_type,
+        int n_rows, int n_cols,
+        int warmup, int iters,
+        float *out_ms) {
+    if (!r || n_rows <= 0 || n_cols <= 0 || iters <= 0 || !out_ms) return -1;
+
+    int blk_elems = 0, blk_bytes = 0;
+    if (quant_matvec_block_info(weight_type, &blk_elems, &blk_bytes) != 0) return -1;
+    if ((n_cols % blk_elems) != 0) return -1;
+    int n_blk_per_row = n_cols / blk_elems;
+    size_t row_bytes = (size_t)n_blk_per_row * blk_bytes;
+    size_t mat_bytes = (size_t)n_rows * row_bytes;
+    size_t x_bytes = (size_t)n_cols * sizeof(float);
+    size_t dst_bytes = (size_t)n_rows * sizeof(float);
+
+    unsigned char *h_mat = (unsigned char *)malloc(mat_bytes);
+    float *h_x = (float *)malloc(x_bytes);
+    if (!h_mat || !h_x) {
+        free(h_mat); free(h_x);
+        return -2;
+    }
+    fill_quant_matvec_inputs(h_mat, mat_bytes, h_x, n_cols, weight_type);
+
+    void *d_mat = NULL, *d_x = NULL, *d_dst = NULL;
+    hipEvent_t ev_start = NULL, ev_stop = NULL;
+    int rc = -2;
+    if (hipMalloc(&d_mat, mat_bytes) != hipSuccess ||
+        hipMalloc(&d_x,   x_bytes)   != hipSuccess ||
+        hipMalloc(&d_dst, dst_bytes) != hipSuccess) {
+        goto done;
+    }
+    if (hipMemcpy(d_mat, h_mat, mat_bytes, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_x, h_x, x_bytes, hipMemcpyHostToDevice) != hipSuccess) {
+        goto done;
+    }
+    if (hipEventCreate(&ev_start) != hipSuccess ||
+        hipEventCreate(&ev_stop)  != hipSuccess) {
+        goto done;
+    }
+
+    for (int i = 0; i < warmup; i++) {
+        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+    }
+    if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
+
+    if (hipEventRecord(ev_start, r->stream) != hipSuccess) goto done;
+    for (int i = 0; i < iters; i++) {
+        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+    }
+    if (hipEventRecord(ev_stop, r->stream) != hipSuccess) goto done;
+    if (hipEventSynchronize(ev_stop) != hipSuccess) goto done;
+
+    float elapsed = 0.0f;
+    if (hipEventElapsedTime(&elapsed, ev_start, ev_stop) != hipSuccess) goto done;
+    *out_ms = elapsed / (float)iters;
+    rc = 0;
+
+done:
+    if (ev_start) hipEventDestroy(ev_start);
+    if (ev_stop) hipEventDestroy(ev_stop);
+    if (d_mat) hipFree(d_mat);
+    if (d_x) hipFree(d_x);
+    if (d_dst) hipFree(d_dst);
+    free(h_mat);
+    free(h_x);
+    return rc;
 }
 
 void hip_llm_reset_state(hip_llm_runner *r) {
