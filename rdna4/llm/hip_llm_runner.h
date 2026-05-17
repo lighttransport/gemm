@@ -116,6 +116,15 @@ int hip_llm_verify_quant_matvec(
         int n_rows, int n_cols,
         double *out_rel_l2, double *out_max_abs);
 
+/* Microbenchmark the GPU matvec kernel for `weight_type` on deterministic
+ * random raw block-quant bytes. No model needs to be loaded. Reports average
+ * HIP event time per launch in milliseconds. */
+int hip_llm_bench_quant_matvec(
+        hip_llm_runner *r, int weight_type,
+        int n_rows, int n_cols,
+        int warmup, int iters,
+        float *out_ms);
+
 /* Query model dimensions (valid after load_weights). */
 int hip_llm_n_embd(const hip_llm_runner *r);
 int hip_llm_n_layers(const hip_llm_runner *r);
