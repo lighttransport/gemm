@@ -5192,10 +5192,14 @@ static void cllm_f16cache_begin(const char *model_path, int verbose) {
         close(fd);
     }
 
-    /* Writer */
-    snprintf(g_f16cache.path_tmp, sizeof(g_f16cache.path_tmp), "%s.tmp", g_f16cache.path_final);
-    g_f16cache.write_fp = fopen(g_f16cache.path_tmp, "wb");
-    if (!g_f16cache.write_fp) return;
+    /* Writer. Use a unique temp path so concurrent cold processes do not
+     * clobber each other's sidecar stream before the final atomic rename. */
+    snprintf(g_f16cache.path_tmp, sizeof(g_f16cache.path_tmp), "%s.tmp.%ld",
+             g_f16cache.path_final, (long)getpid());
+    int wfd = open(g_f16cache.path_tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (wfd < 0) return;
+    g_f16cache.write_fp = fdopen(wfd, "wb");
+    if (!g_f16cache.write_fp) { close(wfd); unlink(g_f16cache.path_tmp); return; }
     uint64_t hdr[4] = { CLLM_F16CACHE_MAGIC, CLLM_F16CACHE_VERSION, g_f16cache.key, 0 };
     if (fwrite(hdr, sizeof(hdr), 1, g_f16cache.write_fp) != 1) {
         fclose(g_f16cache.write_fp); g_f16cache.write_fp = NULL;
@@ -5494,7 +5498,8 @@ static int cllm_st_dtype_to_ggml(const char *dtype) {
     if (strcmp(dtype, "F32") == 0) return GGML_TYPE_F32;
     if (strcmp(dtype, "F16") == 0) return GGML_TYPE_F16;
     if (strcmp(dtype, "BF16") == 0) return GGML_TYPE_BF16;
-    if (strcmp(dtype, "F8_E4M3") == 0) return CLLM_TYPE_F8_E4M3;
+    if (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0)
+        return CLLM_TYPE_F8_E4M3;
     return -1;
 }
 
@@ -5550,7 +5555,17 @@ static qtensor cllm_st_load_tensor_multi(st_context **shards, int n_shards,
                 if (cllm_st_read_scalar_f32_multi(shards, n_shards, scale_name, &scale) == 0) {
                     t.scale = scale;
                     t.has_scale = 1;
+                } else {
+                    fprintf(stderr,
+                            "cuda_llm: FP8 safetensors tensor %s requires scalar F32 scale tensor %s\n",
+                            name, scale_name);
+                    memset(&t, 0, sizeof(t));
+                    return t;
                 }
+            } else {
+                fprintf(stderr, "cuda_llm: FP8 safetensors scale name too long for %s\n", name);
+                memset(&t, 0, sizeof(t));
+                return t;
             }
         }
     }
