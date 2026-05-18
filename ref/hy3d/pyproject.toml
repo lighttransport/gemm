@@ -44,3 +44,6 @@ torch-rocm722 = [
 
 [tool.uv]
 package = false
+
+[tool.setuptools]
+py-modules = []
