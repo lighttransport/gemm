@@ -2,7 +2,7 @@
  * hip_flux2_runner.c - HIP/ROCm Flux.2 Klein text-to-image runner (RDNA4)
  *
  * GPU-accelerated DiT (5 double-stream + 20 single-stream blocks).
- * VAE decode falls back to CPU.
+ * GPU-accelerated VAE decode.
  *
  * Compiles with plain gcc (no hipcc). Uses rocew for dynamic HIP/HIPRTC loading.
  * F32 weights on GPU, F32 compute. Single-stream sequential kernel launches.
