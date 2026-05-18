@@ -268,7 +268,7 @@ int main(int argc, char **argv) {
                     "  [--dump-steps-prefix <pfx>] [--ref-final <bin>] [--path-stats] [--mem-stats]\n"
                     "  [--fp8-quant-stats] [--fp8-fp8-allow <labels>] [--fp8-fp8-deny <labels>]\n"
                     "  [--fp8-fp8-block-min <i>] [--fp8-fp8-block-max <i>]\n"
-                    "  [--fp8-quality-target-db <db>]\n"
+                    "  [--fp8-quality-target-db <db>]  (requires allow/block range for FP8xFP8)\n"
                     "  [--fp8-act-scale-div <x>] [--fp8-act-scale-mode perrow|comfy|clamp]\n"
                     "  [-o out.ppm] [-d dev] [-v]\n", argv[0]);
             return 1;
