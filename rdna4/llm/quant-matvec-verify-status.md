@@ -93,3 +93,15 @@ default path (`--bench-quant-matvec Q5_K 248320 5120 20 3`). End-to-end
 decode improved from 67.785 to 63.404 ms/tok on Qwen3.6-27B IQ3_XXS and
 from 45.179 to 36.372 ms/tok on Qwen3.5-9B Q4_K_XL, with identical A/B
 first/last decoded token ids.
+
+`matvec_q6_K_f32` uses a 64-thread launch as of 2026-05-19. This keeps the
+same one-row-per-block arithmetic and only reduces idle lanes/reduction
+overhead for decode-sized rows. On RX 9070 XT:
+
+| shape | before | after |
+|---|---:|---:|
+| `Q6_K 5120x5120` | 0.143 ms | **0.0899 ms** |
+| `Q6_K 17408x5120` | 0.426 ms | **0.2895 ms** |
+| `Q6_K 5120x17408` | 0.558 ms | **0.4696 ms** |
+
+The same final binary passed `--verify-quant-kernels` with 18/18 PASS.

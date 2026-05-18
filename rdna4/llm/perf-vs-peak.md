@@ -335,6 +335,26 @@ token ids unchanged. Tried the analogous default Q4_K unroll in the same
 pass, but it regressed `Q4_K 5120x5120` from ~0.099 ms to ~0.200 ms/launch,
 so it was not landed.
 
+**Q6_K decode matvec 64-thread launch (✅ LANDED 2026-05-19)** — changed the
+default Q6_K one-row-per-block launch from 256 to 64 threads/block. Decode
+rows have only tens of 256-element K-blocks, so the old 256-thread block left
+most lanes idle and paid an 8-warp reduction. A 128-thread trial was slower on
+all sampled shapes, and a 32-thread trial only helped the smallest sampled
+shape while regressing the larger-row/longer-column cases.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q6_K 5120x5120` | 0.143 ms | **0.0899 ms** | **1.59x** |
+| microbench `Q6_K 17408x5120` | 0.426 ms | **0.2895 ms** | **1.47x** |
+| microbench `Q6_K 5120x17408` | 0.558 ms | **0.4696 ms** | **1.19x** |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 50.85-51.02 ms/tok | **50.12 ms/tok** | ~1.02x |
+| Qwen3.5-9B Q4_K_XL decode L=256, 16 tok | 25.57-25.62 ms/tok | **23.18 ms/tok** | ~1.10x |
+
+Correctness: `--verify-quant-kernels` passes 18/18. The change only alters
+the launch geometry of the existing Q6_K arithmetic.
+
 **Q4_K decode matvec 64-thread launch (✅ LANDED 2026-05-18)** — changed the
 default Q4_K one-row-per-block launch from 256 to 64 threads/block. Decode
 rows have ~16-68 K-blocks, so the old 256-thread block left most lanes idle
