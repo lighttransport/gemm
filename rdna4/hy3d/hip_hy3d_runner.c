@@ -357,6 +357,69 @@ static void *st_upload_f16(st_context *st, const char *name, int verbose) {
     return NULL;
 }
 
+static float hy3d_f16_bits_to_f32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x3ff;
+    uint32_t f;
+    if (exp == 0) {
+        f = sign << 31;
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7f800000 | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(float));
+    return out;
+}
+
+static uint16_t hy3d_f32_to_f16_rn(float f) {
+    union { float f; uint32_t i; } u;
+    u.f = f;
+    uint32_t x = u.i;
+    uint16_t sign = (uint16_t)((x >> 16) & 0x8000);
+    int32_t exp = (int32_t)((x >> 23) & 0xff);
+    uint32_t mant = x & 0x7fffff;
+
+    if (exp == 0xff) {
+        return (uint16_t)(sign | 0x7c00 | (mant ? 0x0200 : 0));
+    }
+
+    int32_t new_exp = exp - 127 + 15;
+    if (new_exp >= 31) return (uint16_t)(sign | 0x7c00);
+    if (new_exp <= 0) {
+        if (new_exp < -10) return sign;
+        mant |= 0x800000;
+        int shift = 14 - new_exp;
+        uint32_t out = mant >> shift;
+        uint32_t rem = mant & ((1u << shift) - 1u);
+        uint32_t half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (out & 1u))) out++;
+        return (uint16_t)(sign | out);
+    }
+
+    uint32_t out_exp = (uint32_t)new_exp << 10;
+    uint32_t out_mant = mant >> 13;
+    uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (out_mant & 1u))) {
+        out_mant++;
+        if (out_mant == 0x400u) {
+            out_mant = 0;
+            new_exp++;
+            if (new_exp >= 31) return (uint16_t)(sign | 0x7c00);
+            out_exp = (uint32_t)new_exp << 10;
+        }
+    }
+    return (uint16_t)(sign | out_exp | out_mant);
+}
+
+static float hy3d_pytorch_fp16_timestep(float sigma) {
+    float t_train = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(sigma * 1000.0f));
+    float t_unit = t_train / 1000.0f;
+    return hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(t_unit));
+}
+
 /* Upload safetensors tensor to GPU as F32 (converting F16->F32 if needed) */
 static void *st_upload_f32(st_context *st, const char *name, int verbose) {
     int idx = safetensors_find(st, name);
@@ -375,19 +438,7 @@ static void *st_upload_f32(st_context *st, const char *name, int verbose) {
         float *f32 = (float *)malloc(n * sizeof(float));
         const uint16_t *f16 = (const uint16_t *)data;
         for (size_t i = 0; i < n; i++) {
-            /* Simple F16 to F32 conversion */
-            uint32_t sign = (f16[i] >> 15) & 0x1;
-            uint32_t exp = (f16[i] >> 10) & 0x1f;
-            uint32_t mant = f16[i] & 0x3ff;
-            uint32_t f;
-            if (exp == 0) {
-                f = sign << 31;
-            } else if (exp == 31) {
-                f = (sign << 31) | 0x7f800000 | (mant << 13);
-            } else {
-                f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-            }
-            memcpy(&f32[i], &f, sizeof(float));
+            f32[i] = hy3d_f16_bits_to_f32(f16[i]);
         }
         void *d = hip_upload_raw(f32, n * sizeof(float));
         free(f32);
@@ -1889,7 +1940,10 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
                               : (float)(step + 1) / (float)(n_steps - 1);
         }
         float dt = sigma - sigma_next; /* negative except last step */
-        float model_t = sigma;
+        /* Pipeline casts scheduler timesteps to latents.dtype (fp16) before
+         * dividing by num_train_timesteps, then the model receives fp16
+         * timestep values. Mirror those rounded values in F32 storage. */
+        float model_t = hy3d_pytorch_fp16_timestep(sigma);
 
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
             fprintf(stderr, "  step %d/%d (t=%.4f)\n", step + 1, n_steps, model_t);
