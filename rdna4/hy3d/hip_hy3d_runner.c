@@ -1917,6 +1917,10 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         }
 
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
+        /* PyTorch scheduler.step upcasts the sample for the Euler add and
+         * then casts prev_sample back to model_output.dtype (fp16 here). Keep
+         * F32 storage for the HIP kernels, but round values through fp16. */
+        op_round_f32_to_f16(ops, stream, d_latents, latent_size);
 
         /* NaN check after each step */
         if (r->verbose && step == 0) {
