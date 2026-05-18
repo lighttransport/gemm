@@ -306,8 +306,17 @@ static int qimg_csv_has_label(const char *csv, const char *label) {
     return 0;
 }
 
+static int qimg_has_fp8_fp8_positive_filter(const hip_qimg_runner *r) {
+    if (!r) return 0;
+    if (r->fp8_fp8_allow && r->fp8_fp8_allow[0]) return 1;
+    if (r->fp8_fp8_block_min >= 0 || r->fp8_fp8_block_max >= 0) return 1;
+    return 0;
+}
+
 static int qimg_allow_fp8_fp8_for_current_label(hip_qimg_runner *r) {
     if (!r) return 0;
+    if (r->fp8_quality_target_db > 0.0f && !qimg_has_fp8_fp8_positive_filter(r))
+        return 0;
     if (r->current_block >= 0) {
         if (r->fp8_fp8_block_min >= 0 && r->current_block < r->fp8_fp8_block_min)
             return 0;
@@ -1256,6 +1265,11 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
                     fprintf(stderr, "hip_qimg: BF16xFP8 WMMA (gfx12 matrix cores) enabled\n");
             }
         }
+        if (!r->use_wmma && r->fp8_quality_target_db > 0.0f && r->fn_gemm_fp8_wmma && r->use_fp8) {
+            r->use_wmma = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: BF16xFP8 WMMA fallback enabled for FP8 quality target\n");
+        }
     }
 
     /* FP8xFP8 WMMA path (gfx12). Opt-in via QIMG_FP8_FP8_WMMA=1. Eligible when
@@ -1296,7 +1310,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
                         fprintf(stderr, "hip_qimg: FP8xFP8 block range: %d..%d\n",
                                 r->fp8_fp8_block_min, r->fp8_fp8_block_max);
                     if (r->fp8_quality_target_db > 0.0f)
-                        fprintf(stderr, "hip_qimg: FP8 quality target: %.1f dB (diagnostic only; no automatic fallback)\n",
+                        fprintf(stderr, "hip_qimg: FP8 quality target: %.1f dB (FP8xFP8 requires allow labels or block range)\n",
                                 r->fp8_quality_target_db);
                     if (!r->fp8_act_scale_scalar && !r->fp8_act_scale_clamp && r->fp8_act_scale_div != 512.0f)
                         fprintf(stderr, "hip_qimg: FP8 activation scale divisor: %.1f\n", r->fp8_act_scale_div);
