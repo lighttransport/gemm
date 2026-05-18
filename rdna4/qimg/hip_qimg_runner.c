@@ -771,8 +771,10 @@ static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
 /* Weight GEMM + BF16 truncation */
 static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           int n_out, int n_in, int n_tok) {
+    hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
+                             (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
     int fp8_fp8_eligible = (r->use_fp8_fp8w && !r->prefer_bf16_wmma && r->fn_gemm_fp8_fp8_pgr2 &&
-                             r->fn_quantize_act_perrow &&
+                             quant_fn && qimg_allow_fp8_fp8_for_current_label(r) &&
                              (n_tok % 128) == 0 && (n_out % 128) == 0 && (n_in % 32) == 0);
     if (r->use_fp8 && (r->fn_gemm_opt_fp8 || (r->use_wmma && r->fn_gemm_fp8_wmma) || fp8_fp8_eligible) && n_tok >= 16) {
         /* Optimized FP8 paths produce already-effectively-BF16 outputs:
