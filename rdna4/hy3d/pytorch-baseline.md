@@ -11,7 +11,9 @@ mesh, and can write a small timing JSON.
 
 ```sh
 cd /mnt/disk1/work/gemm/main/ref/hy3d
-uv run python run_full_pipeline.py \
+uv venv --python 3.12 .venv
+uv pip install -e ".[torch-rocm722]"
+.venv/bin/python run_full_pipeline.py \
     --image /mnt/disk1/models/Hunyuan3D-2.1-repo/assets/example_images/004.png \
     --out /tmp/hy3d_ref.glb \
     --steps 30 --guidance 5.0 --octree 256 --seed 42 \
@@ -30,7 +32,7 @@ For layer-by-layer comparison against the HIP runner, emit a trace directory:
 
 ```sh
 cd /mnt/disk1/work/gemm/main/ref/hy3d
-uv run python run_full_pipeline.py \
+.venv/bin/python run_full_pipeline.py \
     --image /mnt/disk1/models/Hunyuan3D-2.1-repo/assets/example_images/004.png \
     --out /tmp/hy3d_ref_trace.glb \
     --steps 1 --guidance 5.0 --octree 64 --seed 42 \
@@ -55,14 +57,14 @@ removes random latent and conditioner drift from DiT/VAE debugging.
 ## Current caveats
 
 - This checkout has `ref/hy3d/pyproject.toml`, but no checked-in lockfile or
-  local `.venv`. Use the project environment that has the upstream Hy3D
-  dependencies installed.
+  local `.venv`. The `torch-rocm722` extra pins the same ROCm 7.2.2 PyTorch
+  wheel family used by the Trellis2 RDNA4 baseline venv.
 - Plain `uv run` against this `pyproject.toml` resolves PyPI default CUDA
   wheels here (`torch 2.12.0+cu130`, `torch.version.hip=None`,
   `cuda.is_available=False`), so it is not a valid ROCm baseline environment.
-  Use a ROCm PyTorch environment or pin the appropriate ROCm wheel index before
-  taking baseline numbers. The runner now fails fast for the default
-  `--device cuda` path when `torch.version.hip` is absent.
+  Use `.venv/bin/python` after installing `.[torch-rocm722]` before taking
+  baseline numbers. The runner now fails fast for the default `--device cuda`
+  path when `torch.version.hip` is absent.
 - The runner defaults to full-resident GPU execution. The low-VRAM/offload path
   remains documented as unreliable in the script because upstream mixes
   diffusers offload conventions with non-diffusers pipeline state.
