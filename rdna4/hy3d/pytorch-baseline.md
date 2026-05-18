@@ -84,6 +84,17 @@ That makes the next Hy3D work item numeric trajectory/mesh parity, not
 environment setup or a broken VAE. The PyTorch trace is now stable enough to
 use as the oracle.
 
+Per-step drift can be summarized after a replay with latent/velocity dumps:
+
+```sh
+rdna4/hy3d/compare_trace.py \
+    --ref-dir /tmp/hy3d_ref_trace \
+    --hip-latent-prefix /tmp/hy3d_hip_latent \
+    --hip-velocity-prefix /tmp/hy3d_hip_velocity \
+    --steps 4 --guidance 5.0 \
+    --json /tmp/hy3d_trace_compare.json
+```
+
 ## Current caveats
 
 - This checkout has `ref/hy3d/pyproject.toml`, but no checked-in lockfile or
