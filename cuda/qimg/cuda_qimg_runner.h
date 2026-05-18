@@ -2660,12 +2660,25 @@ qkv_fallback:
 static int qimg_f32_split_kv_from_env(const char *env, int n_tok) {
     if (!env || env[0] == '0') return 0;
     if (strcmp(env, "auto") == 0) {
-        /* 2048-token microbench: split_kv=256 was best on the test host.
+        /* Measured qimg token regimes on the test host:
+         *   2048 tokens: split_kv=256
+         *   4608 tokens: split_kv=1024
          * Keep smaller shapes on the default path to avoid merge overhead. */
+        if (n_tok >= 4096) return 1024;
         return (n_tok >= 2048) ? 256 : 0;
     }
-    int split_kv = atoi(env);
-    return (split_kv <= 1) ? 1024 : split_kv;
+    char *end = NULL;
+    long split_kv = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || split_kv < 0) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "cuda_qimg: ignoring invalid QIMG_FA2_SPLIT_F32=%s\n", env);
+            warned = 1;
+        }
+        return 0;
+    }
+    if (split_kv == 0) return 0;
+    return (split_kv <= 1) ? 1024 : (int)split_kv;
 }
 
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
@@ -2686,15 +2699,20 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
             size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
             void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
                               &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim, &split_kv};
-            cuLaunchKernel(r->attn_split_partials_f32,
-                           (unsigned)n_heads, gy, (unsigned)n_splits,
-                           n_threads, 1, 1, smem, r->stream, p_args, NULL);
+            CUresult e1 = cuLaunchKernel(r->attn_split_partials_f32,
+                                         (unsigned)n_heads, gy, (unsigned)n_splits,
+                                         n_threads, 1, 1, smem, r->stream, p_args, NULL);
             void *m_args[] = {&d_out, &r->d_attn_part_o, &r->d_attn_part_m,
                               &r->d_attn_part_l, &n_tok, &n_heads, &head_dim, &n_splits};
-            cuLaunchKernel(r->attn_split_merge_f32,
-                           (unsigned)n_heads, (unsigned)n_tok, 1,
-                           128, 1, 1, 0, r->stream, m_args, NULL);
-            return;
+            CUresult e2 = (e1 == CUDA_SUCCESS)
+                ? cuLaunchKernel(r->attn_split_merge_f32,
+                                 (unsigned)n_heads, (unsigned)n_tok, 1,
+                                 128, 1, 1, 0, r->stream, m_args, NULL)
+                : e1;
+            if (e1 == CUDA_SUCCESS && e2 == CUDA_SUCCESS) return;
+            fprintf(stderr,
+                    "cuda_qimg: split-key attention launch failed (%d/%d), falling back\n",
+                    (int)e1, (int)e2);
         }
     }
 
@@ -3619,6 +3637,13 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         if (cu_buf_slot_ensure(&r->cfg_slots[(id)], (nbytes), (label)) != 0) goto cleanup; \
         (dst) = r->cfg_slots[(id)].ptr; \
     } while (0)
+#define QIMG_CU_OR_CLEANUP(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "cuda_qimg: %s failed (err=%d)\n", (label), (int)_qe); \
+            goto cleanup; \
+        } \
+    } while (0)
 
     /* Check GPU memory before allocations */
     {
@@ -3642,7 +3667,9 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
 
     /* Upload inputs */
     QIMG_ALLOC_OR_CLEANUP(d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in", QIMG_CFG_BUF_IMG_IN);
-    cuMemcpyHtoD(d_img_in, img_tokens, (size_t)n_img * in_ch * sizeof(float));
+    QIMG_CU_OR_CLEANUP(cuMemcpyHtoD(d_img_in, img_tokens,
+                                    (size_t)n_img * in_ch * sizeof(float)),
+                       "img input upload");
     /* Save raw patchified input for comparison */
     if (r->verbose >= 3) {
         FILE *_pf = fopen("cuda_dit_img_input.npy", "wb");
@@ -3663,7 +3690,9 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         }
     }
     QIMG_ALLOC_OR_CLEANUP(d_txt_in, (size_t)n_txt * txt_dim * sizeof(float), "d_txt_in", QIMG_CFG_BUF_TXT_IN_C);
-    cuMemcpyHtoD(d_txt_in, txt_tokens, (size_t)n_txt * txt_dim * sizeof(float));
+    QIMG_CU_OR_CLEANUP(cuMemcpyHtoD(d_txt_in, txt_tokens,
+                                    (size_t)n_txt * txt_dim * sizeof(float)),
+                       "text input upload");
 
     /* Match ComfyUI: apply_model casts input to BF16 (inference dtype).
      * This is critical — BF16 truncation of activations changes the model output
@@ -3687,7 +3716,8 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         t_sin[half + i] = sinf(angle);
     }
     QIMG_ALLOC_OR_CLEANUP(d_t_sin, 256 * sizeof(float), "d_t_sin", QIMG_CFG_BUF_T_SIN);
-    cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float));
+    QIMG_CU_OR_CLEANUP(cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float)),
+                       "timestep upload");
 
     op_gemm(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
@@ -3918,8 +3948,10 @@ int cuda_qimg_dit_step(cuda_qimg_runner *r,
         DIT_SAVE_NPY("cuda_dit_proj_out.npy", d_final_out, n_img, in_ch);
 
         /* Download result (sync stream first to ensure computation is complete) */
-        cuStreamSynchronize(s);
-        cuMemcpyDtoH(out, d_final_out, (size_t)n_img * in_ch * sizeof(float));
+        QIMG_CU_OR_CLEANUP(cuStreamSynchronize(s), "dit step sync");
+        QIMG_CU_OR_CLEANUP(cuMemcpyDtoH(out, d_final_out,
+                                        (size_t)n_img * in_ch * sizeof(float)),
+                           "dit output download");
     }
     rc = 0;
 
@@ -3959,6 +3991,7 @@ cleanup:
         r->prof_block_count = 0;
     }
 #undef QIMG_ALLOC_OR_CLEANUP
+#undef QIMG_CU_OR_CLEANUP
     return rc;
 }
 
@@ -4090,6 +4123,13 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         if (cu_buf_slot_ensure(&r->cfg_slots[(id)], (nbytes), (label)) != 0) goto cleanup; \
         (dst) = r->cfg_slots[(id)].ptr; \
     } while (0)
+#define QIMG_CFG_CU_OR_CLEANUP(call, label) do { \
+        CUresult _qe = (call); \
+        if (_qe != CUDA_SUCCESS) { \
+            fprintf(stderr, "cuda_qimg(cfg): %s failed (err=%d)\n", (label), (int)_qe); \
+            goto cleanup; \
+        } \
+    } while (0)
 
     /* Allocate paired img/txt buffers. Both passes share the same img_tokens
      * at input (same noise) but the hidden states diverge after block 0 so
@@ -4101,11 +4141,17 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
 
     /* Upload img (used twice) + both txt conditionings. */
     QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_IMG_IN, d_img_in, (size_t)n_img * in_ch * sizeof(float), "d_img_in");
-    cuMemcpyHtoD(d_img_in, img_tokens, (size_t)n_img * in_ch * sizeof(float));
+    QIMG_CFG_CU_OR_CLEANUP(cuMemcpyHtoD(d_img_in, img_tokens,
+                                        (size_t)n_img * in_ch * sizeof(float)),
+                           "img input upload");
     QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_TXT_IN_C, d_txt_in_c, (size_t)n_txt_cond   * txt_dim * sizeof(float), "d_txt_in_c");
     QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_TXT_IN_U, d_txt_in_u, (size_t)n_txt_uncond * txt_dim * sizeof(float), "d_txt_in_u");
-    cuMemcpyHtoD(d_txt_in_c, txt_cond,   (size_t)n_txt_cond   * txt_dim * sizeof(float));
-    cuMemcpyHtoD(d_txt_in_u, txt_uncond, (size_t)n_txt_uncond * txt_dim * sizeof(float));
+    QIMG_CFG_CU_OR_CLEANUP(cuMemcpyHtoD(d_txt_in_c, txt_cond,
+                                        (size_t)n_txt_cond * txt_dim * sizeof(float)),
+                           "cond text input upload");
+    QIMG_CFG_CU_OR_CLEANUP(cuMemcpyHtoD(d_txt_in_u, txt_uncond,
+                                        (size_t)n_txt_uncond * txt_dim * sizeof(float)),
+                           "uncond text input upload");
 
     /* Timestep embedding — same for cond/uncond */
     QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_T_EMB, d_t_emb, (size_t)dim * sizeof(float), "d_t_emb");
@@ -4164,7 +4210,8 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         t_sin[half + i] = sinf(angle);
     }
     QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_T_SIN, d_t_sin, 256 * sizeof(float), "d_t_sin");
-    cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float));
+    QIMG_CFG_CU_OR_CLEANUP(cuMemcpyHtoD(d_t_sin, t_sin, 256 * sizeof(float)),
+                           "timestep upload");
     op_gemm(r, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
     op_silu(r, d_t_emb, dim);
     QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_T_EMB2, d_t_emb2, (size_t)dim * sizeof(float), "d_t_emb2");
@@ -4343,8 +4390,10 @@ int cuda_qimg_dit_step_cfg(cuda_qimg_runner *r,
         QIMG_CFG_CACHE_OR_CLEANUP(QIMG_CFG_BUF_FINAL_OUT, d_final_out, (size_t)n_img * in_ch * sizeof(float), "d_final_out");
         op_gemm(r, d_final_out, r->d_proj_out_w, d_scratch1_p, r->d_proj_out_b,
                 in_ch, dim, n_img);
-        cuStreamSynchronize(s);
-        cuMemcpyDtoH(out_p, d_final_out, (size_t)n_img * in_ch * sizeof(float));
+        QIMG_CFG_CU_OR_CLEANUP(cuStreamSynchronize(s), "dit cfg pass sync");
+        QIMG_CFG_CU_OR_CLEANUP(cuMemcpyDtoH(out_p, d_final_out,
+                                            (size_t)n_img * in_ch * sizeof(float)),
+                               "dit cfg output download");
     }
     rc = 0;
 
@@ -4376,6 +4425,7 @@ cleanup:
         r->prof_block_count = 0;
     }
 #undef QIMG_CFG_CACHE_OR_CLEANUP
+#undef QIMG_CFG_CU_OR_CLEANUP
     return rc;
 }
 
