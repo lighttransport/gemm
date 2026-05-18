@@ -68,12 +68,21 @@ removes random latent and conditioner drift from DiT/VAE debugging.
   `7880` verts / `15756` faces. Outputs:
   `/tmp/hy3d_ref_trace_bench.json`, `/tmp/hy3d_ref_trace.glb`,
   `/tmp/hy3d_ref_trace.obj`, `/tmp/hy3d_ref_trace/*.npy`.
-- HIP replay with `--init-trace-dir /tmp/hy3d_ref_trace` completed in
-  `206.22s`, but produced empty SDF/mesh:
-  `SDF min=-1.0015 max=-0.9843 mean=-0.9999`, `0` verts / `0` tris.
+- HIP replay requires a rebuilt `rdna4/hy3d/test_hip_hy3d`; a stale binary used
+  the old descending schedule and produced an empty SDF. After rebuild, replay
+  starts at `t=0.0000`, completes in `207.11s`, and writes
+  `/tmp/hy3d_hip_trace.obj` with `11194` verts / `15884` tris.
+- HIP final latent dump `/tmp/hy3d_hip_latent_004.npy` vs PyTorch
+  `07_vae_input_latents.npy`: rel-L2 `0.0626`, max abs `2.06`, mean abs
+  `0.0136`.
+- HIP VAE-only replay on PyTorch `07_vae_input_latents.npy` is healthy:
+  `SDF min=-1.0083 max=1.0115 mean=-0.8066`.
+- DiT single-forward checks against the trace pass for step 0 CFG batch 0/1
+  and step 1 batch 0 (max abs <= `1.05e-2`).
 
-That makes the next Hy3D work item a VAE/SDF replay mismatch, not environment
-setup. The PyTorch trace is now stable enough to use as the oracle.
+That makes the next Hy3D work item numeric trajectory/mesh parity, not
+environment setup or a broken VAE. The PyTorch trace is now stable enough to
+use as the oracle.
 
 ## Current caveats
 
