@@ -318,7 +318,7 @@ size_t safetensors_dtype_size(const char *dtype_str) {
     static const struct { const char *name; size_t size; } tbl[] = {
         {"F32", 4}, {"F16", 2}, {"BF16", 2}, {"F64", 8},
         {"I8", 1}, {"U8", 1}, {"I16", 2}, {"I32", 4}, {"I64", 8},
-        {"BOOL", 1}, {"F8_E4M3", 1}, {"F8_E5M2", 1},
+        {"BOOL", 1}, {"F8_E4M3", 1}, {"F8_E4M3FN", 1}, {"F8_E5M2", 1},
     };
     for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++) {
         if (strcmp(tbl[i].name, dtype_str) == 0) return tbl[i].size;
