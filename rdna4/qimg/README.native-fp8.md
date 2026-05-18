@@ -75,8 +75,23 @@ QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate \
 
 Current pinned result: latent cosine `0.979988`, PSNR `24.59 dB`,
 denoise `20.3 s`, GEMM traffic `984 GB / 73.1 TF`, extra persistent
-activation-FP8 scratch `3.0 MB`. `--fp8-quality-target-db` is diagnostic
-annotation only; it does not suppress FP8xFP8 dispatch.
+activation-FP8 scratch `3.0 MB`.
+
+Quality-target gated FP8xFP8:
+
+```bash
+QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate ... --fp8-quality-target-db 50
+QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate ... --fp8-quality-target-db 50 \
+  --fp8-fp8-allow img_in
+```
+
+When `--fp8-quality-target-db` is set, FP8xFP8 now fails closed unless an
+explicit positive selector is present (`--fp8-fp8-allow` or block range).
+Eligible GEMMs fall back to BF16xFP8 WMMA automatically, even if only
+`QIMG_FP8_FP8_WMMA=1` was set. A 1-step path-stats smoke with no allow list
+reported `fp8xfp8_wmma=0`; the same smoke with `--fp8-fp8-allow img_in`
+reported exactly one FP8xFP8 GEMM and BF16xFP8 for the remaining eligible
+image-side GEMMs.
 
 Activation scale experiments:
 
