@@ -70,11 +70,11 @@ removes random latent and conditioner drift from DiT/VAE debugging.
   `/tmp/hy3d_ref_trace.obj`, `/tmp/hy3d_ref_trace/*.npy`.
 - HIP replay requires a rebuilt `rdna4/hy3d/test_hip_hy3d`; a stale binary used
   the old descending schedule and produced an empty SDF. After rebuild, replay
-  starts at `t=0.0000`, completes in `206.42s`, and writes
-  `/tmp/hy3d_hip_trace.obj` with `11208` verts / `15900` tris.
+  starts at `t=0.0000`, completes in `205.91s`, and writes
+  `/tmp/hy3d_hip_trace.obj` with `11066` verts / `15676` tris.
 - HIP final latent dump `/tmp/hy3d_hip_latent_004.npy` vs PyTorch
-  `07_vae_input_latents.npy`: rel-L2 `0.0617`, max abs `1.99`, mean abs
-  `0.0132`.
+  `07_vae_input_latents.npy`: rel-L2 `0.0596`, max abs `1.97`, mean abs
+  `0.0131`.
 - HIP VAE-only replay on PyTorch `07_vae_input_latents.npy` is healthy:
   `SDF min=-1.0083 max=1.0115 mean=-0.8066`.
 - DiT single-forward checks against the trace pass for step 0 CFG batch 0/1
