@@ -45,8 +45,8 @@ verify: $(VERIFY_DIT)
 # Default weight paths — override on the command line if your files live elsewhere.
 DIT ?= /mnt/disk1/models/klein2-4b/diffusion_models/flux-2-klein-4b-fp8.safetensors
 VAE ?= /mnt/disk1/models/klein2-4b/vae/diffusion_pytorch_model.safetensors
-ENC ?=
-TOK ?=
+ENC ?= /mnt/disk1/models/klein2-4b/split_files/text_encoders/qwen_3_4b.safetensors
+TOK ?= /mnt/disk1/models/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-F16.gguf
 TXT_BIN ?=
 PROMPT ?= a red apple on a white table
 
