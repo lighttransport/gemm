@@ -239,22 +239,27 @@ def main():
     )
     elapsed = time.time() - t0
     mesh = outputs[0]
-    print(f"  sampled in {elapsed:.1f}s: "
-          f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+    mesh_ok = mesh is not None
+    if mesh_ok:
+        print(f"  sampled in {elapsed:.1f}s: "
+              f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+    else:
+        print(f"  sampled in {elapsed:.1f}s: no mesh surface extracted")
 
     for h in hook_handles:
         h.remove()
 
     out_path = args.out
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    mesh.export(out_path)
-    print(f"  wrote {out_path}")
+    if mesh_ok:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        mesh.export(out_path)
+        print(f"  wrote {out_path}")
 
-    base, ext = os.path.splitext(out_path)
-    if ext.lower() != ".obj":
-        obj_path = base + ".obj"
-        mesh.export(obj_path)
-        print(f"  wrote {obj_path}")
+        base, ext = os.path.splitext(out_path)
+        if ext.lower() != ".obj":
+            obj_path = base + ".obj"
+            mesh.export(obj_path)
+            print(f"  wrote {obj_path}")
 
     if args.bench_json:
         bench = {
@@ -276,14 +281,19 @@ def main():
             "sequential_offload": args.sequential_offload,
             "load_seconds": load_elapsed,
             "sample_seconds": elapsed,
-            "vertices": len(mesh.vertices),
-            "faces": len(mesh.faces),
+            "mesh_ok": mesh_ok,
+            "vertices": len(mesh.vertices) if mesh_ok else 0,
+            "faces": len(mesh.faces) if mesh_ok else 0,
         }
         os.makedirs(os.path.dirname(args.bench_json) or ".", exist_ok=True)
         with open(args.bench_json, "w", encoding="utf-8") as f:
             json.dump(bench, f, indent=2)
             f.write("\n")
         print(f"  wrote {args.bench_json}")
+
+    if not mesh_ok:
+        sys.exit("ERROR: no mesh surface was extracted; try more steps or a "
+                 "different --mc-level for mesh-export baselines.")
 
 
 if __name__ == "__main__":
