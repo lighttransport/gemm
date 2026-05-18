@@ -3,6 +3,7 @@
  *
  * Usage:
  *   ./verify_vae <vae.safetensors> [--ref-dir ref/output/] [--grid-res 8]
+ *                [--latents path.npy] [--ref-sdf path.npy]
  */
 #include "hip_hy3d_runner.h"
 #include <stdio.h>
@@ -78,7 +79,8 @@ static void compare_f32(const char *name, const float *ref, const float *test,
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <vae.safetensors> [--ref-dir dir] [--out-dir dir] [--grid-res N]\n",
+            "Usage: %s <vae.safetensors> [--ref-dir dir] [--out-dir dir] [--grid-res N]\n"
+            "       [--latents path.npy] [--ref-sdf path.npy] [--f32]\n",
             argv[0]);
         return 1;
     }
@@ -86,6 +88,8 @@ int main(int argc, char **argv) {
     const char *vae_path = argv[1];
     const char *ref_dir = "ref/output";
     const char *out_dir = "hip_output";
+    const char *latents_path = NULL;
+    const char *ref_sdf_path = NULL;
     int grid_res = 8;
     int use_f32 = 0;
 
@@ -93,6 +97,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--ref-dir") == 0 && i+1 < argc) ref_dir = argv[++i];
         else if (strcmp(argv[i], "--out-dir") == 0 && i+1 < argc) out_dir = argv[++i];
         else if (strcmp(argv[i], "--grid-res") == 0 && i+1 < argc) grid_res = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--latents") == 0 && i+1 < argc) latents_path = argv[++i];
+        else if (strcmp(argv[i], "--ref-sdf") == 0 && i+1 < argc) ref_sdf_path = argv[++i];
         else if (strcmp(argv[i], "--f32") == 0) use_f32 = 1;
     }
 
@@ -100,7 +106,8 @@ int main(int argc, char **argv) {
 
     /* Load reference latents */
     char path[512];
-    snprintf(path, sizeof(path), "%s/vae_input_latents.npy", ref_dir);
+    if (latents_path) snprintf(path, sizeof(path), "%s", latents_path);
+    else snprintf(path, sizeof(path), "%s/vae_input_latents.npy", ref_dir);
     int dims[4], ndims;
     float *latents = read_npy_f32(path, dims, &ndims);
     if (!latents) {
@@ -110,10 +117,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Loaded ref latents: [%d, %d]\n", dims[0], dims[1]);
 
     /* Load reference SDF grid */
-    snprintf(path, sizeof(path), "%s/vae_sdf_grid.npy", ref_dir);
+    if (ref_sdf_path) snprintf(path, sizeof(path), "%s", ref_sdf_path);
+    else snprintf(path, sizeof(path), "%s/vae_sdf_grid.npy", ref_dir);
     int sdims[4], sndims;
     float *ref_sdf = read_npy_f32(path, sdims, &sndims);
-    int ref_grid_res = sdims[0];
+    int ref_grid_res = ref_sdf ? sdims[0] : 0;
 
     /* Init HIP */
     fprintf(stderr, "\nInitializing HIP...\n");
@@ -153,6 +161,8 @@ int main(int argc, char **argv) {
     } else if (ref_sdf) {
         fprintf(stderr, "\nSKIP comparison: ref grid=%d^3, hip grid=%d^3 (mismatch)\n",
                 ref_grid_res, grid_res);
+    } else {
+        fprintf(stderr, "\nSKIP comparison: no reference SDF grid provided\n");
     }
 
     /* Save */
