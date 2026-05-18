@@ -159,9 +159,16 @@ follow-ups.
      synthetic shape (best `split_kv=256`: 1.363 ms -> 1.790 ms, 0.76x).
      Numeric env values still force a split. `QIMG_FA2_SPLIT_F32=auto`
      enables the measured qimg large-token heuristic (`n_tok>=2048` ->
-     `split_kv=256`); `FLUX2_FA2_SPLIT_F32=auto` currently declines to split
-     because the measured path regresses. Keep this opt-in until real model
-     shapes are tuned.
+     `split_kv=256`, `n_tok>=4096` -> `split_kv=1024`);
+     `FLUX2_FA2_SPLIT_F32=auto` currently declines to split because the
+     measured path regresses. Keep this opt-in until real model shapes are
+     tuned. A 4608-token qimg microbench was added to approximate the
+     1024x1024 image-token regime; recent runs measure about 12.14 ms
+     baseline -> 8.97-8.99 ms split (1.35x), with `split_kv=512` and
+     `1024` close enough to trade places. qimg `auto` keeps `1024` for the
+     lower-workspace path. The same 4608-token bench was added for flux2
+     and still regressed: about 6.72 ms baseline -> 8.94-8.99 ms split
+     (0.75x), so flux2 `auto` remains disabled.
      BF16/FP8 split-key tensor-core variants remain future work.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
      win). The plan's original framing was grid parallelism across keys
@@ -204,6 +211,66 @@ follow-ups.
       `cuda/*/test_cuda_*`, `cuda/*/verify_*`, `cuda/*/cuda_*.ppm`,
       `cuda/*/cuda_*.npy`, `cuda/*/cuda_*.bin`, `server/build/`,
       `logs/`, `**/output_*/`, `trellis2_repo/`.
+
+11. **[done] FP8 safetensors alias + scaled-weight hardening**
+    - Status: common safetensors now accepts `F8_E4M3FN` as a 1-byte dtype.
+      Flux2 treats `F8_E4M3FN` the same as `F8_E4M3` in FP8 upload/split
+      paths. CUDA LLM safetensors maps both names and now fails loudly for
+      FP8 `*.weight` tensors missing the required scalar F32 `*.scale_weight`.
+    - Verify: `make -C cuda/{qimg,flux2,llm}` and FP8 text-encoder
+      `test_cuda_flux2 --test-text-gpu`.
+
+12. **[done] F16 sidecar cold-write temp path race**
+    - Status: cache writers now use a PID-suffixed `*.f16cache.tmp.<pid>`
+      with `O_EXCL`, so concurrent cold processes do not share a temp stream
+      before atomic rename.
+    - Verify: build plus a two-process cold-cache race if changing this again.
+
+13. **[done] Split-key env parsing and launch fallback**
+    - Status: qimg/flux2 split-key selectors now accept only `0`, `auto`, or
+      clean numeric values; malformed env values warn once and disable split.
+      Split partial/merge launch failures now log and fall back to the baseline
+      attention path instead of returning with an unwritten output buffer.
+    - Verify: `./test_cuda_qimg --test-kernels` and
+      `./test_cuda_flux2 --test-kernels`.
+
+14. **[done] Checked hot-path copies for qimg/flux2 DiT steps**
+    - Status: qimg single/CFG DiT input uploads, timestep uploads, final syncs,
+      and output downloads now check CUDA return codes. Flux2 DiT does the same
+      for input/timestep/output transfers and frees the per-step timestep device
+      buffer that previously leaked.
+    - Verify: qimg/flux2 kernel tests plus a short generate smoke after runner
+      changes.
+
+15. **[done] Split-attention bench harness checks CUDA failures**
+    - Status: qimg/flux2 split-attention correctness tests and timing helpers
+      now fail the test on event, launch, sync, alloc/upload, or output-copy
+      errors instead of comparing or timing undefined device buffers.
+    - Verify: `./test_cuda_qimg --test-kernels` and
+      `./test_cuda_flux2 --test-kernels`.
+
+16. **[done] qimg kernel-test upload helpers avoid null-device copies**
+    - Status: local qimg test upload helpers now check `cuMemAlloc` before
+      `cuMemcpyHtoD`, report alloc/copy errors, and return null cleanly.
+      The qimg FP8 GEMM unit test also checks host allocations, device uploads,
+      output allocation, launches, syncs, and downloads before comparing output.
+      The qimg FP8 attention unit test now does the same for its MMA/ref paths
+      and FP8 workspace setup. The qimg `img_in` projection reference test also
+      checks host allocations, safetensors uploads, output allocation, sync, and
+      download before scoring correlation. The qimg production-shape FP8 GEMM
+      regression test now checks weight/bias availability, host allocation,
+      input upload, output allocation, syncs, and downloads while restoring the
+      saved MMA mode on failure.
+    - Verify: `make -C cuda/qimg test_cuda_qimg` and
+      `./test_cuda_qimg --test-kernels`.
+
+17. **[done] flux2 kernel tests check BF16/FP8 setup failures**
+    - Status: Flux2 BF16 GEMM and FP8 attention unit tests now check CPU
+      reference allocation, device uploads, output allocations, syncs, and
+      downloads. The FP8 attention test also restores the saved
+      `FLUX2_FP8_ATTN_REF` environment and runner attention mode on failure.
+    - Verify: `make -C cuda/flux2 test_cuda_flux2` and
+      `./test_cuda_flux2 --test-kernels`.
 
 ## Verification harness
 

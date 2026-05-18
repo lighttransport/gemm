@@ -3718,8 +3718,18 @@ static int flux2_f32_split_kv_from_env(const char *env, int n_tok) {
          * otherwise. Numeric env values still force the experimental path. */
         return 0;
     }
-    int split_kv = atoi(env);
-    return (split_kv <= 1) ? 1024 : split_kv;
+    char *end = NULL;
+    long split_kv = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || split_kv < 0) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "cuda_flux2: ignoring invalid FLUX2_FA2_SPLIT_F32=%s\n", env);
+            warned = 1;
+        }
+        return 0;
+    }
+    if (split_kv == 0) return 0;
+    return (split_kv <= 1) ? 1024 : (int)split_kv;
 }
 
 static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
@@ -3738,15 +3748,20 @@ static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
             size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
             void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
                               &q, &k, &v, &n_tok, &n_heads, &head_dim, &split_kv};
-            cuLaunchKernel(r->fn_flash_attn_split_partials,
-                           (unsigned)n_heads, gy, (unsigned)n_splits,
-                           nt, 1, 1, smem, r->stream, p_args, NULL);
+            CUresult e1 = cuLaunchKernel(r->fn_flash_attn_split_partials,
+                                         (unsigned)n_heads, gy, (unsigned)n_splits,
+                                         nt, 1, 1, smem, r->stream, p_args, NULL);
             void *m_args[] = {&out, &r->d_attn_part_o, &r->d_attn_part_m,
                               &r->d_attn_part_l, &n_tok, &n_heads, &head_dim, &n_splits};
-            cuLaunchKernel(r->fn_flash_attn_split_merge,
-                           (unsigned)n_heads, (unsigned)n_tok, 1,
-                           128, 1, 1, 0, r->stream, m_args, NULL);
-            return;
+            CUresult e2 = (e1 == CUDA_SUCCESS)
+                ? cuLaunchKernel(r->fn_flash_attn_split_merge,
+                                 (unsigned)n_heads, (unsigned)n_tok, 1,
+                                 128, 1, 1, 0, r->stream, m_args, NULL)
+                : e1;
+            if (e1 == CUDA_SUCCESS && e2 == CUDA_SUCCESS) return;
+            fprintf(stderr,
+                    "cuda_flux2: split-key attention launch failed (%d/%d), falling back\n",
+                    (int)e1, (int)e2);
         }
     }
 
@@ -4094,6 +4109,10 @@ static void op_vae_latent_bn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr 
  * needing per-callsite plumbing. */
 static int g_flux2_upload_mode = FLUX2_W_F32;
 
+static int flux2_dtype_is_fp8_e4m3(const char *dtype) {
+    return dtype && (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E4M3FN") == 0);
+}
+
 static CUdeviceptr gpu_upload_st_fp8(st_context *st, const char *wname, const char *sname,
                                       float *out_scale) {
     int widx = safetensors_find(st, wname);
@@ -4106,7 +4125,7 @@ static CUdeviceptr gpu_upload_st_fp8(st_context *st, const char *wname, const ch
     /* When upload-mode != F32 (i.e. F16 or BF16), dequantize FP8 to F32 with
      * the per-tensor weight_scale baked in, then convert to F16 or BF16 and
      * return scale=-1.0 sentinel so GEMM dispatch takes the non-FP8 path. */
-    if (strcmp(dtype, "F8_E4M3") == 0 && g_flux2_upload_mode != FLUX2_W_F32) {
+    if (flux2_dtype_is_fp8_e4m3(dtype) && g_flux2_upload_mode != FLUX2_W_F32) {
         /* Dequantize FP8 -> F32 with the per-tensor weight_scale baked in,
          * then convert to F16 or BF16 per upload mode. */
         float ws = 1.0f;
@@ -4127,7 +4146,7 @@ static CUdeviceptr gpu_upload_st_fp8(st_context *st, const char *wname, const ch
         return d;
     }
 
-    if (strcmp(dtype, "F8_E4M3") == 0) {
+    if (flux2_dtype_is_fp8_e4m3(dtype)) {
         /* Native FP8: upload raw bytes */
         const void *data = safetensors_data(st, widx);
         *out_scale = 1.0f;  /* FP8 dispatch, default scale 1.0 if no weight_scale tensor */
@@ -4615,7 +4634,7 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
                 if (sidx >= 0) l2_scale = *(const float *)safetensors_data(st_fp8, sidx);
                 int Hd = r->H, nf = r->n_ff;
 
-                if (strcmp(dtype, "F8_E4M3") == 0 && fp8) {
+                if (flux2_dtype_is_fp8_e4m3(dtype) && fp8) {
                     /* FP8 GEMM mode: split columns byte-by-byte, scale stays positive */
                     const uint8_t *raw = (const uint8_t *)safetensors_data(st_fp8, widx);
                     int l2_cols = Hd + nf;
@@ -4628,7 +4647,7 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
                     r->gpu_sblk[i].l2_attn_w = gpu_upload_bytes(attn, (size_t)Hd * Hd);
                     r->gpu_sblk[i].l2_mlp_w  = gpu_upload_bytes(mlp_, (size_t)Hd * nf);
                     free(attn); free(mlp_);
-                } else if (strcmp(dtype, "F8_E4M3") == 0) {
+                } else if (flux2_dtype_is_fp8_e4m3(dtype)) {
                     /* BF16/F16 GEMM mode: dequant FP8 with weight_scale baked in,
                      * split columns, upload in target precision, scale=-1. */
                     const uint8_t *raw = (const uint8_t *)safetensors_data(st_fp8, widx);
@@ -4825,22 +4844,34 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         op_gemm_scaled(r, Y, W, X, bias, nout, nin, ntok, scale)
     /* Macro: BF16 truncate buffer in-place when running BF16 inference mode */
     #define BF16(buf, n) do { if (r->fp8_bf16_act) op_bf16_trunc(r, buf, n); } while(0)
+    #define FLUX2_CU_OR_CLEANUP(call, label) do { \
+        CUresult _fe = (call); \
+        if (_fe != CUDA_SUCCESS) { \
+            fprintf(stderr, "cuda_flux2: %s failed (err=%d)\n", (label), (int)_fe); \
+            goto cleanup; \
+        } \
+    } while (0)
 
     if (flux2_alloc_bufs(r, n_img, n_txt) != 0) return -1;
 
     struct timespec _pt0={0}, _pt1={0}, _pt2={0}, _pt3={0}, _pt4={0};
     if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt0); }
+    int rc = -1;
+    CUdeviceptr d_traw = 0;
 
     /* Upload inputs */
-    cuMemcpyHtoD(r->d_img_in_buf, img_tokens, (size_t)n_img * r->pin * F);
-    cuMemcpyHtoD(r->d_txt_in_buf, txt_tokens, (size_t)n_txt * r->txt_dim * F);
+    FLUX2_CU_OR_CLEANUP(cuMemcpyHtoD(r->d_img_in_buf, img_tokens,
+                                     (size_t)n_img * r->pin * F),
+                        "image token upload");
+    FLUX2_CU_OR_CLEANUP(cuMemcpyHtoD(r->d_txt_in_buf, txt_tokens,
+                                     (size_t)n_txt * r->txt_dim * F),
+                        "text token upload");
 
     /* 1. Timestep embedding (computed on CPU, uploaded) */
     float t_raw[256];
     flux2_ts_embed(t_raw, timestep * 1000.0f, 256);
-    CUdeviceptr d_traw;
-    cuMemAlloc(&d_traw, 256 * F);
-    cuMemcpyHtoD(d_traw, t_raw, 256 * F);
+    FLUX2_CU_OR_CLEANUP(cuMemAlloc(&d_traw, 256 * F), "timestep alloc");
+    FLUX2_CU_OR_CLEANUP(cuMemcpyHtoD(d_traw, t_raw, 256 * F), "timestep upload");
 
     /* In BF16 mode, truncate the timestep embedding to BF16 to match ComfyUI */
     BF16(d_traw, 256);
@@ -5188,8 +5219,9 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
     GEMM(r->d_attn_out, r->d_out_proj_w, r->d_scratch2, d0, r->pin, H, n_img, r->s_out_proj);
 
     /* Download result */
-    cuMemcpyDtoH(out, r->d_attn_out, (size_t)n_img * r->pin * F);
-    cuCtxSynchronize();
+    FLUX2_CU_OR_CLEANUP(cuMemcpyDtoH(out, r->d_attn_out, (size_t)n_img * r->pin * F),
+                        "dit output download");
+    FLUX2_CU_OR_CLEANUP(cuCtxSynchronize(), "dit step sync");
 
     if (r->profile_step) {
         clock_gettime(CLOCK_MONOTONIC, &_pt4);
@@ -5213,7 +5245,11 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
 
     #undef GEMM
     #undef BF16
-    return 0;
+    rc = 0;
+cleanup:
+    if (d_traw) cuMemFree(d_traw);
+    #undef FLUX2_CU_OR_CLEANUP
+    return rc;
 }
 
 /* ---- Free ---- */
