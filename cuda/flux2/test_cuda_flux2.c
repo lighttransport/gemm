@@ -837,7 +837,7 @@ static int test_kernel_split_attn_f32_bench(cuda_flux2_runner *r, int n_tok,
 
     const int head_dim = 128;
     const int dim = n_heads * head_dim;
-    const int split_candidates[] = {128, 256, 512, 1024};
+    const int split_candidates[] = {128, 256, 384, 512, 768, 1024, 1536, 2048};
     size_t n_elems = (size_t)n_tok * dim;
 
     float *Q = (float *)malloc(n_elems * sizeof(float));
@@ -886,6 +886,7 @@ static int test_kernel_split_attn_f32_bench(cuda_flux2_runner *r, int n_tok,
     for (int ci = 0; ci < (int)(sizeof(split_candidates) / sizeof(split_candidates[0])); ci++) {
         int split_kv = split_candidates[ci];
         int n_splits = (n_tok + split_kv - 1) / split_kv;
+        if (n_splits <= 1) continue;
         if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
             cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
             cuMemFree(d_ref); cuMemFree(d_split);
