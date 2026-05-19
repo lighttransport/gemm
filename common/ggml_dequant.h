@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include "gguf_loader.h"
 
 #ifdef __cplusplus
@@ -1580,12 +1581,29 @@ static inline void matvec_bf16_8row_pv(float *dst,
     svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
     svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
     int i = 0;
+    /* Lighter SW prefetch: distance 8 iters = 2 × 256 B = 2 cachelines per
+     * pair stream, to L2 (locality=2). With ~12 threads/CMG × 4 pair streams
+     * the HW prefetcher's ~16 slots/CMG are oversubscribed; an L2-only hint
+     * provides headroom without blowing the L1. Guarded by TF_BF16PV_PREFETCH=1. */
+    static int pf_env_done = 0, pf_on = 0;
+    if (__builtin_expect(!pf_env_done, 0)) {
+        const char *e = getenv("TF_BF16PV_PREFETCH");
+        pf_on = (e && *e && *e != '0');
+        pf_env_done = 1;
+    }
+    const int PFD_HW = 8 * 32;  /* halfwords = 2 × 256-B cachelines */
     for (; i + vl - 1 < n; i += vl) {
         /* pair[hw_base = 2*i] points at chunk c = i/vl */
         const uint16_t *ab = pAB + 2 * i;
         const uint16_t *cd = pCD + 2 * i;
         const uint16_t *ef = pEF + 2 * i;
         const uint16_t *gh = pGH + 2 * i;
+        if (pf_on) {
+            __builtin_prefetch(ab + PFD_HW, 0, 2);
+            __builtin_prefetch(cd + PFD_HW, 0, 2);
+            __builtin_prefetch(ef + PFD_HW, 0, 2);
+            __builtin_prefetch(gh + PFD_HW, 0, 2);
+        }
         svuint16_t vA = svld1_u16(p_odd, ab - 1);
         svuint16_t vB = svld1_u16(p_odd, ab);
         svuint16_t vC = svld1_u16(p_odd, cd - 1);
