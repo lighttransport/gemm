@@ -133,12 +133,30 @@ ref/hy3d/.venv/bin/python ref/hy3d/dump_dit_single_step.py \
     --outdir /tmp/hy3d_pt_hip_step3
 ```
 
+The same script can run a single-step ROCm fp16 oracle with block dumps:
+
+```sh
+ref/hy3d/.venv/bin/python ref/hy3d/dump_dit_single_step.py \
+    --ckpt /mnt/disk1/models/Hunyuan3D-2.1/hunyuan3d-dit-v2-1/model.fp16.ckpt \
+    --hy3d-repo /mnt/disk1/models/Hunyuan3D-2.1-repo/hy3dshape \
+    --latents /tmp/hy3d_hip_latent_003.npy \
+    --context /tmp/hy3d_ref_trace/03_dit_context_cfg.npy \
+    --timestep 0.66650390625 \
+    --all-batches \
+    --device cuda --dtype fp16 \
+    --outdir /tmp/hy3d_pt_rocm_hip_step3
+```
+
 On the HIP step-3 latent, HIP velocity vs CPU-float PyTorch CFG is close:
 max abs `0.0752`, mean abs `3.9e-5`, rel-L2 `8.6e-4`. The CPU-float PyTorch
 output on that same HIP latent has the same large gap to the original ROCm
 fp16 trace as HIP does: rel-L2 `0.233`. That means the step-3 mismatch is
 caused by small earlier latent differences crossing a sensitive DiT/MoE
 trajectory boundary.
+
+Against ROCm fp16 PyTorch on the same HIP step-3 latent, default HIP has a
+smaller but measurable single-step CFG gap: rel-L2 `0.0235`. The gap is small
+per batch (`0.0060` cond, `0.0048` uncond) but guidance amplifies it.
 
 Block-level step-0 localization tells the same story. With exact trace input,
 HIP block outputs match the CPU-float oracle tightly through the full DiT:
@@ -156,9 +174,33 @@ block       max_abs      mean_abs       rel_l2
 
 An attempted broad "round every major activation through fp16" experiment did
 not solve the trace drift: it slightly improved step 3 but worsened step 4
-velocity rel-L2 (`0.164` vs `0.135`). The retained precision change is only the
-MoE gate-logit fp16 rounding, which is small but matches the fp16 routing
-boundary and slightly improves the final latent error.
+velocity rel-L2 (`0.164` vs `0.135`). A narrower MoE-only fp16 emulation path is
+available with `HY3D_MOE_FP16=1`; it rounds MoE softmax weights, expert
+activations, expert outputs, and expert weighted accumulation through fp16. It
+improves the same-latent step-3 ROCm fp16 CFG rel-L2 from `0.0235` to `0.0227`.
+
+Full 4-step replay with `HY3D_MOE_FP16=1`:
+
+```text
+Latents
+step  max_abs      mean_abs     rel_l2
+   1           0           0           0
+   2  0.00585938  0.00066545   0.0013448
+   3    0.045166  0.00136097   0.0036736
+   4     1.83936    0.012551   0.0570056
+
+Velocities vs PyTorch CFG
+step  max_abs      mean_abs     rel_l2
+   1   0.0184071  0.00194399  0.00252906
+   2    0.134296  0.00365849   0.0113009
+   3     5.52042   0.0364414    0.222875
+   4     6.53329   0.0319188    0.130072
+```
+
+This improves the final latent rel-L2 from `0.0593` to `0.0570`, but the
+current CPU-side fp16 accumulation emulation increased 4-step runtime from
+`207.92s` to `223.23s`. Treat it as a parity mode until the MoE accumulation is
+moved back to a GPU kernel.
 
 ## Current caveats
 
