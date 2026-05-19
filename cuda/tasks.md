@@ -159,7 +159,9 @@ follow-ups.
      synthetic shape (best `split_kv=256`: 1.363 ms -> 1.790 ms, 0.76x).
      Numeric env values still force a split. `QIMG_FA2_SPLIT_F32=auto`
      enables the measured qimg large-token heuristic (`n_tok>=2048` ->
-     `split_kv=256`, `n_tok>=4096` -> `split_kv=1024`);
+     `split_kv=256`, `n_tok>=4096` -> `split_kv=1024`) only when qimg's
+     faster BF16/FP8 tensor-core attention path is not active; numeric values
+     still force F32 split-key for experiments.
      `FLUX2_FA2_SPLIT_F32=auto` currently declines to split because the
      measured path regresses. Keep this opt-in until real model shapes are
      tuned. A 4608-token qimg microbench was added to approximate the

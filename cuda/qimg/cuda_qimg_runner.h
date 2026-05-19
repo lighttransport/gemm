@@ -2681,11 +2681,25 @@ static int qimg_f32_split_kv_from_env(const char *env, int n_tok) {
     return (split_kv <= 1) ? 1024 : (int)split_kv;
 }
 
+static int qimg_f32_split_env_is_auto(const char *env) {
+    return env && strcmp(env, "auto") == 0;
+}
+
+static int qimg_f32_split_apply_tensor_attn_priority(const char *env, int split_kv,
+                                                      int tensor_attn_active) {
+    return (qimg_f32_split_env_is_auto(env) && tensor_attn_active) ? 0 : split_kv;
+}
+
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
                     CUdeviceptr d_k, CUdeviceptr d_v,
                     int n_tok, int n_heads, int head_dim) {
     const char *split_env = getenv("QIMG_FA2_SPLIT_F32");
     int split_kv = qimg_f32_split_kv_from_env(split_env, n_tok);
+    int tensor_attn_active =
+        head_dim == 128 &&
+        ((r->use_bf16_attn && r->flash_attn_bf16 && r->cast_f32_to_bf16) ||
+         (r->use_fp8_attn && r->flash_attn_fp8 && r->quantize_fp8 && r->reduce_max_abs));
+    split_kv = qimg_f32_split_apply_tensor_attn_priority(split_env, split_kv, tensor_attn_active);
     if (split_kv > 0 &&
         r->attn_split_partials_f32 && r->attn_split_merge_f32 &&
         head_dim <= 128) {
