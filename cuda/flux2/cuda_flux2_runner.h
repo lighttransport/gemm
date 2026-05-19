@@ -3732,10 +3732,25 @@ static int flux2_f32_split_kv_from_env(const char *env, int n_tok) {
     return (split_kv <= 1) ? 1024 : (int)split_kv;
 }
 
+static int flux2_f32_split_env_is_auto(const char *env) {
+    return env && strcmp(env, "auto") == 0;
+}
+
+static int flux2_f32_split_apply_tensor_attn_priority(const char *env, int split_kv,
+                                                       int tensor_attn_active) {
+    return (flux2_f32_split_env_is_auto(env) && tensor_attn_active) ? 0 : split_kv;
+}
+
 static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
                     CUdeviceptr k, CUdeviceptr v, int n_tok, int n_heads, int head_dim) {
     const char *split_env = getenv("FLUX2_FA2_SPLIT_F32");
     int split_kv = flux2_f32_split_kv_from_env(split_env, n_tok);
+    int tensor_attn_active =
+        head_dim == 128 &&
+        ((r->use_bf16_attn && r->fn_flash_attn_bf16 && r->fn_cast_f32_to_bf16) ||
+         (r->use_fp8_attn && r->fn_flash_attn_fp8 && r->fn_quant_fp8 &&
+          r->fn_reduce_max_abs));
+    split_kv = flux2_f32_split_apply_tensor_attn_priority(split_env, split_kv, tensor_attn_active);
     if (split_kv > 0 &&
         r->fn_flash_attn_split_partials && r->fn_flash_attn_split_merge &&
         head_dim <= 128) {
