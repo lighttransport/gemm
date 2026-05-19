@@ -168,7 +168,10 @@ follow-ups.
      1024x1024 image-token regime; recent runs measure about 12.14 ms
      baseline -> 8.97-8.99 ms split (1.35x), with `split_kv=512` and
      `1024` close enough to trade places. qimg `auto` keeps `1024` for the
-     lower-workspace path. The same 4608-token bench was added for flux2
+     lower-workspace path. qimg kernel tests now also verify dispatch priority:
+     `auto` keeps the active BF16 tensor-core attention path, while numeric
+     split values still force F32 split-key for experiments. The same 4608-token
+     bench was added for flux2
      and still regressed: about 6.72 ms baseline -> 8.94-8.99 ms split
      (0.75x), so flux2 `auto` remains disabled.
      BF16/FP8 split-key tensor-core variants remain future work.
