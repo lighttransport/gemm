@@ -2661,11 +2661,11 @@ static int qimg_f32_split_kv_from_env(const char *env, int n_tok) {
     if (!env || env[0] == '0') return 0;
     if (strcmp(env, "auto") == 0) {
         /* Measured qimg token regimes on the test host:
-         *   2048 tokens: split_kv=256
+         *   2048 tokens: split_kv=384
          *   4608 tokens: split_kv=1024
          * Keep smaller shapes on the default path to avoid merge overhead. */
         if (n_tok >= 4096) return 1024;
-        return (n_tok >= 2048) ? 256 : 0;
+        return (n_tok >= 2048) ? 384 : 0;
     }
     char *end = NULL;
     long split_kv = strtol(env, &end, 10);
