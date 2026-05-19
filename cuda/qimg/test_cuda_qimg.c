@@ -761,14 +761,14 @@ fail:
 }
 
 static int test_kernel_split_attn_f32_bench(cuda_qimg_runner *r, int n_tok,
-                                            const char *label, int repeats) {
+                                            int n_heads, const char *label,
+                                            int repeats) {
     fprintf(stderr, "  [kernel] flash_attn_f32 split-key %s bench... ", label);
     if (!r->attn_prefill_f32 || !r->attn_split_partials_f32 || !r->attn_split_merge_f32) {
         fprintf(stderr, "SKIP (kernels not loaded)\n");
         return 0;
     }
 
-    const int n_heads = 1;
     const int head_dim = 128;
     const int dim = n_heads * head_dim;
     const int split_candidates[] = {128, 256, 512, 1024};
@@ -871,12 +871,17 @@ static int test_kernel_split_attn_f32_bench(cuda_qimg_runner *r, int n_tok,
 }
 
 static int test_kernel_split_attn_f32_2048(cuda_qimg_runner *r) {
-    return test_kernel_split_attn_f32_bench(r, 2048, "2048-token", 3);
+    return test_kernel_split_attn_f32_bench(r, 2048, 1, "2048-token", 3);
 }
 
 static int test_kernel_split_attn_f32_4608(cuda_qimg_runner *r) {
     /* Qwen Image 1024x1024 is roughly 4096 image tokens plus text tokens. */
-    return test_kernel_split_attn_f32_bench(r, 4608, "4608-token", 3);
+    return test_kernel_split_attn_f32_bench(r, 4608, 1, "4608-token", 3);
+}
+
+static int test_kernel_split_attn_f32_4608_qimg_heads(cuda_qimg_runner *r) {
+    /* Production Qwen-Image attention shape: hidden=3072 = 24 heads * 128. */
+    return test_kernel_split_attn_f32_bench(r, 4608, 24, "4608-token/24-head", 2);
 }
 
 /* Test 3: img_in linear projection against PyTorch reference.
@@ -1121,6 +1126,7 @@ static int test_kernels(void) {
     fail += test_kernel_split_auto_prefers_tensor_attn(r);
     fail += test_kernel_split_attn_f32_2048(r);
     fail += test_kernel_split_attn_f32_4608(r);
+    fail += test_kernel_split_attn_f32_4608_qimg_heads(r);
     /* The DiT-weight-vs-reference test needs a safetensors path; allow override */
     const char *ref_dit = getenv("QIMG_TEST_DIT");
     if (!ref_dit) ref_dit = "/mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
