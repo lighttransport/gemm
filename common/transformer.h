@@ -43,6 +43,15 @@ typedef struct {
      * the lsl variant needs. NULL when unused. bf16_pv_groups = n_rows/8. */
     uint16_t *bf16_pv;
     int       bf16_pv_groups;
+    /* A64FX int8 svdot quantize-on-load layout: per group of 8 rows × n_cols,
+     * laid out as nb = n_cols/64 blocks of 528 bytes:
+     *   bytes [0..16)   = 8 fp16 row-scales
+     *   bytes [16..528) = 8 rows × 64 int8 quants (row-major within block)
+     * Built from BF16 source when TF_QUANT_Q8=1. Halves weight BW vs bf16
+     * (1.03 B/elem vs 2 B/elem); consumed by matvec_sdot_8row (W8A8 svdot_s32
+     * against int8-quantized x). q8_pv_groups = n_rows/8. */
+    uint8_t  *q8_pv;
+    int       q8_pv_groups;
 } qtensor;
 
 typedef struct {
@@ -702,6 +711,64 @@ static inline void tf_matvec_bf16_rows_pv(float *dst, const uint8_t *base,
                                             const float *x, int n_cols,
                                             int row_start, int row_end);
 
+#if defined(__ARM_FEATURE_SVE)
+/* Per-thread int8 quantization of the activation x for the svdot W8A8 weight
+ * matvec (matvec_sdot_8row). Each pool thread quantizes the FULL x into its
+ * own TLS scratch (per 64-elem block: absmax -> fp16 scale, then round to
+ * int8). The work is redundant across threads but x is only K (<= n_ff)
+ * elements — negligible next to the matvec — which lets us avoid an extra
+ * barrier (decode barriers are already ~18%). Returned pointers are valid
+ * until the next tf_quant_x_sdot call on the same thread. K must be a
+ * multiple of 64 (guaranteed by the q8_pv col_ok constraint). */
+static __thread int8_t   *tf_xq_buf = NULL;
+static __thread uint16_t *tf_xs_buf = NULL;
+static __thread int       tf_xq_cap = 0;
+
+static inline void tf_quant_x_sdot(const float *x, int K,
+                                   const int8_t **xq_out,
+                                   const uint16_t **xs_out) {
+    if (K > tf_xq_cap) {
+        free(tf_xq_buf);
+        free(tf_xs_buf);
+        tf_xq_buf = (int8_t *)malloc((size_t)K);
+        tf_xs_buf = (uint16_t *)malloc((size_t)(K / 64) * sizeof(uint16_t));
+        tf_xq_cap = K;
+    }
+    /* Fully vectorized: scalar lrintf compiles to a libm call on fcc, which
+     * dominated this hot path (called K times per matvec, replicated across
+     * all threads). SVE round-to-nearest via svcvt (FPCR default) + saturating
+     * clamp + truncating byte store (svst1b) avoids it entirely. One svmaxv
+     * per 64-block is the only horizontal op. */
+    svbool_t pg = svptrue_b32();
+    svint32_t qlo = svdup_s32(-127), qhi = svdup_s32(127);
+    int nb = K / 64;
+    for (int b = 0; b < nb; b++) {
+        const float *xb = x + (size_t)b * 64;
+        svfloat32_t v0 = svld1_f32(pg, xb +  0);
+        svfloat32_t v1 = svld1_f32(pg, xb + 16);
+        svfloat32_t v2 = svld1_f32(pg, xb + 32);
+        svfloat32_t v3 = svld1_f32(pg, xb + 48);
+        svfloat32_t m = svmax_x(pg, svmax_x(pg, svabs_x(pg, v0), svabs_x(pg, v1)),
+                                    svmax_x(pg, svabs_x(pg, v2), svabs_x(pg, v3)));
+        float amax = svmaxv_f32(pg, m);
+        float scale = amax / 127.0f;
+        float inv   = amax > 0.0f ? 127.0f / amax : 0.0f;
+        tf_xs_buf[b] = ggml_fp32_to_fp16(scale);
+        svfloat32_t vinv = svdup_f32(inv);
+        int8_t *q = tf_xq_buf + (size_t)b * 64;
+        #define QX(V, OFF) do {                                              \
+            svint32_t qi = svcvt_s32_f32_x(pg, svmul_x(pg, (V), vinv));       \
+            qi = svmax_s32_x(pg, svmin_s32_x(pg, qi, qhi), qlo);             \
+            svst1b_s32(pg, q + (OFF), qi);                                   \
+        } while (0)
+        QX(v0, 0); QX(v1, 16); QX(v2, 32); QX(v3, 48);
+        #undef QX
+    }
+    *xq_out = tf_xq_buf;
+    *xs_out = tf_xs_buf;
+}
+#endif
+
 static void *tf_qmatvec_worker(void *arg) {
     tf_matvec_task *t = (tf_matvec_task *)arg;
     int n_cols = t->mat->n_cols;
@@ -726,6 +793,24 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
     if (t->mat->type == GGML_TYPE_BF16) {
+#if defined(__ARM_FEATURE_SVE)
+        /* Q8_0 quantize-on-load path: when q8_pv is built we use the int8
+         * group layout, halving DRAM traffic vs bf16_pv. Worker row ranges
+         * are 8-aligned by tf_row_split8 so we can step in 8-row groups. */
+        if (t->mat->q8_pv && (t->row_start & 7) == 0 && (t->row_end & 7) == 0) {
+            const uint8_t *qbase = t->mat->q8_pv;
+            const int8_t *xq; const uint16_t *xs;
+            tf_quant_x_sdot(t->x, n_cols, &xq, &xs);
+            int nb = n_cols / 64;
+            size_t group_bytes = (size_t)nb * 528;
+            for (int i = t->row_start; i + 7 < t->row_end; i += 8) {
+                int g = i >> 3;
+                matvec_sdot_8row(t->dst + i, qbase + (size_t)g * group_bytes,
+                                 xq, xs, n_cols);
+            }
+            return NULL;
+        }
+#endif
         /* Route through the pv-aware path so matvec_bf16_8row_pv fires when
          * mat->bf16_pv is built and the worker's row_start is 8-aligned
          * (guaranteed by tf_row_split8 in the pool dispatcher). */
@@ -935,12 +1020,32 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                             t->x, n_cols, t->row_start, t->row_end);
     } else if (t->mat1->type == GGML_TYPE_BF16) {
         size_t row_bytes = (size_t)n_cols * 2;
-        tf_matvec_bf16_rows_pv(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
-                                t->mat1->bf16_pv,
-                                t->x, n_cols, t->row_start, t->row_end);
-        tf_matvec_bf16_rows_pv(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
-                                t->mat2->bf16_pv,
-                                t->x, n_cols, t->row_start, t->row_end);
+#if defined(__ARM_FEATURE_SVE)
+        if (t->mat1->q8_pv && t->mat2->q8_pv &&
+            (t->row_start & 7) == 0 && (t->row_end & 7) == 0) {
+            const int8_t *xq; const uint16_t *xs;
+            tf_quant_x_sdot(t->x, n_cols, &xq, &xs);
+            int nb = n_cols / 64;
+            size_t group_bytes = (size_t)nb * 528;
+            const uint8_t *q1 = t->mat1->q8_pv;
+            const uint8_t *q2 = t->mat2->q8_pv;
+            for (int i = t->row_start; i + 7 < t->row_end; i += 8) {
+                int g = i >> 3;
+                matvec_sdot_8row(t->dst1 + i, q1 + (size_t)g * group_bytes,
+                                 xq, xs, n_cols);
+                matvec_sdot_8row(t->dst2 + i, q2 + (size_t)g * group_bytes,
+                                 xq, xs, n_cols);
+            }
+        } else
+#endif
+        {
+            tf_matvec_bf16_rows_pv(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                                    t->mat1->bf16_pv,
+                                    t->x, n_cols, t->row_start, t->row_end);
+            tf_matvec_bf16_rows_pv(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                                    t->mat2->bf16_pv,
+                                    t->x, n_cols, t->row_start, t->row_end);
+        }
     } else if (t->mat1->type == GGML_TYPE_Q8_0) {
         int nb = n_cols / 32;
         size_t row_bytes = (size_t)nb * sizeof(block_q8_0);
@@ -1113,6 +1218,20 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else if (mat->type == GGML_TYPE_BF16) {
         size_t rb = (size_t)n_cols * 2;
+#if defined(__ARM_FEATURE_SVE)
+        if (mat->q8_pv && (row_start & 7) == 0 && (row_end & 7) == 0) {
+            const int8_t *xq; const uint16_t *xs;
+            tf_quant_x_sdot(x, n_cols, &xq, &xs);
+            int nb = n_cols / 64;
+            size_t group_bytes = (size_t)nb * 528;
+            const uint8_t *qbase = mat->q8_pv;
+            for (int i = row_start; i + 7 < row_end; i += 8) {
+                int g = i >> 3;
+                matvec_sdot_8row(dst + i, qbase + (size_t)g * group_bytes,
+                                 xq, xs, n_cols);
+            }
+        } else
+#endif
         tf_matvec_bf16_rows_pv(dst, (const uint8_t *)mat->data, rb,
                                 mat->bf16_pv, x, n_cols, row_start, row_end);
     } else if (mat->type == GGML_TYPE_Q8_0) {
@@ -1249,6 +1368,21 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
     if (mat->type == GGML_TYPE_BF16) {
         const uint8_t *base = (const uint8_t *)mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
+#if defined(__ARM_FEATURE_SVE)
+        if (mat->q8_pv && n_rows >= 8 && (n_rows & 7) == 0) {
+            const int8_t *xq; const uint16_t *xs;
+            tf_quant_x_sdot(x, n_cols, &xq, &xs);
+            int nb = n_cols / 64;
+            size_t group_bytes = (size_t)nb * 528;
+            const uint8_t *qbase = mat->q8_pv;
+            for (int i = 0; i + 7 < n_rows; i += 8) {
+                int g = i >> 3;
+                matvec_sdot_8row(dst + i, qbase + (size_t)g * group_bytes,
+                                 xq, xs, n_cols);
+            }
+            return;
+        }
+#endif
         tf_matvec_bf16_rows_pv(dst, base, row_bytes, mat->bf16_pv,
                                 x, n_cols, 0, n_rows);
         return;
@@ -1425,6 +1559,77 @@ static void tf_bf16_pv_free(qtensor *t) {
     }
 }
 
+/* int8 svdot quantize-on-load layout — see qtensor.q8_pv comment for the
+ * format. Per group of 8 rows × K cols, we store nb = K/64 blocks of 528 B
+ * each: 8 fp16 row-scales [0..16) then 8 rows × 64 int8 [16..528). Consumed
+ * by matvec_sdot_8row (W8A8 svdot). */
+static size_t tf_q8_pv_bytes(int groups, int K) {
+    int nb = K / 64;
+    return (size_t)groups * (size_t)nb * 528ULL;
+}
+
+static void tf_q8_pv_fill_range(qtensor *t, int g_start, int g_end) {
+    int K = t->n_cols;
+    int nb = K / 64;
+    const uint16_t *W = (const uint16_t *)t->data;
+    uint8_t *qv = t->q8_pv;
+    for (int g = g_start; g < g_end; g++) {
+        uint8_t *gbuf = qv + (size_t)g * nb * 528;
+        for (int b = 0; b < nb; b++) {
+            uint8_t *blk = gbuf + (size_t)b * 528;
+            uint16_t *scl = (uint16_t *)blk;
+            int8_t *qs   = (int8_t *)(blk + 16);
+            for (int r = 0; r < 8; r++) {
+                const uint16_t *src = W + (size_t)(g * 8 + r) * K + (size_t)b * 64;
+                /* Compute absmax over the 64-elem block (BF16 source). */
+                float amax = 0.0f;
+                for (int j = 0; j < 64; j++) {
+                    uint32_t bits = (uint32_t)src[j] << 16;
+                    float f; __builtin_memcpy(&f, &bits, 4);
+                    float a = f < 0 ? -f : f;
+                    if (a > amax) amax = a;
+                }
+                float scale = amax / 127.0f;
+                float invs  = amax > 0 ? 127.0f / amax : 0.0f;
+                scl[r] = ggml_fp32_to_fp16(scale);
+                for (int j = 0; j < 64; j++) {
+                    uint32_t b32 = (uint32_t)src[j] << 16;
+                    float f; __builtin_memcpy(&f, &b32, 4);
+                    int q = (int)lrintf(f * invs);
+                    if (q < -127) q = -127; else if (q > 127) q = 127;
+                    qs[r * 64 + j] = (int8_t)q;
+                }
+            }
+        }
+    }
+}
+
+static int tf_q8_pv_alloc(qtensor *t) {
+    if (!t->data || t->type != GGML_TYPE_BF16) return 0;
+    if (t->n_rows < 8 || (t->n_rows & 7) != 0) return 0;
+    if (t->n_cols <= 0 || (t->n_cols & 63) != 0) return 0;
+    int groups = t->n_rows / 8;
+    size_t bytes = tf_q8_pv_bytes(groups, t->n_cols);
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 0;
+#ifdef MADV_NOHUGEPAGE
+    madvise(p, bytes, MADV_NOHUGEPAGE);
+#endif
+    t->q8_pv = (uint8_t *)p;
+    t->q8_pv_groups = groups;
+    return 1;
+}
+
+static void tf_q8_pv_free(qtensor *t) {
+    if (t->q8_pv) {
+        munmap(t->q8_pv,
+               tf_q8_pv_bytes(t->q8_pv_groups, t->n_cols));
+        t->q8_pv = NULL;
+        t->q8_pv_groups = 0;
+    }
+}
+
 typedef struct {
     float *dst;
     const uint16_t *panel;
@@ -1524,6 +1729,11 @@ static void *tf_panel_build_worker(void *arg) {
 static void *tf_bf16_pv_build_worker(void *arg) {
     tf_panel_build_task *b = (tf_panel_build_task *)arg;
     tf_bf16_pv_fill_range(b->t, b->blk_start, b->blk_end);
+    return NULL;
+}
+static void *tf_q8_pv_build_worker(void *arg) {
+    tf_panel_build_task *b = (tf_panel_build_task *)arg;
+    tf_q8_pv_fill_range(b->t, b->blk_start, b->blk_end);
     return NULL;
 }
 #endif /* __ARM_FEATURE_SVE */
@@ -3980,6 +4190,26 @@ static int tf_prof_site(void *fn) {
 }
 #endif
 
+#ifdef TF_POOL_PROFILE
+/* Zero the persistent-worker section timers + dispatch counters. Called from
+ * the runner at the prefill→decode boundary so the printed breakdown reflects
+ * steady-state decode only (prefill's cold-mmap matvec faults dominate the
+ * raw counters otherwise). */
+void transformer_pool_profile_reset(void) {
+    tf_prof_calls = 0;
+    tf_prof_dispatch = tf_prof_work0 = tf_prof_wait = tf_prof_woke = 0;
+    for (int i = 0; i < TF_PROF_NSITE; i++) {
+        tf_prof_fn[i] = NULL;
+        tf_prof_fn_calls[i] = 0;
+        tf_prof_fn_work[i] = tf_prof_fn_wait[i] = 0;
+    }
+    for (int t = 0; t < 2; t++)
+        tf_pw_matvec[t] = tf_pw_barrier[t] = tf_pw_serial[t] = tf_pw_attn[t] = 0;
+}
+#else
+void transformer_pool_profile_reset(void) {}
+#endif
+
 /* ---- A64FX CMG core pinning ----
  * Pin pool thread `tid` (of n_threads) to a CMG-local core. Threads are
  * grouped contiguously across n_cmgs CMGs, matching the contiguous block
@@ -4287,8 +4517,12 @@ void transformer_build_panels(transformer_model *m) {
         fprintf(stderr, "transformer: panel layout built for %d F16 matvec weights%s\n",
                 built, m->cmg_pin ? " (first-touched per CMG)" : "");
 
-    /* BF16 p_odd-pair packing for dense matvec weights (same set + ssm_*). */
-    if (getenv("TF_NO_BF16_PV")) return;
+    /* BF16 p_odd-pair packing for dense matvec weights (same set + ssm_*).
+     * TF_QUANT_Q8=1 switches the build to Q8_0 quantize-on-load layout
+     * (q8_pv) which halves DRAM traffic for the matvec hot path; in that
+     * mode we skip bf16_pv entirely. */
+    if (getenv("TF_NO_BF16_PV") && !getenv("TF_QUANT_Q8")) return;
+    int use_q8 = getenv("TF_QUANT_Q8") != NULL;
     qtensor *bf16_list[16 * 256 + 1];
     int bn = 0;
     for (int l = 0; l < m->n_layers && bn + 16 <= (int)(sizeof(bf16_list)/sizeof(bf16_list[0])) - 1; l++) {
@@ -4301,17 +4535,23 @@ void transformer_build_panels(transformer_model *m) {
         };
         for (size_t i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
             qtensor *t = cand[i];
-            if (t->data && t->type == GGML_TYPE_BF16 && !t->bf16_pv
+            int col_ok = use_q8 ? ((t->n_cols & 63) == 0) : ((t->n_cols & 15) == 0);
+            int built_already = use_q8 ? (t->q8_pv != NULL) : (t->bf16_pv != NULL);
+            if (t->data && t->type == GGML_TYPE_BF16 && !built_already
                 && t->n_rows >= 8 && (t->n_rows & 7) == 0
-                && (t->n_cols & 15) == 0)
+                && col_ok)
                 bf16_list[bn++] = t;
         }
     }
-    if (m->has_lm_head && m->output.data && m->output.type == GGML_TYPE_BF16 &&
-        !m->output.panel && !m->output.bf16_pv
-        && m->output.n_rows >= 8 && (m->output.n_rows & 7) == 0
-        && (m->output.n_cols & 15) == 0)
-        bf16_list[bn++] = &m->output;
+    {
+        int col_ok = use_q8 ? ((m->output.n_cols & 63) == 0) : ((m->output.n_cols & 15) == 0);
+        int built_already = use_q8 ? (m->output.q8_pv != NULL) : (m->output.bf16_pv != NULL);
+        if (m->has_lm_head && m->output.data && m->output.type == GGML_TYPE_BF16 &&
+            !m->output.panel && !built_already
+            && m->output.n_rows >= 8 && (m->output.n_rows & 7) == 0
+            && col_ok)
+            bf16_list[bn++] = &m->output;
+    }
 
     /* Stream-reclaim source bytes after each pv build so peak memory is
      * weight_size + one tensor instead of 2× weight_size — required to fit
@@ -4325,8 +4565,14 @@ void transformer_build_panels(transformer_model *m) {
     int reclaim = !getenv("TF_KEEP_BF16_SRC");
     for (int i = 0; i < bn; i++) {
         qtensor *t = bf16_list[i];
-        if (!tf_bf16_pv_alloc(t)) continue;
-        int groups = t->bf16_pv_groups;
+        int groups;
+        if (use_q8) {
+            if (!tf_q8_pv_alloc(t)) continue;
+            groups = t->q8_pv_groups;
+        } else {
+            if (!tf_bf16_pv_alloc(t)) continue;
+            groups = t->bf16_pv_groups;
+        }
         if (nt > 1 && m->pool_alive && groups >= nt) {
             tf_panel_build_task *tasks =
                 (tf_panel_build_task *)alloca(nt * sizeof(tf_panel_build_task));
@@ -4336,10 +4582,12 @@ void transformer_build_panels(transformer_model *m) {
                 tasks[w] = (tf_panel_build_task){ t, off, off + c };
                 off += c;
             }
-            tf_pool_dispatch(m, tf_bf16_pv_build_worker, tasks,
-                             sizeof(tf_panel_build_task));
+            tf_pool_dispatch(m,
+                use_q8 ? tf_q8_pv_build_worker : tf_bf16_pv_build_worker,
+                tasks, sizeof(tf_panel_build_task));
         } else {
-            tf_bf16_pv_fill_range(t, 0, groups);
+            if (use_q8) tf_q8_pv_fill_range(t, 0, groups);
+            else        tf_bf16_pv_fill_range(t, 0, groups);
         }
         if (reclaim && t->data) {
             /* Round start up, length down to page boundaries — madvise needs
@@ -4359,7 +4607,8 @@ void transformer_build_panels(transformer_model *m) {
         bbuilt++;
     }
     if (bbuilt > 0) {
-        fprintf(stderr, "transformer: BF16 p_odd-pair layout built for %d matvec weights%s",
+        fprintf(stderr, "transformer: %s layout built for %d matvec weights%s",
+                use_q8 ? "Q8_0 quantize-on-load" : "BF16 p_odd-pair",
                 bbuilt, m->cmg_pin ? " (first-touched per CMG)" : "");
         if (reclaim && reclaimed > 0)
             fprintf(stderr, ", reclaimed %.2f GiB source", reclaimed / (1024.0 * 1024.0 * 1024.0));
@@ -5502,6 +5751,52 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
     *local_sense = my_sense;
 }
 
+/* Hierarchical-ARRIVAL, flat-release barrier. Splits the 48-way atomic
+ * arrival counter into 4 per-CMG counters (cache-local incrs, ~10× cheaper)
+ * but keeps the release on the single sense bit so the wake is one SEV. The
+ * earlier two-level-release design regressed because of doubled WFE/SEV
+ * round-trips on the critical path; this design keeps the cheap arrival
+ * with a flat release. */
+static inline void tf_hier_arr_barrier(transformer_model *m, int tid, int *local_sense,
+                                       int nt, int n_cmgs) {
+    if (n_cmgs <= 1 || nt < n_cmgs * 2 || (nt % n_cmgs) != 0) {
+        tf_spin_barrier(m, local_sense, nt);
+        return;
+    }
+    int tpc  = nt / n_cmgs;
+    int cmg  = tid / tpc;
+    int slot = cmg * 16;  /* 64B-isolated CMG counter slot */
+    int my_sense = !(*local_sense);
+
+    if (__sync_add_and_fetch((int *)&m->hb_cmg_count[slot], 1) == tpc) {
+        /* CMG leader: reset CMG count, hit a *separate* global counter
+         * (hb_g_count) so this barrier can safely coexist with `tf_spin_barrier`
+         * — both flip the shared bar_sense, but bar_count is only used by
+         * the flat version. The thread that closes the global count flips
+         * bar_sense and SEVs. All others wait on bar_sense once. */
+        m->hb_cmg_count[slot] = 0;
+        if (__sync_add_and_fetch((int *)&m->hb_g_count, 1) == n_cmgs) {
+            m->hb_g_count = 0;
+            __sync_synchronize();
+            m->bar_sense = my_sense;
+#if defined(__aarch64__)
+            __asm__ __volatile__("sev");
+#endif
+            *local_sense = my_sense;
+            return;
+        }
+    }
+#if defined(__aarch64__)
+    __asm__ __volatile__("sevl");
+    do {
+        __asm__ __volatile__("wfe");
+    } while (m->bar_sense != my_sense);
+#else
+    while (m->bar_sense != my_sense) tf_cpu_pause();
+#endif
+    *local_sense = my_sense;
+}
+
 /* Software two-level (hierarchical) barrier: per-CMG count on its own cacheline,
  * then inter-CMG count among leaders. Cuts the cross-CMG atomic contention that
  * plagues the flat tf_spin_barrier when nt is 48 split across 4 CMGs. Uses
@@ -5640,6 +5935,20 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
     int n_cols = mat->n_cols;
 
     if (mat->type == GGML_TYPE_BF16) {
+#if defined(__ARM_FEATURE_SVE)
+        if (mat->q8_pv && (rs & 7) == 0 && (re_end & 7) == 0) {
+            const int8_t *xq; const uint16_t *xs;
+            tf_quant_x_sdot(x, n_cols, &xq, &xs);
+            int nb = n_cols / 64;
+            size_t group_bytes = (size_t)nb * 528;
+            const uint8_t *qbase = mat->q8_pv;
+            for (int i = rs; i + 7 < re_end; i += 8) {
+                int g = i >> 3;
+                matvec_sdot_8row(dst + i, qbase + (size_t)g * group_bytes,
+                                 xq, xs, n_cols);
+            }
+        } else
+#endif
         tf_matvec_bf16_rows_pv(dst, (const uint8_t *)mat->data,
                                 (size_t)n_cols * 2, mat->bf16_pv,
                                 x, n_cols, rs, re_end);
@@ -5659,11 +5968,13 @@ static void *tf_persistent_worker(void *arg) {
     /* Persistent-worker barrier macro: swaps in the SW hierarchical barrier
      * when CMG pinning is active. Falls back to flat tf_spin_barrier when
      * the partition is degenerate (handled inside tf_sw_hier_barrier). */
-    /* NOTE: SW hierarchical barrier (tf_sw_hier_barrier) was tried here but
-     * regressed prefill ~1.85× at 14K context on Qwen3.5-9B (463s → 856s).
-     * The two extra SEV/WFE round-trips on the critical path (intra-CMG +
-     * inter-CMG release) outweigh the reduced cacheline contention on the
-     * flat barrier's single count atomic. Keep the flat barrier here. */
+    /* Two SW hier-barrier designs were tried and both regressed on Fugaku:
+     *   - tf_sw_hier_barrier  (two-level release): -46% prefill at 14K — two
+     *     SEV/WFE round-trips on the critical path
+     *   - tf_hier_arr_barrier (hier arrival, flat release): -3% prefill — the
+     *     extra per-CMG atomic step costs as much as the 48-way contention
+     *     saves on A64FX (LSE atomics are already fairly efficient).
+     * Both functions kept in tree for reference. Flat barrier is the default. */
     (void)0;
     #define PW_BARRIER() tf_spin_barrier(m, &local_sense, nt)
 #ifdef TF_POOL_PROFILE

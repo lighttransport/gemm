@@ -470,6 +470,7 @@ int main(int argc, char **argv) {
      * at position `total_prompt`, the next at `total_prompt+1`, etc. */
     fprintf(stderr, "\n=== Generation ===\n");
     fflush(stderr);
+    transformer_pool_profile_reset(); /* steady-state decode profile only */
     double t_gen0 = mono_sec();
     int n_gen = 0;
     int32_t next = -1;
