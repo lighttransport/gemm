@@ -1,6 +1,6 @@
 # Quant Matvec Kernels — A/B Verification Status
 
-**Date:** 2026-05-17; updated 2026-05-18 for Q5_K MW decode path
+**Date:** 2026-05-17; updated 2026-05-20 for Q6_K decode path
 **Tool:** `./test_hip_llm --verify-quant-kernels`
 **Method:** Identical raw quant bytes fed to the HIP `matvec_<type>_f32`
 kernel and to the CPU `dequantize_row_<type>` + scalar dot product. Random
@@ -103,5 +103,15 @@ overhead for decode-sized rows. On RX 9070 XT:
 | `Q6_K 5120x5120` | 0.143 ms | **0.0899 ms** |
 | `Q6_K 17408x5120` | 0.426 ms | **0.2895 ms** |
 | `Q6_K 5120x17408` | 0.558 ms | **0.4696 ms** |
+
+As of 2026-05-20, the Q6_K inner loop also precomputes repeated `d * scale`
+factors and splits the 32-element half-block loop into two 16-element loops.
+This reduces repeated scale work without changing launch geometry:
+
+| shape | before | after |
+|---|---:|---:|
+| `Q6_K 5120x5120` | 0.0895 ms | **0.0859 ms** |
+| `Q6_K 17408x5120` | 0.2890 ms | **0.2780 ms** |
+| `Q6_K 5120x17408` | 0.4693 ms | **0.4325 ms** |
 
 The same final binary passed `--verify-quant-kernels` with 18/18 PASS.
