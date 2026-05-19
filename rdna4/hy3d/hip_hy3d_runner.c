@@ -1020,6 +1020,8 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     hipStream_t stream = r->stream;
     const int H_dim = DIT_HIDDEN;
     const int ffn = DIT_FFN;
+    const char *moe_fp16_env = getenv("HY3D_MOE_FP16");
+    const int moe_fp16 = (moe_fp16_env && *moe_fp16_env && moe_fp16_env[0] != '0') ? 1 : 0;
 
     /* Scratch layout within d_moe_scratch */
     size_t off = 0;
@@ -1055,8 +1057,11 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
             sum += softmax_vals[e];
         }
         float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-        for (int e = 0; e < DIT_N_EXPERTS; e++)
+        for (int e = 0; e < DIT_N_EXPERTS; e++) {
             softmax_vals[e] *= inv;
+            if (moe_fp16)
+                softmax_vals[e] = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(softmax_vals[e]));
+        }
 
         /* Top-2 selection */
         int top_idx[DIT_MOE_TOP_K];
@@ -1103,9 +1108,12 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
         /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e */
         op_gemm(ops, stream, d_exp_h, blk->moe_expert_fc1_w[e], d_input,
                 blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
+        if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
         op_gelu_exact(ops, stream, d_exp_h, N_tok * ffn);
+        if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
         op_gemm(ops, stream, d_exp_o, blk->moe_expert_fc2_w[e], d_exp_h,
                 blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
+        if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_o, N_tok * H_dim);
 
         /* Scale-add: d_output[t,:] += scale[t] * d_exp_o[t,:]  (on CPU) */
         hipStreamSynchronize(stream);
@@ -1117,8 +1125,18 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
         for (int t = 0; t < N_tok; t++) {
             float w = expert_scale_cpu[t];
             if (w == 0.0f) continue;
-            for (int j = 0; j < H_dim; j++)
-                accum_cpu[t * H_dim + j] += w * exp_out_cpu[t * H_dim + j];
+            if (moe_fp16)
+                w = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(w));
+            for (int j = 0; j < H_dim; j++) {
+                size_t idx = (size_t)t * H_dim + j;
+                if (moe_fp16) {
+                    float x = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(exp_out_cpu[idx]));
+                    float prod = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(w * x));
+                    accum_cpu[idx] = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(accum_cpu[idx] + prod));
+                } else {
+                    accum_cpu[idx] += w * exp_out_cpu[idx];
+                }
+            }
         }
 
         hipMemcpyAsync(d_output, accum_cpu,
@@ -1133,10 +1151,14 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     /* Step 5: Add shared expert output */
     op_gemm(ops, stream, d_exp_h, blk->moe_shared_fc1_w, d_input,
             blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
     op_gelu_exact(ops, stream, d_exp_h, N_tok * ffn);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
     op_gemm(ops, stream, d_exp_o, blk->moe_shared_fc2_w, d_exp_h,
             blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_o, N_tok * H_dim);
     op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_output, N_tok * H_dim);
 }
 
 /* Stage 2: Single DiT forward pass */
