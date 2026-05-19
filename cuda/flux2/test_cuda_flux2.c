@@ -606,6 +606,155 @@ fail:
     return 1;
 }
 
+static int test_kernel_split_auto_prefers_tensor_attn(cuda_flux2_runner *r) {
+    fprintf(stderr, "  [kernel] FLUX2_FA2_SPLIT_F32 auto keeps tensor attention... ");
+    if (!r->fn_flash_attn_bf16 || !r->fn_cast_f32_to_bf16 ||
+        !r->fn_flash_attn || !r->fn_flash_attn_split_partials || !r->fn_flash_attn_split_merge) {
+        fprintf(stderr, "SKIP (BF16 or split kernels not loaded)\n");
+        return 0;
+    }
+
+    const int n_tok = 128;
+    const int n_heads = 2;
+    const int head_dim = 128;
+    const int dim = n_heads * head_dim;
+    const int split_kv = 32;
+    const int n_splits = (n_tok + split_kv - 1) / split_kv;
+    size_t n_elems = (size_t)n_tok * dim;
+
+    float *Q = (float *)malloc(n_elems * sizeof(float));
+    float *K = (float *)malloc(n_elems * sizeof(float));
+    float *V = (float *)malloc(n_elems * sizeof(float));
+    float *out_bf16 = (float *)malloc(n_elems * sizeof(float));
+    float *out_auto = (float *)malloc(n_elems * sizeof(float));
+    float *out_f32 = (float *)malloc(n_elems * sizeof(float));
+    float *out_forced = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_bf16 || !out_auto || !out_f32 || !out_forced) {
+        free(Q); free(K); free(V); free(out_bf16); free(out_auto); free(out_f32); free(out_forced);
+        fprintf(stderr, "FAIL (host OOM)\n");
+        return 1;
+    }
+
+    rng_state = 20260519;
+    rng_cached_valid = 0;
+    for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.7f;
+    for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.7f;
+
+    CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
+    CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
+    CUdeviceptr d_V = gpu_upload_f32(V, (int)n_elems);
+    CUdeviceptr d_bf16 = 0, d_auto = 0, d_f32 = 0, d_forced = 0;
+    const char *old_env = getenv("FLUX2_FA2_SPLIT_F32");
+    char *old_env_copy = old_env ? (char *)malloc(strlen(old_env) + 1) : NULL;
+    int saved_bf16_attn = r->use_bf16_attn;
+#define FLUX2_SPLIT_AUTO_CU(call, label) do { \
+        CUresult _fe = (call); \
+        if (_fe != CUDA_SUCCESS) { \
+            fprintf(stderr, "FAIL (%s err=%d)\n", (label), (int)_fe); \
+            goto fail; \
+        } \
+    } while (0)
+    if (old_env && !old_env_copy) {
+        fprintf(stderr, "FAIL (host OOM env copy)\n");
+        goto fail;
+    }
+    if (old_env_copy) strcpy(old_env_copy, old_env);
+    if (!d_Q || !d_K || !d_V) {
+        fprintf(stderr, "FAIL (device upload)\n");
+        goto fail;
+    }
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_bf16, n_elems * sizeof(float)), "alloc bf16");
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_auto, n_elems * sizeof(float)), "alloc auto");
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_f32, n_elems * sizeof(float)), "alloc f32");
+    FLUX2_SPLIT_AUTO_CU(cuMemAlloc(&d_forced, n_elems * sizeof(float)), "alloc forced");
+
+    r->use_bf16_attn = 1;
+    unsetenv("FLUX2_FA2_SPLIT_F32");
+    op_attn(r, d_bf16, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "bf16 sync");
+    FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_bf16, d_bf16, n_elems * sizeof(float)), "bf16 copy");
+
+    setenv("FLUX2_FA2_SPLIT_F32", "auto", 1);
+    op_attn(r, d_auto, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+    FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "auto sync");
+    FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_auto, d_auto, n_elems * sizeof(float)), "auto copy");
+
+    {
+        int ntok = n_tok, nh = n_heads, hd = head_dim;
+        unsigned gy = (unsigned)((n_tok + 3) / 4);
+        size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
+        void *f32_args[] = {&d_f32, &d_Q, &d_K, &d_V, &ntok, &nh, &hd};
+        FLUX2_SPLIT_AUTO_CU(cuLaunchKernel(r->fn_flash_attn, (unsigned)nh, gy, 1,
+                                           128, 1, 1, smem, r->stream, f32_args, NULL),
+                            "f32 launch");
+        FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "f32 sync");
+        FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_f32, d_f32, n_elems * sizeof(float)), "f32 copy");
+
+        if (ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) != 0) {
+            fprintf(stderr, "FAIL (split workspace)\n");
+            goto fail;
+        }
+        setenv("FLUX2_FA2_SPLIT_F32", "32", 1);
+        op_attn(r, d_forced, d_Q, d_K, d_V, n_tok, n_heads, head_dim);
+        FLUX2_SPLIT_AUTO_CU(cuStreamSynchronize(r->stream), "forced sync");
+        FLUX2_SPLIT_AUTO_CU(cuMemcpyDtoH(out_forced, d_forced, n_elems * sizeof(float)), "forced copy");
+    }
+
+    if (old_env_copy) {
+        setenv("FLUX2_FA2_SPLIT_F32", old_env_copy, 1);
+    } else {
+        unsetenv("FLUX2_FA2_SPLIT_F32");
+    }
+    free(old_env_copy);
+    old_env_copy = NULL;
+    r->use_bf16_attn = saved_bf16_attn;
+
+    float auto_bf16_max = 0.0f, forced_f32_max = 0.0f, bf16_f32_max = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        float da = fabsf(out_auto[i] - out_bf16[i]);
+        float df = fabsf(out_forced[i] - out_f32[i]);
+        float db = fabsf(out_bf16[i] - out_f32[i]);
+        if (da > auto_bf16_max) auto_bf16_max = da;
+        if (df > forced_f32_max) forced_f32_max = df;
+        if (db > bf16_f32_max) bf16_f32_max = db;
+    }
+
+    cuMemFree(d_Q); cuMemFree(d_K); cuMemFree(d_V);
+    cuMemFree(d_bf16); cuMemFree(d_auto); cuMemFree(d_f32); cuMemFree(d_forced);
+    free(Q); free(K); free(V); free(out_bf16); free(out_auto); free(out_f32); free(out_forced);
+    if (auto_bf16_max > 0.0f || forced_f32_max > 1e-4f || bf16_f32_max < 1e-7f) {
+        fprintf(stderr, "FAIL (auto_bf16=%.6g forced_f32=%.6g bf16_f32=%.6g)\n",
+                auto_bf16_max, forced_f32_max, bf16_f32_max);
+        return 1;
+    }
+    fprintf(stderr, "OK (auto_bf16=%.6g forced_f32=%.6g bf16_f32=%.6g)\n",
+            auto_bf16_max, forced_f32_max, bf16_f32_max);
+#undef FLUX2_SPLIT_AUTO_CU
+    return 0;
+
+fail:
+    r->use_bf16_attn = saved_bf16_attn;
+    if (old_env_copy) {
+        setenv("FLUX2_FA2_SPLIT_F32", old_env_copy, 1);
+        free(old_env_copy);
+    } else if (old_env) {
+        setenv("FLUX2_FA2_SPLIT_F32", old_env, 1);
+    } else {
+        unsetenv("FLUX2_FA2_SPLIT_F32");
+    }
+    if (d_Q) cuMemFree(d_Q);
+    if (d_K) cuMemFree(d_K);
+    if (d_V) cuMemFree(d_V);
+    if (d_bf16) cuMemFree(d_bf16);
+    if (d_auto) cuMemFree(d_auto);
+    if (d_f32) cuMemFree(d_f32);
+    if (d_forced) cuMemFree(d_forced);
+    free(Q); free(K); free(V); free(out_bf16); free(out_auto); free(out_f32); free(out_forced);
+#undef FLUX2_SPLIT_AUTO_CU
+    return 1;
+}
+
 static float time_flux2_f32_attn(cuda_flux2_runner *r, CUfunction fn,
                                  CUdeviceptr out, CUdeviceptr q,
                                  CUdeviceptr k, CUdeviceptr v,
@@ -807,6 +956,7 @@ static int test_kernels(void) {
     fail += test_kernel_gemm_bf16(r);
     fail += test_kernel_fp8_attn(r);
     fail += test_kernel_split_attn_f32(r);
+    fail += test_kernel_split_auto_prefers_tensor_attn(r);
     fail += test_kernel_split_attn_f32_2048(r);
     fail += test_kernel_split_attn_f32_4608(r);
     cuda_flux2_free(r);
