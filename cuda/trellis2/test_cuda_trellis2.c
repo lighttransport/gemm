@@ -55,12 +55,27 @@ static float *read_npy_f32(const char *path, int *ndim, int *dims) {
     header[header_len] = '\0';
     *ndim = 0;
     char *sp = strstr(header, "shape");
-    if (sp) { sp = strchr(sp, '('); if (sp) { sp++;
-        while (*sp && *sp != ')') { while (*sp == ' ' || *sp == ',') sp++;
-            if (*sp == ')') break; dims[*ndim] = (int)strtol(sp, &sp, 10); (*ndim)++; if (*ndim >= 8) break; }}}
-    size_t n = 1; for (int i = 0; i < *ndim; i++) n *= (size_t)dims[i];
+    if (sp) {
+        sp = strchr(sp, '(');
+        if (sp) {
+            sp++;
+            while (*sp && *sp != ')') {
+                while (*sp == ' ' || *sp == ',') sp++;
+                if (*sp == ')') break;
+                dims[*ndim] = (int)strtol(sp, &sp, 10);
+                (*ndim)++;
+                if (*ndim >= 8) break;
+            }
+        }
+    }
+    size_t n = 1;
+    for (int i = 0; i < *ndim; i++) n *= (size_t)dims[i];
     float *data = (float *)malloc(n * sizeof(float));
-    fread(data, sizeof(float), n, f);
+    if (fread(data, sizeof(float), n, f) != n) {
+        fprintf(stderr, "Short read from %s\n", path);
+        free(data); free(header); fclose(f);
+        return NULL;
+    }
     fclose(f); free(header);
     fprintf(stderr, "Read %s: (", path);
     for (int i = 0; i < *ndim; i++) fprintf(stderr, "%s%d", i?",":"", dims[i]);
@@ -86,7 +101,8 @@ static void write_npy_f32(const char *path, const float *data, const int *dims, 
     int pad = ((total + 63) / 64) * 64 - total;
     uint16_t hlen = (uint16_t)(hl + pad + 1);
     fwrite(&hlen, 2, 1, f); fwrite(hdr, 1, hl, f);
-    for (int i = 0; i < pad; i++) fputc(' ', f); fputc('\n', f);
+    for (int i = 0; i < pad; i++) fputc(' ', f);
+    fputc('\n', f);
     fwrite(data, sizeof(float), n, f);
     fclose(f);
     fprintf(stderr, "Wrote %s\n", path);
@@ -106,6 +122,18 @@ static float rng_randn(rng_state *r) {
     return (float)(sqrt(-2.0*log(u1))*cos(6.283185307179586*u2));
 }
 static float rescale_t(float t, float rt) { return t*rt/(1.0f+(rt-1.0f)*t); }
+
+static double sample_std_f32(const float *x, size_t n) {
+    if (!x || n < 2) return 0.0;
+    double sum = 0.0, sum2 = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double v = (double)x[i];
+        sum += v;
+        sum2 += v * v;
+    }
+    double var = (sum2 - sum * sum / (double)n) / (double)(n - 1);
+    return var > 0.0 ? sqrt(var) : 0.0;
+}
 
 /* Load image and preprocess for DINOv3: resize to 512x512, normalize to [3,512,512] CHW */
 static float *load_image_for_dinov3(const char *path) {
@@ -311,8 +339,6 @@ int main(int argc, char **argv) {
         float t_end = 1.0f - (float)(step + 1) / (float)n_steps;
         float t_cur = rescale_t(t_start, rescale);
         float t_next = rescale_t(t_end, rescale);
-        float dt = t_next - t_cur;
-
         struct timespec step_ts; clock_gettime(CLOCK_MONOTONIC, &step_ts);
         double step_t0 = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
 
@@ -512,10 +538,10 @@ int main(int argc, char **argv) {
 
             clock_gettime(CLOCK_MONOTONIC, &step_ts);
             double step_t1x = step_ts.tv_sec * 1000.0 + step_ts.tv_nsec / 1e6;
+            double s2_std = sample_std_f32(s2_x, (size_t)N_sparse * s2_ch);
             fprintf(stderr, "  step %d/%d  t=%.4f->%.4f  %s  %.1f ms  std=%.4f\n",
                     step + 1, s2_steps, t_cur, t_next,
-                    apply_cfg ? "CFG" : "noG", step_t1x - step_t0x,
-                    0.0f /* TODO: compute std */);
+                    apply_cfg ? "CFG" : "noG", step_t1x - step_t0x, s2_std);
         }
 
         free(s2_v_cond); free(s2_v_uncond); free(s2_zeros_cond);
@@ -621,7 +647,7 @@ int main(int argc, char **argv) {
 
         /* Create sparse tensor for shape decoder */
         sp3d_tensor *slat = sp3d_create(sparse_coords, s2_x, N_sparse, s2_ch, 1);
-        free(s2_x); free(sparse_coords);
+        free(s2_x);
 
         /* Run shape decoder */
         t2_shape_dec_result result = t2_shape_dec_forward(dec, slat, n_threads);
@@ -720,6 +746,7 @@ int main(int argc, char **argv) {
         t2_shape_dec_result_free(&result);
         sp3d_free(slat);
         t2_shape_dec_free(dec);
+        free(sparse_coords);
         if (tex_slat) free(tex_slat);
     } else {
         /* Stage 1 only: marching cubes mesh export */
@@ -739,9 +766,12 @@ int main(int argc, char **argv) {
                         float fy = (y + 0.5f) * scale2 - 0.5f;
                         float fx = (xi + 0.5f) * scale2 - 0.5f;
                         int iz = (int)fz, iy = (int)fy, ix = (int)fx;
-                        if (iz < 0) iz = 0; if (iz > 62) iz = 62;
-                        if (iy < 0) iy = 0; if (iy > 62) iy = 62;
-                        if (ix < 0) ix = 0; if (ix > 62) ix = 62;
+                        if (iz < 0) iz = 0;
+                        if (iz > 62) iz = 62;
+                        if (iy < 0) iy = 0;
+                        if (iy > 62) iy = 62;
+                        if (ix < 0) ix = 0;
+                        if (ix > 62) ix = 62;
                         float dz = fz - iz, dy = fy - iy, dx = fx - ix;
                         #define OCC(a,b,c) occupancy[(a)*64*64 + (b)*64 + (c)]
                         float v = OCC(iz,iy,ix)*(1-dz)*(1-dy)*(1-dx)
