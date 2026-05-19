@@ -355,6 +355,24 @@ Measured on RX 9070 XT:
 Correctness: `--verify-quant-kernels` passes 18/18. The change only alters
 the launch geometry of the existing Q6_K arithmetic.
 
+**Q6_K decode matvec scale-loop split (✅ LANDED 2026-05-20)** — split the
+hot 32-element Q6_K inner loop into two 16-element loops and precomputed the
+repeated `d * scale` factors per half-block. This keeps the same 64-thread
+launch shape and the same dequant arithmetic, but removes repeated scale
+multiplication and `l / 16` indexing from the inner loop.
+
+Measured on RX 9070 XT:
+
+| case | before | after | speedup |
+|---|---:|---:|---:|
+| microbench `Q6_K 5120x5120` | 0.0895 ms | **0.0859 ms** | 1.04x |
+| microbench `Q6_K 17408x5120` | 0.2890 ms | **0.2780 ms** | 1.04x |
+| microbench `Q6_K 5120x17408` | 0.4693 ms | **0.4325 ms** | 1.09x |
+| Qwen3.6-27B IQ3_XXS decode L=256, 16 tok | 50.12 ms/tok | **49.63 ms/tok** | ~1.01x |
+
+Correctness: `--verify-quant-kernels` passes 18/18. First/last decoded token
+ids for the 27B bench stayed `271` / `13`.
+
 **Q4_K decode matvec 64-thread launch (✅ LANDED 2026-05-18)** — changed the
 default Q4_K one-row-per-block launch from 256 to 64 threads/block. Decode
 rows have ~16-68 K-blocks, so the old 256-thread block left most lanes idle
