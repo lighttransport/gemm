@@ -72,9 +72,11 @@ removes random latent and conditioner drift from DiT/VAE debugging.
   the old descending schedule and produced an empty SDF. After rebuild, replay
   starts at `t=0.0000`, completes in `205.91s`, and writes
   `/tmp/hy3d_hip_trace.obj` with `11066` verts / `15676` tris.
+- HIP replay with fp16-rounded MoE gate logits completes in `207.92s` and
+  writes `/tmp/hy3d_hip_trace.obj` with `11130` verts / `15764` tris.
 - HIP final latent dump `/tmp/hy3d_hip_latent_004.npy` vs PyTorch
-  `07_vae_input_latents.npy`: rel-L2 `0.0596`, max abs `1.97`, mean abs
-  `0.0131`.
+  `07_vae_input_latents.npy`: rel-L2 `0.0593`, max abs `1.94`, mean abs
+  `0.0130`.
 - HIP VAE-only replay on PyTorch `07_vae_input_latents.npy` is healthy:
   `SDF min=-1.0083 max=1.0115 mean=-0.8066`.
 - DiT single-forward checks against the trace pass for step 0 CFG batch 0/1
@@ -94,6 +96,69 @@ rdna4/hy3d/compare_trace.py \
     --steps 4 --guidance 5.0 \
     --json /tmp/hy3d_trace_compare.json
 ```
+
+Latest 4-step replay summary:
+
+```text
+Latents
+step  max_abs      mean_abs     rel_l2
+   1           0           0           0
+   2  0.00683594  0.000672213  0.00135945
+   3   0.0446777  0.00146078  0.00393528
+   4     1.94385   0.0130082   0.0592722
+
+Velocities vs PyTorch CFG
+step  max_abs      mean_abs     rel_l2
+   1   0.0186566  0.00196431  0.00255842
+   2    0.133075  0.00398252   0.0122257
+   3     5.83546   0.0376467    0.231608
+   4     6.29063   0.0319469    0.134516
+```
+
+## Drift diagnosis
+
+The large late-step drift is trajectory sensitivity, not a broken HIP DiT
+forward path. `ref/hy3d/dump_dit_single_step.py --all-batches` can replay a
+single DiT call on CPU with float activations using the same latent/context
+inputs:
+
+```sh
+ref/hy3d/.venv/bin/python ref/hy3d/dump_dit_single_step.py \
+    --ckpt /mnt/disk1/models/Hunyuan3D-2.1/hunyuan3d-dit-v2-1/model.fp16.ckpt \
+    --hy3d-repo /mnt/disk1/models/Hunyuan3D-2.1-repo/hy3dshape \
+    --latents /tmp/hy3d_hip_latent_003.npy \
+    --context /tmp/hy3d_ref_trace/03_dit_context_cfg.npy \
+    --timestep 0.66650390625 \
+    --all-batches \
+    --outdir /tmp/hy3d_pt_hip_step3
+```
+
+On the HIP step-3 latent, HIP velocity vs CPU-float PyTorch CFG is close:
+max abs `0.0752`, mean abs `3.9e-5`, rel-L2 `8.6e-4`. The CPU-float PyTorch
+output on that same HIP latent has the same large gap to the original ROCm
+fp16 trace as HIP does: rel-L2 `0.233`. That means the step-3 mismatch is
+caused by small earlier latent differences crossing a sensitive DiT/MoE
+trajectory boundary.
+
+Block-level step-0 localization tells the same story. With exact trace input,
+HIP block outputs match the CPU-float oracle tightly through the full DiT:
+
+```text
+block       max_abs      mean_abs       rel_l2
+0          0.00361      1.49e-05      1.47e-05
+5          0.00372      3.53e-05      1.72e-05
+10         0.00270      3.95e-05      1.91e-05
+11         0.00098      8.57e-06      2.37e-05
+14         0.00810      2.34e-05      5.99e-05
+15         0.02193      1.20e-04      4.53e-04
+20         0.01686      1.74e-05      6.01e-05
+```
+
+An attempted broad "round every major activation through fp16" experiment did
+not solve the trace drift: it slightly improved step 3 but worsened step 4
+velocity rel-L2 (`0.164` vs `0.135`). The retained precision change is only the
+MoE gate-logit fp16 rounding, which is small but matches the fp16 routing
+boundary and slightly improves the final latent error.
 
 ## Current caveats
 

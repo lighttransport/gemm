@@ -1030,6 +1030,10 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     /* Step 1: Compute gate logits: [N_tok, H_dim] @ [8, H_dim]^T -> [N_tok, 8] */
     op_gemm(ops, stream, d_gate, blk->moe_gate_w, d_input, NULL,
             DIT_N_EXPERTS, H_dim, N_tok);
+    /* PyTorch fp16 pipeline routes experts from fp16 gate logits. HIP keeps
+     * activations in F32, so round gate logits before CPU softmax/top-k to
+     * reduce route flips from tiny precision differences. */
+    op_round_f32_to_f16(ops, stream, d_gate, N_tok * DIT_N_EXPERTS);
 
     /* Step 2: Download gate logits, compute softmax + top-2 on CPU */
     float *gate_cpu = (float *)malloc((size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
