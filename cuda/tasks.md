@@ -375,6 +375,16 @@ follow-ups.
     - Verify: `make -B -C cuda/trellis2 test_cuda_trellis2` and
       `git diff --check`.
 
+31. **[done] Trellis2 CUDA image-to-shape smoke can be bounded**
+    - Status: `test_cuda_trellis2` now accepts `--sparse-threshold` and
+      `--max-sparse` for Stage 2 sparse coord extraction, making real
+      DINOv3-image -> Stage 1 -> Stage 2 -> shape-decoder -> FDG mesh smoke
+      runs practical without accidentally expanding tens of thousands of
+      occupancy voxels.
+    - Verify: `make -B -C cuda/trellis2 test_cuda_trellis2`, `git diff --check`,
+      and a bounded smoke with `--max-sparse 2048` that wrote
+      `/tmp/t2_cuda_image_to_shape_smoke.obj`.
+
 ## Verification harness
 
 Quick smokes to run after any of the items above:
