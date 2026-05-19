@@ -827,14 +827,14 @@ fail:
 }
 
 static int test_kernel_split_attn_f32_bench(cuda_flux2_runner *r, int n_tok,
-                                            const char *label, int repeats) {
+                                            int n_heads, const char *label,
+                                            int repeats) {
     fprintf(stderr, "  [kernel] flash_attn_f32 split-key %s bench... ", label);
     if (!r->fn_flash_attn || !r->fn_flash_attn_split_partials || !r->fn_flash_attn_split_merge) {
         fprintf(stderr, "SKIP (kernels not loaded)\n");
         return 0;
     }
 
-    const int n_heads = 1;
     const int head_dim = 128;
     const int dim = n_heads * head_dim;
     const int split_candidates[] = {128, 256, 512, 1024};
@@ -937,11 +937,16 @@ static int test_kernel_split_attn_f32_bench(cuda_flux2_runner *r, int n_tok,
 }
 
 static int test_kernel_split_attn_f32_2048(cuda_flux2_runner *r) {
-    return test_kernel_split_attn_f32_bench(r, 2048, "2048-token", 3);
+    return test_kernel_split_attn_f32_bench(r, 2048, 1, "2048-token", 3);
 }
 
 static int test_kernel_split_attn_f32_4608(cuda_flux2_runner *r) {
-    return test_kernel_split_attn_f32_bench(r, 4608, "4608-token", 2);
+    return test_kernel_split_attn_f32_bench(r, 4608, 1, "4608-token", 2);
+}
+
+static int test_kernel_split_attn_f32_4608_flux2_heads(cuda_flux2_runner *r) {
+    /* Production Flux.2 attention shape: hidden=3072 = 24 heads * 128. */
+    return test_kernel_split_attn_f32_bench(r, 4608, 24, "4608-token/24-head", 2);
 }
 
 static int test_kernels(void) {
@@ -959,6 +964,7 @@ static int test_kernels(void) {
     fail += test_kernel_split_auto_prefers_tensor_attn(r);
     fail += test_kernel_split_attn_f32_2048(r);
     fail += test_kernel_split_attn_f32_4608(r);
+    fail += test_kernel_split_attn_f32_4608_flux2_heads(r);
     cuda_flux2_free(r);
 
     if (fail) {
