@@ -152,14 +152,16 @@ follow-ups.
      partial CTAs, store explicit `(m, l, O)` workspace, then merge partials
      with a second kernel. Both `--test-kernels` suites compare the raw split
      kernels and the `op_attn` dispatch path against baseline
-     `flash_attn_f32`; both also include a 2048-token microbench that sweeps
-     `split_kv={256,512,1024}`. Current measurements on this host: qimg F32
-     split is faster at 2048 tokens (best `split_kv=256`: 2.470 ms baseline
-     -> 1.789 ms split, 1.38x), while flux2 F32 split is slower on the same
-     synthetic shape (best `split_kv=256`: 1.363 ms -> 1.790 ms, 0.76x).
+     `flash_attn_f32`; both also include 2048-token and 4608-token
+     microbenches that sweep
+     `split_kv={128,256,384,512,768,1024,1536,2048}` while ignoring
+     non-split candidates. Current measurements on this host: qimg F32 split
+     is faster at 2048 tokens (best `split_kv=384`: 2.467 ms baseline
+     -> 1.774 ms split, 1.39x), while flux2 F32 split is slower on the same
+     synthetic shape (best `split_kv=384`: 1.364 ms -> 1.776 ms, 0.77x).
      Numeric env values still force a split. `QIMG_FA2_SPLIT_F32=auto`
      enables the measured qimg large-token heuristic (`n_tok>=2048` ->
-     `split_kv=256`, `n_tok>=4096` -> `split_kv=1024`) only when qimg's
+     `split_kv=384`, `n_tok>=4096` -> `split_kv=1024`) only when qimg's
      faster BF16/FP8 tensor-core attention path is not active; numeric values
      still force F32 split-key for experiments.
      `FLUX2_FA2_SPLIT_F32=auto` currently declines to split because the
@@ -175,12 +177,12 @@ follow-ups.
      `auto` keeps the active BF16 tensor-core attention path, while numeric
      split values still force F32 split-key for experiments. qimg tests also
      include a 4608-token/24-head production-shape F32 split bench; on this host
-     it measured about 514.6 ms baseline -> 205.6 ms split (2.50x), confirming
+     it measured about 514.7 ms baseline -> 205.5 ms split (2.50x), confirming
      split-key remains valuable for the qimg fallback path. The same 4608-token
      bench was added for flux2
-     and still regressed: about 6.72 ms baseline -> 8.94-8.99 ms split
+     and still regressed: about 6.74 ms baseline -> 8.94 ms split
      (0.75x). Flux2 also now has a 4608-token/24-head production-shape bench;
-     it measured about 200.8 ms baseline -> 205.6 ms split (0.98x), so flux2
+     it measured about 200.5 ms baseline -> 205.5 ms split (0.98x), so flux2
      `auto` remains disabled.
      BF16/FP8 split-key tensor-core variants remain future work.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
