@@ -63,6 +63,10 @@ cuda/vlm/test_cuda_vlm
 cuda/da3/test_cuda_da3
 cuda/ppd/test_cuda_ppd
 cuda/fp8/fp8_gemm
+cuda/int8/int8_gemm
+cuda/int8/int8_attention
+cuda/int8/int8_ffn
+cuda/int8/cublas_int8_gemm
 cuda/sam3d/test_*
 !cuda/sam3d/test_*.c
 cuda/sam3d/verify_*
