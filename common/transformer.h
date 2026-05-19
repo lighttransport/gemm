@@ -176,6 +176,18 @@ typedef struct {
     float **value_scales;
     int kv_dtype;            /* 0=F32 (default), 1=F16, 2=Q8 with per-head per-pos scale */
     size_t kv_elem_bytes;    /* bytes per K/V element (4/2/1) */
+    int kv_k_transposed;     /* if 1, K stored as [kv_h][d][p] (stride 1 across positions);
+                              * V stays [p][kv_h][d]. Enables FMLA-into-att QK kernel,
+                              * eliminating per-position svaddv. Opt-in via TF_KV_K_T=1. */
+    int kv_k_dp;             /* if 1, K stored as [p][d][kv_h]. Enables qpkd+ktbl QK kernel
+                              * (svld1rq+svtbl, no svaddv, no replication). Requires
+                              * n_heads == SVE width (16 on A64FX). F32/F16/Q8 KV all
+                              * wired. Default ON when eligible; opt out with TF_KV_K_DP=0. */
+    float *q_packed;         /* [head_dim * n_heads] scratch; valid only when kv_k_dp */
+    float *av_tmp;           /* [n_threads * n_heads * head_dim] per-thread AV partials.
+                              * Allocated when kv_k_dp; lets AV parallelize across all
+                              * threads via per-p partition + reduction (instead of the
+                              * baseline 1-thread-per-head split). */
 
     /* Scratch buffers */
     float *x;        /* [n_embd] current hidden state */
@@ -185,6 +197,14 @@ typedef struct {
     float *k;        /* [n_kv_dim] key */
     float *v;        /* [n_kv_dim] value */
     float *att;      /* [n_heads * max_seq_len] attention scores */
+
+    /* Flash-attention position-parallel scratch.
+     * Sized at load for n_heads * TF_MAX_FA_CHUNKS partial accumulators.
+     * fa_m / fa_l: [n_heads * n_chunks] per-tile (max_score, sum_exp).
+     * fa_out:      [n_heads * n_chunks * head_dim] per-tile output. */
+    float *fa_m;
+    float *fa_l;
+    float *fa_out;
     float *ffn_buf1; /* [n_ff] */
     float *ffn_buf2; /* [n_ff] */
     float *ffn_buf3; /* [n_ff] */
@@ -219,6 +239,18 @@ typedef struct {
     volatile int bar_count;    /* barrier arrival counter */
     volatile int bar_sense;    /* barrier sense flag (alternates 0/1) */
 
+    /* SW hierarchical barrier state: 4 CMGs × 16-int slots = each slot one
+     * cacheline (64B) so different CMGs don't false-share. Used by the
+     * persistent worker to reduce 48-way atomic contention on the single
+     * bar_count cacheline; ~3× faster than the flat tf_spin_barrier on
+     * Fugaku 4-CMG nodes. hb_g_* are the inter-CMG sync (only 4 leaders). */
+    volatile int hb_cmg_count[4 * 16];
+    volatile int hb_cmg_sense[4 * 16];
+    volatile int hb_g_count;
+    char _hb_pad1[60];
+    volatile int hb_g_sense;
+    char _hb_pad2[60];
+
     /* A64FX CMG affinity: pool threads pinned to CMG-local cores so that
      * panel buffers first-touched per-thread land on the right HBM stack.
      * cmg_pin=1 enables; cmg_pin_ncmgs = how many CMGs the pool spreads over. */
@@ -251,6 +283,11 @@ void transformer_free(transformer_model *model);
 #define TF_KV_DTYPE_F32 0
 #define TF_KV_DTYPE_F16 1
 #define TF_KV_DTYPE_Q8  2
+
+/* Max position-chunks per head in the flash-attention path. With nt=48 and
+ * n_heads=16 (Qwen3.5-9B) we use 3 chunks/head → 48 (head, chunk) tasks.
+ * Allows up to 16 for future use. Bounds the fa_out scratch at load time. */
+#define TF_MAX_FA_CHUNKS 16
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
@@ -1779,6 +1816,143 @@ static inline void tf_kv_write_all_heads(void *cache_ptr, float *scales,
     }
 }
 
+/* Transposed-K writer: K stored as [kv_h][d][p] with stride max_seq across p.
+ * Writes one position-row of [n_kv_heads * head_dim] floats into the layer's
+ * K cache at position p. Each scalar lands at scattered offsets, but the
+ * total volume is small (n_kv_heads*head_dim per step). Q8 scales unchanged
+ * layout: scales[p*n_kv_heads + h]. */
+static inline void tf_k_write_transposed(void *cache_ptr, float *scales,
+                                         const float *src,
+                                         int p, int n_kv_heads,
+                                         int head_dim, int max_seq_len,
+                                         int kv_dtype) {
+    size_t stride_d = (size_t)max_seq_len;          /* elements per (kv_h,d) row */
+    size_t stride_h = (size_t)head_dim * stride_d;
+    if (kv_dtype == TF_KV_DTYPE_F32) {
+        float *base = (float *)cache_ptr;
+        for (int h = 0; h < n_kv_heads; h++)
+            for (int d = 0; d < head_dim; d++)
+                base[h * stride_h + d * stride_d + p] = src[h * head_dim + d];
+    } else if (kv_dtype == TF_KV_DTYPE_F16) {
+        uint16_t *base = (uint16_t *)cache_ptr;
+        for (int h = 0; h < n_kv_heads; h++)
+            for (int d = 0; d < head_dim; d++)
+                base[h * stride_h + d * stride_d + p] = tf_f32_to_f16(src[h * head_dim + d]);
+    } else {
+        /* Q8: quantise per (kv_h) row using the source, then scatter int8s. */
+        int8_t *base = (int8_t *)cache_ptr;
+        int8_t tmp[512];
+        for (int h = 0; h < n_kv_heads; h++) {
+            float s = tf_quantize_row_q8(tmp, src + h * head_dim, head_dim);
+            scales[(size_t)p * n_kv_heads + h] = s;
+            for (int d = 0; d < head_dim; d++)
+                base[h * stride_h + d * stride_d + p] = tmp[d];
+        }
+    }
+}
+
+/* Forward decl for tf_k_cache_write_row below — full definition is further
+ * down (handles V rows too). */
+static inline void tf_kv_write_row(void *cache_ptr, float *scales,
+                                   const float *src,
+                                   int p, int kvh, int n_kv_heads,
+                                   int head_dim, int kv_dim, int kv_dtype);
+
+/* qpkd K writer: K stored as [p][d][kv_h]. For one position p, write all
+ * n_kv_heads*head_dim values reordered so that element-index = d*n_kv_heads + kv_h.
+ * F32/F16/Q8: dtype-specialised. Q8 quantises per kv_h row first (so each row
+ * shares a single scale), then scatters int8s into the strided slots. */
+static inline void tf_k_write_dp_all_heads(void *cache_ptr, float *scales,
+                                           const float *src, int p,
+                                           int n_kv_heads, int head_dim,
+                                           int kv_dtype) {
+    int kv_dim = n_kv_heads * head_dim;
+    if (kv_dtype == TF_KV_DTYPE_F32) {
+        float *base = (float *)cache_ptr + (size_t)p * kv_dim;
+        for (int h = 0; h < n_kv_heads; h++) {
+            const float *s = src + (size_t)h * head_dim;
+            for (int d = 0; d < head_dim; d++) base[d * n_kv_heads + h] = s[d];
+        }
+    } else if (kv_dtype == TF_KV_DTYPE_F16) {
+        uint16_t *base = (uint16_t *)cache_ptr + (size_t)p * kv_dim;
+        for (int h = 0; h < n_kv_heads; h++) {
+            const float *s = src + (size_t)h * head_dim;
+            for (int d = 0; d < head_dim; d++) base[d * n_kv_heads + h] = tf_f32_to_f16(s[d]);
+        }
+    } else {  /* Q8 */
+        int8_t *base = (int8_t *)cache_ptr + (size_t)p * kv_dim;
+        int8_t tmp[512];  /* head_dim <= 512 in practice */
+        for (int h = 0; h < n_kv_heads; h++) {
+            float sc = tf_quantize_row_q8(tmp, src + (size_t)h * head_dim, head_dim);
+            scales[(size_t)p * n_kv_heads + h] = sc;
+            for (int d = 0; d < head_dim; d++) base[d * n_kv_heads + h] = tmp[d];
+        }
+    }
+}
+
+/* qpkd K writer, single-kv-head variant. */
+static inline void tf_k_write_dp_row(void *cache_ptr, float *scales,
+                                     const float *src, int p, int kv_h,
+                                     int n_kv_heads, int head_dim, int kv_dtype) {
+    int kv_dim = n_kv_heads * head_dim;
+    if (kv_dtype == TF_KV_DTYPE_F32) {
+        float *base = (float *)cache_ptr + (size_t)p * kv_dim;
+        for (int d = 0; d < head_dim; d++) base[d * n_kv_heads + kv_h] = src[d];
+    } else if (kv_dtype == TF_KV_DTYPE_F16) {
+        uint16_t *base = (uint16_t *)cache_ptr + (size_t)p * kv_dim;
+        for (int d = 0; d < head_dim; d++) base[d * n_kv_heads + kv_h] = tf_f32_to_f16(src[d]);
+    } else {  /* Q8 */
+        int8_t *base = (int8_t *)cache_ptr + (size_t)p * kv_dim;
+        int8_t tmp[512];
+        float sc = tf_quantize_row_q8(tmp, src, head_dim);
+        scales[(size_t)p * n_kv_heads + kv_h] = sc;
+        for (int d = 0; d < head_dim; d++) base[d * n_kv_heads + kv_h] = tmp[d];
+    }
+}
+
+/* Dispatch K-row write to the right layout-specific writer. The non-Gemma4
+ * Qwen/hybrid attention path uses this; Gemma4's own KV writer is direct
+ * memcpy into row-major K. */
+static inline void tf_k_cache_write_pos(void *cache, float *scales,
+                                        const float *src, int p,
+                                        int n_kv_heads, int head_dim,
+                                        int max_seq_len, int kv_dtype,
+                                        int transposed, int k_dp) {
+    if (transposed)
+        tf_k_write_transposed(cache, scales, src, p, n_kv_heads, head_dim,
+                              max_seq_len, kv_dtype);
+    else if (k_dp)
+        tf_k_write_dp_all_heads(cache, scales, src, p, n_kv_heads, head_dim, kv_dtype);
+    else
+        tf_kv_write_all_heads(cache, scales, src, p, n_kv_heads, head_dim, kv_dtype);
+}
+
+/* Single-kv-head K row write: writes K[kv_h][0..head_dim] at position p,
+ * choosing layout. The per-head persistent-worker path calls this. */
+static inline void tf_k_cache_write_row(void *cache, float *scales,
+                                        const float *src, int p, int kv_h,
+                                        int n_kv_heads, int head_dim,
+                                        int kv_dim, int max_seq_len,
+                                        int kv_dtype, int transposed, int k_dp) {
+    if (k_dp) {
+        tf_k_write_dp_row(cache, scales, src, p, kv_h, n_kv_heads, head_dim, kv_dtype);
+        return;
+    }
+    if (!transposed) {
+        tf_kv_write_row(cache, scales, src, p, kv_h, n_kv_heads, head_dim, kv_dim, kv_dtype);
+        return;
+    }
+    size_t stride_d = (size_t)max_seq_len;
+    size_t base = (size_t)kv_h * head_dim * stride_d;
+    if (kv_dtype == TF_KV_DTYPE_F32) {
+        float *dst = (float *)cache;
+        for (int d = 0; d < head_dim; d++) dst[base + (size_t)d * stride_d + p] = src[d];
+    } else {  /* F16 (Q8 disabled when transposed) */
+        uint16_t *dst = (uint16_t *)cache;
+        for (int d = 0; d < head_dim; d++) dst[base + (size_t)d * stride_d + p] = tf_f32_to_f16(src[d]);
+    }
+}
+
 /* Write one K (or V) head-row of head_dim floats into the layer-l KV cache at
  * position p, kv_head kvh. Quantises/converts according to kv_dtype. The Q8
  * scale lands in scales[p * n_kv_heads + kvh]. */
@@ -1799,6 +1973,307 @@ static inline void tf_kv_write_row(void *cache_ptr, float *scales,
     }
 }
 
+/* qpkd helpers: K stored [p][d][kv_h], Q packed [d][h].
+ * pack_q_heads: pack a subset of heads [h_lo, h_hi) into Q_packed[d][h]. */
+static inline void tf_qpkd_pack_q_heads(const float *q, float *q_packed,
+                                        int h_lo, int h_hi,
+                                        int n_heads, int head_dim) {
+    for (int h = h_lo; h < h_hi; h++) {
+        const float *src = q + (size_t)h * head_dim;
+        for (int d = 0; d < head_dim; d++)
+            q_packed[(size_t)d * n_heads + h] = src[d];
+    }
+}
+
+#if defined(__ARM_FEATURE_SVE)
+/* qpkd+ktbl QK kernel: process positions [p_lo, p_hi) for ALL heads.
+ * Q_packed layout [d][h], K_dp layout [p][d][kv_h]. Per p, write att[h][p]
+ * for all h in 0..n_heads via a tiny scalar fan-out. Requires svcntw()==n_heads
+ * (verified at env init). */
+static inline void tf_qpkd_qk_chunk_f32(const float *K_dp,
+                                        const float *Q_packed,
+                                        float *att,
+                                        int p_lo, int p_hi,
+                                        int n_heads, int n_kv_heads,
+                                        int head_dim, int max_seq_len,
+                                        float scale) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t vscale = svdup_f32(scale);
+    int gqa = n_heads / n_kv_heads;
+    uint32_t idx_arr[16];
+    for (int i = 0; i < n_heads; i++) idx_arr[i] = (uint32_t)(i / gqa);
+    svuint32_t idx_repl = svld1_u32(pg, idx_arr);
+    int kv_dim = n_kv_heads * head_dim;
+    float tmp[16];
+    for (int p = p_lo; p < p_hi; p++) {
+        const float *kp = K_dp + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(K_dp + (size_t)(p + 2) * kv_dim, 0, 1);
+        svfloat32_t acc = svdup_f32(0.0f);
+        for (int d = 0; d < head_dim; d++) {
+            svfloat32_t qv = svld1(pg, Q_packed + (size_t)d * n_heads);
+            svfloat32_t k4 = svld1rq_f32(pg, kp + (size_t)d * n_kv_heads);
+            svfloat32_t kx = svtbl_f32(k4, idx_repl);
+            acc = svmla_x(pg, acc, qv, kx);
+        }
+        svst1(pg, tmp, svmul_x(pg, acc, vscale));
+        for (int h = 0; h < n_heads; h++)
+            att[(size_t)h * max_seq_len + p] = tmp[h];
+    }
+}
+
+/* F16 variant: K[p][d][kv_h] stored as uint16 half-floats. Vectorized inner
+ * loop processes 4 d-iterations per K load: svld1uh_u32 brings 16 u16 values
+ * (= 4 d × 4 kv_h) into 16 u32 lanes, then svcvt_f32_f16_x converts in one
+ * shot. 4 svtbl + 4 svmla per K-load, vs the previous version's per-d scalar
+ * f16→f32 + stack tmp + svld1rq which was the documented bottleneck. */
+static inline void tf_qpkd_qk_chunk_f16(const uint16_t *K_dp,
+                                        const float *Q_packed,
+                                        float *att,
+                                        int p_lo, int p_hi,
+                                        int n_heads, int n_kv_heads,
+                                        int head_dim, int max_seq_len,
+                                        float scale) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t vscale = svdup_f32(scale);
+    int gqa = n_heads / n_kv_heads;
+    /* Per-d-in-batch (b=0..3) index: lane h pulls k_dp[d+b][h/gqa] from k16
+     * which has layout [k_d.h0..h3, k_d+1.h0..h3, k_d+2.h0..h3, k_d+3.h0..h3]. */
+    uint32_t idx_arr[64];
+    for (int b = 0; b < 4; b++)
+        for (int h = 0; h < n_heads; h++)
+            idx_arr[b * 16 + h] = (uint32_t)(b * n_kv_heads + h / gqa);
+    svuint32_t idx_d0 = svld1_u32(pg, idx_arr +  0);
+    svuint32_t idx_d1 = svld1_u32(pg, idx_arr + 16);
+    svuint32_t idx_d2 = svld1_u32(pg, idx_arr + 32);
+    svuint32_t idx_d3 = svld1_u32(pg, idx_arr + 48);
+    int kv_dim = n_kv_heads * head_dim;
+    float tmp[16];
+    for (int p = p_lo; p < p_hi; p++) {
+        const uint16_t *kp = K_dp + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(K_dp + (size_t)(p + 2) * kv_dim, 0, 1);
+        svfloat32_t acc = svdup_f32(0.0f);
+        for (int d = 0; d < head_dim; d += 4) {
+            const uint16_t *k_base = kp + (size_t)d * n_kv_heads;
+            svuint32_t  ku32 = svld1uh_u32(pg, k_base);
+            svfloat32_t k16  = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(ku32));
+            svfloat32_t q0 = svld1(pg, Q_packed + (size_t)(d + 0) * n_heads);
+            svfloat32_t q1 = svld1(pg, Q_packed + (size_t)(d + 1) * n_heads);
+            svfloat32_t q2 = svld1(pg, Q_packed + (size_t)(d + 2) * n_heads);
+            svfloat32_t q3 = svld1(pg, Q_packed + (size_t)(d + 3) * n_heads);
+            acc = svmla_x(pg, acc, q0, svtbl_f32(k16, idx_d0));
+            acc = svmla_x(pg, acc, q1, svtbl_f32(k16, idx_d1));
+            acc = svmla_x(pg, acc, q2, svtbl_f32(k16, idx_d2));
+            acc = svmla_x(pg, acc, q3, svtbl_f32(k16, idx_d3));
+        }
+        svst1(pg, tmp, svmul_x(pg, acc, vscale));
+        for (int h = 0; h < n_heads; h++)
+            att[(size_t)h * max_seq_len + p] = tmp[h];
+    }
+}
+
+/* Q8 variant: K[p][d][kv_h] stored as int8 with per-(p, kv_h) scale
+ * scales[p * n_kv_heads + kv_h]. Per p, build a per-lane scale vector
+ * once via svld1rq+svtbl (lanes that share a kv_h share a scale), then
+ * accumulate raw int8 products without per-d scale. Combined scale is
+ * applied once at the end. */
+static inline void tf_qpkd_qk_chunk_q8(const int8_t *K_dp,
+                                       const float *scales,
+                                       const float *Q_packed,
+                                       float *att,
+                                       int p_lo, int p_hi,
+                                       int n_heads, int n_kv_heads,
+                                       int head_dim, int max_seq_len,
+                                       float scale) {
+    svbool_t pg = svptrue_b32();
+    int gqa = n_heads / n_kv_heads;
+    /* Same 4-d-batch indices as F16 kernel: 16 s8 K values per load. */
+    uint32_t idx_arr[64];
+    for (int b = 0; b < 4; b++)
+        for (int h = 0; h < n_heads; h++)
+            idx_arr[b * 16 + h] = (uint32_t)(b * n_kv_heads + h / gqa);
+    svuint32_t idx_d0 = svld1_u32(pg, idx_arr +  0);
+    svuint32_t idx_d1 = svld1_u32(pg, idx_arr + 16);
+    svuint32_t idx_d2 = svld1_u32(pg, idx_arr + 32);
+    svuint32_t idx_d3 = svld1_u32(pg, idx_arr + 48);
+    /* Per-lane scale: lanes that share a kv_h share scales[p][kv_h]. The 16
+     * 4-lane groups all share the same idx_arr[0..15] pattern. */
+    uint32_t idx_repl[16];
+    for (int h = 0; h < n_heads; h++) idx_repl[h] = (uint32_t)(h / gqa);
+    svuint32_t idx_s = svld1_u32(pg, idx_repl);
+    int kv_dim = n_kv_heads * head_dim;
+    float tmp[16];
+    for (int p = p_lo; p < p_hi; p++) {
+        const int8_t *kp = K_dp + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(K_dp + (size_t)(p + 2) * kv_dim, 0, 1);
+        svfloat32_t sq = svld1rq_f32(pg, scales + (size_t)p * n_kv_heads);
+        svfloat32_t s_lane = svmul_x(pg, svtbl_f32(sq, idx_s), svdup_f32(scale));
+        svfloat32_t acc = svdup_f32(0.0f);
+        for (int d = 0; d < head_dim; d += 4) {
+            const int8_t *k_base = kp + (size_t)d * n_kv_heads;
+            svint32_t   k_s32 = svld1sb_s32(pg, k_base);
+            svfloat32_t k16   = svcvt_f32_s32_x(pg, k_s32);
+            svfloat32_t q0 = svld1(pg, Q_packed + (size_t)(d + 0) * n_heads);
+            svfloat32_t q1 = svld1(pg, Q_packed + (size_t)(d + 1) * n_heads);
+            svfloat32_t q2 = svld1(pg, Q_packed + (size_t)(d + 2) * n_heads);
+            svfloat32_t q3 = svld1(pg, Q_packed + (size_t)(d + 3) * n_heads);
+            acc = svmla_x(pg, acc, q0, svtbl_f32(k16, idx_d0));
+            acc = svmla_x(pg, acc, q1, svtbl_f32(k16, idx_d1));
+            acc = svmla_x(pg, acc, q2, svtbl_f32(k16, idx_d2));
+            acc = svmla_x(pg, acc, q3, svtbl_f32(k16, idx_d3));
+        }
+        svst1(pg, tmp, svmul_x(pg, acc, s_lane));
+        for (int h = 0; h < n_heads; h++)
+            att[(size_t)h * max_seq_len + p] = tmp[h];
+    }
+}
+
+/* AV partial accumulation over a p-range. V layout is [p][kv_h][d] (baseline).
+ * out_tmp is the caller's per-thread [n_heads * head_dim] buffer; the caller
+ * is responsible for zeroing it before the first call and for reducing
+ * across threads after the barrier.  Each thread streams its own p-slice
+ * sequentially through V — 48-way parallel instead of the per-head split
+ * that left 32 of 48 threads idle on Qwen3.5-9B. */
+static inline void tf_av_chunk_f32(const float *V, const float *att,
+                                   float *out_tmp,
+                                   int p_lo, int p_hi,
+                                   int n_heads, int n_kv_heads, int head_dim,
+                                   int max_seq_len) {
+    svbool_t pg = svptrue_b32();
+    int gqa = n_heads / n_kv_heads;
+    int kv_dim = n_kv_heads * head_dim;
+    int vl = (int)svcntw();
+    for (int p = p_lo; p < p_hi; p++) {
+        const float *vp = V + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(V + (size_t)(p + 2) * kv_dim, 0, 1);
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / gqa;
+            svfloat32_t a = svdup_f32(att[(size_t)h * max_seq_len + p]);
+            const float *v = vp + (size_t)kv_h * head_dim;
+            float *o = out_tmp + (size_t)h * head_dim;
+            int d = 0;
+            for (; d + vl - 1 < head_dim; d += vl) {
+                svfloat32_t ov = svld1(pg, o + d);
+                svfloat32_t vv = svld1(pg, v + d);
+                svst1(pg, o + d, svmla_x(pg, ov, a, vv));
+            }
+            if (d < head_dim) {
+                svbool_t pt = svwhilelt_b32(d, head_dim);
+                svfloat32_t ov = svld1(pt, o + d);
+                svfloat32_t vv = svld1(pt, v + d);
+                svst1(pt, o + d, svmla_m(pt, ov, a, vv));
+            }
+        }
+    }
+}
+
+static inline void tf_av_chunk_f16(const uint16_t *V, const float *att,
+                                   float *out_tmp,
+                                   int p_lo, int p_hi,
+                                   int n_heads, int n_kv_heads, int head_dim,
+                                   int max_seq_len) {
+    svbool_t pg = svptrue_b32();
+    int gqa = n_heads / n_kv_heads;
+    int kv_dim = n_kv_heads * head_dim;
+    int vl = (int)svcntw();
+    for (int p = p_lo; p < p_hi; p++) {
+        const uint16_t *vp = V + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(V + (size_t)(p + 2) * kv_dim, 0, 1);
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / gqa;
+            svfloat32_t a = svdup_f32(att[(size_t)h * max_seq_len + p]);
+            const uint16_t *v = vp + (size_t)kv_h * head_dim;
+            float *o = out_tmp + (size_t)h * head_dim;
+            int d = 0;
+            for (; d + vl - 1 < head_dim; d += vl) {
+                svuint32_t vu = svld1uh_u32(pg, v + d);
+                svfloat32_t vv = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(vu));
+                svfloat32_t ov = svld1(pg, o + d);
+                svst1(pg, o + d, svmla_x(pg, ov, a, vv));
+            }
+            if (d < head_dim) {
+                svbool_t pt = svwhilelt_b32(d, head_dim);
+                svuint32_t vu = svld1uh_u32(pt, v + d);
+                svfloat32_t vv = svcvt_f32_f16_x(pt, svreinterpret_f16_u32(vu));
+                svfloat32_t ov = svld1(pt, o + d);
+                svst1(pt, o + d, svmla_m(pt, ov, a, vv));
+            }
+        }
+    }
+}
+
+static inline void tf_av_chunk_q8(const int8_t *V, const float *scales,
+                                  const float *att, float *out_tmp,
+                                  int p_lo, int p_hi,
+                                  int n_heads, int n_kv_heads, int head_dim,
+                                  int max_seq_len) {
+    svbool_t pg = svptrue_b32();
+    int gqa = n_heads / n_kv_heads;
+    int kv_dim = n_kv_heads * head_dim;
+    int vl = (int)svcntw();
+    for (int p = p_lo; p < p_hi; p++) {
+        const int8_t *vp = V + (size_t)p * kv_dim;
+        if (p + 2 < p_hi)
+            __builtin_prefetch(V + (size_t)(p + 2) * kv_dim, 0, 1);
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / gqa;
+            float s = scales[(size_t)p * n_kv_heads + kv_h];
+            svfloat32_t a = svdup_f32(att[(size_t)h * max_seq_len + p] * s);
+            const int8_t *v = vp + (size_t)kv_h * head_dim;
+            float *o = out_tmp + (size_t)h * head_dim;
+            int d = 0;
+            for (; d + vl - 1 < head_dim; d += vl) {
+                svint32_t vi = svld1sb_s32(pg, v + d);
+                svfloat32_t vv = svcvt_f32_s32_x(pg, vi);
+                svfloat32_t ov = svld1(pg, o + d);
+                svst1(pg, o + d, svmla_x(pg, ov, a, vv));
+            }
+            if (d < head_dim) {
+                svbool_t pt = svwhilelt_b32(d, head_dim);
+                svint32_t vi = svld1sb_s32(pt, v + d);
+                svfloat32_t vv = svcvt_f32_s32_x(pt, vi);
+                svfloat32_t ov = svld1(pt, o + d);
+                svst1(pt, o + d, svmla_m(pt, ov, a, vv));
+            }
+        }
+    }
+}
+
+/* Reduce av_tmp across nt threads into out[head*head_dim + d_lo..d_hi].
+ * Each thread is responsible for some (h, d-slice); the caller chooses the
+ * partition so that all (h, d) are covered exactly once across the pool. */
+static inline void tf_av_reduce_slice(float *out, const float *av_tmp,
+                                      int h, int d_lo, int d_hi,
+                                      int nt, int n_heads, int head_dim) {
+    svbool_t pg = svptrue_b32();
+    int vl = (int)svcntw();
+    size_t per_thread = (size_t)n_heads * head_dim;
+    float *out_h = out + (size_t)h * head_dim;
+    int d = d_lo;
+    for (; d + vl - 1 < d_hi; d += vl) {
+        svfloat32_t acc = svdup_f32(0.0f);
+        for (int t = 0; t < nt; t++) {
+            const float *src = av_tmp + (size_t)t * per_thread + (size_t)h * head_dim + d;
+            acc = svadd_x(pg, acc, svld1(pg, src));
+        }
+        svst1(pg, out_h + d, acc);
+    }
+    if (d < d_hi) {
+        svbool_t pt = svwhilelt_b32(d, d_hi);
+        svfloat32_t acc = svdup_f32(0.0f);
+        for (int t = 0; t < nt; t++) {
+            const float *src = av_tmp + (size_t)t * per_thread + (size_t)h * head_dim + d;
+            acc = svadd_m(pt, acc, svld1(pt, src));
+        }
+        svst1(pt, out_h + d, acc);
+    }
+}
+#endif
+
 /* Multi-head attention worker for threading.
  * key_cache/value_cache stride is kv_dim * elem_bytes; element type matches
  * kv_dtype (4B F32, 2B F16, 1B int8 with per-(pos, kv_head) scale). For Q8,
@@ -1815,6 +2290,10 @@ typedef struct {
     int head_dim, kv_dim, gqa_ratio, seq_len, max_seq_len;
     int n_kv_heads;          /* needed to index per-(pos, kv_h) scales */
     int kv_dtype;            /* TF_KV_DTYPE_F32 / F16 / Q8 */
+    int k_transposed;        /* 1 = K stored [kv_h][d][p] (FMLA-into-att path) */
+    int k_dp;                /* 1 = K stored [p][d][kv_h] (qpkd+ktbl) */
+    int skip_qk;             /* 1 = att already filled by a pre-pass; jump to softmax */
+    int skip_av;             /* 1 = xb2 already filled by parallel AV reduction; no V loop */
     float scale;
 } tf_attn_task;
 
@@ -1973,7 +2452,95 @@ static void *tf_attn_worker(void *arg) {
             int nkv = t->n_kv_heads;
 
             /* ===== QK scores ===== */
-            if (t->kv_dtype == TF_KV_DTYPE_F32) {
+            if (t->k_transposed) {
+                /* K stored as [kv_h][d][p] with stride_d=max_seq_len across p.
+                 * Outer block over positions, inner FMLA over d — accumulator
+                 * is a vector of vl positions, no svaddv per position. */
+                int vl = (int)svcntw();
+                size_t stride_d = (size_t)t->max_seq_len;
+                size_t stride_h = (size_t)t->head_dim * stride_d;
+                svfloat32_t vscale = svdup_f32(t->scale);
+                if (t->kv_dtype == TF_KV_DTYPE_F32) {
+                    const float *K_h = (const float *)t->key_cache + (size_t)kv_h * stride_h;
+                    for (int p = 0; p < seq_len; p += vl) {
+                        svbool_t pp = svwhilelt_b32(p, seq_len);
+                        svfloat32_t acc = svdup_f32(0.0f);
+                        for (int d = 0; d < hd; d++) {
+                            svfloat32_t qv = svdup_f32(q_h[d]);
+                            svfloat32_t kv = svld1(pp, K_h + (size_t)d * stride_d + p);
+                            acc = svmla_x(pp, acc, qv, kv);
+                        }
+                        svst1(pp, att_h + p, svmul_x(pp, acc, vscale));
+                    }
+                } else {  /* F16 (Q8 disabled via load-time check) */
+                    const uint16_t *K_h = (const uint16_t *)t->key_cache + (size_t)kv_h * stride_h;
+                    for (int p = 0; p < seq_len; p += vl) {
+                        svbool_t pp = svwhilelt_b32(p, seq_len);
+                        svfloat32_t acc = svdup_f32(0.0f);
+                        for (int d = 0; d < hd; d++) {
+                            svfloat32_t qv = svdup_f32(q_h[d]);
+                            svuint32_t ku = svld1uh_u32(pp, K_h + (size_t)d * stride_d + p);
+                            svfloat32_t kv = svcvt_f32_f16_x(pp, svreinterpret_f16_u32(ku));
+                            acc = svmla_x(pp, acc, qv, kv);
+                        }
+                        svst1(pp, att_h + p, svmul_x(pp, acc, vscale));
+                    }
+                }
+            } else if (t->skip_qk) {
+                /* QK already filled by qpkd+ktbl pre-pass (any dtype). */
+            } else if (t->k_dp && t->kv_dtype == TF_KV_DTYPE_F32) {
+                /* K stored [p][d][kv_h]: per-head gather fallback (correctness;
+                 * the persistent-worker hot path uses tf_qpkd_qk_chunk_f32 in
+                 * a pre-pass and sets skip_qk instead). */
+                const float *kc_f32 = (const float *)t->key_cache;
+                svuint32_t idx_d = svindex_u32(0, (uint32_t)t->n_kv_heads);
+                for (int p = 0; p < seq_len; p++) {
+                    const float *kp_base = kc_f32 + (size_t)p * t->kv_dim + kv_h;
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(kc_f32 + (size_t)(p+2) * t->kv_dim + kv_h, 0, 1);
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    int d = 0;
+                    int vl = (int)svcntw();
+                    for (; d + vl - 1 < hd; d += vl) {
+                        svfloat32_t qv = svld1(pg, q_h + d);
+                        svfloat32_t kv = svld1_gather_u32index_f32(pg, kp_base + (size_t)d * t->n_kv_heads, idx_d);
+                        acc = svmla_x(pg, acc, qv, kv);
+                    }
+                    if (d < hd) {
+                        svbool_t ptail = svwhilelt_b32(d, hd);
+                        svfloat32_t qv = svld1(ptail, q_h + d);
+                        svfloat32_t kv = svld1_gather_u32index_f32(ptail, kp_base + (size_t)d * t->n_kv_heads, idx_d);
+                        acc = svmla_m(ptail, acc, qv, kv);
+                    }
+                    att_h[p] = svaddv(pg, acc) * t->scale;
+                }
+            } else if (t->k_dp && t->kv_dtype == TF_KV_DTYPE_F16) {
+                /* K [p][d][kv_h] F16: scalar gather over d, convert + accumulate.
+                 * Correctness fallback; hot path uses tf_qpkd_qk_chunk_f16. */
+                const uint16_t *kc_u16 = (const uint16_t *)t->key_cache;
+                for (int p = 0; p < seq_len; p++) {
+                    const uint16_t *kp_base = kc_u16 + (size_t)p * t->kv_dim + kv_h;
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(kc_u16 + (size_t)(p+2) * t->kv_dim + kv_h, 0, 1);
+                    float score = 0.0f;
+                    for (int d = 0; d < hd; d++)
+                        score += q_h[d] * tf_f16_to_f32(kp_base[(size_t)d * t->n_kv_heads]);
+                    att_h[p] = score * t->scale;
+                }
+            } else if (t->k_dp) {  /* Q8 */
+                const int8_t *kc_i8 = (const int8_t *)t->key_cache;
+                const float *ks = t->key_scales;
+                for (int p = 0; p < seq_len; p++) {
+                    const int8_t *kp_base = kc_i8 + (size_t)p * t->kv_dim + kv_h;
+                    if (p + 2 < seq_len)
+                        __builtin_prefetch(kc_i8 + (size_t)(p+2) * t->kv_dim + kv_h, 0, 1);
+                    float s = ks[(size_t)p * nkv + kv_h];
+                    float score = 0.0f;
+                    for (int d = 0; d < hd; d++)
+                        score += q_h[d] * (float)kp_base[(size_t)d * t->n_kv_heads];
+                    att_h[p] = score * t->scale * s;
+                }
+            } else if (t->kv_dtype == TF_KV_DTYPE_F32) {
                 for (int p = 0; p < seq_len; p++) {
                     const float *k_p = (const float *)(kc8 + (size_t)p * row_stride + head_off);
                     if (p + 2 < seq_len)
@@ -2031,6 +2598,9 @@ static void *tf_attn_worker(void *arg) {
                     att_h[p] = svaddv(pg, acc) * t->scale * s;
                 }
             }
+
+            /* skip_av: softmax + V already done by parallel pre-pass; xb2 is filled. */
+            if (t->skip_av) continue;
 
             tf_softmax(att_h, seq_len);
             float *out_h = t->xb2 + h * hd;
@@ -2139,6 +2709,370 @@ static void *tf_attn_worker(void *arg) {
 #endif
     }
     return NULL;
+}
+
+/* ── Flash-attention (position-parallel, online-softmax) ────────────────
+ * Splits each query head's [0, seq_len) over multiple threads. Each
+ * (head, chunk) tile runs the FA-2 inner loop (fused QK + online softmax
+ * + Att·V in one pass) producing partial accumulators (m_local, l_local,
+ * out_local). A reduce phase merges chunks per head into final out.
+ *
+ * Win on A64FX: when nt > n_heads (e.g. 48 threads / 16 query heads), the
+ * old per-head dispatch only uses n_heads workers; FA uses all nt. */
+
+typedef struct {
+    const float *q;              /* full Q buffer [n_heads * head_dim] */
+    const void  *key_cache;
+    const void  *value_cache;
+    const float *key_scales;     /* NULL unless Q8 */
+    const float *value_scales;   /* NULL unless Q8 */
+    int head;                    /* query-head index */
+    int chunk_start, chunk_end;  /* position range, half-open */
+    int head_dim, kv_dim, gqa_ratio;
+    int n_kv_heads, kv_dtype;
+    float scale;                 /* 1 / sqrt(head_dim) */
+    /* outputs */
+    float *m_local;              /* &m[head * n_chunks + chunk_idx] */
+    float *l_local;              /* &l[head * n_chunks + chunk_idx] */
+    float *out_local;            /* [head_dim] */
+} tf_fa_chunk_task;
+
+static void *tf_fa_chunk_worker(void *arg) {
+    tf_fa_chunk_task *t = (tf_fa_chunk_task *)arg;
+    int hd  = t->head_dim;
+    int p0  = t->chunk_start;
+    int p1  = t->chunk_end;
+    int kv_h = t->head / t->gqa_ratio;
+    const float *q_h = t->q + (size_t)t->head * hd;
+    size_t kv_eb = (t->kv_dtype == TF_KV_DTYPE_F32) ? 4 :
+                   (t->kv_dtype == TF_KV_DTYPE_F16) ? 2 : 1;
+    const uint8_t *kc8 = (const uint8_t *)t->key_cache;
+    const uint8_t *vc8 = (const uint8_t *)t->value_cache;
+    size_t row_stride = (size_t)t->kv_dim * kv_eb;
+    size_t head_off   = (size_t)kv_h * hd * kv_eb;
+    int nkv = t->n_kv_heads;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    /* out_local accumulator on stack (max head_dim assumed ≤ 512). */
+    float out_local[512];
+    if (hd > 512) { /* would corrupt stack; bail safely */
+        *t->m_local = -INFINITY; *t->l_local = 0.0f;
+        for (int d = 0; d < hd; d++) t->out_local[d] = 0.0f;
+        return NULL;
+    }
+    for (int d = 0; d < hd; d++) out_local[d] = 0.0f;
+
+    if (p0 >= p1) {
+        /* Empty chunk: write identity (does not contribute to reduce). */
+        *t->m_local = -INFINITY;
+        *t->l_local = 0.0f;
+        for (int d = 0; d < hd; d++) t->out_local[d] = 0.0f;
+        return NULL;
+    }
+
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b32();
+    int vl = (int)svcntw();
+
+    for (int p = p0; p < p1; p++) {
+        /* ── QK score ── */
+        float score;
+        if (t->kv_dtype == TF_KV_DTYPE_F32) {
+            const float *k_p = (const float *)(kc8 + (size_t)p * row_stride + head_off);
+            if (p + 2 < p1)
+                __builtin_prefetch(kc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+            svfloat32_t acc = svdup_f32(0.0f);
+            int d = 0;
+            for (; d + vl - 1 < hd; d += vl)
+                acc = svmla_x(pg, acc, svld1(pg, q_h + d), svld1(pg, k_p + d));
+            if (d < hd) {
+                svbool_t ptail = svwhilelt_b32(d, hd);
+                acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), svld1(ptail, k_p + d));
+            }
+            score = svaddv(pg, acc) * t->scale;
+        } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+            const uint16_t *k_p = (const uint16_t *)(kc8 + (size_t)p * row_stride + head_off);
+            if (p + 2 < p1)
+                __builtin_prefetch(kc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+            svfloat32_t acc = svdup_f32(0.0f);
+            int d = 0;
+            for (; d + vl - 1 < hd; d += vl) {
+                svuint32_t ku = svld1uh_u32(pg, k_p + d);
+                svfloat32_t kf = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(ku));
+                acc = svmla_x(pg, acc, svld1(pg, q_h + d), kf);
+            }
+            if (d < hd) {
+                svbool_t ptail = svwhilelt_b32(d, hd);
+                svuint32_t ku = svld1uh_u32(ptail, k_p + d);
+                svfloat32_t kf = svcvt_f32_f16_x(ptail, svreinterpret_f16_u32(ku));
+                acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), kf);
+            }
+            score = svaddv(pg, acc) * t->scale;
+        } else {  /* Q8 */
+            const int8_t *k_p = (const int8_t *)(kc8 + (size_t)p * row_stride + head_off);
+            if (p + 2 < p1)
+                __builtin_prefetch(kc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+            float ks = t->key_scales[(size_t)p * nkv + kv_h];
+            svfloat32_t acc = svdup_f32(0.0f);
+            int d = 0;
+            for (; d + vl - 1 < hd; d += vl) {
+                svint32_t ki = svld1sb_s32(pg, k_p + d);
+                svfloat32_t kf = svcvt_f32_s32_x(pg, ki);
+                acc = svmla_x(pg, acc, svld1(pg, q_h + d), kf);
+            }
+            if (d < hd) {
+                svbool_t ptail = svwhilelt_b32(d, hd);
+                svint32_t ki = svld1sb_s32(ptail, k_p + d);
+                svfloat32_t kf = svcvt_f32_s32_x(ptail, ki);
+                acc = svmla_m(ptail, acc, svld1(ptail, q_h + d), kf);
+            }
+            score = svaddv(pg, acc) * t->scale * ks;
+        }
+
+        /* ── Online softmax update ── */
+        float m_new = (score > m_i) ? score : m_i;
+        float alpha = (m_i == -INFINITY) ? 0.0f : expf(m_i - m_new);
+        float beta  = expf(score - m_new);
+        l_i = alpha * l_i + beta;
+        m_i = m_new;
+
+        /* ── out *= alpha + beta * v_p ── */
+        svfloat32_t va_alpha = svdup_f32(alpha);
+        svfloat32_t va_beta  = svdup_f32(beta);
+
+        if (t->kv_dtype == TF_KV_DTYPE_F32) {
+            const float *v_p = (const float *)(vc8 + (size_t)p * row_stride + head_off);
+            if (p + 2 < p1)
+                __builtin_prefetch(vc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+            int d = 0;
+            for (; d + vl - 1 < hd; d += vl) {
+                svfloat32_t o = svld1(pg, out_local + d);
+                svfloat32_t v = svld1(pg, v_p + d);
+                o = svmul_x(pg, o, va_alpha);
+                o = svmla_x(pg, o, v, va_beta);
+                svst1(pg, out_local + d, o);
+            }
+            if (d < hd) {
+                svbool_t ptail = svwhilelt_b32(d, hd);
+                svfloat32_t o = svld1(ptail, out_local + d);
+                svfloat32_t v = svld1(ptail, v_p + d);
+                o = svmul_m(ptail, o, va_alpha);
+                o = svmla_m(ptail, o, v, va_beta);
+                svst1(ptail, out_local + d, o);
+            }
+        } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+            const uint16_t *v_p = (const uint16_t *)(vc8 + (size_t)p * row_stride + head_off);
+            if (p + 2 < p1)
+                __builtin_prefetch(vc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+            int d = 0;
+            for (; d + vl - 1 < hd; d += vl) {
+                svfloat32_t o = svld1(pg, out_local + d);
+                svuint32_t vu = svld1uh_u32(pg, v_p + d);
+                svfloat32_t v = svcvt_f32_f16_x(pg, svreinterpret_f16_u32(vu));
+                o = svmul_x(pg, o, va_alpha);
+                o = svmla_x(pg, o, v, va_beta);
+                svst1(pg, out_local + d, o);
+            }
+            if (d < hd) {
+                svbool_t ptail = svwhilelt_b32(d, hd);
+                svfloat32_t o = svld1(ptail, out_local + d);
+                svuint32_t vu = svld1uh_u32(ptail, v_p + d);
+                svfloat32_t v = svcvt_f32_f16_x(ptail, svreinterpret_f16_u32(vu));
+                o = svmul_m(ptail, o, va_alpha);
+                o = svmla_m(ptail, o, v, va_beta);
+                svst1(ptail, out_local + d, o);
+            }
+        } else {  /* Q8 */
+            const int8_t *v_p = (const int8_t *)(vc8 + (size_t)p * row_stride + head_off);
+            if (p + 2 < p1)
+                __builtin_prefetch(vc8 + (size_t)(p+2) * row_stride + head_off, 0, 1);
+            float vs = t->value_scales[(size_t)p * nkv + kv_h];
+            svfloat32_t va_beta_vs = svdup_f32(beta * vs);
+            int d = 0;
+            for (; d + vl - 1 < hd; d += vl) {
+                svfloat32_t o = svld1(pg, out_local + d);
+                svint32_t vi = svld1sb_s32(pg, v_p + d);
+                svfloat32_t v = svcvt_f32_s32_x(pg, vi);
+                o = svmul_x(pg, o, va_alpha);
+                o = svmla_x(pg, o, v, va_beta_vs);
+                svst1(pg, out_local + d, o);
+            }
+            if (d < hd) {
+                svbool_t ptail = svwhilelt_b32(d, hd);
+                svfloat32_t o = svld1(ptail, out_local + d);
+                svint32_t vi = svld1sb_s32(ptail, v_p + d);
+                svfloat32_t v = svcvt_f32_s32_x(ptail, vi);
+                o = svmul_m(ptail, o, va_alpha);
+                o = svmla_m(ptail, o, v, va_beta_vs);
+                svst1(ptail, out_local + d, o);
+            }
+        }
+    }
+#else
+    /* Scalar fallback — same algorithm, no SIMD. */
+    for (int p = p0; p < p1; p++) {
+        float score = 0.0f;
+        if (t->kv_dtype == TF_KV_DTYPE_F32) {
+            const float *k_p = (const float *)(kc8 + (size_t)p * row_stride + head_off);
+            for (int d = 0; d < hd; d++) score += q_h[d] * k_p[d];
+            score *= t->scale;
+        } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+            const uint16_t *k_p = (const uint16_t *)(kc8 + (size_t)p * row_stride + head_off);
+            for (int d = 0; d < hd; d++) score += q_h[d] * tf_f16_to_f32(k_p[d]);
+            score *= t->scale;
+        } else {
+            const int8_t *k_p = (const int8_t *)(kc8 + (size_t)p * row_stride + head_off);
+            float ks = t->key_scales[(size_t)p * nkv + kv_h];
+            for (int d = 0; d < hd; d++) score += q_h[d] * (float)k_p[d];
+            score *= t->scale * ks;
+        }
+        float m_new = (score > m_i) ? score : m_i;
+        float alpha = (m_i == -INFINITY) ? 0.0f : expf(m_i - m_new);
+        float beta  = expf(score - m_new);
+        l_i = alpha * l_i + beta;
+        m_i = m_new;
+        if (t->kv_dtype == TF_KV_DTYPE_F32) {
+            const float *v_p = (const float *)(vc8 + (size_t)p * row_stride + head_off);
+            for (int d = 0; d < hd; d++) out_local[d] = alpha * out_local[d] + beta * v_p[d];
+        } else if (t->kv_dtype == TF_KV_DTYPE_F16) {
+            const uint16_t *v_p = (const uint16_t *)(vc8 + (size_t)p * row_stride + head_off);
+            for (int d = 0; d < hd; d++) out_local[d] = alpha * out_local[d] + beta * tf_f16_to_f32(v_p[d]);
+        } else {
+            const int8_t *v_p = (const int8_t *)(vc8 + (size_t)p * row_stride + head_off);
+            float vs = t->value_scales[(size_t)p * nkv + kv_h];
+            float bvs = beta * vs;
+            for (int d = 0; d < hd; d++) out_local[d] = alpha * out_local[d] + bvs * (float)v_p[d];
+        }
+    }
+#endif
+
+    *t->m_local = m_i;
+    *t->l_local = l_i;
+    for (int d = 0; d < hd; d++) t->out_local[d] = out_local[d];
+    return NULL;
+}
+
+typedef struct {
+    float *xb2_out;              /* &xb2[head * head_dim] */
+    const float *m_partial;      /* [n_chunks] */
+    const float *l_partial;      /* [n_chunks] */
+    const float *out_partial;    /* [n_chunks][head_dim] */
+    int head_dim, n_chunks;
+} tf_fa_reduce_task;
+
+static void *tf_fa_reduce_worker(void *arg) {
+    tf_fa_reduce_task *t = (tf_fa_reduce_task *)arg;
+    int hd = t->head_dim;
+    int nc = t->n_chunks;
+    if (hd <= 0 || nc <= 0) return NULL;
+
+    /* Global max over non-empty chunks. */
+    float m_g = -INFINITY;
+    for (int c = 0; c < nc; c++)
+        if (t->m_partial[c] > m_g) m_g = t->m_partial[c];
+
+    /* Merge partials. */
+    float out_g[512];
+    for (int d = 0; d < hd; d++) out_g[d] = 0.0f;
+    float l_g = 0.0f;
+    for (int c = 0; c < nc; c++) {
+        if (t->m_partial[c] == -INFINITY) continue;
+        float w = expf(t->m_partial[c] - m_g);
+        l_g += w * t->l_partial[c];
+        const float *oc = t->out_partial + (size_t)c * hd;
+        for (int d = 0; d < hd; d++) out_g[d] += w * oc[d];
+    }
+
+    float inv_l = (l_g > 0.0f) ? 1.0f / l_g : 0.0f;
+    for (int d = 0; d < hd; d++) t->xb2_out[d] = out_g[d] * inv_l;
+    return NULL;
+}
+
+/* Dispatch position-parallel flash-attention.
+ * Computes n_heads × n_chunks chunk tasks (one task per pool thread when
+ * n_heads*n_chunks ≤ nt, padding empty tasks), then n_heads reduce tasks.
+ * Writes into m->xb2. Caller must have written K/V at `position`. */
+static inline void tf_attention_fa(transformer_model *m, int layer,
+                                   int n_heads, int n_kv_heads, int head_dim,
+                                   int kv_dim, int gqa_ratio,
+                                   int seq_len, float scale) {
+    int nt = m->n_threads;
+    int n_chunks = (n_heads > 0 && nt > n_heads) ? (nt / n_heads) : 1;
+    if (n_chunks > TF_MAX_FA_CHUNKS) n_chunks = TF_MAX_FA_CHUNKS;
+    /* Don't over-chunk a tiny seq: at least 8 positions per chunk. */
+    while (n_chunks > 1 && seq_len / n_chunks < 8) n_chunks--;
+
+    /* Phase 1: chunk workers. */
+    int n_chunk_tasks = n_heads * n_chunks;
+    int n_dispatch    = (n_chunk_tasks > nt) ? nt : n_chunk_tasks;
+    /* We pad up to nt with empty tasks so pool_dispatch always sees nt slots. */
+    tf_fa_chunk_task *ctasks = (tf_fa_chunk_task *)alloca((size_t)nt * sizeof(tf_fa_chunk_task));
+    int idx = 0;
+    for (int h = 0; h < n_heads; h++) {
+        int chunk_size = (seq_len + n_chunks - 1) / n_chunks;
+        for (int c = 0; c < n_chunks; c++) {
+            int p0 = c * chunk_size;
+            int p1 = p0 + chunk_size;
+            if (p1 > seq_len) p1 = seq_len;
+            if (idx >= nt) break;
+            ctasks[idx] = (tf_fa_chunk_task){
+                .q = m->q,
+                .key_cache   = m->key_cache[layer],
+                .value_cache = m->value_cache[layer],
+                .key_scales   = m->key_scales   ? m->key_scales[layer]   : NULL,
+                .value_scales = m->value_scales ? m->value_scales[layer] : NULL,
+                .head = h,
+                .chunk_start = p0, .chunk_end = p1,
+                .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                .scale = scale,
+                .m_local   = &m->fa_m[(size_t)h * n_chunks + c],
+                .l_local   = &m->fa_l[(size_t)h * n_chunks + c],
+                .out_local = &m->fa_out[((size_t)h * n_chunks + c) * head_dim],
+            };
+            idx++;
+        }
+        if (idx >= nt) break;
+    }
+    /* Pad remaining task slots with empties so pool sees nt work items. */
+    for (int t = idx; t < nt; t++) {
+        ctasks[t] = (tf_fa_chunk_task){
+            .q = m->q,
+            .key_cache = m->key_cache[layer], .value_cache = m->value_cache[layer],
+            .head = 0, .chunk_start = 0, .chunk_end = 0,
+            .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+            .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype, .scale = scale,
+            .m_local = &m->fa_m[0], .l_local = &m->fa_l[0], .out_local = &m->fa_out[0],
+        };
+    }
+    /* Handle n_chunk_tasks > nt by serializing extras after dispatch — for
+     * the cases we care about (16 heads × 3 chunks on 48 threads) this
+     * branch is never taken. Guard with an assert-like fallback. */
+    (void)n_dispatch;
+    tf_pool_dispatch(m, tf_fa_chunk_worker, ctasks, sizeof(tf_fa_chunk_task));
+
+    /* Phase 2: per-head reduce. n_heads ≤ nt → one head per thread, rest idle. */
+    tf_fa_reduce_task *rtasks = (tf_fa_reduce_task *)alloca((size_t)nt * sizeof(tf_fa_reduce_task));
+    for (int t = 0; t < nt; t++) {
+        if (t < n_heads) {
+            rtasks[t] = (tf_fa_reduce_task){
+                .xb2_out    = m->xb2 + (size_t)t * head_dim,
+                .m_partial  = &m->fa_m[(size_t)t * n_chunks],
+                .l_partial  = &m->fa_l[(size_t)t * n_chunks],
+                .out_partial= &m->fa_out[(size_t)t * n_chunks * head_dim],
+                .head_dim = head_dim, .n_chunks = n_chunks,
+            };
+        } else {
+            rtasks[t] = (tf_fa_reduce_task){
+                .xb2_out = NULL,
+                .m_partial = NULL, .l_partial = NULL, .out_partial = NULL,
+                .head_dim = 0, .n_chunks = 0,
+            };
+        }
+    }
+    tf_pool_dispatch(m, tf_fa_reduce_worker, rtasks, sizeof(tf_fa_reduce_task));
 }
 
 #if defined(__AVX2__) && defined(__FMA__)
@@ -2635,12 +3569,13 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
      * transformer_set_threads() so the panels can be first-touched per-CMG. */
 
     /* Allocate KV cache. Element format is selected by TF_KV_DTYPE env var:
-     *   f32 (default) — 4 B/element, fastest read path
-     *   f16           — 2 B/element, SVE FCVT on the fly
+     *   f16 (default) — 2 B/element, SVE FCVT on the fly, best end-to-end at
+     *                   long context when paired with K_DP (qpkd+ktbl QK)
+     *   f32           — 4 B/element, baseline read path
      *   q8            — 1 B/element + 4 B scale per (pos, kv_head)
      * Halves/quarters the per-token attention KV read bandwidth. */
-    m->kv_dtype = TF_KV_DTYPE_F32;
-    m->kv_elem_bytes = sizeof(float);
+    m->kv_dtype = TF_KV_DTYPE_F16;
+    m->kv_elem_bytes = 2;
     {
         const char *e = getenv("TF_KV_DTYPE");
         if (e) {
@@ -2655,6 +3590,52 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             fprintf(stderr, "transformer: TF_KV_DTYPE=%s ignored on Gemma4 (forcing f32)\n", e ? e : "");
             m->kv_dtype = TF_KV_DTYPE_F32;
             m->kv_elem_bytes = 4;
+        }
+    }
+    /* Transposed K cache: K[kv_h][d][p] instead of [p][kv_h][d]. Lets the QK
+     * kernel run as outer-d / inner-p FMLA into att[], NO svaddv per position.
+     * Opt-in for safety. Gemma4 (SWA+shared) and Q8 (per-pos scale stride)
+     * are not supported yet. */
+    m->kv_k_transposed = 0;
+    if (getenv("TF_KV_K_T")) {
+        if (m->is_gemma4)
+            fprintf(stderr, "transformer: TF_KV_K_T ignored on Gemma4\n");
+        else if (m->kv_dtype == TF_KV_DTYPE_Q8)
+            fprintf(stderr, "transformer: TF_KV_K_T ignored for Q8 KV (not yet wired)\n");
+        else {
+            m->kv_k_transposed = 1;
+            fprintf(stderr, "transformer: K cache transposed layout [kv_h][d][p]\n");
+        }
+    }
+    /* qpkd+ktbl layout: K stored as [p][d][kv_h]. Q packed [d][h] per call.
+     * QK kernel uses svld1rq (4 K floats broadcast across SVE quadwords) +
+     * svtbl (permute lanes to per-head) + svmla into a 16-lane accumulator,
+     * eliminating per-position svaddv with no data replication. Requires
+     * n_heads == SVE float width (16 on A64FX). F16/F32/Q8 KV all supported.
+     * Default: ON whenever eligible — opt out with TF_KV_K_DP=0. */
+    m->kv_k_dp = 0;
+    m->q_packed = NULL;
+    m->av_tmp = NULL;
+    {
+        const char *kdp_env = getenv("TF_KV_K_DP");
+        int kdp_want = 1;  /* default ON */
+        if (kdp_env && (kdp_env[0] == '0' || !strcmp(kdp_env, "off") || !strcmp(kdp_env, "no")))
+            kdp_want = 0;
+        if (kdp_want) {
+            if (m->is_gemma4) {
+                if (kdp_env) fprintf(stderr, "transformer: TF_KV_K_DP ignored on Gemma4\n");
+            } else if (m->kv_k_transposed) {
+                if (kdp_env) fprintf(stderr, "transformer: TF_KV_K_DP ignored (TF_KV_K_T already enabled)\n");
+            } else if (m->n_heads != 16) {
+                if (kdp_env) fprintf(stderr, "transformer: TF_KV_K_DP ignored (n_heads=%d, kernel requires 16)\n", m->n_heads);
+            } else if (m->n_heads % m->n_kv_heads != 0) {
+                if (kdp_env) fprintf(stderr, "transformer: TF_KV_K_DP ignored (n_heads %% n_kv_heads != 0)\n");
+            } else {
+                m->kv_k_dp = 1;
+                const char *dtype_name = (m->kv_dtype == TF_KV_DTYPE_F32) ? "f32" :
+                                         (m->kv_dtype == TF_KV_DTYPE_F16) ? "f16" : "q8";
+                fprintf(stderr, "transformer: K cache qpkd+ktbl layout [p][d][kv_h] (%s)\n", dtype_name);
+            }
         }
     }
     int kv_dim = m->n_kv_heads * m->head_dim;
@@ -2796,6 +3777,17 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->k         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
     m->v         = (float *)tf_aligned_calloc(256, kv_dim, sizeof(float));
     m->att       = (float *)tf_aligned_calloc(256, m->n_heads * max_seq_len, sizeof(float));
+    if (m->kv_k_dp) {
+        m->q_packed = (float *)tf_aligned_calloc(256, (size_t)m->head_dim * m->n_heads, sizeof(float));
+        m->av_tmp = (float *)tf_aligned_calloc(256,
+            (size_t)m->n_threads * m->n_heads * m->head_dim, sizeof(float));
+    }
+    {
+        size_t fa_tiles = (size_t)m->n_heads * TF_MAX_FA_CHUNKS;
+        m->fa_m   = (float *)tf_aligned_calloc(256, fa_tiles, sizeof(float));
+        m->fa_l   = (float *)tf_aligned_calloc(256, fa_tiles, sizeof(float));
+        m->fa_out = (float *)tf_aligned_calloc(256, fa_tiles * m->head_dim, sizeof(float));
+    }
     m->ffn_buf1  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
     m->ffn_buf2  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
     m->ffn_buf3  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
@@ -2924,6 +3916,9 @@ void transformer_free(transformer_model *model) {
     free(model->k);
     free(model->v);
     free(model->att);
+    free(model->fa_m);
+    free(model->fa_l);
+    free(model->fa_out);
     free(model->ffn_buf1);
     free(model->ffn_buf2);
     free(model->ffn_buf3);
@@ -3196,6 +4191,12 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     int max_ff = tf_compute_max_ff(model);
     int max_dim = model->n_embd > max_ff ? model->n_embd : max_ff;
     model->n_threads = n_threads;
+    /* AV-parallel scratch sized by n_threads: reallocate if pool grew. */
+    if (model->kv_k_dp) {
+        if (model->av_tmp) free(model->av_tmp);
+        model->av_tmp = (float *)tf_aligned_calloc(256,
+            (size_t)n_threads * model->n_heads * model->head_dim, sizeof(float));
+    }
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
     model->thread_tmp[0] = model->matvec_tmp;
     for (int t = 1; t < n_threads; t++) {
@@ -4217,6 +5218,8 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
 
 /* Forward decls (definitions live in the persistent-worker block below). */
 static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt);
+static inline void tf_sw_hier_barrier(transformer_model *m, int tid, int *local_sense,
+                                      int nt, int n_cmgs);
 static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
                               int n_rows, int tid, int nt);
 
@@ -4499,6 +5502,61 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
     *local_sense = my_sense;
 }
 
+/* Software two-level (hierarchical) barrier: per-CMG count on its own cacheline,
+ * then inter-CMG count among leaders. Cuts the cross-CMG atomic contention that
+ * plagues the flat tf_spin_barrier when nt is 48 split across 4 CMGs. Uses
+ * WFE/SEV on aarch64 so cores park in low-power until the release SEV. */
+static inline void tf_sw_hier_barrier(transformer_model *m, int tid, int *local_sense,
+                                      int nt, int n_cmgs) {
+    if (n_cmgs <= 1 || nt < n_cmgs * 2 || (nt % n_cmgs) != 0) {
+        /* Fall back: degenerate (1 thread/CMG) or uneven partition. */
+        tf_spin_barrier(m, local_sense, nt);
+        return;
+    }
+    int tpc = nt / n_cmgs;
+    int cmg = tid / tpc;
+    int slot = cmg * 16;  /* 16 ints = 64B = own cacheline per CMG */
+    int my_sense = !(*local_sense);
+
+    if (__sync_add_and_fetch((int *)&m->hb_cmg_count[slot], 1) == tpc) {
+        /* CMG leader: reset local count, participate in global sync. */
+        m->hb_cmg_count[slot] = 0;
+        if (__sync_add_and_fetch((int *)&m->hb_g_count, 1) == n_cmgs) {
+            m->hb_g_count = 0;
+            __sync_synchronize();
+            m->hb_g_sense = my_sense;
+#if defined(__aarch64__)
+            __asm__ __volatile__("sev");
+#endif
+        } else {
+#if defined(__aarch64__)
+            __asm__ __volatile__("sevl");
+            do {
+                __asm__ __volatile__("wfe");
+            } while (m->hb_g_sense != my_sense);
+#else
+            while (m->hb_g_sense != my_sense) tf_cpu_pause();
+#endif
+        }
+        /* Release the rest of this CMG. */
+        __sync_synchronize();
+        m->hb_cmg_sense[slot] = my_sense;
+#if defined(__aarch64__)
+        __asm__ __volatile__("sev");
+#endif
+    } else {
+#if defined(__aarch64__)
+        __asm__ __volatile__("sevl");
+        do {
+            __asm__ __volatile__("wfe");
+        } while (m->hb_cmg_sense[slot] != my_sense);
+#else
+        while (m->hb_cmg_sense[slot] != my_sense) tf_cpu_pause();
+#endif
+    }
+    *local_sense = my_sense;
+}
+
 /* Two-level barrier for multi-CMG:
  * Level 1: Hardware barrier within each CMG (cores on same CMG sync via W0)
  * Level 2: Software atomic barrier across CMG leaders
@@ -4598,6 +5656,16 @@ static void *tf_persistent_worker(void *arg) {
     transformer_model *m = ctx->m;
     int tid = ctx->tid;
     int nt = m->n_threads;
+    /* Persistent-worker barrier macro: swaps in the SW hierarchical barrier
+     * when CMG pinning is active. Falls back to flat tf_spin_barrier when
+     * the partition is degenerate (handled inside tf_sw_hier_barrier). */
+    /* NOTE: SW hierarchical barrier (tf_sw_hier_barrier) was tried here but
+     * regressed prefill ~1.85× at 14K context on Qwen3.5-9B (463s → 856s).
+     * The two extra SEV/WFE round-trips on the critical path (intra-CMG +
+     * inter-CMG release) outweigh the reduced cacheline contention on the
+     * flat barrier's single count atomic. Keep the flat barrier here. */
+    (void)0;
+    #define PW_BARRIER() tf_spin_barrier(m, &local_sense, nt)
 #ifdef TF_POOL_PROFILE
     double _ts = tf_now_s();
 #define PW_MARK(BUCKET) do { if (tid < 2) { double _n = tf_now_s(); \
@@ -4629,7 +5697,7 @@ static void *tf_persistent_worker(void *arg) {
         if (tid == 0)
             tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         PW_MARK(serial);
-        tf_spin_barrier(m, &local_sense, nt);  /* B1: xb ready */
+        PW_BARRIER();  /* B1: xb ready */
         PW_MARK(barrier);
 
         if (m->is_hybrid && layer->is_ssm) {
@@ -4638,7 +5706,7 @@ static void *tf_persistent_worker(void *arg) {
              * (ssm_out projection) ready when this returns. */
             tf_ssm_deltanet_forward_parallel(m, l, tid, nt, &local_sense);
             PW_MARK(matvec);
-            tf_spin_barrier(m, &local_sense, nt);  /* B2: SSM done */
+            PW_BARRIER();  /* B2: SSM done */
             PW_MARK(barrier);
         } else {
             /* --- Attention layer --- */
@@ -4656,7 +5724,7 @@ static void *tf_persistent_worker(void *arg) {
                 tf_thread_matvec(m->v, &layer->attn_v, m->xb, kv_dim, tid, nt);
             }
             PW_MARK(matvec);
-            tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
+            PW_BARRIER();  /* B2: Q/K/V ready */
             PW_MARK(barrier);
 
             /* Parallel: de-interleave (gated), QK-norm, F32-bias, RoPE, KV cache.
@@ -4710,9 +5778,11 @@ static void *tf_persistent_worker(void *arg) {
                         }
                     }
                     tf_apply_rope(m, m->q, m->k, n_heads, n_kv_heads, head_dim, pos_t, pos_h, pos_w);
-                    tf_kv_write_all_heads(m->key_cache[l],
-                                          m->key_scales   ? m->key_scales[l]   : NULL,
-                                          m->k, position, n_kv_heads, head_dim, m->kv_dtype);
+                    tf_k_cache_write_pos(m->key_cache[l],
+                                         m->key_scales ? m->key_scales[l] : NULL,
+                                         m->k, position, n_kv_heads, head_dim,
+                                         m->max_seq_len, m->kv_dtype, m->kv_k_transposed,
+                                         m->kv_k_dp);
                     tf_kv_write_all_heads(m->value_cache[l],
                                           m->value_scales ? m->value_scales[l] : NULL,
                                           m->v, position, n_kv_heads, head_dim, m->kv_dtype);
@@ -4839,17 +5909,136 @@ static void *tf_persistent_worker(void *arg) {
                         vk[j]            = v0 * cos_tab[j] - v1 * sin_tab[j];
                         vk[j + pair_off] = v0 * sin_tab[j] + v1 * cos_tab[j];
                     }
-                    tf_kv_write_row(m->key_cache[l],
-                                    m->key_scales   ? m->key_scales[l]   : NULL,
-                                    vk, position, h, n_kv_heads, head_dim, kv_dim, m->kv_dtype);
+                    tf_k_cache_write_row(m->key_cache[l],
+                                         m->key_scales ? m->key_scales[l] : NULL,
+                                         vk, position, h, n_kv_heads, head_dim,
+                                         kv_dim, m->max_seq_len, m->kv_dtype,
+                                         m->kv_k_transposed, m->kv_k_dp);
                     tf_kv_write_row(m->value_cache[l],
                                     m->value_scales ? m->value_scales[l] : NULL,
                                     vv, position, h, n_kv_heads, head_dim, kv_dim, m->kv_dtype);
                 }
             }
             PW_MARK(serial);
-            tf_spin_barrier(m, &local_sense, nt);  /* B3: Q/K ready for attention */
+            PW_BARRIER();  /* B3: Q/K ready for attention */
             PW_MARK(barrier);
+
+            /* qpkd pre-pass: pack this thread's Q heads, barrier, then compute
+             * QK over a p-chunk for ALL heads using qpkd+ktbl. Writes att[h][p]
+             * for all h; per-head attention worker then skips QK. */
+            int pw_skip_qk = 0;
+#if defined(__ARM_FEATURE_SVE)
+            if (m->kv_k_dp) {
+                if (h_count > 0)
+                    tf_qpkd_pack_q_heads(m->q, m->q_packed, h_start, h_start + h_count,
+                                         n_heads, head_dim);
+                PW_MARK(serial);
+                PW_BARRIER();  /* Q_packed ready */
+                PW_MARK(barrier);
+                int seq_len = position + 1;
+                float scale = 1.0f / sqrtf((float)head_dim);
+                long p_lo = (long)tid * seq_len / nt;
+                long p_hi = (long)(tid + 1) * seq_len / nt;
+                if (p_hi > p_lo) {
+                    if (m->kv_dtype == TF_KV_DTYPE_F32)
+                        tf_qpkd_qk_chunk_f32((const float *)m->key_cache[l], m->q_packed,
+                                             m->att, (int)p_lo, (int)p_hi,
+                                             n_heads, n_kv_heads, head_dim,
+                                             m->max_seq_len, scale);
+                    else if (m->kv_dtype == TF_KV_DTYPE_F16)
+                        tf_qpkd_qk_chunk_f16((const uint16_t *)m->key_cache[l], m->q_packed,
+                                             m->att, (int)p_lo, (int)p_hi,
+                                             n_heads, n_kv_heads, head_dim,
+                                             m->max_seq_len, scale);
+                    else
+                        tf_qpkd_qk_chunk_q8((const int8_t *)m->key_cache[l],
+                                            m->key_scales[l], m->q_packed,
+                                            m->att, (int)p_lo, (int)p_hi,
+                                            n_heads, n_kv_heads, head_dim,
+                                            m->max_seq_len, scale);
+                }
+                PW_MARK(attn);
+                PW_BARRIER();  /* att rows ready */
+                PW_MARK(barrier);
+                pw_skip_qk = 1;
+            }
+#endif
+
+            /* Parallel softmax+AV pre-pass: with K_DP, splitting AV across all
+             * threads (per-p partition) instead of one-thread-per-head avoids
+             * the 16-of-48 underutilisation that dominates attention at long
+             * context. Per-thread av_tmp [n_heads*head_dim] is reduced into
+             * xb2 after the chunk pass. */
+            int pw_skip_av = 0;
+#if defined(__ARM_FEATURE_SVE)
+            if (m->kv_k_dp && m->av_tmp) {
+                int seq_len = position + 1;
+                /* Per-head softmax: reuse the same head partition as the
+                 * downstream output projection; idle threads (h_count==0)
+                 * just fall through to the barrier. */
+                for (int hi = 0; hi < h_count; hi++) {
+                    int h = h_start + hi;
+                    tf_softmax(m->att + (size_t)h * m->max_seq_len, seq_len);
+                }
+                PW_MARK(attn);
+                PW_BARRIER();  /* softmax done */
+                PW_MARK(barrier);
+
+                /* AV chunk over this thread's p-range, accumulating into its
+                 * own av_tmp slice (which we zero first). */
+                size_t slice_n = (size_t)n_heads * head_dim;
+                float *my_tmp = m->av_tmp + (size_t)tid * slice_n;
+                memset(my_tmp, 0, slice_n * sizeof(float));
+                long p_lo = (long)tid * seq_len / nt;
+                long p_hi = (long)(tid + 1) * seq_len / nt;
+                if (p_hi > p_lo) {
+                    if (m->kv_dtype == TF_KV_DTYPE_F32)
+                        tf_av_chunk_f32((const float *)m->value_cache[l], m->att,
+                                        my_tmp, (int)p_lo, (int)p_hi,
+                                        n_heads, n_kv_heads, head_dim, m->max_seq_len);
+                    else if (m->kv_dtype == TF_KV_DTYPE_F16)
+                        tf_av_chunk_f16((const uint16_t *)m->value_cache[l], m->att,
+                                        my_tmp, (int)p_lo, (int)p_hi,
+                                        n_heads, n_kv_heads, head_dim, m->max_seq_len);
+                    else
+                        tf_av_chunk_q8((const int8_t *)m->value_cache[l], m->value_scales[l],
+                                       m->att, my_tmp, (int)p_lo, (int)p_hi,
+                                       n_heads, n_kv_heads, head_dim, m->max_seq_len);
+                }
+                PW_MARK(attn);
+                PW_BARRIER();  /* av_tmp ready */
+                PW_MARK(barrier);
+
+                /* Reduce av_tmp across nt threads into xb2.
+                 * Partition (h, d-vec) work units across all threads: vl floats
+                 * per unit, 16 heads × head_dim/vl units total. */
+                {
+                    int vl = (int)svcntw();
+                    int per_h = (head_dim + vl - 1) / vl;
+                    int total_units = n_heads * per_h;
+                    long u_lo = (long)tid * total_units / nt;
+                    long u_hi = (long)(tid + 1) * total_units / nt;
+                    for (long u = u_lo; u < u_hi; u++) {
+                        int h  = (int)u / per_h;
+                        int dv = (int)u % per_h;
+                        int d_lo = dv * vl;
+                        int d_hi = d_lo + vl; if (d_hi > head_dim) d_hi = head_dim;
+                        tf_av_reduce_slice(m->xb2, m->av_tmp, h, d_lo, d_hi,
+                                           nt, n_heads, head_dim);
+                    }
+                }
+                PW_MARK(attn);
+                /* No barrier here: the existing B4 barrier after the worker
+                 * (which is now a no-op for skip_av) plus the per-head sigmoid
+                 * gate (which only touches xb2 for h_start..h_start+h_count
+                 * — what this thread just reduced) makes this safe.  Actually
+                 * we still need a barrier so that each thread's reduce work
+                 * (some other thread's heads) is visible before the gate. */
+                PW_BARRIER();
+                PW_MARK(barrier);
+                pw_skip_av = 1;
+            }
+#endif
 
             /* Attention: each thread handles its head partition */
             {
@@ -4866,9 +6055,14 @@ static void *tf_persistent_worker(void *arg) {
                         .gqa_ratio = gqa_ratio,
                         .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                         .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                        .k_transposed = m->kv_k_transposed,
+                        .k_dp = m->kv_k_dp,
+                        .skip_qk = pw_skip_qk,
+                        .skip_av = pw_skip_av,
                         .scale = scale,
                     };
-                    memset(m->xb2 + h_start * head_dim, 0, (size_t)h_count * head_dim * sizeof(float));
+                    if (!pw_skip_av)
+                        memset(m->xb2 + h_start * head_dim, 0, (size_t)h_count * head_dim * sizeof(float));
                     tf_attn_worker(&at);
                 }
             }
@@ -4881,13 +6075,13 @@ static void *tf_persistent_worker(void *arg) {
                 }
             }
             PW_MARK(attn);
-            tf_spin_barrier(m, &local_sense, nt);  /* B4: xb2 ready */
+            PW_BARRIER();  /* B4: xb2 ready */
             PW_MARK(barrier);
 
             /* Output projection: all threads compute their row partition */
             tf_thread_matvec(m->xb, &layer->attn_output, m->xb2, n_embd, tid, nt);
             PW_MARK(matvec);
-            tf_spin_barrier(m, &local_sense, nt);  /* B5: xb ready */
+            PW_BARRIER();  /* B5: xb ready */
             PW_MARK(barrier);
         }
 
@@ -4897,7 +6091,7 @@ static void *tf_persistent_worker(void *arg) {
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         }
         PW_MARK(serial);
-        tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN (merged) */
+        PW_BARRIER();  /* B6: xb ready for FFN (merged) */
         PW_MARK(barrier);
 
         if (!m->use_moe || !layer->ffn_gate_inp.data) {
@@ -4921,13 +6115,13 @@ static void *tf_persistent_worker(void *arg) {
                 }
             }
             PW_MARK(matvec);
-            tf_spin_barrier(m, &local_sense, nt);  /* B7: ffn_buf3 ready for down */
+            PW_BARRIER();  /* B7: ffn_buf3 ready for down */
             PW_MARK(barrier);
 
             /* Down projection */
             tf_thread_matvec(m->xb, &layer->ffn_down, m->ffn_buf3, n_embd, tid, nt);
             PW_MARK(matvec);
-            tf_spin_barrier(m, &local_sense, nt);  /* B8: xb ready */
+            PW_BARRIER();  /* B8: xb ready */
             PW_MARK(barrier);
 
             /* Thread 0: residual */
@@ -4954,7 +6148,7 @@ static void *tf_persistent_worker(void *arg) {
                 for (int i = 0; i < n_embd; i++) m->x[i] += ew * m->q[i];
                 m->pool_alive = saved_alive;
             }
-            tf_spin_barrier(m, &local_sense, nt);  /* MoE done */
+            PW_BARRIER();  /* MoE done */
         }
         /* No end-of-layer barrier needed: only thread 0 writes m->x (vadd),
          * and only thread 0 reads it at the start of next layer (RMSNorm).
@@ -5377,9 +6571,11 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             TF_PROF_END("rope", 8.0 * (n_heads + n_kv_heads) * head_dim / 2, 0);
 
             /* KV cache */
-            tf_kv_write_all_heads(m->key_cache[l],
-                                  m->key_scales   ? m->key_scales[l]   : NULL,
-                                  m->k, position, n_kv_heads, head_dim, m->kv_dtype);
+            tf_k_cache_write_pos(m->key_cache[l],
+                                 m->key_scales ? m->key_scales[l] : NULL,
+                                 m->k, position, n_kv_heads, head_dim,
+                                 m->max_seq_len, m->kv_dtype, m->kv_k_transposed,
+                                 m->kv_k_dp);
             tf_kv_write_all_heads(m->value_cache[l],
                                   m->value_scales ? m->value_scales[l] : NULL,
                                   m->v, position, n_kv_heads, head_dim, m->kv_dtype);
@@ -5389,26 +6585,35 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
 
-            if (m->n_threads > 1 && n_heads >= m->n_threads && m->pool_alive) {
+            if (m->n_threads > 1 && m->pool_alive) {
                 int nt = m->n_threads;
-                tf_attn_task *atasks = (tf_attn_task *)alloca(nt * sizeof(tf_attn_task));
-                int heads_per = n_heads / nt, heads_extra = n_heads % nt, hoff = 0;
-                for (int t = 0; t < nt; t++) {
-                    int hcount = heads_per + (t < heads_extra ? 1 : 0);
-                    atasks[t] = (tf_attn_task){
-                        .q = m->q, .att = m->att, .xb2 = m->xb2,
-                        .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
-                        .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
-                        .value_scales = m->value_scales ? m->value_scales[l] : NULL,
-                        .head_start = hoff, .head_end = hoff + hcount,
-                        .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                        .seq_len = seq_len, .max_seq_len = m->max_seq_len,
-                        .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
-                        .scale = scale,
-                    };
-                    hoff += hcount;
+                static int fa_enabled = -1;
+                if (fa_enabled < 0) fa_enabled = getenv("TF_USE_FA") ? 1 : 0;
+                if (fa_enabled && nt > n_heads && !m->kv_k_dp) {
+                    tf_attention_fa(m, l, n_heads, n_kv_heads, head_dim, kv_dim,
+                                    gqa_ratio, seq_len, scale);
+                } else {
+                    tf_attn_task *atasks = (tf_attn_task *)alloca(nt * sizeof(tf_attn_task));
+                    int heads_per = n_heads / nt, heads_extra = n_heads % nt, hoff = 0;
+                    for (int t = 0; t < nt; t++) {
+                        int hcount = heads_per + (t < heads_extra ? 1 : 0);
+                        atasks[t] = (tf_attn_task){
+                            .q = m->q, .att = m->att, .xb2 = m->xb2,
+                            .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
+                            .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
+                            .value_scales = m->value_scales ? m->value_scales[l] : NULL,
+                            .head_start = hoff, .head_end = hoff + hcount,
+                            .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                            .seq_len = seq_len, .max_seq_len = m->max_seq_len,
+                            .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                            .k_transposed = m->kv_k_transposed,
+                            .k_dp = m->kv_k_dp,
+                            .scale = scale,
+                        };
+                        hoff += hcount;
+                    }
+                    tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
                 }
-                tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
             } else {
                 /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
                 tf_attn_task st = {
@@ -5420,6 +6625,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                     .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
                     .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                     .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                    .k_transposed = m->kv_k_transposed,
+                    .k_dp = m->kv_k_dp,
                     .scale = scale,
                 };
                 memset(m->xb2, 0, q_dim * sizeof(float));
@@ -5504,9 +6711,11 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             TF_PROF_END("rope", 8.0 * (n_heads + n_kv_heads) * head_dim / 2, 0);
 
             /* Store K/V into cache at position */
-            tf_kv_write_all_heads(m->key_cache[l],
-                                  m->key_scales   ? m->key_scales[l]   : NULL,
-                                  m->k, position, n_kv_heads, head_dim, m->kv_dtype);
+            tf_k_cache_write_pos(m->key_cache[l],
+                                 m->key_scales ? m->key_scales[l] : NULL,
+                                 m->k, position, n_kv_heads, head_dim,
+                                 m->max_seq_len, m->kv_dtype, m->kv_k_transposed,
+                                 m->kv_k_dp);
             tf_kv_write_all_heads(m->value_cache[l],
                                   m->value_scales ? m->value_scales[l] : NULL,
                                   m->v, position, n_kv_heads, head_dim, m->kv_dtype);
@@ -5516,29 +6725,38 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             int seq_len = position + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
 
-            if (m->n_threads > 1 && n_heads >= m->n_threads && m->pool_alive) {
+            if (m->n_threads > 1 && m->pool_alive) {
                 /* Pool-based threaded attention */
                 int nt = m->n_threads;
-                tf_attn_task *atasks = (tf_attn_task *)alloca(nt * sizeof(tf_attn_task));
-                int heads_per = n_heads / nt;
-                int heads_extra = n_heads % nt;
-                int hoff = 0;
-                for (int t = 0; t < nt; t++) {
-                    int hcount = heads_per + (t < heads_extra ? 1 : 0);
-                    atasks[t] = (tf_attn_task){
-                        .q = m->q, .att = m->att, .xb2 = m->xb2,
-                        .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
-                        .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
-                        .value_scales = m->value_scales ? m->value_scales[l] : NULL,
-                        .head_start = hoff, .head_end = hoff + hcount,
-                        .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
-                        .seq_len = seq_len, .max_seq_len = m->max_seq_len,
-                        .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
-                        .scale = scale,
-                    };
-                    hoff += hcount;
+                static int fa_enabled = -1;
+                if (fa_enabled < 0) fa_enabled = getenv("TF_USE_FA") ? 1 : 0;
+                if (fa_enabled && nt > n_heads && !m->kv_k_dp) {
+                    tf_attention_fa(m, l, n_heads, n_kv_heads, head_dim, kv_dim,
+                                    gqa_ratio, seq_len, scale);
+                } else {
+                    tf_attn_task *atasks = (tf_attn_task *)alloca(nt * sizeof(tf_attn_task));
+                    int heads_per = n_heads / nt;
+                    int heads_extra = n_heads % nt;
+                    int hoff = 0;
+                    for (int t = 0; t < nt; t++) {
+                        int hcount = heads_per + (t < heads_extra ? 1 : 0);
+                        atasks[t] = (tf_attn_task){
+                            .q = m->q, .att = m->att, .xb2 = m->xb2,
+                            .key_cache = m->key_cache[l], .value_cache = m->value_cache[l],
+                            .key_scales   = m->key_scales   ? m->key_scales[l]   : NULL,
+                            .value_scales = m->value_scales ? m->value_scales[l] : NULL,
+                            .head_start = hoff, .head_end = hoff + hcount,
+                            .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
+                            .seq_len = seq_len, .max_seq_len = m->max_seq_len,
+                            .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                            .k_transposed = m->kv_k_transposed,
+                            .k_dp = m->kv_k_dp,
+                            .scale = scale,
+                        };
+                        hoff += hcount;
+                    }
+                    tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
                 }
-                tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
             } else {
                 /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
                 tf_attn_task st = {
@@ -5550,6 +6768,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                     .head_dim = head_dim, .kv_dim = kv_dim, .gqa_ratio = gqa_ratio,
                     .seq_len = seq_len, .max_seq_len = m->max_seq_len,
                     .n_kv_heads = n_kv_heads, .kv_dtype = m->kv_dtype,
+                    .k_transposed = m->kv_k_transposed,
+                    .k_dp = m->kv_k_dp,
                     .scale = scale,
                 };
                 memset(m->xb2, 0, q_dim * sizeof(float));

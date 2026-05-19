@@ -156,7 +156,7 @@ static void usage(const char *p) {
         "  --llm-threads N           (LLM forward threads; default 1)\n"
         "  --no-deepstack            (disable deepstack injection)\n"
         "  --mmap                    (file-backed weights; slower per matvec)\n"
-        "  --kv-dtype f32|f16|q8     (KV cache element format; default f32)\n"
+        "  --kv-dtype f32|f16|q8     (KV cache element format; default f16)\n"
         "  --seed N                  (rng seed; default time-based)\n",
         p);
 }
@@ -381,14 +381,18 @@ int main(int argc, char **argv) {
     }
 
     /* ── build chat prompt ── */
-    char text_before[256], text_after[1024];
+    size_t prompt_cap = strlen(user_prompt) + 256;
+    char *text_before = (char *)malloc(prompt_cap);
+    char *text_after  = (char *)malloc(prompt_cap);
     build_chat_prompt(gguf_main, user_prompt, mmproj_path != NULL,
-                      text_before, sizeof(text_before),
-                      text_after,  sizeof(text_after));
+                      text_before, prompt_cap,
+                      text_after,  prompt_cap);
 
-    int32_t tokens_before[128], tokens_after[128];
-    int n_before = bpe_tokenize(vocab, text_before, -1, tokens_before, 128);
-    int n_after  = text_after[0] ? bpe_tokenize(vocab, text_after, -1, tokens_after, 128) : 0;
+    int tok_cap = max_seq_len > 256 ? max_seq_len : 256;
+    int32_t *tokens_before = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
+    int32_t *tokens_after  = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
+    int n_before = bpe_tokenize(vocab, text_before, -1, tokens_before, tok_cap);
+    int n_after  = text_after[0] ? bpe_tokenize(vocab, text_after, -1, tokens_after, tok_cap) : 0;
 
     int total_prompt = n_before + n_vision_tokens + n_after;
     fprintf(stderr, "[6/6] prompt: %d tokens (%d text + %d vision + %d text)\n",
