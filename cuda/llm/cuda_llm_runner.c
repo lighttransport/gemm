@@ -9284,14 +9284,21 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
         return cuda_llm_prefill_qwen35(r, token_ids, embeddings, embd_stride, n_tokens, start_pos);
     }
 
-    /* Fall back to sequential for models with PLE (needs GPU PLE precomputation) */
-    if (r->n_embd_per_layer > 0 && r->d_ple_combined) {
+    /*
+     * The generic batched implementation below is Gemma4-specific. Other
+     * models use the single-token path so prefill remains correct instead of
+     * silently skipping transformer layers.
+     */
+    if (!r->is_gemma4 || (r->n_embd_per_layer > 0 && r->d_ple_combined)) {
         float *result = NULL;
         for (int t = 0; t < n_tokens; t++) {
             if (token_ids)
                 result = cuda_llm_forward(r, token_ids[t], start_pos + t);
             else if (embeddings)
-                result = cuda_llm_forward_embd(r, embeddings + t * embd_stride, embd_stride, start_pos + t);
+                result = cuda_llm_forward_embd(r, embeddings + (size_t)t * embd_stride, embd_stride, start_pos + t);
+            else
+                return NULL;
+            if (!result) return NULL;
         }
         return result;
     }
@@ -9316,21 +9323,34 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
         max_q_dim = q1 > q2 ? q1 : q2;
     }
 
-    CUdeviceptr d_batch_x, d_batch_xb, d_batch_q, d_batch_k, d_batch_v;
-    CUdeviceptr d_batch_xb2, d_batch_gate, d_batch_up;
-    cuMemAlloc(&d_batch_x, batch_embd);
-    cuMemAlloc(&d_batch_xb, batch_embd);
-    cuMemAlloc(&d_batch_q, (size_t)n_tokens * max_q_dim * sizeof(float));
-    cuMemAlloc(&d_batch_k, (size_t)n_tokens * max_kv_dim * sizeof(float));
-    cuMemAlloc(&d_batch_v, (size_t)n_tokens * max_kv_dim * sizeof(float));
-    cuMemAlloc(&d_batch_xb2, (size_t)n_tokens * max_q_dim * sizeof(float));
-    cuMemAlloc(&d_batch_gate, (size_t)n_tokens * n_ff * sizeof(float));
-    cuMemAlloc(&d_batch_up, (size_t)n_tokens * n_ff * sizeof(float));
+    float *result = NULL;
+    float *h_embd = NULL;
+    CUdeviceptr d_batch_x = 0, d_batch_xb = 0, d_batch_q = 0, d_batch_k = 0, d_batch_v = 0;
+    CUdeviceptr d_batch_xb2 = 0, d_batch_gate = 0, d_batch_up = 0;
+#define CLLM_PREFILL_CU_OR_CLEANUP(call, label) do { \
+        CUresult _ce = (call); \
+        if (_ce != CUDA_SUCCESS) { \
+            fprintf(stderr, "cuda_llm: generic prefill %s failed (err=%d)\n", (label), (int)_ce); \
+            goto cleanup; \
+        } \
+    } while (0)
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_x, batch_embd), "alloc batch_x");
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_xb, batch_embd), "alloc batch_xb");
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_q, (size_t)n_tokens * max_q_dim * sizeof(float)), "alloc batch_q");
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_k, (size_t)n_tokens * max_kv_dim * sizeof(float)), "alloc batch_k");
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_v, (size_t)n_tokens * max_kv_dim * sizeof(float)), "alloc batch_v");
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_xb2, (size_t)n_tokens * max_q_dim * sizeof(float)), "alloc batch_xb2");
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_gate, (size_t)n_tokens * n_ff * sizeof(float)), "alloc batch_gate");
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemAlloc(&d_batch_up, (size_t)n_tokens * n_ff * sizeof(float)), "alloc batch_up");
 
     /* Upload token embeddings */
     if (token_ids) {
         /* Token ID path: use single-token forward for embedding, read back from GPU */
-        float *h_embd = (float *)malloc(batch_embd);
+        h_embd = (float *)malloc(batch_embd);
+        if (!h_embd) {
+            fprintf(stderr, "cuda_llm: generic prefill host embedding buffer alloc failed\n");
+            goto cleanup;
+        }
         for (int t = 0; t < n_tokens; t++) {
             /* Use the existing embed kernel (handles Q8_0 padding, Q4_K, etc.) */
             if (r->token_embd_type == GGML_TYPE_Q8_0) {
@@ -9345,24 +9365,30 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                 launch_embed(r, r->d_x, r->d_token_embd, token_ids[t], n_embd);
             }
             if (r->is_gemma4) launch_scale(r, r->d_x, r->embd_scale, n_embd);
-            cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x, n_embd * sizeof(float), r->stream);
+            CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyDtoHAsync(h_embd + t * n_embd, r->d_x,
+                                                         n_embd * sizeof(float), r->stream),
+                                       "embedding download");
         }
-        cuStreamSynchronize(r->stream);
-        cuMemcpyHtoD(d_batch_x, h_embd, batch_embd);
+        CLLM_PREFILL_CU_OR_CLEANUP(cuStreamSynchronize(r->stream), "embedding sync");
+        CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyHtoD(d_batch_x, h_embd, batch_embd),
+                                   "embedding batch upload");
         free(h_embd);
+        h_embd = NULL;
     } else if (embeddings) {
         /* Pre-computed embeddings path */
         if (embd_stride == n_embd) {
-            cuMemcpyHtoD(d_batch_x, embeddings, batch_embd);
+            CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyHtoD(d_batch_x, embeddings, batch_embd),
+                                       "embedding batch upload");
         } else {
             for (int t = 0; t < n_tokens; t++)
-                cuMemcpyHtoDAsync(d_batch_x + (size_t)t * n_embd * sizeof(float),
-                                   embeddings + t * embd_stride,
-                                   n_embd * sizeof(float), r->stream);
+                CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyHtoDAsync(d_batch_x + (size_t)t * n_embd * sizeof(float),
+                                                             embeddings + t * embd_stride,
+                                                             n_embd * sizeof(float), r->stream),
+                                           "embedding row upload");
         }
         /* Gemma4: scale embeddings only for token inputs, not vision embeddings */
     } else {
-        return NULL;
+        goto cleanup;
     }
 
     /* Gemma4: stash token_id for PLE (use last token) */
@@ -9376,18 +9402,11 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
     for (int l = 0; l < n_layers; l++) {
         cuda_layer *cl = &r->layers[l];
         if (cl->is_ssm) {
-            /* SSM layers: fall back to per-token processing */
-            for (int t = 0; t < n_tokens; t++) {
-                cuMemcpyDtoDAsync(r->d_x, d_batch_x + (size_t)t * n_embd * sizeof(float),
-                                   n_embd * sizeof(float), r->stream);
-                /* TODO: SSM forward for this token */
-                cuMemcpyDtoDAsync(d_batch_x + (size_t)t * n_embd * sizeof(float),
-                                   r->d_x, n_embd * sizeof(float), r->stream);
-            }
-            continue;
+            fprintf(stderr,
+                    "cuda_llm: unsupported generic SSM prefill route at layer %d; "
+                    "hybrid SSM models should use cuda_llm_prefill_qwen35\n", l);
+            goto cleanup;
         }
-
-        if (!r->is_gemma4) continue; /* Only Gemma4 batched prefill implemented */
 
         int hd = cl->is_swa ? r->head_dim_swa : r->head_dim_full;
         int layer_kv_heads = cl->n_kv_heads;
@@ -9590,18 +9609,28 @@ float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
 
     /* Final RMSNorm on last token */
     CUdeviceptr d_last = d_batch_x + (size_t)(n_tokens - 1) * n_embd * sizeof(float);
-    cuMemcpyDtoDAsync(r->d_x, d_last, n_embd * sizeof(float), r->stream);
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyDtoDAsync(r->d_x, d_last, n_embd * sizeof(float), r->stream),
+                               "last token copy");
     launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, n_embd, eps);
 
     /* Sync and copy to host */
-    cuStreamSynchronize(r->stream);
-    float *result = r->h_output;
-    cuMemcpyDtoH(result, r->d_x, n_embd * sizeof(float));
+    CLLM_PREFILL_CU_OR_CLEANUP(cuStreamSynchronize(r->stream), "final norm sync");
+    result = r->h_output;
+    CLLM_PREFILL_CU_OR_CLEANUP(cuMemcpyDtoH(result, r->d_x, n_embd * sizeof(float)),
+                               "hidden download");
 
+cleanup:
+    free(h_embd);
     /* Free batch buffers */
-    cuMemFree(d_batch_x); cuMemFree(d_batch_xb);
-    cuMemFree(d_batch_q); cuMemFree(d_batch_k); cuMemFree(d_batch_v);
-    cuMemFree(d_batch_xb2); cuMemFree(d_batch_gate); cuMemFree(d_batch_up);
+    if (d_batch_x) cuMemFree(d_batch_x);
+    if (d_batch_xb) cuMemFree(d_batch_xb);
+    if (d_batch_q) cuMemFree(d_batch_q);
+    if (d_batch_k) cuMemFree(d_batch_k);
+    if (d_batch_v) cuMemFree(d_batch_v);
+    if (d_batch_xb2) cuMemFree(d_batch_xb2);
+    if (d_batch_gate) cuMemFree(d_batch_gate);
+    if (d_batch_up) cuMemFree(d_batch_up);
+#undef CLLM_PREFILL_CU_OR_CLEANUP
 
     return result;
 }

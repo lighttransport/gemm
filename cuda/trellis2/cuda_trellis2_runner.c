@@ -323,17 +323,76 @@ static void dit_block_cpu_free(dit_block_cpu *cpu) {
     memset(cpu, 0, sizeof(*cpu));
 }
 
+static void dino_layer_free_gpu(dino_layer_gpu *l) {
+    CU_FREE(l->ln1_w); CU_FREE(l->ln1_b);
+    CU_FREE(l->q_w); CU_FREE(l->q_b);
+    CU_FREE(l->k_w); CU_FREE(l->k_b);
+    CU_FREE(l->v_w); CU_FREE(l->v_b);
+    CU_FREE(l->q_norm_w); CU_FREE(l->k_norm_w);
+    CU_FREE(l->out_w); CU_FREE(l->out_b);
+    CU_FREE(l->ls1); CU_FREE(l->ls2);
+    CU_FREE(l->ln2_w); CU_FREE(l->ln2_b);
+    CU_FREE(l->fc1_w); CU_FREE(l->fc1_b);
+    CU_FREE(l->fc2_w); CU_FREE(l->fc2_b);
+}
+
+static void dec_resblock_free_gpu(dec_resblock_gpu *rb) {
+    CU_FREE(rb->conv_w); CU_FREE(rb->conv_b);
+    CU_FREE(rb->gn1_w); CU_FREE(rb->gn1_b);
+    CU_FREE(rb->conv1_w); CU_FREE(rb->conv1_b);
+    CU_FREE(rb->gn2_w); CU_FREE(rb->gn2_b);
+    CU_FREE(rb->conv2_w); CU_FREE(rb->conv2_b);
+}
+
+static void dit_model_free_gpu(dit_model_gpu *m) {
+    CU_FREE(m->t_fc1_w); CU_FREE(m->t_fc1_b);
+    CU_FREE(m->t_fc2_w); CU_FREE(m->t_fc2_b);
+    CU_FREE(m->mod_w); CU_FREE(m->mod_b);
+    CU_FREE(m->x_emb_w); CU_FREE(m->x_emb_b);
+    CU_FREE(m->out_w); CU_FREE(m->out_b);
+    if (m->blocks) {
+        int n = m->n_blocks > 0 ? m->n_blocks : DIT_DEPTH;
+        if (n > DIT_DEPTH) n = DIT_DEPTH;
+        for (int i = 0; i < n; i++)
+            dit_block_free_gpu(&m->blocks[i]);
+    }
+    CU_FREE(m->rope_cos);
+    CU_FREE(m->rope_sin);
+}
+
+static void shape_decoder_free_gpu(cuda_trellis2_runner *r) {
+    CU_FREE(r->shape_dec.from_latent_w);
+    CU_FREE(r->shape_dec.from_latent_b);
+    CU_FREE(r->shape_dec.out_w);
+    CU_FREE(r->shape_dec.out_b);
+    for (int s = 0; s < 4; s++) {
+        for (int b = 0; b < 16; b++) {
+            CU_FREE(r->shape_dec.convnext[s][b].conv_w);
+            CU_FREE(r->shape_dec.convnext[s][b].conv_b);
+            CU_FREE(r->shape_dec.convnext[s][b].norm_w);
+            CU_FREE(r->shape_dec.convnext[s][b].norm_b);
+            CU_FREE(r->shape_dec.convnext[s][b].mlp0_w);
+            CU_FREE(r->shape_dec.convnext[s][b].mlp0_b);
+            CU_FREE(r->shape_dec.convnext[s][b].mlp2_w);
+            CU_FREE(r->shape_dec.convnext[s][b].mlp2_b);
+        }
+        CU_FREE(r->shape_dec.c2s[s].norm1_w);
+        CU_FREE(r->shape_dec.c2s[s].norm1_b);
+        CU_FREE(r->shape_dec.c2s[s].conv1_w);
+        CU_FREE(r->shape_dec.c2s[s].conv1_b);
+        CU_FREE(r->shape_dec.c2s[s].conv2_w);
+        CU_FREE(r->shape_dec.c2s[s].conv2_b);
+        CU_FREE(r->shape_dec.c2s[s].subdiv_w);
+        CU_FREE(r->shape_dec.c2s[s].subdiv_b);
+    }
+    r->shape_dec.loaded = 0;
+}
+
 static void dbg4(const char *label, CUdeviceptr ptr, CUstream stream) {
     cuStreamSynchronize(stream);
     float d[4];
     cuMemcpyDtoH(d, ptr, 16);
     fprintf(stderr, "  %s: [:4]=%.6f %.6f %.6f %.6f\n", label, d[0], d[1], d[2], d[3]);
-}
-
-static double t2_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
 /* ======================================================================== */
@@ -543,9 +602,56 @@ void cuda_trellis2_set_max_gpu_layers(cuda_trellis2_runner *r, int n) {
 
 void cuda_trellis2_free(cuda_trellis2_runner *r) {
     if (!r) return;
-    for (int i = 0; i < 8; i++)
-        if (r->scratch[i]) cuMemFree(r->scratch[i]);
-    /* TODO: free all GPU weight buffers */
+    cuCtxSetCurrent(r->context);
+
+    for (int i = 0; i < 12; i++)
+        CU_FREE(r->scratch[i]);
+
+    CU_FREE(r->dit_t_fc1_w); CU_FREE(r->dit_t_fc1_b);
+    CU_FREE(r->dit_t_fc2_w); CU_FREE(r->dit_t_fc2_b);
+    CU_FREE(r->dit_mod_w); CU_FREE(r->dit_mod_b);
+    CU_FREE(r->dit_x_emb_w); CU_FREE(r->dit_x_emb_b);
+    CU_FREE(r->dit_out_w); CU_FREE(r->dit_out_b);
+    for (int i = 0; i < DIT_DEPTH; i++) {
+        dit_block_free_gpu(&r->dit_blocks[i]);
+        dit_block_cpu_free(&r->dit_blocks_cpu[i]);
+    }
+    CU_FREE(r->dit_rope_cos);
+    CU_FREE(r->dit_rope_sin);
+
+    dit_model_free_gpu(&r->stage2);
+    dit_model_free_gpu(&r->stage3);
+    for (int i = 0; i < DIT_DEPTH; i++) {
+        dit_block_cpu_free(&r->stage2_blocks_cpu[i]);
+        dit_block_cpu_free(&r->stage3_blocks_cpu[i]);
+        CU_FREE(r->ca_kv_cache_K[i]);
+        CU_FREE(r->ca_kv_cache_V[i]);
+    }
+
+    CU_FREE(r->dino_patch_w); CU_FREE(r->dino_patch_b);
+    CU_FREE(r->dino_cls_token); CU_FREE(r->dino_storage_tokens);
+    CU_FREE(r->dino_norm_w); CU_FREE(r->dino_norm_b);
+    for (int i = 0; i < DINO_LAYERS; i++)
+        dino_layer_free_gpu(&r->dino_layers[i]);
+    CU_FREE(r->dino_rope_cos);
+    CU_FREE(r->dino_rope_sin);
+
+    CU_FREE(r->dec_conv_in_w); CU_FREE(r->dec_conv_in_b);
+    for (int i = 0; i < 2; i++) {
+        dec_resblock_free_gpu(&r->dec_middle[i]);
+        dec_resblock_free_gpu(&r->dec_res16[i]);
+        dec_resblock_free_gpu(&r->dec_res32[i]);
+        dec_resblock_free_gpu(&r->dec_res64[i]);
+    }
+    CU_FREE(r->dec_up1_w); CU_FREE(r->dec_up1_b);
+    CU_FREE(r->dec_up2_w); CU_FREE(r->dec_up2_b);
+    CU_FREE(r->dec_out_gn_w); CU_FREE(r->dec_out_gn_b);
+    CU_FREE(r->dec_out_conv_w); CU_FREE(r->dec_out_conv_b);
+
+    shape_decoder_free_gpu(r);
+    t2_shape_dec_free(r->shape_dec_cpu);
+    t2_shape_dec_free(r->tex_dec_cpu);
+
     cuModuleUnload(r->module);
     cuStreamDestroy(r->stream);
     cuCtxDestroy(r->context);
@@ -977,7 +1083,6 @@ static CUdeviceptr t2_upload_conv_transposed(st_context *st, const char *name,
     int idx = safetensors_find(st, name);
     if (idx < 0) { if (v) fprintf(stderr, "  [MISSING] %s\n", name); return 0; }
     const char *dtype = safetensors_dtype(st, idx);
-    size_t nbytes = safetensors_nbytes(st, idx);
     void *data = safetensors_data(st, idx);
 
     /* First convert to F32 on CPU */
@@ -1241,7 +1346,8 @@ static void run_dinov3(cuda_trellis2_runner *r, CUdeviceptr d_image, CUdeviceptr
         if (l->ls1) {
             /* layerscale_add: dst[i] += src[i] * scale[i % dim] */
             int n = seq * dim;
-            void *ls_args[] = {&d_hidden, &d_normed, &l->ls1, &n, &dim};
+            int dim_arg = dim;
+            void *ls_args[] = {&d_hidden, &d_normed, &l->ls1, &n, &dim_arg};
             cuLaunchKernel(ops->layerscale_add, (unsigned)((n+255)/256), 1, 1,
                            256, 1, 1, 0, stream, ls_args, NULL);
         } else {
@@ -1256,7 +1362,8 @@ static void run_dinov3(cuda_trellis2_runner *r, CUdeviceptr d_image, CUdeviceptr
 
         if (l->ls2) {
             int n = seq * dim;
-            void *ls_args[] = {&d_hidden, &d_normed, &l->ls2, &n, &dim};
+            int dim_arg = dim;
+            void *ls_args[] = {&d_hidden, &d_normed, &l->ls2, &n, &dim_arg};
             cuLaunchKernel(ops->layerscale_add, (unsigned)((n+255)/256), 1, 1,
                            256, 1, 1, 0, stream, ls_args, NULL);
         } else {
@@ -1588,7 +1695,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     /* 4. Final LayerNorm (no affine) + output projection */
     {
         float eps = 1e-6f;
-        void *ln_args[] = {&d_hidden, &d_hidden, &D, &eps};
+        int D_arg = D;
+        void *ln_args[] = {&d_hidden, &d_hidden, &D_arg, &eps};
         cuLaunchKernel(ops->layernorm_noaffine, (unsigned)N, 1, 1,
                        256, 1, 1, 512 * sizeof(float), stream, ln_args, NULL);
     }
@@ -1665,7 +1773,7 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
 static void run_resblock(cuda_trellis2_runner *r,
                           CUdeviceptr d_out, CUdeviceptr d_in,
                           const dec_resblock_gpu *rb,
-                          int C, int D, int H, int W, int G) {
+                          int C, int D, int H, int W) {
     t2_ops *ops = &r->ops;
     CUstream s = r->stream;
     int spatial = D * H * W;
@@ -1694,8 +1802,6 @@ static void run_decoder(cuda_trellis2_runner *r,
                          CUdeviceptr d_latent, CUdeviceptr d_output) {
     t2_ops *ops = &r->ops;
     CUstream s = r->stream;
-    int G = 32;
-
     /* Alloc main decoder buffers */
     ensure_scratch(r, 6, (size_t)1024 * 16 * 16 * 16 * sizeof(float));
     ensure_scratch(r, 7, (size_t)512 * 32 * 32 * 32 * sizeof(float));
@@ -1710,12 +1816,12 @@ static void run_decoder(cuda_trellis2_runner *r,
     if (r->verbose >= 2) dbg4("dec_conv_in", d_buf_a, s);
 
     /* middle + res16 blocks (512 ch, 16^3) */
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_middle[0], 512, 16, 16, 16, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_middle[0], 512, 16, 16, 16);
     if (r->verbose >= 2) dbg4("dec_mid0", d_buf_b, s);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_middle[1], 512, 16, 16, 16, G);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_middle[1], 512, 16, 16, 16);
     if (r->verbose >= 2) dbg4("dec_mid1", d_buf_a, s);
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res16[0], 512, 16, 16, 16, G);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res16[1], 512, 16, 16, 16, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res16[0], 512, 16, 16, 16);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res16[1], 512, 16, 16, 16);
 
     /* Up1: conv 512->1024, pixel_shuffle -> [128, 32^3] */
     t2_op_conv3d(ops, s, d_buf_b, d_buf_a, r->dec_up1_w, r->dec_up1_b,
@@ -1723,8 +1829,8 @@ static void run_decoder(cuda_trellis2_runner *r,
     t2_op_pixel_shuffle_3d(ops, s, d_buf_a, d_buf_b, 128, 16, 16, 16);
 
     /* res32 blocks (128 ch, 32^3) */
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res32[0], 128, 32, 32, 32, G);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res32[1], 128, 32, 32, 32, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res32[0], 128, 32, 32, 32);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res32[1], 128, 32, 32, 32);
 
     /* Up2: conv 128->256, pixel_shuffle -> [32, 64^3] */
     t2_op_conv3d(ops, s, d_buf_b, d_buf_a, r->dec_up2_w, r->dec_up2_b,
@@ -1737,8 +1843,8 @@ static void run_decoder(cuda_trellis2_runner *r,
     /* res64 blocks (32 ch, 64^3) */
     ensure_scratch(r, 7, (size_t)32 * 64 * 64 * 64 * sizeof(float));
     d_buf_b = r->scratch[7];
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res64[0], 32, 64, 64, 64, G);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res64[1], 32, 64, 64, 64, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res64[0], 32, 64, 64, 64);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res64[1], 32, 64, 64, 64);
 
     /* Output: GN -> SiLU -> Conv3d(32->1) */
     /* Output: ChannelLayerNorm -> SiLU -> Conv3d(32->1) */
@@ -1753,33 +1859,14 @@ static void run_decoder(cuda_trellis2_runner *r,
 /* Full pipeline                                                            */
 /* ======================================================================== */
 
-/* Simple xoshiro256** */
-static uint64_t t2_rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
-typedef struct { uint64_t s[4]; } t2_rng;
-static uint64_t t2_next(t2_rng *rng) {
-    uint64_t *s = rng->s;
-    uint64_t result = t2_rotl(s[1] * 5, 7) * 9;
-    uint64_t t = s[1] << 17;
-    s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
-    s[2] ^= t; s[3] = t2_rotl(s[3], 45);
-    return result;
-}
-static float t2_randn(t2_rng *rng) {
-    double u1 = ((double)(t2_next(rng) >> 11) + 0.5) / (double)(1ULL << 53);
-    double u2 = ((double)(t2_next(rng) >> 11) + 0.5) / (double)(1ULL << 53);
-    return (float)(sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2));
-}
-static float t2_rescale(float t, float rescale_t) {
-    return t * rescale_t / (1.0f + (rescale_t - 1.0f) * t);
-}
-
 float *cuda_trellis2_predict(cuda_trellis2_runner *r,
                               const uint8_t *rgb, int w, int h,
                               int n_steps, float cfg_scale,
                               uint32_t seed) {
-    (void)rgb; (void)w; (void)h;
+    (void)r; (void)rgb; (void)w; (void)h;
+    (void)n_steps; (void)cfg_scale; (void)seed;
     fprintf(stderr, "T2: full predict not implemented yet (use per-stage APIs)\n");
-    fprintf(stderr, "T2: DINOv3 GPU encoding is TODO — pass pre-computed features\n");
+    fprintf(stderr, "T2: DINOv3 GPU encoding is not available in this entry point; pass pre-computed features\n");
     return NULL;
 }
 
@@ -1987,7 +2074,8 @@ int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
             free(feats_cpu);
 
             /* Run C2S on CPU using the full CPU decoder's C2S weights */
-            sp3d_tensor *t_new = t2sd_c2s_forward(t_cpu, &r->shape_dec_cpu->c2s[stage], 4);
+            sp3d_tensor *t_new = t2sd_c2s_forward(t_cpu, &r->shape_dec_cpu->c2s[stage],
+                                                  NULL, 4);
 
             int N_new = t_new->N;
             int C_new = t_new->C;
