@@ -367,6 +367,14 @@ follow-ups.
       untracked build artifacts in the CUDA status view.
     - Verify: `git check-ignore -v cuda/int8/int8_gemm`.
 
+30. **[done] Trellis2 public DINOv3 image-to-occupancy path**
+    - Status: `cuda_trellis2_predict` now runs the RGB image path end to end
+      through DINOv3 preprocessing/encoding, Stage 1 DiT Euler sampling with CFG,
+      and the dense structure decoder, returning a CPU `[64,64,64]` occupancy
+      grid instead of an unsupported-mode stub.
+    - Verify: `make -B -C cuda/trellis2 test_cuda_trellis2` and
+      `git diff --check`.
+
 ## Verification harness
 
 Quick smokes to run after any of the items above:
