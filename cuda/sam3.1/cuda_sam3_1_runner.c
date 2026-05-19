@@ -442,8 +442,8 @@ static int load_block(cuda_sam3_1_ctx *c, int bi) {
     b->fc1_b = upload_f32(c->st, K("mlp.fc1.bias"),   NULL);
     b->fc2_w = upload_linear(c, K("mlp.fc2.weight"));
     b->fc2_b = upload_f32(c->st, K("mlp.fc2.bias"),   NULL);
-    /* TODO(Phase C): load attn.freqs_cis (complex64, (576, 32)) for 2D RoPE
-     * once the ViT attention kernel is switched from RPB → RoPE. */
+    /* ViT RoPE uses runner-built F32 cos/sin tables shared by window/global
+     * blocks; checkpoint attn.freqs_cis tensors are not loaded per block. */
     #undef K
     if (!b->norm1_w || !b->norm1_b || !b->norm2_w || !b->norm2_b ||
         !b->qkv_w || !b->qkv_b || !b->o_w || !b->o_b ||

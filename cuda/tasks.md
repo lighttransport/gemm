@@ -272,6 +272,101 @@ follow-ups.
     - Verify: `make -C cuda/flux2 test_cuda_flux2` and
       `./test_cuda_flux2 --test-kernels`.
 
+18. **[done] CUDA LLM stale generic SSM prefill note cleaned up**
+    - Status: Qwen3.5/Qwen3.5-MoE SSM is implemented in decode and in the
+      `cuda_llm_prefill_qwen35` batched path. The stale generic prefill SSM
+      placeholder was replaced with a loud unsupported-route error that frees temporary
+      batch buffers and returns `NULL`, so future unsupported SSM routing cannot
+      silently skip SSM layers. The surrounding generic prefill path now uses a
+      shared cleanup exit for temporary batch buffers and checks its batch
+      allocations plus embedding upload/download copies. Non-Gemma4 generic
+      prefill now falls back to the single-token path before the Gemma4-only
+      batched kernels, avoiding the old silent layer skip for unsupported
+      batched routes.
+    - Verify: `rg -n "unsupported generic SSM prefill" cuda/llm/cuda_llm_runner.c` and
+      `make -C cuda/llm test_cuda_llm`.
+
+19. **[done] Trellis2 CUDA runner destructor frees loaded weights**
+    - Status: `cuda_trellis2_free` now releases all owned GPU weight groups
+      (Stage 1/2/3 DiT weights, DINOv3 weights, dense decoder weights, shape
+      decoder weights, cross-attention KV cache, and all 12 scratch slots) plus
+      CPU-side streaming copies and CPU shape/texture decoder instances. This
+      removes the previous `free all GPU weight buffers` placeholder and prevents
+      long-lived tools from leaking VRAM across runner reloads.
+    - Verify: `make -C cuda/trellis2 test_cuda_trellis2`.
+
+20. **[done] Trellis2 Stage 2 test step log reports real latent std**
+    - Status: `test_cuda_trellis2` now computes the sample standard deviation
+      of the Stage 2 latent after each Euler update instead of printing the
+      placeholder `0.0000`, removing a stale test-harness placeholder and making
+      long sampling logs useful for spotting divergence.
+    - Verify: `make -C cuda/trellis2 test_cuda_trellis2`.
+
+21. **[done] INT8 tcgen05 option no longer dispatches incomplete PTX**
+    - Status: the experimental INT8 `--tcgen05` path now fails explicitly on
+      SM 10.x with an unsupported-path message instead of selecting a PTX body
+      whose `tcgen05.mma` issue instruction is intentionally absent. The help
+      text now describes the option as disabled until the operand syntax is
+      validated on SM 10.x hardware.
+    - Verify: `make -C cuda/int8 int8_gemm`.
+
+22. **[done] Removed stale cuew cuGetProcAddress alias note**
+    - Status: dropped the commented `cuGetProcAddress_v2_ptsz` alias note from
+      `cuew.h`; the active header already maps `cuGetProcAddress` to the loaded
+      v2 symbol, so the disabled ptsz alias was not an actionable CUDA task.
+    - Verify: `make -C cuda/int8 int8_gemm`.
+
+23. **[done] Trellis2 predict stub reports unsupported mode without placeholder text**
+    - Status: the `cuda_trellis2_predict` stub now reports that DINOv3 GPU
+      encoding is not available through that entry point and asks callers to
+      pass precomputed features, instead of emitting a placeholder-flavored message.
+    - Verify: `make -C cuda/trellis2 test_cuda_trellis2`.
+
+24. **[done] SAM3.1 RoPE block-load note clarified**
+    - Status: the stale Phase-C `attn.freqs_cis` note in the SAM3.1 ViT block
+      loader was replaced with an implementation note. The runner already
+      builds shared F32 RoPE cos/sin tables eagerly and applies them inside
+      each ViT block; it does not load per-block checkpoint `freqs_cis` tensors.
+    - Verify: `make -C cuda/sam3.1 verify_vit`.
+
+25. **[done] Hunyuan3D paint pipeline pyref dependency note clarified**
+    - Status: the top-level paint pipeline script now labels the view-map,
+      DINOv2-conditioning, and UniPC scheduler dump requirements as current
+      external pyref inputs rather than an extraction placeholder, so CUDA marker scans
+      only surface actionable code gaps.
+    - Verify: shell syntax remains unchanged (`set -euo pipefail` script,
+      comment-only change).
+
+26. **[done] Trellis2 runner-local build warnings cleaned up**
+    - Status: removed unused runner-local timing/RNG helpers, an unused upload
+      byte count, the unused decoder group parameter, and the remaining unused
+      predict-stub parameters. Kernel launch argument arrays now use mutable
+      local copies for scalar dimensions, avoiding const-discard warnings.
+    - Verify: `make -C cuda/trellis2 test_cuda_trellis2` and
+      `git diff --check`.
+
+27. **[done] Trellis2 test-harness warning cleanup**
+    - Status: the local `.npy` reader now has structured shape parsing and
+      checks the data `fread`, the writer no longer has misleading one-line
+      indentation, the unused Stage 1 `dt` local was removed, the downsample
+      clamp branches are split onto separate statements, and `sparse_coords`
+      stays alive until the optional texture decoder has consumed it.
+    - Verify: `make -C cuda/trellis2 test_cuda_trellis2`.
+
+28. **[done] Trellis2 shared-header warning cleanup**
+    - Status: fixed the remaining warnings emitted by the Trellis2 CUDA build
+      from shared headers: split misleading one-line conditionals in PBR and
+      shape-decoder helpers, removed dead FDG split-alignment code, made the
+      marching-cubes shrink step use a separate realloc result, and marked
+      implementation-only shape-decoder helpers as intentionally optional.
+    - Verify: `make -B -C cuda/trellis2 test_cuda_trellis2`.
+
+29. **[done] Ignore INT8 CUDA build binaries**
+    - Status: added the generated `cuda/int8` binaries to `.gitignore`, so
+      `make -C cuda/int8 int8_gemm` and adjacent INT8 targets no longer leave
+      untracked build artifacts in the CUDA status view.
+    - Verify: `git check-ignore -v cuda/int8/int8_gemm`.
+
 ## Verification harness
 
 Quick smokes to run after any of the items above:
