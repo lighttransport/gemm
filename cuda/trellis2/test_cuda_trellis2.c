@@ -135,6 +135,12 @@ static double sample_std_f32(const float *x, size_t n) {
     return var > 0.0 ? sqrt(var) : 0.0;
 }
 
+static int cmp_f32_desc(const void *a, const void *b) {
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa < fb) - (fa > fb);
+}
+
 /* Load image and preprocess for DINOv3: resize to 512x512, normalize to [3,512,512] CHW */
 static float *load_image_for_dinov3(const char *path) {
     int w, h, c;
@@ -190,6 +196,8 @@ int main(int argc, char **argv) {
                 "\nStage 2 (shape generation):\n"
                 "  --stage2 <path>      Stage 2 flow model .safetensors\n"
                 "  --shape-dec <path>   Shape decoder .safetensors\n"
+                "  --sparse-threshold <t> Occupancy threshold for Stage 2 sparse coords (default: 0.0)\n"
+                "  --max-sparse <N>     Keep only top-N Stage 2 occupancy voxels (default: unlimited)\n"
                 "  --s2-steps <N>       Stage 2 Euler steps (default: 12)\n"
                 "  --s2-cfg <scale>     Stage 2 CFG scale (default: 7.5)\n"
                 "  --s2-npy <path>      Save Stage 2 latent as .npy\n"
@@ -218,6 +226,8 @@ int main(int argc, char **argv) {
     const char *occ_npy_path = NULL;
     const char *stage2_path = NULL;
     const char *shape_dec_path = NULL;
+    float sparse_threshold = 0.0f;
+    int max_sparse = 0;
     int s2_steps = 12;
     float s2_cfg = 7.5f;
     const char *s2_npy_path = NULL;
@@ -241,6 +251,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--noise") && i+1 < argc) noise_path = argv[++i];
         else if (!strcmp(argv[i], "--stage2") && i+1 < argc) stage2_path = argv[++i];
         else if (!strcmp(argv[i], "--shape-dec") && i+1 < argc) shape_dec_path = argv[++i];
+        else if (!strcmp(argv[i], "--sparse-threshold") && i+1 < argc) sparse_threshold = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--max-sparse") && i+1 < argc) max_sparse = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--s2-steps") && i+1 < argc) s2_steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--s2-cfg") && i+1 < argc) s2_cfg = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--s2-npy") && i+1 < argc) s2_npy_path = argv[++i];
@@ -451,20 +463,57 @@ int main(int argc, char **argv) {
                 s2_steps, s2_cfg);
 
         /* Extract sparse coords from occupancy */
-        int N_sparse = occ_count;
+        int N_sparse = 0;
+        for (int i = 0; i < 64 * 64 * 64; i++)
+            if (occupancy[i] > sparse_threshold) N_sparse++;
+
+        int cap_applied = 0;
+        if (max_sparse > 0 && N_sparse > max_sparse) {
+            float *kept = (float *)malloc((size_t)N_sparse * sizeof(float));
+            if (!kept) {
+                fprintf(stderr, "Failed to allocate sparse threshold scratch\n");
+                free(occupancy); cuda_trellis2_free(r); free(features);
+                return 1;
+            }
+            int k = 0;
+            for (int i = 0; i < 64 * 64 * 64; i++)
+                if (occupancy[i] > sparse_threshold) kept[k++] = occupancy[i];
+            qsort(kept, (size_t)N_sparse, sizeof(float), cmp_f32_desc);
+            sparse_threshold = kept[max_sparse - 1];
+            free(kept);
+            N_sparse = max_sparse;
+            cap_applied = 1;
+            fprintf(stderr, "Sparse cap: keeping top %d voxels (effective threshold %.4f)\n",
+                    max_sparse, sparse_threshold);
+        }
+
+        if (N_sparse <= 0) {
+            fprintf(stderr, "No sparse voxels above threshold %.4f\n", sparse_threshold);
+            free(occupancy); cuda_trellis2_free(r); free(features);
+            return 1;
+        }
         int32_t *sparse_coords = (int32_t *)malloc((size_t)N_sparse * 4 * sizeof(int32_t));
+        if (!sparse_coords) {
+            fprintf(stderr, "Failed to allocate sparse coords\n");
+            free(occupancy); cuda_trellis2_free(r); free(features);
+            return 1;
+        }
         int idx = 0;
         for (int z = 0; z < 64; z++)
             for (int y = 0; y < 64; y++)
                 for (int xi = 0; xi < 64; xi++)
-                    if (occupancy[z * 64 * 64 + y * 64 + xi] > 0.0f) {
+                    if (occupancy[z * 64 * 64 + y * 64 + xi] > sparse_threshold ||
+                        (cap_applied && idx < N_sparse &&
+                         occupancy[z * 64 * 64 + y * 64 + xi] == sparse_threshold)) {
                         sparse_coords[idx * 4 + 0] = 0;   /* batch */
                         sparse_coords[idx * 4 + 1] = z;
                         sparse_coords[idx * 4 + 2] = y;
                         sparse_coords[idx * 4 + 3] = xi;
                         idx++;
+                        if (idx == N_sparse) goto sparse_done;
                     }
-        fprintf(stderr, "Sparse voxels: %d\n", N_sparse);
+sparse_done:
+        fprintf(stderr, "Sparse voxels: %d (threshold %.4f)\n", N_sparse, sparse_threshold);
 
         /* Generate noise [N, 32] for Stage 2 */
         int s2_ch = 32;
