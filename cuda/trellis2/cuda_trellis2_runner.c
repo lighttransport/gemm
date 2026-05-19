@@ -1859,14 +1859,170 @@ static void run_decoder(cuda_trellis2_runner *r,
 /* Full pipeline                                                            */
 /* ======================================================================== */
 
+/* Simple xoshiro256** for public predict() sampling. Matches test harness. */
+static uint64_t t2_rotl64(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+typedef struct { uint64_t s[4]; } t2_rng_state;
+static uint64_t t2_rng_next(t2_rng_state *r) {
+    uint64_t *s = r->s;
+    uint64_t result = t2_rotl64(s[1] * 5, 7) * 9;
+    uint64_t t = s[1] << 17;
+    s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
+    s[2] ^= t; s[3] = t2_rotl64(s[3], 45);
+    return result;
+}
+static float t2_rng_randn(t2_rng_state *r) {
+    double u1 = ((double)(t2_rng_next(r) >> 11) + 0.5) / (double)(1ULL << 53);
+    double u2 = ((double)(t2_rng_next(r) >> 11) + 0.5) / (double)(1ULL << 53);
+    return (float)(sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2));
+}
+static float t2_rescale_t(float t, float rt) {
+    return t * rt / (1.0f + (rt - 1.0f) * t);
+}
+
+static float *t2_preprocess_rgb_for_dinov3(const uint8_t *rgb, int w, int h) {
+    if (!rgb || w <= 0 || h <= 0) return NULL;
+    const int out_w = DINO_IMG_SIZE, out_h = DINO_IMG_SIZE;
+    int crop = w < h ? w : h;
+    int ox = (w - crop) / 2;
+    int oy = (h - crop) / 2;
+    float *out = (float *)malloc((size_t)3 * out_w * out_h * sizeof(float));
+    if (!out) return NULL;
+
+    const float mean[3] = {0.485f, 0.456f, 0.406f};
+    const float stdv[3] = {0.229f, 0.224f, 0.225f};
+    for (int y = 0; y < out_h; y++) {
+        float src_y = ((float)y + 0.5f) * (float)crop / (float)out_h - 0.5f;
+        int y0 = (int)floorf(src_y);
+        float fy = src_y - (float)y0;
+        if (y0 < 0) { y0 = 0; fy = 0.0f; }
+        if (y0 >= crop - 1) { y0 = crop - 1; fy = 0.0f; }
+        int y1 = (y0 + 1 < crop) ? y0 + 1 : y0;
+        for (int x = 0; x < out_w; x++) {
+            float src_x = ((float)x + 0.5f) * (float)crop / (float)out_w - 0.5f;
+            int x0 = (int)floorf(src_x);
+            float fx = src_x - (float)x0;
+            if (x0 < 0) { x0 = 0; fx = 0.0f; }
+            if (x0 >= crop - 1) { x0 = crop - 1; fx = 0.0f; }
+            int x1 = (x0 + 1 < crop) ? x0 + 1 : x0;
+            const uint8_t *p00 = rgb + ((size_t)(oy + y0) * w + (ox + x0)) * 3;
+            const uint8_t *p01 = rgb + ((size_t)(oy + y0) * w + (ox + x1)) * 3;
+            const uint8_t *p10 = rgb + ((size_t)(oy + y1) * w + (ox + x0)) * 3;
+            const uint8_t *p11 = rgb + ((size_t)(oy + y1) * w + (ox + x1)) * 3;
+            for (int ch = 0; ch < 3; ch++) {
+                float v0 = (1.0f - fx) * (float)p00[ch] + fx * (float)p01[ch];
+                float v1 = (1.0f - fx) * (float)p10[ch] + fx * (float)p11[ch];
+                float v = ((1.0f - fy) * v0 + fy * v1) / 255.0f;
+                out[(size_t)ch * out_w * out_h + (size_t)y * out_w + x] =
+                    (v - mean[ch]) / stdv[ch];
+            }
+        }
+    }
+    return out;
+}
+
 float *cuda_trellis2_predict(cuda_trellis2_runner *r,
                               const uint8_t *rgb, int w, int h,
                               int n_steps, float cfg_scale,
                               uint32_t seed) {
-    (void)r; (void)rgb; (void)w; (void)h;
-    (void)n_steps; (void)cfg_scale; (void)seed;
-    fprintf(stderr, "T2: full predict not implemented yet (use per-stage APIs)\n");
-    fprintf(stderr, "T2: DINOv3 GPU encoding is not available in this entry point; pass pre-computed features\n");
+    if (!r || !rgb || w <= 0 || h <= 0 || n_steps <= 0) return NULL;
+    if (!r->dino_patch_w || !r->dit_x_emb_w || !r->dec_conv_in_w) {
+        fprintf(stderr, "T2: predict requires DINOv3, Stage 1 DiT, and decoder weights\n");
+        return NULL;
+    }
+
+    const int N = DIT_N_TOKENS;
+    const int C = DIT_IN_CH;
+    const int cond_tokens = DINO_SEQ_LEN;
+    const int cond_dim = DIT_COND_DIM;
+    const float rescale = 5.0f;
+    const float sigma_min = 1e-5f;
+    const float cfg_rescale = 0.7f;
+
+    float *image_f32 = t2_preprocess_rgb_for_dinov3(rgb, w, h);
+    float *features = (float *)malloc((size_t)cond_tokens * cond_dim * sizeof(float));
+    float *zeros_cond = (float *)calloc((size_t)cond_tokens * cond_dim, sizeof(float));
+    float *x = (float *)malloc((size_t)N * C * sizeof(float));
+    float *v_cond = (float *)malloc((size_t)N * C * sizeof(float));
+    float *v_uncond = (float *)malloc((size_t)N * C * sizeof(float));
+    float *occupancy = (float *)malloc((size_t)64 * 64 * 64 * sizeof(float));
+    if (!image_f32 || !features || !zeros_cond || !x || !v_cond || !v_uncond || !occupancy) {
+        fprintf(stderr, "T2: predict host allocation failed\n");
+        free(image_f32); free(features); free(zeros_cond); free(x);
+        free(v_cond); free(v_uncond); free(occupancy);
+        return NULL;
+    }
+
+    if (r->verbose) fprintf(stderr, "T2: predict DINOv3 encode\n");
+    if (cuda_trellis2_run_dinov3(r, image_f32, features) != 0) goto fail;
+    free(image_f32);
+    image_f32 = NULL;
+
+    t2_rng_state rng = {{seed, seed ^ 0x9E3779B97F4A7C15ULL,
+                         seed ^ 0x6C62272E07BB0142ULL,
+                         seed ^ 0xBF58476D1CE4E5B9ULL}};
+    for (int i = 0; i < 8; i++) t2_rng_next(&rng);
+    for (int i = 0; i < N * C; i++) x[i] = t2_rng_randn(&rng);
+
+    if (r->verbose)
+        fprintf(stderr, "T2: predict Stage 1 flow (%d steps, cfg=%.2f)\n", n_steps, cfg_scale);
+    for (int step = 0; step < n_steps; step++) {
+        float t_start = 1.0f - (float)step / (float)n_steps;
+        float t_end = 1.0f - (float)(step + 1) / (float)n_steps;
+        float t_cur = t2_rescale_t(t_start, rescale);
+        float t_next = t2_rescale_t(t_end, rescale);
+        int apply_cfg = (t_cur >= 0.6f && t_cur <= 1.0f && cfg_scale != 1.0f);
+
+        if (apply_cfg) {
+            if (cuda_trellis2_run_dit(r, x, t_cur, features, v_cond) != 0) goto fail;
+            if (cuda_trellis2_run_dit(r, x, t_cur, zeros_cond, v_uncond) != 0) goto fail;
+            float *pred_v = v_uncond;
+            for (int i = 0; i < N * C; i++)
+                pred_v[i] = cfg_scale * v_cond[i] + (1.0f - cfg_scale) * v_uncond[i];
+
+            if (cfg_rescale > 0.0f) {
+                float tc = sigma_min + (1.0f - sigma_min) * t_cur;
+                float one_m_sm = 1.0f - sigma_min;
+                double sum_pos = 0.0, sum_cfg = 0.0, sum2_pos = 0.0, sum2_cfg = 0.0;
+                for (int i = 0; i < N * C; i++) {
+                    float x0p = one_m_sm * x[i] - tc * v_cond[i];
+                    float x0c = one_m_sm * x[i] - tc * pred_v[i];
+                    sum_pos += x0p; sum2_pos += (double)x0p * x0p;
+                    sum_cfg += x0c; sum2_cfg += (double)x0c * x0c;
+                }
+                double n = (double)(N * C);
+                double var_pos = (sum2_pos - sum_pos * sum_pos / n) / (n - 1.0);
+                double var_cfg = (sum2_cfg - sum_cfg * sum_cfg / n) / (n - 1.0);
+                double std_pos = var_pos > 0.0 ? sqrt(var_pos) : 0.0;
+                double std_cfg = var_cfg > 0.0 ? sqrt(var_cfg) : 0.0;
+                float ratio = (std_cfg > 1e-8) ? (float)(std_pos / std_cfg) : 1.0f;
+                float sc = cfg_rescale * ratio + (1.0f - cfg_rescale);
+                for (int i = 0; i < N * C; i++) {
+                    float x0c = one_m_sm * x[i] - tc * pred_v[i];
+                    pred_v[i] = (one_m_sm * x[i] - sc * x0c) / tc;
+                }
+            }
+
+            for (int i = 0; i < N * C; i++)
+                x[i] -= (t_cur - t_next) * pred_v[i];
+        } else {
+            if (cuda_trellis2_run_dit(r, x, t_cur, features, v_cond) != 0) goto fail;
+            for (int i = 0; i < N * C; i++)
+                x[i] -= (t_cur - t_next) * v_cond[i];
+        }
+        if (r->verbose >= 2)
+            fprintf(stderr, "  predict step %d/%d t=%.4f->%.4f %s\n",
+                    step + 1, n_steps, t_cur, t_next, apply_cfg ? "CFG" : "noG");
+    }
+
+    if (r->verbose) fprintf(stderr, "T2: predict structure decoder\n");
+    if (cuda_trellis2_run_decoder(r, x, occupancy) != 0) goto fail;
+
+    free(features); free(zeros_cond); free(x); free(v_cond); free(v_uncond);
+    return occupancy;
+
+fail:
+    free(image_f32); free(features); free(zeros_cond); free(x);
+    free(v_cond); free(v_uncond); free(occupancy);
     return NULL;
 }
 
