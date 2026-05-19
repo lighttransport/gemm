@@ -96,6 +96,12 @@ static int test_kernel_split_selector(void) {
     fail |= (qimg_f32_split_kv_from_env("garbage", 2048) != 0);
     fail |= (qimg_f32_split_kv_from_env("12x", 2048) != 0);
     fail |= (qimg_f32_split_kv_from_env("-4", 2048) != 0);
+    fail |= (!qimg_f32_split_env_is_auto("auto"));
+    fail |= (qimg_f32_split_env_is_auto("1024"));
+    fail |= (qimg_f32_split_env_is_auto(NULL));
+    fail |= (qimg_f32_split_apply_tensor_attn_priority("auto", 256, 1) != 0);
+    fail |= (qimg_f32_split_apply_tensor_attn_priority("auto", 256, 0) != 256);
+    fail |= (qimg_f32_split_apply_tensor_attn_priority("256", 256, 1) != 256);
     if (fail) {
         fprintf(stderr, "FAIL\n");
         return 1;
