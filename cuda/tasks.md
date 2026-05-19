@@ -179,7 +179,9 @@ follow-ups.
      split-key remains valuable for the qimg fallback path. The same 4608-token
      bench was added for flux2
      and still regressed: about 6.72 ms baseline -> 8.94-8.99 ms split
-     (0.75x), so flux2 `auto` remains disabled.
+     (0.75x). Flux2 also now has a 4608-token/24-head production-shape bench;
+     it measured about 200.8 ms baseline -> 205.6 ms split (0.98x), so flux2
+     `auto` remains disabled.
      BF16/FP8 split-key tensor-core variants remain future work.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
      win). The plan's original framing was grid parallelism across keys
