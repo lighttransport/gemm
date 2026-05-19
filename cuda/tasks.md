@@ -173,7 +173,10 @@ follow-ups.
      `1024` close enough to trade places. qimg `auto` keeps `1024` for the
      lower-workspace path. qimg kernel tests now also verify dispatch priority:
      `auto` keeps the active BF16 tensor-core attention path, while numeric
-     split values still force F32 split-key for experiments. The same 4608-token
+     split values still force F32 split-key for experiments. qimg tests also
+     include a 4608-token/24-head production-shape F32 split bench; on this host
+     it measured about 514.6 ms baseline -> 205.6 ms split (2.50x), confirming
+     split-key remains valuable for the qimg fallback path. The same 4608-token
      bench was added for flux2
      and still regressed: about 6.72 ms baseline -> 8.94-8.99 ms split
      (0.75x), so flux2 `auto` remains disabled.
