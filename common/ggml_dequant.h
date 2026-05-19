@@ -229,6 +229,20 @@ static inline float ggml_fp16_to_fp32(uint16_t h) {
     return result;
 }
 
+/* Round-to-nearest f32 -> f16 (IEEE half). Used to encode per-block quant
+ * scales, which are always small positive values (absmax/127), so the
+ * subnormal/overflow branches below are defensive rather than hot. */
+static inline uint16_t ggml_fp32_to_fp16(float f) {
+    union { float f; uint32_t u; } u; u.f = f;
+    uint32_t bits = u.u;
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t  exp  = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = (bits >> 13) & 0x3ff;
+    if (exp <= 0)       return (uint16_t)sign;
+    if (exp >= 31)      return (uint16_t)(sign | 0x7c00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
 void dequantize_row_q2_K(const void *src, float *dst, int n);
 void dequantize_row_q3_K(const void *src, float *dst, int n);
 void dequantize_row_q8_0(const void *src, float *dst, int n);
@@ -1624,6 +1638,56 @@ static inline void matvec_bf16_8row_pv(float *dst,
     }
     /* n is required to be a multiple of vl by the panel build constraint;
      * no tail handling needed in the kernel. */
+    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
+    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
+    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
+    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* int8 svdot W8A8 8-row matvec for the q8_pv "group" layout.
+ *
+ * group layout (per 8 rows × K cols, K % 64 == 0):
+ *   nb = K / 64 blocks, each 528 bytes:
+ *     bytes [0..16)    -> 8 fp16 row-scales (row 0..7)
+ *     bytes [16..528)  -> 8 rows × 64 int8 quants, row-major
+ *
+ * X is pre-quantized once per matvec into int8 + per-64-block fp16 scale
+ * (see tf_quant_x_sdot). Per row per 64-block: one svdot_s32 (64 int8 MACs
+ * -> 16 i32 lanes) + svcvt + svmla by the scalar (w_scale × x_scale) into a
+ * float lane-accumulator. Block scales fold via the svmla, so there is only
+ * ONE horizontal reduction (svaddv) per row, at the very end. Weight DRAM is
+ * ~1.03 B/elem (528/512) vs bf16_8row_pv's 2.0 — and unlike the scalar-scale
+ * Q8 kernel this stays HBM-BW-bound (svdot keeps the FLA pipe from saturating)
+ * giving ~2× at the model's bandwidth regime. */
+static inline void matvec_sdot_8row(float *dst,
+                                     const uint8_t *group, /* points at block 0 */
+                                     const int8_t *xq, const uint16_t *xscale,
+                                     int K) {
+    svbool_t pg = svptrue_b32();
+    svbool_t pb = svptrue_b8();
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
+    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    int nb = K / 64;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = group + (size_t)b * 528;
+        const uint16_t *scl = (const uint16_t *)blk;
+        const int8_t *qs    = (const int8_t *)(blk + 16);
+        float xs = ggml_fp16_to_fp32(xscale[b]);
+        svint8_t xv = svld1_s8(pb, xq + (size_t)b * 64);
+        #define SDOT_ROW(R, ACC)                                              \
+            do {                                                              \
+                svint8_t wv = svld1_s8(pb, qs + (size_t)(R) * 64);            \
+                svint32_t d = svdot_s32(svdup_s32(0), wv, xv);                \
+                svfloat32_t df = svcvt_f32_s32_x(pg, d);                      \
+                float sc = ggml_fp16_to_fp32(scl[R]) * xs;                    \
+                ACC = svmla_x(pg, ACC, df, svdup_f32(sc));                    \
+            } while (0)
+        SDOT_ROW(0, a0); SDOT_ROW(1, a1); SDOT_ROW(2, a2); SDOT_ROW(3, a3);
+        SDOT_ROW(4, a4); SDOT_ROW(5, a5); SDOT_ROW(6, a6); SDOT_ROW(7, a7);
+        #undef SDOT_ROW
+    }
     dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
     dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
     dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
