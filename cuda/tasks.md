@@ -163,8 +163,10 @@ follow-ups.
      faster BF16/FP8 tensor-core attention path is not active; numeric values
      still force F32 split-key for experiments.
      `FLUX2_FA2_SPLIT_F32=auto` currently declines to split because the
-     measured path regresses. Keep this opt-in until real model shapes are
-     tuned. A 4608-token qimg microbench was added to approximate the
+     measured path regresses; it also has the same tensor-core-priority guard
+     so future auto heuristics will not preempt active BF16/FP8 attention
+     unless a numeric split is explicitly requested. Keep this opt-in until
+     real model shapes are tuned. A 4608-token qimg microbench was added to approximate the
      1024x1024 image-token regime; recent runs measure about 12.14 ms
      baseline -> 8.97-8.99 ms split (1.35x), with `split_kv=512` and
      `1024` close enough to trade places. qimg `auto` keeps `1024` for the
