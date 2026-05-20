@@ -380,3 +380,31 @@ Findings:
 layers -> 4.20 dB (unusable). qimg trades raw GEMM throughput for a quality-safe
 gate; the open perf item is the ~0.70x kernel gap on fc1, independent of the
 coverage/quality work above.
+
+## Vendor (Tensile) FP8 kernel dispatch — opt-in x1.0 path (2026-05-21)
+
+`QIMG_FP8_VENDOR=1` makes the FP8xFP8 path dispatch the extracted vendor
+(hipBLASLt/Tensile) FP8 GEMM instead of the hand-written
+`gemm_fp8_fp8w_perrow_pgr2` — the same kernel class `torch._scaled_mm` /
+ComfyUI use. This reaches GEMM parity (x1.0): on qimg shapes it is 1.5-2.6x the
+hand-written kernel (fc1 4096x12288x3072: 154.7 -> 233.5 TF/s).
+
+- Loads `rdna4/fp8/fp8_kernel_gfx1201.co` (build artifact; regenerate via
+  `rdna4/fp8/extract_fp8_kernel.sh`). Path override: `QIMG_FP8_VENDOR_CO`.
+  Launched through `hipModuleLaunchKernel` with the 172-byte Tensile kernarg
+  (`qimg_launch_fp8_vendor`); per-column F32 bias fused via the kernel's bias
+  slot (BIAS_TYPE=0). Falls back to the hand-written kernel if the .co is
+  absent.
+- End-to-end (1024x1024, all-img FP8, comfy): denoise 88.0s -> 79.8s (+9%).
+  The win is bounded because 1024^2 denoise is attention-bound, not
+  FP8-GEMM-bound; the FP8 GEMM is only part of the step.
+- **Quality caveat (why it is opt-in, not default):** the vendor kernel takes a
+  *scalar* activation scale, so it forces scale=1 quant. That is ~1.5 dB below
+  the hand-written `clamp` per-row path on knife-edge configs (fc1 30..59:
+  48.62 dB vendor vs 50.07 dB hand-written; fc1 8..59: 48.15 dB). It still
+  clears the 48 dB perceptually-lossless tier, but would silently break the
+  documented 50 dB configs, so it is OFF by default.
+- **To make it default-on without the quality hit:** feed the vendor `scaleB` a
+  per-tensor `clamp` scale (compute global max-abs, set scaleB = max>448 ?
+  max/448 : 1). The per-tensor == per-row MAE equivalence above guarantees this
+  recovers the hand-written clamp quality at vendor speed. Not yet implemented.
