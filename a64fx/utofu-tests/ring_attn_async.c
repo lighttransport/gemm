@@ -23,6 +23,27 @@
  * broadcast N-1->0->..->N-2 = 2(N-1) hops, every rank ends with the global),
  * unlike ring_attn_overlap's rank-0 one-hop view.
  *
+ * COMPUTE KERNEL: the production qpacked+ktbl QK kernel (transformer.h
+ * tf_qpkd_qk_chunk_*). Query heads ride the 16 SVE lanes (q packed [d][h]); per
+ * (position,dim) the few GQA kv values are loaded once and broadcast to the
+ * head-lanes via svtbl -- NO per-dot svaddv. K is stored K_DP [pos][dim][kv]
+ * (bf16, expanded with <<16). QH=32 is processed as 2 lane-groups of 16 (gqa=4,
+ * KVH=8). This is ~5-7x faster than ring_attn_overlap's svaddv-per-dot kernel,
+ * so 16K compute drops from a pessimistic upper bound (~190us) toward the real
+ * model's ~30-40us -- which makes compute COMPARABLE TO the full-ring comm, the
+ * regime where across-step overlap matters most. The intra-node parallelisation
+ * stays per-thread-partial + online-softmax merge (NOT the production
+ * position-parallel softmax) so the comm-driver thread can run the reduce
+ * without joining a mid-compute barrier; the qpacked+ktbl QK trick is orthogonal
+ * to that choice. (The earlier svaddv-per-dot kernel is in git commit 07c0c67
+ * for A/B.) MEASURED: this QK trick is only ~20-30% faster end-to-end here, not
+ * production attention's 5-7x -- at 16K per-thread fixed costs (online-softmax
+ * merge, 3 barriers, ~29 pos/thread) dominate; at 1M the kernel is DRAM-bound
+ * streaming the KV shard; and the bulk of production's win is its position-
+ * parallel softmax restructure, which the async overlap precludes. The faster
+ * kernel does make 16K compute (~124us @HW) ~= full-ring comm (~150-170us): the
+ * balanced regime where across-step overlap is exactly the right tool.
+ *
  * Build:  fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp \
  *              -o ring_attn_async ring_attn_async.c -ltofucom -lhwb
  * Run:    RA_SEQ=16384 RA_GROUPS=4 TF_HW_BARRIER=1 mpiexec -np 12 ./ring_attn_async
@@ -127,18 +148,6 @@ static inline svfloat32_t expf_sve(svbool_t pg, svfloat32_t x)
     svint32_t n = svadd_n_s32_x(pg, svcvt_s32_f32_x(pg, flr), 127);
     n = svlsl_n_s32_x(pg, n, 23);
     return svmul_f32_x(pg, y, svreinterpret_f32_s32(n));
-}
-
-static inline float dot_qk_bf16(const float *q, const uint16_t *k, int HD)
-{
-    svbool_t pg = svptrue_b32();
-    svfloat32_t acc = svdup_f32(0.0f);
-    for (int d = 0; d < HD; d += (int)svcntw()) {
-        svuint32_t kb = svld1uh_u32(pg, k + d);
-        svfloat32_t kf = svreinterpret_f32_u32(svlsl_n_u32_x(pg, kb, 16));
-        acc = svmla_f32_x(pg, acc, kf, svld1_f32(pg, q + d));
-    }
-    return svaddv_f32(pg, acc);
 }
 
 static inline void merge_partial(float *A, const float *B, int HD)
@@ -249,9 +258,18 @@ int main(void)
     long WARMUP = envl("RA_WARMUP", 30);
     if (KVH % G != 0) die("RA_GROUPS must divide RA_KVH", -1);
     if (HD % (long)svcntw() != 0) die("RA_HD must be a multiple of svcntw()", -1);
-    long QPKV = QH / KVH;
+    long QPKV = QH / KVH;            /* GQA group size (gqa) */
+    long gqa  = QPKV;
     long kvpg = KVH / G;
     long qhpg = QH / G;
+    /* qpacked+ktbl: query heads ride 16 SVE lanes (svcntw()==16 for f32); a
+     * 16-head lane-group spans <=4 kv-heads so a single quadword broadcast
+     * covers it. Requires QH a multiple of svcntw() and gqa>=4 (16/gqa<=4). */
+    if ((long)svcntw() != 16) die("qpacked kernel assumes svcntw()==16 (f32)", -1);
+    if (QH % 16 != 0)  die("RA_QH must be a multiple of 16 for qpacked+ktbl", -1);
+    if (QH % KVH != 0) die("RA_QH must be a multiple of RA_KVH", -1);
+    if (gqa < 4 || (16 % gqa) != 0) die("qpacked+ktbl needs gqa in {4,8,16}", -1);
+    (void)kvpg;
     float scale = 1.0f / sqrtf((float)HD);
 
     /* ---- uTofu setup ---- */
@@ -341,11 +359,15 @@ int main(void)
 
     float *q = malloc((size_t)QH * HD * sizeof(float));
     for (long i = 0; i < QH * HD; i++) q[i] = 0.01f * (float)((i % 17) - 8);
+    /* qpacked Q: transpose [h][d] -> [d][h] once (q is constant in this bench). */
+    float *q_packed = malloc((size_t)HD * QH * sizeof(float));
+    for (long h = 0; h < QH; h++)
+        for (long d = 0; d < HD; d++) q_packed[d*QH + h] = q[h*HD + d];
     float **part = calloc(nthr, sizeof(float *));
     float **scr  = calloc(nthr, sizeof(float *));
     for (int t = 0; t < nthr; t++) {
         part[t] = malloc((size_t)QH * (HD + 2) * sizeof(float));
-        scr[t]  = malloc((size_t)QPKV * Pt * sizeof(float));
+        scr[t]  = malloc((size_t)QH * Pt * sizeof(float));   /* head-major scores */
     }
     /* two node-partial buffers for the across-step pipeline (parity-indexed) */
     float *buf0 = malloc((size_t)QH * (HD + 2) * sizeof(float));
@@ -380,56 +402,83 @@ int main(void)
                g_hw_enabled ? "HW (libhwb hierarchical)" : "flat OpenMP",
                tot/1048576.0, max_fbytes);
         logmsg("comm = FULL ring all-reduce (reduce + broadcast = %d hops)\n", 2*(N-1));
+        logmsg("kernel = qpacked+ktbl (svtbl QK, K_DP [p][d][kv], gqa=%ld, %ld lane-grp/pos)\n",
+               gqa, (QH + 15) / 16);
     }
 
-    /* compute compute-thread `tid`'s group g into part[tid] (same kernel as
-     * ring_attn_overlap). */
-#define COMPUTE_GROUP(g, tid)                                                     \
+    /* compute compute-thread `tid`'s q-heads [H0, H0+HCNT) into part[tid] using
+     * the PRODUCTION qpacked+ktbl QK kernel: query heads ride the 16 SVE lanes,
+     * K is K_DP [pos][dim][kv] and the few GQA kv values are broadcast to the
+     * head-lanes via svtbl -- no per-dot svaddv. Then the usual per-thread
+     * online-softmax + bf16 A.V over this thread's position range. `idx_v`
+     * (idx[i]=i/gqa) is the svtbl lane->kv map, built per thread below.
+     * QK is done in full 16-lane groups; reading the whole [H0,H0+HCNT) range in
+     * one COMPUTE_ALL pass touches each K_DP cache line once at full width. */
+#define COMPUTE_RANGE(H0, HCNT, tid)                                              \
     do {                                                                          \
         int _cmg = (tid) / cores_per;                                             \
         int _idx = (_cmg == 0) ? (tid) - 1 : (tid) - _cmg * cores_per;            \
         long _p0 = (long)_idx * Pt, _p1 = _p0 + Pt;                               \
         long _Pc = pos_cmg[_cmg];                                                 \
-        for (long _kh = (g)*kvpg; _kh < (g)*kvpg + kvpg; _kh++) {                  \
-            const uint16_t *_K = Kbuf[_cmg] + (size_t)_kh*_Pc*HD;                  \
-            const uint16_t *_V = Vbuf[_cmg] + (size_t)_kh*_Pc*HD;                  \
-            long _q0 = _kh*QPKV;                                                   \
-            float _m[16];                                                         \
-            for (long _qq = 0; _qq < QPKV; _qq++) _m[_qq] = -INFINITY;             \
-            for (long _p = _p0; _p < _p1; _p++) {                                 \
-                const uint16_t *_krow = _K + (size_t)_p*HD;                        \
-                for (long _qq = 0; _qq < QPKV; _qq++) {                            \
-                    float _s = scale * dot_qk_bf16(q + (_q0+_qq)*HD, _krow, HD);   \
-                    scr[tid][_qq*Pt + (_p-_p0)] = _s;                             \
-                    if (_s > _m[_qq]) _m[_qq] = _s;                                \
+        const uint16_t *_Kc = Kbuf[_cmg];                                         \
+        long _h0 = (H0), _hn = (HCNT);                                            \
+        svbool_t _pgd = svptrue_b32();                                            \
+        /* -- QK: per position, all _hn heads via qpacked+ktbl (lane-grps) -- */  \
+        for (long _p = _p0; _p < _p1; _p++) {                                     \
+            const uint16_t *_kp = _Kc + (size_t)_p*HD*KVH;                        \
+            long _pl = _p - _p0;                                                  \
+            for (long _hc = 0; _hc < _hn; _hc += 16) {                            \
+                long _lg = _hn - _hc; if (_lg > 16) _lg = 16;                     \
+                long _hbase = _h0 + _hc;                                          \
+                long _kvbase = _hbase / gqa;                                      \
+                long _nkv = (_lg - 1) / gqa + 1;                                  \
+                svbool_t _pgh = svwhilelt_b32((uint64_t)0, (uint64_t)_lg);        \
+                svbool_t _pgk = svwhilelt_b32((uint64_t)0, (uint64_t)_nkv);       \
+                svfloat32_t _acc = svdup_f32(0.0f);                              \
+                for (long _d = 0; _d < HD; _d++) {                               \
+                    svfloat32_t _qv = svld1_f32(_pgh, q_packed + _d*QH + _hbase); \
+                    svuint32_t _kb = svld1uh_u32(_pgk, _kp + (size_t)_d*KVH + _kvbase); \
+                    svfloat32_t _kf = svreinterpret_f32_u32(svlsl_n_u32_x(_pgk,_kb,16)); \
+                    _acc = svmla_f32_x(_pgh, _acc, _qv, svtbl_f32(_kf, idx_v));   \
                 }                                                                 \
+                float _tmp[16];                                                  \
+                svst1_f32(_pgh, _tmp, svmul_n_f32_x(_pgh, _acc, scale));          \
+                for (long _i = 0; _i < _lg; _i++)                                \
+                    scr[tid][(_hc + _i)*Pt + _pl] = _tmp[_i];                    \
             }                                                                     \
-            for (long _qq = 0; _qq < QPKV; _qq++) {                               \
-                float *_sc = scr[tid] + _qq*Pt;                                    \
-                svbool_t _pg;                                                     \
-                for (long _i = 0; _i < Pt; _i += (long)svcntw()) {                \
-                    _pg = svwhilelt_b32((uint64_t)_i, (uint64_t)Pt);              \
-                    svfloat32_t _v = svsub_n_f32_x(_pg, svld1_f32(_pg, _sc+_i), _m[_qq]); \
-                    svst1_f32(_pg, _sc+_i, expf_sve(_pg, _v));                    \
-                }                                                                 \
-                float _l = 0; for (long _i=0;_i<Pt;_i++) _l += _sc[_i];           \
-                float *_o = part[tid] + (_q0+_qq)*(HD+2);                          \
-                _o[0] = _m[_qq]; _o[1] = _l;                                       \
-                svbool_t _pgd = svptrue_b32();                                     \
-                for (long _d = 0; _d < HD; _d += (long)svcntw()) svst1_f32(_pgd, _o+2+_d, svdup_f32(0.0f)); \
-                for (long _p = _p0; _p < _p1; _p++) {                             \
-                    float _w = _sc[_p-_p0];                                        \
-                    const uint16_t *_vrow = _V + (size_t)_p*HD;                    \
-                    for (long _d = 0; _d < HD; _d += (long)svcntw()) {            \
-                        svuint32_t _vb = svld1uh_u32(_pgd, _vrow+_d);             \
-                        svfloat32_t _vf = svreinterpret_f32_u32(svlsl_n_u32_x(_pgd,_vb,16)); \
-                        svfloat32_t _of = svld1_f32(_pgd, _o+2+_d);              \
-                        svst1_f32(_pgd, _o+2+_d, svmla_n_f32_x(_pgd,_of,_vf,_w)); \
-                    }                                                             \
+        }                                                                         \
+        /* -- softmax + A.V per head over this thread's position sub-range -- */  \
+        for (long _lh = 0; _lh < _hn; _lh++) {                                    \
+            long _hg = _h0 + _lh, _kvh = _hg / gqa;                               \
+            const uint16_t *_V = Vbuf[_cmg] + (size_t)_kvh*_Pc*HD;               \
+            float *_sc = scr[tid] + _lh*Pt;                                       \
+            float _m = -INFINITY;                                                 \
+            for (long _i = 0; _i < Pt; _i++) if (_sc[_i] > _m) _m = _sc[_i];      \
+            for (long _i = 0; _i < Pt; _i += (long)svcntw()) {                    \
+                svbool_t _pg = svwhilelt_b32((uint64_t)_i, (uint64_t)Pt);         \
+                svfloat32_t _v = svsub_n_f32_x(_pg, svld1_f32(_pg, _sc+_i), _m);  \
+                svst1_f32(_pg, _sc+_i, expf_sve(_pg, _v));                        \
+            }                                                                     \
+            float _l = 0; for (long _i=0;_i<Pt;_i++) _l += _sc[_i];               \
+            float *_o = part[tid] + _hg*(HD+2);                                   \
+            _o[0] = _m; _o[1] = _l;                                               \
+            for (long _d = 0; _d < HD; _d += (long)svcntw()) svst1_f32(_pgd, _o+2+_d, svdup_f32(0.0f)); \
+            for (long _p = _p0; _p < _p1; _p++) {                                 \
+                float _w = _sc[_p-_p0];                                           \
+                const uint16_t *_vrow = _V + (size_t)_p*HD;                       \
+                for (long _d = 0; _d < HD; _d += (long)svcntw()) {               \
+                    svuint32_t _vb = svld1uh_u32(_pgd, _vrow+_d);                \
+                    svfloat32_t _vf = svreinterpret_f32_u32(svlsl_n_u32_x(_pgd,_vb,16)); \
+                    svfloat32_t _of = svld1_f32(_pgd, _o+2+_d);                  \
+                    svst1_f32(_pgd, _o+2+_d, svmla_n_f32_x(_pgd,_of,_vf,_w));    \
                 }                                                                 \
             }                                                                     \
         }                                                                         \
     } while (0)
+/* all heads, single full-width pass (compute-only/serial/async) */
+#define COMPUTE_ALL(tid)        COMPUTE_RANGE(0, QH, tid)
+/* one head-group (PIPE pipelining only; may run at <16 lanes if qhpg<16) */
+#define COMPUTE_GROUP(g, tid)   COMPUTE_RANGE((g)*qhpg, qhpg, tid)
 
     /* merge group g's per-thread partials into DST (parallel over the group's
      * q-heads; thread `tid` owns heads where (h-qh0) % nthr == tid). */
@@ -481,6 +530,10 @@ int main(void)
         if (g_hw_enabled && g_assign_failed) { g_hw_enabled = 0; fprintf(stderr, "HW barrier join failed; flat\n"); }
 #pragma omp barrier
         uint64_t seq = seq0;        /* private; only tid0's advances matter */
+        /* svtbl lane->kv map for qpacked+ktbl: head-lane i -> kv (i/gqa) */
+        uint32_t _idxa[16];
+        for (int i = 0; i < 16; i++) _idxa[i] = (uint32_t)(i / gqa);
+        svuint32_t idx_v = svld1_u32(svptrue_b32(), _idxa);
 
         /* ===== A) compute-only (nct threads) ===== */
         double tA = 0;
@@ -488,7 +541,7 @@ int main(void)
             STEPBAR(tid, bb, &ls4);
 #pragma omp master
             if (it == WARMUP) tA = now_sec();
-            for (long g = 0; g < G; g++) if (tid != 0) COMPUTE_GROUP(g, tid);
+            if (tid != 0) COMPUTE_ALL(tid);
             STEPBAR(tid, bb, &ls4);
             for (long g = 0; g < G; g++) MERGE_GROUP(bufs[0], g, tid);
             STEPBAR(tid, bb, &ls4);
@@ -519,7 +572,7 @@ int main(void)
             STEPBAR(tid, bb, &ls4);
 #pragma omp master
             if (it == WARMUP) tC = now_sec();
-            for (long g = 0; g < G; g++) if (tid != 0) COMPUTE_GROUP(g, tid);
+            if (tid != 0) COMPUTE_ALL(tid);
             STEPBAR(tid, bb, &ls4);
             for (long g = 0; g < G; g++) MERGE_GROUP(bufs[0], g, tid);
             STEPBAR(tid, bb, &ls4);
@@ -538,7 +591,7 @@ int main(void)
 #pragma omp master
             if (it == WARMUP) tD = now_sec();
             /* phase A: compute (compute threads) || reduce prev (comm thread) */
-            if (tid != 0) { for (long g = 0; g < G; g++) COMPUTE_GROUP(g, tid); }
+            if (tid != 0) COMPUTE_ALL(tid);
             else          { full_allreduce(prev, 0, QH, seq + 1, seq + 2); seq += 2; }
             STEPBAR(tid, bb, &ls4);                 /* both done */
             /* phase B: publish this step's merged partial into cur */
@@ -597,7 +650,7 @@ int main(void)
 
     utofu_dereg_mem(g_vcq, g_base_stadd, 0);
     utofu_free_vcq(g_vcq);
-    free(region); free(q); free(buf0); free(buf1);
+    free(region); free(q); free(q_packed); free(buf0); free(buf1);
     for (int t = 0; t < nthr; t++) { free(part[t]); free(scr[t]); }
     free(part); free(scr);
     for (int c = 0; c < ncmg; c++) { free(Kbuf[c]); free(Vbuf[c]); }
