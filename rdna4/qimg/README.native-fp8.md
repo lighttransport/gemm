@@ -307,10 +307,11 @@ This is an INT8 intuition that does not transfer to FP8. The same argument
 rules out the "outlier-split BF16 lane" idea — there are no range outliers to
 split.
 
-The only remaining levers are therefore (a) **layer-depth gating** (done: fc1
-deep layers, 17% at 50 dB) and (b) **the quality threshold** (48 dB unlocks fc1
-8..59 = 29%). Improving the activation quantizer is not a viable lever, and the
-kernel is already at vendor-class throughput.
+The only remaining levers for *coverage* are therefore (a) **layer-depth
+gating** (done: fc1 deep layers, 17% at 50 dB) and (b) **the quality threshold**
+(48 dB unlocks fc1 8..59 = 29%). Improving the activation quantizer is not a
+viable lever. (Kernel *throughput* is a separate axis — see below: our
+hand-written kernel runs at ~60-70% of the vendor FP8 GEMM.)
 
 ### The 50 dB latent gate is too strict — 48 dB is perceptually lossless (2026-05-20)
 
@@ -338,3 +339,44 @@ ship the 48 dB latent point to roughly double quality-safe FP8 coverage:
   --fp8-quality-target-db 48
 # -> 49.67 dB latent, 20.10 TF FP8xFP8 (29% of the eligible pool), PNG indistinguishable
 ```
+
+## FP8 GEMM throughput vs ComfyUI fast-fp8 (2026-05-20)
+
+ComfyUI's `--fast fp8_matrix_mult` calls `torch._scaled_mm` (scale=1), which on
+gfx1201/ROCm 7.2.2 dispatches a hipBLASLt/Tensile FP8 kernel. qimg's FP8xFP8
+path instead uses a hand-written HIPRTC WMMA kernel
+(`gemm_fp8_fp8w_perrow_pgr2`) because hipBLASLt's *C++* FP8 entry point is
+broken on this stack. Two low-memory microbenches (one GEMM at a time — the
+full PyTorch pipeline OOMs a 16 GB card) on the real Qwen-Image DiT shapes
+(hidden=3072, mlp_h=12288), GEMM-only (activation cast excluded):
+
+- `tools/bench_comfy_fast_fp8.py` — `torch._scaled_mm` vs bf16 `F.linear`.
+- `tools/bench_qimg_fp8_kernel.c` — qimg's `gemm_fp8_fp8w_perrow_pgr2`.
+
+```text
+                       M=256 (256x256)            M=4096 (1024x1024)
+gemm (NxK)        bf16   comfy   qimg          bf16   comfy   qimg   qimg/comfy
+attn q/k/v/out    69.1   111.7   70.2          119.6  228.8  138.7      0.61x
+mlp_fc1 (12288)   85.0   178.1   83.6          127.5  221.9  154.7      0.70x
+mlp_fc2 (K=12288) 87.4   169.4   89.0          114.2  211.9   91.8      0.43x
+mod (18432)       90.9   194.3   82.6          126.1  224.0  149.6      0.67x
+        (TF/s; backend check mm0: extracted-vendor 214.8 ~= _scaled_mm 208.5)
+```
+
+Findings:
+- ComfyUI fast-fp8 gives a clean ~1.7-2.1x GEMM speedup over its own bf16
+  default and saturates the FP8 ceiling (~210-229 TF/s at M=4096).
+- qimg's hand-written kernel reaches ~60-70% of that on attn/fc1/mod. fc1 (the
+  GEMM we actually FP8-ify for quality) is the best case at 154.7 TF/s (0.70x).
+- `mlp_fc2` (deep K=12288) is qimg's weak spot (0.43x), but it is poison for
+  quality anyway (-9.96 dB) and never enabled — so the throughput gap that
+  matters in practice is the ~0.70x on fc1.
+- Closing the gap means either fixing the hipBLASLt C++ FP8 dispatch (so qimg
+  can call the vendor kernel directly, as torch does) or further WMMA tuning;
+  `rdna4/fp8` notes the hand-written kernel is near the limit of the
+  scheduling/LDS levers tried so far (~44% of the 8-wave WMMA microbench peak).
+
+**Net:** ComfyUI's fast path is faster at the GEMM level but applies fp8 to all
+layers -> 4.20 dB (unusable). qimg trades raw GEMM throughput for a quality-safe
+gate; the open perf item is the ~0.70x kernel gap on fc1, independent of the
+coverage/quality work above.
