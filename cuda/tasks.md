@@ -198,7 +198,13 @@ follow-ups.
      The qimg generate harness also accepts `--enc-st` / `QIMG_TEXT_ENCODER_ST`
      and falls back to the local `/mnt/disk01` FP8-scaled text-encoder
      safetensors instead of requiring the older `/mnt/nvme02` path.
-     BF16/FP8 split-key tensor-core variants remain future work.
+     A BF16-input split partial kernel now exists in both qimg and Flux2 test
+     paths. It consumes the same cast BF16 Q/K/V buffers as the BF16
+     tensor-core attention path, writes the existing `(m,l,O)` partial ABI, and
+     reuses the F32 merge; the small correctness tests compare it against the
+     existing BF16 tensor-core baseline (`max_diff` about 1.9e-4 on this host).
+     This is a typed bridge for the split ABI, not the final tensor-core split
+     kernel. BF16/FP8 split-key tensor-core partial kernels remain future work.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
      win). The plan's original framing was grid parallelism across keys
      for very large n_tok (>2K). For qimg 1024×1024 image stream
@@ -451,6 +457,19 @@ follow-ups.
       `FLUX2_FA2_SPLIT_F32=256 ./test_cuda_flux2 --generate --gpu-enc --no-dumps --height 256 --width 256 --steps 1 --seed 42 --out /tmp/flux2_split_fullpath.ppm`
       and
       `QIMG_FA2_SPLIT_F32=128 ./test_cuda_qimg --generate --dit /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors --vae /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors --enc /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf --enc-st /mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors --prompt smoke --height 256 --width 256 --steps 1 --seed 42`.
+
+35. **[done] BF16-input split-key partial ABI bridge**
+    - Status: qimg and Flux2 now compile `flash_attn_bf16_split_partials`,
+      a BF16-input split partial kernel that consumes cast BF16 Q/K/V buffers,
+      writes the same F32 `(m,l,O)` partial workspace as the F32 split path, and
+      reuses `flash_attn_f32_split_merge`. This validates the split ABI for the
+      BF16 tensor-attention data path without changing runtime dispatch.
+      It is intentionally a scalar bridge, not the final BF16 tensor-core split
+      kernel.
+    - Verify: `make -C cuda/qimg test_cuda_qimg`,
+      `make -C cuda/flux2 test_cuda_flux2`,
+      `./test_cuda_qimg --test-kernels`, and
+      `./test_cuda_flux2 --test-kernels`.
 
 ## Verification harness
 
