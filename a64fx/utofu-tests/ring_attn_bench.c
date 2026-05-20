@@ -31,6 +31,11 @@
  * vs recursive-doubling tree (ceil(log2 N) rounds), and the crossover N where
  * comm starts to dominate -- so one 2-node run shows the whole scaling story.
  *
+ * The ring relay runs twice -- once over the default rank+1 order and once over
+ * a topology-ordered ring that greedily minimises physical link traversals (a
+ * near-Hamiltonian cycle on the torus) -- and rank 0 reports both, to test
+ * whether fewer physical hops actually lowers the measured per-hop latency.
+ *
  * Like tofu_put_demo this binary makes ZERO MPI calls: mpiexec only places it,
  * and it reconstructs ring-neighbour VCQ IDs from coordinates in tofu_topo.txt
  * (written once by tofu_topo_helper) via utofu_construct_vcq_id().
@@ -285,6 +290,20 @@ static double bench_node_bw(size_t per_cmg_mib, double stream_gib,
     return best_gbps;
 }
 
+/* Manhattan distance between two Tofu coord vectors on a torus whose per-axis
+ * extent is ext[k] (axes with ext<=1 are fixed, contribute 0; wrap counts as
+ * adjacent). Scores a ring ordering by the physical link traversals it costs. */
+static int torus_dist(const uint8_t *a, const uint8_t *b, const int *ext)
+{
+    int d = 0;
+    for (int k = 0; k < TOFU_NCOORDS; k++) {
+        int dd = a[k] > b[k] ? a[k] - b[k] : b[k] - a[k];
+        if (ext[k] > 1 && ext[k] - dd < dd) dd = ext[k] - dd;   /* torus wrap */
+        d += dd;
+    }
+    return d;
+}
+
 int main(void)
 {
     int rc;
@@ -325,10 +344,6 @@ int main(void)
     for (int r = 0; r < nprocs; r++)
         if (memcmp(topo[r], my_coords, TOFU_NCOORDS) == 0) my_rank = r;
     if (my_rank == -1) { fprintf(stderr, "my coords not in %s\n", TOPO_PATH); exit(1); }
-
-    int next_rank = (my_rank + 1) % nprocs;          /* we Put to next */
-    uint8_t next_coords[TOFU_NCOORDS];
-    memcpy(next_coords, topo[next_rank], TOFU_NCOORDS);
 
     utofu_vcq_hdl_t vcq;
     rc = utofu_create_vcq_with_cmp_id(tni, DEMO_CMP_ID, 0, &vcq);
@@ -375,18 +390,9 @@ int main(void)
     if (rc != UTOFU_SUCCESS) die("utofu_reg_mem_with_stag", rc);
     utofu_stadd_t send_stadd = base_stadd + slot;     /* our send slot */
 
-    utofu_vcq_id_t next_vcq;
-    rc = utofu_construct_vcq_id(next_coords, tni, DEMO_CQ_ID, DEMO_CMP_ID, &next_vcq);
-    if (rc != UTOFU_SUCCESS) die("utofu_construct_vcq_id(next)", rc);
-    utofu_set_vcq_id_path(&next_vcq, NULL);
-    utofu_stadd_t next_base;
-    rc = utofu_query_stadd(next_vcq, BENCH_STAG, &next_base);
-    if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(next)", rc);
-    utofu_stadd_t next_recv_stadd = next_base;        /* neighbour's recv slot @ +0 */
-
-    /* VCQ id + region base for EVERY peer, so the tree all-reduce can Put to any
-     * rank (not just the ring successor). Built by convention from coords + STAG,
-     * exactly like next_vcq/next_base above -- no runtime exchange. */
+    /* VCQ id + region base for EVERY peer, so we can Put to any rank (the ring
+     * successor in either ordering, and the tree all-reduce's XOR partners).
+     * Built by convention from coords + STAG -- no runtime exchange. */
     static utofu_vcq_id_t peer_vcq[MAX_NODES];
     static utofu_stadd_t  peer_base[MAX_NODES];
     for (int r = 0; r < nprocs; r++) {
@@ -397,6 +403,49 @@ int main(void)
         rc = utofu_query_stadd(peer_vcq[r], BENCH_STAG, &peer_base[r]);
         if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(peer)", rc);
     }
+
+    /* ---- ring orderings: the default rank+1 ring vs a topology-ordered ring
+     * that greedily minimises physical link traversals (nearest unvisited node
+     * by torus distance, starting from rank 0). Per-axis torus extent is taken
+     * from the coords present in tofu_topo.txt. We relay over both and compare,
+     * to see whether fewer physical hops actually lowers the measured latency or
+     * whether (as for the ring's per-hop) it is software-bound and indifferent. */
+    int ext[TOFU_NCOORDS];
+    for (int k = 0; k < TOFU_NCOORDS; k++) {
+        int lo = 255, hi = 0;
+        for (int r = 0; r < nprocs; r++) {
+            if (topo[r][k] < lo) lo = topo[r][k];
+            if (topo[r][k] > hi) hi = topo[r][k];
+        }
+        ext[k] = hi - lo + 1;
+    }
+    static int order_opt[MAX_NODES];
+    {
+        char used[MAX_NODES] = {0};
+        order_opt[0] = 0; used[0] = 1;
+        for (int i = 1; i < nprocs; i++) {
+            int cur = order_opt[i - 1], best = -1, bestd = 1 << 30;
+            for (int r = 0; r < nprocs; r++) {
+                if (used[r]) continue;
+                int dd = torus_dist(topo[cur], topo[r], ext);
+                if (dd < bestd) { bestd = dd; best = r; }
+            }
+            order_opt[i] = best; used[best] = 1;
+        }
+    }
+    int succ_def = (my_rank + 1) % nprocs;            /* default ring successor */
+    int succ_opt = succ_def;                          /* topo-ring successor */
+    for (int i = 0; i < nprocs; i++)
+        if (order_opt[i] == my_rank) { succ_opt = order_opt[(i + 1) % nprocs]; break; }
+    int phys_def = 0, phys_opt = 0;                   /* physical links per ring loop */
+    for (int i = 0; i < nprocs; i++) {
+        phys_def += torus_dist(topo[i], topo[(i + 1) % nprocs], ext);
+        phys_opt += torus_dist(topo[order_opt[i]], topo[order_opt[(i + 1) % nprocs]], ext);
+    }
+
+    /* current ring successor for RING_PUT; swapped between the two relay phases */
+    utofu_vcq_id_t cur_vcq        = peer_vcq[succ_def];
+    utofu_stadd_t  cur_recv_stadd = peer_base[succ_def];
 
     size_t put_len = p8 + 8;                          /* payload + seq counter */
     const unsigned long flags = UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
@@ -413,7 +462,7 @@ int main(void)
 #define RING_PUT()                                                              \
     do {                                                                        \
         for (;;) {                                                              \
-            rc = utofu_put(vcq, next_vcq, send_stadd, next_recv_stadd,           \
+            rc = utofu_put(vcq, cur_vcq, send_stadd, cur_recv_stadd,             \
                            put_len, 0, flags, NULL);                            \
             if (rc != UTOFU_ERR_BUSY) break;                                    \
             utofu_poll_tcq(vcq, 0, &cb);                                        \
@@ -472,9 +521,17 @@ int main(void)
         (elapsed) = now_sec() - _t0;                                            \
     } while (0)
 
-    double warm_el = 0.0, timed_el = 0.0;
+    /* phase 1: default rank+1 ring (cur_* already point at succ_def) */
+    double warm_el = 0.0, timed_def = 0.0;
     RELAY(WARMUP, warm_el);
-    RELAY(ITERS, timed_el);
+    RELAY(ITERS, timed_def);
+
+    /* phase 2: topology-ordered ring (same machinery, successor swapped) */
+    double timed_opt = 0.0;
+    cur_vcq = peer_vcq[succ_opt];
+    cur_recv_stadd = peer_base[succ_opt];
+    RELAY(WARMUP, warm_el);
+    RELAY(ITERS, timed_opt);
 
     /* ---- tree all-reduce (recursive doubling, the comm pattern that actually
      * scales as ceil(log2 N) instead of the ring's N-1). Standard Rabenseifner
@@ -580,7 +637,7 @@ int main(void)
 
     /* rank 0 owns the ring-comm timing and prints the combined estimate */
     if (my_rank == 0) {
-        double per_token_us = timed_el / (double)ITERS * 1e6;  /* N-hop round trip */
+        double per_token_us = timed_def / (double)ITERS * 1e6;  /* N-hop round trip */
         double per_hop_us   = per_token_us / (double)nprocs;
         double ring_reduce_us = per_hop_us * (double)(nprocs - 1);
         double hop_bw = (double)payload / (per_hop_us * 1e-6) / 1e9;
@@ -590,6 +647,22 @@ int main(void)
         logmsg("full circulation  = %.2f us  (%d hops)\n", per_token_us, nprocs);
         logmsg("ring-reduce       = %.2f us  (%d hops, the decode comm cost)\n",
                ring_reduce_us, nprocs - 1);
+
+        /* topology-ordered ring vs default rank+1: does minimising physical link
+         * traversals lower the measured per-hop latency, or is it sw-bound? */
+        double per_token_opt = timed_opt / (double)ITERS * 1e6;
+        logmsg("\n--- topology-ordered ring vs default rank+1 ---\n");
+        logmsg("default rank+1 : %2d physical links (%.2f/hop), circ %.2f us, %.3f us/hop\n",
+               phys_def, (double)phys_def / nprocs, per_token_us, per_hop_us);
+        logmsg("topo-ordered   : %2d physical links (%.2f/hop), circ %.2f us, %.3f us/hop\n",
+               phys_opt, (double)phys_opt / nprocs, per_token_opt, per_token_opt / nprocs);
+        logmsg("topo ring saves %d physical links; measured latency change = %+.1f%%\n",
+               phys_def - phys_opt, (per_token_opt / per_token_us - 1.0) * 100.0);
+        if (nprocs <= 24) {
+            logmsg("topo order     :");
+            for (int i = 0; i < nprocs; i++) logmsg(" %d", order_opt[i]);
+            logmsg("\n");
+        }
 
         double tree_us = tree_timed / (double)ITERS * 1e6;
         int tree_steps = nrounds + (rem > 0 ? 2 : 0);
