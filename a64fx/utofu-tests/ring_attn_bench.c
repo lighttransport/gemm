@@ -314,6 +314,7 @@ int main(void)
     long KVH    = envl("RA_KVH", 8);
     long HD     = envl("RA_HD", 128);
     long KVB    = envl("RA_KVB", 2);
+    long RBYTES = envl("RA_RBYTES", 4);   /* reduce element size: 4=fp32, 2=bf16/fp16 */
     long ITERS  = envl("RA_ITERS", 2000);
     long WARMUP = envl("RA_WARMUP", 200);
     long MEMGB  = envl("RA_MEMGB", 8);
@@ -371,7 +372,7 @@ int main(void)
      * reduction payload followed by an 8-byte sequence counter the receiver polls
      * (written last) to detect arrival. The tree uses a distinct recv slot per
      * step so a partner advancing to the next step can't overwrite an unread one. */
-    size_t payload = (size_t)QH * (HD + 2) * sizeof(float); /* m,l + o[HD] per head */
+    size_t payload = (size_t)QH * (HD + 2) * (size_t)RBYTES; /* m,l + o[HD] per head */
     size_t p8      = (payload + 7) & ~(size_t)7;
     size_t slot    = (p8 + 8 + (DEMO_CACHE_LINE - 1)) & ~(size_t)(DEMO_CACHE_LINE - 1);
     size_t region_sz = (size_t)(2 + TREE_NSTEP) * slot;
@@ -455,7 +456,8 @@ int main(void)
         logmsg("=== ring-attention DECODE cost estimate (no GEMM) ===\n");
         logmsg("nodes=%d  seq S=%ld  pos/node=%ld  q_heads=%ld kv_heads=%ld head_dim=%ld kv_bytes=%ld\n",
                nprocs, S, (S + nprocs - 1) / nprocs, QH, KVH, HD, KVB);
-        logmsg("ring payload = %zu B (q_heads*(head_dim+2)*4)\n", payload);
+        logmsg("ring payload = %zu B (q_heads*(head_dim+2)*%ld, reduce elem %s)\n",
+               payload, RBYTES, RBYTES == 2 ? "bf16/fp16" : RBYTES == 4 ? "fp32" : "?");
     }
 
     /* ---- helper: one ring Put of our send slot into the neighbour's recv ---- */

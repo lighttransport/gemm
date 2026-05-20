@@ -135,6 +135,30 @@ TNIs are for parallelism across *distinct* destinations (different torus
 links/directions), not for fattening one peer-to-peer pipe — a multi-rail /
 dimensional collective could exploit them, but single-peer striping is closed.
 
+### 6. bf16 reduce payload — the **one single-peer lever that works** (`RA_RBYTES`)
+The per-hop fit says the only knob left for a single-peer hop is fewer bytes.
+Sending the online-softmax partials in bf16/fp16 instead of fp32 halves the
+payload (16640 → 8320 B) and delivers exactly the predicted cut on the 12-node
+torus @16K:
+```
+                fp32 16640 B   bf16 8320 B   change
+per-hop            3.81 us       2.47 us     -35%
+ring-reduce        41.92 us      27.14 us    -35%
+tree all-reduce    23.59 us      13.61 us    -42%
+attn-only u.b.     23.9k tok/s   36.8k tok/s +54%
+```
+The tree gains *more* (−42%) than the ring (−35%): its distant-partner premium
+is partly congestion (bytes-in-flight), so halving the payload cuts both the
+base transfer and the congestion term (per-step premium +0.91 → +0.25 µs).
+**bf16 + tree = 13.6 µs vs the original fp32 ring 41.9 µs = 3.1× total.**
+
+Precision note: `m` (running max, 1 scalar/head) and ideally `l` (normalizer)
+should stay fp32 — only `o` (the HD-vector accumulator, the bulk) needs to ride
+in bf16. A mixed `m,l` fp32 + `o` bf16 payload = QH*(2·4 + HD·2) = 8448 B, only
+~1.5% above full-bf16, so the comm win is essentially unchanged with no risk to
+the normalizer. The benchmark sizes the payload via `RA_RBYTES` (4=fp32,
+2=bf16); it does not model the (negligible) accumulation error.
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -146,10 +170,11 @@ dimensional collective could exploit them, but single-peer striping is closed.
 - **Don't stripe a hop across TNIs** — same-peer TNIs share one link, zero gain
   (K=6 is a net loss). The only payoff from the 6 TNIs is sending to *different*
   peers at once.
-- **To shrink the reduce payload** (the only per-hop knob that helps once
-  overhead is amortized): send m,l,o in bf16/fp16 instead of fp32 — halves the
-  2.6 µs transfer component at 16640 B. The per-hop fit `1.23 + bytes/6.36GB/s`
-  says nothing else moves the single-peer hop.
+- **Send the reduce payload in bf16, not fp32** (`RA_RBYTES=2`) — the one
+  single-peer knob that works: ring-reduce −35% (41.9→27.1 µs), tree −42%
+  (23.6→13.6 µs), attn-only upper bound +54%. Keep `m` (and ideally `l`) fp32,
+  send `o` in bf16 (mixed payload only ~1.5% above full-bf16). With a tree this
+  compounds to 3.1× over the fp32 ring.
 - Comm being context-independent means **long-context decode is mem-bound** (KV
   read dominates) and **short/medium-context decode is comm-bound** (latency of
   the reduce dominates) — the optimization target flips with S.
