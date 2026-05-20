@@ -11,8 +11,10 @@
  *   4. Puts a small payload into the peer's buffer and validates what it
  *      receives from its other-side neighbor.
  *
- * Ring topology: peer = (rank + 1) % nprocs. Runs on 2 nodes today; works for
- * any N unchanged. Assumes node topology is fixed for the job's duration.
+ * Ring topology: peer = (rank + 1) % nprocs. Validated for 2..12 nodes; the
+ * logic is N-agnostic (capped only by MAX_NODES). In a ring each node's recv
+ * buffer has exactly one writer -- its (rank-1) neighbor -- so a single recv
+ * slot suffices at any N. Assumes node topology is fixed for the job's duration.
  *
  * Build (NO -lmpi). Native A64FX node:
  *   fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall \
