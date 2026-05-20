@@ -457,6 +457,40 @@ fail:
     return 1;
 }
 
+static void cpu_flash_attn_f32_ref(float *out, const float *Q, const float *K,
+                                   const float *V, int n_tok, int n_heads,
+                                   int head_dim) {
+    int dim = n_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    for (int qi = 0; qi < n_tok; qi++) {
+        for (int h = 0; h < n_heads; h++) {
+            float m_i = -1e30f, l_i = 0.0f;
+            float o_acc[128];
+            for (int d = 0; d < head_dim; d++) o_acc[d] = 0.0f;
+            for (int kj = 0; kj < n_tok; kj++) {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += Q[(size_t)qi * dim + h * head_dim + d] *
+                           K[(size_t)kj * dim + h * head_dim + d];
+                }
+                float score = dot * scale;
+                float new_max = fmaxf(m_i, score);
+                float alpha = expf(m_i - new_max);
+                float p = expf(score - new_max);
+                l_i = l_i * alpha + p;
+                for (int d = 0; d < head_dim; d++) {
+                    o_acc[d] = o_acc[d] * alpha +
+                               p * V[(size_t)kj * dim + h * head_dim + d];
+                }
+                m_i = new_max;
+            }
+            float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                out[(size_t)qi * dim + h * head_dim + d] = o_acc[d] * inv_l;
+        }
+    }
+}
+
 /* Test 4: split-key F32 flash attention partial+merge path vs baseline F32. */
 static int test_kernel_split_attn_f32(cuda_flux2_runner *r) {
     fprintf(stderr, "  [kernel] flash_attn_f32 split-key vs baseline... ");
@@ -479,8 +513,9 @@ static int test_kernel_split_attn_f32(cuda_flux2_runner *r) {
     float *out_ref = (float *)malloc(n_elems * sizeof(float));
     float *out_split = (float *)malloc(n_elems * sizeof(float));
     float *out_op = (float *)malloc(n_elems * sizeof(float));
-    if (!Q || !K || !V || !out_ref || !out_split || !out_op) {
-        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op);
+    float *out_cpu = (float *)malloc(n_elems * sizeof(float));
+    if (!Q || !K || !V || !out_ref || !out_split || !out_op || !out_cpu) {
+        free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
         fprintf(stderr, "FAIL (host OOM)\n");
         return 1;
     }
@@ -490,6 +525,7 @@ static int test_kernel_split_attn_f32(cuda_flux2_runner *r) {
     for (size_t i = 0; i < n_elems; i++) Q[i] = randn() * 0.35f;
     for (size_t i = 0; i < n_elems; i++) K[i] = randn() * 0.35f;
     for (size_t i = 0; i < n_elems; i++) V[i] = randn() * 0.35f;
+    cpu_flash_attn_f32_ref(out_cpu, Q, K, V, n_tok, n_heads, head_dim);
 
     CUdeviceptr d_Q = gpu_upload_f32(Q, (int)n_elems);
     CUdeviceptr d_K = gpu_upload_f32(K, (int)n_elems);
@@ -576,23 +612,26 @@ static int test_kernel_split_attn_f32(cuda_flux2_runner *r) {
     cuMemFree(d_ref); cuMemFree(d_split); cuMemFree(d_op);
     d_Q = d_K = d_V = d_ref = d_split = d_op = 0;
 
-    float max_diff = 0.0f, mean_diff = 0.0f, op_max_diff = 0.0f;
+    float max_diff = 0.0f, mean_diff = 0.0f, op_max_diff = 0.0f, cpu_max_diff = 0.0f;
     for (size_t i = 0; i < n_elems; i++) {
         float d = fabsf(out_split[i] - out_ref[i]);
         if (d > max_diff) max_diff = d;
         mean_diff += d;
         float od = fabsf(out_op[i] - out_ref[i]);
         if (od > op_max_diff) op_max_diff = od;
+        float cd = fabsf(out_ref[i] - out_cpu[i]);
+        if (cd > cpu_max_diff) cpu_max_diff = cd;
     }
     mean_diff /= (float)n_elems;
-    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op);
-    if (max_diff > 1e-4f || mean_diff > 1e-5f || op_max_diff > 1e-4f) {
-        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g splits=%d)\n",
-                max_diff, mean_diff, op_max_diff, n_splits);
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
+    if (max_diff > 1e-4f || mean_diff > 1e-5f || op_max_diff > 1e-4f ||
+        cpu_max_diff > 1e-4f) {
+        fprintf(stderr, "FAIL (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g cpu_max_diff=%.6g splits=%d)\n",
+                max_diff, mean_diff, op_max_diff, cpu_max_diff, n_splits);
         return 1;
     }
-    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g splits=%d)\n",
-            max_diff, mean_diff, op_max_diff, n_splits);
+    fprintf(stderr, "OK (max_diff=%.6g mean_diff=%.6g op_max_diff=%.6g cpu_max_diff=%.6g splits=%d)\n",
+            max_diff, mean_diff, op_max_diff, cpu_max_diff, n_splits);
 #undef FLUX2_SPLIT_TEST_CU
     return 0;
 fail:
@@ -602,7 +641,7 @@ fail:
     if (d_ref) cuMemFree(d_ref);
     if (d_split) cuMemFree(d_split);
     if (d_op) cuMemFree(d_op);
-    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op);
+    free(Q); free(K); free(V); free(out_ref); free(out_split); free(out_op); free(out_cpu);
 #undef FLUX2_SPLIT_TEST_CU
     return 1;
 }
