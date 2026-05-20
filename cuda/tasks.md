@@ -187,6 +187,9 @@ follow-ups.
      The qimg/flux2 split partial workspaces now share the
      `cu_split_attn_f32_workspace` helper in `cuda_runner_common.h`, including
      common overflow-checked sizing and free logic.
+     The qimg/flux2 split correctness tests also compare the baseline F32
+     flash-attention kernel against an independent CPU online-softmax reference
+     before accepting split partial/merge and `op_attn` dispatch equivalence.
      BF16/FP8 split-key tensor-core variants remain future work.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
      win). The plan's original framing was grid parallelism across keys
@@ -409,6 +412,18 @@ follow-ups.
       split-key partial O/m/l buffers. The helper centralizes overflow-checked
       byte sizing, lazy growth, and free logic while keeping the existing
       kernel launch ABI unchanged.
+    - Verify: `make -C cuda/qimg test_cuda_qimg`,
+      `make -C cuda/flux2 test_cuda_flux2`,
+      `./test_cuda_qimg --test-kernels`, and
+      `./test_cuda_flux2 --test-kernels`.
+
+33. **[done] qimg/flux2 split-attention CPU reference gate**
+    - Status: the small F32 split-key correctness tests now compute an
+      independent CPU online-softmax reference and require the baseline F32
+      attention kernel to match it before comparing split partial/merge and
+      forced `op_attn` split dispatch. This keeps the fast production-shape
+      benches tied to a CPU-checked correctness seed without making the large
+      benches CPU-bound.
     - Verify: `make -C cuda/qimg test_cuda_qimg`,
       `make -C cuda/flux2 test_cuda_flux2`,
       `./test_cuda_qimg --test-kernels`, and
