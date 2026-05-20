@@ -19,6 +19,7 @@ distributed-attention budget.
 | `ring_attn_bench.c` | **the main deliverable**: ring-attention decode cost model + measured uTofu comm paths + scaling projection |
 | `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
 | `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
+| `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): same real flash-decode kernel, but overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`) |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -39,9 +40,12 @@ mpiexec -np 12 ./ring_attn_bench
 RA_SEQ=1048576 RA_ITERS=3000 mpiexec -np 12 ./ring_attn_bench
 # overlap validation with real attention math (RA_GROUPS divides RA_KVH=8)
 RA_SEQ=16384 RA_GROUPS=4 RA_ITERS=2000 mpiexec -np 12 ./ring_attn_overlap
+# across-step async driver + HW barrier (TF_HW_BARRIER=1 uses libhwb; needs -lhwb)
+RA_SEQ=16384 RA_GROUPS=4 RA_ITERS=500 TF_HW_BARRIER=1 mpiexec -np 12 ./ring_attn_async
 ```
 Rank-0 reports are also written to `ra_log_<coords>.txt` / `rao_log_<coords>.txt`
-(mpiexec swallows rank-0 stdout on this node, so read the log file).
+/ `raa_log_<coords>.txt` (mpiexec swallows rank-0 stdout on this node, so read
+the log file).
 
 ## The model
 
@@ -217,6 +221,56 @@ Two corrections to the model fall out:
 N−1-hop ring; the full-ring 42 µs from finding #4 is the fair comm figure and is
 still ≪ compute in both regimes.)
 
+### 8. Across-step async comm driver **works**; head-group pipeline still loses; HW barrier usable (`ring_attn_async`)
+Finding #7 said the right overlap design is *across decode steps*, not within
+one. `ring_attn_async.c` builds it and measures it against a fair, **honest full
+22-hop all-reduce** (reduce 0→…→11 then broadcast back, every rank ends with the
+global). It also retimes everything under the **A64FX EL0 hardware barrier**
+(Fujitsu `libhwb`, hierarchical: HW intra-CMG arrival + 4-way SW leader combine +
+HW release) toggled by `TF_HW_BARRIER`, to see whether a cheaper barrier rescues
+the head-group pipeline.
+
+```
+                         16K (S/node 1363)              1M (S/node 87373)
+                      flat OMP        HW libhwb       flat OMP      HW libhwb
+compute-only (47T)    187–402 us      163–190 us      7109 us       5014 us
+comm-only (22-hop)    171–201 us      118–158 us       492 us        117 us
+SERIAL                333–606 us      322–381 us      7653 us       6665 us
+ASYNC (across-step)   196–253 us      174–269 us      7450 us       6223 us
+  ASYNC vs serial    −24% … −62%     −29% … −46%       −2.7%         −6.6%
+PIPE (head-grp G=4)   390–462 us      323–414 us      7521 us       7803 us
+  PIPE vs serial      +19% … +22%    −5% … +29%        −1.7%        +17.1%
+```
+(16K is ITERS=500 over several runs — launcher-contention variance is large, so
+ranges not point estimates; 1M is ITERS=40, one run/barrier.)
+
+Three results, all robust to the variance:
+
+- **The across-step async driver is the real win.** ASYNC beats SERIAL in *every*
+  completed run — −24% to −62% at 16K (where the 22-hop comm is comparable to
+  compute) and it lands at ≈ the model's `max(compute,comm)`. At 1M it wins only
+  −3% to −7%, because there comm is just ~6% of the 5–7 ms step, so hiding it can
+  save at most ~6% — **ASYNC's benefit scales with the comm/compute ratio and it
+  never hurts.** This is the design finding #7 pointed to: thread 0 runs the full
+  collective for step k−1 while threads 1..47 compute step k, double-buffered by
+  iteration parity, only **2 barriers/step** (vs the staged pipeline's 2·(G+1)).
+
+- **The head-group pipeline still loses, and the HW barrier does *not* rescue it.**
+  PIPE is +19% to +29% vs serial at 16K under both barriers (the −5% in one HW run
+  is within the variance, with inflated compute that dwarfs all barrier effects).
+  The staged within-step tax is structural — G× the 1.23 µs fixed per-hop overhead
+  plus 2·(G+1) barriers — so a cheaper barrier shrinks the second term but not the
+  first; #7's conclusion stands.
+
+- **The EL0 HW barrier is usable from plain OpenMP threads here**, and helps:
+  comm-only and SERIAL are consistently lower under `libhwb` than flat OMP, and —
+  notably — the HW path **completed every run**, while the flat-barrier path hit
+  the intermittent cross-rank exit-race timeout ~3 of 7 runs (the tighter HW
+  coupling reduces inter-rank drift). Caveat: compute-only variance is large
+  (launcher contention, 163–402 µs), so treat absolute flat-vs-HW deltas as
+  directional, not precise. (Matches `[[project_hwbarrier_libhwb_win]]`: same
+  libhwb hierarchical barrier, default-ON in the transformer.)
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -240,10 +294,15 @@ still ≪ compute in both regimes.)
   the long pole is compute in both regimes.*
 - **Don't pipeline comm under compute with a per-stage barrier** (head-group or
   similar). The barrier overhead per stage exceeds the comm it hides (finding #7:
-  overlap is +34% at 16K, +8% at 1M, monotonically worse with more groups). If
-  compute and comm are genuinely balanced, overlap with a **single barrier-free
-  async comm driver across decode steps** instead — never a staged within-step
-  pipeline.
+  overlap is +34% at 16K, +8% at 1M, monotonically worse with more groups; finding
+  #8: still +19–29% even under the cheaper HW barrier). Overlap **across decode
+  steps** instead — the async driver of finding #8 (thread 0 runs step k−1's full
+  all-reduce while 1..47 compute step k, 2 barriers/step) beats serial in every
+  run, by −24% to −62% at 16K and ≈ the comm fraction at 1M. It never hurts.
+- **The A64FX EL0 HW barrier (`libhwb`) is usable from OpenMP threads** and worth
+  it (finding #8): lower SERIAL/comm cost and, here, far fewer cross-rank
+  exit-race hangs than the flat OMP barrier. Link `-lhwb`, gate with
+  `TF_HW_BARRIER`; see `[[project_hwbarrier_libhwb_win]]`.
 
 ## Implementation notes / gotchas
 
@@ -273,7 +332,8 @@ still ≪ compute in both regimes.)
 8797a77  study summary & findings (summary.md)
 5157173  multi-TNI striping microbench + 1M confirmation
 7584a0b  RA_RBYTES knob — bf16 reduce payload win
-         ring_attn_overlap — comm/compute overlap validation (real math)
+8e2da9e  ring_attn_overlap — comm/compute overlap validation (real math)
+         ring_attn_async — across-step async driver + HW barrier
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
