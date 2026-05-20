@@ -19,7 +19,7 @@ distributed-attention budget.
 | `ring_attn_bench.c` | **the main deliverable**: ring-attention decode cost model + measured uTofu comm paths + scaling projection |
 | `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
 | `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
-| `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): same real flash-decode kernel, but overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`) |
+| `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`). Uses the **production qpacked+ktbl QK kernel** (svtbl K-broadcast, K_DP `[p][d][kv]`, no svaddv) — see finding #9 |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -271,6 +271,52 @@ Three results, all robust to the variance:
   directional, not precise. (Matches `[[project_hwbarrier_libhwb_win]]`: same
   libhwb hierarchical barrier, default-ON in the transformer.)
 
+### 9. Production qpacked+ktbl QK kernel in the async driver: ~20–30%, not 5–7× (`ring_attn_async`)
+Findings #7–#8 used a deliberately slow QK kernel (one `svaddv` reduction per
+query·position dot). To see how the across-step async overlap behaves with a
+*realistic* kernel, `ring_attn_async.c` now runs the **production qpacked+ktbl
+QK** kernel from `common/transformer.h`: the 16 query heads ride the SVE lanes
+(q packed `[d][h]`), K is stored **K_DP `[pos][dim][kv]`**, and for each
+(position, dim) the few GQA kv values are loaded once and broadcast to the
+head-lanes via **`svtbl`** (`idx[i]=i/gqa`) — **no per-dot `svaddv`**. bf16 KV is
+expanded with `svld1uh_u32` + `svlsl_n_u32_x(...,16)`. QH=32 is processed as two
+16-lane groups; A·V and the per-thread online-softmax merge are unchanged.
+
+```
+                       16K (S/node 1363)            1M
+                    flat OMP      HW libhwb       (mem-bound)
+compute slow        184–257 us    136–172 us      ~6910 us
+compute qpacked     148–237 us    111–124 us      ~6152 us
+  qpkd vs slow      ~8–20%        ~20–30%         ~11%
+```
+
+The result: the production kernel is correct here (`chk=3.539e+04` stable across
+G and runs) but buys only **~20–30%** compute, **not** the **5–7×** the same
+kernel gives in the full transformer. Two reasons:
+
+- **Production's real win is the position-parallel softmax restructure, which the
+  async overlap precludes.** In the model, qpacked+ktbl rides on top of
+  position-parallel softmax (shared `att[]` arrays, cross-thread max/sum
+  reductions). That structure is *incompatible* with across-step overlap: the
+  comm-driver thread (tid 0) cannot join compute's cross-thread barriers while it
+  drives the ring all-reduce. The async driver therefore keeps the per-thread
+  flash partial (each thread owns a position sub-range, merges via online-softmax)
+  — so it gets the barrier-free QK trick but not the restructure that carries most
+  of the 5–7×.
+- **Decode attention here is fixed-cost-bound short, DRAM-bound long.** At 16K
+  (~29 positions/thread across 47 threads) the online-softmax merge and the 2–3
+  barriers dominate, so a faster inner dot moves the total only ~20–30%. At 1M the
+  step just streams the KV shard from DRAM (~915 GB/s), so the kernel is bandwidth-
+  bound and the speedup shrinks to ~11%.
+
+This is the useful part: the faster kernel makes **16K compute (~124 µs HW) ≈ the
+full-ring comm (~150–170 µs)** — exactly the balanced regime where across-step
+overlap is the right tool. ASYNC still beats SERIAL under the qpacked kernel
+(16K HW: −26% to −44%), consistent with #8. (G now only sets PIPE granularity and
+comm grouping; modes A/C/D do a single full-width 16-lane pass that reads each K
+cache line once. The old `svaddv` kernel is preserved at git commit `07c0c67` for
+the A/B.)
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -303,6 +349,14 @@ Three results, all robust to the variance:
   it (finding #8): lower SERIAL/comm cost and, here, far fewer cross-rank
   exit-race hangs than the flat OMP barrier. Link `-lhwb`, gate with
   `TF_HW_BARRIER`; see `[[project_hwbarrier_libhwb_win]]`.
+- **A faster QK kernel helps decode attention only ~20–30% on its own** (finding
+  #9). The production qpacked+ktbl QK trick (svtbl K-broadcast, no `svaddv`) gives
+  5–7× *in the full transformer* mostly via the position-parallel softmax
+  restructure — which the async overlap can't use (the comm-driver thread can't
+  join compute's cross-thread barriers). With the per-thread flash partial that
+  async needs, you keep the barrier-free QK win but not the restructure; short ctx
+  is fixed-cost-bound (merge + barriers), long ctx DRAM-bound. The payoff is that
+  it rebalances 16K compute to ≈ the full-ring comm, the regime async targets.
 
 ## Implementation notes / gotchas
 
@@ -333,7 +387,8 @@ Three results, all robust to the variance:
 5157173  multi-TNI striping microbench + 1M confirmation
 7584a0b  RA_RBYTES knob — bf16 reduce payload win
 8e2da9e  ring_attn_overlap — comm/compute overlap validation (real math)
-         ring_attn_async — across-step async driver + HW barrier
+07c0c67  ring_attn_async — across-step async driver + EL0 HW barrier
+5110468  ring_attn_async — production qpacked+ktbl QK kernel (svtbl, K_DP)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
