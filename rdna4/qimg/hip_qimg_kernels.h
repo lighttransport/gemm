@@ -1136,6 +1136,18 @@ static const char hip_qimg_specific_kernels[] =
 "#endif\n"
 "\n"
 
+/* Row-major bias add: Y[m, n] += bias[n] for m < n_tok, all n < N.
+ * Used by the vendor (Tensile) FP8 GEMM path, which we launch with a null
+ * bias slot and add the per-column bias separately. */
+"__global__ void qimg_add_bias_rowmajor_f32(float *Y, const float *bias,\n"
+"                                           int n_tok, int N) {\n"
+"    size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;\n"
+"    size_t total = (size_t)n_tok * N;\n"
+"    if (i >= total) return;\n"
+"    Y[i] += bias[i % (size_t)N];\n"
+"}\n"
+"\n"
+
 /* ============================================================
  * FP8×FP8 WMMA path (gfx12). Activations are quantized to E4M3
  * with one scale factor per output row (max-abs / scale_div, default 512),
