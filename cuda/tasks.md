@@ -190,6 +190,14 @@ follow-ups.
      The qimg/flux2 split correctness tests also compare the baseline F32
      flash-attention kernel against an independent CPU online-softmax reference
      before accepting split partial/merge and `op_attn` dispatch equivalence.
+     Broader forced-split validation has now covered a Flux2 full
+     text-encoder -> DiT -> VAE 256x256/1-step generate
+     (`FLUX2_FA2_SPLIT_F32=256`, wrote `/tmp/flux2_split_fullpath.ppm`) and
+     a qimg full text-encoder -> DiT -> VAE 256x256/1-step generate
+     (`QIMG_FA2_SPLIT_F32=128`, wrote `cuda/qimg/cuda_qimg_output.ppm`).
+     The qimg generate harness also accepts `--enc-st` / `QIMG_TEXT_ENCODER_ST`
+     and falls back to the local `/mnt/disk01` FP8-scaled text-encoder
+     safetensors instead of requiring the older `/mnt/nvme02` path.
      BF16/FP8 split-key tensor-core variants remain future work.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
      win). The plan's original framing was grid parallelism across keys
@@ -429,6 +437,21 @@ follow-ups.
       `./test_cuda_qimg --test-kernels`, and
       `./test_cuda_flux2 --test-kernels`.
 
+34. **[done] Forced-split full-path qimg/flux2 validation**
+    - Status: validated numeric forced F32 split-key attention in real
+      end-to-end paths, not only isolated kernels. Flux2 completed a
+      GPU-text-encoder 256x256/1-step generate with
+      `FLUX2_FA2_SPLIT_F32=256`, writing `/tmp/flux2_split_fullpath.ppm`.
+      qimg completed a GPU-text-encoder 256x256/1-step generate with
+      `QIMG_FA2_SPLIT_F32=128`, writing `cuda/qimg/cuda_qimg_output.ppm`.
+      The qimg harness now accepts `--enc-st` and `QIMG_TEXT_ENCODER_ST`, with
+      a `/mnt/disk01` fallback for the FP8-scaled Qwen2.5-VL safetensors used
+      to inject Q/K/V biases into the GGUF text encoder.
+    - Verify: rebuild qimg, then run the two forced-split generate smokes:
+      `FLUX2_FA2_SPLIT_F32=256 ./test_cuda_flux2 --generate --gpu-enc --no-dumps --height 256 --width 256 --steps 1 --seed 42 --out /tmp/flux2_split_fullpath.ppm`
+      and
+      `QIMG_FA2_SPLIT_F32=128 ./test_cuda_qimg --generate --dit /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors --vae /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors --enc /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf --enc-st /mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors --prompt smoke --height 256 --width 256 --steps 1 --seed 42`.
+
 ## Verification harness
 
 Quick smokes to run after any of the items above:
@@ -441,6 +464,7 @@ cd cuda/qimg && make test_cuda_qimg && \
     --dit /mnt/disk01/models/qwen-image-st/diffusion_models/qwen_image_fp8_e4m3fn.safetensors \
     --vae /mnt/disk01/models/qwen-image-st/vae/qwen_image_vae.safetensors \
     --enc /mnt/disk01/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf \
+    --enc-st /mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors \
     --prompt "smoke" --height 512 --width 512 --steps 4 --seed 0
 
 # flux2 (kernel + warm-load only — skip full generate unless touching VAE/DiT)

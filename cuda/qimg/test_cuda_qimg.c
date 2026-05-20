@@ -1184,6 +1184,7 @@ int main(int argc, char **argv) {
     const char *dit_path = "/mnt/nvme02/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
     const char *vae_path = "/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors";
     const char *enc_path = "/mnt/nvme02/models/qwen-image/text-encoder/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf";
+    const char *enc_st_path = getenv("QIMG_TEXT_ENCODER_ST");
     const char *prompt = "a red apple on a white table";
     int custom_prompt = 0;
     const char *mode = NULL;
@@ -1206,6 +1207,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dit") == 0 && i+1 < argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae") == 0 && i+1 < argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc") == 0 && i+1 < argc) enc_path = argv[++i];
+        else if (strcmp(argv[i], "--enc-st") == 0 && i+1 < argc) enc_st_path = argv[++i];
         else if (strcmp(argv[i], "--prompt") == 0 && i+1 < argc) { prompt = argv[++i]; custom_prompt = 1; }
         else if (strcmp(argv[i], "--height") == 0 && i+1 < argc) out_h = atoi(argv[++i]);
         else if (strcmp(argv[i], "--width") == 0 && i+1 < argc) out_w = atoi(argv[++i]);
@@ -1217,9 +1219,25 @@ int main(int argc, char **argv) {
 
     if (!mode) {
         fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--test-kernels|--generate\n"
-                "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
+                "  --dit <st>  --vae <st>  --enc <gguf>  --enc-st <st>  --prompt <text>\n"
                 "  --height <h>  --width <w>  --steps <n>  --seed <s>  --no-fp8\n", argv[0]);
         return 1;
+    }
+
+    if (!enc_st_path) {
+        const char *candidates[] = {
+            "/mnt/disk01/models/qwen-image-st/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            NULL
+        };
+        for (int ci = 0; candidates[ci]; ci++) {
+            FILE *fp = fopen(candidates[ci], "rb");
+            if (fp) {
+                fclose(fp);
+                enc_st_path = candidates[ci];
+                break;
+            }
+        }
     }
 
     int lat_h = out_h / 8, lat_w = out_w / 8;
@@ -1421,8 +1439,7 @@ int main(int argc, char **argv) {
         /* Try GPU text encoder (GGUF + biases, ~500× faster than CPU).
          * Uses primary CUDA context shared with DiT runner. */
         if (!txt_hidden) {
-            const char *bias_st = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
-            qimg_text_enc *enc = qimg_text_enc_load_gpu(enc_path, bias_st, 0);
+            qimg_text_enc *enc = enc_st_path ? qimg_text_enc_load_gpu(enc_path, enc_st_path, 0) : NULL;
             if (enc) {
                 txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
                 fprintf(stderr, "  Encoding negative prompt...\n");
@@ -1432,8 +1449,7 @@ int main(int argc, char **argv) {
         }
         /* CPU GGUF fallback (slow but works without GPU LLM runner) */
         if (!txt_hidden) {
-            const char *bias_st = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
-            qimg_text_enc *enc = qimg_text_enc_load_gguf_with_biases(enc_path, bias_st);
+            qimg_text_enc *enc = enc_st_path ? qimg_text_enc_load_gguf_with_biases(enc_path, enc_st_path) : NULL;
             if (enc) {
                 txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
                 fprintf(stderr, "  Encoding negative prompt...\n");
@@ -1443,12 +1459,11 @@ int main(int argc, char **argv) {
         }
         /* FP8 safetensors fallback (dequants to F32 — 30GB, slow on CPU) */
         if (!txt_hidden) {
-            const char *st_enc = "/mnt/nvme02/models/qwen-image/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
-            FILE *tf = fopen(st_enc, "rb");
+            FILE *tf = enc_st_path ? fopen(enc_st_path, "rb") : NULL;
             if (tf) {
                 fclose(tf);
                 fprintf(stderr, "  Loading FP8 scaled text encoder (slow fallback)...\n");
-                qimg_text_enc *enc = qimg_text_enc_load_safetensors(st_enc, enc_path);
+                qimg_text_enc *enc = qimg_text_enc_load_safetensors(enc_st_path, enc_path);
                 if (enc) {
                     txt_hidden = qimg_text_enc_encode(enc, prompt, &n_txt);
                     fprintf(stderr, "  Encoding negative prompt...\n");
