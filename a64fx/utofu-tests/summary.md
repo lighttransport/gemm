@@ -286,9 +286,11 @@ expanded with `svld1uh_u32` + `svlsl_n_u32_x(...,16)`. QH=32 is processed as two
                        16K (S/node 1363)            1M
                     flat OMP      HW libhwb       (mem-bound)
 compute slow        184–257 us    136–172 us      ~6910 us
-compute qpacked     148–237 us    111–124 us      ~6152 us
+compute qpacked     148–237 us    111–144 us      ~6152 us
   qpkd vs slow      ~8–20%        ~20–30%         ~11%
 ```
+(HW-barrier absolute compute drifts ~111–144 µs across sessions with launcher
+contention; the qpkd-vs-slow ratio is from interleaved A/B in one session.)
 
 The result: the production kernel is correct here (`chk=3.539e+04` stable across
 G and runs) but buys only **~20–30%** compute, **not** the **5–7×** the same
@@ -309,13 +311,30 @@ kernel gives in the full transformer. Two reasons:
   step just streams the KV shard from DRAM (~915 GB/s), so the kernel is bandwidth-
   bound and the speedup shrinks to ~11%.
 
-This is the useful part: the faster kernel makes **16K compute (~124 µs HW) ≈ the
-full-ring comm (~150–170 µs)** — exactly the balanced regime where across-step
-overlap is the right tool. ASYNC still beats SERIAL under the qpacked kernel
-(16K HW: −26% to −44%), consistent with #8. (G now only sets PIPE granularity and
-comm grouping; modes A/C/D do a single full-width 16-lane pass that reads each K
-cache line once. The old `svaddv` kernel is preserved at git commit `07c0c67` for
-the A/B.)
+This is the useful part: the faster kernel makes **16K compute (~142 µs HW) ≈ the
+full-ring comm (~124 µs)** — exactly the balanced regime where across-step
+overlap is the right tool. ASYNC still beats SERIAL under the qpacked kernel and
+the across-step win was reconfirmed at both contexts under `TF_HW_BARRIER=1`:
+
+```
+              ASYNC vs SERIAL (qpacked, HW barrier)        n     basis
+16K   −34% … −38%  (compute ~142, comm ~124, serial ~315)  2     clean, low variance
+1M    −9% median  (−8% mean; range −43%…+15%)              14    pooled, contention-noisy
+```
+
+At 16K the win is clean and large (compute ≈ comm, ~70% overlap efficiency). At 1M
+the step is DRAM-bound (compute ~5.6–7.2 ms ≫ comm ~0.12 ms), so the async
+headroom is only the comm+sync fraction; the per-run number is buried under
+±20–40% launcher-contention noise (several runs even logged SERIAL *below*
+compute-only — physically impossible, pure cross-mode drift), so the −9% is the
+median over 14 runs that passed a SERIAL ≥ compute-only sanity filter. It is a bit
+larger than #8's −2.7%…−6.6% because async also hides the barrier/sync overhead
+SERIAL pays sequentially, not just the bare ~120 µs comm. Correctness held
+throughout (`chk=3.539e+04` @16K, `2.269e+06` @1M, identical across all runs).
+Consistent with #8: async never hurts and its benefit scales with comm/compute.
+(G now only sets PIPE granularity and comm grouping; modes A/C/D do a single
+full-width 16-lane pass that reads each K cache line once. The old `svaddv` kernel
+is preserved at git commit `07c0c67` for the A/B.)
 
 ## Practical guidance for distributed decode attention
 
