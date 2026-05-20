@@ -6,9 +6,15 @@
  *   1. Memory access: in sequence-parallel (ring/context-parallel) decode, the
  *      KV cache of length S is sharded across N nodes, so each node reads its
  *      own S/N-position KV shard once per decoded token. Attention decode is
- *      memory-bandwidth bound, so we just STREAM a buffer the size of that KV
- *      shard (multi-threaded) and report the achieved bandwidth and the implied
- *      per-step KV-read time.
+ *      memory-bandwidth bound, so we measure the node's full streaming read BW
+ *      and divide the modeled shard size by it for the per-step KV-read time.
+ *      Reaching peak A64FX BW (~200 GB/s x 4 CMG ~ 800 GB/s/node) requires each
+ *      CMG to read NUMA-local memory: bench_node_bw gives every CMG its own
+ *      buffer pinned to that CMG's node (mbind+MF_MOVE), pins threads, and reads
+ *      with an 8-accumulator SVE kernel. (A single interleaved buffer or the
+ *      naive 1-accumulator reduction reach only ~1/3 of peak.) The shard itself
+ *      is too small to time directly -- it would sit in L2 -- but across a
+ *      model's many layers the KV read is a genuine HBM stream.
  *
  *   2. uTofu comm: the single query token attends across all N shards; nodes
  *      combine their partial results (running max m, denominator l, and output
@@ -37,19 +43,28 @@
  *   RA_ITERS timed ring tokens                (default 2000)
  *   RA_WARMUP untimed warmup tokens           (default 200)
  *   RA_MEMGB GiB to stream for the mem bench  (default 8)
+ *   RA_BWMB  per-CMG probe buffer, MiB        (default 512)
+ *   RA_BW_GBPS override measured node BW      (default 0 = measure)
  */
+#define _GNU_SOURCE
+#include <arm_sve.h>
 #include <assert.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include <utofu.h>
 #ifdef _OPENMP
 #include <omp.h>
+#else
+static int omp_get_thread_num(void) { return 0; }
+static int omp_get_max_threads(void) { return 1; }
 #endif
 
 #include "tofu_demo.h"
@@ -122,32 +137,141 @@ static int read_topo(uint8_t coords[][TOFU_NCOORDS])
 
 static volatile uint64_t g_sink;  /* defeats dead-code elimination of the stream */
 
-/* Stream `n8` uint64 words of memory `iters` times with all OpenMP threads and
- * report GB/s. Integer accumulation (associative -> the compiler is free to
- * vectorize/reorder with SVE) keeps this memory-bandwidth bound, unlike an FP
- * reduction whose loop-carried dependency makes it FP-add-latency bound. Four
- * independent accumulators expose enough ILP to hide load latency. */
-static double bench_memory_bw(const uint64_t *restrict buf, size_t n8, int iters)
+/* NUMA node owning logical CPU `cpu`, or -1. Parsed straight from
+ * /sys/devices/system/node/nodeN/cpulist so we need no libnuma. */
+static int node_of_cpu(int cpu)
 {
-    double t0 = now_sec();
-    uint64_t acc = 0;
-    for (int it = 0; it < iters; it++) {
-        uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-#ifdef _OPENMP
-#pragma omp parallel for reduction(+ : s0, s1, s2, s3) schedule(static)
-#endif
-        for (size_t i = 0; i < n8 - 3; i += 4) {
-            s0 += buf[i + 0];
-            s1 += buf[i + 1];
-            s2 += buf[i + 2];
-            s3 += buf[i + 3];
+    for (int nd = 0; nd < 16; nd++) {
+        char path[64], buf[256];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", nd);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char *got = fgets(buf, sizeof(buf), f);
+        fclose(f);
+        if (!got) continue;
+        char *p = buf;
+        while (*p && *p != '\n') {
+            int a = (int)strtol(p, &p, 10), b = a;
+            if (*p == '-') { p++; b = (int)strtol(p, &p, 10); }
+            if (cpu >= a && cpu <= b) return nd;
+            while (*p == ',') p++;
         }
-        acc += s0 + s1 + s2 + s3;
     }
-    double t1 = now_sec();
+    return -1;
+}
+
+/* SVE 8-accumulator unrolled u64 sum over [lo,hi). hi-lo is a multiple of
+ * 8*svcntd(), so no scalar tail. Eight independent vector accumulators expose
+ * enough in-flight loads to saturate a CMG's HBM (the naive 1-accumulator
+ * reduction is load-latency bound at ~1/3 of peak). */
+static inline uint64_t sve_sum(const uint64_t *restrict b, size_t lo, size_t hi)
+{
+    svbool_t pg = svptrue_b64();
+    uint64_t vl = svcntd();
+    size_t step = vl * 8;
+    svuint64_t a0=svdup_u64(0),a1=svdup_u64(0),a2=svdup_u64(0),a3=svdup_u64(0);
+    svuint64_t a4=svdup_u64(0),a5=svdup_u64(0),a6=svdup_u64(0),a7=svdup_u64(0);
+    for (size_t i = lo; i + step <= hi; i += step) {
+        a0 = svadd_u64_x(pg, a0, svld1_u64(pg, &b[i + 0*vl]));
+        a1 = svadd_u64_x(pg, a1, svld1_u64(pg, &b[i + 1*vl]));
+        a2 = svadd_u64_x(pg, a2, svld1_u64(pg, &b[i + 2*vl]));
+        a3 = svadd_u64_x(pg, a3, svld1_u64(pg, &b[i + 3*vl]));
+        a4 = svadd_u64_x(pg, a4, svld1_u64(pg, &b[i + 4*vl]));
+        a5 = svadd_u64_x(pg, a5, svld1_u64(pg, &b[i + 5*vl]));
+        a6 = svadd_u64_x(pg, a6, svld1_u64(pg, &b[i + 6*vl]));
+        a7 = svadd_u64_x(pg, a7, svld1_u64(pg, &b[i + 7*vl]));
+    }
+    a0 = svadd_u64_x(pg,a0,a1); a2 = svadd_u64_x(pg,a2,a3);
+    a4 = svadd_u64_x(pg,a4,a5); a6 = svadd_u64_x(pg,a6,a7);
+    a0 = svadd_u64_x(pg,a0,a2); a4 = svadd_u64_x(pg,a4,a6);
+    return svaddv_u64(pg, svadd_u64_x(pg, a0, a4));
+}
+
+/* Measure aggregate node read bandwidth (GB/s) the way decode actually streams
+ * the KV cache. Full A64FX node BW (~200 GB/s x 4 CMG) is only reached when each
+ * CMG reads memory *local* to its own NUMA node: a single interleaved buffer
+ * caps near 3/8 of peak on cross-CMG traffic. So we split the allowed cores into
+ * per-CMG teams, give each CMG its own buffer pinned to that CMG's node, pin
+ * each thread, and have every thread read only its CMG's buffer.
+ *
+ * Reports GB/s; *out_ncmg / *out_cores_per describe the detected layout. */
+static double bench_node_bw(size_t per_cmg_mib, double stream_gib,
+                            int *out_ncmg, int *out_cores_per)
+{
+    enum { CMG_CORES = 12 };          /* A64FX: 12 compute cores per CMG */
+    cpu_set_t allowed;
+    sched_getaffinity(0, sizeof(allowed), &allowed);
+    int cores[256], ncore = 0;
+    for (int c = 0; c < CPU_SETSIZE && ncore < 256; c++)
+        if (CPU_ISSET(c, &allowed)) cores[ncore++] = c;
+    int ncmg = ncore / CMG_CORES, cores_per = CMG_CORES;
+    if (ncmg < 1) { ncmg = 1; cores_per = ncore < 1 ? 1 : ncore; }
+    int nthr = ncmg * cores_per;
+    *out_ncmg = ncmg;
+    *out_cores_per = cores_per;
+    if (ncore < 1) return 0.0;
+
+    /* per-CMG buffer rounded to a multiple of cores_per*(8*svcntd()) so every
+     * lane reads a whole number of unrolled SVE blocks (exact byte count). */
+    size_t vl = svcntd(), blk = (size_t)cores_per * vl * 8;
+    size_t n8 = per_cmg_mib * 1024 * 1024 / 8;
+    n8 = (n8 / blk) * blk; if (n8 < blk) n8 = blk;
+    size_t bytes = n8 * 8, lane_n8 = n8 / cores_per;
+
+    uint64_t *buf[64] = {0};
+    for (int c = 0; c < ncmg; c++) {
+        if (posix_memalign((void **)&buf[c], 2*1024*1024, bytes) != 0) die("posix_memalign(bw)", -1);
+        int node = node_of_cpu(cores[c * cores_per]);
+        if (node >= 0) {
+            unsigned long mask = 1UL << node;
+            /* MPOL_BIND | MPOL_MF_MOVE: relocate the pages posix_memalign already
+             * pre-faulted -- Fugaku huge pages fault in on the allocating node,
+             * so without MF_MOVE every buffer would sit on one CMG (~1/4 BW). */
+            if (syscall(SYS_mbind, buf[c], bytes, 2L /*MPOL_BIND*/, &mask,
+                        (unsigned long)(8 * sizeof(mask)), 2U /*MPOL_MF_MOVE*/) != 0)
+                logmsg("warning: mbind CMG %d -> node %d failed (BW may be low)\n", c, node);
+        }
+    }
+
+    /* Report the BEST of several timed trials: this is a peak-BW probe, and on
+     * a shared/interactive node (e.g. the rank running the launcher) background
+     * activity steals BW in some windows -- the best trial catches a clean one,
+     * giving the achievable ceiling rather than a contention-averaged number. */
+    enum { NTRIAL = 6 };
+    int iters = (int)(stream_gib * 1073741824.0 / ((double)NTRIAL * ncmg * bytes));
+    if (iters < 4) iters = 4; if (iters > 4000) iters = 4000;
+
+    double best_gbps = 0.0, t0 = 0, t1 = 0;
+    uint64_t acc = 0;
+#pragma omp parallel num_threads(nthr) reduction(+ : acc)
+    {
+        int t = omp_get_thread_num(), c = t / cores_per, lane = t % cores_per;
+        cpu_set_t s; CPU_ZERO(&s); CPU_SET(cores[t], &s);
+        sched_setaffinity(0, sizeof(s), &s);
+        size_t lo = lane_n8 * lane, hi = lo + lane_n8;
+        for (size_t i = lo; i < hi; i++) buf[c][i] = i + 1;   /* local first-touch */
+        uint64_t local = 0;
+        /* warmup: fault TLB / settle the prefetchers before timing */
+        for (int it = 0; it < 3; it++) local += sve_sum(buf[c], lo, hi);
+        for (int trial = 0; trial < NTRIAL; trial++) {
+#pragma omp barrier
+#pragma omp master
+            t0 = now_sec();
+#pragma omp barrier
+            for (int it = 0; it < iters; it++) local += sve_sum(buf[c], lo, hi);
+#pragma omp barrier
+#pragma omp master
+            {
+                t1 = now_sec();
+                double g = (double)ncmg * bytes * (double)iters / (t1 - t0) / 1e9;
+                if (g > best_gbps) best_gbps = g;
+            }
+        }
+        acc += local;
+    }
     g_sink = acc;
-    double total_bytes = (double)n8 * sizeof(uint64_t) * (double)iters;
-    return total_bytes / (t1 - t0) / 1e9;  /* GB/s (1e9-based) */
+    for (int c = 0; c < ncmg; c++) free(buf[c]);
+    return best_gbps;
 }
 
 int main(void)
@@ -321,42 +445,29 @@ int main(void)
     RELAY(WARMUP, warm_el);
     RELAY(ITERS, timed_el);
 
-    /* ---- memory bench: stream a KV-shard-sized buffer with all threads ---- */
+    /* ---- memory bench: measure full node read BW the way decode streams the
+     * KV cache (per-CMG-local buffers; see bench_node_bw), then apply it to the
+     * modeled per-node KV-shard size. The shard itself (tens of MiB) is too
+     * small to time BW reliably -- it would sit in L2 -- but across a model's
+     * many layers the KV read is a genuine HBM stream, so we measure steady BW
+     * on large per-CMG buffers and divide. ---- */
     long pos_per_node = (S + nprocs - 1) / nprocs;
     size_t kv_bytes = (size_t)pos_per_node * KVH * HD * 2 /*K&V*/ * KVB;
-    size_t n8 = kv_bytes / sizeof(uint64_t);
-    if (n8 < 4) n8 = 4;
-    uint64_t *kvbuf = NULL;
-    if (posix_memalign((void **)&kvbuf, DEMO_CACHE_LINE, n8 * sizeof(uint64_t)) != 0)
-        die("posix_memalign(kv)", -1);
-    /* Parallel first-touch with the SAME static schedule the bench uses, so on
-     * A64FX's 4 CMGs (NUMA domains) each thread's pages are placed on its own
-     * CMG -- otherwise single-thread init pins every page to one CMG and the
-     * read streams from one memory controller (~1/4 the bandwidth). */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (size_t i = 0; i < n8; i++) kvbuf[i] = i + 1;
-    int mem_iters = (int)((double)MEMGB * (1024.0 * 1024.0 * 1024.0) / (double)kv_bytes);
-    if (mem_iters < 5) mem_iters = 5;
-    if (mem_iters > 5000) mem_iters = 5000;
-    double meas_gbps = bench_memory_bw(kvbuf, n8, mem_iters);
-    /* RA_BW_GBPS lets the user substitute a known/target read bandwidth (e.g. a
-     * profiled ~645 GB/s) for the time estimate; 0 (default) uses the measured
-     * streaming BW. Measured BW is NUMA-sensitive: launch with
-     * `numactl --interleave=all` to spread pages across all 4 CMGs. */
+
+    long bwmib = envl("RA_BWMB", 512);          /* per-CMG probe buffer (MiB) */
+    int ncmg = 1, cores_per = 1;
+    double meas_gbps = bench_node_bw((size_t)bwmib, (double)MEMGB, &ncmg, &cores_per);
+    /* RA_BW_GBPS substitutes a known/target read BW for the time estimate; 0
+     * (default) uses the measured per-CMG-local streaming BW. */
     long bw_override = envl("RA_BW_GBPS", 0);
     double gbps = bw_override > 0 ? (double)bw_override : meas_gbps;
     double kv_read_us = (double)kv_bytes / (gbps * 1e9) * 1e6;
 
-    int omp_threads = 1;
-#ifdef _OPENMP
-    omp_threads = omp_get_max_threads();
-#endif
-
-    /* every rank reports its own memory bandwidth */
-    logmsg("rank %d: KV shard = %.2f MiB, mem BW = %.1f GB/s (%d threads), KV read/step = %.1f us\n",
-           my_rank, (double)kv_bytes / (1024.0 * 1024.0), gbps, omp_threads, kv_read_us);
+    /* every rank reports its own node bandwidth */
+    logmsg("rank %d: KV shard = %.2f MiB, node read BW = %.1f GB/s "
+           "(%d CMG x %d cores, %ld MiB/CMG probe), KV read/step = %.1f us\n",
+           my_rank, (double)kv_bytes / (1024.0 * 1024.0), gbps,
+           ncmg, cores_per, bwmib, kv_read_us);
 
     /* rank 0 owns the ring-comm timing and prints the combined estimate */
     if (my_rank == 0) {
@@ -381,7 +492,6 @@ int main(void)
                1e6 / (kv_read_us > ring_reduce_us ? kv_read_us : ring_reduce_us));
     }
 
-    free(kvbuf);
     utofu_dereg_mem(vcq, base_stadd, 0);
     utofu_free_vcq(vcq);
     free(region);
