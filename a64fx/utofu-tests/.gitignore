@@ -1,7 +1,9 @@
 # build artifacts
 tofu_topo_helper
 tofu_put_demo
+ring_attn_bench
 # runtime-generated
 tofu_topo.txt
 demo_log_*.txt
+ra_log_*.txt
 output.*
