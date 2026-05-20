@@ -18,6 +18,7 @@ distributed-attention budget.
 | `tofu_put_demo.c` | minimal MPI-free Put + verify demo (ring exchange, validates the construct-VCQ-from-coords convention) |
 | `ring_attn_bench.c` | **the main deliverable**: ring-attention decode cost model + measured uTofu comm paths + scaling projection |
 | `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
+| `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -36,7 +37,11 @@ mpiexec -np 12 ./tofu_topo_helper
 mpiexec -np 12 ./ring_attn_bench
 # knobs (env): RA_SEQ=<ctx len>, RA_ITERS=<timed tokens, use 3000+ for stable comm>
 RA_SEQ=1048576 RA_ITERS=3000 mpiexec -np 12 ./ring_attn_bench
+# overlap validation with real attention math (RA_GROUPS divides RA_KVH=8)
+RA_SEQ=16384 RA_GROUPS=4 RA_ITERS=2000 mpiexec -np 12 ./ring_attn_overlap
 ```
+Rank-0 reports are also written to `ra_log_<coords>.txt` / `rao_log_<coords>.txt`
+(mpiexec swallows rank-0 stdout on this node, so read the log file).
 
 ## The model
 
@@ -159,6 +164,59 @@ in bf16. A mixed `m,l` fp32 + `o` bf16 payload = QH*(2·4 + HD·2) = 8448 B, onl
 the normalizer. The benchmark sizes the payload via `RA_RBYTES` (4=fp32,
 2=bf16); it does not model the (negligible) accumulation error.
 
+### 7. Overlap validation with **real attention math** — the model's `max()` is doubly wrong (`ring_attn_overlap`)
+Findings #1–6 model comm and approximate compute as a pure KV memory stream
+(`S/N·kv_bytes` at 915 GB/s). `ring_attn_overlap.c` replaces that proxy with the
+**real flash-decode kernel** (q·K dots, vectorised SVE `exp`, A·V over a per-CMG
+NUMA-local bf16 KV shard, producing genuine online-softmax m,l,o partials) plus a
+**real online-softmax ring-reduce**, and a **head-group pipeline** (thread 0
+drives the reduce of group g−1 while threads 1..47 compute group g, per-stage
+OpenMP barrier). Measured on the 12-node torus, 47 compute threads + 1 comm
+driver:
+
+```
+                    16K (S/node 1363)     1M (S/node 87373)
+compute-only (47T)     224 us               6368 us
+comm-only (per-node)   5.7 us               5.7 us
+SERIAL (compute+reduce) 221 us              6372 us
+OVERLAP (head-grp G=4)  297 us  (+34%)      6868 us (+8%)
+```
+
+Two corrections to the model fall out:
+
+- **Real compute ≫ the KV-read lower bound.** The pure-stream proxy predicts
+  ~6 µs @16K / ~390 µs @1M; the *real* kernel costs **224 µs / 6368 µs** — 15–35×
+  more. Even our production qpacked+ktbl kernel is only ~5–7× faster, so in
+  practice **both regimes are compute-bound**, and comm is a tiny slice (16K:
+  2.5%; 1M: 0.09%). The "16K is comm-bound 7×" conclusion of finding #4 holds
+  only under the optimistic assumption that compute is a bare memory stream;
+  with real attention math the long pole is compute, not the reduce. *(This
+  bench's kernel is unoptimised — svaddv per dot, ~29 positions/thread — so its
+  absolute compute is a pessimistic upper bound; the relative comm≪compute
+  conclusion is robust to kernel speed.)*
+
+- **The head-group pipeline is counterproductive — `max()` is unreachable.**
+  OVERLAP is *worse* than SERIAL at both context lengths, and the penalty grows
+  monotonically with the number of groups (single-run G-sweep @16K):
+  ```
+  G        1     2     4     8
+  OVERLAP 173   298   439   534  us
+  ```
+  Each added group (a) makes the reduce pay the ~1.23 µs fixed per-hop overhead G
+  times (finding #5's tax) and (b) adds OpenMP barriers — a G-group pipeline runs
+  2·(G+1) barriers/step vs SERIAL's 3, and a 48-thread flat barrier is ~5–8 µs.
+  The **extra barrier cost (~7 barriers × ~8 µs ≈ 56 µs) alone exceeds even the
+  full-ring comm (42 µs)**, so a *staged within-step* pipeline can never win.
+  The right way to overlap (if compute and comm were balanced — e.g. with the
+  production kernel at 16K, ~35 µs compute vs ~42 µs full-ring comm) is a
+  **barrier-free async comm driver**: thread 0 ring-reduces step k−1's partials
+  while threads 1..47 compute step k in a *single un-staged* region, ONE barrier
+  per step — overlapping *across* decode steps, not within one.
+
+(`comm-only` here is rank-0's per-node participation ≈ one hop, not the full
+N−1-hop ring; the full-ring 42 µs from finding #4 is the fair comm figure and is
+still ≪ compute in both regimes.)
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -177,7 +235,15 @@ the normalizer. The benchmark sizes the payload via `RA_RBYTES` (4=fp32,
   compounds to 3.1× over the fp32 ring.
 - Comm being context-independent means **long-context decode is mem-bound** (KV
   read dominates) and **short/medium-context decode is comm-bound** (latency of
-  the reduce dominates) — the optimization target flips with S.
+  the reduce dominates) — the optimization target flips with S. *But this only
+  holds for the bare-memory-stream model; with real attention math (finding #7)
+  the long pole is compute in both regimes.*
+- **Don't pipeline comm under compute with a per-stage barrier** (head-group or
+  similar). The barrier overhead per stage exceeds the comm it hides (finding #7:
+  overlap is +34% at 16K, +8% at 1M, monotonically worse with more groups). If
+  compute and comm are genuinely balanced, overlap with a **single barrier-free
+  async comm driver across decode steps** instead — never a staged within-step
+  pipeline.
 
 ## Implementation notes / gotchas
 
@@ -204,6 +270,10 @@ the normalizer. The benchmark sizes the payload via `RA_RBYTES` (4=fp32,
 44100a5  N-sweep scaling projection in rank-0 report
 8b3a962  measure real tree all-reduce comm path
 0c82f46  A/B topology-ordered ring vs default rank+1
+8797a77  study summary & findings (summary.md)
+5157173  multi-TNI striping microbench + 1M confirmation
+7584a0b  RA_RBYTES knob — bf16 reduce payload win
+         ring_attn_overlap — comm/compute overlap validation (real math)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
