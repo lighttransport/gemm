@@ -110,7 +110,16 @@ struct hip_qimg_runner {
     hipModule_t mod;
     hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_opt_fp8;
     hipFunction_t fn_gemm_fp8_wmma;  /* gfx12 BF16 act × FP8 wt matrix-core GEMM */
-    hipFunction_t fn_gemm_fp8_fp8_pgr2;  /* gfx12 FP8 act × FP8 wt WMMA */
+    hipFunction_t fn_gemm_fp8_fp8_pgr2;  /* gfx12 FP8 act × FP8 wt WMMA (hand-written) */
+    /* Vendor (hipBLASLt/Tensile) FP8 GEMM, extracted to a .co. ~1.5x our
+     * hand-written kernel; used for the FP8xFP8 path when QIMG_FP8_VENDOR is
+     * set and the .co loads. Scalar scale only (scaleA=scaleB=1); bias added
+     * separately via fn_add_bias. */
+    hipModule_t fp8_vendor_mod;
+    hipFunction_t fn_fp8_vendor;
+    hipFunction_t fn_add_bias;       /* row-major Y[m,n]+=bias[n] */
+    void *d_scale_one;               /* device float[4] = {1,1,1,1} for scaleA/B/C/D */
+    int use_fp8_vendor;              /* 1 = vendor .co loaded and enabled */
     hipFunction_t fn_quantize_act_perrow;  /* F32 -> FP8 with per-row max-abs scale */
     hipFunction_t fn_quantize_act_scalar;  /* F32 -> FP8 with scalar scale=1, Comfy-style */
     hipFunction_t fn_quantize_act_clamp;   /* F32 -> FP8 with scale=max(1,maxabs/448) */
@@ -732,6 +741,65 @@ static int qimg_ensure_act_scratch(hip_qimg_runner *r, size_t M_pad, size_t K) {
  *   3. 128×128 tiled scalar LUT (n_tok ≥ 16) — fallback path
  *   4. 16×16 scalar LUT — fallback for small token batches
  */
+/* Launch the extracted vendor (Tensile) FP8 GEMM: D[M,N] = A[N,K] (op=T) @
+ * B[M,K] (op=N), scalar scaleA/B (=1). Mirrors rdna4/fp8/bench_fp8_extracted.
+ * A operand = weights W[n_out,n_in], B operand = activations X_fp8[n_tok,n_in].
+ * Bias is NOT applied here (null slot); caller adds it separately. */
+#ifndef HIP_LAUNCH_PARAM_BUFFER_POINTER
+#define HIP_LAUNCH_PARAM_BUFFER_POINTER ((void *)0x01)
+#define HIP_LAUNCH_PARAM_BUFFER_SIZE    ((void *)0x02)
+#define HIP_LAUNCH_PARAM_END            ((void *)0x03)
+#endif
+static int qimg_launch_fp8_vendor(hip_qimg_runner *r, void *Y, void *W,
+                                  void *X_fp8, void *bias, int n_out, int n_in, int n_tok) {
+    /* 172-byte kernarg layout (offsets from rdna4/fp8/bench_fp8_extracted). */
+    unsigned char ka[176];
+    memset(ka, 0, sizeof(ka));
+    #define KAU32(off, v) do { uint32_t t_ = (uint32_t)(v); memcpy(ka + (off), &t_, 4); } while (0)
+    #define KAPTR(off, p)  do { void *t_ = (void *)(p);     memcpy(ka + (off), &t_, sizeof(void *)); } while (0)
+    #define KAF32(off, v) do { float t_ = (float)(v);       memcpy(ka + (off), &t_, 4); } while (0)
+    KAU32(0,  1u);            /* GEMM_INFO   */
+    KAU32(4,  0x02200001u);   /* INTERNAL0   */
+    KAU32(8,  0x08010008u);   /* INTERNAL1   */
+    KAU32(12, (unsigned)(n_out / 128));  /* NUMWG */
+    KAU32(16, (unsigned)n_out);          /* SIZES_FREE0 = N */
+    KAU32(20, (unsigned)n_tok);          /* SIZES_FREE1 = M */
+    KAU32(24, 1u);                       /* SIZES_FREE2 = batch */
+    KAU32(28, (unsigned)n_in);           /* SIZES_SUM0  = K */
+    KAPTR(32, Y);     /* D */
+    KAPTR(40, Y);     /* C */
+    KAPTR(48, W);     /* A = weights [N,K] */
+    KAPTR(56, X_fp8); /* B = activations [M,K] */
+    KAU32(64, (unsigned)n_out); /* stride D0 = N */
+    KAU32(72, (unsigned)n_out); /* stride C0 = N */
+    KAU32(80, (unsigned)n_in);  /* stride A0 = K */
+    KAU32(88, (unsigned)n_in);  /* stride B0 = K */
+    KAF32(96, 1.0f);  /* alpha */
+    KAF32(100, 0.0f); /* beta  */
+    KAPTR(104, r->d_scale_one); /* scaleA */
+    KAPTR(112, r->d_scale_one); /* scaleB */
+    KAPTR(120, r->d_scale_one); /* scaleC */
+    KAPTR(128, r->d_scale_one); /* scaleD */
+    /* Fuse the per-column F32 bias via the kernel's bias slot (sym has _Bias_).
+     * BIAS_TYPE 0 = F32, STRIDE_BIAS 0 = broadcast over rows. scaleAV null. */
+    if (bias) {
+        KAPTR(144, bias);
+        KAU32(152, 0u);  /* BIAS_TYPE = F32 */
+        KAU32(156, 0u);  /* STRIDE_BIAS */
+    }
+    #undef KAU32
+    #undef KAPTR
+    #undef KAF32
+    size_t arg_size = 172;
+    void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ka,
+                      HIP_LAUNCH_PARAM_BUFFER_SIZE,    &arg_size,
+                      HIP_LAUNCH_PARAM_END};
+    hipError_t e = hipModuleLaunchKernel(r->fn_fp8_vendor,
+                                         (unsigned)(n_out / 128), (unsigned)(n_tok / 128), 1,
+                                         128, 1, 1, 0, NULL, NULL, (void **)config);
+    return e == hipSuccess ? 0 : -1;
+}
+
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                         int n_out, int n_in, int n_tok) {
     hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
@@ -748,6 +816,19 @@ static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bia
             qimg_maybe_quant_stats(r, X, n_tok, n_in, M_pad);
             /* Quantize: F32 X[n_tok, n_in] -> FP8 + row writeback scale. */
             int K = n_in;
+            if (r->use_fp8_vendor && r->fn_fp8_vendor) {
+                /* Vendor (Tensile) FP8 GEMM: scalar scale=1 quantize, then GEMM,
+                 * then a separate per-column bias add. The vendor kernel uses a
+                 * scalar scaleA/B, so the activation must be scale=1; per-tensor
+                 * == per-row quant error for these activations (see README), so
+                 * this is quality-neutral vs the hand-written per-row path. */
+                void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad};
+                hipModuleLaunchKernel(r->fn_quantize_act_scalar,
+                                      (unsigned)M_pad, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
+                if (qimg_launch_fp8_vendor(r, Y, W, d_x_fp8, bias, n_out, n_in, n_tok) == 0)
+                    return;
+                /* vendor launch failed -> fall through to hand-written kernel. */
+            }
             if (r->fp8_act_scale_scalar || r->fp8_act_scale_clamp) {
                 void *qa[] = {&X, &d_x_fp8, &d_scales, &n_tok, &K, &M_pad};
                 hipModuleLaunchKernel(quant_fn,
@@ -1228,6 +1309,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         r->fn_quantize_act_scalar = NULL;
     if (hipModuleGetFunction(&r->fn_quantize_act_clamp, mod, "qimg_quantize_act_clamp_fp8") != hipSuccess)
         r->fn_quantize_act_clamp = NULL;
+    if (hipModuleGetFunction(&r->fn_add_bias, mod, "qimg_add_bias_rowmajor_f32") != hipSuccess)
+        r->fn_add_bias = NULL;
     GET(fn_layernorm, "layernorm_f32");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
@@ -1375,6 +1458,55 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
             r->prefer_bf16_wmma = 1;
             if (verbose)
                 fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA_BF16=1 -- forcing BF16xFP8 path even where FP8xFP8 would qualify\n");
+        }
+    }
+
+    /* Vendor (Tensile) FP8 GEMM for the FP8xFP8 fast path. Default ON when
+     * --fast is enabled and the extracted .co is present (QIMG_FP8_VENDOR=0
+     * forces the hand-written kernel). ~1.5x our kernel, matches torch. The
+     * .co is a build artifact: regenerate via rdna4/fp8/extract_fp8_kernel.sh. */
+    if (r->use_fp8_fp8w) {
+        /* Opt-in (QIMG_FP8_VENDOR=1): the vendor kernel uses a scalar activation
+         * scale, so it forces scale=1 quant (~1.5 dB below the hand-written
+         * clamp path on knife-edge configs). Default OFF keeps the documented
+         * quality-safe configs valid; enable for the ~1.5x GEMM / ~9% e2e win
+         * at the 48 dB (perceptually-lossless) tier. */
+        const char *vd = getenv("QIMG_FP8_VENDOR");
+        int want = (vd && !(strcmp(vd, "0") == 0 || strcmp(vd, "false") == 0));
+        if (want && r->fn_add_bias) {
+            static const char *VSYM =
+                "Cijk_Alik_Bljk_F8SS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs_"
+                "MT128x128x64_MI16x16x1_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_"
+                "DTLA0_DTLB0_DTVA0_DTVB1_EPS0_FDSI0_GRPM1_GRVWA16_GRVWB16_GSUAMB_GLS0_"
+                "ISA1201_IU1_K1_LDSTI0_LBSPPA256_LBSPPB0_LBSPPM0_LPA32_LPB0_LPM0_LRVW16_"
+                "LWPMn1_MIAV1_MIWT4_4_MO40_NTn1_NTA0_NTB0_NTC0_NTD0_NTM0_NEPBS0_NLCA1_"
+                "NLCB2_ONLL0_PGR2_PLR1_PKA0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_"
+                "SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGROn1_VSn1_VWA4_VWB4_WSGRA0_"
+                "WSGRB0_WS32_WG32_4_1";
+            const char *co_env = getenv("QIMG_FP8_VENDOR_CO");
+            const char *cands[3]; int nc = 0;
+            if (co_env && co_env[0]) cands[nc++] = co_env;
+            cands[nc++] = "../fp8/fp8_kernel_gfx1201.co";
+            cands[nc++] = "rdna4/fp8/fp8_kernel_gfx1201.co";
+            for (int ci = 0; ci < nc && !r->use_fp8_vendor; ci++) {
+                FILE *fp = fopen(cands[ci], "rb");
+                if (!fp) continue;
+                fclose(fp);
+                if (hipModuleLoad(&r->fp8_vendor_mod, cands[ci]) != hipSuccess) continue;
+                if (hipModuleGetFunction(&r->fn_fp8_vendor, r->fp8_vendor_mod, VSYM) != hipSuccess) {
+                    r->fn_fp8_vendor = NULL;
+                    continue;
+                }
+                if (hipMalloc(&r->d_scale_one, 4 * sizeof(float)) == hipSuccess) {
+                    float ones[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                    hipMemcpy(r->d_scale_one, ones, sizeof(ones), hipMemcpyHostToDevice);
+                    r->use_fp8_vendor = 1;
+                    if (verbose)
+                        fprintf(stderr, "hip_qimg: FP8xFP8 using vendor Tensile kernel (%s)\n", cands[ci]);
+                }
+            }
+            if (!r->use_fp8_vendor && verbose)
+                fprintf(stderr, "hip_qimg: vendor FP8 .co not found; using hand-written FP8xFP8 kernel\n");
         }
     }
 
