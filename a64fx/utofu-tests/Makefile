@@ -16,7 +16,7 @@ MPICC     = mpiclang
 MPICFLAGS = -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall
 TOFU      = -ltofucom
 
-all: tofu_topo_helper tofu_put_demo
+all: tofu_topo_helper tofu_put_demo ring_attn_bench
 
 # helper uses MPI + uTofu
 tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
@@ -26,7 +26,11 @@ tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
 tofu_put_demo: tofu_put_demo.c tofu_demo.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
 
+# pure uTofu ring-attention decode cost benchmark: NO MPI, OpenMP for mem stream
+ring_attn_bench: ring_attn_bench.c tofu_demo.h
+	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(TOFU)
+
 clean:
-	rm -f tofu_topo_helper tofu_put_demo tofu_topo.txt
+	rm -f tofu_topo_helper tofu_put_demo ring_attn_bench tofu_topo.txt
 
 .PHONY: all clean
