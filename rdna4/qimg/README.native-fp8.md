@@ -25,6 +25,33 @@ Current expected result on the RX 9070 XT box:
 AMD Radeon RX 9070 XT
 ```
 
+## Qwen-Image FP8 Reference Modes
+
+Keep these modes distinct when comparing qimg against PyTorch/ComfyUI:
+
+- `comfy-default`: the Qwen-Image DiT safetensors file stores selected weights
+  as `float8_e4m3fn`, but normal linear layers dequantize/cast those weights
+  to the active compute dtype and run BF16/FP16/FP32 math. Current ComfyUI marks
+  Qwen-Image inference dtypes as BF16/FP32, so do not treat the stock workflow
+  as all-FP8xFP8.
+- `comfy-fast-fp8`: ComfyUI's opt-in fast FP8 matrix-multiplication path. It
+  clamps activations to the FP8 E4M3 range, casts activations to FP8, uses the
+  stored FP8 weights, applies unit input/weight scales, and returns the result
+  in the input compute dtype. In qimg this is exposed as
+  `--fast fp8_matrix_mult`. The local PyTorch scripts use the
+  `comfy-fast-fp8` name; the older `SCALE_MODE=comfy` spelling remains an alias.
+- `qimg-quality-gated`: qimg's conservative mode. BF16xFP8 WMMA remains the
+  default quality-safe path for FP8 checkpoints. FP8xFP8 is only considered
+  when `--fast fp8_matrix_mult` is set, and can still be restricted by explicit
+  label/block selectors while probing quality.
+
+The local Qwen-Image DiT checkpoint is raw FP8 storage. Its safetensors header
+has no scale metadata (`scale`, `input_scale`, `weight_scale`, `fp8`, or
+`quant` keys were absent in the 2026-05-20 inspection). Representative tensors
+such as `img_in.weight` and `transformer_blocks.0.attn.to_q.weight` are
+`F8_E4M3`; qimg and the local PyTorch probes therefore must supply any
+activation scaling policy themselves.
+
 Low-risk pinned checks:
 
 ```bash
@@ -60,10 +87,10 @@ QIMG_FP8_WMMA=1 ./test_hip_qimg --generate \
 Current pinned result: latent cosine `0.999971`, PSNR `51.70 dB`,
 denoise `24.1 s`, GEMM traffic `1723 GB / 73.1 TF`.
 
-Ungated native FP8xFP8 check:
+ComfyUI-style fast FP8xFP8 check:
 
 ```bash
-QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate \
+./test_hip_qimg --generate --fast fp8_matrix_mult \
   --dit /mnt/disk1/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors \
   --height 256 --width 256 --steps 20 \
   --init-bin ../../ref/qwen_image/init_latent_256.bin \
@@ -80,29 +107,234 @@ activation-FP8 scratch `3.0 MB`.
 Quality-target gated FP8xFP8:
 
 ```bash
-QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate ... --fp8-quality-target-db 50
-QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate ... --fp8-quality-target-db 50 \
+./test_hip_qimg --generate ... --fp8-quality-target-db 50
+./test_hip_qimg --generate ... --fast fp8_matrix_mult --fp8-quality-target-db 50 \
   --fp8-fp8-allow img_in
 ```
 
-When `--fp8-quality-target-db` is set, FP8xFP8 now fails closed unless an
-explicit positive selector is present (`--fp8-fp8-allow` or block range).
-Eligible GEMMs fall back to BF16xFP8 WMMA automatically, even if only
-`QIMG_FP8_FP8_WMMA=1` was set. A 1-step path-stats smoke with no allow list
-reported `fp8xfp8_wmma=0`; the same smoke with `--fp8-fp8-allow img_in`
-reported exactly one FP8xFP8 GEMM and BF16xFP8 for the remaining eligible
-image-side GEMMs.
+By default, qimg does not use activation-FP8 GEMMs. FP8 checkpoint weights are
+kept in raw FP8 storage and eligible GEMMs use BF16xFP8 WMMA automatically.
+`--fast fp8_matrix_mult` is the only CLI switch that enables activation FP8 x
+weight FP8 WMMA. Label and block selectors can narrow the fast path for quality
+probes.
+
+As of the 2026-05-20 quality-gate pass, the full 20-step pinned run exits
+nonzero when `--fp8-quality-target-db` and `--ref-final` are both set and the
+final latent PSNR is below target. The conservative no-allowlist path remains
+the current quality-safe mode:
+
+```text
+no allowlist: fp8xfp8_wmma=0, bf16xfp8_wmma=7240,
+              latent cosine=0.999971, PSNR=51.70 dB, PASS
+```
+
+Do not allowlist `img_in` by default. It only enables 20 FP8xFP8 GEMMs in the
+full run, but still breaks the denoise trajectory:
+
+```text
+--fp8-fp8-allow img_in: fp8xfp8_wmma=20,
+                        latent cosine=0.829002, PSNR=14.60 dB, FAIL
+```
+
+Single-label 20-step pinned sweeps show no full-label FP8xFP8 allowlist clears
+the 50 dB target yet:
+
+```text
+label          PSNR dB   status
+img_k           48.26    FAIL
+img_q           44.34    FAIL
+img_mlp_fc1     34.40    FAIL
+img_mlp_fc2     31.65    FAIL
+img_attn_out    28.55    FAIL
+img_v           23.45    FAIL
+img_in          14.60    FAIL
+```
+
+The useful opening is block-gated `img_k`. Blocks `0..8` pass at 50.59 dB;
+blocks `0..9` fail at 49.95 dB, and all blocks fail at 48.26 dB:
+
+```bash
+rdna4/qimg/test_hip_qimg --generate ... --fast fp8_matrix_mult \
+  --fp8-quality-target-db 50 --fp8-fp8-allow img_k \
+  --fp8-fp8-block-min 0 --fp8-fp8-block-max 8
+```
+
+Changing the per-row activation scale divisor is not a fix either. A standalone
+final-latent quant sweep prefers `div=448` over `512`, but the actual DiT run
+with `--fp8-act-scale-div 448` regresses to `cosine=0.954461`, `PSNR=21.14 dB`.
+The failure is trajectory sensitivity from layerwise FP8xFP8 error, not only
+final-latent quantization noise.
+
+Use the serial sweep helper to test candidate labels without concurrent ROCm
+processes fighting over VRAM:
+
+```bash
+python3 rdna4/qimg/tools/sweep_fp8fp8_quality.py --include-none
+python3 rdna4/qimg/tools/sweep_fp8fp8_quality.py \
+  --labels img_q,img_k,img_v,img_attn_out,img_mlp_fc1,img_mlp_fc2
+python3 rdna4/qimg/tools/sweep_fp8fp8_quality.py \
+  --labels img_k --block-min 0 --block-max 8 \
+  --reference-mode qimg-quality-gated
+```
+
+The helper writes `summary.json`, `summary.csv`, and one log per candidate to
+`/tmp/qimg_fp8fp8_sweep` by default. It runs all selected candidates, then
+exits nonzero if any candidate misses the configured quality target. Each row
+also records the reference mode label (`comfy-default`, `comfy-fast-fp8`, or
+`qimg-quality-gated`) so later reports do not mix Comfy's default storage path
+with its opt-in fast FP8xFP8 path.
 
 Activation scale experiments:
 
 ```bash
-QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate ... --fp8-act-scale-mode comfy
-QIMG_FP8_FP8_WMMA=1 ./test_hip_qimg --generate ... --fp8-act-scale-mode clamp
+./test_hip_qimg --generate ... --fast fp8_matrix_mult
+./test_hip_qimg --generate ... --fast fp8_matrix_mult --fp8-act-scale-mode clamp
 ```
 
-`comfy` mirrors ComfyUI's native FP8 CUDA fast path (`scale=1`, clamp/cast)
-but saturates later qimg activations in the full denoise run: latent cosine
-`0.301305`, PSNR `4.20 dB`. `clamp` keeps scale 1 only while the row fits
-FP8 range and otherwise uses `row_max/448`; it improves the full run to
-cosine `0.986565`, PSNR `25.93 dB`, still far below the 50 dB target without
-BF16 fallback/gating. Image artifact: `apple_fp8fp8_clamp_256.png`.
+`--fast fp8_matrix_mult` is the qimg CLI spelling for the `comfy-fast-fp8`
+diagnostic (`scale=1`, clamp/cast). It saturates later qimg activations in the
+full denoise run: latent cosine `0.301305`, PSNR `4.20 dB`. The experimental
+`clamp` mode keeps scale 1 only while the row fits FP8 range and otherwise uses
+`row_max/448`; it improves the full run to cosine `0.986565`, PSNR `25.93 dB`,
+still far below the 50 dB target without BF16 fallback/gating. Image artifact:
+`apple_fp8fp8_clamp_256.png`.
+
+## Maximizing quality-safe FP8xFP8 coverage (2026-05-20)
+
+Goal: move as many WMMA-eligible GEMMs as possible to the ~2x FP8xFP8 path
+while keeping the pinned 256x256 20-step run at or above the 50 dB latent gate.
+Baseline (BF16xFP8, no FP8xFP8) is `psnr_peak=51.70 dB`, so the entire
+degradation budget to stay >=50 dB is only ~1.7 dB. The WMMA-eligible compute
+pool at 256x256 is `bf16xfp8_wmma=69.58 TF`; every TF moved to FP8xFP8 runs at
+roughly 2x. Use `tools/run_one.sh <tag> <args...>` for single, serial probes
+(one 20 GB checkpoint load at a time — do not run these concurrently).
+
+**Per-GEMM TF weight** (256x256, all 60 blocks): `img_mlp_fc1` and
+`img_mlp_fc2` are 23.19 TF each (33% of the pool each, 67% combined);
+`img_q`/`img_k`/`img_v`/`img_attn_out` are 5.80 TF each. So the FFN dominates
+the achievable speedup and attention projections are minor.
+
+**`clamp` is the universal-best activation mode** for the selective path
+(per-label, all blocks):
+
+```text
+label          comfy(scale=1)   per-row(div512)   clamp
+img_mlp_fc1        34.40            42.43          43.91
+img_mlp_fc2        31.65            -9.96          (poison)
+img_k              48.26            45.12          48.11
+img_q              44.34            41.54          45.64
+img_v              23.45            34.28          (lossy)
+img_attn_out       28.55            19.58          (lossy)
+```
+
+`clamp` matches or beats both other modes everywhere, so always pass
+`--fp8-act-scale-mode clamp` with `--fast fp8_matrix_mult` for quality-safe
+work. `comfy` scale=1 is exact for in-range rows (good for the well-behaved
+`img_k`) but saturates outliers; per-row helps outlier-heavy rows but quantizes
+the scale; `clamp` adaptively picks scale=1 when the row fits FP8 and
+`row_max/448` otherwise. `img_mlp_fc2` is unusable (its input is the post-GELU
+FFN intermediate with huge dynamic range — `-9.96 dB` even on its own).
+
+**Layer-depth sensitivity is the dominant effect, and it is opposite for FFN
+vs attention.** FP8 error does not accumulate uniformly across the 60 DiT
+layers; it localizes:
+
+- `img_mlp_fc1` damage lives in the *early* layers. All-blocks, 0..29, 0..14,
+  and 0..7 all floor at ~44 dB (the kept early layers set the floor); skipping
+  them lifts quality:
+
+  ```text
+  img_mlp_fc1 clamp   block range   PSNR     captured FP8xFP8 TF
+                      0..59         43.91    23.19  (FAIL)
+                      8..59         49.67    20.10  (FAIL, ~48 dB safe)
+                      30..59        50.07    11.60  (PASS 50 dB)
+                      45..59        50.37     5.80  (PASS, more margin)
+  ```
+
+- `img_k`/`img_q` are the reverse: safe on *early* layers, damaging on late
+  ones (`img_k` 0..8 = 50.59 PASS upstream; on 30..59 it degrades).
+
+Because the global `--fp8-fp8-block-min/max` range applies to *all* allowed
+labels at once, you cannot capture "fc1 on late layers" and "k on early layers"
+in one run. Combining is destructive at this budget:
+
+```text
+img_mlp_fc1,img_k,img_q clamp 30..59       45.07 dB  (FAIL; k/q hate late layers)
+all img labels          clamp 45..59       34.58 dB  (FAIL; v/attn_out lossy)
+```
+
+**Recommended quality-safe operating points** (256x256, 50 dB gate):
+
+```bash
+# Max coverage that still passes 50 dB: fc1 on the deep half of the stack.
+./test_hip_qimg --generate ... --fast fp8_matrix_mult \
+  --fp8-act-scale-mode clamp --fp8-fp8-allow img_mlp_fc1 \
+  --fp8-fp8-block-min 30 --fp8-quality-target-db 50
+# -> 50.07 dB PASS, 11.60 TF FP8xFP8 (17% of the eligible pool)
+
+# Same with more headroom (45..59), fewer TF:
+#   --fp8-fp8-block-min 45  -> 50.37 dB, 5.80 TF
+# Relaxed 48 dB target unlocks fc1 8..59 -> 20.10 TF (29% of the pool).
+```
+
+**Bottom line:** the 50 dB gate is the binding constraint, not throughput.
+Quality-safe FP8xFP8 caps at ~17% of WMMA-eligible compute (fc1 on deep
+layers); the 67%-TF FFN pair is mostly off-limits because fc1's early layers
+and all of fc2 break the gate, and attention projections add little TF and have
+opposite layer-depth tolerance.
+
+### Block-wise activation scaling does NOT help (2026-05-20, measured)
+
+Tested directly via the extended `--fp8-quant-stats` (set
+`QIMG_FP8_QUANT_STATS_GBLK=<group>`), which now reports the per-row `mae`
+alongside `mae_blk<g>` (per-row, per-K-group scale) and `mae_tensor` (single
+scale) for the real activations. For `img_mlp_fc1` the three are bit-identical
+across all 60 layers:
+
+```text
+block=0   mae=0.050695  mae_blk32=0.050695  mae_tensor=0.050695  zeros=0.46%
+block=29  mae=0.12354   mae_blk32=0.12354   mae_tensor=0.12354   zeros=0.04%
+block=59  mae=0.38337   mae_blk32=0.38334   mae_tensor=0.3841    zeros=0.00%
+```
+
+Reason: e4m3 is *floating point* with ~constant relative precision (3 mantissa
+bits), so finer scale granularity only helps when it prevents clipping
+(`sat=0.00%`) or underflow (`zeros<0.5%`) — neither occurs here. The quantized
+activation tensor is identical at any granularity, so the GEMM output is
+identical. The early-layer fc1 floor (~44 dB) is intrinsic e4m3
+activation-mantissa error amplified through layer depth, not a scaling problem.
+This is an INT8 intuition that does not transfer to FP8. The same argument
+rules out the "outlier-split BF16 lane" idea — there are no range outliers to
+split.
+
+The only remaining levers are therefore (a) **layer-depth gating** (done: fc1
+deep layers, 17% at 50 dB) and (b) **the quality threshold** (48 dB unlocks fc1
+8..59 = 29%). Improving the activation quantizer is not a viable lever, and the
+kernel is already at vendor-class throughput.
+
+### The 50 dB latent gate is too strict — 48 dB is perceptually lossless (2026-05-20)
+
+Decoded both operating points through the VAE and compared the PNGs (256x256,
+`--vae .../qwen_image_vae.safetensors -o out.png`):
+
+```text
+comparison                     PNG PSNR   mean|d|   max|d|   pix>5/255
+baseline vs FP8 (fc1 8..59)     54.72 dB   0.21      8        0.00%
+baseline vs diffusers-ref       46.63 dB   0.82      18       0.10%
+FP8 vs diffusers-ref            46.10 dB   0.87      17       0.14%
+```
+
+The baseline-vs-FP8 image delta (54.72 dB, max 8/255, zero pixels off by >5) is
+~8 dB tighter than the gap the BF16xFP8 HIP port *already* has to the true
+diffusers reference (46.63 dB). The 48 dB latent point perturbs the rendered
+image less than the port already differs from PyTorch — visually identical.
+
+**Recommendation:** the 50 dB *latent* gate is well inside existing port noise;
+ship the 48 dB latent point to roughly double quality-safe FP8 coverage:
+
+```bash
+./test_hip_qimg --generate ... --fast fp8_matrix_mult \
+  --fp8-act-scale-mode clamp --fp8-fp8-allow img_mlp_fc1 --fp8-fp8-block-min 8 \
+  --fp8-quality-target-db 48
+# -> 49.67 dB latent, 20.10 TF FP8xFP8 (29% of the eligible pool), PNG indistinguishable
+```

@@ -135,7 +135,8 @@ struct hip_qimg_runner {
     int in_ch, txt_dim, mlp_h;
     int use_fp8;  /* 1 = upload FP8 raw + use LUT GEMM (4x less VRAM) */
     int use_wmma; /* 1 = use BF16 WMMA matrix cores for FP8 GEMMs (gfx12 only) */
-    int use_fp8_fp8w; /* 1 = use FP8xFP8 WMMA + per-row act quant when n_tok % 128 == 0 (gfx12) */
+    int use_fp8_fp8w; /* 1 = use FP8xFP8 WMMA + act quant when n_tok % 128 == 0 (gfx12) */
+    int fast_fp8_matrix_mult; /* 1 = ComfyUI --fast fp8_matrix_mult semantics */
     int prefer_bf16_wmma; /* 1 = QIMG_FP8_WMMA_BF16=1 forces BF16xFP8 even when FP8xFP8 would qualify */
 
     /* Persistent scratch for FP8xFP8 path. Sized lazily by op_gemm_fp8 to fit
@@ -315,7 +316,8 @@ static int qimg_has_fp8_fp8_positive_filter(const hip_qimg_runner *r) {
 
 static int qimg_allow_fp8_fp8_for_current_label(hip_qimg_runner *r) {
     if (!r) return 0;
-    if (r->fp8_quality_target_db > 0.0f && !qimg_has_fp8_fp8_positive_filter(r))
+    if (!r->fast_fp8_matrix_mult &&
+        r->fp8_quality_target_db > 0.0f && !qimg_has_fp8_fp8_positive_filter(r))
         return 0;
     if (r->current_block >= 0) {
         if (r->fp8_fp8_block_min >= 0 && r->current_block < r->fp8_fp8_block_min)
@@ -418,14 +420,55 @@ static void qimg_maybe_quant_stats(hip_qimg_runner *r, void *X,
         int idx = (int)(0.99f * (float)(nsamp - 1));
         p99 = samples[idx];
     }
+
+    /* Block-wise (per-row, per-K-group) and per-tensor reconstruction MAE,
+     * to test whether finer activation-scale granularity reduces e4m3 quant
+     * error vs the shipped per-row scale. scale_div / clamp follow the active
+     * mode so the three numbers are directly comparable. Set the K-group with
+     * QIMG_FP8_QUANT_STATS_GBLK (default 128). */
+    int gblk = 128;
+    {
+        const char *gv = getenv("QIMG_FP8_QUANT_STATS_GBLK");
+        if (gv && atoi(gv) > 0) gblk = atoi(gv);
+    }
+    double sum_mae_blk = 0.0, sum_mae_tensor = 0.0;
+    {
+        float st = r->fp8_act_scale_scalar ? 1.0f :
+                   (r->fp8_act_scale_clamp ? (global_max > 448.0f ? global_max / 448.0f : 1.0f)
+                                            : (global_max / r->fp8_act_scale_div));
+        if (st < 1e-12f) st = 1e-12f;
+        float inv_st = 1.0f / st;
+        for (int m = 0; m < n_tok; m++) {
+            const float *row = h + (size_t)m * K;
+            for (int kb = 0; kb < K; kb += gblk) {
+                int ke = kb + gblk; if (ke > K) ke = K;
+                float gmax = 0.0f;
+                for (int k = kb; k < ke; k++) { float a = fabsf(row[k]); if (a > gmax) gmax = a; }
+                float sb = r->fp8_act_scale_scalar ? 1.0f :
+                           (r->fp8_act_scale_clamp ? (gmax > 448.0f ? gmax / 448.0f : 1.0f)
+                                                    : (gmax / r->fp8_act_scale_div));
+                if (sb < 1e-12f) sb = 1e-12f;
+                float inv_sb = 1.0f / sb;
+                for (int k = kb; k < ke; k++) {
+                    float qb = fp8_e4m3_to_f32(f32_to_fp8_e4m3_cpu(row[k] * inv_sb)) * sb;
+                    sum_mae_blk += fabsf(qb - row[k]);
+                    float qt = fp8_e4m3_to_f32(f32_to_fp8_e4m3_cpu(row[k] * inv_st)) * st;
+                    sum_mae_tensor += fabsf(qt - row[k]);
+                }
+            }
+        }
+    }
+
     fprintf(stderr,
             "  fp8q[%03d] block=%d %-18s M=%d/%d K=%d row_max_avg=%.5g max=%.5g "
-            "scale_mode=%s scale_div=%.1f mae=%.5g p99=%.5g zeros=%.2f%% sat=%.2f%%\n",
+            "scale_mode=%s scale_div=%.1f mae=%.5g mae_blk%d=%.5g mae_tensor=%.5g "
+            "p99=%.5g zeros=%.2f%% sat=%.2f%%\n",
             r->quant_prints, r->current_block, r->current_gemm_label,
             n_tok, M_pad, K, sum_row_max / (double)n_tok, global_max,
             r->fp8_act_scale_scalar ? "comfy" : (r->fp8_act_scale_clamp ? "clamp" : "perrow"),
             r->fp8_act_scale_div,
-            sum_mae / (double)n, p99, 100.0 * (double)zeros / (double)n,
+            sum_mae / (double)n, gblk, sum_mae_blk / (double)n,
+            sum_mae_tensor / (double)n, p99, 100.0 * (double)zeros / (double)n,
             100.0 * (double)sat / (double)n);
     r->quant_prints++;
     free(samples);
@@ -682,11 +725,11 @@ static int qimg_ensure_act_scratch(hip_qimg_runner *r, size_t M_pad, size_t K) {
 /* FP8 weight GEMM: W is raw FP8 bytes, dequanted via GPU LUT.
  * Dispatch order:
  *   1. FP8×FP8 WMMA + activation FP8 quant (gfx12, n_tok % 128 == 0,
- *      n_out % 128 == 0, K % 32 == 0) — when QIMG_FP8_FP8_WMMA=1 and
- *      QIMG_FP8_WMMA_BF16 not set. Fastest path, ports the rdna4/fp8
- *      pipe32_pgr2 ~218 TF/s kernel.
- *   2. BF16 WMMA matrix-core (gfx12, n_tok ≥ 16) — when QIMG_FP8_WMMA=1
- *   3. 128×128 tiled scalar LUT (n_tok ≥ 16) — default fast path
+ *      n_out % 128 == 0, K % 32 == 0) — only for ComfyUI-compatible
+ *      --fast fp8_matrix_mult mode.
+ *   2. BF16×FP8 WMMA matrix-core (gfx12, n_tok ≥ 16) — default FP8
+ *      checkpoint compute path when the kernel is present.
+ *   3. 128×128 tiled scalar LUT (n_tok ≥ 16) — fallback path
  *   4. 16×16 scalar LUT — fallback for small token batches
  */
 static void op_gemm_fp8(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
@@ -1252,15 +1295,19 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         }
     }
 
-    /* WMMA matrix-core path (gfx12). Opt-in via QIMG_FP8_WMMA=1. */
+    /* BF16xFP8 WMMA matrix-core path (gfx12). Default ON for FP8
+     * checkpoints when the kernel is available; opt out with QIMG_FP8_WMMA=0. */
     r->use_wmma = 0;
     {
         const char *v = getenv("QIMG_FP8_WMMA");
-        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+        int want_wmma = !(v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+        if (want_wmma) {
             if (!r->fn_gemm_fp8_wmma) {
-                fprintf(stderr, "hip_qimg: WMMA kernel not present (need gfx12); ignoring QIMG_FP8_WMMA\n");
+                if (v)
+                    fprintf(stderr, "hip_qimg: WMMA kernel not present (need gfx12); ignoring QIMG_FP8_WMMA\n");
             } else if (!r->use_fp8) {
-                fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA requires FP8 mode; ignoring\n");
+                if (v)
+                    fprintf(stderr, "hip_qimg: QIMG_FP8_WMMA requires FP8 mode; ignoring\n");
             } else {
                 r->use_wmma = 1;
                 if (verbose)
@@ -1274,11 +1321,12 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         }
     }
 
-    /* FP8xFP8 WMMA path (gfx12). Opt-in via QIMG_FP8_FP8_WMMA=1. Eligible when
-     * n_tok and n_out are both multiples of 128 (img-side GEMMs at 256+ res);
-     * falls back to BF16xFP8 WMMA otherwise. QIMG_FP8_WMMA_BF16=1 forces the
+    /* FP8xFP8 WMMA path (gfx12). This is the ComfyUI --fast fp8_matrix_mult
+     * path: activation clamp/cast to FP8, raw FP8 weights, unit scales by
+     * default, BF16xFP8 fallback otherwise. QIMG_FP8_WMMA_BF16=1 forces the
      * BF16 path even when FP8xFP8 qualifies. */
     r->use_fp8_fp8w = 0;
+    r->fast_fp8_matrix_mult = 0;
     r->prefer_bf16_wmma = 0;
     r->d_act_fp8 = NULL;
     r->d_act_scales = NULL;
@@ -1290,20 +1338,23 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     r->fa_perrow_bytes = 0;
     r->act_scales_bytes = 0;
     {
-        const char *v = getenv("QIMG_FP8_FP8_WMMA");
-        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+        const char *v = getenv("QIMG_FAST_FP8_MATRIX_MULT");
+        r->fast_fp8_matrix_mult = (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) ? 1 : 0;
+        if (r->fast_fp8_matrix_mult) {
+            if (!r->fp8_act_scale_scalar && !r->fp8_act_scale_clamp)
+                r->fp8_act_scale_scalar = 1;
             hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
                                      (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
             if (!r->fn_gemm_fp8_fp8_pgr2 || !quant_fn) {
-                fprintf(stderr, "hip_qimg: FP8xFP8 kernel not present (need gfx12); ignoring QIMG_FP8_FP8_WMMA\n");
+                fprintf(stderr, "hip_qimg: FP8xFP8 kernel not present (need gfx12); ignoring --fast fp8_matrix_mult\n");
             } else if (!r->use_fp8) {
-                fprintf(stderr, "hip_qimg: QIMG_FP8_FP8_WMMA requires FP8 mode; ignoring\n");
+                fprintf(stderr, "hip_qimg: --fast fp8_matrix_mult requires FP8 mode; ignoring\n");
             } else {
                 r->use_fp8_fp8w = 1;
                 if (verbose) {
-                    const char *mode = r->fp8_act_scale_scalar ? "scalar scale=1" :
+                    const char *mode = r->fp8_act_scale_scalar ? "Comfy scale=1 clamp/cast" :
                                        (r->fp8_act_scale_clamp ? "safe scalar" : "per-row");
-                    fprintf(stderr, "hip_qimg: FP8xFP8 WMMA + %s act quant enabled\n", mode);
+                    fprintf(stderr, "hip_qimg: ComfyUI --fast fp8_matrix_mult enabled: FP8xFP8 WMMA + %s act quant\n", mode);
                     if (r->fp8_fp8_allow && r->fp8_fp8_allow[0])
                         fprintf(stderr, "hip_qimg: FP8xFP8 allow labels: %s\n", r->fp8_fp8_allow);
                     if (r->fp8_fp8_deny && r->fp8_fp8_deny[0])
@@ -1312,7 +1363,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
                         fprintf(stderr, "hip_qimg: FP8xFP8 block range: %d..%d\n",
                                 r->fp8_fp8_block_min, r->fp8_fp8_block_max);
                     if (r->fp8_quality_target_db > 0.0f)
-                        fprintf(stderr, "hip_qimg: FP8 quality target: %.1f dB (FP8xFP8 requires allow labels or block range)\n",
+                        fprintf(stderr, "hip_qimg: FP8 quality target: %.1f dB\n",
                                 r->fp8_quality_target_db);
                     if (!r->fp8_act_scale_scalar && !r->fp8_act_scale_clamp && r->fp8_act_scale_div != 512.0f)
                         fprintf(stderr, "hip_qimg: FP8 activation scale divisor: %.1f\n", r->fp8_act_scale_div);
