@@ -184,6 +184,9 @@ follow-ups.
      (0.75x). Flux2 also now has a 4608-token/24-head production-shape bench;
      it measured about 200.5 ms baseline -> 205.5 ms split (0.98x), so flux2
      `auto` remains disabled.
+     The qimg/flux2 split partial workspaces now share the
+     `cu_split_attn_f32_workspace` helper in `cuda_runner_common.h`, including
+     common overflow-checked sizing and free logic.
      BF16/FP8 split-key tensor-core variants remain future work.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
      win). The plan's original framing was grid parallelism across keys
@@ -399,6 +402,17 @@ follow-ups.
     - Verify: `make -B -C cuda/trellis2 test_cuda_trellis2`, `git diff --check`,
       and a bounded smoke with `--max-sparse 2048` that wrote
       `/tmp/t2_cuda_image_to_shape_smoke.obj`.
+
+32. **[done] qimg/flux2 split-attention workspace helper**
+    - Status: qimg and flux2 now use a shared
+      `cu_split_attn_f32_workspace` in `cuda/cuda_runner_common.h` for F32
+      split-key partial O/m/l buffers. The helper centralizes overflow-checked
+      byte sizing, lazy growth, and free logic while keeping the existing
+      kernel launch ABI unchanged.
+    - Verify: `make -C cuda/qimg test_cuda_qimg`,
+      `make -C cuda/flux2 test_cuda_flux2`,
+      `./test_cuda_qimg --test-kernels`, and
+      `./test_cuda_flux2 --test-kernels`.
 
 ## Verification harness
 
