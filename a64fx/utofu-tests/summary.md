@@ -17,6 +17,7 @@ distributed-attention budget.
 | `tofu_topo_helper.c` | MPI + uTofu helper, run **once** per allocation: writes `tofu_topo.txt` (rank → 6D coords) so the pure-uTofu app needs no runtime VCQ/STADD handshake |
 | `tofu_put_demo.c` | minimal MPI-free Put + verify demo (ring exchange, validates the construct-VCQ-from-coords convention) |
 | `ring_attn_bench.c` | **the main deliverable**: ring-attention decode cost model + measured uTofu comm paths + scaling projection |
+| `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -86,11 +87,14 @@ Two effects the bare `ceil(log2 N)*hop` projection (15.2 µs) missed:
   physical distance is nearly free), this extra cost is mostly **congestion**
   from the simultaneous all-pairs butterfly traffic, not physical distance.
 
-### 4. Crossover: comm overtakes memory at **N ≈ 5** (for S=16K)
+### 4. Crossover: comm overtakes memory at **N ≈ 5** (for S=16K) — **regime flip confirmed at 1M**
 At 16K context, 12 nodes are **comm-bound ~7×** (41.8 µs comm vs 6.1 µs KV read).
-At 1M context the same 12 nodes are **mem-bound** (KV read ~390 µs, comm still
-~42 µs ≈ 11%). The scaling table below (rank-0 report, `RA_SEQ=16384`) shows the
-whole story from one run:
+Direct 1M run on the same 12-node torus confirms the flip: KV read **390.8 µs**
+≫ comm **41.95 µs** (comm ≈ 10%), and comm is **context-independent** (41.95 µs
+@1M vs 41.83 µs @16K, 0.3%). The crossover N moves out to **36** at 1M because KV
+read scales with S. So **short/medium context = comm-bound, long context =
+mem-bound** — the optimization target flips with sequence length. The scaling
+table below (rank-0 report, `RA_SEQ=16384`) shows the whole story from one run:
 
 ```
    N  pos/node  KV_read(us)  ring_lin(us)  tree(us)  step_max(us)    tok/s
@@ -105,6 +109,32 @@ crossover: linear ring-reduce overtakes KV read at N=5
 The tree column flattens dramatically at large N (26.6 µs @ N=128 vs 483 µs for
 the linear ring) — **once past N≈5, use a tree, not a ring**.
 
+### 5. Per-hop decomposition + multi-TNI striping is a **dead end** (`tni_stripe_bench`)
+A payload-size sweep (vary `RA_QH`) shows per-hop latency is **linear in bytes**:
+```
+payload   2080   4160   8320  16640  33280  66560  B
+per-hop   1.56   1.83   2.49   3.81   6.75  11.70  us
+```
+Fit: **per-hop ≈ 1.23 µs fixed overhead + bytes / 6.36 GB/s**. The 6.36 GB/s
+asymptote ≈ one TofuD link (~6.8 GB/s), so at large payload a single Put already
+nears single-link saturation; the "low" 4.4 GB/s at our 16640 B payload is just
+the unamortized fixed overhead, not a BW ceiling.
+
+A64FX exposes **6 onesided TNIs**, so the obvious lever is striping a hop's
+payload across K of them. **Measured: it does nothing.** Per-hop is flat in K
+(same destination), then *worse* at K=6:
+```
+payload 16640 B:  K=1 3.87us  K=2 3.88us  K=3 3.87us  K=6 5.42us
+payload 66560 B:  K=1 11.70us K=2 11.85us K=3 11.68us K=6 12.27us
+```
+The 6 TNIs to the **same peer share one physical link** — they add no
+independent bandwidth; K=6 only piles on per-Put issue/poll overhead that can't
+be hidden. Since every step of the linear ring and the recursive-doubling tree
+targets a single peer, **multi-TNI striping cannot help either collective.**
+TNIs are for parallelism across *distinct* destinations (different torus
+links/directions), not for fattening one peer-to-peer pipe — a multi-rail /
+dimensional collective could exploit them, but single-peer striping is closed.
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -113,6 +143,13 @@ the linear ring) — **once past N≈5, use a tree, not a ring**.
 - **Use tree all-reduce past N≈5.** The linear ring is fine only for tiny N.
 - **Don't bother coordinate-ordering the ring** — software-bound per-hop makes it
   a ~1% effect.
+- **Don't stripe a hop across TNIs** — same-peer TNIs share one link, zero gain
+  (K=6 is a net loss). The only payoff from the 6 TNIs is sending to *different*
+  peers at once.
+- **To shrink the reduce payload** (the only per-hop knob that helps once
+  overhead is amortized): send m,l,o in bf16/fp16 instead of fp32 — halves the
+  2.6 µs transfer component at 16640 B. The per-hop fit `1.23 + bytes/6.36GB/s`
+  says nothing else moves the single-peer hop.
 - Comm being context-independent means **long-context decode is mem-bound** (KV
   read dominates) and **short/medium-context decode is comm-bound** (latency of
   the reduce dominates) — the optimization target flips with S.
