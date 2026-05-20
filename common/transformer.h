@@ -4293,21 +4293,48 @@ static inline int tf_cmg_core_of(int tid, int n_threads, int n_cmgs) {
     return 12 + cmg * 12 + local;
 }
 
+/* True only on a real Fujitsu A64FX CPU (MIDR_EL1 implementer 0x46, part
+ * 0x001 → MIDR 0x46?f0010). Read once from sysfs. Gates HW-barrier default-on
+ * so a generic aarch64+Linux build won't engage the A64FX-specific libhwb
+ * path unless TF_HW_BARRIER=1 is set explicitly. */
+static int tf_is_a64fx(void) {
+#if defined(__aarch64__) && defined(__linux__)
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    cached = 0;
+    FILE *f = fopen("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1", "r");
+    if (f) {
+        unsigned long midr = 0;
+        if (fscanf(f, "%lx", &midr) == 1) {
+            unsigned impl = (unsigned)((midr >> 24) & 0xff);
+            unsigned part = (unsigned)((midr >> 4)  & 0xfff);
+            if (impl == 0x46 && part == 0x001) cached = 1;
+        }
+        fclose(f);
+    }
+    return cached;
+#else
+    return 0;
+#endif
+}
+
 /* Master-side HW-barrier setup: called once by tid0 after pinning, before
- * workers are created. Decides enablement (env TF_HW_BARRIER=1, CMG pinning
- * active, threads split evenly across n_cmgs), builds the participating-core
- * bitmask, and allocates the barrier descriptor via libhwb. */
+ * workers are created. Decides enablement (real A64FX CPU + CMG pinning
+ * active + threads split evenly across n_cmgs, or TF_HW_BARRIER=1 to force),
+ * builds the participating-core bitmask, allocates the descriptor via libhwb. */
 static void tf_hwbar_master_init(transformer_model *m) {
 #if defined(__aarch64__) && defined(__linux__)
     m->hwbar_enabled = 0;
-    /* Default ON; TF_HW_BARRIER=0 forces the flat barrier. When defaulting on
-     * we fall back silently if the prerequisites aren't met (CMG pinning,
-     * even thread split, driver present) — only complain loudly when the user
-     * explicitly asked for it via TF_HW_BARRIER=1. */
+    /* Default ON only on a real A64FX CPU; TF_HW_BARRIER=0 forces the flat
+     * barrier, =1 forces an attempt even off-A64FX (for testing). When
+     * defaulting on we fall back silently if the prerequisites aren't met
+     * (CMG pinning, even thread split, driver present) — only complain loudly
+     * when the user explicitly asked for it via TF_HW_BARRIER=1. */
     const char *e = getenv("TF_HW_BARRIER");
     int explicit_on  = (e && e[0] == '1');
     int explicit_off = (e && e[0] == '0');
     if (explicit_off) return;
+    if (!explicit_on && !tf_is_a64fx()) return;   /* default-on: A64FX only */
     if (!m->cmg_pin) {
         if (explicit_on)
             fprintf(stderr, "transformer: TF_HW_BARRIER needs CMG pinning; ignored\n");
