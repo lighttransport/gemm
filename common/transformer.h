@@ -197,6 +197,9 @@ typedef struct {
                               * Allocated when kv_k_dp; lets AV parallelize across all
                               * threads via per-p partition + reduction (instead of the
                               * baseline 1-thread-per-head split). */
+    float *att_pmax;         /* [n_threads * n_heads] per-thread per-head partial max,
+                              * for the position-parallel softmax (kv_k_dp path). */
+    float *att_psum;         /* [n_threads * n_heads] per-thread per-head partial sum_exp. */
 
     /* Scratch buffers */
     float *x;        /* [n_embd] current hidden state */
@@ -3826,6 +3829,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->kv_k_dp = 0;
     m->q_packed = NULL;
     m->av_tmp = NULL;
+    m->att_pmax = NULL;
+    m->att_psum = NULL;
     {
         const char *kdp_env = getenv("TF_KV_K_DP");
         int kdp_want = 1;  /* default ON */
@@ -3991,6 +3996,10 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         m->q_packed = (float *)tf_aligned_calloc(256, (size_t)m->head_dim * m->n_heads, sizeof(float));
         m->av_tmp = (float *)tf_aligned_calloc(256,
             (size_t)m->n_threads * m->n_heads * m->head_dim, sizeof(float));
+        m->att_pmax = (float *)tf_aligned_calloc(256,
+            (size_t)m->n_threads * m->n_heads, sizeof(float));
+        m->att_psum = (float *)tf_aligned_calloc(256,
+            (size_t)m->n_threads * m->n_heads, sizeof(float));
     }
     {
         size_t fa_tiles = (size_t)m->n_heads * TF_MAX_FA_CHUNKS;
@@ -4126,6 +4135,9 @@ void transformer_free(transformer_model *model) {
     free(model->k);
     free(model->v);
     free(model->att);
+    free(model->av_tmp);
+    free(model->att_pmax);
+    free(model->att_psum);
     free(model->fa_m);
     free(model->fa_l);
     free(model->fa_out);
@@ -4426,6 +4438,12 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
         if (model->av_tmp) free(model->av_tmp);
         model->av_tmp = (float *)tf_aligned_calloc(256,
             (size_t)n_threads * model->n_heads * model->head_dim, sizeof(float));
+        if (model->att_pmax) free(model->att_pmax);
+        if (model->att_psum) free(model->att_psum);
+        model->att_pmax = (float *)tf_aligned_calloc(256,
+            (size_t)n_threads * model->n_heads, sizeof(float));
+        model->att_psum = (float *)tf_aligned_calloc(256,
+            (size_t)n_threads * model->n_heads, sizeof(float));
     }
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
     model->thread_tmp[0] = model->matvec_tmp;
@@ -6237,6 +6255,11 @@ static void *tf_persistent_worker(void *arg) {
             /* qpkd pre-pass: pack this thread's Q heads, barrier, then compute
              * QK over a p-chunk for ALL heads using qpkd+ktbl. Writes att[h][p]
              * for all h; per-head attention worker then skips QK. */
+            /* Position-parallel softmax (all 48T) replaces the legacy 16T
+             * per-head softmax; default ON, TF_PSOFTMAX_OFF=1 restores the old
+             * path for A/B comparison. */
+            static int tf_psm = -1;
+            if (tf_psm < 0) tf_psm = getenv("TF_PSOFTMAX_OFF") ? 0 : 1;
             int pw_skip_qk = 0;
 #if defined(__ARM_FEATURE_SVE)
             if (m->kv_k_dp) {
@@ -6268,8 +6291,28 @@ static void *tf_persistent_worker(void *arg) {
                                             n_heads, n_kv_heads, head_dim,
                                             m->max_seq_len, scale);
                 }
+                if (tf_psm && m->av_tmp) {
+                    /* Per-head partial max over this thread's p-range, hot from
+                     * the QK write above. Published by the att-ready barrier
+                     * below (no extra barrier); reduced to a global per-head max
+                     * in the AV block. */
+                    svbool_t pgm = svptrue_b32();
+                    float *pmax = m->att_pmax + (size_t)tid * n_heads;
+                    for (int h = 0; h < n_heads; h++) {
+                        const float *ar = m->att + (size_t)h * m->max_seq_len;
+                        svfloat32_t vmax = svdup_f32(-INFINITY);
+                        long p = p_lo;
+                        for (; p + (long)svcntw() <= p_hi; p += (long)svcntw())
+                            vmax = svmax_f32_x(pgm, vmax, svld1_f32(pgm, ar + p));
+                        if (p < p_hi) {
+                            svbool_t pt = svwhilelt_b32((int)p, (int)p_hi);
+                            vmax = svmax_f32_m(pt, vmax, svld1_f32(pt, ar + p));
+                        }
+                        pmax[h] = svmaxv_f32(svptrue_b32(), vmax);
+                    }
+                }
                 PW_MARK(attn);
-                PW_BARRIER();  /* att rows ready */
+                PW_BARRIER();  /* att rows ready (+ att_pmax when tf_psm) */
                 PW_MARK(barrier);
                 pw_skip_qk = 1;
             }
@@ -6284,24 +6327,47 @@ static void *tf_persistent_worker(void *arg) {
 #if defined(__ARM_FEATURE_SVE)
             if (m->kv_k_dp && m->av_tmp) {
                 int seq_len = position + 1;
-                /* Per-head softmax: reuse the same head partition as the
-                 * downstream output projection; idle threads (h_count==0)
-                 * just fall through to the barrier. */
-                for (int hi = 0; hi < h_count; hi++) {
-                    int h = h_start + hi;
-                    tf_softmax(m->att + (size_t)h * m->max_seq_len, seq_len);
-                }
-                PW_MARK(attn);
-                PW_BARRIER();  /* softmax done */
-                PW_MARK(barrier);
-
-                /* AV chunk over this thread's p-range, accumulating into its
-                 * own av_tmp slice (which we zero first). */
-                size_t slice_n = (size_t)n_heads * head_dim;
-                float *my_tmp = m->av_tmp + (size_t)tid * slice_n;
-                memset(my_tmp, 0, slice_n * sizeof(float));
                 long p_lo = (long)tid * seq_len / nt;
                 long p_hi = (long)(tid + 1) * seq_len / nt;
+                size_t slice_n = (size_t)n_heads * head_dim;
+                float *my_tmp = m->av_tmp + (size_t)tid * slice_n;
+
+                if (tf_psm) {
+                    /* Position-parallel softmax: every thread owns a p-range for
+                     * ALL heads (no 16-of-48 idle threads). Reduce the partial
+                     * maxes written in the QK block (redundantly, per thread) to
+                     * a global per-head max, then exp+sum over this thread's
+                     * p-range in place. 1/sum is folded into the AV reduce below,
+                     * so the old separate softmax barrier is eliminated. */
+                    float *psum = m->att_psum + (size_t)tid * n_heads;
+                    for (int h = 0; h < n_heads; h++) {
+                        float gmax = -INFINITY;
+                        for (int t = 0; t < nt; t++) {
+                            float v = m->att_pmax[(size_t)t * n_heads + h];
+                            if (v > gmax) gmax = v;
+                        }
+                        float *ar = m->att + (size_t)h * m->max_seq_len;
+                        float s = 0.0f;
+                        for (long p = p_lo; p < p_hi; p++) {
+                            float e = expf(ar[p] - gmax);
+                            ar[p] = e;
+                            s += e;
+                        }
+                        psum[h] = s;
+                    }
+                } else {
+                    /* Legacy 16-thread per-head softmax. */
+                    for (int hi = 0; hi < h_count; hi++)
+                        tf_softmax(m->att + (size_t)(h_start + hi) * m->max_seq_len, seq_len);
+                    PW_MARK(attn);
+                    PW_BARRIER();  /* softmax done */
+                    PW_MARK(barrier);
+                }
+
+                /* AV chunk over this thread's p-range, accumulating into its
+                 * own av_tmp slice (which we zero first). att holds exp scores
+                 * (tf_psm) or normalized softmax (legacy). */
+                memset(my_tmp, 0, slice_n * sizeof(float));
                 if (p_hi > p_lo) {
                     if (m->kv_dtype == TF_KV_DTYPE_F32)
                         tf_av_chunk_f32((const float *)m->value_cache[l], m->att,
@@ -6317,10 +6383,22 @@ static void *tf_persistent_worker(void *arg) {
                                        n_heads, n_kv_heads, head_dim, m->max_seq_len);
                 }
                 PW_MARK(attn);
-                PW_BARRIER();  /* av_tmp ready */
+                PW_BARRIER();  /* av_tmp ready (+ att_psum when tf_psm) */
                 PW_MARK(barrier);
 
-                /* Reduce av_tmp across nt threads into xb2.
+                /* Global per-head 1/sum (redundant per thread) for the fold.
+                 * K_DP requires n_heads == SVE width (16); fixed bound avoids a
+                 * per-iteration alloca in this layer loop. */
+                float ginv[64];
+                if (tf_psm) {
+                    for (int h = 0; h < n_heads; h++) {
+                        float s = 0.0f;
+                        for (int t = 0; t < nt; t++) s += m->att_psum[(size_t)t * n_heads + h];
+                        ginv[h] = s > 0.0f ? 1.0f / s : 0.0f;
+                    }
+                }
+
+                /* Reduce av_tmp across nt threads into xb2, folding 1/sum.
                  * Partition (h, d-vec) work units across all threads: vl floats
                  * per unit, 16 heads × head_dim/vl units total. */
                 {
@@ -6336,6 +6414,11 @@ static void *tf_persistent_worker(void *arg) {
                         int d_hi = d_lo + vl; if (d_hi > head_dim) d_hi = head_dim;
                         tf_av_reduce_slice(m->xb2, m->av_tmp, h, d_lo, d_hi,
                                            nt, n_heads, head_dim);
+                        if (tf_psm) {
+                            float inv = ginv[h];
+                            float *o = m->xb2 + (size_t)h * head_dim;
+                            for (int d = d_lo; d < d_hi; d++) o[d] *= inv;
+                        }
                     }
                 }
                 PW_MARK(attn);
