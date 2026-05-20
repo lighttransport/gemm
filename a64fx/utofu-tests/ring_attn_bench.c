@@ -21,7 +21,10 @@
  *      accumulator o per query head) by passing that small reduction payload
  *      around the ring. We circulate a real payload of that size around the
  *      ring with uTofu Put and measure the per-hop latency, then report the
- *      (N-1)-hop ring-reduce cost.
+ *      (N-1)-hop ring-reduce cost. We ALSO run a real recursive-doubling tree
+ *      all-reduce (Rabenseifner, non-power-of-2 aware) over the same payload and
+ *      MEASURE its latency, to check the ceil(log2 N) projection against what
+ *      the network actually delivers for the longer-distance XOR partners.
  *
  * From the single run's measured node BW + per-hop latency, rank 0 also prints
  * an N-sweep projection table: KV read (~1/N) vs linear ring-reduce ((N-1) hops)
@@ -77,6 +80,9 @@ static int omp_get_max_threads(void) { return 1; }
 #define MAX_NODES 256
 #define BENCH_STAG DEMO_STAG          /* reuse the predictable-STADD convention */
 #define WAIT_TIMEOUT_SEC 15.0         /* spin-loop guard so we never hang */
+#define TREE_NSTEP 24                 /* distinct recv slots for the tree all-reduce
+                                       * (1 pre + log2(pof2) doubling + 1 bcast; 24
+                                       * covers pof2 up to 2^22, i.e. any sane N) */
 
 /* MPI launchers redirect rank stdout, so every rank also logs to its own file. */
 static FILE *g_log = NULL;
@@ -343,20 +349,26 @@ int main(void)
         if (a != b) die("VCQ self-check (cq_id convention wrong)", -1);
     }
 
-    /* ---- comm region: a recv slot and a send slot, each on its own cache
-     * line so the CPU never holds the recv line dirty (see tofu_demo.h). Each
-     * slot holds the decode reduction payload followed by an 8-byte sequence
-     * counter; the receiver polls that counter (written last) to detect arrival. */
+    /* ---- comm region: slot 0 = ring recv, slot 1 = send staging (shared by the
+     * ring relay and the tree all-reduce), slots 2..2+TREE_NSTEP-1 = one recv
+     * slot per tree all-reduce step. Each slot is its own cache line so the CPU
+     * never holds a recv line dirty (see tofu_demo.h), and holds the decode
+     * reduction payload followed by an 8-byte sequence counter the receiver polls
+     * (written last) to detect arrival. The tree uses a distinct recv slot per
+     * step so a partner advancing to the next step can't overwrite an unread one. */
     size_t payload = (size_t)QH * (HD + 2) * sizeof(float); /* m,l + o[HD] per head */
     size_t p8      = (payload + 7) & ~(size_t)7;
     size_t slot    = (p8 + 8 + (DEMO_CACHE_LINE - 1)) & ~(size_t)(DEMO_CACHE_LINE - 1);
-    size_t region_sz = 2 * slot;
+    size_t region_sz = (size_t)(2 + TREE_NSTEP) * slot;
 
     void *region = NULL;
     if (posix_memalign(&region, DEMO_CACHE_LINE, region_sz) != 0) die("posix_memalign", -1);
     memset(region, 0, region_sz);
     volatile uint64_t *recv_seq = (volatile uint64_t *)((char *)region + p8);
     uint64_t          *send_seq = (uint64_t *)((char *)region + slot + p8);
+    /* tree step `sid` recv-counter lives in slot (2+sid) */
+#define TREE_RECV_SEQ(sid) \
+    ((volatile uint64_t *)((char *)region + (size_t)(2 + (sid)) * slot + p8))
 
     utofu_stadd_t base_stadd;
     rc = utofu_reg_mem_with_stag(vcq, region, region_sz, BENCH_STAG, 0, &base_stadd);
@@ -371,6 +383,20 @@ int main(void)
     rc = utofu_query_stadd(next_vcq, BENCH_STAG, &next_base);
     if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(next)", rc);
     utofu_stadd_t next_recv_stadd = next_base;        /* neighbour's recv slot @ +0 */
+
+    /* VCQ id + region base for EVERY peer, so the tree all-reduce can Put to any
+     * rank (not just the ring successor). Built by convention from coords + STAG,
+     * exactly like next_vcq/next_base above -- no runtime exchange. */
+    static utofu_vcq_id_t peer_vcq[MAX_NODES];
+    static utofu_stadd_t  peer_base[MAX_NODES];
+    for (int r = 0; r < nprocs; r++) {
+        if (r == my_rank) { peer_vcq[r] = my_vcq_real; peer_base[r] = base_stadd; continue; }
+        rc = utofu_construct_vcq_id(topo[r], tni, DEMO_CQ_ID, DEMO_CMP_ID, &peer_vcq[r]);
+        if (rc != UTOFU_SUCCESS) die("utofu_construct_vcq_id(peer)", rc);
+        utofu_set_vcq_id_path(&peer_vcq[r], NULL);
+        rc = utofu_query_stadd(peer_vcq[r], BENCH_STAG, &peer_base[r]);
+        if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(peer)", rc);
+    }
 
     size_t put_len = p8 + 8;                          /* payload + seq counter */
     const unsigned long flags = UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
@@ -450,6 +476,84 @@ int main(void)
     RELAY(WARMUP, warm_el);
     RELAY(ITERS, timed_el);
 
+    /* ---- tree all-reduce (recursive doubling, the comm pattern that actually
+     * scales as ceil(log2 N) instead of the ring's N-1). Standard Rabenseifner
+     * non-power-of-2 handling: the lowest 2*rem ranks pair up so the even one
+     * folds into the odd one (pre-reduce), recursive doubling runs on the pof2
+     * survivors, then results are sent back to the folded-out evens (broadcast).
+     * We don't combine values (this benchmark measures comm cost only) but keep
+     * the exact dependency chain -- each step waits for the prior step's arrival
+     * before issuing the next -- so the measured latency is the true critical
+     * path, including the longer-distance XOR partners. Every Put targets the
+     * partner's recv slot for that step id; both partners of an exchange agree on
+     * the slot id, so there is a unique writer per (slot,token). ---- */
+    int pof2 = 1; while (pof2 * 2 <= nprocs) pof2 *= 2;
+    int rem = nprocs - pof2;
+    int nrounds = 0; for (int x = 1; x < pof2; x <<= 1) nrounds++;   /* log2(pof2) */
+    int bcast_sid = nrounds + 1;
+    int cl2 = 0; for (int x = 1; x < nprocs; x <<= 1) cl2++;         /* ceil(log2 N) */
+    int newrank;                              /* rank within the pof2 doubling group */
+    if (my_rank < 2 * rem) newrank = (my_rank % 2 == 0) ? -1 : my_rank / 2;
+    else                   newrank = my_rank - rem;
+
+    /* Put our send slot into peer `prank`'s recv slot for step `sid`. */
+#define TREE_PEER_PUT(prank, sid)                                               \
+    do {                                                                        \
+        utofu_stadd_t _tgt = peer_base[prank] + (size_t)(2 + (sid)) * slot;     \
+        for (;;) {                                                              \
+            rc = utofu_put(vcq, peer_vcq[prank], send_stadd, _tgt,              \
+                           put_len, 0, flags, NULL);                            \
+            if (rc != UTOFU_ERR_BUSY) break;                                    \
+            utofu_poll_tcq(vcq, 0, &cb);                                        \
+        }                                                                       \
+        if (rc != UTOFU_SUCCESS) die("utofu_put(tree)", rc);                    \
+        do { rc = utofu_poll_tcq(vcq, 0, &cb); } while (rc == UTOFU_ERR_NOT_FOUND); \
+        if (rc != UTOFU_SUCCESS) die("utofu_poll_tcq(tree)", rc);               \
+    } while (0)
+
+    /* spin until step `sid`'s recv counter reaches token `w` */
+#define TREE_WAIT(sid, w)                                                       \
+    do {                                                                        \
+        volatile uint64_t *_rs = TREE_RECV_SEQ(sid);                            \
+        double _ts = now_sec();                                                 \
+        while (*_rs < (uint64_t)(w))                                            \
+            if (now_sec() - _ts > WAIT_TIMEOUT_SEC) {                           \
+                logmsg("rank %d: tree wait timeout sid=%d want=%lu got=%lu "    \
+                       "(slot off=%zu)\n", my_rank, (sid), (uint64_t)(w),       \
+                       (uint64_t)*_rs, (size_t)(2 + (sid)) * slot + p8);        \
+                exit(1);                                                        \
+            }                                                                   \
+    } while (0)
+
+    /* one full all-reduce of token seq `w`: pre-reduce, doubling, broadcast */
+#define TREE_ALLREDUCE(w)                                                       \
+    do {                                                                        \
+        *send_seq = (uint64_t)(w);                                              \
+        if (my_rank < 2 * rem) {                  /* pre-reduce fold */         \
+            if (my_rank % 2 == 0) TREE_PEER_PUT(my_rank + 1, 0);                \
+            else                  TREE_WAIT(0, w);                              \
+        }                                                                       \
+        if (newrank != -1) {                      /* recursive doubling */      \
+            for (int _k = 0; _k < nrounds; _k++) {                             \
+                int _pnr = newrank ^ (1 << _k);                                \
+                int _pr  = (_pnr < rem) ? (_pnr * 2 + 1) : (_pnr + rem);        \
+                TREE_PEER_PUT(_pr, _k + 1);                                     \
+                TREE_WAIT(_k + 1, w);                                          \
+            }                                                                   \
+        }                                                                       \
+        if (my_rank < 2 * rem) {                  /* broadcast back */          \
+            if (my_rank % 2 == 0) TREE_WAIT(bcast_sid, w);                      \
+            else                  TREE_PEER_PUT(my_rank - 1, bcast_sid);        \
+        }                                                                       \
+    } while (0)
+
+    double tree_warm = 0.0, tree_timed = 0.0;
+    /* NB: pass a plain variable to TREE_ALLREDUCE -- the macro evaluates its
+     * argument many times, so `tok++` here would increment repeatedly. */
+    { double _t0 = now_sec(); for (long i = 0; i < WARMUP; i++) { uint64_t w = tok++; TREE_ALLREDUCE(w); } tree_warm  = now_sec() - _t0; }
+    { double _t0 = now_sec(); for (long i = 0; i < ITERS;  i++) { uint64_t w = tok++; TREE_ALLREDUCE(w); } tree_timed = now_sec() - _t0; }
+    (void)tree_warm;
+
     /* ---- memory bench: measure full node read BW the way decode streams the
      * KV cache (per-CMG-local buffers; see bench_node_bw), then apply it to the
      * modeled per-node KV-shard size. The shard itself (tens of MiB) is too
@@ -487,6 +591,17 @@ int main(void)
         logmsg("ring-reduce       = %.2f us  (%d hops, the decode comm cost)\n",
                ring_reduce_us, nprocs - 1);
 
+        double tree_us = tree_timed / (double)ITERS * 1e6;
+        int tree_steps = nrounds + (rem > 0 ? 2 : 0);
+        logmsg("\n--- uTofu tree all-reduce (recursive doubling, MEASURED) ---\n");
+        logmsg("measured all-reduce = %.2f us  (%d steps: %d doubling%s)\n",
+               tree_us, tree_steps, nrounds, rem > 0 ? " + pre-reduce + broadcast" : "");
+        logmsg("vs linear ring      = %.2f us (%d hops); ceil(log2 N)*hop proj = %.2f us\n",
+               ring_reduce_us, nprocs - 1, (double)cl2 * per_hop_us);
+        if (nprocs > 2)
+            logmsg("tree speedup over linear ring = %.2fx (per-step %.2f us)\n",
+                   ring_reduce_us / tree_us, tree_us / (double)tree_steps);
+
         logmsg("\n--- combined per-decode-step attention estimate ---\n");
         logmsg("KV read (per node) = %.1f us @ %.1f GB/s\n", kv_read_us, gbps);
         logmsg("ring-reduce comm   = %.2f us\n", ring_reduce_us);
@@ -500,13 +615,13 @@ int main(void)
          * this single run's measured node BW and per-hop latency. KV read/node
          * falls as ~1/N (shard = S/N positions); ring-reduce comm grows as
          * (N-1) hops (linear, reduce-to-one -- same model as the line above),
-         * while a recursive-doubling all-reduce needs only ceil(log2 N) rounds.
-         * per_hop_us is our measured SINGLE-physical-hop cost: a topology-ordered
-         * linear ring stays all-1-hop at any N, whereas the tree's logical
-         * partners may span several physical hops -- but per-hop latency here is
-         * software-dominated (Put issue + landing + poll), so that penalty is
-         * modest and roughly constant. The crossover N is where comm starts to
-         * dominate the (overlapped) per-step cost. ---- */
+         * while a recursive-doubling all-reduce needs log2(pof2) doubling rounds
+         * plus 2 fold/broadcast steps when N is not a power of 2 (the actual
+         * Rabenseifner step depth -- the MEASURED tree section above confirms
+         * this count, and that distant XOR partners run a bit above per_hop_us,
+         * so the tree column is a lower bound). per_hop_us is the measured
+         * single-physical-hop cost. The crossover N is where comm starts to
+         * dominate the (overlapped, linear-ring) per-step cost. ---- */
         static const int Nsweep[] = {2,3,4,6,8,12,16,24,32,48,64,96,128};
         logmsg("\n--- scaling projection (S=%ld, BW=%.1f GB/s, hop=%.2f us) ---\n",
                S, gbps, per_hop_us);
@@ -516,7 +631,9 @@ int main(void)
             long pos = (S + N - 1) / N;
             double kvus = (double)pos * KVH * HD * 2 * KVB / (gbps * 1e9) * 1e6;
             double lin  = (double)(N - 1) * per_hop_us;
-            int depth = 0; for (int x = 1; x < N; x <<= 1) depth++;  /* ceil(log2 N) */
+            int p2 = 1; while (p2 * 2 <= N) p2 *= 2;          /* largest pow2 <= N */
+            int depth = 0; for (int x = 1; x < p2; x <<= 1) depth++;  /* log2(pof2) */
+            if (N - p2 > 0) depth += 2;                       /* pre-reduce + bcast */
             double tree = (double)depth * per_hop_us;
             double step = kvus > lin ? kvus : lin;                   /* overlapped */
             logmsg("%4d  %8ld  %11.2f  %12.2f  %8.2f  %12.2f  %7.1f\n",
