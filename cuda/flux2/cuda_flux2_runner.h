@@ -2851,11 +2851,7 @@ struct cuda_flux2_runner {
     size_t bf16_attn_buf_n;                      /* allocated count (n_tok*dim halves) */
     int use_bf16_attn;
     /* Optional split-key F32 attention workspace (FLUX2_FA2_SPLIT_F32). */
-    CUdeviceptr d_attn_part_o;                   /* [n_splits, n_tok, dim] f32 */
-    CUdeviceptr d_attn_part_m;                   /* [n_splits, n_tok, n_heads] f32 */
-    CUdeviceptr d_attn_part_l;                   /* [n_splits, n_tok, n_heads] f32 */
-    size_t attn_part_o_bytes;
-    size_t attn_part_state_bytes;
+    cu_split_attn_f32_workspace attn_split_ws;
     /* FP8 v7 GEMM (ported from cuda/gemm) — quantize X to FP8 and use the
      * cp.async + ldmatrix + 4×4 panel-swizzle kernel. Workspace sized to the
      * largest activation across all GEMMs in the step. */
@@ -3529,35 +3525,8 @@ static int ensure_bf16_attn_buf(cuda_flux2_runner *r, size_t n_elems) {
 
 static int ensure_split_attn_buf(cuda_flux2_runner *r, int n_tok, int n_heads,
                                  int head_dim, int n_splits) {
-    size_t dim = (size_t)n_heads * (size_t)head_dim;
-    size_t o_bytes = (size_t)n_splits * (size_t)n_tok * dim * sizeof(float);
-    size_t state_bytes = (size_t)n_splits * (size_t)n_tok * (size_t)n_heads * sizeof(float);
-    if (o_bytes > r->attn_part_o_bytes) {
-        if (r->d_attn_part_o) { cuMemFree(r->d_attn_part_o); r->d_attn_part_o = 0; }
-        r->attn_part_o_bytes = 0;
-        if (cuMemAlloc(&r->d_attn_part_o, o_bytes) != CUDA_SUCCESS) {
-            r->d_attn_part_o = 0;
-            return -1;
-        }
-        r->attn_part_o_bytes = o_bytes;
-    }
-    if (state_bytes > r->attn_part_state_bytes) {
-        if (r->d_attn_part_m) { cuMemFree(r->d_attn_part_m); r->d_attn_part_m = 0; }
-        if (r->d_attn_part_l) { cuMemFree(r->d_attn_part_l); r->d_attn_part_l = 0; }
-        r->attn_part_state_bytes = 0;
-        if (cuMemAlloc(&r->d_attn_part_m, state_bytes) != CUDA_SUCCESS) {
-            r->d_attn_part_m = 0;
-            return -1;
-        }
-        if (cuMemAlloc(&r->d_attn_part_l, state_bytes) != CUDA_SUCCESS) {
-            cuMemFree(r->d_attn_part_m);
-            r->d_attn_part_m = 0;
-            r->d_attn_part_l = 0;
-            return -1;
-        }
-        r->attn_part_state_bytes = state_bytes;
-    }
-    return 0;
+    return cu_split_attn_f32_workspace_ensure(&r->attn_split_ws, n_tok, n_heads,
+                                              head_dim, n_splits, "flux2.split_attn");
 }
 
 /* Lazily allocate FP8 v7 GEMM workspace (X quant buffer + max + scale).
@@ -3761,13 +3730,15 @@ static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
             unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
             unsigned nt = (unsigned)(32 * fa2_warps);
             size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
-            void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+            void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                              &r->attn_split_ws.l.ptr,
                               &q, &k, &v, &n_tok, &n_heads, &head_dim, &split_kv};
             CUresult e1 = cuLaunchKernel(r->fn_flash_attn_split_partials,
                                          (unsigned)n_heads, gy, (unsigned)n_splits,
                                          nt, 1, 1, smem, r->stream, p_args, NULL);
-            void *m_args[] = {&out, &r->d_attn_part_o, &r->d_attn_part_m,
-                              &r->d_attn_part_l, &n_tok, &n_heads, &head_dim, &n_splits};
+            void *m_args[] = {&out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                              &r->attn_split_ws.l.ptr, &n_tok, &n_heads,
+                              &head_dim, &n_splits};
             CUresult e2 = (e1 == CUDA_SUCCESS)
                 ? cuLaunchKernel(r->fn_flash_attn_split_merge,
                                  (unsigned)n_heads, (unsigned)n_tok, 1,
@@ -5340,9 +5311,7 @@ void cuda_flux2_free(cuda_flux2_runner *r) {
     if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
 
     /* Split-key F32 attention partials */
-    if (r->d_attn_part_o) cuMemFree(r->d_attn_part_o);
-    if (r->d_attn_part_m) cuMemFree(r->d_attn_part_m);
-    if (r->d_attn_part_l) cuMemFree(r->d_attn_part_l);
+    cu_split_attn_f32_workspace_free(&r->attn_split_ws);
 
     /* FP8 v7 GEMM workspace (lazily allocated by ensure_x_fp8_buf) */
     if (r->d_x_fp8)   cuMemFree(r->d_x_fp8);
