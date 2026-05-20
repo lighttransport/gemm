@@ -16,11 +16,14 @@
 # binary makes zero MPI calls. NP defaults to the allocation's node count
 # ($PJM_NODE); override by exporting NP.
 #
-# Memory BW is NUMA-sensitive on A64FX (4 CMGs, ~800 GB/s peak): a single CMG's
-# pages cap at ~1/4 of peak. We launch the bench under `numactl --interleave=all`
-# so KV pages spread across all 4 CMGs, and use all 48 cores. Tune the model
-# shape via RA_* env vars (RA_SEQ, RA_QH, RA_KVH, RA_HD, RA_KVB, ...). To bypass
-# the on-node measurement and use a known/profiled read BW, set RA_BW_GBPS=645.
+# Memory BW is NUMA-sensitive on A64FX (4 CMGs, ~200 GB/s each, ~800 GB/s/node).
+# The bench manages its own placement internally -- one buffer per CMG, mbind'd
+# to that CMG's NUMA node, threads pinned, read with an 8-accumulator SVE kernel
+# -- so it reaches full node BW (~900 GB/s here) WITHOUT any numactl wrapper (do
+# not wrap it in numactl, which would impose a conflicting default policy). Just
+# give it all 48 cores. Tune the model shape via RA_* env vars (RA_SEQ, RA_QH,
+# RA_KVH, RA_HD, RA_KVB, RA_BWMB). To bypass on-node measurement and use a
+# known/profiled read BW for the estimate, set RA_BW_GBPS=645.
 set -e
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin"
@@ -38,6 +41,6 @@ mpiexec -np "$NP" ./tofu_topo_helper
 cat tofu_topo.txt
 
 echo "=== step 2: ring-attention decode cost estimate (no MPI in the binary) ==="
-mpiexec -np "$NP" numactl --interleave=all ./ring_attn_bench
+mpiexec -np "$NP" ./ring_attn_bench
 
 echo "=== done ==="
