@@ -119,6 +119,74 @@ static inline void cu_buf_slots_free(cu_buf_slot *slots, int n) {
     for (int i = 0; i < n; i++) cu_buf_slot_free(&slots[i]);
 }
 
+/* Shared F32 split-key attention partial workspace:
+ *   o: [n_splits, n_tok, n_heads * head_dim] float
+ *   m/l: [n_splits, n_tok, n_heads] float
+ */
+typedef struct {
+    cu_buf_slot o;
+    cu_buf_slot m;
+    cu_buf_slot l;
+} cu_split_attn_f32_workspace;
+
+static inline int cu_mul_size_checked(size_t a, size_t b, size_t *out) {
+    if (!out) return -1;
+    if (a != 0 && b > SIZE_MAX / a) return -1;
+    *out = a * b;
+    return 0;
+}
+
+static inline int cu_split_attn_f32_workspace_bytes(int n_tok, int n_heads,
+                                                    int head_dim, int n_splits,
+                                                    size_t *o_bytes,
+                                                    size_t *state_bytes) {
+    size_t dim, elems;
+    if (n_tok <= 0 || n_heads <= 0 || head_dim <= 0 || n_splits <= 0 ||
+        !o_bytes || !state_bytes) {
+        return -1;
+    }
+    if (cu_mul_size_checked((size_t)n_heads, (size_t)head_dim, &dim) != 0 ||
+        cu_mul_size_checked((size_t)n_splits, (size_t)n_tok, &elems) != 0 ||
+        cu_mul_size_checked(elems, dim, o_bytes) != 0 ||
+        cu_mul_size_checked(*o_bytes, sizeof(float), o_bytes) != 0) {
+        return -1;
+    }
+    if (cu_mul_size_checked(elems, (size_t)n_heads, state_bytes) != 0 ||
+        cu_mul_size_checked(*state_bytes, sizeof(float), state_bytes) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static inline int cu_split_attn_f32_workspace_ensure(cu_split_attn_f32_workspace *w,
+                                                     int n_tok, int n_heads,
+                                                     int head_dim, int n_splits,
+                                                     const char *label) {
+    size_t o_bytes = 0, state_bytes = 0;
+    char o_label[96], m_label[96], l_label[96];
+    if (!w ||
+        cu_split_attn_f32_workspace_bytes(n_tok, n_heads, head_dim, n_splits,
+                                          &o_bytes, &state_bytes) != 0) {
+        fprintf(stderr, "cuda: invalid split attention workspace shape for %s\n",
+                label ? label : "?");
+        return -1;
+    }
+    snprintf(o_label, sizeof(o_label), "%s.part_o", label ? label : "split_attn");
+    snprintf(m_label, sizeof(m_label), "%s.part_m", label ? label : "split_attn");
+    snprintf(l_label, sizeof(l_label), "%s.part_l", label ? label : "split_attn");
+    if (cu_buf_slot_ensure(&w->o, o_bytes, o_label) != 0) return -1;
+    if (cu_buf_slot_ensure(&w->m, state_bytes, m_label) != 0) return -1;
+    if (cu_buf_slot_ensure(&w->l, state_bytes, l_label) != 0) return -1;
+    return 0;
+}
+
+static inline void cu_split_attn_f32_workspace_free(cu_split_attn_f32_workspace *w) {
+    if (!w) return;
+    cu_buf_slot_free(&w->o);
+    cu_buf_slot_free(&w->m);
+    cu_buf_slot_free(&w->l);
+}
+
 /* Async zero of a device range on `stream`. Soft-failure: logs to stderr
  * but does not return an error (matches the cuda_llm reset helper). */
 static inline void cu_async_zero(CUdeviceptr ptr, size_t bytes, CUstream stream,
