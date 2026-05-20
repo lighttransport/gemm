@@ -31,25 +31,29 @@ ifeq ($(CC),fcc)
     BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
     ASMC         := fcc
+    HWBLIB       := -lhwb
 else ifeq ($(CC),gcc)
     BASE_CFLAGS  := -O3 -march=armv8.2-a+sve -ffp-contract=fast
     BASE_CFLAGS  += -Wall -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
     ASMC         := gcc
+    HWBLIB       := -lhwb
 else ifeq ($(CC),clang)
     BASE_CFLAGS  := -O3 -march=armv8.2-a+sve -ffp-contract=fast
     BASE_CFLAGS  += -Wall -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
     ASMC         := clang
+    HWBLIB       := -lhwb
 else
     BASE_CFLAGS  := -O2
     OMP_FLAG     :=
     ASMC         := $(CC)
+    HWBLIB       :=
 endif
 
 CFLAGS  := $(BASE_CFLAGS) -std=c11 -D_GNU_SOURCE \
            -I$(VLM_INC) -I$(VLM_KERNELS) -I$(VLM_SRC) -I$(COMMON)
-LDFLAGS := -lm -lpthread
+LDFLAGS := -lm -lpthread $(HWBLIB)
 
 ifdef OPENMP
     CFLAGS  += $(OMP_FLAG) -DUSE_OPENMP=1

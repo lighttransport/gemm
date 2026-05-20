@@ -269,6 +269,23 @@ typedef struct {
     int cmg_pin;
     int cmg_pin_ncmgs;
 
+    /* A64FX hardware barrier (libhwb / /dev/xos_hwb), env TF_HW_BARRIER=1.
+     * Per-CMG EL0 BST hardware barrier + 4-way SW combine among CMG leaders.
+     * The kernel group-assign that makes the EL0 BST register actually
+     * synchronize is done per-thread by vhbm_bar_assign(); raw MSR/MRS alone
+     * is a no-op. See [[hwbarrier-libhwb-win]]. */
+    int  hwbar_enabled;        /* 1 = use HW barrier in the persistent worker */
+    int  hwbar_bd;             /* vhbm_bar_init() return (barrier-descriptor mask) */
+    int  hwbar_ncmg;           /* CMGs participating */
+    int  hwbar_tpc;            /* threads per CMG (n_threads / hwbar_ncmg) */
+    long hwbar_bb[64];         /* per-tid BST register index (0..3) from assign */
+    volatile int hwbar_lcount; /* 4-way leader-combine arrival count */
+    char _hwbar_pad1[60];
+    volatile int hwbar_lsense; /* 4-way leader-combine release sense */
+    char _hwbar_pad2[60];
+    volatile int hwbar_join_count;   /* threads that finished vhbm_bar_assign (startup) */
+    volatile int hwbar_assign_failed;/* set if any thread's group-join failed → revert to flat */
+
     /* Tensor parallelism */
     int tp_rank;               /* this rank's position in the TP group (0 if no TP) */
     int tp_size;               /* size of the TP group (1 if no TP) */
@@ -4250,6 +4267,106 @@ static int tf_cmg_pin_thread(int tid, int n_threads, int n_cmgs) {
 }
 #endif
 
+#if defined(__aarch64__)
+/* Fujitsu libhwb (/lib64/libhwb.so) — the standalone HW-barrier API the
+ * OpenMP runtime also uses. vhbm_bar_assign() performs the privileged
+ * /dev/xos_hwb group-assign (sets IMP_BARRIER_ASSIGN_EL1 for the calling
+ * core) so the EL0 BST register actually coalesces toggles; without it the
+ * raw MSR/MRS is a per-core no-op. Linked via -lhwb on A64FX builds. */
+extern int  vhbm_bar_init(uint64_t core_bitmask);    /* bit i = node-core i; returns bd-mask */
+extern int  vhbm_bar_assign(int bd_mask, void *bb_hint); /* per-thread join; returns bb (0..3) */
+extern void vhbm_bar(long bb);                        /* hot intra-CMG barrier on BST reg bb */
+extern int  vhbm_bar_unassign(int bd_mask);
+#endif
+
+/* Compute the A64FX compute-core that tf_cmg_pin_thread pins `tid` to (for
+ * building the HW-barrier core mask). Mirrors tf_cmg_pin_thread exactly. */
+static inline int tf_cmg_core_of(int tid, int n_threads, int n_cmgs) {
+    if (n_threads < 1) n_threads = 1;
+    if (n_cmgs < 1) n_cmgs = 1;
+    if (n_cmgs > 4) n_cmgs = 4;
+    int cmg       = (int)((long)tid * n_cmgs / n_threads);
+    int cmg_first = (int)(((long)cmg * n_threads + n_cmgs - 1) / n_cmgs);
+    int local     = tid - cmg_first;
+    if (local < 0)  local = 0;
+    if (local > 11) local = 11;
+    return 12 + cmg * 12 + local;
+}
+
+/* Master-side HW-barrier setup: called once by tid0 after pinning, before
+ * workers are created. Decides enablement (env TF_HW_BARRIER=1, CMG pinning
+ * active, threads split evenly across n_cmgs), builds the participating-core
+ * bitmask, and allocates the barrier descriptor via libhwb. */
+static void tf_hwbar_master_init(transformer_model *m) {
+#if defined(__aarch64__) && defined(__linux__)
+    m->hwbar_enabled = 0;
+    /* Default ON; TF_HW_BARRIER=0 forces the flat barrier. When defaulting on
+     * we fall back silently if the prerequisites aren't met (CMG pinning,
+     * even thread split, driver present) — only complain loudly when the user
+     * explicitly asked for it via TF_HW_BARRIER=1. */
+    const char *e = getenv("TF_HW_BARRIER");
+    int explicit_on  = (e && e[0] == '1');
+    int explicit_off = (e && e[0] == '0');
+    if (explicit_off) return;
+    if (!m->cmg_pin) {
+        if (explicit_on)
+            fprintf(stderr, "transformer: TF_HW_BARRIER needs CMG pinning; ignored\n");
+        return;
+    }
+    int nt = m->n_threads;
+    int ncmg = m->cmg_pin_ncmgs;
+    if (ncmg < 1) ncmg = 1;
+    if (ncmg > 4) ncmg = 4;
+    if (nt < ncmg || (nt % ncmg) != 0) {
+        if (explicit_on)
+            fprintf(stderr, "transformer: TF_HW_BARRIER needs nt%%n_cmgs==0 "
+                    "(nt=%d n_cmgs=%d); ignored\n", nt, ncmg);
+        return;
+    }
+    uint64_t mask = 0;
+    for (int t = 0; t < nt; t++) mask |= (1ULL << tf_cmg_core_of(t, nt, ncmg));
+    int bd = vhbm_bar_init(mask);
+    if (bd < 0) {
+        if (explicit_on)
+            fprintf(stderr, "transformer: vhbm_bar_init failed (%d); HW barrier off\n", bd);
+        return;
+    }
+    m->hwbar_bd      = bd;
+    m->hwbar_ncmg    = ncmg;
+    m->hwbar_tpc     = nt / ncmg;
+    m->hwbar_lcount  = 0;
+    m->hwbar_lsense  = 0;
+    m->hwbar_join_count    = 0;
+    m->hwbar_assign_failed = 0;
+    m->hwbar_enabled = 1;
+    fprintf(stderr, "transformer: HW barrier ON (libhwb bd=%d, %d cores, "
+            "%d CMGs x %d, mask=0x%llx)\n", bd, nt, ncmg, m->hwbar_tpc,
+            (unsigned long long)mask);
+#else
+    (void)m;
+#endif
+}
+
+/* Per-thread join: each pool thread (after pinning) registers with the kernel
+ * barrier group for its core and records its BST register index. */
+static void tf_hwbar_thread_join(transformer_model *m, int tid) {
+#if defined(__aarch64__) && defined(__linux__)
+    if (!m->hwbar_enabled) return;
+    int bb = vhbm_bar_assign(m->hwbar_bd, NULL);
+    if (bb < 0) {
+        fprintf(stderr, "transformer: vhbm_bar_assign tid%d failed (%d); "
+                "reverting to flat barrier\n", tid, bb);
+        m->hwbar_assign_failed = 1;   /* tf_pool_start finalizes the fallback */
+        bb = 0;
+    }
+    m->hwbar_bb[tid] = bb;
+    __sync_synchronize();
+    __sync_add_and_fetch((int *)&m->hwbar_join_count, 1);
+#else
+    (void)m; (void)tid;
+#endif
+}
+
 typedef struct {
     transformer_model *model;
     int tid;
@@ -4263,6 +4380,7 @@ static void *tf_pool_worker_main(void *arg) {
 
     if (m->cmg_pin)
         tf_cmg_pin_thread(tid, m->n_threads, m->cmg_pin_ncmgs);
+    tf_hwbar_thread_join(m, tid);  /* register this core with the HW barrier group */
 
     int last_phase = 0;
     while (1) {
@@ -4349,6 +4467,10 @@ static void tf_pool_start(transformer_model *model) {
             model->cmg_pin = 0;
         }
     }
+    /* HW barrier: allocate the descriptor (master) and join tid0, before the
+     * worker threads are created so vhbm_bar_init precedes any vhbm_bar_assign. */
+    tf_hwbar_master_init(model);
+    tf_hwbar_thread_join(model, 0);
     model->pool_threads = (pthread_t *)calloc(nt, sizeof(pthread_t));
     model->pool_done_flags = (volatile int *)calloc(
         (size_t)nt * TF_POOL_FLAG_STRIDE, sizeof(int));
@@ -4363,6 +4485,22 @@ static void tf_pool_start(transformer_model *model) {
         ctx->model = model;
         ctx->tid = t;
         pthread_create(&model->pool_threads[t], NULL, tf_pool_worker_main, ctx);
+    }
+    /* HW-barrier startup handshake: every thread (tid0 above + workers) must
+     * finish its kernel group-join before the first barrier. The HW barrier is
+     * all-or-nothing — if any join failed, vhbm_bar() for the rest would never
+     * coalesce, so revert ALL threads to the flat barrier here, while workers
+     * are still parked on pool_phase==0 (no PW_BARRIER has run yet, and the
+     * first tf_pool_dispatch is strictly after this returns → race-free). */
+    if (model->hwbar_enabled) {
+        while (model->hwbar_join_count < nt) tf_cpu_pause();
+        __sync_synchronize();
+        if (model->hwbar_assign_failed) {
+            fprintf(stderr, "transformer: HW barrier disabled "
+                    "(a thread failed to join); using flat barrier\n");
+            model->hwbar_enabled = 0;
+            __sync_synchronize();
+        }
     }
 }
 
@@ -5741,6 +5879,28 @@ static inline void tf_hw_barrier_w0(void) {
 }
 #endif
 
+#if defined(__aarch64__)
+/* Hierarchical 48-thread HW barrier: HW intra-CMG arrival + 4-way SW combine
+ * among CMG leaders + HW intra-CMG release. The EL0 BST barrier is intra-CMG
+ * only, so cross-CMG sync needs the software combine. `bb` is this thread's
+ * per-CMG BST register (from vhbm_bar_assign); leaders are tid % tpc == 0. */
+static inline void tf_hwlib_barrier(transformer_model *m, int tid, long bb, int *ls4) {
+    vhbm_bar(bb);                              /* intra-CMG arrival */
+    if (tid % m->hwbar_tpc == 0) {             /* CMG leader: combine across CMGs */
+        int my = !(*ls4);
+        if (__sync_add_and_fetch((int *)&m->hwbar_lcount, 1) == m->hwbar_ncmg) {
+            m->hwbar_lcount = 0;
+            __sync_synchronize();
+            m->hwbar_lsense = my;
+        } else {
+            while (m->hwbar_lsense != my) __asm__ __volatile__("yield");
+        }
+        *ls4 = my;
+    }
+    vhbm_bar(bb);                              /* intra-CMG release */
+}
+#endif
+
 /* Barrier: sense-reversing with SEV/WFE on aarch64 for low-power wait.
  * WFE puts the core in low-power state until an event (SEV from the last
  * arriving thread). No bandwidth consumption while waiting. */
@@ -5992,9 +6152,23 @@ static void *tf_persistent_worker(void *arg) {
      *   - tf_hier_arr_barrier (hier arrival, flat release): -3% prefill — the
      *     extra per-CMG atomic step costs as much as the 48-way contention
      *     saves on A64FX (LSE atomics are already fairly efficient).
-     * Both functions kept in tree for reference. Flat barrier is the default. */
+     * Both functions kept in tree for reference. Flat barrier is the default.
+     *
+     * TF_HW_BARRIER=1 swaps in the A64FX hardware barrier (per-CMG EL0 BST +
+     * 4-way SW leader combine, via libhwb). This *does* work from our pthreads
+     * once vhbm_bar_assign performs the kernel group-assign — see
+     * [[hwbarrier-libhwb-win]]. Falls back to flat when disabled. */
     (void)0;
+#if defined(__aarch64__)
+    long hw_bb = m->hwbar_enabled ? m->hwbar_bb[tid] : 0;
+    int  hw_ls4 = 0;
+    #define PW_BARRIER() do { \
+        if (m->hwbar_enabled) tf_hwlib_barrier(m, tid, hw_bb, &hw_ls4); \
+        else tf_spin_barrier(m, &local_sense, nt); \
+    } while (0)
+#else
     #define PW_BARRIER() tf_spin_barrier(m, &local_sense, nt)
+#endif
 #ifdef TF_POOL_PROFILE
     double _ts = tf_now_s();
 #define PW_MARK(BUCKET) do { if (tid < 2) { double _n = tf_now_s(); \
