@@ -528,15 +528,16 @@ static int test_kernel_split_attn_f32(cuda_flux2_runner *r) {
         goto fail;
     }
     {
-        void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+        void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr,
                           &d_Q, &d_K, &d_V, &ntok, &nh, &hd, &sk};
         unsigned gy = (unsigned)((n_tok + 3) / 4);
         FLUX2_SPLIT_TEST_CU(cuLaunchKernel(r->fn_flash_attn_split_partials,
                                            (unsigned)n_heads, gy, (unsigned)n_splits,
                                            128, 1, 1, smem, r->stream, p_args, NULL),
                             "split partials launch");
-        void *m_args[] = {&d_split, &r->d_attn_part_o, &r->d_attn_part_m,
-                          &r->d_attn_part_l, &ntok, &nh, &hd, &ns};
+        void *m_args[] = {&d_split, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                          &r->attn_split_ws.l.ptr, &ntok, &nh, &hd, &ns};
         FLUX2_SPLIT_TEST_CU(cuLaunchKernel(r->fn_flash_attn_split_merge,
                                            (unsigned)n_heads, (unsigned)n_tok, 1,
                                            128, 1, 1, 0, r->stream, m_args, NULL),
@@ -797,10 +798,11 @@ static float time_flux2_split_attn(cuda_flux2_runner *r,
     int ntok = n_tok, nh = n_heads, hd = head_dim, sk = split_kv, ns = n_splits;
     unsigned gy = (unsigned)((n_tok + 3) / 4);
     size_t smem = (size_t)(2 * 32 * 128) * sizeof(float);
-    void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+    void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr,
                       &q, &k, &v, &ntok, &nh, &hd, &sk};
-    void *m_args[] = {&out, &r->d_attn_part_o, &r->d_attn_part_m,
-                      &r->d_attn_part_l, &ntok, &nh, &hd, &ns};
+    void *m_args[] = {&out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                      &r->attn_split_ws.l.ptr, &ntok, &nh, &hd, &ns};
     if (cuLaunchKernel(r->fn_flash_attn_split_partials, (unsigned)n_heads, gy, (unsigned)n_splits,
                        128, 1, 1, smem, r->stream, p_args, NULL) != CUDA_SUCCESS) goto fail;
     if (cuLaunchKernel(r->fn_flash_attn_split_merge, (unsigned)n_heads, (unsigned)n_tok, 1,

@@ -1250,11 +1250,7 @@ struct cuda_qimg_runner {
     CUdeviceptr d_q_bf16, d_k_bf16, d_v_bf16; /* [n_tok*dim] uint16 bf16 */
     size_t      bf16_attn_buf_n;
     /* Optional split-key F32 attention workspace (QIMG_FA2_SPLIT_F32). */
-    CUdeviceptr d_attn_part_o;   /* [n_splits, n_tok, dim] f32 */
-    CUdeviceptr d_attn_part_m;   /* [n_splits, n_tok, n_heads] f32 */
-    CUdeviceptr d_attn_part_l;   /* [n_splits, n_tok, n_heads] f32 */
-    size_t      attn_part_o_bytes;
-    size_t      attn_part_state_bytes;
+    cu_split_attn_f32_workspace attn_split_ws;
     int use_f16_gemm;  /* 1 to use F16 weights + gemm_f16_f32 (better precision) */
     CUfunction truncate_bf16;
     CUfunction quantize_fp8_rt;  /* FP8 roundtrip quantization */
@@ -2493,35 +2489,8 @@ static int ensure_bf16_attn_buf(cuda_qimg_runner *r, size_t n_bytes) {
 
 static int ensure_split_attn_buf(cuda_qimg_runner *r, int n_tok, int n_heads,
                                  int head_dim, int n_splits) {
-    size_t dim = (size_t)n_heads * (size_t)head_dim;
-    size_t o_bytes = (size_t)n_splits * (size_t)n_tok * dim * sizeof(float);
-    size_t state_bytes = (size_t)n_splits * (size_t)n_tok * (size_t)n_heads * sizeof(float);
-    if (o_bytes > r->attn_part_o_bytes) {
-        if (r->d_attn_part_o) { cuMemFree(r->d_attn_part_o); r->d_attn_part_o = 0; }
-        r->attn_part_o_bytes = 0;
-        if (cuMemAlloc(&r->d_attn_part_o, o_bytes) != CUDA_SUCCESS) {
-            r->d_attn_part_o = 0;
-            return -1;
-        }
-        r->attn_part_o_bytes = o_bytes;
-    }
-    if (state_bytes > r->attn_part_state_bytes) {
-        if (r->d_attn_part_m) { cuMemFree(r->d_attn_part_m); r->d_attn_part_m = 0; }
-        if (r->d_attn_part_l) { cuMemFree(r->d_attn_part_l); r->d_attn_part_l = 0; }
-        r->attn_part_state_bytes = 0;
-        if (cuMemAlloc(&r->d_attn_part_m, state_bytes) != CUDA_SUCCESS) {
-            r->d_attn_part_m = 0;
-            return -1;
-        }
-        if (cuMemAlloc(&r->d_attn_part_l, state_bytes) != CUDA_SUCCESS) {
-            cuMemFree(r->d_attn_part_m);
-            r->d_attn_part_m = 0;
-            r->d_attn_part_l = 0;
-            return -1;
-        }
-        r->attn_part_state_bytes = state_bytes;
-    }
-    return 0;
+    return cu_split_attn_f32_workspace_ensure(&r->attn_split_ws, n_tok, n_heads,
+                                              head_dim, n_splits, "qimg.split_attn");
 }
 
 /* Bulk F32 → BF16 cast launcher. n is the element count (not bytes). */
@@ -2711,13 +2680,15 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
             unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
             unsigned n_threads = (unsigned)(32 * fa2_warps);
             size_t smem = (size_t)2 * fa2_bkv * 128 * sizeof(float);
-            void *p_args[] = {&r->d_attn_part_o, &r->d_attn_part_m, &r->d_attn_part_l,
+            void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                              &r->attn_split_ws.l.ptr,
                               &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim, &split_kv};
             CUresult e1 = cuLaunchKernel(r->attn_split_partials_f32,
                                          (unsigned)n_heads, gy, (unsigned)n_splits,
                                          n_threads, 1, 1, smem, r->stream, p_args, NULL);
-            void *m_args[] = {&d_out, &r->d_attn_part_o, &r->d_attn_part_m,
-                              &r->d_attn_part_l, &n_tok, &n_heads, &head_dim, &n_splits};
+            void *m_args[] = {&d_out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                              &r->attn_split_ws.l.ptr, &n_tok, &n_heads,
+                              &head_dim, &n_splits};
             CUresult e2 = (e1 == CUDA_SUCCESS)
                 ? cuLaunchKernel(r->attn_split_merge_f32,
                                  (unsigned)n_heads, (unsigned)n_tok, 1,
@@ -3402,9 +3373,7 @@ void cuda_qimg_free(cuda_qimg_runner *r) {
     if (r->d_k_bf16) cuMemFree(r->d_k_bf16);
     if (r->d_v_bf16) cuMemFree(r->d_v_bf16);
     /* Split-key F32 attention partials */
-    if (r->d_attn_part_o) cuMemFree(r->d_attn_part_o);
-    if (r->d_attn_part_m) cuMemFree(r->d_attn_part_m);
-    if (r->d_attn_part_l) cuMemFree(r->d_attn_part_l);
+    cu_split_attn_f32_workspace_free(&r->attn_split_ws);
     /* Per-row FP8 MMA scale buffer */
     if (r->d_row_max_buf) cuMemFree(r->d_row_max_buf);
     cu_buf_slots_free(r->cfg_slots, QIMG_CFG_BUF_COUNT);
