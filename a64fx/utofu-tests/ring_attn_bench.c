@@ -23,6 +23,11 @@
  *      ring with uTofu Put and measure the per-hop latency, then report the
  *      (N-1)-hop ring-reduce cost.
  *
+ * From the single run's measured node BW + per-hop latency, rank 0 also prints
+ * an N-sweep projection table: KV read (~1/N) vs linear ring-reduce ((N-1) hops)
+ * vs recursive-doubling tree (ceil(log2 N) rounds), and the crossover N where
+ * comm starts to dominate -- so one 2-node run shows the whole scaling story.
+ *
  * Like tofu_put_demo this binary makes ZERO MPI calls: mpiexec only places it,
  * and it reconstructs ring-neighbour VCQ IDs from coordinates in tofu_topo.txt
  * (written once by tofu_topo_helper) via utofu_construct_vcq_id().
@@ -490,6 +495,44 @@ int main(void)
         logmsg("overlap (max)      = %.1f us  -> %.1f tok/s\n",
                (kv_read_us > ring_reduce_us ? kv_read_us : ring_reduce_us),
                1e6 / (kv_read_us > ring_reduce_us ? kv_read_us : ring_reduce_us));
+
+        /* ---- N-sweep projection: how the two costs scale with ring size, from
+         * this single run's measured node BW and per-hop latency. KV read/node
+         * falls as ~1/N (shard = S/N positions); ring-reduce comm grows as
+         * (N-1) hops (linear, reduce-to-one -- same model as the line above),
+         * while a recursive-doubling all-reduce needs only ceil(log2 N) rounds.
+         * per_hop_us is our measured SINGLE-physical-hop cost: a topology-ordered
+         * linear ring stays all-1-hop at any N, whereas the tree's logical
+         * partners may span several physical hops -- but per-hop latency here is
+         * software-dominated (Put issue + landing + poll), so that penalty is
+         * modest and roughly constant. The crossover N is where comm starts to
+         * dominate the (overlapped) per-step cost. ---- */
+        static const int Nsweep[] = {2,3,4,6,8,12,16,24,32,48,64,96,128};
+        logmsg("\n--- scaling projection (S=%ld, BW=%.1f GB/s, hop=%.2f us) ---\n",
+               S, gbps, per_hop_us);
+        logmsg("   N  pos/node  KV_read(us)  ring_lin(us)  tree(us)  step_max(us)  tok/s\n");
+        for (size_t k = 0; k < sizeof(Nsweep) / sizeof(Nsweep[0]); k++) {
+            int N = Nsweep[k];
+            long pos = (S + N - 1) / N;
+            double kvus = (double)pos * KVH * HD * 2 * KVB / (gbps * 1e9) * 1e6;
+            double lin  = (double)(N - 1) * per_hop_us;
+            int depth = 0; for (int x = 1; x < N; x <<= 1) depth++;  /* ceil(log2 N) */
+            double tree = (double)depth * per_hop_us;
+            double step = kvus > lin ? kvus : lin;                   /* overlapped */
+            logmsg("%4d  %8ld  %11.2f  %12.2f  %8.2f  %12.2f  %7.1f\n",
+                   N, pos, kvus, lin, tree, step, 1e6 / step);
+        }
+        int cross = 0;
+        for (int N = 2; N <= 4096; N++) {
+            long pos = (S + N - 1) / N;
+            double kvus = (double)pos * KVH * HD * 2 * KVB / (gbps * 1e9) * 1e6;
+            if ((double)(N - 1) * per_hop_us > kvus) { cross = N; break; }
+        }
+        if (cross)
+            logmsg("crossover: linear ring-reduce overtakes KV read at N=%d "
+                   "(beyond it comm dominates -- use tree-reduce or fewer/larger shards)\n", cross);
+        else
+            logmsg("crossover: KV read dominates for all N<=4096 at this context\n");
     }
 
     utofu_dereg_mem(vcq, base_stadd, 0);
