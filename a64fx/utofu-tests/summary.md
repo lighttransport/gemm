@@ -23,6 +23,7 @@ distributed-attention budget.
 | `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, all 6 Tofu axes `x→y→z→a→b→c`, `MOE_DIMORDER`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins) and #11 (dimensional relay dead end in-unit; 6-axis multi-unit harness ready) |
 | `allgather_bench.c` | **all-gather** (the BW-optimal *half* of an all-reduce; TP sequence-parallel hidden / KV-shard gather): naive single-TNI all-broadcast / multi-TNI all-broadcast / ring all-gather / recursive-doubling all-gather (Rabenseifner non-pow2), plus the tree all-reduce baseline for the roofline ratio. `AG_BATCH`/`AG_SHARD`/`AG_NTNI` — see finding #12 |
 | `reducescatter_bench.c` | **reduce-scatter** (the *other* BW-optimal half; the all-reduce = reduce-scatter + all-gather decomposition): naive single-TNI direct scatter / multi-TNI direct scatter / ring reduce-scatter, plus a multi-TNI all-gather and the fused tree all-reduce so the decomposed pair is compared to the fused tree in one run. Shares `AG_*` knobs with `allgather_bench` — see finding #13 |
+| `pp_handoff_bench.c` | **pipeline-parallel handoff** (the point-to-point inter-stage send/recv — the comm pattern that *replaces* per-layer collectives): ping-pong one-hop (near vs far for distance sensitivity) / full forward+backward store-and-forward chain `0→…→S-1→…→0` / tree all-reduce baseline (the TP per-layer cost it trades against). `PP_HID`/`PP_ABYTES`/`PP_BATCH`/`PP_FAR` — see finding #14 |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -577,6 +578,50 @@ fan-outs, not as a fused tree — it is 2–4× cheaper in pure comm. Reduce-sca
 and all-gather are cost-symmetric, so the suite's all-gather numbers (finding #12)
 carry over directly.**
 
+### Finding #14 — pipeline-parallel handoff: comm-cheap but bubble-bound; one hop = one link, distance-free
+
+`pp_handoff_bench.c` measures the *point-to-point* inter-stage send/recv that
+pipeline parallelism uses **instead of** per-layer collectives. The model's layers
+split into S=12 stages (one per rank); a microbatch's activation (`HID·ABYTES·B`,
+**not** sharded) is Put across each stage boundary, forward `0→…→S-1` then backward
+in training. Measured 12-node 2×3×2 in-unit torus:
+
+| | per-hop (isolated) | per-hop (in-chain) | fwd chain (S-1=11 hops) | fwd+bwd RT (22 hops) | one tree all-reduce |
+|---|---|---|---|---|---|
+| **B=1** (decode, 12 KiB) | 3.17 µs near / 3.35 far | 3.20 µs | 35.3 µs | 70.5 µs | 18.3 µs |
+| **B=256** (microbatch, 3 MiB) | 496.9 / 497.1 µs | 497.0 µs | 5467 µs | 10934 µs | 3707 µs |
+
+1. **A single handoff is one TofuD link, and torus distance is free.** Near (rank 0↔1)
+   vs far (rank 0↔11, opposite corner) differ by ×1.06 at B=1 and ×1.00 at B=256 —
+   confirming the ring's topology-insensitivity (≈1%) for an isolated P2P. At B=256
+   the 3 MiB hop runs at 3 MiB / 497 µs ≈ **6.33 GB/s = exactly one TofuD link**
+   (cf. the 6.36 GB/s ring-hop and the 6.7 GB/s reduce-scatter ingest cap, #13) —
+   one process injecting to one peer cannot exceed one link, distance notwithstanding.
+2. **Store-and-forward is free.** The in-chain per-hop (3.20 µs / 497.0 µs) equals the
+   isolated ping-pong per-hop — each stage's wake-on-seq + re-issue latency is fully
+   hidden behind the next hop's transfer; the chain is just `(S-1) ×` one hop, with no
+   relay tax (unlike the MoE dimensional relay #11, which paid 3 serial phases + 1.67×
+   forwarding bytes).
+3. **PP trades comm volume for the pipeline bubble.** The full S-1-hop forward chain
+   costs ×1.93 (B=1) / ×1.47 (B=256) of *one* tree all-reduce — but PP pays this
+   **once for the whole model**, whereas TP pays `2·num_layers` all-reduces. For a
+   ~75-layer decode that is PP's 35 µs vs TP's ≈150 × 18.3 µs ≈ 2.7 ms of comm — PP
+   comm is ~80× smaller. The catch is the bubble: with M microbatches in flight the
+   idle fraction is `(S-1)/(M+S-1)` = **0.92 at M=1**, 0.58 at M=8, 0.15 at M=64.
+   Autoregressive decode has **one token in flight** (M=1), so the pipeline can never
+   fill: the (S-1)-hop serial chain lands *fully on the critical path* (35 µs added
+   latency) and 92% of the stages sit idle. **PP only pays off for decode with many
+   concurrent sequences (large M) to amortize the bubble; for single-stream
+   low-latency decode it adds chain latency without usable comm savings.** TP (cheap
+   per-step comm, no bubble, but `2·num_layers` collectives) is the better single-stream
+   structure; PP wins only at high decode batch / throughput-oriented serving.
+
+**Takeaway: a PP stage handoff is one link, distance-free, and store-and-forward is
+free — so the whole-model PP comm is just `(S-1) ×` one-link transfer, ~80× below TP's
+per-layer all-reduce sum. But decode's M=1 makes the bubble 92%, so PP is a
+throughput (large-M) lever, not a latency one. `decode_estimate.py`'s collective
+terms model TP; a PP variant would replace them with `(S-1)·t_hop / (1-bubble)`.**
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -662,7 +707,8 @@ ae8e731  moe_dispatch_bench — MoE expert-dispatch all-to-all (multi-TNI)
 c07f425  moe_dispatch_bench — dimensional store-and-forward variant (dead end, #11)
 14f0a43  allgather_bench — all-gather (multi-TNI wins; recursive-doubling trap, #12)
 e317b82  moe_dispatch_bench — relay extended to all 6 Tofu axes (multi-unit ready, #11)
-(this)   reducescatter_bench — reduce-scatter mirrors all-gather; decompose all-reduce beats fused tree 2-4× (#13)
+f12ee81  reducescatter_bench — reduce-scatter mirrors all-gather; decompose all-reduce beats fused tree 2-4× (#13)
+(this)   pp_handoff_bench — pipeline-parallel handoff: one link/hop, distance-free, bubble-bound (#14)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
