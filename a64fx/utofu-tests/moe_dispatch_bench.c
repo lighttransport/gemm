@@ -20,12 +20,22 @@
  * (like ring_attn_bench, which performs no attention math). We move realistically
  * sized payloads and time them.
  *
- * Three transport variants over the same routing matrix:
+ * Four transport variants over the same routing matrix:
  *   (a) NAIVE  : single TNI, N-1 pairwise Puts (rotate-by-s schedule), drain each.
  *   (b) MULTI  : distinct destinations round-robined over MOE_NTNI TNIs, all Puts
  *                issued before any TCQ drain so the TNIs run concurrently.
  *   (c) TREE   : recursive-doubling all-reduce (copied from ring_attn_bench) over
  *                payload HID*ABYTES*B -- exactly decode_estimate.py's assumption.
+ *   (d) DIM    : dimension-ordered store-and-forward all-to-all along the in-unit
+ *                torus axes a->b->c (coords[3..5], extents 2x3x2). Each message
+ *                hops one axis per phase; intermediate nodes aggregate and forward
+ *                (Bruck-style). Every Put is a single-axis line send, never a
+ *                hardware multi-hop route -- the test of whether axis-balanced
+ *                routing beats the round-robin multi-TNI ~3x cap and relieves the
+ *                hot-link congestion that wrecks (b)/(a) under skewed routing.
+ *                Per-phase bundle byte sizes are computed analytically from the
+ *                shared count matrix, so no real data movement is needed to know
+ *                them -- like the rest of the bench, sized dummy payloads + seq.
  *
  * Like the rest of the suite this binary makes ZERO MPI calls: mpiexec only
  * places it; it reconstructs every peer's VCQ ID from tofu_topo.txt coordinates
@@ -51,6 +61,8 @@
  *   MOE_ROUTE  "uniform" or "worst" (imbalance)  (default uniform)
  *   MOE_CAPFAC capacity factor on payload size   (default 1.0)
  *   MOE_NTNI   TNIs for the multi-TNI variant    (default 6)
+ *   MOE_RELAY  run the dimensional variant (d)    (default 1; 0 to skip)
+ *   MOE_DIMORDER axis order for (d), e.g. abc/bac (default abc)
  *   MOE_LAYERS MoE layers for whole-model scaling(default 75)
  *   MOE_ITERS  timed exchanges                   (default 2000)
  *   MOE_WARMUP untimed warmup exchanges          (default 200)
@@ -165,6 +177,54 @@ static const unsigned long FLAGS = UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
 /* tree all-reduce layout (Rabenseifner, non-pow2), computed in main */
 static int Pof2, Rem, NRounds, BcastSid, NewRank;
 
+/* ---- dimensional (store-and-forward) relay state ----
+ * In-unit torus axes a,b,c = coords[3..5]. A message origin->dst is routed one
+ * axis per phase (DimOrder): after phase i the holder's coords in the resolved
+ * axes equal dst's, in the unresolved axes equal origin's. Each phase send is a
+ * single-axis LINE send (holder -> the line member with dst's coord in that
+ * axis); intermediate nodes aggregate and forward. A node only ever receives
+ * from its (extent-1) line neighbors per phase, so relay recv slots total just
+ * sum(ext-1) (= 4 on the 2x3x2 torus), not 3N. */
+#define RELAY_STAG 2
+#define NDIM 3
+static int   Ext[NDIM];                        /* axis extents (a,b,c)            */
+static int   DimOrder[NDIM];                   /* phase order (axis indices)      */
+static int   RankOf3[8][8][8];                 /* (a,b,c) -> rank (-1 if absent)  */
+static uint8_t AxA[MAX_NODES], AxB[MAX_NODES], AxC[MAX_NODES];
+static int   RecvSlotBase[NDIM];               /* relay recv slot id base/phase   */
+static int   NRelayRecv;                        /* total relay recv slots          */
+static char *RelayRegion;
+static size_t RelaySlot;
+static utofu_stadd_t RelayBase[MAX_TNI];
+static utofu_stadd_t RelayPeerBase[MAX_TNI][MAX_NODES];
+static int   SendBundle[NDIM][MAX_NODES];      /* MyRank send bundle counts/phase (by target) */
+static int   RecvBundle[NDIM][MAX_NODES];      /* MyRank recv bundle counts/phase (by source) */
+
+static inline int axis_coord(int rank, int axis)
+{ return axis == 0 ? AxA[rank] : axis == 1 ? AxB[rank] : AxC[rank]; }
+
+/* the rank with `rank`'s coords but axis-coord replaced by v */
+static int line_member(int rank, int axis, int v)
+{
+    int a = AxA[rank], b = AxB[rank], c = AxC[rank];
+    if (axis == 0) a = v; else if (axis == 1) b = v; else c = v;
+    return RankOf3[a][b][c];
+}
+/* index of src among target's `axis`-line members (coord order, target excluded) */
+static int neighbor_index(int src, int target, int axis)
+{
+    int idx = 0;
+    for (int v = 0; v < Ext[axis]; v++) {
+        int m = line_member(target, axis, v);
+        if (m == target) continue;
+        if (m == src) return idx;
+        idx++;
+    }
+    return -1;
+}
+static inline size_t relay_recv_off(int slot) { return (size_t)slot * RelaySlot; }
+static inline size_t relay_send_off(int j)    { return (size_t)(NRelayRecv + j) * RelaySlot; }
+
 /* slot offsets within the registered region: [disp recv 0..N-1][comb recv 0..N-1]
  * [tree recv 0..TREE_NSTEP-1][send 0..N-1]; each slot its own cache line(s). */
 static inline size_t disp_recv_off(int src) { return (size_t)(src) * Slot; }
@@ -192,6 +252,25 @@ static void drain_n(int k, int n)
     int rc; void *cb;
     for (int j = 0; j < n; j++) { do { rc = utofu_poll_tcq(Vcq[k], 0, &cb); } while (rc == UTOFU_ERR_NOT_FOUND);
                                   if (rc != UTOFU_SUCCESS) die("utofu_poll_tcq(drain)", rc); }
+}
+
+/* a single uTofu Put caps at ~16 MiB; relay's aggregated bundles exceed that
+ * under skew, so chunk them. Chunks on one VCQ to one dst stay ordered, so the
+ * trailing seq counter (in the last chunk) still lands last. Returns #chunks
+ * issued (no local drain -- caller drains the TCQ per TNI like the multi path). */
+#define RELAY_MAX_PUT (8u * 1024u * 1024u)
+static int relay_put(int k, utofu_vcq_id_t pv, utofu_stadd_t s, utofu_stadd_t d, size_t len)
+{
+    int n = 0; size_t off = 0; void *cb;
+    while (off < len) {
+        size_t c = len - off; if (c > RELAY_MAX_PUT) c = RELAY_MAX_PUT;
+        int rc;
+        for (;;) { rc = utofu_put(Vcq[k], pv, s + off, d + off, c, 0, FLAGS, NULL);
+                   if (rc != UTOFU_ERR_BUSY) break; utofu_poll_tcq(Vcq[k], 0, &cb); }
+        if (rc != UTOFU_SUCCESS) die("utofu_put(relay)", rc);
+        off += c; n++;
+    }
+    return n;
 }
 
 /* issue this rank's outgoing messages for one all-to-all phase.
@@ -271,6 +350,110 @@ static void tree_allreduce(uint64_t tok)
     }
 }
 
+/* MyRank's per-phase send/recv bundle counts for routing `mat` (mat[o][d]). */
+static void relay_plan(const int mat[][MAX_NODES])
+{
+    for (int i = 0; i < NDIM; i++)
+        for (int r = 0; r < N; r++) { SendBundle[i][r] = 0; RecvBundle[i][r] = 0; }
+    for (int o = 0; o < N; o++) for (int d = 0; d < N; d++) {
+        int c = mat[o][d]; if (c <= 0) continue;
+        int ha = AxA[o], hb = AxB[o], hc = AxC[o];          /* holder coords */
+        for (int i = 0; i < NDIM; i++) {
+            int axis = DimOrder[i], dv = axis_coord(d, axis);
+            int ta = ha, tb = hb, tc = hc;                  /* target coords this phase */
+            if (axis == 0) ta = dv; else if (axis == 1) tb = dv; else tc = dv;
+            int holder = RankOf3[ha][hb][hc], target = RankOf3[ta][tb][tc];
+            if (holder != target) {
+                if (holder == MyRank) SendBundle[i][target] += c;
+                if (target == MyRank) RecvBundle[i][holder] += c;
+            }
+            ha = ta; hb = tb; hc = tc;                      /* advance for next phase */
+        }
+    }
+}
+
+/* global max bundle count (for slot sizing) + total wire bytes, over all ranks. */
+static int relay_scan(const int mat[][MAX_NODES], double *wire_bytes)
+{
+    static int agg[MAX_NODES][MAX_NODES];
+    int maxc = 0;
+    for (int i = 0; i < NDIM; i++) {
+        for (int x = 0; x < N; x++) for (int y = 0; y < N; y++) agg[x][y] = 0;
+        for (int o = 0; o < N; o++) for (int d = 0; d < N; d++) {
+            int c = mat[o][d]; if (c <= 0) continue;
+            int ha = AxA[o], hb = AxB[o], hc = AxC[o];
+            for (int j = 0; j <= i; j++) {
+                int axis = DimOrder[j], dv = axis_coord(d, axis);
+                int ta = ha, tb = hb, tc = hc;
+                if (axis == 0) ta = dv; else if (axis == 1) tb = dv; else tc = dv;
+                if (j == i) {
+                    int holder = RankOf3[ha][hb][hc], target = RankOf3[ta][tb][tc];
+                    if (holder != target) agg[holder][target] += c;
+                }
+                ha = ta; hb = tb; hc = tc;
+            }
+        }
+        for (int x = 0; x < N; x++) for (int y = 0; y < N; y++) if (agg[x][y] > 0) {
+            if (agg[x][y] > maxc) maxc = agg[x][y];
+            if (wire_bytes) *wire_bytes += (double)plen(agg[x][y]);
+        }
+    }
+    return maxc;
+}
+
+/* one dimension-ordered all-to-all over the currently planned routing. Each phase:
+ * issue line sends (concurrent across TNIs), drain, then WAIT my incoming before
+ * the next phase (the forward dependency -- can't relay what hasn't arrived). */
+static void relay_a2a(uint64_t tok)
+{
+    for (int i = 0; i < NDIM; i++) {
+        int axis = DimOrder[i], issued[MAX_TNI] = {0}, sidx = 0;
+        for (int v = 0; v < Ext[axis]; v++) {
+            int T = line_member(MyRank, axis, v);
+            if (T == MyRank || SendBundle[i][T] <= 0) continue;
+            size_t L = plen(SendBundle[i][T]);
+            char *sb = RelayRegion + relay_send_off(sidx);
+            *(volatile uint64_t *)(sb)     = MOE_MAGIC | (uint64_t)MyRank;
+            *(volatile uint64_t *)(sb + L) = tok;
+            int k = sidx % NTNI;
+            int slot = RecvSlotBase[i] + neighbor_index(MyRank, T, axis);
+            issued[k] += relay_put(k, PeerVcq[k][T], RelayBase[k] + relay_send_off(sidx),
+                                   RelayPeerBase[k][T] + relay_recv_off(slot), L + 8);
+            sidx++;
+        }
+        for (int k = 0; k < NTNI; k++) drain_n(k, issued[k]);
+        double ts = now_sec();
+        for (int v = 0; v < Ext[axis]; v++) {
+            int S = line_member(MyRank, axis, v);
+            if (S == MyRank || RecvBundle[i][S] <= 0) continue;
+            int slot = RecvSlotBase[i] + neighbor_index(S, MyRank, axis);
+            volatile uint64_t *sq = (volatile uint64_t *)(RelayRegion + relay_recv_off(slot) + plen(RecvBundle[i][S]));
+            while (*sq < tok)
+                if (now_sec() - ts > WAIT_TIMEOUT_SEC) die("relay wait timeout", -1);
+        }
+    }
+}
+
+/* one-time relay correctness: every expected recv slot head holds its source id. */
+static int relay_verify(void)
+{
+    for (int i = 0; i < NDIM; i++) {
+        int axis = DimOrder[i];
+        for (int v = 0; v < Ext[axis]; v++) {
+            int S = line_member(MyRank, axis, v);
+            if (S == MyRank || RecvBundle[i][S] <= 0) continue;
+            int slot = RecvSlotBase[i] + neighbor_index(S, MyRank, axis);
+            uint64_t h = *(volatile uint64_t *)(RelayRegion + relay_recv_off(slot));
+            if (h != (MOE_MAGIC | (uint64_t)S)) {
+                logmsg("relay verify FAIL phase=%d src=%d got=0x%lx want=0x%lx\n",
+                       i, S, (unsigned long)h, (unsigned long)(MOE_MAGIC | (uint64_t)S));
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 int main(void)
 {
     int rc;
@@ -312,6 +495,34 @@ int main(void)
     for (int r = 0; r < N; r++) if (memcmp(topo[r], my_coords, TOFU_NCOORDS) == 0) MyRank = r;
     if (MyRank == -1) { fprintf(stderr, "my coords not in %s\n", TOPO_PATH); exit(1); }
 
+    /* ---- in-unit torus axes (a,b,c) = coords[3..5]; set up the dimensional
+     * relay's rank<->coord maps, extents, processing order, and recv-slot bases.
+     * Relay is enabled only on a rectangular, fully-populated <=8^3 sub-torus. ---- */
+    for (int r = 0; r < N; r++) { AxA[r] = topo[r][3]; AxB[r] = topo[r][4]; AxC[r] = topo[r][5]; }
+    Ext[0] = Ext[1] = Ext[2] = 0;
+    for (int r = 0; r < N; r++) {
+        if (AxA[r] + 1 > Ext[0]) Ext[0] = AxA[r] + 1;
+        if (AxB[r] + 1 > Ext[1]) Ext[1] = AxB[r] + 1;
+        if (AxC[r] + 1 > Ext[2]) Ext[2] = AxC[r] + 1;
+    }
+    int relay_on = (int)envl("MOE_RELAY", 1) && Ext[0] <= 8 && Ext[1] <= 8 && Ext[2] <= 8;
+    memset(RankOf3, 0xff, sizeof RankOf3);
+    if (relay_on) {
+        for (int r = 0; r < N; r++) RankOf3[AxA[r]][AxB[r]][AxC[r]] = r;
+        for (int a = 0; a < Ext[0] && relay_on; a++)
+            for (int b = 0; b < Ext[1] && relay_on; b++)
+                for (int c = 0; c < Ext[2]; c++)
+                    if (RankOf3[a][b][c] < 0) { relay_on = 0; break; }   /* non-rectangular */
+    }
+    {   /* dimension processing order (default a->b->c) */
+        const char *od = getenv("MOE_DIMORDER"); const char *s = (od && *od) ? od : "abc";
+        for (int i = 0; i < NDIM; i++)
+            DimOrder[i] = (s[i] == 'a') ? 0 : (s[i] == 'b') ? 1 : (s[i] == 'c') ? 2 : i;
+    }
+    RecvSlotBase[0] = 0;
+    for (int i = 1; i < NDIM; i++) RecvSlotBase[i] = RecvSlotBase[i - 1] + (Ext[DimOrder[i - 1]] - 1);
+    NRelayRecv = RecvSlotBase[NDIM - 1] + (Ext[DimOrder[NDIM - 1]] - 1);
+
     /* ---- routing matrix (identical on every rank) ---- */
     static int cnt[MAX_NODES][MAX_NODES];
     gen_count_matrix((uint64_t)SEED, (int)B, (int)K, (int)E, N, worst, cnt);
@@ -338,6 +549,23 @@ int main(void)
     if (posix_memalign((void **)&Region, DEMO_CACHE_LINE, region_sz) != 0) die("posix_memalign", -1);
     memset(Region, 0, region_sz);
 
+    /* ---- dimensional relay region: slot sized to the max forwarded bundle over
+     * BOTH dispatch (cnt) and combine (cnt^T), since relay aggregates many pairs
+     * into one line send -- bundles dwarf any single direct pair. ---- */
+    static int cntT[MAX_NODES][MAX_NODES];
+    double relay_wire_bytes = 0;
+    size_t relay_region_sz = 0;
+    if (relay_on) {
+        for (int s = 0; s < N; s++) for (int d = 0; d < N; d++) cntT[s][d] = cnt[d][s];
+        int relay_maxc = relay_scan(cnt, &relay_wire_bytes);
+        int m2 = relay_scan(cntT, NULL); if (m2 > relay_maxc) relay_maxc = m2;
+        RelaySlot = (plen(relay_maxc) + 8 + (DEMO_CACHE_LINE - 1)) & ~(size_t)(DEMO_CACHE_LINE - 1);
+        relay_region_sz = (size_t)(NRelayRecv + 4) * RelaySlot;   /* +4 send-staging slots */
+        if (posix_memalign((void **)&RelayRegion, DEMO_CACHE_LINE, relay_region_sz) != 0)
+            die("posix_memalign(relay)", -1);
+        memset(RelayRegion, 0, relay_region_sz);
+    }
+
     /* one VCQ per TNI; register the same region in each (independent stadd space) --
      * the tni_stripe_bench.c:109-122 pattern, generalized to peer arrays for ALL ranks. */
     for (int k = 0; k < NTNI; k++) {
@@ -362,13 +590,26 @@ int main(void)
         utofu_stadd_t chk;
         rc = utofu_query_stadd(my_real, BENCH_STAG, &chk);
         if (rc != UTOFU_SUCCESS || chk != Base[k]) die("STADD self-check", rc);
+        /* dimensional relay region: second stag, independent stadd space */
+        if (relay_on) {
+            rc = utofu_reg_mem_with_stag(Vcq[k], RelayRegion, relay_region_sz, RELAY_STAG, 0, &RelayBase[k]);
+            if (rc != UTOFU_SUCCESS) die("utofu_reg_mem_with_stag(relay)", rc);
+        }
         for (int r = 0; r < N; r++) {
-            if (r == MyRank) { PeerVcq[k][r] = my_real; PeerBase[k][r] = Base[k]; continue; }
+            if (r == MyRank) {
+                PeerVcq[k][r] = my_real; PeerBase[k][r] = Base[k];
+                if (relay_on) RelayPeerBase[k][r] = RelayBase[k];
+                continue;
+            }
             rc = utofu_construct_vcq_id(topo[r], tni, DEMO_CQ_ID, DEMO_CMP_ID, &PeerVcq[k][r]);
             if (rc != UTOFU_SUCCESS) die("utofu_construct_vcq_id(peer)", rc);
             utofu_set_vcq_id_path(&PeerVcq[k][r], NULL);
             rc = utofu_query_stadd(PeerVcq[k][r], BENCH_STAG, &PeerBase[k][r]);
             if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(peer)", rc);
+            if (relay_on) {
+                rc = utofu_query_stadd(PeerVcq[k][r], RELAY_STAG, &RelayPeerBase[k][r]);
+                if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(peer relay)", rc);
+            }
         }
     }
     free(tni_ids);
@@ -390,6 +631,12 @@ int main(void)
                sel, distinct, maxc, HBytes);
         logmsg("slot=%zu B  region=%.1f MiB  NTNI=%d  tree payload=%zu B (%d steps)\n",
                Slot, region_sz / 1048576.0, NTNI, PlenTree, NRounds + (Rem ? 2 : 0));
+        if (relay_on)
+            logmsg("relay: torus %dx%dx%d  dim-order=%c%c%c  recv slots=%d  RelaySlot=%zu B  region=%.1f MiB  wire=%.2f MiB\n",
+                   Ext[0], Ext[1], Ext[2], "abc"[DimOrder[0]], "abc"[DimOrder[1]], "abc"[DimOrder[2]],
+                   NRelayRecv, RelaySlot, relay_region_sz / 1048576.0, relay_wire_bytes / 1048576.0);
+        else
+            logmsg("relay: DISABLED (non-rectangular torus or MOE_RELAY=0)\n");
     }
 
     /* ---- bootstrap: every rank repeatedly Puts seq=1 to its nonzero dispatch
@@ -432,6 +679,7 @@ int main(void)
     } while (0)
 
     double disp_naive = 0, disp_tni = 0, comb_naive = 0, comb_tni = 0, tree_us = 0;
+    double disp_relay = 0, comb_relay = 0;
     TIME_A2A(0, disp_send, disp_recv, BANK_DISP, disp_naive);
     TIME_A2A(1, disp_send, disp_recv, BANK_DISP, disp_tni);
     TIME_A2A(0, comb_send, comb_recv, BANK_COMB, comb_naive);
@@ -442,6 +690,21 @@ int main(void)
       double _t0 = now_sec();
       for (long i = 0; i < ITERS;  i++) { uint64_t w = tok++; tree_allreduce(w); }
       tree_us = (now_sec() - _t0) / (double)ITERS * 1e6; }
+
+    /* dimensional relay (variant d): plan dispatch (cnt) then combine (cnt^T). */
+    if (relay_on) {
+#define TIME_RELAY(out_us)                                                       \
+        do { for (long i = 0; i < WARMUP; i++) { relay_a2a(tok); tok++; }        \
+             double _t0 = now_sec();                                             \
+             for (long i = 0; i < ITERS; i++) { relay_a2a(tok); tok++; }         \
+             (out_us) = (now_sec() - _t0) / (double)ITERS * 1e6; } while (0)
+        relay_plan(cnt);
+        relay_a2a(tok); if (!relay_verify()) die("relay dispatch verify failed", -1); tok++;
+        TIME_RELAY(disp_relay);
+        relay_plan(cntT);
+        relay_a2a(tok); if (!relay_verify()) die("relay combine verify failed", -1); tok++;
+        TIME_RELAY(comb_relay);
+    }
 
     if (MyRank == 0) {
         /* total bytes moved per all-to-all phase = sum of all pair payloads */
@@ -463,10 +726,29 @@ int main(void)
                disp_bytes / (disp_naive * 1e-6) / 1e9, disp_bytes / (disp_tni * 1e-6) / 1e9,
                disp_bytes / 1048576.0);
         (void)tree_bytes;
+        if (relay_on) {
+            double dc_relay = disp_relay + comb_relay;
+            logmsg("\n-- dimensional relay (variant d), dim-order %c%c%c --\n",
+                   "abc"[DimOrder[0]], "abc"[DimOrder[1]], "abc"[DimOrder[2]]);
+            logmsg("dispatch  relay=%.2f  combine relay=%.2f  dispatch+combine relay=%.2f\n",
+                   disp_relay, comb_relay, dc_relay);
+            logmsg("relay vs multiTNI: x%.2f (%s) ; vs naive: x%.2f\n",
+                   dc_best > 0 ? dc_relay / dc_best : 0.0,
+                   dc_relay < dc_best ? "relay WINS" : "multiTNI/naive wins",
+                   dc_naive > 0 ? dc_relay / dc_naive : 0.0);
+            logmsg("RATIO relay/(2*tree) = %.2f  [>1 roofline UNDER-estimates MoE comm]\n",
+                   dc_relay / (2 * tree_us));
+            logmsg("relay dispatch BW: useful=%.1f GB/s  wire=%.1f GB/s  (forwarding moves %.2fx the useful bytes)\n",
+                   disp_bytes / (disp_relay * 1e-6) / 1e9,
+                   relay_wire_bytes / (disp_relay * 1e-6) / 1e9,
+                   disp_bytes > 0 ? relay_wire_bytes / disp_bytes : 0.0);
+        }
         logmsg("whole-model MoE comm (x%ld layers): best=%.1f us/token\n", NMOE, dc_best * NMOE);
     }
 
+    if (relay_on) for (int k = 0; k < NTNI; k++) utofu_dereg_mem(Vcq[k], RelayBase[k], 0);
     for (int k = 0; k < NTNI; k++) { utofu_dereg_mem(Vcq[k], Base[k], 0); utofu_free_vcq(Vcq[k]); }
+    if (relay_on) free(RelayRegion);
     free(Region);
     if (g_log) fclose(g_log);
     return 0;
