@@ -20,7 +20,7 @@ distributed-attention budget.
 | `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
 | `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
 | `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`). Uses the **production qpacked+ktbl QK kernel** (svtbl K-broadcast, K_DP `[p][d][kv]`, no svaddv) — see finding #9 |
-| `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, `MOE_DIMORDER`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins) and #11 (dimensional relay dead end) |
+| `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, all 6 Tofu axes `x→y→z→a→b→c`, `MOE_DIMORDER`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins) and #11 (dimensional relay dead end in-unit; 6-axis multi-unit harness ready) |
 | `allgather_bench.c` | **all-gather** (the BW-optimal *half* of an all-reduce; TP sequence-parallel hidden / KV-shard gather): naive single-TNI all-broadcast / multi-TNI all-broadcast / ring all-gather / recursive-doubling all-gather (Rabenseifner non-pow2), plus the tree all-reduce baseline for the roofline ratio. `AG_BATCH`/`AG_SHARD`/`AG_NTNI` — see finding #12 |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
@@ -461,6 +461,19 @@ chunks at 8 MiB — relevant for any large batched payload, not just relay.
 torus is too small and too well-served by hardware routing for software dimension
 ordering to pay.** (Across *multiple* units — inter-unit Tofu axes with real
 multi-hop distance — the trade-off could differ; untested here.)
+
+**Multi-unit readiness (code in place, not yet measured):** variant `d` now relays
+over **all six Tofu axes** `x→y→z→a→b→c` (`coords[0..5]`), not just the in-unit
+`a,b,c`. Axes are modeled by the *set of distinct coordinate values present* on
+each axis and ranks by their per-axis index into that set, so the machine-scale
+x,y,z coords collapse to small dense ranges. On a single unit x,y,z are degenerate
+(extent 1) and the run is byte-identical to the old a,b,c relay (verified: grid
+`1x1x1x2x3x2`, RATIO relay/(2·tree)=2.64 unchanged); a multi-unit allocation lights
+up the x,y,z phases automatically. The relay enables only when the ranks form a
+full Cartesian grid (`N == prod(ext)`, every cell populated); `MOE_DIMORDER` now
+takes any subset of `xyzabc` (omitted axes appended in canonical order). This is
+the harness for the finding-#11 inter-unit experiment — it needs a multi-unit job
+(`pjsub` from a login node, unavailable on this fixed single-unit interactive node).
 
 ### 12. All-gather: multi-TNI all-broadcast wins **both** regimes; recursive-doubling is a non-pow2 trap (`allgather_bench`)
 

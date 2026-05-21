@@ -26,9 +26,12 @@
  *                issued before any TCQ drain so the TNIs run concurrently.
  *   (c) TREE   : recursive-doubling all-reduce (copied from ring_attn_bench) over
  *                payload HID*ABYTES*B -- exactly decode_estimate.py's assumption.
- *   (d) DIM    : dimension-ordered store-and-forward all-to-all along the in-unit
- *                torus axes a->b->c (coords[3..5], extents 2x3x2). Each message
- *                hops one axis per phase; intermediate nodes aggregate and forward
+ *   (d) DIM    : dimension-ordered store-and-forward all-to-all along ALL SIX Tofu
+ *                axes x->y->z->a->b->c (coords[0..5]). On a single unit x,y,z are
+ *                degenerate (one coord each) so it reduces to the in-unit a,b,c
+ *                2x3x2 relay; a MULTI-unit allocation lights up the x,y,z phases,
+ *                which is the finding-#11 inter-unit experiment. Each message hops
+ *                one axis per phase; intermediate nodes aggregate and forward
  *                (Bruck-style). Every Put is a single-axis line send, never a
  *                hardware multi-hop route -- the test of whether axis-balanced
  *                routing beats the round-robin multi-TNI ~3x cap and relieves the
@@ -62,7 +65,7 @@
  *   MOE_CAPFAC capacity factor on payload size   (default 1.0)
  *   MOE_NTNI   TNIs for the multi-TNI variant    (default 6)
  *   MOE_RELAY  run the dimensional variant (d)    (default 1; 0 to skip)
- *   MOE_DIMORDER axis order for (d), e.g. abc/bac (default abc)
+ *   MOE_DIMORDER axis order for (d), subset of xyzabc  (default xyzabc)
  *   MOE_LAYERS MoE layers for whole-model scaling(default 75)
  *   MOE_ITERS  timed exchanges                   (default 2000)
  *   MOE_WARMUP untimed warmup exchanges          (default 200)
@@ -80,7 +83,7 @@
 
 #include "tofu_demo.h"
 
-#define MAX_NODES 32
+#define MAX_NODES 64                  /* 32 -> 64: a multi-unit relay test needs >12 nodes */
 #define MAX_TNI   6
 #define BENCH_STAG DEMO_STAG          /* predictable-STADD convention */
 #define WAIT_TIMEOUT_SEC 30.0
@@ -178,19 +181,30 @@ static const unsigned long FLAGS = UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
 static int Pof2, Rem, NRounds, BcastSid, NewRank;
 
 /* ---- dimensional (store-and-forward) relay state ----
- * In-unit torus axes a,b,c = coords[3..5]. A message origin->dst is routed one
- * axis per phase (DimOrder): after phase i the holder's coords in the resolved
- * axes equal dst's, in the unresolved axes equal origin's. Each phase send is a
- * single-axis LINE send (holder -> the line member with dst's coord in that
- * axis); intermediate nodes aggregate and forward. A node only ever receives
- * from its (extent-1) line neighbors per phase, so relay recv slots total just
- * sum(ext-1) (= 4 on the 2x3x2 torus), not 3N. */
+ * All six Tofu axes coords[0..5] = (x,y,z, a,b,c): x,y,z are unit-level (vary
+ * only across a MULTI-unit allocation) and a,b,c are the in-unit 2x3x2 axes.
+ * A message origin->dst is routed one axis per phase (DimOrder): after phase i
+ * the holder's coords in the resolved axes equal dst's, in the unresolved axes
+ * equal origin's. Each phase send is a single-axis LINE send (holder -> the line
+ * member with dst's index in that axis); intermediate nodes aggregate and
+ * forward. A node only ever receives from its (extent-1) line neighbors per
+ * phase, so relay recv slots total sum(ext-1) over the six axes (= 4 on one
+ * 2x3x2 unit, where x,y,z are degenerate ext=1 and contribute nothing).
+ *
+ * Axes are modeled by the SORTED SET of distinct coordinate values present on
+ * each axis (AxisVals/Ext) and ranks by their per-axis INDEX into that set
+ * (AxIdx) -- not by raw coords -- so x,y,z (whose machine-scale coords would
+ * overflow a dense array) collapse to small dense index ranges, and a single
+ * unit reduces exactly to the old a,b,c relay. The relay is valid only when the
+ * ranks form a FULL Cartesian grid: N == prod(Ext) with every cell populated. */
 #define RELAY_STAG 2
-#define NDIM 3
-static int   Ext[NDIM];                        /* axis extents (a,b,c)            */
+#define NDIM TOFU_NCOORDS                      /* 6 axes: x,y,z,a,b,c             */
+static int   Ext[NDIM];                        /* # distinct coords present/axis  */
 static int   DimOrder[NDIM];                   /* phase order (axis indices)      */
-static int   RankOf3[8][8][8];                 /* (a,b,c) -> rank (-1 if absent)  */
-static uint8_t AxA[MAX_NODES], AxB[MAX_NODES], AxC[MAX_NODES];
+static int   AxisVals[NDIM][MAX_NODES];        /* sorted distinct coords per axis */
+static int   AxIdx[MAX_NODES][NDIM];           /* rank -> per-axis index in AxisVals */
+static int   Stride[NDIM];                     /* mixed-radix strides into RankOfIdx */
+static int   RankOfIdx[MAX_NODES];             /* linear index-tuple -> rank (-1)  */
 static int   RecvSlotBase[NDIM];               /* relay recv slot id base/phase   */
 static int   NRelayRecv;                        /* total relay recv slots          */
 static char *RelayRegion;
@@ -200,17 +214,22 @@ static utofu_stadd_t RelayPeerBase[MAX_TNI][MAX_NODES];
 static int   SendBundle[NDIM][MAX_NODES];      /* MyRank send bundle counts/phase (by target) */
 static int   RecvBundle[NDIM][MAX_NODES];      /* MyRank recv bundle counts/phase (by source) */
 
-static inline int axis_coord(int rank, int axis)
-{ return axis == 0 ? AxA[rank] : axis == 1 ? AxB[rank] : AxC[rank]; }
-
-/* the rank with `rank`'s coords but axis-coord replaced by v */
+/* resolve an index-tuple (per-axis indices into AxisVals) to its rank, or -1. */
+static inline int rank_of_idx(const int *idx)
+{
+    long li = 0;
+    for (int axis = 0; axis < NDIM; axis++) li += (long)idx[axis] * Stride[axis];
+    return RankOfIdx[li];
+}
+/* the rank with `rank`'s index-tuple but its `axis` index replaced by v */
 static int line_member(int rank, int axis, int v)
 {
-    int a = AxA[rank], b = AxB[rank], c = AxC[rank];
-    if (axis == 0) a = v; else if (axis == 1) b = v; else c = v;
-    return RankOf3[a][b][c];
+    int idx[NDIM];
+    for (int j = 0; j < NDIM; j++) idx[j] = AxIdx[rank][j];
+    idx[axis] = v;
+    return rank_of_idx(idx);
 }
-/* index of src among target's `axis`-line members (coord order, target excluded) */
+/* index of src among target's `axis`-line members (index order, target excluded) */
 static int neighbor_index(int src, int target, int axis)
 {
     int idx = 0;
@@ -357,17 +376,19 @@ static void relay_plan(const int mat[][MAX_NODES])
         for (int r = 0; r < N; r++) { SendBundle[i][r] = 0; RecvBundle[i][r] = 0; }
     for (int o = 0; o < N; o++) for (int d = 0; d < N; d++) {
         int c = mat[o][d]; if (c <= 0) continue;
-        int ha = AxA[o], hb = AxB[o], hc = AxC[o];          /* holder coords */
+        int hidx[NDIM];                                     /* holder index-tuple */
+        for (int j = 0; j < NDIM; j++) hidx[j] = AxIdx[o][j];
         for (int i = 0; i < NDIM; i++) {
-            int axis = DimOrder[i], dv = axis_coord(d, axis);
-            int ta = ha, tb = hb, tc = hc;                  /* target coords this phase */
-            if (axis == 0) ta = dv; else if (axis == 1) tb = dv; else tc = dv;
-            int holder = RankOf3[ha][hb][hc], target = RankOf3[ta][tb][tc];
+            int axis = DimOrder[i], holder = rank_of_idx(hidx);
+            int tidx[NDIM];                                 /* target this phase */
+            for (int j = 0; j < NDIM; j++) tidx[j] = hidx[j];
+            tidx[axis] = AxIdx[d][axis];                    /* resolve this axis to dst */
+            int target = rank_of_idx(tidx);
             if (holder != target) {
                 if (holder == MyRank) SendBundle[i][target] += c;
                 if (target == MyRank) RecvBundle[i][holder] += c;
             }
-            ha = ta; hb = tb; hc = tc;                      /* advance for next phase */
+            for (int j = 0; j < NDIM; j++) hidx[j] = tidx[j]; /* advance for next phase */
         }
     }
 }
@@ -381,16 +402,16 @@ static int relay_scan(const int mat[][MAX_NODES], double *wire_bytes)
         for (int x = 0; x < N; x++) for (int y = 0; y < N; y++) agg[x][y] = 0;
         for (int o = 0; o < N; o++) for (int d = 0; d < N; d++) {
             int c = mat[o][d]; if (c <= 0) continue;
-            int ha = AxA[o], hb = AxB[o], hc = AxC[o];
-            for (int j = 0; j <= i; j++) {
-                int axis = DimOrder[j], dv = axis_coord(d, axis);
-                int ta = ha, tb = hb, tc = hc;
-                if (axis == 0) ta = dv; else if (axis == 1) tb = dv; else tc = dv;
-                if (j == i) {
-                    int holder = RankOf3[ha][hb][hc], target = RankOf3[ta][tb][tc];
-                    if (holder != target) agg[holder][target] += c;
-                }
-                ha = ta; hb = tb; hc = tc;
+            int hidx[NDIM];
+            for (int j = 0; j < NDIM; j++) hidx[j] = AxIdx[o][j];
+            for (int jj = 0; jj <= i; jj++) {
+                int axis = DimOrder[jj], holder = rank_of_idx(hidx);
+                int tidx[NDIM];
+                for (int j = 0; j < NDIM; j++) tidx[j] = hidx[j];
+                tidx[axis] = AxIdx[d][axis];
+                int target = rank_of_idx(tidx);
+                if (jj == i && holder != target) agg[holder][target] += c;
+                for (int j = 0; j < NDIM; j++) hidx[j] = tidx[j];
             }
         }
         for (int x = 0; x < N; x++) for (int y = 0; y < N; y++) if (agg[x][y] > 0) {
@@ -495,33 +516,59 @@ int main(void)
     for (int r = 0; r < N; r++) if (memcmp(topo[r], my_coords, TOFU_NCOORDS) == 0) MyRank = r;
     if (MyRank == -1) { fprintf(stderr, "my coords not in %s\n", TOPO_PATH); exit(1); }
 
-    /* ---- in-unit torus axes (a,b,c) = coords[3..5]; set up the dimensional
-     * relay's rank<->coord maps, extents, processing order, and recv-slot bases.
-     * Relay is enabled only on a rectangular, fully-populated <=8^3 sub-torus. ---- */
-    for (int r = 0; r < N; r++) { AxA[r] = topo[r][3]; AxB[r] = topo[r][4]; AxC[r] = topo[r][5]; }
-    Ext[0] = Ext[1] = Ext[2] = 0;
-    for (int r = 0; r < N; r++) {
-        if (AxA[r] + 1 > Ext[0]) Ext[0] = AxA[r] + 1;
-        if (AxB[r] + 1 > Ext[1]) Ext[1] = AxB[r] + 1;
-        if (AxC[r] + 1 > Ext[2]) Ext[2] = AxC[r] + 1;
+    /* ---- six-axis dimensional relay setup. Model each Tofu axis coords[0..5] by
+     * the sorted set of distinct coordinate values actually present, and each rank
+     * by its per-axis index into that set; the relay is valid only when the ranks
+     * form a full Cartesian grid (N == prod(Ext), every cell populated). On a
+     * single Tofu unit x,y,z are degenerate (ext=1) and this reduces to the old
+     * a,b,c relay; a multi-unit allocation lights up the x,y,z phases. ---- */
+    for (int axis = 0; axis < NDIM; axis++) {
+        int m = 0;
+        for (int r = 0; r < N; r++) {
+            int v = topo[r][axis], seen = 0;
+            for (int j = 0; j < m; j++) if (AxisVals[axis][j] == v) { seen = 1; break; }
+            if (!seen) AxisVals[axis][m++] = v;
+        }
+        for (int a = 1; a < m; a++) {                /* insertion-sort distinct values */
+            int x = AxisVals[axis][a], b = a;
+            while (b > 0 && AxisVals[axis][b - 1] > x) { AxisVals[axis][b] = AxisVals[axis][b - 1]; b--; }
+            AxisVals[axis][b] = x;
+        }
+        Ext[axis] = m;
     }
-    int relay_on = (int)envl("MOE_RELAY", 1) && Ext[0] <= 8 && Ext[1] <= 8 && Ext[2] <= 8;
-    memset(RankOf3, 0xff, sizeof RankOf3);
+    for (int r = 0; r < N; r++)
+        for (int axis = 0; axis < NDIM; axis++)
+            for (int j = 0; j < Ext[axis]; j++)
+                if (AxisVals[axis][j] == topo[r][axis]) { AxIdx[r][axis] = j; break; }
+    long grid = 1;
+    for (int axis = 0; axis < NDIM; axis++) { Stride[axis] = (int)grid; grid *= Ext[axis]; }
+    int relay_on = (int)envl("MOE_RELAY", 1) && grid == (long)N && grid <= MAX_NODES;
+    for (int i = 0; i < MAX_NODES; i++) RankOfIdx[i] = -1;
     if (relay_on) {
-        for (int r = 0; r < N; r++) RankOf3[AxA[r]][AxB[r]][AxC[r]] = r;
-        for (int a = 0; a < Ext[0] && relay_on; a++)
-            for (int b = 0; b < Ext[1] && relay_on; b++)
-                for (int c = 0; c < Ext[2]; c++)
-                    if (RankOf3[a][b][c] < 0) { relay_on = 0; break; }   /* non-rectangular */
+        for (int r = 0; r < N; r++) {
+            int li = 0;
+            for (int axis = 0; axis < NDIM; axis++) li += AxIdx[r][axis] * Stride[axis];
+            RankOfIdx[li] = r;
+        }
+        for (int i = 0; i < (int)grid && relay_on; i++)
+            if (RankOfIdx[i] < 0) relay_on = 0;          /* a grid cell is empty */
     }
-    {   /* dimension processing order (default a->b->c) */
-        const char *od = getenv("MOE_DIMORDER"); const char *s = (od && *od) ? od : "abc";
-        for (int i = 0; i < NDIM; i++)
-            DimOrder[i] = (s[i] == 'a') ? 0 : (s[i] == 'b') ? 1 : (s[i] == 'c') ? 2 : i;
+    {   /* phase order (default x->y->z->a->b->c); accepts any subset, rest appended */
+        static const char AXN[] = "xyzabc";
+        const char *od = getenv("MOE_DIMORDER"); const char *s = (od && *od) ? od : AXN;
+        int used[NDIM] = {0}, np = 0;
+        for (int i = 0; s[i] && np < NDIM; i++) {
+            int ax = -1; for (int a = 0; a < NDIM; a++) if (AXN[a] == s[i]) { ax = a; break; }
+            if (ax >= 0 && !used[ax]) { DimOrder[np++] = ax; used[ax] = 1; }
+        }
+        for (int ax = 0; ax < NDIM; ax++) if (!used[ax]) DimOrder[np++] = ax;
     }
     RecvSlotBase[0] = 0;
     for (int i = 1; i < NDIM; i++) RecvSlotBase[i] = RecvSlotBase[i - 1] + (Ext[DimOrder[i - 1]] - 1);
     NRelayRecv = RecvSlotBase[NDIM - 1] + (Ext[DimOrder[NDIM - 1]] - 1);
+    int relay_max_line = 1;                          /* max non-self line members / phase */
+    for (int axis = 0; axis < NDIM; axis++)
+        if (Ext[axis] - 1 > relay_max_line) relay_max_line = Ext[axis] - 1;
 
     /* ---- routing matrix (identical on every rank) ---- */
     static int cnt[MAX_NODES][MAX_NODES];
@@ -560,7 +607,7 @@ int main(void)
         int relay_maxc = relay_scan(cnt, &relay_wire_bytes);
         int m2 = relay_scan(cntT, NULL); if (m2 > relay_maxc) relay_maxc = m2;
         RelaySlot = (plen(relay_maxc) + 8 + (DEMO_CACHE_LINE - 1)) & ~(size_t)(DEMO_CACHE_LINE - 1);
-        relay_region_sz = (size_t)(NRelayRecv + 4) * RelaySlot;   /* +4 send-staging slots */
+        relay_region_sz = (size_t)(NRelayRecv + relay_max_line) * RelaySlot;  /* + send-staging */
         if (posix_memalign((void **)&RelayRegion, DEMO_CACHE_LINE, relay_region_sz) != 0)
             die("posix_memalign(relay)", -1);
         memset(RelayRegion, 0, relay_region_sz);
@@ -632,11 +679,14 @@ int main(void)
         logmsg("slot=%zu B  region=%.1f MiB  NTNI=%d  tree payload=%zu B (%d steps)\n",
                Slot, region_sz / 1048576.0, NTNI, PlenTree, NRounds + (Rem ? 2 : 0));
         if (relay_on)
-            logmsg("relay: torus %dx%dx%d  dim-order=%c%c%c  recv slots=%d  RelaySlot=%zu B  region=%.1f MiB  wire=%.2f MiB\n",
-                   Ext[0], Ext[1], Ext[2], "abc"[DimOrder[0]], "abc"[DimOrder[1]], "abc"[DimOrder[2]],
+            logmsg("relay: grid %dx%dx%dx%dx%dx%d (xyzabc)  dim-order=%c%c%c%c%c%c  recv slots=%d  RelaySlot=%zu B  region=%.1f MiB  wire=%.2f MiB\n",
+                   Ext[0], Ext[1], Ext[2], Ext[3], Ext[4], Ext[5],
+                   "xyzabc"[DimOrder[0]], "xyzabc"[DimOrder[1]], "xyzabc"[DimOrder[2]],
+                   "xyzabc"[DimOrder[3]], "xyzabc"[DimOrder[4]], "xyzabc"[DimOrder[5]],
                    NRelayRecv, RelaySlot, relay_region_sz / 1048576.0, relay_wire_bytes / 1048576.0);
         else
-            logmsg("relay: DISABLED (non-rectangular torus or MOE_RELAY=0)\n");
+            logmsg("relay: DISABLED (MOE_RELAY=0 or ranks are not a full Cartesian torus grid: N=%d prod(ext)=%ld)\n",
+                   N, grid);
     }
 
     /* ---- bootstrap: every rank repeatedly Puts seq=1 to its nonzero dispatch
@@ -728,8 +778,9 @@ int main(void)
         (void)tree_bytes;
         if (relay_on) {
             double dc_relay = disp_relay + comb_relay;
-            logmsg("\n-- dimensional relay (variant d), dim-order %c%c%c --\n",
-                   "abc"[DimOrder[0]], "abc"[DimOrder[1]], "abc"[DimOrder[2]]);
+            logmsg("\n-- dimensional relay (variant d), dim-order %c%c%c%c%c%c --\n",
+                   "xyzabc"[DimOrder[0]], "xyzabc"[DimOrder[1]], "xyzabc"[DimOrder[2]],
+                   "xyzabc"[DimOrder[3]], "xyzabc"[DimOrder[4]], "xyzabc"[DimOrder[5]]);
             logmsg("dispatch  relay=%.2f  combine relay=%.2f  dispatch+combine relay=%.2f\n",
                    disp_relay, comb_relay, dc_relay);
             logmsg("relay vs multiTNI: x%.2f (%s) ; vs naive: x%.2f\n",
