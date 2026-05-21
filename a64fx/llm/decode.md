@@ -32,7 +32,9 @@ t_mem  = (weight_read + attn_read·B) / (BW·N)      # weights amortize over bat
   attn_read   = idx_dim·idx_bytes·n_idx_layers·S    # DSA indexer scan over context
               + latent·kv_bytes·min(2048,S)·layers  # main sparse attn (tiny)
 
-t_comm = layers · 2 · tree_steps(TP) · (1.23µs + hidden·2·B / 6.36GB/s)
+tree   = tree_steps(TP) · (1.23µs + hidden·2·B / 6.36GB/s)   # one fused all-reduce (upper bound)
+t_comm = layers·0.5·tree                      # attn TP all-reduce, decomposed RS+AG (#13)
+       + moe_layers·{1.8|4.5}·tree            # MoE dispatch+combine, uniform | skew (#10)
 ```
 
 **A64FX/uTofu constants (measured):** realized matvec BW **650 GB/s/node** (not the
@@ -40,46 +42,60 @@ t_comm = layers · 2 · tree_steps(TP) · (1.23µs + hidden·2·B / 6.36GB/s)
 tree all-reduce **log₂(⌊pow2⌋)(+2 if non-pow2)** steps; comm is **context-independent**.
 HBM **32 GiB/node** (≈30 usable).
 
-The two-collectives-per-layer MoE term (`COLLECTIVES_PER_LAYER=2`) is now
-**measured** by `a64fx/utofu-tests/moe_dispatch_bench` (top-8-of-256 all-to-all
-dispatch+combine on the 12-node torus), with two important conditions:
-- **uniform routing + multi-TNI dispatch:** real cost = **0.88–0.93×** of
-  `2 × tree-all-reduce` — the proxy is sound, slightly conservative. (Distinct
-  destinations across the 6 TNIs give ~3×; a naive single-TNI dispatch is ~2.8×
-  the proxy and would blow the budget — the roofline assumes multi-rail.)
-- **skewed routing (hot experts):** real cost rises to **2.2–2.7× the proxy** —
-  traffic concentrates on a few hot destination links (agg BW halves) and the
-  proxy under-estimates. So `COLLECTIVES_PER_LAYER=2` is the *load-balanced* case;
-  derate the MoE comm term for routing skew, or keep routing near-uniform
-  (auxiliary load-balance loss + capacity factor, the standard EP mitigation).
+The per-layer comm term is no longer a flat `2 × tree`; each collective is now the
+**measured best-case** cost from `a64fx/utofu-tests`, as a multiple of one fused tree
+all-reduce (`--route` selects the MoE case):
+- **Attention TP all-reduce** done as decomposed multi-TNI **reduce-scatter +
+  all-gather** (`reducescatter_bench`, #13): **0.52×** the fused tree at B=1 decode
+  (0.23× at B=256) — the fused tree is pessimistic for TP comm expressible as
+  scatter-then-gather. (Caveat: a real RS also does N−1 shard-sized adds the fused
+  tree folds in — negligible at decode shards.)
+- **MoE dispatch+combine** (top-8-of-256 all-to-all, `moe_dispatch_bench`, #10):
+  - *uniform routing + multi-TNI* → **0.88–0.93×** of `2 × tree` ≈ **1.8 trees**.
+    (Distinct destinations across the 6 TNIs give ~3×; naive single-TNI is ~2.8× one
+    tree and would blow the budget — the roofline assumes multi-rail.)
+  - *skewed routing (hot experts)* → **2.2–2.7×** of `2 × tree` ≈ **4.5 trees**:
+    traffic concentrates on a few hot links (agg BW halves), and multi-TNI cannot
+    rescue a single congested link (#5). `--route uniform` is the load-balanced
+    case; keep routing near-uniform (aux load-balance loss + capacity factor, the
+    standard EP mitigation) or pay the skew term.
+
+A **pipeline-parallel** alternative (`pp_handoff_bench`, #14) drops the per-layer
+collectives entirely: comm is fixed at `S−1` single-link handoffs for the *whole*
+model (one TofuD link/hop, torus-distance-free) — ~80× below TP's `2·layers`
+all-reduce sum — but decode's one-token-in-flight makes the pipeline bubble 92% at
+S=12, so PP is a high-batch *throughput* lever, not a single-stream latency one.
 
 ## Results — 1M context, single stream (batch=1)
 
 ```
                        TP   agg BW    mem      comm    ->step  (bound)  tok/s   fit
-4-bit / 24 nodes       8    15.6 TB/s 1.61ms   1.48ms  1.61ms  (mem)    620     21 GiB OK
-4-bit / 48 nodes       8    31.2 TB/s 0.81ms   1.48ms  1.48ms  (comm)   676     11 GiB OK
-4-bit / 60 nodes       12   39.0 TB/s 0.65ms   2.47ms  2.47ms  (comm)   405      9 GiB OK
-8-bit / 24 nodes       8    15.6 TB/s 2.90ms   1.48ms  2.90ms  (mem)    345     37 GiB OOM ✗
-8-bit / 48 nodes       8    31.2 TB/s 1.45ms   1.48ms  1.48ms  (comm)   676     19 GiB OK
-8-bit / 60 nodes       12   39.0 TB/s 1.16ms   2.47ms  2.47ms  (comm)   405     15 GiB OK
---- reference ---
-2-bit / 12 nodes       12    7.8 TB/s 1.95ms   2.47ms  2.47ms  (comm)   405     26 GiB OK
-bf16  / 96 nodes       8    62.4 TB/s 1.37ms   1.48ms  1.48ms  (comm)   676     18 GiB OK
-bf16  / 192 nodes      8   124.8 TB/s 0.68ms   1.48ms  1.48ms  (comm)   676      9 GiB OK
+4-bit / 24 nodes       8    15.6 TB/s 1.61ms   1.65ms  1.65ms  (comm)   606     21 GiB OK
+4-bit / 48 nodes       8    31.2 TB/s 0.81ms   1.65ms  1.65ms  (comm)   606     11 GiB OK
+4-bit / 60 nodes       12   39.0 TB/s 0.65ms   2.75ms  2.75ms  (comm)   364      9 GiB OK
+8-bit / 24 nodes       8    15.6 TB/s 2.90ms   1.65ms  2.90ms  (mem)    345     37 GiB OOM ✗
+8-bit / 48 nodes       8    31.2 TB/s 1.45ms   1.65ms  1.65ms  (comm)   606     19 GiB OK
+8-bit / 60 nodes       12   39.0 TB/s 1.16ms   2.75ms  2.75ms  (comm)   364     15 GiB OK
+--- reference (route=uniform; --route skew ~2.2x the comm term) ---
+2-bit / 12 nodes       12    7.8 TB/s 1.95ms   2.75ms  2.75ms  (comm)   364     26 GiB OK
+bf16  / 96 nodes       8    62.4 TB/s 1.37ms   1.65ms  1.65ms  (comm)   606     18 GiB OK
+bf16  / 192 nodes      8   124.8 TB/s 0.68ms   1.65ms  1.65ms  (comm)   606      9 GiB OK
 ```
 
 ## Key findings
 
-1. **Single-stream floors out on per-layer comm at ~676 tok/s (TP=8).** Once you
-   have enough nodes, the context-independent per-layer all-reduce latency
-   (78 layers × ~2 collectives) is the floor — adding nodes only helps the
-   memory-bound term. bf16/192 ties bf16/96; 4-bit/48 ≈ 8-bit/48 ≈ 676. This is the
-   ring-attention lesson restated: **comm is the fixed cost, compute parallelizes.**
+1. **Single-stream floors out on per-layer comm at ~606 tok/s (TP=8).** Once you
+   have enough nodes, the context-independent per-layer collective latency is the
+   floor — adding nodes only helps the memory-bound term. With the measured-collective
+   model that floor is 78 attn all-reduces (0.5 tree each, decomposed RS+AG) + 75 MoE
+   dispatch+combine (1.8 tree each, uniform) ≈ 174 tree-equivalents/step. bf16/192
+   ties bf16/96; 4-bit/48 ≈ 8-bit/48 ≈ 606. This is the ring-attention lesson
+   restated: **comm is the fixed cost, compute parallelizes.** (Skewed MoE routing
+   drops the ceiling to ~280 tok/s — the MoE term ~2.2×; see `--route skew`.)
 
 2. **Use node counts divisible by 8.** 24, 48, 96, 192 give clean **TP=8** groups
-   (3 tree steps → 676 tok/s ceiling). **12 and 60 are awkward** — forced to TP=12
-   (5 steps) → comm doubles, ceiling drops to **405 tok/s**. The 60-node penalty is
+   (3 tree steps → 606 tok/s ceiling). **12 and 60 are awkward** — forced to TP=12
+   (5 steps) → comm rises, ceiling drops to **364 tok/s**. The 60-node penalty is
    pure layout, not compute. (Override with `--tp`.)
 
 3. **8-bit does not fit on 24 nodes at 1M** (37 GiB/node > 32). Minimum ~32 nodes;
