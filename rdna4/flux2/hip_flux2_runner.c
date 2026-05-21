@@ -498,14 +498,16 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         else
             r->use_fp8_opt = 1;
     }
-    /* WMMA (gfx12 matrix cores): opt-in via FLUX2_FP8_WMMA.
-     *   =1 (or set) : BF16 activation × FP8 weight via BF16 WMMA (accuracy-safe)
-     *   =2 (aka FP8 act): FP8×FP8 WMMA (fastest but lossy, debug only) */
+    /* WMMA (gfx12 matrix cores). Default = pipe32 FP8×FP8 (2.2× DiT vs the LUT,
+     * visually identical on klein). FLUX2_FP8_WMMA overrides:
+     *   =0 : LUT/scalar FP8 GEMM (no WMMA)
+     *   =1 : BF16 activation × FP8 weight (BF16 WMMA, corr ~0.999)
+     *   =2 / fp8 / unset : pipe32 FP8×FP8 (fastest; corr ~0.985, perceptually fine) */
     {
         const char *v = getenv("FLUX2_FP8_WMMA");
-        if (!v || strcmp(v, "0") == 0 || strcmp(v, "false") == 0) r->use_wmma = 0;
-        else if (strcmp(v, "2") == 0 || strcmp(v, "fp8") == 0)    r->use_wmma = 2;
-        else                                                       r->use_wmma = 1;
+        if (v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) r->use_wmma = 0;
+        else if (v && strcmp(v, "1") == 0)                          r->use_wmma = 1;
+        else                                                        r->use_wmma = 2;
     }
 
     /* Get function handles */
@@ -551,8 +553,8 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         }
     }
     if (r->use_wmma) {
-        hipFunction_t want = (r->use_wmma == 2) ? r->fn_gemm_fp8_wmma : r->fn_gemm_fp8_bf16_wmma;
-        const char *label = (r->use_wmma == 2) ? "FP8xFP8" : "BF16xFP8";
+        hipFunction_t want = (r->use_wmma == 2) ? r->fn_flux2_gemm_pgr2 : r->fn_gemm_fp8_bf16_wmma;
+        const char *label = (r->use_wmma == 2) ? "pipe32 FP8xFP8" : "BF16xFP8";
         if (!want) {
             fprintf(stderr, "hip_flux2: WMMA kernel (%s) not found (not gfx12?) — falling back\n", label);
             r->use_wmma = 0;
