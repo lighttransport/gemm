@@ -2173,6 +2173,282 @@ static const char *flux2_kernel_src =
 "    }\n"
 "}\n"
 "\n"
+"__global__ void flash_attn_bf16_tc_split_partials(\n"
+"    float *__restrict__ part_o,\n"
+"    float *__restrict__ part_m,\n"
+"    float *__restrict__ part_l,\n"
+"    const unsigned short *__restrict__ Qb,\n"
+"    const unsigned short *__restrict__ Kb,\n"
+"    const unsigned short *__restrict__ Vb,\n"
+"    int N, int n_heads, int head_dim, int split_kv) {\n"
+"    int h = blockIdx.x;\n"
+"    int split = blockIdx.z;\n"
+"    int kv_start = split * split_kv;\n"
+"    int kv_end = kv_start + split_kv;\n"
+"    if (kv_end > N) kv_end = N;\n"
+"    int warp = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int gid = lane / 4;\n"
+"    int tid4 = lane & 3;\n"
+"    int q_base = blockIdx.y * (FABF16_M * FABF16_NWARPS) + warp * FABF16_M;\n"
+"    int dim = n_heads * head_dim;\n"
+"\n"
+"    unsigned int q_frag[8][4];\n"
+"#pragma unroll\n"
+"    for (int kc = 0; kc < 8; kc++) {\n"
+"        int k0 = kc * 16;\n"
+"        int row0 = q_base + gid;\n"
+"        int row1 = q_base + gid + 8;\n"
+"        const unsigned short *qbase0 = (row0 < N) ? Qb + (long)row0 * dim + h * head_dim : (const unsigned short *)0;\n"
+"        const unsigned short *qbase1 = (row1 < N) ? Qb + (long)row1 * dim + h * head_dim : (const unsigned short *)0;\n"
+"        unsigned int z = 0;\n"
+"        q_frag[kc][0] = qbase0 ? *(const unsigned int *)(qbase0 + k0 + tid4*2)     : z;\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"        q_frag[kc][1] = qbase1 ? *(const unsigned int *)(qbase1 + k0 + tid4*2)     : z;\n"
+"        q_frag[kc][2] = qbase0 ? *(const unsigned int *)(qbase0 + k0 + tid4*2 + 8) : z;\n"
+"#else\n"
+"        q_frag[kc][1] = qbase0 ? *(const unsigned int *)(qbase0 + k0 + tid4*2 + 8) : z;\n"
+"        q_frag[kc][2] = qbase1 ? *(const unsigned int *)(qbase1 + k0 + tid4*2)     : z;\n"
+"#endif\n"
+"        q_frag[kc][3] = qbase1 ? *(const unsigned int *)(qbase1 + k0 + tid4*2 + 8) : z;\n"
+"    }\n"
+"\n"
+"    float O[16][4];\n"
+"#pragma unroll\n"
+"    for (int i = 0; i < 16; i++) {\n"
+"        O[i][0] = 0.0f; O[i][1] = 0.0f; O[i][2] = 0.0f; O[i][3] = 0.0f;\n"
+"    }\n"
+"    float m_state[2] = {-1e30f, -1e30f};\n"
+"    float l_state[2] = {0.0f, 0.0f};\n"
+"    float qk_scale = rsqrtf((float)head_dim);\n"
+"\n"
+"    extern __shared__ unsigned char fa_bf16_smem[];\n"
+"    unsigned short *sK_buf[2];\n"
+"    unsigned short *sV_buf[2];\n"
+"    sK_buf[0] = (unsigned short *)fa_bf16_smem;\n"
+"    sK_buf[1] = sK_buf[0] + FABF16_BKV * FABF16_HDP;\n"
+"    sV_buf[0] = sK_buf[1] + FABF16_BKV * FABF16_HDP;\n"
+"    sV_buf[1] = sV_buf[0] + FABF16_BKV * FABF16_HDP;\n"
+"    int n_kv_tiles = (kv_end - kv_start + FABF16_BKV - 1) / FABF16_BKV;\n"
+"\n"
+"    if (n_kv_tiles > 0) {\n"
+"        unsigned short *_sK = sK_buf[0];\n"
+"        unsigned short *_sV = sV_buf[0];\n"
+"#pragma unroll\n"
+"        for (int _i = 0; _i < 4; _i++) {\n"
+"            int _idx = (int)threadIdx.x + _i * 128;\n"
+"            int _kr  = _idx >> 4;\n"
+"            int _kd  = (_idx & 15) * 8;\n"
+"            int _raw = kv_start + _kr;\n"
+"            int _sr  = (_raw < kv_end) ? _raw : kv_start;\n"
+"            const unsigned short *_kp = Kb + (long)_sr * dim + h * head_dim + _kd;\n"
+"            const unsigned short *_vp = Vb + (long)_sr * dim + h * head_dim + _kd;\n"
+"            unsigned int _dk = (unsigned int)__cvta_generic_to_shared(_sK + _kr * FABF16_HDP + _kd);\n"
+"            unsigned int _dv = (unsigned int)__cvta_generic_to_shared(_sV + _kr * FABF16_HDP + _kd);\n"
+"            asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dk), \"l\"(_kp));\n"
+"            asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dv), \"l\"(_vp));\n"
+"        }\n"
+"        asm volatile(\"cp.async.commit_group;\\n\");\n"
+"    }\n"
+"\n"
+"    for (int kvt = 0; kvt < n_kv_tiles; kvt++) {\n"
+"        int kv_base = kv_start + kvt * FABF16_BKV;\n"
+"        int tile_n = kv_end - kv_base;\n"
+"        if (tile_n > FABF16_BKV) tile_n = FABF16_BKV;\n"
+"        int cur = kvt & 1;\n"
+"        int nxt = 1 - cur;\n"
+"        unsigned short *smK = sK_buf[cur];\n"
+"        unsigned short *smV = sV_buf[cur];\n"
+"        if (kvt + 1 < n_kv_tiles) {\n"
+"            int kv_next = kv_start + (kvt + 1) * FABF16_BKV;\n"
+"            unsigned short *_sK = sK_buf[nxt];\n"
+"            unsigned short *_sV = sV_buf[nxt];\n"
+"#pragma unroll\n"
+"            for (int _i = 0; _i < 4; _i++) {\n"
+"                int _idx = (int)threadIdx.x + _i * 128;\n"
+"                int _kr  = _idx >> 4;\n"
+"                int _kd  = (_idx & 15) * 8;\n"
+"                int _raw = kv_next + _kr;\n"
+"                int _sr  = (_raw < kv_end) ? _raw : kv_start;\n"
+"                const unsigned short *_kp = Kb + (long)_sr * dim + h * head_dim + _kd;\n"
+"                const unsigned short *_vp = Vb + (long)_sr * dim + h * head_dim + _kd;\n"
+"                unsigned int _dk = (unsigned int)__cvta_generic_to_shared(_sK + _kr * FABF16_HDP + _kd);\n"
+"                unsigned int _dv = (unsigned int)__cvta_generic_to_shared(_sV + _kr * FABF16_HDP + _kd);\n"
+"                asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dk), \"l\"(_kp));\n"
+"                asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(_dv), \"l\"(_vp));\n"
+"            }\n"
+"            asm volatile(\"cp.async.commit_group;\\n\");\n"
+"            asm volatile(\"cp.async.wait_group 1;\\n\");\n"
+"        } else {\n"
+"            asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"        }\n"
+"        __syncthreads();\n"
+"\n"
+"        float S[FABF16_NI][4];\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"            S[ni][0] = 0.0f; S[ni][1] = 0.0f; S[ni][2] = 0.0f; S[ni][3] = 0.0f;\n"
+"        }\n"
+"        int ldm_row_off  = lane & 7;\n"
+"        int ldm_col_xtra = (lane & 8) ? 8 : 0;\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"            int n_base = ni * 8;\n"
+"#pragma unroll\n"
+"            for (int kc = 0; kc < 8; kc++) {\n"
+"                int k_off = kc * 16;\n"
+"                unsigned int b0, b1;\n"
+"                unsigned int saddr = (unsigned int)__cvta_generic_to_shared(\n"
+"                    smK + (n_base + ldm_row_off) * FABF16_HDP + k_off + ldm_col_xtra);\n"
+"                asm volatile(\"ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\\n\"\n"
+"                    : \"=r\"(b0), \"=r\"(b1) : \"r\"(saddr));\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(S[ni][0]), \"=f\"(S[ni][1]), \"=f\"(S[ni][2]), \"=f\"(S[ni][3])\n"
+"                    : \"r\"(q_frag[kc][0]), \"r\"(q_frag[kc][1]), \"r\"(q_frag[kc][2]), \"r\"(q_frag[kc][3]),\n"
+"                      \"r\"(b0), \"r\"(b1),\n"
+"                      \"f\"(S[ni][0]), \"f\"(S[ni][1]), \"f\"(S[ni][2]), \"f\"(S[ni][3])\n"
+"                );\n"
+"            }\n"
+"        }\n"
+"\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"            int col0 = ni * 8 + tid4 * 2;\n"
+"            int col1 = col0 + 1;\n"
+"            S[ni][0] = (col0 < tile_n) ? S[ni][0] * qk_scale : -1e30f;\n"
+"            S[ni][1] = (col1 < tile_n) ? S[ni][1] * qk_scale : -1e30f;\n"
+"            S[ni][2] = (col0 < tile_n) ? S[ni][2] * qk_scale : -1e30f;\n"
+"            S[ni][3] = (col1 < tile_n) ? S[ni][3] * qk_scale : -1e30f;\n"
+"        }\n"
+"\n"
+"        float new_m[2], alpha[2];\n"
+"#pragma unroll\n"
+"        for (int rp = 0; rp < 2; rp++) {\n"
+"            float my = -1e30f;\n"
+"#pragma unroll\n"
+"            for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"                my = fmaxf(my, S[ni][rp*2 + 0]);\n"
+"                my = fmaxf(my, S[ni][rp*2 + 1]);\n"
+"            }\n"
+"            float o1 = __shfl_xor_sync(0xFFFFFFFF, my, 1); my = fmaxf(my, o1);\n"
+"            float o2 = __shfl_xor_sync(0xFFFFFFFF, my, 2); my = fmaxf(my, o2);\n"
+"            new_m[rp] = fmaxf(m_state[rp], my);\n"
+"            alpha[rp] = expf(m_state[rp] - new_m[rp]);\n"
+"        }\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < 16; ni++) {\n"
+"            O[ni][0] *= alpha[0]; O[ni][1] *= alpha[0];\n"
+"            O[ni][2] *= alpha[1]; O[ni][3] *= alpha[1];\n"
+"        }\n"
+"        l_state[0] *= alpha[0]; l_state[1] *= alpha[1];\n"
+"\n"
+"        float P_data[FABF16_NI][4];\n"
+"        float row_sum[2] = {0.0f, 0.0f};\n"
+"#pragma unroll\n"
+"        for (int rp = 0; rp < 2; rp++) {\n"
+"#pragma unroll\n"
+"            for (int ni = 0; ni < FABF16_NI; ni++) {\n"
+"                float p0 = expf(S[ni][rp*2 + 0] - new_m[rp]);\n"
+"                float p1 = expf(S[ni][rp*2 + 1] - new_m[rp]);\n"
+"                P_data[ni][rp*2 + 0] = p0;\n"
+"                P_data[ni][rp*2 + 1] = p1;\n"
+"                row_sum[rp] += p0 + p1;\n"
+"            }\n"
+"        }\n"
+"        float r0a = __shfl_xor_sync(0xFFFFFFFF, row_sum[0], 1); row_sum[0] += r0a;\n"
+"        float r0b = __shfl_xor_sync(0xFFFFFFFF, row_sum[0], 2); row_sum[0] += r0b;\n"
+"        float r1a = __shfl_xor_sync(0xFFFFFFFF, row_sum[1], 1); row_sum[1] += r1a;\n"
+"        float r1b = __shfl_xor_sync(0xFFFFFFFF, row_sum[1], 2); row_sum[1] += r1b;\n"
+"        l_state[0] += row_sum[0]; l_state[1] += row_sum[1];\n"
+"        m_state[0] = new_m[0]; m_state[1] = new_m[1];\n"
+"\n"
+"        unsigned int P_pack[FABF16_PV_KC][4];\n"
+"#pragma unroll\n"
+"        for (int kc = 0; kc < FABF16_PV_KC; kc++) {\n"
+"            int ni_a = 2*kc;\n"
+"            int ni_b = 2*kc + 1;\n"
+"            unsigned int q00 = (unsigned int)f32_to_bf16_bits(P_data[ni_a][0])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_a][1]) << 16);\n"
+"            unsigned int q01 = (unsigned int)f32_to_bf16_bits(P_data[ni_a][2])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_a][3]) << 16);\n"
+"            unsigned int q10 = (unsigned int)f32_to_bf16_bits(P_data[ni_b][0])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_b][1]) << 16);\n"
+"            unsigned int q11 = (unsigned int)f32_to_bf16_bits(P_data[ni_b][2])\n"
+"                             | ((unsigned int)f32_to_bf16_bits(P_data[ni_b][3]) << 16);\n"
+"            P_pack[kc][0] = q00;\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"            P_pack[kc][1] = q01;\n"
+"            P_pack[kc][2] = q10;\n"
+"#else\n"
+"            P_pack[kc][1] = q10;\n"
+"            P_pack[kc][2] = q01;\n"
+"#endif\n"
+"            P_pack[kc][3] = q11;\n"
+"        }\n"
+"\n"
+"#pragma unroll\n"
+"        for (int ni = 0; ni < 16; ni++) {\n"
+"            int n_base = ni * 8;\n"
+"            unsigned int v_addr = (unsigned int)__cvta_generic_to_shared(\n"
+"                smV + lane * FABF16_HDP + n_base);\n"
+"            unsigned int vb0, vb1, vb2, vb3;\n"
+"            asm(\"ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\\n\"\n"
+"                : \"=r\"(vb0), \"=r\"(vb1), \"=r\"(vb2), \"=r\"(vb3)\n"
+"                : \"r\"(v_addr));\n"
+"#pragma unroll\n"
+"            for (int kc = 0; kc < FABF16_PV_KC; kc++) {\n"
+"                unsigned int p0 = P_pack[kc][0];\n"
+"                unsigned int p1 = P_pack[kc][1];\n"
+"                unsigned int p2 = P_pack[kc][2];\n"
+"                unsigned int p3 = P_pack[kc][3];\n"
+"                unsigned int b0 = (kc == 0) ? vb0 : vb2;\n"
+"                unsigned int b1 = (kc == 0) ? vb1 : vb3;\n"
+"                float d0 = O[ni][0], d1 = O[ni][1], d2 = O[ni][2], d3 = O[ni][3];\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    : \"=f\"(d0), \"=f\"(d1), \"=f\"(d2), \"=f\"(d3)\n"
+"                    : \"r\"(p0), \"r\"(p1), \"r\"(p2), \"r\"(p3),\n"
+"                      \"r\"(b0), \"r\"(b1),\n"
+"                      \"f\"(d0), \"f\"(d1), \"f\"(d2), \"f\"(d3)\n"
+"                );\n"
+"                O[ni][0] = d0; O[ni][1] = d1; O[ni][2] = d2; O[ni][3] = d3;\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"\n"
+"    int row0 = q_base + gid;\n"
+"    int row1 = q_base + gid + 8;\n"
+"    if (tid4 == 0) {\n"
+"        if (row0 < N) {\n"
+"            long state0 = ((long)split * N + row0) * n_heads + h;\n"
+"            part_m[state0] = m_state[0];\n"
+"            part_l[state0] = l_state[0];\n"
+"        }\n"
+"        if (row1 < N) {\n"
+"            long state1 = ((long)split * N + row1) * n_heads + h;\n"
+"            part_m[state1] = m_state[1];\n"
+"            part_l[state1] = l_state[1];\n"
+"        }\n"
+"    }\n"
+"#pragma unroll\n"
+"    for (int ni = 0; ni < 16; ni++) {\n"
+"        int col0 = ni * 8 + tid4 * 2;\n"
+"        int col1 = col0 + 1;\n"
+"        if (row0 < N && col0 < head_dim)\n"
+"            part_o[((long)split * N + row0) * dim + h * head_dim + col0] = O[ni][0];\n"
+"        if (row0 < N && col1 < head_dim)\n"
+"            part_o[((long)split * N + row0) * dim + h * head_dim + col1] = O[ni][1];\n"
+"        if (row1 < N && col0 < head_dim)\n"
+"            part_o[((long)split * N + row1) * dim + h * head_dim + col0] = O[ni][2];\n"
+"        if (row1 < N && col1 < head_dim)\n"
+"            part_o[((long)split * N + row1) * dim + h * head_dim + col1] = O[ni][3];\n"
+"    }\n"
+"}\n"
+"\n"
 "/* Bulk F32 -> BF16 cast kernel for converting Q/K/V before flash_attn_bf16. */\n"
 "__global__ void cast_f32_to_bf16(const float *src, unsigned short *dst, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -2911,7 +3187,7 @@ struct cuda_flux2_runner {
     size_t fp8_attn_buf_n;                       /* allocated count (n_tok*dim) */
     int use_fp8_attn;
     /* BF16 attention workspace (mma.sync, ported from cuda/fa v4) */
-    CUfunction fn_flash_attn_bf16, fn_cast_f32_to_bf16;
+    CUfunction fn_flash_attn_bf16, fn_flash_attn_bf16_tc_split_partials, fn_cast_f32_to_bf16;
     CUdeviceptr d_q_bf16, d_k_bf16, d_v_bf16;    /* uint16_t bf16 buffers */
     size_t bf16_attn_buf_n;                      /* allocated count (n_tok*dim halves) */
     int use_bf16_attn;
@@ -3775,6 +4051,27 @@ static int flux2_f32_split_apply_tensor_attn_priority(const char *env, int split
     return (flux2_f32_split_env_is_auto(env) && tensor_attn_active) ? 0 : split_kv;
 }
 
+static int flux2_bf16_split_kv_from_env(const char *env, int n_tok) {
+    if (!env || env[0] == '\0' || env[0] == '0') return 0;
+    if (strcmp(env, "auto") == 0) {
+        if (n_tok >= 4096) return 0;
+        if (n_tok >= 2048) return 1024;
+        return 0;
+    }
+    char *end = NULL;
+    long split_kv = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || split_kv < 0) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "cuda_flux2: ignoring invalid FLUX2_BF16_SPLIT_KV=%s\n", env);
+            warned = 1;
+        }
+        return 0;
+    }
+    if (split_kv == 0) return 0;
+    return (split_kv <= 1) ? 1024 : (int)split_kv;
+}
+
 static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
                     CUdeviceptr k, CUdeviceptr v, int n_tok, int n_heads, int head_dim) {
     const char *split_env = getenv("FLUX2_FA2_SPLIT_F32");
@@ -3827,6 +4124,35 @@ static void op_attn(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr q,
             cast_buf_f32_to_bf16(r, r->d_q_bf16, q, n);
             cast_buf_f32_to_bf16(r, r->d_k_bf16, k, n);
             cast_buf_f32_to_bf16(r, r->d_v_bf16, v, n);
+            int bf16_split_kv = flux2_bf16_split_kv_from_env(getenv("FLUX2_BF16_SPLIT_KV"), n_tok);
+            if (bf16_split_kv > 0 && r->fn_flash_attn_bf16_tc_split_partials &&
+                r->fn_flash_attn_split_merge) {
+                int n_splits = (n_tok + bf16_split_kv - 1) / bf16_split_kv;
+                if (n_splits > 1 &&
+                    ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) == 0) {
+                    unsigned gy_split = (unsigned)((n_tok + 63) / 64);
+                    size_t split_smem = (size_t)(4 * 32 * 136 * sizeof(unsigned short));
+                    void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                                      &r->attn_split_ws.l.ptr,
+                                      &r->d_q_bf16, &r->d_k_bf16, &r->d_v_bf16,
+                                      &n_tok, &n_heads, &head_dim, &bf16_split_kv};
+                    CUresult e1 = cuLaunchKernel(r->fn_flash_attn_bf16_tc_split_partials,
+                                                 (unsigned)n_heads, gy_split, (unsigned)n_splits,
+                                                 128, 1, 1, split_smem, r->stream, p_args, NULL);
+                    void *m_args[] = {&out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                                      &r->attn_split_ws.l.ptr, &n_tok, &n_heads,
+                                      &head_dim, &n_splits};
+                    CUresult e2 = (e1 == CUDA_SUCCESS)
+                        ? cuLaunchKernel(r->fn_flash_attn_split_merge,
+                                         (unsigned)n_heads, (unsigned)n_tok, 1,
+                                         128, 1, 1, 0, r->stream, m_args, NULL)
+                        : e1;
+                    if (e1 == CUDA_SUCCESS && e2 == CUDA_SUCCESS) return;
+                    fprintf(stderr,
+                            "cuda_flux2: BF16 split-key attention launch failed (%d/%d), falling back\n",
+                            (int)e1, (int)e2);
+                }
+            }
             unsigned gy = (unsigned)((n_tok + 63) / 64);
             /* smem: 2x double-buffered (sK0+sK1+sV0+sV1) at HDP=136 ~34 KB. */
             size_t smem = (size_t)(4 * 32 * 136 * 2);
@@ -4351,6 +4677,8 @@ cuda_flux2_runner *cuda_flux2_init(int device_id, int verbose) {
         r->fn_flash_attn_fp8 = NULL;
     if (cuModuleGetFunction(&r->fn_flash_attn_bf16, mod, "flash_attn_bf16") != CUDA_SUCCESS)
         r->fn_flash_attn_bf16 = NULL;
+    if (cuModuleGetFunction(&r->fn_flash_attn_bf16_tc_split_partials, mod, "flash_attn_bf16_tc_split_partials") != CUDA_SUCCESS)
+        r->fn_flash_attn_bf16_tc_split_partials = NULL;
     if (cuModuleGetFunction(&r->fn_cast_f32_to_bf16, mod, "cast_f32_to_bf16") != CUDA_SUCCESS)
         r->fn_cast_f32_to_bf16 = NULL;
     if (r->use_bf16_attn && (!r->fn_flash_attn_bf16 || !r->fn_cast_f32_to_bf16)) {
