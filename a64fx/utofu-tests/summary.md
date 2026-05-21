@@ -22,6 +22,7 @@ distributed-attention budget.
 | `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`). Uses the **production qpacked+ktbl QK kernel** (svtbl K-broadcast, K_DP `[p][d][kv]`, no svaddv) — see finding #9 |
 | `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, all 6 Tofu axes `x→y→z→a→b→c`, `MOE_DIMORDER`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins) and #11 (dimensional relay dead end in-unit; 6-axis multi-unit harness ready) |
 | `allgather_bench.c` | **all-gather** (the BW-optimal *half* of an all-reduce; TP sequence-parallel hidden / KV-shard gather): naive single-TNI all-broadcast / multi-TNI all-broadcast / ring all-gather / recursive-doubling all-gather (Rabenseifner non-pow2), plus the tree all-reduce baseline for the roofline ratio. `AG_BATCH`/`AG_SHARD`/`AG_NTNI` — see finding #12 |
+| `reducescatter_bench.c` | **reduce-scatter** (the *other* BW-optimal half; the all-reduce = reduce-scatter + all-gather decomposition): naive single-TNI direct scatter / multi-TNI direct scatter / ring reduce-scatter, plus a multi-TNI all-gather and the fused tree all-reduce so the decomposed pair is compared to the fused tree in one run. Shares `AG_*` knobs with `allgather_bench` — see finding #13 |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -524,6 +525,58 @@ multi-TNI distinct-destination Puts are the right primitive in every regime; rin
 is an acceptable BW-optimal fallback; skip recursive-doubling all-gather on
 non-power-of-2 node counts.**
 
+### 13. Reduce-scatter mirrors all-gather; decomposing all-reduce beats the fused tree **2–4×** (`reducescatter_bench`)
+
+Reduce-scatter is the other bandwidth-optimal half of an all-reduce
+(all-reduce = reduce-scatter + all-gather): every rank starts with the full
+N-shard vector and ends owning the *sum* of just its own shard. This bench
+measures it directly (comm only — the per-receive add is elided, like every
+bench here) and closes the decomposition empirically in **one** allocation: it
+also times a multi-TNI all-gather over the reduced shards so the decomposed pair
+can be compared to the fused recursive-doubling tree the estimator assumes.
+
+```
+                              B=1 decode (1 KiB shard)   B=256 batched (256 KiB shard)
+naive (1-TNI direct scatter)  15.18 us                   469 us
+multi-TNI direct scatter      4.79 us  (×3.17 vs naive)  429 us  (×1.09 vs naive)
+ring reduce-scatter           15.91 us (×0.95)           469 us  (×1.00)
+multi-TNI all-gather (the AG half) 4.91 us               422 us
+tree all-reduce (fused)       18.74 us                   3708 us
+RATIO best_RS / tree          0.26                       0.12
+DECOMPOSED (RS + AG) / tree    0.52×                      0.23×   <- decomposing WINS
+```
+
+Findings:
+1. **Reduce-scatter and all-gather cost the same** — they are exact wire-pattern
+   time-reverses. multi-TNI RS (4.79 / 429 µs) ≈ multi-TNI AG (4.91 / 422 µs) and
+   `best_RS/tree` = 0.26 / 0.12 reproduces finding #12's all-gather ratios. So the
+   two halves of an all-reduce are interchangeable in cost; pick by which buffer
+   layout the surrounding kernel wants.
+2. **Decomposing an all-reduce into multi-TNI reduce-scatter + multi-TNI
+   all-gather is 2× cheaper at decode and ~4× at batched** than the fused
+   recursive-doubling tree (0.52× / 0.23×). The fused tree moves ≈2×(1−1/N)×full
+   bytes per rank over its `log N + fold` serial steps; two multi-TNI fan-outs each
+   move ≈1×full with the distinct-destination links running concurrently. *Caveat:*
+   this is a **comm-only** comparison — a real reduce-scatter must also perform the
+   N−1 shard-sized vector adds, which the fused tree folds into its sends; that
+   reduction compute (memory-bound, ≈ the gathered bytes) eats into the 2–4× when
+   the shard is large, but at decode (1 KiB shard) it is negligible. The headline:
+   `decode_estimate.py`'s fused-tree all-reduce term is **pessimistic** for TP comm
+   that can be expressed as scatter-then-gather.
+3. **The multi-TNI ~3× lever is a latency effect, not a bandwidth multiplier.**
+   Direct scatter gets ×3.17 at B=1 but only ×1.09 at B=256: naive single-TNI
+   scatter already runs at the serial per-link limit there (469 µs ≈ 11 × 256 KiB
+   at ~6.4 GB/s), and one process's Tofu injection caps at ≈1 link's bandwidth
+   (~6.7 GB/s ingest) regardless of TNI count for large messages. The 6 TNIs to 6
+   distinct peers buy concurrency only while messages are small enough to be
+   fixed-cost-bound — exactly the decode regime. (This also explains why the big
+   multi-TNI speedups in #10/#12 are largest at B=1.)
+
+**Takeaway: model a TP all-reduce as `reduce-scatter + all-gather` of multi-TNI
+fan-outs, not as a fused tree — it is 2–4× cheaper in pure comm. Reduce-scatter
+and all-gather are cost-symmetric, so the suite's all-gather numbers (finding #12)
+carry over directly.**
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -607,7 +660,9 @@ ae8e731  moe_dispatch_bench — MoE expert-dispatch all-to-all (multi-TNI)
 57bc9f7  decode roofline: fold MoE dispatch all-to-all result in
 0db2fe1  docs: MoE roofline holds only under uniform routing; skew 2.2-2.7×
 c07f425  moe_dispatch_bench — dimensional store-and-forward variant (dead end, #11)
-(this)   allgather_bench — all-gather (multi-TNI wins; recursive-doubling trap, #12)
+14f0a43  allgather_bench — all-gather (multi-TNI wins; recursive-doubling trap, #12)
+e317b82  moe_dispatch_bench — relay extended to all 6 Tofu axes (multi-unit ready, #11)
+(this)   reducescatter_bench — reduce-scatter mirrors all-gather; decompose all-reduce beats fused tree 2-4× (#13)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
