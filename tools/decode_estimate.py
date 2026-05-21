@@ -58,7 +58,12 @@ ACT_RESERVE_GIB  = 2.0           # leave headroom for activations / runtime
 BW_PER_NODE      = 650e9         # realized decode matvec BW (B/s); stream peak ~900e9
 HOP_FIXED_S      = 1.23e-6       # uTofu fixed per-hop latency
 HOP_BW           = 6.36e9        # uTofu per-link payload BW (B/s)
-COLLECTIVES_PER_LAYER = 2        # attn TP all-reduce + MoE dispatch/combine
+COLLECTIVES_PER_LAYER = 2        # attn TP all-reduce + MoE dispatch/combine.
+                                 # MEASURED ok: a64fx/utofu-tests/moe_dispatch_bench
+                                 # shows real multi-TNI dispatch+combine = 0.88-0.93x
+                                 # of 2x tree-all-reduce (this proxy is ~right, slightly
+                                 # conservative) -- but ONLY with multi-TNI all-to-all;
+                                 # naive single-TNI is ~2.8x and would blow the budget.
 
 GIB = 1024**3
 

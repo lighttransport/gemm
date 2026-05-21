@@ -20,6 +20,7 @@ distributed-attention budget.
 | `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
 | `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
 | `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`). Uses the **production qpacked+ktbl QK kernel** (svtbl K-broadcast, K_DP `[p][d][kv]`, no svaddv) — see finding #9 |
+| `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline over a deterministic shared routing matrix — see finding #10 |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -42,10 +43,13 @@ RA_SEQ=1048576 RA_ITERS=3000 mpiexec -np 12 ./ring_attn_bench
 RA_SEQ=16384 RA_GROUPS=4 RA_ITERS=2000 mpiexec -np 12 ./ring_attn_overlap
 # across-step async driver + HW barrier (TF_HW_BARRIER=1 uses libhwb; needs -lhwb)
 RA_SEQ=16384 RA_GROUPS=4 RA_ITERS=500 TF_HW_BARRIER=1 mpiexec -np 12 ./ring_attn_async
+# MoE expert-dispatch all-to-all (B=1 decode vs B=256 batched; MOE_NTNI sweeps TNIs)
+MOE_BATCH=1   MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
+MOE_BATCH=256 MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
 ```
 Rank-0 reports are also written to `ra_log_<coords>.txt` / `rao_log_<coords>.txt`
-/ `raa_log_<coords>.txt` (mpiexec swallows rank-0 stdout on this node, so read
-the log file).
+/ `raa_log_<coords>.txt` / `moe_log_<coords>.txt` (mpiexec swallows rank-0 stdout
+on this node, so read the log file).
 
 ## The model
 
@@ -336,6 +340,56 @@ Consistent with #8: async never hurts and its benefit scales with comm/compute.
 full-width 16-lane pass that reads each K cache line once. The old `svaddv` kernel
 is preserved at git commit `07c0c67` for the A/B.)
 
+### 10. MoE expert-dispatch all-to-all: multi-TNI across distinct destinations **works** (`moe_dispatch_bench`)
+Findings #1–9 model the **all-reduce** half of decode comm (ring-attention's
+online-softmax reduce). The *other* half is **MoE expert dispatch**: with
+expert-parallelism each token's top-8-of-256 routed-expert hidden states are
+scattered to the rank owning each expert (**dispatch**), the FFN runs, and the
+results are gathered back (**combine**) — an all-to-all *personalized* exchange.
+`tools/decode_estimate.py` modeled this as `COLLECTIVES_PER_LAYER=2 ×`
+tree-all-reduce cost; this bench measures the real pattern. Comm-only (no FFN):
+every rank reproduces the same N×N routing matrix from a shared seed, so per-pair
+byte sizes agree with no runtime exchange; per-pair payload is `cnt·HID·2 B` with
+the seq counter trailing at the variable offset `plen(cnt)`. Three variants:
+naive single-TNI pairwise, multi-TNI (distinct dsts round-robined over `MOE_NTNI`
+TNIs, all Puts issued before any TCQ drain), and the tree-all-reduce baseline.
+
+**The headline: distinct destinations DO parallelize across TNIs** — the exact
+case finding #5's single-peer dead-end said *should* work. NTNI sweep, B=256
+(2048 selections/rank, every pair ~170 H-vectors ≈ dense all-to-all):
+
+```
+NTNI   dispatch us   speedup   agg BW
+ 1       10464         1.02×    28.9 GB/s   (sanity: multi w/ 1 TNI ≈ naive)
+ 2        7365         1.45×    41.0 GB/s
+ 3        4703         2.28×    64.2 GB/s
+ 4        3720         2.71×    81.2 GB/s
+ 6        3500         3.00×    86.3 GB/s
+```
+
+It is **sub-linear — caps at ~3× for 6 TNIs, not 6×.** With 11 destinations over
+a 2×3×2 torus (axis extents 2/3/2) the first few TNIs hit independent axis links;
+past ~4 TNIs the distinct-destination Puts start sharing physical links. So
+finding #5's "the only payoff from 6 TNIs is sending to *different* peers" is now
+**measured and bounded**: real, worth ~3×, but not the naive 6×. At B=1 decode
+(only K=8 H-vectors over ≤5 distinct dsts) multi-TNI still helps **1.5–2.4×**.
+
+**Roofline check** — `(dispatch+combine)_best / (2·tree)`:
+
+```
+            dispatch+combine (best, multi-TNI)   2×tree   ratio
+B=1            34.6 us                            37.3 us   0.93
+B=256        6529   us                          7415   us   0.88
+```
+
+The ratio < 1 means real multi-TNI all-to-all is **~10% cheaper** than
+`decode_estimate.py`'s "2× tree all-reduce" proxy — so `COLLECTIVES_PER_LAYER=2`
+is sound (slightly conservative). **But that only holds *because of* multi-TNI:**
+the naive single-TNI all-to-all is ~2.8× the tree cost and *would* blow the
+budget. The multi-TNI dispatch is precisely what keeps the roofline assumption
+valid. Whole-model (×75 MoE layers) best dispatch+combine: **2.6 ms/tok @B=1**,
+**490 ms/tok @B=256** (the batched all-to-all is the real long pole at scale).
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -345,8 +399,11 @@ is preserved at git commit `07c0c67` for the A/B.)
 - **Don't bother coordinate-ordering the ring** — software-bound per-hop makes it
   a ~1% effect.
 - **Don't stripe a hop across TNIs** — same-peer TNIs share one link, zero gain
-  (K=6 is a net loss). The only payoff from the 6 TNIs is sending to *different*
-  peers at once.
+  (K=6 is a net loss). The payoff from the 6 TNIs is sending to *different* peers
+  at once, which is **real and measured** (finding #10): a multi-TNI all-to-all
+  is ~3× the single-TNI one (sub-linear past ~4 TNIs as distinct destinations
+  start sharing torus axis links). Reach for it whenever the collective fans out
+  to many peers (MoE dispatch), not when it targets one peer per step (ring/tree).
 - **Send the reduce payload in bf16, not fp32** (`RA_RBYTES=2`) — the one
   single-peer knob that works: ring-reduce −35% (41.9→27.1 µs), tree −42%
   (23.6→13.6 µs), attn-only upper bound +54%. Keep `m` (and ideally `l`) fp32,
@@ -408,6 +465,7 @@ is preserved at git commit `07c0c67` for the A/B.)
 8e2da9e  ring_attn_overlap — comm/compute overlap validation (real math)
 07c0c67  ring_attn_async — across-step async driver + EL0 HW barrier
 5110468  ring_attn_async — production qpacked+ktbl QK kernel (svtbl, K_DP)
+ae8e731  moe_dispatch_bench — MoE expert-dispatch all-to-all (multi-TNI)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
