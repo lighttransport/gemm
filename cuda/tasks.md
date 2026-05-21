@@ -198,13 +198,28 @@ follow-ups.
      The qimg generate harness also accepts `--enc-st` / `QIMG_TEXT_ENCODER_ST`
      and falls back to the local `/mnt/disk01` FP8-scaled text-encoder
      safetensors instead of requiring the older `/mnt/nvme02` path.
-     A BF16-input split partial kernel now exists in both qimg and Flux2 test
-     paths. It consumes the same cast BF16 Q/K/V buffers as the BF16
-     tensor-core attention path, writes the existing `(m,l,O)` partial ABI, and
-     reuses the F32 merge; the small correctness tests compare it against the
-     existing BF16 tensor-core baseline (`max_diff` about 1.9e-4 on this host).
-     This is a typed bridge for the split ABI, not the final tensor-core split
-     kernel. BF16/FP8 split-key tensor-core partial kernels remain future work.
+     BF16 split partial coverage now has two layers in both qimg and Flux2:
+     the scalar BF16-input ABI bridge plus a `flash_attn_bf16_tc_split_partials`
+     MMA kernel that writes unnormalized `(m,l,O)` split partials and reuses the
+     existing F32 merge. The small correctness tests compare both against the
+     existing BF16 tensor-core baseline (`typed_max` about 1.9e-4 and `tc_max`
+     about 2.6e-4 on this host). FP8 split-key tensor-core partial kernels and
+     real full-path default-enable validation remain future work.
+     The BF16 TC split path is now also reachable through explicit runtime gates:
+     `QIMG_BF16_SPLIT_KV=<split>` and `FLUX2_BF16_SPLIT_KV=<split>`. The gates
+     are off by default and the auto-dispatch unit tests set them internally to
+     exercise `op_attn`; the observed op-level delta versus monolithic BF16 is
+     about 5.6e-4 on this host.
+     The split kernel now uses the same vectorized `cp.async` double-buffered
+     K/V staging as monolithic BF16. In isolated runs after that optimization,
+     qimg measured 2048-token about 0.073 ms baseline -> 0.074 ms split
+     (~1.0x) and 4608-token/24-head varied from 0.94x to 1.19x across
+     isolated reruns; Flux2 measured 2048-token about 0.085 ms -> 0.074 ms
+     (1.15x) and 4608-token/24-head about 7.0 ms -> 7.4 ms (0.95x).
+     `auto` is therefore conservative:
+     qimg stays disabled for BF16 split, while Flux2 enables only for the
+     2048-token regime with split_kv=1024. Numeric `*_BF16_SPLIT_KV` values
+     remain available for investigation.
    - Shipped in this session was the BKV bump 16→32 (tile-amortization
      win). The plan's original framing was grid parallelism across keys
      for very large n_tok (>2K). For qimg 1024×1024 image stream
@@ -466,6 +481,21 @@ follow-ups.
       BF16 tensor-attention data path without changing runtime dispatch.
       It is intentionally a scalar bridge, not the final BF16 tensor-core split
       kernel.
+    - Verify: `make -C cuda/qimg test_cuda_qimg`,
+      `make -C cuda/flux2 test_cuda_flux2`,
+      `./test_cuda_qimg --test-kernels`, and
+      `./test_cuda_flux2 --test-kernels`.
+
+36. **[done] BF16 tensor-core split-key partial kernel**
+    - Status: qimg and Flux2 now compile `flash_attn_bf16_tc_split_partials`,
+      a BF16 MMA split-partial kernel for head_dim=128 that computes per-split
+      online-softmax state and unnormalized O with tensor cores, then merges via
+      `flash_attn_f32_split_merge`. Runtime dispatch is available only behind
+      explicit `QIMG_BF16_SPLIT_KV` / `FLUX2_BF16_SPLIT_KV` gates; default
+      behavior is unchanged. The split kernel now uses `cp.async` double-buffered
+      K/V staging; isolated benches show qimg is near break-even to modestly
+      faster at tested production shape, while Flux2 is slightly faster at
+      2048 tokens and near break-even at 4608-token/24-head.
     - Verify: `make -C cuda/qimg test_cuda_qimg`,
       `make -C cuda/flux2 test_cuda_flux2`,
       `./test_cuda_qimg --test-kernels`, and

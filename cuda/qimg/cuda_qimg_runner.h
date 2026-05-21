@@ -1316,6 +1316,7 @@ struct cuda_qimg_runner {
      * Q/K/V are bulk-cast from F32 to BF16 (uint16_t) before the kernel runs. */
     int use_bf16_attn;            /* 1 to use mma.sync BF16 flash attention (env QIMG_BF16_ATTN=1) */
     CUfunction flash_attn_bf16;
+    CUfunction flash_attn_bf16_tc_split_partials;
     CUfunction cast_f32_to_bf16;  /* bulk F32→BF16 cast */
     CUdeviceptr d_q_bf16, d_k_bf16, d_v_bf16; /* [n_tok*dim] uint16 bf16 */
     size_t      bf16_attn_buf_n;
@@ -2729,6 +2730,25 @@ static int qimg_f32_split_apply_tensor_attn_priority(const char *env, int split_
     return (qimg_f32_split_env_is_auto(env) && tensor_attn_active) ? 0 : split_kv;
 }
 
+static int qimg_bf16_split_kv_from_env(const char *env, int n_tok) {
+    if (!env || env[0] == '\0' || env[0] == '0') return 0;
+    if (strcmp(env, "auto") == 0) {
+        return 0;
+    }
+    char *end = NULL;
+    long split_kv = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || split_kv < 0) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "cuda_qimg: ignoring invalid QIMG_BF16_SPLIT_KV=%s\n", env);
+            warned = 1;
+        }
+        return 0;
+    }
+    if (split_kv == 0) return 0;
+    return (split_kv <= 1) ? 1024 : (int)split_kv;
+}
+
 static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
                     CUdeviceptr d_k, CUdeviceptr d_v,
                     int n_tok, int n_heads, int head_dim) {
@@ -2782,6 +2802,35 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
             cast_buf_f32_to_bf16(r, r->d_q_bf16, d_q, n_elem);
             cast_buf_f32_to_bf16(r, r->d_k_bf16, d_k, n_elem);
             cast_buf_f32_to_bf16(r, r->d_v_bf16, d_v, n_elem);
+            int bf16_split_kv = qimg_bf16_split_kv_from_env(getenv("QIMG_BF16_SPLIT_KV"), n_tok);
+            if (bf16_split_kv > 0 && head_dim == 128 &&
+                r->flash_attn_bf16_tc_split_partials && r->attn_split_merge_f32) {
+                int n_splits = (n_tok + bf16_split_kv - 1) / bf16_split_kv;
+                if (n_splits > 1 &&
+                    ensure_split_attn_buf(r, n_tok, n_heads, head_dim, n_splits) == 0) {
+                    unsigned gy_split = (unsigned)((n_tok + 63) / 64);
+                    size_t split_smem = (size_t)(4 * 32 * 136 * sizeof(unsigned short));
+                    void *p_args[] = {&r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                                      &r->attn_split_ws.l.ptr,
+                                      &r->d_q_bf16, &r->d_k_bf16, &r->d_v_bf16,
+                                      &n_tok, &n_heads, &head_dim, &bf16_split_kv};
+                    CUresult e1 = cuLaunchKernel(r->flash_attn_bf16_tc_split_partials,
+                                                 (unsigned)n_heads, gy_split, (unsigned)n_splits,
+                                                 128, 1, 1, split_smem, r->stream, p_args, NULL);
+                    void *m_args[] = {&d_out, &r->attn_split_ws.o.ptr, &r->attn_split_ws.m.ptr,
+                                      &r->attn_split_ws.l.ptr, &n_tok, &n_heads,
+                                      &head_dim, &n_splits};
+                    CUresult e2 = (e1 == CUDA_SUCCESS)
+                        ? cuLaunchKernel(r->attn_split_merge_f32,
+                                         (unsigned)n_heads, (unsigned)n_tok, 1,
+                                         128, 1, 1, 0, r->stream, m_args, NULL)
+                        : e1;
+                    if (e1 == CUDA_SUCCESS && e2 == CUDA_SUCCESS) return;
+                    fprintf(stderr,
+                            "cuda_qimg: BF16 split-key attention launch failed (%d/%d), falling back\n",
+                            (int)e1, (int)e2);
+                }
+            }
             unsigned gy = (unsigned)((n_tok + 63) / 64);
             /* smem: 2× double-buffered (sK0+sK1+sV0+sV1) at HDP=136 (bank-
              * conflict-free padded stride) ~34 KB. P held in per-lane regs. */
@@ -2941,6 +2990,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->flash_attn_fp8 = NULL;
     if (cuModuleGetFunction(&r->flash_attn_bf16, module, "flash_attn_bf16") != CUDA_SUCCESS)
         r->flash_attn_bf16 = NULL;
+    if (cuModuleGetFunction(&r->flash_attn_bf16_tc_split_partials, module, "flash_attn_bf16_tc_split_partials") != CUDA_SUCCESS)
+        r->flash_attn_bf16_tc_split_partials = NULL;
     if (cuModuleGetFunction(&r->cast_f32_to_bf16, module, "cast_f32_to_bf16") != CUDA_SUCCESS)
         r->cast_f32_to_bf16 = NULL;
     if (cuModuleGetFunction(&r->quantize_fp8, module, "quantize_to_fp8_e4m3") != CUDA_SUCCESS)
