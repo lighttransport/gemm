@@ -40,6 +40,14 @@ t_comm = layers · 2 · tree_steps(TP) · (1.23µs + hidden·2·B / 6.36GB/s)
 tree all-reduce **log₂(⌊pow2⌋)(+2 if non-pow2)** steps; comm is **context-independent**.
 HBM **32 GiB/node** (≈30 usable).
 
+The two-collectives-per-layer MoE term (`COLLECTIVES_PER_LAYER=2`) is now
+**measured-validated**: `a64fx/utofu-tests/moe_dispatch_bench` (top-8-of-256
+all-to-all dispatch+combine on the 12-node torus) lands at **0.88–0.93×** of
+`2 × tree-all-reduce` — the proxy is sound, slightly conservative. The catch:
+that only holds with a **multi-TNI all-to-all** (distinct destinations across the
+6 TNIs give ~3×; a naive single-TNI dispatch is ~2.8× the proxy and would blow
+the budget). So the roofline assumes the dispatch is implemented multi-rail.
+
 ## Results — 1M context, single stream (batch=1)
 
 ```
