@@ -71,7 +71,12 @@ struct hip_flux2_runner {
 
     hipModule_t mod;
     hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_fp8_opt;
-    hipFunction_t fn_gemm_fp8_wmma;      /* FP8 in × FP8 wt */
+    hipFunction_t fn_gemm_fp8_wmma;      /* FP8 in × FP8 wt (naive ref) */
+    hipFunction_t fn_flux2_gemm_pgr2;    /* pipe32 FP8xFP8 (LDS-tiled, ported from qimg) */
+    hipFunction_t fn_flux2_quant_clamp;  /* per-row clamp act quant + w_scale fold */
+    void *d_act_fp8;                     /* persistent FP8 activation scratch */
+    void *d_act_scales;                  /* persistent per-row scale scratch */
+    size_t act_fp8_cap, act_sc_cap;
     hipFunction_t fn_gemm_fp8_bf16_wmma; /* BF16 act × FP8 wt (BF16 WMMA) */
     hipFunction_t fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_swiglu, fn_flash_attn;
@@ -277,6 +282,34 @@ static void op_gemm_fp8_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, float w_
     hipModuleLaunchKernel(r->fn_gemm_fp8_wmma, gx, gy, 1, 32, 1, 1, 0, NULL, args, NULL);
 }
 
+/* pipe32 FP8xFP8: clamp-quantize activations (per-row scale, w_scale folded in),
+ * then the LDS-tiled WMMA GEMM. Eligible shapes only (n_tok>=128, n_out%128==0,
+ * n_in%32==0); ~143 TF/s class vs the LUT. Returns 0 on success, -1 to fall back. */
+static int op_gemm_fp8_pipe32(hip_flux2_runner *r, void *Y, void *W_fp8, float w_scale,
+                              void *X, void *bias, int n_out, int n_in, int n_tok) {
+    if (!r->fn_flux2_gemm_pgr2 || !r->fn_flux2_quant_clamp) return -1;
+    if (n_tok < 128 || (n_out % 128) != 0 || (n_in % 32) != 0) return -1;
+    int M_pad = ((n_tok + 127) / 128) * 128;
+    size_t need_x = (size_t)M_pad * (size_t)n_in;
+    size_t need_s = (size_t)M_pad * sizeof(float);
+    if (r->act_fp8_cap < need_x) {
+        if (r->d_act_fp8) hipFree(r->d_act_fp8);
+        if (hipMalloc(&r->d_act_fp8, need_x) != hipSuccess) { r->d_act_fp8 = NULL; r->act_fp8_cap = 0; return -1; }
+        r->act_fp8_cap = need_x;
+    }
+    if (r->act_sc_cap < need_s) {
+        if (r->d_act_scales) hipFree(r->d_act_scales);
+        if (hipMalloc(&r->d_act_scales, need_s) != hipSuccess) { r->d_act_scales = NULL; r->act_sc_cap = 0; return -1; }
+        r->act_sc_cap = need_s;
+    }
+    void *qa[] = {&X, &r->d_act_fp8, &r->d_act_scales, &n_tok, &n_in, &M_pad, &w_scale};
+    hipModuleLaunchKernel(r->fn_flux2_quant_clamp, (unsigned)M_pad, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
+    void *ga[] = {&Y, &W_fp8, &r->d_act_fp8, &bias, &r->d_act_scales, &n_out, &n_in, &n_tok, &M_pad};
+    hipModuleLaunchKernel(r->fn_flux2_gemm_pgr2, (unsigned)(n_out / 128), (unsigned)(M_pad / 128), 1,
+                          128, 1, 1, 0, NULL, ga, NULL);
+    return 0;
+}
+
 /* BF16 WMMA with FP8 weights: 256 threads, CTA tile 128 × 128. */
 static void op_gemm_fp8_bf16_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, float w_scale,
                                    void *X, void *bias, int n_out, int n_in, int n_tok) {
@@ -290,8 +323,11 @@ static void op_gemm_fp8_bf16_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, flo
 static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
                        void *X, void *bias, int n_out, int n_in, int n_tok) {
     if (W->scale >= 0.0f) {
-        if (r->use_wmma == 2 && r->fn_gemm_fp8_wmma)
-            op_gemm_fp8_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
+        if (r->use_wmma == 2 &&
+            op_gemm_fp8_pipe32(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok) == 0)
+            ; /* pipe32 FP8xFP8 handled it */
+        else if (r->use_wmma == 2 && r->fn_gemm_fp8_bf16_wmma)
+            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok); /* fallback for ineligible shapes */
         else if (r->use_wmma == 1 && r->fn_gemm_fp8_bf16_wmma)
             op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
         else if (r->use_fp8_opt && r->fn_gemm_fp8_opt)
@@ -479,6 +515,10 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         r->fn_gemm_fp8_opt = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_fp8_wmma, mod, "gemm_fp8_wmma") != hipSuccess)
         r->fn_gemm_fp8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_flux2_gemm_pgr2, mod, "flux2_gemm_fp8_pgr2") != hipSuccess)
+        r->fn_flux2_gemm_pgr2 = NULL;
+    if (hipModuleGetFunction(&r->fn_flux2_quant_clamp, mod, "flux2_quant_act_clamp") != hipSuccess)
+        r->fn_flux2_quant_clamp = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_fp8_bf16_wmma, mod, "gemm_fp8w_bf16a_wmma_t") != hipSuccess)
         r->fn_gemm_fp8_bf16_wmma = NULL;
     hipModuleGetFunction(&r->fn_layernorm,   mod, "layernorm_f32");
