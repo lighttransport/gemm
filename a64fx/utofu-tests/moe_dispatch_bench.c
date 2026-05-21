@@ -39,6 +39,15 @@
  *                Per-phase bundle byte sizes are computed analytically from the
  *                shared count matrix, so no real data movement is needed to know
  *                them -- like the rest of the bench, sized dummy payloads + seq.
+ *   (e) BRUCK  : classic logarithmic-index all-to-all. ceil(log2 N) doubling steps
+ *                instead of N-1 sends: step z sends the blocks whose index has
+ *                bit z set to dst=(i+2^z)%N and receives the mirror set from
+ *                src=(i-2^z)%N, with a final inverse rotation. Trades message
+ *                COUNT for byte VOLUME -- it pads every block to the global max
+ *                pair count (uniform blocks are intrinsic) and moves ~(N/2)*log2(N)
+ *                blocks/rank, so it tests whether fewer-but-fatter hops beat the
+ *                sparse direct all-to-all. Single TNI (each step hits one peer, so
+ *                there is nothing to stripe across rails). Works for any N>=2.
  *
  * Like the rest of the suite this binary makes ZERO MPI calls: mpiexec only
  * places it; it reconstructs every peer's VCQ ID from tofu_topo.txt coordinates
@@ -66,6 +75,7 @@
  *   MOE_NTNI   TNIs for the multi-TNI variant    (default 6)
  *   MOE_RELAY  run the dimensional variant (d)    (default 1; 0 to skip)
  *   MOE_DIMORDER axis order for (d), subset of xyzabc  (default xyzabc)
+ *   MOE_BRUCK  run the Bruck variant (e)          (default 1; 0 to skip)
  *   MOE_LAYERS MoE layers for whole-model scaling(default 75)
  *   MOE_ITERS  timed exchanges                   (default 2000)
  *   MOE_WARMUP untimed warmup exchanges          (default 200)
@@ -214,6 +224,33 @@ static utofu_stadd_t RelayPeerBase[MAX_TNI][MAX_NODES];
 static int   SendBundle[NDIM][MAX_NODES];      /* MyRank send bundle counts/phase (by target) */
 static int   RecvBundle[NDIM][MAX_NODES];      /* MyRank recv bundle counts/phase (by source) */
 
+/* ---- Bruck (logarithmic index) all-to-all state (variant e) ----
+ * The classic Bruck algorithm trades MESSAGE COUNT for BYTE VOLUME: instead of
+ * N-1 pairwise sends it does ceil(log2 N) doubling steps, each moving ~N/2 blocks
+ * to a single distinct peer. It needs UNIFORM blocks, so every per-pair payload
+ * is padded to the global max pair count (BBlk). Step z sends the blocks whose
+ * index has bit z set to dst=(i+2^z)%N and receives the same index set from
+ * src=(i-2^z)%N; a final inverse rotation maps received block s back to its
+ * originator. Unlike the dimensional relay this needs no Cartesian grid -- it
+ * runs for any N>=2 -- but the padding + log-step aggregation is the cost the
+ * bench weighs against the sparse direct all-to-all (a latency-vs-volume study:
+ * Bruck cuts hops but moves padded ~(N/2)*log2(N) blocks/rank). Single TNI: each
+ * step targets one peer, so there is nothing to spread across rails. */
+#define BRUCK_STAG 3
+#define MAX_BSTEP  6                            /* ceil(log2 MAX_NODES) for N<=64  */
+static int    BNStep;                           /* comm steps = ceil(log2 N)       */
+static int    Bm[MAX_BSTEP];                    /* blocks moved/step (bit-z popcount) */
+static int    BitIdx[MAX_BSTEP][MAX_NODES];     /* bit-z-set block indices, ascending */
+static size_t BBlk;                             /* uniform padded block bytes      */
+static char  *BruckRegion;
+static size_t BruckRegionSz;
+static size_t BRstepOff[MAX_BSTEP];             /* per-step recv buffer offset     */
+static size_t BSendOff;                         /* send-staging offset             */
+static utofu_stadd_t BruckBase[MAX_TNI];
+static utofu_stadd_t BruckPeerBase[MAX_TNI][MAX_NODES];
+static uint64_t BHead[MAX_NODES];               /* originator id tracked per rotation slot */
+static double   Bruck_wire_bytes;               /* bytes on the wire per all-to-all */
+
 /* resolve an index-tuple (per-axis indices into AxisVals) to its rank, or -1. */
 static inline int rank_of_idx(const int *idx)
 {
@@ -254,6 +291,10 @@ static inline size_t recv_off(int bank, int src) { return bank == BANK_DISP ? di
 
 /* payload bytes for a per-pair selection count, 8-byte aligned (seq follows). */
 static inline size_t plen(int c) { return ((size_t)c * HBytes + 7) & ~(size_t)7; }
+
+/* cache-line-rounded byte size of a Bruck buffer of m padded blocks (+ trailing seq). */
+static inline size_t bruck_buf(int m)
+{ return (((size_t)m * BBlk + 8) + (DEMO_CACHE_LINE - 1)) & ~(size_t)(DEMO_CACHE_LINE - 1); }
 
 /* one Put (the ring_attn_bench BUSY-retry idiom); drain==1 polls local completion. */
 static void put_issue(utofu_vcq_hdl_t v, utofu_vcq_id_t pv, utofu_stadd_t s,
@@ -475,6 +516,53 @@ static int relay_verify(void)
     return 1;
 }
 
+/* one Bruck all-to-all over uniform (padded) blocks. We only forward each block's
+ * 8-byte head (the originator id) so correctness is verifiable; the Put still moves
+ * the full padded block bytes, so the wire cost is honest. ceil(log2 N) steps, each
+ * a single chunked Put to one peer (single TNI -- nothing to stripe across rails). */
+static void bruck_a2a(uint64_t tok)
+{
+    /* phase 1: rotation. tmp[k] is my block destined for (MyRank+k)%N; all of my
+     * blocks originate here, so every rotation slot starts holding my id. */
+    for (int k = 0; k < N; k++) BHead[k] = MOE_MAGIC | (uint64_t)MyRank;
+    /* phase 2: doubling steps. Step z exchanges the bit-z-set index set with the
+     * peers 2^z away (send up, receive down), forwarding whatever now sits there. */
+    for (int z = 0; z < BNStep; z++) {
+        int dst = (MyRank + (1 << z)) % N;
+        int src = (MyRank - (1 << z) + N) % N;
+        char *sb = BruckRegion + BSendOff;
+        for (int jj = 0; jj < Bm[z]; jj++)
+            *(volatile uint64_t *)(sb + (size_t)jj * BBlk) = BHead[BitIdx[z][jj]];
+        size_t L = (size_t)Bm[z] * BBlk;
+        *(volatile uint64_t *)(sb + L) = tok;                       /* trailing seq */
+        int chunks = relay_put(0, PeerVcq[0][dst], BruckBase[0] + BSendOff,
+                               BruckPeerBase[0][dst] + BRstepOff[z], L + 8);
+        drain_n(0, chunks);
+        volatile uint64_t *sq = (volatile uint64_t *)(BruckRegion + BRstepOff[z] + L);
+        double ts = now_sec();
+        while (*sq < tok) if (now_sec() - ts > WAIT_TIMEOUT_SEC) die("bruck wait timeout", -1);
+        char *rb = BruckRegion + BRstepOff[z];
+        for (int jj = 0; jj < Bm[z]; jj++)              /* unpack into same indices */
+            BHead[BitIdx[z][jj]] = *(volatile uint64_t *)(rb + (size_t)jj * BBlk);
+        (void)src;
+    }
+}
+
+/* one-time Bruck correctness: after the inverse rotation, slot (i-s)%N holds the
+ * block that originated at rank s (the all-to-all result for source s). */
+static int bruck_verify(void)
+{
+    for (int s = 0; s < N; s++) {
+        uint64_t h = BHead[(MyRank - s + N) % N];
+        if (h != (MOE_MAGIC | (uint64_t)s)) {
+            logmsg("bruck verify FAIL src=%d slot=%d got=0x%lx want=0x%lx\n",
+                   s, (MyRank - s + N) % N, (unsigned long)h, (unsigned long)(MOE_MAGIC | (uint64_t)s));
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int main(void)
 {
     int rc;
@@ -613,6 +701,33 @@ int main(void)
         memset(RelayRegion, 0, relay_region_sz);
     }
 
+    /* ---- Bruck region: ceil(log2 N) per-step recv buffers + one send-staging
+     * buffer, every block padded to the global max pair count BBlk (uniform blocks
+     * are intrinsic to Bruck). Works for any N>=2 (no grid requirement). ---- */
+    int bruck_on = (int)envl("MOE_BRUCK", 1) && N >= 2 && maxc > 0;
+    Bruck_wire_bytes = 0;
+    if (bruck_on) {
+        BNStep = 0; for (int d = 1; d < N; d <<= 1) BNStep++;
+        if (BNStep > MAX_BSTEP) bruck_on = 0;          /* N > MAX_NODES guard */
+    }
+    if (bruck_on) {
+        BBlk = plen(maxc);
+        int maxBm = 1;
+        for (int z = 0; z < BNStep; z++) {
+            int m = 0;
+            for (int k = 0; k < N; k++) if ((k >> z) & 1) BitIdx[z][m++] = k;
+            Bm[z] = m; if (m > maxBm) maxBm = m;
+            Bruck_wire_bytes += (double)N * (double)m * (double)BBlk;   /* all ranks send m blocks */
+        }
+        size_t off = 0;
+        for (int z = 0; z < BNStep; z++) { BRstepOff[z] = off; off += bruck_buf(Bm[z]); }
+        BSendOff = off; off += bruck_buf(maxBm);
+        BruckRegionSz = off;
+        if (posix_memalign((void **)&BruckRegion, DEMO_CACHE_LINE, BruckRegionSz) != 0)
+            die("posix_memalign(bruck)", -1);
+        memset(BruckRegion, 0, BruckRegionSz);
+    }
+
     /* one VCQ per TNI; register the same region in each (independent stadd space) --
      * the tni_stripe_bench.c:109-122 pattern, generalized to peer arrays for ALL ranks. */
     for (int k = 0; k < NTNI; k++) {
@@ -642,10 +757,16 @@ int main(void)
             rc = utofu_reg_mem_with_stag(Vcq[k], RelayRegion, relay_region_sz, RELAY_STAG, 0, &RelayBase[k]);
             if (rc != UTOFU_SUCCESS) die("utofu_reg_mem_with_stag(relay)", rc);
         }
+        /* Bruck region: third stag, independent stadd space */
+        if (bruck_on) {
+            rc = utofu_reg_mem_with_stag(Vcq[k], BruckRegion, BruckRegionSz, BRUCK_STAG, 0, &BruckBase[k]);
+            if (rc != UTOFU_SUCCESS) die("utofu_reg_mem_with_stag(bruck)", rc);
+        }
         for (int r = 0; r < N; r++) {
             if (r == MyRank) {
                 PeerVcq[k][r] = my_real; PeerBase[k][r] = Base[k];
                 if (relay_on) RelayPeerBase[k][r] = RelayBase[k];
+                if (bruck_on) BruckPeerBase[k][r] = BruckBase[k];
                 continue;
             }
             rc = utofu_construct_vcq_id(topo[r], tni, DEMO_CQ_ID, DEMO_CMP_ID, &PeerVcq[k][r]);
@@ -656,6 +777,10 @@ int main(void)
             if (relay_on) {
                 rc = utofu_query_stadd(PeerVcq[k][r], RELAY_STAG, &RelayPeerBase[k][r]);
                 if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(peer relay)", rc);
+            }
+            if (bruck_on) {
+                rc = utofu_query_stadd(PeerVcq[k][r], BRUCK_STAG, &BruckPeerBase[k][r]);
+                if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(peer bruck)", rc);
             }
         }
     }
@@ -687,6 +812,11 @@ int main(void)
         else
             logmsg("relay: DISABLED (MOE_RELAY=0 or ranks are not a full Cartesian torus grid: N=%d prod(ext)=%ld)\n",
                    N, grid);
+        if (bruck_on)
+            logmsg("bruck: %d steps  block=%zu B (padded to maxc=%d)  region=%.1f MiB  wire=%.2f MiB\n",
+                   BNStep, BBlk, maxc, BruckRegionSz / 1048576.0, Bruck_wire_bytes / 1048576.0);
+        else
+            logmsg("bruck: DISABLED (MOE_BRUCK=0 or N out of range)\n");
     }
 
     /* ---- bootstrap: every rank repeatedly Puts seq=1 to its nonzero dispatch
@@ -756,6 +886,17 @@ int main(void)
         TIME_RELAY(comb_relay);
     }
 
+    /* Bruck (variant e): symmetric in dispatch/combine (uniform padded blocks),
+     * so time one all-to-all and double it for the per-layer dispatch+combine. */
+    double bruck_us = 0;
+    if (bruck_on) {
+        bruck_a2a(tok); if (!bruck_verify()) die("bruck verify failed", -1); tok++;
+        for (long i = 0; i < WARMUP; i++) { bruck_a2a(tok); tok++; }
+        double _t0 = now_sec();
+        for (long i = 0; i < ITERS; i++) { bruck_a2a(tok); tok++; }
+        bruck_us = (now_sec() - _t0) / (double)ITERS * 1e6;
+    }
+
     if (MyRank == 0) {
         /* total bytes moved per all-to-all phase = sum of all pair payloads */
         double disp_bytes = 0, tree_bytes = (double)N * (PlenTree);
@@ -794,11 +935,30 @@ int main(void)
                    relay_wire_bytes / (disp_relay * 1e-6) / 1e9,
                    disp_bytes > 0 ? relay_wire_bytes / disp_bytes : 0.0);
         }
-        logmsg("whole-model MoE comm (x%ld layers): best=%.1f us/token\n", NMOE, dc_best * NMOE);
+        double overall_best = dc_best;
+        if (bruck_on) {
+            double bruck_dc = 2 * bruck_us;          /* dispatch+combine, symmetric */
+            if (bruck_dc < overall_best) overall_best = bruck_dc;
+            logmsg("\n-- Bruck log-step all-to-all (variant e), %d steps --\n", BNStep);
+            logmsg("one all-to-all=%.2f us  dispatch+combine=%.2f us\n", bruck_us, bruck_dc);
+            logmsg("bruck vs multiTNI/naive best: x%.2f (%s) ; vs naive: x%.2f\n",
+                   dc_best > 0 ? bruck_dc / dc_best : 0.0,
+                   bruck_dc < dc_best ? "Bruck WINS" : "multiTNI/naive wins",
+                   dc_naive > 0 ? bruck_dc / dc_naive : 0.0);
+            logmsg("RATIO bruck/(2*tree) = %.2f  [>1 roofline UNDER-estimates MoE comm]\n",
+                   bruck_dc / (2 * tree_us));
+            logmsg("bruck dispatch BW: useful=%.1f GB/s  wire=%.1f GB/s  (pads/forwards %.2fx the useful bytes)\n",
+                   disp_bytes / (bruck_us * 1e-6) / 1e9,
+                   Bruck_wire_bytes / (bruck_us * 1e-6) / 1e9,
+                   disp_bytes > 0 ? Bruck_wire_bytes / disp_bytes : 0.0);
+        }
+        logmsg("whole-model MoE comm (x%ld layers): best=%.1f us/token\n", NMOE, overall_best * NMOE);
     }
 
+    if (bruck_on) for (int k = 0; k < NTNI; k++) utofu_dereg_mem(Vcq[k], BruckBase[k], 0);
     if (relay_on) for (int k = 0; k < NTNI; k++) utofu_dereg_mem(Vcq[k], RelayBase[k], 0);
     for (int k = 0; k < NTNI; k++) { utofu_dereg_mem(Vcq[k], Base[k], 0); utofu_free_vcq(Vcq[k]); }
+    if (bruck_on) free(BruckRegion);
     if (relay_on) free(RelayRegion);
     free(Region);
     if (g_log) fclose(g_log);
