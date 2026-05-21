@@ -404,7 +404,14 @@ hand-written kernel (fc1 4096x12288x3072: 154.7 -> 233.5 TF/s).
   48.62 dB vendor vs 50.07 dB hand-written; fc1 8..59: 48.15 dB). It still
   clears the 48 dB perceptually-lossless tier, but would silently break the
   documented 50 dB configs, so it is OFF by default.
-- **To make it default-on without the quality hit:** feed the vendor `scaleB` a
-  per-tensor `clamp` scale (compute global max-abs, set scaleB = max>448 ?
-  max/448 : 1). The per-tensor == per-row MAE equivalence above guarantees this
-  recovers the hand-written clamp quality at vendor speed. Not yet implemented.
+- **Per-tensor clamp scale does NOT recover the quality (tried 2026-05-21).**
+  Implemented the global-max-abs reduce + per-tensor `clamp` scale fed to the
+  vendor `scaleB`, expecting the per-tensor == per-row MAE equivalence to make
+  it quality-neutral. It did not: fc1 30..59 gave 47.38 dB — *worse* than even
+  scalar scale=1 (48.62), vs hand-written per-row clamp 50.07. The MAE
+  equivalence holds for activation *reconstruction* but not for the GEMM output
+  / denoise trajectory: per-row clamp leaves small-max rows exact (s=1) while a
+  single per-tensor scale rescales every row, and the 20-step trajectory is
+  sensitive to that. So the vendor (scalar-scale) kernel tops out at ~48.62 dB
+  and cannot match the hand-written per-row path; it stays **opt-in** (plain
+  scale=1 is its best mode). Reverted the per-tensor machinery.
