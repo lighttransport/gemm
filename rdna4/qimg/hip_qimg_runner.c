@@ -170,6 +170,15 @@ struct hip_qimg_runner {
     /* Preloaded blocks on GPU */
     qimg_block_gpu *gpu_blocks;
     int n_preloaded;
+    /* Persistent ping-pong buffers for streamed blocks (>= n_preloaded), reused
+     * every denoise step instead of malloc/free churn. Async-prefetched on
+     * copy_stream and double-buffered to overlap H2D with compute. */
+    qimg_block_gpu stream_blk[2];
+    int stream_blk_alloc;       /* 1 once both buffers' fields are allocated */
+    hipStream_t copy_stream;
+    hipEvent_t stream_copy_done[2];
+    hipEvent_t stream_use_done[2];
+    int use_block_stream_db;    /* 1 = async double-buffered streaming enabled */
 
     /* Global GPU weights */
     void *d_img_in_w, *d_img_in_b;
@@ -575,6 +584,40 @@ static void *qimg_upload_weight(hip_qimg_runner *r, st_context *st, const char *
     return qimg_st_upload_f32(st, name);
 }
 
+/* Copy a tensor into an already-allocated device buffer `dest` (same shape as a
+ * prior upload of an identically-shaped tensor). Used to re-stream the same set
+ * of blocks every denoise step without re-malloc/free. `stream` may be a copy
+ * stream for async overlap (host F32-convert temp is synced before reuse).
+ * Returns 0 on success, -1 on failure. */
+static int qimg_st_upload_fp8_raw_into(st_context *st, const char *name,
+                                       void *dest, hipStream_t stream) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0 || !dest) return -1;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    const void *data = safetensors_data(st, idx);
+    return hipMemcpyAsync(dest, data, nbytes, hipMemcpyHostToDevice, stream) == hipSuccess ? 0 : -1;
+}
+
+static int qimg_st_upload_f32_into(st_context *st, const char *name, void *dest) {
+    /* Bias/norm tensors: small, host dtype-convert then a synchronous copy.
+     * (Kept synchronous — the temp would otherwise need to outlive an async copy.) */
+    void *tmp = qimg_st_upload_f32(st, name);  /* mallocs+copies a fresh device buffer */
+    if (!tmp || !dest) { if (tmp) hipFree(tmp); return -1; }
+    int idx = safetensors_find(st, name);
+    const uint64_t *shape = safetensors_shape(st, idx);
+    int ndims = safetensors_ndims(st, idx);
+    size_t n = 1; for (int d = 0; d < ndims; d++) n *= shape[d];
+    int rc = hipMemcpy(dest, tmp, n * sizeof(float), hipMemcpyDeviceToDevice) == hipSuccess ? 0 : -1;
+    hipFree(tmp);
+    return rc;
+}
+
+static int qimg_upload_weight_into(hip_qimg_runner *r, st_context *st,
+                                   const char *name, void *dest, hipStream_t stream) {
+    if (r->use_fp8) return qimg_st_upload_fp8_raw_into(st, name, dest, stream);
+    return qimg_st_upload_f32_into(st, name, dest);
+}
+
 /* Upload a weight whose source dtype may be FP8 or BF16/F16/F32 (mixed-dtype
  * checkpoints like unsloth/Qwen-Image-2512-FP8). Returns a device pointer and
  * sets *out_is_fp8 to 1 when the data is FP8 raw bytes (caller dispatches
@@ -634,7 +677,11 @@ static void qimg_free_block(qimg_block_gpu *b) {
     }
 }
 
-static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b) {
+/* Load all weights of a transformer block into `b`. If `b`'s fields are already
+ * allocated (reuse=streaming buffer), copy into them on `stream` (no malloc/free);
+ * otherwise malloc fresh (preload path). `stream` is only used for the reuse path. */
+static int qimg_load_block_s(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b,
+                             hipStream_t stream) {
     st_context *st = (st_context *)r->dit_st;
     char name[256];
     int ok = 1;
@@ -642,14 +689,14 @@ static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b)
     /* BLK_W: upload as FP8 raw or F32 depending on use_fp8 */
     #define BLK_W(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        b->field = qimg_upload_weight(r, st, name); \
-        if (!b->field) ok = 0; \
+        if (b->field) { if (qimg_upload_weight_into(r, st, name, b->field, stream) != 0) ok = 0; } \
+        else { b->field = qimg_upload_weight(r, st, name); if (!b->field) ok = 0; } \
     } } while(0)
     /* BLK_F32: always upload as F32 (biases, norms) */
     #define BLK_F32(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        b->field = qimg_st_upload_f32(st, name); \
-        if (!b->field) ok = 0; \
+        if (b->field) { if (qimg_st_upload_f32_into(st, name, b->field) != 0) ok = 0; } \
+        else { b->field = qimg_st_upload_f32(st, name); if (!b->field) ok = 0; } \
     } } while(0)
 
     BLK_W(attn_q_w, "attn.to_q.weight"); BLK_F32(attn_q_b, "attn.to_q.bias");
@@ -683,6 +730,11 @@ static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b)
         return -1;
     }
     return 0;
+}
+
+/* Preload path: fresh malloc, default stream. */
+static int qimg_load_block(hip_qimg_runner *r, int block_idx, qimg_block_gpu *b) {
+    return qimg_load_block_s(r, block_idx, b, 0);
 }
 
 
@@ -1681,6 +1733,19 @@ int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
                 (float)free_mem / (1<<30));
     }
 
+    /* Streamed blocks (>= n_preloaded) reuse a persistent buffer + async copy
+     * instead of malloc/copy/free every step. Default ON; QIMG_BLOCK_STREAM=0
+     * reverts to the per-step malloc/free path. */
+    r->use_block_stream_db = (r->n_preloaded < r->n_blocks);
+    {
+        const char *v = getenv("QIMG_BLOCK_STREAM");
+        if (v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0))
+            r->use_block_stream_db = 0;
+    }
+    if (r->use_block_stream_db && r->verbose)
+        fprintf(stderr, "hip_qimg: persistent streamed-block buffer enabled (%d blocks streamed)\n",
+                r->n_blocks - r->n_preloaded);
+
     fprintf(stderr, "hip_qimg: loaded %d blocks, dim=%d\n", r->n_blocks, r->dim);
     return 0;
 }
@@ -1701,6 +1766,8 @@ int hip_qimg_load_vae(hip_qimg_runner *r, const char *path) {
 void hip_qimg_free(hip_qimg_runner *r) {
     if (!r) return;
     qimg_print_gemm_summary(r);
+    qimg_free_block(&r->stream_blk[0]);
+    qimg_free_block(&r->stream_blk[1]);
     if (r->gpu_blocks) {
         for (int i = 0; i < r->n_preloaded; i++)
             qimg_free_block(&r->gpu_blocks[i]);
@@ -1857,11 +1924,17 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         if (r->verbose && (L % 10 == 0 || L == r->n_blocks - 1))
             fprintf(stderr, "\r  hip_qimg: block %d/%d", L + 1, r->n_blocks);
 
-        /* Use preloaded block if available, otherwise load on-demand */
+        /* Use preloaded block if available, otherwise stream on-demand. Streamed
+         * blocks reuse a persistent buffer (no per-step malloc/free) and copy
+         * async on the default stream so the host queues ahead instead of
+         * blocking — the dominant denoise overhead (see attention profile note). */
         qimg_block_gpu blk;
         int need_free = 0;
         if (L < r->n_preloaded && r->gpu_blocks[L].attn_q_w) {
             blk = r->gpu_blocks[L];
+        } else if (r->use_block_stream_db) {
+            qimg_load_block_s(r, L, &r->stream_blk[0], 0);
+            blk = r->stream_blk[0];
         } else {
             memset(&blk, 0, sizeof(blk));
             qimg_load_block(r, L, &blk);
