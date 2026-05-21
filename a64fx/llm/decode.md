@@ -41,12 +41,17 @@ tree all-reduce **log₂(⌊pow2⌋)(+2 if non-pow2)** steps; comm is **context-
 HBM **32 GiB/node** (≈30 usable).
 
 The two-collectives-per-layer MoE term (`COLLECTIVES_PER_LAYER=2`) is now
-**measured-validated**: `a64fx/utofu-tests/moe_dispatch_bench` (top-8-of-256
-all-to-all dispatch+combine on the 12-node torus) lands at **0.88–0.93×** of
-`2 × tree-all-reduce` — the proxy is sound, slightly conservative. The catch:
-that only holds with a **multi-TNI all-to-all** (distinct destinations across the
-6 TNIs give ~3×; a naive single-TNI dispatch is ~2.8× the proxy and would blow
-the budget). So the roofline assumes the dispatch is implemented multi-rail.
+**measured** by `a64fx/utofu-tests/moe_dispatch_bench` (top-8-of-256 all-to-all
+dispatch+combine on the 12-node torus), with two important conditions:
+- **uniform routing + multi-TNI dispatch:** real cost = **0.88–0.93×** of
+  `2 × tree-all-reduce` — the proxy is sound, slightly conservative. (Distinct
+  destinations across the 6 TNIs give ~3×; a naive single-TNI dispatch is ~2.8×
+  the proxy and would blow the budget — the roofline assumes multi-rail.)
+- **skewed routing (hot experts):** real cost rises to **2.2–2.7× the proxy** —
+  traffic concentrates on a few hot destination links (agg BW halves) and the
+  proxy under-estimates. So `COLLECTIVES_PER_LAYER=2` is the *load-balanced* case;
+  derate the MoE comm term for routing skew, or keep routing near-uniform
+  (auxiliary load-balance loss + capacity factor, the standard EP mitigation).
 
 ## Results — 1M context, single stream (batch=1)
 

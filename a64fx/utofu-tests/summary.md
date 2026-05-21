@@ -390,6 +390,28 @@ budget. The multi-TNI dispatch is precisely what keeps the roofline assumption
 valid. Whole-model (×75 MoE layers) best dispatch+combine: **2.6 ms/tok @B=1**,
 **490 ms/tok @B=256** (the batched all-to-all is the real long pole at scale).
 
+**…and the proxy holds only under UNIFORM routing.** Real MoE routing is skewed
+(hot experts); with `MOE_ROUTE=worst` (selections concentrated on ~N/4 hot ranks)
+the picture changes sharply (B=256, multi-TNI):
+
+```
+route                max pair   dispatch+combine   ratio vs 2×tree   agg BW
+uniform              214        6530 us            0.88              85.6 GB/s
+worst                725        16195 us           2.18              36.5 GB/s
+worst, capfac 1.25   907        20195 us           2.72              36.7 GB/s
+```
+
+Two effects compound: traffic concentrates on a few **hot destination links**
+(agg BW *halves*, 85→36 GB/s — multi-TNI can't rescue a congested link any more
+than finding #5's single-peer striping could), and the per-pair payload grows
+with the skew. So **`COLLECTIVES_PER_LAYER=2` is the optimistic, load-balanced
+case**; under realistic imbalance the MoE comm term is **2–3× larger** and the
+all-reduce proxy under-estimates it. The multi-TNI speedup itself stays ~3.2×
+(the few hot destinations are large transfers spread over independent links), but
+the absolute cost is set by the hottest link. Practical implication: the MoE
+comm budget should be derated for routing skew (or kept near-uniform with an
+auxiliary load-balancing loss + capacity factor, the standard EP mitigation).
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
