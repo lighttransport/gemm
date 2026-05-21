@@ -16,7 +16,7 @@ MPICC     = mpiclang
 MPICFLAGS = -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall
 TOFU      = -ltofucom
 
-all: tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench allgather_bench reducescatter_bench
+all: tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench allgather_bench reducescatter_bench pp_handoff_bench
 
 # helper uses MPI + uTofu
 tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
@@ -46,6 +46,10 @@ allgather_bench: allgather_bench.c tofu_demo.h
 reducescatter_bench: reducescatter_bench.c tofu_demo.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
 
+# pipeline-parallel handoff benchmark (point-to-point stage send/recv chain): NO MPI
+pp_handoff_bench: pp_handoff_bench.c tofu_demo.h
+	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
+
 # ring-attention comm/compute OVERLAP validation (real math): NO MPI, OpenMP
 ring_attn_overlap: ring_attn_overlap.c tofu_demo.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(TOFU)
@@ -55,6 +59,6 @@ ring_attn_async: ring_attn_async.c tofu_demo.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(TOFU) -lhwb
 
 clean:
-	rm -f tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench allgather_bench reducescatter_bench tofu_topo.txt
+	rm -f tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench allgather_bench reducescatter_bench pp_handoff_bench tofu_topo.txt
 
 .PHONY: all clean
