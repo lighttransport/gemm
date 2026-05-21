@@ -415,3 +415,29 @@ hand-written kernel (fc1 4096x12288x3072: 154.7 -> 233.5 TF/s).
   sensitive to that. So the vendor (scalar-scale) kernel tops out at ~48.62 dB
   and cannot match the hand-written per-row path; it stays **opt-in** (plain
   scale=1 is its best mode). Reverted the per-tensor machinery.
+
+## Rowwise-scale vendor kernel — identified, not wired (2026-05-21)
+
+To make the vendor path default-on with per-row quality, the kernel must support
+a per-row activation scale. hipBLASLt has one and torch._scaled_mm uses it:
+
+```
+Cijk_Alik_Bljk_F8BS_BH_Bias_HA_S_SABV_SAV_UserArgs_MT128x128x32_..._MIWT4_4_..._PGR1
+```
+
+(`F8BS`/`SABV` = scale-A-B-Vector, vs our scalar `F8SS`/`SAB`/MT128x128x64.)
+Confirmed via rocprofv3 that torch._scaled_mm with `scale_a=[M,1]` dispatches it,
+cos=0.999999 — **but it only outputs BF16** (`hipblaslt rowwise _scaled_mm only
+supports BFloat16 output`). It lives in a separate library
+(`TensileLibrary_B8B8_..._SAV_..._Alik_Bljk_gfx1201.co`). Our existing F8SS
+kernel's `_SAV_` slot cannot be used by just passing a scaleAlphaVec pointer —
+that produced garbage (cos 0.29); the rowwise control-word flags were not
+captured.
+
+Wiring it in is a full second extraction (extract the F8BS ELF, capture its
+*different* kernarg ABI via dump_kernarg_shim — vector scaleA/B + SABV control
+words, the F8SS offsets/magic do not transfer — plus a BF16->F32 conversion
+pass since qimg is F32). Deferred: the payoff is bounded because 1024^2 denoise
+is attention-bound, so even a perfect default-on rowwise vendor gives only ~9%
+e2e (and less for quality-safe coverage). The opt-in scalar F8SS path
+(`QIMG_FP8_VENDOR=1`, 48 dB tier) remains the shipped x1.0-GEMM option.
