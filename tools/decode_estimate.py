@@ -9,8 +9,11 @@ fit-in-HBM check. The cost constants come from the a64fx/utofu-tests benchmark
 suite and the in-model decode profile (see a64fx/llm/decode.md):
 
   * realized matvec/GEMV bandwidth ~650 GB/s/node (NOT the 900 GB/s stream peak)
-  * uTofu per-hop = 1.23 us fixed + bytes / 6.36 GB/s
+  * uTofu per-hop = 1.23 us fixed + bytes / 6.36 GB/s = one TofuD link (#14, confirmed)
   * tree all-reduce step count = log2(floor_pow2(G)) (+2 if G not a power of 2)
+  * per-layer comm = measured best-case collectives, NOT a flat 2x tree: attn
+    all-reduce = 0.5 tree (decomposed RS+AG, #13) + MoE dispatch+combine = 1.8 tree
+    uniform / 4.5 tree skew (#10); see --route
   * comm is context-INDEPENDENT; weights amortize over batch, KV does not
 
 Defaults model GLM-5.1; override any constant on the command line.
@@ -57,16 +60,27 @@ HBM_GIB_PER_NODE = 32.0          # HBM2 per node
 ACT_RESERVE_GIB  = 2.0           # leave headroom for activations / runtime
 BW_PER_NODE      = 650e9         # realized decode matvec BW (B/s); stream peak ~900e9
 HOP_FIXED_S      = 1.23e-6       # uTofu fixed per-hop latency
-HOP_BW           = 6.36e9        # uTofu per-link payload BW (B/s)
-COLLECTIVES_PER_LAYER = 2        # attn TP all-reduce + MoE dispatch/combine.
-                                 # MEASURED: a64fx/utofu-tests/moe_dispatch_bench shows
-                                 # real multi-TNI dispatch+combine = 0.88-0.93x of 2x
-                                 # tree-all-reduce under UNIFORM routing (proxy ~right,
-                                 # slightly conservative) -- but only with multi-TNI;
-                                 # naive single-TNI is ~2.8x. Under SKEWED routing (hot
-                                 # experts) real cost is 2.2-2.7x this proxy (hot-link
-                                 # congestion) -- derate for imbalance. This is the
-                                 # load-balanced case.
+HOP_BW           = 6.36e9        # uTofu per-link payload BW (B/s); pp_handoff_bench (#14)
+                                 # CONFIRMS one P2P hop = exactly one TofuD link
+                                 # (6.33 GB/s measured @3 MiB) and is torus-distance-free.
+
+# Per-layer comm: instead of a flat "2 tree all-reduces", use the MEASURED best-case
+# cost of each real collective, expressed as a multiple of ONE fused recursive-doubling
+# tree all-reduce (tree_steps*per_hop -- itself an UPPER BOUND). All ratios measured on
+# the 12-node 2x3x2 in-unit torus, a64fx/utofu-tests:
+#   * Attention TP all-reduce, done as decomposed multi-TNI reduce-scatter + all-gather
+#     (reducescatter_bench, #13): 0.52x the fused tree at B=1 decode (0.23x at B=256).
+#     Caveat: a real RS also does N-1 shard-sized vector adds the fused tree folds in --
+#     negligible at decode shard sizes, grows with batch.
+#   * MoE dispatch+combine, real multi-TNI all-to-all (moe_dispatch_bench, #10): 0.88-0.93x
+#     of TWO fused trees under UNIFORM routing -> ~1.8 trees; only multi-TNI achieves this
+#     (naive single-TNI is ~2.8x one tree). Under SKEWED routing (hot experts) it is
+#     2.18-2.72x of two trees -> ~4.5 trees: traffic concentrates on hot destination links,
+#     agg BW halves (85->36 GB/s), and multi-TNI cannot rescue a single congested link (#5).
+ATTN_ALLREDUCE_TREES = 0.5                       # decomposed RS+AG vs fused tree (#13, decode)
+MOE_DISPATCH_TREES   = {"uniform": 1.8, "skew": 4.5}  # dispatch+combine vs one tree (#10)
+MOE_LAYERS           = 75        # MoE layers (78 total - 3 leading dense); attn all-reduce
+                                 # runs on all N_LAYERS, MoE dispatch only on these.
 
 GIB = 1024**3
 
@@ -96,7 +110,7 @@ def pick_tp(nodes):
 
 
 def estimate(bits, nodes, ctx, batch, kv_bytes, idx_bytes, act_bytes,
-             tp=None, derate=1.0, bw_per_node=BW_PER_NODE):
+             tp=None, derate=1.0, bw_per_node=BW_PER_NODE, route="uniform"):
     tp = tp or pick_tp(nodes)
 
     # ---- per-token weight read (amortizes over batch: GEMV -> GEMM) ----
@@ -114,11 +128,14 @@ def estimate(bits, nodes, ctx, batch, kv_bytes, idx_bytes, act_bytes,
     mem_traffic_step = weight_read + attn_read * batch       # weights shared, KV per-seq
     t_mem = mem_traffic_step / agg_bw
 
-    # ---- comm-bound step time ----
-    payload = HIDDEN * act_bytes * batch                     # all-reduce payload / step
-    per_hop = HOP_FIXED_S + payload / HOP_BW
-    per_collective = tree_steps(tp) * per_hop
-    t_comm = N_LAYERS * COLLECTIVES_PER_LAYER * per_collective
+    # ---- comm-bound step time (measured per-collective costs, not a flat proxy) ----
+    payload = HIDDEN * act_bytes * batch                     # collective payload / step
+    per_hop = HOP_FIXED_S + payload / HOP_BW                 # one Tofu link (#14)
+    tree    = tree_steps(tp) * per_hop                       # one fused all-reduce (upper bound)
+    moe_trees = MOE_DISPATCH_TREES.get(route, MOE_DISPATCH_TREES["uniform"])
+    attn_comm = N_LAYERS  * ATTN_ALLREDUCE_TREES * tree      # TP all-reduce, every layer (#13)
+    moe_comm  = MOE_LAYERS * moe_trees           * tree      # dispatch+combine, MoE layers (#10)
+    t_comm = attn_comm + moe_comm
 
     # ---- combine (overlap -> max; also report no-overlap sum) ----
     t_overlap = max(t_mem, t_comm) / derate
@@ -140,6 +157,8 @@ def estimate(bits, nodes, ctx, batch, kv_bytes, idx_bytes, act_bytes,
         "attn_gb": attn_read / 1e9,
         "t_mem_ms": t_mem * 1e3,
         "t_comm_ms": t_comm * 1e3,
+        "t_attn_comm_ms": attn_comm * 1e3,
+        "t_moe_comm_ms": moe_comm * 1e3,
         "t_overlap_ms": t_overlap * 1e3,
         "t_serial_ms": t_serial * 1e3,
         "agg_toks_overlap": batch / t_overlap,
@@ -173,6 +192,8 @@ def main():
     p.add_argument("--act-bytes", type=float, default=2.0, help="activation/all-reduce dtype bytes")
     p.add_argument("--derate", type=float, default=1.0, help="efficiency derate (e.g. 0.4 = 2.5x slower)")
     p.add_argument("--bw", type=float, default=BW_PER_NODE/1e9, help="realized BW GB/s/node")
+    p.add_argument("--route", choices=("uniform", "skew"), default="uniform",
+                   help="MoE routing: uniform (load-balanced, optimistic) or skew (hot experts, ~2.5x MoE comm)")
     p.add_argument("--sweep", action="store_true", help="print the canonical bits x nodes table")
     args = p.parse_args()
 
@@ -180,13 +201,14 @@ def main():
 
     if args.sweep:
         print(f"GLM-5.1 decode roofline @ ctx={args.ctx:,} batch={args.batch} "
-              f"BW={args.bw:.0f}GB/s/node derate={args.derate}")
+              f"BW={args.bw:.0f}GB/s/node derate={args.derate} route={args.route}")
         print("-" * 118)
         for bits in (2, 4, 8, 16):
             for nodes in (12, 24, 48, 60, 96, 192):
                 r = estimate(bits, nodes, args.ctx, args.batch,
                              args.kv_bytes, args.idx_bytes, args.act_bytes,
-                             tp=(args.tp or None), derate=args.derate, bw_per_node=bw)
+                             tp=(args.tp or None), derate=args.derate, bw_per_node=bw,
+                             route=args.route)
                 print(fmt_row(f"{bits}-bit / {nodes} nodes", r))
             print()
         return
@@ -194,13 +216,14 @@ def main():
     bits_list  = [int(x) for x in str(args.bits).split(",")]
     nodes_list = [int(x) for x in str(args.nodes).split(",")]
     print(f"GLM-5.1 decode roofline @ ctx={args.ctx:,} batch={args.batch} "
-          f"BW={args.bw:.0f}GB/s/node derate={args.derate}")
+          f"BW={args.bw:.0f}GB/s/node derate={args.derate} route={args.route}")
     print("-" * 118)
     for bits in bits_list:
         for nodes in nodes_list:
             r = estimate(bits, nodes, args.ctx, args.batch,
                          args.kv_bytes, args.idx_bytes, args.act_bytes,
-                         tp=(args.tp or None), derate=args.derate, bw_per_node=bw)
+                         tp=(args.tp or None), derate=args.derate, bw_per_node=bw,
+                         route=args.route)
             print(fmt_row(f"{bits}-bit / {nodes} nodes", r))
 
 
