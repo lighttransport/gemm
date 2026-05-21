@@ -20,7 +20,7 @@ distributed-attention budget.
 | `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
 | `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
 | `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`). Uses the **production qpacked+ktbl QK kernel** (svtbl K-broadcast, K_DP `[p][d][kv]`, no svaddv) — see finding #9 |
-| `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, all 6 Tofu axes `x→y→z→a→b→c`, `MOE_DIMORDER`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins) and #11 (dimensional relay dead end in-unit; 6-axis multi-unit harness ready) |
+| `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, all 6 Tofu axes `x→y→z→a→b→c`, `MOE_DIMORDER`) / Bruck logarithmic-index all-to-all (variant `e`, `MOE_BRUCK`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins), #11 (dimensional relay dead end in-unit; 6-axis multi-unit harness ready), #15 (Bruck dead end) |
 | `allgather_bench.c` | **all-gather** (the BW-optimal *half* of an all-reduce; TP sequence-parallel hidden / KV-shard gather): naive single-TNI all-broadcast / multi-TNI all-broadcast / ring all-gather / recursive-doubling all-gather (Rabenseifner non-pow2), plus the tree all-reduce baseline for the roofline ratio. `AG_BATCH`/`AG_SHARD`/`AG_NTNI` — see finding #12 |
 | `reducescatter_bench.c` | **reduce-scatter** (the *other* BW-optimal half; the all-reduce = reduce-scatter + all-gather decomposition): naive single-TNI direct scatter / multi-TNI direct scatter / ring reduce-scatter, plus a multi-TNI all-gather and the fused tree all-reduce so the decomposed pair is compared to the fused tree in one run. Shares `AG_*` knobs with `allgather_bench` — see finding #13 |
 | `pp_handoff_bench.c` | **pipeline-parallel handoff** (the point-to-point inter-stage send/recv — the comm pattern that *replaces* per-layer collectives): ping-pong one-hop (near vs far for distance sensitivity) / full forward+backward store-and-forward chain `0→…→S-1→…→0` / tree all-reduce baseline (the TP per-layer cost it trades against). `PP_HID`/`PP_ABYTES`/`PP_BATCH`/`PP_FAR` — see finding #14 |
@@ -49,8 +49,9 @@ RA_SEQ=16384 RA_GROUPS=4 RA_ITERS=500 TF_HW_BARRIER=1 mpiexec -np 12 ./ring_attn
 # MoE expert-dispatch all-to-all (B=1 decode vs B=256 batched; MOE_NTNI sweeps TNIs)
 MOE_BATCH=1   MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
 MOE_BATCH=256 MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
-# skewed routing (hot experts) + dimensional relay variant (MOE_DIMORDER, MOE_RELAY=0 to skip)
-MOE_BATCH=256 MOE_ROUTE=worst MOE_DIMORDER=bac mpiexec -np 12 ./moe_dispatch_bench
+# skewed routing (hot experts) + dimensional relay (MOE_DIMORDER, MOE_RELAY=0 skips) +
+# Bruck variant (MOE_BRUCK=0 skips). worst-route at B=256 needs MOE_ITERS=300 (see #15).
+MOE_BATCH=256 MOE_ROUTE=worst MOE_ITERS=300 MOE_DIMORDER=bac mpiexec -np 12 ./moe_dispatch_bench
 # all-gather (B=1 decode = latency-bound; B=256 batched = bandwidth-bound; AG_NTNI sweeps TNIs)
 AG_BATCH=1   AG_NTNI=6 mpiexec -np 12 ./allgather_bench
 AG_BATCH=256 AG_NTNI=6 mpiexec -np 12 ./allgather_bench
@@ -622,6 +623,54 @@ per-layer all-reduce sum. But decode's M=1 makes the bubble 92%, so PP is a
 throughput (large-M) lever, not a latency one. `decode_estimate.py`'s collective
 terms model TP; a PP variant would replace them with `(S-1)·t_hop / (1-bubble)`.**
 
+### 15. Bruck logarithmic all-to-all is a **dead end** for MoE dispatch (`moe_dispatch_bench` variant `e`)
+
+The last untested all-to-all schedule: the classic **Bruck** index algorithm
+(`MOE_BRUCK=1`, default on), which trades **message count for byte volume** —
+`⌈log₂N⌉` doubling steps instead of N−1 sends. Step `z` sends the blocks whose
+index has bit `z` set to `dst=(i+2^z)%N` and receives the mirror set from
+`src=(i−2^z)%N`, with a final inverse rotation mapping each received block back to
+its originator (verified: every rank's slot `(i−s)%N` ends holding source `s`'s
+block). Unlike the dimensional relay (#11) it needs **no Cartesian grid** — it runs
+for any N≥2 — but it requires **uniform blocks**, so every per-pair payload is
+padded to the global max pair count. Single TNI (each step hits one peer, so there
+is nothing to stripe across rails). 12 nodes → 4 steps. It **loses in every regime:**
+
+```
+regime                 multiTNI(dc)  bruck(dc)  bruck/multiTNI  bruck/naive  wire/useful  bruck/(2·tree)
+B=1   decode           34.8 us       246 us     7.06×           3.85×        7.50×        6.61
+B=256 uniform          6565 us       16657 us   2.54×           0.79×        2.09×        2.25
+B=256 worst (skew)     16436 us      56280 us   3.42×           1.36×        7.08×        7.59
+```
+
+Two root causes, both structural — the *same* failure mode as #5 (single-peer
+striping) and #11 (dimensional relay):
+1. **It collapses the all-to-all into a few fat single-link rounds.** Each step
+   targets one peer, so the 6 TNIs across distinct destinations — the *only* thing
+   that gives direct multi-TNI its ~3× win (#10) — cannot be used. Cutting the
+   message count 11→4 doesn't pay because MoE all-to-all on TofuD is
+   **bandwidth/padding-bound, not message-count-bound** (the regime where Bruck
+   classically wins is tiny dense messages, latency-bound — not 12 KiB+ blocks).
+2. **Uniform-block padding inflates the wire 2.1–7.5×.** MoE routing is sparse
+   (B=1: 5 of 11 pairs active, counts ≈1) and skewed (worst: 3 of 11 pairs, one at
+   725× the rest), so padding *every* block to the global max moves enormous dead
+   bytes. Padding is worst exactly where it hurts most — sparse B=1 (7.5×) and
+   skewed B=256 (7.1×); only dense-uniform B=256 keeps it to 2.1×.
+
+Bruck beats *naive single-TNI* only in the one dense-uniform case (0.79×), and only
+because naive is so bad — same non-win as the relay. It never approaches multi-TNI.
+**Takeaway: direct multi-TNI all-to-all (#10) remains the answer; both software
+all-to-all reschedulings tested (dimensional relay #11, Bruck #15) lose for the same
+reason — they give up the multi-rail, distinct-destination concurrency that is the
+torus's actual lever, and add padding/forwarding bytes on top.** This closes the
+all-to-all schedule space for the single-unit torus.
+
+(Note: the B=256 *worst*-route run needs `MOE_ITERS≈300` — at the default 2000 the
+huge skewed payloads make the four direct phases finish tens of seconds apart, and
+the un-barriered **tree** baseline phase, which a fast rank enters while a slow rank
+is still draining, trips its 30 s wait. Lower iters keep the cross-phase skew bounded;
+the timing is unaffected since each iter already moves ~GB.)
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -708,7 +757,9 @@ c07f425  moe_dispatch_bench — dimensional store-and-forward variant (dead end,
 14f0a43  allgather_bench — all-gather (multi-TNI wins; recursive-doubling trap, #12)
 e317b82  moe_dispatch_bench — relay extended to all 6 Tofu axes (multi-unit ready, #11)
 f12ee81  reducescatter_bench — reduce-scatter mirrors all-gather; decompose all-reduce beats fused tree 2-4× (#13)
-(this)   pp_handoff_bench — pipeline-parallel handoff: one link/hop, distance-free, bubble-bound (#14)
+51e8a4f  pp_handoff_bench — pipeline-parallel handoff: one link/hop, distance-free, bubble-bound (#14)
+5814272  decode_estimate — replace flat 2×-tree comm proxy with measured per-collective costs
+(this)   moe_dispatch_bench — Bruck logarithmic-index all-to-all (variant e, dead end, #15)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
