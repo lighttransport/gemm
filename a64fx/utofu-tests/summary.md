@@ -20,7 +20,7 @@ distributed-attention budget.
 | `tni_stripe_bench.c` | multi-TNI striping microbench: 2-rank ping-pong, stripes one hop's payload across K TNIs to the *same* peer, sweep K via `TS_NTNI` |
 | `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
 | `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`). Uses the **production qpacked+ktbl QK kernel** (svtbl K-broadcast, K_DP `[p][d][kv]`, no svaddv) — see finding #9 |
-| `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline over a deterministic shared routing matrix — see finding #10 |
+| `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, `MOE_DIMORDER`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins) and #11 (dimensional relay dead end) |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -46,6 +46,8 @@ RA_SEQ=16384 RA_GROUPS=4 RA_ITERS=500 TF_HW_BARRIER=1 mpiexec -np 12 ./ring_attn
 # MoE expert-dispatch all-to-all (B=1 decode vs B=256 batched; MOE_NTNI sweeps TNIs)
 MOE_BATCH=1   MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
 MOE_BATCH=256 MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
+# skewed routing (hot experts) + dimensional relay variant (MOE_DIMORDER, MOE_RELAY=0 to skip)
+MOE_BATCH=256 MOE_ROUTE=worst MOE_DIMORDER=bac mpiexec -np 12 ./moe_dispatch_bench
 ```
 Rank-0 reports are also written to `ra_log_<coords>.txt` / `rao_log_<coords>.txt`
 / `raa_log_<coords>.txt` / `moe_log_<coords>.txt` (mpiexec swallows rank-0 stdout
@@ -412,6 +414,50 @@ the absolute cost is set by the hottest link. Practical implication: the MoE
 comm budget should be derated for routing skew (or kept near-uniform with an
 auxiliary load-balancing loss + capacity factor, the standard EP mitigation).
 
+### 11. Dimensional (store-and-forward) all-to-all is a **dead end** on the in-unit torus (`moe_dispatch_bench` variant `d`)
+
+The open question from finding #10 was whether an **axis-aware** schedule could
+beat the round-robin multi-TNI's ~3× cap and, especially, relieve the hot-link
+congestion that wrecks all-to-all under skew. Variant `d` (`MOE_RELAY=1`, default
+on) implements the textbook **dimension-ordered store-and-forward** all-to-all
+along the 2×3×2 in-unit torus axes a→b→c (`coords[3..5]`): each message hops one
+axis per phase, and intermediate nodes **aggregate and forward** (Bruck-style),
+so every Put is a single-axis line send rather than a hardware multi-hop route.
+Per-phase bundle byte sizes are derived analytically from the shared count matrix
+(no real data needed). It **loses in every regime:**
+
+```
+regime                 multi-TNI(dc)   relay(dc)    relay/multiTNI   relay wire/useful
+B=1   decode           34.6 us         98.4 us      2.84×            1.69×
+B=256 uniform          5832 us         14310 us     2.45×            1.66×
+B=64  worst (skew)     4009 us         8608 us      2.15×            1.67×
+B=256 worst (skew)     16283 us        36018 us     2.21×            1.67×
+```
+
+Four reasons, none fixable by scheduling:
+1. **Three sequential phases** serialize — pure latency tax, fatal at B=1 (small
+   messages), where direct multi-TNI just fires N−1 concurrent Puts.
+2. **Forwarding moves 1.66–1.69× the useful bytes** (each byte re-sent at every
+   axis it must traverse) — a structural bandwidth penalty.
+3. **It does NOT relieve hot-link congestion.** Store-and-forward funnels a hot
+   destination's *entire* incoming column through its few final-hop line-neighbors,
+   so the hot node's ingest stays bottlenecked exactly as in direct routing —
+   relay/multi-TNI ratio is ~2.2× under skew, same as uniform.
+4. The **TofuD hardware already routes multi-hop well**, and multi-TNI already
+   parallelizes across distinct destinations (finding #10, ~3× agg BW). Software
+   dimensional routing only piles overhead on top.
+
+Dimension order has a secondary effect (~13%: `MOE_DIMORDER=bac`, the extent-3
+axis first, is best under skew) but never closes the ~2× gap. Relay still beats
+*naive single-TNI* (~0.86×) only because naive is so bad — that is not a win.
+Also surfaced here: a **single uTofu Put caps at ~16 MiB** (12.6 MB completes,
+25.3 MB hangs); the aggregated relay bundles exceed it under skew, so `relay_put`
+chunks at 8 MiB — relevant for any large batched payload, not just relay.
+**Takeaway: stick with direct multi-TNI all-to-all (finding #10); the single-unit
+torus is too small and too well-served by hardware routing for software dimension
+ordering to pay.** (Across *multiple* units — inter-unit Tofu axes with real
+multi-hop distance — the trade-off could differ; untested here.)
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -488,6 +534,9 @@ auxiliary load-balancing loss + capacity factor, the standard EP mitigation).
 07c0c67  ring_attn_async — across-step async driver + EL0 HW barrier
 5110468  ring_attn_async — production qpacked+ktbl QK kernel (svtbl, K_DP)
 ae8e731  moe_dispatch_bench — MoE expert-dispatch all-to-all (multi-TNI)
+57bc9f7  decode roofline: fold MoE dispatch all-to-all result in
+0db2fe1  docs: MoE roofline holds only under uniform routing; skew 2.2-2.7×
+(this)   moe_dispatch_bench — dimensional store-and-forward variant (dead end, #11)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
