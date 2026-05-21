@@ -21,6 +21,7 @@ distributed-attention budget.
 | `ring_attn_overlap.c` | **comm/compute OVERLAP validation with REAL attention math** (the one bench that does GEMM-like work): real flash-decode (bf16 KV, SVE softmax) + real online-softmax ring-reduce + a head-group pipeline; tests whether comm actually hides under compute |
 | `ring_attn_async.c` | **across-step async comm driver + A64FX HW barrier** (libhwb): overlaps the *full* online-softmax all-reduce of step k−1 (thread 0) with step-k compute (threads 1..47), double-buffered, 2 barriers/step; compares SERIAL / ASYNC-across-step / head-group PIPE under a flat OpenMP barrier vs the EL0 hardware barrier (`TF_HW_BARRIER`). Uses the **production qpacked+ktbl QK kernel** (svtbl K-broadcast, K_DP `[p][d][kv]`, no svaddv) — see finding #9 |
 | `moe_dispatch_bench.c` | **MoE expert-dispatch all-to-all** (the *other* half of decode comm): top-8-of-256 routing scattered to expert-owning ranks then gathered back. Naive single-TNI / multi-TNI distinct-destination / tree-all-reduce baseline / dimension-ordered store-and-forward relay (variant `d`, `MOE_DIMORDER`) over a deterministic shared routing matrix — see findings #10 (multi-TNI wins) and #11 (dimensional relay dead end) |
+| `allgather_bench.c` | **all-gather** (the BW-optimal *half* of an all-reduce; TP sequence-parallel hidden / KV-shard gather): naive single-TNI all-broadcast / multi-TNI all-broadcast / ring all-gather / recursive-doubling all-gather (Rabenseifner non-pow2), plus the tree all-reduce baseline for the roofline ratio. `AG_BATCH`/`AG_SHARD`/`AG_NTNI` — see finding #12 |
 | `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
@@ -48,10 +49,13 @@ MOE_BATCH=1   MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
 MOE_BATCH=256 MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
 # skewed routing (hot experts) + dimensional relay variant (MOE_DIMORDER, MOE_RELAY=0 to skip)
 MOE_BATCH=256 MOE_ROUTE=worst MOE_DIMORDER=bac mpiexec -np 12 ./moe_dispatch_bench
+# all-gather (B=1 decode = latency-bound; B=256 batched = bandwidth-bound; AG_NTNI sweeps TNIs)
+AG_BATCH=1   AG_NTNI=6 mpiexec -np 12 ./allgather_bench
+AG_BATCH=256 AG_NTNI=6 mpiexec -np 12 ./allgather_bench
 ```
 Rank-0 reports are also written to `ra_log_<coords>.txt` / `rao_log_<coords>.txt`
-/ `raa_log_<coords>.txt` / `moe_log_<coords>.txt` (mpiexec swallows rank-0 stdout
-on this node, so read the log file).
+/ `raa_log_<coords>.txt` / `moe_log_<coords>.txt` / `ag_log_<coords>.txt` (mpiexec
+swallows rank-0 stdout on this node, so read the log file).
 
 ## The model
 
@@ -458,6 +462,55 @@ torus is too small and too well-served by hardware routing for software dimensio
 ordering to pay.** (Across *multiple* units — inter-unit Tofu axes with real
 multi-hop distance — the trade-off could differ; untested here.)
 
+### 12. All-gather: multi-TNI all-broadcast wins **both** regimes; recursive-doubling is a non-pow2 trap (`allgather_bench`)
+
+All-gather is the third collective the suite now covers — the **bandwidth-optimal
+half of an all-reduce** (all-reduce = reduce-scatter + all-gather) and the concrete
+cost of reconstructing a sequence-parallel sharded hidden vector (or gathering KV /
+sharded weights) across TP ranks. Each rank owns `HID·abytes·B / N` of the vector
+and gathers the rest. Four transports over the same gather result, plus the tree
+all-reduce baseline:
+
+```
+                              B=1 decode (1 KiB shard)   B=256 batched (256 KiB shard)
+naive (1-TNI all-broadcast)   14.99 us                   1160 us
+multi-TNI all-broadcast       4.93 us  (×3.04 vs naive)  436 us  (×2.66 vs naive)  <- WINS both
+ring all-gather               15.68 us (×0.96)           470 us  (×2.47)
+recursive-doubling (Rab.)     13.02 us (×1.15)           1532 us (×0.76 — worse than naive!)
+tree all-reduce (full vec)    18.39 us                   3707 us
+RATIO best_all-gather / tree  0.27                       0.12
+```
+
+Findings:
+1. **Multi-TNI all-broadcast is the single robust winner.** Just fire the N−1
+   independent "send my shard to peer p" Puts round-robined over the 6 TNIs and
+   drain per-TNI. No ring/recursive structure needed. NTNI sweep at B=256:
+   ×1.00 / 1.13 / 2.22 / 2.63 for NTNI=1/2/3/6 — the **same sub-linear ~3× cap as
+   finding #10** (distinct destinations start sharing torus axis links past ~3–4
+   TNIs). It wins in the latency-bound decode regime (×3.04, because N−1 concurrent
+   small Puts beat any serial-dependency schedule) *and* ties/edges ring in the
+   bandwidth-bound regime.
+2. **Recursive-doubling all-gather is a trap on 12 (non-pow2) nodes.** It is the
+   latency-optimal small-message pattern in theory and the direct analog of the
+   tree all-reduce that wins finding #3 — but the Rabenseifner non-pow2 fold makes
+   it **over-move bytes**: each paired-odd rank sends 2+4+8 (doubling) + 12
+   (fold-out) ≈ 26 shards vs ring's 11, all on one serial TNI. So in the
+   bandwidth-bound regime it is the *worst* variant (×0.31 of ring, slower than
+   even naive). In the latency-bound regime its fewer steps (log N + fold) only
+   modestly beat ring (×1.20) and lose badly to multi-TNI. The tree-beats-ring
+   result of finding #3 does **not** carry over to all-gather here.
+3. **All-gather is much cheaper than a full all-reduce** — 0.27× (decode) to 0.12×
+   (batched) of the tree all-reduce, because all-reduce moves ≈NRounds×full bytes
+   while all-gather moves ≈1×full. So `decode_estimate.py`'s all-reduce term is a
+   conservative bound for any gather-only TP comm (and reduce-scatter, its mirror,
+   is the same cheap half). The 0.12 batched ratio shows the gather is firmly
+   bandwidth-bound there; the 0.27 decode ratio is fixed-cost-bound.
+
+**Takeaway: for any fan-out-to-all-peers collective (all-gather, MoE dispatch),
+multi-TNI distinct-destination Puts are the right primitive in every regime; ring
+is an acceptable BW-optimal fallback; skip recursive-doubling all-gather on
+non-power-of-2 node counts.**
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -471,7 +524,11 @@ multi-hop distance — the trade-off could differ; untested here.)
   at once, which is **real and measured** (finding #10): a multi-TNI all-to-all
   is ~3× the single-TNI one (sub-linear past ~4 TNIs as distinct destinations
   start sharing torus axis links). Reach for it whenever the collective fans out
-  to many peers (MoE dispatch), not when it targets one peer per step (ring/tree).
+  to many peers (MoE dispatch **and all-gather**, finding #12), not when it targets
+  one peer per step (ring/tree). For all-gather specifically it beats ring,
+  recursive-doubling and naive in *both* the latency- and bandwidth-bound regimes;
+  **skip recursive-doubling all-gather on non-power-of-2 node counts** (the
+  Rabenseifner fold over-moves bytes — finding #12).
 - **Send the reduce payload in bf16, not fp32** (`RA_RBYTES=2`) — the one
   single-peer knob that works: ring-reduce −35% (41.9→27.1 µs), tree −42%
   (23.6→13.6 µs), attn-only upper bound +54%. Keep `m` (and ideally `l`) fp32,
@@ -536,7 +593,8 @@ multi-hop distance — the trade-off could differ; untested here.)
 ae8e731  moe_dispatch_bench — MoE expert-dispatch all-to-all (multi-TNI)
 57bc9f7  decode roofline: fold MoE dispatch all-to-all result in
 0db2fe1  docs: MoE roofline holds only under uniform routing; skew 2.2-2.7×
-(this)   moe_dispatch_bench — dimensional store-and-forward variant (dead end, #11)
+c07f425  moe_dispatch_bench — dimensional store-and-forward variant (dead end, #11)
+(this)   allgather_bench — all-gather (multi-TNI wins; recursive-doubling trap, #12)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
