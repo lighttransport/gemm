@@ -401,10 +401,20 @@ static int run_generate(hip_flux2_runner *r, const char *dit_path,
         for (int i = 0; i < n_txt_real * txt_dim; i++) txt_hidden[i] = 0.01f * randn();
     }
 
-    /* Front-pad text to 512 tokens (ComfyUI convention). */
-    const int N_TXT = 512;
+    /* Front-pad text to 512 tokens (ComfyUI convention). FLUX2_NTXT overrides:
+     * =0 -> no pad beyond rounding real tokens up to a multiple of 16 (matches
+     * diffusers attention_mask, much less attention work); =N -> pad to N. The
+     * padded txt tokens are non-zero after txt_in (bias) so they DO affect
+     * attention — reducing the pad changes the sample. */
+    int N_TXT = 0;  /* default: no pad — only real tokens (rounded to 16),
+                     * matching diffusers attention_mask. FLUX2_NTXT=512 restores
+                     * the ComfyUI front-pad. */
+    { const char *e = getenv("FLUX2_NTXT"); if (e) N_TXT = atoi(e); }
+    int n_txt_min = ((n_txt_real + 15) / 16) * 16;
+    if (N_TXT < n_txt_min) N_TXT = n_txt_min;
     float *txt_padded = front_pad_text(txt_hidden, n_txt_real, txt_dim, N_TXT);
     int n_txt = N_TXT;
+    fprintf(stderr, "generate: n_txt=%d (real=%d)\n", n_txt, n_txt_real);
 
     /* Now load DiT + VAE (the text encoder has been freed above, so its VRAM is
      * reclaimed). */
