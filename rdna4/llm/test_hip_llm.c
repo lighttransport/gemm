@@ -225,6 +225,36 @@ int main(int argc, char **argv) {
     const char *bench_qmv_type = NULL; /* --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS] */
     int bench_qmv_rows = 0, bench_qmv_cols = 0, bench_qmv_iters = 0, bench_qmv_repeats = 1;
 
+    /* --st <qwen3.safetensors>: sanity-check the safetensors loader + hidden
+     * snapshots (text-encoder path). Loads, runs a few forwards, prints snapshot
+     * norms (finite + reasonable = loader OK), then exits. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--st") == 0 && i + 1 < argc) {
+            const char *st_path = argv[i + 1];
+            hip_llm_runner *r = hip_llm_init(0, 1);
+            if (!r || hip_llm_load_weights_qwen3_safetensors(r, st_path, 512) != 0) {
+                fprintf(stderr, "--st: load failed\n"); return 1;
+            }
+            int hs[3] = {8, 17, 26};
+            if (hip_llm_set_hidden_snapshot_layers(r, hs, 3) != 0) { fprintf(stderr, "--st: set snapshots failed\n"); return 1; }
+            int n = hip_llm_n_embd(r);
+            float *snap = (float *)malloc((size_t)3 * n * sizeof(float));
+            hip_llm_reset_state(r);
+            for (int pos = 0; pos < 5; pos++) {
+                int32_t tok = (int32_t)(100 + pos);
+                if (!hip_llm_forward(r, tok, pos)) { fprintf(stderr, "--st: forward failed at pos %d\n", pos); return 1; }
+                if (hip_llm_read_hidden_snapshots(r, snap, 3, n) != 0) { fprintf(stderr, "--st: read snapshots failed\n"); return 1; }
+                for (int s = 0; s < 3; s++) {
+                    double nn = 0; int nan = 0;
+                    for (int j = 0; j < n; j++) { float v = snap[s*n+j]; if (v != v) nan = 1; nn += (double)v*v; }
+                    printf("pos %d  layer[%d]  norm=%.4f  first=%.5f%s\n", pos, hs[s], sqrt(nn), snap[s*n], nan ? "  NaN!" : "");
+                }
+            }
+            free(snap); hip_llm_free(r);
+            return 0;
+        }
+    }
+
     /* Parse args */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--verify-quant-kernels") == 0) {
