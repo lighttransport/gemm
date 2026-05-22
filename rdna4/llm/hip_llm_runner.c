@@ -20,6 +20,10 @@
 #include "../../common/ggml_dequant.h"
 #include "../../common/transformer.h"
 
+/* safetensors loader (header-only) for the Qwen3 text-encoder weight path */
+#define SAFETENSORS_IMPLEMENTATION
+#include "../../common/safetensors.h"
+
 /* hip_runner_common.h: HIP_CHECK, hip_f32_to_f16, hip_upload_raw, hip_compile_kernels */
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
@@ -4374,6 +4378,12 @@ struct hip_llm_runner {
     /* Phase 4 WMMA decode matvec */
     hipFunction_t fn_matvec_f16_wmma_f32;
 
+    /* Hidden-state snapshots (text-encoder path): capture up to 3 layers'
+     * post-residual hidden state during forward into d_hidden_snapshots. */
+    int   hidden_snapshot_layers[3];
+    int   n_hidden_snapshots;
+    void *d_hidden_snapshots;   /* device [3 * n_embd] f32 */
+
     /* Model params */
     int n_layers;
     int n_embd;
@@ -4931,6 +4941,136 @@ static void launch_convert_f16_to_bf16_loadtime(hip_llm_runner *r, void *dst,
 /* Phase 5 graph capture: defined far below (needs launch helpers + body). */
 static void hip_llm_phase5_capture(hip_llm_runner *r);
 
+static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len);
+
+/* ======================================================================== */
+/* Qwen3 safetensors weight load (text-encoder path for Flux.2 Klein).      */
+/* Builds qtensor views over the BF16/F32 safetensors data and reuses the   */
+/* same upload_weight_matrix / upload_norm_f32 helpers as the GGUF path.    */
+/* ======================================================================== */
+
+/* Build a qtensor view of a safetensors tensor (no copy). n_cols = innermost
+ * (contiguous) dim, matching the GGUF qtensor convention used by the upload
+ * helpers; safetensors [out,in] row-major == GGUF byte layout (no transpose). */
+static qtensor hllm_st_load_tensor(st_context *st, const char *name, int required) {
+    qtensor t = {0};
+    int idx = safetensors_find(st, name);
+    if (idx < 0) {
+        if (required) fprintf(stderr, "hip_llm: missing safetensors tensor '%s'\n", name);
+        return t;
+    }
+    const char *dt = safetensors_dtype(st, idx);
+    if      (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_BF16;
+    else if (strcmp(dt, "F16")  == 0) t.type = GGML_TYPE_F16;
+    else if (strcmp(dt, "F32")  == 0) t.type = GGML_TYPE_F32;
+    else { fprintf(stderr, "hip_llm: unsupported safetensors dtype '%s' for '%s'\n", dt, name); return t; }
+    int nd = safetensors_ndims(st, idx);
+    const uint64_t *sh = safetensors_shape(st, idx);
+    t.n_dims = nd;
+    if (nd >= 2) { t.n_cols = (int)sh[nd - 1]; uint64_t rows = 1; for (int d = 0; d < nd - 1; d++) rows *= sh[d]; t.n_rows = (int)rows; }
+    else if (nd == 1) { t.n_cols = (int)sh[0]; t.n_rows = 1; }
+    for (int d = 0; d < nd && d < 4; d++) t.dims[d] = (int)sh[d];
+    t.data = safetensors_data(st, idx);
+    return t;
+}
+
+int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len) {
+    if (!r || !model_path) return -1;
+    st_context *st = safetensors_open(model_path);
+    if (!st) { fprintf(stderr, "hip_llm: failed to open safetensors '%s'\n", model_path); return -1; }
+
+    /* Discover layer count from tensor names. */
+    int n_layers = 0;
+    for (int i = 0; i < st->n_tensors; i++) {
+        const char *nm = safetensors_name(st, i);
+        if (strncmp(nm, "model.layers.", 13) == 0) {
+            int l = atoi(nm + 13);
+            if (l + 1 > n_layers) n_layers = l + 1;
+        }
+    }
+    if (n_layers <= 0) { fprintf(stderr, "hip_llm: no model.layers.* tensors in '%s'\n", model_path); safetensors_close(st); return -1; }
+
+    qtensor embd = hllm_st_load_tensor(st, "model.embed_tokens.weight", 1);
+    qtensor q0   = hllm_st_load_tensor(st, "model.layers.0.self_attn.q_proj.weight", 1);
+    qtensor k0   = hllm_st_load_tensor(st, "model.layers.0.self_attn.k_proj.weight", 1);
+    qtensor qn0  = hllm_st_load_tensor(st, "model.layers.0.self_attn.q_norm.weight", 1);
+    qtensor ff0  = hllm_st_load_tensor(st, "model.layers.0.mlp.gate_proj.weight", 1);
+    if (!embd.data || !q0.data || !k0.data || !ff0.data) { safetensors_close(st); return -1; }
+
+    /* embed_tokens.weight is [n_vocab, n_embd] -> n_cols=n_embd, n_rows=n_vocab. */
+    r->n_embd     = embd.n_cols;
+    r->n_vocab    = embd.n_rows;
+    r->n_layers   = n_layers;
+    r->head_dim   = qn0.n_cols ? qn0.n_cols : 128;
+    r->n_heads    = q0.n_rows / r->head_dim;     /* q_proj [n_heads*head_dim, n_embd] */
+    r->n_kv_heads = k0.n_rows / r->head_dim;
+    r->n_ff       = ff0.n_rows;                  /* gate_proj [n_ff, n_embd] */
+    r->rms_norm_eps   = 1e-6f;
+    r->rope_freq_base = 1000000.0f;              /* Qwen3 */
+    r->n_rope_pairs   = 0;
+    r->use_mrope      = 0;
+    r->is_hybrid      = 0;
+    r->is_moe         = 0;
+    r->n_deepstack    = 0;
+    if (max_seq_len <= 0) max_seq_len = 2048;
+    r->max_seq_len = max_seq_len;
+
+    if (r->verbose >= 1)
+        fprintf(stderr, "hip_llm: safetensors qwen3 n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d n_vocab=%d\n",
+                r->n_embd, r->n_heads, r->n_kv_heads, r->n_layers, r->n_ff, r->head_dim, r->n_vocab);
+
+    /* token embeddings (BF16 -> F16 via upload_weight_matrix) */
+    if (upload_weight_matrix(&r->d_token_embd, &embd, &r->token_embd_type) != 0) { safetensors_close(st); return -1; }
+
+    qtensor onorm = hllm_st_load_tensor(st, "model.norm.weight", 1);
+    if (!onorm.data || upload_norm_f32(&r->d_output_norm, &onorm, r->n_embd) != 0) { safetensors_close(st); return -1; }
+
+    /* lm_head tied to embeddings (Qwen3-4B) */
+    r->d_output_w   = r->d_token_embd;
+    r->output_w_type = r->token_embd_type;
+    r->has_lm_head  = 1;
+
+    r->layers = (hip_layer *)calloc(r->n_layers, sizeof(hip_layer));
+    if (!r->layers) { safetensors_close(st); return -1; }
+
+    for (int l = 0; l < r->n_layers; l++) {
+        char name[160];
+        hip_layer *cl = &r->layers[l];
+        qtensor t;
+        cl->is_ssm = 0;
+
+        #define ST_NORM(field, suffix, n) do { \
+            snprintf(name, sizeof(name), "model.layers.%d." suffix ".weight", l); \
+            t = hllm_st_load_tensor(st, name, 1); \
+            if (!t.data || upload_norm_f32(&cl->field, &t, (n)) != 0) { safetensors_close(st); return -1; } \
+        } while (0)
+        #define ST_MAT(field, suffix, rf, cf, tf) do { \
+            snprintf(name, sizeof(name), "model.layers.%d." suffix ".weight", l); \
+            t = hllm_st_load_tensor(st, name, 1); \
+            cl->rf = t.n_rows; cl->cf = t.n_cols; \
+            if (!t.data || upload_weight_matrix(&cl->field, &t, &cl->tf) != 0) { safetensors_close(st); return -1; } \
+        } while (0)
+
+        ST_NORM(attn_norm_w,   "input_layernorm",          r->n_embd);
+        ST_MAT (attn_q_w,      "self_attn.q_proj",  attn_q_rows,      attn_q_cols,      attn_q_type);
+        ST_MAT (attn_k_w,      "self_attn.k_proj",  attn_k_rows,      attn_k_cols,      attn_k_type);
+        ST_MAT (attn_v_w,      "self_attn.v_proj",  attn_v_rows,      attn_v_cols,      attn_v_type);
+        ST_MAT (attn_output_w, "self_attn.o_proj",  attn_output_rows, attn_output_cols, attn_output_type);
+        cl->has_qk_norm = 1;
+        ST_NORM(attn_q_norm_w, "self_attn.q_norm",         r->head_dim);
+        ST_NORM(attn_k_norm_w, "self_attn.k_norm",         r->head_dim);
+        ST_NORM(ffn_norm_w,    "post_attention_layernorm", r->n_embd);
+        ST_MAT (ffn_gate_w,    "mlp.gate_proj",     ffn_gate_rows, ffn_gate_cols, ffn_gate_type);
+        ST_MAT (ffn_up_w,      "mlp.up_proj",       ffn_up_rows,   ffn_up_cols,   ffn_up_type);
+        ST_MAT (ffn_down_w,    "mlp.down_proj",     ffn_down_rows, ffn_down_cols, ffn_down_type);
+        #undef ST_NORM
+        #undef ST_MAT
+    }
+
+    safetensors_close(st);
+    return hip_llm_finalize_load(r, max_seq_len);
+}
+
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -5028,8 +5168,6 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
 
     #undef ARCH_KEY
 
-    int kv_dim = r->n_kv_heads * r->head_dim;
-    int q_dim = r->n_heads * r->head_dim;
 
     if (r->verbose >= 1) {
         fprintf(stderr, "hip_llm: arch=%s n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d\n",
@@ -5265,6 +5403,13 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             if (upload_weight_matrix(&cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
         }
     }
+
+    return hip_llm_finalize_load(r, max_seq_len);
+}
+
+static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
+    int kv_dim = r->n_kv_heads * r->head_dim;
+    int q_dim = r->n_heads * r->head_dim;
 
     /* Allocate KV cache */
     r->d_key_cache = (void **)calloc(r->n_layers, sizeof(void *));
@@ -6567,6 +6712,16 @@ static void forward_blocks_body(hip_llm_runner *r) {
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
     for (int l = 0; l < n_run_layers; l++) {
         forward_one_layer(r, l);
+        /* Text-encoder hidden snapshots: copy this layer's post-residual hidden
+         * state (d_x) into the snapshot buffer. Only active when layers are set
+         * (which also disables graph capture so this inline copy runs). */
+        for (int si = 0; si < r->n_hidden_snapshots; si++) {
+            if (r->hidden_snapshot_layers[si] == l && r->d_hidden_snapshots) {
+                hipMemcpyAsync((char *)r->d_hidden_snapshots + (size_t)si * r->n_embd * sizeof(float),
+                               r->d_x, (size_t)r->n_embd * sizeof(float),
+                               hipMemcpyDeviceToDevice, r->stream);
+            }
+        }
     }
     /* Final RMSNorm */
     launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
@@ -7323,6 +7478,50 @@ int hip_llm_read_hidden(const hip_llm_runner *r, float *dst, int n) {
     if (!r || !dst || n <= 0) return -1;
     hipError_t err = hipMemcpy(dst, r->d_x, (size_t)n * sizeof(float), hipMemcpyDeviceToHost);
     return (err == hipSuccess) ? 0 : -1;
+}
+
+/* Select up to 3 layers whose post-residual hidden state is snapshotted during
+ * each forward (text-encoder path). Allocates the snapshot buffer and disables
+ * graph capture (so the inline snapshot copy in forward_blocks_body runs). */
+int hip_llm_set_hidden_snapshot_layers(hip_llm_runner *r, const int *layers, int n_slots) {
+    if (!r) return -1;
+    if (n_slots < 0 || n_slots > 3) return -1;
+    r->n_hidden_snapshots = 0;
+    for (int i = 0; i < 3; i++) r->hidden_snapshot_layers[i] = -1;
+    for (int i = 0; i < n_slots; i++) {
+        int layer = layers ? layers[i] : -1;
+        if (layer < 0 || layer >= r->n_layers) return -1;
+        r->hidden_snapshot_layers[i] = layer;
+        r->n_hidden_snapshots++;
+    }
+    if (n_slots > 0) {
+        if (!r->d_hidden_snapshots &&
+            hipMalloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)) != hipSuccess)
+            return -1;
+        /* Snapshots require the non-graph forward path (the graph captured at load
+         * predates the snapshot copies). Disable + drop the captured graphs so
+         * hip_llm_forward falls back to forward_blocks_body. */
+        r->graph_disabled = 1;
+        r->graph_ready_hidden = 0;
+        r->graph_ready_logits = 0;
+    }
+    return 0;
+}
+
+/* Read the captured snapshots: dst receives n_slots contiguous [n] blocks
+ * (layout [n_slots, n]). n must equal n_embd. */
+int hip_llm_read_hidden_snapshots(const hip_llm_runner *r, float *dst, int n_slots, int n) {
+    if (!r || !dst || !r->d_hidden_snapshots) return -1;
+    if (n != r->n_embd) return -1;
+    if (n_slots > r->n_hidden_snapshots) n_slots = r->n_hidden_snapshots;
+    hipStreamSynchronize(r->stream);
+    for (int si = 0; si < n_slots; si++) {
+        if (hipMemcpy(dst + (size_t)si * n,
+                      (char *)r->d_hidden_snapshots + (size_t)si * r->n_embd * sizeof(float),
+                      (size_t)n * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess)
+            return -1;
+    }
+    return 0;
 }
 
 void hip_llm_set_debug(hip_llm_runner *r, int debug_layers) {
