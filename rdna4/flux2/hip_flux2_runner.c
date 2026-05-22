@@ -85,6 +85,7 @@ struct hip_flux2_runner {
     hipFunction_t fn_rope_img, fn_rope_txt, fn_bf16_trunc, fn_add;
     /* VAE kernels */
     hipFunction_t fn_vae_im2col, fn_vae_add_bias, fn_vae_transpose, fn_vae_conv1, fn_vae_gnsilu;
+    hipFunction_t fn_vae_transpose_tile;
     hipFunction_t fn_vae_up2x, fn_vae_attn, fn_vae_bn;
     hipFunction_t fn_gemm_bf16w_wmma;   /* BF16 WMMA, F32 weights (VAE convs) */
     int use_vae_gemm_wmma;             /* 1 = VAE conv GEMM via BF16 WMMA */
@@ -559,6 +560,7 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
     hipModuleGetFunction(&r->fn_vae_im2col, mod, "vae_im2col_3x3");
     hipModuleGetFunction(&r->fn_vae_add_bias, mod, "vae_add_bias");
     hipModuleGetFunction(&r->fn_vae_transpose, mod, "vae_transpose_2d");
+    hipModuleGetFunction(&r->fn_vae_transpose_tile, mod, "vae_transpose_tile");
     hipModuleGetFunction(&r->fn_vae_conv1,  mod, "vae_conv2d_1x1");
     hipModuleGetFunction(&r->fn_vae_gnsilu, mod, "vae_groupnorm_silu");
     hipModuleGetFunction(&r->fn_vae_up2x,   mod, "vae_upsample2x");
@@ -1198,47 +1200,57 @@ static void vae_conv3(hip_flux2_runner *r, void *out, void *in,
     int col_w = ci * 9;
     size_t F = sizeof(float);
 
-    /* 1. im2col */
-    void *d_col = vae_alloc((size_t)spatial * col_w * F);
-    {
-        int total = spatial * col_w;
-        void *args[] = {&d_col, &in, &ci, &H, &W};
-        hipModuleLaunchKernel(r->fn_vae_im2col, (unsigned)((total+255)/256), 1, 1,
-                              256, 1, 1, 0, NULL, args, NULL);
-    }
+    /* Tile over spatial so the im2col matrix [tile, col_w] stays bounded.
+     * The whole-image im2col is col_w*spatial floats — 19 GB at 1024² with
+     * ci=512 — which OOMs the card. Cap the im2col scratch at ~512 MB; a single
+     * tile (small spatial, e.g. 256²/512²) is the original whole-image path. */
+    const size_t IM2COL_BUDGET = (size_t)512 << 20;
+    int tile = (int)(IM2COL_BUDGET / ((size_t)col_w * F));
+    if (tile < 4096) tile = 4096;
+    if (tile > spatial) tile = spatial;
 
-    /* 2. GEMM: Y[H*W, co] = col[H*W, ci*9] @ w[co, ci*9]^T */
-    void *d_yt = vae_alloc((size_t)spatial * co * F);
-    {
-        void *null_ptr = NULL;
+    void *d_col = vae_alloc((size_t)tile * col_w * F);
+    void *d_yt  = vae_alloc((size_t)tile * co * F);
+    void *null_ptr = NULL;
+
+    for (int s0 = 0; s0 < spatial; s0 += tile) {
+        int ns = spatial - s0; if (ns > tile) ns = tile;
+
+        /* 1. im2col for pixels [s0, s0+ns) -> d_col[ns, col_w] */
+        {
+            long total = (long)ns * col_w;
+            void *args[] = {&d_col, &in, &ci, &H, &W, &s0, &ns};
+            hipModuleLaunchKernel(r->fn_vae_im2col, (unsigned)((total + 255) / 256), 1, 1,
+                                  256, 1, 1, 0, NULL, args, NULL);
+        }
+
+        /* 2. GEMM: d_yt[ns, co] = d_col[ns, col_w] @ w[co, col_w]^T */
         if (r->use_vae_gemm_wmma && r->fn_gemm_bf16w_wmma) {
-            /* BF16 WMMA (F32 weights), F32 accum — accurate, much faster than the
-             * scalar F32 GEMM for the large-M (M=spatial) VAE conv. */
             float one = 1.0f;
-            void *ga[] = {&d_yt, &w, &d_col, &null_ptr, &co, &col_w, &spatial, &one};
+            void *ga[] = {&d_yt, &w, &d_col, &null_ptr, &co, &col_w, &ns, &one};
             unsigned gx = (unsigned)((co + 127) / 128);
-            unsigned gy = (unsigned)((spatial + 127) / 128);
+            unsigned gy = (unsigned)((ns + 127) / 128);
             hipModuleLaunchKernel(r->fn_gemm_bf16w_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, ga, NULL);
         } else {
-            op_gemm(r, d_yt, w, d_col, null_ptr, co, col_w, spatial);
+            op_gemm(r, d_yt, w, d_col, null_ptr, co, col_w, ns);
+        }
+
+        /* 3. transpose-write d_yt[ns, co] -> out[co, spatial] at offset s0 */
+        {
+            long total = (long)ns * co;
+            void *args[] = {&out, &d_yt, &ns, &co, &s0, &spatial};
+            hipModuleLaunchKernel(r->fn_vae_transpose_tile, (unsigned)((total + 255) / 256), 1, 1,
+                                  256, 1, 1, 0, NULL, args, NULL);
         }
     }
     hipFree(d_col);
+    hipFree(d_yt);
 
-    /* 3. Transpose [H*W, co] -> [co, H*W] = out (GPU) */
-    {
-        int total = spatial * co;
-        void *args[] = {&out, &d_yt, &spatial, &co};
-        hipModuleLaunchKernel(r->fn_vae_transpose, (unsigned)((total+255)/256), 1, 1,
-                              256, 1, 1, 0, NULL, args, NULL);
-        hipFree(d_yt);
-    }
-
-    /* 4. Add bias */
+    /* 4. Add bias over the full output */
     if (bias) {
         int total = co * spatial;
         void *args[] = {&out, &bias, &co, &spatial};
-        hipModuleLaunchKernel(r->fn_vae_add_bias, (unsigned)((total+255)/256), 1, 1,
+        hipModuleLaunchKernel(r->fn_vae_add_bias, (unsigned)((total + 255) / 256), 1, 1,
                               256, 1, 1, 0, NULL, args, NULL);
     }
 }

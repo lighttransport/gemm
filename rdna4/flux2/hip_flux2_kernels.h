@@ -661,16 +661,16 @@ static const char hip_flux2_specific_kernels[] =
 
 /* ---- im2col: [ci,H,W] -> [H*W, ci*9] for 3x3 same-padding conv ---- */
 /* Grid: ceil(H*W*ci*9 / 256), Block: 256 */
-"/* ---- vae_im2col_3x3: extract 3x3 patches into column matrix ---- */\n"
+"/* ---- vae_im2col_3x3: extract 3x3 patches for output pixels [s0, s0+ns) into\n"
+" * col[ns, ci*9]. s0=0, ns=H*W processes the whole image (single tile). ---- */\n"
 "__global__ void vae_im2col_3x3(float *col, const float *in,\n"
-"    int ci, int H, int W) {\n"
-"    int spatial = H * W;\n"
+"    int ci, int H, int W, int s0, int ns) {\n"
 "    int col_w = ci * 9;\n"
-"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"    int total = spatial * col_w;\n"
+"    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    long total = (long)ns * col_w;\n"
 "    if (idx >= total) return;\n"
-"    int s = idx / col_w;\n"  /* spatial position */
-"    int k = idx % col_w;\n"  /* column index = ic * 9 + ky * 3 + kx */
+"    int s = s0 + (int)(idx / col_w);\n"  /* global spatial position */
+"    int k = (int)(idx % col_w);\n"       /* column index = ic * 9 + ky * 3 + kx */
 "    int ic = k / 9;\n"
 "    int rem = k % 9;\n"
 "    int ky = rem / 3, kx = rem % 3;\n"
@@ -678,6 +678,17 @@ static const char hip_flux2_specific_kernels[] =
 "    int iy = y + ky - 1, ix = x + kx - 1;\n"
 "    col[idx] = (iy >= 0 && iy < H && ix >= 0 && ix < W)\n"
 "              ? in[(long)ic * H * W + iy * W + ix] : 0.0f;\n"
+"}\n"
+"\n"
+
+/* ---- transpose_tile: in[ns, co] -> out[co, spatial] at column offset s0:\n"
+" * out[c*spatial + s0 + i] = in[i*co + c]. Writes one spatial tile. ---- */
+"__global__ void vae_transpose_tile(float *out, const float *in,\n"
+"    int ns, int co, int s0, int spatial) {\n"
+"    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (idx >= (long)ns * co) return;\n"
+"    int i = (int)(idx / co), c = (int)(idx % co);\n"
+"    out[(long)c * spatial + s0 + i] = in[idx];\n"
 "}\n"
 "\n"
 
