@@ -30,6 +30,9 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose);
  * Returns 0 on success, -1 on error. */
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len);
 
+/* Load Qwen3 dense weights from a safetensors file (text-encoder path). */
+int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len);
+
 /* Run one token through the transformer. Returns pointer to F32 hidden state [n_embd].
  * The returned pointer is valid until the next call (host-side buffer). */
 float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position);
@@ -76,6 +79,11 @@ void hip_llm_reset_state(hip_llm_runner *r);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */
 int hip_llm_read_hidden(const hip_llm_runner *r, float *dst, int n);
+
+/* Text-encoder hidden snapshots: select up to 3 layers, then read their
+ * captured per-token hidden states after each forward. */
+int hip_llm_set_hidden_snapshot_layers(hip_llm_runner *r, const int *layers, int n_slots);
+int hip_llm_read_hidden_snapshots(const hip_llm_runner *r, float *dst, int n_slots, int n);
 
 /* Enable per-layer debug output (print hidden state norm after each layer). */
 void hip_llm_set_debug(hip_llm_runner *r, int debug_layers);
