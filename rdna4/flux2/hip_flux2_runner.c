@@ -86,6 +86,8 @@ struct hip_flux2_runner {
     /* VAE kernels */
     hipFunction_t fn_vae_im2col, fn_vae_add_bias, fn_vae_transpose, fn_vae_conv1, fn_vae_gnsilu;
     hipFunction_t fn_vae_up2x, fn_vae_attn, fn_vae_bn;
+    hipFunction_t fn_gemm_bf16w_wmma;   /* BF16 WMMA, F32 weights (VAE convs) */
+    int use_vae_gemm_wmma;             /* 1 = VAE conv GEMM via BF16 WMMA */
 
     int use_fp8;   /* 1 = raw FP8 weights + LUT GEMM (4x less VRAM) */
     int use_fp8_opt; /* 1 = 128x128 tiled FP8 LUT GEMM (fast path) */
@@ -562,6 +564,13 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
     hipModuleGetFunction(&r->fn_vae_up2x,   mod, "vae_upsample2x");
     hipModuleGetFunction(&r->fn_vae_attn,   mod, "vae_self_attn");
     hipModuleGetFunction(&r->fn_vae_bn,     mod, "vae_bn_denorm");
+    if (hipModuleGetFunction(&r->fn_gemm_bf16w_wmma, mod, "gemm_bf16w_bf16a_wmma_t") != hipSuccess)
+        r->fn_gemm_bf16w_wmma = NULL;
+    {
+        const char *v = getenv("FLUX2_VAE_WMMA");
+        r->use_vae_gemm_wmma = (r->fn_gemm_bf16w_wmma != NULL) &&
+                               !(v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+    }
 
     if (r->use_fp8_opt) {
         if (!r->fn_gemm_fp8_opt) {
@@ -1202,7 +1211,17 @@ static void vae_conv3(hip_flux2_runner *r, void *out, void *in,
     void *d_yt = vae_alloc((size_t)spatial * co * F);
     {
         void *null_ptr = NULL;
-        op_gemm(r, d_yt, w, d_col, null_ptr, co, col_w, spatial);
+        if (r->use_vae_gemm_wmma && r->fn_gemm_bf16w_wmma) {
+            /* BF16 WMMA (F32 weights), F32 accum — accurate, much faster than the
+             * scalar F32 GEMM for the large-M (M=spatial) VAE conv. */
+            float one = 1.0f;
+            void *ga[] = {&d_yt, &w, &d_col, &null_ptr, &co, &col_w, &spatial, &one};
+            unsigned gx = (unsigned)((co + 127) / 128);
+            unsigned gy = (unsigned)((spatial + 127) / 128);
+            hipModuleLaunchKernel(r->fn_gemm_bf16w_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, ga, NULL);
+        } else {
+            op_gemm(r, d_yt, w, d_col, null_ptr, co, col_w, spatial);
+        }
     }
     hipFree(d_col);
 
