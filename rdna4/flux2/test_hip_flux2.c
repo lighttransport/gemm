@@ -22,7 +22,7 @@
  * recognizable image).
  */
 
-#define SAFETENSORS_IMPLEMENTATION
+/* SAFETENSORS_IMPLEMENTATION is provided by hip_llm_runner.o (GPU text encoder). */
 #define GGML_DEQUANT_IMPLEMENTATION
 #define QIMG_SCHEDULER_IMPLEMENTATION
 #define FLUX2_TEXT_ENCODER_IMPLEMENTATION
@@ -34,6 +34,7 @@
 #include "../../common/safetensors.h"
 #include "../../common/ggml_dequant.h"
 #include "../../common/qwen_image_scheduler.h"
+#include "../llm/hip_llm_runner.h"   /* defines HIP_LLM_RUNNER_H -> GPU encoder branch */
 #include "../../common/flux2_klein_text_encoder.h"
 #include "../../common/stb_image_write.h"
 #include "hip_flux2_runner.h"
@@ -351,7 +352,7 @@ static int run_vae_only(hip_flux2_runner *r,
 
 /* ---- Generate mode ---- */
 
-static int run_generate(hip_flux2_runner *r,
+static int run_generate(hip_flux2_runner *r, const char *dit_path,
                          const char *prompt, const char *enc_path, const char *tok_path,
                          const char *txt_bin_path,
                          const char *init_bin_path, const char *sigmas_bin_path,
@@ -364,20 +365,21 @@ static int run_generate(hip_flux2_runner *r,
     int n_img = (lat_h / ps) * (lat_w / ps);
     int txt_dim = 7680;
 
-    if (hip_flux2_load_vae(r, vae_path) < 0) {
-        fprintf(stderr, "generate: VAE load failed\n");
-        return -1;
-    }
-
-    /* ---- Text encoding ---- */
+    /* ---- Text encoding (BEFORE loading DiT/VAE so the GPU encoder has VRAM) ---- */
     float *txt_hidden = NULL;
     int n_txt_real = 0;
     if (txt_bin_path) {
         txt_hidden = load_txt_bin(txt_bin_path, &n_txt_real, txt_dim);
         if (!txt_hidden) return -1;
     } else if (enc_path && tok_path) {
-        fprintf(stderr, "generate: loading CPU text encoder from %s\n", enc_path);
-        flux2_text_enc *enc = flux2_text_enc_load_safetensors(enc_path, tok_path);
+        flux2_text_enc *enc;
+        if (getenv("FLUX2_ENC_GPU")) {
+            fprintf(stderr, "generate: loading GPU text encoder from %s\n", enc_path);
+            enc = flux2_text_enc_load_gpu(enc_path, tok_path, 0);
+        } else {
+            fprintf(stderr, "generate: loading CPU text encoder from %s\n", enc_path);
+            enc = flux2_text_enc_load_safetensors(enc_path, tok_path);
+        }
         if (!enc) {
             fprintf(stderr, "generate: text encoder load FAILED\n");
             return -1;
@@ -403,6 +405,17 @@ static int run_generate(hip_flux2_runner *r,
     const int N_TXT = 512;
     float *txt_padded = front_pad_text(txt_hidden, n_txt_real, txt_dim, N_TXT);
     int n_txt = N_TXT;
+
+    /* Now load DiT + VAE (the text encoder has been freed above, so its VRAM is
+     * reclaimed). */
+    if (hip_flux2_load_dit(r, dit_path) < 0) {
+        fprintf(stderr, "generate: DiT load failed\n");
+        return -1;
+    }
+    if (hip_flux2_load_vae(r, vae_path) < 0) {
+        fprintf(stderr, "generate: VAE load failed\n");
+        return -1;
+    }
 
     /* ---- Sigmas (pinned from --sigmas-bin, else diffusers Flux2 dynamic shift) ---- */
     float *sigmas = (float *)calloc((size_t)(n_steps + 1), sizeof(float));
@@ -587,10 +600,15 @@ int main(int argc, char **argv) {
     hip_flux2_runner *r = hip_flux2_init(device_id, verbose);
     if (!r) { fprintf(stderr, "hip_flux2_init failed\n"); return 1; }
 
-    if (hip_flux2_load_dit(r, dit_path) < 0) {
-        fprintf(stderr, "Failed to load DiT\n");
-        hip_flux2_free(r);
-        return 1;
+    /* For --generate the DiT is loaded inside run_generate AFTER the text
+     * encoder is freed (the 8 GB Qwen3 GPU encoder + 4 GB DiT don't co-reside
+     * on a 16 GB card). All other modes load it up front. */
+    if (!generate) {
+        if (hip_flux2_load_dit(r, dit_path) < 0) {
+            fprintf(stderr, "Failed to load DiT\n");
+            hip_flux2_free(r);
+            return 1;
+        }
     }
 
     if (vae_only) {
@@ -611,7 +629,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: --enc requires --tok\n"); hip_flux2_free(r); return 1;
         }
         (void)path_is_dir;
-        int rc = run_generate(r, prompt, enc_path, tok_path, txt_bin_path,
+        int rc = run_generate(r, dit_path, prompt, enc_path, tok_path, txt_bin_path,
                               init_bin_path, sigmas_bin_path, dump_final_path,
                               bn_mean_bin, bn_var_bin, bn_eps,
                               vae_path, out_path, img_size, n_steps, seed);
