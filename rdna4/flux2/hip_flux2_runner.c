@@ -80,6 +80,8 @@ struct hip_flux2_runner {
     hipFunction_t fn_gemm_fp8_bf16_wmma; /* BF16 act × FP8 wt (BF16 WMMA) */
     hipFunction_t fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_swiglu, fn_flash_attn;
+    hipFunction_t fn_flash_attn_wmma2;  /* BF16 WMMA self-attn (head_dim=128) */
+    int use_attn_wmma;                  /* 1 = use BF16 WMMA attention */
     hipFunction_t fn_rope_img, fn_rope_txt, fn_bf16_trunc, fn_add;
     /* VAE kernels */
     hipFunction_t fn_vae_im2col, fn_vae_add_bias, fn_vae_transpose, fn_vae_conv1, fn_vae_gnsilu;
@@ -385,6 +387,16 @@ static void op_gated_add(hip_flux2_runner *r, void *x, void *proj,
 
 static void op_attn(hip_flux2_runner *r, void *out, void *q,
                     void *k, void *v, int n_tok, int n_heads, int head_dim) {
+    /* BF16 WMMA self-attention (head_dim=128) — same math (F32 accum, online
+     * softmax), much faster than the scalar F32 path. Default ON; disable with
+     * FLUX2_ATTN_WMMA=0. Grid (n_heads, ceil(n_tok/64)), block 128. */
+    if (r->fn_flash_attn_wmma2 && head_dim == 128 && r->use_attn_wmma) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        void *args[] = {&out, &q, &k, &v, &n_tok, &n_heads, &head_dim};
+        hipModuleLaunchKernel(r->fn_flash_attn_wmma2, (unsigned)n_heads, gy, 1,
+                              128, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
     int fa2_warps = 4, fa2_bkv = 16;
     unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
     /* RDNA4 (gfx1201) uses wave32, same as NVIDIA */
@@ -530,6 +542,13 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
     hipModuleGetFunction(&r->fn_rmsnorm_ph,  mod, "rmsnorm_per_head_f32");
     hipModuleGetFunction(&r->fn_swiglu,      mod, "flux2_swiglu");
     hipModuleGetFunction(&r->fn_flash_attn,  mod, "flash_attn_f32");
+    if (hipModuleGetFunction(&r->fn_flash_attn_wmma2, mod, "flash_attn_sa_wmma_f32") != hipSuccess)
+        r->fn_flash_attn_wmma2 = NULL;
+    {
+        const char *v = getenv("FLUX2_ATTN_WMMA");
+        r->use_attn_wmma = (r->fn_flash_attn_wmma2 != NULL) &&
+                           !(v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+    }
     hipModuleGetFunction(&r->fn_rope_img,    mod, "flux2_rope_img_f32");
     hipModuleGetFunction(&r->fn_rope_txt,    mod, "flux2_rope_txt_f32");
     hipModuleGetFunction(&r->fn_bf16_trunc,  mod, "truncate_bf16_f32");
