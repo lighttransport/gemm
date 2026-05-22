@@ -88,6 +88,7 @@ struct hip_flux2_runner {
     hipFunction_t fn_vae_transpose_tile;
     hipFunction_t fn_vae_up2x, fn_vae_attn, fn_vae_bn;
     hipFunction_t fn_gemm_bf16w_wmma;   /* BF16 WMMA, F32 weights (VAE convs) */
+    hipFunction_t fn_vae_conv3x3_wmma;  /* fused im2col+GEMM+transpose 3x3 conv */
     int use_vae_gemm_wmma;             /* 1 = VAE conv GEMM via BF16 WMMA */
 
     int use_fp8;   /* 1 = raw FP8 weights + LUT GEMM (4x less VRAM) */
@@ -568,6 +569,8 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
     hipModuleGetFunction(&r->fn_vae_bn,     mod, "vae_bn_denorm");
     if (hipModuleGetFunction(&r->fn_gemm_bf16w_wmma, mod, "gemm_bf16w_bf16a_wmma_t") != hipSuccess)
         r->fn_gemm_bf16w_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_vae_conv3x3_wmma, mod, "vae_conv3x3_wmma") != hipSuccess)
+        r->fn_vae_conv3x3_wmma = NULL;
     {
         const char *v = getenv("FLUX2_VAE_WMMA");
         r->use_vae_gemm_wmma = (r->fn_gemm_bf16w_wmma != NULL) &&
@@ -1199,6 +1202,16 @@ static void vae_conv3(hip_flux2_runner *r, void *out, void *in,
     int spatial = H * W;
     int col_w = ci * 9;
     size_t F = sizeof(float);
+
+    /* Fused path: one kernel does im2col-gather + BF16 WMMA + transposed store,
+     * with no materialized im2col matrix and no separate transpose. */
+    if (r->use_vae_gemm_wmma && r->fn_vae_conv3x3_wmma) {
+        void *args[] = {&out, &w, &in, &bias, &co, &ci, &H, &W};
+        unsigned gx = (unsigned)((co + 127) / 128);
+        unsigned gy = (unsigned)((spatial + 127) / 128);
+        hipModuleLaunchKernel(r->fn_vae_conv3x3_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
 
     /* Tile over spatial so the im2col matrix [tile, col_w] stays bounded.
      * The whole-image im2col is col_w*spatial floats — 19 GB at 1024² with
