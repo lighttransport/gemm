@@ -1178,10 +1178,37 @@ void hip_flux2_free(hip_flux2_runner *r) {
 
 /* ---- GPU VAE helpers ---- */
 
+/* VAE activation scratch pool: reuse freed buffers to avoid GB-scale
+ * hipMalloc/hipFree churn on the 1024² intermediates. Within one decode the
+ * ping-pong buffers are reused; drained at decode end to release VRAM. */
+#define VAE_POOL_MAX 32
+static struct { void *p; size_t cap; int in_use; } g_vae_pool[VAE_POOL_MAX];
+static int g_vae_pool_n = 0;
+
 static void *vae_alloc(size_t n) {
+    int best = -1;
+    for (int i = 0; i < g_vae_pool_n; i++)
+        if (g_vae_pool[i].p && !g_vae_pool[i].in_use && g_vae_pool[i].cap >= n)
+            if (best < 0 || g_vae_pool[i].cap < g_vae_pool[best].cap) best = i;
+    if (best >= 0) { g_vae_pool[best].in_use = 1; return g_vae_pool[best].p; }
     void *d = NULL;
-    hipMalloc(&d, n);
+    if (hipMalloc(&d, n) != hipSuccess) return NULL;
+    if (g_vae_pool_n < VAE_POOL_MAX) {
+        g_vae_pool[g_vae_pool_n].p = d; g_vae_pool[g_vae_pool_n].cap = n;
+        g_vae_pool[g_vae_pool_n].in_use = 1; g_vae_pool_n++;
+    }
     return d;
+}
+/* Return an activation buffer to the pool (non-pool ptrs fall back to hipFree). */
+static void vae_free(void *p) {
+    if (!p) return;
+    for (int i = 0; i < g_vae_pool_n; i++)
+        if (g_vae_pool[i].p == p) { g_vae_pool[i].in_use = 0; return; }
+    hipFree(p);
+}
+static void vae_pool_drain(void) {
+    for (int i = 0; i < g_vae_pool_n; i++) if (g_vae_pool[i].p) hipFree(g_vae_pool[i].p);
+    g_vae_pool_n = 0;
 }
 
 /* Conv2d 3x3 via im2col + GEMM:
@@ -1317,15 +1344,15 @@ static void vae_resblock_gpu(hip_flux2_runner *r,
     /* tmp2 = Conv3x3(tmp1) [ci -> co] */
     void *tmp2 = vae_alloc((size_t)co * spatial * sizeof(float));
     vae_conv3(r, tmp2, tmp1, c1w, c1b, ci, H, W, co);
-    hipFree(tmp1);
+    vae_free(tmp1);
     /* tmp1 = GroupNorm+SiLU(tmp2) */
     tmp1 = vae_alloc((size_t)co * spatial * sizeof(float));
     vae_groupnorm_silu(r, tmp1, tmp2, n2w, n2b, co, spatial, ng, 1);
     /* tmp2 = Conv3x3(tmp1) [co -> co] */
-    hipFree(tmp2);
+    vae_free(tmp2);
     tmp2 = vae_alloc((size_t)co * spatial * sizeof(float));
     vae_conv3(r, tmp2, tmp1, c2w, c2b, co, H, W, co);
-    hipFree(tmp1);
+    vae_free(tmp1);
     /* skip connection */
     if (skipw) {
         vae_conv1(r, out, x, skipw, skipb, ci, spatial, co);
@@ -1334,7 +1361,7 @@ static void vae_resblock_gpu(hip_flux2_runner *r,
     }
     /* out += tmp2 */
     op_add(r, out, tmp2, co * spatial);
-    hipFree(tmp2);
+    vae_free(tmp2);
 }
 
 /* VAE mid-block attention on GPU */
@@ -1359,7 +1386,7 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     vae_conv1(r, dQ, normed, qw, qb, c, spatial, c);
     vae_conv1(r, dK, normed, kw, kb, c, spatial, c);
     vae_conv1(r, dV, normed, vw, vb, c, spatial, c);
-    hipFree(normed);
+    vae_free(normed);
 
     /* Transpose [c, spatial] -> [spatial, c] for attention */
     /* Do on CPU for simplicity (mid-block is small: spatial=H*W at lowest res) */
@@ -1370,7 +1397,7 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     hipMemcpy(hQ, dQ, sz, hipMemcpyDeviceToHost);
     hipMemcpy(hK, dK, sz, hipMemcpyDeviceToHost);
     hipMemcpy(hV, dV, sz, hipMemcpyDeviceToHost);
-    hipFree(dQ); hipFree(dK); hipFree(dV);
+    vae_free(dQ); vae_free(dK); vae_free(dV);
 
     /* Transpose CHW -> HWC */
     float *tQ = (float *)malloc(sz);
@@ -1397,11 +1424,11 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     void *args[] = {&dO, &dQ, &dK, &dV, &spatial, &c, &scale};
     hipModuleLaunchKernel(r->fn_vae_attn, (unsigned)spatial, 1, 1,
                           256, 1, 1, smem, NULL, args, NULL);
-    hipFree(dQ); hipFree(dK); hipFree(dV);
+    vae_free(dQ); vae_free(dK); vae_free(dV);
 
     /* Transpose back HWC -> CHW */
     hipMemcpy(hO, dO, sz, hipMemcpyDeviceToHost);
-    hipFree(dO);
+    vae_free(dO);
     float *tO = (float *)malloc(sz);
     for (int s = 0; s < spatial; s++)
         for (int ch = 0; ch < c; ch++)
@@ -1413,12 +1440,12 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     free(tO);
     void *proj_out = vae_alloc(sz);
     vae_conv1(r, proj_out, dTO, ow, ob, c, spatial, c);
-    hipFree(dTO);
+    vae_free(dTO);
 
     /* Residual: out = x + proj_out */
     hipMemcpy(out, x, sz, hipMemcpyDeviceToDevice);
     op_add(r, out, proj_out, c * spatial);
-    hipFree(proj_out);
+    vae_free(proj_out);
 }
 
 /* Upload VAE resblock weights */
@@ -1548,7 +1575,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         void *d_pqcb = gpu_upload_f32(m->pqc_b, lc);
         void *d_tmp = vae_alloc((size_t)lc * h * w * F);
         vae_conv1(r, d_tmp, d_x, d_pqcw, d_pqcb, lc, h * w, lc);
-        hipFree(d_x); hipFree(d_pqcw); hipFree(d_pqcb);
+        vae_free(d_x); hipFree(d_pqcw); hipFree(d_pqcb);
         d_x = d_tmp;
     }
     vae_dump_stage("post_q", d_x, (size_t)lc * h * w);
@@ -1560,7 +1587,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         void *d_cib = gpu_upload_f32(m->conv_in_b, c);
         void *d_tmp = vae_alloc((size_t)c * h * w * F);
         vae_conv3(r, d_tmp, d_x, d_ciw, d_cib, lc, h, w, c);
-        hipFree(d_x); hipFree(d_ciw); hipFree(d_cib);
+        vae_free(d_x); hipFree(d_ciw); hipFree(d_cib);
         d_x = d_tmp;
     }
 
@@ -1574,7 +1601,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         vae_resblock_gpu(r, d_tmp, d_x, gr0.n1w, gr0.n1b, gr0.c1w, gr0.c1b,
                          gr0.n2w, gr0.n2b, gr0.c2w, gr0.c2b, gr0.sw, gr0.sb,
                          gr0.ci, gr0.co, h, w, ng);
-        hipFree(d_x); d_x = d_tmp;
+        vae_free(d_x); d_x = d_tmp;
         /* Free resblock weights */
         hipFree(gr0.n1w); hipFree(gr0.n1b); hipFree(gr0.c1w); hipFree(gr0.c1b);
         hipFree(gr0.n2w); hipFree(gr0.n2b); hipFree(gr0.c2w); hipFree(gr0.c2b);
@@ -1586,7 +1613,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         vae_mid_attn_gpu(r, d_tmp, d_x, ga.nw, ga.nb,
                          ga.qw, ga.qb, ga.kw, ga.kb, ga.vw, ga.vb, ga.ow, ga.ob,
                          c, h, w, ng);
-        hipFree(d_x); d_x = d_tmp;
+        vae_free(d_x); d_x = d_tmp;
         hipFree(ga.nw); hipFree(ga.nb); hipFree(ga.qw); hipFree(ga.qb);
         hipFree(ga.kw); hipFree(ga.kb); hipFree(ga.vw); hipFree(ga.vb);
         hipFree(ga.ow); hipFree(ga.ob);
@@ -1597,7 +1624,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         vae_resblock_gpu(r, d_tmp, d_x, gr1.n1w, gr1.n1b, gr1.c1w, gr1.c1b,
                          gr1.n2w, gr1.n2b, gr1.c2w, gr1.c2b, gr1.sw, gr1.sb,
                          gr1.ci, gr1.co, h, w, ng);
-        hipFree(d_x); d_x = d_tmp;
+        vae_free(d_x); d_x = d_tmp;
         hipFree(gr1.n1w); hipFree(gr1.n1b); hipFree(gr1.c1w); hipFree(gr1.c1b);
         hipFree(gr1.n2w); hipFree(gr1.n2b); hipFree(gr1.c2w); hipFree(gr1.c2b);
         if (gr1.sw) { hipFree(gr1.sw); hipFree(gr1.sb); }
@@ -1616,7 +1643,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             vae_resblock_gpu(r, d_tmp, d_x, gr.n1w, gr.n1b, gr.c1w, gr.c1b,
                              gr.n2w, gr.n2b, gr.c2w, gr.c2b, gr.sw, gr.sb,
                              gr.ci, gr.co, h, w, ng);
-            hipFree(d_x); d_x = d_tmp; c = new_c;
+            vae_free(d_x); d_x = d_tmp; c = new_c;
             hipFree(gr.n1w); hipFree(gr.n1b); hipFree(gr.c1w); hipFree(gr.c1b);
             hipFree(gr.n2w); hipFree(gr.n2b); hipFree(gr.c2w); hipFree(gr.c2b);
             if (gr.sw) { hipFree(gr.sw); hipFree(gr.sb); }
@@ -1629,7 +1656,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             vae_resblock_gpu(r, d_tmp, d_x, gr.n1w, gr.n1b, gr.c1w, gr.c1b,
                              gr.n2w, gr.n2b, gr.c2w, gr.c2b, gr.sw, gr.sb,
                              gr.ci, gr.co, h, w, ng);
-            hipFree(d_x); d_x = d_tmp; c = new_c;
+            vae_free(d_x); d_x = d_tmp; c = new_c;
             hipFree(gr.n1w); hipFree(gr.n1b); hipFree(gr.c1w); hipFree(gr.c1b);
             hipFree(gr.n2w); hipFree(gr.n2b); hipFree(gr.c2w); hipFree(gr.c2b);
             if (gr.sw) { hipFree(gr.sw); hipFree(gr.sb); }
@@ -1642,7 +1669,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             vae_resblock_gpu(r, d_tmp, d_x, gr.n1w, gr.n1b, gr.c1w, gr.c1b,
                              gr.n2w, gr.n2b, gr.c2w, gr.c2b, gr.sw, gr.sb,
                              gr.ci, gr.co, h, w, ng);
-            hipFree(d_x); d_x = d_tmp; c = new_c;
+            vae_free(d_x); d_x = d_tmp; c = new_c;
             hipFree(gr.n1w); hipFree(gr.n1b); hipFree(gr.c1w); hipFree(gr.c1b);
             hipFree(gr.n2w); hipFree(gr.n2b); hipFree(gr.c2w); hipFree(gr.c2b);
             if (gr.sw) { hipFree(gr.sw); hipFree(gr.sb); }
@@ -1656,7 +1683,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             void *d_usb = gpu_upload_f32(m->up_sample[bi].conv_b, c);
             void *d_tmp = vae_alloc((size_t)c * h * w * F);
             vae_conv3(r, d_tmp, d_up, d_usw, d_usb, c, h, w, c);
-            hipFree(d_up); hipFree(d_x); hipFree(d_usw); hipFree(d_usb);
+            vae_free(d_up); vae_free(d_x); hipFree(d_usw); hipFree(d_usb);
             d_x = d_tmp;
         }
         if (r->verbose >= 1)
@@ -1671,20 +1698,21 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         void *d_nob = gpu_upload_f32(m->norm_out_b, c);
         void *d_normed = vae_alloc((size_t)c * h * w * F);
         vae_groupnorm_silu(r, d_normed, d_x, d_now, d_nob, c, h*w, ng, 1);
-        hipFree(d_x); hipFree(d_now); hipFree(d_nob);
+        vae_free(d_x); hipFree(d_now); hipFree(d_nob);
         vae_dump_stage("act", d_normed, (size_t)c * h * w);
 
         void *d_cow = gpu_upload_f32(m->conv_out_w, 3 * c * 9);
         void *d_cob = gpu_upload_f32(m->conv_out_b, 3);
         void *d_rgb = vae_alloc((size_t)3 * h * w * F);
         vae_conv3(r, d_rgb, d_normed, d_cow, d_cob, c, h, w, 3);
-        hipFree(d_normed); hipFree(d_cow); hipFree(d_cob);
+        vae_free(d_normed); hipFree(d_cow); hipFree(d_cob);
         vae_dump_stage("conv_out", d_rgb, (size_t)3 * h * w);
 
         /* Download */
         hipMemcpy(out_rgb, d_rgb, (size_t)3 * h * w * F, hipMemcpyDeviceToHost);
         hipDeviceSynchronize();
-        hipFree(d_rgb);
+        vae_free(d_rgb);
+        vae_pool_drain();
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
