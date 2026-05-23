@@ -124,8 +124,10 @@ struct hip_qimg_runner {
     hipFunction_t fn_quantize_act_scalar;  /* F32 -> FP8 with scalar scale=1, Comfy-style */
     hipFunction_t fn_quantize_act_clamp;   /* F32 -> FP8 with scale=max(1,maxabs/448) */
     hipFunction_t fn_layernorm, fn_silu, fn_gelu, fn_adaln, fn_gated_add;
-    hipFunction_t fn_rmsnorm_ph, fn_flash_attn, fn_flash_attn_wmma;
+    hipFunction_t fn_rmsnorm_ph, fn_flash_attn, fn_flash_attn_wmma, fn_flash_attn_wmma_pq, fn_flash_attn_wmma_sp;
     int use_attn_wmma; /* 1 = use BF16 WMMA flash attention (gfx12, head_dim=128) */
+    int use_attn_wmma_pq; /* 1 = use the persistent-Q + double-buffered v2 kernel (opt-in QIMG_ATTN_V2) */
+    int use_attn_wmma_sp; /* 1 = use the software-pipelined v3 kernel (opt-in QIMG_ATTN_V3) */
     hipFunction_t fn_qkv_perhead_maxabs, fn_q_quant_fp8, fn_kv_quant_repack_fp8, fn_flash_attn_fp8;
     hipFunction_t fn_q_quant_perrow, fn_k_quant_repack_perrow, fn_flash_attn_fp8_perrow;
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
@@ -1154,6 +1156,22 @@ static void op_attn(hip_qimg_runner *r, void *d_out, void *d_q,
         }
         return;
     }
+    if (r->use_attn_wmma_sp && r->fn_flash_attn_wmma_sp && head_dim == 128) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+        hipModuleLaunchKernel(r->fn_flash_attn_wmma_sp,
+                              (unsigned)n_heads, gy, 1,
+                              128, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
+    if (r->use_attn_wmma_pq && r->fn_flash_attn_wmma_pq && head_dim == 128) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
+        hipModuleLaunchKernel(r->fn_flash_attn_wmma_pq,
+                              (unsigned)n_heads, gy, 1,
+                              128, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
     if (r->use_attn_wmma && r->fn_flash_attn_wmma && head_dim == 128) {
         unsigned gy = (unsigned)((n_tok + 63) / 64);
         void *args[] = {&d_out, &d_q, &d_k, &d_v, &n_tok, &n_heads, &head_dim};
@@ -1372,6 +1390,10 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_flash_attn, "flash_attn_f32");
     if (hipModuleGetFunction(&r->fn_flash_attn_wmma, mod, "flash_attn_sa_wmma_f32") != hipSuccess)
         r->fn_flash_attn_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_flash_attn_wmma_pq, mod, "flash_attn_sa_wmma_pq_f32") != hipSuccess)
+        r->fn_flash_attn_wmma_pq = NULL;
+    if (hipModuleGetFunction(&r->fn_flash_attn_wmma_sp, mod, "flash_attn_sa_wmma_sp_f32") != hipSuccess)
+        r->fn_flash_attn_wmma_sp = NULL;
     GET(fn_rope_2d, "rope_2d_f32");
     GET(fn_rope_1d, "rope_1d_f32");
     GET(fn_bf16_trunc, "truncate_bf16_f32");
@@ -1603,6 +1625,31 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
             r->use_attn_wmma = 1;
             if (verbose)
                 fprintf(stderr, "hip_qimg: BF16 WMMA flash-attention enabled\n");
+        }
+    }
+
+    /* v2 flash-attention: persistent-Q-in-registers + double-buffered K/V (gfx12,
+     * head_dim=128). Opt-in A/B path via QIMG_ATTN_V2=1; default OFF — the v1 kernel
+     * stays the shipped default until v2 is shown to win 1024² s/step at parity. */
+    r->use_attn_wmma_pq = 0;
+    if (r->fn_flash_attn_wmma_pq) {
+        const char *v = getenv("QIMG_ATTN_V2");
+        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+            r->use_attn_wmma_pq = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: v2 flash-attention (persistent-Q + double-buffer) enabled\n");
+        }
+    }
+
+    /* v3 flash-attention: software-pipelined ("FA3-idea") lookahead-QK + triple-buffered
+     * K/V (gfx12, head_dim=128). Opt-in A/B path via QIMG_ATTN_V3=1; default OFF. */
+    r->use_attn_wmma_sp = 0;
+    if (r->fn_flash_attn_wmma_sp) {
+        const char *v = getenv("QIMG_ATTN_V3");
+        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+            r->use_attn_wmma_sp = 1;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: v3 flash-attention (software-pipelined lookahead-QK) enabled\n");
         }
     }
 
