@@ -5,7 +5,7 @@
  *   test_cuda_sam3d_body --safetensors-dir <DIR> --image <image.jpg>
  *       --mhr-assets <DIR>
  *       [--bbox x0 y0 x1 y1 | --auto-bbox] [--focal F]
- *       [-o body.obj] [--precision fp16|bf16] [--device N] [-v]
+ *       [-o body.obj] [--precision fp16|fp32|bf16] [--device N] [-v]
  *
  *   test_cuda_sam3d_body <safetensors-dir> <image.jpg> ...
  */
@@ -53,7 +53,7 @@ static void print_usage(const char *prog)
             "[--rt-detr-model PATH] [--auto-thresh F]] "
             "[--focal F] [-o body.obj] "
             "[--backbone dinov3|vith] "
-            "[--precision fp16|bf16] [--device N] [-t N] [-v]\n"
+            "[--precision fp16|fp32|bf16] [--device N] [-t N] [-v]\n"
             "  %s SFT_DIR IMG.jpg ...   (legacy positional)\n",
             prog, prog);
 }
