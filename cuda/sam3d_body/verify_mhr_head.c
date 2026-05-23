@@ -73,7 +73,7 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--backbone dinov3|vith] [--device N] "
-                        "[--precision fp16|bf16] [-v]\n", argv[0]);
+                        "[--precision fp16|fp32|bf16] [-v]\n", argv[0]);
         return 2;
     }
 
