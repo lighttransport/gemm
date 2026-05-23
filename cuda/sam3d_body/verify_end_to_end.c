@@ -158,7 +158,7 @@ int main(int argc, char **argv)
                 "--refdir DIR --image IMG --bbox x0 y0 x1 y1 "
                 "[--backbone dinov3|vith] [--image-height H] [--image-width W] "
                 "[--threshold F] "
-                "[--threshold-2d PX] [--device N] [--precision fp16|bf16] [-v]\n",
+                "[--threshold-2d PX] [--device N] [--precision fp16|fp32|bf16] [-v]\n",
                 argv[0]);
         return 2;
     }
