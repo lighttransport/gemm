@@ -9,7 +9,7 @@
  *       --shape-dec <shape_dec.st> [options]
  *
  * Runs Stage 1 DiT + decoder on GPU. If --stage2 is given, also runs Stage 2
- * flow sampling on GPU + shape decoder on CPU + FDG mesh extraction.
+ * flow sampling + SC-VAE shape decoder on GPU + FDG mesh extraction.
  */
 
 #include "cuda_trellis2_runner.h"
@@ -201,7 +201,7 @@ int main(int argc, char **argv) {
                 "  --s2-steps <N>       Stage 2 Euler steps (default: 12)\n"
                 "  --s2-cfg <scale>     Stage 2 CFG scale (default: 7.5)\n"
                 "  --s2-npy <path>      Save Stage 2 latent as .npy\n"
-                "  -t <threads>         CPU threads for shape decoder (default: 4)\n"
+                "  -t <threads>         Ignored compatibility option (SC-VAE decoders run on CUDA)\n"
                 "  --max-gpu-layers <N> Max DiT layers on GPU (0=all, default: 0)\n"
                 "                       Use 1-10 to reduce VRAM at cost of speed\n"
                 "\nStage 3 (texture generation):\n"
@@ -265,6 +265,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tex-dec") && i+1 < argc) tex_dec_path = argv[++i];
         else if (!strcmp(argv[i], "--s3-steps") && i+1 < argc) s3_steps = atoi(argv[++i]);
     }
+    (void)n_threads;
 
     /* Init CUDA runner */
     fprintf(stderr, "\n=== Initializing CUDA runner ===\n");
@@ -310,6 +311,11 @@ int main(int argc, char **argv) {
     }
     if (stage2_path) {
         if (cuda_trellis2_load_stage2(r, stage2_path) != 0) {
+            cuda_trellis2_free(r); free(features); return 1;
+        }
+    }
+    if (stage2_path && shape_dec_path) {
+        if (cuda_trellis2_load_shape_decoder(r, shape_dec_path) != 0) {
             cuda_trellis2_free(r); free(features); return 1;
         }
     }
@@ -683,24 +689,19 @@ sparse_done:
             /* tex_slat (= s3_noise) kept alive for texture decoder */
         }
 
-        fprintf(stderr, "\n=== Shape Decoder (CPU, %d threads) ===\n", n_threads);
+        fprintf(stderr, "\n=== Shape Decoder (CUDA SC-VAE) ===\n");
 
-        /* Load shape decoder */
-        t2_shape_dec *dec = t2_shape_dec_load(shape_dec_path);
-        if (!dec) {
-            fprintf(stderr, "Failed to load shape decoder\n");
+        t2_shape_dec_result result = {0};
+        if (cuda_trellis2_run_shape_decoder_alloc(r, s2_x, sparse_coords, N_sparse,
+                                                  &result.feats, &result.coords,
+                                                  &result.N, &result.C) != 0) {
+            fprintf(stderr, "CUDA shape decoder failed\n");
             free(s2_x); free(sparse_coords); free(occupancy);
             cuda_trellis2_free(r); free(features);
             return 1;
         }
-
-        /* Create sparse tensor for shape decoder */
-        sp3d_tensor *slat = sp3d_create(sparse_coords, s2_x, N_sparse, s2_ch, 1);
         free(s2_x);
-
-        /* Run shape decoder */
-        t2_shape_dec_result result = t2_shape_dec_forward(dec, slat, n_threads);
-        fprintf(stderr, "Shape decoder output: N=%d\n", result.N);
+        fprintf(stderr, "Shape decoder output: N=%d, C=%d\n", result.N, result.C);
 
         /* Post-process: sigmoid on vertex offsets, softplus on split_weight */
         for (int i = 0; i < result.N; i++) {
@@ -738,13 +739,18 @@ sparse_done:
 
             if (tex_slat && stage3_path && tex_dec_path) {
                 /* Run texture decoder to get 6-channel PBR voxel field */
-                fprintf(stderr, "\n=== Texture Decoder (CPU, %d threads) ===\n", n_threads);
-                t2_shape_dec *tex_dec = t2_shape_dec_load(tex_dec_path);
-                if (tex_dec) {
-                    /* Create sparse tensor from texture latent + shape coords */
-                    sp3d_tensor *tex_tensor = sp3d_create(sparse_coords, tex_slat,
-                                                           N_sparse, 32, 1);
-                    t2_shape_dec_result tex_result = t2_shape_dec_forward(tex_dec, tex_tensor, n_threads);
+                fprintf(stderr, "\n=== Texture Decoder (CUDA SC-VAE) ===\n");
+                cuda_trellis2_unload_shape_decoder(r);
+                if (cuda_trellis2_load_texture_decoder(r, tex_dec_path) == 0) {
+                    t2_shape_dec_result tex_result = {0};
+                    if (cuda_trellis2_run_texture_decoder_alloc(r, tex_slat, sparse_coords, N_sparse,
+                                                                &tex_result.feats, &tex_result.coords,
+                                                                &tex_result.N, &tex_result.C) != 0) {
+                        fprintf(stderr, "CUDA texture decoder failed, writing shape-only mesh\n");
+                        t2_fdg_write_obj(obj_path, &fdg_mesh);
+                        t2_shape_dec_result_free(&tex_result);
+                        goto texture_done;
+                    }
                     fprintf(stderr, "Texture decoder output: N=%d, C=%d\n",
                             tex_result.N, tex_result.C);
 
@@ -767,24 +773,31 @@ sparse_done:
                         (size_t)fdg_mesh.n_verts * sizeof(t2_pbr_attr));
                     t2_pbr_sample_vertices(&pbr, fdg_mesh.vertices, fdg_mesh.n_verts, colors);
 
-                    /* Write textured OBJ + MTL + texture maps */
-                    /* Strip .obj extension for base path */
-                    char base[512];
-                    snprintf(base, sizeof(base), "%s", obj_path);
-                    char *dot = strrchr(base, '.');
-                    if (dot) *dot = '\0';
-                    t2_pbr_write_textured_obj(base, fdg_mesh.vertices, fdg_mesh.triangles,
-                                               fdg_mesh.n_verts, fdg_mesh.n_tris, colors, 1024);
+                    /* The UV atlas writer is still experimental; default to
+                     * vertex-colored OBJ so texture decode smoke tests do not
+                     * depend on chart packing. */
+                    const char *write_atlas = getenv("T2_PBR_TEXTURE_MAP");
+                    if (write_atlas && atoi(write_atlas)) {
+                        char base[512];
+                        snprintf(base, sizeof(base), "%s", obj_path);
+                        char *dot = strrchr(base, '.');
+                        if (dot) *dot = '\0';
+                        t2_pbr_write_textured_obj(base, fdg_mesh.vertices, fdg_mesh.triangles,
+                                                   fdg_mesh.n_verts, fdg_mesh.n_tris, colors, 1024);
+                    } else {
+                        t2_pbr_write_colored_obj(obj_path, fdg_mesh.vertices, fdg_mesh.triangles,
+                                                 fdg_mesh.n_verts, fdg_mesh.n_tris, colors);
+                    }
 
                     free(colors);
                     t2_pbr_free(&pbr);
                     t2_shape_dec_result_free(&tex_result);
-                    sp3d_free(tex_tensor);
-                    t2_shape_dec_free(tex_dec);
                 } else {
                     fprintf(stderr, "Failed to load texture decoder, writing shape-only mesh\n");
                     t2_fdg_write_obj(obj_path, &fdg_mesh);
                 }
+texture_done:
+                ;
             } else {
                 t2_fdg_write_obj(obj_path, &fdg_mesh);
             }
@@ -793,8 +806,6 @@ sparse_done:
         free(coords3);
         t2_fdg_mesh_free(&fdg_mesh);
         t2_shape_dec_result_free(&result);
-        sp3d_free(slat);
-        t2_shape_dec_free(dec);
         free(sparse_coords);
         if (tex_slat) free(tex_slat);
     } else {
