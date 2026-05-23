@@ -3,7 +3,8 @@
  * Supports DINOv3-H+ and ViT-H backbones, CUDA encoder/ray/token/decoder
  * stages, and CPU MHR-in-the-loop execution for the production path.
  *
- * Upstream layout (from ckpt slice `sam3d_body_dinov3.safetensors`,
+ * Upstream layout (from ckpt slice `sam3d_body_dinov3.safetensors`, or
+ * `sam3d_body_dinov3_fp32.safetensors` when --precision fp32 is used,
  * prefix `backbone.encoder.`):
  *   patch_embed.proj.weight   F32 (1280, 3, 16, 16)   — kept F32; tiny
  *   patch_embed.proj.bias     F32 (1280,)
@@ -14,14 +15,14 @@
  *   blocks.{i=0..31}:
  *     norm1.weight/bias       F32 (1280,)
  *     norm2.weight/bias       F32 (1280,)
- *     attn.qkv.weight         F16 (3840, 1280)        — big matmul
+ *     attn.qkv.weight         F16/F32 (3840, 1280)    — big matmul
  *     attn.qkv.bias           F32 (3840,)             — all-zero in ckpt
- *     attn.proj.weight        F16 (1280, 1280)
+ *     attn.proj.weight        F16/F32 (1280, 1280)
  *     attn.proj.bias          F32 (1280,)
  *     ls1.gamma, ls2.gamma    F32 (1280,)
- *     mlp.w1/w2.weight        F16 (5120, 1280)        — SwiGLU gates
+ *     mlp.w1/w2.weight        F16/F32 (5120, 1280)    — SwiGLU gates
  *     mlp.w1/w2.bias          F32 (5120,)
- *     mlp.w3.weight           F16 (1280, 5120)        — SwiGLU down-proj
+ *     mlp.w3.weight           F16/F32 (1280, 5120)    — SwiGLU down-proj
  *     mlp.w3.bias             F32 (1280,)
  *
  * Dims: D=1280, H=20, Dh=64, N=32 blocks, ffn=5120, patch=16, default
@@ -32,6 +33,7 @@
 
 #include "cuda_sam3d_body_runner.h"
 #include "../cuew.h"
+#include "../cublasew.h"
 #include "../cuda_kernels_common.h"
 #include "cuda_sam3d_body_kernels.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
@@ -270,14 +272,19 @@ struct cuda_sam3d_body_ctx {
     int sm;
     hipModule_t mod;
     hipFunction_t fn_sentinel;
-    hipFunction_t fn_resize, fn_patch, fn_prepend;
+    hipFunction_t fn_resize, fn_patch, fn_patch_im2col, fn_prepend;
     hipFunction_t fn_bf16_round;
-    hipFunction_t fn_ln, fn_gemm_tiled;
-    hipFunction_t fn_rope_qk, fn_kv_tx, fn_fa;
+    hipFunction_t fn_ln, fn_ln_sqrtdiv, fn_ln_welford, fn_ln_welford_warp;
+    hipFunction_t fn_ln_torchvec;
+    hipFunction_t fn_gemm_tiled, fn_gemm_tiled_f32;
+    hipFunction_t fn_rope_qk, fn_kv_tx, fn_qkv_tx, fn_heads_merge;
+    hipFunction_t fn_attn_prob_v_serial;
+    hipFunction_t fn_fa, fn_sdpa_qkv;
+    hipFunction_t fn_scale_rows, fn_scale_softmax, fn_softmax_warp;
     hipFunction_t fn_silu_mul, fn_layerscale_add;
     hipFunction_t fn_ray_cond_fourier, fn_encoder_to_preconv, fn_chw_to_tok;
     hipFunction_t fn_conv1x1_chw, fn_ln_chw;
-    hipFunction_t fn_linear_bias;
+    hipFunction_t fn_linear_bias, fn_add_bias_rows;
     hipFunction_t fn_gemm_f32, fn_add_two, fn_add_inplace, fn_gelu_inplace, fn_sdpa;
     hipFunction_t fn_relu_inplace, fn_grid_sample, fn_kp_pelvis_norm,
                   fn_augment_overwrite_mask, fn_dense_pe_tok;
@@ -290,6 +297,8 @@ struct cuda_sam3d_body_ctx {
     hipFunction_t fn_mhr_keypoints;
     hipFunction_t fn_mhr_project;
     st_context *st_enc;
+    cublasew_context *cublas;
+    int use_cublas;
     int weights_ready;
 
     /* encoder weights (device ptrs). */
@@ -356,10 +365,12 @@ struct cuda_sam3d_body_ctx {
     /* device runtime buffers. */
     void    *d_img_u8;  size_t img_u8_cap;   /* (Hin, Win, 3) u8, host-resized */
     void    *d_img_f32;                       /* (3, IMG_H, IMG_W) f32 normalized */
+    void    *d_patch_cols;                    /* (N_PATCH, 3*PATCH*PATCH) f32 */
     void    *d_tok;                           /* (N_TOK, D) f32 residual stream */
     void    *d_ln;                            /* (N_TOK, D) f32 LN scratch */
     void    *d_qkv;                           /* (N_TOK, 3D) f32 fused QKV */
-    void    *d_kt, *d_vt;                     /* (HEADS, N_TOK, HEAD_DIM) */
+    void    *d_qt, *d_kt, *d_vt;              /* (HEADS, N_TOK, HEAD_DIM) */
+    void    *d_attn_scores;                   /* (HEADS, N_TOK, N_TOK) */
     void    *d_attn;                          /* (N_TOK, D) attention output */
     void    *d_proj;                          /* (N_TOK, D) post-proj scratch */
     void    *d_gate, *d_up;                   /* (N_TOK, FFN) SwiGLU */
@@ -428,6 +439,39 @@ static int cuda_sam3d_body_ray_cond_from_encoder_dev(
 static int cuda_sam3d_body_chw_to_tok_dev(
         cuda_sam3d_body_ctx *ctx, void *d_out_tok,
         const void *d_in_chw, int N, int D);
+
+static void sb_debug_dump_device_f32(cuda_sam3d_body_ctx *ctx,
+                                     const char *dir,
+                                     const char *stem,
+                                     int idx,
+                                     const void *dev,
+                                     size_t n_float)
+{
+    if (!ctx || !dir || !dir[0] || !stem || !dev || n_float == 0)
+        return;
+    float *host = (float *)malloc(n_float * sizeof(float));
+    if (!host)
+        return;
+    if (hipMemcpy(host, dev, n_float * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess) {
+        free(host);
+        return;
+    }
+    char path[1024];
+    if (idx >= 0)
+        snprintf(path, sizeof(path), "%s/%s%02d.bin", dir, stem, idx);
+    else
+        snprintf(path, sizeof(path), "%s/%s.bin", dir, stem);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(host, sizeof(float), n_float, f);
+        fclose(f);
+        if (ctx->verbose >= 2)
+            fprintf(stderr, "sam3d_body: dumped %s (%zu f32)\n",
+                    path, n_float);
+    }
+    free(host);
+}
 
 /* ===================== safetensors helpers ===================== */
 
@@ -581,17 +625,23 @@ static int sb_load_block(cuda_sam3d_body_ctx *c, int bi) {
     b->norm1_b = sb_upload_f32(c->st_enc, K("norm1.bias"),   SB_DIM);
     b->norm2_w = sb_upload_f32(c->st_enc, K("norm2.weight"), SB_DIM);
     b->norm2_b = sb_upload_f32(c->st_enc, K("norm2.bias"),   SB_DIM);
-    b->qkv_w   = sb_upload_f16(c->st_enc, K("attn.qkv.weight"), (size_t)3 * SB_DIM * SB_DIM);
+    const int fp32 = c->cfg.precision && !strcmp(c->cfg.precision, "fp32");
+    b->qkv_w   = fp32 ? sb_upload_f32(c->st_enc, K("attn.qkv.weight"), (size_t)3 * SB_DIM * SB_DIM)
+                       : sb_upload_f16(c->st_enc, K("attn.qkv.weight"), (size_t)3 * SB_DIM * SB_DIM);
     b->qkv_b   = sb_upload_f32(c->st_enc, K("attn.qkv.bias"),   (size_t)3 * SB_DIM);
-    b->proj_w  = sb_upload_f16(c->st_enc, K("attn.proj.weight"), (size_t)SB_DIM * SB_DIM);
+    b->proj_w  = fp32 ? sb_upload_f32(c->st_enc, K("attn.proj.weight"), (size_t)SB_DIM * SB_DIM)
+                       : sb_upload_f16(c->st_enc, K("attn.proj.weight"), (size_t)SB_DIM * SB_DIM);
     b->proj_b  = sb_upload_f32(c->st_enc, K("attn.proj.bias"),   SB_DIM);
     b->ls1     = sb_upload_f32(c->st_enc, K("ls1.gamma"), SB_DIM);
     b->ls2     = sb_upload_f32(c->st_enc, K("ls2.gamma"), SB_DIM);
-    b->w1_w    = sb_upload_f16(c->st_enc, K("mlp.w1.weight"), (size_t)SB_FFN * SB_DIM);
+    b->w1_w    = fp32 ? sb_upload_f32(c->st_enc, K("mlp.w1.weight"), (size_t)SB_FFN * SB_DIM)
+                       : sb_upload_f16(c->st_enc, K("mlp.w1.weight"), (size_t)SB_FFN * SB_DIM);
     b->w1_b    = sb_upload_f32(c->st_enc, K("mlp.w1.bias"),   SB_FFN);
-    b->w2_w    = sb_upload_f16(c->st_enc, K("mlp.w2.weight"), (size_t)SB_FFN * SB_DIM);
+    b->w2_w    = fp32 ? sb_upload_f32(c->st_enc, K("mlp.w2.weight"), (size_t)SB_FFN * SB_DIM)
+                       : sb_upload_f16(c->st_enc, K("mlp.w2.weight"), (size_t)SB_FFN * SB_DIM);
     b->w2_b    = sb_upload_f32(c->st_enc, K("mlp.w2.bias"),   SB_FFN);
-    b->w3_w    = sb_upload_f16(c->st_enc, K("mlp.w3.weight"), (size_t)SB_DIM * SB_FFN);
+    b->w3_w    = fp32 ? sb_upload_f32(c->st_enc, K("mlp.w3.weight"), (size_t)SB_DIM * SB_FFN)
+                       : sb_upload_f16(c->st_enc, K("mlp.w3.weight"), (size_t)SB_DIM * SB_FFN);
     b->w3_b    = sb_upload_f32(c->st_enc, K("mlp.w3.bias"),   SB_DIM);
     #undef K
     if (!b->norm1_w || !b->norm1_b || !b->norm2_w || !b->norm2_b ||
@@ -1152,13 +1202,26 @@ static int sb_compile(cuda_sam3d_body_ctx *c) {
     BIND(fn_sentinel, "sam3d_body_sentinel");
     BIND(fn_resize,   "resize_normalize");
     BIND(fn_patch,    "patch_embed_sam3d");
+    BIND(fn_patch_im2col, "patch_im2col_sam3d");
     BIND(fn_prepend,  "prepend_special_tokens");
     BIND(fn_bf16_round,     "bf16_round_inplace_f32");
     BIND(fn_ln,             "layernorm_f32");
+    BIND(fn_ln_sqrtdiv,     "layernorm_sqrtdiv_f32");
+    BIND(fn_ln_welford,     "layernorm_welford_f32");
+    BIND(fn_ln_welford_warp, "layernorm_welford_warp_f32");
+    BIND(fn_ln_torchvec,    "layernorm_torchvec_f32");
     BIND(fn_gemm_tiled,     "gemm_tiled_f16_f32");
+    BIND(fn_gemm_tiled_f32, "gemm_tiled_f32_f32");
     BIND(fn_rope_qk,        "rope_apply_qk_rh_sam3d");
     BIND(fn_kv_tx,          "kv_transpose");
+    BIND(fn_qkv_tx,         "qkv_transpose_heads_f32");
+    BIND(fn_heads_merge,    "heads_to_interleaved_f32");
+    BIND(fn_attn_prob_v_serial, "attn_prob_v_serial_f32");
+    BIND(fn_scale_rows,     "scale_rows_f32");
+    BIND(fn_scale_softmax,  "scale_softmax_rows_f32");
+    BIND(fn_softmax_warp,   "softmax_warp_1024_rows_f32");
     BIND(fn_fa,             "flash_attn_tiled_f32");
+    BIND(fn_sdpa_qkv,       "sdpa_qkv_t_f32");
     BIND(fn_silu_mul,       "silu_mul_f32");
     BIND(fn_layerscale_add, "layerscale_add_f32");
     BIND(fn_ray_cond_fourier, "ray_cond_fourier_chw_f32");
@@ -1167,6 +1230,7 @@ static int sb_compile(cuda_sam3d_body_ctx *c) {
     BIND(fn_conv1x1_chw,      "conv1x1_chw_f32");
     BIND(fn_ln_chw,           "layernorm_chw_f32");
     BIND(fn_linear_bias,      "linear_f32_bias");
+    BIND(fn_add_bias_rows,    "add_bias_rows_f32");
     BIND(fn_gemm_f32,         "gemm_f32_bias");
     BIND(fn_add_two,          "add_two_f32");
     BIND(fn_add_inplace,      "add_inplace_f32");
@@ -1210,9 +1274,16 @@ static int sb_precision_is_bf16(const cuda_sam3d_body_ctx *ctx)
     return p && p[0] && !strcmp(p, "bf16");
 }
 
+static int sb_precision_is_fp32(const cuda_sam3d_body_ctx *ctx)
+{
+    const char *p = ctx && ctx->cfg.precision ? ctx->cfg.precision : NULL;
+    return p && p[0] && !strcmp(p, "fp32");
+}
+
 static int sb_precision_is_supported(const char *p)
 {
-    return !p || !p[0] || !strcmp(p, "bf16") || !strcmp(p, "fp16");
+    return !p || !p[0] || !strcmp(p, "bf16") ||
+           !strcmp(p, "fp16") || !strcmp(p, "fp32");
 }
 
 static int sb_bf16_round(cuda_sam3d_body_ctx *ctx, void *x, int n)
@@ -1225,13 +1296,48 @@ static int sb_bf16_round(cuda_sam3d_body_ctx *ctx, void *x, int n)
                      256, 1, 1, 0, &p, sizeof(p));
 }
 
+static int sb_gemm_encoder(cuda_sam3d_body_ctx *ctx, void *Y,
+                           const void *W, const void *X, const void *bias,
+                           int n_out, int n_in, int n_tok)
+{
+    if (ctx && ctx->use_cublas && sb_precision_is_fp32(ctx) &&
+        getenv("SAM3D_BODY_CUBLAS_GEMM") &&
+        cublasew_gemm_f32_pedantic_rowmajor_nt(ctx->cublas,
+                                               (CUdeviceptr)(uintptr_t)Y,
+                                               (CUdeviceptr)(uintptr_t)W,
+                                               (CUdeviceptr)(uintptr_t)X,
+                                               n_tok, n_out, n_in) == 0) {
+        if (bias) {
+            struct __attribute__((packed)) {
+                void *x; const void *b; int N, D;
+            } p = { Y, bias, n_tok, n_out };
+            int total = n_tok * n_out;
+            if (sb_launch(ctx->fn_add_bias_rows,
+                          (unsigned)((total + 255) / 256), 1, 1,
+                          256, 1, 1, 0, &p, sizeof(p)) < 0)
+                return -1;
+        }
+        return 0;
+    }
+
+    hipFunction_t fn = sb_precision_is_fp32(ctx) ?
+        ctx->fn_gemm_tiled_f32 : ctx->fn_gemm_tiled;
+    struct __attribute__((packed)) {
+        void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
+    } p = { Y, W, X, bias, n_out, n_in, n_tok };
+    return sb_launch(fn,
+                     (unsigned)((n_out + 63) / 64),
+                     (unsigned)((n_tok + 15) / 16), 1, 16, 16, 1,
+                     0, &p, sizeof(p));
+}
+
 /* ===================== public API ===================== */
 
 cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
 {
     if (!cfg || !cfg->safetensors_dir) return NULL;
     if (!sb_precision_is_supported(cfg->precision)) {
-        fprintf(stderr, "sam3d_body: unsupported precision '%s' (expected fp16 or bf16)\n",
+        fprintf(stderr, "sam3d_body: unsupported precision '%s' (expected fp16, fp32 or bf16)\n",
                 cfg->precision);
         return NULL;
     }
@@ -1272,6 +1378,15 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
     if (sb_compile(c) < 0) {
         fprintf(stderr, "sam3d_body: kernel compile failed\n");
         free(c); return NULL;
+    }
+    if (sb_precision_is_fp32(c) &&
+        (getenv("SAM3D_BODY_CUBLAS_GEMM") ||
+         getenv("SAM3D_BODY_CUBLAS_PATCH") ||
+         getenv("SAM3D_BODY_CUBLAS_ATTN")) &&
+        cublasewCreate(&c->cublas, 0) == 0) {
+        c->use_cublas = 1;
+        if (c->verbose >= 1)
+            fprintf(stderr, "sam3d_body: cuBLAS fp32 path enabled\n");
     }
 
     char path[512];
@@ -1322,8 +1437,9 @@ cuda_sam3d_body_ctx *cuda_sam3d_body_create(const cuda_sam3d_body_config *cfg)
         goto load_decoder_and_mhr;
     }
 
-    snprintf(path, sizeof(path), "%s/sam3d_body_dinov3.safetensors",
-             cfg->safetensors_dir);
+    snprintf(path, sizeof(path), "%s/%s", cfg->safetensors_dir,
+             sb_precision_is_fp32(c) ? "sam3d_body_dinov3_fp32.safetensors"
+                                     : "sam3d_body_dinov3.safetensors");
     c->st_enc = safetensors_open(path);
     if (!c->st_enc) {
         fprintf(stderr, "sam3d_body: cannot open %s\n", path);
@@ -1498,11 +1614,14 @@ void cuda_sam3d_body_destroy(cuda_sam3d_body_ctx *ctx)
     }
     sb_free_dev(ctx->d_img_u8);
     sb_free_dev(ctx->d_img_f32);
+    sb_free_dev(ctx->d_patch_cols);
     sb_free_dev(ctx->d_tok);
     sb_free_dev(ctx->d_ln);
     sb_free_dev(ctx->d_qkv);
+    sb_free_dev(ctx->d_qt);
     sb_free_dev(ctx->d_kt);
     sb_free_dev(ctx->d_vt);
+    sb_free_dev(ctx->d_attn_scores);
     sb_free_dev(ctx->d_attn);
     sb_free_dev(ctx->d_proj);
     sb_free_dev(ctx->d_gate);
@@ -1584,6 +1703,7 @@ void cuda_sam3d_body_destroy(cuda_sam3d_body_ctx *ctx)
     sb_free_dev(ctx->d_dense_pe_tok);
     free(ctx->dense_pe_tok_h);
     free(D->host_faces_i64);
+    if (ctx->cublas) cublasewDestroy(ctx->cublas);
     if (ctx->mod) hipModuleUnload(ctx->mod);
     if (ctx->st_enc) safetensors_close(ctx->st_enc);
     if (ctx->st_dec) safetensors_close(ctx->st_dec);
@@ -2141,8 +2261,45 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
             return CUDA_SAM3D_BODY_E_LOAD;
     }
 
-    /* patch embed → rows 5..5+1024 */
-    {
+    /* patch embed → rows 5..5+n_patch */
+    if (sb_precision_is_fp32(ctx) && ctx->use_cublas &&
+        getenv("SAM3D_BODY_CUBLAS_PATCH")) {
+        const int K_PATCH = 3 * SB_PATCH * SB_PATCH;
+        if (!ctx->d_patch_cols) {
+            if (hipMalloc(&ctx->d_patch_cols,
+                          (size_t)N_PATCH * K_PATCH * sizeof(float)) != hipSuccess)
+                return CUDA_SAM3D_BODY_E_LOAD;
+        }
+        {
+            struct __attribute__((packed)) {
+                void *cols; const void *img; int gw, ps, img_h, img_w;
+            } p = { ctx->d_patch_cols, ctx->d_img_f32,
+                    GW, SB_PATCH, IMG_H, IMG_W };
+            if (sb_launch(ctx->fn_patch_im2col,
+                          (unsigned)((K_PATCH + 255) / 256),
+                          (unsigned)N_PATCH, 1, 256, 1, 1,
+                          0, &p, sizeof(p)) < 0)
+                return CUDA_SAM3D_BODY_E_LOAD;
+        }
+        void *patch_out = (char *)ctx->d_tok +
+            (size_t)(1 + SB_N_STORAGE) * SB_DIM * sizeof(float);
+        if (cublasew_gemm_f32_pedantic_rowmajor_nt(
+                ctx->cublas, (CUdeviceptr)(uintptr_t)patch_out,
+                (CUdeviceptr)(uintptr_t)ctx->w_patch_w,
+                (CUdeviceptr)(uintptr_t)ctx->d_patch_cols,
+                N_PATCH, SB_DIM, K_PATCH) != 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
+        {
+            struct __attribute__((packed)) {
+                void *x; const void *b; int N, D;
+            } p = { patch_out, ctx->w_patch_b, N_PATCH, SB_DIM };
+            int total = N_PATCH * SB_DIM;
+            if (sb_launch(ctx->fn_add_bias_rows,
+                          (unsigned)((total + 255) / 256), 1, 1,
+                          256, 1, 1, 0, &p, sizeof(p)) < 0)
+                return CUDA_SAM3D_BODY_E_LOAD;
+        }
+    } else {
         struct __attribute__((packed)) {
             void *out; const void *img; const void *w; const void *bias;
             int gw, dim, ps, img_h, img_w, base_tok;
@@ -2156,6 +2313,9 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         return CUDA_SAM3D_BODY_E_LOAD;
     if (hipDeviceSynchronize() != hipSuccess) return CUDA_SAM3D_BODY_E_LOAD;
     t_embed_ms = sb_time_ms() - t_embed0;
+    const char *debug_dump_dir = getenv("SAM3D_BODY_DINOV3_DUMP_BLOCKS_DIR");
+    sb_debug_dump_device_f32(ctx, debug_dump_dir, "cuda_dinov3_preblocks",
+                             -1, ctx->d_tok, (size_t)N_TOK * SB_DIM);
 
     /* Allocate per-block runtime scratch on first use. */
     #define ENSURE(field, bytes) do { \
@@ -2166,6 +2326,12 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
     } while (0)
     ENSURE(d_ln,   (size_t)N_TOK * SB_DIM * sizeof(float));
     ENSURE(d_qkv,  (size_t)N_TOK * 3 * SB_DIM * sizeof(float));
+    if (sb_precision_is_fp32(ctx) && ctx->use_cublas &&
+        getenv("SAM3D_BODY_CUBLAS_ATTN")) {
+        ENSURE(d_qt, (size_t)SB_HEADS * N_TOK * SB_HEAD_DIM * sizeof(float));
+        ENSURE(d_attn_scores,
+               (size_t)SB_HEADS * N_TOK * N_TOK * sizeof(float));
+    }
     ENSURE(d_kt,   (size_t)SB_HEADS * N_TOK * SB_HEAD_DIM * sizeof(float));
     ENSURE(d_vt,   (size_t)SB_HEADS * N_TOK * SB_HEAD_DIM * sizeof(float));
     ENSURE(d_attn, (size_t)N_TOK * SB_DIM * sizeof(float));
@@ -2178,6 +2344,33 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
     const double t_blocks0 = sb_time_ms();
     const float scale = 1.0f / sqrtf((float)SB_HEAD_DIM);
     const int patch_start = 1 + SB_N_STORAGE;
+    const int use_welford_ln =
+        sb_precision_is_fp32(ctx) && getenv("SAM3D_BODY_WELFORD_LN");
+    const int use_welford_warp_ln =
+        sb_precision_is_fp32(ctx) && getenv("SAM3D_BODY_WELFORD_WARP_LN");
+    const int use_sqrtdiv_ln =
+        sb_precision_is_fp32(ctx) && getenv("SAM3D_BODY_SQRTDIV_LN");
+    const int use_torchvec_ln =
+        sb_precision_is_fp32(ctx) && getenv("SAM3D_BODY_TORCHVEC_LN");
+    int torchvec_ln_y = 4;
+    if (use_torchvec_ln) {
+        const char *ln_y_s = getenv("SAM3D_BODY_TORCHVEC_LN_Y");
+        if (ln_y_s) {
+            int v = atoi(ln_y_s);
+            if (v == 1 || v == 2 || v == 4 || v == 8)
+                torchvec_ln_y = v;
+        }
+    }
+    hipFunction_t fn_dinov3_ln = use_torchvec_ln ? ctx->fn_ln_torchvec :
+        (use_welford_warp_ln ? ctx->fn_ln_welford_warp :
+        (use_welford_ln ? ctx->fn_ln_welford :
+            (use_sqrtdiv_ln ? ctx->fn_ln_sqrtdiv : ctx->fn_ln)));
+    const unsigned dinov3_ln_shmem = use_welford_warp_ln ?
+        (unsigned)(32 * sizeof(int) + 64 * sizeof(float)) :
+        (use_torchvec_ln ? (unsigned)(3 * torchvec_ln_y * sizeof(float)) :
+        (use_welford_ln ?
+            (unsigned)(256 * (2 * sizeof(float) + sizeof(int))) :
+            (unsigned)(256 * sizeof(float))));
 
     for (int L = 0; L < SB_N_BLK; L++) {
         sb_block *b = &ctx->blk[L];
@@ -2188,27 +2381,29 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
                 void *dst; const void *src, *w, *bb; int dim; float eps;
             } p = { ctx->d_ln, ctx->d_tok, b->norm1_w, b->norm1_b,
                     SB_DIM, SB_LN_EPS };
-            if (sb_launch(ctx->fn_ln, N_TOK, 1, 1, 256, 1, 1,
-                          256 * 4, &p, sizeof(p)) < 0)
+            if (sb_launch(fn_dinov3_ln, N_TOK, 1, 1,
+                          use_torchvec_ln ? 32u : 256u,
+                          use_torchvec_ln ? (unsigned)torchvec_ln_y : 1u, 1,
+                          dinov3_ln_shmem, &p, sizeof(p)) < 0)
                 return CUDA_SAM3D_BODY_E_LOAD;
         }
         if (sb_bf16_round(ctx, ctx->d_ln, N_TOK * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_norm1", -1,
+                                     ctx->d_ln, (size_t)N_TOK * SB_DIM);
 
         /* QKV: d_qkv <- gemm(qkv_w, d_ln) + qkv_b. Out cols = 3*D. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
-                    3 * SB_DIM, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((3 * SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return CUDA_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_gemm_encoder(ctx, ctx->d_qkv, b->qkv_w, ctx->d_ln, b->qkv_b,
+                            3 * SB_DIM, SB_DIM, N_TOK) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_qkv, N_TOK * 3 * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_qkv", -1,
+                                     ctx->d_qkv, (size_t)N_TOK * 3 * SB_DIM);
 
         /* RoPE on Q,K (patch tokens only). */
         {
@@ -2223,9 +2418,30 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
         if (sb_bf16_round(ctx, ctx->d_qkv, N_TOK * 3 * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_qkv_rope", -1,
+                                     ctx->d_qkv, (size_t)N_TOK * 3 * SB_DIM);
 
-        /* kv_transpose: deinterleave K, V into per-head contiguous layout. */
-        {
+        const int use_cublas_attn =
+            sb_precision_is_fp32(ctx) && ctx->use_cublas &&
+            getenv("SAM3D_BODY_CUBLAS_ATTN");
+        const int torch_sdpa_style =
+            use_cublas_attn && getenv("SAM3D_BODY_TORCH_SDPA_STYLE");
+
+        /* Deinterleave K/V, and Q as well for the cuBLAS strict path. */
+        if (use_cublas_attn) {
+            struct __attribute__((packed)) {
+                void *Q, *K, *V; const void *qkv;
+                int n_tok, dim, heads, hd; float qk_scale;
+            } p = { ctx->d_qt, ctx->d_kt, ctx->d_vt, ctx->d_qkv,
+                    N_TOK, SB_DIM, SB_HEADS, SB_HEAD_DIM,
+                    torch_sdpa_style ? sqrtf(scale) : 1.0f };
+            unsigned total = (unsigned)(N_TOK * SB_DIM);
+            if (sb_launch(ctx->fn_qkv_tx, (total + 255) / 256, 1, 1,
+                          256, 1, 1, 0, &p, sizeof(p)) < 0)
+                return CUDA_SAM3D_BODY_E_LOAD;
+        } else {
             struct __attribute__((packed)) {
                 void *K, *V; const void *qkv;
                 int n_tok, dim, heads, hd;
@@ -2238,7 +2454,172 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
 
         /* FlashAttention: d_attn <- softmax(Q K^T * scale) V. */
-        {
+        if (use_cublas_attn) {
+            const int cublas_attn_fast =
+                getenv("SAM3D_BODY_CUBLAS_ATTN_FAST") != NULL;
+            const int qk_strided_qkv =
+                getenv("SAM3D_BODY_ATTN_QK_STRIDED_QKV") != NULL;
+            for (int h = 0; h < SB_HEADS; h++) {
+                CUdeviceptr Sh = (CUdeviceptr)(uintptr_t)
+                    ((char *)ctx->d_attn_scores + (size_t)h * N_TOK * N_TOK * sizeof(float));
+                int rc_gemm;
+                if (qk_strided_qkv) {
+                    CUdeviceptr Qh = (CUdeviceptr)(uintptr_t)
+                        ((char *)ctx->d_qkv + (size_t)h * SB_HEAD_DIM * sizeof(float));
+                    CUdeviceptr Kh = (CUdeviceptr)(uintptr_t)
+                        ((char *)ctx->d_qkv + ((size_t)SB_DIM + (size_t)h * SB_HEAD_DIM) * sizeof(float));
+                    rc_gemm = cublasew_gemm_f32_pedantic_rowmajor_nt_strided(
+                        ctx->cublas, Sh, Kh, 3 * SB_DIM, Qh, 3 * SB_DIM,
+                        N_TOK, N_TOK, SB_HEAD_DIM);
+                } else {
+                    CUdeviceptr Qh = (CUdeviceptr)(uintptr_t)
+                        ((char *)ctx->d_qt + (size_t)h * N_TOK * SB_HEAD_DIM * sizeof(float));
+                    CUdeviceptr Kh = (CUdeviceptr)(uintptr_t)
+                        ((char *)ctx->d_kt + (size_t)h * N_TOK * SB_HEAD_DIM * sizeof(float));
+                    rc_gemm = cublas_attn_fast ?
+                        cublasew_gemm_f32_rowmajor_nt(
+                            ctx->cublas, Sh, Kh, Qh, N_TOK, N_TOK, SB_HEAD_DIM) :
+                        cublasew_gemm_f32_pedantic_rowmajor_nt(
+                            ctx->cublas, Sh, Kh, Qh, N_TOK, N_TOK, SB_HEAD_DIM);
+                }
+                if (rc_gemm != 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+            }
+            if (torch_sdpa_style) {
+                struct __attribute__((packed)) {
+                    void *x; int rows, cols;
+                } p = { ctx->d_attn_scores, SB_HEADS * N_TOK, N_TOK };
+                if (sb_launch(ctx->fn_softmax_warp,
+                              (unsigned)((SB_HEADS * N_TOK + 3) / 4), 1, 1,
+                              32, 4, 1, 0,
+                              &p, sizeof(p)) < 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+            } else if (getenv("SAM3D_BODY_WARP_SOFTMAX")) {
+                struct __attribute__((packed)) {
+                    void *x; int n; float sc;
+                } ps = { ctx->d_attn_scores,
+                         SB_HEADS * N_TOK * N_TOK, scale };
+                if (sb_launch(ctx->fn_scale_rows,
+                              (unsigned)((SB_HEADS * N_TOK * N_TOK + 255) / 256),
+                              1, 1, 256, 1, 1, 0, &ps, sizeof(ps)) < 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+                struct __attribute__((packed)) {
+                    void *x; int rows, cols;
+                } p = { ctx->d_attn_scores, SB_HEADS * N_TOK, N_TOK };
+                if (sb_launch(ctx->fn_softmax_warp,
+                              (unsigned)((SB_HEADS * N_TOK + 3) / 4), 1, 1,
+                              32, 4, 1, 0,
+                              &p, sizeof(p)) < 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+            } else {
+                struct __attribute__((packed)) {
+                    void *x; int rows, cols; float sc;
+                } p = { ctx->d_attn_scores, SB_HEADS * N_TOK, N_TOK, scale };
+                if (sb_launch(ctx->fn_scale_softmax,
+                              (unsigned)(SB_HEADS * N_TOK), 1, 1,
+                              256, 1, 1, 256 * sizeof(float),
+                              &p, sizeof(p)) < 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+            }
+            if (L == 0)
+                sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                         "cuda_dinov3_b00_attn_prob", -1,
+                                         ctx->d_attn_scores,
+                                         (size_t)SB_HEADS * N_TOK * N_TOK);
+            int value_serial_this_block =
+                getenv("SAM3D_BODY_ATTN_VALUE_SERIAL") != NULL;
+            const char *serial_until =
+                getenv("SAM3D_BODY_ATTN_VALUE_SERIAL_UNTIL");
+            const char *serial_from =
+                getenv("SAM3D_BODY_ATTN_VALUE_SERIAL_FROM");
+            const char *serial_skip =
+                getenv("SAM3D_BODY_ATTN_VALUE_SERIAL_SKIP");
+            if (serial_until)
+                value_serial_this_block |= L < atoi(serial_until);
+            if (serial_from)
+                value_serial_this_block |= L >= atoi(serial_from);
+            if (serial_skip) {
+                const char *p_skip = serial_skip;
+                while (*p_skip) {
+                    char *end = NULL;
+                    long v = strtol(p_skip, &end, 10);
+                    if (end == p_skip) {
+                        p_skip++;
+                        continue;
+                    }
+                    if (v == L) {
+                        value_serial_this_block = 0;
+                        break;
+                    }
+                    p_skip = end;
+                }
+            }
+            if (value_serial_this_block) {
+                struct __attribute__((packed)) {
+                    void *out; const void *prob, *V;
+                    int n_tok, dim, heads, hd;
+                } p = { ctx->d_attn, ctx->d_attn_scores, ctx->d_vt,
+                        N_TOK, SB_DIM, SB_HEADS, SB_HEAD_DIM };
+                unsigned total = (unsigned)(N_TOK * SB_DIM);
+                if (sb_launch(ctx->fn_attn_prob_v_serial,
+                              (total + 255) / 256, 1, 1,
+                              256, 1, 1, 0, &p, sizeof(p)) < 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+            } else if (getenv("SAM3D_BODY_ATTN_VALUE_STRIDED_QKV")) {
+                for (int h = 0; h < SB_HEADS; h++) {
+                    CUdeviceptr Sh = (CUdeviceptr)(uintptr_t)
+                        ((char *)ctx->d_attn_scores + (size_t)h * N_TOK * N_TOK * sizeof(float));
+                    CUdeviceptr Vh = (CUdeviceptr)(uintptr_t)
+                        ((char *)ctx->d_qkv + ((size_t)2 * SB_DIM + (size_t)h * SB_HEAD_DIM) * sizeof(float));
+                    CUdeviceptr Oh = (CUdeviceptr)(uintptr_t)
+                        ((char *)ctx->d_attn + (size_t)h * SB_HEAD_DIM * sizeof(float));
+                    if (cublasew_gemm_f32_pedantic_rowmajor_nn_stridedB(
+                            ctx->cublas, Oh, SB_DIM, Sh, Vh, 3 * SB_DIM,
+                            N_TOK, SB_HEAD_DIM, N_TOK) != 0)
+                        return CUDA_SAM3D_BODY_E_LOAD;
+                }
+            } else {
+            for (int h = 0; h < SB_HEADS; h++) {
+                CUdeviceptr Sh = (CUdeviceptr)(uintptr_t)
+                    ((char *)ctx->d_attn_scores + (size_t)h * N_TOK * N_TOK * sizeof(float));
+                CUdeviceptr Vh = (CUdeviceptr)(uintptr_t)
+                    ((char *)ctx->d_vt + (size_t)h * N_TOK * SB_HEAD_DIM * sizeof(float));
+                CUdeviceptr Oh = (CUdeviceptr)(uintptr_t)
+                    ((char *)ctx->d_qt + (size_t)h * N_TOK * SB_HEAD_DIM * sizeof(float));
+                int rc_gemm = cublas_attn_fast ?
+                    cublasew_gemm_f32_rowmajor_nn(
+                        ctx->cublas, Oh, SB_HEAD_DIM, Sh, Vh, N_TOK,
+                        SB_HEAD_DIM, N_TOK) :
+                    cublasew_gemm_f32_pedantic_rowmajor_nn(
+                        ctx->cublas, Oh, SB_HEAD_DIM, Sh, Vh, N_TOK,
+                        SB_HEAD_DIM, N_TOK);
+                if (rc_gemm != 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+            }
+            {
+                struct __attribute__((packed)) {
+                    void *out; const void *heads_buf;
+                    int n_tok, dim, heads, hd;
+                } p = { ctx->d_attn, ctx->d_qt,
+                        N_TOK, SB_DIM, SB_HEADS, SB_HEAD_DIM };
+                unsigned total = (unsigned)(N_TOK * SB_DIM);
+                if (sb_launch(ctx->fn_heads_merge,
+                              (total + 255) / 256, 1, 1,
+                              256, 1, 1, 0, &p, sizeof(p)) < 0)
+                    return CUDA_SAM3D_BODY_E_LOAD;
+            }
+            }
+        } else if (sb_precision_is_fp32(ctx) && getenv("SAM3D_BODY_PRECISE_ATTN")) {
+            struct __attribute__((packed)) {
+                void *out; const void *qkv, *K, *V;
+                int n_tok, dim, heads, hd; float sc;
+            } p = { ctx->d_attn, ctx->d_qkv, ctx->d_kt, ctx->d_vt,
+                    N_TOK, SB_DIM, SB_HEADS, SB_HEAD_DIM, scale };
+            unsigned shmem = (256u + (unsigned)N_TOK) * sizeof(float);
+            if (sb_launch(ctx->fn_sdpa_qkv, (unsigned)N_TOK, SB_HEADS, 1,
+                          256, 1, 1, shmem, &p, sizeof(p)) < 0)
+                return CUDA_SAM3D_BODY_E_LOAD;
+        } else {
             struct __attribute__((packed)) {
                 void *out; const void *qkv, *K, *V;
                 int n_tok, dim, heads, hd; float sc;
@@ -2252,21 +2633,21 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
         if (sb_bf16_round(ctx, ctx->d_attn, N_TOK * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_attn_preproj", -1,
+                                     ctx->d_attn, (size_t)N_TOK * SB_DIM);
 
         /* Output projection: d_proj <- gemm(proj_w, d_attn) + proj_b. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_proj, b->proj_w, ctx->d_attn, b->proj_b,
-                    SB_DIM, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return CUDA_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_gemm_encoder(ctx, ctx->d_proj, b->proj_w, ctx->d_attn,
+                            b->proj_b, SB_DIM, SB_DIM, N_TOK) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_proj, N_TOK * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_attn_proj", -1,
+                                     ctx->d_proj, (size_t)N_TOK * SB_DIM);
 
         /* LayerScale1 + residual: d_tok += d_proj * ls1. */
         {
@@ -2280,6 +2661,10 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
         if (sb_bf16_round(ctx, ctx->d_tok, N_TOK * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_x_attn", -1,
+                                     ctx->d_tok, (size_t)N_TOK * SB_DIM);
 
         /* LN2: d_ln <- LN(d_tok, norm2_w, norm2_b) */
         {
@@ -2287,38 +2672,38 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
                 void *dst; const void *src, *w, *bb; int dim; float eps;
             } p = { ctx->d_ln, ctx->d_tok, b->norm2_w, b->norm2_b,
                     SB_DIM, SB_LN_EPS };
-            if (sb_launch(ctx->fn_ln, N_TOK, 1, 1, 256, 1, 1,
-                          256 * 4, &p, sizeof(p)) < 0)
+            if (sb_launch(fn_dinov3_ln, N_TOK, 1, 1,
+                          use_torchvec_ln ? 32u : 256u,
+                          use_torchvec_ln ? (unsigned)torchvec_ln_y : 1u, 1,
+                          dinov3_ln_shmem, &p, sizeof(p)) < 0)
                 return CUDA_SAM3D_BODY_E_LOAD;
         }
         if (sb_bf16_round(ctx, ctx->d_ln, N_TOK * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_norm2", -1,
+                                     ctx->d_ln, (size_t)N_TOK * SB_DIM);
 
         /* SwiGLU: d_gate <- gemm(w1, d_ln) + b1; d_up <- gemm(w2, d_ln) + b2. */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } pg = { ctx->d_gate, b->w1_w, ctx->d_ln, b->w1_b,
-                     SB_FFN, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &pg, sizeof(pg)) < 0)
-                return CUDA_SAM3D_BODY_E_LOAD;
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } pu = { ctx->d_up, b->w2_w, ctx->d_ln, b->w2_b,
-                     SB_FFN, SB_DIM, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_FFN + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &pu, sizeof(pu)) < 0)
-                return CUDA_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_gemm_encoder(ctx, ctx->d_gate, b->w1_w, ctx->d_ln, b->w1_b,
+                            SB_FFN, SB_DIM, N_TOK) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
+        if (sb_gemm_encoder(ctx, ctx->d_up, b->w2_w, ctx->d_ln, b->w2_b,
+                            SB_FFN, SB_DIM, N_TOK) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_gate, N_TOK * SB_FFN) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_up, N_TOK * SB_FFN) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0) {
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_mlp_w1", -1,
+                                     ctx->d_gate, (size_t)N_TOK * SB_FFN);
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_mlp_w2", -1,
+                                     ctx->d_up, (size_t)N_TOK * SB_FFN);
+        }
 
         /* d_gate := silu(d_gate) * d_up. */
         {
@@ -2332,21 +2717,21 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
         if (sb_bf16_round(ctx, ctx->d_gate, N_TOK * SB_FFN) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_mlp_act", -1,
+                                     ctx->d_gate, (size_t)N_TOK * SB_FFN);
 
         /* w3: d_proj <- gemm(w3, d_gate) + b3.   (FFN→D)  reuse d_proj */
-        {
-            struct __attribute__((packed)) {
-                void *Y; const void *W, *X, *bias; int n_out, n_in, n_tok;
-            } p = { ctx->d_proj, b->w3_w, ctx->d_gate, b->w3_b,
-                    SB_DIM, SB_FFN, N_TOK };
-            if (sb_launch(ctx->fn_gemm_tiled,
-                          (unsigned)((SB_DIM + 63) / 64),
-                          (unsigned)((N_TOK + 15) / 16), 1, 16, 16, 1,
-                          0, &p, sizeof(p)) < 0)
-                return CUDA_SAM3D_BODY_E_LOAD;
-        }
+        if (sb_gemm_encoder(ctx, ctx->d_proj, b->w3_w, ctx->d_gate, b->w3_b,
+                            SB_DIM, SB_FFN, N_TOK) < 0)
+            return CUDA_SAM3D_BODY_E_LOAD;
         if (sb_bf16_round(ctx, ctx->d_proj, N_TOK * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+        if (L == 0)
+            sb_debug_dump_device_f32(ctx, debug_dump_dir,
+                                     "cuda_dinov3_b00_mlp_w3", -1,
+                                     ctx->d_proj, (size_t)N_TOK * SB_DIM);
 
         /* LayerScale2 + residual: d_tok += d_proj * ls2. */
         {
@@ -2360,6 +2745,9 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
         }
         if (sb_bf16_round(ctx, ctx->d_tok, N_TOK * SB_DIM) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
+
+        sb_debug_dump_device_f32(ctx, debug_dump_dir, "cuda_dinov3_block",
+                                 L, ctx->d_tok, (size_t)N_TOK * SB_DIM);
     }
     if (hipDeviceSynchronize() != hipSuccess) return CUDA_SAM3D_BODY_E_LOAD;
     t_blocks_ms = sb_time_ms() - t_blocks0;
@@ -2371,14 +2759,18 @@ int cuda_sam3d_body_run_encoder(cuda_sam3d_body_ctx *ctx)
             void *dst; const void *src, *w, *bb; int dim; float eps;
         } p = { ctx->d_proj, ctx->d_tok, ctx->w_norm_w, ctx->w_norm_b,
                 SB_DIM, SB_LN_EPS };
-        if (sb_launch(ctx->fn_ln, N_TOK, 1, 1, 256, 1, 1,
-                      256 * 4, &p, sizeof(p)) < 0)
+        if (sb_launch(fn_dinov3_ln, N_TOK, 1, 1,
+                      use_torchvec_ln ? 32u : 256u,
+                      use_torchvec_ln ? (unsigned)torchvec_ln_y : 1u, 1,
+                      dinov3_ln_shmem, &p, sizeof(p)) < 0)
             return CUDA_SAM3D_BODY_E_LOAD;
     }
     if (sb_bf16_round(ctx, ctx->d_proj, N_TOK * SB_DIM) < 0)
         return CUDA_SAM3D_BODY_E_LOAD;
 
     if (hipDeviceSynchronize() != hipSuccess) return CUDA_SAM3D_BODY_E_LOAD;
+    sb_debug_dump_device_f32(ctx, debug_dump_dir, "cuda_dinov3_final",
+                             -1, ctx->d_proj, (size_t)N_TOK * SB_DIM);
     t_final_norm_ms = sb_time_ms() - t_final0;
 
     /* Copy final encoder tokens (post-LN) to host. */
