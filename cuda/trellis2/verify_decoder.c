@@ -11,16 +11,23 @@ static float *read_npy_f32(const char *path, int *ndim, int *dims) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "Cannot read %s\n", path); return NULL; }
     fseek(f, 8, SEEK_SET);
-    uint16_t hl; fread(&hl, 2, 1, f);
-    char *hdr = malloc(hl + 1); fread(hdr, 1, hl, f); hdr[hl] = 0;
+    uint16_t hl;
+    if (fread(&hl, 2, 1, f) != 1) { fclose(f); return NULL; }
+    char *hdr = malloc(hl + 1);
+    if (fread(hdr, 1, hl, f) != (size_t)hl) { free(hdr); fclose(f); return NULL; }
+    hdr[hl] = 0;
     *ndim = 0;
     char *sp = strstr(hdr, "shape");
     if (sp) { sp = strchr(sp, '('); if (sp) { sp++;
-        while (*sp && *sp != ')') { while (*sp==' '||*sp==',') sp++;
-            if (*sp==')') break; dims[*ndim]=(int)strtol(sp,&sp,10); (*ndim)++; if(*ndim>=8) break; }}}
+        while (*sp && *sp != ')') {
+            while (*sp==' '||*sp==',') sp++;
+            if (*sp==')') break;
+            dims[*ndim]=(int)strtol(sp,&sp,10); (*ndim)++;
+            if(*ndim>=8) break;
+        }}}
     size_t n = 1; for (int i = 0; i < *ndim; i++) n *= dims[i];
     float *data = malloc(n * sizeof(float));
-    fread(data, sizeof(float), n, f);
+    if (fread(data, sizeof(float), n, f) != n) { free(data); free(hdr); fclose(f); return NULL; }
     fclose(f); free(hdr);
     return data;
 }
