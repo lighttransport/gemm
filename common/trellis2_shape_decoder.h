@@ -700,7 +700,9 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
             int32_t x  = t->coords[i * 4 + 3];
             for (int s = 0; s < 8; s++) {
                 if (sub_logits && sub_logits[i * 8 + s] <= 0) continue;
-                int dz = (s >> 2) & 1, dy = (s >> 1) & 1, dx = s & 1;
+                /* Match upstream SparseChannel2Spatial: coord dimension i gets
+                 * bit i of subidx, so coords=(b,z,y,x) maps z=bit0, x=bit2. */
+                int dz = s & 1, dy = (s >> 1) & 1, dx = (s >> 2) & 1;
                 sub_coords[si * 4 + 0] = bz;
                 sub_coords[si * 4 + 1] = z * 2 + dz;
                 sub_coords[si * 4 + 2] = y * 2 + dy;
@@ -1117,7 +1119,8 @@ int t2_shape_dec_unguided_synth_host(const t2_shape_dec *d, int stage_idx,
         int32_t cx = coords[i * 4 + 3];
         for (int s = 0; s < 8; s++) {
             if (logits[i * 8 + s] <= 0) continue;
-            int dz = (s >> 2) & 1, dy = (s >> 1) & 1, dx = s & 1;
+            /* Match upstream SparseChannel2Spatial bit order. */
+            int dz = s & 1, dy = (s >> 1) & 1, dx = (s >> 2) & 1;
             idx[kw] = i;
             si[kw]  = s;
             xc[kw * 4 + 0] = bz;
