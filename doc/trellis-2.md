@@ -316,6 +316,7 @@ Result:
 | F32 default + precise math | N=3279,C=7 | N=3279,C=7 | 0 | 1.00000000 | 9.43e-7 | 2.75e-4 | ~175 ms |
 | `T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1` | — | N=3279,C=7 | 0 | 1.00000000 | 5.28e-7 | 8.39e-5 | ~100 ms |
 | `T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1 T2_SCVAE_CPUAVX_LN=1 T2_SCVAE_OUTPUT_GROUP=25 T2_SCVAE_OUTPUT_GROUP_FMA=1` | — | N=3279,C=7 | 0 | 1.00000000 | 5.07e-7 | 6.48e-5 | ~120 ms |
+| previous row + `T2_SCVAE_FINAL_LN_EPS=0.000009` | — | N=3279,C=7 | 0 | 1.00000000 | 5.02e-7 | 6.10e-5 | ~120 ms |
 
 Raw PyTorch fp32 CUDA reference for the same shape input is persisted in
 `ref/trellis2/dumps/shape_scvae_fujisan128/`. It bypasses the optional
@@ -475,6 +476,53 @@ Current localization on the shape smoke:
   - Automated Python `subprocess` sweeps hit `cuInit failed (100)` on this
     machine even when direct verifier invocations work, so continue using direct
     shell verifier runs for CUDA sweeps.
+  - Direct sparse-conv double-accumulation probes with the projected metric did
+    not help: stage3 C2S conv2 direct mode2 raised projected max to `7.35e-5`,
+    stage2 C2S conv2 direct mode2 to `9.58e-5`, and stage3 C2S conv1 direct
+    mode2 to `7.67e-5`.
+  - Stage-wide affine Welford LayerNorm probes all worsened the projected
+    pre-output direction: stage0 `7.94e-5`, stage1 `1.02e-4`, stage2
+    `8.78e-5`, and stage3 `8.47e-5`.
+  - Multi-site cuBLASLt MLP2 combination probes were enabled to test whether
+    individually bad directions cancel. Sampled combinations still worsened:
+    `2:7:2,3:0:2` -> `7.64e-5`, `2:1:2,3:0:2` -> `8.53e-5`,
+    `3:0:2,3:1:2` -> `7.91e-5`, and `2:1:2,2:7:2,3:0:2` -> `8.55e-5`.
+  - `T2SD_STOP_AFTER_C2S_OP=stage:7` returns `to_subdiv` logits as `[N,8]`
+    before host thresholding. All four stage logits are coordinate-exact and
+    well away from topology flips on the worst rows. Minimum positive margins:
+    stage0 `0.428`, stage1 `0.126`, stage2 `0.00242`, stage3 `0.00253`;
+    largest negative logit in stage3 is `-0.000290`. The persistent worst rows
+    have emitted-child logits far from zero, so subdivision topology is not the
+    hidden failure mode.
+  - Final no-affine LayerNorm epsilon is the only knob so far that reduces the
+    full-output max. `T2_SCVAE_FINAL_LN_EPS=0.000009` with group25/FMA lowers
+    final max from `6.48e-5` to `6.10e-5` and projected pre-output max from
+    `6.63e-5` to `6.28e-5`. This is an output-max cancellation/parity tradeoff:
+    PyTorch's `F.layer_norm` default is still `1e-5`. Tested `8.9e-6` and
+    `9.1e-6` tie `6.10e-5`; `8.5e-6`, `9.25e-6`, and output groups 27/31 or
+    cuBLASLt bias output are worse.
+  - Additional full-output probes with the `9e-6` final-LN eps did not improve
+    the max: CPU-built sparse gather maps, cuBLAS pedantic mode, cuBLAS for all
+    ConvNeXt MLP GEMMs, and `sqrtf` LayerNorm all tied `6.10e-5`. Output
+    group28/FMA also ties the max; `eps=9.2e-6` with group28 gives slightly
+    lower rel L2 (`5.01e-7`) but still maxes at `6.10e-5`. Group24/26 and
+    group28 with `eps=8.8e-6`/`9.6e-6` are worse (`6.48e-5` to `6.87e-5`).
+    Serial/double final-LN mode3 with `eps=9.2e-6` is also worse (`6.48e-5`).
+  - Exact-start downstream checks with the current best flags sharpen the
+    remaining target. Starting from saved PyTorch `stage3_block3` and running
+    stage3 C2S + final output gives `3.05e-5` max. Starting from saved PyTorch
+    `stage2_block7` and running stage2 C2S + stage3 + final output gives
+    `7.63e-5` with group25/`eps=9e-6`; group28 improves that exact-start path
+    to `6.87e-5`, and group28 with `eps=9.2e-6` improves it to `6.48e-5`, but
+    none of these improve the full-run max. Stage2 C2S alone from exact
+    `stage2_block7` is only `5.72e-6` max, and exact-stage2 through final LN
+    gives pre-output max `4.53e-6`; projected through `output_layer.weight`,
+    that pre-output drift is `5.93e-5` at `row=3201 col=4`. This confirms the
+    current bottleneck is a tiny C=64 drift direction, not a large local
+    feature error.
+  - Full-run group28/`eps=9.2e-6` output-order variants: mode1 ties the current
+    `6.10e-5` max with rel L2 `5.02e-7`, while modes 2 and 3 are worse
+    (`6.87e-5`).
 
 Additional debug knobs for this path:
 
@@ -483,7 +531,8 @@ Additional debug knobs for this path:
 - `T2SD_GROUP_MLP=stage:block:op:group`: force the grouped scalar-order GEMM
   for one MLP op; `block=-1` and `op=-1` are wildcards.
 - `T2SD_CUBLASLT_MLP=stage:block:op`: force cuBLASLt bias GEMM for selected
-  ConvNeXt MLP ops; wildcards are the same as above.
+  ConvNeXt MLP ops; wildcards are the same as above. Multiple sites can be
+  separated with commas or semicolons.
 - `T2_SCVAE_WELFORD_AFFINE_LN=1`: use a PyTorch CUDA vectorized-Welford-order
   affine LayerNorm for all affine SC-VAE LayerNorm sites.
 - `T2SD_WELFORD_AFFINE_LN=stage:block`: use the affine Welford LayerNorm for
@@ -617,7 +666,8 @@ Debug stop hooks for the texture SC-VAE parity path:
   post sparse conv, `op=1` post affine LayerNorm, and `op=2` post MLP.
 - `T2SD_STOP_AFTER_C2S_OP=stage:op`: C2S op stop, where `op=0` pre-conv1,
   `1` post-conv1, `2` post-updown `h`, `3` post-updown residual `x`,
-  `4` pre-conv2, `5` post-conv2, and `6` final residual output.
+  `4` pre-conv2, `5` post-conv2, `6` final residual output, and `7`
+  `to_subdiv` logits before thresholding.
 - `T2SD_STOP_AT_START=1`: return the uploaded start tensor before any op.
 - `T2_VERIFY_DUMP_FEATS=/path.npy T2_VERIFY_DUMP_COORDS=/path.npy` dumps the
   CUDA tensor emitted by the verifier stop point.
