@@ -37,8 +37,9 @@ typedef struct {
                               * For VITH the input remains fixed 512x384. */
     int device_ordinal;
     int verbose;
-    /* precision: "fp16" (default fast F16-weight path), "bf16" (extra
-     * activation round-trips for diagnosis). NULL or "" -> "fp16". */
+    /* precision: "fp16" (default fast F16-weight path), "fp32" (DINOv3
+     * f32 block weights), "bf16" (extra activation round-trips for
+     * diagnosis). NULL or "" -> "fp16". */
     const char *precision;
     /* Backbone variant. Defaults to DINOV3 (=0) when zero-initialized. */
     cuda_sam3d_body_backbone_t backbone;
