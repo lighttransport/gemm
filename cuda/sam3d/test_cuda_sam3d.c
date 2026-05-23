@@ -54,6 +54,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -73,6 +74,13 @@ static int has_suffix(const char *s, const char *suffix)
     if (!s || !suffix) return 0;
     size_t ns = strlen(s), nx = strlen(suffix);
     return ns >= nx && strcmp(s + ns - nx, suffix) == 0;
+}
+
+static double cli_time_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
 static int write_mesh_file_rgb(const mc_mesh *mesh, const float *rgb,
@@ -477,6 +485,11 @@ static int run_moge_pointmap(const char *python, const char *script,
 
 int main(int argc, char **argv)
 {
+    const double t_main0 = cli_time_ms();
+    double t_decode_image_ms = 0.0, t_decode_mask_ms = 0.0;
+    double t_moge_ms = 0.0, t_load_pointmap_ms = 0.0;
+    double t_create_ms = 0.0, t_set_inputs_ms = 0.0;
+    double t_mesh_ms = 0.0, t_ply_write_ms = 0.0;
     cuda_sam3d_config cfg = {0};
     cfg.device_ordinal = 0;
     cfg.verbose        = 0;
@@ -635,7 +648,9 @@ int main(int argc, char **argv)
     int iw = 0, ih = 0, ichan = 0;
     uint8_t *pixels = NULL;
     if (image_path) {
+        double t0 = cli_time_ms();
         pixels = stbi_load(image_path, &iw, &ih, &ichan, 4);
+        t_decode_image_ms = cli_time_ms() - t0;
         if (!pixels) { fprintf(stderr, "cannot decode %s\n", image_path); return 3; }
     }
 
@@ -643,7 +658,9 @@ int main(int argc, char **argv)
     int mw = 0, mh = 0, mchan = 0;
     uint8_t *mpix = NULL;
     if (mask_path) {
+        double t0 = cli_time_ms();
         mpix = stbi_load(mask_path, &mw, &mh, &mchan, 1);
+        t_decode_mask_ms = cli_time_ms() - t0;
         if (!mpix) {
             fprintf(stderr, "cannot decode %s\n", mask_path);
             stbi_image_free(pixels); return 3;
@@ -673,18 +690,22 @@ int main(int argc, char **argv)
             pointmap_path = generated_pointmap_path;
             generated_pointmap_temp = 1;
         }
+        double t0 = cli_time_ms();
         if (run_moge_pointmap(moge_python, moge_script, image_path,
                               pointmap_path, moge_model, moge_device) != 0) {
             stbi_image_free(pixels); stbi_image_free(mpix);
             return 4;
         }
+        t_moge_ms = cli_time_ms() - t0;
     }
 
     /* Optional pointmap. Use --moge to generate one with the Python MoGe helper. */
     float *pmap = NULL;
     int pmap_dims[8] = {0}, pmap_ndim = 0, pmap_is_f32 = 0;
     if (pointmap_path) {
+        double t0 = cli_time_ms();
         pmap = (float *)npy_load(pointmap_path, &pmap_ndim, pmap_dims, &pmap_is_f32);
+        t_load_pointmap_ms = cli_time_ms() - t0;
         if (!pmap || !pmap_is_f32 || pmap_ndim != 3 || pmap_dims[2] != 3) {
             fprintf(stderr, "pointmap must be (H, W, 3) f32; got ndim=%d\n", pmap_ndim);
             free(pmap); stbi_image_free(pixels); stbi_image_free(mpix);
@@ -692,13 +713,16 @@ int main(int argc, char **argv)
         }
     }
 
+    double t0 = cli_time_ms();
     cuda_sam3d_ctx *ctx = cuda_sam3d_create(&cfg);
+    t_create_ms = cli_time_ms() - t0;
     if (!ctx) {
         fprintf(stderr, "[test_cuda_sam3d] cuda_sam3d_create failed\n");
         stbi_image_free(pixels); stbi_image_free(mpix); free(pmap);
         return 5;
     }
 
+    t0 = cli_time_ms();
     if (pixels && cuda_sam3d_set_image_rgba(ctx, pixels, iw, ih) != 0) {
         fprintf(stderr, "set image failed\n");
         cuda_sam3d_destroy(ctx); stbi_image_free(pixels); stbi_image_free(mpix); free(pmap);
@@ -714,6 +738,7 @@ int main(int argc, char **argv)
         cuda_sam3d_destroy(ctx); stbi_image_free(pixels); stbi_image_free(mpix); free(pmap);
         return 5;
     }
+    t_set_inputs_ms = cli_time_ms() - t0;
 
     int rc = 0;
     int32_t *slat_coords = NULL;
@@ -754,6 +779,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "[test_cuda_sam3d] --mesh-source slat needs --mesh-decoder\n");
                 rc = 10; goto cleanup;
             }
+            t0 = cli_time_ms();
             if (write_learned_mesh(ctx, mesh_dec_path, mesh_out_path,
                                    mesh_threads, mesh_texture_size,
                                    mesh_texture_use_xatlas,
@@ -762,6 +788,7 @@ int main(int argc, char **argv)
                                    pmap, pmap_dims[1], pmap_dims[0]) != 0) {
                 rc = 10; goto cleanup;
             }
+            t_mesh_ms += cli_time_ms() - t0;
             if (mesh_only) goto cleanup;
         }
     } else {
@@ -770,9 +797,11 @@ int main(int argc, char **argv)
         if ((rc = cuda_sam3d_run_ss_dit(ctx))     != 0) { fprintf(stderr, "ss_dit rc=%d\n",     rc); goto cleanup; }
         if ((rc = cuda_sam3d_run_ss_decode(ctx))  != 0) { fprintf(stderr, "ss_decode rc=%d\n",  rc); goto cleanup; }
         if (mesh_out_path && !mesh_source_slat) {
+            t0 = cli_time_ms();
             if (write_occupancy_mesh(ctx, mesh_out_path, mesh_iso) != 0) {
                 rc = 10; goto cleanup;
             }
+            t_mesh_ms += cli_time_ms() - t0;
             if (mesh_only) goto cleanup;
         }
         if ((rc = cuda_sam3d_run_slat_dit(ctx))   != 0) { fprintf(stderr, "slat_dit rc=%d\n",   rc); goto cleanup; }
@@ -781,6 +810,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "[test_cuda_sam3d] --mesh-source slat needs --mesh-decoder\n");
                 rc = 10; goto cleanup;
             }
+            t0 = cli_time_ms();
             if (write_learned_mesh(ctx, mesh_dec_path, mesh_out_path,
                                    mesh_threads, mesh_texture_size,
                                    mesh_texture_use_xatlas,
@@ -789,6 +819,7 @@ int main(int argc, char **argv)
                                    pmap, pmap_dims[1], pmap_dims[0]) != 0) {
                 rc = 10; goto cleanup;
             }
+            t_mesh_ms += cli_time_ms() - t0;
             if (mesh_only) goto cleanup;
         }
     }
@@ -810,32 +841,40 @@ int main(int argc, char **argv)
         fprintf(stderr, "get_gaussians failed\n"); free(gaussians); rc = 8; goto cleanup;
     }
 
-    /* INRIA-PLY rows: x y z  nx ny nz  f_dc(3)  opacity_logit
-     *                 scale_log(3)  rot(4) — slice into per-channel
-     * arrays for gs_ply_write. */
-    float *xyz  = (float *)malloc((size_t)n_gauss * 3 * sizeof(float));
-    float *f_dc = (float *)malloc((size_t)n_gauss * 3 * sizeof(float));
-    float *op   = (float *)malloc((size_t)n_gauss     * sizeof(float));
-    float *scl  = (float *)malloc((size_t)n_gauss * 3 * sizeof(float));
-    float *rot  = (float *)malloc((size_t)n_gauss * 4 * sizeof(float));
-    for (int i = 0; i < n_gauss; i++) {
-        const float *row = gaussians + (size_t)i * CUDA_SAM3D_GS_STRIDE;
-        xyz [i*3+0] = row[0];  xyz [i*3+1] = row[1];  xyz [i*3+2] = row[2];
-        f_dc[i*3+0] = row[6];  f_dc[i*3+1] = row[7];  f_dc[i*3+2] = row[8];
-        op[i] = row[9];
-        scl [i*3+0] = row[10]; scl [i*3+1] = row[11]; scl [i*3+2] = row[12];
-        rot [i*4+0] = row[13]; rot [i*4+1] = row[14];
-        rot [i*4+2] = row[15]; rot [i*4+3] = row[16];
-    }
-    if (gs_ply_write(out_path, n_gauss, xyz, NULL, f_dc, op, scl, rot) != 0) {
+    t0 = cli_time_ms();
+    if (gs_ply_write_rows(out_path, n_gauss, gaussians,
+                          CUDA_SAM3D_GS_STRIDE) != 0) {
         fprintf(stderr, "gs_ply_write failed\n"); rc = 9;
     } else {
         fprintf(stderr, "[test_cuda_sam3d] wrote %d gaussians to %s\n", n_gauss, out_path);
     }
-    free(xyz); free(f_dc); free(op); free(scl); free(rot);
+    t_ply_write_ms = cli_time_ms() - t0;
     free(gaussians);
 
 cleanup:
+    if (cfg.verbose && ctx) {
+        cuda_sam3d_profile p = {0};
+        if (cuda_sam3d_get_profile(ctx, &p) == 0) {
+            fprintf(stderr,
+                    "[test_cuda_sam3d][timing] total %.3f ms "
+                    "(decode image %.3f mask %.3f, moge %.3f, pmap %.3f, "
+                    "create %.3f, set_inputs %.3f, mesh %.3f, ply %.3f)\n",
+                    cli_time_ms() - t_main0, t_decode_image_ms,
+                    t_decode_mask_ms, t_moge_ms, t_load_pointmap_ms,
+                    t_create_ms, t_set_inputs_ms, t_mesh_ms,
+                    t_ply_write_ms);
+            fprintf(stderr,
+                    "[test_cuda_sam3d][timing] stages: dinov2 %.3f, "
+                    "cond_fuser %.3f, ss_dit %.3f, ss_decode %.3f, "
+                    "slat_dit %.3f, slat_gs %.3f ms "
+                    "(dinov2_tokens=%d cond_tokens=%d active_voxels=%d "
+                    "gaussians=%d ss_steps=%d slat_steps=%d cfg_steps=%d)\n",
+                    p.dinov2_ms, p.cond_fuser_ms, p.ss_dit_ms,
+                    p.ss_decode_ms, p.slat_dit_ms, p.slat_gs_ms,
+                    p.dinov2_tokens, p.cond_tokens, p.active_voxels,
+                    p.gaussians, p.ss_steps, p.slat_steps, p.cfg_steps);
+        }
+    }
     cuda_sam3d_destroy(ctx);
     stbi_image_free(pixels);
     stbi_image_free(mpix);
