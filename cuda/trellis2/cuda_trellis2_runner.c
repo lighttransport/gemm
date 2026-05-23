@@ -2614,10 +2614,19 @@ static int t2_shape_debug_group_mlp(int stage, int block, int op) {
 static int t2_shape_debug_cublaslt_mlp(int stage, int block, int op) {
     const char *env = getenv("T2SD_CUBLASLT_MLP");
     if (!env || !env[0]) return 0;
-    int ws = -1, wb = -1, wo = -1;
-    sscanf(env, "%d:%d:%d", &ws, &wb, &wo);
-    return (ws == stage && (wb == block || wb < 0) &&
-            (wo == op || wo < 0));
+    const char *p = env;
+    while (*p) {
+        int ws = -1, wb = -1, wo = -1;
+        if (sscanf(p, "%d:%d:%d", &ws, &wb, &wo) == 3 &&
+            ws == stage && (wb == block || wb < 0) &&
+            (wo == op || wo < 0)) {
+            return 1;
+        }
+        p = strpbrk(p, ",;");
+        if (!p) break;
+        p++;
+    }
+    return 0;
 }
 
 static int t2_shape_debug_welford_affine_ln(int stage, int block) {
@@ -2904,6 +2913,17 @@ static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
                            d_feats,
                            dec->c2s[stage].subdiv_b,
                            8, C_in, N);
+                if (t2_shape_debug_stop_c2s_op(stage, 7)) {
+                    int rc = t2_shape_debug_return(s, d_logits, cur_coords, N, 8,
+                                                   out_feats, out_coords, out_N, out_C);
+                    cuMemFree(d_logits);
+                    t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                    cuMemFree(d_feats);
+                    cuMemFree(d_coords);
+                    free(cur_coords);
+                    T2_RESTORE_SCVAE_GEMM();
+                    return rc;
+                }
                 sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
                 cuStreamSynchronize(s);
                 cuMemcpyDtoH(sub_logits, d_logits, (size_t)N * 8 * sizeof(float));
