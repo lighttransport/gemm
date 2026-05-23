@@ -1057,18 +1057,10 @@ static CUdeviceptr upload_tensor_as_fp8(CUstream stream, const void *data,
     }
     if (!tmp32) return 0;
 
-    /* F32 → FP8 E4M3 */
+    /* F32 → FP8 E4M3 (RNE + saturate-to-finite via shared helper) */
     uint8_t *fp8 = (uint8_t *)malloc(n);
     for (size_t i = 0; i < n; i++) {
-        float v = tmp32[i];
-        uint32_t fb;
-        memcpy(&fb, &v, 4);
-        int sign = (fb >> 31) & 1;
-        int exp = ((fb >> 23) & 0xff) - 127 + 7; /* FP8 E4M3 bias=7 */
-        int mant = (fb >> 20) & 0x7;  /* 3-bit mantissa */
-        if (exp <= 0) { exp = 0; mant = 0; }
-        if (exp > 15) { exp = 15; mant = 6; } /* max non-inf for E4M3 */
-        fp8[i] = (uint8_t)((sign << 7) | (exp << 3) | mant);
+        fp8[i] = cu_f32_to_fp8_e4m3(tmp32[i]);
     }
     free(tmp32);
     CUdeviceptr d;
