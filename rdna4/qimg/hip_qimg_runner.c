@@ -1629,15 +1629,21 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     }
 
     /* v2 flash-attention: persistent-Q-in-registers + double-buffered K/V (gfx12,
-     * head_dim=128). Opt-in A/B path via QIMG_ATTN_V2=1; default OFF — the v1 kernel
-     * stays the shipped default until v2 is shown to win 1024² s/step at parity. */
+     * head_dim=128). DEFAULT ON when the kernel is loaded and WMMA attention is
+     * enabled — numerically bit-identical to v1 but ~10% faster at 1024² (it freed
+     * the 16 KB smQ so the load-latency hiding costs no occupancy). QIMG_ATTN_V2=0
+     * reverts to the v1 kernel; QIMG_BF16_ATTN=0 (which clears use_attn_wmma) drops
+     * all WMMA attention to the scalar fallback — and correctly suppresses v2 too,
+     * because the default-enable hangs off the same use_attn_wmma umbrella. */
     r->use_attn_wmma_pq = 0;
-    if (r->fn_flash_attn_wmma_pq) {
+    if (r->fn_flash_attn_wmma_pq && r->use_attn_wmma) {
         const char *v = getenv("QIMG_ATTN_V2");
-        if (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) {
+        int enable = 1;
+        if (v) enable = !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0);
+        if (enable) {
             r->use_attn_wmma_pq = 1;
             if (verbose)
-                fprintf(stderr, "hip_qimg: v2 flash-attention (persistent-Q + double-buffer) enabled\n");
+                fprintf(stderr, "hip_qimg: v2 flash-attention (persistent-Q + double-buffer) enabled [default]\n");
         }
     }
 
