@@ -1474,7 +1474,37 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     r->act_scales_bytes = 0;
     {
         const char *v = getenv("QIMG_FAST_FP8_MATRIX_MULT");
-        r->fast_fp8_matrix_mult = (v && !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) ? 1 : 0;
+        int fast_off = (v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+        int fast_on  = (v && !fast_off);
+        r->fast_fp8_matrix_mult = fast_on ? 1 : 0;
+
+        /* Quality-safe default preset (2026-05-23): when the user gives no
+         * explicit FP8 fast configuration, route the perceptually-lossless
+         * 48 dB tier to FP8xFP8 — img_mlp_fc1 in blocks >=8, clamp activation
+         * quant. Measured 49.67 dB latent / PNG indistinguishable from the
+         * pure BF16xFP8 default (54.7 dB PNG PSNR, max pixel diff 8/255), at
+         * 29% of the WMMA-eligible GEMM pool. Earlier fc1 blocks (0..7) carry
+         * the intrinsic e4m3 activation-mantissa error that floors at ~44 dB,
+         * so they stay BF16xFP8. See README.native-fp8.md / project memory.
+         * Opt out: --fast none (QIMG_FAST_FP8_MATRIX_MULT=0) or
+         * QIMG_FP8_WMMA_BF16=1 restores the pure BF16xFP8 path. */
+        if (!fast_on && !fast_off && r->use_fp8 &&
+            !getenv("QIMG_FP8_WMMA_BF16") &&
+            !(r->fp8_fp8_allow && r->fp8_fp8_allow[0]) &&
+            !(r->fp8_fp8_deny && r->fp8_fp8_deny[0]) &&
+            r->fp8_fp8_block_min < 0 && r->fp8_fp8_block_max < 0 &&
+            r->fp8_quality_target_db <= 0.0f &&
+            r->fn_gemm_fp8_fp8_pgr2 && r->fn_quantize_act_clamp) {
+            r->fast_fp8_matrix_mult = 1;
+            r->fp8_act_scale_clamp = 1;
+            r->fp8_act_scale_scalar = 0;
+            r->fp8_fp8_allow = "img_mlp_fc1";
+            r->fp8_fp8_block_min = 8;
+            if (verbose)
+                fprintf(stderr, "hip_qimg: quality-safe FP8xFP8 default ON "
+                        "(img_mlp_fc1 blocks>=8, clamp act; ~48 dB tier)\n");
+        }
+
         if (r->fast_fp8_matrix_mult) {
             if (!r->fp8_act_scale_scalar && !r->fp8_act_scale_clamp)
                 r->fp8_act_scale_scalar = 1;

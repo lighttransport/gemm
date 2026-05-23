@@ -40,9 +40,14 @@ Keep these modes distinct when comparing qimg against PyTorch/ComfyUI:
   in the input compute dtype. In qimg this is exposed as
   `--fast fp8_matrix_mult`. The local PyTorch scripts use the
   `comfy-fast-fp8` name; the older `SCALE_MODE=comfy` spelling remains an alias.
-- `qimg-quality-gated`: qimg's conservative mode. BF16xFP8 WMMA remains the
-  default quality-safe path for FP8 checkpoints. FP8xFP8 is only considered
-  when `--fast fp8_matrix_mult` is set, and can still be restricted by explicit
+- `qimg-quality-gated`: qimg's quality-safe mode. **Default since 2026-05-23:**
+  for FP8 checkpoints qimg automatically routes the perceptually-lossless 48 dB
+  tier (`img_mlp_fc1`, blocks >=8, clamp activation quant) to FP8xFP8 WMMA; all
+  other GEMMs stay BF16xFP8. This is the 29%-of-pool operating point measured at
+  49.67 dB latent / 54.7 dB PNG PSNR (indistinguishable from pure BF16xFP8).
+  Opt out to pure BF16xFP8 (51.70 dB) with `--fast none` or
+  `QIMG_FP8_WMMA_BF16=1`. `--fast fp8_matrix_mult` switches to the aggressive
+  all-eligible ComfyUI path (scale=1, ~24 dB) and can be narrowed with explicit
   label/block selectors while probing quality.
 
 The local Qwen-Image DiT checkpoint is raw FP8 storage. Its safetensors header
@@ -112,11 +117,18 @@ Quality-target gated FP8xFP8:
   --fp8-fp8-allow img_in
 ```
 
-By default, qimg does not use activation-FP8 GEMMs. FP8 checkpoint weights are
-kept in raw FP8 storage and eligible GEMMs use BF16xFP8 WMMA automatically.
-`--fast fp8_matrix_mult` is the only CLI switch that enables activation FP8 x
-weight FP8 WMMA. Label and block selectors can narrow the fast path for quality
-probes.
+By default (since 2026-05-23), qimg routes the quality-safe 48 dB FP8xFP8 tier
+automatically: `img_mlp_fc1` in blocks >=8 runs activation-FP8 x weight-FP8 WMMA
+(clamp activation quant), every other eligible GEMM stays BF16xFP8. This is
+49.67 dB latent / 54.7 dB PNG — perceptually identical to pure BF16xFP8 (51.70
+dB) — and cuts denoise ~13–15% (1024² 8.94->7.78 s/step, 256² 1.13->0.96).
+The early fc1 layers (blocks 0..7) carry the intrinsic e4m3 activation-mantissa
+error (floors ~44 dB) so they stay BF16xFP8.
+
+Opt out to pure BF16xFP8 with `--fast none` or `QIMG_FP8_WMMA_BF16=1`.
+`--fast fp8_matrix_mult` switches to the aggressive all-eligible ComfyUI path
+(activation scale=1, ~24 dB). Label/block selectors (`--fp8-fp8-allow`,
+`--fp8-fp8-block-min/max`) narrow the fast path for quality probes.
 
 As of the 2026-05-20 quality-gate pass, the full 20-step pinned run exits
 nonzero when `--fp8-quality-target-db` and `--ref-final` are both set and the

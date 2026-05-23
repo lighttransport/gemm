@@ -11,7 +11,7 @@
  *   make
  */
 
-#define SAFETENSORS_IMPLEMENTATION
+/* SAFETENSORS_IMPLEMENTATION is provided by hip_llm_runner.o (GPU text encoder). */
 #define GGML_DEQUANT_IMPLEMENTATION
 #define GGUF_LOADER_IMPLEMENTATION
 #define BPE_TOKENIZER_IMPLEMENTATION
@@ -233,6 +233,7 @@ int main(int argc, char **argv) {
     float fp8_act_scale_div = 0.0f;
     const char *fp8_act_scale_mode = NULL;
     int fast_fp8_matrix_mult = 0;
+    int fast_explicit_off = 0;  /* --fast none/0: opt out of the FP8xFP8 default */
     int device_id = 0;
     int verbose = 1;
     int out_h = 256, out_w = 256, n_steps = 20;
@@ -284,7 +285,7 @@ int main(int argc, char **argv) {
             if (!strcmp(fast, "fp8_matrix_mult")) {
                 fast_fp8_matrix_mult = 1;
             } else if (!strcmp(fast, "none") || !strcmp(fast, "0")) {
-                fast_fp8_matrix_mult = 0;
+                fast_fp8_matrix_mult = 0; fast_explicit_off = 1;
             } else {
                 fprintf(stderr, "Unsupported --fast option: %s\n", fast);
                 return 1;
@@ -295,7 +296,7 @@ int main(int argc, char **argv) {
             if (!strcmp(fast, "fp8_matrix_mult")) {
                 fast_fp8_matrix_mult = 1;
             } else if (!strcmp(fast, "none") || !strcmp(fast, "0")) {
-                fast_fp8_matrix_mult = 0;
+                fast_fp8_matrix_mult = 0; fast_explicit_off = 1;
             } else {
                 fprintf(stderr, "Unsupported --fast option: %s\n", fast);
                 return 1;
@@ -351,6 +352,9 @@ int main(int argc, char **argv) {
         setenv("QIMG_FAST_FP8_MATRIX_MULT", "1", 1);
         if (!fp8_act_scale_mode)
             fp8_act_scale_mode = "comfy";
+    } else if (fast_explicit_off) {
+        /* Explicit opt-out of the quality-safe FP8xFP8 default → pure BF16xFP8. */
+        setenv("QIMG_FAST_FP8_MATRIX_MULT", "0", 1);
     }
     if (fp8_act_scale_mode) setenv("QIMG_FP8_ACT_SCALE_MODE", fp8_act_scale_mode, 1);
 
