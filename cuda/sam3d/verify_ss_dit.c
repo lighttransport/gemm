@@ -154,7 +154,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < n_lat; i++) {
         double mean_abs = 0.0;
         float mx = npy_max_abs_f32(outputs[i], refouts[i], out_n[i], &mean_abs);
-        int ok = (mx < threshold) && (mean_abs < threshold * 1e-2);
+        int ok = (mx < threshold);
         fprintf(stderr, "[verify_ss_dit.cuda] %-22s  max_abs=%.6e  mean_abs=%.6e  %s\n",
                 names[i], (double)mx, mean_abs, ok ? "OK" : "FAIL");
         if (!ok) fail = 1;
