@@ -55,6 +55,37 @@ CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
 > FFN-down input cast are all gone (fused / written F16 in-pass); what remains is
 > `gelu_f32_to_f16` (≈5.2%) + the smaller residual `cast_f32_f16` (≈2.4%).
 
+## Fix applied #7: fold the layernorm→GEMM input cast into LayerNorm (F16 output)
+
+On the Blackwell F16×F16 path the qkv- and ffn-up-projection GEMMs each cast their F32
+activation input to F16 before the GEMM (`cast_f32_f16`). Those two inputs are the LN1
+and LN2 outputs, so a new VLM kernel `layernorm_f32_f16` writes the normalized result
+**straight to F16** into `d_ln_buf_f16`, and the GEMM consumes it via `vlm_gemm_x_f16`
+(no separate cast). Gated on `!cublas_mixed_ok` — the exact predicate under which
+`vlm_gemm_ex` would have cast — latched once per layer so the LN output format and the
+GEMM's expectation never disagree (layer-0's pre-flip LN stays F32, harmless). The F16
+store replaces the F32 store, so LayerNorm costs the same; the cast pass disappears.
+
+Profile at 768²: `cast_f32_f16` **83 → 29 launches/encode, 1.8 → 0.81 ms** (the 54
+LN-fed casts gone); `layernorm_f32_f16` (53/enc, 2.04 ms) ≈ the old F32 LayerNorm.
+rel_L2 vs CPU **bit-identical (0.6394475)** — the cast was happening either way.
+
+**GELU could not be folded further.** `gelu_f32_to_f16` is already a *fused* gelu+cast
+single pass; the only way to shrink it is to have the up-proj emit F16 so GELU reads
+F16, but **cuBLASLt on sm_120 has no F16-output epilogue** — `BIAS` *and* `GELU_BIAS`
+both fail the algo heuristic with F16 D (status 7). Probed and confirmed; that hardware
+limit is exactly why `gelu_f32_to_f16` exists. So GELU stays at 4.0 ms (≈5.3%).
+
+**Diagnostic — the encoder is now host-launch-bound.** Summing the nsys kernel trace at
+768²: **GPU busy ≈ 75.7 ms/encode vs wall ≈ 95.5 ms → ~20 ms (21%) GPU idle** waiting on
+CPU launches. The cast fold removed 54 launches/encode and ~1 ms GPU time, but the wall
+barely moved because the GPU was already starved. The dominant launch source is the
+**per-head full-attention loop: 6 layers × 16 heads × 3 launches (QK + softmax + PV) =
+288 launches/encode**. Further per-kernel folds (e.g. the remaining 27 attn-out casts,
+≈0.4 ms, which would need a duplicate F16-output attention kernel) will not move the wall
+until that host overhead is collapsed — the real next lever is **CUDA graphs** (capture
+the per-layer kernel sequence once, replay per layer) or batching the per-head launches.
+
 ## Fix applied #6: materialize-scores windowed-attention kernel
 
 After Fix #5, the windowed-attention kernel (`attn_window_warp_f32`) was the clear #2
@@ -227,9 +258,11 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
    GPU. At 768² the only large reducible cost left is the FFN/projection cuBLAS GEMMs
    (≈52%, tensor-core — near the hardware floor); the windowed kernel is down to ≈12% and
    the 6-layer full-attention tensor-core path is ≈17% (spread across QK/softmax/P·V/extract,
-   already on tensor cores). Smaller residual levers: `gelu_f32_to_f16` (≈5.2%) and the
-   `cast_f32_f16` (≈2.4%, qkv/attn-out input casts) could fold into the layernorm/attn-output
-   kernels, but each is minor.
+   already on tensor cores). The qkv/ffn-up input casts are now folded into LayerNorm
+   (Fix #7, F16 output). `gelu_f32_to_f16` (≈5.3%) **cannot** be folded further — sm_120
+   cuBLASLt has no F16-output epilogue. The encoder is now **host-launch-bound** (~21% GPU
+   idle at 768²): the real next lever is CUDA graphs / batching the 288/encode per-head
+   full-attention launches, not more per-kernel folds. See Fix #7.
 
    *Tried and rejected — batching the full-attention heads.* The 6 full-attn layers run
    the QK / softmax / P·V chain **one head at a time** (16 heads × 3 launches × 6 layers).
