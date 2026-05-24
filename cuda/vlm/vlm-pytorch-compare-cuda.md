@@ -38,15 +38,16 @@ attn & window rewrite **43.9 / 116.8** → +cuBLASLt fused bias/GELU epilogue & 
 
 | image  | tokens | CUDA mean ms | CUDA min ms | CUDA tok/s | PyTorch mean ms | PyTorch min ms | PyTorch tok/s | CUDA vs PyTorch |
 |-------:|-------:|-------------:|------------:|-----------:|----------------:|---------------:|--------------:|----------------:|
-| 512²   |   256  |         35.2 |        34.9 |       7264 |            96.0 |           69.6 |          2606 | **2.73× faster** |
-| 768²   |   576  |         81.5 |        80.5 |       7065 |           212.7 |          184.5 |          2712 | **2.61× faster** |
+| 512²   |   256  |         32.4 |        32.2 |       7892 |            96.0 |           69.6 |          2606 | **2.96× faster** |
+| 768²   |   576  |         81.4 |        80.3 |       7078 |           212.7 |          184.5 |          2712 | **2.61× faster** |
 | 1024²  |  1024  | — (unsupported) |          |            |           438.1 |          401.2 |          4354 |        —        |
 | 2048²  |  4096  | — (unsupported) |          |            |          1518.7 |         1515.3 |          2701 |        —        |
 
 CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
 
 > The CUDA encoder is now **>2.6× faster than PyTorch SDPA on the same GPU** at both 512²
-> (2.73×) and 768² (2.61×) — a full reversal of the original 4.9× / 10.4× deficit. (And
+> (2.96×, nearly 3×) and 768² (2.61×) — a full reversal of the original 4.9× / 10.4×
+> deficit. (And
 > PyTorch additionally runs the 3 deepstack mergers the GGUF path omits, so the real-work
 > gap is even larger.) At 768² the dominant remaining cost is the FFN/projection cuBLAS
 > GEMMs (≈52%, tensor-core, near-irreducible); the windowed-attention kernel is down to
@@ -54,6 +55,29 @@ CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
 > is ≈17%. `add_bias`, the standalone `gelu`, the cuBLASLt GELU side kernel, and the large
 > FFN-down input cast are all gone (fused / written F16 in-pass); what remains is
 > `gelu_f32_to_f16` (≈5.2%) + the smaller residual `cast_f32_f16` (≈2.4%).
+
+## Fix applied #10: cache the interpolated position embedding per size
+
+With the host gap closed (Fix #9), the per-phase profile exposed an anomaly: `pos` was
+**2.9 ms at 512² but 0.1 ms at 768²** — backwards (bigger image, less pos cost). Cause:
+the pos-embedding step has two paths. When the encode grid matches the model's native grid
+(`gw == image_size/patch`, i.e. 48×48 at 768²) it uses a cheap direct-indirection kernel
+(0.1 ms). At any other size (512² → 32×32 ≠ 48) it **bilinearly interpolates the pos
+embedding on the CPU** — a `n_patches × dim` = 1024×1152 ≈ 1.2M-element triple-nested host
+loop — then HtoDs the ~4.7 MB result. That interpolation was redone **every encode**, even
+though the result is identical for a fixed image size.
+
+Fix: cache it. `d_pos_interp` is a persistent device buffer that nothing else writes, so the
+last interpolation stays resident. Added `pos_interp_w/h` (last interpolated grid, init −1);
+when the current `(gw, gh)` matches, skip the CPU loop **and** the HtoD and just relaunch the
+`add_pos_embd_direct` kernel reading the resident buffer. First encode at a size still
+interpolates; a size change re-interpolates. Untouched by the CUDA graph (pos runs before the
+captured block loop).
+
+Result (f16, RTX 5060 Ti, `--warmup 5 --iters 20`): **512² 35.2 → 32.4 ms** mean (min 32.2,
+**7892 tok/s**, `pos` 2.9 → 0.0 ms) → **2.96× faster than PyTorch** (nearly 3×). 768²
+unchanged (81.4 ms — it uses the exact-match path, no interpolation). rel_L2 **bit-identical
+0.6394475** (same interpolated bytes, just reused). Helps every non-native size.
 
 ## Fix applied #9: collapse the host-side result assembly (the real residual lever)
 
@@ -334,7 +358,7 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
    attention (Fix #2), then patch im2col+GEMM (Fix #3), tensor-core attention + the
    windowed-attention rewrite (Fix #4), the cuBLASLt fused bias/GELU epilogue +
    F16 FFN intermediate (Fix #5), and the materialize-scores windowed kernel (Fix #6).
-   CUDA is now **2.73× faster at 512² and 2.61× faster at 768²** than PyTorch on the same
+   CUDA is now **2.96× faster at 512² and 2.61× faster at 768²** than PyTorch on the same
    GPU. At 768² the only large reducible cost left is the FFN/projection cuBLAS GEMMs
    (≈52%, tensor-core — near the hardware floor); the windowed kernel is down to ≈12% and
    the 6-layer full-attention tensor-core path is ≈17% (spread across QK/softmax/P·V/extract,
@@ -346,8 +370,10 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
    result `calloc`+pageable-`DtoH`+interleave, RGB HtoD), not GPU launch starvation — now
    collapsed in **Fix #9** (skip the staging/zero-fill/interleave when `n_deepstack==0`),
    which closed the gap (768² 95.2 → 81.5 ms) so the `t_*` phases sum to the wall and the
-   `vit` GPU loop (≈73.5 ms) is the floor. Residual untimed bits (RGB HtoD ~1.5 ms, output
-   DtoH ~2.4 ms) are pinned-memory candidates but small.
+   `vit` GPU loop (≈73.5 ms) is the floor. At non-native sizes the per-encode CPU pos-embed
+   interpolation (≈2.9 ms at 512²) is now cached per size (**Fix #10**, 512² 35.2 → 32.4 ms,
+   2.96× vs PyTorch). Residual untimed bits (RGB HtoD ~1.5 ms, output DtoH ~2.4 ms) are
+   pinned-memory candidates but small.
 
    *Tried and rejected — batching the full-attention heads.* The 6 full-attn layers run
    the QK / softmax / P·V chain **one head at a time** (16 heads × 3 launches × 6 layers).
