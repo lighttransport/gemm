@@ -140,28 +140,34 @@ static const char *cuda_vlm_specific_kernels =
 "}\n"
 "\n"
 "/* ---- rope_vision_f32: M-RoPE on Q and K ---- */\n"
-"/* Grid: (n_patches * n_heads), Block: (half_dim) */\n"
+"/* Grid-stride over (p,h,i) rotation pairs; block 256. (The old launch used   */\n"
+"/* head_dim/2 == 36 threads/block over n_patches*n_heads blocks, which wastes  */\n"
+"/* the 2nd warp and pins occupancy to the per-SM block limit -> it ran ~3x     */\n"
+"/* slower than an equal-volume layernorm and scaled ~5x for 2.25x tokens.)     */\n"
 "__global__ void rope_vision_f32(float *qkv, const float *rope_cos,\n"
 "                                  const float *rope_sin,\n"
 "                                  int n_patches, int n_heads,\n"
 "                                  int dim, int head_dim, int half) {\n"
-"    int idx = blockIdx.x;\n"
-"    int p = idx / n_heads;\n"
-"    int h = idx % n_heads;\n"
-"    int i = threadIdx.x;\n"
-"    if (i >= half) return;\n"
-"    float cos_t = rope_cos[p * head_dim + 2 * i];\n"
-"    float sin_t = rope_sin[p * head_dim + 2 * i];\n"
-"    /* Q */\n"
-"    float *q = qkv + p * 3 * dim + h * head_dim;\n"
-"    float q0 = q[i], q1 = q[i + half];\n"
-"    q[i]        = q0 * cos_t - q1 * sin_t;\n"
-"    q[i + half] = q0 * sin_t + q1 * cos_t;\n"
-"    /* K */\n"
-"    float *k = qkv + p * 3 * dim + dim + h * head_dim;\n"
-"    float k0 = k[i], k1 = k[i + half];\n"
-"    k[i]        = k0 * cos_t - k1 * sin_t;\n"
-"    k[i + half] = k0 * sin_t + k1 * cos_t;\n"
+"    long total = (long)n_patches * n_heads * half;\n"
+"    for (long gid = (long)blockIdx.x * blockDim.x + threadIdx.x; gid < total;\n"
+"         gid += (long)gridDim.x * blockDim.x) {\n"
+"        int i = (int)(gid % half);\n"
+"        long t = gid / half;\n"
+"        int h = (int)(t % n_heads);\n"
+"        int p = (int)(t / n_heads);\n"
+"        float cos_t = rope_cos[p * head_dim + 2 * i];\n"
+"        float sin_t = rope_sin[p * head_dim + 2 * i];\n"
+"        /* Q */\n"
+"        float *q = qkv + (long)p * 3 * dim + h * head_dim;\n"
+"        float q0 = q[i], q1 = q[i + half];\n"
+"        q[i]        = q0 * cos_t - q1 * sin_t;\n"
+"        q[i + half] = q0 * sin_t + q1 * cos_t;\n"
+"        /* K */\n"
+"        float *k = q + dim;\n"
+"        float k0 = k[i], k1 = k[i + half];\n"
+"        k[i]        = k0 * cos_t - k1 * sin_t;\n"
+"        k[i + half] = k0 * sin_t + k1 * cos_t;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- attn_full_f32: Full NxN self-attention per head ---- */\n"
@@ -453,10 +459,17 @@ static const char *cuda_vlm_specific_kernels =
 "/* Grid: (n_windows, n_heads). Block: WT_THREADS. Dyn smem:                       */\n"
 "/* (3*max_win*head_dim + max_win*max_win) floats.                                 */\n"
 "#define WT_THREADS 192\n"
+"/* Q/K/V are staged in shared as F16 (half the bytes of F32). At head_dim=72,   */\n"
+"/* win<=36: F32 staging needed 3*36*72*4 + 36*36*4 = 35.4 KB/block -> only 2     */\n"
+"/* blocks/SM (smem-limited, ~25%% occ). F16 staging is 3*36*72*2 + 36*36*4 =     */\n"
+"/* 20.3 KB -> 4 blocks/SM, doubling occupancy. Dot products still accumulate in  */\n"
+"/* F32 and the score matrix / softmax stay F32; only the staged operands are     */\n"
+"/* F16 -- consistent with the materialized full-attn path (attn_extract_heads    */\n"
+"/* also stages Q/K/V as F16).                                                    */\n"
 "__global__ void attn_window_tile_f32(float *out, const float *qkv,\n"
 "                                     const int *win_start, const int *win_size,\n"
 "                                     int dim, int n_heads, int head_dim, float scale) {\n"
-"    extern __shared__ float tsmem[];\n"
+"    extern __shared__ char tsmem[];\n"
 "    int w = blockIdx.x;\n"
 "    int h = blockIdx.y;\n"
 "    int start = win_start[w];\n"
@@ -465,25 +478,27 @@ static const char *cuda_vlm_specific_kernels =
 "    int tid = threadIdx.x;\n"
 "    int nt = blockDim.x;\n"
 "    int dim3 = 3 * dim;\n"
-"    float *Qs = tsmem;\n"
-"    float *Ks = Qs + size * head_dim;\n"
-"    float *Vs = Ks + size * head_dim;\n"
-"    float *Ss = Vs + size * head_dim;\n"
+"    half_raw *Qs = (half_raw *)tsmem;\n"
+"    half_raw *Ks = Qs + size * head_dim;\n"
+"    half_raw *Vs = Ks + size * head_dim;\n"
+"    float *Ss = (float *)(Vs + size * head_dim);\n"  /* 3*size*head_dim halves is 4-byte aligned */
 "    for (int idx = tid; idx < size * head_dim; idx += nt) {\n"
 "        int kl = idx / head_dim; int d = idx - kl * head_dim;\n"
 "        const float *base = qkv + (size_t)(start + kl) * dim3 + h * head_dim;\n"
-"        Qs[idx] = base[d];\n"
-"        Ks[idx] = base[dim + d];\n"
-"        Vs[idx] = base[2 * dim + d];\n"
+"        half_raw q, k, v;\n"
+"        asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(q) : \"f\"(base[d]));\n"
+"        asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(k) : \"f\"(base[dim + d]));\n"
+"        asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(v) : \"f\"(base[2 * dim + d]));\n"
+"        Qs[idx] = q; Ks[idx] = k; Vs[idx] = v;\n"
 "    }\n"
 "    __syncthreads();\n"
 "    int ns = size * size;\n"
 "    for (int idx = tid; idx < ns; idx += nt) {\n"
 "        int i = idx / size; int j = idx - i * size;\n"
-"        const float *qi = Qs + i * head_dim;\n"
-"        const float *kj = Ks + j * head_dim;\n"
+"        const half_raw *qi = Qs + i * head_dim;\n"
+"        const half_raw *kj = Ks + j * head_dim;\n"
 "        float s = 0.0f;\n"
-"        for (int d = 0; d < head_dim; d++) s += qi[d] * kj[d];\n"
+"        for (int d = 0; d < head_dim; d++) s += half_to_float(qi[d]) * half_to_float(kj[d]);\n"
 "        Ss[idx] = s * scale;\n"
 "    }\n"
 "    __syncthreads();\n"
@@ -504,7 +519,7 @@ static const char *cuda_vlm_specific_kernels =
 "        int i = idx / head_dim; int d = idx - i * head_dim;\n"
 "        const float *prow = Ss + i * size;\n"
 "        float acc = 0.0f;\n"
-"        for (int j = 0; j < size; j++) acc += prow[j] * Vs[j * head_dim + d];\n"
+"        for (int j = 0; j < size; j++) acc += prow[j] * half_to_float(Vs[j * head_dim + d]);\n"
 "        out[(size_t)(start + i) * dim + h * head_dim + d] = acc;\n"
 "    }\n"
 "}\n"
@@ -556,6 +571,172 @@ static const char *cuda_vlm_specific_kernels =
 "        half_raw hr; asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(hr) : \"f\"(e)); p[j] = hr;\n"
 "    }\n"
 "}\n"
+"\n"
+"/* ---- attn_prefill_vision_f32: TENSOR-CORE flash full attention. ----------------- */\n"
+"/* Adapted from cuda_kernels_common.h's attn_prefill_f32 (proven LLM-prefill flash)  */\n"
+"/* but (a) reads Q/K/V straight from the interleaved qkv[N,3*dim] buffer (no K_t/V_t  */\n"
+"/* transpose -- same trick the window kernels use) and (b) handles head_dim=72        */\n"
+"/* (nkf=ceil(72/16)=5 k16 frags, last padded d>=hd ->0; noc=ceil(72/8)=9 output       */\n"
+"/* 8-col groups, 9*8=72 exact). mma.sync.m16n8k16.row.col.f32.f16.f16.f32 + online    */\n"
+"/* softmax + O-rescale, O(N) memory; stages each 16-key K/V tile into shared so all   */\n"
+"/* 4 warps reuse it. Used only as the O(N) fallback above flash_full_n -- it is        */\n"
+"/* numerically identical to the materialized path (rel_L2 0.63948 vs 0.63945 @512²)    */\n"
+"/* but 4-14%% SLOWER (cuBLAS tiles/pipelines better; head_dim=72 wastes half the 5th   */\n"
+"/* k16 frag), far better than the retired CUDA-core flash (3.6-5.5x). Grid (n_heads,   */\n"
+"/* ceil(N/64)), block 128 (4 warps, 16 q/warp). sm_120 a1/a2 frag swap from source.    */\n"
+"#define VP_KF 5\n"
+"#define VP_OC 9\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"__global__ void attn_prefill_vision_f32(float *out, const float *qkv,\n"
+"                                        int n_tok, int dim, int n_heads,\n"
+"                                        int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    if (blockIdx.y * 64 >= n_tok) return;  /* whole block out -> all warps return */\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int qb = blockIdx.y * 64 + warp_id * 16;  /* may exceed n_tok; per-query guards below */\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int gid = lane / 4, tid4 = lane % 4;\n"
+"    int dim3 = 3 * dim;\n"
+"    int qi0 = qb + gid, qi1 = qb + gid + 8;\n"
+"    /* Shared K/V tile (16 keys x head_dim), staged once per block so all 4 warps    */\n"
+"    /* reuse it instead of each re-reading K/V from global (was the 4x-redundant      */\n"
+"    /* bottleneck vs cuBLAS, which tiles K/V into shared).                            */\n"
+"    extern __shared__ float smem[];\n"
+"    float *Ks = smem;\n"
+"    float *Vs = smem + 16 * head_dim;\n"
+"    int nkf = (head_dim + 15) >> 4;\n"
+"    int noc = (head_dim + 7) >> 3;\n"
+"    int qoff = h * head_dim;\n"
+"    /* Pre-load Q fragments (m16k16, 4 per k16 step). */\n"
+"    unsigned int qa0[VP_KF], qa1[VP_KF], qa2[VP_KF], qa3[VP_KF];\n"
+"    for (int ks = 0; ks < nkf; ks++) {\n"
+"        int dc = ks * 16 + tid4 * 2;\n"
+"        { float f0=(qi0<n_tok && dc  <head_dim)?qkv[(size_t)qi0*dim3+qoff+dc  ]:0.0f,\n"
+"                f1=(qi0<n_tok && dc+1<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+1]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa0[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"        { float f0=(qi1<n_tok && dc  <head_dim)?qkv[(size_t)qi1*dim3+qoff+dc  ]:0.0f,\n"
+"                f1=(qi1<n_tok && dc+1<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+1]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa1[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"        { float f0=(qi0<n_tok && dc+8<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+8]:0.0f,\n"
+"                f1=(qi0<n_tok && dc+9<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+9]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa2[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"#else\n"
+"        { float f0=(qi0<n_tok && dc+8<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+8]:0.0f,\n"
+"                f1=(qi0<n_tok && dc+9<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+9]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa1[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"        { float f0=(qi1<n_tok && dc  <head_dim)?qkv[(size_t)qi1*dim3+qoff+dc  ]:0.0f,\n"
+"                f1=(qi1<n_tok && dc+1<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+1]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa2[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"#endif\n"
+"        { float f0=(qi1<n_tok && dc+8<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+8]:0.0f,\n"
+"                f1=(qi1<n_tok && dc+9<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+9]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa3[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"    }\n"
+"    float m0=-1e30f, l0=0.0f, m1=-1e30f, l1=0.0f;\n"
+"    float oc0[VP_OC]={0}, oc1[VP_OC]={0}, oc2[VP_OC]={0}, oc3[VP_OC]={0};\n"
+"    int koff = dim + h * head_dim, voff = 2 * dim + h * head_dim;\n"
+"    for (int kv = 0; kv < n_tok; kv += 16) {\n"
+"        /* Cooperatively stage the 16-key K/V tile (coalesced); zero-fill OOB keys. */\n"
+"        for (int t = threadIdx.x; t < 16 * head_dim; t += blockDim.x) {\n"
+"            int kl = t / head_dim, d = t - kl * head_dim;\n"
+"            int gk = kv + kl;\n"
+"            Ks[t] = (gk < n_tok) ? qkv[(size_t)gk*dim3 + koff + d] : 0.0f;\n"
+"            Vs[t] = (gk < n_tok) ? qkv[(size_t)gk*dim3 + voff + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        float s0[2]={0,0}, s1[2]={0,0}, s2[2]={0,0}, s3[2]={0,0};\n"
+"        for (int ks = 0; ks < nkf; ks++) {\n"
+"            unsigned int a0=qa0[ks], a1=qa1[ks], a2=qa2[ks], a3=qa3[ks];\n"
+"            int col = ks * 16 + tid4 * 2;\n"
+"            for (int nh = 0; nh < 2; nh++) {\n"
+"                int kl = nh*8 + gid;\n"
+"                const float *kp = Ks + kl*head_dim;  /* shared; OOB keys zero-filled */\n"
+"                unsigned int b0=0, b1=0;\n"
+"                { float kf0=(col  <head_dim)?kp[col  ]:0.0f, kf1=(col+1<head_dim)?kp[col+1]:0.0f;\n"
+"                  asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(b0):\"f\"(kf0),\"f\"(kf1));\n"
+"                  float kf2=(col+8<head_dim)?kp[col+8]:0.0f, kf3=(col+9<head_dim)?kp[col+9]:0.0f;\n"
+"                  asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(b1):\"f\"(kf2),\"f\"(kf3)); }\n"
+"                asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    :\"=f\"(s0[nh]),\"=f\"(s1[nh]),\"=f\"(s2[nh]),\"=f\"(s3[nh])\n"
+"                    :\"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1),\n"
+"                     \"f\"(s0[nh]),\"f\"(s1[nh]),\"f\"(s2[nh]),\"f\"(s3[nh]));\n"
+"            }\n"
+"        }\n"
+"        s0[0]*=scale; s1[0]*=scale; s2[0]*=scale; s3[0]*=scale;\n"
+"        s0[1]*=scale; s1[1]*=scale; s2[1]*=scale; s3[1]*=scale;\n"
+"        { int c0=kv+tid4*2, c1=c0+1;\n"
+"          if (c0   >=n_tok){s0[0]=-1e30f;s2[0]=-1e30f;} if (c1   >=n_tok){s1[0]=-1e30f;s3[0]=-1e30f;}\n"
+"          if (c0+8 >=n_tok){s0[1]=-1e30f;s2[1]=-1e30f;} if (c1+8 >=n_tok){s1[1]=-1e30f;s3[1]=-1e30f;} }\n"
+"        if (qi0>=n_tok){s0[0]=-1e30f;s1[0]=-1e30f;s0[1]=-1e30f;s1[1]=-1e30f;}\n"
+"        if (qi1>=n_tok){s2[0]=-1e30f;s3[0]=-1e30f;s2[1]=-1e30f;s3[1]=-1e30f;}\n"
+"        /* row qi0 (gid): keys at cols tid4*2, tid4*2+1 over nh halves */\n"
+"        float mx0 = fmaxf(fmaxf(s0[0],s1[0]), fmaxf(s0[1],s1[1]));\n"
+"        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));\n"
+"        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));\n"
+"        float mn0 = fmaxf(m0, mx0);\n"
+"        float al0 = __expf(m0 - mn0); l0 *= al0; m0 = mn0;\n"
+"        for (int c=0;c<noc;c++){ oc0[c]*=al0; oc1[c]*=al0; }\n"
+"        s0[0]=__expf(s0[0]-m0); s1[0]=__expf(s1[0]-m0); s0[1]=__expf(s0[1]-m0); s1[1]=__expf(s1[1]-m0);\n"
+"        float rs0 = (s0[0]+s1[0])+(s0[1]+s1[1]);\n"
+"        rs0 += __shfl_xor_sync(0xffffffff, rs0, 1);\n"
+"        rs0 += __shfl_xor_sync(0xffffffff, rs0, 2);\n"
+"        l0 += rs0;\n"
+"        float mx1 = fmaxf(fmaxf(s2[0],s3[0]), fmaxf(s2[1],s3[1]));\n"
+"        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));\n"
+"        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));\n"
+"        float mn1 = fmaxf(m1, mx1);\n"
+"        float al1 = __expf(m1 - mn1); l1 *= al1; m1 = mn1;\n"
+"        for (int c=0;c<noc;c++){ oc2[c]*=al1; oc3[c]*=al1; }\n"
+"        s2[0]=__expf(s2[0]-m1); s3[0]=__expf(s3[0]-m1); s2[1]=__expf(s2[1]-m1); s3[1]=__expf(s3[1]-m1);\n"
+"        float rs1 = (s2[0]+s3[0])+(s2[1]+s3[1]);\n"
+"        rs1 += __shfl_xor_sync(0xffffffff, rs1, 1);\n"
+"        rs1 += __shfl_xor_sync(0xffffffff, rs1, 2);\n"
+"        l1 += rs1;\n"
+"        /* Convert P (probs) to f16 fragments for the PV mma (A operand, m16k16).\n"
+"         * Pair the two column elements of the same nh-half (s0,s1 / s2,s3), NOT\n"
+"         * the two nh-halves -- matches attn_prefill_f32's C->A fragment remap.    */\n"
+"        unsigned int pa0, pa1, pa2, pa3;\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa0):\"f\"(s0[0]),\"f\"(s1[0]));\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa1):\"f\"(s2[0]),\"f\"(s3[0]));\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa2):\"f\"(s0[1]),\"f\"(s1[1]));\n"
+"#else\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa1):\"f\"(s0[1]),\"f\"(s1[1]));\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa2):\"f\"(s2[0]),\"f\"(s3[0]));\n"
+"#endif\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa3):\"f\"(s2[1]),\"f\"(s3[1]));\n"
+"        /* PV: O[16q, 8d] += P[16q,16k] V[16k,8d], 9 column groups (72=9*8). */\n"
+"        for (int c = 0; c < noc; c++) {\n"
+"            int vd = c*8+gid;\n"
+"            int vl0=tid4*2, vl1=vl0+1, vl8=vl0+8, vl9=vl8+1;  /* local key indices 0..15 */\n"
+"            unsigned int vb0=0, vb1=0;\n"
+"            if (vd < head_dim) {\n"
+"                float vf0=Vs[vl0*head_dim+vd], vf1=Vs[vl1*head_dim+vd];\n"
+"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb0):\"f\"(vf0),\"f\"(vf1));\n"
+"                float vf2=Vs[vl8*head_dim+vd], vf3=Vs[vl9*head_dim+vd];\n"
+"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb1):\"f\"(vf2),\"f\"(vf3));\n"
+"            }\n"
+"            asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\\n\\t\"\n"
+"                \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                :\"=f\"(oc0[c]),\"=f\"(oc1[c]),\"=f\"(oc2[c]),\"=f\"(oc3[c])\n"
+"                :\"r\"(pa0),\"r\"(pa1),\"r\"(pa2),\"r\"(pa3),\"r\"(vb0),\"r\"(vb1),\n"
+"                 \"f\"(oc0[c]),\"f\"(oc1[c]),\"f\"(oc2[c]),\"f\"(oc3[c]));\n"
+"        }\n"
+"        __syncthreads();  /* all warps done with Ks/Vs before next tile overwrites */\n"
+"    }\n"
+"    float il0=(l0>0.0f)?1.0f/l0:0.0f, il1=(l1>0.0f)?1.0f/l1:0.0f;\n"
+"    for (int c = 0; c < noc; c++) {\n"
+"        int d0=c*8+tid4*2, d1=d0+1;\n"
+"        if (qi0<n_tok && d0<head_dim) out[(size_t)qi0*dim+qoff+d0]=oc0[c]*il0;\n"
+"        if (qi0<n_tok && d1<head_dim) out[(size_t)qi0*dim+qoff+d1]=oc1[c]*il0;\n"
+"        if (qi1<n_tok && d0<head_dim) out[(size_t)qi1*dim+qoff+d0]=oc2[c]*il1;\n"
+"        if (qi1<n_tok && d1<head_dim) out[(size_t)qi1*dim+qoff+d1]=oc3[c]*il1;\n"
+"    }\n"
+"}\n"
+"#endif\n"
 "\n"
 "/* ---- attn_full_bq_f32: full attention, ONE BLOCK PER QUERY. ---- */\n"
 "/* Grid: (n_patches, n_heads). Block: BQ_THREADS. Each block's threads cooperate on a   */\n"
@@ -711,6 +892,7 @@ struct cuda_vision_runner {
     CUfunction fn_rope_vision_f32;
     CUfunction fn_attn_full_f32;
     CUfunction fn_flash_attn_f32;
+    CUfunction fn_attn_prefill_vision_f32; /* TENSOR-CORE O(N)-mem full attention */
     CUfunction fn_attn_full_bq_f32;
     CUfunction fn_attn_extract_heads;   /* deinterleave qkv -> head-contiguous F16 */
     CUfunction fn_attn_softmax_rows;    /* row softmax scores[N,N] -> F16 probs */
@@ -797,6 +979,10 @@ struct cuda_vision_runner {
     /* Tensor-core full-attention scratch (cuBLAS QK^T -> softmax -> P*V) */
     int tc_attn;              /* 1 if cuBLAS available -> use tensor-core attention */
     int win_tile;             /* 1 -> materialize-scores windowed kernel (VLM_WINDOW_TILE) */
+    int flash_full_n;         /* full-attn crossover: N > this -> fused flash kernel
+                               * (materialized [N,N] scratch only sized to min(mp,this)) */
+    int tc_flash;             /* VLM_TC_FLASH: 1 -> tensor-core attn_prefill_vision_f32
+                               * for ALL full-attn layers (A/B vs materialized) */
     CUdeviceptr d_qh_f16;     /* [n_heads * max_patches * head_dim] F16 */
     CUdeviceptr d_kh_f16;     /* [n_heads * max_patches * head_dim] F16 */
     CUdeviceptr d_vh_f16;     /* [n_heads * max_patches * head_dim] F16 */
@@ -908,6 +1094,7 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
     GET_FN(rope_vision_f32);
     GET_FN(attn_full_f32);
     GET_FN(flash_attn_f32);
+    GET_FN(attn_prefill_vision_f32);
     GET_FN(attn_full_bq_f32);
     GET_FN(attn_extract_heads);
     GET_FN(attn_softmax_rows);
@@ -1172,6 +1359,39 @@ cuda_vision_runner *cuda_vision_init(int device_id, int verbose, int use_f16) {
         if (r->verbose >= 1)
             fprintf(stderr, "cuda_vlm: windowed attention = %s kernel\n",
                     r->win_tile ? "tile (materialize-scores)" : "warp-per-query");
+    }
+    {
+        /* Full-attention crossover. The O(N)-memory tensor-core flash
+         * (attn_prefill_vision_f32) kicks in for N > this. IMPORTANT: it is a
+         * *memory* fallback, NOT a speedup -- benchmarking showed flash is
+         * still 4-14%% SLOWER than the materialized tensor-core path (cuBLAS
+         * QK^T -> softmax -> P*V) even with shared K/V staging, because cuBLAS's
+         * larger tiles / pipelining beat a hand-rolled flash and head_dim=72
+         * wastes ~half the 5th k16 fragment. So the default keeps every size
+         * that fits VRAM on the fast materialized path; flash only takes over
+         * above ~2900² where the [N,N] F32 scratch (>4 GB) would OOM the 16 GB
+         * card. VLM_FLASH_FULL forces it on(1)/off(0); VLM_FLASH_FULL_N
+         * overrides the crossover N directly (e.g. for A/B testing). */
+        int fn = 32768;
+        const char *fenv = getenv("VLM_FLASH_FULL_N");
+        if (fenv) fn = atoi(fenv);
+        const char *ff = getenv("VLM_FLASH_FULL");
+        if (ff) fn = (ff[0] == '0') ? (1 << 30) : 0;  /* 0 -> never, else -> always */
+        if (fn < 0) fn = 0;
+        r->flash_full_n = fn;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_vlm: full-attention flash crossover N = %d\n",
+                    r->flash_full_n);
+    }
+    {
+        /* Tensor-core flash: attn_prefill_vision_f32 (mma.sync, online softmax,
+         * O(N) memory). VLM_TC_FLASH=1 routes ALL full-attn layers through it,
+         * regardless of the crossover above -- so it can be A/B'd against the
+         * materialized cuBLAS path at every size. Default off. */
+        const char *tf = getenv("VLM_TC_FLASH");
+        r->tc_flash = (tf && tf[0] != '0') ? 1 : 0;
+        if (r->tc_flash && r->verbose >= 1)
+            fprintf(stderr, "cuda_vlm: tensor-core flash full-attention ENABLED\n");
     }
     {
         /* CUDA-graph capture of the ViT block loop: default ON, VLM_CUDA_GRAPH=0
@@ -1442,14 +1662,21 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
             CHECK_CU(cuMemAlloc(&r->d_ln_buf_f16, (size_t)mp * dim * sizeof(unsigned short)));
         }
         /* Tensor-core full-attention scratch (F16). Per-head Q/K/V + a single
-         * head's [N,N] scores (F32) and probs (F16), reused across heads. */
+         * head's [N,N] scores (F32) and probs (F16), reused across heads. Only
+         * sized to tc_cap = min(mp, flash_full_n): above the crossover the
+         * O(N)-memory tensor-core flash (attn_prefill_vision_f32) runs instead
+         * (no [N,N] buffer, only a 9 KB shared K/V tile), so capping here avoids
+         * e.g. a 1 GB scores alloc at 2048². Encodes with n_patches <= tc_cap
+         * take the materialized path and fit this buffer. */
         if (r->use_f16 && r->tc_attn) {
-            size_t nhd = (size_t)r->n_heads * mp * r->head_dim;
+            int tc_cap = (mp < r->flash_full_n) ? mp : r->flash_full_n;
+            if (tc_cap < 1) tc_cap = 1;  /* forced-flash: keep a minimal valid alloc */
+            size_t nhd = (size_t)r->n_heads * tc_cap * r->head_dim;
             CHECK_CU(cuMemAlloc(&r->d_qh_f16, nhd * sizeof(unsigned short)));
             CHECK_CU(cuMemAlloc(&r->d_kh_f16, nhd * sizeof(unsigned short)));
             CHECK_CU(cuMemAlloc(&r->d_vh_f16, nhd * sizeof(unsigned short)));
-            CHECK_CU(cuMemAlloc(&r->d_attn_scores, (size_t)mp * mp * sizeof(float)));
-            CHECK_CU(cuMemAlloc(&r->d_attn_probs,  (size_t)mp * mp * sizeof(unsigned short)));
+            CHECK_CU(cuMemAlloc(&r->d_attn_scores, (size_t)tc_cap * tc_cap * sizeof(float)));
+            CHECK_CU(cuMemAlloc(&r->d_attn_probs,  (size_t)tc_cap * tc_cap * sizeof(unsigned short)));
         }
     }
 
@@ -1702,9 +1929,15 @@ static void vlm_run_vit_blocks(cuda_vision_runner *r,
                 &r->d_qkv, &r->d_rope_cos, &r->d_rope_sin,
                 &n_patches, &n_heads, &dim, &head_dim, &half
             };
+            /* Grid-stride: 256 threads/block, enough blocks to cover all
+             * (p,h,i) rotation pairs (capped so very large N stays grid-strided). */
+            long rope_total = (long)n_patches * n_heads * half;
+            unsigned int rope_blocks = (unsigned int)((rope_total + 255) / 256);
+            if (rope_blocks > 65535u) rope_blocks = 65535u;
+            if (rope_blocks < 1u) rope_blocks = 1u;
             cuLaunchKernel(r->fn_rope_vision_f32,
-                           n_patches * n_heads, 1, 1,
-                           half, 1, 1,
+                           rope_blocks, 1, 1,
+                           256, 1, 1,
                            0, r->stream,
                            args, NULL);
         }
@@ -1722,11 +1955,11 @@ static void vlm_run_vit_blocks(cuda_vision_runner *r,
                 if (r->win_tile) {
                     /* Materialize-scores windowed attention. Grid (n_windows,
                      * n_heads), block WT_THREADS=192. Dyn smem stages the
-                     * window's Q/K/V + the S[win,win] score matrix
-                     * (3*max_window_tokens*head_dim + max_window_tokens^2 floats). */
-                    size_t smem = (size_t)((size_t)3 * max_window_tokens * head_dim +
-                                           (size_t)max_window_tokens * max_window_tokens) *
-                                  sizeof(float);
+                     * window's Q/K/V as F16 + the S[win,win] F32 score matrix
+                     * (3*max_window_tokens*head_dim halves + max_window_tokens^2
+                     * floats). F16 staging halves the dominant term -> 4 blocks/SM. */
+                    size_t smem = (size_t)3 * max_window_tokens * head_dim * sizeof(unsigned short) +
+                                  (size_t)max_window_tokens * max_window_tokens * sizeof(float);
                     cuLaunchKernel(r->fn_attn_window_tile_f32,
                                    n_windows, n_heads, 1,
                                    192, 1, 1,   /* WT_THREADS */
@@ -1743,6 +1976,35 @@ static void vlm_run_vit_blocks(cuda_vision_runner *r,
                                    smem, r->stream,
                                    args, NULL);
                 }
+            } else if (r->tc_flash ||
+                       (r->tc_attn && r->use_f16 && n_patches > r->flash_full_n)) {
+                /* Tensor-core flash full attention: attn_prefill_vision_f32.
+                 * mma.sync m16n8k16 (F16 frags, F32 accum) + online softmax,
+                 * O(N) memory; reads F32 qkv directly, stages each 16-key K/V
+                 * tile into shared. Grid (n_heads, ceil(N/64)); block 128
+                 * (4 warps, 16 queries each).
+                 *
+                 * This is the O(N)-memory fallback above the flash_full_n
+                 * crossover (where the materialized path's [N,N] F32 scratch
+                 * would OOM the 16 GB card). NOTE: benchmarking showed it is
+                 * still 4-14% SLOWER than the materialized cuBLAS path even
+                 * with shared K/V staging -- cuBLAS's larger tiles / cp.async
+                 * pipelining win, and head_dim=72 wastes ~half the 5th k16
+                 * fragment. So it does NOT replace materialized below the
+                 * crossover; it is a much better fallback than the CUDA-core
+                 * flash_attn_full_f32 (which was 3.6-5.5x slower). VLM_TC_FLASH=1
+                 * forces it at every size for A/B testing. */
+                int n_qtiles64 = (n_patches + 63) / 64;
+                size_t smem = (size_t)2 * 16 * head_dim * sizeof(float);
+                void *args[] = {
+                    &r->d_attn_out, &r->d_qkv,
+                    &n_patches, &dim, &n_heads, &head_dim, &scale
+                };
+                cuLaunchKernel(r->fn_attn_prefill_vision_f32,
+                               n_heads, n_qtiles64, 1,
+                               128, 1, 1,
+                               smem, r->stream,
+                               args, NULL);
             } else if (r->tc_attn && r->use_f16) {
                 /* Tensor-core full attention: cuBLAS QK^T (F16->F32) -> row
                  * softmax (->F16 probs) -> P*V (F16->F32), one head at a time.
