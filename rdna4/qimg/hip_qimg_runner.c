@@ -101,6 +101,20 @@ typedef struct {
     void *txt_mlp_fc1_w, *txt_mlp_fc1_b, *txt_mlp_fc2_w, *txt_mlp_fc2_b;
 } qimg_block_gpu;
 
+/* ---- Per-linear INT4 (Nunchaku/SVDQuant, W4A16) weight descriptor ----
+ * Logical (de-swizzled) layout produced offline by tools/nunchaku_convert_logical.py and uploaded verbatim;
+ * the dequant kernel unpacks contiguous nibbles, applies the per-(out, input-group) wscale, divides the BF16
+ * activation by `smooth`, and adds the rank-128 BF16 low-rank (lora_up · (lora_down · x)) plus bias. */
+typedef struct {
+    void  *qint4;      /* device uint8 [n_out, n_in/2]  contiguous logical int4 nibble pack */
+    float *wscale;     /* device f32   [n_out, n_in/group_size] */
+    float *smooth;     /* device f32   [n_in] */
+    void  *lora_down;  /* device bf16  [rank, n_in] */
+    void  *lora_up;    /* device bf16  [n_out, rank] */
+    float *bias;       /* device f32   [n_out] */
+    int n_out, n_in, rank, group_size;
+} qimg_int4_linear;
+
 /* ---- Runner struct ---- */
 
 struct hip_qimg_runner {
@@ -132,6 +146,7 @@ struct hip_qimg_runner {
     hipFunction_t fn_q_quant_perrow, fn_k_quant_repack_perrow, fn_flash_attn_fp8_perrow;
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
+    hipFunction_t fn_dequant_int4_main, fn_expand_bf16;  /* int4 W4A16 dequant + bf16->f32 lora expand (unfused path) */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
     hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip;
     /* VAE kernels */
@@ -177,6 +192,9 @@ struct hip_qimg_runner {
      * copy_stream and double-buffered to overlap H2D with compute. */
     qimg_block_gpu stream_blk[2];
     int stream_blk_alloc;       /* 1 once both buffers' fields are allocated */
+    /* INT4 (Nunchaku/SVDQuant, W4A16 logical layout) path — all blocks resident (no streaming). */
+    qimg_int4_linear *int4_linears;  /* [n_blocks * QIMG_INT4_PER_BLOCK] per-block logical-linear descriptors */
+    int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
     hipStream_t copy_stream;
     hipEvent_t stream_copy_done[2];
     hipEvent_t stream_use_done[2];
@@ -581,6 +599,44 @@ static void *qimg_st_upload_fp8_raw(st_context *st, const char *name) {
 }
 
 /* Upload weight: FP8 raw if use_fp8, else F32 */
+/* Upload a tensor's raw bytes to device verbatim (dtype-agnostic) — for the logical INT4 bundle's packed
+ * nibbles (uint8) and the BF16 low-rank factors, which the dequant kernel reinterprets. */
+static void *qimg_st_upload_raw(st_context *st, const char *name) {
+    int idx = safetensors_find(st, name);
+    if (idx < 0) return NULL;
+    size_t nbytes = safetensors_nbytes(st, idx);
+    const void *data = safetensors_data(st, idx);
+    void *d = NULL;
+    if (hipMalloc(&d, nbytes) != hipSuccess) {
+        fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for %s (raw)\n", (float)nbytes / (1 << 20), name);
+        return NULL;
+    }
+    hipMemcpy(d, data, nbytes, hipMemcpyHostToDevice);
+    return d;
+}
+
+/* Upload one logical INT4 linear bundle (<key>.qint4/.wscale/.smooth/.lora_down/.lora_up/.bias) into a
+ * descriptor; dims inferred from shapes (qint4 [n_out, n_in/2]; lora_up [n_out, rank]). Returns 0 on success.
+ * Used by the Nunchaku-format DiT loader — all blocks preloaded (the INT4 model fits VRAM; no streaming). */
+static int qimg_upload_int4_linear(st_context *st, const char *key, qimg_int4_linear *L) {
+    char nm[256]; int idx;
+    memset(L, 0, sizeof(*L)); L->group_size = 64;
+    snprintf(nm, sizeof(nm), "%s.qint4", key);
+    idx = safetensors_find(st, nm); if (idx < 0) return -1;
+    const uint64_t *qs = safetensors_shape(st, idx);          /* [n_out, n_in/2] */
+    L->n_out = (int)qs[0]; L->n_in = (int)(qs[1] * 2);
+    snprintf(nm, sizeof(nm), "%s.lora_up", key);
+    idx = safetensors_find(st, nm); if (idx >= 0) L->rank = (int)safetensors_shape(st, idx)[1];
+    snprintf(nm, sizeof(nm), "%s.qint4", key);     L->qint4     = qimg_st_upload_raw(st, nm);
+    snprintf(nm, sizeof(nm), "%s.wscale", key);    L->wscale    = (float *)qimg_st_upload_f32(st, nm);  /* stored f32 — identity load */
+    snprintf(nm, sizeof(nm), "%s.smooth", key);    L->smooth    = (float *)qimg_st_upload_f32(st, nm);
+    snprintf(nm, sizeof(nm), "%s.lora_down", key); L->lora_down = qimg_st_upload_raw(st, nm);
+    snprintf(nm, sizeof(nm), "%s.lora_up", key);   L->lora_up   = qimg_st_upload_raw(st, nm);
+    snprintf(nm, sizeof(nm), "%s.bias", key);      L->bias      = (float *)qimg_st_upload_f32(st, nm);
+    if (!L->qint4 || !L->wscale || !L->smooth || !L->lora_down || !L->lora_up || !L->bias) return -1;
+    return 0;
+}
+
 static void *qimg_upload_weight(hip_qimg_runner *r, st_context *st, const char *name) {
     if (r->use_fp8) return qimg_st_upload_fp8_raw(st, name);
     return qimg_st_upload_f32(st, name);
@@ -990,6 +1046,32 @@ static void op_gemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bi
     op_bf16_trunc(r, Y, n_out * n_tok);
 }
 
+/* Unfused W4A16 SVDQuant linear: Y[n_tok,n_out] = (W·wscale/smooth)@X + lora_up@(lora_down@X) + bias.
+ * Verified-correct, perf-naive (per-call dense materialize + f32 GEMMs); the fused dequant-LDS WMMA kernel
+ * replaces the W-materialize later. L = &int4_linears[block*PER_BLOCK + slot]. X is F32 [n_tok,n_in]. */
+static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
+    int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank; long wn = (long)n_out*n_in;
+    float *dW=0,*ldf=0,*luf=0,*dt=0,*dly=0;
+    hipMalloc(&dW,(size_t)wn*4); hipMalloc(&ldf,(size_t)rk*n_in*4); hipMalloc(&luf,(size_t)n_out*rk*4);
+    hipMalloc(&dt,(size_t)rk*n_tok*4); hipMalloc(&dly,(size_t)n_out*n_tok*4);
+    void *da[]={(void*)&L->qint4,(void*)&L->wscale,(void*)&L->smooth,&dW,&n_out,&n_in,&gs};
+    hipModuleLaunchKernel(r->fn_dequant_int4_main,(unsigned)((wn+255)/256),1,1,256,1,1,0,NULL,da,NULL);
+    op_gemm(r, Y, dW, X, L->bias, n_out, n_in, n_tok);                /* main+smooth+bias */
+    int ldn=rk*n_in, lun=n_out*rk; void *e1[]={(void*)&L->lora_down,&ldf,&ldn}, *e2[]={(void*)&L->lora_up,&luf,&lun};
+    hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((ldn+255)/256),1,1,256,1,1,0,NULL,e1,NULL);
+    hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((lun+255)/256),1,1,256,1,1,0,NULL,e2,NULL);
+    op_gemm(r, dt, ldf, X, NULL, rk, n_in, n_tok); op_gemm(r, dly, luf, dt, NULL, n_out, rk, n_tok);
+    int ny=n_out*n_tok; void *aa[]={&Y,&dly,&ny}; hipModuleLaunchKernel(r->fn_add,(unsigned)((ny+255)/256),1,1,256,1,1,0,NULL,aa,NULL);
+    hipFree(dW);hipFree(ldf);hipFree(luf);hipFree(dt);hipFree(dly);
+}
+
+/* Route a block projection: int4 descriptor[blk*12+slot] when a logical-INT4 DiT is loaded, else BF16 weight. */
+static void op_proj(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
+                    int n_out, int n_in, int n_tok, int blk, int slot) {
+    if (r->use_int4 && r->int4_linears) { op_int4_linear(r, Y, X, &r->int4_linears[(size_t)blk*12 + slot], n_tok); return; }
+    op_wgemm_bf16(r, Y, W, X, bias, n_out, n_in, n_tok);
+}
+
 static void op_silu(hip_qimg_runner *r, void *x, int n) {
     void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_silu, (unsigned)((n+255)/256), 1, 1,
@@ -1382,6 +1464,9 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     if (hipModuleGetFunction(&r->fn_add_bias, mod, "qimg_add_bias_rowmajor_f32") != hipSuccess)
         r->fn_add_bias = NULL;
     GET(fn_layernorm, "layernorm_f32");
+    GET(fn_dequant_int4_main, "dequant_int4_logical_main_f32");
+    GET(fn_add, "add_inplace_f32");
+    GET(fn_expand_bf16, "expand_bf16_f32");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
     GET(fn_adaln, "adaln_modulate_f32");
@@ -1677,6 +1762,171 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
 }
 
 /* ---- Load DiT ---- */
+
+/* The 12 logical linears per transformer block, in the order tools/nunchaku_convert_logical.py emits them
+ * (fused QKV split into separate q/k/v slots); the per-linear key is "transformer_blocks.{b}.{suffix}". */
+#define QIMG_INT4_PER_BLOCK 12
+static const char *const qimg_int4_linear_suffix[QIMG_INT4_PER_BLOCK] = {
+    "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
+    "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
+    "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2",
+};
+
+/* Load a Nunchaku/SVDQuant DiT in the offline-converted "logical" INT4 layout (W4A16). All blocks are
+ * resident — the ~12 GB INT4 model fits 16 GB, so the block-streaming the FP8 path needs is gone. This loads
+ * the per-block quantized-linear descriptors (the novel part); BF16 globals/norms/biases and the modulation
+ * still reuse the existing global-upload flow shared with hip_qimg_load_dit (wired in a following step). */
+int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
+    fprintf(stderr, "hip_qimg: loading logical-INT4 DiT %s\n", path);
+    st_context *st = safetensors_open(path);
+    if (!st) return -1;
+    r->dit_st = st; r->use_int4 = 1;
+    size_t free_entry = 0, vram_total = 0; hipMemGetInfo(&free_entry, &vram_total);  /* for the residency delta */
+    r->dim = 3072; r->n_heads = 24; r->head_dim = 128;
+    r->in_ch = 64; r->txt_dim = 3584; r->mlp_h = 12288;
+    r->n_blocks = 0;
+    for (int i = 0; i < st->n_tensors; i++) {
+        const char *bp = strstr(safetensors_name(st, i), "transformer_blocks.");
+        if (bp) { int blk = atoi(bp + 19); if (blk + 1 > r->n_blocks) r->n_blocks = blk + 1; }
+    }
+    r->int4_linears = (qimg_int4_linear *)calloc((size_t)r->n_blocks * QIMG_INT4_PER_BLOCK, sizeof(qimg_int4_linear));
+    if (!r->int4_linears) return -1;
+    int loaded = 0;
+    for (int b = 0; b < r->n_blocks; b++) {
+        for (int j = 0; j < QIMG_INT4_PER_BLOCK; j++) {
+            char key[160];
+            snprintf(key, sizeof(key), "transformer_blocks.%d.%s", b, qimg_int4_linear_suffix[j]);
+            if (qimg_upload_int4_linear(st, key, &r->int4_linears[(size_t)b * QIMG_INT4_PER_BLOCK + j]) == 0) loaded++;
+        }
+    }
+    /* BF16 globals (converter passthrough) — reuse the auto-dtype path: all BF16 here -> f32 upload. */
+    r->d_img_in_w = qimg_upload_weight_auto(r, st, "img_in.weight", &r->is_fp8_img_in);
+    r->d_img_in_b = qimg_st_upload_f32(st, "img_in.bias");
+    r->d_txt_in_w = qimg_upload_weight_auto(r, st, "txt_in.weight", &r->is_fp8_txt_in);
+    r->d_txt_in_b = qimg_st_upload_f32(st, "txt_in.bias");
+    r->d_txt_norm_w = qimg_st_upload_f32(st, "txt_norm.weight");
+    r->d_t_fc1_w = qimg_upload_weight_auto(r, st, "time_text_embed.timestep_embedder.linear_1.weight", &r->is_fp8_t_fc1);
+    r->d_t_fc1_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_1.bias");
+    r->d_t_fc2_w = qimg_upload_weight_auto(r, st, "time_text_embed.timestep_embedder.linear_2.weight", &r->is_fp8_t_fc2);
+    r->d_t_fc2_b = qimg_st_upload_f32(st, "time_text_embed.timestep_embedder.linear_2.bias");
+    r->d_norm_out_w = qimg_upload_weight_auto(r, st, "norm_out.linear.weight", &r->is_fp8_norm_out);
+    r->d_norm_out_b = qimg_st_upload_f32(st, "norm_out.linear.bias");
+    r->d_proj_out_w = qimg_upload_weight_auto(r, st, "proj_out.weight", &r->is_fp8_proj_out);
+    r->d_proj_out_b = qimg_st_upload_f32(st, "proj_out.bias");
+    if (!r->d_img_in_w || !r->d_txt_in_w || !r->d_proj_out_w)
+        fprintf(stderr, "hip_qimg: int4 globals incomplete (some NULL); render needs all BF16 globals\n");
+    /* Per-block BF16 passthrough (norms + modulation): qkv/mlp come from int4 descriptors, so blocks fully resident. */
+    r->gpu_blocks = (qimg_block_gpu *)calloc((size_t)r->n_blocks, sizeof(qimg_block_gpu)); r->n_preloaded = r->n_blocks;
+    for (int b = 0; b < r->n_blocks; b++) { qimg_block_gpu *g = &r->gpu_blocks[b]; char nm[160];
+        #define MW(f,suf) do{snprintf(nm,sizeof nm,"transformer_blocks.%d." suf,b); g->f=qimg_st_upload_f32(st,nm);}while(0)
+        MW(norm_q_w,"attn.norm_q.weight"); MW(norm_k_w,"attn.norm_k.weight");
+        MW(norm_added_q_w,"attn.norm_added_q.weight"); MW(norm_added_k_w,"attn.norm_added_k.weight");
+        MW(img_mod_w,"img_mod.1.weight"); MW(img_mod_b,"img_mod.1.bias");
+        MW(txt_mod_w,"txt_mod.1.weight"); MW(txt_mod_b,"txt_mod.1.bias");
+        #undef MW
+        if (!g->img_mod_w || !g->txt_mod_w) { fprintf(stderr, "hip_qimg: int4 block %d mod/norm incomplete\n", b); }
+    }
+    if (r->verbose) {
+        const qimg_int4_linear *s = &r->int4_linears[0];  /* sample: block 0, attn.to_q */
+        fprintf(stderr, "hip_qimg: logical-INT4 — %d blocks, %d/%d linear descriptors loaded; "
+                "sample to_q n_out=%d n_in=%d rank=%d group=%d\n",
+                r->n_blocks, loaded, r->n_blocks * QIMG_INT4_PER_BLOCK, s->n_out, s->n_in, s->rank, s->group_size);
+        size_t free_now = 0, t = 0; hipMemGetInfo(&free_now, &t);
+        fprintf(stderr, "hip_qimg: logical-INT4 weights resident: %.0f MB (of %.0f MB VRAM; no block streaming)\n",
+                (double)(free_entry - free_now) / 1e6, (double)vram_total / 1e6);
+    }
+    return (loaded == r->n_blocks * QIMG_INT4_PER_BLOCK) ? 0 : -1;
+}
+
+/* Deterministic on-GPU gate for the int4-logical "main" weight dequant. Assumes hip_qimg_load_dit_int4 has
+ * run (descriptors resident, r->dit_st host bytes available). Runs fn_dequant_int4_main on block-0 attn.to_q's
+ * packed nibbles+scales, copies the dense weight back, and compares element-wise against a host nibble-decode of
+ * the *same* bytes — so any mismatch is purely a kernel-indexing bug (the converter's host decode is the proven
+ * oracle). Bit-exact expected: identical float ops on identical operands. Returns 0 on success. */
+int hip_qimg_test_int4_dequant(hip_qimg_runner *r) {
+    if (!r->use_int4 || !r->int4_linears || !r->dit_st || !r->fn_dequant_int4_main) {
+        fprintf(stderr, "hip_qimg: int4-dequant test prerequisites missing (load logical-INT4 DiT first)\n");
+        return -1;
+    }
+    const char *key = "transformer_blocks.0.attn.to_q";   /* descriptor slot [0]; an unfused logical bundle */
+    const qimg_int4_linear *L = &r->int4_linears[0];
+    int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, ng = n_in / gs;
+    long total = (long)n_out * n_in;
+
+    /* host-side raw bytes the descriptor was built from (still mapped in r->dit_st) */
+    st_context *st = (st_context *)r->dit_st;
+    char nm[256];
+    snprintf(nm, sizeof(nm), "%s.qint4", key);  int iq = safetensors_find(st, nm);
+    snprintf(nm, sizeof(nm), "%s.wscale", key); int iw = safetensors_find(st, nm);
+    if (iq < 0 || iw < 0) { fprintf(stderr, "hip_qimg: int4-dequant test — host tensors for %s absent\n", key); return -1; }
+    const unsigned char *qb = (const unsigned char *)safetensors_data(st, iq);
+    const float *ws = (const float *)safetensors_data(st, iw);
+
+    /* GPU dense weight */
+    float *d_W = NULL;
+    if (hipMalloc(&d_W, (size_t)total * sizeof(float)) != hipSuccess) { fprintf(stderr, "hip_qimg: int4-dequant test hipMalloc failed\n"); return -1; }
+    void *smnull = NULL;  /* pure-decode check uses no smooth (bit-exact vs raw nibble*scale) */
+    void *args[] = { (void *)&L->qint4, (void *)&L->wscale, &smnull, &d_W, &n_out, &n_in, &gs };
+    hipModuleLaunchKernel(r->fn_dequant_int4_main, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, args, NULL);
+    hipDeviceSynchronize();
+    float *h_W = (float *)malloc((size_t)total * sizeof(float));
+    hipMemcpy(h_W, d_W, (size_t)total * sizeof(float), hipMemcpyDeviceToHost);
+
+    /* host reference (the proven converter decode) + max-diff and norm */
+    double max_abs_diff = 0.0, sumsq = 0.0; long n_nonfinite = 0;
+    for (int o = 0; o < n_out; o++) {
+        for (int i = 0; i < n_in; i++) {
+            unsigned char byte = qb[(long)o * (n_in / 2) + (i >> 1)];
+            int nib = (i & 1) ? (byte >> 4) : (byte & 0xF);
+            if (nib >= 8) nib -= 16;
+            float ref = (float)nib * ws[(long)o * ng + (i / gs)];
+            float got = h_W[(long)o * n_in + i];
+            double d = fabs((double)got - (double)ref);
+            if (d > max_abs_diff) max_abs_diff = d;
+            sumsq += (double)ref * ref;
+            if (!isfinite(got)) n_nonfinite++;
+        }
+    }
+    fprintf(stderr, "hip_qimg: int4-dequant gate — %s  Ŵ[%d,%d] group=%d  ||W||=%.1f  max|gpu-host|=%.3g  nonfinite=%ld\n",
+            key, n_out, n_in, gs, sqrt(sumsq), max_abs_diff, n_nonfinite);
+
+    /* int4-main forward hookup: feed the dense weight through the F32 GEMM (bias) on a small batch,
+     * compare to a host matmul. lora/smoothing deferred — this just proves decode->GEMM wiring. */
+    int n_tok = 4; float *xh = (float *)malloc((size_t)n_tok * n_in * sizeof(float));
+    for (long k = 0; k < (long)n_tok * n_in; k++) xh[k] = ((k * 1103515245u + 12345u) % 2048) / 2048.0f - 0.5f;
+    float *dx = NULL, *dy = NULL; hipMalloc(&dx, (size_t)n_tok*n_in*4); hipMalloc(&dy, (size_t)n_tok*n_out*4);
+    hipMemcpy(dx, xh, (size_t)n_tok*n_in*4, hipMemcpyHostToDevice);
+    /* GPU: re-dequant with smoothing folded, then GEMM+bias — main + smooth + bias on GPU */
+    snprintf(nm, sizeof(nm), "%s.smooth", key); int ism = safetensors_find(st, nm); const float *smh = (const float *)safetensors_data(st, ism);
+    void *args2[] = { (void *)&L->qint4, (void *)&L->wscale, (void *)&L->smooth, &d_W, &n_out, &n_in, &gs };
+    hipModuleLaunchKernel(r->fn_dequant_int4_main, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, args2, NULL);
+    op_gemm(r, dy, d_W, dx, L->bias, n_out, n_in, n_tok);  /* main+smooth+bias */
+    /* + rank-128 low-rank residual on the RAW activation: y += lora_up @ (lora_down @ x). bf16->f32 for the f32 GEMMs. */
+    int rk = L->rank; float *ldf = (float*)malloc((size_t)rk*n_in*4), *luf = (float*)malloc((size_t)n_out*rk*4);
+    const uint16_t *ldb = (const uint16_t*)safetensors_data(st, safetensors_find(st, (snprintf(nm,sizeof nm,"%s.lora_down",key),nm)));
+    const uint16_t *lub = (const uint16_t*)safetensors_data(st, safetensors_find(st, (snprintf(nm,sizeof nm,"%s.lora_up",key),nm)));
+    for (long k=0;k<(long)rk*n_in;k++){unsigned u=ldb[k]<<16; memcpy(&ldf[k],&u,4);} for (long k=0;k<(long)n_out*rk;k++){unsigned u=lub[k]<<16; memcpy(&luf[k],&u,4);}
+    float *dld=0,*dlu=0,*dt=0,*dly=0; hipMalloc(&dld,(size_t)rk*n_in*4);hipMalloc(&dlu,(size_t)n_out*rk*4);hipMalloc(&dt,(size_t)n_tok*rk*4);hipMalloc(&dly,(size_t)n_tok*n_out*4);
+    hipMemcpy(dld,ldf,(size_t)rk*n_in*4,hipMemcpyHostToDevice); hipMemcpy(dlu,luf,(size_t)n_out*rk*4,hipMemcpyHostToDevice);
+    op_gemm(r, dt, dld, dx, NULL, rk, n_in, n_tok); op_gemm(r, dly, dlu, dt, NULL, n_out, rk, n_tok);
+    hipDeviceSynchronize();
+    float *yh = (float *)malloc((size_t)n_tok*n_out*4); hipMemcpy(yh, dy, (size_t)n_tok*n_out*4, hipMemcpyDeviceToHost);
+    float *lyh = (float *)malloc((size_t)n_tok*n_out*4); hipMemcpy(lyh, dly, (size_t)n_tok*n_out*4, hipMemcpyDeviceToHost);
+    for (long k=0;k<(long)n_tok*n_out;k++) yh[k]+=lyh[k]; free(lyh);  /* GPU lora GEMMs + accumulate */
+    float *bh = (float *)malloc(n_out*4); hipMemcpy(bh, L->bias, n_out*4, hipMemcpyDeviceToHost);
+    double dot = 0, ng2 = 0, rg2 = 0;
+    for (int t = 0; t < n_tok; t++) for (int o = 0; o < n_out; o++) {
+        double acc = 0; for (int i = 0; i < n_in; i++) acc += (double)(h_W[(long)o*n_in+i]/smh[i]) * xh[(long)t*n_in+i];
+        for (int rkk=0; rkk<rk; rkk++){ double d=0; for(int i=0;i<n_in;i++) d+=(double)ldf[(long)rkk*n_in+i]*xh[(long)t*n_in+i]; acc+=luf[(long)o*rk+rkk]*d; }
+        double ref = acc + bh[o]; float got = yh[(long)t*n_out+o]; dot += ref*got; rg2 += ref*ref; ng2 += (double)got*got;
+    }
+    fprintf(stderr, "hip_qimg: int4 full linear — y[%d,%d] cos(gpu,host)=%.6f (main+smooth+bias+lora%d)\n",
+            n_tok, n_out, dot / (sqrt(rg2)*sqrt(ng2) + 1e-30), rk);
+    free(bh); free(ldf); free(luf); hipFree(dld); hipFree(dlu); hipFree(dt); hipFree(dly);
+    free(xh); free(yh); hipFree(dx); hipFree(dy);
+    free(h_W); hipFree(d_W);
+    return (max_abs_diff == 0.0 && n_nonfinite == 0) ? 0 : -1;
+}
 
 int hip_qimg_load_dit(hip_qimg_runner *r, const char *path) {
     fprintf(stderr, "hip_qimg: loading DiT %s\n", path);
@@ -2061,22 +2311,22 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         void *d_img_k = (char *)d_k + (size_t)n_txt * dim * sizeof(float);
         void *d_img_v = (char *)d_v + (size_t)n_txt * dim * sizeof(float);
         qimg_set_gemm_context(r, L, "img_q");
-        op_wgemm_bf16(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img);
+        op_proj(r, d_img_q, blk.attn_q_w, d_scratch1, blk.attn_q_b, dim, dim, n_img, L, 0);
         qimg_set_gemm_context(r, L, "img_k");
-        op_wgemm_bf16(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img);
+        op_proj(r, d_img_k, blk.attn_k_w, d_scratch1, blk.attn_k_b, dim, dim, n_img, L, 1);
         qimg_set_gemm_context(r, L, "img_v");
-        op_wgemm_bf16(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img);
+        op_proj(r, d_img_v, blk.attn_v_w, d_scratch1, blk.attn_v_b, dim, dim, n_img, L, 2);
 
         /* Text QKV → offset at [0:n_txt] */
         void *d_txt_q = d_q;
         void *d_txt_k = d_k;
         void *d_txt_v = d_v;
         qimg_set_gemm_context(r, L, "txt_q");
-        op_wgemm_bf16(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt);
+        op_proj(r, d_txt_q, blk.attn_add_q_w, d_scratch2, blk.attn_add_q_b, dim, dim, n_txt, L, 4);
         qimg_set_gemm_context(r, L, "txt_k");
-        op_wgemm_bf16(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt);
+        op_proj(r, d_txt_k, blk.attn_add_k_w, d_scratch2, blk.attn_add_k_b, dim, dim, n_txt, L, 5);
         qimg_set_gemm_context(r, L, "txt_v");
-        op_wgemm_bf16(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt);
+        op_proj(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt, L, 6);
 
         /* QK RMSNorm */
         op_rmsnorm_ph(r, d_img_q, blk.norm_q_w, n_img, nh, hd);
@@ -2107,9 +2357,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         void *d_img_attn = (char *)d_attn_out + (size_t)n_txt * dim * sizeof(float);
         void *d_txt_attn = d_attn_out;
         qimg_set_gemm_context(r, L, "img_attn_out");
-        op_wgemm_bf16(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img);
+        op_proj(r, d_scratch1, blk.attn_out_w, d_img_attn, blk.attn_out_b, dim, dim, n_img, L, 3);
         qimg_set_gemm_context(r, L, "txt_attn_out");
-        op_wgemm_bf16(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt);
+        op_proj(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt, L, 7);
 
         /* Gated residual */
         op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
@@ -2118,23 +2368,19 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         /* MLP: Image (GELU) */
         op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
         qimg_set_gemm_context(r, L, "img_mlp_fc1");
-        op_wgemm_bf16(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b,
-                     mlp_h, dim, n_img);
+        op_proj(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b, mlp_h, dim, n_img, L, 8);
         op_gelu(r, d_scratch3, n_img * mlp_h);
         qimg_set_gemm_context(r, L, "img_mlp_fc2");
-        op_wgemm_bf16(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b,
-                     dim, mlp_h, n_img);
+        op_proj(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b, dim, mlp_h, n_img, L, 9);
         op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
 
         /* MLP: Text (GELU) */
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
         qimg_set_gemm_context(r, L, "txt_mlp_fc1");
-        op_wgemm_bf16(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b,
-                     mlp_h, dim, n_txt);
+        op_proj(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b, mlp_h, dim, n_txt, L, 10);
         op_gelu(r, d_scratch3, n_txt * mlp_h);
         qimg_set_gemm_context(r, L, "txt_mlp_fc2");
-        op_wgemm_bf16(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b,
-                     dim, mlp_h, n_txt);
+        op_proj(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b, dim, mlp_h, n_txt, L, 11);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
 
         /* BF16 truncation (image only — text is tiny, not worth a separate launch) */
