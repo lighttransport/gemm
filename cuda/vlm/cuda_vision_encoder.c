@@ -746,6 +746,7 @@ struct cuda_vision_runner {
     int max_pixels;            /* max pixel count for RGB buffer */
     float *h_pos_embd;         /* CPU copy of original pos embedding [n_patches * dim] */
     CUdeviceptr d_pos_interp;  /* GPU buffer for interpolated pos embedding [max_patches * dim] */
+    int pos_interp_w, pos_interp_h; /* grid the cached d_pos_interp is valid for (-1 = none) */
 
     /* GPU weights: patch embeddings */
     CUdeviceptr d_patch_w0;     /* F32 [dim, ps*ps*3] (w1 folded in: w0 += w1 at load) */
@@ -1426,6 +1427,7 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
         CHECK_CU(cuMemAlloc(&r->d_window_starts, (size_t)max_merged * sizeof(int)));
         CHECK_CU(cuMemAlloc(&r->d_window_sizes, (size_t)max_merged * sizeof(int)));
         CHECK_CU(cuMemAlloc(&r->d_pos_interp,(size_t)mp * dim * sizeof(float)));
+        r->pos_interp_w = -1; r->pos_interp_h = -1; /* no interpolated pos cached yet */
         CHECK_CU(cuMemAlloc(&r->d_patch_pix, (size_t)mp * r->patch_size * r->patch_size * 3 * sizeof(float)));
         /* F16 GEMM-input scratch for the Blackwell cuBLAS path (cast X to F16).
          * Largest GEMM input is max(mp*ffn_dim, max_merged*merged_dim) elements. */
@@ -2010,34 +2012,41 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                            0, r->stream,
                            args, NULL);
         } else {
-            /* Bilinear interpolation on CPU, upload to d_pos_interp */
-            fprintf(stderr, "  interpolating pos embedding: %dx%d -> %dx%d\n",
-                    orig_gw, orig_gh, gw, gh);
-            float *interp = (float *)malloc((size_t)n_patches * dim * sizeof(float));
-            for (int py = 0; py < gh; py++) {
-                float sy = (float)py * (orig_gh - 1) / (gh > 1 ? gh - 1 : 1);
-                int y0 = (int)sy, y1 = (y0 + 1 < orig_gh) ? y0 + 1 : y0;
-                float wy = sy - y0;
-                for (int px = 0; px < gw; px++) {
-                    float sx = (float)px * (orig_gw - 1) / (gw > 1 ? gw - 1 : 1);
-                    int x0 = (int)sx, x1 = (x0 + 1 < orig_gw) ? x0 + 1 : x0;
-                    float wx = sx - x0;
-                    int dst_idx = (py * gw + px) * dim;
-                    int s00 = (y0 * orig_gw + x0) * dim;
-                    int s01 = (y0 * orig_gw + x1) * dim;
-                    int s10 = (y1 * orig_gw + x0) * dim;
-                    int s11 = (y1 * orig_gw + x1) * dim;
-                    for (int d = 0; d < dim; d++) {
-                        interp[dst_idx + d] =
-                            r->h_pos_embd[s00+d] * (1-wy)*(1-wx) +
-                            r->h_pos_embd[s01+d] * (1-wy)*wx +
-                            r->h_pos_embd[s10+d] * wy*(1-wx) +
-                            r->h_pos_embd[s11+d] * wy*wx;
+            /* Bilinear interpolation on CPU, upload to d_pos_interp. The result is
+             * size-invariant, so cache it: d_pos_interp persists across encodes and
+             * nothing else writes it, so a repeated (gw,gh) reuses the resident buffer
+             * and skips the ~1M-elem CPU loop + the multi-MB HtoD (the dominant cost
+             * at non-native sizes, e.g. ~2.9 ms/encode at 512²). */
+            if (r->pos_interp_w != gw || r->pos_interp_h != gh) {
+                fprintf(stderr, "  interpolating pos embedding: %dx%d -> %dx%d\n",
+                        orig_gw, orig_gh, gw, gh);
+                float *interp = (float *)malloc((size_t)n_patches * dim * sizeof(float));
+                for (int py = 0; py < gh; py++) {
+                    float sy = (float)py * (orig_gh - 1) / (gh > 1 ? gh - 1 : 1);
+                    int y0 = (int)sy, y1 = (y0 + 1 < orig_gh) ? y0 + 1 : y0;
+                    float wy = sy - y0;
+                    for (int px = 0; px < gw; px++) {
+                        float sx = (float)px * (orig_gw - 1) / (gw > 1 ? gw - 1 : 1);
+                        int x0 = (int)sx, x1 = (x0 + 1 < orig_gw) ? x0 + 1 : x0;
+                        float wx = sx - x0;
+                        int dst_idx = (py * gw + px) * dim;
+                        int s00 = (y0 * orig_gw + x0) * dim;
+                        int s01 = (y0 * orig_gw + x1) * dim;
+                        int s10 = (y1 * orig_gw + x0) * dim;
+                        int s11 = (y1 * orig_gw + x1) * dim;
+                        for (int d = 0; d < dim; d++) {
+                            interp[dst_idx + d] =
+                                r->h_pos_embd[s00+d] * (1-wy)*(1-wx) +
+                                r->h_pos_embd[s01+d] * (1-wy)*wx +
+                                r->h_pos_embd[s10+d] * wy*(1-wx) +
+                                r->h_pos_embd[s11+d] * wy*wx;
+                        }
                     }
                 }
+                cuMemcpyHtoD(r->d_pos_interp, interp, (size_t)n_patches * dim * sizeof(float));
+                free(interp);
+                r->pos_interp_w = gw; r->pos_interp_h = gh;
             }
-            cuMemcpyHtoD(r->d_pos_interp, interp, (size_t)n_patches * dim * sizeof(float));
-            free(interp);
 
             /* Add interpolated pos embedding directly (no pos_map needed) */
             void *args[] = { &r->d_hidden, &r->d_pos_interp, &dim, &n_patches };
