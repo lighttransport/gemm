@@ -55,6 +55,49 @@ CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
 > FFN-down input cast are all gone (fused / written F16 in-pass); what remains is
 > `gelu_f32_to_f16` (≈5.2%) + the smaller residual `cast_f32_f16` (≈2.4%).
 
+## Fix applied #8: CUDA graph capture of the ViT block loop
+
+The 27 ViT blocks issue ~288 host launches/encode (per-head full attention dominates:
+6 full-attn layers × 16 heads × 3 launches). Those launches are now captured **once per
+image size** into a CUDA graph and replayed with a single `cuGraphLaunch`, collapsing the
+per-launch host overhead.
+
+Mechanics (`cuda_vision_encoder.c`): the block loop was factored into
+`vlm_run_vit_blocks()` so it can be issued normally, recorded under capture, or skipped
+for replay. Encode **#1** runs normally (settles `cublas_mixed_ok`, warms cuBLAS
+algos/workspace); encode **#2** captures via `cuStreamBeginCapture_v2`(THREAD_LOCAL) →
+`cuStreamEndCapture` → `cuGraphInstantiateWithFlags`, then replays once to execute;
+encode **#3+** replay. The pre/post window reorder+swaps are *net-identity* per encode, so
+the loop sees the same physical `d_hidden`/`d_hidden2` every time — the baked graph
+pointers stay valid across replays. cuBLAS is bound to the capture stream
+(`cublasewCreate(.., r->stream)`) and its workspace is pre-allocated + algo-cached, so no
+illegal on-stream alloc during capture. Capture is gated on `verbose<2` (in-loop debug
+syncs/DtoH would break capture) and `n_deepstack==0` (the host-side `ds_count` can't
+survive replay); any capture/instantiate failure disables graphs and falls back to
+per-layer launches. `VLM_CUDA_GRAPH=0` disables; default ON.
+
+Result (f16, RTX 5060 Ti, `--warmup 3 --iters 10`):
+
+| size | graph off (mean / min) | graph on (mean / min) |
+|------|------------------------|-----------------------|
+| 512² | 38.2 / 37.6 ms         | **37.7 / 37.2 ms**    |
+| 768² | 96.3 / 94.6 ms         | **95.2 / 94.6 ms**    |
+
+rel_L2 vs CPU of a **replayed** warm encode = **0.6394475**, bit-identical to the
+graph-off warm path — replay is numerically faithful.
+
+**The launch overhead was only ~1.3 ms, not the ~20 ms #7 implied.** Graphs cut the
+genuine in-loop launch cost (≈4.5 µs × 288) and reduce mean jitter, but the 768² *min*
+is unchanged (94.6 ms) — the GPU loop (`vit` phase ≈ 73.4 ms) is the floor. The larger
+gap the #7 nsys "21% idle" figure pointed at is **untimed per-encode host work**, not
+launch latency: the encode tail does `calloc(11.8 MB)` + `malloc(11.8 MB)` + a synchronous
+pageable `cuMemcpyDtoH(11.8 MB)` + a host interleave-copy for the result, plus the RGB
+HtoD up front (none of which is in the `t_*` phase timers). That host-side result assembly
+(≈10 ms) + transfers is the real residual lever — e.g. pinned-memory output, reusing the
+result buffer across encodes, and skipping the interleave when `n_deepstack==0`. The
+window-map + rope precompute (recomputed every encode though size-invariant) is a smaller
+cache-per-size opportunity.
+
 ## Fix applied #7: fold the layernorm→GEMM input cast into LayerNorm (F16 output)
 
 On the Blackwell F16×F16 path the qkv- and ffn-up-projection GEMMs each cast their F32
@@ -85,6 +128,12 @@ barely moved because the GPU was already starved. The dominant launch source is 
 ≈0.4 ms, which would need a duplicate F16-output attention kernel) will not move the wall
 until that host overhead is collapsed — the real next lever is **CUDA graphs** (capture
 the per-layer kernel sequence once, replay per layer) or batching the per-head launches.
+
+> **Correction (see Fix #8):** the in-loop launch overhead turned out to be only ~1.3 ms,
+> not ~20 ms. CUDA graphs recovered exactly that. The bulk of the "21% idle" was untimed
+> per-encode **host** work (result `calloc`+pageable-`DtoH`+interleave of the 11.8 MB
+> output, RGB HtoD), which the nsys GPU-busy-vs-wall comparison mis-attributed to launch
+> starvation. The next lever is that host-side result assembly, not the launch path.
 
 ## Fix applied #6: materialize-scores windowed-attention kernel
 
@@ -260,9 +309,12 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
    the 6-layer full-attention tensor-core path is ≈17% (spread across QK/softmax/P·V/extract,
    already on tensor cores). The qkv/ffn-up input casts are now folded into LayerNorm
    (Fix #7, F16 output). `gelu_f32_to_f16` (≈5.3%) **cannot** be folded further — sm_120
-   cuBLASLt has no F16-output epilogue. The encoder is now **host-launch-bound** (~21% GPU
-   idle at 768²): the real next lever is CUDA graphs / batching the 288/encode per-head
-   full-attention launches, not more per-kernel folds. See Fix #7.
+   cuBLASLt has no F16-output epilogue. The 288/encode per-layer launches are now captured
+   into a **CUDA graph** and replayed (Fix #8) — that recovered the real in-loop launch
+   overhead (~1.3 ms). The remaining wall-vs-GPU gap is **untimed host work** (11.8 MB
+   result `calloc`+pageable-`DtoH`+interleave, RGB HtoD), not GPU launch starvation; the
+   next lever is that host-side result assembly + transfers. See Fix #8 (and the #7
+   correction note).
 
    *Tried and rejected — batching the full-attention heads.* The 6 full-attn layers run
    the QK / softmax / P·V chain **one head at a time** (16 heads × 3 launches × 6 layers).
