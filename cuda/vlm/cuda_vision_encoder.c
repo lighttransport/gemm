@@ -2282,33 +2282,32 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     cuStreamSynchronize(r->stream);
 
     int total_embd = r->proj_dim * (1 + r->n_deepstack);
-    float *result = (float *)calloc(n_merged * total_embd, sizeof(float));
+    float *result = (float *)malloc((size_t)n_merged * total_embd * sizeof(float));
 
-    /* Copy main embeddings */
-    float *mm_host = (float *)malloc((size_t)n_merged * r->proj_dim * sizeof(float));
-    cuMemcpyDtoH(mm_host, r->d_mm_out, (size_t)n_merged * r->proj_dim * sizeof(float));
-
-    /* Copy deepstack features */
-    float *ds_host = NULL;
-    if (ds_count > 0) {
-        ds_host = (float *)malloc((size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
+    if (ds_count == 0) {
+        /* No DeepStack: the output IS d_mm_out, so DtoH straight into result --
+         * skips the staging malloc, the 11.8 MB zero-fill, and the interleave copy
+         * the general path below would do (this was ~half the untimed host tail). */
+        cuMemcpyDtoH(result, r->d_mm_out, (size_t)n_merged * r->proj_dim * sizeof(float));
+    } else {
+        /* DeepStack: interleave [main, ds0, ds1, ...] per token from staged copies. */
+        float *mm_host = (float *)malloc((size_t)n_merged * r->proj_dim * sizeof(float));
+        float *ds_host = (float *)malloc((size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
+        cuMemcpyDtoH(mm_host, r->d_mm_out, (size_t)n_merged * r->proj_dim * sizeof(float));
         cuMemcpyDtoH(ds_host, r->d_ds_feats,
-                      (size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
-    }
-
-    /* Interleave: [main, ds0, ds1, ...] per token */
-    for (int t = 0; t < n_merged; t++) {
-        float *dst = result + t * total_embd;
-        memcpy(dst, mm_host + t * r->proj_dim, r->proj_dim * sizeof(float));
-        for (int d = 0; d < ds_count; d++) {
-            memcpy(dst + (1 + d) * r->proj_dim,
-                   ds_host + d * n_merged * r->proj_dim + t * r->proj_dim,
-                   r->proj_dim * sizeof(float));
+                     (size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
+        for (int t = 0; t < n_merged; t++) {
+            float *dst = result + t * total_embd;
+            memcpy(dst, mm_host + t * r->proj_dim, r->proj_dim * sizeof(float));
+            for (int d = 0; d < ds_count; d++) {
+                memcpy(dst + (1 + d) * r->proj_dim,
+                       ds_host + d * n_merged * r->proj_dim + t * r->proj_dim,
+                       r->proj_dim * sizeof(float));
+            }
         }
+        free(mm_host);
+        free(ds_host);
     }
-
-    free(mm_host);
-    free(ds_host);
 
     if (r->verbose >= 1) {
         fprintf(stderr,
