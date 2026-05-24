@@ -166,6 +166,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Size the runner's scratch for the requested image (the model default is
+     * 768²/2304 patches; larger inputs need a bigger max_patches). Must be set
+     * before load_weights, which derives max_patches from max_pixels and allocates. */
+    cuda_vision_set_max_pixels(cuda_r, image_size * image_size);
+
     printf("Loading CUDA weights...\n");
     if (cuda_vision_load_weights(cuda_r, gguf) != 0) {
         fprintf(stderr, "Failed to load CUDA weights\n");
