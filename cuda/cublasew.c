@@ -62,6 +62,7 @@ enum {
     CUBLASLT_MATMUL_DESC_TRANSB = 4,
     CUBLASLT_MATMUL_DESC_EPILOGUE = 7,
     CUBLASLT_MATMUL_DESC_BIAS_POINTER = 8,
+    CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE = 26,
     CUBLASLT_MATMUL_DESC_A_SCALE_POINTER = 17,
     CUBLASLT_MATMUL_DESC_B_SCALE_POINTER = 18,
     CUBLASLT_MATMUL_DESC_C_SCALE_POINTER = 19,
@@ -76,6 +77,8 @@ enum {
 
     CUBLASLT_EPILOGUE_DEFAULT = 1,
     CUBLASLT_EPILOGUE_BIAS = 4,
+    CUBLASLT_EPILOGUE_GELU = 32,
+    CUBLASLT_EPILOGUE_GELU_BIAS = 36,
     CUBLASLT_ORDER_ROW = 1
 };
 
@@ -994,6 +997,136 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
                           &beta,
                           (void *)(uintptr_t)d_Y, CUDA_R_32F, n_out,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+int cublasew_gemm_f16_f16_f32_rowmajor_nn(cublasew_context *ctx,
+                                          CUdeviceptr d_Y,
+                                          int ld_y,
+                                          CUdeviceptr d_A_f16,
+                                          CUdeviceptr d_B_f16,
+                                          int n_tok,
+                                          int n_out,
+                                          int n_in) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    if (!ctx || !ctx->handle || ld_y < n_out) return -1;
+    /* Row-major Y[M,N] = A[M,K] * B[K,N] is column-major
+     * Y^T[N,M] = B^T[N,K] * A^T[K,M]; the row-major buffers already hold those
+     * transposed column-major layouts, so both cuBLAS operands are N. */
+    return p_cublasGemmEx(ctx->handle,
+                          CUBLAS_OP_N, CUBLAS_OP_N,
+                          n_out, n_tok, n_in,
+                          &alpha,
+                          (const void *)(uintptr_t)d_B_f16, CUDA_R_16F, n_out,
+                          (const void *)(uintptr_t)d_A_f16, CUDA_R_16F, n_in,
+                          &beta,
+                          (void *)(uintptr_t)d_Y, CUDA_R_32F, ld_y,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+/* Row-major Y[n_tok, n_out] = X[n_tok, n_in] * W[n_out, n_in]^T + bias, with an
+ * optional tanh-GELU applied to (Y + bias), fused into the cuBLAS-LT epilogue.
+ * W and X are FP16, Y and bias are FP32, compute FP32. Eliminates the separate
+ * add_bias / gelu kernels on the Blackwell F16xF16 path. Returns -1 (no side
+ * effects) if cuBLAS-LT is unavailable so the caller can fall back. */
+/* F16xF16->{F32|F16} GEMM with a fused bias (and optional tanh-GELU) epilogue.
+ * y_f16=0: D is FP32; y_f16=1: D is FP16 (d_Y must point at an FP16 buffer). The
+ * bias is always FP32 regardless of output type (BIAS_DATA_TYPE forced to F32). */
+int cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
+                                                  CUdeviceptr d_Y,
+                                                  CUdeviceptr d_W_f16,
+                                                  CUdeviceptr d_X_f16,
+                                                  CUdeviceptr d_bias_f32,
+                                                  int gelu,
+                                                  int y_f16,
+                                                  int n_tok,
+                                                  int n_out,
+                                                  int n_in) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasLtMatmulDesc_t desc = NULL;
+    cublasLtMatrixLayout_t a_layout = NULL, b_layout = NULL, d_layout = NULL;
+    cublasLtMatmulHeuristicResult_t heur;
+    cublasStatus_t st;
+    int op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
+    int epilogue = gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+    int bias_dt = CUDA_R_32F;
+    int y_dt = y_f16 ? CUDA_R_16F : CUDA_R_32F;
+    void *biasp = (void *)(uintptr_t)d_bias_f32;
+    void *Wp = (void *)(uintptr_t)d_W_f16;
+    void *Xp = (void *)(uintptr_t)d_X_f16;
+    void *Yp = (void *)(uintptr_t)d_Y;
+
+    if (!ctx || !ctx->lt_handle || !d_bias_f32) return -1;
+    if (!g_cublaslt_available) return -1;
+
+    st = p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                          &op_t, sizeof(op_t)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                          &op_n, sizeof(op_n)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                          &epilogue, sizeof(epilogue)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                          &biasp, sizeof(biasp)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    /* Bias stays FP32 even when D is FP16 (default would assume FP16 bias). */
+    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                          &bias_dt, sizeof(bias_dt)) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+
+    /* W is FP16 [n_out, n_in] row-major -> column-major [n_in, n_out], ld n_in. */
+    if (p_cublasLtMatrixLayoutCreate(&a_layout, CUDA_R_16F,
+                                     (uint64_t)n_in, (uint64_t)n_out,
+                                     (int64_t)n_in) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    /* X is FP16 [n_tok, n_in] row-major -> column-major [n_in, n_tok], ld n_in. */
+    if (p_cublasLtMatrixLayoutCreate(&b_layout, CUDA_R_16F,
+                                     (uint64_t)n_in, (uint64_t)n_tok,
+                                     (int64_t)n_in) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+    /* Y is [n_tok, n_out] row-major -> column-major [n_out, n_tok], ld n_out. */
+    if (p_cublasLtMatrixLayoutCreate(&d_layout, (cudaDataType_t)y_dt,
+                                     (uint64_t)n_out, (uint64_t)n_tok,
+                                     (int64_t)n_out) != CUBLAS_STATUS_SUCCESS)
+        goto fail;
+
+    memset(&heur, 0, sizeof(heur));
+    if (cublasewLtGetHeuristic(ctx->lt_handle, desc,
+                               a_layout, b_layout,
+                               d_layout, d_layout,
+                               ctx->pref, &heur,
+                               gelu ? "f16_gelubias_nt" : "f16_bias_nt",
+                               n_tok, n_out, n_in) != 0)
+        goto fail;
+
+    st = p_cublasLtMatmul(ctx->lt_handle, desc,
+                          &alpha,
+                          Wp, a_layout,
+                          Xp, b_layout,
+                          &beta,
+                          Yp, d_layout,
+                          Yp, d_layout,
+                          (const void *)&heur.algo,
+                          (void *)(uintptr_t)ctx->d_workspace,
+                          ctx->workspace_bytes,
+                          ctx->stream);
+    if (d_layout) p_cublasLtMatrixLayoutDestroy(d_layout);
+    if (b_layout) p_cublasLtMatrixLayoutDestroy(b_layout);
+    if (a_layout) p_cublasLtMatrixLayoutDestroy(a_layout);
+    if (desc) p_cublasLtMatmulDescDestroy(desc);
+    return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+
+fail:
+    if (d_layout) p_cublasLtMatrixLayoutDestroy(d_layout);
+    if (b_layout) p_cublasLtMatrixLayoutDestroy(b_layout);
+    if (a_layout) p_cublasLtMatrixLayoutDestroy(a_layout);
+    if (desc) p_cublasLtMatmulDescDestroy(desc);
+    return -1;
 }
 
 int cublasew_gemm_bf16_bf16_f32_rowmajor_nt(cublasew_context *ctx,

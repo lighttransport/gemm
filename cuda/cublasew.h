@@ -169,6 +169,37 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,
                                            int n_out,
                                            int n_in);
 
+/* Row-major Y[n_tok, n_out] = A[n_tok, n_in] * B[n_in, n_out].
+ * A and B are FP16, Y is FP32, compute is FP32. `ld_y` is Y's row stride in
+ * floats (allows writing into an interleaved parent matrix). Tensor-core path
+ * for the attention P*V product on Blackwell.
+ */
+int cublasew_gemm_f16_f16_f32_rowmajor_nn(cublasew_context *ctx,
+                                          CUdeviceptr d_Y,
+                                          int ld_y,
+                                          CUdeviceptr d_A_f16,
+                                          CUdeviceptr d_B_f16,
+                                          int n_tok,
+                                          int n_out,
+                                          int n_in);
+
+/* Row-major Y[n_tok, n_out] = X[n_tok, n_in] * W[n_out, n_in]^T + bias, with an
+ * optional tanh-GELU on (Y + bias), fused into the cuBLAS-LT epilogue. W and X
+ * are FP16, bias FP32, compute FP32. `gelu` != 0 selects GELU_BIAS. `y_f16` != 0
+ * makes the output D FP16 (d_Y points at an FP16 buffer); 0 keeps it FP32. The
+ * bias stays FP32 in both cases. Returns -1 (no side effects) if cuBLAS-LT is
+ * unavailable so callers can fall back. */
+int cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
+                                                  CUdeviceptr d_Y,
+                                                  CUdeviceptr d_W_f16,
+                                                  CUdeviceptr d_X_f16,
+                                                  CUdeviceptr d_bias_f32,
+                                                  int gelu,
+                                                  int y_f16,
+                                                  int n_tok,
+                                                  int n_out,
+                                                  int n_in);
+
 /* Row-major Y[m, n_out] = X[m, n_in] * W[n_out, n_in]^T
  * W and X are BF16, Y is FP32, compute is FP32.
  */
