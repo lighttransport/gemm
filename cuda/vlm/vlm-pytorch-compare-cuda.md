@@ -40,10 +40,11 @@ attn & window rewrite **43.9 / 116.8** → +cuBLASLt fused bias/GELU epilogue & 
 |-------:|-------:|-------------:|------------:|-----------:|----------------:|---------------:|--------------:|----------------:|
 | 512²   |   256  |         32.4 |        32.2 |       7892 |            96.0 |           69.6 |          2606 | **2.96× faster** |
 | 768²   |   576  |         81.4 |        80.3 |       7078 |           212.7 |          184.5 |          2712 | **2.61× faster** |
-| 1024²  |  1024  | — (unsupported) |          |            |           438.1 |          401.2 |          4354 |        —        |
-| 2048²  |  4096  | — (unsupported) |          |            |          1518.7 |         1515.3 |          2701 |        —        |
+| 1024²  |  1024  |        172.1 |       171.3 |       5949 |           438.1 |          401.2 |          4354 | **2.55× faster** |
+| 2048²  |  4096  |       1506.3 |      1499.5 |       2719 |          1518.7 |         1515.3 |          2701 | **1.01× (parity)** |
 
-CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
+CUDA: `--warmup 5 --iters 20` (1024²/2048² via `cuda_vision_set_max_pixels`, see Fix #11).
+PyTorch: `--warmup 5 --iters 20`.
 
 > The CUDA encoder is now **>2.6× faster than PyTorch SDPA on the same GPU** at both 512²
 > (2.96×, nearly 3×) and 768² (2.61×) — a full reversal of the original 4.9× / 10.4×
@@ -55,6 +56,30 @@ CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
 > is ≈17%. `add_bias`, the standalone `gelu`, the cuBLASLt GELU side kernel, and the large
 > FFN-down input cast are all gone (fused / written F16 in-pass); what remains is
 > `gelu_f32_to_f16` (≈5.2%) + the smaller residual `cast_f32_f16` (≈2.4%).
+
+> **The CUDA lead shrinks as the image grows** (2.96× → 2.61× → 2.55× → 1.01×). The 6
+> full-attention layers are O(N²) and process **one head at a time** reusing a single
+> `[N,N]` score buffer — fast while that buffer stays L2-resident (the documented reason
+> the per-head loop beats `StridedBatched`), but at 2048² it is ≈1 GB, far past this card's
+> ~32 MB L2, so the full-attn layers go DRAM-bound (`vit` ≈ 1.40 s of the 1.51 s wall) while
+> PyTorch's FlashAttention (O(N) memory) scales better — the two converge to parity. So the
+> CUDA advantage is largest at the resolutions Qwen3-VL actually tiles to (≤768² per tile);
+> at very large single images a flash-style O(N)-memory full-attention kernel would be the
+> lever (the windowed layers already are).
+
+## Fix applied #11: lift the 768² image-size cap (run 1024² / 2048²)
+
+The encoder was capped at 768² (`too many patches 4096 (max 2304)`) — but the runner
+already supported larger images: `cuda_vision_load_weights` derives `max_patches` from
+`max_pixels` and sizes all device scratch from it, and `cuda_vision_set_max_pixels()`
+exists to raise it. The harness simply never called the setter, so `max_patches` stayed at
+the model-config default (768²/2304). One-line fix in `test_cuda_vision.c`:
+`cuda_vision_set_max_pixels(cuda_r, image_size*image_size)` **before** `load_weights`. No
+encoder change — the kernels are size-agnostic (the only per-size host work, the pos-embed
+interpolation, is already cached by Fix #10; verbose hidden-state dumps at 1024² are finite
+and healthy). Now 1024² (4096 patches → 1024 tokens) and 2048² (16384 → 4096) both run; see
+the table. (The CPU reference `vision_encode` keeps its own 2304 cap, so a direct CPU rel_L2
+at >768² isn't available — the canonical check is `compare_vs_llamacpp`.)
 
 ## Fix applied #10: cache the interpolated position embedding per size
 
@@ -349,11 +374,11 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
 
 1. ~~cuBLAS GEMM fails / falls back~~ **FIXED** — see "Fix applied" above. cuBLAS now
    engages at every size via the F16×F16→F32 path.
-2. **Image size capped at 768².** `cuda_vision_init()` takes no max-size argument; the
-   runner sizes its device scratch from the model's config (`image=768`,
-   `max_patches=2304`). 1024² (4096 patches) and 2048² (16384) error with
-   `too many patches N (max 2304)`. Reaching them needs a runner change to allocate
-   for a larger max image.
+2. ~~Image size capped at 768².~~ **FIXED (Fix #11).** The runner already sized scratch
+   from `max_pixels`; the harness now calls `cuda_vision_set_max_pixels()` before
+   `load_weights`. 1024² and 2048² run (table above). The remaining limit is GPU VRAM (the
+   single `[N,N]` full-attn score buffer is ≈1 GB at 2048²) and, at very large N, the
+   O(N²) full-attention going DRAM-bound — see the size-scaling note above.
 3. ~~CUDA ~5–10× slower; unfused attention dominates~~ **FIXED + REVERSED** by flash
    attention (Fix #2), then patch im2col+GEMM (Fix #3), tensor-core attention + the
    windowed-attention rewrite (Fix #4), the cuBLASLt fused bias/GELU epilogue +
