@@ -438,9 +438,8 @@ int main(int argc, char **argv) {
             hip_qimg_free(r); return 1;
         }
         t0 = clock();
-        if (hip_qimg_load_dit(r, dit_path) != 0) {
-            hip_qimg_free(r); return 1;
-        }
+        int lrc = use_int4 ? hip_qimg_load_dit_int4(r, dit_path) : hip_qimg_load_dit(r, dit_path);
+        if (lrc != 0) { hip_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     }
 

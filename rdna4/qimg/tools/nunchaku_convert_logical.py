@@ -37,10 +37,10 @@ def _pack_logical_nibbles(nib_int):                      # [out,K] signed int4 -
 def _bundle_from_decoded(dec, o0, o1):                   # extract the logical bundle for output-channel slice [o0:o1]
     nd = dec
     qint4 = _pack_logical_nibbles(nd["nibbles"][o0:o1])               # [slice, K/2]
-    wscale = nd["wscales_logical"].T[o0:o1].astype(np.float32)        # [slice, K/64]
+    wscale = torch.from_numpy(nd["wscales_logical"].T[o0:o1].astype(np.float32)).to(torch.bfloat16)  # [slice,K/64] bf16
     return {
         "qint4":     torch.from_numpy(qint4),
-        "wscale":    torch.from_numpy(wscale),
+        "wscale":    wscale,
         "smooth":    torch.from_numpy(nd["smooth_factor"].astype(np.float32)),          # shared (input-side)
         "lora_down": torch.from_numpy(nd["proj_down"].astype(np.float32)).to(torch.bfloat16),  # [rank, in] shared
         "lora_up":   torch.from_numpy(nd["proj_up"][o0:o1].astype(np.float32)).to(torch.bfloat16),  # [slice, rank]
@@ -93,8 +93,21 @@ def convert(int4_path, out_path, blocks, passthrough=True):
                     if blk not in keep_blocks:                 # other blocks (not in this fixture range) — skip
                         continue
                 tensors[nm] = h.get_tensor(nm).contiguous()    # global, or this-block non-main (norms/biases/modulation int4)
-    # modulation stays AWQ-int4 (passthrough above) — out=18432=6*hidden, so dense would not fit; the loader
-    # dequants it on the fly (M=1, perf-irrelevant). Decoded by a small AWQ unpack kernel, not here.
+    # modulation: re-quantize to OUR logical int4 (RTN g64, no lora/smooth) from the FP8-base dense weight.
+    # out=18432=6*hidden, so AWQ stays 4-bit (~3.4 GB, fits); reuses the proven op_int4_linear. M=1 -> RTN fine.
+    fp8 = "/mnt/disk1/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors"
+    for nm in list(tensors):
+        if ".img_mod.1." in nm or ".txt_mod.1." in nm: del tensors[nm]
+    with safe_open(fp8, "pt", "cpu") as h:
+        for b in blocks:
+            for which in ("img_mod.1", "txt_mod.1"):
+                W = h.get_tensor(f"transformer_blocks.{b}.{which}.weight").float().numpy()  # [out,in]
+                out, K = W.shape; ng = K // 64; mx = np.abs(W).reshape(out, ng, 64).max(2)
+                sc = (mx / 7.0 + 1e-12).astype(np.float32)                                  # [out,ng] symmetric
+                qi = np.clip(np.round(W / np.repeat(sc, 64, 1)), -8, 7).astype(np.int16)
+                tensors[f"transformer_blocks.{b}.{which}.qint4"]  = torch.from_numpy(_pack_logical_nibbles(qi))
+                tensors[f"transformer_blocks.{b}.{which}.wscale"] = torch.from_numpy(sc).to(torch.bfloat16)
+                tensors[f"transformer_blocks.{b}.{which}.bias"]   = h.get_tensor(f"transformer_blocks.{b}.{which}.bias").to(torch.bfloat16).contiguous()
     save_file(tensors, out_path, metadata={"format": "rdna4-logical-int4-w4a16", "group_size": "64", "rank": "128"})
     return tensors
 
