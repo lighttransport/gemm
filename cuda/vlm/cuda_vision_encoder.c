@@ -627,6 +627,35 @@ static const char *cuda_vlm_specific_kernels =
 "    dst[i] = h;\n"
 "}\n"
 "\n"
+"/* ---- layernorm_f32_f16: layernorm that emits F16 directly (folds the F32->F16 ---- */\n"
+"/* cast that the qkv / ffn-up GEMM would otherwise do on the Blackwell F16xF16 path). */\n"
+"__global__ void layernorm_f32_f16(half_raw *dst, const float *src, const float *w,\n"
+"                                   const float *b, int dim, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int tok = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    int nt = blockDim.x;\n"
+"    const float *x = src + (size_t)tok * dim;\n"
+"    half_raw *y = dst + (size_t)tok * dim;\n"
+"    float s = 0.0f;\n"
+"    for (int i = tid; i < dim; i += nt) s += x[i];\n"
+"    sdata[tid] = s;\n"
+"    __syncthreads();\n"
+"    for (int r = nt/2; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid+r]; __syncthreads(); }\n"
+"    float mean = sdata[0] / (float)dim;\n"
+"    __syncthreads();\n"
+"    s = 0.0f;\n"
+"    for (int i = tid; i < dim; i += nt) { float d = x[i] - mean; s += d*d; }\n"
+"    sdata[tid] = s;\n"
+"    __syncthreads();\n"
+"    for (int r = nt/2; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid+r]; __syncthreads(); }\n"
+"    float inv = rsqrtf(sdata[0] / (float)dim + eps);\n"
+"    for (int i = tid; i < dim; i += nt) {\n"
+"        float v = (x[i] - mean) * inv * w[i] + b[i];\n"
+"        half_raw h; asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(v)); y[i] = h;\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern C */\n"
 ;
 
@@ -668,6 +697,7 @@ struct cuda_vision_runner {
     CUmodule module;
     /* Shared kernels */
     CUfunction fn_layernorm_f32;
+    CUfunction fn_layernorm_f32_f16; /* layernorm with F16 output (folds qkv/ffn-up cast) */
     CUfunction fn_gemm_f16_f32;
     CUfunction fn_gelu_f32;
     CUfunction fn_add_f32;
@@ -748,6 +778,7 @@ struct cuda_vision_runner {
     CUdeviceptr d_attn_out;   /* [max_patches * dim] */
     CUdeviceptr d_ffn_buf;    /* [max_patches * ffn_dim] */
     CUdeviceptr d_ln_buf;     /* [max_patches * dim] */
+    CUdeviceptr d_ln_buf_f16; /* [max_patches * dim] F16 layernorm out (Blackwell path) */
     CUdeviceptr d_merge_buf;  /* [n_merged * merged_dim] */
     CUdeviceptr d_mm_buf;     /* [n_merged * merged_dim] */
     CUdeviceptr d_mm_out;     /* [n_merged * proj_dim] */
@@ -852,6 +883,7 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
 
     /* Shared kernels */
     GET_FN(layernorm_f32);
+    GET_FN(layernorm_f32_f16);
     GET_FN(gemm_f16_f32);
     GET_FN(gelu_f32);
     GET_FN(add_f32);
@@ -880,7 +912,7 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 23, sm);
+        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 24, sm);
     return 0;
 }
 
@@ -1379,6 +1411,8 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
             CHECK_CU(cuMemAlloc(&r->d_x_f16, n_xf16 * sizeof(unsigned short)));
             /* F16 GELU(ffn_up) output, consumed directly by ffn_down (no recast). */
             CHECK_CU(cuMemAlloc(&r->d_ffn_buf_f16, (size_t)mp * r->ffn_dim * sizeof(unsigned short)));
+            /* F16 layernorm output, consumed directly by qkv/ffn-up GEMM (no recast). */
+            CHECK_CU(cuMemAlloc(&r->d_ln_buf_f16, (size_t)mp * dim * sizeof(unsigned short)));
         }
         /* Tensor-core full-attention scratch (F16). Per-head Q/K/V + a single
          * head's [N,N] scores (F32) and probs (F16), reused across heads. */
@@ -1797,12 +1831,21 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
 
         gpu_vit_block *blk = &r->blocks[l];
 
-        /* LayerNorm1 */
+        /* On the Blackwell F16xF16 cuBLAS path the qkv/ffn-up GEMMs cast their F32
+         * activation input to F16 anyway, so have LayerNorm emit F16 directly and
+         * feed it via the x-F16 GEMM, folding away the separate cast. The predicate
+         * mirrors exactly when vlm_gemm_ex would cast (mixed GemmEx already proven
+         * unsupported). Latched once per layer for producer/consumer consistency. */
+        int use_f16_ln = (r->use_f16 && r->use_cublas && r->cublas &&
+                          r->d_ln_buf_f16 && !r->cublas_mixed_ok);
+
+        /* LayerNorm1 (emits F16 on the Blackwell path to fold the qkv-input cast). */
         {
             float eps = r->ln_eps;
             size_t smem = 256 * sizeof(float);
-            void *args[] = { &r->d_ln_buf, &r->d_hidden, &blk->ln1_w, &blk->ln1_b, &dim, &eps };
-            cuLaunchKernel(r->fn_layernorm_f32,
+            CUdeviceptr ln_dst = use_f16_ln ? r->d_ln_buf_f16 : r->d_ln_buf;
+            void *args[] = { &ln_dst, &r->d_hidden, &blk->ln1_w, &blk->ln1_b, &dim, &eps };
+            cuLaunchKernel(use_f16_ln ? r->fn_layernorm_f32_f16 : r->fn_layernorm_f32,
                            n_patches, 1, 1,
                            256, 1, 1,
                            smem, r->stream,
@@ -1812,7 +1855,10 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
         /* QKV projection */
         {
             int n_out = 3 * dim;
-            vlm_gemm(r, r->d_qkv, &blk->attn_qkv, r->d_ln_buf, n_patches, n_out, dim);
+            if (use_f16_ln)
+                vlm_gemm_x_f16(r, r->d_qkv, &blk->attn_qkv, r->d_ln_buf_f16, n_patches, n_out, dim);
+            else
+                vlm_gemm(r, r->d_qkv, &blk->attn_qkv, r->d_ln_buf, n_patches, n_out, dim);
         }
 
         /* Debug: check QKV right after GEMM (before RoPE) */
@@ -1950,12 +1996,13 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                            args, NULL);
         }
 
-        /* LayerNorm2 */
+        /* LayerNorm2 (emits F16 on the Blackwell path to fold the ffn-up-input cast). */
         {
             float eps = r->ln_eps;
             size_t smem = 256 * sizeof(float);
-            void *args[] = { &r->d_ln_buf, &r->d_hidden, &blk->ln2_w, &blk->ln2_b, &dim, &eps };
-            cuLaunchKernel(r->fn_layernorm_f32,
+            CUdeviceptr ln_dst = use_f16_ln ? r->d_ln_buf_f16 : r->d_ln_buf;
+            void *args[] = { &ln_dst, &r->d_hidden, &blk->ln2_w, &blk->ln2_b, &dim, &eps };
+            cuLaunchKernel(use_f16_ln ? r->fn_layernorm_f32_f16 : r->fn_layernorm_f32,
                            n_patches, 1, 1,
                            256, 1, 1,
                            smem, r->stream,
@@ -1967,17 +2014,32 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
          * single gelu+cast kernel writes F16 straight into d_ffn_buf_f16 so the
          * down-proj reads it with no separate F32->F16 recast (the largest cast).
          * GELU_BIAS-with-F16-output is unsupported by cuBLASLt here, hence this
-         * split. Otherwise (no cuBLAS / F32): fused-or-separate gelu in F32. */
+         * split. The up-proj reads the F16 LayerNorm output directly when present
+         * (use_f16_ln), folding its input cast too. Otherwise: fused/separate F32. */
         int ffn_f16_path = (r->use_f16 && r->use_cublas && r->cublas &&
                             blk->ffn_down.w_f16 && r->d_ffn_buf_f16 &&
                             !r->cublas_mixed_ok && cublasew_lt_available(r->cublas) == 0);
         if (ffn_f16_path) {
-            vlm_gemm_ex(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim, 0);
+            /* up-proj (bias fused inline, no gelu) reads the F16 LayerNorm output
+             * directly when present (folds its input cast); then a single gelu+cast
+             * kernel writes F16 into d_ffn_buf_f16 for the down-proj. (We cannot emit
+             * F16 from the GEMM epilogue here: cuBLASLt has no F16-output BIAS/GELU
+             * epilogue on sm_120, so this fused gelu+cast pass stays.) */
+            if (use_f16_ln)
+                vlm_gemm_x_f16(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf_f16, n_patches, ffn_dim, dim);
+            else
+                vlm_gemm_ex(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim, 0);
             vlm_launch_gelu_f16(r, r->d_ffn_buf_f16, r->d_ffn_buf, n_patches * ffn_dim);
             vlm_gemm_x_f16(r, r->d_hidden2, &blk->ffn_down, r->d_ffn_buf_f16,
                            n_patches, dim, ffn_dim);
         } else {
-            vlm_gemm_ex(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim, 1);
+            if (use_f16_ln) {
+                /* F16 ln output, but no fused-gelu F16 down path: gelu separately. */
+                vlm_gemm_x_f16(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf_f16, n_patches, ffn_dim, dim);
+                vlm_launch_gelu(r, r->d_ffn_buf, n_patches * ffn_dim);
+            } else {
+                vlm_gemm_ex(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim, 1);
+            }
             vlm_gemm(r, r->d_hidden2, &blk->ffn_down, r->d_ffn_buf, n_patches, dim, ffn_dim);
         }
 
@@ -2238,6 +2300,7 @@ void cuda_vision_free(cuda_vision_runner *r) {
     if (r->d_ffn_buf) cuMemFree(r->d_ffn_buf);
     if (r->d_ffn_buf_f16) cuMemFree(r->d_ffn_buf_f16);
     if (r->d_ln_buf) cuMemFree(r->d_ln_buf);
+    if (r->d_ln_buf_f16) cuMemFree(r->d_ln_buf_f16);
     if (r->d_merge_buf) cuMemFree(r->d_merge_buf);
     if (r->d_mm_buf) cuMemFree(r->d_mm_buf);
     if (r->d_mm_out) cuMemFree(r->d_mm_out);
