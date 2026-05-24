@@ -146,7 +146,7 @@ struct hip_qimg_runner {
     hipFunction_t fn_q_quant_perrow, fn_k_quant_repack_perrow, fn_flash_attn_fp8_perrow;
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
-    hipFunction_t fn_dequant_int4_main, fn_expand_bf16;  /* int4 W4A16 dequant + bf16->f32 lora expand (unfused path) */
+    hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
     hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip;
     /* VAE kernels */
@@ -194,6 +194,8 @@ struct hip_qimg_runner {
     int stream_blk_alloc;       /* 1 once both buffers' fields are allocated */
     /* INT4 (Nunchaku/SVDQuant, W4A16 logical layout) path — all blocks resident (no streaming). */
     qimg_int4_linear *int4_linears;  /* [n_blocks * QIMG_INT4_PER_BLOCK] per-block logical-linear descriptors */
+    qimg_int4_linear *int4_mod;      /* [n_blocks * 2] img_mod/txt_mod RTN-int4 (rank0, no smooth) */
+    float *i4_ldf, *i4_luf, *i4_dt, *i4_dly; size_t i4_dt_cap, i4_dly_cap;  /* persistent lora scratch */
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
     hipStream_t copy_stream;
     hipEvent_t stream_copy_done[2];
@@ -628,12 +630,12 @@ static int qimg_upload_int4_linear(st_context *st, const char *key, qimg_int4_li
     snprintf(nm, sizeof(nm), "%s.lora_up", key);
     idx = safetensors_find(st, nm); if (idx >= 0) L->rank = (int)safetensors_shape(st, idx)[1];
     snprintf(nm, sizeof(nm), "%s.qint4", key);     L->qint4     = qimg_st_upload_raw(st, nm);
-    snprintf(nm, sizeof(nm), "%s.wscale", key);    L->wscale    = (float *)qimg_st_upload_f32(st, nm);  /* stored f32 — identity load */
+    snprintf(nm, sizeof(nm), "%s.wscale", key);    L->wscale    = (float *)qimg_st_upload_raw(st, nm);   /* bf16, kernel expands */
     snprintf(nm, sizeof(nm), "%s.smooth", key);    L->smooth    = (float *)qimg_st_upload_f32(st, nm);
     snprintf(nm, sizeof(nm), "%s.lora_down", key); L->lora_down = qimg_st_upload_raw(st, nm);
     snprintf(nm, sizeof(nm), "%s.lora_up", key);   L->lora_up   = qimg_st_upload_raw(st, nm);
     snprintf(nm, sizeof(nm), "%s.bias", key);      L->bias      = (float *)qimg_st_upload_f32(st, nm);
-    if (!L->qint4 || !L->wscale || !L->smooth || !L->lora_down || !L->lora_up || !L->bias) return -1;
+    if (!L->qint4 || !L->wscale || !L->bias) return -1;        /* mod: no smooth/lora (rank stays 0) */
     return 0;
 }
 
@@ -1050,19 +1052,21 @@ static void op_gemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bi
  * Verified-correct, perf-naive (per-call dense materialize + f32 GEMMs); the fused dequant-LDS WMMA kernel
  * replaces the W-materialize later. L = &int4_linears[block*PER_BLOCK + slot]. X is F32 [n_tok,n_in]. */
 static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
-    int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank; long wn = (long)n_out*n_in;
-    float *dW=0,*ldf=0,*luf=0,*dt=0,*dly=0;
-    hipMalloc(&dW,(size_t)wn*4); hipMalloc(&ldf,(size_t)rk*n_in*4); hipMalloc(&luf,(size_t)n_out*rk*4);
-    hipMalloc(&dt,(size_t)rk*n_tok*4); hipMalloc(&dly,(size_t)n_out*n_tok*4);
-    void *da[]={(void*)&L->qint4,(void*)&L->wscale,(void*)&L->smooth,&dW,&n_out,&n_in,&gs};
-    hipModuleLaunchKernel(r->fn_dequant_int4_main,(unsigned)((wn+255)/256),1,1,256,1,1,0,NULL,da,NULL);
-    op_gemm(r, Y, dW, X, L->bias, n_out, n_in, n_tok);                /* main+smooth+bias */
-    int ldn=rk*n_in, lun=n_out*rk; void *e1[]={(void*)&L->lora_down,&ldf,&ldn}, *e2[]={(void*)&L->lora_up,&luf,&lun};
-    hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((ldn+255)/256),1,1,256,1,1,0,NULL,e1,NULL);
-    hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((lun+255)/256),1,1,256,1,1,0,NULL,e2,NULL);
-    op_gemm(r, dt, ldf, X, NULL, rk, n_in, n_tok); op_gemm(r, dly, luf, dt, NULL, n_out, rk, n_tok);
-    int ny=n_out*n_tok; void *aa[]={&Y,&dly,&ny}; hipModuleLaunchKernel(r->fn_add,(unsigned)((ny+255)/256),1,1,256,1,1,0,NULL,aa,NULL);
-    hipFree(dW);hipFree(ldf);hipFree(luf);hipFree(dt);hipFree(dly);
+    int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank;
+    /* fused W4A16: dequant-in-LDS bf16 WMMA (main+smooth+bias) — replaces dense materialize */
+    void *ga[]={&Y,(void*)&L->qint4,&X,(void*)&L->bias,(void*)&L->wscale,(void*)&L->smooth,&n_out,&n_in,&n_tok};
+    hipModuleLaunchKernel(r->fn_gemm_int4w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,ga,NULL);
+    if (rk > 0 && L->lora_down) {                                     /* rank-128 residual (skip for mod: rank 0) */
+        if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
+        if ((size_t)rk*n_tok > r->i4_dt_cap) { hipFree(r->i4_dt); hipMalloc(&r->i4_dt,(size_t)rk*n_tok*4); r->i4_dt_cap=(size_t)rk*n_tok; }
+        if ((size_t)n_out*n_tok > r->i4_dly_cap) { hipFree(r->i4_dly); hipMalloc(&r->i4_dly,(size_t)n_out*n_tok*4); r->i4_dly_cap=(size_t)n_out*n_tok; }
+        float *ldf=r->i4_ldf,*luf=r->i4_luf,*dt=r->i4_dt,*dly=r->i4_dly;
+        int ldn=rk*n_in, lun=n_out*rk; void *e1[]={(void*)&L->lora_down,&ldf,&ldn}, *e2[]={(void*)&L->lora_up,&luf,&lun};
+        hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((ldn+255)/256),1,1,256,1,1,0,NULL,e1,NULL);
+        hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((lun+255)/256),1,1,256,1,1,0,NULL,e2,NULL);
+        op_gemm(r, dt, ldf, X, NULL, rk, n_in, n_tok); op_gemm(r, dly, luf, dt, NULL, n_out, rk, n_tok);
+        int ny=n_out*n_tok; void *aa[]={&Y,&dly,&ny}; hipModuleLaunchKernel(r->fn_add,(unsigned)((ny+255)/256),1,1,256,1,1,0,NULL,aa,NULL);
+    }
 }
 
 /* Route a block projection: int4 descriptor[blk*12+slot] when a logical-INT4 DiT is loaded, else BF16 weight. */
@@ -1467,6 +1471,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_dequant_int4_main, "dequant_int4_logical_main_f32");
     GET(fn_add, "add_inplace_f32");
     GET(fn_expand_bf16, "expand_bf16_f32");
+    GET(fn_gemm_int4w, "gemm_int4w_bf16a_wmma_t");
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
     GET(fn_adaln, "adaln_modulate_f32");
@@ -1817,14 +1822,15 @@ int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
         fprintf(stderr, "hip_qimg: int4 globals incomplete (some NULL); render needs all BF16 globals\n");
     /* Per-block BF16 passthrough (norms + modulation): qkv/mlp come from int4 descriptors, so blocks fully resident. */
     r->gpu_blocks = (qimg_block_gpu *)calloc((size_t)r->n_blocks, sizeof(qimg_block_gpu)); r->n_preloaded = r->n_blocks;
+    r->int4_mod = (qimg_int4_linear *)calloc((size_t)r->n_blocks * 2, sizeof(qimg_int4_linear));
     for (int b = 0; b < r->n_blocks; b++) { qimg_block_gpu *g = &r->gpu_blocks[b]; char nm[160];
         #define MW(f,suf) do{snprintf(nm,sizeof nm,"transformer_blocks.%d." suf,b); g->f=qimg_st_upload_f32(st,nm);}while(0)
         MW(norm_q_w,"attn.norm_q.weight"); MW(norm_k_w,"attn.norm_k.weight");
         MW(norm_added_q_w,"attn.norm_added_q.weight"); MW(norm_added_k_w,"attn.norm_added_k.weight");
-        MW(img_mod_w,"img_mod.1.weight"); MW(img_mod_b,"img_mod.1.bias");
-        MW(txt_mod_w,"txt_mod.1.weight"); MW(txt_mod_b,"txt_mod.1.bias");
         #undef MW
-        if (!g->img_mod_w || !g->txt_mod_w) { fprintf(stderr, "hip_qimg: int4 block %d mod/norm incomplete\n", b); }
+        snprintf(nm,sizeof nm,"transformer_blocks.%d.img_mod.1",b); int e1=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b]);
+        snprintf(nm,sizeof nm,"transformer_blocks.%d.txt_mod.1",b); int e2=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b+1]);
+        if (e1||e2) fprintf(stderr, "hip_qimg: int4 block %d mod/norm incomplete\n", b);
     }
     if (r->verbose) {
         const qimg_int4_linear *s = &r->int4_linears[0];  /* sample: block 0, attn.to_q */
@@ -1860,7 +1866,8 @@ int hip_qimg_test_int4_dequant(hip_qimg_runner *r) {
     snprintf(nm, sizeof(nm), "%s.wscale", key); int iw = safetensors_find(st, nm);
     if (iq < 0 || iw < 0) { fprintf(stderr, "hip_qimg: int4-dequant test — host tensors for %s absent\n", key); return -1; }
     const unsigned char *qb = (const unsigned char *)safetensors_data(st, iq);
-    const float *ws = (const float *)safetensors_data(st, iw);
+    const unsigned short *wsb = (const unsigned short *)safetensors_data(st, iw);  /* bf16 scales */
+    #define WS(idx) ({unsigned _u=(unsigned)wsb[idx]<<16; float _f; memcpy(&_f,&_u,4); _f;})
 
     /* GPU dense weight */
     float *d_W = NULL;
@@ -1879,7 +1886,7 @@ int hip_qimg_test_int4_dequant(hip_qimg_runner *r) {
             unsigned char byte = qb[(long)o * (n_in / 2) + (i >> 1)];
             int nib = (i & 1) ? (byte >> 4) : (byte & 0xF);
             if (nib >= 8) nib -= 16;
-            float ref = (float)nib * ws[(long)o * ng + (i / gs)];
+            float ref = (float)nib * WS((long)o * ng + (i / gs));
             float got = h_W[(long)o * n_in + i];
             double d = fabs((double)got - (double)ref);
             if (d > max_abs_diff) max_abs_diff = d;
@@ -1922,6 +1929,12 @@ int hip_qimg_test_int4_dequant(hip_qimg_runner *r) {
     }
     fprintf(stderr, "hip_qimg: int4 full linear — y[%d,%d] cos(gpu,host)=%.6f (main+smooth+bias+lora%d)\n",
             n_tok, n_out, dot / (sqrt(rg2)*sqrt(ng2) + 1e-30), rk);
+    /* fused kernel main+smooth+bias (no lora) vs host main+bias */
+    hipModuleLaunchKernel(r->fn_gemm_int4w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,
+        (void*[]){&dy,(void*)&L->qint4,&dx,(void*)&L->bias,(void*)&L->wscale,(void*)&L->smooth,&n_out,&n_in,&n_tok},NULL);
+    hipDeviceSynchronize(); float *fy=(float*)malloc((size_t)n_tok*n_out*4); hipMemcpy(fy,dy,(size_t)n_tok*n_out*4,hipMemcpyDeviceToHost);
+    double fd=0,fg=0,fr=0; for(int t=0;t<n_tok;t++)for(int o=0;o<n_out;o++){double a=bh[o];for(int i=0;i<n_in;i++)a+=(double)(h_W[(long)o*n_in+i]/smh[i])*xh[(long)t*n_in+i];double g=fy[(long)t*n_out+o];fd+=a*g;fr+=a*a;fg+=g*g;}
+    fprintf(stderr,"hip_qimg: fused int4 GEMM cos(fused,host main+smooth+bias)=%.6f\n",fd/(sqrt(fr)*sqrt(fg)+1e-30)); free(fy);
     free(bh); free(ldf); free(luf); hipFree(dld); hipFree(dlu); hipFree(dt); hipFree(dly);
     free(xh); free(yh); hipFree(dx); hipFree(dy);
     free(h_W); hipFree(d_W);
@@ -2280,9 +2293,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         op_silu(r, d_t_silu, dim);
 
         qimg_set_gemm_context(r, L, "img_mod");
-        op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
+        if (r->use_int4) op_int4_linear(r, d_img_mod, d_t_silu, &r->int4_mod[2*L], 1);
+        else op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         qimg_set_gemm_context(r, L, "txt_mod");
-        op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        if (r->use_int4) op_int4_linear(r, d_txt_mod, d_t_silu, &r->int4_mod[2*L+1], 1);
+        else op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
 
         /* Modulation offsets */
         #define MOD_OFF(base, idx) ((void *)((char *)(base) + (size_t)(idx) * dim * sizeof(float)))
