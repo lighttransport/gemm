@@ -63,9 +63,197 @@ PyTorch: `--warmup 5 --iters 20`.
 > the per-head loop beats `StridedBatched`), but at 2048² it is ≈1 GB, far past this card's
 > ~32 MB L2, so the full-attn layers go DRAM-bound (`vit` ≈ 1.40 s of the 1.51 s wall) while
 > PyTorch's FlashAttention (O(N) memory) scales better — the two converge to parity. So the
-> CUDA advantage is largest at the resolutions Qwen3-VL actually tiles to (≤768² per tile);
-> at very large single images a flash-style O(N)-memory full-attention kernel would be the
-> lever (the windowed layers already are).
+> CUDA advantage is largest at the resolutions Qwen3-VL actually tiles to (≤768² per tile).
+
+> **Neither a CUDA-core NOR a tensor-core flash kernel beats cuBLAS here (both measured —
+> Fix #12 and #13).** The obvious large-N move was a fused O(N)-memory flash full-attention
+> kernel. Two were built and verified numerically identical to the materialized path: a
+> CUDA-core version (**3.6–5.5× slower**, Fix #12) and then a real `mma.sync` **tensor-core**
+> version with online softmax + shared K/V staging (**4–14% slower**, Fix #13). The
+> materialized path runs QK^T and P·V on tensor cores via **cuBLAS**, whose tiling /
+> cp.async pipelining / K-reuse a hand-rolled flash can't match — and head_dim=72 wastes
+> ~half the 5th `k16` fragment. So the tensor-core flash ships only as the **O(N)-memory
+> fallback** above ~2900² (where the `[N,N]` F32 scratch >4 GB would OOM the 16 GB card),
+> replacing the much slower CUDA-core one; every standard size keeps the materialized path.
+> Beating cuBLAS would require a full FA2 rewrite (larger query tiles, cp.async double-buffer,
+> `ldmatrix`, swizzled shared, head_dim padding) — uncertain payoff against a heavily-tuned
+> library, so it is parked.
+
+## Fix applied #14: profile the steady-state ViT loop → windowed-attn occupancy + rope launch config
+
+**Motivation.** With the flash line closed (Fix #12/#13: cuBLAS materialized wins attention),
+the next question was *where the time actually goes*. `nsys --cuda-graph-trace=node` on the
+steady-state loop (`--warmup 3 --iters 5`, f16) gave the real per-kernel GPU breakdown — the
+coarse host-side `t_*` phase timers are misleading because the ViT loop is CUDA-graph captured
+(Fix #8), so they measure graph *replay launch*, not GPU execution.
+
+**Per-kernel GPU breakdown (per encode, before this fix):**
+
+| kernel | 512² | 768² | what |
+|---|---:|---:|---|
+| `cutlass_*_s16816gemm_f16_64x64` (cuBLAS) | 60.2% | 53.0% | FFN up/down + QKV/out projections |
+| **`attn_window_tile_f32`** | **13.2%** | **12.2%** | our windowed attention (21 layers) — **#1 non-cuBLAS** |
+| full-attn QK+PV (cuBLAS wmma 32×32) | 6.4% | ~10% | materialized full attn (6 layers), O(N²) |
+| `attn_softmax_rows` | 4.2% | 6.1% | full-attn softmax, O(N²) |
+| `add_f32` / `gelu` / `layernorm` | ~11% | ~11% | residual / activation / norm (memory-bound) |
+| **`rope_vision_f32`** | 2.0% | **3.9%** | M-RoPE — **scaled 5× for 2.25× tokens** |
+
+So **~53–60% is cuBLAS F16 GEMM** (can't beat by hand — see Fix #12/#13; only **FP8** would
+move it) and the rest is our custom kernels. Two of those were demonstrably suboptimal:
+
+**(a) `rope_vision_f32` launch config.** It launched `n_patches·n_heads` blocks of
+`head_dim/2 = 36` threads — barely one warp, wasting the second, and pinned to the per-SM
+*block* limit. It ran ~3× slower than an equal-data-volume layernorm and scaled ~5× for 2.25×
+tokens. Rewrote it as a **grid-stride loop over (p,h,i) rotation pairs, 256 threads/block**
+(exact same math: pair `i,i+half`, cos/sin index `p·head_dim+2i`). Result: 108 → 82 µs at
+768² (**−23%**), now **bandwidth-bound** (≈390 GB/s of the card's ~448 GB/s peak — the residual
+is the in-place RMW of the interleaved `qkv`, irreducible). rel_L2 **bit-identical** (0.6394475).
+
+**(b) `attn_window_tile_f32` occupancy.** The windows are ≤36 tokens (`window=112/16/2=3`
+groups × `merge²=4`). Staging Q/K/V + the `S[win,win]` score matrix in **F32** cost
+`3·36·72·4 + 36²·4 = 35.4 KB`/block → with 100 KB/SM only **2 blocks/SM** resident (~25% occ),
+smem-limited by the 30 KB Q/K/V term. Changed the staging to **F16** (`3·36·72·2 + 36²·4 =
+20.7 KB`/block → **4 blocks/SM**, doubled occupancy). Dot products still accumulate in F32 and
+the score matrix / softmax stay F32; only the staged operands are F16 — consistent with the
+materialized full-attn path, which already stages Q/K/V as F16 (`attn_extract_heads`). Result:
+
+| size | `attn_window_tile_f32` (before → after) | share |
+|---|---:|---:|
+| 512² | 187.9 → 135.0 µs avg (**−28%**) | 13.2% → 9.9% |
+| 768² | 438.1 → 302.8 µs avg (**−31%**) | 12.2% → 8.8% |
+
+rel_L2 0.6394297 vs baseline 0.6394475 (Δ 1.8e-5 — benign f16-staging rounding). (ncu
+occupancy confirmation was unavailable — `ERR_NVGPUCTRPERM`, no perf-counter permission — so
+the 2→4 blocks/SM is from the smem arithmetic; the measured 28–31% kernel drop confirms it.)
+
+**End-to-end (steady-state, f16, `--warmup 3 --iters 10`):**
+
+| size | before | after | Δ |
+|---|---:|---:|---:|
+| 512² | 32.2 ms | **31.0 ms** | −3.7% (8240 tok/s) |
+| 768² | 80.6 ms | **78.2 ms** | −3.0% (7360 tok/s) |
+| 1024² | 169.2 ms | **166.7 ms** | −1.5% |
+
+**Conclusion.** After this fix the encoder is firmly **GEMM-bound**: ~55–60% is cuBLAS F16
+GEMM that a hand-rolled kernel can't beat (Fix #12/#13), `attn_window_tile_f32` is down to
+~9–10% (already per-layer-efficient; tensor cores won't help 36-token windows / head_dim=72,
+same lesson as the flash), and the remaining custom kernels (softmax/add/gelu/layernorm/rope)
+are each ≤6% and memory-bound. **The only remaining large lever is FP8** for the FFN/projection
+GEMMs (Blackwell 5th-gen tensor cores ≈2× F16) — a separate, higher-risk effort gated on
+accuracy validation (`cu_f32_to_fp8_e4m3` clamp bug, sm_120 FP8 cuBLAS quality both unknown).
+
+## Fix applied #13: tensor-core (`mma.sync`) flash full-attention — correct, O(N), still loses to cuBLAS
+
+**Motivation.** Fix #12's CUDA-core flash lost ~5× because cuBLAS keeps QK^T / P·V on
+**tensor cores**. The remaining question: does a flash kernel that *also* uses tensor cores
+(so it keeps that throughput AND O(N) memory) finally beat the materialized cuBLAS path at
+large N, where cuBLAS's `[N,N]` scores go DRAM-bound?
+
+**What was built.** `attn_prefill_vision_f32` (NVRTC string in `cuda_vision_encoder.c`),
+adapted from the proven LLM-prefill flash `attn_prefill_f32` in `cuda/cuda_kernels_common.h`:
+`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` for both QK^T and P·V, F32-accumulated
+**online softmax** with O-accumulator rescaling, **O(N) memory**. Grid `(n_heads,
+ceil(N/64))`, block 128 (4 warps × 16 queries). Two adaptations vs the head_dim=64 source:
+(a) reads Q/K/V straight from the interleaved `qkv[N,3·dim]` (no `K_t`/`V_t` transpose
+buffers — same trick the window kernels use); (b) **head_dim=72**: QK contracts over
+`nkf=⌈72/16⌉=5` `k16` fragments (the 5th half-padded, `d≥72`→0), and the output is
+`noc=⌈72/8⌉=9` 8-wide column groups (9·8=72 exact). The sm_120 `a1/a2` fragment swap is
+preserved verbatim. Each 16-key K/V tile is staged into **shared memory** once per block so
+all 4 warps reuse it (the first version re-read K/V from global in every warp — 4×
+redundant — and was ~18% slower; staging cut that to ~12%).
+
+**Two bugs found and fixed during bring-up:**
+- *P-fragment packing.* First cut packed the probs `f16x2` as `(s0[0],s0[1])` (the two
+  nh-halves of one column) instead of `(s0[0],s1[0])` (the two columns of one nh-half).
+  That scrambles which keys each P fragment element represents → rel_L2 0.6263 (off by
+  0.013). The C→A fragment remap must mirror `attn_prefill_f32` exactly.
+- *`__syncthreads` deadlock.* Adding shared staging meant the per-warp `if (qb>=n_tok)
+  return` could let some warps of the last block exit before the barrier. Switched to a
+  block-level `if (blockIdx.y*64>=n_tok) return` and rely on the existing per-query
+  (`qi<n_tok`) guards.
+
+**Correctness.** Forced on at 512² (16 Q-tiles × 16 K-tiles → full multi-tile online
+softmax): rel_L2 **0.6394808** vs the materialized path's **0.6394475** — identical to 4
+digits (0.005%, pure f16 ordering noise), finite. Numerically equivalent to materialized.
+
+**The finding: still 4–14% SLOWER (steady-state, `--warmup 3 --iters 10`, f16):**
+
+| size  | materialized (cuBLAS) | tc-flash (mma + shared) | penalty |
+|-------|----------------------:|------------------------:|--------:|
+| 512²  |              32.1 ms |                 33.3 ms |  +4%  |
+| 1024² |             169.2 ms |                188.9 ms |  +12% |
+| 2048² |            1499.0 ms |               1704.8 ms |  +14% |
+
+Even with tensor cores + shared K/V staging it loses. Why cuBLAS still wins: its GEMMs use
+**larger tiles** (more K-reuse per load than this kernel's 64-query block), **cp.async**
+double-buffering, swizzled shared to dodge bank conflicts, and optimal mma scheduling — and
+head_dim=72 makes this kernel waste ~half of every 5th `k16` fragment, plus the per-tile
+online-softmax (`__shfl` reductions + `expf`) is pure overhead the materialized GEMMs don't
+pay. At 1024² cuBLAS's `[N,N]` (4 MB) is even L2-resident, so it is not DRAM-bound there at
+all; only 2048² (64 MB > 32 MB L2) is, and cuBLAS *still* wins by raw throughput.
+
+**How it ships.** It **replaces** the Fix #12 CUDA-core `flash_attn_full_f32` (now removed)
+as the O(N)-memory fallback above `flash_full_n` (default 32768 tokens ≈ 5800² images),
+since it is far closer to materialized speed (4–14% vs 3.6–5.5×) at the same O(N) memory.
+Every standard size keeps the materialized path (verified non-regressive: default 512²
+rel_L2 still 0.6394475, 1024²/2048² timings unchanged). `VLM_TC_FLASH=1` forces it at every
+size for A/B testing.
+
+**Conclusion.** On this GPU, for these sizes, the materialized per-head cuBLAS path is the
+best attention implementation we have — confirmed against both a CUDA-core and a tensor-core
+hand-rolled flash. Beating it needs a production-grade FA2 (the rewrite listed in the scaling
+note above); parked pending a decision that the large-N win justifies it.
+
+## Fix applied #12: fused flash full-attention kernel — O(N) memory, but a fallback (not a speedup)
+
+**Motivation.** An `nsys` profile at 2048² (graph off) confirmed the full-attention path
+dominates the encode: `attn_softmax_rows` alone was **38%** (the single biggest kernel —
+it reads the F32 `[N,N]` scores 3× and writes F16 probs, ~14·N² B/head of DRAM), the cuBLAS
+QK^T `tn` GEMMs ~39%, and the P·V `nn` GEMM ~10%. At 2048² (N=16384) the single-head score
+buffer is ~1 GB — far past the 32 MB L2 — so the path is DRAM-bound.
+
+**What was built.** `flash_attn_full_f32` (NVRTC string literal in
+`cuda_vision_encoder.c`): a fused FA2-style kernel with **O(N) memory**. One block owns a
+`FF_BQ=64`-row query tile of one head and streams `FF_BK=64`-row K/V tiles through shared
+memory with a running `(m, l)` online softmax and an `O[64,head_dim]` accumulator;
+generalizes `attn_window_tile_f32`'s "thread owns the whole (i,j) dot, no warp reductions"
+score pass with key-tiling. Reads the F32 `qkv` directly (no F16 extraction → more accurate
+than the tc_attn path). Dynamic shared ~88.5 KB at head_dim=72 (opted into the sm_120 99 KB
+carveout via `cuFuncSetAttribute`). Per-head K/V (~9 MB at 2048²) stays L2-resident across
+the K-loop, so it is *not* DRAM-bound.
+
+**Correctness.** Forced on at 512² (which already tiles to 16 Q-tiles × 16 K-tiles → it
+exercises the full multi-tile online-softmax accumulation): rel_L2 **0.6395133** vs the
+materialized path's 0.6394475 — identical to 3 digits (the tiny delta is F32-flash vs
+F16-tc_attn), finite, no NaN/Inf. The kernel is correct.
+
+**The finding: it is 3.6–5.5× SLOWER, so it is a memory fallback, not a speedup.**
+
+| size  | materialized (tensor-core) | flash (CUDA-core) | flash penalty |
+|-------|---------------------------:|------------------:|--------------:|
+| 1024² |                   169.8 ms |          618.5 ms |        3.6× |
+| 2048² |                  1499.0 ms |         8363.1 ms |        5.6× |
+
+The materialized path runs QK^T and P·V on **tensor cores** (cuBLAS) and sustains ~5
+effective TFLOP/s *even while DRAM-bound*; the hand-rolled CUDA-core flash kernel tops out
+near ~0.9 TFLOP/s (~4% of CUDA-core peak). **Tensor cores beat CUDA cores by more than the
+materialization's DRAM penalty costs**, so no CUDA-core flash kernel can win here (neither
+would half2 — that is ~2× and the gap is ~6×). The lesson: "DRAM-bound" did not mean "slow"
+in absolute terms, because cuBLAS stays efficient even when memory-bound.
+
+**How it ships.** Default crossover `flash_full_n = 32768` (env `VLM_FLASH_FULL_N`), so the
+materialized path keeps every size that fits VRAM (incl. 2048²) — verified non-regressive
+(1024² 169.8 ms, 2048² 1499.0 ms, unchanged). The fused kernel takes over only for N above
+the crossover — i.e. images above ~2900² whose `[N,N]` F32 scratch (>4 GB) would OOM the
+16 GB card. The materialized scratch alloc is now capped to `min(max_patches, flash_full_n)`
+to bound it. `VLM_FLASH_FULL=1`/`=0` forces the kernel on/off for A/B testing.
+
+**The real large-N lever (next, if pursued):** an `mma.sync` **tensor-core** flash kernel
+(F16 fragments, F32 accumulate, online softmax across fragment tiles). That keeps tensor-core
+throughput *and* O(N) memory — the only way to actually beat cuBLAS at very large N.
+head_dim=72 (pad to 80 = 5×k16) is the awkward part. High effort/risk; cuBLAS GEMMs are
+heavily tuned, so even this may only match, not beat, the materialized path until N is large
+enough that the DRAM penalty dominates.
 
 ## Fix applied #11: lift the 768² image-size cap (run 1024² / 2048²)
 
