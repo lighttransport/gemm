@@ -38,15 +38,15 @@ attn & window rewrite **43.9 / 116.8** → +cuBLASLt fused bias/GELU epilogue & 
 
 | image  | tokens | CUDA mean ms | CUDA min ms | CUDA tok/s | PyTorch mean ms | PyTorch min ms | PyTorch tok/s | CUDA vs PyTorch |
 |-------:|-------:|-------------:|------------:|-----------:|----------------:|---------------:|--------------:|----------------:|
-| 512²   |   256  |         38.1 |        37.7 |       6727 |            96.0 |           69.6 |          2606 | **2.52× faster** |
-| 768²   |   576  |         95.8 |        95.4 |       6013 |           212.7 |          184.5 |          2712 | **2.22× faster** |
+| 512²   |   256  |         35.2 |        34.9 |       7264 |            96.0 |           69.6 |          2606 | **2.73× faster** |
+| 768²   |   576  |         81.5 |        80.5 |       7065 |           212.7 |          184.5 |          2712 | **2.61× faster** |
 | 1024²  |  1024  | — (unsupported) |          |            |           438.1 |          401.2 |          4354 |        —        |
 | 2048²  |  4096  | — (unsupported) |          |            |          1518.7 |         1515.3 |          2701 |        —        |
 
 CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
 
-> The CUDA encoder is now **>2× faster than PyTorch SDPA on the same GPU** at both 512²
-> (2.52×) and 768² (2.22×) — a full reversal of the original 4.9× / 10.4× deficit. (And
+> The CUDA encoder is now **>2.6× faster than PyTorch SDPA on the same GPU** at both 512²
+> (2.73×) and 768² (2.61×) — a full reversal of the original 4.9× / 10.4× deficit. (And
 > PyTorch additionally runs the 3 deepstack mergers the GGUF path omits, so the real-work
 > gap is even larger.) At 768² the dominant remaining cost is the FFN/projection cuBLAS
 > GEMMs (≈52%, tensor-core, near-irreducible); the windowed-attention kernel is down to
@@ -54,6 +54,37 @@ CUDA: `--warmup 5 --iters 20`. PyTorch: `--warmup 5 --iters 20`.
 > is ≈17%. `add_bias`, the standalone `gelu`, the cuBLASLt GELU side kernel, and the large
 > FFN-down input cast are all gone (fused / written F16 in-pass); what remains is
 > `gelu_f32_to_f16` (≈5.2%) + the smaller residual `cast_f32_f16` (≈2.4%).
+
+## Fix applied #9: collapse the host-side result assembly (the real residual lever)
+
+Fix #8 proved the in-loop launch overhead was tiny (~1.3 ms) and that the bulk of the
+wall-vs-GPU gap was **untimed per-encode host work** in the encode tail. This fix removes
+it. The old tail unconditionally did, for the 11.8 MB output (576 tokens × 5120 floats):
+`calloc(total)` (zero-fill) **+** `malloc(mm_host)` (a second 11.8 MB buffer) **+** a
+synchronous pageable `cuMemcpyDtoH` into `mm_host` **+** a per-token interleave-copy from
+`mm_host` into `result` **+** two `free`s — even when there are no DeepStack features to
+interleave. For this GGUF, `n_deepstack == 0` **always** (`ds_count == 0`), so all of that
+staging+zero-fill+copy was pure overhead.
+
+New tail: when `ds_count == 0`, `cuMemcpyDtoH(result, d_mm_out, …)` straight into the one
+malloc'd output buffer — no zero-fill, no second buffer, no interleave, no extra frees. The
+DeepStack interleave path is kept verbatim behind the `else` for models that actually
+populate it. Measured tail cost dropped ~17 ms → ~2.4 ms; the win scales with output size
+(more tokens = bigger savings), so 768² gains far more than 512².
+
+Result (f16, RTX 5060 Ti, `--warmup 5 --iters 20`):
+
+| size | before (mean / min) | after (mean / min) |
+|------|---------------------|--------------------|
+| 512² | 37.7 / 37.2 ms      | **35.2 / 34.9 ms** |
+| 768² | 95.2 / 94.6 ms      | **81.5 / 80.5 ms** |
+
+rel_L2 vs CPU of a replayed warm encode = **0.6394475**, bit-identical — the result bytes
+are the same, only the path that assembles them changed. With this, the `t_*` phases now
+**sum to the wall** at 768² (rgb 1.5 + patch 0.5 + pos 0.1 + rope 0.8 + vit 73.5 + mm 1.3
++ tail ~2.4 ≈ 80 ms): the untimed gap is closed and the `vit` GPU loop (≈73.5 ms) is the
+floor. The only sizeable remainders are RGB HtoD (~1.5 ms) and the residual DtoH (~2.4 ms),
+both candidates for pinned memory but small now.
 
 ## Fix applied #8: CUDA graph capture of the ViT block loop
 
@@ -93,10 +124,10 @@ gap the #7 nsys "21% idle" figure pointed at is **untimed per-encode host work**
 launch latency: the encode tail does `calloc(11.8 MB)` + `malloc(11.8 MB)` + a synchronous
 pageable `cuMemcpyDtoH(11.8 MB)` + a host interleave-copy for the result, plus the RGB
 HtoD up front (none of which is in the `t_*` phase timers). That host-side result assembly
-(≈10 ms) + transfers is the real residual lever — e.g. pinned-memory output, reusing the
-result buffer across encodes, and skipping the interleave when `n_deepstack==0`. The
-window-map + rope precompute (recomputed every encode though size-invariant) is a smaller
-cache-per-size opportunity.
+(≈17 ms at 768²) + transfers is the real residual lever — **fixed in Fix #9** by skipping
+the staging buffer, zero-fill, and interleave when `n_deepstack==0` (768² 95.2 → 81.5 ms).
+The window-map + rope precompute (recomputed every encode though size-invariant) is a
+smaller cache-per-size opportunity that remains.
 
 ## Fix applied #7: fold the layernorm→GEMM input cast into LayerNorm (F16 output)
 
@@ -303,7 +334,7 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
    attention (Fix #2), then patch im2col+GEMM (Fix #3), tensor-core attention + the
    windowed-attention rewrite (Fix #4), the cuBLASLt fused bias/GELU epilogue +
    F16 FFN intermediate (Fix #5), and the materialize-scores windowed kernel (Fix #6).
-   CUDA is now **2.52× faster at 512² and 2.22× faster at 768²** than PyTorch on the same
+   CUDA is now **2.73× faster at 512² and 2.61× faster at 768²** than PyTorch on the same
    GPU. At 768² the only large reducible cost left is the FFN/projection cuBLAS GEMMs
    (≈52%, tensor-core — near the hardware floor); the windowed kernel is down to ≈12% and
    the 6-layer full-attention tensor-core path is ≈17% (spread across QK/softmax/P·V/extract,
@@ -311,10 +342,12 @@ unchanged (0.642), i.e. the new path matches the prior built-in F16 output bit-f
    (Fix #7, F16 output). `gelu_f32_to_f16` (≈5.3%) **cannot** be folded further — sm_120
    cuBLASLt has no F16-output epilogue. The 288/encode per-layer launches are now captured
    into a **CUDA graph** and replayed (Fix #8) — that recovered the real in-loop launch
-   overhead (~1.3 ms). The remaining wall-vs-GPU gap is **untimed host work** (11.8 MB
-   result `calloc`+pageable-`DtoH`+interleave, RGB HtoD), not GPU launch starvation; the
-   next lever is that host-side result assembly + transfers. See Fix #8 (and the #7
-   correction note).
+   overhead (~1.3 ms). The remaining wall-vs-GPU gap was **untimed host work** (11.8 MB
+   result `calloc`+pageable-`DtoH`+interleave, RGB HtoD), not GPU launch starvation — now
+   collapsed in **Fix #9** (skip the staging/zero-fill/interleave when `n_deepstack==0`),
+   which closed the gap (768² 95.2 → 81.5 ms) so the `t_*` phases sum to the wall and the
+   `vit` GPU loop (≈73.5 ms) is the floor. Residual untimed bits (RGB HtoD ~1.5 ms, output
+   DtoH ~2.4 ms) are pinned-memory candidates but small.
 
    *Tried and rejected — batching the full-attention heads.* The 6 full-attn layers run
    the QK / softmax / P·V chain **one head at a time** (16 heads × 3 launches × 6 layers).
