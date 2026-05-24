@@ -206,7 +206,7 @@ static float *load_txt_bin(const char *path, int *n_tok, int txt_dim) {
 }
 
 int main(int argc, char **argv) {
-    const char *dit_path = NULL;
+    const char *dit_path = NULL; int use_int4 = 0;
     const char *vae_path = NULL;
     const char *enc_path = NULL;
     const char *prompt = "a red apple on a white table";
@@ -245,6 +245,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--test-dit")) mode = "dit";
         else if (!strcmp(argv[i], "--test-vae")) mode = "vae";
         else if (!strcmp(argv[i], "--generate")) mode = "gen";
+        else if (!strcmp(argv[i], "--test-int4-load")) mode = "int4load";  /* load a logical-int4 DiT (--dit <file>) and report descriptors + residency */
+        else if (!strcmp(argv[i], "--test-int4-dequant")) mode = "int4dequant";  /* on-GPU dequant correctness gate vs host oracle */
+        else if (!strcmp(argv[i], "--int4")) use_int4 = 1;  /* DiT is a logical-INT4 (W4A16) checkpoint */
         else if (!strcmp(argv[i], "--test-enc")) mode = "enc";
         else if (!strcmp(argv[i], "--dit") && i+1 < argc) dit_path = argv[++i];
         else if (!strcmp(argv[i], "--vae") && i+1 < argc) vae_path = argv[++i];
@@ -412,6 +415,20 @@ int main(int argc, char **argv) {
 
     if (!strcmp(mode, "init")) { hip_qimg_free(r); return 0; }
 
+    if (!strcmp(mode, "int4load")) {
+        if (!dit_path) { fprintf(stderr, "--test-int4-load needs --dit <logical-int4.safetensors>\n"); hip_qimg_free(r); return 1; }
+        int rc = hip_qimg_load_dit_int4(r, dit_path);
+        fprintf(stderr, "hip_qimg: int4 logical load %s\n", rc == 0 ? "OK" : "FAILED");
+        hip_qimg_free(r); return rc == 0 ? 0 : 1;
+    }
+    if (!strcmp(mode, "int4dequant")) {  /* deterministic on-GPU dequant gate: kernel vs host oracle on block-0 attn.to_q */
+        if (!dit_path) { fprintf(stderr, "--test-int4-dequant needs --dit <logical-int4.safetensors>\n"); hip_qimg_free(r); return 1; }
+        if (hip_qimg_load_dit_int4(r, dit_path) != 0) { fprintf(stderr, "hip_qimg: int4 logical load FAILED\n"); hip_qimg_free(r); return 1; }
+        int rc = hip_qimg_test_int4_dequant(r);
+        fprintf(stderr, "hip_qimg: int4 dequant gate %s\n", rc == 0 ? "PASS (bit-exact vs host oracle)" : "FAILED");
+        hip_qimg_free(r); return rc == 0 ? 0 : 1;
+    }
+
     clock_t t0;
 
     /* Load DiT (deferred for gen/enc modes — GPU text encoder runs first) */
@@ -537,9 +554,8 @@ int main(int argc, char **argv) {
         /* Load DiT now (after GPU text encoder freed VRAM) */
         if (dit_path) {
             clock_t t0_dit = clock();
-            if (hip_qimg_load_dit(r, dit_path) != 0) {
-                hip_qimg_free(r); return 1;
-            }
+            int lrc = use_int4 ? hip_qimg_load_dit_int4(r, dit_path) : hip_qimg_load_dit(r, dit_path);
+            if (lrc != 0) { hip_qimg_free(r); return 1; }
             fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0_dit)/CLOCKS_PER_SEC);
         }
 

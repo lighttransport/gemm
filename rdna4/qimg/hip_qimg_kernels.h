@@ -1314,6 +1314,37 @@ static const char hip_qimg_specific_kernels[] =
 "#endif\n"
 "\n"
 
+/* INT4-logical "main" weight dequant (Nunchaku/SVDQuant W4A16 path).
+ * Decodes the contiguous logical nibble pack + per-(out,input-group-of-64) scale into a dense
+ * BF16-storable F32 weight: W[o,i] = signed_int4(qint4[o,i/2]) * wscale[o, i/group_size].
+ * Standalone validation/warm-up kernel — its nibble-unpack + group-scale snippet is the inner
+ * step of the eventual fused dequant-in-LDS BF16 WMMA kernel. One thread per output element. */
+"__global__ void dequant_int4_logical_main_f32(const unsigned char *__restrict__ qint4,\n"
+"        const float *__restrict__ wscale, const float *__restrict__ smooth, float *__restrict__ Wout,\n"
+"        int n_out, int n_in, int group_size) {\n"
+"    long e = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    long total = (long)n_out * (long)n_in;\n"
+"    if (e >= total) return;\n"
+"    int o = (int)(e / (long)n_in);\n"
+"    int i = (int)(e - (long)o * (long)n_in);\n"
+"    unsigned char byte = qint4[(long)o * (long)(n_in / 2) + (long)(i >> 1)];\n"
+"    int nib = (i & 1) ? (byte >> 4) : (byte & 0xF);\n"  /* high nibble = odd channel */
+"    if (nib >= 8) nib -= 16;\n"                          /* unsigned-encoded signed int4 [-8,7] */
+"    int ng = n_in / group_size;\n"
+"    float s = wscale[(long)o * (long)ng + (long)(i / group_size)];\n"
+"    float w = (float)nib * s;\n"
+"    if (smooth) w /= smooth[i];\n"                       /* fold smoothing: W@(x/smooth) == (W/smooth)@x */
+"    Wout[e] = w;\n"
+"}\n"
+"__global__ void add_inplace_f32(float *__restrict__ y, const float *__restrict__ a, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] += a[i];\n"
+"}\n"
+"__global__ void expand_bf16_f32(const unsigned short *__restrict__ b, float *__restrict__ f, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;\n"
+"    unsigned u = (unsigned)b[i] << 16; float v; __builtin_memcpy(&v,&u,4); f[i] = v;\n"
+"}\n"
+"\n"
+
 /* FP8 roundtrip quantization */
 "__global__ void quantize_fp8_roundtrip_f32(float *__restrict__ x, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
