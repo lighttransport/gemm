@@ -802,6 +802,15 @@ struct cuda_vision_runner {
     CUdeviceptr d_attn_scores;/* [max_patches * max_patches] F32 (one head) */
     CUdeviceptr d_attn_probs; /* [max_patches * max_patches] F16 (one head) */
 
+    /* CUDA graph capture of the ViT block loop (collapses per-layer host launches) */
+    int use_graph;            /* VLM_CUDA_GRAPH (default 1) && driver graph API present */
+    int capturing;            /* set while the loop is recorded under stream capture */
+    CUgraph graph;
+    CUgraphExec graph_exec;
+    int graph_ready;          /* graph_exec valid for (graph_w, graph_h) */
+    int graph_w, graph_h;     /* grid dims (gw, gh) the captured graph is valid for */
+    int graph_warm;           /* same-size encodes before capture (>=1 => F16 path settled) */
+
     /* Host output */
     float *h_output;
     int loaded;
@@ -1162,6 +1171,22 @@ cuda_vision_runner *cuda_vision_init(int device_id, int verbose, int use_f16) {
         if (r->verbose >= 1)
             fprintf(stderr, "cuda_vlm: windowed attention = %s kernel\n",
                     r->win_tile ? "tile (materialize-scores)" : "warp-per-query");
+    }
+    {
+        /* CUDA-graph capture of the ViT block loop: default ON, VLM_CUDA_GRAPH=0
+         * disables. Requires the driver graph API (loaded via cuew) -- guard the
+         * pointers so an old driver falls back to per-layer launches. */
+        const char *ge = getenv("VLM_CUDA_GRAPH");
+        int want = !(ge && ge[0] == '0');
+        int api = (cuStreamBeginCapture_v2 && cuStreamEndCapture &&
+                   cuGraphInstantiateWithFlags && cuGraphLaunch &&
+                   cuGraphExecDestroy && cuGraphDestroy);
+        r->use_graph = (want && api) ? 1 : 0;
+        r->graph_w = -1;
+        r->graph_h = -1;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_vlm: CUDA graph capture = %s\n",
+                    r->use_graph ? "on" : (want ? "off (driver API missing)" : "off"));
     }
 
     if (vlm_compile_kernels(r) != 0) {
@@ -1588,243 +1613,25 @@ static void vlm_gemm_x_f16(cuda_vision_runner *r, CUdeviceptr d_Y,
 /* Public API: encode                                                       */
 /* ======================================================================== */
 
-float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int width, int height) {
-    if (!r || !r->loaded) return NULL;
+/* Destroy any captured ViT-block graph + its exec (called on size change/teardown). */
+static void vlm_graph_reset(cuda_vision_runner *r) {
+    if (r->graph_exec) { cuGraphExecDestroy(r->graph_exec); r->graph_exec = NULL; }
+    if (r->graph)      { cuGraphDestroy(r->graph);          r->graph = NULL; }
+    r->graph_ready = 0;
+}
 
-    int ps = r->patch_size;
-    int dim = r->dim;
-    int n_heads = r->n_heads;
-    int head_dim = r->head_dim;
-    int ffn_dim = r->ffn_dim;
-    int gw = width / ps;
-    int gh = height / ps;
-    int n_patches = gw * gh;
-    int sm = r->spatial_merge;
-    int merged_dim = dim * sm * sm;
-    int n_merged = n_patches / (sm * sm);
-    int use_window_attn = (r->n_wa_pattern > 0);
-    int n_windows = 0;
-    int max_window_tokens = 0;
-    double t_patch = 0.0, t_pos = 0.0, t_rope = 0.0, t_vit = 0.0;
-    double t_postln = 0.0, t_merge = 0.0, t_mmproj = 0.0;
-    double t0;
-
-    if (n_patches > r->max_patches) {
-        fprintf(stderr, "cuda_vlm: too many patches %d (max %d)\n", n_patches, r->max_patches);
-        return NULL;
-    }
-
-    fprintf(stderr, "cuda_vlm: encoding %dx%d image (%d patches, %d merged tokens)\n",
-            width, height, n_patches, n_merged);
-    if (use_window_attn) {
-        fprintf(stderr, "cuda_vlm: Qwen window attention enabled (pattern=%d window=%d)\n",
-                r->n_wa_pattern, r->attn_window_size);
-    }
-
-    /* 1. Upload RGB to GPU */
-    cuMemcpyHtoD(r->d_rgb, rgb_norm, (size_t)width * height * 3 * sizeof(float));
-
-    /* 2. Patch embedding: im2col + GEMM (w1 already folded into w0 at load). */
-    fprintf(stderr, "  patch embedding (im2col + GEMM)...\n");
-    t0 = vlm_time_ms();
-    {
-        int img_w = width;
-        int ks = ps * ps * 3;
-        void *im_args[] = { &r->d_patch_pix, &r->d_rgb, &gw, &ps, &img_w };
-        cuLaunchKernel(r->fn_patch_im2col_f32,
-                       n_patches, 1, 1,
-                       256, 1, 1,
-                       0, r->stream,
-                       im_args, NULL);
-        gpu_weight pw = { .w_f32 = r->d_patch_w0, .w_f16 = 0, .bias = r->d_patch_bias };
-        vlm_gemm(r, r->d_hidden, &pw, r->d_patch_pix, n_patches, dim, ks);
-    }
-    cuStreamSynchronize(r->stream);
-    t_patch = vlm_time_ms() - t0;
-
-    /* Debug: check patch embedding output */
-    if (r->verbose >= 2) {
-        cuStreamSynchronize(r->stream);
-        float dbg[8];
-        cuMemcpyDtoH(dbg, r->d_hidden, 8 * sizeof(float));
-        fprintf(stderr, "  [DBG] hidden after patch_embed: %.6f %.6f %.6f %.6f\n",
-                dbg[0], dbg[1], dbg[2], dbg[3]);
-    }
-
-    /* 3. Position embeddings (bilinear interpolation for dynamic resolution) */
-    fprintf(stderr, "  position embeddings...\n");
-    t0 = vlm_time_ms();
-    {
-        int orig_gw = r->image_size / ps;
-        int orig_gh = orig_gw;  /* original grid is square */
-
-        if (gw == orig_gw && gh == orig_gh) {
-            /* Exact match: use direct indirection (no interpolation needed) */
-            int *pos_map = (int *)malloc(n_patches * sizeof(int));
-            for (int py = 0; py < gh; py++)
-                for (int px = 0; px < gw; px++)
-                    pos_map[py * gw + px] = py * orig_gw + px;
-            cuMemcpyHtoD(r->d_pos_map, pos_map, n_patches * sizeof(int));
-            free(pos_map);
-
-            void *args[] = { &r->d_hidden, &r->d_pos_embd, &r->d_pos_map, &dim };
-            cuLaunchKernel(r->fn_add_pos_embd,
-                           n_patches, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        } else {
-            /* Bilinear interpolation on CPU, upload to d_pos_interp */
-            fprintf(stderr, "  interpolating pos embedding: %dx%d -> %dx%d\n",
-                    orig_gw, orig_gh, gw, gh);
-            float *interp = (float *)malloc((size_t)n_patches * dim * sizeof(float));
-            for (int py = 0; py < gh; py++) {
-                float sy = (float)py * (orig_gh - 1) / (gh > 1 ? gh - 1 : 1);
-                int y0 = (int)sy, y1 = (y0 + 1 < orig_gh) ? y0 + 1 : y0;
-                float wy = sy - y0;
-                for (int px = 0; px < gw; px++) {
-                    float sx = (float)px * (orig_gw - 1) / (gw > 1 ? gw - 1 : 1);
-                    int x0 = (int)sx, x1 = (x0 + 1 < orig_gw) ? x0 + 1 : x0;
-                    float wx = sx - x0;
-                    int dst_idx = (py * gw + px) * dim;
-                    int s00 = (y0 * orig_gw + x0) * dim;
-                    int s01 = (y0 * orig_gw + x1) * dim;
-                    int s10 = (y1 * orig_gw + x0) * dim;
-                    int s11 = (y1 * orig_gw + x1) * dim;
-                    for (int d = 0; d < dim; d++) {
-                        interp[dst_idx + d] =
-                            r->h_pos_embd[s00+d] * (1-wy)*(1-wx) +
-                            r->h_pos_embd[s01+d] * (1-wy)*wx +
-                            r->h_pos_embd[s10+d] * wy*(1-wx) +
-                            r->h_pos_embd[s11+d] * wy*wx;
-                    }
-                }
-            }
-            cuMemcpyHtoD(r->d_pos_interp, interp, (size_t)n_patches * dim * sizeof(float));
-            free(interp);
-
-            /* Add interpolated pos embedding directly (no pos_map needed) */
-            void *args[] = { &r->d_hidden, &r->d_pos_interp, &dim, &n_patches };
-            cuLaunchKernel(r->fn_add_pos_embd_direct,
-                           n_patches, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
-    }
-    cuStreamSynchronize(r->stream);
-    t_pos = vlm_time_ms() - t0;
-
-    /* 3b. Match llama.cpp token ordering for Qwen window attention. */
-    {
-        int *token_perm = (int *)malloc((size_t)n_patches * sizeof(int));
-        int *token_inv_perm = (int *)malloc((size_t)n_patches * sizeof(int));
-        int *window_starts = (int *)malloc((size_t)n_merged * sizeof(int));
-        int *window_sizes = (int *)malloc((size_t)n_merged * sizeof(int));
-        if (!token_perm || !token_inv_perm || !window_starts || !window_sizes) {
-            free(token_perm);
-            free(token_inv_perm);
-            free(window_starts);
-            free(window_sizes);
-            fprintf(stderr, "cuda_vlm: failed to allocate window maps\n");
-            return NULL;
-        }
-
-        if (vlm_build_qwen_window_maps(gw, gh, sm, ps, r->attn_window_size, use_window_attn,
-                                       token_perm, token_inv_perm,
-                                       window_starts, window_sizes, &n_windows) != 0) {
-            free(token_perm);
-            free(token_inv_perm);
-            free(window_starts);
-            free(window_sizes);
-            fprintf(stderr, "cuda_vlm: failed to build window maps\n");
-            return NULL;
-        }
-
-        cuMemcpyHtoD(r->d_token_perm, token_perm, (size_t)n_patches * sizeof(int));
-        cuMemcpyHtoD(r->d_token_inv_perm, token_inv_perm, (size_t)n_patches * sizeof(int));
-        cuMemcpyHtoD(r->d_window_starts, window_starts, (size_t)n_windows * sizeof(int));
-        cuMemcpyHtoD(r->d_window_sizes, window_sizes, (size_t)n_windows * sizeof(int));
-        for (int i = 0; i < n_windows; i++) {
-            if (window_sizes[i] > max_window_tokens) max_window_tokens = window_sizes[i];
-        }
-        if (max_window_tokens == 0) max_window_tokens = n_patches;
-
-        if (use_window_attn) {
-            void *args[] = { &r->d_hidden2, &r->d_hidden, &r->d_token_perm, &dim };
-            cuLaunchKernel(r->fn_reorder_rows_f32,
-                           n_patches, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-            vlm_swap_ptrs(&r->d_hidden, &r->d_hidden2);
-        }
-
-        free(token_perm);
-        free(token_inv_perm);
-        free(window_starts);
-        free(window_sizes);
-    }
-
-    /* 4. Precompute M-RoPE cos/sin on host, upload to GPU */
-    t0 = vlm_time_ms();
-    {
-        int half = head_dim / 2;
-        int sect_size = head_dim / 4;
-        float freq_base = 10000.0f;
-        float theta_scale = powf(freq_base, -2.0f / (float)half);
-        float *rope_cos = (float *)malloc(n_patches * head_dim * sizeof(float));
-        float *rope_sin = (float *)malloc(n_patches * head_dim * sizeof(float));
-        int *token_perm = (int *)malloc((size_t)n_patches * sizeof(int));
-
-        cuMemcpyDtoH(token_perm, r->d_token_perm, (size_t)n_patches * sizeof(int));
-
-        for (int p = 0; p < n_patches; p++) {
-            int src = use_window_attn ? token_perm[p] : p;
-            int py = src / gw;
-            int px = src % gw;
-            float p_t = (float)py, p_h = (float)px, p_w = (float)py, p_e = (float)px;
-            float cur_t = p_t, cur_h = p_h, cur_w = p_w, cur_e = p_e;
-
-            for (int i0 = 0; i0 < head_dim; i0 += 2) {
-                int sector = i0 / 2;
-                if (sector == 0) cur_t = p_t;
-                if (sector == sect_size) cur_h = p_h;
-                if (sector == 2 * sect_size) cur_w = p_w;
-                if (sector == 3 * sect_size) cur_e = p_e;
-
-                float theta;
-                if (sector < sect_size) theta = cur_t;
-                else if (sector < 2 * sect_size) theta = cur_h;
-                else if (sector < 3 * sect_size) theta = cur_w;
-                else theta = cur_e;
-
-                rope_cos[p * head_dim + i0] = cosf(theta);
-                rope_sin[p * head_dim + i0] = sinf(theta);
-                rope_cos[p * head_dim + i0 + 1] = cosf(theta);
-                rope_sin[p * head_dim + i0 + 1] = sinf(theta);
-
-                cur_t *= theta_scale;
-                cur_h *= theta_scale;
-                cur_w *= theta_scale;
-                cur_e *= theta_scale;
-            }
-        }
-
-        cuMemcpyHtoD(r->d_rope_cos, rope_cos, n_patches * head_dim * sizeof(float));
-        cuMemcpyHtoD(r->d_rope_sin, rope_sin, n_patches * head_dim * sizeof(float));
-        free(token_perm);
-        free(rope_cos);
-        free(rope_sin);
-    }
-    cuStreamSynchronize(r->stream);
-    t_rope = vlm_time_ms() - t0;
-
-    /* 5. ViT blocks */
-    int half = head_dim / 2;
+/* One ViT transformer block, repeated n_blocks times. Factored out of
+ * cuda_vision_encode so the loop can be issued normally, recorded under a
+ * CUDA-graph stream capture, or skipped in favor of graph replay. Touches only
+ * persistent device buffers and r->stream and runs in place on r->d_hidden, so
+ * a graph captured here replays correctly for any later image of the same size. */
+static void vlm_run_vit_blocks(cuda_vision_runner *r,
+                               int n_patches, int n_merged, int dim, int n_heads,
+                               int head_dim, int half, int ffn_dim, int merged_dim,
+                               int gw, int sm, int use_window_attn,
+                               int n_windows, int max_window_tokens,
+                               int *ds_count_out) {
     int ds_count = 0;
-    t0 = vlm_time_ms();
-
     for (int l = 0; l < r->n_blocks; l++) {
         if (l == 0 || l == r->n_blocks - 1 || (l + 1) % 6 == 0)
             fprintf(stderr, "  vit block %d/%d\n", l, r->n_blocks);
@@ -2114,6 +1921,295 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
             ds_count++;
         }
     }
+    if (ds_count_out) *ds_count_out = ds_count;
+}
+
+float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int width, int height) {
+    if (!r || !r->loaded) return NULL;
+
+    int ps = r->patch_size;
+    int dim = r->dim;
+    int n_heads = r->n_heads;
+    int head_dim = r->head_dim;
+    int ffn_dim = r->ffn_dim;
+    int gw = width / ps;
+    int gh = height / ps;
+    int n_patches = gw * gh;
+    int sm = r->spatial_merge;
+    int merged_dim = dim * sm * sm;
+    int n_merged = n_patches / (sm * sm);
+    int use_window_attn = (r->n_wa_pattern > 0);
+    int n_windows = 0;
+    int max_window_tokens = 0;
+    double t_patch = 0.0, t_pos = 0.0, t_rope = 0.0, t_vit = 0.0;
+    double t_postln = 0.0, t_merge = 0.0, t_mmproj = 0.0;
+    double t0;
+
+    if (n_patches > r->max_patches) {
+        fprintf(stderr, "cuda_vlm: too many patches %d (max %d)\n", n_patches, r->max_patches);
+        return NULL;
+    }
+
+    fprintf(stderr, "cuda_vlm: encoding %dx%d image (%d patches, %d merged tokens)\n",
+            width, height, n_patches, n_merged);
+    if (use_window_attn) {
+        fprintf(stderr, "cuda_vlm: Qwen window attention enabled (pattern=%d window=%d)\n",
+                r->n_wa_pattern, r->attn_window_size);
+    }
+
+    /* 1. Upload RGB to GPU */
+    cuMemcpyHtoD(r->d_rgb, rgb_norm, (size_t)width * height * 3 * sizeof(float));
+
+    /* 2. Patch embedding: im2col + GEMM (w1 already folded into w0 at load). */
+    fprintf(stderr, "  patch embedding (im2col + GEMM)...\n");
+    t0 = vlm_time_ms();
+    {
+        int img_w = width;
+        int ks = ps * ps * 3;
+        void *im_args[] = { &r->d_patch_pix, &r->d_rgb, &gw, &ps, &img_w };
+        cuLaunchKernel(r->fn_patch_im2col_f32,
+                       n_patches, 1, 1,
+                       256, 1, 1,
+                       0, r->stream,
+                       im_args, NULL);
+        gpu_weight pw = { .w_f32 = r->d_patch_w0, .w_f16 = 0, .bias = r->d_patch_bias };
+        vlm_gemm(r, r->d_hidden, &pw, r->d_patch_pix, n_patches, dim, ks);
+    }
+    cuStreamSynchronize(r->stream);
+    t_patch = vlm_time_ms() - t0;
+
+    /* Debug: check patch embedding output */
+    if (r->verbose >= 2) {
+        cuStreamSynchronize(r->stream);
+        float dbg[8];
+        cuMemcpyDtoH(dbg, r->d_hidden, 8 * sizeof(float));
+        fprintf(stderr, "  [DBG] hidden after patch_embed: %.6f %.6f %.6f %.6f\n",
+                dbg[0], dbg[1], dbg[2], dbg[3]);
+    }
+
+    /* 3. Position embeddings (bilinear interpolation for dynamic resolution) */
+    fprintf(stderr, "  position embeddings...\n");
+    t0 = vlm_time_ms();
+    {
+        int orig_gw = r->image_size / ps;
+        int orig_gh = orig_gw;  /* original grid is square */
+
+        if (gw == orig_gw && gh == orig_gh) {
+            /* Exact match: use direct indirection (no interpolation needed) */
+            int *pos_map = (int *)malloc(n_patches * sizeof(int));
+            for (int py = 0; py < gh; py++)
+                for (int px = 0; px < gw; px++)
+                    pos_map[py * gw + px] = py * orig_gw + px;
+            cuMemcpyHtoD(r->d_pos_map, pos_map, n_patches * sizeof(int));
+            free(pos_map);
+
+            void *args[] = { &r->d_hidden, &r->d_pos_embd, &r->d_pos_map, &dim };
+            cuLaunchKernel(r->fn_add_pos_embd,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+        } else {
+            /* Bilinear interpolation on CPU, upload to d_pos_interp */
+            fprintf(stderr, "  interpolating pos embedding: %dx%d -> %dx%d\n",
+                    orig_gw, orig_gh, gw, gh);
+            float *interp = (float *)malloc((size_t)n_patches * dim * sizeof(float));
+            for (int py = 0; py < gh; py++) {
+                float sy = (float)py * (orig_gh - 1) / (gh > 1 ? gh - 1 : 1);
+                int y0 = (int)sy, y1 = (y0 + 1 < orig_gh) ? y0 + 1 : y0;
+                float wy = sy - y0;
+                for (int px = 0; px < gw; px++) {
+                    float sx = (float)px * (orig_gw - 1) / (gw > 1 ? gw - 1 : 1);
+                    int x0 = (int)sx, x1 = (x0 + 1 < orig_gw) ? x0 + 1 : x0;
+                    float wx = sx - x0;
+                    int dst_idx = (py * gw + px) * dim;
+                    int s00 = (y0 * orig_gw + x0) * dim;
+                    int s01 = (y0 * orig_gw + x1) * dim;
+                    int s10 = (y1 * orig_gw + x0) * dim;
+                    int s11 = (y1 * orig_gw + x1) * dim;
+                    for (int d = 0; d < dim; d++) {
+                        interp[dst_idx + d] =
+                            r->h_pos_embd[s00+d] * (1-wy)*(1-wx) +
+                            r->h_pos_embd[s01+d] * (1-wy)*wx +
+                            r->h_pos_embd[s10+d] * wy*(1-wx) +
+                            r->h_pos_embd[s11+d] * wy*wx;
+                    }
+                }
+            }
+            cuMemcpyHtoD(r->d_pos_interp, interp, (size_t)n_patches * dim * sizeof(float));
+            free(interp);
+
+            /* Add interpolated pos embedding directly (no pos_map needed) */
+            void *args[] = { &r->d_hidden, &r->d_pos_interp, &dim, &n_patches };
+            cuLaunchKernel(r->fn_add_pos_embd_direct,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+        }
+    }
+    cuStreamSynchronize(r->stream);
+    t_pos = vlm_time_ms() - t0;
+
+    /* 3b. Match llama.cpp token ordering for Qwen window attention. */
+    {
+        int *token_perm = (int *)malloc((size_t)n_patches * sizeof(int));
+        int *token_inv_perm = (int *)malloc((size_t)n_patches * sizeof(int));
+        int *window_starts = (int *)malloc((size_t)n_merged * sizeof(int));
+        int *window_sizes = (int *)malloc((size_t)n_merged * sizeof(int));
+        if (!token_perm || !token_inv_perm || !window_starts || !window_sizes) {
+            free(token_perm);
+            free(token_inv_perm);
+            free(window_starts);
+            free(window_sizes);
+            fprintf(stderr, "cuda_vlm: failed to allocate window maps\n");
+            return NULL;
+        }
+
+        if (vlm_build_qwen_window_maps(gw, gh, sm, ps, r->attn_window_size, use_window_attn,
+                                       token_perm, token_inv_perm,
+                                       window_starts, window_sizes, &n_windows) != 0) {
+            free(token_perm);
+            free(token_inv_perm);
+            free(window_starts);
+            free(window_sizes);
+            fprintf(stderr, "cuda_vlm: failed to build window maps\n");
+            return NULL;
+        }
+
+        cuMemcpyHtoD(r->d_token_perm, token_perm, (size_t)n_patches * sizeof(int));
+        cuMemcpyHtoD(r->d_token_inv_perm, token_inv_perm, (size_t)n_patches * sizeof(int));
+        cuMemcpyHtoD(r->d_window_starts, window_starts, (size_t)n_windows * sizeof(int));
+        cuMemcpyHtoD(r->d_window_sizes, window_sizes, (size_t)n_windows * sizeof(int));
+        for (int i = 0; i < n_windows; i++) {
+            if (window_sizes[i] > max_window_tokens) max_window_tokens = window_sizes[i];
+        }
+        if (max_window_tokens == 0) max_window_tokens = n_patches;
+
+        if (use_window_attn) {
+            void *args[] = { &r->d_hidden2, &r->d_hidden, &r->d_token_perm, &dim };
+            cuLaunchKernel(r->fn_reorder_rows_f32,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+            vlm_swap_ptrs(&r->d_hidden, &r->d_hidden2);
+        }
+
+        free(token_perm);
+        free(token_inv_perm);
+        free(window_starts);
+        free(window_sizes);
+    }
+
+    /* 4. Precompute M-RoPE cos/sin on host, upload to GPU */
+    t0 = vlm_time_ms();
+    {
+        int half = head_dim / 2;
+        int sect_size = head_dim / 4;
+        float freq_base = 10000.0f;
+        float theta_scale = powf(freq_base, -2.0f / (float)half);
+        float *rope_cos = (float *)malloc(n_patches * head_dim * sizeof(float));
+        float *rope_sin = (float *)malloc(n_patches * head_dim * sizeof(float));
+        int *token_perm = (int *)malloc((size_t)n_patches * sizeof(int));
+
+        cuMemcpyDtoH(token_perm, r->d_token_perm, (size_t)n_patches * sizeof(int));
+
+        for (int p = 0; p < n_patches; p++) {
+            int src = use_window_attn ? token_perm[p] : p;
+            int py = src / gw;
+            int px = src % gw;
+            float p_t = (float)py, p_h = (float)px, p_w = (float)py, p_e = (float)px;
+            float cur_t = p_t, cur_h = p_h, cur_w = p_w, cur_e = p_e;
+
+            for (int i0 = 0; i0 < head_dim; i0 += 2) {
+                int sector = i0 / 2;
+                if (sector == 0) cur_t = p_t;
+                if (sector == sect_size) cur_h = p_h;
+                if (sector == 2 * sect_size) cur_w = p_w;
+                if (sector == 3 * sect_size) cur_e = p_e;
+
+                float theta;
+                if (sector < sect_size) theta = cur_t;
+                else if (sector < 2 * sect_size) theta = cur_h;
+                else if (sector < 3 * sect_size) theta = cur_w;
+                else theta = cur_e;
+
+                rope_cos[p * head_dim + i0] = cosf(theta);
+                rope_sin[p * head_dim + i0] = sinf(theta);
+                rope_cos[p * head_dim + i0 + 1] = cosf(theta);
+                rope_sin[p * head_dim + i0 + 1] = sinf(theta);
+
+                cur_t *= theta_scale;
+                cur_h *= theta_scale;
+                cur_w *= theta_scale;
+                cur_e *= theta_scale;
+            }
+        }
+
+        cuMemcpyHtoD(r->d_rope_cos, rope_cos, n_patches * head_dim * sizeof(float));
+        cuMemcpyHtoD(r->d_rope_sin, rope_sin, n_patches * head_dim * sizeof(float));
+        free(token_perm);
+        free(rope_cos);
+        free(rope_sin);
+    }
+    cuStreamSynchronize(r->stream);
+    t_rope = vlm_time_ms() - t0;
+
+    /* 5. ViT blocks */
+    int half = head_dim / 2;
+    int ds_count = 0;
+    t0 = vlm_time_ms();
+
+    /* The 27 ViT blocks issue ~288 host launches/encode (per-head full attention),
+     * which left the GPU ~20 ms idle/encode (host-launch-bound). Capture the loop
+     * once into a CUDA graph per image size, then replay it. Encode #1 runs normally
+     * (settles cublas_mixed_ok, warms cuBLAS algos/workspace); encode #2 captures
+     * (only when verbose<2 -- the in-loop debug syncs/DtoH would break capture -- and
+     * no DeepStack, whose host-side ds_count cannot survive replay); #3+ replay. The
+     * pre/post window reorder+swaps are net-identity per encode, so the loop sees the
+     * same physical d_hidden/d_hidden2 every time and the baked graph pointers stay
+     * valid. A capture or instantiate failure disables graphs and falls back to the
+     * per-layer launches. */
+    int gph = (r->use_graph && r->n_deepstack == 0);
+    if (gph && (r->graph_w != gw || r->graph_h != gh)) {
+        vlm_graph_reset(r);
+        r->graph_w = gw; r->graph_h = gh; r->graph_warm = 0;
+    }
+    if (gph && r->graph_ready) {
+        cuGraphLaunch(r->graph_exec, r->stream);
+    } else if (gph && r->graph_warm >= 1 && r->verbose < 2 && r->use_cublas && r->cublas &&
+               cuStreamBeginCapture_v2(r->stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) == CUDA_SUCCESS) {
+        r->capturing = 1;
+        vlm_run_vit_blocks(r, n_patches, n_merged, dim, n_heads, head_dim, half,
+                           ffn_dim, merged_dim, gw, sm, use_window_attn,
+                           n_windows, max_window_tokens, &ds_count);
+        r->capturing = 0;
+        CUgraph g = NULL;
+        CUresult ec = cuStreamEndCapture(r->stream, &g);
+        if (ec == CUDA_SUCCESS && g &&
+            cuGraphInstantiateWithFlags(&r->graph_exec, g, 0) == CUDA_SUCCESS) {
+            r->graph = g;
+            r->graph_ready = 1;
+            if (r->verbose >= 1)
+                fprintf(stderr, "cuda_vlm: CUDA graph captured (%dx%d, %d blocks)\n",
+                        gw * ps, gh * ps, r->n_blocks);
+            cuGraphLaunch(r->graph_exec, r->stream);  /* capture only records; run it now */
+        } else {
+            if (g) cuGraphDestroy(g);
+            r->use_graph = 0;
+            fprintf(stderr, "cuda_vlm: CUDA graph capture failed (ec=%d), "
+                    "using per-layer launches\n", (int)ec);
+            vlm_run_vit_blocks(r, n_patches, n_merged, dim, n_heads, head_dim, half,
+                               ffn_dim, merged_dim, gw, sm, use_window_attn,
+                               n_windows, max_window_tokens, &ds_count);
+        }
+    } else {
+        vlm_run_vit_blocks(r, n_patches, n_merged, dim, n_heads, head_dim, half,
+                           ffn_dim, merged_dim, gw, sm, use_window_attn,
+                           n_windows, max_window_tokens, &ds_count);
+        if (gph) r->graph_warm++;
+    }
     cuStreamSynchronize(r->stream);
     t_vit = vlm_time_ms() - t0;
 
@@ -2254,6 +2350,9 @@ static void vlm_free_weight(gpu_weight *w) {
 
 void cuda_vision_free(cuda_vision_runner *r) {
     if (!r) return;
+
+    /* Tear down any captured ViT-block graph before freeing its device buffers */
+    vlm_graph_reset(r);
 
     /* Free weights */
     if (r->d_patch_w0) cuMemFree(r->d_patch_w0);
