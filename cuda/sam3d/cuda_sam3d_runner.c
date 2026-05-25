@@ -70,6 +70,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
 #endif
@@ -183,6 +184,7 @@ typedef struct {
 
 struct cuda_sam3d_ctx {
     cuda_sam3d_config cfg;
+    cuda_sam3d_profile profile;
     char    *safetensors_dir_resolved;
 
     /* cuew + NVRTC. */
@@ -308,6 +310,13 @@ static char *cs3d_strdup(const char *s) {
     char *r = (char *)malloc(n);
     if (r) memcpy(r, s, n);
     return r;
+}
+
+static double cs3d_time_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
 /* If cfg->safetensors_dir is non-NULL, return a strdup. Otherwise derive
@@ -449,6 +458,7 @@ static void cs3d_gs_head_ws_free(cs3d_gs_head_ws *w)
 cuda_sam3d_ctx *cuda_sam3d_create(const cuda_sam3d_config *cfg)
 {
     if (!cfg) return NULL;
+    double t0 = cs3d_time_ms();
 
     cuda_sam3d_ctx *c = (cuda_sam3d_ctx *)calloc(1, sizeof(*c));
     if (!c) return NULL;
@@ -469,8 +479,9 @@ cuda_sam3d_ctx *cuda_sam3d_create(const cuda_sam3d_config *cfg)
         free(c->safetensors_dir_resolved); free(c);
         return NULL;
     }
-    if (cuInit(0) != CUDA_SUCCESS) {
-        fprintf(stderr, "cuda_sam3d: cuInit failed\n");
+    CUresult init_rc = cuInit(0);
+    if (init_rc != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_sam3d: cuInit failed (%d)\n", (int)init_rc);
         free(c->safetensors_dir_resolved); free(c);
         return NULL;
     }
@@ -500,10 +511,13 @@ cuda_sam3d_ctx *cuda_sam3d_create(const cuda_sam3d_config *cfg)
         return NULL;
     }
     c->compiled = 1;
+    c->profile.create_ms = cs3d_time_ms() - t0;
+    c->profile.ss_steps = c->cfg.ss_steps;
+    c->profile.slat_steps = c->cfg.slat_steps;
 
     if (c->cfg.verbose >= 1) {
-        fprintf(stderr, "cuda_sam3d: created (sm_%d, safetensors_dir=%s)\n",
-                c->sm, c->safetensors_dir_resolved);
+        fprintf(stderr, "cuda_sam3d: created (sm_%d, safetensors_dir=%s, %.3f ms)\n",
+                c->sm, c->safetensors_dir_resolved, c->profile.create_ms);
     }
     return c;
 }
@@ -566,10 +580,19 @@ void cuda_sam3d_destroy(cuda_sam3d_ctx *ctx)
     free(ctx);
 }
 
+int cuda_sam3d_get_profile(cuda_sam3d_ctx *ctx,
+                           cuda_sam3d_profile *out_profile)
+{
+    if (!ctx || !out_profile) return CUDA_SAM3D_E_INVAL;
+    *out_profile = ctx->profile;
+    return CUDA_SAM3D_E_OK;
+}
+
 /* ===== inputs ===== */
 
 int cuda_sam3d_set_image_rgba(cuda_sam3d_ctx *ctx, const uint8_t *rgba,
                               int width, int height) {
+    double t0 = cs3d_time_ms();
     if (!ctx || !rgba || width <= 0 || height <= 0) return CUDA_SAM3D_E_INVAL;
     free(ctx->img_rgba);
     size_t n = (size_t)width * height * 4;
@@ -577,11 +600,13 @@ int cuda_sam3d_set_image_rgba(cuda_sam3d_ctx *ctx, const uint8_t *rgba,
     if (!ctx->img_rgba) return CUDA_SAM3D_E_LOAD;
     memcpy(ctx->img_rgba, rgba, n);
     ctx->img_w = width; ctx->img_h = height;
+    ctx->profile.set_image_ms = cs3d_time_ms() - t0;
     return CUDA_SAM3D_E_OK;
 }
 
 int cuda_sam3d_set_mask(cuda_sam3d_ctx *ctx, const uint8_t *mask,
                         int width, int height) {
+    double t0 = cs3d_time_ms();
     if (!ctx || !mask || width <= 0 || height <= 0) return CUDA_SAM3D_E_INVAL;
     free(ctx->mask_u8);
     size_t n = (size_t)width * height;
@@ -589,11 +614,13 @@ int cuda_sam3d_set_mask(cuda_sam3d_ctx *ctx, const uint8_t *mask,
     if (!ctx->mask_u8) return CUDA_SAM3D_E_LOAD;
     memcpy(ctx->mask_u8, mask, n);
     ctx->msk_w = width; ctx->msk_h = height;
+    ctx->profile.set_mask_ms = cs3d_time_ms() - t0;
     return CUDA_SAM3D_E_OK;
 }
 
 int cuda_sam3d_set_pointmap(cuda_sam3d_ctx *ctx, const float *pmap,
                             int width, int height) {
+    double t0 = cs3d_time_ms();
     if (!ctx || !pmap || width <= 0 || height <= 0) return CUDA_SAM3D_E_INVAL;
     free(ctx->pmap_f32);
     size_t n = (size_t)width * height * 3;
@@ -601,6 +628,7 @@ int cuda_sam3d_set_pointmap(cuda_sam3d_ctx *ctx, const float *pmap,
     if (!ctx->pmap_f32) return CUDA_SAM3D_E_LOAD;
     memcpy(ctx->pmap_f32, pmap, n * sizeof(float));
     ctx->pmap_w = width; ctx->pmap_h = height;
+    ctx->profile.set_pointmap_ms = cs3d_time_ms() - t0;
     return CUDA_SAM3D_E_OK;
 }
 
@@ -670,6 +698,7 @@ static float *cs3d_gpu_dinov2_encode_branch(cuda_sam3d_ctx *ctx,
 }
 
 int cuda_sam3d_run_dinov2(cuda_sam3d_ctx *ctx) {
+    double t0 = cs3d_time_ms();
     if (!ctx) return CUDA_SAM3D_E_INVAL;
     if (!ctx->img_rgba) return CUDA_SAM3D_E_NO_INPUT;
 
@@ -746,7 +775,10 @@ int cuda_sam3d_run_dinov2(cuda_sam3d_ctx *ctx) {
                (size_t)n_per * dim * sizeof(float));
     }
     free(feat_img); free(feat_msk);
-    return cs3d_adopt_dinov2_tokens(ctx, feats, n_total, dim);
+    int rc = cs3d_adopt_dinov2_tokens(ctx, feats, n_total, dim);
+    ctx->profile.dinov2_ms = cs3d_time_ms() - t0;
+    if (rc == CUDA_SAM3D_E_OK) ctx->profile.dinov2_tokens = n_total;
+    return rc;
 }
 /* Active dinov2 source: prefer override (verify_*.c injects ref data
  * via cuda_sam3d_debug_override_dinov2) so a single verify can isolate
@@ -756,25 +788,27 @@ static const cs3d_host_2d *cs3d_active_dinov2(const cuda_sam3d_ctx *ctx)
     return ctx->ovr_dinov2.data ? &ctx->ovr_dinov2 : &ctx->dinov2_tokens;
 }
 
-static int cs3d_adopt_cond_tokens(cuda_sam3d_ctx *ctx, float *feats,
-                                  int n, int c)
+static int cs3d_adopt_cond_tokens_device(cuda_sam3d_ctx *ctx, float *feats,
+                                         int n, int c, CUdeviceptr d_feats)
 {
     cs3d_free_2d(&ctx->cond_tokens);
-    if (ctx->d_cond_tokens) {
+    if (ctx->d_cond_tokens && ctx->d_cond_tokens != d_feats)
         cuMemFree(ctx->d_cond_tokens);
-        ctx->d_cond_tokens = 0;
+    ctx->d_cond_tokens = 0;
+    if (!feats || n <= 0 || c <= 0 || !d_feats) {
+        free(feats);
+        if (d_feats) cuMemFree(d_feats);
+        return CUDA_SAM3D_E_INVAL;
     }
-    if (!feats || n <= 0 || c <= 0) return CUDA_SAM3D_E_INVAL;
-    size_t bytes = (size_t)n * c * sizeof(float);
-    ctx->d_cond_tokens = cu_upload_raw(feats, bytes);
-    if (!ctx->d_cond_tokens) { free(feats); return CUDA_SAM3D_E_LOAD; }
     ctx->cond_tokens.data = feats;
     ctx->cond_tokens.n    = n;
     ctx->cond_tokens.c    = c;
+    ctx->d_cond_tokens    = d_feats;
     return CUDA_SAM3D_E_OK;
 }
 
 int cuda_sam3d_run_cond_fuser(cuda_sam3d_ctx *ctx) {
+    double t0 = cs3d_time_ms();
     if (!ctx) return CUDA_SAM3D_E_INVAL;
     const cs3d_host_2d *dino = cs3d_active_dinov2(ctx);
     if (!dino->data) {
@@ -925,16 +959,20 @@ int cuda_sam3d_run_cond_fuser(cuda_sam3d_ctx *ctx) {
     cuMemcpyDtoH(feats, d_cond, (size_t)n_total * Do * sizeof(float));
     if (d_dino) cuMemFree(d_dino);
     if (d_ppe)  cuMemFree(d_ppe);
-    cuMemFree(d_cond);
 
     (void)nthr;
-    return cs3d_adopt_cond_tokens(ctx, feats, n_total, Do);
+    int rc = cs3d_adopt_cond_tokens_device(ctx, feats, n_total, Do, d_cond);
+    d_cond = 0;
+    ctx->profile.cond_fuser_ms = cs3d_time_ms() - t0;
+    if (rc == CUDA_SAM3D_E_OK) ctx->profile.cond_tokens = n_total;
+    return rc;
 
 fuser_fail:
     if (d_dino) cuMemFree(d_dino);
     if (d_ppe)  cuMemFree(d_ppe);
     if (d_cond) cuMemFree(d_cond);
     fprintf(stderr, "cuda_sam3d: GPU fuser projection failed\n");
+    if (ctx) ctx->profile.cond_fuser_ms = cs3d_time_ms() - t0;
     return CUDA_SAM3D_E_LOAD;
 }
 /* Active cond source: prefer override (verify_*.c injects ref data). */
@@ -1002,6 +1040,7 @@ static void cs3d_ode_fill_randn(float *buf, int n, uint64_t *state) {
 }
 
 int cuda_sam3d_run_ss_dit(cuda_sam3d_ctx *ctx) {
+    double t0 = cs3d_time_ms();
     if (!ctx) return CUDA_SAM3D_E_INVAL;
     const cs3d_host_2d *cond = cs3d_active_cond(ctx);
     if (!cond->data) {
@@ -1129,12 +1168,17 @@ int cuda_sam3d_run_ss_dit(cuda_sam3d_ctx *ctx) {
                 "cuda_sam3d: ss_dit latent min=%.6g max=%.6g mean=%.6g d=%.3g rescale_t=3 reversed=0 cfg_steps=%d\n",
                 mn, mx, sum / (8.0 * 4096.0), d, cfg_steps);
     }
-    return cs3d_adopt_ss_latent(ctx, latent, dims);
+    rc = cs3d_adopt_ss_latent(ctx, latent, dims);
+    ctx->profile.ss_dit_ms = cs3d_time_ms() - t0;
+    ctx->profile.ss_steps = steps;
+    ctx->profile.cfg_steps = cfg_steps;
+    return rc;
 
 oom:
     for (int i = 0; i < SAM3D_SS_DIT_N_LATENTS; i++) {
         free(lat[i]); free(vel[i]); free(vel_u[i]);
     }
+    if (ctx) ctx->profile.ss_dit_ms = cs3d_time_ms() - t0;
     return CUDA_SAM3D_E_LOAD;
 }
 
@@ -1229,25 +1273,30 @@ static const cs3d_host_nd *cs3d_active_ss_latent(const cuda_sam3d_ctx *ctx)
     return ctx->ovr_ss_latent.data ? &ctx->ovr_ss_latent : &ctx->ss_latent;
 }
 
-static int cs3d_adopt_occupancy(cuda_sam3d_ctx *ctx, float *data,
-                                const int dims[3])
+static int cs3d_adopt_occupancy_device(cuda_sam3d_ctx *ctx, float *data,
+                                       const int dims[3],
+                                       CUdeviceptr d_data)
 {
     cs3d_free_nd(&ctx->occupancy);
-    if (ctx->d_occupancy) { cuMemFree(ctx->d_occupancy); ctx->d_occupancy = 0; }
-    if (!data) return CUDA_SAM3D_E_INVAL;
-    size_t numel = 1;
+    if (ctx->d_occupancy && ctx->d_occupancy != d_data)
+        cuMemFree(ctx->d_occupancy);
+    ctx->d_occupancy = 0;
+    if (!data || !d_data) {
+        free(data);
+        if (d_data) cuMemFree(d_data);
+        return CUDA_SAM3D_E_INVAL;
+    }
     for (int i = 0; i < 3; i++) {
-        if (dims[i] <= 0) { free(data); return CUDA_SAM3D_E_INVAL; }
+        if (dims[i] <= 0) {
+            free(data);
+            cuMemFree(d_data);
+            return CUDA_SAM3D_E_INVAL;
+        }
         ctx->occupancy.dims[i] = dims[i];
-        numel *= (size_t)dims[i];
     }
     ctx->occupancy.ndim = 3;
     ctx->occupancy.data = data;
-    ctx->d_occupancy = cu_upload_raw(data, numel * sizeof(float));
-    if (!ctx->d_occupancy) {
-        cs3d_free_nd(&ctx->occupancy);
-        return CUDA_SAM3D_E_LOAD;
-    }
+    ctx->d_occupancy = d_data;
     return CUDA_SAM3D_E_OK;
 }
 
@@ -1284,6 +1333,7 @@ static int cs3d_ensure_ssdec_gpu(cuda_sam3d_ctx *ctx)
 }
 
 int cuda_sam3d_run_ss_decode(cuda_sam3d_ctx *ctx) {
+    double t0 = cs3d_time_ms();
     if (!ctx) return CUDA_SAM3D_E_INVAL;
     const cs3d_host_nd *lat = cs3d_active_ss_latent(ctx);
     if (!lat->data) {
@@ -1302,28 +1352,34 @@ int cuda_sam3d_run_ss_decode(cuda_sam3d_ctx *ctx) {
     if (rc != CUDA_SAM3D_E_OK) return rc;
 
     CUdeviceptr d_lat = 0, d_out = 0;
+    int own_d_lat = 0;
     size_t lat_bytes = (size_t)8 * 16 * 16 * 16 * sizeof(float);
-    d_lat = cu_upload_raw(lat->data, lat_bytes);
+    if (lat == &ctx->ss_latent && ctx->d_ss_latent) {
+        d_lat = ctx->d_ss_latent;
+    } else {
+        d_lat = cu_upload_raw(lat->data, lat_bytes);
+        own_d_lat = 1;
+    }
     if (!d_lat) return CUDA_SAM3D_E_LOAD;
     if (cuMemAlloc(&d_out, (size_t)64 * 64 * 64 * sizeof(float)) != CUDA_SUCCESS) {
-        cuMemFree(d_lat);
+        if (own_d_lat) cuMemFree(d_lat);
         return CUDA_SAM3D_E_LOAD;
     }
     if (cs3d_ssdec_forward(&ctx->gpu_ssdec, &ctx->gpu_ssdec_fns,
                            &ctx->gpu_ssdec_ws, d_lat, d_out,
                            ctx->cfg.verbose) < 0) {
         fprintf(stderr, "cuda_sam3d: gpu ss_decoder forward failed\n");
-        cuMemFree(d_lat); cuMemFree(d_out);
+        if (own_d_lat) cuMemFree(d_lat);
+        cuMemFree(d_out);
         return CUDA_SAM3D_E_LOAD;
     }
-    cuMemFree(d_lat);
+    if (own_d_lat) cuMemFree(d_lat);
 
     float *logits = (float *)malloc((size_t)64 * 64 * 64 * sizeof(float));
     if (!logits) { cuMemFree(d_out); return CUDA_SAM3D_E_LOAD; }
     if (cuMemcpyDtoH(logits, d_out, (size_t)64 * 64 * 64 * sizeof(float)) != CUDA_SUCCESS) {
         free(logits); cuMemFree(d_out); return CUDA_SAM3D_E_LOAD;
     }
-    cuMemFree(d_out);
     if (ctx->cfg.verbose >= 1) {
         float mn = logits[0], mx = logits[0];
         double sum = 0.0;
@@ -1340,7 +1396,10 @@ int cuda_sam3d_run_ss_decode(cuda_sam3d_ctx *ctx) {
                 mn, mx, sum / (64.0 * 64.0 * 64.0), pos);
     }
     const int dims[3] = {64, 64, 64};
-    return cs3d_adopt_occupancy(ctx, logits, dims);
+    rc = cs3d_adopt_occupancy_device(ctx, logits, dims, d_out);
+    d_out = 0;
+    ctx->profile.ss_decode_ms = cs3d_time_ms() - t0;
+    return rc;
 }
 /* Active occupancy source: prefer override. */
 static const cs3d_host_nd *cs3d_active_occupancy(const cuda_sam3d_ctx *ctx)
@@ -2815,6 +2874,7 @@ static int cs3d_slat_argwhere_gpu(cuda_sam3d_ctx *ctx, const cs3d_host_nd *occ,
 }
 
 int cuda_sam3d_run_slat_dit(cuda_sam3d_ctx *ctx) {
+    double t0 = cs3d_time_ms();
     if (!ctx) return CUDA_SAM3D_E_INVAL;
     const cs3d_host_2d *cond = cs3d_active_cond(ctx);
     if (!cond->data) {
@@ -2850,6 +2910,8 @@ int cuda_sam3d_run_slat_dit(cuda_sam3d_ctx *ctx) {
         fprintf(stderr, "cuda_sam3d: slat_dit active voxels=%d (gpu argwhere occ>0), steps=%d\n",
                 active_voxels, steps);
     }
+    ctx->profile.active_voxels = active_voxels;
+    ctx->profile.slat_steps = steps;
     if (active_voxels <= 0) {
         fprintf(stderr, "cuda_sam3d: slat_dit occupancy is fully negative\n");
         free(active_coords);
@@ -2884,6 +2946,7 @@ int cuda_sam3d_run_slat_dit(cuda_sam3d_ctx *ctx) {
                                 adopt_d_coords, adopt_d_feats,
                                 adopt_d_feats ? 1 : 0);
     if (active_d_coords) cuMemFree(active_d_coords);
+    ctx->profile.slat_dit_ms = cs3d_time_ms() - t0;
     return rc;
 }
 
@@ -4247,6 +4310,7 @@ int cuda_sam3d_debug_slat_gs_pack_ply(cuda_sam3d_ctx *ctx,
 }
 
 int cuda_sam3d_run_slat_gs_decode(cuda_sam3d_ctx *ctx) {
+    double t0 = cs3d_time_ms();
     if (!ctx) return CUDA_SAM3D_E_INVAL;
     const cs3d_host_slat *slat = cs3d_active_slat(ctx);
     if (!slat->feats || !slat->coords) {
@@ -4297,7 +4361,10 @@ int cuda_sam3d_run_slat_gs_decode(cuda_sam3d_ctx *ctx) {
         free(ply);
         return CUDA_SAM3D_E_LOAD;
     }
-    return cs3d_adopt_gaussians(ctx, ply, packed_total);
+    rc = cs3d_adopt_gaussians(ctx, ply, packed_total);
+    ctx->profile.slat_gs_ms = cs3d_time_ms() - t0;
+    if (rc == CUDA_SAM3D_E_OK) ctx->profile.gaussians = packed_total;
+    return rc;
 }
 
 /* ===== read-back stubs ===== */

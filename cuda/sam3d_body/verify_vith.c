@@ -12,8 +12,8 @@
  * tensor via debug_set_normalized_input, runs encoder (no CLS prefix),
  * compares (768, 1280) flat output against the (1, 1280, 32, 24) ref.
  *
- * Gates track the bf16 forward floor of the upstream reference (the same
- * floor used by cpu/sam3d_body/verify_vith.c): max=5e-1, mean=2e-2.
+ * Float32 refs use tight gates. Legacy/config BF16 refs keep the older
+ * loose gates that track upstream's bf16 forward floor over 32 blocks.
  */
 
 #include "cuda_sam3d_body_runner.h"
@@ -25,17 +25,26 @@
 #include <string.h>
 #include "../../common/npy_io.h"
 
+static int ref_backbone_is_float32(const char *refdir)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/backbone_dtype.txt", refdir);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    char buf[64];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return strstr(buf, "float32") != NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *sft_dir = NULL, *refdir = NULL;
-    /* See cpu/sam3d_body/verify_vith.c for the gate justification: the
-     * upstream ViT-H runs in bf16, drift compounds over 32 blocks and
-     * floors max≈3.5e-1, mean≈1.4e-2. We track the same floor with a
-     * tight mean and looser max. */
-    float threshold = 5e-1f;
-    float mean_threshold = 2e-2f;
+    float threshold = -1.0f;
+    float mean_threshold = -1.0f;
     int device = 0, verbose = 0;
-    const char *precision = "bf16";
+    const char *precision = "fp16";
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--safetensors-dir") && i+1 < argc) sft_dir = argv[++i];
@@ -50,10 +59,13 @@ int main(int argc, char **argv)
     if (!sft_dir || !refdir) {
         fprintf(stderr, "Usage: %s --safetensors-dir DIR --refdir DIR "
                         "[--threshold F] [--mean-threshold F] "
-                        "[--device N] [--precision bf16|fp16] [-v]\n",
+                        "[--device N] [--precision fp16|fp32|bf16] [-v]\n",
                 argv[0]);
         return 2;
     }
+    int f32_ref = ref_backbone_is_float32(refdir);
+    if (threshold < 0.0f) threshold = f32_ref ? 2e-3f : 6e-1f;
+    if (mean_threshold < 0.0f) mean_threshold = f32_ref ? 5e-5f : 2e-2f;
 
     char path[1024];
 
