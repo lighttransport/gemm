@@ -159,18 +159,40 @@ Read the **G mma/s** column (instruction issue rate), not just TOP/s:
 (Absolute BF16 ~51 TFLOP/s reflects GeForce's halved FP32-accumulate tensor rate; the *ratios*
 are the clean signal.)
 
-### 4.3 INT4 is emulated — SASS proof
+### 4.3 SASS evidence — FP4 is one native op, INT4 is emulated
 
-Compiling a single `s4`/`s8` mma each with `nvcc -arch=sm_120a -cubin` and dumping SASS
-(`cuobjdump --dump-sass`):
+Compiling single mmas with `nvcc -arch=sm_120a -cubin` and dumping SASS
+(`cuobjdump --dump-sass`) shows the actual tensor-core opcode per format:
 
-- **INT8 `s8` mma → 1× `IMMA.16832.S8.S8`** — one native tensor-core instruction.
-- **INT4 `s4` mma → 2× `IMMA.16832.S8.S8` + ~180 ALU ops** (90 `LOP3.LUT`, 48 `SHF`, 36
-  `IMAD.SHL`, 10 `IADD`, …). ptxas unpacks the 4-bit values and feeds them through the **INT8**
-  tensor core twice. There is no native `s4` datapath — Turing/Ampere had one
-  (`IMMA.8816.S4` etc.); Blackwell dropped it.
+| PTX mma | SASS tensor op(s) | total SASS instrs | verdict |
+|---------|-------------------|------------------:|---------|
+| `…e2m1…block_scale…ue4m3` (NVFP4) | **1× `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`** | 32 | **native** |
+| `…s8.s8…` m16n8k32 (INT8) | **1× `IMMA.16832.S8.S8`** | — | native |
+| `…s4.s4…` m16n8k64 (INT4) | **2× `IMMA.16832.S8.S8`** + ~180 ALU | 224 | **emulated** |
+| `…s4.s4…` m16n8k32 (INT4) | **2× `IMMA.16816.S8.S8`** + ALU | 128 | **emulated** |
 
-That ~90× instruction blow-up is exactly the measured ~19× issue-rate slowdown vs INT8.
+- FP4 maps to a *single* native block-scaled tensor-core op `OMMA.SF…E2M1…` (`.SF` =
+  scale-factor; `16864` = m16n8k64; `4X` = scale_vec). Real silicon.
+- *Both* INT4 shapes lower to **INT8** `IMMA` ops (2×) plus ~180 `LOP3`/`SHF`/`IMAD` ops that
+  unpack 4-bit → 8-bit. **No `IMMA.*.S4` opcode is emitted for sm_120 at all** — Turing/Ampere
+  had one, Blackwell dropped it. The ~90× instruction blow-up is the measured ~19× slowdown.
+
+### 4.4 Would a direct PTX / SASS path help INT4? No.
+
+A natural follow-up: if inline-asm INT4 got emulated, can a hand-written PTX (or SASS) kernel
+force the native path? **No** — the emulation is not a frontend artifact:
+
+1. `nvcc -arch=sm_120a -ptx` emits the PTX **verbatim**: it literally contains
+   `mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32`. The CUDA-C frontend does *not* emulate.
+2. Feeding that exact PTX straight to **`ptxas -arch=sm_120a`** produces the same
+   `2× IMMA.S8 + unpack` SASS. **ptxas is the lowering stage** that emulates — so a hand-written
+   PTX with the identical instruction is byte-for-byte identical.
+3. Below PTX is only SASS, and (a) there is no public SASS assembler, and (b) sm_120 exposes no
+   native `IMMA.*.S4` opcode to target anyway. The INT4 limitation is in **silicon**, surfaced
+   at the ptxas stage; no software layer recovers it.
+
+FP4 needs no such path — it is already a single native `OMMA` regardless of route (inline asm,
+hand PTX, or direct `ptxas`).
 
 ### 4.2 `cublas_fp4_gemm`
 
