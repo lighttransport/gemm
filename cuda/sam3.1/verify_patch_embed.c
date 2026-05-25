@@ -1,9 +1,8 @@
-/* Compare HIP Phase 1 (preprocess + patch_embed + pos_embed + pre-LN)
- * against /tmp/sam3_ref_<img>/vit_embed.npy. Uses the ref dump's
+/* Compare patch_embed + learned pos_embed against the PyTorch ref dump's
  * input_pixel_values.npy for bit-close comparison (bypasses stb resize
  * vs PIL BILINEAR mismatch).
  *
- * Usage: verify_patch_embed --ckpt <...> --refdir /tmp/sam3_ref_cat
+ * Usage: verify_patch_embed --ckpt <...> --refdir /tmp/sam3.1_ref
  */
 #include "cuda_sam3_1_runner.h"
 
@@ -75,12 +74,17 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "ours: (%d, %d)\n", n_tok, D);
 
-    /* sam3.1 has no learned pos_embed; Phase 1 output is patch_embed only
-     * (conv 14×14 stride 14). ln_pre is applied downstream inside the ViT
-     * loop. Ref is (1, 72, 72, 1024) HWC; ours is (5184, 1024) row-major
-     * which matches H*W flatten. */
-    snprintf(path, sizeof(path), "%s/patch_embed.npy", refdir);
+    /* Ref is (1, 72, 72, 1024) HWC; ours is (5184, 1024) row-major which
+     * matches H*W flatten. New refs write patch_pos.npy. Older refs only
+     * have patch_embed.npy and will include the expected pos-embed delta. */
+    snprintf(path, sizeof(path), "%s/patch_pos.npy", refdir);
     float *ref = (float *)read_npy(path, &nd, dims, &esz);
+    const char *label = "patch_pos";
+    if (!ref) {
+        snprintf(path, sizeof(path), "%s/patch_embed.npy", refdir);
+        ref = (float *)read_npy(path, &nd, dims, &esz);
+        label = "patch_embed";
+    }
     if (!ref) {
         fprintf(stderr, "no ref %s — dumping ours[0][:8] only\n", path);
         for (int i = 0; i < 8; i++) fprintf(stderr, "  %.6f\n", ours[i]);
@@ -92,8 +96,8 @@ int main(int argc, char **argv)
             if (d > mx) mx = d;
             sum += d;
         }
-        fprintf(stderr, "patch_embed: max_abs=%.3e mean_abs=%.3e\n",
-                mx, sum / (double)n);
+        fprintf(stderr, "%s: max_abs=%.3e mean_abs=%.3e\n",
+                label, mx, sum / (double)n);
         free(ref);
     }
 
