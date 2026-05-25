@@ -523,18 +523,20 @@ flux2_text_enc *flux2_text_enc_load_gpu(const char *model_path,
     cuda_llm_runner *gpu_model = cuda_llm_init(gpu_device, 1);
     if (!gpu_model) { bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL; }
 
+    const int flux2_text_enc_max_seq = 512;
+
     if (is_gguf) {
         gguf_context *model_gguf = gguf_open(model_path, 1);
         if (!model_gguf) {
             cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
         }
-        if (cuda_llm_load_weights(gpu_model, model_gguf, 2048) != 0) {
+        if (cuda_llm_load_weights(gpu_model, model_gguf, flux2_text_enc_max_seq) != 0) {
             gguf_close(model_gguf);
             cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
         }
         gguf_close(model_gguf);
     } else {
-        if (cuda_llm_load_weights_qwen3_safetensors(gpu_model, model_path, 2048) != 0) {
+        if (cuda_llm_load_weights_qwen3_safetensors(gpu_model, model_path, flux2_text_enc_max_seq) != 0) {
             cuda_llm_free(gpu_model); bpe_vocab_free(vocab); gguf_close(tok_gguf); return NULL;
         }
     }
@@ -758,7 +760,11 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
         /* GPU path: capture the same intermediate hidden states as the CPU
          * reference after layers 8, 17, and 26. */
         cuda_llm_runner *gpu = (cuda_llm_runner *)enc->model;
-        cuda_llm_reset_state(gpu);
+        if (cuda_llm_reset_state(gpu) != 0) {
+            fprintf(stderr, "flux2_text_enc: cuda_llm_reset_state failed\n");
+            free(hidden);
+            return NULL;
+        }
         for (int i = 0; i < n_tok; i++) {
             float *dst = hidden + (size_t)i * n_out;
             if (!cuda_llm_forward(gpu, toks[i], i)) {

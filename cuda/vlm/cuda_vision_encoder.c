@@ -99,6 +99,25 @@ static const char *cuda_vlm_specific_kernels =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- patch_im2col_f32: gather patches into [n_patches, ps*ps*3] for a GEMM ---- */\n"
+"/* Replaces the uncoalesced patch_embed_dual_f32 kernel: build the im2col matrix here  */\n"
+"/* (coalesced writes), then out = patch_pix . (w0+w1)^T via cuBLAS.                    */\n"
+"/* Grid: (n_patches), Block: (256). ki = c*ps*ps + ky*ps + kx (matches conv weight).   */\n"
+"__global__ void patch_im2col_f32(float *cols, const float *rgb,\n"
+"                                 int gw, int ps, int img_w) {\n"
+"    int patch = blockIdx.x;\n"
+"    int py = patch / gw, px = patch % gw;\n"
+"    int ks = ps * ps * 3;\n"
+"    float *dst = cols + (size_t)patch * ks;\n"
+"    for (int ki = threadIdx.x; ki < ks; ki += blockDim.x) {\n"
+"        int c = ki / (ps * ps);\n"
+"        int rem = ki - c * ps * ps;\n"
+"        int ky = rem / ps, kx = rem % ps;\n"
+"        int iy = py * ps + ky, ix = px * ps + kx;\n"
+"        dst[ki] = rgb[((size_t)iy * img_w + ix) * 3 + c];\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- add_pos_embd: add position embeddings via indirection map ---- */\n"
 "/* Grid: (n_patches), Block: (256) */\n"
 "__global__ void add_pos_embd(float *hidden, const float *pos_emb,\n"
@@ -121,28 +140,34 @@ static const char *cuda_vlm_specific_kernels =
 "}\n"
 "\n"
 "/* ---- rope_vision_f32: M-RoPE on Q and K ---- */\n"
-"/* Grid: (n_patches * n_heads), Block: (half_dim) */\n"
+"/* Grid-stride over (p,h,i) rotation pairs; block 256. (The old launch used   */\n"
+"/* head_dim/2 == 36 threads/block over n_patches*n_heads blocks, which wastes  */\n"
+"/* the 2nd warp and pins occupancy to the per-SM block limit -> it ran ~3x     */\n"
+"/* slower than an equal-volume layernorm and scaled ~5x for 2.25x tokens.)     */\n"
 "__global__ void rope_vision_f32(float *qkv, const float *rope_cos,\n"
 "                                  const float *rope_sin,\n"
 "                                  int n_patches, int n_heads,\n"
 "                                  int dim, int head_dim, int half) {\n"
-"    int idx = blockIdx.x;\n"
-"    int p = idx / n_heads;\n"
-"    int h = idx % n_heads;\n"
-"    int i = threadIdx.x;\n"
-"    if (i >= half) return;\n"
-"    float cos_t = rope_cos[p * head_dim + 2 * i];\n"
-"    float sin_t = rope_sin[p * head_dim + 2 * i];\n"
-"    /* Q */\n"
-"    float *q = qkv + p * 3 * dim + h * head_dim;\n"
-"    float q0 = q[i], q1 = q[i + half];\n"
-"    q[i]        = q0 * cos_t - q1 * sin_t;\n"
-"    q[i + half] = q0 * sin_t + q1 * cos_t;\n"
-"    /* K */\n"
-"    float *k = qkv + p * 3 * dim + dim + h * head_dim;\n"
-"    float k0 = k[i], k1 = k[i + half];\n"
-"    k[i]        = k0 * cos_t - k1 * sin_t;\n"
-"    k[i + half] = k0 * sin_t + k1 * cos_t;\n"
+"    long total = (long)n_patches * n_heads * half;\n"
+"    for (long gid = (long)blockIdx.x * blockDim.x + threadIdx.x; gid < total;\n"
+"         gid += (long)gridDim.x * blockDim.x) {\n"
+"        int i = (int)(gid % half);\n"
+"        long t = gid / half;\n"
+"        int h = (int)(t % n_heads);\n"
+"        int p = (int)(t / n_heads);\n"
+"        float cos_t = rope_cos[p * head_dim + 2 * i];\n"
+"        float sin_t = rope_sin[p * head_dim + 2 * i];\n"
+"        /* Q */\n"
+"        float *q = qkv + (long)p * 3 * dim + h * head_dim;\n"
+"        float q0 = q[i], q1 = q[i + half];\n"
+"        q[i]        = q0 * cos_t - q1 * sin_t;\n"
+"        q[i + half] = q0 * sin_t + q1 * cos_t;\n"
+"        /* K */\n"
+"        float *k = q + dim;\n"
+"        float k0 = k[i], k1 = k[i + half];\n"
+"        k[i]        = k0 * cos_t - k1 * sin_t;\n"
+"        k[i + half] = k0 * sin_t + k1 * cos_t;\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- attn_full_f32: Full NxN self-attention per head ---- */\n"
@@ -303,6 +328,515 @@ static const char *cuda_vlm_specific_kernels =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- flash_attn_f32: online-softmax flash attention (full, non-windowed). ---- */\n"
+"/* Replaces attn_full_f32's 16-block serial loop. One warp per query; K/V tiled into  */\n"
+"/* shared memory and reused across the FA_WARPS queries in a block.                    */\n"
+"/* Grid: (ceil(n_patches/FA_WARPS), n_heads).  Block: FA_WARPS*32 threads.             */\n"
+"/* Dynamic shared mem: 2*FA_TILE_K*head_dim floats (K tile + V tile).                  */\n"
+"#define FA_WARPS 16\n"
+"#define FA_TILE_K 16\n"
+"#define FA_MAXREG 4\n"
+"__global__ void flash_attn_f32(float *out, const float *qkv,\n"
+"                               int n_patches, int dim, int n_heads,\n"
+"                               int head_dim, float scale) {\n"
+"    extern __shared__ float smem[];\n"
+"    float *ksh = smem;\n"
+"    float *vsh = smem + FA_TILE_K * head_dim;\n"
+"    int warp = threadIdx.x >> 5;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int h = blockIdx.y;\n"
+"    int qi = blockIdx.x * FA_WARPS + warp;\n"
+"    int dim3 = 3 * dim;\n"
+"    int nreg = (head_dim + 31) >> 5;\n"
+"    int n_threads = FA_WARPS * 32;\n"
+"    int valid = (qi < n_patches);\n"
+"    float q[FA_MAXREG], acc[FA_MAXREG];\n"
+"    #pragma unroll\n"
+"    for (int r = 0; r < FA_MAXREG; r++) { q[r] = 0.0f; acc[r] = 0.0f; }\n"
+"    if (valid) {\n"
+"        const float *q_h = qkv + (size_t)qi * dim3 + h * head_dim;\n"
+"        for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); if (d < head_dim) q[r] = q_h[d]; }\n"
+"    }\n"
+"    float m = -1e30f, l = 0.0f;\n"
+"    for (int kt = 0; kt < n_patches; kt += FA_TILE_K) {\n"
+"        int tk = n_patches - kt; if (tk > FA_TILE_K) tk = FA_TILE_K;\n"
+"        for (int idx = threadIdx.x; idx < tk * head_dim; idx += n_threads) {\n"
+"            int j = idx / head_dim; int d = idx - j * head_dim;\n"
+"            const float *base = qkv + (size_t)(kt + j) * dim3 + h * head_dim;\n"
+"            ksh[idx] = base[dim + d];\n"
+"            vsh[idx] = base[2 * dim + d];\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (valid) {\n"
+"            for (int j = 0; j < tk; j++) {\n"
+"                const float *kj = ksh + j * head_dim;\n"
+"                float partial = 0.0f;\n"
+"                for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); if (d < head_dim) partial += q[r] * kj[d]; }\n"
+"                #pragma unroll\n"
+"                for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, off);\n"
+"                float score = partial * scale;\n"
+"                float m_new = m > score ? m : score;\n"
+"                float corr = __expf(m - m_new);\n"
+"                float p = __expf(score - m_new);\n"
+"                l = l * corr + p;\n"
+"                const float *vj = vsh + j * head_dim;\n"
+"                for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); acc[r] = acc[r] * corr + (d < head_dim ? p * vj[d] : 0.0f); }\n"
+"                m = m_new;\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (valid) {\n"
+"        float inv = (l > 0.0f) ? 1.0f / l : 0.0f;\n"
+"        float *o = out + (size_t)qi * dim + h * head_dim;\n"
+"        for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); if (d < head_dim) o[d] = acc[r] * inv; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- attn_window_warp_f32: windowed attention, ONE WARP PER QUERY.            */\n"
+"/* Replaces attn_window_f32's serial-query + full-block-reduction design (which   */\n"
+"/* did ~16 __syncthreads per query with most threads idle). Online softmax over   */\n"
+"/* the window's keys; q/acc kept in regs (3/lane for head_dim=72); scores reduced */\n"
+"/* with __shfl_xor_sync. The window's K/V are staged into shared memory once per   */\n"
+"/* block so the WW_WARPS warps don't re-read them from global per query.           */\n"
+"/* Grid: (n_windows, n_heads). Block: WW_WARPS*32. Dyn smem: 2*max_win*head_dim.   */\n"
+"#define WW_WARPS 12  /* 36-token windows -> 3 queries/warp, balanced (swept) */\n"
+"__global__ void attn_window_warp_f32(float *out, const float *qkv,\n"
+"                                     const int *win_start, const int *win_size,\n"
+"                                     int dim, int n_heads, int head_dim, float scale) {\n"
+"    extern __shared__ float wsmem[];\n"
+"    int w = blockIdx.x;\n"
+"    int h = blockIdx.y;\n"
+"    int start = win_start[w];\n"
+"    int size = win_size[w];\n"
+"    if (size <= 0) return;\n"
+"    int warp = threadIdx.x >> 5;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int dim3 = 3 * dim;\n"
+"    int nreg = (head_dim + 31) >> 5;\n"
+"    float *ksh = wsmem;\n"
+"    float *vsh = wsmem + size * head_dim;\n"
+"    for (int idx = threadIdx.x; idx < size * head_dim; idx += blockDim.x) {\n"
+"        int kl = idx / head_dim; int d = idx - kl * head_dim;\n"
+"        const float *base = qkv + (size_t)(start + kl) * dim3 + h * head_dim;\n"
+"        ksh[idx] = base[dim + d];\n"
+"        vsh[idx] = base[2 * dim + d];\n"
+"    }\n"
+"    __syncthreads();\n"
+"    for (int ql = warp; ql < size; ql += WW_WARPS) {\n"
+"        int qi = start + ql;\n"
+"        const float *q_h = qkv + (size_t)qi * dim3 + h * head_dim;\n"
+"        float q[4], acc[4];\n"
+"        for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); q[r] = (d < head_dim) ? q_h[d] : 0.0f; acc[r] = 0.0f; }\n"
+"        float m = -1e30f, l = 0.0f;\n"
+"        for (int kl = 0; kl < size; kl++) {\n"
+"            const float *kj = ksh + kl * head_dim;\n"
+"            float partial = 0.0f;\n"
+"            for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); if (d < head_dim) partial += q[r] * kj[d]; }\n"
+"            for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, off);\n"
+"            float score = partial * scale;\n"
+"            float m_new = m > score ? m : score;\n"
+"            float corr = __expf(m - m_new);\n"
+"            float p = __expf(score - m_new);\n"
+"            l = l * corr + p;\n"
+"            const float *vj = vsh + kl * head_dim;\n"
+"            for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); acc[r] = acc[r] * corr + (d < head_dim ? p * vj[d] : 0.0f); }\n"
+"            m = m_new;\n"
+"        }\n"
+"        float inv = (l > 0.0f) ? 1.0f / l : 0.0f;\n"
+"        float *o = out + (size_t)qi * dim + h * head_dim;\n"
+"        for (int r = 0; r < nreg; r++) { int d = lane + (r << 5); if (d < head_dim) o[d] = acc[r] * inv; }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- attn_window_tile_f32: windowed attention, MATERIALIZE-SCORES design.     */\n"
+"/* The warp-per-query kernel above serializes the online softmax across keys     */\n"
+"/* (one dependent __shfl_xor + __expf per key). For the tiny fixed windows here   */\n"
+"/* (<=36 tokens) it is cheaper to stage Q/K/V in shared, compute the full         */\n"
+"/* S[size,size] score matrix with NO reductions (each thread owns whole (i,j)     */\n"
+"/* dot products), softmax each row once (warp-per-row, 2 reductions), then P*V.   */\n"
+"/* This removes the per-key serial dependency entirely.                          */\n"
+"/* Grid: (n_windows, n_heads). Block: WT_THREADS. Dyn smem:                       */\n"
+"/* (3*max_win*head_dim + max_win*max_win) floats.                                 */\n"
+"#define WT_THREADS 192\n"
+"/* Q/K/V are staged in shared as F16 (half the bytes of F32). At head_dim=72,   */\n"
+"/* win<=36: F32 staging needed 3*36*72*4 + 36*36*4 = 35.4 KB/block -> only 2     */\n"
+"/* blocks/SM (smem-limited, ~25%% occ). F16 staging is 3*36*72*2 + 36*36*4 =     */\n"
+"/* 20.3 KB -> 4 blocks/SM, doubling occupancy. Dot products still accumulate in  */\n"
+"/* F32 and the score matrix / softmax stay F32; only the staged operands are     */\n"
+"/* F16 -- consistent with the materialized full-attn path (attn_extract_heads    */\n"
+"/* also stages Q/K/V as F16).                                                    */\n"
+"__global__ void attn_window_tile_f32(float *out, const float *qkv,\n"
+"                                     const int *win_start, const int *win_size,\n"
+"                                     int dim, int n_heads, int head_dim, float scale) {\n"
+"    extern __shared__ char tsmem[];\n"
+"    int w = blockIdx.x;\n"
+"    int h = blockIdx.y;\n"
+"    int start = win_start[w];\n"
+"    int size = win_size[w];\n"
+"    if (size <= 0) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nt = blockDim.x;\n"
+"    int dim3 = 3 * dim;\n"
+"    half_raw *Qs = (half_raw *)tsmem;\n"
+"    half_raw *Ks = Qs + size * head_dim;\n"
+"    half_raw *Vs = Ks + size * head_dim;\n"
+"    float *Ss = (float *)(Vs + size * head_dim);\n"  /* 3*size*head_dim halves is 4-byte aligned */
+"    for (int idx = tid; idx < size * head_dim; idx += nt) {\n"
+"        int kl = idx / head_dim; int d = idx - kl * head_dim;\n"
+"        const float *base = qkv + (size_t)(start + kl) * dim3 + h * head_dim;\n"
+"        half_raw q, k, v;\n"
+"        asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(q) : \"f\"(base[d]));\n"
+"        asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(k) : \"f\"(base[dim + d]));\n"
+"        asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(v) : \"f\"(base[2 * dim + d]));\n"
+"        Qs[idx] = q; Ks[idx] = k; Vs[idx] = v;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    int ns = size * size;\n"
+"    for (int idx = tid; idx < ns; idx += nt) {\n"
+"        int i = idx / size; int j = idx - i * size;\n"
+"        const half_raw *qi = Qs + i * head_dim;\n"
+"        const half_raw *kj = Ks + j * head_dim;\n"
+"        float s = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) s += half_to_float(qi[d]) * half_to_float(kj[d]);\n"
+"        Ss[idx] = s * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    int warp = tid >> 5; int lane = tid & 31; int nwarps = nt >> 5;\n"
+"    for (int i = warp; i < size; i += nwarps) {\n"
+"        float *srow = Ss + i * size;\n"
+"        float m = -1e30f;\n"
+"        for (int j = lane; j < size; j += 32) { float v = srow[j]; if (v > m) m = v; }\n"
+"        for (int off = 16; off > 0; off >>= 1) { float o = __shfl_xor_sync(0xffffffff, m, off); if (o > m) m = o; }\n"
+"        float sum = 0.0f;\n"
+"        for (int j = lane; j < size; j += 32) { float e = __expf(srow[j] - m); srow[j] = e; sum += e; }\n"
+"        for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);\n"
+"        float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;\n"
+"        for (int j = lane; j < size; j += 32) srow[j] *= inv;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    for (int idx = tid; idx < size * head_dim; idx += nt) {\n"
+"        int i = idx / head_dim; int d = idx - i * head_dim;\n"
+"        const float *prow = Ss + i * size;\n"
+"        float acc = 0.0f;\n"
+"        for (int j = 0; j < size; j++) acc += prow[j] * half_to_float(Vs[j * head_dim + d]);\n"
+"        out[(size_t)(start + i) * dim + h * head_dim + d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- attn_extract_heads: deinterleave qkv[N,3*dim] (post-RoPE) into          */\n"
+"/* head-contiguous F16 Q/K/V buffers [n_heads, n_patches, head_dim] for the      */\n"
+"/* tensor-core (cuBLAS) attention path. One thread per qkv element.              */\n"
+"__global__ void attn_extract_heads(half_raw *qh, half_raw *kh, half_raw *vh,\n"
+"                                   const float *qkv, int n_patches, int dim,\n"
+"                                   int n_heads, int head_dim) {\n"
+"    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    long total = (long)n_patches * 3 * dim;\n"
+"    if (idx >= total) return;\n"
+"    int d3 = 3 * dim;\n"
+"    int i = (int)(idx / d3);\n"
+"    int rem = (int)(idx - (long)i * d3);\n"
+"    int third = rem / dim;\n"
+"    int within = rem - third * dim;\n"
+"    int h = within / head_dim;\n"
+"    int dh = within - h * head_dim;\n"
+"    long dst = ((long)h * n_patches + i) * head_dim + dh;\n"
+"    float f = qkv[idx]; half_raw hr;\n"
+"    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(hr) : \"f\"(f));\n"
+"    if (third == 0) qh[dst] = hr; else if (third == 1) kh[dst] = hr; else vh[dst] = hr;\n"
+"}\n"
+"\n"
+"/* ---- attn_softmax_rows: row-wise softmax of scores[N,N] (scale folded in)     */\n"
+"/* into F16 probs[N,N]. One block per row; block-reduction over the N columns.   */\n"
+"/* Dyn smem: blockDim floats.                                                    */\n"
+"__global__ void attn_softmax_rows(half_raw *probs, const float *scores,\n"
+"                                  int n, float scale) {\n"
+"    int row = blockIdx.x;\n"
+"    const float *s = scores + (long)row * n;\n"
+"    half_raw *p = probs + (long)row * n;\n"
+"    extern __shared__ float red[];\n"
+"    int t = threadIdx.x; int nt = blockDim.x;\n"
+"    float m = -1e30f;\n"
+"    for (int j = t; j < n; j += nt) { float v = s[j] * scale; if (v > m) m = v; }\n"
+"    red[t] = m; __syncthreads();\n"
+"    for (int o = nt >> 1; o > 0; o >>= 1) { if (t < o && red[t + o] > red[t]) red[t] = red[t + o]; __syncthreads(); }\n"
+"    float row_max = red[0]; __syncthreads();\n"
+"    float sum = 0.0f;\n"
+"    for (int j = t; j < n; j += nt) sum += __expf(s[j] * scale - row_max);\n"
+"    red[t] = sum; __syncthreads();\n"
+"    for (int o = nt >> 1; o > 0; o >>= 1) { if (t < o) red[t] += red[t + o]; __syncthreads(); }\n"
+"    float inv = (red[0] > 0.0f) ? 1.0f / red[0] : 0.0f;\n"
+"    for (int j = t; j < n; j += nt) {\n"
+"        float e = __expf(s[j] * scale - row_max) * inv;\n"
+"        half_raw hr; asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(hr) : \"f\"(e)); p[j] = hr;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- attn_prefill_vision_f32: TENSOR-CORE flash full attention. ----------------- */\n"
+"/* Adapted from cuda_kernels_common.h's attn_prefill_f32 (proven LLM-prefill flash)  */\n"
+"/* but (a) reads Q/K/V straight from the interleaved qkv[N,3*dim] buffer (no K_t/V_t  */\n"
+"/* transpose -- same trick the window kernels use) and (b) handles head_dim=72        */\n"
+"/* (nkf=ceil(72/16)=5 k16 frags, last padded d>=hd ->0; noc=ceil(72/8)=9 output       */\n"
+"/* 8-col groups, 9*8=72 exact). mma.sync.m16n8k16.row.col.f32.f16.f16.f32 + online    */\n"
+"/* softmax + O-rescale, O(N) memory; stages each 16-key K/V tile into shared so all   */\n"
+"/* 4 warps reuse it. Used only as the O(N) fallback above flash_full_n -- it is        */\n"
+"/* numerically identical to the materialized path (rel_L2 0.63948 vs 0.63945 @512²)    */\n"
+"/* but 4-14%% SLOWER (cuBLAS tiles/pipelines better; head_dim=72 wastes half the 5th   */\n"
+"/* k16 frag), far better than the retired CUDA-core flash (3.6-5.5x). Grid (n_heads,   */\n"
+"/* ceil(N/64)), block 128 (4 warps, 16 q/warp). sm_120 a1/a2 frag swap from source.    */\n"
+"#define VP_KF 5\n"
+"#define VP_OC 9\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"__global__ void attn_prefill_vision_f32(float *out, const float *qkv,\n"
+"                                        int n_tok, int dim, int n_heads,\n"
+"                                        int head_dim, float scale) {\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    if (blockIdx.y * 64 >= n_tok) return;  /* whole block out -> all warps return */\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int qb = blockIdx.y * 64 + warp_id * 16;  /* may exceed n_tok; per-query guards below */\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int gid = lane / 4, tid4 = lane % 4;\n"
+"    int dim3 = 3 * dim;\n"
+"    int qi0 = qb + gid, qi1 = qb + gid + 8;\n"
+"    /* Shared K/V tile (16 keys x head_dim), staged once per block so all 4 warps    */\n"
+"    /* reuse it instead of each re-reading K/V from global (was the 4x-redundant      */\n"
+"    /* bottleneck vs cuBLAS, which tiles K/V into shared).                            */\n"
+"    extern __shared__ float smem[];\n"
+"    float *Ks = smem;\n"
+"    float *Vs = smem + 16 * head_dim;\n"
+"    int nkf = (head_dim + 15) >> 4;\n"
+"    int noc = (head_dim + 7) >> 3;\n"
+"    int qoff = h * head_dim;\n"
+"    /* Pre-load Q fragments (m16k16, 4 per k16 step). */\n"
+"    unsigned int qa0[VP_KF], qa1[VP_KF], qa2[VP_KF], qa3[VP_KF];\n"
+"    for (int ks = 0; ks < nkf; ks++) {\n"
+"        int dc = ks * 16 + tid4 * 2;\n"
+"        { float f0=(qi0<n_tok && dc  <head_dim)?qkv[(size_t)qi0*dim3+qoff+dc  ]:0.0f,\n"
+"                f1=(qi0<n_tok && dc+1<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+1]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa0[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"        { float f0=(qi1<n_tok && dc  <head_dim)?qkv[(size_t)qi1*dim3+qoff+dc  ]:0.0f,\n"
+"                f1=(qi1<n_tok && dc+1<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+1]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa1[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"        { float f0=(qi0<n_tok && dc+8<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+8]:0.0f,\n"
+"                f1=(qi0<n_tok && dc+9<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+9]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa2[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"#else\n"
+"        { float f0=(qi0<n_tok && dc+8<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+8]:0.0f,\n"
+"                f1=(qi0<n_tok && dc+9<head_dim)?qkv[(size_t)qi0*dim3+qoff+dc+9]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa1[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"        { float f0=(qi1<n_tok && dc  <head_dim)?qkv[(size_t)qi1*dim3+qoff+dc  ]:0.0f,\n"
+"                f1=(qi1<n_tok && dc+1<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+1]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa2[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"#endif\n"
+"        { float f0=(qi1<n_tok && dc+8<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+8]:0.0f,\n"
+"                f1=(qi1<n_tok && dc+9<head_dim)?qkv[(size_t)qi1*dim3+qoff+dc+9]:0.0f;\n"
+"          asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(qa3[ks]):\"f\"(f0),\"f\"(f1)); }\n"
+"    }\n"
+"    float m0=-1e30f, l0=0.0f, m1=-1e30f, l1=0.0f;\n"
+"    float oc0[VP_OC]={0}, oc1[VP_OC]={0}, oc2[VP_OC]={0}, oc3[VP_OC]={0};\n"
+"    int koff = dim + h * head_dim, voff = 2 * dim + h * head_dim;\n"
+"    for (int kv = 0; kv < n_tok; kv += 16) {\n"
+"        /* Cooperatively stage the 16-key K/V tile (coalesced); zero-fill OOB keys. */\n"
+"        for (int t = threadIdx.x; t < 16 * head_dim; t += blockDim.x) {\n"
+"            int kl = t / head_dim, d = t - kl * head_dim;\n"
+"            int gk = kv + kl;\n"
+"            Ks[t] = (gk < n_tok) ? qkv[(size_t)gk*dim3 + koff + d] : 0.0f;\n"
+"            Vs[t] = (gk < n_tok) ? qkv[(size_t)gk*dim3 + voff + d] : 0.0f;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        float s0[2]={0,0}, s1[2]={0,0}, s2[2]={0,0}, s3[2]={0,0};\n"
+"        for (int ks = 0; ks < nkf; ks++) {\n"
+"            unsigned int a0=qa0[ks], a1=qa1[ks], a2=qa2[ks], a3=qa3[ks];\n"
+"            int col = ks * 16 + tid4 * 2;\n"
+"            for (int nh = 0; nh < 2; nh++) {\n"
+"                int kl = nh*8 + gid;\n"
+"                const float *kp = Ks + kl*head_dim;  /* shared; OOB keys zero-filled */\n"
+"                unsigned int b0=0, b1=0;\n"
+"                { float kf0=(col  <head_dim)?kp[col  ]:0.0f, kf1=(col+1<head_dim)?kp[col+1]:0.0f;\n"
+"                  asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(b0):\"f\"(kf0),\"f\"(kf1));\n"
+"                  float kf2=(col+8<head_dim)?kp[col+8]:0.0f, kf3=(col+9<head_dim)?kp[col+9]:0.0f;\n"
+"                  asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(b1):\"f\"(kf2),\"f\"(kf3)); }\n"
+"                asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                    :\"=f\"(s0[nh]),\"=f\"(s1[nh]),\"=f\"(s2[nh]),\"=f\"(s3[nh])\n"
+"                    :\"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1),\n"
+"                     \"f\"(s0[nh]),\"f\"(s1[nh]),\"f\"(s2[nh]),\"f\"(s3[nh]));\n"
+"            }\n"
+"        }\n"
+"        s0[0]*=scale; s1[0]*=scale; s2[0]*=scale; s3[0]*=scale;\n"
+"        s0[1]*=scale; s1[1]*=scale; s2[1]*=scale; s3[1]*=scale;\n"
+"        { int c0=kv+tid4*2, c1=c0+1;\n"
+"          if (c0   >=n_tok){s0[0]=-1e30f;s2[0]=-1e30f;} if (c1   >=n_tok){s1[0]=-1e30f;s3[0]=-1e30f;}\n"
+"          if (c0+8 >=n_tok){s0[1]=-1e30f;s2[1]=-1e30f;} if (c1+8 >=n_tok){s1[1]=-1e30f;s3[1]=-1e30f;} }\n"
+"        if (qi0>=n_tok){s0[0]=-1e30f;s1[0]=-1e30f;s0[1]=-1e30f;s1[1]=-1e30f;}\n"
+"        if (qi1>=n_tok){s2[0]=-1e30f;s3[0]=-1e30f;s2[1]=-1e30f;s3[1]=-1e30f;}\n"
+"        /* row qi0 (gid): keys at cols tid4*2, tid4*2+1 over nh halves */\n"
+"        float mx0 = fmaxf(fmaxf(s0[0],s1[0]), fmaxf(s0[1],s1[1]));\n"
+"        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));\n"
+"        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));\n"
+"        float mn0 = fmaxf(m0, mx0);\n"
+"        float al0 = __expf(m0 - mn0); l0 *= al0; m0 = mn0;\n"
+"        for (int c=0;c<noc;c++){ oc0[c]*=al0; oc1[c]*=al0; }\n"
+"        s0[0]=__expf(s0[0]-m0); s1[0]=__expf(s1[0]-m0); s0[1]=__expf(s0[1]-m0); s1[1]=__expf(s1[1]-m0);\n"
+"        float rs0 = (s0[0]+s1[0])+(s0[1]+s1[1]);\n"
+"        rs0 += __shfl_xor_sync(0xffffffff, rs0, 1);\n"
+"        rs0 += __shfl_xor_sync(0xffffffff, rs0, 2);\n"
+"        l0 += rs0;\n"
+"        float mx1 = fmaxf(fmaxf(s2[0],s3[0]), fmaxf(s2[1],s3[1]));\n"
+"        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));\n"
+"        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));\n"
+"        float mn1 = fmaxf(m1, mx1);\n"
+"        float al1 = __expf(m1 - mn1); l1 *= al1; m1 = mn1;\n"
+"        for (int c=0;c<noc;c++){ oc2[c]*=al1; oc3[c]*=al1; }\n"
+"        s2[0]=__expf(s2[0]-m1); s3[0]=__expf(s3[0]-m1); s2[1]=__expf(s2[1]-m1); s3[1]=__expf(s3[1]-m1);\n"
+"        float rs1 = (s2[0]+s3[0])+(s2[1]+s3[1]);\n"
+"        rs1 += __shfl_xor_sync(0xffffffff, rs1, 1);\n"
+"        rs1 += __shfl_xor_sync(0xffffffff, rs1, 2);\n"
+"        l1 += rs1;\n"
+"        /* Convert P (probs) to f16 fragments for the PV mma (A operand, m16k16).\n"
+"         * Pair the two column elements of the same nh-half (s0,s1 / s2,s3), NOT\n"
+"         * the two nh-halves -- matches attn_prefill_f32's C->A fragment remap.    */\n"
+"        unsigned int pa0, pa1, pa2, pa3;\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa0):\"f\"(s0[0]),\"f\"(s1[0]));\n"
+"#if __CUDA_ARCH__ >= 1200\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa1):\"f\"(s2[0]),\"f\"(s3[0]));\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa2):\"f\"(s0[1]),\"f\"(s1[1]));\n"
+"#else\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa1):\"f\"(s0[1]),\"f\"(s1[1]));\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa2):\"f\"(s2[0]),\"f\"(s3[0]));\n"
+"#endif\n"
+"        asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(pa3):\"f\"(s2[1]),\"f\"(s3[1]));\n"
+"        /* PV: O[16q, 8d] += P[16q,16k] V[16k,8d], 9 column groups (72=9*8). */\n"
+"        for (int c = 0; c < noc; c++) {\n"
+"            int vd = c*8+gid;\n"
+"            int vl0=tid4*2, vl1=vl0+1, vl8=vl0+8, vl9=vl8+1;  /* local key indices 0..15 */\n"
+"            unsigned int vb0=0, vb1=0;\n"
+"            if (vd < head_dim) {\n"
+"                float vf0=Vs[vl0*head_dim+vd], vf1=Vs[vl1*head_dim+vd];\n"
+"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb0):\"f\"(vf0),\"f\"(vf1));\n"
+"                float vf2=Vs[vl8*head_dim+vd], vf3=Vs[vl9*head_dim+vd];\n"
+"                asm(\"cvt.rn.f16x2.f32 %0, %2, %1;\":\"=r\"(vb1):\"f\"(vf2),\"f\"(vf3));\n"
+"            }\n"
+"            asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\\n\\t\"\n"
+"                \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n"
+"                :\"=f\"(oc0[c]),\"=f\"(oc1[c]),\"=f\"(oc2[c]),\"=f\"(oc3[c])\n"
+"                :\"r\"(pa0),\"r\"(pa1),\"r\"(pa2),\"r\"(pa3),\"r\"(vb0),\"r\"(vb1),\n"
+"                 \"f\"(oc0[c]),\"f\"(oc1[c]),\"f\"(oc2[c]),\"f\"(oc3[c]));\n"
+"        }\n"
+"        __syncthreads();  /* all warps done with Ks/Vs before next tile overwrites */\n"
+"    }\n"
+"    float il0=(l0>0.0f)?1.0f/l0:0.0f, il1=(l1>0.0f)?1.0f/l1:0.0f;\n"
+"    for (int c = 0; c < noc; c++) {\n"
+"        int d0=c*8+tid4*2, d1=d0+1;\n"
+"        if (qi0<n_tok && d0<head_dim) out[(size_t)qi0*dim+qoff+d0]=oc0[c]*il0;\n"
+"        if (qi0<n_tok && d1<head_dim) out[(size_t)qi0*dim+qoff+d1]=oc1[c]*il0;\n"
+"        if (qi1<n_tok && d0<head_dim) out[(size_t)qi1*dim+qoff+d0]=oc2[c]*il1;\n"
+"        if (qi1<n_tok && d1<head_dim) out[(size_t)qi1*dim+qoff+d1]=oc3[c]*il1;\n"
+"    }\n"
+"}\n"
+"#endif\n"
+"\n"
+"/* ---- attn_full_bq_f32: full attention, ONE BLOCK PER QUERY. ---- */\n"
+"/* Grid: (n_patches, n_heads). Block: BQ_THREADS. Each block's threads cooperate on a   */\n"
+"/* single query: each thread computes COMPLETE scores for its keys (no per-key warp     */\n"
+"/* reduction), block-reduces softmax, then computes the output. K/V cached in L2 across  */\n"
+"/* the query-blocks of a head. Dyn smem: (head_dim + n_patches + blockDim) floats.       */\n"
+"__global__ void attn_full_bq_f32(float *out, const float *qkv,\n"
+"                                 int n_patches, int dim, int n_heads,\n"
+"                                 int head_dim, float scale) {\n"
+"    extern __shared__ float smem[];\n"
+"    int qi = blockIdx.x;\n"
+"    int h  = blockIdx.y;\n"
+"    int tid = threadIdx.x;\n"
+"    int nt  = blockDim.x;\n"
+"    int dim3 = 3 * dim;\n"
+"    float *q_sh   = smem;\n"
+"    float *scores = smem + head_dim;\n"
+"    float *red    = scores + n_patches;\n"
+"    const float *q_h = qkv + (size_t)qi * dim3 + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += nt) q_sh[d] = q_h[d];\n"
+"    __syncthreads();\n"
+"    for (int ki = tid; ki < n_patches; ki += nt) {\n"
+"        const float *k_h = qkv + (size_t)ki * dim3 + dim + h * head_dim;\n"
+"        float s = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) s += q_sh[d] * k_h[d];\n"
+"        scores[ki] = s * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float lm = -1e30f;\n"
+"    for (int ki = tid; ki < n_patches; ki += nt) lm = fmaxf(lm, scores[ki]);\n"
+"    red[tid] = lm; __syncthreads();\n"
+"    for (int r = nt >> 1; r > 0; r >>= 1) { if (tid < r) red[tid] = fmaxf(red[tid], red[tid + r]); __syncthreads(); }\n"
+"    float mx = red[0]; __syncthreads();\n"
+"    float ls = 0.0f;\n"
+"    for (int ki = tid; ki < n_patches; ki += nt) { float e = __expf(scores[ki] - mx); scores[ki] = e; ls += e; }\n"
+"    red[tid] = ls; __syncthreads();\n"
+"    for (int r = nt >> 1; r > 0; r >>= 1) { if (tid < r) red[tid] += red[tid + r]; __syncthreads(); }\n"
+"    float inv = 1.0f / red[0]; __syncthreads();\n"
+"    for (int d = tid; d < head_dim; d += nt) {\n"
+"        float acc = 0.0f;\n"
+"        for (int vi = 0; vi < n_patches; vi++)\n"
+"            acc += scores[vi] * qkv[(size_t)vi * dim3 + 2 * dim + h * head_dim + d];\n"
+"        out[(size_t)qi * dim + h * head_dim + d] = acc * inv;\n"
+"    }\n"
+"}\n"
+"\n"
+"\n"
+"/* ---- cast_f32_f16: F32 -> F16 (half_raw bits), for the cuBLAS F16xF16 path ---- */\n"
+"/* Mixed F16(W)xF32(X) GemmEx is unsupported on Blackwell (sm_120); cast X to F16 */\n"
+"/* and use cublasew_gemm_f16_f16_f32_rowmajor_nt instead. */\n"
+"__global__ void cast_f32_f16(half_raw *dst, const float *src, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    float f = src[i]; half_raw h;\n"
+"    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(f));\n"
+"    dst[i] = h;\n"
+"}\n"
+"\n"
+"/* ---- gelu_f32_to_f16: tanh-GELU (matches gelu_f32) fused with F32->F16 cast ---- */\n"
+"/* Lets the FFN up-proj (bias fused in the GEMM) feed the down-proj as F16 with no */\n"
+"/* separate cast: one pass reads F32, applies GELU, writes F16. */\n"
+"__global__ void gelu_f32_to_f16(half_raw *dst, const float *src, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n) return;\n"
+"    float v = src[i];\n"
+"    float g = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));\n"
+"    half_raw h;\n"
+"    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(g));\n"
+"    dst[i] = h;\n"
+"}\n"
+"\n"
+"/* ---- layernorm_f32_f16: layernorm that emits F16 directly (folds the F32->F16 ---- */\n"
+"/* cast that the qkv / ffn-up GEMM would otherwise do on the Blackwell F16xF16 path). */\n"
+"__global__ void layernorm_f32_f16(half_raw *dst, const float *src, const float *w,\n"
+"                                   const float *b, int dim, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int tok = blockIdx.x;\n"
+"    int tid = threadIdx.x;\n"
+"    int nt = blockDim.x;\n"
+"    const float *x = src + (size_t)tok * dim;\n"
+"    half_raw *y = dst + (size_t)tok * dim;\n"
+"    float s = 0.0f;\n"
+"    for (int i = tid; i < dim; i += nt) s += x[i];\n"
+"    sdata[tid] = s;\n"
+"    __syncthreads();\n"
+"    for (int r = nt/2; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid+r]; __syncthreads(); }\n"
+"    float mean = sdata[0] / (float)dim;\n"
+"    __syncthreads();\n"
+"    s = 0.0f;\n"
+"    for (int i = tid; i < dim; i += nt) { float d = x[i] - mean; s += d*d; }\n"
+"    sdata[tid] = s;\n"
+"    __syncthreads();\n"
+"    for (int r = nt/2; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid+r]; __syncthreads(); }\n"
+"    float inv = rsqrtf(sdata[0] / (float)dim + eps);\n"
+"    for (int i = tid; i < dim; i += nt) {\n"
+"        float v = (x[i] - mean) * inv * w[i] + b[i];\n"
+"        half_raw h; asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(v)); y[i] = h;\n"
+"    }\n"
+"}\n"
+"\n"
 "} /* extern C */\n"
 ;
 
@@ -339,10 +873,12 @@ struct cuda_vision_runner {
     int verbose;
     int use_f16;
     int use_cublas;
+    int cublas_mixed_ok;   /* mixed F16(W)xF32(X) GemmEx works (false on Blackwell) */
 
     CUmodule module;
     /* Shared kernels */
     CUfunction fn_layernorm_f32;
+    CUfunction fn_layernorm_f32_f16; /* layernorm with F16 output (folds qkv/ffn-up cast) */
     CUfunction fn_gemm_f16_f32;
     CUfunction fn_gelu_f32;
     CUfunction fn_add_f32;
@@ -350,13 +886,23 @@ struct cuda_vision_runner {
     /* Vision-specific kernels */
     CUfunction fn_gemm_f32_f32;
     CUfunction fn_patch_embed_dual_f32;
+    CUfunction fn_patch_im2col_f32;
     CUfunction fn_add_pos_embd;
     CUfunction fn_add_pos_embd_direct;
     CUfunction fn_rope_vision_f32;
     CUfunction fn_attn_full_f32;
+    CUfunction fn_flash_attn_f32;
+    CUfunction fn_attn_prefill_vision_f32; /* TENSOR-CORE O(N)-mem full attention */
+    CUfunction fn_attn_full_bq_f32;
+    CUfunction fn_attn_extract_heads;   /* deinterleave qkv -> head-contiguous F16 */
+    CUfunction fn_attn_softmax_rows;    /* row softmax scores[N,N] -> F16 probs */
     CUfunction fn_attn_window_f32;
+    CUfunction fn_attn_window_warp_f32; /* warp-per-query windowed attention */
+    CUfunction fn_attn_window_tile_f32; /* materialize-scores windowed attention */
     CUfunction fn_reorder_rows_f32;
     CUfunction fn_spatial_merge_f32;
+    CUfunction fn_cast_f32_f16;   /* F32 -> F16 cast for cuBLAS F16xF16 path */
+    CUfunction fn_gelu_f32_to_f16; /* fused tanh-GELU + F32->F16 cast (FFN) */
 
     /* Model hyperparams */
     int n_blocks;
@@ -382,10 +928,12 @@ struct cuda_vision_runner {
     int max_pixels;            /* max pixel count for RGB buffer */
     float *h_pos_embd;         /* CPU copy of original pos embedding [n_patches * dim] */
     CUdeviceptr d_pos_interp;  /* GPU buffer for interpolated pos embedding [max_patches * dim] */
+    int pos_interp_w, pos_interp_h; /* grid the cached d_pos_interp is valid for (-1 = none) */
 
     /* GPU weights: patch embeddings */
-    CUdeviceptr d_patch_w0;     /* F32 [dim, ps*ps*3] */
+    CUdeviceptr d_patch_w0;     /* F32 [dim, ps*ps*3] (w1 folded in: w0 += w1 at load) */
     CUdeviceptr d_patch_w1;     /* F32 [dim, ps*ps*3] (second conv, may be 0) */
+    CUdeviceptr d_patch_pix;    /* F32 [max_patches, ps*ps*3] im2col scratch */
     CUdeviceptr d_patch_bias;   /* F32 [dim] */
 
     /* Position embedding */
@@ -413,6 +961,7 @@ struct cuda_vision_runner {
     CUdeviceptr d_attn_out;   /* [max_patches * dim] */
     CUdeviceptr d_ffn_buf;    /* [max_patches * ffn_dim] */
     CUdeviceptr d_ln_buf;     /* [max_patches * dim] */
+    CUdeviceptr d_ln_buf_f16; /* [max_patches * dim] F16 layernorm out (Blackwell path) */
     CUdeviceptr d_merge_buf;  /* [n_merged * merged_dim] */
     CUdeviceptr d_mm_buf;     /* [n_merged * merged_dim] */
     CUdeviceptr d_mm_out;     /* [n_merged * proj_dim] */
@@ -425,6 +974,29 @@ struct cuda_vision_runner {
     CUdeviceptr d_window_starts;  /* [max_merged] int */
     CUdeviceptr d_window_sizes;   /* [max_merged] int */
     CUdeviceptr d_ds_feats;   /* deepstack feature accumulation */
+    CUdeviceptr d_x_f16;      /* [max_patches * max_in] F16 GEMM input (Blackwell path) */
+    CUdeviceptr d_ffn_buf_f16; /* [max_patches * ffn_dim] F16 GELU(up) out, fed to ffn_down */
+    /* Tensor-core full-attention scratch (cuBLAS QK^T -> softmax -> P*V) */
+    int tc_attn;              /* 1 if cuBLAS available -> use tensor-core attention */
+    int win_tile;             /* 1 -> materialize-scores windowed kernel (VLM_WINDOW_TILE) */
+    int flash_full_n;         /* full-attn crossover: N > this -> fused flash kernel
+                               * (materialized [N,N] scratch only sized to min(mp,this)) */
+    int tc_flash;             /* VLM_TC_FLASH: 1 -> tensor-core attn_prefill_vision_f32
+                               * for ALL full-attn layers (A/B vs materialized) */
+    CUdeviceptr d_qh_f16;     /* [n_heads * max_patches * head_dim] F16 */
+    CUdeviceptr d_kh_f16;     /* [n_heads * max_patches * head_dim] F16 */
+    CUdeviceptr d_vh_f16;     /* [n_heads * max_patches * head_dim] F16 */
+    CUdeviceptr d_attn_scores;/* [max_patches * max_patches] F32 (one head) */
+    CUdeviceptr d_attn_probs; /* [max_patches * max_patches] F16 (one head) */
+
+    /* CUDA graph capture of the ViT block loop (collapses per-layer host launches) */
+    int use_graph;            /* VLM_CUDA_GRAPH (default 1) && driver graph API present */
+    int capturing;            /* set while the loop is recorded under stream capture */
+    CUgraph graph;
+    CUgraphExec graph_exec;
+    int graph_ready;          /* graph_exec valid for (graph_w, graph_h) */
+    int graph_w, graph_h;     /* grid dims (gw, gh) the captured graph is valid for */
+    int graph_warm;           /* same-size encodes before capture (>=1 => F16 path settled) */
 
     /* Host output */
     float *h_output;
@@ -507,6 +1079,7 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
 
     /* Shared kernels */
     GET_FN(layernorm_f32);
+    GET_FN(layernorm_f32_f16);
     GET_FN(gemm_f16_f32);
     GET_FN(gelu_f32);
     GET_FN(add_f32);
@@ -515,18 +1088,28 @@ static int vlm_compile_kernels(cuda_vision_runner *r) {
     /* Vision-specific kernels */
     GET_FN(gemm_f32_f32);
     GET_FN(patch_embed_dual_f32);
+    GET_FN(patch_im2col_f32);
     GET_FN(add_pos_embd);
     GET_FN(add_pos_embd_direct);
     GET_FN(rope_vision_f32);
     GET_FN(attn_full_f32);
+    GET_FN(flash_attn_f32);
+    GET_FN(attn_prefill_vision_f32);
+    GET_FN(attn_full_bq_f32);
+    GET_FN(attn_extract_heads);
+    GET_FN(attn_softmax_rows);
     GET_FN(attn_window_f32);
+    GET_FN(attn_window_warp_f32);
+    GET_FN(attn_window_tile_f32);
     GET_FN(reorder_rows_f32);
     GET_FN(spatial_merge_f32);
+    GET_FN(cast_f32_f16);
+    GET_FN(gelu_f32_to_f16);
 
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 14, sm);
+        fprintf(stderr, "cuda_vlm: %d kernels compiled (sm_%d)\n", 24, sm);
     return 0;
 }
 
@@ -759,11 +1342,72 @@ cuda_vision_runner *cuda_vision_init(int device_id, int verbose, int use_f16) {
 
     if (cublasewCreate(&r->cublas, r->stream) == 0) {
         r->use_cublas = 1;
+        r->cublas_mixed_ok = 1;   /* try mixed F16xF32 first; cleared on first failure */
+        r->tc_attn = 1;           /* full attention via cuBLAS tensor cores */
         if (r->verbose >= 1) {
             fprintf(stderr, "cuda_vlm: cuBLAS GEMM fast path enabled\n");
         }
     } else if (r->verbose >= 1) {
         fprintf(stderr, "cuda_vlm: cuBLAS unavailable, using built-in GEMM kernels\n");
+    }
+    {
+        /* Materialize-scores windowed kernel is faster than warp-per-query
+         * (98 vs 102 ms @768², 38.7 vs 41.1 @512²) and numerically equivalent;
+         * default ON, VLM_WINDOW_TILE=0 falls back to the warp kernel. */
+        const char *wt = getenv("VLM_WINDOW_TILE");
+        r->win_tile = (wt && wt[0] == '0') ? 0 : 1;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_vlm: windowed attention = %s kernel\n",
+                    r->win_tile ? "tile (materialize-scores)" : "warp-per-query");
+    }
+    {
+        /* Full-attention crossover. The O(N)-memory tensor-core flash
+         * (attn_prefill_vision_f32) kicks in for N > this. IMPORTANT: it is a
+         * *memory* fallback, NOT a speedup -- benchmarking showed flash is
+         * still 4-14%% SLOWER than the materialized tensor-core path (cuBLAS
+         * QK^T -> softmax -> P*V) even with shared K/V staging, because cuBLAS's
+         * larger tiles / pipelining beat a hand-rolled flash and head_dim=72
+         * wastes ~half the 5th k16 fragment. So the default keeps every size
+         * that fits VRAM on the fast materialized path; flash only takes over
+         * above ~2900² where the [N,N] F32 scratch (>4 GB) would OOM the 16 GB
+         * card. VLM_FLASH_FULL forces it on(1)/off(0); VLM_FLASH_FULL_N
+         * overrides the crossover N directly (e.g. for A/B testing). */
+        int fn = 32768;
+        const char *fenv = getenv("VLM_FLASH_FULL_N");
+        if (fenv) fn = atoi(fenv);
+        const char *ff = getenv("VLM_FLASH_FULL");
+        if (ff) fn = (ff[0] == '0') ? (1 << 30) : 0;  /* 0 -> never, else -> always */
+        if (fn < 0) fn = 0;
+        r->flash_full_n = fn;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_vlm: full-attention flash crossover N = %d\n",
+                    r->flash_full_n);
+    }
+    {
+        /* Tensor-core flash: attn_prefill_vision_f32 (mma.sync, online softmax,
+         * O(N) memory). VLM_TC_FLASH=1 routes ALL full-attn layers through it,
+         * regardless of the crossover above -- so it can be A/B'd against the
+         * materialized cuBLAS path at every size. Default off. */
+        const char *tf = getenv("VLM_TC_FLASH");
+        r->tc_flash = (tf && tf[0] != '0') ? 1 : 0;
+        if (r->tc_flash && r->verbose >= 1)
+            fprintf(stderr, "cuda_vlm: tensor-core flash full-attention ENABLED\n");
+    }
+    {
+        /* CUDA-graph capture of the ViT block loop: default ON, VLM_CUDA_GRAPH=0
+         * disables. Requires the driver graph API (loaded via cuew) -- guard the
+         * pointers so an old driver falls back to per-layer launches. */
+        const char *ge = getenv("VLM_CUDA_GRAPH");
+        int want = !(ge && ge[0] == '0');
+        int api = (cuStreamBeginCapture_v2 && cuStreamEndCapture &&
+                   cuGraphInstantiateWithFlags && cuGraphLaunch &&
+                   cuGraphExecDestroy && cuGraphDestroy);
+        r->use_graph = (want && api) ? 1 : 0;
+        r->graph_w = -1;
+        r->graph_h = -1;
+        if (r->verbose >= 1)
+            fprintf(stderr, "cuda_vlm: CUDA graph capture = %s\n",
+                    r->use_graph ? "on" : (want ? "off (driver API missing)" : "off"));
     }
 
     if (vlm_compile_kernels(r) != 0) {
@@ -853,8 +1497,16 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
     r->d_patch_w0 = vlm_upload_f32(&t_pw0);
     r->d_patch_w1 = vlm_upload_f32(&t_pw1);
     r->d_patch_bias = vlm_upload_f32(&t_pb);
-    if (t_pw1.data)
-        fprintf(stderr, "cuda_vlm: loaded dual conv2d patch embeddings\n");
+    if (t_pw1.data && r->d_patch_w1) {
+        /* Fold the dual conv into one weight (both convs hit the same pixels):
+         * w0 += w1, so patch embed reduces to a single im2col + GEMM. */
+        int n = (int)t_pw0.n_elem;
+        int grid = (n + 255) / 256;
+        void *args[] = { &r->d_patch_w0, &r->d_patch_w1, &n };
+        cuLaunchKernel(r->fn_add_f32, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+        cuStreamSynchronize(r->stream);
+        fprintf(stderr, "cuda_vlm: loaded dual conv2d patch embeddings (folded w0+=w1)\n");
+    }
 
     /* Position embedding (always F32) — keep CPU copy for interpolation */
     vlm_tensor_info t_pos = vlm_get_tensor(g, "v.position_embd.weight", 1);
@@ -995,6 +1647,37 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
         CHECK_CU(cuMemAlloc(&r->d_window_starts, (size_t)max_merged * sizeof(int)));
         CHECK_CU(cuMemAlloc(&r->d_window_sizes, (size_t)max_merged * sizeof(int)));
         CHECK_CU(cuMemAlloc(&r->d_pos_interp,(size_t)mp * dim * sizeof(float)));
+        r->pos_interp_w = -1; r->pos_interp_h = -1; /* no interpolated pos cached yet */
+        CHECK_CU(cuMemAlloc(&r->d_patch_pix, (size_t)mp * r->patch_size * r->patch_size * 3 * sizeof(float)));
+        /* F16 GEMM-input scratch for the Blackwell cuBLAS path (cast X to F16).
+         * Largest GEMM input is max(mp*ffn_dim, max_merged*merged_dim) elements. */
+        if (r->use_f16) {
+            size_t a = (size_t)mp * r->ffn_dim;
+            size_t b = (size_t)max_merged * merged_dim;
+            size_t n_xf16 = a > b ? a : b;
+            CHECK_CU(cuMemAlloc(&r->d_x_f16, n_xf16 * sizeof(unsigned short)));
+            /* F16 GELU(ffn_up) output, consumed directly by ffn_down (no recast). */
+            CHECK_CU(cuMemAlloc(&r->d_ffn_buf_f16, (size_t)mp * r->ffn_dim * sizeof(unsigned short)));
+            /* F16 layernorm output, consumed directly by qkv/ffn-up GEMM (no recast). */
+            CHECK_CU(cuMemAlloc(&r->d_ln_buf_f16, (size_t)mp * dim * sizeof(unsigned short)));
+        }
+        /* Tensor-core full-attention scratch (F16). Per-head Q/K/V + a single
+         * head's [N,N] scores (F32) and probs (F16), reused across heads. Only
+         * sized to tc_cap = min(mp, flash_full_n): above the crossover the
+         * O(N)-memory tensor-core flash (attn_prefill_vision_f32) runs instead
+         * (no [N,N] buffer, only a 9 KB shared K/V tile), so capping here avoids
+         * e.g. a 1 GB scores alloc at 2048². Encodes with n_patches <= tc_cap
+         * take the materialized path and fit this buffer. */
+        if (r->use_f16 && r->tc_attn) {
+            int tc_cap = (mp < r->flash_full_n) ? mp : r->flash_full_n;
+            if (tc_cap < 1) tc_cap = 1;  /* forced-flash: keep a minimal valid alloc */
+            size_t nhd = (size_t)r->n_heads * tc_cap * r->head_dim;
+            CHECK_CU(cuMemAlloc(&r->d_qh_f16, nhd * sizeof(unsigned short)));
+            CHECK_CU(cuMemAlloc(&r->d_kh_f16, nhd * sizeof(unsigned short)));
+            CHECK_CU(cuMemAlloc(&r->d_vh_f16, nhd * sizeof(unsigned short)));
+            CHECK_CU(cuMemAlloc(&r->d_attn_scores, (size_t)tc_cap * tc_cap * sizeof(float)));
+            CHECK_CU(cuMemAlloc(&r->d_attn_probs,  (size_t)tc_cap * tc_cap * sizeof(unsigned short)));
+        }
     }
 
     /* DeepStack feature buffer */
@@ -1021,22 +1704,57 @@ int cuda_vision_load_weights(cuda_vision_runner *r, gguf_context *g) {
 /* GEMM dispatch: F32 or F16                                                */
 /* ======================================================================== */
 
-/* Launch a GEMM: Y[n_tok, n_out] = X[n_tok, n_in] * W^T[n_out, n_in] + bias */
-static void vlm_gemm(cuda_vision_runner *r, CUdeviceptr d_Y, const gpu_weight *w,
-                       CUdeviceptr d_X, int n_tok, int n_out, int n_in) {
+/* Launch tanh-GELU in place over Y[n_tok*n_out] (fallback when not fused). */
+static void vlm_launch_gelu(cuda_vision_runner *r, CUdeviceptr d_Y, int n) {
+    int grid = (n + 255) / 256;
+    void *args[] = { &d_Y, &n };
+    cuLaunchKernel(r->fn_gelu_f32, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+/* Launch a GEMM: Y[n_tok, n_out] = X[n_tok, n_in] * W^T[n_out, n_in] + bias.
+ * If do_gelu, a tanh-GELU is applied to (Y + bias). On the Blackwell F16xF16
+ * cuBLAS path the bias (and gelu) are fused into a cuBLAS-LT epilogue when
+ * available, eliminating the separate add_bias / gelu kernel launches. */
+static void vlm_gemm_ex(cuda_vision_runner *r, CUdeviceptr d_Y, const gpu_weight *w,
+                        CUdeviceptr d_X, int n_tok, int n_out, int n_in, int do_gelu) {
     /* Copy const fields to locals for void* args array */
     CUdeviceptr d_W, d_bias;
     d_bias = w->bias;
     if (r->use_cublas && r->cublas) {
-        int ok;
+        int ok = -1;
         if (r->use_f16 && w->w_f16) {
-            ok = cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, d_Y, w->w_f16, d_X,
-                                                   n_tok, n_out, n_in);
+            /* Mixed F16(W)xF32(X) GemmEx works pre-Blackwell but is unsupported on
+             * sm_120. Try it once; on failure switch permanently to the F16xF16
+             * path (cast X to F16 here, weights are already F16). */
+            if (r->cublas_mixed_ok) {
+                ok = cublasew_gemm_f16_f32_rowmajor_nt(r->cublas, d_Y, w->w_f16, d_X,
+                                                       n_tok, n_out, n_in);
+                if (ok != 0) {
+                    r->cublas_mixed_ok = 0;
+                    if (r->verbose >= 1)
+                        fprintf(stderr, "cuda_vlm: mixed F16xF32 GEMM unsupported "
+                                "(Blackwell), using F16xF16->F32 cuBLAS path\n");
+                }
+            }
+            if (ok != 0 && r->d_x_f16) {
+                int total = n_tok * n_in;
+                int grid = (total + 255) / 256;
+                void *cargs[] = { &r->d_x_f16, &d_X, &total };
+                cuLaunchKernel(r->fn_cast_f32_f16, grid, 1, 1, 256, 1, 1,
+                               0, r->stream, cargs, NULL);
+                /* Fuse bias (+gelu) into a cuBLAS-LT epilogue when possible. */
+                if (d_bias && cublasew_lt_available(r->cublas) == 0) {
+                    int lt = cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(
+                                 r->cublas, d_Y, w->w_f16, r->d_x_f16, d_bias,
+                                 do_gelu, /*y_f16=*/0, n_tok, n_out, n_in);
+                    if (lt == 0) return;  /* GEMM + bias (+gelu) all fused */
+                }
+                ok = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, d_Y, w->w_f16,
+                                                           r->d_x_f16, n_tok, n_out, n_in);
+            }
         } else if (w->w_f32) {
             ok = cublasew_gemm_f32_rowmajor_nt(r->cublas, d_Y, w->w_f32, d_X,
                                                n_tok, n_out, n_in);
-        } else {
-            ok = -1;
         }
         if (ok == 0) {
             if (d_bias) {
@@ -1049,6 +1767,7 @@ static void vlm_gemm(cuda_vision_runner *r, CUdeviceptr d_Y, const gpu_weight *w
                                0, r->stream,
                                args, NULL);
             }
+            if (do_gelu) vlm_launch_gelu(r, d_Y, n_tok * n_out);
             return;
         }
         if (r->verbose >= 1) {
@@ -1080,11 +1799,394 @@ static void vlm_gemm(cuda_vision_runner *r, CUdeviceptr d_Y, const gpu_weight *w
                        0, r->stream,
                        args, NULL);
     }
+    if (do_gelu) vlm_launch_gelu(r, d_Y, n_tok * n_out);
+}
+
+static void vlm_gemm(cuda_vision_runner *r, CUdeviceptr d_Y, const gpu_weight *w,
+                     CUdeviceptr d_X, int n_tok, int n_out, int n_in) {
+    vlm_gemm_ex(r, d_Y, w, d_X, n_tok, n_out, n_in, 0);
+}
+
+/* Launch fused tanh-GELU + F32->F16 cast: dst_f16[n] = GELU(src_f32[n]). */
+static void vlm_launch_gelu_f16(cuda_vision_runner *r, CUdeviceptr dst_f16,
+                                CUdeviceptr src_f32, int n) {
+    int grid = (n + 255) / 256;
+    void *args[] = { &dst_f16, &src_f32, &n };
+    cuLaunchKernel(r->fn_gelu_f32_to_f16, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+}
+
+/* GEMM whose input X is ALREADY F16 (skips the F32->F16 cast). Used for the FFN
+ * down-projection when the up-projection produced F16 output. Bias is fused via
+ * the cuBLAS-LT epilogue when available, else applied with add_bias_f32. */
+static void vlm_gemm_x_f16(cuda_vision_runner *r, CUdeviceptr d_Y,
+                           const gpu_weight *w, CUdeviceptr d_X_f16,
+                           int n_tok, int n_out, int n_in) {
+    if (w->bias && cublasew_lt_available(r->cublas) == 0) {
+        int lt = cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(
+                     r->cublas, d_Y, w->w_f16, d_X_f16, w->bias,
+                     /*gelu=*/0, /*y_f16=*/0, n_tok, n_out, n_in);
+        if (lt == 0) return;
+    }
+    int ok = cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, d_Y, w->w_f16,
+                                                   d_X_f16, n_tok, n_out, n_in);
+    if (ok == 0 && w->bias) {
+        int total = n_out * n_tok;
+        int grid = (total + 255) / 256;
+        CUdeviceptr d_bias = w->bias;
+        void *args[] = { &d_Y, &d_bias, &n_out, &n_tok };
+        cuLaunchKernel(r->fn_add_bias_f32, grid, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    }
 }
 
 /* ======================================================================== */
 /* Public API: encode                                                       */
 /* ======================================================================== */
+
+/* Destroy any captured ViT-block graph + its exec (called on size change/teardown). */
+static void vlm_graph_reset(cuda_vision_runner *r) {
+    if (r->graph_exec) { cuGraphExecDestroy(r->graph_exec); r->graph_exec = NULL; }
+    if (r->graph)      { cuGraphDestroy(r->graph);          r->graph = NULL; }
+    r->graph_ready = 0;
+}
+
+/* One ViT transformer block, repeated n_blocks times. Factored out of
+ * cuda_vision_encode so the loop can be issued normally, recorded under a
+ * CUDA-graph stream capture, or skipped in favor of graph replay. Touches only
+ * persistent device buffers and r->stream and runs in place on r->d_hidden, so
+ * a graph captured here replays correctly for any later image of the same size. */
+static void vlm_run_vit_blocks(cuda_vision_runner *r,
+                               int n_patches, int n_merged, int dim, int n_heads,
+                               int head_dim, int half, int ffn_dim, int merged_dim,
+                               int gw, int sm, int use_window_attn,
+                               int n_windows, int max_window_tokens,
+                               int *ds_count_out) {
+    int ds_count = 0;
+    for (int l = 0; l < r->n_blocks; l++) {
+        if (l == 0 || l == r->n_blocks - 1 || (l + 1) % 6 == 0)
+            fprintf(stderr, "  vit block %d/%d\n", l, r->n_blocks);
+
+        gpu_vit_block *blk = &r->blocks[l];
+
+        /* On the Blackwell F16xF16 cuBLAS path the qkv/ffn-up GEMMs cast their F32
+         * activation input to F16 anyway, so have LayerNorm emit F16 directly and
+         * feed it via the x-F16 GEMM, folding away the separate cast. The predicate
+         * mirrors exactly when vlm_gemm_ex would cast (mixed GemmEx already proven
+         * unsupported). Latched once per layer for producer/consumer consistency. */
+        int use_f16_ln = (r->use_f16 && r->use_cublas && r->cublas &&
+                          r->d_ln_buf_f16 && !r->cublas_mixed_ok);
+
+        /* LayerNorm1 (emits F16 on the Blackwell path to fold the qkv-input cast). */
+        {
+            float eps = r->ln_eps;
+            size_t smem = 256 * sizeof(float);
+            CUdeviceptr ln_dst = use_f16_ln ? r->d_ln_buf_f16 : r->d_ln_buf;
+            void *args[] = { &ln_dst, &r->d_hidden, &blk->ln1_w, &blk->ln1_b, &dim, &eps };
+            cuLaunchKernel(use_f16_ln ? r->fn_layernorm_f32_f16 : r->fn_layernorm_f32,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           smem, r->stream,
+                           args, NULL);
+        }
+
+        /* QKV projection */
+        {
+            int n_out = 3 * dim;
+            if (use_f16_ln)
+                vlm_gemm_x_f16(r, r->d_qkv, &blk->attn_qkv, r->d_ln_buf_f16, n_patches, n_out, dim);
+            else
+                vlm_gemm(r, r->d_qkv, &blk->attn_qkv, r->d_ln_buf, n_patches, n_out, dim);
+        }
+
+        /* Debug: check QKV right after GEMM (before RoPE) */
+        if (l == 0 && r->verbose >= 2) {
+            cuStreamSynchronize(r->stream);
+            float dbg[8];
+            cuMemcpyDtoH(dbg, r->d_qkv, 8 * sizeof(float));
+            fprintf(stderr, "  [DBG] qkv after GEMM (pre-RoPE), block 0: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
+            cuMemcpyDtoH(dbg, r->d_ln_buf, 8 * sizeof(float));
+            fprintf(stderr, "  [DBG] ln_buf (QKV input), block 0: %.6f %.6f %.6f %.6f\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3]);
+            /* Check weight values */
+            if (r->use_f16 && blk->attn_qkv.w_f16) {
+                uint16_t wdbg[8];
+                cuMemcpyDtoH(wdbg, blk->attn_qkv.w_f16, 8 * sizeof(uint16_t));
+                fprintf(stderr, "  [DBG] QKV weight F16[0..3]: %04x %04x %04x %04x (%.6f %.6f %.6f %.6f)\n",
+                        wdbg[0], wdbg[1], wdbg[2], wdbg[3],
+                        ggml_fp16_to_fp32(wdbg[0]), ggml_fp16_to_fp32(wdbg[1]),
+                        ggml_fp16_to_fp32(wdbg[2]), ggml_fp16_to_fp32(wdbg[3]));
+            } else if (blk->attn_qkv.w_f32) {
+                float wdbg[4];
+                cuMemcpyDtoH(wdbg, blk->attn_qkv.w_f32, 4 * sizeof(float));
+                fprintf(stderr, "  [DBG] QKV weight F32[0..3]: %.6f %.6f %.6f %.6f\n",
+                        wdbg[0], wdbg[1], wdbg[2], wdbg[3]);
+            }
+        }
+
+        /* M-RoPE on Q and K */
+        {
+            void *args[] = {
+                &r->d_qkv, &r->d_rope_cos, &r->d_rope_sin,
+                &n_patches, &n_heads, &dim, &head_dim, &half
+            };
+            /* Grid-stride: 256 threads/block, enough blocks to cover all
+             * (p,h,i) rotation pairs (capped so very large N stays grid-strided). */
+            long rope_total = (long)n_patches * n_heads * half;
+            unsigned int rope_blocks = (unsigned int)((rope_total + 255) / 256);
+            if (rope_blocks > 65535u) rope_blocks = 65535u;
+            if (rope_blocks < 1u) rope_blocks = 1u;
+            cuLaunchKernel(r->fn_rope_vision_f32,
+                           rope_blocks, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+        }
+
+        /* Multi-head self-attention */
+        {
+            float scale = 1.0f / sqrtf((float)head_dim);
+            int use_local_attn = use_window_attn && ((l + 1) % r->n_wa_pattern != 0);
+            if (use_local_attn) {
+                void *args[] = {
+                    &r->d_attn_out, &r->d_qkv,
+                    &r->d_window_starts, &r->d_window_sizes,
+                    &dim, &n_heads, &head_dim, &scale
+                };
+                if (r->win_tile) {
+                    /* Materialize-scores windowed attention. Grid (n_windows,
+                     * n_heads), block WT_THREADS=192. Dyn smem stages the
+                     * window's Q/K/V as F16 + the S[win,win] F32 score matrix
+                     * (3*max_window_tokens*head_dim halves + max_window_tokens^2
+                     * floats). F16 staging halves the dominant term -> 4 blocks/SM. */
+                    size_t smem = (size_t)3 * max_window_tokens * head_dim * sizeof(unsigned short) +
+                                  (size_t)max_window_tokens * max_window_tokens * sizeof(float);
+                    cuLaunchKernel(r->fn_attn_window_tile_f32,
+                                   n_windows, n_heads, 1,
+                                   192, 1, 1,   /* WT_THREADS */
+                                   smem, r->stream,
+                                   args, NULL);
+                } else {
+                    /* Warp-per-query windowed attention. Grid (n_windows, n_heads),
+                     * block WW_WARPS*32. Dyn smem stages the window's K/V
+                     * (2 * max_window_tokens * head_dim floats). */
+                    size_t smem = (size_t)2 * max_window_tokens * head_dim * sizeof(float);
+                    cuLaunchKernel(r->fn_attn_window_warp_f32,
+                                   n_windows, n_heads, 1,
+                                   12 * 32, 1, 1,   /* must match WW_WARPS */
+                                   smem, r->stream,
+                                   args, NULL);
+                }
+            } else if (r->tc_flash ||
+                       (r->tc_attn && r->use_f16 && n_patches > r->flash_full_n)) {
+                /* Tensor-core flash full attention: attn_prefill_vision_f32.
+                 * mma.sync m16n8k16 (F16 frags, F32 accum) + online softmax,
+                 * O(N) memory; reads F32 qkv directly, stages each 16-key K/V
+                 * tile into shared. Grid (n_heads, ceil(N/64)); block 128
+                 * (4 warps, 16 queries each).
+                 *
+                 * This is the O(N)-memory fallback above the flash_full_n
+                 * crossover (where the materialized path's [N,N] F32 scratch
+                 * would OOM the 16 GB card). NOTE: benchmarking showed it is
+                 * still 4-14% SLOWER than the materialized cuBLAS path even
+                 * with shared K/V staging -- cuBLAS's larger tiles / cp.async
+                 * pipelining win, and head_dim=72 wastes ~half the 5th k16
+                 * fragment. So it does NOT replace materialized below the
+                 * crossover; it is a much better fallback than the CUDA-core
+                 * flash_attn_full_f32 (which was 3.6-5.5x slower). VLM_TC_FLASH=1
+                 * forces it at every size for A/B testing. */
+                int n_qtiles64 = (n_patches + 63) / 64;
+                size_t smem = (size_t)2 * 16 * head_dim * sizeof(float);
+                void *args[] = {
+                    &r->d_attn_out, &r->d_qkv,
+                    &n_patches, &dim, &n_heads, &head_dim, &scale
+                };
+                cuLaunchKernel(r->fn_attn_prefill_vision_f32,
+                               n_heads, n_qtiles64, 1,
+                               128, 1, 1,
+                               smem, r->stream,
+                               args, NULL);
+            } else if (r->tc_attn && r->use_f16) {
+                /* Tensor-core full attention: cuBLAS QK^T (F16->F32) -> row
+                 * softmax (->F16 probs) -> P*V (F16->F32), one head at a time.
+                 * All ops share r->stream so the per-head scores/probs scratch
+                 * is safely reused across heads. */
+                long total = (long)n_patches * 3 * dim;
+                int egrid = (int)((total + 255) / 256);
+                void *eargs[] = { &r->d_qh_f16, &r->d_kh_f16, &r->d_vh_f16,
+                                  &r->d_qkv, &n_patches, &dim, &n_heads, &head_dim };
+                cuLaunchKernel(r->fn_attn_extract_heads, egrid, 1, 1,
+                               256, 1, 1, 0, r->stream, eargs, NULL);
+                size_t hbytes = (size_t)n_patches * head_dim * sizeof(unsigned short);
+                size_t sm_red = 256 * sizeof(float);
+                for (int h = 0; h < n_heads; h++) {
+                    CUdeviceptr qh = r->d_qh_f16 + (size_t)h * hbytes;
+                    CUdeviceptr kh = r->d_kh_f16 + (size_t)h * hbytes;
+                    CUdeviceptr vh = r->d_vh_f16 + (size_t)h * hbytes;
+                    /* S[N,N] = Q[N,d] * K[N,d]^T  (raw dot; scale folded in softmax) */
+                    cublasew_gemm_f16_f16_f32_rowmajor_nt(r->cublas, r->d_attn_scores,
+                                                          kh, qh, n_patches, n_patches, head_dim);
+                    void *sargs[] = { &r->d_attn_probs, &r->d_attn_scores, &n_patches, &scale };
+                    cuLaunchKernel(r->fn_attn_softmax_rows, n_patches, 1, 1,
+                                   256, 1, 1, sm_red, r->stream, sargs, NULL);
+                    /* O[N,d] = P[N,N] * V[N,d] written into interleaved attn_out (ld=dim) */
+                    CUdeviceptr oh = r->d_attn_out + (size_t)h * head_dim * sizeof(float);
+                    cublasew_gemm_f16_f16_f32_rowmajor_nn(r->cublas, oh, dim,
+                                                          r->d_attn_probs, vh,
+                                                          n_patches, head_dim, n_patches);
+                }
+            } else {
+                /* Flash attention (online softmax). FA_WARPS/FA_TILE_K must match the
+                 * kernel's #defines. One warp per query; K/V tiled into shared mem. */
+                const int fa_warps = 16, fa_tile_k = 16;
+                int n_qtiles = (n_patches + fa_warps - 1) / fa_warps;
+                size_t smem = (size_t)2 * fa_tile_k * head_dim * sizeof(float);
+                void *args[] = {
+                    &r->d_attn_out, &r->d_qkv,
+                    &n_patches, &dim, &n_heads, &head_dim, &scale
+                };
+                cuLaunchKernel(r->fn_flash_attn_f32,
+                               n_qtiles, n_heads, 1,
+                               fa_warps * 32, 1, 1,
+                               smem, r->stream,
+                               args, NULL);
+            }
+        }
+
+        /* Attn output projection */
+        vlm_gemm(r, r->d_hidden2, &blk->attn_out, r->d_attn_out, n_patches, dim, dim);
+
+        /* Residual: hidden += hidden2 */
+        {
+            int n = n_patches * dim;
+            int grid = (n + 255) / 256;
+            void *args[] = { &r->d_hidden, &r->d_hidden2, &n };
+            cuLaunchKernel(r->fn_add_f32,
+                           grid, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+        }
+
+        /* LayerNorm2 (emits F16 on the Blackwell path to fold the ffn-up-input cast). */
+        {
+            float eps = r->ln_eps;
+            size_t smem = 256 * sizeof(float);
+            CUdeviceptr ln_dst = use_f16_ln ? r->d_ln_buf_f16 : r->d_ln_buf;
+            void *args[] = { &ln_dst, &r->d_hidden, &blk->ln2_w, &blk->ln2_b, &dim, &eps };
+            cuLaunchKernel(use_f16_ln ? r->fn_layernorm_f32_f16 : r->fn_layernorm_f32,
+                           n_patches, 1, 1,
+                           256, 1, 1,
+                           smem, r->stream,
+                           args, NULL);
+        }
+
+        /* FFN: up -> GELU -> down. On the Blackwell F16 cuBLAS path the up-proj uses
+         * a BIAS-only epilogue (fused INLINE in the GEMM, no side kernel), then a
+         * single gelu+cast kernel writes F16 straight into d_ffn_buf_f16 so the
+         * down-proj reads it with no separate F32->F16 recast (the largest cast).
+         * GELU_BIAS-with-F16-output is unsupported by cuBLASLt here, hence this
+         * split. The up-proj reads the F16 LayerNorm output directly when present
+         * (use_f16_ln), folding its input cast too. Otherwise: fused/separate F32. */
+        int ffn_f16_path = (r->use_f16 && r->use_cublas && r->cublas &&
+                            blk->ffn_down.w_f16 && r->d_ffn_buf_f16 &&
+                            !r->cublas_mixed_ok && cublasew_lt_available(r->cublas) == 0);
+        if (ffn_f16_path) {
+            /* up-proj (bias fused inline, no gelu) reads the F16 LayerNorm output
+             * directly when present (folds its input cast); then a single gelu+cast
+             * kernel writes F16 into d_ffn_buf_f16 for the down-proj. (We cannot emit
+             * F16 from the GEMM epilogue here: cuBLASLt has no F16-output BIAS/GELU
+             * epilogue on sm_120, so this fused gelu+cast pass stays.) */
+            if (use_f16_ln)
+                vlm_gemm_x_f16(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf_f16, n_patches, ffn_dim, dim);
+            else
+                vlm_gemm_ex(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim, 0);
+            vlm_launch_gelu_f16(r, r->d_ffn_buf_f16, r->d_ffn_buf, n_patches * ffn_dim);
+            vlm_gemm_x_f16(r, r->d_hidden2, &blk->ffn_down, r->d_ffn_buf_f16,
+                           n_patches, dim, ffn_dim);
+        } else {
+            if (use_f16_ln) {
+                /* F16 ln output, but no fused-gelu F16 down path: gelu separately. */
+                vlm_gemm_x_f16(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf_f16, n_patches, ffn_dim, dim);
+                vlm_launch_gelu(r, r->d_ffn_buf, n_patches * ffn_dim);
+            } else {
+                vlm_gemm_ex(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim, 1);
+            }
+            vlm_gemm(r, r->d_hidden2, &blk->ffn_down, r->d_ffn_buf, n_patches, dim, ffn_dim);
+        }
+
+        /* Residual: hidden += hidden2 */
+        {
+            int n = n_patches * dim;
+            int grid = (n + 255) / 256;
+            void *args[] = { &r->d_hidden, &r->d_hidden2, &n };
+            cuLaunchKernel(r->fn_add_f32,
+                           grid, 1, 1,
+                           256, 1, 1,
+                           0, r->stream,
+                           args, NULL);
+        }
+
+        /* Debug: check hidden and qkv after first block */
+        if (l == 0 && r->verbose >= 2) {
+            cuStreamSynchronize(r->stream);
+            float dbg[8];
+            cuMemcpyDtoH(dbg, r->d_hidden, 8 * sizeof(float));
+            fprintf(stderr, "  [DBG] hidden after block 0: %.6f %.6f %.6f %.6f\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3]);
+            cuMemcpyDtoH(dbg, r->d_qkv, 8 * sizeof(float));
+            fprintf(stderr, "  [DBG] qkv[0..3] after block 0: %.6f %.6f %.6f %.6f\n",
+                    dbg[0], dbg[1], dbg[2], dbg[3]);
+        }
+
+        /* DeepStack extraction */
+        for (int ds = 0; ds < r->n_deepstack; ds++) {
+            if (r->deepstack_indices[ds] != l) continue;
+
+            fprintf(stderr, "  deepstack at layer %d\n", l);
+            gpu_deepstack *dsl = &r->deepstack[ds];
+
+            /* Spatial merge current hidden -> merge_buf */
+            {
+                void *args[] = { &r->d_merge_buf, &r->d_hidden, &gw, &sm, &dim };
+                cuLaunchKernel(r->fn_spatial_merge_f32,
+                               n_merged, 1, 1,
+                               256, 1, 1,
+                               0, r->stream,
+                               args, NULL);
+            }
+
+            /* LayerNorm on merge_buf */
+            {
+                float eps = r->ln_eps;
+                size_t smem = 256 * sizeof(float);
+                void *args[] = { &r->d_merge_buf, &r->d_merge_buf,
+                                 &dsl->norm_w, &dsl->norm_b, &merged_dim, &eps };
+                cuLaunchKernel(r->fn_layernorm_f32,
+                               n_merged, 1, 1,
+                               256, 1, 1,
+                               smem, r->stream,
+                               args, NULL);
+            }
+
+            /* fc1: [merged_dim -> merged_dim], bias+GELU fused into epilogue */
+            vlm_gemm_ex(r, r->d_mm_buf, &dsl->fc1, r->d_merge_buf, n_merged, merged_dim, merged_dim, 1);
+
+            /* fc2: [merged_dim -> proj_dim] */
+            vlm_gemm(r, r->d_mm_out, &dsl->fc2, r->d_mm_buf, n_merged, r->proj_dim, merged_dim);
+
+            /* Copy to deepstack feature buffer at offset ds_count */
+            {
+                size_t offset = (size_t)ds_count * n_merged * r->proj_dim * sizeof(float);
+                CUdeviceptr dst = r->d_ds_feats + offset;
+                cuMemcpyDtoDAsync(dst, r->d_mm_out,
+                                   (size_t)n_merged * r->proj_dim * sizeof(float),
+                                   r->stream);
+            }
+            ds_count++;
+        }
+    }
+    if (ds_count_out) *ds_count_out = ds_count;
+}
 
 float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int width, int height) {
     if (!r || !r->loaded) return NULL;
@@ -1122,21 +2224,20 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     /* 1. Upload RGB to GPU */
     cuMemcpyHtoD(r->d_rgb, rgb_norm, (size_t)width * height * 3 * sizeof(float));
 
-    /* 2. Patch embedding (dual conv2d) */
-    fprintf(stderr, "  patch embedding (dual conv2d)...\n");
+    /* 2. Patch embedding: im2col + GEMM (w1 already folded into w0 at load). */
+    fprintf(stderr, "  patch embedding (im2col + GEMM)...\n");
     t0 = vlm_time_ms();
     {
         int img_w = width;
-        void *args[] = {
-            &r->d_hidden, &r->d_rgb,
-            &r->d_patch_w0, &r->d_patch_w1, &r->d_patch_bias,
-            &gw, &dim, &ps, &img_w
-        };
-        cuLaunchKernel(r->fn_patch_embed_dual_f32,
+        int ks = ps * ps * 3;
+        void *im_args[] = { &r->d_patch_pix, &r->d_rgb, &gw, &ps, &img_w };
+        cuLaunchKernel(r->fn_patch_im2col_f32,
                        n_patches, 1, 1,
                        256, 1, 1,
                        0, r->stream,
-                       args, NULL);
+                       im_args, NULL);
+        gpu_weight pw = { .w_f32 = r->d_patch_w0, .w_f16 = 0, .bias = r->d_patch_bias };
+        vlm_gemm(r, r->d_hidden, &pw, r->d_patch_pix, n_patches, dim, ks);
     }
     cuStreamSynchronize(r->stream);
     t_patch = vlm_time_ms() - t0;
@@ -1173,34 +2274,41 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
                            0, r->stream,
                            args, NULL);
         } else {
-            /* Bilinear interpolation on CPU, upload to d_pos_interp */
-            fprintf(stderr, "  interpolating pos embedding: %dx%d -> %dx%d\n",
-                    orig_gw, orig_gh, gw, gh);
-            float *interp = (float *)malloc((size_t)n_patches * dim * sizeof(float));
-            for (int py = 0; py < gh; py++) {
-                float sy = (float)py * (orig_gh - 1) / (gh > 1 ? gh - 1 : 1);
-                int y0 = (int)sy, y1 = (y0 + 1 < orig_gh) ? y0 + 1 : y0;
-                float wy = sy - y0;
-                for (int px = 0; px < gw; px++) {
-                    float sx = (float)px * (orig_gw - 1) / (gw > 1 ? gw - 1 : 1);
-                    int x0 = (int)sx, x1 = (x0 + 1 < orig_gw) ? x0 + 1 : x0;
-                    float wx = sx - x0;
-                    int dst_idx = (py * gw + px) * dim;
-                    int s00 = (y0 * orig_gw + x0) * dim;
-                    int s01 = (y0 * orig_gw + x1) * dim;
-                    int s10 = (y1 * orig_gw + x0) * dim;
-                    int s11 = (y1 * orig_gw + x1) * dim;
-                    for (int d = 0; d < dim; d++) {
-                        interp[dst_idx + d] =
-                            r->h_pos_embd[s00+d] * (1-wy)*(1-wx) +
-                            r->h_pos_embd[s01+d] * (1-wy)*wx +
-                            r->h_pos_embd[s10+d] * wy*(1-wx) +
-                            r->h_pos_embd[s11+d] * wy*wx;
+            /* Bilinear interpolation on CPU, upload to d_pos_interp. The result is
+             * size-invariant, so cache it: d_pos_interp persists across encodes and
+             * nothing else writes it, so a repeated (gw,gh) reuses the resident buffer
+             * and skips the ~1M-elem CPU loop + the multi-MB HtoD (the dominant cost
+             * at non-native sizes, e.g. ~2.9 ms/encode at 512²). */
+            if (r->pos_interp_w != gw || r->pos_interp_h != gh) {
+                fprintf(stderr, "  interpolating pos embedding: %dx%d -> %dx%d\n",
+                        orig_gw, orig_gh, gw, gh);
+                float *interp = (float *)malloc((size_t)n_patches * dim * sizeof(float));
+                for (int py = 0; py < gh; py++) {
+                    float sy = (float)py * (orig_gh - 1) / (gh > 1 ? gh - 1 : 1);
+                    int y0 = (int)sy, y1 = (y0 + 1 < orig_gh) ? y0 + 1 : y0;
+                    float wy = sy - y0;
+                    for (int px = 0; px < gw; px++) {
+                        float sx = (float)px * (orig_gw - 1) / (gw > 1 ? gw - 1 : 1);
+                        int x0 = (int)sx, x1 = (x0 + 1 < orig_gw) ? x0 + 1 : x0;
+                        float wx = sx - x0;
+                        int dst_idx = (py * gw + px) * dim;
+                        int s00 = (y0 * orig_gw + x0) * dim;
+                        int s01 = (y0 * orig_gw + x1) * dim;
+                        int s10 = (y1 * orig_gw + x0) * dim;
+                        int s11 = (y1 * orig_gw + x1) * dim;
+                        for (int d = 0; d < dim; d++) {
+                            interp[dst_idx + d] =
+                                r->h_pos_embd[s00+d] * (1-wy)*(1-wx) +
+                                r->h_pos_embd[s01+d] * (1-wy)*wx +
+                                r->h_pos_embd[s10+d] * wy*(1-wx) +
+                                r->h_pos_embd[s11+d] * wy*wx;
+                        }
                     }
                 }
+                cuMemcpyHtoD(r->d_pos_interp, interp, (size_t)n_patches * dim * sizeof(float));
+                free(interp);
+                r->pos_interp_w = gw; r->pos_interp_h = gh;
             }
-            cuMemcpyHtoD(r->d_pos_interp, interp, (size_t)n_patches * dim * sizeof(float));
-            free(interp);
 
             /* Add interpolated pos embedding directly (no pos_map needed) */
             void *args[] = { &r->d_hidden, &r->d_pos_interp, &dim, &n_patches };
@@ -1324,225 +2432,54 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     int ds_count = 0;
     t0 = vlm_time_ms();
 
-    for (int l = 0; l < r->n_blocks; l++) {
-        if (l == 0 || l == r->n_blocks - 1 || (l + 1) % 6 == 0)
-            fprintf(stderr, "  vit block %d/%d\n", l, r->n_blocks);
-
-        gpu_vit_block *blk = &r->blocks[l];
-
-        /* LayerNorm1 */
-        {
-            float eps = r->ln_eps;
-            size_t smem = 256 * sizeof(float);
-            void *args[] = { &r->d_ln_buf, &r->d_hidden, &blk->ln1_w, &blk->ln1_b, &dim, &eps };
-            cuLaunchKernel(r->fn_layernorm_f32,
-                           n_patches, 1, 1,
-                           256, 1, 1,
-                           smem, r->stream,
-                           args, NULL);
+    /* The 27 ViT blocks issue ~288 host launches/encode (per-head full attention),
+     * which left the GPU ~20 ms idle/encode (host-launch-bound). Capture the loop
+     * once into a CUDA graph per image size, then replay it. Encode #1 runs normally
+     * (settles cublas_mixed_ok, warms cuBLAS algos/workspace); encode #2 captures
+     * (only when verbose<2 -- the in-loop debug syncs/DtoH would break capture -- and
+     * no DeepStack, whose host-side ds_count cannot survive replay); #3+ replay. The
+     * pre/post window reorder+swaps are net-identity per encode, so the loop sees the
+     * same physical d_hidden/d_hidden2 every time and the baked graph pointers stay
+     * valid. A capture or instantiate failure disables graphs and falls back to the
+     * per-layer launches. */
+    int gph = (r->use_graph && r->n_deepstack == 0);
+    if (gph && (r->graph_w != gw || r->graph_h != gh)) {
+        vlm_graph_reset(r);
+        r->graph_w = gw; r->graph_h = gh; r->graph_warm = 0;
+    }
+    if (gph && r->graph_ready) {
+        cuGraphLaunch(r->graph_exec, r->stream);
+    } else if (gph && r->graph_warm >= 1 && r->verbose < 2 && r->use_cublas && r->cublas &&
+               cuStreamBeginCapture_v2(r->stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) == CUDA_SUCCESS) {
+        r->capturing = 1;
+        vlm_run_vit_blocks(r, n_patches, n_merged, dim, n_heads, head_dim, half,
+                           ffn_dim, merged_dim, gw, sm, use_window_attn,
+                           n_windows, max_window_tokens, &ds_count);
+        r->capturing = 0;
+        CUgraph g = NULL;
+        CUresult ec = cuStreamEndCapture(r->stream, &g);
+        if (ec == CUDA_SUCCESS && g &&
+            cuGraphInstantiateWithFlags(&r->graph_exec, g, 0) == CUDA_SUCCESS) {
+            r->graph = g;
+            r->graph_ready = 1;
+            if (r->verbose >= 1)
+                fprintf(stderr, "cuda_vlm: CUDA graph captured (%dx%d, %d blocks)\n",
+                        gw * ps, gh * ps, r->n_blocks);
+            cuGraphLaunch(r->graph_exec, r->stream);  /* capture only records; run it now */
+        } else {
+            if (g) cuGraphDestroy(g);
+            r->use_graph = 0;
+            fprintf(stderr, "cuda_vlm: CUDA graph capture failed (ec=%d), "
+                    "using per-layer launches\n", (int)ec);
+            vlm_run_vit_blocks(r, n_patches, n_merged, dim, n_heads, head_dim, half,
+                               ffn_dim, merged_dim, gw, sm, use_window_attn,
+                               n_windows, max_window_tokens, &ds_count);
         }
-
-        /* QKV projection */
-        {
-            int n_out = 3 * dim;
-            vlm_gemm(r, r->d_qkv, &blk->attn_qkv, r->d_ln_buf, n_patches, n_out, dim);
-        }
-
-        /* Debug: check QKV right after GEMM (before RoPE) */
-        if (l == 0 && r->verbose >= 2) {
-            cuStreamSynchronize(r->stream);
-            float dbg[8];
-            cuMemcpyDtoH(dbg, r->d_qkv, 8 * sizeof(float));
-            fprintf(stderr, "  [DBG] qkv after GEMM (pre-RoPE), block 0: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
-            cuMemcpyDtoH(dbg, r->d_ln_buf, 8 * sizeof(float));
-            fprintf(stderr, "  [DBG] ln_buf (QKV input), block 0: %.6f %.6f %.6f %.6f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3]);
-            /* Check weight values */
-            if (r->use_f16 && blk->attn_qkv.w_f16) {
-                uint16_t wdbg[8];
-                cuMemcpyDtoH(wdbg, blk->attn_qkv.w_f16, 8 * sizeof(uint16_t));
-                fprintf(stderr, "  [DBG] QKV weight F16[0..3]: %04x %04x %04x %04x (%.6f %.6f %.6f %.6f)\n",
-                        wdbg[0], wdbg[1], wdbg[2], wdbg[3],
-                        ggml_fp16_to_fp32(wdbg[0]), ggml_fp16_to_fp32(wdbg[1]),
-                        ggml_fp16_to_fp32(wdbg[2]), ggml_fp16_to_fp32(wdbg[3]));
-            } else if (blk->attn_qkv.w_f32) {
-                float wdbg[4];
-                cuMemcpyDtoH(wdbg, blk->attn_qkv.w_f32, 4 * sizeof(float));
-                fprintf(stderr, "  [DBG] QKV weight F32[0..3]: %.6f %.6f %.6f %.6f\n",
-                        wdbg[0], wdbg[1], wdbg[2], wdbg[3]);
-            }
-        }
-
-        /* M-RoPE on Q and K */
-        {
-            void *args[] = {
-                &r->d_qkv, &r->d_rope_cos, &r->d_rope_sin,
-                &n_patches, &n_heads, &dim, &head_dim, &half
-            };
-            cuLaunchKernel(r->fn_rope_vision_f32,
-                           n_patches * n_heads, 1, 1,
-                           half, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
-
-        /* Multi-head self-attention */
-        {
-            float scale = 1.0f / sqrtf((float)head_dim);
-            int use_local_attn = use_window_attn && ((l + 1) % r->n_wa_pattern != 0);
-            if (use_local_attn) {
-                size_t smem = (size_t)(max_window_tokens + 256) * sizeof(float);
-                void *args[] = {
-                    &r->d_attn_out, &r->d_qkv,
-                    &r->d_window_starts, &r->d_window_sizes,
-                    &dim, &n_heads, &head_dim, &scale
-                };
-                cuLaunchKernel(r->fn_attn_window_f32,
-                               n_heads, n_windows, 1,
-                               256, 1, 1,
-                               smem, r->stream,
-                               args, NULL);
-            } else {
-                /* Shared memory: n_patches (scores) + 256 (reduction scratch) */
-                size_t smem = (n_patches + 256) * sizeof(float);
-                void *args[] = {
-                    &r->d_attn_out, &r->d_qkv,
-                    &n_patches, &dim, &n_heads, &head_dim, &scale
-                };
-                cuLaunchKernel(r->fn_attn_full_f32,
-                               n_heads, 1, 1,
-                               256, 1, 1,
-                               smem, r->stream,
-                               args, NULL);
-            }
-        }
-
-        /* Attn output projection */
-        vlm_gemm(r, r->d_hidden2, &blk->attn_out, r->d_attn_out, n_patches, dim, dim);
-
-        /* Residual: hidden += hidden2 */
-        {
-            int n = n_patches * dim;
-            int grid = (n + 255) / 256;
-            void *args[] = { &r->d_hidden, &r->d_hidden2, &n };
-            cuLaunchKernel(r->fn_add_f32,
-                           grid, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
-
-        /* LayerNorm2 */
-        {
-            float eps = r->ln_eps;
-            size_t smem = 256 * sizeof(float);
-            void *args[] = { &r->d_ln_buf, &r->d_hidden, &blk->ln2_w, &blk->ln2_b, &dim, &eps };
-            cuLaunchKernel(r->fn_layernorm_f32,
-                           n_patches, 1, 1,
-                           256, 1, 1,
-                           smem, r->stream,
-                           args, NULL);
-        }
-
-        /* FFN: up -> GELU -> down */
-        vlm_gemm(r, r->d_ffn_buf, &blk->ffn_up, r->d_ln_buf, n_patches, ffn_dim, dim);
-
-        {
-            int n = n_patches * ffn_dim;
-            int grid = (n + 255) / 256;
-            void *args[] = { &r->d_ffn_buf, &n };
-            cuLaunchKernel(r->fn_gelu_f32,
-                           grid, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
-
-        vlm_gemm(r, r->d_hidden2, &blk->ffn_down, r->d_ffn_buf, n_patches, dim, ffn_dim);
-
-        /* Residual: hidden += hidden2 */
-        {
-            int n = n_patches * dim;
-            int grid = (n + 255) / 256;
-            void *args[] = { &r->d_hidden, &r->d_hidden2, &n };
-            cuLaunchKernel(r->fn_add_f32,
-                           grid, 1, 1,
-                           256, 1, 1,
-                           0, r->stream,
-                           args, NULL);
-        }
-
-        /* Debug: check hidden and qkv after first block */
-        if (l == 0 && r->verbose >= 2) {
-            cuStreamSynchronize(r->stream);
-            float dbg[8];
-            cuMemcpyDtoH(dbg, r->d_hidden, 8 * sizeof(float));
-            fprintf(stderr, "  [DBG] hidden after block 0: %.6f %.6f %.6f %.6f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3]);
-            cuMemcpyDtoH(dbg, r->d_qkv, 8 * sizeof(float));
-            fprintf(stderr, "  [DBG] qkv[0..3] after block 0: %.6f %.6f %.6f %.6f\n",
-                    dbg[0], dbg[1], dbg[2], dbg[3]);
-        }
-
-        /* DeepStack extraction */
-        for (int ds = 0; ds < r->n_deepstack; ds++) {
-            if (r->deepstack_indices[ds] != l) continue;
-
-            fprintf(stderr, "  deepstack at layer %d\n", l);
-            gpu_deepstack *dsl = &r->deepstack[ds];
-
-            /* Spatial merge current hidden -> merge_buf */
-            {
-                void *args[] = { &r->d_merge_buf, &r->d_hidden, &gw, &sm, &dim };
-                cuLaunchKernel(r->fn_spatial_merge_f32,
-                               n_merged, 1, 1,
-                               256, 1, 1,
-                               0, r->stream,
-                               args, NULL);
-            }
-
-            /* LayerNorm on merge_buf */
-            {
-                float eps = r->ln_eps;
-                size_t smem = 256 * sizeof(float);
-                void *args[] = { &r->d_merge_buf, &r->d_merge_buf,
-                                 &dsl->norm_w, &dsl->norm_b, &merged_dim, &eps };
-                cuLaunchKernel(r->fn_layernorm_f32,
-                               n_merged, 1, 1,
-                               256, 1, 1,
-                               smem, r->stream,
-                               args, NULL);
-            }
-
-            /* fc1: [merged_dim -> merged_dim] */
-            vlm_gemm(r, r->d_mm_buf, &dsl->fc1, r->d_merge_buf, n_merged, merged_dim, merged_dim);
-
-            /* GELU */
-            {
-                int n = n_merged * merged_dim;
-                int grid = (n + 255) / 256;
-                void *args[] = { &r->d_mm_buf, &n };
-                cuLaunchKernel(r->fn_gelu_f32,
-                               grid, 1, 1,
-                               256, 1, 1,
-                               0, r->stream,
-                               args, NULL);
-            }
-
-            /* fc2: [merged_dim -> proj_dim] */
-            vlm_gemm(r, r->d_mm_out, &dsl->fc2, r->d_mm_buf, n_merged, r->proj_dim, merged_dim);
-
-            /* Copy to deepstack feature buffer at offset ds_count */
-            {
-                size_t offset = (size_t)ds_count * n_merged * r->proj_dim * sizeof(float);
-                CUdeviceptr dst = r->d_ds_feats + offset;
-                cuMemcpyDtoDAsync(dst, r->d_mm_out,
-                                   (size_t)n_merged * r->proj_dim * sizeof(float),
-                                   r->stream);
-            }
-            ds_count++;
-        }
+    } else {
+        vlm_run_vit_blocks(r, n_patches, n_merged, dim, n_heads, head_dim, half,
+                           ffn_dim, merged_dim, gw, sm, use_window_attn,
+                           n_windows, max_window_tokens, &ds_count);
+        if (gph) r->graph_warm++;
     }
     cuStreamSynchronize(r->stream);
     t_vit = vlm_time_ms() - t0;
@@ -1588,21 +2525,10 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     cuStreamSynchronize(r->stream);
     t_merge = vlm_time_ms() - t0;
 
-    /* 8. MM projection: mm.0 -> GELU -> mm.2 */
+    /* 8. MM projection: mm.0 -> GELU -> mm.2, bias+GELU fused into mm.0 epilogue */
     fprintf(stderr, "  mm projection...\n");
     t0 = vlm_time_ms();
-    vlm_gemm(r, r->d_mm_buf, &r->mm0, r->d_merge_buf, n_merged, merged_dim, merged_dim);
-
-    {
-        int n = n_merged * merged_dim;
-        int grid = (n + 255) / 256;
-        void *args[] = { &r->d_mm_buf, &n };
-        cuLaunchKernel(r->fn_gelu_f32,
-                       grid, 1, 1,
-                       256, 1, 1,
-                       0, r->stream,
-                       args, NULL);
-    }
+    vlm_gemm_ex(r, r->d_mm_buf, &r->mm0, r->d_merge_buf, n_merged, merged_dim, merged_dim, 1);
 
     vlm_gemm(r, r->d_mm_out, &r->mm2, r->d_mm_buf, n_merged, r->proj_dim, merged_dim);
     cuStreamSynchronize(r->stream);
@@ -1627,33 +2553,32 @@ float *cuda_vision_encode(cuda_vision_runner *r, const float *rgb_norm, int widt
     cuStreamSynchronize(r->stream);
 
     int total_embd = r->proj_dim * (1 + r->n_deepstack);
-    float *result = (float *)calloc(n_merged * total_embd, sizeof(float));
+    float *result = (float *)malloc((size_t)n_merged * total_embd * sizeof(float));
 
-    /* Copy main embeddings */
-    float *mm_host = (float *)malloc((size_t)n_merged * r->proj_dim * sizeof(float));
-    cuMemcpyDtoH(mm_host, r->d_mm_out, (size_t)n_merged * r->proj_dim * sizeof(float));
-
-    /* Copy deepstack features */
-    float *ds_host = NULL;
-    if (ds_count > 0) {
-        ds_host = (float *)malloc((size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
+    if (ds_count == 0) {
+        /* No DeepStack: the output IS d_mm_out, so DtoH straight into result --
+         * skips the staging malloc, the 11.8 MB zero-fill, and the interleave copy
+         * the general path below would do (this was ~half the untimed host tail). */
+        cuMemcpyDtoH(result, r->d_mm_out, (size_t)n_merged * r->proj_dim * sizeof(float));
+    } else {
+        /* DeepStack: interleave [main, ds0, ds1, ...] per token from staged copies. */
+        float *mm_host = (float *)malloc((size_t)n_merged * r->proj_dim * sizeof(float));
+        float *ds_host = (float *)malloc((size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
+        cuMemcpyDtoH(mm_host, r->d_mm_out, (size_t)n_merged * r->proj_dim * sizeof(float));
         cuMemcpyDtoH(ds_host, r->d_ds_feats,
-                      (size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
-    }
-
-    /* Interleave: [main, ds0, ds1, ...] per token */
-    for (int t = 0; t < n_merged; t++) {
-        float *dst = result + t * total_embd;
-        memcpy(dst, mm_host + t * r->proj_dim, r->proj_dim * sizeof(float));
-        for (int d = 0; d < ds_count; d++) {
-            memcpy(dst + (1 + d) * r->proj_dim,
-                   ds_host + d * n_merged * r->proj_dim + t * r->proj_dim,
-                   r->proj_dim * sizeof(float));
+                     (size_t)ds_count * n_merged * r->proj_dim * sizeof(float));
+        for (int t = 0; t < n_merged; t++) {
+            float *dst = result + t * total_embd;
+            memcpy(dst, mm_host + t * r->proj_dim, r->proj_dim * sizeof(float));
+            for (int d = 0; d < ds_count; d++) {
+                memcpy(dst + (1 + d) * r->proj_dim,
+                       ds_host + d * n_merged * r->proj_dim + t * r->proj_dim,
+                       r->proj_dim * sizeof(float));
+            }
         }
+        free(mm_host);
+        free(ds_host);
     }
-
-    free(mm_host);
-    free(ds_host);
 
     if (r->verbose >= 1) {
         fprintf(stderr,
@@ -1695,6 +2620,9 @@ static void vlm_free_weight(gpu_weight *w) {
 
 void cuda_vision_free(cuda_vision_runner *r) {
     if (!r) return;
+
+    /* Tear down any captured ViT-block graph before freeing its device buffers */
+    vlm_graph_reset(r);
 
     /* Free weights */
     if (r->d_patch_w0) cuMemFree(r->d_patch_w0);
@@ -1739,7 +2667,9 @@ void cuda_vision_free(cuda_vision_runner *r) {
     if (r->d_qkv) cuMemFree(r->d_qkv);
     if (r->d_attn_out) cuMemFree(r->d_attn_out);
     if (r->d_ffn_buf) cuMemFree(r->d_ffn_buf);
+    if (r->d_ffn_buf_f16) cuMemFree(r->d_ffn_buf_f16);
     if (r->d_ln_buf) cuMemFree(r->d_ln_buf);
+    if (r->d_ln_buf_f16) cuMemFree(r->d_ln_buf_f16);
     if (r->d_merge_buf) cuMemFree(r->d_merge_buf);
     if (r->d_mm_buf) cuMemFree(r->d_mm_buf);
     if (r->d_mm_out) cuMemFree(r->d_mm_out);
@@ -1753,6 +2683,13 @@ void cuda_vision_free(cuda_vision_runner *r) {
     if (r->d_window_sizes) cuMemFree(r->d_window_sizes);
     if (r->d_pos_interp) cuMemFree(r->d_pos_interp);
     if (r->d_ds_feats) cuMemFree(r->d_ds_feats);
+    if (r->d_x_f16) cuMemFree(r->d_x_f16);
+    if (r->d_qh_f16) cuMemFree(r->d_qh_f16);
+    if (r->d_kh_f16) cuMemFree(r->d_kh_f16);
+    if (r->d_vh_f16) cuMemFree(r->d_vh_f16);
+    if (r->d_attn_scores) cuMemFree(r->d_attn_scores);
+    if (r->d_attn_probs) cuMemFree(r->d_attn_probs);
+    if (r->d_patch_pix) cuMemFree(r->d_patch_pix);
 
     free(r->h_pos_embd);
     free(r->h_output);

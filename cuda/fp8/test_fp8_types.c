@@ -342,15 +342,17 @@ static void test_e4m3_vs_e5m2_precision(void) {
 /* ---- Exhaustive decode-encode consistency ---- */
 
 static void test_e4m3_exhaustive_roundtrip(void) {
-    TEST("e4m3: exhaustive normal-value decode->encode consistency");
+    TEST("e4m3: exhaustive decode->encode consistency (incl. subnormals/max)");
     int mismatches = 0;
     for (int i = 0; i < 256; i++) {
         fp8_e4m3_t orig = (fp8_e4m3_t)i;
         int exp = (orig >> 3) & 0xF;
-        /* Skip NaN (exp=15,mant=7), zero/denormals (exp=0),
-         * and max exponent (exp=15) where encoder has a known saturation bug:
-         * all exp=15 values incorrectly clamp to (exp=15,mant=6)=448 */
-        if (exp == 0 || exp == 15) continue;
+        int mant = orig & 0x7;
+        /* Only the two NaN encodings (exp=15,mant=7) can't round-trip; every
+         * finite value — subnormals (exp=0) and the top octave (exp=15)
+         * included — must survive decode->encode->decode now that the encoder
+         * does RNE + saturate-to-finite. */
+        if (exp == 15 && mant == 7) continue;
         float f = fp8_e4m3_to_float(orig);
         fp8_e4m3_t re = float_to_fp8_e4m3(f);
         float f2 = fp8_e4m3_to_float(re);

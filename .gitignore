@@ -60,7 +60,13 @@ cpu/sam3d_body/samples/*.obj.json
 # Build artifact binaries — CUDA runners
 cuda/llm/test_cuda_llm
 cuda/vlm/test_cuda_vlm
+cuda/da3/test_cuda_da3
+cuda/ppd/test_cuda_ppd
 cuda/fp8/fp8_gemm
+cuda/int8/int8_gemm
+cuda/int8/int8_attention
+cuda/int8/int8_ffn
+cuda/int8/cublas_int8_gemm
 cuda/sam3d/test_*
 !cuda/sam3d/test_*.c
 cuda/sam3d/verify_*
@@ -68,6 +74,23 @@ cuda/sam3d/verify_*
 cuda/sam3d_body/test_cuda_sam3d_body
 cuda/sam3d_body/verify_*
 !cuda/sam3d_body/verify_*.c
+
+# Generated CUDA runner binaries and outputs
+cuda/*/test_cuda_*
+!cuda/*/test_cuda_*.c
+cuda/*/test_*
+!cuda/*/test_*.c
+cuda/*/test_paint_*
+!cuda/*/test_paint_*.c
+cuda/*/verify_*
+!cuda/*/verify_*.c
+!cuda/*/verify_*.h
+cuda/*/cuda_*.ppm
+cuda/*/cuda_*.npy
+cuda/*/cuda_*.bin
+cuda/*/*.ppm
+cuda/*/cuda_output/
+cuda/*/output_*/
 
 # Build artifact binaries — unit tests
 tests/test_bpe_tokenizer
@@ -87,6 +110,9 @@ zen2/bench_*
 *.err
 
 # Build artifact binaries — sparse3d
+cpu/*/test_*
+!cpu/*/test_*.c
+cpu/*/logs/
 cpu/sparse3d/test_sparse3d
 cpu/dinov3/test_dinov3
 
@@ -127,6 +153,8 @@ ref/sam3d/.venv/
 ref/sam3d/__pycache__/
 ref/sam3d-body/.venv/
 ref/sam3d-body/__pycache__/
+ref/sam3.1/__pycache__/
+ref/ppd/__pycache__/
 server/sam3d/__pycache__/
 
 # External / generated
@@ -134,16 +162,25 @@ ref/*
 !ref/hy3d/
 !ref/trellis2/
 !ref/llm/
+!ref/sam3.1/
+ref/sam3.1/*
+!ref/sam3.1/gen_image_ref.py
 !ref/sam3d/
 !ref/sam3d/*.py
 !ref/sam3d/README.md
 !ref/sam3d-body/
 !ref/sam3d-body/*.py
 !ref/sam3d-body/README.md
+!ref/ppd/
+!ref/ppd/*.py
 result/
 
 # Local (uncommitted) runner scripts — per-box model paths / env
 server/run-*.local.sh
+server/build/
+server/logs/
+logs/
+trellis2_repo/
 
 # RDNA4 FP8: extracted hipBLASLt Tensile kernel ELF (regenerate via rdna4/fp8/extract_fp8_kernel.sh)
 rdna4/fp8/fp8_kernel_gfx1201.co

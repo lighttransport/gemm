@@ -1,4 +1,4 @@
-# CUDA SAM 3.1 runner (scaffold from cuda/sam3) (NVRTC, no nvcc).
+# CUDA SAM 3.1 runner (NVRTC, no nvcc).
 CC      = gcc
 CFLAGS  = -O3 -Wall -Wextra -I.. -march=native
 LDFLAGS = -ldl -lm -lpthread
@@ -62,7 +62,7 @@ $(VERIFY_MMA): verify_mma_gemm.c $(CUEW_SRC) ../cuew.h ../cuda_runner_common.h .
 	$(CC) $(CFLAGS) -o $@ verify_mma_gemm.c $(CUEW_SRC) $(LDFLAGS)
 
 CKPT   ?= $(MODELS)/sam3.1/sam3.1.model.safetensors
-REFDIR ?= /tmp/sam3_ref_cat
+REFDIR ?= /tmp/sam3.1_ref
 
 verify-patch-embed: $(VERIFY_PE)
 	./$(VERIFY_PE) --ckpt $(CKPT) --refdir $(REFDIR)
