@@ -115,19 +115,37 @@ static acc_result_t validate(const float *got, const float *ref, int n, double c
 }
 
 /* ---------- source builder: prepend #define header ---------- */
-static char *build_src(const char *body, int D, int BR, int BC, int causal, dtype_t dt) {
-    char hdr[512];
+static char *build_src(const char *body, int D, int BR, int BC, int causal, dtype_t dt, int minblk) {
+    char hdr[512]; char mb[48]; mb[0]=0;
+    if (minblk > 0) snprintf(mb, sizeof(mb), "#define FA2_MINBLK %d\n", minblk);
     snprintf(hdr, sizeof(hdr),
-        "#define FA2_D %d\n#define FA2_BR %d\n#define FA2_BC %d\n#define FA2_CAUSAL %d\n%s",
-        D, BR, BC, causal, (dt==DT_BF16) ? "#define FA2_BF16 1\n" : "");
+        "#define FA2_D %d\n#define FA2_BR %d\n#define FA2_BC %d\n#define FA2_CAUSAL %d\n%s%s",
+        D, BR, BC, causal, mb, (dt==DT_BF16) ? "#define FA2_BF16 1\n" : "");
     size_t n = strlen(hdr) + strlen(body) + 1;
     char *s = (char*)malloc(n);
     strcpy(s, hdr); strcat(s, body);
     return s;
 }
 
-/* per-D block sizing: BR=64 (4 warps x 16 rows); BC=32, except D=256 -> 16 (smem/regs) */
-static int pick_BC(int D) { return (D >= 256) ? 16 : 32; }
+/* KV-tile sizing (BR=64 fixed: 4 warps x 16 rows). Tuned per (dtype,D) on the
+ * RTX 5060 Ti: bf16/f16 at D=128 is occupancy-starved at BC=32 (only 2 blocks/SM)
+ * so BC=16 (~5 blocks/SM) wins ~3.5%; fp8 is compute-bound (m16n8k32, 2x rate) and
+ * already has enough occupancy, so the larger BC=32 tile wins; D=256 is forced to
+ * 16 by the O-accumulator reg/smem budget (and BCK>=1 needs BC>=16). See bench_log.md. */
+static int pick_BC(int D, dtype_t dt) {
+    if (D >= 256) return 16;
+    if (D >= 128) return (dt == DT_FP8) ? 32 : 16;
+    return 32;  /* D=64: BC=32 (already >=5 blocks/SM; larger tile amortizes loop) */
+}
+
+/* __launch_bounds__ min-blocks/SM hint (caps registers to raise occupancy).
+ * MEASURED on the RTX 5060 Ti: ALWAYS 0 (no hint). D=128 sits at the sweet spot of
+ * 164 regs / 3 blocks/SM; forcing 4 blocks (cap 128 regs) drops to 36.5 and 5
+ * blocks (cap 96 regs) to 25.8 TFLOP/s — the cap spills the O-accumulator to local
+ * memory and the DRAM traffic swamps the occupancy gain. The free way to more
+ * blocks is shrinking SMEM (see pick_BC), not capping registers. Knob kept (--minblk)
+ * for A/B only. */
+static int pick_MINBLK(int D, dtype_t dt) { (void)D; (void)dt; return 0; }
 
 int main(int argc, char **argv) {
     dtype_t dt = DT_BF16;
@@ -135,6 +153,9 @@ int main(int argc, char **argv) {
     const char *shape_name = "all";
     int B=0,H=0,S=0,D=0, causal=0;
     int iters=50, warmup=5, verify=1, verify_qrows=8, verbose=0;
+    int br_override=0;   /* 0 = auto (BR=64); else force BR (A/B only) */
+    int bc_override=0;   /* 0 = auto (pick_BC); else force BC (A/B only) */
+    int minblk_override=-1; /* -1 = auto (pick_MINBLK); 0 = none; else force */
 
     for (int i=1;i<argc;i++){
         if (!strcmp(argv[i],"--dtype")&&i+1<argc){ const char*s=argv[++i];
@@ -149,6 +170,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--seqlen")&&i+1<argc) S=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--head-dim")&&i+1<argc) D=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--causal")&&i+1<argc) causal=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--br")&&i+1<argc) br_override=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--bc")&&i+1<argc) bc_override=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--minblk")&&i+1<argc) minblk_override=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--iters")&&i+1<argc) iters=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--warmup")&&i+1<argc) warmup=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--verify")&&i+1<argc) verify=atoi(argv[++i]);
@@ -191,7 +215,7 @@ int main(int argc, char **argv) {
         const shape_t *sh = shapes[si];
         int b=sh->B,h=sh->H,s=sh->S,d=sh->D,bh=b*h;
         if (d!=64 && d!=128 && d!=256) { fprintf(stderr,"skip %s: D=%d unsupported (64/128/256)\n",sh->name,d); continue; }
-        int BR=64, BC=pick_BC(d);
+        int BR = br_override ? br_override : 64, BC = bc_override ? bc_override : pick_BC(d, dt);
 
         size_t qn=(size_t)bh*s*d;
         int qk_es = (dt==DT_FP8) ? 1 : 2;   /* Q,K element size; V always bf16/f16 16-bit */
@@ -237,7 +261,8 @@ int main(int argc, char **argv) {
             CUmodule mod; CUfunction fn; size_t smem; int block, gx;
             const char *body = (m==MD_MMA) ? (dt==DT_FP8 ? k_fa2_attn_fp8_src : k_fa2_attn_src) : k_fa2_ref_src;
             const char *kname = (m==MD_MMA) ? (dt==DT_FP8 ? "fa2_attn_fp8" : "fa2_attn") : "fa2_ref";
-            char *src = build_src(body, d, BR, BC, causal, dt);
+            int minblk = (minblk_override >= 0) ? minblk_override : pick_MINBLK(d, dt);
+            char *src = build_src(body, d, BR, BC, causal, dt, minblk);
             if (cu_compile_kernels(&mod,dev,src,kname,verbose,"bench_cuda_fa2")<0){ free(src); continue; }
             free(src);
             if (cuModuleGetFunction(&fn,mod,kname)!=CUDA_SUCCESS){ fprintf(stderr,"getFunc %s failed\n",kname); cuModuleUnload(mod); continue; }
@@ -246,10 +271,16 @@ int main(int argc, char **argv) {
                 /* fp8: K e4m3 rows padded to D+16 bytes + V bf16 rows D+8 halves, x2 buffers */
                 if (dt==DT_FP8) smem=(size_t)2*BC*(d+16) + (size_t)2*BC*(d+8)*sizeof(uint16_t);
                 else            smem=(size_t)4*BC*(d+8)*sizeof(uint16_t);
-                block=128; gx=(s+BR-1)/BR;
+                block=BR/16*32; gx=(s+BR-1)/BR;
             }
             else { smem=(size_t)s*sizeof(float); block=d; gx=s; }
             if (smem > 48*1024) cuFuncSetAttribute(fn,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,(int)smem);
+            if (m==MD_MMA && verbose>=1){
+                int nregs=0; cuFuncGetAttribute(&nregs,CU_FUNC_ATTRIBUTE_NUM_REGS,fn);
+                int occ=0; cuOccupancyMaxActiveBlocksPerMultiprocessor(&occ,fn,block,smem);
+                fprintf(stderr,"[occ] %s BR=%d BC=%d regs=%d smem=%zuB -> %d blocks/SM (%d warps/SM)\n",
+                        kname,BR,BC,nregs,smem,occ,occ*block/32);
+            }
 
             void *args[]={ &dO,&dQ,&dK,&dV,&s,&d,&launch_scale };
             int launch_ok=1;
