@@ -1,10 +1,11 @@
-# FP4 on consumer Blackwell (sm_120) — is it hardware-accelerated?
+# 4-bit on consumer Blackwell (sm_120) — FP4 vs INT4, hardware or not?
 
-This directory revisits an earlier "FP4 is software-emulated on sm_120" assumption and
-tests a specific hypothesis: **maybe NVFP4 is HW-accelerated while MXFP4 is software.**
+This directory revisits an earlier "FP4 is software-emulated on sm_120" assumption and tests
+two hypotheses: **maybe NVFP4 is HW-accelerated while MXFP4 is software**, and (follow-up)
+**maybe INT4 is available and HW-accelerated too.**
 
-Both are answered empirically on an **RTX 5060 Ti (sm_120, 36 SMs, 2587 MHz boost)** with
-**CUDA 13.2** ptxas/NVRTC and **cuBLASLt 13.4**.
+Answered empirically on an **RTX 5060 Ti (sm_120, 36 SMs, 2587 MHz boost)** with **CUDA 13.2**
+ptxas/NVRTC and **cuBLASLt 13.4**.
 
 ---
 
@@ -12,14 +13,24 @@ Both are answered empirically on an **RTX 5060 Ti (sm_120, 36 SMs, 2587 MHz boos
 
 - **FP4 (e2m1) IS hardware-accelerated on consumer sm_120**, through the warp-level
   `mma.sync.aligned.m16n8k64 … e2m1 … block_scale` 5th-gen tensor-core instruction. (sm_120
-  has *no* `tcgen05.mma`; that block-level instruction is sm_100/datacenter only.)
-- **NVFP4 == MXFP4** in throughput, within 0.1%. The hypothesis is **refuted** — both ride the
-  same tensor-core datapath and differ only in *scale granularity*, not in HW vs SW.
+  has *no* `tcgen05.mma`; that block-level instruction is sm_100/datacenter only.) ~406 TOPS,
+  4× FP8, 8× BF16.
+- **NVFP4 == MXFP4** in throughput, within 0.1%. That hypothesis is **refuted** — both ride
+  the same tensor-core datapath and differ only in *scale granularity*, not HW vs SW.
+- **INT4 (s4) is the opposite story: available but SOFTWARE-EMULATED.** The `s4` mma still
+  assembles at `sm_120a`, but ptxas lowers it to **2× `IMMA.s8` + ~180 integer unpack ops**
+  (confirmed in SASS), so it runs at only ~5% of the INT8 mma rate (21.6 TOPS — *slower* than
+  BF16). The native 4-bit integer tensor core of Turing/Ampere is gone on Blackwell. Use FP4
+  or INT8 instead. (INT8 itself is native and fast: 203 TOPS, 2× FP8.)
 - **cuBLASLt does NOT expose FP4 (or block-scaled FP8) GEMM on sm_120.** Every config returns
   `CUBLAS_STATUS_NOT_SUPPORTED` (15), even fully block-scale-configured with the exact layout
   from NVIDIA's `LtNvfp4Matmul` sample. The narrow-precision cuBLAS kernels are gated to
   datacenter Blackwell (sm_100). On this card FP4 is reachable only via hand-written
   `mma.sync` — exactly as the VLM/LLM runners already do for FP8.
+
+> **Takeaway:** on consumer Blackwell the *new* 4-bit format (FP4) got a hardware datapath,
+> while the *old* 4-bit format (INT4) lost its native tensor core and is now emulated on top
+> of INT8.
 
 ---
 
@@ -96,9 +107,10 @@ The block-scale FP4 mma only assembles for the **architecture-specific** `sm_120
 
 ### 3.1 `mma_fp4_probe` — raw `mma.sync` issue rate (the silicon test)
 
-The decisive HW test. For each of BF16 / FP8 / NVFP4 / MXFP4 it generates a kernel that issues
-a long stream of warp-level MMAs into `NACC` independent accumulator tiles (to saturate the
-tensor cores), compiles it at `sm_120a`, and times it.
+The decisive HW test. For each of BF16 / FP8 / NVFP4 / MXFP4 / INT8 / INT4 it generates a
+kernel that issues a long stream of warp-level MMAs into `NACC` independent accumulator tiles
+(to saturate the tensor cores), compiles it at `sm_120a`, and times it. Integer formats use an
+s32 accumulator (`+r`), float formats an f32 accumulator (`+f`).
 
 Two reasons this is definitive:
 - **Assembly is the existence test.** ptxas only emits a tensor-core SASS op if the *target
@@ -125,20 +137,40 @@ whether each precision is supported at all.
 
 ### 4.1 `mma_fp4_probe`
 
-| format | mma shape | TFLOP/s | G mma/s | vs BF16 | vs FP8 |
-|--------|-----------|--------:|--------:|--------:|-------:|
-| BF16  | m16n8k16              |  51 | 12.5 | 1.0× | 0.5× |
-| FP8   | m16n8k32 (e4m3)       | 102 | 12.5 | 2.0× | 1.0× |
-| **NVFP4** | m16n8k64 (vec16/ue4m3) | **408** | 24.9 | 8.0× | 4.0× |
-| **MXFP4** | m16n8k64 (vec32/ue8m0) | **408** | 24.9 | 8.0× | 4.0× |
+| format | mma shape | TOP/s | G mma/s | vs BF16 | vs FP8 | datapath |
+|--------|-----------|------:|--------:|--------:|-------:|----------|
+| BF16  | m16n8k16              |  51 | 12.5 | 1.0× | 0.5× | native |
+| FP8   | m16n8k32 (e4m3)       | 102 | 12.5 | 2.0× | 1.0× | native |
+| **NVFP4** | m16n8k64 (vec16/ue4m3) | **406** | 24.8 | 7.9× | 4.0× | **native** |
+| **MXFP4** | m16n8k64 (vec32/ue8m0) | **406** | 24.8 | 7.9× | 4.0× | **native** |
+| INT8  | m16n8k32 (s8)         | 203 | 24.8 | 3.9× | 2.0× | native (2× FP8!) |
+| **INT4** | m16n8k64 (s4)      |  **22** | **1.3** | 0.4× | 0.2× | **EMULATED** |
 
-Two independent hardware signals:
-1. **FP4 mma issues at 2× the FP8/BF16 rate** (24.9 vs 12.5 G mma/s) — a real, separate FP4
-   datapath, not a microcoded fallback.
-2. Each FP4 mma also covers 2× the K of an FP8 mma → FP4 lands at **4× FP8 / 8× BF16** TFLOP/s.
+(TOP/s = 1e12 ops/s; float rows are TFLOP/s, integer rows are TOPS — same unit.)
+
+Read the **G mma/s** column (instruction issue rate), not just TOP/s:
+
+1. **FP4 mma issues at 2× the FP8/BF16 rate** (24.8 vs 12.5) — a real, separate FP4 datapath,
+   not a microcoded fallback. Plus each FP4 mma covers 2× the K of an FP8 mma → **4× FP8**.
+2. **INT8 mma issues at 24.8 G mma/s — 2× the FP8 rate.** GeForce throttles FP8 to the FP16
+   rate, but INT8 runs full-rate, so INT8 (203 TOPS) beats FP8 (102 TFLOP/s) here.
+3. **INT4 mma issues at only 1.3 G mma/s — ~5% of INT8.** It is *not* a native op (see §4.3).
 
 (Absolute BF16 ~51 TFLOP/s reflects GeForce's halved FP32-accumulate tensor rate; the *ratios*
-are the clean signal and match the 5th-gen tensor-core design.)
+are the clean signal.)
+
+### 4.3 INT4 is emulated — SASS proof
+
+Compiling a single `s4`/`s8` mma each with `nvcc -arch=sm_120a -cubin` and dumping SASS
+(`cuobjdump --dump-sass`):
+
+- **INT8 `s8` mma → 1× `IMMA.16832.S8.S8`** — one native tensor-core instruction.
+- **INT4 `s4` mma → 2× `IMMA.16832.S8.S8` + ~180 ALU ops** (90 `LOP3.LUT`, 48 `SHF`, 36
+  `IMAD.SHL`, 10 `IADD`, …). ptxas unpacks the 4-bit values and feeds them through the **INT8**
+  tensor core twice. There is no native `s4` datapath — Turing/Ampere had one
+  (`IMMA.8816.S4` etc.); Blackwell dropped it.
+
+That ~90× instruction blow-up is exactly the measured ~19× issue-rate slowdown vs INT8.
 
 ### 4.2 `cublas_fp4_gemm`
 
@@ -153,15 +185,21 @@ are the clean signal and match the 5th-gen tensor-core design.)
 
 ## 5. Conclusions
 
-1. **FP4 is hardware-accelerated on consumer sm_120**, at ~408 TFLOP/s here — 4× FP8 and 8×
-   BF16. The "FP4 is software-emulated" assumption was about the dequant→bf16/fp8 path; native
+1. **FP4 is hardware-accelerated on consumer sm_120**, at ~406 TOPS here — 4× FP8 and 8× BF16.
+   The "FP4 is software-emulated" assumption was about the dequant→bf16/fp8 path; native
    `mma.sync` e2m1 is real silicon.
 2. **NVFP4 and MXFP4 are equally hardware-accelerated** (identical to 0.1%). They share one
    datapath; NVFP4 vs MXFP4 is purely an accuracy/standard trade-off (block 16 + ue4m3 vs
    block 32 + ue8m0), *not* HW vs SW. Hypothesis refuted.
-3. **cuBLAS gives you none of this on sm_120.** To exploit FP4 on GeForce Blackwell you must
-   hand-write the `mma.sync` kernels (or use CUTLASS sm120 collectives) — the same situation
-   as FP8 on this card.
+3. **INT4 (s4) is available but software-emulated** — it assembles, but ptxas lowers it to
+   2× INT8 `IMMA` + integer unpacking (SASS-confirmed), so it runs ~19× slower than INT8 and
+   even slower than BF16. The native 4-bit *integer* tensor core of Turing/Ampere is gone on
+   Blackwell; the 4-bit hardware now lives in *FP4*. Prefer FP4 or INT8.
+4. **INT8 is native and the fastest 8-bit path** (203 TOPS, 2× FP8) — GeForce throttles FP8 to
+   the FP16 tensor rate, while INT8 runs full-rate.
+5. **cuBLAS gives you none of the narrow paths on sm_120.** To exploit FP4 on GeForce Blackwell
+   you must hand-write the `mma.sync` kernels (or use CUTLASS sm120 collectives) — the same
+   situation as FP8 on this card.
 
 ---
 
