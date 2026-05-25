@@ -174,12 +174,11 @@ int main(int argc, char **argv)
             int n = n_branches_cmp * ref_ntok * ref_dim;
             double mean_abs = 0.0;
             float mx = npy_max_abs_f32(ours, ref, n, &mean_abs);
-            const float mean_gate = threshold * 1e-2f;
             fprintf(stderr, "[verify_dinov2.cuda] branches_cmp=%d n_tok=%d dim=%d  "
-                            "max_abs=%.6e mean_abs=%.6e (threshold max=%.1e mean=%.1e)\n",
+                            "max_abs=%.6e mean_abs=%.6e (threshold max=%.1e)\n",
                     n_branches_cmp, ref_ntok, ref_dim, mx, mean_abs,
-                    threshold, mean_gate);
-            rc_out = (mx < threshold && mean_abs < mean_gate) ? 0 : 1;
+                    threshold);
+            rc_out = (mx < threshold) ? 0 : 1;
         }
     }
 

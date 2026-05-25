@@ -9,6 +9,11 @@
  *   warp_mat_expect.npy      (2, 3)    f32
  *   preprocess_expect.npy    (3, H, W) f32
  *
+ * It also accepts the full pipeline dumps from gen_image_ref.py:
+ *   input_image.npy
+ *   decoder_batch__{bbox_center,bbox_scale,affine_trans}.npy
+ *   dinov3_input.npy
+ *
  * Checks in sequence:
  *   1. GetBBoxCenterScale + 2× fix_aspect_ratio → bbox_center, bbox_scale
  *   2. get_warp_matrix                           → warp_mat
@@ -26,6 +31,14 @@
 #define SAM3D_BODY_DECODER_IMPLEMENTATION
 #include "sam3d_body_decoder.h"
 #include "npy_io.h"
+
+static void *load_npy_try(const char *refdir, const char *name,
+                          int *nd, int dims[8], int *is_f32)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.npy", refdir, name);
+    return npy_load(path, nd, dims, is_f32);
+}
 
 static int diff_pair(const char *label, const float *a, const float *b,
                      size_t n, float thresh)
@@ -62,52 +75,83 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    char path[1024];
     int nd, dims[8], is_f32;
 
-    snprintf(path, sizeof(path), "%s/raw_image.npy", refdir);
-    uint8_t *img = (uint8_t *)npy_load(path, &nd, dims, &is_f32);
+    uint8_t *img = (uint8_t *)load_npy_try(refdir, "raw_image", &nd, dims, &is_f32);
+    if (!img)
+        img = (uint8_t *)load_npy_try(refdir, "input_image", &nd, dims, &is_f32);
     if (!img || is_f32 || nd != 3 || dims[2] != 3) {
-        fprintf(stderr, "bad %s\n", path); free(img); return 3;
+        fprintf(stderr, "bad/missing raw_image.npy or input_image.npy\n");
+        free(img); return 3;
     }
     const int H_in = dims[0], W_in = dims[1];
 
-    snprintf(path, sizeof(path), "%s/bbox_xyxy.npy", refdir);
-    float *bbox = (float *)npy_load(path, &nd, dims, &is_f32);
-    if (!bbox || !is_f32) { fprintf(stderr, "bad %s\n", path); free(img); free(bbox); return 3; }
+    float *bbox = (float *)load_npy_try(refdir, "bbox_xyxy", &nd, dims, &is_f32);
+    const int has_bbox = (bbox && is_f32);
 
-    snprintf(path, sizeof(path), "%s/bbox_center_expect.npy", refdir);
-    float *c_ref = (float *)npy_load(path, &nd, dims, &is_f32);
-    snprintf(path, sizeof(path), "%s/bbox_scale_expect.npy", refdir);
-    float *s_ref = (float *)npy_load(path, &nd, dims, &is_f32);
-    snprintf(path, sizeof(path), "%s/warp_mat_expect.npy", refdir);
-    float *w_ref = (float *)npy_load(path, &nd, dims, &is_f32);
-    snprintf(path, sizeof(path), "%s/preprocess_expect.npy", refdir);
-    float *p_ref = (float *)npy_load(path, &nd, dims, &is_f32);
-    if (!c_ref || !s_ref || !w_ref || !p_ref) {
-        fprintf(stderr, "missing expect files\n");
+    float *c_ref = (float *)load_npy_try(refdir, "bbox_center_expect",
+                                         &nd, dims, &is_f32);
+    if (!c_ref)
+        c_ref = (float *)load_npy_try(refdir, "decoder_batch__bbox_center",
+                                      &nd, dims, &is_f32);
+    float *s_ref = (float *)load_npy_try(refdir, "bbox_scale_expect",
+                                         &nd, dims, &is_f32);
+    if (!s_ref)
+        s_ref = (float *)load_npy_try(refdir, "decoder_batch__bbox_scale",
+                                      &nd, dims, &is_f32);
+    float *w_ref = (float *)load_npy_try(refdir, "warp_mat_expect",
+                                         &nd, dims, &is_f32);
+    if (!w_ref)
+        w_ref = (float *)load_npy_try(refdir, "decoder_batch__affine_trans",
+                                      &nd, dims, &is_f32);
+    int p_ref_is_dinov3 = 0;
+    float *p_ref = (float *)load_npy_try(refdir, "preprocess_expect",
+                                         &nd, dims, &is_f32);
+    if (!p_ref) {
+        p_ref = (float *)load_npy_try(refdir, "dinov3_input",
+                                      &nd, dims, &is_f32);
+        p_ref_is_dinov3 = (p_ref != NULL);
+    }
+    if (!c_ref || !s_ref || !w_ref || !p_ref || !is_f32) {
+        fprintf(stderr, "missing/non-f32 expect files\n");
         free(img); free(bbox); free(c_ref); free(s_ref); free(w_ref); free(p_ref);
         return 3;
     }
-    const int C_out = dims[0], H_out = dims[1], W_out = dims[2];
+    int C_out = 0, H_out = 0, W_out = 0;
+    if (nd == 3) {
+        C_out = dims[0]; H_out = dims[1]; W_out = dims[2];
+    } else if (nd == 4 && dims[0] == 1) {
+        C_out = dims[1]; H_out = dims[2]; W_out = dims[3];
+    }
+    if (C_out != 3 || H_out <= 0 || W_out <= 0) {
+        fprintf(stderr, "bad preprocess ref shape rank=%d [%d,%d,%d,%d]\n",
+                nd, dims[0], dims[1], dims[2], dims[3]);
+        free(img); free(bbox); free(c_ref); free(s_ref); free(w_ref); free(p_ref);
+        return 3;
+    }
 
     fprintf(stderr, "[verify_preprocess_image] in=%dx%d out=%dx%dx%d "
-                    "bbox=[%.1f %.1f %.1f %.1f]\n",
+                    "bbox=%s\n",
             W_in, H_in, C_out, H_out, W_out,
-            bbox[0], bbox[1], bbox[2], bbox[3]);
+            has_bbox ? "provided" : "not provided");
 
     int rc_total = 0;
 
     /* --- bbox_center + bbox_scale + warp --- */
     float center_ours[2], scale_ours[2], warp_ours[6];
-    sam3d_body_compute_bbox_affine(bbox,
-                                   /*padding=*/1.25f,
-                                   /*aspect_ratio_pre=*/0.75f,
-                                   W_out, H_out,
-                                   center_ours, scale_ours, warp_ours);
-    rc_total |= diff_pair("bbox_center (2,)", center_ours, c_ref, 2, 1e-4f);
-    rc_total |= diff_pair("bbox_scale (2,)",  scale_ours,  s_ref, 2, 1e-3f);
-    rc_total |= diff_pair("warp_mat (2,3)",   warp_ours,   w_ref, 6, 1e-3f);
+    if (has_bbox) {
+        float aspect_ratio_pre = 0.75f;
+        if (p_ref_is_dinov3 && H_out != W_out)
+            aspect_ratio_pre = (float)W_out / (float)H_out;
+        sam3d_body_compute_bbox_affine(bbox,
+                                       /*padding=*/1.25f,
+                                       aspect_ratio_pre,
+                                       W_out, H_out,
+                                       center_ours, scale_ours, warp_ours);
+        rc_total |= diff_pair("bbox_center (2,)", center_ours, c_ref, 2, 1e-4f);
+        rc_total |= diff_pair("bbox_scale (2,)",  scale_ours,  s_ref, 2, 1e-3f);
+        rc_total |= diff_pair("warp_mat (2,3)",   warp_ours,   w_ref, 6, 1e-3f);
+    }
 
     /* --- preprocess (diff vs cv2 bilinear + imagenet norm) --- */
     float *ours = (float *)malloc((size_t)3 * H_out * W_out * sizeof(float));
