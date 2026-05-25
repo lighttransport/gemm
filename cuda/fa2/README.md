@@ -43,11 +43,26 @@ The host **prepends a `#define` header** to the chosen source string before
 
 ```
 #define FA2_D      128   /* head dim: 64 | 128 | 256                 */
-#define FA2_BR      64   /* query rows per CTA (4 warps × 16)         */
-#define FA2_BC      32   /* KV tile (16 for D=256 — smem/reg budget)  */
+#define FA2_BR      64   /* query rows per CTA ((BR/16) warps × 16)   */
+#define FA2_BC      16   /* KV tile — tuned per (dtype,D), see below  */
 #define FA2_CAUSAL   0   /* 0 | 1                                     */
 #define FA2_BF16     1   /* present → bf16; absent → f16 (fa2_attn)   */
 ```
+
+**KV-tile size `BC` is tuned per (dtype, D)** by the host `pick_BC()`:
+
+| dtype     | D=64 | D=128 | D=256 |
+|-----------|:----:|:-----:|:-----:|
+| bf16/f16  |  32  | **16**|  16   |
+| fp8       |  32  |  32   |  16   |
+
+Per-block SMEM ≈ `4·BC·(D+8)·2 B` is set by `BC` (not `BR`), and this kernel is
+**occupancy/latency-bound** on sm_120: at D=128 bf16, BC=32 leaves only ~2
+blocks/SM, so BC=16 (~5 blocks/SM) wins **+3 %**. FP8 Q@Kᵀ is `m16n8k32` (2×
+dense, more compute-bound) and prefers the larger BC=32 tile. D=256 is pinned to
+16 by the O-accumulator reg/SMEM budget. See `bench_log.md` for the full study,
+including two blog levers (`BLOCK_Q=128`, `ldmatrix.x4`) that were measured and
+reverted as net-negative on this card.
 
 ### Design (shared by `fa2_attn` / `fa2_attn_fp8`)
 
@@ -99,9 +114,15 @@ CLI:
 ```
 ./bench_cuda_fa2 [--dtype f16|bf16|fp8] [--mode mma|ref|all] [--shape NAME|all]
                  [--causal 0|1] [--batch B --heads H --seqlen S --head-dim D]
-                 [--iters N] [--warmup N] [--verify 0|1] [--verify-qrows N]
-                 [--verbose N]
+                 [--br N] [--bc N] [--minblk N] [--iters N] [--warmup N]
+                 [--verify 0|1] [--verify-qrows N] [--verbose N]
 ```
+
+- `--br` / `--bc` / `--minblk` override the auto-picked query block / KV tile /
+  `__launch_bounds__` min-blocks hint (else `BR=64`, `BC=pick_BC(D,dtype)`, no
+  hint) — handy for A/B sweeps. All three are tuned to their measured optimum by
+  default; the knobs exist to reproduce the sweeps in `bench_log.md`.
+- `--verbose 1` also prints register count and resident blocks/SM per config.
 
 - `--mode ref` / `all` runs the naïve GPU oracle too; for `--dtype fp8` the ref
   is auto-skipped (it's a 16-bit kernel) — FP8 validates against the **CPU FP32
@@ -113,8 +134,9 @@ CLI:
 
 ## Results (RTX 5060 Ti, sm_120)
 
-See `bench_log.md` for the full table. Headline (non-causal, mma): bf16/f16
-track `cuda/fa` v4 (≈ 42–44 TFLOP/s at long seq, ~90 %+ of the ~42–49 TFLOP/s
-BF16 peak); **fp8 reaches ~57 TFLOP/s** (qwen3_4k), a **~1.35× speedup over
-bf16** — matching theory, since only Q@Kᵀ is FP8 (P@V stays bf16, so the upper
-bound is ~1.33× not 2×). All configs validate cos ≈ 1.0.
+See `bench_log.md` for the full table + tuning study. Headline (non-causal,
+mma): bf16/f16 reach **≈ 43–44 TFLOP/s** at long seq (~90 %+ of the ~42–49
+TFLOP/s BF16 peak, after the per-(dtype,D) `BC` tuning lifted D=128 +3 %);
+**fp8 reaches ~57 TFLOP/s** (qwen3_4k), a **~1.32× speedup over bf16** — matching
+theory, since only Q@Kᵀ is FP8 (P@V stays bf16, so the upper bound is ~1.33×
+not 2×). All configs validate cos ≈ 1.0.
