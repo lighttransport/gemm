@@ -30,6 +30,12 @@
 #include <stdint.h>
 #include "sparse3d.h"
 
+#if defined(__GNUC__)
+#define T2SD_MAYBE_UNUSED __attribute__((unused))
+#else
+#define T2SD_MAYBE_UNUSED
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -259,7 +265,7 @@ static void t2sd_layernorm_mt(float *dst, const float *src, const float *w, cons
 }
 
 /* ---- GELU (AVX2 approximation) ---- */
-static void t2sd_gelu(float *x, int n) {
+static void T2SD_MAYBE_UNUSED t2sd_gelu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float v = x[i];
         x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
@@ -492,7 +498,9 @@ static void t2sd_dump_npy(const char *path, const float *data, int N, int C) {
     FILE *f = fopen(path, "wb"); if (!f) return;
     char hdr[256]; int hl = snprintf(hdr, sizeof hdr,
         "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", N, C);
-    while ((hl + 10) % 16 != 0) hdr[hl++] = ' '; hdr[hl++] = '\n'; hdr[hl] = 0;
+    while ((hl + 10) % 16 != 0) hdr[hl++] = ' ';
+    hdr[hl++] = '\n';
+    hdr[hl] = 0;
     fwrite("\x93NUMPY\x01\x00", 1, 8, f);
     uint16_t hl16 = (uint16_t)hl; fwrite(&hl16, 2, 1, f);
     fwrite(hdr, 1, hl, f);
@@ -504,7 +512,8 @@ static int g_t2sd_op_stage = -1, g_t2sd_op_block = -1, g_t2sd_op_op = -1;
 static const char *g_t2sd_op_path = NULL;
 static int g_t2sd_op_init = 0;
 static void t2sd_op_init(void) {
-    if (g_t2sd_op_init) return; g_t2sd_op_init = 1;
+    if (g_t2sd_op_init) return;
+    g_t2sd_op_init = 1;
     const char *e = getenv("T2SD_STOP_AFTER_OP");  /* "<S>:<B>:<OP>" */
     if (e && e[0]) sscanf(e, "%d:%d:%d", &g_t2sd_op_stage, &g_t2sd_op_block, &g_t2sd_op_op);
     g_t2sd_op_path = getenv("T2SD_DUMP_PATH");
@@ -563,8 +572,8 @@ static void t2sd_convnext_forward_indexed(float *feats, int N, const t2sd_convne
     free(mlp_buf);
 }
 
-static void t2sd_convnext_forward(float *feats, int N, const t2sd_convnext *blk,
-                                    sp3d_tensor *t, int n_threads) {
+static void T2SD_MAYBE_UNUSED t2sd_convnext_forward(float *feats, int N, const t2sd_convnext *blk,
+                                                      sp3d_tensor *t, int n_threads) {
     t2sd_convnext_forward_indexed(feats, N, blk, t, n_threads, -1, -1);
 }
 
@@ -691,7 +700,9 @@ static sp3d_tensor *t2sd_c2s_forward(sp3d_tensor *t, const t2sd_c2s *blk,
             int32_t x  = t->coords[i * 4 + 3];
             for (int s = 0; s < 8; s++) {
                 if (sub_logits && sub_logits[i * 8 + s] <= 0) continue;
-                int dz = (s >> 2) & 1, dy = (s >> 1) & 1, dx = s & 1;
+                /* Match upstream SparseChannel2Spatial: coord dimension i gets
+                 * bit i of subidx, so coords=(b,z,y,x) maps z=bit0, x=bit2. */
+                int dz = s & 1, dy = (s >> 1) & 1, dx = (s >> 2) & 1;
                 sub_coords[si * 4 + 0] = bz;
                 sub_coords[si * 4 + 1] = z * 2 + dz;
                 sub_coords[si * 4 + 2] = y * 2 + dy;
@@ -1108,7 +1119,8 @@ int t2_shape_dec_unguided_synth_host(const t2_shape_dec *d, int stage_idx,
         int32_t cx = coords[i * 4 + 3];
         for (int s = 0; s < 8; s++) {
             if (logits[i * 8 + s] <= 0) continue;
-            int dz = (s >> 2) & 1, dy = (s >> 1) & 1, dx = s & 1;
+            /* Match upstream SparseChannel2Spatial bit order. */
+            int dz = s & 1, dy = (s >> 1) & 1, dx = (s >> 2) & 1;
             idx[kw] = i;
             si[kw]  = s;
             xc[kw * 4 + 0] = bz;

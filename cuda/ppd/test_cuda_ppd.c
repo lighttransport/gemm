@@ -2,7 +2,7 @@
  * test_cuda_ppd.c - Test program for CUDA PPD runner
  *
  * Usage:
- *   ./test_cuda_ppd <ppd.pth> <depth_anything_v2_vitl.pth> [-i image.ppm] [-o depth.pgm]
+ *   ./test_cuda_ppd <ppd.pth> <depth_anything_v2_vitl.pth> [-i image.ppm] [-o depth.pgm] [--repeat N]
  */
 #include "cuda_ppd_runner.h"
 
@@ -10,6 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
+
+static double get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 /* Simple PPM reader (P6 binary) */
 static uint8_t *read_ppm(const char *path, int *w, int *h) {
@@ -91,12 +98,14 @@ int main(int argc, char **argv) {
     const char *out_path = "depth_ppd.pgm";
     const char *npy_path = NULL;
     int verbose = 1;
+    int repeat = 1;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) img_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc) verbose = atoi(argv[++i]);
         else if (strcmp(argv[i], "--npy") == 0 && i + 1 < argc) npy_path = argv[++i];
+        else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
     }
 
     fprintf(stderr, "Initializing CUDA PPD runner...\n");
@@ -115,11 +124,21 @@ int main(int argc, char **argv) {
         uint8_t *rgb = read_ppm(img_path, &w, &h);
         if (!rgb) { fprintf(stderr, "Cannot read %s\n", img_path); cuda_ppd_free(r); return 1; }
 
-        fprintf(stderr, "Running inference on %s (%dx%d)...\n", img_path, w, h);
-        ppd_result res = cuda_ppd_predict(r, rgb, w, h);
+        if (repeat < 1) repeat = 1;
+        fprintf(stderr, "Running inference on %s (%dx%d, repeat=%d)...\n", img_path, w, h, repeat);
+        ppd_result res = {0};
+        double elapsed = 0.0;
+        for (int ri = 0; ri < repeat; ri++) {
+            ppd_result_free(&res);
+            double t0 = get_time_ms();
+            res = cuda_ppd_predict(r, rgb, w, h);
+            elapsed = get_time_ms() - t0;
+            fprintf(stderr, "Inference %d/%d: %.1f ms\n", ri + 1, repeat, elapsed);
+        }
         free(rgb);
 
         if (res.depth) {
+            fprintf(stderr, "Total inference time: %.1f ms\n", elapsed);
             write_pgm(out_path, res.depth, res.width, res.height);
             if (npy_path)
                 write_npy_f32(npy_path, res.depth, res.width, res.height);
