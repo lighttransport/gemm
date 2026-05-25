@@ -1,25 +1,28 @@
 /*
  * Raw mma.sync issue-rate probe for sm_120 (consumer Blackwell, e.g. RTX 5060 Ti)
  *
- * Definitive silicon-datapath test: does the FP4 (e2m1) block-scaled tensor-core
- * mma.sync instruction assemble and run, and at what rate vs FP8 (e4m3) and BF16?
+ * Definitive silicon-datapath test for narrow tensor-core formats: do they
+ * assemble and run, and -- crucially -- at what *issue rate* (G mma/s)?
  *
  *   - ptxas only emits the SASS tensor-core op if the *target arch* supports it.
- *     So if `mma.sync...e2m1...` assembles at sm_120a, the HW datapath exists;
- *     if ptxas rejects it ("not supported on target"), it does not.
- *   - We then measure achieved TFLOP/s by issuing a long dependency-broken chain
- *     of warp-level MMAs (garbage operands -- this measures issue throughput, not
- *     a correct GEMM).
+ *     So if e.g. `mma.sync...e2m1...` assembles at sm_120a the format is exposed;
+ *     if ptxas rejects it ("not supported on target") it is not.
+ *   - Assembling is necessary but NOT sufficient for "HW-accelerated": ptxas may
+ *     *lower* an unsupported mma to an emulation (e.g. INT4 s4 -> 2x IMMA.s8 +
+ *     integer unpacking). The mma issue rate exposes that -- native ops issue at
+ *     the full tensor-core rate, emulated ones far slower.
+ *   - Garbage operands: this measures issue throughput, not a correct GEMM.
  *
  * Each format is compiled as a SEPARATE NVRTC program at --gpu-architecture=sm_120a
  * (the repo's shared cu_compile_kernels hardcodes plain sm_120, which will NOT
- * assemble the block-scale FP4 mma), so an FP4 failure does not kill the BF16/FP8
- * baselines.
+ * assemble the block-scale FP4 mma), so one format failing does not kill the others.
  *
- * MMA shapes / FLOPs per warp-level instruction:
- *   BF16  m16n8k16 : 2*16*8*16 =  4096
- *   FP8   m16n8k32 : 2*16*8*32 =  8192   (e4m3, no block scale)
- *   FP4   m16n8k64 : 2*16*8*64 = 16384   (e2m1, block_scale: NVFP4 vec16/ue4m3, MXFP4 vec32/ue8m0)
+ * MMA shapes / ops per warp-level instruction (2*M*N*K):
+ *   BF16  m16n8k16 :  4096   (f32 accum)
+ *   FP8   m16n8k32 :  8192   (e4m3, f32 accum, no block scale)
+ *   FP4   m16n8k64 : 16384   (e2m1, f32 accum, block_scale: NVFP4 vec16/ue4m3, MXFP4 vec32/ue8m0)
+ *   INT8  m16n8k32 :  8192   (s8,  s32 accum)
+ *   INT4  m16n8k64 : 16384   (s4,  s32 accum)  -- emulated on sm_120 (see README)
  */
 
 #include <stdio.h>
@@ -68,8 +71,24 @@ static const char* MMA_MXFP4 =
   "      : \"+f\"(d##J##0),\"+f\"(d##J##1),\"+f\"(d##J##2),\"+f\"(d##J##3)\n"
   "      : \"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1),\"r\"(sfa),\"r\"(sfb));\n";
 
-/* Build the full CUDA kernel source for one format. */
-static char* build_source(const char* mma_body) {
+/* Integer tensor-core mma: s32 accumulator, s8/s4 packed inputs. */
+static const char* MMA_INT8 =
+  "    asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 \"\n"
+  "      \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
+  "      : \"+r\"(d##J##0),\"+r\"(d##J##1),\"+r\"(d##J##2),\"+r\"(d##J##3)\n"
+  "      : \"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1));\n";
+
+static const char* MMA_INT4 =
+  "    asm volatile(\"mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 \"\n"
+  "      \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
+  "      : \"+r\"(d##J##0),\"+r\"(d##J##1),\"+r\"(d##J##2),\"+r\"(d##J##3)\n"
+  "      : \"r\"(a0),\"r\"(a1),\"r\"(a2),\"r\"(a3),\"r\"(b0),\"r\"(b1));\n";
+
+/* Build the full CUDA kernel source for one format.  is_int selects an s32
+ * accumulator (integer mma, "+r") vs an f32 accumulator (float mma, "+f"). */
+static char* build_source(const char* mma_body, int is_int) {
+    const char* ty   = is_int ? "int" : "float";
+    const char* zero = is_int ? "0"   : "0.f";
     char* buf = (char*)malloc(1 << 16);
     int n = 0;
     n += sprintf(buf + n,
@@ -79,8 +98,8 @@ static char* build_source(const char* mma_body) {
         "  unsigned b0=a3*2654435761u+1u, b1=b0*2654435761u+1u;\n"
         "  unsigned sfa=0x38383838u + (t & 1u), sfb=0x7f7f7f7fu + (t & 1u);\n");
     for (int j = 0; j < NACC; j++)
-        n += sprintf(buf + n, "  float d%d0=0.f,d%d1=0.f,d%d2=0.f,d%d3=0.f;\n", j, j, j, j);
-    n += sprintf(buf + n, "  for (int i = 0; i < iters; i++) {\n");
+        n += sprintf(buf + n, "  %s d%d0=%s,d%d1=%s,d%d2=%s,d%d3=%s;\n", ty, j, zero, j, zero, j, zero, j, zero);
+    n += sprintf(buf + n, "  (void)sfa;(void)sfb;\n  for (int i = 0; i < iters; i++) {\n");
     /* expand the per-tile mma body, substituting the tile index J */
     for (int j = 0; j < NACC; j++) {
         char tile[2048];
@@ -92,10 +111,10 @@ static char* build_source(const char* mma_body) {
         *q = 0;
         n += sprintf(buf + n, "%s", tile);
     }
-    n += sprintf(buf + n, "  }\n  float s=0.f;\n");
+    n += sprintf(buf + n, "  }\n  %s s=%s;\n", ty, zero);
     for (int j = 0; j < NACC; j++)
         n += sprintf(buf + n, "  s += d%d0+d%d1+d%d2+d%d3;\n", j, j, j, j);
-    n += sprintf(buf + n, "  out[t] = s;\n}\n");
+    n += sprintf(buf + n, "  out[t] = (float)s;\n}\n");
     return buf;
 }
 
@@ -129,7 +148,7 @@ static CUmodule compile_sm120a(const char* src, const char* tag) {
     return mod;
 }
 
-typedef struct { const char* name; const char* body; double flops_per_mma; } fmt_t;
+typedef struct { const char* name; const char* body; double flops_per_mma; int is_int; } fmt_t;
 
 int main(int argc, char** argv) {
     int iters = 20000, blocks_per_sm = 8;
@@ -162,19 +181,21 @@ int main(int argc, char** argv) {
            blocks, threads, warps, iters, NACC, total_mmas);
 
     fmt_t fmts[] = {
-        { "BF16",  MMA_BF16,   4096.0  },
-        { "FP8",   MMA_FP8,    8192.0  },
-        { "NVFP4", MMA_NVFP4, 16384.0  },
-        { "MXFP4", MMA_MXFP4, 16384.0  },
+        { "BF16",  MMA_BF16,   4096.0, 0 },
+        { "FP8",   MMA_FP8,    8192.0, 0 },
+        { "NVFP4", MMA_NVFP4, 16384.0, 0 },
+        { "MXFP4", MMA_MXFP4, 16384.0, 0 },
+        { "INT8",  MMA_INT8,   8192.0, 1 },   /* s32.s8.s8.s32  m16n8k32 */
+        { "INT4",  MMA_INT4,  16384.0, 1 },   /* s32.s4.s4.s32  m16n8k64 */
     };
     int nf = (int)(sizeof(fmts)/sizeof(fmts[0]));
 
     CUdeviceptr d_out; CHECK_CUDA(cuMemAlloc(&d_out, (size_t)blocks * threads * sizeof(float)));
 
-    double tflops[8]; int ok[8];
+    double tflops[8], gmmas[8]; int ok[8];
     for (int f = 0; f < nf; f++) {
-        ok[f] = 0; tflops[f] = 0;
-        char* src = build_source(fmts[f].body);
+        ok[f] = 0; tflops[f] = 0; gmmas[f] = 0;
+        char* src = build_source(fmts[f].body, fmts[f].is_int);
         CUmodule mod = compile_sm120a(src, fmts[f].name);
         free(src);
         if (!mod) { printf("  [%-6s] NOT AVAILABLE (see ptxas log above)\n", fmts[f].name); continue; }
@@ -193,16 +214,18 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cuEventSynchronize(e1));
         float ms=0; CHECK_CUDA(cuEventElapsedTime(&ms, e0, e1));
         tflops[f] = (total_mmas * fmts[f].flops_per_mma / (ms/1000.0)) / 1e12;
+        gmmas[f]  = total_mmas / (ms/1000.0) / 1e9;
         ok[f] = 1;
-        printf("  [%-6s] %.3f ms   %.1f TFLOP/s   (%.2f G mma/s)\n",
-               fmts[f].name, ms, tflops[f], total_mmas / (ms/1000.0) / 1e9);
+        printf("  [%-6s] %.3f ms   %7.1f TOP/s   (%.2f G mma/s)\n",
+               fmts[f].name, ms, tflops[f], gmmas[f]);
         cuEventDestroy(e0); cuEventDestroy(e1); cuModuleUnload(mod);
     }
 
     /* summary */
     double bf16 = ok[0] ? tflops[0] : 0, fp8 = ok[1] ? tflops[1] : 0;
     printf("\n=== Summary (raw mma.sync throughput, sm_120a) ===\n");
-    printf("%-7s %-14s %12s %10s %10s\n", "format", "status", "TFLOP/s", "vs BF16", "vs FP8");
+    printf("(float rows are TFLOP/s, INT rows are TOPS -- same 1e12 ops/s unit)\n");
+    printf("%-7s %-14s %12s %10s %10s\n", "format", "status", "TOP/s", "vs BF16", "vs FP8");
     for (int f = 0; f < nf; f++) {
         if (!ok[f]) { printf("%-7s %-14s %12s %10s %10s\n", fmts[f].name, "ptxas-reject", "-","-","-"); continue; }
         char rb[16]="-", rf[16]="-";
@@ -210,11 +233,28 @@ int main(int argc, char** argv) {
         if (fp8 >0) snprintf(rf,sizeof(rf),"%.2fx",tflops[f]/fp8);
         printf("%-7s %-14s %12.1f %10s %10s\n", fmts[f].name, "ran", tflops[f], rb, rf);
     }
+    /* INT4 verdict: a native datapath issues at ~the INT8 mma rate; an emulated
+     * one (ptxas lowering s4 -> 2x IMMA.s8 + ALU unpacking) issues far slower. */
+    int i_int4 = -1, i_int8 = -1;
+    for (int f = 0; f < nf; f++) {
+        if (!strcmp(fmts[f].name, "INT4")) i_int4 = f;
+        if (!strcmp(fmts[f].name, "INT8")) i_int8 = f;
+    }
+
     printf("\nInterpretation:\n");
-    printf("  FP4 mma assembles at sm_120a  => the e2m1 tensor-core datapath EXISTS in silicon.\n");
-    printf("  FP4 TFLOP/s ~ 2x FP8 (~4x BF16) => full-rate native FP4 (each k64 mma does 2x the\n");
-    printf("  work of a k32 FP8 mma at a similar issue rate).  NVFP4 ~ MXFP4 => same datapath,\n");
-    printf("  only the scale granularity (vec16/ue4m3 vs vec32/ue8m0) differs.\n");
+    printf("  A format that ASSEMBLES + runs at sm_120a is exposed; whether it is truly\n");
+    printf("  HW-accelerated shows in the mma issue rate (G mma/s), not just that it ran.\n");
+    printf("  FP4 (e2m1): NVFP4 ~ MXFP4 => same native datapath, only scale granularity\n");
+    printf("              differs (vec16/ue4m3 vs vec32/ue8m0); ~2x FP8 issue rate.\n");
+    if (i_int4 >= 0 && ok[i_int4] && i_int8 >= 0 && ok[i_int8]) {
+        double r = gmmas[i_int4] / gmmas[i_int8];
+        if (r > 0.7)
+            printf("  INT4 (s4):  issues at %.0f%% of the INT8 rate => NATIVE 4-bit integer tensor core.\n", r*100);
+        else
+            printf("  INT4 (s4):  ASSEMBLES but issues at only %.0f%% of the INT8 rate => SOFTWARE-\n"
+                   "              EMULATED (ptxas lowers s4 mma to ~2x IMMA.s8 + integer unpacking).\n"
+                   "              Available, but NOT hardware-accelerated -- prefer INT8 or FP4.\n", r*100);
+    }
 
     cuMemFree(d_out); cuCtxDestroy(ctx);
     return 0;
