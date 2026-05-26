@@ -16,9 +16,17 @@ DINOV3="${DINOV3:-/mnt/disk01/models/dinov3-vitl16/model.safetensors}"
 MODEL_ROOT="${MODEL_ROOT:-$SCRIPT_DIR/model_root}"
 OUTDIR="${OUTDIR:-$SCRIPT_DIR/verify-dumps}"
 SEED="${SEED:-42}"
+# Shape-decoder mesh resolutions to extract (the SC-VAE net runs identically;
+# only flexible_dual_grid_to_mesh grid_size varies). e.g. DECODER_RES=64,128,256,512
+DECODER_RES="${DECODER_RES:-512}"
 DUMP_PER_STEP_FLAG=""
 if [[ "${DUMP_PER_STEP:-0}" == "1" ]]; then
     DUMP_PER_STEP_FLAG="--dump-per-step"
+fi
+# Per-DiT-block + per-decoder-layer dumps into verify-dumps/per_layer/ (large; f32).
+DUMP_PER_BLOCK_FLAG=""
+if [[ "${DUMP_PER_BLOCK:-0}" == "1" ]]; then
+    DUMP_PER_BLOCK_FLAG="--dump-per-block"
 fi
 
 mkdir -p "$OUTDIR"
@@ -30,6 +38,8 @@ mkdir -p "$OUTDIR"
     --output-dir "$OUTDIR" \
     --pipeline-type 512 \
     --seed "$SEED" \
-    $DUMP_PER_STEP_FLAG
+    --decoder-res "$DECODER_RES" \
+    $DUMP_PER_STEP_FLAG \
+    $DUMP_PER_BLOCK_FLAG
 
 echo "Dumps -> $OUTDIR (manifest.json describes each entry)"
