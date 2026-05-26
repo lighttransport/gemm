@@ -2,7 +2,7 @@
  * hip_flux2_runner.c - HIP/ROCm Flux.2 Klein text-to-image runner (RDNA4)
  *
  * GPU-accelerated DiT (5 double-stream + 20 single-stream blocks).
- * VAE decode falls back to CPU.
+ * GPU-accelerated VAE decode.
  *
  * Compiles with plain gcc (no hipcc). Uses rocew for dynamic HIP/HIPRTC loading.
  * F32 weights on GPU, F32 compute. Single-stream sequential kernel launches.
@@ -71,14 +71,26 @@ struct hip_flux2_runner {
 
     hipModule_t mod;
     hipFunction_t fn_gemm, fn_gemm_fp8, fn_gemm_fp8_opt;
-    hipFunction_t fn_gemm_fp8_wmma;      /* FP8 in × FP8 wt */
+    hipFunction_t fn_gemm_fp8_wmma;      /* FP8 in × FP8 wt (naive ref) */
+    hipFunction_t fn_flux2_gemm_pgr2;    /* pipe32 FP8xFP8 (LDS-tiled, ported from qimg) */
+    hipFunction_t fn_flux2_quant_clamp;  /* per-row clamp act quant + w_scale fold */
+    void *d_act_fp8;                     /* persistent FP8 activation scratch */
+    void *d_act_scales;                  /* persistent per-row scale scratch */
+    size_t act_fp8_cap, act_sc_cap;
     hipFunction_t fn_gemm_fp8_bf16_wmma; /* BF16 act × FP8 wt (BF16 WMMA) */
     hipFunction_t fn_layernorm, fn_silu, fn_adaln, fn_gated_add;
     hipFunction_t fn_rmsnorm_ph, fn_swiglu, fn_flash_attn;
+    hipFunction_t fn_flash_attn_wmma2;  /* BF16 WMMA self-attn (head_dim=128) */
+    int use_attn_wmma;                  /* 1 = use BF16 WMMA attention */
     hipFunction_t fn_rope_img, fn_rope_txt, fn_bf16_trunc, fn_add;
     /* VAE kernels */
     hipFunction_t fn_vae_im2col, fn_vae_add_bias, fn_vae_transpose, fn_vae_conv1, fn_vae_gnsilu;
+    hipFunction_t fn_vae_transpose_tile;
     hipFunction_t fn_vae_up2x, fn_vae_attn, fn_vae_bn;
+    hipFunction_t fn_gemm_bf16w_wmma;   /* BF16 WMMA, F32 weights (VAE convs) */
+    hipFunction_t fn_vae_conv3x3_wmma;  /* fused im2col+GEMM+transpose 3x3 conv */
+    hipFunction_t fn_vae_conv1x1_wmma;  /* 1x1 conv as fused WMMA GEMM */
+    int use_vae_gemm_wmma;             /* 1 = VAE conv GEMM via BF16 WMMA */
 
     int use_fp8;   /* 1 = raw FP8 weights + LUT GEMM (4x less VRAM) */
     int use_fp8_opt; /* 1 = 128x128 tiled FP8 LUT GEMM (fast path) */
@@ -277,6 +289,34 @@ static void op_gemm_fp8_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, float w_
     hipModuleLaunchKernel(r->fn_gemm_fp8_wmma, gx, gy, 1, 32, 1, 1, 0, NULL, args, NULL);
 }
 
+/* pipe32 FP8xFP8: clamp-quantize activations (per-row scale, w_scale folded in),
+ * then the LDS-tiled WMMA GEMM. Eligible shapes only (n_tok>=128, n_out%128==0,
+ * n_in%32==0); ~143 TF/s class vs the LUT. Returns 0 on success, -1 to fall back. */
+static int op_gemm_fp8_pipe32(hip_flux2_runner *r, void *Y, void *W_fp8, float w_scale,
+                              void *X, void *bias, int n_out, int n_in, int n_tok) {
+    if (!r->fn_flux2_gemm_pgr2 || !r->fn_flux2_quant_clamp) return -1;
+    if (n_tok < 128 || (n_out % 128) != 0 || (n_in % 32) != 0) return -1;
+    int M_pad = ((n_tok + 127) / 128) * 128;
+    size_t need_x = (size_t)M_pad * (size_t)n_in;
+    size_t need_s = (size_t)M_pad * sizeof(float);
+    if (r->act_fp8_cap < need_x) {
+        if (r->d_act_fp8) hipFree(r->d_act_fp8);
+        if (hipMalloc(&r->d_act_fp8, need_x) != hipSuccess) { r->d_act_fp8 = NULL; r->act_fp8_cap = 0; return -1; }
+        r->act_fp8_cap = need_x;
+    }
+    if (r->act_sc_cap < need_s) {
+        if (r->d_act_scales) hipFree(r->d_act_scales);
+        if (hipMalloc(&r->d_act_scales, need_s) != hipSuccess) { r->d_act_scales = NULL; r->act_sc_cap = 0; return -1; }
+        r->act_sc_cap = need_s;
+    }
+    void *qa[] = {&X, &r->d_act_fp8, &r->d_act_scales, &n_tok, &n_in, &M_pad, &w_scale};
+    hipModuleLaunchKernel(r->fn_flux2_quant_clamp, (unsigned)M_pad, 1, 1, 256, 1, 1, 0, NULL, qa, NULL);
+    void *ga[] = {&Y, &W_fp8, &r->d_act_fp8, &bias, &r->d_act_scales, &n_out, &n_in, &n_tok, &M_pad};
+    hipModuleLaunchKernel(r->fn_flux2_gemm_pgr2, (unsigned)(n_out / 128), (unsigned)(M_pad / 128), 1,
+                          128, 1, 1, 0, NULL, ga, NULL);
+    return 0;
+}
+
 /* BF16 WMMA with FP8 weights: 256 threads, CTA tile 128 × 128. */
 static void op_gemm_fp8_bf16_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, float w_scale,
                                    void *X, void *bias, int n_out, int n_in, int n_tok) {
@@ -290,8 +330,11 @@ static void op_gemm_fp8_bf16_wmma(hip_flux2_runner *r, void *Y, void *W_fp8, flo
 static void op_gemm_wt(hip_flux2_runner *r, void *Y, const flux2_hip_wt *W,
                        void *X, void *bias, int n_out, int n_in, int n_tok) {
     if (W->scale >= 0.0f) {
-        if (r->use_wmma == 2 && r->fn_gemm_fp8_wmma)
-            op_gemm_fp8_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
+        if (r->use_wmma == 2 &&
+            op_gemm_fp8_pipe32(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok) == 0)
+            ; /* pipe32 FP8xFP8 handled it */
+        else if (r->use_wmma == 2 && r->fn_gemm_fp8_bf16_wmma)
+            op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok); /* fallback for ineligible shapes */
         else if (r->use_wmma == 1 && r->fn_gemm_fp8_bf16_wmma)
             op_gemm_fp8_bf16_wmma(r, Y, W->w, W->scale, X, bias, n_out, n_in, n_tok);
         else if (r->use_fp8_opt && r->fn_gemm_fp8_opt)
@@ -349,6 +392,16 @@ static void op_gated_add(hip_flux2_runner *r, void *x, void *proj,
 
 static void op_attn(hip_flux2_runner *r, void *out, void *q,
                     void *k, void *v, int n_tok, int n_heads, int head_dim) {
+    /* BF16 WMMA self-attention (head_dim=128) — same math (F32 accum, online
+     * softmax), much faster than the scalar F32 path. Default ON; disable with
+     * FLUX2_ATTN_WMMA=0. Grid (n_heads, ceil(n_tok/64)), block 128. */
+    if (r->fn_flash_attn_wmma2 && head_dim == 128 && r->use_attn_wmma) {
+        unsigned gy = (unsigned)((n_tok + 63) / 64);
+        void *args[] = {&out, &q, &k, &v, &n_tok, &n_heads, &head_dim};
+        hipModuleLaunchKernel(r->fn_flash_attn_wmma2, (unsigned)n_heads, gy, 1,
+                              128, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
     int fa2_warps = 4, fa2_bkv = 16;
     unsigned gy = (unsigned)((n_tok + fa2_warps - 1) / fa2_warps);
     /* RDNA4 (gfx1201) uses wave32, same as NVIDIA */
@@ -462,14 +515,16 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         else
             r->use_fp8_opt = 1;
     }
-    /* WMMA (gfx12 matrix cores): opt-in via FLUX2_FP8_WMMA.
-     *   =1 (or set) : BF16 activation × FP8 weight via BF16 WMMA (accuracy-safe)
-     *   =2 (aka FP8 act): FP8×FP8 WMMA (fastest but lossy, debug only) */
+    /* WMMA (gfx12 matrix cores). Default = pipe32 FP8×FP8 (2.2× DiT vs the LUT,
+     * visually identical on klein). FLUX2_FP8_WMMA overrides:
+     *   =0 : LUT/scalar FP8 GEMM (no WMMA)
+     *   =1 : BF16 activation × FP8 weight (BF16 WMMA, corr ~0.999)
+     *   =2 / fp8 / unset : pipe32 FP8×FP8 (fastest; corr ~0.985, perceptually fine) */
     {
         const char *v = getenv("FLUX2_FP8_WMMA");
-        if (!v || strcmp(v, "0") == 0 || strcmp(v, "false") == 0) r->use_wmma = 0;
-        else if (strcmp(v, "2") == 0 || strcmp(v, "fp8") == 0)    r->use_wmma = 2;
-        else                                                       r->use_wmma = 1;
+        if (v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0)) r->use_wmma = 0;
+        else if (v && strcmp(v, "1") == 0)                          r->use_wmma = 1;
+        else                                                        r->use_wmma = 2;
     }
 
     /* Get function handles */
@@ -479,6 +534,10 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         r->fn_gemm_fp8_opt = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_fp8_wmma, mod, "gemm_fp8_wmma") != hipSuccess)
         r->fn_gemm_fp8_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_flux2_gemm_pgr2, mod, "flux2_gemm_fp8_pgr2") != hipSuccess)
+        r->fn_flux2_gemm_pgr2 = NULL;
+    if (hipModuleGetFunction(&r->fn_flux2_quant_clamp, mod, "flux2_quant_act_clamp") != hipSuccess)
+        r->fn_flux2_quant_clamp = NULL;
     if (hipModuleGetFunction(&r->fn_gemm_fp8_bf16_wmma, mod, "gemm_fp8w_bf16a_wmma_t") != hipSuccess)
         r->fn_gemm_fp8_bf16_wmma = NULL;
     hipModuleGetFunction(&r->fn_layernorm,   mod, "layernorm_f32");
@@ -488,6 +547,13 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
     hipModuleGetFunction(&r->fn_rmsnorm_ph,  mod, "rmsnorm_per_head_f32");
     hipModuleGetFunction(&r->fn_swiglu,      mod, "flux2_swiglu");
     hipModuleGetFunction(&r->fn_flash_attn,  mod, "flash_attn_f32");
+    if (hipModuleGetFunction(&r->fn_flash_attn_wmma2, mod, "flash_attn_sa_wmma_f32") != hipSuccess)
+        r->fn_flash_attn_wmma2 = NULL;
+    {
+        const char *v = getenv("FLUX2_ATTN_WMMA");
+        r->use_attn_wmma = (r->fn_flash_attn_wmma2 != NULL) &&
+                           !(v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+    }
     hipModuleGetFunction(&r->fn_rope_img,    mod, "flux2_rope_img_f32");
     hipModuleGetFunction(&r->fn_rope_txt,    mod, "flux2_rope_txt_f32");
     hipModuleGetFunction(&r->fn_bf16_trunc,  mod, "truncate_bf16_f32");
@@ -496,11 +562,23 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
     hipModuleGetFunction(&r->fn_vae_im2col, mod, "vae_im2col_3x3");
     hipModuleGetFunction(&r->fn_vae_add_bias, mod, "vae_add_bias");
     hipModuleGetFunction(&r->fn_vae_transpose, mod, "vae_transpose_2d");
+    hipModuleGetFunction(&r->fn_vae_transpose_tile, mod, "vae_transpose_tile");
     hipModuleGetFunction(&r->fn_vae_conv1,  mod, "vae_conv2d_1x1");
     hipModuleGetFunction(&r->fn_vae_gnsilu, mod, "vae_groupnorm_silu");
     hipModuleGetFunction(&r->fn_vae_up2x,   mod, "vae_upsample2x");
     hipModuleGetFunction(&r->fn_vae_attn,   mod, "vae_self_attn");
     hipModuleGetFunction(&r->fn_vae_bn,     mod, "vae_bn_denorm");
+    if (hipModuleGetFunction(&r->fn_gemm_bf16w_wmma, mod, "gemm_bf16w_bf16a_wmma_t") != hipSuccess)
+        r->fn_gemm_bf16w_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_vae_conv3x3_wmma, mod, "vae_conv3x3_wmma") != hipSuccess)
+        r->fn_vae_conv3x3_wmma = NULL;
+    if (hipModuleGetFunction(&r->fn_vae_conv1x1_wmma, mod, "vae_conv1x1_wmma") != hipSuccess)
+        r->fn_vae_conv1x1_wmma = NULL;
+    {
+        const char *v = getenv("FLUX2_VAE_WMMA");
+        r->use_vae_gemm_wmma = (r->fn_gemm_bf16w_wmma != NULL) &&
+                               !(v && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0));
+    }
 
     if (r->use_fp8_opt) {
         if (!r->fn_gemm_fp8_opt) {
@@ -511,8 +589,8 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose) {
         }
     }
     if (r->use_wmma) {
-        hipFunction_t want = (r->use_wmma == 2) ? r->fn_gemm_fp8_wmma : r->fn_gemm_fp8_bf16_wmma;
-        const char *label = (r->use_wmma == 2) ? "FP8xFP8" : "BF16xFP8";
+        hipFunction_t want = (r->use_wmma == 2) ? r->fn_flux2_gemm_pgr2 : r->fn_gemm_fp8_bf16_wmma;
+        const char *label = (r->use_wmma == 2) ? "pipe32 FP8xFP8" : "BF16xFP8";
         if (!want) {
             fprintf(stderr, "hip_flux2: WMMA kernel (%s) not found (not gfx12?) — falling back\n", label);
             r->use_wmma = 0;
@@ -1100,10 +1178,37 @@ void hip_flux2_free(hip_flux2_runner *r) {
 
 /* ---- GPU VAE helpers ---- */
 
+/* VAE activation scratch pool: reuse freed buffers to avoid GB-scale
+ * hipMalloc/hipFree churn on the 1024² intermediates. Within one decode the
+ * ping-pong buffers are reused; drained at decode end to release VRAM. */
+#define VAE_POOL_MAX 32
+static struct { void *p; size_t cap; int in_use; } g_vae_pool[VAE_POOL_MAX];
+static int g_vae_pool_n = 0;
+
 static void *vae_alloc(size_t n) {
+    int best = -1;
+    for (int i = 0; i < g_vae_pool_n; i++)
+        if (g_vae_pool[i].p && !g_vae_pool[i].in_use && g_vae_pool[i].cap >= n)
+            if (best < 0 || g_vae_pool[i].cap < g_vae_pool[best].cap) best = i;
+    if (best >= 0) { g_vae_pool[best].in_use = 1; return g_vae_pool[best].p; }
     void *d = NULL;
-    hipMalloc(&d, n);
+    if (hipMalloc(&d, n) != hipSuccess) return NULL;
+    if (g_vae_pool_n < VAE_POOL_MAX) {
+        g_vae_pool[g_vae_pool_n].p = d; g_vae_pool[g_vae_pool_n].cap = n;
+        g_vae_pool[g_vae_pool_n].in_use = 1; g_vae_pool_n++;
+    }
     return d;
+}
+/* Return an activation buffer to the pool (non-pool ptrs fall back to hipFree). */
+static void vae_free(void *p) {
+    if (!p) return;
+    for (int i = 0; i < g_vae_pool_n; i++)
+        if (g_vae_pool[i].p == p) { g_vae_pool[i].in_use = 0; return; }
+    hipFree(p);
+}
+static void vae_pool_drain(void) {
+    for (int i = 0; i < g_vae_pool_n; i++) if (g_vae_pool[i].p) hipFree(g_vae_pool[i].p);
+    g_vae_pool_n = 0;
 }
 
 /* Conv2d 3x3 via im2col + GEMM:
@@ -1128,43 +1233,81 @@ static void vae_conv3(hip_flux2_runner *r, void *out, void *in,
     int col_w = ci * 9;
     size_t F = sizeof(float);
 
-    /* 1. im2col */
-    void *d_col = vae_alloc((size_t)spatial * col_w * F);
-    {
-        int total = spatial * col_w;
-        void *args[] = {&d_col, &in, &ci, &H, &W};
-        hipModuleLaunchKernel(r->fn_vae_im2col, (unsigned)((total+255)/256), 1, 1,
-                              256, 1, 1, 0, NULL, args, NULL);
+    /* Fused path: one kernel does im2col-gather + BF16 WMMA + transposed store,
+     * with no materialized im2col matrix and no separate transpose. */
+    if (r->use_vae_gemm_wmma && r->fn_vae_conv3x3_wmma) {
+        void *args[] = {&out, &w, &in, &bias, &co, &ci, &H, &W};
+        unsigned gx = (unsigned)((co + 127) / 128);
+        unsigned gy = (unsigned)((spatial + 127) / 128);
+        hipModuleLaunchKernel(r->fn_vae_conv3x3_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, args, NULL);
+        return;
     }
 
-    /* 2. GEMM: Y[H*W, co] = col[H*W, ci*9] @ w[co, ci*9]^T */
-    void *d_yt = vae_alloc((size_t)spatial * co * F);
-    {
-        void *null_ptr = NULL;
-        op_gemm(r, d_yt, w, d_col, null_ptr, co, col_w, spatial);
+    /* Tile over spatial so the im2col matrix [tile, col_w] stays bounded.
+     * The whole-image im2col is col_w*spatial floats — 19 GB at 1024² with
+     * ci=512 — which OOMs the card. Cap the im2col scratch at ~512 MB; a single
+     * tile (small spatial, e.g. 256²/512²) is the original whole-image path. */
+    const size_t IM2COL_BUDGET = (size_t)512 << 20;
+    int tile = (int)(IM2COL_BUDGET / ((size_t)col_w * F));
+    if (tile < 4096) tile = 4096;
+    if (tile > spatial) tile = spatial;
+
+    void *d_col = vae_alloc((size_t)tile * col_w * F);
+    void *d_yt  = vae_alloc((size_t)tile * co * F);
+    void *null_ptr = NULL;
+
+    for (int s0 = 0; s0 < spatial; s0 += tile) {
+        int ns = spatial - s0; if (ns > tile) ns = tile;
+
+        /* 1. im2col for pixels [s0, s0+ns) -> d_col[ns, col_w] */
+        {
+            long total = (long)ns * col_w;
+            void *args[] = {&d_col, &in, &ci, &H, &W, &s0, &ns};
+            hipModuleLaunchKernel(r->fn_vae_im2col, (unsigned)((total + 255) / 256), 1, 1,
+                                  256, 1, 1, 0, NULL, args, NULL);
+        }
+
+        /* 2. GEMM: d_yt[ns, co] = d_col[ns, col_w] @ w[co, col_w]^T */
+        if (r->use_vae_gemm_wmma && r->fn_gemm_bf16w_wmma) {
+            float one = 1.0f;
+            void *ga[] = {&d_yt, &w, &d_col, &null_ptr, &co, &col_w, &ns, &one};
+            unsigned gx = (unsigned)((co + 127) / 128);
+            unsigned gy = (unsigned)((ns + 127) / 128);
+            hipModuleLaunchKernel(r->fn_gemm_bf16w_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, ga, NULL);
+        } else {
+            op_gemm(r, d_yt, w, d_col, null_ptr, co, col_w, ns);
+        }
+
+        /* 3. transpose-write d_yt[ns, co] -> out[co, spatial] at offset s0 */
+        {
+            long total = (long)ns * co;
+            void *args[] = {&out, &d_yt, &ns, &co, &s0, &spatial};
+            hipModuleLaunchKernel(r->fn_vae_transpose_tile, (unsigned)((total + 255) / 256), 1, 1,
+                                  256, 1, 1, 0, NULL, args, NULL);
+        }
     }
     hipFree(d_col);
+    hipFree(d_yt);
 
-    /* 3. Transpose [H*W, co] -> [co, H*W] = out (GPU) */
-    {
-        int total = spatial * co;
-        void *args[] = {&out, &d_yt, &spatial, &co};
-        hipModuleLaunchKernel(r->fn_vae_transpose, (unsigned)((total+255)/256), 1, 1,
-                              256, 1, 1, 0, NULL, args, NULL);
-        hipFree(d_yt);
-    }
-
-    /* 4. Add bias */
+    /* 4. Add bias over the full output */
     if (bias) {
         int total = co * spatial;
         void *args[] = {&out, &bias, &co, &spatial};
-        hipModuleLaunchKernel(r->fn_vae_add_bias, (unsigned)((total+255)/256), 1, 1,
+        hipModuleLaunchKernel(r->fn_vae_add_bias, (unsigned)((total + 255) / 256), 1, 1,
                               256, 1, 1, 0, NULL, args, NULL);
     }
 }
 
 static void vae_conv1(hip_flux2_runner *r, void *out, void *in,
                       void *w, void *bias, int ci, int spatial, int co) {
+    if (r->use_vae_gemm_wmma && r->fn_vae_conv1x1_wmma) {
+        /* 1x1 conv as a fused BF16 WMMA GEMM (vs the scalar per-output kernel). */
+        void *args[] = {&out, &w, &in, &bias, &co, &ci, &spatial};
+        unsigned gx = (unsigned)((co + 127) / 128);
+        unsigned gy = (unsigned)((spatial + 127) / 128);
+        hipModuleLaunchKernel(r->fn_vae_conv1x1_wmma, gx, gy, 1, 256, 1, 1, 0, NULL, args, NULL);
+        return;
+    }
     int total = co * spatial;
     void *args[] = {&out, &in, &w, &bias, &ci, &spatial, &co};
     hipModuleLaunchKernel(r->fn_vae_conv1, (unsigned)((total+255)/256), 1, 1,
@@ -1201,15 +1344,15 @@ static void vae_resblock_gpu(hip_flux2_runner *r,
     /* tmp2 = Conv3x3(tmp1) [ci -> co] */
     void *tmp2 = vae_alloc((size_t)co * spatial * sizeof(float));
     vae_conv3(r, tmp2, tmp1, c1w, c1b, ci, H, W, co);
-    hipFree(tmp1);
+    vae_free(tmp1);
     /* tmp1 = GroupNorm+SiLU(tmp2) */
     tmp1 = vae_alloc((size_t)co * spatial * sizeof(float));
     vae_groupnorm_silu(r, tmp1, tmp2, n2w, n2b, co, spatial, ng, 1);
     /* tmp2 = Conv3x3(tmp1) [co -> co] */
-    hipFree(tmp2);
+    vae_free(tmp2);
     tmp2 = vae_alloc((size_t)co * spatial * sizeof(float));
     vae_conv3(r, tmp2, tmp1, c2w, c2b, co, H, W, co);
-    hipFree(tmp1);
+    vae_free(tmp1);
     /* skip connection */
     if (skipw) {
         vae_conv1(r, out, x, skipw, skipb, ci, spatial, co);
@@ -1218,7 +1361,7 @@ static void vae_resblock_gpu(hip_flux2_runner *r,
     }
     /* out += tmp2 */
     op_add(r, out, tmp2, co * spatial);
-    hipFree(tmp2);
+    vae_free(tmp2);
 }
 
 /* VAE mid-block attention on GPU */
@@ -1243,7 +1386,7 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     vae_conv1(r, dQ, normed, qw, qb, c, spatial, c);
     vae_conv1(r, dK, normed, kw, kb, c, spatial, c);
     vae_conv1(r, dV, normed, vw, vb, c, spatial, c);
-    hipFree(normed);
+    vae_free(normed);
 
     /* Transpose [c, spatial] -> [spatial, c] for attention */
     /* Do on CPU for simplicity (mid-block is small: spatial=H*W at lowest res) */
@@ -1254,7 +1397,7 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     hipMemcpy(hQ, dQ, sz, hipMemcpyDeviceToHost);
     hipMemcpy(hK, dK, sz, hipMemcpyDeviceToHost);
     hipMemcpy(hV, dV, sz, hipMemcpyDeviceToHost);
-    hipFree(dQ); hipFree(dK); hipFree(dV);
+    vae_free(dQ); vae_free(dK); vae_free(dV);
 
     /* Transpose CHW -> HWC */
     float *tQ = (float *)malloc(sz);
@@ -1281,11 +1424,11 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     void *args[] = {&dO, &dQ, &dK, &dV, &spatial, &c, &scale};
     hipModuleLaunchKernel(r->fn_vae_attn, (unsigned)spatial, 1, 1,
                           256, 1, 1, smem, NULL, args, NULL);
-    hipFree(dQ); hipFree(dK); hipFree(dV);
+    vae_free(dQ); vae_free(dK); vae_free(dV);
 
     /* Transpose back HWC -> CHW */
     hipMemcpy(hO, dO, sz, hipMemcpyDeviceToHost);
-    hipFree(dO);
+    vae_free(dO);
     float *tO = (float *)malloc(sz);
     for (int s = 0; s < spatial; s++)
         for (int ch = 0; ch < c; ch++)
@@ -1297,12 +1440,12 @@ static void vae_mid_attn_gpu(hip_flux2_runner *r,
     free(tO);
     void *proj_out = vae_alloc(sz);
     vae_conv1(r, proj_out, dTO, ow, ob, c, spatial, c);
-    hipFree(dTO);
+    vae_free(dTO);
 
     /* Residual: out = x + proj_out */
     hipMemcpy(out, x, sz, hipMemcpyDeviceToDevice);
     op_add(r, out, proj_out, c * spatial);
-    hipFree(proj_out);
+    vae_free(proj_out);
 }
 
 /* Upload VAE resblock weights */
@@ -1432,7 +1575,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         void *d_pqcb = gpu_upload_f32(m->pqc_b, lc);
         void *d_tmp = vae_alloc((size_t)lc * h * w * F);
         vae_conv1(r, d_tmp, d_x, d_pqcw, d_pqcb, lc, h * w, lc);
-        hipFree(d_x); hipFree(d_pqcw); hipFree(d_pqcb);
+        vae_free(d_x); hipFree(d_pqcw); hipFree(d_pqcb);
         d_x = d_tmp;
     }
     vae_dump_stage("post_q", d_x, (size_t)lc * h * w);
@@ -1444,7 +1587,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         void *d_cib = gpu_upload_f32(m->conv_in_b, c);
         void *d_tmp = vae_alloc((size_t)c * h * w * F);
         vae_conv3(r, d_tmp, d_x, d_ciw, d_cib, lc, h, w, c);
-        hipFree(d_x); hipFree(d_ciw); hipFree(d_cib);
+        vae_free(d_x); hipFree(d_ciw); hipFree(d_cib);
         d_x = d_tmp;
     }
 
@@ -1458,7 +1601,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         vae_resblock_gpu(r, d_tmp, d_x, gr0.n1w, gr0.n1b, gr0.c1w, gr0.c1b,
                          gr0.n2w, gr0.n2b, gr0.c2w, gr0.c2b, gr0.sw, gr0.sb,
                          gr0.ci, gr0.co, h, w, ng);
-        hipFree(d_x); d_x = d_tmp;
+        vae_free(d_x); d_x = d_tmp;
         /* Free resblock weights */
         hipFree(gr0.n1w); hipFree(gr0.n1b); hipFree(gr0.c1w); hipFree(gr0.c1b);
         hipFree(gr0.n2w); hipFree(gr0.n2b); hipFree(gr0.c2w); hipFree(gr0.c2b);
@@ -1470,7 +1613,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         vae_mid_attn_gpu(r, d_tmp, d_x, ga.nw, ga.nb,
                          ga.qw, ga.qb, ga.kw, ga.kb, ga.vw, ga.vb, ga.ow, ga.ob,
                          c, h, w, ng);
-        hipFree(d_x); d_x = d_tmp;
+        vae_free(d_x); d_x = d_tmp;
         hipFree(ga.nw); hipFree(ga.nb); hipFree(ga.qw); hipFree(ga.qb);
         hipFree(ga.kw); hipFree(ga.kb); hipFree(ga.vw); hipFree(ga.vb);
         hipFree(ga.ow); hipFree(ga.ob);
@@ -1481,7 +1624,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         vae_resblock_gpu(r, d_tmp, d_x, gr1.n1w, gr1.n1b, gr1.c1w, gr1.c1b,
                          gr1.n2w, gr1.n2b, gr1.c2w, gr1.c2b, gr1.sw, gr1.sb,
                          gr1.ci, gr1.co, h, w, ng);
-        hipFree(d_x); d_x = d_tmp;
+        vae_free(d_x); d_x = d_tmp;
         hipFree(gr1.n1w); hipFree(gr1.n1b); hipFree(gr1.c1w); hipFree(gr1.c1b);
         hipFree(gr1.n2w); hipFree(gr1.n2b); hipFree(gr1.c2w); hipFree(gr1.c2b);
         if (gr1.sw) { hipFree(gr1.sw); hipFree(gr1.sb); }
@@ -1500,7 +1643,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             vae_resblock_gpu(r, d_tmp, d_x, gr.n1w, gr.n1b, gr.c1w, gr.c1b,
                              gr.n2w, gr.n2b, gr.c2w, gr.c2b, gr.sw, gr.sb,
                              gr.ci, gr.co, h, w, ng);
-            hipFree(d_x); d_x = d_tmp; c = new_c;
+            vae_free(d_x); d_x = d_tmp; c = new_c;
             hipFree(gr.n1w); hipFree(gr.n1b); hipFree(gr.c1w); hipFree(gr.c1b);
             hipFree(gr.n2w); hipFree(gr.n2b); hipFree(gr.c2w); hipFree(gr.c2b);
             if (gr.sw) { hipFree(gr.sw); hipFree(gr.sb); }
@@ -1513,7 +1656,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             vae_resblock_gpu(r, d_tmp, d_x, gr.n1w, gr.n1b, gr.c1w, gr.c1b,
                              gr.n2w, gr.n2b, gr.c2w, gr.c2b, gr.sw, gr.sb,
                              gr.ci, gr.co, h, w, ng);
-            hipFree(d_x); d_x = d_tmp; c = new_c;
+            vae_free(d_x); d_x = d_tmp; c = new_c;
             hipFree(gr.n1w); hipFree(gr.n1b); hipFree(gr.c1w); hipFree(gr.c1b);
             hipFree(gr.n2w); hipFree(gr.n2b); hipFree(gr.c2w); hipFree(gr.c2b);
             if (gr.sw) { hipFree(gr.sw); hipFree(gr.sb); }
@@ -1526,7 +1669,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             vae_resblock_gpu(r, d_tmp, d_x, gr.n1w, gr.n1b, gr.c1w, gr.c1b,
                              gr.n2w, gr.n2b, gr.c2w, gr.c2b, gr.sw, gr.sb,
                              gr.ci, gr.co, h, w, ng);
-            hipFree(d_x); d_x = d_tmp; c = new_c;
+            vae_free(d_x); d_x = d_tmp; c = new_c;
             hipFree(gr.n1w); hipFree(gr.n1b); hipFree(gr.c1w); hipFree(gr.c1b);
             hipFree(gr.n2w); hipFree(gr.n2b); hipFree(gr.c2w); hipFree(gr.c2b);
             if (gr.sw) { hipFree(gr.sw); hipFree(gr.sb); }
@@ -1540,7 +1683,7 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
             void *d_usb = gpu_upload_f32(m->up_sample[bi].conv_b, c);
             void *d_tmp = vae_alloc((size_t)c * h * w * F);
             vae_conv3(r, d_tmp, d_up, d_usw, d_usb, c, h, w, c);
-            hipFree(d_up); hipFree(d_x); hipFree(d_usw); hipFree(d_usb);
+            vae_free(d_up); vae_free(d_x); hipFree(d_usw); hipFree(d_usb);
             d_x = d_tmp;
         }
         if (r->verbose >= 1)
@@ -1555,20 +1698,21 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         void *d_nob = gpu_upload_f32(m->norm_out_b, c);
         void *d_normed = vae_alloc((size_t)c * h * w * F);
         vae_groupnorm_silu(r, d_normed, d_x, d_now, d_nob, c, h*w, ng, 1);
-        hipFree(d_x); hipFree(d_now); hipFree(d_nob);
+        vae_free(d_x); hipFree(d_now); hipFree(d_nob);
         vae_dump_stage("act", d_normed, (size_t)c * h * w);
 
         void *d_cow = gpu_upload_f32(m->conv_out_w, 3 * c * 9);
         void *d_cob = gpu_upload_f32(m->conv_out_b, 3);
         void *d_rgb = vae_alloc((size_t)3 * h * w * F);
         vae_conv3(r, d_rgb, d_normed, d_cow, d_cob, c, h, w, 3);
-        hipFree(d_normed); hipFree(d_cow); hipFree(d_cob);
+        vae_free(d_normed); hipFree(d_cow); hipFree(d_cob);
         vae_dump_stage("conv_out", d_rgb, (size_t)3 * h * w);
 
         /* Download */
         hipMemcpy(out_rgb, d_rgb, (size_t)3 * h * w * F, hipMemcpyDeviceToHost);
         hipDeviceSynchronize();
-        hipFree(d_rgb);
+        vae_free(d_rgb);
+        vae_pool_drain();
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
