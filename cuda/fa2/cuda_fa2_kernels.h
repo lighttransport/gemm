@@ -45,6 +45,7 @@ static const char *k_fa2_attn_src =
 "#define FA2_BCK (FA2_BC / 16)\n"  /* k-iters along BC for P@V           */
 "#define FA2_DN  (FA2_D  / 8)\n"   /* N-tiles along D for P@V (= O frags)*/
 "#define FA2_DP  (FA2_D + 8)\n"    /* padded sK/sV row stride (LDS-32 free)*/
+"#define FA2_NTHR (FA2_BR / 16 * 32)\n" /* threads/CTA = (BR/16) warps x 32 */
 "\n"
 "#ifdef FA2_BF16\n"
 "#define FA2_MMA \"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32\"\n"
@@ -70,8 +71,13 @@ static const char *k_fa2_attn_src =
 "}\n"
 "#endif\n"
 "\n"
+"#ifdef FA2_MINBLK\n"
+"#define FA2_LB __launch_bounds__(FA2_NTHR, FA2_MINBLK)\n"
+"#else\n"
+"#define FA2_LB __launch_bounds__(FA2_NTHR)\n"
+"#endif\n"
 "extern \"C\" __global__\n"
-"__launch_bounds__(128)\n"
+"FA2_LB\n"
 "void fa2_attn(dt_t *O,\n"
 "              const dt_t *Q,\n"
 "              const dt_t *K,\n"
@@ -350,6 +356,7 @@ static const char *k_fa2_attn_fp8_src =
 "#define FA2_DN   (FA2_D  / 8)\n"  /* N-tiles along D for P@V (= O frags)   */
 "#define FA2_DP   (FA2_D + 8)\n"   /* padded sV row stride (halves)         */
 "#define FA2_KP   (FA2_D + 16)\n"  /* padded sK row stride (bytes)          */
+"#define FA2_NTHR (FA2_BR / 16 * 32)\n" /* threads/CTA = (BR/16) warps x 32 */
 "\n"
 "#define FA2_PV \"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32\"\n"
 "__device__ __forceinline__ dt_t f2bf(float f){\n"
@@ -362,8 +369,13 @@ static const char *k_fa2_attn_fp8_src =
 "    return ((uint32_t)b << 16) | (uint32_t)a;\n"
 "}\n"
 "\n"
+"#ifdef FA2_MINBLK\n"
+"#define FA2_LB __launch_bounds__(FA2_NTHR, FA2_MINBLK)\n"
+"#else\n"
+"#define FA2_LB __launch_bounds__(FA2_NTHR)\n"
+"#endif\n"
 "extern \"C\" __global__\n"
-"__launch_bounds__(128)\n"
+"FA2_LB\n"
 "void fa2_attn_fp8(dt_t *O,\n"
 "                  const e4m3_t *Q,\n"
 "                  const e4m3_t *K,\n"
