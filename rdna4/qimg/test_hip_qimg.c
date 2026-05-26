@@ -11,7 +11,7 @@
  *   make
  */
 
-#define SAFETENSORS_IMPLEMENTATION
+/* SAFETENSORS_IMPLEMENTATION is provided by hip_llm_runner.o (GPU text encoder). */
 #define GGML_DEQUANT_IMPLEMENTATION
 #define GGUF_LOADER_IMPLEMENTATION
 #define BPE_TOKENIZER_IMPLEMENTATION
@@ -141,7 +141,18 @@ static int write_f32_bin(const char *path, const float *data, size_t n_elems) {
     return 0;
 }
 
-static void compare_f32_arrays(const char *label, const float *ref, const float *ours, size_t n) {
+typedef struct {
+    double cosine;
+    double mae;
+    double rmse;
+    double psnr_peak;
+    float max_abs;
+    size_t max_i;
+} f32_compare_result;
+
+static f32_compare_result compare_f32_arrays(const char *label, const float *ref,
+                                             const float *ours, size_t n) {
+    f32_compare_result out = {0};
     double dot = 0.0, nr = 0.0, no = 0.0, mse = 0.0, mae = 0.0;
     float maxd = 0.0f, peak = 0.0f;
     size_t max_i = 0;
@@ -164,6 +175,13 @@ static void compare_f32_arrays(const char *label, const float *ref, const float 
     fprintf(stderr,
             "%s: n=%zu cos=%.6f mae=%.6f rmse=%.6f max=%.6f@%zu psnr_peak=%.2f dB\n",
             label, n, cos, mae, sqrt(mse), maxd, max_i, psnr);
+    out.cosine = cos;
+    out.mae = mae;
+    out.rmse = sqrt(mse);
+    out.psnr_peak = psnr;
+    out.max_abs = maxd;
+    out.max_i = max_i;
+    return out;
 }
 
 /* Load text hidden states from raw F32 file (any token count, fixed dim). */
@@ -188,7 +206,7 @@ static float *load_txt_bin(const char *path, int *n_tok, int txt_dim) {
 }
 
 int main(int argc, char **argv) {
-    const char *dit_path = NULL;
+    const char *dit_path = NULL; int use_int4 = 0;
     const char *vae_path = NULL;
     const char *enc_path = NULL;
     const char *prompt = "a red apple on a white table";
@@ -214,6 +232,8 @@ int main(int argc, char **argv) {
     float fp8_quality_target_db = 0.0f;
     float fp8_act_scale_div = 0.0f;
     const char *fp8_act_scale_mode = NULL;
+    int fast_fp8_matrix_mult = 0;
+    int fast_explicit_off = 0;  /* --fast none/0: opt out of the FP8xFP8 default */
     int device_id = 0;
     int verbose = 1;
     int out_h = 256, out_w = 256, n_steps = 20;
@@ -225,6 +245,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--test-dit")) mode = "dit";
         else if (!strcmp(argv[i], "--test-vae")) mode = "vae";
         else if (!strcmp(argv[i], "--generate")) mode = "gen";
+        else if (!strcmp(argv[i], "--test-int4-load")) mode = "int4load";  /* load a logical-int4 DiT (--dit <file>) and report descriptors + residency */
+        else if (!strcmp(argv[i], "--test-int4-dequant")) mode = "int4dequant";  /* on-GPU dequant correctness gate vs host oracle */
+        else if (!strcmp(argv[i], "--int4")) use_int4 = 1;  /* DiT is a logical-INT4 (W4A16) checkpoint */
         else if (!strcmp(argv[i], "--test-enc")) mode = "enc";
         else if (!strcmp(argv[i], "--dit") && i+1 < argc) dit_path = argv[++i];
         else if (!strcmp(argv[i], "--vae") && i+1 < argc) vae_path = argv[++i];
@@ -260,6 +283,28 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fp8-quality-target-db") && i+1 < argc) fp8_quality_target_db = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--fp8-act-scale-div") && i+1 < argc) fp8_act_scale_div = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--fp8-act-scale-mode") && i+1 < argc) fp8_act_scale_mode = argv[++i];
+        else if (!strcmp(argv[i], "--fast") && i+1 < argc) {
+            const char *fast = argv[++i];
+            if (!strcmp(fast, "fp8_matrix_mult")) {
+                fast_fp8_matrix_mult = 1;
+            } else if (!strcmp(fast, "none") || !strcmp(fast, "0")) {
+                fast_fp8_matrix_mult = 0; fast_explicit_off = 1;
+            } else {
+                fprintf(stderr, "Unsupported --fast option: %s\n", fast);
+                return 1;
+            }
+        }
+        else if (!strncmp(argv[i], "--fast=", 7)) {
+            const char *fast = argv[i] + 7;
+            if (!strcmp(fast, "fp8_matrix_mult")) {
+                fast_fp8_matrix_mult = 1;
+            } else if (!strcmp(fast, "none") || !strcmp(fast, "0")) {
+                fast_fp8_matrix_mult = 0; fast_explicit_off = 1;
+            } else {
+                fprintf(stderr, "Unsupported --fast option: %s\n", fast);
+                return 1;
+            }
+        }
         else {
             fprintf(stderr, "Usage: %s --test-init|--test-dit|--test-vae|--generate\n"
                     "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
@@ -269,6 +314,7 @@ int main(int argc, char **argv) {
                     "  [--fp8-quant-stats] [--fp8-fp8-allow <labels>] [--fp8-fp8-deny <labels>]\n"
                     "  [--fp8-fp8-block-min <i>] [--fp8-fp8-block-max <i>]\n"
                     "  [--fp8-quality-target-db <db>]\n"
+                    "  [--fast fp8_matrix_mult]\n"
                     "  [--fp8-act-scale-div <x>] [--fp8-act-scale-mode perrow|comfy|clamp]\n"
                     "  [-o out.ppm] [-d dev] [-v]\n", argv[0]);
             return 1;
@@ -304,6 +350,14 @@ int main(int argc, char **argv) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%.8g", fp8_act_scale_div);
         setenv("QIMG_FP8_ACT_SCALE_DIV", buf, 1);
+    }
+    if (fast_fp8_matrix_mult) {
+        setenv("QIMG_FAST_FP8_MATRIX_MULT", "1", 1);
+        if (!fp8_act_scale_mode)
+            fp8_act_scale_mode = "comfy";
+    } else if (fast_explicit_off) {
+        /* Explicit opt-out of the quality-safe FP8xFP8 default → pure BF16xFP8. */
+        setenv("QIMG_FAST_FP8_MATRIX_MULT", "0", 1);
     }
     if (fp8_act_scale_mode) setenv("QIMG_FP8_ACT_SCALE_MODE", fp8_act_scale_mode, 1);
 
@@ -361,6 +415,20 @@ int main(int argc, char **argv) {
 
     if (!strcmp(mode, "init")) { hip_qimg_free(r); return 0; }
 
+    if (!strcmp(mode, "int4load")) {
+        if (!dit_path) { fprintf(stderr, "--test-int4-load needs --dit <logical-int4.safetensors>\n"); hip_qimg_free(r); return 1; }
+        int rc = hip_qimg_load_dit_int4(r, dit_path);
+        fprintf(stderr, "hip_qimg: int4 logical load %s\n", rc == 0 ? "OK" : "FAILED");
+        hip_qimg_free(r); return rc == 0 ? 0 : 1;
+    }
+    if (!strcmp(mode, "int4dequant")) {  /* deterministic on-GPU dequant gate: kernel vs host oracle on block-0 attn.to_q */
+        if (!dit_path) { fprintf(stderr, "--test-int4-dequant needs --dit <logical-int4.safetensors>\n"); hip_qimg_free(r); return 1; }
+        if (hip_qimg_load_dit_int4(r, dit_path) != 0) { fprintf(stderr, "hip_qimg: int4 logical load FAILED\n"); hip_qimg_free(r); return 1; }
+        int rc = hip_qimg_test_int4_dequant(r);
+        fprintf(stderr, "hip_qimg: int4 dequant gate %s\n", rc == 0 ? "PASS (bit-exact vs host oracle)" : "FAILED");
+        hip_qimg_free(r); return rc == 0 ? 0 : 1;
+    }
+
     clock_t t0;
 
     /* Load DiT (deferred for gen/enc modes — GPU text encoder runs first) */
@@ -370,9 +438,8 @@ int main(int argc, char **argv) {
             hip_qimg_free(r); return 1;
         }
         t0 = clock();
-        if (hip_qimg_load_dit(r, dit_path) != 0) {
-            hip_qimg_free(r); return 1;
-        }
+        int lrc = use_int4 ? hip_qimg_load_dit_int4(r, dit_path) : hip_qimg_load_dit(r, dit_path);
+        if (lrc != 0) { hip_qimg_free(r); return 1; }
         fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     }
 
@@ -486,9 +553,8 @@ int main(int argc, char **argv) {
         /* Load DiT now (after GPU text encoder freed VRAM) */
         if (dit_path) {
             clock_t t0_dit = clock();
-            if (hip_qimg_load_dit(r, dit_path) != 0) {
-                hip_qimg_free(r); return 1;
-            }
+            int lrc = use_int4 ? hip_qimg_load_dit_int4(r, dit_path) : hip_qimg_load_dit(r, dit_path);
+            if (lrc != 0) { hip_qimg_free(r); return 1; }
             fprintf(stderr, "DiT loaded in %.1fs\n", (double)(clock()-t0_dit)/CLOCKS_PER_SEC);
         }
 
@@ -652,8 +718,24 @@ int main(int argc, char **argv) {
         if (ref_final_path) {
             float *ref_final = load_f32_bin(ref_final_path, (size_t)n_img * in_ch);
             if (ref_final) {
-                compare_f32_arrays("Final packed latent", ref_final, img_tokens,
-                                   (size_t)n_img * in_ch);
+                f32_compare_result cmp =
+                    compare_f32_arrays("Final packed latent", ref_final, img_tokens,
+                                       (size_t)n_img * in_ch);
+                if (fp8_quality_target_db > 0.0f && cmp.psnr_peak < fp8_quality_target_db) {
+                    fprintf(stderr,
+                            "FP8 quality gate FAIL: psnr_peak %.2f dB < target %.2f dB\n",
+                            cmp.psnr_peak, fp8_quality_target_db);
+                    free(ref_final);
+                    free(latent); free(img_tokens); free(txt_tokens); free(txt_tokens_neg);
+                    free(vel); free(vel_uncond);
+                    hip_qimg_free(r);
+                    return 2;
+                }
+                if (fp8_quality_target_db > 0.0f) {
+                    fprintf(stderr,
+                            "FP8 quality gate PASS: psnr_peak %.2f dB >= target %.2f dB\n",
+                            cmp.psnr_peak, fp8_quality_target_db);
+                }
                 free(ref_final);
             }
         }

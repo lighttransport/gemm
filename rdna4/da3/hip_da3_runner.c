@@ -324,6 +324,30 @@ static const char *hip_da3_specific_kernels =
 "    data[idx] += emb * ratio;\n"
 "}\n"
 "\n"
+"/* ---- sinusoidal_uv_posembed_tok: token-major [H*W,C] variant ---- */\n"
+"__global__ void sinusoidal_uv_posembed_tok(float *data, int C, int H, int W,\n"
+"                                            float span_x, float span_y, float ratio) {\n"
+"    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = C * H * W;\n"
+"    if (idx >= total) return;\n"
+"    int p = idx / C;\n"
+"    int c = idx % C;\n"
+"    int h = p / W, w = p % W;\n"
+"    int quarter = C / 4;\n"
+"    int band, is_cos;\n"
+"    float coord;\n"
+"    float u = (W > 1) ? span_x * (2.0f * w - (W - 1)) / (float)W : 0.0f;\n"
+"    float v = (H > 1) ? span_y * (2.0f * h - (H - 1)) / (float)H : 0.0f;\n"
+"    if (c < quarter) { band = c; coord = u; is_cos = 0; }\n"
+"    else if (c < 2*quarter) { band = c - quarter; coord = u; is_cos = 1; }\n"
+"    else if (c < 3*quarter) { band = c - 2*quarter; coord = v; is_cos = 0; }\n"
+"    else { band = c - 3*quarter; coord = v; is_cos = 1; }\n"
+"    float omega = 1.0f / powf(100.0f, (float)band / (float)quarter);\n"
+"    float angle = coord * omega;\n"
+"    float emb = is_cos ? cosf(angle) : sinf(angle);\n"
+"    data[p * C + c] += emb * ratio;\n"
+"}\n"
+"\n"
 "} /* extern C */\n"
 ;
 
@@ -406,6 +430,7 @@ struct hip_da3_runner {
     hipFunction_t fn_groupnorm_f32;
     hipFunction_t fn_channel_layernorm_f32;
     hipFunction_t fn_sinusoidal_uv_posembed;
+    hipFunction_t fn_sinusoidal_uv_posembed_tok;
     hipFunction_t fn_silu_f32;
 
     /* Model params */
@@ -589,11 +614,12 @@ static int da3_compile_kernels(hip_da3_runner *r) {
     GET_FN(groupnorm_f32);
     GET_FN(channel_layernorm_f32);
     GET_FN(sinusoidal_uv_posembed);
+    GET_FN(sinusoidal_uv_posembed_tok);
 
 #undef GET_FN
 
     if (r->verbose >= 1)
-        fprintf(stderr, "hip_da3: %d kernels compiled\n", 26);
+        fprintf(stderr, "hip_da3: %d kernels compiled\n", 27);
     return 0;
 }
 
@@ -2013,6 +2039,34 @@ static void kl_add_inplace(hip_da3_runner *r, void *dst, void *src, int n) {
     KL(r->fn_add_f32, (unsigned)grid, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
+static void kl_sinusoidal_uv_posembed_chw(hip_da3_runner *r, void *data,
+                                           int C, int H, int W) {
+    float aspect = (float)W / (float)H;
+    float diag = sqrtf(aspect * aspect + 1.0f);
+    float span_x = aspect / diag;
+    float span_y = 1.0f / diag;
+    float ratio = 0.1f;
+    int total = C * H * W;
+    int grid = (total + 255) / 256;
+    void *args[] = {&data, &C, &H, &W, &span_x, &span_y, &ratio};
+    KL(r->fn_sinusoidal_uv_posembed, (unsigned)grid, 1, 1, 256, 1, 1, 0,
+       r->stream, args);
+}
+
+static void kl_sinusoidal_uv_posembed_tok(hip_da3_runner *r, void *data,
+                                           int C, int H, int W) {
+    float aspect = (float)W / (float)H;
+    float diag = sqrtf(aspect * aspect + 1.0f);
+    float span_x = aspect / diag;
+    float span_y = 1.0f / diag;
+    float ratio = 0.1f;
+    int total = C * H * W;
+    int grid = (total + 255) / 256;
+    void *args[] = {&data, &C, &H, &W, &span_x, &span_y, &ratio};
+    KL(r->fn_sinusoidal_uv_posembed_tok, (unsigned)grid, 1, 1, 256, 1, 1, 0,
+       r->stream, args);
+}
+
 static void kl_channel_layernorm(hip_da3_runner *r, void *dst, void *src,
                                    void *w, void *b, int C, int HW) {
     float eps = 1e-5f;
@@ -2250,6 +2304,8 @@ static void run_aux_dpt(hip_da3_runner *r, int *sp_h, int *sp_w, int features,
                      r->dpt_aux.fuse_rcu2_c2_w[0], r->dpt_aux.fuse_rcu2_c2_b[0],
                      r->dpt_aux.has_rcu1[0], r->dpt_aux.has_rcu2[0],
                      sp_h[0] * 2, sp_w[0] * 2);
+
+    kl_sinusoidal_uv_posembed_chw(r, aux_fused, feat, sp_h[0] * 2, sp_w[0] * 2);
 
     /* Debug: check aux_fused values after refinenet */
     if (r->verbose >= 2) {
@@ -2663,6 +2719,7 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
         if (dw->norm_w) kl_layernorm(r, r->d_dpt_ln, r->d_dpt_cat, dw->norm_w, dw->norm_b, np, head_dim_in);
         else hipMemcpyAsync(r->d_dpt_ln, r->d_dpt_cat, (size_t)np*head_dim_in*sizeof(float), hipMemcpyDeviceToDevice, r->stream);
         kl_gemm(r, r->d_dpt_proj, dw->proj_w[fi], r->d_dpt_ln, dw->proj_b[fi], oc_val, head_dim_in, np);
+        kl_sinusoidal_uv_posembed_tok(r, r->d_dpt_proj, oc_val, gh, gw);
 
         if (fi == 0) kl_deconv_gemm_scatter(r, r->d_dpt_spatial[0], r->d_dpt_proj, dw->upsample_0_w, dw->upsample_0_b, r->d_dpt_ln, oc_val, oc_val, gh, gw, 4, 4, 4);
         else if (fi == 1) kl_deconv_gemm_scatter(r, r->d_dpt_spatial[1], r->d_dpt_proj, dw->upsample_1_w, dw->upsample_1_b, r->d_dpt_ln, oc_val, oc_val, gh, gw, 2, 2, 2);
@@ -2838,6 +2895,7 @@ da3_full_result hip_da3_predict_full(hip_da3_runner *r, const uint8_t *rgb,
 
             kl_gemm(r, r->d_dpt_proj, gdw->proj_w[fi], r->d_dpt_ln, gdw->proj_b[fi],
                      oc_val, head_dim_in, np);
+            kl_sinusoidal_uv_posembed_tok(r, r->d_dpt_proj, oc_val, gh, gw);
 
             if (fi == 0)
                 kl_deconv_gemm_scatter(r, r->d_dpt_spatial[0], r->d_dpt_proj,
