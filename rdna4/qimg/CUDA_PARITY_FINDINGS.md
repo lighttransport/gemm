@@ -31,3 +31,6 @@ forcing HIP toward CUDA's fp8 acts makes it worse/collapses (HIP fp8×fp8 kernel
 lossier than cuBLASLt). Byte-parity with CUDA isn't reachable without copying that
 loss. Wobble vs ground truth is fp8 *weight* precision compounding — lever is the
 weights (int4/svdquant), not GEMM/attn internals.
+
+## Repro: emulate CUDA fp8 acts (QIMG_ACT_FP8_RT=1)
+Per-row fp8/448 act roundtrip + accurate GEMM = final cos 0.86 (vs 0.9956 default), WORSE. CUDA fp8 acts are extra loss HIP avoids; 0.9956 is the parity floor. Gated diagnostic, default off.
