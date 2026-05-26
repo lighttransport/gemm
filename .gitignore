@@ -198,4 +198,7 @@ cpu/trellis2/trellis2_repo
 cuda/trellis2/__pycache__/
 cuda/trellis2/trellis2_cuda_ref.egg-info/
 cuda/trellis2/model_root/
-cuda/trellis2/verify-dumps/
+# Ignore the generated dumps but keep the hand-written format doc (the HIP-side
+# dump contract). Use /* (not the bare dir) so the negation can re-include it.
+cuda/trellis2/verify-dumps/*
+!cuda/trellis2/verify-dumps/README.md
