@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../common/stb_image_write.h"
@@ -441,6 +442,11 @@ static int cmd_back_project(int argc, char **argv) {
 
 /* ===== subcommand: chain (full pipeline demo) =========================== */
 
+static inline double mono_s(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static int cmd_chain(int argc, char **argv) {
     if (argc < 10) {
         fprintf(stderr,
@@ -461,6 +467,9 @@ static int cmd_chain(int argc, char **argv) {
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) return 1;
     cuInit(0); CUdevice dev; cuDeviceGet(&dev, 0);
     CUcontext ctx; cuCtxCreate(&ctx, 0, dev);
+
+    double _t_start = mono_s();
+    double _t_stage = _t_start;
 
     /* 1. view_maps */
     obj_mesh m = {0};
@@ -501,9 +510,18 @@ static int cmd_chain(int argc, char **argv) {
     float *all_pos = malloc(N*per*sizeof(float));
     cuMemcpyDtoH(all_nrm, d_n, N*per*sizeof(float));
     cuMemcpyDtoH(all_pos, d_p, N*per*sizeof(float));
+    {   int sd[4]={N,512,512,3}; char tp[512];
+        snprintf(tp,sizeof(tp),"%s/chain_normal.npy",outdir);
+        npy_write_f32(tp,all_nrm,sd,4);
+        snprintf(tp,sizeof(tp),"%s/chain_position.npy",outdir);
+        npy_write_f32(tp,all_pos,sd,4);
+    }
     cuMemFree(d_n); cuMemFree(d_p); cuMemFree(d_de); cuMemFree(d_vi); cuMemFree(d_co);
     /* vm + m stay alive — needed below for xatlas unwrap, atlas raster,
      * and OBJ writeout. */
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] view_maps: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
 
     /* 2. dinov2g */
     int nd; uint64_t sh[8]; size_t nn; char dt[8];
@@ -516,6 +534,9 @@ static int cmd_chain(int argc, char **argv) {
     fprintf(stderr, "[chain] dinov2g: encoded ref image -> [1,257,1536]\n");
     free(dg_in);
     paint_stage_dinov2g_destroy(dg);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] dinov2g: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
 
     /* 3. VAE-encode 2 selected views of normal/position into unet conditioning
      * latents [B=1,N_gen=2,4,64,64] (replaces synthetic random embeds the
@@ -667,6 +688,12 @@ static int cmd_chain(int argc, char **argv) {
         }
     }
     free(img_chw);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] vae_encode: %.3fs\n", mono_s() - _t_stage);
+    /* Free VAE TC scratch (xcol/yt/xbf, can be ~1GB) before loading UNet
+     * weights — VAE decode reallocates lazily on first call. */
+    paint_stage_vae_free_scratch(vae);
+    _t_stage = mono_s();
 
     paint_stage_unet *u = paint_stage_unet_create(dev, unet_path, &cfg);
     if (!u) return 1;
@@ -721,7 +748,33 @@ static int cmd_chain(int argc, char **argv) {
         zero_dino = calloc((size_t)cfg.T_dino * cfg.C_dino_in, sizeof(float));
     }
 
+    /* Pre-populate the RA cache for each CFG chunk. run_dual is the expensive
+     * reference-branch UNet forward; conditioning per chunk is invariant
+     * across timesteps, so we cache it once per chunk and reuse across steps.
+     * set_conditioning inside the step loop is cheap (memcpy + 1 small linear
+     * + 1 layernorm). */
     if (!do_cfg) {
+        paint_stage_unet_set_chunk(u, 0);
+        paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
+                                           (float*)text_in, (float*)ref_lat, dino_h);
+        paint_stage_unet_run_dual(u);
+    } else if (cfg_mode == 2) {
+        paint_stage_unet_set_chunk(u, 0);
+        paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text, zero_ref, zero_dino);
+        paint_stage_unet_run_dual(u);
+        paint_stage_unet_set_chunk(u, 1);
+        paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
+                                           (float*)text_in, (float*)ref_lat, dino_h);
+        paint_stage_unet_run_dual(u);
+    } else {
+        paint_stage_unet_set_chunk(u, 0);
+        paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text, zero_ref, zero_dino);
+        paint_stage_unet_run_dual(u);
+        paint_stage_unet_set_chunk(u, 1);
+        paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text,
+                                           (float*)ref_lat, zero_dino);
+        paint_stage_unet_run_dual(u);
+        paint_stage_unet_set_chunk(u, 2);
         paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
                                            (float*)text_in, (float*)ref_lat, dino_h);
         paint_stage_unet_run_dual(u);
@@ -752,23 +805,33 @@ static int cmd_chain(int argc, char **argv) {
     for (int i = 0; i < N_steps; i++)
         fprintf(stderr, "%lld%s", sch.timesteps[i], i+1<N_steps?",":"]\n");
     size_t spc = 4 * (size_t)cfg.H0 * cfg.W0;
+    struct timespec _ts0, _ts1; clock_gettime(CLOCK_MONOTONIC, &_ts0);
     for (int i = 0; i < N_steps; i++) {
+        struct timespec _tsa, _tsb, _tsc, _tsd;
+        clock_gettime(CLOCK_MONOTONIC, &_tsa);
         if (cfg_mode == 3) {
             /* uncond: zero everything */
+            paint_stage_unet_set_chunk(u, 0);
             paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text,
                                                zero_ref, zero_dino);
-            paint_stage_unet_run_dual(u);
             paint_stage_unet_run_step(u, sch.timesteps[i], x, np_uncond);
+            clock_gettime(CLOCK_MONOTONIC, &_tsb);
             /* ref: real ref_lat only; embeds/text/dino zero */
+            paint_stage_unet_set_chunk(u, 1);
             paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text,
                                                (float*)ref_lat, zero_dino);
-            paint_stage_unet_run_dual(u);
             paint_stage_unet_run_step(u, sch.timesteps[i], x, np_ref);
+            clock_gettime(CLOCK_MONOTONIC, &_tsc);
             /* full: all real */
+            paint_stage_unet_set_chunk(u, 2);
             paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
                                                (float*)text_in, (float*)ref_lat, dino_h);
-            paint_stage_unet_run_dual(u);
             paint_stage_unet_run_step(u, sch.timesteps[i], x, np_buf);
+            clock_gettime(CLOCK_MONOTONIC, &_tsd);
+            fprintf(stderr, "[chain] step %2d/%d: c0=%.2fs c1=%.2fs c2=%.2fs\n", i+1, N_steps,
+                    (_tsb.tv_sec-_tsa.tv_sec)+(_tsb.tv_nsec-_tsa.tv_nsec)*1e-9,
+                    (_tsc.tv_sec-_tsb.tv_sec)+(_tsc.tv_nsec-_tsb.tv_nsec)*1e-9,
+                    (_tsd.tv_sec-_tsc.tv_sec)+(_tsd.tv_nsec-_tsc.tv_nsec)*1e-9);
             /* combine: np = u + g*vs*(r - u) + g*vs*(f - r) */
             for (int b = 0; b < Beff; b++) {
                 float gv = cfg_scale * vs_per_row[b];
@@ -779,13 +842,13 @@ static int cmd_chain(int argc, char **argv) {
                     fl[k] = uc[k] + gv * (re[k] - uc[k]) + gv * (fl[k] - re[k]);
             }
         } else if (cfg_mode == 2) {
+            paint_stage_unet_set_chunk(u, 0);
             paint_stage_unet_set_conditioning(u, zero_en, zero_ep, zero_text,
                                                zero_ref, zero_dino);
-            paint_stage_unet_run_dual(u);
             paint_stage_unet_run_step(u, sch.timesteps[i], x, np_uncond);
+            paint_stage_unet_set_chunk(u, 1);
             paint_stage_unet_set_conditioning(u, embeds_normal, embeds_position,
                                                (float*)text_in, (float*)ref_lat, dino_h);
-            paint_stage_unet_run_dual(u);
             paint_stage_unet_run_step(u, sch.timesteps[i], x, np_buf);
             for (int b = 0; b < Beff; b++) {
                 float gv = cfg_scale * vs_per_row[b];
@@ -799,6 +862,12 @@ static int cmd_chain(int argc, char **argv) {
         }
         pu_unipc_step(&sch, np_buf, x);
     }
+    clock_gettime(CLOCK_MONOTONIC, &_ts1);
+    fprintf(stderr, "[chain] unet total: %.2fs (%d steps cfg=%d)\n",
+            (_ts1.tv_sec-_ts0.tv_sec)+(_ts1.tv_nsec-_ts0.tv_nsec)*1e-9, N_steps, cfg_mode);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] unet: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
     const float inv = 1.0f/0.18215f; for (size_t k=0;k<x_n;k++) x[k]*=inv;
     fprintf(stderr, "[chain] unet: %d UniPC steps -> %d latents\n", N_steps, Beff);
     snprintf(path, sizeof(path), "%s/chain_latents.npy", outdir);
@@ -830,6 +899,9 @@ static int cmd_chain(int argc, char **argv) {
         }
     }
     fprintf(stderr, "[chain] vae: %d latents -> %d RGB views @ %d²\n", Beff, Beff, OH);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] vae_decode: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
     snprintf(path, sizeof(path), "%s/chain_views.npy", outdir);
     int sv[4]={Beff,3,OH,OW}; npy_write_f32(path, views, sv, 4);
     free(x); cuMemFree(d_img); cuMemFree(d_lat);
@@ -875,6 +947,16 @@ static int cmd_chain(int argc, char **argv) {
                         Htex, Wtex, tex_pos, tex_cov);
     int n_cov = 0; for (size_t i = 0; i < tex_nn; i++) n_cov += tex_cov[i];
     fprintf(stderr, "[chain] uv-raster: %d / %zu texels covered\n", n_cov, tex_nn);
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] xatlas_uv_raster: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
+    { int sp[3]={Htex,Wtex,3}, sc[2]={Htex,Wtex};
+      char p2[1024];
+      snprintf(p2,sizeof(p2),"%s/chain_tex_pos.npy",outdir); npy_write_f32(p2,tex_pos,sp,3);
+      float *tcf = malloc(tex_nn*sizeof(float)); for (size_t i=0;i<tex_nn;i++) tcf[i]=(float)tex_cov[i];
+      snprintf(p2,sizeof(p2),"%s/chain_tex_cov.npy",outdir); npy_write_f32(p2,tcf,sc,2);
+      free(tcf);
+    }
     free(uvs_flip); free(vtx_pos_uv);
     /* Oracle bake for diff (optional). */
     float *bake_ref = NULL, *trust_ref = NULL;
@@ -893,15 +975,23 @@ static int cmd_chain(int argc, char **argv) {
                 "depth/vis/cos resolution mismatch will skip all texels\n",
                 Himg, Wimg);
     }
+    /* views are [B,3,H,W] CHW; back_project_sample_f32 indexes as HWC. */
+    float *view_hwc = malloc(out_per * sizeof(float));
     for (int v = 0; v < Nv; v++) {
+        const float *src = views + (size_t)v * out_per;
+        for (int y = 0; y < Himg; y++)
+            for (int xx = 0; xx < Wimg; xx++)
+                for (int c = 0; c < 3; c++)
+                    view_hwc[(y*Wimg + xx)*3 + c] = src[c*Himg*Wimg + y*Wimg + xx];
         paint_stage_back_project_add_view(bp,
-            views + (size_t)v * out_per,
+            view_hwc,
             all_depth + (size_t)v * per1,
             all_vis   + (size_t)v * per1,
             all_cos   + (size_t)v * per1,
             w2c_all + v * 16,
             Himg, Wimg, proj_diag[0], proj_diag[1]);
     }
+    free(view_hwc);
     free(all_depth); free(all_vis); free(all_cos);
     size_t tex_n = (size_t)Htex*Wtex;
     float *bake = malloc(tex_n*3*sizeof(float)), *mask = malloc(tex_n*sizeof(float));
@@ -917,6 +1007,9 @@ static int cmd_chain(int argc, char **argv) {
         if ((mask[i]>0)!=(trust_ref[i]>0)) mm++;
         if (mask[i]>0||trust_ref[i]>0) for (int k=0;k<3;k++){double d=fabs(bake[i*3+k]-bake_ref[i*3+k]); if(d>mx)mx=d;}
     }
+    cuCtxSynchronize();
+    fprintf(stderr, "[chain-time] back_project: %.3fs\n", mono_s() - _t_stage);
+    _t_stage = mono_s();
     fprintf(stderr, "[chain] back-project: N=%d Htex=%d mask_mismatch=%d max_diff=%.3e\n",
             Nv, Htex, mm, mx);
 
@@ -967,6 +1060,8 @@ static int cmd_chain(int argc, char **argv) {
     free(bake); free(mask); free(tex_pos); free(tex_cov); free(bake_ref); free(trust_ref);
     free(views);
     paint_stage_back_project_destroy(bp);
+    fprintf(stderr, "[chain-time] inpaint_write: %.3fs\n", mono_s() - _t_stage);
+    fprintf(stderr, "[chain-time] TOTAL: %.3fs\n", mono_s() - _t_start);
     cuCtxDestroy(ctx);
     fprintf(stderr, "[chain] DONE — outputs in %s\n", outdir);
     return 0;

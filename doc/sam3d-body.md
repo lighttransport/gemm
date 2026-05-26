@@ -1,6 +1,6 @@
 # SAM 3D Body — Current State and TODOs
 
-Snapshot: 2026-04-27.
+Snapshot: 2026-05-22.
 
 FAIR's `sam-3d-body`: single-image, full-body 3D human-mesh recovery.
 Encoder–decoder (DINOv3-H+ backbone → promptable decoder → MHR-head
@@ -61,6 +61,7 @@ common/sam3d_body_vit.h             # DINOv3-H+ generic-Dh ViT (Dh=80)
 common/dinov3.h                     # shared DINOv3 backbone (also used by da3)
 common/npy_io.h                     # promoted shared NPY reader
 ref/sam3d-body/                     # dedicated venv + gen_image_ref.py
+ref/sam3d-body/dumps/               # persisted PyTorch reference dumps
 /mnt/disk01/models/sam3d-body/      # checkpoints + MHR assets
 ```
 
@@ -98,6 +99,88 @@ reference unless noted.
 | End-to-end raw image (CUDA) | GREEN  | 2.43e-2   | 4.06e-3  | fixed bbox vs `body_out_*`; 2D max 6.78 px                                             |
 | ViT-H override (CPU)        | GREEN  | 1.37e-6   | 1.64e-7  | rectangular kp-update fixed; 2D max 4.88e-4 px                                         |
 | ViT-H raw image (CPU/CUDA)  | GREEN  | 1.26e-1   | 3.11e-2  | fixed bbox vs `body_out_*`; 2D max 162.7 px; encoder precision floor                   |
+
+## Strict reference campaign — 2026-05-22
+
+Target under test: `max_abs < 1e-5` against PyTorch reference dumps.
+The reference generator now disables CUDA TF32 by default for both
+matmul and cuDNN conv and uses math SDPA by default:
+
+```bash
+env XDG_RUNTIME_DIR=/run/user/1000 \
+ref/sam3d-body/.venv/bin/python ref/sam3d-body/gen_image_ref.py \
+    --image cpu/sam3d_body/samples/dancing.jpg \
+    --bbox 0 0 2250 1500 \
+    --local-ckpt-dir /mnt/disk01/models/sam3d-body/dinov3 \
+    --outdir ref/sam3d-body/dumps/dinov3_512x384_f32_precise \
+    --image-width 384 --image-height 512 \
+    --backbone-dtype float32 --sdp math \
+    --dump-dinov3-blocks --seed 42
+```
+
+Persisted refs:
+
+| Refdir | Size | Purpose |
+|--------|------|---------|
+| `ref/sam3d-body/dumps/dinov3_512x384_f32_precise` | 247M | strict no-TF32 f32-backbone target + DINOv3 block dumps |
+| `ref/sam3d-body/dumps/dinov3_512x384_fp16_precise` | 126M | diagnostic fp16-backbone PyTorch target |
+
+Current CUDA verifier status against the f32 precise ref:
+
+| Stage | max_abs | mean_abs | Strict status | Notes |
+|-------|---------|----------|---------------|-------|
+| DINOv3 encoder fp16 | `8.231401e-05` | `6.680113e-07` | FAIL | Fast default path. |
+| DINOv3 encoder fp32 | `7.110834e-05` | `6.840330e-07` | FAIL | `--precision fp32` loads `sam3d_body_dinov3_fp32.safetensors` and uses f32 tiled block GEMMs. Weight precision is not the main floor. |
+| ray_cond_emb | `5.722046e-06` | `6.153528e-07` | PASS | No-TF32 ref removed the old `~8.8e-4` conv mismatch. |
+| build_tokens x/x_pe | `3.814697e-06` | `~5e-09` | PASS | Stable. |
+| decoder_layer fwd | worst `1.335144e-05` | `4.47e-07` | FAIL | Only layer 0 exceeds strict max; CPU layer verifier is under target. |
+| kp_token_update | worst `6.198883e-06` | `1.89e-07` | PASS | All layers under target. |
+| norm_final + heads | worst `3.814697e-06` | `3.19e-07` | PASS | `verify_mhr_head --threshold 1e-5`. |
+| decoder loop outputs | worst `7.6294e-06` | `1.66e-06` | PASS | Use `verify_decoder --threshold 1e-5 --mean-threshold 1e-5`; all max errors under target. |
+| end-to-end body branch fp32 | verts `1.1679e-03`, k3d `1.1581e-03`, k2d `4.1452e-01 px` | — | FAIL | Still dominated by DINOv3 encoder drift; fp32 block weights do not move final outputs materially. |
+
+The fp16-backbone PyTorch ref does **not** close the encoder gap:
+CUDA DINOv3 vs that ref is `1.189868e-01` max / `6.699263e-04` mean,
+so the useful strict target remains the f32 no-TF32/math-SDPA ref.
+The f32 CUDA encoder mode is implemented but only improves strict DINOv3
+from `8.23e-5` to `7.11e-5`; remaining work is an encoder math audit
+around per-substage math/reduction order, not just weight dtype.
+Timing on the local sm_120 GPU for the 512x384 verifier was
+`~918 ms` for fp16 and `~756 ms` for fp32; the f16 path currently pays
+per-GEMM half-to-float conversion in the non-MMA tiled kernel.
+
+Block-level DINOv3 dumps are now available:
+
+```bash
+SAM3D_BODY_DINOV3_DUMP_BLOCKS_DIR=/tmp/sam3d_body_cuda_blocks \
+./cuda/sam3d_body/verify_dinov3 \
+    --safetensors-dir /mnt/disk01/models/sam3d-body/safetensors \
+    --refdir ref/sam3d-body/dumps/dinov3_512x384_f32_precise \
+    --precision fp32 -v
+```
+
+The block diff localizes the drift to the encoder immediately: block 0
+already has patch-token `max_abs=4.577637e-05` (prefix-token
+`1.678467e-04`), then residual-stream patch max grows to
+`5.908203e-02` by block 31. Final LayerNorm compresses that to the
+published `7.110834e-05` patch-output max.
+
+Tightening experiments tried so far:
+
+| Experiment | max_abs | mean_abs | Timing | Result |
+|------------|---------|----------|--------|--------|
+| default fp32 quality path | `7.110834e-05` | `6.840330e-07` | `~756 ms` | best current strict max |
+| `SAM3D_BODY_PRECISE_ATTN=1` | `9.715557e-05` | `5.820347e-07` | `~1008 ms` | materialized SDPA row is slower and worse max |
+| `SAM3D_BODY_CUBLAS_GEMM=1` | `1.324415e-04` | `8.012580e-07` | `~291 ms` | much faster, worse strict max |
+
+`SAM3D_BODY_CUBLAS_GEMM=1` is therefore an opt-in speed path for fp32
+DINOv3, not the strict-quality default. `SAM3D_BODY_PRECISE_ATTN=1`
+is kept as a diagnostic path only.
+
+Verifier update: `cuda/sam3d_body/verify_decoder` accepts
+`--mean-threshold` now. Without the flag it preserves the old
+`mean < 0.15 * threshold` gate; strict max campaigns can set both
+thresholds to `1e-5`.
 
 ## Steps — gate status
 
