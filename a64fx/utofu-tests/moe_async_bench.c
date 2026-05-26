@@ -136,24 +136,6 @@ static int read_topo(uint8_t coords[][TOFU_NCOORDS])
     return n;
 }
 
-static int node_of_cpu(int cpu)
-{
-    for (int nd = 0; nd < 16; nd++) {
-        char path[64], buf[256];
-        snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", nd);
-        FILE *f = fopen(path, "r"); if (!f) continue;
-        char *got = fgets(buf, sizeof buf, f); fclose(f); if (!got) continue;
-        char *p = buf;
-        while (*p && *p != '\n') {
-            int a = (int)strtol(p, &p, 10), b = a;
-            if (*p == '-') { p++; b = (int)strtol(p, &p, 10); }
-            if (cpu >= a && cpu <= b) return nd;
-            while (*p == ',') p++;
-        }
-    }
-    return -1;
-}
-
 /* deterministic routing matrix (identical on every rank), as moe_dispatch_bench. */
 static uint64_t splitmix64(uint64_t *s)
 {
