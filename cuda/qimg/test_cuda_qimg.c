@@ -1644,6 +1644,7 @@ static int test_int8_gemm(void) {
         cuMemAlloc(&dB, (size_t)N*sizeof(float));cuMemcpyHtoD(dB, Bf, (size_t)N*sizeof(float));
         cuMemAlloc(&dY, nY*sizeof(float));
 
+        cuMemsetD8(dY, 0, nY*sizeof(float));
         op_gemm(r, dY, dW, dX, dB, N, K, M);
         cuStreamSynchronize(r->stream);
         float *Yg = (float*)malloc(nY*sizeof(float));
