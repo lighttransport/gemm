@@ -357,6 +357,69 @@ static void *st_upload_f16(st_context *st, const char *name, int verbose) {
     return NULL;
 }
 
+static float hy3d_f16_bits_to_f32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x3ff;
+    uint32_t f;
+    if (exp == 0) {
+        f = sign << 31;
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7f800000 | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(float));
+    return out;
+}
+
+static uint16_t hy3d_f32_to_f16_rn(float f) {
+    union { float f; uint32_t i; } u;
+    u.f = f;
+    uint32_t x = u.i;
+    uint16_t sign = (uint16_t)((x >> 16) & 0x8000);
+    int32_t exp = (int32_t)((x >> 23) & 0xff);
+    uint32_t mant = x & 0x7fffff;
+
+    if (exp == 0xff) {
+        return (uint16_t)(sign | 0x7c00 | (mant ? 0x0200 : 0));
+    }
+
+    int32_t new_exp = exp - 127 + 15;
+    if (new_exp >= 31) return (uint16_t)(sign | 0x7c00);
+    if (new_exp <= 0) {
+        if (new_exp < -10) return sign;
+        mant |= 0x800000;
+        int shift = 14 - new_exp;
+        uint32_t out = mant >> shift;
+        uint32_t rem = mant & ((1u << shift) - 1u);
+        uint32_t half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (out & 1u))) out++;
+        return (uint16_t)(sign | out);
+    }
+
+    uint32_t out_exp = (uint32_t)new_exp << 10;
+    uint32_t out_mant = mant >> 13;
+    uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (out_mant & 1u))) {
+        out_mant++;
+        if (out_mant == 0x400u) {
+            out_mant = 0;
+            new_exp++;
+            if (new_exp >= 31) return (uint16_t)(sign | 0x7c00);
+            out_exp = (uint32_t)new_exp << 10;
+        }
+    }
+    return (uint16_t)(sign | out_exp | out_mant);
+}
+
+static float hy3d_pytorch_fp16_timestep(float sigma) {
+    float t_train = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(sigma * 1000.0f));
+    float t_unit = t_train / 1000.0f;
+    return hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(t_unit));
+}
+
 /* Upload safetensors tensor to GPU as F32 (converting F16->F32 if needed) */
 static void *st_upload_f32(st_context *st, const char *name, int verbose) {
     int idx = safetensors_find(st, name);
@@ -375,19 +438,7 @@ static void *st_upload_f32(st_context *st, const char *name, int verbose) {
         float *f32 = (float *)malloc(n * sizeof(float));
         const uint16_t *f16 = (const uint16_t *)data;
         for (size_t i = 0; i < n; i++) {
-            /* Simple F16 to F32 conversion */
-            uint32_t sign = (f16[i] >> 15) & 0x1;
-            uint32_t exp = (f16[i] >> 10) & 0x1f;
-            uint32_t mant = f16[i] & 0x3ff;
-            uint32_t f;
-            if (exp == 0) {
-                f = sign << 31;
-            } else if (exp == 31) {
-                f = (sign << 31) | 0x7f800000 | (mant << 13);
-            } else {
-                f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-            }
-            memcpy(&f32[i], &f, sizeof(float));
+            f32[i] = hy3d_f16_bits_to_f32(f16[i]);
         }
         void *d = hip_upload_raw(f32, n * sizeof(float));
         free(f32);
@@ -969,6 +1020,8 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     hipStream_t stream = r->stream;
     const int H_dim = DIT_HIDDEN;
     const int ffn = DIT_FFN;
+    const char *moe_fp16_env = getenv("HY3D_MOE_FP16");
+    const int moe_fp16 = (moe_fp16_env && *moe_fp16_env && moe_fp16_env[0] != '0') ? 1 : 0;
 
     /* Scratch layout within d_moe_scratch */
     size_t off = 0;
@@ -979,6 +1032,10 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     /* Step 1: Compute gate logits: [N_tok, H_dim] @ [8, H_dim]^T -> [N_tok, 8] */
     op_gemm(ops, stream, d_gate, blk->moe_gate_w, d_input, NULL,
             DIT_N_EXPERTS, H_dim, N_tok);
+    /* PyTorch fp16 pipeline routes experts from fp16 gate logits. HIP keeps
+     * activations in F32, so round gate logits before CPU softmax/top-k to
+     * reduce route flips from tiny precision differences. */
+    op_round_f32_to_f16(ops, stream, d_gate, N_tok * DIT_N_EXPERTS);
 
     /* Step 2: Download gate logits, compute softmax + top-2 on CPU */
     float *gate_cpu = (float *)malloc((size_t)N_tok * DIT_N_EXPERTS * sizeof(float));
@@ -1000,8 +1057,11 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
             sum += softmax_vals[e];
         }
         float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-        for (int e = 0; e < DIT_N_EXPERTS; e++)
+        for (int e = 0; e < DIT_N_EXPERTS; e++) {
             softmax_vals[e] *= inv;
+            if (moe_fp16)
+                softmax_vals[e] = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(softmax_vals[e]));
+        }
 
         /* Top-2 selection */
         int top_idx[DIT_MOE_TOP_K];
@@ -1048,9 +1108,12 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
         /* expert_out = GELU(x @ fc1_w_e.T + fc1_b_e) @ fc2_w_e.T + fc2_b_e */
         op_gemm(ops, stream, d_exp_h, blk->moe_expert_fc1_w[e], d_input,
                 blk->moe_expert_fc1_b[e], ffn, H_dim, N_tok);
+        if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
         op_gelu_exact(ops, stream, d_exp_h, N_tok * ffn);
+        if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
         op_gemm(ops, stream, d_exp_o, blk->moe_expert_fc2_w[e], d_exp_h,
                 blk->moe_expert_fc2_b[e], H_dim, ffn, N_tok);
+        if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_o, N_tok * H_dim);
 
         /* Scale-add: d_output[t,:] += scale[t] * d_exp_o[t,:]  (on CPU) */
         hipStreamSynchronize(stream);
@@ -1062,8 +1125,18 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
         for (int t = 0; t < N_tok; t++) {
             float w = expert_scale_cpu[t];
             if (w == 0.0f) continue;
-            for (int j = 0; j < H_dim; j++)
-                accum_cpu[t * H_dim + j] += w * exp_out_cpu[t * H_dim + j];
+            if (moe_fp16)
+                w = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(w));
+            for (int j = 0; j < H_dim; j++) {
+                size_t idx = (size_t)t * H_dim + j;
+                if (moe_fp16) {
+                    float x = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(exp_out_cpu[idx]));
+                    float prod = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(w * x));
+                    accum_cpu[idx] = hy3d_f16_bits_to_f32(hy3d_f32_to_f16_rn(accum_cpu[idx] + prod));
+                } else {
+                    accum_cpu[idx] += w * exp_out_cpu[idx];
+                }
+            }
         }
 
         hipMemcpyAsync(d_output, accum_cpu,
@@ -1078,10 +1151,14 @@ static void run_dit_moe(hip_hy3d_runner *r, dit_block_gpu *blk,
     /* Step 5: Add shared expert output */
     op_gemm(ops, stream, d_exp_h, blk->moe_shared_fc1_w, d_input,
             blk->moe_shared_fc1_b, ffn, H_dim, N_tok);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
     op_gelu_exact(ops, stream, d_exp_h, N_tok * ffn);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_h, N_tok * ffn);
     op_gemm(ops, stream, d_exp_o, blk->moe_shared_fc2_w, d_exp_h,
             blk->moe_shared_fc2_b, H_dim, ffn, N_tok);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_exp_o, N_tok * H_dim);
     op_add(ops, stream, d_output, d_exp_o, N_tok * H_dim);
+    if (moe_fp16) op_round_f32_to_f16(ops, stream, d_output, N_tok * H_dim);
 }
 
 /* Stage 2: Single DiT forward pass */
@@ -1889,7 +1966,10 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
                               : (float)(step + 1) / (float)(n_steps - 1);
         }
         float dt = sigma - sigma_next; /* negative except last step */
-        float model_t = sigma;
+        /* Pipeline casts scheduler timesteps to latents.dtype (fp16) before
+         * dividing by num_train_timesteps, then the model receives fp16
+         * timestep values. Mirror those rounded values in F32 storage. */
+        float model_t = hy3d_pytorch_fp16_timestep(sigma);
 
         if (r->verbose && (step % 5 == 0 || step == n_steps - 1))
             fprintf(stderr, "  step %d/%d (t=%.4f)\n", step + 1, n_steps, model_t);
@@ -1917,6 +1997,10 @@ hy3d_mesh hip_hy3d_predict(hip_hy3d_runner *r,
         }
 
         op_euler_step(ops, stream, d_latents, d_pred_combined, dt, latent_size);
+        /* PyTorch scheduler.step upcasts the sample for the Euler add and
+         * then casts prev_sample back to model_output.dtype (fp16 here). Keep
+         * F32 storage for the HIP kernels, but round values through fp16. */
+        op_round_f32_to_f16(ops, stream, d_latents, latent_size);
 
         /* NaN check after each step */
         if (r->verbose && step == 0) {

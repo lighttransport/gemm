@@ -27,8 +27,20 @@ COMMON_DEPS = hip_flux2_runner.h hip_flux2_kernels.h \
 
 all: $(TARGET) $(VERIFY_VAE) $(VERIFY_DIT)
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+# GPU text encoder via the HIP LLM runner (Qwen3-4B). test_hip_flux2.c no longer
+# defines SAFETENSORS_IMPLEMENTATION — hip_llm_runner.o provides it.
+ROCM_PATH ?= /opt/rocm
+HIPCC ?= hipcc
+LLM_DIR = ../llm
+LLM_SRC = $(LLM_DIR)/hip_llm_runner.c
+LLM_BLASLT = $(LLM_DIR)/mm_blaslt_bridge.o
+
+$(LLM_BLASLT): $(LLM_DIR)/mm_blaslt_bridge.cpp $(LLM_DIR)/mm_blaslt_bridge.h
+	$(HIPCC) -O3 -fPIE --offload-arch=gfx1201 -c -o $@ $<
+
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(LLM_SRC) $(LLM_BLASLT) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -DLLM_HIPBLASLT_ENABLED -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) \
+	    $(LLM_SRC) $(LLM_BLASLT) $(LDFLAGS) -L$(ROCM_PATH)/lib -lhipblaslt -lstdc++
 
 $(VERIFY_VAE): verify_vae.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
 	$(CC) $(CFLAGS) -fopenmp -o $@ verify_vae.c $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
@@ -45,8 +57,8 @@ verify: $(VERIFY_DIT)
 # Default weight paths — override on the command line if your files live elsewhere.
 DIT ?= /mnt/disk1/models/klein2-4b/diffusion_models/flux-2-klein-4b-fp8.safetensors
 VAE ?= /mnt/disk1/models/klein2-4b/vae/diffusion_pytorch_model.safetensors
-ENC ?=
-TOK ?=
+ENC ?= /mnt/disk1/models/klein2-4b/split_files/text_encoders/qwen_3_4b.safetensors
+TOK ?= /mnt/disk1/models/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-F16.gguf
 TXT_BIN ?=
 PROMPT ?= a red apple on a white table
 

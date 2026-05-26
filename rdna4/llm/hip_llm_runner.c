@@ -20,6 +20,17 @@
 #include "../../common/ggml_dequant.h"
 #include "../../common/transformer.h"
 
+/* safetensors loader (header-only) for the Qwen3 text-encoder weight path.
+ * When linked into a host TU that already carries the safetensors/json
+ * implementation (e.g. diffusion-server's server.c), define
+ * HIP_LLM_RUNNER_EXTERNAL_IMPLS=1 to use declarations only and avoid
+ * multiple-definition link errors. The standalone rdna4/llm build leaves it
+ * unset and owns the implementation here. */
+#ifndef HIP_LLM_RUNNER_EXTERNAL_IMPLS
+#define SAFETENSORS_IMPLEMENTATION
+#endif
+#include "../../common/safetensors.h"
+
 /* hip_runner_common.h: HIP_CHECK, hip_f32_to_f16, hip_upload_raw, hip_compile_kernels */
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
@@ -766,6 +777,55 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Same math as matvec_q4_K_f32, but one warp owns one output row.\n"
+" * The decode shapes have nb ~= 16-20 blocks/row, so the old one-block-per-row\n"
+" * kernel left most of its threads idle. This packs blockDim.x/32 rows/block. */\n"
+"__global__ void matvec_q4_K_mw_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int rows_per_block = blockDim.x / 32;\n"
+"    int row = blockIdx.x * rows_per_block + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 144;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 144;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qs = bp + 16;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        int is = 0;\n"
+"        #pragma unroll\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0;\n"
+"            float d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            #pragma unroll 4\n"
+"            for (int l = 0; l < 32; l++)\n"
+"                partial += (d1 * (q[l] & 0xF) - m1) * xb[yi++];\n"
+"            #pragma unroll 4\n"
+"            for (int l = 0; l < 32; l++)\n"
+"                partial += (d2 * (q[l] >> 4) - m2) * xb[yi++];\n"
+"            is += 2;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
 "__global__ void matvec_q6_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -786,18 +846,38 @@ static const char *hip_kernel_source =
 "        float d = half_to_float(*(const half_raw *)(bp + 208));\n"
 "        const float *xb = x + b * 256;\n"
 "        float partial = 0.0f;\n"
+"        #pragma unroll\n"
 "        for (int half = 0; half < 2; half++) {\n"
 "            int base = half * 128;\n"
-"            for (int l = 0; l < 32; l++) {\n"
-"                int is = l / 16;\n"
+"            float s0 = d * (float)sc[0];\n"
+"            float s2 = d * (float)sc[2];\n"
+"            float s4 = d * (float)sc[4];\n"
+"            float s6 = d * (float)sc[6];\n"
+"            float s1 = d * (float)sc[1];\n"
+"            float s3 = d * (float)sc[3];\n"
+"            float s5 = d * (float)sc[5];\n"
+"            float s7 = d * (float)sc[7];\n"
+"            #pragma unroll 4\n"
+"            for (int l = 0; l < 16; l++) {\n"
 "                int q1 = (int)((ql[l] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;\n"
 "                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;\n"
 "                int q3 = (int)((ql[l] >> 4) | (((qh[l]>>4)&3)<<4)) - 32;\n"
 "                int q4 = (int)((ql[l+32] >> 4) | (((qh[l]>>6)&3)<<4)) - 32;\n"
-"                partial += d * sc[is+0] * q1 * xb[base+l];\n"
-"                partial += d * sc[is+2] * q2 * xb[base+l+32];\n"
-"                partial += d * sc[is+4] * q3 * xb[base+l+64];\n"
-"                partial += d * sc[is+6] * q4 * xb[base+l+96];\n"
+"                partial += s0 * q1 * xb[base+l];\n"
+"                partial += s2 * q2 * xb[base+l+32];\n"
+"                partial += s4 * q3 * xb[base+l+64];\n"
+"                partial += s6 * q4 * xb[base+l+96];\n"
+"            }\n"
+"            #pragma unroll 4\n"
+"            for (int l = 16; l < 32; l++) {\n"
+"                int q1 = (int)((ql[l] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;\n"
+"                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;\n"
+"                int q3 = (int)((ql[l] >> 4) | (((qh[l]>>4)&3)<<4)) - 32;\n"
+"                int q4 = (int)((ql[l+32] >> 4) | (((qh[l]>>6)&3)<<4)) - 32;\n"
+"                partial += s1 * q1 * xb[base+l];\n"
+"                partial += s3 * q2 * xb[base+l+32];\n"
+"                partial += s5 * q3 * xb[base+l+64];\n"
+"                partial += s7 * q4 * xb[base+l+96];\n"
 "            }\n"
 "            ql += 64; qh += 32; sc += 8;\n"
 "        }\n"
@@ -873,6 +953,53 @@ static const char *hip_kernel_source =
 "        for (int w = 0; w < nw; w++) total += ws5[w];\n"
 "        dst[row] = total;\n"
 "    }\n"
+"}\n"
+"\n"
+"__global__ void matvec_q5_K_mw_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 176;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 176;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4;\n"
+"        const unsigned char *qh = bp + 16;\n"
+"        const unsigned char *qs = bp + 48;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f;\n"
+"        int yi = 0;\n"
+"        int is = 0;\n"
+"        for (int j = 0; j < 4; j++) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0;\n"
+"            float d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int qhbit = (qh[l] >> (2*j)) & 1;\n"
+"                partial += (d1 * ((q[l] & 0xF) | (qhbit << 4)) - m1) * xb[yi++];\n"
+"            }\n"
+"            for (int l = 0; l < 32; l++) {\n"
+"                int qhbit = (qh[l] >> (2*j + 1)) & 1;\n"
+"                partial += (d2 * ((q[l] >> 4) | (qhbit << 4)) - m2) * xb[yi++];\n"
+"            }\n"
+"            is += 2;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
 "/* ---- 18. embed_q2_K: Q2_K embedding lookup -> F32 ---- */\n"
@@ -2707,14 +2834,16 @@ static const char *hip_kernel_source =
 "        const float *xb = x + b * 256;\n"
 "        float partial = 0.0f;\n"
 "        int yi = 0;\n"
+"        #pragma unroll\n"
 "        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
-"            unsigned int aux32;\n"
-"            memcpy(&aux32, scales_and_signs + 4*ib32, 4);\n"
+"            unsigned int aux32 = *(const unsigned int *)(scales_and_signs + 4*ib32);\n"
 "            float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n"
+"            #pragma unroll\n"
 "            for (int l = 0; l < 4; l++) {\n"
 "                unsigned char signs = ksigns_iq2xs_dev[(aux32 >> (7*l)) & 127];\n"
 "                const unsigned char *grid1 = (const unsigned char *)&iq3xxs_grid_dev[qs[2*l+0]];\n"
 "                const unsigned char *grid2 = (const unsigned char *)&iq3xxs_grid_dev[qs[2*l+1]];\n"
+"                #pragma unroll\n"
 "                for (int j = 0; j < 4; j++) {\n"
 "                    float w0 = db * (float)grid1[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
 "                    float w1 = db * (float)grid2[j] * ((signs & (1 << (j+4))) ? -1.0f : 1.0f);\n"
@@ -3211,8 +3340,7 @@ static const char *hip_kernel_source =
 "    int elem_in_sub = tid & 31;   /* 0..31 */\n"
 "    int pair_idx = elem_in_sub >> 3;     /* 0..3 (4 pair-iters per sub) */\n"
 "    int elem_in_pair = elem_in_sub & 7;  /* 0..7 (8 elems per pair) */\n"
-"    unsigned int aux32;\n"
-"    memcpy(&aux32, scales_and_signs + 4 * ib32, 4);\n"
+"    unsigned int aux32 = *(const unsigned int *)(scales_and_signs + 4 * ib32);\n"
 "    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;\n"
 "    unsigned char signs = ksigns_iq2xs_dev[(aux32 >> (7 * pair_idx)) & 127];\n"
 "    int use_grid2 = (elem_in_pair >= 4);\n"
@@ -4191,7 +4319,9 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q2_K_f32;
     hipFunction_t fn_matvec_q3_K_f32;
     hipFunction_t fn_matvec_q4_K_f32;
+    hipFunction_t fn_matvec_q4_K_mw_f32;
     hipFunction_t fn_matvec_q5_K_f32;
+    hipFunction_t fn_matvec_q5_K_mw_f32;
     hipFunction_t fn_matvec_q6_K_f32;
     hipFunction_t fn_embed_q2_K;
     /* SSM kernels */
@@ -4254,6 +4384,12 @@ struct hip_llm_runner {
 
     /* Phase 4 WMMA decode matvec */
     hipFunction_t fn_matvec_f16_wmma_f32;
+
+    /* Hidden-state snapshots (text-encoder path): capture up to 3 layers'
+     * post-residual hidden state during forward into d_hidden_snapshots. */
+    int   hidden_snapshot_layers[3];
+    int   n_hidden_snapshots;
+    void *d_hidden_snapshots;   /* device [3 * n_embd] f32 */
 
     /* Model params */
     int n_layers;
@@ -4400,6 +4536,8 @@ struct hip_llm_runner {
 
     /* === Phase 4: WMMA decode matvec === */
     int decode_wmma;            /* 1 = use WMMA matvec for F16 weights at decode */
+    int quant_matvec_opt;       /* 1 = route experimental quant matvec variants */
+    int q5_k_mw;                /* 1 = use one-warp-per-row Q5_K matvec */
 
     /* === Phase 5: HIP graph capture for decode === */
     hipFunction_t fn_rope_neox_f32_devp;
@@ -4460,7 +4598,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q3_K_f32);
     GET_FUNC(matvec_q4_K_f32);
+    GET_FUNC(matvec_q4_K_mw_f32);
     GET_FUNC(matvec_q5_K_f32);
+    GET_FUNC(matvec_q5_K_mw_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
     /* SSM kernels */
@@ -4549,6 +4689,16 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     if (!r) return NULL;
     r->verbose = verbose;
     r->device = device_id;
+    r->quant_matvec_opt = 0;
+    {
+        const char *env_qmv = getenv("LLM_QUANT_MATVEC_OPT");
+        if (env_qmv) r->quant_matvec_opt = atoi(env_qmv) != 0;
+    }
+    r->q5_k_mw = 1;
+    {
+        const char *env_q5 = getenv("LLM_Q5_K_MW");
+        if (env_q5) r->q5_k_mw = atoi(env_q5) != 0;
+    }
 
     CHECK_HIP_NULL(hipSetDevice(device_id));
     r->context = NULL;  /* use default context (no hipCtxCreate) */
@@ -4798,6 +4948,136 @@ static void launch_convert_f16_to_bf16_loadtime(hip_llm_runner *r, void *dst,
 /* Phase 5 graph capture: defined far below (needs launch helpers + body). */
 static void hip_llm_phase5_capture(hip_llm_runner *r);
 
+static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len);
+
+/* ======================================================================== */
+/* Qwen3 safetensors weight load (text-encoder path for Flux.2 Klein).      */
+/* Builds qtensor views over the BF16/F32 safetensors data and reuses the   */
+/* same upload_weight_matrix / upload_norm_f32 helpers as the GGUF path.    */
+/* ======================================================================== */
+
+/* Build a qtensor view of a safetensors tensor (no copy). n_cols = innermost
+ * (contiguous) dim, matching the GGUF qtensor convention used by the upload
+ * helpers; safetensors [out,in] row-major == GGUF byte layout (no transpose). */
+static qtensor hllm_st_load_tensor(st_context *st, const char *name, int required) {
+    qtensor t = {0};
+    int idx = safetensors_find(st, name);
+    if (idx < 0) {
+        if (required) fprintf(stderr, "hip_llm: missing safetensors tensor '%s'\n", name);
+        return t;
+    }
+    const char *dt = safetensors_dtype(st, idx);
+    if      (strcmp(dt, "BF16") == 0) t.type = GGML_TYPE_BF16;
+    else if (strcmp(dt, "F16")  == 0) t.type = GGML_TYPE_F16;
+    else if (strcmp(dt, "F32")  == 0) t.type = GGML_TYPE_F32;
+    else { fprintf(stderr, "hip_llm: unsupported safetensors dtype '%s' for '%s'\n", dt, name); return t; }
+    int nd = safetensors_ndims(st, idx);
+    const uint64_t *sh = safetensors_shape(st, idx);
+    t.n_dims = nd;
+    if (nd >= 2) { t.n_cols = (int)sh[nd - 1]; uint64_t rows = 1; for (int d = 0; d < nd - 1; d++) rows *= sh[d]; t.n_rows = (int)rows; }
+    else if (nd == 1) { t.n_cols = (int)sh[0]; t.n_rows = 1; }
+    for (int d = 0; d < nd && d < 4; d++) t.dims[d] = (int)sh[d];
+    t.data = safetensors_data(st, idx);
+    return t;
+}
+
+int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len) {
+    if (!r || !model_path) return -1;
+    st_context *st = safetensors_open(model_path);
+    if (!st) { fprintf(stderr, "hip_llm: failed to open safetensors '%s'\n", model_path); return -1; }
+
+    /* Discover layer count from tensor names. */
+    int n_layers = 0;
+    for (int i = 0; i < st->n_tensors; i++) {
+        const char *nm = safetensors_name(st, i);
+        if (strncmp(nm, "model.layers.", 13) == 0) {
+            int l = atoi(nm + 13);
+            if (l + 1 > n_layers) n_layers = l + 1;
+        }
+    }
+    if (n_layers <= 0) { fprintf(stderr, "hip_llm: no model.layers.* tensors in '%s'\n", model_path); safetensors_close(st); return -1; }
+
+    qtensor embd = hllm_st_load_tensor(st, "model.embed_tokens.weight", 1);
+    qtensor q0   = hllm_st_load_tensor(st, "model.layers.0.self_attn.q_proj.weight", 1);
+    qtensor k0   = hllm_st_load_tensor(st, "model.layers.0.self_attn.k_proj.weight", 1);
+    qtensor qn0  = hllm_st_load_tensor(st, "model.layers.0.self_attn.q_norm.weight", 1);
+    qtensor ff0  = hllm_st_load_tensor(st, "model.layers.0.mlp.gate_proj.weight", 1);
+    if (!embd.data || !q0.data || !k0.data || !ff0.data) { safetensors_close(st); return -1; }
+
+    /* embed_tokens.weight is [n_vocab, n_embd] -> n_cols=n_embd, n_rows=n_vocab. */
+    r->n_embd     = embd.n_cols;
+    r->n_vocab    = embd.n_rows;
+    r->n_layers   = n_layers;
+    r->head_dim   = qn0.n_cols ? qn0.n_cols : 128;
+    r->n_heads    = q0.n_rows / r->head_dim;     /* q_proj [n_heads*head_dim, n_embd] */
+    r->n_kv_heads = k0.n_rows / r->head_dim;
+    r->n_ff       = ff0.n_rows;                  /* gate_proj [n_ff, n_embd] */
+    r->rms_norm_eps   = 1e-6f;
+    r->rope_freq_base = 1000000.0f;              /* Qwen3 */
+    r->n_rope_pairs   = 0;
+    r->use_mrope      = 0;
+    r->is_hybrid      = 0;
+    r->is_moe         = 0;
+    r->n_deepstack    = 0;
+    if (max_seq_len <= 0) max_seq_len = 2048;
+    r->max_seq_len = max_seq_len;
+
+    if (r->verbose >= 1)
+        fprintf(stderr, "hip_llm: safetensors qwen3 n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d n_vocab=%d\n",
+                r->n_embd, r->n_heads, r->n_kv_heads, r->n_layers, r->n_ff, r->head_dim, r->n_vocab);
+
+    /* token embeddings (BF16 -> F16 via upload_weight_matrix) */
+    if (upload_weight_matrix(&r->d_token_embd, &embd, &r->token_embd_type) != 0) { safetensors_close(st); return -1; }
+
+    qtensor onorm = hllm_st_load_tensor(st, "model.norm.weight", 1);
+    if (!onorm.data || upload_norm_f32(&r->d_output_norm, &onorm, r->n_embd) != 0) { safetensors_close(st); return -1; }
+
+    /* lm_head tied to embeddings (Qwen3-4B) */
+    r->d_output_w   = r->d_token_embd;
+    r->output_w_type = r->token_embd_type;
+    r->has_lm_head  = 1;
+
+    r->layers = (hip_layer *)calloc(r->n_layers, sizeof(hip_layer));
+    if (!r->layers) { safetensors_close(st); return -1; }
+
+    for (int l = 0; l < r->n_layers; l++) {
+        char name[160];
+        hip_layer *cl = &r->layers[l];
+        qtensor t;
+        cl->is_ssm = 0;
+
+        #define ST_NORM(field, suffix, n) do { \
+            snprintf(name, sizeof(name), "model.layers.%d." suffix ".weight", l); \
+            t = hllm_st_load_tensor(st, name, 1); \
+            if (!t.data || upload_norm_f32(&cl->field, &t, (n)) != 0) { safetensors_close(st); return -1; } \
+        } while (0)
+        #define ST_MAT(field, suffix, rf, cf, tf) do { \
+            snprintf(name, sizeof(name), "model.layers.%d." suffix ".weight", l); \
+            t = hllm_st_load_tensor(st, name, 1); \
+            cl->rf = t.n_rows; cl->cf = t.n_cols; \
+            if (!t.data || upload_weight_matrix(&cl->field, &t, &cl->tf) != 0) { safetensors_close(st); return -1; } \
+        } while (0)
+
+        ST_NORM(attn_norm_w,   "input_layernorm",          r->n_embd);
+        ST_MAT (attn_q_w,      "self_attn.q_proj",  attn_q_rows,      attn_q_cols,      attn_q_type);
+        ST_MAT (attn_k_w,      "self_attn.k_proj",  attn_k_rows,      attn_k_cols,      attn_k_type);
+        ST_MAT (attn_v_w,      "self_attn.v_proj",  attn_v_rows,      attn_v_cols,      attn_v_type);
+        ST_MAT (attn_output_w, "self_attn.o_proj",  attn_output_rows, attn_output_cols, attn_output_type);
+        cl->has_qk_norm = 1;
+        ST_NORM(attn_q_norm_w, "self_attn.q_norm",         r->head_dim);
+        ST_NORM(attn_k_norm_w, "self_attn.k_norm",         r->head_dim);
+        ST_NORM(ffn_norm_w,    "post_attention_layernorm", r->n_embd);
+        ST_MAT (ffn_gate_w,    "mlp.gate_proj",     ffn_gate_rows, ffn_gate_cols, ffn_gate_type);
+        ST_MAT (ffn_up_w,      "mlp.up_proj",       ffn_up_rows,   ffn_up_cols,   ffn_up_type);
+        ST_MAT (ffn_down_w,    "mlp.down_proj",     ffn_down_rows, ffn_down_cols, ffn_down_type);
+        #undef ST_NORM
+        #undef ST_MAT
+    }
+
+    safetensors_close(st);
+    return hip_llm_finalize_load(r, max_seq_len);
+}
+
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -4895,8 +5175,6 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
 
     #undef ARCH_KEY
 
-    int kv_dim = r->n_kv_heads * r->head_dim;
-    int q_dim = r->n_heads * r->head_dim;
 
     if (r->verbose >= 1) {
         fprintf(stderr, "hip_llm: arch=%s n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d\n",
@@ -5132,6 +5410,13 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             if (upload_weight_matrix(&cl->ffn_down_w, &t, &cl->ffn_down_type) != 0) return -1;
         }
     }
+
+    return hip_llm_finalize_load(r, max_seq_len);
+}
+
+static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
+    int kv_dim = r->n_kv_heads * r->head_dim;
+    int q_dim = r->n_heads * r->head_dim;
 
     /* Allocate KV cache */
     r->d_key_cache = (void **)calloc(r->n_layers, sizeof(void *));
@@ -5692,9 +5977,31 @@ static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat,
 
 DEFINE_LAUNCH_MATVEC(q2_K, fn_matvec_q2_K_f32)
 DEFINE_LAUNCH_MATVEC(q3_K, fn_matvec_q3_K_f32)
-DEFINE_LAUNCH_MATVEC(q4_K, fn_matvec_q4_K_f32)
-DEFINE_LAUNCH_MATVEC(q5_K, fn_matvec_q5_K_f32)
-DEFINE_LAUNCH_MATVEC(q6_K, fn_matvec_q6_K_f32)
+static inline void launch_matvec_q4_K(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    if (r->quant_matvec_opt && n_rows <= 4096 && n_cols <= 4096) {
+        LAUNCH(r->fn_matvec_q4_K_mw_f32, n_rows, 1, 1, 32, 1, 1, 0,
+               r->stream, args);
+    } else {
+        LAUNCH(r->fn_matvec_q4_K_f32, n_rows, 1, 1, 64, 1, 1, 0, r->stream, args);
+    }
+}
+static inline void launch_matvec_q5_K(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    if (r->q5_k_mw) {
+        LAUNCH(r->fn_matvec_q5_K_mw_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0,
+               r->stream, args);
+    } else {
+        LAUNCH(r->fn_matvec_q5_K_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+    }
+}
+static inline void launch_matvec_q6_K(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_q6_K_f32, n_rows, 1, 1, 64, 1, 1, 0, r->stream, args);
+}
 DEFINE_LAUNCH_MATVEC_MW(iq2_xxs, fn_matvec_iq2_xxs_f32)
 DEFINE_LAUNCH_MATVEC(q4_0, fn_matvec_q4_0_f32)
 DEFINE_LAUNCH_MATVEC(q4_1, fn_matvec_q4_1_f32)
@@ -6412,6 +6719,16 @@ static void forward_blocks_body(hip_llm_runner *r) {
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
     for (int l = 0; l < n_run_layers; l++) {
         forward_one_layer(r, l);
+        /* Text-encoder hidden snapshots: copy this layer's post-residual hidden
+         * state (d_x) into the snapshot buffer. Only active when layers are set
+         * (which also disables graph capture so this inline copy runs). */
+        for (int si = 0; si < r->n_hidden_snapshots; si++) {
+            if (r->hidden_snapshot_layers[si] == l && r->d_hidden_snapshots) {
+                hipMemcpyAsync((char *)r->d_hidden_snapshots + (size_t)si * r->n_embd * sizeof(float),
+                               r->d_x, (size_t)r->n_embd * sizeof(float),
+                               hipMemcpyDeviceToDevice, r->stream);
+            }
+        }
     }
     /* Final RMSNorm */
     launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
@@ -7170,6 +7487,50 @@ int hip_llm_read_hidden(const hip_llm_runner *r, float *dst, int n) {
     return (err == hipSuccess) ? 0 : -1;
 }
 
+/* Select up to 3 layers whose post-residual hidden state is snapshotted during
+ * each forward (text-encoder path). Allocates the snapshot buffer and disables
+ * graph capture (so the inline snapshot copy in forward_blocks_body runs). */
+int hip_llm_set_hidden_snapshot_layers(hip_llm_runner *r, const int *layers, int n_slots) {
+    if (!r) return -1;
+    if (n_slots < 0 || n_slots > 3) return -1;
+    r->n_hidden_snapshots = 0;
+    for (int i = 0; i < 3; i++) r->hidden_snapshot_layers[i] = -1;
+    for (int i = 0; i < n_slots; i++) {
+        int layer = layers ? layers[i] : -1;
+        if (layer < 0 || layer >= r->n_layers) return -1;
+        r->hidden_snapshot_layers[i] = layer;
+        r->n_hidden_snapshots++;
+    }
+    if (n_slots > 0) {
+        if (!r->d_hidden_snapshots &&
+            hipMalloc(&r->d_hidden_snapshots, (size_t)3 * r->n_embd * sizeof(float)) != hipSuccess)
+            return -1;
+        /* Snapshots require the non-graph forward path (the graph captured at load
+         * predates the snapshot copies). Disable + drop the captured graphs so
+         * hip_llm_forward falls back to forward_blocks_body. */
+        r->graph_disabled = 1;
+        r->graph_ready_hidden = 0;
+        r->graph_ready_logits = 0;
+    }
+    return 0;
+}
+
+/* Read the captured snapshots: dst receives n_slots contiguous [n] blocks
+ * (layout [n_slots, n]). n must equal n_embd. */
+int hip_llm_read_hidden_snapshots(const hip_llm_runner *r, float *dst, int n_slots, int n) {
+    if (!r || !dst || !r->d_hidden_snapshots) return -1;
+    if (n != r->n_embd) return -1;
+    if (n_slots > r->n_hidden_snapshots) n_slots = r->n_hidden_snapshots;
+    hipStreamSynchronize(r->stream);
+    for (int si = 0; si < n_slots; si++) {
+        if (hipMemcpy(dst + (size_t)si * n,
+                      (char *)r->d_hidden_snapshots + (size_t)si * r->n_embd * sizeof(float),
+                      (size_t)n * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess)
+            return -1;
+    }
+    return 0;
+}
+
 void hip_llm_set_debug(hip_llm_runner *r, int debug_layers) {
     if (r) r->debug_layers = debug_layers;
 }
@@ -7428,6 +7789,50 @@ void hip_llm_free(hip_llm_runner *r) {
 /* Public API: accessors                                                    */
 /* ======================================================================== */
 
+/* Local block metadata for quant matvec kernels. ggml_type_info is a static
+ * const in gguf_loader.h, only visible to translation units that define
+ * GGUF_LOADER_IMPLEMENTATION, so the runner keeps the small table it needs. */
+static int quant_matvec_block_info(int weight_type, int *blk_elems, int *blk_bytes) {
+    if (!blk_elems || !blk_bytes) return -1;
+    *blk_elems = 0;
+    *blk_bytes = 0;
+    switch (weight_type) {
+        case GGML_TYPE_Q4_K:    *blk_elems = 256; *blk_bytes = 144; break;
+        case GGML_TYPE_Q5_K:    *blk_elems = 256; *blk_bytes = 176; break;
+        case GGML_TYPE_Q6_K:    *blk_elems = 256; *blk_bytes = 210; break;
+        case GGML_TYPE_Q4_0:    *blk_elems = 32;  *blk_bytes = 18;  break;
+        case GGML_TYPE_Q4_1:    *blk_elems = 32;  *blk_bytes = 20;  break;
+        case GGML_TYPE_Q5_0:    *blk_elems = 32;  *blk_bytes = 22;  break;
+        case GGML_TYPE_Q5_1:    *blk_elems = 32;  *blk_bytes = 24;  break;
+        case GGML_TYPE_IQ2_XXS: *blk_elems = 256; *blk_bytes = 66;  break;
+        case GGML_TYPE_IQ2_XS:  *blk_elems = 256; *blk_bytes = 74;  break;
+        case GGML_TYPE_IQ2_S:   *blk_elems = 256; *blk_bytes = 82;  break;
+        case GGML_TYPE_IQ3_XXS: *blk_elems = 256; *blk_bytes = 98;  break;
+        case GGML_TYPE_IQ3_S:   *blk_elems = 256; *blk_bytes = 110; break;
+        case GGML_TYPE_IQ1_S:   *blk_elems = 256; *blk_bytes = 50;  break;
+        case GGML_TYPE_IQ1_M:   *blk_elems = 256; *blk_bytes = 56;  break;
+        case GGML_TYPE_IQ4_NL:  *blk_elems = 32;  *blk_bytes = 18;  break;
+        case GGML_TYPE_IQ4_XS:  *blk_elems = 256; *blk_bytes = 136; break;
+        case GGML_TYPE_TQ1_0:   *blk_elems = 256; *blk_bytes = 54;  break;
+        case GGML_TYPE_TQ2_0:   *blk_elems = 256; *blk_bytes = 66;  break;
+        default: return -1;
+    }
+    return 0;
+}
+
+static void fill_quant_matvec_inputs(unsigned char *h_mat, size_t mat_bytes,
+                                     float *h_x, int n_cols, int weight_type) {
+    unsigned s = 0xC0FFEEu ^ (unsigned)weight_type;
+    for (size_t i = 0; i < mat_bytes; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        h_mat[i] = (unsigned char)s;
+    }
+    for (int i = 0; i < n_cols; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        h_x[i] = (((float)((s >> 8) & 0xFFFFFF) / 16777216.0f) - 0.5f) * 0.1f;
+    }
+}
+
 /* A/B verify: GPU matvec_<type> vs caller-provided CPU dequant + scalar matvec
  * on identical raw quant bytes. Used by test_hip_llm --verify-quant-kernels. */
 int hip_llm_verify_quant_matvec(
@@ -7437,25 +7842,8 @@ int hip_llm_verify_quant_matvec(
         double *out_rel_l2, double *out_max_abs) {
     if (!r || !cpu_dequant_row || n_rows <= 0 || n_cols <= 0) return -1;
 
-    /* Reject types that don't have a HIP matvec kernel we want to verify,
-     * and look up block sizes locally (ggml_type_info is a static const in
-     * gguf_loader.h, only visible to translation units that define
-     * GGUF_LOADER_IMPLEMENTATION — which hip_llm_runner.c does not). */
     int blk_elems = 0, blk_bytes = 0;
-    switch (weight_type) {
-        case GGML_TYPE_IQ2_XXS: blk_elems = 256; blk_bytes = 66;  break;
-        case GGML_TYPE_IQ2_XS:  blk_elems = 256; blk_bytes = 74;  break;
-        case GGML_TYPE_IQ2_S:   blk_elems = 256; blk_bytes = 82;  break;
-        case GGML_TYPE_IQ3_XXS: blk_elems = 256; blk_bytes = 98;  break;
-        case GGML_TYPE_IQ3_S:   blk_elems = 256; blk_bytes = 110; break;
-        case GGML_TYPE_IQ1_S:   blk_elems = 256; blk_bytes = 50;  break;
-        case GGML_TYPE_IQ1_M:   blk_elems = 256; blk_bytes = 56;  break;
-        case GGML_TYPE_IQ4_NL:  blk_elems = 32;  blk_bytes = 18;  break;
-        case GGML_TYPE_IQ4_XS:  blk_elems = 256; blk_bytes = 136; break;
-        case GGML_TYPE_TQ1_0:   blk_elems = 256; blk_bytes = 54;  break;
-        case GGML_TYPE_TQ2_0:   blk_elems = 256; blk_bytes = 66;  break;
-        default: return -1;
-    }
+    if (quant_matvec_block_info(weight_type, &blk_elems, &blk_bytes) != 0) return -1;
     if ((n_cols % blk_elems) != 0) return -1;
     int n_blk_per_row = n_cols / blk_elems;
     size_t row_bytes  = (size_t)n_blk_per_row * blk_bytes;
@@ -7471,22 +7859,15 @@ int hip_llm_verify_quant_matvec(
         return -2;
     }
 
-    /* Deterministic random bytes per quant type (xorshift). */
-    unsigned s = 0xC0FFEEu ^ (unsigned)weight_type;
-    for (size_t i = 0; i < mat_bytes; i++) {
-        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        h_mat[i] = (unsigned char)s;
-    }
-    for (int i = 0; i < n_cols; i++) {
-        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        h_x[i] = (((float)((s >> 8) & 0xFFFFFF) / 16777216.0f) - 0.5f) * 0.1f;
-    }
+    fill_quant_matvec_inputs(h_mat, mat_bytes, h_x, n_cols, weight_type);
 
     void *d_mat = NULL, *d_x = NULL, *d_dst = NULL;
     if (hipMalloc(&d_mat, mat_bytes) != hipSuccess ||
         hipMalloc(&d_x,   (size_t)n_cols * sizeof(float)) != hipSuccess ||
         hipMalloc(&d_dst, (size_t)n_rows * sizeof(float)) != hipSuccess) {
-        if (d_mat) hipFree(d_mat); if (d_x) hipFree(d_x); if (d_dst) hipFree(d_dst);
+        if (d_mat) hipFree(d_mat);
+        if (d_x) hipFree(d_x);
+        if (d_dst) hipFree(d_dst);
         free(h_mat); free(h_x); free(h_dst_hip); free(h_dst_ref); free(h_row_f32);
         return -2;
     }
@@ -7534,6 +7915,75 @@ int hip_llm_verify_quant_matvec(
     hipFree(d_mat); hipFree(d_x); hipFree(d_dst);
     free(h_mat); free(h_x); free(h_dst_hip); free(h_dst_ref); free(h_row_f32);
     return 0;
+}
+
+int hip_llm_bench_quant_matvec(
+        hip_llm_runner *r, int weight_type,
+        int n_rows, int n_cols,
+        int warmup, int iters,
+        float *out_ms) {
+    if (!r || n_rows <= 0 || n_cols <= 0 || iters <= 0 || !out_ms) return -1;
+
+    int blk_elems = 0, blk_bytes = 0;
+    if (quant_matvec_block_info(weight_type, &blk_elems, &blk_bytes) != 0) return -1;
+    if ((n_cols % blk_elems) != 0) return -1;
+    int n_blk_per_row = n_cols / blk_elems;
+    size_t row_bytes = (size_t)n_blk_per_row * blk_bytes;
+    size_t mat_bytes = (size_t)n_rows * row_bytes;
+    size_t x_bytes = (size_t)n_cols * sizeof(float);
+    size_t dst_bytes = (size_t)n_rows * sizeof(float);
+
+    unsigned char *h_mat = (unsigned char *)malloc(mat_bytes);
+    float *h_x = (float *)malloc(x_bytes);
+    if (!h_mat || !h_x) {
+        free(h_mat); free(h_x);
+        return -2;
+    }
+    fill_quant_matvec_inputs(h_mat, mat_bytes, h_x, n_cols, weight_type);
+
+    void *d_mat = NULL, *d_x = NULL, *d_dst = NULL;
+    hipEvent_t ev_start = NULL, ev_stop = NULL;
+    int rc = -2;
+    if (hipMalloc(&d_mat, mat_bytes) != hipSuccess ||
+        hipMalloc(&d_x,   x_bytes)   != hipSuccess ||
+        hipMalloc(&d_dst, dst_bytes) != hipSuccess) {
+        goto done;
+    }
+    if (hipMemcpy(d_mat, h_mat, mat_bytes, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_x, h_x, x_bytes, hipMemcpyHostToDevice) != hipSuccess) {
+        goto done;
+    }
+    if (hipEventCreate(&ev_start) != hipSuccess ||
+        hipEventCreate(&ev_stop)  != hipSuccess) {
+        goto done;
+    }
+
+    for (int i = 0; i < warmup; i++) {
+        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+    }
+    if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
+
+    if (hipEventRecord(ev_start, r->stream) != hipSuccess) goto done;
+    for (int i = 0; i < iters; i++) {
+        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+    }
+    if (hipEventRecord(ev_stop, r->stream) != hipSuccess) goto done;
+    if (hipEventSynchronize(ev_stop) != hipSuccess) goto done;
+
+    float elapsed = 0.0f;
+    if (hipEventElapsedTime(&elapsed, ev_start, ev_stop) != hipSuccess) goto done;
+    *out_ms = elapsed / (float)iters;
+    rc = 0;
+
+done:
+    if (ev_start) hipEventDestroy(ev_start);
+    if (ev_stop) hipEventDestroy(ev_stop);
+    if (d_mat) hipFree(d_mat);
+    if (d_x) hipFree(d_x);
+    if (d_dst) hipFree(d_dst);
+    free(h_mat);
+    free(h_x);
+    return rc;
 }
 
 void hip_llm_reset_state(hip_llm_runner *r) {
