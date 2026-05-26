@@ -1589,6 +1589,110 @@ static int test_kernels(void) {
     return fail;
 }
 
+/* ---- INT8 W8A8 GEMM self-test (no model needed; exercises op_gemm int8 path) ----
+ * Validates (a) correctness vs a CPU int8 reference (cos ~1) and vs an f32
+ * dequant-weight reference (quant quality), and (b) run-to-run BIT-EXACT
+ * determinism — the core reproducibility property that motivates int8. */
+static int test_int8_gemm(void) {
+    fprintf(stderr, "=== INT8 W8A8 GEMM self-test ===\n");
+    cuda_qimg_runner *r = cuda_qimg_init(0, 1);
+    if (!r) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    if (!r->gemm_w8a8_perrow || !r->quant_act_perrow_int8) {
+        fprintf(stderr, "FAIL: int8 kernels not loaded\n"); cuda_qimg_free(r); return 1;
+    }
+    r->use_int8 = 1;  /* force the int8 path in op_gemm */
+
+    struct { int N, K, M; const char *label; } cases[] = {
+        {512, 256, 64,   "small"},
+        {3072, 3072, 64, "attn-proj"},
+        {12288, 3072, 16,"mlp-fc1"},
+        {18432, 3072, 1, "modulation n_tok=1"},
+        {64, 3072, 64,   "proj_out"},
+    };
+    int n_cases = (int)(sizeof(cases)/sizeof(cases[0]));
+    int all_ok = 1;
+    rng_state = 1234567;
+
+    for (int c = 0; c < n_cases; c++) {
+        int N = cases[c].N, K = cases[c].K, M = cases[c].M;
+        size_t nW = (size_t)N*K, nX = (size_t)M*K, nY = (size_t)M*N;
+        float *Wf = (float*)malloc(nW*sizeof(float));
+        float *Xf = (float*)malloc(nX*sizeof(float));
+        float *Bf = (float*)malloc((size_t)N*sizeof(float));
+        for (size_t i=0;i<nW;i++) Wf[i] = randn()*0.05f;
+        for (size_t i=0;i<nX;i++) Xf[i] = randn()*0.5f;
+        for (int i=0;i<N;i++)     Bf[i] = randn()*0.1f;
+
+        /* per-channel symmetric int8 quant of W (same as quantize_int8.py) */
+        float *wscale = (float*)malloc((size_t)N*sizeof(float));
+        signed char *Wq = (signed char*)malloc(nW);
+        for (int o=0;o<N;o++){
+            float amax=0; for(int k=0;k<K;k++){float a=fabsf(Wf[(size_t)o*K+k]); if(a>amax)amax=a;}
+            float sc = amax>0 ? amax/127.0f : 1e-12f; wscale[o]=sc;
+            for(int k=0;k<K;k++){ float q=rintf(Wf[(size_t)o*K+k]/sc);
+                if(q>127)q=127; else if(q<-127)q=-127; Wq[(size_t)o*K+k]=(signed char)q; }
+        }
+        /* fat weight buffer: [wscale N f32][Wq N*K int8] */
+        size_t fatbytes = (size_t)N*sizeof(float) + nW;
+        unsigned char *fat = (unsigned char*)malloc(fatbytes);
+        memcpy(fat, wscale, (size_t)N*sizeof(float));
+        memcpy(fat + (size_t)N*sizeof(float), Wq, nW);
+
+        CUdeviceptr dW=0,dX=0,dB=0,dY=0;
+        cuMemAlloc(&dW, fatbytes);              cuMemcpyHtoD(dW, fat, fatbytes);
+        cuMemAlloc(&dX, nX*sizeof(float));      cuMemcpyHtoD(dX, Xf, nX*sizeof(float));
+        cuMemAlloc(&dB, (size_t)N*sizeof(float));cuMemcpyHtoD(dB, Bf, (size_t)N*sizeof(float));
+        cuMemAlloc(&dY, nY*sizeof(float));
+
+        op_gemm(r, dY, dW, dX, dB, N, K, M);
+        cuStreamSynchronize(r->stream);
+        float *Yg = (float*)malloc(nY*sizeof(float));
+        cuMemcpyDtoH(Yg, dY, nY*sizeof(float));
+        /* determinism: rerun, compare bit-exact */
+        cuMemsetD8(dY, 0, nY*sizeof(float));
+        op_gemm(r, dY, dW, dX, dB, N, K, M);
+        cuStreamSynchronize(r->stream);
+        float *Yg2 = (float*)malloc(nY*sizeof(float));
+        cuMemcpyDtoH(Yg2, dY, nY*sizeof(float));
+        int det = (memcmp(Yg, Yg2, nY*sizeof(float)) == 0);
+
+        /* CPU references */
+        double dot=0,na=0,nb=0,maxabs=0, dotf=0,naf=0,nbf=0;
+        for (int t=0;t<M;t++){
+            float xmax=0; for(int k=0;k<K;k++){float a=fabsf(Xf[(size_t)t*K+k]); if(a>xmax)xmax=a;}
+            float xsc = xmax>1e-30f ? xmax/127.0f : 1.0f;
+            signed char *xq=(signed char*)malloc(K);
+            for(int k=0;k<K;k++){float q=rintf(Xf[(size_t)t*K+k]/xsc);
+                if(q>127)q=127; else if(q<-127)q=-127; xq[k]=(signed char)q;}
+            for (int o=0;o<N;o++){
+                long acc=0; const signed char *wr=Wq+(size_t)o*K;
+                for(int k=0;k<K;k++) acc += (int)xq[k]*(int)wr[k];
+                float y = (float)acc * (xsc*wscale[o]) + Bf[o];
+                unsigned int bits; memcpy(&bits,&y,4);
+                bits += 0x7FFFu + ((bits>>16)&1u); bits &= 0xFFFF0000u; memcpy(&y,&bits,4);
+                float g = Yg[(size_t)t*N+o];
+                double d=(double)g-y; if(fabs(d)>maxabs)maxabs=fabs(d);
+                dot+=(double)g*y; na+=(double)g*g; nb+=(double)y*y;
+                double yf=Bf[o]; for(int k=0;k<K;k++) yf+=(double)Xf[(size_t)t*K+k]*(double)wr[k]*wscale[o];
+                dotf+=(double)g*yf; naf+=(double)g*g; nbf+=yf*yf;
+            }
+            free(xq);
+        }
+        double cos  = dot/(sqrt(na)*sqrt(nb)+1e-30);
+        double cosf = dotf/(sqrt(naf)*sqrt(nbf)+1e-30);
+        int ok = (cos>0.999) && (cosf>0.99) && det;
+        if(!ok) all_ok=0;
+        fprintf(stderr, "  %-20s N=%-5d K=%-4d M=%-4d  cos(int8)=%.6f cos(f32)=%.5f maxabs=%.2e det=%s -> %s\n",
+                cases[c].label,N,K,M,cos,cosf,maxabs,det?"yes":"NO",ok?"PASS":"FAIL");
+
+        cuMemFree(dW);cuMemFree(dX);cuMemFree(dB);cuMemFree(dY);
+        free(Wf);free(Xf);free(Bf);free(wscale);free(Wq);free(fat);free(Yg);free(Yg2);
+    }
+    cuda_qimg_free(r);
+    fprintf(stderr, "RESULT: %s\n", all_ok?"PASS":"FAIL");
+    return all_ok?0:1;
+}
+
 int main(int argc, char **argv) {
     const char *dit_path = "/mnt/nvme02/models/qwen-image/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
     const char *vae_path = "/mnt/nvme02/models/qwen-image/vae/qwen_image_vae.safetensors";
@@ -1606,6 +1710,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-load") == 0) mode = "load";
         else if (strcmp(argv[i], "--test-dit") == 0) mode = "dit";
         else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
+        else if (strcmp(argv[i], "--test-int8-gemm") == 0) mode = "int8gemm";
         else if (strcmp(argv[i], "--test-vae") == 0) mode = "vae";
         else if (strcmp(argv[i], "--generate") == 0) mode = "gen";
         else if (strcmp(argv[i], "--no-fp8") == 0) force_f16 = 1;
@@ -1625,6 +1730,7 @@ int main(int argc, char **argv) {
     }
 
     if (mode && strcmp(mode, "kernels") == 0) return test_kernels();
+    if (mode && strcmp(mode, "int8gemm") == 0) return test_int8_gemm();
 
     if (!mode) {
         fprintf(stderr, "Usage: %s --test-init|--test-load|--test-dit|--test-kernels|--generate\n"
@@ -1936,6 +2042,21 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++)
             if (strcmp(argv[i], "--cfg-scale") == 0 && i+1 < argc)
                 cfg_scale = (float)atof(argv[++i]);
+
+        /* Debug dumps for HIP layer-by-layer verify (compare_cuda_dumps.py):
+         * the exact embeddings + sigma schedule the CUDA DiT saw, raw f32
+         * row-major. Cond [n_txt,3584], uncond [n_txt_neg,3584], sigmas[n+1]. */
+        if (r->verbose >= 3) {
+            FILE *tf = fopen("cuda_txt_pos.bin", "wb");
+            if (tf) { fwrite(txt_hidden, sizeof(float), (size_t)n_txt*txt_dim, tf); fclose(tf);
+                fprintf(stderr, "  Saved cuda_txt_pos.bin [%d, %d]\n", n_txt, txt_dim); }
+            FILE *nf = fopen("cuda_txt_neg.bin", "wb");
+            if (nf) { fwrite(txt_neg_hidden, sizeof(float), (size_t)n_txt_neg*txt_dim, nf); fclose(nf);
+                fprintf(stderr, "  Saved cuda_txt_neg.bin [%d, %d]\n", n_txt_neg, txt_dim); }
+            FILE *gf = fopen("cuda_sigmas.bin", "wb");
+            if (gf) { fwrite(sched.sigmas, sizeof(float), (size_t)n_steps+1, gf); fclose(gf);
+                fprintf(stderr, "  Saved cuda_sigmas.bin [%d]\n", n_steps+1); }
+        }
 
         /* Patchify + denoising loop with CFG */
         float *img_tokens = (float *)malloc((size_t)n_img * in_ch * sizeof(float));
