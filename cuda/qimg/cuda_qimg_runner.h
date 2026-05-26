@@ -1290,6 +1290,15 @@ struct cuda_qimg_runner {
     CUfunction reduce_max_abs_per_row;
     CUdeviceptr d_row_max_buf;     /* [max_n_tok] f32, lazily allocated */
     size_t      row_max_buf_n;
+    /* INT8 W8A8 dynamic path (auto-enabled when DiT weights load as I8).
+     * Bit-exact int8xint8->int32 GEMM for reproducible CUDA<->HIP verify. */
+    int use_int8;
+    CUfunction quant_act_perrow_int8;   /* X f32 -> Xq int8 + xscale[n_tok] */
+    CUfunction gemm_w8a8_perrow;        /* int8 GEMM, fat-buffer weight */
+    CUdeviceptr d_xq_int8;              /* [max_n_tok * max_n_in] int8, lazily grown */
+    size_t      xq_int8_n;
+    CUdeviceptr d_x_iscale;             /* [max_n_tok] f32 per-token act scale */
+    size_t      x_iscale_n;
     /* cuBLAS-LT FP8 path (env QIMG_CUBLASLT_FP8=1, default 1 if loaded). */
     int use_cublaslt_fp8;
     struct cublasew_context *cublaslt_ctx;
@@ -1619,6 +1628,51 @@ static int qimg_st_upload_fp8_raw_async_r(struct cuda_qimg_runner *r,
     return 0;
 }
 
+/* ---- INT8 fat-buffer weight upload ----
+ * Builds [scale: n_out f32][int8 weights: n_out*n_in] in one device buffer from
+ * the "<w>.weight" (I8) + "<w>.weight_scale" (F32) safetensors pair, so the
+ * op_gemm int8 path can read wscale=W, Wq=W+sbytes. */
+static int qimg_int8_scale_name(const char *wname, char *out, size_t outsz) {
+    size_t L = strlen(wname);
+    if (L < 7 || strcmp(wname + L - 7, ".weight") != 0) return -1;
+    snprintf(out, outsz, "%.*s.weight_scale", (int)(L - 7), wname);
+    return 0;
+}
+
+/* Resident (synchronous) fat upload. Returns device ptr or 0. */
+static CUdeviceptr qimg_st_upload_int8_fat(st_context *st, const char *wname) {
+    int widx = safetensors_find(st, wname);
+    if (widx < 0) return 0;
+    char sname[256];
+    if (qimg_int8_scale_name(wname, sname, sizeof(sname)) != 0) return 0;
+    int sidx = safetensors_find(st, sname);
+    if (sidx < 0) return 0;
+    size_t wbytes = safetensors_nbytes(st, widx);
+    size_t sbytes = safetensors_nbytes(st, sidx);
+    CUdeviceptr d = checked_cuMemAlloc(sbytes + wbytes);
+    if (!d) return 0;
+    cuMemcpyHtoD(d, safetensors_data(st, sidx), sbytes);
+    cuMemcpyHtoD(d + sbytes, safetensors_data(st, widx), wbytes);
+    return d;
+}
+
+/* Streaming (async) fat upload into a pre-sized fat slot (scale then weight).
+ * Slot must be sbytes+wbytes (see qimg_alloc_scratch_block int8 sizing). */
+static int qimg_upload_int8_fat_async_r(struct cuda_qimg_runner *r, st_context *st,
+                                        const char *wname, CUdeviceptr dst, CUstream s) {
+    int widx = safetensors_find(st, wname);
+    if (widx < 0) return -1;
+    char sname[256];
+    if (qimg_int8_scale_name(wname, sname, sizeof(sname)) != 0) return -1;
+    int sidx = safetensors_find(st, sname);
+    if (sidx < 0) return -1;
+    size_t wbytes = safetensors_nbytes(st, widx);
+    size_t sbytes = safetensors_nbytes(st, sidx);
+    cuMemcpyHtoDAsync(dst, qimg_tensor_host_src(r, st, sidx), sbytes, s);
+    cuMemcpyHtoDAsync(dst + sbytes, qimg_tensor_host_src(r, st, widx), wbytes, s);
+    return 0;
+}
+
 static int qimg_st_upload_f32_async(st_context *st, const char *name,
                                     CUdeviceptr dst, size_t dst_nelem,
                                     CUstream s) {
@@ -1694,7 +1748,9 @@ static int qimg_load_block(cuda_qimg_runner *r, int block_idx, qimg_block_gpu *b
     /* Upload weight: FP8 raw for native GEMM, F16 for MMA, or F32 fallback */
     #define BLK_W(field, suffix) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        if (r->use_fp8_gemm) { \
+        if (r->use_int8) { \
+            b->field = qimg_st_upload_int8_fat(st, name); \
+        } else if (r->use_fp8_gemm) { \
             b->field = qimg_st_upload_fp8_raw(st, name); \
         } else if (r->use_f16_gemm) { \
             b->field = qimg_st_upload_f16(st, name); \
@@ -1768,6 +1824,10 @@ static int qimg_alloc_scratch_block(cuda_qimg_runner *r) {
         int _ti = safetensors_find(st, name); \
         if (_ti < 0) { ok = 0; break; } \
         size_t _nb = safetensors_nbytes(st, _ti); \
+        if (r->use_int8) { \
+            const uint64_t *_sh = safetensors_shape(st, _ti); \
+            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-channel scale */ \
+        } \
         if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
     } } while(0)
 #define ALLOC_F32(field, suffix) do { if (ok) { \
@@ -1840,6 +1900,10 @@ static int qimg_alloc_scratch_block_b(cuda_qimg_runner *r) {
         int _ti = safetensors_find(st, name); \
         if (_ti < 0) { ok = 0; break; } \
         size_t _nb = safetensors_nbytes(st, _ti); \
+        if (r->use_int8) { \
+            const uint64_t *_sh = safetensors_shape(st, _ti); \
+            _nb += (size_t)_sh[0] * sizeof(float); /* fat slot: + per-channel scale */ \
+        } \
         if (cuMemAlloc(&b->field, _nb) != CUDA_SUCCESS) { ok = 0; break; } \
     } } while(0)
 #define ALLOC_F32(field, suffix) do { if (ok) { \
@@ -1922,7 +1986,9 @@ static int qimg_load_block_into_slot_ex(cuda_qimg_runner *r, int block_idx,
     int ok = 1;
 #define UPLOAD_FP8(field, suffix, _bytes) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
-        if (qimg_st_upload_fp8_raw_async_r(r, st, name, b->field, _bytes, s) != 0) ok = 0; \
+        if (r->use_int8) { \
+            if (qimg_upload_int8_fat_async_r(r, st, name, b->field, s) != 0) ok = 0; \
+        } else if (qimg_st_upload_fp8_raw_async_r(r, st, name, b->field, _bytes, s) != 0) ok = 0; \
     } } while(0)
 #define UPLOAD_F32(field, suffix, _nelem) do { if (ok) { \
         snprintf(name, sizeof(name), "transformer_blocks.%d." suffix, block_idx); \
@@ -2052,6 +2118,42 @@ static void op_bf16_trunc(cuda_qimg_runner *r, CUdeviceptr x, int n);  /* forwar
 static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                     CUdeviceptr X, CUdeviceptr bias,
                     int n_out, int n_in, int n_tok) {
+
+    /* INT8 W8A8 dynamic path — highest priority when enabled. Quantizes X
+     * per-token-row to int8, does int8xint8->int32 GEMM (bit-exact across HW),
+     * dequants with xscale[t]*wscale[o], adds bias. The weight pointer W is a
+     * fat buffer: [wscale: n_out f32][wq: n_out*n_in int8]. */
+    if (r->use_int8 && r->gemm_w8a8_perrow && r->quant_act_perrow_int8) {
+        CUdeviceptr wscale = W;
+        CUdeviceptr Wq = W + (size_t)n_out * sizeof(float);
+        size_t need_q = (size_t)n_tok * n_in;
+        if (need_q > r->xq_int8_n) {
+            if (r->d_xq_int8) cuMemFree(r->d_xq_int8);
+            r->d_xq_int8 = 0;
+            if (cuMemAlloc(&r->d_xq_int8, need_q) == CUDA_SUCCESS) r->xq_int8_n = need_q;
+            else r->xq_int8_n = 0;
+        }
+        size_t need_s = (size_t)n_tok * sizeof(float);
+        if (need_s > r->x_iscale_n) {
+            if (r->d_x_iscale) cuMemFree(r->d_x_iscale);
+            r->d_x_iscale = 0;
+            if (cuMemAlloc(&r->d_x_iscale, need_s) == CUDA_SUCCESS) r->x_iscale_n = need_s;
+            else r->x_iscale_n = 0;
+        }
+        if (r->d_xq_int8 && r->d_x_iscale) {
+            void *qa[] = {&X, &r->d_xq_int8, &r->d_x_iscale, &n_tok, &n_in};
+            cuLaunchKernel(r->quant_act_perrow_int8, (unsigned)n_tok, 1, 1,
+                           256, 1, 1, 0, r->stream, qa, NULL);
+            void *ga[] = {&Y, &Wq, &wscale, &r->d_xq_int8, &r->d_x_iscale, &bias,
+                          &n_out, &n_in, &n_tok};
+            unsigned gx = (unsigned)((n_out + 127) / 128);
+            cuLaunchKernel(r->gemm_w8a8_perrow, gx, (unsigned)n_tok, 1,
+                           128, 1, 1, 0, r->stream, ga, NULL);
+            op_bf16_trunc(r, Y, n_out * n_tok);
+            return;
+        }
+        /* OOM → fall through (very unlikely) */
+    }
 
     /* cuBLAS-LT FP8 e4m3 path — highest priority. Quantizes X to FP8 with a
      * per-tensor scale = max(|X|)/448, calls cublasLtMatmul (BF16 output),
@@ -2892,6 +2994,83 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
 
 /* ---- Init ---- */
 
+/* ---- INT8 W8A8 dynamic GEMM kernels (runner-local) ----
+ * int8 x int8 -> int32 accumulate is associative & lossless, so the GEMM is
+ * BIT-EXACT across CUDA/HIP regardless of tiling/thread mapping (unlike FP8,
+ * whose e4m3 rounding + accumulation order differ per hardware). This is the
+ * whole reason for the INT8 path: reproducible CUDA<->HIP layer verification.
+ *
+ * Weight buffer is a "fat" layout so op_gemm needs no extra scale argument and
+ * the scale travels with the weight pointer through the streaming loader:
+ *     W = [ per-out-channel scale : n_out * f32 ][ int8 weights : n_out*n_in ]
+ * Dequant: w_bf16[o,i] = wq[o,i] * wscale[o].
+ * Activations are quantized dynamically per token-row (no calibration):
+ *     xscale[t] = max(|X[t,:]|)/127 ; xq[t,k] = clamp(rint(X[t,k]/xscale), -127,127)
+ *     y[t,o] = (sum_k xq[t,k]*wq[o,k]) * (xscale[t]*wscale[o]) + bias[o]
+ */
+static const char *int8_kernels_src =
+"extern \"C\" {\n"
+/* Per-token-row activation quant: one CTA per row, 256 threads. Writes
+ * xq[n_tok,n_in] (int8) and xscale[n_tok]. Same max-reduce as the fp8 path. */
+"__global__ void quant_act_perrow_int8(const float *X, signed char *Xq,\n"
+"                                      float *xscale, int n_tok, int n_in) {\n"
+"    int row = blockIdx.x;\n"
+"    if (row >= n_tok) return;\n"
+"    const float *xr = X + (long)row * n_in;\n"
+"    signed char *qr = Xq + (long)row * n_in;\n"
+"    float v = 0.0f;\n"
+"    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {\n"
+"        float a = fabsf(xr[i]); if (a > v) v = a;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) {\n"
+"        float o = __shfl_xor_sync(0xFFFFFFFF, v, off); if (o > v) v = o;\n"
+"    }\n"
+"    __shared__ float warp_max[8];\n"
+"    int wid = threadIdx.x / 32;\n"
+"    if ((threadIdx.x & 31) == 0) warp_max[wid] = v;\n"
+"    __syncthreads();\n"
+"    __shared__ float s_scale;\n"
+"    if (wid == 0) {\n"
+"        v = (threadIdx.x < (blockDim.x / 32)) ? warp_max[threadIdx.x] : 0.0f;\n"
+"        for (int off = 16; off > 0; off >>= 1) {\n"
+"            float o = __shfl_xor_sync(0xFFFFFFFF, v, off); if (o > v) v = o;\n"
+"        }\n"
+"        if (threadIdx.x == 0) {\n"
+"            float sc = (v > 1e-30f) ? (v / 127.0f) : 1.0f;\n"
+"            xscale[row] = sc; s_scale = sc;\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float sc = s_scale;\n"
+"    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {\n"
+"        float q = rintf(xr[i] / sc);\n"
+"        if (q > 127.0f) q = 127.0f; else if (q < -127.0f) q = -127.0f;\n"
+"        qr[i] = (signed char)q;\n"
+"    }\n"
+"}\n"
+/* W8A8 GEMM. One thread per output element (o,t); full k-reduction in int32
+ * via dp4a (4 int8/step). n_in is always a multiple of 4 for qimg linears. */
+"__global__ void gemm_w8a8_perrow_f32(float *Y, const signed char *Wq,\n"
+"                                     const float *wscale, const signed char *Xq,\n"
+"                                     const float *xscale, const float *bias,\n"
+"                                     int n_out, int n_in, int n_tok) {\n"
+"    int o = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int t = blockIdx.y;\n"
+"    if (o >= n_out || t >= n_tok) return;\n"
+"    const int *w4 = (const int *)(Wq + (long)o * n_in);\n"
+"    const int *x4 = (const int *)(Xq + (long)t * n_in);\n"
+"    int acc = 0;\n"
+"    int n4 = n_in >> 2;\n"
+"    for (int i = 0; i < n4; i++) acc = __dp4a(w4[i], x4[i], acc);\n"
+"    for (int i = n4 << 2; i < n_in; i++)\n"
+"        acc += (int)Wq[(long)o*n_in+i] * (int)Xq[(long)t*n_in+i];\n"
+"    float s = xscale[t] * wscale[o];\n"
+"    float y = (float)acc * s;\n"
+"    if (bias) y += bias[o];\n"
+"    Y[(long)t * n_out + o] = y;\n"
+"}\n"
+"}\n";
+
 cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) {
         fprintf(stderr, "cuda_qimg: cuewInit failed\n");
@@ -2930,15 +3109,17 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     size_t len1 = strlen(cuda_kernels_common_src);
     size_t len2 = strlen(qimg_kernel_src);
     size_t len3 = strlen(fp8_mma_kernels_src);
+    size_t len4 = strlen(int8_kernels_src);  /* own extern "C" block */
     size_t lo = strlen(mma_open);
     size_t lc = strlen(mma_close);
-    char *full_src = (char *)malloc(len1 + len2 + lo + len3 + lc + 1);
+    char *full_src = (char *)malloc(len1 + len2 + lo + len3 + lc + len4 + 1);
     char *p = full_src;
     memcpy(p, cuda_kernels_common_src, len1); p += len1;
     memcpy(p, qimg_kernel_src, len2);         p += len2;
     memcpy(p, mma_open, lo);                  p += lo;
     memcpy(p, fp8_mma_kernels_src, len3);     p += len3;
     memcpy(p, mma_close, lc);                 p += lc;
+    memcpy(p, int8_kernels_src, len4);        p += len4;
     *p = '\0';
 
     CUmodule module;
@@ -2974,6 +3155,10 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_fp8_pipe_perrow_mt4_concat3 = NULL;
     if (cuModuleGetFunction(&r->reduce_max_abs_per_row, module, "reduce_max_abs_per_row_f32") != CUDA_SUCCESS)
         r->reduce_max_abs_per_row = NULL;
+    if (cuModuleGetFunction(&r->quant_act_perrow_int8, module, "quant_act_perrow_int8") != CUDA_SUCCESS)
+        r->quant_act_perrow_int8 = NULL;
+    if (cuModuleGetFunction(&r->gemm_w8a8_perrow, module, "gemm_w8a8_perrow_f32") != CUDA_SUCCESS)
+        r->gemm_w8a8_perrow = NULL;
     if (cuModuleGetFunction(&r->quant_f32_to_fp8_e4m3, module, "quant_f32_to_fp8_e4m3") != CUDA_SUCCESS)
         r->quant_f32_to_fp8_e4m3 = NULL;
     if (cuModuleGetFunction(&r->compute_x_scale_from_max, module, "compute_x_scale_from_max") != CUDA_SUCCESS)
@@ -3260,6 +3445,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
 /* Upload weight: raw FP8 for native GEMM, or upload FP8 + GPU dequant to F16 */
 static CUdeviceptr qimg_upload_weight_auto(cuda_qimg_runner *r,
                                             st_context *st, const char *name) {
+    if (r->use_int8)
+        return qimg_st_upload_int8_fat(st, name);
     if (r->use_fp8_gemm)
         return qimg_st_upload_fp8_raw(st, name);
     if (r->use_f16_gemm)
@@ -3309,6 +3496,27 @@ int cuda_qimg_load_dit(cuda_qimg_runner *r, const char *path) {
         if (bp) {
             int blk = atoi(bp + 19);
             if (blk + 1 > r->dit_n_blocks) r->dit_n_blocks = blk + 1;
+        }
+    }
+
+    /* Auto-detect INT8 W8A8 weights: peek a representative linear's dtype. If
+     * "I8", switch to the bit-exact int8 GEMM path and disable all FP8/F16
+     * paths (their dispatch in op_gemm is bypassed by the use_int8 branch, but
+     * clear the flags so the loaders take the fat-buffer route). */
+    {
+        int pidx = safetensors_find(st, "transformer_blocks.0.attn.to_q.weight");
+        if (pidx < 0) pidx = safetensors_find(st, "img_in.weight");
+        if (pidx >= 0 && strcmp(safetensors_dtype(st, pidx), "I8") == 0) {
+            if (!r->gemm_w8a8_perrow || !r->quant_act_perrow_int8) {
+                fprintf(stderr, "cuda_qimg: INT8 weights but int8 kernels missing\n");
+                return -1;
+            }
+            r->use_int8 = 1;
+            r->use_fp8_gemm = 0; r->use_f16_gemm = 0; r->use_old_gemm = 0;
+            r->use_fp8_pipe_perrow = 0; r->use_fp8_pipe = 0;
+            r->use_fp8_mma = 0; r->use_fp8_mma_bf16 = 0; r->use_bf16_mma = 0;
+            r->use_cublaslt_fp8 = 0;
+            fprintf(stderr, "cuda_qimg: INT8 W8A8 weights detected — bit-exact int8 GEMM path\n");
         }
     }
 
