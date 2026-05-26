@@ -3072,7 +3072,10 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
     CUstream stream;
     CU_CHECK_NULL(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
 
-    if (verbose) {
+    {
+        /* Print the device line unconditionally (not just under --verbose): the
+         * compare server parses "cuda_qimg: <name> (sm_..)" for its progress/device
+         * readout, and it's a single concise, harmless line for every caller. */
         char name[256]; cuDeviceGetName(name, sizeof(name), dev);
         size_t mem; cuDeviceTotalMem(&mem, dev);
         fprintf(stderr, "cuda_qimg: %s (sm_%d, %.1f GB)\n", name, sm, (float)mem/(1<<30));
