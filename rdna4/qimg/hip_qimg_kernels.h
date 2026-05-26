@@ -1398,6 +1398,17 @@ static const char hip_qimg_specific_kernels[] =
 "      xr[j]=r*sc; }\n"
 "}\n"
 "\n"
+/* Int8 group-64 symmetric weight roundtrip (per output-channel, 64-col groups):
+ * quantize each group to int8 (sc=max/127) and dequant. Diagnostic to measure
+ * int8 weight precision vs fp8. One block per output row, in place. */
+"__global__ void w_int8_roundtrip_g64(float *__restrict__ w, int n_in) {\n"
+"    float *wr = w + (size_t)blockIdx.x*n_in;\n"
+"    for(int g=0; g*64<n_in; g++){ int n=min(64,n_in-g*64); float *p=wr+g*64;\n"
+"      float m=0; for(int j=0;j<n;j++){float a=fabsf(p[j]); if(a>m)m=a;}\n"
+"      float sc=m/127.0f; if(sc<1e-12f)sc=1e-12f; float inv=1.0f/sc;\n"
+"      for(int j=0;j<n;j++){ float q=roundf(p[j]*inv); if(q>127)q=127; if(q<-127)q=-127; p[j]=q*sc; } }\n"
+"}\n"
+"\n"
 
 /* ---- gemm_fp8w_bf16a_wmma_t: BF16-act × FP8-wt WMMA (gfx12 matrix cores)
  *

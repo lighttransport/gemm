@@ -34,3 +34,17 @@ weights (int4/svdquant), not GEMM/attn internals.
 
 ## Repro: emulate CUDA fp8 acts (QIMG_ACT_FP8_RT=1)
 Per-row fp8/448 act roundtrip + accurate GEMM = final cos 0.86 (vs 0.9956 default), WORSE. CUDA fp8 acts are extra loss HIP avoids; 0.9956 is the parity floor. Gated diagnostic, default off.
+
+## int8 vs bf16 end-to-end (vs CUDA-fp8 dumps, F32-streaming roundtrip)
+| weights | cos vs CUDA | PSNR |
+|---|---|---|
+| fp8 e4m3 (current) | 0.9956 | 29.7 |
+| bf16 lossless | 0.9818 | 23.8 |
+| int8 g64 | 0.9811 | 23.7 |
+
+int8 g64 == bf16 (lossless). Both FARTHER from CUDA than fp8 because CUDA itself
+is fp8 — the dumps are not a ground-truth yardstick for wobble. int8 g64 is the
+right quant to reduce *visible* wobble (bf16-equivalent at ~half VRAM), but only
+pays off with a real int8 streaming GEMM; the F32-stream validation here is
+207s/step (unusable for perf, quality-only). QIMG_FORCE_F32W enables bf16/f32
+ckpt via f32 streaming; QIMG_W_INT8_RT adds int8-g64 weight roundtrip.
