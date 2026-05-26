@@ -68,6 +68,61 @@ static void print_first_n(const char *label, const float *v, int n, int show) {
     fprintf(stderr, " ...] norm=%.4f\n", vec_norm(v, n));
 }
 
+/* ---- Quant-matvec A/B verifier (--verify-quant-kernels) ----
+ *
+ * For each ported IQ/TQ matvec kernel, run the runner-internal verifier
+ * that compares the GPU launch_matvec_<type> against dequantize_row_<type>
+ * + scalar matvec on identical random raw bytes. */
+typedef void (*deq_row_fn)(const void *src, float *dst, int n);
+
+static int run_verify_quant_kernels(void) {
+    fprintf(stderr, "=== --verify-quant-kernels: A/B HIP matvec vs CPU dequant+matvec ===\n");
+    fprintf(stderr, "Shape: n_rows=64, n_cols=512.  Pass threshold: rel_l2 < 1e-4.\n\n");
+
+    hip_llm_runner *r = hip_llm_init(0, 0);
+    if (!r) { fprintf(stderr, "hip_llm_init failed\n"); return 1; }
+
+    struct { int type; const char *name; deq_row_fn fn; } cases[] = {
+        { GGML_TYPE_IQ2_XXS, "IQ2_XXS", dequantize_row_iq2_xxs },
+        { GGML_TYPE_IQ2_XS,  "IQ2_XS",  dequantize_row_iq2_xs  },
+        { GGML_TYPE_IQ2_S,   "IQ2_S",   dequantize_row_iq2_s   },
+        { GGML_TYPE_IQ3_XXS, "IQ3_XXS", dequantize_row_iq3_xxs },
+        { GGML_TYPE_IQ3_S,   "IQ3_S",   dequantize_row_iq3_s   },
+        { GGML_TYPE_IQ1_S,   "IQ1_S",   dequantize_row_iq1_s   },
+        { GGML_TYPE_IQ1_M,   "IQ1_M",   dequantize_row_iq1_m   },
+        { GGML_TYPE_IQ4_NL,  "IQ4_NL",  dequantize_row_iq4_nl  },
+        { GGML_TYPE_IQ4_XS,  "IQ4_XS",  dequantize_row_iq4_xs  },
+        { GGML_TYPE_TQ1_0,   "TQ1_0",   dequantize_row_tq1_0   },
+        { GGML_TYPE_TQ2_0,   "TQ2_0",   dequantize_row_tq2_0   },
+    };
+    int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
+    int n_pass = 0, n_fail = 0, n_skip = 0;
+    const double thresh = 1e-4;
+
+    fprintf(stderr, "%-8s  %12s  %12s   %s\n", "type", "rel_l2", "max_abs", "result");
+    fprintf(stderr, "%-8s  %12s  %12s   %s\n", "----", "------", "-------", "------");
+    for (int i = 0; i < n_cases; i++) {
+        double rel_l2 = 0.0, max_abs = 0.0;
+        int rc = hip_llm_verify_quant_matvec(r, cases[i].type, cases[i].fn,
+                                             64, 512, &rel_l2, &max_abs);
+        if (rc != 0) {
+            fprintf(stderr, "%-8s  %12s  %12s   SKIP (rc=%d)\n",
+                    cases[i].name, "-", "-", rc);
+            n_skip++;
+            continue;
+        }
+        int pass = (rel_l2 < thresh);
+        fprintf(stderr, "%-8s  %12.3e  %12.3e   %s\n",
+                cases[i].name, rel_l2, max_abs, pass ? "PASS" : "FAIL");
+        if (pass) n_pass++; else n_fail++;
+    }
+    fprintf(stderr, "\n%d PASS, %d FAIL, %d SKIP (threshold rel_l2 < %.0e).\n",
+            n_pass, n_fail, n_skip, thresh);
+
+    hip_llm_free(r);
+    return n_fail == 0 ? 0 : 2;
+}
+
 /* ---- Main ---- */
 
 static int argmax_logits(const float *logits, int n) {
@@ -89,10 +144,13 @@ int main(int argc, char **argv) {
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
+    int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--verify-quant-kernels") == 0) {
+            verify_quant_kernels = 1;
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             max_tokens = atoi(argv[++i]);
@@ -118,9 +176,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* --verify-quant-kernels has no model dependency; run it and exit. */
+    if (verify_quant_kernels) {
+        return run_verify_quant_kernels();
+    }
+
     if (!model_path) {
         fprintf(stderr, "Usage: %s <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
         fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
+        fprintf(stderr, "       [--verify-quant-kernels]   (standalone; no model needed)\n");
         return 1;
     }
 
@@ -252,6 +316,14 @@ int main(int argc, char **argv) {
                 "[--compare-paths] rel_l2=%.4e  max_abs=%.4e  argmax: per-token=%d batched=%d %s\n",
                 rl2, max_abs, top_p, top_b, (top_p == top_b) ? "(match)" : "(DIFFER)");
             free(buf_p);
+        }
+
+        /* Warm-up prefill (first call builds hipBLASLt plans; not counted). */
+        const char *warmup_env = getenv("LLM_PREFILL_WARMUP");
+        int n_warmup = warmup_env ? atoi(warmup_env) : 0;
+        for (int w = 0; w < n_warmup; w++) {
+            float *lg = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            if (!lg) { fprintf(stderr, "GPU prefill warmup %d failed\n", w); pass = 0; goto bench_done; }
         }
 
         /* Prefill: a single forward_batch_logits call. Phase 1 implementation is a

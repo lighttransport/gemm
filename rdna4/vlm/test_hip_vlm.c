@@ -340,21 +340,45 @@ int main(int argc, char **argv) {
     t1 = get_time_ms();
     fprintf(stderr, "  Text before: %d tokens, %.1f ms\n", n_before, t1 - t0);
 
-    /* Vision tokens */
+    /* Vision tokens — batched via hip_llm_forward_batch_embd, chunked by 1024
+     * (the BMAX cap for hybrid models). For non-hybrid dense models BMAX=4096
+     * but we keep the same chunk size for simplicity; chunks are still
+     * vastly larger than 1, so the per-token overhead is amortized. Set
+     * LLM_VLM_BATCH_EMBD=0 to force the legacy per-token loop. */
     t0 = get_time_ms();
-    for (int i = 0; i < n_vision_tokens; i++) {
-        float *embd_i = vision_embd + i * total_embd;
-        hip_llm_forward_embd(llm, embd_i, total_embd, pos);
-        pos++;
-        if (i == 0 || i == n_vision_tokens - 1 || (i + 1) % 100 == 0) {
+    const char *env_be = getenv("LLM_VLM_BATCH_EMBD");
+    int use_batch_embd = (env_be == NULL) ? 1 : atoi(env_be);
+    if (use_batch_embd) {
+        int chunk = 1024;
+        for (int i = 0; i < n_vision_tokens; i += chunk) {
+            int M = n_vision_tokens - i;
+            if (M > chunk) M = chunk;
+            float *embd_i = vision_embd + (size_t)i * total_embd;
+            if (!hip_llm_forward_batch_embd(llm, embd_i, M, total_embd, pos)) {
+                fprintf(stderr, "  hip_llm_forward_batch_embd failed at i=%d M=%d\n", i, M);
+                return 1;
+            }
+            pos += M;
             double tc = get_time_ms();
-            fprintf(stderr, "  Vision token %d/%d, pos=%d (%.1f ms cumulative)\n",
-                    i + 1, n_vision_tokens, pos - 1, tc - t0);
+            fprintf(stderr, "  Vision chunk %d..%d (M=%d), pos=%d (%.1f ms cumulative)\n",
+                    i, i + M - 1, M, pos - 1, tc - t0);
+        }
+    } else {
+        for (int i = 0; i < n_vision_tokens; i++) {
+            float *embd_i = vision_embd + i * total_embd;
+            hip_llm_forward_embd(llm, embd_i, total_embd, pos);
+            pos++;
+            if (i == 0 || i == n_vision_tokens - 1 || (i + 1) % 100 == 0) {
+                double tc = get_time_ms();
+                fprintf(stderr, "  Vision token %d/%d, pos=%d (%.1f ms cumulative)\n",
+                        i + 1, n_vision_tokens, pos - 1, tc - t0);
+            }
         }
     }
     t1 = get_time_ms();
-    fprintf(stderr, "  Vision prefill: %d tokens, %.1f ms (%.2f ms/token)\n",
-            n_vision_tokens, t1 - t0, (t1 - t0) / n_vision_tokens);
+    fprintf(stderr, "  Vision prefill: %d tokens, %.1f ms (%.2f ms/token)%s\n",
+            n_vision_tokens, t1 - t0, (t1 - t0) / n_vision_tokens,
+            use_batch_embd ? " [batched]" : " [per-token]");
 
     /* Text tokens after vision (last one returns logits) */
     float *logits = NULL;
