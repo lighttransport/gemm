@@ -90,3 +90,33 @@ INT4-resident, block-streaming-eliminating GPU path — is unblocked.
 
 Minimal deliverable: **the fc1 layer alone at N=6144** is enough to crack the alignment; the other layers are
 confirmation that the fix generalizes.
+
+## Results from the NV-box run (2026-05-23) — and a correction to the N=2K recommendation
+
+Ran on the Blackwell box (RTX 5060 Ti, sm_120, nunchaku 1.2.1, INT4). `X` is well-conditioned at every N
+(`cond(X)=5.8`, ideal for unit-Gaussian). **But N=2K is marginal**, because the per-token int4 *activation*
+quantizer makes the map `y = W_eff·quant(x) + lowrank(x) + b`: the quantization noise is an **irreducible
+~20% per-row residual** that does *not* shrink with more rows. What more rows buy is a tighter `W_eff`
+*estimate* (lower variance), not a lower residual. Measured on `transformer_blocks.0.img_mlp.net.0.proj`
+(K=3072, out=12288), fitting `W_eff` on nested subsets vs the N=8K fit:
+
+| N        | γ=K/N | in-sample resid | held-out pred err | ‖W(N)−W(8K)‖/‖W‖ |
+|----------|-------|-----------------|-------------------|-------------------|
+| 6144 (2K)| 0.50  | 0.150           | **0.300**         | **0.200**         |
+| 12288(4K)| 0.25  | 0.183           | 0.245             | 0.094             |
+| 18432(6K)| 0.17  | 0.193           | 0.214             | 0.052             |
+| 24576(8K)| 0.125 | 0.198           | 0.198             | 0 (ref)           |
+
+At N=2K the held-out error (0.30) is 2× the in-sample (0.15) — the overfit gap — and `W_eff` is **~20% off**
+the converged operator, same order as the noise floor and only ~10× below the 3× (200%) misalignment being
+hunted. Usable to *see* the relabeling, but noisy. By N≥4K `W_eff` is within ~9%; by N=6–8K within ~5%, with
+in-sample and held-out both at the ~20% noise floor (no more overfit gap). **Recommendation: use N=8K
+(`--probe-mult 8`).** That is what was dumped. Offline, treat the ~20% in-sample residual as the expected
+floor (it's the activation-quantization noise, not a bug), and use the held-out-prediction-error−vs−in-sample
+gap (not the in-sample residual alone) as the convergence check.
+
+Artifacts (one safetensors per layer; keys `x`,`y` bf16 + `y_at_zero`=bias ref; meta has N/K/out/seed):
+`nunchaku_probe.transformer_blocks.0.img_mlp.net.0.proj` (N=24576, ~755 MB),
+`…0.attn.to_qkv` (N=24576), `…30.img_mlp.net.0.proj` (N=24576). NB: this box stores them under
+`/mnt/disk01/models/qwen-image/nunchaku/` (the doc's `/mnt/disk1/…` is the AMD-box destination — copy across).
+The optional fc2 (`…0.img_mlp.net.2`, in=12288) would want N=8·12288=98304 (~4.8 GB); still deferred.
