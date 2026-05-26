@@ -20,8 +20,15 @@
 #include "../../common/ggml_dequant.h"
 #include "../../common/transformer.h"
 
-/* safetensors loader (header-only) for the Qwen3 text-encoder weight path */
+/* safetensors loader (header-only) for the Qwen3 text-encoder weight path.
+ * When linked into a host TU that already carries the safetensors/json
+ * implementation (e.g. diffusion-server's server.c), define
+ * HIP_LLM_RUNNER_EXTERNAL_IMPLS=1 to use declarations only and avoid
+ * multiple-definition link errors. The standalone rdna4/llm build leaves it
+ * unset and owns the implementation here. */
+#ifndef HIP_LLM_RUNNER_EXTERNAL_IMPLS
 #define SAFETENSORS_IMPLEMENTATION
+#endif
 #include "../../common/safetensors.h"
 
 /* hip_runner_common.h: HIP_CHECK, hip_f32_to_f16, hip_upload_raw, hip_compile_kernels */
