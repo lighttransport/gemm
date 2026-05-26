@@ -20,7 +20,7 @@
 
 static const float E2M1[16]={0,0.5f,1,1.5f,2,3,4,6,-0.f,-0.5f,-1,-1.5f,-2,-3,-4,-6};
 static float ue4m3_decode(unsigned char b){int e=(b>>3)&0xF,m=b&0x7;
-    if(e==0)return ldexpf((float)m/8.0f,1-7); return ldexpf(1.0f+(float)m/8.0f,e-7);}
+    if(e==0){ return ldexpf((float)m/8.0f,1-7); } return ldexpf(1.0f+(float)m/8.0f,e-7);}
 
 static const char *KSRC =
 "extern \"C\" __global__ void w4a4_gemm(const unsigned int* A, const unsigned int* B,\n"
@@ -58,7 +58,7 @@ static CUmodule compile_sm120a(const char*src){
     if(nvrtcGetCUBINSize&&nvrtcGetCUBINSize(p,&bs)==NVRTC_SUCCESS&&bs>0){char*bl=malloc(bs);
         nvrtcGetCUBIN(p,bl);nvrtcDestroyProgram(&p);if(cuModuleLoadData(&m,bl)!=CUDA_SUCCESS)m=NULL;free(bl);}
     else{size_t ps=0;nvrtcGetPTXSize(p,&ps);char*x=malloc(ps);nvrtcGetPTX(p,x);nvrtcDestroyProgram(&p);
-        if(cuModuleLoadData(&m,x)!=CUDA_SUCCESS)m=NULL;free(x);}
+        if(cuModuleLoadData(&m,x)!=CUDA_SUCCESS){m=NULL;}free(x);}
     return m;
 }
 
