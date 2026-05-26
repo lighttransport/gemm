@@ -24,7 +24,8 @@ distributed-attention budget.
 | `allgather_bench.c` | **all-gather** (the BW-optimal *half* of an all-reduce; TP sequence-parallel hidden / KV-shard gather): naive single-TNI all-broadcast / multi-TNI all-broadcast / ring all-gather / recursive-doubling all-gather (Rabenseifner non-pow2), plus the tree all-reduce baseline for the roofline ratio. `AG_BATCH`/`AG_SHARD`/`AG_NTNI` — see finding #12 |
 | `reducescatter_bench.c` | **reduce-scatter** (the *other* BW-optimal half; the all-reduce = reduce-scatter + all-gather decomposition): naive single-TNI direct scatter / multi-TNI direct scatter / ring reduce-scatter, plus a multi-TNI all-gather and the fused tree all-reduce so the decomposed pair is compared to the fused tree in one run. Shares `AG_*` knobs with `allgather_bench` — see finding #13 |
 | `pp_handoff_bench.c` | **pipeline-parallel handoff** (the point-to-point inter-stage send/recv — the comm pattern that *replaces* per-layer collectives): ping-pong one-hop (near vs far for distance sensitivity) / full forward+backward store-and-forward chain `0→…→S-1→…→0` / tree all-reduce baseline (the TP per-layer cost it trades against). `PP_HID`/`PP_ABYTES`/`PP_BATCH`/`PP_FAR` — see finding #14 |
-| `Makefile`, `run_bench.sh`, `run_demo.sh` | build + launch |
+| `p2p_latbw_bench.c` | **point-to-point latency/bandwidth characterization** of the raw Tofu links (the floor every estimate above builds on): per-peer Put ping-pong / one-sided Get / `armw8` fetch-add latency reported vs computed torus hop-distance, plus a Put-injection & Get-delivered bandwidth size-sweep with a pipelined async window. The only program here that exercises `utofu_get`/`utofu_armw8` (the rest are Put + memory-sentinel). `P2P_MAXBYTES`/`P2P_WINDOW`/`P2P_LAT_BYTES`/`P2P_BW_PEER` — see finding #17 |
+| `Makefile`, `run_bench.sh`, `run_demo.sh`, `run_p2p.sh` | build + launch |
 
 The whole approach: `utofu_construct_vcq_id(peer_coords, tni, cq, cmp, &vcq)`
 rebuilds a peer's VCQ ID purely from its 6D Tofu coordinates, and
@@ -52,13 +53,20 @@ MOE_BATCH=256 MOE_NTNI=6 mpiexec -np 12 ./moe_dispatch_bench
 # skewed routing (hot experts) + dimensional relay (MOE_DIMORDER, MOE_RELAY=0 skips) +
 # Bruck variant (MOE_BRUCK=0 skips). worst-route at B=256 needs MOE_ITERS=300 (see #15).
 MOE_BATCH=256 MOE_ROUTE=worst MOE_ITERS=300 MOE_DIMORDER=bac mpiexec -np 12 ./moe_dispatch_bench
+# MoE dispatch+combine all-to-all || REAL expert SwiGLU compute OVERLAP (across-step
+# async driver, libhwb HW barrier; needs -fopenmp -lhwb). B=1 = comm-trivial/imbalance-
+# bound; B=256 = comm-substantial, overlap 67-81% effective (see #16). Per-rank load +
+# dispatch/combine split logged for every rank.
+MOE_BATCH=1   TF_HW_BARRIER=1 mpiexec -np 12 ./moe_async_bench
+MOE_BATCH=256 MOE_ITERS=60 TF_HW_BARRIER=1 mpiexec -np 12 ./moe_async_bench
 # all-gather (B=1 decode = latency-bound; B=256 batched = bandwidth-bound; AG_NTNI sweeps TNIs)
 AG_BATCH=1   AG_NTNI=6 mpiexec -np 12 ./allgather_bench
 AG_BATCH=256 AG_NTNI=6 mpiexec -np 12 ./allgather_bench
 ```
 Rank-0 reports are also written to `ra_log_<coords>.txt` / `rao_log_<coords>.txt`
-/ `raa_log_<coords>.txt` / `moe_log_<coords>.txt` / `ag_log_<coords>.txt` (mpiexec
-swallows rank-0 stdout on this node, so read the log file).
+/ `raa_log_<coords>.txt` / `moe_log_<coords>.txt` / `moea_log_<coords>.txt` /
+`ag_log_<coords>.txt` (mpiexec swallows rank-0 stdout on this node, so read the log
+file; `moe_async_bench` logs per-rank load to *every* rank's file, not just rank 0).
 
 ## The model
 
@@ -671,6 +679,102 @@ the un-barriered **tree** baseline phase, which a fast rank enters while a slow 
 is still draining, trips its 30 s wait. Lower iters keep the cross-phase skew bounded;
 the timing is unaffected since each iter already moves ~GB.)
 
+### 16. MoE dispatch+combine async overlap: a **two-regime split** — useless at B=1 (comm is 0.5%, load imbalance dominates), 67–81% effective at B=256 (`moe_async_bench`)
+
+The first bench in the suite to overlap **real expert compute** with the
+dispatch+combine all-to-all — the MoE analogue of the across-step async driver (#8).
+tid0 is the comm driver (runs `combine(prev)+dispatch(next)` over multi-TNI distinct-
+destination all-to-all, #10) while threads 1..47 run the expert SwiGLU FFN for the
+current step; a **compute-threads-only barrier** (CBAR, tid0 excluded — the #9
+constraint) carries the gate/up→down dependency. Compute is **real bf16 GEMV**,
+M=1 per active expert (decode is weight-read-bound: `NActive = min(fan-in, experts/node)`
+expert weight matrices, 54 MiB each, streamed from HBM by 47 threads = 4 CMG × 12,
+libhwb HW barrier). Measured 12-node 2×3×2, E=256/K=8/HID=6144/INTER=1536, per MoE step (µs):
+
+```
+regime          compute  comm   serial  async   overlap-eff  async/serial  async/max()  bound
+B=1   decode      5179      39    8406    7090     41%          -16%          +37%       straggler-compute
+B=256 dense      13906    6440   22305   16651   67-81%         -25%          +20%       compute (+ real comm)
+```
+
+1. **B=1 decode: comm is a rounding error (39 µs = 0.5% of the step) — there is nothing
+   to hide.** The measured dispatch+combine (39 µs) *matches* `decode_estimate`'s
+   `2·tree` proxy (44–106 µs), so the roofline's comm term is accurate — but it is
+   negligible against ~5–7 ms of expert compute. The SERIAL "combine" cost (2.78 ms)
+   is **not communication**: it is rank 0 blocking at the combine all-to-all for the
+   **straggler rank's compute** to finish. At B=1 expert load is severely imbalanced —
+   each rank's fan-in R (the (token,expert) pairs landing on its experts) ranged **3 to
+   12 across the 12 ranks** (a balls-in-bins spread: 12 tokens × top-8 over 12 owner-
+   ranks), so per-rank compute ranged 1.8–7.1 ms. ASYNC's 16% gain is **not from hiding
+   comm** — it comes from dropping 3 of SERIAL's 4 global barriers and decoupling the
+   per-step straggler sync. **The B=1 lever is load balancing (capacity factor / expert
+   placement), not comm/compute overlap.**
+2. **B=256 dense: load balances (every rank saturates its 22 local experts) and comm
+   becomes substantial (6.4 ms ≈ 31% of the serial step, 94 GB/s aggregate over 6
+   TNIs).** Here the across-step driver delivers: ASYNC (16.7 ms) lands **67–81% of the
+   way** from serial (22.3 ms) to the compute roofline (13.9 ms) — −25% vs serial,
+   within +20% of `max(compute,comm)`. This is the MoE confirmation of #8: the multi-TNI
+   dispatch+combine all-to-all **can be hidden behind expert compute** with a tid0
+   driver, exactly when comm is a meaningful fraction of compute.
+3. **Caveat — B=256 here is a comm-favorable stress test, not real batched MoE.**
+   Compute is M=1 GEMV per expert (the weight-read-bound decode model), but the dispatch
+   payload is B-scaled (2 MiB/pair ≈ 170 tokens' worth). A faithful batched MoE would
+   compute M≈170 per expert — far more FLOPs — making comm a *smaller* fraction and
+   overlap *less* impactful. So this regime over-states comm's weight; it proves the
+   overlap *mechanism* works for all-to-all, but real prefill is more compute-dominated.
+   The DIAG also shows the in-phase compute inflating ~1.2× at B=256 (the 2 MiB/pair
+   dispatch DMA writes contend with the 47 threads' weight reads for HBM bandwidth);
+   at B=1 the payload is tiny and there is no such contention (ratio ≈1.0).
+
+**Takeaway: `decode_estimate`'s MoE-comm term (≈2·tree) is accurate in magnitude but the
+wrong thing to optimize at B=1 — comm is 0.5% of the MoE step; the straggler/imbalance is
+the cost. Async dispatch+combine overlap is a real but regime-specific win (only when comm
+is ≳20–30% of compute, i.e. dense / large batch), confirming #8 generalizes from the ring
+all-reduce to the MoE all-to-all. Across both regimes the dominant cost is never the comm:
+it is expert load imbalance at decode and batched-GEMM compute at prefill.**
+
+### 17. Point-to-point link floor: ~1 µs one-way, ~6.3 GB/s/link, mild distance slope (`p2p_latbw_bench`)
+
+Direct characterization of the raw Tofu links on the 12-node 2×3×2 (a,b,c extents
+2,3,2; x,y,z fixed), all driven from rank 0. This is the only bench that exercises
+one-sided **Get** (`utofu_get`, completion via local MRQ `UTOFU_MRQ_TYPE_LCL_GET`)
+and **`armw8`** fetch-add (MRQ `LCL_ARMW`, pre-op value in `notice.rmt_value`) —
+the rest are Put + memory-sentinel polling.
+
+**Latency vs torus hop-distance** (8 B, 2000 iters/op, one-way = ping-pong RTT/2):
+
+| dist | peers | Put 1-way | Get RTT | armw RTT |
+|------|-------|-----------|---------|----------|
+| 1 | 1,2,4,6 | 0.97–0.99 µs | 1.48–1.51 µs | 1.32–1.35 µs |
+| 2 | 3,5,7,8,10 | 1.04–1.08 µs | 1.64–1.66 µs | 1.48–1.50 µs |
+| 3 | 9,11 | 1.13 µs | 1.80 µs | 1.63 µs |
+
+The wraparound torus metric is confirmed correct: rank 2 (b=2) is distance **1**,
+not 2, via the ring-of-3 b-axis. Distance slope is real but **shallow** — ~+0.08 µs
+one-way per hop (~+8%/hop) — consistent with finding #14 ("one hop = one link,
+distance is a rounding error") and the ring-attn ~1.23 µs fixed per-hop figure.
+Get/armw cost a bit more than a Put one-way because each is a full request→response
+round-trip the initiator waits on (no remote CPU involved).
+
+**Bandwidth vs message size** (peer rank 9, dist 3, async window W=8):
+
+| size | Put inject | Get delivered |
+|------|-----------|---------------|
+| 1 KiB | 3.49 GB/s | 3.48 GB/s |
+| 4 KiB | 6.18 | 6.12 |
+| ≥16 KiB | 6.30–6.34 | 6.28–6.35 |
+
+Saturates at **~6.34 GB/s** for ≥16 KiB — matches the recorded single-TofuD-link
+~6.36 GB/s (and finding #5: one peer = one link, so W>1 fills the pipe but does not
+exceed one link). Small messages are latency-bound; the half-BW point is ~4 KiB.
+Put-injection (sender TCQ) and Get-delivered (data landed locally, MRQ) track each
+other within noise, so the link is symmetric and injection ≈ delivered at this scale.
+
+**Takeaway: the link floor is ~1 µs one-way / ~6.3 GB/s, distance adds only ~8%/hop.
+Every higher-level number in this suite is consistent with this floor; the levers
+that matter are payload size (finding #6) and parallelism across *distinct* peers
+(findings #10/#12), never a single point-to-point link.**
+
 ## Practical guidance for distributed decode attention
 
 - **Few/large shards** beat many/small ones while comm-bound: keep N at or below
@@ -759,7 +863,8 @@ e317b82  moe_dispatch_bench — relay extended to all 6 Tofu axes (multi-unit re
 f12ee81  reducescatter_bench — reduce-scatter mirrors all-gather; decompose all-reduce beats fused tree 2-4× (#13)
 51e8a4f  pp_handoff_bench — pipeline-parallel handoff: one link/hop, distance-free, bubble-bound (#14)
 5814272  decode_estimate — replace flat 2×-tree comm proxy with measured per-collective costs
-(this)   moe_dispatch_bench — Bruck logarithmic-index all-to-all (variant e, dead end, #15)
+080a70a  moe_dispatch_bench — Bruck logarithmic-index all-to-all (variant e, dead end, #15)
+(this)   moe_async_bench — dispatch+combine all-to-all || real expert SwiGLU overlap (two-regime, #16)
 ```
 
 Cross-references in auto-memory: `reference_ring_attn_decode_cost`,
