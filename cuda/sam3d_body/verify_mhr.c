@@ -1,7 +1,5 @@
 /*
- * verify_mhr (CUDA) — sanity check for the speculative MHR-on-GPU
- * helpers (exploratory; Step 7 is officially CLOSED via CPU OpenMP per
- * PORT.md).
+ * verify_mhr (CUDA) — sanity check for MHR-on-GPU helper kernels.
  *
  * Validates that each GPU helper matches the CPU reference bit-exact (or
  * within 1 ULP) on deterministic-random inputs. No /tmp/sam3d_body_ref/
@@ -10,6 +8,7 @@
  *   - cuda_sam3d_body_debug_run_blend_shape       (45 → V*3)
  *   - cuda_sam3d_body_debug_run_face_expressions  (72 → V*3)
  *   - cuda_sam3d_body_debug_run_pose_correctives  (127×7 → V*3)
+ *   - cuda_sam3d_body_debug_run_lbs_skin          (127×8, V×3 → V×3)
  */
 
 #include "cuda_sam3d_body_runner.h"
@@ -76,7 +75,7 @@ int main(int argc, char **argv)
         .image_size      = 512,
         .device_ordinal  = device,
         .verbose         = verbose,
-        .precision       = "bf16",
+        .precision       = "fp16",
     };
     cuda_sam3d_body_ctx *ctx = cuda_sam3d_body_create(&cfg);
     if (!ctx) {

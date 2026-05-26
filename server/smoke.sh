@@ -30,8 +30,11 @@ request GET /models
 echo "[smoke] POST /v1/infer (sam3 — expect 'ckpt path not set' unless --sam3-ckpt was passed)"
 request POST /v1/infer '{"model":"sam3","task":"segmentation","backend":"cpu","inputs":{"text":"cat","image_base64":"aGVsbG8="}}'
 
-echo "[smoke] POST /v1/infer (sam3.1 — expect 501 pending_runner)"
+echo "[smoke] POST /v1/infer (sam3.1 cpu — expect 501, cuda-only)"
 request POST /v1/infer '{"model":"sam3.1","task":"segmentation","backend":"cpu","inputs":{"text":"cat","image_base64":"aGVsbG8="}}'
+
+echo "[smoke] POST /v1/infer (sam3.1 cuda — expect ckpt/path error unless --sam3-ckpt-v31 was passed)"
+request POST /v1/infer '{"model":"sam3.1","task":"segmentation","backend":"cuda","inputs":{"text":"cat","image_base64":"aGVsbG8="}}'
 
 echo "[smoke] POST /v1/infer (unsupported qwen backend)"
 request POST /v1/infer '{"model":"qwen-image","task":"text-to-image","backend":"cuda","inputs":{"text":"cat"},"params":{"width":64,"height":64,"steps":1}}'

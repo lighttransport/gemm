@@ -40,6 +40,9 @@ void paint_stage_vae_encode(paint_stage_vae *s,
                              CUdeviceptr d_vnc, CUdeviceptr d_ync);
 
 void paint_stage_vae_destroy(paint_stage_vae *s);
+/* Release transient TC scratch (xcol/yt/xbf) without unloading the module —
+ * call between encode and UNet load to give VRAM back. */
+void paint_stage_vae_free_scratch(paint_stage_vae *s);
 
 /* ===== UNet stage =========================================================
  * Wraps the dual-stream UNet2p5DConditionModel + per-step scheduler-driven
@@ -73,6 +76,17 @@ typedef struct {
 paint_stage_unet *paint_stage_unet_create(CUdevice dev,
                                            const char *unet_safetensors_path,
                                            const paint_unet_config *cfg);
+
+/* Select the active RA-cache chunk (0..PAINT_UNET_MAX_CHUNKS-1).
+ * Used by classifier-free guidance: run_dual is expensive (~half of UNet
+ * step). Each CFG chunk has invariant conditioning across timesteps, so we
+ * cache its RA tensors once. Caller pattern:
+ *   for c in 0..C-1: set_chunk(c); set_conditioning(...); run_dual()
+ *   for step in 0..N-1:
+ *     for c in 0..C-1: set_chunk(c); set_conditioning(...); run_step(...)
+ * set_conditioning is cheap (memcpy + small linear+LN); run_dual is not. */
+#define PAINT_UNET_MAX_CHUNKS 3
+void paint_stage_unet_set_chunk(paint_stage_unet *s, int chunk_id);
 
 void paint_stage_unet_set_conditioning(paint_stage_unet *s,
     const float *embeds_normal,           /* [N_gen, 4, H0, W0] */

@@ -96,7 +96,9 @@ static void compare_outputs(const float *cpu, const float *gpu, int n,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <mmproj.gguf> [--f16] [--image-size N]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <mmproj.gguf> [--f16] [--image-size N]\n"
+                        "                          [--warmup N] [--iters N] [--no-cpu]\n",
+                argv[0]);
         return 1;
     }
 
@@ -104,12 +106,23 @@ int main(int argc, char **argv) {
     int use_f16 = 0;
     int image_size = 0;  /* 0 = use model default */
     int verbose = 1;
+    int warmup = 0;      /* steady-state warmup encodes (timing not counted) */
+    int iters = 1;       /* timed encodes; >1 enables steady-state bench mode */
+    int no_cpu = 0;      /* skip the 1-thread CPU reference (slow at large sizes) */
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--f16") == 0) use_f16 = 1;
         else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) verbose = 2;
+        else if (strcmp(argv[i], "--no-cpu") == 0) no_cpu = 1;
         else if (strcmp(argv[i], "--image-size") == 0 && i + 1 < argc) {
             image_size = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            warmup = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+            iters = atoi(argv[++i]);
+            if (iters < 1) iters = 1;
         }
     }
 
@@ -153,6 +166,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Size the runner's scratch for the requested image (the model default is
+     * 768²/2304 patches; larger inputs need a bigger max_patches). Must be set
+     * before load_weights, which derives max_patches from max_pixels and allocates. */
+    cuda_vision_set_max_pixels(cuda_r, image_size * image_size);
+
     printf("Loading CUDA weights...\n");
     if (cuda_vision_load_weights(cuda_r, gguf) != 0) {
         fprintf(stderr, "Failed to load CUDA weights\n");
@@ -170,40 +188,8 @@ int main(int argc, char **argv) {
     float *rgb_norm = vision_normalize_image(vm, test_img, image_size, image_size);
     free(test_img);
 
-    /* CPU encoding */
-    printf("\n--- CPU Encoding ---\n");
-    double t0 = get_time_ms();
-    float *cpu_result = vision_encode(vm, rgb_norm, image_size, image_size, 1);
-    double t1 = get_time_ms();
-    printf("CPU time: %.1f ms\n", t1 - t0);
-
-    if (!cpu_result) {
-        fprintf(stderr, "CPU encoding failed!\n");
-        free(rgb_norm);
-        cuda_vision_free(cuda_r);
-        vision_free(vm);
-        gguf_close(gguf);
-        return 1;
-    }
-
-    /* GPU encoding */
-    printf("\n--- GPU Encoding ---\n");
-    double t2 = get_time_ms();
-    float *gpu_result = cuda_vision_encode(cuda_r, rgb_norm, image_size, image_size);
-    double t3 = get_time_ms();
-    printf("GPU time: %.1f ms\n", t3 - t2);
-
-    if (!gpu_result) {
-        fprintf(stderr, "GPU encoding failed!\n");
-        free(cpu_result);
-        free(rgb_norm);
-        cuda_vision_free(cuda_r);
-        vision_free(vm);
-        gguf_close(gguf);
-        return 1;
-    }
-
-    /* Compare — compute actual n_merged for the given image size */
+    /* Geometry — merged-token count drives tok/s (matches bench_pytorch_vision.py:
+     * tokens = (N/patch)^2 / merge^2). */
     int ps = vm->patch_size;
     int sp = vm->spatial_merge;
     int actual_gw = image_size / ps;
@@ -211,18 +197,85 @@ int main(int argc, char **argv) {
     int actual_n_merged = actual_n_patches / (sp * sp);
     int total_embd = cuda_vision_total_embd(cuda_r);
     int total_floats = actual_n_merged * total_embd;
-    printf("\nComparing %d merged tokens x %d embd = %d floats\n",
-           actual_n_merged, total_embd, total_floats);
+
+    /* CPU encoding (reference) — single-threaded; skip with --no-cpu for timing runs. */
+    double cpu_ms = 0.0;
+    float *cpu_result = NULL;
+    if (!no_cpu) {
+        printf("\n--- CPU Encoding ---\n");
+        double t0 = get_time_ms();
+        cpu_result = vision_encode(vm, rgb_norm, image_size, image_size, 1);
+        double t1 = get_time_ms();
+        cpu_ms = t1 - t0;
+        printf("CPU time: %.1f ms\n", cpu_ms);
+        if (!cpu_result) {
+            fprintf(stderr, "CPU encoding failed!\n");
+            free(rgb_norm);
+            cuda_vision_free(cuda_r);
+            vision_free(vm);
+            gguf_close(gguf);
+            return 1;
+        }
+    }
+
+    /* GPU encoding: warmup (NVRTC compile + cuBLAS init on first call), then
+     * `iters` timed encodes. Each cuda_vision_encode returns a fresh buffer that
+     * we free; the runner reuses its persistent device scratch. */
+    printf("\n--- GPU Encoding ---\n");
+    for (int w = 0; w < warmup; w++) {
+        float *tmp = cuda_vision_encode(cuda_r, rgb_norm, image_size, image_size);
+        if (!tmp) { fprintf(stderr, "GPU warmup encode failed!\n"); return 1; }
+        free(tmp);
+    }
+
+    float *gpu_result = NULL;
+    double gpu_sum = 0.0, gpu_min = 1e30, gpu_max = 0.0;
+    for (int it = 0; it < iters; it++) {
+        double ta = get_time_ms();
+        float *res = cuda_vision_encode(cuda_r, rgb_norm, image_size, image_size);
+        double tb = get_time_ms();
+        if (!res) {
+            fprintf(stderr, "GPU encoding failed!\n");
+            free(cpu_result);
+            free(rgb_norm);
+            cuda_vision_free(cuda_r);
+            vision_free(vm);
+            gguf_close(gguf);
+            return 1;
+        }
+        double dt = tb - ta;
+        gpu_sum += dt;
+        if (dt < gpu_min) gpu_min = dt;
+        if (dt > gpu_max) gpu_max = dt;
+        if (it == iters - 1) gpu_result = res;  /* keep last for comparison */
+        else free(res);
+    }
+    double gpu_mean = gpu_sum / iters;
+    printf("GPU time: mean %.1f ms  min %.1f ms  max %.1f ms  (%d iters, %d warmup)\n",
+           gpu_mean, gpu_min, gpu_max, iters, warmup);
+
+    /* Correctness comparison (only when CPU reference was computed) */
     float threshold = use_f16 ? 1e-2f : 1e-4f;
+    if (cpu_result) {
+        printf("\nComparing %d merged tokens x %d embd = %d floats\n",
+               actual_n_merged, total_embd, total_floats);
+        compare_outputs(cpu_result, gpu_result, total_floats,
+                         use_f16 ? "F16 GPU vs CPU" : "F32 GPU vs CPU", threshold);
+    }
 
-    compare_outputs(cpu_result, gpu_result, total_floats,
-                     use_f16 ? "F16 GPU vs CPU" : "F32 GPU vs CPU", threshold);
-
-    /* Timing summary */
+    /* Timing summary + throughput (tok/s on merged tokens) */
     printf("\n=== Timing Summary ===\n");
-    printf("  CPU (1 thread): %.1f ms\n", t1 - t0);
-    printf("  GPU:            %.1f ms\n", t3 - t2);
-    printf("  Speedup:        %.1fx\n", (t1 - t0) / (t3 - t2));
+    printf("  Image:          %dx%d  (%d merged tokens)\n",
+           image_size, image_size, actual_n_merged);
+    printf("  dtype:          %s\n", use_f16 ? "F16" : "F32");
+    if (cpu_result) {
+        printf("  CPU (1 thread): %.1f ms\n", cpu_ms);
+        printf("  Speedup:        %.1fx\n", cpu_ms / gpu_mean);
+    }
+    printf("  GPU mean:       %.1f ms  (%.1f tok/s)\n",
+           gpu_mean, 1000.0 * actual_n_merged / gpu_mean);
+    printf("  GPU min:        %.1f ms  (%.1f tok/s)\n",
+           gpu_min, 1000.0 * actual_n_merged / gpu_min);
 
     /* Cleanup */
     free(cpu_result);

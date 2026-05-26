@@ -159,6 +159,25 @@ def compile_one(M, K, N, BM, BN, BK, nw, ns, silu=0):
     return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
 
 
+def scrub_meta_paths(meta):
+    """Drop host-local absolute paths from Triton's generated metadata."""
+    meta = dict(meta)
+    libs = meta.get("extern_libs")
+    if isinstance(libs, list):
+        scrubbed = []
+        for item in libs:
+            if not (isinstance(item, list) and len(item) == 2 and isinstance(item[1], str)):
+                scrubbed.append(item)
+                continue
+            lib, path = item
+            marker = "site-packages/"
+            if marker in path:
+                path = path.split(marker, 1)[1]
+            scrubbed.append([lib, path])
+        meta["extern_libs"] = scrubbed
+    return meta
+
+
 def index_triton_cache():
     """Build {(num_warps, shared, BM, BN, BK): cache_dir}."""
     idx = {}
@@ -196,7 +215,8 @@ def main():
         dst = KERNELS_DIR / tag
         dst.mkdir(exist_ok=True)
         shutil.copy2(src / f"{kname}.hsaco", dst / "kernel.hsaco")
-        shutil.copy2(src / f"{kname}.json",  dst / "kernel.json")
+        meta = scrub_meta_paths(meta)
+        (dst / "kernel.json").write_text(json.dumps(meta, separators=(",", ": ")) + "\n")
         shapes_out.append({
             "tag": tag, "M_max": M, "K": K, "N": N,
             "BM": BM, "BN": BN, "BK": BK,

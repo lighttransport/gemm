@@ -85,6 +85,10 @@ def main():
                          "same conditioning each step). Dumps loop_x0.npy, "
                          "loop_timesteps.npy, loop_model_out_<i>.npy, "
                          "loop_x_after_<i>.npy.")
+    ap.add_argument("--vae", default=None,
+                    help="If set together with --steps, VAE-decode the final "
+                         "loop latent (with pipeline scaling 1/0.18215) and "
+                         "save loop_rgb_final.npy [Beff, 3, 8H, 8W].")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -262,6 +266,21 @@ def main():
             x = x_flat_new.reshape(B, N_pbr, N_gen, 4, H, W).to(device)
             print(f"  loop step {i:2d}: t={int(t):4d}  mo range=[{float(mo.min()):+.3f},{float(mo.max()):+.3f}]  "
                   f"x range=[{float(x.min()):+.3f},{float(x.max()):+.3f}]",
+                  file=sys.stderr)
+
+        if args.vae is not None:
+            from diffusers import AutoencoderKL
+            vae = AutoencoderKL.from_pretrained(args.vae, torch_dtype=torch.float32).eval().to(device)
+            scaling = 0.18215
+            with torch.no_grad():
+                latent = x.reshape(B * N_pbr * N_gen, 4, H, W).to(device)
+                rgb = vae.decode(latent / scaling, return_dict=False)[0]
+            np.save(os.path.join(args.outdir, "loop_rgb_final.npy"),
+                    rgb.detach().cpu().numpy().astype(np.float32))
+            np.save(os.path.join(args.outdir, "loop_x_final.npy"),
+                    latent.detach().cpu().numpy().astype(np.float32))
+            print(f"  VAE decode: rgb shape={tuple(rgb.shape)} "
+                  f"range=[{float(rgb.min()):+.3f},{float(rgb.max()):+.3f}]",
                   file=sys.stderr)
 
         import json
