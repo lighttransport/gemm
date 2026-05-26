@@ -5,8 +5,11 @@ One HTTP service that dispatches /v1/infer across backends for a
 text-to-image prompt:
 
   - "ours-cpu":     shells out to cpu/qwen_image/test_qwen_image --generate <dit> <vae> <enc>
-  - "ours-cuda":    (advertised only if cuda/qwen_image/test_cuda_qwen_image exists)
+  - "ours-cuda":    cuda/qimg/test_cuda_qimg (advertised only when built); the dit
+                    selects FP8 vs native W4A4 FP4 (NVFP4 OMMA, sm_120a) by its keys
   - "pytorch-cuda": shells out to ref/qwen_image/gen_diffusers_reference.py
+
+Pages served: /qwen_image_compare (generic compare) and /qwen-image-fp4 (FP4 vs FP8).
 
 Variants register {dit, vae, text_encoder} triplets by convention.
 Each variant directory is expected to contain::
@@ -113,8 +116,17 @@ class Variant:
     __slots__ = ("name", "model_dir", "dit", "vae", "enc", "kind")
     def __init__(self, name, model_dir):
         self.name = name
-        self.model_dir = os.path.abspath(model_dir)
-        self.dit, self.vae, self.enc = detect_triplet(self.model_dir)
+        p = os.path.abspath(model_dir)
+        if os.path.isfile(p):
+            # Explicit dit file (e.g. .../qwen-image/diffusion-models/qwen-image-fp4-omma.safetensors):
+            # use it directly and auto-detect vae/enc from the model root (the dit's grandparent dir).
+            # Lets several variants (fp4 vs fp8) live in one diffusion-models/ dir and share vae/encoder.
+            self.dit = p
+            self.model_dir = os.path.dirname(os.path.dirname(p))
+            _, self.vae, self.enc = detect_triplet(self.model_dir)
+        else:
+            self.model_dir = p
+            self.dit, self.vae, self.enc = detect_triplet(self.model_dir)
         self.kind = detect_kind(self.dit)
 
 
@@ -184,7 +196,14 @@ class OursCpuBackend:
 
 
 class OursCudaBackend:
-    """cuda/qwen_image/test_cuda_qwen_image — optional, advertised only when built."""
+    """cuda/qimg/test_cuda_qimg --generate --dit <> --vae <> --enc <> --prompt ... --out <ppm>.
+
+    Native CUDA runner. The dit auto-selects its path by the checkpoint's keys:
+    a Nunchaku NVFP4 OMMA checkpoint (transformer_blocks.0.attn.to_q.qweight_fp4)
+    runs the native W4A4 FP4 GEMM on sm_120a; an FP8 checkpoint runs the FP8 path.
+    So 'fp4' vs 'fp8' is just a different --dit. One-shot per request (reloads
+    weights each call), so expect ~tens of seconds per generation.
+    """
     def __init__(self, bin_path):
         self.bin = os.path.abspath(bin_path)
         self.lock = threading.Lock()
@@ -200,15 +219,23 @@ class OursCudaBackend:
         height = int(req.get("height") or 256)
         steps  = int(req.get("steps")  or 20)
         seed   = int(req.get("seed")   or 42)
+        # The runner's NVRTC FP4 (sm_120a) path needs CUDA 12.9 libs + the driver.
+        env = dict(os.environ)
+        cuda_libs = "/usr/local/cuda-12.9/lib64:/usr/local/cuda/lib64"
+        env["LD_LIBRARY_PATH"] = (
+            cuda_libs + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""))
         with self.lock, tempfile.TemporaryDirectory() as td:
-            out_path = os.path.join(td, "out.png")
-            cmd = [self.bin, "--generate", variant.dit, variant.vae, variant.enc,
+            out_path = os.path.join(td, "out.ppm")
+            cmd = [self.bin, "--generate",
+                   "--dit", variant.dit, "--vae", variant.vae, "--enc", variant.enc,
                    "--prompt", prompt,
                    "--width", str(width), "--height", str(height),
                    "--steps", str(steps), "--seed", str(seed),
                    "--out", out_path]
             t0 = time.time()
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            # cwd=td so the runner's stray latent dumps (cuda_latent*.npy/bin) land
+            # in the throwaway temp dir instead of polluting the repo.
+            proc = subprocess.run(cmd, capture_output=True, text=True, cwd=td, env=env)
             dt_ms = int((time.time() - t0) * 1000)
             if proc.returncode != 0 or not os.path.isfile(out_path):
                 raise RuntimeError(
@@ -288,6 +315,11 @@ def make_handler(backends, variants, default_variant, web_root):
             if path in ("/", "/qwen_image_compare", "/qwen_image_compare.html"):
                 self._serve_file(
                     os.path.join(web_root, "qwen_image_compare.html"),
+                    "text/html; charset=utf-8")
+                return
+            if path in ("/qwen-image-fp4", "/qwen-image-fp4.html", "/qwen_image_fp4"):
+                self._serve_file(
+                    os.path.join(web_root, "qwen-image-fp4.html"),
                     "text/html; charset=utf-8")
                 return
             if path == "/health":
@@ -385,8 +417,8 @@ def main():
                     default=os.path.join(repo_root, "cpu", "qwen_image",
                                          "test_qwen_image"))
     ap.add_argument("--cuda-bin",
-                    default=os.path.join(repo_root, "cuda", "qwen_image",
-                                         "test_cuda_qwen_image"))
+                    default=os.path.join(repo_root, "cuda", "qimg",
+                                         "test_cuda_qimg"))
     ap.add_argument("--ref-script",
                     default=os.path.join(here, "gen_diffusers_reference.py"))
     ap.add_argument("--ref-python", default=sys.executable,
