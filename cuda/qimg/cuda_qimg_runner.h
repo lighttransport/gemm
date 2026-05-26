@@ -1296,6 +1296,7 @@ struct cuda_qimg_runner {
     CUfunction quant_act_perrow_int8;   /* X f32 -> Xq int8 + xscale[n_tok] */
     CUfunction gemm_w8a8_perrow;        /* int8 GEMM, naive (any shape) */
     CUfunction gemm_int8_pipe_perrow;   /* int8 mma.sync GEMM (n_out%256,n_in%32,n_tok>=16) */
+    CUfunction gemm_int8_pipe_perrow_mt4; /* MTILE=4 (64 rows/CTA), n_tok%64==0 */
     CUdeviceptr d_xq_int8;              /* [max_n_tok * max_n_in] int8, lazily grown */
     size_t      xq_int8_n;
     CUdeviceptr d_x_iscale;             /* [max_n_tok] f32 per-token act scale */
@@ -2146,8 +2147,26 @@ static void op_gemm(cuda_qimg_runner *r, CUdeviceptr Y, CUdeviceptr W,
                 void *ga[] = {&Y, &Wq, &wscale, &X, &bias, &n_out, &n_in, &n_tok,
                               &r->d_row_max_buf};
                 unsigned gx = (unsigned)((n_out + 255) / 256);
+                gx = (gx + 3u) & ~3u;
+                /* MTILE=4 (64 rows/CTA) halves the row-tile count -> halves W
+                 * traffic, and the MT2 kernel is W-memory-bandwidth-bound here.
+                 * Same numerics (bit-exact). BUT halving rows/CTA also halves the
+                 * CTA count, and MT4's 128 s32 accumulators raise register pressure
+                 * (occupancy cap 3 vs MT2's 4): below ~512 rows the GPU is left
+                 * underfilled and MT4 is a wash/slight loss (measured 256^2: MT2
+                 * 1.80 vs MT4 1.85 s/step). Above it MT4 wins (512^2: 2.51 -> 2.33).
+                 * So gate on n_tok >= 512 to take the win without the small-M regression. */
+                if (!getenv("QIMG_DISABLE_INT8_MT4") && r->gemm_int8_pipe_perrow_mt4 &&
+                    n_tok >= 512 && (n_tok % 64) == 0) {
+                    unsigned gy4 = (unsigned)((n_tok + 63) / 64);
+                    gy4 = (gy4 + 3u) & ~3u;
+                    size_t smem4 = 2048 + 8192 * 2 + (64 + 64 + 256) * sizeof(float);
+                    cuLaunchKernel(r->gemm_int8_pipe_perrow_mt4, gx, gy4, 1, 128, 1, 1,
+                                   smem4, r->stream, ga, NULL);
+                    return;
+                }
                 unsigned gy = (unsigned)((n_tok +  31) /  32);
-                gx = (gx + 3u) & ~3u; gy = (gy + 3u) & ~3u;
+                gy = (gy + 3u) & ~3u;
                 size_t smem = 1024 + 8192 * 2 + (32 + 32 + 256) * sizeof(float);
                 cuLaunchKernel(r->gemm_int8_pipe_perrow, gx, gy, 1, 128, 1, 1,
                                smem, r->stream, ga, NULL);
@@ -3248,6 +3267,162 @@ static const char *int8_kernels_src =
 "        }\n"
 "    }\n"
 "}\n"
+/* MTILE=4 (64 rows/CTA) variant of gemm_int8_pipe_perrow. At the qimg workload
+ * sizes (n_tok=256/1024) the MT2 kernel is W-memory-bandwidth-bound: each 32-row
+ * tile re-reads the CTA's full W panel from DRAM, so total W traffic scales as
+ * n_tok/32. Doubling rows/CTA halves the row-tile count -> halves W traffic and
+ * roughly doubles throughput. Identical numerics (same mma, same direct A-frag
+ * load, same per-row x per-channel dequant) so still bit-exact. Gate (caller):
+ * n_tok % 64 == 0, n_out % 256 == 0, n_in % 32 == 0. */
+"__global__ __launch_bounds__(128, 3)\n"
+"void gemm_int8_pipe_perrow_mt4(float *Y, const signed char *W, const float *wscale,\n"
+"                                const float *X, const float *bias,\n"
+"                                int n_out, int n_in, int n_tok, const float *row_max) {\n"
+"    extern __shared__ unsigned char i8pr4_smem[];\n"
+"    signed char *smX  = (signed char *)i8pr4_smem;\n"                  /* 64 x 32 s8 = 2048 */
+"    signed char *smW0 = (signed char *)(i8pr4_smem + 2048);\n"        /* double-buffered W */
+"    signed char *smW1 = (signed char *)(i8pr4_smem + 2048 + 8192);\n"
+"    float *smInv = (float *)(i8pr4_smem + 2048 + 8192 + 8192);\n"     /* 64 inv */
+"    float *smFwd = smInv + 64;\n"                                     /* 64 fwd */
+"    float *smWsc = smFwd + 64;\n"                                     /* 256 per-channel scale */
+"    int blk_lin = blockIdx.y * gridDim.x + blockIdx.x;\n"
+"    int npx_ = gridDim.x; int npy_ = gridDim.y;\n"
+"    int panels_m_ = (npy_ + 3) >> 2;\n"
+"    int per_panel_ = 16;\n"
+"    int panel_id_ = blk_lin / per_panel_;\n"
+"    int in_panel_ = blk_lin - panel_id_ * per_panel_;\n"
+"    int panel_m_id_ = panel_id_ - (panel_id_ / panels_m_) * panels_m_;\n"
+"    int panel_n_id_ = panel_id_ / panels_m_;\n"
+"    int m_in_ = in_panel_ & 3; int n_in__ = in_panel_ >> 2;\n"
+"    int tile_m_ = (panel_m_id_ << 2) + m_in_;\n"
+"    int tile_n_ = (panel_n_id_ << 2) + n_in__;\n"
+"    if (tile_m_ >= npy_ || tile_n_ >= npx_) return;\n"
+"    int tok_base = tile_m_ * 64;\n"                                   /* MTILE=4 -> 64 rows/CTA */
+"    int warp_id  = threadIdx.x / 32;\n"
+"    int out_base_cta = tile_n_ * 256;\n"
+"    int out_base = out_base_cta + warp_id * 64;\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int gid  = lane / 4; int tid4 = lane & 3; int tid = threadIdx.x;\n"
+"    if (tok_base >= n_tok) return;\n"
+"    if (out_base_cta >= n_out) return;\n"
+"    if (tid < 64) {\n"
+"        int r = tok_base + tid;\n"
+"        float mx = (r < n_tok) ? row_max[r] : 0.0f;\n"
+"        float fwd, inv;\n"
+"        if (mx > 1e-30f) { fwd = mx / 127.0f; inv = 127.0f / mx; }\n"
+"        else             { fwd = 1.0f;        inv = 1.0f;        }\n"
+"        smInv[tid] = inv; smFwd[tid] = fwd;\n"
+"    }\n"
+"    for (int i = tid; i < 256; i += blockDim.x) {\n"
+"        int c = out_base_cta + i;\n"
+"        smWsc[i] = (c < n_out) ? wscale[c] : 0.0f;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    int d0[4][8]; int d1[4][8]; int d2[4][8]; int d3[4][8];\n"
+"#pragma unroll\n"
+"    for (int mt = 0; mt < 4; mt++)\n"
+"#pragma unroll\n"
+"        for (int i = 0; i < 8; i++) { d0[mt][i]=0; d1[mt][i]=0; d2[mt][i]=0; d3[mt][i]=0; }\n"
+"    int n_ktiles = n_in / 32;\n"
+"#define LOAD_W_I8_4(buf, ktile) do {\\\n"
+"        int _k = (ktile) * 32;\\\n"
+"        int _r0 = 2 * tid; int _r1 = _r0 + 1;\\\n"
+"        unsigned int _d0 = (unsigned int)__cvta_generic_to_shared((buf) + _r0 * 32);\\\n"
+"        unsigned int _d1 = (unsigned int)__cvta_generic_to_shared((buf) + _r1 * 32);\\\n"
+"        const signed char *_s0 = W + (size_t)(out_base_cta + _r0) * n_in + _k;\\\n"
+"        const signed char *_s1 = W + (size_t)(out_base_cta + _r1) * n_in + _k;\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d0),     \"l\"(_s0));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d0+16),  \"l\"(_s0+16));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d1),     \"l\"(_s1));\\\n"
+"        asm volatile(\"cp.async.ca.shared.global [%0],[%1],16;\\n\"::\"r\"(_d1+16),  \"l\"(_s1+16));\\\n"
+"    } while (0)\n"
+"    LOAD_W_I8_4(smW0, 0); asm volatile(\"cp.async.commit_group;\\n\");\n"
+"    if (n_ktiles > 1) { LOAD_W_I8_4(smW1, 1); asm volatile(\"cp.async.commit_group;\\n\"); }\n"
+"    for (int kt = 0; kt < n_ktiles; kt++) {\n"
+"        int k = kt * 32;\n"
+"        signed char *smW_cur = (kt & 1) ? smW1 : smW0;\n"
+"        /* Quant this k-tile of X into smX (64 rows): each thread does 2 rows (srow, srow+32). */\n"
+"        int srow_a = tid / 4; int scol = (tid & 3) * 8;\n"
+"#pragma unroll\n"
+"        for (int rep = 0; rep < 2; rep++) {\n"
+"            int srow = (rep == 0) ? srow_a : srow_a + 32;\n"
+"            int grow = tok_base + srow;\n"
+"            float x_inv = smInv[srow];\n"
+"            float xv[8];\n"
+"            if (grow < n_tok) {\n"
+"                const float4 *xp = (const float4 *)&X[(long)grow * n_in + k + scol];\n"
+"                float4 v0 = xp[0]; float4 v1 = xp[1];\n"
+"                xv[0]=v0.x*x_inv;xv[1]=v0.y*x_inv;xv[2]=v0.z*x_inv;xv[3]=v0.w*x_inv;\n"
+"                xv[4]=v1.x*x_inv;xv[5]=v1.y*x_inv;xv[6]=v1.z*x_inv;xv[7]=v1.w*x_inv;\n"
+"            } else {\n"
+"                xv[0]=xv[1]=xv[2]=xv[3]=xv[4]=xv[5]=xv[6]=xv[7]=0;\n"
+"            }\n"
+"            unsigned int pk0=0, pk1=0;\n"
+"#pragma unroll\n"
+"            for (int i = 0; i < 4; i++) {\n"
+"                int q = __float2int_rn(xv[i]); if (q>127) q=127; else if (q<-127) q=-127;\n"
+"                pk0 |= ((unsigned int)(q & 0xff)) << (i*8);\n"
+"                int q2 = __float2int_rn(xv[i+4]); if (q2>127) q2=127; else if (q2<-127) q2=-127;\n"
+"                pk1 |= ((unsigned int)(q2 & 0xff)) << (i*8);\n"
+"            }\n"
+"            *(unsigned int *)(smX + srow * 32 + scol    ) = pk0;\n"
+"            *(unsigned int *)(smX + srow * 32 + scol + 4) = pk1;\n"
+"        }\n"
+"        /* Keep one W tile in flight (2-stage prefetch) to overlap DRAM load with mma. */\n"
+"        if (n_ktiles - kt >= 2) asm volatile(\"cp.async.wait_group 1;\\n\");\n"
+"        else                    asm volatile(\"cp.async.wait_group 0;\\n\");\n"
+"        __syncthreads();\n"
+"        /* Direct A-fragment load per PTX m16n8k32 8-bit layout (no ldmatrix). 4 M-tiles. */\n"
+"        unsigned int a0[4], a1[4], a2[4], a3[4];\n"
+"#pragma unroll\n"
+"        for (int mt = 0; mt < 4; mt++) {\n"
+"            int mr = mt * 16;\n"
+"            a0[mt] = *(const unsigned int *)(smX + (mr + gid    ) * 32 + tid4 * 4);\n"
+"            a1[mt] = *(const unsigned int *)(smX + (mr + gid + 8) * 32 + tid4 * 4);\n"
+"            a2[mt] = *(const unsigned int *)(smX + (mr + gid    ) * 32 + tid4 * 4 + 16);\n"
+"            a3[mt] = *(const unsigned int *)(smX + (mr + gid + 8) * 32 + tid4 * 4 + 16);\n"
+"        }\n"
+"#pragma unroll\n"
+"        for (int nt = 0; nt < 8; nt++) {\n"
+"            int bc_local = warp_id * 64 + nt * 8 + gid;\n"
+"            const signed char *bp = smW_cur + bc_local * 32 + tid4 * 4;\n"
+"            unsigned int b0 = *(const unsigned int *)bp;\n"
+"            unsigned int b1 = *(const unsigned int *)(bp + 16);\n"
+"#pragma unroll\n"
+"            for (int mt = 0; mt < 4; mt++) {\n"
+"                asm volatile(\n"
+"                    \"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32\\n\\t\"\n"
+"                    \"    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
+"                    : \"+r\"(d0[mt][nt]), \"+r\"(d1[mt][nt]), \"+r\"(d2[mt][nt]), \"+r\"(d3[mt][nt])\n"
+"                    : \"r\"(a0[mt]), \"r\"(a1[mt]), \"r\"(a2[mt]), \"r\"(a3[mt]), \"r\"(b0), \"r\"(b1));\n"
+"            }\n"
+"        }\n"
+"        if (kt + 2 < n_ktiles) {\n"
+"            signed char *smW_next = ((kt + 2) & 1) ? smW1 : smW0;\n"
+"            LOAD_W_I8_4(smW_next, kt + 2); asm volatile(\"cp.async.commit_group;\\n\");\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"#undef LOAD_W_I8_4\n"
+"#pragma unroll\n"
+"    for (int mt = 0; mt < 4; mt++) {\n"
+"        int mr = mt * 16;\n"
+"        int yr0 = tok_base + mr + gid; int yr1 = yr0 + 8;\n"
+"        float fwd0 = smFwd[mr + gid]; float fwd1 = smFwd[mr + gid + 8];\n"
+"#pragma unroll\n"
+"        for (int nt = 0; nt < 8; nt++) {\n"
+"            int yc0 = out_base + nt * 8 + tid4 * 2; int yc1 = yc0 + 1;\n"
+"            int c0 = yc0 - out_base_cta; int c1 = yc1 - out_base_cta;\n"
+"            float wsc0 = smWsc[c0]; float wsc1 = smWsc[c1];\n"
+"            float bv0 = (bias && yc0 < n_out) ? bias[yc0] : 0.0f;\n"
+"            float bv1 = (bias && yc1 < n_out) ? bias[yc1] : 0.0f;\n"
+"            if (yr0 < n_tok && yc0 < n_out) Y[(long)yr0*n_out+yc0] = to_bf16((float)d0[mt][nt]*(fwd0*wsc0)+bv0);\n"
+"            if (yr0 < n_tok && yc1 < n_out) Y[(long)yr0*n_out+yc1] = to_bf16((float)d1[mt][nt]*(fwd0*wsc1)+bv1);\n"
+"            if (yr1 < n_tok && yc0 < n_out) Y[(long)yr1*n_out+yc0] = to_bf16((float)d2[mt][nt]*(fwd1*wsc0)+bv0);\n"
+"            if (yr1 < n_tok && yc1 < n_out) Y[(long)yr1*n_out+yc1] = to_bf16((float)d3[mt][nt]*(fwd1*wsc1)+bv1);\n"
+"        }\n"
+"    }\n"
+"}\n"
 "#endif\n"
 "}\n";
 
@@ -3341,6 +3516,8 @@ cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
         r->gemm_w8a8_perrow = NULL;
     if (cuModuleGetFunction(&r->gemm_int8_pipe_perrow, module, "gemm_int8_pipe_perrow") != CUDA_SUCCESS)
         r->gemm_int8_pipe_perrow = NULL;
+    if (cuModuleGetFunction(&r->gemm_int8_pipe_perrow_mt4, module, "gemm_int8_pipe_perrow_mt4") != CUDA_SUCCESS)
+        r->gemm_int8_pipe_perrow_mt4 = NULL;
     if (cuModuleGetFunction(&r->quant_f32_to_fp8_e4m3, module, "quant_f32_to_fp8_e4m3") != CUDA_SUCCESS)
         r->quant_f32_to_fp8_e4m3 = NULL;
     if (cuModuleGetFunction(&r->compute_x_scale_from_max, module, "compute_x_scale_from_max") != CUDA_SUCCESS)
