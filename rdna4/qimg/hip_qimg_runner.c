@@ -1058,14 +1058,22 @@ static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4
     hipModuleLaunchKernel(r->fn_gemm_int4w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,ga,NULL);
     if (rk > 0 && L->lora_down) {                                     /* rank-128 residual (skip for mod: rank 0) */
         if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
-        if ((size_t)rk*n_tok > r->i4_dt_cap) { hipFree(r->i4_dt); hipMalloc(&r->i4_dt,(size_t)rk*n_tok*4); r->i4_dt_cap=(size_t)rk*n_tok; }
-        if ((size_t)n_out*n_tok > r->i4_dly_cap) { hipFree(r->i4_dly); hipMalloc(&r->i4_dly,(size_t)n_out*n_tok*4); r->i4_dly_cap=(size_t)n_out*n_tok; }
+        /* Growing these shared scratch buffers means hipFree+hipMalloc; sync
+         * first so we never free a buffer a prior launch is still reading. Skip
+         * and the GEMM faults at the first bigger output (img_mlp_fc1, 12288) and
+         * the whole queue hangs. */
+        if ((size_t)rk*n_tok > r->i4_dt_cap) { hipDeviceSynchronize(); hipFree(r->i4_dt); hipMalloc(&r->i4_dt,(size_t)rk*n_tok*4); r->i4_dt_cap=(size_t)rk*n_tok; }
+        if ((size_t)n_out*n_tok > r->i4_dly_cap) { hipDeviceSynchronize(); hipFree(r->i4_dly); hipMalloc(&r->i4_dly,(size_t)n_out*n_tok*4); r->i4_dly_cap=(size_t)n_out*n_tok; }
         float *ldf=r->i4_ldf,*luf=r->i4_luf,*dt=r->i4_dt,*dly=r->i4_dly;
         int ldn=rk*n_in, lun=n_out*rk; void *e1[]={(void*)&L->lora_down,&ldf,&ldn}, *e2[]={(void*)&L->lora_up,&luf,&lun};
         hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((ldn+255)/256),1,1,256,1,1,0,NULL,e1,NULL);
         hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((lun+255)/256),1,1,256,1,1,0,NULL,e2,NULL);
         op_gemm(r, dt, ldf, X, NULL, rk, n_in, n_tok); op_gemm(r, dly, luf, dt, NULL, n_out, rk, n_tok);
         int ny=n_out*n_tok; void *aa[]={&Y,&dly,&ny}; hipModuleLaunchKernel(r->fn_add,(unsigned)((ny+255)/256),1,1,256,1,1,0,NULL,aa,NULL);
+        /* Drain before the next linear reuses the shared dt/dly scratch: 60
+         * blocks x ~6 unsynced launches each overruns the queue and deadlocks
+         * at the final block. ~0.06 ms/step cost; safe. */
+        hipDeviceSynchronize();
     }
 }
 
@@ -1766,6 +1774,20 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     return r;
 }
 
+/* Fill dst with the active HIP device's marketing name (e.g. "AMD Radeon RX
+ * 9070 XT"). Returns 0 on success. Used by callers to prove the GEMM/VAE work
+ * actually targets the GPU. */
+int hip_qimg_device_name(const hip_qimg_runner *r, char *dst, size_t cap) {
+    if (!r || !dst || cap == 0) return -1;
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, r->device_id) != hipSuccess) {
+        snprintf(dst, cap, "(unknown)");
+        return -1;
+    }
+    snprintf(dst, cap, "%s", props.name);
+    return 0;
+}
+
 /* ---- Load DiT ---- */
 
 /* The 12 logical linears per transformer block, in the order tools/nunchaku_convert_logical.py emits them
@@ -2143,6 +2165,42 @@ void hip_qimg_free(hip_qimg_runner *r) {
     free(r);
 }
 
+/* Free resident DiT weights (int4/bf16) to reclaim VRAM before VAE decode. The
+ * int4 model is 14 GB resident — keeping it through decode leaves too little for
+ * the VAE on a 16 GB card. Safe to call after the denoise loop; DiT is unusable
+ * afterward. */
+void hip_qimg_unload_dit(hip_qimg_runner *r) {
+    if (!r) return;
+    hipDeviceSynchronize();
+    /* Fused-QKV split linears alias one lora_down/lora_up/smooth across the 3
+     * descriptors, so free each unique device pointer exactly once. */
+    int n4 = r->int4_linears ? r->n_blocks * QIMG_INT4_PER_BLOCK : 0;
+    int nm = r->int4_mod ? r->n_blocks * 2 : 0;
+    size_t cap = (size_t)(n4 + nm) * 6 + 8;
+    void **seen = (void **)malloc(cap * sizeof(void *)); size_t ns = 0;
+    #define FREE1(p) do{ if(p){ size_t _j; for(_j=0;_j<ns;_j++) if(seen[_j]==(void*)(p)) break; \
+        if(_j==ns){ hipFree(p); seen[ns++]=(void*)(p);} (p)=NULL; } }while(0)
+    for (int i = 0; i < n4; i++) { qimg_int4_linear *L=&r->int4_linears[i];
+        FREE1(L->qint4); FREE1(L->wscale); FREE1(L->smooth); FREE1(L->lora_down); FREE1(L->lora_up); FREE1(L->bias); }
+    for (int i = 0; i < nm; i++) { qimg_int4_linear *L=&r->int4_mod[i];
+        FREE1(L->qint4); FREE1(L->wscale); FREE1(L->smooth); FREE1(L->lora_down); FREE1(L->lora_up); FREE1(L->bias); }
+    #undef FREE1
+    free(seen);
+    free(r->int4_linears); r->int4_linears = NULL;
+    free(r->int4_mod); r->int4_mod = NULL;
+    if (r->gpu_blocks) {
+        for (int i = 0; i < r->n_preloaded; i++) qimg_free_block(&r->gpu_blocks[i]);
+        free(r->gpu_blocks); r->gpu_blocks = NULL; r->n_preloaded = 0;
+    }
+    if (r->i4_ldf) { hipFree(r->i4_ldf); r->i4_ldf = NULL; }
+    if (r->i4_luf) { hipFree(r->i4_luf); r->i4_luf = NULL; }
+    if (r->i4_dt)  { hipFree(r->i4_dt);  r->i4_dt = NULL; r->i4_dt_cap = 0; }
+    if (r->i4_dly) { hipFree(r->i4_dly); r->i4_dly = NULL; r->i4_dly_cap = 0; }
+    r->n_blocks = 0; r->use_int4 = 0;
+    hipDeviceSynchronize();
+    { size_t f=0,t=0; hipMemGetInfo(&f,&t); fprintf(stderr,"hip_qimg: DiT unloaded; %.0f/%.0f MB free\n",f/1e6,t/1e6); }
+}
+
 
 /* ---- DiT single step ---- */
 
@@ -2233,6 +2291,17 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     int wp_rope = n_img / hp_rope;
     float rope_theta = 10000.0f;
     int t_dim_rope = 16, h_dim_rope = 56, w_dim_rope = 56;
+
+    /* Pre-size the int4 LoRA scratch once for this step's largest linear
+     * (rank-128 down, mlp_h-wide up, max(n_img,n_txt) tokens), so the per-block
+     * grow path never reallocs a buffer the GPU is mid-using. */
+    if (r->use_int4) {
+        int mt = n_img > n_txt ? n_img : n_txt;
+        if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
+        size_t need_dt=(size_t)128*mt, need_dly=(size_t)mlp_h*mt;
+        if (need_dt > r->i4_dt_cap)  { hipFree(r->i4_dt);  hipMalloc(&r->i4_dt,  need_dt*4);  r->i4_dt_cap=need_dt; }
+        if (need_dly> r->i4_dly_cap) { hipFree(r->i4_dly); hipMalloc(&r->i4_dly, need_dly*4); r->i4_dly_cap=need_dly; }
+    }
 
     /* Pre-allocate per-block modulation buffers (avoid malloc/free inside loop) */
     void *d_t_silu = NULL, *d_img_mod = NULL, *d_txt_mod = NULL;
