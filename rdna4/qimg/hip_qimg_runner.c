@@ -148,7 +148,8 @@ struct hip_qimg_runner {
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
     hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
-    hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip;
+    hipFunction_t fn_rmsnorm_weighted, fn_fp8_roundtrip, fn_act_fp8_rt;
+    int act_fp8_rt;  /* QIMG_ACT_FP8_RT=1: per-row fp8/448 act roundtrip pre-GEMM (CUDA repro) */
     /* VAE kernels */
     hipFunction_t fn_vae_conv2d, fn_vae_rmsnorm, fn_vae_silu, fn_vae_up2x;
     hipFunction_t fn_vae_conv2d_3x3_wmma, fn_vae_conv2d_1x1_wmma;
@@ -1007,6 +1008,9 @@ static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
 /* Weight GEMM + BF16 truncation */
 static void op_wgemm_bf16(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
                           int n_out, int n_in, int n_tok) {
+    if (r->act_fp8_rt && r->fn_act_fp8_rt) {  /* CUDA-repro: lossy fp8/448 acts, accurate GEMM */
+        void *a[] = {&X, &n_in}; hipModuleLaunchKernel(r->fn_act_fp8_rt, (unsigned)n_tok, 1, 1, 256, 1, 1, 0, NULL, a, NULL);
+    }
     hipFunction_t quant_fn = r->fp8_act_scale_clamp ? r->fn_quantize_act_clamp :
                              (r->fp8_act_scale_scalar ? r->fn_quantize_act_scalar : r->fn_quantize_act_perrow);
     int fp8_fp8_eligible = (r->use_fp8_fp8w && !r->prefer_bf16_wmma && r->fn_gemm_fp8_fp8_pgr2 &&
@@ -1436,6 +1440,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         r->quant_stats_max = 80;
         e = getenv("QIMG_FP8_QUANT_STATS_MAX");
         if (e && atoi(e) > 0) r->quant_stats_max = atoi(e);
+        { const char *ar = getenv("QIMG_ACT_FP8_RT"); r->act_fp8_rt = (ar && atoi(ar)); }
         r->fp8_fp8_allow = getenv("QIMG_FP8_FP8_ALLOW");
         r->fp8_fp8_deny = getenv("QIMG_FP8_FP8_DENY");
         r->fp8_fp8_block_min = -1;
@@ -1501,6 +1506,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_cfg_combine, "cfg_combine_f32");
     GET(fn_rmsnorm_weighted, "rmsnorm_weighted_f32");
     GET(fn_fp8_roundtrip, "quantize_fp8_roundtrip_f32");
+    GET(fn_act_fp8_rt, "act_fp8_roundtrip_perrow");
     GET(fn_vae_conv2d, "vae_conv2d_f32");
     if (hipModuleGetFunction(&r->fn_vae_conv2d_3x3_wmma, mod, "vae_conv2d_3x3_wmma_f32") != hipSuccess)
         r->fn_vae_conv2d_3x3_wmma = NULL;

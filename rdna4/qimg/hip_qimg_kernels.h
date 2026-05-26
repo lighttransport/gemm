@@ -1382,6 +1382,22 @@ static const char hip_qimg_specific_kernels[] =
 "    x[i] = result;\n"
 "}\n"
 "\n"
+/* Per-row FP8 e4m3 activation roundtrip emulating CUDA's per-tensor max/448
+ * scheme (one row = one token, n_in cols): scale = maxabs/448, q=e4m3(x/scale),
+ * x = dequant(q)*scale. One block per row. Reproduces CUDA's lossy fp8 acts. */
+"__global__ void act_fp8_roundtrip_perrow(float *__restrict__ x, int n_in) {\n"
+"    int row = blockIdx.x; float *xr = x + (size_t)row*n_in;\n"
+"    float m=0; for(int j=threadIdx.x;j<n_in;j+=blockDim.x){float a=fabsf(xr[j]); if(a>m)m=a;}\n"
+"    __shared__ float sm[256]; sm[threadIdx.x]=m; __syncthreads();\n"
+"    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s&&sm[threadIdx.x+s]>sm[threadIdx.x])sm[threadIdx.x]=sm[threadIdx.x+s]; __syncthreads(); }\n"
+"    float sc=sm[0]/448.0f; if(sc<1e-12f)sc=1e-12f; float inv=1.0f/sc;\n"
+"    for(int j=threadIdx.x;j<n_in;j+=blockDim.x){ float v=xr[j]*inv; if(v>448.0f)v=448.0f; if(v<-448.0f)v=-448.0f;\n"
+"      unsigned bits; memcpy(&bits,&v,4); unsigned sign=bits>>31; int exp=(int)((bits>>23)&0xFF)-127; unsigned mant=bits&0x7FFFFF; int fe=exp+7; float r;\n"
+"      if(exp<-9)r=0; else if(fe<=0){unsigned fm=mant|0x800000;int sh=1-fe+20; if(sh>=24)r=0; else{unsigned q=(fm+(1u<<(sh-1)))>>sh; if(q>7)q=7; r=ldexpf((float)q/8.0f,-6); if(sign)r=-r;}}\n"
+"      else if(fe>=15)r=sign?-448.0f:448.0f; else{unsigned q=(mant+(1u<<19))>>20; if(q>7){q=0;fe++;} if(fe>=15)r=sign?-448.0f:448.0f; else{r=ldexpf(1.0f+(float)q/8.0f,fe-7); if(sign)r=-r;}}\n"
+"      xr[j]=r*sc; }\n"
+"}\n"
+"\n"
 
 /* ---- gemm_fp8w_bf16a_wmma_t: BF16-act × FP8-wt WMMA (gfx12 matrix cores)
  *
