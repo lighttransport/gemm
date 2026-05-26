@@ -51,9 +51,7 @@
   <h1>Qwen-Image FP4 <span class="badge">W4A4 OMMA</span></h1>
   <div class="sub">Fans one prompt across the checked <b>variants</b> on the CUDA backend and renders each image + timing — so you can compare native 4-bit (NVFP4 SVDQuant, sm_120a block-scale <code>mma.sync</code>) against FP8/BF16 on the same card.</div>
   <div class="note">
-    The <code>ours-cuda</code> runner (<code>cuda/qimg/test_cuda_qimg</code>) auto-selects its path from the checkpoint's keys: a Nunchaku <b>NVFP4 OMMA</b> dit runs the native W4A4 FP4 GEMM, an FP8 dit runs the FP8 path. Register the variants when launching the server, e.g.
-    <code>VARIANTS="fp4:/…/qwen-image/diffusion-models/qwen-image-fp4-omma.safetensors,fp8:/…/qwen-image/diffusion-models/qwen-image-fp4-repack-fp8.safetensors" ./server/run-qwen-compare.sh</code>.
-    Each generation is a one-shot process (weights reload per request), so expect tens of seconds per variant.
+    The <code>ours-cuda</code> runner (<code>cuda/qimg/test_cuda_qimg</code>) auto-selects its path from the checkpoint's keys: a Nunchaku <b>NVFP4 OMMA</b> dit runs the native W4A4 FP4 GEMM, an FP8 dit runs the FP8 path — all sharing the same VAE + text encoder, so only the DiT differs. The default <code>./server/run-qwen-compare.sh</code> registers three: <b>fp4</b> (native W4A4), <b>fp8</b> (canonical <code>qwen_image_fp8_e4m3fn</code>), and <b>fp8-repack</b> (Nunchaku→dense FP8). Each generation is a one-shot process (weights reload per request), so expect tens of seconds per variant.
   </div>
 
   <form id="form" class="panel">
@@ -199,6 +197,21 @@ function mkCell(variant) {
   return sec;
 }
 
+// Map a /v1/progress snapshot to a short human label for the status pill.
+function phaseLabel(p) {
+  if (!p) return 'running';
+  switch (p.phase) {
+    case 'starting':  return 'starting';
+    case 'encode':    return 'text encoding';
+    case 'dit_load':  return 'loading DiT';
+    case 'dit':       return p.dit_total ? `DiT ${p.dit_step}/${p.dit_total}` : 'DiT';
+    case 'vae_load':  return 'loading VAE';
+    case 'vae':       return 'VAE decode';
+    case 'done':      return 'finishing';
+    default:          return p.phase || 'running';
+  }
+}
+
 let running = [];
 
 function cancelAll() {
@@ -220,9 +233,21 @@ async function runOne(variant, backend, body, grid) {
 
   const ctrl = new AbortController(); running.push(ctrl);
   const t0 = performance.now();
+  // Live phase label, refreshed by the /v1/progress poller below.
+  let phaseTxt = 'starting', lastGpu = '';
   const ticker = setInterval(() => {
-    pill.textContent = 'running ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
+    pill.textContent = phaseTxt + ' · ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
   }, 100);
+  // The sidecar streams the runner's per-step progress into GET /v1/progress.
+  // Variants run sequentially here, so the active job is this one.
+  const poller = setInterval(async () => {
+    try {
+      const r = await fetch('/v1/progress', { cache: 'no-store' });
+      const p = await r.json();
+      if (p && p.active) { phaseTxt = phaseLabel(p); if (p.gpu) lastGpu = p.gpu; }
+    } catch (_) {}
+  }, 250);
+  const stopTimers = () => { clearInterval(ticker); clearInterval(poller); };
 
   try {
     // This sidecar (qwen_image_server.py) reads backend + variant from params.
@@ -240,17 +265,19 @@ async function runOne(variant, backend, body, grid) {
       throw new Error(extractError(res, data));
     }
 
-    clearInterval(ticker);
+    stopTimers();
     const dt = ((performance.now() - t0) / 1000).toFixed(2) + 's';
     pill.className = 'pill'; pill.textContent = 'ok ' + dt;
 
     const out = (data.outputs && data.outputs[0]) || null;
     if (!out || !out.data_base64) throw new Error('no image output');
     const tm = data.timings_ms || {};
+    meta.style.whiteSpace = 'pre-line';
     meta.textContent =
       `${out.width||'?'}×${out.height||'?'}  ` +
       `infer=${tm.infer||0}ms total=${tm.total||0}ms` +
-      (data.variant_kind ? `  (${data.variant_kind})` : '');
+      (data.variant_kind ? `  (${data.variant_kind})` : '') +
+      (lastGpu ? `\n${lastGpu}` : '');
 
     const img = new Image();
     img.onload = () => {
@@ -260,7 +287,7 @@ async function runOne(variant, backend, body, grid) {
     };
     img.src = 'data:' + (out.mime || 'image/png') + ';base64,' + out.data_base64;
   } catch (e) {
-    clearInterval(ticker);
+    stopTimers();
     pill.className = 'pill err'; pill.textContent = 'error';
     errEl.style.display = 'block';
     errEl.textContent = String(e.message || e);
