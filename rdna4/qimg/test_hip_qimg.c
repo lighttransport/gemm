@@ -213,6 +213,7 @@ int main(int argc, char **argv) {
     const char *out_path = "hip_qimg_out.ppm";
     const char *mode = NULL;
     const char *init_bin_path = NULL;
+    const char *latent_bin_path = NULL;   /* --test-vae: VAE input latent [16,lat_h,lat_w] f32 */
     const char *txt_bin_path = NULL;
     const char *neg_txt_bin_path = NULL;
     const char *sigmas_bin_path = NULL;
@@ -264,6 +265,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-d") && i+1 < argc) device_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 2;
         else if (!strcmp(argv[i], "--init-bin") && i+1 < argc) init_bin_path = argv[++i];
+        else if (!strcmp(argv[i], "--latent-bin") && i+1 < argc) latent_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--txt-bin") && i+1 < argc) txt_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--neg-txt-bin") && i+1 < argc) neg_txt_bin_path = argv[++i];
         else if (!strcmp(argv[i], "--sigmas-bin") && i+1 < argc) sigmas_bin_path = argv[++i];
@@ -310,7 +312,9 @@ int main(int argc, char **argv) {
                     "  --dit <st>  --vae <st>  --enc <gguf>  --prompt <text>\n"
                     "  --height <h>  --width <w>  --steps <n>  --seed <s>\n"
                     "  [--cfg <scale> --negative <text>] [--neg-txt-bin <bin>]\n"
-                    "  [--dump-steps-prefix <pfx>] [--ref-final <bin>] [--path-stats] [--mem-stats]\n"
+                    "  [--init-bin <bin>] [--txt-bin <bin>] [--sigmas-bin <bin>]\n"
+                    "  [--latent-bin <bin>] (VAE input latent for --test-vae)\n"
+                    "  [--dump-final <bin>] [--dump-steps-prefix <pfx>] [--ref-final <bin>] [--path-stats] [--mem-stats]\n"
                     "  [--fp8-quant-stats] [--fp8-fp8-allow <labels>] [--fp8-fp8-deny <labels>]\n"
                     "  [--fp8-fp8-block-min <i>] [--fp8-fp8-block-max <i>]\n"
                     "  [--fp8-quality-target-db <db>]\n"
@@ -451,10 +455,20 @@ int main(int argc, char **argv) {
         }
         hip_qimg_load_vae(r, vae_path);
 
-        /* Generate random latent for testing */
-        rng_state = seed;
+        /* Input latent: pinned --latent-bin ([16,lat_h,lat_w] f32, fed directly,
+         * already post-denorm) > random for testing. */
         float *latent = (float *)malloc((size_t)16 * lat_h * lat_w * sizeof(float));
-        for (int i = 0; i < 16 * lat_h * lat_w; i++) latent[i] = randn() * 0.5f;
+        if (latent_bin_path) {
+            float *loaded = load_f32_bin(latent_bin_path, (size_t)16 * lat_h * lat_w);
+            if (!loaded) { free(latent); hip_qimg_free(r); return 1; }
+            memcpy(latent, loaded, (size_t)16 * lat_h * lat_w * sizeof(float));
+            free(loaded);
+            fprintf(stderr, "  loaded VAE input latent from %s [16,%d,%d]\n",
+                    latent_bin_path, lat_h, lat_w);
+        } else {
+            rng_state = seed;
+            for (int i = 0; i < 16 * lat_h * lat_w; i++) latent[i] = randn() * 0.5f;
+        }
 
         float *rgb = (float *)malloc((size_t)3 * out_h * out_w * sizeof(float));
         t0 = clock();
