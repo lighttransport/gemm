@@ -49,6 +49,11 @@ if(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
         ${ROOT_DIR}/rdna4/qimg/hip_qimg_runner.c
         ${ROOT_DIR}/rdna4/llm/hip_llm_runner.c
         ${ROOT_DIR}/rdna4/rocew.c)
+    # server.c already carries the SAFETENSORS / json implementations; tell
+    # hip_llm_runner.c to use declarations only (hip_qimg_runner.c already does)
+    # to avoid multiple-definition link errors.
+    set_source_files_properties(${ROOT_DIR}/rdna4/llm/hip_llm_runner.c
+        PROPERTIES COMPILE_DEFINITIONS "HIP_LLM_RUNNER_EXTERNAL_IMPLS=1")
 endif()
 
 if(DIFFUSION_SERVER_ENABLE_SAM3)
