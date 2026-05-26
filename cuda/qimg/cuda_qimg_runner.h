@@ -2976,10 +2976,10 @@ static int qimg_compile_fp4(cuda_qimg_runner *r) {
     CUmodule m=NULL; size_t bs=0;
     if (nvrtcGetCUBINSize && nvrtcGetCUBINSize(prog,&bs)==NVRTC_SUCCESS && bs>0) {
         char*bl=(char*)malloc(bs); nvrtcGetCUBIN(prog,bl); nvrtcDestroyProgram(&prog);
-        if (cuModuleLoadData(&m,bl)!=CUDA_SUCCESS) m=NULL; free(bl);
+        if (cuModuleLoadData(&m,bl)!=CUDA_SUCCESS) { m=NULL; } free(bl);
     } else {
         size_t ps=0; nvrtcGetPTXSize(prog,&ps); char*x=(char*)malloc(ps); nvrtcGetPTX(prog,x);
-        nvrtcDestroyProgram(&prog); if (cuModuleLoadData(&m,x)!=CUDA_SUCCESS) m=NULL; free(x);
+        nvrtcDestroyProgram(&prog); if (cuModuleLoadData(&m,x)!=CUDA_SUCCESS) { m=NULL; } free(x);
     }
     if (!m) return -1;
     r->fp4_module = m;
