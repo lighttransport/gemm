@@ -42,6 +42,10 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (threshold <= 1e-5f && getenv("CUDA_RUNNER_PRECISE_MATH") == NULL) {
+        setenv("CUDA_RUNNER_PRECISE_MATH", "1", 0);
+    }
+
     cuda_sam3d_config cfg = {0};
     cfg.safetensors_dir = sft_dir;
     cfg.pipeline_yaml   = yaml;
