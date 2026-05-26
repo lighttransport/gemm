@@ -70,9 +70,9 @@ static CUmodule compile_sm120a(const char* src){
     CUmodule m=NULL; size_t bs=0;
     if(nvrtcGetCUBINSize&&nvrtcGetCUBINSize(p,&bs)==NVRTC_SUCCESS&&bs>0){
         char*bl=malloc(bs); nvrtcGetCUBIN(p,bl); nvrtcDestroyProgram(&p);
-        if(cuModuleLoadData(&m,bl)!=CUDA_SUCCESS) m=NULL; free(bl);
+        if(cuModuleLoadData(&m,bl)!=CUDA_SUCCESS) { m=NULL; } free(bl);
     } else { size_t ps=0; nvrtcGetPTXSize(p,&ps); char*x=malloc(ps); nvrtcGetPTX(p,x);
-        nvrtcDestroyProgram(&p); if(cuModuleLoadData(&m,x)!=CUDA_SUCCESS) m=NULL; free(x); }
+        nvrtcDestroyProgram(&p); if(cuModuleLoadData(&m,x)!=CUDA_SUCCESS) { m=NULL; } free(x); }
     return m;
 }
 
@@ -86,7 +86,7 @@ static void run(unsigned int*sfa,unsigned int*sfb,float*out){
     CHECK_CUDA(cuMemcpyDtoH(out,g_dD,16*8*sizeof(float)));
 }
 
-int main(int argc, char** argv){
+int main(void){
     if(cuewInit(CUEW_INIT_CUDA|CUEW_INIT_NVRTC)!=CUEW_SUCCESS){fprintf(stderr,"cuewInit fail\n");return 1;}
     CHECK_CUDA(cuInit(0));
     CUdevice dev; CUcontext ctx; CHECK_CUDA(cuDeviceGet(&dev,0)); CHECK_CUDA(cuCtxCreate(&ctx,0,dev));
@@ -135,7 +135,7 @@ int main(int argc, char** argv){
     /* ---- byte->group probe. B group gq gets distinct value: g0=1,g1=2,g2=4,g3=0.5
        (codes 2,4,6,1). baseline out=16*(1+2+4+0.5)=120. Doubling sfa byte b of the
        row's feeding thread adds 16*v_{group(b)} -> identify group. ---- */
-    { int gcode[4]={2,4,6,1}; float gval[4]={1,2,4,0.5f};
+    { int gcode[4]={2,4,6,1}; float gval[4]={1,2,4,0.5f}; (void)gval;
       for(int n=0;n<8;n++) for(int k=0;k<64;k++) Bc[n][k]=gcode[k/16];
       for(int n=0;n<8;n++){unsigned v;for(int u=0;u<8;u++){v=0;for(int i=0;i<8;i++)v|=((unsigned)Bc[n][u*8+i]&0xF)<<(i*4);Bu[n*16+u]=v;}}
       CHECK_CUDA(cuMemcpyHtoD(g_dB,Bu,sizeof(Bu)));

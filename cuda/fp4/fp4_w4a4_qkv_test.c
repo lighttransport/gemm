@@ -12,7 +12,6 @@
 #include "cuew.h"
 #define CHECK_CUDA(c) do{CUresult e=(c);if(e!=CUDA_SUCCESS){const char*s;cuGetErrorString(e,&s);\
     fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,s);exit(1);}}while(0)
-static const float E2M1[16]={0,0.5f,1,1.5f,2,3,4,6,-0.f,-0.5f,-1,-1.5f,-2,-3,-4,-6};
 
 static void* rdbin(const char*p,size_t bytes){FILE*f=fopen(p,"rb");if(!f){fprintf(stderr,"open %s\n",p);exit(1);}
     void*b=malloc(bytes); if(fread(b,1,bytes,f)!=bytes){fprintf(stderr,"short %s\n",p);exit(1);} fclose(f);return b;}
@@ -65,7 +64,7 @@ static CUmodule compile_sm120a(const char*src){
     if(nvrtcGetCUBINSize&&nvrtcGetCUBINSize(p,&bs)==NVRTC_SUCCESS&&bs>0){char*bl=malloc(bs);nvrtcGetCUBIN(p,bl);
         nvrtcDestroyProgram(&p);if(cuModuleLoadData(&m,bl)!=CUDA_SUCCESS)m=NULL;free(bl);}
     else{size_t ps=0;nvrtcGetPTXSize(p,&ps);char*x=malloc(ps);nvrtcGetPTX(p,x);nvrtcDestroyProgram(&p);
-        if(cuModuleLoadData(&m,x)!=CUDA_SUCCESS)m=NULL;free(x);}
+        if(cuModuleLoadData(&m,x)!=CUDA_SUCCESS){m=NULL;}free(x);}
     return m;
 }
 
