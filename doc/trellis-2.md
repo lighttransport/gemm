@@ -40,25 +40,25 @@ Image (RGB)
 ┌──────────────────────────┐
 │  Stage 2: Shape DiT       │  SLatFlowModel (1.3B params)
 │  [N, 32] latent space     │  Sparse DiT, 12 steps, produces shape latent
-└──────────┬───────────────┘  (NOT YET IMPLEMENTED)
+└──────────┬───────────────┘  (CUDA DiT implemented)
            │
            ▼
 ┌──────────────────────────┐
 │  Stage 2: Shape Decoder   │  SC-VAE decoder
 │  shape latent → mesh      │  Vertices + faces + attributes
-└──────────┬───────────────┘  (NOT YET IMPLEMENTED)
+└──────────┬───────────────┘  (CUDA SC-VAE shape decoder implemented)
            │
            ▼
 ┌──────────────────────────┐
 │  Stage 3: Texture DiT     │  Texture flow model (1.3B params)
 │  shape + image → texture  │  12 steps, produces texture latent
-└──────────┬───────────────┘  (NOT YET IMPLEMENTED)
+└──────────┬───────────────┘  (CUDA DiT implemented)
            │
            ▼
 ┌──────────────────────────┐
 │  Stage 3: Texture Decoder │  SC-VAE texture decoder
 │  texture latent → PBR     │  Albedo, roughness, metallic maps
-└──────────┬───────────────┘  (NOT YET IMPLEMENTED)
+└──────────┬───────────────┘  (CUDA SC-VAE texture decoder implemented)
            │
            ▼
 ┌──────────────────────────┐
@@ -146,13 +146,15 @@ Output:       [1, 64, 64, 64] occupancy logits
 
 ResBlock3d: `GN(32) → SiLU → Conv3d → GN(32) → SiLU → Conv3d + skip`
 
-### Stages 2-3 (Not Yet Implemented)
+### Stages 2-3
 
 - **Stage 2 Shape**: Sparse DiT (1.3B), operates on sparse voxel coords from Stage 1.
   Two resolution variants: 512 and 1024 (cascade mode). Uses FlexGEMM for sparse conv.
 - **Stage 3 Texture**: Sparse DiT (1.3B), conditioned on shape + image.
   Produces texture latent decoded by SC-VAE to PBR material maps.
-- **Decoders**: SC-VAE (Sparse Convolutional VAE) for both shape and texture.
+- **Decoders**: SC-VAE (Sparse Convolutional VAE) for both shape and texture. CUDA
+  shape and texture decode paths are implemented; texture uses dense 8x C2S
+  because `tex_dec_next_dc_f16c32_fp16` has `pred_subdiv=false`.
 
 ## Implementation Status Matrix
 
@@ -179,9 +181,9 @@ ResBlock3d: `GN(32) → SiLU → Conv3d → GN(32) → SiLU → Conv3d + skip`
 | Stage 1 DiT + decoder (same noise) | ✓ CORRECT | 94% IoU with PyTorch reference |
 | Full pipeline (random noise) | ✓ WORKS | 7.8% occupancy with seed=42 |
 | Stage 2 shape flow DiT | ✓ IMPLEMENTED | Generic DiT, sparse RoPE, 12-step Euler + CFG |
-| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | GPU ConvNeXt + CPU C2S hybrid |
+| Stage 2 shape decoder (SC-VAE) | ✓ IMPLEMENTED | CUDA sparse ConvNeXt + C2S; host threshold compaction/hash build |
 | Stage 3 texture flow DiT | ✓ IMPLEMENTED | No CFG, [noise\|shape_norm] concat input |
-| Stage 3 texture decoder | ✓ IMPLEMENTED | Same GPU decoder, 6 output channels |
+| Stage 3 texture decoder | ✓ IMPLEMENTED | CUDA dense C2S SC-VAE; vertex-color OBJ export by default |
 | Cross-attn KV cache | ✓ IMPLEMENTED | Precomputed for all 30 blocks, saves ~2160 dispatches/stage |
 
 ### Stage 1: HIP/ROCm (AMD RX 9070 XT, GFX1201 / RDNA4)
@@ -221,10 +223,10 @@ ResBlock3d: `GN(32) → SiLU → Conv3d → GN(32) → SiLU → Conv3d + skip`
 | Component | CUDA | CPU | PyTorch Ref | Status |
 |-----------|------|-----|-------------|--------|
 | Sparse tensor infrastructure | — | `common/sparse3d.h` | — | CPU ops verified |
-| Stage 2 shape flow DiT | `cuda_trellis2_runner.c` | `trellis2_dit.h` | `run_stage2_ref.py` | **CUDA verified (corr=1.0)** |
-| Stage 2 shape decoder (SC-VAE) | — | `trellis2_shape_decoder.h` | — | CPU verified |
-| Stage 3 texture flow DiT | — | `trellis2_dit.h` | `run_stage3_tex_ref.py` | CPU 1-step verified |
-| Stage 3 texture decoder (SC-VAE) | — | `trellis2_shape_decoder.h` | — | CPU verified (small N) |
+| Stage 2 shape flow DiT | `cuda_trellis2_runner.c` | `trellis2_dit.h` | `run_stage2_ref.py` | **CUDA verified (corr=1.0); E2E smoke-tested** |
+| Stage 2 shape decoder (SC-VAE) | `cuda_trellis2_runner.c` | `trellis2_shape_decoder.h` | `gen_scvae_decoder_ref.py` | **CUDA verified vs PyTorch; exact coords on capped smoke** |
+| Stage 3 texture flow DiT | `cuda_trellis2_runner.c` | `trellis2_dit.h` | `run_stage3_tex_ref.py` | CUDA path implemented; needs fresh ref dump |
+| Stage 3 texture decoder (SC-VAE) | `cuda_trellis2_runner.c` | `trellis2_shape_decoder.h` | `gen_scvae_decoder_ref.py` | **CUDA verified vs PyTorch; dense C2S smoke** |
 | FDG mesh extraction | — | `trellis2_fdg_mesh.h` | — | CPU verified, .obj export |
 | Mesh extraction (marching cubes) | `test_cuda_trellis2.c` | `test_trellis2.c` | — | Both work |
 
@@ -267,9 +269,458 @@ All results below use **matched initial noise** (same tensor loaded from .npy).
 | Stage | CPU (Zen4, 16T) | CUDA (RTX 5060 Ti) | HIP (RX 9070 XT) | PyTorch (RX 9070 XT) |
 |-------|----------------|---------------------|-------------------|----------------------|
 | DINOv3 encode | ~3.5 min | — (CPU features) | — (CPU features) | ~10 sec |
-| Stage 1 DiT (12 steps, CFG) | ~9 hours | **~8 min** | **~42 sec** (BF16 WMMA) | ~110 sec |
+| Stage 1 DiT (12 steps, CFG) | ~9 hours | **~50 sec** estimated from 2026-05 sm_120 run | **~42 sec** (BF16 WMMA) | ~110 sec |
 | Decoder | ~6.3 min | ~0.5 sec | ~0.4 sec | ~0.2 sec |
-| **Total (DiT + decode only)** | **~9.5 hours** | **~8 min** | **~42 sec** | **~2 min** |
+| **Total (DiT + decode only)** | **~9.5 hours** | **~50 sec** estimated | **~42 sec** | **~2 min** |
+
+CUDA Stage 1/2/3 DiT uses F16 MMA GEMM for BF16/F16 weights and an MMA attention
+path for head_dim=128. The CUDA cross-attention KV cache is keyed by model,
+condition hash, and CFG slot: slot 0 for the active image condition and slot 1
+for the all-zero negative condition. This avoids rebuilding and evicting the KV
+cache on every conditioned/unconditioned CFG pass; a 2-step Stage 1 run now builds
+two caches total (`slot=0`, `slot=1`) and reuses both on step 2.
+
+### CUDA SC-VAE Decoders
+
+Implementation files:
+
+- `cuda/trellis2/cuda_trellis2_runner.c`: shape/texture decoder load/run paths.
+- `cuda/trellis2/cuda_trellis2_kernels.h`: sparse gather-map, C2S gather, residual repeat kernels.
+- `cuda/trellis2/verify_shape_decoder.c`: CPU-vs-CUDA SC-VAE decoder verifier
+- `ref/trellis2/gen_scvae_decoder_ref.py`: PyTorch SC-VAE decoder reference
+  generator with a tiny pure-PyTorch sparse-conv backend for parity checks.
+
+`verify_shape_decoder` also accepts external PyTorch references:
+`--ref-feats <npy> --ref-coords <npy>`. Add `--skip-cpu` when only the CUDA-vs-
+PyTorch comparison is needed.
+
+Default precision is F32 for the SC-VAE shape decoder because F16/MMA can change
+subdivision decisions near the `to_subdiv > 0` threshold. `T2_SHAPE_DEC_F16=1`
+enables the faster F16 path; `T2_SHAPE_DEC_F32=1` forces F32.
+
+Current capped smoke verification, RTX 5060 Ti, input `N=128` from the Fujisan
+Stage 2 one-step dump:
+
+```bash
+env XDG_RUNTIME_DIR=/run/user/1000 CUDA_RUNNER_PRECISE_MATH=1 \
+  ./cuda/trellis2/verify_shape_decoder \
+  /mnt/disk01/models/trellis2-4b/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors \
+  /tmp/trellis2_fujisan_s2_128_denorm.npy \
+  /tmp/trellis2_fujisan_s2_128_coords.npy
+```
+
+Result:
+
+| Mode | CPU output | CUDA output | Coord mismatch | Corr | Rel L2 | Max abs | CUDA SC-VAE time |
+|------|------------|-------------|----------------|------|--------|---------|------------------|
+| F32 default + precise math | N=3279,C=7 | N=3279,C=7 | 0 | 1.00000000 | 9.43e-7 | 2.75e-4 | ~175 ms |
+| `T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1` | — | N=3279,C=7 | 0 | 1.00000000 | 5.28e-7 | 8.39e-5 | ~100 ms |
+| `T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1 T2_SCVAE_CPUAVX_LN=1 T2_SCVAE_OUTPUT_GROUP=25 T2_SCVAE_OUTPUT_GROUP_FMA=1` | — | N=3279,C=7 | 0 | 1.00000000 | 5.07e-7 | 6.48e-5 | ~120 ms |
+| previous row + `T2_SCVAE_FINAL_LN_EPS=0.000009` | — | N=3279,C=7 | 0 | 1.00000000 | 5.02e-7 | 6.10e-5 | ~120 ms |
+
+Raw PyTorch fp32 CUDA reference for the same shape input is persisted in
+`ref/trellis2/dumps/shape_scvae_fujisan128/`. It bypasses the optional
+`cumesh` FDG mesh wrapper and instantiates the base SC-VAE decoder directly.
+Result vs CUDA: `N=3279,C=7`, coordinate mismatch `0`, correlation
+`1.00000000`, best full-output rel L2 `5.07e-7`, best full-output max abs
+`6.48e-5`.
+
+The F32 path keeps the CPU reference subdivision topology exactly on this smoke
+case. The F16 subnormal upload fix removed the old `~5e-3` raw-output drift, but
+the raw shape decoder is still above the `<1e-5` full-output max-abs target.
+The exact final projection is now below target when started from the saved
+PyTorch pre-output tensor:
+
+```bash
+env XDG_RUNTIME_DIR=/run/user/1000 T2SD_START_PRE_OUTPUT=1 \
+  T2_SCVAE_OUTPUT_GROUP=25 T2_SCVAE_OUTPUT_GROUP_FMA=1 \
+  ./cuda/trellis2/verify_shape_decoder \
+  /mnt/disk01/models/trellis2-4b/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors \
+  ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_pre_output_feats.npy \
+  ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_pre_output_coords.npy \
+  --start-stage 4 --start-block 0 \
+  --ref-feats ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_output_feats.npy \
+  --ref-coords ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_output_coords.npy \
+  --skip-cpu
+```
+
+This gives max abs `7.63e-6`; non-FMA pair32 is `1.14e-5`, scalar/cuBLAS-like
+orders are `~2.29e-5`. A closer PyTorch match is the cuBLASLt bias epilogue:
+
+```bash
+env XDG_RUNTIME_DIR=/run/user/1000 \
+  CUBLASEW_LT_WORKSPACE_BYTES=1048576 CUBLASEW_LT_MIN_ALIGNMENT_BYTES=4 \
+  T2_SCVAE_CUBLAS=1 T2_SCVAE_CUBLASLT_BIAS_GEMM=1 T2SD_START_PRE_OUTPUT=1 \
+  ./cuda/trellis2/verify_shape_decoder \
+  /mnt/disk01/models/trellis2-4b/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors \
+  ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_pre_output_feats.npy \
+  ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_pre_output_coords.npy \
+  --start-stage 4 --start-block 0 \
+  --ref-feats ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_output_feats.npy \
+  --ref-coords ref/trellis2/dumps/shape_scvae_fujisan128/pytorch_fp32_cuda_output_coords.npy \
+  --skip-cpu
+```
+
+That path is bit-exact (`max abs 0`) from saved PyTorch pre-output, including
+with `T2_SCVAE_CUBLAS=1`. Full-output drift is therefore dominated by upstream
+feature drift projected by `out_w`, not by the final projection GEMM.
+
+Current localization on the shape smoke:
+
+- Best pre-output max abs is `6.68e-6` with gather-GEMM sparse conv plus
+  `T2_SCVAE_CPUAVX_LN=1`, but that error direction projects to `8.01e-5`
+  full-output max abs.
+- Best full-output max abs is `6.48e-5` with packed sparse conv,
+  `T2_SCVAE_CPUAVX_LN=1`, and FMA group25 output. The fixed-pre-output
+  output-layer sweep found several equivalent projection orders (`group25_fma`,
+  `group27_fma`, `group50`, `group60`, `group62`) below the prior group32/FMA
+  `6.87e-5` max; larger groups return to `6.87e-5` or worse.
+  Reverse group/channel traversal probes (`T2_SCVAE_OUTPUT_GROUP_MODE=1/2/3`)
+  and bias-as-initial-accumulator grouped output
+  (`T2_SCVAE_OUTPUT_GROUP_BIASINIT=1`) tie the best PyTorch-reference max
+  on the group25/FMA path but do not reduce it further. Pairwise tree
+  reduction across group partials (`T2_SCVAE_OUTPUT_GROUP_TREE=1`) also ties
+  at group25/group27 and worsens for sampled groups such as group4, group50,
+  and group60.
+- Starting from exact PyTorch `stage3` features,
+  `T2_SCVAE_FINAL_WELFORD_LN=1` reproduces PyTorch CUDA's vectorized no-affine
+  final LayerNorm bit-exactly; with cuBLASLt bias output this path is also
+  bit-exact through final output. Enabling Welford for every intermediate
+  no-affine LN (`T2_SCVAE_WELFORD_LN=1`) is not the best full-smoke mode because
+  its remaining error direction projects worse than the CPUAVX LN path.
+- cuBLASLt parity work:
+  - `cublasew` now uses the CUDA-header-compatible
+    `cublasLtMatmulHeuristicResult_t` stride. The old 256-byte opaque record
+    made `CUBLASEW_LT_ALGO_INDEX>0` read garbage heuristic entries.
+  - `CUBLASEW_LT_WORKSPACE_BYTES=N` and
+    `CUBLASEW_LT_MIN_ALIGNMENT_BYTES=N` control the shared cuBLASLt preference.
+    PyTorch CUDA fp32 `linear()` on the stage2 block7 `1024 -> 256` MLP uses
+    cuBLASLt algo 20 with `1 MiB` workspace and split-K=2.
+  - With
+    `CUBLASEW_LT_WORKSPACE_BYTES=1048576 CUBLASEW_LT_MIN_ALIGNMENT_BYTES=4
+    T2_SCVAE_CUBLASLT_BIAS_GEMM=1`, isolated `stage2_b7` from exact PyTorch
+    post-LN input drops from `2.10e-5` to `3.81e-6`.
+  - Enabling that path globally gives the best pre-output max seen so far
+    (`6.63e-6`) but still produces `7.63e-5` full-output max, because the
+    remaining feature-direction error is amplified by the exact output layer.
+- Remaining blocker for `<1e-5` full-output:
+  - Starting from exact PyTorch `stage2` features, stage3 + final output is
+    `4.58e-5` max. Stage3 ConvNeXt block output is only `4.29e-6`, but stage3
+    C2S `conv2` reaches a one-ULP `7.63e-6` post-conv drift that is later
+    amplified.
+  - Full-run stage2 output is `2.86e-5` max vs PyTorch. The largest stage2 C2S
+    final drift comes through the repeated skip branch (`post_updown_x`), not
+    the stage2 C2S `conv2` result alone.
+  - Full-run localization with the current best flags shows `stage2_block7`
+    jumps from `1.14e-5` after `stage2_block6` to `2.48e-5`; inside that block
+    the MLP output is the visible amplifier. Forcing cuBLASLt only on
+    `stage2_block7` MLP2 reduces the block/stage2 max (`1.05e-5`/`1.53e-5`)
+    but worsens the final logits (`8.77e-5`), so it remains a probe only.
+  - Full-run stage3 C2S `conv2` is the last large amplifier: `post_conv2`
+    reaches `3.24e-5` with the packed sparse-conv path. Gather-GEMM,
+    no-bias cuBLASLt, direct sparse conv, precise math, and CPU gather-map
+    variants did not beat packed sparse conv on this smoke.
+  - Per-site sparse-conv probes (`T2SD_SPARSE_*`) confirm the same result when
+    only stage3 C2S `conv2` is changed: gather, cuBLASLt, and direct modes tie
+    or worsen the old `6.87e-5` full-output max. Stage3 ConvNeXt sparse-conv
+    per-block probes also tie or worsen the current best.
+  - Per-stage C2S no-affine Welford probes did not help the final output.
+    Stage2 reduces stage3 C2S `post_conv2` locally (`3.05e-5`) but projects to
+    a worse `1.11e-4` final max; stage3 ties the local C2S max and worsens the
+    output to `7.63e-5`.
+  - `T2_SCVAE_CUBLASLT_GEMM=1` adds a no-bias cuBLASLt route for sparse-conv
+    packed-row GEMMs. It is useful for algorithm probes but did not reduce the
+    stage3 C2S `conv2` max on the Fujisan `N=128` smoke.
+  - `T2_VERIFY_PROJECT_OUT=1` in `verify_shape_decoder` loads
+    `output_layer.weight` on the host and, for 64-channel intermediate
+    comparisons, reports the max final-logit delta implied by
+    `(cuda_feats - ref_feats) @ output_w.T`. With the current best full-run
+    flags and `T2SD_STOP_PRE_OUTPUT=1`, raw pre-output max is `7.87e-6` but the
+    projected output-delta max is `6.63e-5` at `row=2835 col=5`, matching the
+    observed final-output failure direction.
+  - Projection-screened probes on the Fujisan `N=128` smoke did not beat the
+    current best pre-output direction: `T2SD_CUBLASLT_MLP=2:7:2` raised the
+    projected max to `7.91e-5`, `T2SD_WELFORD_AFFINE_LN=2:7` to `7.23e-5`,
+    `T2_SCVAE_FINAL_WELFORD_LN=1` to `7.33e-5`, and final serial LN modes
+    tested at `7.79e-5`/`8.40e-5`.
+  - The projection diagnostic now also prints the largest channel
+    contributions for the worst projected row/output. Current best full-run
+    pre-output has top terms `c17=+1.49e-5`, `c34=-1.47e-5`,
+    `c19=+1.16e-5`, `c18=+1.13e-5`, `c40=+8.58e-6`, and
+    `c59=+8.22e-6`, so the failure is still a broad feature-direction drift.
+  - Exact-start projected localization: starting from saved PyTorch stage2
+    output (`--start-stage 3`) gives projected pre-output max `3.90e-5`;
+    starting from saved PyTorch stage1 output (`--start-stage 2`) gives
+    `5.49e-5`; full-run gives `6.63e-5`. Stage3 remains a real contributor,
+    but the full-run worst direction is seeded upstream.
+  - Stage3 C2S variants from exact stage2 did not improve projected max:
+    gather-GEMM for stage3 C2S conv2 tied baseline at `3.90e-5`, C2S norm2
+    Welford was `4.02e-5`, and C2S norm1 Welford was `4.23e-5`.
+  - cuBLASLt MLP2 stage3 probes from exact stage2 lowered local projected max
+    for blocks 0/1 (`3.28e-5`/`3.37e-5`), but the same block0 change worsened
+    full-run projected max to `8.10e-5` and full final output to `8.01e-5`.
+    Full-run stage3 MLP2 block 1/2/3 projected maxes were also worse
+    (`8.47e-5`, `8.39e-5`, `8.04e-5`).
+  - Full-run stage2 MLP2 cuBLASLt probes for blocks 0..7 also worsened the
+    projected pre-output direction; sampled maxes ranged from `7.48e-5` to
+    `1.05e-4`. Stage2 block6/7 and stage3 block0/1 MLP0 cuBLASLt probes were
+    numerically unchanged from baseline.
+  - Tracing the persistent worst rows through the saved PyTorch coordinate
+    hierarchy shows several share the same stage0 C2S parent row `110`, but
+    ancestor-row raw errors remain diffuse (`~2e-5` to `4e-5` L2 per row) and
+    do not expose one bad channel or one obviously broken child slot.
+  - Additional full-output projection probes: group21/group23 FMA worsen to
+    `6.87e-5`; group29/group31 FMA tie the current best `6.48e-5`.
+    Existing double-accumulation GEMM paths are worse (`9.16e-5` with bias
+    GEMMs, `8.77e-5` with all GEMMs), and pair32 output is `6.87e-5`.
+  - Automated Python `subprocess` sweeps hit `cuInit failed (100)` on this
+    machine even when direct verifier invocations work, so continue using direct
+    shell verifier runs for CUDA sweeps.
+  - Direct sparse-conv double-accumulation probes with the projected metric did
+    not help: stage3 C2S conv2 direct mode2 raised projected max to `7.35e-5`,
+    stage2 C2S conv2 direct mode2 to `9.58e-5`, and stage3 C2S conv1 direct
+    mode2 to `7.67e-5`.
+  - Stage-wide affine Welford LayerNorm probes all worsened the projected
+    pre-output direction: stage0 `7.94e-5`, stage1 `1.02e-4`, stage2
+    `8.78e-5`, and stage3 `8.47e-5`.
+  - Multi-site cuBLASLt MLP2 combination probes were enabled to test whether
+    individually bad directions cancel. Sampled combinations still worsened:
+    `2:7:2,3:0:2` -> `7.64e-5`, `2:1:2,3:0:2` -> `8.53e-5`,
+    `3:0:2,3:1:2` -> `7.91e-5`, and `2:1:2,2:7:2,3:0:2` -> `8.55e-5`.
+  - `T2SD_STOP_AFTER_C2S_OP=stage:7` returns `to_subdiv` logits as `[N,8]`
+    before host thresholding. All four stage logits are coordinate-exact and
+    well away from topology flips on the worst rows. Minimum positive margins:
+    stage0 `0.428`, stage1 `0.126`, stage2 `0.00242`, stage3 `0.00253`;
+    largest negative logit in stage3 is `-0.000290`. The persistent worst rows
+    have emitted-child logits far from zero, so subdivision topology is not the
+    hidden failure mode.
+  - Final no-affine LayerNorm epsilon is the only knob so far that reduces the
+    full-output max. `T2_SCVAE_FINAL_LN_EPS=0.000009` with group25/FMA lowers
+    final max from `6.48e-5` to `6.10e-5` and projected pre-output max from
+    `6.63e-5` to `6.28e-5`. This is an output-max cancellation/parity tradeoff:
+    PyTorch's `F.layer_norm` default is still `1e-5`. Tested `8.9e-6` and
+    `9.1e-6` tie `6.10e-5`; `8.5e-6`, `9.25e-6`, and output groups 27/31 or
+    cuBLASLt bias output are worse.
+  - Additional full-output probes with the `9e-6` final-LN eps did not improve
+    the max: CPU-built sparse gather maps, cuBLAS pedantic mode, cuBLAS for all
+    ConvNeXt MLP GEMMs, and `sqrtf` LayerNorm all tied `6.10e-5`. Output
+    group28/FMA also ties the max; `eps=9.2e-6` with group28 gives slightly
+    lower rel L2 (`5.01e-7`) but still maxes at `6.10e-5`. Group24/26 and
+    group28 with `eps=8.8e-6`/`9.6e-6` are worse (`6.48e-5` to `6.87e-5`).
+    Serial/double final-LN mode3 with `eps=9.2e-6` is also worse (`6.48e-5`).
+  - Exact-start downstream checks with the current best flags sharpen the
+    remaining target. Starting from saved PyTorch `stage3_block3` and running
+    stage3 C2S + final output gives `3.05e-5` max. Starting from saved PyTorch
+    `stage2_block7` and running stage2 C2S + stage3 + final output gives
+    `7.63e-5` with group25/`eps=9e-6`; group28 improves that exact-start path
+    to `6.87e-5`, and group28 with `eps=9.2e-6` improves it to `6.48e-5`, but
+    none of these improve the full-run max. Stage2 C2S alone from exact
+    `stage2_block7` is only `5.72e-6` max, and exact-stage2 through final LN
+    gives pre-output max `4.53e-6`; projected through `output_layer.weight`,
+    that pre-output drift is `5.93e-5` at `row=3201 col=4`. This confirms the
+    current bottleneck is a tiny C=64 drift direction, not a large local
+    feature error.
+  - Full-run group28/`eps=9.2e-6` output-order variants: mode1 ties the current
+    `6.10e-5` max with rel L2 `5.02e-7`, while modes 2 and 3 are worse
+    (`6.87e-5`).
+
+Additional debug knobs for this path:
+
+- `T2SD_STOP_AFTER_MLP_OP=stage:block:op`: stop inside the ConvNeXt MLP
+  (`op=0` after `mlp.0`, `op=1` after SiLU, `op=2` after `mlp.2`).
+- `T2SD_GROUP_MLP=stage:block:op:group`: force the grouped scalar-order GEMM
+  for one MLP op; `block=-1` and `op=-1` are wildcards.
+- `T2SD_CUBLASLT_MLP=stage:block:op`: force cuBLASLt bias GEMM for selected
+  ConvNeXt MLP ops; wildcards are the same as above. Multiple sites can be
+  separated with commas or semicolons.
+- `T2_SCVAE_WELFORD_AFFINE_LN=1`: use a PyTorch CUDA vectorized-Welford-order
+  affine LayerNorm for all affine SC-VAE LayerNorm sites.
+- `T2SD_WELFORD_AFFINE_LN=stage:block`: use the affine Welford LayerNorm for
+  one ConvNeXt block norm; `block=-1` is a stage wildcard.
+- `T2SD_WELFORD_AFFINE_C2S=stage`: use the affine Welford LayerNorm for one
+  C2S `norm1`; `stage=-1` applies to all C2S stages.
+- `T2SD_WELFORD_NOAFFINE_C2S=stage`: use the no-affine Welford LayerNorm for
+  one C2S `norm2`; `stage=-1` applies to all C2S stages.
+- `T2SD_SPARSE_PACKED=stage:block:op:value`: override packed sparse conv for
+  one site (`op=0` ConvNeXt conv, `op=1` C2S conv1, `op=2` C2S conv2; C2S
+  uses `block=-1`).
+- `T2SD_SPARSE_LT=stage:block:op`: force cuBLASLt no-bias GEMM for one sparse
+  conv site; same site numbering and wildcards as `T2SD_SPARSE_PACKED`.
+- `T2SD_SPARSE_DIRECT=stage:block:op:mode`: force direct sparse conv for one
+  sparse conv site (`mode=1/2/3` matches `T2_SCVAE_DIRECT_CONV`).
+- `T2SD_SPARSE_CUBLAS=stage:block:op`: force cuBLAS for one gather-GEMM sparse
+  conv site.
+- `T2_SCVAE_OUTPUT_GROUP_MODE=mode`: output-layer grouped GEMM traversal probe;
+  `mode` bit 0 reverses group order and bit 1 reverses channel order inside
+  each group.
+- `T2_SCVAE_OUTPUT_GROUP_BIASINIT=1`: start the output-layer grouped GEMM
+  accumulator from bias instead of adding bias after the dot product.
+- `T2_SCVAE_OUTPUT_GROUP_TREE=1`: reduce output-layer group partials with a
+  pairwise tree instead of sequential accumulation.
+- `T2_SCVAE_FINAL_WELFORD_LN=1`: use a PyTorch CUDA vectorized-Welford-order
+  no-affine LayerNorm only for the final `F.layer_norm` before `output_layer`.
+- `T2_SCVAE_WELFORD_LN=1`: use the same Welford no-affine LayerNorm for all
+  no-affine SC-VAE LayerNorm sites; useful for localization, not the current
+  best full-output mode.
+- `T2_VERIFY_PROJECT_OUT=1`: verifier-only diagnostic for 64-channel
+  intermediate comparisons. It reports the max output-layer-weighted feature
+  error without changing the CUDA decoder path.
+
+Small end-to-end smoke:
+
+```bash
+env XDG_RUNTIME_DIR=/run/user/1000 T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1 \
+  ./cuda/trellis2/test_cuda_trellis2 \
+  /mnt/disk01/models/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors \
+  /mnt/disk01/models/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors \
+  unused.npy --image fujisan.jpg --dinov3 /mnt/disk01/models/dinov3-vitl16/model.safetensors \
+  -n 1 --grid 32 \
+  --stage2 /mnt/disk01/models/trellis2-4b/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors \
+  --shape-dec /mnt/disk01/models/trellis2-4b/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors \
+  --sparse-threshold -1000 --max-sparse 16 --s2-steps 1 \
+  --s2-npy /tmp/trellis2_e2e_check_shape_s2_n16.npy \
+  --occ /tmp/trellis2_e2e_check_shape_occ_n16.npy \
+  -o /tmp/trellis2_e2e_check_shape_n16.obj
+```
+
+Measured in the Stage 3 smoke below: Stage 1 one step produced all-negative
+occupancy, so the smoke uses top-N sparse selection. Stage 2 DiT one step
+`586.8 ms`; CUDA SC-VAE shape decoder emitted `N=918,C=7`; shape OBJ written
+to `/tmp/trellis2_e2e_check_n16.obj_shape.obj`.
+
+Fix notes:
+
+- Sparse gather-map lookup now uses the same Fibonacci-hash slot as
+  `sp3d_hash_build`: `(key * 0x9E3779B97F4A7C15) & (capacity - 1)`. The old CUDA
+  lookup used a different modulo hash and broke sparse-conv neighbor maps.
+- ConvNeXt MLP activation is SiLU to match `SparseConvNeXtBlock3d`.
+- Dense C2S child-slot order now matches upstream PyTorch
+  `SparseChannel2Spatial`: for coords `(b,z,y,x)`, `subidx` bit 0 maps to `z`,
+  bit 1 maps to `y`, and bit 2 maps to `x`. The old C/CUDA order matched the
+  local C decoder but produced `7680` coord mismatches vs PyTorch on the
+  `N=1 -> 4096` texture smoke.
+- CUDA LayerNorm now has the two-pass no-affine variance path plus opt-in
+  PyTorch vectorized-Welford-order paths for no-affine and affine SC-VAE
+  LayerNorm. The final SC-VAE no-affine LayerNorm is bit-exact with PyTorch
+  CUDA under `T2_SCVAE_FINAL_WELFORD_LN=1`.
+- C2S norm, sparse conv, gather, conv2, and residual repeat are CUDA kernels.
+  The remaining CPU work is subdivision-list synthesis from logits and sparse
+  hash-table construction/upload for each scale.
+
+Texture decoder verification, RTX 5060 Ti, synthetic `N=1` input. The PyTorch
+reference tensors are persisted in `ref/trellis2/dumps/tex_scvae_tiny/`.
+
+Generate PyTorch fp32 CUDA reference:
+
+```bash
+cpu/trellis2/.venv/bin/python ref/trellis2/gen_scvae_decoder_ref.py \
+  --decoder /mnt/disk01/models/trellis2-4b/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors \
+  --outdir ref/trellis2/dumps/tex_scvae_tiny \
+  --prefix pytorch_fp32_cuda \
+  --device cuda --dtype fp32 --dump-stages
+```
+
+Compare CUDA decoder to C and PyTorch references:
+
+```bash
+env XDG_RUNTIME_DIR=/run/user/1000 ./cuda/trellis2/verify_shape_decoder \
+  /mnt/disk01/models/trellis2-4b/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors \
+  ref/trellis2/dumps/tex_scvae_tiny/pytorch_fp32_cuda_input_slat.npy \
+  ref/trellis2/dumps/tex_scvae_tiny/pytorch_fp32_cuda_input_coords.npy \
+  --ref-feats ref/trellis2/dumps/tex_scvae_tiny/pytorch_fp32_cuda_output_feats.npy \
+  --ref-coords ref/trellis2/dumps/tex_scvae_tiny/pytorch_fp32_cuda_output_coords.npy
+```
+
+Result: C, PyTorch, and CUDA all emit `N=4096,C=6` with coordinate mismatch `0`.
+
+| Reference | Corr | Rel L2 | Max abs |
+|-----------|------|--------|---------|
+| C fp32 vs CUDA fp32 | 1.00000000 | 2.91e-7 | 1.19e-6 |
+| PyTorch fp32 CUDA vs CUDA fp32 | 1.00000000 | 4.33e-7 | 2.18e-6 |
+
+The texture decoder has no `to_subdiv` head, so the CUDA path uses dense C2S:
+`1 -> 8 -> 64 -> 512 -> 4096`.
+
+Accuracy/speed knobs tested against the persisted fp32 CUDA PyTorch reference:
+
+| CUDA mode | Corr | Rel L2 | Max abs | Notes |
+|-----------|------|--------|---------|-------|
+| default F32 tiled GEMM + precise math | 1.00000000 | 4.332e-7 | 2.176e-6 | target `<1e-5` reached |
+| `T2_SCVAE_SERIAL_LN=4` | 1.00000000 | 5.166e-7 | 2.056e-6 | serial `1/sqrtf` block LayerNorm, slightly lower max |
+| `T2_SCVAE_CUBLAS=1` | 1.00000000 | 2.106e-7 | 9.537e-7 | best speed path and best numeric match on this smoke |
+| `T2_SCVAE_CUBLAS_BIAS_ONLY=1` | 1.00000000 | ~4e-7 | ~2e-6 | diagnostic dense-only cuBLAS path |
+| `T2_SCVAE_CUBLAS_MLP=1` | 1.00000000 | ~4e-7 | ~2e-6 | diagnostic MLP-only cuBLAS path |
+| `T2_SCVAE_CUBLAS_SPARSE=1` | 1.00000000 | ~4e-7 | ~2e-6 | diagnostic sparse-conv-only cuBLAS path |
+
+`T2_SCVAE_CUBLAS_PEDANTIC=1` produced the same result as normal cuBLAS on this
+smoke. The `<1e-5` max-abs target is reached; best verified max is
+`9.5367432e-7` with `T2_SCVAE_CUBLAS=1`.
+
+Debug stop hooks for the texture SC-VAE parity path:
+
+- `verify_shape_decoder --start-stage S --start-block B`: start CUDA from a
+  saved intermediate sparse tensor instead of running `from_latent`.
+- `T2SD_START_AT_OP=stage:block:op`: start a ConvNeXt block from a saved op
+  input (`op=1` post sparse conv, `op=2` post LayerNorm).
+- `T2SD_STOP_AFTER_OP=stage:block:op`: ConvNeXt op stop, where `op=0`
+  post sparse conv, `op=1` post affine LayerNorm, and `op=2` post MLP.
+- `T2SD_STOP_AFTER_C2S_OP=stage:op`: C2S op stop, where `op=0` pre-conv1,
+  `1` post-conv1, `2` post-updown `h`, `3` post-updown residual `x`,
+  `4` pre-conv2, `5` post-conv2, `6` final residual output, and `7`
+  `to_subdiv` logits before thresholding.
+- `T2SD_STOP_AT_START=1`: return the uploaded start tensor before any op.
+- `T2_VERIFY_DUMP_FEATS=/path.npy T2_VERIFY_DUMP_COORDS=/path.npy` dumps the
+  CUDA tensor emitted by the verifier stop point.
+
+Stage dumps localize the remaining texture error to sparse ConvNeXt/C2S
+accumulation order. All stage comparisons have coordinate mismatch `0`.
+
+| Stop point | Shape | Rel L2 | Max abs |
+|------------|-------|--------|---------|
+| `from_latent` | `N=1,C=1024` | 1.06e-7 | 1.19e-7 |
+| `stage3` / C2S final | `N=4096,C=64` | 3.50e-7 | 2.29e-4 |
+| `pre_output` | `N=4096,C=64` | 2.47e-7 | 1.43e-6 |
+| `output` | `N=4096,C=6` | 4.332e-7 | 2.176e-6 |
+
+Root cause for the previous `~2e-5` output drift was the CUDA runner's C-side
+F16->F32 upload for sparse-conv weights: F16 subnormal values were flushed to
+signed zero in `t2_upload_conv_transposed`. Several stage3 ConvNeXt dot products
+depend on those subnormals under heavy cancellation. Preserving subnormals
+reduces the stage3 block3 local post-LayerNorm max error from `1.47e-4` to
+`1.43e-6`, and the full output max from `1.97e-5` to `2.18e-6`.
+
+The shipped PyTorch config sets `use_fp16=true`. Against that official-dtype
+reference, CUDA fp32 is still coordinate-exact but the numeric error is looser
+(`rel_L2=6.10e-4`, max abs `0.00253`); the opt-in CUDA F16 path is similar
+(`rel_L2=6.94e-4`, max abs `0.00282`). The fp32 reference is the current tight
+numeric parity target.
+
+Stage 3 end-to-end smoke:
+
+```bash
+env XDG_RUNTIME_DIR=/run/user/1000 T2_SCVAE_CUBLAS=1 T2_SCVAE_PACKED_CONV=1 \
+  ./cuda/trellis2/test_cuda_trellis2 \
+  /mnt/disk01/models/trellis2-4b/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors \
+  /mnt/disk01/models/trellis-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors \
+  unused.npy --image fujisan.jpg --dinov3 /mnt/disk01/models/dinov3-vitl16/model.safetensors \
+  -n 1 --grid 32 \
+  --stage2 /mnt/disk01/models/trellis2-4b/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors \
+  --shape-dec /mnt/disk01/models/trellis2-4b/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors \
+  --stage3 /mnt/disk01/models/trellis2-4b/ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors \
+  --tex-dec /mnt/disk01/models/trellis2-4b/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors \
+  --sparse-threshold -1000 --max-sparse 16 --s2-steps 1 --s3-steps 1 \
+  --s2-npy /tmp/trellis2_e2e_check_s2_n16.npy \
+  --occ /tmp/trellis2_e2e_check_occ_n16.npy \
+  -o /tmp/trellis2_e2e_check_n16.obj
+```
+
+Measured output on the rebuilt CUDA binary: Stage 1 one step `4.56 s`, Stage 2
+one step `586.8 ms`, Stage 3 one step `292.3 ms`; shape SC-VAE emitted
+`N=918,C=7`, texture SC-VAE emitted `N=65536,C=6`, and vertex-colored OBJ was
+written to `/tmp/trellis2_e2e_check_n16.obj`. The harness unloads shape SC-VAE
+weights before loading texture SC-VAE weights to reduce peak VRAM. UV texture
+atlas export is still available with `T2_PBR_TEXTURE_MAP=1`, but the default is
+vertex colors because the chart packer is still experimental.
 
 HIP DiT now uses BF16 WMMA GEMM + BF16 WMMA flash-attn (commit 4d59a1e).
 1.73 s/step × 12 steps × 2 (CFG fwds) ≈ 42 s. Falls back to scalar F32 GEMM
@@ -310,6 +761,35 @@ BUILD_TARGET=rocm GPU_ARCHS=gfx1201 uv pip install --no-build-isolation -e \
     /mnt/disk1/work/gemm/trellis2/rdna4/trellis2/deps/FlexGEMM
 .venv/bin/python bench_tex_dec_coldwarm.py --reps 4
 ```
+
+AMD/RDNA4 drift debug mode:
+
+- HIPRTC defaults to `-ffast-math` for speed. Set `HIP_RUNNER_PRECISE_MATH=1`
+  to compile runtime kernels without fast-math when comparing against PyTorch.
+- tex_dec SiLU now uses `expf` instead of the approximate `__expf` intrinsic, so
+  the precise-math mode has a meaningful effect on activation drift.
+- The native tex_dec Makefile depends on `kernels/hip_tex_dec_kernels.h` and
+  adds `-Ikernels`; `verify-tex-dec` builds the CPU-correct PBR oracle from
+  `tools/build_pbr_cpu_oracle.py`.
+- `NO_HIPBLASLT=1` builds the native runner with stub hipBLASLt entry points.
+  Use it with `T2_TEX_BLASLT=0` for scalar/precise drift bisection on machines
+  that do not have hipBLASLt development headers.
+
+Tightest AMD comparison mode:
+
+```bash
+env HIP_RUNNER_PRECISE_MATH=1 \
+    T2_LIN_NAIVE=1 T2_TEX_BLASLT=0 T2_TEX_TRITON=0 \
+    T2_TEX_KLIN_TRITON=0 T2_TEX_WMMA_SPCONV=0 \
+  make -C rdna4/trellis2 verify-tex-dec \
+    NO_HIPBLASLT=1 \
+    TEX_DEC_WEIGHTS=/mnt/disk01/models/trellis2-4b/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors \
+    REF_DIR=/tmp/tex_knight_r512_v2
+```
+
+The machine running this needs ROCm development headers/libraries visible under
+`ROCM_PATH` for the default hipBLASLt build. With `NO_HIPBLASLT=1`, the scalar
+drift path still needs the HIP runtime and HIPRTC libraries available at runtime.
 
 ## Weight Files
 
@@ -357,12 +837,14 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 | File | Lines | Description |
 |------|-------|-------------|
 | `cuda_trellis2_runner.h` | 65 | Public API |
-| `cuda_trellis2_runner.c` | ~900 | DiT forward, decoder forward, weight loading |
+| `cuda_trellis2_runner.c` | ~2500 | DINOv3, Stage 1/2/3 DiT forward, decoder forward, weight loading |
 | `cuda_trellis2_kernels.h` | ~280 | CUDA kernels: adaLN, gated_add, modulation, rope_3d, rms_norm_perhead, conv3d, channel_layernorm_3d, pixel_shuffle_3d, timestep_embed_cossin |
 | `cuda_trellis2_ops.h` | ~300 | Kernel launch wrappers |
-| `test_cuda_trellis2.c` | ~320 | Test harness: full/stage1/decode modes, .npy I/O, mesh export |
-| `verify_decoder.c` | ~65 | Standalone decoder verification |
-| `Makefile` | 20 | gcc build (no nvcc, NVRTC runtime compilation) |
+| `test_cuda_trellis2.c` | ~860 | Test harness: full/stage1/stage2/stage3/decode modes, .npy I/O, mesh export |
+| `verify_decoder.c` | ~90 | Standalone decoder verification |
+| `verify_stage2.c` | ~90 | Stage 2 DiT single-step verifier |
+| `verify_stage3.c` | ~90 | Stage 3 DiT single-step verifier |
+| `Makefile` | ~30 | gcc build for runner + verifiers (no nvcc, NVRTC runtime compilation) |
 
 ### HIP/ROCm implementation (`rdna4/trellis2/`)
 
@@ -391,6 +873,7 @@ uvx --from huggingface_hub hf download microsoft/TRELLIS-image-large \
 | File | Description |
 |------|-------------|
 | `gen_stage1_ref.py` | Full Stage 1 pipeline: DINOv3 → DiT 12-step CFG → decoder → .npy outputs |
+| `gen_scvae_decoder_ref.py` | Shape/texture SC-VAE PyTorch refs with pure-PyTorch sparse-conv backend |
 | `dump_dit_intermediates.py` | Per-block hidden state dump for layer-by-layer comparison |
 | `make_comparison.py` | Compare .npy pairs (corr, max_diff, relative L2) |
 
@@ -427,6 +910,7 @@ TRELLIS.2 model code: `cpu/trellis2/trellis2_repo/` (cloned from github.com/micr
 | DINOv3 final norm | Features range differs | TRELLIS.2 uses unparameterized LN, not learned norm | Apply plain LN in encoder |
 | **Stage 2 F16 GEMM** | **All GEMM output garbage** | **`use_f32_gemm` not set when loading Stage 2 standalone** | **Set flag in `cuda_trellis2_load_stage2`** |
 | **Stage 2 scratch overflow** | **Cross-attn produces 5e26** | **`scratch[1]` sized for self-attn N only, not cross-attn ctx_len*2D** | **Include `ca_kv_gemm_sz` in max** |
+| **CUDA CFG KV cache thrash** | **Cross-attn KV rebuilt for every conditioned/unconditioned pass** | **Single cache slot was invalidated at public API entry and could not hold both CFG conditions** | **Two condition slots keyed by model id + condition hash; zero condition uses slot 1** |
 | **Vulkan: DiT QK RMSNorm gamma** | **11/12 heads use wrong gamma → 0% occupancy** | **`rms_norm_f32.comp` used `w[i]` (head 0 gamma) instead of `w[h*head_dim+i]`** | **Fix gamma index (commit 4306224)** |
 | **Vulkan: DINOv3 patch embed dispatch** | **Tokens 256-1023 all zeros → features diff 14.75** | **`opPatchEmbed` dispatched 1024 workgroups instead of 4096 (shader covers 256 elements/group)** | **`(n_patches*dim+255)/256` workgroups (commit 4306224)** |
 | **Vulkan: GELU approximation** | **DINOv3 features max diff 0.061 vs official** | **`gelu_f32.comp` used tanh approximation; DINOv3 specifies exact erf GELU** | **Replace with A&S erf polynomial, max intrinsic error ~1.5e-7 (commit 70c3b70)** |
@@ -434,13 +918,14 @@ TRELLIS.2 model code: `cpu/trellis2/trellis2_repo/` (cloned from github.com/micr
 ## Next Steps
 
 ### CUDA
-1. **Stage 2 full sampling**: Integrate Stage 2 DiT into end-to-end flow sampling with CFG
-   on GPU (DiT forward verified, need sampling loop + shape decoder).
-2. **Stage 3 Texture CUDA**: Port Stage 3 texture flow DiT to GPU (same architecture).
-3. **Shape decoder CUDA**: Sparse conv SC-VAE decoder on GPU.
-4. **Texture decoder CUDA**: Sparse conv SC-VAE texture decoder on GPU.
-5. **F16 GEMM**: Switch from F32 tiled GEMM to F16 tensor-core GEMM for ~10x speedup.
-6. **Full GPU pipeline (CUDA)**: Image → DINOv3 → Stage 1 → Stage 2 → Stage 3 → mesh.
+1. **GPU subdivision compaction/hash build**: Move `to_subdiv` threshold compaction
+   and sparse hash construction/upload fully onto GPU for the shape decoder.
+2. **PBR atlas export**: Fix/verify the UV chart packer; vertex-colored OBJ is the
+   default texture output for now, `T2_PBR_TEXTURE_MAP=1` opts into atlas maps.
+3. **Fresh Stage 2/3 DiT reference dumps**: Persist current PyTorch flow-model
+   tensors for CUDA verifier coverage beyond old ad-hoc `/tmp` dumps. SC-VAE
+   shape/texture refs now live under `ref/trellis2/dumps/`.
+4. **Full GPU pipeline (CUDA)**: Image → DINOv3 → Stage 1 → Stage 2 → Stage 3 → mesh.
 
 ### HIP/ROCm (RX 9070 XT)
 1. **Fix E2E sampling**: 12-step CFG + rescale produces ~70% occupancy vs PyTorch's ~2%.
@@ -460,5 +945,5 @@ TRELLIS.2 model code: `cpu/trellis2/trellis2_repo/` (cloned from github.com/micr
 2. **F16 GEMM**: Use `matmul_coopmat_f16` for cooperative matrix acceleration on RDNA4
    (biggest remaining perf win — all stages bottlenecked by F32 GEMM).
 3. **GPU C2S subdivision**: Move coordinate expansion + hash build to GPU to eliminate
-   CPU roundtrip in shape/texture decoder (currently hybrid GPU+CPU).
+   CPU roundtrip in Vulkan shape/texture decoder paths.
 4. **FDG mesh extraction**: Port `trellis2_fdg_mesh.h` for final textured mesh output.

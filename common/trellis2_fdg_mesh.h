@@ -107,22 +107,6 @@ static const int edge_offsets[3][4][3] = {
     {{0,0,0}, {0,1,0}, {1,1,0}, {1,0,0}},
 };
 
-static float vec3_cross_dot(const float a[3], const float b[3], const float c[3], const float d[3]) {
-    /* cross(b-a, c-a) · cross(c-b, d-b) */
-    float n1[3], n2[3];
-    float ba[3] = {b[0]-a[0], b[1]-a[1], b[2]-a[2]};
-    float ca[3] = {c[0]-a[0], c[1]-a[1], c[2]-a[2]};
-    n1[0] = ba[1]*ca[2] - ba[2]*ca[1];
-    n1[1] = ba[2]*ca[0] - ba[0]*ca[2];
-    n1[2] = ba[0]*ca[1] - ba[1]*ca[0];
-    float cb[3] = {c[0]-b[0], c[1]-b[1], c[2]-b[2]};
-    float db[3] = {d[0]-b[0], d[1]-b[1], d[2]-b[2]};
-    n2[0] = cb[1]*db[2] - cb[2]*db[1];
-    n2[1] = cb[2]*db[0] - cb[0]*db[2];
-    n2[2] = cb[0]*db[1] - cb[1]*db[0];
-    return fabsf(n1[0]*n2[0] + n1[1]*n2[1] + n1[2]*n2[2]);
-}
-
 t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
                               int N, float voxel_size, const float aabb[6]) {
     t2_fdg_mesh mesh = {0};
@@ -182,13 +166,6 @@ t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
 
     for (int q = 0; q < n_quads; q++) {
         int *qi = quads + q * 4;
-        float *v0 = verts + qi[0] * 3, *v1 = verts + qi[1] * 3;
-        float *v2 = verts + qi[2] * 3, *v3 = verts + qi[3] * 3;
-
-        /* Try split 1: (0,1,2) + (0,2,3) */
-        float align0 = vec3_cross_dot(v0, v1, v2, v3);
-        /* Try split 2: (0,1,3) + (3,1,2) */
-        float align1 = vec3_cross_dot(v0, v1, v3, v1);
 
         /* Use split_weight if available */
         float sw0 = feats[qi[0]*7+6] * feats[qi[2]*7+6];

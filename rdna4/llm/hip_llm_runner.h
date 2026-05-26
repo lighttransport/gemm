@@ -44,6 +44,16 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
 float *hip_llm_forward_embd(hip_llm_runner *r, const float *embd, int embd_stride, int position);
 float *hip_llm_forward_embd_logits(hip_llm_runner *r, const float *embd, int embd_stride, int position);
 
+/* Batched embedding forward: feed M pre-computed embeddings through the
+ * batched prefill path in one shot (positions [position_start, +M)). Same
+ * row layout as hip_llm_forward_embd — first n_embd floats per row are the
+ * main embedding, remainder (when embd_stride > n_embd) are deepstack slices.
+ * Falls back to per-token loop if M doesn't fit the batched path. Returns
+ * the last row's hidden state [n_embd] (host-side buffer, valid until next
+ * call). */
+float *hip_llm_forward_batch_embd(hip_llm_runner *r, const float *embds,
+                                    int M, int embd_stride, int position_start);
+
 /* Batched forward over a contiguous run of n_tokens starting at position_start.
  * Returns the LAST token's hidden state [n_embd] (or logits [n_vocab] for the
  * _logits variant). Buffer is host-side, valid until the next call. Phase 1 is
@@ -79,6 +89,32 @@ void hip_llm_set_max_layers(hip_llm_runner *r, int max_layers);
  * n_tokens >= LLM_GEMM_M_THRESHOLD. */
 void hip_llm_set_batched_path(hip_llm_runner *r, int enable);
 int  hip_llm_batched_path_available(const hip_llm_runner *r);
+
+/* A/B verify the GPU matvec kernel for `weight_type` against a CPU reference.
+ *
+ * Generates a deterministic random raw block-quant matrix [n_rows, n_cols]
+ * (native layout for `weight_type`) and an F32 input vector x[n_cols], runs
+ * the HIP matvec, then dequantizes the same bytes on CPU via `cpu_dequant_row`
+ * and does a scalar dot-product per row. Reports rel-L2 vs the CPU reference
+ * and the max absolute per-row error.
+ *
+ * `cpu_dequant_row` must dequantize exactly `n` elements (= n_cols here) of
+ * `weight_type` from `src` into `dst`. Caller supplies the function pointer
+ * (typically `dequantize_row_<type>` from common/ggml_dequant.h) so the runner
+ * doesn't link in the full dequant implementation set.
+ *
+ * Constraint: n_cols must be a multiple of the block-element count for
+ * `weight_type` (32 for IQ4_NL etc.; 256 for K-/IQ-super-block types).
+ *
+ * No model needs to be loaded — only `hip_llm_init` must have succeeded so
+ * the HIPRTC module is available. Returns 0 on success (out values written),
+ * -1 if the type has no registered HIP matvec or shape is invalid, -2 on
+ * any HIP allocation/launch error. */
+int hip_llm_verify_quant_matvec(
+        hip_llm_runner *r, int weight_type,
+        void (*cpu_dequant_row)(const void *src, float *dst, int n),
+        int n_rows, int n_cols,
+        double *out_rel_l2, double *out_max_abs);
 
 /* Query model dimensions (valid after load_weights). */
 int hip_llm_n_embd(const hip_llm_runner *r);

@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 #include <time.h>
 
@@ -139,6 +140,28 @@ typedef struct {
     CUdeviceptr gn2_w, gn2_b, conv2_w, conv2_b;
 } dec_resblock_gpu;
 
+typedef struct {
+    CUdeviceptr from_latent_w, from_latent_b;  /* [1024, 32] */
+    CUdeviceptr out_w, out_b;                  /* [out_channels, 64] */
+    struct {
+        CUdeviceptr conv_w, conv_b;   /* [27, C, C] transposed for gather-GEMM */
+        CUdeviceptr norm_w, norm_b;   /* [C] */
+        CUdeviceptr mlp0_w, mlp0_b;   /* [4C, C] */
+        CUdeviceptr mlp2_w, mlp2_b;   /* [C, 4C] */
+    } convnext[4][16];  /* [stage][block] — max 16 blocks per stage */
+    struct {
+        CUdeviceptr norm1_w, norm1_b;
+        CUdeviceptr conv1_w, conv1_b;  /* [27, C_out*8, C_in] transposed */
+        CUdeviceptr conv2_w, conv2_b;  /* [27, C_out, C_out] transposed */
+        CUdeviceptr subdiv_w, subdiv_b; /* [8, C_in], absent for dense texture decoder */
+    } c2s[4];
+    int n_convnext[4];  /* {4, 16, 8, 4} */
+    int channels[5];    /* {1024, 512, 256, 128, 64} */
+    int out_channels;   /* 7 for shape, 6 for texture */
+    int use_f16;
+    int loaded;
+} t2_scvae_dec_gpu;
+
 /* ======================================================================== */
 /* Runner struct                                                            */
 /* ======================================================================== */
@@ -196,38 +219,18 @@ struct cuda_trellis2_runner {
     CUdeviceptr dec_out_gn_w, dec_out_gn_b;
     CUdeviceptr dec_out_conv_w, dec_out_conv_b;
 
-    /* Shape decoder (SC-VAE) */
-    struct {
-        CUdeviceptr from_latent_w, from_latent_b;  /* [1024, 32] */
-        CUdeviceptr out_w, out_b;                   /* [7, 64] */
-        struct {
-            CUdeviceptr conv_w, conv_b;   /* [27, C, C] transposed for gather-GEMM */
-            CUdeviceptr norm_w, norm_b;   /* [C] */
-            CUdeviceptr mlp0_w, mlp0_b;   /* [4C, C] */
-            CUdeviceptr mlp2_w, mlp2_b;   /* [C, 4C] */
-        } convnext[4][16];  /* [stage][block] — max 16 blocks per stage */
-        struct {
-            CUdeviceptr norm1_w, norm1_b;
-            CUdeviceptr conv1_w, conv1_b;  /* [27, C_out*8, C_in] transposed */
-            CUdeviceptr conv2_w, conv2_b;  /* [27, C_out, C_out] transposed */
-            CUdeviceptr subdiv_w, subdiv_b; /* [8, C_in] */
-        } c2s[4];  /* one per stage */
-        int n_convnext[4];  /* {4, 16, 8, 4} */
-        int channels[5];    /* {1024, 512, 256, 128, 64} */
-        int loaded;
-    } shape_dec;
+    /* SC-VAE decoders */
+    t2_scvae_dec_gpu shape_dec;
+    t2_scvae_dec_gpu tex_dec;
 
-    /* CPU-side decoders for C2S operations */
-    t2_shape_dec *shape_dec_cpu;
-    t2_shape_dec *tex_dec_cpu;
-    int tex_dec_loaded;
-
-    /* Cross-attention KV cache (precomputed per-block, reused across timesteps) */
-    CUdeviceptr ca_kv_cache_K[DIT_DEPTH];
-    CUdeviceptr ca_kv_cache_V[DIT_DEPTH];
-    int ca_kv_cache_n_blocks;
-    int ca_kv_cache_model_id;  /* which model's weights were cached */
-    int ca_kv_cache_valid;
+    /* Cross-attention KV cache (precomputed per-block, reused across timesteps).
+     * Slot 0 is the active nonzero condition, slot 1 is the all-zero CFG condition. */
+    CUdeviceptr ca_kv_cache_K[2][DIT_DEPTH];
+    CUdeviceptr ca_kv_cache_V[2][DIT_DEPTH];
+    uint64_t ca_kv_cache_cond_hash[2];
+    int ca_kv_cache_n_blocks[2];
+    int ca_kv_cache_model_id[2];  /* which model's weights were cached */
+    int ca_kv_cache_valid[2];
 
     /* Scratch buffers (expanded to 12 for shape decoder use) */
     CUdeviceptr scratch[12];
@@ -323,6 +326,71 @@ static void dit_block_cpu_free(dit_block_cpu *cpu) {
     memset(cpu, 0, sizeof(*cpu));
 }
 
+static void dino_layer_free_gpu(dino_layer_gpu *l) {
+    CU_FREE(l->ln1_w); CU_FREE(l->ln1_b);
+    CU_FREE(l->q_w); CU_FREE(l->q_b);
+    CU_FREE(l->k_w); CU_FREE(l->k_b);
+    CU_FREE(l->v_w); CU_FREE(l->v_b);
+    CU_FREE(l->q_norm_w); CU_FREE(l->k_norm_w);
+    CU_FREE(l->out_w); CU_FREE(l->out_b);
+    CU_FREE(l->ls1); CU_FREE(l->ls2);
+    CU_FREE(l->ln2_w); CU_FREE(l->ln2_b);
+    CU_FREE(l->fc1_w); CU_FREE(l->fc1_b);
+    CU_FREE(l->fc2_w); CU_FREE(l->fc2_b);
+}
+
+static void dec_resblock_free_gpu(dec_resblock_gpu *rb) {
+    CU_FREE(rb->conv_w); CU_FREE(rb->conv_b);
+    CU_FREE(rb->gn1_w); CU_FREE(rb->gn1_b);
+    CU_FREE(rb->conv1_w); CU_FREE(rb->conv1_b);
+    CU_FREE(rb->gn2_w); CU_FREE(rb->gn2_b);
+    CU_FREE(rb->conv2_w); CU_FREE(rb->conv2_b);
+}
+
+static void dit_model_free_gpu(dit_model_gpu *m) {
+    CU_FREE(m->t_fc1_w); CU_FREE(m->t_fc1_b);
+    CU_FREE(m->t_fc2_w); CU_FREE(m->t_fc2_b);
+    CU_FREE(m->mod_w); CU_FREE(m->mod_b);
+    CU_FREE(m->x_emb_w); CU_FREE(m->x_emb_b);
+    CU_FREE(m->out_w); CU_FREE(m->out_b);
+    if (m->blocks) {
+        int n = m->n_blocks > 0 ? m->n_blocks : DIT_DEPTH;
+        if (n > DIT_DEPTH) n = DIT_DEPTH;
+        for (int i = 0; i < n; i++)
+            dit_block_free_gpu(&m->blocks[i]);
+    }
+    CU_FREE(m->rope_cos);
+    CU_FREE(m->rope_sin);
+}
+
+static void scvae_decoder_free_gpu(t2_scvae_dec_gpu *d) {
+    CU_FREE(d->from_latent_w);
+    CU_FREE(d->from_latent_b);
+    CU_FREE(d->out_w);
+    CU_FREE(d->out_b);
+    for (int s = 0; s < 4; s++) {
+        for (int b = 0; b < 16; b++) {
+            CU_FREE(d->convnext[s][b].conv_w);
+            CU_FREE(d->convnext[s][b].conv_b);
+            CU_FREE(d->convnext[s][b].norm_w);
+            CU_FREE(d->convnext[s][b].norm_b);
+            CU_FREE(d->convnext[s][b].mlp0_w);
+            CU_FREE(d->convnext[s][b].mlp0_b);
+            CU_FREE(d->convnext[s][b].mlp2_w);
+            CU_FREE(d->convnext[s][b].mlp2_b);
+        }
+        CU_FREE(d->c2s[s].norm1_w);
+        CU_FREE(d->c2s[s].norm1_b);
+        CU_FREE(d->c2s[s].conv1_w);
+        CU_FREE(d->c2s[s].conv1_b);
+        CU_FREE(d->c2s[s].conv2_w);
+        CU_FREE(d->c2s[s].conv2_b);
+        CU_FREE(d->c2s[s].subdiv_w);
+        CU_FREE(d->c2s[s].subdiv_b);
+    }
+    d->loaded = 0;
+}
+
 static void dbg4(const char *label, CUdeviceptr ptr, CUstream stream) {
     cuStreamSynchronize(stream);
     float d[4];
@@ -330,15 +398,33 @@ static void dbg4(const char *label, CUdeviceptr ptr, CUstream stream) {
     fprintf(stderr, "  %s: [:4]=%.6f %.6f %.6f %.6f\n", label, d[0], d[1], d[2], d[3]);
 }
 
-static double t2_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
-}
-
 /* ======================================================================== */
 /* Weight upload helpers                                                    */
 /* ======================================================================== */
+
+static float t2_f16_to_f32_value(uint16_t h) {
+    uint32_t sign = ((uint32_t)h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x3ff;
+    uint32_t bits;
+    float f;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+            memcpy(&f, &bits, 4);
+            return f;
+        }
+        f = ldexpf((float)mant, -24);
+        return sign ? -f : f;
+    }
+    if (exp == 31) {
+        bits = sign | 0x7f800000 | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    memcpy(&f, &bits, 4);
+    return f;
+}
 
 /* Upload safetensors tensor as F32 on GPU (handles F16, BF16, F32 source) */
 static CUdeviceptr t2_upload_f32(st_context *st, const char *name, int verbose) {
@@ -371,16 +457,7 @@ static CUdeviceptr t2_upload_f32(st_context *st, const char *name, int verbose) 
         }
     } else { /* F16 */
         for (size_t i = 0; i < n_elem; i++) {
-            /* Simple F16->F32 */
-            uint16_t h = src[i];
-            uint32_t sign = ((uint32_t)h & 0x8000) << 16;
-            uint32_t exp = (h >> 10) & 0x1f;
-            uint32_t mant = h & 0x3ff;
-            uint32_t f;
-            if (exp == 0) { if (mant == 0) f = sign; else { exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3ff; f = sign | ((exp + 127 - 15) << 23) | (mant << 13); } }
-            else if (exp == 31) f = sign | 0x7f800000 | (mant << 13);
-            else f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-            memcpy(&f32[i], &f, 4);
+            f32[i] = t2_f16_to_f32_value(src[i]);
         }
     }
 
@@ -526,6 +603,9 @@ cuda_trellis2_runner *cuda_trellis2_init(int device_id, int verbose) {
         free(r);
         return NULL;
     }
+    if (cublasewCreate(&r->ops.cublas, r->stream) == 0) {
+        fprintf(stderr, "T2: cuBLAS available for opt-in F32 GEMM\n");
+    }
 
     fprintf(stderr, "T2: kernels compiled for sm_%d\n", sm);
     return r;
@@ -543,9 +623,58 @@ void cuda_trellis2_set_max_gpu_layers(cuda_trellis2_runner *r, int n) {
 
 void cuda_trellis2_free(cuda_trellis2_runner *r) {
     if (!r) return;
-    for (int i = 0; i < 8; i++)
-        if (r->scratch[i]) cuMemFree(r->scratch[i]);
-    /* TODO: free all GPU weight buffers */
+    cuCtxSetCurrent(r->context);
+
+    for (int i = 0; i < 12; i++)
+        CU_FREE(r->scratch[i]);
+
+    CU_FREE(r->dit_t_fc1_w); CU_FREE(r->dit_t_fc1_b);
+    CU_FREE(r->dit_t_fc2_w); CU_FREE(r->dit_t_fc2_b);
+    CU_FREE(r->dit_mod_w); CU_FREE(r->dit_mod_b);
+    CU_FREE(r->dit_x_emb_w); CU_FREE(r->dit_x_emb_b);
+    CU_FREE(r->dit_out_w); CU_FREE(r->dit_out_b);
+    for (int i = 0; i < DIT_DEPTH; i++) {
+        dit_block_free_gpu(&r->dit_blocks[i]);
+        dit_block_cpu_free(&r->dit_blocks_cpu[i]);
+    }
+    CU_FREE(r->dit_rope_cos);
+    CU_FREE(r->dit_rope_sin);
+
+    dit_model_free_gpu(&r->stage2);
+    dit_model_free_gpu(&r->stage3);
+    for (int i = 0; i < DIT_DEPTH; i++) {
+        dit_block_cpu_free(&r->stage2_blocks_cpu[i]);
+        dit_block_cpu_free(&r->stage3_blocks_cpu[i]);
+        for (int slot = 0; slot < 2; slot++) {
+            CU_FREE(r->ca_kv_cache_K[slot][i]);
+            CU_FREE(r->ca_kv_cache_V[slot][i]);
+        }
+    }
+
+    CU_FREE(r->dino_patch_w); CU_FREE(r->dino_patch_b);
+    CU_FREE(r->dino_cls_token); CU_FREE(r->dino_storage_tokens);
+    CU_FREE(r->dino_norm_w); CU_FREE(r->dino_norm_b);
+    for (int i = 0; i < DINO_LAYERS; i++)
+        dino_layer_free_gpu(&r->dino_layers[i]);
+    CU_FREE(r->dino_rope_cos);
+    CU_FREE(r->dino_rope_sin);
+
+    CU_FREE(r->dec_conv_in_w); CU_FREE(r->dec_conv_in_b);
+    for (int i = 0; i < 2; i++) {
+        dec_resblock_free_gpu(&r->dec_middle[i]);
+        dec_resblock_free_gpu(&r->dec_res16[i]);
+        dec_resblock_free_gpu(&r->dec_res32[i]);
+        dec_resblock_free_gpu(&r->dec_res64[i]);
+    }
+    CU_FREE(r->dec_up1_w); CU_FREE(r->dec_up1_b);
+    CU_FREE(r->dec_up2_w); CU_FREE(r->dec_up2_b);
+    CU_FREE(r->dec_out_gn_w); CU_FREE(r->dec_out_gn_b);
+    CU_FREE(r->dec_out_conv_w); CU_FREE(r->dec_out_conv_b);
+
+    scvae_decoder_free_gpu(&r->shape_dec);
+    scvae_decoder_free_gpu(&r->tex_dec);
+
+    if (r->ops.cublas) cublasewDestroy(r->ops.cublas);
     cuModuleUnload(r->module);
     cuStreamDestroy(r->stream);
     cuCtxDestroy(r->context);
@@ -956,14 +1085,20 @@ static int load_dit_model_weights(cuda_trellis2_runner *r, const char *path,
 int cuda_trellis2_load_stage2(cuda_trellis2_runner *r, const char *stage2_path) {
     int ret = load_dit_model_weights(r, stage2_path, &r->stage2, r->stage2_blocks,
                                       r->stage2_blocks_cpu, "Stage 2");
-    if (ret == 0) r->stage2_loaded = 1;
+    if (ret == 0) {
+        r->stage2_loaded = 1;
+        cuda_trellis2_invalidate_kv_cache(r);
+    }
     return ret;
 }
 
 int cuda_trellis2_load_stage3(cuda_trellis2_runner *r, const char *stage3_path) {
     int ret = load_dit_model_weights(r, stage3_path, &r->stage3, r->stage3_blocks,
                                       r->stage3_blocks_cpu, "Stage 3");
-    if (ret == 0) r->stage3_loaded = 1;
+    if (ret == 0) {
+        r->stage3_loaded = 1;
+        cuda_trellis2_invalidate_kv_cache(r);
+    }
     return ret;
 }
 
@@ -977,7 +1112,6 @@ static CUdeviceptr t2_upload_conv_transposed(st_context *st, const char *name,
     int idx = safetensors_find(st, name);
     if (idx < 0) { if (v) fprintf(stderr, "  [MISSING] %s\n", name); return 0; }
     const char *dtype = safetensors_dtype(st, idx);
-    size_t nbytes = safetensors_nbytes(st, idx);
     void *data = safetensors_data(st, idx);
 
     /* First convert to F32 on CPU */
@@ -994,15 +1128,7 @@ static CUdeviceptr t2_upload_conv_transposed(st_context *st, const char *name,
         }
     } else if (strcmp(dtype, "F16") == 0) {
         for (size_t i = 0; i < n_elem; i++) {
-            uint16_t h = src16[i];
-            uint32_t sign = ((uint32_t)h & 0x8000) << 16;
-            uint32_t exp = (h >> 10) & 0x1f;
-            uint32_t mant = h & 0x3ff;
-            uint32_t fb;
-            if (exp == 0) { fb = sign; }
-            else if (exp == 31) fb = sign | 0x7f800000 | (mant << 13);
-            else fb = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-            memcpy(&f32[i], &fb, 4);
+            f32[i] = t2_f16_to_f32_value(src16[i]);
         }
     } else {
         free(f32); return 0;
@@ -1043,27 +1169,47 @@ static CUdeviceptr t2_upload_conv_transposed(st_context *st, const char *name,
     return d;
 }
 
-int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) {
+static int cuda_trellis2_load_scvae_decoder(cuda_trellis2_runner *r,
+                                             t2_scvae_dec_gpu *dec,
+                                             const char *path,
+                                             const char *label) {
     st_context *st = safetensors_open(path);
     if (!st) return -1;
-    fprintf(stderr, "T2: loading shape decoder from %s (%d tensors)\n", path, st->n_tensors);
+    fprintf(stderr, "T2: loading %s from %s (%d tensors)\n", label, path, st->n_tensors);
     int v = r->verbose;
-    int use_f16 = (r->ops.sm_version >= 70);
+    int use_f16 = 0;
+    {
+        const char *f16 = getenv("T2_SHAPE_DEC_F16");
+        if (f16 && atoi(f16) && r->ops.sm_version >= 70) use_f16 = 1;
+        const char *e = getenv("T2_SHAPE_DEC_F32");
+        if (e && atoi(e)) use_f16 = 0;
+    }
+    scvae_decoder_free_gpu(dec);
+    dec->use_f16 = use_f16;
 
     /* Weight names match: blocks.{stage}.{block}.{component} */
     #define UPW(n) (use_f16 ? t2_upload_f16(st, n, v) : t2_upload_f32(st, n, v))
     #define UPB(n) t2_upload_f32(st, n, v)
 
-    r->shape_dec.from_latent_w = UPW("from_latent.weight");
-    r->shape_dec.from_latent_b = UPB("from_latent.bias");
-    r->shape_dec.out_w = UPW("output_layer.weight");
-    r->shape_dec.out_b = UPB("output_layer.bias");
+    dec->from_latent_w = UPW("from_latent.weight");
+    dec->from_latent_b = UPB("from_latent.bias");
+    dec->out_w = UPW("output_layer.weight");
+    dec->out_b = UPB("output_layer.bias");
+    {
+        int oi = safetensors_find(st, "output_layer.weight");
+        if (oi >= 0 && safetensors_ndims(st, oi) >= 2) {
+            const uint64_t *sh = safetensors_shape(st, oi);
+            dec->out_channels = (int)sh[0];
+        } else {
+            dec->out_channels = 7;
+        }
+    }
 
     /* Channel progression: 1024 -> 512 -> 256 -> 128 -> 64 */
     int ch[] = {1024, 512, 256, 128, 64};
     int nblk[] = {4, 16, 8, 4};
-    memcpy(r->shape_dec.channels, ch, sizeof(ch));
-    memcpy(r->shape_dec.n_convnext, nblk, sizeof(nblk));
+    memcpy(dec->channels, ch, sizeof(ch));
+    memcpy(dec->n_convnext, nblk, sizeof(nblk));
 
     for (int s = 0; s < 4; s++) {
         int C = ch[s];
@@ -1072,15 +1218,15 @@ int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) 
         for (int b = 0; b < nblk[s]; b++) {
             char name[256];
             #define CN(suf) (snprintf(name, sizeof(name), "blocks.%d.%d.%s", s, b, suf), name)
-            r->shape_dec.convnext[s][b].conv_w = t2_upload_conv_transposed(
+            dec->convnext[s][b].conv_w = t2_upload_conv_transposed(
                 st, CN("conv.weight"), C, C, v, use_f16);
-            r->shape_dec.convnext[s][b].conv_b = UPB(CN("conv.bias"));
-            r->shape_dec.convnext[s][b].norm_w = UPB(CN("norm.weight"));
-            r->shape_dec.convnext[s][b].norm_b = UPB(CN("norm.bias"));
-            r->shape_dec.convnext[s][b].mlp0_w = UPW(CN("mlp.0.weight"));
-            r->shape_dec.convnext[s][b].mlp0_b = UPB(CN("mlp.0.bias"));
-            r->shape_dec.convnext[s][b].mlp2_w = UPW(CN("mlp.2.weight"));
-            r->shape_dec.convnext[s][b].mlp2_b = UPB(CN("mlp.2.bias"));
+            dec->convnext[s][b].conv_b = UPB(CN("conv.bias"));
+            dec->convnext[s][b].norm_w = UPB(CN("norm.weight"));
+            dec->convnext[s][b].norm_b = UPB(CN("norm.bias"));
+            dec->convnext[s][b].mlp0_w = UPW(CN("mlp.0.weight"));
+            dec->convnext[s][b].mlp0_b = UPB(CN("mlp.0.bias"));
+            dec->convnext[s][b].mlp2_w = UPW(CN("mlp.2.weight"));
+            dec->convnext[s][b].mlp2_b = UPB(CN("mlp.2.bias"));
             #undef CN
         }
 
@@ -1089,24 +1235,24 @@ int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) 
             char name[256];
             int C_out = ch[s + 1];
             #define C2S(suf) (snprintf(name, sizeof(name), "blocks.%d.%d.%s", s, nblk[s], suf), name)
-            r->shape_dec.c2s[s].norm1_w = UPB(C2S("norm1.weight"));
-            r->shape_dec.c2s[s].norm1_b = UPB(C2S("norm1.bias"));
-            r->shape_dec.c2s[s].conv1_w = t2_upload_conv_transposed(
+            dec->c2s[s].norm1_w = UPB(C2S("norm1.weight"));
+            dec->c2s[s].norm1_b = UPB(C2S("norm1.bias"));
+            dec->c2s[s].conv1_w = t2_upload_conv_transposed(
                 st, C2S("conv1.weight"), C_out * 8, C, v, use_f16);
-            r->shape_dec.c2s[s].conv1_b = UPB(C2S("conv1.bias"));
-            r->shape_dec.c2s[s].conv2_w = t2_upload_conv_transposed(
+            dec->c2s[s].conv1_b = UPB(C2S("conv1.bias"));
+            dec->c2s[s].conv2_w = t2_upload_conv_transposed(
                 st, C2S("conv2.weight"), C_out, C_out, v, use_f16);
-            r->shape_dec.c2s[s].conv2_b = UPB(C2S("conv2.bias"));
+            dec->c2s[s].conv2_b = UPB(C2S("conv2.bias"));
             /* to_subdiv may be missing (texture decoder) */
             snprintf(name, sizeof(name), "blocks.%d.%d.to_subdiv.weight", s, nblk[s]);
             int idx = safetensors_find(st, name);
             if (idx >= 0) {
-                r->shape_dec.c2s[s].subdiv_w = UPW(name);
+                dec->c2s[s].subdiv_w = UPW(name);
                 snprintf(name, sizeof(name), "blocks.%d.%d.to_subdiv.bias", s, nblk[s]);
-                r->shape_dec.c2s[s].subdiv_b = UPB(name);
+                dec->c2s[s].subdiv_b = UPB(name);
             } else {
-                r->shape_dec.c2s[s].subdiv_w = 0;
-                r->shape_dec.c2s[s].subdiv_b = 0;
+                dec->c2s[s].subdiv_w = 0;
+                dec->c2s[s].subdiv_b = 0;
             }
             #undef C2S
         }
@@ -1116,25 +1262,27 @@ int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) 
     #undef UPB
 
     safetensors_close(st);
-    r->shape_dec.loaded = 1;
+    dec->loaded = 1;
 
-    /* Also load full CPU decoder for C2S operations (needs F32 weights) */
-    r->shape_dec_cpu = t2_shape_dec_load(path);
-    if (!r->shape_dec_cpu)
-        fprintf(stderr, "T2: WARNING: failed to load CPU shape decoder for C2S\n");
-
-    fprintf(stderr, "T2: shape decoder loaded (GPU=%s, CPU for C2S)\n", use_f16 ? "F16" : "F32");
+    fprintf(stderr, "T2: %s loaded (GPU=%s, out_ch=%d)\n",
+            label, use_f16 ? "F16" : "F32", dec->out_channels);
     return 0;
 }
 
+int cuda_trellis2_load_shape_decoder(cuda_trellis2_runner *r, const char *path) {
+    return cuda_trellis2_load_scvae_decoder(r, &r->shape_dec, path, "shape decoder");
+}
+
 int cuda_trellis2_load_texture_decoder(cuda_trellis2_runner *r, const char *path) {
-    /* Texture decoder uses the same SC-VAE architecture as shape decoder.
-     * Load as CPU decoder (AVX2+pthreads optimized). */
-    r->tex_dec_cpu = t2_shape_dec_load(path);
-    if (!r->tex_dec_cpu) return -1;
-    r->tex_dec_loaded = 1;
-    fprintf(stderr, "T2: texture decoder loaded (out_ch=%d)\n", r->tex_dec_cpu->out_channels);
-    return 0;
+    return cuda_trellis2_load_scvae_decoder(r, &r->tex_dec, path, "texture decoder");
+}
+
+void cuda_trellis2_unload_shape_decoder(cuda_trellis2_runner *r) {
+    if (r) scvae_decoder_free_gpu(&r->shape_dec);
+}
+
+void cuda_trellis2_unload_texture_decoder(cuda_trellis2_runner *r) {
+    if (r) scvae_decoder_free_gpu(&r->tex_dec);
 }
 
 int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
@@ -1149,6 +1297,7 @@ int cuda_trellis2_load_weights(cuda_trellis2_runner *r,
     if (decoder_path && load_decoder_weights(r, decoder_path) != 0) return -1;
 
     if (dinov3_path && load_dinov3_weights(r, dinov3_path) != 0) return -1;
+    if (stage1_path) cuda_trellis2_invalidate_kv_cache(r);
 
     /* Stage 2 shape flow model loads with same code as Stage 1 — just different in_channels */
     r->stage2_loaded = 0;
@@ -1241,7 +1390,8 @@ static void run_dinov3(cuda_trellis2_runner *r, CUdeviceptr d_image, CUdeviceptr
         if (l->ls1) {
             /* layerscale_add: dst[i] += src[i] * scale[i % dim] */
             int n = seq * dim;
-            void *ls_args[] = {&d_hidden, &d_normed, &l->ls1, &n, &dim};
+            int dim_arg = dim;
+            void *ls_args[] = {&d_hidden, &d_normed, &l->ls1, &n, &dim_arg};
             cuLaunchKernel(ops->layerscale_add, (unsigned)((n+255)/256), 1, 1,
                            256, 1, 1, 0, stream, ls_args, NULL);
         } else {
@@ -1256,7 +1406,8 @@ static void run_dinov3(cuda_trellis2_runner *r, CUdeviceptr d_image, CUdeviceptr
 
         if (l->ls2) {
             int n = seq * dim;
-            void *ls_args[] = {&d_hidden, &d_normed, &l->ls2, &n, &dim};
+            int dim_arg = dim;
+            void *ls_args[] = {&d_hidden, &d_normed, &l->ls2, &n, &dim_arg};
             cuLaunchKernel(ops->layerscale_add, (unsigned)((n+255)/256), 1, 1,
                            256, 1, 1, 0, stream, ls_args, NULL);
         } else {
@@ -1296,7 +1447,9 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                                       dit_block_cpu *blocks_cpu, /* CPU copies for streaming (NULL = all on GPU) */
                                       CUdeviceptr rope_cos, CUdeviceptr rope_sin,
                                       int n_freqs, int axis_dim,
-                                      int model_id) {  /* 1=Stage1, 2=Stage2, 3=Stage3 */
+                                      int model_id,  /* 1=Stage1, 2=Stage2, 3=Stage3 */
+                                      uint64_t cond_hash,
+                                      int cache_slot) {
     t2_ops *ops = &r->ops;
     CUstream stream = r->stream;
     const int D = DIT_DIM;        /* 1536 */
@@ -1373,15 +1526,19 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     /* Precompute cross-attention KV for all blocks if not cached.
      * KV depends on block weights (different per block) but NOT on timestep or x_t.
      * So we compute once and cache for all subsequent calls with same cond. */
-    int use_kv_cache = (r->ca_kv_cache_valid && r->ca_kv_cache_model_id == model_id);
+    if (cache_slot < 0 || cache_slot > 1) cache_slot = 0;
+    int use_kv_cache = (r->ca_kv_cache_valid[cache_slot] &&
+                        r->ca_kv_cache_model_id[cache_slot] == model_id &&
+                        r->ca_kv_cache_cond_hash[cache_slot] == cond_hash);
     if (!use_kv_cache && d_cond) {
         /* Allocate/reallocate cache */
         size_t kv_sz = (size_t)ctx_len * D * sizeof(float);
-        if (r->ca_kv_cache_n_blocks != n_blocks) {
+        if (r->ca_kv_cache_n_blocks[cache_slot] != n_blocks) {
             for (int bi = 0; bi < DIT_DEPTH; bi++) {
-                if (r->ca_kv_cache_K[bi]) cuMemFree(r->ca_kv_cache_K[bi]);
-                if (r->ca_kv_cache_V[bi]) cuMemFree(r->ca_kv_cache_V[bi]);
-                r->ca_kv_cache_K[bi] = 0; r->ca_kv_cache_V[bi] = 0;
+                if (r->ca_kv_cache_K[cache_slot][bi]) cuMemFree(r->ca_kv_cache_K[cache_slot][bi]);
+                if (r->ca_kv_cache_V[cache_slot][bi]) cuMemFree(r->ca_kv_cache_V[cache_slot][bi]);
+                r->ca_kv_cache_K[cache_slot][bi] = 0;
+                r->ca_kv_cache_V[cache_slot][bi] = 0;
             }
         }
         for (int bi = 0; bi < n_blocks; bi++) {
@@ -1392,23 +1549,27 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
                 dit_block_upload_to_gpu(blk, &blocks_cpu[bi]);
                 blk_streamed = 1;
             }
-            if (!r->ca_kv_cache_K[bi]) cuMemAlloc(&r->ca_kv_cache_K[bi], kv_sz);
-            if (!r->ca_kv_cache_V[bi]) cuMemAlloc(&r->ca_kv_cache_V[bi], kv_sz);
+            if (!r->ca_kv_cache_K[cache_slot][bi]) cuMemAlloc(&r->ca_kv_cache_K[cache_slot][bi], kv_sz);
+            if (!r->ca_kv_cache_V[cache_slot][bi]) cuMemAlloc(&r->ca_kv_cache_V[cache_slot][bi], kv_sz);
             /* KV GEMM: [ctx, cond_dim] -> [ctx, 2*D] */
             t2_op_gemm(ops, stream, d_qkv, blk->ca_kv_w, d_cond, blk->ca_kv_b,
                        2 * D, DIT_COND_DIM, ctx_len);
-            t2_op_split_kv_chunk(ops, stream, r->ca_kv_cache_K[bi], r->ca_kv_cache_V[bi],
+            t2_op_split_kv_chunk(ops, stream,
+                                  r->ca_kv_cache_K[cache_slot][bi],
+                                  r->ca_kv_cache_V[cache_slot][bi],
                                   d_qkv, ctx_len, D);
             if (blk->ca_k_norm)
-                t2_op_rms_norm_perhead(ops, stream, r->ca_kv_cache_K[bi], blk->ca_k_norm,
+                t2_op_rms_norm_perhead(ops, stream, r->ca_kv_cache_K[cache_slot][bi], blk->ca_k_norm,
                                       ctx_len, H, HD, D);
             if (blk_streamed) { cuStreamSynchronize(stream); dit_block_free_gpu(blk); }
         }
-        r->ca_kv_cache_n_blocks = n_blocks;
-        r->ca_kv_cache_model_id = model_id;
-        r->ca_kv_cache_valid = 1;
+        r->ca_kv_cache_n_blocks[cache_slot] = n_blocks;
+        r->ca_kv_cache_model_id[cache_slot] = model_id;
+        r->ca_kv_cache_cond_hash[cache_slot] = cond_hash;
+        r->ca_kv_cache_valid[cache_slot] = 1;
         if (r->verbose >= 1)
-            fprintf(stderr, "  Cross-attn KV cached for %d blocks\n", n_blocks);
+            fprintf(stderr, "  Cross-attn KV cached for %d blocks (slot=%d)\n",
+                    n_blocks, cache_slot);
     }
 
     /* 3. Transformer blocks */
@@ -1527,8 +1688,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
             t2_op_rms_norm_perhead(ops, stream, d_cross_Q, blk->ca_q_norm, N, H, HD, D);
 
         /* KV from conditioning (cached — precomputed above) */
-        CUdeviceptr d_ca_K_cached = r->ca_kv_cache_K[bi];
-        CUdeviceptr d_ca_V_cached = r->ca_kv_cache_V[bi];
+        CUdeviceptr d_ca_K_cached = r->ca_kv_cache_K[cache_slot][bi];
+        CUdeviceptr d_ca_V_cached = r->ca_kv_cache_V[cache_slot][bi];
 
         /* Cross-attention (using cached KV) */
         t2_op_cross_attn(ops, stream, d_attn, d_cross_Q, d_ca_K_cached, d_ca_V_cached,
@@ -1588,7 +1749,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
     /* 4. Final LayerNorm (no affine) + output projection */
     {
         float eps = 1e-6f;
-        void *ln_args[] = {&d_hidden, &d_hidden, &D, &eps};
+        int D_arg = D;
+        void *ln_args[] = {&d_hidden, &d_hidden, &D_arg, &eps};
         cuLaunchKernel(ops->layernorm_noaffine, (unsigned)N, 1, 1,
                        256, 1, 1, 512 * sizeof(float), stream, ln_args, NULL);
     }
@@ -1599,7 +1761,8 @@ static void run_dit_forward_generic(cuda_trellis2_runner *r,
 /* Stage 1 wrapper — uses F16 MMA if weights are F16, else F32 */
 static void run_dit_forward(cuda_trellis2_runner *r,
                              CUdeviceptr d_x, float timestep,
-                             CUdeviceptr d_cond, CUdeviceptr d_output) {
+                             CUdeviceptr d_cond, CUdeviceptr d_output,
+                             uint64_t cond_hash, int cache_slot) {
     /* Save GEMM mode and set appropriate mode for Stage 1 */
     int saved_f32 = r->ops.use_f32_gemm;
     int saved_mma = r->ops.use_mma_gemm;
@@ -1619,7 +1782,7 @@ static void run_dit_forward(cuda_trellis2_runner *r,
         r->dit_out_w, r->dit_out_b,
         r->dit_blocks, r->dit_blocks_cpu,
         r->dit_rope_cos, r->dit_rope_sin,
-        r->dit_n_freqs, r->dit_axis_dim, 1);
+        r->dit_n_freqs, r->dit_axis_dim, 1, cond_hash, cache_slot);
 
     r->ops.use_f32_gemm = saved_f32;
     r->ops.use_mma_gemm = saved_mma;
@@ -1632,7 +1795,7 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
                                      CUdeviceptr d_x, float timestep,
                                      CUdeviceptr d_cond, CUdeviceptr d_output,
                                      int N, CUdeviceptr rope_cos, CUdeviceptr rope_sin,
-                                     int model_id) {
+                                     int model_id, uint64_t cond_hash, int cache_slot) {
     /* Save GEMM mode and set F16 MMA if available */
     int saved_f32 = r->ops.use_f32_gemm;
     int saved_mma = r->ops.use_mma_gemm;
@@ -1652,7 +1815,7 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
         m->out_w, m->out_b,
         m->blocks, blocks_cpu,
         rope_cos, rope_sin,
-        m->n_rope_freqs, m->rope_axis_dim, model_id);
+        m->n_rope_freqs, m->rope_axis_dim, model_id, cond_hash, cache_slot);
 
     r->ops.use_f32_gemm = saved_f32;
     r->ops.use_mma_gemm = saved_mma;
@@ -1665,7 +1828,7 @@ static void run_sparse_dit_forward(cuda_trellis2_runner *r,
 static void run_resblock(cuda_trellis2_runner *r,
                           CUdeviceptr d_out, CUdeviceptr d_in,
                           const dec_resblock_gpu *rb,
-                          int C, int D, int H, int W, int G) {
+                          int C, int D, int H, int W) {
     t2_ops *ops = &r->ops;
     CUstream s = r->stream;
     int spatial = D * H * W;
@@ -1694,8 +1857,6 @@ static void run_decoder(cuda_trellis2_runner *r,
                          CUdeviceptr d_latent, CUdeviceptr d_output) {
     t2_ops *ops = &r->ops;
     CUstream s = r->stream;
-    int G = 32;
-
     /* Alloc main decoder buffers */
     ensure_scratch(r, 6, (size_t)1024 * 16 * 16 * 16 * sizeof(float));
     ensure_scratch(r, 7, (size_t)512 * 32 * 32 * 32 * sizeof(float));
@@ -1710,12 +1871,12 @@ static void run_decoder(cuda_trellis2_runner *r,
     if (r->verbose >= 2) dbg4("dec_conv_in", d_buf_a, s);
 
     /* middle + res16 blocks (512 ch, 16^3) */
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_middle[0], 512, 16, 16, 16, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_middle[0], 512, 16, 16, 16);
     if (r->verbose >= 2) dbg4("dec_mid0", d_buf_b, s);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_middle[1], 512, 16, 16, 16, G);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_middle[1], 512, 16, 16, 16);
     if (r->verbose >= 2) dbg4("dec_mid1", d_buf_a, s);
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res16[0], 512, 16, 16, 16, G);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res16[1], 512, 16, 16, 16, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res16[0], 512, 16, 16, 16);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res16[1], 512, 16, 16, 16);
 
     /* Up1: conv 512->1024, pixel_shuffle -> [128, 32^3] */
     t2_op_conv3d(ops, s, d_buf_b, d_buf_a, r->dec_up1_w, r->dec_up1_b,
@@ -1723,8 +1884,8 @@ static void run_decoder(cuda_trellis2_runner *r,
     t2_op_pixel_shuffle_3d(ops, s, d_buf_a, d_buf_b, 128, 16, 16, 16);
 
     /* res32 blocks (128 ch, 32^3) */
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res32[0], 128, 32, 32, 32, G);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res32[1], 128, 32, 32, 32, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res32[0], 128, 32, 32, 32);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res32[1], 128, 32, 32, 32);
 
     /* Up2: conv 128->256, pixel_shuffle -> [32, 64^3] */
     t2_op_conv3d(ops, s, d_buf_b, d_buf_a, r->dec_up2_w, r->dec_up2_b,
@@ -1737,8 +1898,8 @@ static void run_decoder(cuda_trellis2_runner *r,
     /* res64 blocks (32 ch, 64^3) */
     ensure_scratch(r, 7, (size_t)32 * 64 * 64 * 64 * sizeof(float));
     d_buf_b = r->scratch[7];
-    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res64[0], 32, 64, 64, 64, G);
-    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res64[1], 32, 64, 64, 64, G);
+    run_resblock(r, d_buf_b, d_buf_a, &r->dec_res64[0], 32, 64, 64, 64);
+    run_resblock(r, d_buf_a, d_buf_b, &r->dec_res64[1], 32, 64, 64, 64);
 
     /* Output: GN -> SiLU -> Conv3d(32->1) */
     /* Output: ChannelLayerNorm -> SiLU -> Conv3d(32->1) */
@@ -1753,51 +1914,218 @@ static void run_decoder(cuda_trellis2_runner *r,
 /* Full pipeline                                                            */
 /* ======================================================================== */
 
-/* Simple xoshiro256** */
-static uint64_t t2_rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
-typedef struct { uint64_t s[4]; } t2_rng;
-static uint64_t t2_next(t2_rng *rng) {
-    uint64_t *s = rng->s;
-    uint64_t result = t2_rotl(s[1] * 5, 7) * 9;
+/* Simple xoshiro256** for public predict() sampling. Matches test harness. */
+static uint64_t t2_rotl64(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+typedef struct { uint64_t s[4]; } t2_rng_state;
+static uint64_t t2_rng_next(t2_rng_state *r) {
+    uint64_t *s = r->s;
+    uint64_t result = t2_rotl64(s[1] * 5, 7) * 9;
     uint64_t t = s[1] << 17;
     s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
-    s[2] ^= t; s[3] = t2_rotl(s[3], 45);
+    s[2] ^= t; s[3] = t2_rotl64(s[3], 45);
     return result;
 }
-static float t2_randn(t2_rng *rng) {
-    double u1 = ((double)(t2_next(rng) >> 11) + 0.5) / (double)(1ULL << 53);
-    double u2 = ((double)(t2_next(rng) >> 11) + 0.5) / (double)(1ULL << 53);
+static float t2_rng_randn(t2_rng_state *r) {
+    double u1 = ((double)(t2_rng_next(r) >> 11) + 0.5) / (double)(1ULL << 53);
+    double u2 = ((double)(t2_rng_next(r) >> 11) + 0.5) / (double)(1ULL << 53);
     return (float)(sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2));
 }
-static float t2_rescale(float t, float rescale_t) {
-    return t * rescale_t / (1.0f + (rescale_t - 1.0f) * t);
+static float t2_rescale_t(float t, float rt) {
+    return t * rt / (1.0f + (rt - 1.0f) * t);
+}
+
+static float *t2_preprocess_rgb_for_dinov3(const uint8_t *rgb, int w, int h) {
+    if (!rgb || w <= 0 || h <= 0) return NULL;
+    const int out_w = DINO_IMG_SIZE, out_h = DINO_IMG_SIZE;
+    int crop = w < h ? w : h;
+    int ox = (w - crop) / 2;
+    int oy = (h - crop) / 2;
+    float *out = (float *)malloc((size_t)3 * out_w * out_h * sizeof(float));
+    if (!out) return NULL;
+
+    const float mean[3] = {0.485f, 0.456f, 0.406f};
+    const float stdv[3] = {0.229f, 0.224f, 0.225f};
+    for (int y = 0; y < out_h; y++) {
+        float src_y = ((float)y + 0.5f) * (float)crop / (float)out_h - 0.5f;
+        int y0 = (int)floorf(src_y);
+        float fy = src_y - (float)y0;
+        if (y0 < 0) { y0 = 0; fy = 0.0f; }
+        if (y0 >= crop - 1) { y0 = crop - 1; fy = 0.0f; }
+        int y1 = (y0 + 1 < crop) ? y0 + 1 : y0;
+        for (int x = 0; x < out_w; x++) {
+            float src_x = ((float)x + 0.5f) * (float)crop / (float)out_w - 0.5f;
+            int x0 = (int)floorf(src_x);
+            float fx = src_x - (float)x0;
+            if (x0 < 0) { x0 = 0; fx = 0.0f; }
+            if (x0 >= crop - 1) { x0 = crop - 1; fx = 0.0f; }
+            int x1 = (x0 + 1 < crop) ? x0 + 1 : x0;
+            const uint8_t *p00 = rgb + ((size_t)(oy + y0) * w + (ox + x0)) * 3;
+            const uint8_t *p01 = rgb + ((size_t)(oy + y0) * w + (ox + x1)) * 3;
+            const uint8_t *p10 = rgb + ((size_t)(oy + y1) * w + (ox + x0)) * 3;
+            const uint8_t *p11 = rgb + ((size_t)(oy + y1) * w + (ox + x1)) * 3;
+            for (int ch = 0; ch < 3; ch++) {
+                float v0 = (1.0f - fx) * (float)p00[ch] + fx * (float)p01[ch];
+                float v1 = (1.0f - fx) * (float)p10[ch] + fx * (float)p11[ch];
+                float v = ((1.0f - fy) * v0 + fy * v1) / 255.0f;
+                out[(size_t)ch * out_w * out_h + (size_t)y * out_w + x] =
+                    (v - mean[ch]) / stdv[ch];
+            }
+        }
+    }
+    return out;
 }
 
 float *cuda_trellis2_predict(cuda_trellis2_runner *r,
                               const uint8_t *rgb, int w, int h,
                               int n_steps, float cfg_scale,
                               uint32_t seed) {
-    (void)rgb; (void)w; (void)h;
-    fprintf(stderr, "T2: full predict not implemented yet (use per-stage APIs)\n");
-    fprintf(stderr, "T2: DINOv3 GPU encoding is TODO — pass pre-computed features\n");
+    if (!r || !rgb || w <= 0 || h <= 0 || n_steps <= 0) return NULL;
+    if (!r->dino_patch_w || !r->dit_x_emb_w || !r->dec_conv_in_w) {
+        fprintf(stderr, "T2: predict requires DINOv3, Stage 1 DiT, and decoder weights\n");
+        return NULL;
+    }
+
+    const int N = DIT_N_TOKENS;
+    const int C = DIT_IN_CH;
+    const int cond_tokens = DINO_SEQ_LEN;
+    const int cond_dim = DIT_COND_DIM;
+    const float rescale = 5.0f;
+    const float sigma_min = 1e-5f;
+    const float cfg_rescale = 0.7f;
+
+    float *image_f32 = t2_preprocess_rgb_for_dinov3(rgb, w, h);
+    float *features = (float *)malloc((size_t)cond_tokens * cond_dim * sizeof(float));
+    float *zeros_cond = (float *)calloc((size_t)cond_tokens * cond_dim, sizeof(float));
+    float *x = (float *)malloc((size_t)N * C * sizeof(float));
+    float *v_cond = (float *)malloc((size_t)N * C * sizeof(float));
+    float *v_uncond = (float *)malloc((size_t)N * C * sizeof(float));
+    float *occupancy = (float *)malloc((size_t)64 * 64 * 64 * sizeof(float));
+    if (!image_f32 || !features || !zeros_cond || !x || !v_cond || !v_uncond || !occupancy) {
+        fprintf(stderr, "T2: predict host allocation failed\n");
+        free(image_f32); free(features); free(zeros_cond); free(x);
+        free(v_cond); free(v_uncond); free(occupancy);
+        return NULL;
+    }
+
+    if (r->verbose) fprintf(stderr, "T2: predict DINOv3 encode\n");
+    if (cuda_trellis2_run_dinov3(r, image_f32, features) != 0) goto fail;
+    free(image_f32);
+    image_f32 = NULL;
+
+    t2_rng_state rng = {{seed, seed ^ 0x9E3779B97F4A7C15ULL,
+                         seed ^ 0x6C62272E07BB0142ULL,
+                         seed ^ 0xBF58476D1CE4E5B9ULL}};
+    for (int i = 0; i < 8; i++) t2_rng_next(&rng);
+    for (int i = 0; i < N * C; i++) x[i] = t2_rng_randn(&rng);
+
+    if (r->verbose)
+        fprintf(stderr, "T2: predict Stage 1 flow (%d steps, cfg=%.2f)\n", n_steps, cfg_scale);
+    for (int step = 0; step < n_steps; step++) {
+        float t_start = 1.0f - (float)step / (float)n_steps;
+        float t_end = 1.0f - (float)(step + 1) / (float)n_steps;
+        float t_cur = t2_rescale_t(t_start, rescale);
+        float t_next = t2_rescale_t(t_end, rescale);
+        int apply_cfg = (t_cur >= 0.6f && t_cur <= 1.0f && cfg_scale != 1.0f);
+
+        if (apply_cfg) {
+            if (cuda_trellis2_run_dit(r, x, t_cur, features, v_cond) != 0) goto fail;
+            if (cuda_trellis2_run_dit(r, x, t_cur, zeros_cond, v_uncond) != 0) goto fail;
+            float *pred_v = v_uncond;
+            for (int i = 0; i < N * C; i++)
+                pred_v[i] = cfg_scale * v_cond[i] + (1.0f - cfg_scale) * v_uncond[i];
+
+            if (cfg_rescale > 0.0f) {
+                float tc = sigma_min + (1.0f - sigma_min) * t_cur;
+                float one_m_sm = 1.0f - sigma_min;
+                double sum_pos = 0.0, sum_cfg = 0.0, sum2_pos = 0.0, sum2_cfg = 0.0;
+                for (int i = 0; i < N * C; i++) {
+                    float x0p = one_m_sm * x[i] - tc * v_cond[i];
+                    float x0c = one_m_sm * x[i] - tc * pred_v[i];
+                    sum_pos += x0p; sum2_pos += (double)x0p * x0p;
+                    sum_cfg += x0c; sum2_cfg += (double)x0c * x0c;
+                }
+                double n = (double)(N * C);
+                double var_pos = (sum2_pos - sum_pos * sum_pos / n) / (n - 1.0);
+                double var_cfg = (sum2_cfg - sum_cfg * sum_cfg / n) / (n - 1.0);
+                double std_pos = var_pos > 0.0 ? sqrt(var_pos) : 0.0;
+                double std_cfg = var_cfg > 0.0 ? sqrt(var_cfg) : 0.0;
+                float ratio = (std_cfg > 1e-8) ? (float)(std_pos / std_cfg) : 1.0f;
+                float sc = cfg_rescale * ratio + (1.0f - cfg_rescale);
+                for (int i = 0; i < N * C; i++) {
+                    float x0c = one_m_sm * x[i] - tc * pred_v[i];
+                    pred_v[i] = (one_m_sm * x[i] - sc * x0c) / tc;
+                }
+            }
+
+            for (int i = 0; i < N * C; i++)
+                x[i] -= (t_cur - t_next) * pred_v[i];
+        } else {
+            if (cuda_trellis2_run_dit(r, x, t_cur, features, v_cond) != 0) goto fail;
+            for (int i = 0; i < N * C; i++)
+                x[i] -= (t_cur - t_next) * v_cond[i];
+        }
+        if (r->verbose >= 2)
+            fprintf(stderr, "  predict step %d/%d t=%.4f->%.4f %s\n",
+                    step + 1, n_steps, t_cur, t_next, apply_cfg ? "CFG" : "noG");
+    }
+
+    if (r->verbose) fprintf(stderr, "T2: predict structure decoder\n");
+    if (cuda_trellis2_run_decoder(r, x, occupancy) != 0) goto fail;
+
+    free(features); free(zeros_cond); free(x); free(v_cond); free(v_uncond);
+    return occupancy;
+
+fail:
+    free(image_f32); free(features); free(zeros_cond); free(x);
+    free(v_cond); free(v_uncond); free(occupancy);
     return NULL;
 }
 
 /* ---- Per-stage APIs ---- */
 
+static uint64_t t2_hash_f32_bytes(const float *data, size_t n) {
+    if (!data) return 0;
+    const unsigned char *p = (const unsigned char *)data;
+    size_t bytes = n * sizeof(float);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < bytes; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int t2_all_zero_f32(const float *data, size_t n) {
+    if (!data) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (data[i] != 0.0f) return 0;
+    }
+    return 1;
+}
+
+static int t2_cond_cache_slot(const float *cond_features, int ctx_len) {
+    if (!cond_features) return 0;
+    return t2_all_zero_f32(cond_features, (size_t)ctx_len * DIT_COND_DIM) ? 1 : 0;
+}
+
 void cuda_trellis2_invalidate_kv_cache(cuda_trellis2_runner *r) {
-    r->ca_kv_cache_valid = 0;
-    r->ca_kv_cache_model_id = 0;
+    if (!r) return;
+    for (int slot = 0; slot < 2; slot++) {
+        r->ca_kv_cache_valid[slot] = 0;
+        r->ca_kv_cache_model_id[slot] = 0;
+        r->ca_kv_cache_cond_hash[slot] = 0;
+    }
 }
 
 int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
                            const float *x_t, float timestep,
                            const float *cond_features, float *output) {
-    /* Invalidate KV cache since cond may differ between CFG passes */
-    cuda_trellis2_invalidate_kv_cache(r);
     CUstream s = r->stream;
     int N = DIT_N_TOKENS, in_ch = DIT_IN_CH;
     int ctx_len = DINO_SEQ_LEN;
+    size_t cond_n = (size_t)ctx_len * DIT_COND_DIM;
+    uint64_t cond_hash = t2_hash_f32_bytes(cond_features, cond_n);
+    int cache_slot = t2_cond_cache_slot(cond_features, ctx_len);
 
     /* Transpose input from NCDHW [C, spatial] to [spatial, C] on CPU.
      * Official code: x.view(B, C, -1).permute(0, 2, 1) -> [B, N, C] */
@@ -1812,7 +2140,7 @@ int cuda_trellis2_run_dit(cuda_trellis2_runner *r,
     CUdeviceptr d_out;
     cuMemAlloc(&d_out, (size_t)N * in_ch * sizeof(float));
 
-    run_dit_forward(r, d_x, timestep, d_cond, d_out);
+    run_dit_forward(r, d_x, timestep, d_cond, d_out, cond_hash, cache_slot);
 
     /* Transpose output from [spatial, C] back to [C, spatial] NCDHW */
     float *out_flat = (float *)malloc((size_t)N * in_ch * sizeof(float));
@@ -1850,13 +2178,53 @@ int cuda_trellis2_run_decoder(cuda_trellis2_runner *r,
 /* Run one ConvNeXt block on GPU.
  * d_feats: [N, C] in/out features (modified in-place via residual)
  * d_gather_map: [N, 27] precomputed neighbor indices */
-static void run_shape_convnext(cuda_trellis2_runner *r,
+static void t2_run_sparse_conv3d(cuda_trellis2_runner *r,
+                                  CUdeviceptr dst,
+                                  CUdeviceptr feats,
+                                  CUdeviceptr weight,
+                                  CUdeviceptr bias,
+                                  CUdeviceptr gather_map,
+                                  CUdeviceptr scratch,
+                                  CUdeviceptr scratch2,
+                                  const int32_t *coords,
+                                  const sp3d_hash *hash,
+                                  int N, int in_C, int out_C,
+                                  int stage, int block, int op);
+
+static int t2_shape_debug_stop_op(int stage, int block, int op);
+static int t2_shape_debug_start_op(int stage, int block);
+static int t2_shape_debug_stop_mlp_op(int stage, int block, int op);
+static int t2_shape_debug_group_mlp(int stage, int block, int op);
+static int t2_shape_debug_cublaslt_mlp(int stage, int block, int op);
+static int t2_shape_debug_welford_affine_ln(int stage, int block);
+static int t2_shape_debug_welford_affine_c2s(int stage);
+static int t2_shape_debug_welford_noaffine_c2s(int stage);
+static int t2_shape_debug_sparse_value(const char *name,
+                                       int stage, int block, int op,
+                                       int *out_value);
+static int t2_shape_launch_group_gemm(t2_ops *ops, CUstream s,
+                                      CUdeviceptr Y, CUdeviceptr W,
+                                      CUdeviceptr X, CUdeviceptr bias,
+                                      int n_out, int n_in, int n_tok,
+                                      int group);
+
+static int t2_env_flag(const char *name) {
+    const char *v = getenv(name);
+    return (v && v[0] && atoi(v) != 0) ? 1 : 0;
+}
+
+static int run_shape_convnext(cuda_trellis2_runner *r,
                                  CUdeviceptr d_feats, int N, int C,
                                  CUdeviceptr d_gather_map,
+                                 const int32_t *coords,
+                                 const sp3d_hash *hash,
                                  CUdeviceptr conv_w, CUdeviceptr conv_b,
                                  CUdeviceptr norm_w, CUdeviceptr norm_b,
                                  CUdeviceptr mlp0_w, CUdeviceptr mlp0_b,
-                                 CUdeviceptr mlp2_w, CUdeviceptr mlp2_b) {
+                                 CUdeviceptr mlp2_w, CUdeviceptr mlp2_b,
+                                 int stage, int block,
+                                 CUdeviceptr *debug_feats,
+                                 int *debug_C) {
     t2_ops *ops = &r->ops;
     CUstream s = r->stream;
 
@@ -1871,194 +2239,1094 @@ static void run_shape_convnext(cuda_trellis2_runner *r,
     CUdeviceptr d_tmp = r->scratch[8];
     CUdeviceptr d_gathered = r->scratch[9];
     CUdeviceptr d_partial = r->scratch[10];
+    int start_op = t2_shape_debug_start_op(stage, block);
 
     /* 1. Sparse conv: feats -> tmp */
-    t2_op_sparse_conv3d(ops, s, d_tmp, d_feats, conv_w, conv_b,
-                         d_gather_map, d_gathered, d_partial, N, C, C);
+    if (start_op <= 0) {
+        t2_run_sparse_conv3d(r, d_tmp, d_feats, conv_w, conv_b,
+                             d_gather_map, d_gathered, d_partial,
+                             coords, hash, N, C, C, stage, block, 0);
+        if (t2_shape_debug_stop_op(stage, block, 0)) {
+            if (debug_feats) *debug_feats = d_tmp;
+            if (debug_C) *debug_C = C;
+            return 1;
+        }
+    } else {
+        d_tmp = d_feats;
+    }
 
     /* 2. LayerNorm: tmp -> tmp */
-    t2_op_layernorm(ops, s, d_tmp, d_tmp, norm_w, norm_b, N, C);
+    if (start_op <= 1) {
+        if (t2_shape_debug_welford_affine_ln(stage, block)) {
+            t2_op_layernorm_welford_eps(ops, s, d_tmp, d_tmp,
+                                        norm_w, norm_b, N, C, 1e-6f);
+        } else {
+            t2_op_layernorm(ops, s, d_tmp, d_tmp, norm_w, norm_b, N, C);
+        }
+        if (t2_shape_debug_stop_op(stage, block, 1)) {
+            if (debug_feats) *debug_feats = d_tmp;
+            if (debug_C) *debug_C = C;
+            return 1;
+        }
+    }
 
-    /* 3. MLP: Linear(C->4C) -> GELU -> Linear(4C->C) */
+    /* 3. MLP: Linear(C->4C) -> SiLU -> Linear(4C->C) */
     CUdeviceptr d_mlp = r->scratch[9];  /* reuse as [N, 4C] */
-    t2_op_gemm(ops, s, d_mlp, mlp0_w, d_tmp, mlp0_b, 4 * C, C, N);
-    t2_op_gelu(ops, s, d_mlp, N * 4 * C);
-    t2_op_gemm(ops, s, d_tmp, mlp2_w, d_mlp, mlp2_b, C, 4 * C, N);
+    int saved_cublas = ops->use_cublas_f32;
+    if (t2_env_flag("T2_SCVAE_CUBLAS_MLP") && ops->cublas)
+        ops->use_cublas_f32 = 1;
+    int lt_mlp0 = t2_shape_debug_cublaslt_mlp(stage, block, 0);
+    int group_mlp0 = t2_shape_debug_group_mlp(stage, block, 0);
+    if (!(lt_mlp0 &&
+          t2_op_gemm_f32_lt_bias(ops, s, d_mlp, mlp0_w, d_tmp, mlp0_b,
+                                 4 * C, C, N) == 0) &&
+        (!group_mlp0 ||
+        t2_shape_launch_group_gemm(ops, s, d_mlp, mlp0_w, d_tmp, mlp0_b,
+                                   4 * C, C, N, group_mlp0) != 0)) {
+        t2_op_gemm(ops, s, d_mlp, mlp0_w, d_tmp, mlp0_b, 4 * C, C, N);
+    }
+    if (t2_shape_debug_stop_mlp_op(stage, block, 0)) {
+        ops->use_cublas_f32 = saved_cublas;
+        if (debug_feats) *debug_feats = d_mlp;
+        if (debug_C) *debug_C = 4 * C;
+        return 1;
+    }
+    t2_op_silu_inplace(ops, s, d_mlp, N * 4 * C);
+    if (t2_shape_debug_stop_mlp_op(stage, block, 1)) {
+        ops->use_cublas_f32 = saved_cublas;
+        if (debug_feats) *debug_feats = d_mlp;
+        if (debug_C) *debug_C = 4 * C;
+        return 1;
+    }
+    int lt_mlp2 = t2_shape_debug_cublaslt_mlp(stage, block, 2);
+    int group_mlp2 = t2_shape_debug_group_mlp(stage, block, 2);
+    if (!(lt_mlp2 &&
+          t2_op_gemm_f32_lt_bias(ops, s, d_tmp, mlp2_w, d_mlp, mlp2_b,
+                                 C, 4 * C, N) == 0) &&
+        (!group_mlp2 ||
+        t2_shape_launch_group_gemm(ops, s, d_tmp, mlp2_w, d_mlp, mlp2_b,
+                                   C, 4 * C, N, group_mlp2) != 0)) {
+        t2_op_gemm(ops, s, d_tmp, mlp2_w, d_mlp, mlp2_b, C, 4 * C, N);
+    }
+    ops->use_cublas_f32 = saved_cublas;
+    if (t2_shape_debug_stop_mlp_op(stage, block, 2)) {
+        if (debug_feats) *debug_feats = d_tmp;
+        if (debug_C) *debug_C = C;
+        return 1;
+    }
+    if (t2_shape_debug_stop_op(stage, block, 2)) {
+        if (debug_feats) *debug_feats = d_tmp;
+        if (debug_C) *debug_C = C;
+        return 1;
+    }
 
     /* 4. Residual: feats += tmp */
     t2_op_residual_add(ops, s, d_feats, d_tmp, N * C);
+    return 0;
 }
 
-/* Run shape decoder forward pass.
+static int t2_make_subdiv_from_logits_host(const float *logits,
+                                            const int32_t *coords, int N,
+                                            int dense,
+                                            int32_t **out_idx,
+                                            int32_t **out_subidx,
+                                            int32_t **out_coords,
+                                            int *out_N) {
+    int total = 0;
+    if (dense) {
+        total = N * 8;
+    } else {
+        for (int i = 0; i < N * 8; i++)
+            if (logits[i] > 0.0f) total++;
+    }
+    if (total <= 0) {
+        *out_idx = NULL; *out_subidx = NULL; *out_coords = NULL; *out_N = 0;
+        return -1;
+    }
+    int32_t *idx = (int32_t *)malloc((size_t)total * sizeof(int32_t));
+    int32_t *subidx = (int32_t *)malloc((size_t)total * sizeof(int32_t));
+    int32_t *fine_coords = (int32_t *)malloc((size_t)total * 4 * sizeof(int32_t));
+    if (!idx || !subidx || !fine_coords) {
+        free(idx); free(subidx); free(fine_coords);
+        return -1;
+    }
+
+    int k = 0;
+    for (int i = 0; i < N; i++) {
+        int32_t b = coords[i * 4 + 0];
+        int32_t z = coords[i * 4 + 1];
+        int32_t y = coords[i * 4 + 2];
+        int32_t x = coords[i * 4 + 3];
+        for (int s = 0; s < 8; s++) {
+            if (!dense && logits[i * 8 + s] <= 0.0f) continue;
+            /* Match upstream SparseChannel2Spatial: coord dimension i gets
+             * bit i of subidx, so coords=(b,z,y,x) maps z=bit0, x=bit2. */
+            int dz = s & 1;
+            int dy = (s >> 1) & 1;
+            int dx = (s >> 2) & 1;
+            idx[k] = i;
+            subidx[k] = s;
+            fine_coords[k * 4 + 0] = b;
+            fine_coords[k * 4 + 1] = z * 2 + dz;
+            fine_coords[k * 4 + 2] = y * 2 + dy;
+            fine_coords[k * 4 + 3] = x * 2 + dx;
+            k++;
+        }
+    }
+
+    *out_idx = idx;
+    *out_subidx = subidx;
+    *out_coords = fine_coords;
+    *out_N = total;
+    return 0;
+}
+
+static void t2_free_sparse_gpu_index(sp3d_hash *hash,
+                                      CUdeviceptr d_hash_keys,
+                                      CUdeviceptr d_hash_vals,
+                                      CUdeviceptr d_gather_map) {
+    if (d_gather_map) cuMemFree(d_gather_map);
+    if (d_hash_keys) cuMemFree(d_hash_keys);
+    if (d_hash_vals) cuMemFree(d_hash_vals);
+    if (hash) sp3d_hash_free(hash);
+}
+
+static void t2_sparse_conv_pack_free(t2_sparse_conv_pack *pack) {
+    if (!pack) return;
+    for (int k = 0; k < 27; k++) {
+        if (pack->src_idx[k]) cuMemFree(pack->src_idx[k]);
+        if (pack->dst_idx[k]) cuMemFree(pack->dst_idx[k]);
+    }
+    memset(pack, 0, sizeof(*pack));
+}
+
+static int t2_sparse_conv_pack_build(const int32_t *coords, int N,
+                                      const sp3d_hash *hash,
+                                      t2_sparse_conv_pack *pack) {
+    memset(pack, 0, sizeof(*pack));
+    int *src = (int *)malloc((size_t)27 * N * sizeof(int));
+    int *dst = (int *)malloc((size_t)27 * N * sizeof(int));
+    if (!src || !dst) {
+        free(src);
+        free(dst);
+        return -1;
+    }
+
+    for (int i = 0; i < N; i++) {
+        int32_t b = coords[i * 4 + 0];
+        int32_t z = coords[i * 4 + 1];
+        int32_t y = coords[i * 4 + 2];
+        int32_t x = coords[i * 4 + 3];
+        for (int kd = 0; kd < 3; kd++) {
+            for (int kh = 0; kh < 3; kh++) {
+                for (int kw = 0; kw < 3; kw++) {
+                    int k = kd * 9 + kh * 3 + kw;
+                    int ni = sp3d_hash_lookup(hash, b, z + kd - 1, y + kh - 1, x + kw - 1);
+                    if (ni < 0) continue;
+                    int m = pack->M[k]++;
+                    src[k * N + m] = ni;
+                    dst[k * N + m] = i;
+                }
+            }
+        }
+    }
+
+    for (int k = 0; k < 27; k++) {
+        int M = pack->M[k];
+        if (M <= 0) continue;
+        pack->src_idx[k] = cu_upload_raw(src + k * N, (size_t)M * sizeof(int));
+        pack->dst_idx[k] = cu_upload_raw(dst + k * N, (size_t)M * sizeof(int));
+        if (!pack->src_idx[k] || !pack->dst_idx[k]) {
+            free(src);
+            free(dst);
+            t2_sparse_conv_pack_free(pack);
+            return -1;
+        }
+    }
+
+    free(src);
+    free(dst);
+    return 0;
+}
+
+static void t2_run_sparse_conv3d(cuda_trellis2_runner *r,
+                                  CUdeviceptr dst,
+                                  CUdeviceptr feats,
+                                  CUdeviceptr weight,
+                                  CUdeviceptr bias,
+                                  CUdeviceptr gather_map,
+                                  CUdeviceptr scratch,
+                                  CUdeviceptr scratch2,
+                                  const int32_t *coords,
+                                  const sp3d_hash *hash,
+                                  int N, int in_C, int out_C,
+                                  int stage, int block, int op) {
+    t2_ops *ops = &r->ops;
+    int v = 0;
+    const char *direct_env = getenv("T2_SCVAE_DIRECT_CONV");
+    int direct_mode = (direct_env && direct_env[0]) ? atoi(direct_env) : 0;
+    if (t2_shape_debug_sparse_value("T2SD_SPARSE_DIRECT",
+                                    stage, block, op, &v)) {
+        direct_mode = v;
+    }
+    if (ops->use_f32_gemm && direct_mode) {
+        t2_op_sparse_conv3d_direct(ops, r->stream, dst, feats, weight, bias,
+                                   gather_map, N, in_C, out_C, direct_mode);
+        return;
+    }
+    int use_packed = ops->use_packed_sparse_conv;
+    if (t2_shape_debug_sparse_value("T2SD_SPARSE_PACKED",
+                                    stage, block, op, &v)) {
+        use_packed = v ? 1 : 0;
+    }
+    int use_lt = t2_shape_debug_sparse_value("T2SD_SPARSE_LT",
+                                             stage, block, op, NULL);
+    if (ops->use_f32_gemm && use_packed && hash &&
+        ops->sparse_pack_rows && ops->scatter_add_rows) {
+        t2_sparse_conv_pack pack;
+        if (t2_sparse_conv_pack_build(coords, N, hash, &pack) == 0) {
+            t2_op_sparse_conv3d_packed(ops, r->stream, dst, feats, weight, bias,
+                                       &pack, scratch, scratch2, in_C, out_C,
+                                       N, use_lt);
+            t2_sparse_conv_pack_free(&pack);
+            return;
+        }
+        fprintf(stderr, "T2: packed sparse conv setup failed; using gather-GEMM\n");
+    }
+
+    int saved_cublas = ops->use_cublas_f32;
+    if (ops->use_f32_gemm &&
+        ((t2_env_flag("T2_SCVAE_CUBLAS_SPARSE") && ops->cublas) ||
+         t2_shape_debug_sparse_value("T2SD_SPARSE_CUBLAS",
+                                     stage, block, op, NULL)))
+        ops->use_cublas_f32 = 1;
+    t2_op_sparse_conv3d(ops, r->stream, dst, feats, weight, bias,
+                        gather_map, scratch, scratch2, N, in_C, out_C, use_lt);
+    ops->use_cublas_f32 = saved_cublas;
+}
+
+static int t2_build_sparse_gpu_index(cuda_trellis2_runner *r,
+                                      const int32_t *coords, int N,
+                                      CUdeviceptr d_coords,
+                                      sp3d_hash **out_hash,
+                                      CUdeviceptr *out_hash_keys,
+                                      CUdeviceptr *out_hash_vals,
+                                      CUdeviceptr *out_gather_map) {
+    sp3d_hash *hash = sp3d_hash_build(coords, N);
+    if (!hash) return -1;
+    CUdeviceptr d_hash_keys = cu_upload_raw(hash->keys, (size_t)hash->capacity * sizeof(uint64_t));
+    CUdeviceptr d_hash_vals = cu_upload_raw(hash->vals, (size_t)hash->capacity * sizeof(int32_t));
+    CUdeviceptr d_gather_map = 0;
+    if (t2_env_flag("T2_SCVAE_CPU_GATHER_MAP")) {
+        int32_t *gm = (int32_t *)malloc((size_t)N * 27 * sizeof(int32_t));
+        if (!gm) {
+            sp3d_hash_free(hash);
+            return -1;
+        }
+        for (int i = 0; i < N; i++) {
+            int32_t b = coords[i * 4 + 0];
+            int32_t z = coords[i * 4 + 1];
+            int32_t y = coords[i * 4 + 2];
+            int32_t x = coords[i * 4 + 3];
+            for (int kd = 0; kd < 3; kd++)
+                for (int kh = 0; kh < 3; kh++)
+                    for (int kw = 0; kw < 3; kw++)
+                        gm[i * 27 + kd * 9 + kh * 3 + kw] =
+                            sp3d_hash_lookup(hash, b, z + kd - 1, y + kh - 1, x + kw - 1);
+        }
+        d_gather_map = cu_upload_raw(gm, (size_t)N * 27 * sizeof(int32_t));
+        free(gm);
+    } else {
+        cuMemAlloc(&d_gather_map, (size_t)N * 27 * sizeof(int32_t));
+        t2_op_sparse_build_gather_map(&r->ops, r->stream, d_gather_map, d_coords, N,
+                                      d_hash_keys, d_hash_vals, hash->capacity);
+    }
+    *out_hash = hash;
+    *out_hash_keys = d_hash_keys;
+    *out_hash_vals = d_hash_vals;
+    *out_gather_map = d_gather_map;
+    return 0;
+}
+
+static int t2_shape_debug_return(CUstream s, CUdeviceptr d_feats,
+                                  const int32_t *coords, int N, int C,
+                                  float **out_feats,
+                                  int32_t **out_coords,
+                                  int *out_N, int *out_C) {
+    float *hf = (float *)malloc((size_t)N * C * sizeof(float));
+    int32_t *hc = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
+    if (!hf || !hc) {
+        free(hf); free(hc);
+        return -1;
+    }
+    cuStreamSynchronize(s);
+    cuMemcpyDtoH(hf, d_feats, (size_t)N * C * sizeof(float));
+    memcpy(hc, coords, (size_t)N * 4 * sizeof(int32_t));
+    *out_feats = hf;
+    *out_coords = hc;
+    if (out_N) *out_N = N;
+    if (out_C) *out_C = C;
+    return 0;
+}
+
+static int t2_shape_debug_stop_stage_block(int stage, int block) {
+    const char *sb = getenv("T2SD_STOP_AFTER_STAGE_BLOCK");
+    if (!sb || !sb[0]) return 0;
+    int ws = -1, wb = -1;
+    sscanf(sb, "%d:%d", &ws, &wb);
+    return ws == stage && wb == block;
+}
+
+static int t2_shape_debug_stop_op(int stage, int block, int op) {
+    const char *env = getenv("T2SD_STOP_AFTER_OP");
+    if (!env || !env[0]) return 0;
+    int ws = -1, wb = -1, wo = -1;
+    sscanf(env, "%d:%d:%d", &ws, &wb, &wo);
+    return ws == stage && wb == block && wo == op;
+}
+
+static int t2_shape_debug_start_op(int stage, int block) {
+    const char *env = getenv("T2SD_START_AT_OP");
+    if (!env || !env[0]) return 0;
+    int ws = -1, wb = -1, wo = 0;
+    sscanf(env, "%d:%d:%d", &ws, &wb, &wo);
+    return (ws == stage && wb == block) ? wo : 0;
+}
+
+static int t2_shape_debug_stop_mlp_op(int stage, int block, int op) {
+    const char *env = getenv("T2SD_STOP_AFTER_MLP_OP");
+    if (!env || !env[0]) return 0;
+    int ws = -1, wb = -1, wo = -1;
+    sscanf(env, "%d:%d:%d", &ws, &wb, &wo);
+    return ws == stage && wb == block && wo == op;
+}
+
+static int t2_shape_debug_group_mlp(int stage, int block, int op) {
+    const char *env = getenv("T2SD_GROUP_MLP");
+    if (!env || !env[0]) return 0;
+    int ws = -1, wb = -1, wo = -1, group = 0;
+    sscanf(env, "%d:%d:%d:%d", &ws, &wb, &wo, &group);
+    return (ws == stage && (wb == block || wb < 0) &&
+            (wo == op || wo < 0) && group > 0)
+        ? group : 0;
+}
+
+static int t2_shape_debug_cublaslt_mlp(int stage, int block, int op) {
+    const char *env = getenv("T2SD_CUBLASLT_MLP");
+    if (!env || !env[0]) return 0;
+    const char *p = env;
+    while (*p) {
+        int ws = -1, wb = -1, wo = -1;
+        if (sscanf(p, "%d:%d:%d", &ws, &wb, &wo) == 3 &&
+            ws == stage && (wb == block || wb < 0) &&
+            (wo == op || wo < 0)) {
+            return 1;
+        }
+        p = strpbrk(p, ",;");
+        if (!p) break;
+        p++;
+    }
+    return 0;
+}
+
+static int t2_shape_debug_welford_affine_ln(int stage, int block) {
+    const char *env = getenv("T2SD_WELFORD_AFFINE_LN");
+    if (!env || !env[0]) return 0;
+    int ws = -1, wb = -1;
+    sscanf(env, "%d:%d", &ws, &wb);
+    return (ws == stage && (wb == block || wb < 0));
+}
+
+static int t2_shape_debug_welford_affine_c2s(int stage) {
+    const char *env = getenv("T2SD_WELFORD_AFFINE_C2S");
+    if (!env || !env[0]) return 0;
+    int ws = -1;
+    sscanf(env, "%d", &ws);
+    return ws == stage || ws < 0;
+}
+
+static int t2_shape_debug_welford_noaffine_c2s(int stage) {
+    const char *env = getenv("T2SD_WELFORD_NOAFFINE_C2S");
+    if (!env || !env[0]) return 0;
+    int ws = -1;
+    sscanf(env, "%d", &ws);
+    return ws == stage || ws < 0;
+}
+
+static int t2_shape_debug_sparse_value(const char *name,
+                                       int stage, int block, int op,
+                                       int *out_value) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return 0;
+    int ws = -1, wb = -1, wo = -1, value = 1;
+    int n = sscanf(env, "%d:%d:%d:%d", &ws, &wb, &wo, &value);
+    if (n < 3) return 0;
+    if (ws != stage && ws >= 0) return 0;
+    if (wb != block && wb >= 0) return 0;
+    if (wo != op && wo >= 0) return 0;
+    if (out_value) *out_value = (n >= 4) ? value : 1;
+    return 1;
+}
+
+static int t2_shape_launch_group_gemm(t2_ops *ops, CUstream s,
+                                      CUdeviceptr Y, CUdeviceptr W,
+                                      CUdeviceptr X, CUdeviceptr bias,
+                                      int n_out, int n_in, int n_tok,
+                                      int group) {
+    if (!ops->use_f32_gemm || !ops->gemm_f32_group || group <= 0) return -1;
+    void *args[] = {&Y, &W, &X, &bias, &n_out, &n_in, &n_tok, &group};
+    cuLaunchKernel(ops->gemm_f32_group,
+                   (unsigned)(((size_t)n_out * n_tok + 255) / 256),
+                   1, 1, 256, 1, 1, 0, s, args, NULL);
+    return 0;
+}
+
+static int t2_shape_debug_stop_c2s_op(int stage, int op) {
+    const char *env = getenv("T2SD_STOP_AFTER_C2S_OP");
+    if (!env || !env[0]) return 0;
+    int ws = -1, wo = -1;
+    sscanf(env, "%d:%d", &ws, &wo);
+    return ws == stage && wo == op;
+}
+
+/* Run shape decoder forward pass on CUDA.
  * slat: [N, 32] structured latent on CPU
  * coords: [N, 4] int32 on CPU
- * out_feats: caller-allocated [N_out, 7] on CPU
- * out_coords: caller-allocated [N_out, 4] int32 on CPU
- * Returns N_out (number of output voxels after C2S upsampling).
- * NOTE: Currently runs ConvNeXt blocks only (no C2S), outputs at same resolution. */
-int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
-                                      const float *slat, const int32_t *coords, int N,
-                                      float *out_feats, int32_t *out_coords,
-                                      int *out_N) {
-    if (!r->shape_dec.loaded) {
-        fprintf(stderr, "T2: shape decoder not loaded\n"); return -1;
+ * out_feats/out_coords are malloc-owned CPU outputs. */
+static int cuda_trellis2_run_scvae_decoder_alloc(cuda_trellis2_runner *r,
+                                                  t2_scvae_dec_gpu *dec,
+                                                  const char *label,
+                                                  const float *input_feats,
+                                                  int input_C,
+                                                  const int32_t *coords, int N,
+                                                  int start_stage,
+                                                  int start_block,
+                                                  float **out_feats,
+                                                  int32_t **out_coords,
+                                                  int *out_N,
+                                                  int *out_C) {
+    if (!dec->loaded) {
+        fprintf(stderr, "T2: %s not loaded\n", label); return -1;
     }
     t2_ops *ops = &r->ops;
     CUstream s = r->stream;
+    *out_feats = NULL;
+    *out_coords = NULL;
+    if (out_N) *out_N = 0;
+    if (out_C) *out_C = 0;
 
-    /* Use F16 MMA GEMM for shape decoder weights */
+    /* Match GEMM mode to the loaded shape decoder weight precision. */
     int saved_f32 = ops->use_f32_gemm;
     int saved_mma = ops->use_mma_gemm;
-    if (r->ops.sm_version >= 70) {
+    int saved_cublas = ops->use_cublas_f32;
+    int saved_cublas_pedantic = ops->use_cublas_pedantic;
+    int saved_packed_conv = ops->use_packed_sparse_conv;
+    if (dec->use_f16 && r->ops.sm_version >= 70) {
         ops->use_f32_gemm = 0;
         ops->use_mma_gemm = 1;
+        ops->use_cublas_f32 = 0;
+        ops->use_packed_sparse_conv = 0;
+    } else {
+        ops->use_f32_gemm = 1;
+        ops->use_mma_gemm = 0;
+        const char *use_cb = getenv("T2_SCVAE_CUBLAS");
+        ops->use_cublas_f32 = (use_cb && atoi(use_cb) && ops->cublas) ? 1 : 0;
+        const char *ped = getenv("T2_SCVAE_CUBLAS_PEDANTIC");
+        ops->use_cublas_pedantic = (ped && atoi(ped)) ? 1 : 0;
+        const char *packed_conv = getenv("T2_SCVAE_PACKED_CONV");
+        ops->use_packed_sparse_conv = (packed_conv && atoi(packed_conv)) ? 1 : 0;
+        if (ops->use_cublas_f32) {
+            fprintf(stderr, "T2: %s: using cuBLAS F32 GEMM%s\n", label,
+                    ops->use_cublas_pedantic ? " (pedantic)" : "");
+        }
+        if (ops->use_packed_sparse_conv) {
+            fprintf(stderr, "T2: %s: using packed-row F32 sparse conv\n", label);
+        }
+    }
+    #define T2_RESTORE_SCVAE_GEMM() do { \
+        ops->use_f32_gemm = saved_f32; \
+        ops->use_mma_gemm = saved_mma; \
+        ops->use_cublas_f32 = saved_cublas; \
+        ops->use_cublas_pedantic = saved_cublas_pedantic; \
+        ops->use_packed_sparse_conv = saved_packed_conv; \
+    } while (0)
+
+    if (start_stage >= 0) {
+        if (start_stage > 4) {
+            fprintf(stderr, "T2: %s: invalid start_stage=%d\n", label, start_stage);
+            T2_RESTORE_SCVAE_GEMM();
+            return -1;
+        }
+        int expect_C = dec->channels[start_stage];
+        if (input_C != expect_C) {
+            fprintf(stderr, "T2: %s: start_stage=%d expects C=%d, got C=%d\n",
+                    label, start_stage, expect_C, input_C);
+            T2_RESTORE_SCVAE_GEMM();
+            return -1;
+        }
+        if (start_stage < 4) {
+            int nblk = dec->n_convnext[start_stage];
+            if (start_block < 0 || start_block > nblk) {
+                fprintf(stderr, "T2: %s: invalid start_block=%d for stage %d (nblk=%d)\n",
+                        label, start_block, start_stage, nblk);
+                T2_RESTORE_SCVAE_GEMM();
+                return -1;
+            }
+        }
     }
 
-    int C = r->shape_dec.channels[0];  /* 1024 */
+    int C = (start_stage >= 0) ? input_C : dec->channels[0];  /* 1024 for full path */
 
     /* Upload input */
-    CUdeviceptr d_slat = cu_upload_raw(slat, (size_t)N * 32 * sizeof(float));
-    CUdeviceptr d_coords = cu_upload_raw(coords, (size_t)N * 4 * sizeof(int));
+    CUdeviceptr d_coords = cu_upload_raw(coords, (size_t)N * 4 * sizeof(int32_t));
+    CUdeviceptr d_feats = 0;
+    if (start_stage >= 0) {
+        d_feats = cu_upload_raw(input_feats, (size_t)N * C * sizeof(float));
+        fprintf(stderr, "T2: %s: start from stage=%d block=%d -> [%d, %d]\n",
+                label, start_stage, start_block, N, C);
+    } else {
+        CUdeviceptr d_slat = cu_upload_raw(input_feats, (size_t)N * 32 * sizeof(float));
+        /* from_latent: [N, 32] -> [N, 1024] */
+        cuMemAlloc(&d_feats, (size_t)N * C * sizeof(float));
+        t2_op_gemm(ops, s, d_feats, dec->from_latent_w, d_slat, dec->from_latent_b,
+                   C, 32, N);
+        cuMemFree(d_slat);
 
-    /* from_latent: [N, 32] -> [N, 1024] */
-    CUdeviceptr d_feats;
-    cuMemAlloc(&d_feats, (size_t)N * C * sizeof(float));
-    t2_op_gemm(ops, s, d_feats, r->shape_dec.from_latent_w, d_slat, r->shape_dec.from_latent_b,
-               C, 32, N);
-    cuMemFree(d_slat);
+        fprintf(stderr, "T2: %s: from_latent -> [%d, %d]\n", label, N, C);
+    }
 
-    fprintf(stderr, "T2: shape decoder: from_latent -> [%d, %d]\n", N, C);
+    sp3d_hash *hash = NULL;
+    CUdeviceptr d_hash_keys = 0, d_hash_vals = 0, d_gather_map = 0;
 
-    /* Build hash table on CPU, upload to GPU */
-    /* We need the sp3d hash for neighbor lookup. Build on CPU, upload keys/vals. */
-    /* Using the sp3d_hash from sparse3d.h */
-    sp3d_hash *hash = sp3d_hash_build(coords, N);
-    CUdeviceptr d_hash_keys = cu_upload_raw(hash->keys, (size_t)hash->capacity * sizeof(uint64_t));
-    CUdeviceptr d_hash_vals = cu_upload_raw(hash->vals, (size_t)hash->capacity * sizeof(int32_t));
-    int hash_cap = hash->capacity;
+    if (start_stage < 0) {
+        const char *flag = getenv("T2SD_STOP_AFTER_LATENT");
+        if (flag && atoi(flag)) {
+            int rc = t2_shape_debug_return(s, d_feats, coords, N, C,
+                                           out_feats, out_coords, out_N, out_C);
+            cuMemFree(d_feats);
+            cuMemFree(d_coords);
+            T2_RESTORE_SCVAE_GEMM();
+            return rc;
+        }
+    }
 
-    /* Build gather map on GPU */
-    CUdeviceptr d_gather_map;
-    cuMemAlloc(&d_gather_map, (size_t)N * 27 * sizeof(int));
-    t2_op_sparse_build_gather_map(ops, s, d_gather_map, d_coords, N,
-                                   d_hash_keys, d_hash_vals, hash_cap);
-
-    fprintf(stderr, "T2: shape decoder: gather map built (N=%d, hash_cap=%d)\n", N, hash_cap);
-
-    /* Current CPU-side copies of features and coords for C2S round-trips */
+    /* Current CPU-side coords for subdivision-list synthesis. */
     int32_t *cur_coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
     memcpy(cur_coords, coords, (size_t)N * 4 * sizeof(int32_t));
 
+    if (start_stage < 4) {
+        if (t2_build_sparse_gpu_index(r, cur_coords, N, d_coords,
+                                      &hash, &d_hash_keys, &d_hash_vals,
+                                      &d_gather_map) != 0) {
+            cuMemFree(d_feats); cuMemFree(d_coords); free(cur_coords);
+            T2_RESTORE_SCVAE_GEMM();
+            return -1;
+        }
+
+        fprintf(stderr, "T2: %s: gather map built (N=%d, hash_cap=%d)\n",
+                label, N, hash->capacity);
+    }
+
+    {
+        const char *flag = getenv("T2SD_STOP_AT_START");
+        if (flag && atoi(flag)) {
+            int rc = t2_shape_debug_return(s, d_feats, cur_coords, N, C,
+                                           out_feats, out_coords, out_N, out_C);
+            t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+            cuMemFree(d_feats);
+            cuMemFree(d_coords);
+            free(cur_coords);
+            T2_RESTORE_SCVAE_GEMM();
+            return rc;
+        }
+    }
+
     /* Run ConvNeXt blocks + C2S for each stage */
-    for (int stage = 0; stage < 4; stage++) {
-        int nblk = r->shape_dec.n_convnext[stage];
-        C = r->shape_dec.channels[stage];
-        fprintf(stderr, "T2: shape dec: stage %d: %d ConvNeXt(%d), N=%d\n",
-                stage, nblk, C, N);
+    int first_stage = (start_stage >= 0) ? start_stage : 0;
+    for (int stage = first_stage; stage < 4; stage++) {
+        int nblk = dec->n_convnext[stage];
+        C = dec->channels[stage];
+        fprintf(stderr, "T2: %s: stage %d: %d ConvNeXt(%d), N=%d\n",
+                label, stage, nblk, C, N);
 
         struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
 
-        for (int b = 0; b < nblk; b++) {
-            run_shape_convnext(r, d_feats, N, C,
+        int first_block = (stage == first_stage && start_stage >= 0) ? start_block : 0;
+        for (int b = first_block; b < nblk; b++) {
+            CUdeviceptr d_debug_feats = 0;
+            int debug_C = C;
+            int stop_op = run_shape_convnext(r, d_feats, N, C,
                 d_gather_map,
-                r->shape_dec.convnext[stage][b].conv_w,
-                r->shape_dec.convnext[stage][b].conv_b,
-                r->shape_dec.convnext[stage][b].norm_w,
-                r->shape_dec.convnext[stage][b].norm_b,
-                r->shape_dec.convnext[stage][b].mlp0_w,
-                r->shape_dec.convnext[stage][b].mlp0_b,
-                r->shape_dec.convnext[stage][b].mlp2_w,
-                r->shape_dec.convnext[stage][b].mlp2_b);
+                cur_coords,
+                hash,
+                dec->convnext[stage][b].conv_w,
+                dec->convnext[stage][b].conv_b,
+                dec->convnext[stage][b].norm_w,
+                dec->convnext[stage][b].norm_b,
+                dec->convnext[stage][b].mlp0_w,
+                dec->convnext[stage][b].mlp0_b,
+                dec->convnext[stage][b].mlp2_w,
+                dec->convnext[stage][b].mlp2_b,
+                stage, b, &d_debug_feats, &debug_C);
+            if (stop_op) {
+                int rc = t2_shape_debug_return(s, d_debug_feats, cur_coords, N, debug_C,
+                                               out_feats, out_coords, out_N, out_C);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                cuMemFree(d_feats);
+                cuMemFree(d_coords);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
+            if (t2_shape_debug_stop_stage_block(stage, b)) {
+                int rc = t2_shape_debug_return(s, d_feats, cur_coords, N, C,
+                                               out_feats, out_coords, out_N, out_C);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                cuMemFree(d_feats);
+                cuMemFree(d_coords);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
         }
 
         cuStreamSynchronize(s);
         struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
         double dt_conv = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
-        fprintf(stderr, "T2: shape dec: stage %d convnext %.1f ms\n", stage, dt_conv);
+        fprintf(stderr, "T2: %s: stage %d convnext %.1f ms\n", label, stage, dt_conv);
 
-        /* C2S upsampling (hybrid: CPU subdivision + GPU conv) */
-        if (stage < 3) {
-            /* Download features to CPU */
-            float *feats_cpu = (float *)malloc((size_t)N * C * sizeof(float));
-            cuMemcpyDtoH(feats_cpu, d_feats, (size_t)N * C * sizeof(float));
+        /* C2S upsampling. Subdivision list is synthesized on host from GPU
+         * logits; norm/conv/gather/conv2/residual stay on CUDA. */
+        if (dec->c2s[stage].conv1_w) {
+            int C_in = C;
+            int C_out = dec->channels[stage + 1];
+            int C_exp = C_out * 8;
+            int C_in8 = C_in / 8;
 
-            /* Build CPU sparse tensor for C2S */
-            sp3d_tensor *t_cpu = sp3d_create(cur_coords, feats_cpu, N, C, 1);
-            free(feats_cpu);
+            float *sub_logits = NULL;
+            int dense_subdiv = dec->c2s[stage].subdiv_w ? 0 : 1;
+            if (!dense_subdiv) {
+                CUdeviceptr d_logits = 0;
+                cuMemAlloc(&d_logits, (size_t)N * 8 * sizeof(float));
+                t2_op_gemm(ops, s, d_logits,
+                           dec->c2s[stage].subdiv_w,
+                           d_feats,
+                           dec->c2s[stage].subdiv_b,
+                           8, C_in, N);
+                if (t2_shape_debug_stop_c2s_op(stage, 7)) {
+                    int rc = t2_shape_debug_return(s, d_logits, cur_coords, N, 8,
+                                                   out_feats, out_coords, out_N, out_C);
+                    cuMemFree(d_logits);
+                    t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                    cuMemFree(d_feats);
+                    cuMemFree(d_coords);
+                    free(cur_coords);
+                    T2_RESTORE_SCVAE_GEMM();
+                    return rc;
+                }
+                sub_logits = (float *)malloc((size_t)N * 8 * sizeof(float));
+                cuStreamSynchronize(s);
+                cuMemcpyDtoH(sub_logits, d_logits, (size_t)N * 8 * sizeof(float));
+                cuMemFree(d_logits);
+            }
 
-            /* Run C2S on CPU using the full CPU decoder's C2S weights */
-            sp3d_tensor *t_new = t2sd_c2s_forward(t_cpu, &r->shape_dec_cpu->c2s[stage], 4);
+            int32_t *sub_idx = NULL, *sub_subidx = NULL, *new_coords = NULL;
+            int N_new = 0;
+            if (t2_make_subdiv_from_logits_host(sub_logits, cur_coords, N, dense_subdiv,
+                                                &sub_idx, &sub_subidx, &new_coords,
+                                                &N_new) != 0) {
+                fprintf(stderr, "T2: %s: c2s produced no voxels at stage %d\n", label, stage);
+                free(sub_logits);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                cuMemFree(d_feats); cuMemFree(d_coords); free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return -1;
+            }
+            free(sub_logits);
 
-            int N_new = t_new->N;
-            int C_new = t_new->C;
-            fprintf(stderr, "T2: shape dec: c2s %d->%d: N %d -> %d, C %d -> %d\n",
-                    stage, stage + 1, N, N_new, C, C_new);
+            CUdeviceptr d_sub_idx = cu_upload_raw(sub_idx, (size_t)N_new * sizeof(int32_t));
+            CUdeviceptr d_sub_subidx = cu_upload_raw(sub_subidx, (size_t)N_new * sizeof(int32_t));
+            free(sub_idx); free(sub_subidx);
 
-            /* Free old GPU buffers */
-            cuMemFree(d_feats); cuMemFree(d_coords);
-            cuMemFree(d_gather_map); cuMemFree(d_hash_keys); cuMemFree(d_hash_vals);
-            sp3d_hash_free(hash); sp3d_free(t_cpu);
+            ensure_scratch(r, 8, (size_t)N * C_in * sizeof(float));
+            ensure_scratch(r, 9, (size_t)N * ((C_in > C_exp) ? C_in : C_exp) * sizeof(float));
+            ensure_scratch(r, 10, (size_t)N * C_exp * sizeof(float));
+            CUdeviceptr d_norm = r->scratch[8];
+            CUdeviceptr d_gather_tmp = r->scratch[9];
+            CUdeviceptr d_partial = r->scratch[10];
 
-            /* Upload new features and coords to GPU */
-            N = N_new; C = C_new;
-            d_feats = cu_upload_raw(t_new->feats, (size_t)N * C * sizeof(float));
-            d_coords = cu_upload_raw(t_new->coords, (size_t)N * 4 * sizeof(int));
+            if (t2_shape_debug_welford_affine_c2s(stage)) {
+                t2_op_layernorm_welford_eps(ops, s, d_norm, d_feats,
+                                            dec->c2s[stage].norm1_w,
+                                            dec->c2s[stage].norm1_b,
+                                            N, C_in, 1e-6f);
+            } else {
+                t2_op_layernorm(ops, s, d_norm, d_feats,
+                                dec->c2s[stage].norm1_w,
+                                dec->c2s[stage].norm1_b,
+                                N, C_in);
+            }
+            t2_op_silu_inplace(ops, s, d_norm, N * C_in);
+            if (t2_shape_debug_stop_c2s_op(stage, 0)) {
+                int rc = t2_shape_debug_return(s, d_norm, cur_coords, N, C_in,
+                                               out_feats, out_coords, out_N, out_C);
+                cuMemFree(d_sub_idx);
+                cuMemFree(d_sub_subidx);
+                free(new_coords);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                cuMemFree(d_feats);
+                cuMemFree(d_coords);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
 
-            /* Save CPU coords for next round */
+            CUdeviceptr d_expanded = 0;
+            cuMemAlloc(&d_expanded, (size_t)N * C_exp * sizeof(float));
+            t2_run_sparse_conv3d(r, d_expanded, d_norm,
+                                  dec->c2s[stage].conv1_w,
+                                  dec->c2s[stage].conv1_b,
+                                  d_gather_map, d_gather_tmp, d_partial,
+                                  cur_coords, hash, N, C_in, C_exp,
+                                  stage, -1, 1);
+            if (t2_shape_debug_stop_c2s_op(stage, 1)) {
+                int rc = t2_shape_debug_return(s, d_expanded, cur_coords, N, C_exp,
+                                               out_feats, out_coords, out_N, out_C);
+                cuMemFree(d_expanded);
+                cuMemFree(d_sub_idx);
+                cuMemFree(d_sub_subidx);
+                free(new_coords);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                cuMemFree(d_feats);
+                cuMemFree(d_coords);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
+
+            CUdeviceptr d_h_fine = 0, d_x_fine = 0;
+            cuMemAlloc(&d_h_fine, (size_t)N_new * C_out * sizeof(float));
+            cuMemAlloc(&d_x_fine, (size_t)N_new * C_in8 * sizeof(float));
+            t2_op_c2s_gather(ops, s, d_h_fine, d_x_fine,
+                             d_expanded, d_feats,
+                             d_sub_idx, d_sub_subidx,
+                             N_new, C_out, C_in8);
+            cuStreamSynchronize(s);
+            if (t2_shape_debug_stop_c2s_op(stage, 2) ||
+                t2_shape_debug_stop_c2s_op(stage, 3)) {
+                int want_x = t2_shape_debug_stop_c2s_op(stage, 3);
+                int rc = t2_shape_debug_return(s,
+                                               want_x ? d_x_fine : d_h_fine,
+                                               new_coords, N_new,
+                                               want_x ? C_in8 : C_out,
+                                               out_feats, out_coords, out_N, out_C);
+                cuMemFree(d_expanded);
+                cuMemFree(d_sub_idx);
+                cuMemFree(d_sub_subidx);
+                cuMemFree(d_h_fine);
+                cuMemFree(d_x_fine);
+                free(new_coords);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                cuMemFree(d_feats);
+                cuMemFree(d_coords);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
+            cuMemFree(d_expanded);
+            cuMemFree(d_sub_idx);
+            cuMemFree(d_sub_subidx);
+
+            cuMemFree(d_feats);
+            d_feats = 0;
+            cuMemFree(d_coords);
+            d_coords = 0;
+            t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+            hash = NULL; d_hash_keys = d_hash_vals = d_gather_map = 0;
+
             free(cur_coords);
-            cur_coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
-            memcpy(cur_coords, t_new->coords, (size_t)N * 4 * sizeof(int32_t));
+            cur_coords = new_coords;
+            N = N_new;
+            C = C_out;
+            d_coords = cu_upload_raw(cur_coords, (size_t)N * 4 * sizeof(int32_t));
+            if (t2_build_sparse_gpu_index(r, cur_coords, N, d_coords,
+                                          &hash, &d_hash_keys, &d_hash_vals,
+                                          &d_gather_map) != 0) {
+                cuMemFree(d_h_fine); cuMemFree(d_x_fine); cuMemFree(d_coords);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return -1;
+            }
 
-            /* Rebuild hash table and gather map */
-            hash = sp3d_hash_build(t_new->coords, N);
-            d_hash_keys = cu_upload_raw(hash->keys, (size_t)hash->capacity * sizeof(uint64_t));
-            d_hash_vals = cu_upload_raw(hash->vals, (size_t)hash->capacity * sizeof(int32_t));
-            hash_cap = hash->capacity;
+            ensure_scratch(r, 8, (size_t)N * C * sizeof(float));
+            ensure_scratch(r, 9, (size_t)N * C * sizeof(float));
+            ensure_scratch(r, 10, (size_t)N * C * sizeof(float));
+            CUdeviceptr d_h_norm = r->scratch[8];
+            d_gather_tmp = r->scratch[9];
+            d_partial = r->scratch[10];
 
-            cuMemAlloc(&d_gather_map, (size_t)N * 27 * sizeof(int));
-            t2_op_sparse_build_gather_map(ops, s, d_gather_map, d_coords, N,
-                                           d_hash_keys, d_hash_vals, hash_cap);
-            sp3d_free(t_new);
+            if (t2_shape_debug_welford_noaffine_c2s(stage)) {
+                t2_op_layernorm_noaffine_welford_eps(ops, s, d_h_norm,
+                                                     d_h_fine, N, C, 1e-6f);
+            } else {
+                t2_op_layernorm_noaffine_eps(ops, s, d_h_norm,
+                                             d_h_fine, N, C, 1e-6f);
+            }
+            t2_op_silu_inplace(ops, s, d_h_norm, N * C);
+            if (t2_shape_debug_stop_c2s_op(stage, 4)) {
+                int rc = t2_shape_debug_return(s, d_h_norm, cur_coords, N, C,
+                                               out_feats, out_coords, out_N, out_C);
+                cuMemFree(d_h_fine);
+                cuMemFree(d_x_fine);
+                cuMemFree(d_coords);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
+            CUdeviceptr d_c2s_out = 0;
+            cuMemAlloc(&d_c2s_out, (size_t)N * C * sizeof(float));
+            t2_run_sparse_conv3d(r, d_c2s_out, d_h_norm,
+                                  dec->c2s[stage].conv2_w,
+                                  dec->c2s[stage].conv2_b,
+                                  d_gather_map, d_gather_tmp, d_partial,
+                                  cur_coords, hash, N, C, C, stage, -1, 2);
+            if (t2_shape_debug_stop_c2s_op(stage, 5)) {
+                int rc = t2_shape_debug_return(s, d_c2s_out, cur_coords, N, C,
+                                               out_feats, out_coords, out_N, out_C);
+                cuMemFree(d_c2s_out);
+                cuMemFree(d_h_fine);
+                cuMemFree(d_x_fine);
+                cuMemFree(d_coords);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
+            t2_op_c2s_residual_repeat(ops, s, d_c2s_out, d_x_fine, N, C, C_in8);
+            cuStreamSynchronize(s);
+            if (t2_shape_debug_stop_c2s_op(stage, 6)) {
+                int rc = t2_shape_debug_return(s, d_c2s_out, cur_coords, N, C,
+                                               out_feats, out_coords, out_N, out_C);
+                cuMemFree(d_c2s_out);
+                cuMemFree(d_h_fine);
+                cuMemFree(d_x_fine);
+                cuMemFree(d_coords);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
+            cuMemFree(d_h_fine);
+            cuMemFree(d_x_fine);
 
+            d_feats = d_c2s_out;
             struct timespec ts2; clock_gettime(CLOCK_MONOTONIC, &ts2);
             double dt_c2s = (ts2.tv_sec - ts1.tv_sec) * 1000.0 + (ts2.tv_nsec - ts1.tv_nsec) / 1e6;
-            fprintf(stderr, "T2: shape dec: c2s %.1f ms, N=%d\n", dt_c2s, N);
+            fprintf(stderr, "T2: %s: c2s %d->%d %.1f ms, N=%d\n",
+                    label, C_in, C_out, dt_c2s, N);
+        }
+
+        {
+            const char *stop_env = getenv("T2SD_STOP_AFTER_STAGE");
+            if (stop_env && atoi(stop_env) == stage) {
+                int rc = t2_shape_debug_return(s, d_feats, cur_coords, N, C,
+                                               out_feats, out_coords, out_N, out_C);
+                t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+                cuMemFree(d_feats);
+                cuMemFree(d_coords);
+                free(cur_coords);
+                T2_RESTORE_SCVAE_GEMM();
+                return rc;
+            }
+        }
+    }
+
+    {
+        const char *skip_final_ln_env = getenv("T2SD_START_PRE_OUTPUT");
+        int skip_final_ln = (start_stage == 4 && skip_final_ln_env &&
+                             atoi(skip_final_ln_env) != 0);
+        if (!skip_final_ln) {
+            int final_ln_mode = 0;
+            const char *ln_env = getenv("T2_SCVAE_FINAL_LN_MODE");
+            if (ln_env && ln_env[0]) final_ln_mode = atoi(ln_env);
+            float final_ln_eps = 1e-5f;
+            const char *eps_env = getenv("T2_SCVAE_FINAL_LN_EPS");
+            if (eps_env && eps_env[0]) final_ln_eps = (float)atof(eps_env);
+            if (final_ln_mode > 0) {
+                t2_op_layernorm_noaffine_serial_eps(ops, s, d_feats, d_feats,
+                                                    N, C, final_ln_eps, final_ln_mode);
+            } else if (t2_env_flag("T2_SCVAE_FINAL_WELFORD_LN")) {
+                t2_op_layernorm_noaffine_welford_eps(ops, s, d_feats, d_feats,
+                                                     N, C, final_ln_eps);
+            } else {
+                t2_op_layernorm_noaffine_eps(ops, s, d_feats, d_feats, N, C, final_ln_eps);
+            }
+        }
+    }
+
+    {
+        const char *flag = getenv("T2SD_STOP_PRE_OUTPUT");
+        if (flag && atoi(flag)) {
+            int rc = t2_shape_debug_return(s, d_feats, cur_coords, N, C,
+                                           out_feats, out_coords, out_N, out_C);
+            free(cur_coords);
+            cuMemFree(d_feats);
+            cuMemFree(d_coords);
+            t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+            T2_RESTORE_SCVAE_GEMM();
+            return rc;
         }
     }
 
     /* output_layer: [N, C=64] -> [N, out_ch] */
-    int out_ch = r->shape_dec.channels[4]; /* 64 -> detect from weight */
-    {
-        /* Detect actual output channels from out_w shape:
-         * For shape decoder: 7, for texture decoder: 6 */
-        /* For now use a fixed value based on what was loaded */
-        out_ch = 7;  /* shape decoder default */
-    }
+    int out_ch = dec->out_channels > 0 ? dec->out_channels : 7;
 
     cuStreamSynchronize(s);
     CUdeviceptr d_output;
     cuMemAlloc(&d_output, (size_t)N * out_ch * sizeof(float));
-    t2_op_gemm(ops, s, d_output, r->shape_dec.out_w, d_feats, r->shape_dec.out_b,
-               out_ch, C, N);
+    int output_done = 0;
+    {
+        const char *group_env = getenv("T2_SCVAE_OUTPUT_GROUP");
+        int group = group_env && group_env[0] ? atoi(group_env) : 0;
+        if (group > 0 &&
+            t2_op_gemm_f32_group(ops, s, d_output, dec->out_w, d_feats,
+                                 dec->out_b, out_ch, C, N, group) == 0) {
+            output_done = 1;
+        }
+    }
+    if (!output_done && getenv("T2_SCVAE_OUTPUT_PAIR32") &&
+        t2_op_gemm_f32_pair32(ops, s, d_output, dec->out_w, d_feats,
+                              dec->out_b, out_ch, C, N) == 0) {
+        output_done = 1;
+    }
+    if (!output_done && getenv("T2_SCVAE_CUBLASLT_BIAS_GEMM") && dec->out_b &&
+        t2_op_gemm_f32_lt_bias(ops, s, d_output, dec->out_w, d_feats,
+                               dec->out_b, out_ch, C, N) == 0) {
+        output_done = 1;
+    }
+    if (!output_done && ops->use_cublas_f32 && dec->out_b) {
+        t2_op_broadcast_bias(ops, s, d_output, dec->out_b, N, out_ch);
+        if (t2_op_gemm_f32_cublas_beta1(ops, s, d_output, dec->out_w,
+                                         d_feats, out_ch, C, N) == 0) {
+            output_done = 1;
+        }
+    }
+    if (!output_done) {
+        t2_op_gemm(ops, s, d_output, dec->out_w, d_feats, dec->out_b,
+                   out_ch, C, N);
+    }
     cuStreamSynchronize(s);
 
-    /* Download results — caller must have allocated enough for max possible N */
-    cuMemcpyDtoH(out_feats, d_output, (size_t)N * out_ch * sizeof(float));
-    memcpy(out_coords, cur_coords, (size_t)N * 4 * sizeof(int32_t));
-    *out_N = N;
+    float *host_feats = (float *)malloc((size_t)N * out_ch * sizeof(float));
+    int32_t *host_coords = (int32_t *)malloc((size_t)N * 4 * sizeof(int32_t));
+    if (!host_feats || !host_coords) {
+        free(host_feats); free(host_coords);
+        cuMemFree(d_output);
+        free(cur_coords);
+        cuMemFree(d_feats);
+        cuMemFree(d_coords);
+        t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
+        T2_RESTORE_SCVAE_GEMM();
+        return -1;
+    }
+    cuMemcpyDtoH(host_feats, d_output, (size_t)N * out_ch * sizeof(float));
+    memcpy(host_coords, cur_coords, (size_t)N * 4 * sizeof(int32_t));
+    *out_feats = host_feats;
+    *out_coords = host_coords;
+    if (out_N) *out_N = N;
+    if (out_C) *out_C = out_ch;
     cuMemFree(d_output);
 
     /* Cleanup */
     free(cur_coords);
     cuMemFree(d_feats);
     cuMemFree(d_coords);
-    cuMemFree(d_gather_map);
-    cuMemFree(d_hash_keys);
-    cuMemFree(d_hash_vals);
-    sp3d_hash_free(hash);
+    t2_free_sparse_gpu_index(hash, d_hash_keys, d_hash_vals, d_gather_map);
 
-    ops->use_f32_gemm = saved_f32;
-    ops->use_mma_gemm = saved_mma;
+    T2_RESTORE_SCVAE_GEMM();
+    #undef T2_RESTORE_SCVAE_GEMM
+    return 0;
+}
+
+int cuda_trellis2_run_shape_decoder_alloc(cuda_trellis2_runner *r,
+                                           const float *slat,
+                                           const int32_t *coords, int N,
+                                           float **out_feats,
+                                           int32_t **out_coords,
+                                           int *out_N,
+                                           int *out_C) {
+    return cuda_trellis2_run_scvae_decoder_alloc(r, &r->shape_dec, "shape decoder",
+                                                  slat, 32, coords, N, -1, 0,
+                                                  out_feats, out_coords,
+                                                  out_N, out_C);
+}
+
+int cuda_trellis2_run_shape_decoder_from_alloc(cuda_trellis2_runner *r,
+                                                const float *feats,
+                                                int C,
+                                                const int32_t *coords, int N,
+                                                int start_stage,
+                                                int start_block,
+                                                float **out_feats,
+                                                int32_t **out_coords,
+                                                int *out_N,
+                                                int *out_C) {
+    return cuda_trellis2_run_scvae_decoder_alloc(r, &r->shape_dec, "shape decoder",
+                                                  feats, C, coords, N,
+                                                  start_stage, start_block,
+                                                  out_feats, out_coords,
+                                                  out_N, out_C);
+}
+
+int cuda_trellis2_run_texture_decoder_alloc(cuda_trellis2_runner *r,
+                                             const float *slat,
+                                             const int32_t *coords, int N,
+                                             float **out_feats,
+                                             int32_t **out_coords,
+                                             int *out_N,
+                                             int *out_C) {
+    return cuda_trellis2_run_scvae_decoder_alloc(r, &r->tex_dec, "texture decoder",
+                                                  slat, 32, coords, N, -1, 0,
+                                                  out_feats, out_coords,
+                                                  out_N, out_C);
+}
+
+int cuda_trellis2_run_shape_decoder(cuda_trellis2_runner *r,
+                                      const float *slat, const int32_t *coords, int N,
+                                      float *out_feats, int32_t *out_coords,
+                                      int *out_N) {
+    float *tmp_feats = NULL;
+    int32_t *tmp_coords = NULL;
+    int out_count = 0, out_ch = 0;
+    int rc = cuda_trellis2_run_shape_decoder_alloc(r, slat, coords, N,
+                                                    &tmp_feats, &tmp_coords,
+                                                    &out_count, &out_ch);
+    if (rc != 0) return rc;
+    memcpy(out_feats, tmp_feats, (size_t)out_count * out_ch * sizeof(float));
+    memcpy(out_coords, tmp_coords, (size_t)out_count * 4 * sizeof(int32_t));
+    if (out_N) *out_N = out_count;
+    free(tmp_feats);
+    free(tmp_coords);
+    return 0;
+}
+
+int cuda_trellis2_run_texture_decoder(cuda_trellis2_runner *r,
+                                       const float *slat, const int32_t *coords, int N,
+                                       float *out_feats, int32_t *out_coords,
+                                       int *out_N) {
+    float *tmp_feats = NULL;
+    int32_t *tmp_coords = NULL;
+    int out_count = 0, out_ch = 0;
+    int rc = cuda_trellis2_run_texture_decoder_alloc(r, slat, coords, N,
+                                                      &tmp_feats, &tmp_coords,
+                                                      &out_count, &out_ch);
+    if (rc != 0) return rc;
+    memcpy(out_feats, tmp_feats, (size_t)out_count * out_ch * sizeof(float));
+    memcpy(out_coords, tmp_coords, (size_t)out_count * 4 * sizeof(int32_t));
+    if (out_N) *out_N = out_count;
+    free(tmp_feats);
+    free(tmp_coords);
     return 0;
 }
 
@@ -2067,8 +3335,6 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
                                   const float *cond_features,
                                   const int32_t *coords, int N,
                                   float *output) {
-    /* Invalidate cache since CFG uses different cond per pass */
-    cuda_trellis2_invalidate_kv_cache(r);
     if (!r->stage2_loaded) {
         fprintf(stderr, "T2: Stage 2 not loaded\n"); return -1;
     }
@@ -2076,6 +3342,9 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
     dit_model_gpu *m = &r->stage2;
     int in_ch = m->in_channels;  /* 32 */
     int ctx_len = DINO_SEQ_LEN;
+    size_t cond_n = (size_t)ctx_len * DIT_COND_DIM;
+    uint64_t cond_hash = t2_hash_f32_bytes(cond_features, cond_n);
+    int cache_slot = t2_cond_cache_slot(cond_features, ctx_len);
 
     /* Compute 3D RoPE tables from sparse coords on CPU */
     int n_freqs = m->n_rope_freqs;  /* 21 */
@@ -2115,7 +3384,8 @@ int cuda_trellis2_run_stage2_dit(cuda_trellis2_runner *r,
 
     /* Run Stage 2 DiT forward */
     run_sparse_dit_forward(r, m, r->stage2_blocks_cpu,
-                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin, 2);
+                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin,
+                            2, cond_hash, cache_slot);
 
     cuStreamSynchronize(s);
     cuMemcpyDtoH(output, d_out, (size_t)N * in_ch * sizeof(float));
@@ -2137,6 +3407,9 @@ int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
     dit_model_gpu *m = &r->stage3;
     int in_ch = m->in_channels;  /* 64 (noise_32 + shape_slat_32) */
     int ctx_len = DINO_SEQ_LEN;
+    size_t cond_n = (size_t)ctx_len * DIT_COND_DIM;
+    uint64_t cond_hash = t2_hash_f32_bytes(cond_features, cond_n);
+    int cache_slot = t2_cond_cache_slot(cond_features, ctx_len);
 
     /* Compute 3D RoPE tables from sparse coords (same as Stage 2) */
     int n_freqs = m->n_rope_freqs;
@@ -2172,7 +3445,8 @@ int cuda_trellis2_run_stage3_dit(cuda_trellis2_runner *r,
     cuMemAlloc(&d_out, (size_t)N * out_ch * sizeof(float));
 
     run_sparse_dit_forward(r, m, r->stage3_blocks_cpu,
-                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin, 3);
+                            d_x, timestep, d_cond, d_out, N, d_rope_cos, d_rope_sin,
+                            3, cond_hash, cache_slot);
 
     cuStreamSynchronize(s);
     cuMemcpyDtoH(output, d_out, (size_t)N * out_ch * sizeof(float));

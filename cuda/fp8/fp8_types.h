@@ -10,6 +10,7 @@
 #define FP8_TYPES_H
 
 #include <stdint.h>
+#include <string.h>
 #include <math.h>
 
 typedef uint8_t fp8_e4m3_t;
@@ -29,29 +30,43 @@ typedef uint8_t fp8_e5m2_t;
 #define FP8_E5M2_MAX_EXP   31
 #define FP8_E5M2_MAX       57344.0f
 
-/* Convert float to FP8 E4M3 */
+/* Convert float to FP8 E4M3 (round-to-nearest-even, saturate-to-finite —
+ * matches the hardware cvt.rn.satfinite.e4m3x2.f32 instruction). Max finite
+ * 448 (exp=15,mant=6); (exp=15,mant=7) is NaN; smallest normal 2^-6;
+ * subnormals are k*2^-9 for k=1..7. */
 static inline fp8_e4m3_t float_to_fp8_e4m3(float f) {
     if (f != f) return 0x7F; /* NaN -> 0x7F (all mantissa bits set) */
-    if (f == 0.0f) return 0x00;
 
     uint32_t bits;
     memcpy(&bits, &f, sizeof(bits));
 
-    uint32_t sign = (bits >> 31) & 1;
-    int32_t exp = ((bits >> 23) & 0xFF) - 127 + FP8_E4M3_BIAS;
-    uint32_t mant = (bits >> 20) & 0x7; /* Take top 3 bits of mantissa */
+    fp8_e4m3_t s8 = (fp8_e4m3_t)(((bits >> 31) & 1u) << 7);
+    float af = (f < 0.0f) ? -f : f;
+    if (af == 0.0f) return s8;                       /* +/-0 keep sign */
+    if (af >= FP8_E4M3_MAX) return (fp8_e4m3_t)(s8 | (0xFu << 3) | 0x6u); /* saturate (incl. Inf) */
 
-    /* Handle overflow */
-    if (exp >= 15) {
-        exp = 15;
-        mant = 0x6; /* Max normal value, not NaN */
+    int32_t E = (int32_t)((bits >> 23) & 0xFF) - 127; /* unbiased f32 exponent */
+    if (E < -6) {
+        /* Subnormal range: nearest multiple of 2^-9 (k=0..8), RNE. k==8
+         * carries up into the smallest normal (exp field 1, mant 0). */
+        float scaled = af * 512.0f;                  /* exact power-of-two scale */
+        uint32_t k = (uint32_t)scaled;               /* truncate; scaled >= 0 */
+        float frac = scaled - (float)k;
+        if (frac > 0.5f || (frac == 0.5f && (k & 1u))) k++;
+        if (k == 0u) return s8;
+        if (k < 8u) return (fp8_e4m3_t)(s8 | (k & 0x7u));     /* subnormal */
+        return (fp8_e4m3_t)(s8 | (1u << 3));                  /* -> smallest normal */
     }
-    /* Handle underflow */
-    if (exp <= 0) {
-        return (sign << 7); /* Zero with sign */
+    /* Normal range: reduce the 23-bit mantissa to 3 bits with RNE. */
+    uint32_t mant = (bits >> 20) & 0x7u;             /* top 3 mantissa bits */
+    uint32_t rem  = bits & 0xFFFFFu;                 /* low 20 bits = round info */
+    if (rem > 0x80000u || (rem == 0x80000u && (mant & 1u))) {
+        if (++mant == 8u) { mant = 0u; E++; }        /* mantissa carry bumps exp */
     }
-
-    return (sign << 7) | ((exp & 0xF) << 3) | (mant & 0x7);
+    int32_t exp_field = E + FP8_E4M3_BIAS;
+    if (exp_field > 15 || (exp_field == 15 && mant > 6u))
+        return (fp8_e4m3_t)(s8 | (0xFu << 3) | 0x6u); /* saturate to 448 */
+    return (fp8_e4m3_t)(s8 | ((uint32_t)exp_field << 3) | mant);
 }
 
 /* Convert FP8 E4M3 to float */
