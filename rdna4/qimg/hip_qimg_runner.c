@@ -2525,11 +2525,38 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
 /* ---- VAE decode on GPU ---- */
 
+/* Env-gated per-stage VAE dump for layer-by-layer comparison vs the CUDA fp8
+ * reference. When QIMG_VAE_DUMP_PREFIX is set, each decode stage's current
+ * activation d_x is copied D->H and written as raw little-endian f32 [c,h,w]
+ * (C-contiguous, channel-major) to "<prefix>_<name>.bin" — matching the layout
+ * of the CUDA cuda_vae_*.npy dumps. No effect when the env var is unset. */
+static void qimg_vae_dump(const char *prefix, const char *name,
+                          void *d_buf, int c, int h, int w) {
+    if (!prefix || !d_buf) return;
+    size_t n = (size_t)c * h * w;
+    float *host = (float *)malloc(n * sizeof(float));
+    if (!host) return;
+    hipDeviceSynchronize();
+    hipMemcpy(host, d_buf, n * sizeof(float), hipMemcpyDeviceToHost);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%s.bin", prefix, name);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(host, sizeof(float), n, f);
+        fclose(f);
+        fprintf(stderr, "  [vae-dump] %s [%d,%d,%d]\n", path, c, h, w);
+    } else {
+        fprintf(stderr, "  [vae-dump] failed to open %s\n", path);
+    }
+    free(host);
+}
+
 int hip_qimg_vae_decode(hip_qimg_runner *r,
                         const float *latent, int lat_h, int lat_w,
                         float *out_rgb) {
     st_context *st = (st_context *)r->vae_st;
     if (!st) { fprintf(stderr, "hip_qimg: VAE not loaded\n"); return -1; }
+    const char *vae_dump_prefix = getenv("QIMG_VAE_DUMP_PREFIX");
 
     /* Free preloaded DiT blocks to make room */
     if (r->gpu_blocks) {
@@ -2556,6 +2583,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         hipFree(d_x); d_x = d_tmp;
         hipFree(d_pqc_w); hipFree(d_pqc_b);
     }
+    qimg_vae_dump(vae_dump_prefix, "post_quant", d_x, c, h, w);
 
     /* decoder.conv1: 16→384, 3×3 */
     int co_c1, ci_c1;
@@ -2569,6 +2597,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         hipFree(d_c1_w); hipFree(d_c1_b);
     }
     fprintf(stderr, "  after conv1: [%d, %d, %d]\n", c, h, w);
+    qimg_vae_dump(vae_dump_prefix, "conv1", d_x, c, h, w);
 
     /* Load resblock weights helper macro */
     #define LOAD_RB_NAMED(pfx_str, n1, c1w, c1b, n2, c2w, c2b, scw, scb) \
@@ -2590,6 +2619,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
       hipFree(d_x); d_x = d_tmp;
       hipFree(n1); hipFree(c1w); hipFree(c1b); hipFree(n2); hipFree(c2w); hipFree(c2b);
       if (scw) { hipFree(scw); } if (scb) { hipFree(scb); } }
+    qimg_vae_dump(vae_dump_prefix, "middle_0", d_x, c, h, w);
 
     /* Middle attention: CPU fallback for spatial self-attention */
     {
@@ -2679,6 +2709,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
         double _ms = (_t1.tv_sec-_t0.tv_sec)*1e3 + (_t1.tv_nsec-_t0.tv_nsec)/1e6;
         fprintf(stderr, "  vae middle attention: %.0f ms (spatial=%d, c=%d)\n", _ms, h*w, c);
     }
+    qimg_vae_dump(vae_dump_prefix, "middle_1", d_x, c, h, w);
 
     /* mid.2 */
     { LOAD_RB_NAMED("decoder.middle.2", n1, c1w, c1b, n2, c2w, c2b, scw, scb);
@@ -2687,6 +2718,7 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
       hipFree(n1); hipFree(c1w); hipFree(c1b); hipFree(n2); hipFree(c2w); hipFree(c2b);
       if (scw) { hipFree(scw); } if (scb) { hipFree(scb); } }
     fprintf(stderr, "  after middle: [%d, %d, %d]\n", c, h, w);
+    qimg_vae_dump(vae_dump_prefix, "middle_2", d_x, c, h, w);
 
     /* Upsample blocks 0-14 */
     for (int i = 0; i < 15; i++) {
@@ -2725,6 +2757,10 @@ int hip_qimg_vae_decode(hip_qimg_runner *r,
             hipFree(rs_w); hipFree(rs_b);
             d_x = d_tmp; c = new_c;
             fprintf(stderr, "  upsample %d: [%d, %d, %d]\n", i, c, h, w);
+        }
+        if (vae_dump_prefix) {
+            char nm[32]; snprintf(nm, sizeof(nm), "upsample_%d", i);
+            qimg_vae_dump(vae_dump_prefix, nm, d_x, c, h, w);
         }
     }
     #undef LOAD_RB_NAMED
